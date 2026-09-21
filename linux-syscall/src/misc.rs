@@ -608,14 +608,21 @@ impl Syscall<'_> {
                     None
                 } else {
                     let timeout_addr: UserInPtr<TimeSpec> = val2.into();
-                    timeout_addr.read_if_not_null()?.map(|timeout| {
-                        let now = if cmd == FUTEX_LOCK_PI || op & FUTEX_CLOCK_REALTIME != 0 {
-                            Duration::from(TimeSpec::now())
-                        } else {
-                            Duration::from(TimeSpec::now_monotonic())
-                        };
-                        timer_now() + Duration::from(timeout).saturating_sub(now)
-                    })
+                    match timeout_addr.read_if_not_null()? {
+                        None => None,
+                        Some(timeout) => {
+                            let now = if cmd == FUTEX_LOCK_PI || op & FUTEX_CLOCK_REALTIME != 0 {
+                                Duration::from(TimeSpec::now())
+                            } else {
+                                Duration::from(TimeSpec::now_monotonic())
+                            };
+                            // Validated and saturating: a `timespec` out of
+                            // range is EINVAL, and adding a `Duration`
+                            // panics on overflow.
+                            let dur = timeout.try_into_duration()?;
+                            Some(timer_now().saturating_add(dur.saturating_sub(now)))
+                        }
+                    }
                 };
                 loop {
                     let cur = futex.load();
@@ -697,15 +704,18 @@ impl Syscall<'_> {
                     // takes an absolute one on the clock selected by
                     // FUTEX_CLOCK_REALTIME. Convert absolute deadlines to the
                     // kernel's monotonic deadline base.
+                    // Validated and saturating: a `timespec` out of range is
+                    // EINVAL, and adding a `Duration` panics on overflow.
+                    let dur = timeout.try_into_duration()?;
                     let deadline = if cmd == FUTEX_WAIT_BITSET {
                         let now = if op & FUTEX_CLOCK_REALTIME != 0 {
                             Duration::from(TimeSpec::now())
                         } else {
                             Duration::from(TimeSpec::now_monotonic())
                         };
-                        timer_now() + Duration::from(timeout).saturating_sub(now)
+                        timer_now().saturating_add(dur.saturating_sub(now))
                     } else {
-                        timer_now() + Duration::from(timeout)
+                        timer_now().saturating_add(dur)
                     };
                     self.thread
                         .blocking_run(future, ThreadState::BlockedFutex, deadline, None)
@@ -768,6 +778,11 @@ impl Syscall<'_> {
             }
             RLIMIT_NOFILE => {
                 let new_limit = new_limit.read_if_not_null()?;
+                // `cur` is what actually caps this process's fd table
+                // (`LinuxProcess::file_limit`), and nothing checked it before:
+                // a soft limit above the hard one was simply installed, so the
+                // hard limit meant nothing at all.
+                let new_limit = new_limit.map(rlimit_validate).transpose()?;
                 old_limit.write_if_not_null(proc.file_limit(new_limit))?;
                 Ok(0)
             }
@@ -886,6 +901,35 @@ impl Syscall<'_> {
 
 const USER_STACK_SIZE: usize = 8 * 1024 * 1024; // 8 MB, the default config of Linux
 
+/// Linux's `sysctl_nr_open` default: the ceiling `prlimit64` puts on
+/// `RLIMIT_NOFILE`'s hard limit, over which it answers `EPERM`.
+const NR_OPEN: u64 = 1024 * 1024;
+
+/// Check a `new_limit` from `setrlimit(2)` / `prlimit64(2)`.
+///
+/// Two of the three rules `do_prlimit` applies:
+///
+/// ```c
+/// if (new_rlim->rlim_cur > new_rlim->rlim_max)                        return -EINVAL;
+/// if (resource == RLIMIT_NOFILE && new_rlim->rlim_max > sysctl_nr_open) return -EPERM;
+/// ```
+///
+/// The third -- raising the hard limit above its old value needs
+/// `CAP_SYS_RESOURCE` -- is deliberately **not** implemented, because this
+/// kernel has no capability model to ask. So the hard limit here stops a
+/// process from raising its soft limit past it *by mistake*; it does not stop
+/// a process that sets both at once. Worth knowing before anyone relies on
+/// `RLIMIT_NOFILE` as a boundary rather than as a self-imposed budget.
+fn rlimit_validate(new: RLimit) -> Result<RLimit, LxError> {
+    if new.cur > new.max {
+        return Err(LxError::EINVAL);
+    }
+    if new.max > NR_OPEN {
+        return Err(LxError::EPERM);
+    }
+    Ok(new)
+}
+
 const RLIMIT_STACK: usize = 3;
 const RLIMIT_RSS: usize = 5;
 const RLIMIT_NOFILE: usize = 7;
@@ -929,6 +973,109 @@ fn cap_version_elems(version: u32) -> Option<usize> {
         LINUX_CAPABILITY_VERSION_1 => Some(1),
         LINUX_CAPABILITY_VERSION_2 | LINUX_CAPABILITY_VERSION_3 => Some(2),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod rlimit_tests {
+    //! `RLIMIT_NOFILE`'s soft limit is what actually caps this process's fd
+    //! table, and nothing checked the pair before: a soft limit above the hard
+    //! one was installed as given, so the hard limit meant nothing at all.
+
+    use super::{rlimit_validate, LxError, RLimit, NR_OPEN};
+
+    #[test]
+    fn a_soft_limit_above_the_hard_one_is_einval() {
+        // The rule that makes the hard limit mean anything.
+        assert_eq!(
+            rlimit_validate(RLimit {
+                cur: 4096,
+                max: 1024
+            }),
+            Err(LxError::EINVAL)
+        );
+        assert_eq!(
+            rlimit_validate(RLimit { cur: 1, max: 0 }),
+            Err(LxError::EINVAL)
+        );
+    }
+
+    #[test]
+    fn a_soft_limit_equal_to_the_hard_one_is_fine() {
+        // The boundary is `>`, not `>=`: setting both to the same value is
+        // what a process does when it raises itself to its hard limit, which
+        // is the single most common `setrlimit` call there is.
+        let l = RLimit {
+            cur: 1024,
+            max: 1024,
+        };
+        assert_eq!(rlimit_validate(l), Ok(l));
+        let l = RLimit { cur: 0, max: 0 };
+        assert_eq!(rlimit_validate(l), Ok(l));
+    }
+
+    #[test]
+    fn a_hard_limit_past_nr_open_is_eperm_not_einval() {
+        // Linux answers EPERM here and EINVAL above, and the difference is
+        // load-bearing: a caller that sees EPERM retries with a smaller
+        // number, and one that sees EINVAL concludes it built the struct
+        // wrong. `RLIM_INFINITY` is the value every "just give me all the
+        // file descriptors" program passes.
+        assert_eq!(
+            rlimit_validate(RLimit {
+                cur: NR_OPEN,
+                max: NR_OPEN + 1
+            }),
+            Err(LxError::EPERM)
+        );
+        assert_eq!(
+            rlimit_validate(RLimit {
+                cur: u64::MAX,
+                max: u64::MAX
+            }),
+            Err(LxError::EPERM)
+        );
+    }
+
+    #[test]
+    fn nr_open_itself_is_accepted() {
+        let l = RLimit {
+            cur: NR_OPEN,
+            max: NR_OPEN,
+        };
+        assert_eq!(rlimit_validate(l), Ok(l));
+    }
+
+    #[test]
+    fn the_order_of_the_two_rules_is_linuxs() {
+        // Both wrong at once: `cur > max` is checked first, so this is EINVAL
+        // and not EPERM. A caller that retries on EPERM would otherwise spin
+        // on a struct that is never going to be accepted.
+        assert_eq!(
+            rlimit_validate(RLimit {
+                cur: u64::MAX,
+                max: NR_OPEN + 1,
+            }),
+            Err(LxError::EINVAL)
+        );
+    }
+
+    #[test]
+    fn the_hard_limit_is_not_a_security_boundary_here() {
+        // Documented on purpose: Linux also needs `CAP_SYS_RESOURCE` to raise
+        // the hard limit above its old value, and this kernel has no
+        // capability model to ask, so that rule is not implemented. A process
+        // can still lift both at once, and this test is here so that the gap
+        // is a decision on the record rather than a surprise.
+        let l = RLimit {
+            cur: NR_OPEN,
+            max: NR_OPEN,
+        };
+        assert_eq!(
+            rlimit_validate(l),
+            Ok(l),
+            "raising both at once is accepted; see the note on rlimit_validate"
+        );
     }
 }
 

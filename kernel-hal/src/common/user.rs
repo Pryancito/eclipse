@@ -460,11 +460,14 @@ impl<P: Policy> Debug for IoVecs<P> {
     }
 }
 
-impl IoVecs<Out> {
-    pub fn new(iov_ptr: UserInPtr<IoVec<Out>>, iov_count: usize) -> IoVecs<Out> {
-        iov_ptr.read_iovecs(iov_count).unwrap()
-    }
-}
+// `IoVecs::<Out>::new` used to live here: a constructor that did
+// `read_iovecs(count).unwrap()`. Every one of `read_iovecs`'s errors comes
+// from userspace -- a null pointer, more than `IOV_MAX` entries, lengths that
+// sum past `usize` -- so that `unwrap` was a kernel panic reachable from any
+// `readv`-shaped syscall that happened to use it. Nothing did, which is why it
+// never fired. It is removed rather than fixed: `read_iovecs` is the same call
+// with the error kept, and an infallible-looking constructor over fallible
+// user input is a trap for whoever reaches for it next.
 impl<P: Policy> UserInPtr<IoVec<P>> {
     pub fn read_iovecs(&self, count: usize) -> Result<IoVecs<P>> {
         if self.0.is_null() {

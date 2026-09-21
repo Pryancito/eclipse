@@ -16,6 +16,7 @@
 //!   the process as owner, which collapses their one behavioural difference
 //!   (per-description ownership) into per-process ownership.
 
+use crate::error::{LxError, LxResult};
 use alloc::vec::Vec;
 use hashbrown::HashMap;
 use lazy_static::lazy_static;
@@ -67,6 +68,47 @@ pub struct ConflictInfo {
     pub len: u64,
     /// Owner pid.
     pub pid: KoID,
+}
+
+/// Resolve a `struct flock`'s `l_start` and `l_len` against an already
+/// resolved `l_whence` base into the absolute `[start, end)` range the lock
+/// table speaks, with `u64::MAX` for "to the end of the file and beyond".
+///
+/// Three things make this worth writing down rather than inlining.
+///
+/// A **negative `l_len` is legal** and means the range *before* `l_start`,
+/// which POSIX spells out and which programs do use. Treating it as an error,
+/// or as its absolute value, locks a different part of the file than the one
+/// the caller asked for -- and a record lock over the wrong range is a data
+/// corruption bug in every program that relies on `fcntl` locking (sqlite,
+/// dpkg, apk) with no error anywhere.
+///
+/// The arithmetic **overflows**: all three inputs are a full `i64` straight
+/// out of userspace. `base + l_start` can leave the range, and `-l_len` is
+/// not representable when `l_len` is `i64::MIN`. Linux answers `EOVERFLOW`;
+/// wrapping instead silently locks somewhere else entirely.
+///
+/// And the end is **exclusive** here while Linux's `fl_end` is inclusive, so
+/// the `- 1` in its bounds checks does not appear.
+pub fn resolve_range(base: i64, l_start: i64, l_len: i64) -> LxResult<(u64, u64)> {
+    let start = base.checked_add(l_start).ok_or(LxError::EOVERFLOW)?;
+    let (start, end) = if l_len == 0 {
+        // To the end of the file, and anything appended to it later.
+        (start, None)
+    } else if l_len > 0 {
+        (
+            start,
+            Some(start.checked_add(l_len).ok_or(LxError::EOVERFLOW)?),
+        )
+    } else {
+        // The range before `l_start`: [start + l_len, start).
+        let first = start.checked_add(l_len).ok_or(LxError::EOVERFLOW)?;
+        (first, Some(start))
+    };
+    if start < 0 {
+        return Err(LxError::EINVAL);
+    }
+    Ok((start as u64, end.map_or(u64::MAX, |e| e as u64)))
 }
 
 lazy_static! {
@@ -274,5 +316,205 @@ mod tests {
         let h = held(true, 100, u64::MAX, 1);
         assert!(conflicts(&h, &req(false, 1000, 1001, 2)));
         assert!(!conflicts(&h, &req(true, 0, 100, 2)));
+    }
+}
+
+#[cfg(test)]
+mod range_tests {
+    //! `fcntl(2)` record locks, the range half.
+    //!
+    //! The three fields of a `struct flock` are a full `i64` each, straight
+    //! out of userspace, and a negative `l_len` is **legal**: it names the
+    //! range *before* `l_start`. Get any of it wrong and the program locks a
+    //! different part of the file than the one it asked for, with no error
+    //! anywhere -- which for the programs that rely on `fcntl` locking
+    //! (sqlite, dpkg, apk) is a data corruption bug, not an inconvenience.
+
+    use super::*;
+
+    fn ok(base: i64, start: i64, len: i64) -> (u64, u64) {
+        resolve_range(base, start, len).unwrap()
+    }
+
+    #[test]
+    fn a_plain_forward_range_is_what_it_says() {
+        assert_eq!(ok(0, 10, 5), (10, 15));
+        assert_eq!(ok(0, 0, 1), (0, 1));
+    }
+
+    #[test]
+    fn the_end_is_exclusive() {
+        // Linux's `fl_end` is the last byte; this table's `end` is one past
+        // it. A lock of one byte at 10 must not reach byte 11, or two
+        // programs locking adjacent single bytes would conflict.
+        let (start, end) = ok(0, 10, 1);
+        assert_eq!((start, end), (10, 11));
+        assert!(
+            !ranges_overlap(start, end, 11, 12),
+            "10 and 11 must not clash"
+        );
+        assert!(ranges_overlap(start, end, 10, 20), "10 and 10 must clash");
+    }
+
+    #[test]
+    fn a_length_of_zero_runs_to_the_end_of_the_file_and_beyond() {
+        // This is how every whole-file lock is written, and it has to cover
+        // bytes appended after the lock was taken.
+        assert_eq!(ok(0, 0, 0), (0, u64::MAX));
+        assert_eq!(ok(0, 4096, 0), (4096, u64::MAX));
+    }
+
+    #[test]
+    fn a_negative_length_names_the_range_before_the_start() {
+        // POSIX says so. Taking the absolute value instead would lock
+        // [100, 110) where the caller asked for [90, 100) -- a lock on the
+        // wrong bytes, with nothing reported.
+        assert_eq!(ok(0, 100, -10), (90, 100));
+        assert_eq!(ok(0, 1, -1), (0, 1));
+    }
+
+    #[test]
+    fn a_negative_length_covers_exactly_the_same_bytes_as_its_positive_twin() {
+        // Locking [90, 100) has one spelling from each side, and they have
+        // to agree byte for byte.
+        for &(start, len) in &[(100i64, -10i64), (50, -50), (4096, -4096)] {
+            let back = ok(0, start, len);
+            let forward = ok(0, start + len, -len);
+            assert_eq!(back, forward, "l_start {} l_len {}", start, len);
+        }
+    }
+
+    #[test]
+    fn the_whence_base_is_added_to_the_start() {
+        // SEEK_CUR and SEEK_END arrive here as a base. Ignoring it locks the
+        // wrong end of the file.
+        assert_eq!(ok(1000, 10, 5), (1010, 1015));
+        assert_eq!(ok(1000, -10, 5), (990, 995));
+        assert_eq!(ok(1000, 0, -100), (900, 1000));
+    }
+
+    #[test]
+    fn a_range_starting_before_the_file_is_refused() {
+        // A lock cannot cover negative offsets, however it was spelled.
+        assert!(matches!(resolve_range(0, -1, 5), Err(LxError::EINVAL)));
+        assert!(matches!(resolve_range(10, -20, 5), Err(LxError::EINVAL)));
+        assert!(
+            matches!(resolve_range(0, 5, -10), Err(LxError::EINVAL)),
+            "a backwards range that runs off the front"
+        );
+    }
+
+    #[test]
+    fn a_start_that_leaves_the_range_of_an_offset_is_refused_not_wrapped() {
+        // `base + l_start` on two full i64s. Wrapping lands the lock at some
+        // small offset and it silently blocks an unrelated part of the file.
+        assert!(matches!(
+            resolve_range(1, i64::MAX, 0),
+            Err(LxError::EOVERFLOW)
+        ));
+        assert!(matches!(
+            resolve_range(i64::MAX, i64::MAX, 0),
+            Err(LxError::EOVERFLOW)
+        ));
+    }
+
+    #[test]
+    fn an_end_that_leaves_the_range_of_an_offset_is_refused_not_wrapped() {
+        assert!(matches!(
+            resolve_range(0, i64::MAX, i64::MAX),
+            Err(LxError::EOVERFLOW)
+        ));
+        assert!(matches!(
+            resolve_range(0, i64::MAX - 1, 2),
+            Err(LxError::EOVERFLOW)
+        ));
+        // One less and it fits exactly.
+        assert_eq!(
+            ok(0, i64::MAX - 1, 1),
+            ((i64::MAX - 1) as u64, i64::MAX as u64)
+        );
+    }
+
+    #[test]
+    fn the_most_negative_length_is_refused_rather_than_negated() {
+        // `-i64::MIN` is not representable: negating it overflows. This is
+        // the one a fuzzer finds first, and it is one `fcntl` call away from
+        // userspace.
+        assert!(resolve_range(0, 0, i64::MIN).is_err());
+        assert!(resolve_range(i64::MAX, 0, i64::MIN).is_err());
+        // And with a base that would make it land in range, it is still
+        // refused rather than wrapped to a positive length.
+        assert!(matches!(
+            resolve_range(0, i64::MAX, i64::MIN),
+            Err(LxError::EINVAL) | Err(LxError::EOVERFLOW)
+        ));
+    }
+
+    #[test]
+    fn a_backwards_range_that_leaves_the_offset_range_is_refused_not_wrapped() {
+        // `start + l_len` with a negative `l_len` can underflow just as the
+        // forward case overflows, and a wrap there comes back **positive**:
+        // a lock up near 2^63 that passes every later check and silently
+        // covers bytes nobody asked about. `l_whence` only ever hands this
+        // function a non-negative base today, so these values are not
+        // reachable from `fcntl`; this is the invariant the function owes
+        // its caller, and what a future `l_whence` case would break.
+        assert!(matches!(
+            resolve_range(i64::MIN, 0, -1),
+            Err(LxError::EOVERFLOW)
+        ));
+        assert!(matches!(
+            resolve_range(i64::MIN + 5, 0, -10),
+            Err(LxError::EOVERFLOW)
+        ));
+    }
+
+    #[test]
+    fn nothing_userspace_can_send_gets_through_unresolved() {
+        // Sweep the awkward values in all three fields: every combination
+        // has to come back as a range or an error, never a panic and never a
+        // range whose end is before its start.
+        let edges = [
+            i64::MIN,
+            i64::MIN + 1,
+            -4096,
+            -1,
+            0,
+            1,
+            4096,
+            i64::MAX - 1,
+            i64::MAX,
+        ];
+        for &base in &edges {
+            for &start in &edges {
+                for &len in &edges {
+                    if let Ok((s, e)) = resolve_range(base, start, len) {
+                        let where_ = || alloc::format!("base {} start {} len {}", base, start, len);
+                        assert!(s <= e, "{} gave [{}, {})", where_(), s, e);
+                        // Every byte of an accepted range has to be one an
+                        // `off_t` can name. A wrap lands inside `u64` but
+                        // outside that, which is how a silently relocated
+                        // lock would look.
+                        assert!(s <= i64::MAX as u64, "{} starts past off_t", where_());
+                        assert!(
+                            e <= i64::MAX as u64 || e == u64::MAX,
+                            "{} ends past off_t at {}",
+                            where_(),
+                            e
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn an_empty_range_is_never_produced_from_a_non_zero_length() {
+        // A zero-width lock conflicts with nothing, so a request that
+        // collapsed to one would silently do nothing at all.
+        for &len in &[1i64, 4096, -1, -4096] {
+            let (s, e) = ok(8192, 0, len);
+            assert!(e > s, "len {} collapsed to [{}, {})", len, s, e);
+        }
     }
 }

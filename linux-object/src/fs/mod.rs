@@ -71,6 +71,62 @@ lazy_static! {
 use zircon_object::{object::KernelObject, vm::VmObject};
 
 use crate::error::{LxError, LxResult};
+
+/// A file offset as userspace supplied it, or `EINVAL`.
+///
+/// `off_t` is **signed** in the uAPI, but the syscall ABI hands arguments
+/// over as raw machine words, so a negative offset arrives with its sign bit
+/// set and reads as an enormous positive number. Linux checks `pos < 0` and
+/// returns `EINVAL` before it touches the file; without that check a
+/// `pwrite(fd, buf, 1, -1)` reaches the filesystem as an offset of
+/// 2^64 - 1, and the filesystem below will try to honour it.
+pub fn user_offset(raw: u64) -> LxResult<u64> {
+    if (raw as i64) < 0 {
+        Err(LxError::EINVAL)
+    } else {
+        Ok(raw)
+    }
+}
+
+/// A file length as userspace supplied it, or `EINVAL`. Same reasoning as
+/// [`user_offset`]: `ftruncate(fd, -1)` would otherwise ask the filesystem
+/// to grow the file to sixteen exabytes.
+pub fn user_len(raw: usize) -> LxResult<usize> {
+    if (raw as isize) < 0 {
+        Err(LxError::EINVAL)
+    } else {
+        Ok(raw)
+    }
+}
+
+/// The exclusive end of a `[offset, offset + len)` window userspace named
+/// with an `off_t` and a count, or an error.
+///
+/// [`user_offset`] alone is not enough once a syscall *walks* a window rather
+/// than touching one position: `copy_file_range(2)` and `sendfile(2)` advance
+/// the offset by what they copied, and an offset that is a valid `off_t` on
+/// its own can still leave `off_t` before the copy ends. Linux checks both,
+/// with two different errnos (`generic_copy_file_checks`):
+///
+/// ```c
+/// if (unlikely(pos_in < 0 || pos_out < 0))                     return -EINVAL;
+/// if (unlikely((pos_in + count) < pos_in ||
+///              (pos_out + count) < pos_out))                   return -EOVERFLOW;
+/// ```
+///
+/// The wrap test is Linux's exactly, and it is **not** a ceiling of
+/// `i64::MAX`. A ceiling there would be stricter than Linux: it caps `count`
+/// itself further down instead, so `sendfile(out, in, NULL, SIZE_MAX)` -- the
+/// "copy everything" idiom -- is a call Linux accepts and clamps, and
+/// rejecting it here would break a program that works on Linux. The offset is
+/// already non-negative by then, so what the wrap test actually catches is a
+/// `count` with its top bit set: the same signed-argument hole again, this
+/// time in the length.
+pub fn user_offset_end(offset: u64, len: usize) -> LxResult<u64> {
+    let offset = user_offset(offset)?;
+    offset.checked_add(len as u64).ok_or(LxError::EOVERFLOW)
+}
+
 use crate::net::Socket;
 use crate::process::LinuxProcess;
 use devfs::RandomINode;
@@ -2367,6 +2423,47 @@ mod tests {
         assert_eq!(b[0], 0, "nothing comes back from before the truncate");
     }
 
+    /// `mmap`'s offset is a raw machine word from userspace, and it arrives
+    /// here in bytes, where the page cache adds it to the mapping length.
+    ///
+    /// `mmap(NULL, 4096, PROT_READ, MAP_SHARED, fd, 0xFFFFFFFFFFFFF000)` is
+    /// page-aligned, so the one check this path had let it through, and
+    /// `offset + len` wrapped to zero: a kernel panic in debug, and in release
+    /// a cache that claimed to cover a window it does not.
+    ///
+    /// The syscall layer rejects that offset now, but `get_vmo_shared` is a
+    /// trait method, so the invariant it owes its caller is asserted here:
+    /// whatever it returns, `off + len` must fit inside the VMO, because
+    /// `sys_mmap` computes `vmo.len() - off` from it.
+    #[async_std::test]
+    async fn a_mapping_offset_that_wraps_is_refused_not_wrapped() {
+        use super::{new_memfd, FileLike};
+        const PAGE: usize = 4096;
+        let f = new_memfd("hostile-offset", 0).unwrap();
+        f.set_len(4 * PAGE as u64).unwrap();
+        // Make the cache exist first: the wrap used to be *worse* on this arm,
+        // where a registered cache is returned for a window it cannot cover.
+        let (_warm, _) = f.get_vmo_shared(0, PAGE).unwrap();
+
+        for offset in [
+            usize::MAX - PAGE + 1,     // sum wraps to exactly 0
+            usize::MAX - 2 * PAGE + 1, // sum wraps to PAGE
+            usize::MAX / PAGE * PAGE,  // the highest page-aligned offset there is
+        ] {
+            assert_eq!(offset % PAGE, 0, "the offsets under test are aligned");
+            if let Ok((vmo, off)) = f.get_vmo_shared(offset, PAGE) {
+                assert!(
+                    off.checked_add(PAGE).is_some_and(|end| end <= vmo.len()),
+                    "get_vmo_shared({:#x}) returned off={:#x} for a vmo of {:#x}: \
+                     sys_mmap computes vmo.len() - off and would underflow",
+                    offset,
+                    off,
+                    vmo.len()
+                );
+            }
+        }
+    }
+
     /// A read fault on a shared object commits a real page (so a later write
     /// through another mapping is seen); a private one still gets the global
     /// zero frame.
@@ -2509,4 +2606,135 @@ pub fn rescan_partitions(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod user_argument_tests {
+    //! The syscall ABI hands every argument over as a raw machine word, so a
+    //! value that is **signed** in the uAPI arrives here with no sign left:
+    //! `-1` reads as `0xFFFF_FFFF_FFFF_FFFF`. Linux checks each of these for
+    //! a negative value and returns `EINVAL` before it touches the file.
+    //! Letting one through means a `pwrite` at offset 2^64 - 1 or an
+    //! `ftruncate` to sixteen exabytes, and the filesystem below will try to
+    //! honour it.
+
+    use super::*;
+
+    #[test]
+    fn a_negative_offset_is_refused() {
+        // These are the bit patterns userspace gets from passing -1, -2 and
+        // LONG_MIN as an `off_t`.
+        assert!(user_offset(u64::MAX).is_err());
+        assert!(user_offset(u64::MAX - 1).is_err());
+        assert!(user_offset(1u64 << 63).is_err());
+    }
+
+    #[test]
+    fn a_window_that_starts_negative_is_einval_not_eoverflow() {
+        // The start is checked first, and with the same errno as everywhere
+        // else: `copy_file_range` with a negative offset is a bad argument,
+        // not an arithmetic accident.
+        assert!(matches!(user_offset_end(u64::MAX, 1), Err(LxError::EINVAL)));
+        assert!(matches!(
+            user_offset_end(1u64 << 63, 0),
+            Err(LxError::EINVAL)
+        ));
+    }
+
+    #[test]
+    fn a_window_whose_length_wraps_it_is_eoverflow() {
+        // This is the case `user_offset` alone cannot see: the start is a
+        // perfectly legal `off_t` and the *length* is what is hostile. Since
+        // the offset is already non-negative here, a sum that wraps a `u64`
+        // means a `count` with its top bit set -- the signed-argument hole
+        // again, moved from the offset to the length. Linux answers EOVERFLOW,
+        // a different errno on purpose: the offset was fine, the window is
+        // not.
+        assert!(matches!(
+            user_offset_end(4096, usize::MAX),
+            Err(LxError::EOVERFLOW)
+        ));
+        assert!(matches!(
+            user_offset_end(1, usize::MAX),
+            Err(LxError::EOVERFLOW)
+        ));
+        // Exactly no wrap is still accepted: the boundary is the wrap itself.
+        assert_eq!(user_offset_end(1, usize::MAX - 1).unwrap(), u64::MAX);
+    }
+
+    #[test]
+    fn a_huge_but_finite_window_is_not_refused() {
+        // Deliberately NOT stricter than Linux. `sendfile(out, in, NULL,
+        // SIZE_MAX)` is how programs say "copy everything"; Linux clamps
+        // `count` further down rather than refusing it, so a window that ends
+        // above `i64::MAX` without wrapping has to be accepted here too.
+        let start = i64::MAX as u64 - 4096;
+        assert!(user_offset_end(start, 1 << 20).is_ok());
+        assert!(user_offset_end(i64::MAX as u64, 1).is_ok());
+    }
+
+    #[test]
+    fn an_ordinary_window_comes_back_as_its_end() {
+        assert_eq!(user_offset_end(0, 0).unwrap(), 0);
+        assert_eq!(user_offset_end(0, 4096).unwrap(), 4096);
+        assert_eq!(user_offset_end(1000, 24).unwrap(), 1024);
+    }
+
+    #[test]
+    fn the_refusal_is_einval() {
+        // `pread` returning the wrong errno sends libc down a different
+        // path; EBADF in particular would have a caller close the fd.
+        assert!(matches!(user_offset(u64::MAX), Err(LxError::EINVAL)));
+        assert!(matches!(user_len(usize::MAX), Err(LxError::EINVAL)));
+    }
+
+    #[test]
+    fn every_offset_a_file_can_really_have_is_accepted() {
+        // The boundary is the sign bit, not some smaller cap: a file offset
+        // is allowed all 63 bits.
+        assert_eq!(user_offset(0).unwrap(), 0);
+        assert_eq!(user_offset(1).unwrap(), 1);
+        assert_eq!(
+            user_offset(i64::MAX as u64).unwrap(),
+            i64::MAX as u64,
+            "the largest offset an off_t can name"
+        );
+        assert!(user_offset((1u64 << 63) - 1).is_ok());
+    }
+
+    #[test]
+    fn a_negative_length_is_refused() {
+        assert!(user_len(usize::MAX).is_err());
+        assert!(user_len(1usize << 63).is_err());
+    }
+
+    #[test]
+    fn a_zero_length_is_not_negative() {
+        // `ftruncate(fd, 0)` empties a file and is the single most common
+        // call; only `fallocate` treats zero as an error, and it does that
+        // itself.
+        assert_eq!(user_len(0).unwrap(), 0);
+    }
+
+    #[test]
+    fn every_length_a_file_can_really_have_is_accepted() {
+        assert_eq!(user_len(1).unwrap(), 1);
+        assert_eq!(user_len(isize::MAX as usize).unwrap(), isize::MAX as usize);
+    }
+
+    #[test]
+    fn the_two_checks_draw_the_line_in_the_same_place() {
+        // One is for `u64` and the other for `usize`, and on a 64-bit target
+        // they must agree, or a `pwrite` and an `ftruncate` would disagree
+        // about the same number.
+        for shift in 0..64u32 {
+            let v = 1u64 << shift;
+            assert_eq!(
+                user_offset(v).is_ok(),
+                user_len(v as usize).is_ok(),
+                "1 << {}",
+                shift
+            );
+        }
+    }
 }
