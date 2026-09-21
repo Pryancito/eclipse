@@ -123,8 +123,8 @@ fn arm_poller() {
     // this, only the eventfd path armed it — so a lone `sync_wait` on a
     // sync_file never saw the GPU land its fence and Zink killed the
     // swapchain (`zink: swapchain killed` → `GLXBadCurrentWindow`).
-    let interested = WAITER_COUNT.load(Ordering::Relaxed) > 0
-        || super::syncobj_file::pending_waiter_count() > 0;
+    let interested =
+        WAITER_COUNT.load(Ordering::Relaxed) > 0 || super::syncobj_file::pending_waiter_count() > 0;
     if !interested
         || !zcore_drivers::scheme::syncobj::has_pending()
         || POLLER_ARMED.swap(true, Ordering::AcqRel)

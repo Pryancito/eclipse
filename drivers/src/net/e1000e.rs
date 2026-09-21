@@ -106,8 +106,7 @@ fn e1000e_hash_mc_addr(mc_addr: &[u8; 6]) -> u32 {
     while hash_mask >> bit_shift != 0xFF {
         bit_shift += 1;
     }
-    hash_mask
-        & (((mc_addr[4] as u32) >> (8 - bit_shift)) | ((mc_addr[5] as u32) << bit_shift))
+    hash_mask & (((mc_addr[4] as u32) >> (8 - bit_shift)) | ((mc_addr[5] as u32) << bit_shift))
 }
 
 /// Pick the next ITR setting from traffic samples (pure; unit-tested).
@@ -1471,6 +1470,7 @@ impl E1000eHw {
         let strap = mmio_read(self.base, E1000E_STRAP);
         let nvm_size = ((((strap >> 1) & 0x1F) + 1) * 4096) as u32;
         let bank_words = (nvm_size / 2) / 2; // words per bank
+
         // Signature at word offset 0x13 of each bank; valid if (sig & 0xC0) == 0x80.
         if let Some(d) = self.flash_read_dword_spt(0x13 << 1) {
             let sig = ((d >> 8) & 0xFF) as u16;
@@ -1570,12 +1570,7 @@ impl E1000eHw {
         let _ = mmio_read(self.base, E1000E_RCTL);
     }
 
-    pub unsafe fn set_rx_mode(
-        &mut self,
-        promisc: bool,
-        allmulti: bool,
-        mc_addrs: &[[u8; 6]],
-    ) {
+    pub unsafe fn set_rx_mode(&mut self, promisc: bool, allmulti: bool, mc_addrs: &[[u8; 6]]) {
         self.rx_promisc = promisc;
         self.rx_allmulti = allmulti;
         self.mc_list.clear();
