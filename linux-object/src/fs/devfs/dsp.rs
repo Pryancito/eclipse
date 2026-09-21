@@ -585,7 +585,10 @@ impl DspDev {
     /// Client bytes queued in the device and not yet played, partial frame
     /// included (Linux `snd_pcm_oss_get_odelay`).
     fn odelay(&self, rt: &OssRuntime) -> usize {
-        rt.client_bytes(self.audio.queued_bytes()) + rt.partial_len
+        // Everything still to play before the last written byte, driver
+        // silence included: `snd_pcm_oss_get_odelay` adds the hardware's
+        // own delay to the queue for the same reason.
+        rt.client_bytes(self.audio.delay_bytes()) + rt.partial_len
     }
 
     /// Client bytes of whole frames a write would take right now without

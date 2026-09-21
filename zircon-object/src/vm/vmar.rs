@@ -2545,6 +2545,21 @@ impl VmMapping {
         }
     }
 
+    /// The backing object and the byte offset inside it that `vaddr` names,
+    /// or `None` when `vaddr` lies outside this mapping.
+    ///
+    /// This is the pair Linux calls "inode + offset", and it is what a futex
+    /// shared between processes has to be keyed by: two processes mapping the
+    /// same object at different addresses must land on the same kernel-side
+    /// queue. See `linux_object::sync::shared_futex`.
+    pub fn vmo_and_offset(&self, vaddr: VirtAddr) -> Option<(Arc<VmObject>, usize)> {
+        let inner = self.inner.lock();
+        if vaddr < inner.addr || vaddr >= inner.addr + inner.size {
+            return None;
+        }
+        Some((self.vmo.clone(), inner.vmo_offset + (vaddr - inner.addr)))
+    }
+
     /// query vaddr's PhysAddr, PhysAddr, PageSize.
     pub fn query_vaddr(&self, vaddr: usize) -> PagingResult<(PhysAddr, MMUFlags, PageSize)> {
         self.page_table.lock().query(vaddr)

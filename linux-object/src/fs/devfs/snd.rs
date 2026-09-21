@@ -1657,7 +1657,12 @@ impl PcmDev {
                     return Err(FsError::Broken);
                 }
                 drop(st);
-                unsafe { *(data as *mut i64) = self.queued_frames() as i64 };
+                // Frames until the last written one plays: the client's own
+                // queue plus whatever silence the driver has ahead of it
+                // (Linux adds `runtime->delay`, the hardware's own latency,
+                // the same way).
+                let delay = self.audio.delay_bytes() as u64 / BYTES_PER_FRAME;
+                unsafe { *(data as *mut i64) = delay as i64 };
                 Ok(0)
             }
             0x22 => {
@@ -1692,11 +1697,14 @@ impl PcmDev {
             0x40 => {
                 // PREPARE — also the recovery path out of XRUN, so the stall
                 // clock starts over with the freshly reset ring. Linux
-                // refuses it from OPEN (no hw_params yet) and while the
-                // stream is live.
+                // refuses it from OPEN (no hw_params yet, EBADFD) and while
+                // the stream is live (`snd_pcm_pre_prepare`: EBUSY).
                 let mut st = self.st.lock();
-                if matches!(st.state, STATE_OPEN | STATE_RUNNING | STATE_DRAINING) {
+                if st.state == STATE_OPEN {
                     return Err(FsError::BadState);
+                }
+                if matches!(st.state, STATE_RUNNING | STATE_DRAINING) {
+                    return Err(FsError::Busy);
                 }
                 let _ = self.audio.reset();
                 // The engine waits for start_threshold, or for START.
@@ -1717,12 +1725,18 @@ impl PcmDev {
             0x42 => {
                 // START: from PREPARED only (EBADFD otherwise), and a
                 // playback stream with nothing queued has nothing to start
-                // (EPIPE), as in Linux's `snd_pcm_pre_start`.
+                // (EPIPE) -- unless its stop_threshold sits at the boundary,
+                // in which case it is free-running and may start empty
+                // (`snd_pcm_pre_start` via `snd_pcm_playback_data`). That
+                // second half is what PulseAudio relies on: its sink sets
+                // both thresholds to the boundary, and an EPIPE here is
+                // logged and ignored, leaving the stream primed and held
+                // with nothing ever releasing it.
                 let mut st = self.st.lock();
                 if st.state != STATE_PREPARED {
                     return Err(FsError::BadState);
                 }
-                if self.queued_frames() == 0 {
+                if st.stop_threshold < st.boundary && self.queued_frames() == 0 {
                     return Err(FsError::Broken);
                 }
                 self.start_running(&mut st);
@@ -3120,8 +3134,17 @@ mod timer_tests {
             pcm.io_control(0x4140, 0).unwrap();
             let boundary = pcm.st.lock().boundary;
             set_sw(&pcm, |p| p.start_threshold = boundary);
-            // START with nothing queued is EPIPE, as in snd_pcm_pre_start.
+            // START with nothing queued is EPIPE, as in snd_pcm_pre_start...
             assert!(matches!(pcm.io_control(0x4142, 0), Err(FsError::Broken)));
+            // ...unless the stream is free-running (stop_threshold at the
+            // boundary, PulseAudio's setting), when it starts empty.
+            set_sw(&pcm, |p| p.stop_threshold = boundary);
+            pcm.io_control(0x4142, 0).unwrap();
+            assert_eq!(pcm.st.lock().state, STATE_RUNNING);
+            assert!(!audio.held());
+            pcm.io_control(0x4143, 0).unwrap(); // DROP
+            pcm.io_control(0x4140, 0).unwrap(); // PREPARE
+            set_sw(&pcm, |p| p.stop_threshold = 32);
             write(&pcm, 16);
             write(&pcm, 16);
             assert_eq!(pcm.st.lock().state, STATE_PREPARED);
@@ -3260,6 +3283,14 @@ mod timer_tests {
             pcm.io_control(0x4112, 0).unwrap();
             assert_eq!(pcm.st.lock().state, STATE_OPEN);
             assert!(matches!(pcm.io_control(0x4140, 0), Err(FsError::BadState)));
+        }
+
+        #[test]
+        fn prepare_on_a_running_stream_is_ebusy() {
+            let (_, pcm) = pcm(64);
+            pcm.io_control(0x4140, 0).unwrap();
+            write(&pcm, 8);
+            assert!(matches!(pcm.io_control(0x4140, 0), Err(FsError::Busy)));
         }
 
         #[test]

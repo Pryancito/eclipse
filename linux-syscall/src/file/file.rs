@@ -902,7 +902,7 @@ impl Syscall<'_> {
                             return Err(LxError::EINVAL);
                         }
                     };
-                    let dmabuf = DmaBuf::new(phys, size, vmo);
+                    let dmabuf = DmaBuf::from_prime(h.handle, phys, size, vmo);
                     let new_fd = match proc.add_file(dmabuf) {
                         Ok(fd) => fd,
                         Err(e) => {

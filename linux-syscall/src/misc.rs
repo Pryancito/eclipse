@@ -430,6 +430,61 @@ impl Syscall<'_> {
         }
     }
 
+    /// The `Futex` a process-shared futex word names, or `None` when this
+    /// word is not shared and the per-process table is the right home for it.
+    ///
+    /// Keyed by the pair Linux spells "inode + offset" -- the backing
+    /// `VmObject`'s koid and the byte offset of the word inside it -- so two
+    /// processes that map the same object at different addresses reach one
+    /// queue. The word itself is reached through the kernel's linear map of
+    /// the physical frame, never through either process's virtual address: the
+    /// `Futex` outlives any one address space, and the process doing the
+    /// `FUTEX_WAKE` is generally not the one that created it.
+    ///
+    /// Every failure here is a `None` that falls back to the per-process
+    /// table, which is exactly the behaviour this kernel had before.
+    #[allow(unsafe_code)]
+    fn shared_futex(&self, uaddr: usize) -> Option<Arc<zircon_object::signal::Futex>> {
+        use core::sync::atomic::AtomicI32;
+        use zircon_object::object::KernelObject;
+        use zircon_object::vm::MMUFlags;
+
+        if uaddr == 0 || !uaddr.is_multiple_of(core::mem::align_of::<AtomicI32>()) {
+            return None;
+        }
+        let vmar = self.zircon_process().vmar();
+        let mapping = vmar.find_mapping(uaddr)?;
+        let (vmo, offset) = mapping.vmo_and_offset(uaddr)?;
+        // A PRIVATE mapping keeps the per-process table even without the
+        // private flag: nobody else can observe that word, and sharing a queue
+        // across a copy-on-write split would be wrong.
+        if !vmo.is_shared_object() {
+            return None;
+        }
+        // Force the page resident before translating: a lazily mapped word has
+        // no page-table entry yet, and `query_vaddr` would simply fail.
+        let _ = vmar.handle_page_fault(uaddr, MMUFlags::READ);
+        let (paddr, flags, _) = mapping.query_vaddr(uaddr).ok()?;
+        // Empty flags mean "present in the tables with no permissions", which
+        // is how a guard page looks; there is nothing readable there.
+        if flags.is_empty() {
+            return None;
+        }
+        let kvaddr = kernel_hal::mem::phys_to_virt(paddr);
+        if kvaddr == 0 {
+            return None;
+        }
+        // Safe: `kvaddr` is the kernel's own linear-map address of a resident,
+        // 4-byte-aligned frame the table now holds an `Arc<VmObject>` on, so
+        // it stays mapped and owned for as long as the `Futex` can be reached.
+        let word: &'static AtomicI32 = unsafe { &*(kvaddr as *const AtomicI32) };
+        Some(linux_object::sync::shared_futex::intern(
+            (vmo.id(), offset),
+            vmo,
+            word,
+        ))
+    }
+
     /// provides a method for waiting until a certain condition becomes true.
     /// - `uaddr` - points to the futex word.
     /// - `op` -  the operation to perform on the futex
@@ -465,12 +520,6 @@ impl Syscall<'_> {
             "Futex uaddr: {:#x}, op: {:x}, val: {}, val2(timeout_addr): {:x}",
             uaddr, op, val, val2,
         );
-        if op & FUTEX_PRIVATE_FLAG == 0 {
-            // Futexes are per-process objects here, which is correct for
-            // private futexes and a usable approximation for shared ones
-            // within a single process (e.g. musl pthread_join passes priv=0).
-            debug!("process-shared futex is treated as process-private");
-        }
         // NOTE: do NOT parse `op` as bitflags — command values are an enum
         // (WAIT_BITSET=9 would alias WAKE=1 when bits are truncated).
         let cmd = op & !(FUTEX_PRIVATE_FLAG | FUTEX_CLOCK_REALTIME);
@@ -493,10 +542,20 @@ impl Syscall<'_> {
         // reproducible to the byte across boots, from PulseAudio.
         let word: UserInPtr<i32> = uaddr.into();
         word.check()?;
-        let futex = self
-            .linux_process()
-            .get_futex(uaddr)
-            .ok_or(LxError::EINVAL)?;
+        // A futex without FUTEX_PRIVATE_FLAG may name a word two DIFFERENT
+        // processes share, so it cannot be served from the per-process table.
+        // See `linux_object::sync::shared_futex` for why this is what every GL
+        // application under Xwayland hangs on when it is missing.
+        let futex = match (op & FUTEX_PRIVATE_FLAG == 0)
+            .then(|| self.shared_futex(uaddr))
+            .flatten()
+        {
+            Some(futex) => futex,
+            None => self
+                .linux_process()
+                .get_futex(uaddr)
+                .ok_or(LxError::EINVAL)?,
+        };
         match cmd {
             // ── Priority-inheritance lock ops: LOCK_PI / LOCK_PI2 / TRYLOCK_PI ──
             //

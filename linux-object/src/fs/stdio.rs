@@ -111,6 +111,10 @@ struct TtyState {
     /// deliver `relsig` on a switch away and `acqsig` on a switch back,
     /// Linux-style (see [`request_vt_switch`]).
     vt_owner: AtomicU64,
+    /// Double-Ctrl-C arm: first VINTR for a pgrp stores it here; a second
+    /// VINTR for the same pgrp escalates to SIGKILL (see
+    /// [`crate::process::interrupt_or_force_pgrp`]).
+    ctrl_c_armed_pgid: AtomicI32,
 }
 
 lazy_static! {
@@ -123,6 +127,7 @@ lazy_static! {
             kbd_leds: AtomicU8::new(0),
             flow_stopped: AtomicBool::new(false),
             vt_owner: AtomicU64::new(0),
+            ctrl_c_armed_pgid: AtomicI32::new(0),
         })
         .collect();
 }
@@ -358,7 +363,11 @@ fn tty_ioctl(vt: usize, cmd: u32, data: usize) -> Result<usize> {
         }
         TIOCSPGRP => {
             let pgid = unsafe { *(data as *const i32) };
-            tty_fg_pgrp(vt).store(pgid, Ordering::Relaxed);
+            let vt_i = vt_clamp(vt);
+            let old = tty_fg_pgrp(vt).swap(pgid, Ordering::Relaxed);
+            if old != pgid {
+                crate::process::clear_interrupt_arm(&TTY_STATES[vt_i].ctrl_c_armed_pgid);
+            }
             Ok(0)
         }
         TIOCGPGRP => {
@@ -1408,21 +1417,29 @@ impl Stdin {
             if cc_match(&c_cc, VINTR, c as u8) {
                 ctrl_c_pending_set();
                 let pgid = tty_fg_pgrp(self.vt).load(Ordering::Relaxed);
-                if pgid > 0 {
-                    // Whole foreground group, not just the leader — otherwise a
-                    // shell child like `ping` never sees the Ctrl-C.
-                    let _ = crate::process::send_signal_to_pgrp(
-                        pgid as usize,
-                        crate::signal::Signal::SIGINT,
-                    );
-                }
+                let vt_i = vt_clamp(self.vt);
+                let sent = if pgid > 0 {
+                    // First Ctrl-C → SIGINT; second for the same pgrp → SIGKILL
+                    // so a hung glxgears/etc. can be torn down without closing
+                    // the terminal.
+                    crate::process::interrupt_or_force_pgrp(
+                        pgid,
+                        &TTY_STATES[vt_i].ctrl_c_armed_pgid,
+                    )
+                } else {
+                    crate::signal::Signal::SIGINT
+                };
                 if lflag & NOFLSH == 0 {
                     self.buf.lock().clear();
                     self.canon_buf.lock().clear();
                     self.eof_pending.store(false, Ordering::Release);
                 }
                 if lflag & ECHO != 0 {
-                    self.echo("^C\n");
+                    if sent == crate::signal::Signal::SIGKILL {
+                        self.echo("^C (killed)\n");
+                    } else {
+                        self.echo("^C\n");
+                    }
                 }
                 // Wake waiters without latching READABLE on an empty queue
                 // (that caused busy-loops in blocking `read`).
@@ -2106,6 +2123,7 @@ mod line_discipline_tests {
         *tty_termios(VT).lock() = t;
         TTY_STATES[VT].flow_stopped.store(false, Ordering::Relaxed);
         TTY_STATES[VT].fg_pgrp.store(0, Ordering::Relaxed);
+        crate::process::clear_interrupt_arm(&TTY_STATES[VT].ctrl_c_armed_pgid);
         ctrl_c_pending_take();
         Stdin::new(VT)
     }

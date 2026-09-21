@@ -3321,10 +3321,26 @@ impl XhciInner {
             );
         }
         if real_proto == HID_PROTO_TABLET {
-            warn!(
-                "[xhci] absolute USB pointer slot={} vid={:04x} pid={:04x}",
-                slot, vid, pid
-            );
+            if is_vm_abs_tablet(vid, pid, proto) {
+                warn!(
+                    "[xhci] absolute USB pointer slot={} vid={:04x} pid={:04x} (VM tablet)",
+                    slot, vid, pid
+                );
+            } else {
+                // The tablet arm of `dispatch_hid` decodes exactly two
+                // layouts, QEMU's and VirtualBox's. A real absolute device --
+                // a digitizer, a touchscreen, a gamepad -- is not either of
+                // them, so its reports are decoded as whichever of those two
+                // it is not, and the cursor jumps. Error level because that is
+                // the only level a rig booted with `LOG=error` prints, and
+                // because this is the line that says which device to unplug.
+                error!(
+                    "[xhci] slot={} vid={:04x} pid={:04x} iface={} declares ABSOLUTE X/Y but is \
+                     not a VM tablet: its reports are decoded with a VM layout and will be \
+                     meaningless. Relative pointers are NOT affected.",
+                    slot, vid, pid, iface
+                );
+            }
         }
         self.refresh_abs_pointer();
         Ok(())
@@ -4445,69 +4461,107 @@ impl Scheme for XhciUsbHid {
     }
 }
 
+/// Build one `EVIOCGBIT` bitmap for this scheme's evdev node.
+///
+/// Split out of `capability()` so every combination of the three inputs is
+/// testable: the node is one device that can carry a keyboard, a relative
+/// mouse and an absolute tablet at once, and the combinations that bite are
+/// exactly the ones no VM ever produces.
+///
+/// * `vm_tablet` — a VM absolute tablet currently owns the pointer
+///   ([`USB_ABS_POINTER`]). This, and ONLY this, suppresses the relative axes.
+///   It used to be `tablet` below, which is true for *any* HID interface whose
+///   report descriptor declares absolute X and Y. In a VM that is only ever the
+///   emulated tablet, but on real hardware a gamepad, a digitizer, a
+///   touchscreen or a mouse's own vendor interface declares absolute axes too
+///   — and any one of them then took `EV_REL` off the node for the whole
+///   session. The keyboard kept working and the pointer was dead, in X11 and
+///   in Wayland alike, because both read these bitmaps and neither will
+///   deliver an event of a type the device does not declare. `USB_ABS_POINTER`
+///   was narrowed to real VM tablets (`is_vm_abs_tablet`) precisely because
+///   the same over-broad test silenced every relative pointer; this is the
+///   place that was left behind.
+/// * `rel_mouse` — a relative mouse is bound right now.
+/// * `tablet` — an absolute interface is bound, so the node really does
+///   deliver `ABS_X`/`ABS_Y`.
+fn hid_capability(
+    cap_type: CapabilityType,
+    vm_tablet: bool,
+    rel_mouse: bool,
+    tablet: bool,
+) -> InputCapability {
+    let mut cap = InputCapability::empty();
+    // Advertise a relative pointer whenever no VM tablet owns the pointer,
+    // even before a mouse has finished USB enumeration. libinput reads these
+    // capabilities ONCE, when it opens the evdev node, and on real hardware
+    // the compositor can open it before the mouse enumerates.
+    let want_rel = !vm_tablet || rel_mouse;
+    // Every REL code advertised below, the wheel included. A tablet reports a
+    // wheel of its own (`dispatch_hid`'s tablet arm calls `emit_scroll`), so
+    // the wheel axes are live even when the pointer axes are not.
+    let want_wheel = want_rel || tablet;
+    match cap_type {
+        CapabilityType::Event => {
+            cap.set_all(&[EV_SYN, EV_KEY]);
+            // EV_REL must be here whenever ANY REL code is advertised below.
+            // It used to be set only for `want_rel`, while the wheel axes were
+            // set for `want_rel || tablet`: a tablet-only node therefore
+            // listed REL_WHEEL in a bitmap nothing would ever read, because
+            // libevdev only asks for the REL codes of a device whose type
+            // bitmap claims EV_REL. Every wheel event the tablet arm emitted
+            // was then dropped before it reached the compositor -- which is
+            // the entire "the mouse wheel does not work", in the one
+            // configuration every QEMU run uses (`-device usb-tablet`).
+            if want_wheel {
+                cap.set(EV_REL);
+            }
+            if tablet {
+                cap.set(EV_ABS);
+            }
+        }
+        CapabilityType::Key => {
+            // Advertise the full keyboard keycode block plus the mouse
+            // buttons this HID scheme can emit. libinput builds the
+            // device's key set from EVIOCGBIT(EV_KEY) and DROPS any key
+            // event whose code is not in this bitmap.
+            for code in KEY_ESC..=KEY_MICMUTE {
+                cap.set(code);
+            }
+            cap.set_all(&[BTN_LEFT, BTN_RIGHT, BTN_MIDDLE, BTN_SIDE, BTN_EXTRA]);
+        }
+        CapabilityType::RelAxis => {
+            if want_rel {
+                cap.set_all(&[REL_X, REL_Y]);
+            }
+            // The hi-res axes go in alongside the low-res ones because
+            // `emit_scroll` emits both. Advertising one without the other
+            // is the one combination that breaks scrolling outright:
+            // libinput only synthesises hi-res events for a device that
+            // does NOT claim the axis, so a claimed-but-silent
+            // REL_WHEEL_HI_RES would leave its wheel state machine with
+            // nothing to integrate.
+            if want_wheel {
+                cap.set_all(&[REL_WHEEL, REL_HWHEEL, REL_WHEEL_HI_RES, REL_HWHEEL_HI_RES]);
+            }
+        }
+        CapabilityType::AbsAxis if tablet => cap.set_all(&[ABS_X, ABS_Y]),
+        CapabilityType::InputProp if tablet => cap.set(INPUT_PROP_POINTER),
+        _ => {}
+    }
+    cap
+}
+
 impl InputScheme for XhciUsbHid {
     fn capability(&self, cap_type: CapabilityType) -> InputCapability {
-        let mut cap = InputCapability::empty();
-        let tablet = self.has_tablet();
-        let rel_mouse = self.has_rel_mouse();
-        // Advertise a relative pointer whenever no absolute tablet owns the
-        // pointer, even before a mouse has finished USB enumeration. libinput
-        // reads these capabilities ONCE, when it opens the evdev node, and on
-        // real hardware the compositor can open it before the mouse enumerates.
-        // Gating EV_REL on has_rel_mouse() then left the node a keyboard-only
-        // device for the rest of the session — the cursor was drawn but never
-        // moved while the keyboard worked. QEMU passes `usb-tablet`, so `tablet`
-        // is true there and the absolute path is unchanged.
-        let want_rel = !tablet || rel_mouse;
-        match cap_type {
-            CapabilityType::Event => {
-                cap.set_all(&[EV_SYN, EV_KEY]);
-                if want_rel {
-                    cap.set(EV_REL);
-                }
-                if tablet {
-                    cap.set(EV_ABS);
-                }
-            }
-            CapabilityType::Key => {
-                // Advertise the full keyboard keycode block plus the mouse
-                // buttons this HID scheme can emit. libinput builds the
-                // device's key set from EVIOCGBIT(EV_KEY) and DROPS any key
-                // event whose code is not in this bitmap. The previous list
-                // named only a sparse sample of keys (KEY_A and KEY_Z as if
-                // they were range endpoints, KEY_0/KEY_9, KEY_F1/KEY_F12) and
-                // NONE of the keys in between — so the compositor only ever
-                // received the handful of explicitly-listed keys (notably just
-                // 'a' among the letters). `hid_usage_to_linux` maps HID usages
-                // across the whole 1..=248 keyboard range, so advertise all of
-                // it, exactly as a real keyboard does.
-                for code in KEY_ESC..=KEY_MICMUTE {
-                    cap.set(code);
-                }
-                if want_rel || tablet {
-                    cap.set_all(&[BTN_LEFT, BTN_RIGHT, BTN_MIDDLE, BTN_SIDE, BTN_EXTRA]);
-                }
-            }
-            CapabilityType::RelAxis => {
-                // The hi-res axes go in alongside the low-res ones because
-                // `emit_scroll` emits both. Advertising one without the other
-                // is the one combination that breaks scrolling outright:
-                // libinput only synthesises hi-res events for a device that
-                // does NOT claim the axis, so a claimed-but-silent
-                // REL_WHEEL_HI_RES would leave its wheel state machine with
-                // nothing to integrate.
-                if want_rel {
-                    cap.set_all(&[REL_X, REL_Y]);
-                }
-                if want_rel || tablet {
-                    cap.set_all(&[REL_WHEEL, REL_HWHEEL, REL_WHEEL_HI_RES, REL_HWHEEL_HI_RES]);
-                }
-            }
-            CapabilityType::AbsAxis if tablet => cap.set_all(&[ABS_X, ABS_Y]),
-            CapabilityType::InputProp if tablet => cap.set(INPUT_PROP_POINTER),
-            _ => {}
-        }
-        cap
+        hid_capability(
+            cap_type,
+            // Only a VM tablet takes the relative axes away -- NOT any
+            // interface that happens to declare absolute X/Y. See
+            // `hid_capability`.
+            USB_ABS_POINTER.load(Ordering::Relaxed),
+            self.has_rel_mouse(),
+            self.has_tablet(),
+        )
     }
 
     fn abs_info(&self, axis: u16) -> Option<AbsInfo> {
@@ -5077,5 +5131,114 @@ mod tests {
         // Stall Error and Babble do halt it.
         assert!(cc_halts_endpoint(6));
         assert!(cc_halts_endpoint(3));
+    }
+
+    /// Every event CODE a device advertises has to have its event TYPE in the
+    /// `EVIOCGBIT(0)` bitmap. libevdev asks for a type's code bitmap only when
+    /// that type is set, and neither X11 nor Wayland will deliver an event of
+    /// a type the device never declared -- so a code advertised under a
+    /// missing type is not merely untidy, it is silently dropped input.
+    fn assert_types_cover_codes(vm_tablet: bool, rel_mouse: bool, tablet: bool) {
+        let types = hid_capability(CapabilityType::Event, vm_tablet, rel_mouse, tablet);
+        for (ev, cap_type) in [
+            (EV_KEY, CapabilityType::Key),
+            (EV_REL, CapabilityType::RelAxis),
+            (EV_ABS, CapabilityType::AbsAxis),
+        ] {
+            let codes = hid_capability(cap_type, vm_tablet, rel_mouse, tablet);
+            let any_code = (0u16..1024).any(|c| codes.contains(c));
+            if any_code {
+                assert!(
+                    types.contains(ev),
+                    "vm_tablet={} rel_mouse={} tablet={}: codes for ev {:#x} \
+                     advertised without the type",
+                    vm_tablet,
+                    rel_mouse,
+                    tablet,
+                    ev
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_type_bitmap_covers_every_code_bitmap_in_every_configuration() {
+        for vm_tablet in [false, true] {
+            for rel_mouse in [false, true] {
+                for tablet in [false, true] {
+                    assert_types_cover_codes(vm_tablet, rel_mouse, tablet);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_vm_tablet_still_advertises_a_wheel_it_can_use() {
+        // `-device usb-tablet` is what every QEMU run uses, and the tablet arm
+        // of `dispatch_hid` does emit REL_WHEEL. EV_REL used to be missing
+        // here, so those events were dropped: the wheel could not work in the
+        // one configuration anyone ever ran.
+        let types = hid_capability(CapabilityType::Event, true, false, true);
+        assert!(types.contains(EV_REL), "a wheel needs EV_REL");
+        assert!(types.contains(EV_ABS));
+        let rel = hid_capability(CapabilityType::RelAxis, true, false, true);
+        assert!(rel.contains(REL_WHEEL) && rel.contains(REL_WHEEL_HI_RES));
+        // The pointer axes stay off, so libinput still classifies it absolute.
+        assert!(!rel.contains(REL_X) && !rel.contains(REL_Y));
+    }
+
+    #[test]
+    fn a_gamepad_does_not_take_the_pointer_away_on_real_hardware() {
+        // A gamepad, a digitizer or a touchscreen all declare absolute X/Y, so
+        // `tablet` is true for them on metal -- but none of them owns the
+        // pointer, so `USB_ABS_POINTER` (vm_tablet) is false. The node must
+        // still be a relative pointer, or the cursor is dead in X11 and
+        // Wayland at once while the keyboard keeps working.
+        let types = hid_capability(CapabilityType::Event, false, false, true);
+        assert!(types.contains(EV_REL), "the pointer must survive a gamepad");
+        let rel = hid_capability(CapabilityType::RelAxis, false, false, true);
+        assert!(rel.contains(REL_X) && rel.contains(REL_Y));
+        let key = hid_capability(CapabilityType::Key, false, false, true);
+        assert!(
+            key.contains(BTN_LEFT),
+            "a pointer with no buttons is rejected"
+        );
+    }
+
+    #[test]
+    fn a_plain_mouse_and_keyboard_box_advertises_both_roles() {
+        let types = hid_capability(CapabilityType::Event, false, true, false);
+        assert!(types.contains(EV_SYN) && types.contains(EV_KEY) && types.contains(EV_REL));
+        assert!(!types.contains(EV_ABS));
+        let rel = hid_capability(CapabilityType::RelAxis, false, true, false);
+        for code in [
+            REL_X,
+            REL_Y,
+            REL_WHEEL,
+            REL_HWHEEL,
+            REL_WHEEL_HI_RES,
+            REL_HWHEEL_HI_RES,
+        ] {
+            assert!(rel.contains(code), "missing rel code {:#x}", code);
+        }
+        let key = hid_capability(CapabilityType::Key, false, true, false);
+        assert!(key.contains(KEY_A) && key.contains(KEY_Z) && key.contains(BTN_LEFT));
+    }
+
+    #[test]
+    fn the_relative_axes_never_appear_without_each_other() {
+        // libinput's `evdev_reject_device` throws the WHOLE device away when
+        // REL_X and REL_Y disagree, or ABS_X and ABS_Y do -- keyboard
+        // included.
+        for vm_tablet in [false, true] {
+            for rel_mouse in [false, true] {
+                for tablet in [false, true] {
+                    let rel = hid_capability(CapabilityType::RelAxis, vm_tablet, rel_mouse, tablet);
+                    assert_eq!(rel.contains(REL_X), rel.contains(REL_Y));
+                    let abs = hid_capability(CapabilityType::AbsAxis, vm_tablet, rel_mouse, tablet);
+                    assert_eq!(abs.contains(ABS_X), abs.contains(ABS_Y));
+                }
+            }
+        }
     }
 }

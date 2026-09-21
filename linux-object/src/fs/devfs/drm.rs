@@ -1039,6 +1039,52 @@ pub fn nouveau_gem_add_ref(handle: u32) -> Option<u32> {
     zcore_drivers::scheme::gem_mmap::add_ref(handle, current_pid())
 }
 
+/// Holder id a live dma-buf fd records against a nouveau GEM object. Re-export
+/// of [`zcore_drivers::scheme::gem_mmap::DMABUF_HOLDER`] so the syscall layer
+/// and `DmaBuf` do not need a direct drivers dependency for the sentinel.
+pub const DMABUF_HOLDER: u64 = zcore_drivers::scheme::gem_mmap::DMABUF_HOLDER;
+
+/// Take the dma-buf's reference on a nouveau GEM object at `PRIME_HANDLE_TO_FD`
+/// time. No-op for low-range (dumb/generic) handles — those stay alive via the
+/// `Arc<VmObject>` the dma-buf already holds. See `DMABUF_HOLDER`.
+pub fn dmabuf_take_gem_ref(handle_id: u32) {
+    if handle_id < zcore_drivers::scheme::gem_mmap::DRIVER_HANDLE_BASE {
+        return;
+    }
+    let n = zcore_drivers::scheme::gem_mmap::add_ref(handle_id, DMABUF_HOLDER);
+    if n.is_none() {
+        // Export of a handle that is not in gem_mmap: either it was never a
+        // nouveau object, or it was already freed under us. The export path
+        // itself will have failed `lookup_for` before reaching here for the
+        // latter; this is a belt-and-braces log for the former.
+        log::debug!(
+            "[drm] dmabuf_take_gem_ref handle={:#x}: not tracked in gem_mmap",
+            handle_id
+        );
+    }
+}
+
+/// Release the reference [`dmabuf_take_gem_ref`] took, freeing the GEM object
+/// when it was the last one. Routed through the driver's `GEM_CLOSE` so the
+/// last close also drains VM_BIND mappings and returns memory to the RM —
+/// same contract as [`fb_drop_gem_ref`].
+pub fn dmabuf_drop_gem_ref(handle_id: u32) {
+    if handle_id < zcore_drivers::scheme::gem_mmap::DRIVER_HANDLE_BASE {
+        return;
+    }
+    if zcore_drivers::scheme::gem_mmap::lookup(handle_id).is_none() {
+        return;
+    }
+    match get_primary_driver() {
+        Some(driver) => {
+            driver.nouveau_gem_close(handle_id, DMABUF_HOLDER);
+        }
+        None => {
+            zcore_drivers::scheme::gem_mmap::dec_ref(handle_id, DMABUF_HOLDER);
+        }
+    }
+}
+
 /// The holder id a KMS framebuffer's own reference on a nouveau GEM object is
 /// recorded under.
 ///
@@ -2178,12 +2224,27 @@ pub fn scanout_region_checked(
         snap
     };
     if let Some((cx, cy, cw, ch, bmp)) = cursor {
+        let cursor_pitch_px = (src_stride as u32).min(info.pitch() / 4).max(fb_width);
         // CE-direct skipped the full-frame FromDevice. Invalidate just the
         // cursor window so the CPU blend sees GPU pixels; counted in cursor
         // time, not `sync`, so the klog keeps showing ~0us sync on CE.
         if blitted_by_ce && !cpu_src_synced && gem_cpu_mapped {
+            // Widened for the same reason as the invalidate in
+            // `repaint_for_cursor`: `blit_cursor_patch` reads out to the
+            // write-combining boundary and to the row pitch, so invalidating
+            // only `cw` columns clipped to `fb_width` leaves the margins it
+            // reads coming from stale cache lines.
+            let (ex, ew) = expand_x_for_wc(cx.max(0) as u32, cw, cursor_pitch_px);
             dma_sync_gem_rect_from_device(
-                vaddr, fb.size, src_stride, cx, cy, cw, ch, fb_width, fb_height,
+                vaddr,
+                fb.size,
+                src_stride,
+                ex as i32,
+                cy,
+                ew,
+                ch,
+                cursor_pitch_px,
+                fb_height,
             );
         }
         // Clip to what the framebuffer covers (`fb_width`/`fb_height`), not to
@@ -2479,10 +2540,40 @@ pub fn repaint_for_cursor() {
     // not the full-frame clflush -- it is the cost `scanout()` already pays per
     // present, restricted to the two windows a move touches.
     let gem_cpu_mapped = zcore_drivers::scheme::gem_mmap::lookup(fb.gem_handle_id).is_some();
+    // Invalidate exactly what the blit will READ, which is wider than the rect
+    // asked for. `restore_rect` and `blit_cursor_patch` both widen x to the
+    // 16-pixel write-combining boundary and cap it at the row pitch, not at
+    // the visible width -- so up to 15 columns on each side, plus any pitch
+    // padding, were being read without ever being invalidated.
+    //
+    // CLFLUSH covers whole 64-byte lines, which is 16 pixels, so on a
+    // framebuffer whose stride is a multiple of 16 pixels the widened columns
+    // happen to fall inside the lines the unexpanded rect already flushed and
+    // nothing goes wrong. At any other stride the row base is not line-aligned
+    // and they do not: each row reads a different slice of stale cache. That is
+    // the failure the comment above describes -- the pointer dragging stale
+    // squares of an older frame -- and it only shows where the GPU recently
+    // rewrote those pixels, so a flat wallpaper hides it and a window shadow
+    // (a gradient, freshly composited) does not.
+    let sync_pitch_px = (src_stride as u32).min(info.pitch() / 4).max(fw);
     let sync_rect = |x: i32, y: i32, w: u32, h: u32| {
-        if gem_cpu_mapped {
-            dma_sync_gem_rect_from_device(vaddr, fb.size, src_stride, x, y, w, h, fw, fh);
+        if !gem_cpu_mapped {
+            return;
         }
+        let x0 = x.max(0) as u32;
+        let x1 = (x + w as i32).max(0) as u32;
+        let (ex, ew) = expand_x_for_wc(x0, x1.saturating_sub(x0), sync_pitch_px);
+        dma_sync_gem_rect_from_device(
+            vaddr,
+            fb.size,
+            src_stride,
+            ex as i32,
+            y,
+            ew,
+            h,
+            sync_pitch_px,
+            fh,
+        );
     };
     // Compose in cached sysmem (the CRTC dumb buffer), then one write-only
     // blit to GOP. Never read the display aperture: that RMW is why the
@@ -5869,5 +5960,94 @@ mod blanking_and_atomic_rollback_tests {
         let mut state = DRM_STATE.lock();
         state.crtc_fb = 0;
         state.atomic = AtomicKmsState::default();
+    }
+}
+
+#[cfg(test)]
+mod cursor_invalidate_tests {
+    use super::expand_x_for_wc;
+
+    /// The byte range a CLFLUSH loop over `[start, start + len)` actually
+    /// evicts: whole 64-byte lines, so it reaches down to the line containing
+    /// `start` and up to the one containing the last byte.
+    fn flushed_lines(start: usize, len: usize) -> (usize, usize) {
+        assert!(len > 0);
+        (start - start % 64, (start + len).div_ceil(64) * 64)
+    }
+
+    /// Bytes `blit_cursor_patch` / `restore_rect` read on row `r`, given the
+    /// rect they were handed. Both widen x the same way before reading.
+    fn read_span(row: usize, stride_px: usize, x: u32, w: u32, pitch_px: u32) -> (usize, usize) {
+        let (ex, ew) = expand_x_for_wc(x, w, pitch_px);
+        let start = (row * stride_px + ex as usize) * 4;
+        (start, start + ew as usize * 4)
+    }
+
+    /// Bytes the invalidate covers on row `r` for the rect it was handed.
+    fn sync_span(row: usize, stride_px: usize, x: u32, w: u32) -> (usize, usize) {
+        let start = (row * stride_px + x as usize) * 4;
+        (start, start + w as usize * 4)
+    }
+
+    /// Strides that are NOT a multiple of 16 pixels are the interesting ones:
+    /// there the row base is not 64-byte aligned, so widening x to the
+    /// write-combining boundary walks into cache lines the unexpanded rect
+    /// never touched. 1366 is the classic panel width (5464 bytes = 8 mod 16).
+    const STRIDES: [usize; 4] = [1366, 1367, 1376, 1920];
+    const CURSOR_W: u32 = 64;
+
+    #[test]
+    fn the_invalidate_covers_every_column_the_cursor_blit_reads() {
+        for stride in STRIDES {
+            let pitch_px = stride as u32;
+            for x in 0..48u32 {
+                for row in [0usize, 1, 2, 7, 33] {
+                    let (rd0, rd1) = read_span(row, stride, x, CURSOR_W, pitch_px);
+                    // What the fixed code invalidates: the same widened span.
+                    let (ex, ew) = expand_x_for_wc(x, CURSOR_W, pitch_px);
+                    let (sy0, sy1) = sync_span(row, stride, ex, ew);
+                    let (f0, f1) = flushed_lines(sy0, sy1 - sy0);
+                    assert!(
+                        f0 <= rd0 && f1 >= rd1,
+                        "stride={} x={} row={}: flushed [{},{}) does not cover read [{},{})",
+                        stride,
+                        x,
+                        row,
+                        f0,
+                        f1,
+                        rd0,
+                        rd1
+                    );
+                }
+            }
+        }
+    }
+
+    /// The bug this replaced: invalidating the rect as asked for, while the
+    /// blit reads the widened one. On a stride that is not a multiple of 16
+    /// pixels there are rows where the flushed lines fall short -- those are
+    /// the columns that came back as stale cache and got painted to screen.
+    #[test]
+    fn the_unexpanded_invalidate_left_columns_unflushed() {
+        let mut short = 0;
+        for stride in STRIDES {
+            let pitch_px = stride as u32;
+            for x in 0..48u32 {
+                for row in 0..64usize {
+                    let (rd0, rd1) = read_span(row, stride, x, CURSOR_W, pitch_px);
+                    // What the old code invalidated: the rect as handed in.
+                    let (sy0, sy1) = sync_span(row, stride, x, CURSOR_W);
+                    let (f0, f1) = flushed_lines(sy0, sy1 - sy0);
+                    if f0 > rd0 || f1 < rd1 {
+                        short += 1;
+                    }
+                }
+            }
+        }
+        assert!(
+            short > 0,
+            "expected the unexpanded invalidate to fall short somewhere; \
+             if this fires, the widening is no longer load-bearing"
+        );
     }
 }
