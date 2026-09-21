@@ -869,9 +869,22 @@ fn force_fault_signal(thread: &CurrentThread, signal: Signal) {
             || action.handler == SIG_IGN
     };
     if undeliverable {
-        warn!(
-            "[exit] pid={} killed by fault signal {:?} ({}) — undeliverable, terminating",
+        // error!, not warn!, and for the same reason the sibling path above
+        // spells out: this is a process DYING, and at `LOG=error` — what a
+        // desktop actually boots with — a warn! line is not printed at all.
+        // So the loudest case of all, a fault the process had no handler for,
+        // was the one that vanished without a trace: the program's window
+        // disappears, nothing reaches the console, and the only evidence left
+        // is a shell exit status nobody is watching. That is exactly how
+        // "glxgears opens for under a second and then closes with no apparent
+        // errors" looks from the outside.
+        //
+        // The process name goes in too, as it does above: a bare pid says
+        // nothing when the question is *which* program just died.
+        error!(
+            "[exit] pid={} ({}) killed by fault signal {:?} ({}) — undeliverable, terminating",
             thread.proc().id(),
+            thread.proc().name(),
             signal,
             signal as i32,
         );
