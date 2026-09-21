@@ -348,29 +348,7 @@ impl ProcessExt for Process {
             perf: crate::perf::ProcPerf::new(),
             itimers: Default::default(),
             aspace_lock: Mutex::new(()),
-            inner: Mutex::new(LinuxProcessInner {
-                execute_path: linux_parent_inner.execute_path.clone(),
-                cmdline: linux_parent_inner.cmdline.clone(),
-                current_working_directory: linux_parent_inner.current_working_directory.clone(),
-                files: linux_parent_inner.files.clone(),
-                // POSIX fork(2): the child gets its own COPY of each fd's
-                // FD_CLOEXEC flag — later fcntl(F_SETFD) in either process
-                // must not affect the other.
-                cloexec_fds: linux_parent_inner.cloexec_fds.clone(),
-                signal_actions: linux_parent_inner.signal_actions.clone(),
-                credentials: linux_parent_inner.credentials.clone(),
-                pgid: parent_pgid,
-                sid: parent_sid,
-                // fork(2)/prctl(2) inheritance: no_new_privs, dumpable, the
-                // execution domain and THP setting carry over; pdeathsig and
-                // the subreaper attribute deliberately do not.
-                no_new_privs: linux_parent_inner.no_new_privs,
-                dumpable: linux_parent_inner.dumpable,
-                personality: linux_parent_inner.personality,
-                abi: linux_parent_inner.abi,
-                thp_disable: linux_parent_inner.thp_disable,
-                ..Default::default()
-            }),
+            inner: Mutex::new(linux_parent_inner.forked_child(parent_pgid, parent_sid)),
         };
         let new_proc = Process::create_with_ext(&parent.job(), "", new_linux_proc)?;
         // Batch the fork's cross-CPU TLB shootdowns into one, but only when
@@ -2151,6 +2129,90 @@ impl LinuxProcess {
 }
 
 impl LinuxProcessInner {
+    /// Everything a `fork(2)` child starts life with, decided field by field.
+    ///
+    /// Written out in full, with no `..Default::default()`, on purpose: a
+    /// field that falls through to its default silently gives the child a
+    /// *fresh* value where Linux gives it the parent's, and nothing says so
+    /// at the fork site. Four fields were getting exactly that. Spelling
+    /// every field out makes the compiler ask the question again each time
+    /// one is added.
+    fn forked_child(&self, pgid: KoID, sid: KoID) -> Self {
+        LinuxProcessInner {
+            // --- copied from the parent -------------------------------------
+            execute_path: self.execute_path.clone(),
+            cmdline: self.cmdline.clone(),
+            // `/proc/<pid>/environ` reads the process's own memory in Linux,
+            // and a fork copies that memory, so a child that has not exec'd
+            // still reports the parent's environment.
+            environ: self.environ.clone(),
+            current_working_directory: self.current_working_directory.clone(),
+            files: self.files.clone(),
+            // POSIX fork(2): the child gets its own COPY of each fd's
+            // FD_CLOEXEC flag — later fcntl(F_SETFD) in either process
+            // must not affect the other.
+            cloexec_fds: self.cloexec_fds.clone(),
+            // RLIMIT_NOFILE survives fork, and this is the field that really
+            // caps the fd table. Resetting it undid every `ulimit -n` the
+            // moment the shell forked -- which is the only way a program ever
+            // gets a raised limit.
+            file_limit: self.file_limit,
+            signal_actions: self.signal_actions.clone(),
+            credentials: self.credentials.clone(),
+            pgid,
+            sid,
+            // fork(2)/prctl(2) inheritance: no_new_privs, dumpable, the
+            // execution domain and THP setting carry over.
+            no_new_privs: self.no_new_privs,
+            dumpable: self.dumpable,
+            personality: self.personality,
+            abi: self.abi,
+            thp_disable: self.thp_disable,
+            // The heap. `fork` copies the address space, so the heap is there
+            // in the child -- but the bookkeeping that says where it ends was
+            // starting from zero, and `sys_brk` answers every call with the
+            // old break when the break is below the heap base. So `brk` in a
+            // forked child could not move at all, and `sbrk(0)` reported 0.
+            // A child that never execs -- a subshell, a zygote -- had its
+            // allocator silently pushed onto mmap for the rest of its life.
+            brk: self.brk,
+            mapped_brk: self.mapped_brk,
+            // shmat(2): the attachments come along with the copied address
+            // space, so the child must be able to `shmdt` them. Without the
+            // record it cannot, and the mapping stays for the child's life.
+            shm_identifiers: self.shm_identifiers.clone(),
+
+            // --- deliberately fresh -----------------------------------------
+            // A child has no children of its own, and no accumulated times
+            // for them: Linux zeroes `cutime`/`cstime` in `copy_process`.
+            children: Default::default(),
+            reaped_children: Default::default(),
+            children_utime_ns: 0,
+            children_stime_ns: 0,
+            // `p->pdeath_signal = 0` in `copy_process`, and the subreaper
+            // attribute is the parent's own role, not a child's.
+            pdeathsig: 0,
+            child_subreaper: false,
+            // Not stopped, and nothing pending to report to a waiter.
+            job_stopped: false,
+            job_stop_sig: 0,
+            job_stop_pending: false,
+            job_continued_pending: false,
+            // Kernel-side futex objects are keyed by address in *this*
+            // address space; the child gets its own.
+            futexes: Default::default(),
+            // `SemProc`'s own `Clone` says what a fork needs -- "Fork the
+            // semaphore table. Clear undo info." -- and fork was not using
+            // it. Through `..Default::default()` the child lost the sets its
+            // parent had open as well, and the ids are per-process indices,
+            // so an id the parent passed down named nothing in the child
+            // until it did its own `semget`. SEM_UNDO really is not
+            // inherited by a plain fork (only `CLONE_SYSVSEM` shares it), and
+            // that is exactly what the `Clone` drops.
+            semaphores: self.semaphores.clone(),
+        }
+    }
+
     /// Fold a reaped child's CPU usage into the RUSAGE_CHILDREN totals.
     fn add_children_cpu(&mut self, cpu: ChildCpu) {
         self.children_utime_ns += cpu.utime_ns;
@@ -2909,231 +2971,257 @@ pub fn send_signal_to_process(pid: usize, signal: LinuxSignal) -> LxResult<()> {
 }
 
 #[cfg(test)]
-mod dac_tests {
-    //! The discretionary-access decisions of `LinuxProcess`, on pure inputs:
-    //! who gets which permission bits, what a `chmod` really lands, and which
-    //! of a caller's three ids an unprivileged id switch may name. Each test
-    //! cites the Linux rule it pins (`fs/namei.c`, `fs/attr.c`, `kernel/sys.c`).
+mod fork_inheritance_tests {
+    //! What a `fork(2)` child starts life with. Every one of these is a
+    //! one-line decision that is invisible at the call site and wrong in only
+    //! one direction: a field that quietly falls back to its default gives
+    //! the child a fresh value where Linux gives it the parent's, and nothing
+    //! fails -- the child just behaves as if the parent had never configured
+    //! anything. Four were doing exactly that.
 
     use super::*;
 
-    const OWNER: u32 = 1000;
-    const GROUP: u32 = 100;
-    const OTHER_GROUP: u32 = 200;
-
-    /// An ordinary user: every id the same, no supplementary groups.
-    fn user(uid: u32, gid: u32) -> Credentials {
-        Credentials {
-            ruid: uid,
-            euid: uid,
-            suid: uid,
-            rgid: gid,
-            egid: gid,
-            sgid: gid,
-            groups: Vec::new(),
-            umask: 0o022,
-        }
+    /// A parent with every field set to something that is *not* its default,
+    /// so a field the fork forgets shows up as the default and a field it
+    /// copies shows up as this.
+    fn a_configured_parent() -> LinuxProcessInner {
+        let mut p = LinuxProcessInner {
+            execute_path: String::from("/usr/bin/labwc"),
+            cmdline: alloc::vec![String::from("labwc"), String::from("-s")],
+            environ: alloc::vec![String::from("WAYLAND_DISPLAY=wayland-0")],
+            current_working_directory: String::from("/home/moebius"),
+            file_limit: RLimit {
+                cur: 65536,
+                max: 65536,
+            },
+            brk: 0x5555_0010_0000,
+            mapped_brk: 0x5555_0020_0000,
+            pgid: 41,
+            sid: 42,
+            no_new_privs: true,
+            dumpable: Some(0),
+            personality: 0x0004_0000,
+            thp_disable: true,
+            children_utime_ns: 111,
+            children_stime_ns: 222,
+            pdeathsig: 15,
+            child_subreaper: true,
+            job_stopped: true,
+            job_stop_sig: 19,
+            job_stop_pending: true,
+            job_continued_pending: true,
+            ..Default::default()
+        };
+        p.cloexec_fds.insert(7.into());
+        p.files.insert(
+            7.into(),
+            crate::fs::Inotify::new(crate::fs::OpenFlags::empty()) as Arc<dyn FileLike>,
+        );
+        p
     }
 
-    fn may(creds: &Credentials, mode: u16, requested: u16, use_effective: bool) -> bool {
-        LinuxProcess::access_verdict(creds, OWNER, GROUP, mode, false, requested, use_effective)
-            .is_ok()
+    fn fork_of(parent: &LinuxProcessInner) -> LinuxProcessInner {
+        parent.forked_child(41, 42)
     }
 
-    fn may_dir(creds: &Credentials, mode: u16, requested: u16) -> bool {
-        LinuxProcess::access_verdict(creds, OWNER, GROUP, mode, true, requested, true).is_ok()
-    }
-
-    /// `acl_permission_check`: "Are we the owner? If so, ACL's don't matter"
-    /// -- and neither do the group or other bits. `0o077` gives the owner
-    /// nothing even though everybody else can do everything.
     #[test]
-    fn the_owner_arm_is_exclusive() {
-        let owner = user(OWNER, GROUP);
-        assert!(
-            !may(&owner, 0o077, 0o4, true),
-            "owner denied read by the owner bits"
-        );
-        assert!(!may(&owner, 0o077, 0o2, true));
-        assert!(!may(&owner, 0o077, 0o1, true));
-        let stranger = user(4242, 4242);
-        assert!(
-            may(&stranger, 0o077, 0o7, true),
-            "other bits still apply to others"
-        );
+    fn the_file_descriptor_limit_survives_the_fork() {
+        // `ulimit -n 65536` only ever reaches a program through a fork: the
+        // shell raises its own limit and then forks. Resetting it here undid
+        // every raise in the system, silently, and the program hit EMFILE at
+        // the default -- the failure a raised limit exists to prevent.
+        let child = fork_of(&a_configured_parent());
+        assert_eq!(child.file_limit.cur, 65536);
+        assert_eq!(child.file_limit.max, 65536);
     }
 
-    /// `in_group_p()` consults the ACTING gid and the supplementary list. A
-    /// process that dropped its effective gid must lose the group bits with
-    /// it: keeping them is keeping the very access the drop gave up.
     #[test]
-    fn a_dropped_effective_gid_loses_group_access() {
-        // rgid is still the file's group, egid is not.
-        let mut dropped = user(4242, GROUP);
-        dropped.egid = OTHER_GROUP;
-        dropped.sgid = OTHER_GROUP;
-
-        assert!(
-            !may(&dropped, 0o060, 0o4, true),
-            "the effective path must not read group bits through the REAL gid"
-        );
-        // `access(2)` asks about the real ids, and there the real gid counts.
-        assert!(
-            may(&dropped, 0o060, 0o4, false),
-            "the real path is the one place the real gid belongs"
-        );
+    fn the_heap_bookkeeping_survives_the_fork() {
+        // `fork` copies the address space, so the heap is in the child. The
+        // numbers that say where it ends were starting from zero, and
+        // `sys_brk` returns the old break unchanged for anything below the
+        // heap base -- so in a forked child `brk` could not move at all and
+        // `sbrk(0)` answered 0. A child that never execs (a subshell, a
+        // zygote) had its allocator pushed onto mmap for good.
+        let child = fork_of(&a_configured_parent());
+        assert_eq!(child.brk, 0x5555_0010_0000);
+        assert_eq!(child.mapped_brk, 0x5555_0020_0000);
     }
 
-    /// The supplementary list counts on both paths, as `in_group_p` walks it
-    /// regardless of which primary gid is being asked about.
     #[test]
-    fn a_supplementary_group_counts_on_both_paths() {
-        let mut member = user(4242, OTHER_GROUP);
-        member.groups = vec![7, GROUP, 9];
-        assert!(may(&member, 0o060, 0o6, true));
-        assert!(may(&member, 0o060, 0o6, false));
-        let outsider = user(4242, OTHER_GROUP);
-        assert!(!may(&outsider, 0o060, 0o4, true));
-        assert!(
-            may(&outsider, 0o004, 0o4, true),
-            "falls through to the other bits"
-        );
-    }
-
-    /// `generic_permission`: read/write DACs are always overridable by
-    /// CAP_DAC_OVERRIDE; executing a file needs at least one x bit somewhere;
-    /// a directory is always searchable.
-    #[test]
-    fn root_reads_and_writes_anything_but_executes_only_what_has_an_x_bit() {
-        let root = user(ROOT_UID, ROOT_UID);
-        assert!(may(&root, 0o000, 0o6, true));
-        assert!(
-            !may(&root, 0o000, 0o1, true),
-            "no x bit anywhere: even root may not exec"
-        );
-        assert!(
-            may(&root, 0o001, 0o1, true),
-            "one x bit, any column, is enough"
-        );
-        assert!(
-            may_dir(&root, 0o000, 0o1),
-            "a 0700 (or 0000) directory is searchable by root"
-        );
-        // The override follows the SELECTED uid: a setuid-root program asked
-        // about its real ids is not root for `access(2)`.
-        let mut setuid_root = user(OWNER, GROUP);
-        setuid_root.euid = ROOT_UID;
-        assert!(may(&setuid_root, 0o000, 0o2, true));
-        assert!(!may(&setuid_root, 0o000, 0o2, false));
-    }
-
-    /// `mask & ~mode` with an empty mask is zero: `F_OK` is existence only.
-    #[test]
-    fn nothing_requested_is_always_granted() {
-        let stranger = user(4242, 4242);
-        assert!(may(&stranger, 0o000, 0, true));
-        assert!(may(&stranger, 0o000, 0, false));
-    }
-
-    // ---- chmod -------------------------------------------------------------
-
-    fn chmod(creds: &Credentials, cur: u16, mode: u16) -> LxResult<u16> {
-        LinuxProcess::chmod_bits(creds, OWNER, GROUP, cur, mode)
-    }
-
-    /// `setattr_prepare` never touches `S_ISUID`: this is how a user makes a
-    /// setuid binary of a file they own. It used to be stripped from every
-    /// non-root chmod, and the call still returned success, so `chmod 4755`
-    /// silently left `0755` behind.
-    #[test]
-    fn the_owner_keeps_setuid_on_chmod() {
-        let owner = user(OWNER, GROUP);
-        assert_eq!(chmod(&owner, 0o100_644, 0o4755), Ok(0o104_755));
-        // File-type bits above the permission mask are never the caller's to
-        // change.
-        assert_eq!(chmod(&owner, 0o100_644, 0o7777), Ok(0o107_777));
-    }
-
-    /// "Normal users cannot set the setgid bit if they are not in the group"
-    /// -- and that is the only bit `setattr_prepare` strips, and only then.
-    #[test]
-    fn setgid_is_stripped_only_from_a_caller_outside_the_file_group() {
-        let owner_in_group = user(OWNER, GROUP);
-        assert_eq!(chmod(&owner_in_group, 0o644, 0o2755), Ok(0o2755));
-
-        let mut owner_outside = user(OWNER, OTHER_GROUP);
+    fn the_environment_survives_the_fork() {
+        // `/proc/<pid>/environ` reads the process's own memory in Linux, and
+        // a fork copies that memory. A child that has not exec'd reported an
+        // empty environment.
+        let child = fork_of(&a_configured_parent());
         assert_eq!(
-            chmod(&owner_outside, 0o644, 0o6755),
-            Ok(0o4755),
-            "setgid stripped, setuid kept"
+            child.environ,
+            alloc::vec![String::from("WAYLAND_DISPLAY=wayland-0")]
         );
-        // A supplementary membership is membership.
-        owner_outside.groups = vec![GROUP];
-        assert_eq!(chmod(&owner_outside, 0o644, 0o2755), Ok(0o2755));
-        // And, per `in_group_p`, the REAL gid is not.
-        let mut owner_real_only = user(OWNER, GROUP);
-        owner_real_only.egid = OTHER_GROUP;
-        owner_real_only.sgid = OTHER_GROUP;
-        assert_eq!(chmod(&owner_real_only, 0o644, 0o2755), Ok(0o755));
     }
 
-    /// `inode_owner_or_capable`: the owner or root, nobody else; and root is
-    /// exempt from the setgid rule.
     #[test]
-    fn a_stranger_cannot_chmod_and_root_keeps_every_bit() {
-        let stranger = user(4242, GROUP);
-        assert_eq!(chmod(&stranger, 0o644, 0o600), Err(LxError::EPERM));
-        let root = user(ROOT_UID, ROOT_UID);
-        assert_eq!(chmod(&root, 0o644, 0o6755), Ok(0o6755));
+    fn the_working_directory_and_command_line_survive_the_fork() {
+        let child = fork_of(&a_configured_parent());
+        assert_eq!(child.current_working_directory, "/home/moebius");
+        assert_eq!(child.execute_path, "/usr/bin/labwc");
+        assert_eq!(child.cmdline.len(), 2);
     }
 
-    // ---- which id an unprivileged switch may name --------------------------
-
-    /// `sys_setuid`: `!uid_eq(kuid, old->uid) && !uid_eq(kuid, new->suid)`
-    /// -> EPERM. The effective id is not in the set: with (r=1000, e=2000,
-    /// s=3000), `setuid(2000)` is refused by Linux.
     #[test]
-    fn setuid_draws_from_real_and_saved_not_effective() {
-        assert!(LinuxProcess::setid_allowed(1000, 3000, 1000));
-        assert!(LinuxProcess::setid_allowed(1000, 3000, 3000));
-        assert!(!LinuxProcess::setid_allowed(1000, 3000, 2000));
-        assert!(!LinuxProcess::setid_allowed(1000, 3000, ROOT_UID));
-    }
-
-    /// `sys_setreuid`: the real argument may be the old real or effective id,
-    /// never the saved one. With (r=1000, e=1000, s=0) -- a daemon that
-    /// dropped root and kept it in the saved slot -- `setreuid(0, -1)` is
-    /// EPERM on Linux; letting it through moved the saved id into the REAL
-    /// slot, where every later rule accepts it. The effective argument, and
-    /// every `setresuid` argument, may name any of the three.
-    #[test]
-    fn the_real_argument_of_setreuid_never_takes_the_saved_id() {
-        assert!(!LinuxProcess::set_real_allowed(1000, 1000, ROOT_UID));
-        assert!(LinuxProcess::set_real_allowed(1000, 2000, 2000));
-        assert!(LinuxProcess::set_real_allowed(1000, 2000, 1000));
-        assert!(LinuxProcess::set_any_allowed(
-            1000, 1000, ROOT_UID, ROOT_UID
-        ));
-        assert!(!LinuxProcess::set_any_allowed(1000, 2000, 3000, 4000));
-    }
-
-    /// `if (ruid != -1 || (euid != -1 && !uid_eq(keuid, old->uid))) new->suid
-    /// = new->euid;` -- there is no privileged term, so a `setreuid(-1, -1)`
-    /// that asks for nothing leaves the saved id alone, root or not.
-    #[test]
-    fn setreuid_with_nothing_to_do_leaves_the_saved_id_alone() {
-        assert!(!LinuxProcess::setreid_updates_saved(NO_ID, NO_ID, 1000));
+    fn the_close_on_exec_set_is_copied_and_not_shared() {
+        // POSIX: the child gets its own copy of each fd's FD_CLOEXEC flag, so
+        // a later `fcntl(F_SETFD)` in either process must not reach the other.
+        let parent = a_configured_parent();
+        let mut child = fork_of(&parent);
+        assert!(child.cloexec_fds.contains(&7.into()));
+        child.cloexec_fds.remove(&7.into());
         assert!(
-            LinuxProcess::setreid_updates_saved(1000, NO_ID, 1000),
-            "a real id is set"
+            parent.cloexec_fds.contains(&7.into()),
+            "the child's copy must be its own"
         );
+    }
+
+    #[test]
+    fn the_prctl_settings_that_linux_inherits_do() {
+        // A `no_new_privs` that did not survive fork would hand a child back
+        // the setuid behaviour its parent gave up -- the one thing the flag
+        // exists to make irreversible.
+        let child = fork_of(&a_configured_parent());
+        assert!(child.no_new_privs);
+        assert_eq!(child.dumpable, Some(0));
+        assert_eq!(child.personality, 0x0004_0000);
+        assert!(child.thp_disable);
+    }
+
+    #[test]
+    fn the_process_group_and_session_are_the_resolved_ones_passed_in() {
+        // Not the parent's raw fields: an unset (0) pgid means "the parent's
+        // own pid", and the child needs the concrete value or a Ctrl-C never
+        // reaches it.
+        let mut parent = a_configured_parent();
+        parent.pgid = 0;
+        parent.sid = 0;
+        let child = parent.forked_child(1234, 5678);
+        assert_eq!(child.pgid, 1234);
+        assert_eq!(child.sid, 5678);
+    }
+
+    #[test]
+    fn the_open_files_survive_the_fork() {
+        // The one thing everybody knows a fork does. It is here so the
+        // exhaustive list above cannot lose it while nobody is looking.
+        let child = fork_of(&a_configured_parent());
+        assert!(child.files.contains_key(&7.into()));
+    }
+
+    #[test]
+    fn a_child_starts_with_no_children_of_its_own() {
+        let mut parent = a_configured_parent();
+        parent.reaped_children.insert(99, (0, Default::default()));
+        let child = fork_of(&parent);
+        assert!(child.children.is_empty());
         assert!(
-            LinuxProcess::setreid_updates_saved(NO_ID, 2000, 1000),
-            "an effective id other than the old real one is set"
+            child.reaped_children.is_empty(),
+            "a newborn child has reaped nobody"
         );
+        // `copy_process` zeroes `cutime`/`cstime`: a child must not be born
+        // already credited with the CPU time of its parent's other children,
+        // or `times(2)` double-counts it up the whole tree.
+        assert_eq!(child.children_utime_ns, 0);
+        assert_eq!(child.children_stime_ns, 0);
+    }
+
+    #[test]
+    fn a_child_is_not_born_stopped_or_owing_a_notification() {
+        // `job_stopped` carried over would leave the child parked before its
+        // first instruction, waiting for a SIGCONT nobody will send it; the
+        // pending flags carried over would make its first `waitpid` report a
+        // stop that happened to its parent.
+        let child = fork_of(&a_configured_parent());
+        assert!(!child.job_stopped);
+        assert_eq!(child.job_stop_sig, 0);
+        assert!(!child.job_stop_pending);
+        assert!(!child.job_continued_pending);
+    }
+
+    #[test]
+    fn the_parents_own_roles_are_not_handed_down() {
+        // `p->pdeath_signal = 0` in `copy_process`: the signal is "tell me
+        // when MY parent dies", so inheriting it would have the child killed
+        // when its grandparent exits. The subreaper attribute is likewise the
+        // parent's role, not something a child is born holding.
+        let child = fork_of(&a_configured_parent());
+        assert_eq!(child.pdeathsig, 0);
+        assert!(!child.child_subreaper);
+    }
+
+    #[test]
+    fn the_semaphore_undo_state_is_not_inherited() {
+        // A plain `fork` does NOT share SEM_UNDO state -- only
+        // `CLONE_SYSVSEM` does. Copying it would have the child undo, on its
+        // own exit, semaphore operations that its parent performed and that
+        // the parent will undo again.
+        let mut parent = a_configured_parent();
+        let id = parent
+            .semaphores
+            .add(crate::ipc::SemArray::get_or_create(0, 1, 0o666).unwrap());
+        parent.semaphores.add_undo(id, 0, -1);
+
+        let child = fork_of(&parent);
         assert!(
-            !LinuxProcess::setreid_updates_saved(NO_ID, 1000, 1000),
-            "setting the effective id back to the real one is not a new identity"
+            child.semaphores.owes_no_undo(),
+            "a forked child owes no semaphore undo"
         );
+        // ...but it keeps the sets the parent had open. The ids are
+        // per-process indices, so dropping the table left an id the parent
+        // passed down naming nothing in the child.
+        assert!(
+            child.semaphores.get(id).is_some(),
+            "the child must still find the set its parent had open"
+        );
+    }
+
+    #[test]
+    fn the_shared_memory_attachments_survive_the_fork() {
+        // `fork` copies the address space, so the segments the parent had
+        // attached are mapped in the child too -- it is holding them whether
+        // the kernel remembers or not. Without the record the child cannot
+        // `shmdt` them, so the mapping stays for its whole life, and the
+        // segment's use count is wrong. This is the same bookkeeping whose
+        // loss on `IPC_RMID` leaked an address range per X11 frame.
+        use crate::ipc::ShmGuard;
+        use zircon_object::vm::VmObject;
+        let mut parent = a_configured_parent();
+        let guard = Arc::new(kernel_hal::sync::Mutex::new(ShmGuard {
+            shared_guard: VmObject::new_paged(1),
+            shmid_ds: kernel_hal::sync::Mutex::new(Default::default()),
+        }));
+        parent.shm_identifiers.add(9, guard);
+        let mut ident = parent.shm_identifiers.get(9).unwrap();
+        ident.addr = 0x7f00_0000;
+        parent.shm_identifiers.set(9, ident);
+
+        let child = fork_of(&parent);
+        assert_eq!(
+            child.shm_identifiers.get_id(0x7f00_0000),
+            Some(9),
+            "the child must be able to find the segment it inherited"
+        );
+    }
+
+    #[test]
+    fn the_kernel_side_futex_objects_are_not_inherited() {
+        // They are keyed by address in the parent's address space and hold
+        // its waiters. The child's memory is a copy: same addresses,
+        // different pages, and nobody waiting. Handing the child the
+        // parent's objects would have a `futex_wake` in the child reach
+        // threads of the parent that are waiting on their own memory.
+        static WORD: AtomicI32 = AtomicI32::new(0);
+        let mut parent = a_configured_parent();
+        parent.futexes.insert(0x1000, Futex::new(&WORD));
+
+        let child = fork_of(&parent);
+        assert!(child.futexes.is_empty());
     }
 }

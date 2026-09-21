@@ -41,7 +41,7 @@ bitflags! {
 ///
 /// struct ipc_perm
 #[repr(C)]
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct IpcPerm {
     /// Key supplied to semget(2)
     pub key: u32,
@@ -104,6 +104,14 @@ impl SemProc {
     /// Get an semaphore set by `id`
     pub fn get(&self, id: SemId) -> Option<Arc<SemArray>> {
         self.arrays.get(&id).cloned()
+    }
+
+    /// Does this process owe any SEM_UNDO adjustment?
+    ///
+    /// A `fork(2)` child must owe none: a plain fork does not share SEM_UNDO
+    /// state, only `CLONE_SYSVSEM` does. The sets themselves do come along.
+    pub fn owes_no_undo(&self) -> bool {
+        self.undos.is_empty()
     }
 
     /// Add an undo operation
