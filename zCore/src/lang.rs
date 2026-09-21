@@ -172,6 +172,14 @@ fn dl_paint() {
     // The last CPU seen publishing a wait mask: whose goals the non-acker
     // lines below are held to (single-waiter in every capture so far).
     let mut waiter_cpu: usize = usize::MAX;
+    // Every HOLDER cpu seen, so the RIP block below can say where each one is
+    // wedged RIGHT NOW. The site printed on a HOLDER line is where it ACQUIRED
+    // the lock, which for a lock with few acquire sites says almost nothing:
+    // the capture that prompted this had HOLDER and waiter at the very same
+    // line (the kernel heap's `dealloc`), so the banner named the lock and left
+    // the only real question -- why is the holder not releasing it? -- unasked.
+    let mut holder_cpus = [usize::MAX; DL_SLOTS];
+    let mut holder_n = 0usize;
     for i in 0..DL_SLOTS {
         let p = DL_FILE_PTR[i].load(Ordering::SeqCst);
         if p == 0 {
@@ -182,6 +190,10 @@ fn dl_paint() {
         let cpu = lc >> 32;
         let is_holder = DL_HOLDER[i].load(Ordering::SeqCst) != 0;
         let role = if is_holder { "HOLDER " } else { "" };
+        if is_holder && holder_n < DL_SLOTS {
+            holder_cpus[holder_n] = cpu;
+            holder_n += 1;
+        }
         // SAFETY: (p, l) were stored from a live &'static str (either the
         // reporter's own #[track_caller] file, or the holder's, snapshotted by
         // kernel-sync from the same immortal strings).
@@ -218,6 +230,11 @@ fn dl_paint() {
     // IRQs disabled, so broadcast one first and read each stuck core's CURRENT
     // RIP: that is the exact non-pumping busy-wait to symbolize with
     // `llvm-addr2line -e zcore`. Do the broadcast ONCE, before the loop.
+    // The pre-snapshot has to happen BEFORE the broadcast (see below), so it
+    // runs first and on its own; the broadcast itself is unconditional.
+    let mut pre_seq = [0u64; 64];
+    let mut pre_goal = [0u64; 64];
+    let mut pre_q = [(0usize, 0usize, 0usize, false, false); 64];
     if nonack_union != 0 {
         // Snapshot the protocol state BEFORE the RIP-capture NMI broadcast:
         // that broadcast runs the unconditional shootdown rescue on every
@@ -226,9 +243,6 @@ fn dl_paint() {
         // pre/post seq pair is the discriminator: pre<goal && post>=goal
         // means the rescue works and the starvation was real; post<goal
         // means the publish itself is not landing (identity / wrong slot).
-        let mut pre_seq = [0u64; 64];
-        let mut pre_goal = [0u64; 64];
-        let mut pre_q = [(0usize, 0usize, 0usize, false, false); 64];
         let mut m = nonack_union;
         while m != 0 {
             let c = m.trailing_zeros() as usize;
@@ -239,7 +253,15 @@ fn dl_paint() {
                 pre_q[c] = kernel_hal::shootdown_queue_state(c);
             }
         }
-        kernel_hal::kstats::capture_cpu_rips();
+    }
+    // One broadcast, always. An NMI reaches a core even while it spins with
+    // IRQs off, and `nmi_rip` is a plain atomic read of a per-cpu slot -- no
+    // heap, no lock -- which is what makes this safe here, where the allocator
+    // itself may be the wedged lock. Both of these are lock-free:
+    // `send_nmi_all_others` writes the local APIC directly and the settle wait
+    // is an `rdtsc` spin.
+    kernel_hal::kstats::capture_cpu_rips();
+    if nonack_union != 0 {
         let mut m = nonack_union;
         while m != 0 {
             let c = m.trailing_zeros() as usize;
@@ -269,6 +291,38 @@ fn dl_paint() {
             );
         }
     }
+    // Where each HOLDER actually is, which is the question the banner exists to
+    // answer and could not. A holder's printed site is where it ACQUIRED the
+    // lock; this is the instruction it is sitting on now. Symbolized in place
+    // when the kernel carries a symbol table (`ksyms::lookup` is a binary
+    // search over a static blob -- no heap, no lock), so the common case needs
+    // no addr2line round trip at all.
+    // At most two. The banner is a 1024-byte stack buffer whose writer
+    // silently truncates, and the DIAG verdict is written last -- so anything
+    // added here is spent out of the verdict's budget. Two covers every
+    // capture seen (one holder, or the two sides of a cycle) and leaves the
+    // line that names the conclusion room to land.
+    for i in 0..holder_n.min(2) {
+        let c = holder_cpus[i];
+        let rip = kernel_hal::kstats::nmi_rip(c);
+        if rip != 0 {
+            let _ = write!(
+                b,
+                "\nHOLDER cpu{} is now at {}",
+                c,
+                kernel_hal::ksyms::Addr(rip)
+            );
+        } else {
+            // No NMI landed: either that cpu is gone (halted, triple-faulted,
+            // never started) or NMIs are blocked on it. Both are findings.
+            let _ = write!(
+                b,
+                "\nHOLDER cpu{} took no NMI (last_tick={:#x}) -- cpu dead or NMI-blocked",
+                c,
+                kernel_hal::kstats::cpu_tick_rip(c)
+            );
+        }
+    }
     // One-line verdict so the on-screen (no-serial) capture is self-diagnosing.
     if shootdown_head {
         let _ = write!(
@@ -278,10 +332,20 @@ fn dl_paint() {
              Not AB-BA."
         );
     } else {
+        // NOT "therefore AB-BA". Ruling out shootdown starvation leaves more
+        // than one cause, and a cycle is only one of them: a holder looping or
+        // merely slow inside its critical section (the buddy allocator's O(n)
+        // coalescing scan is a real candidate), or one that faulted there,
+        // produces this exact banner with no cycle anywhere. The capture that
+        // prompted this wording had HOLDER and waiter on the SAME line, which
+        // cannot be AB-BA at all -- that needs two locks taken in opposite
+        // orders -- yet the verdict sent the reader hunting for one. The
+        // "is now at" line above is what discriminates.
         let _ = write!(
             b,
-            "\nDIAG: no HOLDER is in a shootdown wait -> lock-ordering cycle (AB-BA); \
-             compare the HOLDER site(s) above."
+            "\nDIAG: no HOLDER is in a shootdown wait. Either a lock-ordering cycle \
+             (AB-BA) or a HOLDER stuck inside its own critical section -- the \
+             \"is now at\" line above says which."
         );
     }
     let valid = match core::str::from_utf8(&b.buf[..b.len]) {
