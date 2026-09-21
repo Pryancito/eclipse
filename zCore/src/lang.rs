@@ -302,8 +302,7 @@ fn dl_paint() {
     // added here is spent out of the verdict's budget. Two covers every
     // capture seen (one holder, or the two sides of a cycle) and leaves the
     // line that names the conclusion room to land.
-    for i in 0..holder_n.min(2) {
-        let c = holder_cpus[i];
+    for &c in holder_cpus.iter().take(holder_n.min(2)) {
         let rip = kernel_hal::kstats::nmi_rip(c);
         if rip != 0 {
             let _ = write!(

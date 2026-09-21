@@ -3077,15 +3077,37 @@ impl Drop for VmMapping {
 
 /// The base of kernel address space
 /// In x86 fuchsia this is 0xffff_ff80_0000_0000 instead
-#[cfg(target_os = "none")]
+#[cfg(all(target_os = "none", not(target_arch = "riscv64")))]
 pub const KERNEL_ASPACE_BASE: u64 = 0xffff_ff02_0000_0000;
+/// RISC-V runs Sv39, whose canonical upper half starts at
+/// `0xffff_ffc0_0000_0000` — the `0xffff_ff02_0000_0000` the others use is in
+/// the hole below it and cannot be represented in a page table at all. The
+/// Linux ELF loader maps the executable's VMO into this aspace to read it
+/// (`loader/mod.rs`), so the very first byte it read faulted:
+/// `[KERNEL PAGE FAULT] vaddr=0xffffff0200000001 flags=READ rip=0x0`, then
+/// `[KERNEL BUG] halting`, on every case of
+/// `Linux Other Test Baremetal (riscv64)`.
+///
+/// This is the last-but-one 1 GiB of the address space, top-level entry 510.
+/// `zCore/src/platform/riscv/boot_page_table.rs` installs a shared level-1
+/// table there at boot and must keep agreeing with this constant; see its
+/// `KERNEL_ASPACE_TABLE` for why an already-present entry is the whole point.
+/// Entry 511 is deliberately left out so `base + size` cannot wrap to 0.
+#[cfg(all(target_os = "none", target_arch = "riscv64"))]
+pub const KERNEL_ASPACE_BASE: u64 = 0xffff_ffff_8000_0000;
 /// Hosted (libos) builds run in a normal user process: keep the "kernel"
 /// aspace inside the host's mappable range, above the mock PMEM window.
 #[cfg(not(target_os = "none"))]
 pub const KERNEL_ASPACE_BASE: u64 = 0x0000_0010_0000_0000;
 /// The size of kernel address space
-#[cfg(target_os = "none")]
+#[cfg(all(target_os = "none", not(target_arch = "riscv64")))]
 pub const KERNEL_ASPACE_SIZE: u64 = 0x0000_0080_0000_0000;
+/// The single 1 GiB covered by the shared level-1 table the boot page table
+/// installs. The 512 GiB the other architectures use does not exist here —
+/// Sv39's whole upper half is 256 GiB — and a gigabyte is far more than the
+/// loader's temporary mappings need.
+#[cfg(all(target_os = "none", target_arch = "riscv64"))]
+pub const KERNEL_ASPACE_SIZE: u64 = 0x0000_0000_4000_0000;
 /// Hosted (libos) kernel aspace size.
 #[cfg(not(target_os = "none"))]
 pub const KERNEL_ASPACE_SIZE: u64 = 0x0000_0010_0000_0000;
