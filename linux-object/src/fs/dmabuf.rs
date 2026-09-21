@@ -6,6 +6,12 @@
 //! for scanout. The dma-buf just carries the backing frames (a contiguous
 //! `VmObject`) plus its physical address and size; the pixel layout
 //! (width/height/format/pitch) travels separately via `ADDFB2`.
+//!
+//! For nouveau-uAPI GEM objects the dma-buf also holds a `gem_mmap` reference
+//! ([`super::devfs::drm::DMABUF_HOLDER`]) for its whole lifetime. Without that,
+//! the exporter's `GEM_CLOSE` after `PRIME_HANDLE_TO_FD` (the normal DRI3
+//! dance under Xwayland) frees the object while the fd is still in flight to
+//! the importer — see the module docs on `DMABUF_HOLDER`.
 
 use super::*;
 use alloc::sync::Arc;
@@ -21,24 +27,66 @@ pub struct DmaBuf {
     /// Backing frames — kept alive while the dma-buf (or any GEM handle
     /// imported from it) is referenced.
     vmo: Arc<VmObject>,
+    /// Nouveau-uAPI GEM handle this dma-buf was exported from, if any. The
+    /// corresponding `DMABUF_HOLDER` reference is taken in [`Self::from_prime`]
+    /// / [`Self::dup`] and released in [`Drop`]. `None` for dumb/generic
+    /// exports, which stay alive via `vmo` alone.
+    nouveau_handle: Option<u32>,
 }
 
 impl_kobject!(DmaBuf);
 
 impl DmaBuf {
     /// Wrap a buffer's physical memory in a shareable dma-buf object.
+    ///
+    /// Prefer [`Self::from_prime`] when the export came from a known GEM
+    /// handle: that path takes the nouveau reference a DRI3 importer needs.
     pub fn new(phys_addr: u64, size: usize, vmo: Arc<VmObject>) -> Arc<Self> {
         Arc::new(Self {
             base: KObjectBase::new(),
             phys_addr,
             size,
             vmo,
+            nouveau_handle: None,
+        })
+    }
+
+    /// Like [`Self::new`], but if `gem_handle` is a nouveau-uAPI object, take a
+    /// `DMABUF_HOLDER` reference so the exporter can `GEM_CLOSE` its local
+    /// handle without freeing the buffer out from under this fd.
+    pub fn from_prime(
+        gem_handle: u32,
+        phys_addr: u64,
+        size: usize,
+        vmo: Arc<VmObject>,
+    ) -> Arc<Self> {
+        let nouveau_handle =
+            if gem_handle >= zcore_drivers::scheme::gem_mmap::DRIVER_HANDLE_BASE {
+                super::devfs::drm::dmabuf_take_gem_ref(gem_handle);
+                Some(gem_handle)
+            } else {
+                None
+            };
+        Arc::new(Self {
+            base: KObjectBase::new(),
+            phys_addr,
+            size,
+            vmo,
+            nouveau_handle,
         })
     }
 
     /// The backing frames, for importing into another DRM node's GEM table.
     pub fn vmo(&self) -> Arc<VmObject> {
         self.vmo.clone()
+    }
+}
+
+impl Drop for DmaBuf {
+    fn drop(&mut self) {
+        if let Some(handle) = self.nouveau_handle.take() {
+            super::devfs::drm::dmabuf_drop_gem_ref(handle);
+        }
     }
 }
 
@@ -53,11 +101,17 @@ impl FileLike for DmaBuf {
     }
 
     fn dup(&self) -> Arc<dyn FileLike> {
+        // A fresh object, so a fresh DMABUF_HOLDER reference — SCM_RIGHTS
+        // shares the Arc and does not come through here.
+        if let Some(handle) = self.nouveau_handle {
+            super::devfs::drm::dmabuf_take_gem_ref(handle);
+        }
         Arc::new(Self {
             base: KObjectBase::new(),
             phys_addr: self.phys_addr,
             size: self.size,
             vmo: self.vmo.clone(),
+            nouveau_handle: self.nouveau_handle,
         })
     }
 
