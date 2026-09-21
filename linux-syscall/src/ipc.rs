@@ -346,7 +346,11 @@ impl Syscall<'_> {
             shmflg,
             self.zircon_process().id() as u32,
         )?;
-        let id = self.linux_process().shm_add(shared_guard);
+        // The id is system-wide: `shmget` hands out a number that names the
+        // same segment in every process, because passing it to another
+        // program is the whole mechanism. See `shm_register`.
+        let id = linux_object::ipc::shm_register(&shared_guard)?;
+        self.linux_process().shm_add(id, shared_guard);
         Ok(id)
     }
 
@@ -362,7 +366,14 @@ impl Syscall<'_> {
         // space — a layout mutation a concurrent fork must not race. Taken
         // before the `inner`-touching shm lookup (global lock order).
         let _aspace = self.linux_process().aspace_lock().lock();
-        let mut shm_identifier = self.linux_process().shm_get(id).ok_or(LxError::EINVAL)?;
+        // Looked up system-wide, NOT in this process's own map: the id may
+        // have been created by another program and passed here -- which is
+        // what the X11 shared-memory extension does with every image.
+        let guard = linux_object::ipc::shm_lookup(id).ok_or(LxError::EINVAL)?;
+        let mut shm_identifier = self
+            .linux_process()
+            .shm_get(id)
+            .unwrap_or(ShmIdentifier { addr: 0, guard });
 
         let proc = self.zircon_process();
         let vmar = proc.vmar();
@@ -444,8 +455,12 @@ impl Syscall<'_> {
     /// performs the control operation specified by cmd on the shared memory segment whose identifier is given in id
     pub fn sys_shmctl(&self, id: usize, cmd: usize, buffer: usize) -> SysResult {
         info!("shmctl: id: {}, cmd: {} buffer: {:#x}", id, cmd, buffer);
-        let shm_identifier = self.linux_process().shm_get(id).ok_or(LxError::EINVAL)?;
-        let shm_guard = shm_identifier.guard.lock();
+        // System-wide, like `shmat`: a program may be asked to remove or stat
+        // a segment it never created itself.
+        let guard = linux_object::ipc::shm_lookup(id)
+            .or_else(|| self.linux_process().shm_get(id).map(|i| i.guard))
+            .ok_or(LxError::EINVAL)?;
+        let shm_guard = guard.lock();
         let cmd = match ShmctlCmds::try_from(cmd) {
             Ok(t) => t,
             Err(_) => {
@@ -456,7 +471,13 @@ impl Syscall<'_> {
         match cmd {
             ShmctlCmds::IPC_RMID => {
                 shm_guard.remove();
-                self.linux_process().shm_pop(id);
+                linux_object::ipc::shm_unregister(id);
+                // The attachment stays. shmget(2): the segment is destroyed
+                // only once the last process detaches, and every user of the
+                // X11 extension removes the id the moment it has attached --
+                // dropping the attachment here left `shmdt` with nothing to
+                // find, so the mapping was never torn down and each image
+                // leaked its address range for the life of the process.
                 Ok(0)
             }
             ShmctlCmds::IPC_SET => {

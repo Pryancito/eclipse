@@ -2024,9 +2024,9 @@ impl LinuxProcess {
         self.inner.lock().shm_identifiers.pop(id)
     }
 
-    /// Insert the `SharedGuard` and return its ID
-    pub fn shm_add(&self, shared_guard: Arc<Mutex<ShmGuard>>) -> usize {
-        self.inner.lock().shm_identifiers.add(shared_guard)
+    /// Record that this process is using the segment `id` names.
+    pub fn shm_add(&self, id: usize, shared_guard: Arc<Mutex<ShmGuard>>) {
+        self.inner.lock().shm_identifiers.add(id, shared_guard)
     }
 
     /// Set Virtual Addr for shared memory

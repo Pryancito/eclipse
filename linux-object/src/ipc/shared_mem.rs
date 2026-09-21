@@ -9,6 +9,78 @@ use zircon_object::vm::*;
 
 lazy_static! {
     static ref KEY2SHM: RwLock<BTreeMap<u32, Weak<Mutex<ShmGuard>>>> = RwLock::new(BTreeMap::new());
+    /// Every shared segment in the system, under the id `shmget(2)` handed
+    /// out for it. See [`shm_register`].
+    static ref SHMID2SHM: RwLock<BTreeMap<ShmId, Arc<Mutex<ShmGuard>>>> =
+        RwLock::new(BTreeMap::new());
+    /// The next id to hand out. Ids are never reused, so a stale `shmid` kept
+    /// by a program that already detached names nothing rather than somebody
+    /// else's segment (Linux gets the same property from the sequence number
+    /// it packs into the id).
+    static ref NEXT_SHMID: Mutex<ShmId> = Mutex::new(1);
+}
+
+/// `SHMMNI`: how many segments may exist at once, Linux's own default.
+const SHMMNI: usize = 4096;
+
+/// Register a segment under a **system-wide** id and return it, or return the
+/// id it already has.
+///
+/// `shmget(2)` returns an identifier that means the same thing in every
+/// process: that is the whole mechanism by which two unrelated programs share
+/// memory without a common ancestor, because the id is passed between them by
+/// some other channel.
+///
+/// Here the id used to be an index into the CALLING process's own little map,
+/// starting at 0 and counted per process — so a second program handed that id
+/// either found nothing under it (`shmat` -> `EINVAL`) or, worse, found **its
+/// own unrelated segment** at the same index and attached to that.
+///
+/// The X11 shared-memory extension is exactly this pattern, on every frame:
+/// the client calls `shmget(IPC_PRIVATE, ...)`, sends the id to the X server
+/// over the X socket (`XShmAttach`), and the server calls `shmat` on it. The
+/// server has segments of its own, so the low ids were taken: the id the
+/// client sent named a different buffer inside the server. Wayland passes a
+/// `memfd` over the socket instead and never comes this way, which is the
+/// shape of "it works under Wayland and not under X".
+pub fn shm_register(guard: &Arc<Mutex<ShmGuard>>) -> Result<ShmId, LxError> {
+    let mut table = SHMID2SHM.write();
+    // `shmget` on an existing key answers with the id that key already has,
+    // as Linux does -- not a second id for the same segment.
+    if let Some((&id, _)) = table.iter().find(|(_, g)| Arc::ptr_eq(g, guard)) {
+        return Ok(id);
+    }
+    // A segment outlives the process that made it: that is what shmget(2)
+    // promises, and it is why `ipcs -m` can show one with nothing attached.
+    // So the table is the only thing holding those alive, and without a bound
+    // a loop of `shmget(IPC_PRIVATE, ...)` would pin memory for ever from an
+    // ordinary process. Linux bounds it the same way and with the same error.
+    if table.len() >= SHMMNI {
+        return Err(LxError::ENOSPC);
+    }
+    let mut next = NEXT_SHMID.lock();
+    let id = *next;
+    *next += 1;
+    table.insert(id, guard.clone());
+    Ok(id)
+}
+
+/// The segment an id names, from any process.
+pub fn shm_lookup(id: ShmId) -> Option<Arc<Mutex<ShmGuard>>> {
+    SHMID2SHM.read().get(&id).cloned()
+}
+
+/// `shmctl(id, IPC_RMID, ..)`: the id stops naming the segment and no further
+/// `shmat` can find it.
+///
+/// The memory itself lives on while anyone is attached -- `shmat` mapped the
+/// VMO into the address space, which holds its own reference -- which is what
+/// shmget(2) requires and what every user of the X11 extension depends on:
+/// the idiom is `shmget` + `shmat` + `shmctl(IPC_RMID)` **immediately**, so
+/// the segment cannot outlive the client that made it, and then the buffer is
+/// used for the lifetime of the image.
+pub fn shm_unregister(id: ShmId) -> bool {
+    SHMID2SHM.write().remove(&id).is_some()
 }
 
 /// shmid data structure
@@ -216,6 +288,156 @@ mod shm_tests {
 
     fn get(key: u32, size: usize, flags: usize) -> Result<Arc<Mutex<ShmGuard>>, LxError> {
         ShmIdentifier::new_shared_guard(key, size, flags, PID)
+    }
+
+    /// Clear the system-wide id table between tests: it is process-wide and
+    /// other tests in this module create segments too.
+    fn clear_ids() {
+        SHMID2SHM.write().clear();
+    }
+
+    // ---- the id `shmget` hands out ---------------------------------------
+
+    /// The bug that broke the X11 shared-memory extension. The id was an
+    /// index into the CALLING process's own map, counted from 0 per process,
+    /// so the number a client sent to the X server named a different segment
+    /// there -- or nothing at all. It has to mean the same segment
+    /// everywhere, because passing it to another program is what it is for.
+    #[test]
+    fn an_id_names_the_same_segment_from_anywhere() {
+        let _guard = test_lock();
+        clear_ids();
+        let client_image = get(0, 4096, CREAT | 0o666).unwrap();
+        let id = shm_register(&client_image).unwrap();
+        // The other program has only the number.
+        let seen_by_the_server = shm_lookup(id).unwrap();
+        assert!(Arc::ptr_eq(&seen_by_the_server, &client_image));
+        // And what it writes is what the client reads.
+        seen_by_the_server
+            .lock()
+            .shared_guard
+            .write(0, b"un frame")
+            .unwrap();
+        let mut back = [0u8; 8];
+        client_image.lock().shared_guard.read(0, &mut back).unwrap();
+        assert_eq!(&back, b"un frame");
+    }
+
+    /// Two segments never share an id, whoever made them. Per-process
+    /// counting gave both of them 0.
+    #[test]
+    fn two_segments_never_share_an_id() {
+        let _guard = test_lock();
+        clear_ids();
+        let a = get(0, 4096, CREAT | 0o666).unwrap();
+        let b = get(0, 4096, CREAT | 0o666).unwrap();
+        let ia = shm_register(&a).unwrap();
+        let ib = shm_register(&b).unwrap();
+        assert_ne!(ia, ib);
+        assert!(Arc::ptr_eq(&shm_lookup(ia).unwrap(), &a));
+        assert!(Arc::ptr_eq(&shm_lookup(ib).unwrap(), &b));
+    }
+
+    /// `shmget` on a key that already has a segment answers with the id that
+    /// segment already has, as Linux does.
+    #[test]
+    fn the_same_segment_keeps_the_same_id() {
+        let _guard = test_lock();
+        clear_ids();
+        let first = get(0x515e, 4096, CREAT | 0o666).unwrap();
+        let again = get(0x515e, 4096, 0o666).unwrap();
+        assert!(Arc::ptr_eq(&first, &again));
+        assert_eq!(shm_register(&first).unwrap(), shm_register(&again).unwrap());
+    }
+
+    /// An id is never handed out twice, so a program holding a stale one
+    /// finds nothing rather than somebody else's memory.
+    #[test]
+    fn an_id_is_never_reused() {
+        let _guard = test_lock();
+        clear_ids();
+        let a = get(0, 4096, CREAT | 0o666).unwrap();
+        let id = shm_register(&a).unwrap();
+        assert!(shm_unregister(id));
+        drop(a);
+        let b = get(0, 4096, CREAT | 0o666).unwrap();
+        assert_ne!(shm_register(&b).unwrap(), id);
+        assert!(shm_lookup(id).is_none());
+    }
+
+    /// `shmctl(id, IPC_RMID)` is what every user of the X11 extension calls
+    /// the moment it has attached: the id must stop working while the memory
+    /// stays alive for whoever is already attached.
+    #[test]
+    fn removing_the_id_does_not_take_the_memory_with_it() {
+        let _guard = test_lock();
+        clear_ids();
+        let attached = get(0, 4096, CREAT | 0o666).unwrap();
+        let id = shm_register(&attached).unwrap();
+        assert!(shm_unregister(id));
+        assert!(shm_lookup(id).is_none());
+        // Still writable by whoever holds it.
+        attached
+            .lock()
+            .shared_guard
+            .write(0, b"sigue viva")
+            .unwrap();
+        // And removing it twice is not an error the second time round.
+        assert!(!shm_unregister(id));
+    }
+
+    /// A segment outlives the process that created it, so the table is the
+    /// only thing keeping it alive -- and a loop of `shmget` would pin memory
+    /// for ever. Linux bounds it at `SHMMNI` and answers `ENOSPC`.
+    #[test]
+    fn the_number_of_segments_is_bounded() {
+        let _guard = test_lock();
+        clear_ids();
+        {
+            let mut table = SHMID2SHM.write();
+            let one = get(0, 4096, CREAT | 0o666).unwrap();
+            for i in 0..SHMMNI {
+                table.insert(1_000_000 + i, one.clone());
+            }
+        }
+        let extra = get(0, 4096, CREAT | 0o666).unwrap();
+        assert_eq!(shm_register(&extra), Err(LxError::ENOSPC));
+        clear_ids();
+        // The number is Linux's, so it is asserted apart from the code that
+        // uses it -- a test built out of the constant moves with it.
+        assert_eq!(SHMMNI, 4096);
+    }
+
+    /// The per-process map records where this process attached the segment,
+    /// and that is what `shmdt(addr)` looks up. A later `shmget` for the same
+    /// id must not reset it to 0, or the detach finds nothing and the mapping
+    /// stays in the address space for good.
+    #[test]
+    fn asking_again_for_a_segment_does_not_forget_where_it_is_attached() {
+        let _guard = test_lock();
+        let seg = get(0, 4096, CREAT | 0o666).unwrap();
+        let mut proc = crate::ipc::ShmProc::default();
+        proc.add(7, seg.clone());
+        proc.set(
+            7,
+            ShmIdentifier {
+                addr: 0x4000,
+                guard: seg.clone(),
+            },
+        );
+        proc.add(7, seg.clone());
+        assert_eq!(proc.get(7).unwrap().addr, 0x4000);
+        assert_eq!(proc.get_id(0x4000), Some(7));
+        proc.pop(7);
+        assert!(proc.get(7).is_none());
+    }
+
+    #[test]
+    fn a_number_that_names_nothing_is_not_a_segment() {
+        let _guard = test_lock();
+        clear_ids();
+        assert!(shm_lookup(0).is_none());
+        assert!(shm_lookup(999_999).is_none());
     }
 
     #[test]

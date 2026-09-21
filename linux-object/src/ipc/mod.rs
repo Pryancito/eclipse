@@ -65,8 +65,10 @@ pub struct IpcPerm {
 
 /// Semaphore set identifier (in a process)
 type SemId = usize;
-/// Shared_memory identifier (in a process)
-type ShmId = usize;
+/// Shared memory identifier. System-wide: `shmget(2)`'s id means the same
+/// segment in every process, which is how two programs with no common
+/// ancestor share memory. See [`shared_mem::shm_register`].
+pub type ShmId = usize;
 
 /// Semaphore number (in an array)
 type SemNum = u16;
@@ -157,22 +159,17 @@ impl Drop for SemProc {
 }
 
 impl ShmProc {
-    /// Insert the `SharedGuard` and return its ID
-    pub fn add(&mut self, shared_guard: Arc<Mutex<ShmGuard>>) -> ShmId {
-        let id = self.get_free_id();
+    /// Record that this process is using the segment `id` names.
+    ///
+    /// The id comes from [`shared_mem::shm_register`] and is the same number
+    /// in every process; this map is only what THIS process has attached, so
+    /// `shmdt(addr)` can find its way back to the segment.
+    pub fn add(&mut self, id: ShmId, shared_guard: Arc<Mutex<ShmGuard>>) {
         let shm_identifier = ShmIdentifier {
             addr: 0,
             guard: shared_guard,
         };
-        self.shm_identifiers.insert(id, shm_identifier);
-        id
-    }
-
-    /// Get a free ID
-    fn get_free_id(&self) -> ShmId {
-        (0..)
-            .find(|i| !self.shm_identifiers.contains_key(i))
-            .unwrap()
+        self.shm_identifiers.entry(id).or_insert(shm_identifier);
     }
 
     /// Get an semaphore set by `id`
