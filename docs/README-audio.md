@@ -72,8 +72,15 @@ HDA controller (PCI 04:03) ── codec ── pin ── HDMI/DP or analog jack
   numbers the front ends see (free, queued, delay, buffer) and the write
   itself cross into client frames, through `accept_client_frames` /
   `link_to_client_bytes` / `client_to_link_bytes`. `free_bytes` reports
-  exactly what `write` will accept, so a client that just saw room is never
-  answered with 0 (the EAGAIN-after-avail that aborts PulseAudio). A client
+  exactly what `write` will accept, and `queued_bytes` is derived from that
+  same figure (`client_queued_bytes`: `buffer - accept`), so the ALSA node's
+  own `avail = buffer_size - queued` equals what `write` takes at every fill
+  level of the ring. That identity is what keeps PulseAudio alive: its
+  `alsa-sink.c` aborts if a write it was just told had room returns 0
+  (`try_recover`'s EAGAIN assert). Converting `queued` independently broke
+  it near a full ring by one to four frames, and the daemon died within
+  seconds of the converter engaging; the unit tests now check the identity
+  at every fill level and pin the old formula as broken. A client
   at 48 kHz takes the pre-existing path byte for byte, so with the daemon's
   sink fixed at 48 kHz (below) the converter is dormant; it engages when a
   front end negotiates another rate. `/proc/gpusnd` shows `client=.. Hz
