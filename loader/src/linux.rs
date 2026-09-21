@@ -862,7 +862,7 @@ fn force_fault_signal(thread: &CurrentThread, signal: Signal) {
     let inner = thread.inner();
     let undeliverable = {
         let linux = inner.lock_linux();
-        linux.signal_mask.contains(signal)
+        linux.signal_mask().contains(signal)
             || linux.handling_signal.is_some()
             || linux.signals.contains(signal)
             || action.handler == SIG_DFL
@@ -880,7 +880,9 @@ fn force_fault_signal(thread: &CurrentThread, signal: Signal) {
         // Deliverable custom handler: unblock so it cannot be deferred and queue
         // it for the next pass of the run loop.
         let mut linux = inner.lock_linux();
-        linux.signal_mask.remove(signal);
+        let mut mask = linux.signal_mask();
+        mask.remove(signal);
+        linux.set_signal_mask(mask);
         linux.signals.insert(signal);
     }
 }
