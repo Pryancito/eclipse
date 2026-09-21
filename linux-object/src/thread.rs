@@ -580,6 +580,72 @@ impl LinuxThread {
         self.clear_child_tid.as_addr()
     }
 
+    /// What `execve` must make this thread forget.
+    ///
+    /// Every field reset here either names an address in the image `execve`
+    /// is about to destroy, or is handler state whose handler is going with
+    /// it. Linux does the same in `begin_new_exec()` (`sas_ss_reset(me)`,
+    /// `me->robust_list = NULL`) and in `exec_mm_release()` -> `mm_release()`
+    /// (`tsk->clear_child_tid = NULL`).
+    ///
+    /// The fields are named ONE BY ONE with no `..`, so a field added to
+    /// [`LinuxThread`] stops compiling here until someone says whether
+    /// `execve` keeps it. The process half is
+    /// [`LinuxProcess::reset_for_exec`](crate::process::LinuxProcess::reset_for_exec).
+    pub fn reset_for_exec(&mut self) {
+        let Self {
+            clear_child_tid,
+            signals: _,
+            signal_mask: _,
+            saved_sigmask,
+            signal_alternate_stack,
+            robust_list,
+            robust_list_len,
+            handling_signal,
+            comm,
+            timerslack_ns: _,
+        } = self;
+
+        // `mm_release()`: the address the kernel writes a 0 into, and
+        // futex-wakes, when this thread dies. It points into the image being
+        // replaced, so past the exec it names whatever the NEW image happens
+        // to have put at that address.
+        *clear_child_tid = 0.into();
+
+        // `begin_new_exec()`. Same story and worse: this one is the head of a
+        // chain of user addresses the kernel walks AND compare-exchanges at
+        // thread exit (see [`walk_robust_list`]). A thread that has just
+        // replaced its address space holds no locks in it.
+        *robust_list = 0.into();
+        *robust_list_len = 0;
+
+        // `sas_ss_reset(me)` in `begin_new_exec()`, which is exactly what
+        // `SignalStack::default()` is: sp and size zero, `SS_DISABLE` set.
+        // Left stale, the next `SA_ONSTACK` signal puts its frame at an
+        // address that belonged to the old image.
+        *signal_alternate_stack = SignalStack::default();
+
+        // A thread may `execve` from inside a signal handler. The `sigreturn`
+        // that would clear these is in the image that just went away, so
+        // without this the new program starts life mid-handler:
+        // `handle_signal` delivers NOTHING while `handling_signal` is set --
+        // Ctrl-C included, for good -- and a stale `saved_sigmask` would be
+        // installed as the new program's mask by the first handler to return.
+        *handling_signal = None;
+        *saved_sigmask = None;
+
+        // execve(2) resets the name to the new image's basename: empty means
+        // "never set", which is how readers fall back to it.
+        comm.clear();
+
+        // Kept on purpose, because execve(2) says so:
+        // - `signals`: the set of pending signals is preserved.
+        // - `signal_mask`: the signal mask is preserved.
+        // - `timerslack_ns`: prctl(2) puts PR_SET_TIMERSLACK among the
+        //   settings that survive both fork and exec, and `begin_new_exec()`
+        //   never touches it.
+    }
+
     /// Handle signal
     pub fn handle_signal(&mut self) -> Option<(Signal, Sigset)> {
         if self.handling_signal.is_none() {
@@ -1274,5 +1340,171 @@ mod robust_list_tests {
         assert_eq!(word(0), 0x1111_1111_1111_1111);
         assert_eq!(word(8) as isize, -16);
         assert_eq!(word(16), 0x3333_3333_3333_3333);
+    }
+}
+
+#[cfg(test)]
+mod exec_reset_tests {
+    //! What a thread must forget when its process calls `execve`, and what it
+    //! must not.
+    //!
+    //! Every field [`LinuxThread::reset_for_exec`] clears holds an address in
+    //! the image `execve` destroys, or handler state whose handler goes with
+    //! it. So each of these is a way the kernel would otherwise reach into
+    //! the NEW program with a number that described the old one.
+
+    use super::*;
+    use crate::signal::SignalStackFlags;
+
+    /// A thread with a NON-DEFAULT value in every single field. A fixture
+    /// that is already empty where the test asserts emptiness asserts
+    /// nothing, so this one leaves nothing at its default.
+    fn a_thread_in_full_swing() -> LinuxThread {
+        let mut signals = Sigset::empty();
+        signals.insert(Signal::SIGUSR2);
+        let mut signal_mask = Sigset::empty();
+        signal_mask.insert(Signal::SIGPIPE);
+        let mut saved = Sigset::empty();
+        saved.insert(Signal::SIGWINCH);
+        LinuxThread {
+            clear_child_tid: 0x7fff_0000.into(),
+            signals,
+            signal_mask,
+            saved_sigmask: Some(saved),
+            signal_alternate_stack: SignalStack {
+                sp: 0x5000_0000,
+                flags: SignalStackFlags::AUTODISARM,
+                size: 0x4000,
+            },
+            robust_list: 0x6000_0000.into(),
+            robust_list_len: core::mem::size_of::<RobustList>(),
+            handling_signal: Some(Signal::SIGUSR2 as u32),
+            comm: String::from("programa-viejo"),
+            timerslack_ns: 1_234_567,
+        }
+    }
+
+    #[test]
+    fn a_thread_that_execs_no_longer_has_an_alternate_signal_stack() {
+        // `sas_ss_reset(me)` in `begin_new_exec()`. That address named the
+        // image `execve` destroyed; the next `SA_ONSTACK` signal would put
+        // its frame there, in the middle of whatever the new program mapped.
+        let mut t = a_thread_in_full_swing();
+        t.reset_for_exec();
+        let alt = t.signal_alternate_stack;
+        // Spelled out rather than compared against `SignalStack::default()`:
+        // a test that checks a value against the very constant it is meant to
+        // pin moves with it and checks nothing.
+        assert_eq!(alt.sp, 0);
+        assert_eq!(alt.size, 0);
+        assert!(alt.flags.contains(SignalStackFlags::DISABLE));
+        // And what that means where it is read: no frame goes there.
+        assert!(!alt.usable_from(0x1000));
+    }
+
+    #[test]
+    fn a_thread_that_execs_holds_no_robust_locks() {
+        // `me->robust_list = NULL` in `begin_new_exec()`. This head is the
+        // one the kernel WALKS and compare-exchanges when the thread dies
+        // (see `walk_robust_list`), so a stale one has it writing
+        // FUTEX_OWNER_DIED into words of the new program that happen to
+        // carry this thread's tid.
+        let mut t = a_thread_in_full_swing();
+        t.reset_for_exec();
+        assert_eq!(t.robust_list.as_addr(), 0);
+        assert_eq!(t.robust_list_len, 0);
+        assert!(walk_robust_list(t.robust_list.as_addr(), |_| {
+            panic!("a thread that has just exec'd must read no user memory")
+        })
+        .is_empty());
+    }
+
+    #[test]
+    fn a_thread_that_execs_forgets_the_set_tid_address_word() {
+        // `mm_release()` sets `tsk->clear_child_tid = NULL`. Kept, the kernel
+        // writes a zero and futex-wakes at that address when the thread dies
+        // -- an address that is now somewhere inside the new program.
+        let mut t = a_thread_in_full_swing();
+        assert_ne!(t.tid_address(), 0, "the fixture must have one to forget");
+        t.reset_for_exec();
+        assert_eq!(t.tid_address(), 0);
+    }
+
+    #[test]
+    fn a_thread_that_execs_from_inside_a_handler_can_still_be_interrupted() {
+        // The `sigreturn` that clears `handling_signal` is in the image
+        // `execve` just destroyed, so it is never coming. `handle_signal`
+        // delivers NOTHING while that field is set, so without this reset the
+        // new program can never be interrupted again -- Ctrl-C included, for
+        // the rest of its life, whatever it does.
+        let mut t = a_thread_in_full_swing();
+        assert!(
+            t.handling_signal.is_some(),
+            "the fixture must exec from inside a handler"
+        );
+        t.reset_for_exec();
+        t.signals.insert(Signal::SIGINT);
+        assert_eq!(
+            t.handle_signal().map(|(sig, _)| sig),
+            Some(Signal::SIGINT),
+            "the new program never got its signal"
+        );
+    }
+
+    #[test]
+    fn a_thread_that_execs_does_not_restore_the_old_programs_mask() {
+        // `saved_sigmask` is the mask an `rt_sigsuspend` asked to have
+        // reinstated once its handler returned. That handler went with the
+        // image, so the mask must not survive to be installed behind the new
+        // program's back by the first handler IT runs.
+        let mut t = a_thread_in_full_swing();
+        t.reset_for_exec();
+        t.signals.insert(Signal::SIGINT);
+        let (_, restore) = t.handle_signal().expect("SIGINT is deliverable");
+        assert!(
+            !restore.contains(Signal::SIGWINCH),
+            "the frame carried the old program's suspend mask"
+        );
+        assert_eq!(restore.val(), t.signal_mask().val());
+    }
+
+    #[test]
+    fn a_thread_that_execs_answers_to_the_new_programs_name() {
+        // execve(2) resets the name to the new image's basename, and empty is
+        // how a reader knows to fall back to it; a stale `prctl(PR_SET_NAME)`
+        // override would have /proc/<pid>/comm naming the program that is
+        // gone.
+        let mut t = a_thread_in_full_swing();
+        t.reset_for_exec();
+        assert!(t.comm.is_empty());
+    }
+
+    #[test]
+    fn signals_that_were_pending_are_still_pending_after_the_exec() {
+        // execve(2): the set of pending signals is preserved. A SIGTERM sent
+        // to a shell between its fork and its exec must still kill the
+        // program the shell went on to run.
+        let mut t = a_thread_in_full_swing();
+        t.reset_for_exec();
+        assert!(t.signals.contains(Signal::SIGUSR2));
+    }
+
+    #[test]
+    fn the_blocked_signal_mask_survives_the_exec() {
+        // execve(2): the signal mask is preserved. This is what a program
+        // that blocks a signal and then execs is relying on -- and it is the
+        // documented way to hand a child a signal already blocked.
+        let mut t = a_thread_in_full_swing();
+        t.reset_for_exec();
+        assert!(t.signal_mask().contains(Signal::SIGPIPE));
+    }
+
+    #[test]
+    fn the_timer_slack_survives_the_exec() {
+        // prctl(2) lists PR_SET_TIMERSLACK among the settings that survive
+        // both fork and exec; `begin_new_exec()` never touches it.
+        let mut t = a_thread_in_full_swing();
+        t.reset_for_exec();
+        assert_eq!(t.timerslack_ns, 1_234_567);
     }
 }

@@ -922,6 +922,30 @@ fn arm_itimer(owner: KoID, which: usize, deadline: Duration, gen: u64) {
 }
 
 /// Deliver `signo` to every thread of process `owner` (mirrors setitimer/alarm).
+/// Disarm and delete every POSIX timer owned by `owner`, returning how many
+/// there were.
+///
+/// `execve` must do this: timer_create(2) says timers "are not inherited by a
+/// child created via fork(2), and are disarmed and deleted during an
+/// execve(2)", and Linux does it in `begin_new_exec()` -> `exit_itimers()`.
+/// Left behind, a timer keeps firing at the same pid -- which past the exec
+/// is a DIFFERENT program. The new image takes a `SIGALRM`, or whatever
+/// signal the old one registered, from a timer it never created, and the
+/// default action for those is to die.
+///
+/// Dropping the entry is all the disarming needed: an already-scheduled
+/// one-shot looks itself up by id when it fires (see `arm_posix_timer`) and
+/// finds nothing.
+///
+/// Interval timers (`setitimer`) are deliberately NOT touched here:
+/// setitimer(2) says those ARE preserved across an `execve`.
+pub fn drop_posix_timers_of(owner: KoID) -> usize {
+    let mut timers = POSIX_TIMERS.lock();
+    let before = timers.len();
+    timers.retain(|_, t| t.owner != owner);
+    before - timers.len()
+}
+
 fn deliver_timer_signal(owner: KoID, signo: usize) {
     if signo == 0 {
         return;
@@ -1129,5 +1153,98 @@ mod adjtimex_tests {
         assert_eq!(setoffset_ns(&ns, true).unwrap(), 250);
         let neg = TimeValI64 { sec: -1, usec: 0 };
         assert_eq!(setoffset_ns(&neg, false).unwrap(), -1_000_000_000);
+    }
+}
+
+#[cfg(test)]
+mod exec_timer_tests {
+    //! timer_create(2): POSIX timers "are disarmed and deleted during an
+    //! execve(2)". They fire at a pid, and past an exec that pid is a
+    //! different program, so one left armed delivers a signal to an image
+    //! that never asked for it — and the default action for `SIGALRM` is to
+    //! die.
+    extern crate std;
+    use super::*;
+
+    /// `POSIX_TIMERS` is one map shared by the whole test binary, so every
+    /// test that writes it takes this first. CI runs with `--test-threads=1`
+    /// and would never see the interference; a developer running the suite in
+    /// parallel would, as a count that is off by someone else's timer.
+    static LOCK: self::std::sync::Mutex<()> = self::std::sync::Mutex::new(());
+
+    fn serialised() -> self::std::sync::MutexGuard<'static, ()> {
+        // A test that panics while holding this poisons it; the tests that
+        // follow are not at fault, so step over the poison.
+        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Register an armed, periodic timer owned by `owner`, as
+    /// `timer_create` + `timer_settime` would leave one.
+    fn a_timer_of(owner: KoID) -> usize {
+        let id = NEXT_TIMER_ID.fetch_add(1, Ordering::Relaxed);
+        POSIX_TIMERS.lock().insert(
+            id,
+            PosixTimer {
+                owner,
+                signo: Signal::SIGALRM as usize,
+                interval: Duration::from_secs(1),
+                next: Duration::from_secs(1),
+                generation: 0,
+            },
+        );
+        id
+    }
+
+    fn still_there(id: usize) -> bool {
+        POSIX_TIMERS.lock().contains_key(&id)
+    }
+
+    #[test]
+    fn an_exec_deletes_the_timers_of_that_process_and_no_others() {
+        let _guard = serialised();
+        let (mine, neighbour) = (0x4711_0001, 0x4711_0002);
+        let one = a_timer_of(mine);
+        let two = a_timer_of(mine);
+        let theirs = a_timer_of(neighbour);
+
+        assert_eq!(drop_posix_timers_of(mine), 2);
+
+        assert!(!still_there(one));
+        assert!(!still_there(two));
+        assert!(
+            still_there(theirs),
+            "an exec in one process took another process's timer"
+        );
+        POSIX_TIMERS.lock().remove(&theirs);
+    }
+
+    #[test]
+    fn deleting_is_what_stops_an_already_scheduled_one_shot() {
+        let _guard = serialised();
+        let owner = 0x4711_0003;
+        let id = a_timer_of(owner);
+        drop_posix_timers_of(owner);
+        // This is the whole disarm: the callback `arm_posix_timer` left in
+        // the timer wheel cannot be cancelled, so when it fires it looks
+        // itself up by id and does nothing at all if the entry is gone.
+        assert!(POSIX_TIMERS.lock().get(&id).is_none());
+    }
+
+    #[test]
+    fn a_second_exec_finds_nothing_left_to_delete() {
+        let _guard = serialised();
+        let owner = 0x4711_0004;
+        a_timer_of(owner);
+        assert_eq!(drop_posix_timers_of(owner), 1);
+        assert_eq!(drop_posix_timers_of(owner), 0);
+    }
+
+    #[test]
+    fn an_exec_in_a_process_with_no_timers_deletes_nothing() {
+        let _guard = serialised();
+        let theirs = a_timer_of(0x4711_0005);
+        assert_eq!(drop_posix_timers_of(0x4711_0006), 0);
+        assert!(still_there(theirs));
+        POSIX_TIMERS.lock().remove(&theirs);
     }
 }

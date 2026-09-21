@@ -899,17 +899,31 @@ impl Syscall<'_> {
         // deterministic `sh` crash in musl mallocng's __malloc_alloc_meta seen
         // when `sh -c gendepends.sh` re-execs into the script.
         proc.set_mapped_brk(initial_brk);
-        proc.apply_exec_metadata(&metadata);
+        // `bprm->secureexec`: whether this exec raised privileges, which
+        // decides part of what the process must forget just below.
+        let privileged = proc.apply_exec_metadata(&metadata);
+        // The rest of what `execve` forgets, process side -- the attachments
+        // to the address space that `vmar.clear()` above destroyed, and the
+        // parent-death signal a parent chose for a program that no longer
+        // exists. The other two halves ran before the swap
+        // (`remove_cloexec_files`, `reset_signal_actions_for_exec`).
+        proc.reset_for_exec(privileged);
+        // timer_create(2): POSIX timers are disarmed and deleted by an
+        // execve. They fire at a pid, and this pid is a different program
+        // now, so one left armed delivers its signal to an image that never
+        // asked for it. (`setitimer` timers survive, and are left alone.)
+        crate::time::drop_posix_timers_of(self.zircon_process().id());
         self.zircon_process()
             .set_name(comm_from_path(&execute_path));
-        // execve(2) resets the task's comm to the new executable's basename:
-        // clearing the prctl(PR_SET_NAME) override makes /proc/<pid>/comm and
-        // PR_GET_NAME fall back to exactly that. try_lock_linux: PID 1 / init can
-        // re-exec (e.g. `exec`ing its real payload) and may carry no LinuxThread
-        // ext; there is no comm override to clear in that case, so skip quietly
-        // instead of unwrap-panicking.
+        // And thread side: the alternate signal stack, the robust futex list,
+        // the `set_tid_address` word and the in-handler state all name the
+        // image that `vmar.clear()` just destroyed, plus the comm override so
+        // /proc/<pid>/comm and PR_GET_NAME fall back to the new basename.
+        // try_lock_linux: PID 1 / init can re-exec (e.g. `exec`ing its real
+        // payload) and may carry no LinuxThread ext; there is nothing to
+        // forget in that case, so skip quietly instead of unwrap-panicking.
         if let Some(mut lt) = self.thread.try_lock_linux() {
-            lt.comm.clear();
+            lt.reset_for_exec();
         }
         // hunter: a new image is now in place — re-apply any default syscall
         // whitelist and reset the anomaly window so a benign-then-malicious

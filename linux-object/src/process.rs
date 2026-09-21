@@ -1600,22 +1600,25 @@ impl LinuxProcess {
     }
 
     /// Apply setuid/setgid exec transitions.
-    pub fn apply_exec_metadata(&self, metadata: &Metadata) {
-        let mut inner = self.inner.lock();
-        // no_new_privs (Documentation/userspace-api/no_new_privs.rst): execve
-        // must not grant privileges the process could not have gained on its
-        // own — setuid/setgid bits on the image are simply not honoured.
-        if inner.no_new_privs {
-            return;
-        }
-        if (metadata.mode & MODE_SET_UID) != 0 {
-            inner.credentials.euid = metadata.uid as u32;
-            inner.credentials.suid = metadata.uid as u32;
-        }
-        if (metadata.mode & MODE_SET_GID) != 0 {
-            inner.credentials.egid = metadata.gid as u32;
-            inner.credentials.sgid = metadata.gid as u32;
-        }
+    ///
+    /// Returns whether this exec actually RAISED privileges -- Linux's
+    /// `bprm->secureexec`, which is what turns on the extra forgetting in
+    /// [`Self::reset_for_exec`].
+    pub fn apply_exec_metadata(&self, metadata: &Metadata) -> bool {
+        self.inner
+            .lock()
+            .apply_exec_ids(metadata.mode, metadata.uid as u32, metadata.gid as u32)
+    }
+
+    /// What `execve` must make the PROCESS forget, once the old address space
+    /// is gone. `privileged` is Linux's `bprm->secureexec`, which
+    /// [`Self::apply_exec_metadata`] returns.
+    ///
+    /// The other halves of the exec reset are [`Self::remove_cloexec_files`],
+    /// [`Self::reset_signal_actions_for_exec`] and, per thread,
+    /// [`LinuxThread::reset_for_exec`](crate::thread::LinuxThread::reset_for_exec).
+    pub fn reset_for_exec(&self, privileged: bool) {
+        self.inner.lock().reset_for_exec(privileged)
     }
 
     /// Set supplementary groups.
@@ -2022,6 +2025,67 @@ impl LinuxProcessInner {
     /// at the fork site. Four fields were getting exactly that. Spelling
     /// every field out makes the compiler ask the question again each time
     /// one is added.
+    /// Honour the set-user-ID / set-group-ID bits of the image `execve` is
+    /// loading, and report whether doing so actually RAISED privileges --
+    /// Linux's `bprm->secureexec`.
+    ///
+    /// A set-user-ID bit naming the id the caller already runs as raises
+    /// nothing, and neither does a `no_new_privs` process, where the bits are
+    /// not honoured at all.
+    fn apply_exec_ids(&mut self, mode: u16, uid: u32, gid: u32) -> bool {
+        // no_new_privs (Documentation/userspace-api/no_new_privs.rst): execve
+        // must not grant privileges the process could not have gained on its
+        // own — setuid/setgid bits on the image are simply not honoured.
+        if self.no_new_privs {
+            return false;
+        }
+        let mut raised = false;
+        if (mode & MODE_SET_UID) != 0 {
+            raised |= self.credentials.euid != uid;
+            self.credentials.euid = uid;
+            self.credentials.suid = uid;
+        }
+        if (mode & MODE_SET_GID) != 0 {
+            raised |= self.credentials.egid != gid;
+            self.credentials.egid = gid;
+            self.credentials.sgid = gid;
+        }
+        raised
+    }
+
+    /// What `execve` must make the process forget, once the old address space
+    /// is gone. `privileged` is `bprm->secureexec`.
+    fn reset_for_exec(&mut self, privileged: bool) {
+        // Every System V segment this process had attached was mapped in the
+        // address space `execve` just cleared; Linux unmaps them with the
+        // rest of the old mm and each `shm_close` accounts its detach. Kept,
+        // these entries claim attachments at addresses that now belong to the
+        // NEW image, and `shmdt` trusts them: it looks the address up in this
+        // very map and unmaps that many bytes there (`sys_shmdt`), so a
+        // detach of a segment the process no longer has punches a hole in the
+        // new program. The segment's attach count never drops either, so an
+        // `IPC_RMID` on it frees nothing.
+        self.shm_identifiers = Default::default();
+
+        // `begin_new_exec()`: `if (bprm->secureexec) me->pdeath_signal = 0;`
+        // The parent picked this signal while the child was still running
+        // code the parent controlled. Keeping it across a privilege-raising
+        // exec would let an unprivileged parent arrange for the now-
+        // privileged process to be signalled the moment the parent exits --
+        // which is precisely the parent's own choice of moment.
+        if privileged {
+            self.pdeathsig = 0;
+        }
+
+        // Left alone on purpose, because execve(2) and friends say so: the
+        // file table (minus close-on-exec, done by `remove_cloexec_files`),
+        // the credentials, the working directory, the process group and
+        // session, `no_new_privs`, the resource limits, and the `setitimer`
+        // interval timers, which setitimer(2) preserves across an exec.
+        // `brk`/`mapped_brk`, `environ`, `cmdline`, `execute_path` and `abi`
+        // are all overwritten by the caller from the new image.
+    }
+
     fn forked_child(&self, pgid: KoID, sid: KoID) -> Self {
         LinuxProcessInner {
             // --- copied from the parent -------------------------------------
@@ -3108,5 +3172,144 @@ mod fork_inheritance_tests {
 
         let child = fork_of(&parent);
         assert!(child.futexes.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod exec_reset_tests {
+    //! What the PROCESS must forget when it calls `execve`: its attachments
+    //! to an address space that no longer exists, and the parent's choice of
+    //! death signal once the exec has made the program privileged.
+
+    use super::*;
+
+    /// A process holding a shared segment at a known address, a parent-death
+    /// signal and an ordinary user's ids, so the tests have something real to
+    /// lose. Nothing here is left at its default: a fixture that is already
+    /// empty where the test asserts emptiness asserts nothing.
+    fn a_process_about_to_exec() -> LinuxProcessInner {
+        use crate::ipc::ShmGuard;
+        use zircon_object::vm::VmObject;
+        let mut inner = LinuxProcessInner::default();
+        let guard = Arc::new(kernel_hal::sync::Mutex::new(ShmGuard {
+            shared_guard: VmObject::new_paged(1),
+            shmid_ds: kernel_hal::sync::Mutex::new(Default::default()),
+        }));
+        inner.shm_identifiers.add(9, guard);
+        let mut ident = inner.shm_identifiers.get(9).unwrap();
+        ident.addr = 0x7f00_0000;
+        inner.shm_identifiers.set(9, ident);
+        inner.pdeathsig = crate::signal::Signal::SIGTERM as u8;
+        inner.credentials.ruid = 1000;
+        inner.credentials.euid = 1000;
+        inner.credentials.suid = 1000;
+        inner.credentials.rgid = 1000;
+        inner.credentials.egid = 1000;
+        inner.credentials.sgid = 1000;
+        inner
+    }
+
+    #[test]
+    fn an_exec_forgets_the_segments_the_old_address_space_had_attached() {
+        // Those mappings died with `vmar.clear()`. The record of where they
+        // were is what `shmdt` trusts: it looks an address up in this very
+        // map and unmaps that many bytes there, so kept across an exec it
+        // punches a hole in the program that is running now.
+        let mut inner = a_process_about_to_exec();
+        assert_eq!(
+            inner.shm_identifiers.get_id(0x7f00_0000),
+            Some(9),
+            "the fixture must be holding a segment to lose"
+        );
+        inner.reset_for_exec(false);
+        assert_eq!(inner.shm_identifiers.get_id(0x7f00_0000), None);
+        assert!(inner.shm_identifiers.get(9).is_none());
+    }
+
+    #[test]
+    fn an_ordinary_exec_keeps_the_parent_death_signal() {
+        // prctl(2) puts PR_SET_PDEATHSIG among the settings an `execve`
+        // preserves; Linux clears it only for a privilege-raising one. A
+        // supervisor that sets it and then execs its real payload is relying
+        // on exactly this.
+        let mut inner = a_process_about_to_exec();
+        inner.reset_for_exec(false);
+        assert_eq!(inner.pdeathsig, crate::signal::Signal::SIGTERM as u8);
+    }
+
+    #[test]
+    fn an_exec_that_raises_privileges_drops_the_parent_death_signal() {
+        // `begin_new_exec()`: `if (bprm->secureexec) me->pdeath_signal = 0;`
+        // The parent chose both the signal and, by exiting, the moment --
+        // while the child was still running code the parent controlled. It
+        // must not keep that lever over a program that is now privileged.
+        let mut inner = a_process_about_to_exec();
+        inner.reset_for_exec(true);
+        assert_eq!(inner.pdeathsig, 0);
+    }
+
+    #[test]
+    fn a_setuid_image_owned_by_another_user_raises_privileges() {
+        let mut inner = a_process_about_to_exec();
+        assert!(inner.apply_exec_ids(0o4755, ROOT_UID, 1000));
+        assert_eq!(inner.credentials.euid, ROOT_UID);
+        // The saved id follows, which is what lets the program drop and
+        // regain the privilege later.
+        assert_eq!(inner.credentials.suid, ROOT_UID);
+        // And the real id does not move: that is the whole point of setuid.
+        assert_eq!(inner.credentials.ruid, 1000);
+    }
+
+    #[test]
+    fn a_setgid_image_alone_raises_privileges_too() {
+        // Its own test because the group half is a second, separate decision
+        // -- and a `raised` that only ever looked at the user half would let
+        // a set-group-ID program keep the lever.
+        let mut inner = a_process_about_to_exec();
+        assert!(inner.apply_exec_ids(0o2755, 1000, 0));
+        assert_eq!(inner.credentials.egid, 0);
+        assert_eq!(inner.credentials.sgid, 0);
+        assert_eq!(inner.credentials.rgid, 1000);
+    }
+
+    #[test]
+    fn a_setuid_bit_naming_the_id_we_already_run_as_raises_nothing() {
+        // Linux's `secureexec` asks whether the ids CHANGED, not whether the
+        // bits were set. A user's own set-user-ID binary grants that user
+        // nothing, so nothing about the process needs hardening.
+        let mut inner = a_process_about_to_exec();
+        assert!(!inner.apply_exec_ids(0o6755, 1000, 1000));
+        assert_eq!(inner.credentials.euid, 1000);
+        assert_eq!(inner.credentials.egid, 1000);
+    }
+
+    #[test]
+    fn an_ordinary_image_raises_nothing() {
+        let mut inner = a_process_about_to_exec();
+        assert!(!inner.apply_exec_ids(0o0755, ROOT_UID, ROOT_UID));
+        assert_eq!(inner.credentials.euid, 1000);
+        assert_eq!(inner.credentials.egid, 1000);
+    }
+
+    #[test]
+    fn no_new_privs_means_the_setuid_bits_are_not_honoured_at_all() {
+        // Documentation/userspace-api/no_new_privs.rst. And since nothing was
+        // granted, nothing was raised: reporting a raise here would have the
+        // process hardened against a privilege it never got.
+        let mut inner = a_process_about_to_exec();
+        inner.no_new_privs = true;
+        assert!(!inner.apply_exec_ids(0o6755, ROOT_UID, ROOT_UID));
+        assert_eq!(inner.credentials.euid, 1000);
+        assert_eq!(inner.credentials.egid, 1000);
+        assert_eq!(inner.credentials.suid, 1000);
+        assert_eq!(inner.credentials.sgid, 1000);
+    }
+
+    #[test]
+    fn the_bits_are_the_ones_linux_uses() {
+        // Pinned against the octal literals, not against each other: a test
+        // that checks a constant with the same constant moves with it.
+        assert_eq!(MODE_SET_UID, 0o4000);
+        assert_eq!(MODE_SET_GID, 0o2000);
     }
 }
