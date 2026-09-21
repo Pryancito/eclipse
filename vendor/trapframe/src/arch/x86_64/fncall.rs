@@ -40,21 +40,37 @@ impl UserContext {
     }
 }
 
-// User: (musl)
+// The kernel state the guest has to find again on its way back in lives in the
+// HOST thread's GS base, not in the guest's thread structure.
+//
+// It used to live at the guest's `fs:48`, on the grounds that a musl
+// `struct pthread` keeps `canary2` there and nothing reads it. Fuchsia's libc
+// does not have that field: its thread structure holds a live pointer at
+// offset 48, so the first syscall a Zircon guest made after its libc
+// initialised read that pointer as a kernel fsbase, loaded a zero out of
+// guest memory sixty-four bytes further on, and died in `pop rsp` with a
+// null stack pointer. That is the `-11` every `Zircon Core Test Libos` run
+// exits with, right after userboot maps the test binary.
+//
+// GS is free on x86_64: neither glibc nor musl nor Fuchsia's libc uses it,
+// and a guest cannot change it (the trap frame carries no gs base, so
+// `arch_prctl(ARCH_SET_GS)` from the guest never reaches the register).
+// Pointing it at the host thread's own fsbase makes both lookups direct and
+// takes the guest's memory out of the path entirely.
+//
+// User: (musl, Fuchsia libc)
 // - fs:0  (pthread.self)       = user fsbase
-// - fs:48 (pthread.canary2)    = kernel fsbase
 //
 // Kernel: (glibc)
-// - fs:0  (pthread.self)       = kernel fsbase
-// - fs:64 (pthread.???)        = kernel stack
+// - fs:0  (pthread.self)       = kernel fsbase, and so does gs:0
+// - fs:64 (pthread.???)        = kernel stack, and so does gs:64
 // - fs:72 (pthread.???)        = init user fsbase
 //
 #[cfg(target_os = "linux")]
 global_asm!(
     r#"
 .macro SWITCH_TO_KERNEL_STACK
-    mov rsp, fs:48          # rsp = kernel fsbase
-    mov rsp, [rsp + 64]     # rsp = kernel stack
+    mov rsp, gs:64          # rsp = kernel stack (gs base == kernel fsbase)
 .endm
 .macro SAVE_KERNEL_STACK
     mov fs:64, rsp
@@ -65,12 +81,16 @@ global_asm!(
 .macro SWITCH_TO_KERNEL_FSBASE
     mov eax, 158            # SYS_arch_prctl
     mov edi, 0x1002         # SET_FS
-    mov rsi, fs:48          # rsi = kernel fsbase
+    mov rsi, gs:0           # rsi = kernel fsbase
     syscall
 .endm
 .macro POP_USER_FSBASE
+    mov rdx, fs:0           # rdx = kernel fsbase (read before fs moves)
+    mov rsi, rdx
+    mov eax, 158            # SYS_arch_prctl
+    mov edi, 0x1001         # SET_GS
+    syscall                 # gs base = kernel fsbase, for the way back in
     mov rsi, [rsp + 18 * 8] # rsi = user fsbase
-    mov rdx, fs:0           # rdx = kernel fsbase
     test rsi, rsi
     jnz 1f                  # if not 0, goto set
 0:  lea rsi, [rdx + 72]     # rsi = init user fsbase
@@ -78,7 +98,6 @@ global_asm!(
 1:  mov eax, 158            # SYS_arch_prctl
     mov edi, 0x1002         # SET_FS
     syscall                 # set fsbase
-    mov fs:48, rdx          # user_fs:48 = kernel fsbase
 .endm
 
 .global syscall_fn_entry
