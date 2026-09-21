@@ -421,23 +421,40 @@ fn mix_streams(
 }
 
 // ── MMIO helpers ────────────────────────────────────────────────────────────
+//
+// In the test binary the BAR is host memory owned by `hda_fake`, and every
+// access also tells the fake, which is what makes the registers behave
+// (a verb posted through CORBWP is answered in the RIRB, a RUN bit moves
+// the engine). Outside tests the hooks compile to nothing.
 fn mmio_r8(bar: usize, off: usize) -> u8 {
+    #[cfg(test)]
+    hda_fake::on_read(bar, off);
     unsafe { read_volatile((bar + off) as *const u8) }
 }
 fn mmio_r16(bar: usize, off: usize) -> u16 {
+    #[cfg(test)]
+    hda_fake::on_read(bar, off);
     unsafe { read_volatile((bar + off) as *const u16) }
 }
 fn mmio_r32(bar: usize, off: usize) -> u32 {
+    #[cfg(test)]
+    hda_fake::on_read(bar, off);
     unsafe { read_volatile((bar + off) as *const u32) }
 }
 fn mmio_w8(bar: usize, off: usize, v: u8) {
     unsafe { write_volatile((bar + off) as *mut u8, v) }
+    #[cfg(test)]
+    hda_fake::on_write(bar, off, v as u32);
 }
 fn mmio_w16(bar: usize, off: usize, v: u16) {
     unsafe { write_volatile((bar + off) as *mut u16, v) }
+    #[cfg(test)]
+    hda_fake::on_write(bar, off, v as u32);
 }
 fn mmio_w32(bar: usize, off: usize, v: u32) {
     unsafe { write_volatile((bar + off) as *mut u32, v) }
+    #[cfg(test)]
+    hda_fake::on_write(bar, off, v);
 }
 
 fn clflush_range(vaddr: usize, len: usize) {
@@ -459,11 +476,19 @@ fn clflush_range(vaddr: usize, len: usize) {
     let _ = (vaddr, len);
 }
 
+#[cfg(not(test))]
 fn wait_us(us: u64) {
     let start = timer_now_as_micros();
     while timer_now_as_micros().wrapping_sub(start) < us {
         core::hint::spin_loop();
     }
+}
+
+/// The test clock only moves when something moves it, so a wait is the
+/// same thing as the time passing.
+#[cfg(test)]
+fn wait_us(us: u64) {
+    crate::nvme::nvme_queue::test_clock::advance(us);
 }
 
 // ── Driver state ────────────────────────────────────────────────────────────
@@ -2387,6 +2412,100 @@ impl HdaInner {
     }
 }
 
+impl HdaInner {
+    /// The driver state over an already-programmed controller: the CORB/RIRB
+    /// and PCM ring it was given, no codec path yet, nothing running. What
+    /// [`HdaDevice::new`] fills in before codec discovery, and what the tests
+    /// build over a fake controller.
+    #[allow(clippy::too_many_arguments)]
+    fn bare(
+        bar: usize,
+        corb_va: usize,
+        corb_entries: usize,
+        rirb_va: usize,
+        rirb_entries: usize,
+        cad: u32,
+        sd_base: usize,
+        ring_va: usize,
+        ring_len: usize,
+        bdl_pa: usize,
+        dma_pos_va: usize,
+    ) -> Self {
+        HdaInner {
+            bar,
+            corb_va,
+            corb_entries,
+            rirb_va,
+            rirb_entries,
+            rirb_rp: 0,
+            cad,
+            conv_nid: 0,
+            pin_nid: 0,
+            digital: false,
+            afg: 0,
+            candidates: Vec::new(),
+            sd_base,
+            stream_tag: 1,
+            ring_va,
+            ring_len,
+            bdl_pa,
+            running: false,
+            last_lpib: 0,
+            last_poll_us: 0,
+            dma_pos_va,
+            last_dpib: 0,
+            dpib_trusted: false,
+            fill_pos: 0,
+            zero_end: 0,
+            mixed_bytes: 0,
+            consumed: 0,
+            wall_last: 0,
+            wall_ticks: 0,
+            lpib_total: 0,
+            dpib_total: 0,
+            stat_lead: 0,
+            lead_now: 0,
+            stat_drains: 0,
+            stat_underruns: 0,
+            stat_idle_stops: 0,
+            stat_restarts: 0,
+            stat_late_fills: 0,
+            stat_stop_timeouts: 0,
+            stat_pos_reads: 0,
+            stat_pos_read_max_us: 0,
+            stat_pos_reads_slow: 0,
+            stat_bad_pos: 0,
+            last_bad_pos: 0,
+            last_bad_prev: 0,
+            last_bad_dt_us: 0,
+            last_bad_src: 0,
+            stat_fifo_err: 0,
+            stat_desc_err: 0,
+            stat_stale_resp: 0,
+            stat_reroutes: 0,
+            last_reroute: (0, 0, 0),
+            sense_probe: Vec::new(),
+            last_kick_us: 0,
+            stream_start_wall: 0,
+            stream_start_us: 0,
+            stops: [StopEvent::default(); STOP_HISTORY],
+            rate: LINK_RATE,
+            channels: 2,
+            gap_since_us: 0,
+            gain_l: 100,
+            gain_r: 100,
+            mute_l: false,
+            mute_r: false,
+            vol: Volume::new(LINK_RATE, 2),
+            streams: Vec::new(),
+            next_stream: 0,
+            mix_acc: alloc::vec![0; FILL_MAX / 2],
+            mix_buf: alloc::vec![0; FILL_MAX],
+            pull_buf: alloc::vec![0; FILL_MAX],
+        }
+    }
+}
+
 impl HdaDevice {
     pub fn new(bar: usize, name: String, is_nvidia: bool) -> DeviceResult<Self> {
         let gcap = mmio_r16(bar, REG_GCAP);
@@ -2521,79 +2640,20 @@ impl HdaDevice {
             }
         };
 
-        let mut inner = HdaInner {
+        let mut inner = HdaInner::bare(
             bar,
             corb_va,
             corb_entries,
             rirb_va,
             rirb_entries,
-            rirb_rp: 0,
             cad,
-            conv_nid: 0,
-            pin_nid: 0,
-            digital: false,
-            afg: 0,
-            candidates: Vec::new(),
             // First output stream descriptor comes after the input ones.
-            sd_base: REG_SD_BASE + iss * 0x20,
-            stream_tag: 1,
+            REG_SD_BASE + iss * 0x20,
             ring_va,
             ring_len,
             bdl_pa,
-            running: false,
-            last_lpib: 0,
-            last_poll_us: 0,
             dma_pos_va,
-            last_dpib: 0,
-            dpib_trusted: false,
-            fill_pos: 0,
-            zero_end: 0,
-            mixed_bytes: 0,
-            consumed: 0,
-            wall_last: 0,
-            wall_ticks: 0,
-            lpib_total: 0,
-            dpib_total: 0,
-            stat_lead: 0,
-            lead_now: 0,
-            stat_drains: 0,
-            stat_underruns: 0,
-            stat_idle_stops: 0,
-            stat_restarts: 0,
-            stat_late_fills: 0,
-            stat_stop_timeouts: 0,
-            stat_pos_reads: 0,
-            stat_pos_read_max_us: 0,
-            stat_pos_reads_slow: 0,
-            stat_bad_pos: 0,
-            last_bad_pos: 0,
-            last_bad_prev: 0,
-            last_bad_dt_us: 0,
-            last_bad_src: 0,
-            stat_fifo_err: 0,
-            stat_desc_err: 0,
-            stat_stale_resp: 0,
-            stat_reroutes: 0,
-            last_reroute: (0, 0, 0),
-            sense_probe: Vec::new(),
-            last_kick_us: 0,
-            stream_start_wall: 0,
-            stream_start_us: 0,
-            stops: [StopEvent::default(); STOP_HISTORY],
-            rate: LINK_RATE,
-            channels: 2,
-            gap_since_us: 0,
-            gain_l: 100,
-            gain_r: 100,
-            mute_l: false,
-            mute_r: false,
-            vol: Volume::new(LINK_RATE, 2),
-            streams: Vec::new(),
-            next_stream: 0,
-            mix_acc: alloc::vec![0; FILL_MAX / 2],
-            mix_buf: alloc::vec![0; FILL_MAX],
-            pull_buf: alloc::vec![0; FILL_MAX],
-        };
+        );
 
         // ── Codec discovery ────────────────────────────────────────────────
         let vendor = inner.param(0, PAR_VENDOR_ID)?;
@@ -3463,6 +3523,10 @@ impl PciDriver for HdaDriverPci {
         Ok(Device::Audio(hda))
     }
 }
+
+#[cfg(test)]
+#[path = "hda_fake.rs"]
+mod hda_fake;
 
 #[cfg(test)]
 mod dai_tests {

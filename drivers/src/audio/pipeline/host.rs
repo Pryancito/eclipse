@@ -690,7 +690,7 @@ mod tests {
         assert!((4700..=4800).contains(&link), "{} link frames", link);
         // What the client is told it has queued is its own count of it.
         let q = s.queued_bytes() / FRAME;
-        assert!(q <= 4410 && q >= 4300, "{} client frames", q);
+        assert!((4300..=4410).contains(&q), "{} client frames", q);
     }
 
     #[test]
