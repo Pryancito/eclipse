@@ -642,21 +642,26 @@ fn a_name_created_without_sync_survives_a_remount() -> Result<()> {
     let sfs = SimpleFileSystem::create(device.clone(), size).expect("failed to create SFS");
     sfs.sync()?;
 
-    // What `create_root_fs` does to the initramfs root on every boot. Scoped so
-    // the handles go away as they do there: `INodeImpl::drop` writes the inode
-    // itself back, which is the half of the metadata that was already durable.
-    {
-        let root = sfs.root_inode();
-        let cache = root.create("cache", FileType::Dir, 0o755)?;
-        cache.create("apk", FileType::Dir, 0o755)?;
-    }
+    // What `create_root_fs` does to the initramfs root on every boot. `apk` is
+    // deliberately still alive at the remount below, the way a mount point is:
+    // `INodeImpl::drop` was the only thing that ever wrote an inode back, so an
+    // inode the kernel keeps forever stayed all zeroes on disk under a
+    // directory entry that named it, and reading it back gave
+    // `FileType::Invalid`.
+    let root = sfs.root_inode();
+    let cache = root.create("cache", FileType::Dir, 0o755)?;
+    let apk = cache.create("apk", FileType::Dir, 0o755)?;
+    drop(cache);
+    drop(root);
     std::mem::forget(sfs);
 
     let sfs = SimpleFileSystem::open(device).expect("failed to reopen SFS");
     let root = sfs.root_inode();
     let cache = root.find("cache")?;
     assert_eq!(cache.metadata()?.type_, FileType::Dir);
-    cache.find("apk")?;
+    let found = cache.find("apk")?;
+    assert_eq!(found.metadata()?.type_, FileType::Dir);
+    std::mem::forget(apk);
     std::mem::forget(sfs);
     Ok(())
 }

@@ -916,6 +916,13 @@ impl SimpleFileSystem {
     /// block marked taken that nothing references. That leaks space, which is
     /// recoverable and harmless, where the other way round is corruption.
     ///
+    /// The inode itself is the third link in the same chain, and the
+    /// `new_inode_*` constructors write it for the same reason: it used to
+    /// reach the device only from `INodeImpl::drop`, so an inode the kernel
+    /// keeps alive forever -- a mount point, say -- stayed all zeroes on disk
+    /// under a directory entry that named it, and the next mount read
+    /// `FileType::Invalid` out of it and panicked with "Unknown file type".
+    ///
     /// Best effort: a device that refuses the write leaves the filesystem
     /// exactly as before, usable in RAM, and `sync` will try again.
     fn sync_freemap_block(&self, free_map: &BitVec<Lsb0, u8>, block_id: BlockId) {
@@ -1013,13 +1020,17 @@ impl SimpleFileSystem {
     fn new_inode_file(&self) -> vfs::Result<Arc<INodeImpl>> {
         let id = self.alloc_block().ok_or(FsError::NoDeviceSpace)?;
         let disk_inode = Dirty::new_dirty(DiskINode::new_file());
-        Ok(self._new_inode(id, disk_inode))
+        let inode = self._new_inode(id, disk_inode);
+        inode.sync_all()?;
+        Ok(inode)
     }
     /// Create a new INode symlink
     fn new_inode_symlink(&self) -> vfs::Result<Arc<INodeImpl>> {
         let id = self.alloc_block().ok_or(FsError::NoDeviceSpace)?;
         let disk_inode = Dirty::new_dirty(DiskINode::new_symlink());
-        Ok(self._new_inode(id, disk_inode))
+        let inode = self._new_inode(id, disk_inode);
+        inode.sync_all()?;
+        Ok(inode)
     }
     /// Create a new INode dir
     fn new_inode_dir(&self, parent: INodeId) -> vfs::Result<Arc<INodeImpl>> {
@@ -1027,6 +1038,7 @@ impl SimpleFileSystem {
         let disk_inode = Dirty::new_dirty(DiskINode::new_dir());
         let inode = self._new_inode(id, disk_inode);
         inode.init_direntry(parent)?;
+        inode.sync_all()?;
         Ok(inode)
     }
     /// Create a new INode chardevice
@@ -1034,6 +1046,7 @@ impl SimpleFileSystem {
         let id = self.alloc_block().ok_or(FsError::NoDeviceSpace)?;
         let disk_inode = Dirty::new_dirty(DiskINode::new_chardevice(device_inode_id));
         let new_inode = self._new_inode(id, disk_inode);
+        new_inode.sync_all()?;
         Ok(new_inode)
     }
     fn flush_weak_inodes(&self) {
