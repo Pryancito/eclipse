@@ -348,29 +348,7 @@ impl ProcessExt for Process {
             perf: crate::perf::ProcPerf::new(),
             itimers: Default::default(),
             aspace_lock: Mutex::new(()),
-            inner: Mutex::new(LinuxProcessInner {
-                execute_path: linux_parent_inner.execute_path.clone(),
-                cmdline: linux_parent_inner.cmdline.clone(),
-                current_working_directory: linux_parent_inner.current_working_directory.clone(),
-                files: linux_parent_inner.files.clone(),
-                // POSIX fork(2): the child gets its own COPY of each fd's
-                // FD_CLOEXEC flag — later fcntl(F_SETFD) in either process
-                // must not affect the other.
-                cloexec_fds: linux_parent_inner.cloexec_fds.clone(),
-                signal_actions: linux_parent_inner.signal_actions.clone(),
-                credentials: linux_parent_inner.credentials.clone(),
-                pgid: parent_pgid,
-                sid: parent_sid,
-                // fork(2)/prctl(2) inheritance: no_new_privs, dumpable, the
-                // execution domain and THP setting carry over; pdeathsig and
-                // the subreaper attribute deliberately do not.
-                no_new_privs: linux_parent_inner.no_new_privs,
-                dumpable: linux_parent_inner.dumpable,
-                personality: linux_parent_inner.personality,
-                abi: linux_parent_inner.abi,
-                thp_disable: linux_parent_inner.thp_disable,
-                ..Default::default()
-            }),
+            inner: Mutex::new(linux_parent_inner.forked_child(parent_pgid, parent_sid)),
         };
         let new_proc = Process::create_with_ext(&parent.job(), "", new_linux_proc)?;
         // Batch the fork's cross-CPU TLB shootdowns into one, but only when
@@ -2036,6 +2014,90 @@ impl LinuxProcess {
 }
 
 impl LinuxProcessInner {
+    /// Everything a `fork(2)` child starts life with, decided field by field.
+    ///
+    /// Written out in full, with no `..Default::default()`, on purpose: a
+    /// field that falls through to its default silently gives the child a
+    /// *fresh* value where Linux gives it the parent's, and nothing says so
+    /// at the fork site. Four fields were getting exactly that. Spelling
+    /// every field out makes the compiler ask the question again each time
+    /// one is added.
+    fn forked_child(&self, pgid: KoID, sid: KoID) -> Self {
+        LinuxProcessInner {
+            // --- copied from the parent -------------------------------------
+            execute_path: self.execute_path.clone(),
+            cmdline: self.cmdline.clone(),
+            // `/proc/<pid>/environ` reads the process's own memory in Linux,
+            // and a fork copies that memory, so a child that has not exec'd
+            // still reports the parent's environment.
+            environ: self.environ.clone(),
+            current_working_directory: self.current_working_directory.clone(),
+            files: self.files.clone(),
+            // POSIX fork(2): the child gets its own COPY of each fd's
+            // FD_CLOEXEC flag — later fcntl(F_SETFD) in either process
+            // must not affect the other.
+            cloexec_fds: self.cloexec_fds.clone(),
+            // RLIMIT_NOFILE survives fork, and this is the field that really
+            // caps the fd table. Resetting it undid every `ulimit -n` the
+            // moment the shell forked -- which is the only way a program ever
+            // gets a raised limit.
+            file_limit: self.file_limit,
+            signal_actions: self.signal_actions.clone(),
+            credentials: self.credentials.clone(),
+            pgid,
+            sid,
+            // fork(2)/prctl(2) inheritance: no_new_privs, dumpable, the
+            // execution domain and THP setting carry over.
+            no_new_privs: self.no_new_privs,
+            dumpable: self.dumpable,
+            personality: self.personality,
+            abi: self.abi,
+            thp_disable: self.thp_disable,
+            // The heap. `fork` copies the address space, so the heap is there
+            // in the child -- but the bookkeeping that says where it ends was
+            // starting from zero, and `sys_brk` answers every call with the
+            // old break when the break is below the heap base. So `brk` in a
+            // forked child could not move at all, and `sbrk(0)` reported 0.
+            // A child that never execs -- a subshell, a zygote -- had its
+            // allocator silently pushed onto mmap for the rest of its life.
+            brk: self.brk,
+            mapped_brk: self.mapped_brk,
+            // shmat(2): the attachments come along with the copied address
+            // space, so the child must be able to `shmdt` them. Without the
+            // record it cannot, and the mapping stays for the child's life.
+            shm_identifiers: self.shm_identifiers.clone(),
+
+            // --- deliberately fresh -----------------------------------------
+            // A child has no children of its own, and no accumulated times
+            // for them: Linux zeroes `cutime`/`cstime` in `copy_process`.
+            children: Default::default(),
+            reaped_children: Default::default(),
+            children_utime_ns: 0,
+            children_stime_ns: 0,
+            // `p->pdeath_signal = 0` in `copy_process`, and the subreaper
+            // attribute is the parent's own role, not a child's.
+            pdeathsig: 0,
+            child_subreaper: false,
+            // Not stopped, and nothing pending to report to a waiter.
+            job_stopped: false,
+            job_stop_sig: 0,
+            job_stop_pending: false,
+            job_continued_pending: false,
+            // Kernel-side futex objects are keyed by address in *this*
+            // address space; the child gets its own.
+            futexes: Default::default(),
+            // `SemProc`'s own `Clone` says what a fork needs -- "Fork the
+            // semaphore table. Clear undo info." -- and fork was not using
+            // it. Through `..Default::default()` the child lost the sets its
+            // parent had open as well, and the ids are per-process indices,
+            // so an id the parent passed down named nothing in the child
+            // until it did its own `semget`. SEM_UNDO really is not
+            // inherited by a plain fork (only `CLONE_SYSVSEM` shares it), and
+            // that is exactly what the `Clone` drops.
+            semaphores: self.semaphores.clone(),
+        }
+    }
+
     /// Fold a reaped child's CPU usage into the RUSAGE_CHILDREN totals.
     fn add_children_cpu(&mut self, cpu: ChildCpu) {
         self.children_utime_ns += cpu.utime_ns;
@@ -2790,5 +2852,261 @@ pub fn send_signal_to_process(pid: usize, signal: LinuxSignal) -> LxResult<()> {
         Ok(())
     } else {
         Err(LxError::ESRCH)
+    }
+}
+
+#[cfg(test)]
+mod fork_inheritance_tests {
+    //! What a `fork(2)` child starts life with. Every one of these is a
+    //! one-line decision that is invisible at the call site and wrong in only
+    //! one direction: a field that quietly falls back to its default gives
+    //! the child a fresh value where Linux gives it the parent's, and nothing
+    //! fails -- the child just behaves as if the parent had never configured
+    //! anything. Four were doing exactly that.
+
+    use super::*;
+
+    /// A parent with every field set to something that is *not* its default,
+    /// so a field the fork forgets shows up as the default and a field it
+    /// copies shows up as this.
+    fn a_configured_parent() -> LinuxProcessInner {
+        let mut p = LinuxProcessInner {
+            execute_path: String::from("/usr/bin/labwc"),
+            cmdline: alloc::vec![String::from("labwc"), String::from("-s")],
+            environ: alloc::vec![String::from("WAYLAND_DISPLAY=wayland-0")],
+            current_working_directory: String::from("/home/moebius"),
+            file_limit: RLimit {
+                cur: 65536,
+                max: 65536,
+            },
+            brk: 0x5555_0010_0000,
+            mapped_brk: 0x5555_0020_0000,
+            pgid: 41,
+            sid: 42,
+            no_new_privs: true,
+            dumpable: Some(0),
+            personality: 0x0004_0000,
+            thp_disable: true,
+            children_utime_ns: 111,
+            children_stime_ns: 222,
+            pdeathsig: 15,
+            child_subreaper: true,
+            job_stopped: true,
+            job_stop_sig: 19,
+            job_stop_pending: true,
+            job_continued_pending: true,
+            ..Default::default()
+        };
+        p.cloexec_fds.insert(7.into());
+        p.files.insert(
+            7.into(),
+            crate::fs::Inotify::new(crate::fs::OpenFlags::empty()) as Arc<dyn FileLike>,
+        );
+        p
+    }
+
+    fn fork_of(parent: &LinuxProcessInner) -> LinuxProcessInner {
+        parent.forked_child(41, 42)
+    }
+
+    #[test]
+    fn the_file_descriptor_limit_survives_the_fork() {
+        // `ulimit -n 65536` only ever reaches a program through a fork: the
+        // shell raises its own limit and then forks. Resetting it here undid
+        // every raise in the system, silently, and the program hit EMFILE at
+        // the default -- the failure a raised limit exists to prevent.
+        let child = fork_of(&a_configured_parent());
+        assert_eq!(child.file_limit.cur, 65536);
+        assert_eq!(child.file_limit.max, 65536);
+    }
+
+    #[test]
+    fn the_heap_bookkeeping_survives_the_fork() {
+        // `fork` copies the address space, so the heap is in the child. The
+        // numbers that say where it ends were starting from zero, and
+        // `sys_brk` returns the old break unchanged for anything below the
+        // heap base -- so in a forked child `brk` could not move at all and
+        // `sbrk(0)` answered 0. A child that never execs (a subshell, a
+        // zygote) had its allocator pushed onto mmap for good.
+        let child = fork_of(&a_configured_parent());
+        assert_eq!(child.brk, 0x5555_0010_0000);
+        assert_eq!(child.mapped_brk, 0x5555_0020_0000);
+    }
+
+    #[test]
+    fn the_environment_survives_the_fork() {
+        // `/proc/<pid>/environ` reads the process's own memory in Linux, and
+        // a fork copies that memory. A child that has not exec'd reported an
+        // empty environment.
+        let child = fork_of(&a_configured_parent());
+        assert_eq!(
+            child.environ,
+            alloc::vec![String::from("WAYLAND_DISPLAY=wayland-0")]
+        );
+    }
+
+    #[test]
+    fn the_working_directory_and_command_line_survive_the_fork() {
+        let child = fork_of(&a_configured_parent());
+        assert_eq!(child.current_working_directory, "/home/moebius");
+        assert_eq!(child.execute_path, "/usr/bin/labwc");
+        assert_eq!(child.cmdline.len(), 2);
+    }
+
+    #[test]
+    fn the_close_on_exec_set_is_copied_and_not_shared() {
+        // POSIX: the child gets its own copy of each fd's FD_CLOEXEC flag, so
+        // a later `fcntl(F_SETFD)` in either process must not reach the other.
+        let parent = a_configured_parent();
+        let mut child = fork_of(&parent);
+        assert!(child.cloexec_fds.contains(&7.into()));
+        child.cloexec_fds.remove(&7.into());
+        assert!(
+            parent.cloexec_fds.contains(&7.into()),
+            "the child's copy must be its own"
+        );
+    }
+
+    #[test]
+    fn the_prctl_settings_that_linux_inherits_do() {
+        // A `no_new_privs` that did not survive fork would hand a child back
+        // the setuid behaviour its parent gave up -- the one thing the flag
+        // exists to make irreversible.
+        let child = fork_of(&a_configured_parent());
+        assert!(child.no_new_privs);
+        assert_eq!(child.dumpable, Some(0));
+        assert_eq!(child.personality, 0x0004_0000);
+        assert!(child.thp_disable);
+    }
+
+    #[test]
+    fn the_process_group_and_session_are_the_resolved_ones_passed_in() {
+        // Not the parent's raw fields: an unset (0) pgid means "the parent's
+        // own pid", and the child needs the concrete value or a Ctrl-C never
+        // reaches it.
+        let mut parent = a_configured_parent();
+        parent.pgid = 0;
+        parent.sid = 0;
+        let child = parent.forked_child(1234, 5678);
+        assert_eq!(child.pgid, 1234);
+        assert_eq!(child.sid, 5678);
+    }
+
+    #[test]
+    fn the_open_files_survive_the_fork() {
+        // The one thing everybody knows a fork does. It is here so the
+        // exhaustive list above cannot lose it while nobody is looking.
+        let child = fork_of(&a_configured_parent());
+        assert!(child.files.contains_key(&7.into()));
+    }
+
+    #[test]
+    fn a_child_starts_with_no_children_of_its_own() {
+        let mut parent = a_configured_parent();
+        parent.reaped_children.insert(99, (0, Default::default()));
+        let child = fork_of(&parent);
+        assert!(child.children.is_empty());
+        assert!(
+            child.reaped_children.is_empty(),
+            "a newborn child has reaped nobody"
+        );
+        // `copy_process` zeroes `cutime`/`cstime`: a child must not be born
+        // already credited with the CPU time of its parent's other children,
+        // or `times(2)` double-counts it up the whole tree.
+        assert_eq!(child.children_utime_ns, 0);
+        assert_eq!(child.children_stime_ns, 0);
+    }
+
+    #[test]
+    fn a_child_is_not_born_stopped_or_owing_a_notification() {
+        // `job_stopped` carried over would leave the child parked before its
+        // first instruction, waiting for a SIGCONT nobody will send it; the
+        // pending flags carried over would make its first `waitpid` report a
+        // stop that happened to its parent.
+        let child = fork_of(&a_configured_parent());
+        assert!(!child.job_stopped);
+        assert_eq!(child.job_stop_sig, 0);
+        assert!(!child.job_stop_pending);
+        assert!(!child.job_continued_pending);
+    }
+
+    #[test]
+    fn the_parents_own_roles_are_not_handed_down() {
+        // `p->pdeath_signal = 0` in `copy_process`: the signal is "tell me
+        // when MY parent dies", so inheriting it would have the child killed
+        // when its grandparent exits. The subreaper attribute is likewise the
+        // parent's role, not something a child is born holding.
+        let child = fork_of(&a_configured_parent());
+        assert_eq!(child.pdeathsig, 0);
+        assert!(!child.child_subreaper);
+    }
+
+    #[test]
+    fn the_semaphore_undo_state_is_not_inherited() {
+        // A plain `fork` does NOT share SEM_UNDO state -- only
+        // `CLONE_SYSVSEM` does. Copying it would have the child undo, on its
+        // own exit, semaphore operations that its parent performed and that
+        // the parent will undo again.
+        let mut parent = a_configured_parent();
+        let id = parent
+            .semaphores
+            .add(crate::ipc::SemArray::get_or_create(0, 1, 0o666).unwrap());
+        parent.semaphores.add_undo(id, 0, -1);
+
+        let child = fork_of(&parent);
+        assert!(
+            child.semaphores.owes_no_undo(),
+            "a forked child owes no semaphore undo"
+        );
+        // ...but it keeps the sets the parent had open. The ids are
+        // per-process indices, so dropping the table left an id the parent
+        // passed down naming nothing in the child.
+        assert!(
+            child.semaphores.get(id).is_some(),
+            "the child must still find the set its parent had open"
+        );
+    }
+
+    #[test]
+    fn the_shared_memory_attachments_survive_the_fork() {
+        // `fork` copies the address space, so the segments the parent had
+        // attached are mapped in the child too -- it is holding them whether
+        // the kernel remembers or not. Without the record the child cannot
+        // `shmdt` them, so the mapping stays for its whole life, and the
+        // segment's use count is wrong. This is the same bookkeeping whose
+        // loss on `IPC_RMID` leaked an address range per X11 frame.
+        use crate::ipc::ShmGuard;
+        use zircon_object::vm::VmObject;
+        let mut parent = a_configured_parent();
+        let guard = Arc::new(kernel_hal::sync::Mutex::new(ShmGuard {
+            shared_guard: VmObject::new_paged(1),
+            shmid_ds: kernel_hal::sync::Mutex::new(Default::default()),
+        }));
+        parent.shm_identifiers.add(9, guard);
+        let mut ident = parent.shm_identifiers.get(9).unwrap();
+        ident.addr = 0x7f00_0000;
+        parent.shm_identifiers.set(9, ident);
+
+        let child = fork_of(&parent);
+        assert_eq!(
+            child.shm_identifiers.get_id(0x7f00_0000),
+            Some(9),
+            "the child must be able to find the segment it inherited"
+        );
+    }
+
+    #[test]
+    fn the_kernel_side_futex_objects_are_not_inherited() {
+        // They are keyed by address in the parent's address space and hold
+        // its waiters. The child's memory is a copy: same addresses,
+        // different pages, and nobody waiting. Handing the child the
+        // parent's objects would have a `futex_wake` in the child reach
+        // threads of the parent that are waiting on their own memory.
+        static WORD: AtomicI32 = AtomicI32::new(0);
+        let mut parent = a_configured_parent();
+        parent.futexes.insert(0x1000, Futex::new(&WORD));
+
+        let child = fork_of(&parent);
+        assert!(child.futexes.is_empty());
     }
 }
