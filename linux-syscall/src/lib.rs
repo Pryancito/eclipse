@@ -36,6 +36,7 @@ use zircon_object::task::{CurrentThread, Process, ThreadFn};
 use zircon_object::vm::VirtAddr;
 
 use self::consts::SyscallType as Sys;
+use self::file::poll_timeout_msecs;
 
 mod consts {
     // generated from syscall.h.in
@@ -346,8 +347,15 @@ impl Syscall<'_> {
             Sys::EPOLL_CREATE1 => self.sys_epoll_create1(a0),
             Sys::EPOLL_CTL => self.sys_epoll_ctl(a0.into(), a1 as i32, a2.into(), a3.into()),
             Sys::EPOLL_PWAIT => {
-                self.sys_epoll_pwait(a0.into(), a1.into(), a2, a3 as isize, a4.into(), a5)
-                    .await
+                self.sys_epoll_pwait(
+                    a0.into(),
+                    a1.into(),
+                    a2,
+                    poll_timeout_msecs(a3),
+                    a4.into(),
+                    a5,
+                )
+                .await
             }
             Sys::EVENTFD2 => self.sys_eventfd2(a0 as u32, a1),
             // Legacy `inotify_init` exists only in the x86_64 table; the generic
@@ -733,7 +741,7 @@ impl Syscall<'_> {
             Sys::OPEN => self.sys_open(a0.into(), a1, a2),
             Sys::STAT => self.sys_stat(a0.into(), a1.into()),
             Sys::LSTAT => self.sys_lstat(a0.into(), a1.into()),
-            Sys::POLL => self.sys_poll(a0.into(), a1, a2 as _).await,
+            Sys::POLL => self.sys_poll(a0.into(), a1, poll_timeout_msecs(a2)).await,
             Sys::ACCESS => self.sys_access(a0.into(), a1),
             Sys::PIPE => self.sys_pipe(a0.into()),
             Sys::SELECT => {
@@ -760,7 +768,7 @@ impl Syscall<'_> {
             Sys::CLONE => self.sys_clone(a0, a1, a2.into(), a4, a3.into()).await,
             Sys::EPOLL_CREATE => self.sys_epoll_create(a0),
             Sys::EPOLL_WAIT => {
-                self.sys_epoll_wait(a0.into(), a1.into(), a2, a3 as isize)
+                self.sys_epoll_wait(a0.into(), a1.into(), a2, poll_timeout_msecs(a3))
                     .await
             }
             _ => self.unknown_syscall(sys_type),
