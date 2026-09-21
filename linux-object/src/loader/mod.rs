@@ -50,6 +50,38 @@ fn detect_abi(data: &[u8], _elf: &ElfFile) -> Abi {
     Abi::Linux
 }
 
+/// Split a shebang line into the interpreter and its single optional argument.
+///
+/// POSIX splits on ASCII space/tab only, and passes everything after the first
+/// separator as ONE argument, however many spaces it contains.
+fn split_shebang(line: &str) -> Option<(&str, Option<&str>)> {
+    let mut parts = line.splitn(2, [' ', '\t']);
+    let interp = match parts.next() {
+        Some(i) if !i.is_empty() => i,
+        _ => return None,
+    };
+    let arg = parts.next().map(|s| s.trim()).filter(|s| !s.is_empty());
+    Some((interp, arg))
+}
+
+/// The interpreter named by a `#!` line at the head of `data`, if it is a
+/// script at all. Scans at most the first 512 bytes, as the loader does.
+fn shebang_interp(data: &[u8]) -> Option<&str> {
+    if !data.starts_with(b"#!") {
+        return None;
+    }
+    let scan_limit = data.len().min(512);
+    let newline = data[..scan_limit]
+        .iter()
+        .position(|&b| b == b'\n')
+        .unwrap_or(scan_limit);
+    let line = core::str::from_utf8(data.get(2..newline)?)
+        .ok()?
+        .trim_end_matches('\r')
+        .trim();
+    split_shebang(line).map(|(interp, _)| interp)
+}
+
 /// Stack top: place the user stack at the very top of the user address space so
 /// that the heap (at `initial_brk` just after the loaded image) never collides
 /// with the stack.  Linux uses a similar high-address default for the stack.
@@ -131,6 +163,55 @@ impl LinuxElfLoader {
     /// Maximum number of interpreter levels (shebang + ELF PT_INTERP combined).
     const MAX_INTERP_DEPTH: usize = 4;
 
+    /// Walk the shebang interpreter chain, resolving every level, WITHOUT
+    /// loading or mapping anything.
+    ///
+    /// `execve` has a point of no return: `vmar.clear()` destroys the calling
+    /// process's address space, and every step after it is assumed to succeed.
+    /// A shebang whose interpreter does not exist used to be discovered
+    /// *after* that point, so the ENOENT was returned to a process whose code
+    /// was no longer mapped, and it faulted on the instruction after the
+    /// syscall:
+    ///
+    /// ```text
+    /// shebang: lookup interp "usr/bin/env" failed: EntryNotFound
+    /// execve: LinuxElfLoader::load failed: ENOENT
+    /// unhandled page fault @ 0x55991a(EXECUTE | USER) [unmapped] -> SIGSEGV
+    /// ```
+    ///
+    /// Linux resolves the whole chain while building the `bprm`, before
+    /// `begin_new_exec` commits, so a missing interpreter is an ordinary
+    /// ENOENT and the shell simply reports "not found". Call this before the
+    /// clear and let its error propagate while the caller is still whole.
+    ///
+    /// Only the head of each file is read -- a shebang line is at most 512
+    /// bytes -- so this costs one `read_at` per interpreter level, and nothing
+    /// at all for the ELF case, which is the overwhelmingly common one.
+    pub fn preflight_interpreters(&self, head: &[u8]) -> LxResult<()> {
+        let mut buf = [0u8; 512];
+        let mut n = head.len().min(buf.len());
+        buf[..n].copy_from_slice(&head[..n]);
+        // One more level than the loader accepts: going deeper is the loader's
+        // error to report, with its own message, not this check's.
+        for _ in 0..=Self::MAX_INTERP_DEPTH {
+            let interp = match shebang_interp(&buf[..n]) {
+                Some(i) => i,
+                // Not a script: an ELF (or garbage the loader will reject).
+                None => return Ok(()),
+            };
+            let inode = self
+                .root_inode
+                .lookup_follow(interp.trim_start_matches('/'), 1)
+                .map_err(|e| {
+                    warn!("execve: interpreter {:?} does not resolve: {:?}", interp, e);
+                    e
+                })?;
+            // An interpreter may itself be a script, so keep walking.
+            n = inode.read_at(0, &mut buf)?;
+        }
+        Ok(())
+    }
+
     /// Internal recursive loader that tracks interpreter depth.
     fn load_impl(
         &self,
@@ -179,13 +260,10 @@ impl LinuxElfLoader {
                 .map_err(|_| ZxError::INVALID_ARGS)?
                 .trim_end_matches('\r')
                 .trim();
-            // Split only on ASCII space/tab (POSIX shebang convention).
-            let mut parts = line.splitn(2, [' ', '\t']);
-            let interp = match parts.next() {
-                Some(i) if !i.is_empty() => i,
-                _ => return Err(ZxError::INVALID_ARGS.into()),
+            let (interp, interp_arg) = match split_shebang(line) {
+                Some(pair) => pair,
+                None => return Err(ZxError::INVALID_ARGS.into()),
             };
-            let interp_arg = parts.next().map(|s| s.trim()).filter(|s| !s.is_empty());
             debug!(
                 "shebang: interp={:?}, arg={:?}, script={:?}",
                 interp, interp_arg, path
@@ -646,5 +724,50 @@ impl LinuxElfLoader {
         // still mmaps, and the collision is the same one.
         let initial_brk = HEAP_BASE;
         Ok((entry, sp, initial_brk, path, abi))
+    }
+}
+
+#[cfg(test)]
+mod shebang_tests {
+    use super::*;
+
+    /// The interpreter is everything up to the first space or tab, and the
+    /// rest of the line is ONE argument however many spaces it holds -- that
+    /// is what makes `#!/usr/bin/env python3` work at all.
+    #[test]
+    fn a_shebang_splits_into_interpreter_and_one_argument() {
+        assert_eq!(split_shebang("/bin/sh"), Some(("/bin/sh", None)));
+        assert_eq!(
+            split_shebang("/usr/bin/env python3"),
+            Some(("/usr/bin/env", Some("python3")))
+        );
+        // Everything after the first separator is a single argument.
+        assert_eq!(
+            split_shebang("/usr/bin/awk -f -v x=1"),
+            Some(("/usr/bin/awk", Some("-f -v x=1")))
+        );
+        assert_eq!(split_shebang("/bin/sh\t-e"), Some(("/bin/sh", Some("-e"))));
+        assert_eq!(split_shebang(""), None);
+    }
+
+    /// `preflight_interpreters` must say "not a script" for anything that is
+    /// not a `#!` file, because the preflight runs on EVERY exec and an ELF
+    /// must not pay for it -- nor be rejected by it.
+    #[test]
+    fn only_a_hash_bang_file_names_an_interpreter() {
+        assert_eq!(shebang_interp(b"#!/bin/sh\necho hi\n"), Some("/bin/sh"));
+        assert_eq!(
+            shebang_interp(b"#!/usr/bin/env bash\n"),
+            Some("/usr/bin/env")
+        );
+        // A trailing CR (a script written on Windows) is not part of the path.
+        assert_eq!(shebang_interp(b"#!/bin/sh\r\n"), Some("/bin/sh"));
+        // Leading blanks after the `#!` are allowed and skipped.
+        assert_eq!(shebang_interp(b"#!  /bin/sh\n"), Some("/bin/sh"));
+        assert_eq!(shebang_interp(b"\x7fELF\x02\x01\x01"), None);
+        assert_eq!(shebang_interp(b"echo not a script\n"), None);
+        assert_eq!(shebang_interp(b""), None);
+        // No newline at all: the whole (bounded) file is the line.
+        assert_eq!(shebang_interp(b"#!/bin/sh"), Some("/bin/sh"));
     }
 }

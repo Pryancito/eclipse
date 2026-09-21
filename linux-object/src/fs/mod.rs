@@ -861,19 +861,36 @@ pub fn create_root_fs(rootfs: Arc<dyn FileSystem>) -> Arc<dyn INode> {
         .map(|_| devfs::new_audio_claim())
         .collect();
 
-    // Add OSS PCM playback nodes: `/dev/dsp` for card 0, `/dev/dsp1`, … for
-    // the rest (typically remaining analog or extra HDMI functions).
+    // Add the OSS nodes: `/dev/dsp` + `/dev/audio` + `/dev/mixer` for card
+    // 0, `/dev/dsp1` etc. for the rest (typically remaining analog or extra
+    // HDMI functions). `audio` is the µ-law variant of the same PCM node and
+    // shares its claim; the mixer is the OSS view of the card's gain.
     {
-        use devfs::DspDev;
+        use devfs::{DspDev, MixerDev, OssDefaults};
         for (idx, audio) in audio_cards.iter().enumerate() {
-            let fname = if idx == 0 {
-                "dsp".to_string()
+            let suffix = if idx == 0 {
+                String::new()
             } else {
-                format!("dsp{}", idx)
+                idx.to_string()
             };
+            let fname = format!("dsp{}", suffix);
             info!("/dev/{} -> audio device '{}'", fname, audio.name());
             let dsp = DspDev::with_claim(audio.clone(), idx, audio_claims[idx].clone());
             if let Err(e) = devfs_root.add(&fname, Arc::new(dsp)) {
+                warn!("failed to mknod /dev/{}: {:?}", fname, e);
+            }
+            let fname = format!("audio{}", suffix);
+            let sun = DspDev::with_defaults(
+                audio.clone(),
+                idx,
+                audio_claims[idx].clone(),
+                OssDefaults::Audio,
+            );
+            if let Err(e) = devfs_root.add(&fname, Arc::new(sun)) {
+                warn!("failed to mknod /dev/{}: {:?}", fname, e);
+            }
+            let fname = format!("mixer{}", suffix);
+            if let Err(e) = devfs_root.add(&fname, Arc::new(MixerDev::new(audio.clone(), idx))) {
                 warn!("failed to mknod /dev/{}: {:?}", fname, e);
             }
         }

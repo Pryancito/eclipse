@@ -273,9 +273,33 @@ pub fn run_userboot(zbi: impl AsRef<[u8]>, cmdline: &str) -> Arc<Process> {
     // kcounter
     let (desc_vmo, arena_vmo) = kcounter_vmos();
 
-    // Resources. Only the name matters to userboot: it takes the one called
-    // "vmex" as its VMEX capability (used to make bootfs VMOs executable) and
-    // hands the rest on to the programs it starts.
+    // Resources. Only the name matters to userboot: it looks each one up by
+    // name ("system", "vmex", "mmio", "irq", "io_port"/"smc", "power"), takes
+    // the one called "vmex" as its own VMEX capability (used to make bootfs
+    // VMOs executable) and hands the rest on to the programs it starts.
+    //
+    // The root of the SYSTEM kind. Without it `zx_take_startup_handle`
+    // returns nothing for `PA_SYSTEM_RESOURCE` in the program userboot
+    // starts, and Fuchsia's standalone test runtime asserts in
+    // `standalone-init.cc` ("standalone test didn't receive system
+    // resource") the moment it sets itself up. That assertion never gets
+    // printed, either: it fires from inside the initializer of the very
+    // singleton that `__assert_fail`'s printf path needs, so
+    // `__cxa_guard_acquire` blocks on the guard its own caller holds and the
+    // process wedges in `futex.wait ... deadline=Forever` with nobody left to
+    // wake it. That was `Zircon Core Test Baremetal (x86_64)` timing out
+    // before it could list a single test.
+    //
+    // The range covers every subrange this kernel knows about (see
+    // `SystemResource`), which is what makes it the parent capability the
+    // named ones are carved out of.
+    let system_resource = Resource::create(
+        "system",
+        ResourceKind::SYSTEM,
+        0,
+        SystemResource::Debuglog as usize + 1,
+        ResourceFlags::empty(),
+    );
     let vmex_resource = Resource::create(
         "vmex",
         ResourceKind::SYSTEM,
@@ -377,6 +401,7 @@ pub fn run_userboot(zbi: impl AsRef<[u8]>, cmdline: &str) -> Arc<Process> {
     handles.extend(process_capabilities());
     handles.extend(alloc::vec![
         Handle::new(job, Rights::DEFAULT_JOB),
+        Handle::new(system_resource, Rights::DEFAULT_RESOURCE),
         Handle::new(vmex_resource, Rights::DEFAULT_RESOURCE),
         Handle::new(mmio_resource, Rights::DEFAULT_RESOURCE),
         Handle::new(irq_resource, Rights::DEFAULT_RESOURCE),

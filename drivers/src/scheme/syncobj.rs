@@ -353,7 +353,19 @@ pub fn attach_hw_fence(
             // until THIS submit lands, and drop the fence the slot carried,
             // which this one supersedes.
             obj.point = 0;
-            table.pending.retain(|f| f.handle != handle);
+            // Only the fences this binary signal actually supersedes, i.e. the
+            // ones inside binary range. Dropping every pending fence on the
+            // handle threw away a timeline fence in flight at a higher point --
+            // the same bug the test below guards for a handle already driven
+            // past binary range, which this arm (cur <= 1) never reached. With
+            // its fence gone nothing would ever advance the counter to that
+            // point, so a TIMELINE_WAIT on it parked until its deadline, which
+            // for NVK's INT64_MAX is forever. Linux cannot hit this at all: a
+            // binary replace swaps the single fence slot and cannot delete a
+            // `dma_fence_chain` node at a higher seqno.
+            table
+                .pending
+                .retain(|f| !(f.handle == handle && f.point <= 1));
         } else if point <= cur {
             // Already past that point: nothing to wait for.
             //
@@ -456,7 +468,9 @@ pub fn destroy(handle: u32) -> bool {
         return true;
     }
     table.objects.swap_remove(pos);
-    table.pending.retain(|f| f.handle != handle);
+    table
+        .pending
+        .retain(|f| !(f.handle == handle && f.point <= 1));
     PENDING_COUNT.store(table.pending.len(), Ordering::Relaxed);
     true
 }
@@ -685,7 +699,9 @@ pub fn reset(handle: u32) -> bool {
     };
     obj.point = 0;
     obj.linked = None;
-    table.pending.retain(|f| f.handle != handle);
+    table
+        .pending
+        .retain(|f| !(f.handle == handle && f.point <= 1));
     PENDING_COUNT.store(table.pending.len(), Ordering::Relaxed);
     true
 }
@@ -830,7 +846,19 @@ fn wait_ready_inner(
                 d.run();
                 return Some(Err(WaitOutcome::Invalid));
             };
-            let target = points.map(|p| p[i]).unwrap_or(1);
+            // Point 0 is NOT "already satisfied". Linux resolves a wait point
+            // through `drm_syncobj_find_fence()`, and point 0 there means "the
+            // syncobj's current fence" -- the wait still blocks until that
+            // fence signals. With a bare `point >= 0` an unsignaled, fenceless
+            // syncobj reported itself signaled, and Mesa's
+            // `vk_drm_syncobj_wait_many` passes wait_value 0 for the BINARY
+            // syncs in any batch that also carries a timeline one. So every
+            // mixed `vkWaitSemaphores`/`vkQueueSubmit` wait list returned
+            // VK_SUCCESS on its binary halves without waiting, and NVK went on
+            // to recycle command buffers the GPU was still reading. Flooring to
+            // 1 is what the rest of this module already does (`export_snapshot`,
+            // `transfer`, the eventfd registry).
+            let target = points.map(|p| p[i]).unwrap_or(1).max(1);
             let pending_covers = available_only
                 && table
                     .pending
@@ -892,7 +920,19 @@ fn wait_inner(
                     account(false);
                     return WaitOutcome::Invalid;
                 };
-                let target = points.map(|p| p[i]).unwrap_or(1);
+                // Point 0 is NOT "already satisfied". Linux resolves a wait point
+                // through `drm_syncobj_find_fence()`, and point 0 there means "the
+                // syncobj's current fence" -- the wait still blocks until that
+                // fence signals. With a bare `point >= 0` an unsignaled, fenceless
+                // syncobj reported itself signaled, and Mesa's
+                // `vk_drm_syncobj_wait_many` passes wait_value 0 for the BINARY
+                // syncs in any batch that also carries a timeline one. So every
+                // mixed `vkWaitSemaphores`/`vkQueueSubmit` wait list returned
+                // VK_SUCCESS on its binary halves without waiting, and NVK went on
+                // to recycle command buffers the GPU was still reading. Flooring to
+                // 1 is what the rest of this module already does (`export_snapshot`,
+                // `transfer`, the eventfd registry).
+                let target = points.map(|p| p[i]).unwrap_or(1).max(1);
                 let pending_covers = table
                     .pending
                     .iter()
@@ -1077,6 +1117,39 @@ mod tests {
 
     /// A binary signal on a handle userspace has already driven past 1 as a
     /// timeline must take the timeline branch, not the slot-replacement one.
+    /// Mesa's `vk_drm_syncobj_wait_many` uses the TIMELINE wait whenever any
+    /// entry in the batch carries a non-zero value, and passes wait_value 0 for
+    /// the BINARY syncs sitting in that same batch. Point 0 therefore has to
+    /// mean "wait for this syncobj's current fence", as `drm_syncobj_find_fence`
+    /// makes it in Linux -- never "already satisfied". It returning signaled is
+    /// silent: every caller gets VK_SUCCESS and races the GPU.
+    #[test]
+    fn a_timeline_wait_on_point_zero_still_waits() {
+        let h = create(false);
+        assert_eq!(query(h), Some(0));
+
+        // Unsignaled, no fence attached: point 0 must NOT report signaled.
+        assert!(matches!(
+            wait(&[h], Some(&[0]), false, 0),
+            WaitOutcome::Timeout
+        ));
+        // And the readiness probe must agree: `None` is "sleep and retry",
+        // i.e. not satisfied. (A zero deadline would report Timeout instead,
+        // which is the same verdict by another name.)
+        assert!(wait_ready(&[h], Some(&[0]), false, u64::MAX).is_none());
+
+        // Once it IS signaled, point 0 is satisfied.
+        assert!(signal(h));
+        assert!(matches!(
+            wait(&[h], Some(&[0]), false, 0),
+            WaitOutcome::Signaled {
+                first_signaled_index: 0
+            }
+        ));
+
+        destroy(h);
+    }
+
     /// Rewinding is wrong there (it would un-signal a real timeline), and so
     /// is purging the handle's pending fences: the first cut of the binary
     /// fix dropped them unconditionally, which threw away a timeline fence
@@ -1111,6 +1184,36 @@ mod tests {
             pending_hw_fence(h, 7).map(|f| f.0),
             Some(inflight.va()),
             "the in-flight timeline fence must survive the binary signal"
+        );
+        assert_eq!(query_submitted(h), Some(7));
+
+        destroy(h);
+    }
+
+    /// The same stranding, one arm over: a handle still INSIDE binary range
+    /// (point 0 or 1) with a timeline fence in flight at a higher point. The
+    /// binary arm rewinds the counter, which is right, and used to purge every
+    /// pending fence on the handle, which is not -- the in-flight one is not
+    /// superseded by a binary signal, and with it gone nothing would ever
+    /// advance the counter to its point.
+    #[test]
+    fn a_binary_signal_in_binary_range_spares_a_higher_timeline_fence() {
+        let h = create(false);
+        let inflight = Landing::new();
+
+        // Point 7 submitted while the handle is still at 0.
+        assert!(attach_hw_fence(h, 7, inflight.va(), 0, 3, 0, false));
+        assert_eq!(query(h), Some(0));
+        assert_eq!(query_submitted(h), Some(7));
+
+        // A binary signal arrives on the same handle.
+        let stray = Landing::new();
+        assert!(attach_hw_fence(h, 1, stray.va(), 0, 1, 0, true));
+
+        assert_eq!(
+            pending_hw_fence(h, 7).map(|f| f.0),
+            Some(inflight.va()),
+            "the in-flight timeline fence must survive a binary signal"
         );
         assert_eq!(query_submitted(h), Some(7));
 

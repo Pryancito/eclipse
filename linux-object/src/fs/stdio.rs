@@ -753,8 +753,14 @@ pub fn register_tty_intr_waker(waker: core::task::Waker) {
     register_tty_waker_once(&mut TTY_INTR_WAKERS.lock(), &waker);
 }
 
+/// Keep THIS waker registered for the next sleep cycle without disturbing the
+/// other waiters — see `kernel_hal::net::retain_net_rx_waker`, which had the
+/// same inverted `retain` predicate and the same consequence: one waiter's
+/// re-arm deleted everybody else's registration, so they lost their wakes and
+/// fell back to the poll backstop. `wake_tty_intr_waiters` above takes the
+/// whole list, so there is nothing to retain after a wake either.
 pub fn retain_tty_intr_waker(waker: &core::task::Waker) {
-    TTY_INTR_WAKERS.lock().retain(|w| w.will_wake(waker));
+    register_tty_waker_once(&mut TTY_INTR_WAKERS.lock(), waker);
 }
 
 /// Remove a wait's TTY-intr registration on Ready/`Drop` (see net clear_io_wait).
@@ -2061,5 +2067,493 @@ impl INode for Stdout {
 
     fn as_any_ref(&self) -> &dyn Any {
         self
+    }
+}
+
+#[cfg(test)]
+mod line_discipline_tests {
+    //! Host tests for the TTY line discipline — `Stdin::push`.
+    //!
+    //! This is the code between a keystroke and what a shell's `read()`
+    //! returns. Breaking it does not fail loudly; it leaves a console that
+    //! swallows backspace, never completes a line, or stops answering Ctrl-C,
+    //! and none of that shows up until someone sits in front of a terminal.
+    //!
+    //! What a test can see here is which characters become *readable* and
+    //! when, which is the half that matters. Echo is not observable: it goes
+    //! to `vt_console_write_str`, a no-op without the `graphic` feature, which
+    //! `linux-object` does not enable.
+    //!
+    //! `Stdin::new` gives each test its own buffers, but `c_termios` and the
+    //! flow-control flag are per-VT globals, so the tests share one VT and
+    //! serialise on [`SERIAL`], resetting both as they start.
+
+    use super::*;
+    use alloc::string::String;
+    use lock::Mutex as TestMutex;
+
+    static SERIAL: TestMutex<()> = TestMutex::new(());
+
+    /// A VT that is neither the serial console (0) nor the graphics VT.
+    const VT: usize = 3;
+
+    /// `Termios::default_tty()` with `c_lflag`/`c_iflag` overridden, installed
+    /// on [`VT`], plus a fresh `Stdin` bound to it.
+    fn tty(lflag: u32, iflag: u32) -> Stdin {
+        let mut t = Termios::default_tty();
+        t.c_lflag = lflag;
+        t.c_iflag = iflag;
+        *tty_termios(VT).lock() = t;
+        TTY_STATES[VT].flow_stopped.store(false, Ordering::Relaxed);
+        TTY_STATES[VT].fg_pgrp.store(0, Ordering::Relaxed);
+        ctrl_c_pending_take();
+        Stdin::new(VT)
+    }
+
+    /// The cooked default: ISIG | ICANON | ECHO | ECHOE | ECHOK | IEXTEN,
+    /// ICRNL | IXON | IMAXBEL.
+    fn cooked() -> Stdin {
+        let d = Termios::default_tty();
+        tty(d.c_lflag, d.c_iflag)
+    }
+
+    fn feed(s: &Stdin, text: &str) {
+        for c in text.chars() {
+            s.push(c);
+        }
+    }
+
+    /// Everything a reader could take right now, leaving the buffer empty.
+    fn drain(s: &Stdin) -> String {
+        let mut out = String::new();
+        while s.can_read() {
+            out.push(s.pop());
+        }
+        out
+    }
+
+    fn flow_stopped() -> bool {
+        TTY_STATES[VT].flow_stopped.load(Ordering::Relaxed)
+    }
+
+    const DEL: char = '\u{7f}';
+    const CTRL_C: char = '\u{3}';
+    const CTRL_D: char = '\u{4}';
+    const CTRL_O: char = '\u{f}';
+    const CTRL_Q: char = '\u{11}';
+    const CTRL_R: char = '\u{12}';
+    const CTRL_S: char = '\u{13}';
+    const CTRL_U: char = '\u{15}';
+    const CTRL_V: char = '\u{16}';
+    const CTRL_W: char = '\u{17}';
+
+    // ---- canonical line assembly ---------------------------------------
+
+    #[test]
+    fn a_canonical_line_is_delivered_only_on_its_newline() {
+        let _g = SERIAL.lock();
+        let s = cooked();
+        feed(&s, "hola");
+        // Still being edited: a reader must see nothing at all.
+        assert!(!s.can_read());
+        s.push('\n');
+        // And then the whole line at once, newline included.
+        assert_eq!(drain(&s), "hola\n");
+        assert!(!s.can_read());
+    }
+
+    #[test]
+    fn icrnl_completes_a_line_but_inlcr_and_igncr_do_not() {
+        let _g = SERIAL.lock();
+        let d = Termios::default_tty();
+        // ICRNL (the default): Enter sends CR, and it must land as '\n'.
+        let s = tty(d.c_lflag, ICRNL);
+        feed(&s, "ab\r");
+        assert_eq!(drain(&s), "ab\n");
+
+        // IGNCR: the CR is dropped outright, so the line stays open.
+        let s = tty(d.c_lflag, IGNCR);
+        feed(&s, "ab\r");
+        assert!(!s.can_read());
+        s.push('\n');
+        assert_eq!(drain(&s), "ab\n");
+
+        // INLCR: '\n' becomes '\r', which is not an end-of-line, so the line
+        // does NOT complete -- the translation runs before the EOL test.
+        let s = tty(d.c_lflag, INLCR);
+        feed(&s, "ab\n");
+        assert!(!s.can_read());
+    }
+
+    #[test]
+    fn veol_and_veol2_terminate_a_line_like_newline_does() {
+        let _g = SERIAL.lock();
+        let d = Termios::default_tty();
+        let mut t = Termios::default_tty();
+        t.c_cc[VEOL] = b';';
+        t.c_cc[VEOL2] = b'!';
+        *tty_termios(VT).lock() = t;
+        let s = Stdin::new(VT);
+        feed(&s, "uno;");
+        assert_eq!(drain(&s), "uno;");
+        feed(&s, "dos!");
+        assert_eq!(drain(&s), "dos!");
+        // A VEOL of 0 means "disabled", never "matches NUL".
+        let s = tty(d.c_lflag, d.c_iflag);
+        feed(&s, "tres\0");
+        assert!(!s.can_read());
+    }
+
+    #[test]
+    fn a_control_char_set_to_zero_is_disabled_not_a_match_for_nul() {
+        let _g = SERIAL.lock();
+        // The same rule on the `cc_match` side, which every signal and
+        // editing character goes through. Disabling VINTR must make Ctrl-C
+        // ordinary input AND must not turn NUL into the interrupt character.
+        let mut t = Termios::default_tty();
+        t.c_cc[VINTR] = 0;
+        *tty_termios(VT).lock() = t;
+        TTY_STATES[VT].flow_stopped.store(false, Ordering::Relaxed);
+        ctrl_c_pending_take();
+        let s = Stdin::new(VT);
+        s.push('\0');
+        s.push(CTRL_C);
+        s.push('\n');
+        assert_eq!(drain(&s), alloc::format!("\0{}\n", CTRL_C));
+        assert!(!ctrl_c_pending_peek());
+    }
+
+    // ---- line editing ---------------------------------------------------
+
+    #[test]
+    fn verase_removes_one_character_and_vkill_the_whole_line() {
+        let _g = SERIAL.lock();
+        let s = cooked();
+        feed(&s, "abc");
+        s.push(DEL);
+        s.push('\n');
+        assert_eq!(drain(&s), "ab\n");
+
+        feed(&s, "borrame");
+        s.push(CTRL_U);
+        s.push('\n');
+        assert_eq!(drain(&s), "\n");
+    }
+
+    #[test]
+    fn verase_on_an_empty_line_erases_nothing() {
+        let _g = SERIAL.lock();
+        let s = cooked();
+        // Backspace at the prompt must not eat into a previous line, and must
+        // not leave anything readable.
+        s.push(DEL);
+        s.push(DEL);
+        assert!(!s.can_read());
+        feed(&s, "x\n");
+        assert_eq!(drain(&s), "x\n");
+    }
+
+    #[test]
+    fn vwerase_drops_trailing_blanks_then_one_word() {
+        let _g = SERIAL.lock();
+        let s = cooked();
+        feed(&s, "foo bar  ");
+        s.push(CTRL_W);
+        s.push('\n');
+        assert_eq!(drain(&s), "foo \n");
+        // A second word erase takes "foo " down to empty (the blank it stops
+        // at belongs to the word it just removed).
+        feed(&s, "foo bar");
+        s.push(CTRL_W);
+        s.push(CTRL_W);
+        s.push('\n');
+        assert_eq!(drain(&s), "\n");
+    }
+
+    #[test]
+    fn the_extended_editing_chars_need_iexten() {
+        let _g = SERIAL.lock();
+        let d = Termios::default_tty();
+        // Without IEXTEN, Ctrl-W / Ctrl-R / Ctrl-V are ordinary input.
+        let s = tty(d.c_lflag & !IEXTEN, d.c_iflag);
+        feed(&s, "ab");
+        s.push(CTRL_W);
+        s.push(CTRL_R);
+        s.push(CTRL_V);
+        s.push('\n');
+        let line = drain(&s);
+        assert_eq!(line, alloc::format!("ab{}{}{}\n", CTRL_W, CTRL_R, CTRL_V));
+        // With it, the same Ctrl-W edits the line instead.
+        let s = cooked();
+        feed(&s, "ab cd");
+        s.push(CTRL_W);
+        s.push('\n');
+        assert_eq!(drain(&s), "ab \n");
+    }
+
+    #[test]
+    fn vlnext_quotes_the_next_character_even_a_signal_one() {
+        let _g = SERIAL.lock();
+        let s = cooked();
+        feed(&s, "x");
+        s.push(CTRL_V);
+        // Ctrl-C right after Ctrl-V is data, not SIGINT: the line survives and
+        // the interrupt latch stays clear.
+        s.push(CTRL_C);
+        s.push('\n');
+        assert_eq!(drain(&s), alloc::format!("x{}\n", CTRL_C));
+        assert!(!ctrl_c_pending_peek());
+        // The latch is one-shot: the next Ctrl-C is a signal again.
+        feed(&s, "y");
+        s.push(CTRL_C);
+        assert!(ctrl_c_pending_take());
+        assert!(!s.can_read());
+    }
+
+    #[test]
+    fn vreprint_redraws_without_changing_the_pending_line() {
+        let _g = SERIAL.lock();
+        let s = cooked();
+        feed(&s, "intacta");
+        s.push(CTRL_R);
+        s.push('\n');
+        assert_eq!(drain(&s), "intacta\n");
+    }
+
+    // ---- end of file ----------------------------------------------------
+
+    #[test]
+    fn veof_delivers_a_partial_line_and_only_signals_eof_on_an_empty_one() {
+        let _g = SERIAL.lock();
+        let s = cooked();
+        feed(&s, "abc");
+        s.push(CTRL_D);
+        // The partial line becomes readable with no newline appended, and this
+        // is NOT end of file -- the shell must keep reading.
+        assert_eq!(drain(&s), "abc");
+        assert!(!s.eof_pending.load(Ordering::Acquire));
+        // Ctrl-D at the start of a line is end of file.
+        s.push(CTRL_D);
+        assert!(!s.can_read());
+        assert!(s.eof_pending.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn an_interrupt_clears_a_pending_eof() {
+        let _g = SERIAL.lock();
+        let s = cooked();
+        s.push(CTRL_D);
+        assert!(s.eof_pending.load(Ordering::Acquire));
+        s.push(CTRL_C);
+        // Otherwise the next read would return 0 and the shell would exit on
+        // a Ctrl-C.
+        assert!(!s.eof_pending.load(Ordering::Acquire));
+    }
+
+    // ---- raw mode -------------------------------------------------------
+
+    #[test]
+    fn raw_mode_delivers_every_character_as_it_arrives() {
+        let _g = SERIAL.lock();
+        let d = Termios::default_tty();
+        let s = tty(d.c_lflag & !ICANON, d.c_iflag);
+        s.push('a');
+        assert_eq!(drain(&s), "a");
+        feed(&s, "bc");
+        assert_eq!(drain(&s), "bc");
+    }
+
+    // ---- signals --------------------------------------------------------
+
+    #[test]
+    fn vintr_latches_ctrl_c_and_flushes_what_was_typed() {
+        let _g = SERIAL.lock();
+        let s = cooked();
+        feed(&s, "a medio escribir");
+        s.push(CTRL_C);
+        assert!(!s.can_read());
+        assert!(ctrl_c_pending_take());
+        // And the latch is consumed by that take.
+        assert!(!ctrl_c_pending_peek());
+    }
+
+    #[test]
+    fn noflsh_keeps_the_pending_input_across_an_interrupt() {
+        let _g = SERIAL.lock();
+        let d = Termios::default_tty();
+        let s = tty(d.c_lflag | NOFLSH, d.c_iflag);
+        feed(&s, "abc");
+        s.push(CTRL_C);
+        assert!(ctrl_c_pending_take());
+        // The half-typed line is still there, so the newline still delivers it.
+        s.push('\n');
+        assert_eq!(drain(&s), "abc\n");
+    }
+
+    #[test]
+    fn without_isig_an_interrupt_character_is_ordinary_input() {
+        let _g = SERIAL.lock();
+        let d = Termios::default_tty();
+        let s = tty(d.c_lflag & !ISIG, d.c_iflag);
+        feed(&s, "a");
+        s.push(CTRL_C);
+        s.push('\n');
+        assert_eq!(drain(&s), alloc::format!("a{}\n", CTRL_C));
+        assert!(!ctrl_c_pending_peek());
+    }
+
+    // ---- software flow control -----------------------------------------
+
+    #[test]
+    fn ixon_consumes_stop_and_start_without_delivering_them() {
+        let _g = SERIAL.lock();
+        let d = Termios::default_tty();
+        let s = tty(d.c_lflag, IXON | ICRNL);
+        feed(&s, "a");
+        s.push(CTRL_S);
+        assert!(flow_stopped());
+        s.push(CTRL_Q);
+        assert!(!flow_stopped());
+        s.push('\n');
+        // Neither Ctrl-S nor Ctrl-Q may reach the reader.
+        assert_eq!(drain(&s), "a\n");
+    }
+
+    #[test]
+    fn ixany_lets_any_character_resume_stopped_output() {
+        let _g = SERIAL.lock();
+        let d = Termios::default_tty();
+        let s = tty(d.c_lflag, IXON | IXANY | ICRNL);
+        s.push(CTRL_S);
+        assert!(flow_stopped());
+        // The resuming byte is still delivered as input.
+        s.push('z');
+        assert!(!flow_stopped());
+        s.push('\n');
+        assert_eq!(drain(&s), "z\n");
+    }
+
+    #[test]
+    fn without_ixany_input_does_not_resume_stopped_output() {
+        let _g = SERIAL.lock();
+        let d = Termios::default_tty();
+        let s = tty(d.c_lflag, IXON | ICRNL);
+        s.push(CTRL_S);
+        s.push('z');
+        assert!(flow_stopped());
+    }
+
+    #[test]
+    fn a_job_control_signal_lifts_an_output_freeze() {
+        let _g = SERIAL.lock();
+        let d = Termios::default_tty();
+        let s = tty(d.c_lflag, IXON | ICRNL);
+        s.push(CTRL_S);
+        assert!(flow_stopped());
+        // Otherwise the signalled process stays blocked behind the Ctrl-S and
+        // the terminal looks hung.
+        s.push(CTRL_C);
+        assert!(!flow_stopped());
+        assert!(ctrl_c_pending_take());
+    }
+
+    #[test]
+    fn vdiscard_is_swallowed_under_iexten() {
+        let _g = SERIAL.lock();
+        let d = Termios::default_tty();
+        let s = tty(d.c_lflag, d.c_iflag);
+        feed(&s, "ab");
+        s.push(CTRL_O);
+        s.push('\n');
+        assert_eq!(drain(&s), "ab\n");
+        // Without IEXTEN it is ordinary input.
+        let s = tty(d.c_lflag & !IEXTEN, d.c_iflag);
+        feed(&s, "ab");
+        s.push(CTRL_O);
+        s.push('\n');
+        assert_eq!(drain(&s), alloc::format!("ab{}\n", CTRL_O));
+    }
+
+    // ---- the outgoing escape-sequence sniffer ---------------------------
+
+    /// A VT of its own for the outgoing tests, because they drive the shared
+    /// `vt_stdin(vt)` rather than a private `Stdin`.
+    const VT_OUT: usize = 4;
+
+    fn drain_vt_out() -> String {
+        let s = vt_stdin(VT_OUT);
+        let mut out = String::new();
+        while s.can_read() {
+            out.push(s.pop());
+        }
+        out
+    }
+
+    #[test]
+    fn decckm_follows_smkx_and_rmkx() {
+        let _g = SERIAL.lock();
+        // `\E[?1h` / `\E[?1l` is how a shell switches the arrow keys between
+        // application and normal mode; miss it and every arrow key sends the
+        // wrong prefix.
+        APP_CURSOR_KEYS.store(false, Ordering::SeqCst);
+        tty_handle_outgoing(VT_OUT, b"\x1b[?1h");
+        assert!(APP_CURSOR_KEYS.load(Ordering::SeqCst));
+        tty_handle_outgoing(VT_OUT, b"\x1b[?1l");
+        assert!(!APP_CURSOR_KEYS.load(Ordering::SeqCst));
+        // Another private mode must not move it.
+        APP_CURSOR_KEYS.store(true, Ordering::SeqCst);
+        tty_handle_outgoing(VT_OUT, b"\x1b[?25l");
+        assert!(APP_CURSOR_KEYS.load(Ordering::SeqCst));
+        APP_CURSOR_KEYS.store(false, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn a_device_status_report_is_answered_on_the_same_vt() {
+        let _g = SERIAL.lock();
+        let _ = drain_vt_out();
+        tty_handle_outgoing(VT_OUT, b"\x1b[5n");
+        assert_eq!(drain_vt_out(), "\x1b[0n");
+        // Embedded in ordinary output, and answered once per write however
+        // many times it appears.
+        tty_handle_outgoing(VT_OUT, b"hola\x1b[5nadios\x1b[5n");
+        assert_eq!(drain_vt_out(), "\x1b[0n");
+        // Ordinary output alone is never answered.
+        tty_handle_outgoing(VT_OUT, b"nada que ver");
+        assert_eq!(drain_vt_out(), "");
+    }
+
+    #[test]
+    fn a_truncated_escape_sequence_is_ignored_not_misread() {
+        let _g = SERIAL.lock();
+        let _ = drain_vt_out();
+        APP_CURSOR_KEYS.store(false, Ordering::SeqCst);
+        // Each of these ends mid-sequence; the parser must run off none of
+        // them, answer nothing and change nothing.
+        for partial in [
+            &b"\x1b"[..],
+            &b"\x1b["[..],
+            &b"\x1b[?"[..],
+            &b"\x1b[?1"[..],
+            &b"\x1b[5"[..],
+        ] {
+            tty_handle_outgoing(VT_OUT, partial);
+        }
+        tty_handle_outgoing(VT_OUT, b"");
+        assert_eq!(drain_vt_out(), "");
+        assert!(!APP_CURSOR_KEYS.load(Ordering::SeqCst));
+    }
+
+    // ---- the bypass -----------------------------------------------------
+
+    #[test]
+    fn push_bytes_bypasses_the_line_discipline_entirely() {
+        let _g = SERIAL.lock();
+        let s = cooked();
+        // A TTY query response goes straight to the reader: no line assembly,
+        // no signal handling, no echo -- even though this is cooked mode and
+        // the payload contains an interrupt character.
+        s.push_bytes(&[b'\x1b', b'[', b'0', b'n', 3]);
+        assert_eq!(drain(&s), alloc::format!("\x1b[0n{}", CTRL_C));
+        assert!(!ctrl_c_pending_peek());
     }
 }

@@ -457,8 +457,22 @@ run: build justrun
 debug: build debugrun
 endif
 
+# The QCOW2 scratch disk is attached ONLY under `DISK=on` (see the `qemu_opts`
+# rule above), and `DISK` defaults to empty, so requiring it on every run was
+# wasted work everywhere and fatal on riscv64: that arm of the `$(qemu_disk)`
+# rule converts `zCore/riscv64.img`, a Linux rootfs image that only
+# `make image ARCH=riscv64` produces. A Zircon job never builds one, so every
+# riscv64 Zircon run died inside the prerequisite -- `make` exit 2, 13 ms, QEMU
+# never launched, zero guest output (`Zircon Core Test Baremetal (riscv64)`).
+# The other two architectures took the `qemu-img create` arm, which needs no
+# input file, which is why only riscv64 was red.
+run_disk :=
+ifeq ($(DISK), on)
+  run_disk := $(qemu_disk)
+endif
+
 .PHONY: justrun
-justrun: $(qemu_disk)
+justrun: $(run_disk)
 ifeq ($(ARCH), x86_64)
 	$(sed) 's#cmdline=.*#cmdline=$(CMDLINE)#' $(esp)/EFI/Boot/rboot.conf
   ifeq ($(have_vfat),yes)
@@ -469,18 +483,28 @@ ifeq ($(ARCH), x86_64)
 # image the initramfs did not fit in ("Disk full" from mcopy). The
 # `|| du -sm` fallback keeps non-GNU du (macOS) working as before.
 # Rebuild the image only when it is missing or something OTHER than the
-# cmdline changed. `rboot.conf` is excluded from the staleness test on purpose:
-# the `$(sed)` above rewrites it on EVERY `justrun`, so testing it made every
-# run a full rebuild. That cost is not small -- the QEMU live image is ~1.8 GiB,
-# so each run did a 1.8 GiB `dd`, a `mkfs.vfat` and an `mcopy` of the whole
+# cmdline changed. That cost is not small -- the QEMU live image is ~1.8 GiB,
+# so a rebuild is a 1.8 GiB `dd`, a `mkfs.vfat` and an `mcopy` of the whole
 # tree. `scripts/linux_libc_test.py` and `tests/linux_other_test.py` call
-# `justrun` once PER TEST CASE under a 10 s budget, which that rebuild ate whole
-# before QEMU was ever launched: `Linux Libc Test Baremetal (x86_64)` timed out
-# on all 410 cases and `Linux Other Test Baremetal (x86_64)` on all 10, in both
-# cases with zero guest output. The one-file `mcopy` below then carries the new
-# cmdline into the existing image, which is all that actually changed.
+# `justrun` once PER TEST CASE under a 10 s budget, which that rebuild eats
+# whole before QEMU is ever launched. The one-file `mcopy` below carries the
+# new cmdline into the existing image, which is all that actually changed.
+#
+# TWO exclusions are needed, and only having the first is why this guard never
+# once took the cheap branch:
+#
+# * `! -name rboot.conf`, because the `$(sed)` above rewrites that file on
+#   EVERY `justrun`; and
+# * `-type f`, because `sed -i` replaces it through a temporary file, which
+#   bumps the mtime of the DIRECTORY holding it. `$(esp)/EFI/Boot` is not
+#   excluded by name, so the guard matched it every single time.
+#
+# The symptom was the full `Building .../esp.img (1904 MiB FAT32 ...)` line
+# once per test case in CI, and `Linux Other Test Baremetal (x86_64)` and
+# `Linux Libc Test Baremetal (x86_64)` timing out on every case with zero
+# guest output.
 	@if [ ! -f "$(esp_img)" ] || [ -n "$$(find "$(esp)/EFI" -newer "$(esp_img)" \
-	      ! -name rboot.conf -print -quit 2>/dev/null)" ]; then \
+	      -type f ! -name rboot.conf -print -quit 2>/dev/null)" ]; then \
 	  esp_mb=$$(du -sm --apparent-size "$(esp)/EFI" 2>/dev/null | cut -f1 \
 	    || du -sm "$(esp)/EFI" | cut -f1); esp_mb=$$((esp_mb + 128)); \
 	  echo "Building $(esp_img) ($$esp_mb MiB FAT32 — real ESP image; fat:rw dir emulation caps at FAT16 504 MiB)"; \
@@ -515,7 +539,7 @@ else ifeq ($(ARCH), riscv64)
 endif
 
 .PHONY: debugrun
-debugrun: $(qemu_disk)
+debugrun: $(run_disk)
 	cp .gdbinit_$(ARCH) .gdbinit
 ifeq ($(ARCH), x86_64)
 	$(sed) 's#cmdline=.*#cmdline=$(CMDLINE)#' $(esp)/EFI/Boot/rboot.conf

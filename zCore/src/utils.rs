@@ -139,6 +139,34 @@ pub fn wait_for_exit(proc: Option<Arc<Process>>) -> ! {
     std::process::exit(exit_code);
 }
 
+/// Reset the machine as soon as `proc` exits, for `baremetal-test` builds.
+///
+/// [`wait_for_exit`]'s queue-empty path cannot do this for a Linux guest:
+/// `run_until_idle` returns only when THIS CPU's run queue drains, and the
+/// kernel's own background work (deferred driver jobs, the net stack, the
+/// console) keeps it non-empty for as long as the machine is up, so the body
+/// of that loop never runs a second time. Watching the process's
+/// `PROCESS_TERMINATED` signal is what "whose exit takes the system down" in
+/// `main.rs` actually means, and it is exact rather than a heuristic.
+///
+/// Without it `INIT=/bin/busybox?uname` printed its line and QEMU then sat
+/// there until the test runner killed it -- every case of `Linux Other Test
+/// Baremetal`, on all three architectures.
+///
+/// Only the Linux personality arms this. The Zircon side reaches the
+/// queue-empty path on its own, and a parked watcher task would keep that
+/// queue non-empty forever.
+#[cfg(all(not(feature = "libos"), feature = "baremetal-test"))]
+pub fn reset_when_process_exits(proc: Arc<Process>) {
+    kernel_hal::thread::spawn(async move {
+        use zircon_object::object::Signal;
+        let object: Arc<dyn KernelObject> = proc.clone();
+        object.wait_signal(Signal::PROCESS_TERMINATED).await;
+        check_exit_code(proc);
+        kernel_hal::cpu::reset();
+    });
+}
+
 #[cfg(not(feature = "libos"))]
 pub fn wait_for_exit(proc: Option<Arc<Process>>) -> ! {
     kernel_hal::timer::timer_enable();

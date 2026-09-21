@@ -542,10 +542,16 @@ impl FileInner {
         if !crate::fs::memfd_write_allowed(&self.inode) {
             return Err(LxError::EPERM);
         }
-        let n = self
-            .inode
-            .write_at(offset as usize, buf)
-            .map_err(|e| fs_grow_error(&self.inode, e))?;
+        // `/dev/dsp`: the OSS write needs the fd's O_NONBLOCK, which the
+        // `INode::write_at` contract cannot carry (the same reason the ALSA
+        // PCM ioctl is routed with its flags in `File::ioctl`).
+        use super::devfs::DspDev;
+        let n = if let Some(dsp) = self.inode.downcast_ref::<DspDev>() {
+            dsp.write_pcm(buf, self.flags.non_block())
+        } else {
+            self.inode.write_at(offset as usize, buf)
+        }
+        .map_err(|e| fs_grow_error(&self.inode, e))?;
         cache_overlay_write(&self.inode, offset as usize, &buf[..n]);
         Ok(n)
     }
