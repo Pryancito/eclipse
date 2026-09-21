@@ -52,12 +52,24 @@ struct Syncobj {
     /// real DRM (and fixing the stale-handle window the old no-refcount
     /// table left for Mesa fence export).
     refs: u32,
-    /// A pending `sync_file` import (see [`import_snapshot`]): this object
-    /// also counts as signaled — binary point 1 — once `src` reaches
-    /// `target`. `None` for the normal case, and cleared whenever the object
-    /// is signaled or reset directly, mirroring how a real `drm_syncobj`
-    /// REPLACES its fence on those operations rather than accumulating them.
-    linked: Option<(u32, u64)>,
+    /// A pending dependency on another syncobj: `(src, target, dst_point)`.
+    /// This object reaches `dst_point` once `src` reaches `target`.
+    ///
+    /// Set by a `sync_file` import (see [`import_snapshot`], where `dst_point`
+    /// is 1, because a binary import really does replace the binary fence) and
+    /// by a [`transfer`] whose source has not landed yet. `None` for the normal
+    /// case, and cleared whenever the object is signaled or reset directly,
+    /// mirroring how a real `drm_syncobj` REPLACES its fence on those
+    /// operations rather than accumulating them.
+    ///
+    /// `dst_point` used to be missing, so a software timeline-to-timeline
+    /// transfer landed `dst` at 1 whatever point was asked for. Linux allocates
+    /// a `dma_fence_chain` node and `drm_syncobj_add_point(dst, chain, fence,
+    /// args->dst_point)`, so `dst` reaches exactly that point. The gap was a
+    /// hang, not a rounding error: wlroots' `linux-drm-syncobj-v1` moves a
+    /// client's acquire point into its own timeline at a point it chooses, then
+    /// waits on it, so a point that never arrives freezes that surface.
+    linked: Option<(u32, u64, u64)>,
 }
 
 /// "`handle` reaches `point` once the GPU has written a value >= `payload`
@@ -94,10 +106,10 @@ struct PendingFence {
 fn effective_point(objects: &[Syncobj], handle: u32, depth: u8) -> Option<u64> {
     let obj = objects.iter().find(|o| o.handle == handle)?;
     let mut point = obj.point;
-    if let (Some((src, target)), true) = (obj.linked, depth > 0) {
+    if let (Some((src, target, dst_point)), true) = (obj.linked, depth > 0) {
         if let Some(src_point) = effective_point(objects, src, depth - 1) {
             if src_point >= target {
-                point = point.max(1);
+                point = point.max(dst_point.max(1));
             }
         }
     }
@@ -608,7 +620,9 @@ pub fn import_snapshot(dst: u32, src: u32, target: u64) -> bool {
             obj.linked = None;
             Some(obj.point)
         } else {
-            obj.linked = Some((src, target));
+            // A binary import: `dst_point` is 1, because `IMPORT_SYNC_FILE`
+            // really does replace the binary fence.
+            obj.linked = Some((src, target, 1));
             None
         };
         (adv, d)
@@ -631,11 +645,10 @@ pub fn import_snapshot(dst: u32, src: u32, target: u64) -> bool {
 /// `dst_point` right away (monotonic — never backwards). If `src` is still
 /// waiting on a pending HARDWARE fence covering that point, `dst` gets the
 /// same hardware fence at `dst_point` (a timeline-exact transfer, as Linux
-/// does with the dma_fence). Otherwise the dependency is recorded like a
-/// `sync_file` import so `dst` resolves on its own as `src` catches up --
-/// that branch can only carry a binary dependency, so a still-pending
-/// software timeline→timeline transfer lands `dst` at point 1 rather than
-/// an arbitrary `dst_point`.
+/// does with the dma_fence). Otherwise the dependency is recorded so `dst`
+/// resolves on its own as `src` catches up, carrying `dst_point` with it: a
+/// still-pending software timeline→timeline transfer reaches exactly the point
+/// that was asked for, the way `drm_syncobj_add_point` does.
 pub fn transfer(dst: u32, dst_point: u64, src: u32, src_point: u64) -> bool {
     let (new_point, deferred) = {
         let mut table = TABLE.lock();
@@ -676,7 +689,7 @@ pub fn transfer(dst: u32, dst_point: u64, src: u32, src_point: u64) -> bool {
             }
             None
         } else {
-            obj.linked = Some((src, need));
+            obj.linked = Some((src, need, dst_point.max(1)));
             None
         };
         (np, d)
@@ -1115,8 +1128,38 @@ mod tests {
         destroy(h);
     }
 
-    /// A binary signal on a handle userspace has already driven past 1 as a
-    /// timeline must take the timeline branch, not the slot-replacement one.
+    /// A transfer whose source has not landed yet has to remember WHICH point
+    /// it was asked to reach. Landing `dst` at 1 instead looks like a rounding
+    /// error and is a hang: wlroots' `linux-drm-syncobj-v1` moves a client's
+    /// acquire point into its own timeline at a point it picks, then waits on
+    /// that point, so a point that never arrives freezes the surface and, with
+    /// the commit waiting on it, the whole output.
+    #[test]
+    fn a_deferred_transfer_reaches_the_point_it_was_given() {
+        let src = create(false);
+        let dst = create(false);
+
+        // `src` is nowhere near point 5 yet, so the transfer is deferred.
+        assert!(transfer(dst, 9, src, 5));
+        assert_eq!(query(dst), Some(0), "nothing has landed yet");
+
+        // `src` arrives. `dst` must now be at 9, not 1.
+        assert!(timeline_signal(src, 5));
+        assert_eq!(
+            query(dst),
+            Some(9),
+            "a deferred transfer must reach its destination point"
+        );
+        // And a wait on that point is satisfied, which is the thing that hung.
+        assert!(matches!(
+            wait(&[dst], Some(&[9]), false, 0),
+            WaitOutcome::Signaled { .. }
+        ));
+
+        destroy(dst);
+        destroy(src);
+    }
+
     /// Mesa's `vk_drm_syncobj_wait_many` uses the TIMELINE wait whenever any
     /// entry in the batch carries a non-zero value, and passes wait_value 0 for
     /// the BINARY syncs sitting in that same batch. Point 0 therefore has to
@@ -1150,6 +1193,8 @@ mod tests {
         destroy(h);
     }
 
+    /// A binary signal on a handle userspace has already driven past 1 as a
+    /// timeline must take the timeline branch, not the slot-replacement one.
     /// Rewinding is wrong there (it would un-signal a real timeline), and so
     /// is purging the handle's pending fences: the first cut of the binary
     /// fix dropped them unconditionally, which threw away a timeline fence
