@@ -1427,11 +1427,12 @@ impl Syscall<'_> {
         // number alone: sleeping is a side effect, and it must not be possible
         // to inflict it on an unrelated fd that happens to be handed this
         // number.
-        if {
+        let is_wait_vblank = {
             use linux_object::fs::devfs::drm_scheme::{is_drm_ioctl_nr, nr};
             let (n, min) = nr::WAIT_VBLANK;
             is_drm_ioctl_nr(request as u32, n, min)
-        } {
+        };
+        if is_wait_vblank {
             if let Some(file) = file_like.downcast_ref::<File>() {
                 if let Some(dev) = file
                     .inode()
@@ -1464,11 +1465,12 @@ impl Syscall<'_> {
         // for the client's rendering to land before the sync arm scans that
         // buffer out. Without this the fence was accepted and ignored, so an
         // explicit-sync compositor could have a half-drawn frame presented.
-        if {
+        let is_mode_atomic = {
             use linux_object::fs::devfs::drm_scheme::{is_drm_ioctl_nr, nr};
             let (n, min) = nr::MODE_ATOMIC;
             is_drm_ioctl_nr(request as u32, n, min)
-        } {
+        };
+        if is_mode_atomic {
             if let Some(file) = file_like.downcast_ref::<File>() {
                 if let Some(dev) = file
                     .inode()
@@ -1554,7 +1556,7 @@ impl Syscall<'_> {
         // matching. Without this the dispatch misses and the ioctl falls
         // through to ENOTTY ("Not a tty").
         let cmd = request as u32 as usize;
-        if {
+        let is_prime_or_lease = {
             use linux_object::fs::devfs::drm_scheme::{is_drm_ioctl_nr, nr};
             let c = cmd as u32;
             [
@@ -1564,7 +1566,8 @@ impl Syscall<'_> {
             ]
             .iter()
             .any(|&(n, min)| is_drm_ioctl_nr(c, n, min))
-        } {
+        };
+        if is_prime_or_lease {
             // `sys_drm_prime` logs only on genuine failures; the wrapper stays
             // silent on the hot path. Ok(None) means "not a PRIME request after
             // all"; fall through to the inode `io_control`.
@@ -1592,11 +1595,12 @@ impl Syscall<'_> {
         }
         // SYNCOBJ_EVENTFD — same fd-table-access reasoning as the syncobj FD
         // ioctls above (it takes an eventfd), and the same sign-extension caveat.
-        if {
+        let is_syncobj_eventfd = {
             use linux_object::fs::devfs::drm_scheme::{is_drm_ioctl_nr, nr};
             let (n, min) = nr::SYNCOBJ_EVENTFD;
             is_drm_ioctl_nr(cmd as u32, n, min)
-        } {
+        };
+        if is_syncobj_eventfd {
             match self.sys_drm_syncobj_eventfd(cmd, arg1) {
                 Ok(Some(ret)) => return Ok(ret),
                 Ok(None) => {}
