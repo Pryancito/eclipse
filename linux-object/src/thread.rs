@@ -207,10 +207,20 @@ impl CurrentThreadExt for CurrentThread {
             }
             #[cfg(not(target_os = "none"))]
             {
-                clear_child_tid.write(0).unwrap();
-                let uaddr = clear_child_tid.as_addr();
-                if let Some(futex) = self.proc().linux().get_futex(uaddr) {
-                    futex.wake(1);
+                // Linux's `mm_release` is `if (!put_user(0, tidptr)) do_futex(...)`:
+                // a tid address userspace got wrong costs that thread its exit
+                // wake and nothing else. This `unwrap` made it a kernel panic
+                // instead, reachable from any thread exit -- musl's `start()`
+                // aborts a thread it could not finish creating with
+                // `set_tid_address(&args->control); for(;;) exit(0);`, and when
+                // that pointer is garbage the whole kernel came down on the
+                // libos build. Three of the libc suite's pthread cases died
+                // here rather than in the test.
+                if clear_child_tid.write(0).is_ok() {
+                    let uaddr = clear_child_tid.as_addr();
+                    if let Some(futex) = self.proc().linux().get_futex(uaddr) {
+                        futex.wake(1);
+                    }
                 }
             }
         }
