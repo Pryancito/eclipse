@@ -241,6 +241,11 @@ struct Deferred {
 }
 
 impl Deferred {
+    /// Must be called with the [`TABLE`] lock RELEASED (both upcalls re-enter
+    /// this module), and must be called on EVERY path out of the block that
+    /// built it: [`resolve_locked`] has already taken those fences out of the
+    /// table, so a `Deferred` that is dropped instead of run is a lost
+    /// wakeup and a lost hang report, with nothing left to retry them.
     fn run(self) {
         for (h, p) in self.notify {
             notify_signal(h, p);
@@ -471,19 +476,55 @@ pub fn add_ref(handle: u32) -> bool {
 /// only the last reference removes it (and its pending fences). Returns
 /// `false` if `handle` is unknown.
 pub fn destroy(handle: u32) -> bool {
-    let mut table = TABLE.lock();
-    let Some(pos) = table.objects.iter().position(|o| o.handle == handle) else {
-        return false;
+    let notify = {
+        let mut table = TABLE.lock();
+        let Some(pos) = table.objects.iter().position(|o| o.handle == handle) else {
+            return false;
+        };
+        if table.objects[pos].refs > 1 {
+            table.objects[pos].refs -= 1;
+            return true;
+        }
+        table.objects.swap_remove(pos);
+        // EVERY fence still in flight on it, timeline points included. The
+        // old filter kept anything above binary range, and those entries
+        // outlived the object they belonged to: nothing could advance (the
+        // resolver looks the handle up and finds nothing), nothing could wait
+        // on them, and [`FENCE_TIMEOUT_US`] later they reached the timeout
+        // hook, which latches their GPU context WEDGED -- so the client's
+        // next submit failed with EIO/device-lost. Closing a syncobj with a
+        // submit in flight is not an error, it is what
+        // `drm_syncobj_release`/process teardown does to every handle a
+        // client owns, so a client that simply exited mid-frame took the
+        // context down with it. Linux has nothing to leak here: the syncobj
+        // drops its `dma_fence` reference and the fence is just a refcounted
+        // object with no back-pointer to it.
+        table.pending.retain(|f| f.handle != handle);
+        PENDING_COUNT.store(table.pending.len(), Ordering::Relaxed);
+        // A still-deferred import/transfer names its source BY HANDLE (a
+        // real one holds the `dma_fence` itself, which outlives the syncobj
+        // it came from). With the source gone the link can never resolve, so
+        // the destination parks at its old point forever -- and NVK's waits
+        // carry an INT64_MAX deadline, so forever is literal. Release them
+        // to the point the transfer promised, the same call
+        // [`abandon_fences`] makes for a fence that can no longer land: a
+        // waiter on a dead producer moves on rather than freezing.
+        let mut notify = Vec::new();
+        for obj in table.objects.iter_mut() {
+            if let Some((src, _, dst_point)) = obj.linked {
+                if src == handle {
+                    obj.linked = None;
+                    obj.point = obj.point.max(dst_point);
+                    notify.push((obj.handle, obj.point));
+                }
+            }
+        }
+        notify
     };
-    if table.objects[pos].refs > 1 {
-        table.objects[pos].refs -= 1;
-        return true;
+    // Lock released: the hook re-enters this module to re-check waiters.
+    for (h, p) in notify {
+        notify_signal(h, p);
     }
-    table.objects.swap_remove(pos);
-    table
-        .pending
-        .retain(|f| !(f.handle == handle && f.point <= 1));
-    PENDING_COUNT.store(table.pending.len(), Ordering::Relaxed);
     true
 }
 
@@ -609,10 +650,14 @@ pub fn import_snapshot(dst: u32, src: u32, target: u64) -> bool {
         let mut table = TABLE.lock();
         let d = resolve_locked(&mut table);
         let Some(src_point) = effective_point(&table.objects, src, LINK_DEPTH) else {
+            drop(table);
+            d.run();
             return false;
         };
         let reached = src_point >= target;
         let Some(obj) = table.objects.iter_mut().find(|o| o.handle == dst) else {
+            drop(table);
+            d.run();
             return false;
         };
         let adv = if reached {
@@ -654,6 +699,8 @@ pub fn transfer(dst: u32, dst_point: u64, src: u32, src_point: u64) -> bool {
         let mut table = TABLE.lock();
         let d = resolve_locked(&mut table);
         let Some(src_eff) = effective_point(&table.objects, src, LINK_DEPTH) else {
+            drop(table);
+            d.run();
             return false;
         };
         let need = src_point.max(1);
@@ -666,6 +713,8 @@ pub fn transfer(dst: u32, dst_point: u64, src: u32, src_point: u64) -> bool {
             .min_by_key(|f| f.point)
             .copied();
         let Some(obj) = table.objects.iter_mut().find(|o| o.handle == dst) else {
+            drop(table);
+            d.run();
             return false;
         };
         let np = if reached {
@@ -712,9 +761,16 @@ pub fn reset(handle: u32) -> bool {
     };
     obj.point = 0;
     obj.linked = None;
-    table
-        .pending
-        .retain(|f| !(f.handle == handle && f.point <= 1));
+    // Every fence, not just the ones inside binary range: `SYNCOBJ_RESET` is
+    // `drm_syncobj_replace_fence(syncobj, NULL)` in Linux, i.e. "this object
+    // carries no fence at all". A timeline fence left in flight across the
+    // reset landed later and drove the counter back up to its point on its
+    // own, so a syncobj Mesa had just reset for reuse re-signaled itself
+    // behind the application's back -- a premature signal, which reads as
+    // corruption nowhere near sync. (This is the opposite case to a binary
+    // *signal*, which supersedes only the slot it replaces and must spare a
+    // timeline fence in flight; a reset supersedes everything.)
+    table.pending.retain(|f| f.handle != handle);
     PENDING_COUNT.store(table.pending.len(), Ordering::Relaxed);
     true
 }
@@ -1049,7 +1105,59 @@ pub fn describe(handles: &[u32], points: Option<&[u64]>) -> alloc::string::Strin
 
 #[cfg(test)]
 mod tests {
+    extern crate std;
+
     use super::*;
+    use crate::nvme::nvme_queue::test_clock;
+    use core::cell::RefCell;
+
+    /// Every test here drives the one global [`TABLE`] and the two global
+    /// hook slots, and the fence clock is per-thread, so a test that winds
+    /// its own clock forward would time out another test's pending fences.
+    /// Serialise them. (CI runs with `--test-threads=1`, which hides exactly
+    /// this class of coupling, so the lock is not optional here.)
+    fn test_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    std::thread_local! {
+        static SIGNALS: RefCell<Vec<(u32, u64)>> = const { RefCell::new(Vec::new()) };
+        /// `(ctx_idx, handle, point)` of each fence the timeout hook was
+        /// fired for.
+        static TIMEOUTS: RefCell<Vec<(u32, u32, u64)>> = const { RefCell::new(Vec::new()) };
+    }
+
+    fn record_signal(handle: u32, point: u64) {
+        SIGNALS.with(|s| s.borrow_mut().push((handle, point)));
+    }
+
+    fn record_timeout(ctx_idx: u32, _va: usize, _payload: u32, handle: u32, point: u64) {
+        TIMEOUTS.with(|s| s.borrow_mut().push((ctx_idx, handle, point)));
+    }
+
+    /// Install the upcalls and start from a clean slate. The hooks are the
+    /// real registration path (`set_signal_hook` is what `linux-object` calls
+    /// at boot to drive `SYNCOBJ_EVENTFD`), so what these tests observe is
+    /// what an eventfd waiter would.
+    fn arm_hooks() {
+        set_signal_hook(record_signal);
+        set_fence_timeout_hook(record_timeout);
+        SIGNALS.with(|s| s.borrow_mut().clear());
+        TIMEOUTS.with(|s| s.borrow_mut().clear());
+    }
+
+    fn signals() -> Vec<(u32, u64)> {
+        SIGNALS.with(|s| s.borrow().clone())
+    }
+
+    fn timeouts() -> Vec<(u32, u32, u64)> {
+        TIMEOUTS.with(|s| s.borrow().clone())
+    }
+
+    fn pending_now() -> usize {
+        PENDING_COUNT.load(Ordering::Relaxed)
+    }
 
     /// A fence landing zone the test drives by hand, standing in for the
     /// sysmem word the GPU's host-semaphore RELEASE writes.
@@ -1074,6 +1182,7 @@ mod tests {
     /// went straight through and sampled a half-written buffer.
     #[test]
     fn a_second_binary_signal_rearms_the_syncobj_on_the_new_fence() {
+        let _g = test_lock();
         let h = create(false);
         let mut first = Landing::new();
         let mut second = Landing::new();
@@ -1111,6 +1220,7 @@ mod tests {
     /// a point already reached is genuinely moot and stays dropped.
     #[test]
     fn a_timeline_fence_at_or_below_the_current_point_is_still_dropped() {
+        let _g = test_lock();
         let h = create(false);
         let mut fence = Landing::new();
 
@@ -1136,6 +1246,7 @@ mod tests {
     /// the commit waiting on it, the whole output.
     #[test]
     fn a_deferred_transfer_reaches_the_point_it_was_given() {
+        let _g = test_lock();
         let src = create(false);
         let dst = create(false);
 
@@ -1168,6 +1279,7 @@ mod tests {
     /// silent: every caller gets VK_SUCCESS and races the GPU.
     #[test]
     fn a_timeline_wait_on_point_zero_still_waits() {
+        let _g = test_lock();
         let h = create(false);
         assert_eq!(query(h), Some(0));
 
@@ -1203,6 +1315,7 @@ mod tests {
     /// below the point, and a waiter on it hung.
     #[test]
     fn a_binary_signal_does_not_strand_a_timeline_fence_in_flight() {
+        let _g = test_lock();
         let h = create(false);
         let mut reached = Landing::new();
         let inflight = Landing::new();
@@ -1243,6 +1356,7 @@ mod tests {
     /// advance the counter to its point.
     #[test]
     fn a_binary_signal_in_binary_range_spares_a_higher_timeline_fence() {
+        let _g = test_lock();
         let h = create(false);
         let inflight = Landing::new();
 
@@ -1263,5 +1377,268 @@ mod tests {
         assert_eq!(query_submitted(h), Some(7));
 
         destroy(h);
+    }
+
+    /// Closing a syncobj that still has a submit in flight is the ordinary
+    /// end of a frame's semaphore, and process teardown does it to every
+    /// handle a client owns (`drm_scheme.rs`'s release path). The fences it
+    /// left behind outlived it: the resolver could no longer find the object
+    /// to advance, nobody could wait on it, and 10 s later the timeout hook
+    /// fired and latched the GPU context WEDGED -- so the client's NEXT
+    /// submit (or another process sharing the channel) failed with
+    /// EIO/device-lost, for a syncobj that had simply been closed.
+    #[test]
+    fn destroying_a_syncobj_drops_the_timeline_fences_still_in_flight() {
+        let _g = test_lock();
+        arm_hooks();
+        const CTX: u32 = 0x5e_71;
+
+        let before = pending_now();
+        let h = create(false);
+        let fences = [Landing::new(), Landing::new(), Landing::new()];
+        // Binary range, an ordinary timeline point, and the far end of the
+        // counter: which fences go must not depend on the point at all. Only
+        // the first of the three was dropped before, and the filter's blind
+        // spot is everything above binary range.
+        for (i, point) in [1u64, 7, u64::MAX].iter().enumerate() {
+            assert!(attach_hw_fence(h, *point, fences[i].va(), 0, 3, CTX, false));
+        }
+        assert_eq!(pending_now(), before + 3, "three fences in flight");
+
+        assert!(destroy(h));
+        assert_eq!(
+            pending_now(),
+            before,
+            "destroying a syncobj must drop every fence in flight on it, not \
+             just the ones inside binary range"
+        );
+
+        // Past the hang deadline the orphan used to reach the timeout hook.
+        test_clock::advance(FENCE_TIMEOUT_US + 1);
+        poll_pending();
+        assert!(
+            timeouts().iter().all(|&(ctx, ..)| ctx != CTX),
+            "a closed syncobj must not wedge the context its fence was on"
+        );
+    }
+
+    /// `SYNCOBJ_RESET` is `drm_syncobj_replace_fence(syncobj, NULL)`: the
+    /// object carries no fence afterwards. A timeline fence left in flight
+    /// across the reset landed later and drove the counter back up on its
+    /// own, so a syncobj Mesa had just reset for reuse re-signaled itself
+    /// with nobody having signaled it.
+    #[test]
+    fn resetting_a_syncobj_drops_the_timeline_fence_it_carried() {
+        let _g = test_lock();
+
+        let h = create(false);
+        let mut fence = Landing::new();
+        assert!(attach_hw_fence(h, 7, fence.va(), 0, 3, 0, false));
+        assert_eq!(query_submitted(h), Some(7));
+
+        assert!(reset(h));
+        assert_eq!(
+            query_submitted(h),
+            Some(0),
+            "a reset syncobj carries no fence, in flight ones included"
+        );
+
+        // The GPU writes the landing zone anyway: the fence was real, it just
+        // no longer belongs to anything.
+        fence.land(3);
+        assert_eq!(
+            query(h),
+            Some(0),
+            "a reset syncobj must not re-signal itself from the fence it had"
+        );
+
+        destroy(h);
+    }
+
+    /// A deferred transfer names its source BY HANDLE, because there is no
+    /// refcounted `dma_fence` here to hand over. So destroying the source --
+    /// a client closing its acquire syncobj, or exiting -- left the
+    /// destination linked to a handle that no longer resolves: its point
+    /// could never advance again. That is wlroots' `linux-drm-syncobj-v1`
+    /// timeline, and NVK waits on it with an INT64_MAX deadline, so the
+    /// surface (and the output committing it) froze for good.
+    #[test]
+    fn destroying_a_transfer_source_releases_the_destination_it_promised() {
+        let _g = test_lock();
+        let src = create(false);
+        let dst = create(false);
+
+        // `src` is nowhere near point 5, so the transfer stays deferred.
+        assert!(transfer(dst, 9, src, 5));
+        assert_eq!(query(dst), Some(0), "nothing has landed yet");
+
+        arm_hooks();
+        assert!(destroy(src));
+        assert!(
+            signals().contains(&(dst, 9)),
+            "and an eventfd armed on that point has to be woken -- reading the \
+             table is not how a waiter finds out, got {:?}",
+            signals()
+        );
+        assert_eq!(
+            query(dst),
+            Some(9),
+            "the destination of a transfer whose source went away must be \
+             released to the point it was promised, not parked forever"
+        );
+        assert!(matches!(
+            wait(&[dst], Some(&[9]), false, 0),
+            WaitOutcome::Signaled { .. }
+        ));
+
+        destroy(dst);
+    }
+
+    /// Every table access resolves the pending fences first, and that
+    /// resolution is DESTRUCTIVE: the fence is taken out of the table and the
+    /// counter advanced before the caller's own work begins. The upcalls it
+    /// produced are handed back to be made once the lock is released. An
+    /// ioctl that then bailed out on an unknown handle dropped that parcel on
+    /// the floor, and there was nothing left to retry it with: the
+    /// `SYNCOBJ_EVENTFD` waiter for the point that had just been reached was
+    /// never woken, which for a compositor is a surface that never repaints.
+    /// One `SYNCOBJ_FD_TO_HANDLE` with a stale handle -- a race any client
+    /// can lose at teardown -- was enough.
+    #[test]
+    fn a_failed_import_still_delivers_the_signals_it_resolved() {
+        let _g = test_lock();
+        const GONE: u32 = 0xdead_beef;
+
+        // Bad DESTINATION: the source resolves, the destination does not.
+        let h = create(false);
+        let mut fence = Landing::new();
+        assert!(attach_hw_fence(h, 7, fence.va(), 0, 3, 0, false));
+        arm_hooks();
+        // Land it WITHOUT touching the table, so the resolution happens
+        // inside the failing call.
+        fence.land(3);
+        assert!(!import_snapshot(GONE, h, 1), "unknown destination handle");
+        assert!(
+            signals().contains(&(h, 7)),
+            "the fence that landed inside the failing import must still wake \
+             its waiters, got {:?}",
+            signals()
+        );
+
+        // Bad SOURCE: the call gives up before it even looks at the
+        // destination, one return earlier.
+        let h2 = create(false);
+        let mut fence2 = Landing::new();
+        assert!(attach_hw_fence(h2, 7, fence2.va(), 0, 3, 0, false));
+        arm_hooks();
+        fence2.land(3);
+        assert!(!import_snapshot(h, GONE, 1), "unknown source handle");
+        assert!(signals().contains(&(h2, 7)), "got {:?}", signals());
+
+        destroy(h2);
+        destroy(h);
+    }
+
+    /// [`transfer`] has the same two exits, and loses the same parcel.
+    #[test]
+    fn a_failed_transfer_still_delivers_the_signals_it_resolved() {
+        let _g = test_lock();
+        const GONE: u32 = 0xdead_beef;
+
+        let h = create(false);
+        let mut fence = Landing::new();
+        assert!(attach_hw_fence(h, 7, fence.va(), 0, 3, 0, false));
+        arm_hooks();
+        fence.land(3);
+        assert!(!transfer(GONE, 1, h, 1), "unknown destination handle");
+        assert!(signals().contains(&(h, 7)), "got {:?}", signals());
+
+        let h2 = create(false);
+        let mut fence2 = Landing::new();
+        assert!(attach_hw_fence(h2, 7, fence2.va(), 0, 3, 0, false));
+        arm_hooks();
+        fence2.land(3);
+        assert!(!transfer(h, 1, GONE, 1), "unknown source handle");
+        assert!(signals().contains(&(h2, 7)), "got {:?}", signals());
+
+        destroy(h2);
+        destroy(h);
+    }
+
+    /// The other half of the dropped parcel: a fence that did NOT land within
+    /// [`FENCE_TIMEOUT_US`] is a hung ring, and the upcall is how the driver
+    /// learns of it -- it latches the context wedged so the next submit fails
+    /// honestly instead of the client waiting on a GPU that will never
+    /// answer. Losing it turns a reported hang into a silent one.
+    #[test]
+    fn a_failed_ioctl_still_reports_the_fence_that_timed_out() {
+        let _g = test_lock();
+        const CTX: u32 = 0x7a_11;
+        const GONE: u32 = 0xdead_beef;
+
+        let h = create(false);
+        let fence = Landing::new();
+        assert!(attach_hw_fence(h, 7, fence.va(), 0, 3, CTX, false));
+
+        test_clock::advance(FENCE_TIMEOUT_US + 1);
+        arm_hooks();
+        assert!(!import_snapshot(GONE, h, 1), "unknown destination handle");
+        assert!(
+            timeouts().contains(&(CTX, h, 7)),
+            "a hung fence resolved inside a failing ioctl must still reach the \
+             timeout hook, got {:?}",
+            timeouts()
+        );
+
+        destroy(h);
+    }
+
+    /// The two fixes have to stay independent: dropping a destroyed handle's
+    /// fences must not touch anybody else's, and the links it releases are
+    /// only the ones that named it.
+    #[test]
+    fn destroying_one_syncobj_leaves_the_others_alone() {
+        let _g = test_lock();
+        let keep = create(false);
+        let doomed = create(false);
+        let other_src = create(false);
+        let linked = create(false);
+
+        let kept_fence = Landing::new();
+        let doomed_fence = Landing::new();
+        assert!(attach_hw_fence(keep, 7, kept_fence.va(), 0, 3, 0, false));
+        assert!(attach_hw_fence(
+            doomed,
+            7,
+            doomed_fence.va(),
+            0,
+            3,
+            0,
+            false
+        ));
+        // `linked` waits on a source that is NOT the one being destroyed.
+        assert!(transfer(linked, 9, other_src, 5));
+
+        let before = pending_now();
+        assert!(destroy(doomed));
+        assert_eq!(before - 1, pending_now(), "only its own fence goes");
+        assert_eq!(
+            query_submitted(keep),
+            Some(7),
+            "another handle's fence must survive"
+        );
+        assert_eq!(
+            query(linked),
+            Some(0),
+            "a link on a different source must not be released"
+        );
+
+        // And the link still works once its real source arrives.
+        assert!(timeline_signal(other_src, 5));
+        assert_eq!(query(linked), Some(9));
+
+        destroy(linked);
+        destroy(other_src);
+        destroy(keep);
     }
 }
