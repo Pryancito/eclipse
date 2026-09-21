@@ -211,6 +211,20 @@ fn vt_mode_accepted(mode: u8) -> bool {
     mode == VT_AUTO || mode == VT_PROCESS
 }
 
+/// Whether `KDSKBMODE` accepts this keyboard mode: Linux's `vt_do_kdskbmode`
+/// takes exactly `K_RAW`, `K_MEDIUMRAW`, `K_XLATE`, `K_UNICODE` and `K_OFF`,
+/// and answers `-EINVAL` to anything else.
+///
+/// The value used to be stored as it came. That was not harmless: the line
+/// discipline decides "cooked" as `matches!(mode, K_XLATE | K_UNICODE)`, so a
+/// VT left in any other number stopped translating key presses -- the
+/// keyboard went dead on that console, `KDGKBMODE` echoed the nonsense back,
+/// and the caller had been told `Ok`. The third ioctl of this family with the
+/// same hole, after `VT_SETMODE` and `KDSETMODE`.
+fn kbd_mode_accepted(mode: i32) -> bool {
+    matches!(mode, K_RAW | K_MEDIUMRAW | K_XLATE | K_UNICODE | K_OFF)
+}
+
 /// Give a VT back to the kernel, the way Linux's `reset_vc()` does.
 ///
 /// Used when the process that took the VT with `VT_SETMODE(VT_PROCESS)` can no
@@ -516,6 +530,10 @@ fn tty_ioctl(vt: usize, cmd: u32, data: usize) -> Result<usize> {
             // ioctl argument by value, not a pointer. X puts the keyboard into
             // K_RAW/K_OFF this way during console takeover.
             let mode = data as i32;
+            if !kbd_mode_accepted(mode) {
+                warn!("[vt] KDSKBMODE vt={} rejected mode={:#x}", vt, mode);
+                return Err(FsError::InvalidParam);
+            }
             TTY_STATES[vt_clamp(vt)]
                 .kbd_mode
                 .store(mode, Ordering::Relaxed);
@@ -2933,5 +2951,54 @@ mod vt_ownership_tests {
         }
 
         set_kd_mode_vt(0, KD_TEXT);
+    }
+
+    // ---- KDSKBMODE / KDGKBMODE -------------------------------------------
+
+    /// `vt_do_kdskbmode` accepts five modes and refuses the rest with EINVAL.
+    /// Storing anything else used to switch the VT's line discipline off:
+    /// "cooked" is decided by comparing the stored value against `K_XLATE`
+    /// and `K_UNICODE`, so a number that is neither stopped every key press
+    /// from becoming a character. A dead keyboard, reported as success.
+    #[test]
+    fn kdskbmode_refuses_a_mode_that_is_not_a_mode() {
+        let _g = test_lock();
+        TTY_STATES[0].kbd_mode.store(K_XLATE, Ordering::Relaxed);
+
+        for bogus in [5usize, 0x2a, usize::MAX] {
+            assert!(
+                tty_ioctl(0, KDSKBMODE as u32, bogus).is_err(),
+                "mode {:#x} has to be EINVAL",
+                bogus
+            );
+            assert_eq!(
+                tty_kbd_mode(0),
+                K_XLATE,
+                "and the VT must be left as it was"
+            );
+            assert!(tty_kbd_cooked(0), "the keyboard keeps cooking");
+        }
+    }
+
+    /// The five modes Linux knows all go through, and `KDGKBMODE` reads back
+    /// exactly what was set.
+    #[test]
+    fn kdskbmode_takes_the_five_modes_linux_knows() {
+        let _g = test_lock();
+        for mode in [K_RAW, K_MEDIUMRAW, K_XLATE, K_UNICODE, K_OFF] {
+            assert!(
+                tty_ioctl(0, KDSKBMODE as u32, mode as usize).is_ok(),
+                "{:#x}",
+                mode
+            );
+            let mut out: i32 = -1;
+            assert!(tty_ioctl(0, KDGKBMODE as u32, &mut out as *mut i32 as usize).is_ok());
+            assert_eq!(out, mode);
+        }
+        // Only the two translating modes cook; the X-server modes do not.
+        TTY_STATES[0].kbd_mode.store(K_RAW, Ordering::Relaxed);
+        assert!(!tty_kbd_cooked(0));
+        TTY_STATES[0].kbd_mode.store(K_XLATE, Ordering::Relaxed);
+        assert!(tty_kbd_cooked(0));
     }
 }
