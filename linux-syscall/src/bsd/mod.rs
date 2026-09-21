@@ -141,7 +141,7 @@ impl Syscall<'_> {
             }
             sys::CLOSE => BsdRet::from_result(self.sys_close(a0.into())),
             sys::CLOSE_RANGE => BsdRet::from_result(self.sys_close_range(a0, a1, a2)),
-            sys::LSEEK => BsdRet::from_result(self.sys_lseek(a0.into(), a1 as i64, a2 as u8)),
+            sys::LSEEK => BsdRet::from_result(self.sys_lseek(a0.into(), a1 as i64, a2)),
             sys::FSYNC => BsdRet::from_result(self.sys_fsync(a0.into())),
             sys::FDATASYNC => BsdRet::from_result(self.sys_fdatasync(a0.into())),
             sys::TRUNCATE => BsdRet::from_result(self.sys_truncate(a0.into(), a1)),
