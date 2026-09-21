@@ -8306,6 +8306,14 @@ mod out_fence_tests {
 
         commit(&c, &req, DRM_MODE_ATOMIC_TEST_ONLY).expect("TEST_ONLY commit");
 
+        // What this pins is that the slot IS written, with `-1`. That it is `-1`
+        // *rather than a real fd* is not separable here and no sharper test will
+        // separate it: installing the signaled stub needs a current thread with
+        // a Linux fd table, and a hosted test has neither, so
+        // `try_signaled_out_fence_fd` returns `None` and the success leg writes
+        // `-1` too. Swapping the two legs therefore survives this module by
+        // construction; the leg that is checkable is checked above and in
+        // `a_failed_commit_still_writes_minus_one_into_the_out_fence_slot`.
         assert_eq!(slot, -1, "TEST_ONLY did not write the fence slot");
         assert!(
             (0..8).all(|y| (0..32).all(|x| screen.pixel(x, y) == kms_emu::UNTOUCHED)),
@@ -8417,5 +8425,41 @@ mod out_fence_tests {
         // Leaving it off is not a modeset, so the same property with the other
         // value needs neither.
         assert!(commit(&c, &benign_request(), 0).is_ok());
+    }
+
+    /// And with a mode in hand, the `ALLOW_MODESET` flag is still required on
+    /// its own. Both guards refuse the same request with the same errno, so this
+    /// is the only shape that tells them apart: a commit that carries a mode has
+    /// nothing left to object to except the missing flag. Linux's rule is that a
+    /// client which has not opted into modesetting never gets one -- wlroots
+    /// relies on it to probe configurations without disturbing the screen.
+    #[test]
+    fn a_modeset_that_carries_a_mode_still_needs_the_allow_modeset_flag() {
+        let (_screen, c) = atomic_client(32, 8);
+        // The panel's own mode: anything else is refused for a different reason.
+        let mode = make_modeinfo(32, 8);
+        let mut blob = DrmModeCreateBlob {
+            data: mode.as_ptr() as u64,
+            length: mode.len() as u32,
+            blob_id: 0,
+        };
+        c.ioctl(DRM_IOCTL_MODE_CREATEPROPBLOB, &mut blob)
+            .expect("CREATEPROPBLOB");
+        assert_ne!(blob.blob_id, 0, "the mode blob was not created");
+
+        let req = Request::new(
+            &[drm::SYNTH_CRTC_ID],
+            &[2],
+            &[PROP_MODE_ID, PROP_ACTIVE],
+            &[u64::from(blob.blob_id), 1],
+        );
+
+        assert_eq!(
+            commit(&c, &req, 0),
+            Err(FsError::InvalidParam),
+            "a modeset went through without ALLOW_MODESET"
+        );
+        commit(&c, &req, DRM_MODE_ATOMIC_ALLOW_MODESET)
+            .expect("a modeset with the flag and a matching mode must be accepted");
     }
 }
