@@ -277,8 +277,39 @@ pub fn lookup(handle: u32) -> Option<(u64, u64)> {
 }
 
 /// Like [`lookup`], but only if [`holds`] says `pid` may use `handle`.
+///
+/// A refusal here is SILENT to the caller -- PRIME export, the driver-private
+/// mmap and `ADDFB` all just see `None` and answer the same ENOENT/EINVAL they
+/// would for a handle that does not exist. That is the right answer for a
+/// prober and a terrible one to debug: if some legitimate holder is ever
+/// missing from `holders`, a real client (NVK under Xwayland, where the buffer
+/// crosses client -> Xwayland -> compositor) loses a buffer it owns and hangs
+/// with nothing in the log to say why.
+///
+/// So say it, loudly and at most a few times per boot: an entry that EXISTS but
+/// is not held by the caller is the only case worth reporting -- an unknown
+/// handle is an ordinary miss, not an ownership decision.
 pub fn lookup_for(handle: u32, pid: u64) -> Option<(u64, u64)> {
     if !holds(handle, pid) {
+        use core::sync::atomic::{AtomicU32, Ordering};
+        static DENIED: AtomicU32 = AtomicU32::new(0);
+        // Bound to a `let`, NOT left as an `if` condition: a temporary lock
+        // guard in the condition lives to the end of the `if`, which would
+        // hold MAPPINGS across the log call below.
+        let tracked = MAPPINGS.lock().iter().any(|e| e.handle == handle);
+        if tracked {
+            let n = DENIED.fetch_add(1, Ordering::Relaxed);
+            if n < 8 {
+                log::error!(
+                    "[gem] handle={:#x} refused to pid={} -- it is tracked but that pid holds no \
+                     reference (denial {}/8 this boot). If a working client just lost a buffer, \
+                     this is why: the holder list is missing whoever legitimately imported it.",
+                    handle,
+                    pid,
+                    n + 1
+                );
+            }
+        }
         return None;
     }
     lookup(handle)
