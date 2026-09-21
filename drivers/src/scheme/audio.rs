@@ -33,6 +33,19 @@ pub trait AudioScheme: Scheme {
     /// Total capacity of the playback ring in bytes.
     fn buffer_bytes(&self) -> usize;
 
+    /// What [`buffer_bytes`](AudioScheme::buffer_bytes) will report once a
+    /// client at `rate` Hz is negotiated with `set_params`, without
+    /// changing anything. A device that resamples into a fixed-rate ring
+    /// holds a rate-dependent number of CLIENT frames, and a front end
+    /// sizing a buffer for a rate it has not applied yet must ask for that
+    /// rate's figure: the one for the previous stream is not a bound the
+    /// device can honour, and a buffer bigger than the ring is `avail`
+    /// promising room that `write` then refuses. Default: rate-independent.
+    fn buffer_bytes_at(&self, rate: u32) -> usize {
+        let _ = rate;
+        self.buffer_bytes()
+    }
+
     /// Bytes of client PCM queued but not yet played out. Silence the device
     /// inserted on its own (see [`delay_bytes`](AudioScheme::delay_bytes))
     /// is not counted: this is what a client's hardware pointer is derived
