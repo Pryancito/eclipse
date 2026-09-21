@@ -79,4 +79,20 @@ pub trait NetScheme: Scheme {
     fn link_carrier_up(&self) -> bool {
         true
     }
+    /// SIOCSIFFLAGS admin-down — quiesce datapath without tearing down the iface.
+    fn admin_down(&self) -> DeviceResult {
+        Ok(())
+    }
+    /// IFF_PROMISC — unicast (+ typically multicast) promiscuous receive.
+    fn set_promiscuous(&self, _on: bool) -> DeviceResult {
+        Ok(())
+    }
+    /// IFF_ALLMULTI — accept all multicast without programming the MTA.
+    fn set_allmulti(&self, _on: bool) -> DeviceResult {
+        Ok(())
+    }
+    /// Replace the hardware multicast filter list (ignored when allmulti/promisc).
+    fn set_multicast_list(&self, _addrs: &[[u8; 6]]) -> DeviceResult {
+        Ok(())
+    }
 }

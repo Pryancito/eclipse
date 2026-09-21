@@ -62,8 +62,8 @@ const E1000E_FEXTNVM7: usize = 0x01018 / 4;
 ```
 
 Según el mapa de registros de Linux e1000e, FEXTNVM6 está en `0x00010` y
-FEXTNVM7 en `0x000E4` — no cerca de PBA (`0x1000`). El archivo muerto
-`e1000e_pch.rs:30` tiene el mismo `0x01018` erróneo, lo que sugiere un
+FEXTNVM7 en `0x000E4` — no cerca de PBA (`0x1000`). Un borrador huérfano
+`e1000e_pch.rs` (eliminado) tenía el mismo `0x01018` erróneo, lo que sugiere un
 origen compartido del error (posible confusión con la región de PBA).
 Efecto: los workarounds de ULP/SPT (líneas 683-684, 995-996) hacen
 read-modify-write sobre MMIO reservado en vez de tocar el registro real, y

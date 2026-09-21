@@ -26,11 +26,14 @@ extern crate log;
 use alloc::sync::Arc;
 use core::fmt;
 
-#[cfg(any(feature = "mock", doc))]
+// Do not use `cfg(doc)` here: rustdoc sets it for `--doc` tests, which would
+// compile these modules without their optional deps (`async-std`/`sdl2` /
+// `virtio-drivers`) and without the `mock` feature that disables `no_std`.
+#[cfg(feature = "mock")]
 #[doc(cfg(feature = "mock"))]
 pub mod mock;
 
-#[cfg(any(feature = "virtio", doc))]
+#[cfg(feature = "virtio")]
 #[doc(cfg(feature = "virtio"))]
 pub mod virtio;
 
