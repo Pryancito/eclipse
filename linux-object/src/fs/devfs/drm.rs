@@ -9,7 +9,7 @@ use alloc::sync::{Arc, Weak};
 use alloc::vec;
 use alloc::vec::Vec;
 use core::convert::TryFrom;
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use core::time::Duration;
 use lock::Mutex;
 
@@ -53,6 +53,10 @@ static SCANOUT_NULL_LOGGED: core::sync::atomic::AtomicBool =
 static CE_NO_TAKER_LOGGED: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 /// One-shot latch for the CE staging-buffer allocation failure warning.
+/// One-shot: hardware KMS took over the scanout while the pointer was still
+/// software-composited, so nothing can draw it. See `repaint_for_cursor`.
+static SURFACEFLIP_NO_CURSOR_LOGGED: AtomicBool = AtomicBool::new(false);
+
 static CE_STAGING_ALLOC_FAILED_LOGGED: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 /// Staging buffer for the pitch-mismatch CE present: `(vaddr, paddr, size,
@@ -651,6 +655,28 @@ pub fn register_driver(driver: Arc<dyn DrmScheme>) {
     }
 }
 
+/// Unregister a driver [`register_driver`] added, matched by identity
+/// (`Arc::ptr_eq`) rather than by name. Returns whether one was removed.
+///
+/// Test-only, and `DRM_STATE.drivers` is append-only for a reason: nothing in
+/// this kernel unplugs a GPU. But a unit-test binary runs every test of the
+/// crate in ONE process, and a registered driver changes the answers the whole
+/// DRM core gives -- `software_kms_active()` asks every driver whether it can
+/// scan out, `get_primary_driver()` takes the first entry, and `get_resources`
+/// filters the topology on whether any driver has hardware KMS. One left behind
+/// would put every later test on the hardware path.
+#[cfg(test)]
+pub(crate) fn unregister_driver(driver: &Arc<dyn DrmScheme>) -> bool {
+    let mut state = DRM_STATE.lock();
+    match state.drivers.iter().position(|d| Arc::ptr_eq(d, driver)) {
+        Some(pos) => {
+            state.drivers.remove(pos);
+            true
+        }
+        None => false,
+    }
+}
+
 /// Get the primary DRM driver
 pub fn get_primary_driver() -> Option<Arc<dyn DrmScheme>> {
     DRM_STATE.lock().drivers.first().cloned()
@@ -841,6 +867,17 @@ pub fn driver_for_minor(minor: u32) -> Option<Arc<dyn DrmScheme>> {
         .iter()
         .find(|n| n.owns_minor(minor))
         .map(|n| n.driver.clone())
+}
+
+/// How many framebuffer objects and GEM handles the kernel is holding.
+///
+/// For tests that run a frame loop and then check it came back into balance:
+/// both tables are process-wide here, not per `drm_file` as in Linux, so a
+/// leaked entry is visible globally and only globally.
+#[cfg(test)]
+pub(crate) fn table_sizes_for_test() -> (usize, usize) {
+    let state = DRM_STATE.lock();
+    (state.framebuffers.len(), state.handles.len())
 }
 
 /// Whether `minor` is one of the compute-only nodes (index 1 and up). Those
@@ -1843,6 +1880,35 @@ fn dma_sync_gem_rect_from_device(
     }
 }
 
+/// Take a framebuffer's geometry AND a reference that keeps its memory alive for
+/// as long as the returned guard lives.
+///
+/// The present path copies `DrmFramebuffer` out of `DRM_STATE` (it is `Copy`),
+/// drops the lock, and then blits from `phys_addr` for anything between a
+/// millisecond and ~100 ms, re-enabling interrupts between bands. It held no
+/// reference at all while doing that, so a concurrent `rmfb` -- or a process
+/// exit -- could drop the last `Arc<VmObject>`, hand the frames back to the
+/// allocator, and let the in-flight blit read memory that now belongs to
+/// somebody else. `release_process`'s comment argued the process's mappings are
+/// already gone by then, which covers userspace writers but says nothing about a
+/// kernel blit in flight on another CPU.
+///
+/// The second element is that reference. It is `None` when the backing is a
+/// nouveau GEM object, which has no `VmObject` to take a reference on -- that
+/// case is covered instead by retiring the framebuffer when the GEM object is
+/// freed (see [`retire_framebuffers_for_handle`]), which closes the window from
+/// the other end.
+fn snapshot_fb_for_present(fb_id: u32) -> Option<(DrmFramebuffer, Option<Arc<VmObject>>)> {
+    let state = DRM_STATE.lock();
+    let fb = *state.framebuffers.iter().find(|f| f.id == fb_id)?;
+    let backing = state
+        .fb_backing
+        .iter()
+        .find(|(id, _)| *id == fb_id)
+        .map(|(_, vmo)| vmo.clone());
+    Some((fb, backing))
+}
+
 /// How many retired framebuffer ids [`DrmState::fb_retirements`] remembers.
 /// A double-buffered swapchain retires two per recreate, so sixteen covers
 /// several recreates -- far enough back to still cover the id a stuck
@@ -1979,14 +2045,13 @@ pub fn scanout_region_checked(
     fb_id: u32,
     rect: Option<(u32, u32, u32, u32)>,
 ) -> Result<(), PresentError> {
-    let fb = {
-        let state = DRM_STATE.lock();
-        match state.framebuffers.iter().find(|f| f.id == fb_id) {
-            Some(f) => *f,
-            None => {
-                warn!("[drm] scanout: fb_id={} not found", fb_id);
-                return Err(PresentError::NoSuchFb);
-            }
+    // `_backing` is held for the whole function on purpose: it is what stops a
+    // concurrent RMFB or process exit from freeing the frames under the blit.
+    let (fb, _backing) = match snapshot_fb_for_present(fb_id) {
+        Some(v) => v,
+        None => {
+            warn!("[drm] scanout: fb_id={} not found", fb_id);
+            return Err(PresentError::NoSuchFb);
         }
     };
     // Before the display, because this one is the framebuffer's OWN defect and
@@ -2427,18 +2492,32 @@ pub fn set_cursor_bo(handle_id: u32, w: u32, h: u32) -> bool {
     true
 }
 
-/// `true` when the kernel cmdline opts into the display-engine hardware
-/// cursor (`nvidia.hwcursor`). Cached after the first look: this is on every
-/// pointer-motion path.
+/// Whether the display-engine cursor plane may take the pointer
+/// (`nvidia.hwcursor`): 0 = nobody has said, 1 = yes, 2 = no. Read on every
+/// pointer-motion path, so it is an atomic and never re-parses anything.
+static HW_CURSOR: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// Opt into (or out of) the display-engine hardware cursor.
+///
+/// Called from boot where every other `nvidia.*` flag is parsed. It used to be
+/// the only one of them read straight from the cmdline down here, which meant
+/// nothing could ever exercise the hardware-cursor path except a real boot with
+/// the flag on -- and that path decides whether the pointer is drawn by the CPU
+/// or by the display engine, so "the pointer vanished" had no test either way.
+pub fn set_hw_cursor_enabled(v: bool) {
+    HW_CURSOR.store(if v { 1 } else { 2 }, Ordering::Relaxed);
+}
+
+/// `true` when the display-engine hardware cursor is opted into.
 fn hw_cursor_wanted() -> bool {
-    use core::sync::atomic::AtomicU8;
-    static WANTED: AtomicU8 = AtomicU8::new(0); // 0 unknown, 1 yes, 2 no
-    match WANTED.load(Ordering::Relaxed) {
+    match HW_CURSOR.load(Ordering::Relaxed) {
         1 => true,
         2 => false,
+        // Nobody called `set_hw_cursor_enabled`: fall back to the cmdline, so
+        // the flag still works in a build whose boot path does not set it.
         _ => {
             let yes = kernel_hal::boot::cmdline().contains("nvidia.hwcursor");
-            WANTED.store(if yes { 1 } else { 2 }, Ordering::Relaxed);
+            HW_CURSOR.store(if yes { 1 } else { 2 }, Ordering::Relaxed);
             yes
         }
     }
@@ -2463,7 +2542,78 @@ pub fn move_cursor(x: i32, y: i32) {
     }
 }
 
-/// Make a cursor set/move take effect immediately (the legacy cursor ioctls
+/// Composite the software cursor on top of a frame the DRIVER just flipped.
+///
+/// A successful `DrmScheme::page_flip` short-circuits `scanout_region`, and
+/// `scanout_region` is the only place that composites the software pointer and
+/// records `cursor.drawn`. So with `nvidia.hwflip` every accepted flip landed a
+/// frame with no pointer in it, and left `cursor.drawn` describing a rectangle
+/// the flip had already overwritten -- so the next `repaint_for_cursor` "erased"
+/// a cursor that was not there, painting a stale patch of an older frame.
+///
+/// No erase is needed here, unlike `repaint_for_cursor`: the flip has just
+/// rewritten the whole scanout from the compositor's scene, which never has a
+/// cursor baked in. Draw the pointer at its current position and record it.
+///
+/// Returns whether anything was drawn.
+fn composite_cursor_after_driver_flip(fb_id: u32) -> bool {
+    if scanout_paused() {
+        return false;
+    }
+    let new = {
+        let mut st = DRM_STATE.lock();
+        if st.graphics_vt != Some(kernel_hal::console::active_vt()) {
+            return false;
+        }
+        // The display engine composites its own plane during scanout.
+        if st.cursor.hw {
+            return false;
+        }
+        let c = &st.cursor;
+        let new = if c.visible && c.w > 0 && c.h > 0 {
+            c.bitmap
+                .as_ref()
+                .filter(|b| !b.is_empty())
+                .map(|b| (c.x, c.y, c.w, c.h, Arc::clone(b)))
+        } else {
+            None
+        };
+        // The flip wiped whatever was on screen, so this is the whole truth
+        // about what is drawn -- including `None`, which correctly tells the
+        // next move there is nothing to erase.
+        st.cursor.drawn = new.as_ref().map(|(x, y, w, h, _)| (*x, *y, *w, *h));
+        new
+    };
+    let Some((nx, ny, nw, nh, bmp)) = new else {
+        return false;
+    };
+    let Some((fb, _backing)) = snapshot_fb_for_present(fb_id) else {
+        return false;
+    };
+    let Some(display) = primary_display() else {
+        return false;
+    };
+    if fb.phys_addr == 0 || fb.size == 0 || fb.pitch < 4 {
+        return false;
+    }
+    let info = display.info();
+    let (fw, fh) = (info.width.min(fb.width), info.height.min(fb.height));
+    let vaddr = phys_to_virt(fb.phys_addr as usize);
+    // SAFETY: contiguous physical framebuffer of `fb.size` bytes, identity
+    // mapped at `vaddr`; read as `fb.size / 4` u32 pixels. `_backing` keeps it
+    // alive for the duration.
+    let pixels = unsafe { core::slice::from_raw_parts(vaddr as *const u32, fb.size / 4) };
+    let src_stride = (fb.pitch / 4) as usize;
+    if zcore_drivers::scheme::gem_mmap::lookup(fb.gem_handle_id).is_some() {
+        dma_sync_gem_rect_from_device(vaddr, fb.size, src_stride, nx, ny, nw, nh, fw, fh);
+    }
+    blit_cursor_patch(
+        &*display, pixels, src_stride, fw, fh, nx, ny, nw, nh, nx, ny, nw, nh, &bmp,
+    );
+    true
+}
+
+/// Make a cursor set/move take effect immediately (the legacy cursor ioctls/// Make a cursor set/move take effect immediately (the legacy cursor ioctls
 /// carry no page-flip of their own) WITHOUT re-blitting the whole frame.
 ///
 /// The pointer moves far more often than the scene changes — wlroots issues a
@@ -2478,7 +2628,30 @@ pub fn repaint_for_cursor() {
     // present, so it must not light a panel the client turned off. This is the
     // latch half of `set_crtc_blanked` -- without it a mouse twitch redrew the
     // whole frame and undid the blank.
-    if !software_kms_active() || scanout_paused() || crtc_blanked() {
+    if scanout_paused() || crtc_blanked() {
+        return;
+    }
+    if !software_kms_active() {
+        // Hardware KMS has taken over the scanout. `has_hardware_kms()` is
+        // recomputed on every call and flips to true the first time the NVC57E
+        // ladder reports ready, so this guard starts firing mid-session -- at
+        // which point the last software cursor image simply stopped being
+        // repainted and nothing replaced it. A CPU composite into the GOP is
+        // genuinely useless here (the display engine is scanning out the
+        // client's own surface, not the GOP framebuffer), so the honest answer
+        // is to say so once rather than leave the user wondering where the
+        // pointer went.
+        let needs_hw_plane = {
+            let st = DRM_STATE.lock();
+            st.cursor.visible && !st.cursor.hw
+        };
+        if needs_hw_plane && !SURFACEFLIP_NO_CURSOR_LOGGED.swap(true, Ordering::Relaxed) {
+            kernel_hal::klog_info!(
+                "[drm] hardware KMS is presenting (nvidia.surfaceflip) but the pointer is \
+                 software-composited, so it can no longer be drawn -- add nvidia.hwcursor \
+                 to the cmdline for a hardware cursor plane"
+            );
+        }
         return;
     }
     // Snapshot everything needed under the lock, and record the rect we are
@@ -2513,12 +2686,10 @@ pub fn repaint_for_cursor() {
     if fb_id == 0 {
         return;
     }
-    let fb = {
-        let state = DRM_STATE.lock();
-        match state.framebuffers.iter().find(|f| f.id == fb_id) {
-            Some(f) => *f,
-            None => return,
-        }
+    // Same lifetime guard as `scanout_region`: this blits with the lock dropped.
+    let (fb, _backing) = match snapshot_fb_for_present(fb_id) {
+        Some(v) => v,
+        None => return,
     };
     let display = match primary_display() {
         Some(d) => d,
@@ -2873,8 +3044,18 @@ pub fn reset_vblank_period() {
 pub enum FlipError {
     /// A previous flip's completion event has not been posted yet (Linux EBUSY).
     Busy,
-    /// Present/scanout failed.
-    Failed,
+    /// The frame could not be put on the screen, and why.
+    ///
+    /// Carries the reason so the ioctl arm can apply the same policy `SETCRTC`
+    /// does (see `present_failed` there): a missing framebuffer is the client's
+    /// own error and fails the ioctl with `ENOENT`, while a frame that merely
+    /// could not be copied is reported and accepted. Collapsing all three to
+    /// one `Failed` answered `EIO` for every one of them, and wlroots escalates
+    /// an unexpected page-flip failure into an output teardown -- it drops DRM
+    /// master and the desktop falls back to the text console. `SETCRTC` was
+    /// given this distinction and the flip path was left without it, so the
+    /// identical condition was survivable on one and fatal on the other.
+    Present(PresentError),
 }
 
 /// `want_event`: the request carried `DRM_MODE_PAGE_FLIP_EVENT`. Without it
@@ -2913,14 +3094,23 @@ pub fn page_flip(
             return Err(FlipError::Busy);
         }
     }
-    let flipped = present_now(fb_id, crtc_id);
-    if !flipped {
-        return Err(FlipError::Failed);
+    let present = present_now_checked(fb_id, crtc_id, None);
+    // A framebuffer that is not there is the one reason to fail the flip, and
+    // it owes no completion. For the others the flip stands: the event MUST
+    // still be queued, because a client that asked for one and does not get it
+    // blocks in `poll()` on the card fd for a frame that will never be
+    // reported -- the frame loop stops dead, which is worse than a frame that
+    // was not copied.
+    if matches!(present, Err(PresentError::NoSuchFb)) {
+        return Err(FlipError::Present(PresentError::NoSuchFb));
     }
     if want_event {
         schedule_flip_event(crtc_id, user_data, file);
     }
-    Ok(())
+    match present {
+        Ok(()) => Ok(()),
+        Err(e) => Err(FlipError::Present(e)),
+    }
 }
 
 /// Deliver a page-flip completion at the next synthetic vblank boundary rather
@@ -2966,6 +3156,39 @@ static DRM_TIMER_ARMED: AtomicBool = AtomicBool::new(false);
 /// True between [`schedule_flip_event`] and the matching [`queue_flip_event`].
 static FLIP_EVENT_PENDING: AtomicBool = AtomicBool::new(false);
 
+/// How many page-flip completions are queued OR mid-delivery.
+///
+/// `FLIP_EVENT_PENDING` alone could not express "mid-delivery", and two things
+/// broke on that. `deliver_pending_drm_timer` drains the whole queue into a
+/// local `Vec` and only clears the latch later, inside `queue_flip_event`; in
+/// that window `clear_stale_flip_pending` sees a queue with no `Flip` in it,
+/// concludes the latch is stale and clears it -- so the "one flip outstanding"
+/// invariant is gone and two frames can reach the scanout inside one vblank
+/// period. And `queue_flip_event` cleared the latch unconditionally, so
+/// delivering the first of two queued flips marked the second as not pending,
+/// after which a further flip skipped the flush entirely and the queue held two.
+///
+/// This counts both states, so the latch is cleared exactly when the last flip
+/// has been delivered or cancelled and not a moment sooner.
+static FLIPS_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+
+/// Account for one flip leaving the queued-or-delivering population, clearing
+/// the latch only when it was the last one.
+fn flip_in_flight_done() {
+    // `fetch_update` rather than a bare decrement: a cancel path may already
+    // have taken the count to zero, and wrapping below zero would latch
+    // `FLIP_EVENT_PENDING` on forever (a permanent EBUSY, which wlroots turns
+    // into an output teardown).
+    let prev = FLIPS_IN_FLIGHT
+        .try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+            Some(n.saturating_sub(1))
+        })
+        .unwrap_or(0);
+    if prev <= 1 {
+        FLIP_EVENT_PENDING.store(false, Ordering::Release);
+    }
+}
+
 fn deliver_pending_drm_timer() {
     DRM_TIMER_ARMED.store(false, Ordering::Release);
     // Everything scheduled for this vblank boundary completes together — the
@@ -2984,7 +3207,7 @@ fn deliver_pending_drm_timer() {
                     queue_flip_event(&file, crtc_id, user_data);
                 } else {
                     // drm_file closed before delivery — drop the event.
-                    FLIP_EVENT_PENDING.store(false, Ordering::Release);
+                    flip_in_flight_done();
                 }
             }
             PendingDrmTimer::Vblank {
@@ -3056,6 +3279,9 @@ fn schedule_flip_event(crtc_id: u32, user_data: u64, file: &Arc<DrmFileState>) {
     LAST_FLIP_PID.store(current_pid(), Ordering::Relaxed);
     {
         let mut q = PENDING_DRM_TIMERS.lock();
+        // Inside the queue lock, for the same reason the latch store is: the
+        // count and the queue must never be seen disagreeing.
+        FLIPS_IN_FLIGHT.fetch_add(1, Ordering::AcqRel);
         FLIP_EVENT_PENDING.store(true, Ordering::Release);
         q.push_back(PendingDrmTimer::Flip {
             crtc_id,
@@ -3076,7 +3302,7 @@ fn schedule_flip_event(crtc_id: u32, user_data: u64, file: &Arc<DrmFileState>) {
 /// accepting the new flip) and still delivers exactly one event per flip — no
 /// dropped or overwritten completion, so no stale `wl_listener` free in labwc.
 /// Pending vblank-wait jobs keep their own pacing and stay queued.
-fn flush_pending_flip_completions() {
+pub(crate) fn flush_pending_flip_completions() {
     let flips: Vec<(u32, u64, Weak<DrmFileState>)> = {
         let mut q = PENDING_DRM_TIMERS.lock();
         let mut kept = VecDeque::with_capacity(q.len());
@@ -3111,12 +3337,12 @@ fn flush_pending_flip_completions() {
 /// userspace see a persistent EBUSY, which wlroots escalates into output
 /// teardown. If no queued flip exists, clear the latch and continue.
 fn clear_stale_flip_pending() {
-    let has_queued_flip = {
-        let q = PENDING_DRM_TIMERS.lock();
-        q.iter()
-            .any(|job| matches!(job, PendingDrmTimer::Flip { .. }))
-    };
-    if !has_queued_flip {
+    // The QUEUE is not the population: `deliver_pending_drm_timer` drains it
+    // into a local before delivering, so a flip that is mid-delivery appears in
+    // neither place. Ask the counter, which covers both, or this "self-heal"
+    // becomes the bug -- clearing the latch for a flip that has not been
+    // delivered yet and letting a second frame through inside one vblank.
+    if FLIPS_IN_FLIGHT.load(Ordering::Acquire) == 0 {
         FLIP_EVENT_PENDING.store(false, Ordering::Release);
     }
 }
@@ -3151,12 +3377,13 @@ pub fn schedule_vblank_event(signal: u64, due_seq: u32, file: &Arc<DrmFileState>
 pub fn cancel_pending_events() {
     PENDING_DRM_TIMERS.lock().clear();
     DRM_TIMER_ARMED.store(false, Ordering::Release);
+    FLIPS_IN_FLIGHT.store(0, Ordering::Release);
     FLIP_EVENT_PENDING.store(false, Ordering::Release);
 }
 
 /// Drain timer jobs that target a closing drm_file (by raw pointer identity).
 fn cancel_pending_timers_for_file(file_ptr: *const DrmFileState) {
-    let mut cleared_flip = false;
+    let mut cleared_flip = 0usize;
     {
         let mut q = PENDING_DRM_TIMERS.lock();
         q.retain(|job| {
@@ -3166,7 +3393,7 @@ fn cancel_pending_timers_for_file(file_ptr: *const DrmFileState) {
             };
             if core::ptr::eq(job_ptr, file_ptr) {
                 if matches!(job, PendingDrmTimer::Flip { .. }) {
-                    cleared_flip = true;
+                    cleared_flip += 1;
                 }
                 false
             } else {
@@ -3174,8 +3401,8 @@ fn cancel_pending_timers_for_file(file_ptr: *const DrmFileState) {
             }
         });
     }
-    if cleared_flip {
-        FLIP_EVENT_PENDING.store(false, Ordering::Release);
+    for _ in 0..cleared_flip {
+        flip_in_flight_done();
     }
 }
 
@@ -3377,7 +3604,12 @@ pub fn present_now_checked(
             .and_then(|f| f.driver_fb_id)?;
         Some(driver.page_flip(driver_fb_id)).filter(|&ok| ok)
     });
-    if !hw.unwrap_or(false) {
+    if hw.unwrap_or(false) {
+        // The driver flip replaced the whole scanout and skipped
+        // `scanout_region`, which is the only place the software pointer gets
+        // composited. Put it back on top of this frame.
+        composite_cursor_after_driver_flip(fb_id);
+    } else {
         scanout_region_checked(fb_id, rect)?;
     }
     set_crtc_fb(crtc_id, fb_id);
@@ -3418,8 +3650,9 @@ fn queue_flip_event(file: &DrmFileState, crtc_id: u32, user_data: u64) {
     let seq = vblank_seq_now();
     push_drm_event(file, DRM_EVENT_FLIP_COMPLETE, crtc_id, seq, user_data);
     // Flip is complete from the KMS POV once the event is on the card fd —
-    // a new PAGE_FLIP may be accepted even before userspace reads it.
-    FLIP_EVENT_PENDING.store(false, Ordering::Release);
+    // a new PAGE_FLIP may be accepted even before userspace reads it. Only the
+    // LAST outstanding flip clears the latch; see `FLIPS_IN_FLIGHT`.
+    flip_in_flight_done();
 }
 
 /// Enqueue a `DRM_EVENT_VBLANK` for a `WAIT_VBLANK` request that asked for an
@@ -4316,6 +4549,23 @@ pub fn get_plane(id: u32) -> Option<DrmPlane> {
     None
 }
 
+/// Put the process-wide output state a present depends on back to its defaults.
+///
+/// Called when an emulated output detaches, INCLUDING while a panic unwinds. A
+/// test that fails half way through would otherwise leave a visible software
+/// cursor, or a blanked CRTC, behind, and the next test then fails for a reason
+/// that is not its own -- exactly the noise [`test_globals`] exists to remove.
+/// Call it with no display registered, so unblanking cannot clear one.
+#[cfg(test)]
+pub(crate) fn reset_output_state_for_test() {
+    set_crtc_blanked(false);
+    // Back to "nobody has said", which is what a fresh process looks like.
+    HW_CURSOR.store(0, Ordering::Relaxed);
+    let mut st = DRM_STATE.lock();
+    st.cursor = CursorState::default();
+    st.crtc_fb = 0;
+}
+
 #[cfg(test)]
 pub(super) mod test_globals {
     extern crate std;
@@ -4842,6 +5092,7 @@ mod refresh_tests {
     /// carries.
     #[test]
     fn a_stated_vrefresh_wins_over_the_timings() {
+        let _serialised = super::test_globals::lock();
         assert_eq!(
             refresh_hz_from_modeinfo(&modeinfo(139_900, 2080, 1121, 144)),
             Some(144)
@@ -4859,6 +5110,7 @@ mod refresh_tests {
     /// exactly how SETCRTC and an atomic MODE_ID blob reach this path.
     #[test]
     fn a_derived_refresh_rounds_to_nearest_like_linux() {
+        let _serialised = super::test_globals::lock();
         // 1920x1080, the mode `make_modeinfo` builds.
         assert_eq!(
             refresh_hz_from_modeinfo(&modeinfo(139_900, 2080, 1121, 0)),
@@ -4893,6 +5145,7 @@ mod refresh_tests {
     /// falls back to 60 Hz rather than dividing by zero or pacing off garbage.
     #[test]
     fn an_unusable_modeinfo_has_no_refresh() {
+        let _serialised = super::test_globals::lock();
         assert_eq!(refresh_hz_from_modeinfo(&[]), None);
         assert_eq!(refresh_hz_from_modeinfo(&[0u8; 27]), None, "truncated blob");
         assert_eq!(refresh_hz_from_modeinfo(&modeinfo(0, 2080, 1121, 0)), None);
@@ -4911,6 +5164,7 @@ mod refresh_tests {
     /// mode.
     #[test]
     fn the_vblank_period_tracks_the_mode_and_is_never_zero() {
+        let _serialised = super::test_globals::lock();
         set_vblank_period_from_modeinfo(&modeinfo(139_900, 2080, 1121, 0));
         assert_eq!(vblank_period_ns(), 1_000_000_000 / 60);
         set_vblank_period_from_modeinfo(&modeinfo(0, 0, 0, 144));
@@ -6056,5 +6310,230 @@ mod cursor_invalidate_tests {
             "expected the unexpanded invalidate to fall short somewhere; \
              if this fires, the widening is no longer load-bearing"
         );
+    }
+}
+
+/// Tests for the "one page flip outstanding" invariant, driven single-threaded
+/// with no timers: the queue and the pending latch are private statics in this
+/// module, so a test can put them into exactly the state the race produced.
+#[cfg(test)]
+mod flip_latch_tests {
+    use super::*;
+
+    /// Start from a clean slate; these statics are process-wide.
+    fn reset() {
+        PENDING_DRM_TIMERS.lock().clear();
+        FLIPS_IN_FLIGHT.store(0, Ordering::Release);
+        FLIP_EVENT_PENDING.store(false, Ordering::Release);
+        DRM_TIMER_ARMED.store(false, Ordering::Release);
+    }
+
+    /// Queue a flip the way `schedule_flip_event` does, without arming a real
+    /// timer (which under libos would spawn an async sleep task and make this
+    /// non-deterministic).
+    fn queue_one(file: &Arc<DrmFileState>) {
+        let mut q = PENDING_DRM_TIMERS.lock();
+        FLIPS_IN_FLIGHT.fetch_add(1, Ordering::AcqRel);
+        FLIP_EVENT_PENDING.store(true, Ordering::Release);
+        q.push_back(PendingDrmTimer::Flip {
+            crtc_id: SYNTH_CRTC_ID,
+            user_data: 0xF11D,
+            file: Arc::downgrade(file),
+        });
+    }
+
+    /// The regression this guards. `deliver_pending_drm_timer` drains the whole
+    /// queue into a local before delivering anything, so a flip that is
+    /// mid-delivery is in neither the queue nor yet delivered.
+    /// `clear_stale_flip_pending` looked only at the queue, decided the latch
+    /// was stale, and cleared it -- so a concurrent PAGE_FLIP was accepted while
+    /// the previous one had not completed, and two frames could reach the
+    /// scanout inside one vblank period.
+    #[test]
+    fn a_flip_being_delivered_still_counts_as_pending() {
+        let _serialised = super::test_globals::lock();
+        reset();
+        let file = DrmFileState::new();
+        queue_one(&file);
+        assert!(FLIP_EVENT_PENDING.load(Ordering::Acquire));
+
+        // Reproduce the window: the queue has been drained but the event has
+        // not been pushed to the fd yet.
+        let drained: Vec<PendingDrmTimer> = PENDING_DRM_TIMERS.lock().drain(..).collect();
+        assert_eq!(drained.len(), 1);
+        assert!(
+            !PENDING_DRM_TIMERS
+                .lock()
+                .iter()
+                .any(|j| matches!(j, PendingDrmTimer::Flip { .. })),
+            "the queue is empty, which is what fooled the old check"
+        );
+
+        clear_stale_flip_pending();
+        assert!(
+            FLIP_EVENT_PENDING.load(Ordering::Acquire),
+            "the latch must survive: this flip has not been delivered yet"
+        );
+
+        // Delivering it is what clears the latch.
+        queue_flip_event(&file, SYNTH_CRTC_ID, 0xF11D);
+        assert!(!FLIP_EVENT_PENDING.load(Ordering::Acquire));
+        assert_eq!(FLIPS_IN_FLIGHT.load(Ordering::Acquire), 0);
+        assert!(file.has_events(), "the completion reached the card fd");
+        reset();
+    }
+
+    /// The other half: `queue_flip_event` cleared the latch unconditionally, so
+    /// delivering the first of two outstanding flips advertised "nothing
+    /// pending" while the second was still queued -- after which a further flip
+    /// skipped the flush and the queue held two.
+    #[test]
+    fn delivering_one_of_two_flips_leaves_the_latch_set() {
+        let _serialised = super::test_globals::lock();
+        reset();
+        let file = DrmFileState::new();
+        queue_one(&file);
+        queue_one(&file);
+        assert_eq!(FLIPS_IN_FLIGHT.load(Ordering::Acquire), 2);
+
+        queue_flip_event(&file, SYNTH_CRTC_ID, 0xF11D);
+        assert!(
+            FLIP_EVENT_PENDING.load(Ordering::Acquire),
+            "one flip is still outstanding"
+        );
+        queue_flip_event(&file, SYNTH_CRTC_ID, 0xF11D);
+        assert!(!FLIP_EVENT_PENDING.load(Ordering::Acquire), "now none is");
+        reset();
+    }
+
+    /// A genuinely stale latch -- set with nothing queued and nothing in flight
+    /// -- still self-heals. That is what `clear_stale_flip_pending` is for: a
+    /// stuck latch means a persistent EBUSY, which wlroots escalates into an
+    /// output teardown.
+    #[test]
+    fn a_truly_stale_latch_is_still_cleared() {
+        let _serialised = super::test_globals::lock();
+        reset();
+        FLIP_EVENT_PENDING.store(true, Ordering::Release);
+        clear_stale_flip_pending();
+        assert!(!FLIP_EVENT_PENDING.load(Ordering::Acquire));
+        reset();
+    }
+
+    /// Cancelling is accounted for too, and can never drive the count below
+    /// zero: an underflow would wrap and latch the flag on forever.
+    #[test]
+    fn cancelling_clears_the_latch_and_never_underflows() {
+        let _serialised = super::test_globals::lock();
+        reset();
+        let file = DrmFileState::new();
+        queue_one(&file);
+        cancel_pending_events();
+        assert!(!FLIP_EVENT_PENDING.load(Ordering::Acquire));
+        assert_eq!(FLIPS_IN_FLIGHT.load(Ordering::Acquire), 0);
+
+        // More completions than flips (a cancel racing a delivery) must not wrap.
+        flip_in_flight_done();
+        flip_in_flight_done();
+        assert_eq!(FLIPS_IN_FLIGHT.load(Ordering::Acquire), 0);
+        assert!(!FLIP_EVENT_PENDING.load(Ordering::Acquire));
+        reset();
+    }
+}
+
+/// Tests for the reference the present path holds on a framebuffer's backing
+/// while it blits with `DRM_STATE` released.
+#[cfg(test)]
+mod present_lifetime_tests {
+    use super::*;
+
+    /// The regression this guards. `DrmFramebuffer` is `Copy`, so the present
+    /// path took a bare `phys_addr`/`size` out of `DRM_STATE`, dropped the lock,
+    /// and blitted for up to ~100 ms holding nothing. A concurrent RMFB could
+    /// drop the last `Arc<VmObject>` in that window and hand the frames back to
+    /// the allocator while the blit was still reading them.
+    #[test]
+    fn a_present_snapshot_keeps_the_framebuffer_memory_alive() {
+        let _serialised = super::test_globals::lock();
+        let vmo = VmObject::new_paged(1);
+        {
+            let mut state = DRM_STATE.lock();
+            state.framebuffers.push(DrmFramebuffer {
+                id: 9601,
+                driver_fb_id: None,
+                gem_handle_id: 7,
+                width: 1,
+                height: 1,
+                pitch: 4,
+                phys_addr: 0,
+                size: 4096,
+                owner: current_pid(),
+            });
+            state.fb_backing.push((9601, vmo.clone()));
+        }
+        // The test's own reference plus the one in `fb_backing`.
+        assert_eq!(Arc::strong_count(&vmo), 2);
+
+        let (fb, backing) = snapshot_fb_for_present(9601).expect("the fb exists");
+        assert_eq!(fb.id, 9601);
+        let backing = backing.expect("a dumb-buffer fb has a VMO to hold");
+        assert_eq!(
+            Arc::strong_count(&vmo),
+            3,
+            "the snapshot must take its own reference"
+        );
+
+        // RMFB while the "blit" is in flight: the fb is gone from the table, but
+        // the memory is NOT freed, because the snapshot still owns a reference.
+        assert!(rmfb(9601));
+        assert!(snapshot_fb_for_present(9601).is_none(), "the fb is retired");
+        assert_eq!(
+            Arc::strong_count(&vmo),
+            2,
+            "only the table's reference dropped; the blit's is intact"
+        );
+
+        // The blit finishes and lets go.
+        drop(backing);
+        assert_eq!(Arc::strong_count(&vmo), 1);
+    }
+
+    /// A nouveau-backed framebuffer has no `VmObject` to take a reference on, so
+    /// the snapshot reports `None` rather than pretending. That window is closed
+    /// from the other end instead, by retiring the framebuffer when the GEM
+    /// object is freed -- which is what `retire_framebuffers_for_handle` does.
+    #[test]
+    fn a_nouveau_backed_framebuffer_has_no_reference_to_take() {
+        let _serialised = super::test_globals::lock();
+        let handle = zcore_drivers::scheme::gem_mmap::DRIVER_HANDLE_BASE + 0x77;
+        {
+            let mut state = DRM_STATE.lock();
+            state.framebuffers.push(DrmFramebuffer {
+                id: 9602,
+                driver_fb_id: None,
+                gem_handle_id: handle,
+                width: 1,
+                height: 1,
+                pitch: 4,
+                phys_addr: 0x2_0000,
+                size: 4096,
+                owner: current_pid(),
+            });
+        }
+        let (fb, backing) = snapshot_fb_for_present(9602).expect("the fb exists");
+        assert_eq!(fb.gem_handle_id, handle);
+        assert!(
+            backing.is_none(),
+            "there is no VmObject behind a nouveau GEM"
+        );
+        DRM_STATE.lock().framebuffers.retain(|f| f.id != 9602);
+    }
+
+    /// An unknown id is not a framebuffer.
+    #[test]
+    fn an_unknown_framebuffer_cannot_be_snapshotted() {
+        let _serialised = super::test_globals::lock();
+        assert!(snapshot_fb_for_present(0).is_none());
+        assert!(snapshot_fb_for_present(0xDEAD_BEEF).is_none());
     }
 }

@@ -3530,6 +3530,52 @@ impl DisplayScheme for NvidiaGpu {
     }
 }
 
+/// Clip a hardware page-flip's copy geometry against BOTH the source
+/// framebuffer and the destination mode, returning `(row_bytes, lines)`.
+///
+/// `scanout_region` has always clipped with `fb.width.min(info.width)` and
+/// `fb.height.min(info.height)`; the hwflip path passed `fb.width * 4` and
+/// `fb.height` straight through, so a client framebuffer larger than the mode
+/// had two ways to go wrong:
+///
+/// - Wider than the destination pitch: the RM rejects the 2D copy with
+///   `NV_ERR_INVALID_ARGUMENT`, and `CE_PRESENT_WEDGED` latches for the REST OF
+///   THE BOOT -- every later present silently degrades to the CPU blit. Refused
+///   here instead, so the caller falls back for this frame only.
+/// - Taller than the mode: the copy engine writes past the scanout framebuffer
+///   inside BAR1. `ce_present_2d_pitched`'s own `fb_size` guard catches the
+///   total overrun and declines, which is safe but also silently gives up the
+///   whole fast path; clipping the line count keeps it usable.
+///
+/// `None` means "nothing safely copyable" -- the caller must fall back.
+fn hwflip_geometry(
+    fb_width: u32,
+    fb_height: u32,
+    fb_pitch: u32,
+    dst_width: u32,
+    dst_height: u32,
+    dst_pitch: u32,
+) -> Option<(u32, u32)> {
+    if fb_pitch == 0 || dst_pitch == 0 {
+        return None;
+    }
+    // `checked_mul`, not `saturating_mul`: a saturated byte count UNDERSTATES
+    // the real one, and would then compare as fitting inside a stride it does
+    // not fit in.
+    let row_bytes = fb_width.min(dst_width).checked_mul(4)?;
+    let lines = fb_height.min(dst_height);
+    if row_bytes == 0 || lines == 0 {
+        return None;
+    }
+    // A row must fit in both strides: in the source's, or we would read the
+    // next row's pixels as this row's tail; in the destination's, or the RM
+    // rejects the copy and wedges the engine.
+    if row_bytes > fb_pitch || row_bytes > dst_pitch {
+        return None;
+    }
+    Some((row_bytes, lines))
+}
+
 /// Pull `elapsed: N ns` out of a `/proc/gpubench` report. 0 if absent.
 fn parse_gpubench_elapsed_ns(report: &str) -> u64 {
     for line in report.lines() {
@@ -7701,13 +7747,18 @@ impl DrmScheme for NvidiaGpu {
             return false;
         }
         let dst_pitch = self.info.pitch;
-        let row_bytes = fb.width.saturating_mul(4);
-        if row_bytes == 0 || row_bytes > fb.pitch || dst_pitch == 0 {
+        let Some((row_bytes, lines)) = hwflip_geometry(
+            fb.width,
+            fb.height,
+            fb.pitch,
+            self.info.width,
+            self.info.height,
+            dst_pitch,
+        ) else {
             return false;
-        }
+        };
         static HWFLIP_TRIED: AtomicBool = AtomicBool::new(false);
-        let ok =
-            self.ce_present_2d_pitched(fb.phys_addr, fb.pitch, 0, dst_pitch, row_bytes, fb.height);
+        let ok = self.ce_present_2d_pitched(fb.phys_addr, fb.pitch, 0, dst_pitch, row_bytes, lines);
         if ok {
             let now = unsafe { crate::bus::drivers_timer_now_as_micros() };
             let mut state = self.kms_state.lock();
@@ -12933,6 +12984,84 @@ mod decode_tests {
         // cases a 32-bit host would wrap on while the range check catches the
         // rest. Either way the answer has to be "no".
         assert!(!user_slice_ok::<[u8; 0x1_0000]>(0x1000, u32::MAX));
+    }
+
+    /// The regression this guards. `page_flip`'s copy-engine path passed
+    /// `fb.width * 4` and `fb.height` straight to the CE without ever comparing
+    /// them against the mode, unlike `scanout_region`, which has always clipped
+    /// with `.min(info.width)` / `.min(info.height)`.
+    #[test]
+    fn a_hardware_flip_is_clipped_to_the_mode_it_is_flipping_into() {
+        // A client framebuffer wider and taller than the mode: clipped to the
+        // mode on both axes, not passed through.
+        assert_eq!(
+            hwflip_geometry(2560, 1440, 2560 * 4, 1920, 1080, 1920 * 4),
+            Some((1920 * 4, 1080))
+        );
+        // The ordinary case is untouched: fb exactly the mode.
+        assert_eq!(
+            hwflip_geometry(1920, 1080, 1920 * 4, 1920, 1080, 1920 * 4),
+            Some((1920 * 4, 1080))
+        );
+        // A padded destination pitch is fine -- the row is narrower than the
+        // stride, which is exactly what a pitched 2D copy is for. This is the
+        // documented dual-RTX case: client pitch 5504, GOP pitch 8192.
+        assert_eq!(
+            hwflip_geometry(1376, 1080, 5504, 1376, 1080, 8192),
+            Some((1376 * 4, 1080))
+        );
+        // A framebuffer SMALLER than the mode copies only what it has; the rest
+        // of the screen is not this flip's business.
+        assert_eq!(
+            hwflip_geometry(800, 600, 800 * 4, 1920, 1080, 1920 * 4),
+            Some((800 * 4, 600))
+        );
+    }
+
+    /// Refusing is the safe answer, and it matters more than it looks: a row
+    /// wider than the destination pitch makes the RM reject the copy with
+    /// `NV_ERR_INVALID_ARGUMENT`, and `CE_PRESENT_WEDGED` then latches for the
+    /// whole boot -- every later present silently degrades to the CPU blit. A
+    /// `None` here costs one frame's fast path instead.
+    #[test]
+    fn a_flip_that_cannot_be_expressed_as_a_pitched_copy_is_refused() {
+        // Row wider than the destination stride: would shear each row into the
+        // next inside the scanout framebuffer.
+        assert_eq!(
+            hwflip_geometry(1920, 1080, 1920 * 4, 1920, 1080, 1024),
+            None
+        );
+        // Row wider than the SOURCE stride: would read the next row's pixels as
+        // this row's tail.
+        assert_eq!(
+            hwflip_geometry(1920, 1080, 1024, 1920, 1080, 1920 * 4),
+            None
+        );
+        // Degenerate geometry on either side.
+        assert_eq!(
+            hwflip_geometry(0, 1080, 1920 * 4, 1920, 1080, 1920 * 4),
+            None
+        );
+        assert_eq!(
+            hwflip_geometry(1920, 0, 1920 * 4, 1920, 1080, 1920 * 4),
+            None
+        );
+        assert_eq!(hwflip_geometry(1920, 1080, 0, 1920, 1080, 1920 * 4), None);
+        assert_eq!(hwflip_geometry(1920, 1080, 1920 * 4, 1920, 1080, 0), None);
+        assert_eq!(
+            hwflip_geometry(1920, 1080, 1920 * 4, 0, 1080, 1920 * 4),
+            None
+        );
+        assert_eq!(
+            hwflip_geometry(1920, 1080, 1920 * 4, 1920, 0, 1920 * 4),
+            None
+        );
+        // A width whose byte count would overflow must not wrap into a small
+        // row that then passes the stride checks.
+        assert_eq!(
+            hwflip_geometry(u32::MAX, 1, u32::MAX, u32::MAX, 1, u32::MAX),
+            None
+        );
     }
 
     /// `elapsed: N ns` is how `/proc/gpubench` reports a launch, and 0 is the

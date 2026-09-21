@@ -226,7 +226,7 @@ impl ShadowFramebuffer {
             let Some(mut g) = self.lock_inner() else {
                 return;
             };
-            self.take_dirty(&mut g)
+            self.take_dirty(&mut g, display.fb_write_combining())
         };
         let Some(((x, y, w, h), pixels)) = snap else {
             return;
@@ -275,18 +275,32 @@ impl ShadowFramebuffer {
             let Some(mut g) = self.lock_inner() else {
                 return;
             };
+            // Only a write-combining aperture gains anything from the
+            // widening; on a write-back one it is pure extra bytes -- see
+            // [`Self::wc_expand_x`].
+            let wc = display.fb_write_combining();
             // 1. The dirty content region.
-            let dirty = self.take_dirty(&mut g);
+            let dirty = self.take_dirty(&mut g, wc);
+            // Widen a cell blit to whole write-combining lines, keeping any
+            // inversion on the cell's own columns.
+            let cell_blit = |rect: DirtyRect, invert: bool| {
+                let (x, y, w, h) = rect;
+                let (x0, x1) = if wc {
+                    Self::wc_expand_x(x, x + w, self.width)
+                } else {
+                    (x, x + w)
+                };
+                let window = if invert { x..x + w } else { 0..0 };
+                let wide = (x0, y, x1 - x0, h);
+                (wide, Self::cell_pixels(&g.data, self.width, wide, window))
+            };
             // 2. The previously drawn cursor, if it moved or is hidden.
             let erase = match g.prev_cursor {
-                Some(prev) if Some(prev) != new_rect => {
-                    Some((prev, Self::cell_pixels(&g.data, self.width, prev, false)))
-                }
+                Some(prev) if Some(prev) != new_rect => Some(cell_blit(prev, false)),
                 _ => None,
             };
             // 3. The cursor (inverted) at its new position.
-            let draw =
-                new_rect.map(|rect| (rect, Self::cell_pixels(&g.data, self.width, rect, true)));
+            let draw = new_rect.map(|rect| cell_blit(rect, true));
             g.prev_cursor = new_rect;
             (dirty, erase, draw)
         };
@@ -299,10 +313,44 @@ impl ShadowFramebuffer {
         }
     }
 
-    /// Take the dirty rectangle, clamped to the screen, as `((x, y, w, h),
-    /// pixels)` with the rows tightly packed (`w` pixels per row). `None` when
-    /// nothing is dirty. Must be called with the shadow lock held.
-    fn take_dirty(&self, g: &mut ShadowInner) -> Option<(DirtyRect, Vec<u32>)> {
+    /// Widen `[x0, x1)` to whole write-combining lines: 16 XRGB8888 pixels are
+    /// one 64-byte PCIe burst, and a blit whose left or right edge sits
+    /// mid-line makes the aperture flush a half-full combine buffer over the
+    /// neighbouring pixels -- leftover squares and stripes.
+    ///
+    /// The console needs this more than anything else on the machine and had no
+    /// equivalent at all (the DRM present path has `expand_x_for_wc`). A text
+    /// cell is 9 px = 36 bytes wide, so column *c* starts at byte `36 * c`,
+    /// which is a multiple of 64 only every sixteenth column: virtually every
+    /// console blit degenerated into scalar head and tail stores in
+    /// `nt_store_row`. Rounding the left edge down fixes that.
+    ///
+    /// Applied only when the destination really is write-combining: on a
+    /// write-back framebuffer (QEMU's virtio-gpu, and every host test that does
+    /// not say otherwise) there are no combine buffers to align to, so the extra
+    /// columns would be bytes spent for nothing.
+    ///
+    /// `limit` is the shadow's own width, since unlike the DRM path there is no
+    /// off-screen padding here to park a right-edge tail in -- so the right edge
+    /// only reaches a boundary when the screen width is itself a multiple of 16.
+    /// Widening never loses pixels: the extra columns are read from the same
+    /// clean shadow and are identical to what is already on screen.
+    fn wc_expand_x(x0: usize, x1: usize, limit: usize) -> (usize, usize) {
+        const WC_PX: usize = 16;
+        if x0 >= x1 || limit == 0 {
+            return (x0, x1);
+        }
+        let lo = x0 - (x0 % WC_PX);
+        let hi = x1.div_ceil(WC_PX).saturating_mul(WC_PX).min(limit);
+        (lo, hi.max(x1))
+    }
+
+    /// Take the dirty rectangle, clamped to the screen and -- when `wc` says the
+    /// destination aperture is write-combining -- widened to whole write-combining
+    /// lines, as `((x, y, w, h), pixels)` with the rows tightly packed (`w` pixels
+    /// per row). `None` when nothing is dirty. Must be called with the shadow lock
+    /// held.
+    fn take_dirty(&self, g: &mut ShadowInner, wc: bool) -> Option<(DirtyRect, Vec<u32>)> {
         let (x0, y0, x1, y1) = g.dirty.take()?;
         let x0 = x0.min(self.width);
         let y0 = y0.min(self.height);
@@ -311,6 +359,11 @@ impl ShadowFramebuffer {
         if x0 >= x1 || y0 >= y1 {
             return None;
         }
+        let (x0, x1) = if wc {
+            Self::wc_expand_x(x0, x1, self.width)
+        } else {
+            (x0, x1)
+        };
         let (w, h) = (x1 - x0, y1 - y0);
         let mut pixels = Vec::with_capacity(w * h);
         for r in y0..y1 {
@@ -320,19 +373,31 @@ impl ShadowFramebuffer {
         Some(((x0, y0, w, h), pixels))
     }
 
-    /// Copy one character cell out of the shadow, optionally inverting it (for
-    /// the cursor). `rect` is `(x, y, w, h)` in pixels; the result is tightly
-    /// packed.
-    fn cell_pixels(data: &[u32], width: usize, rect: DirtyRect, invert: bool) -> Vec<u32> {
+    /// Copy a strip of the shadow, inverting only the columns in `invert` (an
+    /// absolute x range, empty for none). `rect` is `(x, y, w, h)` in pixels;
+    /// the result is tightly packed.
+    ///
+    /// The invert window is separate from the rect because the blit is widened
+    /// to whole write-combining lines (see [`Self::wc_expand_x`]) while the
+    /// inversion must stay on the cursor's own cell -- otherwise the blink would
+    /// flip up to 15 neighbouring columns with it.
+    fn cell_pixels(
+        data: &[u32],
+        width: usize,
+        rect: DirtyRect,
+        invert: core::ops::Range<usize>,
+    ) -> Vec<u32> {
         let (x, y, w, h) = rect;
         let mut out = Vec::with_capacity(w * h);
         for r in 0..h {
             let base = (y + r) * width + x;
-            if invert {
-                out.extend(data[base..base + w].iter().map(|px| px ^ 0x00FF_FFFF));
-            } else {
-                out.extend_from_slice(&data[base..base + w]);
-            }
+            out.extend(data[base..base + w].iter().enumerate().map(|(c, px)| {
+                if invert.contains(&(x + c)) {
+                    px ^ 0x00FF_FFFF
+                } else {
+                    *px
+                }
+            }));
         }
         out
     }
@@ -611,5 +676,182 @@ mod tests {
         fb.present_with_cursor(dev.as_ref(), Some((2, 0)), 8, 8);
         // Only the content rect, no cursor blit.
         assert_eq!(dev.rects(), vec![(0, 0, 16, 8)]);
+    }
+}
+
+/// Tests for the shadow framebuffer's dirty-rectangle bookkeeping, and in
+/// particular for the write-combining line alignment of what it hands the
+/// display. The console is the heaviest user of the framebuffer aperture on a
+/// text boot, and it had no alignment of any kind.
+#[cfg(test)]
+mod wc_dirty_tests {
+    use super::*;
+    use crate::scheme::display::{ColorFormat, DisplayInfo, FrameBuffer};
+    use crate::scheme::Scheme;
+
+    /// A display that records the `(dst_x, dst_y, width, height)` of every blit
+    /// instead of drawing: what the console asks for IS the thing under test.
+    struct RecordingDisplay {
+        info: DisplayInfo,
+        mem: Mutex<alloc::vec::Vec<u8>>,
+        blits: Mutex<alloc::vec::Vec<(u32, u32, u32, u32)>>,
+    }
+
+    impl RecordingDisplay {
+        fn new(width: u32, height: u32) -> Self {
+            let size = (width * height * 4) as usize;
+            Self {
+                info: DisplayInfo {
+                    width,
+                    height,
+                    pitch: width * 4,
+                    format: ColorFormat::ARGB8888,
+                    fb_base_vaddr: 0,
+                    fb_size: size,
+                },
+                mem: Mutex::new(alloc::vec![0u8; size]),
+                blits: Mutex::new(alloc::vec::Vec::new()),
+            }
+        }
+        fn taken(&self) -> alloc::vec::Vec<(u32, u32, u32, u32)> {
+            core::mem::take(&mut *self.blits.lock())
+        }
+    }
+
+    impl Scheme for RecordingDisplay {
+        fn name(&self) -> &str {
+            "recording-display"
+        }
+    }
+
+    impl DisplayScheme for RecordingDisplay {
+        fn info(&self) -> DisplayInfo {
+            self.info
+        }
+        fn fb(&self) -> FrameBuffer<'_> {
+            let mut m = self.mem.lock();
+            // SAFETY: the buffer is owned by `self` and outlives the view.
+            unsafe { FrameBuffer::from_raw_parts_mut(m.as_mut_ptr(), m.len()) }
+        }
+        fn fb_write_combining(&self) -> bool {
+            true
+        }
+        fn blit_from(
+            &self,
+            dst_x: u32,
+            dst_y: u32,
+            _src: &[u32],
+            _src_stride: usize,
+            width: u32,
+            height: u32,
+        ) {
+            self.blits.lock().push((dst_x, dst_y, width, height));
+        }
+    }
+
+    /// 16 XRGB8888 pixels are one 64-byte write-combining burst, so both edges
+    /// have to sit on a 16-pixel boundary or the aperture flushes a half-full
+    /// combine buffer over the neighbouring pixels.
+    #[test]
+    fn a_span_is_widened_to_whole_write_combining_lines() {
+        // A single 9-px text cell in column 4: bytes 144..180, neither end on a
+        // 64-byte boundary. Becomes pixels 32..48, i.e. bytes 128..192.
+        assert_eq!(ShadowFramebuffer::wc_expand_x(36, 45, 1920), (32, 48));
+        // Already aligned spans are left exactly as they are.
+        assert_eq!(ShadowFramebuffer::wc_expand_x(0, 16, 1920), (0, 16));
+        assert_eq!(ShadowFramebuffer::wc_expand_x(64, 128, 1920), (64, 128));
+        // Empty and degenerate spans are not widened into existence.
+        assert_eq!(ShadowFramebuffer::wc_expand_x(10, 10, 1920), (10, 10));
+        assert_eq!(ShadowFramebuffer::wc_expand_x(0, 8, 0), (0, 8));
+    }
+
+    /// Unlike the DRM present path there is no off-screen padding here to park a
+    /// right-edge tail in, so the right edge stops at the shadow's own width --
+    /// and must never be pulled BELOW what was asked for, which would drop
+    /// pixels the console just drew.
+    #[test]
+    fn widening_never_drops_a_requested_pixel() {
+        for limit in [64usize, 720, 1366, 1920] {
+            for x0 in 0..limit {
+                for len in [1usize, 5, 9, 16, 33] {
+                    let x1 = (x0 + len).min(limit);
+                    if x0 >= x1 {
+                        continue;
+                    }
+                    let (lo, hi) = ShadowFramebuffer::wc_expand_x(x0, x1, limit);
+                    assert!(lo <= x0, "left edge moved right: {} > {}", lo, x0);
+                    assert!(hi >= x1, "right edge moved left: {} < {}", hi, x1);
+                    assert!(hi <= limit, "ran past the shadow: {} > {}", hi, limit);
+                    assert_eq!(lo % 16, 0, "left edge {} is not on a WC line", lo);
+                }
+            }
+        }
+    }
+
+    /// The regression this guards, end to end: a one-cell update used to be
+    /// blitted at its raw pixel offset, so `nt_store_row` degenerated into
+    /// scalar head and tail stores for all but 4 of every 64 bytes. Now the
+    /// console asks for a 16-pixel-aligned span.
+    #[test]
+    fn a_one_cell_console_update_is_blitted_on_a_wc_boundary() {
+        let d = RecordingDisplay::new(1920, 64);
+        let shadow = ShadowFramebuffer::new(1920, 64);
+        // Column 4 of a 9x18 cell grid: x = 36..45.
+        shadow.fill_rect(36, 0, 9, 18, 0x00FF_FFFF);
+        shadow.present(&d);
+
+        let blits = d.taken();
+        assert_eq!(blits.len(), 1, "one dirty region, one blit");
+        let (x, _y, w, _h) = blits[0];
+        assert_eq!(x % 16, 0, "blit starts mid-WC-line at x={}", x);
+        assert_eq!((x + w) % 16, 0, "blit ends mid-WC-line at x={}", x + w);
+        // And it still covers the cell it was asked to draw.
+        assert!(
+            x <= 36 && x + w >= 45,
+            "cell 36..45 not covered by {}..{}",
+            x,
+            x + w
+        );
+    }
+
+    /// The blinking cursor is its own blit, at cell granularity, running at
+    /// 2 Hz forever -- so it needs the same alignment. But the INVERSION must
+    /// stay on the cursor's own cell: widening the blit to a WC line must not
+    /// flip up to 15 neighbouring columns with it.
+    #[test]
+    fn the_cursor_blit_is_aligned_but_only_its_own_cell_is_inverted() {
+        let d = RecordingDisplay::new(1920, 64);
+        let shadow = ShadowFramebuffer::new(1920, 64);
+        shadow.clear(0x0000_0000);
+        shadow.present(&d);
+        let _ = d.taken();
+
+        // Cursor at column 4, row 0 of a 9x18 grid.
+        shadow.present_with_cursor(&d, Some((4, 0)), 9, 18);
+        let blits = d.taken();
+        assert!(!blits.is_empty(), "the cursor must be drawn");
+        for (x, _, w, _) in &blits {
+            assert_eq!(x % 16, 0, "cursor blit starts mid-WC-line at x={}", x);
+            assert_eq!(
+                (x + w) % 16,
+                0,
+                "cursor blit ends mid-WC-line at x={}",
+                x + w
+            );
+        }
+
+        // The inversion window: cells 36..45 flip, their WC-line neighbours do
+        // not. Check against the pixels the shadow would hand over.
+        let rect = (32usize, 0usize, 16usize, 18usize);
+        let data = alloc::vec![0x0000_0000u32; 1920 * 64];
+        let pixels = ShadowFramebuffer::cell_pixels(&data, 1920, rect, 36..45);
+        for (i, px) in pixels.iter().take(16).enumerate() {
+            let abs = 32 + i;
+            if (36..45).contains(&abs) {
+                assert_eq!(*px, 0x00FF_FFFF, "column {} should be inverted", abs);
+            } else {
+                assert_eq!(*px, 0, "column {} must NOT be inverted", abs);
+            }
+        }
     }
 }

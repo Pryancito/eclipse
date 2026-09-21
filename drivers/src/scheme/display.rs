@@ -290,12 +290,14 @@ pub trait DisplayScheme: Scheme {
                     off += 4;
                 }
             }
+            self.drain_if_write_combining();
         } else {
             for j in top..bottom {
                 for i in left..right {
                     self.draw_pixel(i, j, color);
                 }
             }
+            self.drain_if_write_combining();
         }
     }
 
@@ -348,6 +350,7 @@ pub trait DisplayScheme: Scheme {
                 copy_row(r);
             }
         }
+        self.drain_if_write_combining();
     }
 
     /// Blit a CPU-side ARGB8888 buffer into the framebuffer at `(dst_x, dst_y)`.
@@ -414,6 +417,7 @@ pub trait DisplayScheme: Scheme {
                     buf[d..d + 4].copy_from_slice(&px);
                 }
             }
+            self.drain_if_write_combining();
             return;
         }
 
@@ -433,7 +437,7 @@ pub trait DisplayScheme: Scheme {
                 .saturating_add((h - 1).saturating_mul(pitch))
                 .saturating_add(width_bytes);
             if self.fb_write_combining()
-                && crate::utils::dma_sync::has_nt_blit()
+                && crate::utils::dma_sync::has_nt_store()
                 && last_src <= src.len()
                 && last_dst <= buf.len()
                 // SAFETY: `last_src`/`last_dst` were bounds-checked against
@@ -467,6 +471,7 @@ pub trait DisplayScheme: Scheme {
                 }
                 buf[d..d_end].copy_from_slice(src_bytes);
             }
+            self.drain_if_write_combining();
         } else {
             // Per-pixel `draw_pixel`, so the visible width is the limit.
             let w = visible_w;
@@ -483,6 +488,7 @@ pub trait DisplayScheme: Scheme {
                     );
                 }
             }
+            self.drain_if_write_combining();
         }
     }
 
@@ -555,6 +561,25 @@ pub trait DisplayScheme: Scheme {
                 };
                 buf[d_off..d_off + 4].copy_from_slice(&out.to_ne_bytes());
             }
+        }
+        self.drain_if_write_combining();
+    }
+
+    /// Drain the CPU's write-combining store buffers when this backend's
+    /// framebuffer is write-combining, so the scanout engine cannot read a
+    /// half-flushed combine buffer as the last line of what we just drew.
+    ///
+    /// Every generic 2D primitive ends with this. The non-temporal path inside
+    /// [`dma_sync::nt_store_rows`] already fences itself, and it says why: "so
+    /// scanout / cursor overlay cannot observe a torn last line". The scalar
+    /// paths need exactly the same guarantee and had no barrier at all --
+    /// `need_flush()` is `false` for both write-combining backends (UEFI GOP and
+    /// NVIDIA BAR1), so nothing above supplied one either. A no-op on a
+    /// write-back or virtio destination.
+    #[inline]
+    fn drain_if_write_combining(&self) {
+        if self.fb_write_combining() {
+            crate::utils::dma_sync::wc_store_drain();
         }
     }
 
@@ -700,6 +725,93 @@ mod blit_tests {
         assert_eq!(d.px(1375, 0), 0x100F, "the combine buffer is completed");
         // Second row, addressed through the pitch, not through the width.
         assert_eq!(d.px(1366, 1), 0x1016);
+    }
+
+    /// Why the drain in every 2D primitive is not optional. Both real
+    /// write-combining backends advertise `fb_write_combining()` and neither
+    /// overrides `need_flush()`, so before this there was no barrier anywhere
+    /// between an ordinary store into the aperture and the scanout engine
+    /// reading it -- the last line of a blit could reach the panel torn, or a
+    /// frame late. The one backend that DOES flush (virtio-gpu) is the one that
+    /// is not write-combining.
+    #[test]
+    fn a_write_combining_backend_offers_no_flush_of_its_own() {
+        let uefi = crate::display::UefiDisplay::new(DisplayInfo {
+            width: 1920,
+            height: 1080,
+            pitch: 1920 * 4,
+            format: ColorFormat::ARGB8888,
+            fb_base_vaddr: 0,
+            fb_size: 1920 * 1080 * 4,
+        });
+        assert!(
+            uefi.fb_write_combining(),
+            "the GOP aperture is write-combining"
+        );
+        assert!(
+            !uefi.need_flush(),
+            "...and offers no flush, so the primitives must drain themselves"
+        );
+    }
+
+    /// The drain runs whenever the destination says it is write-combining, and
+    /// is skipped otherwise. Asserted through the trait so a backend cannot
+    /// accidentally opt out of it.
+    #[test]
+    fn the_drain_follows_the_backends_own_answer() {
+        struct Cached(DisplayInfo, Mutex<alloc::vec::Vec<u8>>);
+        impl Scheme for Cached {
+            fn name(&self) -> &str {
+                "cached"
+            }
+        }
+        impl DisplayScheme for Cached {
+            fn info(&self) -> DisplayInfo {
+                self.0
+            }
+            fn fb(&self) -> FrameBuffer<'_> {
+                let mut m = self.1.lock();
+                // SAFETY: owned by `self`, outlives the view.
+                unsafe { FrameBuffer::from_raw_parts_mut(m.as_mut_ptr(), m.len()) }
+            }
+            fn fb_write_combining(&self) -> bool {
+                false
+            }
+        }
+        let wc = FakeDisplay::new(16, 2, 16);
+        assert!(wc.fb_write_combining());
+        // Both must complete without panicking, and both must draw: the drain
+        // is a barrier, never a bail-out.
+        wc.fill_rect(
+            &Rectangle {
+                x: 0,
+                y: 0,
+                width: 4,
+                height: 1,
+            },
+            RgbColor(0x00AB_CDEF),
+        );
+        assert_eq!(wc.px(0, 0), 0x00AB_CDEF);
+
+        let info = DisplayInfo {
+            width: 16,
+            height: 2,
+            pitch: 64,
+            format: ColorFormat::ARGB8888,
+            fb_base_vaddr: 0,
+            fb_size: 128,
+        };
+        let cached = Cached(info, Mutex::new(alloc::vec![0u8; 128]));
+        cached.fill_rect(
+            &Rectangle {
+                x: 0,
+                y: 0,
+                width: 4,
+                height: 1,
+            },
+            RgbColor(0x0012_3456),
+        );
+        assert_eq!(&cached.1.lock()[0..4], &0x0012_3456u32.to_ne_bytes());
     }
 
     /// The pitch is a hard limit even so: the padding belongs to this row, and

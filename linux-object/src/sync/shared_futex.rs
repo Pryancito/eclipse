@@ -96,8 +96,26 @@ pub fn clear_for_test() {
 
 #[cfg(test)]
 mod tests {
+    extern crate std;
     use super::*;
     use alloc::boxed::Box;
+
+    /// `SHARED_FUTEXES` is process-wide and cargo runs a crate's tests in
+    /// threads, so `clear_for_test` in one test wipes the table another is
+    /// counting. Every test here takes this first.
+    ///
+    /// CI runs with `--test-threads=1` and therefore never sees it; on a
+    /// developer's machine it failed about one run in eight, in
+    /// `an_entry_is_reclaimed_once_nobody_holds_the_futex`, with a length of 2
+    /// where it wanted 1 -- which reads as a real regression in the interning
+    /// and is not one.
+    static LOCK: self::std::sync::Mutex<()> = self::std::sync::Mutex::new(());
+
+    fn serialised() -> self::std::sync::MutexGuard<'static, ()> {
+        // A test that panics while holding this poisons it; the tests that
+        // follow are not at fault, so step over the poison.
+        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
 
     fn leaked_word() -> &'static AtomicI32 {
         Box::leak(Box::new(AtomicI32::new(0)))
@@ -109,6 +127,7 @@ mod tests {
 
     #[test]
     fn the_same_key_gives_the_same_futex() {
+        let _serialised = serialised();
         clear_for_test();
         let vmo = some_vmo();
         let word = leaked_word();
@@ -123,6 +142,7 @@ mod tests {
 
     #[test]
     fn different_offsets_in_one_object_are_different_futexes() {
+        let _serialised = serialised();
         clear_for_test();
         let vmo = some_vmo();
         let a = intern((9, 0), vmo.clone(), leaked_word());
@@ -148,6 +168,7 @@ mod tests {
             unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &VTABLE)) }
         }
 
+        let _serialised = serialised();
         clear_for_test();
         let vmo = some_vmo();
         let word = leaked_word();
@@ -181,6 +202,7 @@ mod tests {
 
     #[test]
     fn an_entry_is_reclaimed_once_nobody_holds_the_futex() {
+        let _serialised = serialised();
         clear_for_test();
         let vmo = some_vmo();
         let key = (11, 0x80);
