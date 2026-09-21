@@ -51,18 +51,26 @@ hal_fn_impl! {
         #[allow(deprecated)]
         fn send_ipi(cpuid: usize, reason: usize) -> HalResult {
             trace!("ipi [{}] => [{}]", super::cpu::cpu_id(), cpuid);
-            let queue = crate::common::ipi::ipi_queue(cpuid);
-            let idx = queue.alloc_entry();
-            if let Some(idx) = idx {
-                let entry = queue.entry_at(idx);
-                *entry = reason;
-                queue.commit_entry(idx);
-                // `cpuid` is a dense logical id (queue index); SBI needs a hart mask.
-                let mask: usize = 1 << super::cpu::logical_to_hart(cpuid);
-                sbi_rt::legacy::send_ipi(&mask as *const usize as usize);
-                return Ok(());
+            // This used to allocate a queue slot inline and, when the queue
+            // was full, return an error having noted nothing. That is not the
+            // same as what x86_64 and aarch64 do, and the difference is a lost
+            // invalidation: the initiator drops an unreachable target from its
+            // wait set and frees the frame, while this CPU — which was never
+            // told to flush — keeps the stale mapping. The overflow bit exists
+            // precisely so a payload that did not fit still forces a full
+            // flush; `publish_ipi_entry` always sets it.
+            //
+            // It also indexed the queue with the caller's `cpuid` unchecked,
+            // where x86_64 is covered by its APIC-map lookup and aarch64 by
+            // its GICv2 target-list check.
+            if !crate::common::ipi::publish_ipi_entry(cpuid, reason) {
+                warn!("send_ipi: logical cpu {} has no IPI queue — dropped", cpuid);
+                return Err(HalError);
             }
-            Err(HalError)
+            // `cpuid` is a dense logical id (queue index); SBI needs a hart mask.
+            let mask: usize = 1 << super::cpu::logical_to_hart(cpuid);
+            sbi_rt::legacy::send_ipi(&mask as *const usize as usize);
+            Ok(())
         }
 
         fn ipi_reason() -> Vec<usize> {

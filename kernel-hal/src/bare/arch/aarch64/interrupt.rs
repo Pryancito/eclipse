@@ -49,18 +49,12 @@ hal_fn_impl! {
                 warn!("send_ipi: cpu {} is beyond the GICv2 SGI target list", cpuid);
                 return Err(crate::HalError);
             }
-            // Push reason into per-CPU IPI queue
-            let queue = crate::common::ipi::ipi_queue(cpuid);
-            let mut delivered = false;
-            if let Some(idx) = queue.alloc_entry() {
-                *queue.entry_at(idx) = reason;
-                delivered = queue.commit_entry(idx);
-            }
-            if !delivered {
-                // Same contract as x86: the receiver cannot learn this entry's
-                // payload, so make its next ack a full flush rather than let the
-                // precise path skip an invalidation.
-                crate::common::ipi::note_ipi_queue_overflow(cpuid);
+            // Push reason into per-CPU IPI queue, noting an overflow if it
+            // will not fit — shared with the other architectures so the two
+            // halves of that contract cannot drift apart again.
+            if !crate::common::ipi::publish_ipi_entry(cpuid, reason) {
+                warn!("send_ipi: logical cpu {} has no IPI queue — dropped", cpuid);
+                return Err(crate::HalError);
             }
             // Send GIC SGI #0 to the target CPU (GICv2 GICD_SGIR)
             // GICD_SGIR: [25:24]=TargetListFilter=0b00 (use list), [23:16]=CPUTargetList, [3:0]=SGIINTID

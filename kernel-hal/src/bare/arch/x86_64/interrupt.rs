@@ -93,18 +93,12 @@ hal_fn_impl! {
                 );
                 return Err(crate::HalError);
             };
-            let queue = crate::common::ipi::ipi_queue(cpuid);
-            let mut delivered = false;
-            if let Some(idx) = queue.alloc_entry() {
-                *queue.entry_at(idx) = reason;
-                delivered = queue.commit_entry(idx);
-            }
-            if !delivered {
-                // Queue full or commit lost the publish race: the receiver
-                // cannot learn this entry's payload, so force it to treat the
-                // next ack as a full flush. Without this, the precise
-                // (per-page) ack path would silently skip an invalidation.
-                crate::common::ipi::note_ipi_queue_overflow(cpuid);
+            // Publishing the payload — and noting the overflow when it cannot
+            // be published — is the same contract on every architecture, so it
+            // lives in one place now (`publish_ipi_entry`).
+            if !crate::common::ipi::publish_ipi_entry(cpuid, reason) {
+                warn!("send_ipi: logical cpu {} has no IPI queue — dropped", cpuid);
+                return Err(crate::HalError);
             }
             // X86_INT_LOCAL_APIC_BASE + 3 = 0xf3, our IPI vector
             const IPI_VECTOR: u8 = 0xf3;
