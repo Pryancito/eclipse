@@ -447,6 +447,32 @@ fn describe_addr(vmar: &Arc<VmAddressRegion>, addr: usize) -> String {
     String::from("unmapped")
 }
 
+/// The permissions the kernel has on RECORD for the faulting page, and the
+/// ones actually in the hardware page table.
+///
+/// An `ACCESS_DENIED` page fault has two very different causes and the message
+/// could not tell them apart. Either the mapping never carried the access —
+/// `perm` is missing the bit, which is a question about the `mmap`/`mprotect`
+/// that built it — or the record allows it and the page table does not, which
+/// is ours: a fault path that did not install what the record promised. The
+/// two have opposite fixes, and guessing between them costs a boot on hardware
+/// each time. Printing both settles it in the line that already reports the
+/// fault.
+///
+/// Per PAGE, like `addr_is_executable` and for the same reason: a partial
+/// `mprotect` leaves mixed permissions inside one mapping.
+fn describe_fault_perms(vmar: &Arc<VmAddressRegion>, addr: usize) -> String {
+    let perm = vmar
+        .get_mapping_flags(addr)
+        .map(|f| alloc::format!("{:?}", f))
+        .unwrap_or_else(|e| alloc::format!("{:?}", e));
+    let pte = vmar
+        .get_vaddr_flags(addr)
+        .map(|f| alloc::format!("{:?}", f))
+        .unwrap_or_else(|e| alloc::format!("{:?}", e));
+    alloc::format!("perm={perm} pte={pte}")
+}
+
 /// Whether `addr` lies on a mapped, executable user page.
 ///
 /// Per PAGE, not per mapping row: a partial `mprotect` leaves mixed
@@ -1122,10 +1148,11 @@ async fn handle_user_trap(thread: &CurrentThread, mut ctx: Box<UserContext>) -> 
             let fault_result = vmar.handle_page_fault(vaddr, flags);
             if let Err(err) = fault_result {
                 error!(
-                    "unhandled page fault @ {:#x}({:?}) [{}]: {:?}, pid={} proc={} pc={:#x} [{}] -> SIGSEGV",
+                    "unhandled page fault @ {:#x}({:?}) [{}] {}: {:?}, pid={} proc={} pc={:#x} [{}] -> SIGSEGV",
                     vaddr,
                     flags,
                     describe_addr(&vmar, vaddr),
+                    describe_fault_perms(&vmar, vaddr),
                     err,
                     pid,
                     thread.proc().name(),

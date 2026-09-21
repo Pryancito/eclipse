@@ -4104,6 +4104,29 @@ mod tests {
         assert_eq!(rows[0].end, base + 0x4000);
     }
 
+    /// `shmat` mapped with `RXW` and no `USER` -- the one caller of `map` that
+    /// did -- and every attached MIT-SHM image SIGSEGV'd at its first byte
+    /// once shm ids were global enough for the attach to land on the right
+    /// segment. `map` fixes the permission ceiling at `RXW`, so nothing puts
+    /// `USER` back for the fault check; it has to arrive in the flags.
+    #[test]
+    fn a_mapping_created_without_user_denies_a_user_write() {
+        let vmar = VmAddressRegion::new_root();
+        let vmo = VmObject::new_paged(1);
+        let addr = vmar.map(None, vmo, 0, PAGE_SIZE, MMUFlags::RXW).unwrap();
+        assert_eq!(
+            vmar.handle_page_fault(addr, MMUFlags::WRITE | MMUFlags::USER),
+            Err(ZxError::ACCESS_DENIED),
+            "the pre-fix shmat shape: RXW recorded, USER never inserted"
+        );
+        let vmo = VmObject::new_paged(1);
+        let addr = vmar
+            .map(None, vmo, 0, PAGE_SIZE, MMUFlags::RXW | MMUFlags::USER)
+            .unwrap();
+        vmar.handle_page_fault(addr, MMUFlags::WRITE | MMUFlags::USER)
+            .expect("with USER in the flags the same store is accepted");
+    }
+
     /// musl mallocng / pthread_create / ld.so: `mmap(PROT_NONE)` then
     /// `mprotect` a slice to RW. The first user store is WRITE|USER; if
     /// USER was dropped when raising RXW, that store SIGSEGVs.
