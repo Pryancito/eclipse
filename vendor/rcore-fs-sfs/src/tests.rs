@@ -590,7 +590,11 @@ fn resize_out_of_space_rolls_back() -> Result<()> {
     let meta = f.metadata()?;
     assert_eq!(meta.size, 8 * BLKSIZE);
     assert_eq!(meta.blocks, 8);
-    assert_eq!(sfs.info().bfree, free1, "failed growth must give every block back");
+    assert_eq!(
+        sfs.info().bfree,
+        free1,
+        "failed growth must give every block back"
+    );
 
     // write(2) past the device (auto-extend goes through the same path)
     let err = f.write_at(3000 * BLKSIZE, &[1u8; 16]).unwrap_err();
@@ -612,5 +616,47 @@ fn resize_out_of_space_rolls_back() -> Result<()> {
     root.unlink("big")?;
     drop(f);
     assert_eq!(sfs.info().bfree, free0);
+    Ok(())
+}
+
+/// A name created on an SFS must still resolve after a remount that nothing
+/// synced in between.
+///
+/// The inode and the directory entry naming it are written straight through by
+/// `sync_all`, but the bitmap that records the inode's block used to stay in
+/// RAM until someone called `FileSystem::sync` -- and the kernel, which holds
+/// its root filesystem in a static for the life of the machine, never does. On
+/// the one architecture QEMU hands a raw read-write image to (aarch64), the two
+/// `mkdir`s `create_root_fs` does for `/var/cache/apk` were written back into
+/// `aarch64.img` without their bitmap bits, and the next boot panicked in
+/// `get_inode`'s `assert!(!self.free_map.read()[id])` before reaching its test.
+///
+/// `mem::forget` rather than `drop` on purpose: `SimpleFileSystem::drop` syncs,
+/// which is exactly the thing that does not happen when a machine goes away.
+#[test]
+fn a_name_created_without_sync_survives_a_remount() -> Result<()> {
+    let file = tempfile::tempfile().expect("failed to create file");
+    let device = Arc::new(Mutex::new(file));
+    let size = 32 * 4096 * 4096;
+
+    let sfs = SimpleFileSystem::create(device.clone(), size).expect("failed to create SFS");
+    sfs.sync()?;
+
+    // What `create_root_fs` does to the initramfs root on every boot. Scoped so
+    // the handles go away as they do there: `INodeImpl::drop` writes the inode
+    // itself back, which is the half of the metadata that was already durable.
+    {
+        let root = sfs.root_inode();
+        let cache = root.create("cache", FileType::Dir, 0o755)?;
+        cache.create("apk", FileType::Dir, 0o755)?;
+    }
+    std::mem::forget(sfs);
+
+    let sfs = SimpleFileSystem::open(device).expect("failed to reopen SFS");
+    let root = sfs.root_inode();
+    let cache = root.find("cache")?;
+    assert_eq!(cache.metadata()?.type_, FileType::Dir);
+    cache.find("apk")?;
+    std::mem::forget(sfs);
     Ok(())
 }

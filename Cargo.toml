@@ -13,6 +13,10 @@ members = [
     "zCore",
     "z-config",
     "xtask",
+    # A workspace member so its unit tests can run (`cargo test -p
+    # rcore-fs-sfs`); the `[patch]` below is what makes the rest of the tree
+    # use this copy.
+    "vendor/rcore-fs-sfs",
     "hunter",
 ]
 default-members = ["xtask"]
