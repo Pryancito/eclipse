@@ -570,8 +570,17 @@ impl PcmDev {
         }))
     }
 
-    fn ring_frames(&self) -> u64 {
-        self.audio.buffer_bytes() as u64 / BYTES_PER_FRAME
+    /// The ring's capacity in frames for a client at `rate`, BEFORE that
+    /// rate is applied. This is the bound the refine and `install` put on
+    /// `buffer_size`: on a device that resamples into a fixed-rate ring the
+    /// capacity in client frames depends on the rate, and bounding a
+    /// 44.1 kHz request with the previous 48 kHz stream's figure granted
+    /// PulseAudio a buffer 999 frames deeper than the ring. `avail`
+    /// (`buffer_size - queued`) then stayed positive with the ring full,
+    /// `write` took nothing, and alsa-sink's `try_recover` asserted on the
+    /// EAGAIN that followed its own `snd_pcm_avail()`.
+    fn ring_frames_at(&self, rate: u32) -> u64 {
+        self.audio.buffer_bytes_at(rate) as u64 / BYTES_PER_FRAME
     }
 
     fn queued_frames(&self) -> u64 {
@@ -766,7 +775,6 @@ impl PcmDev {
     /// One propagation sweep. Returns `true` if any interval narrowed.
     fn propagate(&self, iv: &mut [SndInterval; 12]) -> bool {
         let mut changed = false;
-        let ring = self.ring_frames();
 
         // Fixed points of this path: S16LE stereo.
         changed |= Self::iv_clamp(&mut iv[Self::IV_SAMPLE_BITS], 16, 16);
@@ -774,19 +782,29 @@ impl PcmDev {
         changed |= Self::iv_clamp(&mut iv[Self::IV_FRAME_BITS], 32, 32);
 
         // Rate: snap to the discrete set the HDA stream format encodes.
-        {
+        let rate_lo = {
             let r = &mut iv[Self::IV_RATE];
             let lo = RATES.iter().copied().find(|&x| x >= r.min);
             let hi = RATES.iter().rev().copied().find(|&x| x <= r.max);
             match (lo, hi) {
                 (Some(lo), Some(hi)) if lo <= hi => {
                     changed |= Self::iv_clamp(r, lo as u64, hi as u64);
+                    lo
                 }
                 _ => {
                     r.flags |= INTERVAL_EMPTY;
+                    r.min
                 }
             }
-        }
+        };
+        // The ring's capacity for the rate this request can still end up
+        // at. The lowest rate left in the interval, which is also the one
+        // `install` picks when the client leaves the rate open: on a
+        // fixed-rate ring a lower client rate means fewer client frames, so
+        // this is the bound every rate in the interval can honour. A client
+        // that pins its rate first (alsa-lib's `set_*_near` helpers do, as
+        // do PulseAudio, aplay and SDL) gets that rate's exact capacity.
+        let ring = self.ring_frames_at(rate_lo);
 
         // Hard bounds of the driver ring. The period ceiling is half the ring
         // so at least two periods always fit; without it a long period at a
@@ -1107,7 +1125,10 @@ impl PcmDev {
         // it back is exactly what Linux does; the client reads the granted
         // values (they are what `aplay -v` prints) rather than its request.
         let period = (p.intervals[Self::IV_PERIOD_SIZE].min as u64).max(1);
-        let ring = self.ring_frames();
+        // For the rate about to be set, not the one the device is at: the
+        // buffer granted here must be one the ring holds once `set_params`
+        // below has switched the device to `rate` (see `ring_frames_at`).
+        let ring = self.ring_frames_at(rate);
         let bs_lo = p.intervals[Self::IV_BUFFER_SIZE].min as u64;
         let bs_hi = (p.intervals[Self::IV_BUFFER_SIZE].max as u64).min(ring);
         let n_iv = p.intervals[Self::IV_PERIODS];
@@ -2619,6 +2640,12 @@ mod timer_tests {
             cap: usize,
             queued: Mutex<usize>,
             hold: Mutex<bool>,
+            /// `Some(link_rate)`: the ring holds `cap` bytes at THAT rate
+            /// and a client at another rate fits `cap * rate / link` of its
+            /// own, the way the HDA driver's fixed-rate sink counts. `None`:
+            /// the capacity is the same at every rate.
+            link: Option<u32>,
+            rate: Mutex<u32>,
         }
 
         impl FakeAudio {
@@ -2627,7 +2654,33 @@ mod timer_tests {
                     cap,
                     queued: Mutex::new(0),
                     hold: Mutex::new(false),
+                    link: None,
+                    rate: Mutex::new(48_000),
                 }
+            }
+
+            /// A ring of `cap` bytes at `link` Hz whose client-visible
+            /// capacity scales with the client's rate.
+            pub(super) fn fixed_link(cap: usize, link: u32) -> Self {
+                Self {
+                    link: Some(link),
+                    ..Self::new(cap)
+                }
+            }
+
+            fn cap_at(&self, rate: u32) -> usize {
+                match self.link {
+                    Some(link) => {
+                        let frames = self.cap / BYTES_PER_FRAME as usize;
+                        (frames as u64 * rate as u64 / link as u64) as usize
+                            * BYTES_PER_FRAME as usize
+                    }
+                    None => self.cap,
+                }
+            }
+
+            fn cap_now(&self) -> usize {
+                self.cap_at(*self.rate.lock())
             }
 
             pub(super) fn held(&self) -> bool {
@@ -2649,27 +2702,36 @@ mod timer_tests {
 
         impl AudioScheme for FakeAudio {
             fn set_params(&self, rate: u32, channels: u8) -> DeviceResult<(u32, u8)> {
+                *self.rate.lock() = rate;
                 Ok((rate, channels))
             }
 
             fn params(&self) -> (u32, u8) {
-                (48_000, 2)
+                match self.link {
+                    Some(_) => (*self.rate.lock(), 2),
+                    None => (48_000, 2),
+                }
             }
 
             fn write(&self, pcm: &[u8]) -> DeviceResult<usize> {
+                let cap = self.cap_now();
                 let mut queued = self.queued.lock();
-                let room = self.cap.saturating_sub(*queued);
+                let room = cap.saturating_sub(*queued);
                 let n = room.min(pcm.len());
                 *queued += n;
                 Ok(n)
             }
 
             fn free_bytes(&self) -> usize {
-                self.cap.saturating_sub(*self.queued.lock())
+                self.cap_now().saturating_sub(*self.queued.lock())
             }
 
             fn buffer_bytes(&self) -> usize {
-                self.cap
+                self.cap_now()
+            }
+
+            fn buffer_bytes_at(&self, rate: u32) -> usize {
+                self.cap_at(rate)
             }
 
             fn queued_bytes(&self) -> usize {
@@ -2719,6 +2781,121 @@ mod timer_tests {
             assert_eq!(st.state, STATE_RUNNING);
             assert_eq!(st.appl_ptr, 4);
             assert_eq!(pcm.queued_frames(), 4);
+        }
+
+        /// A wide-open hw_params request, as `snd_pcm_hw_params_any` builds it.
+        fn any_hw_params() -> SndPcmHwParams {
+            let mut p: SndPcmHwParams = unsafe { core::mem::zeroed() };
+            for m in p.masks.iter_mut() {
+                m.bits[0] = !0;
+                m.bits[1] = !0;
+            }
+            for iv in p.intervals.iter_mut() {
+                iv.min = 0;
+                iv.max = u32::MAX;
+            }
+            p.rmask = !0;
+            p
+        }
+
+        /// HW_PARAMS bounds the buffer with the ring's capacity FOR THE RATE
+        /// IT IS ABOUT TO SET, not for the rate the device is at. On the HDA
+        /// driver's fixed-rate sink the ring holds 12288 frames of a 48 kHz
+        /// client and 11289 of a 44.1 kHz one; sizing a 44.1 kHz request
+        /// with the 48 kHz figure (the device is at 48 kHz until the
+        /// `set_params` inside HW_PARAMS) granted PulseAudio 999 frames the
+        /// ring did not have. `avail = buffer_size - queued` then never
+        /// reached zero: with the ring full it still promised 999 frames,
+        /// the write took none, and alsa-sink's `try_recover` asserted on
+        /// the EAGAIN (`pa_assert(err != -EAGAIN)`) -- the daemon died by
+        /// SIGABRT a few seconds into every 44.1 kHz track.
+        #[test]
+        fn hw_params_sizes_the_buffer_for_the_rate_it_sets() {
+            let audio = Arc::new(FakeAudio::fixed_link(
+                12288 * BYTES_PER_FRAME as usize,
+                48_000,
+            ));
+            let pcm = PcmDev::new(audio.clone(), 0);
+            assert_eq!(audio.buffer_bytes() as u64 / BYTES_PER_FRAME, 12288);
+
+            // The request PulseAudio makes: rate pinned first, buffer left
+            // open so it gets the deepest one.
+            let mut hp = any_hw_params();
+            hp.intervals[PcmDev::IV_RATE].min = 44_100;
+            hp.intervals[PcmDev::IV_RATE].max = 44_100;
+            pcm.io_control(0x4111, &mut hp as *mut SndPcmHwParams as usize)
+                .unwrap();
+
+            let granted = pcm.st.lock().buffer_size;
+            let ring_now = audio.buffer_bytes() as u64 / BYTES_PER_FRAME;
+            assert_eq!(audio.params().0, 44_100);
+            assert_eq!(ring_now, 11289);
+            assert!(
+                granted <= ring_now,
+                "granted {} frames, the ring holds {} at 44.1 kHz",
+                granted,
+                ring_now
+            );
+            // ...and not shrunk out of caution either: the deepest buffer
+            // that is a whole number of periods.
+            assert!(granted > ring_now - 256, "granted only {}", granted);
+            assert_eq!(hp.intervals[PcmDev::IV_BUFFER_SIZE].min as u64, granted);
+
+            // The ring takes the whole granted buffer, and once it has,
+            // `avail` is zero: nothing is promised that `write` would refuse.
+            // (With the stale bound the write stopped at 11289 of 12288 and
+            // `avail` stayed at 999.)
+            pcm.st.lock().state = STATE_PREPARED;
+            let samples = alloc::vec![0u8; 12288 * BYTES_PER_FRAME as usize];
+            let mut xfer = SndXferI {
+                result: 0,
+                buf: samples.as_ptr() as usize as u64,
+                frames: 12288,
+            };
+            pcm.writei(&mut xfer, OpenFlags::NON_BLOCK).unwrap();
+            assert_eq!(xfer.result as u64, granted);
+            let st = pcm.st.lock();
+            assert_eq!(pcm.avail(&st), 0);
+        }
+
+        /// The refine tells the same truth: with the rate pinned it bounds
+        /// the buffer by that rate's capacity, and with the rate still open
+        /// by the lowest rate the request can end up at (the one `install`
+        /// would pick), never by the rate the device happens to be at.
+        #[test]
+        fn hw_refine_bounds_the_buffer_by_the_requested_rate() {
+            let audio = Arc::new(FakeAudio::fixed_link(
+                12288 * BYTES_PER_FRAME as usize,
+                48_000,
+            ));
+            let pcm = PcmDev::new(audio.clone(), 0);
+
+            let mut hp = any_hw_params();
+            hp.intervals[PcmDev::IV_RATE].min = 44_100;
+            hp.intervals[PcmDev::IV_RATE].max = 44_100;
+            pcm.io_control(0x4110, &mut hp as *mut SndPcmHwParams as usize)
+                .unwrap();
+            assert_eq!(hp.intervals[PcmDev::IV_BUFFER_SIZE].max, 11289);
+
+            let mut hp = any_hw_params();
+            hp.intervals[PcmDev::IV_RATE].min = 48_000;
+            hp.intervals[PcmDev::IV_RATE].max = 48_000;
+            pcm.io_control(0x4110, &mut hp as *mut SndPcmHwParams as usize)
+                .unwrap();
+            assert_eq!(hp.intervals[PcmDev::IV_BUFFER_SIZE].max, 12288);
+
+            // Rate open: the bound every rate in the interval can honour.
+            let mut hp = any_hw_params();
+            hp.intervals[PcmDev::IV_RATE].min = 22_050;
+            hp.intervals[PcmDev::IV_RATE].max = 48_000;
+            pcm.io_control(0x4110, &mut hp as *mut SndPcmHwParams as usize)
+                .unwrap();
+            assert_eq!(
+                hp.intervals[PcmDev::IV_BUFFER_SIZE].max,
+                12288 * 22_050 / 48_000
+            );
+            // The device never moved: the refine changes nothing.
+            assert_eq!(audio.params().0, 48_000);
         }
 
         #[test]

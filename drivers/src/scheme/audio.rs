@@ -33,10 +33,29 @@ pub trait AudioScheme: Scheme {
     /// Total capacity of the playback ring in bytes.
     fn buffer_bytes(&self) -> usize;
 
-    /// Bytes of client PCM queued but not yet played out. Silence the device
-    /// inserted on its own (see [`delay_bytes`](AudioScheme::delay_bytes))
-    /// is not counted: this is what a client's hardware pointer is derived
-    /// from, and it must only ever advance through bytes the client wrote.
+    /// What [`buffer_bytes`](AudioScheme::buffer_bytes) will report once a
+    /// client at `rate` Hz is negotiated with `set_params`, without
+    /// changing anything. A device that resamples into a fixed-rate ring
+    /// holds a rate-dependent number of CLIENT frames, and a front end
+    /// sizing a buffer for a rate it has not applied yet must ask for that
+    /// rate's figure: the one for the previous stream is not a bound the
+    /// device can honour, and a buffer bigger than the ring is `avail`
+    /// promising room that `write` then refuses. Default: rate-independent.
+    fn buffer_bytes_at(&self, rate: u32) -> usize {
+        let _ = rate;
+        self.buffer_bytes()
+    }
+
+    /// Bytes queued but not yet played out, as the client must count them:
+    /// EXACTLY [`buffer_bytes`](AudioScheme::buffer_bytes) less what
+    /// [`write`](AudioScheme::write) would accept right now. The ALSA node
+    /// derives both `avail` and the client's hardware pointer from this, and
+    /// alsa-lib clients (PulseAudio's sink aborts) treat a write that takes
+    /// nothing after `avail` said there was room as a driver bug. So any
+    /// silence the device inserted on its own that still occupies the ring
+    /// counts here too; a device that keeps its engine running through a
+    /// gap lets the pointer step back once, by that silence, when the gap
+    /// opens, rather than promise room it does not have.
     fn queued_bytes(&self) -> usize;
 
     /// Bytes the link still has to play before the last queued client byte
