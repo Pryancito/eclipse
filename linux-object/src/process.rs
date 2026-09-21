@@ -2320,6 +2320,19 @@ pub fn all_live_processes() -> Vec<Arc<Process>> {
     processes
 }
 
+/// Whether `pid` names a process that has not exited.
+///
+/// The same lookup `send_signal_to_process` does, minus the processes that
+/// have already exited and are only waiting to be reaped: a zombie cannot act
+/// on a signal, so for anything that asks "is somebody still there to do
+/// this?" it is not there.
+pub fn process_exists(pid: KoID) -> bool {
+    ROOT_JOB
+        .find_process(pid)
+        .map(|p| !matches!(p.status(), Status::Exited(_)))
+        .unwrap_or(false)
+}
+
 /// Linux PID of the `init` process (the base program). The system's reaper of
 /// last resort for orphaned children, and the one process a `kill(-1, sig)`
 /// broadcast must never reach.
