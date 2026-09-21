@@ -64,11 +64,25 @@ HDA controller (PCI 04:03) ── codec ── pin ── HDMI/DP or analog jack
   output sample, with the phase step scaled by the ratio on downsampling so
   the cutoff follows the lower Nyquist and nothing aliases. Fixed-point and
   streaming (it keeps the input history a straddling window needs, so a
-  chunked stream resamples the same as one buffer). It is **not yet wired
-  into a device path**. The interim step, done in PulseAudio config (see the
-  PulseAudio section), already fixes the sink at 48 kHz so the link never
-  reprograms per track; wiring this component as a kernel fixed-rate sink is
-  the eventual step that takes PulseAudio out of the resampling entirely.
+  chunked stream resamples the same as one buffer). It is **wired into the
+  HDA driver as a fixed-rate sink**: the link is always programmed at 48 kHz
+  (`LINK_RATE` in `hda.rs`), `set_params` accepts any client rate, and a
+  client at another rate is resampled into the ring on the way in. The ring
+  and every counter derived from it stay in link frames; only the four
+  numbers the front ends see (free, queued, delay, buffer) and the write
+  itself cross into client frames, through `accept_client_frames` /
+  `link_to_client_bytes` / `client_to_link_bytes`. `free_bytes` reports
+  exactly what `write` will accept, so a client that just saw room is never
+  answered with 0 (the EAGAIN-after-avail that aborts PulseAudio). A client
+  at 48 kHz takes the pre-existing path byte for byte, so with the daemon's
+  sink fixed at 48 kHz (below) the converter is dormant; it engages when a
+  front end negotiates another rate. `/proc/gpusnd` shows `client=.. Hz
+  src=passthrough|resampling`. Turning it on for the desktop means letting
+  the daemon hand streams to the sink at their native rate
+  (`avoid-resampling` in `daemon.conf`); that is a separate, reversible step
+  because a rate change still goes through `set_params`, which stops and
+  wipes the stream, and on HDMI a stop/start can re-lock. Keeping the engine
+  running across a client-rate change is the step after.
   `mixer` is SOF's mixer component (`mix_n_s16`): it sums several S16LE
   streams into one, accumulating each frame in `i32` and clamping once at the
   end, never pairwise (a pairwise clamp folds a loud stream over a quiet one

@@ -57,6 +57,7 @@ use core::sync::atomic::{fence, Ordering};
 use lock::Mutex;
 use pci::{PCIDevice, BAR};
 
+use crate::audio::pipeline::src::Resampler;
 use crate::audio::pipeline::volume::{gain_from_percent, Volume};
 use crate::builder::IoMapper;
 use crate::bus::pci_drivers::PciDriver;
@@ -389,6 +390,85 @@ fn exposed_queued(queued: usize, pad_end: u64, consumed: u64) -> usize {
     queued.saturating_sub(pad.min(queued as u64) as usize)
 }
 
+// ── Fixed-rate sink ─────────────────────────────────────────────────────────
+//
+// The HDA link runs at ONE rate, `LINK_RATE`, whatever rate a client asks
+// for. A client at another rate is resampled into the ring by
+// `crate::audio::pipeline::src` on the way in (SOF's SRC sits in front of
+// its DAI the same way). Two things come of that:
+//
+//  * The stream is never reprogrammed for a rate change. On an HDMI/DP sink
+//    a format change is a re-lock, and the monitor mutes for a few hundred
+//    milliseconds while it does it -- the missing first half-second of every
+//    44.1 kHz track after a 48 kHz one. Fixing the sink rate in PulseAudio's
+//    config already avoided that; this moves the resampling that costs into
+//    the kernel, where the converter is the polyphase one rather than
+//    speex's.
+//  * The ring, and every counter derived from it (positions, `queued`,
+//    `consumed`, the gap pad), stays in LINK frames. Only the four numbers
+//    the front ends see -- free, queued, delay, buffer -- and the write
+//    itself cross into CLIENT frames, through the helpers below. Frame SIZE
+//    is the same on both sides (S16LE stereo throughout); only the frame
+//    COUNT scales, by `client_rate / LINK_RATE`.
+//
+// A client at exactly `LINK_RATE` takes the same path as before this
+// existed: no converter, byte-for-byte copy, identity conversions.
+
+/// The one rate the HDA stream is ever programmed at.
+const LINK_RATE: u32 = 48000;
+
+/// Link frames held back below the free space when sizing a resampled
+/// write. The converter's output for N input frames is `N * fout / fin`
+/// give or take one (the fractional phase carries between calls); this keeps
+/// that one, and a couple more, from landing past what fits.
+const SRC_SLACK_FRAMES: usize = 4;
+
+/// Client rates outside this range are clamped rather than refused: the
+/// converter's window covers ratios down to about a third, and nothing a
+/// desktop plays sits outside it.
+const CLIENT_RATE_MIN: u32 = 8000;
+const CLIENT_RATE_MAX: u32 = 192_000;
+
+/// How many CLIENT frames a resampled write may take when the ring has
+/// `free_link_frames` free: the largest count whose converted output is sure
+/// to fit. Zero when there is no room for the slack -- the client then sees
+/// a full ring and polls, which is the normal answer.
+///
+/// This is the one number `free_bytes` reports AND the one `write` accepts,
+/// so a client that just read "N free" and offers N is never turned away
+/// with 0 (alsa-lib's `try_recover` aborts PulseAudio on EAGAIN right after
+/// `snd_pcm_avail()` said there was room).
+fn accept_client_frames(free_link_frames: usize, fin: u32, fout: u32) -> usize {
+    if fin == 0 || fout == 0 {
+        return 0;
+    }
+    let usable = free_link_frames.saturating_sub(SRC_SLACK_FRAMES);
+    (usable as u64 * fin as u64 / fout as u64) as usize
+}
+
+/// `link_bytes` of ring, seen as client bytes: the frame count scaled by
+/// `fin / fout`, floored to a whole frame. Used for what is QUEUED and for
+/// the buffer size, where under-reporting is the safe direction (a client
+/// thinks slightly less is waiting, never more than it wrote).
+fn link_to_client_bytes(link_bytes: usize, fin: u32, fout: u32, frame: usize) -> usize {
+    if frame == 0 || fout == 0 {
+        return 0;
+    }
+    let frames = (link_bytes / frame) as u64;
+    (frames * fin as u64 / fout as u64) as usize * frame
+}
+
+/// `client_bytes` of a client's request, as ring bytes: the inverse of
+/// [`link_to_client_bytes`], floored to a whole frame. For `rewind` and
+/// `forward`, which name an amount of the client's own PCM.
+fn client_to_link_bytes(client_bytes: usize, fin: u32, fout: u32, frame: usize) -> usize {
+    if frame == 0 || fin == 0 {
+        return 0;
+    }
+    let frames = (client_bytes / frame) as u64;
+    (frames * fout as u64 / fin as u64) as usize * frame
+}
+
 // ── MMIO helpers ────────────────────────────────────────────────────────────
 fn mmio_r8(bar: usize, off: usize) -> u8 {
     unsafe { read_volatile((bar + off) as *const u8) }
@@ -626,6 +706,20 @@ struct HdaInner {
     mute_l: bool,
     mute_r: bool,
     vol: Volume,
+
+    /// The rate the client negotiated (what [`AudioScheme::params`] reports
+    /// and what its byte counts are in). The ring itself is always at
+    /// [`LINK_RATE`]; see the fixed-rate sink notes above `LINK_RATE`.
+    client_rate: u32,
+    /// The converter from `client_rate` into the ring, or `None` when the
+    /// client is at `LINK_RATE` and the write is a plain copy.
+    src: Option<Resampler>,
+    /// Scratch for one resampled write: the client frames taken, the link
+    /// frames they became, and those as the bytes the ring copy reads. Kept
+    /// across writes so the hot path does not allocate.
+    src_in: Vec<i16>,
+    src_out: Vec<i16>,
+    src_bytes: Vec<u8>,
 }
 
 pub struct HdaDevice {
@@ -1061,6 +1155,60 @@ impl HdaInner {
         free_bytes_of(self.ring_len, RING_GUARD, self.queued)
     }
 
+    /// `(client_rate, LINK_RATE)` when a converter is in the path.
+    fn src_rates(&self) -> Option<(u32, u32)> {
+        self.src.as_ref().map(|s| s.rates())
+    }
+
+    /// Ring bytes as the client counts them (identity without a converter).
+    fn to_client_bytes(&self, link_bytes: usize) -> usize {
+        match self.src_rates() {
+            Some((fin, fout)) => link_to_client_bytes(link_bytes, fin, fout, self.frame_bytes()),
+            None => link_bytes,
+        }
+    }
+
+    /// A client's byte count as ring bytes (identity without a converter).
+    fn to_link_bytes(&self, client_bytes: usize) -> usize {
+        match self.src_rates() {
+            Some((fin, fout)) => client_to_link_bytes(client_bytes, fin, fout, self.frame_bytes()),
+            None => client_bytes,
+        }
+    }
+
+    /// Client bytes a write may take right now. This is what `free_bytes`
+    /// reports to the front ends and exactly what `write` accepts, so the
+    /// two never disagree (see [`accept_client_frames`]).
+    fn client_free_bytes(&self) -> usize {
+        let free = self.free_bytes();
+        match self.src_rates() {
+            Some((fin, fout)) => {
+                let frame = self.frame_bytes();
+                accept_client_frames(free / frame, fin, fout) * frame
+            }
+            None => free,
+        }
+    }
+
+    /// Convert `client_frames` whole frames of client S16LE `pcm` through the
+    /// resampler into `self.src_bytes` (ring-rate S16LE). Returns the link
+    /// byte count. Only called with a converter present.
+    fn resample_client(&mut self, pcm: &[u8], client_frames: usize) -> usize {
+        let frame = self.frame_bytes();
+        let (samples, _) = pcm[..client_frames * frame].as_chunks::<2>();
+        self.src_in.clear();
+        self.src_in
+            .extend(samples.iter().map(|s| i16::from_le_bytes(*s)));
+        self.src_out.clear();
+        if let Some(src) = self.src.as_mut() {
+            src.process(&self.src_in, &mut self.src_out);
+        }
+        self.src_bytes.clear();
+        self.src_bytes
+            .extend(self.src_out.iter().flat_map(|s| s.to_le_bytes()));
+        self.src_bytes.len()
+    }
+
     /// Clear RUN and wait for the engine to acknowledge it. Returns whether it
     /// did: a caller that is about to rewrite the ring must not do so while
     /// the engine is still fetching from it.
@@ -1351,6 +1499,11 @@ fn stream_format(rate: u32, channels: u8) -> u16 {
     fmt
 }
 
+/// The HDA rate table, and the nearest entry to `rate`. The link is fixed at
+/// [`LINK_RATE`] now (a client at any other rate is resampled), so nothing
+/// at runtime snaps to this table any more; the tests keep it as the record
+/// of what [`stream_format`] can encode.
+#[cfg(test)]
 fn nearest_rate(rate: u32) -> u32 {
     const RATES: [u32; 11] = [
         8000, 11025, 16000, 22050, 32000, 44100, 48000, 88200, 96000, 176400, 192000,
@@ -1403,9 +1556,136 @@ mod format_and_ring_tests {
     //! position that runs backwards is what the intermittent dropouts were.
 
     use super::{
-        exposed_queued, free_bytes_of, honourable_bytes, nearest_rate, park_target, stream_format,
-        sub_nodes,
+        accept_client_frames, client_to_link_bytes, exposed_queued, free_bytes_of,
+        honourable_bytes, link_to_client_bytes, nearest_rate, park_target, stream_format,
+        sub_nodes, Resampler, LINK_RATE, SRC_SLACK_FRAMES,
     };
+
+    /// Rates a desktop actually plays, paired against the fixed link.
+    const CLIENT_RATES: [u32; 9] = [
+        8000, 11025, 16000, 22050, 32000, 44100, 48000, 96000, 192_000,
+    ];
+
+    /// The invariant the whole fixed-rate sink rests on: whatever the ring
+    /// has free, the client frames `accept_client_frames` sizes never
+    /// convert into more link frames than that. If they did, `write` would
+    /// copy past the ring. Checked against the converter's own sizing hint
+    /// for every rate and every free count up to a full ring.
+    #[test]
+    fn an_accepted_write_always_fits_after_conversion() {
+        for &fin in &CLIENT_RATES {
+            let r = Resampler::new(fin, LINK_RATE, 2);
+            for free in 0..=16384usize {
+                let take = accept_client_frames(free, fin, LINK_RATE);
+                let out = r.out_frames_hint(take);
+                assert!(
+                    take == 0 || out <= free,
+                    "{} Hz: {} free link frames, took {} client frames -> {} link frames",
+                    fin,
+                    free,
+                    take,
+                    out
+                );
+            }
+        }
+    }
+
+    /// The converter's real output, not just its hint, fits too: run the
+    /// sized take through it, chunk after chunk, with the ring "draining"
+    /// between writes, and never see more come out than was free.
+    #[test]
+    fn the_real_converted_output_fits_the_free_space() {
+        for &fin in &CLIENT_RATES {
+            if fin == LINK_RATE {
+                continue;
+            }
+            let mut r = Resampler::new(fin, LINK_RATE, 2);
+            let mut out = alloc::vec::Vec::new();
+            for free in [5usize, 6, 7, 10, 33, 100, 1024, 4096, 16000] {
+                let take = accept_client_frames(free, fin, LINK_RATE);
+                let input = alloc::vec![1000i16; take * 2];
+                out.clear();
+                r.process(&input, &mut out);
+                let got = out.len() / 2;
+                assert!(
+                    got <= free,
+                    "{} Hz: {} free, took {} -> {} out",
+                    fin,
+                    free,
+                    take,
+                    got
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn nothing_is_accepted_without_room_for_the_slack() {
+        for &fin in &CLIENT_RATES {
+            for free in 0..SRC_SLACK_FRAMES {
+                assert_eq!(accept_client_frames(free, fin, LINK_RATE), 0);
+            }
+        }
+        assert_eq!(accept_client_frames(1000, 0, LINK_RATE), 0);
+        assert_eq!(accept_client_frames(1000, 44100, 0), 0);
+    }
+
+    #[test]
+    fn a_client_at_the_link_rate_gets_the_free_space_minus_slack_only() {
+        // 48k -> 48k is not resampled in practice (no converter), but the
+        // arithmetic must still be the identity apart from the slack.
+        assert_eq!(
+            accept_client_frames(1000, LINK_RATE, LINK_RATE),
+            1000 - SRC_SLACK_FRAMES
+        );
+    }
+
+    #[test]
+    fn link_to_client_scales_the_frame_count_and_floors_to_a_frame() {
+        // 480 link frames at 48k are 441 client frames at 44.1k.
+        assert_eq!(link_to_client_bytes(480 * 4, 44100, 48000, 4), 441 * 4);
+        // 48k -> 96k client: twice as many client frames.
+        assert_eq!(link_to_client_bytes(100 * 4, 96000, 48000, 4), 200 * 4);
+        // A dangling byte in the link count is dropped, never rounded up
+        // into a phantom frame.
+        assert_eq!(link_to_client_bytes(480 * 4 + 3, 44100, 48000, 4), 441 * 4);
+        assert_eq!(link_to_client_bytes(1000, 44100, 48000, 0), 0);
+        assert_eq!(link_to_client_bytes(1000, 44100, 0, 4), 0);
+    }
+
+    #[test]
+    fn client_to_link_is_the_inverse_direction() {
+        assert_eq!(client_to_link_bytes(441 * 4, 44100, 48000, 4), 480 * 4);
+        assert_eq!(client_to_link_bytes(200 * 4, 96000, 48000, 4), 100 * 4);
+        assert_eq!(client_to_link_bytes(1000, 0, 48000, 4), 0);
+    }
+
+    /// Under-reporting is the safe direction for what is queued: a client
+    /// must never be told more of ITS frames are waiting than it wrote.
+    /// Converting `n` client frames to link and back never exceeds `n`.
+    #[test]
+    fn a_round_trip_through_the_link_never_gains_frames() {
+        for &fin in &CLIENT_RATES {
+            for n in [1usize, 7, 100, 441, 1023, 4096] {
+                let link = client_to_link_bytes(n * 4, fin, LINK_RATE, 4);
+                let back = link_to_client_bytes(link, fin, LINK_RATE, 4);
+                assert!(back <= n * 4, "{} Hz: {} -> {} -> {}", fin, n, link, back);
+                // And it is not wildly lossy either. Each floor can drop
+                // under one LINK frame, which is `fin / fout` client frames
+                // when the client is the faster side (one link frame at 48k
+                // is four client frames at 192k), so that is the bound.
+                let slop = (fin as usize).div_ceil(LINK_RATE as usize);
+                assert!(
+                    back + 4 * slop >= n * 4,
+                    "{} Hz: {} -> {} (allowed loss {} frames)",
+                    fin,
+                    n,
+                    back,
+                    slop
+                );
+            }
+        }
+    }
 
     /// Decode an HDA stream format word the way the controller does
     /// (Intel HDA §3.7.1): base rate bit, multiplier, divisor, sample size,
@@ -2307,6 +2587,11 @@ impl HdaDevice {
             mute_l: false,
             mute_r: false,
             vol: Volume::new(48000, 2),
+            client_rate: LINK_RATE,
+            src: None,
+            src_in: Vec::new(),
+            src_out: Vec::new(),
+            src_bytes: Vec::new(),
         };
 
         // ── Codec discovery ────────────────────────────────────────────────
@@ -2374,16 +2659,19 @@ impl Scheme for HdaDevice {
 
 impl AudioScheme for HdaDevice {
     fn set_params(&self, rate: u32, channels: u8) -> DeviceResult<(u32, u8)> {
-        let rate = nearest_rate(rate);
+        // The client gets the rate it asked for (within reason); the link
+        // stays at LINK_RATE and the difference is resampled on the way in.
+        // See the fixed-rate sink notes above `LINK_RATE`.
+        let client_rate = rate.clamp(CLIENT_RATE_MIN, CLIENT_RATE_MAX);
         let _ = channels;
         let channels = 2u8; // stereo only for now
         let mut inner = self.inner.lock();
-        if inner.rate != rate {
+        if inner.client_rate != client_rate {
             // One line per rate switch: the last serial line before a
             // machine dies at a stream start says which step it reached.
             warn!(
-                "[hda] set_params: {} Hz -> {} Hz (running={})",
-                inner.rate, rate, inner.running
+                "[hda] set_params: client {} Hz -> {} Hz, link stays {} Hz (running={})",
+                inner.client_rate, client_rate, LINK_RATE, inner.running
             );
         }
         inner.stop_stream();
@@ -2395,19 +2683,27 @@ impl AudioScheme for HdaDevice {
         inner.pad_end = 0;
         unsafe { core::ptr::write_bytes(inner.ring_va as *mut u8, 0, inner.ring_len) };
         clflush_range(inner.ring_va, inner.ring_len);
-        inner.rate = rate;
+        inner.rate = LINK_RATE;
         inner.channels = channels;
-        inner.vol.set_format(rate, channels as usize);
+        inner.client_rate = client_rate;
+        // A fresh converter per prepare: its input history belongs to the
+        // stream that was just dropped.
+        inner.src = if client_rate != LINK_RATE {
+            Some(Resampler::new(client_rate, LINK_RATE, channels as usize))
+        } else {
+            None
+        };
+        inner.vol.set_format(LINK_RATE, channels as usize);
         if inner.digital {
             let ch = channels;
             inner.send_audio_infoframe(ch);
         }
-        Ok((rate, channels))
+        Ok((client_rate, channels))
     }
 
     fn params(&self) -> (u32, u8) {
         let inner = self.inner.lock();
-        (inner.rate, inner.channels)
+        (inner.client_rate, inner.channels)
     }
 
     fn write(&self, pcm: &[u8]) -> DeviceResult<usize> {
@@ -2458,26 +2754,60 @@ impl AudioScheme for HdaDevice {
             inner.pad_end = 0;
         }
         let starting = !inner.running && !inner.paused && !inner.hold_start;
-        let free = inner.free_bytes();
         // Whole frames only, so channels never swap on a partial write.
         let frame = inner.channels as usize * 2;
-        let n = free.min(pcm.len()) / frame * frame;
+        // `n` is what the CLIENT wrote and what this call returns; `link`
+        // is what goes into the ring. Without a converter they are the same
+        // bytes. With one, `n` is sized so its converted output is sure to
+        // fit (`accept_client_frames`), then converted into `src_bytes`.
+        let n = inner.client_free_bytes().min(pcm.len()) / frame * frame;
         if n == 0 {
             return Ok(0);
         }
-        let mut p = inner.wp;
-        let mut done = 0;
-        while done < n {
-            let chunk = (n - done).min(inner.ring_len - p);
-            let dst = inner.ring_va + p;
-            inner.copy_pcm_scaled(&pcm[done..done + chunk], dst, chunk);
-            clflush_range(dst, chunk);
-            p = (p + chunk) % inner.ring_len;
-            done += chunk;
-        }
-        inner.wp = p;
-        inner.queued += n;
-        inner.stream_written += n;
+        let taken = if inner.src.is_some() {
+            let link_len = inner.resample_client(pcm, n / frame);
+            let free = inner.free_bytes();
+            if link_len > free {
+                // Cannot happen (the slack in `accept_client_frames` covers
+                // the converter's ±1 frame, and the unit tests hold it to
+                // that), but a copy past the ring is the one outcome never
+                // worth risking: drop the excess rather than overrun.
+                warn!(
+                    "[hda] resampled write of {} B exceeds {} B free; truncating",
+                    link_len, free
+                );
+            }
+            let link_len = link_len.min(free) / frame * frame;
+            let bytes = core::mem::take(&mut inner.src_bytes);
+            let mut p = inner.wp;
+            let mut done = 0;
+            while done < link_len {
+                let chunk = (link_len - done).min(inner.ring_len - p);
+                let dst = inner.ring_va + p;
+                inner.copy_pcm_scaled(&bytes[done..done + chunk], dst, chunk);
+                clflush_range(dst, chunk);
+                p = (p + chunk) % inner.ring_len;
+                done += chunk;
+            }
+            inner.src_bytes = bytes;
+            inner.wp = p;
+            link_len
+        } else {
+            let mut p = inner.wp;
+            let mut done = 0;
+            while done < n {
+                let chunk = (n - done).min(inner.ring_len - p);
+                let dst = inner.ring_va + p;
+                inner.copy_pcm_scaled(&pcm[done..done + chunk], dst, chunk);
+                clflush_range(dst, chunk);
+                p = (p + chunk) % inner.ring_len;
+                done += chunk;
+            }
+            inner.wp = p;
+            n
+        };
+        inner.queued += taken;
+        inner.stream_written += taken;
         // Client PCM again: the gap, if one was open, ends here. The pad
         // ahead of it plays out on its own.
         inner.gap_since_us = 0;
@@ -2493,27 +2823,31 @@ impl AudioScheme for HdaDevice {
         Ok(n)
     }
 
+    // The four counts the front ends see are in CLIENT bytes: identical to
+    // the ring's own when the client is at LINK_RATE, scaled by the rate
+    // ratio when a converter is in the path.
+
     fn free_bytes(&self) -> usize {
         let mut inner = self.inner.lock();
         inner.poll_progress();
-        inner.free_bytes()
+        inner.client_free_bytes()
     }
 
     fn buffer_bytes(&self) -> usize {
         let inner = self.inner.lock();
-        inner.ring_len - RING_GUARD
+        inner.to_client_bytes(inner.ring_len - RING_GUARD)
     }
 
     fn queued_bytes(&self) -> usize {
         let mut inner = self.inner.lock();
         inner.poll_progress();
-        inner.exposed_queued()
+        inner.to_client_bytes(inner.exposed_queued())
     }
 
     fn delay_bytes(&self) -> usize {
         let mut inner = self.inner.lock();
         inner.poll_progress();
-        inner.queued
+        inner.to_client_bytes(inner.queued)
     }
 
     fn is_playing(&self) -> bool {
@@ -2534,11 +2868,17 @@ impl AudioScheme for HdaDevice {
     }
 
     fn rewind(&self, bytes: usize) -> DeviceResult<usize> {
-        Ok(self.inner.lock().rewind_bytes(bytes))
+        let mut inner = self.inner.lock();
+        let link = inner.to_link_bytes(bytes);
+        let done = inner.rewind_bytes(link);
+        Ok(inner.to_client_bytes(done))
     }
 
     fn forward(&self, bytes: usize) -> DeviceResult<usize> {
-        Ok(self.inner.lock().forward_bytes(bytes))
+        let mut inner = self.inner.lock();
+        let link = inner.to_link_bytes(bytes);
+        let done = inner.forward_bytes(link);
+        Ok(inner.to_client_bytes(done))
     }
 
     fn pause(&self) -> DeviceResult {
@@ -2645,13 +2985,19 @@ impl AudioScheme for HdaDevice {
         );
         let _ = writeln!(
             out,
-            "[gpusnd] ring: running={} queued={} (pad {} B of driver silence ahead of it) wp={} rate={} ch={} gap={}",
+            "[gpusnd] ring: running={} queued={} (pad {} B of driver silence ahead of it) wp={} rate={} ch={} client={} Hz src={} gap={}",
             inner.running,
             inner.exposed_queued(),
             inner.queued - inner.exposed_queued(),
             inner.wp,
             inner.rate,
             inner.channels,
+            inner.client_rate,
+            if inner.src.is_some() {
+                "resampling"
+            } else {
+                "passthrough"
+            },
             if inner.gap_since_us != 0 {
                 alloc::format!(
                     "{} ms (engine idling on silence, stops at {} ms)",

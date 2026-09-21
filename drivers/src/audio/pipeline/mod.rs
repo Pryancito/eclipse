@@ -11,7 +11,8 @@
 //!   pass-through fast path at 0 dB (`src/audio/volume` in SOF).
 //! * [`src`]: a polyphase FIR sample-rate converter (`src/audio/src` in SOF),
 //!   one oversampled prototype low-pass indexed per output sample, fixed-point,
-//!   streaming. Not yet wired into a device path -- that is the follow-up.
+//!   streaming. Wired into `hda.rs` as a fixed-rate sink: the link runs at
+//!   48 kHz and a client at any other rate is converted on the way in.
 //! * [`mixer`]: saturating N-to-one PCM summing (`src/audio/mixer.c` in SOF),
 //!   `i32` accumulate then clamp once. What a kernel-side mixer is built from,
 //!   so more than one client can share a card; wiring it is the follow-up.
