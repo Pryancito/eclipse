@@ -500,7 +500,9 @@ impl Syscall<'_> {
         );
         use core::time::Duration;
         use kernel_hal::{thread, timer};
-        let duration: Duration = req.read()?.into();
+        // Same rule as `nanosleep`: reject an out-of-range `timespec`
+        // instead of sleeping for whatever it happens to convert to.
+        let duration: Duration = req.read()?.try_into_duration()?;
         let clockid = ClockId::from(clockid);
         let flags = ClockFlags::from(flags);
         info!("clockid={:?}, flags={:?}", clockid, flags,);
