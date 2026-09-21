@@ -2335,6 +2335,9 @@ impl VmMapping {
             let cap = self.inner.lock().flags.scratch_capacity();
             (Vec::with_capacity(cap), Vec::with_capacity(cap))
         };
+        // Pages whose PTE we drop below, for the builds that have to put them
+        // straight back (see `recommit_dropped`). Stays empty everywhere else.
+        let mut dropped: Vec<usize> = Vec::new();
         let mut inner = self.inner.lock();
         let mut pg_table = self.page_table.lock();
         // mmu-gather: defer the cross-CPU shootdown to one flush after the
@@ -2395,6 +2398,9 @@ impl VmMapping {
             };
             if unowned_frame && new_flags.contains(MMUFlags::WRITE) {
                 pg_table.unmap_no_shootdown(va).ignore().unwrap();
+                if cfg!(feature = "libos") {
+                    dropped.push(i);
+                }
             } else {
                 pg_table
                     .update_no_shootdown(va, None, Some(new_flags))
@@ -2405,6 +2411,44 @@ impl VmMapping {
         if start_index < end_index {
             pg_table.remote_flush_all();
         }
+        drop(pg_table);
+        drop(inner);
+        if !dropped.is_empty() {
+            self.recommit_dropped(&dropped);
+        }
+    }
+
+    /// Re-map the pages [`protect`](Self::protect) had to drop, for a build
+    /// with no demand paging.
+    ///
+    /// On hardware the dropped PTE IS the mechanism: the next store faults and
+    /// `commit_page(WRITE)` performs the copy the read-only PTE existed to
+    /// force. libos has no page-fault path at all — its `PageTable` is a thin
+    /// wrapper over the HOST's mmap/munmap/mprotect and nothing turns the
+    /// resulting SIGSEGV back into a fault — so an absent page kills the whole
+    /// kernel at the first access. The copy has to happen here instead, at the
+    /// same moment, with the new flags already stored in `inner.flags`.
+    fn recommit_dropped(&self, indices: &[usize]) {
+        let _ = self.vmo.commit_pages_with(&mut |commit| {
+            let inner = self.inner.lock();
+            let mut page_table = self.page_table.lock();
+            let page_num = inner.size / PAGE_SIZE;
+            let vmo_offset = inner.vmo_offset / PAGE_SIZE;
+            for &i in indices {
+                if i >= page_num {
+                    continue;
+                }
+                let paddr = commit(vmo_offset + i, inner.flags[i])?;
+                page_table
+                    .map(
+                        Page::new_aligned(inner.addr + i * PAGE_SIZE, BASE_PAGE_SIZE),
+                        paddr,
+                        inner.flags[i],
+                    )
+                    .expect("failed to map");
+            }
+            Ok(())
+        });
     }
 
     /// `madvise(MADV_DONTNEED)` for the sub-range `[begin, end)` of this mapping:
