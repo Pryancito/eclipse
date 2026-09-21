@@ -176,14 +176,18 @@ impl Syscall<'_> {
                 Ok(0)
             }
             _ => {
-                let sem = &sem_array[num];
+                // `num` comes from userspace. This used to index the set
+                // directly, so `semctl(id, 9999, GETVAL)` from any process was
+                // a kernel panic; semctl(2) says EINVAL. Its sibling `semop`
+                // had the check all along — see `SemArray::get_sem`.
+                let sem = sem_array.get_sem(num).ok_or(LxError::EINVAL)?;
                 match cmd {
                     SemctlCmds::GETPID => Ok(sem.get_pid()),
                     SemctlCmds::GETVAL => Ok(sem.get() as usize),
                     SemctlCmds::GETNCNT => Ok(sem.get_ncnt()),
                     SemctlCmds::GETZCNT => Ok(0),
                     SemctlCmds::SETVAL => {
-                        sem.set(arg as isize);
+                        sem.set(setval_from_arg(arg)?);
                         sem.set_pid(self.zircon_process().id() as usize);
                         sem_array.ctime();
                         Ok(0)
@@ -342,7 +346,11 @@ impl Syscall<'_> {
             shmflg,
             self.zircon_process().id() as u32,
         )?;
-        let id = self.linux_process().shm_add(shared_guard);
+        // The id is system-wide: `shmget` hands out a number that names the
+        // same segment in every process, because passing it to another
+        // program is the whole mechanism. See `shm_register`.
+        let id = linux_object::ipc::shm_register(&shared_guard)?;
+        self.linux_process().shm_add(id, shared_guard);
         Ok(id)
     }
 
@@ -358,7 +366,14 @@ impl Syscall<'_> {
         // space — a layout mutation a concurrent fork must not race. Taken
         // before the `inner`-touching shm lookup (global lock order).
         let _aspace = self.linux_process().aspace_lock().lock();
-        let mut shm_identifier = self.linux_process().shm_get(id).ok_or(LxError::EINVAL)?;
+        // Looked up system-wide, NOT in this process's own map: the id may
+        // have been created by another program and passed here -- which is
+        // what the X11 shared-memory extension does with every image.
+        let guard = linux_object::ipc::shm_lookup(id).ok_or(LxError::EINVAL)?;
+        let mut shm_identifier = self
+            .linux_process()
+            .shm_get(id)
+            .unwrap_or(ShmIdentifier { addr: 0, guard });
 
         let proc = self.zircon_process();
         let vmar = proc.vmar();
@@ -440,8 +455,12 @@ impl Syscall<'_> {
     /// performs the control operation specified by cmd on the shared memory segment whose identifier is given in id
     pub fn sys_shmctl(&self, id: usize, cmd: usize, buffer: usize) -> SysResult {
         info!("shmctl: id: {}, cmd: {} buffer: {:#x}", id, cmd, buffer);
-        let shm_identifier = self.linux_process().shm_get(id).ok_or(LxError::EINVAL)?;
-        let shm_guard = shm_identifier.guard.lock();
+        // System-wide, like `shmat`: a program may be asked to remove or stat
+        // a segment it never created itself.
+        let guard = linux_object::ipc::shm_lookup(id)
+            .or_else(|| self.linux_process().shm_get(id).map(|i| i.guard))
+            .ok_or(LxError::EINVAL)?;
+        let shm_guard = guard.lock();
         let cmd = match ShmctlCmds::try_from(cmd) {
             Ok(t) => t,
             Err(_) => {
@@ -452,7 +471,13 @@ impl Syscall<'_> {
         match cmd {
             ShmctlCmds::IPC_RMID => {
                 shm_guard.remove();
-                self.linux_process().shm_pop(id);
+                linux_object::ipc::shm_unregister(id);
+                // The attachment stays. shmget(2): the segment is destroyed
+                // only once the last process detaches, and every user of the
+                // X11 extension removes the id the moment it has attached --
+                // dropping the attachment here left `shmdt` with nothing to
+                // find, so the mapping was never torn down and each image
+                // leaked its address range for the life of the process.
                 Ok(0)
             }
             ShmctlCmds::IPC_SET => {
@@ -478,6 +503,25 @@ impl Syscall<'_> {
                 Err(LxError::EINVAL)
             }
         }
+    }
+}
+
+/// Largest value a semaphore may be set to (`SEMVMX`, include/uapi/linux/sem.h).
+const SEMVMX: i32 = 32767;
+
+/// What `semctl(.., SETVAL, arg)` makes of its `arg`.
+///
+/// `arg` is the `int val` member of `union semun`, and a variadic argument
+/// arrives in a whole register: reading all 64 bits of it turns the `-1` a
+/// program passes by mistake into 4294967295 and sets the semaphore to it,
+/// rather than answering. Linux reads the `int`, and `semctl(2)` says ERANGE
+/// for anything outside `[0, SEMVMX]`.
+fn setval_from_arg(arg: usize) -> Result<isize, LxError> {
+    let val = arg as u32 as i32;
+    if (0..=SEMVMX).contains(&val) {
+        Ok(val as isize)
+    } else {
+        Err(LxError::ERANGE)
     }
 }
 
@@ -577,3 +621,45 @@ const MSG_NOERROR: usize = 0o10000;
 /// msgrcv(2) `MSG_EXCEPT`: with msgtyp > 0, take the first message of a
 /// *different* type.
 const MSG_EXCEPT: usize = 0o20000;
+
+/// The System V IPC syscalls, tested where they can be: the parts that are a
+/// decision about a userspace value rather than a walk through process state.
+///
+/// The bounds check `sys_semctl` was missing lives in
+/// `linux_object::ipc::SemArray::get_sem` and is tested there; the `Index`
+/// impl it used to go through is gone, so the line cannot be written again.
+#[cfg(test)]
+mod ipc_tests {
+    use super::*;
+
+    #[test]
+    fn setval_takes_the_int_and_not_the_register() {
+        assert_eq!(setval_from_arg(0), Ok(0));
+        assert_eq!(setval_from_arg(1), Ok(1));
+        assert_eq!(setval_from_arg(SEMVMX as usize), Ok(SEMVMX as isize));
+    }
+
+    #[test]
+    fn setval_refuses_a_negative_value() {
+        // `semctl(id, 0, SETVAL, -1)`: the register holds 0xffff_ffff_ffff_ffff
+        // on a 64-bit caller and 0xffff_ffff sign-extended from the `int` on
+        // the wire either way. Both are -1, and neither may become 4294967295.
+        assert_eq!(setval_from_arg(usize::MAX), Err(LxError::ERANGE));
+        assert_eq!(setval_from_arg(0xffff_ffff), Err(LxError::ERANGE));
+        assert_eq!(setval_from_arg(-1i64 as usize), Err(LxError::ERANGE));
+        assert_eq!(setval_from_arg(0x8000_0000), Err(LxError::ERANGE));
+    }
+
+    #[test]
+    fn setval_refuses_a_value_above_semvmx() {
+        assert_eq!(setval_from_arg(SEMVMX as usize + 1), Err(LxError::ERANGE));
+        assert_eq!(setval_from_arg(70000), Err(LxError::ERANGE));
+    }
+
+    #[test]
+    fn setval_ignores_the_high_half_of_the_register() {
+        // Whatever a variadic caller left in the top 32 bits is not part of
+        // the `int`, so it must neither reach the semaphore nor cause ERANGE.
+        assert_eq!(setval_from_arg(0xdead_beef_0000_0005), Ok(5));
+    }
+}

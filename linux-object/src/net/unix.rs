@@ -749,28 +749,45 @@ impl Socket for UnixSocketState {
     }
 
     fn recv_fds(&self, max: usize) -> Vec<Arc<dyn FileLike>> {
-        if max == 0 {
-            return Vec::new();
-        }
         let mut inner = self.inner.lock();
         let mut out: Vec<Arc<dyn FileLike>> = Vec::new();
         // Deliver an fd batch once the reader has consumed at least the first
         // byte of the message it was attached to (`offset` is that first byte's
-        // index, so the gate is strict `<`), and only whole batches that fit in
-        // the caller's fd budget. This hands the fd to the same recvmsg that
-        // returns the message's leading bytes, as Linux does.
+        // index, so the gate is strict `<`). This hands the fd to the same
+        // recvmsg that returns the message's leading bytes, as Linux does.
+        //
+        // A batch larger than the caller's fd budget used to be refused whole,
+        // and it sits at the HEAD of the queue: the fds never came out, and
+        // neither did any batch behind them — fd passing on that socket was
+        // over for good. A caller sizes its control buffer for the fds it
+        // expects, so one message carrying more than that wedged the
+        // connection. Now the budget takes what fits and the rest stays at the
+        // head, keeping its offset, for the next call.
+        //
+        // (Linux instead drops the leftovers and sets `MSG_CTRUNC`. Holding
+        // them is the more conservative divergence: nothing is lost, and a
+        // caller that asks again gets the rest.)
         loop {
-            let take = match inner.pending_fds.front() {
-                Some((offset, batch)) => {
-                    *offset < inner.total_read && out.len() + batch.len() <= max
-                }
-                None => false,
-            };
-            if !take {
+            let room = max - out.len();
+            if room == 0 {
                 break;
             }
-            let (_, batch) = inner.pending_fds.pop_front().unwrap();
-            out.extend(batch);
+            let ready = match inner.pending_fds.front() {
+                Some((offset, _)) => *offset < inner.total_read,
+                None => false,
+            };
+            if !ready {
+                break;
+            }
+            let (offset, mut batch) = inner.pending_fds.pop_front().unwrap();
+            if batch.len() <= room {
+                out.extend(batch);
+            } else {
+                let rest = batch.split_off(room);
+                out.extend(batch);
+                inner.pending_fds.push_front((offset, rest));
+                break;
+            }
         }
         out
     }
@@ -1157,5 +1174,183 @@ mod tests {
             }
             other => panic!("POLLOUT expected Ready(write), got {:?}", other),
         }
+    }
+}
+
+/// Passing a file descriptor from one process to another over a unix socket —
+/// `SCM_RIGHTS` — had no tests, and it is how a graphical desktop hands
+/// buffers around: DRI3 passes a GPU buffer's fd over the X11 socket, `wl_shm`
+/// passes a memfd over the Wayland one. None of it runs in CI, which has no
+/// display.
+///
+/// The bug these found: a batch of descriptors larger than the receiver's
+/// control buffer was refused **whole**, and it sits at the head of the queue.
+/// So the descriptors never came out, and neither did any batch behind them —
+/// descriptor passing on that connection was over for good, from one message.
+/// A caller sizes its control buffer for the number of fds it expects, so one
+/// message carrying more than that was enough.
+#[cfg(test)]
+mod fd_passing_tests {
+    use super::*;
+
+    /// Two connected endpoints: bytes written to `.0` arrive at `.1`.
+    fn pair() -> (Arc<UnixSocketState>, Arc<UnixSocketState>) {
+        let a = UnixSocketState::new();
+        let b = UnixSocketState::new();
+        UnixSocketState::connect_pair(&a, &b);
+        (a, b)
+    }
+
+    /// Some file to pass. A socket is one, and it needs no filesystem.
+    fn a_file() -> Arc<dyn FileLike> {
+        UnixSocketState::new()
+    }
+
+    /// Whether two handles are the same object — the only thing that matters
+    /// about a passed descriptor.
+    fn same(x: &Arc<dyn FileLike>, y: &Arc<dyn FileLike>) -> bool {
+        core::ptr::eq(Arc::as_ptr(x) as *const u8, Arc::as_ptr(y) as *const u8)
+    }
+
+    /// Attach `fds` to the next message and send `bytes` with it.
+    fn send_with(from: &Arc<UnixSocketState>, fds: Vec<Arc<dyn FileLike>>, bytes: &[u8]) {
+        Socket::send_fds(&**from, fds).expect("send_fds");
+        Socket::write(&**from, bytes, None).expect("write");
+    }
+
+    /// Read `n` bytes on `at`.
+    async fn recv_bytes(at: &Arc<UnixSocketState>, n: usize) -> usize {
+        let mut buf = vec![0u8; n];
+        Socket::read(&**at, &mut buf).await.0.expect("read")
+    }
+
+    #[async_std::test]
+    async fn a_descriptor_arrives_with_the_message_it_was_sent_with() {
+        let (a, b) = pair();
+        let f = a_file();
+        send_with(&a, vec![f.clone()], b"hola");
+        // Before the receiver has read a byte of that message, the descriptor
+        // is not hers yet: Linux delivers it with the recvmsg that returns the
+        // message's first data byte.
+        assert!(Socket::recv_fds(&*b, 8).is_empty());
+        assert_eq!(recv_bytes(&b, 4).await, 4);
+        let got = Socket::recv_fds(&*b, 8);
+        assert_eq!(got.len(), 1);
+        assert!(same(&got[0], &f));
+    }
+
+    #[async_std::test]
+    async fn a_batch_bigger_than_the_receivers_buffer_no_longer_wedges_the_socket() {
+        // This is the bug. With a control buffer sized for one descriptor, the
+        // three-descriptor batch used to come back empty every single time,
+        // for ever, and block everything queued behind it.
+        let (a, b) = pair();
+        let f: Vec<Arc<dyn FileLike>> = (0..3).map(|_| a_file()).collect();
+        send_with(&a, f.clone(), b"hola");
+        assert_eq!(recv_bytes(&b, 4).await, 4);
+
+        let mut got: Vec<Arc<dyn FileLike>> = Vec::new();
+        for _ in 0..3 {
+            let round = Socket::recv_fds(&*b, 1);
+            assert_eq!(round.len(), 1, "one descriptor per call, and never zero");
+            got.extend(round);
+        }
+        assert!(Socket::recv_fds(&*b, 1).is_empty());
+        for (want, have) in f.iter().zip(got.iter()) {
+            assert!(same(want, have), "and in the order they were sent");
+        }
+    }
+
+    #[async_std::test]
+    async fn what_does_not_fit_stays_at_the_head_and_does_not_block_the_rest() {
+        let (a, b) = pair();
+        let first: Vec<Arc<dyn FileLike>> = (0..3).map(|_| a_file()).collect();
+        let second = a_file();
+        send_with(&a, first.clone(), b"uno");
+        send_with(&a, vec![second.clone()], b"dos");
+        assert_eq!(recv_bytes(&b, 6).await, 6);
+
+        // Room for two: two of the first batch come out, the third stays put,
+        // and the later batch stays behind it rather than jumping the queue.
+        let got = Socket::recv_fds(&*b, 2);
+        assert_eq!(got.len(), 2);
+        assert!(same(&got[0], &first[0]) && same(&got[1], &first[1]));
+
+        let rest = Socket::recv_fds(&*b, 8);
+        assert_eq!(rest.len(), 2);
+        assert!(same(&rest[0], &first[2]));
+        assert!(same(&rest[1], &second));
+    }
+
+    #[async_std::test]
+    async fn a_receiver_with_no_room_takes_nothing_and_loses_nothing() {
+        // A recvmsg with no control buffer at all asks for zero descriptors.
+        // They must still be there for the call that does ask.
+        let (a, b) = pair();
+        let f = a_file();
+        send_with(&a, vec![f.clone()], b"hola");
+        assert_eq!(recv_bytes(&b, 4).await, 4);
+        assert!(Socket::recv_fds(&*b, 0).is_empty());
+        let got = Socket::recv_fds(&*b, 4);
+        assert_eq!(got.len(), 1);
+        assert!(same(&got[0], &f));
+    }
+
+    #[async_std::test]
+    async fn each_message_hands_over_its_own_descriptors_and_not_the_next_ones() {
+        // The reason the fds are tagged with a byte offset at all: a peer that
+        // reads a header first and the body second must get the first
+        // message's descriptor with the first message.
+        let (a, b) = pair();
+        let one = a_file();
+        let two = a_file();
+        send_with(&a, vec![one.clone()], b"aaaa");
+        send_with(&a, vec![two.clone()], b"bbbb");
+
+        assert_eq!(recv_bytes(&b, 4).await, 4);
+        let got = Socket::recv_fds(&*b, 8);
+        assert_eq!(got.len(), 1);
+        assert!(same(&got[0], &one));
+
+        assert_eq!(recv_bytes(&b, 4).await, 4);
+        let got = Socket::recv_fds(&*b, 8);
+        assert_eq!(got.len(), 1);
+        assert!(same(&got[0], &two));
+    }
+
+    #[async_std::test]
+    async fn a_descriptor_sent_with_a_message_nobody_has_read_yet_waits() {
+        let (a, b) = pair();
+        send_with(&a, vec![a_file()], b"aaaa");
+        send_with(&a, vec![a_file()], b"bbbb");
+        // Only the first message has been read, so only its descriptor is due.
+        assert_eq!(recv_bytes(&b, 4).await, 4);
+        assert_eq!(Socket::recv_fds(&*b, 8).len(), 1);
+        assert!(Socket::recv_fds(&*b, 8).is_empty());
+    }
+
+    #[test]
+    fn passing_a_descriptor_with_no_peer_is_enotconn() {
+        // Not a panic and not a silent success: the caller has to learn that
+        // the file did not go anywhere.
+        let lone = UnixSocketState::new();
+        assert!(matches!(
+            Socket::send_fds(&*lone, vec![a_file()]),
+            Err(LxError::ENOTCONN)
+        ));
+    }
+
+    #[test]
+    fn passing_no_descriptors_is_a_no_op_even_without_a_peer() {
+        // `sendmsg` with a control buffer that holds no SCM_RIGHTS must not
+        // start failing because of it.
+        let lone = UnixSocketState::new();
+        assert!(Socket::send_fds(&*lone, Vec::new()).is_ok());
+    }
+
+    #[test]
+    fn a_socket_with_nothing_queued_hands_back_nothing() {
+        let (_a, b) = pair();
+        assert!(Socket::recv_fds(&*b, 8).is_empty());
     }
 }

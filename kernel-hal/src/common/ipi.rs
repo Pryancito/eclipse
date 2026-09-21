@@ -23,8 +23,52 @@ lazy_static::lazy_static! {
         .collect();
 }
 
-pub(crate) fn ipi_queue(cpuid: usize) -> &'static IRQueue {
-    &IPI_QUEUE[cpuid]
+/// The IPI queue of dense logical CPU `cpuid`, or `None` when no such CPU
+/// exists.
+///
+/// Bounds-checked because the id is not always ours to trust. `cpu_id()` reads
+/// the LAPIC, and reading it through the wrong interface is a documented
+/// failure on this kernel: see [`SMP_ENABLED`] for the x2APIC window that made
+/// every CPU report the same bogus id on real hardware. Every accessor in this
+/// module already re-checks the id for that reason; this makes the check part
+/// of the lookup instead, so a new caller cannot forget it. Indexing straight
+/// into the table would panic — and the callers run in an interrupt handler,
+/// or inside a ticket lock's spin pump with that lock held, where a panic
+/// takes the machine with it and buries the cause.
+pub(crate) fn ipi_queue(cpuid: usize) -> Option<&'static IRQueue> {
+    IPI_QUEUE.get(cpuid)
+}
+
+/// Publish `reason` into `cpuid`'s IPI queue, or record that it could not be
+/// published. Returns whether `cpuid` names a CPU at all.
+///
+/// This is the receiving half of the shootdown contract and it belongs in one
+/// place: **a payload that does not reach the queue must set the target's
+/// overflow bit**, because that bit is what makes the target's next drain a
+/// full flush instead of the precise per-page one. Drop the payload without
+/// the bit and the target never invalidates the page, while the initiator —
+/// which only learns of a failed *send* — goes on to free the frame.
+///
+/// Each architecture used to write this out itself, and they had drifted:
+/// x86_64 and aarch64 noted the overflow, riscv returned an error and noted
+/// nothing. See `send_ipi` in `bare/arch/*/interrupt.rs`.
+pub fn publish_ipi_entry(cpuid: usize, reason: IpiEntry) -> bool {
+    let Some(queue) = ipi_queue(cpuid) else {
+        return false;
+    };
+    let delivered = match queue.alloc_entry() {
+        Some(idx) => {
+            *queue.entry_at(idx) = reason;
+            queue.commit_entry(idx)
+        }
+        None => false,
+    };
+    if !delivered {
+        // Queue full, or the commit lost the publish race: the receiver cannot
+        // learn this entry's payload, so force its next ack to full-flush.
+        note_ipi_queue_overflow(cpuid);
+    }
+    true
 }
 
 /// Arm the hardware write-watch on an IPI ring's `size` word, so the next
@@ -55,13 +99,21 @@ pub(crate) fn ipi_queue(cpuid: usize) -> &'static IRQueue {
 pub fn arm_queue_watch() -> bool {
     // `&...size`, not the struct address: `MpscQueue` is `repr(Rust)` and the
     // compiler is free to put `size` anywhere in it.
-    let addr = &IPI_QUEUE[0].size as *const usize as usize;
+    let Some(q) = ipi_queue(0) else {
+        return false;
+    };
+    let addr = &q.size as *const usize as usize;
     crate::watchpoint::watch_write(addr, 8)
 }
 
 pub(crate) fn ipi_reason() -> Vec<usize> {
     let cpu_id = crate::cpu::cpu_id() as usize;
-    let queue = ipi_queue(cpu_id);
+    // An id past the table has no queue to drain, so there is nothing to
+    // report. Every other accessor here already returns rather than index; this
+    // one used to index, and it runs straight out of the IPI vector.
+    let Some(queue) = ipi_queue(cpu_id) else {
+        return Vec::new();
+    };
     queue.consume_entrys().iter().map(|entry| entry.1).collect()
 }
 
@@ -238,7 +290,9 @@ pub fn shootdown_queue_state(cpu: usize) -> (usize, usize, usize, bool, bool) {
     if cpu >= MAX_CORE_NUM {
         return (0, 0, 0, false, false);
     }
-    let q = ipi_queue(cpu);
+    let Some(q) = ipi_queue(cpu) else {
+        return (0, 0, 0, false, false);
+    };
     (
         q.chead(),
         q.ptail(),
@@ -306,7 +360,9 @@ pub fn tlb_shootdown_pump() {
     if me >= MAX_CORE_NUM || IPI_READY.load(Ordering::Relaxed) & (1u64 << me) == 0 {
         return;
     }
-    let q = ipi_queue(me);
+    let Some(q) = ipi_queue(me) else {
+        return;
+    };
     if q.chead() == q.ptail() && IPI_QUEUE_OVERFLOW.load(Ordering::Relaxed) & (1u64 << me) == 0 {
         return;
     }
@@ -332,7 +388,9 @@ fn tlb_shootdown_ack_on(me: usize) {
     // rescue would have found the flag set. Peek only (the overflow bit is
     // NOT consumed here); the flagged path below re-checks after consuming.
     {
-        let q = ipi_queue(me);
+        let Some(q) = ipi_queue(me) else {
+            return;
+        };
         if q.chead() == q.ptail() && IPI_QUEUE_OVERFLOW.load(Ordering::Acquire) & (1u64 << me) == 0
         {
             return;
@@ -354,7 +412,9 @@ fn tlb_shootdown_ack_on(me: usize) {
         0
     };
     // Non-allocating bounded drain of this CPU's queue (single consumer).
-    let q = ipi_queue(me);
+    let Some(q) = ipi_queue(me) else {
+        return;
+    };
     let mut vpns = [0usize; MAX_PRECISE_SHOOTDOWN];
     let mut n_vpns = 0usize;
     let mut precise = true;
@@ -488,7 +548,9 @@ pub fn tlb_shootdown_ack_nmi() {
     if me >= MAX_CORE_NUM {
         return;
     }
-    let q = ipi_queue(me);
+    let Some(q) = ipi_queue(me) else {
+        return;
+    };
     // The single-consumer drain may only run when no other drain is in flight
     // on this CPU (the NMI may have interrupted a pump/IRQ ack mid-queue).
     if !SHOOTDOWN_ACK_ACTIVE[me].load(Ordering::SeqCst)
@@ -653,7 +715,7 @@ pub fn remote_flush_tlb_aspace(vaddr: Option<usize>, aspace: Option<usize>) {
                 cpu,
             ));
         } else {
-            goal[cpu] = ipi_queue(cpu).ptail() as u64;
+            goal[cpu] = ipi_queue(cpu).map_or(0, |q| q.ptail() as u64);
             // Overflow does not advance `ptail`. If this send bumped the
             // overflow generation, wait for a drain that consumed it — not
             // merely for `SEQ >= ptail`, which a previous drain may already
@@ -705,8 +767,9 @@ pub fn remote_flush_tlb_aspace(vaddr: Option<usize>, aspace: Option<usize>) {
         }
         // Self-pump: if a peer asked US to flush, do it now (non-allocating) so
         // it isn't blocked on our ack while we block on its.
-        let q = ipi_queue(me);
-        if q.chead() < q.ptail() || IPI_QUEUE_OVERFLOW.load(Ordering::Relaxed) & (1u64 << me) != 0 {
+        if ipi_queue(me).is_some_and(|q| q.chead() < q.ptail())
+            || IPI_QUEUE_OVERFLOW.load(Ordering::Relaxed) & (1u64 << me) != 0
+        {
             tlb_shootdown_ack();
         }
         spins += 1;
@@ -806,5 +869,299 @@ impl From<IpiReason> for IpiEntry {
             IpiReason::TlbShutdown { vpn: info } => (TYPE_TLB_SHUTDOWN << TYPE_SHIFT) | info,
             IpiReason::Invalid => 0,
         }
+    }
+}
+
+/// The masks in this module are `u64`, so a CPU above 63 has no overflow bit,
+/// no online bit and no ready bit — and every one of those guards is spelled
+/// `< 64` rather than `< MAX_CORE_NUM`. Raising the CPU limit past 64 without
+/// widening them would leave those CPUs with a queue that exists, an id that
+/// passes the bounds check, and a dropped shootdown every time the queue
+/// fills. Caught here rather than in a test, because it is a property of the
+/// constants and should fail the build.
+const _: () = assert!(
+    MAX_CORE_NUM <= 64,
+    "IPI masks are u64: widen them before raising MAX_CORE_NUM past 64"
+);
+
+/// The TLB-shootdown protocol had no tests, on 810 lines whose own comments
+/// record what its bugs cost: torn pages under fork, and full-machine freezes
+/// with nothing on the serial line. None of it runs in CI — the emulator boots
+/// one or two cores and never fills an IPI queue — so the only place these
+/// paths execute is Moebius's machine.
+///
+/// Two things they pin down, both found by writing them:
+///
+/// 1. **A payload that does not fit must still set the overflow bit.** That bit
+///    is the entire reason a full queue is survivable: it turns the target's
+///    next drain into a full flush. riscv's `send_ipi` dropped the payload and
+///    returned an error instead, and the initiator's response to a failed send
+///    is to stop waiting for that CPU and free the frame — so the page was
+///    never invalidated there. `publish_ipi_entry` is now the only place that
+///    decision is written.
+/// 2. **A CPU id is not to be trusted with an index.** `ipi_reason` indexed the
+///    queue table with `cpu_id()` raw, from inside the IPI vector, while every
+///    sibling accessor bounds-checked it first — against a failure this kernel
+///    has actually seen (see `SMP_ENABLED`).
+///
+/// These tests share the module's global queues and masks, so they take
+/// [`test_lock`] and each queue test owns a distinct CPU id.
+#[cfg(test)]
+mod ipi_tests {
+    use super::*;
+
+    /// The globals here (the queue table, `CPU_ONLINE`, `IPI_READY`, the
+    /// overflow mask) are shared, and CI runs the suite with `--test-threads=1`
+    /// so it would never notice. Serialize regardless.
+    fn test_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Distinct CPU ids per queue test, so one test's entries are never
+    /// another's. Counts down from the top of the table.
+    fn scratch_cpu(n: usize) -> usize {
+        MAX_CORE_NUM - 1 - n
+    }
+
+    fn drain(cpu: usize) {
+        let q = ipi_queue(cpu).unwrap();
+        q.discard_entrys();
+        IPI_QUEUE_OVERFLOW.fetch_and(!(1u64 << cpu), Ordering::SeqCst);
+    }
+
+    // ── the wire format ────────────────────────────────────────────────────
+
+    #[test]
+    fn every_reason_survives_the_round_trip() {
+        for reason in [
+            IpiReason::Invalid,
+            IpiReason::MockBlock { block_info: 0 },
+            IpiReason::MockBlock { block_info: 0x1234 },
+            IpiReason::TlbShutdown { vpn: 0 },
+            IpiReason::TlbShutdown { vpn: 1 },
+            IpiReason::TlbShutdown { vpn: 0xdead_beef },
+        ] {
+            let wire: IpiEntry = reason.into();
+            assert_eq!(
+                IpiReason::from(wire),
+                reason,
+                "{:?} did not round-trip",
+                reason
+            );
+        }
+    }
+
+    #[test]
+    fn the_full_flush_sentinel_is_not_the_empty_slot() {
+        // `IPI_BUFFERS` starts zeroed and a drain reads every index in
+        // `chead..ptail`, so a slot that was never written must decode to
+        // something that asks for nothing. `TlbShutdown { vpn: 0 }` means
+        // "flush everything", so the two must not share an encoding.
+        let empty: IpiEntry = 0;
+        assert_eq!(IpiReason::from(empty), IpiReason::Invalid);
+        let full_flush: IpiEntry = IpiReason::TlbShutdown { vpn: 0 }.into();
+        assert_ne!(full_flush, empty);
+        assert_eq!(
+            IpiReason::from(full_flush),
+            IpiReason::TlbShutdown { vpn: 0 }
+        );
+    }
+
+    #[test]
+    fn an_unknown_type_decodes_to_invalid_not_to_a_flush() {
+        // Garbage in a slot must not be read as a shootdown request: a decode
+        // that guessed `TlbShutdown` would have the drain invalidate an
+        // arbitrary page, and one that guessed vpn 0 would full-flush on every
+        // corrupt entry.
+        for ty in [0x3usize, 0x7, 0xf] {
+            let wire = (ty << TYPE_SHIFT) | 0x41;
+            assert_eq!(IpiReason::from(wire), IpiReason::Invalid, "type {:#x}", ty);
+        }
+    }
+
+    #[test]
+    fn the_highest_kernel_page_number_still_fits_beside_the_type_field() {
+        // `vpn` is `vaddr >> 12`, so it needs 52 bits; the decode masks the
+        // payload to exactly that and the type sits above it. Narrowing either
+        // would truncate the address of the very mappings this is used for —
+        // the kernel half, whose vpns have every one of those 52 bits set.
+        let top_vaddr = usize::MAX;
+        let vpn = top_vaddr >> 12;
+        let wire: IpiEntry = IpiReason::TlbShutdown { vpn }.into();
+        assert_eq!(IpiReason::from(wire), IpiReason::TlbShutdown { vpn });
+        assert_eq!(wire >> TYPE_SHIFT, TYPE_TLB_SHUTDOWN);
+    }
+
+    // ── the queue table ────────────────────────────────────────────────────
+
+    #[test]
+    fn a_cpu_past_the_table_has_no_queue_instead_of_a_panic() {
+        let _g = test_lock();
+        for cpu in 0..MAX_CORE_NUM {
+            assert!(ipi_queue(cpu).is_some(), "cpu {} should have a queue", cpu);
+        }
+        assert!(ipi_queue(MAX_CORE_NUM).is_none());
+        assert!(ipi_queue(usize::MAX).is_none());
+        // And the diagnostics agree rather than indexing.
+        assert_eq!(shootdown_queue_state(MAX_CORE_NUM), (0, 0, 0, false, false));
+        assert_eq!(shootdown_seq_of(MAX_CORE_NUM), 0);
+        assert_eq!(shootdown_wait_mask(MAX_CORE_NUM), 0);
+        assert_eq!(shootdown_goal(MAX_CORE_NUM, 0), 0);
+        assert_eq!(shootdown_goal(0, MAX_CORE_NUM), 0);
+    }
+
+    #[test]
+    fn a_published_entry_arrives_with_its_payload_intact() {
+        let _g = test_lock();
+        let cpu = scratch_cpu(0);
+        drain(cpu);
+        let reason: IpiEntry = IpiReason::TlbShutdown { vpn: 0x5678 }.into();
+        assert!(publish_ipi_entry(cpu, reason));
+        let q = ipi_queue(cpu).unwrap();
+        let (chead, ptail) = (q.chead(), q.ptail());
+        assert_eq!(ptail - chead, 1, "exactly one entry should be queued");
+        assert_eq!(
+            IpiReason::from(*q.entry_at(chead)),
+            IpiReason::TlbShutdown { vpn: 0x5678 }
+        );
+        // Publishing does not raise the overflow bit on the way.
+        assert_eq!(IPI_QUEUE_OVERFLOW.load(Ordering::SeqCst) & (1u64 << cpu), 0);
+        drain(cpu);
+    }
+
+    #[test]
+    fn a_full_queue_sets_the_overflow_bit_rather_than_losing_the_flush() {
+        // The bug this pins: what does not fit must still be announced, or the
+        // target never flushes and the initiator frees the frame anyway.
+        let _g = test_lock();
+        let cpu = scratch_cpu(1);
+        drain(cpu);
+        let gen_before = IPI_OVERFLOW_GEN[cpu].load(Ordering::SeqCst);
+        let reason: IpiEntry = IpiReason::TlbShutdown { vpn: 1 }.into();
+        for i in 0..REASON_SIZE {
+            assert!(publish_ipi_entry(cpu, reason), "publish {} failed", i);
+        }
+        assert_eq!(
+            IPI_QUEUE_OVERFLOW.load(Ordering::SeqCst) & (1u64 << cpu),
+            0,
+            "a queue filled exactly to capacity has not overflowed"
+        );
+        // One past capacity: the CPU still exists, so the send is not an
+        // error — but the target must be told to full-flush.
+        assert!(publish_ipi_entry(cpu, reason));
+        assert_ne!(
+            IPI_QUEUE_OVERFLOW.load(Ordering::SeqCst) & (1u64 << cpu),
+            0,
+            "a dropped payload must set the overflow bit"
+        );
+        assert!(
+            IPI_OVERFLOW_GEN[cpu].load(Ordering::SeqCst) > gen_before,
+            "the overflow generation must advance, or a waiter accepts an \
+             older drain's watermark as its ack"
+        );
+        drain(cpu);
+    }
+
+    #[test]
+    fn publishing_to_a_cpu_that_does_not_exist_reports_it_and_marks_nothing() {
+        let _g = test_lock();
+        let before = IPI_QUEUE_OVERFLOW.load(Ordering::SeqCst);
+        assert!(!publish_ipi_entry(MAX_CORE_NUM, 1));
+        assert!(!publish_ipi_entry(usize::MAX, 1));
+        assert_eq!(
+            IPI_QUEUE_OVERFLOW.load(Ordering::SeqCst),
+            before,
+            "an id with no queue must not set some other CPU's bit"
+        );
+    }
+
+    #[test]
+    fn note_ipi_queue_overflow_ignores_an_id_with_no_bit() {
+        let _g = test_lock();
+        let before = IPI_QUEUE_OVERFLOW.load(Ordering::SeqCst);
+        note_ipi_queue_overflow(64);
+        note_ipi_queue_overflow(usize::MAX);
+        assert_eq!(IPI_QUEUE_OVERFLOW.load(Ordering::SeqCst), before);
+    }
+
+    // ── the CPU masks ──────────────────────────────────────────────────────
+
+    #[test]
+    fn for_each_cpu_visits_exactly_the_set_bits() {
+        let mut seen = alloc::vec::Vec::new();
+        for_each_cpu(0, |c| seen.push(c));
+        assert!(seen.is_empty(), "an empty mask targets nobody");
+
+        seen.clear();
+        for_each_cpu(0b1010_0001, |c| seen.push(c));
+        assert_eq!(seen, alloc::vec![0, 5, 7]);
+
+        // The top bit is a real CPU (MAX_CORE_NUM is 64) and must not be
+        // dropped or shifted out.
+        seen.clear();
+        for_each_cpu(1u64 << 63, |c| seen.push(c));
+        assert_eq!(seen, alloc::vec![63]);
+
+        seen.clear();
+        for_each_cpu(u64::MAX, |c| seen.push(c));
+        assert_eq!(seen.len(), 64);
+        assert_eq!(seen[0], 0);
+        assert_eq!(seen[63], 63);
+    }
+
+    #[test]
+    fn the_online_mask_counts_only_cpus_that_reported_in() {
+        let _g = test_lock();
+        let before = cpu_online_mask();
+        // The BSP is online from the start: accounting that divides by the
+        // online count must never see zero.
+        assert_ne!(before & 1, 0, "the BSP is always online");
+        assert!(online_cpu_count() >= 1);
+
+        mark_cpu_online(63);
+        assert_ne!(cpu_online_mask() & (1u64 << 63), 0);
+        assert_eq!(
+            online_cpu_count(),
+            (before | (1u64 << 63)).count_ones() as usize
+        );
+
+        // An id with no bit is ignored, not shifted: `1u64 << 64` is not a
+        // no-op, it is undefined.
+        let now = cpu_online_mask();
+        mark_cpu_online(64);
+        mark_cpu_online(usize::MAX);
+        assert_eq!(cpu_online_mask(), now);
+
+        CPU_ONLINE.store(before, Ordering::Release);
+    }
+
+    #[test]
+    fn a_cpu_is_ready_to_service_ipis_only_after_it_says_so() {
+        let _g = test_lock();
+        let before = IPI_READY.load(Ordering::Acquire);
+        let cpu = scratch_cpu(2);
+        IPI_READY.fetch_and(!(1u64 << cpu), Ordering::Release);
+        assert_eq!(IPI_READY.load(Ordering::Acquire) & (1u64 << cpu), 0);
+        mark_cpu_ipi_ready(cpu);
+        assert_ne!(IPI_READY.load(Ordering::Acquire) & (1u64 << cpu), 0);
+
+        let now = IPI_READY.load(Ordering::Acquire);
+        mark_cpu_ipi_ready(64);
+        mark_cpu_ipi_ready(usize::MAX);
+        assert_eq!(IPI_READY.load(Ordering::Acquire), now);
+
+        IPI_READY.store(before, Ordering::Release);
+    }
+
+    #[test]
+    fn smp_can_be_turned_off_and_back_on() {
+        let _g = test_lock();
+        let before = smp_enabled();
+        assert!(before, "AP bring-up defaults on");
+        set_smp_enabled(false);
+        assert!(!smp_enabled());
+        set_smp_enabled(before);
+        assert_eq!(smp_enabled(), before);
     }
 }

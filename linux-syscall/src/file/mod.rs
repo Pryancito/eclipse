@@ -16,3 +16,4 @@ mod splice;
 mod stat;
 
 use self::dir::AtFlags;
+pub(crate) use self::poll::poll_timeout_msecs;

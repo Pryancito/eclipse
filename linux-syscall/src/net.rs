@@ -1,4 +1,5 @@
 use super::*;
+use crate::outparams::hand_out_pair;
 use alloc::vec::Vec;
 use core::convert::TryInto;
 use core::mem::size_of;
@@ -77,13 +78,108 @@ fn write_sockopt_out(
     value: &[u8],
 ) -> SysResult {
     let max = optlen.read()? as usize;
-    let n = value.len().min(max);
+    let n = sockopt_out_len(max, value.len());
     if n > 0 {
         let mut dst: UserOutPtr<u8> = optval.as_addr().into();
         dst.write_array(&value[..n])?;
     }
-    optlen.write(value.len() as u32)?;
+    // Report the number of bytes actually written, not the option's full size.
+    // `sock_getsockopt()` clamps (`if (len > lv) len = lv;`) before its
+    // `put_user(len, optlen)`, and a caller that believes an `optlen` larger
+    // than the buffer it supplied goes on to read bytes the kernel never
+    // wrote — its own uninitialised stack.
+    optlen.write(n as u32)?;
     Ok(0)
+}
+
+/// How many bytes of an option value `getsockopt` copies out, which is also
+/// what it reports back through `optlen`.
+///
+/// `sock_getsockopt()` clamps (`if (len > lv) len = lv;`) before its
+/// `put_user(len, optlen)`. Reporting the option's *full* size instead, which
+/// is what this used to do, tells a caller with a smaller buffer that the
+/// kernel wrote more than it did: the caller then reads its own uninitialised
+/// stack as part of the answer. `SO_PEERCRED` into a 4-byte `int` is the case
+/// that turns up, since a `struct ucred` is 12.
+fn sockopt_out_len(requested: usize, actual: usize) -> usize {
+    actual.min(requested)
+}
+
+/// `struct cmsghdr` is `{ size_t cmsg_len; int cmsg_level; int cmsg_type; }`:
+/// 16 bytes on a 64-bit target, followed by the payload, with each message
+/// `CMSG_ALIGN`ed to 8.
+const CMSG_HDR_LEN: usize = 16;
+/// `SOL_SOCKET`, as it appears in `cmsg_level`.
+const SOL_SOCKET_LEVEL: i32 = 1;
+/// `SCM_RIGHTS`, as it appears in `cmsg_type`.
+const SCM_RIGHTS: i32 = 1;
+/// Most file descriptors one `sendmsg` may carry (`SCM_MAX_FD`,
+/// include/net/scm.h). Linux answers `EINVAL` above it; without a cap, one
+/// `sendmsg` with a 64 KiB control buffer asks the receiver to install 16000
+/// descriptors.
+const SCM_MAX_FD: usize = 253;
+
+/// Walk a control buffer and return the file descriptor numbers its
+/// `SCM_RIGHTS` messages carry, in order.
+///
+/// Everything here comes from userspace, including `cmsg_len`, so every step
+/// is checked: a length that wraps past the end of the buffer, one shorter
+/// than the header it claims to be, and an aligned step that would not move
+/// forward all stop the walk instead of slicing out of range or spinning.
+/// A malformed *tail* is simply where the walk ends, which is what
+/// `__cmsg_nxthdr()` does; only the fd count is an error, because Linux makes
+/// it one.
+fn parse_scm_rights_fds(ctrl: &[u8]) -> Result<Vec<i32>, LxError> {
+    let mut fds: Vec<i32> = Vec::new();
+    let mut off = 0usize;
+    while off + CMSG_HDR_LEN <= ctrl.len() {
+        let cmsg_len = u64::from_ne_bytes(ctrl[off..off + 8].try_into().unwrap()) as usize;
+        let level = i32::from_ne_bytes(ctrl[off + 8..off + 12].try_into().unwrap());
+        let typ = i32::from_ne_bytes(ctrl[off + 12..off + 16].try_into().unwrap());
+        let cmsg_end = match off.checked_add(cmsg_len) {
+            Some(end) if cmsg_len >= CMSG_HDR_LEN && end <= ctrl.len() => end,
+            _ => break,
+        };
+        if level == SOL_SOCKET_LEVEL && typ == SCM_RIGHTS {
+            // A trailing partial fd is not one: `as_chunks` drops it, as the
+            // kernel's `(cmsg_len - sizeof(cmsghdr)) / sizeof(int)` does.
+            for chunk in ctrl[off + CMSG_HDR_LEN..cmsg_end].as_chunks::<4>().0 {
+                if fds.len() == SCM_MAX_FD {
+                    return Err(LxError::EINVAL);
+                }
+                fds.push(i32::from_ne_bytes(*chunk));
+            }
+        }
+        // CMSG_ALIGN(cmsg_len); checked, and required to move forward so a
+        // wrapped or zero step cannot spin forever.
+        let step = match cmsg_len.checked_add(7).map(|v| v & !7) {
+            Some(s) if s > 0 => s,
+            _ => break,
+        };
+        off = match off.checked_add(step) {
+            Some(n) => n,
+            None => break,
+        };
+    }
+    Ok(fds)
+}
+
+/// Build the single `SCM_RIGHTS` control message `recvmsg` hands back for
+/// `fds`, in the layout [`parse_scm_rights_fds`] reads.
+///
+/// The two are the same 16-byte header written twice, once in each direction,
+/// which is why the tests below round-trip them against each other rather than
+/// each against a hand-written blob.
+fn build_scm_rights_cmsg(fds: &[i32]) -> Vec<u8> {
+    let cmsg_len = CMSG_HDR_LEN + fds.len() * 4;
+    let mut buf = Vec::with_capacity(cmsg_len);
+    buf.extend_from_slice(&(cmsg_len as u64).to_ne_bytes());
+    buf.extend_from_slice(&SOL_SOCKET_LEVEL.to_ne_bytes());
+    buf.extend_from_slice(&SCM_RIGHTS.to_ne_bytes());
+    for fd in fds {
+        buf.extend_from_slice(&fd.to_ne_bytes());
+    }
+    buf
 }
 
 impl Syscall<'_> {
@@ -480,50 +576,26 @@ impl Syscall<'_> {
     }
 
     /// Parse `SCM_RIGHTS` ancillary data and resolve the carried fd numbers to
-    /// the sender's open files, ready to be queued on the peer. `struct cmsghdr`
-    /// is `{ size_t cmsg_len; int cmsg_level; int cmsg_type; }` (16 bytes on
-    /// x86_64), followed by the fd array; entries are `CMSG_ALIGN`ed to 8.
-    fn collect_scm_rights_fds(&self, ctrl: &[u8]) -> Vec<Arc<dyn FileLike>> {
-        const CMSG_HDR_LEN: usize = 16;
-        const SOL_SOCKET_LEVEL: i32 = 1;
-        const SCM_RIGHTS: i32 = 1;
-        let mut fds = Vec::new();
+    /// the sender's open files, ready to be queued on the peer.
+    ///
+    /// The byte walk is [`parse_scm_rights_fds`]; this half only turns numbers
+    /// into files. An fd the sender does not have is `EBADF` for the **whole**
+    /// `sendmsg`, as `scm_fp_copy()` does. Skipping it silently, which is what
+    /// this used to do, is the worse answer by far: the receiver gets a short
+    /// fd array with no indication, so a protocol that pairs the Nth fd with
+    /// the Nth request — every one of them: DRI3, `wl_shm`, `wl_buffer` —
+    /// silently pairs each fd with somebody else's request from there on.
+    fn collect_scm_rights_fds(&self, ctrl: &[u8]) -> Result<Vec<Arc<dyn FileLike>>, LxError> {
+        let raw_fds = parse_scm_rights_fds(ctrl)?;
         let proc = self.linux_process();
-        let mut off = 0usize;
-        while off + CMSG_HDR_LEN <= ctrl.len() {
-            let cmsg_len = u64::from_ne_bytes(ctrl[off..off + 8].try_into().unwrap()) as usize;
-            let level = i32::from_ne_bytes(ctrl[off + 8..off + 12].try_into().unwrap());
-            let typ = i32::from_ne_bytes(ctrl[off + 12..off + 16].try_into().unwrap());
-            // `cmsg_len` is attacker-controlled; compute the message end with
-            // checked arithmetic so a value near usize::MAX cannot wrap past the
-            // `> ctrl.len()` guard (which would then slice with start > end and
-            // panic the kernel).
-            let cmsg_end = match off.checked_add(cmsg_len) {
-                Some(end) if cmsg_len >= CMSG_HDR_LEN && end <= ctrl.len() => end,
-                _ => break,
-            };
-            if level == SOL_SOCKET_LEVEL && typ == SCM_RIGHTS {
-                for chunk in ctrl[off + CMSG_HDR_LEN..cmsg_end].as_chunks::<4>().0 {
-                    let raw = i32::from_ne_bytes(*chunk);
-                    if raw >= 0 {
-                        if let Ok(fl) = proc.get_file_like(FileDesc::from(raw as usize)) {
-                            fds.push(fl);
-                        }
-                    }
-                }
+        let mut fds = Vec::with_capacity(raw_fds.len());
+        for raw in raw_fds {
+            if raw < 0 {
+                return Err(LxError::EBADF);
             }
-            // CMSG_ALIGN(cmsg_len); use checked arithmetic and require forward
-            // progress so a wrapped/zero step cannot spin forever.
-            let step = match cmsg_len.checked_add(7).map(|v| v & !7) {
-                Some(s) if s > 0 => s,
-                _ => break,
-            };
-            off = match off.checked_add(step) {
-                Some(n) => n,
-                None => break,
-            };
+            fds.push(proc.get_file_like(FileDesc::from(raw as usize))?);
         }
-        fds
+        Ok(fds)
     }
 
     /// transmit a message to another socket
@@ -599,7 +671,7 @@ impl Syscall<'_> {
                 return Err(LxError::EINVAL);
             }
             let ctrl = hdr.msg_control.read_array(hdr.msg_controllen)?;
-            self.collect_scm_rights_fds(&ctrl)
+            self.collect_scm_rights_fds(&ctrl)?
         } else {
             Vec::new()
         };
@@ -682,17 +754,12 @@ impl Syscall<'_> {
                 let max_fds = (hdr.msg_controllen - 16) / 4;
                 let fds = socket.recv_fds(max_fds);
                 if !fds.is_empty() {
-                    let cmsg_len = 16 + fds.len() * 4;
-                    let mut cbuf = Vec::with_capacity(cmsg_len);
-                    cbuf.extend_from_slice(&(cmsg_len as u64).to_ne_bytes());
-                    cbuf.extend_from_slice(&1i32.to_ne_bytes()); // SOL_SOCKET
-                    cbuf.extend_from_slice(&1i32.to_ne_bytes()); // SCM_RIGHTS
                     let proc = self.linux_process();
+                    let mut installed: Vec<i32> = Vec::with_capacity(fds.len());
                     for fl in fds {
-                        let newfd = proc.add_file(fl)?;
-                        let raw: i32 = newfd.into();
-                        cbuf.extend_from_slice(&raw.to_ne_bytes());
+                        installed.push(proc.add_file(fl)?.into());
                     }
+                    let cbuf = build_scm_rights_cmsg(&installed);
                     ctrl_written = cbuf.len().min(hdr.msg_controllen);
                     hdr.msg_control.write_array(&cbuf[..ctrl_written])?;
                 }
@@ -967,8 +1034,18 @@ impl Syscall<'_> {
             socket2.set_flags(new_flags)?;
         }
         let fd1 = proc.add_socket(socket1)?;
-        let fd2 = proc.add_socket(socket2)?;
-        sv.write_array(&[fd1.into(), fd2.into()])?;
+        // Taken back if the caller never gets the numbers, like `pipe2`.
+        hand_out_pair(
+            fd1,
+            || proc.add_socket(socket2),
+            |fd1, fd2| {
+                sv.write_array(&[fd1.into(), fd2.into()])?;
+                Ok(())
+            },
+            |fd| {
+                let _ = proc.close_file(fd);
+            },
+        )?;
         Ok(0)
     }
 
@@ -1081,5 +1158,246 @@ impl Syscall<'_> {
                 .write(linux_object::net::dns::DnsResultEntry::from_ip(*ip))?;
         }
         Ok(n as _)
+    }
+}
+
+/// The unix-socket control path: passing a file descriptor from one process to
+/// another, which had no tests at all.
+///
+/// This is how a graphical desktop hands buffers around — DRI3 passes a GPU
+/// buffer's fd over the X11 socket, `wl_shm` passes a memfd over the Wayland
+/// one — so everything here runs thousands of times a second in a session and
+/// never once in CI, which has no display.
+///
+/// Every field of a control buffer comes from userspace, `cmsg_len` included,
+/// so the walk is written to survive whatever is in it. The round-trip test at
+/// the end is the one that matters most: the 16-byte header is written in two
+/// places, once by the parser and once by the builder, and nothing but that
+/// test keeps them agreeing.
+#[cfg(test)]
+mod scm_rights_tests {
+    use super::*;
+
+    /// A control buffer holding one cmsg with `level`, `typ` and `payload`,
+    /// padded to `CMSG_ALIGN` so another can follow.
+    fn cmsg(level: i32, typ: i32, payload: &[u8]) -> Vec<u8> {
+        let cmsg_len = CMSG_HDR_LEN + payload.len();
+        let mut b = Vec::new();
+        b.extend_from_slice(&(cmsg_len as u64).to_ne_bytes());
+        b.extend_from_slice(&level.to_ne_bytes());
+        b.extend_from_slice(&typ.to_ne_bytes());
+        b.extend_from_slice(payload);
+        while b.len() % 8 != 0 {
+            b.push(0);
+        }
+        b
+    }
+
+    /// The bytes of `fds` as a C `int` array.
+    fn fd_bytes(fds: &[i32]) -> Vec<u8> {
+        fds.iter().flat_map(|f| f.to_ne_bytes()).collect()
+    }
+
+    /// A cmsg with a hand-chosen `cmsg_len`, for the malformed cases.
+    fn cmsg_raw(cmsg_len: u64, level: i32, typ: i32, payload: &[u8]) -> Vec<u8> {
+        let mut b = Vec::new();
+        b.extend_from_slice(&cmsg_len.to_ne_bytes());
+        b.extend_from_slice(&level.to_ne_bytes());
+        b.extend_from_slice(&typ.to_ne_bytes());
+        b.extend_from_slice(payload);
+        b
+    }
+
+    #[test]
+    fn one_message_yields_the_descriptors_it_carries() {
+        let ctrl = cmsg(SOL_SOCKET_LEVEL, SCM_RIGHTS, &fd_bytes(&[7, 9, 11]));
+        assert_eq!(parse_scm_rights_fds(&ctrl), Ok(vec![7, 9, 11]));
+    }
+
+    #[test]
+    fn a_message_of_another_level_or_type_carries_no_descriptors() {
+        // SCM_CREDENTIALS (type 2) and IPPROTO_IP (level 0) both hold plain
+        // data; reading it as descriptor numbers would install whatever the
+        // numbers happened to be.
+        let creds = cmsg(SOL_SOCKET_LEVEL, 2, &fd_bytes(&[3, 4, 5]));
+        assert_eq!(parse_scm_rights_fds(&creds), Ok(vec![]));
+        let ip = cmsg(0, SCM_RIGHTS, &fd_bytes(&[3, 4, 5]));
+        assert_eq!(parse_scm_rights_fds(&ip), Ok(vec![]));
+    }
+
+    #[test]
+    fn several_messages_are_walked_in_order_across_the_padding() {
+        // The first payload is 4 bytes, so its cmsg is 20 and the next one
+        // starts at 24. Getting the alignment wrong reads the second header
+        // out of the middle of the first message.
+        let mut ctrl = cmsg(SOL_SOCKET_LEVEL, SCM_RIGHTS, &fd_bytes(&[3]));
+        assert_eq!(ctrl.len(), 24);
+        ctrl.extend(cmsg(SOL_SOCKET_LEVEL, 2, &fd_bytes(&[99])));
+        ctrl.extend(cmsg(SOL_SOCKET_LEVEL, SCM_RIGHTS, &fd_bytes(&[5, 6])));
+        assert_eq!(parse_scm_rights_fds(&ctrl), Ok(vec![3, 5, 6]));
+    }
+
+    #[test]
+    fn a_trailing_partial_descriptor_is_not_one() {
+        // `cmsg_len` covering 6 bytes of payload is one `int` and a half; the
+        // kernel divides and drops the remainder rather than reading past it.
+        let ctrl = cmsg_raw(
+            (CMSG_HDR_LEN + 6) as u64,
+            SOL_SOCKET_LEVEL,
+            SCM_RIGHTS,
+            &[1, 0, 0, 0, 2, 0],
+        );
+        assert_eq!(parse_scm_rights_fds(&ctrl), Ok(vec![1]));
+    }
+
+    #[test]
+    fn a_length_past_the_end_of_the_buffer_stops_the_walk() {
+        let ctrl = cmsg_raw(4096, SOL_SOCKET_LEVEL, SCM_RIGHTS, &fd_bytes(&[3, 4]));
+        assert_eq!(parse_scm_rights_fds(&ctrl), Ok(vec![]));
+    }
+
+    #[test]
+    fn a_length_that_wraps_the_address_space_stops_the_walk() {
+        // `off + cmsg_len` overflowing would land back under `ctrl.len()` and
+        // then slice with start > end, which is a kernel panic.
+        for len in [u64::MAX, u64::MAX - 7, (usize::MAX as u64) - 16] {
+            let ctrl = cmsg_raw(len, SOL_SOCKET_LEVEL, SCM_RIGHTS, &fd_bytes(&[3, 4]));
+            assert_eq!(parse_scm_rights_fds(&ctrl), Ok(vec![]), "cmsg_len {}", len);
+        }
+    }
+
+    #[test]
+    fn a_length_that_wraps_past_a_message_already_walked_stops_the_walk() {
+        // The wrap that actually bites. At offset 0 a huge `cmsg_len` lands
+        // past the end of the buffer and is refused on size alone; it takes a
+        // first, well-formed message to move the walk forward before
+        // `off + cmsg_len` can come back around to a SMALL number that passes
+        // the bounds check. The slice is then `ctrl[off+16..that]`, with the
+        // start past the end — a kernel panic inside `sendmsg`, from a control
+        // buffer any process can hand over.
+        let mut ctrl = cmsg(SOL_SOCKET_LEVEL, SCM_RIGHTS, &fd_bytes(&[3]));
+        assert_eq!(ctrl.len(), 24);
+        ctrl.extend(cmsg_raw(u64::MAX - 20, SOL_SOCKET_LEVEL, SCM_RIGHTS, &[]));
+        assert_eq!(ctrl.len(), 40);
+        assert_eq!(parse_scm_rights_fds(&ctrl), Ok(vec![3]));
+    }
+
+    #[test]
+    fn a_length_shorter_than_its_own_header_stops_the_walk() {
+        for len in [0u64, 1, 8, 15] {
+            let ctrl = cmsg_raw(len, SOL_SOCKET_LEVEL, SCM_RIGHTS, &fd_bytes(&[3, 4]));
+            assert_eq!(parse_scm_rights_fds(&ctrl), Ok(vec![]), "cmsg_len {}", len);
+        }
+    }
+
+    #[test]
+    fn an_empty_message_is_stepped_over_rather_than_looped_on() {
+        // `cmsg_len` 16 is a well-formed SCM_RIGHTS carrying nothing. The walk
+        // has to step past it and find the next one.
+        //
+        // The `s > 0` guard on the step is a second lock on the same door: a
+        // step can only be 0 if `cmsg_len` is, and a `cmsg_len` under 16 has
+        // already ended the walk. It is kept because losing the length check
+        // would otherwise turn into an unkillable loop inside a syscall rather
+        // than a wrong answer, and no test can tell the two locks apart.
+        let mut ctrl = cmsg_raw(16, SOL_SOCKET_LEVEL, SCM_RIGHTS, &[]);
+        ctrl.extend(cmsg(SOL_SOCKET_LEVEL, SCM_RIGHTS, &fd_bytes(&[8])));
+        assert_eq!(parse_scm_rights_fds(&ctrl), Ok(vec![8]));
+    }
+
+    #[test]
+    fn a_buffer_too_short_for_a_header_carries_nothing() {
+        for n in 0..CMSG_HDR_LEN {
+            let ctrl = vec![0xffu8; n];
+            assert_eq!(parse_scm_rights_fds(&ctrl), Ok(vec![]), "{} bytes", n);
+        }
+    }
+
+    #[test]
+    fn the_descriptor_cap_is_the_number_linux_uses() {
+        // Every other test here builds its fd array *from* the constant, so
+        // they all move with it and none of them would notice it changing.
+        // This is an ABI number (`SCM_MAX_FD`, include/net/scm.h), not a knob.
+        assert_eq!(SCM_MAX_FD, 253);
+    }
+
+    #[test]
+    fn more_descriptors_than_linux_allows_is_einval() {
+        // Without the cap, one sendmsg with the 64 KiB control buffer the
+        // caller is allowed asks the receiver to install some 16000 fds.
+        let ok = cmsg(
+            SOL_SOCKET_LEVEL,
+            SCM_RIGHTS,
+            &fd_bytes(&(0..SCM_MAX_FD as i32).collect::<Vec<_>>()),
+        );
+        assert_eq!(parse_scm_rights_fds(&ok).map(|v| v.len()), Ok(SCM_MAX_FD));
+
+        let too_many = cmsg(
+            SOL_SOCKET_LEVEL,
+            SCM_RIGHTS,
+            &fd_bytes(&(0..SCM_MAX_FD as i32 + 1).collect::<Vec<_>>()),
+        );
+        assert_eq!(parse_scm_rights_fds(&too_many), Err(LxError::EINVAL));
+    }
+
+    #[test]
+    fn the_cap_counts_across_messages_and_not_within_one() {
+        // Two messages of 200 fds each is 400, which Linux refuses just the
+        // same as one message of 400.
+        let half = || fd_bytes(&(0..200i32).collect::<Vec<_>>());
+        let mut ctrl = cmsg(SOL_SOCKET_LEVEL, SCM_RIGHTS, &half());
+        ctrl.extend(cmsg(SOL_SOCKET_LEVEL, SCM_RIGHTS, &half()));
+        assert_eq!(parse_scm_rights_fds(&ctrl), Err(LxError::EINVAL));
+    }
+
+    #[test]
+    fn a_negative_descriptor_number_comes_back_as_it_was_written() {
+        // The walk reports what is on the wire; `collect_scm_rights_fds` is
+        // the half that turns a number into a file and answers EBADF.
+        let ctrl = cmsg(SOL_SOCKET_LEVEL, SCM_RIGHTS, &fd_bytes(&[3, -1, 4]));
+        assert_eq!(parse_scm_rights_fds(&ctrl), Ok(vec![3, -1, 4]));
+    }
+
+    #[test]
+    fn what_recvmsg_writes_is_what_sendmsg_reads() {
+        // The one that keeps the two halves of the header honest.
+        for fds in [
+            vec![],
+            vec![0],
+            vec![3, 4, 5],
+            vec![i32::MAX, 1, 2, 3, 4, 5, 6, 7],
+        ] {
+            let built = build_scm_rights_cmsg(&fds);
+            assert_eq!(parse_scm_rights_fds(&built), Ok(fds.clone()), "{:?}", fds);
+        }
+    }
+
+    #[test]
+    fn the_built_message_is_the_length_it_declares() {
+        // A caller walks the buffer with `cmsg_len`, so a header that lies
+        // about its own size sends it into the next message or off the end.
+        let built = build_scm_rights_cmsg(&[3, 4, 5]);
+        let declared = u64::from_ne_bytes(built[..8].try_into().unwrap()) as usize;
+        assert_eq!(declared, built.len());
+        assert_eq!(built.len(), CMSG_HDR_LEN + 3 * 4);
+        assert_eq!(
+            i32::from_ne_bytes(built[8..12].try_into().unwrap()),
+            SOL_SOCKET_LEVEL
+        );
+        assert_eq!(
+            i32::from_ne_bytes(built[12..16].try_into().unwrap()),
+            SCM_RIGHTS
+        );
+    }
+
+    #[test]
+    fn getsockopt_reports_what_it_wrote_and_not_what_it_had() {
+        // A `struct ucred` is 12 bytes; a caller asking SO_PEERCRED into an
+        // `int` gets 4 and must be told 4, or it reads 8 bytes of its own
+        // stack as if the kernel had filled them.
+        assert_eq!(sockopt_out_len(4, 12), 4);
+        assert_eq!(sockopt_out_len(12, 12), 12);
+        assert_eq!(sockopt_out_len(64, 12), 12);
+        assert_eq!(sockopt_out_len(0, 12), 0);
     }
 }

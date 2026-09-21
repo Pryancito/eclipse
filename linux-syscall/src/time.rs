@@ -1,6 +1,7 @@
 //! Syscalls for time
 //! - clock_gettime
 //!
+use crate::outparams::commit_and_report_old;
 use crate::Syscall;
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
@@ -576,7 +577,7 @@ impl Syscall<'_> {
         let interval = Duration::from(val.interval);
         let now = kernel_hal::timer::timer_now();
         let owner = self.zircon_process().id();
-        let arm = {
+        let (old, arm) = {
             let mut slots = self.linux_process().itimers().lock();
             let slot = &mut slots[which];
             let old = itimerval_from_slot(slot, now);
@@ -593,12 +594,18 @@ impl Syscall<'_> {
                 slot.deadline = Some(deadline);
                 Some((deadline, slot.generation))
             };
-            old_value.write_if_not_null(old)?;
-            arm
+            (old, arm)
         };
-        if let Some((deadline, generation)) = arm {
-            arm_itimer(owner, which, deadline, generation);
-        }
+        // Reported LAST, after the timer is armed. Writing it here used to
+        // abort the call on a faulting pointer with the slot ALREADY changed
+        // and `arm_itimer` never reached: the process was left with a timer
+        // that `getitimer` counts down and that never fires.
+        commit_and_report_old(old, &mut old_value, || {
+            if let Some((deadline, generation)) = arm {
+                arm_itimer(owner, which, deadline, generation);
+            }
+            Ok(())
+        })?;
         Ok(0)
     }
 
@@ -744,12 +751,14 @@ impl Syscall<'_> {
             };
             (old, arm)
         };
-        if !old_value.is_null() {
-            old_value.write(old)?;
-        }
-        if let Some((deadline, gen)) = arm {
-            arm_posix_timer(id, deadline, gen);
-        }
+        // Same as `setitimer`: armed first, reported after. A faulting
+        // `old_value` used to leave the timer recorded as due and never armed.
+        commit_and_report_old(old, &mut old_value, || {
+            if let Some((deadline, gen)) = arm {
+                arm_posix_timer(id, deadline, gen);
+            }
+            Ok(())
+        })?;
         Ok(0)
     }
 

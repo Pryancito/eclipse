@@ -46,6 +46,140 @@ const IO_WAIT_TICK: Duration = Duration::from_millis(linux_object::net::wait::IO
 /// this bound it notices its VT becoming active and resumes fast polling.
 const SLOW_IO_WAIT_TICK: Duration = Duration::from_millis(100);
 
+/// Pick the io-wait re-poll interval, given whether the caller's terminal is
+/// the one the user is looking at. Split from [`io_wait_interval`] so the
+/// decision itself — which has regressed twice, in both directions — is a
+/// pure function the host tests can ask every combination of.
+fn io_wait_interval_for(
+    watch_net: bool,
+    watch_interactive: bool,
+    terminal_only: bool,
+    on_active_vt: bool,
+) -> Duration {
+    let background_interactive = watch_interactive && terminal_only && !on_active_vt;
+    if !watch_net && background_interactive {
+        SLOW_IO_WAIT_TICK
+    } else {
+        IO_WAIT_TICK
+    }
+}
+
+/// The timeout of `poll(2)`/`epoll_wait(2)`, as it must be read out of the
+/// syscall register.
+///
+/// Two things happen here that `as isize` does not do:
+///
+///  * **It is an `int`.** Linux declares `SYSCALL_DEFINE3(poll, ..., int,
+///    timeout_msecs)`, and the `SYSCALL_DEFINE` macros cast each register to
+///    the declared type, so the top 32 bits are not part of the number. Taking
+///    the whole register instead turned a `-1` that arrived zero-extended
+///    (0xffff_ffff — what a caller that keeps the timeout in a 32-bit slot
+///    leaves in the register) into a finite 49-day wait, and any value with a
+///    high bit set into a wait of up to 292 million years.
+///  * **Every negative value means "for ever"**, not just `-1`. poll(2) says
+///    so, and both [`Epoll::wait`] and `IoMultiplexWait` already read it that
+///    way (`timeout_msecs >= 0`). The poll/select futures did not: they matched
+///    `-1` alone and let everything else fall through to an arm that returned
+///    `Poll::Pending` **without arming a timer, an io-wait waker or a readiness
+///    subscription**. A plain `poll(fds, n, -2)` from any process parked that
+///    thread with nothing left in the kernel that could ever wake it.
+///
+/// Normalizing at the syscall boundary keeps both readings in one place.
+pub(crate) fn poll_timeout_msecs(raw: usize) -> isize {
+    let msecs = raw as u32 as i32;
+    if msecs < 0 {
+        -1
+    } else {
+        msecs as isize
+    }
+}
+
+/// The widest fd number `select(2)` can be asked about here: what the
+/// `fd_set` this kernel accepts can hold.
+const MAX_SELECT_NFDS: usize = MAX_FDSET_SIZE * FD_PER_ITEM;
+
+/// `select(2)`'s first argument, as Linux reads it: `int n`, negative is
+/// `EINVAL`, and anything past the table of open files is **clamped**, not
+/// refused (`if (n > max_fds) n = max_fds;` in `core_sys_select`).
+///
+/// Read as a whole `usize` it was neither. `select(nfds, NULL, NULL, NULL,
+/// &tv)` is a portable way to sleep, and a caller that passed a large `nfds`
+/// with no fd sets sent the kernel scanning `0..nfds` — twice per pass, plus
+/// once per watched fd — for two billion iterations with no lock held and no
+/// way out: one unprivileged call burned a core until the machine was
+/// rebooted. Clamping bounds the scan by the same thing that bounds the
+/// `fd_set` itself.
+fn select_nfds(raw: usize) -> Result<usize, LxError> {
+    let n = raw as u32 as i32;
+    if n < 0 {
+        return Err(LxError::EINVAL);
+    }
+    Ok((n as usize).min(MAX_SELECT_NFDS))
+}
+
+/// Linux's `EP_MAX_EVENTS`: as many events as can be counted in the `int`
+/// that `epoll_wait(2)` returns.
+const EP_MAX_EVENTS: usize = (i32::MAX as usize) / core::mem::size_of::<EpollEvent>();
+
+/// `epoll_wait(2)`'s `maxevents`, as Linux reads it: `int`, and
+/// `maxevents <= 0 || maxevents > EP_MAX_EVENTS` is `EINVAL` before anything
+/// else happens.
+///
+/// Taken as a whole `usize` and never checked, `maxevents = 0` was not "no
+/// events": the wait loop pushes an event first and only then tests
+/// `events.len() >= maxevents`, so it returned **one** event and wrote it into
+/// a buffer the caller had sized for none — a 12-byte write past the end of
+/// whatever userspace allocated, from a syscall any process can make.
+fn epoll_maxevents(raw: usize) -> Result<usize, LxError> {
+    let n = raw as u32 as i32;
+    if n <= 0 || n as usize > EP_MAX_EVENTS {
+        return Err(LxError::EINVAL);
+    }
+    Ok(n as usize)
+}
+
+/// What a poll/select pass does once it has scanned every fd and found
+/// nothing ready.
+#[derive(Debug, PartialEq, Eq)]
+enum PollWait {
+    /// Return 0 now: the caller asked not to block, or its deadline has
+    /// already passed.
+    ReturnEmpty,
+    /// Block. `Some(remaining)` is how much of the caller's timeout is left;
+    /// `None` is a wait with no deadline.
+    Sleep(Option<Duration>),
+}
+
+/// Decide between returning empty and blocking again. Written once for both
+/// `poll` and `select`, which had the same four-armed `match` copied into each
+/// future — and the copy is where the arm for "any other negative timeout"
+/// went missing.
+fn poll_wait_decision(timeout_msecs: isize, begin_time: Duration, now: Duration) -> PollWait {
+    match timeout_msecs {
+        0 => PollWait::ReturnEmpty,
+        1.. => {
+            let deadline = begin_time + Duration::from_millis(timeout_msecs as u64);
+            if now >= deadline {
+                PollWait::ReturnEmpty
+            } else {
+                PollWait::Sleep(Some(deadline.saturating_sub(now)))
+            }
+        }
+        // Negative: wait for ever (poll(2)).
+        _ => PollWait::Sleep(None),
+    }
+}
+
+/// How long to sleep before re-scanning: the re-poll tick, or the rest of the
+/// caller's timeout when that is shorter — a wait must not overshoot its own
+/// deadline by a tick.
+fn wake_after(limit: Option<Duration>, tick: Duration) -> Duration {
+    match limit {
+        Some(remaining) => remaining.min(tick),
+        None => tick,
+    }
+}
+
 /// Pick the io-wait re-poll interval. The slow tick exists for exactly one
 /// pattern: a shell parked in poll(stdin) on a *background* VT, whose input can
 /// only ever arrive once its VT becomes active — re-polling that at 4 ms just
@@ -67,14 +201,8 @@ fn io_wait_interval(
     watch_interactive: bool,
     terminal_only: bool,
 ) -> Duration {
-    let background_interactive = watch_interactive
-        && terminal_only
-        && s.linux_process().vt() != kernel_hal::console::active_vt();
-    if !watch_net && background_interactive {
-        SLOW_IO_WAIT_TICK
-    } else {
-        IO_WAIT_TICK
-    }
+    let on_active_vt = s.linux_process().vt() == kernel_hal::console::active_vt();
+    io_wait_interval_for(watch_net, watch_interactive, terminal_only, on_active_vt)
 }
 
 fn arm_io_wait(cx: &mut Context, watch_net: bool, watch_interactive: bool, io_armed: &mut bool) {
@@ -291,9 +419,8 @@ impl Syscall<'_> {
                 let covered_tick =
                     Duration::from_millis(linux_object::net::wait::IO_WAIT_COVERED_TICK_MS);
 
-                match this.timeout_msecs {
-                    // no timeout, return now;
-                    0 => {
+                match poll_wait_decision(this.timeout_msecs, this.begin_time, mono_now()) {
+                    PollWait::ReturnEmpty => {
                         clear_poll_io(
                             &mut this.timer,
                             &mut this.io_waker,
@@ -302,19 +429,7 @@ impl Syscall<'_> {
                         );
                         return Poll::Ready(Ok(0));
                     }
-                    1.. => {
-                        let deadline =
-                            this.begin_time + Duration::from_millis(this.timeout_msecs as u64);
-                        if mono_now() >= deadline {
-                            clear_poll_io(
-                                &mut this.timer,
-                                &mut this.io_waker,
-                                watch_net,
-                                watch_interactive,
-                            );
-                            return Poll::Ready(Ok(0));
-                        }
-                        let remaining = deadline.saturating_sub(mono_now());
+                    PollWait::Sleep(limit) => {
                         let tick = if covered {
                             covered_tick
                         } else {
@@ -325,28 +440,10 @@ impl Syscall<'_> {
                                 terminal_only,
                             )
                         };
-                        let wake_in = remaining.min(tick);
+                        let wake_in = wake_after(limit, tick);
                         arm_io_wait(cx, watch_net, watch_interactive, &mut this.io_armed);
                         this.io_waker = Some(cx.waker().clone());
                         schedule_poll_wakeup(cx, wake_in, &mut this.timer);
-                    }
-                    -1 => {
-                        let tick = if covered {
-                            covered_tick
-                        } else {
-                            io_wait_interval(
-                                this.syscall,
-                                watch_net,
-                                watch_interactive,
-                                terminal_only,
-                            )
-                        };
-                        arm_io_wait(cx, watch_net, watch_interactive, &mut this.io_armed);
-                        this.io_waker = Some(cx.waker().clone());
-                        schedule_poll_wakeup(cx, tick, &mut this.timer);
-                    }
-                    _ => {
-                        info!("No waker. timeout: {:?}", this.timeout_msecs);
                     }
                 }
 
@@ -499,6 +596,10 @@ impl Syscall<'_> {
         err: UserInOutPtr<u32>,
         timeout_msecs: isize,
     ) -> SysResult {
+        // `nfds` is an `int` that Linux clamps to the caller's open-file
+        // table; unclamped it made `0..nfds` a two-billion-iteration scan on
+        // every pass. See `select_nfds`.
+        let nfds = select_nfds(nfds)?;
         let mut read_fds = FdSet::new(read, nfds)?;
         let mut write_fds = FdSet::new(write, nfds)?;
         let mut err_fds = FdSet::new(err, nfds)?;
@@ -685,9 +786,13 @@ impl Syscall<'_> {
                 let covered_tick =
                     Duration::from_millis(linux_object::net::wait::IO_WAIT_COVERED_TICK_MS);
 
-                match this.timeout_msecs {
-                    // no timeout, return now;
-                    0 => {
+                match poll_wait_decision(this.timeout_msecs, this.begin_time, mono_now()) {
+                    PollWait::ReturnEmpty => {
+                        // A select that ran out of time still answers with the
+                        // (empty) ready sets, as Linux does.
+                        this.read_fds.commit();
+                        this.write_fds.commit();
+                        this.err_fds.commit();
                         clear_poll_io(
                             &mut this.timer,
                             &mut this.io_waker,
@@ -696,19 +801,7 @@ impl Syscall<'_> {
                         );
                         return Poll::Ready(Ok(0));
                     }
-                    1.. => {
-                        let deadline =
-                            this.begin_time + Duration::from_millis(this.timeout_msecs as u64);
-                        if mono_now() >= deadline {
-                            clear_poll_io(
-                                &mut this.timer,
-                                &mut this.io_waker,
-                                watch_net,
-                                watch_interactive,
-                            );
-                            return Poll::Ready(Ok(0));
-                        }
-                        let remaining = deadline.saturating_sub(mono_now());
+                    PollWait::Sleep(limit) => {
                         let tick = if covered {
                             covered_tick
                         } else {
@@ -719,27 +812,11 @@ impl Syscall<'_> {
                                 terminal_only,
                             )
                         };
-                        let wake_in = remaining.min(tick);
+                        let wake_in = wake_after(limit, tick);
                         arm_io_wait(cx, watch_net, watch_interactive, &mut this.io_armed);
                         this.io_waker = Some(cx.waker().clone());
                         schedule_poll_wakeup(cx, wake_in, &mut this.timer);
                     }
-                    -1 => {
-                        let tick = if covered {
-                            covered_tick
-                        } else {
-                            io_wait_interval(
-                                this.syscall,
-                                watch_net,
-                                watch_interactive,
-                                terminal_only,
-                            )
-                        };
-                        arm_io_wait(cx, watch_net, watch_interactive, &mut this.io_armed);
-                        this.io_waker = Some(cx.waker().clone());
-                        schedule_poll_wakeup(cx, tick, &mut this.timer);
-                    }
-                    _ => {}
                 }
                 Poll::Pending
             }
@@ -820,6 +897,10 @@ impl Syscall<'_> {
             maxevents,
             timeout
         );
+        // Validated before anything else, as Linux does: `maxevents` sizes the
+        // caller's output array, and the wait loop fills it without a second
+        // bound. See `epoll_maxevents`.
+        let maxevents = epoll_maxevents(maxevents)?;
         let mut guard = self.install_temp_sigmask(sigmask, sigsetsize)?;
         // Resolve the epoll object to an owned Arc (not a borrow of a local):
         // `wait` awaits, and a stale net/timer waker re-polling this future
@@ -902,7 +983,7 @@ struct FdSet {
 impl FdSet {
     /// Initialize a `FdSet` from pointer and number of fds
     /// Check if the array is large enough
-    fn new(mut addr: UserInOutPtr<u32>, nfds: usize) -> Result<FdSet, LxError> {
+    fn new(addr: UserInOutPtr<u32>, nfds: usize) -> Result<FdSet, LxError> {
         if addr.is_null() {
             Ok(FdSet {
                 addr,
@@ -914,11 +995,17 @@ impl FdSet {
             if len > MAX_FDSET_SIZE {
                 return Err(LxError::EINVAL);
             }
-            // save the fdset, and clear it
+            // Save the caller's set. Do NOT clear it here: the result is
+            // written once, by `commit`, and only on the paths where select
+            // actually has an answer. Zeroing it up front meant a select that
+            // failed — `EINTR` from a signal, or `EFAULT`/`EINVAL` raised
+            // while building one of the *later* two sets — handed the caller
+            // back an emptied `fd_set` that Linux leaves untouched. The usual
+            // `while (select(...) < 0 && errno == EINTR) continue;` loop then
+            // re-entered on a set with no fds in it and waited for an event
+            // that could no longer be asked for.
             let origin = BitVec::from_slice(addr.as_slice(len)?).unwrap();
-            let vec0 = alloc::vec![0; len];
-            addr.write_array(&vec0)?;
-            let ready = BitVec::from_slice(&vec0).unwrap();
+            let ready = BitVec::from_slice(&alloc::vec![0; len]).unwrap();
             Ok(FdSet {
                 addr,
                 origin,
@@ -969,5 +1056,402 @@ mod abi_tests {
     #[test]
     fn pollfd_matches_linux_uapi() {
         assert_eq!(size_of::<PollFd>(), 8);
+    }
+}
+
+#[cfg(test)]
+mod poll_tests {
+    //! Host tests for the four numbers `poll`/`select`/`epoll_wait` take from
+    //! userspace, and for the decision every blocking pass makes.
+    //!
+    //! This is the file a desktop lives in: a compositor, its clients and
+    //! every shell spend nearly all of their time parked in one of these three
+    //! syscalls, so a wrong answer here shows up as "the machine is slow" or
+    //! "it hung" and never as an error. None of it needs a process, a timer or
+    //! an fd — the parts that decide are plain functions of their arguments,
+    //! which is why they were split out.
+
+    use super::*;
+
+    /// The register a syscall argument arrives in, holding the given `int`.
+    /// The C caller only ever set the low 32 bits; what is above them is not
+    /// part of the value.
+    fn reg(value: i32) -> usize {
+        value as u32 as usize
+    }
+
+    // ---- poll(2) / epoll_wait(2) timeout --------------------------------
+
+    #[test]
+    fn a_timeout_in_milliseconds_is_taken_as_it_is() {
+        assert_eq!(poll_timeout_msecs(reg(0)), 0);
+        assert_eq!(poll_timeout_msecs(reg(1)), 1);
+        assert_eq!(poll_timeout_msecs(reg(250)), 250);
+        // The longest finite wait an `int` of milliseconds can name: ~24 days.
+        assert_eq!(poll_timeout_msecs(reg(i32::MAX)), i32::MAX as isize);
+    }
+
+    #[test]
+    fn minus_one_is_the_wait_with_no_deadline() {
+        assert_eq!(poll_timeout_msecs(-1isize as usize), -1);
+    }
+
+    /// The hang. poll(2): "a negative value means an infinite timeout" — any
+    /// negative value. The futures matched `-1` alone and let the rest fall
+    /// into an arm that returned `Pending` with no timer and no waker, so
+    /// `poll(fds, n, -2)` parked the caller with nothing left in the kernel
+    /// that could ever wake it.
+    #[test]
+    fn every_negative_timeout_is_infinite_not_just_minus_one() {
+        for raw in [-2i32, -3, -1000, i32::MIN] {
+            assert_eq!(
+                poll_timeout_msecs(reg(raw)),
+                -1,
+                "timeout {} must mean for ever",
+                raw
+            );
+        }
+    }
+
+    /// `SYSCALL_DEFINE3(poll, ..., int, timeout_msecs)`: the top half of the
+    /// register is not part of the number.
+    #[test]
+    fn the_high_half_of_the_register_is_not_part_of_the_timeout() {
+        assert_eq!(poll_timeout_msecs(0x1_0000_0000), 0);
+        assert_eq!(poll_timeout_msecs(0x1_0000_0064), 100);
+        assert_eq!(poll_timeout_msecs(0xdead_beef_0000_000a), 10);
+    }
+
+    /// A `-1` that arrives zero-extended — what a caller keeping the timeout
+    /// in a 32-bit slot leaves in the register — is still "for ever", not a
+    /// finite 49-day wait.
+    #[test]
+    fn a_minus_one_that_arrives_zero_extended_still_means_for_ever() {
+        assert_eq!(poll_timeout_msecs(0x0000_0000_ffff_ffff), -1);
+    }
+
+    // ---- the blocking decision ------------------------------------------
+
+    const T0: Duration = Duration::from_secs(100);
+
+    #[test]
+    fn a_zero_timeout_never_blocks() {
+        assert_eq!(poll_wait_decision(0, T0, T0), PollWait::ReturnEmpty);
+    }
+
+    #[test]
+    fn a_live_deadline_sleeps_for_what_is_left_of_it() {
+        let now = T0 + Duration::from_millis(30);
+        assert_eq!(
+            poll_wait_decision(100, T0, now),
+            PollWait::Sleep(Some(Duration::from_millis(70)))
+        );
+    }
+
+    /// The deadline is measured from the first pass, not from this one: a
+    /// re-scan must not restart the caller's timeout.
+    #[test]
+    fn the_deadline_is_measured_from_the_first_pass() {
+        let later = T0 + Duration::from_millis(90);
+        assert_eq!(
+            poll_wait_decision(100, T0, later),
+            PollWait::Sleep(Some(Duration::from_millis(10)))
+        );
+    }
+
+    #[test]
+    fn an_expired_deadline_returns_instead_of_sleeping_again() {
+        let now = T0 + Duration::from_millis(101);
+        assert_eq!(poll_wait_decision(100, T0, now), PollWait::ReturnEmpty);
+    }
+
+    /// Exactly on the deadline the wait is over, not "zero more milliseconds":
+    /// sleeping for `Duration::ZERO` would spin.
+    #[test]
+    fn a_deadline_that_falls_exactly_now_returns() {
+        let now = T0 + Duration::from_millis(100);
+        assert_eq!(poll_wait_decision(100, T0, now), PollWait::ReturnEmpty);
+    }
+
+    #[test]
+    fn an_infinite_wait_has_no_deadline_to_run_out() {
+        assert_eq!(poll_wait_decision(-1, T0, T0), PollWait::Sleep(None));
+        let much_later = T0 + Duration::from_secs(86_400);
+        assert_eq!(
+            poll_wait_decision(-1, T0, much_later),
+            PollWait::Sleep(None)
+        );
+    }
+
+    /// The other half of the hang: whatever negative number reaches the
+    /// future, it must end up blocking *with* a wakeup, never in an arm that
+    /// falls through.
+    #[test]
+    fn any_negative_timeout_blocks_like_minus_one() {
+        for t in [-2isize, -1000, i32::MIN as isize, isize::MIN] {
+            assert_eq!(
+                poll_wait_decision(t, T0, T0),
+                PollWait::Sleep(None),
+                "timeout {} must block with a wakeup armed",
+                t
+            );
+        }
+    }
+
+    #[test]
+    fn the_longest_finite_timeout_does_not_overflow_the_deadline() {
+        assert_eq!(
+            poll_wait_decision(i32::MAX as isize, T0, T0),
+            PollWait::Sleep(Some(Duration::from_millis(i32::MAX as u64)))
+        );
+    }
+
+    // ---- how long the pass actually sleeps -------------------------------
+
+    #[test]
+    fn a_wait_with_no_deadline_sleeps_one_tick_at_a_time() {
+        assert_eq!(wake_after(None, IO_WAIT_TICK), IO_WAIT_TICK);
+        assert_eq!(wake_after(None, SLOW_IO_WAIT_TICK), SLOW_IO_WAIT_TICK);
+    }
+
+    /// A timeout shorter than the re-poll tick must wake at the timeout. With
+    /// the covered tick at 100 ms, taking the tick instead would answer a
+    /// `poll(.., 5)` in 100 ms.
+    #[test]
+    fn a_deadline_closer_than_the_tick_wins() {
+        let five = Duration::from_millis(5);
+        assert_eq!(wake_after(Some(five), SLOW_IO_WAIT_TICK), five);
+        assert_eq!(wake_after(Some(five), IO_WAIT_TICK), IO_WAIT_TICK);
+    }
+
+    #[test]
+    fn a_deadline_exactly_one_tick_away_sleeps_one_tick() {
+        assert_eq!(wake_after(Some(IO_WAIT_TICK), IO_WAIT_TICK), IO_WAIT_TICK);
+    }
+
+    // ---- the re-poll interval -------------------------------------------
+
+    /// The shape the slow tick exists for: a shell parked in `poll(stdin)` on
+    /// a VT nobody is looking at. Its keypress can only arrive once that VT is
+    /// the active one, so re-scanning it every 4 ms is pure heat.
+    #[test]
+    fn a_shell_on_a_background_vt_is_polled_slowly() {
+        assert_eq!(
+            io_wait_interval_for(false, true, true, false),
+            SLOW_IO_WAIT_TICK
+        );
+    }
+
+    #[test]
+    fn the_same_shell_on_the_active_vt_is_polled_fast() {
+        assert_eq!(io_wait_interval_for(false, true, true, true), IO_WAIT_TICK);
+    }
+
+    /// First regression: a set with no interactive fd at all — DRM fds,
+    /// timerfds, pipes, device fds, which is the shape of a compositor's
+    /// startup waits — was demoted to 100 ms, and every roundtrip of the
+    /// startup was gated at a tenth of a second.
+    #[test]
+    fn a_set_with_no_interactive_fd_is_never_demoted() {
+        for on_active_vt in [false, true] {
+            assert_eq!(
+                io_wait_interval_for(false, false, true, on_active_vt),
+                IO_WAIT_TICK
+            );
+            assert_eq!(
+                io_wait_interval_for(false, false, false, on_active_vt),
+                IO_WAIT_TICK
+            );
+        }
+    }
+
+    /// Second regression: keying the demotion on `watch_interactive` alone —
+    /// true for any non-socket fd — put PulseAudio's ALSA sink thread
+    /// (`[pcm, timer]`, in a process that is never on the active VT) on a
+    /// 100 ms re-scan. Its 108 ms buffer underran on every wake. Only a set
+    /// where *every* fd is a terminal is the pattern.
+    #[test]
+    fn an_interactive_set_that_is_not_all_terminals_is_polled_fast() {
+        assert_eq!(
+            io_wait_interval_for(false, true, false, false),
+            IO_WAIT_TICK
+        );
+    }
+
+    /// A socket in the set means the network stack has to be pumped, whatever
+    /// else is in there.
+    #[test]
+    fn a_socket_in_the_set_keeps_the_fast_tick() {
+        assert_eq!(io_wait_interval_for(true, true, true, false), IO_WAIT_TICK);
+    }
+
+    // ---- select(2)'s nfds -----------------------------------------------
+
+    #[test]
+    fn zero_fds_is_a_valid_way_to_sleep() {
+        assert_eq!(select_nfds(reg(0)), Ok(0));
+    }
+
+    #[test]
+    fn a_negative_nfds_is_einval() {
+        assert_eq!(select_nfds(reg(-1)), Err(LxError::EINVAL));
+        assert_eq!(select_nfds(reg(i32::MIN)), Err(LxError::EINVAL));
+    }
+
+    #[test]
+    fn a_whole_fd_set_fits() {
+        assert_eq!(select_nfds(reg(1024)), Ok(1024));
+        assert_eq!(MAX_SELECT_NFDS, 1024);
+    }
+
+    /// Linux clamps `nfds` to the caller's open-file table rather than
+    /// refusing it (`if (n > max_fds) n = max_fds;`), so a program built with
+    /// a wider `fd_set` keeps working. Clamping is also what bounds the
+    /// `0..nfds` scan: taken whole, `select(0x7fffffff, NULL, NULL, NULL,
+    /// &tv)` — a legal way to sleep — sent the kernel round that loop two
+    /// billion times per pass.
+    #[test]
+    fn more_fds_than_the_set_holds_are_clamped_not_refused() {
+        assert_eq!(select_nfds(reg(2000)), Ok(MAX_SELECT_NFDS));
+        assert_eq!(select_nfds(reg(i32::MAX)), Ok(MAX_SELECT_NFDS));
+    }
+
+    #[test]
+    fn the_high_half_of_the_register_is_not_part_of_nfds() {
+        assert_eq!(select_nfds(0x1_0000_0008), Ok(8));
+        // 0xffff_ffff is `int` -1, not four billion fds.
+        assert_eq!(select_nfds(0x0000_0000_ffff_ffff), Err(LxError::EINVAL));
+    }
+
+    // ---- epoll_wait(2)'s maxevents ---------------------------------------
+
+    /// The overflow: room for no events is not "give me one anyway". The wait
+    /// loop pushes an event before testing the cap, so `maxevents = 0`
+    /// returned one and wrote it over whatever followed the caller's array.
+    #[test]
+    fn asking_for_no_events_is_einval() {
+        assert_eq!(epoll_maxevents(reg(0)), Err(LxError::EINVAL));
+    }
+
+    #[test]
+    fn a_negative_maxevents_is_einval() {
+        assert_eq!(epoll_maxevents(reg(-1)), Err(LxError::EINVAL));
+        assert_eq!(epoll_maxevents(reg(i32::MIN)), Err(LxError::EINVAL));
+        assert_eq!(epoll_maxevents(0x0000_0000_ffff_ffff), Err(LxError::EINVAL));
+    }
+
+    #[test]
+    fn one_event_is_the_smallest_ask() {
+        assert_eq!(epoll_maxevents(reg(1)), Ok(1));
+        assert_eq!(epoll_maxevents(reg(1024)), Ok(1024));
+    }
+
+    /// `EP_MAX_EVENTS` is `INT_MAX / sizeof(struct epoll_event)`, and the
+    /// struct is the 12-byte packed one on x86_64 (asserted in
+    /// `linux-object`'s `epoll::abi_tests`).
+    #[test]
+    fn the_cap_is_the_number_linux_uses() {
+        assert_eq!(
+            epoll_maxevents(reg(EP_MAX_EVENTS as i32)),
+            Ok(EP_MAX_EVENTS)
+        );
+        assert_eq!(
+            epoll_maxevents(reg(EP_MAX_EVENTS as i32 + 1)),
+            Err(LxError::EINVAL)
+        );
+        #[cfg(target_arch = "x86_64")]
+        assert_eq!(EP_MAX_EVENTS, 178_956_970);
+    }
+
+    #[test]
+    fn the_high_half_of_the_register_is_not_part_of_maxevents() {
+        assert_eq!(epoll_maxevents(0x1_0000_0008), Ok(8));
+        assert_eq!(epoll_maxevents(0x1_0000_0000), Err(LxError::EINVAL));
+    }
+
+    // ---- the fd_set itself ------------------------------------------------
+    //
+    // `libos` addresses are ordinary host addresses, so a `Vec<u32>` is a
+    // valid stand-in for a user-space `fd_set` and the copies below run for
+    // real.
+
+    fn user_fdset(words: &mut [u32]) -> UserInOutPtr<u32> {
+        UserInOutPtr::from(words.as_mut_ptr() as usize)
+    }
+
+    /// Building the sets must not touch the caller's memory. It used to zero
+    /// each one as it read it, so a select that then failed — `EINTR` from a
+    /// signal, or a fault raised while reading the *second* set — handed back
+    /// an emptied `fd_set` that Linux leaves exactly as it was. The
+    /// `while (select(...) < 0 && errno == EINTR) continue;` loop that every
+    /// other program is written with then asked about no fds at all.
+    #[test]
+    fn reading_a_fd_set_leaves_the_callers_copy_alone() {
+        let mut words = [0b1011u32, 0xffff_ffff];
+        let before = words;
+        let fds = FdSet::new(user_fdset(&mut words), 64).unwrap();
+        assert_eq!(words, before);
+        assert!(fds.contains(FileDesc::from(0usize)));
+        assert!(fds.contains(FileDesc::from(1usize)));
+        assert!(!fds.contains(FileDesc::from(2usize)));
+        assert!(fds.contains(FileDesc::from(3usize)));
+        assert!(fds.contains(FileDesc::from(32usize)));
+    }
+
+    /// The answer is written once, and it is the ready set — not the set the
+    /// caller asked about. select(2) returns the fds that fired, so the ones
+    /// that did not must come back clear.
+    #[test]
+    fn committing_replaces_the_set_with_the_fds_that_fired() {
+        let mut words = [0b1011u32, 0xffff_ffff];
+        let mut fds = FdSet::new(user_fdset(&mut words), 64).unwrap();
+        fds.set(FileDesc::from(3usize));
+        fds.commit();
+        assert_eq!(words, [0b1000u32, 0]);
+    }
+
+    /// A timeout is an answer too: nothing fired, so the caller's sets come
+    /// back empty rather than still full of what it asked about.
+    #[test]
+    fn committing_nothing_clears_the_set() {
+        let mut words = [0xffff_ffffu32];
+        let mut fds = FdSet::new(user_fdset(&mut words), 32).unwrap();
+        fds.commit();
+        assert_eq!(words, [0u32]);
+    }
+
+    /// `select(n, NULL, NULL, &exceptfds, &tv)` is ordinary: the sets a caller
+    /// does not use are null, and an fd is never in one.
+    #[test]
+    fn a_null_fd_set_holds_nothing_and_writes_nothing() {
+        let mut fds = FdSet::new(UserInOutPtr::from(0), 64).unwrap();
+        assert!(!fds.contains(FileDesc::from(0usize)));
+        fds.set(FileDesc::from(0usize));
+        fds.commit();
+    }
+
+    /// An fd past the end of the set is simply not in it, and marking it
+    /// ready writes nothing: `select_core` walks `0..nfds` against three sets
+    /// that may be different sizes.
+    #[test]
+    fn an_fd_past_the_end_of_the_set_is_not_in_it() {
+        let mut words = [0xffff_ffffu32];
+        let mut fds = FdSet::new(user_fdset(&mut words), 32).unwrap();
+        assert!(!fds.contains(FileDesc::from(32usize)));
+        fds.set(FileDesc::from(32usize));
+        fds.commit();
+        assert_eq!(words, [0u32]);
+    }
+
+    /// The `fd_set` this kernel accepts stops at 1024 fds; `select_nfds` now
+    /// clamps before this is reached, so the two bounds agree.
+    #[test]
+    fn a_fd_set_wider_than_the_kernel_accepts_is_einval() {
+        let mut words = [0u32; MAX_FDSET_SIZE + 1];
+        assert_eq!(
+            FdSet::new(user_fdset(&mut words), MAX_SELECT_NFDS + 1).err(),
+            Some(LxError::EINVAL)
+        );
+        assert!(FdSet::new(user_fdset(&mut words), MAX_SELECT_NFDS).is_ok());
     }
 }
