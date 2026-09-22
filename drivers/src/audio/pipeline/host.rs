@@ -11,10 +11,7 @@
 //! which is what lets it be tested to the byte without one.
 //!
 //! Everything a client is told -- free, queued, delay, buffer -- is derived
-//! from one occupancy figure: this buffer, plus the stream's own PCM the
-//! mixer has already put in the DMA ring and the link has not played yet
-//! (the engine keeps the stream told where the ring stands). One identity
-//! holds at every fill level:
+//! from this buffer, and one identity holds at every fill level:
 //!
 //! ```text
 //! buffer_bytes - queued_bytes == what write() accepts right now
@@ -180,28 +177,7 @@ pub struct HostStream {
     /// run of them: the client fell behind.
     underruns: u64,
     empty_since_last_pull: bool,
-    /// The stream's PCM in the DMA ring, as runs of contiguous pulls
-    /// `(begin, end)` in the engine's stream coordinate, oldest first (a
-    /// new run opens after a pull that found the stream empty: the
-    /// mixer's silence sits between it and the last), and where the
-    /// engine stands against them: how far the controller has fetched
-    /// (its reported position, what Linux calls the hardware pointer) and
-    /// how far the link has played (the driver's link clock, never ahead
-    /// of the fetch). `in_ring` is the part not fetched yet and
-    /// `unplayed` the part not played yet, the silence between runs
-    /// excluded from both.
-    runs: VecDeque<(u64, u64)>,
-    played_to: u64,
-    fetched_to: u64,
-    in_ring: usize,
-    unplayed: usize,
 }
-
-/// Runs of a stream's PCM kept apart in the ring. A run is opened by a
-/// pull after an empty one, so this many outstanding takes a client that
-/// starves the mixer at that many consecutive fills and still has the
-/// oldest unplayed; past it the oldest (nearest the link) is let go.
-const RING_RUNS_MAX: usize = 32;
 
 impl HostStream {
     /// A stream of `capacity` link bytes at [`LINK_RATE`], `channels`
@@ -223,13 +199,6 @@ impl HostStream {
             pulled: 0,
             underruns: 0,
             empty_since_last_pull: false,
-            // Room for every run it may hold: nothing allocates under the
-            // device lock, which is IRQ-off.
-            runs: VecDeque::with_capacity(RING_RUNS_MAX),
-            played_to: 0,
-            fetched_to: 0,
-            in_ring: 0,
-            unplayed: 0,
         }
     }
 
@@ -273,7 +242,6 @@ impl HostStream {
         self.started = false;
         self.paused = false;
         self.empty_since_last_pull = false;
-        self.forget_ring();
         rate
     }
 
@@ -285,27 +253,11 @@ impl HostStream {
         self.src.is_some()
     }
 
-    /// `(free, queued)` in client bytes, from the one occupancy figure:
-    /// what is queued here and what is in the ring ahead of the
-    /// controller's fetch.
-    ///
-    /// Counting the ring's part is what makes `queued` the client's
-    /// frames the hardware has not taken, and so `hw_ptr = appl_ptr -
-    /// queued` the controller's position (as on Linux) rather than the
-    /// mixer's. With this buffer alone, a stream whose last frame the
-    /// mixer had just taken read as empty -- `avail` at the whole buffer
-    /// -- while up to the fill depth of it (85 ms) was still to play, and
-    /// the ALSA node's underrun rule (`avail >= stop_threshold`, Linux's)
-    /// called that an XRUN: EPIPE to a client that was not late, on every
-    /// sound shorter than the fill depth and on every writer that let its
-    /// queue run down to it. The fetch rather than the link is the
-    /// reference so that a controller that fetches far ahead of what it
-    /// plays (QEMU: 106 KB) does not eat the client's buffer; what it has
-    /// fetched and not played is in `delay`, as Linux's `runtime->delay`.
+    /// `(free, queued)` in client bytes, from the one occupancy figure.
     pub fn counts(&self) -> (usize, usize) {
         client_counts(
             self.capacity,
-            self.buf.len() + self.in_ring,
+            self.buf.len(),
             self.src_rates(),
             self.frame_bytes(),
         )
@@ -446,84 +398,12 @@ impl HostStream {
     }
 
     /// Drop everything and stop contributing. The converter and the rate
-    /// stay (a `reset` is not a prepare). What the mixer already took
-    /// plays out of the ring, but it is no longer the client's: its
-    /// position starts over.
+    /// stay (a `reset` is not a prepare).
     pub fn reset(&mut self) {
         self.buf.clear();
         self.started = false;
         self.paused = false;
         self.empty_since_last_pull = false;
-        self.forget_ring();
-    }
-
-    /// The mixer took `n` link bytes of this stream for ring position `at`
-    /// (the engine's stream coordinate). Contiguous with the previous
-    /// pull they extend the stream's current run in the ring; after a pull
-    /// that found the stream empty they open a new one, and the old run's
-    /// unplayed part stays the client's until the link gets there.
-    pub fn note_pulled(&mut self, at: u64, n: usize) {
-        if n == 0 {
-            return;
-        }
-        let end = at + n as u64;
-        match self.runs.back_mut() {
-            Some(run) if run.1 == at => run.1 = end,
-            _ => {
-                if self.runs.len() == RING_RUNS_MAX {
-                    self.runs.pop_front();
-                }
-                self.runs.push_back((at, end));
-            }
-        }
-        self.update_in_ring();
-    }
-
-    /// The engine moved: the link has played up to `played` and the
-    /// controller fetched up to `fetched` (never behind `played`).
-    pub fn note_played(&mut self, played: u64, fetched: u64) {
-        self.played_to = played;
-        self.fetched_to = fetched.max(played);
-        self.update_in_ring();
-    }
-
-    /// The ring's positions are gone (the engine stopped, or the stream
-    /// was reset): none of this stream is ahead of the link.
-    pub fn forget_ring(&mut self) {
-        self.runs.clear();
-        self.played_to = 0;
-        self.fetched_to = 0;
-        self.in_ring = 0;
-        self.unplayed = 0;
-    }
-
-    fn update_in_ring(&mut self) {
-        let (played, fetched) = (self.played_to, self.fetched_to);
-        while matches!(self.runs.front(), Some(&(_, end)) if end <= played) {
-            self.runs.pop_front();
-        }
-        let runs = &self.runs;
-        let ahead_of = |from: u64| -> usize {
-            runs.iter()
-                .map(|&(begin, end)| end.saturating_sub(from.max(begin)) as usize)
-                .sum()
-        };
-        let (in_ring, unplayed) = (ahead_of(fetched), ahead_of(played));
-        self.in_ring = in_ring;
-        self.unplayed = unplayed;
-    }
-
-    /// Link bytes of this stream in the ring the controller has not
-    /// fetched: the part of `queued_bytes` that is not in this buffer.
-    pub fn in_ring(&self) -> usize {
-        self.in_ring
-    }
-
-    /// Link bytes of this stream in the ring the link has not played:
-    /// [`in_ring`](HostStream::in_ring) plus what the controller holds
-    /// fetched. The client's delay is this and the queue.
-    pub fn unplayed(&self) -> usize {
-        self.unplayed
     }
 
     pub fn pause(&mut self) {

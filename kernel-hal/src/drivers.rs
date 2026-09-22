@@ -654,20 +654,6 @@ mod drivers_ffi_libos {
     extern "C" fn drivers_dma_verify_uncached(_paddr: PhysAddr, _pages: usize) -> i32 {
         0
     }
-
-    // What a driver allocated through `drivers_dma_alloc` it reaches through
-    // these: hosted physical memory is the mock pmem file, mapped once at a
-    // fixed offset.
-    use crate::VirtAddr;
-    #[no_mangle]
-    extern "C" fn drivers_phys_to_virt(paddr: PhysAddr) -> VirtAddr {
-        crate::mem::phys_to_virt(paddr)
-    }
-
-    #[no_mangle]
-    extern "C" fn drivers_virt_to_phys(vaddr: VirtAddr) -> PhysAddr {
-        vaddr - crate::mem::phys_to_virt(0)
-    }
 }
 
 #[cfg(not(feature = "libos"))]

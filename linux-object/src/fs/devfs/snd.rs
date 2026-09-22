@@ -4174,7 +4174,3 @@ impl INode for CtlDev {
         self
     }
 }
-
-#[cfg(test)]
-#[path = "snd_hda_tests.rs"]
-mod hda_tests;
