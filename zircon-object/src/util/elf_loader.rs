@@ -7,8 +7,9 @@ use core::convert::TryFrom;
 #[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
 use xmas_elf::program::ProgramHeader;
 use xmas_elf::{
+    header::Class,
     program::{Flags, SegmentData, Type},
-    sections::SectionData,
+    sections::{SectionData, SectionHeader, ShType},
     symbol_table::{DynEntry64, Entry},
     ElfFile,
 };
@@ -448,6 +449,124 @@ pub fn segment_end_pages(virtual_addr: u64, mem_size: u64) -> usize {
         .map_or(usize::MAX / PAGE_SIZE, |rounded| rounded / PAGE_SIZE)
 }
 
+/// The bytes section `sh` stores in the file, or nothing when it stores none
+/// that are there.
+///
+/// `SectionHeader::raw_data` unwraps `get_type()` -- an `Err` for any
+/// `sh_type` the parser does not know -- asserts the section is not
+/// `SHT_NULL`, and then slices the file with an unchecked add. This does none
+/// of that.
+fn section_bytes<'a>(elf: &ElfFile<'a>, sh: &SectionHeader) -> &'a [u8] {
+    // A section that stores no bytes in the file has none to hand back,
+    // whatever its `sh_offset` and `sh_size` say. Its size is also the one
+    // `check_elf_bounds` cannot bound -- it describes memory, not the file --
+    // so leaving this to the slice below would put the only guard on a number
+    // nothing has checked.
+    if sh.get_type() == Ok(ShType::NoBits) {
+        return &[];
+    }
+    let start = sh.offset() as usize;
+    let end = start.saturating_add(sh.size() as usize);
+    // Every other section is bounded by `check_elf_bounds`, so this slice
+    // exists; the fallback is there because nothing in the type system says so.
+    elf.input.get(start..end).unwrap_or(&[])
+}
+
+/// The nul-terminated name at `offset` in a string table.
+///
+/// Public so the loader's tests can reach it: it is the one place in this file
+/// whose whole job is to be the bounded version of something that panics, and
+/// through its callers every failure looks like a section that was not found.
+///
+/// Every name lookup in `xmas_elf` goes through `zero::read_str`, which panics
+/// twice over: `"No null byte in input"` when the table does not terminate,
+/// and `"Non-utf8 string"` when the bytes are not UTF-8. Both are bytes the
+/// file chose, so both were a kernel panic reachable from `execve`. Neither
+/// can be checked from outside, because the check is what the panic replaces:
+/// the scan has to be the bounded one.
+pub fn str_at(table: &[u8], offset: u32) -> Option<&str> {
+    let rest = table.get(offset as usize..)?;
+    let len = rest.iter().position(|&b| b == 0)?;
+    core::str::from_utf8(&rest[..len]).ok()
+}
+
+/// The section header table's own string table, which holds section names.
+fn section_names<'a>(elf: &ElfFile<'a>) -> &'a [u8] {
+    match elf.section_header(elf.header.pt2.sh_str_index()) {
+        Ok(names) => section_bytes(elf, &names),
+        Err(_) => &[],
+    }
+}
+
+/// Find a section by name, without going through [`str_at`]'s panicking
+/// counterpart in the parser.
+fn find_section<'a>(elf: &ElfFile<'a>, name: &str) -> Option<SectionHeader<'a>> {
+    let names = section_names(elf);
+    elf.section_iter()
+        .find(|sh| str_at(names, sh.name()) == Some(name))
+}
+
+/// Size of one entry of a section `xmas_elf` hands back as a slice, for the
+/// types this loader asks for.
+fn section_entry_size(elf: &ElfFile, ty: ShType) -> Option<usize> {
+    let is_64 = matches!(elf.header.pt1.class(), Class::SixtyFour);
+    Some(match ty {
+        ShType::SymTab | ShType::DynSym => {
+            if is_64 {
+                24
+            } else {
+                16
+            }
+        }
+        ShType::Rela => {
+            if is_64 {
+                24
+            } else {
+                12
+            }
+        }
+        ShType::Rel => {
+            if is_64 {
+                16
+            } else {
+                8
+            }
+        }
+        _ => return None,
+    })
+}
+
+/// A section's contents, as the type the caller asked for.
+///
+/// Two checks the parser leaves out. It dispatches on `sh_type` alone, so
+/// asking it for `.dynsym` and being handed a note section, or a group, or a
+/// 32-bit note it answers with `unimplemented!()`, is a matter of what the
+/// file says; naming the expected type here means only the types this loader
+/// understands are ever parsed. And half of them it turns into a slice with
+/// `zero::read_array`, which ASSERTS that the section divides exactly into
+/// entries -- a `.dynsym` one byte short of a whole symbol panicked the
+/// kernel.
+fn section_data<'a>(
+    elf: &ElfFile<'a>,
+    sh: &SectionHeader<'a>,
+    expected: ShType,
+) -> Option<SectionData<'a>> {
+    if sh.get_type() != Ok(expected) {
+        return None;
+    }
+    if let Some(entry_size) = section_entry_size(elf, expected) {
+        if !(sh.size() as usize).is_multiple_of(entry_size) {
+            warn!(
+                "elf: section of {} bytes does not divide into {}-byte entries",
+                sh.size(),
+                entry_size
+            );
+            return None;
+        }
+    }
+    sh.get_data(elf).ok()
+}
+
 /// Extensional ELF loading methods for `ElfFile`.
 pub trait ElfExt {
     /// Get total size of all LOAD segments.
@@ -490,13 +609,21 @@ impl ElfExt for ElfFile<'_> {
     }
 
     fn get_symbol_address(&self, symbol: &str) -> Option<u64> {
+        // Every section, asked for its contents whatever its type, used to run
+        // through the parser's whole dispatch: a group section indexed
+        // `data[0]` on an empty one, a 32-bit note reached an
+        // `unimplemented!()`, and anything it hands back as a slice asserted
+        // on the section's size. Only symbol tables are of any interest here.
+        let names = find_section(self, ".strtab")
+            .map(|strtab| section_bytes(self, &strtab))
+            .unwrap_or(&[]);
         for section in self.section_iter() {
-            if let Ok(SectionData::SymbolTable64(entries)) = section.get_data(self) {
+            if let Some(SectionData::SymbolTable64(entries)) =
+                section_data(self, &section, ShType::SymTab)
+            {
                 for e in entries {
-                    if let Ok(name) = e.get_name(self) {
-                        if name == symbol {
-                            return Some(e.value());
-                        }
+                    if str_at(names, e.name()) == Some(symbol) {
+                        return Some(e.value());
                     }
                 }
             }
@@ -547,12 +674,8 @@ impl ElfExt for ElfFile<'_> {
     }
 
     fn dynsym(&self) -> Result<&[DynEntry64], &'static str> {
-        match self
-            .find_section_by_name(".dynsym")
-            .ok_or(".dynsym not found")?
-            .get_data(self)
-            .map_err(|_| "corrupted .dynsym")?
-        {
+        let section = find_section(self, ".dynsym").ok_or(".dynsym not found")?;
+        match section_data(self, &section, ShType::DynSym).ok_or("corrupted .dynsym")? {
             SectionData::DynSymbolTable64(dsym) => Ok(dsym),
             _ => Err("bad .dynsym"),
         }
@@ -648,17 +771,19 @@ impl ElfExt for ElfFile<'_> {
         // back the procedure linkage table; skipping it leaves call targets
         // pointing at unrelocated stubs (observed as a jump to a low address and
         // an Invalid Opcode #UD fault).
+        // Names for the log line below, read the bounded way.
+        let dynstr = find_section(self, ".dynstr")
+            .map(|dynstr| section_bytes(self, &dynstr))
+            .unwrap_or(&[]);
         for &sec_name in [".rela.dyn", ".rela.plt"].iter() {
-            let section = match self.find_section_by_name(sec_name) {
+            let section = match find_section(self, sec_name) {
                 Some(section) => section,
                 None => continue,
             };
-            let entries = match section
-                .get_data(self)
-                .map_err(|_| "corrupted relocation section")?
-            {
-                SectionData::Rela64(entries) => entries,
-                _ => continue,
+            let entries = match section_data(self, &section, ShType::Rela) {
+                Some(SectionData::Rela64(entries)) => entries,
+                Some(_) => continue,
+                None => return Err("corrupted relocation section"),
             };
             found_any = true;
             for entry in entries.iter() {
@@ -676,13 +801,26 @@ impl ElfExt for ElfFile<'_> {
                                 continue;
                             }
                         };
-                        let sym = &dynsym[entry.get_symbol_table_index() as usize];
+                        // The index is a `u32` the file chose, and indexing
+                        // the slice with it panicked the kernel on any entry
+                        // naming a symbol past the end of `.dynsym`.
+                        let sym = match dynsym.get(entry.get_symbol_table_index() as usize) {
+                            Some(sym) => sym,
+                            None => {
+                                warn!(
+                                    "relocate: symbol index {} is outside .dynsym ({} entries)",
+                                    entry.get_symbol_table_index(),
+                                    dynsym.len()
+                                );
+                                continue;
+                            }
+                        };
                         // An undefined symbol (shndx == 0) is resolved later by the
                         // dynamic linker in user space (or is simply unavailable to
                         // the in-kernel loader). Skip it instead of panicking — a
                         // user binary must never be able to crash the kernel.
                         if sym.shndx() == 0 {
-                            let name = sym.get_name(self).unwrap_or("<unknown>");
+                            let name = str_at(dynstr, sym.name()).unwrap_or("<unknown>");
                             warn!("relocate: undefined symbol {:?}, skipping", name);
                             continue;
                         }

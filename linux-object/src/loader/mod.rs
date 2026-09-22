@@ -871,8 +871,13 @@ mod elf_bounds_tests {
     #[derive(Clone, Copy, Default)]
     struct Shdr {
         sh_type: u32,
+        /// Offset of this section's name in the name table.
+        name: u32,
         offset: u64,
         size: u64,
+        /// Set instead of `offset` to place the section in the payload area,
+        /// whose position depends on how many headers there turn out to be.
+        at_payload: Option<u64>,
     }
 
     /// An ELF64 image built field by field, so a test can put one value out of
@@ -917,6 +922,14 @@ mod elf_bounds_tests {
             self
         }
 
+        /// Append `bytes` to the payload and return where they start, as an
+        /// offset within it.
+        fn blob(&mut self, bytes: &[u8]) -> u64 {
+            let at = self.payload.len() as u64;
+            self.payload.extend_from_slice(bytes);
+            at
+        }
+
         fn build(&self) -> Vec<u8> {
             let ph_table = EHDR_SIZE;
             let sh_table = ph_table + self.phdrs.len() * PHDR_SIZE;
@@ -950,8 +963,13 @@ mod elf_bounds_tests {
             }
             for (i, sh) in self.shdrs.iter().enumerate() {
                 let at = sh_table + i * SHDR_SIZE;
+                let offset = match sh.at_payload {
+                    Some(within) => payload_at as u64 + within,
+                    None => sh.offset,
+                };
+                v[at..at + 4].copy_from_slice(&sh.name.to_le_bytes());
                 v[at + 4..at + 8].copy_from_slice(&sh.sh_type.to_le_bytes());
-                v[at + 24..at + 32].copy_from_slice(&sh.offset.to_le_bytes());
+                v[at + 24..at + 32].copy_from_slice(&offset.to_le_bytes());
                 v[at + 32..at + 40].copy_from_slice(&sh.size.to_le_bytes());
             }
             v.extend_from_slice(&self.payload);
@@ -1084,6 +1102,7 @@ mod elf_bounds_tests {
             sh_type: SHT_PROGBITS,
             offset: payload_at(0) + SHDR_SIZE as u64,
             size: 8,
+            ..Default::default()
         });
         elf.payload = vec![0u8; 8];
         assert_eq!(check_elf_bounds(&elf.build()), Ok(()));
@@ -1099,6 +1118,7 @@ mod elf_bounds_tests {
             sh_type: SHT_NOBITS,
             offset: payload_at(0) + SHDR_SIZE as u64,
             size: 0x10000,
+            ..Default::default()
         });
         assert_eq!(check_elf_bounds(&elf.build()), Ok(()));
 
@@ -1108,6 +1128,7 @@ mod elf_bounds_tests {
             sh_type: SHT_NOBITS,
             offset: 0x1000,
             size: 0,
+            ..Default::default()
         });
         assert_eq!(check_elf_bounds(&elf.build()), Err(ZxError::INVALID_ARGS));
     }
@@ -1302,6 +1323,222 @@ mod elf_bounds_tests {
         // In range as a number, outside the user address space.
         assert!(entry_address(0, STACK_TOP as u64).is_err());
         assert_eq!(entry_address(0, STACK_TOP as u64 - 1), Ok(STACK_TOP - 1));
+    }
+
+    /// `sh_type` values this tree's loader meets.
+    const SHT_SYMTAB: u32 = 2;
+    const SHT_STRTAB: u32 = 3;
+    const SHT_RELA: u32 = 4;
+    const SHT_DYNSYM: u32 = 11;
+    const SHT_GROUP: u32 = 17;
+
+    /// An image with a section table: a name table, and the sections the
+    /// caller asks for as `(name, sh_type, contents)`, named from it.
+    fn with_sections(sections: &[(&str, u32, &[u8])]) -> Vec<u8> {
+        with_named_sections(sections, None)
+    }
+
+    /// The same, but the name table's own contents can be supplied whole --
+    /// which is how a table with no terminator gets built.
+    fn with_named_sections(sections: &[(&str, u32, &[u8])], names: Option<&[u8]>) -> Vec<u8> {
+        let mut table = vec![0u8];
+        let mut offsets = Vec::new();
+        for (name, _, _) in sections {
+            offsets.push(table.len() as u32);
+            table.extend_from_slice(name.as_bytes());
+            table.push(0);
+        }
+        let table_name = table.len() as u32;
+        table.extend_from_slice(b".shstrtab\0");
+        let table = names.map(<[u8]>::to_vec).unwrap_or(table);
+
+        let mut elf = Elf::new();
+        let mut placed = Vec::new();
+        for (i, (_, sh_type, data)) in sections.iter().enumerate() {
+            let at = elf.blob(data);
+            placed.push(Shdr {
+                name: offsets[i],
+                sh_type: *sh_type,
+                at_payload: Some(at),
+                size: data.len() as u64,
+                offset: 0,
+            });
+        }
+        let table_at = elf.blob(&table);
+        elf.shdrs.extend(placed);
+        elf.shdrs.push(Shdr {
+            name: table_name,
+            sh_type: SHT_STRTAB,
+            at_payload: Some(table_at),
+            size: table.len() as u64,
+            offset: 0,
+        });
+        elf.sh_str_index = sections.len() as u16;
+        elf.build()
+    }
+
+    /// One `Elf64_Sym`: name offset at 0, value at 8.
+    fn symbol(name: u32, value: u64) -> [u8; 24] {
+        let mut sym = [0u8; 24];
+        sym[..4].copy_from_slice(&name.to_le_bytes());
+        // `st_shndx` of 1: a defined symbol, so `relocate` does not skip it.
+        sym[6..8].copy_from_slice(&1u16.to_le_bytes());
+        sym[8..16].copy_from_slice(&value.to_le_bytes());
+        sym
+    }
+
+    /// Every name in an ELF is an offset into a table of nul-terminated
+    /// strings, and both the offset and the bytes come from the file.
+    /// `zero::read_str`, which every name lookup in the parser goes through,
+    /// panics on a table that does not terminate and again on bytes that are
+    /// not UTF-8.
+    #[test]
+    fn a_name_read_from_a_string_table_is_bounded_at_both_ends() {
+        let table = b"\0first\0second\0";
+        assert_eq!(str_at(table, 1), Some("first"));
+        assert_eq!(str_at(table, 7), Some("second"));
+        assert_eq!(str_at(table, 0), Some(""));
+        // A name may start part way through another, which is how a linker
+        // shares the tail of a string.
+        assert_eq!(str_at(table, 10), Some("ond"));
+
+        // Past the end of the table.
+        assert_eq!(str_at(table, table.len() as u32 + 1), None);
+        assert_eq!(str_at(table, u32::MAX), None);
+        // No terminator: the scan used to run off the end of the table.
+        assert_eq!(str_at(b"no terminator", 0), None);
+        // Not UTF-8.
+        assert_eq!(str_at(b"\xff\xfe\0", 0), None);
+        assert_eq!(str_at(b"", 0), None);
+    }
+
+    /// `get_data` hands back a symbol table as a slice with
+    /// `zero::read_array`, which ASSERTS that the section divides exactly into
+    /// entries. A `.symtab` one byte long panicked the kernel, and
+    /// `get_symbol_address` runs on every exec looking for the syscall
+    /// trampoline.
+    #[test]
+    fn a_symbol_table_that_does_not_divide_into_symbols_is_not_read() {
+        let names = b"\0entry\0";
+        let good = with_sections(&[
+            (".symtab", SHT_SYMTAB, &symbol(1, 0x1234)),
+            (".strtab", SHT_STRTAB, names),
+        ]);
+        let elf = parse_checked_elf(&good).unwrap();
+        assert_eq!(elf.get_symbol_address("entry"), Some(0x1234));
+        assert_eq!(elf.get_symbol_address("missing"), None);
+
+        // The same table with one byte too many.
+        let mut ragged = symbol(1, 0x1234).to_vec();
+        ragged.push(0);
+        let bad = with_sections(&[
+            (".symtab", SHT_SYMTAB, &ragged),
+            (".strtab", SHT_STRTAB, names),
+        ]);
+        let elf = parse_checked_elf(&bad).unwrap();
+        assert_eq!(elf.get_symbol_address("entry"), None);
+    }
+
+    /// The same for `.dynsym`, which `relocate` reads on every dynamically
+    /// linked program.
+    #[test]
+    fn a_ragged_dynsym_is_an_error_not_a_panic() {
+        let good = with_sections(&[(".dynsym", SHT_DYNSYM, &symbol(1, 0x20))]);
+        assert_eq!(
+            parse_checked_elf(&good).unwrap().dynsym().map(<[_]>::len),
+            Ok(1)
+        );
+
+        let bad = with_sections(&[(".dynsym", SHT_DYNSYM, &symbol(1, 0x20)[..23])]);
+        assert!(parse_checked_elf(&bad).unwrap().dynsym().is_err());
+
+        // And an image with no `.dynsym` at all, which is most of them.
+        let none = with_sections(&[(".text", 1, b"\x90")]);
+        assert!(parse_checked_elf(&none).unwrap().dynsym().is_err());
+    }
+
+    /// `get_symbol_address` asked every section for its contents whatever its
+    /// type, so the parser's whole dispatch ran on file-chosen bytes: an empty
+    /// group section indexed `data[0]`, and a 32-bit note reached an
+    /// `unimplemented!()`. Only symbol tables are of any interest here, and
+    /// the search has to carry on past the rest.
+    #[test]
+    fn a_section_type_the_parser_cannot_handle_is_skipped() {
+        let image = with_sections(&[
+            (".group", SHT_GROUP, b""),
+            (".symtab", SHT_SYMTAB, &symbol(1, 0x5678)),
+            (".strtab", SHT_STRTAB, b"\0entry\0"),
+        ]);
+        let elf = parse_checked_elf(&image).unwrap();
+        assert_eq!(elf.get_symbol_address("entry"), Some(0x5678));
+    }
+
+    /// A section may declare a size and store nothing (`.bss` is the usual
+    /// one), and that size is the one the bounds check cannot bound: it
+    /// describes memory, not the file. So a string table declared that way
+    /// holds no names, whatever bytes happen to sit where it points.
+    #[test]
+    fn a_string_table_that_stores_no_bytes_holds_no_names() {
+        const SHT_NOBITS: u32 = 8;
+        let names = b"\0entry\0";
+        // The very same image, with `.strtab` the one way and the other.
+        let real = with_sections(&[
+            (".symtab", SHT_SYMTAB, &symbol(1, 0x4321)),
+            (".strtab", SHT_STRTAB, names),
+        ]);
+        assert_eq!(
+            parse_checked_elf(&real)
+                .unwrap()
+                .get_symbol_address("entry"),
+            Some(0x4321)
+        );
+
+        let nobits = with_sections(&[
+            (".symtab", SHT_SYMTAB, &symbol(1, 0x4321)),
+            (".strtab", SHT_NOBITS, names),
+        ]);
+        assert_eq!(
+            parse_checked_elf(&nobits)
+                .unwrap()
+                .get_symbol_address("entry"),
+            None
+        );
+    }
+
+    /// The section names themselves live in a table the file chose, so a
+    /// lookup by name is a string read like any other. With nothing readable
+    /// there, no section is found -- which is the answer for a stripped
+    /// binary too, and not a panic.
+    #[test]
+    fn a_name_table_that_does_not_terminate_finds_no_sections() {
+        let image = with_named_sections(
+            &[(".dynsym", SHT_DYNSYM, &symbol(1, 0x20))],
+            Some(b"\0.dynsym"),
+        );
+        let elf = parse_checked_elf(&image).unwrap();
+        assert!(elf.dynsym().is_err());
+        assert_eq!(elf.get_symbol_address("entry"), None);
+    }
+
+    /// A relocation names its symbol by index into `.dynsym`, and the index is
+    /// a `u32` from the file: indexing the slice with it panicked the kernel
+    /// on any entry pointing past the end of the table.
+    #[test]
+    fn a_relocation_naming_a_symbol_outside_dynsym_is_skipped() {
+        // One `Elf64_Rela`: r_offset, then r_info as (symbol index << 32) |
+        // type, then r_addend. Type 6 is R_X86_64_GLOB_DAT, which resolves a
+        // symbol and so reaches the table.
+        let mut rela = [0u8; 24];
+        rela[..8].copy_from_slice(&0x1000u64.to_le_bytes());
+        rela[8..16].copy_from_slice(&(((0xffff_u64) << 32) | 6).to_le_bytes());
+        let image = with_sections(&[
+            (".rela.dyn", SHT_RELA, &rela),
+            (".dynsym", SHT_DYNSYM, &symbol(1, 0x20)),
+            (".dynstr", SHT_STRTAB, b"\0entry\0"),
+        ]);
+        let elf = parse_checked_elf(&image).unwrap();
+        let vmar = VmAddressRegion::new_root();
+        assert_eq!(elf.relocate(vmar.clone(), &vmar), Ok(()));
     }
 
     /// Every check here rejects something, and a check that rejects too much
