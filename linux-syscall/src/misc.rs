@@ -3,7 +3,7 @@ use core::time::Duration;
 use kernel_hal::timer::timer_now;
 use linux_object::time::*;
 use zircon_object::task::ThreadState;
-use zircon_object::ZxError;
+use zircon_object::{ZxError, ZxResult};
 
 impl Syscall<'_> {
     #[cfg(target_arch = "x86_64")]
@@ -605,24 +605,20 @@ impl Syscall<'_> {
                 // FUTEX_CLOCK_REALTIME selects (monotonic otherwise).
                 // TRYLOCK_PI never sleeps and ignores it.
                 let deadline = if cmd == FUTEX_TRYLOCK_PI {
-                    None
+                    NO_FUTEX_DEADLINE
                 } else {
                     let timeout_addr: UserInPtr<TimeSpec> = val2.into();
-                    match timeout_addr.read_if_not_null()? {
-                        None => None,
-                        Some(timeout) => {
-                            let now = if cmd == FUTEX_LOCK_PI || op & FUTEX_CLOCK_REALTIME != 0 {
-                                Duration::from(TimeSpec::now())
-                            } else {
-                                Duration::from(TimeSpec::now_monotonic())
-                            };
-                            // Validated and saturating: a `timespec` out of
-                            // range is EINVAL, and adding a `Duration`
-                            // panics on overflow.
-                            let dur = timeout.try_into_duration()?;
-                            Some(timer_now().saturating_add(dur.saturating_sub(now)))
-                        }
-                    }
+                    // Validated: a `timespec` out of range is EINVAL.
+                    let timeout = timeout_addr
+                        .read_if_not_null()?
+                        .map(|timeout| timeout.try_into_duration())
+                        .transpose()?;
+                    let now = if cmd == FUTEX_LOCK_PI || op & FUTEX_CLOCK_REALTIME != 0 {
+                        Duration::from(TimeSpec::now())
+                    } else {
+                        Duration::from(TimeSpec::now_monotonic())
+                    };
+                    futex_deadline(timer_now(), timeout, Some(now))
                 };
                 loop {
                     let cur = futex.load();
@@ -651,14 +647,13 @@ impl Syscall<'_> {
                         continue;
                     }
                     let future = futex.wait(contended);
-                    let res = match deadline {
-                        Some(deadline) => {
-                            self.thread
-                                .blocking_run(future, ThreadState::BlockedFutex, deadline, None)
-                                .await
-                        }
-                        None => future.await,
-                    };
+                    // ALWAYS through `blocking_run`, even with no timeout:
+                    // see `futex_deadline`. Awaiting the raw future here left
+                    // a contended PI mutex unkillable.
+                    let res: ZxResult = self
+                        .thread
+                        .blocking_run(future, ThreadState::BlockedFutex, deadline, None)
+                        .await;
                     match res {
                         // Woken by UNLOCK_PI, or the word changed under us
                         // before we were queued: re-read and retry.
@@ -699,30 +694,34 @@ impl Syscall<'_> {
                 // both musl and glibc only use FUTEX_BITSET_MATCH_ANY here.
                 let future = futex.wait(val as _);
                 let timeout_addr: UserInPtr<TimeSpec> = val2.into();
-                let res = if let Some(timeout) = timeout_addr.read_if_not_null()? {
-                    // FUTEX_WAIT takes a relative timeout; FUTEX_WAIT_BITSET
-                    // takes an absolute one on the clock selected by
-                    // FUTEX_CLOCK_REALTIME. Convert absolute deadlines to the
-                    // kernel's monotonic deadline base.
-                    // Validated and saturating: a `timespec` out of range is
-                    // EINVAL, and adding a `Duration` panics on overflow.
-                    let dur = timeout.try_into_duration()?;
-                    let deadline = if cmd == FUTEX_WAIT_BITSET {
-                        let now = if op & FUTEX_CLOCK_REALTIME != 0 {
-                            Duration::from(TimeSpec::now())
-                        } else {
-                            Duration::from(TimeSpec::now_monotonic())
-                        };
-                        timer_now().saturating_add(dur.saturating_sub(now))
+                // Validated: a `timespec` out of range is EINVAL, and it is
+                // rejected whether or not we end up waiting.
+                let timeout = timeout_addr
+                    .read_if_not_null()?
+                    .map(|timeout| timeout.try_into_duration())
+                    .transpose()?;
+                // FUTEX_WAIT takes a RELATIVE timeout; FUTEX_WAIT_BITSET takes
+                // an ABSOLUTE one on the clock FUTEX_CLOCK_REALTIME selects.
+                let on_clock = (cmd == FUTEX_WAIT_BITSET).then(|| {
+                    if op & FUTEX_CLOCK_REALTIME != 0 {
+                        Duration::from(TimeSpec::now())
                     } else {
-                        timer_now().saturating_add(dur)
-                    };
-                    self.thread
-                        .blocking_run(future, ThreadState::BlockedFutex, deadline, None)
-                        .await
-                } else {
-                    future.await
-                };
+                        Duration::from(TimeSpec::now_monotonic())
+                    }
+                });
+                // ALWAYS through `blocking_run`, even with no timeout: see
+                // `futex_deadline`. A null `timespec` is the ordinary case --
+                // every contended `pthread_mutex_lock` -- and awaiting the raw
+                // future there made the wait uninterruptible by anything.
+                let res: ZxResult = self
+                    .thread
+                    .blocking_run(
+                        future,
+                        ThreadState::BlockedFutex,
+                        futex_deadline(timer_now(), timeout, on_clock),
+                        None,
+                    )
+                    .await;
                 match res {
                     Ok(_) => Ok(0),
                     Err(e) => Err(e.into()),
@@ -896,6 +895,55 @@ impl Syscall<'_> {
             written += current_len;
         }
         Ok(len)
+    }
+}
+
+/// The deadline a `futex` wait gets when it was given no timeout: far enough
+/// out never to fire, and the same "no deadline" this kernel already uses for
+/// a thread blocked on an exception (`Thread::handle_exception`).
+pub const NO_FUTEX_DEADLINE: Duration = Duration::from_nanos(u64::MAX);
+
+/// How long a `futex` wait blocks, as a deadline on the kernel's monotonic
+/// clock.
+///
+/// `timeout` is `None` when the caller passed a null `timespec`, which
+/// futex(2) documents as "block indefinitely". **Indefinitely still means
+/// interruptibly**, so this answers with a deadline that never fires rather
+/// than an `Option` a caller could serve by awaiting the raw future -- and
+/// that distinction is the whole reason the function exists. A futex wait
+/// that skips `Thread::blocking_run` registers no killer and never enters
+/// `BlockedFutex`, and `FutexFuture` has no timer, no signal check and no
+/// wakeup of its own, so once a thread parks there NOTHING in the kernel can
+/// end the wait but a matching `FUTEX_WAKE`: not a signal, not `kill -9`, not
+/// the process exiting, and `/proc` does not even show it as blocked. The
+/// untimed wait is the ordinary one -- it is what a contended
+/// `pthread_mutex_lock` and a `pthread_cond_wait` without a deadline come
+/// down to -- so that is a whole process wedged past rescue.
+///
+/// `on_clock` says how `timeout` is expressed:
+/// * `None` -- RELATIVE to now, which is what plain `FUTEX_WAIT` takes.
+/// * `Some(now)` -- ABSOLUTE, a point on the clock the operation selected,
+///   with `now` read from that same clock. `FUTEX_WAIT_BITSET` and the PI
+///   locks take these: on `CLOCK_REALTIME` when `FUTEX_CLOCK_REALTIME` is set
+///   (and always, for `FUTEX_LOCK_PI`), on `CLOCK_MONOTONIC` otherwise.
+pub fn futex_deadline(
+    now_monotonic: Duration,
+    timeout: Option<Duration>,
+    on_clock: Option<Duration>,
+) -> Duration {
+    let timeout = match timeout {
+        Some(timeout) => timeout,
+        None => return NO_FUTEX_DEADLINE,
+    };
+    match on_clock {
+        // An absolute deadline is a point on the CALLER's clock while the
+        // kernel sleeps on the monotonic one, so carry over only what is left
+        // of it. One already past saturates to nothing left, which is the
+        // immediate ETIMEDOUT Linux gives.
+        Some(clock_now) => now_monotonic.saturating_add(timeout.saturating_sub(clock_now)),
+        // Saturating rather than `+`: adding a `Duration` panics on overflow,
+        // and the timeout came from userspace.
+        None => now_monotonic.saturating_add(timeout),
     }
 }
 
@@ -1127,4 +1175,154 @@ pub struct SysInfo {
     freehigh: u64,
     /// Memory unit size in bytes
     mem_unit: u32,
+}
+
+#[cfg(test)]
+mod futex_deadline_tests {
+    use super::{futex_deadline, NO_FUTEX_DEADLINE};
+    use core::time::Duration;
+
+    /// The monotonic clock at the moment `sys_futex` computes a deadline.
+    /// Anything but zero, so a deadline that forgot to start from *now* is
+    /// visibly different from one that did.
+    fn kernel_now() -> Duration {
+        Duration::new(1_234, 500_000_000)
+    }
+
+    /// A `futex` wait with a null `timespec` blocks indefinitely, and that
+    /// must be expressed as a deadline that never fires -- NOT as "no
+    /// deadline", which is the shape that lets a caller skip
+    /// `Thread::blocking_run`.
+    ///
+    /// The distinction is not cosmetic. Without `blocking_run` the thread
+    /// registers no killer with `Thread::kill`, never enters `BlockedFutex`,
+    /// and waits on a `FutexFuture` that has no timer and no signal check --
+    /// so a plain contended `pthread_mutex_lock` becomes a wait nothing in
+    /// the kernel can end but a matching `FUTEX_WAKE`.
+    #[test]
+    fn no_timeout_is_a_deadline_that_never_fires() {
+        assert_eq!(
+            futex_deadline(kernel_now(), None, None),
+            NO_FUTEX_DEADLINE,
+            "a relative wait with no timeout must still get a deadline"
+        );
+        assert_eq!(
+            futex_deadline(kernel_now(), None, Some(Duration::from_secs(9_999))),
+            NO_FUTEX_DEADLINE,
+            "an absolute wait with a null timespec ignores the clock too"
+        );
+    }
+
+    /// Pinned against literals, not against `NO_FUTEX_DEADLINE` itself: the
+    /// point of the constant is that it is far enough out that a kernel that
+    /// boots today never reaches it. `u64::MAX` nanoseconds is ~584 years of
+    /// uptime, and this is the same value `Thread::handle_exception` already
+    /// uses for a blocked-on-exception thread.
+    #[test]
+    fn the_never_deadline_is_centuries_away() {
+        assert_eq!(NO_FUTEX_DEADLINE.as_nanos(), u64::MAX as u128);
+        assert!(
+            NO_FUTEX_DEADLINE.as_secs() > 500 * 365 * 24 * 3600,
+            "a 'never' deadline that can be reached is a timeout: {:?}",
+            NO_FUTEX_DEADLINE
+        );
+    }
+
+    /// Plain `FUTEX_WAIT` takes a RELATIVE timeout, counted from now.
+    #[test]
+    fn a_relative_timeout_counts_from_now() {
+        assert_eq!(
+            futex_deadline(kernel_now(), Some(Duration::from_millis(250)), None),
+            kernel_now() + Duration::from_millis(250)
+        );
+    }
+
+    /// `FUTEX_WAIT_BITSET` and the PI locks take an ABSOLUTE deadline on the
+    /// clock they selected, while the kernel sleeps on the monotonic one.
+    /// Only what is LEFT of it carries over.
+    #[test]
+    fn an_absolute_deadline_carries_over_what_is_left_of_it() {
+        // The caller asked for 09:00:03 on a clock that reads 09:00:01, so
+        // there are two seconds left however far that clock is from the
+        // kernel's own.
+        let clock_now = Duration::from_secs(1_600_000_001);
+        let absolute = Duration::from_secs(1_600_000_003);
+        assert_eq!(
+            futex_deadline(kernel_now(), Some(absolute), Some(clock_now)),
+            kernel_now() + Duration::from_secs(2),
+            "an absolute deadline must not be used as a monotonic one"
+        );
+    }
+
+    /// The realtime and monotonic clocks read wildly different numbers (one
+    /// is seconds since 1970, the other since boot), so reading the wrong one
+    /// for an absolute deadline is the difference between "in 2 seconds" and
+    /// "in fifty years". Both must give the same remaining time.
+    #[test]
+    fn the_clock_the_deadline_is_on_is_the_clock_it_is_measured_against() {
+        let left = Duration::from_secs(2);
+        let realtime = futex_deadline(
+            kernel_now(),
+            Some(Duration::from_secs(1_600_000_000) + left),
+            Some(Duration::from_secs(1_600_000_000)),
+        );
+        let monotonic = futex_deadline(
+            kernel_now(),
+            Some(Duration::from_secs(42) + left),
+            Some(Duration::from_secs(42)),
+        );
+        assert_eq!(realtime, monotonic);
+        assert_eq!(realtime, kernel_now() + left);
+    }
+
+    /// An absolute deadline already in the past is not an error and not a
+    /// wait: Linux answers `ETIMEDOUT` straight away, which here is a
+    /// deadline of "now" that `blocking_run`'s `sleep_until` has already
+    /// passed. It must saturate rather than underflow.
+    #[test]
+    fn an_absolute_deadline_already_past_times_out_at_once() {
+        let clock_now = Duration::from_secs(1_600_000_010);
+        let absolute = Duration::from_secs(1_600_000_000);
+        assert_eq!(
+            futex_deadline(kernel_now(), Some(absolute), Some(clock_now)),
+            kernel_now(),
+            "a deadline ten seconds in the past must expire now, not wrap"
+        );
+    }
+
+    /// The timeout comes from userspace, and `Duration + Duration` PANICS on
+    /// overflow -- in the kernel, from an unprivileged `futex` call. Both
+    /// paths saturate.
+    #[test]
+    fn an_absurd_timeout_saturates_instead_of_panicking() {
+        let huge = Duration::new(u64::MAX, 999_999_999);
+        assert_eq!(
+            futex_deadline(kernel_now(), Some(huge), None),
+            Duration::MAX
+        );
+        assert_eq!(
+            futex_deadline(kernel_now(), Some(huge), Some(Duration::ZERO)),
+            Duration::MAX
+        );
+    }
+
+    /// A deadline already reached and a deadline that never fires are the two
+    /// ends of the range, and nothing in between may collapse onto either.
+    #[test]
+    fn a_finite_timeout_is_never_the_never_deadline() {
+        for timeout in [
+            Duration::ZERO,
+            Duration::from_nanos(1),
+            Duration::from_secs(60),
+            Duration::from_secs(365 * 24 * 3600),
+        ] {
+            let deadline = futex_deadline(kernel_now(), Some(timeout), None);
+            assert_ne!(
+                deadline, NO_FUTEX_DEADLINE,
+                "a {:?} timeout must stay a timeout",
+                timeout
+            );
+            assert_eq!(deadline, kernel_now() + timeout);
+        }
+    }
 }
