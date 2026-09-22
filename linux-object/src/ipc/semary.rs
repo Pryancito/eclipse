@@ -30,9 +30,31 @@ pub struct SemArray {
     /// semid data structure
     pub semid_ds: Mutex<SemidDs>,
     sems: Vec<Semaphore>,
+    /// Serialises `semop` over the whole set.
+    ///
+    /// semop(2): "The set of operations contained in `sops` is performed in
+    /// array order, and **atomically**, that is, the operations are performed
+    /// either as a complete unit, or not at all." Each `Semaphore` has its
+    /// own lock, which is enough for one of them and says nothing about the
+    /// set -- two callers could interleave halfway through their arrays and
+    /// both see a state neither of them ever agreed to. Linux keeps one lock
+    /// per set for exactly this; so does this.
+    semop_lock: Mutex<()>,
 }
 
 impl SemArray {
+    /// Take the set-wide `semop` lock. Held across the plan AND the apply,
+    /// which is what makes the array atomic.
+    pub fn semop_guard(&self) -> kernel_hal::sync::MutexGuard<'_, ()> {
+        self.semop_lock.lock()
+    }
+
+    /// The value and generation of every semaphore in the set, read under the
+    /// caller's [`semop_guard`](Self::semop_guard).
+    pub fn snapshot(&self) -> Vec<(isize, u64)> {
+        self.sems.iter().map(|s| s.get_versioned()).collect()
+    }
+
     /// Number of semaphores in the set.
     pub fn len(&self) -> usize {
         self.sems.len()
@@ -165,6 +187,7 @@ impl SemArray {
                 __pad2: 0,
             }),
             sems: semaphores,
+            semop_lock: Mutex::new(()),
         });
         // A private set has no name, so nothing may ever look it up again.
         if key != 0 {
