@@ -69,7 +69,21 @@ struct Syncobj {
     /// hang, not a rounding error: wlroots' `linux-drm-syncobj-v1` moves a
     /// client's acquire point into its own timeline at a point it chooses, then
     /// waits on it, so a point that never arrives freezes that surface.
-    linked: Option<(u32, u64, u64)>,
+    linked: Option<Link>,
+}
+
+/// A deferred dependency: the object reaches `dst_point` once EVERY entry of
+/// `deps` -- "`src` has reached `target`" -- is satisfied.
+///
+/// One entry is a `sync_file` import or a [`transfer`]. Several entries are
+/// a **merged** `sync_file` (`SYNC_IOC_MERGE`, see [`merge_fences`]): Linux
+/// builds a `dma_fence_array` that signals when all of its fences have, and
+/// Mesa's window-system code leans on it every frame under X11 -- the
+/// acquire semaphore of a swapchain image is the merge of "the compositor
+/// released the image" and "the previous present of it completed".
+struct Link {
+    deps: Vec<(u32, u64)>,
+    dst_point: u64,
 }
 
 /// "`handle` reaches `point` once the GPU has written a value >= `payload`
@@ -106,18 +120,49 @@ struct PendingFence {
 fn effective_point(objects: &[Syncobj], handle: u32, depth: u8) -> Option<u64> {
     let obj = objects.iter().find(|o| o.handle == handle)?;
     let mut point = obj.point;
-    if let (Some((src, target, dst_point)), true) = (obj.linked, depth > 0) {
-        if let Some(src_point) = effective_point(objects, src, depth - 1) {
-            if src_point >= target {
-                point = point.max(dst_point.max(1));
-            }
+    if let (Some(link), true) = (&obj.linked, depth > 0) {
+        let all_reached = link.deps.iter().all(|&(src, target)| {
+            effective_point(objects, src, depth - 1).is_some_and(|p| p >= target)
+        });
+        if all_reached {
+            point = point.max(link.dst_point.max(1));
         }
     }
     Some(point)
 }
 
-/// Link-following depth for [`effective_point`].
-const LINK_DEPTH: u8 = 4;
+/// Link-following depth for [`effective_point`]. The X11 route of a
+/// swapchain image is five links deep before any driver adds its own: the
+/// acquire semaphore -> the merged sync_file -> the surrogate the release
+/// point was transferred to -> the release timeline -> the surrogate the
+/// compositor imported its render fence into -> that fence's syncobj.
+const LINK_DEPTH: u8 = 8;
+
+/// Whether some object's link still names `handle` as a source.
+fn is_link_source(objects: &[Syncobj], handle: u32) -> bool {
+    objects.iter().any(|o| {
+        o.linked
+            .as_ref()
+            .is_some_and(|l| l.deps.iter().any(|&(src, _)| src == handle))
+    })
+}
+
+/// Drop every object whose last reference is gone and that no link names
+/// any more (see the orphan rule in [`destroy`]). Cheap when there are none.
+fn collect_orphans(table: &mut SyncobjTable) {
+    if !table.objects.iter().any(|o| o.refs == 0) {
+        return;
+    }
+    while let Some(pos) = table
+        .objects
+        .iter()
+        .position(|o| o.refs == 0 && !is_link_source(&table.objects, o.handle))
+    {
+        let gone = table.objects.swap_remove(pos).handle;
+        table.pending.retain(|f| f.handle != gone);
+    }
+    PENDING_COUNT.store(table.pending.len(), Ordering::Relaxed);
+}
 
 struct SyncobjTable {
     objects: Vec<Syncobj>,
@@ -363,7 +408,7 @@ pub fn attach_hw_fence(
         let Some(obj) = table.objects.iter_mut().find(|o| o.handle == handle) else {
             return false;
         };
-        obj.linked = None;
+        let dropped_link = obj.linked.take().is_some();
         let cur = obj.point;
         if binary && cur <= 1 {
             // Replace the slot's fence: rewind the point so waiters block
@@ -403,6 +448,9 @@ pub fn attach_hw_fence(
             submitted_us: now_us(),
         });
         PENDING_COUNT.store(table.pending.len(), Ordering::Relaxed);
+        if dropped_link {
+            collect_orphans(&mut table);
+        }
         resolve_locked(&mut table)
     };
     deferred.run();
@@ -465,7 +513,11 @@ pub fn create(signaled: bool) -> u32 {
 /// the handle is unknown.
 pub fn add_ref(handle: u32) -> bool {
     let mut table = TABLE.lock();
-    let Some(obj) = table.objects.iter_mut().find(|o| o.handle == handle) else {
+    let Some(obj) = table
+        .objects
+        .iter_mut()
+        .find(|o| o.handle == handle && o.refs > 0)
+    else {
         return false;
     };
     obj.refs = obj.refs.saturating_add(1);
@@ -478,11 +530,34 @@ pub fn add_ref(handle: u32) -> bool {
 pub fn destroy(handle: u32) -> bool {
     let notify = {
         let mut table = TABLE.lock();
-        let Some(pos) = table.objects.iter().position(|o| o.handle == handle) else {
+        let Some(pos) = table
+            .objects
+            .iter()
+            .position(|o| o.handle == handle && o.refs > 0)
+        else {
             return false;
         };
         if table.objects[pos].refs > 1 {
             table.objects[pos].refs -= 1;
+            return true;
+        }
+        // A fence outlives the syncobj it was taken from. In Linux a
+        // dependent holds the `dma_fence` itself, so destroying the source
+        // changes nothing for it; here a link names its source BY HANDLE, so
+        // an object that other links still depend on, and that can still make
+        // progress (a hardware fence in flight, or a link of its own), stays
+        // in the table as an ORPHAN: no reference, invisible to `add_ref` and
+        // to a second `destroy`, but resolved like any other object until
+        // nothing names it ([`collect_orphans`]). Mesa creates exactly this
+        // every frame under X11: a surrogate syncobj receives a transfer of a
+        // point still in flight, is exported as a sync_file, and is destroyed
+        // at once -- releasing its dependents instead (what this function did
+        // before) signaled the acquire semaphore of a swapchain image before
+        // the compositor had let go of it.
+        let can_progress =
+            table.pending.iter().any(|f| f.handle == handle) || table.objects[pos].linked.is_some();
+        if can_progress && is_link_source(&table.objects, handle) {
+            table.objects[pos].refs = 0;
             return true;
         }
         table.objects.swap_remove(pos);
@@ -511,14 +586,22 @@ pub fn destroy(handle: u32) -> bool {
         // waiter on a dead producer moves on rather than freezing.
         let mut notify = Vec::new();
         for obj in table.objects.iter_mut() {
-            if let Some((src, _, dst_point)) = obj.linked {
-                if src == handle {
-                    obj.linked = None;
-                    obj.point = obj.point.max(dst_point);
-                    notify.push((obj.handle, obj.point));
-                }
+            let Some(link) = obj.linked.as_mut() else {
+                continue;
+            };
+            if !link.deps.iter().any(|&(src, _)| src == handle) {
+                continue;
+            }
+            // A merged fence keeps waiting for its other sources.
+            link.deps.retain(|&(src, _)| src != handle);
+            if link.deps.is_empty() {
+                let dst_point = link.dst_point;
+                obj.linked = None;
+                obj.point = obj.point.max(dst_point);
+                notify.push((obj.handle, obj.point));
             }
         }
+        collect_orphans(&mut table);
         notify
     };
     // Lock released: the hook re-enters this module to re-check waiters.
@@ -580,13 +663,16 @@ pub fn timeline_signal(handle: u32, point: u64) -> bool {
         }
         // A direct signal replaces whatever fence the object carried, imported
         // sync_file included — same as real drm_syncobj.
-        obj.linked = None;
+        let dropped_link = obj.linked.take().is_some();
         let p = obj.point;
         // Pending hardware fences at or below the new point are moot.
         table
             .pending
             .retain(|f| !(f.handle == handle && f.point <= p));
         PENDING_COUNT.store(table.pending.len(), Ordering::Relaxed);
+        if dropped_link {
+            collect_orphans(&mut table);
+        }
         (p, resolve_locked(&mut table))
     };
     // Lock released: service any SYNCOBJ_EVENTFD waiters this advance satisfies.
@@ -660,6 +746,7 @@ pub fn import_snapshot(dst: u32, src: u32, target: u64) -> bool {
             d.run();
             return false;
         };
+        let had_link = obj.linked.is_some();
         let adv = if reached {
             obj.point = obj.point.max(1);
             obj.linked = None;
@@ -667,9 +754,15 @@ pub fn import_snapshot(dst: u32, src: u32, target: u64) -> bool {
         } else {
             // A binary import: `dst_point` is 1, because `IMPORT_SYNC_FILE`
             // really does replace the binary fence.
-            obj.linked = Some((src, target, 1));
+            obj.linked = Some(Link {
+                deps: alloc::vec![(src, target)],
+                dst_point: 1,
+            });
             None
         };
+        if had_link {
+            collect_orphans(&mut table);
+        }
         (adv, d)
     };
     // Lock released: an already-satisfied import advanced `dst` — wake waiters.
@@ -717,6 +810,7 @@ pub fn transfer(dst: u32, dst_point: u64, src: u32, src_point: u64) -> bool {
             d.run();
             return false;
         };
+        let had_link = obj.linked.is_some();
         let np = if reached {
             obj.point = obj.point.max(dst_point.max(1));
             obj.linked = None;
@@ -738,9 +832,15 @@ pub fn transfer(dst: u32, dst_point: u64, src: u32, src_point: u64) -> bool {
             }
             None
         } else {
-            obj.linked = Some((src, need, dst_point.max(1)));
+            obj.linked = Some(Link {
+                deps: alloc::vec![(src, need)],
+                dst_point: dst_point.max(1),
+            });
             None
         };
+        if had_link {
+            collect_orphans(&mut table);
+        }
         (np, d)
     };
     // Lock released: a satisfied transfer advanced `dst`, so wake its waiters.
@@ -749,6 +849,46 @@ pub fn transfer(dst: u32, dst_point: u64, src: u32, src_point: u64) -> bool {
     }
     deferred.run();
     true
+}
+
+/// `SYNC_IOC_MERGE`: a new syncobj that reaches 1 once EVERY `(handle,
+/// point)` of `fences` has been reached -- the `dma_fence_array` behind a
+/// merged `sync_file`. The caller owns the one reference (the merged fd).
+///
+/// Mesa's window-system code issues this on every acquire of a swapchain
+/// image that has been presented before: the acquire semaphore is "the
+/// compositor released the image" AND "its previous present completed",
+/// each exported as a sync_file and merged. Without the ioctl the acquire
+/// fails, and zink kills the GLX swapchain after the first `image_count`
+/// frames -- a window that opens and closes in under a second.
+pub fn merge_fences(fences: &[(u32, u64)]) -> u32 {
+    let handle = NEXT_HANDLE.fetch_add(1, Ordering::Relaxed);
+    let deferred = {
+        let mut table = TABLE.lock();
+        let d = resolve_locked(&mut table);
+        // Sources that no longer exist count as reached, the way [`destroy`]
+        // releases a dependent whose source is gone for good.
+        let deps: Vec<(u32, u64)> = fences
+            .iter()
+            .copied()
+            .filter(|&(src, target)| {
+                effective_point(&table.objects, src, LINK_DEPTH).is_some_and(|p| p < target)
+            })
+            .collect();
+        table.objects.push(Syncobj {
+            handle,
+            point: if deps.is_empty() { 1 } else { 0 },
+            refs: 1,
+            linked: if deps.is_empty() {
+                None
+            } else {
+                Some(Link { deps, dst_point: 1 })
+            },
+        });
+        d
+    };
+    deferred.run();
+    handle
 }
 
 /// Resets a syncobj to point 0 (`SYNCOBJ_RESET`). Returns `false` if
@@ -760,7 +900,7 @@ pub fn reset(handle: u32) -> bool {
         return false;
     };
     obj.point = 0;
-    obj.linked = None;
+    let dropped_link = obj.linked.take().is_some();
     // Every fence, not just the ones inside binary range: `SYNCOBJ_RESET` is
     // `drm_syncobj_replace_fence(syncobj, NULL)` in Linux, i.e. "this object
     // carries no fence at all". A timeline fence left in flight across the
@@ -772,6 +912,9 @@ pub fn reset(handle: u32) -> bool {
     // timeline fence in flight; a reset supersedes everything.)
     table.pending.retain(|f| f.handle != handle);
     PENDING_COUNT.store(table.pending.len(), Ordering::Relaxed);
+    if dropped_link {
+        collect_orphans(&mut table);
+    }
     true
 }
 
@@ -1640,5 +1783,151 @@ mod tests {
         destroy(linked);
         destroy(other_src);
         destroy(keep);
+    }
+
+    #[cfg(test)]
+    fn object_count() -> usize {
+        TABLE.lock().objects.len()
+    }
+
+    /// `SYNC_IOC_MERGE`: the merged fence signals only once EVERY source has,
+    /// the way the `dma_fence_array` behind a merged sync_file does.
+    #[test]
+    fn a_merged_fence_waits_for_every_source() {
+        let _g = test_lock();
+        let a = create(false);
+        let b = create(false);
+        let m = merge_fences(&[(a, 3), (b, 1)]);
+        assert_eq!(query(m), Some(0), "nothing has been reached yet");
+        assert!(timeline_signal(a, 3));
+        assert_eq!(query(m), Some(0), "one source of two is not enough");
+        assert!(matches!(wait(&[m], None, false, 0), WaitOutcome::Timeout));
+        assert!(timeline_signal(b, 1));
+        assert_eq!(query(m), Some(1), "both sources reached: the merge signals");
+        assert!(matches!(
+            wait(&[m], None, false, 0),
+            WaitOutcome::Signaled { .. }
+        ));
+        destroy(m);
+        destroy(a);
+        destroy(b);
+    }
+
+    #[test]
+    fn a_merge_of_fences_already_reached_is_signaled_at_once() {
+        let _g = test_lock();
+        let a = create(true);
+        let b = create(false);
+        assert!(timeline_signal(b, 5));
+        let m = merge_fences(&[(a, 1), (b, 5)]);
+        assert_eq!(query(m), Some(1));
+        destroy(m);
+        destroy(a);
+        destroy(b);
+    }
+
+    /// Mesa's per-frame pattern under X11: a surrogate syncobj receives a
+    /// transfer of a point still in flight, is exported as a sync_file, the
+    /// sync_file is imported into the acquire semaphore, and the surrogate
+    /// is destroyed at once. The semaphore must NOT signal until the fence
+    /// lands -- releasing it on the surrogate's destroy handed the GPU an
+    /// image the compositor was still reading.
+    #[test]
+    fn a_link_survives_the_destroy_of_its_source() {
+        let _g = test_lock();
+        arm_hooks();
+        let release = create(false);
+        let mut landing = Landing::new();
+        assert!(attach_hw_fence(release, 4, landing.va(), 0, 7, 0, false));
+        let surrogate = create(false);
+        assert!(transfer(surrogate, 0, release, 4));
+        let sem = create(false);
+        assert!(import_snapshot(sem, surrogate, 1));
+        assert!(destroy(surrogate), "destroyed right after the export");
+        assert_eq!(
+            query(sem),
+            Some(0),
+            "the fence has not landed: the semaphore must stay unsignaled"
+        );
+        assert!(
+            !signals().iter().any(|&(h, _)| h == sem || h == surrogate),
+            "and nobody was woken early, got {:?}",
+            signals()
+        );
+        landing.land(7);
+        assert_eq!(
+            query(sem),
+            Some(1),
+            "once the GPU writes the fence the link resolves through the orphan"
+        );
+        assert!(
+            !signals().is_empty(),
+            "and the landing is announced, so an eventfd waiter re-checks"
+        );
+        destroy(sem);
+        destroy(release);
+    }
+
+    /// Same, one level deeper: the dying source is itself only linked.
+    #[test]
+    fn a_link_survives_the_destroy_of_a_source_that_is_itself_linked() {
+        let _g = test_lock();
+        let release = create(false);
+        let surrogate = create(false);
+        assert!(
+            transfer(surrogate, 0, release, 2),
+            "deferred: release is at 0"
+        );
+        let sem = create(false);
+        assert!(import_snapshot(sem, surrogate, 1));
+        assert!(destroy(surrogate));
+        assert_eq!(query(sem), Some(0), "release has not been signaled");
+        assert!(timeline_signal(release, 2));
+        assert_eq!(query(sem), Some(1));
+        destroy(sem);
+        destroy(release);
+    }
+
+    /// An orphan lives exactly as long as something depends on it.
+    #[test]
+    fn an_orphaned_source_is_collected_once_nothing_depends_on_it() {
+        let _g = test_lock();
+        let src = create(false);
+        let mut landing = Landing::new();
+        assert!(attach_hw_fence(src, 1, landing.va(), 0, 1, 0, true));
+        let dst = create(false);
+        assert!(import_snapshot(dst, src, 1));
+        let objects = object_count();
+        let pending = pending_now();
+        assert!(destroy(src));
+        assert_eq!(
+            object_count(),
+            objects,
+            "still named by dst's link: kept as an orphan"
+        );
+        assert!(!add_ref(src), "an orphan cannot be revived");
+        assert!(!destroy(src), "nor destroyed twice");
+        // A direct signal replaces dst's fence, so nothing names the orphan.
+        assert!(timeline_signal(dst, 1));
+        assert_eq!(object_count(), objects - 1, "the orphan is collected");
+        assert_eq!(pending_now(), pending - 1, "and its fence with it");
+        landing.land(1);
+        destroy(dst);
+    }
+
+    /// A merge whose source is gone for good (no fence, no link) keeps
+    /// waiting for the sources that are still alive.
+    #[test]
+    fn a_merge_outlives_a_source_that_can_never_signal() {
+        let _g = test_lock();
+        let a = create(false);
+        let b = create(false);
+        let m = merge_fences(&[(a, 1), (b, 1)]);
+        assert!(destroy(a));
+        assert_eq!(query(m), Some(0), "b has not signaled");
+        assert!(timeline_signal(b, 1));
+        assert_eq!(query(m), Some(1));
+        destroy(m);
+        destroy(b);
     }
 }
