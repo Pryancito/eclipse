@@ -1903,14 +1903,16 @@ impl Syscall<'_> {
                 }
                 FcntlCmd::GETFL => Ok(file_like.flags().bits()),
                 FcntlCmd::SETFL => {
-                    file_like.set_flags(OpenFlags::from_bits_truncate(arg))?;
+                    // Only the status flags change (`SETFL_MASK`); the raw
+                    // argument used to go in whole, so `F_SETFL(O_NONBLOCK)`
+                    // also cleared the file's `O_CLOEXEC` record, which is
+                    // `F_SETFD`'s to change.
+                    let requested = OpenFlags::from_bits_truncate(arg);
+                    file_like.set_flags(OpenFlags::after_setfl(file_like.flags(), requested))?;
                     Ok(0)
                 }
                 FcntlCmd::DUPFD | FcntlCmd::DUPFD_CLOEXEC => {
-                    let new_fd = proc.get_free_fd_from(arg);
-                    // sys_dup2 registers the new fd with CLOEXEC off (POSIX
-                    // dup semantics); only the _CLOEXEC variant re-tags it.
-                    self.sys_dup2(fd, new_fd)?;
+                    let new_fd = FileDesc::from(self.sys_dupfd(fd, arg)?);
                     if cmd == FcntlCmd::DUPFD_CLOEXEC {
                         proc.set_fd_cloexec(new_fd, true)?;
                     }

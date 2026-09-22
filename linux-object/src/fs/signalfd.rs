@@ -12,6 +12,7 @@ use crate::signal::{Signal as LinuxSignal, Sigset};
 use crate::thread::ThreadExt;
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicU64, Ordering::SeqCst};
+use lock::Mutex;
 use zircon_object::object::*;
 use zircon_object::task::Thread;
 
@@ -23,7 +24,8 @@ const SIGINFO_SIZE: usize = 128;
 pub struct SignalFd {
     base: KObjectBase,
     mask: Arc<AtomicU64>,
-    flags: OpenFlags,
+    /// Behind a lock so `fcntl(F_SETFL)` can change it after creation.
+    flags: Mutex<OpenFlags>,
 }
 
 impl_kobject!(SignalFd);
@@ -34,7 +36,7 @@ impl SignalFd {
         Arc::new(SignalFd {
             base: KObjectBase::new(),
             mask: Arc::new(AtomicU64::new(mask)),
-            flags,
+            flags: Mutex::new(flags),
         })
     }
 
@@ -71,10 +73,11 @@ impl SignalFd {
 #[async_trait]
 impl FileLike for SignalFd {
     fn flags(&self) -> OpenFlags {
-        self.flags
+        *self.flags.lock()
     }
 
-    fn set_flags(&self, _f: OpenFlags) -> LxResult {
+    fn set_flags(&self, f: OpenFlags) -> LxResult {
+        self.flags.lock().take_settable(f);
         Ok(())
     }
 
@@ -82,7 +85,7 @@ impl FileLike for SignalFd {
         Arc::new(Self {
             base: KObjectBase::new(),
             mask: self.mask.clone(),
-            flags: self.flags,
+            flags: Mutex::new(self.flags()),
         })
     }
 
@@ -99,7 +102,7 @@ impl FileLike for SignalFd {
                 buf[..4].copy_from_slice(&(sig as u32).to_ne_bytes());
                 return Ok(SIGINFO_SIZE);
             }
-            if self.flags.contains(OpenFlags::NON_BLOCK) {
+            if self.flags().non_block() {
                 return Err(LxError::EAGAIN);
             }
             // Block until a matching signal is pending. Signals don't fire a
@@ -175,6 +178,23 @@ mod tests {
 
     fn sfd(mask: u64, flags: OpenFlags) -> Arc<SignalFd> {
         SignalFd::new(mask, flags)
+    }
+
+    /// `fcntl(F_SETFL, O_NONBLOCK)` on a signalfd made without `SFD_NONBLOCK`
+    /// used to change nothing, so a read with no matching signal pending
+    /// slept in 20 ms ticks for good instead of answering EAGAIN. If this
+    /// test hangs, that is the bug back.
+    #[test]
+    fn set_flags_turns_a_blocking_signalfd_non_blocking() {
+        let fd = sfd(mask_of(&[LinuxSignal::SIGINT]), OpenFlags::empty());
+        assert!(!fd.flags().non_block());
+        fd.set_flags(OpenFlags::NON_BLOCK).unwrap();
+        assert!(fd.flags().non_block());
+        let mut buf = [0u8; SIGINFO_SIZE];
+        assert_eq!(block_on(fd.read(&mut buf)), Err(LxError::EAGAIN));
+        let copy = fd.dup();
+        copy.set_flags(OpenFlags::empty()).unwrap();
+        assert!(fd.flags().non_block(), "a dup has its own flags");
     }
 
     #[test]

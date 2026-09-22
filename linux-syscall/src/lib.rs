@@ -317,7 +317,7 @@ impl Syscall<'_> {
             Sys::FACCESSAT => self.sys_faccessat(a0.into(), a1.into(), a2, a3),
             Sys::FACCESSAT2 => self.sys_faccessat(a0.into(), a1.into(), a2, a3),
             Sys::DUP => self.sys_dup(a0.into()),
-            Sys::DUP3 => self.sys_dup3(a0.into(), a1.into(), a2),
+            Sys::DUP3 => self.sys_dup3(a0.into(), a1, a2),
             Sys::PIPE2 => self.sys_pipe2(a0.into(), a1), // TODO: handle `flags`
             Sys::UTIMENSAT => self.sys_utimensat(a0.into(), a1.into(), a2.into(), a3),
             // `utimes` is an x86_64-only syscall number; riscv64 and aarch64
@@ -749,7 +749,7 @@ impl Syscall<'_> {
                 self.sys_select(a0, a1.into(), a2.into(), a3.into(), a4.into())
                     .await
             }
-            Sys::DUP2 => self.sys_dup2(a0.into(), a1.into()),
+            Sys::DUP2 => self.sys_dup2(a0.into(), a1),
             //            Sys::ALARM => self.unimplemented("alarm", Ok(0)),
             Sys::PAUSE => self.sys_pause().await,
             Sys::FORK => self.sys_fork(0, 0),

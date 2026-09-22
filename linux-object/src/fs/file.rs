@@ -59,6 +59,33 @@ impl OpenFlags {
     pub fn close_on_exec(self) -> bool {
         self.contains(Self::CLOEXEC)
     }
+    /// The bits `fcntl(F_SETFL)` may change: `SETFL_MASK` in `fs/fcntl.c`,
+    /// the status flags. The access mode, the creation flags and `O_CLOEXEC`
+    /// (per descriptor, `F_SETFD`) are not among them.
+    fn setfl_mask() -> Self {
+        Self::APPEND | Self::NON_BLOCK
+    }
+    /// What an open file's flags become after `fcntl(F_SETFL, requested)`.
+    /// Linux (`setfl`) copies only `SETFL_MASK` out of the argument and keeps
+    /// everything else as it was, so `F_SETFL(O_NONBLOCK)` on a read-write
+    /// file leaves its `O_CLOEXEC` record alone and `F_SETFL(O_CLOEXEC)`
+    /// sets nothing. Handing the raw argument to `set_flags`, which copies
+    /// that record, did both.
+    pub fn after_setfl(current: Self, requested: Self) -> Self {
+        (current - Self::setfl_mask()) | (requested & Self::setfl_mask())
+    }
+    /// Take from `requested` the bits [`FileLike::set_flags`] accepts: the
+    /// status flags, and the creation-time `O_CLOEXEC` record that the dup
+    /// paths clear before installing a copy. Every `set_flags` used to spell
+    /// this out by hand, and the ones that spelled nothing (eventfd,
+    /// signalfd, timerfd, inotify) silently dropped the request, so an
+    /// `fcntl(F_SETFL, O_NONBLOCK)` on them changed nothing and the next read
+    /// with nothing pending blocked for good.
+    pub fn take_settable(&mut self, requested: Self) {
+        for bit in [Self::APPEND, Self::NON_BLOCK, Self::CLOEXEC] {
+            self.set(bit, requested.contains(bit));
+        }
+    }
 }
 
 bitflags::bitflags! {
@@ -752,10 +779,7 @@ impl FileLike for File {
     }
 
     fn set_flags(&self, f: OpenFlags) -> LxResult {
-        let flags = &mut self.inner.write().flags;
-        flags.set(OpenFlags::APPEND, f.contains(OpenFlags::APPEND));
-        flags.set(OpenFlags::NON_BLOCK, f.contains(OpenFlags::NON_BLOCK));
-        flags.set(OpenFlags::CLOEXEC, f.contains(OpenFlags::CLOEXEC));
+        self.inner.write().flags.take_settable(f);
         Ok(())
     }
 
@@ -1289,5 +1313,64 @@ mod seek_tests {
         File::seek(&f, SeekFrom::Start(37)).unwrap();
         assert_eq!(File::seek(&f, SeekFrom::Current(0)).unwrap(), 37);
         assert_eq!(File::seek(&f, SeekFrom::Current(0)).unwrap(), 37);
+    }
+}
+
+#[cfg(test)]
+mod setfl_tests {
+    //! `fcntl(F_SETFL)` used to hand its whole argument to `set_flags`, and
+    //! `set_flags` took the bits it knew from it. What Linux's `setfl` does is
+    //! narrower: `SETFL_MASK` in, everything else as it was.
+
+    use super::OpenFlags;
+
+    #[test]
+    fn setfl_changes_only_the_status_flags() {
+        let rw = OpenFlags::RDWR | OpenFlags::CLOEXEC;
+        // The common call: make an existing fd non-blocking. The access mode
+        // and the close-on-exec record survive it.
+        let after = OpenFlags::after_setfl(rw, OpenFlags::NON_BLOCK);
+        assert_eq!(after, rw | OpenFlags::NON_BLOCK);
+        assert!(after.readable() && after.writable());
+        // The next common call: `F_SETFL(fcntl(F_GETFL) & ~O_NONBLOCK)`,
+        // which glibc spells as the flags word with the bit cleared.
+        let back = OpenFlags::after_setfl(after, after - OpenFlags::NON_BLOCK);
+        assert_eq!(back, rw);
+        // An argument of 0 clears the status flags and nothing else: it does
+        // not turn the file read-only (`RDONLY` is 0) or drop CLOEXEC.
+        let cleared = OpenFlags::after_setfl(
+            rw | OpenFlags::APPEND | OpenFlags::NON_BLOCK,
+            OpenFlags::empty(),
+        );
+        assert_eq!(cleared, rw);
+    }
+
+    #[test]
+    fn setfl_cannot_set_what_is_not_a_status_flag() {
+        let ro = OpenFlags::RDONLY;
+        // `F_SETFL(O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC)`: none of it
+        // takes. The access mode is fixed at open, creation flags are for
+        // `open`, and close-on-exec is `F_SETFD`'s.
+        let asked =
+            OpenFlags::WRONLY | OpenFlags::CREATE | OpenFlags::TRUNCATE | OpenFlags::CLOEXEC;
+        let after = OpenFlags::after_setfl(ro, asked);
+        assert_eq!(after, ro);
+        assert!(!after.writable() && !after.close_on_exec());
+        // While APPEND rides along with NON_BLOCK.
+        let after = OpenFlags::after_setfl(ro, asked | OpenFlags::APPEND);
+        assert_eq!(after, ro | OpenFlags::APPEND);
+    }
+
+    #[test]
+    fn take_settable_is_the_three_bits_every_set_flags_used_to_copy_by_hand() {
+        let mut flags = OpenFlags::RDWR | OpenFlags::NON_BLOCK;
+        flags.take_settable(OpenFlags::APPEND | OpenFlags::CLOEXEC);
+        assert_eq!(
+            flags,
+            OpenFlags::RDWR | OpenFlags::APPEND | OpenFlags::CLOEXEC
+        );
+        // Bits it does not own are left alone in both directions.
+        flags.take_settable(OpenFlags::WRONLY | OpenFlags::CREATE);
+        assert_eq!(flags, OpenFlags::RDWR);
     }
 }

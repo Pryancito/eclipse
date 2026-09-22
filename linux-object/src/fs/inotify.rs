@@ -26,7 +26,8 @@ pub struct Inotify {
     base: KObjectBase,
     inner: Arc<Mutex<InotifyInner>>,
     eventbus: Arc<Mutex<EventBus>>,
-    flags: OpenFlags,
+    /// Behind a lock so `fcntl(F_SETFL)` can change it after creation.
+    flags: Mutex<OpenFlags>,
 }
 
 #[derive(Default)]
@@ -53,7 +54,7 @@ impl Inotify {
                 watches: BTreeMap::new(),
             })),
             eventbus: EventBus::new(),
-            flags,
+            flags: Mutex::new(flags),
         })
     }
 
@@ -87,10 +88,11 @@ impl Inotify {
 #[async_trait]
 impl FileLike for Inotify {
     fn flags(&self) -> OpenFlags {
-        self.flags
+        *self.flags.lock()
     }
 
-    fn set_flags(&self, _f: OpenFlags) -> LxResult {
+    fn set_flags(&self, f: OpenFlags) -> LxResult {
+        self.flags.lock().take_settable(f);
         Ok(())
     }
 
@@ -99,7 +101,7 @@ impl FileLike for Inotify {
             base: KObjectBase::new(),
             inner: self.inner.clone(),
             eventbus: self.eventbus.clone(),
-            flags: self.flags,
+            flags: Mutex::new(self.flags()),
         })
     }
 
@@ -108,7 +110,7 @@ impl FileLike for Inotify {
         // (the normal "nothing pending" answer); a blocking reader parks on
         // the eventbus that never fires — exactly how a real inotify fd with
         // no pending events behaves.
-        if self.flags.contains(OpenFlags::NON_BLOCK) {
+        if self.flags().non_block() {
             return Err(LxError::EAGAIN);
         }
         let bus = self.eventbus.clone();
@@ -161,6 +163,23 @@ mod tests {
 
     fn inotify(flags: OpenFlags) -> Arc<Inotify> {
         Inotify::new(flags)
+    }
+
+    /// `fcntl(F_SETFL, O_NONBLOCK)` on an inotify fd made without
+    /// `IN_NONBLOCK` used to change nothing, so a read parked on the bus that
+    /// never fires instead of answering EAGAIN. If this test hangs, that is
+    /// the bug back.
+    #[test]
+    fn set_flags_turns_a_blocking_inotify_non_blocking() {
+        let i = inotify(OpenFlags::empty());
+        assert!(!i.flags().non_block());
+        i.set_flags(OpenFlags::NON_BLOCK).unwrap();
+        assert!(i.flags().non_block());
+        let mut buf = [0u8; 64];
+        assert_eq!(block_on(i.read(&mut buf)), Err(LxError::EAGAIN));
+        let copy = i.dup();
+        copy.set_flags(OpenFlags::empty()).unwrap();
+        assert!(i.flags().non_block(), "a dup has its own flags");
     }
 
     fn watched(i: &Inotify) -> alloc::vec::Vec<(i32, String, u32)> {

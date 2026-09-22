@@ -18,7 +18,8 @@ pub struct EventFd {
     base: KObjectBase,
     counter: Arc<AtomicU64>,
     eventbus: Arc<Mutex<EventBus>>,
-    flags: OpenFlags,
+    /// Behind a lock so `fcntl(F_SETFL)` can change it after creation.
+    flags: Mutex<OpenFlags>,
 }
 
 impl_kobject!(EventFd);
@@ -30,7 +31,7 @@ impl EventFd {
             base: KObjectBase::new(),
             counter: Arc::new(AtomicU64::new(initval as u64)),
             eventbus: EventBus::new(),
-            flags,
+            flags: Mutex::new(flags),
         };
         // A non-zero initial value is already an event to deliver.
         fd.publish_readiness();
@@ -38,7 +39,7 @@ impl EventFd {
     }
 
     fn semaphore(&self) -> bool {
-        self.flags.bits() & EFD_SEMAPHORE != 0
+        self.flags().bits() & EFD_SEMAPHORE != 0
     }
 
     /// Publish readiness from the counter, which is the only thing that makes
@@ -70,10 +71,11 @@ impl EventFd {
 #[async_trait]
 impl FileLike for EventFd {
     fn flags(&self) -> OpenFlags {
-        self.flags
+        *self.flags.lock()
     }
 
-    fn set_flags(&self, _f: OpenFlags) -> LxResult {
+    fn set_flags(&self, f: OpenFlags) -> LxResult {
+        self.flags.lock().take_settable(f);
         Ok(())
     }
 
@@ -82,7 +84,7 @@ impl FileLike for EventFd {
             base: KObjectBase::new(),
             counter: self.counter.clone(),
             eventbus: self.eventbus.clone(),
-            flags: self.flags,
+            flags: Mutex::new(self.flags()),
         })
     }
 
@@ -118,7 +120,7 @@ impl FileLike for EventFd {
                 self.publish_readiness();
                 return Ok(8);
             }
-            if self.flags.contains(OpenFlags::NON_BLOCK) {
+            if self.flags().non_block() {
                 return Err(LxError::EAGAIN);
             }
             self.async_poll(PollEvents::IN).await?;
@@ -145,7 +147,7 @@ impl FileLike for EventFd {
                     return Ok(8);
                 }
             } else {
-                if self.flags.contains(OpenFlags::NON_BLOCK) {
+                if self.flags().non_block() {
                     return Err(LxError::EAGAIN);
                 }
                 // TODO: wait for writeable? EventFd is almost always writeable unless overflow
@@ -222,6 +224,38 @@ mod tests {
 
     fn nonblock() -> OpenFlags {
         OpenFlags::NON_BLOCK
+    }
+
+    /// `fcntl(F_SETFL, O_NONBLOCK)` on an eventfd made without `EFD_NONBLOCK`
+    /// used to change nothing (`set_flags` ignored its argument), so the
+    /// caller's next read with a zero counter parked for good instead of
+    /// answering EAGAIN. If this test hangs, that is the bug back.
+    #[test]
+    fn set_flags_turns_a_blocking_eventfd_non_blocking() {
+        let fd = efd(0, OpenFlags::empty());
+        assert!(!fd.flags().non_block());
+        fd.set_flags(nonblock()).unwrap();
+        assert!(fd.flags().non_block());
+        assert_eq!(read8(&fd), Err(LxError::EAGAIN));
+        // And back: the bit is settable both ways, not sticky.
+        fd.set_flags(OpenFlags::empty()).unwrap();
+        assert!(!fd.flags().non_block());
+    }
+
+    /// `dup2` clears `O_CLOEXEC` on the copy it installs, through
+    /// `set_flags`; with that call ignored, a dup of an `EFD_CLOEXEC` eventfd
+    /// was registered close-on-exec and vanished across the child's exec.
+    /// The two objects keep their own flags: clearing the copy's must not
+    /// touch the original's.
+    #[test]
+    fn a_dup_has_its_own_flags_and_can_drop_cloexec() {
+        let fd = efd(0, nonblock() | OpenFlags::CLOEXEC);
+        let copy = fd.dup();
+        assert!(copy.flags().close_on_exec(), "a dup starts as a copy");
+        copy.set_flags(copy.flags() - OpenFlags::CLOEXEC).unwrap();
+        assert!(!copy.flags().close_on_exec());
+        assert!(copy.flags().non_block(), "only the named bit changed");
+        assert!(fd.flags().close_on_exec(), "the original is untouched");
     }
 
     fn read8(fd: &EventFd) -> LxResult<u64> {

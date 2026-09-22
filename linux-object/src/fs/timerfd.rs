@@ -91,7 +91,8 @@ impl TimerInner {
 pub struct TimerFd {
     base: KObjectBase,
     inner: Arc<TimerInner>,
-    flags: OpenFlags,
+    /// Behind a lock so `fcntl(F_SETFL)` can change it after creation.
+    flags: Mutex<OpenFlags>,
 }
 
 impl_kobject!(TimerFd);
@@ -108,7 +109,7 @@ impl TimerFd {
                 generation: AtomicU64::new(0),
                 eventbus: EventBus::new(),
             }),
-            flags,
+            flags: Mutex::new(flags),
         })
     }
 
@@ -138,10 +139,11 @@ impl TimerFd {
 #[async_trait]
 impl FileLike for TimerFd {
     fn flags(&self) -> OpenFlags {
-        self.flags
+        *self.flags.lock()
     }
 
-    fn set_flags(&self, _f: OpenFlags) -> LxResult {
+    fn set_flags(&self, f: OpenFlags) -> LxResult {
+        self.flags.lock().take_settable(f);
         Ok(())
     }
 
@@ -149,7 +151,7 @@ impl FileLike for TimerFd {
         Arc::new(Self {
             base: KObjectBase::new(),
             inner: self.inner.clone(),
-            flags: self.flags,
+            flags: Mutex::new(self.flags()),
         })
     }
 
@@ -164,7 +166,7 @@ impl FileLike for TimerFd {
                 buf[..8].copy_from_slice(&count.to_ne_bytes());
                 return Ok(8);
             }
-            if self.flags.contains(OpenFlags::NON_BLOCK) {
+            if self.flags().non_block() {
                 return Err(LxError::EAGAIN);
             }
             self.async_poll(PollEvents::IN).await?;
@@ -240,6 +242,25 @@ mod tests {
 
     fn nonblock() -> OpenFlags {
         OpenFlags::NON_BLOCK
+    }
+
+    /// `fcntl(F_SETFL, O_NONBLOCK)` on a timerfd made without `TFD_NONBLOCK`
+    /// used to change nothing, so a read of a disarmed timer parked for good
+    /// instead of answering EAGAIN. If this test hangs, that is the bug back.
+    #[test]
+    fn set_flags_turns_a_blocking_timerfd_non_blocking() {
+        let fd = tfd(OpenFlags::empty());
+        assert!(!fd.flags().non_block());
+        fd.set_flags(nonblock()).unwrap();
+        assert!(fd.flags().non_block());
+        assert_eq!(read8(&fd), Err(LxError::EAGAIN));
+        let copy = fd.dup();
+        assert!(
+            copy.flags().non_block(),
+            "a dup copies the flags as set now"
+        );
+        copy.set_flags(OpenFlags::empty()).unwrap();
+        assert!(fd.flags().non_block(), "and keeps its own copy of them");
     }
 
     fn read8(fd: &TimerFd) -> LxResult<u64> {
