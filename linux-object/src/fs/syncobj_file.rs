@@ -118,6 +118,34 @@ impl SyncobjHandle {
         })
     }
 
+    /// `SYNCOBJ_FD_TO_HANDLE` without `IMPORT_SYNC_FILE`: hand the importing
+    /// process the handle number, together with a reference of its own.
+    ///
+    /// In Linux every import creates a new handle in the importer's table, and
+    /// each handle is one reference on the object, so the importer's later
+    /// `SYNCOBJ_DESTROY` drops only what the import took. Here the handle
+    /// space is global and the number comes back unchanged, which made the
+    /// import free: the only references were the creator's and the fd's, and
+    /// the fd is closed right after importing. A GLX client's swapchain
+    /// syncobj travels client -> Xwayland -> labwc through two such imports,
+    /// and each of those two frees its handle on its own schedule
+    /// (`xcb_dri3_free_syncobj`, the `wp_linux_drm_syncobj_timeline_v1`
+    /// destroy), so whichever of the three destroyed first destroyed it for
+    /// the other two: the client's next wait answered ENOENT, the
+    /// compositor's next `SYNCOBJ_EVENTFD` failed.
+    ///
+    /// `None` for a sync_file fd (a fence, not an object; the caller reports
+    /// the flag mismatch) or a syncobj that no longer exists.
+    pub fn import_opaque(&self) -> Option<u32> {
+        if self.sync_file_point.is_some() {
+            return None;
+        }
+        if !zcore_drivers::scheme::syncobj::add_ref(self.handle) {
+            return None;
+        }
+        Some(self.handle)
+    }
+
     /// Whether this fd should report `POLLIN` (sync_file fence reached).
     fn fence_ready(&self) -> bool {
         let Some(point) = self.sync_file_point else {
@@ -357,6 +385,64 @@ mod sync_file_poll_tests {
         let status = fd.poll(PollEvents::IN).expect("poll after signal");
         assert!(status.read, "once the point lands, POLLIN must fire");
         drop(fd);
+    }
+
+    /// The X11 route of a swapchain image: the client exports the syncobj,
+    /// Xwayland imports it and closes the fd, and later frees its handle on
+    /// its own schedule. The client must still own its object afterwards.
+    #[test]
+    fn an_importer_freeing_its_handle_does_not_take_the_creators_syncobj() {
+        let handle = zcore_drivers::scheme::syncobj::create(false);
+        // HANDLE_TO_FD: the fd takes its own reference.
+        assert!(zcore_drivers::scheme::syncobj::add_ref(handle));
+        let fd = SyncobjHandle::new(handle);
+        // FD_TO_HANDLE in the importing process, then close(fd).
+        let imported = fd.import_opaque().expect("a live syncobj imports");
+        assert_eq!(imported, handle, "the handle space is global");
+        drop(fd);
+        // xcb_dri3_free_syncobj -> drmSyncobjDestroy in the importer.
+        assert!(zcore_drivers::scheme::syncobj::destroy(imported));
+        assert!(
+            zcore_drivers::scheme::syncobj::timeline_signal(handle, 3),
+            "the creator's handle must survive the importer's destroy"
+        );
+        assert_eq!(zcore_drivers::scheme::syncobj::query(handle), Some(3));
+        // The creator's own destroy is the last reference.
+        assert!(zcore_drivers::scheme::syncobj::destroy(handle));
+        assert_eq!(zcore_drivers::scheme::syncobj::query(handle), None);
+    }
+
+    /// Mesa's external-sync probe: export and import inside ONE process, then
+    /// destroy both handles. Every reference must be accounted for, so the
+    /// object is gone after the second destroy and not before.
+    #[test]
+    fn an_export_import_round_trip_in_one_process_balances_its_references() {
+        let handle = zcore_drivers::scheme::syncobj::create(false);
+        assert!(zcore_drivers::scheme::syncobj::add_ref(handle));
+        let fd = SyncobjHandle::new(handle);
+        let imported = fd.import_opaque().expect("a live syncobj imports");
+        drop(fd);
+        assert!(zcore_drivers::scheme::syncobj::destroy(imported));
+        assert_eq!(
+            zcore_drivers::scheme::syncobj::query(handle),
+            Some(0),
+            "one handle is still held"
+        );
+        assert!(zcore_drivers::scheme::syncobj::destroy(handle));
+        assert_eq!(zcore_drivers::scheme::syncobj::query(handle), None);
+    }
+
+    /// A sync_file fd is a fence, not the object: importing it as a syncobj
+    /// would alias the two, so `import_opaque` refuses and takes no reference.
+    #[test]
+    fn a_sync_file_fd_is_not_importable_as_a_syncobj() {
+        let handle = zcore_drivers::scheme::syncobj::create(false);
+        assert!(zcore_drivers::scheme::syncobj::add_ref(handle));
+        let fd = SyncobjHandle::new_sync_file(handle, 1);
+        assert!(fd.import_opaque().is_none());
+        drop(fd);
+        assert!(zcore_drivers::scheme::syncobj::destroy(handle));
+        assert_eq!(zcore_drivers::scheme::syncobj::query(handle), None);
     }
 
     #[test]
