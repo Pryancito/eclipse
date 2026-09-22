@@ -146,6 +146,27 @@ impl SyncobjHandle {
         Some(self.handle)
     }
 
+    /// `SYNC_IOC_MERGE`: a sync_file that is ready once both `self` and
+    /// `other` are (a `dma_fence_array` in Linux). `None` unless both fds are
+    /// sync_files, which Linux answers with `ENOENT`.
+    ///
+    /// Mesa's window-system code merges two of these on every acquire of a
+    /// swapchain image that has been presented before ("the compositor
+    /// released it" and "its previous present completed"), and imports the
+    /// result into the acquire semaphore. With no ioctl at all on a sync_file
+    /// fd, that acquire failed after the first `image_count` frames and zink
+    /// killed the GLX swapchain: `zink: swapchain killed`, then
+    /// `GLXBadCurrentWindow` from the `glXSwapBuffers` fallback, with nothing
+    /// in dmesg because the client's error print is compiled out.
+    pub fn merge(&self, other: &SyncobjHandle) -> Option<Arc<Self>> {
+        let a = self.sync_file_point?;
+        let b = other.sync_file_point?;
+        let merged =
+            zcore_drivers::scheme::syncobj::merge_fences(&[(self.handle, a), (other.handle, b)]);
+        // The merged syncobj's one reference belongs to this fd.
+        Some(Self::new_sync_file(merged, 1))
+    }
+
     /// Whether this fd should report `POLLIN` (sync_file fence reached).
     fn fence_ready(&self) -> bool {
         let Some(point) = self.sync_file_point else {
@@ -443,6 +464,79 @@ mod sync_file_poll_tests {
         drop(fd);
         assert!(zcore_drivers::scheme::syncobj::destroy(handle));
         assert_eq!(zcore_drivers::scheme::syncobj::query(handle), None);
+    }
+
+    /// `SYNC_IOC_MERGE`: ready only once both fences are.
+    #[test]
+    fn a_merged_sync_file_is_ready_only_when_both_fences_are() {
+        let a = zcore_drivers::scheme::syncobj::create(false);
+        let b = zcore_drivers::scheme::syncobj::create(false);
+        assert!(zcore_drivers::scheme::syncobj::add_ref(a));
+        assert!(zcore_drivers::scheme::syncobj::add_ref(b));
+        let fa = SyncobjHandle::new_sync_file(a, 2);
+        let fb = SyncobjHandle::new_sync_file(b, 1);
+        let m = fa.merge(&fb).expect("two sync_files merge");
+        assert!(!m.poll(PollEvents::IN).expect("poll").read);
+        assert!(zcore_drivers::scheme::syncobj::timeline_signal(a, 2));
+        wake_ready_waiters();
+        assert!(
+            !m.poll(PollEvents::IN).expect("poll").read,
+            "one fence of two is not enough"
+        );
+        assert!(zcore_drivers::scheme::syncobj::timeline_signal(b, 1));
+        wake_ready_waiters();
+        assert!(
+            m.poll(PollEvents::IN).expect("poll").read,
+            "both fences reached: the merged sync_file is ready"
+        );
+        drop(m);
+        drop(fa);
+        drop(fb);
+        assert!(zcore_drivers::scheme::syncobj::destroy(a));
+        assert!(zcore_drivers::scheme::syncobj::destroy(b));
+    }
+
+    /// Mesa imports the merged sync_file into the acquire semaphore and then
+    /// closes every fd and destroys every surrogate in one go. The semaphore
+    /// must keep waiting for both fences.
+    #[test]
+    fn closing_the_merged_fd_after_import_keeps_the_dependency() {
+        use zcore_drivers::scheme::syncobj as so;
+        let a = so::create(false);
+        let b = so::create(false);
+        assert!(so::add_ref(a));
+        assert!(so::add_ref(b));
+        let fa = SyncobjHandle::new_sync_file(a, 1);
+        let fb = SyncobjHandle::new_sync_file(b, 1);
+        let m = fa.merge(&fb).expect("merge");
+        let sem = so::create(false);
+        assert!(so::import_snapshot(sem, m.handle, 1));
+        drop(m);
+        drop(fa);
+        drop(fb);
+        assert_eq!(so::query(sem), Some(0), "nothing has signaled");
+        assert!(so::timeline_signal(a, 1));
+        assert_eq!(so::query(sem), Some(0), "one of two");
+        assert!(so::timeline_signal(b, 1));
+        assert_eq!(so::query(sem), Some(1), "both: the semaphore signals");
+        assert!(so::destroy(sem));
+        assert!(so::destroy(a));
+        assert!(so::destroy(b));
+    }
+
+    /// An opaque syncobj fd is the object, not a fence: it does not merge.
+    #[test]
+    fn an_opaque_syncobj_fd_does_not_merge() {
+        let a = zcore_drivers::scheme::syncobj::create(false);
+        assert!(zcore_drivers::scheme::syncobj::add_ref(a));
+        assert!(zcore_drivers::scheme::syncobj::add_ref(a));
+        let opaque = SyncobjHandle::new(a);
+        let fence = SyncobjHandle::new_sync_file(a, 1);
+        assert!(opaque.merge(&fence).is_none());
+        assert!(fence.merge(&opaque).is_none());
+        drop(opaque);
+        drop(fence);
+        assert!(zcore_drivers::scheme::syncobj::destroy(a));
     }
 
     #[test]

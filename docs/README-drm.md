@@ -261,6 +261,8 @@ esto no:
 | Divergencia | Qué rompe |
 |---|---|
 | `SYNCOBJ_TRANSFER` pierde el `dst_point` en el camino software | wlroots `linux-drm-syncobj-v1`: el frame del cliente no se libera nunca |
+| ~~Un fd de `sync_file` no admite `SYNC_IOC_MERGE`~~ | **Corregido:** `SyncobjHandle::merge` crea un syncobj que llega a 1 cuando TODAS sus fuentes llegan (`syncobj::merge_fences`, la `dma_fence_array` de Linux). Mesa lo pide en cada adquisición de una imagen de swapchain ya presentada (fence de release del compositor + fence del present anterior); sin el ioctl la adquisición fallaba tras las primeras `image_count` frames y zink mataba el swapchain GLX (`zink: swapchain killed`, luego `GLXBadCurrentWindow`), sin nada en dmesg porque el error del cliente está compilado fuera |
+| ~~Destruir un syncobj soltaba a sus dependientes al punto prometido~~ | **Corregido:** un syncobj del que aún dependen enlaces y que puede progresar (fence HW en vuelo o enlace propio) se queda como huérfano hasta que nadie lo nombra; antes, el patrón de Mesa (surrogate + transfer + export + destroy inmediato) señalaba el semáforo de acquire antes de que el compositor soltara la imagen |
 | ~~Los fd de `sync_file` no se pueden sondear~~ | **Corregido:** `SyncobjHandle::poll` reporta `POLLIN` cuando la fence alcanzó el punto; `subscribe_readiness` + el poller de fences HW despiertan `sys_poll` al aterrizar (sin eso `sync_wait()` de Mesa en GLX/DRI3 mataba el swapchain: `zink: swapchain killed`) |
 | `OUT_FENCE_PTR` devuelve una fence ya señalada | Quien marque el ritmo de frames con ella suelta buffers aún en escaneo |
 | El arm síncrono de `SYNCOBJ_WAIT` puede girar sin ceder la CPU | Una corrutina del kernel atascada; la máquina parece congelada |

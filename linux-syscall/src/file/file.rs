@@ -1379,6 +1379,70 @@ impl Syscall<'_> {
         }
     }
 
+    /// `SYNC_IOC_MERGE` (`<linux/sync_file.h>`): a new sync_file fd that is
+    /// ready once both the target fd and `fd2` are. Both must be sync_files:
+    /// a target that is not one gets `ENOTTY` (the ioctl is unknown to that
+    /// file), an `fd2` that is not one gets `ENOENT`, as in Linux.
+    ///
+    /// This is what Mesa's window-system code calls on every acquire of a
+    /// swapchain image that has been presented before, to build the acquire
+    /// semaphore out of the compositor's release fence and the image's last
+    /// present fence. It had no implementation at all, so the acquire failed
+    /// after the first `image_count` frames and zink killed the GLX
+    /// swapchain; see `SyncobjHandle::merge`.
+    fn sys_sync_file_merge(&self, file: &Arc<dyn FileLike>, arg1: usize) -> SysResult {
+        use linux_object::fs::SyncobjHandle;
+
+        // struct sync_merge_data { char name[32]; __s32 fd2; __s32 fence;
+        //                          __u32 flags; __u32 pad; }
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct SyncMergeData {
+            name: [u8; 32],
+            fd2: i32,
+            fence: i32,
+            flags: u32,
+            pad: u32,
+        }
+
+        let Some(first) = file.downcast_ref::<SyncobjHandle>() else {
+            return Err(LxError::ENOTTY);
+        };
+        let mut ptr = UserInOutPtr::<SyncMergeData>::from(arg1);
+        let mut data = ptr.read()?;
+        if data.flags != 0 || data.pad != 0 {
+            return Err(LxError::EINVAL);
+        }
+        let proc = self.linux_process();
+        let second = proc.get_file_like(FileDesc::from(data.fd2 as usize))?;
+        let Some(second) = second.downcast_ref::<SyncobjHandle>() else {
+            return Err(LxError::ENOENT);
+        };
+        let Some(merged) = first.merge(second) else {
+            return Err(LxError::ENOENT);
+        };
+        let fd = proc.add_file(merged)?;
+        // Bounded, LOG=error-visible trace: the first merges of a boot are the
+        // GLX client's second round of acquires, the step that used to fail.
+        {
+            static MERGE_TRACE_BUDGET: core::sync::atomic::AtomicU32 =
+                core::sync::atomic::AtomicU32::new(0);
+            let n = MERGE_TRACE_BUDGET.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            if n < 8 {
+                kernel_hal::klog_info!(
+                    "[drm] SYNC_IOC_MERGE #{} pid={} fd2={} -> fd={}",
+                    n + 1,
+                    self.zircon_process().id(),
+                    data.fd2,
+                    i32::from(fd),
+                );
+            }
+        }
+        data.fence = i32::from(fd);
+        ptr.write(data)?;
+        Ok(0)
+    }
+
     /// `SYNCOBJ_EVENTFD` (`drm.h`, core DRM): signal an eventfd when syncobj
     /// `handle` reaches `point`. Needs the eventfd from the process fd table
     /// (like the FD ioctls above), so it is dispatched here, not in the DRM
@@ -1701,6 +1765,11 @@ impl Syscall<'_> {
                 Ok(None) => {}
                 Err(e) => return Err(e),
             }
+        }
+        // SYNC_IOC_MERGE on a sync_file fd: needs the fd table (a second fd in,
+        // a new fd out), so it is dispatched here like the DRM fd ioctls.
+        if is_sync_ioc_merge(request as u32) {
+            return self.sys_sync_file_merge(&file_like, arg1);
         }
         // SYNCOBJ_HANDLE_TO_FD / SYNCOBJ_FD_TO_HANDLE — same fd-table-access
         // reasoning and sign-extension caveat as PRIME above. Match by ioctl NR
@@ -2667,5 +2736,32 @@ mod seek_and_access_tests {
         assert_eq!(Syscall::access_mode(0o10), Err(LxError::EINVAL));
         assert_eq!(Syscall::access_mode(0o17), Err(LxError::EINVAL));
         assert_eq!(Syscall::access_mode(usize::MAX), Err(LxError::EINVAL));
+    }
+}
+
+/// `SYNC_IOC_MERGE` is `_IOWR('>', 3, struct sync_merge_data)`: type `'>'`
+/// (0x3e), nr 3, 48 bytes. Matched on type and nr, like the DRM syncobj fd
+/// ioctls: the struct is UABI-frozen, and a size-pinned constant is how this
+/// tree has lost ioctls before.
+pub(crate) fn is_sync_ioc_merge(cmd: u32) -> bool {
+    (cmd >> 8) & 0xff == 0x3e && cmd & 0xff == 3
+}
+
+#[cfg(test)]
+mod sync_file_ioctl_tests {
+    use super::is_sync_ioc_merge;
+
+    /// The number libsync's `sync_merge()` sends.
+    const SYNC_IOC_MERGE: u32 = 0xc030_3e03;
+
+    #[test]
+    fn the_merge_ioctl_is_recognised() {
+        assert!(is_sync_ioc_merge(SYNC_IOC_MERGE));
+        // Same type, other nrs (`SYNC_IOC_FILE_INFO` is 4) are not the merge.
+        assert!(!is_sync_ioc_merge(0xc038_3e04));
+        // The DRM syncobj fd ioctls share the "match on type and nr" idea but
+        // are another family.
+        assert!(!is_sync_ioc_merge(0xc018_64c1));
+        assert!(!is_sync_ioc_merge(0xc018_64c2));
     }
 }
