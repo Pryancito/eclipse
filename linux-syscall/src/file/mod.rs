@@ -9,6 +9,7 @@ mod dir;
 mod fd;
 #[allow(clippy::module_inception)]
 mod file;
+pub(crate) use file::{after_write_error, sigpipe_due, AfterWriteError};
 mod mount;
 mod pidfd;
 mod poll;
