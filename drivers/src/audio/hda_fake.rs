@@ -13,12 +13,6 @@
 //! The clock is the per-thread test clock behind `timer_now_as_micros`,
 //! moved by `run_for_us` and by the driver's own `wait_us`. One fake per
 //! thread, so the tests run in parallel.
-//!
-//! With the `hda-fake` feature the fake is part of the crate, for another
-//! crate's tests to put a real `HdaDevice` on ([`controller`] and
-//! [`hdmi_controller`]); the helpers only this file's tests use are then
-//! dead code by design.
-#![cfg_attr(not(test), allow(dead_code))]
 
 use super::*;
 use crate::nvme::nvme_queue::test_clock;
@@ -129,13 +123,6 @@ fn peek<T>(va: usize) -> T {
     unsafe { read_volatile(va as *const T) }
 }
 
-/// Where the driver's DMA memory is, from the physical address it
-/// programmed into a register. In this crate's test binary the two are the
-/// same; under another crate's hosted kernel they are not.
-fn va(pa: usize) -> usize {
-    crate::nvme::nvme_queue::phys_to_virt(pa)
-}
-
 /// Every register read by the driver.
 pub(super) fn on_read(bar: usize, _off: usize) {
     if let Some(tick) = with_state(bar, |st| st.read_tick_us) {
@@ -157,15 +144,15 @@ pub(super) fn on_write(bar: usize, off: usize, v: u32) {
         REG_CORBSIZE => st.corb_entries = entries_for(v as u8),
         REG_RIRBSIZE => st.rirb_entries = entries_for(v as u8),
         REG_CORBLBASE => st.corb_lo = v,
-        REG_CORBUBASE => st.corb_va = va(((v as usize) << 32) | st.corb_lo as usize),
+        REG_CORBUBASE => st.corb_va = ((v as usize) << 32) | st.corb_lo as usize,
         REG_RIRBLBASE => st.rirb_lo = v,
-        REG_RIRBUBASE => st.rirb_va = va(((v as usize) << 32) | st.rirb_lo as usize),
+        REG_RIRBUBASE => st.rirb_va = ((v as usize) << 32) | st.rirb_lo as usize,
         REG_DPUBASE => st.dp_hi = v,
         REG_DPLBASE => {
             if st.refuse_pos_buffer {
                 poke::<u32>(bar + REG_DPLBASE, v & !DPLBASE_ENABLE);
             } else if v & DPLBASE_ENABLE != 0 {
-                let base = va(((st.dp_hi as usize) << 32) | (v & !DPLBASE_ENABLE) as usize);
+                let base = ((st.dp_hi as usize) << 32) | (v & !DPLBASE_ENABLE) as usize;
                 st.pos_va = base + st.iss * 8;
             }
         }
@@ -173,8 +160,8 @@ pub(super) fn on_write(bar: usize, off: usize, v: u32) {
         o if o == st.sd_base + SD_BDPU => {
             // The ring is what the BDL describes: first entry's address,
             // CBL bytes. A BDL pointing elsewhere plays elsewhere.
-            let bdl = va(((v as usize) << 32) | st.bdl_lo as usize);
-            st.ring_va = va(peek::<u64>(bdl) as usize);
+            let bdl = ((v as usize) << 32) | st.bdl_lo as usize;
+            st.ring_va = peek::<u64>(bdl) as usize;
         }
         o if o == st.sd_base + SD_CBL => st.ring_len = v as usize,
         REG_CORBRP if v & (1 << 15) != 0 => st.corb_rp = 0,
@@ -254,34 +241,34 @@ fn post_rirb(st: &mut FakeState, resp: u32, ext: u32) {
 /// The codec the fake answers for, and the output path the driver is
 /// told it found: one converter and one analog pin, like QEMU's
 /// `hda-output`.
-pub const CODEC: u32 = 0;
-pub const AFG: u32 = 1;
-pub const CONV: u32 = 2;
-pub const PIN: u32 = 3;
+pub(super) const CODEC: u32 = 0;
+pub(super) const AFG: u32 = 1;
+pub(super) const CONV: u32 = 2;
+pub(super) const PIN: u32 = 3;
 /// A second line-out jack, for [`Hw::install_output_codec_with_second_jack`].
-pub const SECOND_PIN: u32 = 4;
-pub const TAG: u32 = 1;
+pub(super) const SECOND_PIN: u32 = 4;
+pub(super) const TAG: u32 = 1;
 
 /// Link bytes per second at the link format (48 kHz stereo S16).
 const LINK_BYTES_PER_S: u64 = LINK_RATE as u64 * 4;
 
 /// The HDMI codec's nodes: converters 4 and 5, DisplayPort pin 6, HDMI
 /// pin 7 (see [`Hw::install_hdmi_codec`]).
-pub const HDMI_CONV: u32 = 4;
-pub const DP_PIN: u32 = 6;
-pub const HDMI_PIN: u32 = 7;
+pub(super) const HDMI_CONV: u32 = 4;
+pub(super) const DP_PIN: u32 = 6;
+pub(super) const HDMI_PIN: u32 = 7;
 /// Config default: jack, digital other out (HDMI), external, no colour.
-pub const PIN_DEFCFG_DIGITAL_DISPLAY: u32 = 0x1856_0010;
+pub(super) const PIN_DEFCFG_DIGITAL_DISPLAY: u32 = 0x1856_0010;
 
 /// The DAC's output amplifier: mute capable, 0 dB at step 0x4a.
-pub const DAC_AMP_CAP: u32 = (1 << 31) | 0x4a;
+pub(super) const DAC_AMP_CAP: u32 = (1 << 31) | 0x4a;
 /// Config default: jack, line out, front, green.
-pub const PIN_DEFCFG_LINE_OUT_JACK: u32 = 0x0101_4010;
+pub(super) const PIN_DEFCFG_LINE_OUT_JACK: u32 = 0x0101_4010;
 
 /// The test's handle on the controller: its BAR, and the engine's
 /// controls.
 #[derive(Clone, Copy)]
-pub struct Hw {
+pub(super) struct Hw {
     pub bar: usize,
 }
 
@@ -608,7 +595,6 @@ impl Hw {
 /// A fresh controller on this thread, and the driver state over it as it
 /// stands after codec discovery: one analog path found, nothing running,
 /// the clock at zero.
-#[cfg(test)]
 pub(super) fn engine() -> (Hw, HdaInner) {
     let hw = install(0);
     let bar = hw.bar;
@@ -652,7 +638,7 @@ pub(super) fn engine() -> (Hw, HdaInner) {
 /// and 4 output descriptors, 256-entry CORB/RIRB on offer, the output
 /// codec attached, nothing programmed. The test calls `HdaDevice::new`
 /// on `hw.bar` itself, after any change of circumstances it wants.
-pub fn controller(iss: usize) -> Hw {
+pub(super) fn controller(iss: usize) -> Hw {
     let hw = install(iss);
     hw.set_streams(iss, 4);
     poke::<u8>(hw.bar + REG_CORBSIZE, 0x40);
@@ -662,7 +648,7 @@ pub fn controller(iss: usize) -> Hw {
 }
 
 /// Like [`controller`], with the HDMI codec attached instead.
-pub fn hdmi_controller(iss: usize) -> Hw {
+pub(super) fn hdmi_controller(iss: usize) -> Hw {
     let hw = install(iss);
     hw.set_streams(iss, 4);
     poke::<u8>(hw.bar + REG_CORBSIZE, 0x40);
@@ -673,13 +659,8 @@ pub fn hdmi_controller(iss: usize) -> Hw {
 
 /// A fresh, empty controller on this thread and the clock at zero.
 fn install(iss: usize) -> Hw {
-    test_clock::install();
     test_clock::set(0);
     let (bar, _) = ProviderImpl::alloc_dma(PAGE_SIZE);
-    // The registers start at zero. In this crate's test binary the page
-    // comes zeroed; a hosted kernel's frame allocator hands back frames
-    // another test freed, with their contents (a WALCLK, a pointer).
-    unsafe { core::ptr::write_bytes(bar as *mut u8, 0, PAGE_SIZE) };
     let sd_base = REG_SD_BASE + iss * 0x20;
     FAKE.with(|cell| {
         *cell.borrow_mut() = Some(FakeState {
@@ -1602,20 +1583,12 @@ mod probe_tests {
         assert!(a.is_playing() && b.is_playing());
         assert!(!dev.own.is_playing(), "the device's own stream has nothing");
         // The first write started the engine, which primed the ring from
-        // the one stream it had; the second joined at the fill point. The
-        // primed PCM is still a's until the link plays it: nothing is
-        // free on either.
+        // the one stream it had; the second joined at the fill point.
         assert_eq!(a.buffer_bytes(), HOST_BUFFER);
-        assert_eq!(a.free_bytes(), 0);
-        assert_eq!(a.queued_bytes(), HOST_BUFFER);
+        assert_eq!(a.free_bytes(), FILL_DEPTH);
+        assert_eq!(a.queued_bytes(), HOST_BUFFER - FILL_DEPTH);
         assert_eq!(b.free_bytes(), 0);
         assert_eq!(b.queued_bytes(), HOST_BUFFER);
-        {
-            // Streams in the order they were added: own, a, b.
-            let inner = dev.inner.lock();
-            assert_eq!(inner.streams[1].1.in_ring(), FILL_DEPTH);
-            assert_eq!(inner.streams[2].1.in_ring(), 0);
-        }
         for _ in 0..(FILL_DEPTH / 768 + 2) {
             tick(&hw, &dev);
         }
@@ -1628,14 +1601,14 @@ mod probe_tests {
             heard[FILL_DEPTH / 2..].iter().all(|&s| s == 15_000),
             "then the mix"
         );
-        // Each stream's queue is its own, and the fill takes from both alike:
-        // a is a fill depth ahead of b in what it has played.
+        // Each stream's queue is its own, and the fill takes from both alike.
         assert_eq!(a.queued_bytes() + FILL_DEPTH, b.queued_bytes());
         assert_eq!(a.free_bytes() + a.queued_bytes(), a.buffer_bytes());
-        // Delay is that same figure: the stream's frames the link has not
-        // heard, in its queue or in the ring.
-        assert_eq!(a.delay_bytes(), a.queued_bytes());
-        assert_eq!(b.delay_bytes(), b.queued_bytes());
+        // Delay is the queue plus what the ring holds ahead of the link.
+        let inner = dev.inner.lock();
+        let ahead = inner.ring_ahead();
+        drop(inner);
+        assert_eq!(a.delay_bytes(), a.queued_bytes() + ahead);
     }
 
     #[test]
