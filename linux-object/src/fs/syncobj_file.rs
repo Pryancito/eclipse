@@ -292,7 +292,7 @@ impl FileLike for SyncobjHandle {
                 return Ok(status);
             }
             let bus = self.eventbus.clone();
-            crate::sync::wait_for_event(bus, Event::READABLE).await;
+            crate::sync::wait_for_event(bus, Event::READABLE).await?;
         }
     }
 

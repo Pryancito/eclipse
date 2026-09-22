@@ -195,7 +195,7 @@ impl FileLike for TimerFd {
                 return Ok(status);
             }
             let bus = self.inner.eventbus.clone();
-            crate::sync::wait_for_event(bus, Event::READABLE).await;
+            crate::sync::wait_for_event(bus, Event::READABLE).await?;
         }
     }
 

@@ -162,15 +162,28 @@ impl Job {
         if !inner.is_empty() {
             return Err(ZxError::BAD_STATE);
         }
+        // Parse and weigh the whole array before applying any of it. Both
+        // halves of this used to happen inside one loop that also wrote to
+        // `inner.policy`: an array whose second entry collided with the parent
+        // returned `ALREADY_EXISTS` with the first entry already applied, and
+        // an entry naming a condition the enums do not have was read as one
+        // anyway, because the caller's bytes arrive here unchecked.
+        // `ZX_JOB_POL_ABSOLUTE` means every condition in the array or none.
+        let mut to_apply = Vec::with_capacity(policies.len());
         for policy in policies {
-            if self.parent_policy.get_action(policy.condition).is_some() {
+            let (condition, action) = policy.parse()?;
+            if self.parent_policy.get_action(condition).is_some() {
                 match options {
+                    // The parent has spoken for this condition and its policy
+                    // wins either way; absolute says so is an error.
                     SetPolicyOptions::Absolute => return Err(ZxError::ALREADY_EXISTS),
-                    SetPolicyOptions::Relative => {}
+                    SetPolicyOptions::Relative => continue,
                 }
-            } else {
-                inner.policy.apply(*policy);
             }
+            to_apply.push((condition, action));
+        }
+        for (condition, action) in to_apply {
+            inner.policy.apply(condition, action);
         }
         Ok(())
     }
@@ -181,8 +194,8 @@ impl Job {
         if !inner.is_empty() {
             return Err(ZxError::BAD_STATE);
         }
-        check_timer_policy(&policy)?;
-        inner.timer_policy = inner.timer_policy.generate_new(policy);
+        let (min_slack, mode) = policy.parse()?;
+        inner.timer_policy = inner.timer_policy.generate_new(min_slack, mode);
         Ok(())
     }
 
@@ -330,6 +343,7 @@ pub struct JobInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::signal::Slack;
     use crate::task::{Status, Thread, ThreadState, TASK_RETCODE_SYSCALL_KILL};
     use core::time::Duration;
 
@@ -351,6 +365,181 @@ mod tests {
         assert_eq!(root_job.create_child().err(), Some(ZxError::BAD_STATE));
     }
 
+    /// `ZX_JOB_POL_RELATIVE` means "applied for the conditions not
+    /// specifically overridden by the parent policy", so an entry for a
+    /// condition the parent has already spoken for is dropped, not written.
+    #[test]
+    fn a_relative_policy_does_not_overwrite_the_parent() {
+        let root_job = Job::root();
+        root_job
+            .set_policy_basic(
+                SetPolicyOptions::Relative,
+                &[BasicPolicy {
+                    condition: PolicyCondition::BadHandle as u32,
+                    action: PolicyAction::Deny as u32,
+                }],
+            )
+            .expect("failed to set the parent policy");
+        let job = Job::create_child(&root_job).expect("failed to create job");
+
+        job.set_policy_basic(
+            SetPolicyOptions::Relative,
+            &[
+                BasicPolicy {
+                    condition: PolicyCondition::BadHandle as u32,
+                    action: PolicyAction::Allow as u32,
+                },
+                BasicPolicy {
+                    condition: PolicyCondition::VmarWx as u32,
+                    action: PolicyAction::Allow as u32,
+                },
+            ],
+        )
+        .expect("failed to set policy");
+
+        // The parent's word stands, and the condition it had not spoken for
+        // is the child's to set.
+        //
+        // Only the first of those two is load-bearing in the loop: `policy()`
+        // merges with the parent and `merge` gives the parent priority
+        // unconditionally, so writing the dropped entry into the child's own
+        // table would not change any answer either. The `continue` says what
+        // is meant; the parent winning is what makes it true.
+        assert_eq!(
+            job.policy().get_action(PolicyCondition::BadHandle),
+            Some(PolicyAction::Deny)
+        );
+        assert_eq!(
+            job.policy().get_action(PolicyCondition::VmarWx),
+            Some(PolicyAction::Allow)
+        );
+    }
+
+    /// `ZX_JOB_POL_ABSOLUTE` means every condition in the array or none.
+    /// Parsing, weighing and applying all happened in one loop, so an array
+    /// whose second entry collided with the parent came back
+    /// `ALREADY_EXISTS` with the first entry already written.
+    #[test]
+    fn an_absolute_policy_that_fails_applies_nothing() {
+        let root_job = Job::root();
+        root_job
+            .set_policy_basic(
+                SetPolicyOptions::Relative,
+                &[BasicPolicy {
+                    condition: PolicyCondition::BadHandle as u32,
+                    action: PolicyAction::Deny as u32,
+                }],
+            )
+            .expect("failed to set the parent policy");
+        let job = Job::create_child(&root_job).expect("failed to create job");
+
+        // The first entry is fine; the second is one the parent has spoken for.
+        assert_eq!(
+            job.set_policy_basic(
+                SetPolicyOptions::Absolute,
+                &[
+                    BasicPolicy {
+                        condition: PolicyCondition::WrongObject as u32,
+                        action: PolicyAction::Deny as u32,
+                    },
+                    BasicPolicy {
+                        condition: PolicyCondition::BadHandle as u32,
+                        action: PolicyAction::Allow as u32,
+                    },
+                ],
+            )
+            .err(),
+            Some(ZxError::ALREADY_EXISTS)
+        );
+        assert_eq!(
+            job.policy().get_action(PolicyCondition::WrongObject),
+            None,
+            "the first entry of a failed absolute call was applied"
+        );
+    }
+
+    /// Both fields of an entry are raw `u32` out of the caller's memory, so an
+    /// array is only worth applying once every entry of it has been read.
+    #[test]
+    fn an_array_with_an_unknown_condition_applies_nothing() {
+        let root_job = Job::root();
+        assert_eq!(
+            root_job
+                .set_policy_basic(
+                    SetPolicyOptions::Relative,
+                    &[
+                        BasicPolicy {
+                            condition: PolicyCondition::VmarWx as u32,
+                            action: PolicyAction::Deny as u32,
+                        },
+                        BasicPolicy {
+                            condition: u32::MAX,
+                            action: PolicyAction::Deny as u32,
+                        },
+                    ],
+                )
+                .err(),
+            Some(ZxError::INVALID_ARGS)
+        );
+        assert_eq!(root_job.policy().get_action(PolicyCondition::VmarWx), None);
+
+        // An action outside the enum is the same answer.
+        assert_eq!(
+            root_job
+                .set_policy_basic(
+                    SetPolicyOptions::Relative,
+                    &[BasicPolicy {
+                        condition: PolicyCondition::VmarWx as u32,
+                        action: 99,
+                    }],
+                )
+                .err(),
+            Some(ZxError::INVALID_ARGS)
+        );
+        assert_eq!(root_job.policy().get_action(PolicyCondition::VmarWx), None);
+    }
+
+    /// The timer slack topic of the same syscall. `TimerSlackPolicy` comes
+    /// straight out of the caller's memory too, and its mode used to be a
+    /// `Slack` that nothing checked.
+    #[test]
+    fn a_timer_slack_policy_the_caller_invented_changes_nothing() {
+        let root_job = Job::root();
+        let slack_of = |job: &Arc<Job>| job.inner.lock().timer_policy.parts();
+        assert_eq!(slack_of(&root_job), (0, Slack::Center));
+
+        // Set a real one first, so that a rejected policy has something to
+        // leave alone: refusing and then writing the default would look the
+        // same on an untouched job.
+        root_job
+            .set_policy_timer_slack(TimerSlackPolicy::from_raw_parts(1000, 2))
+            .unwrap();
+        assert_eq!(slack_of(&root_job), (1000, Slack::Late));
+
+        for policy in [
+            TimerSlackPolicy::from_raw_parts(3000, 3),
+            TimerSlackPolicy::from_raw_parts(3000, u32::MAX),
+            TimerSlackPolicy::from_raw_parts(-1, 0),
+        ] {
+            assert_eq!(
+                root_job.set_policy_timer_slack(policy).err(),
+                Some(ZxError::INVALID_ARGS)
+            );
+            assert_eq!(slack_of(&root_job), (1000, Slack::Late));
+        }
+
+        // Only an empty job takes a timer slack policy at all.
+        let child = Job::create_child(&root_job).unwrap();
+        assert_eq!(
+            root_job
+                .set_policy_timer_slack(TimerSlackPolicy::from_raw_parts(2000, 0))
+                .err(),
+            Some(ZxError::BAD_STATE)
+        );
+        assert_eq!(slack_of(&root_job), (1000, Slack::Late));
+        assert_eq!(slack_of(&child), (0, Slack::Center));
+    }
+
     #[test]
     fn set_policy() {
         let root_job = Job::root();
@@ -363,8 +552,8 @@ mod tests {
 
         // set policy for root job
         let policy = &[BasicPolicy {
-            condition: PolicyCondition::BadHandle,
-            action: PolicyAction::Deny,
+            condition: PolicyCondition::BadHandle as u32,
+            action: PolicyAction::Deny as u32,
         }];
         root_job
             .set_policy_basic(SetPolicyOptions::Relative, policy)
@@ -376,8 +565,8 @@ mod tests {
 
         // override policy should success
         let policy = &[BasicPolicy {
-            condition: PolicyCondition::BadHandle,
-            action: PolicyAction::Allow,
+            condition: PolicyCondition::BadHandle as u32,
+            action: PolicyAction::Allow as u32,
         }];
         root_job
             .set_policy_basic(SetPolicyOptions::Relative, policy)
@@ -404,8 +593,8 @@ mod tests {
 
         // set new policy should success.
         let policy = &[BasicPolicy {
-            condition: PolicyCondition::WrongObject,
-            action: PolicyAction::Allow,
+            condition: PolicyCondition::WrongObject as u32,
+            action: PolicyAction::Allow as u32,
         }];
         job.set_policy_basic(SetPolicyOptions::Relative, policy)
             .expect("failed to set policy");
@@ -416,8 +605,8 @@ mod tests {
 
         // relatively setting existing policy should be ignored.
         let policy = &[BasicPolicy {
-            condition: PolicyCondition::BadHandle,
-            action: PolicyAction::Deny,
+            condition: PolicyCondition::BadHandle as u32,
+            action: PolicyAction::Deny as u32,
         }];
         job.set_policy_basic(SetPolicyOptions::Relative, policy)
             .expect("failed to set policy");

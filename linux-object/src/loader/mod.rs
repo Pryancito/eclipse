@@ -6,6 +6,7 @@ use {
     crate::fs::INodeExt,
     crate::process::Abi,
     alloc::{collections::BTreeMap, string::String, sync::Arc, vec::Vec},
+    core::convert::TryFrom,
     rcore_fs::vfs::INode,
     xmas_elf::ElfFile,
     zircon_object::{util::elf_loader::*, vm::*, ZxError},
@@ -80,6 +81,28 @@ fn shebang_interp(data: &[u8]) -> Option<&str> {
         .trim_end_matches('\r')
         .trim();
     split_shebang(line).map(|(interp, _)| interp)
+}
+
+/// Where an image's entry point lands once it is loaded at `base`.
+///
+/// `e_entry` is a `u64` the file chose freely, and the sum used to be an
+/// unchecked `usize` add: an entry point near the top of the range wrapped
+/// round to a small address, and the process was started on whatever happened
+/// to be mapped there instead of being rejected. Linux rejects the same
+/// binaries, `BAD_ADDR(elf_entry)` in `load_elf_binary`.
+fn entry_address(base: usize, entry_point: u64) -> LxResult<usize> {
+    let entry = usize::try_from(entry_point)
+        .ok()
+        .and_then(|entry| base.checked_add(entry))
+        .ok_or(ZxError::INVALID_ARGS)?;
+    if entry >= STACK_TOP {
+        warn!(
+            "elf: entry point {:#x} is outside the user address space",
+            entry
+        );
+        return Err(ZxError::INVALID_ARGS.into());
+    }
+    Ok(entry)
 }
 
 /// Stack top: place the user stack at the very top of the user address space so
@@ -335,9 +358,12 @@ impl LinuxElfLoader {
             return res;
         }
 
-        let elf = ElfFile::new(data).map_err(|e| {
-            error!("elf: ElfFile::new failed for {:?}: {:?}", path, e);
-            ZxError::INVALID_ARGS
+        // `xmas_elf` slices the header, the two header tables and every
+        // segment out of `data` without checking any of them against its
+        // length, so a malformed image panics the parser -- and `data` here is
+        // whatever file the calling process named.
+        let elf = parse_checked_elf(data).inspect_err(|&e| {
+            error!("elf: cannot parse {:?}: {:?}", path, e);
         })?;
 
         debug!("elf info:  {:#x?}", elf.header.pt2);
@@ -389,7 +415,7 @@ impl LinuxElfLoader {
             let _app_vmo = app_vmar.load_from_elf(&elf).inspect_err(|&e| {
                 error!("elf: load app from elf failed: {:?}", e);
             })?;
-            let app_entry = app_base + elf.header.pt2.entry_point() as usize;
+            let app_entry = entry_address(app_base, elf.header.pt2.entry_point())?;
 
             // Patch any in-binary syscall-entry trampoline present in the main program.
             // Write through the VMAR (which resolves the per-segment VMO): the symbol
@@ -439,9 +465,8 @@ impl LinuxElfLoader {
             let interp_data =
                 unsafe { core::slice::from_raw_parts(interp_virt as *const u8, interp_vmo.len()) };
 
-            let interp_elf = ElfFile::new(interp_data).map_err(|_| {
-                error!("elf: interp {:?} is not a valid ELF", interp);
-                ZxError::INVALID_ARGS
+            let interp_elf = parse_checked_elf(interp_data).inspect_err(|&e| {
+                error!("elf: cannot parse interp {:?}: {:?}", interp, e);
             })?;
             let interp_size = interp_elf.load_segment_size();
             let interp_vmar = vmar
@@ -456,7 +481,7 @@ impl LinuxElfLoader {
             let _interp_vmo = interp_vmar.load_from_elf(&interp_elf).inspect_err(|&e| {
                 error!("elf: load interp {:?} from elf failed: {:?}", interp, e);
             })?;
-            let interp_entry = interp_base + interp_elf.header.pt2.entry_point() as usize;
+            let interp_entry = entry_address(interp_base, interp_elf.header.pt2.entry_point())?;
 
             match interp_elf.relocate(interp_vmar.clone(), vmar) {
                 Ok(()) => info!("interp relocate passed!"),
@@ -620,7 +645,7 @@ impl LinuxElfLoader {
         let _vmo = image_vmar.load_from_elf(&elf).inspect_err(|&e| {
             error!("elf: load_from_elf failed: {:?}", e);
         })?;
-        let entry = base + elf.header.pt2.entry_point() as usize;
+        let entry = entry_address(base, elf.header.pt2.entry_point())?;
 
         debug!(
             "load: vmar.addr & size: {:#x?}, base: {:#x?}, entry: {:#x?}",
@@ -817,5 +842,824 @@ mod shebang_tests {
         assert_eq!(shebang_interp(b""), None);
         // No newline at all: the whole (bounded) file is the line.
         assert_eq!(shebang_interp(b"#!/bin/sh"), Some("/bin/sh"));
+    }
+}
+
+#[cfg(test)]
+mod elf_bounds_tests {
+    use super::*;
+
+    /// `EI_CLASS` = 64-bit, `EI_DATA` = little-endian.
+    const CLASS64: u8 = 2;
+    const DATA_LSB: u8 = 1;
+    /// Size of an ELF64 header and of one ELF64 program header entry.
+    const EHDR_SIZE: usize = 64;
+    const PHDR_SIZE: usize = 56;
+    const SHDR_SIZE: usize = 64;
+
+    /// One program header entry, in the fields this loader reads.
+    #[derive(Clone, Copy, Default)]
+    struct Phdr {
+        p_type: u32,
+        offset: u64,
+        virtual_addr: u64,
+        file_size: u64,
+        mem_size: u64,
+    }
+
+    /// One section header entry, likewise.
+    #[derive(Clone, Copy, Default)]
+    struct Shdr {
+        sh_type: u32,
+        /// Offset of this section's name in the name table.
+        name: u32,
+        offset: u64,
+        size: u64,
+        /// Set instead of `offset` to place the section in the payload area,
+        /// whose position depends on how many headers there turn out to be.
+        at_payload: Option<u64>,
+    }
+
+    /// An ELF64 image built field by field, so a test can put one value out of
+    /// range and leave everything else well formed.
+    #[derive(Default)]
+    struct Elf {
+        class: u8,
+        data_encoding: u8,
+        entry_point: u64,
+        ph_offset: Option<u64>,
+        ph_entry_size: u16,
+        sh_offset: Option<u64>,
+        sh_entry_size: u16,
+        sh_str_index: u16,
+        phdrs: Vec<Phdr>,
+        shdrs: Vec<Shdr>,
+        /// Bytes appended after both tables, so a segment has somewhere to
+        /// point at.
+        payload: Vec<u8>,
+        /// Length to cut the finished image down to.
+        truncate_to: Option<usize>,
+    }
+
+    impl Elf {
+        fn new() -> Self {
+            Self {
+                class: CLASS64,
+                data_encoding: DATA_LSB,
+                ph_entry_size: PHDR_SIZE as u16,
+                sh_entry_size: SHDR_SIZE as u16,
+                ..Default::default()
+            }
+        }
+
+        fn phdr(mut self, ph: Phdr) -> Self {
+            self.phdrs.push(ph);
+            self
+        }
+
+        fn shdr(mut self, sh: Shdr) -> Self {
+            self.shdrs.push(sh);
+            self
+        }
+
+        /// Append `bytes` to the payload and return where they start, as an
+        /// offset within it.
+        fn blob(&mut self, bytes: &[u8]) -> u64 {
+            let at = self.payload.len() as u64;
+            self.payload.extend_from_slice(bytes);
+            at
+        }
+
+        fn build(&self) -> Vec<u8> {
+            let ph_table = EHDR_SIZE;
+            let sh_table = ph_table + self.phdrs.len() * PHDR_SIZE;
+            let payload_at = sh_table + self.shdrs.len() * SHDR_SIZE;
+            let mut v = vec![0u8; payload_at];
+            v[..4].copy_from_slice(&[0x7f, b'E', b'L', b'F']);
+            v[4] = self.class;
+            v[5] = self.data_encoding;
+            v[6] = 1;
+            v[16..18].copy_from_slice(&2u16.to_le_bytes()); // ET_EXEC
+            v[18..20].copy_from_slice(&0x3eu16.to_le_bytes()); // EM_X86_64
+            v[24..32].copy_from_slice(&self.entry_point.to_le_bytes());
+            let ph_offset = self.ph_offset.unwrap_or(ph_table as u64);
+            let sh_offset = self.sh_offset.unwrap_or(sh_table as u64);
+            v[32..40].copy_from_slice(&ph_offset.to_le_bytes());
+            v[40..48].copy_from_slice(&sh_offset.to_le_bytes());
+            v[52..54].copy_from_slice(&(EHDR_SIZE as u16).to_le_bytes());
+            v[54..56].copy_from_slice(&self.ph_entry_size.to_le_bytes());
+            v[56..58].copy_from_slice(&(self.phdrs.len() as u16).to_le_bytes());
+            v[58..60].copy_from_slice(&self.sh_entry_size.to_le_bytes());
+            v[60..62].copy_from_slice(&(self.shdrs.len() as u16).to_le_bytes());
+            v[62..64].copy_from_slice(&self.sh_str_index.to_le_bytes());
+
+            for (i, ph) in self.phdrs.iter().enumerate() {
+                let at = ph_table + i * PHDR_SIZE;
+                v[at..at + 4].copy_from_slice(&ph.p_type.to_le_bytes());
+                v[at + 8..at + 16].copy_from_slice(&ph.offset.to_le_bytes());
+                v[at + 16..at + 24].copy_from_slice(&ph.virtual_addr.to_le_bytes());
+                v[at + 32..at + 40].copy_from_slice(&ph.file_size.to_le_bytes());
+                v[at + 40..at + 48].copy_from_slice(&ph.mem_size.to_le_bytes());
+            }
+            for (i, sh) in self.shdrs.iter().enumerate() {
+                let at = sh_table + i * SHDR_SIZE;
+                let offset = match sh.at_payload {
+                    Some(within) => payload_at as u64 + within,
+                    None => sh.offset,
+                };
+                v[at..at + 4].copy_from_slice(&sh.name.to_le_bytes());
+                v[at + 4..at + 8].copy_from_slice(&sh.sh_type.to_le_bytes());
+                v[at + 24..at + 32].copy_from_slice(&offset.to_le_bytes());
+                v[at + 32..at + 40].copy_from_slice(&sh.size.to_le_bytes());
+            }
+            v.extend_from_slice(&self.payload);
+            if let Some(len) = self.truncate_to {
+                v.truncate(len);
+            }
+            v
+        }
+    }
+
+    /// Offset of the payload area of an image with `phdrs` program headers and
+    /// no section headers.
+    fn payload_at(phdrs: usize) -> u64 {
+        (EHDR_SIZE + phdrs * PHDR_SIZE) as u64
+    }
+
+    /// The whole point: `execve` hands the parser a file the calling process
+    /// chose, and `xmas_elf` slices `data[16..64]` out of it the moment the
+    /// first sixteen bytes look like an ELF. A twenty-byte file used to be
+    /// enough to panic the kernel from an unprivileged process.
+    #[test]
+    fn a_file_too_short_to_hold_its_own_header_is_rejected() {
+        let full = Elf::new().build();
+        assert_eq!(full.len(), EHDR_SIZE);
+        assert_eq!(check_elf_bounds(&full), Ok(()));
+        for len in 0..EHDR_SIZE {
+            assert_eq!(
+                check_elf_bounds(&full[..len]),
+                Err(ZxError::INVALID_ARGS),
+                "a {}-byte image passed the bounds check",
+                len
+            );
+        }
+    }
+
+    /// `parse_program_header` indexes the file at `e_phoff` with no bounds
+    /// check of any kind, so a header table said to live past the end of the
+    /// file panicked the parser on the first entry.
+    #[test]
+    fn a_header_table_outside_the_file_is_rejected() {
+        let phdr = Phdr {
+            p_type: 1, // PT_LOAD
+            ..Default::default()
+        };
+        // Well formed: the table follows the ELF header.
+        assert_eq!(check_elf_bounds(&Elf::new().phdr(phdr).build()), Ok(()));
+
+        // Past the end of the file.
+        let mut elf = Elf::new().phdr(phdr);
+        elf.ph_offset = Some(0x1000);
+        assert_eq!(check_elf_bounds(&elf.build()), Err(ZxError::INVALID_ARGS));
+
+        // Starting inside the file but running off the end of it.
+        let mut elf = Elf::new().phdr(phdr);
+        elf.ph_offset = Some(EHDR_SIZE as u64 + 8);
+        assert_eq!(check_elf_bounds(&elf.build()), Err(ZxError::INVALID_ARGS));
+
+        // Far enough out that `e_phoff + e_phnum * e_phentsize` wraps.
+        let mut elf = Elf::new().phdr(phdr);
+        elf.ph_offset = Some(u64::MAX - 8);
+        assert_eq!(check_elf_bounds(&elf.build()), Err(ZxError::INVALID_ARGS));
+
+        // The same for the section header table, which `get_symbol_address`
+        // walks on every exec.
+        let mut elf = Elf::new().shdr(Shdr::default());
+        elf.sh_offset = Some(0x1000);
+        assert_eq!(check_elf_bounds(&elf.build()), Err(ZxError::INVALID_ARGS));
+    }
+
+    /// An entry smaller than the struct the parser reads out of it makes
+    /// `zero::read` assert, which is the same kernel panic by another route.
+    #[test]
+    fn a_header_entry_smaller_than_its_struct_is_rejected() {
+        let mut elf = Elf::new().phdr(Phdr::default());
+        elf.ph_entry_size = PHDR_SIZE as u16 - 1;
+        assert_eq!(check_elf_bounds(&elf.build()), Err(ZxError::INVALID_ARGS));
+
+        let mut elf = Elf::new().shdr(Shdr::default());
+        elf.sh_entry_size = SHDR_SIZE as u16 - 1;
+        assert_eq!(check_elf_bounds(&elf.build()), Err(ZxError::INVALID_ARGS));
+
+        // A count of zero means there is no table at all, so an entry size of
+        // zero is not a problem and a real linker does emit one.
+        let mut elf = Elf::new();
+        elf.ph_entry_size = 0;
+        elf.sh_entry_size = 0;
+        assert_eq!(check_elf_bounds(&elf.build()), Ok(()));
+    }
+
+    /// `ProgramHeader::raw_data` slices `p_offset .. p_offset + p_filesz`, so
+    /// any truncated binary -- a copy interrupted half way -- panicked the
+    /// kernel rather than failing the exec.
+    #[test]
+    fn a_segment_whose_contents_run_past_the_end_of_the_file_is_rejected() {
+        let load = Phdr {
+            p_type: 1,
+            offset: payload_at(1),
+            file_size: 16,
+            mem_size: 16,
+            ..Default::default()
+        };
+        let mut elf = Elf::new().phdr(load);
+        elf.payload = vec![0u8; 16];
+        assert_eq!(check_elf_bounds(&elf.build()), Ok(()));
+
+        // The same image with the last byte missing.
+        let image = elf.build();
+        assert_eq!(
+            check_elf_bounds(&image[..image.len() - 1]),
+            Err(ZxError::INVALID_ARGS)
+        );
+
+        // A file size that wraps when added to the offset.
+        let mut elf = Elf::new().phdr(Phdr {
+            file_size: u64::MAX,
+            ..load
+        });
+        elf.payload = vec![0u8; 16];
+        assert_eq!(check_elf_bounds(&elf.build()), Err(ZxError::INVALID_ARGS));
+    }
+
+    /// Section contents are sliced the same way by `get_symbol_address` and
+    /// `dynsym`, with one exception: `.bss` declares a size but stores no
+    /// bytes, so its `sh_offset` says nothing about the file.
+    #[test]
+    fn a_section_outside_the_file_is_rejected_unless_it_holds_no_bytes() {
+        const SHT_PROGBITS: u32 = 1;
+        const SHT_NOBITS: u32 = 8;
+        let mut elf = Elf::new().shdr(Shdr {
+            sh_type: SHT_PROGBITS,
+            offset: payload_at(0) + SHDR_SIZE as u64,
+            size: 8,
+            ..Default::default()
+        });
+        elf.payload = vec![0u8; 8];
+        assert_eq!(check_elf_bounds(&elf.build()), Ok(()));
+
+        let image = elf.build();
+        assert_eq!(
+            check_elf_bounds(&image[..image.len() - 1]),
+            Err(ZxError::INVALID_ARGS)
+        );
+
+        // `.bss`: a size far larger than the file, and legitimate.
+        let elf = Elf::new().shdr(Shdr {
+            sh_type: SHT_NOBITS,
+            offset: payload_at(0) + SHDR_SIZE as u64,
+            size: 0x10000,
+            ..Default::default()
+        });
+        assert_eq!(check_elf_bounds(&elf.build()), Ok(()));
+
+        // Its offset still has to be inside the file: `get_shstr_table` slices
+        // `input[sh_offset..]` before anything has looked at the type.
+        let elf = Elf::new().shdr(Shdr {
+            sh_type: SHT_NOBITS,
+            offset: 0x1000,
+            size: 0,
+            ..Default::default()
+        });
+        assert_eq!(check_elf_bounds(&elf.build()), Err(ZxError::INVALID_ARGS));
+    }
+
+    /// `e_shstrndx` names the section holding every other section's name, and
+    /// `get_shstr_table` reads it with no range check of its own: an index
+    /// past the end of the table slices the file at an arbitrary multiple of
+    /// the entry size. `dynsym` reaches it on every dynamically linked
+    /// program, looking for `.dynsym`.
+    #[test]
+    fn a_name_table_index_outside_the_section_table_is_rejected() {
+        let with_index = |sh_str_index| {
+            let mut elf = Elf::new().shdr(Shdr::default()).shdr(Shdr::default());
+            elf.sh_str_index = sh_str_index;
+            check_elf_bounds(&elf.build())
+        };
+        assert_eq!(with_index(0), Ok(()));
+        assert_eq!(with_index(1), Ok(()));
+        assert_eq!(with_index(2), Err(ZxError::INVALID_ARGS));
+        assert_eq!(with_index(u16::MAX), Err(ZxError::INVALID_ARGS));
+
+        // With no section table at all nothing reads a name, so the index is
+        // not consulted and a stripped binary still loads.
+        let mut elf = Elf::new();
+        elf.sh_str_index = 7;
+        assert_eq!(check_elf_bounds(&elf.build()), Ok(()));
+    }
+
+    /// The identification bytes decide how everything after them is read. The
+    /// parser maps its structs straight onto the file, so it reads every field
+    /// in the host's byte order and a big-endian image would be read as
+    /// garbage, lengths included.
+    #[test]
+    fn only_a_little_endian_image_of_a_known_class_is_accepted() {
+        let mut elf = Elf::new();
+        elf.data_encoding = 2; // ELFDATA2MSB
+        assert_eq!(check_elf_bounds(&elf.build()), Err(ZxError::INVALID_ARGS));
+
+        let mut elf = Elf::new();
+        elf.class = 0; // ELFCLASSNONE
+        assert_eq!(check_elf_bounds(&elf.build()), Err(ZxError::INVALID_ARGS));
+
+        // Not an ELF at all: the same error the parser itself would give, so a
+        // shell script still fails the way it always did.
+        assert_eq!(check_elf_bounds(b"#!/bin/sh\n"), Err(ZxError::INVALID_ARGS));
+        assert_eq!(check_elf_bounds(b""), Err(ZxError::INVALID_ARGS));
+    }
+
+    /// A 32-bit image has a smaller header and smaller entries, and the check
+    /// has to know both or it rejects every one of them.
+    #[test]
+    fn a_32_bit_image_is_measured_with_32_bit_offsets() {
+        // An ELF32 header is 52 bytes, and its program headers are 32.
+        let mut v = vec![0u8; 52 + 32];
+        v[..4].copy_from_slice(&[0x7f, b'E', b'L', b'F']);
+        v[4] = 1; // ELFCLASS32
+        v[5] = DATA_LSB;
+        v[28..32].copy_from_slice(&52u32.to_le_bytes()); // e_phoff
+        v[42..44].copy_from_slice(&32u16.to_le_bytes()); // e_phentsize
+        v[44..46].copy_from_slice(&1u16.to_le_bytes()); // e_phnum
+        assert_eq!(check_elf_bounds(&v), Ok(()));
+
+        // The same image one byte short of its program header.
+        assert_eq!(
+            check_elf_bounds(&v[..v.len() - 1]),
+            Err(ZxError::INVALID_ARGS)
+        );
+
+        // With no tables at all, the header's own 52 bytes are the only thing
+        // that has to be there -- and the parser slices all 52 of them.
+        let mut bare = v[..52].to_vec();
+        bare[44..46].copy_from_slice(&0u16.to_le_bytes()); // e_phnum
+        assert_eq!(check_elf_bounds(&bare), Ok(()));
+        for len in 0..52 {
+            assert_eq!(
+                check_elf_bounds(&bare[..len]),
+                Err(ZxError::INVALID_ARGS),
+                "a {}-byte 32-bit image passed the bounds check",
+                len
+            );
+        }
+
+        // A segment past the end of the file, read through 32-bit fields:
+        // `p_offset` sits four bytes into the entry and `p_filesz` sixteen.
+        v[56..60].copy_from_slice(&64u32.to_le_bytes()); // p_offset
+        v[68..72].copy_from_slice(&64u32.to_le_bytes()); // p_filesz
+        assert_eq!(check_elf_bounds(&v), Err(ZxError::INVALID_ARGS));
+    }
+
+    /// `p_type` is a `u32` the file chooses, and `xmas_elf` knows only a
+    /// handful of values. Unwrapping the `Err` panicked the kernel on a
+    /// one-byte edit; Linux's loader switches on `p_type` and ignores what it
+    /// does not recognise.
+    #[test]
+    fn a_program_header_of_an_unknown_type_is_skipped_not_unwrapped() {
+        let elf = Elf::new().phdr(Phdr {
+            p_type: 8, // between PT_TLS and PT_GNU_RELRO: no name at all
+            virtual_addr: 0x1000,
+            mem_size: 0x1000,
+            ..Default::default()
+        });
+        let image = elf.build();
+        assert_eq!(check_elf_bounds(&image), Ok(()));
+        let parsed = ElfFile::new(&image).unwrap();
+        assert!(parsed.program_iter().next().unwrap().get_type().is_err());
+        // No LOAD segment, so nothing to size -- and no panic getting there.
+        assert_eq!(parsed.load_segment_size(), 0);
+    }
+
+    /// `p_vaddr + p_memsz` was an unchecked `u64` add fed into a `pages()`
+    /// that rounds up with a `wrapping_add`, so a segment at the top of the
+    /// address space came back as a handful of pages and the image was mapped
+    /// into a region far too small for it.
+    #[test]
+    fn a_segment_at_the_top_of_the_address_space_does_not_wrap_to_nothing() {
+        let build = |virtual_addr, mem_size| {
+            let image = Elf::new()
+                .phdr(Phdr {
+                    p_type: 1,
+                    virtual_addr,
+                    mem_size,
+                    ..Default::default()
+                })
+                .build();
+            assert_eq!(check_elf_bounds(&image), Ok(()));
+            ElfFile::new(&image).unwrap().load_segment_size()
+        };
+
+        // An ordinary segment still measures the way it always did.
+        assert_eq!(build(0x1000, 0x2000), 0x3000);
+        assert_eq!(build(0x1100, 0x1), 0x2000);
+
+        // Measured on its own as well, for the same reason.
+        assert_eq!(segment_end_pages(0x1000, 0x2000), 3);
+        assert_eq!(segment_end_pages(0x1100, 1), 2);
+        assert_eq!(segment_end_pages(0, 0), 0);
+        assert_eq!(segment_end_pages(u64::MAX, 1), usize::MAX / PAGE_SIZE);
+        assert_eq!(segment_end_pages(1, u64::MAX), usize::MAX / PAGE_SIZE);
+
+        // These used to wrap round to a size of zero, or to one page.
+        assert_eq!(build(u64::MAX, 1), usize::MAX / PAGE_SIZE * PAGE_SIZE);
+        assert_eq!(
+            build(u64::MAX - 0xfff, 0x1000),
+            usize::MAX / PAGE_SIZE * PAGE_SIZE
+        );
+        assert_eq!(build(1, u64::MAX), usize::MAX / PAGE_SIZE * PAGE_SIZE);
+    }
+
+    /// The interpreter path is read by scanning a segment for a nul byte. The
+    /// scan had no end, so a `PT_INTERP` whose contents are not terminated ran
+    /// off the segment and panicked the kernel.
+    #[test]
+    fn an_interpreter_path_without_a_terminator_is_an_error_not_a_panic() {
+        let interp = |bytes: &[u8]| {
+            let mut elf = Elf::new().phdr(Phdr {
+                p_type: 3, // PT_INTERP
+                offset: payload_at(1),
+                file_size: bytes.len() as u64,
+                mem_size: bytes.len() as u64,
+                ..Default::default()
+            });
+            elf.payload = bytes.to_vec();
+            let image = elf.build();
+            assert_eq!(check_elf_bounds(&image), Ok(()));
+            ElfFile::new(&image)
+                .unwrap()
+                .get_interpreter()
+                .map(String::from)
+                .map_err(String::from)
+        };
+
+        assert_eq!(
+            interp(b"/lib/ld-musl-x86_64.so.1\0").as_deref(),
+            Ok("/lib/ld-musl-x86_64.so.1")
+        );
+        // Every byte of the segment is path: there is no terminator to find.
+        assert!(interp(b"/lib/ld.so").is_err());
+        assert!(interp(b"").is_err());
+    }
+
+    /// `e_entry` is a `u64` the file chooses, and it used to be added to the
+    /// load base with no check: an entry point near the top of the range
+    /// wrapped round to a small address and the process was started on
+    /// whatever happened to be mapped there.
+    #[test]
+    fn an_entry_point_that_does_not_fit_is_rejected() {
+        assert_eq!(entry_address(0x40_0000, 0x1000), Ok(0x40_1000));
+        assert_eq!(entry_address(0, 0), Ok(0));
+
+        assert!(entry_address(0x40_0000, u64::MAX).is_err());
+        assert!(entry_address(usize::MAX, 1).is_err());
+        // In range as a number, outside the user address space.
+        assert!(entry_address(0, STACK_TOP as u64).is_err());
+        assert_eq!(entry_address(0, STACK_TOP as u64 - 1), Ok(STACK_TOP - 1));
+    }
+
+    /// `sh_type` values this tree's loader meets.
+    const SHT_SYMTAB: u32 = 2;
+    const SHT_STRTAB: u32 = 3;
+    const SHT_RELA: u32 = 4;
+    const SHT_DYNSYM: u32 = 11;
+    const SHT_GROUP: u32 = 17;
+
+    /// An image with a section table: a name table, and the sections the
+    /// caller asks for as `(name, sh_type, contents)`, named from it.
+    fn with_sections(sections: &[(&str, u32, &[u8])]) -> Vec<u8> {
+        with_named_sections(sections, None)
+    }
+
+    /// The same, but the name table's own contents can be supplied whole --
+    /// which is how a table with no terminator gets built.
+    fn with_named_sections(sections: &[(&str, u32, &[u8])], names: Option<&[u8]>) -> Vec<u8> {
+        let mut table = vec![0u8];
+        let mut offsets = Vec::new();
+        for (name, _, _) in sections {
+            offsets.push(table.len() as u32);
+            table.extend_from_slice(name.as_bytes());
+            table.push(0);
+        }
+        let table_name = table.len() as u32;
+        table.extend_from_slice(b".shstrtab\0");
+        let table = names.map(<[u8]>::to_vec).unwrap_or(table);
+
+        let mut elf = Elf::new();
+        let mut placed = Vec::new();
+        for (i, (_, sh_type, data)) in sections.iter().enumerate() {
+            let at = elf.blob(data);
+            placed.push(Shdr {
+                name: offsets[i],
+                sh_type: *sh_type,
+                at_payload: Some(at),
+                size: data.len() as u64,
+                offset: 0,
+            });
+        }
+        let table_at = elf.blob(&table);
+        elf.shdrs.extend(placed);
+        elf.shdrs.push(Shdr {
+            name: table_name,
+            sh_type: SHT_STRTAB,
+            at_payload: Some(table_at),
+            size: table.len() as u64,
+            offset: 0,
+        });
+        elf.sh_str_index = sections.len() as u16;
+        elf.build()
+    }
+
+    /// One `Elf64_Sym`: name offset at 0, value at 8.
+    fn symbol(name: u32, value: u64) -> [u8; 24] {
+        let mut sym = [0u8; 24];
+        sym[..4].copy_from_slice(&name.to_le_bytes());
+        // `st_shndx` of 1: a defined symbol, so `relocate` does not skip it.
+        sym[6..8].copy_from_slice(&1u16.to_le_bytes());
+        sym[8..16].copy_from_slice(&value.to_le_bytes());
+        sym
+    }
+
+    /// Every name in an ELF is an offset into a table of nul-terminated
+    /// strings, and both the offset and the bytes come from the file.
+    /// `zero::read_str`, which every name lookup in the parser goes through,
+    /// panics on a table that does not terminate and again on bytes that are
+    /// not UTF-8.
+    #[test]
+    fn a_name_read_from_a_string_table_is_bounded_at_both_ends() {
+        let table = b"\0first\0second\0";
+        assert_eq!(str_at(table, 1), Some("first"));
+        assert_eq!(str_at(table, 7), Some("second"));
+        assert_eq!(str_at(table, 0), Some(""));
+        // A name may start part way through another, which is how a linker
+        // shares the tail of a string.
+        assert_eq!(str_at(table, 10), Some("ond"));
+
+        // Past the end of the table.
+        assert_eq!(str_at(table, table.len() as u32 + 1), None);
+        assert_eq!(str_at(table, u32::MAX), None);
+        // No terminator: the scan used to run off the end of the table.
+        assert_eq!(str_at(b"no terminator", 0), None);
+        // Not UTF-8.
+        assert_eq!(str_at(b"\xff\xfe\0", 0), None);
+        assert_eq!(str_at(b"", 0), None);
+    }
+
+    /// `get_data` hands back a symbol table as a slice with
+    /// `zero::read_array`, which ASSERTS that the section divides exactly into
+    /// entries. A `.symtab` one byte long panicked the kernel, and
+    /// `get_symbol_address` runs on every exec looking for the syscall
+    /// trampoline.
+    #[test]
+    fn a_symbol_table_that_does_not_divide_into_symbols_is_not_read() {
+        let names = b"\0entry\0";
+        let good = with_sections(&[
+            (".symtab", SHT_SYMTAB, &symbol(1, 0x1234)),
+            (".strtab", SHT_STRTAB, names),
+        ]);
+        let elf = parse_checked_elf(&good).unwrap();
+        assert_eq!(elf.get_symbol_address("entry"), Some(0x1234));
+        assert_eq!(elf.get_symbol_address("missing"), None);
+
+        // The same table with one byte too many.
+        let mut ragged = symbol(1, 0x1234).to_vec();
+        ragged.push(0);
+        let bad = with_sections(&[
+            (".symtab", SHT_SYMTAB, &ragged),
+            (".strtab", SHT_STRTAB, names),
+        ]);
+        let elf = parse_checked_elf(&bad).unwrap();
+        assert_eq!(elf.get_symbol_address("entry"), None);
+    }
+
+    /// The same for `.dynsym`, which `relocate` reads on every dynamically
+    /// linked program.
+    #[test]
+    fn a_ragged_dynsym_is_an_error_not_a_panic() {
+        let good = with_sections(&[(".dynsym", SHT_DYNSYM, &symbol(1, 0x20))]);
+        assert_eq!(
+            parse_checked_elf(&good).unwrap().dynsym().map(<[_]>::len),
+            Ok(1)
+        );
+
+        let bad = with_sections(&[(".dynsym", SHT_DYNSYM, &symbol(1, 0x20)[..23])]);
+        assert!(parse_checked_elf(&bad).unwrap().dynsym().is_err());
+
+        // And an image with no `.dynsym` at all, which is most of them.
+        let none = with_sections(&[(".text", 1, b"\x90")]);
+        assert!(parse_checked_elf(&none).unwrap().dynsym().is_err());
+    }
+
+    /// `get_symbol_address` asked every section for its contents whatever its
+    /// type, so the parser's whole dispatch ran on file-chosen bytes: an empty
+    /// group section indexed `data[0]`, and a 32-bit note reached an
+    /// `unimplemented!()`. Only symbol tables are of any interest here, and
+    /// the search has to carry on past the rest.
+    #[test]
+    fn a_section_type_the_parser_cannot_handle_is_skipped() {
+        let image = with_sections(&[
+            (".group", SHT_GROUP, b""),
+            (".symtab", SHT_SYMTAB, &symbol(1, 0x5678)),
+            (".strtab", SHT_STRTAB, b"\0entry\0"),
+        ]);
+        let elf = parse_checked_elf(&image).unwrap();
+        assert_eq!(elf.get_symbol_address("entry"), Some(0x5678));
+    }
+
+    /// A section may declare a size and store nothing (`.bss` is the usual
+    /// one), and that size is the one the bounds check cannot bound: it
+    /// describes memory, not the file. So a string table declared that way
+    /// holds no names, whatever bytes happen to sit where it points.
+    #[test]
+    fn a_string_table_that_stores_no_bytes_holds_no_names() {
+        const SHT_NOBITS: u32 = 8;
+        let names = b"\0entry\0";
+        // The very same image, with `.strtab` the one way and the other.
+        let real = with_sections(&[
+            (".symtab", SHT_SYMTAB, &symbol(1, 0x4321)),
+            (".strtab", SHT_STRTAB, names),
+        ]);
+        assert_eq!(
+            parse_checked_elf(&real)
+                .unwrap()
+                .get_symbol_address("entry"),
+            Some(0x4321)
+        );
+
+        let nobits = with_sections(&[
+            (".symtab", SHT_SYMTAB, &symbol(1, 0x4321)),
+            (".strtab", SHT_NOBITS, names),
+        ]);
+        assert_eq!(
+            parse_checked_elf(&nobits)
+                .unwrap()
+                .get_symbol_address("entry"),
+            None
+        );
+    }
+
+    /// The section names themselves live in a table the file chose, so a
+    /// lookup by name is a string read like any other. With nothing readable
+    /// there, no section is found -- which is the answer for a stripped
+    /// binary too, and not a panic.
+    #[test]
+    fn a_name_table_that_does_not_terminate_finds_no_sections() {
+        let image = with_named_sections(
+            &[(".dynsym", SHT_DYNSYM, &symbol(1, 0x20))],
+            Some(b"\0.dynsym"),
+        );
+        let elf = parse_checked_elf(&image).unwrap();
+        assert!(elf.dynsym().is_err());
+        assert_eq!(elf.get_symbol_address("entry"), None);
+    }
+
+    /// A relocation names its symbol by index into `.dynsym`, and the index is
+    /// a `u32` from the file: indexing the slice with it panicked the kernel
+    /// on any entry pointing past the end of the table.
+    #[test]
+    fn a_relocation_naming_a_symbol_outside_dynsym_is_skipped() {
+        // One `Elf64_Rela`: r_offset, then r_info as (symbol index << 32) |
+        // type, then r_addend. Type 6 is R_X86_64_GLOB_DAT, which resolves a
+        // symbol and so reaches the table.
+        let mut rela = [0u8; 24];
+        rela[..8].copy_from_slice(&0x1000u64.to_le_bytes());
+        rela[8..16].copy_from_slice(&(((0xffff_u64) << 32) | 6).to_le_bytes());
+        let image = with_sections(&[
+            (".rela.dyn", SHT_RELA, &rela),
+            (".dynsym", SHT_DYNSYM, &symbol(1, 0x20)),
+            (".dynstr", SHT_STRTAB, b"\0entry\0"),
+        ]);
+        let elf = parse_checked_elf(&image).unwrap();
+        let vmar = VmAddressRegion::new_root();
+        assert_eq!(elf.relocate(vmar.clone(), &vmar), Ok(()));
+    }
+
+    /// Every check here rejects something, and a check that rejects too much
+    /// is worse than the panic it replaced: nothing on the system would run.
+    /// So: a real ELF, produced by a real linker, with a full section table,
+    /// a `.bss`, a section name table and program headers of half a dozen
+    /// types. The test binary itself is one.
+    #[test]
+    fn a_real_binary_still_passes_every_check() {
+        extern crate std;
+        let image = match std::fs::read("/proc/self/exe") {
+            Ok(image) => image,
+            // Not Linux, or /proc is not mounted: nothing to say either way.
+            Err(_) => return,
+        };
+        assert_eq!(check_elf_bounds(&image), Ok(()));
+        let elf = parse_checked_elf(&image).expect("the test binary is an ELF");
+        assert!(elf.load_segment_size() > 0);
+        // And the section-name path, which is what `dynsym` walks.
+        assert!(elf.find_section_by_name(".text").is_some());
+    }
+
+    /// `parse_checked_elf` is the only way an image from userspace becomes an
+    /// `ElfFile`, so the bounds check cannot be left out of a call site by
+    /// forgetting it. Every file that used to panic the parser comes back as
+    /// an error from here.
+    #[test]
+    fn the_checked_parser_rejects_what_the_parser_would_have_panicked_on() {
+        let full = Elf::new().build();
+        // Twenty bytes: `parse_header` would have sliced `data[16..64]`.
+        assert_eq!(
+            parse_checked_elf(&full[..20]).err(),
+            Some(ZxError::INVALID_ARGS)
+        );
+        // A program header table outside the file.
+        let mut elf = Elf::new().phdr(Phdr {
+            p_type: 1,
+            ..Default::default()
+        });
+        elf.ph_offset = Some(0x1000);
+        assert_eq!(
+            parse_checked_elf(&elf.build()).err(),
+            Some(ZxError::INVALID_ARGS)
+        );
+        // A well-formed image still parses.
+        assert!(parse_checked_elf(&full).is_ok());
+    }
+
+    /// An ELF with no LOAD segment at all maps nothing, so there is no first
+    /// VMO to hand back. Unwrapping the `None` panicked the kernel; an image
+    /// with only a `PT_NOTE` is enough to reach it.
+    #[test]
+    fn an_image_with_nothing_to_load_is_rejected_by_the_mapper() {
+        let image = Elf::new()
+            .phdr(Phdr {
+                p_type: 4, // PT_NOTE
+                ..Default::default()
+            })
+            .build();
+        let parsed = ElfFile::new(&image).unwrap();
+        let vmar = VmAddressRegion::new_root();
+        assert_eq!(
+            vmar.load_from_elf(&parsed).err(),
+            Some(ZxError::INVALID_ARGS)
+        );
+    }
+
+    /// `make_vmo` sized its VMO with `pages(mem_size + page_offset)`, and
+    /// `pages()` rounds up with a `wrapping_add`: a segment whose `p_memsz`
+    /// sits at the top of the range asked for a handful of pages, and the
+    /// segment's own contents were then written past the end of them.
+    #[test]
+    fn a_segment_too_large_to_measure_is_rejected_by_the_mapper() {
+        let load = |virtual_addr, mem_size| {
+            let image = Elf::new()
+                .phdr(Phdr {
+                    p_type: 1, // PT_LOAD
+                    virtual_addr,
+                    mem_size,
+                    ..Default::default()
+                })
+                .build();
+            let parsed = ElfFile::new(&image).unwrap();
+            VmAddressRegion::new_root().load_from_elf(&parsed).err()
+        };
+
+        // Measured on its own, because through `load_from_elf` every way of
+        // getting this wrong comes back as the same error from a later step.
+        assert_eq!(segment_pages(0x1000, 0), Ok(1));
+        assert_eq!(segment_pages(0x1001, 0), Ok(2));
+        assert_eq!(segment_pages(0, 0), Ok(0));
+        assert_eq!(segment_pages(1, PAGE_SIZE - 1), Ok(1));
+        assert_eq!(segment_pages(2, PAGE_SIZE - 1), Ok(2));
+        // A segment larger than the whole user address space could not be
+        // mapped whatever else is in the way, and sizing a VMO for it is what
+        // used to wrap round to a handful of pages.
+        assert_eq!(segment_pages(u64::MAX, 0), Err(ZxError::INVALID_ARGS));
+        assert_eq!(
+            segment_pages(USER_ASPACE_SIZE, 0),
+            Ok(USER_ASPACE_SIZE as usize / PAGE_SIZE)
+        );
+        assert_eq!(
+            segment_pages(USER_ASPACE_SIZE, 1),
+            Err(ZxError::INVALID_ARGS)
+        );
+        assert_eq!(
+            segment_pages(USER_ASPACE_SIZE + 1, 0),
+            Err(ZxError::INVALID_ARGS)
+        );
+        // And the sum itself does not fit.
+        assert_eq!(
+            segment_pages(u64::MAX - 0x100, 0x200),
+            Err(ZxError::INVALID_ARGS)
+        );
+
+        assert_eq!(load(0x1000, u64::MAX), Some(ZxError::INVALID_ARGS));
+        // The size alone fits; it is the part of the first page below
+        // `p_vaddr` that tips it over, and that sum used to wrap to 0xff --
+        // one page for a segment claiming the whole address space.
+        assert_eq!(load(0x1200, u64::MAX - 0x100), Some(ZxError::INVALID_ARGS));
+        // An ordinary segment still loads.
+        assert_eq!(load(0x1000, 0x2000), None);
     }
 }

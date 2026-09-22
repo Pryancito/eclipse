@@ -10,7 +10,14 @@ use core::future::Future;
 use core::ops::Deref;
 use core::pin::Pin;
 use core::task::{Context, Poll};
+use core::time::Duration;
 use kernel_hal::sync::Mutex;
+
+/// How often a blocked `semop` wakes up just to ask whether it should still
+/// be waiting. Same reasoning, and the same figure, as the io-multiplex
+/// backstop: a ceiling on how late a `kill` can be, not on how fast a
+/// `release` is noticed (the event bus still does that immediately).
+const SEMOP_INTERRUPT_CHECK_TICK_MS: u64 = 100;
 
 /// A counting, blocking, semaphore.
 pub struct Semaphore {
@@ -26,8 +33,36 @@ struct SemaphoreInner {
     pid: usize,
     /// is removed
     removed: bool,
+    /// Bumped on every change to `count`, so a waiter can tell "nothing has
+    /// happened yet" from "it changed and changed back".
+    ///
+    /// The event bus cannot answer that on its own: its `CAN_ACQUIRE` flag
+    /// says the count is *positive*, which is the wrong question for a
+    /// `semop` waiting for the count to reach **zero** (semop(2)'s `sem_op ==
+    /// 0`). A counter has no such blind spot and cannot race: a change that
+    /// lands between the snapshot and the park is still visible afterwards.
+    generation: u64,
     /// EventBus of this Semaphore
     eventbus: EventBus,
+}
+
+impl SemaphoreInner {
+    /// Set the count and leave the derived state -- the "can acquire" signal
+    /// and the generation counter -- telling the truth about it.
+    ///
+    /// Every write to `count` goes through here. A signal left set from an
+    /// earlier release wakes every waiter on the bus for a resource that is
+    /// not there, and a write that forgets to bump the generation leaves a
+    /// `semop` parked on a value that already changed.
+    fn store(&mut self, count: isize) {
+        self.count = count;
+        self.generation = self.generation.wrapping_add(1);
+        if count >= 1 {
+            self.eventbus.set(Event::SEMAPHORE_CAN_ACQUIRE);
+        } else {
+            self.eventbus.clear(Event::SEMAPHORE_CAN_ACQUIRE);
+        }
+    }
 }
 
 /// An RAII guard which will release a resource acquired from a semaphore when
@@ -48,6 +83,7 @@ impl Semaphore {
                 count,
                 removed: false,
                 pid: 0,
+                generation: 0,
                 eventbus: EventBus::default(),
             })),
         }
@@ -70,6 +106,12 @@ impl Semaphore {
         struct SemaphoreFuture {
             inner: Arc<Mutex<SemaphoreInner>>,
             sub_id: Option<u64>,
+            /// Backstop slot: the event bus fires for `release` and for
+            /// `IPC_RMID`, and for nothing that happens to the WAITER. Without
+            /// a tick nothing re-polls this, so nothing checks for a signal,
+            /// and `semop(-1)` on a semaphore nobody ever releases was a wait
+            /// that `kill -9` could not end either.
+            timer: Option<kernel_hal::timer_waker::TimerWakerSlot>,
         }
 
         impl Drop for SemaphoreFuture {
@@ -77,6 +119,7 @@ impl Semaphore {
                 if let Some(id) = self.sub_id.take() {
                     self.inner.lock().eventbus.unsubscribe(id);
                 }
+                kernel_hal::timer_waker::kill_timer_waker(&mut self.timer);
             }
         }
 
@@ -94,10 +137,8 @@ impl Semaphore {
                         return Poll::Ready(Err(LxError::EIDRM));
                     }
                     if inner.count >= 1 {
-                        inner.count -= 1;
-                        if inner.count < 1 {
-                            inner.eventbus.clear(Event::SEMAPHORE_CAN_ACQUIRE);
-                        }
+                        let count = inner.count - 1;
+                        inner.store(count);
                         if let Some(id) = this.sub_id.take() {
                             inner.eventbus.unsubscribe(id);
                         }
@@ -112,6 +153,22 @@ impl Semaphore {
                     }
                 }
 
+                // Nothing to take. Before parking again, ask whether this
+                // thread is still supposed to be waiting -- the bus reports
+                // only what the SEMAPHORE does, so this is the only thing here
+                // that can answer a signal or a kill. semop(2) lists EINTR
+                // among its errors for exactly this.
+                if let Err(err) = crate::process::check_signals() {
+                    if let Some(id) = this.sub_id.take() {
+                        this.inner.lock().eventbus.unsubscribe(id);
+                    }
+                    kernel_hal::timer_waker::kill_timer_waker(&mut this.timer);
+                    return Poll::Ready(Err(err));
+                }
+                let deadline = kernel_hal::timer::deadline_after(Duration::from_millis(
+                    SEMOP_INTERRUPT_CHECK_TICK_MS,
+                ));
+                kernel_hal::timer_waker::ensure_timer_waker(&mut this.timer, deadline, cx);
                 Poll::Pending
             }
         }
@@ -119,6 +176,7 @@ impl Semaphore {
         let future = SemaphoreFuture {
             inner: self.lock.clone(),
             sub_id: None,
+            timer: None,
         };
         future.await
     }
@@ -129,10 +187,8 @@ impl Semaphore {
     /// will notify any pending waiters in `acquire` or `access` if necessary.
     pub fn release(&self) {
         let mut inner = self.lock.lock();
-        inner.count += 1;
-        if inner.count >= 1 {
-            inner.eventbus.set(Event::SEMAPHORE_CAN_ACQUIRE);
-        }
+        let count = inner.count.saturating_add(1);
+        inner.store(count);
     }
 
     /// Acquires a resource of this semaphore, returning an RAII guard to
@@ -174,21 +230,123 @@ impl Semaphore {
     /// separate lock acquisitions with a window in between.
     pub fn adjust(&self, delta: isize) {
         let mut inner = self.lock.lock();
-        inner.count = inner.count.saturating_add(delta);
-        if inner.count >= 1 {
-            inner.eventbus.set(Event::SEMAPHORE_CAN_ACQUIRE);
-        } else {
-            inner.eventbus.clear(Event::SEMAPHORE_CAN_ACQUIRE);
-        }
+        let count = inner.count.saturating_add(delta);
+        inner.store(count);
     }
 
-    /// Set the current count
+    /// Set the current count.
+    ///
+    /// Used by `semctl(SETVAL/SETALL)` and by the `semop` apply. It CLEARS
+    /// the "can acquire" signal when the new value is not positive -- setting
+    /// a semaphore back to 0 used to leave the flag from whenever it was last
+    /// positive, and every waiter on the bus then woke for a resource that
+    /// was not there and went straight back to sleep.
     pub fn set(&self, value: isize) {
         let mut inner = self.lock.lock();
-        inner.count = value;
-        if inner.count >= 1 {
-            inner.eventbus.set(Event::SEMAPHORE_CAN_ACQUIRE);
+        inner.store(value);
+    }
+
+    /// The value, and the generation it belongs to, read together.
+    ///
+    /// A `semop` plans against a snapshot of the WHOLE set and then applies
+    /// it, so it needs to know the snapshot is still current; reading the
+    /// value and the generation in two steps would not tell it that.
+    pub fn get_versioned(&self) -> (isize, u64) {
+        let inner = self.lock.lock();
+        (inner.count, inner.generation)
+    }
+
+    /// Whether this semaphore has been `IPC_RMID`-ed.
+    pub fn is_removed(&self) -> bool {
+        self.lock.lock().removed
+    }
+
+    /// Park until this semaphore's value may have changed, WITHOUT taking
+    /// anything from it.
+    ///
+    /// This is what a blocked `semop` waits on. It cannot use
+    /// [`acquire`](Self::acquire), which both waits and decrements: semop(2)
+    /// applies the whole operation array atomically, so a blocked caller must
+    /// hold *nothing* while it waits and re-plan from scratch when it wakes.
+    ///
+    /// `since` is the generation the caller planned against. Returns as soon
+    /// as the current one differs, which makes the "it changed while I was
+    /// getting here" race a no-op rather than a missed wakeup.
+    pub async fn wait_for_change(&self, since: u64) -> Result<(), LxError> {
+        #[must_use = "future does nothing unless polled/`await`-ed"]
+        struct ChangeFuture {
+            inner: Arc<Mutex<SemaphoreInner>>,
+            since: u64,
+            sub_id: Option<u64>,
+            timer: Option<kernel_hal::timer_waker::TimerWakerSlot>,
         }
+
+        impl Drop for ChangeFuture {
+            fn drop(&mut self) {
+                if let Some(id) = self.sub_id.take() {
+                    self.inner.lock().eventbus.unsubscribe(id);
+                }
+                kernel_hal::timer_waker::kill_timer_waker(&mut self.timer);
+            }
+        }
+
+        impl ChangeFuture {
+            fn done(&mut self, out: Result<(), LxError>) -> Poll<Result<(), LxError>> {
+                if let Some(id) = self.sub_id.take() {
+                    self.inner.lock().eventbus.unsubscribe(id);
+                }
+                kernel_hal::timer_waker::kill_timer_waker(&mut self.timer);
+                Poll::Ready(out)
+            }
+        }
+
+        impl Future for ChangeFuture {
+            type Output = Result<(), LxError>;
+
+            fn poll(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
+                let this = self.as_mut().get_mut();
+                {
+                    let mut inner = this.inner.lock();
+                    if inner.removed {
+                        drop(inner);
+                        return this.done(Err(LxError::EIDRM));
+                    }
+                    if inner.generation != this.since {
+                        drop(inner);
+                        return this.done(Ok(()));
+                    }
+                    if this.sub_id.is_none() {
+                        let waker = cx.waker().clone();
+                        this.sub_id = inner.eventbus.subscribe(Box::new(move |_| {
+                            waker.wake_by_ref();
+                            true
+                        }));
+                    }
+                }
+                // Same reason as `acquire`: the bus reports only what the
+                // SEMAPHORE does, so without this a `semop` blocked on a
+                // semaphore nobody releases could not be killed either.
+                if let Err(err) = crate::process::check_signals() {
+                    return this.done(Err(err));
+                }
+                // The backstop also covers the one thing the bus cannot
+                // report: `CAN_ACQUIRE` says the count went POSITIVE, and a
+                // `semop` with `sem_op == 0` is waiting for it to reach ZERO.
+                let deadline = kernel_hal::timer::deadline_after(Duration::from_millis(
+                    SEMOP_INTERRUPT_CHECK_TICK_MS,
+                ));
+                kernel_hal::timer_waker::ensure_timer_waker(&mut this.timer, deadline, cx);
+                Poll::Pending
+            }
+        }
+
+        ChangeFuture {
+            inner: self.lock.clone(),
+            since,
+            sub_id: None,
+            timer: None,
+        }
+        .await
     }
 }
 
@@ -315,5 +473,168 @@ mod tests {
             assert_eq!(sem.get(), 0);
         }
         assert_eq!(sem.get(), 1);
+    }
+}
+
+#[cfg(test)]
+mod semop_primitive_tests {
+    //! What a `semop` needs from a single semaphore, beyond "take one".
+    //!
+    //! `semop(2)` plans over the whole set and then applies it, so it needs
+    //! to write an exact value (not "one more" or "one less"), to know
+    //! whether the snapshot it planned against is still current, and to park
+    //! until something changes without taking anything.
+
+    use super::*;
+    use core::pin::pin;
+    use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+
+    fn can_acquire(sem: &Semaphore) -> bool {
+        sem.lock
+            .lock()
+            .eventbus
+            .events()
+            .contains(Event::SEMAPHORE_CAN_ACQUIRE)
+    }
+
+    /// A waker that does nothing. These tests drive `wait_for_change` by hand
+    /// -- one poll at a time -- rather than `block_on`, ON PURPOSE: a mutation
+    /// that stops the wait from ever resolving would make `block_on` hang
+    /// forever, and a hang is not a detected failure. A bounded poll turns
+    /// that same mutation into a clean assertion failure on the next line.
+    fn noop_waker() -> Waker {
+        unsafe fn clone(_: *const ()) -> RawWaker {
+            RawWaker::new(core::ptr::null(), &VTABLE)
+        }
+        unsafe fn noop(_: *const ()) {}
+        static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, noop, noop, noop);
+        unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &VTABLE)) }
+    }
+
+    /// Setting a semaphore back to a non-positive value must CLEAR the "can
+    /// acquire" signal. It used to only ever set it, so a semaphore that had
+    /// been positive kept the flag forever: every waiter on the bus woke for
+    /// a resource that was not there, found nothing, and parked again --
+    /// several times a second, for as long as the set existed.
+    #[test]
+    fn setting_a_semaphore_back_to_zero_clears_the_can_acquire_signal() {
+        let sem = Semaphore::new(0);
+        sem.set(4);
+        assert!(can_acquire(&sem));
+        sem.set(0);
+        assert!(
+            !can_acquire(&sem),
+            "a semaphore at zero must not advertise that it can be acquired"
+        );
+        sem.set(-2);
+        assert!(!can_acquire(&sem));
+    }
+
+    /// Every write to the value moves the generation on, whichever way it
+    /// came in. A `semop` parked on a stale generation is a `semop` that
+    /// missed its wakeup.
+    #[test]
+    fn every_kind_of_write_moves_the_generation_on() {
+        let sem = Semaphore::new(0);
+        let (_, start) = sem.get_versioned();
+        let mut seen = start;
+        for step in 0..4 {
+            match step {
+                0 => sem.release(),
+                1 => sem.adjust(-3),
+                2 => sem.set(7),
+                _ => async_std::task::block_on(sem.acquire()).unwrap(),
+            }
+            let (_, now) = sem.get_versioned();
+            assert_ne!(now, seen, "write {} left the generation where it was", step);
+            seen = now;
+        }
+    }
+
+    /// The value and its generation come back from one read. Two reads could
+    /// straddle a change and hand the caller a value that belongs to one
+    /// generation and a stamp that belongs to another -- which is exactly the
+    /// combination that makes a planned-then-applied `semop` write a value
+    /// nobody agreed to.
+    #[test]
+    fn the_value_and_its_generation_come_from_the_same_read() {
+        let sem = Semaphore::new(3);
+        let (value, generation) = sem.get_versioned();
+        assert_eq!(value, 3);
+        sem.set(3);
+        let (same_value, later) = sem.get_versioned();
+        assert_eq!(same_value, 3);
+        assert_ne!(
+            later, generation,
+            "a write of the same value still happened, and a waiter must re-plan"
+        );
+    }
+
+    /// A wait that starts on a generation that has ALREADY moved returns at
+    /// once. This is the race the counter exists for: between the plan and
+    /// the park, another process can release the very unit being waited for,
+    /// and a wait that only listened for future events would sleep through
+    /// it.
+    #[test]
+    fn a_wait_on_a_stale_generation_returns_immediately() {
+        let sem = Semaphore::new(0);
+        let (_, generation) = sem.get_versioned();
+        sem.release();
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut fut = pin!(sem.wait_for_change(generation));
+        assert!(
+            matches!(fut.as_mut().poll(&mut cx), Poll::Ready(Ok(()))),
+            "a change that already happened must be seen on the very first poll"
+        );
+    }
+
+    /// And a removed set answers `EIDRM` rather than waiting, `IPC_RMID`
+    /// being the other way a blocked `semop` ends.
+    #[test]
+    fn a_wait_on_a_removed_semaphore_is_eidrm() {
+        let sem = Semaphore::new(0);
+        let (_, generation) = sem.get_versioned();
+        sem.remove();
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut fut = pin!(sem.wait_for_change(generation));
+        assert!(matches!(
+            fut.as_mut().poll(&mut cx),
+            Poll::Ready(Err(LxError::EIDRM))
+        ));
+    }
+
+    /// The wait parks while nothing has changed, resolves once something does,
+    /// and takes nothing when it resolves. `acquire` both waits and
+    /// decrements, which a blocked `semop` must never do: it has to hold
+    /// nothing at all while it waits, or the array it is halfway through stops
+    /// being atomic.
+    #[test]
+    fn waiting_for_a_change_parks_then_resolves_and_takes_nothing() {
+        let sem = Semaphore::new(0);
+        let (_, generation) = sem.get_versioned();
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut fut = pin!(sem.wait_for_change(generation));
+
+        // Nothing has changed yet, so it parks.
+        assert!(
+            fut.as_mut().poll(&mut cx).is_pending(),
+            "a wait on the current generation must park"
+        );
+
+        // A release moves the generation on. The next poll must resolve...
+        sem.release();
+        assert!(
+            matches!(fut.as_mut().poll(&mut cx), Poll::Ready(Ok(()))),
+            "a change while parked must wake the wait on the next poll"
+        );
+        // ...without having taken the unit the release added.
+        assert_eq!(
+            sem.get(),
+            1,
+            "the released unit must still be there for whoever re-plans first"
+        );
     }
 }

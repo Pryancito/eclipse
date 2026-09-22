@@ -393,10 +393,10 @@ mod tests {
         assert!(interrupt.trigger(1234).is_ok());
         let packet = port.wait().await;
         assert_eq!(
-            PortPacketRepr::from(&packet),
+            packet.decode().unwrap(),
             PortPacketRepr {
                 key: 1,
-                status: ZxError::OK,
+                status: ZxError::OK as i32,
                 data: PayloadRepr::Interrupt(PacketInterrupt {
                     timestamp: 1234,
                     _reserved0: 0,

@@ -276,67 +276,158 @@ pub struct Tms {
     pub tms_cstime: u64,
 }
 
-/// Clock id
-#[derive(Debug)]
+/// A POSIX clock id, as `clock_gettime(2)` and friends spell it.
+///
+/// The conversion from the raw `usize` a syscall is handed is **fallible**,
+/// and has to be: this used to be an infallible `From<usize>` ending in
+/// `unreachable!()`, which made `clock_nanosleep(99, ...)` a kernel panic.
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
 #[repr(usize)]
 pub enum ClockId {
-    /// missing documentation
+    /// Wall-clock time, settable, counted from the Unix epoch.
     ClockRealTime = 0,
-    /// missing documentation
+    /// Time since boot, never settable, never jumps.
     ClockMonotonic = 1,
-    /// missing documentation
+    /// CPU time used by the whole process.
     ClockProcessCpuTimeId = 2,
-    /// missing documentation
+    /// CPU time used by the calling thread.
     ClockThreadCpuTimeId = 3,
-    /// missing documentation
+    /// Monotonic time with no NTP adjustment applied.
     ClockMonotonicRaw = 4,
-    /// missing documentation
+    /// A cheaper, coarser `CLOCK_REALTIME`.
     ClockRealTimeCoarse = 5,
-    /// missing documentation
+    /// A cheaper, coarser `CLOCK_MONOTONIC`.
     ClockMonotonicCoarse = 6,
-    /// missing documentation
+    /// Like `CLOCK_MONOTONIC`, but counting time spent suspended.
     ClockBootTime = 7,
-    /// missing documentation
+    /// `CLOCK_REALTIME` that also wakes the machine from suspend.
     ClockRealTimeAlarm = 8,
-    /// missing documentation
+    /// `CLOCK_BOOTTIME` that also wakes the machine from suspend.
     ClockBootTimeAlarm = 9,
 }
 
-impl From<usize> for ClockId {
-    fn from(t: usize) -> ClockId {
-        match t {
-            0 => ClockId::ClockRealTime,
-            1 => ClockId::ClockMonotonic,
-            2 => ClockId::ClockProcessCpuTimeId,
-            3 => ClockId::ClockThreadCpuTimeId,
-            4 => ClockId::ClockMonotonicRaw,
-            5 => ClockId::ClockRealTimeCoarse,
-            6 => ClockId::ClockMonotonicCoarse,
-            7 => ClockId::ClockBootTime,
-            8 => ClockId::ClockRealTimeAlarm,
-            9 => ClockId::ClockBootTimeAlarm,
-            _ => unreachable!(),
-        }
+impl ClockId {
+    /// The clock a process named, or `EINVAL` if it named none of them.
+    ///
+    /// Written out rather than range-checked so that adding a clock has to
+    /// be a decision taken here and in [`clock_nanosleep_base`], not a
+    /// number that quietly starts being accepted.
+    pub fn from_raw(raw: usize) -> crate::error::LxResult<Self> {
+        Ok(match raw {
+            0 => Self::ClockRealTime,
+            1 => Self::ClockMonotonic,
+            2 => Self::ClockProcessCpuTimeId,
+            3 => Self::ClockThreadCpuTimeId,
+            4 => Self::ClockMonotonicRaw,
+            5 => Self::ClockRealTimeCoarse,
+            6 => Self::ClockMonotonicCoarse,
+            7 => Self::ClockBootTime,
+            8 => Self::ClockRealTimeAlarm,
+            9 => Self::ClockBootTimeAlarm,
+            // Every negative id lands here too, as a very large `usize`:
+            // Linux routes those to the per-process CPU clocks, which this
+            // kernel does not have. `CLOCK_TAI` is not modelled either.
+            _ => return Err(crate::error::LxError::EINVAL),
+        })
     }
 }
 
-/// Clock Flags
-#[derive(Debug)]
-#[repr(usize)]
-pub enum ClockFlags {
-    /// missing documentation
-    ZeroFlag = 0,
-    /// missing documentation
-    TimerAbsTime = 1,
+/// `clock_nanosleep(2)`'s only flag: the requested time is an absolute point
+/// on the given clock rather than a length.
+pub const TIMER_ABSTIME: usize = 1;
+
+/// The timeline a clock's times are counted on.
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub enum ClockBase {
+    /// Counted from boot, which is what the kernel's own timer runs on.
+    Monotonic,
+    /// Counted from the Unix epoch.
+    Wall,
 }
 
-impl From<usize> for ClockFlags {
-    fn from(t: usize) -> ClockFlags {
-        match t {
-            0 => ClockFlags::ZeroFlag,
-            1 => ClockFlags::TimerAbsTime,
-            _ => unreachable!(),
-        }
+/// What a `clock_nanosleep` call should do, worked out before anything sleeps.
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub enum SleepPlan {
+    /// Sleep until this point on the monotonic timeline.
+    Until(Duration),
+    /// The deadline has already gone by; return at once.
+    AlreadyPast,
+}
+
+/// Which timeline `clock_nanosleep` counts `clock` on, or why it cannot sleep
+/// on it at all.
+///
+/// Linux answers this with `clockid_to_kclock` and then `kc->nsleep`, and it
+/// has three different answers: a clock it does not know is `EINVAL`, one it
+/// knows but whose `k_clock` has no `nsleep` is `EOPNOTSUPP`, and
+/// `CLOCK_THREAD_CPUTIME_ID`'s own `nsleep` returns `EINVAL`. This used to be
+/// `ClockId::from`, an infallible `From` ending in `unreachable!()`, so
+/// `clock_nanosleep(99, ...)` was a kernel panic from an ordinary syscall.
+pub fn clock_nanosleep_base(clock: usize) -> crate::error::LxResult<ClockBase> {
+    use crate::error::LxError;
+    // No catch-all arm: a clock added to `ClockId` has to say here what
+    // sleeping on it means, rather than falling into someone else's answer.
+    Ok(match ClockId::from_raw(clock)? {
+        ClockId::ClockRealTime => ClockBase::Wall,
+        ClockId::ClockMonotonic => ClockBase::Monotonic,
+        // Linux sleeps on the process's own CPU time; this kernel does not
+        // account it, so the sleep runs on elapsed time instead. CPU time
+        // never runs ahead of elapsed time, so the sleep can end early and
+        // never late, which is the benign direction for a sleep.
+        // `sys_setitimer` makes the same choice for ITIMER_VIRTUAL and
+        // ITIMER_PROF.
+        ClockId::ClockProcessCpuTimeId => ClockBase::Monotonic,
+        // `thread_cpu_nsleep` is `return -EINVAL`.
+        ClockId::ClockThreadCpuTimeId => return Err(LxError::EINVAL),
+        // These three carry no `nsleep` in their `k_clock` at all, which is
+        // a different answer from one Linux has never heard of.
+        ClockId::ClockMonotonicRaw
+        | ClockId::ClockRealTimeCoarse
+        | ClockId::ClockMonotonicCoarse => return Err(LxError::EOPNOTSUPP),
+        // This kernel's monotonic timer does not stop for suspend, so boot
+        // time and monotonic time are the same thing here.
+        ClockId::ClockBootTime => ClockBase::Monotonic,
+        // Linux wants CAP_WAKE_ALARM for these and wakes the machine from
+        // suspend; there is no suspend here, so they are their non-alarm
+        // clocks.
+        ClockId::ClockRealTimeAlarm => ClockBase::Wall,
+        ClockId::ClockBootTimeAlarm => ClockBase::Monotonic,
+    })
+}
+
+/// What `clock_nanosleep` should do, worked out before anything sleeps.
+///
+/// `request` is a length when `TIMER_ABSTIME` is clear, and a point on
+/// `clock`'s own timeline when it is set. Only that one bit is looked at:
+/// `common_nsleep` does `flags & TIMER_ABSTIME`, so a flag word carrying
+/// other bits is a relative sleep in Linux and not an error.
+///
+/// The answer is always on the monotonic timeline, because that is the only
+/// one the kernel's timer can be asked to wake on.
+pub fn plan_clock_nanosleep(
+    clock: usize,
+    flags: usize,
+    request: Duration,
+    now_monotonic: Duration,
+    now_wall: Duration,
+) -> crate::error::LxResult<SleepPlan> {
+    let base = clock_nanosleep_base(clock)?;
+    if flags & TIMER_ABSTIME == 0 {
+        return Ok(SleepPlan::Until(now_monotonic.saturating_add(request)));
+    }
+    // An absolute request is a point on the clock's own timeline, so what is
+    // left of it is the distance from that clock's `now`. Sleeping for the
+    // absolute value itself is what the tree used to do, and on
+    // CLOCK_REALTIME that is decades.
+    let now = match base {
+        ClockBase::Monotonic => now_monotonic,
+        ClockBase::Wall => now_wall,
+    };
+    let remaining = request.saturating_sub(now);
+    if remaining.is_zero() {
+        Ok(SleepPlan::AlreadyPast)
+    } else {
+        Ok(SleepPlan::Until(now_monotonic.saturating_add(remaining)))
     }
 }
 
@@ -355,6 +446,188 @@ mod time_tests {
     use super::*;
 
     const NEG_ONE: usize = usize::MAX;
+
+    /// `clock_nanosleep` used to turn both its clock id and its flag word
+    /// into Rust enums through an infallible `From<usize>` that ended in
+    /// `unreachable!()`, so **any process could panic the kernel** with
+    /// `clock_nanosleep(99, 0, &ts, NULL)`. `clock_gettime`, which takes the
+    /// same id, has always answered `EINVAL` for one it does not know: two
+    /// doors to the same thing and only one of them checked.
+    #[test]
+    fn a_clock_nanosleep_on_a_clock_that_is_not_one_is_not_a_kernel_panic() {
+        use crate::error::LxError;
+        for (clock, base) in [
+            (0, ClockBase::Wall),
+            (1, ClockBase::Monotonic),
+            (2, ClockBase::Monotonic),
+            (7, ClockBase::Monotonic),
+            (8, ClockBase::Wall),
+            (9, ClockBase::Monotonic),
+        ] {
+            assert_eq!(clock_nanosleep_base(clock), Ok(base), "clock {}", clock);
+        }
+        // CLOCK_THREAD_CPUTIME_ID has an `nsleep` and it says EINVAL.
+        assert_eq!(clock_nanosleep_base(3), Err(LxError::EINVAL));
+        // These three have no `nsleep` at all, which is a different answer.
+        for clock in [4, 5, 6] {
+            assert_eq!(
+                clock_nanosleep_base(clock),
+                Err(LxError::EOPNOTSUPP),
+                "clock {}",
+                clock
+            );
+        }
+        // Past the end of the table, and every negative id, which reaches
+        // this kernel as a very large `usize`.
+        for clock in [10, 11, 99, usize::MAX, -1_isize as usize, -6_isize as usize] {
+            assert_eq!(
+                clock_nanosleep_base(clock),
+                Err(LxError::EINVAL),
+                "clock {}",
+                clock
+            );
+        }
+    }
+
+    /// The one that hangs a program rather than killing the kernel: with
+    /// `TIMER_ABSTIME` the request is a **point in time**, and both arms of
+    /// the old `match` slept for it as though it were a length.
+    #[test]
+    fn an_absolute_deadline_is_not_slept_as_a_length() {
+        let now_mono = Duration::from_secs(3_600);
+        let now_wall = Duration::from_secs(1_700_000_000);
+
+        // CLOCK_MONOTONIC: the request is already on the timeline we wake on.
+        assert_eq!(
+            plan_clock_nanosleep(
+                1,
+                TIMER_ABSTIME,
+                now_mono + Duration::from_secs(2),
+                now_mono,
+                now_wall
+            ),
+            Ok(SleepPlan::Until(now_mono + Duration::from_secs(2)))
+        );
+
+        // CLOCK_REALTIME: the request counts from the epoch, so only the
+        // distance from wall-clock now goes on the monotonic timeline. The
+        // old code slept for the whole epoch value: fifty-odd years.
+        assert_eq!(
+            plan_clock_nanosleep(
+                0,
+                TIMER_ABSTIME,
+                now_wall + Duration::from_secs(2),
+                now_mono,
+                now_wall
+            ),
+            Ok(SleepPlan::Until(now_mono + Duration::from_secs(2)))
+        );
+    }
+
+    /// An absolute deadline that has already gone by returns at once. Linux
+    /// does not sleep, and it does not fail either.
+    #[test]
+    fn an_absolute_deadline_already_gone_by_returns_at_once() {
+        let now_mono = Duration::from_secs(3_600);
+        let now_wall = Duration::from_secs(1_700_000_000);
+        for (clock, request) in [
+            (1, now_mono),
+            (1, Duration::ZERO),
+            (0, now_wall),
+            (0, Duration::from_secs(1)),
+        ] {
+            assert_eq!(
+                plan_clock_nanosleep(clock, TIMER_ABSTIME, request, now_mono, now_wall),
+                Ok(SleepPlan::AlreadyPast),
+                "clock {} request {:?}",
+                clock,
+                request
+            );
+        }
+    }
+
+    /// Without the flag the request is a length, and the clock's own epoch
+    /// does not come into it.
+    #[test]
+    fn a_relative_sleep_counts_from_now_whatever_the_clock() {
+        let now_mono = Duration::from_secs(3_600);
+        let now_wall = Duration::from_secs(1_700_000_000);
+        for clock in [0, 1, 2, 7, 8, 9] {
+            assert_eq!(
+                plan_clock_nanosleep(clock, 0, Duration::from_millis(250), now_mono, now_wall),
+                Ok(SleepPlan::Until(now_mono + Duration::from_millis(250))),
+                "clock {}",
+                clock
+            );
+        }
+        // CLOCK_BOOTTIME used to fall into an empty arm and return without
+        // sleeping at all, which turns a one-second sleep into a busy loop.
+        assert_ne!(
+            plan_clock_nanosleep(7, 0, Duration::from_secs(1), now_mono, now_wall),
+            Ok(SleepPlan::AlreadyPast)
+        );
+    }
+
+    /// `common_nsleep` does `flags & TIMER_ABSTIME`, so a flag word with
+    /// other bits in it is a relative sleep in Linux, not an error and
+    /// certainly not a panic.
+    #[test]
+    fn only_the_abstime_bit_of_the_flag_word_is_looked_at() {
+        let now_mono = Duration::from_secs(3_600);
+        let now_wall = Duration::from_secs(1_700_000_000);
+        let relative = Ok(SleepPlan::Until(now_mono + Duration::from_secs(5)));
+        for flags in [0, 2, 4, 0x8000, usize::MAX ^ 1] {
+            assert_eq!(
+                plan_clock_nanosleep(1, flags, Duration::from_secs(5), now_mono, now_wall),
+                relative,
+                "flags {:#x}",
+                flags
+            );
+        }
+        for flags in [1, 3, 5, usize::MAX] {
+            assert_eq!(
+                plan_clock_nanosleep(
+                    1,
+                    flags,
+                    now_mono + Duration::from_secs(5),
+                    now_mono,
+                    now_wall
+                ),
+                relative,
+                "flags {:#x}",
+                flags
+            );
+        }
+    }
+
+    /// The clock is checked before the deadline is worked out, so a bad id
+    /// is refused whether the request is absolute or relative.
+    #[test]
+    fn the_clock_is_refused_before_anything_is_computed() {
+        use crate::error::LxError;
+        for flags in [0, TIMER_ABSTIME] {
+            assert_eq!(
+                plan_clock_nanosleep(
+                    5,
+                    flags,
+                    Duration::from_secs(1),
+                    Duration::ZERO,
+                    Duration::ZERO
+                ),
+                Err(LxError::EOPNOTSUPP)
+            );
+            assert_eq!(
+                plan_clock_nanosleep(
+                    99,
+                    flags,
+                    Duration::from_secs(1),
+                    Duration::ZERO,
+                    Duration::ZERO
+                ),
+                Err(LxError::EINVAL)
+            );
+        }
+    }
 
     #[test]
     fn a_timespec_from_userspace_can_never_panic_the_conversion() {

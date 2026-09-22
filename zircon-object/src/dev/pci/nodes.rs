@@ -183,6 +183,167 @@ pub struct PcieBarInfo {
     allocation: Option<(usize, usize)>,
 }
 
+/// What a BAR's low register says it is, before any probing.
+///
+/// Bit 0 picks memory or I/O space and bits 2:1 the memory width (PCI Local
+/// Bus 3.0 §6.2.5.1). `0b01` in bits 2:1 is reserved: a device answering
+/// that is malformed, and guessing a width would mean probing the wrong
+/// number of registers.
+fn bar_kind(index: usize, low: u32) -> ZxResult<(bool, bool)> {
+    if (low & PCI_BAR_IO_TYPE_MASK) != PCI_BAR_IO_TYPE_MMIO {
+        return Ok((false, false));
+    }
+    match low & PCI_BAR_MMIO_TYPE_MASK {
+        PCI_BAR_MMIO_TYPE_32BIT => Ok((true, false)),
+        PCI_BAR_MMIO_TYPE_64BIT => Ok((true, true)),
+        _ => {
+            warn!(
+                "Unrecognized MMIO BAR type (BAR[{}] == {:#x?}) while fetching BAR info",
+                index, low
+            );
+            Err(ZxError::BAD_STATE)
+        }
+    }
+}
+
+/// What a BAR's registers mean once the size probe has run.
+///
+/// `low`/`high` are the two registers as the device left them; `low_probe`/
+/// `high_probe` are what they read back after writing ones into the address
+/// bits, which is how a BAR reports its size. `high` and `high_probe` are
+/// only read for a 64-bit BAR and are ignored otherwise.
+///
+/// Taking the upper register as an argument is the point: the loop that did
+/// this inline read it into a `bar_val` shadowed inside the `if`, so by the
+/// time the bus address was assembled `bar_val` was the *low* register
+/// again and the upper half of every 64-bit BAR was the low register's own
+/// type and prefetch bits. A BAR below 4 GiB, which is all QEMU hands out,
+/// has an upper register of zero and hides it.
+fn bar_info_from_probe(
+    first_bar_reg: usize,
+    is_mmio: bool,
+    is_64bit: bool,
+    low: u32,
+    low_probe: u32,
+    high: u32,
+    high_probe: u32,
+) -> PcieBarInfo {
+    let addr_mask = if is_mmio {
+        PCI_BAR_MMIO_ADDR_MASK
+    } else {
+        PCI_BAR_PIO_ADDR_MASK
+    };
+    let mut size_mask = !(low_probe & addr_mask) as u64;
+    if is_64bit {
+        size_mask |= (!high_probe as u64) << 32;
+    }
+    // An unimplemented BAR probes back as zeros, so the mask is all ones and
+    // the size wraps to nothing. `wrapping_add` says that on purpose: a
+    // 64-bit BAR claiming the whole address space used to overflow here.
+    let size = if is_64bit {
+        size_mask.wrapping_add(1)
+    } else {
+        (size_mask + 1) as u32 as u64
+    };
+    let size = if is_mmio {
+        size
+    } else {
+        size & PCIE_PIO_ADDR_SPACE_MASK
+    };
+    let addr_lo = (low & addr_mask) as u64;
+    PcieBarInfo {
+        is_mmio,
+        is_64bit,
+        is_prefetchable: is_mmio && (low & PCI_BAR_MMIO_PREFETCH_MASK) != 0,
+        first_bar_reg,
+        size,
+        bus_addr: if is_64bit {
+            addr_lo | ((high as u64) << 32)
+        } else {
+            addr_lo
+        },
+        allocation: None,
+    }
+}
+
+/// How much address space to reserve for a BAR of `size`.
+///
+/// A BAR may be as small as 16 bytes of memory or 4 bytes of I/O. An MMIO
+/// BAR is handed to userspace as a VMO by `zx_pci_get_bar`, and a VMO is
+/// whole pages, so a sub-page MMIO BAR has to be rounded up or the mapping
+/// reaches into whatever sits next to it in the window. I/O ports have no
+/// page table behind them and the whole space is 64 KiB, so an I/O BAR is
+/// reserved at its natural size.
+fn bar_alignment(size: u64, is_mmio: bool) -> usize {
+    let size = size as usize;
+    if size >= PAGE_SIZE || (PCIE_HAS_IO_ADDR_SPACE && !is_mmio) {
+        size
+    } else {
+        PAGE_SIZE
+    }
+}
+
+/// The per-vector mask register after masking or unmasking one vector.
+///
+/// One function, so the two callers cannot disagree about the direction of
+/// the shift: `enable_irq` unmasked with `!(1 >> irq_id)`, which is `!1` for
+/// vector 0 and `!0` — a no-op — for every vector after it. A device using
+/// one MSI vector works; the second vector onwards stays masked forever and
+/// its interrupts never arrive.
+fn msi_mask_after(current: u32, irq: usize, mask: bool) -> u32 {
+    let bit = 1u32 << irq;
+    if mask {
+        current | bit
+    } else {
+        current & !bit
+    }
+}
+
+/// How many MSI vectors a request may be given, encoded the way the Multiple
+/// Message Enable field wants it.
+///
+/// A device can be given a power-of-two number of vectors, at most 32 and at
+/// most what its capability advertises as Multiple Message Capable (PCI
+/// Local Bus 3.0 §6.8.1.3). Deciding that here is what keeps it out of the
+/// two `assert!`s it used to reach inside the MSI setup, where a
+/// `zx_pci_set_irq_mode(handle, MSI, 33)` from userspace panicked the
+/// kernel.
+fn msi_multi_message_encoding(requested_irqs: usize, device_max: u32) -> ZxResult<u16> {
+    if !(1..=PCIE_MAX_MSI_IRQS).contains(&requested_irqs) || requested_irqs > device_max as usize {
+        return Err(ZxError::INVALID_ARGS);
+    }
+    Ok(requested_irqs.next_power_of_two().trailing_zeros() as u16)
+}
+
+/// Bounds and alignment for a `zx_pci_config_read`/`zx_pci_config_write`.
+///
+/// The offset comes from userspace. A function advertising a PCI Express
+/// capability has the 4 KiB extended configuration space (PCI Express 4.0
+/// §7.2.2), where the extended capabilities live; one without it has only
+/// the 256-byte PCI header (PCI Local Bus 3.0 §6.1). These two were the
+/// wrong way round, so extended capabilities were unreachable on the
+/// devices that have them and readable past the end on the devices that do
+/// not. Accesses must be naturally aligned as well: the bus cannot express
+/// a dword read at an odd offset, and over PIO it would straddle
+/// `CONFIG_DATA`.
+fn check_config_access(offset: usize, width: usize, has_pcie_cap: bool) -> ZxResult {
+    if !matches!(width, 1 | 2 | 4) {
+        return Err(ZxError::INVALID_ARGS);
+    }
+    if !offset.is_multiple_of(width) {
+        return Err(ZxError::INVALID_ARGS);
+    }
+    let cfg_size = if has_pcie_cap {
+        PCIE_EXTENDED_CONFIG_SIZE
+    } else {
+        PCIE_BASE_CONFIG_SIZE
+    };
+    if offset.checked_add(width).ok_or(ZxError::INVALID_ARGS)? > cfg_size {
+        return Err(ZxError::INVALID_ARGS);
+    }
+    Ok(())
+}
+
 /// Struct for managing shared legacy IRQ handlers.
 #[derive(Default)]
 pub struct SharedLegacyIrqHandler {
@@ -477,21 +638,12 @@ impl PcieDevice {
         let mut i = 0;
         let cfg = self.cfg.as_ref().unwrap();
         while i < self.bar_count {
-            let bar_val = cfg.read_bar(i);
-            let is_mmio = (bar_val & PCI_BAR_IO_TYPE_MASK) == PCI_BAR_IO_TYPE_MMIO;
-            let is_64bit = is_mmio && (bar_val & PCI_BAR_MMIO_TYPE_MASK) == PCI_BAR_MMIO_TYPE_64BIT;
-            if is_64bit {
-                if i + 1 >= self.bar_count {
-                    warn!(
-                        "Illegal 64-bit MMIO BAR position {}/{} while fetching BAR info",
-                        i, self.bar_count
-                    );
-                    return Err(ZxError::BAD_STATE);
-                }
-            } else if is_mmio && ((bar_val & PCI_BAR_MMIO_TYPE_MASK) != PCI_BAR_MMIO_TYPE_32BIT) {
+            let low = cfg.read_bar(i);
+            let (is_mmio, is_64bit) = bar_kind(i, low)?;
+            if is_64bit && i + 1 >= self.bar_count {
                 warn!(
-                    "Unrecognized MMIO BAR type (BAR[{}] == {:#x?}) while fetching BAR info",
-                    i, bar_val
+                    "Illegal 64-bit MMIO BAR position {}/{} while fetching BAR info",
+                    i, self.bar_count
                 );
                 return Err(ZxError::BAD_STATE);
             }
@@ -513,42 +665,21 @@ impl PcieDevice {
             } else {
                 PCI_BAR_PIO_ADDR_MASK
             };
-            let addr_lo = bar_val & addr_mask;
-            cfg.write_bar(i, bar_val | addr_mask);
-            let mut size_mask: u64 = !(cfg.read_bar(i) & addr_mask) as u64;
-            cfg.write_bar(i, bar_val);
-            if is_mmio && is_64bit {
-                let bar_id = i + 1;
-                let bar_val = cfg.read_bar(bar_id);
-                cfg.write_bar(bar_id, 0xFFFF_FFFF);
-                size_mask |= (!cfg.read_bar(bar_id) as u64) << 32;
-                cfg.write_bar(bar_id, bar_val);
-            }
+            cfg.write_bar(i, low | addr_mask);
+            let low_probe = cfg.read_bar(i);
+            cfg.write_bar(i, low);
+            let (high, high_probe) = if is_64bit {
+                let high = cfg.read_bar(i + 1);
+                cfg.write_bar(i + 1, 0xFFFF_FFFF);
+                let high_probe = cfg.read_bar(i + 1);
+                cfg.write_bar(i + 1, high);
+                (high, high_probe)
+            } else {
+                (0, 0)
+            };
             cfg.write16(PciReg16::Command, backup);
-            let size = if is_64bit {
-                size_mask + 1
-            } else {
-                (size_mask + 1) as u32 as u64
-            };
-            let size = if is_mmio {
-                size
-            } else {
-                size & PCIE_PIO_ADDR_SPACE_MASK
-            };
-            let bus_addr = if is_mmio && is_64bit {
-                (addr_lo as u64) | ((bar_val as u64) << 32)
-            } else {
-                addr_lo as u64
-            };
-            let bar_info = PcieBarInfo {
-                is_mmio,
-                is_64bit,
-                is_prefetchable: is_mmio && (bar_val & PCI_BAR_MMIO_PREFETCH_MASK) != 0,
-                first_bar_reg: i,
-                size,
-                bus_addr,
-                allocation: None,
-            };
+            let bar_info =
+                bar_info_from_probe(i, is_mmio, is_64bit, low, low_probe, high, high_probe);
             let bar_info_size = bar_info.size;
             self.inner.lock().bars[i] = bar_info;
             i += 1;
@@ -704,12 +835,7 @@ impl PcieDevice {
             } else {
                 PCI_BAR_PIO_ADDR_MASK
             };
-            let is_io_space = PCIE_HAS_IO_ADDR_SPACE && bar_info.is_mmio;
-            let align_size = if bar_info.size as usize >= PAGE_SIZE || is_io_space {
-                bar_info.size as usize
-            } else {
-                PAGE_SIZE
-            };
+            let align_size = bar_alignment(bar_info.size, bar_info.is_mmio);
             let alloc1 = allocator.lock().allocate_by_size(align_size, align_size);
             match alloc1 {
                 Some(a) => bar_info.allocation = Some(a),
@@ -832,20 +958,9 @@ impl PcieDevice {
             PcieIrqMode::Msi => {
                 let (_std, msi) = inner.msi().unwrap();
                 if msi.has_pvm {
-                    let mut val = self
-                        .cfg
-                        .as_ref()
-                        .unwrap()
-                        .read32_offset(msi.mask_bits_offset);
-                    if enable {
-                        val &= !(1 >> irq_id);
-                    } else {
-                        val |= 1 << irq_id;
-                    }
-                    self.cfg
-                        .as_ref()
-                        .unwrap()
-                        .write32_offset(msi.mask_bits_offset, val);
+                    let cfg = self.cfg.as_ref().unwrap();
+                    let val = cfg.read32_(msi.mask_bits_offset);
+                    cfg.write32_(msi.mask_bits_offset, msi_mask_after(val, irq_id, !enable));
                 }
                 // x86_64 does not support msi masking
                 #[cfg(not(target_arch = "x86_64"))]
@@ -966,7 +1081,7 @@ impl PcieDevice {
             self.cfg
                 .as_ref()
                 .unwrap()
-                .write32_offset(msi.mask_bits_offset, u32::MAX);
+                .write32_(msi.mask_bits_offset, u32::MAX);
             true
         } else {
             false
@@ -984,7 +1099,7 @@ impl PcieDevice {
         let block = msi.irq_block.lock();
         let (target_addr, target_data) = (block.target_addr, block.target_data);
         self.set_msi_target(inner, target_addr, target_data);
-        self.set_msi_multi_message_enb(inner, requested_irqs);
+        self.set_msi_multi_message_enb(inner, requested_irqs)?;
         for (i, e) in inner.irq.handlers.iter().enumerate() {
             let arc_self = inner.arc_self();
             let handler_copy = e.clone();
@@ -1036,16 +1151,15 @@ impl PcieDevice {
         &self,
         inner: &MutexGuard<PcieDeviceInner>,
         requested_irqs: usize,
-    ) {
-        assert!((1..=PCIE_MAX_MSI_IRQS).contains(&requested_irqs));
-        let log2 = requested_irqs.next_power_of_two().trailing_zeros();
-        assert!(log2 <= 5);
+    ) -> ZxResult {
         let cfg = self.cfg.as_ref().unwrap();
-        let (std, _msi) = inner.msi().unwrap();
+        let (std, msi) = inner.msi().ok_or(ZxError::NOT_SUPPORTED)?;
+        let log2 = msi_multi_message_encoding(requested_irqs, msi.max_irq)?;
         let ctrl_addr = std.base as usize + PciCapabilityMsi::ctrl_offset();
         let mut val = cfg.read16_(ctrl_addr);
-        val = (val & !0x70) | ((log2 as u16 & 0x7) << 4);
+        val = (val & !0x70) | ((log2 & 0x7) << 4);
         cfg.write16_(ctrl_addr, val);
+        Ok(())
     }
     fn set_msi_enb(&self, inner: &MutexGuard<PcieDeviceInner>, enable: bool) {
         let cfg = self.cfg.as_ref().unwrap();
@@ -1062,11 +1176,11 @@ impl PcieDevice {
         let cfg = self.cfg.as_ref().unwrap();
         let (_std, msi) = inner.msi().unwrap();
         if msi.has_pvm {
-            cfg.write32_offset(msi.mask_bits_offset, u32::MAX);
+            cfg.write32_(msi.mask_bits_offset, u32::MAX);
         }
     }
     fn mask_msi_irq(&self, inner: &MutexGuard<PcieDeviceInner>, irq: usize, mask: bool) -> bool {
-        assert!(!inner.irq.handlers.is_empty());
+        assert!(irq < inner.irq.handlers.len());
         let cfg = self.cfg.as_ref().unwrap();
         let (_std, msi) = inner.msi().unwrap();
         if mask && !msi.has_pvm {
@@ -1075,16 +1189,15 @@ impl PcieDevice {
         if msi.has_pvm {
             assert!(irq < PCIE_MAX_MSI_IRQS);
             let addr = msi.mask_bits_offset;
-            let mut val = cfg.read32_offset(addr);
-            if mask {
-                val |= 1 << irq;
-            } else {
-                val &= !(1 << irq);
-            }
-            cfg.write32_offset(addr, val);
+            let val = cfg.read32_(addr);
+            cfg.write32_(addr, msi_mask_after(val, irq, mask));
         }
-        let ret = inner.irq.handlers[0].get_masked();
-        inner.irq.handlers[0].set_masked(mask);
+        // Per vector, not vector 0's: `msi_irq_handler` reads this back to
+        // decide whether the interrupt it is holding is one it already
+        // masked, so sharing one flag between vectors made every vector
+        // after the first answer for vector 0.
+        let ret = inner.irq.handlers[irq].get_masked();
+        inner.irq.handlers[irq].set_masked(mask);
         ret
     }
     fn msi_irq_handler(dev: Arc<PcieDevice>, state: Arc<PcieIrqHandlerState>) {
@@ -1112,6 +1225,16 @@ impl PcieDevice {
             return Err(ZxError::BAD_STATE);
         } else if requested_irqs < 1 {
             return Err(ZxError::INVALID_ARGS);
+        }
+        // Settle the request before touching anything: a count the hardware
+        // cannot express used to be found halfway through the MSI setup, by
+        // an `assert!`, with the device's previous mode already dismantled.
+        if let PcieIrqMode::Msi = mode {
+            let device_max = inner
+                .msi()
+                .map(|(_std, msi)| msi.max_irq)
+                .ok_or(ZxError::NOT_SUPPORTED)?;
+            msi_multi_message_encoding(requested_irqs, device_max)?;
         }
         match inner.irq.mode {
             PcieIrqMode::Legacy => {
@@ -1155,18 +1278,12 @@ impl PcieDevice {
     /// Read the device's config.
     pub fn config_read(&self, offset: usize, width: usize) -> ZxResult<u32> {
         let inner = self.inner.lock();
-        let cfg_size: usize = if inner.pcie().is_some() {
-            PCIE_BASE_CONFIG_SIZE
-        } else {
-            PCIE_EXTENDED_CONFIG_SIZE
-        };
-        if offset + width > cfg_size {
-            return Err(ZxError::INVALID_ARGS);
-        }
+        check_config_access(offset, width, inner.pcie().is_some())?;
+        let cfg = self.cfg.as_ref().unwrap();
         match width {
-            1 => Ok(self.cfg.as_ref().unwrap().read8_offset(offset) as u32),
-            2 => Ok(self.cfg.as_ref().unwrap().read16_offset(offset) as u32),
-            4 => Ok(self.cfg.as_ref().unwrap().read32_offset(offset)),
+            1 => Ok(cfg.read8_(offset) as u32),
+            2 => Ok(cfg.read16_(offset) as u32),
+            4 => Ok(cfg.read32_(offset)),
             _ => Err(ZxError::INVALID_ARGS),
         }
     }
@@ -1174,22 +1291,12 @@ impl PcieDevice {
     /// Write the device's config.
     pub fn config_write(&self, offset: usize, width: usize, val: u32) -> ZxResult {
         let inner = self.inner.lock();
-        let cfg_size: usize = if inner.pcie().is_some() {
-            PCIE_BASE_CONFIG_SIZE
-        } else {
-            PCIE_EXTENDED_CONFIG_SIZE
-        };
-        if offset + width > cfg_size {
-            return Err(ZxError::INVALID_ARGS);
-        }
+        check_config_access(offset, width, inner.pcie().is_some())?;
+        let cfg = self.cfg.as_ref().unwrap();
         match width {
-            1 => self.cfg.as_ref().unwrap().write8_offset(offset, val as u8),
-            2 => self
-                .cfg
-                .as_ref()
-                .unwrap()
-                .write16_offset(offset, val as u16),
-            4 => self.cfg.as_ref().unwrap().write32_offset(offset, val),
+            1 => cfg.write8_(offset, val as u8),
+            2 => cfg.write16_(offset, val as u16),
+            4 => cfg.write32_(offset, val),
             _ => return Err(ZxError::INVALID_ARGS),
         };
         Ok(())
@@ -1591,4 +1698,645 @@ pub struct PcieIrqModeCaps {
     /// For MSI or MSI-X, indicates whether or not per-vector-masking has been
     /// implemented by the hardware.
     pub per_vector_masking_supported: bool,
+}
+
+#[cfg(test)]
+mod pci_bar_and_config_tests {
+    use super::*;
+    use crate::dev::pci::PciAddrSpace;
+
+    /// One PCI function's configuration space, in memory.
+    ///
+    /// [`PciConfig`] in [`PciAddrSpace::MMIO`] mode reads and writes through
+    /// `base` as a raw pointer, so a correctly aligned page of memory is a
+    /// configuration space as far as this module can tell. That is what makes
+    /// the tests below possible at all: the PCI bus driver here only runs
+    /// under Zircon userboot against a real bus, so not one line of it is
+    /// executed by CI.
+    #[repr(C, align(4096))]
+    struct ConfigSpace([u8; PCIE_EXTENDED_CONFIG_SIZE]);
+
+    impl ConfigSpace {
+        fn new() -> alloc::boxed::Box<Self> {
+            alloc::boxed::Box::new(ConfigSpace([0; PCIE_EXTENDED_CONFIG_SIZE]))
+        }
+
+        /// Hand out the accessor the driver will use. Takes `&mut self` so the
+        /// pointer it keeps may be written through, as a real device's is.
+        fn config(&mut self) -> Arc<PciConfig> {
+            Arc::new(PciConfig {
+                addr_space: PciAddrSpace::MMIO,
+                base: self.0.as_mut_ptr() as usize,
+            })
+        }
+
+        /// Seed a register, as firmware would have left it.
+        fn poke32(&mut self, offset: usize, val: u32) {
+            self.0[offset..offset + 4].copy_from_slice(&val.to_le_bytes());
+        }
+
+        fn peek32(&self, offset: usize) -> u32 {
+            u32::from_le_bytes([
+                self.0[offset],
+                self.0[offset + 1],
+                self.0[offset + 2],
+                self.0[offset + 3],
+            ])
+        }
+
+        fn peek16(&self, offset: usize) -> u16 {
+            u16::from_le_bytes([self.0[offset], self.0[offset + 1]])
+        }
+
+        fn peek8(&self, offset: usize) -> u8 {
+            self.0[offset]
+        }
+    }
+
+    /// A device with nothing but a configuration space behind it: the
+    /// identifiers are a real RTX 2060 SUPER (TU106), the card this kernel is
+    /// actually run on.
+    fn device_with(cfg: Arc<PciConfig>) -> PcieDevice {
+        PcieDevice {
+            bus_id: 0,
+            dev_id: 3,
+            func_id: 0,
+            bar_count: 6,
+            cfg: Some(cfg),
+            _cfg_phys: 0,
+            dev_lock: Mutex::default(),
+            command_lock: Mutex::default(),
+            vendor_id: 0x10de,
+            device_id: 0x1f06,
+            class_id: 0x03,
+            subclass_id: 0x00,
+            prog_if: 0x00,
+            rev_id: 0xa1,
+            inner: Default::default(),
+        }
+    }
+
+    /// The capability list of a card like the one above: power management at
+    /// 0x40, MSI (64-bit, per-vector masking) at 0x50, PCI Express at 0x68.
+    fn seed_capability_list(space: &mut ConfigSpace) {
+        space.0[PciReg8::CapabilitiesPtr as usize] = 0x40;
+        // id 0x01, next 0x50.
+        space.poke32(0x40, 0x0000_5001);
+        // id 0x05, next 0x68, control 0x0184 = 64-bit address, per-vector
+        // masking, and four vectors supported.
+        space.poke32(0x50, 0x0184_6805);
+        // id 0x10, next 0x00, capability register 0x0002 = version 2, endpoint.
+        space.poke32(0x68, 0x0002_0010);
+    }
+
+    // ---------- What a BAR register says it is ----------
+
+    #[test]
+    fn a_bar_declares_its_space_and_its_width() {
+        // Memory, 32-bit: bit 0 clear, bits 2:1 == 0b00.
+        assert_eq!(bar_kind(0, 0xF600_0000), Ok((true, false)));
+        // Memory, 64-bit prefetchable: bits 2:1 == 0b10, bit 3 set.
+        assert_eq!(bar_kind(1, 0x0000_000C), Ok((true, true)));
+        // I/O: bit 0 set, and the width bits mean nothing there.
+        assert_eq!(bar_kind(5, 0x0000_E001), Ok((false, false)));
+        assert_eq!(bar_kind(5, 0x0000_E003), Ok((false, false)));
+    }
+
+    #[test]
+    fn a_memory_bar_of_a_reserved_width_is_refused() {
+        // 0b01 in bits 2:1 was "below 1 MiB" on the original PCI bus and is
+        // reserved now. Guessing would mean probing the wrong register count.
+        assert_eq!(bar_kind(0, 0xF600_0002), Err(ZxError::BAD_STATE));
+        assert_eq!(bar_kind(0, 0xF600_0006), Err(ZxError::BAD_STATE));
+    }
+
+    // ---------- What the two registers mean after the size probe ----------
+
+    #[test]
+    fn a_32_bit_memory_bar_reports_its_size_and_its_address() {
+        // BAR0 of the card: 16 MiB of registers at 0xF600_0000.
+        let bar = bar_info_from_probe(0, true, false, 0xF600_0000, 0xFF00_0000, 0, 0);
+        assert!(bar.is_mmio);
+        assert!(!bar.is_64bit);
+        assert!(!bar.is_prefetchable);
+        assert_eq!(bar.size, 16 << 20);
+        assert_eq!(bar.bus_addr, 0xF600_0000);
+        assert_eq!(bar.first_bar_reg, 0);
+    }
+
+    #[test]
+    fn a_64_bit_bar_takes_its_high_half_from_the_upper_register() {
+        // BAR1 of the card: 256 MiB of framebuffer aperture, prefetchable,
+        // which firmware puts at 0x10_0000_0000 — above 4 GiB, where QEMU
+        // never puts anything, which is why this went unnoticed.
+        let bar = bar_info_from_probe(
+            1,
+            true,
+            true,
+            0x0000_000C,
+            0xF000_000C,
+            0x0000_0010,
+            0xFFFF_FFFF,
+        );
+        assert!(bar.is_64bit);
+        assert!(bar.is_prefetchable);
+        assert_eq!(bar.size, 256 << 20);
+        // Not 0x0000_000C_0000_0000: the upper half is the upper register,
+        // never the low one's type and prefetch bits.
+        assert_eq!(bar.bus_addr, 0x0000_0010_0000_0000);
+    }
+
+    #[test]
+    fn an_io_bar_stays_inside_the_32_bit_port_space() {
+        // BAR5: 128 I/O ports at 0xE000.
+        let bar = bar_info_from_probe(5, false, false, 0x0000_E001, 0xFFFF_FF81, 0, 0);
+        assert!(!bar.is_mmio);
+        assert!(!bar.is_prefetchable);
+        assert_eq!(bar.size, 128);
+        assert_eq!(bar.bus_addr, 0xE000);
+    }
+
+    #[test]
+    fn prefetchable_is_a_memory_only_bit() {
+        // Bit 3 of an I/O BAR is part of the address, not a prefetch hint.
+        let bar = bar_info_from_probe(5, false, false, 0x0000_E009, 0xFFFF_FF81, 0, 0);
+        assert!(!bar.is_prefetchable);
+        assert_eq!(bar.bus_addr, 0xE008);
+    }
+
+    #[test]
+    fn an_unimplemented_bar_has_no_size() {
+        // Registers read back as zeros, so the size mask is all ones and the
+        // size wraps to nothing. The 64-bit case used to overflow instead.
+        assert_eq!(bar_info_from_probe(2, true, false, 0, 0, 0, 0).size, 0);
+        assert_eq!(bar_info_from_probe(2, false, false, 0, 0, 0, 0).size, 0);
+        assert_eq!(bar_info_from_probe(2, true, true, 0, 0, 0, 0).size, 0);
+    }
+
+    #[test]
+    fn the_bars_of_the_card_come_out_as_the_card_declares_them() {
+        // (index, is_mmio, is_64bit, low, low_probe, high, high_probe)
+        // then the size and bus address the card is documented to have.
+        let card = [
+            (
+                (
+                    0usize,
+                    true,
+                    false,
+                    0xF600_0000u32,
+                    0xFF00_0000u32,
+                    0u32,
+                    0u32,
+                ),
+                16u64 << 20,
+                0xF600_0000u64,
+            ),
+            (
+                (
+                    1,
+                    true,
+                    true,
+                    0x0000_000C,
+                    0xF000_000C,
+                    0x0000_0010,
+                    0xFFFF_FFFF,
+                ),
+                256 << 20,
+                0x10_0000_0000,
+            ),
+            (
+                (
+                    3,
+                    true,
+                    true,
+                    0x0000_000C,
+                    0xFE00_000C,
+                    0x0000_0011,
+                    0xFFFF_FFFF,
+                ),
+                32 << 20,
+                0x11_0000_0000,
+            ),
+            (
+                (5, false, false, 0x0000_E001, 0xFFFF_FF81, 0, 0),
+                128,
+                0xE000,
+            ),
+        ];
+        for ((i, is_mmio, is_64bit, low, low_probe, high, high_probe), size, addr) in card {
+            let bar = bar_info_from_probe(i, is_mmio, is_64bit, low, low_probe, high, high_probe);
+            assert_eq!(bar.size, size, "tamaño de BAR{}", i);
+            assert_eq!(bar.bus_addr, addr, "dirección de BAR{}", i);
+        }
+    }
+
+    #[test]
+    fn probing_the_bars_leaves_every_register_as_it_found_it() {
+        // A configuration space that is only memory cannot answer a size
+        // probe — writing ones and reading them back gives ones — so what
+        // this pins is the handling around the probe: that the command
+        // register is put back, that both halves of a 64-bit BAR are put
+        // back, and that a 64-bit BAR consumes the register after it. A BAR
+        // left holding the probe pattern would have the device decoding a
+        // window it does not own.
+        let mut space = ConfigSpace::new();
+        let bars = [
+            0xF600_0000u32, // 0: memory, 32-bit
+            0x0000_000C,    // 1: memory, 64-bit prefetchable, low half
+            0x0000_0010,    //    and its upper half
+            0xF500_0000,    // 3: memory, 32-bit
+            0x0000_0000,    // 4: unimplemented
+            0x0000_E001,    // 5: I/O
+        ];
+        for (i, val) in bars.iter().enumerate() {
+            space.poke32(0x10 + i * 4, *val);
+        }
+        space.poke32(0x04, 0x0010_0007); // command: I/O, memory and bus master on
+        let dev = device_with(space.config());
+        dev.init_probe_bars().unwrap();
+
+        for (i, val) in bars.iter().enumerate() {
+            assert_eq!(space.peek32(0x10 + i * 4), *val, "BAR{} sin restaurar", i);
+        }
+        assert_eq!(
+            space.peek16(0x04),
+            0x0007,
+            "registro de comando sin restaurar"
+        );
+
+        let inner = dev.inner.lock();
+        // Sixteen bytes is what a memory BAR backed by plain memory reports;
+        // four is what an I/O BAR reports, its address mask being two bits
+        // wider.
+        assert_eq!(inner.bars[0].size, 16);
+        assert!(inner.bars[0].is_mmio && !inner.bars[0].is_64bit);
+        assert!(inner.bars[1].is_64bit && inner.bars[1].is_prefetchable);
+        assert_eq!(inner.bars[1].size, 16);
+        // Register 2 is the upper half of BAR1 and is never a BAR of its own.
+        assert_eq!(inner.bars[2].size, 0);
+        assert_eq!(inner.bars[2].first_bar_reg, 0);
+        assert_eq!(inner.bars[3].size, 16);
+        assert_eq!(inner.bars[4].size, 16);
+        assert_eq!(inner.bars[5].size, 4);
+        assert!(!inner.bars[5].is_mmio);
+    }
+
+    // ---------- How much space a BAR is given ----------
+
+    #[test]
+    fn a_memory_bar_smaller_than_a_page_is_given_a_whole_page() {
+        // It becomes a VMO handed to userspace, and a VMO is whole pages, so
+        // 128 bytes of registers must not share their page with the next
+        // device's.
+        assert_eq!(bar_alignment(128, true), PAGE_SIZE);
+        assert_eq!(bar_alignment(PAGE_SIZE as u64 - 1, true), PAGE_SIZE);
+        assert_eq!(bar_alignment(PAGE_SIZE as u64, true), PAGE_SIZE);
+        assert_eq!(bar_alignment(16 << 20, true), 16 << 20);
+    }
+
+    #[test]
+    fn an_io_bar_is_given_its_natural_size_where_there_are_ports() {
+        // The whole I/O space is 64 KiB and has no page table behind it, so
+        // rounding 32 ports up to a page would spend a sixteenth of it.
+        let expected = if PCIE_HAS_IO_ADDR_SPACE {
+            32
+        } else {
+            PAGE_SIZE
+        };
+        assert_eq!(bar_alignment(32, false), expected);
+        assert_eq!(bar_alignment(16 << 20, false), 16 << 20);
+    }
+
+    // ---------- The per-vector MSI mask ----------
+
+    #[test]
+    fn masking_a_vector_touches_only_its_own_bit() {
+        assert_eq!(msi_mask_after(0, 0, true), 0b1);
+        assert_eq!(msi_mask_after(0, 3, true), 0b1000);
+        assert_eq!(msi_mask_after(0b1010, 0, true), 0b1011);
+        assert_eq!(msi_mask_after(0b1111, 1, false), 0b1101);
+        assert_eq!(msi_mask_after(u32::MAX, 31, false), 0x7FFF_FFFF);
+    }
+
+    #[test]
+    fn every_vector_masks_and_unmasks_back_to_where_it_started() {
+        // The unmask side used to shift the wrong way: `!(1 >> irq)` is `!1`
+        // for vector 0 and `!0` — a no-op — for every vector after it, so
+        // only the first vector of a device could ever be unmasked.
+        for irq in 0..PCIE_MAX_MSI_IRQS {
+            let masked = msi_mask_after(0, irq, true);
+            assert_eq!(masked, 1u32 << irq, "vector {}", irq);
+            assert_eq!(msi_mask_after(masked, irq, false), 0, "vector {}", irq);
+            assert_eq!(
+                msi_mask_after(u32::MAX, irq, false),
+                !(1u32 << irq),
+                "vector {}",
+                irq
+            );
+        }
+    }
+
+    #[test]
+    fn a_vector_count_the_hardware_cannot_express_is_refused() {
+        // Four vectors is what the fake card advertises.
+        assert_eq!(msi_multi_message_encoding(1, 4), Ok(0));
+        assert_eq!(msi_multi_message_encoding(2, 4), Ok(1));
+        assert_eq!(msi_multi_message_encoding(3, 4), Ok(2));
+        assert_eq!(msi_multi_message_encoding(4, 4), Ok(2));
+        assert_eq!(msi_multi_message_encoding(5, 4), Err(ZxError::INVALID_ARGS));
+        // A device that supports the whole file of 32.
+        assert_eq!(msi_multi_message_encoding(32, 32), Ok(5));
+        assert_eq!(
+            msi_multi_message_encoding(33, 32),
+            Err(ZxError::INVALID_ARGS)
+        );
+        // The field a device states its vector count in is three bits wide,
+        // so a malformed one can claim 64 or 128 — more than the Multiple
+        // Message Enable field can encode, and more than there would be
+        // handlers for. What a device claims is a ceiling, not a licence.
+        assert_eq!(msi_multi_message_encoding(32, 128), Ok(5));
+        assert_eq!(
+            msi_multi_message_encoding(64, 128),
+            Err(ZxError::INVALID_ARGS)
+        );
+        assert_eq!(
+            msi_multi_message_encoding(33, 64),
+            Err(ZxError::INVALID_ARGS)
+        );
+        assert_eq!(
+            msi_multi_message_encoding(0, 32),
+            Err(ZxError::INVALID_ARGS)
+        );
+        assert_eq!(
+            msi_multi_message_encoding(usize::MAX, 32),
+            Err(ZxError::INVALID_ARGS)
+        );
+    }
+
+    #[test]
+    fn asking_for_more_vectors_than_a_device_has_is_an_error_not_a_panic() {
+        // `zx_pci_set_irq_mode(handle, MSI, 33)` reached an `assert!` inside
+        // the MSI setup, which is a kernel panic from a syscall.
+        let mut space = ConfigSpace::new();
+        seed_capability_list(&mut space);
+        let dev = device_with(space.config());
+        dev.init_capabilities().unwrap();
+        dev.inner.lock().plugged_in = true;
+        assert_eq!(
+            dev.set_irq_mode(PcieIrqMode::Msi, 33),
+            Err(ZxError::INVALID_ARGS)
+        );
+        assert_eq!(
+            dev.set_irq_mode(PcieIrqMode::Msi, 5),
+            Err(ZxError::INVALID_ARGS)
+        );
+        // And the device is left as it was, not half torn down.
+        assert_eq!(dev.inner.lock().irq.mode, PcieIrqMode::Disabled);
+        assert!(dev.inner.lock().irq.handlers.is_empty());
+    }
+
+    #[test]
+    fn msi_on_a_device_without_the_capability_is_refused_before_anything_moves() {
+        let mut space = ConfigSpace::new();
+        let dev = device_with(space.config());
+        dev.inner.lock().plugged_in = true;
+        assert_eq!(
+            dev.set_irq_mode(PcieIrqMode::Msi, 1),
+            Err(ZxError::NOT_SUPPORTED)
+        );
+        assert_eq!(dev.inner.lock().irq.mode, PcieIrqMode::Disabled);
+    }
+
+    // ---------- Bounds and alignment of a configuration access ----------
+
+    #[test]
+    fn a_pci_express_device_reaches_its_extended_space() {
+        // The extended capabilities — AER, ARI, resizable BAR — all live
+        // above 0x100, and a driver that cannot read them cannot use them.
+        assert_eq!(check_config_access(0x100, 4, true), Ok(()));
+        assert_eq!(check_config_access(4092, 4, true), Ok(()));
+        assert_eq!(
+            check_config_access(4096, 1, true),
+            Err(ZxError::INVALID_ARGS)
+        );
+    }
+
+    #[test]
+    fn a_plain_pci_device_stops_at_its_header() {
+        // 256 bytes is all it has; past that is another function's registers.
+        assert_eq!(check_config_access(252, 4, false), Ok(()));
+        assert_eq!(
+            check_config_access(256, 1, false),
+            Err(ZxError::INVALID_ARGS)
+        );
+        assert_eq!(
+            check_config_access(0x100, 4, false),
+            Err(ZxError::INVALID_ARGS)
+        );
+    }
+
+    #[test]
+    fn a_configuration_access_must_be_naturally_aligned() {
+        assert_eq!(check_config_access(0x10, 4, true), Ok(()));
+        assert_eq!(
+            check_config_access(0x11, 4, true),
+            Err(ZxError::INVALID_ARGS)
+        );
+        assert_eq!(
+            check_config_access(0x12, 4, true),
+            Err(ZxError::INVALID_ARGS)
+        );
+        assert_eq!(check_config_access(0x12, 2, true), Ok(()));
+        assert_eq!(
+            check_config_access(0x13, 2, true),
+            Err(ZxError::INVALID_ARGS)
+        );
+        assert_eq!(check_config_access(0x13, 1, true), Ok(()));
+    }
+
+    #[test]
+    fn only_a_byte_a_word_or_a_dword_can_be_asked_for() {
+        for width in [0usize, 3, 5, 8, 16] {
+            assert_eq!(
+                check_config_access(0, width, true),
+                Err(ZxError::INVALID_ARGS),
+                "ancho {}",
+                width
+            );
+        }
+        // An offset that would wrap instead of exceeding the space.
+        assert_eq!(
+            check_config_access(usize::MAX - 3, 4, true),
+            Err(ZxError::INVALID_ARGS)
+        );
+    }
+
+    // ---------- Against a configuration space ----------
+
+    #[test]
+    fn a_configuration_read_lands_on_the_devices_own_registers() {
+        let mut space = ConfigSpace::new();
+        // Vendor 0x10DE, device 0x1F06 — where a driver looks first.
+        space.poke32(0x00, 0x1F06_10DE);
+        space.poke32(0x10, 0xF600_0000);
+        space.0[0x3C] = 0x0B;
+        let dev = device_with(space.config());
+        assert_eq!(dev.config_read(0x00, 4), Ok(0x1F06_10DE));
+        assert_eq!(dev.config_read(0x00, 2), Ok(0x10DE));
+        assert_eq!(dev.config_read(0x02, 2), Ok(0x1F06));
+        assert_eq!(dev.config_read(0x10, 4), Ok(0xF600_0000));
+        assert_eq!(dev.config_read(0x3C, 1), Ok(0x0B));
+    }
+
+    #[test]
+    fn a_configuration_write_lands_on_the_devices_own_registers() {
+        let mut space = ConfigSpace::new();
+        // Neighbours with something in them, so a write that is wider than it
+        // was asked to be shows up: the byte at 0x0D is the latency timer,
+        // sitting between the cache line size and the header type.
+        space.poke32(0x0C, 0xAABB_CCDD);
+        space.poke32(0x04, 0x1111_2222);
+        let dev = device_with(space.config());
+        assert_eq!(dev.config_write(0x04, 2, 0x0007), Ok(()));
+        assert_eq!(dev.config_write(0x14, 4, 0xDEAD_BEEF), Ok(()));
+        assert_eq!(dev.config_write(0x0D, 1, 0x40), Ok(()));
+        assert_eq!(space.peek16(0x04), 0x0007);
+        assert_eq!(space.peek32(0x14), 0xDEAD_BEEF);
+        assert_eq!(space.peek8(0x0D), 0x40);
+        // Each write is exactly as wide as it was asked to be: the byte write
+        // left the three registers around it alone, and the word write left
+        // the upper half of its dword alone.
+        assert_eq!(space.peek32(0x0C), 0xAABB_40DD);
+        assert_eq!(space.peek32(0x04), 0x1111_0007);
+        // And nothing outside the registers it was told to write.
+        assert_eq!(space.peek32(0x00), 0);
+        assert_eq!(space.peek32(0x10), 0);
+    }
+
+    #[test]
+    fn the_space_a_device_may_be_asked_for_follows_its_capabilities() {
+        let mut space = ConfigSpace::new();
+        space.poke32(0x100, 0xCAFE_F00D);
+        let dev = device_with(space.config());
+        // With no capability list walked yet there is no PCI Express
+        // capability, so the header is the whole space.
+        assert_eq!(dev.config_read(0x100, 4), Err(ZxError::INVALID_ARGS));
+        assert_eq!(dev.config_write(0x100, 4, 1), Err(ZxError::INVALID_ARGS));
+        seed_capability_list(&mut space);
+        let dev = device_with(space.config());
+        dev.init_capabilities().unwrap();
+        assert!(dev.inner.lock().pcie().is_some());
+        assert_eq!(dev.config_read(0x100, 4), Ok(0xCAFE_F00D));
+        assert_eq!(dev.config_write(0x100, 4, 0x0000_0002), Ok(()));
+        assert_eq!(space.peek32(0x100), 0x0000_0002);
+    }
+
+    // ---------- The capability walk ----------
+
+    #[test]
+    fn the_capability_list_of_the_card_is_walked_in_order() {
+        let mut space = ConfigSpace::new();
+        seed_capability_list(&mut space);
+        let dev = device_with(space.config());
+        dev.init_capabilities().unwrap();
+        let inner = dev.inner.lock();
+        let ids: alloc::vec::Vec<u8> = inner
+            .caps
+            .iter()
+            .map(|c| match c {
+                PciCapability::Msi(std, _) => std.id,
+                PciCapability::Pcie(std, _) => std.id,
+                PciCapability::AdvFeatures(std, _) => std.id,
+                PciCapability::Std(std) => std.id,
+            })
+            .collect();
+        assert_eq!(ids, alloc::vec![0x01, 0x05, 0x10]);
+        let (std, msi) = inner.msi().unwrap();
+        assert_eq!(std.base, 0x50);
+        assert!(msi.is_64bit);
+        assert!(msi.has_pvm);
+        assert_eq!(msi.mask_bits_offset, 0x60);
+        let (_std, pcie) = inner.pcie().unwrap();
+        assert_eq!(pcie.version, 2);
+    }
+
+    #[test]
+    fn the_msi_mask_register_is_initialised_inside_the_devices_space() {
+        // Bringing up a capability with per-vector masking starts with every
+        // vector masked. That write is an offset inside the capability, so it
+        // has to go through `base`; it used to be handed to the accessor that
+        // takes a whole address, which put it at address 0x60.
+        let mut space = ConfigSpace::new();
+        seed_capability_list(&mut space);
+        let dev = device_with(space.config());
+        dev.init_capabilities().unwrap();
+        assert_eq!(space.peek32(0x60), u32::MAX);
+        // The control word keeps its 64-bit, masking and vector-count bits.
+        assert_eq!(space.peek16(0x52), 0x0184);
+    }
+
+    #[test]
+    fn a_capability_pointer_outside_the_list_area_is_refused() {
+        let mut space = ConfigSpace::new();
+        // 0x30 is inside the standard header, not the capability area.
+        space.0[PciReg8::CapabilitiesPtr as usize] = 0x30;
+        let dev = device_with(space.config());
+        assert_eq!(dev.init_capabilities(), Err(ZxError::INVALID_ARGS));
+    }
+
+    // ---------- Masking a vector against a configuration space ----------
+
+    #[test]
+    fn unmasking_the_second_vector_of_a_device_actually_unmasks_it() {
+        let mut space = ConfigSpace::new();
+        seed_capability_list(&mut space);
+        let dev = device_with(space.config());
+        dev.init_capabilities().unwrap();
+        {
+            let mut inner = dev.inner.lock();
+            dev.allocate_irq_handler(&mut inner, 4, true);
+            inner.irq.mode = PcieIrqMode::Msi;
+            inner.plugged_in = true;
+            for h in inner.irq.handlers.iter() {
+                h.set_handler(Some(alloc::boxed::Box::new(|| 0)));
+            }
+        }
+        // Every vector starts masked.
+        assert_eq!(space.peek32(0x60), u32::MAX);
+        for irq in 0..4 {
+            dev.enable_irq(irq, true);
+        }
+        // The four vectors this device uses are now unmasked, and nothing
+        // else was touched.
+        assert_eq!(space.peek32(0x60), 0xFFFF_FFF0);
+        dev.enable_irq(2, false);
+        assert_eq!(space.peek32(0x60), 0xFFFF_FFF4);
+    }
+
+    #[test]
+    fn each_vector_remembers_whether_it_is_masked() {
+        // `msi_irq_handler` asks `mask_msi_irq` whether the vector it is
+        // holding was already masked, to tell a real interrupt from one it
+        // masked itself. That bookkeeping was kept for vector 0 only, so
+        // every vector after the first answered for vector 0.
+        let mut space = ConfigSpace::new();
+        seed_capability_list(&mut space);
+        let dev = device_with(space.config());
+        dev.init_capabilities().unwrap();
+        let mut inner = dev.inner.lock();
+        dev.allocate_irq_handler(&mut inner, 4, false);
+        let inner = inner;
+        // Bringing the capability up masked every vector; start from none
+        // masked so each call's own bit is the one that moves.
+        for irq in 0..4 {
+            dev.mask_msi_irq(&inner, irq, false);
+        }
+        assert_eq!(space.peek32(0x60), 0xFFFF_FFF0);
+        assert!(!dev.mask_msi_irq(&inner, 2, true));
+        // Vector 2 is masked now, and it is vector 2 that says so.
+        assert!(dev.mask_msi_irq(&inner, 2, true));
+        assert!(!dev.mask_msi_irq(&inner, 0, true));
+        assert!(!dev.mask_msi_irq(&inner, 3, false));
+        assert_eq!(space.peek32(0x60), 0xFFFF_FFF5);
+    }
 }

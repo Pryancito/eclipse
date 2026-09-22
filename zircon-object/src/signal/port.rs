@@ -104,7 +104,9 @@ impl Port {
     /// Push a `User` type `packet` into the port.
     pub fn push_user(&self, packet: impl Into<PortPacket>) -> ZxResult<()> {
         let mut packet = packet.into();
-        packet.type_ = PacketType::User;
+        // Zircon's `PortDispatcher::QueueUser` does the same: whatever type the
+        // caller wrote, a queued packet is a user packet.
+        packet.type_ = PacketType::User as u32;
         let mut inner = self.inner.lock();
         if inner.queue.len() >= MAX_ALLOCATED_PACKET_COUNT_PER_PORT {
             return Err(ZxError::SHOULD_WAIT);
@@ -177,7 +179,7 @@ impl Port {
         };
         let packet = PortPacketRepr {
             key: observer.key,
-            status: ZxError::OK,
+            status: ZxError::OK as i32,
             data: PayloadRepr::Signal(PacketSignal {
                 trigger: observer.signals,
                 observed,
@@ -265,7 +267,7 @@ impl Port {
                     }
                     return PortPacketRepr {
                         key: packet.key,
-                        status: ZxError::OK,
+                        status: ZxError::OK as i32,
                         data: PayloadRepr::Interrupt(packet.into()),
                     }
                     .into();
@@ -392,7 +394,7 @@ mod tests {
 
         let packet_repr2 = PortPacketRepr {
             key: 2,
-            status: ZxError::OK,
+            status: ZxError::OK as i32,
             data: PayloadRepr::Signal(PacketSignal {
                 trigger: Signal::WRITABLE,
                 observed: Signal::WRITABLE,
@@ -418,7 +420,7 @@ mod tests {
         let packet = port.wait().await;
         let packet_repr = PortPacketRepr {
             key: 1,
-            status: ZxError::OK,
+            status: ZxError::OK as i32,
             data: PayloadRepr::Signal(PacketSignal {
                 trigger: Signal::READABLE,
                 observed: Signal::READABLE,
@@ -427,10 +429,10 @@ mod tests {
                 _reserved1: 0,
             }),
         };
-        assert_eq!(PortPacketRepr::from(&packet), packet_repr);
+        assert_eq!(packet.decode().unwrap(), packet_repr);
 
         let packet = port.wait().await;
-        assert_eq!(PortPacketRepr::from(&packet), packet_repr2);
+        assert_eq!(packet.decode().unwrap(), packet_repr2);
 
         // Test asserting signal before `send_signal_to_port_async`.
         let port = Port::new(0).unwrap();
@@ -438,6 +440,33 @@ mod tests {
         object.signal_set(Signal::READABLE);
         object.send_signal_to_port_async(Signal::READABLE, &port, 1);
         let packet = port.wait().await;
-        assert_eq!(PortPacketRepr::from(&packet), packet_repr);
+        assert_eq!(packet.decode().unwrap(), packet_repr);
+    }
+
+    /// `push_user` gets the struct `sys_port_queue` read out of the caller's
+    /// memory, so its type is whatever the process wrote. Zircon's
+    /// `PortDispatcher::QueueUser` overwrites it and leaves the rest alone.
+    #[async_std::test]
+    async fn a_queued_packet_is_a_user_packet_whatever_the_caller_wrote() {
+        #[allow(unsafe_code)]
+        fn packet_from_bytes(type_: u32, status: i32) -> PortPacket {
+            let mut bytes = [0u8; 48];
+            bytes[0..8].copy_from_slice(&9u64.to_le_bytes());
+            bytes[8..12].copy_from_slice(&type_.to_le_bytes());
+            bytes[12..16].copy_from_slice(&status.to_le_bytes());
+            bytes[16..48].copy_from_slice(&[0x5a; 32]);
+            unsafe { core::ptr::read_unaligned(bytes.as_ptr() as *const PortPacket) }
+        }
+
+        // 9 is `ZX_PKT_TYPE_PAGE_REQUEST`, which has no payload and used to
+        // panic the kernel on the way in; 8 is not a type at all.
+        for type_ in [0u32, 6, 8, 9, u32::MAX] {
+            let port = Port::new(0).unwrap();
+            port.push_user(packet_from_bytes(type_, -77)).unwrap();
+            let queued = port.wait().await;
+            assert_eq!(queued.type_, PacketType::User as u32);
+            assert_eq!(queued.status, -77, "the status is carried through");
+            assert_eq!(queued.decode().unwrap().data, PayloadRepr::User([0x5a; 32]));
+        }
     }
 }
