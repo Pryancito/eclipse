@@ -139,7 +139,12 @@ impl Syscall<'_> {
         if !path.is_empty() {
             new_proc.set_name(comm_from_path(&path));
         }
-        let new_thread = Thread::create_linux(&new_proc)?;
+        // What the child thread takes from this one -- the signal mask above
+        // all, which a `fork` inherits (sigprocmask(2)). `false`: a fork does
+        // not share the address space, so the alternate signal stack comes
+        // across too.
+        let inherited = self.thread.lock_linux().forked_child();
+        let new_thread = Thread::create_linux_with(&new_proc, inherited)?;
         let mut new_ctx = self.thread.context_cloned()?;
         if newsp != 0 {
             new_ctx.set_field(UserContextField::StackPointer, newsp);
@@ -174,7 +179,12 @@ impl Syscall<'_> {
         // implementation cannot replace a shared address space on execve, so use a copy
         // here while retaining vfork's parent-suspension semantics.
         let new_proc = Process::fork_from(self.zircon_process())?;
-        let new_thread = Thread::create_linux(&new_proc)?;
+        // `false`: Linux's rule is `(clone_flags & (CLONE_VM|CLONE_VFORK)) ==
+        // CLONE_VM`, and a vfork sets BOTH bits, so the alternate signal
+        // stack comes across just as it does for a fork -- doubly right here,
+        // where the address space is copied anyway (see above).
+        let inherited = self.thread.lock_linux().forked_child();
+        let new_thread = Thread::create_linux_with(&new_proc, inherited)?;
         let mut new_ctx = self.thread.context_cloned()?;
         if newsp != 0 {
             new_ctx.set_field(UserContextField::StackPointer, newsp);
@@ -336,7 +346,12 @@ impl Syscall<'_> {
         // (no CLONE_DETACHED), and falling back to fork() for it silently
         // created a separate process whose "threads" could never synchronize
         // through futexes with the parent.
-        let new_thread = Thread::create_linux(self.zircon_process())?;
+        // `true`: a thread shares the address space, so it starts with NO
+        // alternate signal stack of its own -- two threads pointing their
+        // signal frames at the same pages would overwrite each other. The
+        // signal mask does come across (pthread_create(3)).
+        let inherited = self.thread.lock_linux().new_thread();
+        let new_thread = Thread::create_linux_with(self.zircon_process(), inherited)?;
         let mut new_ctx = self.thread.context_cloned()?;
         new_ctx.set_field(UserContextField::StackPointer, newsp);
         if clone_flags.contains(CloneFlags::SETTLS) {
