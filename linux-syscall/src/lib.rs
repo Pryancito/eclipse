@@ -445,14 +445,14 @@ impl Syscall<'_> {
             // SOCK_NONBLOCK). GLib/GDBus uses it unconditionally; falling
             // through to `unknown syscall` broke waybar's D-Bus socket path.
             Sys::ACCEPT4 => self.sys_accept4(a0, a1.into(), a2.into(), a3).await,
-            Sys::SENDTO => self.sys_sendto(a0, a1.into(), a2, a3, a4.into(), a5),
+            Sys::SENDTO => self.sys_sendto(a0, a1.into(), a2, a3, a4.into(), a5).await,
             Sys::RECVFROM => {
                 self.sys_recvfrom(a0, a1.into(), a2, a3, a4.into(), a5.into())
                     .await
             }
-            Sys::SENDMSG => self.sys_sendmsg(a0, a1.into(), a2),
+            Sys::SENDMSG => self.sys_sendmsg(a0, a1.into(), a2).await,
             Sys::RECVMSG => self.sys_recvmsg(a0, a1.into(), a2).await,
-            Sys::SENDMMSG => self.sys_sendmmsg(a0, a1.into(), a2, a3),
+            Sys::SENDMMSG => self.sys_sendmmsg(a0, a1.into(), a2, a3).await,
             Sys::RECVMMSG => self.sys_recvmmsg(a0, a1.into(), a2, a3).await,
             Sys::SHUTDOWN => self.sys_shutdown(a0, a1),
             Sys::BIND => self.sys_bind(a0, a1.into(), a2),

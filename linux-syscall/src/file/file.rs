@@ -190,7 +190,7 @@ impl Syscall<'_> {
             );
         })?;
         let chunk_size = len.min(super::SYSCALL_IO_MAX);
-        let blocking_pipe = self.blocking_pipe(&file_like);
+        let waits = self.waits_for_room(&file_like);
         let mut written = 0usize;
         while written < len {
             let n = (len - written).min(chunk_size);
@@ -214,7 +214,7 @@ impl Syscall<'_> {
                 });
             let w = match res {
                 Ok(w) => w,
-                Err(e) => match after_write_error(e, blocking_pipe, written) {
+                Err(e) => match after_write_error(e, waits, written) {
                     // A blocking pipe writer waits for room and carries on:
                     // `pipe_write` returns only once every byte is in (or a
                     // signal cuts it short), never `EAGAIN`.
@@ -228,7 +228,7 @@ impl Syscall<'_> {
                     // make the caller resend data the file already took.
                     AfterWriteError::Partial => break,
                     AfterWriteError::Fail => {
-                        self.raise_sigpipe_if_due(e, blocking_pipe || self.is_pipe(&file_like));
+                        self.raise_sigpipe_if_due(e, self.is_stream(&file_like));
                         return Err(e);
                     }
                 },
@@ -248,18 +248,38 @@ impl Syscall<'_> {
         super::splice::pipe_inode(file_like).is_some()
     }
 
-    /// True for a pipe fd without `O_NONBLOCK`: the one kind of fd whose
-    /// `write` this syscall waits on, as `pipe_write` does, instead of
-    /// handing the caller the `EAGAIN` that only a non-blocking fd may see.
-    fn blocking_pipe(&self, file_like: &Arc<dyn FileLike>) -> bool {
-        self.is_pipe(file_like) && !file_like.flags().non_block()
+    /// True for a unix-domain socket fd. Its `write` queues into a bounded
+    /// peer buffer, like a pipe, and answers `EAGAIN` when that is full.
+    fn is_unix_socket(&self, file_like: &Arc<dyn FileLike>) -> bool {
+        file_like
+            .downcast_ref::<linux_object::net::UnixSocketState>()
+            .is_some()
     }
 
-    /// `pipe_write` pairs its `-EPIPE` with `send_sig(SIGPIPE, current, 0)`:
-    /// a writer whose reader has gone is killed unless it asked to be told
-    /// instead. Without the signal, `yes | head -1` ran `yes` for ever.
-    fn raise_sigpipe_if_due(&self, e: LxError, pipe: bool) {
-        if sigpipe_due(e, pipe) {
+    /// A pipe or a socket: the fds whose `EPIPE` means "the other side is
+    /// gone" and comes with `SIGPIPE` (`pipe_write`, `unix_stream_sendmsg`,
+    /// `sk_stream_error`), as opposed to a device reusing the errno.
+    fn is_stream(&self, file_like: &Arc<dyn FileLike>) -> bool {
+        self.is_pipe(file_like) || file_like.as_socket().is_ok()
+    }
+
+    /// True for a pipe or unix socket fd without `O_NONBLOCK`: the fds whose
+    /// `write` this syscall waits on, as `pipe_write` and
+    /// `unix_stream_sendmsg` do, instead of handing the caller the `EAGAIN`
+    /// that only a non-blocking fd may see. (A TCP socket's `write` waits
+    /// for window on its own, synchronously.)
+    fn waits_for_room(&self, file_like: &Arc<dyn FileLike>) -> bool {
+        (self.is_pipe(file_like) || self.is_unix_socket(file_like))
+            && !file_like.flags().non_block()
+    }
+
+    /// `pipe_write` pairs its `-EPIPE` with `send_sig(SIGPIPE, current, 0)`,
+    /// and every socket family does the same unless `MSG_NOSIGNAL` says
+    /// otherwise (`write(2)` cannot say it): a writer whose reader has gone
+    /// is killed unless it asked to be told instead. Without the signal,
+    /// `yes | head -1` ran `yes` for ever.
+    fn raise_sigpipe_if_due(&self, e: LxError, stream: bool) {
+        if sigpipe_due(e, stream) {
             self.thread
                 .lock_linux()
                 .signals
@@ -405,7 +425,7 @@ impl Syscall<'_> {
         let total = iovs.total_len();
         let proc = self.linux_process();
         let file_like = proc.get_file_like(fd)?;
-        let blocking_pipe = self.blocking_pipe(&file_like);
+        let waits = self.waits_for_room(&file_like);
         let mut buf = vec![0u8; total.min(super::SYSCALL_IO_MAX)];
         let mut written = 0usize;
         while written < total {
@@ -423,11 +443,11 @@ impl Syscall<'_> {
                     // A pipe that took part of a chunk has no room for the
                     // rest yet; a blocking writer waits for it (below, on
                     // the next `Again`) rather than stopping short.
-                    if w < n && !blocking_pipe {
+                    if w < n && !waits {
                         break;
                     }
                 }
-                Err(e) => match after_write_error(e, blocking_pipe, written) {
+                Err(e) => match after_write_error(e, waits, written) {
                     AfterWriteError::Wait => {
                         file_like.async_poll(PollEvents::OUT).await?;
                     }
@@ -437,7 +457,7 @@ impl Syscall<'_> {
                     // written and resend bytes the file already consumed.
                     AfterWriteError::Partial => break,
                     AfterWriteError::Fail => {
-                        self.raise_sigpipe_if_due(e, blocking_pipe || self.is_pipe(&file_like));
+                        self.raise_sigpipe_if_due(e, self.is_stream(&file_like));
                         return Err(e);
                     }
                 },
@@ -2549,7 +2569,7 @@ fn pipe_size_round(arg: usize) -> Result<usize, LxError> {
 /// What `write(2)`/`writev(2)` do with an error from the file, given what
 /// they already wrote and whether the fd is a pipe that blocks.
 #[derive(Debug, PartialEq, Eq)]
-enum AfterWriteError {
+pub(crate) enum AfterWriteError {
     /// Park until the pipe has room, then write the rest.
     Wait,
     /// Report the bytes already taken; the error waits for the next call.
@@ -2561,8 +2581,8 @@ enum AfterWriteError {
 /// `pipe_write`: a blocking writer never sees `EAGAIN`, it waits; every
 /// other fd keeps the partial-write rule, and an error before any byte went
 /// in is the call's answer.
-fn after_write_error(e: LxError, blocking_pipe: bool, written: usize) -> AfterWriteError {
-    if e == LxError::EAGAIN && blocking_pipe {
+pub(crate) fn after_write_error(e: LxError, waits: bool, written: usize) -> AfterWriteError {
+    if e == LxError::EAGAIN && waits {
         AfterWriteError::Wait
     } else if written > 0 {
         AfterWriteError::Partial
@@ -2571,18 +2591,20 @@ fn after_write_error(e: LxError, blocking_pipe: bool, written: usize) -> AfterWr
     }
 }
 
-/// `SIGPIPE` goes with `EPIPE` from a pipe (`pipe_write`), not with the
-/// `EPIPE` a sound device uses to say "underrun" (ALSA's `-EPIPE` is an
-/// `XRUN`, and no signal comes with it).
-fn sigpipe_due(e: LxError, pipe: bool) -> bool {
-    e == LxError::EPIPE && pipe
+/// `SIGPIPE` goes with `EPIPE` from a pipe (`pipe_write`) or a socket
+/// (`unix_stream_sendmsg`, `sk_stream_error`), not with the `EPIPE` a sound
+/// device uses to say "underrun" (ALSA's `-EPIPE` is an `XRUN`, and no
+/// signal comes with it).
+pub(crate) fn sigpipe_due(e: LxError, stream: bool) -> bool {
+    e == LxError::EPIPE && stream
 }
 
 #[cfg(test)]
 mod pipe_write_tests {
-    //! The two decisions `write(2)` makes about a pipe that Linux makes and
-    //! this kernel did not: a blocking writer waits for room, and a writer
-    //! with no reader gets `SIGPIPE` with its `EPIPE`.
+    //! The two decisions `write(2)` makes about a pipe or a unix socket
+    //! that Linux makes and this kernel did not: a blocking writer waits
+    //! for room, and a writer with no reader gets `SIGPIPE` with its
+    //! `EPIPE`.
 
     use super::{after_write_error, sigpipe_due, AfterWriteError, LxError};
 
@@ -2630,7 +2652,7 @@ mod pipe_write_tests {
     }
 
     #[test]
-    fn sigpipe_comes_with_epipe_from_a_pipe_and_nothing_else() {
+    fn sigpipe_comes_with_epipe_from_a_pipe_or_socket_and_nothing_else() {
         assert!(sigpipe_due(LxError::EPIPE, true));
         // ALSA's EPIPE is an underrun report, not a broken pipe: a player
         // that hits an XRUN recovers, it must not be killed.

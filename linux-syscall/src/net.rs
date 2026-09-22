@@ -5,12 +5,38 @@ use core::convert::TryInto;
 use core::mem::size_of;
 use kernel_hal::user::UserInOutPtr;
 use linux_object::{
-    fs::{split_path, FileLike, OpenFlags},
+    fs::{split_path, FileLike, OpenFlags, PollEvents},
     net::*,
+    thread::ThreadExt,
 };
 
 const MSG_DONTWAIT: usize = 0x40;
 const MSG_PEEK: usize = 0x2;
+const MSG_NOSIGNAL: usize = 0x4000;
+
+/// How a `send`-family call treats the two things its flags decide.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SendMode {
+    /// Wait for room in a full queue instead of answering `EAGAIN`.
+    wait: bool,
+    /// Pair `EPIPE` with `SIGPIPE`.
+    sigpipe: bool,
+}
+
+/// `sock_sendmsg` flag handling. Waiting is for a unix socket (whose
+/// `write` queues into a bounded peer buffer and says `EAGAIN` when it is
+/// full) unless the fd is `O_NONBLOCK` or the call says `MSG_DONTWAIT`; a
+/// TCP socket's `write` waits for window on its own. `SIGPIPE` is the
+/// default for a dead peer, and `MSG_NOSIGNAL` is the one way to opt out.
+///
+/// Both flags used to be ignored: a blocking `sendto`/`sendmsg` on a full
+/// unix socket came back `EAGAIN`, and `EPIPE` never killed anyone.
+fn send_mode(flags: usize, fd_non_block: bool, unix: bool) -> SendMode {
+    SendMode {
+        wait: unix && !fd_non_block && flags & MSG_DONTWAIT == 0,
+        sigpipe: flags & MSG_NOSIGNAL == 0,
+    }
+}
 
 /// `struct mmsghdr` from `<sys/socket.h>`: one batch entry for
 /// `sendmmsg`/`recvmmsg` — a plain `msghdr` plus the per-message transfer
@@ -492,8 +518,59 @@ impl Syscall<'_> {
         }
     }
 
+    /// Queue `data` on the socket behind `file_like` the way
+    /// `unix_stream_sendmsg` does for a caller that may block: every byte, or
+    /// the count that went in before the error, and `SIGPIPE` with a bare
+    /// `EPIPE` unless the call opted out.
+    async fn send_all(
+        &self,
+        file_like: &Arc<dyn FileLike>,
+        data: &[u8],
+        endpoint: Option<Endpoint>,
+        mode: SendMode,
+    ) -> SysResult {
+        use crate::file::{after_write_error, sigpipe_due, AfterWriteError};
+        let socket = file_like.as_socket()?;
+        let mut sent = 0usize;
+        loop {
+            match socket.write(&data[sent..], endpoint.clone()) {
+                Ok(n) => {
+                    sent += n;
+                    if !mode.wait || n == 0 || sent >= data.len() {
+                        return Ok(sent);
+                    }
+                }
+                // The same three answers `write(2)` gives a pipe.
+                Err(e) => match after_write_error(e, mode.wait, sent) {
+                    AfterWriteError::Wait => {
+                        file_like.async_poll(PollEvents::OUT).await?;
+                    }
+                    AfterWriteError::Partial => return Ok(sent),
+                    AfterWriteError::Fail => {
+                        if sigpipe_due(e, mode.sigpipe) {
+                            self.thread
+                                .lock_linux()
+                                .signals
+                                .insert(linux_object::signal::Signal::SIGPIPE);
+                        }
+                        return Err(e);
+                    }
+                },
+            }
+        }
+    }
+
+    /// The send mode for `file_like` under `flags`.
+    fn send_mode_for(&self, file_like: &Arc<dyn FileLike>, flags: usize) -> SendMode {
+        send_mode(
+            flags,
+            file_like.flags().contains(OpenFlags::NON_BLOCK),
+            file_like.downcast_ref::<UnixSocketState>().is_some(),
+        )
+    }
+
     /// transmit a message to another socket
-    pub fn sys_sendto(
+    pub async fn sys_sendto(
         &mut self,
         sockfd: usize,
         buf: UserInPtr<u8>,
@@ -519,10 +596,10 @@ impl Syscall<'_> {
         // `len`. TCP `write()` can perform a short write (queues min(len, free TX
         // space)); reporting `len` regardless makes the caller believe bytes it
         // never sent were delivered, silently truncating the stream.
-        let written = file_like
-            .clone()
-            .as_socket()?
-            .write(buf.as_slice(len)?, endpoint)?;
+        let mode = self.send_mode_for(&file_like, flags);
+        let written = self
+            .send_all(&file_like, buf.as_slice(len)?, endpoint, mode)
+            .await?;
         // Do not drain_net_poll here — busybox ping uses sendto; 32× poll_ifaces
         // blocks for a long time (smoltcp + SOCKETS lock). Sockets drive RX in read/poll.
         Ok(written)
@@ -600,22 +677,22 @@ impl Syscall<'_> {
 
     /// transmit a message to another socket
     #[allow(unsafe_code)]
-    pub fn sys_sendmsg(
+    pub async fn sys_sendmsg(
         &mut self,
         sockfd: usize,
         msg: UserInPtr<MsgHdr>,
-        _flags: usize,
+        flags: usize,
     ) -> SysResult {
         info!(
             "sys_sendmsg: sockfd:{:?}, msg:{:?}, flags:{}",
-            sockfd, msg, _flags
+            sockfd, msg, flags
         );
         let hdr = msg.read()?;
-        self.sendmsg_hdr(sockfd, &hdr)
+        self.sendmsg_hdr(sockfd, &hdr, flags).await
     }
 
     /// Core of `sendmsg` for an already-read header (shared with `sendmmsg`).
-    fn sendmsg_hdr(&mut self, sockfd: usize, hdr: &MsgHdr) -> SysResult {
+    async fn sendmsg_hdr(&mut self, sockfd: usize, hdr: &MsgHdr, flags: usize) -> SysResult {
         let iov_ptr: UserInPtr<IoVecIn> = hdr.msg_iov.as_addr().into();
         let iovlen = hdr.msg_iovlen;
         let iovs = iov_ptr.read_iovecs(iovlen)?;
@@ -696,11 +773,23 @@ impl Syscall<'_> {
         // a peer that reads a header first and the body second (seatd/libseat)
         // got "Bad file descriptor" — the fd was withheld until the whole
         // message had been read.
-        if !passed_fds.is_empty() {
+        let fds_queued = !passed_fds.is_empty();
+        if fds_queued {
             let _ = socket.send_fds(passed_fds);
         }
-        let written = socket.write(&data, endpoint)?;
-        Ok(written)
+        let mode = self.send_mode_for(&file_like, flags);
+        let sent = self.send_all(&file_like, &data, endpoint, mode).await;
+        // A message that did not go in takes its descriptors with it, as the
+        // skb they rode on is freed on Linux. Leaving them queued meant the
+        // caller's retry of the same `sendmsg` (the normal answer to EAGAIN
+        // on a non-blocking socket) delivered every fd twice, and the peer
+        // paired the duplicates with the next messages' requests.
+        if fds_queued && sent.is_err() {
+            if let Some(unix) = file_like.downcast_ref::<UnixSocketState>() {
+                unix.retract_fds();
+            }
+        }
+        sent
     }
 
     /// receive messages from a socket
@@ -1054,12 +1143,12 @@ impl Syscall<'_> {
     /// Firefox name lookup spammed `unknown syscall: SENDMMSG` and fell back.
     /// Sequential delegation to the sendmsg core; each entry's `msg_len` is
     /// written back. On error: fail if nothing was sent, else report the count.
-    pub fn sys_sendmmsg(
+    pub async fn sys_sendmmsg(
         &mut self,
         sockfd: usize,
         msgvec: UserInOutPtr<u8>,
         vlen: usize,
-        _flags: usize,
+        flags: usize,
     ) -> SysResult {
         info!(
             "sys_sendmmsg: sockfd:{}, msgvec:{:?}, vlen:{}",
@@ -1072,7 +1161,7 @@ impl Syscall<'_> {
         for i in 0..vlen.min(MMSG_MAX) {
             let hdr_ptr: UserInPtr<MsgHdr> = (base + i * stride).into();
             let hdr = hdr_ptr.read()?;
-            match self.sendmsg_hdr(sockfd, &hdr) {
+            match self.sendmsg_hdr(sockfd, &hdr, flags).await {
                 Ok(n) => {
                     let mut len_ptr: UserOutPtr<u32> =
                         (base + i * stride + core::mem::size_of::<MsgHdr>()).into();
@@ -1399,5 +1488,41 @@ mod scm_rights_tests {
         assert_eq!(sockopt_out_len(12, 12), 12);
         assert_eq!(sockopt_out_len(64, 12), 12);
         assert_eq!(sockopt_out_len(0, 12), 0);
+    }
+}
+
+#[cfg(test)]
+mod send_mode_tests {
+    //! `sock_sendmsg` flag handling for `sendto`/`sendmsg`/`sendmmsg`, which
+    //! ignored `flags` altogether: `MSG_DONTWAIT` and `MSG_NOSIGNAL` are the
+    //! two a stream client leans on (libwayland sends with both).
+
+    use super::{send_mode, MSG_DONTWAIT, MSG_NOSIGNAL, MSG_PEEK};
+
+    #[test]
+    fn a_blocking_unix_socket_waits_and_gets_sigpipe_by_default() {
+        let mode = send_mode(0, false, true);
+        assert!(mode.wait);
+        assert!(mode.sigpipe);
+        // Unrelated flags change nothing.
+        assert_eq!(send_mode(MSG_PEEK, false, true), mode);
+    }
+
+    #[test]
+    fn dontwait_or_o_nonblock_or_another_family_means_no_waiting() {
+        assert!(!send_mode(MSG_DONTWAIT, false, true).wait);
+        assert!(!send_mode(0, true, true).wait);
+        // TCP's `write` waits for window itself; UDP never queues.
+        assert!(!send_mode(0, false, false).wait);
+        // None of that touches the signal.
+        assert!(send_mode(MSG_DONTWAIT, true, false).sigpipe);
+    }
+
+    #[test]
+    fn nosignal_is_the_one_way_out_of_sigpipe() {
+        let mode = send_mode(MSG_NOSIGNAL, false, true);
+        assert!(!mode.sigpipe);
+        assert!(mode.wait, "MSG_NOSIGNAL says nothing about waiting");
+        assert!(!send_mode(MSG_NOSIGNAL | MSG_DONTWAIT, false, true).wait);
     }
 }

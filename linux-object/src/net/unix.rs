@@ -28,6 +28,47 @@ lazy_static! {
 
 const MAX_UNIX_SOCKET_REGISTRY: usize = 1024;
 
+/// Bound on one end's inbound queue: what a peer that never reads can pin
+/// in the fixed kernel heap. Linux bounds the same thing by `sk_sndbuf`.
+pub const UNIX_STREAM_BUF_MAX: usize = 4 * 1024 * 1024;
+
+/// What a writer (or a `POLLOUT` poller) needs to know about its peer's
+/// inbound queue, read under the *peer's* lock.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PeerQueue {
+    /// Bytes the queue can still take.
+    space: usize,
+    /// The peer shut its receive side: a write answers `EPIPE` at once.
+    read_closed: bool,
+}
+
+/// `unix_writable`: whether a write on this end would return without
+/// waiting. `None` is "no live peer" (`ENOTCONN`/`EPIPE`, immediate). With a
+/// peer, a shut write side or a peer that stopped reading answer at once
+/// (`EPIPE`), and otherwise it is a matter of room in the peer's queue.
+///
+/// This used to be "the peer is alive", full queue or not, so a blocking
+/// `write` on a full socket came back `EAGAIN` -- an errno only a
+/// non-blocking fd may see -- and `poll(POLLOUT)` said "go ahead" to a
+/// writer that could not.
+fn write_would_not_block(write_closed: bool, peer: Option<PeerQueue>) -> bool {
+    match peer {
+        None => true,
+        Some(peer) => write_closed || peer.read_closed || peer.space > 0,
+    }
+}
+
+/// Wake whoever waits for `WRITABLE` on `bus` without leaving the flag on.
+///
+/// The flag is deliberately not latched (see `connect_pair`): every fresh
+/// `poll`/`epoll` re-scan subscribes anew, and `EventBus::subscribe` fires
+/// at once on any set flag. A set-then-clear is one transition, seen only by
+/// the callbacks that asked for `WRITABLE`, and leaves nothing behind.
+fn pulse_writable(bus: &mut EventBus) {
+    bus.set(Event::WRITABLE);
+    bus.clear(Event::WRITABLE);
+}
+
 /// Snapshot the bound-socket registry for `/proc/net/unix`:
 /// `(path, strong reference count, is_listening)` per live entry, sorted by
 /// path so the listing is stable across reads.
@@ -106,6 +147,27 @@ struct UnixInner {
     pending_fds: VecDeque<(usize, Vec<Arc<dyn FileLike>>)>,
 }
 
+impl UnixInner {
+    /// Room left in this end's inbound queue.
+    fn send_space(&self) -> usize {
+        UNIX_STREAM_BUF_MAX.saturating_sub(self.buffer.len())
+    }
+
+    /// What a peer writing into this end wants to know.
+    fn as_peer_queue(&self) -> PeerQueue {
+        PeerQueue {
+            space: self.send_space(),
+            read_closed: self.read_closed,
+        }
+    }
+
+    /// The live peer, if any. The caller drops our lock before locking it
+    /// (self→peer nested inside peer→self is the AB-BA cycle `write` names).
+    fn live_peer(&self) -> Option<Arc<Mutex<UnixInner>>> {
+        self.peer.as_ref().and_then(|w| w.upgrade())
+    }
+}
+
 impl Default for UnixSocketState {
     fn default() -> Self {
         Self {
@@ -167,6 +229,26 @@ impl UnixSocketState {
             let mut bi = b.inner.lock();
             bi.peer = Some(Arc::downgrade(&a.inner));
             bi.connected = true;
+        }
+    }
+
+    /// Take back the descriptors `send_fds` queued for a message that then
+    /// did not go in at all (`EAGAIN` on a non-blocking socket, `EPIPE`).
+    ///
+    /// The batch is the peer's last one and still sits at the byte offset
+    /// the failed message would have started at, which `write` did not
+    /// advance. A batch that a later message already rides on is left alone.
+    pub fn retract_fds(&self) {
+        let peer = self.inner.lock().live_peer();
+        if let Some(peer) = peer {
+            let mut pi = peer.lock();
+            if pi
+                .pending_fds
+                .back()
+                .is_some_and(|(offset, _)| *offset == pi.total_written)
+            {
+                pi.pending_fds.pop_back();
+            }
         }
     }
 
@@ -425,7 +507,15 @@ impl Future for UnixPollWait<'_> {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
-        let ready = {
+        // Everything that lives under our own lock: read-side readiness, and
+        // the waker subscription. For POLLOUT the deciding state (room in the
+        // peer's queue) lives under the *peer's* lock, which must not be taken
+        // inside ours; so the waker is parked FIRST and the peer looked at
+        // second. A drain that lands between the look and the park would be
+        // a lost wake (the pulse is a transition, not a latch); one that
+        // lands after the park fires the waker, and one before it is seen by
+        // the look.
+        let (ready, write_closed, peer) = {
             let mut inner = this.sock.inner.lock();
             let peer_gone =
                 inner.peer_closed || inner.peer.as_ref().is_none_or(|w| w.strong_count() == 0);
@@ -433,12 +523,10 @@ impl Future for UnixPollWait<'_> {
                 || (inner.is_listening && !inner.accept_queue.is_empty())
                 || inner.read_closed
                 || peer_gone;
-            let writable = !peer_gone;
             let want_read = this.events.contains(PollEvents::IN);
             let want_write = this.events.contains(PollEvents::OUT);
-            let ready = (want_read && readable)
-                || (want_write && (writable || peer_gone))
-                || (!want_read && !want_write);
+            let ready =
+                (want_read && readable) || (want_write && peer_gone) || (!want_read && !want_write);
             if ready {
                 if let Some(id) = this.sub_id.take() {
                     inner.eventbus.unsubscribe(id);
@@ -467,10 +555,24 @@ impl Future for UnixPollWait<'_> {
                     true
                 }));
             }
-            ready
+            let peer = if !ready && want_write {
+                inner.live_peer()
+            } else {
+                None
+            };
+            (ready, inner.write_closed, peer)
         };
+        // POLLOUT with a live peer: ready once a write would not block.
+        let ready = ready
+            || peer.is_some_and(|peer| {
+                let queue = peer.lock().as_peer_queue();
+                write_would_not_block(write_closed, Some(queue))
+            });
         if !ready {
             return Poll::Pending;
+        }
+        if let Some(id) = this.sub_id.take() {
+            this.sock.inner.lock().eventbus.unsubscribe(id);
         }
         let (read, write, error) = Socket::poll(this.sock, this.events);
         Poll::Ready(Ok(PollStatus {
@@ -521,10 +623,20 @@ impl Socket for UnixSocketState {
                     data[..front.len()].copy_from_slice(front);
                     data[front.len()..len].copy_from_slice(&back[..len - front.len()]);
                 }
+                let was_full = inner.send_space() == 0;
                 inner.buffer.drain(..len);
                 inner.total_read += len;
                 if inner.buffer.is_empty() {
                     inner.eventbus.clear(Event::READABLE);
+                }
+                // A writer parks only once it has seen the queue full (its
+                // `write` got `EAGAIN`, `UnixPollWait` found no room), so a
+                // drain from full is the one that has anyone to wake. The
+                // wake goes to the *peer's* bus, after our lock is released.
+                let peer = if was_full { inner.live_peer() } else { None };
+                drop(inner);
+                if let Some(peer) = peer {
+                    pulse_writable(&mut peer.lock().eventbus);
                 }
                 return (Ok(len), Endpoint::Unix(path));
             }
@@ -602,8 +714,7 @@ impl Socket for UnixSocketState {
         // syscall layer already loops on short writes); return EAGAIN when the
         // buffer is completely full. This method is synchronous and never blocked
         // before, so no blocking behavior is lost.
-        const UNIX_STREAM_BUF_MAX: usize = 4 * 1024 * 1024;
-        let space = UNIX_STREAM_BUF_MAX.saturating_sub(pi.buffer.len());
+        let space = pi.send_space();
         if space == 0 {
             return Err(LxError::EAGAIN);
         }
@@ -711,23 +822,33 @@ impl Socket for UnixSocketState {
         }
         // Take the peer ref under our lock but drop our lock before locking the
         // peer, to avoid the self→peer / peer→self AB-BA deadlock (see `write`).
+        let shut_rd = howto == 0 || howto == 2;
+        let shut_wr = howto == 1 || howto == 2;
         let peer = {
             let mut inner = self.inner.lock();
-            if howto == 0 || howto == 2 {
+            if shut_rd {
                 inner.read_closed = true;
                 inner.eventbus.set(Event::READABLE); // wake blocked reader
             }
-            if howto == 1 || howto == 2 {
+            if shut_wr {
                 inner.write_closed = true;
-                inner.peer.as_ref().and_then(|w| w.upgrade())
-            } else {
-                None
+                // A writer of ours parked on a full peer now gets EPIPE.
+                pulse_writable(&mut inner.eventbus);
             }
+            inner.live_peer()
         };
         if let Some(peer) = peer {
             let mut pi = peer.lock();
-            pi.peer_closed = true;
-            pi.eventbus.set(Event::READABLE); // wake blocked reader
+            if shut_wr {
+                pi.peer_closed = true;
+                pi.eventbus.set(Event::READABLE); // wake blocked reader
+            }
+            if shut_rd {
+                // `unix_shutdown` wakes the peer too: its writer parked on
+                // our full queue must learn that nobody will drain it (EPIPE)
+                // instead of sleeping until we close.
+                pulse_writable(&mut pi.eventbus);
+            }
         }
         Ok(0)
     }
@@ -843,14 +964,23 @@ impl Socket for UnixSocketState {
     }
 
     fn poll(&self, _events: PollEvents) -> (bool, bool, bool) {
-        let inner = self.inner.lock();
-        // `read_closed` counts as readable: a read would return immediately
-        // (EOF), which is exactly what POLLIN promises.
-        let readable = !inner.buffer.is_empty()
-            || (inner.is_listening && !inner.accept_queue.is_empty())
-            || inner.peer_closed
-            || inner.read_closed;
-        let writable = inner.peer.as_ref().is_some_and(|w| w.strong_count() > 0);
+        let (readable, write_closed, peer) = {
+            let inner = self.inner.lock();
+            // `read_closed` counts as readable: a read would return immediately
+            // (EOF), which is exactly what POLLIN promises.
+            let readable = !inner.buffer.is_empty()
+                || (inner.is_listening && !inner.accept_queue.is_empty())
+                || inner.peer_closed
+                || inner.read_closed;
+            (readable, inner.write_closed, inner.live_peer())
+        };
+        // POLLOUT is "a write would not block": a live peer with room, or one
+        // a write answers at once. The peer's queue is read under its own
+        // lock, after ours is gone.
+        let writable = peer.is_some_and(|peer| {
+            let queue = peer.lock().as_peer_queue();
+            write_would_not_block(write_closed, Some(queue))
+        });
         (readable, writable, false)
     }
 }
@@ -1461,5 +1591,281 @@ mod fd_passing_tests {
     fn a_socket_with_nothing_queued_hands_back_nothing() {
         let (_a, b) = pair();
         assert!(Socket::recv_fds(&*b, 8).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod write_room_tests {
+    //! `POLLOUT` and the blocking writer on a unix stream socket, which
+    //! Linux decides from the room in the peer's queue and this kernel
+    //! decided from the peer being alive: a writer facing a full queue was
+    //! told "go ahead", got `EAGAIN` from a blocking fd, and had nobody to
+    //! wake it once the reader drained.
+
+    use super::*;
+    use alloc::task::Wake;
+    use alloc::vec;
+    use core::sync::atomic::{AtomicUsize, Ordering};
+    use core::task::Waker;
+
+    /// A waker that counts its wakes.
+    struct Counter(AtomicUsize);
+
+    impl Wake for Counter {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    fn counting_waker() -> (Arc<Counter>, Waker) {
+        let counter = Arc::new(Counter(AtomicUsize::new(0)));
+        (counter.clone(), Waker::from(counter))
+    }
+
+    fn pair() -> (Arc<UnixSocketState>, Arc<UnixSocketState>) {
+        let a = UnixSocketState::new();
+        let b = UnixSocketState::new();
+        UnixSocketState::connect_pair(&a, &b);
+        (a, b)
+    }
+
+    /// A read that has data waiting resolves on its first poll.
+    fn read_now(sock: &UnixSocketState, buf: &mut [u8]) -> usize {
+        async_std::task::block_on(Socket::read(sock, buf))
+            .0
+            .unwrap()
+    }
+
+    /// Write from `a` until its peer's queue is full.
+    fn fill(a: &UnixSocketState) {
+        let chunk = vec![7u8; 1 << 20];
+        loop {
+            match Socket::write(a, &chunk, None) {
+                Ok(_) => {}
+                Err(LxError::EAGAIN) => return,
+                Err(e) => panic!("filling: {:?}", e),
+            }
+        }
+    }
+
+    fn poll_out<'a>(
+        sock: &'a UnixSocketState,
+        waker: &Waker,
+    ) -> (Poll<LxResult<PollStatus>>, UnixPollWait<'a>) {
+        let mut fut = UnixPollWait {
+            sock,
+            events: PollEvents::OUT,
+            sub_id: None,
+        };
+        let mut cx = Context::from_waker(waker);
+        let polled = Pin::new(&mut fut).poll(&mut cx);
+        (polled, fut)
+    }
+
+    #[test]
+    fn a_write_would_not_block_without_a_peer_or_with_room_and_blocks_on_a_full_queue() {
+        // No live peer: ENOTCONN/EPIPE come back at once.
+        assert!(write_would_not_block(false, None));
+        let room = PeerQueue {
+            space: 1,
+            read_closed: false,
+        };
+        let full = PeerQueue {
+            space: 0,
+            read_closed: false,
+        };
+        assert!(write_would_not_block(false, Some(room)));
+        assert!(!write_would_not_block(false, Some(full)));
+        // A shut write side, or a peer that stopped reading, answer EPIPE at
+        // once whatever the queue holds.
+        assert!(write_would_not_block(true, Some(full)));
+        assert!(write_would_not_block(
+            false,
+            Some(PeerQueue {
+                space: 0,
+                read_closed: true,
+            })
+        ));
+    }
+
+    #[test]
+    fn the_queue_stops_at_its_bound_and_pollout_says_so() {
+        let (a, b) = pair();
+        assert!(
+            Socket::poll(&*a, PollEvents::OUT).1,
+            "fresh pair is writable"
+        );
+        fill(&a);
+        assert_eq!(b.inner.lock().buffer.len(), UNIX_STREAM_BUF_MAX);
+        assert!(
+            !Socket::poll(&*a, PollEvents::OUT).1,
+            "POLLOUT on a full queue used to say writable"
+        );
+        // The bound is a stream bound: a write takes what fits.
+        let mut buf = [0u8; 10];
+        assert_eq!(read_now(&b, &mut buf), 10);
+        assert_eq!(Socket::write(&*a, &[1u8; 64], None).unwrap(), 10);
+        assert!(!Socket::poll(&*a, PollEvents::OUT).1);
+    }
+
+    #[test]
+    fn a_writer_parked_on_a_full_queue_is_woken_by_a_read_and_nothing_stays_latched() {
+        let (a, b) = pair();
+        fill(&a);
+        let (wakes, waker) = counting_waker();
+        let (polled, fut) = poll_out(&a, &waker);
+        assert!(polled.is_pending(), "no room: the writer must park");
+        assert!(fut.sub_id.is_some(), "parked means a waker on our bus");
+        assert_eq!(wakes.0.load(Ordering::SeqCst), 0);
+
+        let mut buf = [0u8; 1];
+        assert_eq!(read_now(&b, &mut buf), 1);
+        assert_eq!(
+            wakes.0.load(Ordering::SeqCst),
+            1,
+            "the drain of a full queue must wake the parked writer"
+        );
+        // The wake is a transition, not a latch: nothing is left on the bus
+        // for the next POLLIN re-scan to trip over (the labwc busy-spin).
+        assert!(!a.inner.lock().eventbus.events().contains(Event::WRITABLE));
+
+        let mut fut = fut;
+        let mut cx = Context::from_waker(&waker);
+        match Pin::new(&mut fut).poll(&mut cx) {
+            Poll::Ready(Ok(status)) => assert!(status.write),
+            other => panic!(
+                "after the drain the writer must be ready: {:?}",
+                other.is_pending()
+            ),
+        }
+        assert!(
+            fut.sub_id.is_none(),
+            "a ready future leaves no waker behind"
+        );
+    }
+
+    #[test]
+    fn a_drain_that_does_not_come_from_full_wakes_nobody() {
+        // Not a parked writer's concern, but a POLLIN re-scan's: every wake
+        // on this bus is a pass over its callbacks, so a socket that never
+        // filled must not pulse on every read.
+        let (a, b) = pair();
+        Socket::write(&*a, b"hola", None).unwrap();
+        let (wakes, waker) = counting_waker();
+        let id = subscribe_waker_on(&a, Event::WRITABLE, &waker);
+        let mut buf = [0u8; 4];
+        assert_eq!(read_now(&b, &mut buf), 4);
+        assert_eq!(wakes.0.load(Ordering::SeqCst), 0);
+        a.inner.lock().eventbus.unsubscribe(id);
+    }
+
+    fn subscribe_waker_on(sock: &UnixSocketState, mask: Event, waker: &Waker) -> u64 {
+        let mut inner = sock.inner.lock();
+        crate::sync::subscribe_waker(&mut inner.eventbus, mask, waker).expect("subscribed")
+    }
+
+    #[test]
+    fn the_peer_shutting_its_read_side_wakes_a_parked_writer_into_epipe() {
+        let (a, b) = pair();
+        fill(&a);
+        let (wakes, waker) = counting_waker();
+        let (polled, _fut) = poll_out(&a, &waker);
+        assert!(polled.is_pending());
+        Socket::shutdown(&*b, 0).unwrap();
+        assert_eq!(
+            wakes.0.load(Ordering::SeqCst),
+            1,
+            "SHUT_RD on the peer used to leave our writer asleep until close"
+        );
+        assert!(Socket::poll(&*a, PollEvents::OUT).1, "EPIPE does not block");
+        assert!(matches!(
+            Socket::write(&*a, b"x", None),
+            Err(LxError::EPIPE)
+        ));
+    }
+
+    #[test]
+    fn shutting_our_own_write_side_wakes_our_parked_writer() {
+        let (a, _b) = pair();
+        fill(&a);
+        let (wakes, waker) = counting_waker();
+        let (polled, _fut) = poll_out(&a, &waker);
+        assert!(polled.is_pending());
+        Socket::shutdown(&*a, 1).unwrap();
+        assert_eq!(wakes.0.load(Ordering::SeqCst), 1);
+        assert!(Socket::poll(&*a, PollEvents::OUT).1);
+        assert!(matches!(
+            Socket::write(&*a, b"x", None),
+            Err(LxError::EPIPE)
+        ));
+    }
+
+    #[test]
+    fn a_peer_that_goes_away_wakes_a_parked_writer() {
+        let (a, b) = pair();
+        fill(&a);
+        let (wakes, waker) = counting_waker();
+        let (polled, fut) = poll_out(&a, &waker);
+        assert!(polled.is_pending());
+        drop(b);
+        assert_eq!(wakes.0.load(Ordering::SeqCst), 1);
+        let mut fut = fut;
+        let mut cx = Context::from_waker(&waker);
+        assert!(Pin::new(&mut fut).poll(&mut cx).is_ready());
+    }
+
+    /// The whole round trip the syscall layer runs for a blocking writer:
+    /// `write` until `EAGAIN`, `async_poll(OUT)`, again -- against a reader
+    /// that drains slowly. Every byte must arrive, in order.
+    #[async_std::test]
+    async fn a_blocking_writer_gets_every_byte_through_a_slow_reader() {
+        let (a, b) = pair();
+        let total = UNIX_STREAM_BUF_MAX + 3 * (1 << 20) + 17;
+        let writer = {
+            let a = a.clone();
+            async_std::task::spawn(async move {
+                let chunk = vec![0x5au8; 1 << 20];
+                let mut sent = 0usize;
+                while sent < total {
+                    let want = (total - sent).min(chunk.len());
+                    match Socket::write(&*a, &chunk[..want], None) {
+                        Ok(n) => sent += n,
+                        Err(LxError::EAGAIN) => {
+                            FileLike::async_poll(&*a, PollEvents::OUT).await.unwrap();
+                        }
+                        Err(e) => panic!("writer: {:?}", e),
+                    }
+                }
+                sent
+            })
+        };
+        let mut got = 0usize;
+        let mut buf = vec![0u8; 256 * 1024];
+        while got < total {
+            async_std::task::sleep(core::time::Duration::from_millis(1)).await;
+            let (r, _) = Socket::read(&*b, &mut buf).await;
+            let n = r.unwrap();
+            assert!(buf[..n].iter().all(|&x| x == 0x5a));
+            got += n;
+        }
+        assert_eq!(writer.await, total);
+        assert_eq!(got, total);
+    }
+
+    #[test]
+    fn retracting_takes_back_the_batch_no_message_rode_on_and_only_that_one() {
+        let (a, b) = pair();
+        let file: Arc<dyn FileLike> = UnixSocketState::new();
+        Socket::send_fds(&*a, vec![file.clone()]).unwrap();
+        assert_eq!(b.inner.lock().pending_fds.len(), 1);
+        // The message failed outright: the fds go with it.
+        a.retract_fds();
+        assert_eq!(b.inner.lock().pending_fds.len(), 0);
+
+        // A batch whose message did go in is not ours to take back.
+        Socket::send_fds(&*a, vec![file]).unwrap();
+        Socket::write(&*a, b"hola", None).unwrap();
+        a.retract_fds();
+        assert_eq!(b.inner.lock().pending_fds.len(), 1);
     }
 }
