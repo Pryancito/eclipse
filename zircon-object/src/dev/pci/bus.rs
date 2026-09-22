@@ -9,15 +9,91 @@ use super::{
 use crate::dev::Interrupt;
 use crate::object::*;
 use crate::vm::{kernel_allocate_physical, CachePolicy, MMUFlags, PhysAddr, VirtAddr};
-use crate::ZxResult;
+use crate::{ZxError, ZxResult};
 
 use alloc::sync::{Arc, Weak};
 use alloc::{collections::BTreeMap, vec::Vec};
-use core::cmp::min;
+use core::cmp::{max, min};
 use core::marker::{Send, Sync};
 use kernel_hal::sync::Mutex;
 use lazy_static::*;
 use region_alloc::RegionAllocator;
+
+/// How an MMIO window is split between the allocator below 4 GiB and the one
+/// above it, as `(base, size)` for each half.
+///
+/// A window that straddles the boundary belongs to both. The high half used
+/// to be handed `end` where a size was expected, so a window reaching past
+/// 4 GiB registered everything from the boundary up to its own end *plus*
+/// four gigabytes — address space that is not the PCI window at all, and
+/// that a BAR could then be allocated over. QEMU's window lies entirely
+/// below 4 GiB, so the high half never ran.
+#[allow(clippy::type_complexity)]
+fn split_mmio_window(base: u64, size: u64) -> ZxResult<(Option<(u64, u64)>, Option<(u64, u64)>)> {
+    const BOUNDARY: u64 = u32::MAX as u64 + 1;
+    let end = base.checked_add(size).ok_or(ZxError::INVALID_ARGS)?;
+    let lo = if base < BOUNDARY {
+        Some((base, min(BOUNDARY - base, size)))
+    } else {
+        None
+    };
+    let hi = if end > BOUNDARY {
+        let hi_base = max(base, BOUNDARY);
+        Some((hi_base, end - hi_base))
+    } else {
+        None
+    };
+    Ok((lo, hi))
+}
+
+/// Whether two inclusive ranges of bus numbers share a bus.
+fn bus_ranges_overlap(a: (u8, u8), b: (u8, u8)) -> bool {
+    a.0 <= b.1 && b.0 <= a.1
+}
+
+/// Whether an ECAM window may be added, given the windows already mapped.
+///
+/// Two windows claiming the same bus would give one function two
+/// configuration spaces at different addresses. The test for that was
+/// written the wrong way round — it asked whether the ranges were
+/// *disjoint* — so a second host bridge's window was refused and an
+/// overlapping one was taken. It also only looked at the neighbour below,
+/// missing a window that starts lower and reaches over an existing one, and
+/// its last clause computed `bus_end + 1` on a `u8`, which overflows on bus
+/// 255.
+fn check_ecam_region(
+    ecam: &PciEcamRegion,
+    mut existing: impl Iterator<Item = (u8, u8)>,
+) -> ZxResult {
+    if ecam.bus_start > ecam.bus_end {
+        return Err(ZxError::INVALID_ARGS);
+    }
+    let bus_count = (ecam.bus_end - ecam.bus_start) as usize + 1;
+    if ecam.size != bus_count * PCIE_ECAM_BYTES_PER_BUS {
+        return Err(ZxError::INVALID_ARGS);
+    }
+    let want = (ecam.bus_start, ecam.bus_end);
+    if existing.any(|have| bus_ranges_overlap(want, have)) {
+        return Err(ZxError::BAD_STATE);
+    }
+    Ok(())
+}
+
+/// Where one function's configuration space sits inside an ECAM window.
+///
+/// PCI Express 4.0 §7.2.2 lays the window out with the bus in bits 27:20,
+/// the device in 19:15 and the function in 14:12. A device or function
+/// number past the end of its field does not wrap, it carries into the next
+/// field — device 32 addresses the next bus, which is somebody else's
+/// registers — so it is refused rather than encoded.
+fn ecam_offset(bus_offset: u8, device_id: u8, function_id: u8) -> ZxResult<usize> {
+    if device_id as usize >= PCI_MAX_DEVICES_PER_BUS
+        || function_id as usize >= PCI_MAX_FUNCTIONS_PER_DEVICE
+    {
+        return Err(ZxError::INVALID_ARGS);
+    }
+    Ok((bus_offset as usize) << 20 | (device_id as usize) << 15 | (function_id as usize) << 12)
+}
 
 /// PCIE Bus Driver.
 pub struct PCIeBusDriver {
@@ -153,19 +229,16 @@ impl PCIeBusDriver {
             return Err(ZxError::INVALID_ARGS);
         }
         if aspace == PciAddrSpace::MMIO {
-            let u32_max: u64 = u32::MAX as u64;
-            let end = base + size;
-            if base <= u32_max {
-                let lo_size = min(u32_max + 1 - base, size);
+            let (lo, hi) = split_mmio_window(base, size)?;
+            if let Some((lo_base, lo_size)) = lo {
                 self.mmio_lo
                     .lock()
-                    .add_or_subtract(base as usize, lo_size as usize, is_add);
+                    .add_or_subtract(lo_base as usize, lo_size as usize, is_add);
             }
-            if end > u32_max + 1 {
-                let hi_size = min(end - (u32_max + 1), size);
+            if let Some((hi_base, hi_size)) = hi {
                 self.mmio_hi
                     .lock()
-                    .add_or_subtract((end - hi_size) as usize, end as usize, is_add);
+                    .add_or_subtract(hi_base as usize, hi_size as usize, is_add);
             }
         } else if aspace == PciAddrSpace::PIO {
             let end = base + size - 1;
@@ -382,24 +455,11 @@ pub struct MmioPcieAddressProvider {
 impl MmioPcieAddressProvider {
     /// Add a ECAM region.
     pub fn add_ecam(&self, ecam: PciEcamRegion) -> ZxResult {
-        if ecam.bus_start > ecam.bus_end {
-            return Err(ZxError::INVALID_ARGS);
-        }
-        let bus_count = (ecam.bus_end - ecam.bus_start) as usize + 1;
-        if ecam.size != bus_count * PCIE_ECAM_BYTES_PER_BUS {
-            return Err(ZxError::INVALID_ARGS);
-        }
         let mut inner = self.ecam_regions.lock();
-        if let Some((_key, value)) = inner.range(..=ecam.bus_start).last() {
-            // if intersect...
-            if ecam.bus_end <= value.ecam.bus_start
-                || value.ecam.bus_end <= ecam.bus_start
-                || bus_count == 0
-                || value.ecam.bus_start == value.ecam.bus_end + 1
-            {
-                return Err(ZxError::BAD_STATE);
-            }
-        }
+        check_ecam_region(
+            &ecam,
+            inner.values().map(|v| (v.ecam.bus_start, v.ecam.bus_end)),
+        )?;
         let vaddr = kernel_allocate_physical(
             ecam.size,
             ecam.phys_base as PhysAddr,
@@ -436,8 +496,7 @@ impl PCIeAddressProvider for MmioPcieAddressProvider {
             return Err(ZxError::NOT_FOUND);
         }
         let bus_id = bus_id - target.1.ecam.bus_start;
-        let offset =
-            (bus_id as usize) << 20 | (device_id as usize) << 15 | (function_id as usize) << 12;
+        let offset = ecam_offset(bus_id, device_id, function_id)?;
         let phys = target.1.ecam.phys_base as usize + offset;
         let vaddr = target.1.vaddr as usize + offset;
         Ok((phys, vaddr))
@@ -551,5 +610,239 @@ impl PcieDeviceKObject {
     /// Write the device's config.
     pub fn config_write(&self, offset: usize, width: usize, val: u32) -> ZxResult {
         self.device.device().config_write(offset, width, val)
+    }
+}
+
+#[cfg(test)]
+mod pci_window_tests {
+    use super::*;
+
+    const BOUNDARY: u64 = u32::MAX as u64 + 1;
+
+    fn ecam(bus_start: u8, bus_end: u8) -> PciEcamRegion {
+        PciEcamRegion {
+            phys_base: 0xE000_0000,
+            size: ((bus_end - bus_start) as usize + 1) * PCIE_ECAM_BYTES_PER_BUS,
+            bus_start,
+            bus_end,
+        }
+    }
+
+    // ---------- Splitting an MMIO window at 4 GiB ----------
+
+    #[test]
+    fn a_window_below_four_gigabytes_stays_below() {
+        // What QEMU hands out, which is why nothing else here ever ran.
+        assert_eq!(
+            split_mmio_window(0xC000_0000, 0x3EC0_0000),
+            Ok((Some((0xC000_0000, 0x3EC0_0000)), None))
+        );
+        // And one that ends exactly on the boundary is still all low.
+        assert_eq!(
+            split_mmio_window(0xC000_0000, 0x4000_0000),
+            Ok((Some((0xC000_0000, 0x4000_0000)), None))
+        );
+    }
+
+    #[test]
+    fn a_window_above_four_gigabytes_stays_above() {
+        assert_eq!(
+            split_mmio_window(BOUNDARY, 0x4_0000_0000),
+            Ok((None, Some((BOUNDARY, 0x4_0000_0000))))
+        );
+        assert_eq!(
+            split_mmio_window(0x10_0000_0000, 1 << 30),
+            Ok((None, Some((0x10_0000_0000, 1 << 30))))
+        );
+    }
+
+    #[test]
+    fn a_window_that_straddles_four_gigabytes_is_cut_in_two() {
+        // 2 GiB of window starting at 2 GiB: half below the boundary, half
+        // above. The high half is 2 GiB — not 6 GiB, which is what passing
+        // the window's end where a size belongs used to register, handing
+        // the allocator four gigabytes of address space that is not the PCI
+        // window and that a BAR could then be placed over.
+        assert_eq!(
+            split_mmio_window(0x8000_0000, 0x1_0000_0000),
+            Ok((
+                Some((0x8000_0000, 0x8000_0000)),
+                Some((BOUNDARY, 0x8000_0000))
+            ))
+        );
+    }
+
+    #[test]
+    fn the_two_halves_are_exactly_the_window_and_nothing_more() {
+        for (base, size) in [
+            (0u64, 1u64),
+            (0, BOUNDARY),
+            (0, BOUNDARY + 1),
+            (0x8000_0000, 0x1_0000_0000),
+            (BOUNDARY - 1, 2),
+            (BOUNDARY, 1),
+            (0xC000_0000, 0x3EC0_0000),
+            (0x10_0000_0000, 1 << 28),
+        ] {
+            let (lo, hi) = split_mmio_window(base, size).unwrap();
+            let covered: u64 = lo.map_or(0, |(_, s)| s) + hi.map_or(0, |(_, s)| s);
+            assert_eq!(covered, size, "ventana {:#x}+{:#x}", base, size);
+            if let Some((lo_base, lo_size)) = lo {
+                assert_eq!(lo_base, base);
+                assert!(lo_base + lo_size <= BOUNDARY);
+            }
+            if let Some((hi_base, hi_size)) = hi {
+                assert!(hi_base >= BOUNDARY);
+                assert_eq!(hi_base + hi_size, base + size);
+            }
+            if let (Some((lo_base, lo_size)), Some((hi_base, _))) = (lo, hi) {
+                assert_eq!(lo_base + lo_size, hi_base, "las mitades dejan un hueco");
+            }
+        }
+    }
+
+    #[test]
+    fn a_window_that_wraps_the_address_space_is_refused() {
+        assert_eq!(split_mmio_window(u64::MAX, 2), Err(ZxError::INVALID_ARGS));
+        assert_eq!(split_mmio_window(1, u64::MAX), Err(ZxError::INVALID_ARGS));
+    }
+
+    // ---------- Adding an ECAM window ----------
+
+    #[test]
+    fn two_bus_ranges_overlap_only_when_they_share_a_bus() {
+        assert!(bus_ranges_overlap((0, 7), (7, 15)));
+        assert!(bus_ranges_overlap((0, 255), (128, 128)));
+        assert!(bus_ranges_overlap((4, 4), (4, 4)));
+        assert!(!bus_ranges_overlap((0, 7), (8, 15)));
+        assert!(!bus_ranges_overlap((8, 15), (0, 7)));
+    }
+
+    #[test]
+    fn a_second_host_bridges_window_is_accepted() {
+        // The machine has one window for bus 0 and a second for the rest.
+        // This is the case the old test refused: it asked whether the two
+        // ranges were disjoint and called that an overlap.
+        let existing = [(0u8, 0u8)];
+        assert_eq!(
+            check_ecam_region(&ecam(1, 255), existing.iter().copied()),
+            Ok(())
+        );
+        assert_eq!(
+            check_ecam_region(&ecam(128, 255), existing.iter().copied()),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn a_window_that_claims_a_bus_twice_is_refused() {
+        let existing = [(8u8, 15u8)];
+        // Overlapping from above, from below, and swallowing it whole.
+        assert_eq!(
+            check_ecam_region(&ecam(12, 20), existing.iter().copied()),
+            Err(ZxError::BAD_STATE)
+        );
+        assert_eq!(
+            check_ecam_region(&ecam(0, 8), existing.iter().copied()),
+            Err(ZxError::BAD_STATE)
+        );
+        assert_eq!(
+            check_ecam_region(&ecam(0, 255), existing.iter().copied()),
+            Err(ZxError::BAD_STATE)
+        );
+        assert_eq!(
+            check_ecam_region(&ecam(8, 15), existing.iter().copied()),
+            Err(ZxError::BAD_STATE)
+        );
+        // With more than one window already mapped the clash can be with any
+        // of them; the old check only ever looked at the neighbour below.
+        let two = [(0u8, 3u8), (8u8, 15u8)];
+        assert_eq!(
+            check_ecam_region(&ecam(12, 20), two.iter().copied()),
+            Err(ZxError::BAD_STATE)
+        );
+        assert_eq!(
+            check_ecam_region(&ecam(2, 2), two.iter().copied()),
+            Err(ZxError::BAD_STATE)
+        );
+        // And the gap between them is still free.
+        assert_eq!(check_ecam_region(&ecam(4, 7), two.iter().copied()), Ok(()));
+    }
+
+    #[test]
+    fn a_window_reaching_the_last_bus_does_not_overflow() {
+        // The old check computed `bus_end + 1` on a `u8`.
+        let existing = [(255u8, 255u8)];
+        assert_eq!(
+            check_ecam_region(&ecam(0, 254), existing.iter().copied()),
+            Ok(())
+        );
+        assert_eq!(
+            check_ecam_region(&ecam(200, 255), existing.iter().copied()),
+            Err(ZxError::BAD_STATE)
+        );
+    }
+
+    #[test]
+    fn a_window_has_to_describe_the_buses_it_claims() {
+        assert_eq!(check_ecam_region(&ecam(0, 0), core::iter::empty()), Ok(()));
+        let backwards = PciEcamRegion {
+            phys_base: 0xE000_0000,
+            size: PCIE_ECAM_BYTES_PER_BUS,
+            bus_start: 8,
+            bus_end: 4,
+        };
+        assert_eq!(
+            check_ecam_region(&backwards, core::iter::empty()),
+            Err(ZxError::INVALID_ARGS)
+        );
+        let wrong_size = PciEcamRegion {
+            phys_base: 0xE000_0000,
+            size: PCIE_ECAM_BYTES_PER_BUS * 3,
+            bus_start: 0,
+            bus_end: 7,
+        };
+        assert_eq!(
+            check_ecam_region(&wrong_size, core::iter::empty()),
+            Err(ZxError::INVALID_ARGS)
+        );
+    }
+
+    // ---------- Finding a function inside a window ----------
+
+    #[test]
+    fn a_function_sits_where_the_specification_puts_it() {
+        assert_eq!(ecam_offset(0, 0, 0), Ok(0));
+        assert_eq!(ecam_offset(1, 0, 0), Ok(1 << 20));
+        assert_eq!(ecam_offset(0, 1, 0), Ok(1 << 15));
+        assert_eq!(ecam_offset(0, 0, 1), Ok(1 << 12));
+        assert_eq!(ecam_offset(0, 31, 7), Ok(31 << 15 | 7 << 12));
+        assert_eq!(ecam_offset(255, 31, 7), Ok(255 << 20 | 31 << 15 | 7 << 12));
+    }
+
+    #[test]
+    fn a_device_or_function_past_the_end_of_its_field_is_refused() {
+        // Device 32 does not wrap, it carries into the bus field: it would
+        // address the next bus, which is another device's registers.
+        assert_eq!(ecam_offset(0, 32, 0), Err(ZxError::INVALID_ARGS));
+        assert_eq!(ecam_offset(0, 255, 0), Err(ZxError::INVALID_ARGS));
+        assert_eq!(ecam_offset(0, 0, 8), Err(ZxError::INVALID_ARGS));
+        assert_eq!(ecam_offset(0, 0, 255), Err(ZxError::INVALID_ARGS));
+    }
+
+    #[test]
+    fn every_function_of_a_bus_gets_its_own_place_inside_that_bus() {
+        for dev in 0..PCI_MAX_DEVICES_PER_BUS as u8 {
+            for func in 0..PCI_MAX_FUNCTIONS_PER_DEVICE as u8 {
+                let offset = ecam_offset(3, dev, func).unwrap();
+                // Inside bus 3's own megabyte, and nowhere near bus 4's.
+                assert!(offset >= 3 << 20, "dev {} func {}", dev, func);
+                assert!(offset < 4 << 20, "dev {} func {}", dev, func);
+                assert_eq!(
+                    offset - (3 << 20) + 4096,
+                    (dev as usize * PCI_MAX_FUNCTIONS_PER_DEVICE + func as usize + 1) * 4096
+                );
+            }
+        }
     }
 }
