@@ -520,6 +520,11 @@ impl Process {
     }
 
     /// Check whether `condition` is allowed in the parent job's policy.
+    ///
+    /// All five actions a job may set are answered here. Three of them used to
+    /// fall into an `unimplemented!()`, and a job can set any of them through
+    /// `zx_job_set_policy`: reaching the condition afterwards panicked the
+    /// kernel from an ordinary syscall.
     pub fn check_policy(&self, condition: PolicyCondition) -> ZxResult {
         match self
             .policy
@@ -528,7 +533,27 @@ impl Process {
         {
             PolicyAction::Allow => Ok(()),
             PolicyAction::Deny => Err(ZxError::ACCESS_DENIED),
-            _ => unimplemented!(),
+            // Zircon raises a debug exception first and then allows or denies.
+            // There is no exception port wired up here, so the decision is all
+            // that is carried out, and the missing half is said out loud
+            // rather than panicked over.
+            PolicyAction::AllowException => {
+                warn!("job policy: {:?} allowed, exception not raised", condition);
+                Ok(())
+            }
+            PolicyAction::DenyException => {
+                warn!("job policy: {:?} denied, exception not raised", condition);
+                Err(ZxError::ACCESS_DENIED)
+            }
+            // Zircon terminates the process. Denying is the safe half of that,
+            // and the process at least cannot proceed as if it were allowed.
+            PolicyAction::Kill => {
+                warn!(
+                    "job policy: {:?} denied; the kill action is not implemented",
+                    condition
+                );
+                Err(ZxError::ACCESS_DENIED)
+            }
         }
     }
 
@@ -1121,16 +1146,48 @@ mod tests {
         assert!(inner.contains_thread(&thread) && !inner.contains_thread(&thread1));
     }
 
+    /// A job may set any of the five actions through `zx_job_set_policy`.
+    /// Three of them fell into an `unimplemented!()`, so reaching the
+    /// condition afterwards panicked the kernel from an ordinary syscall.
+    #[test]
+    fn every_policy_action_has_an_answer() {
+        let expected = [
+            (PolicyAction::Allow, None),
+            (PolicyAction::Deny, Some(ZxError::ACCESS_DENIED)),
+            (PolicyAction::AllowException, None),
+            (PolicyAction::DenyException, Some(ZxError::ACCESS_DENIED)),
+            (PolicyAction::Kill, Some(ZxError::ACCESS_DENIED)),
+        ];
+        for (action, answer) in expected {
+            let job = Job::root();
+            job.set_policy_basic(
+                SetPolicyOptions::Relative,
+                &[BasicPolicy {
+                    condition: PolicyCondition::NewChannel as u32,
+                    action: action as u32,
+                }],
+            )
+            .expect("failed to set policy");
+            let proc = Process::create(&job, "proc").expect("failed to create process");
+            assert_eq!(
+                proc.check_policy(PolicyCondition::NewChannel).err(),
+                answer,
+                "{:?}",
+                action
+            );
+        }
+    }
+
     #[test]
     fn check_policy() {
         let root_job = Job::root();
         let policy1 = BasicPolicy {
-            condition: PolicyCondition::BadHandle,
-            action: PolicyAction::Allow,
+            condition: PolicyCondition::BadHandle as u32,
+            action: PolicyAction::Allow as u32,
         };
         let policy2 = BasicPolicy {
-            condition: PolicyCondition::NewChannel,
-            action: PolicyAction::Deny,
+            condition: PolicyCondition::NewChannel as u32,
+            action: PolicyAction::Deny as u32,
         };
 
         assert!(root_job
