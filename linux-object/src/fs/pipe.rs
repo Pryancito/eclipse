@@ -26,6 +26,12 @@ pub enum PipeEnd {
 /// Linux default since 2.6.11.
 pub const PIPE_DEFAULT_CAPACITY: usize = 65536;
 
+/// `PIPE_BUF`: a write of at most this many bytes is atomic, which on a full
+/// pipe means it waits (or answers `EAGAIN`) rather than going in by halves.
+/// Linux keeps a pipe as page-sized slots, so "a slot is free" is also "a
+/// `PIPE_BUF` fits": that is what the write end's readiness means here.
+pub const PIPE_BUF: usize = 4096;
+
 /// Pipe inner data
 pub struct PipeData {
     /// pipe buffer
@@ -36,11 +42,41 @@ pub struct PipeData {
     read_cnt: i32,
     /// number of write ends
     write_cnt: i32,
-    /// Nominal capacity for `F_GETPIPE_SZ`/`F_SETPIPE_SZ` round-trips. The
-    /// byte queue itself is unbounded and writes never block on it — this
-    /// value is what programs that tune their pipes (`pv`, shells sizing
-    /// splice batches) get to read back.
+    /// Capacity of the byte queue, `F_GETPIPE_SZ`/`F_SETPIPE_SZ`. A write
+    /// that does not fit answers `Again` (the caller waits or reports
+    /// `EAGAIN`), and the write end reads as writable only with `PIPE_BUF`
+    /// of room. The queue used to be unbounded and every write went through:
+    /// `yes | sleep 10` grew the kernel heap by however fast `yes` runs.
     capacity: usize,
+}
+
+impl PipeData {
+    fn hangup_for(&self, direction: &PipeEnd) -> bool {
+        match direction {
+            PipeEnd::Read => self.write_cnt == 0,
+            PipeEnd::Write => self.read_cnt == 0,
+        }
+    }
+
+    /// Bytes a write may add right now.
+    fn room(&self) -> usize {
+        self.capacity.saturating_sub(self.buf.len())
+    }
+
+    /// The write end's readiness: a `PIPE_BUF` (or, for a pipe smaller than
+    /// that, the whole capacity) fits. Any smaller amount of room would let a
+    /// parked writer wake only to be told `Again` again.
+    fn has_room(&self) -> bool {
+        self.room() >= PIPE_BUF.min(self.capacity)
+    }
+
+    fn publish_room(&mut self) {
+        if self.has_room() {
+            self.eventbus.set(Event::WRITABLE);
+        } else {
+            self.eventbus.clear(Event::WRITABLE);
+        }
+    }
 }
 
 /// pipe struct
@@ -89,13 +125,16 @@ impl Drop for Pipe {
 impl Pipe {
     /// Create a pair of INode: (read, write)
     pub fn create_pair() -> (Pipe, Pipe) {
-        let inner = PipeData {
+        let mut inner = PipeData {
             buf: VecDeque::new(),
             eventbus: EventBus::default(),
             read_cnt: 1,
             write_cnt: 1,
             capacity: PIPE_DEFAULT_CAPACITY,
         };
+        // An empty pipe has room: a writer subscribing for `WRITABLE` before
+        // anything happened must not wait for a transition that never comes.
+        inner.publish_room();
         let data = Arc::new(Mutex::new(inner));
         (
             Pipe {
@@ -144,10 +183,17 @@ impl Pipe {
         self.data.lock().capacity
     }
 
-    /// Set the nominal capacity (`fcntl(F_SETPIPE_SZ)`); the caller has
-    /// already rounded and bounds-checked the value.
-    pub fn set_capacity(&self, cap: usize) {
-        self.data.lock().capacity = cap;
+    /// Set the capacity (`fcntl(F_SETPIPE_SZ)`); the caller has already
+    /// rounded and bounds-checked the value. Shrinking below what is queued
+    /// is refused with `Busy` (`EBUSY`), as `pipe_set_size` does.
+    pub fn set_capacity(&self, cap: usize) -> Result<()> {
+        let mut data = self.data.lock();
+        if cap < data.buf.len() {
+            return Err(FsError::Busy);
+        }
+        data.capacity = cap;
+        data.publish_room();
+        Ok(())
     }
 
     /// Copy up to `len` buffered bytes without consuming them (`tee(2)`), plus
@@ -177,7 +223,8 @@ impl Pipe {
     /// whether the pipe struct is writeable
     fn can_write(&self) -> bool {
         if let PipeEnd::Write = self.direction {
-            self.data.lock().read_cnt > 0
+            let data = self.data.lock();
+            data.read_cnt > 0 && data.has_room()
         } else {
             false
         }
@@ -210,6 +257,7 @@ impl INode for Pipe {
                 if data.buf.is_empty() {
                     data.eventbus.clear(Event::READABLE);
                 }
+                data.publish_room();
                 Ok(len)
             }
         } else {
@@ -218,14 +266,39 @@ impl INode for Pipe {
     }
 
     /// write to pipe
+    ///
+    /// `pipe_write`: with no reader left the answer is `Broken` (`EPIPE`, and
+    /// the syscall adds `SIGPIPE`), whatever the buffer holds. A write of at
+    /// most `PIPE_BUF` bytes goes in whole or not at all; a bigger one takes
+    /// what fits. `Again` is "no room for this", which a blocking writer
+    /// turns into a wait for [`Event::WRITABLE`] and a non-blocking one into
+    /// `EAGAIN`. Every write used to succeed in full: a reader that had gone
+    /// away was never noticed, so `yes | head -1` ran `yes` for ever, and the
+    /// queue grew without bound while it did.
     fn write_at(&self, _offset: usize, buf: &[u8]) -> Result<usize> {
         if let PipeEnd::Write = self.direction {
             let mut data = self.data.lock();
+            if data.read_cnt == 0 {
+                return Err(FsError::Broken);
+            }
+            let room = data.room();
+            let take = if buf.len() <= PIPE_BUF {
+                if room < buf.len() {
+                    return Err(FsError::Again);
+                }
+                buf.len()
+            } else {
+                if room == 0 {
+                    return Err(FsError::Again);
+                }
+                min(room, buf.len())
+            };
             // Copy-slice specialization (memcpy) instead of a per-byte
             // push_back loop.
-            data.buf.extend(buf);
+            data.buf.extend(&buf[..take]);
             data.eventbus.set(Event::READABLE);
-            Ok(buf.len())
+            data.publish_room();
+            Ok(take)
         } else {
             Ok(0)
         }
@@ -235,13 +308,13 @@ impl INode for Pipe {
     /// if the write end is not close and the buffer is empty, the read end will be block
     fn poll(&self) -> Result<PollStatus> {
         let data = self.data.lock();
-        let hangup = match self.direction {
-            PipeEnd::Read => data.write_cnt == 0,
-            PipeEnd::Write => data.read_cnt == 0,
-        };
+        let hangup = data.hangup_for(&self.direction);
         Ok(PollStatus {
             read: matches!(self.direction, PipeEnd::Read) && (!data.buf.is_empty() || hangup),
-            write: matches!(self.direction, PipeEnd::Write) && data.read_cnt > 0,
+            // Writable with a `PIPE_BUF` of room, as `pipe_poll` reports
+            // `POLLOUT` for a free slot; a full pipe is not writable, or a
+            // writer parked on it spins on `Again`.
+            write: matches!(self.direction, PipeEnd::Write) && data.read_cnt > 0 && data.has_room(),
             // Linux: POLLERR on the write end when no readers remain.
             error: matches!(self.direction, PipeEnd::Write) && hangup,
             hangup,
@@ -285,16 +358,15 @@ impl INode for Pipe {
                 // later pipe write wakes a freed task (UAF → delayed PAGE FAULT).
                 let this = self.get_mut();
                 let mut data = this.pipe.data.lock();
-                let hangup = match this.pipe.direction {
-                    PipeEnd::Read => data.write_cnt == 0,
-                    PipeEnd::Write => data.read_cnt == 0,
-                };
+                let hangup = data.hangup_for(&this.pipe.direction);
                 let ready = match this.pipe.direction {
                     // Readable data, or EOF/hangup when writers are gone.
                     PipeEnd::Read => !data.buf.is_empty() || hangup,
-                    // Writable while readers remain; hangup when they are gone
-                    // (must wake POLLHUP/POLLERR interest, not spin Pending).
-                    PipeEnd::Write => data.read_cnt > 0 || hangup,
+                    // Room to write while readers remain; hangup when they
+                    // are gone (must wake POLLHUP/POLLERR interest, not spin
+                    // Pending). A full pipe parks the writer here until a
+                    // read frees a `PIPE_BUF`.
+                    PipeEnd::Write => data.has_room() || hangup,
                 };
                 if ready {
                     if let Some(id) = this.sub_id.take() {
@@ -304,13 +376,19 @@ impl INode for Pipe {
                     return Poll::Ready(this.pipe.poll());
                 }
                 if this.sub_id.is_none() {
-                    let waker = cx.waker().clone();
-                    this.sub_id = data.eventbus.subscribe(Box::new({
-                        move |_| {
-                            waker.wake_by_ref();
-                            true
-                        }
-                    }));
+                    // Only this end's own transitions: the flags are latched
+                    // and `subscribe` fires at once on any that is already
+                    // set, so a reader parked on an empty pipe must not be
+                    // woken by the `WRITABLE` an empty pipe always carries
+                    // (nor a full pipe's writer by `READABLE`). `CLOSED` is
+                    // set only once a whole side is gone, which is a hangup
+                    // for whichever end is left to poll.
+                    let mask = match this.pipe.direction {
+                        PipeEnd::Read => Event::READABLE | Event::CLOSED | Event::ERROR,
+                        PipeEnd::Write => Event::WRITABLE | Event::CLOSED | Event::ERROR,
+                    };
+                    this.sub_id =
+                        crate::sync::subscribe_waker(&mut data.eventbus, mask, cx.waker());
                 }
                 Poll::Pending
             }
@@ -399,5 +477,146 @@ mod tests {
                 "each Drop must clear the parked pipe waker"
             );
         }
+    }
+
+    fn fill(w: &Pipe, n: usize) {
+        let bytes = alloc::vec![0xabu8; n];
+        assert_eq!(w.write_at(0, &bytes), Ok(n));
+    }
+
+    fn drain(r: &Pipe, n: usize) -> usize {
+        let mut sink = alloc::vec![0u8; n];
+        r.read_at(0, &mut sink).unwrap()
+    }
+
+    /// `pipe_write`: no reader left is `EPIPE`, whatever the pipe holds.
+    /// Every write used to succeed, so a writer never learnt its reader had
+    /// gone and `yes | head -1` never ended.
+    #[test]
+    fn a_write_with_no_reader_is_a_broken_pipe() {
+        let (r, w) = Pipe::create_pair();
+        assert_eq!(w.write_at(0, b"still read"), Ok(10));
+        drop(r);
+        assert_eq!(w.write_at(0, b"x"), Err(FsError::Broken));
+        let s = w.poll().unwrap();
+        assert!(
+            s.hangup && s.error && !s.write,
+            "POLLHUP|POLLERR, not POLLOUT"
+        );
+    }
+
+    /// The byte queue is bounded by the pipe's capacity: what does not fit
+    /// answers `Again`, and room comes back as the reader drains. It used to
+    /// take everything, for ever.
+    #[test]
+    fn the_queue_stops_at_its_capacity() {
+        let (r, w) = Pipe::create_pair();
+        fill(&w, PIPE_DEFAULT_CAPACITY);
+        assert_eq!(w.write_at(0, b"x"), Err(FsError::Again));
+        assert!(!w.poll().unwrap().write, "a full pipe is not writable");
+        assert_eq!(drain(&r, PIPE_BUF), PIPE_BUF);
+        assert!(w.poll().unwrap().write);
+        assert_eq!(w.write_at(0, b"x"), Ok(1));
+    }
+
+    /// `PIPE_BUF` atomicity: a write of at most that many bytes is all or
+    /// nothing, a bigger one takes what fits.
+    #[test]
+    fn a_small_write_is_all_or_nothing_and_a_big_one_takes_what_fits() {
+        let (_r, w) = Pipe::create_pair();
+        fill(&w, PIPE_DEFAULT_CAPACITY - 100);
+        let small = [0u8; 200];
+        assert_eq!(w.write_at(0, &small), Err(FsError::Again), "200 into 100");
+        let big = [0u8; PIPE_BUF + 1];
+        assert_eq!(w.write_at(0, &big), Ok(100), "what fits of a big write");
+        assert_eq!(w.write_at(0, &big), Err(FsError::Again), "nothing fits now");
+        // At the boundary a PIPE_BUF write still goes in whole.
+        assert_eq!(drain(&_r, PIPE_BUF), PIPE_BUF);
+        assert_eq!(w.write_at(0, &[0u8; PIPE_BUF]), Ok(PIPE_BUF));
+    }
+
+    /// The write end is ready only with a `PIPE_BUF` of room: with less, a
+    /// parked writer of an atomic chunk would be woken just to be told
+    /// `Again` again.
+    #[test]
+    fn writable_means_a_pipe_buf_of_room() {
+        let (r, w) = Pipe::create_pair();
+        fill(&w, PIPE_DEFAULT_CAPACITY - PIPE_BUF + 1);
+        assert!(!w.can_write());
+        assert!(!w.poll().unwrap().write);
+        assert!(!r.data.lock().eventbus.events().contains(Event::WRITABLE));
+        assert_eq!(drain(&r, 1), 1);
+        assert!(w.can_write());
+        assert!(w.poll().unwrap().write);
+        assert!(r.data.lock().eventbus.events().contains(Event::WRITABLE));
+    }
+
+    /// A fresh pipe advertises room on its bus from the start, so a writer
+    /// that subscribes for `WRITABLE` before anything happened is not left
+    /// waiting for a transition that never comes.
+    #[test]
+    fn a_fresh_pipe_advertises_room() {
+        let (r, w) = Pipe::create_pair();
+        assert!(r.data.lock().eventbus.events().contains(Event::WRITABLE));
+        assert!(w.can_write());
+        fill(&w, PIPE_DEFAULT_CAPACITY);
+        assert!(!w.data.lock().eventbus.events().contains(Event::WRITABLE));
+    }
+
+    /// The blocking write path parks on `async_poll` when the pipe is full
+    /// and must be woken by the read that frees room.
+    #[test]
+    fn a_writer_parked_on_a_full_pipe_is_woken_by_a_read() {
+        static WOKE: AtomicBool = AtomicBool::new(false);
+        WOKE.store(false, Ordering::SeqCst);
+
+        let (r, w) = Pipe::create_pair();
+        fill(&w, PIPE_DEFAULT_CAPACITY);
+        let waker = flag_waker(&WOKE);
+        let mut cx = Context::from_waker(&waker);
+        let mut fut = w.async_poll();
+        assert!(
+            matches!(fut.as_mut().poll(&mut cx), Poll::Pending),
+            "full: parks"
+        );
+        assert!(!WOKE.load(Ordering::SeqCst));
+        // A read that frees less than a PIPE_BUF is not the wake.
+        assert_eq!(drain(&r, 10), 10);
+        assert!(!WOKE.load(Ordering::SeqCst), "10 bytes of room is not room");
+        assert_eq!(drain(&r, PIPE_BUF), PIPE_BUF);
+        assert!(
+            WOKE.load(Ordering::SeqCst),
+            "a PIPE_BUF of room wakes the writer"
+        );
+        match fut.as_mut().poll(&mut cx) {
+            Poll::Ready(Ok(s)) => assert!(s.write),
+            other => panic!(
+                "expected Ready(write), got {:?}",
+                other.map(|r| r.map(|s| s.write))
+            ),
+        }
+    }
+
+    /// `F_SETPIPE_SZ` below what is queued is `EBUSY` (`pipe_set_size`);
+    /// growing it makes room at once.
+    #[test]
+    fn shrinking_the_capacity_below_what_is_queued_is_busy() {
+        let (_r, w) = Pipe::create_pair();
+        fill(&w, 10_000);
+        assert_eq!(w.set_capacity(PIPE_BUF), Err(FsError::Busy));
+        assert_eq!(w.capacity(), PIPE_DEFAULT_CAPACITY);
+        assert_eq!(
+            w.set_capacity(10_000),
+            Ok(()),
+            "exactly what is queued is fine"
+        );
+        assert!(!w.can_write(), "and leaves no room");
+        assert!(!w.data.lock().eventbus.events().contains(Event::WRITABLE));
+        assert_eq!(w.write_at(0, b"x"), Err(FsError::Again));
+        assert_eq!(w.set_capacity(16_384), Ok(()));
+        assert!(w.can_write());
+        // Growing publishes the room, so a writer parked on the old size wakes.
+        assert!(w.data.lock().eventbus.events().contains(Event::WRITABLE));
+        assert_eq!(w.write_at(0, b"x"), Ok(1));
     }
 }

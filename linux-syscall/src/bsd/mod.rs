@@ -124,9 +124,9 @@ impl Syscall<'_> {
         match num {
             // ---- file I/O ---------------------------------------------------
             sys::READ => BsdRet::from_result(self.sys_read(a0.into(), a1.into(), a2).await),
-            sys::WRITE => BsdRet::from_result(self.sys_write(a0.into(), a1.into(), a2)),
+            sys::WRITE => BsdRet::from_result(self.sys_write(a0.into(), a1.into(), a2).await),
             sys::READV => BsdRet::from_result(self.sys_readv(a0.into(), a1.into(), a2).await),
-            sys::WRITEV => BsdRet::from_result(self.sys_writev(a0.into(), a1.into(), a2)),
+            sys::WRITEV => BsdRet::from_result(self.sys_writev(a0.into(), a1.into(), a2).await),
             sys::PREAD => {
                 BsdRet::from_result(self.sys_pread(a0.into(), a1.into(), a2, a3 as _).await)
             }
