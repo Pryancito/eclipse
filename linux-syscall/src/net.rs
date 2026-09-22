@@ -14,6 +14,13 @@ const MSG_DONTWAIT: usize = 0x40;
 const MSG_PEEK: usize = 0x2;
 const MSG_NOSIGNAL: usize = 0x4000;
 
+/// A socket whose `write` answers `EAGAIN` for "queue full": unix (bounded
+/// peer buffer) and UDP (smoltcp's transmit ring). TCP waits on its own.
+pub(crate) fn queue_is_bounded(file_like: &Arc<dyn FileLike>) -> bool {
+    file_like.downcast_ref::<UnixSocketState>().is_some()
+        || file_like.downcast_ref::<UdpSocketState>().is_some()
+}
+
 /// How a `send`-family call treats the two things its flags decide.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct SendMode {
@@ -23,17 +30,17 @@ struct SendMode {
     sigpipe: bool,
 }
 
-/// `sock_sendmsg` flag handling. Waiting is for a unix socket (whose
-/// `write` queues into a bounded peer buffer and says `EAGAIN` when it is
-/// full) unless the fd is `O_NONBLOCK` or the call says `MSG_DONTWAIT`; a
+/// `sock_sendmsg` flag handling. Waiting is for a socket whose `write`
+/// queues into a bounded buffer and says `EAGAIN` when it is full (unix and
+/// UDP) unless the fd is `O_NONBLOCK` or the call says `MSG_DONTWAIT`; a
 /// TCP socket's `write` waits for window on its own. `SIGPIPE` is the
 /// default for a dead peer, and `MSG_NOSIGNAL` is the one way to opt out.
 ///
 /// Both flags used to be ignored: a blocking `sendto`/`sendmsg` on a full
 /// unix socket came back `EAGAIN`, and `EPIPE` never killed anyone.
-fn send_mode(flags: usize, fd_non_block: bool, unix: bool) -> SendMode {
+fn send_mode(flags: usize, fd_non_block: bool, bounded_queue: bool) -> SendMode {
     SendMode {
-        wait: unix && !fd_non_block && flags & MSG_DONTWAIT == 0,
+        wait: bounded_queue && !fd_non_block && flags & MSG_DONTWAIT == 0,
         sigpipe: flags & MSG_NOSIGNAL == 0,
     }
 }
@@ -565,7 +572,7 @@ impl Syscall<'_> {
         send_mode(
             flags,
             file_like.flags().contains(OpenFlags::NON_BLOCK),
-            file_like.downcast_ref::<UnixSocketState>().is_some(),
+            queue_is_bounded(file_like),
         )
     }
 
@@ -1512,7 +1519,7 @@ mod send_mode_tests {
     fn dontwait_or_o_nonblock_or_another_family_means_no_waiting() {
         assert!(!send_mode(MSG_DONTWAIT, false, true).wait);
         assert!(!send_mode(0, true, true).wait);
-        // TCP's `write` waits for window itself; UDP never queues.
+        // TCP's `write` waits for window itself.
         assert!(!send_mode(0, false, false).wait);
         // None of that touches the signal.
         assert!(send_mode(MSG_DONTWAIT, true, false).sigpipe);
