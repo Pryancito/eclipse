@@ -1107,19 +1107,16 @@ fn renderer_mode() -> Renderer {
 fn detect_renderer() -> Renderer {
     match fs::read_to_string("/sys/class/drm/card0/device/vendor") {
         Ok(v) if v.trim().eq_ignore_ascii_case("0x10de") => {
-            // NVIDIA: nouveau GL composites on real hardware via zink+NVK (the
-            // path this uAPI implements). build_child_env's Gl arm additionally
-            // pins GL clients to zink so they take the same NVK path instead of
-            // the unimplemented classic nvc0 GEM_PUSHBUF one (which would drop
-            // them to llvmpipe, whose buffers are not nouveau objects).
+            // NVIDIA: the nouveau uAPI path is available on real hardware when
+            // explicitly requested by cmdline.
             //
             // Same TWO-condition rule as the kernel and /etc/profile: the
             // NVIDIA GPU is the capability, `nvidia.nouveau_uapi` on the
             // cmdline is the request that actually TURNS THE KERNEL uAPI ON.
             // Without the flag the DRM node identifies as "zcore", NVK finds
-            // 0 GPUs, and returning Gl here only bought a doomed zink probe
-            // (labwc: EGL fails -> wlroots falls back to pixman anyway; GL
-            // clients: a zink pin that can never work). In practice this arm
+            // 0 GPUs, and returning Gl here only bought a doomed probe
+            // (labwc: EGL fails -> wlroots falls back to pixman anyway). In
+            // practice this arm
             // only runs WITHOUT the flag -- `GL=1` stamps `renderer=gl`
             // alongside the flag, so an explicit token wins before auto ever
             // gets asked -- but keying on the flag keeps a hand-written
@@ -1160,9 +1157,8 @@ fn detect_renderer() -> Renderer {
 }
 
 /// Is the GPU behind `/dev/dri/card0` an NVIDIA card (PCI vendor `0x10de`)?
-/// Used to pin GL clients to zink+NVK on real hardware WITHOUT touching QEMU's
-/// virtio-gpu (`0x1af4`), whose GL runs through virgl and has no Vulkan for
-/// zink to sit on.
+/// Used to gate the explicit wlroots GPU-renderer modes to real NVIDIA
+/// hardware without touching QEMU's virtio-gpu (`0x1af4`).
 fn gpu_is_nvidia() -> bool {
     fs::read_to_string("/sys/class/drm/card0/device/vendor")
         .map(|v| v.trim().eq_ignore_ascii_case("0x10de"))
@@ -1228,18 +1224,11 @@ fn build_child_env() -> Vec<CString> {
                          (via nvidia.wlr_{})",
                         if wlr == "vulkan" { "vulkan" } else { "gles2" }
                     ));
-                    // On real NVIDIA hardware, pin the OpenGL Gallium driver to
-                    // zink (GL-on-Vulkan over NVK) only on the explicit
-                    // experimental path. Our nouveau uAPI implements the zink/NVK
-                    // submission path (VM_BIND/EXEC) but NOT classic nvc0
-                    // GEM_PUSHBUF, so hardware GL clients need the pin whenever we
-                    // intentionally exercise the GPU path.
-                    env.push(CString::new("GALLIUM_DRIVER=zink").unwrap());
-                    env.push(CString::new("MESA_LOADER_DRIVER_OVERRIDE=zink").unwrap());
+                    // Keep client-side OpenGL unpinned here so tools like
+                    // glxgears can run natively even when the compositor is on an
+                    // explicit GPU-renderer session.
                     push_sdl_render_env(&mut env, SdlRender::Gles2);
-                    log(
-                        "renderer=gl: NVIDIA GPU -> pinning GL clients to zink+NVK on explicit experimental path",
-                    );
+                    log("renderer=gl: NVIDIA GPU -> explicit wlroots GPU renderer enabled");
                 } else {
                     env.push(CString::new("WLR_RENDERER=pixman").unwrap());
                     env.push(CString::new("WLR_RENDERER_ALLOW_SOFTWARE=1").unwrap());

@@ -978,17 +978,13 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
               \x20 if grep -q 'nvidia\\.wlr_vulkan' /proc/cmdline 2>/dev/null; then\n\
               \x20\x20 export WLR_RENDERER=vulkan\n\
               \x20\x20 export WLR_DRM_NO_MODIFIERS=1\n\
-              \x20\x20 export GALLIUM_DRIVER=zink\n\
-              \x20\x20 export MESA_LOADER_DRIVER_OVERRIDE=zink\n\
               \x20\x20 # SDL: GLES2 renderer on the GPU sessions (SDL2 has no Vulkan\n\
-              \x20\x20 # renderer; GLES2 lands on zink+NVK like the compositor).\n\
+              \x20\x20 # renderer).\n\
               \x20\x20 export SDL_RENDER_DRIVER=opengles2\n\
               \x20\x20 export SDL_FRAMEBUFFER_ACCELERATION=opengles2\n\
               \x20 elif grep -q 'nvidia\\.wlr_gles2' /proc/cmdline 2>/dev/null; then\n\
               \x20\x20 export WLR_RENDERER=gles2\n\
               \x20\x20 export WLR_DRM_NO_MODIFIERS=1\n\
-              \x20\x20 export GALLIUM_DRIVER=zink\n\
-              \x20\x20 export MESA_LOADER_DRIVER_OVERRIDE=zink\n\
               \x20\x20 export SDL_RENDER_DRIVER=opengles2\n\
               \x20\x20 export SDL_FRAMEBUFFER_ACCELERATION=opengles2\n\
               \x20 else\n\
