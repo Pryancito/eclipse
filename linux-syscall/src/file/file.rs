@@ -248,12 +248,10 @@ impl Syscall<'_> {
         super::splice::pipe_inode(file_like).is_some()
     }
 
-    /// True for a unix-domain socket fd. Its `write` queues into a bounded
-    /// peer buffer, like a pipe, and answers `EAGAIN` when that is full.
-    fn is_unix_socket(&self, file_like: &Arc<dyn FileLike>) -> bool {
-        file_like
-            .downcast_ref::<linux_object::net::UnixSocketState>()
-            .is_some()
+    /// True for a socket whose `write` queues into a bounded buffer, like a
+    /// pipe, and answers `EAGAIN` when that is full (unix, UDP).
+    fn is_bounded_socket(&self, file_like: &Arc<dyn FileLike>) -> bool {
+        crate::net::queue_is_bounded(file_like)
     }
 
     /// A pipe or a socket: the fds whose `EPIPE` means "the other side is
@@ -263,13 +261,13 @@ impl Syscall<'_> {
         self.is_pipe(file_like) || file_like.as_socket().is_ok()
     }
 
-    /// True for a pipe or unix socket fd without `O_NONBLOCK`: the fds whose
-    /// `write` this syscall waits on, as `pipe_write` and
-    /// `unix_stream_sendmsg` do, instead of handing the caller the `EAGAIN`
-    /// that only a non-blocking fd may see. (A TCP socket's `write` waits
-    /// for window on its own, synchronously.)
+    /// True for a pipe, unix or UDP socket fd without `O_NONBLOCK`: the fds
+    /// whose `write` this syscall waits on, as `pipe_write`,
+    /// `unix_stream_sendmsg` and `sock_alloc_send_skb` do, instead of
+    /// handing the caller the `EAGAIN` that only a non-blocking fd may see.
+    /// (A TCP socket's `write` waits for window on its own, synchronously.)
     fn waits_for_room(&self, file_like: &Arc<dyn FileLike>) -> bool {
-        (self.is_pipe(file_like) || self.is_unix_socket(file_like))
+        (self.is_pipe(file_like) || self.is_bounded_socket(file_like))
             && !file_like.flags().non_block()
     }
 
