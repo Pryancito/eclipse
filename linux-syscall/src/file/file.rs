@@ -1315,7 +1315,16 @@ impl Syscall<'_> {
                 );
                 return Err(LxError::EINVAL);
             }
-            h.handle = syncobj.handle;
+            // The importer gets a reference of its own (Linux: a new handle
+            // in its table), so its later DESTROY frees only that.
+            let Some(handle) = syncobj.import_opaque() else {
+                warn!(
+                    "[drm] SYNCOBJ_FD_TO_HANDLE EINVAL: fd={} names syncobj handle={} that no longer exists",
+                    h.fd, syncobj.handle
+                );
+                return Err(LxError::EINVAL);
+            };
+            h.handle = handle;
             ptr.write(h)?;
             Ok(Some(0))
         }
