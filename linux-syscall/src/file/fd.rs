@@ -484,13 +484,14 @@ impl Syscall<'_> {
     /// `dup3(2)`: like dup2, but equal descriptors are an error and
     /// `O_CLOEXEC` can be applied atomically to the new descriptor — the whole
     /// reason the syscall exists, and what the old alias-to-dup2 dropped.
-    pub fn sys_dup3(&self, fd1: FileDesc, fd2: FileDesc, flags: usize) -> SysResult {
-        info!("dup3: from {:?} to {:?} flags {:#o}", fd1, fd2, flags);
+    pub fn sys_dup3(&self, fd1: FileDesc, fd2: usize, flags: usize) -> SysResult {
+        info!("dup3: from {:?} to {} flags {:#o}", fd1, fd2, flags);
         const O_CLOEXEC: usize = 0o2000000;
-        if fd1 == fd2 || flags & !O_CLOEXEC != 0 {
+        if usize::from(fd1) == fd2 || flags & !O_CLOEXEC != 0 {
             return Err(LxError::EINVAL);
         }
         self.sys_dup2(fd1, fd2)?;
+        let fd2 = FileDesc::from(fd2);
         if flags & O_CLOEXEC != 0 {
             // Per-descriptor CLOEXEC on the new fd — set in the fd table, not
             // in the File object (whose flags are only a creation-time record).
@@ -500,9 +501,15 @@ impl Syscall<'_> {
     }
 
     /// create a copy of the file descriptor oldfd.
-    pub fn sys_dup2(&self, fd1: FileDesc, fd2: FileDesc) -> SysResult {
-        info!("dup2: from {:?} to {:?}", fd1, fd2);
+    ///
+    /// `fd2` arrives as the raw register: Linux (`ksys_dup3`) answers `EBADF`
+    /// to a target at or past `RLIMIT_NOFILE` before it looks at anything
+    /// else, and the check has to see the whole word, since narrowing first
+    /// turned `1 << 32 | 1` into fd 1 and `-1` into a table entry at -1.
+    pub fn sys_dup2(&self, fd1: FileDesc, fd2: usize) -> SysResult {
+        info!("dup2: from {:?} to {}", fd1, fd2);
         let proc = self.linux_process();
+        let fd2 = dup_target(fd2, proc.file_limit(None).cur)?;
         if fd1 == fd2 {
             let _ = proc.get_file_like(fd1)?;
             return Ok(fd2.into());
@@ -527,6 +534,23 @@ impl Syscall<'_> {
             }
         }
         Ok(fd2.into())
+    }
+
+    /// `fcntl(F_DUPFD)`: the copy goes to the lowest free descriptor at or
+    /// above `start`, which is also checked against `RLIMIT_NOFILE` the way
+    /// `f_dupfd` does. Before the check, a start of `-1` (every "no minimum"
+    /// mistake spells it that way) reached the allocator as `usize::MAX`: the
+    /// first call installed the copy at descriptor -1 and the second walked
+    /// the open range off the end of `usize`, which is a kernel panic from a
+    /// process with no privileges.
+    pub fn sys_dupfd(&self, fd1: FileDesc, start: usize) -> SysResult {
+        let proc = self.linux_process();
+        let nofile = proc.file_limit(None).cur;
+        let start = dupfd_start(start, nofile)?;
+        let new_fd = dupfd_picked(proc.get_free_fd_from(start).into(), nofile)?;
+        // sys_dup2 registers the new fd with CLOEXEC off (POSIX dup
+        // semantics); F_DUPFD_CLOEXEC re-tags it afterwards.
+        self.sys_dup2(fd1, new_fd.into())
     }
 
     /// create a copy of the file descriptor fd, and uses the lowest-numbered unused descriptor for the new descriptor.
@@ -700,6 +724,96 @@ impl Syscall<'_> {
         let event = PerfEvent::new(&attr_bytes, pid, cpu, OpenFlags::from_bits_truncate(flags));
         let fd = self.linux_process().add_file(event)?;
         Ok(fd.into())
+    }
+}
+
+/// `fcntl(F_DUPFD, start)`: `f_dupfd` answers `EINVAL` to a start at or past
+/// the soft `RLIMIT_NOFILE`, before looking for a free descriptor.
+fn dupfd_start(start: usize, nofile: u64) -> Result<usize, LxError> {
+    if start as u64 >= nofile || start > i32::MAX as usize {
+        return Err(LxError::EINVAL);
+    }
+    Ok(start)
+}
+
+/// The descriptor `F_DUPFD`'s search settled on, which `alloc_fd` refuses
+/// with `EMFILE` when it is past the limit: the search starts below it but
+/// every number from there up may be taken.
+fn dupfd_picked(fd: usize, nofile: u64) -> Result<FileDesc, LxError> {
+    if fd as u64 >= nofile {
+        return Err(LxError::EMFILE);
+    }
+    Ok(FileDesc::from(fd))
+}
+
+/// `dup2`/`dup3`'s target, which `ksys_dup3` answers `EBADF` to at or past
+/// the soft `RLIMIT_NOFILE`. Checked on the raw word: a negative `int` from
+/// the caller is a huge `usize` here and must not become descriptor -1, and a
+/// value past 32 bits must not fold onto a small descriptor that is open.
+fn dup_target(newfd: usize, nofile: u64) -> Result<FileDesc, LxError> {
+    if newfd as u64 >= nofile || newfd > i32::MAX as usize {
+        return Err(LxError::EBADF);
+    }
+    Ok(FileDesc::from(newfd))
+}
+
+#[cfg(test)]
+mod dup_limit_tests {
+    //! The three `RLIMIT_NOFILE` checks the dup family did not have. The
+    //! limit is the process's soft one, 1024 by default; every value here is
+    //! what a C caller's `int` becomes in the syscall register.
+
+    use super::{dup_target, dupfd_picked, dupfd_start, FileDesc, LxError};
+
+    const NOFILE: u64 = 1024;
+    /// `(int)-1`, sign-extended into the register.
+    const MINUS_ONE: usize = usize::MAX;
+
+    #[test]
+    fn a_dupfd_start_at_or_past_the_limit_is_einval() {
+        // `fcntl(fd, F_DUPFD, -1)` used to hand the allocator `usize::MAX`;
+        // the copy landed at descriptor -1 and the second call panicked the
+        // kernel walking off the end of the open range.
+        assert_eq!(dupfd_start(MINUS_ONE, NOFILE), Err(LxError::EINVAL));
+        assert_eq!(dupfd_start(1024, NOFILE), Err(LxError::EINVAL));
+        assert_eq!(dupfd_start(1023, NOFILE), Ok(1023));
+        assert_eq!(dupfd_start(0, NOFILE), Ok(0));
+        // A raised limit widens the window; a huge one still cannot admit a
+        // start that is not a descriptor number.
+        assert_eq!(dupfd_start(1024, 4096), Ok(1024));
+        assert_eq!(dupfd_start(MINUS_ONE, u64::MAX), Err(LxError::EINVAL));
+        assert_eq!(dupfd_start(1 << 32, u64::MAX), Err(LxError::EINVAL));
+    }
+
+    #[test]
+    fn a_dupfd_that_lands_past_the_limit_is_emfile_not_a_descriptor() {
+        // Start 1000 with 1000..1023 all open: the lowest free number is
+        // 1024, which is not a descriptor this process may hold.
+        assert_eq!(dupfd_picked(1024, NOFILE), Err(LxError::EMFILE));
+        assert_eq!(dupfd_picked(1023, NOFILE), Ok(FileDesc::from(1023usize)));
+        assert_eq!(dupfd_picked(3, NOFILE), Ok(FileDesc::from(3usize)));
+    }
+
+    #[test]
+    fn a_dup2_target_at_or_past_the_limit_is_ebadf() {
+        // `dup2(fd, -1)` installed the copy at descriptor -1; `dup2(fd,
+        // 1 << 32 | 1)` narrowed to 1 and clobbered stdout.
+        assert_eq!(dup_target(MINUS_ONE, NOFILE), Err(LxError::EBADF));
+        assert_eq!(dup_target((1 << 32) | 1, NOFILE), Err(LxError::EBADF));
+        assert_eq!(dup_target(1024, NOFILE), Err(LxError::EBADF));
+        assert_eq!(dup_target(1023, NOFILE), Ok(FileDesc::from(1023usize)));
+        assert_eq!(dup_target(1, NOFILE), Ok(FileDesc::from(1usize)));
+        assert_eq!(dup_target(2048, 4096), Ok(FileDesc::from(2048usize)));
+        // The narrowing guard stands on its own: with a limit that would
+        // admit the number, `1 << 32 | 1` still cannot become descriptor 1.
+        assert_eq!(dup_target((1 << 32) | 1, u64::MAX), Err(LxError::EBADF));
+        assert_eq!(
+            dup_target(i32::MAX as usize + 1, u64::MAX),
+            Err(LxError::EBADF)
+        );
+        // Not EINVAL: `dup2` and `dup3` say EBADF here, and `F_DUPFD` says
+        // EINVAL, and callers tell the two apart.
+        assert_ne!(dup_target(MINUS_ONE, NOFILE), Err(LxError::EINVAL));
     }
 }
 

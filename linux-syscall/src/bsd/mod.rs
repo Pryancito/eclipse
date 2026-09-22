@@ -147,7 +147,7 @@ impl Syscall<'_> {
             sys::TRUNCATE => BsdRet::from_result(self.sys_truncate(a0.into(), a1)),
             sys::FTRUNCATE => BsdRet::from_result(self.sys_ftruncate(a0.into(), a1)),
             sys::DUP => BsdRet::from_result(self.sys_dup(a0.into())),
-            sys::DUP2 => BsdRet::from_result(self.sys_dup2(a0.into(), a1.into())),
+            sys::DUP2 => BsdRet::from_result(self.sys_dup2(a0.into(), a1)),
             sys::FCNTL => BsdRet::from_result(self.sys_fcntl(a0.into(), a1, a2).await),
             sys::FLOCK => BsdRet::from_result(self.sys_flock(a0.into(), a1)),
             sys::GETCWD => BsdRet::from_result(self.sys_getcwd(a0.into(), a1)),
