@@ -131,7 +131,7 @@ impl TryInto<PortPacket> for rvm::RvmExitPacket {
         };
         Ok(PortPacketRepr {
             key: self.key,
-            status: ZxError::OK,
+            status: ZxError::OK as i32,
             data,
         }
         .into())

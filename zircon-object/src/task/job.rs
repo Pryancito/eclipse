@@ -194,8 +194,8 @@ impl Job {
         if !inner.is_empty() {
             return Err(ZxError::BAD_STATE);
         }
-        check_timer_policy(&policy)?;
-        inner.timer_policy = inner.timer_policy.generate_new(policy);
+        let (min_slack, mode) = policy.parse()?;
+        inner.timer_policy = inner.timer_policy.generate_new(min_slack, mode);
         Ok(())
     }
 
@@ -343,6 +343,7 @@ pub struct JobInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::signal::Slack;
     use crate::task::{Status, Thread, ThreadState, TASK_RETCODE_SYSCALL_KILL};
     use core::time::Duration;
 
@@ -496,6 +497,47 @@ mod tests {
             Some(ZxError::INVALID_ARGS)
         );
         assert_eq!(root_job.policy().get_action(PolicyCondition::VmarWx), None);
+    }
+
+    /// The timer slack topic of the same syscall. `TimerSlackPolicy` comes
+    /// straight out of the caller's memory too, and its mode used to be a
+    /// `Slack` that nothing checked.
+    #[test]
+    fn a_timer_slack_policy_the_caller_invented_changes_nothing() {
+        let root_job = Job::root();
+        let slack_of = |job: &Arc<Job>| job.inner.lock().timer_policy.parts();
+        assert_eq!(slack_of(&root_job), (0, Slack::Center));
+
+        // Set a real one first, so that a rejected policy has something to
+        // leave alone: refusing and then writing the default would look the
+        // same on an untouched job.
+        root_job
+            .set_policy_timer_slack(TimerSlackPolicy::from_raw_parts(1000, 2))
+            .unwrap();
+        assert_eq!(slack_of(&root_job), (1000, Slack::Late));
+
+        for policy in [
+            TimerSlackPolicy::from_raw_parts(3000, 3),
+            TimerSlackPolicy::from_raw_parts(3000, u32::MAX),
+            TimerSlackPolicy::from_raw_parts(-1, 0),
+        ] {
+            assert_eq!(
+                root_job.set_policy_timer_slack(policy).err(),
+                Some(ZxError::INVALID_ARGS)
+            );
+            assert_eq!(slack_of(&root_job), (1000, Slack::Late));
+        }
+
+        // Only an empty job takes a timer slack policy at all.
+        let child = Job::create_child(&root_job).unwrap();
+        assert_eq!(
+            root_job
+                .set_policy_timer_slack(TimerSlackPolicy::from_raw_parts(2000, 0))
+                .err(),
+            Some(ZxError::BAD_STATE)
+        );
+        assert_eq!(slack_of(&root_job), (1000, Slack::Late));
+        assert_eq!(slack_of(&child), (0, Slack::Center));
     }
 
     #[test]

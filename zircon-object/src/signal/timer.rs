@@ -31,7 +31,7 @@ struct TimerInner {
 ///
 /// **Not supported: Now slack has no effect on the timer.**
 #[repr(u32)]
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub enum Slack {
     /// slack is centered around deadline
     Center = 0,
@@ -39,6 +39,22 @@ pub enum Slack {
     Early = 1,
     /// slack interval is [deadline, deadline + slack)
     Late = 2,
+}
+
+impl Slack {
+    /// Convert the raw `zx_timer_slack_t` mode a process wrote.
+    ///
+    /// `zx_job_set_policy` reads a `zx_policy_timer_slack_t` straight out of
+    /// the caller's memory, so the mode is whatever the process put there and
+    /// must not be materialised as this enum without checking.
+    pub fn from_raw(raw: u32) -> ZxResult<Self> {
+        Ok(match raw {
+            0 => Self::Center,
+            1 => Self::Early,
+            2 => Self::Late,
+            _ => return Err(ZxError::INVALID_ARGS),
+        })
+    }
 }
 
 impl Timer {

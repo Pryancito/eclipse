@@ -200,19 +200,41 @@ pub enum PolicyAction {
 /// Timer slack policy.
 ///
 /// See [timer slack](../../signal/timer/enum.Slack.html) for more information.
+/// The wire form of `zx_policy_timer_slack_t`, as `sys_job_set_policy` reads it
+/// out of the caller's memory. `default_mode` is a raw `u32` for the same
+/// reason [`BasicPolicy`]'s fields are: see [`TimerSlackPolicy::parse`].
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct TimerSlackPolicy {
     min_slack: i64,
-    default_mode: Slack,
+    default_mode: u32,
 }
 
-/// Check whether the policy is valid.
-pub fn check_timer_policy(policy: &TimerSlackPolicy) -> ZxResult {
-    if policy.min_slack.is_negative() {
-        return Err(ZxError::INVALID_ARGS);
+impl TimerSlackPolicy {
+    /// Check the policy the caller wrote, and return what it says.
+    ///
+    /// Zircon rejects a negative `min_slack` and a `default_mode` above
+    /// `ZX_TIMER_SLACK_LATE`. Only the first was checked here, and the second
+    /// was a `Slack` read straight out of the caller's memory, which is
+    /// undefined behaviour for any value but 0, 1 and 2. `zx_timer_create`,
+    /// the other way into the same enum, has always checked its mode.
+    pub fn parse(&self) -> ZxResult<(i64, Slack)> {
+        if self.min_slack.is_negative() {
+            return Err(ZxError::INVALID_ARGS);
+        }
+        Ok((self.min_slack, Slack::from_raw(self.default_mode)?))
     }
-    Ok(())
+
+    /// Build one as a caller would have written it.
+    ///
+    /// Test-only: the kernel only ever gets these out of user memory.
+    #[cfg(test)]
+    pub(crate) fn from_raw_parts(min_slack: i64, default_mode: u32) -> Self {
+        Self {
+            min_slack,
+            default_mode,
+        }
+    }
 }
 
 #[repr(C)]
@@ -222,11 +244,17 @@ pub(super) struct TimerSlack {
 }
 
 impl TimerSlack {
-    pub(super) fn generate_new(&self, policy: TimerSlackPolicy) -> TimerSlack {
+    pub(super) fn generate_new(&self, min_slack: i64, mode: Slack) -> TimerSlack {
         TimerSlack {
-            amount: self.amount.max(policy.min_slack),
-            mode: policy.default_mode,
+            amount: self.amount.max(min_slack),
+            mode,
         }
+    }
+
+    /// What the job's timer slack currently is.
+    #[cfg(test)]
+    pub(super) fn parts(&self) -> (i64, Slack) {
+        (self.amount, self.mode)
     }
 }
 
@@ -242,6 +270,70 @@ impl Default for TimerSlack {
 #[cfg(test)]
 mod job_policy_tests {
     use super::*;
+
+    /// `sys_job_set_policy` reads a `zx_policy_timer_slack_t` straight out of
+    /// the caller's memory, so `default_mode` is whatever the process wrote.
+    /// Only `min_slack` was checked, and the mode was materialised as a `Slack`
+    /// with three variants. Zircon checks both.
+    #[test]
+    fn a_timer_slack_mode_the_caller_invented_is_rejected() {
+        for (raw, expected) in [(0, Slack::Center), (1, Slack::Early), (2, Slack::Late)] {
+            assert_eq!(Slack::from_raw(raw), Ok(expected));
+            assert_eq!(expected as u32, raw);
+            assert_eq!(
+                TimerSlackPolicy::from_raw_parts(7, raw).parse(),
+                Ok((7, expected))
+            );
+        }
+        for raw in [3, 4, 0x8000, u32::MAX] {
+            assert_eq!(Slack::from_raw(raw), Err(ZxError::INVALID_ARGS));
+            assert_eq!(
+                TimerSlackPolicy::from_raw_parts(7, raw).parse(),
+                Err(ZxError::INVALID_ARGS)
+            );
+        }
+    }
+
+    /// The mode is checked even when `min_slack` is the thing that is wrong,
+    /// and a negative one is still refused.
+    #[test]
+    fn a_negative_minimum_slack_is_rejected() {
+        for min_slack in [-1i64, -1000, i64::MIN] {
+            assert_eq!(
+                TimerSlackPolicy::from_raw_parts(min_slack, 0).parse(),
+                Err(ZxError::INVALID_ARGS)
+            );
+        }
+        assert_eq!(
+            TimerSlackPolicy::from_raw_parts(0, 0).parse(),
+            Ok((0, Slack::Center))
+        );
+        assert_eq!(
+            TimerSlackPolicy::from_raw_parts(i64::MAX, 2).parse(),
+            Ok((i64::MAX, Slack::Late))
+        );
+    }
+
+    /// The amount only ever grows: a job cannot ask for less slack than it
+    /// already has, but the mode is replaced.
+    #[test]
+    fn the_amount_of_slack_only_grows_and_the_mode_is_replaced() {
+        let slack = TimerSlack::default();
+        assert_eq!(slack.parts(), (0, Slack::Center));
+        let slack = slack.generate_new(500, Slack::Late);
+        assert_eq!(slack.parts(), (500, Slack::Late));
+        let slack = slack.generate_new(100, Slack::Early);
+        assert_eq!(slack.parts(), (500, Slack::Early));
+        let slack = slack.generate_new(900, Slack::Center);
+        assert_eq!(slack.parts(), (900, Slack::Center));
+    }
+
+    /// `zx_policy_timer_slack_t` is sixteen bytes on the wire, and the struct
+    /// the syscall reads has to stay that size.
+    #[test]
+    fn the_timer_slack_policy_keeps_its_wire_size() {
+        assert_eq!(core::mem::size_of::<TimerSlackPolicy>(), 16);
+    }
 
     /// One past the last condition and the last action there are.
     const CONDITION_COUNT: u32 = 15;
