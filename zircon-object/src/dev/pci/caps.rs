@@ -92,7 +92,9 @@ impl PciCapabilityMsi {
         cfg.write16_(base + 0x2, ctrl & !0x71);
         let mask_bits = base + if is_64bit { 0x10 } else { 0xC };
         if has_pvm {
-            cfg.write32_offset(mask_bits, 0xffff_ffff);
+            // `mask_bits` is an offset inside the capability, like the two
+            // accesses just above it; it went to the whole-address accessor.
+            cfg.write32_(mask_bits, 0xffff_ffff);
         }
         PciCapabilityMsi {
             msi_size: match (has_pvm, is_64bit) {
