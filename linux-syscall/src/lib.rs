@@ -262,7 +262,7 @@ impl Syscall<'_> {
         let perf_start = kernel_hal::timer::timer_now();
         let ret = match sys_type {
             Sys::READ => self.sys_read(a0.into(), a1.into(), a2).await,
-            Sys::WRITE => self.sys_write(a0.into(), a1.into(), a2),
+            Sys::WRITE => self.sys_write(a0.into(), a1.into(), a2).await,
             Sys::OPENAT => self.sys_openat(a0.into(), a1.into(), a2, a3),
             Sys::CLOSE => self.sys_close(a0.into()),
             Sys::FSTAT => self.sys_fstat(a0.into(), a1.into()),
@@ -272,7 +272,7 @@ impl Syscall<'_> {
             Sys::PREAD64 => self.sys_pread(a0.into(), a1.into(), a2, a3 as _).await,
             Sys::PWRITE64 => self.sys_pwrite(a0.into(), a1.into(), a2, a3 as _),
             Sys::READV => self.sys_readv(a0.into(), a1.into(), a2).await,
-            Sys::WRITEV => self.sys_writev(a0.into(), a1.into(), a2),
+            Sys::WRITEV => self.sys_writev(a0.into(), a1.into(), a2).await,
             // Positional vectored I/O. The kernel ABI splits the offset into
             // (pos_l, pos_h) halves; on 64-bit both musl and glibc put the whole
             // offset in pos_l, and the kernel ignores pos_h — so do we.
@@ -282,7 +282,10 @@ impl Syscall<'_> {
                 self.sys_preadv2(a0.into(), a1.into(), a2, a3 as i64, a5)
                     .await
             }
-            Sys::PWRITEV2 => self.sys_pwritev2(a0.into(), a1.into(), a2, a3 as i64, a5),
+            Sys::PWRITEV2 => {
+                self.sys_pwritev2(a0.into(), a1.into(), a2, a3 as i64, a5)
+                    .await
+            }
             Sys::SENDFILE => self.sys_sendfile(a0.into(), a1.into(), a2.into(), a3).await,
             Sys::FCNTL => self.sys_fcntl(a0.into(), a1, a2).await,
             Sys::FLOCK => self.sys_flock(a0.into(), a1),

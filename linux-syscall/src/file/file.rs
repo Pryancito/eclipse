@@ -10,7 +10,7 @@
 //! - access, faccessat
 
 use super::*;
-use linux_object::{process::FsInfo, time::TimeSpec};
+use linux_object::{process::FsInfo, thread::ThreadExt, time::TimeSpec};
 
 /// `lseek(2)`'s `whence`, which the syscall declares `int` and this tree read
 /// as a `u8`.
@@ -155,7 +155,7 @@ impl Syscall<'_> {
     /// - fd – file descriptor
     /// - base – pointer to the buffer write
     /// - len – number of bytes to write
-    pub fn sys_write(&self, fd: FileDesc, base: UserInPtr<u8>, len: usize) -> SysResult {
+    pub async fn sys_write(&self, fd: FileDesc, base: UserInPtr<u8>, len: usize) -> SysResult {
         info!("write: fd={:?}, base={:?}, len={:#x}", fd, base, len);
         // Diagnostic: surface X-server log/error lines into the dmesg ring so the
         // reason a graphics server aborts is visible even without its logfile.
@@ -190,6 +190,7 @@ impl Syscall<'_> {
             );
         })?;
         let chunk_size = len.min(super::SYSCALL_IO_MAX);
+        let blocking_pipe = self.blocking_pipe(&file_like);
         let mut written = 0usize;
         while written < len {
             let n = (len - written).min(chunk_size);
@@ -213,12 +214,24 @@ impl Syscall<'_> {
                 });
             let w = match res {
                 Ok(w) => w,
-                // A later chunk failing (e.g. EAGAIN once the pipe/socket
-                // buffer filled) must report the bytes already consumed, not
-                // the error — POSIX partial write. Erroring would make the
-                // caller resend data the file already took.
-                Err(_) if written > 0 => break,
-                Err(e) => return Err(e),
+                Err(e) => match after_write_error(e, blocking_pipe, written) {
+                    // A blocking pipe writer waits for room and carries on:
+                    // `pipe_write` returns only once every byte is in (or a
+                    // signal cuts it short), never `EAGAIN`.
+                    AfterWriteError::Wait => {
+                        file_like.async_poll(PollEvents::OUT).await?;
+                        continue;
+                    }
+                    // A later chunk failing (e.g. EAGAIN once the socket
+                    // buffer filled) must report the bytes already consumed,
+                    // not the error — POSIX partial write. Erroring would
+                    // make the caller resend data the file already took.
+                    AfterWriteError::Partial => break,
+                    AfterWriteError::Fail => {
+                        self.raise_sigpipe_if_due(e, blocking_pipe || self.is_pipe(&file_like));
+                        return Err(e);
+                    }
+                },
             };
             // A write of 0 would otherwise spin forever; stop and report the
             // bytes written so far (short write).
@@ -228,6 +241,30 @@ impl Syscall<'_> {
             written += w;
         }
         Ok(written)
+    }
+
+    /// True for a pipe fd (either end).
+    fn is_pipe(&self, file_like: &Arc<dyn FileLike>) -> bool {
+        super::splice::pipe_inode(file_like).is_some()
+    }
+
+    /// True for a pipe fd without `O_NONBLOCK`: the one kind of fd whose
+    /// `write` this syscall waits on, as `pipe_write` does, instead of
+    /// handing the caller the `EAGAIN` that only a non-blocking fd may see.
+    fn blocking_pipe(&self, file_like: &Arc<dyn FileLike>) -> bool {
+        self.is_pipe(file_like) && !file_like.flags().non_block()
+    }
+
+    /// `pipe_write` pairs its `-EPIPE` with `send_sig(SIGPIPE, current, 0)`:
+    /// a writer whose reader has gone is killed unless it asked to be told
+    /// instead. Without the signal, `yes | head -1` ran `yes` for ever.
+    fn raise_sigpipe_if_due(&self, e: LxError, pipe: bool) {
+        if sigpipe_due(e, pipe) {
+            self.thread
+                .lock_linux()
+                .signals
+                .insert(linux_object::signal::Signal::SIGPIPE);
+        }
     }
 
     /// read from or write to a file descriptor at a given offset
@@ -354,7 +391,7 @@ impl Syscall<'_> {
     /// bounded-copy iteration Linux does — and report a partial count when a
     /// later chunk cannot proceed (POSIX short write; xcb and stdio both
     /// resume from it).
-    pub fn sys_writev(
+    pub async fn sys_writev(
         &self,
         fd: FileDesc,
         iov_ptr: UserInPtr<IoVecIn>,
@@ -368,6 +405,7 @@ impl Syscall<'_> {
         let total = iovs.total_len();
         let proc = self.linux_process();
         let file_like = proc.get_file_like(fd)?;
+        let blocking_pipe = self.blocking_pipe(&file_like);
         let mut buf = vec![0u8; total.min(super::SYSCALL_IO_MAX)];
         let mut written = 0usize;
         while written < total {
@@ -382,16 +420,27 @@ impl Syscall<'_> {
             match file_like.write(&buf[..n]) {
                 Ok(w) => {
                     written += w;
-                    if w < n {
+                    // A pipe that took part of a chunk has no room for the
+                    // rest yet; a blocking writer waits for it (below, on
+                    // the next `Again`) rather than stopping short.
+                    if w < n && !blocking_pipe {
                         break;
                     }
                 }
-                // Progress already made: report the partial count; the error
-                // will surface on the caller's next write. Erroring here
-                // instead would make the caller believe NOTHING was written
-                // and resend bytes the file already consumed.
-                Err(_) if written > 0 => break,
-                Err(e) => return Err(e),
+                Err(e) => match after_write_error(e, blocking_pipe, written) {
+                    AfterWriteError::Wait => {
+                        file_like.async_poll(PollEvents::OUT).await?;
+                    }
+                    // Progress already made: report the partial count; the
+                    // error will surface on the caller's next write. Erroring
+                    // here instead would make the caller believe NOTHING was
+                    // written and resend bytes the file already consumed.
+                    AfterWriteError::Partial => break,
+                    AfterWriteError::Fail => {
+                        self.raise_sigpipe_if_due(e, blocking_pipe || self.is_pipe(&file_like));
+                        return Err(e);
+                    }
+                },
             }
         }
         Ok(written)
@@ -502,7 +551,7 @@ impl Syscall<'_> {
     ///
     /// Offset -1 falls back to `writev` semantics; non-zero flags answer
     /// `EOPNOTSUPP` for the same reason as [`sys_preadv2`](Self::sys_preadv2).
-    pub fn sys_pwritev2(
+    pub async fn sys_pwritev2(
         &self,
         fd: FileDesc,
         iov_ptr: UserInPtr<IoVecIn>,
@@ -514,7 +563,7 @@ impl Syscall<'_> {
             return Err(LxError::EOPNOTSUPP);
         }
         if offset == -1 {
-            return self.sys_writev(fd, iov_ptr, iov_count);
+            return self.sys_writev(fd, iov_ptr, iov_count).await;
         }
         self.sys_pwritev(fd, iov_ptr, iov_count, offset as u64)
     }
@@ -1886,7 +1935,9 @@ impl Syscall<'_> {
                 Ok(pipe.capacity())
             } else {
                 let size = pipe_size_round(arg)?;
-                pipe.set_capacity(size);
+                // EBUSY when more than that is already queued, as
+                // `pipe_set_size` answers.
+                pipe.set_capacity(size)?;
                 // Linux returns the actual (rounded) capacity, not 0.
                 Ok(size)
             };
@@ -2424,6 +2475,100 @@ fn pipe_size_round(arg: usize) -> Result<usize, LxError> {
         return Err(LxError::EPERM);
     }
     Ok(size)
+}
+
+/// What `write(2)`/`writev(2)` do with an error from the file, given what
+/// they already wrote and whether the fd is a pipe that blocks.
+#[derive(Debug, PartialEq, Eq)]
+enum AfterWriteError {
+    /// Park until the pipe has room, then write the rest.
+    Wait,
+    /// Report the bytes already taken; the error waits for the next call.
+    Partial,
+    /// Report the error.
+    Fail,
+}
+
+/// `pipe_write`: a blocking writer never sees `EAGAIN`, it waits; every
+/// other fd keeps the partial-write rule, and an error before any byte went
+/// in is the call's answer.
+fn after_write_error(e: LxError, blocking_pipe: bool, written: usize) -> AfterWriteError {
+    if e == LxError::EAGAIN && blocking_pipe {
+        AfterWriteError::Wait
+    } else if written > 0 {
+        AfterWriteError::Partial
+    } else {
+        AfterWriteError::Fail
+    }
+}
+
+/// `SIGPIPE` goes with `EPIPE` from a pipe (`pipe_write`), not with the
+/// `EPIPE` a sound device uses to say "underrun" (ALSA's `-EPIPE` is an
+/// `XRUN`, and no signal comes with it).
+fn sigpipe_due(e: LxError, pipe: bool) -> bool {
+    e == LxError::EPIPE && pipe
+}
+
+#[cfg(test)]
+mod pipe_write_tests {
+    //! The two decisions `write(2)` makes about a pipe that Linux makes and
+    //! this kernel did not: a blocking writer waits for room, and a writer
+    //! with no reader gets `SIGPIPE` with its `EPIPE`.
+
+    use super::{after_write_error, sigpipe_due, AfterWriteError, LxError};
+
+    #[test]
+    fn a_blocking_pipe_writer_waits_on_eagain_wherever_it_is() {
+        // Before or after some bytes went in: `pipe_write` blocks until every
+        // byte is written, so neither a partial count nor EAGAIN comes back.
+        assert_eq!(
+            after_write_error(LxError::EAGAIN, true, 0),
+            AfterWriteError::Wait
+        );
+        assert_eq!(
+            after_write_error(LxError::EAGAIN, true, 4096),
+            AfterWriteError::Wait
+        );
+    }
+
+    #[test]
+    fn a_non_blocking_pipe_and_every_other_fd_keep_the_partial_write_rule() {
+        // `O_NONBLOCK` on the pipe: EAGAIN is the answer when nothing went
+        // in, and the count when something did.
+        assert_eq!(
+            after_write_error(LxError::EAGAIN, false, 0),
+            AfterWriteError::Fail
+        );
+        assert_eq!(
+            after_write_error(LxError::EAGAIN, false, 100),
+            AfterWriteError::Partial
+        );
+        // Only EAGAIN is a reason to wait: a broken pipe fails at once even
+        // for a blocking writer, and after a partial write it is reported
+        // next time.
+        assert_eq!(
+            after_write_error(LxError::EPIPE, true, 0),
+            AfterWriteError::Fail
+        );
+        assert_eq!(
+            after_write_error(LxError::EPIPE, true, 8),
+            AfterWriteError::Partial
+        );
+        assert_eq!(
+            after_write_error(LxError::EBADF, true, 0),
+            AfterWriteError::Fail
+        );
+    }
+
+    #[test]
+    fn sigpipe_comes_with_epipe_from_a_pipe_and_nothing_else() {
+        assert!(sigpipe_due(LxError::EPIPE, true));
+        // ALSA's EPIPE is an underrun report, not a broken pipe: a player
+        // that hits an XRUN recovers, it must not be killed.
+        assert!(!sigpipe_due(LxError::EPIPE, false));
+        assert!(!sigpipe_due(LxError::EAGAIN, true));
+        assert!(!sigpipe_due(LxError::EBADF, true));
+    }
 }
 
 #[cfg(test)]

@@ -20,7 +20,7 @@ const SPLICE_FLAGS_ALL: usize = SPLICE_F_MOVE | SPLICE_F_NONBLOCK | SPLICE_F_MOR
 /// `File` wrapping a `Pipe` inode (see `sys_pipe2`); `dyn INode` only offers
 /// `downcast_ref`, so the caller keeps the returned `Arc` alive and borrows
 /// the `Pipe` out of it at the use site.
-fn pipe_inode(f: &Arc<dyn FileLike>) -> Option<Arc<dyn rcore_fs::vfs::INode>> {
+pub(super) fn pipe_inode(f: &Arc<dyn FileLike>) -> Option<Arc<dyn rcore_fs::vfs::INode>> {
     let file = f.downcast_ref::<File>()?;
     let inode = file.inode();
     inode.downcast_ref::<Pipe>().is_some().then_some(inode)
@@ -203,7 +203,7 @@ impl Syscall<'_> {
         if is_read_end {
             self.sys_readv(fd, iov_ptr.into(), iov_count).await
         } else {
-            self.sys_writev(fd, iov_ptr.into(), iov_count)
+            self.sys_writev(fd, iov_ptr.into(), iov_count).await
         }
     }
 }
