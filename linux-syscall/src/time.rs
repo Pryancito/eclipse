@@ -493,48 +493,30 @@ impl Syscall<'_> {
     ) -> SysResult {
         let _ = self.maybe_handle_tty_intr()?;
         info!(
-            "clock_nanosleep: clockid={:?}, flags={:?}, req={:?}, rem={:?}",
-            clockid,
-            flags,
-            req.read()?,
-            rem
+            "clock_nanosleep: clockid={}, flags={:#x}, req={:?}, rem={:?}",
+            clockid, flags, req, rem
         );
-        use core::time::Duration;
         use kernel_hal::{thread, timer};
         // Same rule as `nanosleep`: reject an out-of-range `timespec`
         // instead of sleeping for whatever it happens to convert to.
-        let duration: Duration = req.read()?.try_into_duration()?;
-        let clockid = ClockId::from(clockid);
-        let flags = ClockFlags::from(flags);
-        info!("clockid={:?}, flags={:?}", clockid, flags,);
-        match clockid {
-            ClockId::ClockRealTime => {
-                match flags {
-                    ClockFlags::ZeroFlag => {
-                        thread::sleep_until(timer::deadline_after(duration)).await;
-                    }
-                    ClockFlags::TimerAbsTime => {
-                        // 目前统一由nanosleep代替了、之后再修改
-                        thread::sleep_until(timer::deadline_after(duration)).await;
-                    }
-                }
-            }
-            ClockId::ClockMonotonic => match flags {
-                ClockFlags::ZeroFlag => {
-                    thread::sleep_until(timer::deadline_after(duration)).await;
-                }
-                ClockFlags::TimerAbsTime => {
-                    thread::sleep_until(timer::deadline_after(duration)).await;
-                }
-            },
-            ClockId::ClockProcessCpuTimeId => {}
-            ClockId::ClockThreadCpuTimeId => {}
-            ClockId::ClockMonotonicRaw => {}
-            ClockId::ClockRealTimeCoarse => {}
-            ClockId::ClockMonotonicCoarse => {}
-            ClockId::ClockBootTime => {}
-            ClockId::ClockRealTimeAlarm => {}
-            ClockId::ClockBootTimeAlarm => {}
+        let request: Duration = req.read()?.try_into_duration()?;
+        // Every decision this call makes, taken before anything sleeps. The
+        // clock id and the flag word both used to go through an infallible
+        // `From<usize>` ending in `unreachable!()`, so an id or a flag this
+        // kernel did not list was a kernel panic from an ordinary syscall.
+        let plan = plan_clock_nanosleep(
+            clockid,
+            flags,
+            request,
+            timer::timer_now(),
+            timer::wall_clock_now(),
+        )?;
+        // `rem` only ever carries what a signal left over from a *relative*
+        // sleep. Linux does not write it on success, and ignores it entirely
+        // when TIMER_ABSTIME is set.
+        let _ = rem;
+        if let SleepPlan::Until(deadline) = plan {
+            thread::sleep_until(deadline).await;
         }
         Ok(0)
     }
