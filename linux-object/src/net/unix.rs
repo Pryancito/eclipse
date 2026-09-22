@@ -492,10 +492,22 @@ impl Socket for UnixSocketState {
             let mut inner = self.inner.lock();
             let path = inner.path.clone();
 
-            if inner.read_closed {
-                return (Ok(0), Endpoint::Unix(path));
+            // `unix_stream_read_generic`: `if (sk->sk_state != TCP_ESTABLISHED)
+            // return -EINVAL;` -- a socket that was never connected (or is a
+            // listener) has no stream to read from. Parking here instead, as
+            // this used to, was a hang: nothing can ever wake a reader on a
+            // socket with no peer to write to it. `connected` is set by every
+            // wiring path (`connect_pair`, `mark_connected`) and stays set
+            // after the peer goes away, so this only names the never-wired.
+            if !inner.connected {
+                return (Err(LxError::EINVAL), Endpoint::Unix(path));
             }
 
+            // Queued bytes come out before a receive-side shutdown is honoured:
+            // Linux only reports `RCV_SHUTDOWN` as EOF once the receive queue
+            // is empty (`unix_stream_read_generic` peeks the queue first). The
+            // old order answered `shutdown(SHUT_RD)` with 0 straight away and
+            // silently dropped whatever the peer had already sent.
             if !inner.buffer.is_empty() {
                 let len = core::cmp::min(data.len(), inner.buffer.len());
                 // Bulk copy from the deque's two contiguous halves instead of a
@@ -515,6 +527,10 @@ impl Socket for UnixSocketState {
                     inner.eventbus.clear(Event::READABLE);
                 }
                 return (Ok(len), Endpoint::Unix(path));
+            }
+
+            if inner.read_closed {
+                return (Ok(0), Endpoint::Unix(path));
             }
 
             // EOF: peer gone
@@ -686,6 +702,13 @@ impl Socket for UnixSocketState {
     }
 
     fn shutdown(&self, howto: usize) -> SysResult {
+        // `unix_shutdown`: `if (mode < SHUT_RD || mode > SHUT_RDWR) return
+        // -EINVAL;`. Anything else used to fall through both `if`s below and
+        // return Ok having shut nothing down -- the caller believed the half
+        // it named was closed.
+        if howto > 2 {
+            return Err(LxError::EINVAL);
+        }
         // Take the peer ref under our lock but drop our lock before locking the
         // peer, to avoid the self→peer / peer→self AB-BA deadlock (see `write`).
         let peer = {
@@ -1198,20 +1221,83 @@ mod tests {
             other => panic!("POLLOUT expected Ready(write), got {:?}", other),
         }
     }
+
+    /// `unix_stream_read_generic`: `if (sk->sk_state != TCP_ESTABLISHED)
+    /// return -EINVAL;`. A read on a socket that was never connected used to
+    /// park on the eventbus forever (nothing can ever write to it), or answer
+    /// EAGAIN on a non-blocking one -- "try again" for a condition that no
+    /// retry can change. Blocking or not, the answer is EINVAL.
+    #[async_std::test]
+    async fn read_on_a_never_connected_socket_is_einval() {
+        let lone = UnixSocketState::new();
+        let mut buf = [0u8; 8];
+        let (r, _) = Socket::read(&*lone, &mut buf).await;
+        assert!(matches!(r, Err(LxError::EINVAL)), "blocking: {:?}", r);
+
+        lone.inner.lock().flags |= OpenFlags::NON_BLOCK;
+        let (r, _) = Socket::read(&*lone, &mut buf).await;
+        assert!(matches!(r, Err(LxError::EINVAL)), "non-blocking: {:?}", r);
+
+        // A listener is not a stream either.
+        let listener = UnixSocketState::new();
+        listener.inner.lock().is_listening = true;
+        let (r, _) = Socket::read(&*listener, &mut buf).await;
+        assert!(matches!(r, Err(LxError::EINVAL)), "listener: {:?}", r);
+    }
+
+    /// Linux reports `RCV_SHUTDOWN` as EOF only once the receive queue is
+    /// empty: bytes the peer sent before `shutdown(SHUT_RD)` are still
+    /// delivered. Answering 0 straight away dropped them on the floor.
+    #[async_std::test]
+    async fn shutdown_rd_delivers_what_was_already_queued_before_eof() {
+        let a = UnixSocketState::new();
+        let b = UnixSocketState::new();
+        UnixSocketState::connect_pair(&a, &b);
+        Socket::write(&*a, b"queued", None).unwrap();
+
+        assert!(Socket::shutdown(&*b, 0).is_ok(), "SHUT_RD");
+        let mut buf = [0u8; 16];
+        let (r, _) = Socket::read(&*b, &mut buf).await;
+        assert_eq!(r.unwrap(), 6, "the queued bytes come out first");
+        assert_eq!(&buf[..6], b"queued");
+        let (r, _) = Socket::read(&*b, &mut buf).await;
+        assert_eq!(r.unwrap(), 0, "then EOF, without blocking");
+    }
+
+    /// `unix_shutdown`: `if (mode < SHUT_RD || mode > SHUT_RDWR) return
+    /// -EINVAL;`. Any other value used to match neither half and return Ok
+    /// with both halves still open.
+    #[test]
+    fn shutdown_refuses_a_how_that_is_not_a_how() {
+        let a = UnixSocketState::new();
+        let b = UnixSocketState::new();
+        UnixSocketState::connect_pair(&a, &b);
+
+        for bogus in [3usize, 0x2a, usize::MAX] {
+            assert!(
+                matches!(Socket::shutdown(&*a, bogus), Err(LxError::EINVAL)),
+                "how={:#x}",
+                bogus
+            );
+        }
+        let ai = a.inner.lock();
+        assert!(!ai.read_closed && !ai.write_closed, "nothing was shut down");
+        drop(ai);
+        // The three real values still act: SHUT_WR on one side, and
+        // SHUT_RDWR (2, the upper bound of the check) on the other closes
+        // both halves at once.
+        assert!(Socket::shutdown(&*a, 1).is_ok());
+        assert!(a.inner.lock().write_closed);
+        assert!(matches!(
+            Socket::write(&*a, b"x", None),
+            Err(LxError::EPIPE)
+        ));
+        assert!(Socket::shutdown(&*b, 2).is_ok(), "SHUT_RDWR is a how");
+        let bi = b.inner.lock();
+        assert!(bi.read_closed && bi.write_closed, "SHUT_RDWR closes both");
+    }
 }
 
-/// Passing a file descriptor from one process to another over a unix socket —
-/// `SCM_RIGHTS` — had no tests, and it is how a graphical desktop hands
-/// buffers around: DRI3 passes a GPU buffer's fd over the X11 socket, `wl_shm`
-/// passes a memfd over the Wayland one. None of it runs in CI, which has no
-/// display.
-///
-/// The bug these found: a batch of descriptors larger than the receiver's
-/// control buffer was refused **whole**, and it sits at the head of the queue.
-/// So the descriptors never came out, and neither did any batch behind them —
-/// descriptor passing on that connection was over for good, from one message.
-/// A caller sizes its control buffer for the number of fds it expects, so one
-/// message carrying more than that was enough.
 #[cfg(test)]
 mod fd_passing_tests {
     use super::*;
