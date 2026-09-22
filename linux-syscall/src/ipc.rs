@@ -6,17 +6,42 @@ use zircon_object::vm::*;
 
 pub use linux_object::ipc::*;
 
-/// The MMU flags a `shmat` mapping is created with.
+/// `shmat(2)` attach flags (`linux/shm.h`).
+const SHM_RDONLY: usize = 0o10000;
+const SHM_RND: usize = 0o20000;
+
+/// `SHMLBA`: the boundary `SHM_RND` rounds a requested attach address down to.
+/// Every architecture this kernel targets (x86-64, aarch64, riscv64) defines
+/// `SHMLBA` as `PAGE_SIZE`; the arches where it is larger (to dodge D-cache
+/// aliasing) are ones this kernel does not build for.
+const SHMLBA: usize = PAGE_SIZE;
+
+/// Where `shmat` puts the segment.
+#[derive(Debug, PartialEq, Eq)]
+enum ShmatPlace {
+    /// `addr == 0`: let the kernel choose the address.
+    Anywhere,
+    /// A specific address the caller asked for (already rounded when
+    /// `SHM_RND` was set).
+    At(VirtAddr),
+}
+
+/// Decide the mapping permissions and placement for one
+/// `shmat(id, addr, shmflg)`.
 ///
-/// `USER` is not optional. `VmMapping::handle_page_fault` requires the
-/// page's recorded flags to contain the whole fault mask, and a ring-3
-/// access always faults with `USER` set -- so a mapping recorded without
-/// it answers the very first store with `ACCESS_DENIED`, and the process
-/// takes `SIGSEGV`. `sys_mmap` has always included it; this path did not,
-/// and nobody noticed for as long as the segment `shmat` attached was the
-/// wrong one anyway (shm ids were per-process until #1318). The first
-/// build where MIT-SHM attached the right segment was the first build
-/// where an X client got as far as writing into it:
+/// Pure, so the whole of shmat's flag handling is unit-testable without an
+/// address space -- and it needed testing, because the old code answered
+/// every attach with one fixed set of flags and ignored `addr` outright.
+///
+/// `USER` is never optional. `VmMapping::handle_page_fault` requires the
+/// page's recorded flags to contain the whole fault mask, and a ring-3 access
+/// always faults with `USER` set -- so a mapping recorded without it answers
+/// the very first store with `ACCESS_DENIED`, and the process takes
+/// `SIGSEGV`. `sys_mmap` has always included it; this path did not, and nobody
+/// noticed for as long as the segment `shmat` attached was the wrong one
+/// anyway (shm ids were per-process until #1318). The first build where
+/// MIT-SHM attached the right segment was the first build where an X client
+/// got as far as writing into it:
 ///
 ///     unhandled page fault @ 0x11937000(WRITE | USER)
 ///         [anon+0x0 in map 0x11937000-0x1199b000]: ACCESS_DENIED,
@@ -24,8 +49,35 @@ pub use linux_object::ipc::*;
 ///
 /// `rep stos` zeroing the freshly attached 400 KiB image, from `glxgears`
 /// and `eglgears_x11` alike, at the first byte.
-fn shmat_mapping_flags() -> MMUFlags {
-    MMUFlags::READ | MMUFlags::WRITE | MMUFlags::EXECUTE | MMUFlags::USER
+///
+/// `SHM_RDONLY` is the correctness fix this function exists for: an attach
+/// that asks for read-only used to be handed a writable mapping, so a program
+/// that attached a segment read-only and then wrote to it succeeded silently
+/// where it must take `SIGSEGV`. `EXECUTE` is kept unconditionally, as the old
+/// fixed flags had it -- narrowing it to `SHM_EXEC` is a separate change with
+/// its own W^X risk, out of scope here.
+fn shmat_flags_and_place(shmflg: usize, addr: VirtAddr) -> Result<(MMUFlags, ShmatPlace), LxError> {
+    let mut flags = MMUFlags::READ | MMUFlags::EXECUTE | MMUFlags::USER;
+    if shmflg & SHM_RDONLY == 0 {
+        flags |= MMUFlags::WRITE;
+    }
+
+    let place = if addr == 0 {
+        // shmat(2): "If shmaddr is NULL, the system chooses a suitable
+        // (unused) page-aligned address." This is the case MIT-SHM uses.
+        ShmatPlace::Anywhere
+    } else if shmflg & SHM_RND != 0 {
+        // "the attach occurs at the address rounded down to the nearest
+        // multiple of SHMLBA."
+        ShmatPlace::At(addr & !(SHMLBA - 1))
+    } else if addr.is_multiple_of(SHMLBA) {
+        ShmatPlace::At(addr)
+    } else {
+        // A non-aligned address without SHM_RND is EINVAL -- not, as before,
+        // silently mapped somewhere else.
+        return Err(LxError::EINVAL);
+    };
+    Ok((flags, place))
 }
 
 /// Syscalls of inter-process communication and System V semaphore Set operation.
@@ -424,11 +476,15 @@ impl Syscall<'_> {
     /// to the address space of the calling process.
     /// The attaching address is specified by `addr`.
     /// If `addr` is zero, the system chooses a suitable page-aligned address to attach the segment.
-    pub fn sys_shmat(&self, id: usize, mut addr: VirtAddr, shmflg: usize) -> SysResult {
+    pub fn sys_shmat(&self, id: usize, addr: VirtAddr, shmflg: usize) -> SysResult {
         // mmap_lock (LinuxProcess::aspace_lock): shmat maps into the address
         // space — a layout mutation a concurrent fork must not race. Taken
         // before the `inner`-touching shm lookup (global lock order).
         let _aspace = self.linux_process().aspace_lock().lock();
+        // Permissions and placement first, so a bad `addr` is rejected before
+        // any lookup or mapping: read-only means read-only, a non-aligned
+        // address without SHM_RND is EINVAL, and SHM_RND rounds down.
+        let (flags, place) = shmat_flags_and_place(shmflg, addr)?;
         // Looked up system-wide, NOT in this process's own map: the id may
         // have been created by another program and passed here -- which is
         // what the X11 shared-memory extension does with every image.
@@ -440,22 +496,23 @@ impl Syscall<'_> {
 
         let proc = self.zircon_process();
         let vmar = proc.vmar();
-        if addr == 0 {
-            // although NULL can be a valid address
-            // but in C, NULL is regarded as allocation failure
-            // so just skip it
-            addr = PAGE_SIZE;
-        }
         let shm_guard = shm_identifier.guard.lock();
         let vmo = shm_guard.shared_guard.clone();
         info!(
-            "shmat: id: {}, addr = {:#x}, size = {}, flags = {:#x}",
+            "shmat: id: {}, place = {:?}, size = {}, flags = {:?}",
             id,
-            addr,
+            place,
             vmo.len(),
-            shmflg
+            flags
         );
-        let addr = vmar.map(None, vmo.clone(), 0, vmo.len(), shmat_mapping_flags())?;
+        // A requested address is an offset into the process's root vmar, as
+        // `sys_mmap` does for MAP_FIXED. `Anywhere` lets the kernel choose,
+        // which is the MIT-SHM path and the only one that reached here before.
+        let vmar_offset = match place {
+            ShmatPlace::Anywhere => None,
+            ShmatPlace::At(want) => Some(want - vmar.addr()),
+        };
+        let addr = vmar.map(vmar_offset, vmo.clone(), 0, vmo.len(), flags)?;
         shm_identifier.addr = addr;
         self.linux_process().shm_set(id, shm_identifier.clone());
 
@@ -828,7 +885,7 @@ mod ipc_tests {
     /// `USER` answers the first user store with `ACCESS_DENIED`.
     #[test]
     fn a_shmat_mapping_is_accessible_from_user_mode() {
-        let flags = shmat_mapping_flags();
+        let (flags, _) = shmat_flags_and_place(0, 0).unwrap();
         assert!(
             flags.contains(MMUFlags::USER),
             "a ring-3 store faults with USER set, and the fault handler \
@@ -1059,5 +1116,107 @@ mod semop_plan_tests {
             (1, 1),
             "one missing unit holds the whole array"
         );
+    }
+}
+
+#[cfg(test)]
+mod shmat_place_tests {
+    //! What `shmat(id, addr, shmflg)` does with its flags and address, which
+    //! the old code did not do at all: it answered every attach with one fixed
+    //! `READ|WRITE|EXECUTE|USER` and passed `None` as the address, so
+    //! `SHM_RDONLY` was ignored (a read-only attach came back writable) and a
+    //! requested address was ignored (the segment landed wherever the kernel
+    //! chose, and the caller was told so only by the return value).
+
+    use super::{shmat_flags_and_place, ShmatPlace, SHMLBA, SHM_RDONLY, SHM_RND};
+    use crate::LxError;
+    use zircon_object::vm::*;
+
+    /// A read-only attach must come back read-only. This is the correctness --
+    /// and security -- fix: a program that attaches `SHM_RDONLY` and then
+    /// stores has to take `SIGSEGV`, not scribble over a segment it asked the
+    /// kernel to protect.
+    #[test]
+    fn shm_rdonly_drops_write() {
+        let (flags, _) = shmat_flags_and_place(SHM_RDONLY, 0).unwrap();
+        assert!(flags.contains(MMUFlags::READ));
+        assert!(
+            !flags.contains(MMUFlags::WRITE),
+            "SHM_RDONLY must not leave the mapping writable"
+        );
+        // USER is never dropped, whatever else changes (the glxgears #PF).
+        assert!(flags.contains(MMUFlags::USER));
+    }
+
+    /// The default attach is read/write. Nothing about adding the read-only
+    /// path may quietly make the ordinary attach read-only.
+    #[test]
+    fn a_default_attach_is_read_write() {
+        let (flags, _) = shmat_flags_and_place(0, 0).unwrap();
+        assert!(flags.contains(MMUFlags::READ | MMUFlags::WRITE | MMUFlags::USER));
+    }
+
+    /// `addr == 0` lets the kernel choose -- the MIT-SHM path, and the only
+    /// one the old code ever really took. It must stay `Anywhere` regardless
+    /// of the other flags.
+    #[test]
+    fn a_null_address_is_placed_anywhere() {
+        assert_eq!(shmat_flags_and_place(0, 0).unwrap().1, ShmatPlace::Anywhere);
+        assert_eq!(
+            shmat_flags_and_place(SHM_RND, 0).unwrap().1,
+            ShmatPlace::Anywhere,
+            "SHM_RND on a null address still means 'anywhere', not 'at 0'"
+        );
+    }
+
+    /// A page-aligned address without `SHM_RND` is honoured as given.
+    #[test]
+    fn an_aligned_address_is_placed_there() {
+        let addr = 8 * SHMLBA;
+        assert_eq!(
+            shmat_flags_and_place(0, addr).unwrap().1,
+            ShmatPlace::At(addr)
+        );
+    }
+
+    /// A non-aligned address WITHOUT `SHM_RND` is `EINVAL`. The old code
+    /// ignored the address entirely, so this request used to succeed at some
+    /// unrelated address -- the opposite of what the caller asked for.
+    #[test]
+    fn a_misaligned_address_without_rnd_is_einval() {
+        let addr = 8 * SHMLBA + 1;
+        assert_eq!(shmat_flags_and_place(0, addr), Err(LxError::EINVAL));
+    }
+
+    /// `SHM_RND` rounds the address DOWN to the nearest `SHMLBA`, and never
+    /// up: the segment must not start above where the caller pointed.
+    #[test]
+    fn shm_rnd_rounds_the_address_down() {
+        let below = 8 * SHMLBA;
+        // Anywhere inside the page rounds back to its base.
+        for extra in [1, 17, SHMLBA - 1] {
+            assert_eq!(
+                shmat_flags_and_place(SHM_RND, below + extra).unwrap().1,
+                ShmatPlace::At(below),
+                "SHM_RND must round {} down to {}",
+                below + extra,
+                below
+            );
+        }
+        // An already-aligned address is left where it is.
+        assert_eq!(
+            shmat_flags_and_place(SHM_RND, below).unwrap().1,
+            ShmatPlace::At(below)
+        );
+    }
+
+    /// The permission flags and the placement are independent: `SHM_RDONLY`
+    /// and `SHM_RND` set together must give a read-only mapping AND a
+    /// rounded-down address, not one or the other.
+    #[test]
+    fn rdonly_and_rnd_both_take_effect_together() {
+        let (flags, place) = shmat_flags_and_place(SHM_RDONLY | SHM_RND, 4 * SHMLBA + 3).unwrap();
+        assert!(!flags.contains(MMUFlags::WRITE));
+        assert_eq!(place, ShmatPlace::At(4 * SHMLBA));
     }
 }
