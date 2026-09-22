@@ -10,7 +10,14 @@ use core::future::Future;
 use core::ops::Deref;
 use core::pin::Pin;
 use core::task::{Context, Poll};
+use core::time::Duration;
 use kernel_hal::sync::Mutex;
+
+/// How often a blocked `semop` wakes up just to ask whether it should still
+/// be waiting. Same reasoning, and the same figure, as the io-multiplex
+/// backstop: a ceiling on how late a `kill` can be, not on how fast a
+/// `release` is noticed (the event bus still does that immediately).
+const SEMOP_INTERRUPT_CHECK_TICK_MS: u64 = 100;
 
 /// A counting, blocking, semaphore.
 pub struct Semaphore {
@@ -70,6 +77,12 @@ impl Semaphore {
         struct SemaphoreFuture {
             inner: Arc<Mutex<SemaphoreInner>>,
             sub_id: Option<u64>,
+            /// Backstop slot: the event bus fires for `release` and for
+            /// `IPC_RMID`, and for nothing that happens to the WAITER. Without
+            /// a tick nothing re-polls this, so nothing checks for a signal,
+            /// and `semop(-1)` on a semaphore nobody ever releases was a wait
+            /// that `kill -9` could not end either.
+            timer: Option<kernel_hal::timer_waker::TimerWakerSlot>,
         }
 
         impl Drop for SemaphoreFuture {
@@ -77,6 +90,7 @@ impl Semaphore {
                 if let Some(id) = self.sub_id.take() {
                     self.inner.lock().eventbus.unsubscribe(id);
                 }
+                kernel_hal::timer_waker::kill_timer_waker(&mut self.timer);
             }
         }
 
@@ -112,6 +126,22 @@ impl Semaphore {
                     }
                 }
 
+                // Nothing to take. Before parking again, ask whether this
+                // thread is still supposed to be waiting -- the bus reports
+                // only what the SEMAPHORE does, so this is the only thing here
+                // that can answer a signal or a kill. semop(2) lists EINTR
+                // among its errors for exactly this.
+                if let Err(err) = crate::process::check_signals() {
+                    if let Some(id) = this.sub_id.take() {
+                        this.inner.lock().eventbus.unsubscribe(id);
+                    }
+                    kernel_hal::timer_waker::kill_timer_waker(&mut this.timer);
+                    return Poll::Ready(Err(err));
+                }
+                let deadline = kernel_hal::timer::deadline_after(Duration::from_millis(
+                    SEMOP_INTERRUPT_CHECK_TICK_MS,
+                ));
+                kernel_hal::timer_waker::ensure_timer_waker(&mut this.timer, deadline, cx);
                 Poll::Pending
             }
         }
@@ -119,6 +149,7 @@ impl Semaphore {
         let future = SemaphoreFuture {
             inner: self.lock.clone(),
             sub_id: None,
+            timer: None,
         };
         future.await
     }

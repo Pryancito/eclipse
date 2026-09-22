@@ -801,7 +801,7 @@ impl FileLike for File {
                         use super::devfs::DrmDev;
                         if let Some(drmdev) = inode.downcast_ref::<DrmDev>() {
                             let bus = drmdev.file_state().eventbus();
-                            crate::sync::wait_for_event(bus, crate::sync::Event::READABLE).await;
+                            crate::sync::wait_for_event(bus, crate::sync::Event::READABLE).await?;
                         } else {
                             inode.async_poll().await?;
                         }
@@ -862,7 +862,7 @@ impl FileLike for File {
                         use super::devfs::DrmDev;
                         if let Some(drmdev) = inode.downcast_ref::<DrmDev>() {
                             let bus = drmdev.file_state().eventbus();
-                            crate::sync::wait_for_event(bus, crate::sync::Event::READABLE).await;
+                            crate::sync::wait_for_event(bus, crate::sync::Event::READABLE).await?;
                         } else {
                             inode.async_poll().await?;
                         }

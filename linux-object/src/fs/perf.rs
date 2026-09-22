@@ -432,7 +432,7 @@ impl FileLike for PerfEvent {
                 });
             }
             let bus = self.eventbus.clone();
-            crate::sync::wait_for_event(bus, Event::READABLE).await;
+            crate::sync::wait_for_event(bus, Event::READABLE).await?;
         }
     }
 

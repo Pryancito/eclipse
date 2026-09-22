@@ -8,6 +8,7 @@ use core::{
     future::Future,
     pin::Pin,
     task::{Context, Poll},
+    time::Duration,
 };
 use lock::Mutex;
 
@@ -245,12 +246,99 @@ pub fn subscribe_readiness_on(
     }
 }
 
+/// How often a parked wait wakes up just to ask whether it should still be
+/// waiting.
+///
+/// The event bus is the fast path and covers everything the *data* can do: a
+/// pipe write, a peer close, a timer expiring. What it cannot report is
+/// anything that happens to the WAITER -- a signal arriving, the thread being
+/// killed, the process exiting -- because `send_signal_to_process` writes into
+/// the target's signal set and never touches this bus. Without a backstop
+/// nothing re-polls the future, so nothing ever calls [`wait_interrupted`],
+/// and the wait outlives every attempt to end it.
+///
+/// 100 ms is the same backstop the io-multiplex path already uses
+/// (`net::wait::IO_WAIT_COVERED_TICK_MS`), and it is a ceiling on how late a
+/// `kill` can be, not on how fast data arrives.
+const INTERRUPT_CHECK_TICK_MS: u64 = 100;
+
+/// Whether a thread parked in a blocking wait must stop waiting -- because a
+/// signal is deliverable, the thread is dying, or the process has exited.
+///
+/// Indirected so the host tests can drive it: there is no current thread in a
+/// host test, so [`crate::process::check_signals`] always answers `Ok` there
+/// and no test could otherwise reach the interrupted branch at all.
+#[cfg(not(test))]
+fn wait_interrupted() -> crate::error::LxResult<()> {
+    crate::process::check_signals()
+}
+
+#[cfg(test)]
+fn wait_interrupted() -> crate::error::LxResult<()> {
+    self::test_interrupt::check()
+}
+
+/// The test-only stand-in for [`crate::process::check_signals`].
+#[cfg(test)]
+pub(crate) mod test_interrupt {
+    extern crate std;
+
+    use crate::error::{LxError, LxResult};
+    use core::cell::Cell;
+
+    self::std::thread_local! {
+        /// What the next check answers, and how many are left. Thread-local so
+        /// the suite stays safe under the `--test-threads=1` CI *and* under a
+        /// parallel local run: nothing here is shared between tests, so no
+        /// test lock is needed and a test that panics cannot poison the next.
+        static PENDING: Cell<Option<LxError>> = const { Cell::new(None) };
+        static DELAY: Cell<usize> = const { Cell::new(0) };
+    }
+
+    /// Answer `Ok` for the next `after_polls` checks, then `Err(err)` for
+    /// every one after that.
+    pub(crate) fn interrupt_after(after_polls: usize, err: LxError) {
+        PENDING.with(|p| p.set(Some(err)));
+        DELAY.with(|d| d.set(after_polls));
+    }
+
+    /// Back to "nothing is interrupting anything".
+    pub(crate) fn clear() {
+        PENDING.with(|p| p.set(None));
+        DELAY.with(|d| d.set(0));
+    }
+
+    pub(super) fn check() -> LxResult<()> {
+        match PENDING.with(|p| p.get()) {
+            Some(err) => {
+                let left = DELAY.with(|d| d.get());
+                if left == 0 {
+                    Err(err)
+                } else {
+                    DELAY.with(|d| d.set(left - 1));
+                    Ok(())
+                }
+            }
+            None => Ok(()),
+        }
+    }
+}
+
 /// wait for a event async
-pub fn wait_for_event(bus: Arc<Mutex<EventBus>>, mask: Event) -> impl Future<Output = Event> {
+///
+/// Resolves with the events that matched, or with an error when the wait was
+/// interrupted -- see [`wait_interrupted`]. Callers must propagate that error
+/// rather than loop: it means "stop waiting", and swallowing it puts the
+/// thread straight back into the wait it was just pulled out of.
+pub fn wait_for_event(
+    bus: Arc<Mutex<EventBus>>,
+    mask: Event,
+) -> impl Future<Output = crate::error::LxResult<Event>> {
     EventBusFuture {
         bus,
         mask,
         sub_id: None,
+        timer: None,
     }
 }
 
@@ -260,6 +348,10 @@ struct EventBusFuture {
     bus: Arc<Mutex<EventBus>>,
     mask: Event,
     sub_id: Option<u64>,
+    /// Backstop slot (`timer_waker`): armed once while Pending, refreshed in
+    /// place on re-polls, cancelled on Ready and on Drop so a late tick cannot
+    /// wake a finished task. See [`INTERRUPT_CHECK_TICK_MS`].
+    timer: Option<kernel_hal::timer_waker::TimerWakerSlot>,
 }
 
 impl Drop for EventBusFuture {
@@ -267,33 +359,57 @@ impl Drop for EventBusFuture {
         if let Some(id) = self.sub_id.take() {
             self.bus.lock().unsubscribe(id);
         }
+        kernel_hal::timer_waker::kill_timer_waker(&mut self.timer);
     }
 }
 
 impl Future for EventBusFuture {
-    type Output = Event;
+    type Output = crate::error::LxResult<Event>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
         let this = self.as_mut().get_mut();
-        let mut lock = this.bus.lock();
-        if !(lock.event & this.mask).is_empty() {
-            if let Some(id) = this.sub_id.take() {
-                lock.unsubscribe(id);
-            }
-            return Poll::Ready(lock.event);
-        }
-        if this.sub_id.is_none() {
-            let waker = cx.waker().clone();
-            let mask = this.mask;
-            let sub_id = lock.subscribe(Box::new(move |s| {
-                if (s & mask).is_empty() {
-                    return false;
+        {
+            let mut lock = this.bus.lock();
+            if !(lock.event & this.mask).is_empty() {
+                if let Some(id) = this.sub_id.take() {
+                    lock.unsubscribe(id);
                 }
-                waker.wake_by_ref();
-                true
-            }));
-            this.sub_id = sub_id;
+                let event = lock.event;
+                drop(lock);
+                kernel_hal::timer_waker::kill_timer_waker(&mut this.timer);
+                return Poll::Ready(Ok(event));
+            }
+            if this.sub_id.is_none() {
+                let waker = cx.waker().clone();
+                let mask = this.mask;
+                let sub_id = lock.subscribe(Box::new(move |s| {
+                    if (s & mask).is_empty() {
+                        return false;
+                    }
+                    waker.wake_by_ref();
+                    true
+                }));
+                this.sub_id = sub_id;
+            }
         }
+        // The data is not there. Before parking again, ask whether this thread
+        // is still supposed to be here at all: this is the ONLY thing in the
+        // whole wait that can answer a signal or a kill, because the bus only
+        // ever reports what the file did.
+        //
+        // Checked AFTER the readiness test, deliberately, and in that order:
+        // Linux gives a read that can be served right now its data, and
+        // synthesises EINTR only when it would otherwise block.
+        if let Err(err) = wait_interrupted() {
+            if let Some(id) = this.sub_id.take() {
+                this.bus.lock().unsubscribe(id);
+            }
+            kernel_hal::timer_waker::kill_timer_waker(&mut this.timer);
+            return Poll::Ready(Err(err));
+        }
+        let deadline =
+            kernel_hal::timer::deadline_after(Duration::from_millis(INTERRUPT_CHECK_TICK_MS));
+        kernel_hal::timer_waker::ensure_timer_waker(&mut this.timer, deadline, cx);
         Poll::Pending
     }
 }
@@ -384,8 +500,231 @@ mod tests {
         let mut fut = wait_for_event(bus.clone(), Event::READABLE);
         assert!(matches!(
             Pin::new(&mut fut).poll(&mut cx),
-            Poll::Ready(Event::READABLE)
+            Poll::Ready(Ok(Event::READABLE))
         ));
         assert_eq!(bus.lock().get_callback_len(), 0);
+    }
+}
+
+#[cfg(test)]
+mod interruptible_wait_tests {
+    //! A blocking wait that only ever hears from the FILE is a wait that
+    //! nothing which happens to the *waiter* can end.
+    //!
+    //! `wait_for_event` is what `read(2)` comes down to on a pipe, an
+    //! eventfd, a timerfd, an inotify fd and a perf fd. The event bus is a
+    //! fine fast path for data, but a signal does not go through it:
+    //! `send_signal_to_process` writes into the target's signal set and
+    //! pulses the *process* object, not this bus. So a reader parked here
+    //! used to be unreachable by `kill`, by a signal, and by its own process
+    //! exiting -- it sat there until a peer wrote, forever if none ever did.
+    //!
+    //! These drive the check through the hook in [`test_interrupt`], because
+    //! a host test has no current thread and the real
+    //! `process::check_signals` would always answer `Ok`.
+
+    use super::test_interrupt;
+    use super::*;
+    use crate::error::LxError;
+    use core::sync::atomic::{AtomicBool, Ordering};
+    use core::task::{RawWaker, RawWakerVTable, Waker};
+    use lock::Mutex;
+
+    fn noop_waker(flag: &'static AtomicBool) -> Waker {
+        fn raw(ptr: *const ()) -> RawWaker {
+            unsafe fn clone(ptr: *const ()) -> RawWaker {
+                raw(ptr)
+            }
+            unsafe fn wake(ptr: *const ()) {
+                (*(ptr as *const AtomicBool)).store(true, Ordering::SeqCst);
+            }
+            unsafe fn wake_by_ref(ptr: *const ()) {
+                (*(ptr as *const AtomicBool)).store(true, Ordering::SeqCst);
+            }
+            unsafe fn drop(_: *const ()) {}
+            RawWaker::new(ptr, &RawWakerVTable::new(clone, wake, wake_by_ref, drop))
+        }
+        unsafe { Waker::from_raw(raw(flag as *const AtomicBool as *const ())) }
+    }
+
+    /// Every test leaves the hook the way it found it, so one that interrupts
+    /// cannot make the next one fail.
+    struct Restore;
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            test_interrupt::clear();
+        }
+    }
+
+    /// A reader parked on a bus that never fires must come back with the
+    /// interruption rather than wait for data that is not coming. This is the
+    /// whole bug: before, the only two outcomes were "the file became ready"
+    /// and "never".
+    #[test]
+    fn an_interrupted_wait_gives_up_instead_of_parking_forever() {
+        let _restore = Restore;
+        static WOKE: AtomicBool = AtomicBool::new(false);
+        let bus: Arc<Mutex<EventBus>> = EventBus::new();
+        let waker = noop_waker(&WOKE);
+        let mut cx = Context::from_waker(&waker);
+
+        test_interrupt::clear();
+        let mut fut = wait_for_event(bus.clone(), Event::READABLE);
+        // Nothing on the bus and nothing interrupting: it parks, which is
+        // correct and is what it always did.
+        assert!(matches!(Pin::new(&mut fut).poll(&mut cx), Poll::Pending));
+
+        // Now the thread takes a signal. The bus has not changed at all.
+        test_interrupt::interrupt_after(0, LxError::EINTR);
+        assert!(matches!(
+            Pin::new(&mut fut).poll(&mut cx),
+            Poll::Ready(Err(LxError::EINTR))
+        ));
+    }
+
+    /// A thread being torn down (`kill -9`, the process exiting) reaches the
+    /// wait as `ESRCH`/`EINTR` just the same -- whatever the check answers is
+    /// what the caller gets, unchanged. A wait that translated one error into
+    /// another would hide which of the two it was.
+    #[test]
+    fn the_reason_for_the_interruption_reaches_the_caller_unchanged() {
+        let _restore = Restore;
+        static WOKE: AtomicBool = AtomicBool::new(false);
+        let waker = noop_waker(&WOKE);
+        let mut cx = Context::from_waker(&waker);
+
+        for err in [LxError::EINTR, LxError::ESRCH, LxError::EIDRM] {
+            let bus: Arc<Mutex<EventBus>> = EventBus::new();
+            test_interrupt::interrupt_after(0, err);
+            let mut fut = wait_for_event(bus, Event::READABLE);
+            match Pin::new(&mut fut).poll(&mut cx) {
+                Poll::Ready(Err(got)) => assert_eq!(got, err),
+                other => panic!("expected {:?}, got {:?}", err, other.is_pending()),
+            }
+        }
+    }
+
+    /// Data wins over a signal: the readiness test comes FIRST, so a read
+    /// that can be served right now is served. Linux synthesises `EINTR` only
+    /// for a read that would otherwise block, and a kernel that checked the
+    /// other way round would drop bytes that were already in the pipe.
+    #[test]
+    fn data_already_there_beats_a_pending_signal() {
+        let _restore = Restore;
+        static WOKE: AtomicBool = AtomicBool::new(false);
+        let bus: Arc<Mutex<EventBus>> = EventBus::new();
+        bus.lock().set(Event::READABLE);
+        let waker = noop_waker(&WOKE);
+        let mut cx = Context::from_waker(&waker);
+
+        test_interrupt::interrupt_after(0, LxError::EINTR);
+        let mut fut = wait_for_event(bus.clone(), Event::READABLE);
+        assert!(
+            matches!(
+                Pin::new(&mut fut).poll(&mut cx),
+                Poll::Ready(Ok(Event::READABLE))
+            ),
+            "a signal must not swallow data that is already readable"
+        );
+    }
+
+    /// An event the waiter did not ask for is still not a wakeup. The mask
+    /// governs readiness exactly as before; the interruption check is an
+    /// extra way OUT of the wait, never a new way to end it early with a
+    /// success.
+    #[test]
+    fn an_unwanted_event_is_still_not_readiness() {
+        let _restore = Restore;
+        static WOKE: AtomicBool = AtomicBool::new(false);
+        let bus: Arc<Mutex<EventBus>> = EventBus::new();
+        bus.lock().set(Event::WRITABLE);
+        let waker = noop_waker(&WOKE);
+        let mut cx = Context::from_waker(&waker);
+
+        test_interrupt::clear();
+        let mut fut = wait_for_event(bus.clone(), Event::READABLE);
+        assert!(matches!(Pin::new(&mut fut).poll(&mut cx), Poll::Pending));
+    }
+
+    /// The parked callback and the backstop timer are both let go when the
+    /// wait ends in an interruption, not only when it ends in data. A bus
+    /// that kept one callback per interrupted read would fill its 4096-entry
+    /// table and then thrash -- the same failure `Drop` already guards.
+    #[test]
+    fn an_interrupted_wait_leaves_nothing_parked_on_the_bus() {
+        let _restore = Restore;
+        static WOKE: AtomicBool = AtomicBool::new(false);
+        let bus: Arc<Mutex<EventBus>> = EventBus::new();
+        let waker = noop_waker(&WOKE);
+        let mut cx = Context::from_waker(&waker);
+
+        for _ in 0..5_000 {
+            test_interrupt::clear();
+            let mut fut = wait_for_event(bus.clone(), Event::READABLE);
+            assert!(matches!(Pin::new(&mut fut).poll(&mut cx), Poll::Pending));
+            assert_eq!(bus.lock().get_callback_len(), 1);
+
+            test_interrupt::interrupt_after(0, LxError::EINTR);
+            assert!(matches!(
+                Pin::new(&mut fut).poll(&mut cx),
+                Poll::Ready(Err(LxError::EINTR))
+            ));
+            assert_eq!(
+                bus.lock().get_callback_len(),
+                0,
+                "an interrupted wait must unsubscribe, like a satisfied one"
+            );
+        }
+    }
+
+    /// A wait that is NOT interrupted keeps waiting however many times it is
+    /// re-polled. The backstop tick re-polls a parked reader several times a
+    /// second, so a check that answered "interrupted" spuriously -- or once
+    /// and then latched -- would turn every quiet read into an `EINTR` storm.
+    #[test]
+    fn a_wait_nobody_interrupts_keeps_waiting_across_re_polls() {
+        let _restore = Restore;
+        static WOKE: AtomicBool = AtomicBool::new(false);
+        let bus: Arc<Mutex<EventBus>> = EventBus::new();
+        let waker = noop_waker(&WOKE);
+        let mut cx = Context::from_waker(&waker);
+
+        test_interrupt::clear();
+        let mut fut = wait_for_event(bus.clone(), Event::READABLE);
+        for _ in 0..1_000 {
+            assert!(matches!(Pin::new(&mut fut).poll(&mut cx), Poll::Pending));
+        }
+        // And exactly one callback the whole time: re-polls refresh the
+        // subscription in place rather than pushing a new one.
+        assert_eq!(bus.lock().get_callback_len(), 1);
+    }
+
+    /// The check runs on every pass, not only on the first. A reader parks
+    /// long before the signal arrives -- that is the whole point of a
+    /// blocking read -- so a check that only ran when the future was first
+    /// polled would leave every already-parked reader exactly as stuck as
+    /// before the fix.
+    #[test]
+    fn the_check_runs_on_every_pass_not_just_the_first() {
+        let _restore = Restore;
+        static WOKE: AtomicBool = AtomicBool::new(false);
+        let bus: Arc<Mutex<EventBus>> = EventBus::new();
+        let waker = noop_waker(&WOKE);
+        let mut cx = Context::from_waker(&waker);
+
+        // Ok for the first 20 passes, interrupted from the 21st on.
+        test_interrupt::interrupt_after(20, LxError::EINTR);
+        let mut fut = wait_for_event(bus.clone(), Event::READABLE);
+        for pass in 0..20 {
+            assert!(
+                matches!(Pin::new(&mut fut).poll(&mut cx), Poll::Pending),
+                "pass {} should still be waiting",
+                pass
+            );
+        }
+        assert!(matches!(
+            Pin::new(&mut fut).poll(&mut cx),
+            Poll::Ready(Err(LxError::EINTR))
+        ));
     }
 }

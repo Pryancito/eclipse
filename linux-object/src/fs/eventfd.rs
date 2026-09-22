@@ -180,7 +180,7 @@ impl FileLike for EventFd {
                 return Ok(status);
             }
             let bus = self.eventbus.clone();
-            crate::sync::wait_for_event(bus, Event::READABLE | Event::WRITABLE).await;
+            crate::sync::wait_for_event(bus, Event::READABLE | Event::WRITABLE).await?;
         }
     }
 

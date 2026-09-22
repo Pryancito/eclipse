@@ -112,7 +112,7 @@ impl FileLike for Inotify {
             return Err(LxError::EAGAIN);
         }
         let bus = self.eventbus.clone();
-        crate::sync::wait_for_event(bus, Event::READABLE).await;
+        crate::sync::wait_for_event(bus, Event::READABLE).await?;
         Err(LxError::EAGAIN)
     }
 
@@ -141,7 +141,7 @@ impl FileLike for Inotify {
         // spin a caller that only cares about POLLIN, so wait on the (silent)
         // eventbus like the blocking read does.
         let bus = self.eventbus.clone();
-        crate::sync::wait_for_event(bus, Event::READABLE).await;
+        crate::sync::wait_for_event(bus, Event::READABLE).await?;
         self.poll(_events)
     }
 }

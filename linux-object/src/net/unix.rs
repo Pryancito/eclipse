@@ -340,9 +340,14 @@ impl Drop for UnixEventWait {
 }
 
 impl Future for UnixEventWait {
-    type Output = ();
+    /// `Err` when the wait was interrupted -- a signal, a kill, the process
+    /// exiting. The event bus reports only what the SOCKET does, so without
+    /// this the wait could not be ended by anything that happens to the
+    /// waiter, and a client parked on an idle Wayland or D-Bus connection
+    /// survived every attempt to kill it.
+    type Output = LxResult<()>;
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
         {
             let mut inner = this.inner.lock();
@@ -351,7 +356,7 @@ impl Future for UnixEventWait {
                     inner.eventbus.unsubscribe(id);
                 }
                 kernel_hal::timer_waker::kill_timer_waker(&mut this.timer);
-                return Poll::Ready(());
+                return Poll::Ready(Ok(()));
             }
             if this.sub_id.is_none() {
                 let waker = cx.waker().clone();
@@ -365,10 +370,25 @@ impl Future for UnixEventWait {
                 }));
             }
         }
+        // Nothing on the socket. Before parking again, ask whether this
+        // thread is still supposed to be waiting at all: the bus only reports
+        // what the socket does, so this is the only thing here that can answer
+        // a signal or a kill. Checked AFTER the readiness test, deliberately:
+        // Linux serves a read it can serve now and synthesises EINTR only when
+        // it would otherwise block.
+        if let Err(err) = crate::process::check_signals() {
+            if let Some(id) = this.sub_id.take() {
+                this.inner.lock().eventbus.unsubscribe(id);
+            }
+            kernel_hal::timer_waker::kill_timer_waker(&mut this.timer);
+            return Poll::Ready(Err(err));
+        }
         // Backstop: eventbus is the fast path, but a parked callback can be
-        // evicted from a full table. Arm once; refresh waker on re-poll —
-        // never push a fresh `timer_set` every Pending (that was the churn
-        // behind the desktop null fn-ptr #PF).
+        // evicted from a full table -- and nothing on the bus ever fires for a
+        // signal, so this tick is also what bounds how late a `kill` can be.
+        // Arm once; refresh waker on re-poll — never push a fresh `timer_set`
+        // every Pending (that was the churn behind the desktop null fn-ptr
+        // #PF).
         let deadline = kernel_hal::timer::deadline_after(Duration::from_millis(20));
         kernel_hal::timer_waker::ensure_timer_waker(&mut this.timer, deadline, cx);
         Poll::Pending
@@ -513,13 +533,16 @@ impl Socket for UnixSocketState {
             // READABLE (or CLOSED); the loop re-validates the condition after
             // each wake. Event-driven, so a blocked reader resumes on the very
             // write instead of on a retry timer.
-            UnixEventWait {
+            if let Err(err) = (UnixEventWait {
                 inner: self.inner.clone(),
                 mask: Event::READABLE | Event::CLOSED,
                 sub_id: None,
                 timer: None,
+            })
+            .await
+            {
+                return (Err(err), Endpoint::Unix(self.inner.lock().path.clone()));
             }
-            .await;
         }
     }
 
@@ -658,7 +681,7 @@ impl Socket for UnixSocketState {
                 sub_id: None,
                 timer: None,
             }
-            .await;
+            .await?;
         }
     }
 
