@@ -46,6 +46,7 @@ pub fn install(rootfs: &Path) {
     write_labwc_wrapper(rootfs);
     write_memwatch(rootfs);
     write_terminal_wrapper(rootfs);
+    write_glxgears_wrapper(rootfs);
     write_firefox_wrapper(rootfs);
     write_firefox_desktop_override(rootfs);
     write_freedoom_wrapper(rootfs);
@@ -61,6 +62,47 @@ pub fn install(rootfs: &Path) {
     write_eclipse_tz(rootfs);
     write_eclipse_look(rootfs);
     write_kde_helpers(rootfs);
+}
+
+/// `/usr/local/bin/glxgears`: run glxgears normally first, but if Mesa/zink
+/// dies with the known swapchain teardown error (`zink: swapchain killed` /
+/// `GLXBadCurrentWindow`), retry once on llvmpipe so the demo still runs
+/// cleanly.
+fn write_glxgears_wrapper(rootfs: &Path) {
+    let localbin = rootfs.join("usr/local/bin");
+    let _ = fs::create_dir_all(&localbin);
+    let wrapper = localbin.join("glxgears");
+    fs::write(
+        &wrapper,
+        b"#!/bin/sh\n\
+          # Eclipse OS: recover glxgears from the zink swapchain-killed path.\n\
+          LOG=\"${HOME:-/root}/.glxgears.log\"\n\
+          GLX=/usr/bin/glxgears\n\
+          if [ ! -x \"$GLX\" ]; then\n\
+          \x20 echo 'glxgears: /usr/bin/glxgears not found (apk add mesa-demos)' >&2\n\
+          \x20 echo 'glxgears: /usr/bin/glxgears not found' >>\"$LOG\"\n\
+          \x20 exit 127\n\
+          fi\n\
+          ERR=\"/tmp/glxgears.$$.err\"\n\
+          trap 'rm -f \"$ERR\"' EXIT INT TERM\n\
+          \"$GLX\" \"$@\" 2>\"$ERR\"\n\
+          rc=$?\n\
+          if [ \"$rc\" -ne 0 ] && grep -Eq 'zink: swapchain killed|GLXBadCurrentWindow' \"$ERR\"; then\n\
+          \x20 echo \"[$(date '+%H:%M:%S')] glxgears: zink swapchain failure detected; retrying on llvmpipe\" >>\"$LOG\"\n\
+          \x20 export LIBGL_ALWAYS_SOFTWARE=1\n\
+          \x20 export GALLIUM_DRIVER=llvmpipe\n\
+          \x20 export MESA_LOADER_DRIVER_OVERRIDE=llvmpipe\n\
+          \x20 exec \"$GLX\" \"$@\" 2>>\"$LOG\"\n\
+          fi\n\
+          cat \"$ERR\" >&2\n\
+          [ \"$rc\" -eq 0 ] || cat \"$ERR\" >>\"$LOG\" 2>/dev/null || true\n\
+          exit \"$rc\"\n",
+    )
+    .unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755)).unwrap();
+    }
 }
 
 /// `/usr/local/bin/eclipse-xkbmap`: load the X keyboard map into Xwayland once
@@ -2802,6 +2844,29 @@ mod tests {
         assert!(caches.contains("/root/.cache/pixbuf-loaders.cache"));
         let ff = fs::read_to_string(dir.join("usr/local/bin/eclipse-firefox")).unwrap();
         assert!(ff.contains("export NO_AT_BRIDGE=1\n"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn glxgears_wrapper_parses_and_has_llvmpipe_fallback() {
+        let dir =
+            std::env::temp_dir().join(format!("eclipse-glxgears-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        write_glxgears_wrapper(&dir);
+        let path = dir.join("usr/local/bin/glxgears");
+        let src = fs::read_to_string(&path).unwrap();
+        assert!(src.starts_with("#!/bin/sh\n"), "shebang");
+        let st = std::process::Command::new("sh")
+            .arg("-n")
+            .arg(&path)
+            .status()
+            .unwrap();
+        assert!(st.success(), "sh -n rejected glxgears wrapper");
+        assert!(src.contains("zink: swapchain killed"));
+        assert!(src.contains("GLXBadCurrentWindow"));
+        assert!(src.contains("LIBGL_ALWAYS_SOFTWARE=1"));
+        assert!(src.contains("GALLIUM_DRIVER=llvmpipe"));
+        assert!(src.contains("MESA_LOADER_DRIVER_OVERRIDE=llvmpipe"));
         let _ = fs::remove_dir_all(&dir);
     }
 
