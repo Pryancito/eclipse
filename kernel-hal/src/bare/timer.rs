@@ -305,10 +305,16 @@ pub(crate) fn notify_clock_changed() {
     if observer == 0 {
         return;
     }
-    // Soft-smash can leave a truncated .text low32 in this AtomicUsize.
+    // Soft-smash can leave a truncated .text low32 in this AtomicUsize, and
+    // this is about to `transmute` it and *call* it. The high-bits test this
+    // used to be caught the truncation and nothing else: every stack and
+    // physmap address in the kernel half shares those bits, so a slot
+    // scribbled with a stack pointer -- the commonest residue of all, and the
+    // one the whole soft-smash hunt is about -- passed the guard and was
+    // jumped to. A function pointer belongs in `.text`; ask that.
     #[cfg(all(target_arch = "x86_64", not(test)))]
     {
-        if (observer as u64 >> 32) != 0xffff_ff00 {
+        if !crate::kaddr::is_kernel_text(observer as u64) {
             zcore_drivers::utils::note_heap_smash_suspected();
             return;
         }

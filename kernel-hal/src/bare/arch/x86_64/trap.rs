@@ -66,15 +66,16 @@ unsafe extern "C" fn null_slot_fault_recover() {
     core::arch::naked_asm!("ud2",);
 }
 
+/// Whether `ret` is a `.text` address at all — the bounds come from the
+/// linker's own `stext`/`etext` (see [`crate::kaddr`]), not from a literal.
+///
+/// An RFLAGS-shaped value cannot reach here: RF is bit 16, so a saved RFLAGS
+/// has a zero top half and this window does not. The guard that used to be
+/// spelled out alongside is load-bearing only in the companion question, on
+/// a word whose top half is already gone — [`crate::kaddr::truncated_text`].
 #[inline]
 fn looks_like_kernel_text_ret(ret: u64) -> bool {
-    let low32 = ret & 0xffff_ffff;
-    let in_text = (0x10_000..0x0100_0000).contains(&low32);
-    let high_ok = (ret >> 32) == 0xffff_ff00;
-    // Reject RFLAGS-shaped values that can land in the .text low32 window
-    // (RF=bit16 ⇒ 0x1xxxx). Real return addresses have kernel high bits.
-    let looks_like_rflags = (ret >> 32) == 0 && (ret & 0x2) != 0 && (ret & !0x3f_ffffu64) == 0;
-    high_ok && in_text && !looks_like_rflags
+    crate::kaddr::is_kernel_text(ret)
 }
 
 /// Whether the instruction ending at `ret` is a CALL — i.e. whether `ret` can
@@ -107,53 +108,17 @@ fn looks_like_kernel_text_ret(ret: u64) -> bool {
 /// `ret` must already have passed [`looks_like_kernel_text_ret`], so the
 /// bytes read here are inside mapped, read-only kernel `.text`.
 fn preceded_by_call(ret: u64) -> bool {
-    let byte = |a: u64| -> u8 {
-        // SAFETY: `a` is within [ret - 8, ret), inside mapped kernel .text
-        // (caller contract above); .text is never unmapped.
-        unsafe { core::ptr::read_volatile(a as *const u8) }
-    };
-    if ret < 0xffff_ff00_0001_0000 + 8 {
+    let (text_lo, _) = crate::kaddr::kernel_text();
+    if ret < text_lo + 8 {
         return false;
     }
-    // call rel32: E8 xx xx xx xx
-    if byte(ret - 5) == 0xe8 {
-        return true;
+    let mut tail = [0u8; 8];
+    for (i, b) in tail.iter_mut().enumerate() {
+        // SAFETY: `ret - 8 + i` is within [ret - 8, ret), inside mapped kernel
+        // .text (caller contract above); .text is never unmapped.
+        *b = unsafe { core::ptr::read_volatile((ret - 8 + i as u64) as *const u8) };
     }
-    // Indirect near call: optional REX (0x40..=0x4F), then FF with ModRM
-    // reg-field /2 (0x10..=0x17 register-indirect, 0xD0..=0xD7 register,
-    // 0x50..=0x57 [reg+disp8], 0x90..=0x97 [reg+disp32]), possibly with a SIB
-    // byte. Instead of fully decoding ModRM/SIB, test each plausible length:
-    // an FF at `ret - n` whose ModRM selects /2 and whose operand bytes fill
-    // exactly `n` is a CALL ending at `ret`.
-    for n in 2..=8u64 {
-        let mut p = ret - n;
-        let mut rem = n;
-        if (0x40..=0x4f).contains(&byte(p)) {
-            p += 1;
-            rem -= 1;
-        }
-        if rem < 2 || byte(p) != 0xff {
-            continue;
-        }
-        let modrm = byte(p + 1);
-        if (modrm >> 3) & 7 != 2 {
-            continue; // not /2 = CALL
-        }
-        let mode = modrm >> 6;
-        let rm = modrm & 7;
-        let sib = mode != 3 && rm == 4; // SIB byte present
-        let disp: u64 = match mode {
-            0 if rm == 5 => 4, // RIP-relative disp32
-            0 => 0,
-            1 => 1,
-            2 => 4,
-            _ => 0, // register-direct
-        };
-        if 2 + sib as u64 + disp == rem {
-            return true;
-        }
-    }
-    false
+    crate::kaddr::ends_with_call(&tail)
 }
 
 // ── Idle-halt stack seal ────────────────────────────────────────────────────
@@ -395,7 +360,7 @@ fn dump_null_execute_stack_once(tf: &TrapFrame, sp: u64, slot0: u64) {
     let mut q = [slot0, 0u64, 0u64, 0u64];
     for (i, slot) in q.iter_mut().enumerate().skip(1) {
         let a = sp + (i * 8) as u64;
-        if (0xffff_ff00_0000_0000..0xffff_ff01_0000_0000).contains(&a) && (a & 7) == 0 {
+        if crate::kaddr::is_kernel_stack_qword(a) {
             // SAFETY: a is 8-aligned in the kernel stack VA window.
             *slot = unsafe { core::ptr::read_volatile(a as *const u64) };
         }
@@ -440,13 +405,11 @@ fn dump_null_execute_stack_once(tf: &TrapFrame, sp: u64, slot0: u64) {
     // computed length. Scan the contiguous zeros around the fault slot (bounded,
     // 8-aligned reads in the stack window only) and report the extent so a photo
     // of ONE crash is enough to classify the writer without another boot.
-    const SW_LO: u64 = 0xffff_ff00_0000_0000;
-    const SW_HI: u64 = 0xffff_ff01_0000_0000;
-    let readable = |a: u64| (SW_LO..SW_HI).contains(&a) && (a & 7) == 0;
+    let readable = crate::kaddr::is_kernel_stack_qword;
     let read8 = |a: u64| -> Option<u64> {
         // SAFETY: caller-guaranteed 8-aligned address inside the mapped kernel
         // coroutine-stack window; a stray read there cannot fault (the guard
-        // pages are outside [SW_LO, SW_HI) growth, and this is diagnostic-only).
+        // pages are outside the kernel-half window, and this is diagnostic-only).
         readable(a).then(|| unsafe { core::ptr::read_volatile(a as *const u64) })
     };
     if read8(sp) == Some(0) {
@@ -538,7 +501,7 @@ fn dump_null_execute_stack_once(tf: &TrapFrame, sp: u64, slot0: u64) {
 fn report_dma_uaf_if_recycled(sp: u64) {
     use crate::vm::{GenericPageTable, PageTable};
     let va = sp as usize;
-    if !(0xffff_ff00_0000_0000..0xffff_ff01_0000_0000).contains(&va) {
+    if !crate::kaddr::is_kernel_addr(va as u64) {
         return;
     }
     let pt = PageTable::from_current();
@@ -605,7 +568,7 @@ fn try_recover_null_return_slot(tf: &mut TrapFrame, fault_vaddr: usize, sp: u64)
             ));
             let mut a = lo;
             while a < hi {
-                if (0xffff_ff00_0000_0000..0xffff_ff01_0000_0000).contains(&a) {
+                if crate::kaddr::is_kernel_stack_qword(a) {
                     // SAFETY: 8-aligned address on this executor's mapped stack
                     // window (same bound as the scan below).
                     let w = unsafe { core::ptr::read_volatile(a as *const u64) };
@@ -626,7 +589,7 @@ fn try_recover_null_return_slot(tf: &mut TrapFrame, fault_vaddr: usize, sp: u64)
     const SCAN_QWORDS: u64 = 32;
     for i in 1..=SCAN_QWORDS {
         let addr = sp + i * 8;
-        if (addr & 7) != 0 || addr >= 0xffff_ff01_0000_0000 {
+        if !crate::kaddr::is_kernel_stack_qword(addr) {
             break;
         }
         // SAFETY: addr stays in the same kernel stack window as `sp`.
@@ -675,8 +638,7 @@ fn try_skip_null_execute_call(tf: &mut TrapFrame, fault_vaddr: usize) -> bool {
     // For same-CPL kernel #PF on `call`, CPU-saved RSP points at the return
     // address the CALL pushed before loading the bad RIP.
     let sp = tf.rsp as u64;
-    let plausible_sp = |a: u64| (0xffff_ff00_0000_0000..0xffff_ff01_0000_0000).contains(&a);
-    if !plausible_sp(sp) || (sp & 7) != 0 {
+    if !crate::kaddr::is_kernel_stack_qword(sp) {
         return false;
     }
     // SAFETY: sp is the faulting RSP from the hardware iret frame (trap.S),
@@ -721,12 +683,8 @@ fn try_skip_null_execute_call(tf: &mut TrapFrame, fault_vaddr: usize) -> bool {
     // Accept only a return into kernel .text (same bound the #GP-repair path
     // uses for low32). A non-kernel / truncated ret means the stack is too
     // far gone to skip safely — fall through to the panic diagnostics.
-    let low32 = ret & 0xffff_ffff;
-    let in_text = (0x10_000..0x0100_0000).contains(&low32);
-    let high_ok = (ret >> 32) == 0xffff_ff00;
-    let looks_like_rflags = (ret >> 32) == 0 && (ret & 0x2) != 0 && (ret & !0x3f_ffffu64) == 0;
-    if !high_ok || !in_text || looks_like_rflags {
-        let truncated_text = (ret >> 32) == 0 && in_text && !looks_like_rflags;
+    if !looks_like_kernel_text_ret(ret) {
+        let truncated_text = crate::kaddr::looks_truncated_text(ret);
         if truncated_text || ret < 0x1000 {
             ::executor::note_heap_smash_suspected();
             use core::sync::atomic::{AtomicBool, Ordering};
@@ -851,7 +809,8 @@ fn report_ud_shape(rip: u64) {
     // scribbled function pointer and the CPU decoded whatever lives at address
     // 0x21 — the same corrupt-pointer family as the null-range #PFs, not an
     // instruction problem. Reading bytes there is not safe, so say it and stop.
-    if !(0xffff_ff00_0001_0000 + 8..0xffff_ff00_0100_0000).contains(&rip) {
+    let (text_lo, text_hi) = crate::kaddr::kernel_text();
+    if !(text_lo + 8..text_hi.saturating_sub(1)).contains(&rip) {
         crate::console::serial_write_fmt_spin(format_args!(
             "[#UD] RIP {:#x} is outside kernel .text — execution branched \
              through a corrupt function pointer and is decoding whatever is at \
@@ -1006,15 +965,12 @@ pub extern "C" fn trap_handler(tf: &mut TrapFrame) {
             // pattern of a real kernel pointer AND a low32 inside .text — so it
             // never fires on a genuine #GP or user address.
             if vec == 13 {
-                let rip = tf.rip;
-                let mid_is_kernel = ((rip >> 32) & 0x00ff_ffff) == 0x00ff_ff00;
-                let top_mangled = (rip >> 56) != 0xff;
-                let low32 = rip & 0xffff_ffff;
-                let in_text = (0x10_000..0x0100_0000).contains(&low32);
-                if mid_is_kernel && top_mangled && in_text {
+                let rip = tf.rip as u64;
+                if let Some(fixed) =
+                    crate::kaddr::unmangle_kernel_text(crate::kaddr::kernel_text(), rip)
+                {
                     use core::sync::atomic::{AtomicUsize, Ordering};
                     static REPAIRS: AtomicUsize = AtomicUsize::new(0);
-                    let fixed = (rip & 0x00ff_ffff_ffff_ffff) | 0xff00_0000_0000_0000;
                     let n = REPAIRS.fetch_add(1, Ordering::Relaxed);
                     if n < 64 {
                         crate::console::serial_write_fmt_spin(format_args!(
@@ -1022,7 +978,7 @@ pub extern "C" fn trap_handler(tf: &mut TrapFrame) {
                             n, rip, fixed,
                         ));
                     }
-                    tf.rip = fixed;
+                    tf.rip = fixed as usize;
                     return;
                 }
             }

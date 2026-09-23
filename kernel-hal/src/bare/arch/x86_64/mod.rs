@@ -101,6 +101,26 @@ pub fn init_ram_disk() -> Option<&'static mut [u8]> {
 pub fn primary_init_early() {
     // init serial output first
     drivers::init_early().unwrap();
+    // Hand the crash probes the image's own `.text` bounds. Until this runs
+    // they answer from a literal window whose low bound sits 64 KiB above the
+    // image base, so a return address into the first page of `.text` does not
+    // look like one. aarch64 and riscv64 have always read these symbols to
+    // build their kernel page tables; x86_64 was the one guessing.
+    extern "C" {
+        fn stext();
+        fn etext();
+    }
+    let (lo, hi) = (
+        stext as *const () as usize as u64,
+        etext as *const () as usize as u64,
+    );
+    if !crate::kaddr::set_kernel_text(lo, hi) {
+        warn!(
+            "[boot] stext/etext = {:#x}..{:#x} is not a plausible .text range; \
+             crash probes keep the literal window",
+            lo, hi,
+        );
+    }
 }
 
 /// Nothing to do: the bootloader hands the kernel a page table that already
