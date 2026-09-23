@@ -411,49 +411,22 @@ impl Syscall<'_> {
     ///
     /// Everything else is delegated to [`sys_clone`](Self::sys_clone).
     pub async fn sys_clone3(&self, uargs: UserInPtr<u64>, size: usize) -> SysResult {
-        const CLONE_ARGS_SIZE_VER0: usize = 64;
         if size < CLONE_ARGS_SIZE_VER0 {
             return Err(LxError::EINVAL);
         }
         let words = uargs.read_array(CLONE_ARGS_SIZE_VER0 / 8)?;
-        let [flags, pidfd, child_tid, parent_tid, exit_signal, stack, stack_size, tls] =
-            <[u64; 8]>::try_from(words).unwrap();
+        let words = <[u64; 8]>::try_from(words).unwrap();
+        let args = clone3_to_clone(words)?;
         info!(
             "clone3: flags={:#x} exit_signal={} stack={:#x} stack_size={:#x}",
-            flags, exit_signal, stack, stack_size
+            words[0], words[4], words[5], words[6]
         );
-        // The exit signal lives in its own field; flags carrying low-byte bits
-        // is invalid here, as is an out-of-range signal number.
-        if flags & 0xff != 0 || exit_signal > 64 {
-            return Err(LxError::EINVAL);
-        }
-        if (stack == 0) != (stack_size == 0) {
-            return Err(LxError::EINVAL);
-        }
-        let newsp = if stack != 0 {
-            (stack + stack_size) as usize
-        } else {
-            0
-        };
-        let clone_flags = CloneFlags::from_bits_truncate(flags as usize);
-        // Legacy clone reports the pidfd through the parent_tid slot; clone3
-        // gives it a dedicated field. PARENT_SETTID and PIDFD together can't
-        // be expressed through the legacy entry point — glibc never combines
-        // them, so reject rather than misdeliver one of the two.
-        let parent_slot = if clone_flags.contains(CloneFlags::PIDFD) {
-            if clone_flags.contains(CloneFlags::PARENT_SETTID) {
-                return Err(LxError::EINVAL);
-            }
-            pidfd
-        } else {
-            parent_tid
-        };
         self.sys_clone(
-            flags as usize | exit_signal as usize,
-            newsp,
-            (parent_slot as usize).into(),
-            tls as usize,
-            (child_tid as usize).into(),
+            args.flags,
+            args.newsp,
+            args.parent_slot.into(),
+            args.tls,
+            args.child_tid.into(),
         )
         .await
     }
@@ -1911,6 +1884,77 @@ bitflags! {
 
 /// `prctl(PR_SET_PDEATHSIG)` took its argument as a byte, so any number whose
 /// low byte happened to name a signal was latched as that signal.
+/// Size of `struct clone_args` version 0 (Linux `CLONE_ARGS_SIZE_VER0`).
+pub(crate) const CLONE_ARGS_SIZE_VER0: usize = 64;
+
+/// The legacy-`clone` arguments that a `clone3` `struct clone_args` decodes to.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct Clone3Args {
+    /// Legacy `flags` word: the clone flags with the exit signal in its low byte.
+    pub flags: usize,
+    /// Initial stack pointer for the child (0 = share the caller's).
+    pub newsp: usize,
+    /// What legacy `clone` calls `parent_tid`: the pidfd slot under `CLONE_PIDFD`.
+    pub parent_slot: usize,
+    /// New TLS base.
+    pub tls: usize,
+    /// `child_tid` pointer.
+    pub child_tid: usize,
+}
+
+/// Decodes the eight `u64` of `struct clone_args` into legacy `clone`
+/// arguments, or the `errno` Linux answers for that struct.
+///
+/// Pulled out of [`Syscall::sys_clone3`] because it is the whole of what
+/// `clone3` does differently, and because until this batch **none of it ran**:
+/// the dispatch table carried `Sys::CLONE3 => Err(LxError::ENOSYS)` above the
+/// arm that called the implementation, with `#[allow(unreachable_patterns)]`
+/// on the live arm to keep the build quiet under `deny(warnings)`. The stub
+/// answered every `clone3`, and the implementation below it was decoration.
+///
+/// Which mattered, because it carried a way for any process to take the kernel
+/// down: the child's stack pointer is `stack + stack_size`, both read straight
+/// out of userspace, and a plain `+` on a debug build panics on overflow.
+/// `clone3` with `stack = u64::MAX` and `stack_size = 1` was a kernel panic
+/// waiting for the day someone deleted the stub.
+pub(crate) fn clone3_to_clone(words: [u64; 8]) -> LxResult<Clone3Args> {
+    let [flags, pidfd, child_tid, parent_tid, exit_signal, stack, stack_size, tls] = words;
+    // The exit signal lives in its own field; flags carrying low-byte bits
+    // is invalid here, as is an out-of-range signal number.
+    if flags & 0xff != 0 || exit_signal > 64 {
+        return Err(LxError::EINVAL);
+    }
+    // Linux's `clone3_stack_valid`: both zero, or neither.
+    if (stack == 0) != (stack_size == 0) {
+        return Err(LxError::EINVAL);
+    }
+    let newsp = if stack != 0 {
+        stack.checked_add(stack_size).ok_or(LxError::EINVAL)?
+    } else {
+        0
+    };
+    let clone_flags = CloneFlags::from_bits_truncate(flags as usize);
+    // Legacy clone reports the pidfd through the parent_tid slot; clone3
+    // gives it a dedicated field. PARENT_SETTID and PIDFD together can't
+    // be expressed through the legacy entry point — glibc never combines
+    // them, so reject rather than misdeliver one of the two.
+    let parent_slot = if clone_flags.contains(CloneFlags::PIDFD) {
+        if clone_flags.contains(CloneFlags::PARENT_SETTID) {
+            return Err(LxError::EINVAL);
+        }
+        pidfd
+    } else {
+        parent_tid
+    };
+    Ok(Clone3Args {
+        flags: flags as usize | exit_signal as usize,
+        newsp: newsp as usize,
+        parent_slot: parent_slot as usize,
+        tls: tls as usize,
+        child_tid: child_tid as usize,
+    })
+}
+
 #[cfg(test)]
 mod pdeathsig_tests {
     use super::*;
@@ -1960,5 +2004,148 @@ mod pdeathsig_tests {
         // prctl never sees it as negative; it sees a very large unsigned.
         assert_eq!(pdeathsig_from_arg(usize::MAX), Err(LxError::EINVAL));
         assert_eq!(pdeathsig_from_arg(-9i64 as usize), Err(LxError::EINVAL));
+    }
+}
+
+#[cfg(test)]
+mod clone3_tests {
+    use super::*;
+
+    /// `struct clone_args` version 0, as eight `u64`, in field order.
+    fn args(
+        flags: u64,
+        pidfd: u64,
+        child_tid: u64,
+        parent_tid: u64,
+        exit_signal: u64,
+        stack: u64,
+        stack_size: u64,
+        tls: u64,
+    ) -> [u64; 8] {
+        [
+            flags,
+            pidfd,
+            child_tid,
+            parent_tid,
+            exit_signal,
+            stack,
+            stack_size,
+            tls,
+        ]
+    }
+
+    fn ok(words: [u64; 8]) -> Clone3Args {
+        clone3_to_clone(words).expect("should decode")
+    }
+
+    #[test]
+    fn a_stack_that_overflows_is_refused_instead_of_panicking_the_kernel() {
+        // `stack + stack_size` are both read straight out of userspace, and a
+        // plain `+` panics on a debug build. Any process could have taken the
+        // kernel down with this the moment clone3 became reachable.
+        assert_eq!(
+            clone3_to_clone(args(0, 0, 0, 0, 0, u64::MAX, 1, 0)),
+            Err(LxError::EINVAL)
+        );
+        assert_eq!(
+            clone3_to_clone(args(0, 0, 0, 0, 0, 1, u64::MAX, 0)),
+            Err(LxError::EINVAL)
+        );
+        assert_eq!(
+            clone3_to_clone(args(0, 0, 0, 0, 0, u64::MAX, u64::MAX, 0)),
+            Err(LxError::EINVAL)
+        );
+        // The largest pair that does not overflow is still a legal request.
+        let a = ok(args(0, 0, 0, 0, 0, u64::MAX - 1, 1, 0));
+        assert_eq!(a.newsp, u64::MAX as usize);
+    }
+
+    #[test]
+    fn the_child_stack_pointer_is_the_top_of_the_range() {
+        // Legacy clone is handed the top of the stack; clone3 gives the low
+        // address and a size, and the kernel adds them.
+        let a = ok(args(0, 0, 0, 0, 0, 0x7000_0000, 0x10_0000, 0));
+        assert_eq!(a.newsp, 0x7010_0000);
+        // No stack at all means "share the caller's", not "top of nothing".
+        let a = ok(args(0, 0, 0, 0, 0, 0, 0, 0));
+        assert_eq!(a.newsp, 0);
+    }
+
+    #[test]
+    fn a_stack_without_a_size_or_a_size_without_a_stack_is_refused() {
+        assert_eq!(
+            clone3_to_clone(args(0, 0, 0, 0, 0, 0x7000_0000, 0, 0)),
+            Err(LxError::EINVAL)
+        );
+        assert_eq!(
+            clone3_to_clone(args(0, 0, 0, 0, 0, 0, 0x10_0000, 0)),
+            Err(LxError::EINVAL)
+        );
+    }
+
+    #[test]
+    fn the_exit_signal_is_folded_back_into_the_legacy_flags_word() {
+        // clone3 gives the exit signal its own field; legacy clone packs it
+        // into the low byte of flags, which is what sys_clone reads.
+        let a = ok(args(0x0011_0f00, 0, 0, 0, 17, 0, 0, 0));
+        assert_eq!(a.flags & 0xff, 17, "SIGCHLD must survive the conversion");
+        assert_eq!(a.flags & !0xff, 0x0011_0f00);
+    }
+
+    #[test]
+    fn flags_carrying_a_signal_in_their_low_byte_are_refused() {
+        // In clone3 the low byte of flags is reserved; a caller putting the
+        // signal there as well would have it counted twice.
+        assert_eq!(
+            clone3_to_clone(args(0x0011_0f11, 0, 0, 0, 0, 0, 0, 0)),
+            Err(LxError::EINVAL)
+        );
+    }
+
+    #[test]
+    fn a_signal_number_that_does_not_exist_is_refused() {
+        assert!(clone3_to_clone(args(0, 0, 0, 0, 64, 0, 0, 0)).is_ok());
+        assert_eq!(
+            clone3_to_clone(args(0, 0, 0, 0, 65, 0, 0, 0)),
+            Err(LxError::EINVAL)
+        );
+        assert_eq!(
+            clone3_to_clone(args(0, 0, 0, 0, u64::MAX, 0, 0, 0)),
+            Err(LxError::EINVAL)
+        );
+    }
+
+    #[test]
+    fn the_pidfd_travels_in_the_parent_tid_slot_only_when_asked_for() {
+        let pidfd_flag = CloneFlags::PIDFD.bits() as u64;
+        let a = ok(args(pidfd_flag, 0xfd00, 0, 0xba5e, 0, 0, 0, 0));
+        assert_eq!(a.parent_slot, 0xfd00, "CLONE_PIDFD uses its own field");
+        let a = ok(args(0, 0xfd00, 0, 0xba5e, 0, 0, 0, 0));
+        assert_eq!(a.parent_slot, 0xba5e, "without it, parent_tid as usual");
+    }
+
+    #[test]
+    fn asking_for_a_pidfd_and_a_parent_tid_at_once_is_refused_not_guessed() {
+        // The legacy entry point has one slot for both, so one of the two
+        // would be written to the other's pointer.
+        let both = (CloneFlags::PIDFD.bits() | CloneFlags::PARENT_SETTID.bits()) as u64;
+        assert_eq!(
+            clone3_to_clone(args(both, 0x1000, 0, 0x2000, 0, 0, 0, 0)),
+            Err(LxError::EINVAL)
+        );
+    }
+
+    #[test]
+    fn the_remaining_fields_are_passed_through_untouched() {
+        let a = ok(args(0x0001_0000, 0, 0xc71d, 0xba5e, 0, 0, 0, 0x715));
+        assert_eq!(a.child_tid, 0xc71d);
+        assert_eq!(a.tls, 0x715);
+        assert_eq!(a.parent_slot, 0xba5e);
+    }
+
+    #[test]
+    fn version_zero_of_the_struct_is_sixty_four_bytes() {
+        assert_eq!(CLONE_ARGS_SIZE_VER0, 64);
+        assert_eq!(CLONE_ARGS_SIZE_VER0 / 8, 8, "eight u64 fields");
     }
 }

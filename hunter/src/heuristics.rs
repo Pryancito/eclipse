@@ -342,9 +342,9 @@ fn stats_shard(pid: u64) -> &'static Mutex<BTreeMap<u64, ProcStat>> {
 static SYS_FORK_WINDOW_START: AtomicU64 = AtomicU64::new(0);
 static SYS_FORK_COUNT: AtomicU64 = AtomicU64::new(0);
 static SYS_FORK_ALERTED: AtomicBool = AtomicBool::new(false);
-/// Taken only to start a new system-wide fork window, so the three stores that
-/// make one up cannot interleave. See [`roll_sys_fork_window`].
 lazy_static::lazy_static! {
+    /// Taken only to start a new system-wide fork window, so the three stores
+    /// that make one up cannot interleave. See [`roll_sys_fork_window`].
     static ref SYS_FORK_ROLL: Mutex<()> = Mutex::new(());
 }
 

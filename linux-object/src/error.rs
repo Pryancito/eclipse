@@ -271,7 +271,12 @@ impl From<FsError> for LxError {
             FsError::EntryExist => LxError::EEXIST,
             FsError::NotSameFs => LxError::EXDEV,
             FsError::InvalidParam => LxError::EINVAL,
-            FsError::NoDeviceSpace => LxError::ENOMEM,
+            // ENOSPC, not ENOMEM: this is "the filesystem is full", and it is
+            // the errno every caller actually tests for. A `write` that
+            // answers ENOMEM instead makes a program report the machine out of
+            // memory and, worse, retry -- musl's stdio, package managers and
+            // sqlite all branch on ENOSPC specifically and on nothing else.
+            FsError::NoDeviceSpace => LxError::ENOSPC,
             FsError::DirRemoved => LxError::ENOENT,
             FsError::DirNotEmpty => LxError::ENOTEMPTY,
             FsError::WrongFs => LxError::EINVAL,
@@ -309,6 +314,184 @@ impl From<Error> for LxError {
             Error::BufferTooSmall => LxError::ENOBUFS,
             Error::InvalidLength => LxError::EINVAL,
             Error::InvalidVectorAddress => LxError::EINVAL,
+        }
+    }
+}
+
+#[cfg(test)]
+mod errno_tests {
+    use super::*;
+
+    /// The numbers, checked against `asm-generic/errno.h` (which x86_64,
+    /// aarch64 and riscv64 all use). These are the values userspace compares
+    /// against, so a table that drifts is a program taking the wrong branch.
+    #[test]
+    fn the_numbers_are_the_ones_userspace_knows() {
+        for (err, n) in [
+            (LxError::EPERM, 1),
+            (LxError::ENOENT, 2),
+            (LxError::ESRCH, 3),
+            (LxError::EINTR, 4),
+            (LxError::EIO, 5),
+            (LxError::ENXIO, 6),
+            (LxError::EBADF, 9),
+            (LxError::EAGAIN, 11),
+            (LxError::ENOMEM, 12),
+            (LxError::EACCES, 13),
+            (LxError::EFAULT, 14),
+            (LxError::EBUSY, 16),
+            (LxError::EEXIST, 17),
+            (LxError::EXDEV, 18),
+            (LxError::ENODEV, 19),
+            (LxError::ENOTDIR, 20),
+            (LxError::EISDIR, 21),
+            (LxError::EINVAL, 22),
+            (LxError::ENOTTY, 25),
+            (LxError::EFBIG, 27),
+            (LxError::ENOSPC, 28),
+            (LxError::ESPIPE, 29),
+            (LxError::EROFS, 30),
+            (LxError::EPIPE, 32),
+            (LxError::ERANGE, 34),
+            (LxError::ENOSYS, 38),
+            (LxError::ENOTEMPTY, 39),
+            (LxError::ELOOP, 40),
+            (LxError::ETIME, 62),
+            (LxError::EOVERFLOW, 75),
+            (LxError::EBADFD, 77),
+            (LxError::ENOTSOCK, 88),
+            (LxError::EOPNOTSUPP, 95),
+            (LxError::ETIMEDOUT, 110),
+            (LxError::ECONNREFUSED, 111),
+            (LxError::EALREADY, 114),
+            (LxError::EINPROGRESS, 115),
+        ] {
+            assert_eq!(err as isize, n, "{:?}", err);
+        }
+    }
+
+    #[test]
+    fn a_full_filesystem_says_so_instead_of_blaming_memory() {
+        // ENOSPC is the errno every caller tests for when a write fails --
+        // musl's stdio, package managers and sqlite branch on it and on
+        // nothing else. Answering ENOMEM made a full disk look like a machine
+        // out of memory, which is both the wrong message and, for anything
+        // that retries on ENOMEM, the wrong action.
+        assert_eq!(LxError::from(FsError::NoDeviceSpace), LxError::ENOSPC);
+        assert_ne!(LxError::from(FsError::NoDeviceSpace), LxError::ENOMEM);
+    }
+
+    /// Every `FsError` the filesystem layer can raise, and the errno it must
+    /// reach userspace as. Written out rather than derived so a change to the
+    /// mapping has to be made twice, on purpose.
+    #[test]
+    fn every_filesystem_error_maps_to_the_errno_it_means() {
+        for (fs, lx) in [
+            (FsError::NotSupported, LxError::ENOSYS),
+            (FsError::NotFile, LxError::EISDIR),
+            (FsError::IsDir, LxError::EISDIR),
+            (FsError::NotDir, LxError::ENOTDIR),
+            (FsError::EntryNotFound, LxError::ENOENT),
+            (FsError::EntryExist, LxError::EEXIST),
+            (FsError::NotSameFs, LxError::EXDEV),
+            (FsError::InvalidParam, LxError::EINVAL),
+            (FsError::NoDeviceSpace, LxError::ENOSPC),
+            (FsError::DirRemoved, LxError::ENOENT),
+            (FsError::DirNotEmpty, LxError::ENOTEMPTY),
+            (FsError::WrongFs, LxError::EINVAL),
+            (FsError::DeviceError, LxError::EIO),
+            (FsError::IOCTLError, LxError::EINVAL),
+            (FsError::NoDevice, LxError::ENODEV),
+            (FsError::Again, LxError::EAGAIN),
+            (FsError::TimedOut, LxError::ETIME),
+            (FsError::SymLoop, LxError::ELOOP),
+            (FsError::Busy, LxError::EBUSY),
+            (FsError::ReadOnly, LxError::EROFS),
+            (FsError::Interrupted, LxError::EINTR),
+            (FsError::NoPermission, LxError::EACCES),
+            (FsError::OpNotSupported, LxError::EOPNOTSUPP),
+            (FsError::BadAddress, LxError::EFAULT),
+            (FsError::BadState, LxError::EBADFD),
+            (FsError::Broken, LxError::EPIPE),
+            (FsError::NoSuchDeviceOrAddress, LxError::ENXIO),
+        ] {
+            let name = alloc::format!("{:?}", fs);
+            assert_eq!(LxError::from(fs), lx, "{}", name);
+        }
+    }
+
+    #[test]
+    fn a_missing_device_is_enodev_and_not_einval() {
+        // mesa's nouveau winsys tests for -ENODEV specifically to decide a
+        // channel was killed; a driver that carefully returns it only for
+        // userspace to read EINVAL makes every such check silently wrong.
+        assert_eq!(LxError::from(FsError::NoDevice), LxError::ENODEV);
+    }
+
+    #[test]
+    fn running_out_of_frames_is_enomem_and_never_a_panic() {
+        // Seen live as one panic per CPU when foot's render load drained the
+        // frame pool. It has to surface to the caller as an errno.
+        assert_eq!(LxError::from(ZxError::NO_MEMORY), LxError::ENOMEM);
+        assert_eq!(LxError::from(ZxError::NO_RESOURCES), LxError::ENOMEM);
+    }
+
+    #[test]
+    fn the_kernel_errors_userspace_acts_on_map_to_their_posix_names() {
+        for (zx, lx) in [
+            (ZxError::INVALID_ARGS, LxError::EINVAL),
+            (ZxError::NOT_SUPPORTED, LxError::ENOSYS),
+            (ZxError::ALREADY_EXISTS, LxError::EEXIST),
+            (ZxError::SHOULD_WAIT, LxError::EAGAIN),
+            (ZxError::PEER_CLOSED, LxError::EPIPE),
+            (ZxError::BAD_HANDLE, LxError::EBADF),
+            (ZxError::TIMED_OUT, LxError::ETIMEDOUT),
+            (ZxError::ACCESS_DENIED, LxError::EACCES),
+            (ZxError::NOT_FOUND, LxError::ENOENT),
+            (ZxError::NOT_DIR, LxError::ENOTDIR),
+            (ZxError::NOT_FILE, LxError::EISDIR),
+            (ZxError::FILE_BIG, LxError::EFBIG),
+            (ZxError::NO_SPACE, LxError::ENOSPC),
+            (ZxError::UNAVAILABLE, LxError::EBUSY),
+            (ZxError::CANCELED, LxError::EINTR),
+            (ZxError::IO, LxError::EIO),
+        ] {
+            assert_eq!(LxError::from(zx), lx, "{:?}", zx);
+        }
+    }
+
+    #[test]
+    fn an_unmapped_kernel_error_is_still_an_error_and_not_a_panic() {
+        // The fallback exists so a new ZxError can never take the machine
+        // down; EIO is a real errno for the caller.
+        assert_eq!(LxError::from(ZxError::INTERNAL), LxError::EIO);
+        assert_eq!(LxError::from(ZxError::WRONG_TYPE), LxError::EIO);
+    }
+
+    #[test]
+    fn reading_userspace_memory_badly_is_efault_and_not_einval() {
+        // EFAULT is what a program's own fault handler and its test suite
+        // expect from a bad pointer; EINVAL reads as "your arguments were
+        // wrong", which sends the author looking in the wrong place.
+        assert_eq!(LxError::from(Error::InvalidPointer), LxError::EFAULT);
+        assert_eq!(LxError::from(Error::InvalidUtf8), LxError::EINVAL);
+        assert_eq!(LxError::from(Error::BufferTooSmall), LxError::ENOBUFS);
+        assert_eq!(LxError::from(Error::InvalidLength), LxError::EINVAL);
+        assert_eq!(LxError::from(Error::InvalidVectorAddress), LxError::EINVAL);
+    }
+
+    #[test]
+    fn no_errno_is_zero_because_zero_is_success() {
+        // `-(err as isize)` is how a failure reaches the caller's register, so
+        // an errno of 0 would negate to 0 and read as a successful call.
+        for err in [
+            LxError::from(FsError::NoDeviceSpace),
+            LxError::from(FsError::EntryNotFound),
+            LxError::from(ZxError::NO_MEMORY),
+            LxError::from(ZxError::INTERNAL),
+            LxError::from(Error::InvalidPointer),
+        ] {
+            assert!(err as isize > 0, "{:?} would negate to a success", err);
         }
     }
 }
