@@ -139,6 +139,8 @@ pub enum LxError {
     EINPROGRESS = 115,
     /// Address already in use
     EADDRINUSE = 98,
+    /// Cannot assign requested address
+    EADDRNOTAVAIL = 99,
     /// Message too long
     EMSGSIZE = 90,
     /// Operation already in progress
@@ -209,6 +211,7 @@ impl fmt::Display for LxError {
             ECONNREFUSED => "Connection refused",
             EINPROGRESS => "Operation in progress",
             EADDRINUSE => "Address already in use",
+            EADDRNOTAVAIL => "Cannot assign requested address",
             EMSGSIZE => "Message too long",
             EALREADY => "Operation already in progress",
             _ => "Unknown error",

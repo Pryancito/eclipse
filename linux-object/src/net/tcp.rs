@@ -13,7 +13,7 @@ use alloc::boxed::Box;
 use alloc::vec;
 
 // smoltcp
-use smoltcp::socket::{TcpSocket, TcpSocketBuffer, TcpState};
+use smoltcp::socket::{SocketSet, TcpSocket, TcpSocketBuffer, TcpState};
 use smoltcp::wire::{IpAddress, Ipv4Address, Ipv6Address};
 
 // async
@@ -50,6 +50,14 @@ pub struct TcpInner {
     connect_in_progress: bool,
     /// True once the socket reached Established (for RST → ECONNRESET).
     was_connected: bool,
+    /// The port this socket registered in `BIND_TABLE` (bind, or the
+    /// autobind of `listen`); released on drop. Accepted children share the
+    /// listener's port without a registration of their own.
+    bound: Option<IpEndpoint>,
+    /// `SO_REUSEADDR`.
+    reuse_addr: bool,
+    /// `shutdown(SHUT_RD)`: reads drain what is queued and then report EOF.
+    read_closed: bool,
 }
 
 impl Drop for TcpInner {
@@ -66,6 +74,95 @@ impl Drop for TcpInner {
                 crate::net::LISTEN_TABLE.unlisten(ep.port);
             }
         }
+        if let Some(ep) = self.bound {
+            crate::net::BIND_TABLE.release(ep);
+        }
+    }
+}
+
+/// One socket that holds a port, as `inet_csk_bind_conflict` sees it.
+#[derive(Clone, Copy, Debug)]
+struct PortHolder {
+    endpoint: IpEndpoint,
+    listening: bool,
+    reuse_addr: bool,
+}
+
+/// `inet_csk_bind_conflict` without `SO_REUSEPORT`: `want` collides with a
+/// holder of the same port on an overlapping address, unless both ends set
+/// `SO_REUSEADDR` and the holder is not listening. That last clause is what
+/// lets a server restart while its old connections linger.
+fn bind_conflict<I: IntoIterator<Item = PortHolder>>(
+    holders: I,
+    want: IpEndpoint,
+    reuse_addr: bool,
+) -> bool {
+    holders.into_iter().any(|holder| {
+        endpoints_collide(holder.endpoint, want)
+            && !(reuse_addr && holder.reuse_addr && !holder.listening)
+    })
+}
+
+/// Every TCP port holder: the sockets bound but not yet open (only
+/// `BIND_TABLE` knows them) and the sockets open in smoltcp (listening,
+/// connecting, connected, or in TIME-WAIT; their `SO_REUSEADDR` is not
+/// recorded in the set, so they are taken to have it, which only ever lets
+/// a bind through that Linux would refuse, never the reverse). smoltcp
+/// itself lets any number of sockets listen on or connect from one port and
+/// hands each segment to the first that accepts it. A CLOSED socket is
+/// skipped for clarity only: smoltcp clears its endpoints on the next
+/// dispatch, and a listener closed by `shutdown` is still in `BIND_TABLE`.
+fn tcp_port_taken(set: &SocketSet<'_>, want: IpEndpoint, reuse_addr: bool) -> bool {
+    let bound = crate::net::BIND_TABLE
+        .snapshot()
+        .into_iter()
+        .map(|b| PortHolder {
+            endpoint: b.endpoint,
+            listening: false,
+            reuse_addr: b.reuse_addr,
+        });
+    let open = set.iter().filter_map(|socket| match socket {
+        smoltcp::socket::Socket::Tcp(tcp) if tcp.state() != TcpState::Closed => Some(PortHolder {
+            endpoint: tcp.local_endpoint(),
+            listening: tcp.is_listening(),
+            reuse_addr: true,
+        }),
+        _ => None,
+    });
+    bind_conflict(bound.chain(open), want, reuse_addr)
+}
+
+/// An ephemeral port no TCP socket holds on `addr`, or `None` when the
+/// dynamic range is exhausted. `get_ephemeral_port` alone is a counter that
+/// does not look at what is bound: `bind(0)` and `connect` landed on a port
+/// a daemon listened on, and the listener answered the SYN-ACK with a RST.
+/// The search never leans on `SO_REUSEADDR` (`inet_csk_find_open_port`
+/// with `relax` off): a port shared that way is a poor pick.
+fn free_ephemeral_port(set: &SocketSet<'_>, addr: IpAddress) -> Option<u16> {
+    const RANGE: usize = 65535 - 49152;
+    (0..RANGE)
+        .map(|_| get_ephemeral_port())
+        .find(|&port| !tcp_port_taken(set, IpEndpoint::new(addr, port), false))
+}
+
+/// smoltcp refuses to connect to port 0; on Linux the SYN goes out and the
+/// answer is a RST, so the caller sees `ECONNREFUSED`, not `ENOBUFS`.
+fn connect_error(e: smoltcp::Error) -> LxError {
+    match e {
+        smoltcp::Error::Unaddressable => LxError::ECONNREFUSED,
+        smoltcp::Error::Illegal => LxError::EISCONN,
+        _ => LxError::ENOBUFS,
+    }
+}
+
+/// A `setsockopt` integer: four native-endian bytes, or a lone byte.
+fn sockopt_int(data: &[u8]) -> LxResult<u32> {
+    if data.len() >= 4 {
+        Ok(u32::from_ne_bytes([data[0], data[1], data[2], data[3]]))
+    } else if let Some(&b) = data.first() {
+        Ok(b as u32)
+    } else {
+        Err(LxError::EINVAL)
     }
 }
 
@@ -129,6 +226,9 @@ impl TcpSocketState {
                 pending_error: 0,
                 connect_in_progress: false,
                 was_connected: false,
+                bound: None,
+                reuse_addr: false,
+                read_closed: false,
             })),
         })
     }
@@ -139,15 +239,34 @@ impl TcpSocketState {
             (true, IpAddress::Ipv6(_)) | (false, IpAddress::Ipv4(_))
         )
     }
+
+    fn loopback_addr(ipv6: bool) -> IpAddress {
+        if ipv6 {
+            IpAddress::Ipv6(Ipv6Address::LOOPBACK)
+        } else {
+            IpAddress::Ipv4(Ipv4Address::new(127, 0, 0, 1))
+        }
+    }
+
+    /// `inet_csk_get_port(sk, 0)`: take a free ephemeral port for a socket
+    /// that has not bound. Caller holds `inner` and the socket set.
+    fn autobind(inner: &mut TcpInner, set: &SocketSet<'_>) -> LxResult<IpEndpoint> {
+        let port = free_ephemeral_port(set, IpAddress::Unspecified).ok_or(LxError::EADDRINUSE)?;
+        let ep = IpEndpoint::new(IpAddress::Unspecified, port);
+        crate::net::BIND_TABLE.insert(ep, inner.reuse_addr);
+        inner.local_endpoint = Some(ep);
+        inner.bound = Some(ep);
+        Ok(ep)
+    }
 }
 
 #[async_trait]
 impl Socket for TcpSocketState {
     /// read to buffer
     async fn read(&self, data: &mut [u8]) -> (SysResult, Endpoint) {
-        let (handle, flags) = {
+        let (handle, flags, read_closed) = {
             let inner = self.inner.lock();
-            (inner.handle.0, inner.flags)
+            (inner.handle.0, inner.flags, inner.read_closed)
         };
         debug!(
             "tcp read handle={} req_len={} nonblock={}",
@@ -195,7 +314,9 @@ impl Socket for TcpSocketState {
             // EOF the moment `recv_slice` was momentarily Exhausted mid-transfer,
             // which truncated downloads intermittently (apk then RSA-verified a
             // short APKINDEX -> "BAD signature").
-            let recv_closed = !socket.may_recv();
+            // `tcp_recvmsg` after `shutdown(SHUT_RD)`: what is queued is still
+            // handed out, then EOF instead of waiting.
+            let recv_closed = !socket.may_recv() || read_closed;
             trace!(
                 "[tcp read] state={:?} recv_closed={} result={:?}",
                 state,
@@ -300,9 +421,9 @@ impl Socket for TcpSocketState {
         }
     }
     async fn peek(&self, data: &mut [u8]) -> (SysResult, Endpoint) {
-        let (handle, flags) = {
+        let (handle, flags, read_closed) = {
             let inner = self.inner.lock();
-            (inner.handle.0, inner.flags)
+            (inner.handle.0, inner.flags, inner.read_closed)
         };
         let mut empty_polls: u32 = 0;
         loop {
@@ -322,6 +443,9 @@ impl Socket for TcpSocketState {
             drop(sets);
             match copied_len {
                 Err(smoltcp::Error::Exhausted) => {
+                    if read_closed {
+                        return (Ok(0), Endpoint::Ip(IpEndpoint::UNSPECIFIED));
+                    }
                     if flags.contains(OpenFlags::NON_BLOCK) {
                         return (Err(LxError::EAGAIN), Endpoint::Ip(IpEndpoint::UNSPECIFIED));
                     }
@@ -420,12 +544,16 @@ impl Socket for TcpSocketState {
                 inner.flags.contains(OpenFlags::NON_BLOCK),
             )
         };
-        let Endpoint::Ip(ip) = endpoint else {
+        let Endpoint::Ip(mut ip) = endpoint else {
             error!("connect: bad endpoint");
             return Err(LxError::EINVAL);
         };
         if !Self::endpoint_matches_family(ipv6, &ip) {
             return Err(LxError::EINVAL);
+        }
+        // `ip_route_connect`: the unspecified address means this host.
+        if ip.addr.is_unspecified() {
+            ip.addr = Self::loopback_addr(ipv6);
         }
 
         {
@@ -444,25 +572,28 @@ impl Socket for TcpSocketState {
             }
         }
 
-        // Honor a prior bind(): use its local endpoint; if unbound or port 0,
-        // allocate an ephemeral port (smoltcp rejects local port 0).
-        let local_endpoint = {
-            let inner = self.inner.lock();
-            match inner.local_endpoint {
-                Some(ep) if ep.port != 0 => ep,
-                Some(mut ep) => {
-                    ep.port = get_ephemeral_port();
-                    ep
+        // Honor a prior bind(): use its local endpoint; if unbound, take an
+        // ephemeral port nobody holds (`inet_hash_connect`), chosen and used
+        // under one hold of the set so no other socket can slip in between.
+        let bound = self.inner.lock().local_endpoint;
+        let connected = {
+            let sockets = get_sockets();
+            let mut sets = sockets.lock();
+            let local_endpoint = match bound {
+                Some(ep) => ep,
+                None => {
+                    let port = free_ephemeral_port(&sets, IpAddress::Unspecified)
+                        .ok_or(LxError::EADDRNOTAVAIL)?;
+                    IpEndpoint::new(IpAddress::Unspecified, port)
                 }
-                None => IpEndpoint::new(IpAddress::Unspecified, get_ephemeral_port()),
-            }
+            };
+            let connected = sets
+                .get::<TcpSocket>(handle)
+                .connect(ip, local_endpoint)
+                .map_err(connect_error);
+            connected
         };
-
-        get_sockets()
-            .lock()
-            .get::<TcpSocket>(handle)
-            .connect(ip, local_endpoint)
-            .map_err(|_| LxError::ENOBUFS)?;
+        connected?;
 
         // Reflect the endpoint smoltcp actually bound (addr may stay
         // unspecified until the stack picks a source).
@@ -595,7 +726,7 @@ impl Socket for TcpSocketState {
                 inner.connect_in_progress = false;
                 inner.was_connected = true;
             }
-            if socket.can_recv() {
+            if socket.can_recv() || inner.read_closed {
                 read = true; // POLLIN
             } else {
                 match socket.state() {
@@ -617,20 +748,31 @@ impl Socket for TcpSocketState {
     }
 
     fn bind(&self, endpoint: Endpoint) -> SysResult {
+        let Endpoint::Ip(mut ip) = endpoint else {
+            return Err(LxError::EINVAL);
+        };
         let mut inner = self.inner.lock();
-        if let Endpoint::Ip(mut ip) = endpoint {
-            if !Self::endpoint_matches_family(inner.ipv6, &ip) {
-                return Err(LxError::EINVAL);
-            }
-            if ip.port == 0 {
-                ip.port = get_ephemeral_port();
-            }
-            inner.local_endpoint = Some(ip);
-            inner.is_listening = false;
-            Ok(0)
-        } else {
-            Err(LxError::EINVAL)
+        if !Self::endpoint_matches_family(inner.ipv6, &ip) {
+            return Err(LxError::EINVAL);
         }
+        // `inet_bind`: a socket that already has a local port (bound,
+        // connected, or accepted) cannot be bound again.
+        if inner.local_endpoint.is_some() {
+            return Err(LxError::EINVAL);
+        }
+        let sockets = get_sockets();
+        let set = sockets.lock();
+        if ip.port == 0 {
+            ip.port = free_ephemeral_port(&set, ip.addr).ok_or(LxError::EADDRINUSE)?;
+        } else if tcp_port_taken(&set, ip, inner.reuse_addr) {
+            return Err(LxError::EADDRINUSE);
+        }
+        crate::net::BIND_TABLE.insert(ip, inner.reuse_addr);
+        drop(set);
+        inner.local_endpoint = Some(ip);
+        inner.bound = Some(ip);
+        inner.is_listening = false;
+        Ok(0)
     }
 
     fn listen(&self) -> SysResult {
@@ -640,7 +782,18 @@ impl Socket for TcpSocketState {
             return Ok(0);
         }
 
-        let local_endpoint = inner.local_endpoint.ok_or(LxError::EINVAL)?;
+        let local_endpoint = {
+            let sockets = get_sockets();
+            let mut set = sockets.lock();
+            // `inet_listen`: only a closed socket can start listening.
+            if set.get::<TcpSocket>(inner.handle.0).is_open() {
+                return Err(LxError::EINVAL);
+            }
+            match inner.local_endpoint {
+                Some(ep) => ep,
+                None => Self::autobind(&mut inner, &set)?,
+            }
+        };
         info!("socket listening on {:?}", local_endpoint);
 
         if !crate::net::LISTEN_TABLE.can_listen(local_endpoint.port) {
@@ -659,17 +812,31 @@ impl Socket for TcpSocketState {
     }
 
     fn shutdown(&self, howto: usize) -> SysResult {
+        let (shut_rd, shut_wr) = shutdown_sides(howto)?;
         let mut inner = self.inner.lock();
-        if inner.is_listening {
-            if let Some(ep) = inner.local_endpoint {
-                crate::net::LISTEN_TABLE.unlisten(ep.port);
-            }
-            inner.is_listening = false;
-        }
         let sets = get_sockets();
         let mut sets = sets.lock();
         let mut socket = sets.get::<TcpSocket>(inner.handle.0);
-        if howto == 1 || howto == 2 {
+        if inner.is_listening {
+            // `inet_shutdown` on TCP_LISTEN: a read side stops the listener
+            // (`tcp_disconnect`), SHUT_WR alone leaves it listening.
+            if shut_rd {
+                if let Some(ep) = inner.local_endpoint {
+                    crate::net::LISTEN_TABLE.unlisten(ep.port);
+                }
+                inner.is_listening = false;
+                socket.close();
+            }
+            return Ok(0);
+        }
+        if shut_rd {
+            inner.read_closed = true;
+        }
+        // `inet_shutdown` on TCP_CLOSE: the sides are recorded, the call fails.
+        if !socket.is_open() {
+            return Err(LxError::ENOTCONN);
+        }
+        if shut_wr {
             socket.close();
         }
         Ok(0)
@@ -751,6 +918,9 @@ impl Socket for TcpSocketState {
                         pending_error: 0,
                         connect_in_progress: false,
                         was_connected: true,
+                        bound: None,
+                        reuse_addr: false,
+                        read_closed: false,
                     })),
                 });
                 return Ok((new_socket as Arc<dyn FileLike>, Endpoint::Ip(remote)));
@@ -831,16 +1001,17 @@ impl Socket for TcpSocketState {
     }
 
     fn setsockopt(&self, level: usize, opt: usize, data: &[u8]) -> SysResult {
+        const SOL_SOCKET: usize = 1;
+        const SO_REUSEADDR: usize = 2;
         const IPPROTO_TCP: usize = 6;
         const TCP_NODELAY: usize = 1;
+        if level == SOL_SOCKET && opt == SO_REUSEADDR {
+            // Read at bind time (`sk_reuse`); set it before `bind`, as servers do.
+            self.inner.lock().reuse_addr = sockopt_int(data)? != 0;
+            return Ok(0);
+        }
         if level == IPPROTO_TCP && opt == TCP_NODELAY {
-            let optval = if data.len() >= 4 {
-                u32::from_ne_bytes([data[0], data[1], data[2], data[3]])
-            } else if let Some(&b) = data.first() {
-                b as u32
-            } else {
-                return Err(LxError::EINVAL);
-            };
+            let optval = sockopt_int(data)?;
             // TCP_NODELAY disables Nagle; smoltcp's API is the inverse flag.
             let handle = self.inner.lock().handle.0;
             get_sockets()
@@ -1080,5 +1251,440 @@ mod transfer_bench {
     #[test]
     fn large_transfer_fast_reader() {
         run_transfer(16 * 1024 * 1024, 256 * 1024);
+    }
+}
+
+#[cfg(test)]
+mod port_tests {
+    //! `bind`/`listen`/`connect`/`shutdown` against `af_inet.c` and
+    //! `inet_connection_sock.c`, on the host: the sockets live in the real
+    //! global smoltcp set and a loopback interface built here carries the
+    //! handshake between two of them. Every test takes `NET_TEST_LOCK`
+    //! (shared with the UDP tests) and uses its own ports, 41010-41090.
+
+    use super::*;
+    use alloc::collections::BTreeMap;
+    use smoltcp::iface::{Interface, InterfaceBuilder, Routes};
+    use smoltcp::phy::{Loopback, Medium};
+    use smoltcp::time::Instant;
+    use smoltcp::wire::IpCidr;
+
+    use crate::net::NET_TEST_LOCK as LOCK;
+
+    fn ep(addr: IpAddress, port: u16) -> IpEndpoint {
+        IpEndpoint::new(addr, port)
+    }
+
+    fn any(port: u16) -> IpEndpoint {
+        ep(IpAddress::Ipv4(Ipv4Address::UNSPECIFIED), port)
+    }
+
+    fn v4(port: u16) -> Endpoint {
+        Endpoint::Ip(any(port))
+    }
+
+    fn lo(port: u16) -> Endpoint {
+        Endpoint::Ip(ep(IpAddress::v4(127, 0, 0, 1), port))
+    }
+
+    fn holder(endpoint: IpEndpoint, listening: bool, reuse_addr: bool) -> PortHolder {
+        PortHolder {
+            endpoint,
+            listening,
+            reuse_addr,
+        }
+    }
+
+    fn sock() -> TcpSocketState {
+        let s = TcpSocketState::new(false).unwrap();
+        FileLike::set_flags(&s, OpenFlags::NON_BLOCK).unwrap();
+        s
+    }
+
+    fn reuse(s: &TcpSocketState) {
+        assert_eq!(Socket::setsockopt(s, 1, 2, &1u32.to_ne_bytes()), Ok(0));
+    }
+
+    fn loopback() -> Interface<'static, Loopback> {
+        InterfaceBuilder::new(Loopback::new(Medium::Ip))
+            .ip_addrs([IpCidr::new(IpAddress::v4(127, 0, 0, 1), 8)])
+            .routes(Routes::new(BTreeMap::new()))
+            .finalize()
+    }
+
+    /// Move whatever is queued through the loopback.
+    fn deliver(iface: &mut Interface<'static, Loopback>) {
+        let sets = get_sockets();
+        let mut sets = sets.lock();
+        for ms in 0..16 {
+            let _ = iface.poll(&mut sets, Instant::from_millis(ms));
+        }
+    }
+
+    fn state_of(s: &TcpSocketState) -> TcpState {
+        let handle = s.inner.lock().handle.0;
+        get_sockets().lock().get::<TcpSocket>(handle).state()
+    }
+
+    fn port_of(s: &TcpSocketState) -> u16 {
+        match Socket::endpoint(s) {
+            Some(Endpoint::Ip(ep)) => ep.port,
+            other => panic!("{:?}", other),
+        }
+    }
+
+    fn connect(s: &TcpSocketState, to: Endpoint) -> SysResult {
+        async_std::task::block_on(Socket::connect(s, to))
+    }
+
+    fn read(s: &dyn Socket, buf: &mut [u8]) -> SysResult {
+        async_std::task::block_on(s.read(buf)).0
+    }
+
+    /// A listener on `port`, a client connected to it through `iface`, and
+    /// the accepted child.
+    fn connected_pair(
+        iface: &mut Interface<'static, Loopback>,
+        port: u16,
+    ) -> (TcpSocketState, TcpSocketState, Arc<dyn FileLike>) {
+        let server = sock();
+        assert_eq!(Socket::bind(&server, v4(port)), Ok(0));
+        assert_eq!(Socket::listen(&server), Ok(0));
+        let client = sock();
+        assert_eq!(connect(&client, lo(port)), Err(LxError::EINPROGRESS));
+        deliver(iface);
+        assert_eq!(state_of(&client), TcpState::Established);
+        let (child, from) = async_std::task::block_on(Socket::accept(&server)).unwrap();
+        assert!(matches!(from, Endpoint::Ip(ep) if ep.port == port_of(&client)));
+        // accept() hands out a blocking child; a test must never park.
+        child.set_flags(OpenFlags::NON_BLOCK).unwrap();
+        (server, client, child)
+    }
+
+    #[test]
+    fn the_bind_conflict_rule_is_linuxs_without_reuseport() {
+        let l = IpAddress::v4(127, 0, 0, 1);
+        let other = IpAddress::v4(10, 0, 0, 1);
+        let idle = |e| holder(e, false, false);
+        // Same port: the wildcard overlaps everything, a specific address
+        // only itself.
+        assert!(bind_conflict([idle(any(80))], any(80), false));
+        assert!(bind_conflict([idle(any(80))], ep(l, 80), false));
+        assert!(bind_conflict([idle(ep(l, 80))], any(80), false));
+        assert!(bind_conflict([idle(ep(l, 80))], ep(l, 80), false));
+        assert!(!bind_conflict([idle(ep(l, 80))], ep(other, 80), false));
+        assert!(!bind_conflict([idle(any(80))], any(81), false));
+        assert!(!bind_conflict([], any(80), true));
+        // SO_REUSEADDR must be on both sides, and the holder must not listen.
+        assert!(!bind_conflict(
+            [holder(any(80), false, true)],
+            any(80),
+            true
+        ));
+        assert!(bind_conflict(
+            [holder(any(80), false, true)],
+            any(80),
+            false
+        ));
+        assert!(bind_conflict(
+            [holder(any(80), false, false)],
+            any(80),
+            true
+        ));
+        assert!(bind_conflict([holder(any(80), true, true)], any(80), true));
+        // One conflicting holder among many is enough.
+        assert!(bind_conflict(
+            [idle(any(79)), holder(any(80), true, true), idle(any(81))],
+            any(80),
+            true
+        ));
+    }
+
+    #[test]
+    fn binding_twice_is_einval_and_a_port_another_socket_holds_is_in_use() {
+        let _g = LOCK.lock();
+        let a = sock();
+        assert_eq!(Socket::bind(&a, v4(41010)), Ok(0));
+        assert_eq!(
+            Socket::bind(&a, v4(41011)),
+            Err(LxError::EINVAL),
+            "inet_bind: a bound socket cannot be rebound"
+        );
+        assert_eq!(port_of(&a), 41010);
+        let b = sock();
+        assert_eq!(
+            Socket::bind(&b, v4(41010)),
+            Err(LxError::EADDRINUSE),
+            "a bound socket is invisible to smoltcp; only the bind table knows it"
+        );
+        assert_eq!(Socket::bind(&b, lo(41010)), Err(LxError::EADDRINUSE));
+        assert_eq!(Socket::bind(&b, v4(0)), Ok(0));
+        assert!(port_of(&b) >= 49152);
+        // The port is given back when the socket goes away, not before.
+        let c = sock();
+        assert_eq!(Socket::bind(&c, v4(41010)), Err(LxError::EADDRINUSE));
+        drop(a);
+        assert_eq!(Socket::bind(&c, v4(41010)), Ok(0));
+        // A different specific address is free.
+        let d = sock();
+        assert_eq!(Socket::bind(&d, lo(41012)), Ok(0));
+        let e = sock();
+        assert_eq!(
+            Socket::bind(&e, Endpoint::Ip(ep(IpAddress::v4(10, 0, 0, 1), 41012))),
+            Ok(0)
+        );
+    }
+
+    #[test]
+    fn so_reuseaddr_lets_idle_sockets_share_a_port_but_never_a_listener() {
+        let _g = LOCK.lock();
+        let a = sock();
+        let b = sock();
+        reuse(&a);
+        reuse(&b);
+        assert_eq!(Socket::bind(&a, v4(41020)), Ok(0));
+        assert_eq!(Socket::bind(&b, v4(41020)), Ok(0));
+        let c = sock();
+        assert_eq!(
+            Socket::bind(&c, v4(41020)),
+            Err(LxError::EADDRINUSE),
+            "SO_REUSEADDR has to be set on both sides"
+        );
+        assert_eq!(Socket::listen(&a), Ok(0));
+        assert_eq!(
+            Socket::listen(&b),
+            Err(LxError::EADDRINUSE),
+            "two listeners on one port need SO_REUSEPORT"
+        );
+        let d = sock();
+        reuse(&d);
+        assert_eq!(
+            Socket::bind(&d, v4(41020)),
+            Err(LxError::EADDRINUSE),
+            "a listener blocks the port even for SO_REUSEADDR"
+        );
+        // Off again is off.
+        let e = sock();
+        reuse(&e);
+        assert_eq!(Socket::setsockopt(&e, 1, 2, &0u32.to_ne_bytes()), Ok(0));
+        assert_eq!(Socket::bind(&e, v4(41021)), Ok(0));
+        let f = sock();
+        reuse(&f);
+        assert_eq!(Socket::bind(&f, v4(41021)), Err(LxError::EADDRINUSE));
+        assert_eq!(Socket::setsockopt(&f, 1, 2, &[]), Err(LxError::EINVAL));
+        // Each binder holds its own registration: dropping the listener
+        // leaves the idle sharer's.
+        drop(a);
+        let strict = sock();
+        assert_eq!(Socket::bind(&strict, v4(41020)), Err(LxError::EADDRINUSE));
+        drop(b);
+        assert_eq!(Socket::bind(&strict, v4(41020)), Ok(0));
+    }
+
+    #[test]
+    fn an_ephemeral_port_skips_a_listener_for_bind_and_for_connect() {
+        let _g = LOCK.lock();
+        let next = get_ephemeral_port();
+        crate::net::rewind_ephemeral_port_to(next);
+        let server = sock();
+        assert_eq!(Socket::bind(&server, v4(next)), Ok(0));
+        assert_eq!(Socket::listen(&server), Ok(0));
+        // bind(0) would have taken `next` and hidden the listener.
+        crate::net::rewind_ephemeral_port_to(next);
+        let a = sock();
+        assert_eq!(Socket::bind(&a, v4(0)), Ok(0));
+        assert_ne!(port_of(&a), next);
+        assert_eq!(port_of(&a), if next == 65534 { 49152 } else { next + 1 });
+        // connect() would have used `next` as its source port and the
+        // listener would have answered the SYN-ACK.
+        crate::net::rewind_ephemeral_port_to(next);
+        let other = sock();
+        assert_eq!(Socket::bind(&other, v4(41030)), Ok(0));
+        assert_eq!(Socket::listen(&other), Ok(0));
+        let c = sock();
+        assert_eq!(connect(&c, lo(41030)), Err(LxError::EINPROGRESS));
+        assert_ne!(port_of(&c), next);
+        assert_ne!(port_of(&c), port_of(&a));
+        // A bound-but-idle socket is skipped too, even one that would
+        // share with SO_REUSEADDR (inet_csk_find_open_port, relax off).
+        crate::net::rewind_ephemeral_port_to(port_of(&a));
+        let d = sock();
+        assert_eq!(connect(&d, lo(41030)), Err(LxError::EINPROGRESS));
+        assert_ne!(port_of(&d), port_of(&a));
+        let used = [next, port_of(&a), port_of(&c), port_of(&d)];
+        let p = loop {
+            let p = get_ephemeral_port();
+            if !used.contains(&p) {
+                break p;
+            }
+        };
+        let shared = sock();
+        reuse(&shared);
+        assert_eq!(Socket::bind(&shared, v4(p)), Ok(0));
+        crate::net::rewind_ephemeral_port_to(p);
+        let e = sock();
+        reuse(&e);
+        assert_eq!(Socket::bind(&e, v4(0)), Ok(0));
+        assert_ne!(port_of(&e), p);
+    }
+
+    #[test]
+    fn listen_autobinds_and_an_open_socket_can_neither_listen_nor_bind() {
+        let _g = LOCK.lock();
+        let mut iface = loopback();
+        let server = sock();
+        assert_eq!(
+            Socket::listen(&server),
+            Ok(0),
+            "inet_listen binds an unbound socket to an ephemeral port"
+        );
+        let port = port_of(&server);
+        assert!(port >= 49152, "{}", port);
+        assert_eq!(Socket::listen(&server), Ok(0), "listen is idempotent");
+        let taken = sock();
+        assert_eq!(Socket::bind(&taken, v4(port)), Err(LxError::EADDRINUSE));
+
+        let client = sock();
+        assert_eq!(connect(&client, lo(port)), Err(LxError::EINPROGRESS));
+        deliver(&mut iface);
+        let (child, _) = async_std::task::block_on(Socket::accept(&server)).unwrap();
+        let child = child.as_socket().unwrap();
+        assert_eq!(child.listen(), Err(LxError::EINVAL));
+        assert_eq!(Socket::listen(&client), Err(LxError::EINVAL));
+        assert_eq!(Socket::bind(&client, v4(41040)), Err(LxError::EINVAL));
+        assert_eq!(child.bind(v4(41040)), Err(LxError::EINVAL));
+        assert!(port_of(&client) >= 49152);
+        // A stopped listener stays bound (the autobind registered its port
+        // like a bind would), so even SO_REUSEADDR cannot take it...
+        assert_eq!(Socket::shutdown(&server, 0), Ok(0));
+        let reuser = sock();
+        reuse(&reuser);
+        assert_eq!(Socket::bind(&reuser, v4(port)), Err(LxError::EADDRINUSE));
+        // ...until the listener is dropped; its child does not hold it.
+        drop(server);
+        let again = sock();
+        reuse(&again);
+        assert_eq!(
+            Socket::bind(&again, v4(port)),
+            Ok(0),
+            "a restarted server binds over its live connections with SO_REUSEADDR"
+        );
+        let strict = sock();
+        assert_eq!(
+            Socket::bind(&strict, lo(port)),
+            Err(LxError::EADDRINUSE),
+            "without it the established child still holds the port"
+        );
+    }
+
+    #[test]
+    fn a_connect_to_port_zero_is_refused_and_the_unspecified_address_is_this_host() {
+        let _g = LOCK.lock();
+        let mut iface = loopback();
+        assert_eq!(
+            connect_error(smoltcp::Error::Unaddressable),
+            LxError::ECONNREFUSED
+        );
+        assert_eq!(connect_error(smoltcp::Error::Illegal), LxError::EISCONN);
+        assert_eq!(connect_error(smoltcp::Error::Exhausted), LxError::ENOBUFS);
+        let c = sock();
+        assert_eq!(
+            connect(&c, lo(0)),
+            Err(LxError::ECONNREFUSED),
+            "Linux sends the SYN to port 0 and gets a RST"
+        );
+        let server = sock();
+        assert_eq!(Socket::bind(&server, v4(41050)), Ok(0));
+        assert_eq!(Socket::listen(&server), Ok(0));
+        assert_eq!(
+            connect(&c, v4(41050)),
+            Err(LxError::EINPROGRESS),
+            "0.0.0.0 routes to loopback (ip_route_connect)"
+        );
+        deliver(&mut iface);
+        assert_eq!(state_of(&c), TcpState::Established);
+        assert!(matches!(
+            Socket::remote_endpoint(&c),
+            Some(Endpoint::Ip(ep)) if ep == IpEndpoint::new(IpAddress::v4(127, 0, 0, 1), 41050)
+        ));
+        assert_eq!(connect(&c, lo(41050)), Err(LxError::EISCONN));
+    }
+
+    #[test]
+    fn shutdown_is_validated_reports_notconn_and_shut_rd_reads_as_eof_after_the_queue() {
+        let _g = LOCK.lock();
+        let mut iface = loopback();
+        let idle = sock();
+        assert_eq!(Socket::shutdown(&idle, 3), Err(LxError::EINVAL));
+        assert_eq!(
+            Socket::shutdown(&idle, 0),
+            Err(LxError::ENOTCONN),
+            "inet_shutdown on TCP_CLOSE"
+        );
+
+        let (_server, client, child) = connected_pair(&mut iface, 41060);
+        let child = child.as_socket().unwrap();
+        assert_eq!(Socket::write(&client, b"hola", None), Ok(4));
+        deliver(&mut iface);
+        assert_eq!(child.poll(PollEvents::all()), (true, true, false));
+        assert_eq!(child.shutdown(0), Ok(0));
+        let mut buf = [0u8; 8];
+        // What arrived before SHUT_RD is still handed out (`tcp_recvmsg`),
+        // then EOF where a non-blocking read used to say EAGAIN.
+        assert_eq!(read(child, &mut buf), Ok(4));
+        assert_eq!(&buf[..4], b"hola");
+        assert_eq!(read(child, &mut buf), Ok(0));
+        assert_eq!(async_std::task::block_on(child.peek(&mut buf)).0, Ok(0));
+        assert_eq!(
+            child.poll(PollEvents::all()),
+            (true, true, false),
+            "EOF is readable"
+        );
+        // The write side is untouched: the client still hears the child.
+        assert_eq!(child.write(b"adios", None), Ok(5));
+        deliver(&mut iface);
+        assert_eq!(read(&client, &mut buf), Ok(5));
+        assert_eq!(&buf[..5], b"adios");
+        // SHUT_WR sends the FIN and the client reads EOF; its own write
+        // side stays open.
+        assert_eq!(child.shutdown(1), Ok(0));
+        deliver(&mut iface);
+        assert_eq!(read(&client, &mut buf), Ok(0));
+        assert_eq!(Socket::write(&client, b"x", None), Ok(1));
+    }
+
+    #[test]
+    fn shut_wr_leaves_a_listener_listening_and_shut_rd_stops_it() {
+        let _g = LOCK.lock();
+        let mut iface = loopback();
+        let server = sock();
+        assert_eq!(Socket::bind(&server, v4(41070)), Ok(0));
+        assert_eq!(Socket::listen(&server), Ok(0));
+        assert_eq!(Socket::shutdown(&server, 1), Ok(0));
+        assert!(!crate::net::LISTEN_TABLE.can_listen(41070));
+        let first = sock();
+        assert_eq!(connect(&first, lo(41070)), Err(LxError::EINPROGRESS));
+        deliver(&mut iface);
+        assert_eq!(state_of(&first), TcpState::Established);
+        assert!(async_std::task::block_on(Socket::accept(&server)).is_ok());
+
+        assert_eq!(Socket::shutdown(&server, 0), Ok(0));
+        assert!(crate::net::LISTEN_TABLE.can_listen(41070));
+        assert_eq!(state_of(&server), TcpState::Closed);
+        let second = sock();
+        assert_eq!(connect(&second, lo(41070)), Err(LxError::EINPROGRESS));
+        deliver(&mut iface);
+        assert_eq!(state_of(&second), TcpState::Closed, "nobody listens: RST");
+        // The client the RST closed no longer holds its port (smoltcp
+        // clears the endpoints of a CLOSED socket, as tcp_set_state does).
+        crate::net::rewind_ephemeral_port_to(port_of(&second));
+        let third = sock();
+        assert_eq!(connect(&third, lo(41071)), Err(LxError::EINPROGRESS));
+        assert_eq!(port_of(&third), port_of(&second));
+        // Still bound, so it can listen again and nobody else can bind there.
+        assert_eq!(Socket::bind(&sock(), v4(41070)), Err(LxError::EADDRINUSE));
+        assert_eq!(Socket::listen(&server), Ok(0));
+        assert_eq!(Socket::shutdown(&server, 2), Ok(0));
+        assert!(crate::net::LISTEN_TABLE.can_listen(41070));
     }
 }

@@ -77,16 +77,6 @@ fn send_error(e: smoltcp::Error) -> LxError {
     }
 }
 
-/// `shutdown(2)`'s `how` as (read side, write side); anything else is `EINVAL`.
-fn shutdown_sides(howto: usize) -> LxResult<(bool, bool)> {
-    match howto {
-        0 => Ok((true, false)),
-        1 => Ok((false, true)),
-        2 => Ok((true, true)),
-        _ => Err(LxError::EINVAL),
-    }
-}
-
 /// `udp_lib_lport_inuse` without `SO_REUSEADDR`: `want` collides with an
 /// open UDP socket on the same port when either side is bound to the
 /// wildcard address or both are bound to the same one. smoltcp itself lets
@@ -680,13 +670,12 @@ mod tests {
     use super::*;
     use alloc::collections::BTreeMap;
     use alloc::vec::Vec;
-    use lock::Mutex as TestMutex;
     use smoltcp::iface::{Interface, InterfaceBuilder, Routes};
     use smoltcp::phy::{Loopback, Medium};
     use smoltcp::time::Instant;
     use smoltcp::wire::IpCidr;
 
-    static LOCK: TestMutex<()> = TestMutex::new(());
+    use crate::net::NET_TEST_LOCK as LOCK;
 
     fn v4(port: u16) -> Endpoint {
         Endpoint::Ip(IpEndpoint::new(
@@ -782,15 +771,6 @@ mod tests {
 
     /// Walk the ephemeral allocator round its range until its next answer
     /// will be `port`.
-    fn rewind_allocator_to(port: u16) {
-        let before = if port == 49152 { 65534 } else { port - 1 };
-        for _ in 0..(2 * 16384) {
-            if get_ephemeral_port() == before {
-                return;
-            }
-        }
-        panic!("allocator never came round to {}", before);
-    }
 
     fn port_of(s: &UdpSocketState) -> u16 {
         match Socket::endpoint(s) {
@@ -817,7 +797,7 @@ mod tests {
         }
         assert!(taken.len() >= 30, "could not pin the range: {:?}", taken);
         let first = taken[0];
-        rewind_allocator_to(first);
+        crate::net::rewind_ephemeral_port_to(first);
         let sets = get_sockets();
         let sets = sets.lock();
         let picked = free_ephemeral_port(&sets, IpAddress::Ipv4(Ipv4Address::UNSPECIFIED)).unwrap();
@@ -828,14 +808,14 @@ mod tests {
         ));
         drop(sets);
         // An implicit bind (first sendto) lands on a free one too...
-        rewind_allocator_to(first);
+        crate::net::rewind_ephemeral_port_to(first);
         let s = sock();
         assert_eq!(Socket::write(&s, b"x", Some(lo(40013))), Ok(1));
         let mine = port_of(&s);
         assert!(!taken.contains(&mine), "autobind took bound port {}", mine);
         assert!(mine >= 49152);
         // ...and so does an explicit bind to port 0.
-        rewind_allocator_to(first);
+        crate::net::rewind_ephemeral_port_to(first);
         let z = sock();
         assert_eq!(Socket::bind(&z, v4(0)), Ok(0));
         let zp = port_of(&z);
