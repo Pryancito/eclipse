@@ -1764,6 +1764,9 @@ mod gl_client_abi_tests {
     /// `DRM_NOUVEAU_*` offsets plus `DRM_COMMAND_BASE`. Getting one wrong routes
     /// a client's call to another arm, which is worse than not handling it.
     #[test]
+    // The table below is `DRM_COMMAND_BASE + <offset>` spelled out, so the
+    // 0x40 + 0x00 row is the same shape as its neighbours on purpose.
+    #[allow(clippy::identity_op)]
     fn the_command_numbers_are_the_ones_nouveau_publishes() {
         assert_eq!(DRM_COMMAND_BASE, 0x40, "DRM_COMMAND_BASE is fixed at 0x40");
         let table: &[(&str, u32, u32)] = &[

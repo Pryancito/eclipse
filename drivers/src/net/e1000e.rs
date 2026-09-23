@@ -190,6 +190,14 @@ const E1000E_PHY_CTRL: usize = 0x00F10 / 4;
 // Real offsets per Linux e1000e's regs.h — 0x01014/0x01018 (this file's
 // previous values) land in reserved MMIO next to PBA, not on FEXTNVM6/7, so
 // the ULP/SPT workarounds that RMW them were silently no-ops.
+const E1000E_FEXTNVM: usize = 0x00028 / 4;
+const E1000E_FEXTNVM4: usize = 0x00024 / 4;
+/// FEXTNVM4[2:0] — beacon duration. The I217 packet-loss erratum wants 8 usec.
+const FEXTNVM4_BEACON_DURATION_MASK: u32 = 0x7;
+const FEXTNVM4_BEACON_DURATION_8USEC: u32 = 0x7;
+/// FEXTNVM bit 27 — software configuration of the LAN Connected Device is
+/// enabled. Linux only rewrites the OEM bits when this is set.
+const FEXTNVM_SW_CONFIG_ICH8M: u32 = 1 << 27;
 const E1000E_FEXTNVM6: usize = 0x00010 / 4;
 const E1000E_FEXTNVM7: usize = 0x000E4 / 4;
 const E1000E_PBA: usize = 0x01000 / 4;
@@ -201,6 +209,8 @@ const E1000E_IMC: usize = 0x00D8 / 4;
 const E1000E_RCTL: usize = 0x0100 / 4;
 const E1000E_TCTL: usize = 0x0400 / 4;
 const E1000E_TIPG: usize = 0x0410 / 4;
+/// TIPG[9:0] — IPGT, the transmit inter-packet gap (Linux `E1000_TIPG_IPGT_MASK`).
+const TIPG_IPGT_MASK: u32 = 0x0000_03FF;
 const E1000E_RDBAL: usize = 0x2800 / 4;
 const E1000E_RDBAH: usize = 0x2804 / 4;
 const E1000E_RDLEN: usize = 0x2808 / 4;
@@ -273,6 +283,110 @@ fn status_speed_mbps(status: u32) -> u32 {
         1 => 100,
         _ => 1000,
     }
+}
+
+/// Value to write into the PHY page-select register for an HV paged access.
+///
+/// Port of the `if (page == HV_INTC_FC_PAGE_START) page = 0;` line in Linux's
+/// `__e1000_read_phy_reg_hv` / `__e1000_write_phy_reg_hv`. Page 768 is the one
+/// page that is *not* addressed by its own number: it is the PHY's page 0 seen
+/// at MDIO address 1, so selecting 768 lands somewhere else entirely and every
+/// read comes back as another page's register. That matters for `HV_OEM_BITS`
+/// (768, 25), which is where LPLU actually lives.
+fn hv_page_select(page: u32) -> u16 {
+    let page = if page == HV_INTC_FC_PAGE_START {
+        0
+    } else {
+        page
+    };
+    (page << PHY_PAGE_SHIFT) as u16
+}
+
+/// Port of Linux `e1000_oem_bits_config_ich8lan`: the value to write back into
+/// the PHY's `HV_OEM_BITS` given the MAC-side `PHY_CTRL` register.
+///
+/// `d0_state` is true while the driver is up (D0a); false is the suspend path,
+/// where the non-D0a copies of the bits apply as well. `reset_blocked` mirrors
+/// `check_reset_block` — when the ME forbids resetting the PHY, the
+/// restart-auto-negotiation bit is left alone.
+fn oem_bits_for_d0(phy_ctrl: u32, oem_reg: u16, d0_state: bool, reset_blocked: bool) -> u16 {
+    let mut oem = oem_reg & !(HV_OEM_BITS_GBE_DIS | HV_OEM_BITS_LPLU);
+    let (gbe_mask, lplu_mask) = if d0_state {
+        (PHY_CTRL_GBE_DISABLE, PHY_CTRL_D0A_LPLU)
+    } else {
+        (
+            PHY_CTRL_GBE_DISABLE | PHY_CTRL_NOND0A_GBE_DISABLE,
+            PHY_CTRL_D0A_LPLU | PHY_CTRL_NOND0A_LPLU,
+        )
+    };
+    if phy_ctrl & gbe_mask != 0 {
+        oem |= HV_OEM_BITS_GBE_DIS;
+    }
+    if phy_ctrl & lplu_mask != 0 {
+        oem |= HV_OEM_BITS_LPLU;
+    }
+    if !reset_blocked {
+        oem |= HV_OEM_BITS_RESTART_AN;
+    }
+    oem
+}
+
+/// Resolve what auto-negotiation settled on from the PHY's own registers, the
+/// way `ethtool` does: the highest-priority mode both ends advertised.
+///
+/// `bmsr` decides whether there is anything to resolve at all (link up AND
+/// auto-negotiation complete). Returns `(speed in Mb/s, full duplex)`.
+///
+/// IEEE 802.3 priority: 1000-full, 1000-half, 100-full, 100-half, 10-full,
+/// 10-half. This is the PHY's truth; the MAC's `STATUS` register is a separate
+/// path (auto-speed detection over the MAC-PHY interconnect), so the two
+/// disagreeing is itself a diagnosis.
+fn phy_negotiated_link(
+    bmsr: u16,
+    adv: u16,
+    lpa: u16,
+    ctrl1000: u16,
+    stat1000: u16,
+) -> Option<(u32, bool)> {
+    if bmsr & BMSR_LSTATUS == 0 || bmsr & BMSR_ANEGCOMPLETE == 0 {
+        return None;
+    }
+    if ctrl1000 & ADVERTISE_1000FULL != 0 && stat1000 & LPA_1000FULL != 0 {
+        return Some((1000, true));
+    }
+    if ctrl1000 & ADVERTISE_1000HALF != 0 && stat1000 & LPA_1000HALF != 0 {
+        return Some((1000, false));
+    }
+    let common = adv & lpa;
+    if common & LPA_100FULL != 0 {
+        return Some((100, true));
+    }
+    if common & LPA_100HALF != 0 {
+        return Some((100, false));
+    }
+    if common & LPA_10FULL != 0 {
+        return Some((10, true));
+    }
+    if common & LPA_10HALF != 0 {
+        return Some((10, false));
+    }
+    None
+}
+
+/// Port of the TIPG half of Linux `e1000_check_for_copper_link_ich8lan`.
+///
+/// 10 Mb/s half duplex needs a much larger inter-packet gap (some parts are so
+/// aggressive they collide constantly); PCH-SPT and later also want a wider gap
+/// at 100 Mb/s full duplex. Returns the whole TIPG value, IPGT field replaced.
+fn tipg_for_link(tipg: u32, is_spt_or_later: bool, speed: u32, full_duplex: bool) -> u32 {
+    let ipgt = if !full_duplex && speed == 10 {
+        0xFF
+    } else if is_spt_or_later && full_duplex && speed != 1000 {
+        0x0C
+    } else {
+        0x08
+    };
+    (tipg & !TIPG_IPGT_MASK) | ipgt
 }
 
 // CTRL_EXT bits
@@ -378,6 +492,18 @@ const MAX_PHY_REG_ADDRESS: u32 = 0x1F;
 const MAX_PHY_MULTI_PAGE_REG: u32 = 0x0F;
 const HV_PHY_ADDR: u8 = 1; // pages >= 768 live at PHY addr 1
 
+// HV_OEM_BITS = PHY_REG(768, 25) — the PHY's own copy of the "link up at the
+// lowest speed to save power" (LPLU) and "no gigabit" (GBE_DIS) knobs. Linux
+// keeps it in sync with the MAC-side PHY_CTRL register in
+// `e1000_oem_bits_config_ich8lan`; see [`oem_bits_for_d0`].
+const HV_OEM_BITS_PAGE: u32 = 768;
+const HV_OEM_BITS_REG: u32 = 25;
+const HV_OEM_BITS_LPLU: u16 = 0x0004;
+const HV_OEM_BITS_GBE_DIS: u16 = 0x0040;
+const HV_OEM_BITS_RESTART_AN: u16 = 0x0400;
+/// Linux `HV_INTC_FC_PAGE_START`: the first HV page reachable at PHY address 1,
+/// and the one page whose select value is written as 0 (see [`hv_page_select`]).
+const HV_INTC_FC_PAGE_START: u32 = 768;
 // CV_SMB_CTRL = PHY_REG(769, 23)
 const CV_SMB_CTRL_PAGE: u32 = 769;
 const CV_SMB_CTRL_REG: u32 = 23;
@@ -409,6 +535,10 @@ const KMRNCTRLSTA_OFFSET: u32 = 0x001F_0000;
 const KMRNCTRLSTA_REN: u32 = 0x0020_0000;
 const KMRNCTRLSTA_K1_CONFIG: u32 = 0x7;
 const KMRNCTRLSTA_K1_ENABLE: u16 = 0x0002;
+/// Kumeran sub-registers Linux programs in `e1000_setup_copper_link_ich8lan`
+/// with the comment "this fixes erroneous timeouts at 10Mbps".
+const KMRNCTRLSTA_TIMEOUTS: u32 = 0x4;
+const KMRNCTRLSTA_INBAND_PARAM: u32 = 0x9;
 const CTRL_EXT_SPD_BYPS: u32 = 0x0000_8000;
 const CTRL_SPD_1000: u32 = 0x0000_0200;
 const CTRL_SPD_100: u32 = 0x0000_0100;
@@ -429,7 +559,10 @@ const MII_CTRL1000: u32 = 0x09;
 const MII_ESTATUS: u32 = 0x0F;
 /// BMSR bit 8: register 15 (ESTATUS) is implemented.
 const BMSR_ESTATEN: u16 = 0x0100;
-/// ESTATUS bits 12/13: the PHY can do 1000BASE-T half / full duplex.
+/// ESTATUS bits 12/13: the PHY can do 1000BASE-T half / full duplex. Half is
+/// never advertised (Linux refuses it too) but is kept here because the
+/// register bit is part of the documented layout.
+#[allow(dead_code)]
 const ESTATUS_1000_THALF: u16 = 0x1000;
 const ESTATUS_1000_TFULL: u16 = 0x2000;
 /// ADVERTISE bits 5..8: 10/100, half and full duplex.
@@ -442,6 +575,21 @@ const ADVERTISE_ALL_10_100: u16 =
 /// CTRL1000 bits 8/9: advertise 1000BASE-T half / full duplex.
 const ADVERTISE_1000HALF: u16 = 0x0100;
 const ADVERTISE_1000FULL: u16 = 0x0200;
+/// MII registers needed to read back what auto-negotiation actually settled on.
+const MII_BMCR: u32 = 0x00;
+const MII_LPA: u32 = 0x05;
+const MII_STAT1000: u32 = 0x0A;
+/// BMSR bit 2 / bit 5: link is up (latched low) and auto-negotiation finished.
+const BMSR_LSTATUS: u16 = 0x0004;
+const BMSR_ANEGCOMPLETE: u16 = 0x0020;
+/// LPA (register 5) — what the link partner advertised for 10/100.
+const LPA_10HALF: u16 = 0x0020;
+const LPA_10FULL: u16 = 0x0040;
+const LPA_100HALF: u16 = 0x0080;
+const LPA_100FULL: u16 = 0x0100;
+/// STAT1000 (register 10) bits 10/11 — the partner's 1000BASE-T abilities.
+const LPA_1000HALF: u16 = 0x0400;
+const LPA_1000FULL: u16 = 0x0800;
 
 // Legacy RX descriptor status (LK / 8254x §3.2.3.1)
 const RXD_STAT_DD: u8 = 1 << 0;
@@ -997,11 +1145,7 @@ impl E1000eHw {
 
     unsafe fn phy_read_hv(&self, page: u32, reg: u32) -> Option<u16> {
         if reg > MAX_PHY_MULTI_PAGE_REG
-            && !self.mdic_write(
-                HV_PHY_ADDR,
-                PHY_PAGE_SELECT_REG,
-                (page << PHY_PAGE_SHIFT) as u16,
-            )
+            && !self.mdic_write(HV_PHY_ADDR, PHY_PAGE_SELECT_REG, hv_page_select(page))
         {
             return None;
         }
@@ -1010,11 +1154,7 @@ impl E1000eHw {
 
     unsafe fn phy_write_hv(&self, page: u32, reg: u32, val: u16) -> bool {
         if reg > MAX_PHY_MULTI_PAGE_REG
-            && !self.mdic_write(
-                HV_PHY_ADDR,
-                PHY_PAGE_SELECT_REG,
-                (page << PHY_PAGE_SHIFT) as u16,
-            )
+            && !self.mdic_write(HV_PHY_ADDR, PHY_PAGE_SELECT_REG, hv_page_select(page))
         {
             return false;
         }
@@ -1214,6 +1354,137 @@ impl E1000eHw {
     }
 
     // -----------------------------------------------------------------------
+    // LPLU / gigabit-disable in the PHY (port of e1000_oem_bits_config_ich8lan
+    // and e1000_set_lplu_state_pchlan), plus the Kumeran and MAC tuning that
+    // Linux hangs off the copper-link setup and the link-change check.
+    // -----------------------------------------------------------------------
+
+    /// Clear "low power link up" and "gigabit disabled" **in the PHY**.
+    ///
+    /// Clearing them in the MAC-side `PHY_CTRL` register (step 10 of
+    /// `reset_and_init`) is not enough on a PCH part: the bits that actually
+    /// steer auto-negotiation live in the PHY's own `HV_OEM_BITS`, they survive
+    /// a MAC reset, and the ME leaves LPLU set when it has been holding the
+    /// link up for manageability. LPLU means "negotiate the lowest speed the
+    /// link supports", i.e. **10 Mb/s** — which is exactly what a host that
+    /// never clears it sees on a gigabit switch.
+    ///
+    /// Linux gates the full `PHY_CTRL` -> `HV_OEM_BITS` mirror on
+    /// `FEXTNVM.SW_CONFIG`; when that gate is closed it still has a narrower
+    /// entry point (`phy.ops.set_d0_lplu_state`, i.e.
+    /// `e1000_set_lplu_state_pchlan`) that only touches LPLU and restarts
+    /// auto-negotiation. We run whichever of the two applies, so the link is
+    /// never left at 10 Mb/s just because the NVM gate is closed.
+    unsafe fn oem_bits_config(&self, d0_state: bool) {
+        if !self.is_pch() {
+            return;
+        }
+        if !self.acquire_swflag() {
+            crate::klog_warn!("[e1000e] oem_bits_config: SW/FW semaphore busy\n");
+            return;
+        }
+        let fextnvm = mmio_read(self.base, E1000E_FEXTNVM);
+        let phy_ctrl = mmio_read(self.base, E1000E_PHY_CTRL);
+        let sw_config = fextnvm & FEXTNVM_SW_CONFIG_ICH8M != 0;
+        if let Some(oem) = self.phy_read_hv(HV_OEM_BITS_PAGE, HV_OEM_BITS_REG) {
+            if oem != 0xFFFF {
+                let want = if sw_config {
+                    oem_bits_for_d0(phy_ctrl, oem, d0_state, false)
+                } else {
+                    // Narrow path: LPLU only, as e1000_set_lplu_state_pchlan does.
+                    (oem & !HV_OEM_BITS_LPLU) | HV_OEM_BITS_RESTART_AN
+                };
+                if want != oem {
+                    let ok = self.phy_write_hv(HV_OEM_BITS_PAGE, HV_OEM_BITS_REG, want);
+                    crate::klog_warn!(
+                        "[e1000e] HV_OEM_BITS {:#06x} -> {:#06x} (lplu={} gbe_dis={} sw_config={} ok={})\n",
+                        oem,
+                        want,
+                        oem & HV_OEM_BITS_LPLU != 0,
+                        oem & HV_OEM_BITS_GBE_DIS != 0,
+                        sw_config,
+                        ok
+                    );
+                }
+            }
+        } else {
+            crate::klog_warn!(
+                "[e1000e] HV_OEM_BITS unreadable (PHY_CTRL={:#010x} FEXTNVM={:#010x})\n",
+                phy_ctrl,
+                fextnvm
+            );
+        }
+        self.release_swflag();
+    }
+
+    /// Port of the Kumeran half of Linux `e1000_setup_copper_link_ich8lan`:
+    /// maximum wait between PHY polls and the in-band parameter floor. Linux's
+    /// own comment is "this fixes erroneous timeouts at 10Mbps".
+    unsafe fn setup_kmrn_copper_timeouts(&self) {
+        if !self.is_pch() {
+            return;
+        }
+        if !self.acquire_swflag() {
+            return;
+        }
+        self.kmrn_write(KMRNCTRLSTA_TIMEOUTS, 0xFFFF);
+        let inband = self.kmrn_read(KMRNCTRLSTA_INBAND_PARAM);
+        self.kmrn_write(KMRNCTRLSTA_INBAND_PARAM, inband | 0x3F);
+        self.release_swflag();
+    }
+
+    /// Read back what auto-negotiation actually resolved to, straight from the
+    /// PHY. Used only for reporting: the MAC's `STATUS` stays the value the
+    /// driver acts on, exactly as in Linux.
+    unsafe fn read_phy_negotiated(&self) -> Option<(u32, bool)> {
+        if !self.acquire_swflag() {
+            return None;
+        }
+        let out = self.read_phy_negotiated_locked();
+        self.release_swflag();
+        out
+    }
+
+    unsafe fn read_phy_negotiated_locked(&self) -> Option<(u32, bool)> {
+        let phy_addrs: [u8; 2] = if self.is_pch() { [2, 1] } else { [1, 2] };
+        for phy_addr in phy_addrs {
+            let Some(bmsr) = self.mdic_read(phy_addr, MII_BMSR) else {
+                continue;
+            };
+            if bmsr == 0xFFFF {
+                continue;
+            }
+            let adv = self.mdic_read(phy_addr, MII_ADVERTISE).unwrap_or(0);
+            let lpa = self.mdic_read(phy_addr, MII_LPA).unwrap_or(0);
+            let ctrl1000 = self.mdic_read(phy_addr, MII_CTRL1000).unwrap_or(0);
+            let stat1000 = self.mdic_read(phy_addr, MII_STAT1000).unwrap_or(0);
+            return phy_negotiated_link(bmsr, adv, lpa, ctrl1000, stat1000);
+        }
+        None
+    }
+
+    /// Speed-dependent MAC tuning Linux applies every time the link changes
+    /// (`e1000_check_for_copper_link_ich8lan`): the transmit inter-packet gap,
+    /// and the I217 beacon duration that its packet-loss erratum calls for.
+    unsafe fn apply_link_speed_tuning(&self, status: u32) {
+        if !self.is_pch() {
+            return;
+        }
+        let speed = status_speed_mbps(status);
+        let full_duplex = status & STATUS_FD != 0;
+        let tipg = mmio_read(self.base, E1000E_TIPG);
+        let want = tipg_for_link(tipg, self.is_pch_spt_or_later(), speed, full_duplex);
+        if want != tipg {
+            mmio_write(self.base, E1000E_TIPG, want);
+        }
+        let f4 = mmio_read(self.base, E1000E_FEXTNVM4);
+        let want4 = (f4 & !FEXTNVM4_BEACON_DURATION_MASK) | FEXTNVM4_BEACON_DURATION_8USEC;
+        if want4 != f4 {
+            mmio_write(self.base, E1000E_FEXTNVM4, want4);
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // Restart auto-negotiation via the PHY BMCR (register 0). Tries both
     // possible PHY addresses and protects the access with the SW/FW semaphore.
     // -----------------------------------------------------------------------
@@ -1230,13 +1501,13 @@ impl E1000eHw {
         // reached the real PHY. Discrete 82574 keeps its PHY at address 1.
         let phy_addrs: [u8; 2] = if self.is_pch() { [2, 1] } else { [1, 2] };
         for phy_addr in phy_addrs {
-            if let Some(bmcr) = self.mdic_read(phy_addr, 0) {
+            if let Some(bmcr) = self.mdic_read(phy_addr, MII_BMCR) {
                 if bmcr == 0xFFFF {
                     continue;
                 }
                 self.widen_autoneg_advertisement(phy_addr);
                 let v = bmcr | MII_CR_AUTO_NEG_EN | MII_CR_RESTART_AUTO_NEG;
-                if self.mdic_write(phy_addr, 0, v) {
+                if self.mdic_write(phy_addr, MII_BMCR, v) {
                     crate::klog_warn!("[e1000e] restart autoneg on phy_addr={}\n", phy_addr);
                     break;
                 }
@@ -1285,16 +1556,15 @@ impl E1000eHw {
         if estatus == 0xFFFF {
             return;
         }
-        let mut capable = 0u16;
-        if estatus & ESTATUS_1000_TFULL != 0 {
-            capable |= ADVERTISE_1000FULL;
-        }
-        if estatus & ESTATUS_1000_THALF != 0 {
-            capable |= ADVERTISE_1000HALF;
-        }
-        if capable == 0 {
+        // Only full duplex: Linux's e1000_phy_setup_autoneg refuses to
+        // advertise 1000BASE-T half duplex outright ("Advertise 1000mb Half
+        // duplex request denied!"). Offering it can only ever resolve to a
+        // worse link than the one we already asked for.
+        let capable = if estatus & ESTATUS_1000_TFULL != 0 {
+            ADVERTISE_1000FULL
+        } else {
             return;
-        }
+        };
         if let Some(ctrl1000) = self.mdic_read(phy_addr, MII_CTRL1000) {
             if ctrl1000 != 0xFFFF && ctrl1000 & capable != capable {
                 let want = ctrl1000 | capable;
@@ -1718,6 +1988,14 @@ impl E1000eHw {
             Self::udelay(1_000);
         }
 
+        // 10.5 Mirror those bits into the PHY's own HV_OEM_BITS. The MAC-side
+        //      register above is only the host's copy; the PHY keeps its own,
+        //      it survives CTRL_RST, and while its LPLU bit is set the PHY
+        //      negotiates the *lowest* speed the link supports — 10 Mb/s on a
+        //      gigabit switch. Linux does this in every PHY reset path
+        //      (e1000_post_phy_reset_ich8lan -> e1000_oem_bits_config_ich8lan).
+        self.oem_bits_config(true);
+
         // 11. Skip PHY soft reset — BMCR reset disrupts auto-negotiation (3-5 s) and may
         //     reload LPLU from NVM, permanently keeping the link down. The MAC-level
         //     CTRL_RST + PHY_CTRL LPLU clear is sufficient; the OSDev i219-V guide
@@ -1731,6 +2009,11 @@ impl E1000eHw {
             mmio_write(self.base, E1000E_CTRL, ctrl);
             let _ = mmio_read(self.base, E1000E_CTRL);
         }
+
+        // 12.3 Kumeran poll timeouts — Linux's e1000_setup_copper_link_ich8lan
+        //      sets these right after SLU/ASDE, to stop the MAC giving up on
+        //      the PHY early ("fixes erroneous timeouts at 10Mbps").
+        self.setup_kmrn_copper_timeouts();
 
         // 12.5 Configure K1 (Kumeran power state) to a known-good enabled state.
         //      Runs the FRCSPD/SPD_BYPS dance from Linux and restores CTRL.
@@ -2533,6 +2816,9 @@ impl E1000eHw {
             link_changed = true;
             self.link_up = link;
             if link {
+                // Linux re-tunes the inter-packet gap on every link change,
+                // because the right value depends on the speed we just got.
+                self.apply_link_speed_tuning(status);
                 // Report what auto-negotiation actually settled on. Nothing
                 // else in the system surfaces link speed (there is no ethtool
                 // and no /sys/class/net/*/speed), so without this a link that
@@ -2549,6 +2835,31 @@ impl E1000eHw {
                     },
                     status
                 );
+                // Second opinion, straight from the PHY. STATUS is what the
+                // MAC's auto-speed detection made of the MAC-PHY interconnect;
+                // the MII registers are what the two link partners agreed on.
+                // When they disagree the problem is between MAC and PHY (the
+                // interconnect stuck in SMBus mode, say), not on the wire.
+                match self.read_phy_negotiated() {
+                    Some((phy_speed, phy_fd)) => {
+                        if phy_speed != status_speed_mbps(status)
+                            || phy_fd != (status & STATUS_FD != 0)
+                        {
+                            crate::klog_warn!(
+                                "[e1000e] PHY says {}Mb/s fd={} but MAC STATUS says {}Mb/s fd={} — MAC-PHY interconnect mismatch\n",
+                                phy_speed,
+                                phy_fd,
+                                status_speed_mbps(status),
+                                status & STATUS_FD != 0
+                            );
+                        }
+                    }
+                    None => {
+                        crate::klog_warn!(
+                            "[e1000e] link UP but the PHY reports auto-negotiation incomplete\n"
+                        );
+                    }
+                }
             } else {
                 crate::klog_warn!("[e1000e] link DOWN\n");
             }
@@ -4861,5 +5172,238 @@ mod rx_mode_and_id_tests {
         // a full CTRL_RST against mock MMIO.
         hw.hw_running = true;
         assert!(hw.can_send());
+    }
+}
+
+#[cfg(test)]
+mod link_speed_tests {
+    //! Auto-negotiation: what we ask the PHY for, what we read back, and what
+    //! the MAC is tuned to afterwards.
+    //!
+    //! None of this needs a NIC — every decision below is a pure function of
+    //! register contents, which is the whole reason it is split out that way.
+    //! The path these cover (a PCH part with a live Management Engine) is
+    //! never executed in CI: QEMU's e1000e has no ME, no ULP and no HV pages.
+
+    use super::rx_ring_tests::make_hw;
+    use super::*;
+
+    /// I219-V, i.e. what a PCH-SPT-or-later part looks like to `is_pch()`.
+    const I219: u16 = 0x15b8;
+
+    fn reg_read(base: usize, reg: usize) -> u32 {
+        unsafe { core::ptr::read_volatile((base + reg * 4) as *const u32) }
+    }
+    fn reg_write(base: usize, reg: usize, v: u32) {
+        unsafe { core::ptr::write_volatile((base + reg * 4) as *mut u32, v) }
+    }
+
+    // ---------------------------------------------------------------- pages
+
+    #[test]
+    fn hv_page_768_is_selected_as_page_zero() {
+        // Linux: `if (page == HV_INTC_FC_PAGE_START) page = 0;`. Page 768 is
+        // the PHY's page 0 seen at MDIO address 1. Selecting it by number
+        // writes 768 << 5 = 0x6000, which is a different page entirely — and
+        // HV_OEM_BITS (768, 25) is where LPLU lives, so getting this wrong
+        // means reading and writing someone else's register.
+        assert_eq!(hv_page_select(768), 0);
+        assert_ne!(hv_page_select(768), (768u32 << PHY_PAGE_SHIFT) as u16);
+    }
+
+    #[test]
+    fn other_hv_pages_are_selected_by_number_shifted_left_five() {
+        assert_eq!(hv_page_select(769), 0x6020); // CV_SMB_CTRL
+        assert_eq!(hv_page_select(770), 0x6040); // HV_PM_CTRL
+        assert_eq!(hv_page_select(779), 0x6160); // I218_ULP_CONFIG1
+    }
+
+    // ------------------------------------------------------------- OEM bits
+
+    #[test]
+    fn oem_bits_clear_lplu_and_gbe_disable_when_the_mac_copy_is_clear() {
+        // This is the fix: the ME leaves LPLU set in the PHY, the driver
+        // clears the MAC-side PHY_CTRL and thinks it is done, and the PHY goes
+        // on negotiating the lowest speed the link supports — 10 Mb/s.
+        let oem = HV_OEM_BITS_LPLU | HV_OEM_BITS_GBE_DIS;
+        let got = oem_bits_for_d0(0, oem, true, false);
+        assert_eq!(got & HV_OEM_BITS_LPLU, 0);
+        assert_eq!(got & HV_OEM_BITS_GBE_DIS, 0);
+        assert_ne!(got & HV_OEM_BITS_RESTART_AN, 0);
+    }
+
+    #[test]
+    fn oem_bits_mirror_the_d0_copies_of_the_mac_register() {
+        let phy_ctrl = PHY_CTRL_D0A_LPLU | PHY_CTRL_GBE_DISABLE;
+        let got = oem_bits_for_d0(phy_ctrl, 0, true, false);
+        assert_ne!(got & HV_OEM_BITS_LPLU, 0);
+        assert_ne!(got & HV_OEM_BITS_GBE_DIS, 0);
+    }
+
+    #[test]
+    fn oem_bits_in_d0_ignore_the_non_d0_copies() {
+        // In D0a only the D0a bits apply; the suspend path (d0_state = false)
+        // takes both. Folding the two together would disable gigabit on a
+        // machine whose firmware only asked for it while suspended.
+        let phy_ctrl = PHY_CTRL_NOND0A_LPLU | PHY_CTRL_NOND0A_GBE_DISABLE;
+        let d0 = oem_bits_for_d0(phy_ctrl, 0, true, false);
+        assert_eq!(d0 & (HV_OEM_BITS_LPLU | HV_OEM_BITS_GBE_DIS), 0);
+        let dx = oem_bits_for_d0(phy_ctrl, 0, false, false);
+        assert_eq!(
+            dx & (HV_OEM_BITS_LPLU | HV_OEM_BITS_GBE_DIS),
+            HV_OEM_BITS_LPLU | HV_OEM_BITS_GBE_DIS
+        );
+    }
+
+    #[test]
+    fn oem_bits_do_not_restart_autoneg_when_the_me_blocks_phy_resets() {
+        let got = oem_bits_for_d0(0, HV_OEM_BITS_LPLU, true, true);
+        assert_eq!(got & HV_OEM_BITS_RESTART_AN, 0);
+    }
+
+    #[test]
+    fn oem_bits_leave_every_other_bit_of_the_register_alone() {
+        // The register also carries LED and other OEM configuration we have no
+        // business rewriting.
+        let oem = 0x1289 | HV_OEM_BITS_LPLU;
+        let got = oem_bits_for_d0(0, oem, true, false);
+        assert_eq!(got & 0x1289, 0x1289);
+    }
+
+    // --------------------------------------------------- negotiation result
+
+    #[test]
+    fn phy_result_needs_both_link_and_autoneg_complete() {
+        let up_and_done = BMSR_LSTATUS | BMSR_ANEGCOMPLETE;
+        assert!(phy_negotiated_link(up_and_done, ADVERTISE_100FULL, LPA_100FULL, 0, 0).is_some());
+        assert!(phy_negotiated_link(BMSR_LSTATUS, ADVERTISE_100FULL, LPA_100FULL, 0, 0).is_none());
+        assert!(
+            phy_negotiated_link(BMSR_ANEGCOMPLETE, ADVERTISE_100FULL, LPA_100FULL, 0, 0).is_none()
+        );
+    }
+
+    #[test]
+    fn phy_result_prefers_gigabit_full_duplex() {
+        let bmsr = BMSR_LSTATUS | BMSR_ANEGCOMPLETE;
+        let adv = ADVERTISE_ALL_10_100;
+        let lpa = LPA_10HALF | LPA_10FULL | LPA_100HALF | LPA_100FULL;
+        let got = phy_negotiated_link(bmsr, adv, lpa, ADVERTISE_1000FULL, LPA_1000FULL);
+        assert_eq!(got, Some((1000, true)));
+    }
+
+    #[test]
+    fn phy_result_ignores_gigabit_the_partner_never_offered() {
+        // We advertise 1000; the switch port is 100-only. Resolution has to
+        // fall through to 100 full, not claim the gigabit we asked for.
+        let bmsr = BMSR_LSTATUS | BMSR_ANEGCOMPLETE;
+        let got = phy_negotiated_link(
+            bmsr,
+            ADVERTISE_ALL_10_100,
+            LPA_100FULL | LPA_100HALF,
+            ADVERTISE_1000FULL,
+            0,
+        );
+        assert_eq!(got, Some((100, true)));
+    }
+
+    #[test]
+    fn phy_result_walks_down_the_ieee_priority_list() {
+        let bmsr = BMSR_LSTATUS | BMSR_ANEGCOMPLETE;
+        let cases: [(u16, u16, (u32, bool)); 4] = [
+            (ADVERTISE_100FULL, LPA_100FULL, (100, true)),
+            (ADVERTISE_100HALF, LPA_100HALF, (100, false)),
+            (ADVERTISE_10FULL, LPA_10FULL, (10, true)),
+            (ADVERTISE_10HALF, LPA_10HALF, (10, false)),
+        ];
+        for (adv, lpa, want) in cases {
+            assert_eq!(phy_negotiated_link(bmsr, adv, lpa, 0, 0), Some(want));
+        }
+        // 1000 half only ever resolves when both sides offered it.
+        assert_eq!(
+            phy_negotiated_link(bmsr, 0, 0, ADVERTISE_1000HALF, LPA_1000HALF),
+            Some((1000, false))
+        );
+    }
+
+    #[test]
+    fn phy_result_is_none_when_the_two_sides_share_nothing() {
+        let bmsr = BMSR_LSTATUS | BMSR_ANEGCOMPLETE;
+        assert_eq!(
+            phy_negotiated_link(bmsr, ADVERTISE_100FULL, LPA_10HALF, 0, 0),
+            None
+        );
+    }
+
+    // ------------------------------------------------------- MAC STATUS bits
+
+    #[test]
+    fn status_decodes_all_four_speed_encodings() {
+        assert_eq!(status_speed_mbps(0), 10);
+        assert_eq!(status_speed_mbps(0b01 << STATUS_SPEED_SHIFT), 100);
+        assert_eq!(status_speed_mbps(0b10 << STATUS_SPEED_SHIFT), 1000);
+        assert_eq!(status_speed_mbps(0b11 << STATUS_SPEED_SHIFT), 1000);
+        // Bits outside [7:6] must not leak into the decode.
+        assert_eq!(status_speed_mbps(0xFFFF_FF3F), 10);
+    }
+
+    // ------------------------------------------------------------ TIPG / IPG
+
+    #[test]
+    fn tipg_widens_the_gap_only_at_10_megabit_half_duplex() {
+        let base = 8 | (8 << 10) | (6 << 20);
+        assert_eq!(tipg_for_link(base, true, 10, false) & TIPG_IPGT_MASK, 0xFF);
+        assert_eq!(tipg_for_link(base, true, 10, true) & TIPG_IPGT_MASK, 0x0C);
+        assert_eq!(tipg_for_link(base, false, 10, true) & TIPG_IPGT_MASK, 0x08);
+    }
+
+    #[test]
+    fn tipg_uses_the_intermediate_gap_below_gigabit_on_spt_and_later() {
+        let base = 8 | (8 << 10) | (6 << 20);
+        assert_eq!(tipg_for_link(base, true, 100, true) & TIPG_IPGT_MASK, 0x0C);
+        assert_eq!(tipg_for_link(base, true, 1000, true) & TIPG_IPGT_MASK, 0x08);
+        assert_eq!(tipg_for_link(base, false, 100, true) & TIPG_IPGT_MASK, 0x08);
+    }
+
+    #[test]
+    fn tipg_keeps_the_ipgr1_and_ipgr2_fields() {
+        let base = 8 | (8 << 10) | (6 << 20);
+        let got = tipg_for_link(base, true, 10, false);
+        assert_eq!(got & !TIPG_IPGT_MASK, base & !TIPG_IPGT_MASK);
+    }
+
+    #[test]
+    fn link_tuning_writes_tipg_and_the_i217_beacon_duration() {
+        let mut hw = make_hw();
+        hw.device_id = I219;
+        reg_write(hw.base, E1000E_TIPG, 8 | (8 << 10) | (6 << 20));
+        reg_write(hw.base, E1000E_FEXTNVM4, 0xDEAD_BEE0);
+
+        // 10 Mb/s half duplex: STATUS speed bits 00, FD clear.
+        unsafe { hw.apply_link_speed_tuning(0) };
+        assert_eq!(reg_read(hw.base, E1000E_TIPG) & TIPG_IPGT_MASK, 0xFF);
+        assert_eq!(
+            reg_read(hw.base, E1000E_FEXTNVM4) & FEXTNVM4_BEACON_DURATION_MASK,
+            FEXTNVM4_BEACON_DURATION_8USEC
+        );
+        // The rest of FEXTNVM4 is left as it was.
+        assert_eq!(
+            reg_read(hw.base, E1000E_FEXTNVM4) & !0x7,
+            0xDEAD_BEE0 & !0x7
+        );
+
+        // Gigabit full duplex rolls the gap back to the default.
+        unsafe { hw.apply_link_speed_tuning((0b10 << STATUS_SPEED_SHIFT) | STATUS_FD) };
+        assert_eq!(reg_read(hw.base, E1000E_TIPG) & TIPG_IPGT_MASK, 0x08);
+    }
+
+    #[test]
+    fn link_tuning_leaves_discrete_parts_alone() {
+        // The TIPG erratum and the beacon duration are PCH-only; an 82574 in
+        // QEMU must come out of this untouched.
+        let hw = make_hw();
+        assert!(!hw.is_pch());
+        reg_write(hw.base, E1000E_TIPG, 0x1234_5678);
+        unsafe { hw.apply_link_speed_tuning(0) };
+        assert_eq!(reg_read(hw.base, E1000E_TIPG), 0x1234_5678);
     }
 }
