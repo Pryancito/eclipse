@@ -1563,6 +1563,35 @@ fn timestamp_entropy() -> u64 {
 /// already holding the global SOCKETS lock (e.g. tcp `connect`), so re-locking
 /// it here would deadlock. The random seed plus the monotonically advancing
 /// counter makes a same-4-tuple collision unlikely in practice.
+/// `shutdown(2)`'s `how`: which halves it names, `EINVAL` past `SHUT_RDWR`.
+pub(crate) fn shutdown_sides(howto: usize) -> LxResult<(bool, bool)> {
+    match howto {
+        0 => Ok((true, false)),
+        1 => Ok((false, true)),
+        2 => Ok((true, true)),
+        _ => Err(LxError::EINVAL),
+    }
+}
+
+/// Serializes the socket tests of this module tree: they share the global
+/// smoltcp set, the loopback interfaces they build move every socket's
+/// packets, and the ephemeral port counter is one for all of them.
+#[cfg(test)]
+pub(crate) static NET_TEST_LOCK: lock::Mutex<()> = lock::Mutex::new(());
+
+/// Spin the ephemeral port counter until its next answer is `port`, so a
+/// test can tell "skipped what is bound" from "the next number anyway".
+#[cfg(test)]
+pub(crate) fn rewind_ephemeral_port_to(port: u16) {
+    let before = if port == 49152 { 65534 } else { port - 1 };
+    for _ in 0..(2 * 16384) {
+        if get_ephemeral_port() == before {
+            return;
+        }
+    }
+    panic!("allocator never came round to {}", before);
+}
+
 fn get_ephemeral_port() -> u16 {
     use core::sync::atomic::{AtomicU16, Ordering};
     const LOW: u16 = 49152;
