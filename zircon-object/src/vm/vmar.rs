@@ -159,10 +159,12 @@ impl Drop for ForkPhase {
 }
 
 /// Per-mapping fork cost broken into phases, in nanoseconds:
-/// `(mappings cloned, total, create_child, protect_for_cow, map_committed)`.
+/// `(mappings cloned, total, create_child, protect_for_cow, map_committed,
+/// allocations)`.
 ///
-/// `total` covers all of `clone_map`; the difference between it and the three
-/// phases is the eager-copy fallback plus bookkeeping.
+/// `total` covers all of `clone_map` plus the `map_committed` that follows it,
+/// so it is the whole per-mapping cost of a fork; the difference between it and
+/// the three phases is the eager-copy fallback plus bookkeeping.
 pub fn fork_phase_stats() -> (u64, u64, u64, u64, u64, u64) {
     (
         FORK_MAPPINGS.load(Ordering::Relaxed),
@@ -186,8 +188,15 @@ pub fn fork_eager_stats() -> (u64, u64, u64) {
 
 /// Charge `ns` to the `map_committed` phase. Called from `fork_from`, which is
 /// where that step happens.
+///
+/// It goes into `FORK_NS_TOTAL` too. `ForkPhase` only spans `clone_map`, and
+/// `map_committed` runs on `clone_map`'s *result*, after it has returned — so
+/// without this the per-mapping total left out a whole phase while the report
+/// next to it printed that phase as part of the breakdown, and the parts came
+/// to more than the whole.
 fn note_map_committed(ns: u64) {
     FORK_NS_MAP_COMMITTED.fetch_add(ns, Ordering::Relaxed);
+    FORK_NS_TOTAL.fetch_add(ns, Ordering::Relaxed);
 }
 
 /// Charges the eager-copy fallback, however it exits.
