@@ -514,15 +514,19 @@ impl Syscall<'_> {
             let _ = proc.get_file_like(fd1)?;
             return Ok(fd2.into());
         }
-        let file_like = proc.get_file_like(fd1)?.dup();
-        let mut flags = file_like.flags();
-        flags -= OpenFlags::CLOEXEC;
-        file_like.set_flags(flags)?;
+        // `dup2(2)` installs the SAME open file description under `fd2`, not a
+        // copy of it: `fs/file.c`'s `do_dup2` does `get_file(file)` and stores
+        // that pointer. So the two descriptors share the file offset and the
+        // status flags -- which is what makes `prog >log 2>&1` write one log
+        // instead of two streams overwriting each other from offset 0 -- and
+        // the only thing the new descriptor gets of its own is `FD_CLOEXEC`,
+        // which `dup2` clears (POSIX; `dup3(2)` sets it back when asked).
+        let file_like = proc.get_file_like(fd1)?;
         // Atomic replace (Linux dup2 semantics). The previous close-then-insert
         // pair took the fd-table lock twice, leaving a window where fd2 was
         // absent — a concurrent syscall on fd2 in that window got a spurious
         // EBADF.
-        let old = proc.replace_file(fd2, file_like)?;
+        let old = proc.replace_file(fd2, file_like, false)?;
         if let Some(old) = old {
             if let Some(desc) = linux_object::fs::drm_fd_desc(&old) {
                 error!(
@@ -557,11 +561,10 @@ impl Syscall<'_> {
     pub fn sys_dup(&self, fd1: FileDesc) -> SysResult {
         info!("dup: from {:?}", fd1);
         let proc = self.linux_process();
-        let file_like = proc.get_file_like(fd1)?.dup();
-        let mut flags = file_like.flags();
-        flags -= OpenFlags::CLOEXEC;
-        file_like.set_flags(flags)?;
-        let fd2 = proc.add_file(file_like)?;
+        // Same open file description, lowest free descriptor, `FD_CLOEXEC`
+        // clear (see `sys_dup2`).
+        let file_like = proc.get_file_like(fd1)?;
+        let fd2 = proc.add_file_cloexec(file_like, false)?;
         Ok(fd2.into())
     }
 

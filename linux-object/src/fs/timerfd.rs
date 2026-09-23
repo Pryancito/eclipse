@@ -147,14 +147,6 @@ impl FileLike for TimerFd {
         Ok(())
     }
 
-    fn dup(&self) -> Arc<dyn FileLike> {
-        Arc::new(Self {
-            base: KObjectBase::new(),
-            inner: self.inner.clone(),
-            flags: Mutex::new(self.flags()),
-        })
-    }
-
     async fn read(&self, buf: &mut [u8]) -> LxResult<usize> {
         if buf.len() < 8 {
             return Err(LxError::EINVAL);
@@ -254,13 +246,6 @@ mod tests {
         fd.set_flags(nonblock()).unwrap();
         assert!(fd.flags().non_block());
         assert_eq!(read8(&fd), Err(LxError::EAGAIN));
-        let copy = fd.dup();
-        assert!(
-            copy.flags().non_block(),
-            "a dup copies the flags as set now"
-        );
-        copy.set_flags(OpenFlags::empty()).unwrap();
-        assert!(fd.flags().non_block(), "and keeps its own copy of them");
     }
 
     fn read8(fd: &TimerFd) -> LxResult<u64> {
@@ -446,8 +431,7 @@ mod tests {
     #[test]
     fn a_dup_shares_the_timer_and_its_expirations() {
         let fd = tfd(nonblock());
-        let dup = fd.dup();
-        let dup = dup.downcast_arc::<TimerFd>().ok().unwrap();
+        let dup = fd.clone();
         fd.set_time(10 * MS, 0, false);
         // Arming through one fd arms the other: they are one timer.
         assert!(dup.get_time().1 > 0);

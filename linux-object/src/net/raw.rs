@@ -375,13 +375,6 @@ impl FileLike for RawSocketState {
         Ok(())
     }
 
-    fn dup(&self) -> Arc<dyn FileLike> {
-        Arc::new(Self {
-            base: KObjectBase::new(),
-            inner: self.inner.clone(),
-        })
-    }
-
     async fn read(&self, buf: &mut [u8]) -> LxResult<usize> {
         Socket::read(self, buf).await.0
     }

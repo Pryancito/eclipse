@@ -711,15 +711,6 @@ impl FileLike for NetlinkSocketState {
         Ok(())
     }
 
-    fn dup(&self) -> Arc<dyn FileLike> {
-        Arc::new(Self {
-            base: KObjectBase::new(),
-            data: self.data.clone(),
-            local_endpoint: self.local_endpoint.clone(),
-            flags: self.flags.clone(),
-        })
-    }
-
     async fn read(&self, buf: &mut [u8]) -> LxResult<usize> {
         Socket::read(self, buf).await.0
     }

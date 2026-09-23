@@ -294,21 +294,6 @@ impl FileLike for SyncobjHandle {
         Ok(())
     }
 
-    fn dup(&self) -> Arc<dyn FileLike> {
-        // Another fd reference — bump the syncobj refcount to match Drop.
-        let _ = zcore_drivers::scheme::syncobj::add_ref(self.handle);
-        let duped = Arc::new(Self {
-            base: KObjectBase::new(),
-            handle: self.handle,
-            sync_file_point: self.sync_file_point,
-            signaled: self.signaled.clone(),
-            eventbus: self.eventbus.clone(),
-        });
-        // A dup of an unready sync_file shares the waiter via the Arc pair;
-        // no second registration.
-        duped
-    }
-
     async fn read(&self, _buf: &mut [u8]) -> LxResult<usize> {
         Err(LxError::ENOSYS)
     }

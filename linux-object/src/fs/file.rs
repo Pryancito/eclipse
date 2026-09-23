@@ -783,14 +783,6 @@ impl FileLike for File {
         Ok(())
     }
 
-    fn dup(&self) -> Arc<dyn FileLike> {
-        Arc::new(Self {
-            base: KObjectBase::new(),
-            path: self.path.clone(),
-            inner: RwLock::new(self.inner.read().clone()),
-        })
-    }
-
     fn metadata(&self) -> LxResult<Metadata> {
         File::metadata(self)
     }

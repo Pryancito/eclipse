@@ -96,15 +96,6 @@ impl FileLike for Inotify {
         Ok(())
     }
 
-    fn dup(&self) -> Arc<dyn FileLike> {
-        Arc::new(Self {
-            base: KObjectBase::new(),
-            inner: self.inner.clone(),
-            eventbus: self.eventbus.clone(),
-            flags: Mutex::new(self.flags()),
-        })
-    }
-
     async fn read(&self, _buf: &mut [u8]) -> LxResult<usize> {
         // No events are ever generated. A non-blocking reader gets EAGAIN
         // (the normal "nothing pending" answer); a blocking reader parks on
@@ -177,9 +168,6 @@ mod tests {
         assert!(i.flags().non_block());
         let mut buf = [0u8; 64];
         assert_eq!(block_on(i.read(&mut buf)), Err(LxError::EAGAIN));
-        let copy = i.dup();
-        copy.set_flags(OpenFlags::empty()).unwrap();
-        assert!(i.flags().non_block(), "a dup has its own flags");
     }
 
     fn watched(i: &Inotify) -> alloc::vec::Vec<(i32, String, u32)> {
@@ -269,8 +257,7 @@ mod tests {
     #[test]
     fn a_dup_shares_the_watch_table() {
         let i = inotify(OpenFlags::NON_BLOCK);
-        let d = i.dup();
-        let d = d.downcast_arc::<Inotify>().ok().unwrap();
+        let d = i.clone();
         let wd = i.add_watch("/etc", IN_MODIFY).unwrap() as i32;
         // Same instance underneath, so a watch added through one fd is
         // removable through the other.

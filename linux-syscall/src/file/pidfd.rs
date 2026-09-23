@@ -86,15 +86,16 @@ impl Syscall<'_> {
         if matches!(target_proc.status(), Status::Exited(_)) {
             return Err(LxError::ESRCH);
         }
+        // Like `dup`, this installs the target's own open file description
+        // here (`pidfd_getfd` calls `get_file`), so the two processes share
+        // the offset and the status flags. `pidfd_getfd(2)`: "the
+        // close-on-exec flag is set on the file descriptor" -- on THIS
+        // descriptor, not on the description the target is still using.
         let file = target_proc
             .try_linux()
             .ok_or(LxError::ESRCH)?
-            .get_file_like(targetfd.into())?
-            .dup();
-        let mut open_flags = file.flags();
-        open_flags |= OpenFlags::CLOEXEC;
-        file.set_flags(open_flags)?;
-        let new_fd = caller.add_file(file)?;
+            .get_file_like(targetfd.into())?;
+        let new_fd = caller.add_file_cloexec(file, true)?;
         Ok(new_fd.into())
     }
 }
