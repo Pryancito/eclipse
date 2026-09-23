@@ -1249,13 +1249,14 @@ mod elf_bounds_tests {
     /// binaries carry, and relocations belong to dynamically linked ones.
     #[test]
     fn a_stripped_binary_still_loads() {
-        // Above the host's `vm.mmap_min_addr`: this really maps under libos,
-        // and a GitHub runner's 64 KiB answers EPERM to an address a container
-        // with 4 KiB accepts. 4 MiB is where a non-PIE image starts anyway.
         let mut elf = Elf::new().phdr(Phdr {
             p_type: 1,    // PT_LOAD
             flags: 0b101, // R+X
             offset: payload_at(1),
+            // Above the host's `vm.mmap_min_addr`, like the flags test below:
+            // this one really does `mmap` at the address the header names, and
+            // a runner with the usual 64 KiB answers EPERM where a container
+            // with 4 KiB maps it happily.
             virtual_addr: 0x40_0000,
             file_size: 4,
             mem_size: 0x1000,
