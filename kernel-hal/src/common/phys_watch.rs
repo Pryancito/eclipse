@@ -147,6 +147,9 @@ fn block_holds(base: usize, pages: usize, paddr: usize) -> bool {
 pub struct FreedRing<const N: usize> {
     base: [AtomicUsize; N],
     pages: [AtomicUsize; N],
+    /// The `seq + 1` of the write that owns each slot, `0` while one is in
+    /// progress. Monotonic, which is what makes it a usable witness.
+    stamp: [AtomicU64; N],
     /// Monotonic count of blocks freed since boot; also the write cursor.
     seq: AtomicU64,
 }
@@ -162,6 +165,7 @@ impl<const N: usize> FreedRing<N> {
         Self {
             base: [const { AtomicUsize::new(0) }; N],
             pages: [const { AtomicUsize::new(0) }; N],
+            stamp: [const { AtomicU64::new(0) }; N],
             seq: AtomicU64::new(0),
         }
     }
@@ -169,23 +173,31 @@ impl<const N: usize> FreedRing<N> {
     /// Record that `[base, base + pages * PAGE_SIZE)` was just returned to the
     /// frame pool.
     ///
-    /// The slot is **retired before it is overwritten**: `pages` goes to zero
-    /// first, then the new base, then the new length. Publishing the length
-    /// last is what makes a reader that catches the slot mid-write either miss
-    /// it or see a pair that belongs together. Writing the length first — which
-    /// is what this did — let a reader take the *old* base with the *new*
-    /// length and match an address that was never in either block, on the one
-    /// path where a false positive costs the most: the already-fatal fault
-    /// report, whose whole job is to name the writer.
+    /// The slot is **retired before it is overwritten**: its stamp goes to
+    /// zero first, then the new base and length, then the stamp of the write
+    /// that owns it. A reader that catches the slot mid-write sees the zero
+    /// and skips it; one that straddles a whole write sees a stamp that has
+    /// moved on. Without that, a reader could take the *old* base with the
+    /// *new* length and match an address that was never in either block, on
+    /// the one path where a false positive costs the most: the already-fatal
+    /// fault report, whose whole job is to name the writer.
+    ///
+    /// The stamp has to be the witness rather than the length, because the
+    /// length is not one. Re-reading it and finding it unchanged says nothing
+    /// when the ring is short and the traffic repeats: two blocks freed in
+    /// turn put the same length back in the same slot, so a reader whose two
+    /// loads straddle a full cycle sees its own value again and pairs it with
+    /// the base it read in between. The stamp only ever counts up.
     pub fn note(&self, base: usize, pages: usize) {
         if pages == 0 {
             return;
         }
         let seq = self.seq.fetch_add(1, Ordering::AcqRel);
         let slot = (seq % N as u64) as usize;
-        self.pages[slot].store(0, Ordering::Release);
+        self.stamp[slot].store(0, Ordering::Release);
         self.base[slot].store(base, Ordering::Release);
         self.pages[slot].store(pages, Ordering::Release);
+        self.stamp[slot].store(seq + 1, Ordering::Release);
     }
 
     /// If `paddr` falls inside a block still in the ring, how many frees have
@@ -197,15 +209,18 @@ impl<const N: usize> FreedRing<N> {
             if back >= now {
                 break;
             }
-            let slot = ((now - 1 - back) % N as u64) as usize;
-            let pages = self.pages[slot].load(Ordering::Acquire);
-            if pages == 0 {
+            let want = now - 1 - back;
+            let slot = (want % N as u64) as usize;
+            // A slot still holding the write this position names. Zero is a
+            // write in flight, and a never-written slot never matches.
+            if self.stamp[slot].load(Ordering::Acquire) != want + 1 {
                 continue;
             }
             let base = self.base[slot].load(Ordering::Acquire);
-            // The length was published last, so re-reading it unchanged is
-            // what says this base belongs to it.
-            if self.pages[slot].load(Ordering::Acquire) != pages {
+            let pages = self.pages[slot].load(Ordering::Acquire);
+            // And still holding it afterwards, which is what says the two
+            // words belong together.
+            if self.stamp[slot].load(Ordering::Acquire) != want + 1 {
                 continue;
             }
             if block_holds(base, pages, paddr) {
