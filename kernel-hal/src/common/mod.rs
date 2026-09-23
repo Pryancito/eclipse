@@ -10,6 +10,7 @@ pub mod addr;
 pub mod boot_logo;
 pub mod console;
 pub mod context;
+pub mod deadline;
 pub mod dma_pin;
 pub mod dma_quarantine;
 pub mod fault_slots;

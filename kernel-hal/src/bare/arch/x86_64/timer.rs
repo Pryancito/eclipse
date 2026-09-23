@@ -251,7 +251,7 @@ pub fn calibrate_lapic_timer() {
 /// LAPIC timer initial count for the normal full-rate scheduler tick (4 ms at
 /// 250 Hz), in the measured count rate.
 pub fn fast_tick_count() -> u32 {
-    (lapic_hz() / TICKS_PER_SEC).clamp(1, u32::MAX as u64) as u32
+    crate::deadline::counts_per_tick(lapic_hz(), TICKS_PER_SEC)
 }
 
 /// Period of the full-rate scheduler tick, in nanoseconds (4 ms at 250 Hz).
@@ -266,8 +266,7 @@ pub const fn fast_tick_ns() -> u64 {
 /// measured count rate. Clamped to a non-zero `u32`: a count of 0 stops the
 /// timer, and counts above `u32::MAX` are not representable.
 pub fn ns_to_tick_count(ns: u64) -> u32 {
-    let counts = (lapic_hz() as u128).saturating_mul(ns as u128) / 1_000_000_000;
-    counts.clamp(1, u32::MAX as u128) as u32
+    crate::deadline::counts_for(lapic_hz(), ns)
 }
 
 /// Reprogram this CPU's LAPIC timer initial count (the period, in periodic
