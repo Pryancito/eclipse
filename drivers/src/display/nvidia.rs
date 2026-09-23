@@ -9384,6 +9384,7 @@ impl NvidiaGpu {
                     next_payload: 1,
                     submits: 0,
                     fenced: 0,
+                    last_fence: None,
                 };
                 // Landing zone starts BELOW every payload; slot page cleared.
                 unsafe {
@@ -9523,6 +9524,9 @@ impl NvidiaGpu {
                     store_fence();
                     unsafe { core::ptr::write_volatile(f.doorbell_va as *mut u32, f.work_token) };
                     f.submits += 1;
+                    if let Some((_, _, payload)) = fence {
+                        f.last_fence = Some((f.submits, payload));
+                    }
                     if waited {
                         nv::EXEC_RING_WAIT_US.fetch_add(
                             unsafe { crate::bus::drivers_timer_now_as_micros() }
@@ -9577,7 +9581,19 @@ impl NvidiaGpu {
             }
         };
         let queued = match self.nouveau_fast.lock().get(ctx_idx as usize) {
-            Some(FastSlot::Ready(f)) => f.submits > 0,
+            // Idle when the last thing on the ring is a fence that landed
+            // (WFI: the engines were idle when it did): nothing to wait for
+            // and no probe to append. Without this, every NOWAIT prep on an
+            // idle channel appended a probe and lost the race against the
+            // PBDMA -- EBUSY for a buffer nothing was touching, and a ring
+            // entry per poll.
+            Some(FastSlot::Ready(f)) => {
+                f.submits > 0
+                    && !f.last_fence.is_some_and(|(at, payload)| {
+                        at == f.submits
+                            && crate::scheme::syncobj::hw_fence_landed(f.fence_sem_va, payload)
+                    })
+            }
             _ => false,
         };
         if !queued {
@@ -9867,14 +9883,29 @@ impl NvidiaGpu {
                 None => return,
             }
         };
-        if let FastSlot::Ready(f) = old {
-            let abandoned = crate::scheme::syncobj::abandon_fences(f.fence_sem_va);
-            lock::pump();
-            let status = nvidia_rm_sys::rm_init::exec_fast_release(device_instance, ctx_idx);
-            log::info!(
-                "[nouveau-uapi] ctx{}: direct-submit state released (status={:#x}, {} submits, {} fenced, {} fence(s) abandoned)",
-                ctx_idx, status, f.submits, f.fenced, abandoned
-            );
+        match old {
+            FastSlot::Ready(f) => {
+                let abandoned = crate::scheme::syncobj::abandon_fences(f.fence_sem_va);
+                lock::pump();
+                let status = nvidia_rm_sys::rm_init::exec_fast_release(device_instance, ctx_idx);
+                log::info!(
+                    "[nouveau-uapi] ctx{}: direct-submit state released (status={:#x}, {} submits, {} fenced, {} fence(s) abandoned)",
+                    ctx_idx, status, f.submits, f.fenced, abandoned
+                );
+            }
+            FastSlot::Failed => {
+                // A setup that failed may still have mapped the USERD window:
+                // the RM maps it before the stages that can fail, and the
+                // encoder self-check runs after every one of them. `ctx_free`
+                // does not unmap it, and the next `exec_fast_prepare` on this
+                // index (the next process to get the channel) finds a window
+                // over a memdesc that is gone and refuses ("stale USERD map"),
+                // so the direct path would be lost for this index for good.
+                // The release is a no-op when nothing was mapped.
+                lock::pump();
+                let _ = nvidia_rm_sys::rm_init::exec_fast_release(device_instance, ctx_idx);
+            }
+            FastSlot::Unprepared | FastSlot::Preparing => {}
         }
     }
 
@@ -13331,6 +13362,8 @@ mod nouveau_bookkeeping_tests {
     //! test takes `LOCK`: the uAPI switch, the live-bytes counter and the
     //! `gem_mmap` registry are process globals.
 
+    extern crate std;
+
     use super::super::nouveau_uapi as nv;
     use super::*;
     use core::mem::size_of;
@@ -14485,7 +14518,10 @@ mod nouveau_bookkeeping_tests {
 
     // ----- With the fake RM: the arms a GL client reaches once attached -----
 
-    use super::rm_host_shims::{fake_fbmem_offset, reset_fake_rm, FAKE_RM};
+    use super::rm_host_shims::{
+        fake_fbmem_offset, reset_fake_rm, FastChan, FAKE_DOORBELL, FAKE_RM, FAST_ENTRIES,
+        FAST_GPFIFO_OFF, FAST_PB_OFF, FAST_SEM_OFF,
+    };
 
     /// The compositor's pid: it owns ctx 0, so every other pid is a GL
     /// client and gets a context of its own.
@@ -15409,8 +15445,8 @@ mod nouveau_bookkeeping_tests {
         );
         assert_eq!(
             rm_calls_since(before),
-            ["exec_submit", "exec_submit"],
-            "one RM entry per push (the direct-submit setup is refused here)"
+            ["exec_fast_prepare", "exec_submit", "exec_submit"],
+            "the direct-submit setup is tried once and refused here: one RM entry per push"
         );
         assert_eq!(
             FAKE_RM.lock().submits,
@@ -15498,7 +15534,10 @@ mod nouveau_bookkeeping_tests {
             Ok(0),
             "both waits already satisfied"
         );
-        assert_eq!(rm_calls_since(before), ["exec_submit_signaled"]);
+        assert_eq!(
+            rm_calls_since(before),
+            ["exec_fast_prepare", "exec_submit_signaled"]
+        );
         assert_eq!(syncobj::query(out), Some(1));
         // An unknown wait handle: ENOENT, and the ring never heard of it.
         let before = FAKE_RM.lock().calls.len();
@@ -15700,6 +15739,845 @@ mod nouveau_bookkeeping_tests {
         gpu.nouveau_release_process(B);
         assert_eq!(FAKE_RM.lock().bad, 0);
     }
+
+    // ---- The direct-submit path -------------------------------------------
+    //
+    // With the fake's `fast` switch on, `exec_fast_prepare` hands the driver
+    // a channel: a 64 KiB buffer (fence slot page, landing zone, GPFIFO
+    // ring) and a USERD window, host memory the driver reaches through the
+    // identity `phys_to_virt`. From then on an EXEC never enters the RM: it
+    // writes GP entries and semaphore streams, bumps GPPut and pokes the
+    // doorbell in BAR0. `run_gpu` is the PBDMA: it walks GPGet up to GPPut,
+    // decodes each entry, executes the host semaphore methods (a RELEASE
+    // writes its payload, an ACQUIRE stalls the channel until the payload
+    // is there) and hands back what it fetched, in order.
+
+    use crate::nvme::nvme_queue::test_clock;
+    use std::time::Duration;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Fetched {
+        Push { va: u64, len: u32 },
+        Release { sem_va: u64, payload: u32 },
+        Acquire { sem_va: u64, payload: u32 },
+    }
+
+    fn gpu_rm_fast() -> NvidiaGpu {
+        let gpu = gpu_rm();
+        FAKE_RM.lock().fast = true;
+        gpu
+    }
+
+    fn chan(ctx: u32) -> FastChan {
+        *FAKE_RM
+            .lock()
+            .fast_ctxs
+            .iter()
+            .find(|c| c.ctx == ctx)
+            .expect("no direct-submit channel behind this context")
+    }
+
+    fn has_chan(ctx: u32) -> bool {
+        FAKE_RM.lock().fast_ctxs.iter().any(|c| c.ctx == ctx)
+    }
+
+    fn peek(addr: usize) -> u32 {
+        unsafe { core::ptr::read_volatile(addr as *const u32) }
+    }
+
+    fn poke(addr: usize, v: u32) {
+        unsafe { core::ptr::write_volatile(addr as *mut u32, v) }
+    }
+
+    /// `(GPGet, GPPut)` of a channel's USERD.
+    fn userd(c: &FastChan) -> (u32, u32) {
+        (peek(c.userd + 0x88), peek(c.userd + 0x8c))
+    }
+
+    fn doorbell(gpu: &NvidiaGpu) -> u32 {
+        peek(gpu._bar0 + FAKE_DOORBELL as usize)
+    }
+
+    fn landing_zone(c: &FastChan) -> u32 {
+        peek(c.buf + FAST_SEM_OFF as usize)
+    }
+
+    /// The channel's fence semaphore, as the GPU addresses it.
+    fn sem_va(c: &FastChan) -> u64 {
+        c.gpu_va + u64::from(FAST_SEM_OFF)
+    }
+
+    fn cpu_prep(gpu: &NvidiaGpu, handle: u32, pid: u64) -> Result<usize, i32> {
+        let mut r = nv::DrmNouveauGemCpuPrep { handle, flags: 0 };
+        call(
+            gpu,
+            wr::<nv::DrmNouveauGemCpuPrep>(nv::NR_GEM_CPU_PREP),
+            &mut r,
+            pid,
+        )
+    }
+
+    /// The PBDMA of context `ctx`: fetch every entry from GPGet up to GPPut.
+    fn run_gpu(ctx: u32) -> Vec<Fetched> {
+        let c = chan(ctx);
+        let mut out = Vec::new();
+        loop {
+            let (get, put) = userd(&c);
+            if get == put {
+                break;
+            }
+            let gp = c.buf + FAST_GPFIFO_OFF as usize + get as usize * 8;
+            let (e0, e1) = (peek(gp), peek(gp + 4));
+            let va = (u64::from(e1 & 0xff) << 32) | u64::from(e0);
+            let len = ((e1 >> 10) & 0x1f_ffff) * 4;
+            let streams = c.gpu_va + u64::from(FAST_PB_OFF)..c.gpu_va + u64::from(FAST_SEM_OFF);
+            let item = if streams.contains(&va) {
+                assert_eq!(len, 24, "a host semaphore stream is six dwords");
+                let words = c.buf + (va - c.gpu_va) as usize;
+                let w: [u32; 6] = core::array::from_fn(|i| peek(words + i * 4));
+                assert_eq!(
+                    w[0],
+                    nv::push_hdr(0, nv::NVC46F_SEM_ADDR_LO, 5),
+                    "SEM_ADDR_LO..SEM_EXECUTE, five methods, incrementing"
+                );
+                let sem_va = (u64::from(w[2] & 0xff) << 32) | u64::from(w[1]);
+                assert_eq!(w[4], 0, "SEM_PAYLOAD_HI");
+                assert!(
+                    (c.gpu_va..c.gpu_va + 0x10000).contains(&sem_va),
+                    "a semaphore outside the channel's own buffer: {:#x}",
+                    sem_va
+                );
+                let sem = c.buf + (sem_va - c.gpu_va) as usize;
+                let payload = w[3];
+                match w[5] {
+                    nv::NVC46F_SEM_EXECUTE_RELEASE => {
+                        poke(sem, payload);
+                        Fetched::Release { sem_va, payload }
+                    }
+                    nv::NVC46F_SEM_EXECUTE_ACQUIRE => {
+                        if (peek(sem).wrapping_sub(payload) as i32) < 0 {
+                            // The channel stalls here: GPGet stays.
+                            break;
+                        }
+                        Fetched::Acquire { sem_va, payload }
+                    }
+                    other => panic!(
+                        "SEM_EXECUTE {:#x} is neither a release nor an acquire",
+                        other
+                    ),
+                }
+            } else {
+                Fetched::Push { va, len }
+            };
+            out.push(item);
+            poke(c.userd + 0x88, (get + 1) % FAST_ENTRIES);
+        }
+        out
+    }
+
+    #[test]
+    fn a_direct_submit_writes_the_ring_and_rings_the_doorbell_without_the_rm() {
+        let _g = LOCK.lock();
+        let _live = LiveBytes::hold();
+        let gpu = gpu_rm_fast();
+        let ch = client_with_pushbuf(&gpu, A);
+        let fast = nv::EXEC_FAST_SUBMITS.load(Ordering::Relaxed);
+        let legacy = nv::EXEC_LEGACY_SUBMITS.load(Ordering::Relaxed);
+        let before = FAKE_RM.lock().calls.len();
+        assert_eq!(
+            exec(
+                &gpu,
+                A,
+                ch,
+                &[push(PUSH_VA, 16), push(PUSH_VA + 0x100, 32)],
+                &[],
+                &[]
+            ),
+            Ok(0)
+        );
+        assert_eq!(
+            rm_calls_since(before),
+            ["exec_fast_prepare"],
+            "the channel is prepared once; the submit itself never enters the RM"
+        );
+        assert!(FAKE_RM.lock().submits.is_empty());
+        let c = chan(1);
+        assert_eq!(
+            userd(&c),
+            (0, 2),
+            "GPGet is the GPU's; GPPut past the two entries"
+        );
+        assert_eq!(
+            doorbell(&gpu),
+            c.token,
+            "the channel's work token in the usermode doorbell"
+        );
+        // The raw entries, as the PBDMA reads them: GET in bits 31:2 of the
+        // low word, GET_HI and the length in dwords in the high one.
+        let gp = c.buf + FAST_GPFIFO_OFF as usize;
+        assert_eq!(peek(gp), PUSH_VA as u32);
+        assert_eq!(peek(gp + 4), (((PUSH_VA >> 32) as u32) & 0xff) | (4 << 10));
+        assert_eq!(peek(gp + 12), (((PUSH_VA >> 32) as u32) & 0xff) | (8 << 10));
+        assert_eq!(
+            run_gpu(1),
+            [
+                Fetched::Push {
+                    va: PUSH_VA,
+                    len: 16
+                },
+                Fetched::Push {
+                    va: PUSH_VA + 0x100,
+                    len: 32
+                }
+            ]
+        );
+        assert_eq!(userd(&c), (2, 2));
+        // The next EXEC: no prepare, the next slot.
+        let before = FAKE_RM.lock().calls.len();
+        assert_eq!(
+            exec(&gpu, A, ch, &[push(PUSH_VA + 0x200, 8)], &[], &[]),
+            Ok(0)
+        );
+        assert_eq!(rm_calls_since(before), [] as [&str; 0]);
+        assert_eq!(userd(&c), (2, 3));
+        assert_eq!(
+            run_gpu(1),
+            [Fetched::Push {
+                va: PUSH_VA + 0x200,
+                len: 8
+            }]
+        );
+        assert_eq!(nv::EXEC_FAST_SUBMITS.load(Ordering::Relaxed), fast + 2);
+        assert_eq!(nv::EXEC_LEGACY_SUBMITS.load(Ordering::Relaxed), legacy);
+        // A second client: a channel of its own, and A's ring untouched.
+        let ch_b = client_with_pushbuf(&gpu, B);
+        let before = FAKE_RM.lock().calls.len();
+        assert_eq!(exec(&gpu, B, ch_b, &[push(PUSH_VA, 16)], &[], &[]), Ok(0));
+        assert_eq!(rm_calls_since(before), ["exec_fast_prepare"]);
+        let b = chan(2);
+        assert_ne!(b.buf, c.buf);
+        assert_eq!(userd(&b), (0, 1));
+        assert_eq!(userd(&c), (3, 3));
+        assert_eq!(doorbell(&gpu), b.token);
+        assert_eq!(
+            run_gpu(2),
+            [Fetched::Push {
+                va: PUSH_VA,
+                len: 16
+            }]
+        );
+        gpu.nouveau_release_process(A);
+        gpu.nouveau_release_process(B);
+        assert_eq!(FAKE_RM.lock().bad, 0);
+    }
+
+    #[test]
+    fn a_syncobj_signals_only_when_the_gpu_reaches_the_fence_behind_the_pushes() {
+        let _g = LOCK.lock();
+        let _live = LiveBytes::hold();
+        let gpu = gpu_rm_fast();
+        let ch = client_with_pushbuf(&gpu, A);
+        let bin = syncobj::create(false);
+        let tl = syncobj::create(false);
+        let fenced = nv::EXEC_FAST_FENCED.load(Ordering::Relaxed);
+        assert_eq!(
+            exec(
+                &gpu,
+                A,
+                ch,
+                &[push(PUSH_VA, 16), push(PUSH_VA + 0x100, 32)],
+                &[],
+                &[sync(bin), sync_tl(tl, 5)]
+            ),
+            Ok(0),
+            "returns at once: the fence is the GPU's to write"
+        );
+        let c = chan(1);
+        assert_eq!(
+            userd(&c),
+            (0, 3),
+            "two pushes and the fence entry behind them"
+        );
+        assert_eq!(landing_zone(&c), 0);
+        // Submitted, not signaled: NVK asks for both.
+        assert_eq!(syncobj::query_submitted(bin), Some(1));
+        assert_eq!(syncobj::query_submitted(tl), Some(5));
+        assert_eq!(syncobj::query(bin), Some(0));
+        assert_eq!(syncobj::query(tl), Some(0));
+        test_clock::set_auto_advance(100);
+        let deadline = test_clock::now() + 5_000;
+        assert!(
+            matches!(
+                syncobj::wait(&[bin, tl], Some(&[1, 5]), true, deadline),
+                syncobj::WaitOutcome::Timeout
+            ),
+            "5 ms of waiting: the GPU has not run"
+        );
+        test_clock::set_auto_advance(0);
+        assert_eq!(
+            run_gpu(1),
+            [
+                Fetched::Push {
+                    va: PUSH_VA,
+                    len: 16
+                },
+                Fetched::Push {
+                    va: PUSH_VA + 0x100,
+                    len: 32
+                },
+                Fetched::Release {
+                    sem_va: sem_va(&c),
+                    payload: 1
+                }
+            ]
+        );
+        assert_eq!(landing_zone(&c), 1);
+        assert_eq!(syncobj::query(bin), Some(1));
+        assert_eq!(syncobj::query(tl), Some(5));
+        assert!(!syncobj::has_pending());
+        // The payloads are the channel's own sequence: the next fence is 2,
+        // written into the same landing zone from the next slot's stream.
+        let out = syncobj::create(false);
+        assert_eq!(
+            exec(&gpu, A, ch, &[push(PUSH_VA, 16)], &[], &[sync(out)]),
+            Ok(0)
+        );
+        assert_eq!(
+            run_gpu(1),
+            [
+                Fetched::Push {
+                    va: PUSH_VA,
+                    len: 16
+                },
+                Fetched::Release {
+                    sem_va: sem_va(&c),
+                    payload: 2
+                }
+            ]
+        );
+        assert_eq!(syncobj::query(out), Some(1));
+        // A signal on a handle nobody has: the work is on the ring by the
+        // time the handle is looked up, and the ioctl says so.
+        assert_eq!(
+            exec(&gpu, A, ch, &[push(PUSH_VA, 16)], &[], &[sync(0xdead_0000)]),
+            Err(nv::ENOENT)
+        );
+        assert_eq!(userd(&c), (5, 7));
+        assert_eq!(
+            run_gpu(1),
+            [
+                Fetched::Push {
+                    va: PUSH_VA,
+                    len: 16
+                },
+                Fetched::Release {
+                    sem_va: sem_va(&c),
+                    payload: 3
+                }
+            ]
+        );
+        assert_eq!(nv::EXEC_FAST_FENCED.load(Ordering::Relaxed), fenced + 3);
+        for h in [bin, tl, out] {
+            assert!(syncobj::destroy(h));
+        }
+        gpu.nouveau_release_process(A);
+        assert_eq!(FAKE_RM.lock().bad, 0);
+    }
+
+    #[test]
+    fn a_wait_on_the_same_channel_is_a_gpu_acquire_and_one_on_another_channel_a_cpu_wait() {
+        let _g = LOCK.lock();
+        let _live = LiveBytes::hold();
+        let gpu = gpu_rm_fast();
+        let ch_a = client_with_pushbuf(&gpu, A);
+        let ch_b = client_with_pushbuf(&gpu, B);
+        let out = syncobj::create(false);
+        let out2 = syncobj::create(false);
+        assert_eq!(
+            exec(&gpu, A, ch_a, &[push(PUSH_VA, 16)], &[], &[sync(out)]),
+            Ok(0)
+        );
+        let before = FAKE_RM.lock().calls.len();
+        // 1 us per clock read: a CPU wait here (the wrong path, nothing
+        // runs the GPU yet) ends in EIO after 10 s virtual, a failure
+        // rather than a hang.
+        test_clock::set_auto_advance(1);
+        let t0 = test_clock::now();
+        assert_eq!(
+            exec(
+                &gpu,
+                A,
+                ch_a,
+                &[push(PUSH_VA + 0x100, 16)],
+                &[sync(out)],
+                &[sync(out2)]
+            ),
+            Ok(0),
+            "the wait is a fence pending on this very channel: no CPU wait"
+        );
+        test_clock::set_auto_advance(0);
+        assert!(test_clock::now() - t0 < 1_000, "submitted without waiting");
+        assert_eq!(rm_calls_since(before), [] as [&str; 0]);
+        let a = chan(1);
+        assert_eq!(userd(&a), (0, 5), "push, fence, acquire, push, fence");
+        assert_eq!(
+            run_gpu(1),
+            [
+                Fetched::Push {
+                    va: PUSH_VA,
+                    len: 16
+                },
+                Fetched::Release {
+                    sem_va: sem_va(&a),
+                    payload: 1
+                },
+                Fetched::Acquire {
+                    sem_va: sem_va(&a),
+                    payload: 1
+                },
+                Fetched::Push {
+                    va: PUSH_VA + 0x100,
+                    len: 16
+                },
+                Fetched::Release {
+                    sem_va: sem_va(&a),
+                    payload: 2
+                }
+            ],
+            "the acquire sits in front of the push it guards"
+        );
+        assert_eq!(syncobj::query(out), Some(1));
+        assert_eq!(syncobj::query(out2), Some(1));
+        // B waits on A's fence. This RM cannot map A's semaphore into B's
+        // VAS, so B's EXEC blocks on the CPU until A's GPU gets there, and
+        // B's ring carries no acquire.
+        let out3 = syncobj::create(false);
+        let out4 = syncobj::create(false);
+        assert_eq!(
+            exec(&gpu, A, ch_a, &[push(PUSH_VA, 16)], &[], &[sync(out3)]),
+            Ok(0)
+        );
+        let now = test_clock::now();
+        let gpu_ref = &gpu;
+        std::thread::scope(|s| {
+            let t = s.spawn(move || {
+                // 1 us per clock read: B's wait ends in EIO after 10 s
+                // virtual should A's fence never land (a failure, not a
+                // hang).
+                test_clock::set(now);
+                test_clock::set_auto_advance(1);
+                exec(
+                    gpu_ref,
+                    B,
+                    ch_b,
+                    &[push(PUSH_VA, 16)],
+                    &[sync(out3)],
+                    &[sync(out4)],
+                )
+            });
+            std::thread::sleep(Duration::from_millis(50));
+            assert!(!t.is_finished(), "B is waiting for A's fence");
+            assert!(
+                !has_chan(2),
+                "and has queued nothing yet: its channel is not even prepared"
+            );
+            assert_eq!(
+                run_gpu(1),
+                [
+                    Fetched::Push {
+                        va: PUSH_VA,
+                        len: 16
+                    },
+                    Fetched::Release {
+                        sem_va: sem_va(&a),
+                        payload: 3
+                    }
+                ]
+            );
+            assert_eq!(t.join().unwrap(), Ok(0));
+        });
+        let b = chan(2);
+        assert_eq!(
+            run_gpu(2),
+            [
+                Fetched::Push {
+                    va: PUSH_VA,
+                    len: 16
+                },
+                Fetched::Release {
+                    sem_va: sem_va(&b),
+                    payload: 1
+                }
+            ],
+            "no acquire on B's ring"
+        );
+        assert_eq!(syncobj::query(out4), Some(1));
+        for h in [out, out2, out3, out4] {
+            assert!(syncobj::destroy(h));
+        }
+        gpu.nouveau_release_process(A);
+        gpu.nouveau_release_process(B);
+        assert_eq!(FAKE_RM.lock().bad, 0);
+    }
+
+    #[test]
+    fn a_full_ring_waits_for_the_gpu_and_one_that_never_drains_is_eio_and_wedges_the_channel() {
+        let _g = LOCK.lock();
+        let _live = LiveBytes::hold();
+        let gpu = gpu_rm_fast();
+        let ch = client_with_pushbuf(&gpu, A);
+        // One slot is always kept free, so 127 entries fill the 128-entry ring.
+        for i in 0..127 {
+            assert_eq!(
+                exec(&gpu, A, ch, &[push(PUSH_VA + i * 16, 16)], &[], &[]),
+                Ok(0),
+                "entry {}",
+                i
+            );
+        }
+        let c = chan(1);
+        assert_eq!(userd(&c), (0, 127));
+        // The GPU drains the ring while the 128th submit waits for room:
+        // the entry goes into the last slot and GPPut wraps to 0.
+        let now = test_clock::now();
+        // 1 us per clock read: the submit gives up (EIO) after 10 s virtual
+        // should the GPU never make room, a failure rather than a hang.
+        test_clock::set_auto_advance(1);
+        let mut drained = std::thread::scope(|s| {
+            let t = s.spawn(move || {
+                test_clock::set(now);
+                std::thread::sleep(Duration::from_millis(30));
+                run_gpu(1)
+            });
+            assert_eq!(
+                exec(&gpu, A, ch, &[push(PUSH_VA + 0x800, 16)], &[], &[]),
+                Ok(0),
+                "room came while the submit waited"
+            );
+            t.join().unwrap()
+        });
+        test_clock::set_auto_advance(0);
+        assert_eq!(userd(&c).1, 0, "wrapped");
+        // The GPU may or may not have reached the 128th entry before it
+        // stopped: either way it is the last thing fetched.
+        drained.extend(run_gpu(1));
+        assert_eq!(drained.len(), 128);
+        assert_eq!(
+            drained[127],
+            Fetched::Push {
+                va: PUSH_VA + 0x800,
+                len: 16
+            }
+        );
+        assert_eq!(userd(&c), (0, 0));
+        assert!(!nv::ctx_is_wedged(1));
+        // Fill it again, and this time nothing drains it: after 10 s
+        // (1 ms per clock read) the submit is EIO and the channel is
+        // latched WEDGED, so the client fast-fails instead of hanging the
+        // compositor's ring behind it.
+        for i in 0..127 {
+            assert_eq!(
+                exec(&gpu, A, ch, &[push(PUSH_VA + i * 16, 16)], &[], &[]),
+                Ok(0)
+            );
+        }
+        assert_eq!(userd(&c), (0, 127));
+        let out = syncobj::create(false);
+        test_clock::set_auto_advance(1000);
+        assert_eq!(
+            exec(&gpu, A, ch, &[push(PUSH_VA, 16)], &[], &[sync(out)]),
+            Err(nv::EIO)
+        );
+        test_clock::set_auto_advance(0);
+        assert!(nv::ctx_is_wedged(1));
+        assert_eq!(userd(&c), (0, 127), "nothing was written over the ring");
+        assert_eq!(syncobj::query(out), Some(0), "and nothing was attached");
+        assert!(!syncobj::has_pending());
+        // The GPU catching up later does not unlatch the context.
+        assert_eq!(run_gpu(1).len(), 127);
+        assert_eq!(userd(&c), (127, 127));
+        let before = FAKE_RM.lock().calls.len();
+        assert_eq!(
+            exec(&gpu, A, ch, &[push(PUSH_VA, 16)], &[], &[]),
+            Err(nv::EIO),
+            "wedged until the process goes away"
+        );
+        assert_eq!(rm_calls_since(before), [] as [&str; 0]);
+        assert_eq!(userd(&c), (127, 127));
+        // B is unaffected: its own channel.
+        let ch_b = client_with_pushbuf(&gpu, B);
+        assert_eq!(exec(&gpu, B, ch_b, &[push(PUSH_VA, 16)], &[], &[]), Ok(0));
+        // A exits and comes back: a fresh channel, ring at 0.
+        gpu.nouveau_release_process(A);
+        assert!(!nv::ctx_is_wedged(1));
+        assert_eq!(FAKE_RM.lock().fast_releases, [1]);
+        let ch = client_with_pushbuf(&gpu, A);
+        assert_eq!(exec(&gpu, A, ch, &[push(PUSH_VA, 16)], &[], &[]), Ok(0));
+        let c2 = chan(1);
+        assert_ne!(c2.userd, c.userd);
+        assert_eq!(userd(&c2), (0, 1));
+        assert!(syncobj::destroy(out));
+        gpu.nouveau_release_process(A);
+        gpu.nouveau_release_process(B);
+        assert_eq!(FAKE_RM.lock().bad, 0);
+    }
+
+    #[test]
+    fn exit_releases_the_window_before_freeing_the_context_and_lets_go_of_the_fences_in_flight() {
+        let _g = LOCK.lock();
+        let _live = LiveBytes::hold();
+        let gpu = gpu_rm_fast();
+        let ch = client_with_pushbuf(&gpu, A);
+        let out = syncobj::create(false);
+        let tl = syncobj::create(false);
+        assert_eq!(
+            exec(
+                &gpu,
+                A,
+                ch,
+                &[push(PUSH_VA, 16)],
+                &[],
+                &[sync(out), sync_tl(tl, 4)]
+            ),
+            Ok(0)
+        );
+        assert_eq!(syncobj::query(out), Some(0));
+        assert!(syncobj::has_pending());
+        let before = FAKE_RM.lock().calls.len();
+        gpu.nouveau_release_process(A);
+        let calls = rm_calls_since(before);
+        let released = calls
+            .iter()
+            .position(|c| *c == "exec_fast_release")
+            .expect("the USERD window is unmapped at exit");
+        let freed = calls
+            .iter()
+            .position(|c| *c == "ctx_free")
+            .expect("the channel is freed at exit");
+        assert!(
+            released < freed,
+            "the window goes before the channel it maps: {:?}",
+            calls
+        );
+        assert_eq!(FAKE_RM.lock().fast_releases, [1]);
+        assert!(FAKE_RM.lock().fast_ctxs.is_empty());
+        // A fence that can never land now is signaled, as a killed channel's
+        // would be: a compositor waiting on the dead client's buffer moves on.
+        assert!(!syncobj::has_pending());
+        assert_eq!(syncobj::query(out), Some(1));
+        assert_eq!(syncobj::query(tl), Some(4));
+        assert!(!nv::ctx_is_wedged(1), "abandoned, not timed out");
+        // Back: a fresh window and ring.
+        let ch = client_with_pushbuf(&gpu, A);
+        let before = FAKE_RM.lock().calls.len();
+        assert_eq!(exec(&gpu, A, ch, &[push(PUSH_VA, 16)], &[], &[]), Ok(0));
+        assert_eq!(rm_calls_since(before), ["exec_fast_prepare"]);
+        assert_eq!(userd(&chan(1)), (0, 1));
+        for h in [out, tl] {
+            assert!(syncobj::destroy(h));
+        }
+        gpu.nouveau_release_process(A);
+        assert_eq!(FAKE_RM.lock().bad, 0);
+    }
+
+    #[test]
+    fn a_setup_that_fails_pins_the_rm_path_and_still_releases_its_window_at_exit() {
+        let _g = LOCK.lock();
+        let _live = LiveBytes::hold();
+        let gpu = gpu_rm_fast();
+        // The SDK's DRF value for SEM_EXECUTE disagrees with the kernel's
+        // encoder: the RM path, for this context, for good.
+        FAKE_RM.lock().fast_bad_encoding = true;
+        let ch = client_with_pushbuf(&gpu, A);
+        let before = FAKE_RM.lock().calls.len();
+        assert_eq!(exec(&gpu, A, ch, &[push(PUSH_VA, 16)], &[], &[]), Ok(0));
+        assert_eq!(
+            rm_calls_since(before),
+            ["exec_fast_prepare", "exec_submit"],
+            "the self-check failed: this push goes through the RM"
+        );
+        let before = FAKE_RM.lock().calls.len();
+        FAKE_RM.lock().fast_bad_encoding = false;
+        assert_eq!(exec(&gpu, A, ch, &[push(PUSH_VA, 16)], &[], &[]), Ok(0));
+        assert_eq!(
+            rm_calls_since(before),
+            ["exec_submit"],
+            "the verdict is pinned: no second prepare, even one that would pass"
+        );
+        assert!(
+            has_chan(1),
+            "the RM mapped the USERD before the check that failed"
+        );
+        // A exits. The window it never used still has to go: `ctx_free`
+        // does not unmap it, and the RM refuses to prepare the next channel
+        // behind an index whose window maps a freed one -- which would take
+        // the direct path away from every later owner of this index.
+        let before = FAKE_RM.lock().calls.len();
+        gpu.nouveau_release_process(A);
+        assert!(
+            rm_calls_since(before).contains(&"exec_fast_release"),
+            "{:?}",
+            rm_calls_since(before)
+        );
+        assert!(!has_chan(1));
+        let ch = client_with_pushbuf(&gpu, B);
+        let before = FAKE_RM.lock().calls.len();
+        assert_eq!(exec(&gpu, B, ch, &[push(PUSH_VA, 16)], &[], &[]), Ok(0));
+        assert_eq!(
+            rm_calls_since(before),
+            ["exec_fast_prepare"],
+            "the next owner of the index gets the direct path"
+        );
+        assert_eq!(userd(&chan(1)), (0, 1));
+        gpu.nouveau_release_process(B);
+        // A prepare the RM refuses outright pins the RM path the same way.
+        FAKE_RM.lock().fast = false;
+        let ch = client_with_pushbuf(&gpu, A);
+        let before = FAKE_RM.lock().calls.len();
+        assert_eq!(exec(&gpu, A, ch, &[push(PUSH_VA, 16)], &[], &[]), Ok(0));
+        assert_eq!(rm_calls_since(before), ["exec_fast_prepare", "exec_submit"]);
+        FAKE_RM.lock().fast = true;
+        let before = FAKE_RM.lock().calls.len();
+        assert_eq!(exec(&gpu, A, ch, &[push(PUSH_VA, 16)], &[], &[]), Ok(0));
+        assert_eq!(rm_calls_since(before), ["exec_submit"]);
+        gpu.nouveau_release_process(A);
+        // `nvidia.exec_rm`: the direct path switched off never prepares at
+        // all, and switching it back on prepares on the next EXEC.
+        nv::set_exec_fast_enabled(false);
+        let ch = client_with_pushbuf(&gpu, STRANGER);
+        let before = FAKE_RM.lock().calls.len();
+        assert_eq!(
+            exec(&gpu, STRANGER, ch, &[push(PUSH_VA, 16)], &[], &[]),
+            Ok(0)
+        );
+        assert_eq!(rm_calls_since(before), ["exec_submit"]);
+        nv::set_exec_fast_enabled(true);
+        let before = FAKE_RM.lock().calls.len();
+        assert_eq!(
+            exec(&gpu, STRANGER, ch, &[push(PUSH_VA, 16)], &[], &[]),
+            Ok(0)
+        );
+        assert_eq!(rm_calls_since(before), ["exec_fast_prepare"]);
+        gpu.nouveau_release_process(STRANGER);
+        assert_eq!(FAKE_RM.lock().bad, 0);
+    }
+
+    #[test]
+    fn cpu_prep_waits_for_everything_queued_on_the_channel_behind_a_probe_fence_of_its_own() {
+        let _g = LOCK.lock();
+        let _live = LiveBytes::hold();
+        let gpu = gpu_rm_fast();
+        let ch = client_with_pushbuf(&gpu, A);
+        let h = gem_new_rm(&gpu, 4096, nv::NOUVEAU_GEM_DOMAIN_GART, A)
+            .unwrap()
+            .handle;
+        // Nothing queued: nothing to wait for, and no channel is prepared
+        // just to find that out.
+        let before = FAKE_RM.lock().calls.len();
+        assert_eq!(cpu_prep_nowait(&gpu, h, A), Ok(0));
+        assert_eq!(cpu_prep(&gpu, h, A), Ok(0));
+        assert_eq!(rm_calls_since(before), [] as [&str; 0]);
+        assert!(!has_chan(1));
+        assert_eq!(exec(&gpu, A, ch, &[push(PUSH_VA, 16)], &[], &[]), Ok(0));
+        let c = chan(1);
+        assert_eq!(userd(&c), (0, 1));
+        // NOWAIT with the push still queued: EBUSY at once, and a
+        // fence-only entry behind the push is what will prove it finished.
+        // The clock moves 1 us per read from here on, so a wait that
+        // blocks shows up as virtual time, and a wait for a GPU that never
+        // comes ends (EBUSY after 10 s virtual) instead of hanging.
+        test_clock::set_auto_advance(1);
+        let t0 = test_clock::now();
+        assert_eq!(cpu_prep_nowait(&gpu, h, A), Err(nv::EBUSY));
+        assert!(test_clock::now() - t0 < 1_000, "answered without waiting");
+        assert_eq!(userd(&c), (0, 2), "a probe fence behind the push");
+        assert_eq!(cpu_prep_nowait(&gpu, h, A), Err(nv::EBUSY));
+        assert_eq!(userd(&c), (0, 3));
+        // A blocking prep returns once the GPU has run past its probe.
+        let now = test_clock::now();
+        let sem = sem_va(&c);
+        std::thread::scope(|s| {
+            let t = s.spawn(move || {
+                test_clock::set(now);
+                let mut fetched = Vec::new();
+                for _ in 0..5_000 {
+                    fetched.extend(run_gpu(1));
+                    if fetched.contains(&Fetched::Release {
+                        sem_va: sem,
+                        payload: 3,
+                    }) {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                fetched
+            });
+            assert_eq!(cpu_prep(&gpu, h, A), Ok(0));
+            assert_eq!(
+                t.join().unwrap(),
+                [
+                    Fetched::Push {
+                        va: PUSH_VA,
+                        len: 16
+                    },
+                    Fetched::Release {
+                        sem_va: sem,
+                        payload: 1
+                    },
+                    Fetched::Release {
+                        sem_va: sem,
+                        payload: 2
+                    },
+                    Fetched::Release {
+                        sem_va: sem,
+                        payload: 3
+                    }
+                ]
+            );
+        });
+        assert_eq!(userd(&c), (4, 4));
+        assert_eq!(landing_zone(&c), 3);
+        // Idle: the last thing on the ring is a fence that landed. Neither
+        // prep appends a probe, and NOWAIT is not busy.
+        assert_eq!(cpu_prep_nowait(&gpu, h, A), Ok(0));
+        assert_eq!(cpu_prep(&gpu, h, A), Ok(0));
+        assert_eq!(userd(&c), (4, 4), "no probe needed: the last one landed");
+        // A push behind that fence makes the channel busy again. Nothing
+        // runs the GPU: after 10 s (1 ms per clock read) the wait is EBUSY,
+        // as Linux answers a reservation wait that timed out.
+        assert_eq!(exec(&gpu, A, ch, &[push(PUSH_VA, 16)], &[], &[]), Ok(0));
+        assert_eq!(cpu_prep_nowait(&gpu, h, A), Err(nv::EBUSY));
+        assert_eq!(userd(&c), (4, 6), "the push and its probe");
+        // A GPU that arrives two real seconds late, an eternity next to
+        // the 10 s virtual: only there so a wait that ignored its bound
+        // would fail here instead of hanging the test.
+        test_clock::set_auto_advance(1000);
+        let now = test_clock::now();
+        let (late, _) = std::thread::scope(|s| {
+            let t = s.spawn(move || {
+                test_clock::set(now);
+                std::thread::sleep(Duration::from_secs(2));
+                run_gpu(1)
+            });
+            (cpu_prep(&gpu, h, A), t.join().unwrap())
+        });
+        assert_eq!(late, Err(nv::EBUSY));
+        test_clock::set_auto_advance(0);
+        assert!(!nv::ctx_is_wedged(1), "a slow GPU is not a hung one");
+        // A process without a channel of its own has queued nothing.
+        let hs = gem_new_rm(&gpu, 4096, nv::NOUVEAU_GEM_DOMAIN_GART, STRANGER)
+            .unwrap()
+            .handle;
+        assert_eq!(cpu_prep(&gpu, hs, STRANGER), Ok(0));
+        assert_eq!(
+            cpu_prep(&gpu, h, STRANGER),
+            Err(nv::ENOENT),
+            "not its buffer"
+        );
+        gpu.nouveau_release_process(A);
+        gpu.nouveau_release_process(STRANGER);
+        assert_eq!(FAKE_RM.lock().bad, 0);
+    }
 }
 
 /// The RM entry points the host test binary has no C code for: every
@@ -15791,13 +16669,129 @@ mod rm_host_shims {
     extern "C" fn eclipse_rm_edid(_a0: u32, _a1: *mut u8) -> u32 {
         NV_ERR_NOT_SUPPORTED
     }
-    #[no_mangle]
-    extern "C" fn eclipse_rm_exec_fast_prepare(_a0: u32, _a1: u32, _a2: *mut u8) -> u32 {
-        NV_ERR_NOT_SUPPORTED
+    /// A direct-submit channel the fake handed out: the pages the driver
+    /// writes GP entries, semaphore streams and GPPut into and reads GPGet
+    /// from. Real memory, since `phys_to_virt` is the identity here.
+    #[derive(Clone, Copy, Debug)]
+    pub(super) struct FastChan {
+        pub ctx: u32,
+        /// 64 KiB: the fence slot page at `FAST_PB_OFF`, the landing zone
+        /// at `FAST_SEM_OFF`, the GPFIFO ring at `FAST_GPFIFO_OFF`.
+        pub buf: usize,
+        /// 256 B USERD window: GPGet at 0x88, GPPut at 0x8c.
+        pub userd: usize,
+        /// Where `buf` is bound in the context's VAS.
+        pub gpu_va: u64,
+        pub token: u32,
+        /// Which build of the context this window belongs to: the RM
+        /// refuses a window left over from a channel that was freed.
+        build: u32,
     }
+
+    /// BAR0 offset of the usermode doorbell the fake reports.
+    pub(super) const FAKE_DOORBELL: u32 = 0x0081_0000;
+    pub(super) const FAST_PB_OFF: u32 = 0xA000;
+    pub(super) const FAST_SEM_OFF: u32 = 0xB000;
+    pub(super) const FAST_GPFIFO_OFF: u32 = 0xC000;
+    pub(super) const FAST_ENTRIES: u32 = 128;
+    pub(super) const FAST_SLOT_BYTES: u32 = 32;
+    /// `NV_ERR_INVALID_STATE`: what the C side answers for a channel that
+    /// is not ready, and for a USERD window it mapped for a channel that
+    /// has since been freed.
+    const NV_ERR_INVALID_STATE: u32 = 0x40;
+
+    /// The constant half of a direct submit, once per context, the way
+    /// `eclipse_rm_exec_fast_prepare` computes it: `NV_OK` with the
+    /// verdict in `status`, as the C side does past its argument checks.
     #[no_mangle]
-    extern "C" fn eclipse_rm_exec_fast_release(_a0: u32, _a1: u32) -> u32 {
-        NV_ERR_NOT_SUPPORTED
+    extern "C" fn eclipse_rm_exec_fast_prepare(
+        _inst: u32,
+        ctx_idx: u32,
+        out: *mut ExecFast,
+    ) -> u32 {
+        use super::super::nouveau_uapi::{gp_entry0, gp_entry1, sem_release_stream};
+        use nvidia_rm_sys::rm_init::{EXEC_FAST_CHK_LEN, EXEC_FAST_CHK_VA};
+        let mut f = FAKE_RM.lock();
+        f.calls.push("exec_fast_prepare");
+        if !f.fast {
+            return NV_ERR_NOT_SUPPORTED;
+        }
+        let build = f.ctx_build.iter().find(|b| b.0 == ctx_idx).map(|b| b.1);
+        let chan = match (f.ctxs.contains(&ctx_idx), build) {
+            (true, Some(build)) => match f.fast_ctxs.iter().find(|c| c.ctx == ctx_idx) {
+                Some(c) if c.build == build => Some(*c),
+                // The window still maps the USERD of a channel that was
+                // freed: the RM refuses rather than poke freed BAR1.
+                Some(_) => None,
+                None => {
+                    let buf = alloc::boxed::Box::leak(alloc::vec![0u64; 8192].into_boxed_slice())
+                        .as_ptr() as usize;
+                    let userd = alloc::boxed::Box::leak(alloc::vec![0u64; 32].into_boxed_slice())
+                        .as_ptr() as usize;
+                    let c = FastChan {
+                        ctx: ctx_idx,
+                        buf,
+                        userd,
+                        gpu_va: 0x7000_0000 + (u64::from(ctx_idx) << 20),
+                        token: 0xC0DE_0000 | ctx_idx,
+                        build,
+                    };
+                    f.fast_ctxs.push(c);
+                    Some(c)
+                }
+            },
+            _ => None,
+        };
+        let result = if let Some(c) = chan {
+            let stream = sem_release_stream(EXEC_FAST_CHK_VA, 0);
+            let sem_execute = if f.fast_bad_encoding {
+                stream[5] ^ (1 << 20)
+            } else {
+                stream[5]
+            };
+            ExecFast {
+                status: NV_OK,
+                work_token: c.token,
+                runlist_id: 7,
+                userd_size: 0x100,
+                userd_cpu: c.userd as u64,
+                fence_pb_phys: (c.buf + FAST_PB_OFF as usize) as u64,
+                fence_sem_phys: (c.buf + FAST_SEM_OFF as usize) as u64,
+                gpfifo_phys: (c.buf + FAST_GPFIFO_OFF as usize) as u64,
+                buf_gpu_va: c.gpu_va,
+                gpfifo_entries: FAST_ENTRIES,
+                doorbell_reg: FAKE_DOORBELL,
+                fence_pb_off: FAST_PB_OFF,
+                fence_sem_off: FAST_SEM_OFF,
+                gpfifo_off: FAST_GPFIFO_OFF,
+                slot_bytes: FAST_SLOT_BYTES,
+                chk_gp_entry0: gp_entry0(EXEC_FAST_CHK_VA),
+                chk_gp_entry1: gp_entry1(EXEC_FAST_CHK_VA, EXEC_FAST_CHK_LEN),
+                chk_sem_hdr: stream[0],
+                chk_sem_addr_hi: stream[2],
+                chk_sem_execute: sem_execute,
+                userd_gpget_off: 0x88,
+                userd_gpput_off: 0x8c,
+            }
+        } else {
+            ExecFast {
+                status: NV_ERR_INVALID_STATE,
+                ..ExecFast::default()
+            }
+        };
+        unsafe { *out = result };
+        NV_OK
+    }
+    /// Drop the window of `ctx_idx`; a no-op when there is none, as in C.
+    #[no_mangle]
+    extern "C" fn eclipse_rm_exec_fast_release(_inst: u32, ctx_idx: u32) -> u32 {
+        let mut f = FAKE_RM.lock();
+        f.calls.push("exec_fast_release");
+        if let Some(i) = f.fast_ctxs.iter().position(|c| c.ctx == ctx_idx) {
+            f.fast_ctxs.remove(i);
+            f.fast_releases.push(ctx_idx);
+        }
+        NV_OK
     }
     #[no_mangle]
     extern "C" fn eclipse_rm_get_gsp_info(_a0: u32, _a1: *mut u8) -> u32 {
@@ -15939,7 +16933,7 @@ mod rm_host_shims {
     use alloc::vec::Vec;
     use core::sync::atomic::{AtomicU32, Ordering};
     use nvidia_rm_sys::rm_init::{
-        CtxAlloc, ExecSignal, ExecSubmit, GemAlloc, GemMapCpu, VmBind, ADDR_SYSMEM,
+        CtxAlloc, ExecFast, ExecSignal, ExecSubmit, GemAlloc, GemMapCpu, VmBind, ADDR_SYSMEM,
     };
 
     const NV_OK: u32 = 0;
@@ -16000,6 +16994,17 @@ mod rm_host_shims {
         pub ring_full: bool,
         /// The submit goes through but the fence never lands.
         pub fence_stalls: bool,
+        /// `exec_fast_prepare` hands out a channel instead of
+        /// `NV_ERR_NOT_SUPPORTED`: EXEC takes the direct-submit path.
+        pub fast: bool,
+        /// The SDK's `SEM_EXECUTE` disagrees with the kernel's encoder.
+        pub fast_bad_encoding: bool,
+        /// The direct-submit channels handed out and not released.
+        pub fast_ctxs: Vec<FastChan>,
+        /// Every `exec_fast_release` that found a window, in order.
+        pub fast_releases: Vec<u32>,
+        /// `(ctx, build)`: how many times each index was built.
+        ctx_build: Vec<(u32, u32)>,
     }
 
     const EMPTY_RM: FakeRm = FakeRm {
@@ -16027,6 +17032,11 @@ mod rm_host_shims {
         refuse_class: false,
         ring_full: false,
         fence_stalls: false,
+        fast: false,
+        fast_bad_encoding: false,
+        fast_ctxs: Vec::new(),
+        fast_releases: Vec::new(),
+        ctx_build: Vec::new(),
     };
 
     pub(super) static FAKE_RM: lock::Mutex<FakeRm> = lock::Mutex::new(EMPTY_RM);
@@ -16106,6 +17116,13 @@ mod rm_host_shims {
         } else {
             if !f.ctxs.contains(&ctx_idx) {
                 f.ctxs.push(ctx_idx);
+                // A new channel behind this index: the USERD of the old one
+                // went with it.
+                if let Some(b) = f.ctx_build.iter_mut().find(|b| b.0 == ctx_idx) {
+                    b.1 += 1;
+                } else {
+                    f.ctx_build.push((ctx_idx, 1));
+                }
             }
             NV_OK
         };
