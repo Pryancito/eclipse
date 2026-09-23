@@ -1,6 +1,4 @@
 use crate::context::TrapReason;
-use crate::IpiReason;
-use alloc::vec::Vec;
 use riscv::register::scause;
 use trapframe::TrapFrame;
 pub(super) const SUPERVISOR_TIMER_INT_VEC: usize = 5; // scause::Interrupt::SupervisorTimer
@@ -19,14 +17,23 @@ pub(super) fn super_timer() {
     //发生外界中断时，epc的指令还没有执行，故无需修改epc到下一条
 }
 
+/// The supervisor software interrupt: this architecture's TLB-shootdown IPI.
+///
+/// It used to call `ipi_reason()` and log what came back. That call consumed
+/// the queue, so the handler *ate* every shootdown request this CPU was sent
+/// and then flushed nothing and acknowledged nothing -- leaving the stale
+/// mapping in place and the initiator spinning on a watermark that, with the
+/// queue now reading empty, no later drain could ever advance. The initiator's
+/// wait has no timeout (correctness over latency) and the NMI escalation is
+/// x86-only, so on riscv every cross-CPU shootdown was a hang.
+///
+/// Drain and acknowledge instead, the same call x86_64 wires to its 0xf3
+/// vector. Allocation-free, which an interrupt handler on the shootdown path
+/// has to be: it is reached with the caller's lock held.
 pub(super) fn super_soft() {
     #[allow(deprecated)]
     sbi_rt::legacy::clear_ipi();
-    let reasons: Vec<IpiReason> = crate::interrupt::ipi_reason()
-        .iter()
-        .map(|x| IpiReason::from(*x))
-        .collect();
-    debug!("Interrupt::SupervisorSoft, reason = {:?}", reasons);
+    crate::common::ipi::tlb_shootdown_ack();
 }
 
 #[no_mangle]

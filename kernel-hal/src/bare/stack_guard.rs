@@ -38,9 +38,11 @@
 //! scheduler already handles. The failure mode of this module is "no better
 //! than before", never "worse".
 
-use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::Ordering;
 
+use crate::fault_slots::SlotTable;
 use crate::mem::PhysFrame;
+use crate::phys_watch::{FramePool, FrameSet, FreedRing};
 use crate::vm::{GenericPageTable, PageTable};
 use crate::{MMUFlags, PhysAddr};
 
@@ -65,12 +67,13 @@ const PAGE_SIZE: usize = 4096;
 // with the kernel heap above 16 GiB is not a configuration this hunt targets.
 const TRACKED_FRAMES: usize = 4 * 1024 * 1024; // 16 GiB / 4 KiB
 const FRAME_WORDS: usize = TRACKED_FRAMES / 64;
-static STACK_FRAME_BITS: [AtomicU64; FRAME_WORDS] = [const { AtomicU64::new(0) }; FRAME_WORDS];
-static STACK_FRAMES_OVER_CAP: AtomicUsize = AtomicUsize::new(0);
+/// The bitset itself, and the walk over it, live in `crate::phys_watch`, where
+/// every build compiles them.
+static STACK_FRAMES: FrameSet<FRAME_WORDS> = FrameSet::new();
 
-#[inline]
-fn frame_bit(frame: usize) -> (usize, u64) {
-    (frame / 64, 1u64 << (frame % 64))
+/// How many frames past the tracked range were offered, for the boot log.
+pub fn stack_frames_over_cap() -> usize {
+    STACK_FRAMES.over_cap()
 }
 
 // ── Recently-freed DMA-block ring: catch the DEVICE/userspace-mapping UAF ─────
@@ -102,49 +105,20 @@ fn frame_bit(frame: usize) -> (usize, u64) {
 // diagnostic — recording is a couple of relaxed stores per DMA free, the lookup
 // runs only on the already-fatal fault path.
 const DMA_RING_SLOTS: usize = 512;
-static DMA_FREED_BASE: [AtomicUsize; DMA_RING_SLOTS] =
-    [const { AtomicUsize::new(0) }; DMA_RING_SLOTS];
-static DMA_FREED_PAGES: [AtomicUsize; DMA_RING_SLOTS] =
-    [const { AtomicUsize::new(0) }; DMA_RING_SLOTS];
-/// Monotonic count of DMA-block frees since boot; also the ring write cursor.
-static DMA_FREED_SEQ: AtomicU64 = AtomicU64::new(0);
+/// The ring itself, and its publication order, live in `crate::phys_watch`.
+static DMA_FREED: FreedRing<DMA_RING_SLOTS> = FreedRing::new();
 
 /// Record that `[paddr, paddr + pages*PAGE)` was just freed by a DMA path.
 /// Called from `drivers_dma_dealloc` for every block returned to the pool.
 pub fn dma_free_note(paddr: usize, pages: usize) {
-    if pages == 0 {
-        return;
-    }
-    let seq = DMA_FREED_SEQ.fetch_add(1, Ordering::AcqRel);
-    let slot = (seq as usize) % DMA_RING_SLOTS;
-    // Base published last: a concurrent reader that catches this slot mid-write
-    // sees the OLD (base, pages) or a zero pages and simply does not match — the
-    // safe direction for a best-effort diagnostic.
-    DMA_FREED_PAGES[slot].store(pages, Ordering::Relaxed);
-    DMA_FREED_BASE[slot].store(paddr, Ordering::Release);
+    DMA_FREED.note(paddr, pages);
 }
 
 /// If `paddr` falls inside a recently-freed DMA block, return how many DMA
 /// frees have happened since (0 = the most recent). `None` if not found —
 /// either it was never a DMA buffer, or it aged out of the ring.
 pub fn paddr_recently_freed_dma(paddr: usize) -> Option<u64> {
-    let now = DMA_FREED_SEQ.load(Ordering::Acquire);
-    for back in 0..(DMA_RING_SLOTS as u64) {
-        if back >= now {
-            break;
-        }
-        let seq = now - 1 - back;
-        let slot = (seq as usize) % DMA_RING_SLOTS;
-        let base = DMA_FREED_BASE[slot].load(Ordering::Acquire);
-        let pages = DMA_FREED_PAGES[slot].load(Ordering::Relaxed);
-        if pages == 0 {
-            continue;
-        }
-        if paddr >= base && paddr < base + pages * PAGE_SIZE {
-            return Some(back);
-        }
-    }
-    None
+    DMA_FREED.since(paddr)
 }
 
 // ── Userspace pin of DMA frames (GEM CPU-mmap) ───────────────────────────────
@@ -191,15 +165,10 @@ fn mark_stack_frames(usable_base: usize, set: bool) {
             continue;
         };
         let frame = paddr / PAGE_SIZE;
-        if frame >= TRACKED_FRAMES {
-            STACK_FRAMES_OVER_CAP.fetch_add(1, Ordering::Relaxed);
-            continue;
-        }
-        let (w, b) = frame_bit(frame);
         if set {
-            STACK_FRAME_BITS[w].fetch_or(b, Ordering::Relaxed);
+            STACK_FRAMES.mark(frame);
         } else {
-            STACK_FRAME_BITS[w].fetch_and(!b, Ordering::Relaxed);
+            STACK_FRAMES.clear(frame);
         }
     }
 }
@@ -261,21 +230,7 @@ pub fn check_physmap_write(who: &str, paddr: usize, len: usize) {
 /// `pmem_write`) before they scribble — a `true` means the write would corrupt
 /// a live executor stack through the physmap alias.
 pub fn paddr_aliases_stack(paddr: usize, len: usize) -> bool {
-    if len == 0 {
-        return false;
-    }
-    let first = paddr / PAGE_SIZE;
-    let last = (paddr + len - 1) / PAGE_SIZE;
-    for frame in first..=last {
-        if frame >= TRACKED_FRAMES {
-            continue;
-        }
-        let (w, b) = frame_bit(frame);
-        if STACK_FRAME_BITS[w].load(Ordering::Relaxed) & b != 0 {
-            return true;
-        }
-    }
-    false
+    STACK_FRAMES.aliases(paddr, len)
 }
 
 /// Live guard bands. Two per executor (bottom and top); the scheduler's own
@@ -284,24 +239,20 @@ pub fn paddr_aliases_stack(paddr: usize, len: usize) -> bool {
 /// refuses and that executor falls back to the soft canary.
 const MAX_GUARDS: usize = 1024;
 
-/// Registry of installed bands: `base == 0` marks a free slot.
-///
-/// A plain lock-free table rather than a `Mutex<Vec<_>>` because
+/// Registry of installed bands, with each band's original flags. Lock-free
+/// and allocation-free rather than a `Mutex<Vec<_>>` because
 /// [`is_guard_fault`] is called from the page-fault handler, where taking a
 /// lock — or allocating — risks turning a diagnosable fault into a deadlock.
-static GUARD_BASE: [AtomicUsize; MAX_GUARDS] = [const { AtomicUsize::new(0) }; MAX_GUARDS];
-static GUARD_END: [AtomicUsize; MAX_GUARDS] = [const { AtomicUsize::new(0) }; MAX_GUARDS];
-/// Original flags of the band's pages, to be written back by [`remove`].
-static GUARD_FLAGS: [AtomicUsize; MAX_GUARDS] = [const { AtomicUsize::new(0) }; MAX_GUARDS];
+/// The table lives in `crate::fault_slots`, shared with the quarantine
+/// registry below, which had a second copy of every line of it.
+static GUARDS: SlotTable<MAX_GUARDS> = SlotTable::new();
 
-/// One past the highest slot index ever claimed, so [`slot_of`] does not walk
-/// the whole table on every kernel page fault. Slots are reused, so this
-/// settles at roughly twice the number of executors alive at once.
-static GUARD_HIGH: AtomicUsize = AtomicUsize::new(0);
-
-/// Bands installed and removed since boot, for the boot log.
-static INSTALLED: AtomicUsize = AtomicUsize::new(0);
-static REFUSED: AtomicUsize = AtomicUsize::new(0);
+/// The bottom band is told from the top one by its size, which only works
+/// while the two differ. If they ever stopped differing, `install` would mark
+/// the frames *above* the top guard as a live coroutine stack, and the next
+/// legitimate physmap write to them would report a smash that did not happen —
+/// which latches the flag that stops the timer path dispatching at all.
+const _: () = assert!(executor::GUARD_SIZE != executor::TOP_GUARD_SIZE);
 
 // ── Page-table frames reserved for splitting huge mappings ───────────────────
 //
@@ -327,12 +278,9 @@ static REFUSED: AtomicUsize = AtomicUsize::new(0);
 // `install` refuses that band and the scheduler keeps its soft canary, which
 // is exactly what happened for every band before this existed.
 const SPLIT_POOL_FRAMES: usize = 128;
-static SPLIT_POOL: [AtomicUsize; SPLIT_POOL_FRAMES] =
-    [const { AtomicUsize::new(0) }; SPLIT_POOL_FRAMES];
-/// How many slots of [`SPLIT_POOL`] hold a frame. Written once, by `init`.
-static SPLIT_POOL_LEN: AtomicUsize = AtomicUsize::new(0);
-/// The pool's bump cursor; also the count of frames handed out.
-static SPLIT_POOL_TAKEN: AtomicUsize = AtomicUsize::new(0);
+/// The reserve itself lives in `crate::phys_watch`, where every build compiles
+/// it.
+static SPLIT_POOL: FramePool<SPLIT_POOL_FRAMES> = FramePool::new();
 
 /// Serialises the split phase of [`install`].
 ///
@@ -350,12 +298,13 @@ static SPLIT_LOCK: spin::Mutex<()> = spin::Mutex::new(());
 
 /// Reserve the page-table frames [`ensure_4k`] will need. Called from `init`.
 fn fill_split_pool() {
-    for (i, slot) in SPLIT_POOL.iter().enumerate().take(SPLIT_POOL_FRAMES) {
+    for _ in 0..SPLIT_POOL_FRAMES {
         let Some(frame) = PhysFrame::new_zero() else {
             break;
         };
-        slot.store(frame.paddr(), Ordering::Relaxed);
-        SPLIT_POOL_LEN.store(i + 1, Ordering::Release);
+        if !SPLIT_POOL.push(frame.paddr()) {
+            break;
+        }
         // Leaked deliberately. Dropping a `PhysFrame` returns it to the frame
         // allocator, and these become live page tables: the allocator would
         // hand a table that the MMU is walking to the next VMO that asks for a
@@ -366,22 +315,12 @@ fn fill_split_pool() {
 
 /// Hand out one reserved frame, or `None` once the pool is spent.
 fn split_pool_take() -> Option<PhysAddr> {
-    let len = SPLIT_POOL_LEN.load(Ordering::Acquire);
-    let i = SPLIT_POOL_TAKEN.fetch_add(1, Ordering::AcqRel);
-    if i >= len {
-        return None;
-    }
-    Some(SPLIT_POOL[i].load(Ordering::Relaxed))
+    SPLIT_POOL.take()
 }
 
-/// `(frames reserved, frames spent on splits)` since boot.
-pub fn split_pool_stats() -> (usize, usize) {
-    (
-        SPLIT_POOL_LEN.load(Ordering::Relaxed),
-        SPLIT_POOL_TAKEN
-            .load(Ordering::Relaxed)
-            .min(SPLIT_POOL_LEN.load(Ordering::Relaxed)),
-    )
+/// `(frames reserved, frames spent on splits, splits refused for want of one)`.
+pub fn split_pool_stats() -> (usize, usize, usize) {
+    SPLIT_POOL.stats()
 }
 
 /// Make every page of `[base, base + size)` an ordinary 4 KiB entry, splitting
@@ -439,58 +378,7 @@ pub fn init() {
 
 /// `(bands installed, install requests refused)` since boot.
 pub fn stats() -> (usize, usize) {
-    (
-        INSTALLED.load(Ordering::Relaxed),
-        REFUSED.load(Ordering::Relaxed),
-    )
-}
-
-/// Claim a registry slot for `[base, base + size)`. `None` if the table is full.
-fn claim_slot(base: usize, size: usize, flags: MMUFlags) -> Option<usize> {
-    for i in 0..MAX_GUARDS {
-        if GUARD_BASE[i].load(Ordering::Relaxed) != 0 {
-            continue;
-        }
-        if GUARD_BASE[i]
-            .compare_exchange(0, base, Ordering::AcqRel, Ordering::Relaxed)
-            .is_ok()
-        {
-            // Published last, and read only after `base` is seen: a concurrent
-            // `is_guard_fault` that catches this slot mid-claim sees `end == 0`
-            // and simply does not match, which is the safe direction.
-            GUARD_FLAGS[i].store(flags.bits(), Ordering::Relaxed);
-            GUARD_END[i].store(base + size, Ordering::Release);
-            GUARD_HIGH.fetch_max(i + 1, Ordering::Release);
-            return Some(i);
-        }
-    }
-    None
-}
-
-/// Release a slot claimed by [`claim_slot`].
-fn free_slot(i: usize) {
-    GUARD_END[i].store(0, Ordering::Relaxed);
-    GUARD_FLAGS[i].store(0, Ordering::Relaxed);
-    GUARD_BASE[i].store(0, Ordering::Release);
-}
-
-/// Find the slot covering `vaddr`, if any.
-///
-/// On the kernel page-fault path, and that path is not rare — a fault taken in
-/// kernel context on a *user* address (copy-to-user touching a page the VMAR
-/// has not committed yet) comes through here too. Both early exits below exist
-/// for that traffic: a guard band is always a kernel-half address, and only the
-/// slots ever claimed are worth scanning.
-fn slot_of(vaddr: usize) -> Option<usize> {
-    if (vaddr as isize) >= 0 {
-        return None;
-    }
-    let high = GUARD_HIGH.load(Ordering::Acquire).min(MAX_GUARDS);
-    (0..high).find(|&i| {
-        let base = GUARD_BASE[i].load(Ordering::Acquire);
-        let end = GUARD_END[i].load(Ordering::Acquire);
-        base != 0 && vaddr >= base && vaddr < end
-    })
+    GUARDS.stats()
 }
 
 /// Write `flags` into every page of the band, reporting the first failure.
@@ -518,7 +406,7 @@ fn set_band_flags(pt: &mut PageTable, base: usize, size: usize, flags: MMUFlags)
 /// its soft canary.
 fn install(guard_base: usize, guard_size: usize) -> bool {
     let refuse = |reason: &str| {
-        let n = REFUSED.fetch_add(1, Ordering::Relaxed);
+        let n = GUARDS.note_refused();
         // Logged only the first few times. This runs inside `Executor::new`,
         // which the scheduler calls with the runtime lock held and interrupts
         // off on every preemption-mid-poll — a per-executor log line from a
@@ -590,7 +478,7 @@ fn install(guard_base: usize, guard_size: usize) -> bool {
 
     // Publish before editing: a fault inside the band from here on is a guard
     // hit and should be reported as one.
-    let Some(slot) = claim_slot(guard_base, guard_size, expect) else {
+    let Some(slot) = GUARDS.claim(guard_base, guard_size, expect.bits()) else {
         return refuse("guard registry is full");
     };
 
@@ -605,7 +493,7 @@ fn install(guard_base: usize, guard_size: usize) -> bool {
 
     if set_band_flags(&mut pt, guard_base, guard_size, MMUFlags::empty()).is_err() {
         rollback(&mut pt);
-        free_slot(slot);
+        GUARDS.free(slot);
         return refuse("clearing the band's permissions failed");
     }
 
@@ -621,7 +509,7 @@ fn install(guard_base: usize, guard_size: usize) -> bool {
         };
         if !gone {
             rollback(&mut pt);
-            free_slot(slot);
+            GUARDS.free(slot);
             return refuse("band still readable after clearing its permissions");
         }
     }
@@ -639,7 +527,7 @@ fn install(guard_base: usize, guard_size: usize) -> bool {
     if guard_size == executor::GUARD_SIZE {
         mark_stack_frames(guard_base + executor::GUARD_SIZE, true);
     }
-    INSTALLED.fetch_add(1, Ordering::Relaxed);
+    GUARDS.note_accepted();
     true
 }
 
@@ -650,7 +538,7 @@ fn install(guard_base: usize, guard_size: usize) -> bool {
 /// and the next owner would fault on an address nothing explains. That is worth
 /// a loud panic rather than a silent return.
 fn remove(guard_base: usize, guard_size: usize) {
-    let Some(slot) = slot_of(guard_base) else {
+    let Some(slot) = GUARDS.slot_of(guard_base) else {
         // Never installed (the scheduler only calls this for bands it recorded
         // as hard, so this means the registry and the scheduler disagree).
         return;
@@ -661,7 +549,13 @@ fn remove(guard_base: usize, guard_size: usize) {
     if guard_size == executor::GUARD_SIZE {
         mark_stack_frames(guard_base + executor::GUARD_SIZE, false);
     }
-    let flags = MMUFlags::from_bits_truncate(GUARD_FLAGS[slot].load(Ordering::Relaxed));
+    // A slot that went free between the lookup and here would hand back `None`
+    // and leave the band unmapped; the registry is only ever released by this
+    // function, for a band the scheduler is holding, so it cannot.
+    let Some(bits) = GUARDS.flags(slot) else {
+        return;
+    };
+    let flags = MMUFlags::from_bits_truncate(bits);
     let mut pt = PageTable::from_current();
     if set_band_flags(&mut pt, guard_base, guard_size, flags).is_err() {
         panic!(
@@ -673,7 +567,7 @@ fn remove(guard_base: usize, guard_size: usize) {
     // Other CPUs may have cached the not-present entry; make them re-walk.
     crate::vm::flush_tlb(None);
     crate::common::ipi::remote_flush_tlb_aspace(None, None);
-    free_slot(slot);
+    GUARDS.free(slot);
 }
 
 /// Whether `fault_vaddr` fell inside an installed guard band.
@@ -684,7 +578,7 @@ fn remove(guard_base: usize, guard_size: usize) {
 /// on the fault path, where blocking would turn a reportable overflow into a
 /// hang.
 pub fn is_guard_fault(fault_vaddr: usize) -> bool {
-    slot_of(fault_vaddr).is_some()
+    GUARDS.slot_of(fault_vaddr).is_some()
 }
 
 // ── Freed-stack quarantine: catch the use-after-free WRITER red-handed ────────
@@ -710,48 +604,9 @@ pub fn is_guard_fault(fault_vaddr: usize) -> bool {
 /// Same real ceiling as the guard registry — a handful of executors churn at
 /// once, and the scheduler's ring holds only the most-recently-freed stacks.
 const MAX_QUAR: usize = 128;
-static QUAR_BASE: [AtomicUsize; MAX_QUAR] = [const { AtomicUsize::new(0) }; MAX_QUAR];
-static QUAR_END: [AtomicUsize; MAX_QUAR] = [const { AtomicUsize::new(0) }; MAX_QUAR];
-/// Original flags to write back when the stack is finally released.
-static QUAR_FLAGS: [AtomicUsize; MAX_QUAR] = [const { AtomicUsize::new(0) }; MAX_QUAR];
-static QUAR_HIGH: AtomicUsize = AtomicUsize::new(0);
-static QUAR_PROTECTED: AtomicUsize = AtomicUsize::new(0);
-
-fn quar_claim_slot(base: usize, size: usize, flags: MMUFlags) -> Option<usize> {
-    for i in 0..MAX_QUAR {
-        if QUAR_BASE[i].load(Ordering::Relaxed) != 0 {
-            continue;
-        }
-        if QUAR_BASE[i]
-            .compare_exchange(0, base, Ordering::AcqRel, Ordering::Relaxed)
-            .is_ok()
-        {
-            QUAR_FLAGS[i].store(flags.bits(), Ordering::Relaxed);
-            QUAR_END[i].store(base + size, Ordering::Release);
-            QUAR_HIGH.fetch_max(i + 1, Ordering::Release);
-            return Some(i);
-        }
-    }
-    None
-}
-
-fn free_quar_slot(i: usize) {
-    QUAR_END[i].store(0, Ordering::Relaxed);
-    QUAR_FLAGS[i].store(0, Ordering::Relaxed);
-    QUAR_BASE[i].store(0, Ordering::Release);
-}
-
-fn quar_slot_of(vaddr: usize) -> Option<usize> {
-    if (vaddr as isize) >= 0 {
-        return None;
-    }
-    let high = QUAR_HIGH.load(Ordering::Acquire).min(MAX_QUAR);
-    (0..high).find(|&i| {
-        let base = QUAR_BASE[i].load(Ordering::Acquire);
-        let end = QUAR_END[i].load(Ordering::Acquire);
-        base != 0 && vaddr >= base && vaddr < end
-    })
-}
+/// The same registry as the guards, a second instance of it — not a second
+/// copy of the code, which is what this was.
+static QUARANTINE: SlotTable<MAX_QUAR> = SlotTable::new();
 
 /// Write-protect the freed usable stack `[usable_base, usable_base + size)` and
 /// register it, so a stale write into it faults at the writer.
@@ -760,41 +615,88 @@ fn quar_slot_of(vaddr: usize) -> Option<usize> {
 /// of writable 4 KiB pages or the registry is full; the scheduler then frees the
 /// stack the ordinary way. Same all-or-nothing contract as [`install`].
 pub fn quarantine_protect(usable_base: usize, size: usize) -> bool {
+    let refuse = |reason: &str| {
+        let n = QUARANTINE.note_refused();
+        // Same rate limit, and for the same reason, as `install`'s: this runs
+        // on every executor teardown and a permanent condition would otherwise
+        // print at that rate. Counted always, so `quarantine_stats` can tell
+        // "armed and never hit" from "never armed".
+        if n < 4 {
+            warn!(
+                "stack_guard: refusing to quarantine {:#x}+{:#x} ({})",
+                usable_base, size, reason
+            );
+        }
+        false
+    };
     if size == 0 || !usable_base.is_multiple_of(PAGE_SIZE) || !size.is_multiple_of(PAGE_SIZE) {
-        return false;
+        return refuse("region is not page aligned");
     }
     let mut pt = PageTable::from_current();
+    // Split the covering huge entries first, exactly as `install` does. Without
+    // this the quarantine was silently unavailable on riscv64 and aarch64,
+    // where the kernel heap is a window of a physmap mapped with 2 MiB pages:
+    // every region arrived covered by a huge PTE, every call returned `false`,
+    // and the only outward sign was that the use-after-free writer was never
+    // caught on those architectures.
+    if let Err(reason) = ensure_4k(&mut pt, usable_base, size) {
+        return refuse(reason);
+    }
     let expect = match pt.query(usable_base) {
         Ok((_, flags, crate::vm::PageSize::Size4K)) => flags,
-        // Huge PTE or unmapped: cannot protect at page granularity.
-        _ => return false,
+        Ok((_, _, _)) => return refuse("region is covered by a huge PTE"),
+        Err(_) => return refuse("region is not mapped"),
     };
-    if !expect.contains(MMUFlags::WRITE) || expect.is_empty() {
-        return false;
+    // An empty flag set cannot contain WRITE, so this one test is the whole
+    // check; it used to be written twice, and neither copy could then be shown
+    // to do anything.
+    if !expect.contains(MMUFlags::WRITE) {
+        return refuse("region is already not writable");
     }
     for off in (0..size).step_by(PAGE_SIZE) {
         match pt.query(usable_base + off) {
             Ok((paddr, flags, crate::vm::PageSize::Size4K))
                 if flags == expect && paddr & !(PAGE_SIZE - 1) != 0 => {}
-            _ => return false,
+            _ => return refuse("region is not a uniform run of mapped 4 KiB pages"),
         }
     }
-    let Some(slot) = quar_claim_slot(usable_base, size, expect) else {
-        return false;
+    let Some(slot) = QUARANTINE.claim(usable_base, size, expect.bits()) else {
+        return refuse("quarantine registry is full");
+    };
+    let rollback = |pt: &mut PageTable| {
+        let _ = set_band_flags(pt, usable_base, size, expect);
+        crate::vm::flush_tlb(None);
+        crate::common::ipi::remote_flush_tlb_aspace(None, None);
     };
     // Present + readable, minus WRITE: a stale read stays silent, a stale write
     // faults with the WRITE error bit set.
     let readonly = MMUFlags::from_bits_truncate(expect.bits() & !MMUFlags::WRITE.bits());
     if set_band_flags(&mut pt, usable_base, size, readonly).is_err() {
-        let _ = set_band_flags(&mut pt, usable_base, size, expect);
-        crate::vm::flush_tlb(None);
-        crate::common::ipi::remote_flush_tlb_aspace(None, None);
-        free_quar_slot(slot);
-        return false;
+        rollback(&mut pt);
+        QUARANTINE.free(slot);
+        return refuse("clearing the region's write permission failed");
+    }
+    // Verify rather than trust, as `install` does. "Clearing the WRITE bit
+    // leaves the page readable and not writable" is a per-architecture detail
+    // of `From<MMUFlags>`; reading it back is what turns it into something this
+    // module knows. Without it a quarantine that protected nothing still
+    // returned `true` and still counted, so the diagnostic said the stacks were
+    // watched while every stale write went through untouched — the failure this
+    // whole path exists to catch, reported as a success.
+    for off in (0..size).step_by(PAGE_SIZE) {
+        let still_writable = match pt.query(usable_base + off) {
+            Ok((_, flags, _)) => flags.contains(MMUFlags::WRITE),
+            Err(_) => true,
+        };
+        if still_writable {
+            rollback(&mut pt);
+            QUARANTINE.free(slot);
+            return refuse("region still writable after clearing its write permission");
+        }
     }
     crate::vm::flush_tlb(None);
     crate::common::ipi::remote_flush_tlb_aspace(None, None);
-    QUAR_PROTECTED.fetch_add(1, Ordering::Relaxed);
+    QUARANTINE.note_accepted();
     true
 }
 
@@ -803,10 +705,13 @@ pub fn quarantine_protect(usable_base: usize, size: usize) -> bool {
 /// panic on failure: returning write-protected memory to the heap would fault
 /// the next owner on an address nothing explains.
 pub fn quarantine_unprotect(usable_base: usize, size: usize) {
-    let Some(slot) = quar_slot_of(usable_base) else {
+    let Some(slot) = QUARANTINE.slot_of(usable_base) else {
         return;
     };
-    let flags = MMUFlags::from_bits_truncate(QUAR_FLAGS[slot].load(Ordering::Relaxed));
+    let Some(bits) = QUARANTINE.flags(slot) else {
+        return;
+    };
+    let flags = MMUFlags::from_bits_truncate(bits);
     let mut pt = PageTable::from_current();
     if set_band_flags(&mut pt, usable_base, size, flags).is_err() {
         panic!(
@@ -817,17 +722,22 @@ pub fn quarantine_unprotect(usable_base: usize, size: usize) {
     }
     crate::vm::flush_tlb(None);
     crate::common::ipi::remote_flush_tlb_aspace(None, None);
-    free_quar_slot(slot);
+    QUARANTINE.free(slot);
 }
 
 /// Whether `fault_vaddr` fell inside a write-protected quarantined stack — i.e.
 /// a use-after-free write into freed coroutine-stack memory. Lock-free and
 /// allocation-free; safe on the page-fault path.
 pub fn is_quarantine_fault(fault_vaddr: usize) -> bool {
-    quar_slot_of(fault_vaddr).is_some()
+    QUARANTINE.slot_of(fault_vaddr).is_some()
 }
 
-/// `(stacks currently/ever quarantined-protected)` for the boot/diagnostic log.
-pub fn quarantine_stats() -> usize {
-    QUAR_PROTECTED.load(Ordering::Relaxed)
+/// `(stacks protected right now, protected ever, refused)` for the boot log.
+///
+/// Three numbers because the one this used to return could not tell the two
+/// interesting failures apart: a quarantine that is armed and has simply not
+/// caught anything reads the same as one that has never once been able to arm.
+pub fn quarantine_stats() -> (usize, usize, usize) {
+    let (ever, refused) = QUARANTINE.stats();
+    (QUARANTINE.live(), ever, refused)
 }

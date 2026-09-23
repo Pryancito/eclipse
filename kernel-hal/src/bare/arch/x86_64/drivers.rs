@@ -308,7 +308,7 @@ pub(super) fn init() -> DeviceResult {
     // status blocks (GPE0/GPE1 STS write-1-to-clear) the safe default is to
     // leave the SCI MASKED — input is never starved. Opt in with `acpi.powerbtn`
     // once GPE draining lands and can be validated on hardware.
-    if crate::KCONFIG.cmdline.contains("acpi.powerbtn") {
+    if crate::cmdline::flag(crate::KCONFIG.cmdline, "acpi.powerbtn") {
         init_acpi_power_button(&irq);
     }
 

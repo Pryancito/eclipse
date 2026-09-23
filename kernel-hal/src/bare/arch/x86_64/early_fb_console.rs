@@ -53,22 +53,6 @@ pub fn set_mirror_x(on: bool) {
     zcore_drivers::scheme::set_scanout_mirror_x(on);
 }
 
-/// Colon-separated cmdline flags, matching rboot's `has_cmdline_flag`.
-fn cmdline_flag(cmdline: &str, key: &str) -> bool {
-    for part in cmdline.split(':') {
-        let mut it = part.splitn(2, '=');
-        let k = it.next().unwrap_or("").trim();
-        let v = it.next().unwrap_or("").trim();
-        if k.eq_ignore_ascii_case(key) {
-            return v.is_empty()
-                || v == "1"
-                || v.eq_ignore_ascii_case("true")
-                || v.eq_ignore_ascii_case("on");
-        }
-    }
-    false
-}
-
 /// Set once [`latch_cmdline_flags`] has parsed the boot command line. After
 /// that the string is never read again: `KernelConfig::cmdline` borrows the
 /// bootloader's own memory, which is reclaimed once the kernel owns the
@@ -85,10 +69,10 @@ pub fn latch_cmdline_flags() {
     let Some(cfg) = KCONFIG.try_get() else {
         return;
     };
-    if cmdline_flag(cfg.cmdline, "FB_ROT180") {
+    if crate::cmdline::flag(cfg.cmdline, "FB_ROT180") {
         ROT180.store(true, Ordering::SeqCst);
     }
-    if cmdline_flag(cfg.cmdline, "FB_MIRROR_X") {
+    if crate::cmdline::flag(cfg.cmdline, "FB_MIRROR_X") {
         MIRROR_X.store(true, Ordering::SeqCst);
         zcore_drivers::scheme::set_scanout_mirror_x(true);
     }

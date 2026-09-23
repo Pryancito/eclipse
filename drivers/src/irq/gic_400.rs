@@ -126,9 +126,24 @@ impl IntController {
         }
     }
 
+    /// The acknowledged interrupt, as the raw GICC_IAR word, or `usize::MAX`
+    /// when there is none.
+    ///
+    /// The whole word, not the interrupt id: for a **software-generated
+    /// interrupt** (an SGI, ids 0..=15) bits [12:10] carry the id of the CPU
+    /// that sent it, and GICv2 requires the same word to come back to GICC_EOIR
+    /// -- an EOI that does not match the active interrupt is UNPREDICTABLE, and
+    /// on this part leaves it active, so the CPU's running priority never drops
+    /// and it takes no further interrupt of that priority or below. Ever.
+    ///
+    /// The spuriousness test therefore has to look at the id alone. Comparing
+    /// the whole word against 0x3fe called every SGI from a CPU other than 0
+    /// spurious -- IAR is `0x400` for CPU 1 -- and the caller then wrote
+    /// `0xffff_ffff` to EOIR. SPIs are unaffected either way: their CPUID
+    /// field is zero, so the word *is* the id.
     pub fn pending_irq(&self) -> usize {
         let iar = unsafe { self.gicc.read(GICC_IAR) as usize };
-        if iar >= 0x3fe {
+        if iar & 0x3ff >= 0x3fe {
             usize::MAX
         } else {
             iar
@@ -143,7 +158,11 @@ impl Scheme for IntController {
 
     fn handle_irq(&self, irq_num: usize) {
         if irq_num != usize::MAX {
-            self.manager.lock().handle(irq_num).ok();
+            // Dispatch on the interrupt id, acknowledge with the whole word:
+            // see `pending_irq`. For everything but an SGI the two are equal,
+            // so a caller passing a bare id (every caller but the aarch64 trap
+            // entry) is unaffected.
+            self.manager.lock().handle(irq_num & 0x3ff).ok();
         }
         self.irq_eoi(irq_num as u32);
     }

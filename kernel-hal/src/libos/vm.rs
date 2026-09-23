@@ -48,7 +48,73 @@ hal_fn_impl! {
         /// `unimplemented!("vm::flush_tlb()")` -- a panic sitting under
         /// `common::ipi::remote_flush_tlb_aspace`, which is architecture
         /// independent and therefore compiled here too.
-        fn flush_tlb(_vaddr: Option<VirtAddr>) {}
+        fn flush_tlb(_vaddr: Option<VirtAddr>) {
+            #[cfg(test)]
+            crate::imp::vm::flush_probe::note(_vaddr);
+        }
+    }
+}
+
+/// Test-only record of every invalidation this HAL was asked for, and a
+/// one-shot hook run *inside* one.
+///
+/// `flush_tlb` is a no-op here, so a drain that consumed a shootdown request
+/// and serviced it looks exactly like one that consumed it and dropped it on
+/// the floor. That is the whole difference between the three architectures'
+/// IPI handlers, so the tests in `common::ipi` have to be able to see it.
+///
+/// The hook is what makes the *ordering* testable: a publish site that reads
+/// the queue tail after the flush instead of before it can only be caught by
+/// something that commits an entry while the flush is in progress.
+#[cfg(test)]
+pub(crate) mod flush_probe {
+    use alloc::boxed::Box;
+    use alloc::vec::Vec;
+    use std::sync::Mutex;
+
+    type Hook = Box<dyn FnOnce() + Send + 'static>;
+
+    static LOG: Mutex<Vec<Option<usize>>> = Mutex::new(Vec::new());
+    static DURING: Mutex<Option<Hook>> = Mutex::new(None);
+
+    pub(crate) fn note(vaddr: Option<usize>) {
+        if let Ok(mut log) = LOG.lock() {
+            log.push(vaddr);
+        }
+        // Take the hook out and drop the guard before running it, so a hook
+        // that flushes (or that the flush path re-enters) cannot deadlock.
+        let hook = DURING.lock().ok().and_then(|mut g| g.take());
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    /// Forget every flush recorded so far, and disarm any pending hook.
+    pub(crate) fn reset() {
+        if let Ok(mut log) = LOG.lock() {
+            log.clear();
+        }
+        if let Ok(mut g) = DURING.lock() {
+            *g = None;
+        }
+    }
+
+    /// Run `f` once, inside the next `flush_tlb`.
+    pub(crate) fn during_next_flush(f: impl FnOnce() + Send + 'static) {
+        if let Ok(mut g) = DURING.lock() {
+            *g = Some(Box::new(f));
+        }
+    }
+
+    /// Every invalidation recorded since the last [`reset`]: `None` is a full
+    /// flush, `Some(vaddr)` a single page.
+    pub(crate) fn flushes() -> Vec<Option<usize>> {
+        LOG.lock().map(|l| l.clone()).unwrap_or_default()
+    }
+
+    /// Whether a full flush has been recorded since the last [`reset`].
+    pub(crate) fn saw_full_flush() -> bool {
+        flushes().iter().any(|f| f.is_none())
     }
 }
 

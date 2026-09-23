@@ -116,16 +116,17 @@ hal_fn_impl! {
             // enough to diagnose that its precondition belongs in the boot log.
             let (installed, refused) = super::stack_guard::stats();
             let (hard, soft) = executor::hard_guard_executor_counts();
-            let (pool, spent) = super::stack_guard::split_pool_stats();
+            let (pool, spent, starved) = super::stack_guard::split_pool_stats();
             crate::klog_info!(
                 "stack_guard: {} guard band(s) installed, {} refused; \
-                 executors hard={} soft={}; split frames {}/{}",
+                 executors hard={} soft={}; split frames {}/{} ({} starved)",
                 installed,
                 refused,
                 hard,
                 soft,
                 spent,
-                pool
+                pool,
+                starved
             );
             // The primary now holds logical id 0 and everything a secondary
             // needs; release any that are already spinning (see `PRIMARY_READY`).

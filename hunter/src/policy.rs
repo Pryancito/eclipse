@@ -20,9 +20,9 @@
 extern crate alloc;
 
 use alloc::collections::BTreeMap;
+use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
-use alloc::{format, vec};
 use core::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use lock::Mutex;
 
@@ -126,12 +126,49 @@ static EXEC_LEARN: AtomicBool = AtomicBool::new(false);
 /// many distinct binaries.
 const MAX_LEARNED_EXEC: usize = 8192;
 
+/// The built-in world-writable locations. Kept in canonical prefix form (see
+/// [`canonicalize_prefix`]) -- `default_untrusted_directories_are_canonical`
+/// in the tests is what holds a future entry to it.
 fn default_untrusted_prefixes() -> Vec<String> {
-    vec![
+    alloc::vec![
         String::from("/tmp/"),
         String::from("/var/tmp/"),
         String::from("/dev/shm/"),
     ]
+}
+
+/// Refuses a relaxing control-plane change while the tighten-only latch is
+/// engaged, recording the refusal. Returns `true` when the caller may proceed.
+///
+/// The latch's promise is that "a single relaxing store cannot quietly
+/// neutralise hunter after boot", but it was only ever consulted by
+/// [`apply_mode`] — i.e. by the four mode words. Every other way of relaxing
+/// the policy walked straight past it, and they are the effective ones:
+/// `add_trusted_exec_prefix("/")` trusts the whole filesystem,
+/// `clear_trusted_exec()` deactivates the allowlist outright,
+/// `set_exec_learning(true)` turns exec into a domain that never denies, and
+/// `set_default_whitelist(None)` drops the seccomp default — all with the
+/// modes still reading `enforce` in `/proc/hunter`, which is the part that
+/// makes it quiet.
+///
+/// Tightening changes (adding an untrusted or blacklisted location, disabling
+/// learning, raising a mode) are never gated, and neither is
+/// [`remove_policy`], which is process teardown rather than a policy change.
+fn allow_relaxing(what: &str) -> bool {
+    if !TIGHTEN_ONLY.load(Ordering::SeqCst) {
+        return true;
+    }
+    record(
+        0,
+        Severity::Warning,
+        "CONTROL",
+        "WARNING",
+        format!(
+            "refused relaxing control change: {} (tighten-only latch)",
+            what
+        ),
+    );
+    false
 }
 
 /// Applies a mode transition for one domain, honouring the tighten-only latch
@@ -227,6 +264,29 @@ pub fn is_tighten_only() -> bool {
     TIGHTEN_ONLY.load(Ordering::SeqCst)
 }
 
+/// Test-only: returns the whole control plane to its boot defaults, latch
+/// included. The latch is one-way by design, so without this a test binary
+/// could only ever hold one latch scenario; never compiled into the kernel.
+#[cfg(test)]
+pub(crate) fn reset_for_test() {
+    TIGHTEN_ONLY.store(false, Ordering::SeqCst);
+    SYSCALL_MODE.store(Mode::Enforce.to_u8(), Ordering::SeqCst);
+    WX_MODE.store(Mode::Report.to_u8(), Ordering::SeqCst);
+    EXEC_MODE.store(Mode::Report.to_u8(), Ordering::SeqCst);
+    ANOMALY_MODE.store(Mode::Report.to_u8(), Ordering::SeqCst);
+    EXEC_LEARN.store(false, Ordering::SeqCst);
+    TRUSTED_EXEC_PATHS.lock().clear();
+    TRUSTED_EXEC_PREFIXES.lock().clear();
+    LEARNED_EXEC_PATHS.lock().clear();
+    BLACKLISTED_EXEC_PATHS.lock().clear();
+    BLACKLISTED_EXEC_PREFIXES.lock().clear();
+    *UNTRUSTED_EXEC_PREFIXES.lock() = default_untrusted_prefixes();
+    *DEFAULT_WHITELIST.lock() = None;
+    let mut map = GLOBAL_POLICIES.lock();
+    map.clear();
+    POLICY_COUNT.store(map.len(), Ordering::Release);
+}
+
 // ---- Back-compat shims for the original boolean enforcement switch --------
 
 /// Sets whether syscall violations block (`true`) or warn (`false`).
@@ -263,6 +323,11 @@ pub fn active_policy_count() -> usize {
 /// Sets (or clears) the default whitelist applied to freshly-exec'd images.
 /// `None` keeps the syscall domain opt-in / default-permissive.
 pub fn set_default_whitelist(list: Option<Vec<u32>>) {
+    // Clearing the default is unambiguously a relaxation. Replacing one list
+    // with another may go either way and is left to the operator.
+    if list.is_none() && !allow_relaxing("clear default syscall whitelist") {
+        return;
+    }
     *DEFAULT_WHITELIST.lock() = list;
 }
 
@@ -319,9 +384,10 @@ pub fn is_syscall_allowed(pid: u64, syscall_num: u32) -> Result<(), bool> {
 
 /// Adds a path prefix to the untrusted-execution list (idempotent).
 pub fn add_untrusted_exec_prefix(prefix: String) {
+    let canon = canonicalize_prefix(&prefix);
     let mut list = UNTRUSTED_EXEC_PREFIXES.lock();
-    if !list.iter().any(|p| *p == prefix) {
-        list.push(prefix);
+    if !list.iter().any(|p| *p == canon) {
+        list.push(canon);
     }
 }
 
@@ -345,21 +411,60 @@ pub fn canonicalize(path: &str) -> String {
     out
 }
 
+/// Normalizes a *directory prefix* the way every query path is normalized.
+///
+/// Every membership test in this module canonicalizes the path it is given and
+/// then compares it against the stored list, but only the exact-path mutators
+/// canonicalized what they stored: the prefix mutators pushed the operator's
+/// raw string. A prefix that was not already canonical therefore could not
+/// match anything, ever — and on the blacklist, which is the one hard deny in
+/// the whole exec policy, a rule that never matches fails *open*. Nothing
+/// reported it, because a deny rule that never fires looks exactly like a deny
+/// rule nobody tripped.
+///
+/// The trailing slash is the second half: `starts_with` does not know about
+/// path components, so a prefix of `/usr/bin` let `/usr/binaries/evil` inherit
+/// `/usr/bin`'s trust. Canonicalization drops a trailing slash, so it is put
+/// back here and a prefix always means "this directory and what is under it".
+fn canonicalize_prefix(prefix: &str) -> String {
+    let mut canon = canonicalize(prefix);
+    if !canon.ends_with('/') {
+        canon.push('/');
+    }
+    canon
+}
+
+/// Whether `canon` is a `/proc/<pid>/fd/<n>` magic link.
+///
+/// Takes an already-canonicalized path on purpose. This test used to be two
+/// copies of `path.starts_with("/proc/") && path.contains("/fd/")` run on the
+/// *raw* path, one in each of the functions below, while everything around it
+/// worked on the canonical form. So `//proc/self/fd/3` and
+/// `/bin/../proc/self/fd/3` — which the loader opens exactly like
+/// `/proc/self/fd/3` — were not magic links as far as hunter was concerned:
+/// they are not world-writable either, so with learning on (which is how the
+/// kernel boots it, see `/etc/hunter`) the *first* such exec put
+/// `/proc/self/fd/3` into the permanent trusted allowlist, and from then on any
+/// process could execute whatever inode it had open on fd 3.
+fn is_proc_fd_link(canon: &str) -> bool {
+    canon.starts_with("/proc/") && canon.contains("/fd/")
+}
+
 /// Returns `true` when executing from `path` should be treated as untrusted:
 /// a world-writable location (after canonicalization) or a `/proc/*/fd/*`
 /// magic-link that smuggles past prefix matching (P6, finding ELF-2/ELF-3).
 pub fn is_untrusted_exec_path(path: &str) -> bool {
-    // /proc/self/fd/N and /proc/<pid>/fd/N resolve to an arbitrary opened
-    // inode, defeating textual prefix checks — always treat as untrusted.
-    if path.starts_with("/proc/") && path.contains("/fd/") {
-        return true;
-    }
     // A relative exec path is resolved against cwd at the FS layer; without that
     // context we cannot prove it lands somewhere trusted, so flag it.
     if !path.starts_with('/') {
         return true;
     }
     let canon = canonicalize(path);
+    // /proc/self/fd/N and /proc/<pid>/fd/N resolve to an arbitrary opened
+    // inode, defeating textual prefix checks — always treat as untrusted.
+    if is_proc_fd_link(&canon) {
+        return true;
+    }
     let list = UNTRUSTED_EXEC_PREFIXES.lock();
     list.iter().any(|p| canon.starts_with(p.as_str()))
 }
@@ -377,6 +482,9 @@ pub fn is_untrusted_exec_path(path: &str) -> bool {
 
 /// Adds an exact canonical executable path to the trusted-program allowlist.
 pub fn add_trusted_exec_path(path: String) {
+    if !allow_relaxing("add trusted program") {
+        return;
+    }
     let canon = canonicalize(&path);
     let mut list = TRUSTED_EXEC_PATHS.lock();
     if !list.iter().any(|p| *p == canon) {
@@ -393,16 +501,20 @@ pub fn add_trusted_exec_path(path: String) {
 
 /// Adds a trusted directory prefix: any executable under it is allowed.
 pub fn add_trusted_exec_prefix(prefix: String) {
+    if !allow_relaxing("add trusted exec directory") {
+        return;
+    }
+    let canon = canonicalize_prefix(&prefix);
     let mut list = TRUSTED_EXEC_PREFIXES.lock();
-    if !list.iter().any(|p| *p == prefix) {
+    if !list.iter().any(|p| *p == canon) {
         record(
             0,
             Severity::Notice,
             "CONTROL",
             "CONFIG",
-            format!("trusted exec directory added: {}", prefix),
+            format!("trusted exec directory added: {}", canon),
         );
-        list.push(prefix);
+        list.push(canon);
     }
 }
 
@@ -428,6 +540,9 @@ pub fn install_default_trusted_exec() {
 
 /// Clears the trusted-program allowlist, deactivating it.
 pub fn clear_trusted_exec() {
+    if !allow_relaxing("clear trusted-program allowlist") {
+        return;
+    }
     TRUSTED_EXEC_PATHS.lock().clear();
     TRUSTED_EXEC_PREFIXES.lock().clear();
 }
@@ -473,6 +588,11 @@ pub fn is_exec_allowed(path: &str) -> bool {
 /// auto-added to the allowlist and never denied — a learning allowlist that
 /// builds itself without breaking anything.
 pub fn set_exec_learning(enabled: bool) {
+    // Turning learning ON is a relaxation (it makes exec a domain that never
+    // denies); turning it OFF is a tightening and always allowed.
+    if enabled && !allow_relaxing("enable exec learning") {
+        return;
+    }
     if EXEC_LEARN.swap(enabled, Ordering::SeqCst) != enabled {
         record(
             0,
@@ -505,6 +625,13 @@ pub fn learned_exec_paths() -> Vec<String> {
 /// Adds `path` to the learned set if not already trusted and the cap allows.
 /// Returns `true` if a new entry was learned (so the caller can log it once).
 pub fn learn_exec_path(path: &str) -> bool {
+    // Runs on the exec path for every program, so it declines silently rather
+    // than recording a refusal per exec. The caller still allows the exec; what
+    // the latch stops is the allowlist growing new permanent entries after the
+    // control plane was sealed.
+    if TIGHTEN_ONLY.load(Ordering::SeqCst) {
+        return false;
+    }
     if is_exec_listed(path) {
         return false;
     }
@@ -537,16 +664,17 @@ pub fn add_blacklisted_exec_path(path: String) {
 
 /// Adds a denied directory prefix to the exec blacklist.
 pub fn add_blacklisted_exec_prefix(prefix: String) {
+    let canon = canonicalize_prefix(&prefix);
     let mut list = BLACKLISTED_EXEC_PREFIXES.lock();
-    if !list.iter().any(|p| *p == prefix) {
+    if !list.iter().any(|p| *p == canon) {
         record(
             0,
             Severity::Notice,
             "CONTROL",
             "CONFIG",
-            format!("blacklisted directory: {}", prefix),
+            format!("blacklisted directory: {}", canon),
         );
-        list.push(prefix);
+        list.push(canon);
     }
 }
 
@@ -571,12 +699,268 @@ pub fn is_exec_blacklisted(path: &str) -> bool {
 /// relative paths, so a package manager exec'ing `lib/apk/.../busybox` with a
 /// relative path is still learnable.
 pub fn is_world_writable_exec_path(path: &str) -> bool {
-    if path.starts_with("/proc/") && path.contains("/fd/") {
+    let canon = canonicalize(path);
+    if is_proc_fd_link(&canon) {
         return true;
     }
-    let canon = canonicalize(path);
     UNTRUSTED_EXEC_PREFIXES
         .lock()
         .iter()
         .any(|p| canon.starts_with(p.as_str()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_globals;
+
+    fn start() -> impl Drop {
+        let g = test_globals::lock();
+        reset_for_test();
+        g
+    }
+
+    // ---- canonicalization of stored prefixes (the query side always did) --
+
+    #[test]
+    fn a_prefix_is_stored_canonical_and_always_means_a_directory() {
+        assert_eq!(canonicalize_prefix("/usr/bin"), String::from("/usr/bin/"));
+        assert_eq!(canonicalize_prefix("/usr/bin/"), String::from("/usr/bin/"));
+        assert_eq!(
+            canonicalize_prefix("//opt//danger//"),
+            String::from("/opt/danger/")
+        );
+        assert_eq!(
+            canonicalize_prefix("/opt/../opt/danger/"),
+            String::from("/opt/danger/")
+        );
+        assert_eq!(canonicalize_prefix("/"), String::from("/"));
+    }
+
+    #[test]
+    fn a_blacklisted_directory_written_with_a_dotdot_still_denies() {
+        let _g = start();
+        // The blacklist is the only hard deny in the exec policy -- it blocks
+        // even in Report mode -- and it was the one list whose prefixes were
+        // stored exactly as the operator typed them while every lookup
+        // canonicalized. A rule that cannot match fails open, and a deny rule
+        // that never fires is indistinguishable from one nobody tripped.
+        add_blacklisted_exec_prefix(String::from("/opt/../opt/danger/"));
+        assert!(is_exec_blacklisted("/opt/danger/payload"));
+        assert!(is_exec_blacklisted("/opt/danger/sub/payload"));
+        assert!(!is_exec_blacklisted("/opt/safe/payload"));
+    }
+
+    #[test]
+    fn a_blacklisted_directory_written_with_a_double_slash_still_denies() {
+        let _g = start();
+        add_blacklisted_exec_prefix(String::from("//opt//danger//"));
+        assert!(is_exec_blacklisted("/opt/danger/payload"));
+        assert_eq!(blacklisted_exec_count(), 1);
+        // The same rule typed the canonical way is the same rule, not a second.
+        add_blacklisted_exec_prefix(String::from("/opt/danger/"));
+        assert_eq!(blacklisted_exec_count(), 1);
+    }
+
+    #[test]
+    fn an_untrusted_directory_written_loosely_still_flags() {
+        let _g = start();
+        add_untrusted_exec_prefix(String::from("/srv/../srv/upload/"));
+        assert!(is_untrusted_exec_path("/srv/upload/x"));
+        assert!(is_world_writable_exec_path("/srv/upload/x"));
+        assert!(!is_untrusted_exec_path("/srv/safe/x"));
+    }
+
+    #[test]
+    fn default_untrusted_directories_are_canonical() {
+        for p in default_untrusted_prefixes() {
+            assert_eq!(canonicalize_prefix(&p), p, "default prefix not canonical");
+        }
+        let _g = start();
+        assert!(is_untrusted_exec_path("/tmp/payload"));
+        assert!(is_untrusted_exec_path("//tmp/payload"));
+        assert!(is_untrusted_exec_path("/usr/../tmp/payload"));
+        assert!(is_untrusted_exec_path("/var/tmp/payload"));
+        assert!(is_untrusted_exec_path("/dev/shm/payload"));
+    }
+
+    #[test]
+    fn a_trusted_directory_does_not_lend_its_trust_across_a_name_boundary() {
+        let _g = start();
+        // `starts_with` knows nothing about path components: a trusted prefix
+        // of "/usr/bin" used to cover "/usr/binaries-of-mine/evil" too.
+        add_trusted_exec_prefix(String::from("/usr/bin"));
+        assert!(is_exec_listed("/usr/bin/ls"));
+        assert!(!is_exec_listed("/usr/binaries-of-mine/evil"));
+        assert!(!is_exec_listed("/usr/bin-backup/evil"));
+    }
+
+    // ---- /proc/<pid>/fd/<n> magic links -----------------------------------
+
+    #[test]
+    fn a_proc_fd_link_is_untrusted_however_it_is_spelled() {
+        let _g = start();
+        // All four of these are the same file to the loader. Only the first
+        // was a magic link as far as hunter was concerned, because the test
+        // ran on the raw path while everything around it ran on the canonical
+        // one.
+        for p in [
+            "/proc/self/fd/3",
+            "//proc/self/fd/3",
+            "/bin/../proc/self/fd/3",
+            "/./proc/1234/fd/7",
+        ] {
+            assert!(is_untrusted_exec_path(p), "should be untrusted: {}", p);
+            assert!(
+                is_world_writable_exec_path(p),
+                "should not be auto-trustable: {}",
+                p
+            );
+        }
+        // And an ordinary /proc path is not one.
+        assert!(!is_world_writable_exec_path("/proc/self/exe"));
+    }
+
+    #[test]
+    fn a_disguised_proc_fd_link_is_never_learned() {
+        let _g = start();
+        // This is what the miss cost. The kernel boots with learning on (see
+        // linux-object's /etc/hunter loader), a magic link is not in any
+        // world-writable directory, so the first exec of one put
+        // `/proc/self/fd/3` into the permanent trusted allowlist -- after
+        // which any process could execute whatever inode it had open there.
+        set_exec_learning(true);
+        assert!(learn_exec_path("/bin/sh"), "a real program is learnable");
+        // The learning gate in `check_exec_path` is this predicate, so it is
+        // the one that has to see through the spelling.
+        for p in [
+            "/proc/self/fd/3",
+            "//proc/self/fd/3",
+            "/bin/../proc/self/fd/3",
+        ] {
+            assert!(
+                is_world_writable_exec_path(p),
+                "must never be auto-trusted: {}",
+                p
+            );
+        }
+        assert!(!is_exec_listed("/proc/self/fd/3"));
+        assert_eq!(learned_exec_count(), 1);
+    }
+
+    // ---- the tighten-only latch beyond the four mode words ----------------
+
+    #[test]
+    fn the_latch_still_refuses_to_relax_a_mode() {
+        let _g = start();
+        set_exec_mode(Mode::Enforce);
+        seal_tighten_only();
+        set_exec_mode(Mode::Off);
+        assert_eq!(exec_mode(), Mode::Enforce);
+    }
+
+    #[test]
+    fn the_latch_refuses_to_trust_a_new_directory_or_program() {
+        let _g = start();
+        add_trusted_exec_prefix(String::from("/bin/"));
+        seal_tighten_only();
+        // "/" would trust the entire filesystem while /proc/hunter still reads
+        // `exec=enforce`, which is the quiet part.
+        add_trusted_exec_prefix(String::from("/"));
+        add_trusted_exec_path(String::from("/tmp/payload"));
+        assert_eq!(trusted_exec_count(), 1);
+        assert!(!is_exec_listed("/tmp/payload"));
+        assert!(is_exec_listed("/bin/ls"));
+    }
+
+    #[test]
+    fn the_latch_refuses_to_empty_the_allowlist() {
+        let _g = start();
+        add_trusted_exec_path(String::from("/bin/sh"));
+        seal_tighten_only();
+        clear_trusted_exec();
+        assert!(exec_allowlist_active());
+        assert_eq!(trusted_exec_count(), 1);
+    }
+
+    #[test]
+    fn the_latch_refuses_to_turn_learning_on_but_lets_it_be_turned_off() {
+        let _g = start();
+        seal_tighten_only();
+        set_exec_learning(true);
+        assert!(
+            !exec_learning_enabled(),
+            "learning never denies; turning it on is a relaxation"
+        );
+        // A system sealed with learning already on can still tighten.
+        reset_for_test();
+        set_exec_learning(true);
+        seal_tighten_only();
+        set_exec_learning(false);
+        assert!(!exec_learning_enabled());
+    }
+
+    #[test]
+    fn the_latch_stops_the_allowlist_growing_by_learning() {
+        let _g = start();
+        set_exec_learning(true);
+        assert!(learn_exec_path("/bin/sh"));
+        seal_tighten_only();
+        assert!(!learn_exec_path("/opt/app/new"));
+        assert_eq!(learned_exec_count(), 1);
+        assert!(!is_exec_listed("/opt/app/new"));
+    }
+
+    #[test]
+    fn the_latch_refuses_to_drop_the_default_syscall_whitelist() {
+        let _g = start();
+        set_default_whitelist(Some(alloc::vec![1, 2, 3]));
+        seal_tighten_only();
+        set_default_whitelist(None);
+        apply_default_policy(77);
+        assert!(is_syscall_allowed(77, 1).is_ok());
+        assert!(
+            is_syscall_allowed(77, 9).is_err(),
+            "the default whitelist must survive the latch"
+        );
+        // Replacing one list with another may tighten or relax; that call is
+        // the operator's, so the latch does not take it away.
+        set_default_whitelist(Some(alloc::vec![9]));
+        apply_default_policy(78);
+        assert!(is_syscall_allowed(78, 9).is_ok());
+        assert!(is_syscall_allowed(78, 1).is_err());
+        remove_policy(77);
+        remove_policy(78);
+    }
+
+    #[test]
+    fn the_latch_does_not_stand_in_the_way_of_tightening() {
+        let _g = start();
+        seal_tighten_only();
+        add_blacklisted_exec_prefix(String::from("/opt/danger/"));
+        add_blacklisted_exec_path(String::from("/usr/bin/evil"));
+        add_untrusted_exec_prefix(String::from("/srv/upload/"));
+        assert!(is_exec_blacklisted("/opt/danger/x"));
+        assert!(is_exec_blacklisted("/usr/bin/evil"));
+        assert!(is_untrusted_exec_path("/srv/upload/x"));
+    }
+
+    #[test]
+    fn the_latch_does_not_stand_in_the_way_of_a_process_exiting() {
+        let _g = start();
+        register_policy(88, alloc::vec![1]);
+        seal_tighten_only();
+        assert_eq!(active_policy_count(), 1);
+        // Teardown is not a policy change. Gating it would leak one whitelist
+        // per process for the rest of the uptime, and hand a recycled pid the
+        // dead process's policy.
+        remove_policy(88);
+        assert_eq!(active_policy_count(), 0);
+        // And a fresh process can still be given one.
+        register_policy(89, alloc::vec![1]);
+        inherit_policy(89, 90);
+        assert!(is_syscall_allowed(90, 2).is_err());
+        remove_policy(89);
+        remove_policy(90);
+    }
 }
