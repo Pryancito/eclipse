@@ -861,8 +861,11 @@ mod elf_bounds_tests {
     #[derive(Clone, Copy, Default)]
     struct Phdr {
         p_type: u32,
+        /// `p_flags`: the R/W/X bits the mapper turns into page permissions.
+        flags: u32,
         offset: u64,
         virtual_addr: u64,
+        physical_addr: u64,
         file_size: u64,
         mem_size: u64,
     }
@@ -956,8 +959,10 @@ mod elf_bounds_tests {
             for (i, ph) in self.phdrs.iter().enumerate() {
                 let at = ph_table + i * PHDR_SIZE;
                 v[at..at + 4].copy_from_slice(&ph.p_type.to_le_bytes());
+                v[at + 4..at + 8].copy_from_slice(&ph.flags.to_le_bytes());
                 v[at + 8..at + 16].copy_from_slice(&ph.offset.to_le_bytes());
                 v[at + 16..at + 24].copy_from_slice(&ph.virtual_addr.to_le_bytes());
+                v[at + 24..at + 32].copy_from_slice(&ph.physical_addr.to_le_bytes());
                 v[at + 32..at + 40].copy_from_slice(&ph.file_size.to_le_bytes());
                 v[at + 40..at + 48].copy_from_slice(&ph.mem_size.to_le_bytes());
             }
@@ -1326,6 +1331,7 @@ mod elf_bounds_tests {
     }
 
     /// `sh_type` values this tree's loader meets.
+    const SHT_PROGBITS_: u32 = 1;
     const SHT_SYMTAB: u32 = 2;
     const SHT_STRTAB: u32 = 3;
     const SHT_RELA: u32 = 4;
@@ -1661,5 +1667,380 @@ mod elf_bounds_tests {
         assert_eq!(load(0x1200, u64::MAX - 0x100), Some(ZxError::INVALID_ARGS));
         // An ordinary segment still loads.
         assert_eq!(load(0x1000, 0x2000), None);
+    }
+
+    /// One `Elf64_Rela`: `r_offset`, then `r_info` as `(symbol index << 32) |
+    /// type`, then the signed `r_addend`.
+    fn rela(offset: u64, sym: u32, ty: u32, addend: i64) -> [u8; 24] {
+        let mut e = [0u8; 24];
+        e[..8].copy_from_slice(&offset.to_le_bytes());
+        e[8..16].copy_from_slice(&(((sym as u64) << 32) | ty as u64).to_le_bytes());
+        e[16..24].copy_from_slice(&addend.to_le_bytes());
+        e
+    }
+
+    /// R_X86_64_RELATIVE and R_X86_64_GLOB_DAT: one relocation that writes
+    /// `B + A` and one that writes `S + A`.
+    const R_RELATIVE: u32 = 8;
+    const R_GLOB_DAT: u32 = 6;
+
+    /// An image mapped somewhere other than zero, which is where the ELF
+    /// interpreter of every dynamically linked program ends up: it is loaded
+    /// after the main image, so its base is not zero, and that is what it
+    /// takes for the relocation arithmetic to go past the end.
+    fn image_vmar() -> (Arc<VmAddressRegion>, Arc<VmAddressRegion>) {
+        let root = VmAddressRegion::new_root();
+        let image = root
+            .allocate_at(0x10_0000, 0x4000, VmarFlags::CAN_MAP_RXW, PAGE_SIZE)
+            .unwrap();
+        image
+            .map_at(0, VmObject::new_paged(1), 0, PAGE_SIZE, MMUFlags::RXW)
+            .unwrap();
+        (root, image)
+    }
+
+    /// The word a relocation left at `image.addr() + offset`.
+    fn word_at(image: &Arc<VmAddressRegion>, offset: usize) -> usize {
+        let mut buf = [0u8; core::mem::size_of::<usize>()];
+        image.read_memory(image.addr() + offset, &mut buf).unwrap();
+        usize::from_ne_bytes(buf)
+    }
+
+    /// `base + r_offset` says WHERE a relocation writes, and both halves come
+    /// from outside: `r_offset` is a `u64` the file chose and `base` is
+    /// wherever the image was mapped. It was an unchecked add, reached once
+    /// per entry by every dynamically linked program, and a `u64` near the top
+    /// of the range panicked the kernel from `execve` on. In release it
+    /// wrapped instead, and a wrapped address can still land inside another of
+    /// the process's own mappings, which is a word written somewhere nobody
+    /// asked for.
+    #[test]
+    fn a_relocation_target_that_does_not_fit_is_an_error_not_a_panic() {
+        let (root, image) = image_vmar();
+        for entry in [
+            rela(u64::MAX, 0, R_RELATIVE, 0),
+            rela(u64::MAX, 0, R_GLOB_DAT, 0),
+        ] {
+            let bytes = with_sections(&[
+                (".rela.dyn", SHT_RELA, &entry),
+                (".dynsym", SHT_DYNSYM, &symbol(1, 0x20)),
+                (".dynstr", SHT_STRTAB, b"\0entry\0"),
+            ]);
+            let elf = parse_checked_elf(&bytes).unwrap();
+            assert_eq!(
+                elf.relocate(image.clone(), &root),
+                Err("relocation target outside the address space")
+            );
+        }
+        // And one that does fit still lands.
+        let bytes = with_sections(&[(".rela.dyn", SHT_RELA, &rela(0x10, 0, R_RELATIVE, 0x20))]);
+        let elf = parse_checked_elf(&bytes).unwrap();
+        assert_eq!(elf.relocate(image.clone(), &root), Ok(()));
+        assert_eq!(word_at(&image, 0x10), image.addr() + 0x20);
+    }
+
+    /// The VALUE a relocation writes is ABI arithmetic, not an address, and it
+    /// is allowed to wrap: `r_addend` is SIGNED, a negative one is ordinary in
+    /// a real object, and the dynamic linkers this loader stands in for
+    /// compute `B + A` in plain C. Bounding it like the target would reject
+    /// objects that work everywhere else -- so the two are checked
+    /// differently, on purpose.
+    #[test]
+    fn a_negative_addend_is_ordinary_arithmetic_not_an_error() {
+        let (root, image) = image_vmar();
+        let bytes = with_sections(&[(".rela.dyn", SHT_RELA, &rela(0x10, 0, R_RELATIVE, -8))]);
+        let elf = parse_checked_elf(&bytes).unwrap();
+        assert_eq!(elf.relocate(image.clone(), &root), Ok(()));
+        assert_eq!(word_at(&image, 0x10), image.addr().wrapping_sub(8));
+
+        // Same for the symbol-resolving form: `S + A` with the symbol at 0x20.
+        let bytes = with_sections(&[
+            (".rela.dyn", SHT_RELA, &rela(0x18, 0, R_GLOB_DAT, -8)),
+            (".dynsym", SHT_DYNSYM, &symbol(1, 0x20)),
+            (".dynstr", SHT_STRTAB, b"\0entry\0"),
+        ]);
+        let elf = parse_checked_elf(&bytes).unwrap();
+        assert_eq!(elf.relocate(image.clone(), &root), Ok(()));
+        assert_eq!(word_at(&image, 0x18), image.addr() + 0x20 - 8);
+    }
+
+    /// `st_value` is a `u64` from the file too, and it is added to the base
+    /// the same way. It is a value, so it wraps rather than being rejected --
+    /// but it used to panic the kernel before it could do either.
+    #[test]
+    fn a_symbol_value_that_does_not_fit_wraps_instead_of_panicking() {
+        let (root, image) = image_vmar();
+        let bytes = with_sections(&[
+            (".rela.dyn", SHT_RELA, &rela(0x10, 0, R_GLOB_DAT, 0)),
+            (".dynsym", SHT_DYNSYM, &symbol(1, u64::MAX)),
+            (".dynstr", SHT_STRTAB, b"\0entry\0"),
+        ]);
+        let elf = parse_checked_elf(&bytes).unwrap();
+        assert_eq!(elf.relocate(image.clone(), &root), Ok(()));
+        assert_eq!(word_at(&image, 0x10), image.addr().wrapping_sub(1));
+    }
+
+    /// `get_phdr_vaddr` answers the `AT_PHDR` the dynamic linker reads its own
+    /// program headers from. When the image carries no `PT_PHDR` it is
+    /// inferred as `p_vaddr + e_phoff` of the segment at file offset 0 -- two
+    /// more numbers from the file, added without a check. A `PT_LOAD` at
+    /// offset 0 with a `p_vaddr` near the top panicked the kernel; not having
+    /// an address to give is a case this already handles.
+    #[test]
+    fn an_inferred_phdr_address_that_does_not_fit_is_no_phdr() {
+        let inferred = |virtual_addr| {
+            let image = Elf::new()
+                .phdr(Phdr {
+                    p_type: 1, // PT_LOAD
+                    offset: 0,
+                    virtual_addr,
+                    ..Default::default()
+                })
+                .build();
+            ElfFile::new(&image).unwrap().get_phdr_vaddr()
+        };
+        // `e_phoff` is the header size, since the table follows the header.
+        assert_eq!(inferred(0x40_0000), Some(0x40_0000 + EHDR_SIZE as u64));
+        assert_eq!(inferred(u64::MAX), None);
+        assert_eq!(inferred(u64::MAX - EHDR_SIZE as u64 + 1), None);
+        assert_eq!(
+            inferred(u64::MAX - EHDR_SIZE as u64),
+            Some(u64::MAX - EHDR_SIZE as u64 + EHDR_SIZE as u64)
+        );
+
+        // A declared `PT_PHDR` is used as it stands, with no arithmetic at all.
+        let image = Elf::new()
+            .phdr(Phdr {
+                p_type: 6, // PT_PHDR
+                virtual_addr: 0x1234,
+                ..Default::default()
+            })
+            .phdr(Phdr {
+                p_type: 1,
+                offset: 0,
+                virtual_addr: 0x40_0000,
+                ..Default::default()
+            })
+            .build();
+        assert_eq!(ElfFile::new(&image).unwrap().get_phdr_vaddr(), Some(0x1234));
+
+        // And an image with neither has no phdr to name.
+        let image = Elf::new()
+            .phdr(Phdr {
+                p_type: 1,
+                offset: 0x40,
+                virtual_addr: 0x40_0000,
+                ..Default::default()
+            })
+            .build();
+        assert_eq!(ElfFile::new(&image).unwrap().get_phdr_vaddr(), None);
+    }
+
+    /// A symbol the file declares but does not define (`st_shndx == 0`): the
+    /// dynamic linker resolves it in user space, so the kernel leaves it.
+    fn undefined_symbol(name: u32) -> [u8; 24] {
+        let mut sym = symbol(name, 0x20);
+        sym[6..8].copy_from_slice(&0u16.to_le_bytes());
+        sym
+    }
+
+    /// `.rela.plt` holds the JUMP_SLOT entries behind the procedure linkage
+    /// table. Walking only `.rela.dyn` leaves every call going through an
+    /// unrelocated stub, which showed up as a jump to a low address and an
+    /// Invalid Opcode fault.
+    #[test]
+    fn the_plt_relocations_are_applied_as_well_as_the_dynamic_ones() {
+        let (root, image) = image_vmar();
+        let bytes = with_sections(&[
+            (".rela.dyn", SHT_RELA, &rela(0x10, 0, R_RELATIVE, 0x11)),
+            (".rela.plt", SHT_RELA, &rela(0x20, 0, R_RELATIVE, 0x22)),
+        ]);
+        let elf = parse_checked_elf(&bytes).unwrap();
+        assert_eq!(elf.relocate(image.clone(), &root), Ok(()));
+        assert_eq!(word_at(&image, 0x10), image.addr() + 0x11);
+        assert_eq!(word_at(&image, 0x20), image.addr() + 0x22);
+    }
+
+    /// Everything this loop can be handed and does not act on. None of it is
+    /// fatal: a relocation type it does not implement (a TLS one, say) used to
+    /// be `unimplemented!()`, which panicked the whole kernel over one user
+    /// program, and a symbol relocation in an object with no `.dynsym` has
+    /// nothing to resolve against.
+    #[test]
+    fn what_the_relocation_loop_cannot_act_on_is_skipped_not_fatal() {
+        let (root, image) = image_vmar();
+
+        // An unsupported type, next to one that works.
+        let mut entries = rela(0x10, 0, 99, 0x11).to_vec();
+        entries.extend_from_slice(&rela(0x20, 0, R_RELATIVE, 0x22));
+        let bytes = with_sections(&[(".rela.dyn", SHT_RELA, &entries)]);
+        let elf = parse_checked_elf(&bytes).unwrap();
+        assert_eq!(elf.relocate(image.clone(), &root), Ok(()));
+        assert_eq!(word_at(&image, 0x10), 0);
+        assert_eq!(word_at(&image, 0x20), image.addr() + 0x22);
+
+        // A symbol relocation with no `.dynsym` to resolve against. The
+        // base-relative entry beside it still lands: an object that carries
+        // only those is the ordinary case for a PIE with no imports.
+        let (root, image) = image_vmar();
+        let mut entries = rela(0x10, 0, R_GLOB_DAT, 0x11).to_vec();
+        entries.extend_from_slice(&rela(0x20, 0, R_RELATIVE, 0x22));
+        let bytes = with_sections(&[(".rela.dyn", SHT_RELA, &entries)]);
+        let elf = parse_checked_elf(&bytes).unwrap();
+        assert_eq!(elf.relocate(image.clone(), &root), Ok(()));
+        assert_eq!(word_at(&image, 0x10), 0);
+        assert_eq!(word_at(&image, 0x20), image.addr() + 0x22);
+
+        // A symbol the object declares but does not define is user space's to
+        // resolve, not this loader's.
+        let (root, image) = image_vmar();
+        let bytes = with_sections(&[
+            (".rela.dyn", SHT_RELA, &rela(0x10, 0, R_GLOB_DAT, 0)),
+            (".dynsym", SHT_DYNSYM, &undefined_symbol(1)),
+            (".dynstr", SHT_STRTAB, b"\0memcpy\0"),
+        ]);
+        let elf = parse_checked_elf(&bytes).unwrap();
+        assert_eq!(elf.relocate(image.clone(), &root), Ok(()));
+        assert_eq!(word_at(&image, 0x10), 0);
+    }
+
+    /// What the caller is told when there was nothing to do, and when there
+    /// was something it could not read. The difference matters: a missing
+    /// `.rela.dyn` is the normal case for a non-PIE static binary, and the
+    /// caller logs it and carries on.
+    #[test]
+    fn an_object_with_no_relocations_is_told_apart_from_a_corrupted_one() {
+        let (root, image) = image_vmar();
+
+        // Nothing to relocate at all.
+        let bytes = with_sections(&[(".text", SHT_PROGBITS_, b"\x90")]);
+        let elf = parse_checked_elf(&bytes).unwrap();
+        assert_eq!(
+            elf.relocate(image.clone(), &root),
+            Err(".rela.dyn not found")
+        );
+
+        // A `.rela.dyn` that does not divide into whole entries: the parser
+        // asserts on that, so it never gets to.
+        let ragged = &rela(0x10, 0, R_RELATIVE, 0x11)[..23];
+        let bytes = with_sections(&[(".rela.dyn", SHT_RELA, ragged)]);
+        let elf = parse_checked_elf(&bytes).unwrap();
+        assert_eq!(
+            elf.relocate(image.clone(), &root),
+            Err("corrupted relocation section")
+        );
+
+        // An empty one is not corrupt, it is empty.
+        let bytes = with_sections(&[(".rela.dyn", SHT_RELA, &[])]);
+        let elf = parse_checked_elf(&bytes).unwrap();
+        assert_eq!(elf.relocate(image.clone(), &root), Ok(()));
+    }
+
+    /// Relocation targets cluster in one or two mappings, so the loop keeps
+    /// the last mapping it wrote through instead of re-scanning the VMAR for
+    /// every entry. The cache has to be asked whether it still contains the
+    /// address, not assumed: a stale hit would write a word into a mapping
+    /// that the relocation had nothing to do with.
+    #[test]
+    fn the_mapping_cache_never_writes_through_the_wrong_mapping() {
+        let root = VmAddressRegion::new_root();
+        let image = root
+            .allocate_at(0x10_0000, 0x4000, VmarFlags::CAN_MAP_RXW, PAGE_SIZE)
+            .unwrap();
+        // Two separate mappings, a page apart, with a hole between them.
+        image
+            .map_at(0, VmObject::new_paged(1), 0, PAGE_SIZE, MMUFlags::RXW)
+            .unwrap();
+        image
+            .map_at(0x2000, VmObject::new_paged(1), 0, PAGE_SIZE, MMUFlags::RXW)
+            .unwrap();
+
+        // Alternate between them so a cache that never re-checks gets it wrong
+        // on the second entry, and finish in the hole, which belongs to
+        // neither.
+        let mut entries = rela(0x0010, 0, R_RELATIVE, 0xa1).to_vec();
+        entries.extend_from_slice(&rela(0x2010, 0, R_RELATIVE, 0xb2));
+        entries.extend_from_slice(&rela(0x0020, 0, R_RELATIVE, 0xc3));
+        entries.extend_from_slice(&rela(0x2020, 0, R_RELATIVE, 0xd4));
+        let bytes = with_sections(&[(".rela.dyn", SHT_RELA, &entries)]);
+        let elf = parse_checked_elf(&bytes).unwrap();
+        assert_eq!(elf.relocate(image.clone(), &root), Ok(()));
+        assert_eq!(word_at(&image, 0x0010), image.addr() + 0xa1);
+        assert_eq!(word_at(&image, 0x2010), image.addr() + 0xb2);
+        assert_eq!(word_at(&image, 0x0020), image.addr() + 0xc3);
+        assert_eq!(word_at(&image, 0x2020), image.addr() + 0xd4);
+
+        // An address in the hole is in no mapping at all, cache or not.
+        let bytes = with_sections(&[(".rela.dyn", SHT_RELA, &rela(0x1010, 0, R_RELATIVE, 0))]);
+        let elf = parse_checked_elf(&bytes).unwrap();
+        assert_eq!(elf.relocate(image.clone(), &root), Err("Invalid Vmar"));
+    }
+
+    /// `p_flags` is what the file asks for and `to_mmu_flags` is the whole
+    /// translation: a segment mapped writable that asked to be read-only is a
+    /// W^X hole, and one mapped without `USER` is a segment the program cannot
+    /// reach at all.
+    #[test]
+    fn a_segments_page_permissions_are_the_ones_its_header_asked_for() {
+        // PF_X = 1, PF_W = 2, PF_R = 4.
+        let flags_of = |p_flags: u32| {
+            let image = Elf::new()
+                .phdr(Phdr {
+                    p_type: 1, // PT_LOAD
+                    flags: p_flags,
+                    virtual_addr: 0x1000,
+                    mem_size: 0x1000,
+                    ..Default::default()
+                })
+                .build();
+            let elf = ElfFile::new(&image).unwrap();
+            let vmar = VmAddressRegion::new_root();
+            vmar.load_from_elf(&elf).unwrap();
+            vmar.find_mapping(0x1000)
+                .unwrap()
+                .get_flags(0x1000)
+                .unwrap()
+        };
+        let user = MMUFlags::USER;
+        assert_eq!(flags_of(4), user | MMUFlags::READ);
+        assert_eq!(flags_of(6), user | MMUFlags::READ | MMUFlags::WRITE);
+        assert_eq!(flags_of(5), user | MMUFlags::READ | MMUFlags::EXECUTE);
+        assert_eq!(
+            flags_of(7),
+            user | MMUFlags::READ | MMUFlags::WRITE | MMUFlags::EXECUTE
+        );
+        // Read-only means read-only: no write bit arrives from anywhere else.
+        assert!(!flags_of(4).contains(MMUFlags::WRITE));
+        assert!(!flags_of(4).contains(MMUFlags::EXECUTE));
+        // Every segment belongs to the program, whatever else it asked for.
+        assert!(flags_of(0).contains(MMUFlags::USER));
+        // A segment that asked for nothing gets nothing but that.
+        assert_eq!(flags_of(0), user);
+    }
+
+    /// A relocation whose word straddles the end of its mapping. The fast path
+    /// refuses it (it writes all or nothing), so the loop falls back to the
+    /// VMAR, which clamps and writes the part that fits -- half a relocated
+    /// word, reported as success. Pinned rather than changed: it is the
+    /// behaviour every caller has had, and a straddling relocation is a
+    /// malformed object either way.
+    #[test]
+    fn a_relocation_straddling_the_end_of_its_mapping_is_written_in_part() {
+        let root = VmAddressRegion::new_root();
+        let image = root
+            .allocate_at(0x10_0000, 0x4000, VmarFlags::CAN_MAP_RXW, PAGE_SIZE)
+            .unwrap();
+        image
+            .map_at(0, VmObject::new_paged(1), 0, PAGE_SIZE, MMUFlags::RXW)
+            .unwrap();
+        // Four bytes from the end of the only page, so a `usize` runs over.
+        let at = PAGE_SIZE - 4;
+        let bytes = with_sections(&[(".rela.dyn", SHT_RELA, &rela(at as u64, 0, R_RELATIVE, 0))]);
+        let elf = parse_checked_elf(&bytes).unwrap();
+        assert_eq!(elf.relocate(image.clone(), &root), Ok(()));
+        // The low half of the value landed; the high half went nowhere.
+        let mut buf = [0u8; 4];
+        image.read_memory(image.addr() + at, &mut buf).unwrap();
+        assert_eq!(buf, image.addr().to_ne_bytes()[..4]);
     }
 }

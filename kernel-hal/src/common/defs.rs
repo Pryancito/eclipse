@@ -36,161 +36,176 @@ numeric_enum! {
     }
 }
 
-cfg_if! {
-    if #[cfg(target_arch = "aarch64")] {
-        #[derive(Debug, PartialEq, Eq, Copy, Clone)]
-        pub enum Kind {
-            Synchronous = 0,
-            Irq = 1,
-            Fiq = 2,
-            SError = 3,
+// The AArch64 exception-syndrome decoding. Compiled everywhere, not only on
+// aarch64: it is pure integer decoding of what the architecture puts in
+// `ESR_EL1`, with no register access and nothing target-specific about it, and
+// behind a `cfg` it was code that only the machine it runs on could check.
+#[derive(Debug, PartialEq, Eq, Copy, Clone)]
+pub enum Kind {
+    Synchronous = 0,
+    Irq = 1,
+    Fiq = 2,
+    SError = 3,
+}
+
+impl Kind {
+    /// The exception kind a vector-table entry number names, or `None` if it
+    /// names none of them.
+    ///
+    /// This used to `panic!("bad kind")`, from inside the trap handler, on a
+    /// number nobody had checked -- and a panic taken on the way *into* the
+    /// trap handler has no context left to report from. There are four kinds
+    /// and the caller decides what an unknown one deserves.
+    pub fn from_num(x: usize) -> Option<Kind> {
+        match x {
+            x if x == Kind::Synchronous as usize => Some(Kind::Synchronous),
+            x if x == Kind::Irq as usize => Some(Kind::Irq),
+            x if x == Kind::Fiq as usize => Some(Kind::Fiq),
+            x if x == Kind::SError as usize => Some(Kind::SError),
+            _ => None,
         }
+    }
+}
 
-        impl Kind {
-            pub fn from(x: usize) -> Kind {
-                match x {
-                    x if x == Kind::Synchronous as usize => Kind::Synchronous,
-                    x if x == Kind::Irq as usize => Kind::Irq,
-                    x if x == Kind::Fiq as usize => Kind::Fiq,
-                    x if x == Kind::SError as usize => Kind::SError,
-                    _ => panic!("bad kind"),
-                }
-            }
+#[derive(Debug, PartialEq, Eq, Copy, Clone)]
+pub enum Source {
+    CurrentSpEl0 = 0,
+    CurrentSpElx = 1,
+    LowerAArch64 = 2,
+    LowerAArch32 = 3,
+}
+
+impl Source {
+    /// Which exception level, and which stack pointer, the exception came
+    /// from; `None` if the number names none of the four. Same reasoning as
+    /// [`Kind::from_num`].
+    pub fn from_num(x: usize) -> Option<Source> {
+        match x {
+            x if x == Source::CurrentSpEl0 as usize => Some(Source::CurrentSpEl0),
+            x if x == Source::CurrentSpElx as usize => Some(Source::CurrentSpElx),
+            x if x == Source::LowerAArch64 as usize => Some(Source::LowerAArch64),
+            x if x == Source::LowerAArch32 as usize => Some(Source::LowerAArch32),
+            _ => None,
         }
+    }
 
-        #[derive(Debug, PartialEq, Eq, Copy, Clone)]
-        pub enum Source {
-            CurrentSpEl0 = 0,
-            CurrentSpElx = 1,
-            LowerAArch64 = 2,
-            LowerAArch32 = 3,
+    /// Whether the exception came from a lower exception level, i.e. from
+    /// user code rather than from the kernel.
+    pub fn is_user(self) -> bool {
+        matches!(self, Source::LowerAArch64 | Source::LowerAArch32)
+    }
+}
+
+#[derive(Debug, PartialEq, Eq, Copy, Clone)]
+pub struct Info {
+    pub source: Source,
+    pub kind: Kind,
+}
+
+#[derive(Debug, PartialEq, Eq, Copy, Clone)]
+pub enum Fault {
+    AddressSize,
+    Translation,
+    AccessFlag,
+    Permission,
+    Alignment,
+    TlbConflict,
+    Other(u8),
+}
+
+impl From<u32> for Fault {
+    fn from(val: u32) -> Fault {
+        use self::Fault::*;
+
+        // IFSC or DFSC bits (ref: D10.2.39, Page 2457~2464).
+        match val & 0b111100 {
+            0b000000 => AddressSize,
+            0b000100 => Translation,
+            0b001000 => AccessFlag,
+            0b001100 => Permission,
+            0b100000 => Alignment,
+            0b110000 => TlbConflict,
+            _ => Other((val & 0b111111) as u8),
         }
+    }
+}
 
-        impl Source {
-            pub fn from(x: usize) -> Source {
-                match x {
-                    x if x == Source::CurrentSpEl0 as usize => Source::CurrentSpEl0,
-                    x if x == Source::CurrentSpElx as usize => Source::CurrentSpElx,
-                    x if x == Source::LowerAArch64 as usize => Source::LowerAArch64,
-                    x if x == Source::LowerAArch32 as usize => Source::LowerAArch32,
-                    _ => panic!("bad kind"),
-                }
-            }
+#[derive(Debug, PartialEq, Eq, Copy, Clone)]
+pub enum Syndrome {
+    Unknown,
+    WfiWfe,
+    McrMrc,
+    McrrMrrc,
+    LdcStc,
+    SimdFp,
+    Vmrs,
+    Mrrc,
+    IllegalExecutionState,
+    Svc(u16),
+    Hvc(u16),
+    Smc(u16),
+    MsrMrsSystem,
+    InstructionAbort { kind: Fault, level: u8 },
+    PCAlignmentFault,
+    DataAbort { kind: Fault, level: u8 },
+    SpAlignmentFault,
+    TrappedFpu,
+    SError,
+    Breakpoint,
+    Step,
+    Watchpoint,
+    Brk(u16),
+    Other(u32),
+}
+
+/// Converts a raw syndrome value (ESR) into a `Syndrome` (ref: D1.10.4, D10.2.39).
+impl From<u32> for Syndrome {
+    fn from(esr: u32) -> Syndrome {
+        use self::Syndrome::*;
+
+        let ec = esr >> 26;
+        let iss = esr & 0xFFFFFF;
+
+        match ec {
+            0b000000 => Unknown,
+            0b000001 => WfiWfe,
+            0b000011 => McrMrc,
+            0b000100 => McrrMrrc,
+            0b000101 => McrMrc,
+            0b000110 => LdcStc,
+            0b000111 => SimdFp,
+            0b001000 => Vmrs,
+            0b001100 => Mrrc,
+            0b001110 => IllegalExecutionState,
+            0b010001 => Svc((iss & 0xFFFF) as u16),
+            0b010010 => Hvc((iss & 0xFFFF) as u16),
+            0b010011 => Smc((iss & 0xFFFF) as u16),
+            0b010101 => Svc((iss & 0xFFFF) as u16),
+            0b010110 => Hvc((iss & 0xFFFF) as u16),
+            0b010111 => Smc((iss & 0xFFFF) as u16),
+            0b011000 => MsrMrsSystem,
+            0b100000 | 0b100001 => InstructionAbort {
+                kind: Fault::from(iss),
+                level: (iss & 0b11) as u8,
+            },
+            0b100010 => PCAlignmentFault,
+            0b100100 | 0b100101 => DataAbort {
+                kind: Fault::from(iss),
+                level: (iss & 0b11) as u8,
+            },
+            0b100110 => SpAlignmentFault,
+            0b101000 => TrappedFpu,
+            0b101100 => TrappedFpu,
+            0b101111 => SError,
+            0b110000 => Breakpoint,
+            0b110001 => Breakpoint,
+            0b110010 => Step,
+            0b110011 => Step,
+            0b110100 => Watchpoint,
+            0b110101 => Watchpoint,
+            0b111100 => Brk((iss & 0xFFFF) as u16),
+            other => Other(other),
         }
-
-        #[derive(Debug, PartialEq, Eq, Copy, Clone)]
-        pub struct Info {
-            pub source: Source,
-            pub kind: Kind,
-        }
-
-        #[derive(Debug, PartialEq, Eq, Copy, Clone)]
-        pub enum Fault {
-            AddressSize,
-            Translation,
-            AccessFlag,
-            Permission,
-            Alignment,
-            TlbConflict,
-            Other(u8),
-        }
-
-        impl From<u32> for Fault {
-            fn from(val: u32) -> Fault {
-                use self::Fault::*;
-
-                // IFSC or DFSC bits (ref: D10.2.39, Page 2457~2464).
-                match val & 0b111100 {
-                    0b000000 => AddressSize,
-                    0b000100 => Translation,
-                    0b001000 => AccessFlag,
-                    0b001100 => Permission,
-                    0b100000 => Alignment,
-                    0b110000 => TlbConflict,
-                    _ => Other((val & 0b111111) as u8),
-                }
-            }
-        }
-
-        #[derive(Debug, PartialEq, Eq, Copy, Clone)]
-        pub enum Syndrome {
-            Unknown,
-            WfiWfe,
-            McrMrc,
-            McrrMrrc,
-            LdcStc,
-            SimdFp,
-            Vmrs,
-            Mrrc,
-            IllegalExecutionState,
-            Svc(u16),
-            Hvc(u16),
-            Smc(u16),
-            MsrMrsSystem,
-            InstructionAbort { kind: Fault, level: u8 },
-            PCAlignmentFault,
-            DataAbort { kind: Fault, level: u8 },
-            SpAlignmentFault,
-            TrappedFpu,
-            SError,
-            Breakpoint,
-            Step,
-            Watchpoint,
-            Brk(u16),
-            Other(u32),
-        }
-
-        /// Converts a raw syndrome value (ESR) into a `Syndrome` (ref: D1.10.4, D10.2.39).
-        impl From<u32> for Syndrome {
-            fn from(esr: u32) -> Syndrome {
-                use self::Syndrome::*;
-
-                let ec = esr >> 26;
-                let iss = esr & 0xFFFFFF;
-
-                match ec {
-                    0b000000 => Unknown,
-                    0b000001 => WfiWfe,
-                    0b000011 => McrMrc,
-                    0b000100 => McrrMrrc,
-                    0b000101 => McrMrc,
-                    0b000110 => LdcStc,
-                    0b000111 => SimdFp,
-                    0b001000 => Vmrs,
-                    0b001100 => Mrrc,
-                    0b001110 => IllegalExecutionState,
-                    0b010001 => Svc((iss & 0xFFFF) as u16),
-                    0b010010 => Hvc((iss & 0xFFFF) as u16),
-                    0b010011 => Smc((iss & 0xFFFF) as u16),
-                    0b010101 => Svc((iss & 0xFFFF) as u16),
-                    0b010110 => Hvc((iss & 0xFFFF) as u16),
-                    0b010111 => Smc((iss & 0xFFFF) as u16),
-                    0b011000 => MsrMrsSystem,
-                    0b100000 | 0b100001 => InstructionAbort {
-                        kind: Fault::from(iss),
-                        level: (iss & 0b11) as u8,
-                    },
-                    0b100010 => PCAlignmentFault,
-                    0b100100 | 0b100101 => DataAbort {
-                        kind: Fault::from(iss),
-                        level: (iss & 0b11) as u8,
-                    },
-                    0b100110 => SpAlignmentFault,
-                    0b101000 => TrappedFpu,
-                    0b101100 => TrappedFpu,
-                    0b101111 => SError,
-                    0b110000 => Breakpoint,
-                    0b110001 => Breakpoint,
-                    0b110010 => Step,
-                    0b110011 => Step,
-                    0b110100 => Watchpoint,
-                    0b110101 => Watchpoint,
-                    0b111100 => Brk((iss & 0xFFFF) as u16),
-                    other => Other(other),
-                }
-            }
-        }
-
     }
 }
 

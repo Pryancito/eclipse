@@ -3263,6 +3263,25 @@ pub const USER_STACK_PAGES: usize = 128;
 mod tests {
     use super::*;
 
+    /// Lets go of a thread this test parked, however the test ends.
+    ///
+    /// Four tests here block a scoped thread on a channel and release it at
+    /// the end. But `std::thread::scope` joins on the way out, so an
+    /// assertion that fails before the release never reaches it and the
+    /// scope waits for a thread that will never wake: the test **hangs**
+    /// instead of failing, and the whole binary hangs with it under
+    /// `--test-threads=1`. A job the CI has to time out says a great deal
+    /// less than a failing assertion with a test name on it. Releasing from
+    /// a `Drop` runs on the unwinding path too.
+    struct Release(std::sync::mpsc::Sender<()>);
+
+    impl Drop for Release {
+        fn drop(&mut self) {
+            // The parked thread may have gone already, so this may fail.
+            let _ = self.0.send(());
+        }
+    }
+
     /// Set by a test to stop a page fault in the window between `commit_page`
     /// and the PTE install; see `fault_publish_hook`. Global, and the test
     /// binary runs its tests in parallel threads, so every hook here filters
@@ -3545,6 +3564,7 @@ mod tests {
 
         let (locked_tx, locked_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
+        let release = Release(release_tx);
         let (done_tx, done_rx) = mpsc::channel();
         let mut child_vmo = None;
         std::thread::scope(|s| {
@@ -3563,7 +3583,7 @@ mod tests {
                 done_rx.recv_timeout(Duration::from_millis(50)).is_err(),
                 "create_child must wait for the contended alias mapping before dropping WRITE"
             );
-            release_tx.send(()).unwrap();
+            drop(release);
             child_vmo = Some(
                 done_rx
                     .recv_timeout(Duration::from_secs(1))
@@ -3594,6 +3614,7 @@ mod tests {
 
         let (locked_tx, locked_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
+        let release = Release(release_tx);
         let (first_tx, first_rx) = mpsc::channel();
         let (second_tx, second_rx) = mpsc::channel();
         let mut first_child = None;
@@ -3629,7 +3650,7 @@ mod tests {
                 "second create_child should wait behind the in-progress publish window"
             );
 
-            release_tx.send(()).unwrap();
+            drop(release);
             first_child = Some(
                 first_rx
                     .recv_timeout(Duration::from_secs(1))
@@ -3743,6 +3764,7 @@ mod tests {
 
         let (reached_tx, reached_rx) = mpsc::channel::<()>();
         let (release_tx, release_rx) = mpsc::channel::<()>();
+        let release = Release(release_tx);
         let reached_tx = StdMutex::new(reached_tx);
         let release_rx = StdMutex::new(release_rx);
         let fired = AtomicBool::new(false);
@@ -3765,7 +3787,7 @@ mod tests {
             reached_rx.recv_timeout(Duration::from_secs(5)).unwrap();
             vmo.decommit(0, PAGE_SIZE).unwrap();
             assert!(vmo.committed_paddr(0).is_none());
-            release_tx.send(()).unwrap();
+            drop(release);
         });
 
         // The libOS page table cannot be queried, but `update` reports a page
@@ -3799,6 +3821,7 @@ mod tests {
 
         let (locked_tx, locked_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel::<()>();
+        let release = Release(release_tx);
         let (done_tx, done_rx) = mpsc::channel();
         std::thread::scope(|s| {
             let mapping = mapping.clone();
@@ -3825,7 +3848,7 @@ mod tests {
                 "decommit should be waiting for the contended mapping"
             );
             assert!(vmo.decommit_snapshot().is_none());
-            release_tx.send(()).unwrap();
+            drop(release);
             done_rx
                 .recv_timeout(Duration::from_secs(5))
                 .unwrap()

@@ -291,7 +291,14 @@ fn bar_alignment(size: u64, is_mmio: bool) -> usize {
 /// one MSI vector works; the second vector onwards stays masked forever and
 /// its interrupts never arrive.
 fn msi_mask_after(current: u32, irq: usize, mask: bool) -> u32 {
-    let bit = 1u32 << irq;
+    // `1 << 32` is a panic in debug and a silent wrap round to bit 0 in
+    // release, which masks somebody else's vector. The count is bounded to 32
+    // where it is chosen, so nothing reaches this today; a shift that could
+    // quietly move the wrong bit is not worth leaving to that.
+    let Some(bit) = (irq < u32::BITS as usize).then(|| 1u32 << irq) else {
+        warn!("pci: msi vector {} has no mask bit", irq);
+        return current;
+    };
     if mask {
         current | bit
     } else {
@@ -937,15 +944,31 @@ impl PcieDevice {
         }
     }
 
-    /// Enable an IRQ.
-    pub fn enable_irq(&self, irq_id: usize, enable: bool) {
+    /// Enable or disable one of this device's IRQ vectors.
+    ///
+    /// Every one of the five checks below used to be an `assert!`, and the
+    /// caller is `zx_interrupt_ack`/`zx_interrupt_destroy` by way of
+    /// [`PciInterrupt`](crate::dev::interrupt::Interrupt)'s mask and unmask.
+    /// A device whose IRQ mode went back to `Disabled` under a live interrupt
+    /// object has an empty vector table, so acking that interrupt afterwards
+    /// panicked the kernel from userspace, in three syscalls, all of them
+    /// documented ones.
+    pub fn enable_irq(&self, irq_id: usize, enable: bool) -> ZxResult {
         let _dev_lcok = self.dev_lock.lock();
         let inner = self.inner.lock();
-        assert!(inner.plugged_in);
-        assert!(irq_id < inner.irq.handlers.len());
-        if enable {
-            assert!(!inner.disabled);
-            assert!(inner.irq.handlers[irq_id].has_handler());
+        if !inner.plugged_in {
+            return Err(ZxError::BAD_STATE);
+        }
+        // Cloned out of the table so the borrow ends here: `msi()` below
+        // borrows `inner` again.
+        let handler = inner
+            .irq
+            .handlers
+            .get(irq_id)
+            .ok_or(ZxError::INVALID_ARGS)?
+            .clone();
+        if enable && (inner.disabled || !handler.has_handler()) {
+            return Err(ZxError::BAD_STATE);
         }
         match inner.irq.mode {
             PcieIrqMode::Legacy => {
@@ -956,9 +979,9 @@ impl PcieDevice {
                 }
             }
             PcieIrqMode::Msi => {
-                let (_std, msi) = inner.msi().unwrap();
+                let (_std, msi) = inner.msi().ok_or(ZxError::BAD_STATE)?;
                 if msi.has_pvm {
-                    let cfg = self.cfg.as_ref().unwrap();
+                    let cfg = self.cfg.as_ref().ok_or(ZxError::BAD_STATE)?;
                     let val = cfg.read32_(msi.mask_bits_offset);
                     cfg.write32_(msi.mask_bits_offset, msi_mask_after(val, irq_id, !enable));
                 }
@@ -966,33 +989,57 @@ impl PcieDevice {
                 #[cfg(not(target_arch = "x86_64"))]
                 error!("If the platform supports msi masking, do so");
             }
-            _ => {
-                unreachable!();
-            }
+            // A mode with no way to mask a vector: `Disabled`, which every
+            // device starts in. It was `unreachable!()`, on a value the table
+            // above is supposed to agree with and nothing enforces.
+            _ => return Err(ZxError::BAD_STATE),
         }
-        inner.irq.handlers[irq_id].enable(enable);
+        handler.enable(enable);
+        Ok(())
     }
 
-    /// Register an IRQ handle.
-    pub fn register_irq_handle(&self, irq_id: usize, handle: Box<dyn Fn() -> u32 + Send + Sync>) {
+    /// Install the handler for one of this device's IRQ vectors.
+    ///
+    /// `zx_pci_map_interrupt` lands here, and the object it goes through lets
+    /// any vector number below **ten** past -- a constant this kernel made up,
+    /// with no relation to the count `zx_pci_set_irq_mode` actually allocated.
+    /// So both of these were a kernel panic reachable from userspace: asking
+    /// for a vector the device was never given, and asking before setting an
+    /// IRQ mode at all, which is a device whose vector table is still empty.
+    /// The second needs one syscall, on a handle any driver process holds.
+    pub fn register_irq_handle(
+        &self,
+        irq_id: usize,
+        handle: Box<dyn Fn() -> u32 + Send + Sync>,
+    ) -> ZxResult {
         let _dev_lcok = self.dev_lock.lock();
         let inner = self.inner.lock();
-        assert!(!inner.disabled);
-        assert!(inner.plugged_in);
-        assert!(inner.irq.mode != PcieIrqMode::Disabled);
-        assert!(irq_id < inner.irq.handlers.len());
-        inner.irq.handlers[irq_id].set_handler(Some(handle));
+        if inner.disabled || !inner.plugged_in || inner.irq.mode == PcieIrqMode::Disabled {
+            return Err(ZxError::BAD_STATE);
+        }
+        inner
+            .irq
+            .handlers
+            .get(irq_id)
+            .ok_or(ZxError::INVALID_ARGS)?
+            .set_handler(Some(handle));
+        Ok(())
     }
 
-    /// Unregister an IRQ handle.
+    /// Remove the handler for one of this device's IRQ vectors.
+    ///
+    /// Total where [`Self::register_irq_handle`] is strict, and for a reason:
+    /// this runs from the interrupt object's own teardown, including its
+    /// `Drop`, and by then the vector table may already have been emptied by
+    /// a `zx_pci_set_irq_mode` or the device unplugged. "No handler on that
+    /// vector" is what the caller is asking for, so a vector that is not
+    /// there is the answer, not four `assert!`s.
     pub fn unregister_irq_handle(&self, irq_id: usize) {
         let _dev_lcok = self.dev_lock.lock();
         let inner = self.inner.lock();
-        assert!(!inner.disabled);
-        assert!(inner.plugged_in);
-        assert!(inner.irq.mode != PcieIrqMode::Disabled);
-        assert!(irq_id < inner.irq.handlers.len());
-        inner.irq.handlers[irq_id].set_handler(None);
+        if let Some(handler) = inner.irq.handlers.get(irq_id) {
+            handler.set_handler(None);
+        }
     }
 
     /// Get PcieBarInfo.
@@ -1179,15 +1226,28 @@ impl PcieDevice {
             cfg.write32_(msi.mask_bits_offset, u32::MAX);
         }
     }
+    /// Mask or unmask one MSI vector, answering whether it was already masked.
+    ///
+    /// Runs from the MSI interrupt handler, i.e. from IRQ context, holding a
+    /// vector number captured when the handler was registered. Nothing keeps
+    /// that vector alive: `zx_pci_set_irq_mode` empties the table while the
+    /// block the device writes into is still live. So the three `assert!`s
+    /// and `unwrap`s this used to open with were a kernel panic taken from an
+    /// interrupt, which is the worst place to take one.
     fn mask_msi_irq(&self, inner: &MutexGuard<PcieDeviceInner>, irq: usize, mask: bool) -> bool {
-        assert!(irq < inner.irq.handlers.len());
-        let cfg = self.cfg.as_ref().unwrap();
-        let (_std, msi) = inner.msi().unwrap();
+        let Some(handler) = inner.irq.handlers.get(irq).cloned() else {
+            return false;
+        };
+        let Some(cfg) = self.cfg.as_ref() else {
+            return false;
+        };
+        let Some((_std, msi)) = inner.msi() else {
+            return false;
+        };
         if mask && !msi.has_pvm {
             return false;
         }
         if msi.has_pvm {
-            assert!(irq < PCIE_MAX_MSI_IRQS);
             let addr = msi.mask_bits_offset;
             let val = cfg.read32_(addr);
             cfg.write32_(addr, msi_mask_after(val, irq, mask));
@@ -1196,8 +1256,8 @@ impl PcieDevice {
         // decide whether the interrupt it is holding is one it already
         // masked, so sharing one flag between vectors made every vector
         // after the first answer for vector 0.
-        let ret = inner.irq.handlers[irq].get_masked();
-        inner.irq.handlers[irq].set_masked(mask);
+        let ret = handler.get_masked();
+        handler.set_masked(mask);
         ret
     }
     fn msi_irq_handler(dev: Arc<PcieDevice>, state: Arc<PcieIrqHandlerState>) {
@@ -1226,15 +1286,36 @@ impl PcieDevice {
         } else if requested_irqs < 1 {
             return Err(ZxError::INVALID_ARGS);
         }
-        // Settle the request before touching anything: a count the hardware
-        // cannot express used to be found halfway through the MSI setup, by
-        // an `assert!`, with the device's previous mode already dismantled.
-        if let PcieIrqMode::Msi = mode {
-            let device_max = inner
-                .msi()
-                .map(|(_std, msi)| msi.max_irq)
-                .ok_or(ZxError::NOT_SUPPORTED)?;
-            msi_multi_message_encoding(requested_irqs, device_max)?;
+        // Settle the whole request before touching anything. Everything the
+        // request can be refused for is known here, and the dismantling of
+        // the device's current mode comes next and is not undone: a refusal
+        // taken after it leaves the device with no vectors, no handlers and
+        // every interrupt object over it pointing at nothing, which is not
+        // what an error return means.
+        //
+        // Every one of these used to be found on the far side of it. A count
+        // the hardware cannot express was an `assert!` halfway through the
+        // MSI setup; `MsiX` is a mode this driver does not implement; and
+        // `Count` is a variant of the enum the syscall converts into, so
+        // `zx_pci_set_irq_mode(handle, 4, 1)` is a one-syscall way for a
+        // driver process to disarm its own device and be told it did
+        // nothing.
+        match mode {
+            PcieIrqMode::Disabled => {}
+            PcieIrqMode::Legacy => {
+                if inner.irq.legacy.pin == 0 || requested_irqs > 1 {
+                    return Err(ZxError::NOT_SUPPORTED);
+                }
+            }
+            PcieIrqMode::Msi => {
+                let device_max = inner
+                    .msi()
+                    .map(|(_std, msi)| msi.max_irq)
+                    .ok_or(ZxError::NOT_SUPPORTED)?;
+                msi_multi_message_encoding(requested_irqs, device_max)?;
+            }
+            PcieIrqMode::MsiX => return Err(ZxError::NOT_SUPPORTED),
+            _ => return Err(ZxError::INVALID_ARGS),
         }
         match inner.irq.mode {
             PcieIrqMode::Legacy => {
@@ -1338,14 +1419,18 @@ pub trait IPciNode: Send + Sync {
     fn enable_bus_master(&self, _enable: bool) -> ZxResult {
         unimplemented!("IPciNode.enable_bus_master");
     }
-    fn enable_irq(&self, irq_id: usize) {
-        self.device().enable_irq(irq_id, true);
+    fn enable_irq(&self, irq_id: usize) -> ZxResult {
+        self.device().enable_irq(irq_id, true)
     }
-    fn disable_irq(&self, irq_id: usize) {
-        self.device().enable_irq(irq_id, false);
+    fn disable_irq(&self, irq_id: usize) -> ZxResult {
+        self.device().enable_irq(irq_id, false)
     }
-    fn register_irq_handle(&self, irq_id: usize, handle: Box<dyn Fn() -> u32 + Send + Sync>) {
-        self.device().register_irq_handle(irq_id, handle);
+    fn register_irq_handle(
+        &self,
+        irq_id: usize,
+        handle: Box<dyn Fn() -> u32 + Send + Sync>,
+    ) -> ZxResult {
+        self.device().register_irq_handle(irq_id, handle)
     }
     fn unregister_irq_handle(&self, irq_id: usize) {
         self.device().unregister_irq_handle(irq_id);
@@ -1704,6 +1789,7 @@ pub struct PcieIrqModeCaps {
 mod pci_bar_and_config_tests {
     use super::*;
     use crate::dev::pci::PciAddrSpace;
+    use crate::dev::Interrupt;
 
     /// One PCI function's configuration space, in memory.
     ///
@@ -2304,12 +2390,12 @@ mod pci_bar_and_config_tests {
         // Every vector starts masked.
         assert_eq!(space.peek32(0x60), u32::MAX);
         for irq in 0..4 {
-            dev.enable_irq(irq, true);
+            assert_eq!(dev.enable_irq(irq, true), Ok(()));
         }
         // The four vectors this device uses are now unmasked, and nothing
         // else was touched.
         assert_eq!(space.peek32(0x60), 0xFFFF_FFF0);
-        dev.enable_irq(2, false);
+        assert_eq!(dev.enable_irq(2, false), Ok(()));
         assert_eq!(space.peek32(0x60), 0xFFFF_FFF4);
     }
 
@@ -2338,5 +2424,346 @@ mod pci_bar_and_config_tests {
         assert!(!dev.mask_msi_irq(&inner, 0, true));
         assert!(!dev.mask_msi_irq(&inner, 3, false));
         assert_eq!(space.peek32(0x60), 0xFFFF_FFF5);
+    }
+
+    // ---------- The vector table, and who is allowed to name a vector ----------
+
+    /// A device in MSI mode with `vectors` vectors, each of them masked,
+    /// which is where a `zx_pci_set_irq_mode(handle, MSI, vectors)` leaves
+    /// one. The real entry also allocates an interrupt block from the
+    /// platform, of which a host has none; nothing under test here reads it.
+    fn device_in_msi_mode(space: &mut ConfigSpace, vectors: usize) -> Arc<PcieDevice> {
+        seed_capability_list(space);
+        let dev = Arc::new(device_with(space.config()));
+        dev.init_capabilities().unwrap();
+        let mut inner = dev.inner.lock();
+        inner.plugged_in = true;
+        dev.allocate_irq_handler(&mut inner, vectors, true);
+        inner.irq.mode = PcieIrqMode::Msi;
+        drop(inner);
+        dev
+    }
+
+    /// The node a driver process reaches the device through: this is what
+    /// `zx_pci_map_interrupt` hands to `Interrupt::new_pci`.
+    fn node_of(dev: Arc<PcieDevice>) -> Arc<dyn IPciNode> {
+        Arc::new(PciDeviceNode { base_device: dev })
+    }
+
+    fn a_handler() -> alloc::boxed::Box<dyn Fn() -> u32 + Send + Sync> {
+        alloc::boxed::Box::new(|| 0)
+    }
+
+    #[test]
+    fn mapping_an_interrupt_before_any_irq_mode_is_a_refusal_not_a_panic() {
+        // One syscall, on the handle every PCI driver process holds:
+        // `zx_pci_map_interrupt` without a `zx_pci_set_irq_mode` before it.
+        // The device's vector table is still empty and its mode is
+        // `Disabled`, and two of the four `assert!`s here answered for that.
+        let mut space = ConfigSpace::new();
+        seed_capability_list(&mut space);
+        let dev = Arc::new(device_with(space.config()));
+        dev.init_capabilities().unwrap();
+        dev.inner.lock().plugged_in = true;
+        assert_eq!(
+            dev.register_irq_handle(0, a_handler()),
+            Err(ZxError::BAD_STATE)
+        );
+        // And the same thing through the object userspace actually gets.
+        assert_eq!(
+            Interrupt::new_pci(node_of(dev), 0, true).err(),
+            Some(ZxError::BAD_STATE)
+        );
+    }
+
+    #[test]
+    fn a_vector_the_device_was_never_given_is_refused() {
+        // The other half of that syscall. The number is checked against
+        // `irqs_avail_cnt`, a constant this kernel sets to ten and never
+        // revisits, while how many vectors the device has is whatever the
+        // last `zx_pci_set_irq_mode` asked for. Everything in between was
+        // `assert!(irq_id < inner.irq.handlers.len())`.
+        let mut space = ConfigSpace::new();
+        let dev = device_in_msi_mode(&mut space, 4);
+        assert_eq!(
+            dev.register_irq_handle(4, a_handler()),
+            Err(ZxError::INVALID_ARGS)
+        );
+        assert_eq!(
+            dev.register_irq_handle(9, a_handler()),
+            Err(ZxError::INVALID_ARGS)
+        );
+        // And the same number arriving at the other end, from an ack or a
+        // destroy on an interrupt object that outlived its vector.
+        assert_eq!(dev.enable_irq(4, true), Err(ZxError::INVALID_ARGS));
+        assert_eq!(dev.enable_irq(4, false), Err(ZxError::INVALID_ARGS));
+        assert_eq!(space.peek32(0x60), u32::MAX);
+        assert_eq!(
+            Interrupt::new_pci(node_of(dev), 5, true).err(),
+            Some(ZxError::INVALID_ARGS)
+        );
+    }
+
+    #[test]
+    fn an_interrupt_object_takes_the_vector_it_names_and_unmasks_it() {
+        // The path that is meant to work, so that the refusals around it are
+        // refusals and not the function having stopped working.
+        let mut space = ConfigSpace::new();
+        let dev = device_in_msi_mode(&mut space, 4);
+        assert_eq!(space.peek32(0x60), u32::MAX);
+        let irq = Interrupt::new_pci(node_of(dev.clone()), 2, true).unwrap();
+        {
+            let inner = dev.inner.lock();
+            assert!(inner.irq.handlers[2].has_handler());
+            for &other in [0usize, 1, 3].iter() {
+                assert!(
+                    !inner.irq.handlers[other].has_handler(),
+                    "vector {} took somebody else's handler",
+                    other
+                );
+            }
+        }
+        // Creating the object unmasks what it just registered, and that is
+        // one bit of one register of the device.
+        assert_eq!(space.peek32(0x60), 0xFFFF_FFFB);
+        assert_eq!(irq.destroy(), Ok(()));
+        // Teardown masks it again and gives the vector back.
+        assert_eq!(space.peek32(0x60), u32::MAX);
+        assert!(!dev.inner.lock().irq.handlers[2].has_handler());
+    }
+
+    #[test]
+    fn a_vector_with_no_handler_cannot_be_unmasked_but_can_be_masked() {
+        // The asymmetry is deliberate. Unmasking a vector nothing answers
+        // for arms an interrupt line into an empty slot; masking one is what
+        // teardown does, and teardown runs once the handler is already gone.
+        let mut space = ConfigSpace::new();
+        let dev = device_in_msi_mode(&mut space, 4);
+        assert_eq!(dev.enable_irq(1, true), Err(ZxError::BAD_STATE));
+        assert_eq!(dev.enable_irq(1, false), Ok(()));
+        dev.register_irq_handle(1, a_handler()).unwrap();
+        assert_eq!(dev.enable_irq(1, true), Ok(()));
+        assert_eq!(space.peek32(0x60), 0xFFFF_FFFD);
+    }
+
+    #[test]
+    fn a_device_whose_irq_mode_went_back_to_disabled_refuses_its_old_vectors() {
+        // Three syscalls, every one of them documented: map an interrupt,
+        // put the device's IRQ mode back to `Disabled` -- which empties the
+        // vector table while the interrupt object is still live and still
+        // holding vector 2 -- then destroy the interrupt. Its teardown masks
+        // and unregisters that vector, and both of those asserted it was
+        // still there.
+        let mut space = ConfigSpace::new();
+        let dev = device_in_msi_mode(&mut space, 4);
+        let irq = Interrupt::new_pci(node_of(dev.clone()), 2, true).unwrap();
+        dev.set_irq_mode(PcieIrqMode::Disabled, 0).unwrap();
+        assert!(dev.inner.lock().irq.handlers.is_empty());
+        assert_eq!(irq.destroy(), Ok(()));
+    }
+
+    #[test]
+    fn an_unplugged_device_refuses_its_vectors_instead_of_asserting() {
+        // A hot-unplug under a live interrupt object. `plugged_in` was the
+        // opening `assert!` of all three of these.
+        let mut space = ConfigSpace::new();
+        let dev = device_in_msi_mode(&mut space, 4);
+        dev.register_irq_handle(0, a_handler()).unwrap();
+        dev.inner.lock().plugged_in = false;
+        assert_eq!(dev.enable_irq(0, true), Err(ZxError::BAD_STATE));
+        assert_eq!(dev.enable_irq(0, false), Err(ZxError::BAD_STATE));
+        assert_eq!(
+            dev.register_irq_handle(0, a_handler()),
+            Err(ZxError::BAD_STATE)
+        );
+        // Handing a handler back is the exception, because that is teardown
+        // and teardown has to work on a device that is already gone.
+        dev.unregister_irq_handle(0);
+        assert!(!dev.inner.lock().irq.handlers[0].has_handler());
+    }
+
+    #[test]
+    fn a_disabled_device_refuses_to_arm_a_vector() {
+        let mut space = ConfigSpace::new();
+        let dev = device_in_msi_mode(&mut space, 4);
+        dev.register_irq_handle(0, a_handler()).unwrap();
+        dev.inner.lock().disabled = true;
+        assert_eq!(dev.enable_irq(0, true), Err(ZxError::BAD_STATE));
+        assert_eq!(
+            dev.register_irq_handle(1, a_handler()),
+            Err(ZxError::BAD_STATE)
+        );
+        // Disarming it still has to work: that is how it gets disabled.
+        assert_eq!(dev.enable_irq(0, false), Ok(()));
+    }
+
+    #[test]
+    fn a_vector_of_a_device_in_a_mode_with_no_masking_is_refused() {
+        // The last of the five, and the only one with no syscall behind it:
+        // `inner.irq.mode` is a field two other functions agree to keep in
+        // step with the vector table, and this arm was an `unreachable!()`
+        // resting on that agreement. Made total rather than traced.
+        let mut space = ConfigSpace::new();
+        let dev = device_in_msi_mode(&mut space, 4);
+        dev.register_irq_handle(0, a_handler()).unwrap();
+        dev.inner.lock().irq.mode = PcieIrqMode::MsiX;
+        assert_eq!(dev.enable_irq(0, true), Err(ZxError::BAD_STATE));
+        assert_eq!(dev.enable_irq(0, false), Err(ZxError::BAD_STATE));
+    }
+
+    #[test]
+    fn unregistering_a_vector_takes_only_that_ones_handler() {
+        let mut space = ConfigSpace::new();
+        let dev = device_in_msi_mode(&mut space, 4);
+        for irq in 0..4 {
+            dev.register_irq_handle(irq, a_handler()).unwrap();
+        }
+        dev.unregister_irq_handle(2);
+        let inner = dev.inner.lock();
+        assert!(!inner.irq.handlers[2].has_handler());
+        for &other in [0usize, 1, 3].iter() {
+            assert!(
+                inner.irq.handlers[other].has_handler(),
+                "vector {} lost its handler too",
+                other
+            );
+        }
+    }
+
+    #[test]
+    fn unregistering_a_vector_that_is_gone_is_not_a_panic() {
+        // This runs from the interrupt object's teardown, which a process
+        // exiting reaches through a `Drop`, and a panic taken while already
+        // unwinding aborts. All four of its `assert!`s can be false by then.
+        let mut space = ConfigSpace::new();
+        let dev = device_in_msi_mode(&mut space, 4);
+        dev.set_irq_mode(PcieIrqMode::Disabled, 0).unwrap();
+        dev.unregister_irq_handle(0);
+        dev.unregister_irq_handle(9);
+        dev.inner.lock().plugged_in = false;
+        dev.unregister_irq_handle(0);
+    }
+
+    #[test]
+    fn masking_a_vector_that_is_no_longer_there_reports_nothing() {
+        // `msi_irq_handler` runs in interrupt context holding a vector
+        // number captured when its handler was registered, and asks this
+        // whether that vector was already masked, to tell a real interrupt
+        // from one it masked itself. `zx_pci_set_irq_mode` empties the table
+        // underneath it, so the number can be stale -- and an interrupt is
+        // the worst place in the kernel to take a panic.
+        let mut space = ConfigSpace::new();
+        let dev = device_in_msi_mode(&mut space, 4);
+        {
+            // Every vector starts masked, so this one reports it was.
+            let inner = dev.inner.lock();
+            assert!(dev.mask_msi_irq(&inner, 0, false));
+            assert_eq!(space.peek32(0x60), 0xFFFF_FFFE);
+        }
+        dev.set_irq_mode(PcieIrqMode::Disabled, 0).unwrap();
+        let inner = dev.inner.lock();
+        assert!(!dev.mask_msi_irq(&inner, 0, true));
+        assert!(!dev.mask_msi_irq(&inner, 0, false));
+        // And the register it would have written is the one teardown left.
+        assert_eq!(space.peek32(0x60), u32::MAX);
+    }
+
+    #[test]
+    fn a_vector_with_no_bit_in_the_mask_register_is_left_alone() {
+        // Thirty-two vectors is all the register holds, and the count is
+        // bounded to that where it is chosen. `1 << 32` is a panic in debug
+        // and, in release, a wrap round to bit 0 -- somebody else's vector.
+        assert_eq!(msi_mask_after(0xFFFF_FFFF, 32, false), 0xFFFF_FFFF);
+        assert_eq!(msi_mask_after(0, 33, true), 0);
+        assert_eq!(msi_mask_after(0, usize::MAX, true), 0);
+        // The last vector that does have one still moves.
+        assert_eq!(msi_mask_after(0xFFFF_FFFF, 31, false), 0x7FFF_FFFF);
+        assert_eq!(msi_mask_after(0, 31, true), 0x8000_0000);
+    }
+
+    #[test]
+    fn a_refused_irq_mode_leaves_the_device_the_way_it_found_it() {
+        // `Count` is a variant of the enum the syscall turns the user's
+        // number into, so `zx_pci_set_irq_mode(handle, 4, 1)` gets all the
+        // way in and is refused at the end -- on the far side of taking the
+        // device's current mode apart, which nothing undoes. One syscall for
+        // a driver process to disarm its own device and be told it did
+        // nothing. `MsiX` and the two legacy refusals sat there too.
+        let mut space = ConfigSpace::new();
+        let dev = device_in_msi_mode(&mut space, 4);
+        dev.register_irq_handle(1, a_handler()).unwrap();
+        assert_eq!(
+            dev.set_irq_mode(PcieIrqMode::Count, 1),
+            Err(ZxError::INVALID_ARGS)
+        );
+        assert_eq!(
+            dev.set_irq_mode(PcieIrqMode::MsiX, 1),
+            Err(ZxError::NOT_SUPPORTED)
+        );
+        // A card with no legacy interrupt pin, which is what a PCI Express
+        // card is, asking for the one mode it has not got.
+        assert_eq!(
+            dev.set_irq_mode(PcieIrqMode::Legacy, 1),
+            Err(ZxError::NOT_SUPPORTED)
+        );
+        // More legacy interrupts than any device can have.
+        dev.inner.lock().irq.legacy.pin = 1;
+        assert_eq!(
+            dev.set_irq_mode(PcieIrqMode::Legacy, 2),
+            Err(ZxError::NOT_SUPPORTED)
+        );
+        // And a vector count the MSI capability cannot encode, which is the
+        // same bug one layer down and is settled here for the same reason.
+        assert_eq!(
+            dev.set_irq_mode(PcieIrqMode::Msi, 33),
+            Err(ZxError::INVALID_ARGS)
+        );
+        // Five refusals, and the device is still doing what it was.
+        let inner = dev.inner.lock();
+        assert_eq!(inner.irq.mode, PcieIrqMode::Msi);
+        assert_eq!(inner.irq.handlers.len(), 4);
+        assert!(inner.irq.handlers[1].has_handler());
+    }
+
+    #[test]
+    fn an_interrupt_the_platform_cannot_mask_never_touches_the_mask_register() {
+        // Whether a PCI interrupt is maskable at all comes from the bus, and
+        // the interrupt object has to leave the device's per-vector mask
+        // alone when it is not. Registering the handler is not optional.
+        let mut space = ConfigSpace::new();
+        let dev = device_in_msi_mode(&mut space, 4);
+        // Leave vector 2 unmasked before the object exists, so that a mask
+        // it should not be doing has somewhere to show. Starting from every
+        // vector masked, as the device does, hides it: masking what is
+        // already masked writes the same register back.
+        dev.register_irq_handle(2, a_handler()).unwrap();
+        assert_eq!(dev.enable_irq(2, true), Ok(()));
+        dev.unregister_irq_handle(2);
+        assert_eq!(space.peek32(0x60), 0xFFFF_FFFB);
+        let irq = Interrupt::new_pci(node_of(dev.clone()), 2, false).unwrap();
+        assert!(dev.inner.lock().irq.handlers[2].has_handler());
+        assert_eq!(space.peek32(0x60), 0xFFFF_FFFB);
+        assert_eq!(irq.destroy(), Ok(()));
+        assert_eq!(space.peek32(0x60), 0xFFFF_FFFB);
+        assert!(!dev.inner.lock().irq.handlers[2].has_handler());
+    }
+
+    #[test]
+    fn destroying_an_interrupt_twice_does_not_take_the_vector_twice() {
+        // `zx_interrupt_destroy` on a handle that has already been
+        // destroyed. The second round finds its registration handed back
+        // and has to leave the vector alone, rather than mask whatever is
+        // on it by then.
+        let mut space = ConfigSpace::new();
+        let dev = device_in_msi_mode(&mut space, 4);
+        let irq = Interrupt::new_pci(node_of(dev.clone()), 2, true).unwrap();
+        assert_eq!(irq.destroy(), Ok(()));
+        // Somebody else takes vector 2 and arms it.
+        dev.register_irq_handle(2, a_handler()).unwrap();
+        assert_eq!(dev.enable_irq(2, true), Ok(()));
+        assert_eq!(space.peek32(0x60), 0xFFFF_FFFB);
+        assert_eq!(irq.destroy(), Ok(()));
+        assert_eq!(space.peek32(0x60), 0xFFFF_FFFB);
+        assert!(dev.inner.lock().irq.handlers[2].has_handler());
     }
 }

@@ -128,7 +128,7 @@ struct ExceptionHeader {
 /// Things available from regsets (e.g., pc) are not included here.
 /// For an example list of things one might add, see linux siginfo.
 #[repr(C)]
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 struct ExceptionContext {
     arch: ExceptionContextInner,
     synth_code: u32,
@@ -138,7 +138,7 @@ struct ExceptionContext {
 cfg_if::cfg_if! {
     if #[cfg(target_arch = "x86_64")] {
         #[repr(C)]
-        #[derive(Debug, Default, Clone)]
+        #[derive(Debug, Default, Clone, PartialEq, Eq)]
         struct ExceptionContextInner {
             vector: u64,
             err_code: u64,
@@ -146,7 +146,7 @@ cfg_if::cfg_if! {
         }
     } else if #[cfg(target_arch = "aarch64")] {
         #[repr(C)]
-        #[derive(Debug, Default, Clone)]
+        #[derive(Debug, Default, Clone, PartialEq, Eq)]
         struct ExceptionContextInner {
             esr: u32,
             _padding1: u32,
@@ -155,7 +155,7 @@ cfg_if::cfg_if! {
         }
     } else if #[cfg(target_arch = "riscv64")] {
         #[repr(C)]
-        #[derive(Debug, Default, Clone)]
+        #[derive(Debug, Default, Clone, PartialEq, Eq)]
         struct ExceptionContextInner {
             scause: u64,
             stval: u64,
@@ -568,6 +568,7 @@ impl Iterator for JobDebuggerIterator {
 mod tests {
     use super::*;
     use crate::task::*;
+    use core::convert::TryInto;
 
     #[test]
     fn exceptionate_iterator() {
@@ -704,5 +705,308 @@ mod tests {
 
         // test for the order: proc debug -> thread -> job
         assert_eq!(handled_order.lock().clone(), vec![0, 1, 3]);
+    }
+
+    /// A thread of its own job and process, so nothing here shares an
+    /// exceptionate with anything else.
+    fn a_thread() -> Arc<Thread> {
+        let job = Job::root().create_child().unwrap();
+        let proc = Process::create(&job, "proc").unwrap();
+        Thread::create(&proc, "thread").unwrap()
+    }
+
+    fn page_fault(thread: &Arc<Thread>) -> Arc<Exception> {
+        Exception::new(thread, ExceptionType::FatalPageFault, None)
+    }
+
+    #[test]
+    /// `zx_task_create_exception_channel` gives out one endpoint at a time, and
+    /// the seat opens again when the handler lets go of its end -- a debugger
+    /// that crashed must not lock the task out of ever being debugged again.
+    fn a_task_has_one_exception_channel_at_a_time() {
+        let e = Exceptionate::new(ExceptionChannelType::Thread);
+        let handler = e.create_channel(Rights::DEFAULT_THREAD).unwrap();
+        assert!(e.has_channel());
+        assert_eq!(
+            e.create_channel(Rights::DEFAULT_THREAD).err(),
+            Some(ZxError::ALREADY_BOUND),
+        );
+
+        drop(handler);
+        assert!(!e.has_channel(), "the seat is free once the handler goes");
+        let _second = e.create_channel(Rights::DEFAULT_THREAD).unwrap();
+        assert!(e.has_channel());
+    }
+
+    #[test]
+    /// Shutdown is how a dying task stops accepting handlers, and it is final:
+    /// it is not the same state as "nobody has asked yet".
+    fn a_shut_down_exceptionate_takes_no_more_handlers() {
+        let e = Exceptionate::new(ExceptionChannelType::Thread);
+        let _handler = e.create_channel(Rights::DEFAULT_THREAD).unwrap();
+        e.shutdown();
+        assert!(!e.has_channel());
+        assert_eq!(
+            e.create_channel(Rights::DEFAULT_THREAD).err(),
+            Some(ZxError::BAD_STATE),
+        );
+
+        let thread = a_thread();
+        assert_eq!(
+            e.send_exception(&page_fault(&thread)).err(),
+            Some(ZxError::NEXT),
+            "a shut down handler is skipped, not an error the thread sees",
+        );
+    }
+
+    #[test]
+    /// `NEXT` is how one link in the handler chain says "not me": nobody
+    /// listening, and a handler that has closed its end, both mean the same
+    /// thing to `handle_with`, which is to try the next one.
+    fn an_exceptionate_nobody_is_listening_to_says_next() {
+        let thread = a_thread();
+        let exception = page_fault(&thread);
+        let e = Exceptionate::new(ExceptionChannelType::Thread);
+        assert_eq!(e.send_exception(&exception).err(), Some(ZxError::NEXT));
+
+        let handler = e.create_channel(Rights::DEFAULT_THREAD).unwrap();
+        assert!(e.send_exception(&exception).is_ok());
+        drop(handler);
+        assert_eq!(e.send_exception(&exception).err(), Some(ZxError::NEXT));
+
+        // And the seat is given up on the way out, so the next handler to ask
+        // for it gets it rather than `ALREADY_BOUND` for a channel that is
+        // never going to answer.
+        assert!(!e.has_channel());
+        assert!(e.create_channel(Rights::DEFAULT_THREAD).is_ok());
+    }
+
+    #[test]
+    /// What the handler reads off the channel is `zx_exception_info_t`, laid
+    /// out for a program that is not this kernel: two koids, the type, and the
+    /// padding that makes it 24 bytes. Plus one handle, the exception object.
+    fn the_packet_names_the_process_and_the_thread_that_faulted() {
+        let thread = a_thread();
+        let e = Exceptionate::new(ExceptionChannelType::Thread);
+        let handler = e.create_channel(Rights::DEFAULT_THREAD).unwrap();
+        // Kept, so the exception object in the packet stays unsignalled.
+        let _closed = e.send_exception(&page_fault(&thread)).unwrap();
+
+        let packet = handler.read().unwrap();
+        assert_eq!(packet.data.len(), 24);
+        let word = |at: usize| u64::from_ne_bytes(packet.data[at..at + 8].try_into().unwrap());
+        let half = |at: usize| u32::from_ne_bytes(packet.data[at..at + 4].try_into().unwrap());
+        assert_eq!(word(0), thread.proc().id(), "pid");
+        assert_eq!(word(8), thread.id(), "tid");
+        assert_eq!(half(16), ExceptionType::FatalPageFault as u32, "type");
+        assert_eq!(half(20), 0, "padding");
+
+        assert_eq!(packet.handles.len(), 1);
+        let object = packet.handles[0]
+            .object
+            .clone()
+            .downcast_arc::<ExceptionObject>()
+            .unwrap();
+        assert_eq!(object.state(), 0, "not handled until the handler says so");
+    }
+
+    #[test]
+    /// The report a debugger reads carries its own length, and the v1 form is
+    /// the same report without the synthetic tail. Both numbers are the ABI,
+    /// so they are worth pinning: a field added to `ExceptionContext` without
+    /// a matching change on the other side reads as garbage.
+    fn an_exception_report_is_the_size_it_says_it_is() {
+        let report = ExceptionReport::new(ExceptionType::FatalPageFault, None);
+        assert_eq!(report.header.size as usize, size_of::<ExceptionReport>());
+        assert_eq!(report.header.type_, ExceptionType::FatalPageFault);
+
+        let v1 = report.as_v1();
+        assert_eq!(v1.header.size as usize, size_of::<ExceptionReportV1>());
+        assert_eq!(v1.header.type_, report.header.type_);
+        assert!(
+            size_of::<ExceptionReportV1>() < size_of::<ExceptionReport>(),
+            "v1 is the report without the synthetic fields",
+        );
+        assert_eq!(
+            size_of::<ExceptionReportV1>(),
+            size_of::<ExceptionHeader>() + size_of::<ExceptionContextInner>(),
+        );
+        assert_eq!(size_of::<ExceptionInfo>(), 24);
+        assert_eq!(size_of::<ExceptionHeader>(), 8);
+    }
+
+    #[test]
+    /// `zx_exception_set_state` and `zx_exception_set_strategy` are both
+    /// booleans on the wire, so anything else is an error rather than a
+    /// truncation to some bit of it.
+    fn the_state_and_the_strategy_only_take_a_zero_or_a_one() {
+        let thread = a_thread();
+        let exception = page_fault(&thread);
+        exception.inner.lock().current_channel_type = ExceptionChannelType::Debugger;
+        let (object, _closed) = ExceptionObject::create(exception, Rights::DEFAULT_THREAD);
+
+        assert_eq!(object.state(), 0);
+        assert_eq!(object.set_state(2).err(), Some(ZxError::INVALID_ARGS));
+        assert_eq!(object.state(), 0, "a refused set changes nothing");
+        object.set_state(1).unwrap();
+        assert_eq!(object.state(), 1);
+        object.set_state(0).unwrap();
+        assert_eq!(object.state(), 0);
+
+        assert_eq!(object.strategy(), 0);
+        assert_eq!(object.set_strategy(2).err(), Some(ZxError::INVALID_ARGS));
+        assert_eq!(object.strategy(), 0);
+        object.set_strategy(1).unwrap();
+        assert_eq!(object.strategy(), 1);
+    }
+
+    #[test]
+    /// Only a debugger can ask for a second chance, because the second chance
+    /// *is* the debugger being tried again after the process handler passed.
+    /// Everyone else gets `BAD_STATE`, and the flag stays where it was.
+    fn only_a_debugger_gets_a_second_chance() {
+        let thread = a_thread();
+        let exception = page_fault(&thread);
+        let (object, _closed) = ExceptionObject::create(exception.clone(), Rights::DEFAULT_THREAD);
+
+        for kind in [
+            ExceptionChannelType::None,
+            ExceptionChannelType::Thread,
+            ExceptionChannelType::Process,
+            ExceptionChannelType::Job,
+        ] {
+            exception.inner.lock().current_channel_type = kind;
+            assert_eq!(
+                object.set_strategy(1).err(),
+                Some(ZxError::BAD_STATE),
+                "{:?} asked for a second chance",
+                kind,
+            );
+            assert_eq!(object.strategy(), 0);
+        }
+
+        for kind in [
+            ExceptionChannelType::Debugger,
+            ExceptionChannelType::JobDebugger,
+        ] {
+            exception.inner.lock().current_channel_type = kind;
+            object.set_strategy(1).unwrap();
+            assert_eq!(object.strategy(), 1);
+            object.set_strategy(0).unwrap();
+        }
+    }
+
+    #[test]
+    /// A thread-level handler is given the faulting thread and nothing above
+    /// it; the process handle is the debugger's. And both handles carry the
+    /// rights the exceptionate was opened with, narrowed to what the kind of
+    /// object allows -- never more.
+    fn a_thread_handler_does_not_get_a_handle_to_the_process() {
+        let thread = a_thread();
+        let exception = page_fault(&thread);
+        // A job's exceptionate opens with a job's rights, which is what tells
+        // the two masks below apart: `ENUMERATE` survives into a process
+        // handle and not into a thread handle.
+        let (object, _closed) = ExceptionObject::create(exception.clone(), Rights::DEFAULT_JOB);
+
+        exception.inner.lock().current_channel_type = ExceptionChannelType::Thread;
+        assert_eq!(
+            object.get_process_handle().err(),
+            Some(ZxError::ACCESS_DENIED),
+        );
+
+        exception.inner.lock().current_channel_type = ExceptionChannelType::Debugger;
+        let process = object.get_process_handle().unwrap();
+        assert!(Arc::ptr_eq(
+            &process.object.clone().downcast_arc::<Process>().unwrap(),
+            thread.proc(),
+        ));
+        assert_eq!(
+            process.rights,
+            Rights::DEFAULT_JOB & Rights::DEFAULT_PROCESS
+        );
+        assert!(process.rights.contains(Rights::ENUMERATE));
+        assert!(!process.rights.contains(Rights::MANAGE_JOB), "and no more");
+
+        let handle = object.get_thread_handle();
+        assert!(Arc::ptr_eq(
+            &handle.object.clone().downcast_arc::<Thread>().unwrap(),
+            &thread,
+        ));
+        assert_eq!(handle.rights, Rights::DEFAULT_JOB & Rights::DEFAULT_THREAD);
+        assert!(
+            !handle.rights.contains(Rights::ENUMERATE),
+            "a thread is not something you enumerate the children of",
+        );
+
+        // A handler opened with less than the default keeps less.
+        let (thin, _closed) = ExceptionObject::create(exception, Rights::INSPECT);
+        assert_eq!(thin.get_thread_handle().rights, Rights::INSPECT);
+    }
+
+    #[test]
+    /// The thread that faulted is waiting on the exception object going away,
+    /// so letting go of the last handle is what resumes it. That signal is the
+    /// whole reason the object exists rather than the exception being sent.
+    fn letting_go_of_the_exception_object_is_what_wakes_the_thread() {
+        let thread = a_thread();
+        let (object, mut closed) = ExceptionObject::create(page_fault(&thread), Rights::INSPECT);
+        assert_eq!(closed.try_recv(), Ok(None), "still held, still waiting");
+
+        let second = object.clone();
+        drop(object);
+        assert_eq!(
+            closed.try_recv(),
+            Ok(None),
+            "one of two handles is not enough"
+        );
+        drop(second);
+        assert_eq!(closed.try_recv(), Ok(Some(())), "the last one wakes it");
+    }
+
+    #[test]
+    /// An exception that is not a fault has no fault to report, and the early
+    /// return in `from_user_context` is the only thing standing between it and
+    /// the architecture's fault-syndrome registers -- which, at this point in
+    /// the exception's life, hold whatever the last real fault put there.
+    /// (On aarch64 that read was `unimplemented!()` until this batch, so the
+    /// guard was also the only thing keeping the kernel up.)
+    fn an_exception_that_is_not_a_fault_reports_no_fault() {
+        let quiet = UserContext::new();
+        let with_context = ExceptionReport::new(ExceptionType::ThreadStarting, Some(&quiet));
+        let without = ExceptionReport::new(ExceptionType::ThreadStarting, None);
+        assert_eq!(with_context.context, without.context);
+        assert_eq!(with_context.context, ExceptionContext::default());
+    }
+
+    #[test]
+    /// The numbers are `zx_excp_type_t` and a debugger reads them off the
+    /// wire, so they are fixed. `is_synth` is the bit that says whether the
+    /// kernel made this one up, which is what decides that there is no
+    /// register context to report and that nobody being home is not fatal.
+    fn the_kernel_made_exceptions_are_the_ones_with_the_synth_bit() {
+        let architectural = [
+            (ExceptionType::General, 0x008),
+            (ExceptionType::FatalPageFault, 0x108),
+            (ExceptionType::UndefinedInstruction, 0x208),
+            (ExceptionType::SoftwareBreakpoint, 0x308),
+            (ExceptionType::HardwareBreakpoint, 0x408),
+            (ExceptionType::UnalignedAccess, 0x508),
+        ];
+        let synthetic = [
+            (ExceptionType::Synth, 0x8000),
+            (ExceptionType::ThreadStarting, 0x8008),
+            (ExceptionType::ThreadExiting, 0x8108),
+            (ExceptionType::PolicyError, 0x8208),
+            (ExceptionType::ProcessStarting, 0x8308),
+        ];
+        for (type_, number) in architectural {
+            assert_eq!(type_ as u32, number, "{:?}", type_);
+            assert!(!type_.is_synth(), "{:?}", type_);
+        }
+        for (type_, number) in synthetic {
+            assert_eq!(type_ as u32, number, "{:?}", type_);
+            assert!(type_.is_synth(), "{:?}", type_);
+        }
     }
 }

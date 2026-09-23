@@ -69,7 +69,7 @@ pub fn init() {
 }
 
 /// The error type for external device.
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeviceError {
     /// The buffer is too small.
     BufferTooSmall,
