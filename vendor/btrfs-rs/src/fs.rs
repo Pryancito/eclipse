@@ -903,28 +903,58 @@ impl Btrfs {
         };
         let enc = entry.encode();
         let hash = crate::crc::name_hash(name);
+        // A directory entry is three items that only make sense together. Any
+        // of the three inserts can fail -- with NoSpace once metadata is
+        // genuinely exhausted, since a leaf split needs a tree block -- so a
+        // failed one is undone before returning. Without this, a create that
+        // ran out of space left a DIR_ITEM with no DIR_INDEX and no
+        // INODE_REF: `btrfs check` reports it as `unresolved ref ... no dir
+        // index, no inode ref`, and the name is neither usable nor
+        // removable. Unwinding only ever shrinks or deletes items that were
+        // just written, which never needs an allocation of its own.
         {
+            let dir_key = Key::new(dir, DIR_ITEM_KEY, hash);
+            let ref_key = Key::new(ino, INODE_REF_KEY, dir);
+            let index_key = Key::new(dir, DIR_INDEX_KEY, index);
+            let ref_entry = encode_inode_ref(index, name);
+
             let mut t = self.tree();
             // DIR_ITEM (append on hash collision).
-            let key = Key::new(dir, DIR_ITEM_KEY, hash);
-            match t.get(FS_TREE, key)? {
-                Some(mut existing) => {
-                    existing.extend_from_slice(&enc);
-                    t.set_item(FS_TREE, key, &existing)?;
+            let dir_item_was = t.get(FS_TREE, dir_key)?;
+            match &dir_item_was {
+                Some(existing) => {
+                    let mut grown = existing.clone();
+                    grown.extend_from_slice(&enc);
+                    t.set_item(FS_TREE, dir_key, &grown)?;
                 }
-                None => t.insert(FS_TREE, key, &enc)?,
+                None => t.insert(FS_TREE, dir_key, &enc)?,
             }
             // DIR_INDEX.
-            t.insert(FS_TREE, Key::new(dir, DIR_INDEX_KEY, index), &enc)?;
+            if let Err(e) = t.insert(FS_TREE, index_key, &enc) {
+                undo_item(&mut t, dir_key, dir_item_was.as_deref());
+                return Err(e);
+            }
             // INODE_REF.
-            let ref_key = Key::new(ino, INODE_REF_KEY, dir);
-            let ref_entry = encode_inode_ref(index, name);
-            match t.get(FS_TREE, ref_key)? {
-                Some(mut existing) => {
-                    existing.extend_from_slice(&ref_entry);
-                    t.set_item(FS_TREE, ref_key, &existing)?;
+            let inode_ref_was = match t.get(FS_TREE, ref_key) {
+                Ok(v) => v,
+                Err(e) => {
+                    let _ = t.delete(FS_TREE, index_key);
+                    undo_item(&mut t, dir_key, dir_item_was.as_deref());
+                    return Err(e);
                 }
-                None => t.insert(FS_TREE, ref_key, &ref_entry)?,
+            };
+            let wrote_ref = match &inode_ref_was {
+                Some(existing) => {
+                    let mut grown = existing.clone();
+                    grown.extend_from_slice(&ref_entry);
+                    t.set_item(FS_TREE, ref_key, &grown)
+                }
+                None => t.insert(FS_TREE, ref_key, &ref_entry),
+            };
+            if let Err(e) = wrote_ref {
+                let _ = t.delete(FS_TREE, index_key);
+                undo_item(&mut t, dir_key, dir_item_was.as_deref());
+                return Err(e);
             }
         }
         // Directory size grows by name_len for each of DIR_ITEM and DIR_INDEX.
@@ -1069,9 +1099,21 @@ impl Btrfs {
         };
         {
             let mut t = self.tree();
-            t.insert(FS_TREE, Key::new(ino, INODE_ITEM_KEY, 0), &inode.encode())?;
+            if let Err(e) = t.insert(FS_TREE, Key::new(ino, INODE_ITEM_KEY, 0), &inode.encode()) {
+                self.next_ino = ino;
+                return Err(e);
+            }
         }
-        self.add_entry(dir, name, ino, kind.dir_type())?;
+        // An inode with no name is an orphan `btrfs check` reports and
+        // nothing can reach or delete; drop it if the entry does not land.
+        if let Err(e) = self.add_entry(dir, name, ino, kind.dir_type()) {
+            {
+                let mut t = self.tree();
+                let _ = t.delete(FS_TREE, Key::new(ino, INODE_ITEM_KEY, 0));
+            }
+            self.next_ino = ino;
+            return Err(e);
+        }
         self.commit(false)?;
         Ok(ino)
     }
@@ -1264,8 +1306,19 @@ impl Btrfs {
                 self.purge_inode(existing, &target)?;
             }
         }
-        let (_, dir_type) = self.remove_entry(old_dir, old_name)?;
+        // Write the new name first and only then drop the old one. Adding is
+        // the step that can fail -- NoSpace, once metadata is exhausted --
+        // and `add_entry` leaves nothing behind when it does, so the file
+        // keeps the name it had. The other order lost the file outright: the
+        // old name was already gone, and putting it back needed the very
+        // space that had just run out. Removing an entry only deletes items,
+        // so it cannot fail for want of space.
+        let dir_type = self.read_inode(ino)?.kind().dir_type();
         self.add_entry(new_dir, new_name, ino, dir_type)?;
+        if let Err(e) = self.remove_entry(old_dir, old_name) {
+            let _ = self.remove_entry(new_dir, new_name);
+            return Err(e);
+        }
         let mut inode = self.read_inode(ino)?;
         inode.ctime = self.now();
         self.write_inode(ino, &inode)?;
@@ -2140,6 +2193,18 @@ impl Btrfs {
             self.apply_pending()?;
         }
     }
+}
+
+/// Put an item back the way it was before a just-attempted edit: restore its
+/// previous bytes, or delete it if it did not exist. Both shrink the leaf, so
+/// neither can fail for want of space; a failure here would mean the tree is
+/// already damaged, and there is nothing better to do than report the error
+/// that caused the unwind.
+fn undo_item(t: &mut Tree<'_>, key: Key, was: Option<&[u8]>) {
+    let _ = match was {
+        Some(prev) => t.set_item(FS_TREE, key, prev),
+        None => t.delete(FS_TREE, key),
+    };
 }
 
 fn check_name(name: &str) -> Result<&[u8]> {
