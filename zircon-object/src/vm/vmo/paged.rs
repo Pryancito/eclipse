@@ -649,6 +649,54 @@ impl VMObjectPaged {
             _reentry: ReentryPop(self.lock_ptr()),
         }
     }
+
+    /// Drop every PTE that points into `start_page..start_page + pages` of
+    /// this object, borrowers of its pages included.
+    ///
+    /// The rule every operation that hands frames back to the allocator has
+    /// to keep -- no PTE may go on pointing at them -- written once. Three
+    /// operations release frames (`decommit`, `set_len` and `zero`) and only
+    /// `decommit` used to keep it: a shrink or a whole-page zero left
+    /// userspace with a live PTE onto a frame the allocator had taken back,
+    /// and a whole-page zero left it reading the bytes it had just asked to
+    /// have zeroed.
+    ///
+    /// `mappings` is what the caller collected while it still held the family
+    /// lock. The passes below run WITHOUT it, so the mapping locks can be
+    /// taken in blocking mode and no stale PTE is skipped on contention.
+    fn unmap_released(&self, mappings: Vec<Arc<VmMapping>>, start_page: usize, pages: usize) {
+        if pages == 0 {
+            return;
+        }
+        for map in mappings {
+            map.range_change_blocking(start_page, pages, RangeChangeOp::Unmap);
+        }
+        // A borrower's PTEs point at THIS object's frames and it has no way
+        // of learning that they went; only the cache knows who borrows it.
+        let borrowers: Vec<(Arc<VmMapping>, usize)> = self
+            .borrower_maps
+            .lock()
+            .iter()
+            .filter_map(|(m, base)| m.upgrade().map(|m| (m, *base)))
+            .collect();
+        for (map, base) in borrowers {
+            let s = start_page.max(base);
+            let e = (start_page + pages).max(base);
+            if e > s {
+                map.range_change_blocking(s - base, e - s, RangeChangeOp::Unmap);
+            }
+        }
+    }
+
+    /// The mappings of this object, for an unmap pass that runs once the
+    /// family lock is back down.
+    fn live_mappings(&self) -> Vec<Arc<VmMapping>> {
+        self.get_inner()
+            .mappings
+            .iter()
+            .filter_map(|map| map.upgrade())
+            .collect()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -926,6 +974,12 @@ impl VMObjectTrait for VMObjectPaged {
 
     fn zero(&self, offset: usize, len: usize) -> ZxResult {
         let mut range_changes = Vec::new();
+        // The whole-page path below drops frames, so it releases memory just
+        // like `decommit` does and takes the same window. See `set_len`.
+        let _decommit_guard = DecommitGuard::begin(self);
+        // First page dropped, and how many: the blocks a `zero` walks are
+        // consecutive, so the pages it drops are one run.
+        let mut released: Option<(usize, usize)> = None;
         let ret = (|| {
             let mut inner = self.get_inner_mut();
             // Checked, because `zx_vmo_op_range(ZX_VMO_OP_ZERO)` hands both
@@ -948,6 +1002,10 @@ impl VMObjectTrait for VMObjectPaged {
                     let _ = inner.commit_page(block.block, MMUFlags::WRITE, &mut range_changes)?;
                     unwanted.push_back(block.block + inner.parent_offset / PAGE_SIZE);
                     inner.frames.remove(&block.block);
+                    released = Some(match released {
+                        None => (block.block, 1),
+                        Some((first, _)) => (first, block.block + 1 - first),
+                    });
                 } else if inner.committed_pages_in_range(block.block, block.block + 1) != 0 {
                     // check whether this page is initialized, otherwise nothing should be done
                     let paddr =
@@ -959,6 +1017,14 @@ impl VMObjectTrait for VMObjectPaged {
             Ok(())
         })();
         apply_deferred_range_changes(range_changes);
+        // A dropped frame is a dropped frame whichever operation dropped it:
+        // without this the next read through a mapping came back with the
+        // bytes the caller had just asked to have zeroed, off a frame the
+        // allocator had taken back. Runs even when the loop gave up partway,
+        // because the pages it got through are gone either way.
+        if let Some((first, pages)) = released {
+            self.unmap_released(self.live_mappings(), first, pages);
+        }
         ret
     }
 
@@ -969,14 +1035,30 @@ impl VMObjectTrait for VMObjectPaged {
     fn set_len(&self, len: usize) -> ZxResult {
         assert!(page_aligned(len));
         let mut deferred: Vec<Arc<VMObjectPaged>> = Vec::new();
-        {
+        // Shrinking hands frames back to the allocator, so this opens the
+        // decommit window too: a fault that is between `commit_page` and
+        // publishing its PTE gives up and retries instead of mapping a frame
+        // that is on its way out. Taken for a grow as well, which releases
+        // nothing -- the window then closes a few instructions later, and a
+        // guard that depends on which way the object is about to be resized
+        // would have to read `size` before taking the lock that decides it.
+        let _decommit_guard = DecommitGuard::begin(self);
+        let released = {
             let mut inner = self.get_inner_mut();
             if inner.pin_count > 0 {
                 return Err(ZxError::BAD_STATE);
             }
+            let old_len = inner.size;
             inner.resize(len, &mut deferred);
-        }
+            old_len.saturating_sub(len) / PAGE_SIZE
+        };
         drop(deferred);
+        // `resize` dropped the frames of every page past `len`; the mappings
+        // that still point at them are this object's to tear down, exactly as
+        // in `decommit`. Collected after the family lock is back down: a
+        // mapping that arrives after this point faults for its PTEs, and the
+        // frames are already gone by then.
+        self.unmap_released(self.live_mappings(), len / PAGE_SIZE, released);
         Ok(())
     }
 
@@ -984,6 +1066,17 @@ impl VMObjectTrait for VMObjectPaged {
         let mut range_changes = Vec::new();
         let ret = {
             let mut inner = self.get_inner_mut();
+            // The page-fault path arrives here, and a mapping outlives the
+            // pages it covers: `zx_vmo_set_size` can shrink the object under a
+            // mapping that was within it when it was made. A write fault past
+            // the end used to demand-allocate a frame at an index the object
+            // does not have -- one that `committed_pages_in_range`, which
+            // clamps to `size`, could never report again. Out of range is an
+            // error here, and the fault becomes an exception, which is what a
+            // read or a write of that same address already answers.
+            if page_idx >= inner.size / PAGE_SIZE {
+                return Err(ZxError::OUT_OF_RANGE);
+            }
             let flags = self.shared_commit_flags(&inner, flags);
             inner.commit_page(page_idx, flags, &mut range_changes)
         };
@@ -1018,6 +1111,16 @@ impl VMObjectTrait for VMObjectPaged {
         let mut range_changes = Vec::new();
         let ret = (|| {
             let mut inner = self.get_inner_mut();
+            // The other half of the bound `zero` carries. Past the end,
+            // `commit_page` demand-allocated real frames at page indices this
+            // object does not have -- and `committed_pages_in_range` clamps to
+            // `size`, so nothing that reports what a VMO holds could see them:
+            // one `zx_vmo_op_range(COMMIT)` made a one-page object hold
+            // sixty-four while every counter still said one.
+            let end = offset.checked_add(len).ok_or(ZxError::OUT_OF_RANGE)?;
+            if end > inner.size {
+                return Err(ZxError::OUT_OF_RANGE);
+            }
             for i in 0..pages {
                 inner.commit_page(start_page + i, MMUFlags::WRITE, &mut range_changes)?;
             }
@@ -1041,6 +1144,14 @@ impl VMObjectTrait for VMObjectPaged {
             let mut inner = self.get_inner_mut();
             if inner.parent.is_some() {
                 return Err(ZxError::NOT_SUPPORTED);
+            }
+            // Same bound `zero` carries, and the one `VMObjectSlice` already
+            // wrote down for this very operation: `zx_vmo_op_range` hands
+            // `offset` and `len` through from userspace with nothing but an
+            // alignment check of its own.
+            let end = offset.checked_add(len).ok_or(ZxError::OUT_OF_RANGE)?;
+            if end > inner.size {
+                return Err(ZxError::OUT_OF_RANGE);
             }
             // A pinned page is one a device may be doing DMA into right now:
             // handing its frame back to the allocator is a use-after-free that
@@ -1067,25 +1178,8 @@ impl VMObjectTrait for VMObjectPaged {
                 .filter_map(|map| map.upgrade())
                 .collect::<Vec<_>>()
         };
-        // The frames are gone; no PTE may keep pointing at them. Do the unmap
-        // pass after dropping the VMO family lock so we can take mapping locks
-        // in blocking mode and never skip a stale PTE on contention.
-        for map in mappings {
-            map.range_change_blocking(start_page, pages, RangeChangeOp::Unmap);
-        }
-        let borrowers: Vec<(Arc<VmMapping>, usize)> = self
-            .borrower_maps
-            .lock()
-            .iter()
-            .filter_map(|(m, base)| m.upgrade().map(|m| (m, *base)))
-            .collect();
-        for (map, base) in borrowers {
-            let s = start_page.max(base);
-            let e = (start_page + pages).max(base);
-            if e > s {
-                map.range_change_blocking(s - base, e - s, RangeChangeOp::Unmap);
-            }
-        }
+        // The frames are gone; no PTE may keep pointing at them.
+        self.unmap_released(mappings, start_page, pages);
         Ok(())
     }
 
@@ -2794,5 +2888,124 @@ mod pin_tests {
         vmo.unpin(0, 0).unwrap();
         vmo.decommit(0, PAGE_SIZE).unwrap();
         assert_eq!(held(&vmo), [false, true, true, true]);
+    }
+}
+
+#[cfg(test)]
+mod range_bound_tests {
+    //! One question -- is this page inside the object? -- asked by six
+    //! operations that all take an offset and a length straight from
+    //! userspace, and answered by four of them.
+    //!
+    //! `zx_vmo_op_range` checks that both numbers are page-aligned and hands
+    //! them through; `VMObjectSlice` wrote the bound down for its own
+    //! `commit`/`decommit` ("hands `offset` and `len` through unbounded"), and
+    //! `zero` carries it too. The object underneath did not, so a commit past
+    //! the end demand-allocated real frames at page indices the object does
+    //! not have -- and `committed_pages_in_range` clamps to `size`, so no
+    //! counter that reports what a VMO is holding could see them afterwards.
+    use super::*;
+
+    /// A one-page object, so page 1 is the first one outside it.
+    fn one_page() -> Arc<VmObject> {
+        VmObject::new_paged(1)
+    }
+
+    #[test]
+    /// All six give the same answer for the same range. Two of them did not.
+    fn every_range_operation_answers_the_same_bound() {
+        let vmo = one_page();
+        let mut buf = [0u8; 1];
+        assert_eq!(vmo.read(PAGE_SIZE, &mut buf), Err(ZxError::OUT_OF_RANGE));
+        assert_eq!(vmo.write(PAGE_SIZE, &[9]), Err(ZxError::OUT_OF_RANGE));
+        assert_eq!(vmo.zero(PAGE_SIZE, PAGE_SIZE), Err(ZxError::OUT_OF_RANGE));
+        assert_eq!(vmo.pin(PAGE_SIZE, PAGE_SIZE), Err(ZxError::OUT_OF_RANGE));
+        assert_eq!(vmo.commit(PAGE_SIZE, PAGE_SIZE), Err(ZxError::OUT_OF_RANGE));
+        assert_eq!(
+            vmo.decommit(PAGE_SIZE, PAGE_SIZE),
+            Err(ZxError::OUT_OF_RANGE)
+        );
+    }
+
+    #[test]
+    /// And the frames are the point: `zx_vmo_op_range(ZX_VMO_OP_COMMIT)` over
+    /// sixty-four pages of a one-page object really allocated sixty-four
+    /// frames, while `zx_object_get_info` went on reporting one page
+    /// committed. Every accounting and memory-pressure figure in the kernel
+    /// reads those clamped counters, so an unprivileged process could hold
+    /// physical memory that nothing could account for.
+    fn a_commit_past_the_end_allocates_nothing() {
+        let vmo = one_page();
+        let before = vmo_page_bytes();
+        assert_eq!(
+            vmo.commit(0, 64 * PAGE_SIZE),
+            Err(ZxError::OUT_OF_RANGE),
+            "a one-page object accepted a sixty-four-page commit"
+        );
+        assert_eq!(
+            vmo_page_bytes(),
+            before,
+            "the refused commit still allocated frames"
+        );
+        assert_eq!(vmo.get_info().committed_bytes, 0);
+    }
+
+    #[test]
+    /// All or nothing, like the pinned-page refusal next door: a range with
+    /// one page outside the object leaves the pages inside it alone, rather
+    /// than committing as far as it can and then failing.
+    fn a_partly_out_of_range_commit_leaves_the_object_alone() {
+        let vmo = one_page();
+        assert_eq!(
+            vmo.commit(0, 2 * PAGE_SIZE),
+            Err(ZxError::OUT_OF_RANGE),
+            "a two-page commit on a one-page object"
+        );
+        assert_eq!(
+            vmo.committed_pages_in_range(0, 1),
+            0,
+            "the page inside the object was committed by a refused call"
+        );
+    }
+
+    #[test]
+    /// A sum that wraps is out of range, not a short range that happens to
+    /// fit. `zx_vmo_op_range` page-aligns both numbers and nothing else, so
+    /// the pair below arrives exactly as written.
+    fn a_range_that_wraps_is_out_of_range() {
+        let vmo = one_page();
+        let high = usize::MAX - PAGE_SIZE + 1;
+        assert_eq!(vmo.commit(high, PAGE_SIZE * 2), Err(ZxError::OUT_OF_RANGE));
+        assert_eq!(
+            vmo.decommit(high, PAGE_SIZE * 2),
+            Err(ZxError::OUT_OF_RANGE)
+        );
+    }
+
+    #[test]
+    /// The bound is on the end of the range, so an empty range that starts
+    /// exactly at the end of the object is inside it -- the same answer a
+    /// zero-length pin already gave.
+    fn an_empty_range_at_the_very_end_is_allowed() {
+        let vmo = one_page();
+        vmo.commit(PAGE_SIZE, 0).unwrap();
+        vmo.decommit(PAGE_SIZE, 0).unwrap();
+        vmo.pin(PAGE_SIZE, 0).unwrap();
+        vmo.zero(PAGE_SIZE, 0).unwrap();
+        // One past it is not.
+        assert_eq!(
+            vmo.commit(PAGE_SIZE + PAGE_SIZE, 0),
+            Err(ZxError::OUT_OF_RANGE)
+        );
+    }
+
+    #[test]
+    /// The whole object still commits, which is what the bound must not cost.
+    fn committing_the_whole_object_still_works() {
+        let vmo = VmObject::new_paged(4);
+        vmo.commit(0, 4 * PAGE_SIZE).unwrap();
+        assert_eq!(vmo.committed_pages_in_range(0, 4), 4);
+        vmo.decommit(0, 4 * PAGE_SIZE).unwrap();
+        assert_eq!(vmo.committed_pages_in_range(0, 4), 0);
     }
 }
