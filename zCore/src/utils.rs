@@ -1,4 +1,4 @@
-use alloc::{collections::BTreeMap, string::String, sync::Arc};
+use alloc::{string::String, sync::Arc};
 use zircon_object::{object::KernelObject, task::Process};
 
 #[derive(Debug)]
@@ -17,20 +17,6 @@ pub struct BootOptions {
     pub shell_proc: String,
 }
 
-fn parse_cmdline(cmdline: &str) -> BTreeMap<&str, &str> {
-    let mut options = BTreeMap::new();
-    for opt in cmdline.split(':') {
-        // parse "key=value"
-        let mut iter = opt.trim().splitn(2, '=');
-        if let Some(key) = iter.next() {
-            if let Some(value) = iter.next() {
-                options.insert(key.trim(), value.trim());
-            }
-        }
-    }
-    options
-}
-
 pub fn boot_options() -> BootOptions {
     cfg_if! {
         if #[cfg(feature = "libos")] {
@@ -45,8 +31,8 @@ pub fn boot_options() -> BootOptions {
 
             let (cmdline, log_level) = if cfg!(feature = "zircon") {
                 let cmdline = args.get(2).cloned().unwrap_or_default();
-                let options = parse_cmdline(&cmdline);
-                let log_level = String::from(*options.get("LOG").unwrap_or(&""));
+                let log_level =
+                    String::from(kernel_hal::cmdline::value(&cmdline, "LOG").unwrap_or(""));
                 (cmdline, log_level)
             } else {
                 (String::new(), std::env::var("LOG").unwrap_or_default())
@@ -63,10 +49,9 @@ pub fn boot_options() -> BootOptions {
         } else {
             use alloc::string::ToString;
             let cmdline = kernel_hal::boot::cmdline();
-            let options = parse_cmdline(&cmdline);
+            let opt = |k: &str| kernel_hal::cmdline::value(&cmdline, k);
             BootOptions {
-                cmdline: cmdline.clone(),
-                log_level: options.get("LOG").unwrap_or(&"").to_string(),
+                log_level: opt("LOG").unwrap_or("").to_string(),
                 // `INIT` selects the PID 1 process. Default `/sbin/init`, which
                 // the rootfs points at Eclipse's native `eclipse-init` (the
                 // default init system); if its cross-build was unavailable the
@@ -75,13 +60,13 @@ pub fn boot_options() -> BootOptions {
                 // at PIDs 101.. (default busybox); `ROOTPROC` is accepted as a
                 // deprecated alias for `SHELL`.
                 #[cfg(feature = "linux")]
-                init_proc: options.get("INIT").unwrap_or(&"/sbin/init").to_string(),
+                init_proc: opt("INIT").unwrap_or("/sbin/init").to_string(),
                 #[cfg(feature = "linux")]
-                shell_proc: options
-                    .get("SHELL")
-                    .or_else(|| options.get("ROOTPROC"))
-                    .unwrap_or(&"/bin/busybox?sh")
+                shell_proc: opt("SHELL")
+                    .or_else(|| opt("ROOTPROC"))
+                    .unwrap_or("/bin/busybox?sh")
                     .to_string(),
+                cmdline,
             }
         }
     }

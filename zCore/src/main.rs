@@ -95,11 +95,11 @@ fn primary_main(config: kernel_hal::KernelConfig) {
     // real difference either way. See docs/README-performance.md.
     #[cfg(not(feature = "libos"))]
     {
-        if options.cmdline.contains("TIMERDEADLINE=0") {
+        if kernel_hal::cmdline::is_off(&options.cmdline, "TIMERDEADLINE") {
             kernel_hal::timer::set_deadline_timer(false);
             klog_info!("Eclipse: deadline timer DISABLED (TIMERDEADLINE=0)");
         }
-        if options.cmdline.contains("WAKEPREEMPT=0") {
+        if kernel_hal::cmdline::is_off(&options.cmdline, "WAKEPREEMPT") {
             executor::set_wakeup_preempt(false);
             klog_info!("Eclipse: wake-up preemption DISABLED (WAKEPREEMPT=0)");
         }
@@ -108,7 +108,7 @@ fn primary_main(config: kernel_hal::KernelConfig) {
         // `PANICONOOPS=1` restores the immediate halt, which is what one wants
         // while debugging a specific failure — the machine freezes on the spot,
         // dump intact and the guilty coroutine still standing.
-        if options.cmdline.contains("PANICONOOPS=1") {
+        if kernel_hal::cmdline::flag(&options.cmdline, "PANICONOOPS") {
             oops::set_panic_on_oops(true);
             klog_info!("Eclipse: kernel fault containment DISABLED (PANICONOOPS=1)");
         } else {
@@ -123,7 +123,7 @@ fn primary_main(config: kernel_hal::KernelConfig) {
         // pointer that writes into freed stack memory faults AT THE WRITER's rip
         // (`[stack-uaf]`) — the diagnostic that pins the transient-executor UAF.
         // Costs held memory + a TLB shootdown per free, so it is opt-in.
-        if options.cmdline.contains("STACKQUARANTINE=1") {
+        if kernel_hal::cmdline::flag(&options.cmdline, "STACKQUARANTINE") {
             executor::set_stack_quarantine_enabled(true);
             klog_info!(
                 "Eclipse: freed-stack quarantine ENABLED (STACKQUARANTINE=1) — \
@@ -149,11 +149,11 @@ fn primary_main(config: kernel_hal::KernelConfig) {
         // fixed by the shootdown spin-pump — root cause and re-validation recorded
         // there. `FORKCOW=0` is the kill-switch; `FORKCOW=1` stays accepted so
         // existing command lines keep meaning what they say.
-        if options.cmdline.contains("FORKCOW=1") {
+        if kernel_hal::cmdline::flag(&options.cmdline, "FORKCOW") {
             zircon_object::vm::set_cow_fork(true);
             klog_info!("Eclipse: copy-on-write fork ENABLED (FORKCOW=1)");
         }
-        if options.cmdline.contains("FORKCOW=0") {
+        if kernel_hal::cmdline::is_off(&options.cmdline, "FORKCOW") {
             zircon_object::vm::set_cow_fork(false);
             klog_info!("Eclipse: copy-on-write fork DISABLED (FORKCOW=0) -- eager copy");
         }
@@ -161,7 +161,7 @@ fn primary_main(config: kernel_hal::KernelConfig) {
         // this is the hottest path in the kernel; on, it is two `rdtsc`s and two
         // relaxed adds per allocation, which is enough to answer whether the
         // allocator is what makes `fork` quadratic in its mapping count.
-        if options.cmdline.contains("HEAPPROF=1") {
+        if kernel_hal::cmdline::flag(&options.cmdline, "HEAPPROF") {
             kernel_hal::kstats::set_heap_prof(true);
             klog_info!("Eclipse: kernel heap profiling ENABLED (HEAPPROF=1)");
         }
@@ -175,15 +175,9 @@ fn primary_main(config: kernel_hal::KernelConfig) {
         // The recorder lives in linux-object, which a zircon-only kernel does
         // not link.
         #[cfg(feature = "linux")]
-        if let Some(rest) = options.cmdline.split("BOOTTRACE=").nth(1) {
-            // Stop at any cmdline separator: ':' (the QEMU-style list), a space,
-            // or ','. A comm has none of these.
-            let comm: alloc::string::String = rest
-                .chars()
-                .take_while(|c| !c.is_ascii_whitespace() && *c != ',' && *c != ':')
-                .collect();
+        if let Some(comm) = kernel_hal::cmdline::value(&options.cmdline, "BOOTTRACE") {
             if !comm.is_empty() {
-                linux_object::boot_trace::set_target(&comm);
+                linux_object::boot_trace::set_target(comm);
                 klog_info!("Eclipse: boot-trace ARMED for comm '{}' (BOOTTRACE)", comm);
             }
         }
@@ -194,8 +188,8 @@ fn primary_main(config: kernel_hal::KernelConfig) {
         // the rate counters are opt-in. Two spellings accepted: HUNTERANOMALY=1
         // and HUNTER_ANOMALY=1 (a parallel branch introduced the underscored
         // A/B knob when the default was still on; =0 is now the default state).
-        if options.cmdline.contains("HUNTERANOMALY=1")
-            || options.cmdline.contains("HUNTER_ANOMALY=1")
+        if kernel_hal::cmdline::flag(&options.cmdline, "HUNTERANOMALY")
+            || kernel_hal::cmdline::flag(&options.cmdline, "HUNTER_ANOMALY")
         {
             hunter::heuristics::set_anomaly_detection(true);
             klog_info!("Eclipse: hunter rate heuristics ENABLED (HUNTERANOMALY=1)");
@@ -205,7 +199,7 @@ fn primary_main(config: kernel_hal::KernelConfig) {
         // `VmAddressRegion::fork_from` for why that condition is what makes it
         // sound. `FORKGATHER=0` restores one shootdown per mapping, which is
         // what the benchmark's `fork cost per mapping` row exists to expose.
-        if options.cmdline.contains("FORKGATHER=0") {
+        if kernel_hal::cmdline::is_off(&options.cmdline, "FORKGATHER") {
             zircon_object::vm::set_fork_gather(false);
             klog_info!("Eclipse: batched fork TLB shootdown DISABLED (FORKGATHER=0)");
         }
@@ -225,7 +219,7 @@ fn primary_main(config: kernel_hal::KernelConfig) {
         // NOT a switch to set on real hardware that declines to advertise an
         // invariant TSC, because there the counter may genuinely drift between
         // sockets and userspace has no way to notice.
-        if options.cmdline.contains("VDSOFORCE=1") {
+        if kernel_hal::cmdline::flag(&options.cmdline, "VDSOFORCE") {
             kernel_hal::timer::set_force_tsc_invariant(true);
             klog_info!("Eclipse: vDSO forced on despite CPUID (VDSOFORCE=1)");
         }
@@ -238,7 +232,7 @@ fn primary_main(config: kernel_hal::KernelConfig) {
         // it), and is fixed; see `kernel_hal::common::ipi::SMP_ENABLED`.
         // `smp=off` remains for bringing a suspect machine up single-core
         // without a rebuild.
-        if options.cmdline.contains("smp=off") {
+        if kernel_hal::cmdline::is_off(&options.cmdline, "smp") {
             kernel_hal::set_smp_enabled(false);
             klog_info!("Eclipse: single-core boot forced (smp=off)");
         } else {
@@ -252,7 +246,7 @@ fn primary_main(config: kernel_hal::KernelConfig) {
         // `kernel_hal::console::set_diag_present_over_graphics` existed for
         // this and had no caller, so the diagnostic could not be turned on at
         // all; this is its switch.
-        if options.cmdline.contains("console.overgraphics") {
+        if kernel_hal::cmdline::flag(&options.cmdline, "console.overgraphics") {
             kernel_hal::console::set_diag_present_over_graphics(true);
             klog_info!(
                 "Eclipse: console.overgraphics ON — el log del kernel se sigue pintando \
@@ -500,7 +494,7 @@ fn primary_main(config: kernel_hal::KernelConfig) {
             // still present through the slow CPU scanout path. Opt-out with
             // `nvidia.nocepresent`. On failure CE auto-wedges and falls back to
             // CPU blit (see CE_PRESENT_WEDGED in nvidia.rs).
-            let ce_ready = if !options.cmdline.contains("nvidia.noautoboot") {
+            let ce_ready = if !kernel_hal::cmdline::flag(&options.cmdline, "nvidia.noautoboot") {
                 auto_bringup_compute_gpus()
             } else {
                 klog_info!("Eclipse: NVIDIA compute-GPU auto bring-up disabled (nvidia.noautoboot)");
@@ -534,14 +528,14 @@ fn primary_main(config: kernel_hal::KernelConfig) {
             // NOTE: do NOT auto-bring-up the CONSOLE GPU on the boot path.
             // Deferred bring-up is scheduled AFTER 100% (see
             // schedule_deferred_console_bringup) with scanout paused.
-            if options.cmdline.contains("nvidia.hwcursor") {
+            if kernel_hal::cmdline::flag(&options.cmdline, "nvidia.hwcursor") {
                 linux_object::fs::devfs::drm::set_hw_cursor_enabled(true);
                 klog_info!(
                     "Eclipse: nvidia.hwcursor ON — bring-up diferido tras escritorio \
                      (scanout pausado); cursor software hasta entonces"
                 );
             }
-            if options.cmdline.contains("nvidia.console_gpu") {
+            if kernel_hal::cmdline::flag(&options.cmdline, "nvidia.console_gpu") {
                 klog_info!(
                     "Eclipse: nvidia.console_gpu ON — bring-up diferido de la GPU de consola \
                      tras escritorio; si sube, el present pasa a su propio copy engine"
@@ -550,13 +544,13 @@ fn primary_main(config: kernel_hal::KernelConfig) {
             // Opt-in CE present on DRM page_flip (GOP via copy-engine). Default
             // off; does not claim hardware KMS. Pair with CE present / dual-GPU
             // bring-up for best results.
-            if options.cmdline.contains("nvidia.hwflip") {
+            if kernel_hal::cmdline::flag(&options.cmdline, "nvidia.hwflip") {
                 kernel_hal::drivers::set_hwflip_enabled(true);
                 klog_info!(
                     "Eclipse: nvidia.hwflip ON — page_flip intentará CE present al GOP"
                 );
             }
-            if options.cmdline.contains("nvidia.surfaceflip") {
+            if kernel_hal::cmdline::flag(&options.cmdline, "nvidia.surfaceflip") {
                 kernel_hal::drivers::set_surfaceflip_enabled(true);
                 klog_info!(
                     "Eclipse: nvidia.surfaceflip ON — page_flip intentará NVC57E ISO (VRAM)"
@@ -568,7 +562,7 @@ fn primary_main(config: kernel_hal::KernelConfig) {
             // used (`nouveau.atomic=1`). Boot with `drm.atomic` to let
             // compositors take the atomic path; without it they fall back to
             // legacy KMS exactly as before.
-            if options.cmdline.contains("drm.atomic") {
+            if kernel_hal::cmdline::flag(&options.cmdline, "drm.atomic") {
                 linux_object::fs::devfs::drm::set_atomic_enabled(true);
                 klog_info!("Eclipse: DRM atomic modesetting ENABLED (drm.atomic)");
             }
@@ -594,13 +588,13 @@ fn primary_main(config: kernel_hal::KernelConfig) {
             // (lookup + BAR1 map + inline fence poll per submit) instead of
             // the direct-submit path. Only for A/B comparison; see
             // docs/README-nouveau-uapi.md ("Direct submit").
-            if options.cmdline.contains("nvidia.exec_rm") {
+            if kernel_hal::cmdline::flag(&options.cmdline, "nvidia.exec_rm") {
                 kernel_hal::drivers::set_exec_fast_enabled(false);
                 klog_info!(
                     "Eclipse: nvidia.exec_rm -- EXEC direct-submit path DISABLED (RM per-submit path, synchronous fence poll)"
                 );
             }
-            if options.cmdline.contains("nvidia.nouveau_uapi") {
+            if kernel_hal::cmdline::flag(&options.cmdline, "nvidia.nouveau_uapi") {
                 let capable = kernel_hal::drivers::all_drm()
                     .as_vec()
                     .iter()
@@ -630,7 +624,7 @@ fn primary_main(config: kernel_hal::KernelConfig) {
             // instead, once the pause is in place (see
             // `schedule_deferred_console_bringup`). Passing both flags is still
             // the way to ask for on-demand bring-up at the first client.
-            if options.cmdline.contains("nvidia.console_gsp") {
+            if kernel_hal::cmdline::flag(&options.cmdline, "nvidia.console_gsp") {
                 kernel_hal::drivers::set_console_gsp_enabled(true);
                 klog_info!(
                     "Eclipse: nvidia.console_gsp -- console GPU GSP on-demand bring-up ENABLED"
@@ -713,8 +707,8 @@ fn primary_main(config: kernel_hal::KernelConfig) {
             kernel_hal::console::early_progress_bar(100);
             // Either flag wants the console GPU up; the task runs once and
             // serves both (hardware cursor plane and/or local CE present).
-            let want_console_gpu = options.cmdline.contains("nvidia.console_gpu");
-            if options.cmdline.contains("nvidia.hwcursor") || want_console_gpu {
+            let want_console_gpu = kernel_hal::cmdline::flag(&options.cmdline, "nvidia.console_gpu");
+            if kernel_hal::cmdline::flag(&options.cmdline, "nvidia.hwcursor") || want_console_gpu {
                 let reason = if want_console_gpu {
                     "nvidia.console_gpu"
                 } else {
@@ -722,10 +716,10 @@ fn primary_main(config: kernel_hal::KernelConfig) {
                 };
                 schedule_deferred_console_bringup(
                     reason,
-                    !options.cmdline.contains("nvidia.nocepresent"),
+                    !kernel_hal::cmdline::flag(&options.cmdline, "nvidia.nocepresent"),
                     // `nvidia.console_gpu` deliberately left the console-GSP
                     // gate shut at boot; the task opens it under the pause.
-                    want_console_gpu && !options.cmdline.contains("nvidia.console_gsp"),
+                    want_console_gpu && !kernel_hal::cmdline::flag(&options.cmdline, "nvidia.console_gsp"),
                 );
             }
             #[cfg(all(feature = "linux", not(feature = "libos")))]

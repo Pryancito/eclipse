@@ -1517,23 +1517,15 @@ fn determine_real_root(
     None
 }
 
-/// Extract the `ROOT=` device from the kernel command line, which is a
-/// `:`-separated list of `KEY=value` pairs (e.g. `LOG=info:ROOT=/dev/sda2`).
+/// Extract the `ROOT=` device from the kernel command line.
+///
+/// The installer substitutes `__ECLIPSE_CMDROOTDEV` for the real partition;
+/// on the live medium it is left as written, and an unsubstituted placeholder
+/// is not a device.
 fn parse_root_cmdline(cmdline: &str) -> Option<&str> {
-    for opt in cmdline.split(':') {
-        let mut it = opt.trim().splitn(2, '=');
-        let key = it.next().unwrap_or("").trim();
-        if key.eq_ignore_ascii_case("ROOT") {
-            let val = it.next().unwrap_or("").trim();
-            if !val.is_empty()
-                && !val.starts_with("__ECLIPSE_")
-                && val != "/dev/__ECLIPSE_CMDROOTDEV"
-            {
-                return Some(val);
-            }
-        }
-    }
-    None
+    let val = kernel_hal::cmdline::value(cmdline, "ROOT")?;
+    (!val.is_empty() && !val.starts_with("__ECLIPSE_") && val != "/dev/__ECLIPSE_CMDROOTDEV")
+        .then_some(val)
 }
 
 /// True for partition nodes (`sda2`, `nvme0n1p3`, …), false for whole disks (`sda`).

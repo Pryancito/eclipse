@@ -111,8 +111,14 @@ fn cap_at_base_clock() -> bool {
     // Parsed once; every logical CPU (BSP + APs) asks during its power init.
     static CAP: spin::Once<bool> = spin::Once::new();
     *CAP.call_once(|| {
-        let cmdline = super::cmdline();
-        cmdline.contains("noturbo") || cmdline.contains("turbo=off")
+        // Two spellings of one switch. Read as keys rather than as text: the
+        // substring test that used to be here said yes to `noturbo=0`, so the
+        // one way to ask for turbo *back* was the one way to lose it -- and
+        // yes to `turbo=off` written inside somebody else's value.
+        let c = super::cmdline();
+        crate::cmdline::flag(&c, "noturbo")
+            || crate::cmdline::value(&c, "turbo").and_then(crate::cmdline::parse_bool)
+                == Some(false)
     })
 }
 

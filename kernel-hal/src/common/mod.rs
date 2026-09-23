@@ -8,6 +8,7 @@ pub(super) mod vm;
 pub mod addr;
 #[cfg(feature = "graphic")]
 pub mod boot_logo;
+pub mod cmdline;
 pub mod console;
 pub mod context;
 pub mod deadline;
