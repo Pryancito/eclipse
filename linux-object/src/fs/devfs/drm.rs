@@ -3081,18 +3081,11 @@ pub fn page_flip(
     // DRM master and the desktop falls back to the text console ("se dibuja y
     // desaparece"). Deliver the outstanding completion NOW and accept the flip;
     // one event per flip is still preserved, only this frame is un-paced.
-    if FLIP_EVENT_PENDING.load(Ordering::Acquire) {
-        flush_pending_flip_completions();
-        if FLIP_EVENT_PENDING.load(Ordering::Acquire) {
-            clear_stale_flip_pending();
-        }
-        if FLIP_EVENT_PENDING.load(Ordering::Acquire) {
-            // Should not reach here after the atomic set-and-push fix in
-            // schedule_flip_event, but keep as a safety net. Returning EBUSY
-            // here is a last resort; the alternative (proceeding with
-            // FLIP_EVENT_PENDING still set) risks a double-delivery.
-            return Err(FlipError::Busy);
-        }
+    if !settle_outstanding_flip() {
+        // Only a delivery that never finished gets here (see
+        // `settle_outstanding_flip`). EBUSY is the last resort; proceeding
+        // with FLIP_EVENT_PENDING still set risks a double-delivery.
+        return Err(FlipError::Busy);
     }
     let present = present_now_checked(fb_id, crtc_id, None);
     // A framebuffer that is not there is the one reason to fail the flip, and
@@ -3344,6 +3337,59 @@ fn clear_stale_flip_pending() {
     // delivered yet and letting a second frame through inside one vblank.
     if FLIPS_IN_FLIGHT.load(Ordering::Acquire) == 0 {
         FLIP_EVENT_PENDING.store(false, Ordering::Release);
+    }
+}
+
+/// How long [`settle_outstanding_flip`] waits for a completion that the timer
+/// has taken off the queue but not yet posted, counted in spins. The window is
+/// microseconds (build a 32-byte event, take the fd's queue lock, push); the
+/// limit only exists so that a counter which has somehow lost its deliverer
+/// cannot hold a syscall forever.
+const FLIP_DELIVERY_SPIN_LIMIT: u32 = 1 << 22;
+
+/// Bring the CRTC to "no completion outstanding" before a new flip or atomic
+/// commit is accepted. `true` when it is; `false` only when a completion stayed
+/// mid-delivery for the whole of [`FLIP_DELIVERY_SPIN_LIMIT`].
+///
+/// Three things can hold the latch: a flip still queued for the synthetic
+/// vblank (delivered now, see [`flush_pending_flip_completions`]); a latch
+/// left set with nothing behind it (cleared, see [`clear_stale_flip_pending`]);
+/// and a completion the timer is delivering at this very moment.
+/// `deliver_pending_drm_timer` drains the queue into a local before it posts
+/// anything, so for those few microseconds the job is in neither place while
+/// the counter still says one in flight -- and it must, or a second frame
+/// gets through inside one vblank. On one CPU that window never overlaps a
+/// syscall: the timer IRQ runs to completion first. With two, the compositor's
+/// next PAGE_FLIP can land exactly there, and this used to answer EBUSY -- the
+/// "safety net that should not trigger" -- which wlroots escalates into an
+/// output teardown (DROP_MASTER, and the desktop drops to the text console).
+/// The deliverer is on another CPU (another thread, under libos) and holds
+/// nothing this path needs, so wait for it.
+fn settle_outstanding_flip() -> bool {
+    let mut spins = 0u32;
+    loop {
+        if !FLIP_EVENT_PENDING.load(Ordering::Acquire) {
+            return true;
+        }
+        flush_pending_flip_completions();
+        if !FLIP_EVENT_PENDING.load(Ordering::Acquire) {
+            return true;
+        }
+        clear_stale_flip_pending();
+        if !FLIP_EVENT_PENDING.load(Ordering::Acquire) {
+            return true;
+        }
+        if spins >= FLIP_DELIVERY_SPIN_LIMIT {
+            return false;
+        }
+        // Mid-delivery. Give the deliverer a moment before looking again --
+        // re-flushing on every pass would only hammer the queue lock it may be
+        // about to take for a follow-up arm -- and flush again on the next
+        // pass in case another client queued a flip of its own meanwhile.
+        for _ in 0..64 {
+            core::hint::spin_loop();
+        }
+        spins += 64;
     }
 }
 
@@ -3858,6 +3904,7 @@ fn damage_rect_from_clips(data: &[u8], fb_w: u32, fb_h: u32) -> Option<(u32, u32
 /// Why an atomic check/commit was refused. Mapped to errno by the ioctl
 /// dispatcher (`Invalid` → EINVAL, `NotFound` → ENOENT, `Device` → EIO,
 /// `Busy` → EBUSY).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AtomicError {
     /// Malformed value, rect out of bounds, or a modeset without
     /// `DRM_MODE_ATOMIC_ALLOW_MODESET`.
@@ -4025,18 +4072,12 @@ pub fn atomic_commit(
     // A prior flip's completion is still outstanding. Flush it now — *before*
     // mutating scanout state — rather than refusing the commit with EBUSY:
     // wlroots turns an unexpected atomic-commit EBUSY into an output teardown
-    // (DROP_MASTER -> the desktop drops to the text console). See [`page_flip`].
-    // With schedule_flip_event now setting FLIP_EVENT_PENDING inside the queue
-    // lock (atomically with push_back), flush always finds the job; the inner
-    // EBUSY is a safety net that should not trigger in normal operation.
-    if want_event && FLIP_EVENT_PENDING.load(Ordering::Acquire) {
-        flush_pending_flip_completions();
-        if FLIP_EVENT_PENDING.load(Ordering::Acquire) {
-            clear_stale_flip_pending();
-        }
-        if FLIP_EVENT_PENDING.load(Ordering::Acquire) {
-            return Err(AtomicError::Busy);
-        }
+    // (DROP_MASTER -> the desktop drops to the text console). See [`page_flip`]
+    // and [`settle_outstanding_flip`], which also waits out a completion the
+    // timer is delivering on another CPU at this very moment; EBUSY is left
+    // for a delivery that never finishes.
+    if want_event && !settle_outstanding_flip() {
+        return Err(AtomicError::Busy);
     }
 
     // --- Commit phase ---
@@ -6324,6 +6365,8 @@ mod cursor_invalidate_tests {
 /// module, so a test can put them into exactly the state the race produced.
 #[cfg(test)]
 mod flip_latch_tests {
+    extern crate std;
+
     use super::*;
 
     /// Start from a clean slate; these statics are process-wide.
@@ -6443,6 +6486,197 @@ mod flip_latch_tests {
         flip_in_flight_done();
         assert_eq!(FLIPS_IN_FLIGHT.load(Ordering::Acquire), 0);
         assert!(!FLIP_EVENT_PENDING.load(Ordering::Acquire));
+        reset();
+    }
+
+    /// The window as the timer IRQ leaves it on another CPU: queued, drained,
+    /// not yet posted. [`finish_delivery`] is the other half.
+    fn leave_one_mid_delivery(file: &Arc<DrmFileState>) {
+        queue_one(file);
+        let drained: Vec<PendingDrmTimer> = PENDING_DRM_TIMERS.lock().drain(..).collect();
+        assert_eq!(drained.len(), 1);
+        assert!(FLIP_EVENT_PENDING.load(Ordering::Acquire));
+    }
+
+    /// Also puts the next vblank slot in the future as of now: the racer
+    /// goes ahead the moment this returns, and a commit that finds the slot
+    /// already missed delivers its own completion on the spot (see
+    /// `arm_coalesced_drm_timer_locked`), leaving nothing to look at.
+    fn finish_delivery(file: &DrmFileState) {
+        DRM_STATE.lock().next_vblank = kernel_hal::timer::timer_now();
+        queue_flip_event(file, SYNTH_CRTC_ID, 0xF11D);
+    }
+
+    /// Run `f` on another thread -- the compositor's syscall on another CPU
+    /// than the timer -- with the delivery held open until `f` has certainly
+    /// reached its settle step, then finish the delivery. Returns what `f`
+    /// answered and whether the first completion was already on the fd when
+    /// it did: a caller that went ahead early sees an empty fd.
+    fn race_against_delivery<R: Send + 'static>(
+        file: &Arc<DrmFileState>,
+        f: impl FnOnce(&Arc<DrmFileState>) -> R + Send + 'static,
+    ) -> (R, bool) {
+        let entered = Arc::new(AtomicBool::new(false));
+        let racer = {
+            let file = file.clone();
+            let entered = entered.clone();
+            std::thread::spawn(move || {
+                entered.store(true, Ordering::Release);
+                let answer = f(&file);
+                (answer, file.has_events())
+            })
+        };
+        while !entered.load(Ordering::Acquire) {
+            std::thread::yield_now();
+        }
+        std::thread::sleep(Duration::from_millis(20));
+        assert_eq!(
+            FLIPS_IN_FLIGHT.load(Ordering::Acquire),
+            1,
+            "the racer went ahead while the delivery was still open"
+        );
+        finish_delivery(file);
+        racer.join().expect("the racer panicked")
+    }
+
+    /// A completion that `atomic_commit` scheduled has armed the real timer,
+    /// which fires on another thread here. Let it, so it does not go off in
+    /// the middle of whichever test runs next.
+    fn let_the_armed_timer_fire() {
+        for _ in 0..200 {
+            if !DRM_TIMER_ARMED.load(Ordering::Acquire) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        panic!("the vblank timer never fired");
+    }
+
+    /// The compositor's next PAGE_FLIP lands on one CPU while the timer IRQ on
+    /// another has the previous completion drained but not yet posted. This
+    /// used to be EBUSY -- the "safety net" in `page_flip` -- and wlroots tears
+    /// the output down on that. It waits for the delivery instead.
+    #[test]
+    fn a_flip_that_lands_mid_delivery_waits_for_it_instead_of_ebusy() {
+        let _serialised = super::test_globals::lock();
+        reset();
+        let file = DrmFileState::new();
+        leave_one_mid_delivery(&file);
+
+        let (answer, first_completion_was_on_the_fd) = race_against_delivery(&file, |file| {
+            page_flip(0x77, SYNTH_CRTC_ID, 0xF1A9, true, file)
+        });
+        // 0x77 is no framebuffer, so past the settle step the answer is the
+        // fb's own. What matters is that it is not EBUSY.
+        assert_eq!(answer, Err(FlipError::Present(PresentError::NoSuchFb)));
+        assert!(
+            first_completion_was_on_the_fd,
+            "the flip went ahead before the completion reached the fd"
+        );
+        assert!(!FLIP_EVENT_PENDING.load(Ordering::Acquire));
+        assert_eq!(FLIPS_IN_FLIGHT.load(Ordering::Acquire), 0);
+        reset();
+    }
+
+    /// The atomic path has the same step, and the same used-to-be-EBUSY.
+    #[test]
+    fn an_atomic_commit_that_lands_mid_delivery_waits_for_it_too() {
+        let _serialised = super::test_globals::lock();
+        reset();
+        let file = DrmFileState::new();
+        leave_one_mid_delivery(&file);
+
+        let (answer, first_completion_was_on_the_fd) = race_against_delivery(&file, |file| {
+            atomic_commit(&AtomicUpdate::default(), false, false, true, 0xA70, file)
+        });
+        assert_eq!(
+            answer,
+            Ok(()),
+            "an empty commit that asks for an event is accepted"
+        );
+        assert!(
+            first_completion_was_on_the_fd,
+            "the commit went ahead before the completion reached the fd"
+        );
+        // And its own completion is the one now outstanding, queued behind
+        // the one that was delivered.
+        assert_eq!(FLIPS_IN_FLIGHT.load(Ordering::Acquire), 1);
+        assert!(PENDING_DRM_TIMERS.lock().iter().any(|j| matches!(
+            j,
+            PendingDrmTimer::Flip {
+                user_data: 0xA70,
+                ..
+            }
+        )));
+        let_the_armed_timer_fire();
+        reset();
+    }
+
+    /// A commit that asks for no event owes the CRTC no ordering with the
+    /// previous completion, and never did: it must not sit out the delivery.
+    #[test]
+    fn a_commit_without_an_event_does_not_wait_for_the_delivery() {
+        let _serialised = super::test_globals::lock();
+        reset();
+        let file = DrmFileState::new();
+        leave_one_mid_delivery(&file);
+
+        assert_eq!(
+            atomic_commit(&AtomicUpdate::default(), false, false, false, 0, &file),
+            Ok(())
+        );
+        assert!(
+            FLIP_EVENT_PENDING.load(Ordering::Acquire),
+            "the delivery is still open; the commit did not touch it"
+        );
+        assert!(!file.has_events());
+        finish_delivery(&file);
+        reset();
+    }
+
+    /// A completion still queued for the vblank is delivered now, not waited
+    /// for: the compositor's next frame must not sit out the rest of the
+    /// period. No timer is armed here, so waiting would be the whole limit.
+    #[test]
+    fn a_queued_completion_is_delivered_now_not_waited_for() {
+        let _serialised = super::test_globals::lock();
+        reset();
+        let file = DrmFileState::new();
+        queue_one(&file);
+
+        assert!(settle_outstanding_flip());
+        assert!(file.has_events(), "the queued completion reached the fd");
+        assert_eq!(FLIPS_IN_FLIGHT.load(Ordering::Acquire), 0);
+        assert!(!FLIP_EVENT_PENDING.load(Ordering::Acquire));
+        reset();
+    }
+
+    /// A latch with nothing behind it -- no queued flip, none in flight -- is
+    /// the self-heal case, and costs the next flip nothing.
+    #[test]
+    fn a_stale_latch_does_not_hold_up_the_next_flip() {
+        let _serialised = super::test_globals::lock();
+        reset();
+        FLIP_EVENT_PENDING.store(true, Ordering::Release);
+        assert!(settle_outstanding_flip());
+        assert!(!FLIP_EVENT_PENDING.load(Ordering::Acquire));
+        reset();
+    }
+
+    /// The limit: a delivery that never finishes (a counter that lost its
+    /// deliverer) is EBUSY, not a syscall that never returns.
+    #[test]
+    fn a_delivery_that_never_finishes_is_ebusy_not_a_hang() {
+        let _serialised = super::test_globals::lock();
+        reset();
+        let file = DrmFileState::new();
+        leave_one_mid_delivery(&file);
+
+        assert!(!settle_outstanding_flip());
+        assert_eq!(
+            page_flip(0x77, SYNTH_CRTC_ID, 0, true, &file),
+            Err(FlipError::Busy)
+        );
         reset();
     }
 }
