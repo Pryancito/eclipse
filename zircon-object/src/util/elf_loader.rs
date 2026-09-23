@@ -595,6 +595,26 @@ pub trait ElfExt {
     ) -> Result<(), &'static str>;
 }
 
+/// Where a relocation writes: `base + r_offset`, or nothing when that address
+/// does not exist.
+///
+/// `r_offset` is a `u64` straight out of the file and `base` is wherever the
+/// image was mapped, so their sum was an unchecked add reached once per
+/// relocation entry. Every dynamically linked program takes this path, because
+/// the loader relocates the ELF interpreter itself, and that one is mapped
+/// after the main image -- at a base that is not zero, which is what it takes
+/// for the add to overflow. In debug that panicked the kernel from `execve`;
+/// in release it wrapped, and the wrapped address could still land inside a
+/// real mapping of the same process, so the relocation quietly wrote a word
+/// somewhere it was never meant to go. An address outside the address space is
+/// something this loop already has an answer for.
+fn reloc_addr(base: usize, offset: u64) -> Result<usize, &'static str> {
+    usize::try_from(offset)
+        .ok()
+        .and_then(|offset| base.checked_add(offset))
+        .ok_or("relocation target outside the address space")
+}
+
 impl ElfExt for ElfFile<'_> {
     fn load_segment_size(&self) -> usize {
         self.program_iter()
@@ -666,7 +686,19 @@ impl ElfExt for ElfFile<'_> {
             .find(|ph| ph.get_type() == Ok(Type::Load) && ph.offset() == 0)
         {
             // otherwise, check if elf is loaded from the beginning, then phdr can be inferred.
-            Some(elf_addr.virtual_addr() + self.header.pt2.ph_offset())
+            //
+            // Both halves come from the file, and this used to be an unchecked
+            // `u64` add: a `PT_LOAD` at file offset 0 with a `p_vaddr` near the
+            // top of the range panicked the kernel here, from `execve` on. An
+            // address that does not exist is no phdr, which is a case this
+            // already has: the loader leaves `AT_PHDR` out.
+            let inferred = elf_addr
+                .virtual_addr()
+                .checked_add(self.header.pt2.ph_offset());
+            if inferred.is_none() {
+                warn!("elf: inferred phdr address does not fit, tls might not work");
+            }
+            inferred
         } else {
             warn!("elf: no phdr found, tls might not work");
             None
@@ -824,15 +856,22 @@ impl ElfExt for ElfFile<'_> {
                             warn!("relocate: undefined symbol {:?}, skipping", name);
                             continue;
                         }
-                        let symval = base + sym.value() as usize;
-                        let value = symval + entry.get_addend() as usize;
-                        let addr = base + entry.get_offset() as usize;
+                        // `S + A`. The VALUE is ABI arithmetic on numbers
+                        // the file chose and is allowed to wrap: a negative
+                        // `r_addend` is ordinary in a real object, and the
+                        // dynamic linkers this loader stands in for compute it
+                        // in plain C. Only the ADDRESS has to exist.
+                        let symval = base.wrapping_add(sym.value() as usize);
+                        let value = symval.wrapping_add(entry.get_addend() as usize);
+                        let addr = reloc_addr(base, entry.get_offset())?;
                         trace!("GOT write: {:#x} @ {:#x}", value, addr);
                         write_word(&mut cached, addr, value)?;
                     }
                     REL_RELATIVE | R_RISCV_RELATIVE | R_AARCH64_RELATIVE => {
-                        let value = base + entry.get_addend() as usize;
-                        let addr = base + entry.get_offset() as usize;
+                        // `B + A`, same split as above: the value may wrap,
+                        // the address may not.
+                        let value = base.wrapping_add(entry.get_addend() as usize);
+                        let addr = reloc_addr(base, entry.get_offset())?;
                         trace!("RELATIVE write: {:#x} @ {:#x}", value, addr);
                         write_word(&mut cached, addr, value)?;
                     }
@@ -842,8 +881,11 @@ impl ElfExt for ElfFile<'_> {
                     other => {
                         #[cfg(target_arch = "x86_64")]
                         if other == R_X86_64_IRELATIVE {
-                            let got_addr = base + entry.get_offset() as usize;
-                            let resolver_addr = base + entry.get_addend() as usize;
+                            let got_addr = reloc_addr(base, entry.get_offset())?;
+                            // The resolver is CALLED, so unlike a plain value
+                            // it has to be an address that exists; the scratch
+                            // mapping rejects it otherwise.
+                            let resolver_addr = base.wrapping_add(entry.get_addend() as usize);
                             irelative.push((got_addr, resolver_addr));
                             continue;
                         }
