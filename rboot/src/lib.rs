@@ -16,6 +16,8 @@ pub mod fb;
 #[cfg(any(feature = "boot-ui", test))]
 pub mod logo;
 #[cfg(any(feature = "boot-ui", test))]
+pub mod page_table;
+#[cfg(any(feature = "boot-ui", test))]
 pub mod progress;
 #[cfg(any(feature = "boot-ui", test))]
 pub mod video;
