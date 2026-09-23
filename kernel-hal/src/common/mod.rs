@@ -10,6 +10,8 @@ pub mod addr;
 pub mod boot_logo;
 pub mod console;
 pub mod context;
+pub mod dma_pin;
+pub mod dma_quarantine;
 pub mod ipi;
 pub mod kstats;
 pub mod ksyms;

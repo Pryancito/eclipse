@@ -435,28 +435,14 @@ pub(crate) fn dma_quarantine_release_held(paddr: crate::PhysAddr, pages: usize) 
 /// window is comparatively tiny and holding it would blow the budget alone).
 #[cfg(not(feature = "libos"))]
 fn dma_quarantine_dealloc(paddr: crate::PhysAddr, pages: usize) {
+    use crate::dma_quarantine::{Quarantine, Verdict};
     use lock::Mutex;
-    // Per-block cap (32 MiB) — covers a 4K framebuffer. Total held out of the
-    // pool (64 MiB) and max entries: whichever bound is hit first evicts the
-    // oldest. Sized to outlast in-flight GPU DMA across a kill+relaunch without
-    // starving the frame pool.
-    const MAX_BLOCK_PAGES: usize = 8192; // 32 MiB
-    const BUDGET_PAGES: usize = 16 * 1024; // 64 MiB
-    const MAX_BLOCKS: usize = 1024;
     const POISON: u64 = 0xDEAD_D3AD_F0F0_F0F0;
 
-    struct Quar {
-        ring: [(usize, usize); MAX_BLOCKS], // (base_pa, pages); (0,0) = empty
-        head: usize,                        // index of the oldest entry
-        len: usize,
-        held_pages: usize,
-    }
-    static QUAR: Mutex<Quar> = Mutex::new(Quar {
-        ring: [(0, 0); MAX_BLOCKS],
-        head: 0,
-        len: 0,
-        held_pages: 0,
-    });
+    // Which block to evict and when is `crate::dma_quarantine`, which compiles
+    // everywhere and is tested; what is left here is the frame pool, the
+    // poison and the report.
+    static QUAR: Mutex<Quarantine> = Mutex::new(Quarantine::new());
 
     let free_now = |base: usize, n: usize| {
         for i in 0..n {
@@ -466,44 +452,46 @@ fn dma_quarantine_dealloc(paddr: crate::PhysAddr, pages: usize) {
     if pages == 0 {
         return;
     }
-    if pages > MAX_BLOCK_PAGES {
-        free_now(paddr, pages);
-        return;
-    }
     // Userspace still maps this range through a physical VMO (nouveau GEM
     // CPU-mmap). Hold the free until the last pin drops — returning to the
-    // pool now is the free-while-mapped UAF.
-    if crate::stack_guard::dma_user_pinned(paddr, pages) {
-        crate::stack_guard::dma_hold_until_unpin(paddr, pages);
+    // pool now is the free-while-mapped UAF. One call, so the last unpin
+    // cannot land between asking and parking and leave the block parked
+    // behind a pin that no longer exists.
+    if crate::stack_guard::dma_hold_if_pinned(paddr, pages) {
         return;
     }
     let phys_to_va = |pa: usize| pa + crate::KCONFIG.phys_to_virt_offset;
-    // Poison the first word of every page of the block we are now quarantining.
-    unsafe {
-        for i in 0..pages {
-            core::ptr::write_volatile(phys_to_va(paddr + i * crate::PAGE_SIZE) as *mut u64, POISON);
-        }
-    }
     // Make room for the new block (evict the OLDEST until within both bounds),
     // then enqueue it. Collect the evicted blocks and process them AFTER the
     // lock is dropped: `frame_dealloc` and the clflush/read loop must not run
     // under the quarantine lock.
     let mut evicted: alloc::vec::Vec<(usize, usize)> = alloc::vec::Vec::new();
-    {
-        let mut q = QUAR.lock();
-        while q.len >= MAX_BLOCKS || (q.held_pages + pages > BUDGET_PAGES && q.len > 0) {
-            let h = q.head;
-            let (base, n) = q.ring[h];
-            q.ring[h] = (0, 0);
-            q.head = (h + 1) % MAX_BLOCKS;
-            q.len -= 1;
-            q.held_pages -= n;
-            evicted.push((base, n));
+    // The poison goes into the first word of every page, and only for a block
+    // the quarantine actually takes.
+    let poison = || unsafe {
+        for i in 0..pages {
+            core::ptr::write_volatile(phys_to_va(paddr + i * crate::PAGE_SIZE) as *mut u64, POISON);
         }
-        let tail = (q.head + q.len) % MAX_BLOCKS;
-        q.ring[tail] = (paddr, pages);
-        q.len += 1;
-        q.held_pages += pages;
+    };
+    match QUAR.lock().push(paddr, pages, &mut evicted, poison) {
+        Verdict::Held => {}
+        Verdict::TooBig => {
+            free_now(paddr, pages);
+            return;
+        }
+        Verdict::DoubleFree => {
+            // Returning these frames to the pool a second time would hand one
+            // frame to two owners, which is the corruption everything here
+            // exists to catch. Drop the free and name it: the quarantine is
+            // the one place in the system that can see this.
+            crate::console::serial_write_fmt_spin(format_args!(
+                "\n[dma-double-free] paddr={:#x} pages={} was freed again while still in \
+                 quarantine — dropping the second free; one more and the frame pool would \
+                 have handed these pages to two owners.\n",
+                paddr, pages,
+            ));
+            return;
+        }
     }
     for (old_base, old_pages) in evicted {
         // Verify the evicted block's poison. Flush the sentinel line first so a

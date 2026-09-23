@@ -11,9 +11,14 @@ pub fn paddr_aliases_stack(_paddr: usize, _len: usize) -> bool {
     false
 }
 
+// A hosted build has no DMA, no frame pool and no quarantine, so there is
+// nothing for a pin to hold a free against: these stay no-ops rather than
+// driving `crate::dma_pin`, whose entries nothing here would ever release.
 pub fn dma_pin_user(_paddr: usize, _pages: usize) {}
 pub fn dma_unpin_user(_paddr: usize, _pages: usize) {}
 pub fn dma_user_pinned(_paddr: usize, _pages: usize) -> bool {
     false
 }
-pub fn dma_hold_until_unpin(_paddr: usize, _pages: usize) {}
+pub fn dma_hold_if_pinned(_paddr: usize, _pages: usize) -> bool {
+    false
+}
