@@ -63,6 +63,23 @@ pub struct IpcPerm {
     pub __pad2: usize,
 }
 
+impl IpcPerm {
+    /// Whether `euid` may change this object: `IPC_SET` and `IPC_RMID`, which
+    /// Linux allows only to the owner, the creator or a privileged caller and
+    /// answers with `EPERM` otherwise (`ipcctl_obtain_check`, `ipc/util.c`).
+    ///
+    /// Nothing here asked. `msgctl`, `semctl` and `shmctl` each read a
+    /// `*_ds` out of userspace and copied its `uid`, `gid` and `mode` straight
+    /// into the object, so any process that could name the id took the queue,
+    /// the segment or the semaphore set over. These three fields were written
+    /// and then only ever read back out by `IPC_STAT` and `/proc/sysvipc` --
+    /// never to decide anything -- and there is no `EACCES` anywhere in this
+    /// module.
+    pub fn may_control(&self, euid: u32) -> bool {
+        euid == 0 || euid == self.uid || euid == self.cuid
+    }
+}
+
 /// Semaphore set identifier (in a process)
 type SemId = usize;
 /// Shared memory identifier. System-wide: `shmget(2)`'s id means the same
@@ -234,7 +251,7 @@ mod sem_proc_tests {
 
     /// A private set of `n` semaphores, all starting at zero.
     fn set(n: usize) -> Arc<SemArray> {
-        SemArray::get_or_create(0, n, CREAT | 0o666).unwrap()
+        SemArray::get_or_create(0, n, CREAT | 0o666, 0, 0).unwrap()
     }
 
     #[test]

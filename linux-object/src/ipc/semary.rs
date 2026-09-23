@@ -110,13 +110,26 @@ impl SemArray {
         self.semid_ds.lock().ctime = TimeSpec::now().sec;
     }
 
-    /// for IPC_SET
-    /// see man semctl(2)
-    pub fn set(&self, new: &SemidDs) {
+    /// `IPC_SET`: owner and permission bits, per semctl(2).
+    ///
+    /// Only the owner, the creator or a privileged caller may do this; anyone
+    /// else gets `EPERM`. Without that check the `semid_ds` userspace handed
+    /// in rewrote `uid` and `gid`, so naming the id was enough to take the set
+    /// over -- see [`IpcPerm::may_control`].
+    pub fn set(&self, new: &SemidDs, euid: u32) -> Result<(), LxError> {
         let mut lock = self.semid_ds.lock();
+        if !lock.perm.may_control(euid) {
+            return Err(LxError::EPERM);
+        }
         lock.perm.uid = new.perm.uid;
         lock.perm.gid = new.perm.gid;
         lock.perm.mode = new.perm.mode & 0x1ff;
+        Ok(())
+    }
+
+    /// Whether `euid` may `IPC_SET` or `IPC_RMID` this set.
+    pub fn may_control(&self, euid: u32) -> bool {
+        self.semid_ds.lock().perm.may_control(euid)
     }
 
     /// Get the semaphore array with `key`, following semget(2).
@@ -135,7 +148,13 @@ impl SemArray {
     /// - Asking an existing set for more semaphores than it has is `EINVAL`.
     ///   Without it the caller walked away believing in semaphores that do not
     ///   exist, and every index past the end came back `EFBIG` from `semop`.
-    pub fn get_or_create(key: u32, nsems: usize, flags: usize) -> Result<Arc<Self>, LxError> {
+    pub fn get_or_create(
+        key: u32,
+        nsems: usize,
+        flags: usize,
+        uid: u32,
+        gid: u32,
+    ) -> Result<Arc<Self>, LxError> {
         let mut key2sem = KEY2SEM.write();
         Self::purge_stale_keys(&mut key2sem);
         let flag = IpcGetFlag::from_bits_truncate(flags);
@@ -170,10 +189,10 @@ impl SemArray {
             semid_ds: Mutex::new(SemidDs {
                 perm: IpcPerm {
                     key,
-                    uid: 0,
-                    gid: 0,
-                    cuid: 0,
-                    cgid: 0,
+                    uid,
+                    gid,
+                    cuid: uid,
+                    cgid: gid,
                     // least significant 9 bits
                     mode: (flags as u32) & 0x1ff,
                     __seq: 0,
@@ -216,17 +235,29 @@ mod sem_tests {
     const CREAT: usize = 0o1000;
     /// `IPC_EXCL`.
     const EXCL: usize = 0o2000;
+    /// `euid == 0`.
+    const ROOT: u32 = 0;
+    /// The owner in the ownership tests.
+    const OWNER: u32 = 1000;
+    /// Somebody else.
+    const STRANGER: u32 = 1001;
+
+    /// `semget` as root, which is what every test here that does not care
+    /// about ownership wants.
+    fn get(key: u32, nsems: usize, flags: usize) -> Result<Arc<SemArray>, LxError> {
+        SemArray::get_or_create(key, nsems, flags, ROOT, ROOT)
+    }
 
     #[test]
     fn a_private_set_is_not_filed_under_any_key() {
         let _guard = test_lock();
         // Hold it alive: the bug needed a live set to alias onto.
-        let _private = SemArray::get_or_create(0, 4, CREAT | 0o666).unwrap();
+        let _private = get(0, 4, CREAT | 0o666).unwrap();
         // This used to hand back `_private`, because that is where the old
         // code had filed it.
         for key in 1u32..=4 {
             assert_eq!(
-                SemArray::get_or_create(key, 1, 0).err(),
+                get(key, 1, 0).err(),
                 Some(LxError::ENOENT),
                 "a private set must not be reachable as key {}",
                 key
@@ -240,7 +271,7 @@ mod sem_tests {
         // The invariant the fix rests on, stated where a later edit will trip
         // over it: key 0 is never a row in the table, so no lookup can ever
         // come back with somebody's private set.
-        let _private = SemArray::get_or_create(0, 1, CREAT | 0o666).unwrap();
+        let _private = get(0, 1, CREAT | 0o666).unwrap();
         assert!(!KEY2SEM.read().contains_key(&0));
     }
 
@@ -249,15 +280,15 @@ mod sem_tests {
         let _guard = test_lock();
         // semget(2): with IPC_PRIVATE a new set is created whatever the flags
         // say, so the ENOENT rule must not reach this path.
-        let a = SemArray::get_or_create(0, 2, 0o666).unwrap();
+        let a = get(0, 2, 0o666).unwrap();
         assert_eq!(a.len(), 2);
     }
 
     #[test]
     fn two_private_sets_are_different_sets() {
         let _guard = test_lock();
-        let a = SemArray::get_or_create(0, 1, CREAT | 0o666).unwrap();
-        let b = SemArray::get_or_create(0, 1, CREAT | 0o666).unwrap();
+        let a = get(0, 1, CREAT | 0o666).unwrap();
+        let b = get(0, 1, CREAT | 0o666).unwrap();
         assert!(
             !Arc::ptr_eq(&a, &b),
             "every IPC_PRIVATE semget is a fresh set"
@@ -271,23 +302,20 @@ mod sem_tests {
         let _guard = test_lock();
         // A bare semget is how a program asks whether a set is there. It used
         // to create one and answer "yes".
-        assert_eq!(
-            SemArray::get_or_create(0x5e_0001, 1, 0o666).err(),
-            Some(LxError::ENOENT)
-        );
+        assert_eq!(get(0x5e_0001, 1, 0o666).err(), Some(LxError::ENOENT));
         // And with IPC_CREAT it does create it.
-        let made = SemArray::get_or_create(0x5e_0001, 1, CREAT | 0o666).unwrap();
+        let made = get(0x5e_0001, 1, CREAT | 0o666).unwrap();
         assert_eq!(made.len(), 1);
         // Now the probe finds it.
-        let found = SemArray::get_or_create(0x5e_0001, 1, 0o666).unwrap();
+        let found = get(0x5e_0001, 1, 0o666).unwrap();
         assert!(Arc::ptr_eq(&made, &found));
     }
 
     #[test]
     fn the_same_key_comes_back_as_the_same_set() {
         let _guard = test_lock();
-        let a = SemArray::get_or_create(0x5e_0002, 3, CREAT | 0o666).unwrap();
-        let b = SemArray::get_or_create(0x5e_0002, 3, CREAT | 0o666).unwrap();
+        let a = get(0x5e_0002, 3, CREAT | 0o666).unwrap();
+        let b = get(0x5e_0002, 3, CREAT | 0o666).unwrap();
         assert!(Arc::ptr_eq(&a, &b));
         a.get_sem(2).unwrap().set(5);
         assert_eq!(b.get_sem(2).unwrap().get(), 5);
@@ -296,9 +324,9 @@ mod sem_tests {
     #[test]
     fn creat_and_excl_together_on_an_existing_key_is_eexist() {
         let _guard = test_lock();
-        let _a = SemArray::get_or_create(0x5e_0003, 1, CREAT | 0o666).unwrap();
+        let _a = get(0x5e_0003, 1, CREAT | 0o666).unwrap();
         assert_eq!(
-            SemArray::get_or_create(0x5e_0003, 1, CREAT | EXCL | 0o666).err(),
+            get(0x5e_0003, 1, CREAT | EXCL | 0o666).err(),
             Some(LxError::EEXIST)
         );
     }
@@ -307,19 +335,19 @@ mod sem_tests {
     fn excl_without_creat_returns_the_set_that_is_there() {
         let _guard = test_lock();
         // semget(2): IPC_EXCL only means anything alongside IPC_CREAT.
-        let a = SemArray::get_or_create(0x5e_0004, 1, CREAT | 0o666).unwrap();
-        let b = SemArray::get_or_create(0x5e_0004, 1, EXCL | 0o666).unwrap();
+        let a = get(0x5e_0004, 1, CREAT | 0o666).unwrap();
+        let b = get(0x5e_0004, 1, EXCL | 0o666).unwrap();
         assert!(Arc::ptr_eq(&a, &b));
     }
 
     #[test]
     fn asking_an_existing_set_for_more_semaphores_than_it_has_is_einval() {
         let _guard = test_lock();
-        let _a = SemArray::get_or_create(0x5e_0005, 2, CREAT | 0o666).unwrap();
+        let _a = get(0x5e_0005, 2, CREAT | 0o666).unwrap();
         // The caller walks away believing in four semaphores and gets EFBIG
         // from semop on the two that do not exist.
         assert_eq!(
-            SemArray::get_or_create(0x5e_0005, 4, CREAT | 0o666).err(),
+            get(0x5e_0005, 4, CREAT | 0o666).err(),
             Some(LxError::EINVAL)
         );
     }
@@ -329,9 +357,9 @@ mod sem_tests {
         let _guard = test_lock();
         // nsems == 0 is "don't care", and it is what every attach-only caller
         // passes.
-        let a = SemArray::get_or_create(0x5e_0006, 3, CREAT | 0o666).unwrap();
-        let b = SemArray::get_or_create(0x5e_0006, 0, 0o666).unwrap();
-        let c = SemArray::get_or_create(0x5e_0006, 3, 0o666).unwrap();
+        let a = get(0x5e_0006, 3, CREAT | 0o666).unwrap();
+        let b = get(0x5e_0006, 0, 0o666).unwrap();
+        let c = get(0x5e_0006, 3, 0o666).unwrap();
         assert!(Arc::ptr_eq(&a, &b) && Arc::ptr_eq(&a, &c));
     }
 
@@ -340,7 +368,7 @@ mod sem_tests {
         let _guard = test_lock();
         // This is the one that panicked the kernel: `semctl` fed a userspace
         // number straight into the old `Index` impl.
-        let a = SemArray::get_or_create(0, 2, CREAT | 0o666).unwrap();
+        let a = get(0, 2, CREAT | 0o666).unwrap();
         assert!(a.get_sem(0).is_some());
         assert!(a.get_sem(1).is_some());
         assert!(a.get_sem(2).is_none());
@@ -353,7 +381,7 @@ mod sem_tests {
         let _guard = test_lock();
         // semget with nsems == 0 on a *new* key really does make an empty set,
         // so even index 0 has to answer None rather than panic.
-        let a = SemArray::get_or_create(0, 0, CREAT | 0o666).unwrap();
+        let a = get(0, 0, CREAT | 0o666).unwrap();
         assert!(a.is_empty());
         assert_eq!(a.len(), 0);
         assert!(a.get_sem(0).is_none());
@@ -362,27 +390,21 @@ mod sem_tests {
     #[test]
     fn dropping_the_last_reference_frees_the_key() {
         let _guard = test_lock();
-        let a = SemArray::get_or_create(0x5e_0007, 1, CREAT | 0o666).unwrap();
+        let a = get(0x5e_0007, 1, CREAT | 0o666).unwrap();
         drop(a);
         // The table holds a Weak, so the key is gone with the set and the
         // probe says so.
-        assert_eq!(
-            SemArray::get_or_create(0x5e_0007, 1, 0o666).err(),
-            Some(LxError::ENOENT)
-        );
+        assert_eq!(get(0x5e_0007, 1, 0o666).err(), Some(LxError::ENOENT));
     }
 
     #[test]
     fn removing_a_set_frees_its_key_even_while_it_is_still_referenced() {
         let _guard = test_lock();
-        let a = SemArray::get_or_create(0x5e_0008, 1, CREAT | 0o666).unwrap();
+        let a = get(0x5e_0008, 1, CREAT | 0o666).unwrap();
         a.remove();
-        assert_eq!(
-            SemArray::get_or_create(0x5e_0008, 1, 0o666).err(),
-            Some(LxError::ENOENT)
-        );
+        assert_eq!(get(0x5e_0008, 1, 0o666).err(), Some(LxError::ENOENT));
         // A fresh create under the same key is a different set.
-        let b = SemArray::get_or_create(0x5e_0008, 1, CREAT | 0o666).unwrap();
+        let b = get(0x5e_0008, 1, CREAT | 0o666).unwrap();
         assert!(!Arc::ptr_eq(&a, &b));
     }
 
@@ -392,17 +414,17 @@ mod sem_tests {
         // A private set carries key 0. `remove` used to take key 0 out of the
         // table, which after the fix is nobody's key — but a set filed under a
         // real key must survive its neighbour's removal either way.
-        let keyed = SemArray::get_or_create(0x5e_0009, 1, CREAT | 0o666).unwrap();
-        let private = SemArray::get_or_create(0, 1, CREAT | 0o666).unwrap();
+        let keyed = get(0x5e_0009, 1, CREAT | 0o666).unwrap();
+        let private = get(0, 1, CREAT | 0o666).unwrap();
         private.remove();
-        let still_there = SemArray::get_or_create(0x5e_0009, 1, 0o666).unwrap();
+        let still_there = get(0x5e_0009, 1, 0o666).unwrap();
         assert!(Arc::ptr_eq(&keyed, &still_there));
     }
 
     #[test]
     fn the_semid_ds_records_the_key_the_mode_and_the_count() {
         let _guard = test_lock();
-        let a = SemArray::get_or_create(0x5e_000a, 3, CREAT | 0o1666).unwrap();
+        let a = get(0x5e_000a, 3, CREAT | 0o1666).unwrap();
         let ds = *a.semid_ds.lock();
         assert_eq!(ds.perm.key, 0x5e_000a);
         assert_eq!(ds.nsems, 3);
@@ -416,14 +438,14 @@ mod sem_tests {
         let _guard = test_lock();
         // What `ipcs -s` shows for a private set, and what it used to show
         // instead was the synthesised key it had been filed under.
-        let a = SemArray::get_or_create(0, 1, CREAT | 0o666).unwrap();
+        let a = get(0, 1, CREAT | 0o666).unwrap();
         assert_eq!(a.semid_ds.lock().perm.key, 0);
     }
 
     #[test]
     fn otime_and_ctime_are_stamped_where_semop_and_semctl_say() {
         let _guard = test_lock();
-        let a = SemArray::get_or_create(0, 1, CREAT | 0o666).unwrap();
+        let a = get(0, 1, CREAT | 0o666).unwrap();
         assert_eq!(a.semid_ds.lock().otime, 0);
         a.otime();
         assert_ne!(a.semid_ds.lock().otime, 0);
@@ -435,17 +457,69 @@ mod sem_tests {
     #[test]
     fn ipc_set_takes_the_owner_and_the_low_nine_bits_of_the_mode() {
         let _guard = test_lock();
-        let a = SemArray::get_or_create(0x5e_000b, 1, CREAT | 0o666).unwrap();
+        let a = get(0x5e_000b, 1, CREAT | 0o666).unwrap();
         let mut ds = *a.semid_ds.lock();
         ds.perm.uid = 1000;
         ds.perm.gid = 1001;
         ds.perm.mode = 0o7654;
-        a.set(&ds);
+        assert_eq!(a.set(&ds, ROOT), Ok(()));
         let now = *a.semid_ds.lock();
         assert_eq!(now.perm.uid, 1000);
         assert_eq!(now.perm.gid, 1001);
         assert_eq!(now.perm.mode, 0o654);
         assert_eq!(now.perm.key, 0x5e_000b, "IPC_SET never moves the key");
+    }
+
+    // ---- who may change the set ------------------------------------------
+
+    /// `semget` filled `uid`, `gid`, `cuid` and `cgid` with zeros, whoever
+    /// called it, so `semctl(IPC_STAT)` reported every set in the system as
+    /// root's and there was nothing for a permission check to read. `msgget`,
+    /// three files away, had always recorded its caller.
+    #[test]
+    fn semget_records_the_caller_as_owner_and_creator() {
+        let _guard = test_lock();
+        let a = SemArray::get_or_create(0, 1, CREAT | 0o666, OWNER, OWNER + 5).unwrap();
+        let perm = a.semid_ds.lock().perm;
+        assert_eq!(perm.uid, OWNER);
+        assert_eq!(perm.gid, OWNER + 5);
+        assert_eq!(perm.cuid, OWNER);
+        assert_eq!(perm.cgid, OWNER + 5);
+    }
+
+    /// The whole of the old `set`: uid, gid and mode straight out of the
+    /// buffer userspace handed in, with nobody asked, so naming the id was
+    /// enough to take the set over (semctl(2): `EPERM`).
+    #[test]
+    fn ipc_set_from_a_stranger_is_eperm_and_changes_nothing() {
+        let _guard = test_lock();
+        let a = SemArray::get_or_create(0, 1, CREAT | 0o600, OWNER, OWNER).unwrap();
+        let mut ds = *a.semid_ds.lock();
+        ds.perm.uid = STRANGER;
+        ds.perm.mode = 0o666;
+        assert_eq!(a.set(&ds, STRANGER), Err(LxError::EPERM));
+        let now = a.semid_ds.lock().perm;
+        assert_eq!(now.uid, OWNER);
+        assert_eq!(now.mode, 0o600);
+        assert_eq!(a.set(&ds, OWNER), Ok(()));
+        assert_eq!(a.semid_ds.lock().perm.uid, STRANGER);
+    }
+
+    /// The same predicate gates `IPC_RMID`, which is how `semctl` decides
+    /// whether a caller may destroy somebody else's set.
+    #[test]
+    fn only_the_owner_the_creator_and_root_may_control_a_set() {
+        let _guard = test_lock();
+        let a = SemArray::get_or_create(0, 1, CREAT | 0o666, OWNER, OWNER).unwrap();
+        assert!(a.may_control(OWNER));
+        assert!(a.may_control(ROOT));
+        assert!(!a.may_control(STRANGER));
+        // Handed over, the creator keeps its rights (ipcctl_obtain_check).
+        let mut ds = *a.semid_ds.lock();
+        ds.perm.uid = STRANGER;
+        assert_eq!(a.set(&ds, OWNER), Ok(()));
+        assert!(a.may_control(OWNER));
+        assert!(a.may_control(STRANGER));
     }
 }
 
