@@ -471,7 +471,34 @@ impl KObjectBase {
         // in time.
         if !callback(inner.signal) {
             if inner.signal_callbacks.len() >= MAX_SIGNAL_CALLBACKS {
-                return;
+                // Full — but most of it is probably dead. A callback is only
+                // ever retired when it is *called*, which happens on a signal
+                // change, and an object can go its whole life without one
+                // while waits come and go on it: `wait_signal_many` leaves a
+                // callback behind on every target that did not fire, a
+                // cancelled `zx_object_wait_async` leaves one behind, and a
+                // dropped `wait_signal` leaves one behind. Silently refusing
+                // the new one wedges whoever registered it — for a
+                // `wait_signal` permanently, since its future has already
+                // latched "registered" and will never ask again — so make
+                // room first.
+                //
+                // Evaluating the list at the current signal is exactly what
+                // the last `signal_change` did, and no callback in the tree
+                // acts twice for the same signal, so a live one answers
+                // `false` again and only the dead drop out: a dropped
+                // waiter, a finished wait, a cancelled observer, a closed
+                // handle, a dead port.
+                let signal = inner.signal;
+                inner.signal_callbacks.retain(|f| !f(signal));
+                if inner.signal_callbacks.len() >= MAX_SIGNAL_CALLBACKS {
+                    warn!(
+                        "[kobject] \"{}\" holds {} live signal callbacks; refusing one more — \
+                         whoever registered it will never be woken",
+                        inner.name, MAX_SIGNAL_CALLBACKS
+                    );
+                    return;
+                }
             }
             inner.signal_callbacks.push(callback);
         }
@@ -550,10 +577,31 @@ impl dyn KernelObject {
 pub fn wait_signal_many(
     targets: &[(Arc<dyn KernelObject>, Signal)],
 ) -> impl Future<Output = Vec<Signal>> {
+    /// Shared between the future and the callbacks it leaves on its targets.
+    ///
+    /// Those callbacks outlive the poll that registered them and, on every
+    /// target whose signal never arrives, the whole wait: a callback is only
+    /// retired when it is called, and an object may have no further signal
+    /// change. So neither the waker nor the answer to "am I still wanted"
+    /// can live inside a callback. A waker cloned once is stale as soon as
+    /// the executor hands the future a different one, and a finished wait
+    /// whose callbacks keep waking a task that is gone goes on filling the
+    /// object's callback list until it reaches `MAX_SIGNAL_CALLBACKS` and
+    /// the object stops accepting waits from anyone.
+    struct ManyWaiter {
+        waker: Mutex<Option<core::task::Waker>>,
+        /// Set when the wait is over but the future is still alive, so the
+        /// callbacks left on the targets retire themselves. A wait that was
+        /// simply dropped needs no flag: the `Weak` they hold stops
+        /// upgrading the moment the future goes.
+        done: AtomicBool,
+    }
+
     #[must_use = "wait_signal_many does nothing unless polled/`await`-ed"]
     struct SignalManyFuture {
         targets: Vec<(Arc<dyn KernelObject>, Signal)>,
-        first: bool,
+        waiter: Arc<ManyWaiter>,
+        registered: bool,
     }
 
     impl SignalManyFuture {
@@ -572,23 +620,42 @@ pub fn wait_signal_many(
             let current_signals: Vec<_> =
                 self.targets.iter().map(|(obj, _)| obj.signal()).collect();
             if self.happened(&current_signals) {
+                self.waiter.done.store(true, Ordering::Release);
                 return Poll::Ready(current_signals);
             }
-            if self.first {
+            // On every poll, not only the first: a later poll may carry a
+            // different waker (a `select!` arm re-armed, a task moved), and
+            // the callbacks below are the only thing that will ever wake
+            // this future again.
+            *self.waiter.waker.lock() = Some(cx.waker().clone());
+            if !self.registered {
                 for (object, signal) in self.targets.iter() {
                     object.add_signal_callback(Box::new({
                         let signal = *signal;
-                        let waker = cx.waker().clone();
+                        let waiter = Arc::downgrade(&self.waiter);
                         move |s| {
+                            let Some(waiter) = waiter.upgrade() else {
+                                return true;
+                            };
+                            if waiter.done.load(Ordering::Acquire) {
+                                return true;
+                            }
                             if (s & signal).is_empty() {
                                 return false;
                             }
-                            waker.wake_by_ref();
-                            true
+                            if let Some(waker) = waiter.waker.lock().take() {
+                                waker.wake();
+                            }
+                            // Stay registered: the signal may be consumed
+                            // again before the poll this just asked for, and
+                            // this is the only callback the wait has on this
+                            // target — retiring it here would leave the
+                            // target mute for the rest of the wait.
+                            false
                         }
                     }));
                 }
-                self.first = false;
+                self.registered = true;
             }
             Poll::Pending
         }
@@ -596,7 +663,11 @@ pub fn wait_signal_many(
 
     SignalManyFuture {
         targets: Vec::from(targets),
-        first: true,
+        waiter: Arc::new(ManyWaiter {
+            waker: Mutex::new(None),
+            done: AtomicBool::new(false),
+        }),
+        registered: false,
     }
 }
 
@@ -701,6 +772,440 @@ mod tests {
     use super::*;
     use async_std::sync::Barrier;
     use std::time::Duration;
+
+    /// A waker that only counts. The waits in this module are measured by
+    /// hand rather than `await`-ed: a test that `await`s the wake it is
+    /// checking for hangs when the wake goes missing, which is the one
+    /// answer a test must never give.
+    struct Counter(AtomicUsize);
+
+    impl Counter {
+        fn new() -> Arc<Self> {
+            Arc::new(Counter(AtomicUsize::new(0)))
+        }
+
+        fn count(&self) -> usize {
+            self.0.load(Ordering::SeqCst)
+        }
+    }
+
+    impl futures::task::ArcWake for Counter {
+        fn wake_by_ref(arc_self: &Arc<Self>) {
+            arc_self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// How many signal callbacks the object is still holding.
+    fn callbacks(object: &DummyObject) -> usize {
+        object.base.inner.lock().signal_callbacks.len()
+    }
+
+    fn two_dummies() -> (Arc<DummyObject>, Arc<DummyObject>) {
+        (DummyObject::new(), DummyObject::new())
+    }
+
+    fn targets(a: &Arc<DummyObject>, b: &Arc<DummyObject>) -> [(Arc<dyn KernelObject>, Signal); 2] {
+        [
+            (a.clone() as Arc<dyn KernelObject>, Signal::READABLE),
+            (b.clone() as Arc<dyn KernelObject>, Signal::WRITABLE),
+        ]
+    }
+
+    #[test]
+    fn a_name_asked_for_while_the_object_lock_is_held_does_not_wait_for_it() {
+        let base = KObjectBase::with_name("lockholder");
+        let held = base.inner.lock();
+        // `signal_change` keeps `inner` locked while it runs the callbacks,
+        // so a callback that asks this object for its name arrives here with
+        // the lock already held by its own CPU. `try_name` is the answer for
+        // the callers that can do without one.
+        assert_eq!(base.try_name(), None);
+        drop(held);
+        assert_eq!(base.try_name().as_deref(), Some("lockholder"));
+        assert_eq!(base.name(), "lockholder");
+        // `name()`'s own backstop — the `<name: ...>` placeholder for when
+        // `held_by_current_cpu()` says this CPU is the holder — cannot be
+        // reached from here: a hosted build has no "this CPU", so
+        // `kernel_sync::HeldByCurrentCpu` is a constant `false` there and
+        // asking for the name under the guard above spins forever instead
+        // of answering. That half is covered on bare metal only.
+    }
+
+    #[test]
+    fn the_default_try_name_gives_up_rather_than_reach_for_the_lock() {
+        struct Handrolled(KObjectBase);
+
+        impl core::fmt::Debug for Handrolled {
+            fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+                f.write_str("Handrolled")
+            }
+        }
+
+        impl KernelObject for Handrolled {
+            fn id(&self) -> KoID {
+                self.0.id
+            }
+            fn type_name(&self) -> &str {
+                "Handrolled"
+            }
+            fn name(&self) -> String {
+                self.0.name()
+            }
+            fn set_name(&self, name: &str) {
+                self.0.set_name(name)
+            }
+            fn signal(&self) -> Signal {
+                self.0.signal()
+            }
+            fn signal_set(&self, signal: Signal) {
+                self.0.signal_set(signal)
+            }
+            fn signal_clear(&self, signal: Signal) {
+                self.0.signal_clear(signal)
+            }
+            fn signal_change(&self, clear: Signal, set: Signal) {
+                self.0.signal_change(clear, set)
+            }
+            fn add_signal_callback(&self, callback: SignalHandler) {
+                self.0.add_signal_callback(callback)
+            }
+        }
+
+        let object = Handrolled(KObjectBase::with_name("handrolled"));
+        assert_eq!(object.name(), "handrolled");
+        // Not the name: an object that did not go through `impl_kobject!`
+        // has not said its `name()` is safe to call from inside a signal
+        // callback, and falling back to it would put the self-deadlock
+        // `try_name` exists to avoid right back on that path.
+        assert_eq!(object.try_name(), None);
+    }
+
+    #[test]
+    fn a_signal_change_that_nets_to_nothing_calls_nobody() {
+        let object = DummyObject::new();
+        let calls = Arc::new(AtomicUsize::new(0));
+        object.signal_set(Signal::READABLE);
+        object.add_signal_callback(Box::new({
+            let calls = calls.clone();
+            move |_| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                false
+            }
+        }));
+        // Registering evaluates it once, against the signal as it stands.
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        object.signal_set(Signal::READABLE);
+        object.signal_clear(Signal::WRITABLE);
+        // Cleared and set again in the one call: the bit never left, so
+        // there is no edge to report.
+        object.signal_change(Signal::READABLE, Signal::READABLE);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        object.signal_set(Signal::WRITABLE);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn a_signal_change_clears_before_it_sets() {
+        let object = DummyObject::new();
+        object.signal_set(Signal::READABLE | Signal::USER_SIGNAL_0);
+        // WRITABLE is named on both sides of the same call: the set wins,
+        // and a bit named on neither side is left alone.
+        object.signal_change(Signal::READABLE | Signal::WRITABLE, Signal::WRITABLE);
+        assert_eq!(object.signal(), Signal::WRITABLE | Signal::USER_SIGNAL_0);
+    }
+
+    #[test]
+    fn callbacks_are_visited_newest_first_and_keep_their_order() {
+        let object = DummyObject::new();
+        let order = Arc::new(Mutex::new(Vec::new()));
+        for i in 0..3 {
+            object.add_signal_callback(Box::new({
+                let order = order.clone();
+                move |_| {
+                    order.lock().push(i);
+                    false
+                }
+            }));
+        }
+        order.lock().clear();
+        object.signal_set(Signal::READABLE);
+        // Zircon visits the most recently registered observer first.
+        assert_eq!(*order.lock(), [2, 1, 0]);
+        order.lock().clear();
+        // And the list is put back the way it was, so the next change is not
+        // served in the opposite order.
+        object.signal_set(Signal::WRITABLE);
+        assert_eq!(*order.lock(), [2, 1, 0]);
+    }
+
+    #[test]
+    fn a_callback_satisfied_at_once_is_never_stored() {
+        let object = DummyObject::new();
+        object.signal_set(Signal::READABLE);
+        let calls = Arc::new(AtomicUsize::new(0));
+        object.add_signal_callback(Box::new({
+            let calls = calls.clone();
+            move |s| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                s.contains(Signal::READABLE)
+            }
+        }));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(callbacks(&object), 0);
+        object.signal_set(Signal::WRITABLE);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn a_wait_that_is_dropped_retires_its_callback() {
+        let object = DummyObject::new();
+        let waiter = object.clone() as Arc<dyn KernelObject>;
+        let counter = Counter::new();
+        let waker = futures::task::waker(counter.clone());
+        let mut cx = Context::from_waker(&waker);
+        {
+            let future = waiter.wait_signal(Signal::READABLE);
+            futures::pin_mut!(future);
+            assert!(future.as_mut().poll(&mut cx).is_pending());
+            assert_eq!(callbacks(&object), 1);
+        }
+        object.signal_set(Signal::READABLE);
+        assert_eq!(counter.count(), 0);
+        assert_eq!(callbacks(&object), 0);
+    }
+
+    /// A callback is retired only when it is *called*, and an object can go
+    /// a long time without a signal change while waits come and go on it.
+    /// Refusing a new one because the list is full of waits that are long
+    /// over wedges whoever asked, and for a `wait_signal` it wedges them for
+    /// good: the future has already latched "registered" and never asks
+    /// again, even once the list drains.
+    #[test]
+    fn a_full_callback_list_makes_room_by_dropping_the_dead() {
+        let object = DummyObject::new();
+        let waiter = object.clone() as Arc<dyn KernelObject>;
+        let counter = Counter::new();
+        let waker = futures::task::waker(counter.clone());
+        let mut cx = Context::from_waker(&waker);
+
+        for _ in 0..MAX_SIGNAL_CALLBACKS {
+            let future = waiter.wait_signal(Signal::READABLE);
+            futures::pin_mut!(future);
+            assert!(future.as_mut().poll(&mut cx).is_pending());
+        }
+        assert_eq!(callbacks(&object), MAX_SIGNAL_CALLBACKS);
+        assert_eq!(counter.count(), 0);
+
+        let future = waiter.wait_signal(Signal::READABLE);
+        futures::pin_mut!(future);
+        assert!(future.as_mut().poll(&mut cx).is_pending());
+        assert_eq!(
+            callbacks(&object),
+            1,
+            "the thousand dead ones should have gone, and the new one stayed"
+        );
+        object.signal_set(Signal::READABLE);
+        assert_eq!(
+            counter.count(),
+            1,
+            "the wait past the cap was dropped on the floor"
+        );
+        assert_eq!(future.as_mut().poll(&mut cx), Poll::Ready(Signal::READABLE));
+    }
+
+    #[test]
+    fn a_wait_wakes_the_waker_of_its_latest_poll() {
+        let object = DummyObject::new();
+        let waiter = object.clone() as Arc<dyn KernelObject>;
+        let stale = Counter::new();
+        let stale_waker = futures::task::waker(stale.clone());
+        let fresh = Counter::new();
+        let fresh_waker = futures::task::waker(fresh.clone());
+
+        let future = waiter.wait_signal(Signal::READABLE);
+        futures::pin_mut!(future);
+        assert!(future
+            .as_mut()
+            .poll(&mut Context::from_waker(&stale_waker))
+            .is_pending());
+        assert!(future
+            .as_mut()
+            .poll(&mut Context::from_waker(&fresh_waker))
+            .is_pending());
+        assert_eq!(callbacks(&object), 1);
+
+        object.signal_set(Signal::READABLE);
+        assert_eq!(stale.count(), 0, "woke the waker of an earlier poll");
+        assert_eq!(fresh.count(), 1);
+    }
+
+    #[test]
+    fn a_many_wait_wakes_the_waker_of_its_latest_poll() {
+        let (a, b) = two_dummies();
+        let targets = targets(&a, &b);
+        let stale = Counter::new();
+        let stale_waker = futures::task::waker(stale.clone());
+        let fresh = Counter::new();
+        let fresh_waker = futures::task::waker(fresh.clone());
+
+        let future = wait_signal_many(&targets);
+        futures::pin_mut!(future);
+        assert!(future
+            .as_mut()
+            .poll(&mut Context::from_waker(&stale_waker))
+            .is_pending());
+        // A later poll carries the waker the executor holds now.
+        assert!(future
+            .as_mut()
+            .poll(&mut Context::from_waker(&fresh_waker))
+            .is_pending());
+
+        assert_eq!(
+            (callbacks(&a), callbacks(&b)),
+            (1, 1),
+            "the second poll registered a second callback"
+        );
+
+        b.signal_set(Signal::WRITABLE);
+        assert_eq!(stale.count(), 0, "woke the waker of an earlier poll");
+        assert_eq!(fresh.count(), 1);
+        assert_eq!(
+            future.as_mut().poll(&mut Context::from_waker(&fresh_waker)),
+            Poll::Ready(vec![Signal::empty(), Signal::WRITABLE])
+        );
+    }
+
+    #[test]
+    fn a_many_wait_rearms_when_the_signal_is_consumed_before_the_poll() {
+        let (a, b) = two_dummies();
+        let targets = targets(&a, &b);
+        let counter = Counter::new();
+        let waker = futures::task::waker(counter.clone());
+        let mut cx = Context::from_waker(&waker);
+
+        let future = wait_signal_many(&targets);
+        futures::pin_mut!(future);
+        assert!(future.as_mut().poll(&mut cx).is_pending());
+        a.signal_set(Signal::READABLE);
+        assert_eq!(counter.count(), 1);
+        // Taken by a competing waiter before this one got to look.
+        a.signal_clear(Signal::READABLE);
+        assert!(future.as_mut().poll(&mut cx).is_pending());
+        a.signal_set(Signal::READABLE);
+        assert_eq!(
+            counter.count(),
+            2,
+            "the target went mute after waking the wait once"
+        );
+    }
+
+    #[test]
+    fn a_finished_many_wait_leaves_nothing_on_the_targets_that_did_not_fire() {
+        let (a, b) = two_dummies();
+        let targets = targets(&a, &b);
+        let counter = Counter::new();
+        let waker = futures::task::waker(counter.clone());
+        let mut cx = Context::from_waker(&waker);
+
+        let future = wait_signal_many(&targets);
+        futures::pin_mut!(future);
+        assert!(future.as_mut().poll(&mut cx).is_pending());
+        a.signal_set(Signal::READABLE);
+        assert_eq!(
+            future.as_mut().poll(&mut cx),
+            Poll::Ready(vec![Signal::READABLE, Signal::empty()])
+        );
+        assert_eq!(counter.count(), 1);
+
+        // `b` never fired. Its callback must not outlive the wait, waking a
+        // task that has moved on and taking a slot on `b` for good.
+        b.signal_set(Signal::WRITABLE);
+        assert_eq!(counter.count(), 1, "woke a wait that was already over");
+        assert_eq!(callbacks(&b), 0);
+    }
+
+    #[test]
+    fn a_many_wait_that_is_dropped_retires_its_callbacks() {
+        let (a, b) = two_dummies();
+        let targets = targets(&a, &b);
+        let counter = Counter::new();
+        let waker = futures::task::waker(counter.clone());
+        let mut cx = Context::from_waker(&waker);
+        {
+            let future = wait_signal_many(&targets);
+            futures::pin_mut!(future);
+            assert!(future.as_mut().poll(&mut cx).is_pending());
+            assert_eq!((callbacks(&a), callbacks(&b)), (1, 1));
+        }
+        a.signal_set(Signal::READABLE);
+        b.signal_set(Signal::WRITABLE);
+        assert_eq!(counter.count(), 0);
+        assert_eq!((callbacks(&a), callbacks(&b)), (0, 0));
+    }
+
+    #[test]
+    fn a_many_wait_already_satisfied_registers_nothing() {
+        let (a, b) = two_dummies();
+        let targets = targets(&a, &b);
+        let counter = Counter::new();
+        let waker = futures::task::waker(counter.clone());
+        let mut cx = Context::from_waker(&waker);
+
+        a.signal_set(Signal::READABLE);
+        let future = wait_signal_many(&targets);
+        futures::pin_mut!(future);
+        assert_eq!(
+            future.as_mut().poll(&mut cx),
+            Poll::Ready(vec![Signal::READABLE, Signal::empty()])
+        );
+        assert_eq!((callbacks(&a), callbacks(&b)), (0, 0));
+    }
+
+    #[test]
+    fn a_pid_can_never_collide_with_a_plain_object_id() {
+        let task = KObjectBase::with_name_pooled("task");
+        assert!(
+            (pid_pool::FLOOR..pid_pool::CEIL).contains(&task.id),
+            "a pid must be a valid pid_t and stay under pid_max, got {}",
+            task.id
+        );
+        for base in [
+            KObjectBase::new(),
+            KObjectBase::with_name("vmo"),
+            KObjectBase::with_signal(Signal::WRITABLE),
+            KObjectBase::with("channel", Signal::READABLE),
+        ] {
+            assert!(
+                base.id >= 1 << 32,
+                "object churn must live above the pid space, got {}",
+                base.id
+            );
+        }
+    }
+
+    #[test]
+    fn a_fixed_id_is_never_fed_back_into_the_pid_pool() {
+        // init and the per-terminal shells get their ids by hand. Handing
+        // one back to the pool would give PID 1 to an ordinary task later;
+        // the pool's range assertion turns that into a panic right here.
+        for (id, name) in [(1u64, "init"), (101, "shell")] {
+            let base = KObjectBase::with_id(id, name, Signal::empty());
+            assert_eq!(base.id, id);
+            assert_eq!(base.name(), name);
+            drop(base);
+        }
+    }
+
+    #[test]
+    fn a_name_watch_refuses_a_prefix_it_cannot_pack() {
+        // The prefix is packed into 8 bytes and read back up to its first
+        // NUL, so an empty one would match every object and an embedded NUL
+        // would silently shorten the match to whatever came before it.
+        assert!(!watch_process_name(""));
+        assert!(!watch_process_name("ni\0ente"));
+        assert!(watch_process_name("zzprobe"));
+        unwatch_process_name();
+    }
 
     #[test]
     fn wait_rearms_after_signal_is_consumed() {
