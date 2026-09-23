@@ -138,6 +138,108 @@ fn effective_point(objects: &[Syncobj], handle: u32, depth: u8) -> Option<u64> {
 /// compositor imported its render fence into -> that fence's syncobj.
 const LINK_DEPTH: u8 = 8;
 
+/// The hardware fence in flight that delivers `target` on `handle`, seen
+/// THROUGH the link an import, a deferred transfer or a merge carries.
+///
+/// A link names its source by handle, so the fence the GPU will write sits
+/// in the source's row and never in the importer's -- and the importer is
+/// the handle the client waits on. The acquire semaphore of an X11
+/// swapchain image is always such an importer, so looked up by its own
+/// handle it had no fence, and EXEC parked on the CPU instead of emitting
+/// a GPU ACQUIRE for it. The lowest of `handle`'s own fences covering
+/// `target` wins; otherwise a link that delivers at least `target` and has
+/// exactly ONE source still short of its point is followed to that source.
+/// Two sources still in flight are not one ACQUIRE, and a source with
+/// nothing submitted has no fence: both report nothing, and the caller
+/// waits on the CPU as before.
+///
+/// Callers must hold the table lock, with pending fences resolved.
+fn fence_through_link(
+    table: &SyncobjTable,
+    handle: u32,
+    target: u64,
+    depth: u8,
+) -> Option<PendingFence> {
+    let own = table
+        .pending
+        .iter()
+        .filter(|f| f.handle == handle && f.point >= target)
+        .min_by_key(|f| f.point)
+        .copied();
+    if own.is_some() || depth == 0 {
+        return own;
+    }
+    let link = table
+        .objects
+        .iter()
+        .find(|o| o.handle == handle)?
+        .linked
+        .as_ref()?;
+    if link.dst_point.max(1) < target {
+        return None;
+    }
+    let mut short = link.deps.iter().filter(|&&(src, t)| {
+        !effective_point(&table.objects, src, LINK_DEPTH).is_some_and(|p| p >= t)
+    });
+    let &(src, t) = short.next()?;
+    if short.next().is_some() {
+        return None;
+    }
+    fence_through_link(table, src, t, depth - 1)
+}
+
+/// Whether `target` on `handle` is SUBMITTED: reached, covered by a fence
+/// in flight, or promised by a link whose every source is itself submitted
+/// to its point. This is what `WAIT_AVAILABLE` and `QUERY LAST_SUBMITTED`
+/// ask, and an importer is exactly as submitted as its source: Mesa's
+/// submit thread waits for its semaphores to be *available* before
+/// queueing, so an importer that only counted its own fences kept that
+/// thread parked until the source's work had run, not until it was queued.
+///
+/// Callers must hold the table lock, with pending fences resolved.
+fn submitted_locked(table: &SyncobjTable, handle: u32, target: u64, depth: u8) -> bool {
+    if effective_point(&table.objects, handle, LINK_DEPTH).is_some_and(|p| p >= target) {
+        return true;
+    }
+    if table
+        .pending
+        .iter()
+        .any(|f| f.handle == handle && f.point >= target)
+    {
+        return true;
+    }
+    if depth == 0 {
+        return false;
+    }
+    let Some(link) = table
+        .objects
+        .iter()
+        .find(|o| o.handle == handle)
+        .and_then(|o| o.linked.as_ref())
+    else {
+        return false;
+    };
+    link.dst_point.max(1) >= target
+        && link
+            .deps
+            .iter()
+            .all(|&(src, t)| submitted_locked(table, src, t, depth - 1))
+}
+
+/// The point a link on `handle` promises, if it carries one (0 otherwise).
+/// `EXPORT_SYNC_FILE` names the fence attached LAST, and on a timeline that
+/// still carries a deferred transfer that is the transfer's point, not the
+/// counter: exporting the counter handed the importer a fence already
+/// reached, signaled before the transferred work had run.
+fn promised_point(table: &SyncobjTable, handle: u32) -> u64 {
+    table
+        .objects
+        .iter()
+        .find(|o| o.handle == handle)
+        .and_then(|o| o.linked.as_ref())
+        .map_or(0, |l| l.dst_point.max(1))
+}
+
 /// Whether some object's link still names `handle` as a source.
 fn is_link_source(objects: &[Syncobj], handle: u32) -> bool {
     objects.iter().any(|o| {
@@ -688,28 +790,33 @@ pub fn destroy(handle: u32) -> bool {
 /// If `handle` has an unresolved HW fence that will deliver at least `point`,
 /// return `(fence_va_cpu, fence_gpu_va, payload, ctx_idx)`. Used by EXEC to
 /// emit a GPU ACQUIRE instead of spinning on the CPU. `fence_gpu_va` is 0
-/// when the producer did not publish one.
+/// when the producer did not publish one. An importer, a deferred transfer
+/// or a merge has no fence of its own: the one behind its link is returned
+/// when a single source still owes it ([`fence_through_link`]).
 pub fn pending_hw_fence(handle: u32, point: u64) -> Option<(usize, u64, u32, u32)> {
     let (r, deferred) = {
         let mut table = TABLE.lock();
         let d = resolve_locked(&mut table);
         // Binary waits (point 0/1): the highest pending fence on this handle.
         // Timeline: the lowest pending fence that covers `point`.
-        let found = if point <= 1 {
+        let own = if point <= 1 {
             table
                 .pending
                 .iter()
                 .filter(|f| f.handle == handle)
                 .max_by_key(|f| f.point)
-                .map(|f| (f.fence_va, f.fence_gpu_va, f.payload, f.ctx_idx))
+                .copied()
         } else {
             table
                 .pending
                 .iter()
                 .filter(|f| f.handle == handle && f.point >= point)
                 .min_by_key(|f| f.point)
-                .map(|f| (f.fence_va, f.fence_gpu_va, f.payload, f.ctx_idx))
+                .copied()
         };
+        let found = own
+            .or_else(|| fence_through_link(&table, handle, point.max(1), LINK_DEPTH))
+            .map(|f| (f.fence_va, f.fence_gpu_va, f.payload, f.ctx_idx));
         (found, d)
     };
     deferred.run();
@@ -791,7 +898,8 @@ pub fn export_snapshot(handle: u32) -> Option<u64> {
             .map(|f| f.point)
             .max()
             .unwrap_or(0);
-        (cur.map(|p| p.max(in_flight).max(1)), d)
+        let promised = promised_point(&table, handle);
+        (cur.map(|p| p.max(in_flight).max(promised).max(1)), d)
     };
     deferred.run();
     r
@@ -1031,7 +1139,16 @@ fn query_inner(handle: u32, last_submitted: bool) -> Option<u64> {
                     .map(|f| f.point)
                     .max()
                     .unwrap_or(0);
-                p.max(inflight)
+                // A link counts once every source has submitted its point.
+                let promised = promised_point(&table, handle);
+                let promised = if promised > p.max(inflight)
+                    && submitted_locked(&table, handle, promised, LINK_DEPTH)
+                {
+                    promised
+                } else {
+                    0
+                };
+                p.max(inflight).max(promised)
             })
         } else {
             cur
@@ -1072,7 +1189,8 @@ pub fn wait(
 }
 
 /// [`wait`] but `WAIT_AVAILABLE`: a pending hardware fence that covers the
-/// target counts as satisfied (fence submitted, not necessarily signaled).
+/// target counts as satisfied (fence submitted, not necessarily signaled),
+/// through a link as well ([`submitted_locked`]).
 pub fn wait_available(
     handles: &[u32],
     points: Option<&[u64]>,
@@ -1086,9 +1204,10 @@ pub fn wait_available(
 /// whose target is covered by a hardware fence PENDING ON THAT SAME CHANNEL
 /// counts as satisfied without waiting, because the GPFIFO executes in order
 /// -- the new submission cannot run before the fence lands, which is the
-/// only guarantee the wait exists to give. Fences on other channels (another
-/// process's work, an imported sync_file) are still waited for on the CPU.
-/// The syncobj itself stays pending until the fence really lands.
+/// only guarantee the wait exists to give, whether the fence is the handle's
+/// own or the one behind its link ([`fence_through_link`]). Fences on other
+/// channels (another process's work) are still waited for on the CPU. The
+/// syncobj itself stays pending until the fence really lands.
 pub fn wait_ordered(
     handles: &[u32],
     points: Option<&[u64]>,
@@ -1156,11 +1275,7 @@ fn wait_ready_inner(
             // 1 is what the rest of this module already does (`export_snapshot`,
             // `transfer`, the eventfd registry).
             let target = points.map(|p| p[i]).unwrap_or(1).max(1);
-            let pending_covers = available_only
-                && table
-                    .pending
-                    .iter()
-                    .any(|f| f.handle == h && f.point >= target);
+            let pending_covers = available_only && submitted_locked(&table, h, target, LINK_DEPTH);
             if point >= target || pending_covers {
                 signaled_count += 1;
                 if first_signaled.is_none() {
@@ -1230,18 +1345,20 @@ fn wait_inner(
                 // 1 is what the rest of this module already does (`export_snapshot`,
                 // `transfer`, the eventfd registry).
                 let target = points.map(|p| p[i]).unwrap_or(1).max(1);
-                let pending_covers = table
-                    .pending
-                    .iter()
-                    .any(|f| f.handle == h && f.point >= target);
+                let pending_covers =
+                    available_only && submitted_locked(&table, h, target, LINK_DEPTH);
                 let ordered = match ordered_ctx {
-                    Some(ctx) => table
-                        .pending
-                        .iter()
-                        .any(|f| f.handle == h && f.ctx_idx == ctx && f.point >= target),
+                    Some(ctx) => {
+                        table
+                            .pending
+                            .iter()
+                            .any(|f| f.handle == h && f.ctx_idx == ctx && f.point >= target)
+                            || fence_through_link(&table, h, target, LINK_DEPTH)
+                                .is_some_and(|f| f.ctx_idx == ctx)
+                    }
                     None => false,
                 };
-                if point >= target || ordered || (available_only && pending_covers) {
+                if point >= target || ordered || pending_covers {
                     signaled_count += 1;
                     if first_signaled.is_none() {
                         first_signaled = Some(i as u32);
@@ -2515,5 +2632,251 @@ mod tests {
         );
         assert_eq!(links_now(), 0);
         destroy(dst);
+    }
+
+    /// EXEC asks [`pending_hw_fence`] for the hardware fence behind each
+    /// wait so it can emit a GPU ACQUIRE instead of parking the ioctl on the
+    /// CPU. The acquire semaphore of an X11 swapchain image is always an
+    /// import or a merge, whose fence sits in the SOURCE's row: looked up by
+    /// the importer's handle it came back empty, so every such wait spun on
+    /// the CPU inside EXEC. Seen through the link, it is the source's fence.
+    #[test]
+    fn an_exec_wait_on_an_importer_finds_the_fence_its_source_waits_for() {
+        let _g = test_lock();
+        arm_hooks();
+        let src = create(false);
+        let mut zone = Landing::new();
+        assert!(attach_hw_fence(src, 1, zone.va(), 0x4000, 7, 3, true));
+        let dst = create(false);
+        assert!(import_snapshot(dst, src, export_snapshot(src).unwrap()));
+        let fence = Some((zone.va(), 0x4000u64, 7u32, 3u32));
+        assert_eq!(pending_hw_fence(dst, 1), fence, "the source's fence");
+        assert_eq!(
+            pending_hw_fence(dst, 0),
+            fence,
+            "point 0 is the binary fence"
+        );
+        assert_eq!(
+            pending_hw_fence(dst, 2),
+            None,
+            "a binary import delivers point 1, nothing higher"
+        );
+        assert_eq!(
+            query_submitted(dst),
+            Some(1),
+            "submitted as far as its source"
+        );
+        assert_eq!(query(dst), Some(0));
+        // An import of an import: two links deep, same fence.
+        let leaf = create(false);
+        assert!(import_snapshot(leaf, dst, 1));
+        assert_eq!(pending_hw_fence(leaf, 1), fence);
+        // A source with nothing submitted has nothing to acquire.
+        let idle = create(false);
+        let waiter = create(false);
+        assert!(import_snapshot(waiter, idle, 1));
+        assert_eq!(pending_hw_fence(waiter, 1), None);
+        assert_eq!(query_submitted(waiter), Some(0));
+        zone.land(7);
+        assert_eq!(query(leaf), Some(1));
+        assert_eq!(pending_hw_fence(dst, 1), None, "landed: nothing in flight");
+        for h in [leaf, dst, src, waiter, idle] {
+            assert!(destroy(h));
+        }
+    }
+
+    /// A transfer recorded before its source was submitted is a link; once
+    /// the source's work is in flight, the link shows that fence, and only
+    /// up to the point the transfer promised. Among several fences on the
+    /// source, the lowest one that covers the transferred point is the one.
+    #[test]
+    fn a_pending_transfer_shows_its_source_fence_up_to_the_point_it_promises() {
+        let _g = test_lock();
+        arm_hooks();
+        let src = create(false);
+        let dst = create(false);
+        assert!(
+            transfer(dst, 6, src, 4),
+            "deferred: nothing submitted on src"
+        );
+        assert_eq!(pending_hw_fence(dst, 6), None);
+        assert!(matches!(
+            wait_available(&[dst], Some(&[6]), true, 0),
+            WaitOutcome::Timeout
+        ));
+        assert_eq!(query_submitted(dst), Some(0));
+        let low = Landing::new();
+        let mut high = Landing::new();
+        let top = Landing::new();
+        assert!(attach_hw_fence(src, 2, low.va(), 0, 5, 1, false));
+        assert!(attach_hw_fence(src, 4, high.va(), 0, 11, 2, false));
+        assert!(attach_hw_fence(src, 6, top.va(), 0, 13, 2, false));
+        let fence = Some((high.va(), 0u64, 11u32, 2u32));
+        assert_eq!(pending_hw_fence(dst, 6), fence, "the fence that reaches 4");
+        assert_eq!(
+            pending_hw_fence(dst, 3),
+            fence,
+            "any point the transfer covers"
+        );
+        assert_eq!(pending_hw_fence(dst, 7), None, "past what it promises");
+        assert!(matches!(
+            wait_available(&[dst], Some(&[6]), true, 0),
+            WaitOutcome::Signaled { .. }
+        ));
+        assert!(matches!(
+            wait_available_ready(&[dst], Some(&[6]), true, 0),
+            Some(Ok(0))
+        ));
+        assert!(matches!(
+            wait_available(&[dst], Some(&[7]), true, 0),
+            WaitOutcome::Timeout
+        ));
+        assert!(matches!(
+            wait_available_ready(&[dst], Some(&[7]), true, 0),
+            Some(Err(WaitOutcome::Timeout))
+        ));
+        assert_eq!(query_submitted(dst), Some(6));
+        assert_eq!(query(dst), Some(0), "available is not signaled");
+        assert_eq!(export_snapshot(dst), Some(6));
+        high.land(11);
+        assert_eq!(query(dst), Some(6));
+        assert!(destroy(dst));
+        assert!(destroy(src));
+        assert_eq!(pending_now(), 0, "src's fences at 2 and 6 went with it");
+    }
+
+    /// A merged fence is submitted once EVERY source is, and can be one GPU
+    /// ACQUIRE only while exactly one source is still in flight.
+    #[test]
+    fn a_merge_is_available_once_every_source_is_submitted_and_acquirable_when_one_remains() {
+        let _g = test_lock();
+        arm_hooks();
+        let a = create(false);
+        let b = create(false);
+        let mut za = Landing::new();
+        let mut zb = Landing::new();
+        let m = merge_fences(&[(a, 1), (b, 1)]);
+        assert!(matches!(
+            wait_available(&[m], None, true, 0),
+            WaitOutcome::Timeout
+        ));
+        assert_eq!(pending_hw_fence(m, 1), None);
+        assert!(attach_hw_fence(a, 1, za.va(), 0, 1, 0, true));
+        assert!(
+            matches!(wait_available(&[m], None, true, 0), WaitOutcome::Timeout),
+            "one source not submitted"
+        );
+        assert_eq!(pending_hw_fence(m, 1), None, "b has nothing to acquire yet");
+        assert!(attach_hw_fence(b, 1, zb.va(), 0, 2, 1, true));
+        assert!(matches!(
+            wait_available(&[m], None, true, 0),
+            WaitOutcome::Signaled { .. }
+        ));
+        assert_eq!(query_submitted(m), Some(1));
+        assert_eq!(query(m), Some(0));
+        assert_eq!(
+            pending_hw_fence(m, 1),
+            None,
+            "two fences in flight are not one ACQUIRE"
+        );
+        za.land(1);
+        assert_eq!(
+            pending_hw_fence(m, 1),
+            Some((zb.va(), 0, 2, 1)),
+            "a reached: b's fence is the one left"
+        );
+        zb.land(2);
+        assert_eq!(query(m), Some(1));
+        for h in [m, a, b] {
+            assert!(destroy(h));
+        }
+    }
+
+    /// The in-order guarantee of a channel holds through a link as well: a
+    /// submit on the channel whose fence an importer waits for cannot
+    /// overtake it.
+    #[test]
+    fn a_wait_on_its_own_channel_is_ordered_through_a_link_too() {
+        let _g = test_lock();
+        arm_hooks();
+        let src = create(false);
+        let zone = Landing::new();
+        assert!(attach_hw_fence(src, 1, zone.va(), 0, 1, 5, true));
+        let dst = create(false);
+        assert!(import_snapshot(dst, src, 1));
+        assert!(matches!(
+            wait_ordered(&[dst], None, 0, 5),
+            WaitOutcome::Signaled { .. }
+        ));
+        assert!(matches!(
+            wait_ordered(&[dst], None, 0, 6),
+            WaitOutcome::Timeout
+        ));
+        assert!(
+            matches!(wait(&[dst], None, true, 0), WaitOutcome::Timeout),
+            "ordered is not signaled"
+        );
+        assert_eq!(query(dst), Some(0));
+        assert!(destroy(dst));
+        assert!(destroy(src));
+    }
+
+    /// `EXPORT_SYNC_FILE` takes the fence attached LAST. On a timeline that
+    /// still carries a transfer, that is the point the transfer promised,
+    /// not the counter: exporting the counter made the importer signaled
+    /// before the transferred work had run.
+    #[test]
+    fn exporting_a_timeline_with_a_transfer_pending_names_the_point_it_promises() {
+        let _g = test_lock();
+        arm_hooks();
+        let src = create(false);
+        let t = create(false);
+        assert!(timeline_signal(t, 3));
+        assert!(transfer(t, 5, src, 2), "deferred: src is at 0");
+        assert_eq!(query(t), Some(3));
+        assert_eq!(export_snapshot(t), Some(5));
+        let imp = create(false);
+        assert!(import_snapshot(imp, t, export_snapshot(t).unwrap()));
+        assert_eq!(query(imp), Some(0), "not before the transfer lands");
+        assert!(matches!(wait(&[imp], None, true, 0), WaitOutcome::Timeout));
+        assert!(timeline_signal(src, 2));
+        assert_eq!(query(t), Some(5));
+        assert_eq!(query(imp), Some(1));
+        for h in [imp, t, src] {
+            assert!(destroy(h));
+        }
+    }
+
+    /// Two syncobjs importing each other can never resolve; looking through
+    /// their links must give up, not recurse until the stack runs out.
+    #[test]
+    fn a_cycle_of_links_is_neither_acquirable_nor_available() {
+        let _g = test_lock();
+        arm_hooks();
+        let a = create(false);
+        let b = create(false);
+        assert!(import_snapshot(a, b, 1));
+        assert!(import_snapshot(b, a, 1));
+        assert_eq!(pending_hw_fence(a, 1), None);
+        assert!(matches!(
+            wait_available(&[a, b], None, true, 0),
+            WaitOutcome::Timeout
+        ));
+        assert!(matches!(
+            wait_available_ready(&[a], None, true, 0),
+            Some(Err(WaitOutcome::Timeout))
+        ));
+        assert_eq!(query_submitted(a), Some(0));
+        assert_eq!(export_snapshot(a), Some(1));
+        assert!(matches!(
+            wait_ordered(&[a], None, 0, 0),
+            WaitOutcome::Timeout
+        ));
+        // A direct signal breaks the cycle: b's link is then reached.
+        assert!(signal(a));
+        assert_eq!(query(b), Some(1));
+        assert_eq!(links_now(), 0);
+        assert!(destroy(a));
+        assert!(destroy(b));
     }
 }
