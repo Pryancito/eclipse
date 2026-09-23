@@ -21,7 +21,7 @@ use alloc::vec::Vec;
 use core::arch::asm;
 use log::warn;
 use rboot::config::{self, Resolution};
-use rboot::{cmdline, fb, logo, progress, video, BootInfo, GraphicInfo};
+use rboot::{cmdline, fb, logo, page_table, progress, video, BootInfo, GraphicInfo};
 use uefi::proto::console::gop::{GraphicsOutput, ModeInfo, PixelFormat};
 use uefi::proto::media::file::*;
 use uefi::proto::media::fs::SimpleFileSystem;
@@ -36,7 +36,6 @@ use xmas_elf::ElfFile;
 
 mod idt;
 mod libc_shim;
-mod page_table;
 
 const CONFIG_PATH: &str = "\\EFI\\Boot\\rboot.conf";
 
@@ -168,24 +167,23 @@ fn efi_main(image: Handle, mut st: SystemTable<Boot>) -> Status {
         // immediately on real hardware.
         Efer::update(|f| f.insert(EferFlags::NO_EXECUTE_ENABLE));
     }
+    let mut allocator = UEFIFrameAllocator(bs);
+    let mut machine = page_table::Firmware {
+        mapper: &mut page_table,
+        allocator: &mut allocator,
+    };
     debug!("mapping elf segments...");
-    page_table::map_elf(&elf, &mut page_table, &mut UEFIFrameAllocator(bs))
-        .expect("failed to map ELF");
+    page_table::map_elf(&elf, &mut machine).expect("failed to map ELF");
     debug!("mapping kernel stack...");
     page_table::map_stack(
         config.kernel_stack_address,
         config.kernel_stack_size,
-        &mut page_table,
-        &mut UEFIFrameAllocator(bs),
+        &mut machine,
     )
     .expect("failed to map stack");
     debug!("mapping physical memory...");
-    page_table::map_physical_memory(
-        config.physical_memory_offset,
-        max_phys_addr,
-        &mut page_table,
-        &mut UEFIFrameAllocator(bs),
-    );
+    page_table::map_physical_memory(config.physical_memory_offset, max_phys_addr, &mut machine)
+        .expect("failed to map physical memory");
     progress::bar(graphic_info.mode, graphic_info.fb_addr, 47);
     debug!("sanity checks before ExitBootServices...");
 
