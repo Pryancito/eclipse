@@ -101,21 +101,25 @@ impl RangeMap {
 
     /// Carve a free range of exactly `len` bytes within `[lo, hi)`, aligned to
     /// `align`. Returns its start.
+    ///
+    /// Iterates via `ranges_overlapping`, which also yields the at-most-one
+    /// free range that *starts before* `lo` and extends into the window. Free
+    /// ranges are coalesced across block-group boundaries, and block groups
+    /// are laid out back to back (mkfs puts SYSTEM, METADATA and DATA next to
+    /// each other, and `create_chunk` places every new one at `logical_end()`),
+    /// so a block group whose head is free is routinely covered by a range
+    /// keyed *inside its predecessor*. Keying the scan on `range(lo..hi)`
+    /// missed exactly that range, and a brand-new chunk -- entirely free, and
+    /// adjacent to a predecessor with a free tail -- looked like it had no
+    /// usable space at all.
     pub fn alloc_in(&mut self, lo: u64, hi: u64, len: u64, align: u64) -> Option<u64> {
-        let mut cursor = lo;
-        while let Some((&rs, &rl)) = self.map.range(cursor..hi).next() {
-            let start = rs.max(lo);
-            let start = start.div_ceil(align) * align;
-            if start + len <= (rs + rl).min(hi) {
-                self.take(start, len).ok()?;
-                return Some(start);
-            }
-            cursor = rs + rl;
-            if cursor >= hi {
-                break;
-            }
-        }
-        None
+        let start = self.ranges_overlapping(lo, hi).find_map(|(rs, rl)| {
+            let start = rs.max(lo).checked_next_multiple_of(align)?;
+            let end = (rs + rl).min(hi);
+            (start.checked_add(len)? <= end).then_some(start)
+        })?;
+        self.take(start, len).ok()?;
+        Some(start)
     }
 
     /// Largest free range within `[lo, hi)`, if any: (start, len).
@@ -386,5 +390,155 @@ impl FreeSpace {
             }
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Block groups sit back to back and free ranges coalesce across their
+    /// boundaries, so the free space at the head of a block group is very
+    /// often described by a range *keyed inside its predecessor*. Every
+    /// accessor has to look at that straddling range, not just at the ranges
+    /// whose key falls inside the window.
+    #[test]
+    fn alloc_in_sees_a_range_that_starts_before_the_window() {
+        // bg A = [0, 0x1000), bg B = [0x1000, 0x2000). A's tail is free and
+        // all of B is free, so both are one coalesced range keyed at 0x800.
+        let mut m = RangeMap::default();
+        m.insert(0x800, 0x1800);
+        assert_eq!(m.iter().collect::<Vec<_>>(), alloc::vec![(0x800, 0x1800)]);
+        // The three accessors must agree that B is entirely free.
+        assert_eq!(m.total_free_in(0x1000, 0x2000), 0x1000);
+        assert_eq!(m.largest_in(0x1000, 0x2000), Some((0x1000, 0x1000)));
+        assert_eq!(m.alloc_in(0x1000, 0x2000, 0x400, 0x400), Some(0x1000));
+        assert_eq!(m.total_free_in(0x1000, 0x2000), 0xc00);
+    }
+
+    /// The whole window may be covered by the straddler, with nothing keyed
+    /// inside it at all -- a brand-new chunk placed right after a block group
+    /// with a free tail.
+    #[test]
+    fn alloc_in_can_fill_a_window_covered_only_by_the_straddler() {
+        let mut m = RangeMap::default();
+        m.insert(0, 0x4000);
+        // Consume all of [0x1000, 0x2000) one aligned block at a time.
+        for i in 0..4 {
+            assert_eq!(
+                m.alloc_in(0x1000, 0x2000, 0x400, 0x400),
+                Some(0x1000 + i * 0x400),
+                "block {} of the window",
+                i
+            );
+        }
+        assert_eq!(m.alloc_in(0x1000, 0x2000, 0x400, 0x400), None);
+        // The rest of the coalesced range is untouched.
+        assert_eq!(m.total_free_in(0, 0x1000), 0x1000);
+        assert_eq!(m.total_free_in(0x2000, 0x4000), 0x2000);
+    }
+
+    /// Alignment is applied to the clipped start, and a range that reaches
+    /// into the window but leaves too little aligned room is skipped in
+    /// favour of a later one.
+    #[test]
+    fn alloc_in_aligns_the_clipped_start_and_skips_short_ranges() {
+        let mut m = RangeMap::default();
+        // Straddles into the window but only by 0x80 bytes.
+        m.insert(0xf80, 0x100);
+        m.insert(0x1800, 0x800);
+        assert_eq!(m.alloc_in(0x1000, 0x2000, 0x400, 0x400), Some(0x1800));
+        // An unaligned range start is rounded up inside its own extent.
+        let mut m = RangeMap::default();
+        m.insert(0x1100, 0x900);
+        assert_eq!(m.alloc_in(0x1000, 0x2000, 0x400, 0x400), Some(0x1400));
+    }
+
+    /// A range must not be handed out beyond `hi`, even though it continues
+    /// past it in the map.
+    #[test]
+    fn alloc_in_never_crosses_the_upper_bound() {
+        let mut m = RangeMap::default();
+        m.insert(0, 0x8000);
+        assert_eq!(m.alloc_in(0x1000, 0x1400, 0x800, 0x400), None);
+        assert_eq!(m.alloc_in(0x1000, 0x1400, 0x400, 0x400), Some(0x1000));
+    }
+
+    /// `dev_free.alloc_in(0, u64::MAX, ..)` is a real call site and `want`
+    /// reaches `create_chunk` straight from the caller, so an absurd length
+    /// must come back as "no space" rather than wrap around into a hit.
+    #[test]
+    fn alloc_in_refuses_an_absurd_length_instead_of_wrapping() {
+        let mut m = RangeMap::default();
+        m.insert(0x1000, 0x1000);
+        assert_eq!(m.alloc_in(0, u64::MAX, u64::MAX, 0x1000), None);
+        assert_eq!(m.alloc_in(0, u64::MAX, u64::MAX - 0xfff, 0x1000), None);
+        assert_eq!(m.total_free_in(0, u64::MAX), 0x1000);
+        assert_eq!(m.alloc_in(0, u64::MAX, 0x1000, 0x1000), Some(0x1000));
+    }
+
+    fn bgs(groups: &[(u64, u64, u64)]) -> FreeSpace {
+        let mut fs = FreeSpace {
+            nodesize: 0x4000,
+            sectorsize: 0x1000,
+            ..Default::default()
+        };
+        for &(start, len, flags) in groups {
+            fs.bgs.insert(
+                start,
+                BlockGroup {
+                    start,
+                    len,
+                    flags,
+                    used: 0,
+                    dirty: false,
+                },
+            );
+            fs.free.insert(start, len);
+        }
+        fs
+    }
+
+    /// The bug as the filesystem hits it: a fresh metadata chunk laid down
+    /// immediately after a data block group with a free tail. Every byte of
+    /// it is free and `meta_free()` says so, yet allocating one tree block
+    /// out of it used to fail -- ENOSPC on a nearly empty filesystem.
+    #[test]
+    fn a_fresh_chunk_after_a_half_used_neighbour_is_usable() {
+        let mut fs = bgs(&[
+            (0x10_0000, 0x40_0000, BLOCK_GROUP_DATA),
+            (0x50_0000, 0x40_0000, BLOCK_GROUP_METADATA),
+        ]);
+        // Half the data group is in use; its tail coalesces with the new
+        // metadata group into a single free range keyed inside the data one.
+        fs.free.take(0x10_0000, 0x20_0000).unwrap();
+        fs.account(0x10_0000, 0x20_0000, 1).unwrap();
+        assert_eq!(fs.free.iter().count(), 1);
+        assert_eq!(fs.meta_free(), 0x40_0000);
+
+        let bytenr = fs.alloc_tree_block(FS_TREE, 0, BLOCK_GROUP_METADATA).unwrap();
+        assert_eq!(bytenr, 0x50_0000);
+        assert_eq!(fs.meta_free(), 0x40_0000 - 0x4000);
+    }
+
+    /// `meta_free()` (`len - used`, per block group) and what the free-range
+    /// map will actually hand out must not disagree: the whole metadata group
+    /// has to be allocatable, one node at a time, until `meta_free()` is zero.
+    #[test]
+    fn metadata_can_be_allocated_down_to_the_last_node() {
+        let mut fs = bgs(&[
+            (0x10_0000, 0x10_0000, BLOCK_GROUP_DATA),
+            (0x20_0000, 0x4_0000, BLOCK_GROUP_METADATA),
+        ]);
+        let mut n = 0;
+        while fs.meta_free() > 0 {
+            fs.alloc_tree_block(FS_TREE, 0, BLOCK_GROUP_METADATA)
+                .unwrap_or_else(|e| panic!("node {} of a group reporting free space: {:?}", n, e));
+            n += 1;
+        }
+        assert_eq!(n, 0x4_0000 / 0x4000);
+        assert!(fs.alloc_tree_block(FS_TREE, 0, BLOCK_GROUP_METADATA).is_err());
+        // The neighbouring data group is untouched.
+        assert_eq!(fs.data_free(), 0x10_0000);
     }
 }
