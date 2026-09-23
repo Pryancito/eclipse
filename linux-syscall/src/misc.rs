@@ -729,11 +729,28 @@ impl Syscall<'_> {
             }
             FUTEX_WAKE | FUTEX_WAKE_BITSET => Ok(futex.wake(val as _)),
             FUTEX_REQUEUE | FUTEX_CMP_REQUEUE => {
-                let requeue_futex = self
-                    .linux_process()
-                    .get_futex(uaddr2)
-                    .ok_or(LxError::EINVAL)?;
-                // FUTEX_CMP_REQUEUE checks *uaddr against val3 first.
+                // The TARGET word is resolved exactly like the source one
+                // above. A requeue that carries no FUTEX_PRIVATE_FLAG names a
+                // word another process may be waiting on, and taking its
+                // queue from the per-process table would move those waiters
+                // onto a queue nobody else can ever reach -- they would sleep
+                // for good. Linux keys both sides through `get_futex_key`.
+                let requeue_futex = match (op & FUTEX_PRIVATE_FLAG == 0)
+                    .then(|| self.shared_futex(uaddr2))
+                    .flatten()
+                {
+                    Some(futex) => futex,
+                    None => self
+                        .linux_process()
+                        .get_futex(uaddr2)
+                        .ok_or(LxError::EINVAL)?,
+                };
+                // FUTEX_CMP_REQUEUE checks *uaddr against val3 first; a
+                // mismatch comes back as `BAD_STATE`, which maps to EAGAIN,
+                // what Linux answers. The result is how many were woken plus
+                // how many moved -- FUTEX_WAKE above already returns its own
+                // count, and answering 0 here told every caller that a
+                // broadcast had reached nobody.
                 let res = futex.requeue(
                     val3 as i32,
                     val as _,
@@ -743,7 +760,7 @@ impl Syscall<'_> {
                     cmd == FUTEX_CMP_REQUEUE,
                 );
                 match res {
-                    Ok(_) => Ok(0),
+                    Ok(count) => Ok(count),
                     Err(e) => Err(e.into()),
                 }
             }

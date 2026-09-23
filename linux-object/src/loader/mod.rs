@@ -1983,12 +1983,18 @@ mod elf_bounds_tests {
     #[test]
     fn a_segments_page_permissions_are_the_ones_its_header_asked_for() {
         // PF_X = 1, PF_W = 2, PF_R = 4.
+        //
+        // The segment has to sit above the host's `vm.mmap_min_addr`: under
+        // libos this really does `mmap` at the address the header names, and
+        // a runner with the usual 64 KiB answers EPERM where a container with
+        // 4 KiB maps it happily. 4 MiB is where a non-PIE image starts anyway.
+        const BASE: usize = 0x40_0000;
         let flags_of = |p_flags: u32| {
             let image = Elf::new()
                 .phdr(Phdr {
                     p_type: 1, // PT_LOAD
                     flags: p_flags,
-                    virtual_addr: 0x1000,
+                    virtual_addr: BASE as u64,
                     mem_size: 0x1000,
                     ..Default::default()
                 })
@@ -1996,10 +2002,7 @@ mod elf_bounds_tests {
             let elf = ElfFile::new(&image).unwrap();
             let vmar = VmAddressRegion::new_root();
             vmar.load_from_elf(&elf).unwrap();
-            vmar.find_mapping(0x1000)
-                .unwrap()
-                .get_flags(0x1000)
-                .unwrap()
+            vmar.find_mapping(BASE).unwrap().get_flags(BASE).unwrap()
         };
         let user = MMUFlags::USER;
         assert_eq!(flags_of(4), user | MMUFlags::READ);
