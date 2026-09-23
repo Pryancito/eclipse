@@ -287,6 +287,17 @@ impl Futex {
                     }
                     inner.waker.replace(cx.waker().clone());
                     futex_inner.waiter_queue.push_back(self.waiter.clone());
+                } else if inner
+                    .waker
+                    .as_ref()
+                    .is_some_and(|waker| !waker.will_wake(cx.waker()))
+                {
+                    // Already queued, and re-polled with a DIFFERENT waker.
+                    // `Future::poll` only promises to wake the waker of the
+                    // MOST RECENT poll, so keeping the first one is a lost
+                    // wakeup: the waiter then sleeps to its deadline, or for
+                    // good when it has none.
+                    inner.waker = Some(cx.waker().clone());
                 }
                 Poll::Pending
             }
@@ -336,19 +347,32 @@ impl Futex {
     /// set to the thread which was woken. Otherwise, the futex will have no owner.
     pub fn wake_single_owner(&self) {
         // Pop the waiter and set the new owner under one lock acquire
-        // (pre-compute the next owner from the popped waiter's thread,
-        // independent of whether the wakeup itself raced with cancellation).
+        // (pre-compute the next owner from the popped waiter's thread).
         // The actual wake happens after the lock is released to preserve the
         // futex.inner -> waiter.inner ordering ban.
-        let waiter = {
-            let mut inner = self.inner.lock();
-            let w = inner.waiter_queue.pop_front();
-            let new_owner = w.as_ref().and_then(|w| w.thread.clone());
-            inner.set_owner(new_owner);
-            w
-        };
-        if let Some(waiter) = waiter {
-            waiter.wake();
+        //
+        // A popped waiter may be a tombstone: cancelled or timed out, yet
+        // still queued because the `FutexFuture` that owned it searched its
+        // previous queue after a `requeue` had already moved it (see the
+        // retarget comment there). A tombstone is not "a thread to wake", so
+        // it may neither become the owner nor strand the live waiter behind
+        // it -- keep going, exactly as `wake` does.
+        loop {
+            let waiter = {
+                let mut inner = self.inner.lock();
+                let w = inner.waiter_queue.pop_front();
+                let new_owner = w.as_ref().and_then(|w| w.thread.clone());
+                inner.set_owner(new_owner);
+                w
+            };
+            match waiter {
+                // Woken for real: the owner installed above is its thread.
+                Some(waiter) if waiter.wake() => return,
+                // Tombstoned: owns nothing and wakes nothing. Next.
+                Some(_) => continue,
+                // Queue drained: the lock above left the futex unowned.
+                None => return,
+            }
         }
     }
 
@@ -361,10 +385,20 @@ impl Futex {
     ///
     /// This requeueing behavior may be used to avoid thundering herds on wake.
     ///
+    /// Returns how many waiters were woken plus how many were moved, which is
+    /// the number `FUTEX_REQUEUE`/`FUTEX_CMP_REQUEUE` answer with on Linux.
+    ///
     /// # Ownership
     ///
     /// The owner of this futex is set to nothing, regardless of the wake count.
     /// The owner of the `requeue_futex` is set to the thread `new_requeue_owner`.
+    ///
+    /// # Errors
+    ///
+    /// - `BAD_STATE`: `check_value` was asked for and `current_value` does not
+    ///   match the value of this futex (Linux answers `EAGAIN`).
+    /// - `INVALID_ARGS`: `new_requeue_owner` is one of the waiters, so it would
+    ///   come out owning a futex it is itself blocked on.
     pub fn requeue(
         &self,
         current_value: i32,
@@ -373,7 +407,42 @@ impl Futex {
         requeue_futex: &Arc<Futex>,
         new_requeue_owner: Option<Arc<Thread>>,
         check_value: bool,
-    ) -> ZxResult {
+    ) -> ZxResult<usize> {
+        // Locks are taken in address order below so that two concurrent
+        // requeues with swapped futexes cannot deadlock (ABBA) -- and first
+        // of all the degenerate case where both are the SAME futex, which no
+        // ordering can save.
+        let this = self as *const Futex;
+        let that = Arc::as_ptr(requeue_futex);
+        if this == that {
+            // A futex requeued onto itself. Zircon rejects it one layer up
+            // (`zx_futex_requeue` answers INVALID_ARGS when `value_ptr` and
+            // `requeue_ptr` are the same futex), so this is the Linux side:
+            // there it is legal, and since moving waiters from a queue to
+            // itself changes nothing, all that is left is the wake half.
+            //
+            // What Linux does NOT skip is the comparison. `futex_requeue`
+            // (kernel/futex/requeue.c) reads the word under the bucket lock
+            // before touching a single waiter and answers EAGAIN when it no
+            // longer matches, whether or not the two addresses are equal --
+            // `double_lock_hb` exists precisely so the same-bucket case goes
+            // through the identical path. Returning `Ok` and waking anyway,
+            // which is what this branch used to do, tells a condvar
+            // broadcast it won a race it had lost and wakes the sleepers it
+            // was supposed to leave alone.
+            {
+                // Under the queue lock, for the same reason the two-futex
+                // path below checks there: it must not race a waiter's
+                // check-and-enqueue. `wake` takes the lock again afterwards;
+                // a waiter that slips in between is merely woken too, which
+                // the API allows, whereas one skipped would be lost.
+                let _queue = self.inner.lock();
+                if check_value && self.value.load(Ordering::SeqCst) != current_value {
+                    return Err(ZxError::BAD_STATE);
+                }
+            }
+            return Ok(self.wake(wake_count));
+        }
         let mut to_wake = alloc::vec::Vec::new();
         let mut to_requeue = alloc::vec::Vec::new();
         {
@@ -382,18 +451,6 @@ impl Futex {
             // a concurrent FUTEX_WAKE on the target (e.g. a mutex unlock
             // racing musl's condvar unlock_requeue) finds an empty queue and
             // the wakeup is lost — threads then stall until a timeout.
-            // Lock in address order so two concurrent requeues with swapped
-            // futexes cannot deadlock (ABBA).
-            let this = self as *const Futex;
-            let that = Arc::as_ptr(requeue_futex);
-            if this == that {
-                // Requeueing a futex onto itself is meaningless and would
-                // self-deadlock below; treat it as a plain wake.
-                drop(to_wake);
-                let woken = self.wake(wake_count);
-                let _ = woken;
-                return Ok(());
-            }
             let (mut inner, mut new_inner);
             if (this as usize) <= (that as usize) {
                 inner = self.inner.lock();
@@ -407,6 +464,18 @@ impl Futex {
                 if self.value.load(Ordering::SeqCst) != current_value {
                     return Err(ZxError::BAD_STATE);
                 }
+            }
+            // A thread may not own a futex it is itself blocked on: that is
+            // what `wait_with_owner` already refuses through the very same
+            // helper, and `zx_futex_requeue` documents the rule for
+            // `new_requeue_owner` too. Asked of BOTH queues -- a waiter of
+            // this futex is one requeue away from waiting on the other one --
+            // and before anything moves, so a rejected call leaves every
+            // waiter exactly where it was.
+            if !inner.is_valid_new_owner(&new_requeue_owner)
+                || !new_inner.is_valid_new_owner(&new_requeue_owner)
+            {
+                return Err(ZxError::INVALID_ARGS);
             }
             for _ in 0..wake_count {
                 if let Some(waiter) = inner.waiter_queue.pop_front() {
@@ -428,14 +497,19 @@ impl Futex {
         // the poll/Drop lock order). A waiter cancelled in this window
         // searches its old queue, misses, and stays tombstoned on the new
         // queue, where wake() skips it without consuming a count.
+        let requeued = to_requeue.len();
         for waiter in to_requeue {
             waiter.reset_futex(requeue_futex.clone());
         }
-        // Deliver wakeups last, with no futex lock held.
+        // Deliver wakeups last, with no futex lock held. A tombstone among
+        // them wakes nobody and so counts for nobody.
+        let mut woken = 0;
         for waiter in to_wake {
-            waiter.wake();
+            if waiter.wake() {
+                woken += 1;
+            }
         }
-        Ok(())
+        Ok(woken + requeued)
     }
 }
 
@@ -507,7 +581,85 @@ impl Waiter {
 mod tests {
     use super::*;
     use crate::task::{Job, Process};
+    use alloc::boxed::Box;
+    use alloc::vec::Vec;
     use core::time::Duration;
+    use futures::task::{waker, ArcWake};
+
+    /// A futex over a freshly leaked word, so every test owns its own value
+    /// instead of sharing one `static` with the next one.
+    fn futex_with(value: i32) -> Arc<Futex> {
+        Futex::new(Box::leak(Box::new(AtomicI32::new(value))))
+    }
+
+    /// A waker that only counts, so a test can ask "was THIS waiter woken?"
+    /// rather than "did somebody wake".
+    struct Counter(AtomicUsize);
+
+    impl Counter {
+        fn count(&self) -> usize {
+            self.0.load(Ordering::SeqCst)
+        }
+    }
+
+    impl ArcWake for Counter {
+        fn wake_by_ref(arc_self: &Arc<Self>) {
+            arc_self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// A waiter blocked on `futex`, queued by polling its future once by hand.
+    ///
+    /// Driving the future instead of spawning a task is what makes these
+    /// tests exact: the queue is in a known state at every line, there is no
+    /// sleep to tune, and dropping the returned future is a cancellation with
+    /// no race in it. Hold on to the future -- dropping it cancels the wait.
+    #[allow(clippy::type_complexity)]
+    fn queue_waiter(
+        futex: &Arc<Futex>,
+        value: i32,
+        thread: Option<Arc<Thread>>,
+    ) -> (Pin<Box<dyn Future<Output = ZxResult>>>, Arc<Counter>) {
+        let counter = Arc::new(Counter(AtomicUsize::new(0)));
+        let mut future: Pin<Box<dyn Future<Output = ZxResult>>> =
+            Box::pin(futex.wait_with_owner(value, thread, None));
+        let waker = waker(counter.clone());
+        assert_eq!(
+            future.as_mut().poll(&mut Context::from_waker(&waker)),
+            Poll::Pending,
+            "the waiter should be on the queue now"
+        );
+        (future, counter)
+    }
+
+    /// A cancelled waiter still sitting on a queue.
+    ///
+    /// This state is reachable for real: `requeue` retargets waiters AFTER
+    /// releasing the queue locks, so one cancelled inside that window looks
+    /// for itself on the queue it has just left, misses, and stays behind on
+    /// the new one -- which is exactly what the comment there says. Building
+    /// it by hand is the same state without the race.
+    fn enqueue_tombstone(futex: &Arc<Futex>, thread: Option<Arc<Thread>>) {
+        let waiter = Arc::new(Waiter {
+            thread,
+            inner: Mutex::new(WaiterInner {
+                waker: None,
+                woken: true,
+                futex: futex.clone(),
+            }),
+        });
+        futex.inner.lock().waiter_queue.push_back(waiter);
+    }
+
+    /// Two threads of one throwaway process, to hang futex ownership on.
+    fn two_threads() -> (Arc<Thread>, Arc<Thread>) {
+        let root_job = Job::root();
+        let proc = Process::create(&root_job, "proc").expect("failed to create process");
+        (
+            Thread::create(&proc, "one").expect("failed to create thread"),
+            Thread::create(&proc, "two").expect("failed to create thread"),
+        )
+    }
 
     #[async_std::test]
     async fn wait() {
@@ -663,5 +815,401 @@ mod tests {
         // The woken locker takes the free word, preserving the flag bit.
         assert_eq!(futex.compare_exchange(WAITERS, 8 | WAITERS), Ok(WAITERS));
         assert_eq!(futex.load() & 0x3fff_ffff, 8);
+    }
+    /// `zx_futex_wake` clears the owner "regardless of the wake count", zero
+    /// included -- and a zero wake must not disturb the queue.
+    #[test]
+    fn a_wake_of_zero_clears_the_owner_and_touches_nobody() {
+        let (thread, _) = two_threads();
+        let futex = futex_with(1);
+        let (_waiter, counter) = queue_waiter(&futex, 1, None);
+        futex.inner.lock().set_owner(Some(thread));
+
+        assert_eq!(futex.wake(0), 0);
+        assert!(futex.owner().is_none());
+        assert_eq!(counter.count(), 0);
+        assert_eq!(futex.inner.lock().waiter_queue.len(), 1);
+    }
+
+    /// A wake takes exactly the batch it was asked for and leaves the rest.
+    #[test]
+    fn a_wake_takes_exactly_the_batch_it_was_asked_for() {
+        let futex = futex_with(1);
+        let waiters: Vec<_> = (0..4).map(|_| queue_waiter(&futex, 1, None)).collect();
+        let (owner, _) = two_threads();
+        futex.inner.lock().set_owner(Some(owner));
+
+        assert_eq!(futex.wake(2), 2);
+        // "The owner of the futex is set to nothing, regardless of the wake
+        // count" -- on this path as much as on the other two.
+        assert!(futex.owner().is_none());
+        assert_eq!(waiters[0].1.count(), 1);
+        assert_eq!(waiters[1].1.count(), 1);
+        assert_eq!(waiters[2].1.count(), 0);
+        assert_eq!(waiters[3].1.count(), 0);
+        assert_eq!(futex.inner.lock().waiter_queue.len(), 2);
+    }
+
+    /// The condvar broadcast: `INT_MAX` waiters asked for, however many are
+    /// there woken, once each, and the queue left empty.
+    #[test]
+    fn waking_more_than_are_queued_drains_the_queue_once() {
+        let futex = futex_with(1);
+        let waiters: Vec<_> = (0..3).map(|_| queue_waiter(&futex, 1, None)).collect();
+
+        assert_eq!(futex.wake(i32::MAX as usize), 3);
+        for (_, counter) in &waiters {
+            assert_eq!(counter.count(), 1);
+        }
+        assert_eq!(futex.wake(i32::MAX as usize), 0);
+        for (_, counter) in &waiters {
+            assert_eq!(counter.count(), 1);
+        }
+    }
+
+    /// Cancelling a wait (the timed-out `FUTEX_WAIT`) takes the waiter off
+    /// the queue, so it neither gets woken nor eats somebody else's wake.
+    #[test]
+    fn a_cancelled_wait_leaves_the_queue() {
+        let futex = futex_with(1);
+        let (waiter, counter) = queue_waiter(&futex, 1, None);
+        assert_eq!(futex.inner.lock().waiter_queue.len(), 1);
+
+        drop(waiter);
+        assert_eq!(futex.inner.lock().waiter_queue.len(), 0);
+        assert_eq!(futex.wake(1), 0);
+        assert_eq!(counter.count(), 0);
+    }
+
+    /// Wake-one over a tombstone: it must not report "one woken" for a waiter
+    /// that is not there any more, nor leave the live one asleep behind it.
+    #[test]
+    fn a_tombstone_does_not_consume_a_wake_of_one() {
+        let futex = futex_with(1);
+        enqueue_tombstone(&futex, None);
+        let (_waiter, counter) = queue_waiter(&futex, 1, None);
+
+        assert_eq!(futex.wake(1), 1);
+        assert_eq!(counter.count(), 1);
+        assert_eq!(futex.inner.lock().waiter_queue.len(), 0);
+
+        // And a queue of nothing but tombstones is an empty queue: it wakes
+        // nobody and says so, rather than reporting the one it discarded.
+        enqueue_tombstone(&futex, None);
+        enqueue_tombstone(&futex, None);
+        assert_eq!(futex.wake(1), 0);
+        assert_eq!(futex.inner.lock().waiter_queue.len(), 0);
+    }
+
+    /// The same for the batch path, where the top-up loop has to go back to
+    /// the queue for as many live waiters as the tombstones displaced.
+    #[test]
+    fn a_tombstone_does_not_consume_a_wake_in_a_batch() {
+        let futex = futex_with(1);
+        enqueue_tombstone(&futex, None);
+        let (_first, first) = queue_waiter(&futex, 1, None);
+        enqueue_tombstone(&futex, None);
+        let (_second, second) = queue_waiter(&futex, 1, None);
+
+        assert_eq!(futex.wake(2), 2);
+        assert_eq!(first.count(), 1);
+        assert_eq!(second.count(), 1);
+    }
+
+    /// `zx_futex_wake_single_owner` says the owner becomes "the thread which
+    /// was woken". A tombstone at the head of the queue is nobody's thread:
+    /// handing it the futex left the live waiter asleep AND named a cancelled
+    /// thread as owner of a lock it was no longer waiting for.
+    #[test]
+    fn wake_single_owner_skips_a_tombstone_and_owns_the_thread_it_woke() {
+        let (gone, live) = two_threads();
+        let futex = futex_with(1);
+        enqueue_tombstone(&futex, Some(gone.clone()));
+        let (_waiter, counter) = queue_waiter(&futex, 1, Some(live.clone()));
+
+        futex.wake_single_owner();
+        assert_eq!(counter.count(), 1, "the live waiter is the one to wake");
+        let owner = futex.owner().expect("the woken thread owns the futex");
+        assert!(Arc::ptr_eq(&owner, &live));
+        assert!(!Arc::ptr_eq(&owner, &gone));
+    }
+
+    /// "Otherwise, the futex will have no owner": a queue of nothing but
+    /// tombstones is an empty queue.
+    #[test]
+    fn wake_single_owner_over_an_empty_queue_leaves_no_owner() {
+        let (gone, previous) = two_threads();
+        let futex = futex_with(1);
+        futex.inner.lock().set_owner(Some(previous));
+        enqueue_tombstone(&futex, Some(gone));
+
+        futex.wake_single_owner();
+        assert!(futex.owner().is_none());
+
+        futex.wake_single_owner();
+        assert!(futex.owner().is_none());
+    }
+
+    /// A futex requeued onto ITSELF. Zircon rejects it one layer up, so this
+    /// is the Linux path, where it is legal -- `FUTEX_CMP_REQUEUE` with
+    /// `uaddr1 == uaddr2`. Linux still reads the word first and answers
+    /// EAGAIN when it moved; this branch used to return success and wake the
+    /// sleepers anyway, telling a broadcast it had won a race it lost.
+    #[test]
+    fn requeueing_a_futex_onto_itself_still_checks_the_value() {
+        let futex = futex_with(1);
+        let (_waiter, counter) = queue_waiter(&futex, 1, None);
+
+        assert_eq!(
+            futex.requeue(99, 1, 1, &futex, None, true),
+            Err(ZxError::BAD_STATE)
+        );
+        assert_eq!(counter.count(), 0, "nobody may be woken on a mismatch");
+        assert_eq!(futex.inner.lock().waiter_queue.len(), 1);
+
+        // With the value it was told, the same call is an ordinary wake.
+        assert_eq!(futex.requeue(1, 1, 1, &futex, None, true), Ok(1));
+        assert_eq!(counter.count(), 1);
+        assert_eq!(futex.inner.lock().waiter_queue.len(), 0);
+    }
+
+    /// `FUTEX_REQUEUE` (no `CMP_`) passes no value to compare, and then the
+    /// self-requeue is a plain wake whatever the word says.
+    #[test]
+    fn requeueing_a_futex_onto_itself_unchecked_is_a_plain_wake() {
+        let futex = futex_with(1);
+        let waiters: Vec<_> = (0..3).map(|_| queue_waiter(&futex, 1, None)).collect();
+
+        assert_eq!(futex.requeue(99, 2, 1, &futex, None, false), Ok(2));
+        assert_eq!(waiters[0].1.count(), 1);
+        assert_eq!(waiters[1].1.count(), 1);
+        assert_eq!(waiters[2].1.count(), 0);
+        assert_eq!(futex.inner.lock().waiter_queue.len(), 1);
+    }
+
+    /// Linux answers a requeue with how many it woke plus how many it moved.
+    /// Answering zero told every caller that the broadcast reached nobody.
+    #[test]
+    fn requeue_answers_how_many_it_woke_and_how_many_it_moved() {
+        let source = futex_with(1);
+        let target = futex_with(2);
+        let waiters: Vec<_> = (0..4).map(|_| queue_waiter(&source, 1, None)).collect();
+        let (owner, next_owner) = two_threads();
+        source.inner.lock().set_owner(Some(owner));
+
+        assert_eq!(
+            source.requeue(1, 1, 2, &target, Some(next_owner.clone()), true),
+            Ok(3)
+        );
+        assert_eq!(waiters[0].1.count(), 1, "the first is woken");
+        assert_eq!(source.inner.lock().waiter_queue.len(), 1);
+        assert_eq!(target.inner.lock().waiter_queue.len(), 2);
+        // "The owner of this futex is set to nothing, regardless of the wake
+        // count. The owner of the `requeue_futex` is set to the thread
+        // `new_requeue_owner`."
+        assert!(source.owner().is_none());
+        assert!(Arc::ptr_eq(&target.owner().unwrap(), &next_owner));
+
+        // The two that moved are woken by the target now, not by the source.
+        assert_eq!(source.wake(2), 1);
+        assert_eq!(waiters[1].1.count(), 0);
+        assert_eq!(target.wake(2), 2);
+        assert_eq!(waiters[1].1.count(), 1);
+        assert_eq!(waiters[2].1.count(), 1);
+    }
+
+    /// A waiter that was moved belongs to the queue it was moved TO, so
+    /// cancelling it has to take it off that one. Leaving it on the old
+    /// futex's queue would strand a tombstone on the new one for good.
+    #[test]
+    fn a_cancelled_wait_leaves_the_queue_it_was_moved_to() {
+        let source = futex_with(1);
+        let target = futex_with(2);
+        let (waiter, counter) = queue_waiter(&source, 1, None);
+
+        assert_eq!(source.requeue(1, 0, 1, &target, None, true), Ok(1));
+        assert_eq!(target.inner.lock().waiter_queue.len(), 1);
+
+        drop(waiter);
+        assert_eq!(target.inner.lock().waiter_queue.len(), 0);
+        assert_eq!(target.wake(1), 0);
+        assert_eq!(counter.count(), 0);
+    }
+
+    /// Asking to move more than are queued moves what there is.
+    #[test]
+    fn requeue_moves_no_more_than_are_queued() {
+        let source = futex_with(1);
+        let target = futex_with(2);
+        let _waiters: Vec<_> = (0..2).map(|_| queue_waiter(&source, 1, None)).collect();
+
+        assert_eq!(
+            source.requeue(1, 0, i32::MAX as usize, &target, None, true),
+            Ok(2)
+        );
+        assert_eq!(source.inner.lock().waiter_queue.len(), 0);
+        assert_eq!(target.inner.lock().waiter_queue.len(), 2);
+    }
+
+    /// A thread may not come out owning a futex it is itself blocked on.
+    /// `wait_with_owner` has always refused it; the requeue side set the new
+    /// owner without ever asking.
+    #[test]
+    fn a_waiter_cannot_be_made_the_owner_of_the_futex_it_waits_on() {
+        let (blocked, _) = two_threads();
+        let source = futex_with(1);
+        let target = futex_with(2);
+        let (_on_target, on_target) = queue_waiter(&target, 2, Some(blocked.clone()));
+        let (_moving, moving) = queue_waiter(&source, 1, None);
+
+        assert_eq!(
+            source.requeue(1, 0, 1, &target, Some(blocked.clone()), true),
+            Err(ZxError::INVALID_ARGS)
+        );
+        // And a rejected call leaves every waiter where it was.
+        assert_eq!(source.inner.lock().waiter_queue.len(), 1);
+        assert_eq!(target.inner.lock().waiter_queue.len(), 1);
+        assert!(target.owner().is_none());
+        assert_eq!(on_target.count(), 0);
+        assert_eq!(moving.count(), 0);
+
+        // Waiting on the SOURCE and on nothing else is the same answer: it is
+        // one requeue away from waiting on the target.
+        let (waiting, elsewhere) = two_threads();
+        let other_source = futex_with(1);
+        let other_target = futex_with(2);
+        let (_on_source, _) = queue_waiter(&other_source, 1, Some(waiting.clone()));
+        assert_eq!(
+            other_source.requeue(1, 0, 1, &other_target, Some(waiting), true),
+            Err(ZxError::INVALID_ARGS)
+        );
+        assert_eq!(other_source.inner.lock().waiter_queue.len(), 1);
+        assert_eq!(other_target.inner.lock().waiter_queue.len(), 0);
+        assert!(other_target.owner().is_none());
+
+        // Any other thread is a fine owner, and then the move happens.
+        assert_eq!(
+            other_source.requeue(1, 0, 1, &other_target, Some(elsewhere.clone()), true),
+            Ok(1)
+        );
+        assert_eq!(other_target.inner.lock().waiter_queue.len(), 1);
+        assert!(Arc::ptr_eq(&other_target.owner().unwrap(), &elsewhere));
+    }
+
+    /// The two-futex path compares the value too, and a call it refuses must
+    /// not have moved or woken anybody on the way to refusing.
+    #[test]
+    fn a_requeue_whose_value_moved_leaves_both_queues_alone() {
+        let source = futex_with(1);
+        let target = futex_with(2);
+        let waiters: Vec<_> = (0..2).map(|_| queue_waiter(&source, 1, None)).collect();
+        let (owner, _) = two_threads();
+        source.inner.lock().set_owner(Some(owner.clone()));
+
+        assert_eq!(
+            source.requeue(99, 1, 1, &target, None, true),
+            Err(ZxError::BAD_STATE)
+        );
+        assert_eq!(waiters[0].1.count(), 0);
+        assert_eq!(waiters[1].1.count(), 0);
+        assert_eq!(source.inner.lock().waiter_queue.len(), 2);
+        assert_eq!(target.inner.lock().waiter_queue.len(), 0);
+        assert!(Arc::ptr_eq(&source.owner().unwrap(), &owner));
+    }
+
+    /// A thread already waiting on the futex cannot be named its owner by a
+    /// second waiter: it would come out owning a lock it is itself blocked on.
+    /// The test that has covered this since always AWAITS the answer, so with
+    /// the check gone it waits for ever instead of failing; polling by hand
+    /// turns that into a failure with a name on it.
+    #[test]
+    fn a_waiter_cannot_be_named_the_owner_by_a_second_wait() {
+        let (blocked, other) = two_threads();
+        let futex = futex_with(1);
+        let (_first, _) = queue_waiter(&futex, 1, Some(blocked.clone()));
+
+        let counter = Arc::new(Counter(AtomicUsize::new(0)));
+        let waker = waker(counter);
+        let mut second = Box::pin(futex.wait_with_owner(1, Some(other.clone()), Some(blocked)));
+        assert_eq!(
+            second.as_mut().poll(&mut Context::from_waker(&waker)),
+            Poll::Ready(Err(ZxError::INVALID_ARGS))
+        );
+        // Refused before queueing: the second waiter never joined.
+        assert_eq!(futex.inner.lock().waiter_queue.len(), 1);
+
+        // Somebody who is not on the queue is a fine owner, and then the wait
+        // goes through.
+        let mut third = Box::pin(futex.wait_with_owner(1, None, Some(other)));
+        assert_eq!(
+            third.as_mut().poll(&mut Context::from_waker(&waker)),
+            Poll::Pending
+        );
+        assert_eq!(futex.inner.lock().waiter_queue.len(), 2);
+    }
+
+    /// `Future::poll` only promises to wake the waker of the LAST poll. A
+    /// waiter that keeps the first one wakes a task that is no longer
+    /// listening, and the one that is sleeps on.
+    #[test]
+    fn a_re_poll_with_a_new_waker_wakes_the_new_one() {
+        let futex = futex_with(1);
+        let stale = Arc::new(Counter(AtomicUsize::new(0)));
+        let fresh = Arc::new(Counter(AtomicUsize::new(0)));
+        let (stale_waker, fresh_waker) = (waker(stale.clone()), waker(fresh.clone()));
+        let mut future = Box::pin(futex.wait(1));
+
+        assert_eq!(
+            future.as_mut().poll(&mut Context::from_waker(&stale_waker)),
+            Poll::Pending
+        );
+        assert_eq!(
+            future.as_mut().poll(&mut Context::from_waker(&fresh_waker)),
+            Poll::Pending
+        );
+        // Still one waiter, not two.
+        assert_eq!(futex.inner.lock().waiter_queue.len(), 1);
+
+        assert_eq!(futex.wake(1), 1);
+        assert_eq!(stale.count(), 0, "the stale waker wakes nobody useful");
+        assert_eq!(fresh.count(), 1);
+        assert_eq!(
+            future.as_mut().poll(&mut Context::from_waker(&fresh_waker)),
+            Poll::Ready(Ok(()))
+        );
+    }
+
+    /// `FUTEX_UNLOCK_PI`'s release step counts a tombstone as a waiter on
+    /// purpose: the worst case is one extra kernel round trip for the next
+    /// locker, while missing a real waiter would be a lost wakeup.
+    #[test]
+    fn store_by_waiters_counts_a_tombstone() {
+        const WAITERS: i32 = 0x8000_0000_u32 as i32;
+        let futex = futex_with(7);
+
+        assert!(!futex.store_by_waiters(WAITERS, 0));
+        assert_eq!(futex.load(), 0);
+
+        enqueue_tombstone(&futex, None);
+        assert!(futex.store_by_waiters(WAITERS, 0));
+        assert_eq!(futex.load(), WAITERS);
+    }
+
+    /// The `FUTEX_WAIT` fast path must agree with the check the enqueue does
+    /// under the queue lock, in both directions.
+    #[test]
+    fn value_eq_agrees_with_the_queued_check() {
+        let futex = futex_with(1);
+        assert!(futex.value_eq(1));
+        assert!(!futex.value_eq(2));
+
+        let counter = Arc::new(Counter(AtomicUsize::new(0)));
+        let waker = waker(counter);
+        let mut mismatch = Box::pin(futex.wait(2));
+        assert_eq!(
+            mismatch.as_mut().poll(&mut Context::from_waker(&waker)),
+            Poll::Ready(Err(ZxError::BAD_STATE))
+        );
+        assert_eq!(futex.inner.lock().waiter_queue.len(), 0);
     }
 }
