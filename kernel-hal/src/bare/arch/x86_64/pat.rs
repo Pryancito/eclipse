@@ -31,8 +31,6 @@
 //! New mappings that ask for [`CachePolicy::WriteCombining`] get the PAT bit
 //! from `X86PTE::set_flags` in `vm.rs` once [`pat_wc_ready`] reports true.
 
-use core::sync::atomic::{AtomicBool, Ordering};
-
 use x86_64::instructions::tlb;
 use x86_64::registers::model_specific::Msr;
 
@@ -43,16 +41,9 @@ const IA32_PAT: u32 = 0x277;
 /// Memory-type encodings for PAT entries (Intel SDM vol. 3A, table 11-10).
 const PAT_TYPE_WC: u64 = 0x01;
 
-/// Set once the BSP has programmed a WC entry into its PAT; APs replicate the
-/// same value before they can touch any WC mapping. Read by `vm.rs` so the
-/// WriteCombining PAT bit is only ever emitted when entry 7 really is WC.
-static PAT_WC_READY: AtomicBool = AtomicBool::new(false);
-
-/// Whether PAT entry 7 has been redefined to write-combining.
-#[inline]
-pub fn pat_wc_ready() -> bool {
-    PAT_WC_READY.load(Ordering::Acquire)
-}
+// The flag itself lives beside its reader, in `utils::pte::x86_64`, so a host
+// test can drive both sides of the branch that consults it.
+pub use crate::utils::pte::x86_64::{pat_wc_ready, set_pat_wc_ready};
 
 /// Program PAT entry 7 = WC on the calling CPU. Idempotent, per-core.
 ///
@@ -70,7 +61,7 @@ pub fn init_this_cpu() {
             msr.write(new);
         }
     }
-    PAT_WC_READY.store(true, Ordering::Release);
+    set_pat_wc_ready(true);
 }
 
 const PTE_PWT: u64 = 1 << 3;

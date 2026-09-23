@@ -39,6 +39,16 @@ hal_fn_impl! {
         fn activate_paging(_vmtoken: PhysAddr) {}
         fn pin_kernel_vmtoken() {}
         fn activate_kernel_paging() {}
+
+        /// Nothing to invalidate: a guest page here IS a host mapping, and
+        /// `mmap`/`mprotect`/`munmap` have already told the host kernel.
+        ///
+        /// There is no default body for this one, so without an
+        /// implementation `crate::vm::flush_tlb` is the macro-generated
+        /// `unimplemented!("vm::flush_tlb()")` -- a panic sitting under
+        /// `common::ipi::remote_flush_tlb_aspace`, which is architecture
+        /// independent and therefore compiled here too.
+        fn flush_tlb(_vaddr: Option<VirtAddr>) {}
     }
 }
 
