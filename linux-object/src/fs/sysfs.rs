@@ -44,6 +44,86 @@ impl FileSystem for SysFS {
     }
 }
 
+/// Inode numbers for the tree.
+///
+/// Every directory needs one of its own. They used to be literals spaced ten
+/// apart, with the per-device ones written `40 + index` and `100 + index` --
+/// spacing that holds until a machine has enough of the thing being counted,
+/// and then silently stops: the eleventh PCI function is `/sys/devices/system`
+/// again, and the first disk is `/sys/class/thermal`. Moebius's machine has
+/// more than eleven functions, so that collision is not hypothetical. Here the
+/// growing ranges are disjoint by construction instead of by arithmetic.
+mod ino {
+    pub const ROOT: usize = 1;
+    pub const CLASS: usize = 2;
+    pub const CLASS_DRM: usize = 3;
+    pub const CLASS_INPUT: usize = 4;
+    pub const CLASS_NET: usize = 5;
+    pub const CLASS_POWER_SUPPLY: usize = 6;
+    pub const CLASS_THERMAL: usize = 7;
+    pub const THERMAL_ZONE: usize = 8;
+    pub const THERMAL_COOLING: usize = 9;
+    pub const BLOCK: usize = 10;
+    pub const CLASS_BLOCK: usize = 23;
+    pub const BUS: usize = 11;
+    pub const BUS_PCI: usize = 12;
+    pub const BUS_PCI_DEVICES: usize = 13;
+    pub const DEVICES: usize = 14;
+    pub const DEVICES_PCI_BUS: usize = 15;
+    pub const DEVICES_SYSTEM: usize = 16;
+    pub const SYSTEM_NODE: usize = 17;
+    pub const SYSTEM_NODE0: usize = 18;
+    pub const SYSTEM_CPU: usize = 19;
+    pub const DEV: usize = 20;
+    pub const DEV_CHAR: usize = 21;
+    pub const POWER: usize = 22;
+
+    /// Plus the device's index on the bus.
+    pub const PCI_DEV: usize = 0x1000;
+    /// Plus the disk's index.
+    pub const BLOCK_DEV: usize = 0x2000;
+    /// Plus the CPU's number.
+    pub const CPU: usize = 0x3000;
+    /// Plus the node's minor, which is unique across every GPU.
+    pub const DRM_NODE: usize = 0x4000;
+    /// Plus the owning device's index on the bus.
+    pub const DRM_DIR: usize = 0x5000;
+    /// Plus the event device's number.
+    pub const INPUT_EVENT: usize = 0x6000;
+    /// Plus the interface's index.
+    pub const NET_IFACE: usize = 0x7000;
+}
+
+/// Where an interface sits in the list `/sys/class/net` shows, which is all
+/// the identity it has: the node carries the name, not a number.
+fn net_iface_index(name: &str) -> usize {
+    list_net_ifnames()
+        .iter()
+        .position(|n| n == name)
+        .unwrap_or(0)
+}
+
+/// The `id`-th name of a directory whose own contents are `names`.
+///
+/// A listing opens with `.` and `..`. Linux does it, and so does every other
+/// filesystem this kernel mounts: `rcore-fs-ramfs` and `rcore-fs-devfs` both
+/// answer those two at 0 and 1 and their own contents from 2. `getdents` here
+/// goes straight through `get_entry` and synthesises nothing, so the
+/// twenty-nine directories of this tree -- every one of which numbered from
+/// its first real name -- returned neither. Both have always been reachable
+/// by name, since every `find` below answers them; they were only invisible
+/// to a listing, which is the harder half to notice.
+fn nth_entry<S: AsRef<str>>(id: usize, names: &[S]) -> Result<String> {
+    match id {
+        0 => Ok(String::from(".")),
+        1 => Ok(String::from("..")),
+        i => names
+            .get(i - 2)
+            .map(|n| String::from(n.as_ref()))
+            .ok_or(FsError::EntryNotFound),
+    }
+}
+
 fn dir_metadata(inode: usize) -> Metadata {
     Metadata {
         dev: 0,
@@ -63,6 +143,33 @@ fn dir_metadata(inode: usize) -> Metadata {
     }
 }
 
+/// The letters Linux gives the `index`-th disk of a family: `a`..`z`, then
+/// `aa`..`az`, `ba`.. -- `sd_format_disk_name()` in `drivers/scsi/sd.c`.
+///
+/// It is bijective base-26, not ordinary base-26, so it never runs out and
+/// never repeats. This used to be `b'a' + index % 26`, which wrapped: the
+/// twenty-seventh disk was `sda` again, and since `block_index_by_name`
+/// answers with the FIRST name that matches, everything addressed to it --
+/// `/sys/block/sda/size`, a partition table, a mount -- landed on disk zero.
+/// Twenty-seven disks is a lot for a desk and nothing for the kind of box
+/// that gets an HBA.
+fn disk_suffix(mut index: usize) -> String {
+    let mut out = [0u8; 8];
+    let mut at = out.len();
+    loop {
+        at -= 1;
+        out[at] = b'a' + (index % 26) as u8;
+        match (index / 26).checked_sub(1) {
+            Some(next) => index = next,
+            None => break,
+        }
+        if at == 0 {
+            break;
+        }
+    }
+    String::from_utf8_lossy(&out[at..]).into_owned()
+}
+
 fn list_block_devices() -> Vec<String> {
     let blocks = drivers::all_block().as_vec();
     let mut names = Vec::new();
@@ -79,15 +186,13 @@ fn list_block_devices() -> Vec<String> {
                 .iter()
                 .filter(|b| b.name().starts_with("virtio"))
                 .count();
-            let name_char = (b'a' + (virtio_idx % 26) as u8) as char;
-            format!("vd{}", name_char)
+            format!("vd{}", disk_suffix(virtio_idx))
         } else {
             let other_idx = blocks[..i]
                 .iter()
                 .filter(|b| !b.name().starts_with("nvme") && !b.name().starts_with("virtio"))
                 .count();
-            let name_char = (b'a' + (other_idx % 26) as u8) as char;
-            format!("sd{}", name_char)
+            format!("sd{}", disk_suffix(other_idx))
         };
         names.push(fname);
     }
@@ -132,7 +237,7 @@ impl INode for SysRootINode {
     }
 
     fn metadata(&self) -> Result<Metadata> {
-        Ok(dir_metadata(10))
+        Ok(dir_metadata(ino::ROOT))
     }
 
     fn as_any_ref(&self) -> &dyn Any {
@@ -157,11 +262,7 @@ impl INode for SysRootINode {
     }
 
     fn get_entry(&self, id: usize) -> Result<String> {
-        let entries = Self::entries();
-        if id >= entries.len() {
-            return Err(FsError::EntryNotFound);
-        }
-        Ok(entries[id].into())
+        nth_entry(id, &Self::entries())
     }
 }
 
@@ -192,7 +293,7 @@ impl INode for SysClassINode {
     }
 
     fn metadata(&self) -> Result<Metadata> {
-        Ok(dir_metadata(20))
+        Ok(dir_metadata(ino::CLASS))
     }
 
     fn as_any_ref(&self) -> &dyn Any {
@@ -207,7 +308,7 @@ impl INode for SysClassINode {
         match name {
             "." => Ok(Arc::new(SysClassINode)),
             ".." => Ok(Arc::new(SysRootINode)),
-            "block" => Ok(Arc::new(SysBlockDirINode)),
+            "block" => Ok(Arc::new(SysClassBlockDirINode)),
             "drm" => Ok(Arc::new(SysClassDrmDirINode)),
             "input" => Ok(Arc::new(SysClassInputDirINode)),
             "net" => Ok(Arc::new(SysClassNetDirINode)),
@@ -218,11 +319,7 @@ impl INode for SysClassINode {
     }
 
     fn get_entry(&self, id: usize) -> Result<String> {
-        let entries = Self::entries();
-        if id >= entries.len() {
-            return Err(FsError::EntryNotFound);
-        }
-        Ok(entries[id].into())
+        nth_entry(id, &Self::entries())
     }
 }
 
@@ -247,7 +344,7 @@ impl INode for SysBlockDirINode {
     }
 
     fn metadata(&self) -> Result<Metadata> {
-        Ok(dir_metadata(30))
+        Ok(dir_metadata(ino::BLOCK))
     }
 
     fn as_any_ref(&self) -> &dyn Any {
@@ -273,11 +370,7 @@ impl INode for SysBlockDirINode {
     }
 
     fn get_entry(&self, id: usize) -> Result<String> {
-        let entries = list_block_devices();
-        if id >= entries.len() {
-            return Err(FsError::EntryNotFound);
-        }
-        Ok(entries[id].clone())
+        nth_entry(id, &list_block_devices())
     }
 }
 
@@ -310,7 +403,7 @@ impl INode for SysBlockDevINode {
     }
 
     fn metadata(&self) -> Result<Metadata> {
-        Ok(dir_metadata(40 + self.index))
+        Ok(dir_metadata(ino::BLOCK_DEV + self.index))
     }
 
     fn as_any_ref(&self) -> &dyn Any {
@@ -338,11 +431,70 @@ impl INode for SysBlockDevINode {
     }
 
     fn get_entry(&self, id: usize) -> Result<String> {
-        let entries = Self::entries();
-        if id >= entries.len() {
-            return Err(FsError::EntryNotFound);
+        nth_entry(id, &Self::entries())
+    }
+}
+
+/// `/sys/class/block`, which is not `/sys/block` again.
+///
+/// Both exist in Linux and both list the disks, but they are two directories:
+/// the names under `class/` are symlinks to the canonical ones, exactly as
+/// `/sys/class/drm/card0` is a symlink here already. Mounting one directory at
+/// both places instead gave `/sys/class/block` the inode of `/sys/block` and,
+/// worse, its `..` -- so walking up from a disk found under `class/` landed in
+/// `/sys`, skipping `/sys/class`. That walk is how libudev names a device's
+/// subsystem.
+struct SysClassBlockDirINode;
+
+impl INode for SysClassBlockDirINode {
+    fn read_at(&self, _offset: usize, _buf: &mut [u8]) -> Result<usize> {
+        Ok(0)
+    }
+
+    fn write_at(&self, _offset: usize, _buf: &[u8]) -> Result<usize> {
+        Err(FsError::NotSupported)
+    }
+
+    fn poll(&self) -> Result<PollStatus> {
+        Ok(PollStatus {
+            read: true,
+            write: false,
+            error: false,
+            hangup: false,
+        })
+    }
+
+    fn metadata(&self) -> Result<Metadata> {
+        Ok(dir_metadata(ino::CLASS_BLOCK))
+    }
+
+    fn as_any_ref(&self) -> &dyn Any {
+        self
+    }
+
+    fn fs(&self) -> Arc<dyn FileSystem> {
+        Arc::new(SysFS)
+    }
+
+    fn find(&self, name: &str) -> Result<Arc<dyn INode>> {
+        match name {
+            "." => Ok(Arc::new(SysClassBlockDirINode)),
+            ".." => Ok(Arc::new(SysClassINode)),
+            _ => {
+                if block_index_by_name(name).is_some() {
+                    Ok(Arc::new(Pseudo::new(
+                        &format!("../../block/{}", name),
+                        FileType::SymLink,
+                    )))
+                } else {
+                    Err(FsError::EntryNotFound)
+                }
+            }
         }
-        Ok(entries[id].into())
+    }
+
+    fn get_entry(&self, id: usize) -> Result<String> {
+        nth_entry(id, &list_block_devices())
     }
 }
 
@@ -364,7 +516,7 @@ impl INode for SysBusDirINode {
         })
     }
     fn metadata(&self) -> Result<Metadata> {
-        Ok(dir_metadata(50))
+        Ok(dir_metadata(ino::BUS))
     }
     fn as_any_ref(&self) -> &dyn Any {
         self
@@ -381,11 +533,7 @@ impl INode for SysBusDirINode {
         }
     }
     fn get_entry(&self, id: usize) -> Result<String> {
-        if id == 0 {
-            Ok("pci".into())
-        } else {
-            Err(FsError::EntryNotFound)
-        }
+        nth_entry(id, &["pci"])
     }
 }
 
@@ -407,7 +555,7 @@ impl INode for SysBusPciDirINode {
         })
     }
     fn metadata(&self) -> Result<Metadata> {
-        Ok(dir_metadata(60))
+        Ok(dir_metadata(ino::BUS_PCI))
     }
     fn as_any_ref(&self) -> &dyn Any {
         self
@@ -424,11 +572,7 @@ impl INode for SysBusPciDirINode {
         }
     }
     fn get_entry(&self, id: usize) -> Result<String> {
-        if id == 0 {
-            Ok("devices".into())
-        } else {
-            Err(FsError::EntryNotFound)
-        }
+        nth_entry(id, &["devices"])
     }
 }
 
@@ -450,7 +594,7 @@ impl INode for SysDevicesDirINode {
         })
     }
     fn metadata(&self) -> Result<Metadata> {
-        Ok(dir_metadata(70))
+        Ok(dir_metadata(ino::DEVICES))
     }
     fn as_any_ref(&self) -> &dyn Any {
         self
@@ -468,11 +612,7 @@ impl INode for SysDevicesDirINode {
         }
     }
     fn get_entry(&self, id: usize) -> Result<String> {
-        match id {
-            0 => Ok("pci0000:00".into()),
-            1 => Ok("system".into()),
-            _ => Err(FsError::EntryNotFound),
-        }
+        nth_entry(id, &["pci0000:00", "system"])
     }
 }
 
@@ -494,7 +634,7 @@ impl INode for SysDevicesSystemDirINode {
         })
     }
     fn metadata(&self) -> Result<Metadata> {
-        Ok(dir_metadata(110))
+        Ok(dir_metadata(ino::DEVICES_SYSTEM))
     }
     fn as_any_ref(&self) -> &dyn Any {
         self
@@ -512,11 +652,7 @@ impl INode for SysDevicesSystemDirINode {
         }
     }
     fn get_entry(&self, id: usize) -> Result<String> {
-        match id {
-            0 => Ok("node".into()),
-            1 => Ok("cpu".into()),
-            _ => Err(FsError::EntryNotFound),
-        }
+        nth_entry(id, &["node", "cpu"])
     }
 }
 
@@ -538,7 +674,7 @@ impl INode for SysDevicesSystemNodeDirINode {
         })
     }
     fn metadata(&self) -> Result<Metadata> {
-        Ok(dir_metadata(120))
+        Ok(dir_metadata(ino::SYSTEM_NODE))
     }
     fn as_any_ref(&self) -> &dyn Any {
         self
@@ -555,11 +691,7 @@ impl INode for SysDevicesSystemNodeDirINode {
         }
     }
     fn get_entry(&self, id: usize) -> Result<String> {
-        if id == 0 {
-            Ok("node0".into())
-        } else {
-            Err(FsError::EntryNotFound)
-        }
+        nth_entry(id, &["node0"])
     }
 }
 
@@ -587,7 +719,7 @@ impl INode for SysDevicesSystemNode0DirINode {
         })
     }
     fn metadata(&self) -> Result<Metadata> {
-        Ok(dir_metadata(130))
+        Ok(dir_metadata(ino::SYSTEM_NODE0))
     }
     fn as_any_ref(&self) -> &dyn Any {
         self
@@ -632,11 +764,7 @@ impl INode for SysDevicesSystemNode0DirINode {
         }
     }
     fn get_entry(&self, id: usize) -> Result<String> {
-        let entries = Self::entries();
-        if id >= entries.len() {
-            return Err(FsError::EntryNotFound);
-        }
-        Ok(entries[id].into())
+        nth_entry(id, &Self::entries())
     }
 }
 
@@ -658,7 +786,7 @@ impl INode for SysDevicesPciBusDirINode {
         })
     }
     fn metadata(&self) -> Result<Metadata> {
-        Ok(dir_metadata(80))
+        Ok(dir_metadata(ino::DEVICES_PCI_BUS))
     }
     fn as_any_ref(&self) -> &dyn Any {
         self
@@ -689,14 +817,7 @@ impl INode for SysDevicesPciBusDirINode {
         }
     }
     fn get_entry(&self, id: usize) -> Result<String> {
-        let devices = get_pci_devices();
-        if id < devices.len() {
-            return Ok(devices[id].name.clone());
-        }
-        if compute_alias_needed() && id == devices.len() {
-            return Ok(COMPUTE_ALIAS_BDF.into());
-        }
-        Err(FsError::EntryNotFound)
+        nth_entry(id, &pci_device_names())
     }
 }
 
@@ -718,7 +839,7 @@ impl INode for SysPciDevicesDirINode {
         })
     }
     fn metadata(&self) -> Result<Metadata> {
-        Ok(dir_metadata(90))
+        Ok(dir_metadata(ino::BUS_PCI_DEVICES))
     }
     fn as_any_ref(&self) -> &dyn Any {
         self
@@ -754,14 +875,7 @@ impl INode for SysPciDevicesDirINode {
         }
     }
     fn get_entry(&self, id: usize) -> Result<String> {
-        let devices = get_pci_devices();
-        if id < devices.len() {
-            return Ok(devices[id].name.clone());
-        }
-        if compute_alias_needed() && id == devices.len() {
-            return Ok(COMPUTE_ALIAS_BDF.into());
-        }
-        Err(FsError::EntryNotFound)
+        nth_entry(id, &pci_device_names())
     }
 }
 
@@ -771,6 +885,12 @@ struct SysPciDevDirINode {
     vendor: String,
     device: String,
     class: String,
+}
+
+impl SysPciDevDirINode {
+    fn ids(&self) -> PciIds {
+        PciIds::parse(&self.vendor, &self.device, &self.class)
+    }
 }
 
 impl INode for SysPciDevDirINode {
@@ -789,7 +909,7 @@ impl INode for SysPciDevDirINode {
         })
     }
     fn metadata(&self) -> Result<Metadata> {
-        Ok(dir_metadata(100 + self.index))
+        Ok(dir_metadata(ino::PCI_DEV + self.index))
     }
     fn as_any_ref(&self) -> &dyn Any {
         self
@@ -824,33 +944,25 @@ impl INode for SysPciDevDirINode {
                 &format!("{}\n", self.class),
                 FileType::File,
             ))),
-            "uevent" => {
-                let vendor_hex = self.vendor.trim_start_matches("0x");
-                let device_hex = self.device.trim_start_matches("0x");
-                let class_hex = self.class.trim_start_matches("0x");
-                let uevent_content = format!(
-                    "PCI_CLASS={}\nPCI_ID={}:{}\nPCI_SUBSYS_ID=0000:0000\nPCI_SLOT_NAME={}\n",
-                    class_hex, vendor_hex, device_hex, self.name
-                );
-                Ok(Arc::new(Pseudo::new(&uevent_content, FileType::File)))
-            }
+            "uevent" => Ok(Arc::new(Pseudo::new(
+                &self.ids().uevent(&self.name),
+                FileType::File,
+            ))),
             "config" => {
+                let ids = self.ids();
                 let mut cfg = [0u8; 256];
-                let v = u16::from_str_radix(self.vendor.trim_start_matches("0x"), 16).unwrap_or(0);
-                let d = u16::from_str_radix(self.device.trim_start_matches("0x"), 16).unwrap_or(0);
-                let c = u32::from_str_radix(self.class.trim_start_matches("0x"), 16).unwrap_or(0);
 
-                cfg[0..2].copy_from_slice(&v.to_le_bytes());
-                cfg[2..4].copy_from_slice(&d.to_le_bytes());
+                cfg[0..2].copy_from_slice(&(ids.vendor as u16).to_le_bytes());
+                cfg[2..4].copy_from_slice(&(ids.device as u16).to_le_bytes());
 
-                cfg[9] = (c & 0xff) as u8;
-                cfg[10] = ((c >> 8) & 0xff) as u8;
-                cfg[11] = ((c >> 16) & 0xff) as u8;
+                cfg[9] = ids.prog_if();
+                cfg[10] = ids.subclass();
+                cfg[11] = ids.base_class();
 
                 Ok(Arc::new(Pseudo::new_bytes(cfg.to_vec(), FileType::File)))
             }
             "modalias" => Ok(Arc::new(Pseudo::new(
-                &pci_modalias(&self.vendor, &self.device, &self.class),
+                &self.ids().modalias(),
                 FileType::File,
             ))),
             // libdrm's drmParseSubsystemType() readlink()s `<dev>/subsystem`
@@ -888,10 +1000,7 @@ impl INode for SysPciDevDirINode {
         if !drm_nodes_for_pci_index(self.index).is_empty() {
             entries.push("drm");
         }
-        if id >= entries.len() {
-            return Err(FsError::EntryNotFound);
-        }
-        Ok(entries[id].into())
+        nth_entry(id, &entries)
     }
 }
 
@@ -903,23 +1012,92 @@ struct PciDevInfo {
     class: String,
 }
 
-fn pci_modalias(vendor: &str, device: &str, class: &str) -> String {
-    let v = u32::from_str_radix(vendor.trim_start_matches("0x"), 16).unwrap_or(0);
-    let d = u32::from_str_radix(device.trim_start_matches("0x"), 16).unwrap_or(0);
-    let c = class.trim_start_matches("0x");
-    let (bc, sc, pi) = if c.len() >= 6 {
-        (&c[0..2], &c[2..4], &c[4..6])
-    } else {
-        ("00", "00", "00")
-    };
-    format!(
-        "pci:v{v:08x}d{d:08x}sv00000000sd00000000bc{bc}sc{sc}i{pi}\n",
-        v = v,
-        d = d,
-        bc = bc,
-        sc = sc,
-        pi = pi
-    )
+/// What `/sys/bus/pci/devices` and `/sys/devices/pci0000:00` list: every
+/// device on the bus, plus the synthetic function that names a second GPU as
+/// a compute device when one is needed.
+fn pci_device_names() -> Vec<String> {
+    let mut names: Vec<String> = get_pci_devices().iter().map(|d| d.name.clone()).collect();
+    if compute_alias_needed() {
+        names.push(String::from(COMPUTE_ALIAS_BDF));
+    }
+    names
+}
+
+/// The three numbers a PCI device is identified by, decoded once.
+///
+/// They reach this tree as the `0x`-prefixed strings `scan_pci_devices` wrote,
+/// and three different places used to pick them apart again: `config` and
+/// `modalias` parsed them, `uevent` trimmed the prefix off and published the
+/// text as it stood. So the same decision was written three times and the odd
+/// one out disagreed with the others.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PciIds {
+    vendor: u32,
+    device: u32,
+    class: u32,
+}
+
+impl PciIds {
+    fn parse(vendor: &str, device: &str, class: &str) -> Self {
+        fn hex(s: &str) -> u32 {
+            u32::from_str_radix(s.trim_start_matches("0x"), 16).unwrap_or(0)
+        }
+        PciIds {
+            vendor: hex(vendor),
+            device: hex(device),
+            class: hex(class),
+        }
+    }
+
+    fn base_class(&self) -> u8 {
+        (self.class >> 16) as u8
+    }
+
+    fn subclass(&self) -> u8 {
+        (self.class >> 8) as u8
+    }
+
+    fn prog_if(&self) -> u8 {
+        self.class as u8
+    }
+
+    /// What Linux's `modalias_show()` writes, **in upper case**.
+    ///
+    /// `file2alias` builds every `pci:v...` pattern in `modules.alias` with
+    /// `%02X`, and `kmod` matches the two with `fnmatch`, which respects case.
+    /// So a lower-case modalias matched nothing for any device whose ids carry
+    /// a hex letter -- `10de` (NVIDIA) and `8086` are the two on this desk, and
+    /// the first of them is all letters.
+    fn modalias(&self) -> String {
+        format!(
+            "pci:v{:08X}d{:08X}sv{:08X}sd{:08X}bc{:02X}sc{:02X}i{:02X}\n",
+            self.vendor,
+            self.device,
+            0,
+            0,
+            self.base_class(),
+            self.subclass(),
+            self.prog_if()
+        )
+    }
+
+    /// What Linux's `pci_uevent()` adds to the environment, same case and same
+    /// widths -- `%04X`, so a class of `0x030000` prints as five digits, not
+    /// six. The `MODALIAS=` line was missing altogether, and it is the one
+    /// systemd-udevd's `kmod` builtin reads; the `modalias` file beside it is
+    /// for a human with `cat`.
+    fn uevent(&self, slot: &str) -> String {
+        format!(
+            "PCI_CLASS={:04X}\nPCI_ID={:04X}:{:04X}\nPCI_SUBSYS_ID={:04X}:{:04X}\nPCI_SLOT_NAME={}\nMODALIAS={}",
+            self.class,
+            self.vendor,
+            self.device,
+            0,
+            0,
+            slot,
+            self.modalias()
+        )
+    }
 }
 
 fn display_pci_index() -> Option<usize> {
@@ -1296,7 +1474,7 @@ impl INode for SysClassDrmDirINode {
         })
     }
     fn metadata(&self) -> Result<Metadata> {
-        Ok(dir_metadata(21))
+        Ok(dir_metadata(ino::CLASS_DRM))
     }
     fn as_any_ref(&self) -> &dyn Any {
         self
@@ -1313,14 +1491,15 @@ impl INode for SysClassDrmDirINode {
     }
     fn get_entry(&self, id: usize) -> Result<String> {
         if drm_card0_pci_index().is_none() {
-            return Err(FsError::EntryNotFound);
+            return nth_entry(id, &[] as &[&str]);
         }
         // card0, renderD128, then each further GPU's pair -- the same order
         // and the same set as `/dev/dri`, because both read one table.
-        drm_class_entries()
-            .get(id)
+        let names: Vec<String> = drm_class_entries()
+            .iter()
             .map(|m| crate::fs::devfs::drm::node_name(*m))
-            .ok_or(FsError::EntryNotFound)
+            .collect();
+        nth_entry(id, &names)
     }
 }
 
@@ -1363,7 +1542,7 @@ impl INode for SysDrmNodeINode {
         })
     }
     fn metadata(&self) -> Result<Metadata> {
-        Ok(dir_metadata(22))
+        Ok(dir_metadata(ino::DRM_NODE + self.minor as usize))
     }
     fn as_any_ref(&self) -> &dyn Any {
         self
@@ -1413,11 +1592,7 @@ impl INode for SysDrmNodeINode {
         }
     }
     fn get_entry(&self, id: usize) -> Result<String> {
-        let entries = Self::entries();
-        if id >= entries.len() {
-            return Err(FsError::EntryNotFound);
-        }
-        Ok(entries[id].into())
+        nth_entry(id, &Self::entries())
     }
 }
 
@@ -1446,7 +1621,7 @@ impl INode for SysDrmDeviceDrmDirINode {
         })
     }
     fn metadata(&self) -> Result<Metadata> {
-        Ok(dir_metadata(29))
+        Ok(dir_metadata(ino::DRM_DIR + self.pci_index))
     }
     fn as_any_ref(&self) -> &dyn Any {
         self
@@ -1470,10 +1645,11 @@ impl INode for SysDrmDeviceDrmDirINode {
         }
     }
     fn get_entry(&self, id: usize) -> Result<String> {
-        drm_nodes_for_pci_index(self.pci_index)
-            .get(id)
+        let names: Vec<String> = drm_nodes_for_pci_index(self.pci_index)
+            .iter()
             .map(|m| crate::fs::devfs::drm::node_name(*m))
-            .ok_or(FsError::EntryNotFound)
+            .collect();
+        nth_entry(id, &names)
     }
 }
 
@@ -1504,7 +1680,7 @@ impl INode for SysDevDirINode {
         })
     }
     fn metadata(&self) -> Result<Metadata> {
-        Ok(dir_metadata(160))
+        Ok(dir_metadata(ino::DEV))
     }
     fn as_any_ref(&self) -> &dyn Any {
         self
@@ -1521,11 +1697,7 @@ impl INode for SysDevDirINode {
         }
     }
     fn get_entry(&self, id: usize) -> Result<String> {
-        if id == 0 {
-            Ok("char".into())
-        } else {
-            Err(FsError::EntryNotFound)
-        }
+        nth_entry(id, &["char"])
     }
 }
 
@@ -1547,7 +1719,7 @@ impl INode for SysDevCharDirINode {
         })
     }
     fn metadata(&self) -> Result<Metadata> {
-        Ok(dir_metadata(161))
+        Ok(dir_metadata(ino::DEV_CHAR))
     }
     fn as_any_ref(&self) -> &dyn Any {
         self
@@ -1609,15 +1781,14 @@ impl INode for SysDevCharDirINode {
     fn get_entry(&self, id: usize) -> Result<String> {
         // Every DRM node first, in the same order `/sys/class/drm` lists them
         // (226:0, 226:128, then each further GPU's pair), then evdev 13:64..
-        let drm = drm_class_entries();
-        if let Some(minor) = drm.get(id) {
-            return Ok(format!("226:{}", minor));
+        let mut names: Vec<String> = drm_class_entries()
+            .iter()
+            .map(|minor| format!("226:{}", minor))
+            .collect();
+        for ev in 0..input_event_count() {
+            names.push(format!("13:{}", EVDEV_EVENT_MINOR_BASE + ev));
         }
-        let ev = id - drm.len();
-        if ev < input_event_count() {
-            return Ok(format!("13:{}", EVDEV_EVENT_MINOR_BASE + ev));
-        }
-        Err(FsError::EntryNotFound)
+        nth_entry(id, &names)
     }
 }
 
@@ -1696,7 +1867,7 @@ impl INode for SysClassInputDirINode {
         })
     }
     fn metadata(&self) -> Result<Metadata> {
-        Ok(dir_metadata(27))
+        Ok(dir_metadata(ino::CLASS_INPUT))
     }
     fn as_any_ref(&self) -> &dyn Any {
         self
@@ -1722,10 +1893,10 @@ impl INode for SysClassInputDirINode {
         }
     }
     fn get_entry(&self, id: usize) -> Result<String> {
-        if id >= input_event_count() {
-            return Err(FsError::EntryNotFound);
-        }
-        Ok(format!("event{}", id))
+        let names: Vec<String> = (0..input_event_count())
+            .map(|i| format!("event{}", i))
+            .collect();
+        nth_entry(id, &names)
     }
 }
 
@@ -1755,7 +1926,7 @@ impl INode for SysInputEventINode {
         })
     }
     fn metadata(&self) -> Result<Metadata> {
-        Ok(dir_metadata(28))
+        Ok(dir_metadata(ino::INPUT_EVENT + self.id))
     }
     fn as_any_ref(&self) -> &dyn Any {
         self
@@ -1790,11 +1961,7 @@ impl INode for SysInputEventINode {
         }
     }
     fn get_entry(&self, id: usize) -> Result<String> {
-        let entries = Self::entries();
-        if id >= entries.len() {
-            return Err(FsError::EntryNotFound);
-        }
-        Ok(entries[id].into())
+        nth_entry(id, &Self::entries())
     }
 }
 
@@ -1816,7 +1983,7 @@ impl INode for SysClassNetDirINode {
         })
     }
     fn metadata(&self) -> Result<Metadata> {
-        Ok(dir_metadata(24))
+        Ok(dir_metadata(ino::CLASS_NET))
     }
     fn as_any_ref(&self) -> &dyn Any {
         self
@@ -1838,11 +2005,7 @@ impl INode for SysClassNetDirINode {
         }
     }
     fn get_entry(&self, id: usize) -> Result<String> {
-        let names = list_net_ifnames();
-        if id >= names.len() {
-            return Err(FsError::EntryNotFound);
-        }
-        Ok(names[id].clone())
+        nth_entry(id, &list_net_ifnames())
     }
 }
 
@@ -1872,7 +2035,7 @@ impl INode for SysNetIfaceINode {
         })
     }
     fn metadata(&self) -> Result<Metadata> {
-        Ok(dir_metadata(25))
+        Ok(dir_metadata(ino::NET_IFACE + net_iface_index(&self.name)))
     }
     fn as_any_ref(&self) -> &dyn Any {
         self
@@ -1915,11 +2078,7 @@ impl INode for SysNetIfaceINode {
         }
     }
     fn get_entry(&self, id: usize) -> Result<String> {
-        let entries = Self::entries();
-        if id >= entries.len() {
-            return Err(FsError::EntryNotFound);
-        }
-        Ok(entries[id].into())
+        nth_entry(id, &Self::entries())
     }
 }
 
@@ -1941,7 +2100,7 @@ impl INode for SysClassPowerSupplyDirINode {
         })
     }
     fn metadata(&self) -> Result<Metadata> {
-        Ok(dir_metadata(26))
+        Ok(dir_metadata(ino::CLASS_POWER_SUPPLY))
     }
     fn as_any_ref(&self) -> &dyn Any {
         self
@@ -1951,12 +2110,18 @@ impl INode for SysClassPowerSupplyDirINode {
     }
     fn find(&self, name: &str) -> Result<Arc<dyn INode>> {
         match name {
-            "." | ".." => Ok(Arc::new(SysClassPowerSupplyDirINode)),
+            "." => Ok(Arc::new(SysClassPowerSupplyDirINode)),
+            // Not itself. Every one of its twenty-eight siblings answers its
+            // parent here, and a `..` that is the directory again is a loop:
+            // anything walking up from a power supply -- which is what
+            // upower does to find the device a battery belongs to -- never
+            // leaves `/sys/class/power_supply`.
+            ".." => Ok(Arc::new(SysClassINode)),
             _ => Err(FsError::EntryNotFound),
         }
     }
-    fn get_entry(&self, _id: usize) -> Result<String> {
-        Err(FsError::EntryNotFound)
+    fn get_entry(&self, id: usize) -> Result<String> {
+        nth_entry(id, &[] as &[&str])
     }
 }
 
@@ -2129,7 +2294,7 @@ impl INode for SysClassThermalDirINode {
         })
     }
     fn metadata(&self) -> Result<Metadata> {
-        Ok(dir_metadata(40))
+        Ok(dir_metadata(ino::CLASS_THERMAL))
     }
     fn as_any_ref(&self) -> &dyn Any {
         self
@@ -2147,11 +2312,7 @@ impl INode for SysClassThermalDirINode {
         }
     }
     fn get_entry(&self, id: usize) -> Result<String> {
-        let entries = Self::entries();
-        if id >= entries.len() {
-            return Err(FsError::EntryNotFound);
-        }
-        Ok(entries[id].into())
+        nth_entry(id, &Self::entries())
     }
 }
 
@@ -2190,7 +2351,7 @@ impl INode for SysThermalZoneDirINode {
         })
     }
     fn metadata(&self) -> Result<Metadata> {
-        Ok(dir_metadata(41))
+        Ok(dir_metadata(ino::THERMAL_ZONE))
     }
     fn as_any_ref(&self) -> &dyn Any {
         self
@@ -2222,11 +2383,7 @@ impl INode for SysThermalZoneDirINode {
         }
     }
     fn get_entry(&self, id: usize) -> Result<String> {
-        let entries = Self::entries();
-        if id >= entries.len() {
-            return Err(FsError::EntryNotFound);
-        }
-        Ok(entries[id].into())
+        nth_entry(id, &Self::entries())
     }
 }
 
@@ -2254,7 +2411,7 @@ impl INode for SysThermalCoolingDirINode {
         })
     }
     fn metadata(&self) -> Result<Metadata> {
-        Ok(dir_metadata(42))
+        Ok(dir_metadata(ino::THERMAL_COOLING))
     }
     fn as_any_ref(&self) -> &dyn Any {
         self
@@ -2276,11 +2433,7 @@ impl INode for SysThermalCoolingDirINode {
         }
     }
     fn get_entry(&self, id: usize) -> Result<String> {
-        let entries = Self::entries();
-        if id >= entries.len() {
-            return Err(FsError::EntryNotFound);
-        }
-        Ok(entries[id].into())
+        nth_entry(id, &Self::entries())
     }
 }
 
@@ -2479,7 +2632,7 @@ impl INode for SysPowerDirINode {
         })
     }
     fn metadata(&self) -> Result<Metadata> {
-        Ok(dir_metadata(140))
+        Ok(dir_metadata(ino::POWER))
     }
     fn as_any_ref(&self) -> &dyn Any {
         self
@@ -2502,11 +2655,7 @@ impl INode for SysPowerDirINode {
         }
     }
     fn get_entry(&self, id: usize) -> Result<String> {
-        let entries = Self::entries();
-        if id >= entries.len() {
-            return Err(FsError::EntryNotFound);
-        }
-        Ok(entries[id].into())
+        nth_entry(id, &Self::entries())
     }
 }
 
@@ -2528,7 +2677,7 @@ impl INode for SysDevicesSystemCpuDirINode {
         })
     }
     fn metadata(&self) -> Result<Metadata> {
-        Ok(dir_metadata(150))
+        Ok(dir_metadata(ino::SYSTEM_CPU))
     }
     fn as_any_ref(&self) -> &dyn Any {
         self
@@ -2565,17 +2714,15 @@ impl INode for SysDevicesSystemCpuDirINode {
         }
     }
     fn get_entry(&self, id: usize) -> Result<String> {
-        let count = kernel_hal::cpu::cpu_count() as usize;
         // Aggregate files first, then one entry per CPU.
-        const AGG: [&str; 4] = ["online", "present", "possible", "kernel_max"];
-        if id < AGG.len() {
-            return Ok(AGG[id].into());
+        let mut names: Vec<String> = ["online", "present", "possible", "kernel_max"]
+            .iter()
+            .map(|s| String::from(*s))
+            .collect();
+        for cpu in 0..kernel_hal::cpu::cpu_count() as usize {
+            names.push(format!("cpu{}", cpu));
         }
-        let cpu_idx = id - AGG.len();
-        if cpu_idx < count {
-            return Ok(format!("cpu{}", cpu_idx));
-        }
-        Err(FsError::EntryNotFound)
+        nth_entry(id, &names)
     }
 }
 
@@ -2599,7 +2746,7 @@ impl INode for SysCpuNDirINode {
         })
     }
     fn metadata(&self) -> Result<Metadata> {
-        Ok(dir_metadata(151))
+        Ok(dir_metadata(ino::CPU + self.cpu))
     }
     fn as_any_ref(&self) -> &dyn Any {
         self
@@ -2620,11 +2767,7 @@ impl INode for SysCpuNDirINode {
     fn get_entry(&self, id: usize) -> Result<String> {
         // The boot CPU has no `online` toggle in Linux, but exposing it for all
         // CPUs keeps the shim uniform and simple.
-        if id == 0 {
-            Ok("online".into())
-        } else {
-            Err(FsError::EntryNotFound)
-        }
+        nth_entry(id, &["online"])
     }
 }
 
@@ -2640,14 +2783,30 @@ impl INode for SysCpuNDirINode {
 /// ever finishing GPU init — so the compositor never rendered. PCI topology is
 /// fixed after boot, so a scan-once cache is correct and collapses each of those
 /// syscalls to a small `Vec` clone.
+#[cfg(not(test))]
 fn get_pci_devices() -> Vec<PciDevInfo> {
     PCI_DEVICES.clone()
 }
 
+/// The bus a test walks the tree over.
+///
+/// One seam covers the whole of `/sys`, because every directory here that
+/// names a PCI device asks this same question. It has to be a seam and not a
+/// fake bus: [`scan_pci_devices`] is `in`/`out` on the configuration ports,
+/// and off a real machine that is a fault, not an empty list, so without it
+/// the tree could not be walked outside a kernel at all -- which is why 2750
+/// lines of it had three tests.
+#[cfg(test)]
+fn get_pci_devices() -> Vec<PciDevInfo> {
+    test_bus::table()
+}
+
+#[cfg(not(test))]
 lazy_static! {
     static ref PCI_DEVICES: Vec<PciDevInfo> = scan_pci_devices();
 }
 
+#[cfg(not(test))]
 fn scan_pci_devices() -> Vec<PciDevInfo> {
     #[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
     {
@@ -2678,6 +2837,143 @@ fn scan_pci_devices() -> Vec<PciDevInfo> {
     #[cfg(not(any(target_arch = "x86_64", target_arch = "riscv64")))]
     {
         Vec::new()
+    }
+}
+
+/// The PCI bus the tests build `/sys` over, in place of the configuration
+/// ports.
+#[cfg(test)]
+mod test_bus {
+    extern crate std;
+
+    use super::PciDevInfo;
+    use alloc::{format, string::String, vec, vec::Vec};
+
+    /// The table is process-wide and cargo runs a crate's tests in threads, so
+    /// every test that seeds a bus takes this first.
+    static LOCK: self::std::sync::Mutex<()> = self::std::sync::Mutex::new(());
+    static TABLE: self::std::sync::Mutex<Option<Vec<PciDevInfo>>> =
+        self::std::sync::Mutex::new(None);
+
+    /// Take the bus, seeded with `devs`, and hold it until the guard goes.
+    ///
+    /// A test that panics while holding the lock poisons it; that is not a
+    /// failure for the tests that follow, so step over the poison.
+    pub(super) fn with(devs: Vec<PciDevInfo>) -> Bus {
+        let guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        *TABLE.lock().unwrap_or_else(|e| e.into_inner()) = Some(devs);
+        Bus { _guard: guard }
+    }
+
+    pub(super) struct Bus {
+        _guard: self::std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl Drop for Bus {
+        fn drop(&mut self) {
+            *TABLE.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        }
+    }
+
+    pub(super) fn table() -> Vec<PciDevInfo> {
+        TABLE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+            .unwrap_or_default()
+    }
+
+    pub(super) fn dev(name: &str, vendor: u16, device: u16, class: u32) -> PciDevInfo {
+        PciDevInfo {
+            name: String::from(name),
+            vendor: format!("{:#06x}", vendor),
+            device: format!("{:#06x}", device),
+            class: format!("{:#08x}", class),
+        }
+    }
+
+    /// Moebius's machine: a host bridge, an NVMe disk, and the two RTX 2060
+    /// SUPERs, each with its HDMI audio function.
+    pub(super) fn a_real_machine() -> Vec<PciDevInfo> {
+        vec![
+            dev("0000:00:00.0", 0x8086, 0x3e30, 0x060000),
+            dev("0000:01:00.0", 0x144d, 0xa808, 0x010802),
+            dev("0000:02:00.0", 0x10de, 0x1f06, 0x030000),
+            dev("0000:02:00.1", 0x10de, 0x10f9, 0x040300),
+            dev("0000:03:00.0", 0x10de, 0x1f06, 0x030000),
+            dev("0000:03:00.1", 0x10de, 0x10f9, 0x040300),
+        ]
+    }
+
+    /// A disk with nothing behind it, so that `/sys/block` has something in
+    /// it at all: with no driver registered both it and `/sys/class/block`
+    /// are empty, which is every machine the CI runs on.
+    struct FakeDisk {
+        name: String,
+        sectors: usize,
+    }
+
+    impl zcore_drivers::scheme::Scheme for FakeDisk {
+        fn name(&self) -> &str {
+            &self.name
+        }
+    }
+
+    impl zcore_drivers::scheme::BlockScheme for FakeDisk {
+        fn read_block(&self, _id: usize, _buf: &mut [u8]) -> zcore_drivers::DeviceResult {
+            Ok(())
+        }
+        fn write_block(&self, _id: usize, _buf: &[u8]) -> zcore_drivers::DeviceResult {
+            Ok(())
+        }
+        fn flush(&self) -> zcore_drivers::DeviceResult {
+            Ok(())
+        }
+        fn block_count(&self) -> usize {
+            self.sectors
+        }
+    }
+
+    /// The disks a test plugs in, unplugged again when it ends.
+    ///
+    /// `DeviceList` is append-only on bare metal and `add_device_hosted`'s
+    /// partner only exists under `libos`, which is how these tests build.
+    pub(super) struct Disks {
+        devs: Vec<zcore_drivers::Device>,
+    }
+
+    impl Drop for Disks {
+        fn drop(&mut self) {
+            for dev in self.devs.drain(..) {
+                kernel_hal::drivers::remove_device_hosted(&dev);
+            }
+        }
+    }
+
+    /// Plug in one disk per driver name given, each `sectors` sectors long.
+    ///
+    /// The names are the DRIVER's (`nvme0`, `virtio-blk`, `ahci0`), not the
+    /// ones `/sys/block` shows -- turning one into the other is what
+    /// `list_block_devices` is for and what the test is measuring.
+    ///
+    /// The bus guard is asked for and dropped, rather than described in a
+    /// comment, because the device list is process-wide the same way the PCI
+    /// table is: a test that plugs a disk in without holding the lock puts it
+    /// in front of whatever another test is walking. That is exactly the shape
+    /// of flaky suite this kernel has shipped five of, and `--test-threads=1`
+    /// in the CI hides every one of them.
+    pub(super) fn disks(_bus: &Bus, names: &[&str], sectors: usize) -> Disks {
+        let mut devs = Vec::new();
+        for name in names {
+            let disk = alloc::sync::Arc::new(FakeDisk {
+                name: String::from(*name),
+                sectors,
+            });
+            let dev = zcore_drivers::Device::Block(disk);
+            kernel_hal::drivers::add_device_hosted(dev.clone());
+            devs.push(dev);
+        }
+        Disks { devs }
     }
 }
 
@@ -2746,5 +3042,534 @@ mod drm_name_tests {
             "it parses as a render minor; whether a node exists is the table's call"
         );
         assert!(drm_node_pci_index(u32::MAX).is_none());
+    }
+}
+
+#[cfg(test)]
+mod tree_tests {
+    //! The shape of `/sys`, walked whole.
+    //!
+    //! Everything userspace knows about the machine it runs on comes from
+    //! walking this tree: udev enumerates it, libinput reads the input class
+    //! out of it, and libdrm and Mesa resolve a GPU through four of its
+    //! symlinks before they will open a device. All of that is `readdir`,
+    //! `open` and `readlink` over twenty-nine directories, and none of it was
+    //! reachable from a test until the bus became a seam.
+
+    use super::*;
+    use alloc::vec;
+
+    /// One node of the tree, with where it was found and who found it.
+    struct Node {
+        path: String,
+        inode: Arc<dyn INode>,
+        parent_ino: usize,
+        type_: FileType,
+    }
+
+    /// Every node reachable from `/sys`, without following a symlink --
+    /// following them would make the walk infinite, and they get a test of
+    /// their own.
+    fn whole_tree() -> Vec<Node> {
+        let mut out: Vec<Node> = vec![];
+        let root = SYS_ROOT.clone();
+        let root_ino = root.metadata().unwrap().inode;
+        let mut queue = vec![Node {
+            path: String::from(""),
+            inode: root,
+            parent_ino: root_ino,
+            type_: FileType::Dir,
+        }];
+        while let Some(node) = queue.pop() {
+            if node.type_ == FileType::Dir {
+                let ino = node.inode.metadata().unwrap().inode;
+                for name in listing(&node.inode) {
+                    if name == "." || name == ".." {
+                        continue;
+                    }
+                    let child = node
+                        .inode
+                        .find(&name)
+                        .unwrap_or_else(|e| panic!("{}/{} listed but {:?}", node.path, name, e));
+                    let type_ = child.metadata().unwrap().type_;
+                    queue.push(Node {
+                        path: format!("{}/{}", node.path, name),
+                        inode: child,
+                        parent_ino: ino,
+                        type_,
+                    });
+                }
+            }
+            out.push(node);
+        }
+        out
+    }
+
+    /// What `readdir` would return: `get_entry` from 0 until it stops.
+    fn listing(node: &Arc<dyn INode>) -> Vec<String> {
+        let mut names = vec![];
+        for id in 0.. {
+            match node.get_entry(id) {
+                Ok(name) => names.push(name),
+                Err(_) => break,
+            }
+            assert!(
+                id < 4096,
+                "a listing that does not end is an `ls` that does not end"
+            );
+        }
+        names
+    }
+
+    fn contents(node: &Arc<dyn INode>) -> Vec<u8> {
+        let mut out = vec![];
+        let mut buf = [0u8; 64];
+        loop {
+            let n = node.read_at(out.len(), &mut buf).unwrap();
+            if n == 0 {
+                return out;
+            }
+            out.extend_from_slice(&buf[..n]);
+            assert!(out.len() < 1 << 16, "a file that never ends");
+        }
+    }
+
+    #[test]
+    fn every_directory_lists_itself_and_its_parent_first() {
+        // `getdents` goes straight through `get_entry` and synthesises
+        // nothing, so a directory numbering from its first real name is one
+        // `readdir` never reports `.` or `..` for -- which every other
+        // filesystem this kernel mounts does report.
+        let _bus = test_bus::with(test_bus::a_real_machine());
+        for node in whole_tree() {
+            if node.type_ != FileType::Dir {
+                continue;
+            }
+            let names = listing(&node.inode);
+            assert_eq!(
+                names.first().map(|s| s.as_str()),
+                Some("."),
+                "{}",
+                node.path
+            );
+            assert_eq!(
+                names.get(1).map(|s| s.as_str()),
+                Some(".."),
+                "{}",
+                node.path
+            );
+            assert!(
+                !names[2..].iter().any(|n| n == "." || n == ".."),
+                "{} lists them twice",
+                node.path
+            );
+        }
+    }
+
+    #[test]
+    fn an_empty_directory_still_has_the_two() {
+        let _bus = test_bus::with(vec![]);
+        let empty = SYS_ROOT.lookup_follow("class/power_supply", 4).unwrap();
+        assert_eq!(listing(&empty), vec![String::from("."), String::from("..")]);
+    }
+
+    #[test]
+    fn dot_is_the_directory_and_dotdot_is_the_one_above_it() {
+        let _bus = test_bus::with(test_bus::a_real_machine());
+        for node in whole_tree() {
+            if node.type_ != FileType::Dir {
+                continue;
+            }
+            let ino = node.inode.metadata().unwrap().inode;
+            let here = node.inode.find(".").unwrap().metadata().unwrap().inode;
+            assert_eq!(here, ino, "{}/. is somewhere else", node.path);
+            let up = node.inode.find("..").unwrap().metadata().unwrap().inode;
+            assert_eq!(
+                up, node.parent_ino,
+                "{}/.. is not the directory above",
+                node.path
+            );
+        }
+    }
+
+    #[test]
+    fn walking_up_from_a_power_supply_reaches_the_class_directory() {
+        // Its `..` used to be itself, so anything walking up from a battery
+        // -- which is how a power daemon finds the device one belongs to --
+        // stayed in `/sys/class/power_supply` for ever.
+        let _bus = test_bus::with(vec![]);
+        let class = SYS_ROOT.lookup_follow("class", 4).unwrap();
+        let up = SYS_ROOT.lookup_follow("class/power_supply/..", 4).unwrap();
+        assert_eq!(
+            up.metadata().unwrap().inode,
+            class.metadata().unwrap().inode
+        );
+        let twice = SYS_ROOT
+            .lookup_follow("class/power_supply/../..", 4)
+            .unwrap();
+        assert_eq!(
+            twice.metadata().unwrap().inode,
+            SYS_ROOT.metadata().unwrap().inode
+        );
+    }
+
+    #[test]
+    fn every_name_a_directory_lists_can_be_opened() {
+        // The walk panics on a name `find` refuses, so reaching the end is
+        // the assertion; the count keeps it from passing on an empty tree.
+        let _bus = test_bus::with(test_bus::a_real_machine());
+        assert!(whole_tree().len() > 60);
+    }
+
+    #[test]
+    fn a_listing_ends_instead_of_repeating_itself_or_panicking() {
+        let _bus = test_bus::with(test_bus::a_real_machine());
+        for node in whole_tree() {
+            if node.type_ != FileType::Dir {
+                continue;
+            }
+            let n = listing(&node.inode).len();
+            assert_eq!(
+                node.inode.get_entry(n),
+                Err(FsError::EntryNotFound),
+                "{}",
+                node.path
+            );
+            assert_eq!(
+                node.inode.get_entry(usize::MAX),
+                Err(FsError::EntryNotFound),
+                "{} on the last id there is",
+                node.path
+            );
+        }
+    }
+
+    #[test]
+    fn no_two_directories_of_the_tree_claim_the_same_inode() {
+        // They were literals spaced ten apart with the per-device ones
+        // written `40 + index` and `100 + index`, so the eleventh PCI
+        // function was `/sys/devices/system` over again and the first disk
+        // was `/sys/class/thermal`.
+        let _bus = test_bus::with(test_bus::a_real_machine());
+        let mut seen: Vec<(usize, String)> = vec![];
+        for node in whole_tree() {
+            if node.type_ != FileType::Dir {
+                continue;
+            }
+            let ino = node.inode.metadata().unwrap().inode;
+            if let Some((_, other)) = seen.iter().find(|(i, _)| *i == ino) {
+                panic!("{} and {} are both inode {}", other, node.path, ino);
+            }
+            seen.push((ino, node.path.clone()));
+        }
+    }
+
+    #[test]
+    fn a_bus_wider_than_the_old_numbering_allowed_still_numbers_apart() {
+        // Twenty functions, which an ordinary desktop passes once the
+        // chipset's own are counted.
+        let devs: Vec<PciDevInfo> = (0..20)
+            .map(|i| test_bus::dev(&format!("0000:00:{:02x}.0", i), 0x8086, 0x1234, 0x060000))
+            .collect();
+        let _bus = test_bus::with(devs);
+        let mut seen: Vec<usize> = vec![];
+        for node in whole_tree() {
+            if node.type_ != FileType::Dir {
+                continue;
+            }
+            let ino = node.inode.metadata().unwrap().inode;
+            assert!(!seen.contains(&ino), "{} repeats inode {}", node.path, ino);
+            seen.push(ino);
+        }
+    }
+
+    #[test]
+    fn every_symlink_resolves_to_something_in_the_tree() {
+        // Four of these are what libdrm walks to decide which device a card
+        // belongs to, and the only thing that can be wrong with one is the
+        // number of `..` in it, which reads as correct however long you look.
+        let _bus = test_bus::with(test_bus::a_real_machine());
+        let mut links = 0;
+        for node in whole_tree() {
+            if node.type_ != FileType::SymLink {
+                continue;
+            }
+            let target = contents(&node.inode);
+            let target = core::str::from_utf8(&target).unwrap();
+            let path = node.path.trim_start_matches('/');
+            let found = SYS_ROOT
+                .lookup_follow(path, 8)
+                .unwrap_or_else(|e| panic!("{} -> {} is {:?}", node.path, target, e));
+            assert_eq!(
+                found.metadata().unwrap().type_,
+                FileType::Dir,
+                "{} -> {} is not a directory",
+                node.path,
+                target
+            );
+            assert_eq!(
+                node.inode.metadata().unwrap().size,
+                target.len(),
+                "{} reports the wrong length for its target",
+                node.path
+            );
+            links += 1;
+        }
+        assert!(
+            links >= 10,
+            "only {} symlinks: the tree came up empty",
+            links
+        );
+    }
+
+    #[test]
+    fn a_file_read_from_the_middle_gives_the_rest_of_it() {
+        // `cat` reads whatever its buffer holds and asks again from where it
+        // stopped. A file answering from the beginning every time never ends.
+        let _bus = test_bus::with(test_bus::a_real_machine());
+        for node in whole_tree() {
+            if node.type_ != FileType::File {
+                continue;
+            }
+            let whole = contents(&node.inode);
+            for offset in [0, 1, whole.len() / 2, whole.len()] {
+                let offset = offset.min(whole.len());
+                let mut buf = vec![0u8; whole.len() + 8];
+                let n = node.inode.read_at(offset, &mut buf).unwrap();
+                assert_eq!(&buf[..n], &whole[offset..], "{} at {}", node.path, offset);
+            }
+            assert_eq!(
+                node.inode.read_at(whole.len() + 1, &mut [0u8; 8]).unwrap(),
+                0,
+                "{} past its end",
+                node.path
+            );
+        }
+    }
+
+    #[test]
+    fn the_bus_the_tree_shows_is_the_bus_it_was_given() {
+        let _bus = test_bus::with(test_bus::a_real_machine());
+        let devices = SYS_ROOT.lookup_follow("bus/pci/devices", 4).unwrap();
+        let names = listing(&devices);
+        assert_eq!(&names[..2], &[String::from("."), String::from("..")]);
+        assert_eq!(names[2], "0000:00:00.0");
+        assert_eq!(names.len(), 8, "six functions and the two");
+
+        // The card Moebius runs, read back the way udev reads it.
+        let card = SYS_ROOT
+            .lookup_follow("devices/pci0000:00/0000:02:00.0", 4)
+            .unwrap();
+        assert_eq!(contents(&card.find("vendor").unwrap()), b"0x10de\n");
+        assert_eq!(contents(&card.find("device").unwrap()), b"0x1f06\n");
+        assert_eq!(contents(&card.find("class").unwrap()), b"0x030000\n");
+        // Upper case, because `modules.alias` is upper case and `kmod`
+        // compares the two with `fnmatch`.
+        assert_eq!(
+            contents(&card.find("modalias").unwrap()),
+            b"pci:v000010DEd00001F06sv00000000sd00000000bc03sc00i00\n"
+        );
+        assert_eq!(
+            contents(&card.find("uevent").unwrap()),
+            b"PCI_CLASS=30000\nPCI_ID=10DE:1F06\nPCI_SUBSYS_ID=0000:0000\n\
+              PCI_SLOT_NAME=0000:02:00.0\n\
+              MODALIAS=pci:v000010DEd00001F06sv00000000sd00000000bc03sc00i00\n"
+                .as_slice()
+        );
+
+        // The 256 bytes `config` hands out are the header a driver expects to
+        // find the device at: ids at 0, then revision, prog-if, subclass and
+        // base class at 8 through 11.
+        let cfg = contents(&card.find("config").unwrap());
+        assert_eq!(cfg.len(), 256);
+        assert_eq!(&cfg[0..4], &[0xde, 0x10, 0x06, 0x1f]);
+        assert_eq!(&cfg[8..12], &[0x00, 0x00, 0x00, 0x03]);
+
+        // Its HDMI audio function is a different device, not the card again.
+        let audio = SYS_ROOT
+            .lookup_follow("devices/pci0000:00/0000:02:00.1", 4)
+            .unwrap();
+        assert_eq!(contents(&audio.find("device").unwrap()), b"0x10f9\n");
+        assert_eq!(contents(&audio.find("class").unwrap()), b"0x040300\n");
+        assert_ne!(
+            card.metadata().unwrap().inode,
+            audio.metadata().unwrap().inode
+        );
+    }
+
+    #[test]
+    fn a_class_with_a_hex_letter_in_it_keeps_its_case() {
+        // An xHCI controller is class 0x0c0330, and the `0c` is the only
+        // reason to look: every other number on a desk is digits. The old
+        // modalias took the three bytes as text straight out of the string
+        // the scan had formatted, which was lower case.
+        let _bus = test_bus::with(vec![test_bus::dev(
+            "0000:00:14.0",
+            0x8086,
+            0xa36d,
+            0x0c0330,
+        )]);
+        let dev = SYS_ROOT
+            .lookup_follow("bus/pci/devices/0000:00:14.0", 4)
+            .unwrap();
+        assert_eq!(
+            contents(&dev.find("modalias").unwrap()),
+            b"pci:v00008086d0000A36Dsv00000000sd00000000bc0Csc03i30\n"
+        );
+        let cfg = contents(&dev.find("config").unwrap());
+        assert_eq!(&cfg[9..12], &[0x30, 0x03, 0x0c], "prog-if, subclass, class");
+    }
+
+    #[test]
+    fn a_device_with_nothing_readable_in_it_still_answers() {
+        // `scan_pci_devices` writes these strings and they are always
+        // well-formed, but the synthetic compute alias builds one by hand
+        // with `0x0000`, and a parse that gave up used to leave three
+        // different files disagreeing about what it had given up on.
+        let ids = PciIds::parse("nonsense", "0x", "");
+        assert_eq!(
+            ids,
+            PciIds {
+                vendor: 0,
+                device: 0,
+                class: 0
+            }
+        );
+        assert_eq!(
+            ids.modalias(),
+            "pci:v00000000d00000000sv00000000sd00000000bc00sc00i00\n"
+        );
+        assert!(ids.uevent("0000:00:00.0").ends_with(&ids.modalias()));
+    }
+
+    #[test]
+    fn a_disk_is_the_same_disk_from_both_places_that_show_it() {
+        let _bus = test_bus::with(test_bus::a_real_machine());
+        // Moebius's NVMe, plus the SATA disk he has said he does not have
+        // here but the installer still has to name.
+        let _disks = test_bus::disks(&_bus, &["nvme0", "ahci0"], 2048);
+
+        let block = SYS_ROOT.lookup_follow("block", 4).unwrap();
+        assert_eq!(
+            listing(&block),
+            vec![
+                String::from("."),
+                String::from(".."),
+                String::from("nvme0n1"),
+                String::from("sda"),
+            ]
+        );
+
+        // `/sys/class/block` shows the same names, as links to those.
+        let class_block = SYS_ROOT.lookup_follow("class/block", 4).unwrap();
+        assert_eq!(listing(&class_block), listing(&block));
+        let link = class_block.find("nvme0n1").unwrap();
+        assert_eq!(link.metadata().unwrap().type_, FileType::SymLink);
+        assert_eq!(contents(&link), b"../../block/nvme0n1");
+
+        // And following it lands on the disk itself, not somewhere else
+        // with the same name.
+        let by_link = SYS_ROOT.lookup_follow("class/block/nvme0n1", 4).unwrap();
+        let direct = SYS_ROOT.lookup_follow("block/nvme0n1", 4).unwrap();
+        assert_eq!(
+            by_link.metadata().unwrap().inode,
+            direct.metadata().unwrap().inode
+        );
+        assert_eq!(contents(&direct.find("size").unwrap()), b"2048\n");
+    }
+
+    #[test]
+    fn walking_up_from_a_disk_goes_back_the_way_it_came() {
+        let _bus = test_bus::with(vec![]);
+        let _disks = test_bus::disks(&_bus, &["nvme0"], 512);
+
+        // `/sys/block/<dev>/..` is `/sys/block`, whose own `..` is `/sys`.
+        let disk = SYS_ROOT.lookup_follow("block/nvme0n1", 4).unwrap();
+        let up = disk.find("..").unwrap();
+        assert_eq!(
+            up.metadata().unwrap().inode,
+            SYS_ROOT
+                .lookup_follow("block", 4)
+                .unwrap()
+                .metadata()
+                .unwrap()
+                .inode
+        );
+        assert_eq!(
+            up.find("..").unwrap().metadata().unwrap().inode,
+            SYS_ROOT.metadata().unwrap().inode
+        );
+
+        // `/sys/class/block`'s is `/sys/class`. Mounting one directory at
+        // both places made this one `/sys`, so a walk up from a disk found
+        // under `class/` skipped the subsystem it belongs to -- which is
+        // precisely what libudev reads that walk for.
+        let cb = SYS_ROOT.lookup_follow("class/block", 4).unwrap();
+        assert_eq!(
+            cb.find("..").unwrap().metadata().unwrap().inode,
+            SYS_ROOT
+                .lookup_follow("class", 4)
+                .unwrap()
+                .metadata()
+                .unwrap()
+                .inode
+        );
+        assert_ne!(
+            cb.metadata().unwrap().inode,
+            SYS_ROOT
+                .lookup_follow("block", 4)
+                .unwrap()
+                .metadata()
+                .unwrap()
+                .inode
+        );
+    }
+
+    #[test]
+    fn a_twenty_seventh_disk_does_not_take_the_first_one_s_name() {
+        // `sda` through `sdz`, and then what? The naming wrapped with
+        // `% 26` and started over, so two disks answered to `sda` and
+        // `block_index_by_name` handed out the first of them for both --
+        // the installer would have written a partition table to the wrong
+        // one. Linux goes on to `sdaa`.
+        let _bus = test_bus::with(vec![]);
+        let names: Vec<String> = (0..27).map(|i| format!("ahci{}", i)).collect();
+        let refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
+        let _disks = test_bus::disks(&_bus, &refs, 64);
+
+        let listed = list_block_devices();
+        assert_eq!(listed.len(), 27);
+        assert_eq!(listed[25], "sdz");
+        assert_eq!(listed[26], "sdaa");
+
+        let mut sorted = listed.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted.len(), 27, "two disks share a name: {:?}", listed);
+
+        // And every name still finds the disk it belongs to.
+        for (i, name) in listed.iter().enumerate() {
+            assert_eq!(block_index_by_name(name), Some(i), "{}", name);
+        }
+
+        // A name that is merely the start of one is not that disk. `sd`
+        // resolving to `sda` would make `/sys/block/sd` a second way in.
+        assert_eq!(block_index_by_name("sd"), None);
+        assert_eq!(block_index_by_name("sda"), Some(0));
+        assert_eq!(block_index_by_name("sdaa"), Some(26));
+        assert_eq!(block_index_by_name("sdaaa"), None);
+    }
+
+    #[test]
+    fn a_machine_with_no_bus_at_all_still_has_a_tree() {
+        // Not hypothetical: it is what every non-PCI machine looks like, and
+        // the walk has to end rather than fault or run on.
+        let _bus = test_bus::with(vec![]);
+        let devices = SYS_ROOT.lookup_follow("bus/pci/devices", 4).unwrap();
+        assert_eq!(
+            listing(&devices),
+            vec![String::from("."), String::from("..")]
+        );
+        assert!(whole_tree().len() > 30);
     }
 }
