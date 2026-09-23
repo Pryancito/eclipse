@@ -2120,8 +2120,14 @@ pub fn current_vt_tty() -> Arc<dyn INode> {
 }
 
 impl INode for Stdout {
+    /// The write side of a terminal has nothing to read. `File::read` refuses
+    /// a `WRONLY` descriptor before it gets here, and no `/dev` node is backed
+    /// by a `Stdout` (the per-VT nodes are `Stdin`), so nothing reaches this
+    /// today -- but the body was `unimplemented!()`, which is a kernel panic
+    /// rather than an errno, and one `devfs_root.add` away from being
+    /// reachable from a `read(2)`.
     fn read_at(&self, _offset: usize, _buf: &mut [u8]) -> Result<usize> {
-        unimplemented!()
+        Err(FsError::NotSupported)
     }
 
     fn write_at(&self, _offset: usize, buf: &[u8]) -> Result<usize> {
@@ -3000,5 +3006,23 @@ mod vt_ownership_tests {
         assert!(!tty_kbd_cooked(0));
         TTY_STATES[0].kbd_mode.store(K_XLATE, Ordering::Relaxed);
         assert!(tty_kbd_cooked(0));
+    }
+}
+
+#[cfg(test)]
+mod stdout_node_tests {
+    //! The write side of a virtual terminal, as an inode.
+
+    use super::*;
+
+    /// A read has to be an errno. `unimplemented!()` here was a kernel panic
+    /// waiting for the first caller that did not go through `File::read`'s
+    /// `WRONLY` check -- a `/dev` node backed by a `Stdout`, a `sendfile`
+    /// source, a page-cache fill.
+    #[test]
+    fn reading_the_write_side_of_a_terminal_is_an_errno_not_a_panic() {
+        let out = Stdout { vt: 0 };
+        let mut buf = [0u8; 8];
+        assert_eq!(out.read_at(0, &mut buf), Err(FsError::NotSupported));
     }
 }

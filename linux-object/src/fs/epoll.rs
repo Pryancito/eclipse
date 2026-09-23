@@ -214,16 +214,6 @@ impl FileLike for Epoll {
         Ok(())
     }
 
-    fn dup(&self) -> Arc<dyn FileLike> {
-        Arc::new(Self {
-            base: KObjectBase::new(),
-            inner: Mutex::new(EpollInner {
-                interest_list: self.inner.lock().interest_list.clone(),
-            }),
-            flags: self.flags,
-        })
-    }
-
     async fn read(&self, _buf: &mut [u8]) -> LxResult<usize> {
         Err(LxError::ENOSYS)
     }
@@ -613,19 +603,24 @@ mod tests {
         assert!(readable(&chain[0]));
     }
 
+    /// `dup(epfd)` gives a second descriptor for the SAME `struct eventpoll`
+    /// (`fs/eventpoll.c` never copies one), so `epoll_ctl` through either fd
+    /// is visible through the other. The fd table hands out this very `Arc`
+    /// for a dup, which is what makes that true here.
     #[test]
-    fn dup_copies_the_interest_list_without_sharing_it() {
+    fn a_dup_of_an_epoll_fd_watches_the_same_interest_list() {
         let ep = epoll();
         let dev = evfd(true);
         ep.ctl(ADD, FileDesc::from(6), ev(PollEvents::IN, 0), Some(dev))
             .unwrap();
-        let copy = ep.dup();
+        let copy: Arc<dyn FileLike> = ep.clone();
         assert!(copy.poll(PollEvents::IN).unwrap().read);
-        // Removing the watch from the original leaves the copy watching it --
-        // a dup'd epoll fd is its own description in this kernel.
         ep.ctl(DEL, FileDesc::from(6), ev(PollEvents::IN, 0), None)
             .unwrap();
         assert!(!readable(&ep));
-        assert!(copy.poll(PollEvents::IN).unwrap().read);
+        assert!(
+            !copy.poll(PollEvents::IN).unwrap().read,
+            "a watch dropped through one fd is dropped for both"
+        );
     }
 }

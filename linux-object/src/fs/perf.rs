@@ -371,19 +371,6 @@ impl FileLike for PerfEvent {
         Ok(())
     }
 
-    fn dup(&self) -> Arc<dyn FileLike> {
-        // Share the same underlying event/ring (the original stays registered
-        // with the sampler; both fds observe the same samples).
-        Arc::new(PerfEvent {
-            base: KObjectBase::new(),
-            cpu: self.cpu,
-            pid: self.pid,
-            flags: self.flags,
-            eventbus: self.eventbus.clone(),
-            inner: self.inner.clone(),
-        })
-    }
-
     async fn read(&self, buf: &mut [u8]) -> LxResult<usize> {
         // Non-mmap read returns the accumulated count (optionally enabled/
         // running/id per read_format), like a counting event.

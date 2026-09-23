@@ -99,21 +99,6 @@ impl FileLike for DmaBuf {
         Ok(())
     }
 
-    fn dup(&self) -> Arc<dyn FileLike> {
-        // A fresh object, so a fresh DMABUF_HOLDER reference — SCM_RIGHTS
-        // shares the Arc and does not come through here.
-        if let Some(handle) = self.nouveau_handle {
-            super::devfs::drm::dmabuf_take_gem_ref(handle);
-        }
-        Arc::new(Self {
-            base: KObjectBase::new(),
-            phys_addr: self.phys_addr,
-            size: self.size,
-            vmo: self.vmo.clone(),
-            nouveau_handle: self.nouveau_handle,
-        })
-    }
-
     async fn read(&self, _buf: &mut [u8]) -> LxResult<usize> {
         Err(LxError::ENOSYS)
     }

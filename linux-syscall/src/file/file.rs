@@ -1144,11 +1144,13 @@ impl Syscall<'_> {
             MODE_CREATE_LEASE => {
                 // An empty lease is just a fresh fd to the same DRM device: our
                 // GEM table is global, so per-fd handle ref-counting (the reason
-                // wlroots' dumb allocator leases) is unnecessary. Hand back a dup
-                // of this fd as the lease.
+                // wlroots' dumb allocator leases) is unnecessary. Hand back a
+                // second descriptor for this same open file description, the way
+                // `dup` does -- so closing the lease does not run the DRM file's
+                // teardown on state the lessor is still using.
                 let mut ptr = UserInOutPtr::<DrmModeCreateLease>::from(arg1);
                 let mut l = ptr.read()?;
-                let lease = file_like.dup();
+                let lease = file_like.clone();
                 let new_fd = proc.add_file(lease)?;
                 l.lessee_id = 1;
                 l.fd = i32::from(new_fd);

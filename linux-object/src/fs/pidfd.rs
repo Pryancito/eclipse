@@ -68,15 +68,6 @@ impl FileLike for PidFd {
         Ok(())
     }
 
-    fn dup(&self) -> Arc<dyn FileLike> {
-        Arc::new(Self {
-            base: KObjectBase::new(),
-            process: self.process.clone(),
-            open_flags: Mutex::new(*self.open_flags.lock()),
-            eventbus: self.eventbus.clone(),
-        })
-    }
-
     async fn read(&self, _buf: &mut [u8]) -> LxResult<usize> {
         Err(LxError::EINVAL)
     }

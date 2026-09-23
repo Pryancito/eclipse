@@ -348,13 +348,6 @@ impl FileLike for IcmpSocketState {
         Ok(())
     }
 
-    fn dup(&self) -> Arc<dyn FileLike> {
-        Arc::new(Self {
-            base: KObjectBase::new(),
-            inner: self.inner.clone(),
-        })
-    }
-
     async fn read(&self, buf: &mut [u8]) -> LxResult<usize> {
         let inner = self.inner.lock();
         if icmp_rx::pending_for(inner.ipv6) {

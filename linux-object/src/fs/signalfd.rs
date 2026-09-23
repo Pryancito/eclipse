@@ -81,14 +81,6 @@ impl FileLike for SignalFd {
         Ok(())
     }
 
-    fn dup(&self) -> Arc<dyn FileLike> {
-        Arc::new(Self {
-            base: KObjectBase::new(),
-            mask: self.mask.clone(),
-            flags: Mutex::new(self.flags()),
-        })
-    }
-
     async fn read(&self, buf: &mut [u8]) -> LxResult<usize> {
         if buf.len() < SIGINFO_SIZE {
             return Err(LxError::EINVAL);
@@ -192,9 +184,6 @@ mod tests {
         assert!(fd.flags().non_block());
         let mut buf = [0u8; SIGINFO_SIZE];
         assert_eq!(block_on(fd.read(&mut buf)), Err(LxError::EAGAIN));
-        let copy = fd.dup();
-        copy.set_flags(OpenFlags::empty()).unwrap();
-        assert!(fd.flags().non_block(), "a dup has its own flags");
     }
 
     #[test]
@@ -213,8 +202,7 @@ mod tests {
     #[test]
     fn a_dup_shares_the_mask_so_updating_one_updates_both() {
         let fd = sfd(mask_of(&[LinuxSignal::SIGINT]), OpenFlags::NON_BLOCK);
-        let dup = fd.dup();
-        let dup = dup.downcast_arc::<SignalFd>().ok().unwrap();
+        let dup = fd.clone();
         let wider = mask_of(&[LinuxSignal::SIGINT, LinuxSignal::SIGTERM]);
         fd.set_mask(wider);
         assert_eq!(dup.mask.load(SeqCst), wider);

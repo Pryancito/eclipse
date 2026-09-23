@@ -490,16 +490,6 @@ impl FileLike for PacketSocketState {
         Ok(())
     }
 
-    fn dup(&self) -> Arc<dyn FileLike> {
-        let inner = self.inner.clone();
-        let state = Arc::new(Self {
-            base: KObjectBase::with_signal(Signal::WRITABLE),
-            inner,
-        });
-        register_fd(&state.inner, &state);
-        state
-    }
-
     async fn read(&self, buf: &mut [u8]) -> LxResult<usize> {
         Socket::read(self, buf).await.0
     }

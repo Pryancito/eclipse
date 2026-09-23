@@ -79,15 +79,6 @@ impl FileLike for EventFd {
         Ok(())
     }
 
-    fn dup(&self) -> Arc<dyn FileLike> {
-        Arc::new(Self {
-            base: KObjectBase::new(),
-            counter: self.counter.clone(),
-            eventbus: self.eventbus.clone(),
-            flags: Mutex::new(self.flags()),
-        })
-    }
-
     async fn read(&self, buf: &mut [u8]) -> LxResult<usize> {
         if buf.len() < 8 {
             return Err(LxError::EINVAL);
@@ -242,20 +233,20 @@ mod tests {
         assert!(!fd.flags().non_block());
     }
 
-    /// `dup2` clears `O_CLOEXEC` on the copy it installs, through
-    /// `set_flags`; with that call ignored, a dup of an `EFD_CLOEXEC` eventfd
-    /// was registered close-on-exec and vanished across the child's exec.
-    /// The two objects keep their own flags: clearing the copy's must not
-    /// touch the original's.
+    /// The status flags live in the open file description, so a dup shares
+    /// them: `fcntl(F_SETFL, O_NONBLOCK)` through one descriptor is in force
+    /// on the other. What a dup does NOT share is `FD_CLOEXEC`, which is a
+    /// property of the descriptor and lives in the fd table
+    /// ([`crate::process::opened_cloexec`]) -- never here.
     #[test]
-    fn a_dup_has_its_own_flags_and_can_drop_cloexec() {
+    fn a_dup_shares_the_status_flags() {
         let fd = efd(0, nonblock() | OpenFlags::CLOEXEC);
-        let copy = fd.dup();
-        assert!(copy.flags().close_on_exec(), "a dup starts as a copy");
-        copy.set_flags(copy.flags() - OpenFlags::CLOEXEC).unwrap();
-        assert!(!copy.flags().close_on_exec());
-        assert!(copy.flags().non_block(), "only the named bit changed");
-        assert!(fd.flags().close_on_exec(), "the original is untouched");
+        let copy: Arc<dyn FileLike> = fd.clone();
+        copy.set_flags(OpenFlags::empty()).unwrap();
+        assert!(
+            !fd.flags().non_block(),
+            "clearing O_NONBLOCK through one fd clears it for both"
+        );
     }
 
     fn read8(fd: &EventFd) -> LxResult<u64> {
@@ -413,8 +404,7 @@ mod tests {
     #[test]
     fn a_dup_shares_the_counter_and_the_readiness() {
         let fd = efd(0, nonblock());
-        let dup = fd.dup();
-        let dup = dup.downcast_arc::<EventFd>().ok().unwrap();
+        let dup = fd.clone();
         write8(&fd, 2).unwrap();
         // Same object underneath: the dup sees the count and draining through
         // it clears the original's readiness too.

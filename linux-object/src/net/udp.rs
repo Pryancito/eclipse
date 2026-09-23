@@ -657,13 +657,6 @@ impl FileLike for UdpSocketState {
         Socket::ioctl(self, request, arg1, arg2, arg3)
     }
 
-    fn dup(&self) -> Arc<dyn FileLike> {
-        Arc::new(Self {
-            base: KObjectBase::new(),
-            inner: self.inner.clone(),
-        })
-    }
-
     fn as_socket(&self) -> LxResult<&dyn Socket> {
         Ok(self)
     }
