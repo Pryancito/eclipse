@@ -17334,6 +17334,183 @@ mod nouveau_bookkeeping_tests {
         assert_eq!(FAKE_RM.lock().bad, 0);
     }
 
+    /// The X11 acquire is never A's syncobj itself: the client waits on a
+    /// sync_file IMPORTED from it, or on a MERGE of it with the previous
+    /// present. Both are links whose fence sits in A's row. Looked up by
+    /// the importer's handle that fence was invisible, so every such EXEC
+    /// parked on the CPU inside the ioctl; seen through the link it is the
+    /// same GPU acquire on A's mapped semaphore as a wait on A's syncobj.
+    #[test]
+    fn an_exec_wait_on_an_imported_or_merged_fence_is_a_gpu_acquire_on_the_producers_fence() {
+        let _g = LOCK.lock();
+        let _live = LiveBytes::hold();
+        let gpu = gpu_rm_fast();
+        FAKE_RM.lock().peer = true;
+        let ch_a = client_with_pushbuf(&gpu, A);
+        let ch_b = client_with_pushbuf(&gpu, B);
+        let out = syncobj::create(false);
+        assert_eq!(
+            exec(&gpu, A, ch_a, &[push(PUSH_VA, 16)], &[], &[sync(out)]),
+            Ok(0)
+        );
+        // What Mesa's WSI does: A's fence exported as a sync_file and
+        // imported into the client's own semaphore...
+        let imported = syncobj::create(false);
+        assert!(syncobj::import_snapshot(
+            imported,
+            out,
+            syncobj::export_snapshot(out).unwrap()
+        ));
+        // ...or merged with the previous present, long done here.
+        let previous = syncobj::create(true);
+        let merged = syncobj::merge_fences(&[(out, 1), (previous, 1)]);
+        assert_eq!(syncobj::query(imported), Some(0));
+        assert_eq!(syncobj::query(merged), Some(0));
+        let a = chan(1);
+        let out2 = syncobj::create(false);
+        // 1 ms per clock read: a CPU wait below (the old path, nothing runs
+        // the GPU) ends in EIO after 10 s virtual instead of hanging.
+        test_clock::set_auto_advance(1_000);
+        let t0 = test_clock::now();
+        assert_eq!(
+            exec(
+                &gpu,
+                B,
+                ch_b,
+                &[push(PUSH_VA, 16)],
+                &[sync(imported), sync(merged)],
+                &[sync(out2)]
+            ),
+            Ok(0),
+            "both waits are A's fence: no CPU wait"
+        );
+        assert!(
+            test_clock::now() - t0 < 1_000_000,
+            "submitted without waiting"
+        );
+        assert_eq!(
+            peer_maps_made(),
+            1,
+            "A's semaphore mapped into B's VAS once, for both waits"
+        );
+        let (producer_va, local_va) = peer_map(2, 1).expect("the mapping the RM made");
+        assert_eq!(producer_va, sem_va(&a));
+        let b = chan(2);
+        assert_eq!(userd(&b), (0, 4), "acquire, acquire, push, fence");
+        assert_eq!(
+            run_gpu(2),
+            [],
+            "B's channel stalls on the acquire: A has not run"
+        );
+        assert_eq!(syncobj::query(out2), Some(0));
+        assert_eq!(run_gpu(1).len(), 2);
+        assert_eq!(
+            run_gpu(2),
+            [
+                Fetched::Acquire {
+                    sem_va: local_va,
+                    payload: 1
+                },
+                Fetched::Acquire {
+                    sem_va: local_va,
+                    payload: 1
+                },
+                Fetched::Push {
+                    va: PUSH_VA,
+                    len: 16
+                },
+                Fetched::Release {
+                    sem_va: sem_va(&b),
+                    payload: 1
+                }
+            ],
+            "one acquire per wait, both on A's fence, in front of the push"
+        );
+        assert_eq!(syncobj::query(imported), Some(1));
+        assert_eq!(syncobj::query(merged), Some(1));
+        assert_eq!(syncobj::query(out2), Some(1));
+        test_clock::set_auto_advance(0);
+        for h in [out, imported, previous, merged, out2] {
+            assert!(syncobj::destroy(h));
+        }
+        gpu.nouveau_release_process(A);
+        gpu.nouveau_release_process(B);
+        assert_eq!(FAKE_RM.lock().bad, 0);
+    }
+
+    /// The same through a link on the client's own channel: no mapping, the
+    /// acquire on its own semaphore, exactly as a wait on the syncobj itself.
+    #[test]
+    fn an_exec_wait_on_an_import_of_its_own_channels_fence_needs_no_mapping() {
+        let _g = LOCK.lock();
+        let _live = LiveBytes::hold();
+        let gpu = gpu_rm_fast();
+        let ch_a = client_with_pushbuf(&gpu, A);
+        let out = syncobj::create(false);
+        let out2 = syncobj::create(false);
+        assert_eq!(
+            exec(&gpu, A, ch_a, &[push(PUSH_VA, 16)], &[], &[sync(out)]),
+            Ok(0)
+        );
+        let imported = syncobj::create(false);
+        assert!(syncobj::import_snapshot(imported, out, 1));
+        let before = FAKE_RM.lock().calls.len();
+        // 1 us per clock read: a CPU wait here ends in EIO after 10 s
+        // virtual, a failure rather than a hang.
+        test_clock::set_auto_advance(1);
+        let t0 = test_clock::now();
+        assert_eq!(
+            exec(
+                &gpu,
+                A,
+                ch_a,
+                &[push(PUSH_VA + 0x100, 16)],
+                &[sync(imported)],
+                &[sync(out2)]
+            ),
+            Ok(0),
+            "the import's fence is pending on this very channel: no CPU wait"
+        );
+        test_clock::set_auto_advance(0);
+        assert!(test_clock::now() - t0 < 1_000, "submitted without waiting");
+        assert_eq!(rm_calls_since(before), [] as [&str; 0], "no peer mapping");
+        let a = chan(1);
+        assert_eq!(userd(&a), (0, 5), "push, fence, acquire, push, fence");
+        assert_eq!(
+            run_gpu(1),
+            [
+                Fetched::Push {
+                    va: PUSH_VA,
+                    len: 16
+                },
+                Fetched::Release {
+                    sem_va: sem_va(&a),
+                    payload: 1
+                },
+                Fetched::Acquire {
+                    sem_va: sem_va(&a),
+                    payload: 1
+                },
+                Fetched::Push {
+                    va: PUSH_VA + 0x100,
+                    len: 16
+                },
+                Fetched::Release {
+                    sem_va: sem_va(&a),
+                    payload: 2
+                }
+            ],
+            "the acquire on its own semaphore, in front of the push it guards"
+        );
+        assert_eq!(syncobj::query(imported), Some(1));
+        assert_eq!(syncobj::query(out2), Some(1));
+        for h in [out, imported, out2] {
+            assert!(syncobj::destroy(h));
+        }
+        gpu.nouveau_release_process(A);
+        assert_eq!(FAKE_RM.lock().bad, 0);
+    }
+
     // ----- The compositor's singleton: claimed through the ladder, reset at exit -----
 
     /// A GPU whose fake RM carries the compositor's ladder too, so ctx 0 is
