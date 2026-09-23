@@ -239,10 +239,7 @@ impl Syscall<'_> {
         );
         let sys_type = match sys_type {
             Ok(t) => t,
-            Err(_) => {
-                error!("invalid syscall number: {}", num);
-                return LxError::EINVAL as _;
-            }
+            Err(_) => return unknown_syscall_number(num),
         };
         let [a0, a1, a2, a3, a4, a5] = args;
         // Eclipse's own perf accounting: time every syscall and attribute it to
@@ -317,8 +314,12 @@ impl Syscall<'_> {
             Sys::FCHMODAT => self.sys_fchmodat(a0.into(), a1.into(), a2, a3),
             Sys::FCHOWN => self.sys_fchown(a0.into(), a1, a2),
             Sys::FCHOWNAT => self.sys_fchownat(a0.into(), a1.into(), a2, a3, a4),
-            Sys::FACCESSAT => self.sys_faccessat(a0.into(), a1.into(), a2, a3),
-            Sys::FACCESSAT2 => self.sys_faccessat(a0.into(), a1.into(), a2, a3),
+            // `faccessat` has no flags argument; `faccessat2` does. See
+            // `faccessat_flags`.
+            ref s @ (Sys::FACCESSAT | Sys::FACCESSAT2) => {
+                let flags = faccessat_flags(faccessat_takes_flags(s), a3);
+                self.sys_faccessat(a0.into(), a1.into(), a2, flags)
+            }
             Sys::DUP => self.sys_dup(a0.into()),
             Sys::DUP3 => self.sys_dup3(a0.into(), a1, a2),
             Sys::PIPE2 => self.sys_pipe2(a0.into(), a1), // TODO: handle `flags`
@@ -479,8 +480,6 @@ impl Syscall<'_> {
             // context provably carries every caller-saved register, answering
             // ENOSYS is the correct, safe behaviour — sys_clone3 below stays
             // implemented for when that is fixed.
-            Sys::CLONE3 => Err(LxError::ENOSYS),
-            #[allow(unreachable_patterns)]
             Sys::CLONE3 => self.sys_clone3(a0.into(), a1).await,
             Sys::EXIT => self.sys_exit(a0 as _),
             Sys::EXIT_GROUP => self.sys_exit_group(a0 as _),
@@ -720,10 +719,7 @@ impl Syscall<'_> {
         if let Err(err) = ret {
             alsa_hunt(pid, num, &args, err);
         }
-        match ret {
-            Ok(value) => value as isize,
-            Err(err) => -(err as isize),
-        }
+        syscall_ret(ret)
     }
 
     #[cfg(target_arch = "aarch64")]
@@ -913,6 +909,63 @@ fn alsa_hunt(pid: KoID, num: u32, args: &[usize; 6], err: LxError) {
     }
 }
 
+/// Encodes a [`SysResult`] the way the caller's register expects it.
+///
+/// Linux's convention is that a syscall return in `[-4095, -1]` is an error
+/// and anything else is a value, so the sign is not decoration -- it is the
+/// whole signal. Every answer this kernel gives userspace goes through here.
+fn syscall_ret(ret: SysResult) -> isize {
+    match ret {
+        Ok(value) => value as isize,
+        Err(err) => -(err as isize),
+    }
+}
+
+/// The answer to a syscall number this kernel does not have in its table.
+///
+/// This used to be `return LxError::EINVAL as _`, which is **+22**: not an
+/// error at all, but a successful call that returned the number 22. Deciding
+/// at runtime whether a syscall exists is how both glibc and musl handle
+/// kernels older than themselves -- they issue the call and read `-ENOSYS` --
+/// so `epoll_pwait2`, `fchmodat2`, `futex_waitv`, `process_madvise`,
+/// `memfd_secret`, `cachestat` and the rest of what this table does not list
+/// all answered "yes, and it worked", after which the libc believes whatever
+/// it thinks the call produced. The right answer is Linux's `-ENOSYS`, which
+/// is what [`Syscall::unknown_syscall`] already gives for a number that IS in
+/// the table with no implementation behind it. Half of "we do not do that"
+/// was already correct, which is why the other half went unnoticed.
+fn unknown_syscall_number(num: u32) -> isize {
+    error!("invalid syscall number: {}", num);
+    syscall_ret(Err(LxError::ENOSYS))
+}
+
+/// The `flags` argument for the `faccessat` family.
+///
+/// `faccessat` is `SYSCALL_DEFINE3` in Linux: it takes `(dirfd, path, mode)`
+/// and never reads a fourth register. `faccessat2` is the four-argument one
+/// that added the flags. Both were dispatched here as if they were
+/// `faccessat2`, so a plain `access()` -- which musl issues as a
+/// three-argument `faccessat`, leaving the fourth register holding whatever
+/// its syscall stub last had in it -- handed us that as `AT_` flags. Two of
+/// the bits `AtFlags` keeps change the answer: `AT_SYMLINK_NOFOLLOW` applies
+/// the check to a symlink instead of to its target, and `AT_EACCESS` swaps the
+/// real uid/gid for the effective ones. Intermittently, differing per call
+/// site, on a syscall every shell and every dynamic loader makes constantly.
+fn faccessat_flags(takes_flags: bool, a3: usize) -> usize {
+    if takes_flags {
+        a3
+    } else {
+        0
+    }
+}
+
+/// Which of the `faccessat` family carries a fourth argument. The dispatch
+/// asks this rather than deciding per arm, so the answer is one place and a
+/// test can read it.
+fn faccessat_takes_flags(sys: &Sys) -> bool {
+    matches!(sys, Sys::FACCESSAT2)
+}
+
 /// [einval-hunt] One budgeted `error!` line naming a syscall that returned
 /// `EINVAL`, for the syscall families on the X11/GLX fd-passing path. See the
 /// call site in [`Syscall::syscall`]: glxgears against the finally-alive
@@ -968,5 +1021,113 @@ fn einval_hunt(pid: KoID, num: u32, args: &[usize; 6]) {
             args[2],
             args[3]
         );
+    }
+}
+
+#[cfg(test)]
+mod syscall_answer_tests {
+    use super::*;
+
+    /// Linux's ABI: a return in `[-4095, -1]` is an error, anything else is a
+    /// value. This is the predicate every libc's syscall stub applies.
+    fn reads_as_error(ret: isize) -> bool {
+        (-4095..0).contains(&ret)
+    }
+
+    #[test]
+    fn an_unknown_syscall_number_is_an_error_not_a_value() {
+        // The number 9999 is in no table on any architecture.
+        let ret = unknown_syscall_number(9999);
+        assert!(
+            reads_as_error(ret),
+            "an unknown syscall answered {}, which userspace reads as success",
+            ret
+        );
+        assert_eq!(ret, -(LxError::ENOSYS as isize));
+    }
+
+    #[test]
+    fn every_syscall_number_linux_has_added_since_this_table_answers_enosys() {
+        // What this table does not list is exactly what a modern libc probes
+        // for at runtime: it issues the call and decides from -ENOSYS whether
+        // the kernel has it. Answering +22 told it yes.
+        for num in [
+            440u32, // process_madvise
+            441,    // epoll_pwait2
+            443,    // quotactl_fd
+            447,    // memfd_secret
+            449,    // futex_waitv
+            451,    // cachestat
+            452,    // fchmodat2
+            457,    // statmount
+            1_000_000,
+            u32::MAX,
+        ] {
+            assert!(
+                Sys::try_from(num).is_err(),
+                "{} is in the table; pick another for this test",
+                num
+            );
+            let ret = unknown_syscall_number(num);
+            assert!(reads_as_error(ret), "syscall {} answered {}", num, ret);
+            assert_eq!(ret, -(LxError::ENOSYS as isize), "syscall {}", num);
+        }
+    }
+
+    #[test]
+    fn a_number_that_is_in_the_table_still_decodes() {
+        // The guard against "answer ENOSYS to everything".
+        assert_eq!(Sys::try_from(0), Ok(Sys::READ));
+        assert_eq!(Sys::try_from(1), Ok(Sys::WRITE));
+        assert!(Sys::try_from(435).is_ok(), "clone3 is in the table");
+    }
+
+    #[test]
+    fn a_failed_syscall_is_the_negated_errno() {
+        for err in [
+            LxError::EPERM,
+            LxError::ENOENT,
+            LxError::EINTR,
+            LxError::EAGAIN,
+            LxError::ENOSYS,
+            LxError::ENOSPC,
+            LxError::ETIMEDOUT,
+            LxError::EINPROGRESS,
+        ] {
+            let ret = syscall_ret(Err(err));
+            assert_eq!(ret, -(err as isize), "{:?}", err);
+            assert!(reads_as_error(ret), "{:?} answered {}", err, ret);
+        }
+    }
+
+    #[test]
+    fn a_successful_syscall_keeps_its_value() {
+        assert_eq!(syscall_ret(Ok(0)), 0);
+        assert_eq!(syscall_ret(Ok(4096)), 4096);
+        // An address from mmap is a plain value, however large: user addresses
+        // stay well below the range Linux reserves for errors.
+        assert_eq!(syscall_ret(Ok(0x7fff_ffff_f000)), 0x7fff_ffff_f000);
+        assert!(!reads_as_error(syscall_ret(Ok(0x7fff_ffff_f000))));
+    }
+
+    #[test]
+    fn faccessat_is_given_no_flags_and_faccessat2_is_given_the_register() {
+        // AT_SYMLINK_NOFOLLOW is 0x100 and AT_EACCESS is 0x200: the two bits
+        // in a garbage register that change what access() answers.
+        for garbage in [0x100usize, 0x200, 0x300, 0xdead_beef, usize::MAX] {
+            assert_eq!(
+                faccessat_flags(false, garbage),
+                0,
+                "faccessat has three arguments; the fourth register is not its own"
+            );
+            assert_eq!(faccessat_flags(true, garbage), garbage);
+        }
+        assert_eq!(faccessat_flags(true, 0), 0);
+    }
+
+    #[test]
+    fn only_faccessat2_of_the_family_has_a_fourth_argument() {
+        assert!(!faccessat_takes_flags(&Sys::FACCESSAT));
+        assert!(faccessat_takes_flags(&Sys::FACCESSAT2));
     }
 }
