@@ -865,7 +865,19 @@ mod tests {
         let _g = SERIAL.lock();
         // SERIAL keeps the other flag-touching test out, but the slot this
         // thread marks is whichever `cpu_id()` names right now, so assert on
-        // the delta rather than on an absolute count of one.
+        // the delta rather than on an absolute count of one. And under libos
+        // that id is the host thread id truncated to a byte, so whether it
+        // names a slot at all depends on how many threads the harness has
+        // started before this one -- that is, on how many tests the crate
+        // happens to have. Guarded the same way as `tick_context_records_*`,
+        // which this one was missing.
+        let Some(_slot) = current_slot() else {
+            // Out-of-range ids are checked, not indexed: nothing to observe.
+            let before = cpus_idle_now();
+            set_cpu_idle(true);
+            assert_eq!(cpus_idle_now(), before);
+            return;
+        };
         set_cpu_idle(false);
         let base = cpus_idle_now();
         set_cpu_idle(true);
