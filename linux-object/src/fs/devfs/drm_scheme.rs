@@ -4235,6 +4235,7 @@ mod present_failure_policy_tests {
     /// at the bus.
     #[test]
     fn an_unknown_fb_id_still_fails_the_ioctl_but_as_enoent() {
+        let _serialised = drm::test_globals::lock();
         assert_eq!(
             present_failed("SETCRTC", 7, 1, drm::PresentError::NoSuchFb),
             Err(FsError::EntryNotFound),
@@ -4252,6 +4253,7 @@ mod present_failure_policy_tests {
     /// chance — instead of the output being written off for good.
     #[test]
     fn a_frame_that_could_not_be_copied_does_not_fail_the_modeset() {
+        let _serialised = drm::test_globals::lock();
         for reason in [drm::PresentError::NoDisplay, drm::PresentError::NoBacking] {
             drm::set_crtc_fb(1, 0);
             assert_eq!(
@@ -4277,6 +4279,7 @@ mod present_failure_policy_tests {
     /// the failure it reports is a steady state, not a one-off.
     #[test]
     fn the_console_trace_is_bounded_however_long_the_storm_runs() {
+        let _serialised = drm::test_globals::lock();
         PRESENT_FAIL_TRACED.store(0, Ordering::Relaxed);
         for _ in 0..10_000 {
             let _ = present_failed("SETCRTC", 7, 1, drm::PresentError::NoDisplay);
