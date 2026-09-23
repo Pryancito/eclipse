@@ -2,6 +2,7 @@
 use core::cell::UnsafeCell;
 
 pub(crate) mod page_table;
+pub(crate) mod pte;
 
 #[cfg(test)]
 pub(crate) mod test_frames;

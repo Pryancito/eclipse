@@ -1,5 +1,4 @@
 //! Kernel configuration.
-use crate::PAGE_SIZE;
 
 /// Kernel configuration passed by kernel when calls [`crate::primary_init_early()`].
 #[repr(C)]
@@ -25,7 +24,8 @@ pub const VIRTIO_BASE: usize = 0x0a00_0000;
 pub const VIRTIO_SIZE: usize = 0x100;
 pub const PA_1TB_BITS: usize = 40;
 pub const PHYS_ADDR_MAX: usize = (1 << PA_1TB_BITS) - 1;
-pub const PHYS_ADDR_MASK: usize = PHYS_ADDR_MAX & !(PAGE_SIZE - 1);
+// One definition, in the module that needs it on every target.
+pub use crate::utils::pte::aarch64::PHYS_ADDR_MASK;
 // rayboot does not pass a firmware memory map yet. Both supported targets have
 // at least 512 MiB available from PHYS_MEMORY_BASE, which is also enough for
 // current Fuchsia's substantially larger core-tests bootfs.
