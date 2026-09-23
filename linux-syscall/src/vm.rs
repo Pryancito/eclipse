@@ -1,8 +1,12 @@
 use super::*;
 use alloc::vec::Vec;
 use bitflags::bitflags;
+use linux_object::error::LxResult;
 use linux_object::loader::heap_base;
-use zircon_object::vm::{pages, roundup_pages, MMUFlags, VmObject, PAGE_SIZE};
+use zircon_object::vm::{
+    pages, round_down_pages, roundup_pages, MMUFlags, VmAddressRegion, VmObject, PAGE_SIZE,
+    USER_ASPACE_BASE, USER_ASPACE_SIZE,
+};
 
 /// Per-call cap for a single `mmap` / `brk` growth. It bounds how much a single
 /// syscall can commit at once (physical frames + per-page VMO metadata).
@@ -503,15 +507,13 @@ impl Syscall<'_> {
         // `/oscomp/brk` case does exactly that, because it prints and
         // round-trips the break through a 32-bit int and the heap base is a
         // round power of two whose low 32 bits are zero.
-        if new_brk < heap_base(&vmar) {
+        let Some(new_brk_aligned) = brk_target(new_brk, heap_base(&vmar)) else {
             info!(
-                "brk: {:#x} is below the heap base, keeping {:#x}",
+                "brk: {:#x} is not a break this address space can take, keeping {:#x}",
                 new_brk, current_brk
             );
             return Ok(current_brk);
-        }
-
-        let new_brk_aligned = roundup_pages(new_brk);
+        };
 
         if new_brk_aligned < current_brk {
             // Shrink: just move the user-visible break. The reserved pages
@@ -623,10 +625,14 @@ impl Syscall<'_> {
             addr, len, prot
         );
         // Linux UAPI: addr must be page-aligned; len is rounded up to pages.
-        if !addr.is_multiple_of(PAGE_SIZE) {
-            return Err(LxError::EINVAL);
-        }
-        let len = roundup_pages(len);
+        let Some(len) = mprotect_args(addr, len)? else {
+            // `if (!len) return 0;` (mm/mprotect.c), before Linux has looked at
+            // a single VMA. Falling through instead reached
+            // `VmAddressRegion::protect`, which refuses a zero length, so an
+            // empty `mprotect` logged an INCOMPLETE-transition error -- and
+            // under W^X enforcement answered `EINVAL`.
+            return Ok(0);
+        };
         // hunter W^X: reject (or audit) transitions to writable+executable,
         // including the two-step mmap(W)-then-mprotect(X) bypass (it tracks the
         // ever-writable history of this exact range).
@@ -713,10 +719,7 @@ impl Syscall<'_> {
         let _aspace = self.linux_process().aspace_lock().lock();
         info!("munmap: addr={:#x}, size={:#x}", addr, len);
         // Linux UAPI: addr must be page-aligned; len is rounded up to pages.
-        if !addr.is_multiple_of(PAGE_SIZE) || len == 0 {
-            return Err(LxError::EINVAL);
-        }
-        let len = roundup_pages(len);
+        let len = munmap_args(addr, len)?;
         let proc = self.thread.proc();
         // hunter P3: the range is gone, so drop its W^X writable-history.
         hunter::check_munmap(proc.id(), addr, len);
@@ -772,11 +775,7 @@ impl Syscall<'_> {
         }
         // Linux: old_addr must be page-aligned; lengths round up to pages. A
         // zero old_len (the MAP_SHARED duplication trick) is not supported.
-        if !old_addr.is_multiple_of(PAGE_SIZE) || old_len == 0 || new_len == 0 {
-            return Err(LxError::EINVAL);
-        }
-        let old_len = roundup_pages(old_len);
-        let new_len = roundup_pages(new_len);
+        let (old_len, new_len) = mremap_args(old_addr, old_len, new_len)?;
         if new_len > MAX_MMAP_LEN {
             return Err(LxError::ENOMEM);
         }
@@ -831,29 +830,20 @@ impl Syscall<'_> {
     /// guarantee — succeeding here is honest, and it un-breaks software that
     /// treats an `msync` failure as fatal (sqlite, mandb).
     pub fn sys_msync(&self, addr: usize, len: usize, flags: usize) -> SysResult {
-        const MS_ASYNC: usize = 1;
-        const MS_INVALIDATE: usize = 2;
-        const MS_SYNC: usize = 4;
         info!(
             "msync: addr={:#x}, len={:#x}, flags={:#x}",
             addr, len, flags
         );
-        if flags & !(MS_ASYNC | MS_INVALIDATE | MS_SYNC) != 0
-            || (flags & MS_SYNC != 0 && flags & MS_ASYNC != 0)
-            || !addr.is_multiple_of(PAGE_SIZE)
-        {
-            return Err(LxError::EINVAL);
-        }
-        let vmar = self.zircon_process().vmar();
-        let mut page = addr;
-        let end = addr + roundup_pages(len);
-        while page < end {
-            if vmar.find_mapping(page).is_none() {
-                return Err(LxError::ENOMEM);
-            }
-            page += PAGE_SIZE;
-        }
-        Ok(0)
+        let Some(len) = msync_args(addr, len, flags)? else {
+            return Ok(0);
+        };
+        // `msync_args` proved this sum fits. It used to be
+        // `addr + roundup_pages(len)`: for a `len` in the last page of the
+        // address space the round-up wrapped to zero and the walk below ran
+        // zero times, so `msync(p, -1, MS_SYNC)` reported success over a range
+        // it never looked at; for a `len` just below that the sum itself
+        // wrapped, to an `end` under `addr`, with the same result.
+        walk_mapped(&self.zircon_process().vmar(), addr, addr + len)
     }
 
     /// Determine whether pages are resident in memory
@@ -866,18 +856,8 @@ impl Syscall<'_> {
     /// which some allocators use to probe address-space layout.
     pub fn sys_mincore(&self, addr: usize, len: usize, mut vec: UserOutPtr<u8>) -> SysResult {
         info!("mincore: addr={:#x}, len={:#x}", addr, len);
-        if !addr.is_multiple_of(PAGE_SIZE) {
-            return Err(LxError::EINVAL);
-        }
-        let pages_count = pages(len);
-        let vmar = self.zircon_process().vmar();
-        let mut residency = Vec::with_capacity(pages_count);
-        for i in 0..pages_count {
-            let page = addr + i * PAGE_SIZE;
-            let mapping = vmar.find_mapping(page).ok_or(LxError::ENOMEM)?;
-            let resident = mapping.query_vaddr(page).is_ok();
-            residency.push(resident as u8);
-        }
+        let pages_count = mincore_args(addr, len)?;
+        let residency = mincore_residency(&self.zircon_process().vmar(), addr, pages_count)?;
         vec.write_array(&residency)?;
         Ok(0)
     }
@@ -886,22 +866,12 @@ impl Syscall<'_> {
     /// as mlock(2) specifies) must belong to a mapping, else `ENOMEM` — the
     /// address-range validation `mlock`/`munlock` owe their callers.
     fn check_locked_range(&self, addr: usize, len: usize) -> SysResult {
-        let start = addr / PAGE_SIZE * PAGE_SIZE;
-        // A hostile `len` can wrap the end computation; a wrapped range cannot
-        // be fully mapped, so ENOMEM is the right answer for it too. The walk
-        // itself is bounded: it stops at the first hole, so it never scans
+        // The walk is bounded: it stops at the first hole, so it never scans
         // beyond the actually-mapped span plus one page.
-        let end = addr
-            .checked_add(len)
-            .map(roundup_pages)
-            .ok_or(LxError::ENOMEM)?;
-        let vmar = self.zircon_process().vmar();
-        let mut page = start;
-        while page < end {
-            vmar.find_mapping(page).ok_or(LxError::ENOMEM)?;
-            page += PAGE_SIZE;
-        }
-        Ok(0)
+        let Some((start, end)) = mlock_args(addr, len)? else {
+            return Ok(0);
+        };
+        walk_mapped(&self.zircon_process().vmar(), start, end)
     }
 
     /// Lock part of the calling process's memory into RAM (see mlock(2) and
@@ -914,9 +884,6 @@ impl Syscall<'_> {
     /// that secrets never hit backing store.
     pub fn sys_mlock(&self, addr: usize, len: usize) -> SysResult {
         info!("mlock: addr={:#x}, len={:#x}", addr, len);
-        if len == 0 {
-            return Ok(0);
-        }
         self.check_locked_range(addr, len)
     }
 
@@ -938,9 +905,6 @@ impl Syscall<'_> {
     /// `sys_mlock`.
     pub fn sys_munlock(&self, addr: usize, len: usize) -> SysResult {
         info!("munlock: addr={:#x}, len={:#x}", addr, len);
-        if len == 0 {
-            return Ok(0);
-        }
         self.check_locked_range(addr, len)
     }
 
@@ -971,12 +935,9 @@ impl Syscall<'_> {
             "madvise: addr={:#x}, len={:#x}, advice={}",
             addr, len, advice
         );
-        if !madvise_advice_known(advice) {
-            return Err(LxError::EINVAL);
-        }
-        if !addr.is_multiple_of(PAGE_SIZE) {
-            return Err(LxError::EINVAL);
-        }
+        let Some(len) = madvise_args(addr, len, advice)? else {
+            return Ok(0);
+        };
         // MADV_DONTNEED (4) / MADV_FREE (8) must actually DISCARD the pages:
         // Linux guarantees the range reads back as zero on next access. Memory
         // allocators rely on this — they decommit a region with MADV_DONTNEED
@@ -994,7 +955,7 @@ impl Syscall<'_> {
         // entry" abort during `apk update`.
         const MADV_DONTNEED: usize = 4;
         const MADV_FREE: usize = 8;
-        if (advice == MADV_DONTNEED || advice == MADV_FREE) && len != 0 {
+        if advice == MADV_DONTNEED || advice == MADV_FREE {
             // Zero the committed pages in the range THROUGH THE VMO so they read
             // back as zero on next access — including pages whose PTE was dropped
             // or turned PROT_NONE, which a page-table walk cannot see (that gap
@@ -1003,7 +964,7 @@ impl Syscall<'_> {
             // turned the abort into a SIGSEGV).
             let proc = self.zircon_process();
             let vmar = proc.vmar();
-            vmar.madv_dontneed(addr, roundup_pages(len));
+            vmar.madv_dontneed(addr, len);
         }
         Ok(0)
     }
@@ -1087,6 +1048,264 @@ const KNOWN_MADVISE: &[usize] = &[
 /// classification is unit-testable independently of the syscall plumbing.
 fn madvise_advice_known(advice: usize) -> bool {
     KNOWN_MADVISE.contains(&advice)
+}
+
+/// The first address no user mapping can reach.
+///
+/// Linux calls it `TASK_SIZE`, and every memory syscall bounds `addr + len`
+/// against it before it looks at a single mapping -- `access_ok(start, len)` in
+/// `mm/mincore.c`, `len > TASK_SIZE - start` in `mm/mmap.c`. Here it is the
+/// span of the root user VMAR, which `VmAddressRegion::new_root` builds from
+/// exactly these two constants, so a range that ends past it cannot name a
+/// mapping however far it is walked.
+const USER_ASPACE_END: usize = (USER_ASPACE_BASE + USER_ASPACE_SIZE) as usize;
+
+/// What the `(addr, len)` pair a memory syscall was handed actually asks about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UserRange {
+    /// `len` is zero: the call names no page at all.
+    Empty,
+    /// `[addr, addr + len)`, with `len` rounded up to whole pages, non-zero,
+    /// and wholly inside the user address space.
+    Pages(usize),
+    /// The range runs off the end of the user address space.
+    Beyond,
+}
+
+/// Resolve the raw `(addr, len)` of a memory syscall into the range it names.
+///
+/// Every one of them takes that pair straight from userspace and has to answer
+/// the same three questions before it touches a mapping. The only thing that
+/// differs between them is the errno each puts on the two bad answers -- that
+/// difference is real and comes from the man pages, so it stays with the
+/// callers and the rule lives here.
+///
+/// Two traps, and both were open on every caller:
+///
+/// * **The round-up wraps.** [`roundup_pages`] is `ceil`, and `ceil` rounds
+///   with `wrapping_add` on purpose, so every `len` from `usize::MAX - 4094` to
+///   `usize::MAX` comes back as **zero** -- 4095 lengths that each name most of
+///   the address space and each arrived looking like an empty range. Linux
+///   rounds and then asks the same question out loud: `if (len_in && !len)
+///   return -EINVAL;` (`mm/madvise.c`).
+/// * **The sum overflows.** For a `len` near `usize::MAX - 4095` the round-up
+///   does *not* wrap -- it is `2^64 - 4096` -- and `addr + len` does. The kernel
+///   is built without `overflow-checks`, so that sum wraps to an end below
+///   `addr` and the page walk behind it runs zero times; a test build panics on
+///   the same line instead.
+///
+/// Both land in the same place: a call that names most of the address space
+/// looks like one that names nothing, and the syscall reports success over a
+/// range it never looked at.
+fn user_range(addr: usize, len: usize) -> UserRange {
+    if len == 0 {
+        return UserRange::Empty;
+    }
+    let rounded = roundup_pages(len);
+    if rounded == 0 {
+        return UserRange::Beyond;
+    }
+    match addr.checked_add(rounded) {
+        Some(end) if end <= USER_ASPACE_END => UserRange::Pages(rounded),
+        _ => UserRange::Beyond,
+    }
+}
+
+/// What `munmap(2)` answers for its `(addr, len)` before it touches a mapping
+/// (`do_vmi_munmap`, `mm/mmap.c`): a misaligned address, an empty range and a
+/// range past the end of the address space are all `EINVAL`.
+fn munmap_args(addr: usize, len: usize) -> LxResult<usize> {
+    if !addr.is_multiple_of(PAGE_SIZE) {
+        return Err(LxError::EINVAL);
+    }
+    match user_range(addr, len) {
+        UserRange::Pages(len) => Ok(len),
+        UserRange::Empty | UserRange::Beyond => Err(LxError::EINVAL),
+    }
+}
+
+/// What `mprotect(2)` answers (`mm/mprotect.c`): `EINVAL` for a misaligned
+/// address, plain success for an empty range, `ENOMEM` for one past the end.
+///
+/// `Ok(None)` is the empty range, and it is not cosmetic:
+/// `VmAddressRegion::protect` refuses a zero length with `INVALID_ARGS`, so
+/// `mprotect(p, 0, prot)` -- which Linux answers with 0 before looking at a
+/// single VMA -- reached the failure arm of the caller.
+fn mprotect_args(addr: usize, len: usize) -> LxResult<Option<usize>> {
+    if !addr.is_multiple_of(PAGE_SIZE) {
+        return Err(LxError::EINVAL);
+    }
+    match user_range(addr, len) {
+        UserRange::Empty => Ok(None),
+        UserRange::Pages(len) => Ok(Some(len)),
+        UserRange::Beyond => Err(LxError::ENOMEM),
+    }
+}
+
+/// `msync(2)` flags (`mm/msync.c`).
+const MS_ASYNC: usize = 1;
+/// See [`MS_ASYNC`].
+const MS_INVALIDATE: usize = 2;
+/// See [`MS_ASYNC`].
+const MS_SYNC: usize = 4;
+
+/// What `msync(2)` answers for `(addr, len, flags)` before it walks a single
+/// mapping (`mm/msync.c`): unknown flags, `MS_SYNC` and `MS_ASYNC` together and
+/// a misaligned address are `EINVAL`; an empty range is success (`if (end ==
+/// start) goto out;`, reached with `error = 0`); a range past the end of the
+/// address space is `ENOMEM`.
+fn msync_args(addr: usize, len: usize, flags: usize) -> LxResult<Option<usize>> {
+    if flags & !(MS_ASYNC | MS_INVALIDATE | MS_SYNC) != 0
+        || (flags & MS_SYNC != 0 && flags & MS_ASYNC != 0)
+        || !addr.is_multiple_of(PAGE_SIZE)
+    {
+        return Err(LxError::EINVAL);
+    }
+    match user_range(addr, len) {
+        UserRange::Empty => Ok(None),
+        UserRange::Pages(len) => Ok(Some(len)),
+        UserRange::Beyond => Err(LxError::ENOMEM),
+    }
+}
+
+/// How many pages `mincore(2)` was asked about (`mm/mincore.c`): `EINVAL` for a
+/// misaligned address, `ENOMEM` for a range `access_ok` would refuse.
+///
+/// The upper bound is what keeps the caller's reservation honest. `len` is a
+/// raw machine word and the byte vector was sized from it, so
+/// `mincore(p, 1 << 63, v)` asked the fixed kernel heap for 2 PiB -- an
+/// infallible allocation, and therefore a panic of the whole machine from an
+/// unprivileged process.
+fn mincore_args(addr: usize, len: usize) -> LxResult<usize> {
+    if !addr.is_multiple_of(PAGE_SIZE) {
+        return Err(LxError::EINVAL);
+    }
+    match user_range(addr, len) {
+        UserRange::Empty => Ok(0),
+        UserRange::Pages(len) => Ok(len / PAGE_SIZE),
+        UserRange::Beyond => Err(LxError::ENOMEM),
+    }
+}
+
+/// What `madvise(2)` answers for `(addr, len, advice)` (`mm/madvise.c`):
+/// unrecognised advice and a misaligned address are `EINVAL`, and so is a
+/// length whose round-up wrapped -- Linux spells that one out on its own line,
+/// `if (len_in && !len) return -EINVAL;`. An empty range succeeds.
+fn madvise_args(addr: usize, len: usize, advice: usize) -> LxResult<Option<usize>> {
+    if !madvise_advice_known(advice) || !addr.is_multiple_of(PAGE_SIZE) {
+        return Err(LxError::EINVAL);
+    }
+    match user_range(addr, len) {
+        UserRange::Empty => Ok(None),
+        UserRange::Pages(len) => Ok(Some(len)),
+        UserRange::Beyond => Err(LxError::EINVAL),
+    }
+}
+
+/// The page range `mlock(2)` and `munlock(2)` validate, as `[start, end)`, or
+/// `None` when there is nothing to validate.
+///
+/// These two round the address DOWN and stretch the length to cover the rest of
+/// its page (`len = PAGE_ALIGN(len + offset_in_page(start)); start &=
+/// PAGE_MASK;`, `mm/mlock.c`), so what has to stay inside the address space is
+/// the SUM, not the length: with an unaligned `addr` the range is a page longer
+/// than `roundup_pages(len)`.
+///
+/// Rounding the sum was already the shape here, but in the other order --
+/// `addr.checked_add(len).map(roundup_pages)` -- which caught the addition and
+/// then let the round-up wrap to zero. An `end` of zero is below every `start`,
+/// so the walk ran zero times and `mlock` reported the whole address space
+/// locked.
+fn mlock_args(addr: usize, len: usize) -> LxResult<Option<(usize, usize)>> {
+    if len == 0 {
+        return Ok(None);
+    }
+    let start = round_down_pages(addr);
+    let span = (addr - start).checked_add(len).ok_or(LxError::ENOMEM)?;
+    match user_range(start, span) {
+        UserRange::Empty => Ok(None),
+        UserRange::Pages(span) => Ok(Some((start, start + span))),
+        UserRange::Beyond => Err(LxError::ENOMEM),
+    }
+}
+
+/// The two lengths `mremap(2)` works with (`mm/mremap.c`). `old_addr` must be
+/// page-aligned, and neither length may be empty or run off the end of the
+/// address space. A zero `old_len` is the `MAP_SHARED` duplication trick, which
+/// this kernel does not support.
+fn mremap_args(old_addr: usize, old_len: usize, new_len: usize) -> LxResult<(usize, usize)> {
+    let old_len = match user_range(old_addr, old_len) {
+        UserRange::Pages(len) => len,
+        UserRange::Empty | UserRange::Beyond => return Err(LxError::EINVAL),
+    };
+    if !old_addr.is_multiple_of(PAGE_SIZE) {
+        return Err(LxError::EINVAL);
+    }
+    // The new length is not anchored anywhere yet -- `may_move` can place it
+    // where it likes -- so it is bounded against the address space as a whole.
+    let new_len = match user_range(0, new_len) {
+        UserRange::Pages(len) => len,
+        UserRange::Empty | UserRange::Beyond => return Err(LxError::EINVAL),
+    };
+    Ok((old_len, new_len))
+}
+
+/// Where `brk(2)` should move the program break, or `None` to leave it where it
+/// is -- which is Linux's answer to a break it cannot satisfy (`if (brk <
+/// mm->start_brk) goto out;` returns the old one).
+///
+/// The upper bound is the one that was missing. `roundup_pages` wraps (see
+/// [`user_range`]), so a `new_brk` in the last page of the address space came
+/// back as **zero**; zero is below the current break, so the shrink branch took
+/// it and moved the program's heap end to address 0, inside its own image.
+/// `brk(-1)` is one line of C.
+fn brk_target(new_brk: usize, heap_base: usize) -> Option<usize> {
+    if new_brk < heap_base || new_brk > USER_ASPACE_END {
+        return None;
+    }
+    Some(roundup_pages(new_brk))
+}
+
+/// Every page of `[start, end)` must belong to a mapping, else `ENOMEM`.
+///
+/// This is the address-range validation `msync(2)` and `mlock(2)`/`munlock(2)`
+/// owe their callers, and it was written out twice -- once each -- for a check
+/// neither of them varies. The walk stops at the first hole, so it never scans
+/// beyond the mapped span plus one page.
+fn walk_mapped(vmar: &Arc<VmAddressRegion>, start: usize, end: usize) -> SysResult {
+    let mut page = start;
+    while page < end {
+        if vmar.find_mapping(page).is_none() {
+            return Err(LxError::ENOMEM);
+        }
+        page += PAGE_SIZE;
+    }
+    Ok(0)
+}
+
+/// One byte per page of `[addr, addr + pages * PAGE_SIZE)` for `mincore(2)`,
+/// bit 0 set when the page is resident, `ENOMEM` at the first page that is not
+/// mapped.
+///
+/// Resident means "has a page-table entry": a demand-paged page nobody has
+/// touched yet reports non-resident, which is exactly the distinction
+/// `mincore` draws, and the one allocators use to probe address-space layout.
+///
+/// `addr + i * PAGE_SIZE` is safe here only because the caller bounded the
+/// range first (see [`mincore_args`]); so is the reservation, which Linux
+/// keeps to a single page of kernel buffer (`__get_free_page`, mm/mincore.c)
+/// rather than one byte per page of a range userspace chose. Sizing it from
+/// `len` made it a function of a raw machine word: `mincore(p, 1 << 63, v)`
+/// asked the fixed kernel heap for 2 PiB, and that allocation cannot fail,
+/// only abort the machine.
+fn mincore_residency(vmar: &Arc<VmAddressRegion>, addr: usize, pages: usize) -> LxResult<Vec<u8>> {
+    let mut residency = Vec::with_capacity(pages.min(PAGE_SIZE));
+    for i in 0..pages {
+        let page = addr + i * PAGE_SIZE;
+        let mapping = vmar.find_mapping(page).ok_or(LxError::ENOMEM)?;
+        residency.push(mapping.query_vaddr(page).is_ok() as u8);
+    }
+    Ok(residency)
 }
 
 #[cfg(test)]
@@ -1401,5 +1620,404 @@ mod mlockall_flag_tests {
                 "{flags:#x}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod user_range_tests {
+    //! `(addr, len)` is the pair every memory syscall takes straight from
+    //! userspace, and `roundup_pages` -- the first thing each of them did with
+    //! it -- rounds with a wrapping add. So the lengths that name almost the
+    //! whole address space are precisely the ones that arrived looking like an
+    //! empty range, and an empty range is what every one of these calls answers
+    //! with success.
+
+    use super::{roundup_pages, user_range, UserRange, USER_ASPACE_END};
+
+    const PAGE: usize = 4096;
+
+    #[test]
+    fn a_length_of_zero_names_no_page() {
+        assert_eq!(user_range(0x1000, 0), UserRange::Empty);
+        assert_eq!(user_range(0, 0), UserRange::Empty);
+        assert_eq!(user_range(USER_ASPACE_END, 0), UserRange::Empty);
+    }
+
+    #[test]
+    fn a_length_rounds_up_to_whole_pages() {
+        assert_eq!(user_range(0x1000, 1), UserRange::Pages(PAGE));
+        assert_eq!(user_range(0x1000, PAGE), UserRange::Pages(PAGE));
+        assert_eq!(user_range(0x1000, PAGE + 1), UserRange::Pages(2 * PAGE));
+    }
+
+    #[test]
+    fn every_length_whose_round_up_wraps_is_out_of_range_and_not_empty() {
+        // `ceil` is `x.wrapping_add(align - 1) / align`, so the last page's
+        // worth of lengths -- 4095 of them -- all round to zero. Each one names
+        // essentially the whole address space, and each one used to walk zero
+        // pages and report success.
+        for len in (usize::MAX - 4094)..=usize::MAX {
+            assert_eq!(roundup_pages(len), 0, "roundup_pages({:#x})", len);
+            assert_eq!(
+                user_range(0x1000, len),
+                UserRange::Beyond,
+                "len = {:#x}",
+                len
+            );
+        }
+    }
+
+    #[test]
+    fn the_largest_length_that_rounds_up_cleanly_still_runs_off_the_end() {
+        // One below the wrapping set, the round-up is exact -- 2^64 - 4096 --
+        // and it is the addition that goes over. A release kernel wraps it to
+        // an end below `addr`; a test build panics on the same line.
+        let len = usize::MAX - 4095;
+        assert_eq!(roundup_pages(len), len);
+        assert_eq!(0x1000usize.checked_add(len), None);
+        assert_eq!(user_range(0x1000, len), UserRange::Beyond);
+    }
+
+    #[test]
+    fn a_range_that_ends_exactly_at_the_top_of_the_address_space_is_taken() {
+        assert_eq!(
+            user_range(USER_ASPACE_END - PAGE, PAGE),
+            UserRange::Pages(PAGE)
+        );
+    }
+
+    #[test]
+    fn a_range_that_ends_one_byte_past_the_top_is_not() {
+        assert_eq!(
+            user_range(USER_ASPACE_END - PAGE, PAGE + 1),
+            UserRange::Beyond
+        );
+        assert_eq!(user_range(USER_ASPACE_END, PAGE), UserRange::Beyond);
+    }
+
+    #[test]
+    fn a_length_the_round_up_survives_can_still_be_absurd() {
+        // 2^63 rounds cleanly and adds cleanly; what refuses it is the address
+        // space. `mincore` sized a `Vec` from exactly this: 2^51 pages, from an
+        // allocation that cannot fail, only abort.
+        assert_eq!(roundup_pages(1 << 63), 1 << 63);
+        assert!(0x1000usize.checked_add(1 << 63).is_some());
+        assert_eq!(user_range(0x1000, 1 << 63), UserRange::Beyond);
+    }
+}
+
+#[cfg(test)]
+mod mm_range_tests {
+    //! The same hostile `(addr, len)` asked of every memory syscall that takes
+    //! one. The errnos differ between them -- that is the man pages, not an
+    //! accident -- but "success over a range I never looked at" is not among
+    //! them anywhere.
+
+    use super::{
+        brk_target, madvise_args, mincore_args, mlock_args, mprotect_args, mremap_args, msync_args,
+        munmap_args, roundup_pages, USER_ASPACE_END,
+    };
+    use alloc::vec::Vec;
+    use linux_object::error::LxError;
+
+    const PAGE: usize = 4096;
+    const MS_ASYNC: usize = 1;
+    const MS_INVALIDATE: usize = 2;
+    const MS_SYNC: usize = 4;
+    const MADV_NORMAL: usize = 0;
+    const MADV_DONTNEED: usize = 4;
+
+    /// The lengths that used to arrive looking like an empty range, plus the
+    /// one whose round-up is clean and whose addition is not, plus one that
+    /// survives both and is still bigger than the address space.
+    const HOSTILE: [usize; 4] = [usize::MAX, usize::MAX - 4094, usize::MAX - 4095, 1 << 63];
+
+    /// Every taker of a `(addr, len)` pair, by name, so a syscall left out of
+    /// the rule shows up as a name rather than as a line number.
+    fn answers(addr: usize, len: usize) -> Vec<(&'static str, Result<(), LxError>)> {
+        vec![
+            ("munmap", munmap_args(addr, len).map(|_| ())),
+            ("mprotect", mprotect_args(addr, len).map(|_| ())),
+            ("msync", msync_args(addr, len, MS_SYNC).map(|_| ())),
+            ("mincore", mincore_args(addr, len).map(|_| ())),
+            (
+                "madvise",
+                madvise_args(addr, len, MADV_DONTNEED).map(|_| ()),
+            ),
+            ("mlock", mlock_args(addr, len).map(|_| ())),
+            ("mremap", mremap_args(addr, len, len).map(|_| ())),
+        ]
+    }
+
+    #[test]
+    fn no_memory_syscall_takes_a_length_that_names_the_whole_address_space() {
+        for len in HOSTILE {
+            for (name, answer) in answers(0x1000, len) {
+                assert!(answer.is_err(), "{} accepted len={:#x}", name, len);
+            }
+        }
+    }
+
+    #[test]
+    fn each_one_refuses_it_the_way_its_own_man_page_does() {
+        let len = usize::MAX;
+        assert_eq!(munmap_args(0x1000, len), Err(LxError::EINVAL));
+        assert_eq!(mprotect_args(0x1000, len), Err(LxError::ENOMEM));
+        assert_eq!(msync_args(0x1000, len, MS_SYNC), Err(LxError::ENOMEM));
+        assert_eq!(mincore_args(0x1000, len), Err(LxError::ENOMEM));
+        assert_eq!(
+            madvise_args(0x1000, len, MADV_DONTNEED),
+            Err(LxError::EINVAL)
+        );
+        assert_eq!(mlock_args(0x1000, len), Err(LxError::ENOMEM));
+        assert_eq!(mremap_args(0x1000, len, PAGE), Err(LxError::EINVAL));
+        assert_eq!(mremap_args(0x1000, PAGE, len), Err(LxError::EINVAL));
+    }
+
+    #[test]
+    fn an_empty_range_is_a_bad_argument_only_to_the_two_that_must_move_something() {
+        assert_eq!(munmap_args(0x1000, 0), Err(LxError::EINVAL));
+        assert_eq!(mremap_args(0x1000, 0, PAGE), Err(LxError::EINVAL));
+        assert_eq!(mremap_args(0x1000, PAGE, 0), Err(LxError::EINVAL));
+        // The rest answer an honest zero. `mprotect` in particular: Linux
+        // returns before it looks at a single VMA, and the VMAR below refuses
+        // a zero-length protect, so this is the difference between 0 and a
+        // logged incomplete transition -- or a hard EINVAL under W^X enforce.
+        assert_eq!(mprotect_args(0x1000, 0), Ok(None));
+        assert_eq!(msync_args(0x1000, 0, MS_SYNC), Ok(None));
+        assert_eq!(mincore_args(0x1000, 0), Ok(0));
+        assert_eq!(madvise_args(0x1000, 0, MADV_DONTNEED), Ok(None));
+        assert_eq!(mlock_args(0x1000, 0), Ok(None));
+    }
+
+    #[test]
+    fn an_unaligned_address_is_einval_everywhere_but_mlock() {
+        for (name, answer) in answers(0x1001, PAGE) {
+            if name == "mlock" {
+                // mlock(2) rounds the address DOWN instead of refusing it.
+                assert!(answer.is_ok(), "mlock refused an unaligned address");
+                continue;
+            }
+            assert_eq!(
+                answer,
+                Err(LxError::EINVAL),
+                "{} on an unaligned address",
+                name
+            );
+        }
+    }
+
+    #[test]
+    fn mlock_rounds_the_address_down_and_stretches_the_length_over_it() {
+        // `mlock(0x1001, PAGE)` covers two pages on Linux, not one:
+        // `len = PAGE_ALIGN(len + offset_in_page(start))`.
+        assert_eq!(mlock_args(0x1001, PAGE), Ok(Some((0x1000, 0x3000))));
+        assert_eq!(mlock_args(0x1000, PAGE), Ok(Some((0x1000, 0x2000))));
+        assert_eq!(mlock_args(0x1fff, 1), Ok(Some((0x1000, 0x2000))));
+    }
+
+    #[test]
+    fn mlock_bounds_the_sum_and_not_only_the_length() {
+        // The old order rounded AFTER the addition -- `checked_add(len).map(
+        // roundup_pages)` -- so a sum of `usize::MAX` gave an end of zero,
+        // which is below every start: the walk that proves the range is mapped
+        // ran zero times and `mlock` reported the whole space locked.
+        let addr = 0x1000;
+        assert_eq!(roundup_pages(addr + (usize::MAX - addr)), 0);
+        assert_eq!(mlock_args(addr, usize::MAX - addr), Err(LxError::ENOMEM));
+    }
+
+    #[test]
+    fn the_last_page_of_the_address_space_is_still_usable() {
+        let top = USER_ASPACE_END - PAGE;
+        assert_eq!(munmap_args(top, PAGE), Ok(PAGE));
+        assert_eq!(mprotect_args(top, PAGE), Ok(Some(PAGE)));
+        assert_eq!(msync_args(top, PAGE, MS_SYNC), Ok(Some(PAGE)));
+        assert_eq!(mincore_args(top, PAGE), Ok(1));
+        assert_eq!(madvise_args(top, PAGE, MADV_DONTNEED), Ok(Some(PAGE)));
+        assert_eq!(mlock_args(top, PAGE), Ok(Some((top, USER_ASPACE_END))));
+        assert_eq!(mremap_args(top, PAGE, PAGE), Ok((PAGE, PAGE)));
+    }
+
+    #[test]
+    fn mincore_counts_pages_and_not_bytes() {
+        assert_eq!(mincore_args(0x1000, 1), Ok(1));
+        assert_eq!(mincore_args(0x1000, PAGE), Ok(1));
+        assert_eq!(mincore_args(0x1000, PAGE + 1), Ok(2));
+    }
+
+    #[test]
+    fn msync_keeps_the_flag_rules_it_already_had() {
+        assert_eq!(msync_args(0x1000, PAGE, 8), Err(LxError::EINVAL));
+        assert_eq!(
+            msync_args(0x1000, PAGE, MS_SYNC | MS_ASYNC),
+            Err(LxError::EINVAL)
+        );
+        assert_eq!(msync_args(0x1000, PAGE, 0), Ok(Some(PAGE)));
+        assert_eq!(msync_args(0x1000, PAGE, MS_INVALIDATE), Ok(Some(PAGE)));
+    }
+
+    #[test]
+    fn madvise_keeps_rejecting_advice_it_does_not_know() {
+        assert_eq!(madvise_args(0x1000, PAGE, 7), Err(LxError::EINVAL));
+        assert_eq!(madvise_args(0x1000, PAGE, MADV_NORMAL), Ok(Some(PAGE)));
+    }
+
+    #[test]
+    fn brk_keeps_the_old_break_for_one_it_cannot_reach() {
+        let heap = 0x40_0000;
+        // The whole of it in one line: `roundup_pages(usize::MAX)` is 0, zero
+        // is below the current break, so the shrink branch took `brk(-1)` and
+        // moved the program's heap end to address 0 -- under its own text.
+        assert_eq!(roundup_pages(usize::MAX), 0);
+        assert_eq!(brk_target(usize::MAX, heap), None);
+        assert_eq!(brk_target(USER_ASPACE_END + 1, heap), None);
+        assert_eq!(brk_target(heap - 1, heap), None);
+    }
+
+    #[test]
+    fn brk_rounds_a_break_it_can_reach_up_to_a_page() {
+        let heap = 0x40_0000;
+        assert_eq!(brk_target(heap, heap), Some(heap));
+        assert_eq!(brk_target(heap + 1, heap), Some(heap + PAGE));
+        assert_eq!(brk_target(USER_ASPACE_END, heap), Some(USER_ASPACE_END));
+    }
+}
+
+#[cfg(test)]
+mod mm_walk_tests {
+    //! `msync`, `mlock`/`munlock` and `mincore` all answer the same question --
+    //! "is every page of this range mapped?" -- and all three walked it
+    //! themselves. A real root VMAR fits in a unit test in this crate, so the
+    //! walk can be asked rather than reasoned about.
+
+    use super::{mincore_residency, mlock_args, walk_mapped, PAGE_SIZE};
+    use alloc::sync::Arc;
+    use linux_object::error::LxError;
+    use zircon_object::vm::{MMUFlags, VmAddressRegion, VmObject};
+
+    /// A root VMAR with `pages` pages mapped at `base`, and nothing after
+    /// them.
+    ///
+    /// Every caller passes a `base` of its own. Under libos a root VMAR is
+    /// backed by the *host* process's address space, so two of these tests
+    /// running at once at the same base fight over the same host mapping --
+    /// and `cargo test` runs them at once while the CI job pins
+    /// `--test-threads=1`, which is the one arrangement where that never
+    /// shows. A base is also well clear of `vm.mmap_min_addr`, which is what a
+    /// low test mapping runs into on a CI runner and not here.
+    fn mapped(base: usize, pages: usize) -> (Arc<VmAddressRegion>, usize) {
+        assert!(base >= 0x100_0000 && base.is_multiple_of(PAGE_SIZE));
+        let vmar = VmAddressRegion::new_root();
+        let addr = vmar.addr() + base;
+        // `map_range: false` is what makes this an anonymous `mmap` and not
+        // something else: `VmAddressRegion::map`/`map_at` pass `true` and
+        // install a PTE for every page up front, so `mincore` over one of
+        // those answers "resident" for pages nobody has ever touched and the
+        // distinction it exists to draw never appears.
+        vmar.map_ext_min(
+            Some(base),
+            VmObject::new_paged(pages),
+            0,
+            pages * PAGE_SIZE,
+            MMUFlags::RXW,
+            MMUFlags::READ | MMUFlags::WRITE | MMUFlags::USER,
+            false,
+            false,
+            false,
+            0,
+        )
+        .unwrap();
+        assert!(
+            vmar.find_mapping(addr + pages * PAGE_SIZE).is_none(),
+            "the page after the mapping is mapped, so the hole tests below \
+             would pass for the wrong reason"
+        );
+        (vmar, addr)
+    }
+
+    #[test]
+    fn a_range_that_is_mapped_end_to_end_is_accepted() {
+        let (vmar, addr) = mapped(0x100_0000, 3);
+        assert_eq!(walk_mapped(&vmar, addr, addr + 3 * PAGE_SIZE), Ok(0));
+    }
+
+    #[test]
+    fn the_walk_stops_at_the_first_page_that_is_not_mapped() {
+        let (vmar, addr) = mapped(0x200_0000, 2);
+        assert_eq!(
+            walk_mapped(&vmar, addr, addr + 3 * PAGE_SIZE),
+            Err(LxError::ENOMEM)
+        );
+        // And a range that starts in the hole, not just one that ends there.
+        assert_eq!(
+            walk_mapped(&vmar, addr + 2 * PAGE_SIZE, addr + 3 * PAGE_SIZE),
+            Err(LxError::ENOMEM)
+        );
+    }
+
+    #[test]
+    fn an_empty_walk_is_vacuously_true() {
+        let (vmar, addr) = mapped(0x300_0000, 1);
+        assert_eq!(walk_mapped(&vmar, addr, addr), Ok(0));
+        // Including one whose end is below its start, which is what the
+        // wrapped `addr + roundup_pages(len)` used to hand it.
+        assert_eq!(walk_mapped(&vmar, addr, 0), Ok(0));
+    }
+
+    #[test]
+    fn mlock_validates_the_page_its_own_rounding_added() {
+        // One page mapped. `mlock(addr + 1, PAGE_SIZE)` names bytes in two
+        // pages, and mlock(2) rounds to cover both -- so the second one, which
+        // is a hole, has to make this ENOMEM. Bounding `roundup_pages(len)`
+        // instead of the sum would have let it through.
+        let (vmar, addr) = mapped(0x400_0000, 1);
+        let (start, end) = mlock_args(addr + 1, PAGE_SIZE).unwrap().unwrap();
+        assert_eq!((start, end), (addr, addr + 2 * PAGE_SIZE));
+        assert_eq!(walk_mapped(&vmar, start, end), Err(LxError::ENOMEM));
+
+        // The same call one byte shorter stays inside the page it started in.
+        let (start, end) = mlock_args(addr + 1, PAGE_SIZE - 1).unwrap().unwrap();
+        assert_eq!((start, end), (addr, addr + PAGE_SIZE));
+        assert_eq!(walk_mapped(&vmar, start, end), Ok(0));
+    }
+
+    #[test]
+    fn mincore_calls_a_touched_page_resident_and_an_untouched_one_not() {
+        // Nothing has been touched yet: the mapping exists, the pages are
+        // demand-paged, and `mincore` draws exactly that distinction -- which
+        // is what allocators use it for.
+        let (vmar, addr) = mapped(0x500_0000, 2);
+        assert_eq!(mincore_residency(&vmar, addr, 2), Ok(vec![0, 0]));
+        vmar.handle_page_fault(addr, MMUFlags::READ).unwrap();
+        assert_eq!(mincore_residency(&vmar, addr, 1), Ok(vec![1]));
+        // Its neighbour reads resident too, and that is not a bug: a fault
+        // here maps the pages around it (`fault_around`), so one touch really
+        // does leave both present, and `mincore` is reporting what the page
+        // tables say. The half that matters is the one above -- a mapping
+        // nobody has touched reads as absent -- because that is the
+        // distinction `mincore` exists to draw and the one allocators probe
+        // for.
+        assert_eq!(mincore_residency(&vmar, addr, 2), Ok(vec![1, 1]));
+    }
+
+    #[test]
+    fn mincore_gives_up_at_the_first_page_that_is_not_mapped() {
+        let (vmar, addr) = mapped(0x700_0000, 2);
+        assert_eq!(mincore_residency(&vmar, addr, 2).map(|v| v.len()), Ok(2));
+        assert_eq!(mincore_residency(&vmar, addr, 3), Err(LxError::ENOMEM));
+    }
+
+    #[test]
+    fn mincore_says_enomem_at_the_first_hole_instead_of_reserving_for_the_rest() {
+        // The page count here is what `mincore(0, TASK_SIZE, v)` produces after
+        // the range check: 2^35 pages. Reserving one byte per page for it asks
+        // the kernel heap for 32 GiB, from an allocation that cannot fail --
+        // only abort the machine. The walk gives up on the first page.
+        let (vmar, addr) = mapped(0x600_0000, 1);
+        assert_eq!(
+            mincore_residency(&vmar, addr, 1 << 35),
+            Err(LxError::ENOMEM)
+        );
     }
 }

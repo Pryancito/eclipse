@@ -516,7 +516,9 @@ mod tests {
         assert_eq!(fs.free.iter().count(), 1);
         assert_eq!(fs.meta_free(), 0x40_0000);
 
-        let bytenr = fs.alloc_tree_block(FS_TREE, 0, BLOCK_GROUP_METADATA).unwrap();
+        let bytenr = fs
+            .alloc_tree_block(FS_TREE, 0, BLOCK_GROUP_METADATA)
+            .unwrap();
         assert_eq!(bytenr, 0x50_0000);
         assert_eq!(fs.meta_free(), 0x40_0000 - 0x4000);
     }
@@ -537,7 +539,9 @@ mod tests {
             n += 1;
         }
         assert_eq!(n, 0x4_0000 / 0x4000);
-        assert!(fs.alloc_tree_block(FS_TREE, 0, BLOCK_GROUP_METADATA).is_err());
+        assert!(fs
+            .alloc_tree_block(FS_TREE, 0, BLOCK_GROUP_METADATA)
+            .is_err());
         // The neighbouring data group is untouched.
         assert_eq!(fs.data_free(), 0x10_0000);
     }
