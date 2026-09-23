@@ -448,6 +448,27 @@ pub fn render_report() -> String {
     out
 }
 
+/// Serialization point for the tests.
+///
+/// Every piece of state in this crate is process-wide -- the policy atomics,
+/// the lazy_static maps, the W^X intervals, the event rings -- and cargo runs a
+/// crate's tests in threads unless told otherwise (the CI passes
+/// `--test-threads=1`, a developer's `cargo test` does not). Every test that
+/// touches any of it takes this lock first and resets what it uses, so the
+/// suite means the same thing either way.
+#[cfg(test)]
+pub(crate) mod test_globals {
+    extern crate std;
+
+    static LOCK: self::std::sync::Mutex<()> = self::std::sync::Mutex::new(());
+
+    pub(crate) fn lock() -> self::std::sync::MutexGuard<'static, ()> {
+        // A test that panics while holding this poisons it; that is not a
+        // failure for the tests that follow, so step over it.
+        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -459,6 +480,8 @@ mod tests {
     // `#[test]`, with the latch exercised last.
     #[test]
     fn hunter_behaviour() {
+        let _g = crate::test_globals::lock();
+        policy::reset_for_test();
         seccomp_section();
         elf_validation_section();
         elf_integrity_section();
@@ -610,6 +633,81 @@ mod tests {
         policy::set_exec_learning(false);
         policy::clear_trusted_exec();
         policy::set_exec_mode(Mode::Off);
+    }
+
+    #[test]
+    fn a_disguised_proc_fd_link_is_never_learned_and_never_trusted() {
+        let _g = crate::test_globals::lock();
+        policy::reset_for_test();
+        // The kernel boots hunter with learning on (linux-object reads
+        // /etc/hunter and calls set_exec_learning(true)), and learning is the
+        // path that writes permanent trust. A magic link lives in no
+        // world-writable directory, so the only thing keeping it out was the
+        // /proc/*/fd/* test -- which ran on the raw path, one spelling of it.
+        policy::set_exec_learning(true);
+        policy::set_exec_mode(Mode::Report);
+        for p in [
+            "/proc/self/fd/3",
+            "//proc/self/fd/3",
+            "/bin/../proc/self/fd/3",
+        ] {
+            check_exec_path(p);
+            assert!(
+                !policy::is_exec_listed(p),
+                "a magic link must never be learned: {}",
+                p
+            );
+        }
+        assert_eq!(policy::learned_exec_count(), 0);
+        // And under enforcement all three are blocked, not just the plain one.
+        policy::set_exec_mode(Mode::Enforce);
+        for p in [
+            "/proc/self/fd/3",
+            "//proc/self/fd/3",
+            "/bin/../proc/self/fd/3",
+        ] {
+            assert!(!check_exec_path(p), "should be blocked: {}", p);
+        }
+        // A real program on the same boot still learns and still runs.
+        assert!(check_exec_path("/usr/bin/apk"));
+        assert!(policy::is_exec_listed("/usr/bin/apk"));
+        policy::reset_for_test();
+    }
+
+    #[test]
+    fn a_blacklisted_directory_typed_loosely_still_blocks_the_exec() {
+        let _g = crate::test_globals::lock();
+        policy::reset_for_test();
+        // The blacklist blocks even in Report mode -- it is the one hard deny
+        // in the exec policy -- so a prefix that cannot match is the whole
+        // rule silently doing nothing.
+        policy::set_exec_mode(Mode::Report);
+        policy::add_blacklisted_exec_prefix(String::from("/opt/../opt/danger/"));
+        assert!(!check_elf_binary("/opt/danger/payload", b"\x7fELF"));
+        assert!(check_elf_binary("/opt/safe/payload", b"\x7fELF"));
+        policy::reset_for_test();
+    }
+
+    #[test]
+    fn sealing_the_control_plane_stops_the_exec_policy_being_undone() {
+        let _g = crate::test_globals::lock();
+        policy::reset_for_test();
+        policy::set_exec_mode(Mode::Enforce);
+        policy::add_trusted_exec_prefix(String::from("/bin/"));
+        assert!(check_elf_binary("/bin/ls", b"\x7fELF"));
+        assert!(!check_elf_binary("/opt/app/foo", b"\x7fELF"));
+
+        policy::seal_tighten_only();
+        // Each of these used to walk straight past the latch, and each of them
+        // ends with /opt/app/foo running while /proc/hunter still says
+        // `exec=enforce`.
+        policy::add_trusted_exec_prefix(String::from("/"));
+        policy::add_trusted_exec_path(String::from("/opt/app/foo"));
+        policy::clear_trusted_exec();
+        policy::set_exec_learning(true);
+        assert!(!check_elf_binary("/opt/app/foo", b"\x7fELF"));
+        assert!(check_elf_binary("/bin/ls", b"\x7fELF"));
+        policy::reset_for_test();
     }
 
     fn tighten_only_section() {

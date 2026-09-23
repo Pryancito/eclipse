@@ -71,6 +71,19 @@ const SYS_FORKBOMB_THRESHOLD: u64 = 2_000;
 /// Count backstop: roll the window after this many syscalls even if the clock
 /// has not advanced, so a frozen/lying clock cannot disable detection (P12).
 const WINDOW_EVENTS_BACKSTOP: u32 = 1_000_000;
+/// The same backstop for the *system-wide* fork window, in the same ratio to
+/// its threshold as [`WINDOW_EVENTS_BACKSTOP`] is to [`FLOOD_THRESHOLD`].
+///
+/// P12 gave the per-process window a count backstop and the module heading
+/// says so, but the system-wide window never got one — and it is the one that
+/// starts from a literal zero. `SYS_FORK_WINDOW_START` begins at 0, so with a
+/// clock that reads 0 (none registered yet, or one that does not advance)
+/// `now - start >= WINDOW_NS` is false forever: the window never rolls, the
+/// counter runs from boot, the storm alarm fires once on the 2001st fork the
+/// machine has ever done, and `SYS_FORK_ALERTED` then latches it silent for
+/// the rest of the uptime. Exactly the failure P12 was written to prevent,
+/// left in the one window it did not reach.
+const SYS_FORK_EVENTS_BACKSTOP: u64 = 20 * SYS_FORKBOMB_THRESHOLD;
 /// WATCH events emitted per process per window before further ones are
 /// suppressed (still counted), bounding self-inflicted log pressure (P11).
 const WATCH_BUDGET: u32 = 16;
@@ -329,6 +342,48 @@ fn stats_shard(pid: u64) -> &'static Mutex<BTreeMap<u64, ProcStat>> {
 static SYS_FORK_WINDOW_START: AtomicU64 = AtomicU64::new(0);
 static SYS_FORK_COUNT: AtomicU64 = AtomicU64::new(0);
 static SYS_FORK_ALERTED: AtomicBool = AtomicBool::new(false);
+/// Taken only to start a new system-wide fork window, so the three stores that
+/// make one up cannot interleave. See [`roll_sys_fork_window`].
+lazy_static::lazy_static! {
+    static ref SYS_FORK_ROLL: Mutex<()> = Mutex::new(());
+}
+
+/// Starts a new system-wide fork window if the current one is over, and returns
+/// whether this call was the one that started it.
+///
+/// The reset used to be a bare load / compare / three stores. There is no
+/// single-CPU way to notice what that costs, which is why it survived: it only
+/// misbehaves when several CPUs fork at once, which is precisely the
+/// *distributed* fork bomb this counter exists to catch. Every CPU that saw the
+/// window expire zeroed it, and a CPU delayed between its load and its stores
+/// zeroed a window that had already been counted -- clearing `SYS_FORK_ALERTED`
+/// with it, so the storm went back to counting from nothing.
+///
+/// The decision is re-taken under a lock, which is what makes it one roll per
+/// window: the second CPU in finds the window it wanted to replace already
+/// replaced. The lock-free pre-check keeps the fork path's usual case to two
+/// relaxed loads, and the lock itself is reached about once a second.
+fn roll_sys_fork_window(now: u64) -> bool {
+    if !window_is_over(now) {
+        return false;
+    }
+    let _guard = SYS_FORK_ROLL.lock();
+    if !window_is_over(now) {
+        return false;
+    }
+    SYS_FORK_WINDOW_START.store(now, Ordering::Relaxed);
+    SYS_FORK_COUNT.store(0, Ordering::Relaxed);
+    SYS_FORK_ALERTED.store(false, Ordering::Relaxed);
+    true
+}
+
+/// Whether the current system-wide fork window has run out, by the clock or by
+/// the count backstop.
+fn window_is_over(now: u64) -> bool {
+    let start = SYS_FORK_WINDOW_START.load(Ordering::Relaxed);
+    now.saturating_sub(start) >= WINDOW_NS
+        || SYS_FORK_COUNT.load(Ordering::Relaxed) >= SYS_FORK_EVENTS_BACKSTOP
+}
 
 /// Enables or disables the per-process rate heuristics.
 pub fn set_anomaly_detection(enabled: bool) {
@@ -434,12 +489,7 @@ pub fn on_syscall(pid: u64, num: u32) -> bool {
     // System-wide fork-rate window (lock-free), for distributed fork bombs.
     let mut alert_sys_fork = false;
     if forking {
-        let prev = SYS_FORK_WINDOW_START.load(Ordering::Relaxed);
-        if now.saturating_sub(prev) >= WINDOW_NS {
-            SYS_FORK_WINDOW_START.store(now, Ordering::Relaxed);
-            SYS_FORK_COUNT.store(0, Ordering::Relaxed);
-            SYS_FORK_ALERTED.store(false, Ordering::Relaxed);
-        }
+        roll_sys_fork_window(now);
         let total = SYS_FORK_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
         if total > SYS_FORKBOMB_THRESHOLD && !SYS_FORK_ALERTED.swap(true, Ordering::Relaxed) {
             alert_sys_fork = true;
@@ -595,5 +645,136 @@ mod tests {
         st.syscall_count = 40_000;
         assert!(st.windows_observed < ADAPTIVE_MIN_WINDOWS);
         assert!(!st.adaptive_flood());
+    }
+}
+
+#[cfg(test)]
+mod window_tests {
+    use super::*;
+    use crate::test_globals;
+
+    extern crate std;
+
+    fn reset() {
+        SYS_FORK_WINDOW_START.store(0, Ordering::Relaxed);
+        SYS_FORK_COUNT.store(0, Ordering::Relaxed);
+        SYS_FORK_ALERTED.store(false, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn a_live_window_is_not_rolled() {
+        let _g = test_globals::lock();
+        reset();
+        assert!(roll_sys_fork_window(WINDOW_NS * 4));
+        SYS_FORK_COUNT.store(SYS_FORKBOMB_THRESHOLD + 1, Ordering::Relaxed);
+        SYS_FORK_ALERTED.store(true, Ordering::Relaxed);
+        // Half a second later the storm is still the same storm: rolling here
+        // would reset the count under a live clock and hide it.
+        assert!(!roll_sys_fork_window(WINDOW_NS * 4 + WINDOW_NS / 2));
+        assert_eq!(
+            SYS_FORK_COUNT.load(Ordering::Relaxed),
+            SYS_FORKBOMB_THRESHOLD + 1
+        );
+        reset();
+    }
+
+    #[test]
+    fn a_finished_window_is_rolled_and_rearms_the_alarm() {
+        let _g = test_globals::lock();
+        reset();
+        assert!(roll_sys_fork_window(WINDOW_NS * 4));
+        SYS_FORK_COUNT.store(SYS_FORKBOMB_THRESHOLD + 1, Ordering::Relaxed);
+        SYS_FORK_ALERTED.store(true, Ordering::Relaxed);
+        assert!(roll_sys_fork_window(WINDOW_NS * 5));
+        assert_eq!(SYS_FORK_COUNT.load(Ordering::Relaxed), 0);
+        assert!(!SYS_FORK_ALERTED.load(Ordering::Relaxed));
+        reset();
+    }
+
+    #[test]
+    fn a_clock_that_never_advances_does_not_silence_the_fork_storm_alarm() {
+        let _g = test_globals::lock();
+        reset();
+        // `now_ns()` reads 0 until the kernel registers a time source, and a
+        // frozen clock reads the same value forever. `SYS_FORK_WINDOW_START`
+        // starts at 0 too, so `now - start >= WINDOW_NS` was false for the
+        // whole uptime: the counter ran from boot, the alarm fired once on the
+        // 2001st fork the machine had ever done, and SYS_FORK_ALERTED then
+        // latched it silent. P12 put a count backstop on the per-process
+        // window for exactly this and the module heading says so -- the
+        // system-wide window simply never got one.
+        let frozen = 0u64;
+        assert!(!roll_sys_fork_window(frozen), "nothing to roll yet");
+        SYS_FORK_ALERTED.store(true, Ordering::Relaxed);
+        SYS_FORK_COUNT.store(SYS_FORK_EVENTS_BACKSTOP - 1, Ordering::Relaxed);
+        assert!(!roll_sys_fork_window(frozen), "still below the backstop");
+        SYS_FORK_COUNT.store(SYS_FORK_EVENTS_BACKSTOP, Ordering::Relaxed);
+        assert!(
+            roll_sys_fork_window(frozen),
+            "the count backstop must roll the window with the clock frozen"
+        );
+        assert_eq!(SYS_FORK_COUNT.load(Ordering::Relaxed), 0);
+        assert!(
+            !SYS_FORK_ALERTED.load(Ordering::Relaxed),
+            "a rolled window must re-arm the alarm"
+        );
+        reset();
+    }
+
+    #[test]
+    fn the_backstop_is_far_above_the_threshold_it_backs() {
+        // If the backstop were near the threshold it would roll the window in
+        // the middle of a real storm and reset the very count that detects it.
+        assert!(SYS_FORK_EVENTS_BACKSTOP > SYS_FORKBOMB_THRESHOLD * 4);
+        assert!(WINDOW_EVENTS_BACKSTOP as u64 > FLOOD_THRESHOLD as u64 * 4);
+    }
+
+    #[test]
+    fn only_one_cpu_rolls_a_given_window() {
+        let _g = test_globals::lock();
+        reset();
+        // This is the ordering half, and no single-threaded mutation can see
+        // it: the reset used to be a bare load / compare / three stores, so
+        // every CPU that saw the window expire zeroed it -- on the many-CPU
+        // storm this signal exists for. A CPU delayed between its load and its
+        // stores zeroed a window that had already been counted and cleared the
+        // alarm with it. A real writer thread is the only witness there is.
+        const THREADS: usize = 8;
+        const ROUNDS: u64 = 200;
+        // Two phases per round: every thread is lined up on the same expired
+        // window before anyone tries to roll it, and nobody runs ahead into
+        // the next round until this one is settled.
+        let gate = self::std::sync::Arc::new(self::std::sync::Barrier::new(THREADS));
+        let rolls = self::std::sync::Arc::new(core::sync::atomic::AtomicU64::new(0));
+        let mut handles = alloc::vec::Vec::new();
+        for _ in 0..THREADS {
+            let gate = gate.clone();
+            let rolls = rolls.clone();
+            handles.push(self::std::thread::spawn(move || {
+                for r in 1..=ROUNDS {
+                    gate.wait();
+                    if roll_sys_fork_window(r * WINDOW_NS * 2) {
+                        rolls.fetch_add(1, Ordering::Relaxed);
+                    }
+                    gate.wait();
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert_eq!(
+            rolls.load(Ordering::Relaxed),
+            ROUNDS,
+            "one window, one roll: {} CPUs saw each of the {} windows expire",
+            THREADS,
+            ROUNDS
+        );
+        assert_eq!(
+            SYS_FORK_WINDOW_START.load(Ordering::Relaxed),
+            ROUNDS * WINDOW_NS * 2,
+            "the last window to be started is the last deadline seen"
+        );
+        reset();
     }
 }
