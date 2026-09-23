@@ -4,7 +4,6 @@ use alloc::boxed::Box;
 use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use alloc::sync::Arc;
 use bitflags::bitflags;
-use core::sync::atomic::{AtomicBool, Ordering};
 use futures::channel::oneshot::Receiver;
 use kernel_hal::sync::Mutex;
 
@@ -53,6 +52,21 @@ struct Observer {
     signals: Signal,
     options: WaitAsyncOptions,
     cancel: Option<Receiver<()>>,
+    /// Whether an asserted signal may now queue this observer's packet.
+    ///
+    /// `WaitAsyncOptions::EDGE` asks for the packet on an inactive→active
+    /// transition *after* the call, so an observer registered while its
+    /// signals are already asserted starts unarmed and arms the first time
+    /// they are seen inactive. Everything else is armed from the start.
+    ///
+    /// It lives here rather than as a "first call" latch in the callback.
+    /// A latch only suppresses the very first evaluation, so the next
+    /// change on the object — including a change to a signal this observer
+    /// does not even watch — queued a packet for a signal that had never
+    /// gone inactive. Keeping the state beside the observer also makes the
+    /// callback a pure function of it and the signal it is handed, so
+    /// evaluating it twice for one signal cannot invent an edge.
+    edge_armed: bool,
 }
 
 impl Observer {
@@ -139,6 +153,7 @@ impl Port {
                     source,
                     key,
                     signals,
+                    edge_armed: !options.contains(WaitAsyncOptions::EDGE),
                     options,
                     cancel,
                 },
@@ -146,16 +161,15 @@ impl Port {
             id
         };
         let port = Arc::downgrade(self);
-        let initial = AtomicBool::new(true);
         object.add_signal_callback(Box::new(move |observed| {
             let Some(port) = port.upgrade() else {
                 return true;
             };
-            port.signal_observer(id, observed, initial.swap(false, Ordering::Relaxed))
+            port.signal_observer(id, observed)
         }));
     }
 
-    fn signal_observer(&self, id: u64, observed: Signal, initial: bool) -> bool {
+    fn signal_observer(&self, id: u64, observed: Signal) -> bool {
         let mut inner = self.inner.lock();
         let Some(observer) = inner.observers.get_mut(&id) else {
             return true;
@@ -164,9 +178,13 @@ impl Port {
             inner.observers.remove(&id);
             return true;
         }
-        if !observed.intersects(observer.signals)
-            || (initial && observer.options.contains(WaitAsyncOptions::EDGE))
-        {
+        if !observer.edge_armed {
+            // Edge-triggered, and the signals were asserted when the wait
+            // was registered: nothing queues until they have gone inactive.
+            observer.edge_armed = !observed.intersects(observer.signals);
+            return false;
+        }
+        if !observed.intersects(observer.signals) {
             return false;
         }
         let timestamp = if observer
@@ -328,6 +346,145 @@ bitflags! {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    /// `ZX_WAIT_ASYNC_EDGE` asks for the packet on an inactive→active
+    /// transition *after* the call, so a signal that was already asserted
+    /// when the wait was registered has to go away before it can arrive.
+    #[test]
+    fn an_edge_wait_needs_its_signal_to_go_inactive_first() {
+        use futures::FutureExt;
+        let port = Port::new(0).unwrap();
+        let object = DummyObject::new() as Arc<dyn KernelObject>;
+        object.signal_set(Signal::READABLE);
+        port.wait_async(
+            &object,
+            (1, 4),
+            7,
+            Signal::READABLE,
+            WaitAsyncOptions::EDGE,
+            None,
+        );
+        assert!(port.wait().now_or_never().is_none());
+        // A change to a signal this wait does not even watch is not an edge
+        // on the one it does.
+        object.signal_set(Signal::USER_SIGNAL_0);
+        assert!(port.wait().now_or_never().is_none());
+        // Nor is the signal going away.
+        object.signal_clear(Signal::READABLE);
+        assert!(port.wait().now_or_never().is_none());
+        // This is the transition it asked for.
+        object.signal_set(Signal::READABLE);
+        assert_eq!(port.wait().now_or_never().unwrap().key, 7);
+    }
+
+    #[test]
+    fn an_edge_wait_on_an_idle_signal_fires_on_the_first_assertion() {
+        use futures::FutureExt;
+        let port = Port::new(0).unwrap();
+        let object = DummyObject::new() as Arc<dyn KernelObject>;
+        port.wait_async(
+            &object,
+            (1, 4),
+            7,
+            Signal::READABLE,
+            WaitAsyncOptions::EDGE,
+            None,
+        );
+        assert!(port.wait().now_or_never().is_none());
+        object.signal_set(Signal::READABLE);
+        assert_eq!(port.wait().now_or_never().unwrap().key, 7);
+    }
+
+    #[test]
+    fn a_level_wait_fires_for_a_signal_that_is_already_asserted() {
+        use futures::FutureExt;
+        let port = Port::new(0).unwrap();
+        let object = DummyObject::new() as Arc<dyn KernelObject>;
+        object.signal_set(Signal::READABLE);
+        port.wait_async(
+            &object,
+            (1, 4),
+            7,
+            Signal::READABLE,
+            WaitAsyncOptions::empty(),
+            None,
+        );
+        assert_eq!(port.wait().now_or_never().unwrap().key, 7);
+    }
+
+    /// Asking for a timestamp is the only reason `signal_observer` reads the
+    /// clock; without it the packet carries a zero, which is what a reader
+    /// checks to know whether the field means anything.
+    #[test]
+    fn only_a_timestamped_wait_stamps_its_packet() {
+        use futures::FutureExt;
+        for (options, stamped) in [
+            (WaitAsyncOptions::empty(), false),
+            (WaitAsyncOptions::TIMESTAMP, true),
+            (WaitAsyncOptions::BOOT_TIMESTAMP, true),
+        ] {
+            let before = kernel_hal::timer::timer_now().as_nanos() as u64;
+            let port = Port::new(0).unwrap();
+            let object = DummyObject::new() as Arc<dyn KernelObject>;
+            port.wait_async(&object, (1, 4), 7, Signal::READABLE, options, None);
+            object.signal_set(Signal::READABLE);
+            let packet = port.wait().now_or_never().unwrap().decode().unwrap();
+            let PayloadRepr::Signal(signal) = packet.data else {
+                panic!("a signal wait answers with a signal packet");
+            };
+            if stamped {
+                assert!(signal.timestamp >= before, "options: {:?}", options);
+            } else {
+                assert_eq!(signal.timestamp, 0, "options: {:?}", options);
+            }
+        }
+    }
+
+    /// The cancel token is the handle the wait was registered against. When
+    /// it closes the wait is off, and the observer goes with it there and
+    /// then: a port that waited until the next `port.wait()` to notice would
+    /// answer `cancel` as if the wait were still live.
+    #[test]
+    fn a_wait_whose_handle_closed_queues_nothing_and_is_forgotten() {
+        use futures::FutureExt;
+        let port = Port::new(0).unwrap();
+        let object = DummyObject::new() as Arc<dyn KernelObject>;
+        let (sender, receiver) = futures::channel::oneshot::channel();
+        port.wait_async(
+            &object,
+            (1, 4),
+            7,
+            Signal::READABLE,
+            WaitAsyncOptions::empty(),
+            Some(receiver),
+        );
+        drop(sender);
+        object.signal_set(Signal::READABLE);
+        assert_eq!(port.cancel(None, 7), Err(ZxError::NOT_FOUND));
+        assert!(port.wait().now_or_never().is_none());
+    }
+
+    /// And when the handle closes after the packet is already queued, the
+    /// packet is dropped on the way out rather than reported to a wait
+    /// nobody is on any more.
+    #[test]
+    fn a_queued_packet_whose_handle_closed_is_dropped_on_the_way_out() {
+        use futures::FutureExt;
+        let port = Port::new(0).unwrap();
+        let object = DummyObject::new() as Arc<dyn KernelObject>;
+        let (sender, receiver) = futures::channel::oneshot::channel();
+        port.wait_async(
+            &object,
+            (1, 4),
+            7,
+            Signal::READABLE,
+            WaitAsyncOptions::empty(),
+            Some(receiver),
+        );
+        object.signal_set(Signal::READABLE);
+        drop(sender);
+        assert!(port.wait().now_or_never().is_none());
+    }
 
     #[test]
     fn cancellation_distinguishes_source_handles_and_queued_packets() {
