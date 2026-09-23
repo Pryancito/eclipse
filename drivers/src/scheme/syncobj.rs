@@ -1930,4 +1930,299 @@ mod tests {
         destroy(m);
         destroy(b);
     }
+
+    // ----- The wait family, abandoned landing zones, exported snapshots -----
+
+    /// `WAIT_AVAILABLE`: a fence that is submitted but has not landed
+    /// satisfies the wait (Mesa's "wait for the point to be queued"); a
+    /// plain wait still parks on it, and neither flavour signals anything.
+    #[test]
+    fn wait_available_is_satisfied_by_a_fence_in_flight_and_a_plain_wait_is_not() {
+        let _g = test_lock();
+        arm_hooks();
+        let h = create(false);
+        let t = create(false);
+        let mut zone = Landing::new();
+        // Nothing submitted yet: nothing is available either.
+        assert!(matches!(
+            wait_available(&[h], None, true, 0),
+            WaitOutcome::Timeout
+        ));
+        assert!(matches!(
+            wait_available_ready(&[h], None, true, 0),
+            Some(Err(WaitOutcome::Timeout))
+        ));
+        assert!(attach_hw_fence(h, 1, zone.va(), 0, 1, 0, true));
+        assert!(attach_hw_fence(t, 5, zone.va(), 0, 2, 0, false));
+        assert!(
+            matches!(wait(&[h], None, true, 0), WaitOutcome::Timeout),
+            "submitted is not landed"
+        );
+        assert!(matches!(
+            wait_available(&[h], None, true, 0),
+            WaitOutcome::Signaled {
+                first_signaled_index: 0
+            }
+        ));
+        assert!(matches!(
+            wait_ready(&[h], None, true, 0),
+            Some(Err(WaitOutcome::Timeout))
+        ));
+        assert!(matches!(
+            wait_available_ready(&[h], None, true, 0),
+            Some(Ok(0))
+        ));
+        // The point in flight is the bound: at it available, past it not.
+        assert!(matches!(
+            wait_available(&[t], Some(&[5]), true, 0),
+            WaitOutcome::Signaled { .. }
+        ));
+        assert!(matches!(
+            wait_available(&[t], Some(&[6]), true, 0),
+            WaitOutcome::Timeout
+        ));
+        assert!(matches!(
+            wait_available_ready(&[t], Some(&[6]), true, 0),
+            Some(Err(WaitOutcome::Timeout))
+        ));
+        // Any-of names the first satisfied index; all-of needs every one.
+        assert!(matches!(
+            wait_available(&[t, h], Some(&[6, 1]), false, 0),
+            WaitOutcome::Signaled {
+                first_signaled_index: 1
+            }
+        ));
+        assert!(matches!(
+            wait_available_ready(&[t, h], Some(&[6, 1]), false, 0),
+            Some(Ok(1))
+        ));
+        assert!(matches!(
+            wait_available(&[t, h], Some(&[6, 1]), true, 0),
+            WaitOutcome::Timeout
+        ));
+        // Available is not signaled: the counter reads 0 and the fence stays.
+        assert_eq!(query(h), Some(0));
+        assert_eq!(query_submitted(h), Some(1));
+        assert_eq!(pending_now(), 2);
+        assert!(
+            signals().iter().all(|&(_, p)| p >= 1),
+            "only submits announced"
+        );
+        // A probe with the deadline ahead says sleep...
+        let ahead = now_us() + 1_000_000;
+        assert!(wait_ready(&[h], None, true, ahead).is_none());
+        // ...until the fence lands, when the plain wait goes through.
+        zone.land(2);
+        assert!(matches!(wait_ready(&[h], None, true, ahead), Some(Ok(0))));
+        assert!(matches!(
+            wait(&[h, t], Some(&[1, 5]), true, 0),
+            WaitOutcome::Signaled {
+                first_signaled_index: 0
+            }
+        ));
+        assert_eq!(pending_now(), 0);
+        // An unknown handle is Invalid on every flavour, whatever the others.
+        assert!(matches!(
+            wait_available(&[h, 0xdead_0000], None, false, 0),
+            WaitOutcome::Invalid
+        ));
+        assert!(matches!(
+            wait_available_ready(&[h, 0xdead_0000], None, false, 0),
+            Some(Err(WaitOutcome::Invalid))
+        ));
+        destroy(h);
+        destroy(t);
+    }
+
+    /// A driver about to submit on a channel may take a fence pending on
+    /// THAT channel as already ordered: the ring executes in order, so the
+    /// submission cannot overtake it. A fence on any other channel is a real
+    /// wait, and an ordered fence is not a signaled one.
+    #[test]
+    fn wait_ordered_trusts_a_fence_on_its_own_channel_and_waits_for_every_other() {
+        let _g = test_lock();
+        arm_hooks();
+        let same = create(false);
+        let other = create(false);
+        let plain = create(false);
+        let mut zone_a = Landing::new();
+        let mut zone_b = Landing::new();
+        assert!(attach_hw_fence(same, 3, zone_a.va(), 0, 1, 1, false));
+        assert!(attach_hw_fence(other, 1, zone_b.va(), 0, 1, 2, true));
+        assert!(timeline_signal(plain, 7));
+        assert!(matches!(
+            wait_ordered(&[same], Some(&[3]), 0, 1),
+            WaitOutcome::Signaled {
+                first_signaled_index: 0
+            }
+        ));
+        assert!(
+            matches!(
+                wait_ordered(&[same], Some(&[4]), 0, 1),
+                WaitOutcome::Timeout
+            ),
+            "only up to the point the ring will land"
+        );
+        assert!(
+            matches!(
+                wait_ordered(&[same], Some(&[3]), 0, 2),
+                WaitOutcome::Timeout
+            ),
+            "from another channel the same fence is a wait"
+        );
+        // Every handle must pass: the other channel's fence holds it up...
+        assert!(matches!(
+            wait_ordered(&[plain, same, other], Some(&[7, 3, 1]), 0, 1),
+            WaitOutcome::Timeout
+        ));
+        // ...until it lands.
+        zone_b.land(1);
+        assert!(matches!(
+            wait_ordered(&[plain, same, other], Some(&[7, 3, 1]), 0, 1),
+            WaitOutcome::Signaled {
+                first_signaled_index: 0
+            }
+        ));
+        // Ordered is not signaled: `same` still waits for its own landing.
+        assert_eq!(query(same), Some(0));
+        assert_eq!(pending_now(), 1);
+        assert!(matches!(
+            wait(&[same], Some(&[3]), true, 0),
+            WaitOutcome::Timeout
+        ));
+        zone_a.land(1);
+        assert_eq!(query(same), Some(3));
+        assert!(matches!(
+            wait_ordered(&[same, 0xdead_0000], None, 0, 1),
+            WaitOutcome::Invalid
+        ));
+        destroy(same);
+        destroy(other);
+        destroy(plain);
+    }
+
+    /// A channel going away takes its landing zone with it. Every fence
+    /// pending on that zone is released as signaled -- its waiters move on,
+    /// the eventfd side hears of it, an import of it resolves -- and none is
+    /// reported as a timeout; a fence on any other zone is untouched.
+    #[test]
+    fn abandoning_a_landing_zone_releases_its_fences_as_signaled_and_no_others() {
+        let _g = test_lock();
+        arm_hooks();
+        let a = create(false);
+        let b = create(false);
+        let c = create(false);
+        let dst = create(false);
+        let dead = Landing::new();
+        let live = Landing::new();
+        assert!(attach_hw_fence(a, 3, dead.va(), 0, 1, 1, false));
+        assert!(attach_hw_fence(a, 5, dead.va(), 0, 2, 1, false));
+        assert!(attach_hw_fence(b, 1, dead.va(), 0, 3, 1, true));
+        assert!(attach_hw_fence(c, 1, live.va(), 0, 1, 2, true));
+        // The compositor's acquire: a's point 3, imported as a sync_file.
+        assert!(import_snapshot(dst, a, 3));
+        assert_eq!(query(dst), Some(0));
+        assert_eq!(pending_now(), 4);
+        assert_eq!(abandon_fences(0xdead_0000), 0, "a zone nobody uses");
+        assert_eq!(pending_now(), 4);
+        SIGNALS.with(|s| s.borrow_mut().clear());
+        assert_eq!(abandon_fences(dead.va()), 3);
+        assert_eq!(pending_now(), 1, "the live zone's fence stays");
+        assert_eq!(query(a), Some(5));
+        assert_eq!(query(b), Some(1));
+        assert_eq!(query(c), Some(0));
+        assert_eq!(query(dst), Some(1), "a reached 3, so the import is in");
+        assert!(matches!(
+            wait(&[a, b], Some(&[5, 1]), true, 0),
+            WaitOutcome::Signaled { .. }
+        ));
+        assert!(matches!(wait(&[c], None, true, 0), WaitOutcome::Timeout));
+        let heard = signals();
+        assert!(heard.contains(&(a, 5)), "announced: {:?}", heard);
+        assert!(heard.contains(&(b, 1)), "announced: {:?}", heard);
+        assert!(heard.iter().all(|&(h, _)| h != c), "not c: {:?}", heard);
+        // Released, not timed out: the ring is not latched wedged for them.
+        // The live zone's fence does time out, on its own clock.
+        test_clock::advance(FENCE_TIMEOUT_US + 1);
+        assert_eq!(query(c), Some(1), "timed out: released too, but reported");
+        assert_eq!(timeouts(), [(2, c, 1)]);
+        destroy(a);
+        destroy(b);
+        destroy(c);
+        destroy(dst);
+    }
+
+    /// `HANDLE_TO_FD` with `EXPORT_SYNC_FILE`: the snapshot names the fence
+    /// current at export time -- the highest submission in flight, never
+    /// point 0 (an unsignaled binary syncobj exports its next signal), so an
+    /// importer waits for exactly that submission and not one less.
+    #[test]
+    fn an_exported_snapshot_names_the_fence_in_flight_and_never_point_zero() {
+        let _g = test_lock();
+        arm_hooks();
+        assert_eq!(export_snapshot(0xdead_0000), None);
+        let h = create(false);
+        assert_eq!(export_snapshot(h), Some(1), "unsignaled: its next signal");
+        let s = create(true);
+        assert_eq!(export_snapshot(s), Some(1));
+        let t = create(false);
+        assert!(timeline_signal(t, 4));
+        assert_eq!(export_snapshot(t), Some(4));
+        let mut zone = Landing::new();
+        assert!(attach_hw_fence(t, 6, zone.va(), 0, 1, 0, false));
+        assert!(attach_hw_fence(t, 9, zone.va(), 0, 2, 0, false));
+        assert_eq!(
+            export_snapshot(t),
+            Some(9),
+            "the highest fence in flight, not the counter"
+        );
+        let dst = create(false);
+        assert!(import_snapshot(dst, t, export_snapshot(t).unwrap()));
+        zone.land(1);
+        assert_eq!(query(t), Some(6));
+        assert_eq!(query(dst), Some(0), "the second submission has not landed");
+        zone.land(2);
+        assert_eq!(query(dst), Some(1));
+        assert_eq!(export_snapshot(t), Some(9), "landed: the counter itself");
+        // An object that is itself waiting on an import exports its next
+        // signal, and a snapshot of it resolves when that import does.
+        let src = create(false);
+        let linked = create(false);
+        assert!(import_snapshot(linked, src, 1));
+        assert_eq!(export_snapshot(linked), Some(1));
+        let far = create(false);
+        assert!(import_snapshot(far, linked, 1));
+        assert_eq!(query(far), Some(0));
+        assert!(signal(src));
+        assert_eq!(query(far), Some(1));
+        for x in [h, s, t, dst, src, linked, far] {
+            destroy(x);
+        }
+    }
+
+    /// The one line every timed-out wait prints: each handle with its
+    /// target, its current point (-1 for one that does not exist) and the
+    /// fences still in flight for it, with the channel they ride.
+    #[test]
+    fn describe_names_each_handle_with_target_current_and_the_fences_in_flight() {
+        let _g = test_lock();
+        let h = create(false);
+        let t = create(false);
+        assert!(timeline_signal(t, 2));
+        let zone = Landing::new();
+        assert!(attach_hw_fence(t, 7, zone.va(), 0, 1, 3, false));
+        assert!(attach_hw_fence(t, 8, zone.va(), 0, 2, 3, false));
+        assert_eq!(
+            describe(&[h, t, 0xdead_0000], Some(&[1, 7, 1])),
+            alloc::format!(" {:#x}:1/0 {:#x}:7/2+7(ctx3)+8(ctx3) 0xdead0000:1/-1", h, t)
+        );
+        assert_eq!(
+            describe(&[t], None),
+            alloc::format!(" {:#x}:1/2+7(ctx3)+8(ctx3)", t),
+            "no points: binary targets"
+        );
+        assert_eq!(describe(&[], None), "");
+        destroy(h);
+        destroy(t);
+    }
 }
