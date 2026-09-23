@@ -8401,11 +8401,20 @@ impl DrmScheme for NvidiaGpu {
         // Channel bookkeeping. Only the RM-backed channel carries real GPU state,
         // so a process that merely enumerated (discovery channels) is reclaimed
         // without the class-object cleanup below.
+        //
+        // The sticky ctx-0 owner gives the singleton back whether or not it
+        // still holds a channel. A compositor that exits cleanly frees its
+        // channels first (NVK destroys its contexts before the device
+        // closes), and inferring the role from the channel table here left
+        // ctx 0 owned by a dead pid: the respawned compositor then ran as a
+        // GL client, on a context of its own, while the singleton's channel
+        // and direct-submit window stayed as the dead one had left them.
+        let owns_ctx0 = self.ctx0_is_owner(pid);
         let (had_rm_backed, released_ctx0) = {
             let mut chans = self.nouveau_channels.lock();
             let before = chans.len();
             let mut rm_backed = false;
-            let mut ctx0 = false;
+            let mut ctx0 = owns_ctx0;
             chans.retain(|c| {
                 if c.owner_pid == pid {
                     rm_backed |= c.rm_backed;
@@ -8415,7 +8424,7 @@ impl DrmScheme for NvidiaGpu {
                     true
                 }
             });
-            if before == chans.len() {
+            if before == chans.len() && !owns_ctx0 {
                 if dropped_maps > 0 || freed_gems > 0 || my_ctx.is_some() {
                     log::info!(
                         "[nouveau-uapi] process exit pid={}: reclaimed {} mapping(s), {} GEM object(s) ({} KiB), ctx={:?}",
@@ -8426,7 +8435,7 @@ impl DrmScheme for NvidiaGpu {
             }
             (rm_backed, ctx0)
         };
-        if !had_rm_backed {
+        if !had_rm_backed && !released_ctx0 {
             log::info!(
                 "[nouveau-uapi] process exit pid={}: released discovery channel(s); reclaimed {} mapping(s), {} GEM object(s)",
                 pid, dropped_maps, freed_gems
@@ -10062,6 +10071,12 @@ impl NvidiaGpu {
     fn reset_ctx0_singleton(&self, device_instance: u32, reason: &str, owner_pid: u64) {
         self.ctx0_release(owner_pid);
         self.fast_release(device_instance, 0);
+        // The RM's `ctx0_reset` frees every peer-fence mapping context 0
+        // takes part in, as consumer and as producer, along with the fence
+        // page they map. So must this cache, or the respawned compositor
+        // waits on its clients -- and is waited on by them -- through VAs
+        // of the channel that is gone: an MMU fault on the first frame.
+        self.forget_peer_fences(0);
         lock::pump();
         let status = nvidia_rm_sys::rm_init::ctx0_reset(device_instance);
         if status == 0 {
@@ -14667,13 +14682,15 @@ mod nouveau_bookkeeping_tests {
     // ----- With the fake RM: the arms a GL client reaches once attached -----
 
     use super::rm_host_shims::{
-        fake_fbmem_offset, reset_fake_rm, FastChan, FAKE_DOORBELL, FAKE_RM, FAST_ENTRIES,
-        FAST_GPFIFO_OFF, FAST_PB_OFF, FAST_SEM_OFF,
+        fake_fbmem_offset, notifier_pa, reset_fake_rm, FastChan, FAKE_DOORBELL, FAKE_RM,
+        FAST_ENTRIES, FAST_GPFIFO_OFF, FAST_PB_OFF, FAST_SEM_OFF,
     };
 
     /// The compositor's pid: it owns ctx 0, so every other pid is a GL
     /// client and gets a context of its own.
     const COMP: u64 = 66_000;
+    /// The compositor respawned: a new pid for the same role.
+    const COMP2: u64 = 66_004;
 
     fn gpu_rm() -> NvidiaGpu {
         let gpu = gpu();
@@ -17304,6 +17321,354 @@ mod nouveau_bookkeeping_tests {
         assert!(FAKE_RM.lock().peer_maps.is_empty());
         assert_eq!(FAKE_RM.lock().bad, 0);
     }
+
+    // ----- The compositor's singleton: claimed through the ladder, reset at exit -----
+
+    /// A GPU whose fake RM carries the compositor's ladder too, so ctx 0 is
+    /// claimed the way the desktop claims it: through `CHANNEL_ALLOC`.
+    fn gpu_rm_ladder() -> NvidiaGpu {
+        let gpu = gpu_rm_fast();
+        gpu.ctx0_owner.store(0, Ordering::Release);
+        FAKE_RM.lock().ladder = true;
+        gpu
+    }
+
+    fn ctx0_owner(gpu: &NvidiaGpu) -> u64 {
+        gpu.ctx0_owner.load(Ordering::Acquire)
+    }
+
+    fn ctx0_resets() -> u32 {
+        FAKE_RM.lock().ctx0_resets
+    }
+
+    fn step17_builds() -> u32 {
+        FAKE_RM.lock().step17_builds
+    }
+
+    #[test]
+    fn the_compositor_claims_ctx0_through_the_ladder_once_and_keeps_it_across_its_throwaway_channels(
+    ) {
+        let _g = LOCK.lock();
+        let _live = LiveBytes::hold();
+        let gpu = gpu_rm_ladder();
+        assert_eq!(ctx0_owner(&gpu), 0);
+        // The ladder refusing at either step, or stopping part-way: no
+        // channel, no claim, nothing built behind index 0.
+        FAKE_RM.lock().fail_step16 = true;
+        assert_eq!(
+            channel_alloc(&gpu, COMP).map(|c| c.channel),
+            Err(nv::ENODEV)
+        );
+        FAKE_RM.lock().fail_step16 = false;
+        FAKE_RM.lock().incomplete_step16 = true;
+        assert_eq!(
+            channel_alloc(&gpu, COMP).map(|c| c.channel),
+            Err(nv::ENODEV),
+            "a ladder with no context share"
+        );
+        FAKE_RM.lock().incomplete_step16 = false;
+        FAKE_RM.lock().fail_step17 = true;
+        assert_eq!(
+            channel_alloc(&gpu, COMP).map(|c| c.channel),
+            Err(nv::ENODEV)
+        );
+        FAKE_RM.lock().fail_step17 = false;
+        FAKE_RM.lock().incomplete_step17 = true;
+        assert_eq!(
+            channel_alloc(&gpu, COMP).map(|c| c.channel),
+            Err(nv::ENODEV),
+            "a channel that never got scheduled"
+        );
+        FAKE_RM.lock().incomplete_step17 = false;
+        assert_eq!(ctx0_owner(&gpu), 0, "nothing claimed");
+        assert_eq!(rm_backed_channels(&gpu, COMP), 0);
+        assert_eq!(step17_builds(), 0);
+        assert!(!FAKE_RM.lock().ctxs.contains(&0));
+        // The first compositor channel: the ladder, the singleton channel,
+        // the notifier cached for the failure path, and the sticky claim.
+        nv::set_chan_notifier_pa(0);
+        assert_eq!(nv::chan_notifier_pa_cached(), None);
+        let before = FAKE_RM.lock().calls.len();
+        let c = channel_alloc(&gpu, COMP).unwrap();
+        assert_eq!(c.channel, 0);
+        assert_eq!(
+            c.notifier_handle, 0x6000,
+            "the singleton channel's notifier"
+        );
+        assert_eq!(ctx0_owner(&gpu), COMP);
+        assert_eq!(
+            ctx_of(&gpu, COMP),
+            None,
+            "no client context: the compositor IS context 0"
+        );
+        assert_eq!(rm_backed_channels(&gpu, COMP), 1);
+        let calls = rm_calls_since(before);
+        assert_eq!(&calls[..2], ["step16", "step17"]);
+        assert!(calls.contains(&"chan_notifier_pa"));
+        assert!(!calls.contains(&"ctx_alloc"), "no client context built");
+        assert_eq!(nv::chan_notifier_pa_cached(), Some(notifier_pa()));
+        // labwc runs two Vulkan instances: the second channel of the same
+        // pid rides the cached ladder.
+        assert_eq!(channel_alloc(&gpu, COMP).unwrap().channel, 1);
+        assert_eq!(step17_builds(), 1, "the ladder is a singleton");
+        assert_eq!(rm_backed_channels(&gpu, COMP), 2);
+        // A client meanwhile is a client: a context of its own.
+        assert_eq!(channel_alloc(&gpu, A).unwrap().notifier_handle, 0x6001);
+        assert_eq!(ctx_of(&gpu, A), Some((1, true)));
+        // The compositor freeing every channel it has (NVK's throwaway
+        // enumeration context, in both instances) keeps the sticky role:
+        // the next client is still a client, and the compositor's next
+        // channel is still ctx 0, on the same singleton channel.
+        assert_eq!(channel_free(&gpu, 0, COMP), Ok(0));
+        assert_eq!(channel_free(&gpu, 1, COMP), Ok(0));
+        assert_eq!(rm_backed_channels(&gpu, COMP), 0);
+        assert_eq!(ctx0_owner(&gpu), COMP, "sticky");
+        assert_eq!(channel_alloc(&gpu, B).unwrap().notifier_handle, 0x6002);
+        assert_eq!(ctx_of(&gpu, B), Some((2, true)));
+        let again = channel_alloc(&gpu, COMP).unwrap();
+        assert_eq!(again.notifier_handle, 0x6000);
+        assert_eq!(ctx_of(&gpu, COMP), None);
+        assert_eq!(step17_builds(), 1);
+        assert_eq!(ctx0_resets(), 0, "a CHANNEL_FREE is not an exit");
+        // And its submits go down the singleton's own ring, direct, from a
+        // buffer bound in the ladder's VAS.
+        let h = gem_new_rm(&gpu, 65536, nv::NOUVEAU_GEM_DOMAIN_GART, COMP)
+            .unwrap()
+            .handle;
+        assert_eq!(
+            vm_bind_ops(&gpu, COMP, &mut [map(h, PUSH_VA, 65536)]),
+            Ok(0)
+        );
+        assert_eq!(
+            FAKE_RM
+                .lock()
+                .maps_of_ctx(0)
+                .iter()
+                .map(|m| (m.0, m.1))
+                .collect::<Vec<_>>(),
+            [(PUSH_VA, 65536)],
+            "bound in context 0"
+        );
+        let out = syncobj::create(false);
+        assert_eq!(
+            exec(
+                &gpu,
+                COMP,
+                again.channel as u32,
+                &[push(PUSH_VA, 16)],
+                &[],
+                &[sync(out)]
+            ),
+            Ok(0)
+        );
+        let ring = run_gpu(0);
+        assert_eq!(ring.len(), 2, "the push and its fence");
+        assert_eq!(
+            ring[0],
+            Fetched::Push {
+                va: PUSH_VA,
+                len: 16
+            }
+        );
+        assert!(syncobj::destroy(out));
+        gpu.nouveau_release_process(A);
+        gpu.nouveau_release_process(B);
+        gpu.nouveau_release_process(COMP);
+        assert_eq!(ctx0_owner(&gpu), 0);
+        assert_eq!(FAKE_RM.lock().bad, 0);
+    }
+
+    #[test]
+    fn the_compositors_exit_gives_ctx0_back_and_the_respawn_gets_a_fresh_channel_and_fresh_peer_mappings(
+    ) {
+        let _g = LOCK.lock();
+        let _live = LiveBytes::hold();
+        let gpu = gpu_rm_ladder();
+        FAKE_RM.lock().peer = true;
+        // 1 ms per clock read: every wait below is meant to be the GPU's;
+        // one that falls to the CPU ends after 10 s virtual, not never.
+        test_clock::set_auto_advance(1_000);
+        let ch_c = client_with_pushbuf(&gpu, COMP);
+        assert_eq!(ctx0_owner(&gpu), COMP);
+        let ch_a = client_with_pushbuf(&gpu, A);
+        // A frame each way: the compositor waits on the client's, and the
+        // client on the compositor's (the buffer's release).
+        let out = syncobj::create(false);
+        let out2 = syncobj::create(false);
+        assert_eq!(
+            exec(&gpu, A, ch_a, &[push(PUSH_VA, 16)], &[], &[sync(out)]),
+            Ok(0)
+        );
+        assert_eq!(
+            exec(
+                &gpu,
+                COMP,
+                ch_c,
+                &[push(PUSH_VA, 16)],
+                &[sync(out)],
+                &[sync(out2)]
+            ),
+            Ok(0)
+        );
+        assert_eq!(
+            exec(&gpu, A, ch_a, &[push(PUSH_VA, 16)], &[sync(out2)], &[]),
+            Ok(0)
+        );
+        assert_eq!(peer_maps_made(), 2, "one mapping each way");
+        let (_, stale) = peer_map(0, 1).unwrap();
+        let (_, stale_a) = peer_map(1, 0).unwrap();
+        assert_eq!(run_gpu(1).len(), 2);
+        assert_eq!(run_gpu(0).len(), 3, "acquire, push, fence");
+        assert_eq!(run_gpu(1).len(), 2, "acquire, push");
+        let old = chan(0);
+        // The compositor dies mid-session. Its window is released before
+        // the channel behind it, the singleton is torn down, the role is
+        // free, and the RM has dropped every mapping context 0 took part
+        // in -- both directions.
+        let before = FAKE_RM.lock().calls.len();
+        gpu.nouveau_release_process(COMP);
+        assert_eq!(ctx0_owner(&gpu), 0, "the role is free again");
+        let calls = rm_calls_since(before);
+        let released = calls
+            .iter()
+            .position(|c| *c == "exec_fast_release")
+            .expect("the window released");
+        let reset = calls
+            .iter()
+            .position(|c| *c == "ctx0_reset")
+            .expect("the singleton reset");
+        assert!(released < reset, "the window before the channel behind it");
+        assert_eq!(ctx0_resets(), 1);
+        assert!(!has_chan(0));
+        assert_eq!(peer_map(0, 1), None);
+        assert_eq!(peer_map(1, 0), None);
+        // The RM dropped both mappings with the channel; so must the driver's
+        // cache, or a client that outlives the compositor is waited on --
+        // and waits -- through the VAs the RM has already freed.
+        assert!(
+            gpu.nouveau_peer_fence
+                .lock()
+                .keys()
+                .all(|&(consumer, producer)| consumer != 0 && producer != 0),
+            "no mapping of context 0 is remembered past its reset"
+        );
+        // The clients go with it (their socket is gone)...
+        gpu.nouveau_release_process(A);
+        // ...and it comes back. Its CHANNEL_ALLOC rebuilds the singleton
+        // channel: a new ring, a new window, not the dead compositor's. A
+        // new client takes the dead one's index, and the two wait on each
+        // other through mappings of the NEW channels' fence pages.
+        let ch_c = client_with_pushbuf(&gpu, COMP2);
+        assert_eq!(ctx0_owner(&gpu), COMP2);
+        assert_eq!(step17_builds(), 2, "a new channel behind index 0");
+        let ch_b = client_with_pushbuf(&gpu, B);
+        assert_eq!(ctx_of(&gpu, B), Some((1, true)), "the dead client's index");
+        let out3 = syncobj::create(false);
+        let out4 = syncobj::create(false);
+        assert_eq!(
+            exec(&gpu, B, ch_b, &[push(PUSH_VA, 16)], &[], &[sync(out3)]),
+            Ok(0)
+        );
+        let before = FAKE_RM.lock().calls.len();
+        assert_eq!(
+            exec(
+                &gpu,
+                COMP2,
+                ch_c,
+                &[push(PUSH_VA, 16)],
+                &[sync(out3)],
+                &[sync(out4)]
+            ),
+            Ok(0)
+        );
+        assert_ne!(chan(0).buf, old.buf, "a fresh window");
+        assert!(
+            rm_calls_since(before).contains(&"map_peer_fence"),
+            "the client's fence mapped into the new compositor's VAS"
+        );
+        let (producer_va, fresh) = peer_map(0, 1).expect("a mapping the RM holds");
+        assert_eq!(producer_va, sem_va(&chan(1)));
+        assert_ne!(fresh, stale);
+        let before = FAKE_RM.lock().calls.len();
+        assert_eq!(
+            exec(&gpu, B, ch_b, &[push(PUSH_VA, 16)], &[sync(out4)], &[]),
+            Ok(0)
+        );
+        assert!(
+            rm_calls_since(before).contains(&"map_peer_fence"),
+            "and the new compositor's fence into the client's"
+        );
+        let (producer_va, fresh_a) = peer_map(1, 0).expect("a mapping the RM holds");
+        assert_eq!(producer_va, sem_va(&chan(0)), "of the NEW channel's fence");
+        assert_ne!(fresh_a, stale_a);
+        assert_eq!(run_gpu(1).len(), 2);
+        let ring = run_gpu(0);
+        assert_eq!(ring.len(), 3, "acquire, push, fence: no fault");
+        assert!(
+            matches!(ring[0], Fetched::Acquire { sem_va, .. } if sem_va == fresh),
+            "the acquire resolves on the client's landing zone: {:?}",
+            ring[0]
+        );
+        let ring = run_gpu(1);
+        assert_eq!(ring.len(), 2, "acquire, push: no fault");
+        assert!(
+            matches!(ring[0], Fetched::Acquire { sem_va, .. } if sem_va == fresh_a),
+            "the acquire resolves on the new compositor's landing zone: {:?}",
+            ring[0]
+        );
+        test_clock::set_auto_advance(0);
+        for h in [out, out2, out3, out4] {
+            assert!(syncobj::destroy(h));
+        }
+        gpu.nouveau_release_process(B);
+        gpu.nouveau_release_process(COMP2);
+        assert_eq!(ctx0_owner(&gpu), 0);
+        assert_eq!(ctx0_resets(), 2);
+        assert!(FAKE_RM.lock().peer_maps.is_empty());
+        assert_eq!(FAKE_RM.lock().bad, 0);
+    }
+
+    #[test]
+    fn a_compositor_that_freed_its_channels_before_exiting_still_gives_ctx0_back() {
+        let _g = LOCK.lock();
+        let _live = LiveBytes::hold();
+        let gpu = gpu_rm_ladder();
+        let c = channel_alloc(&gpu, COMP).unwrap().channel;
+        assert_eq!(ctx0_owner(&gpu), COMP);
+        // A client freeing its channel and leaving is its own business.
+        let ca = channel_alloc(&gpu, A).unwrap().channel;
+        assert_eq!(channel_free(&gpu, ca, A), Ok(0));
+        gpu.nouveau_release_process(A);
+        assert_eq!(ctx0_owner(&gpu), COMP);
+        assert_eq!(ctx0_resets(), 0);
+        // A clean compositor exit: NVK destroys its contexts (CHANNEL_FREE)
+        // before the device closes, so by the time the process goes there
+        // is no channel of its own left in the table to infer the role
+        // from. The role is the sticky claim, and that is what exits.
+        assert_eq!(channel_free(&gpu, c, COMP), Ok(0));
+        assert_eq!(rm_backed_channels(&gpu, COMP), 0);
+        gpu.nouveau_release_process(COMP);
+        assert_eq!(ctx0_owner(&gpu), 0, "the singleton is given back");
+        assert_eq!(ctx0_resets(), 1, "and its channel torn down");
+        // The respawn is the compositor again: ctx 0 on a rebuilt channel,
+        // not a GL client on a context of its own beside a singleton the
+        // dead one still holds.
+        let c2 = channel_alloc(&gpu, COMP2).unwrap();
+        assert_eq!(c2.notifier_handle, 0x6000);
+        assert_eq!(ctx0_owner(&gpu), COMP2);
+        assert_eq!(ctx_of(&gpu, COMP2), None);
+        assert_eq!(step17_builds(), 2);
+        // A stranger's exit, or the same exit twice, resets nothing more.
+        gpu.nouveau_release_process(STRANGER);
+        assert_eq!(ctx0_resets(), 1);
+        assert_eq!(ctx0_owner(&gpu), COMP2);
+        gpu.nouveau_release_process(COMP2);
+        assert_eq!(ctx0_resets(), 2);
+        gpu.nouveau_release_process(COMP2);
+        assert_eq!(ctx0_resets(), 2);
+        assert_eq!(ctx0_owner(&gpu), 0);
+        assert_eq!(FAKE_RM.lock().bad, 0);
+    }
 }
 
 /// The NVC57E surface flip on the host: `page_flip` against the fake ladder
@@ -17539,13 +17904,14 @@ mod surfaceflip_tests {
 
 /// The RM entry points the host test binary has no C code for: every
 /// `eclipse_rm_*` the `nvidia-rm-sys` crate declares, generated from its
-/// `extern "C"` blocks. The hardware ladder (GSP, display, the compositor's
-/// step16/17 channel, CE, EXEC) answers `NV_ERR_NOT_SUPPORTED`: a test GPU
-/// never reaches it. The eleven a GL client's own path goes through --
-/// context build and prime, GEM alloc/map/free, VM_BIND map/unmap, class
-/// objects -- are a small stateful fake (`FakeRm`), so `VM_BIND`, `GEM_NEW`
-/// and the RM-backed `CHANNEL_ALLOC` can be exercised on the host, with the
-/// RM's real refusals (a VA already taken, an object it never handed out).
+/// `extern "C"` blocks. The hardware ladder (GSP, display, CE) answers
+/// `NV_ERR_NOT_SUPPORTED`: a test GPU never reaches it. What a GL client's
+/// own path goes through -- context build and prime, GEM alloc/map/free,
+/// VM_BIND map/unmap, class objects, submission -- and, behind `ladder`,
+/// the compositor's step16/17 singleton and its reset, are a small stateful
+/// fake (`FakeRm`), so `VM_BIND`, `GEM_NEW`, `EXEC` and the RM-backed
+/// `CHANNEL_ALLOC` can be exercised on the host, with the RM's real
+/// refusals (a VA already taken, an object it never handed out).
 /// Global to the test binary, like the `drivers_*` shims in `net/e1000e.rs`.
 #[cfg(test)]
 mod rm_host_shims {
@@ -17614,13 +17980,41 @@ mod rm_host_shims {
     extern "C" fn eclipse_rm_ce_wait(_a0: u32, _a1: u64) -> u32 {
         NV_ERR_NOT_SUPPORTED
     }
-    #[no_mangle]
-    extern "C" fn eclipse_rm_chan_notifier_pa(_a0: u32, _a1: *mut u8) -> u32 {
-        NV_ERR_NOT_SUPPORTED
+    /// The singleton channel's error notifier (`NvNotification`, 16 bytes).
+    /// Real memory: the EXEC failure path reads it through `phys_to_virt`,
+    /// the identity here, with no RM call.
+    static NOTIFIER: [AtomicU32; 4] = [const { AtomicU32::new(0) }; 4];
+    pub(super) fn notifier_pa() -> u64 {
+        NOTIFIER.as_ptr() as u64
     }
+    /// Cached at `CHANNEL_ALLOC` for that failure path; there is one only
+    /// while step 17's channel stands.
     #[no_mangle]
-    extern "C" fn eclipse_rm_ctx0_reset(_a0: u32) -> u32 {
-        NV_ERR_NOT_SUPPORTED
+    extern "C" fn eclipse_rm_chan_notifier_pa(_inst: u32, out: *mut u64) -> u32 {
+        let mut f = FAKE_RM.lock();
+        f.calls.push("chan_notifier_pa");
+        if !f.chan_built {
+            return NV_ERR_INVALID_STATE;
+        }
+        unsafe { *out = notifier_pa() };
+        NV_OK
+    }
+    /// Tear down the singleton channel and clear step 17's cache, so the
+    /// next `step17` builds a new channel behind index 0; the ladder's VAS
+    /// stays. Drops every peer-fence mapping context 0 takes part in, as
+    /// the C does. A no-op before step 17, also as the C.
+    #[no_mangle]
+    extern "C" fn eclipse_rm_ctx0_reset(_inst: u32) -> u32 {
+        let mut f = FAKE_RM.lock();
+        f.calls.push("ctx0_reset");
+        if !f.chan_built {
+            return NV_OK;
+        }
+        f.chan_built = false;
+        f.ctx0_resets += 1;
+        f.ctxs.retain(|c| *c != 0);
+        f.peer_maps.retain(|m| m.0 != 0 && m.1 != 0);
+        NV_OK
     }
     #[no_mangle]
     extern "C" fn eclipse_rm_edid(_a0: u32, _a1: *mut u8) -> u32 {
@@ -17966,13 +18360,97 @@ mod rm_host_shims {
     extern "C" fn eclipse_rm_step15(_a0: u32, _a1: *mut u8) -> u32 {
         NV_ERR_NOT_SUPPORTED
     }
+    /// The VAS of the compositor's ladder: context 0's.
+    pub(super) const LADDER_H_VAS: u32 = 0x5000;
+    /// Step 16, the compositor's allocation ladder (client, device,
+    /// subdevice, VAS, TSG, context share). Idempotent: a repeat call
+    /// answers the cached, still-alive allocation.
     #[no_mangle]
-    extern "C" fn eclipse_rm_step16(_a0: u32, _a1: *mut u8) -> u32 {
-        NV_ERR_NOT_SUPPORTED
+    extern "C" fn eclipse_rm_step16(_inst: u32, out: *mut GrAlloc) -> u32 {
+        let mut f = FAKE_RM.lock();
+        f.calls.push("step16");
+        if !f.ladder {
+            return NV_ERR_NOT_SUPPORTED;
+        }
+        if f.fail_step16 {
+            return NV_ERR_INVALID_STATE;
+        }
+        let ctxshare_status = if f.incomplete_step16 {
+            NV_ERR_INVALID_STATE
+        } else {
+            f.ladder_built = true;
+            NV_OK
+        };
+        unsafe {
+            *out = GrAlloc {
+                client_status: 0,
+                device_status: 0,
+                subdev_status: 0,
+                vas_status: 0,
+                tsg_status: 0,
+                ctxshare_status,
+                h_client: 0x4000,
+                h_device: 0x4001,
+                h_subdevice: 0x4002,
+                h_vas: LADDER_H_VAS,
+                h_tsg: 0x4004,
+                h_ctxshare: if ctxshare_status == NV_OK { 0x4005 } else { 0 },
+            };
+        }
+        NV_OK
     }
+    /// Step 17 on the cached ladder: the singleton channel of context 0.
+    /// Idempotent until `ctx0_reset`; a rebuild is a new channel behind
+    /// index 0, so a direct-submit window of the old one is refused.
     #[no_mangle]
-    extern "C" fn eclipse_rm_step17(_a0: u32, _a1: *mut u8) -> u32 {
-        NV_ERR_NOT_SUPPORTED
+    extern "C" fn eclipse_rm_step17(_inst: u32, out: *mut GrChannel) -> u32 {
+        let mut f = FAKE_RM.lock();
+        f.calls.push("step17");
+        if !f.ladder {
+            return NV_ERR_NOT_SUPPORTED;
+        }
+        if !f.ladder_built || f.fail_step17 {
+            return NV_ERR_INVALID_STATE;
+        }
+        let sched_status = if f.incomplete_step17 {
+            NV_ERR_INVALID_STATE
+        } else {
+            if !f.chan_built {
+                f.chan_built = true;
+                f.step17_builds += 1;
+                if !f.ctxs.contains(&0) {
+                    f.ctxs.push(0);
+                }
+                if let Some(b) = f.ctx_build.iter_mut().find(|b| b.0 == 0) {
+                    b.1 += 1;
+                } else {
+                    f.ctx_build.push((0, 1));
+                }
+            }
+            NV_OK
+        };
+        unsafe {
+            *out = GrChannel {
+                userd_status: 0,
+                buf_status: 0,
+                virt_status: 0,
+                map_status: 0,
+                notif_status: 0,
+                chan_status: 0,
+                compute_status: 0,
+                sched_status,
+                h_userd: 0x4100,
+                h_phys_buf: 0x4101,
+                h_virt_buf: 0x4102,
+                h_notifier: 0x6000,
+                h_channel: 0x7000,
+                h_compute: 0x4106,
+                channel_class: 0xc46f,
+                userd_size: 0x100,
+                buf_gpu_va: 0x8_0000,
+            };
+        }
+        NV_OK
     }
     #[no_mangle]
     extern "C" fn eclipse_rm_step18(_a0: u32, _a1: *mut u8) -> u32 {
@@ -18019,7 +18497,8 @@ mod rm_host_shims {
     use alloc::vec::Vec;
     use core::sync::atomic::{AtomicU32, Ordering};
     use nvidia_rm_sys::rm_init::{
-        CtxAlloc, ExecFast, ExecSignal, ExecSubmit, GemAlloc, GemMapCpu, VmBind, ADDR_SYSMEM,
+        CtxAlloc, ExecFast, ExecSignal, ExecSubmit, GemAlloc, GemMapCpu, GrAlloc, GrChannel,
+        VmBind, ADDR_SYSMEM,
     };
 
     const NV_OK: u32 = 0;
@@ -18098,6 +18577,24 @@ mod rm_host_shims {
         pub peer_maps: Vec<(u32, u32, u64, u64)>,
         /// Mappings ever made: each gets a consumer VA of its own.
         peer_maps_made: u32,
+        /// `step16`/`step17` build the compositor's ladder instead of
+        /// answering `NV_ERR_NOT_SUPPORTED`.
+        pub ladder: bool,
+        pub fail_step16: bool,
+        /// `step16` returns `NV_OK` with the context share unallocated:
+        /// the C side's shape for a ladder that stopped part-way.
+        pub incomplete_step16: bool,
+        pub fail_step17: bool,
+        /// `step17` returns `NV_OK` with the channel never scheduled.
+        pub incomplete_step17: bool,
+        /// Step 16 ran to the end (`g_grAllocDone`).
+        ladder_built: bool,
+        /// Step 17's channel stands (`g_grChanDone`): cleared by `ctx0_reset`.
+        pub chan_built: bool,
+        /// How many channels step 17 built behind index 0.
+        pub step17_builds: u32,
+        /// How many times `ctx0_reset` found a channel to tear down.
+        pub ctx0_resets: u32,
     }
 
     const EMPTY_RM: FakeRm = FakeRm {
@@ -18133,6 +18630,15 @@ mod rm_host_shims {
         peer: false,
         peer_maps: Vec::new(),
         peer_maps_made: 0,
+        ladder: false,
+        fail_step16: false,
+        incomplete_step16: false,
+        fail_step17: false,
+        incomplete_step17: false,
+        ladder_built: false,
+        chan_built: false,
+        step17_builds: 0,
+        ctx0_resets: 0,
     };
 
     pub(super) static FAKE_RM: lock::Mutex<FakeRm> = lock::Mutex::new(EMPTY_RM);
