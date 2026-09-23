@@ -10550,11 +10550,31 @@ impl NvidiaGpu {
                     //
                     // Discovery channels (no RM) keep the bookkeeping-only
                     // answer: enumeration must work without hardware.
+                    //
+                    // The channel must exist and be the caller's, like
+                    // SCLASS: Linux resolves the token to one of the calling
+                    // file's own channels (`nouveau_abi16_chan`) and fails
+                    // EINVAL otherwise. Accepting a NEW on a channel nobody
+                    // allocated, or on another process's, used to answer
+                    // "bookkeeping only" -- which on an RM-backed channel is
+                    // exactly the unbuilt engine context described above.
                     let rm_backed = {
                         let chans = self.nouveau_channels.lock();
-                        chans
-                            .iter()
-                            .any(|c| c.id >= 0 && c.id as u64 == hdr.token && c.rm_backed)
+                        let Some(c) = chans.iter().find(|c| {
+                            c.id >= 0
+                                && c.id as u64 == hdr.token
+                                && (owner_pid == 0 || c.owner_pid == owner_pid)
+                        }) else {
+                            log::warn!(
+                                "[nouveau-uapi] NVIF NEW oclass={:#06x}: no channel with token={} \
+                                 for pid={} -- CHANNEL_ALLOC must come first",
+                                new.oclass,
+                                hdr.token,
+                                owner_pid
+                            );
+                            return Err(nv::EINVAL);
+                        };
+                        c.rm_backed
                     };
                     if rm_backed {
                         let Some(device_instance) = *self.rm_device_instance.lock() else {
@@ -10742,12 +10762,20 @@ impl NvidiaGpu {
                     );
                     return Err(nv::EINVAL);
                 }
+                // The caller's own channel, as in Linux (`nouveau_abi16_chan`
+                // walks the calling file's channels): another process's
+                // token is EINVAL, not its engine list.
                 let chan = self.nouveau_channels.lock();
-                let Some(st) = chan.iter().find(|c| c.id >= 0 && c.id as u64 == hdr.token) else {
+                let Some(st) = chan.iter().find(|c| {
+                    c.id >= 0
+                        && c.id as u64 == hdr.token
+                        && (owner_pid == 0 || c.owner_pid == owner_pid)
+                }) else {
                     log::warn!(
-                        "[nouveau-uapi] NVIF SCLASS: no channel with token={} -- CHANNEL_ALLOC \
-                         must come first",
-                        hdr.token
+                        "[nouveau-uapi] NVIF SCLASS: no channel with token={} for pid={} -- \
+                         CHANNEL_ALLOC must come first",
+                        hdr.token,
+                        owner_pid
                     );
                     return Err(nv::EINVAL);
                 };
@@ -13211,6 +13239,12 @@ impl NvidiaGpu {
     pub(super) fn for_test(device_id: u16, vram_size_mb: u32) -> Self {
         let bar0 = alloc::boxed::Box::leak(alloc::boxed::Box::new([0u32; 4])).as_ptr() as usize;
         let gem_handle_slice = crate::scheme::gem_mmap::alloc_handle_slice();
+        // The id table decides the architecture as it does for real; an id
+        // it does not know stands in for a Turing board it cannot size.
+        let (architecture, gpu_model) = match identify_gpu(device_id) {
+            (NvidiaArchitecture::Unknown, _, _) => (NvidiaArchitecture::Turing, "test"),
+            (arch, model, _) => (arch, model),
+        };
         Self {
             name: String::from("nvidia-test"),
             info: DisplayInfo {
@@ -13221,8 +13255,8 @@ impl NvidiaGpu {
                 fb_base_vaddr: 0,
                 fb_size: 256 << 20,
             },
-            architecture: NvidiaArchitecture::Turing,
-            gpu_model: "test",
+            architecture,
+            gpu_model,
             device_id,
             vram_size_mb,
             pitch_override: None,
@@ -14012,6 +14046,424 @@ mod nouveau_bookkeeping_tests {
         gpu.nouveau_gem.lock().retain(|o| o.handle != mine);
         assert_eq!(getparam(&gpu, nv::NOUVEAU_GETPARAM_VRAM_USED), Ok(0));
         gpu.nouveau_gem.lock().retain(|o| o.handle != in_gart);
+    }
+
+    // ----- NVIF: five payloads on one nr, resolved by the header's type -----
+
+    const HDR: usize = size_of::<nv::NvifIoctlV0>();
+    const NEW: usize = size_of::<nv::NvifIoctlNewV0>();
+    const MTHD: usize = size_of::<nv::NvifIoctlMthdV0>();
+    const SCLASS: usize = size_of::<nv::NvifIoctlSclassV0>();
+    const OCLASS: usize = size_of::<nv::NvifSclassOclassV0>();
+    const INFO: usize = size_of::<nv::NvDeviceInfoV0>();
+
+    /// A raw NVIF request: mesa's anonymous `struct { ioctl; body; data }`
+    /// as bytes, written unaligned exactly as the arm reads it.
+    struct Nvif(Vec<u8>);
+
+    impl Nvif {
+        fn new(type_: u8, route: u8, token: u64, object: u64, len: usize) -> Self {
+            let mut b = alloc::vec![0u8; len];
+            let hdr = nv::NvifIoctlV0 {
+                version: 0,
+                type_,
+                pad02: [0; 4],
+                owner: 0,
+                route,
+                token,
+                object,
+            };
+            unsafe { core::ptr::write_unaligned(b.as_mut_ptr() as *mut nv::NvifIoctlV0, hdr) };
+            Nvif(b)
+        }
+
+        fn put<T: Copy>(mut self, at: usize, v: T) -> Self {
+            assert!(at + size_of::<T>() <= self.0.len());
+            unsafe { core::ptr::write_unaligned(self.0.as_mut_ptr().add(at) as *mut T, v) };
+            self
+        }
+
+        /// Shortens the declared length, keeping the bytes behind it
+        /// allocated (and zero): a driver that reads past the length reads
+        /// a zero, not the heap, so the only thing a test observes is what
+        /// the driver decided from the length itself.
+        fn cut(mut self, len: usize) -> Self {
+            self.0.truncate(len);
+            self
+        }
+
+        fn get<T: Copy>(&self, at: usize) -> T {
+            assert!(at + size_of::<T>() <= self.0.len());
+            unsafe { core::ptr::read_unaligned(self.0.as_ptr().add(at) as *const T) }
+        }
+
+        fn send(&mut self, gpu: &NvidiaGpu, pid: u64) -> Result<usize, i32> {
+            let req = ioc(IOC_WRITE, DRM_IOCTL_TYPE, nv::NR_NVIF, self.0.len());
+            gpu.nouveau_ioctl(req, self.0.as_mut_ptr() as usize, pid)
+        }
+    }
+
+    fn new_body(oclass: i32, object: u64) -> nv::NvifIoctlNewV0 {
+        nv::NvifIoctlNewV0 {
+            version: 0,
+            pad01: [0; 6],
+            route: 0,
+            token: object,
+            object,
+            handle: 0,
+            oclass,
+        }
+    }
+
+    /// `nouveau_ws_device_alloc`: 72 bytes, NEW of NV_DEVICE with a selector.
+    fn device_new(device: u64) -> Nvif {
+        Nvif::new(
+            nv::NVIF_IOCTL_V0_NEW,
+            0,
+            0,
+            0,
+            HDR + NEW + size_of::<nv::NvDeviceV0>(),
+        )
+        .put(HDR, new_body(nv::NVIF_CLASS_NV_DEVICE, 0xd0d0))
+        .put(
+            HDR + NEW,
+            nv::NvDeviceV0 {
+                version: 0,
+                pad01: [0; 7],
+                device,
+            },
+        )
+    }
+
+    /// `nouveau_ws_subchan_alloc`: 56 bytes, NEW of an engine class on a
+    /// channel (route 0xff, token = the channel id).
+    fn subchan_new(channel: u64, oclass: i32, object: u64) -> Nvif {
+        Nvif::new(nv::NVIF_IOCTL_V0_NEW, 0xff, channel, 0, HDR + NEW)
+            .put(HDR, new_body(oclass, object))
+    }
+
+    /// `nouveau_ws_device_info`: 136 bytes, MTHD NV_DEVICE_V0_INFO.
+    fn device_info(method: u8) -> Nvif {
+        Nvif::new(nv::NVIF_IOCTL_V0_MTHD, 0, 0, 0xd0d0, HDR + MTHD + INFO).put(
+            HDR,
+            nv::NvifIoctlMthdV0 {
+                version: 0,
+                method,
+                pad02: [0; 6],
+            },
+        )
+    }
+
+    /// `nouveau_ws_context_query_classes`: SCLASS with `slots` entries of
+    /// room, every one pre-filled so a stale slot is visible.
+    fn sclass(channel: u64, route: u8, count: u8, slots: usize) -> Nvif {
+        let mut r = Nvif::new(
+            nv::NVIF_IOCTL_V0_SCLASS,
+            route,
+            channel,
+            0,
+            HDR + SCLASS + slots * OCLASS,
+        )
+        .put(
+            HDR,
+            nv::NvifIoctlSclassV0 {
+                version: 0,
+                count,
+                pad02: [0; 6],
+            },
+        );
+        for i in 0..slots {
+            r = r.put(
+                HDR + SCLASS + i * OCLASS,
+                nv::NvifSclassOclassV0 {
+                    oclass: 0x7777,
+                    minver: 7,
+                    maxver: 7,
+                },
+            );
+        }
+        r
+    }
+
+    fn classes_in(r: &Nvif) -> (u8, Vec<i32>) {
+        let count = r.get::<nv::NvifIoctlSclassV0>(HDR).count;
+        let slots = (r.0.len() - HDR - SCLASS) / OCLASS;
+        let list = (0..slots)
+            .map(|i| {
+                r.get::<nv::NvifSclassOclassV0>(HDR + SCLASS + i * OCLASS)
+                    .oclass
+            })
+            .collect();
+        (count, list)
+    }
+
+    fn cstr(b: &[u8]) -> &str {
+        let end = b.iter().position(|&c| c == 0).unwrap_or(b.len());
+        core::str::from_utf8(&b[..end]).unwrap()
+    }
+
+    #[test]
+    fn nvif_refuses_a_short_payload_and_an_unknown_type_before_reading_a_body() {
+        let _g = LOCK.lock();
+        let gpu = gpu();
+        assert_eq!(
+            Nvif::new(nv::NVIF_IOCTL_V0_NEW, 0, 0, 0, HDR - 1).send(&gpu, A),
+            Err(nv::EINVAL),
+            "shorter than the header"
+        );
+        assert_eq!(
+            Nvif::new(0x09, 0, 0, 0, HDR + NEW).send(&gpu, A),
+            Err(nv::ENOSYS),
+            "a type this driver has no arm for"
+        );
+        assert_eq!(
+            device_new(u64::MAX).cut(HDR + NEW - 1).send(&gpu, A),
+            Err(nv::EINVAL),
+            "NEW without its 32-byte body, however acceptable the bytes behind"
+        );
+        assert_eq!(
+            Nvif::new(nv::NVIF_IOCTL_V0_MTHD, 0, 0, 0, HDR + MTHD - 1).send(&gpu, A),
+            Err(nv::EINVAL),
+            "MTHD without its 8-byte body"
+        );
+        assert_eq!(
+            device_info(nv::NV_DEVICE_V0_INFO)
+                .cut(HDR + MTHD + INFO - 1)
+                .send(&gpu, A),
+            Err(nv::EINVAL),
+            "INFO with no room for its 104-byte reply"
+        );
+        assert_eq!(channel_alloc(&gpu, A).unwrap().channel, 0);
+        assert_eq!(
+            sclass(0, 0xff, 16, 16).cut(HDR + SCLASS - 1).send(&gpu, A),
+            Err(nv::EINVAL),
+            "SCLASS without its 8-byte body, on a channel that exists"
+        );
+        // An NVIF request has no fixed floor at the dispatch: the 24-byte
+        // DEL is a complete request.
+        assert_eq!(
+            Nvif::new(nv::NVIF_IOCTL_V0_DEL, 0, 0, 0x1234, HDR).send(&gpu, A),
+            Ok(0)
+        );
+    }
+
+    #[test]
+    fn nvif_new_of_the_device_object_takes_only_the_client_default() {
+        let _g = LOCK.lock();
+        let gpu = gpu();
+        assert_eq!(device_new(u64::MAX).send(&gpu, A), Ok(0), "mesa's ~0");
+        assert_eq!(
+            device_new(0).send(&gpu, A),
+            Err(nv::EINVAL),
+            "this node exposes one GPU; selecting another is an error"
+        );
+        assert_eq!(device_new(1).send(&gpu, A), Err(nv::EINVAL));
+        // No class data at all (a 56-byte NEW of NV_DEVICE): the default.
+        assert_eq!(
+            Nvif::new(nv::NVIF_IOCTL_V0_NEW, 0, 0, 0, HDR + NEW)
+                .put(HDR, new_body(nv::NVIF_CLASS_NV_DEVICE, 1))
+                .send(&gpu, A),
+            Ok(0)
+        );
+        // oclass 0 is what mesa sends when SCLASS gave it nothing: refused
+        // even on a channel of the caller's, where any real class is fine.
+        assert_eq!(channel_alloc(&gpu, A).unwrap().channel, 0);
+        assert_eq!(subchan_new(0, 0xc597, 1).send(&gpu, A), Ok(0));
+        assert_eq!(subchan_new(0, 0, 1).send(&gpu, A), Err(nv::EINVAL));
+    }
+
+    #[test]
+    fn nvif_device_info_reports_the_board_and_floors_its_vram() {
+        let _g = LOCK.lock();
+        let gpu = gpu();
+        let mut r = device_info(nv::NV_DEVICE_V0_INFO);
+        assert_eq!(r.send(&gpu, A), Ok(0));
+        let info: nv::NvDeviceInfoV0 = r.get(HDR + MTHD);
+        assert_eq!(info.version, 0);
+        assert_eq!(
+            info.platform,
+            nv::NV_DEVICE_INFO_V0_PCIE,
+            "discrete: NVK's conformance gate needs DIS"
+        );
+        assert_eq!(info.chipset, 0x162, "the same chip GETPARAM reports");
+        assert_eq!(info.revision, 0, "BAR0 reads as zero");
+        assert_eq!(info.family, 0);
+        assert_eq!(
+            (info.ram_size, info.ram_user),
+            (8192 * MIB, 8192 * MIB),
+            "ram_user is what mesa takes as vram_size_B"
+        );
+        assert_eq!(cstr(&info.chip), "TU1xx");
+        assert_eq!(cstr(&info.name), "nvidia-test");
+        assert_eq!(
+            device_info(0x05).send(&gpu, A),
+            Err(nv::ENOSYS),
+            "the only method is INFO"
+        );
+        // A board the id table does not know: the architecture's floor,
+        // never a 0 that would leave NVK with an empty VRAM heap.
+        let unknown = NvidiaGpu::for_test(0x1fff, 0);
+        let mut r = device_info(nv::NV_DEVICE_V0_INFO);
+        assert_eq!(r.send(&unknown, A), Ok(0));
+        let info: nv::NvDeviceInfoV0 = r.get(HDR + MTHD);
+        assert_eq!(info.ram_user, 4096 * MIB);
+    }
+
+    #[test]
+    fn nvif_sclass_lists_the_callers_channels_engines_within_the_room_offered() {
+        let _g = LOCK.lock();
+        let gpu = gpu();
+        assert_eq!(
+            sclass(0, 0xff, 16, 16).send(&gpu, A),
+            Err(nv::EINVAL),
+            "no channel yet"
+        );
+        assert_eq!(channel_alloc(&gpu, A).unwrap().channel, 0);
+        assert_eq!(
+            sclass(0, 0x00, 16, 16).send(&gpu, A),
+            Err(nv::EINVAL),
+            "classes hang off a channel: route must be 0xff"
+        );
+        assert_eq!(
+            sclass(0, 0xff, 16, 16).send(&gpu, B),
+            Err(nv::EINVAL),
+            "not B's channel"
+        );
+        assert_eq!(sclass(7, 0xff, 16, 16).send(&gpu, A), Err(nv::EINVAL));
+        // Mesa's call: 16 slots offered, all five engines come back and
+        // the unused tail is cleared (mesa reads every slot).
+        let turing = [0x902d, 0xa140, 0xc597, 0xc5c0, 0xc5b5];
+        let mut r = sclass(0, 0xff, 16, 16);
+        assert_eq!(r.send(&gpu, A), Ok(0));
+        let (count, list) = classes_in(&r);
+        assert_eq!(count, 5);
+        assert_eq!(&list[..5], &turing);
+        assert!(
+            list[5..].iter().all(|&c| c == 0),
+            "no stale slot: {:?}",
+            list
+        );
+        let mut r = sclass(0, 0xff, 16, 16);
+        assert_eq!(r.send(&gpu, 0), Ok(0), "the kernel reads anyone's");
+        // Less room than engines, said by count: the first ones, and
+        // nothing written past what the caller offered.
+        let mut r = sclass(0, 0xff, 3, 16);
+        assert_eq!(r.send(&gpu, A), Ok(0));
+        let (count, list) = classes_in(&r);
+        assert_eq!(count, 3);
+        assert_eq!(&list[..3], &turing[..3]);
+        assert!(
+            list[3..].iter().all(|&c| c == 0x7777),
+            "beyond count is the caller's: {:?}",
+            list
+        );
+        // Less room than count, said by the payload itself.
+        let mut r = sclass(0, 0xff, 16, 2);
+        assert_eq!(r.send(&gpu, A), Ok(0));
+        assert_eq!(classes_in(&r), (2, alloc::vec![0x902d, 0xa140]));
+        // More slots than the protocol's ceiling: capped at 16.
+        let mut r = sclass(0, 0xff, 40, 40);
+        assert_eq!(r.send(&gpu, A), Ok(0));
+        let (count, list) = classes_in(&r);
+        assert_eq!(count, 5);
+        assert!(list[5..16].iter().all(|&c| c == 0));
+        assert!(
+            list[16..].iter().all(|&c| c == 0x7777),
+            "past 16 is never touched"
+        );
+        // A second GPU of another architecture answers with its own triple.
+        let ampere = NvidiaGpu::for_test(0x2204, 24576);
+        assert_eq!(channel_alloc(&ampere, A).unwrap().channel, 0);
+        let mut r = sclass(0, 0xff, 16, 16);
+        assert_eq!(r.send(&ampere, A), Ok(0));
+        assert_eq!(
+            &classes_in(&r).1[..5],
+            &[0x902d, 0xa140, 0xc797, 0xc7c0, 0xc7b5]
+        );
+    }
+
+    #[test]
+    fn nvif_new_of_a_subchannel_needs_the_callers_channel_and_records_nothing_without_the_rm() {
+        let _g = LOCK.lock();
+        let gpu = gpu();
+        assert_eq!(
+            subchan_new(0, 0xc597, 0x1000).send(&gpu, A),
+            Err(nv::EINVAL),
+            "no channel: Linux's abi16 finds no object for the token"
+        );
+        assert_eq!(channel_alloc(&gpu, A).unwrap().channel, 0);
+        assert_eq!(subchan_new(0, 0xc597, 0x1000).send(&gpu, A), Ok(0));
+        assert_eq!(
+            subchan_new(0, 0xc5c0, 0x1008).send(&gpu, 0),
+            Ok(0),
+            "the kernel"
+        );
+        assert_eq!(
+            subchan_new(0, 0xc597, 0x1000).send(&gpu, B),
+            Err(nv::EINVAL),
+            "A's channel is not B's"
+        );
+        assert_eq!(
+            subchan_new(3, 0xc597, 0x1000).send(&gpu, A),
+            Err(nv::EINVAL)
+        );
+        assert!(
+            nv::class_objects_drain_pid(A).is_empty(),
+            "a discovery channel builds no RM object, so there is nothing to reap"
+        );
+        assert_eq!(channel_free(&gpu, 0, A), Ok(0));
+        assert_eq!(
+            subchan_new(0, 0xc597, 0x1000).send(&gpu, A),
+            Err(nv::EINVAL),
+            "freed: the token means nothing again"
+        );
+    }
+
+    #[test]
+    fn nvif_del_and_the_class_registry_are_scoped_to_the_owner_and_the_channel() {
+        let _g = LOCK.lock();
+        let gpu = gpu();
+        nv::class_object_insert(3, 0x1000, 0x5a5a, A);
+        nv::class_object_insert(3, 0x1000, 0x6b6b, B);
+        nv::class_object_insert(4, 0x2000, 0x7c7c, A);
+        nv::class_object_insert(3, 0x3000, 0x8d8d, A);
+        // A DEL names the object by the cookie mesa passed at NEW (a heap
+        // pointer, so equal across processes): only the caller's goes.
+        assert_eq!(
+            Nvif::new(nv::NVIF_IOCTL_V0_DEL, 0xff, 3, 0x1000, HDR).send(&gpu, STRANGER),
+            Ok(0),
+            "nothing of STRANGER's: a no-op, as in Linux's nvif_object_dtor"
+        );
+        assert_eq!(
+            Nvif::new(nv::NVIF_IOCTL_V0_DEL, 0xff, 3, 0x1000, HDR).send(&gpu, A),
+            Ok(0)
+        );
+        assert_eq!(nv::class_object_remove(0x1000, A), None, "gone");
+        assert_eq!(
+            nv::class_object_remove(0x1000, B),
+            Some(0x6b6b),
+            "B's survived A's DEL"
+        );
+        // CHANNEL_FREE reaps what a process left on THAT channel.
+        assert_eq!(nv::class_objects_drain_channel(3, B), alloc::vec![]);
+        assert_eq!(
+            nv::class_objects_drain_channel(3, A),
+            alloc::vec![(0x3000, 0x8d8d)]
+        );
+        assert_eq!(nv::class_objects_drain_channel(4, B), alloc::vec![]);
+        // Process exit reaps everything of that pid, across channels.
+        nv::class_object_insert(5, 0x5000, 0x9e9e, A);
+        nv::class_object_insert(5, 0x6000, 0xafaf, B);
+        assert_eq!(
+            nv::class_objects_drain_pid(A),
+            alloc::vec![(0x2000, 0x7c7c), (0x5000, 0x9e9e)],
+            "in insertion order"
+        );
+        assert_eq!(nv::class_objects_drain_pid(A), alloc::vec![]);
+        assert_eq!(
+            nv::class_objects_drain_pid(B),
+            alloc::vec![(0x6000, 0xafaf)]
+        );
     }
 }
 
