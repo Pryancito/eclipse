@@ -1042,6 +1042,22 @@ impl VMObjectTrait for VMObjectPaged {
             if inner.parent.is_some() {
                 return Err(ZxError::NOT_SUPPORTED);
             }
+            // A pinned page is one a device may be doing DMA into right now:
+            // handing its frame back to the allocator is a use-after-free that
+            // nothing downstream can notice, and it leaves `unpin` looking for
+            // a frame that is no longer there. `set_len` and `set_cache_policy`
+            // already refuse for exactly this reason; this is the third of the
+            // three, and it was the one that did not. Asked first, over the
+            // whole range, so a refused decommit leaves every page alone.
+            for i in 0..pages {
+                let pinned = inner
+                    .frames
+                    .get(&(start_page + i))
+                    .is_some_and(|frame| frame.pin_count != 0);
+                if pinned {
+                    return Err(ZxError::BAD_STATE);
+                }
+            }
             for i in 0..pages {
                 inner.decommit(start_page + i);
             }
@@ -1235,11 +1251,18 @@ impl VMObjectTrait for VMObjectPaged {
         let start_page = offset / PAGE_SIZE;
         let end_page = pages(offset + len);
         for i in start_page..end_page {
-            let frame = inner.frames.get(&i).unwrap();
+            // Not `unwrap`: `zx_bti_pin` commits the range and then pins it,
+            // and those are two turns of this lock. A `zx_vmo_op_range`
+            // decommit in between -- which nothing refuses, because the pages
+            // are not pinned yet -- left this looking for a frame that is no
+            // longer there, and that was a kernel panic.
+            let frame = inner.frames.get(&i).ok_or(ZxError::BAD_STATE)?;
             if frame.pin_count == VM_PAGE_OBJECT_MAX_PIN_COUNT {
                 return Err(ZxError::UNAVAILABLE);
             }
         }
+        // Every frame in the range was there a moment ago and this lock has
+        // not been let go of since.
         for i in start_page..end_page {
             inner.frames.get_mut(&i).unwrap().pin_count += 1;
             inner.pin_count += 1;
@@ -1258,12 +1281,26 @@ impl VMObjectTrait for VMObjectPaged {
         let start_page = offset / PAGE_SIZE;
         let end_page = pages(offset + len);
         for i in start_page..end_page {
-            let frame = inner.frames.get(&i).unwrap();
+            let frame = inner.frames.get(&i).ok_or(ZxError::BAD_STATE)?;
             if frame.pin_count == 0 {
                 return Err(ZxError::UNAVAILABLE);
             }
         }
-        assert_ne!(inner.pin_count, 0);
+        if inner.pin_count == 0 {
+            // The loop above established that every frame in the range is
+            // pinned, and the object's own count is their sum, so this says
+            // the two disagree. It was an `assert_ne!`: no guard at all in
+            // release, where the `-= 1` below wraps instead, and in debug a
+            // kernel panic raised from wherever the unpin came from -- which
+            // is usually `PinnedMemoryToken::drop`, so it aborted rather than
+            // unwound. An answer the caller can read is better than both.
+            error!(
+                "unpinning {:#x}..{:#x} of a vmo whose own pin count is zero",
+                offset,
+                offset + len,
+            );
+            return Err(ZxError::BAD_STATE);
+        }
         for i in start_page..end_page {
             inner.frames.get_mut(&i).unwrap().pin_count -= 1;
             inner.pin_count -= 1;
@@ -2287,7 +2324,21 @@ impl Drop for VMObjectPaged {
                         frame.1.pin_count -= 1;
                     }
                 }
-                assert_eq!(frame.1.pin_count, 0);
+                if frame.1.pin_count != 0 {
+                    // A frame still pinned here means a device was told it
+                    // could do DMA into a page that is on its way back to the
+                    // allocator, and the token that made that promise is
+                    // already gone. Worth saying loudly; not worth a panic.
+                    // This is a destructor, and a panic in one aborts instead
+                    // of unwinding, so the report costs the whole machine --
+                    // and it is where `PinnedMemoryToken`'s own `Drop` would
+                    // land one frame later, now that a refused `unpin` there
+                    // is reported rather than asserted. Same hole, one report.
+                    error!(
+                        "vmo dropped with page {} still pinned {} time(s)",
+                        frame.0, frame.1.pin_count,
+                    );
+                }
             }
             drop_crumb(9); // scope tail: about to release the family lock
         }
@@ -2558,5 +2609,190 @@ mod tests {
         assert_eq!(vmo.committed_pages_in_range(2, 64), 0);
         assert_eq!(vmo.committed_pages_in_range(64, 65), 0);
         assert_eq!(vmo.committed_pages_in_range(64, 8), 0);
+    }
+}
+
+#[cfg(test)]
+mod pin_tests {
+    //! Pinning is the promise that a page stays where it is because a device
+    //! is about to do DMA into it. Three operations take pages away from a
+    //! VMO; two of them asked whether anything was pinned first and the third
+    //! did not, so the frame went back to the allocator with the IOMMU still
+    //! pointing at it.
+    use super::*;
+
+    /// A four-page object with every page committed.
+    fn committed() -> Arc<VmObject> {
+        let vmo = VmObject::new_paged(4);
+        vmo.commit(0, 4 * PAGE_SIZE).unwrap();
+        assert_eq!(held(&vmo), [true; 4]);
+        vmo
+    }
+
+    /// Holds a pin for as long as it is alive.
+    ///
+    /// `Drop for VMObjectPaged` asserts that no frame is left pinned, so a
+    /// test that fails an assertion with a pin still held panics a second
+    /// time on its way out and aborts the whole binary: the suite goes red
+    /// with no test name anywhere in it, which is most of what a CI failure
+    /// is for. Nothing reachable from userspace can trip that assert -- the
+    /// token holds the `Arc` -- but a test can, and letting go from a `Drop`
+    /// runs on the unwinding path too.
+    struct Pinned<'a> {
+        vmo: &'a Arc<VmObject>,
+        offset: usize,
+        len: usize,
+        held: bool,
+    }
+
+    impl Pinned<'_> {
+        /// Let go of the pin, and say whether the kernel agreed.
+        fn release(mut self) -> ZxResult {
+            self.held = false;
+            self.vmo.unpin(self.offset, self.len)
+        }
+    }
+
+    impl Drop for Pinned<'_> {
+        fn drop(&mut self) {
+            if self.held {
+                let _ = self.vmo.unpin(self.offset, self.len);
+            }
+        }
+    }
+
+    /// Pins a range and hands back the handle that lets go of it.
+    fn pin(vmo: &Arc<VmObject>, offset: usize, len: usize) -> Pinned<'_> {
+        vmo.pin(offset, len).unwrap();
+        Pinned {
+            vmo,
+            offset,
+            len,
+            held: true,
+        }
+    }
+
+    /// Which of the four pages the object is still holding a frame for.
+    fn held(vmo: &Arc<VmObject>) -> [bool; 4] {
+        let mut out = [false; 4];
+        for (i, slot) in out.iter_mut().enumerate() {
+            *slot = vmo.committed_pages_in_range(i, i + 1) == 1;
+        }
+        out
+    }
+
+    #[test]
+    /// A pinned page is not handed back to the allocator. `zx_vmo_op_range`
+    /// passes its offset and length straight through from userspace, so this
+    /// used to hand a frame a device was about to write into back for someone
+    /// else to use, and answer `Ok`.
+    fn a_pinned_page_is_not_handed_back_to_the_allocator() {
+        let vmo = committed();
+        // Two pages, so a pin that only marked the first one shows up here.
+        let pinned = pin(&vmo, 0, 2 * PAGE_SIZE);
+        assert_eq!(vmo.decommit(0, PAGE_SIZE), Err(ZxError::BAD_STATE));
+        assert_eq!(vmo.decommit(PAGE_SIZE, PAGE_SIZE), Err(ZxError::BAD_STATE));
+        assert_eq!(held(&vmo), [true; 4], "a page went under the pin");
+        // And with the pin released they go as usual.
+        pinned.release().unwrap();
+        vmo.decommit(0, 2 * PAGE_SIZE).unwrap();
+        assert_eq!(held(&vmo), [false, false, true, true]);
+    }
+
+    #[test]
+    /// The refusal is per page, not per object: the rest of a mostly-pinned
+    /// VMO can still be decommitted.
+    fn decommitting_around_a_pinned_page_still_works() {
+        let vmo = committed();
+        let pinned = pin(&vmo, PAGE_SIZE, PAGE_SIZE);
+        vmo.decommit(0, PAGE_SIZE).unwrap();
+        vmo.decommit(2 * PAGE_SIZE, 2 * PAGE_SIZE).unwrap();
+        assert_eq!(vmo.decommit(PAGE_SIZE, PAGE_SIZE), Err(ZxError::BAD_STATE));
+        assert_eq!(held(&vmo), [false, true, false, false]);
+        pinned.release().unwrap();
+    }
+
+    #[test]
+    /// And it is all or nothing: a range with one pinned page in it leaves
+    /// every page alone, including the ones before the pinned one.
+    fn a_refused_decommit_leaves_every_page_alone() {
+        let vmo = committed();
+        let pinned = pin(&vmo, 3 * PAGE_SIZE, PAGE_SIZE);
+        assert_eq!(vmo.decommit(0, 4 * PAGE_SIZE), Err(ZxError::BAD_STATE));
+        assert_eq!(held(&vmo), [true; 4]);
+        pinned.release().unwrap();
+    }
+
+    #[test]
+    /// Taking pages away is three operations, and all three answer the same
+    /// thing while something is pinned. Two of them always did.
+    fn the_three_ways_of_taking_pages_away_all_refuse_a_pinned_object() {
+        let vmo = VmObject::new_paged_with_resizable(true, 4);
+        vmo.commit(0, 4 * PAGE_SIZE).unwrap();
+        let pinned = pin(&vmo, 0, PAGE_SIZE);
+        assert_eq!(vmo.set_len(PAGE_SIZE), Err(ZxError::BAD_STATE));
+        assert_eq!(
+            vmo.set_cache_policy(CachePolicy::Uncached),
+            Err(ZxError::BAD_STATE),
+        );
+        assert_eq!(vmo.decommit(0, PAGE_SIZE), Err(ZxError::BAD_STATE));
+
+        pinned.release().unwrap();
+        vmo.decommit(0, PAGE_SIZE).unwrap();
+        vmo.set_len(PAGE_SIZE).unwrap();
+    }
+
+    #[test]
+    /// Pinning a page the object does not have is an error, not a panic.
+    /// `zx_bti_pin` commits the range and then pins it, and those are two
+    /// turns of the object's lock: a decommit in between is allowed, because
+    /// the pages are not pinned yet, and this is where it lands.
+    fn pinning_a_page_that_is_not_there_is_an_error_not_a_panic() {
+        let vmo = VmObject::new_paged(4);
+        assert_eq!(vmo.pin(0, PAGE_SIZE), Err(ZxError::BAD_STATE));
+
+        let vmo = committed();
+        vmo.decommit(2 * PAGE_SIZE, PAGE_SIZE).unwrap();
+        assert_eq!(vmo.pin(0, 4 * PAGE_SIZE), Err(ZxError::BAD_STATE));
+        // Nothing was half-pinned on the way to that answer: the pages before
+        // the missing one are still free to go.
+        vmo.decommit(0, PAGE_SIZE).unwrap();
+        assert_eq!(held(&vmo), [false, true, false, true]);
+    }
+
+    #[test]
+    /// Unpinning one is the same answer rather than the same panic.
+    fn unpinning_a_page_that_is_not_there_is_an_error_not_a_panic() {
+        let vmo = VmObject::new_paged(4);
+        assert_eq!(vmo.unpin(0, PAGE_SIZE), Err(ZxError::BAD_STATE));
+
+        // A page that is there but was never pinned is a different answer.
+        let vmo = committed();
+        assert_eq!(vmo.unpin(0, PAGE_SIZE), Err(ZxError::UNAVAILABLE));
+    }
+
+    #[test]
+    /// A VMO that goes away with a page still pinned is a hole worth saying
+    /// out loud, and saying it used to be an `assert_eq!` inside a
+    /// destructor. That costs the machine to report a leak, and in a test
+    /// binary it costs every test after this one: a panic raised while
+    /// something else is already unwinding does not unwind, it aborts, so
+    /// the run ends with no test name in it at all. It is also exactly
+    /// where a refused `unpin` in `PinnedMemoryToken`'s own `Drop` lands one
+    /// frame later, so the two have to agree.
+    fn a_vmo_that_goes_away_still_pinned_is_reported_not_a_panic() {
+        let vmo = committed();
+        vmo.pin(0, PAGE_SIZE).unwrap();
+        drop(vmo);
+    }
+
+    #[test]
+    /// A zero-length pin or unpin is nothing at all, whatever it names.
+    fn nothing_is_pinned_by_a_zero_length_range() {
+        let vmo = committed();
+        vmo.pin(0, 0).unwrap();
+        vmo.unpin(0, 0).unwrap();
+        vmo.decommit(0, PAGE_SIZE).unwrap();
+        assert_eq!(held(&vmo), [false, true, true, true]);
     }
 }
