@@ -1,11 +1,10 @@
 #[cfg(not(feature = "libos"))]
 use core::cell::UnsafeCell;
 
-cfg_if! {
-    if #[cfg(not(feature = "libos"))] {
-        pub(crate) mod page_table;
-    }
-}
+pub(crate) mod page_table;
+
+#[cfg(test)]
+pub(crate) mod test_frames;
 
 pub(crate) mod init_once;
 

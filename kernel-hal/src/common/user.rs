@@ -624,15 +624,14 @@ mod tests {
     //! stand-in for a user buffer and the copies below run for real.
 
     use super::*;
-    use crate::kernel_handler::KernelHandler;
-
-    struct TestHandler;
-    impl KernelHandler for TestHandler {}
 
     /// `check()` consults `KHANDLER`, which has no default outside `libos`.
-    /// `init_once_by` is a `call_once`, so every test may call this.
+    /// `init_once_by` is a `call_once`, so every test may call this -- and
+    /// because it is a `call_once`, the whole test binary shares whichever
+    /// handler lands first. So there is exactly one, in
+    /// [`crate::utils::test_frames`], and it answers frame allocations too.
     fn init_handler() {
-        crate::KHANDLER.init_once_by(&TestHandler);
+        crate::utils::test_frames::install();
     }
 
     // ---- bounds ---------------------------------------------------------
