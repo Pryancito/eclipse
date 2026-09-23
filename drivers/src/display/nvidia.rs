@@ -16693,11 +16693,23 @@ mod nouveau_bookkeeping_tests {
         assert_eq!(cpu_prep_nowait(&gpu, h, A), Err(nv::EBUSY));
         assert_eq!(userd(&c), (0, 3));
         // A blocking prep returns once the GPU has run past its probe.
+        // The GPU only starts fetching once that probe is on the ring
+        // (GPPut at 4): were it to run the two NOWAIT probes first, the
+        // prep would find the channel idle and append nothing, and this
+        // test would then wait its full five seconds for a third release
+        // that never comes.
         let now = test_clock::now();
         let sem = sem_va(&c);
         std::thread::scope(|s| {
             let t = s.spawn(move || {
                 test_clock::set(now);
+                for _ in 0..5_000 {
+                    if userd(&c).1 >= 4 {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                assert_eq!(userd(&c), (0, 4), "the blocking prep queued its probe");
                 let mut fetched = Vec::new();
                 for _ in 0..5_000 {
                     fetched.extend(run_gpu(1));
