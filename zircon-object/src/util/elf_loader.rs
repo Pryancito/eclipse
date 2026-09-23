@@ -9,7 +9,7 @@ use xmas_elf::program::ProgramHeader;
 use xmas_elf::{
     header::Class,
     program::{Flags, SegmentData, Type},
-    sections::{SectionData, SectionHeader, ShType},
+    sections::{SectionData, SectionHeader, ShType, SHN_LORESERVE},
     symbol_table::{DynEntry64, Entry},
     ElfFile,
 };
@@ -59,8 +59,6 @@ struct HeaderLayout {
     segment_fields: (usize, usize),
     /// Offsets of `sh_type`, `sh_offset` and `sh_size` inside a section header.
     section_fields: (usize, usize, usize),
-    /// Offset of `e_shstrndx` in the ELF header.
-    sh_str_index_at: usize,
 }
 
 impl HeaderLayout {
@@ -77,7 +75,6 @@ impl HeaderLayout {
                 sh_entry_size: 40,
                 segment_fields: (4, 16),
                 section_fields: (4, 16, 20),
-                sh_str_index_at: 50,
             }),
             ELF_CLASS64 => Some(Self {
                 header_size: 64,
@@ -88,7 +85,6 @@ impl HeaderLayout {
                 sh_entry_size: 64,
                 segment_fields: (8, 32),
                 section_fields: (4, 24, 32),
-                sh_str_index_at: 62,
             }),
             _ => None,
         }
@@ -146,12 +142,10 @@ pub fn check_elf_bounds(data: &[u8]) -> ZxResult {
         check_range_fits(offset, file_size, file_len)?;
     }
 
-    // `e_shstrndx` is an index the file chooses, and `get_shstr_table` reads
-    // that section with no range check of its own, so an index past the end of
-    // the table slices the file at an arbitrary multiple of the entry size.
-    if sh_table.count > 0 && read_le(data, layout.sh_str_index_at, 2) >= sh_table.count {
-        return Err(ZxError::INVALID_ARGS);
-    }
+    // `e_shstrndx` is not checked here. It is an index rather than an extent,
+    // and the only file it could be measured against a table for is one that
+    // has a table -- which is not the file that panicked. See
+    // [`section_count`], which is where every section index is bounded now.
 
     let (sh_type_at, sh_offset_at, sh_size_at) = layout.section_fields;
     for entry in sh_table.entries() {
@@ -490,11 +484,45 @@ pub fn str_at(table: &[u8], offset: u32) -> Option<&str> {
     core::str::from_utf8(&rest[..len]).ok()
 }
 
+/// How many sections of `elf` can be read at all.
+///
+/// `e_shnum` is a `u16` the file chooses, but `SHN_LORESERVE` and everything
+/// above it are escape values rather than section indices, so a table holds at
+/// most that many however large the count says it is.
+///
+/// `ElfFile::section_header` knows neither bound. It `assert!`s on a reserved
+/// index, and below one it slices `e_shoff + index * e_shentsize` out of the
+/// file with no bounds check at all -- `e_shnum` included, so an index the
+/// table does not contain is read exactly as if it did.
+///
+/// Neither is something [`check_elf_bounds`] can bound. It measures the table
+/// by walking its entries, and the file that panicked is the one with no
+/// entries to walk: with `e_shnum == 0` there is nothing to measure `e_shoff`
+/// and `e_shentsize` against, and a 64-byte image whose `e_shentsize` is
+/// `0xffff` was a kernel panic from `execve`. So the bound lives here, at the
+/// read, where it holds for every file whether or not it was checked first.
+fn section_count(elf: &ElfFile) -> u16 {
+    elf.header.pt2.sh_count().min(SHN_LORESERVE)
+}
+
+/// The section at `index`, or nothing when the file has no such section.
+fn section_at<'a>(elf: &ElfFile<'a>, index: u16) -> Option<SectionHeader<'a>> {
+    if index >= section_count(elf) {
+        return None;
+    }
+    elf.section_header(index).ok()
+}
+
+/// Every section of `elf`, stopping where the parser would `assert!` instead.
+fn sections<'b, 'a>(elf: &'b ElfFile<'a>) -> impl Iterator<Item = SectionHeader<'a>> + 'b {
+    (0..section_count(elf)).filter_map(move |index| elf.section_header(index).ok())
+}
+
 /// The section header table's own string table, which holds section names.
 fn section_names<'a>(elf: &ElfFile<'a>) -> &'a [u8] {
-    match elf.section_header(elf.header.pt2.sh_str_index()) {
-        Ok(names) => section_bytes(elf, &names),
-        Err(_) => &[],
+    match section_at(elf, elf.header.pt2.sh_str_index()) {
+        Some(names) => section_bytes(elf, &names),
+        None => &[],
     }
 }
 
@@ -502,15 +530,22 @@ fn section_names<'a>(elf: &ElfFile<'a>) -> &'a [u8] {
 /// counterpart in the parser.
 fn find_section<'a>(elf: &ElfFile<'a>, name: &str) -> Option<SectionHeader<'a>> {
     let names = section_names(elf);
-    elf.section_iter()
-        .find(|sh| str_at(names, sh.name()) == Some(name))
+    sections(elf).find(|sh| str_at(names, sh.name()) == Some(name))
 }
 
-/// Size of one entry of a section `xmas_elf` hands back as a slice, for the
-/// types this loader asks for.
-fn section_entry_size(elf: &ElfFile, ty: ShType) -> Option<usize> {
+/// Size and file alignment of one entry of a section `xmas_elf` hands back as
+/// a slice, for the types this loader asks for.
+///
+/// The alignment is a property of where the section sits in the file, not just
+/// of the struct: `zero::read_array` builds the slice with
+/// `slice::from_raw_parts` straight off the section's bytes, and every entry
+/// type here carries fields as wide as the class. A real linker gives these
+/// sections an `sh_addralign` to match, but `sh_offset` is a number the file
+/// chooses and nothing makes it honour it.
+fn section_entry_layout(elf: &ElfFile, ty: ShType) -> Option<(usize, usize)> {
     let is_64 = matches!(elf.header.pt1.class(), Class::SixtyFour);
-    Some(match ty {
+    let align = if is_64 { 8 } else { 4 };
+    let size = match ty {
         ShType::SymTab | ShType::DynSym => {
             if is_64 {
                 24
@@ -533,19 +568,27 @@ fn section_entry_size(elf: &ElfFile, ty: ShType) -> Option<usize> {
             }
         }
         _ => return None,
-    })
+    };
+    Some((size, align))
 }
 
 /// A section's contents, as the type the caller asked for.
 ///
-/// Two checks the parser leaves out. It dispatches on `sh_type` alone, so
+/// Three checks the parser leaves out. It dispatches on `sh_type` alone, so
 /// asking it for `.dynsym` and being handed a note section, or a group, or a
 /// 32-bit note it answers with `unimplemented!()`, is a matter of what the
 /// file says; naming the expected type here means only the types this loader
-/// understands are ever parsed. And half of them it turns into a slice with
-/// `zero::read_array`, which ASSERTS that the section divides exactly into
-/// entries -- a `.dynsym` one byte short of a whole symbol panicked the
-/// kernel.
+/// understands are ever parsed.
+///
+/// The other two are what `zero::read_array` needs to build the slice and does
+/// not check. It ASSERTS that the section divides exactly into entries -- a
+/// `.dynsym` one byte short of a whole symbol panicked the kernel -- and it
+/// then calls `slice::from_raw_parts` on the section's first byte, where a
+/// misaligned address is undefined behaviour however whole the entries are.
+/// That one is worse than the panic beside it: the debug build's precondition
+/// check for it does not unwind, so the machine aborts where a kernel cannot
+/// even report what happened. The address is the image's own plus the offset
+/// the file chose, so both go into the check.
 fn section_data<'a>(
     elf: &ElfFile<'a>,
     sh: &SectionHeader<'a>,
@@ -554,12 +597,21 @@ fn section_data<'a>(
     if sh.get_type() != Ok(expected) {
         return None;
     }
-    if let Some(entry_size) = section_entry_size(elf, expected) {
+    if let Some((entry_size, align)) = section_entry_layout(elf, expected) {
         if !(sh.size() as usize).is_multiple_of(entry_size) {
             warn!(
                 "elf: section of {} bytes does not divide into {}-byte entries",
                 sh.size(),
                 entry_size
+            );
+            return None;
+        }
+        let at = (elf.input.as_ptr() as usize).wrapping_add(sh.offset() as usize);
+        if !at.is_multiple_of(align) {
+            warn!(
+                "elf: section at offset {:#x} is not aligned to {} bytes",
+                sh.offset(),
+                align
             );
             return None;
         }
@@ -637,7 +689,7 @@ impl ElfExt for ElfFile<'_> {
         let names = find_section(self, ".strtab")
             .map(|strtab| section_bytes(self, &strtab))
             .unwrap_or(&[]);
-        for section in self.section_iter() {
+        for section in sections(self) {
             if let Some(SectionData::SymbolTable64(entries)) =
                 section_data(self, &section, ShType::SymTab)
             {

@@ -1139,27 +1139,285 @@ mod elf_bounds_tests {
     }
 
     /// `e_shstrndx` names the section holding every other section's name, and
-    /// `get_shstr_table` reads it with no range check of its own: an index
-    /// past the end of the table slices the file at an arbitrary multiple of
-    /// the entry size. `dynsym` reaches it on every dynamically linked
-    /// program, looking for `.dynsym`.
+    /// `ElfFile::section_header` reads it without consulting the table's
+    /// length: it slices `e_shoff + index * e_shentsize` out of the file
+    /// whatever `e_shnum` says, and `assert!`s outright at `SHN_LORESERVE`,
+    /// where section indices stop and the format's escape values begin.
+    /// `get_symbol_address` reaches it on every exec, looking for the syscall
+    /// trampoline, and `dynsym` on every dynamically linked program.
+    ///
+    /// Linux never reads `e_shstrndx` at all -- `binfmt_elf` works from the
+    /// program headers -- so an index naming no section is not a reason to
+    /// refuse the exec. The lookup finds nothing, which is the answer a
+    /// stripped binary gets too.
     #[test]
-    fn a_name_table_index_outside_the_section_table_is_rejected() {
-        let with_index = |sh_str_index| {
-            let mut elf = Elf::new().shdr(Shdr::default()).shdr(Shdr::default());
-            elf.sh_str_index = sh_str_index;
-            check_elf_bounds(&elf.build())
+    fn a_name_table_index_the_table_does_not_contain_names_no_section() {
+        // Three sections: the two asked for and the name table they are named
+        // from, which `with_sections` puts last and points `e_shstrndx` at.
+        let good = with_sections(&[
+            (".symtab", SHT_SYMTAB, &symbol(1, 0x1234)),
+            (".strtab", SHT_STRTAB, b"\0entry\0"),
+        ]);
+        let found = |image: &[u8]| {
+            assert_eq!(check_elf_bounds(image), Ok(()));
+            parse_checked_elf(image)
+                .unwrap()
+                .get_symbol_address("entry")
         };
-        assert_eq!(with_index(0), Ok(()));
-        assert_eq!(with_index(1), Ok(()));
-        assert_eq!(with_index(2), Err(ZxError::INVALID_ARGS));
-        assert_eq!(with_index(u16::MAX), Err(ZxError::INVALID_ARGS));
+        assert_eq!(found(&good), Some(0x1234));
+        // The last index the table holds is the name table itself, and a bound
+        // one too tight would lose it -- along with every well-formed binary's.
+        assert_eq!(found(&with_name_table_index(good.clone(), 2)), Some(0x1234));
 
-        // With no section table at all nothing reads a name, so the index is
-        // not consulted and a stripped binary still loads.
+        // One past the end of the table, and the reserved index above which
+        // the parser asserts rather than answering.
+        for index in [3u16, 4, 0xff00, u16::MAX] {
+            assert_eq!(
+                found(&with_name_table_index(good.clone(), index)),
+                None,
+                "e_shstrndx = {:#x} named a section the table does not hold",
+                index
+            );
+        }
+
+        // The off-by-one on its own, with nothing at all after the table, so
+        // an index one past the end is read from outside the file or not at
+        // all -- there is no third answer to mistake for the right one.
+        let mut elf = Elf::new().shdr(Shdr::default()).shdr(Shdr::default());
+        elf.sh_str_index = 1; // the last entry there is
+        assert_eq!(found(&elf.build()), None);
+        elf.sh_str_index = 2; // one past it
+        assert_eq!(found(&elf.build()), None);
+    }
+
+    /// The file that panicked is the one with no section table at all.
+    /// `check_elf_bounds` measures a table by walking its entries, so with
+    /// `e_shnum == 0` there is nothing to measure `e_shoff` and `e_shentsize`
+    /// against -- and `e_shstrndx` is read outside that walk, so it reached
+    /// `section_header` with all three numbers unchecked. Sixty-four bytes was
+    /// enough to panic the kernel from `execve`, four different ways.
+    #[test]
+    fn a_file_with_no_section_table_reads_no_section_header() {
+        let mut shapes: Vec<(&str, Elf)> = Vec::new();
+
         let mut elf = Elf::new();
         elf.sh_str_index = 7;
-        assert_eq!(check_elf_bounds(&elf.build()), Ok(()));
+        shapes.push(("e_shstrndx past the end of a table that is not there", elf));
+
+        let mut elf = Elf::new();
+        elf.sh_str_index = 0xff00; // SHN_LORESERVE: the parser asserts on it
+        shapes.push(("e_shstrndx is a reserved index", elf));
+
+        // The last two leave `e_shstrndx` at 0, which is what a stripped
+        // binary carries: the bound that matters is on `e_shnum`, and an
+        // index of zero reaches `section_header` exactly like any other.
+        let mut elf = Elf::new();
+        elf.sh_entry_size = u16::MAX;
+        shapes.push(("e_shentsize far larger than the file", elf));
+
+        let mut elf = Elf::new();
+        elf.sh_offset = Some(0x1_0000);
+        shapes.push(("e_shoff past the end of the file", elf));
+
+        for (what, elf) in shapes {
+            let image = elf.build();
+            assert_eq!(image.len(), EHDR_SIZE, "{}", what);
+            assert_eq!(check_elf_bounds(&image), Ok(()), "{}", what);
+            let parsed = parse_checked_elf(&image).unwrap();
+            // The three section reads an exec makes.
+            assert_eq!(
+                parsed.get_symbol_address("rcore_syscall_entry"),
+                None,
+                "{}",
+                what
+            );
+            assert!(parsed.dynsym().is_err(), "{}", what);
+            let (root, image) = image_vmar();
+            assert_eq!(
+                parsed.relocate(image, &root),
+                Err(".rela.dyn not found"),
+                "{}",
+                what
+            );
+        }
+    }
+
+    /// The point of answering instead of rejecting: a binary with its sections
+    /// stripped is an ordinary thing to run, and it has to load. `e_shnum` of
+    /// zero is what `strip` leaves behind, and the loader's three section reads
+    /// are all optional -- the syscall trampoline is a patch this tree's own
+    /// binaries carry, and relocations belong to dynamically linked ones.
+    #[test]
+    fn a_stripped_binary_still_loads() {
+        let mut elf = Elf::new().phdr(Phdr {
+            p_type: 1,    // PT_LOAD
+            flags: 0b101, // R+X
+            offset: payload_at(1),
+            virtual_addr: 0x1000,
+            file_size: 4,
+            mem_size: 0x1000,
+            ..Default::default()
+        });
+        elf.payload = vec![0x90u8; 4];
+        // No section table at all, and an `e_shstrndx` left pointing at a
+        // section that was stripped away with the rest.
+        elf.sh_str_index = 3;
+        let image = elf.build();
+        let parsed = parse_checked_elf(&image).unwrap();
+        let vmar = VmAddressRegion::new_root();
+        assert!(vmar.load_from_elf(&parsed).is_ok());
+    }
+
+    /// A 32-bit image reaches `section_header` through the same door and is
+    /// sliced with 32-bit entries, so the bound has to hold for it too -- and
+    /// nothing in the loader's own 64-bit-only section handling gets that far.
+    #[test]
+    fn a_32_bit_image_with_no_section_table_reads_no_section_header() {
+        // An ELF32 header and nothing else: `e_shnum` is zero, so `e_shoff`,
+        // `e_shentsize` and `e_shstrndx` are all unmeasured.
+        let mut v = vec![0u8; 52];
+        v[..4].copy_from_slice(&[0x7f, b'E', b'L', b'F']);
+        v[4] = 1; // ELFCLASS32
+        v[5] = DATA_LSB;
+        v[6] = 1;
+        v[32..36].copy_from_slice(&0x1_0000u32.to_le_bytes()); // e_shoff
+        v[46..48].copy_from_slice(&u16::MAX.to_le_bytes()); // e_shentsize
+        v[50..52].copy_from_slice(&9u16.to_le_bytes()); // e_shstrndx
+        assert_eq!(check_elf_bounds(&v), Ok(()));
+        let parsed = parse_checked_elf(&v).unwrap();
+        assert_eq!(parsed.get_symbol_address("rcore_syscall_entry"), None);
+        assert!(parsed.dynsym().is_err());
+    }
+
+    /// `e_shnum` is a `u16`, but section indices stop at `SHN_LORESERVE`:
+    /// everything from there up is an escape value, and the parser `assert!`s
+    /// rather than answering for one. A count above that describes a table
+    /// that cannot be walked to the end -- and `get_symbol_address` walks the
+    /// whole table on every exec, so it used to panic part way through.
+    #[test]
+    fn a_section_table_longer_than_the_index_space_stops_where_indices_do() {
+        const RESERVED: usize = 0xff00;
+        // Entries of nothing: the only question this asks is whether the walk
+        // reaches the end of the table it was given.
+        let empty_table = |count: usize| {
+            let mut v = vec![0u8; EHDR_SIZE + count * SHDR_SIZE];
+            v[..4].copy_from_slice(&[0x7f, b'E', b'L', b'F']);
+            v[4] = CLASS64;
+            v[5] = DATA_LSB;
+            v[6] = 1;
+            v[40..48].copy_from_slice(&(EHDR_SIZE as u64).to_le_bytes()); // e_shoff
+            v[58..60].copy_from_slice(&(SHDR_SIZE as u16).to_le_bytes()); // e_shentsize
+            v[60..62].copy_from_slice(&(count as u16).to_le_bytes()); // e_shnum
+            v
+        };
+        // The largest table the index space holds, and one entry more. Both
+        // fit in the file, so the bounds check has nothing to say about them.
+        // The third puts `e_shstrndx` in the reserved range as well, which a
+        // table this long is the only way to reach: the point read is bounded
+        // by the same rule as the walk, not merely by `e_shnum`.
+        for (count, name_table) in [
+            (RESERVED, 0u16),
+            (RESERVED + 1, 0),
+            (RESERVED + 1, RESERVED as u16),
+        ] {
+            let mut image = empty_table(count);
+            image[62..64].copy_from_slice(&name_table.to_le_bytes());
+            let what = alloc::format!("{} sections, e_shstrndx {:#x}", count, name_table);
+            assert_eq!(check_elf_bounds(&image), Ok(()), "{}", what);
+            assert_eq!(
+                parse_checked_elf(&image).unwrap().get_symbol_address("x"),
+                None,
+                "{}",
+                what
+            );
+        }
+    }
+
+    /// And the walk has to reach the last entry of the table. Section order is
+    /// the linker's to choose, so the `.symtab` that `get_symbol_address`
+    /// looks for on every exec can be the one sitting there -- a bound one
+    /// entry short would find nothing and quietly leave the syscall
+    /// trampoline unpatched.
+    #[test]
+    fn the_last_entry_of_the_section_table_is_walked() {
+        let image = symbol_table_last(0);
+        assert_eq!(check_elf_bounds(&image), Ok(()));
+        assert_eq!(
+            parse_checked_elf(&image)
+                .unwrap()
+                .get_symbol_address("entry"),
+            Some(0x77)
+        );
+    }
+
+    /// An image whose three sections are the name table, a `.strtab` and a
+    /// `.symtab`, in that order, with the symbol table `skew` bytes off its
+    /// natural eight-byte alignment.
+    fn symbol_table_last(skew: usize) -> Vec<u8> {
+        let mut elf = Elf::new();
+        // `\0.shstrtab\0.strtab\0.symtab\0`: names at 1, 11 and 19.
+        let names = b"\0.shstrtab\0.strtab\0.symtab\0";
+        let names_at = elf.blob(names);
+        let strtab = b"\0entry\0";
+        let strtab_at = elf.blob(strtab);
+        // A real linker gives `.symtab` an `sh_addralign` of 8 and places it
+        // accordingly; the payload of an image with no program headers starts
+        // on an eight-byte boundary, so pad to one here the same way.
+        let payload_start = EHDR_SIZE + 3 * SHDR_SIZE;
+        assert_eq!(payload_start % 8, 0);
+        let pad = (8 - elf.payload.len() % 8) % 8 + skew;
+        elf.blob(&vec![0u8; pad]);
+        let symtab = symbol(1, 0x77);
+        let symtab_at = elf.blob(&symtab);
+        assert_eq!((payload_start + symtab_at as usize) % 8, skew % 8);
+        for (name, sh_type, at, size) in [
+            (1u32, SHT_STRTAB, names_at, names.len()),
+            (11, SHT_STRTAB, strtab_at, strtab.len()),
+            (19, SHT_SYMTAB, symtab_at, symtab.len()),
+        ] {
+            elf.shdrs.push(Shdr {
+                name,
+                sh_type,
+                at_payload: Some(at),
+                size: size as u64,
+                offset: 0,
+            });
+        }
+        elf.sh_str_index = 0; // the name table first, the symbol table last
+        elf.build()
+    }
+
+    /// `zero::read_array` turns a section's bytes into a `&[Entry64]` with
+    /// `slice::from_raw_parts`, which needs the section to be aligned for the
+    /// type as well as a whole number of entries. Only the second was
+    /// checked, and `sh_offset` is a number the file chooses: a `.symtab` at
+    /// an odd offset built a misaligned slice, which is undefined behaviour.
+    ///
+    /// It is worse than the panic it sits beside. The debug build's
+    /// precondition check for it does NOT unwind -- `thread caused
+    /// non-unwinding panic. aborting.` -- so there is nothing for a kernel to
+    /// report or recover from, and `get_symbol_address` runs on every exec.
+    #[test]
+    fn a_symbol_table_at_an_odd_offset_is_not_read() {
+        // The same image, one byte over and back on the boundary.
+        for skew in 1..8 {
+            let image = symbol_table_last(skew);
+            assert_eq!(check_elf_bounds(&image), Ok(()), "skew {}", skew);
+            assert_eq!(
+                parse_checked_elf(&image)
+                    .unwrap()
+                    .get_symbol_address("entry"),
+                None,
+                "a .symtab {} bytes off its alignment was read anyway",
+                skew
+            );
+        }
+        assert_eq!(
+            parse_checked_elf(&symbol_table_last(8))
+                .unwrap()
+                .get_symbol_address("entry"),
+            Some(0x77)
+        );
     }
 
     /// The identification bytes decide how everything after them is read. The
@@ -1381,6 +1639,12 @@ mod elf_bounds_tests {
         });
         elf.sh_str_index = sections.len() as u16;
         elf.build()
+    }
+
+    /// The same image with `e_shstrndx` pointed somewhere else.
+    fn with_name_table_index(mut image: Vec<u8>, index: u16) -> Vec<u8> {
+        image[62..64].copy_from_slice(&index.to_le_bytes());
+        image
     }
 
     /// One `Elf64_Sym`: name offset at 0, value at 8.
