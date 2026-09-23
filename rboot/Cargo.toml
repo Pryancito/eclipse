@@ -14,5 +14,14 @@ xmas-elf = "0.8"
 x86_64 = { git = "https://github.com/rust-osdev/x86_64", tag = "v0.15.5" }
 
 [features]
-rboot = ["uefi-services"]
+# The bootloader binary: the UEFI logger/panic handler, and with it every
+# module that parses or draws on the firmware's behalf.
+rboot = ["uefi-services", "boot-ui"]
+# `rboot.conf`, the kernel cmdline, EDID/mode choice and the splash. The
+# kernel links this crate with `default-features = false` for `BootInfo`
+# alone and has no use for an 800 KiB logo in its own binary. `cfg(test)`
+# turns these on too, so `cargo test --lib --no-default-features` (which is
+# how they are tested: `uefi-services` defines `panic_impl`, and `std` in a
+# test binary already has it) still sees them.
+boot-ui = []
 default = ["rboot"]
