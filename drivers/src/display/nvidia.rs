@@ -10344,6 +10344,19 @@ impl NvidiaGpu {
     /// and sizes shader-local memory from them, and this getparam is
     /// **enumeration-fatal** (`goto out_err` on failure), so it can never
     /// return EINVAL as an earlier milestone did.
+    /// `NOUVEAU_GETPARAM_VRAM_USED`: bytes of VRAM backing live GEM objects
+    /// on this GPU, every client's included, like Linux's
+    /// `ttm_resource_manager_usage(vram_mgr)`. GART objects live in system
+    /// memory and do not count.
+    fn nouveau_vram_used(&self) -> u64 {
+        self.nouveau_gem
+            .lock()
+            .iter()
+            .filter(|o| o.domain & super::nouveau_uapi::NOUVEAU_GEM_DOMAIN_VRAM != 0)
+            .map(|o| o.size)
+            .sum()
+    }
+
     fn nouveau_graph_units(&self) -> u64 {
         // Real topology, straight from the live GSP-RM, whenever the GPU is
         // attached (this is the same GR_GET_GPC_MASK/TPC_MASK probe as
@@ -10537,11 +10550,31 @@ impl NvidiaGpu {
                     //
                     // Discovery channels (no RM) keep the bookkeeping-only
                     // answer: enumeration must work without hardware.
+                    //
+                    // The channel must exist and be the caller's, like
+                    // SCLASS: Linux resolves the token to one of the calling
+                    // file's own channels (`nouveau_abi16_chan`) and fails
+                    // EINVAL otherwise. Accepting a NEW on a channel nobody
+                    // allocated, or on another process's, used to answer
+                    // "bookkeeping only" -- which on an RM-backed channel is
+                    // exactly the unbuilt engine context described above.
                     let rm_backed = {
                         let chans = self.nouveau_channels.lock();
-                        chans
-                            .iter()
-                            .any(|c| c.id >= 0 && c.id as u64 == hdr.token && c.rm_backed)
+                        let Some(c) = chans.iter().find(|c| {
+                            c.id >= 0
+                                && c.id as u64 == hdr.token
+                                && (owner_pid == 0 || c.owner_pid == owner_pid)
+                        }) else {
+                            log::warn!(
+                                "[nouveau-uapi] NVIF NEW oclass={:#06x}: no channel with token={} \
+                                 for pid={} -- CHANNEL_ALLOC must come first",
+                                new.oclass,
+                                hdr.token,
+                                owner_pid
+                            );
+                            return Err(nv::EINVAL);
+                        };
+                        c.rm_backed
                     };
                     if rm_backed {
                         let Some(device_instance) = *self.rm_device_instance.lock() else {
@@ -10729,12 +10762,20 @@ impl NvidiaGpu {
                     );
                     return Err(nv::EINVAL);
                 }
+                // The caller's own channel, as in Linux (`nouveau_abi16_chan`
+                // walks the calling file's channels): another process's
+                // token is EINVAL, not its engine list.
                 let chan = self.nouveau_channels.lock();
-                let Some(st) = chan.iter().find(|c| c.id >= 0 && c.id as u64 == hdr.token) else {
+                let Some(st) = chan.iter().find(|c| {
+                    c.id >= 0
+                        && c.id as u64 == hdr.token
+                        && (owner_pid == 0 || c.owner_pid == owner_pid)
+                }) else {
                     log::warn!(
-                        "[nouveau-uapi] NVIF SCLASS: no channel with token={} -- CHANNEL_ALLOC \
-                         must come first",
-                        hdr.token
+                        "[nouveau-uapi] NVIF SCLASS: no channel with token={} for pid={} -- \
+                         CHANNEL_ALLOC must come first",
+                        hdr.token,
+                        owner_pid
                     );
                     return Err(nv::EINVAL);
                 };
@@ -10977,9 +11018,13 @@ impl NvidiaGpu {
                     // requested via tile_flags, else mapped uncompressed at
                     // VM_BIND (refusing it there hangs the channel).
                     nv::NOUVEAU_GETPARAM_HAS_VMA_TILEMODE => 1,
-                    // No live usage counter in `NvidiaVramAllocator` yet --
-                    // report 0 rather than guessing.
-                    nv::NOUVEAU_GETPARAM_VRAM_USED => 0,
+                    // Linux reports the VRAM manager's usage: bytes of VRAM
+                    // held by every client's live objects, not just the
+                    // caller's. This driver's VRAM objects are the
+                    // VRAM-domain entries of `nouveau_gem`, so their sum is
+                    // that number; a constant 0 read as "nothing allocated"
+                    // to the GL HUD and to anything that budgets by it.
+                    nv::NOUVEAU_GETPARAM_VRAM_USED => self.nouveau_vram_used(),
                     // A monotonically-rising nanosecond counter. Real nouveau
                     // returns the GPU's PTIMER; Mesa uses this for GL_TIMESTAMP,
                     // which only needs a rising clock, so a CPU-derived
@@ -12457,11 +12502,19 @@ impl NvidiaGpu {
                 };
                 // GPU VA, if VM_BIND has mapped this object -- bookkeeping
                 // independent from nouveau_gem, same as VM_BIND itself.
+                // Linux looks the VMA up in the CALLER's vmm
+                // (`nouveau_vma_find(nvbo, cli->vmm)`): each client has its
+                // own VA space, so a PRIME importer that has not bound the
+                // object gets 0, never the creator's VA, which means
+                // nothing in the importer's context. The kernel (pid 0)
+                // has no VA space of its own and sees the first binding.
                 let offset = self
                     .nouveau_vm_mappings
                     .lock()
                     .iter()
-                    .find(|m| m.gem_handle == req.handle)
+                    .find(|m| {
+                        m.gem_handle == req.handle && (owner_pid == 0 || m.owner_pid == owner_pid)
+                    })
                     .map(|m| m.va)
                     .unwrap_or(0);
                 let map_handle = phys_addr.map(|_| (req.handle as u64) << 12).unwrap_or(0);
@@ -13173,5 +13226,1542 @@ mod decode_tests {
         // A short EDID is not parsed at all: an all-zero ELD, never a read
         // past the end of the buffer.
         assert_eq!(build_eld_from_base_edid(&[0u8; 127], 0, false), [0u8; 96]);
+    }
+}
+
+#[cfg(test)]
+impl NvidiaGpu {
+    /// A GPU with no PCI device behind it: BAR0 reads as zero (so the chip
+    /// id falls back to `architecture`), no RM instance, no boot
+    /// framebuffer. That is the state every nouveau ioctl sees on a GPU the
+    /// RM never attached, and it is enough for every arm that is
+    /// bookkeeping rather than hardware.
+    pub(super) fn for_test(device_id: u16, vram_size_mb: u32) -> Self {
+        let bar0 = alloc::boxed::Box::leak(alloc::boxed::Box::new([0u32; 4])).as_ptr() as usize;
+        let gem_handle_slice = crate::scheme::gem_mmap::alloc_handle_slice();
+        // The id table decides the architecture as it does for real; an id
+        // it does not know stands in for a Turing board it cannot size.
+        let (architecture, gpu_model) = match identify_gpu(device_id) {
+            (NvidiaArchitecture::Unknown, _, _) => (NvidiaArchitecture::Turing, "test"),
+            (arch, model, _) => (arch, model),
+        };
+        Self {
+            name: String::from("nvidia-test"),
+            info: DisplayInfo {
+                width: 0,
+                height: 0,
+                pitch: 0,
+                format: ColorFormat::ARGB8888,
+                fb_base_vaddr: 0,
+                fb_size: 256 << 20,
+            },
+            architecture,
+            gpu_model,
+            device_id,
+            vram_size_mb,
+            pitch_override: None,
+            _bar0: bar0,
+            _bar1: 0,
+            bar1_phys: 0,
+            bar0_phys: 0,
+            bar0_len: 0,
+            bar2_phys: 0,
+            bar2_len: 0,
+            pci_domain: 0,
+            pci_bus: 0,
+            pci_device: 0,
+            vram_allocator: Mutex::new(None),
+            bringup: Mutex::new(None),
+            rm_attach_result: Mutex::new(None),
+            rm_device_instance: Mutex::new(None),
+            rm_display_snap: Mutex::new(None),
+            auto_bringup_done: AtomicBool::new(false),
+            gsp_firmware: Mutex::new(None),
+            gsp_fw_status: Mutex::new(None),
+            gsp_init_result: Mutex::new(None),
+            state_init_result: Mutex::new(None),
+            step10_result: Mutex::new(None),
+            imported_handles: Mutex::new(Vec::new()),
+            nouveau_channels: Mutex::new(Vec::new()),
+            nouveau_gem: Mutex::new(Vec::new()),
+            nouveau_gem_next_handle: AtomicU32::new(gem_handle_slice.base()),
+            nouveau_gem_handle_end: gem_handle_slice.end(),
+            nouveau_vm_mappings: Mutex::new(Vec::new()),
+            nouveau_pid_ctx: Mutex::new(Vec::new()),
+            nouveau_fast: Mutex::new(
+                (0..super::nouveau_uapi::MAX_CTX)
+                    .map(|_| FastSlot::Unprepared)
+                    .collect(),
+            ),
+            kms_framebuffers: Mutex::new(Vec::new()),
+            next_kms_fb_id: AtomicU32::new(1),
+            kms_state: Mutex::new(NvidiaKmsState {
+                crtc_fb: 0,
+                plane_fb: 0,
+                last_vblank_us: 0,
+            }),
+            msi_vector: AtomicUsize::new(usize::MAX),
+            ctx0_owner: AtomicU64::new(0),
+        }
+    }
+}
+
+#[cfg(test)]
+mod nouveau_bookkeeping_tests {
+    //! The nouveau-uAPI arms that are bookkeeping rather than hardware, on
+    //! a GPU the RM never attached: the state every ioctl sees before
+    //! `/proc/gpustep14`, and the only state a host test can reach. Every
+    //! test takes `LOCK`: the uAPI switch, the live-bytes counter and the
+    //! `gem_mmap` registry are process globals.
+
+    use super::super::nouveau_uapi as nv;
+    use super::*;
+    use core::mem::size_of;
+    use lock::Mutex as TestMutex;
+
+    static LOCK: TestMutex<()> = TestMutex::new(());
+
+    const A: u64 = 66_001;
+    const B: u64 = 66_002;
+    const STRANGER: u64 = 66_003;
+    const MIB: u64 = 1024 * 1024;
+
+    const IOC_WRITE: u32 = 1;
+    const IOC_READ: u32 = 2;
+    const DRM_IOCTL_TYPE: u32 = 0x64;
+
+    fn ioc(dir: u32, ty: u32, nr: u32, size: usize) -> u32 {
+        (dir << 30) | ((size as u32) << 16) | (ty << 8) | nr
+    }
+
+    fn wr<T>(nr: u32) -> u32 {
+        ioc(IOC_READ | IOC_WRITE, DRM_IOCTL_TYPE, nr, size_of::<T>())
+    }
+
+    fn gpu() -> NvidiaGpu {
+        nv::set_enabled(true);
+        NvidiaGpu::for_test(0x1f06, 8192)
+    }
+
+    fn call<T>(gpu: &NvidiaGpu, request: u32, req: &mut T, pid: u64) -> Result<usize, i32> {
+        gpu.nouveau_ioctl(request, req as *mut T as usize, pid)
+    }
+
+    fn getparam(gpu: &NvidiaGpu, param: u64) -> Result<u64, i32> {
+        let mut r = nv::DrmNouveauGetparam { param, value: 0 };
+        call(
+            gpu,
+            wr::<nv::DrmNouveauGetparam>(nv::NR_GETPARAM),
+            &mut r,
+            A,
+        )
+        .map(|_| r.value)
+    }
+
+    fn gem_new(gpu: &NvidiaGpu, size: u64, domain: u32, pid: u64) -> Result<usize, i32> {
+        let mut r = nv::DrmNouveauGemNew {
+            info: nv::DrmNouveauGemInfo {
+                handle: 0,
+                domain,
+                size,
+                offset: 0,
+                map_handle: 0,
+                tile_mode: 0,
+                tile_flags: 0,
+            },
+            channel_hint: 0,
+            align: 0,
+        };
+        call(gpu, wr::<nv::DrmNouveauGemNew>(nv::NR_GEM_NEW), &mut r, pid)
+    }
+
+    fn gem_info(gpu: &NvidiaGpu, handle: u32, pid: u64) -> Result<nv::DrmNouveauGemInfo, i32> {
+        let mut r = nv::DrmNouveauGemInfo {
+            handle,
+            domain: 0,
+            size: 0,
+            offset: 0,
+            map_handle: 0,
+            tile_mode: 0,
+            tile_flags: 0,
+        };
+        call(
+            gpu,
+            wr::<nv::DrmNouveauGemInfo>(nv::NR_GEM_INFO),
+            &mut r,
+            pid,
+        )
+        .map(|_| r)
+    }
+
+    fn cpu_fini(gpu: &NvidiaGpu, handle: u32, pid: u64) -> Result<usize, i32> {
+        let mut r = nv::DrmNouveauGemCpuFini { handle };
+        call(
+            gpu,
+            wr::<nv::DrmNouveauGemCpuFini>(nv::NR_GEM_CPU_FINI),
+            &mut r,
+            pid,
+        )
+    }
+
+    fn cpu_prep_nowait(gpu: &NvidiaGpu, handle: u32, pid: u64) -> Result<usize, i32> {
+        let mut r = nv::DrmNouveauGemCpuPrep { handle, flags: 0x2 };
+        call(
+            gpu,
+            wr::<nv::DrmNouveauGemCpuPrep>(nv::NR_GEM_CPU_PREP),
+            &mut r,
+            pid,
+        )
+    }
+
+    fn channel_alloc(gpu: &NvidiaGpu, pid: u64) -> Result<nv::DrmNouveauChannelAlloc, i32> {
+        let mut r = nv::DrmNouveauChannelAlloc {
+            fb_ctxdma_handle: 0,
+            tt_ctxdma_handle: 0,
+            channel: -1,
+            pushbuf_domains: 0,
+            notifier_handle: 0xffff_ffff,
+            subchan: [nv::DrmNouveauChannelAllocSubchan {
+                handle: 0,
+                grclass: 0,
+            }; 8],
+            nr_subchan: 7,
+        };
+        call(
+            gpu,
+            wr::<nv::DrmNouveauChannelAlloc>(nv::NR_CHANNEL_ALLOC),
+            &mut r,
+            pid,
+        )
+        .map(|_| r)
+    }
+
+    fn channel_free(gpu: &NvidiaGpu, channel: i32, pid: u64) -> Result<usize, i32> {
+        let mut r = nv::DrmNouveauChannelFree { channel };
+        call(
+            gpu,
+            wr::<nv::DrmNouveauChannelFree>(nv::NR_CHANNEL_FREE),
+            &mut r,
+            pid,
+        )
+    }
+
+    fn vm_bind(gpu: &NvidiaGpu, pid: u64) -> Result<usize, i32> {
+        let mut r = nv::DrmNouveauVmBind {
+            op_count: 1,
+            flags: 0,
+            wait_count: 0,
+            sig_count: 0,
+            wait_ptr: 0,
+            sig_ptr: 0,
+            op_ptr: 0x1000,
+        };
+        call(gpu, wr::<nv::DrmNouveauVmBind>(nv::NR_VM_BIND), &mut r, pid)
+    }
+
+    /// Restores the global live-bytes counter, panic or not, so one test's
+    /// objects never count against another's quota.
+    struct LiveBytes(u64);
+
+    impl LiveBytes {
+        fn hold() -> Self {
+            Self(NOUVEAU_GEM_BYTES.load(Ordering::Relaxed))
+        }
+        fn delta(&self) -> i64 {
+            NOUVEAU_GEM_BYTES.load(Ordering::Relaxed) as i64 - self.0 as i64
+        }
+    }
+
+    impl Drop for LiveBytes {
+        fn drop(&mut self) {
+            NOUVEAU_GEM_BYTES.store(self.0, Ordering::Relaxed);
+        }
+    }
+
+    /// A GEM object as `GEM_NEW` would have left it: in the table, counted,
+    /// and registered with `gem_mmap` when it has a CPU mapping.
+    fn object(gpu: &NvidiaGpu, owner: u64, size: u64, phys: Option<u64>) -> u32 {
+        let handle = gpu.next_gem_handle().unwrap();
+        gpu.nouveau_gem.lock().push(nv::NouveauGemObject {
+            handle,
+            h_memory: 0xcafe_0000 | (handle & 0xffff),
+            owner_pid: owner,
+            size,
+            phys_addr: phys,
+            vram_offset: None,
+            domain: nv::NOUVEAU_GEM_DOMAIN_GART,
+            tile_mode: 0x10,
+            tile_flags: 0x600,
+        });
+        NOUVEAU_GEM_BYTES.fetch_add(size, Ordering::Relaxed);
+        if let Some(pa) = phys {
+            crate::scheme::gem_mmap::register(handle, pa, size, owner);
+        }
+        handle
+    }
+
+    /// A VRAM-domain object with no CPU aperture, like a tiled render
+    /// target NVK allocates.
+    fn vram_object(gpu: &NvidiaGpu, owner: u64, size: u64) -> u32 {
+        let handle = object(gpu, owner, size, None);
+        let mut gem = gpu.nouveau_gem.lock();
+        let obj = gem.iter_mut().find(|o| o.handle == handle).unwrap();
+        obj.domain = nv::NOUVEAU_GEM_DOMAIN_VRAM;
+        obj.vram_offset = Some(0x100_0000 * u64::from(handle & 0xff));
+        handle
+    }
+
+    fn mapping(gpu: &NvidiaGpu, owner: u64, gem_handle: u32, va: u64, size: u64) {
+        gpu.nouveau_vm_mappings.lock().push(nv::NouveauVmMapping {
+            gem_handle,
+            h_virt: 0xbeef,
+            owner_pid: owner,
+            va,
+            size,
+            bo_offset: 0,
+        });
+    }
+
+    fn framebuffer(gpu: &NvidiaGpu, handle_id: u32) -> u32 {
+        let id = gpu.next_kms_fb_id.fetch_add(1, Ordering::Relaxed);
+        gpu.kms_framebuffers.lock().push(NvidiaKmsFramebuffer {
+            id,
+            handle_id,
+            width: 64,
+            height: 64,
+            pitch: 256,
+            phys_addr: 0,
+            size: 16384,
+            h_memory: 0,
+            vram_offset: None,
+        });
+        id
+    }
+
+    fn has_object(gpu: &NvidiaGpu, handle: u32) -> bool {
+        gpu.nouveau_gem.lock().iter().any(|o| o.handle == handle)
+    }
+
+    fn owner_of(gpu: &NvidiaGpu, handle: u32) -> Option<u64> {
+        gpu.nouveau_gem
+            .lock()
+            .iter()
+            .find(|o| o.handle == handle)
+            .map(|o| o.owner_pid)
+    }
+
+    fn mappings_of(gpu: &NvidiaGpu, handle: u32) -> usize {
+        gpu.nouveau_vm_mappings
+            .lock()
+            .iter()
+            .filter(|m| m.gem_handle == handle)
+            .count()
+    }
+
+    fn channels_of(gpu: &NvidiaGpu, pid: u64) -> usize {
+        gpu.nouveau_channels
+            .lock()
+            .iter()
+            .filter(|c| c.owner_pid == pid)
+            .count()
+    }
+
+    #[test]
+    fn the_dispatch_gates_on_the_switch_the_type_and_the_payload_floor() {
+        let _g = LOCK.lock();
+        let gpu = gpu();
+        nv::set_enabled(false);
+        assert_eq!(
+            getparam(&gpu, nv::NOUVEAU_GETPARAM_PCI_VENDOR),
+            Err(nv::ENOSYS),
+            "off by default: byte for byte the old NvidiaGpu::ioctl"
+        );
+        nv::set_enabled(true);
+        assert_eq!(getparam(&gpu, nv::NOUVEAU_GETPARAM_PCI_VENDOR), Ok(0x10de));
+        let mut r = nv::DrmNouveauGetparam {
+            param: nv::NOUVEAU_GETPARAM_PCI_VENDOR,
+            value: 0,
+        };
+        // Not the DRM ioctl type at all.
+        assert_eq!(
+            call(
+                &gpu,
+                ioc(IOC_READ | IOC_WRITE, 0x63, nv::NR_GETPARAM, 16),
+                &mut r,
+                A
+            ),
+            Err(nv::ENOSYS)
+        );
+        // A caller whose struct is shorter than the one the arm writes.
+        assert_eq!(
+            call(
+                &gpu,
+                ioc(IOC_READ | IOC_WRITE, DRM_IOCTL_TYPE, nv::NR_GETPARAM, 8),
+                &mut r,
+                A
+            ),
+            Err(nv::EINVAL)
+        );
+        // The direction bits are advisory: Linux dispatches by NR alone.
+        assert_eq!(
+            call(
+                &gpu,
+                ioc(IOC_WRITE, DRM_IOCTL_TYPE, nv::NR_GETPARAM, 16),
+                &mut r,
+                A
+            ),
+            Ok(0)
+        );
+        assert_eq!(r.value, 0x10de);
+        // An NR nouveau never published.
+        assert_eq!(
+            call(
+                &gpu,
+                ioc(IOC_READ | IOC_WRITE, DRM_IOCTL_TYPE, 0x40 + 0x50, 16),
+                &mut r,
+                A
+            ),
+            Err(nv::ENOSYS)
+        );
+    }
+
+    #[test]
+    fn getparam_enumerates_the_gpu_without_the_rm() {
+        let _g = LOCK.lock();
+        let gpu = gpu();
+        assert_eq!(getparam(&gpu, nv::NOUVEAU_GETPARAM_PCI_VENDOR), Ok(0x10de));
+        assert_eq!(getparam(&gpu, nv::NOUVEAU_GETPARAM_PCI_DEVICE), Ok(0x1f06));
+        assert_eq!(getparam(&gpu, nv::NOUVEAU_GETPARAM_BUS_TYPE), Ok(2));
+        assert_eq!(getparam(&gpu, nv::NOUVEAU_GETPARAM_FB_SIZE), Ok(8192 * MIB));
+        assert_eq!(
+            getparam(&gpu, nv::NOUVEAU_GETPARAM_VRAM_BAR_SIZE),
+            Ok(256 * MIB),
+            "the BAR1 aperture, not the board's VRAM"
+        );
+        assert_eq!(getparam(&gpu, nv::NOUVEAU_GETPARAM_AGP_SIZE), Ok(0));
+        assert_eq!(
+            getparam(&gpu, nv::NOUVEAU_GETPARAM_CHIPSET_ID),
+            Ok(0x162),
+            "BAR0 reads as zero, so the architecture's flagship chip stands in"
+        );
+        assert_eq!(getparam(&gpu, nv::NOUVEAU_GETPARAM_HAS_VMA_TILEMODE), Ok(1));
+        assert_eq!(getparam(&gpu, nv::NOUVEAU_GETPARAM_HAS_PAGEFLIP), Ok(0));
+        assert_eq!(getparam(&gpu, nv::NOUVEAU_GETPARAM_EXEC_PUSH_MAX), Ok(64));
+        assert_eq!(
+            getparam(&gpu, nv::NOUVEAU_GETPARAM_GRAPH_UNITS),
+            Ok(6 | (36 << 8)),
+            "no RM: the full TU102 die, gpc in the low byte, tpc above"
+        );
+        assert_eq!(getparam(&gpu, 99), Err(nv::EINVAL));
+        // A GPU the id table does not know still reports VRAM: the
+        // architecture floor, never zero (NVK would skip it).
+        let unknown = NvidiaGpu::for_test(0x1fff, 0);
+        assert_eq!(
+            getparam(&unknown, nv::NOUVEAU_GETPARAM_FB_SIZE),
+            Ok(4096 * MIB)
+        );
+    }
+
+    #[test]
+    fn gem_new_is_refused_for_its_own_reason_before_it_needs_the_rm() {
+        let _g = LOCK.lock();
+        let live = LiveBytes::hold();
+        let gpu = gpu();
+        let gart = nv::NOUVEAU_GEM_DOMAIN_GART;
+        assert_eq!(gem_new(&gpu, 4096, 0, A), Err(nv::EOPNOTSUPP));
+        assert_eq!(gem_new(&gpu, 0, gart, A), Err(nv::EINVAL));
+        assert_eq!(gem_new(&gpu, u32::MAX as u64 + 1, gart, A), Err(nv::EINVAL));
+        assert_eq!(
+            gem_new(&gpu, GEM_NEW_MAX_SINGLE + 1, gart, A),
+            Err(nv::ENOMEM),
+            "single-allocation cap"
+        );
+        assert_eq!(gem_new(&gpu, GEM_NEW_MAX_SINGLE, gart, A), Err(nv::ENODEV));
+        // Per-pid quota: what A already holds plus this request.
+        object(&gpu, A, GEM_NEW_MAX_PER_PID - 4096, None);
+        assert_eq!(gem_new(&gpu, 8192, gart, A), Err(nv::ENOMEM));
+        assert_eq!(gem_new(&gpu, 4096, gart, A), Err(nv::ENODEV));
+        assert_eq!(
+            gem_new(&gpu, 8192, gart, B),
+            Err(nv::ENODEV),
+            "B's quota is B's"
+        );
+        // Global quota: min(4 GiB, twice the VRAM), across every pid.
+        object(&gpu, B, GEM_NEW_MAX_PER_PID, None);
+        assert_eq!(gem_new(&gpu, 8192, gart, STRANGER), Err(nv::ENOMEM));
+        assert_eq!(gem_new(&gpu, 4096, gart, STRANGER), Err(nv::ENODEV));
+        // Twice a 1 GiB board is the tighter cap.
+        let small = NvidiaGpu::for_test(0x1f06, 1024);
+        NOUVEAU_GEM_BYTES.store(2048 * MIB - 4096, Ordering::Relaxed);
+        assert_eq!(gem_new(&small, 8192, gart, STRANGER), Err(nv::ENOMEM));
+        assert_eq!(gem_new(&small, 4096, gart, STRANGER), Err(nv::ENODEV));
+        // A request the RM never saw burns no handle.
+        let next = gpu.nouveau_gem_next_handle.load(Ordering::Relaxed);
+        assert_eq!(gem_new(&gpu, 4096, gart, STRANGER), Err(nv::ENODEV));
+        assert_eq!(gpu.nouveau_gem_next_handle.load(Ordering::Relaxed), next);
+        drop(live);
+    }
+
+    #[test]
+    fn a_gem_object_is_seen_by_its_creator_a_prime_holder_and_the_kernel() {
+        let _g = LOCK.lock();
+        let _live = LiveBytes::hold();
+        let gpu = gpu();
+        let h1 = object(&gpu, A, 65536, Some(0x1000_0000));
+        let h2 = object(&gpu, A, 4096, None);
+        mapping(&gpu, A, h1, 0x4000_0000, 65536);
+
+        let info = gem_info(&gpu, h1, A).unwrap();
+        assert_eq!(info.size, 65536);
+        assert_eq!(info.domain, nv::NOUVEAU_GEM_DOMAIN_GART);
+        assert_eq!(info.offset, 0x4000_0000, "the GPU VA it is bound at");
+        assert_eq!(info.map_handle, (h1 as u64) << 12);
+        assert_eq!((info.tile_mode, info.tile_flags), (0x10, 0x600));
+        assert_eq!(
+            gem_info(&gpu, h1, B).map(|i| i.size),
+            Err(nv::ENOENT),
+            "not B's, not shared"
+        );
+        assert!(crate::scheme::gem_mmap::add_ref(h1, B).is_some());
+        assert_eq!(
+            gem_info(&gpu, h1, B).map(|i| i.size),
+            Ok(65536),
+            "a PRIME holder"
+        );
+        assert_eq!(
+            gem_info(&gpu, h1, STRANGER).map(|i| i.size),
+            Err(nv::ENOENT)
+        );
+        assert_eq!(
+            gem_info(&gpu, h1, 0).map(|i| i.size),
+            Ok(65536),
+            "the kernel"
+        );
+        // Never CPU-mappable: nothing to import, so only the creator.
+        let info = gem_info(&gpu, h2, A).unwrap();
+        assert_eq!((info.offset, info.map_handle), (0, 0));
+        assert!(crate::scheme::gem_mmap::add_ref(h2, B).is_none());
+        assert_eq!(gem_info(&gpu, h2, B).map(|i| i.size), Err(nv::ENOENT));
+        assert_eq!(
+            gem_info(&gpu, h2, 0).map(|i| i.size),
+            Ok(4096),
+            "the kernel sees it without a holder entry"
+        );
+        assert_eq!(
+            gem_info(&gpu, h2 + 1000, A).map(|i| i.size),
+            Err(nv::ENOENT)
+        );
+        // CPU_PREP / CPU_FINI apply the same rule.
+        assert_eq!(cpu_fini(&gpu, h1, A), Ok(0));
+        assert_eq!(cpu_fini(&gpu, h1, B), Ok(0));
+        assert_eq!(cpu_fini(&gpu, h1, STRANGER), Err(nv::ENOENT));
+        assert_eq!(cpu_fini(&gpu, h2, B), Err(nv::ENOENT));
+        assert_eq!(
+            cpu_prep_nowait(&gpu, h1, A),
+            Ok(0),
+            "nothing queued: nothing to wait"
+        );
+        assert_eq!(cpu_prep_nowait(&gpu, h1, STRANGER), Err(nv::ENOENT));
+        assert!(crate::scheme::gem_mmap::unregister(h1));
+    }
+
+    #[test]
+    fn gem_close_frees_on_the_last_holder_and_takes_its_mappings_and_framebuffers() {
+        let _g = LOCK.lock();
+        let live = LiveBytes::hold();
+        let gpu = gpu();
+        let h1 = object(&gpu, A, 65536, Some(0x2000_0000));
+        let h2 = object(&gpu, A, 4096, None);
+        let h3 = object(&gpu, B, 4096, Some(0x3000_0000));
+        crate::scheme::gem_mmap::add_ref(h1, B).unwrap();
+        mapping(&gpu, A, h1, 0x1_0000, 65536);
+        mapping(&gpu, B, h1, 0x2_0000, 65536);
+        mapping(&gpu, B, h3, 0x3_0000, 4096);
+        let fb = framebuffer(&gpu, h1);
+        let fb3 = framebuffer(&gpu, h3);
+        gpu.kms_state.lock().crtc_fb = fb;
+        let counted = live.delta();
+
+        assert!(!gpu.nouveau_gem_close(h1, STRANGER), "not a holder");
+        assert!(has_object(&gpu, h1));
+        assert!(gpu.nouveau_gem_close(h1, B), "one holder letting go");
+        assert!(has_object(&gpu, h1), "A still holds it");
+        assert_eq!(mappings_of(&gpu, h1), 2);
+        assert_eq!(live.delta(), counted);
+        assert!(gpu.nouveau_gem_close(h1, A), "the last holder");
+        assert!(!has_object(&gpu, h1));
+        assert_eq!(
+            mappings_of(&gpu, h1),
+            0,
+            "its VM_BIND mappings went with it"
+        );
+        assert_eq!(mappings_of(&gpu, h3), 1, "another object's did not");
+        let fbs: Vec<u32> = gpu.kms_framebuffers.lock().iter().map(|f| f.id).collect();
+        assert_eq!(
+            fbs,
+            [fb3],
+            "the fb built on it is gone, the other one stays"
+        );
+        assert_eq!(
+            gpu.kms_state.lock().crtc_fb,
+            0,
+            "and is no longer being scanned out"
+        );
+        assert_eq!(live.delta(), counted - 65536);
+        assert!(!gpu.nouveau_gem_close(h1, A), "gone is gone");
+        // Never exported: its creator alone, and nobody else can even see it.
+        assert!(!gpu.nouveau_gem_close(h2, B));
+        assert!(gpu.nouveau_gem_close(h2, A));
+        assert_eq!(live.delta(), counted - 65536 - 4096);
+        assert!(
+            gpu.nouveau_gem_close(h3, 0),
+            "the kernel closes on anyone's behalf"
+        );
+        assert!(!gpu.nouveau_gem_close(h3 + 1000, A));
+    }
+
+    #[test]
+    fn the_gem_handle_slice_is_never_overrun() {
+        let _g = LOCK.lock();
+        let gpu = gpu();
+        let end = gpu.nouveau_gem_handle_end;
+        gpu.nouveau_gem_next_handle
+            .store(end - 2, Ordering::Relaxed);
+        assert_eq!(gpu.next_gem_handle(), Some(end - 2));
+        assert_eq!(gpu.next_gem_handle(), Some(end - 1));
+        assert_eq!(gpu.next_gem_handle(), None, "the next id is another card's");
+        assert_eq!(gpu.next_gem_handle(), None);
+        assert_eq!(gpu.nouveau_gem_next_handle.load(Ordering::Relaxed), end);
+    }
+
+    #[test]
+    fn channels_without_the_rm_are_discovery_only_and_free_is_owner_scoped() {
+        let _g = LOCK.lock();
+        let gpu = gpu();
+        let c = channel_alloc(&gpu, A).unwrap();
+        assert_eq!(c.channel, 0);
+        assert_eq!(c.notifier_handle, 0, "no RM notifier");
+        assert_eq!(c.pushbuf_domains, nv::NOUVEAU_GEM_DOMAIN_VRAM);
+        assert_eq!(c.nr_subchan, 0);
+        assert_eq!(channel_alloc(&gpu, A).unwrap().channel, 1);
+        assert_eq!(channel_alloc(&gpu, B).unwrap().channel, 2);
+        assert!(!gpu.nouveau_rm_vas_ready());
+        assert_eq!(
+            vm_bind(&gpu, A),
+            Err(nv::ENODEV),
+            "no VA space was ever built"
+        );
+        assert_eq!(channel_free(&gpu, 0, B), Err(nv::EINVAL), "not B's channel");
+        assert_eq!(channel_free(&gpu, 7, A), Err(nv::EINVAL));
+        assert_eq!(channel_free(&gpu, 0, A), Ok(0));
+        assert_eq!(channels_of(&gpu, A), 1);
+        assert_eq!(
+            channel_alloc(&gpu, B).unwrap().channel,
+            0,
+            "the lowest free id"
+        );
+        assert_eq!(channel_free(&gpu, 2, 0), Ok(0), "the kernel frees anyone's");
+        assert_eq!(channels_of(&gpu, B), 1);
+        while gpu.nouveau_channels.lock().len() < nv::MAX_CHANNELS {
+            channel_alloc(&gpu, STRANGER).unwrap();
+        }
+        assert_eq!(channel_alloc(&gpu, A).map(|c| c.channel), Err(nv::EBUSY));
+        assert_eq!(channel_free(&gpu, 1, A), Ok(0));
+        assert!(channel_alloc(&gpu, A).is_ok());
+    }
+
+    #[test]
+    fn process_exit_reclaims_only_the_exiting_pids_channels_objects_and_mappings() {
+        let _g = LOCK.lock();
+        let live = LiveBytes::hold();
+        let gpu = gpu();
+        channel_alloc(&gpu, A).unwrap();
+        channel_alloc(&gpu, A).unwrap();
+        channel_alloc(&gpu, B).unwrap();
+        let h1 = object(&gpu, A, 4096, None);
+        let h2 = object(&gpu, A, 65536, Some(0x2000_0000));
+        let h3 = object(&gpu, A, 8192, Some(0x3000_0000));
+        crate::scheme::gem_mmap::add_ref(h3, B).unwrap();
+        let h4 = object(&gpu, B, 4096, Some(0x4000_0000));
+        let h5 = object(&gpu, B, 4096, None);
+        let h6 = object(&gpu, STRANGER, 4096, Some(0x6000_0000));
+        crate::scheme::gem_mmap::add_ref(h6, B).unwrap();
+        let kernels = object(&gpu, 0, 4096, None);
+        mapping(&gpu, A, h1, 0x1_0000, 4096);
+        mapping(&gpu, A, h2, 0x2_0000, 65536);
+        mapping(&gpu, B, h3, 0x3_0000, 8192);
+        let fb = framebuffer(&gpu, h2);
+        gpu.kms_state.lock().plane_fb = fb;
+        let counted = live.delta();
+
+        gpu.nouveau_release_process(0);
+        assert_eq!(channels_of(&gpu, A), 2, "pid 0 is nobody");
+        assert!(has_object(&gpu, kernels), "and owns nothing to reclaim");
+
+        gpu.nouveau_release_process(A);
+        assert_eq!(channels_of(&gpu, A), 0);
+        assert_eq!(channels_of(&gpu, B), 1);
+        assert!(!has_object(&gpu, h1), "never exported: freed");
+        assert!(!has_object(&gpu, h2), "exported, A the only holder: freed");
+        assert!(crate::scheme::gem_mmap::lookup(h2).is_none());
+        assert_eq!(
+            owner_of(&gpu, h3),
+            Some(0),
+            "B still imports it: orphaned, not freed"
+        );
+        assert!(crate::scheme::gem_mmap::holds(h3, B));
+        assert_eq!(owner_of(&gpu, h4), Some(B));
+        assert!(has_object(&gpu, h5), "B's unexported object is B's");
+        assert_eq!(mappings_of(&gpu, h1) + mappings_of(&gpu, h2), 0);
+        assert_eq!(
+            mappings_of(&gpu, h3),
+            1,
+            "B's mapping of the shared object stays"
+        );
+        assert!(gpu.kms_framebuffers.lock().is_empty());
+        assert_eq!(gpu.kms_state.lock().plane_fb, 0);
+        assert_eq!(
+            live.delta(),
+            counted - 4096 - 65536,
+            "the orphan is still live"
+        );
+        // The orphan now belongs to B alone: B's own GEM_CLOSE frees it,
+        // owner or not (the last holder is who Linux frees for).
+        assert!(gpu.nouveau_gem_close(h3, B));
+        assert!(!has_object(&gpu, h3));
+        assert_eq!(mappings_of(&gpu, h3), 0);
+        assert_eq!(live.delta(), counted - 4096 - 65536 - 8192);
+        // B's exit: its own objects go, its import of a LIVE owner's
+        // buffer is let go without detaching that owner.
+        gpu.nouveau_release_process(B);
+        assert!(!has_object(&gpu, h4));
+        assert!(!has_object(&gpu, h5));
+        assert_eq!(owner_of(&gpu, h6), Some(STRANGER), "still the owner's");
+        assert!(!crate::scheme::gem_mmap::holds(h6, B));
+        assert!(crate::scheme::gem_mmap::holds(h6, STRANGER));
+        assert!(gpu.nouveau_channels.lock().is_empty());
+        gpu.nouveau_release_process(STRANGER);
+        assert!(!has_object(&gpu, h6));
+        assert!(
+            has_object(&gpu, kernels),
+            "nobody's exit reclaims the kernel's"
+        );
+        gpu.nouveau_gem.lock().retain(|o| o.handle != kernels);
+        NOUVEAU_GEM_BYTES.fetch_sub(4096, Ordering::Relaxed);
+        assert_eq!(live.delta(), 0);
+    }
+
+    #[test]
+    fn drain_vm_mappings_takes_exactly_what_matches_and_keeps_the_rest_in_order() {
+        let _g = LOCK.lock();
+        let gpu = gpu();
+        mapping(&gpu, A, 1, 0x1000, 4096);
+        mapping(&gpu, B, 2, 0x2000, 4096);
+        mapping(&gpu, A, 3, 0x3000, 4096);
+        mapping(&gpu, B, 4, 0x4000, 4096);
+        assert_eq!(
+            gpu.drain_vm_mappings("test", |m| m.owner_pid == A, false),
+            2
+        );
+        let left: Vec<u32> = gpu
+            .nouveau_vm_mappings
+            .lock()
+            .iter()
+            .map(|m| m.gem_handle)
+            .collect();
+        assert_eq!(left, [2, 4]);
+        assert_eq!(gpu.drain_vm_mappings("test", |_| false, true), 0);
+        assert_eq!(gpu.drain_vm_mappings("test", |m| m.va == 0x4000, true), 1);
+        let left: Vec<u32> = gpu
+            .nouveau_vm_mappings
+            .lock()
+            .iter()
+            .map(|m| m.gem_handle)
+            .collect();
+        assert_eq!(left, [2]);
+    }
+
+    #[test]
+    fn gem_info_reports_the_callers_own_binding_never_another_contexts_va() {
+        let _g = LOCK.lock();
+        let _live = LiveBytes::hold();
+        let gpu = gpu();
+        let h = object(&gpu, A, 65536, Some(0x5000_0000));
+        assert!(crate::scheme::gem_mmap::add_ref(h, B).is_some());
+        mapping(&gpu, A, h, 0x4000_0000, 65536);
+        assert_eq!(gem_info(&gpu, h, A).unwrap().offset, 0x4000_0000);
+        // B imported the object but never bound it: in B's VA space the
+        // object is nowhere, and A's VA would point at whatever B has
+        // there. Linux: `nouveau_vma_find(nvbo, cli->vmm)` -> NULL -> 0.
+        assert_eq!(
+            gem_info(&gpu, h, B).unwrap().offset,
+            0,
+            "the creator's VA means nothing in the importer's context"
+        );
+        mapping(&gpu, B, h, 0x7000_0000, 65536);
+        assert_eq!(gem_info(&gpu, h, B).unwrap().offset, 0x7000_0000);
+        assert_eq!(
+            gem_info(&gpu, h, A).unwrap().offset,
+            0x4000_0000,
+            "A keeps its own, whatever B bound"
+        );
+        assert_eq!(
+            gem_info(&gpu, h, 0).unwrap().offset,
+            0x4000_0000,
+            "the kernel has no VA space: the first binding"
+        );
+        assert!(crate::scheme::gem_mmap::unregister(h));
+    }
+
+    #[test]
+    fn vram_used_is_the_sum_of_every_clients_live_vram_objects() {
+        let _g = LOCK.lock();
+        let _live = LiveBytes::hold();
+        let gpu = gpu();
+        assert_eq!(getparam(&gpu, nv::NOUVEAU_GETPARAM_VRAM_USED), Ok(0));
+        let in_gart = object(&gpu, A, 65536, None);
+        assert_eq!(
+            getparam(&gpu, nv::NOUVEAU_GETPARAM_VRAM_USED),
+            Ok(0),
+            "GART is system memory"
+        );
+        let mine = vram_object(&gpu, A, 3 * MIB);
+        let theirs = vram_object(&gpu, B, 5 * MIB);
+        assert_eq!(
+            getparam(&gpu, nv::NOUVEAU_GETPARAM_VRAM_USED),
+            Ok(8 * MIB),
+            "the VRAM manager's usage: every client's, as Linux reports it"
+        );
+        // Another GPU's objects are that GPU's VRAM, not this one's.
+        let other = NvidiaGpu::for_test(0x1f06, 8192);
+        vram_object(&other, A, 7 * MIB);
+        assert_eq!(getparam(&gpu, nv::NOUVEAU_GETPARAM_VRAM_USED), Ok(8 * MIB));
+        assert_eq!(
+            getparam(&other, nv::NOUVEAU_GETPARAM_VRAM_USED),
+            Ok(7 * MIB)
+        );
+        // Freed objects stop counting.
+        gpu.nouveau_gem.lock().retain(|o| o.handle != theirs);
+        assert_eq!(getparam(&gpu, nv::NOUVEAU_GETPARAM_VRAM_USED), Ok(3 * MIB));
+        gpu.nouveau_gem.lock().retain(|o| o.handle != mine);
+        assert_eq!(getparam(&gpu, nv::NOUVEAU_GETPARAM_VRAM_USED), Ok(0));
+        gpu.nouveau_gem.lock().retain(|o| o.handle != in_gart);
+    }
+
+    // ----- NVIF: five payloads on one nr, resolved by the header's type -----
+
+    const HDR: usize = size_of::<nv::NvifIoctlV0>();
+    const NEW: usize = size_of::<nv::NvifIoctlNewV0>();
+    const MTHD: usize = size_of::<nv::NvifIoctlMthdV0>();
+    const SCLASS: usize = size_of::<nv::NvifIoctlSclassV0>();
+    const OCLASS: usize = size_of::<nv::NvifSclassOclassV0>();
+    const INFO: usize = size_of::<nv::NvDeviceInfoV0>();
+
+    /// A raw NVIF request: mesa's anonymous `struct { ioctl; body; data }`
+    /// as bytes, written unaligned exactly as the arm reads it.
+    struct Nvif(Vec<u8>);
+
+    impl Nvif {
+        fn new(type_: u8, route: u8, token: u64, object: u64, len: usize) -> Self {
+            let mut b = alloc::vec![0u8; len];
+            let hdr = nv::NvifIoctlV0 {
+                version: 0,
+                type_,
+                pad02: [0; 4],
+                owner: 0,
+                route,
+                token,
+                object,
+            };
+            unsafe { core::ptr::write_unaligned(b.as_mut_ptr() as *mut nv::NvifIoctlV0, hdr) };
+            Nvif(b)
+        }
+
+        fn put<T: Copy>(mut self, at: usize, v: T) -> Self {
+            assert!(at + size_of::<T>() <= self.0.len());
+            unsafe { core::ptr::write_unaligned(self.0.as_mut_ptr().add(at) as *mut T, v) };
+            self
+        }
+
+        /// Shortens the declared length, keeping the bytes behind it
+        /// allocated (and zero): a driver that reads past the length reads
+        /// a zero, not the heap, so the only thing a test observes is what
+        /// the driver decided from the length itself.
+        fn cut(mut self, len: usize) -> Self {
+            self.0.truncate(len);
+            self
+        }
+
+        fn get<T: Copy>(&self, at: usize) -> T {
+            assert!(at + size_of::<T>() <= self.0.len());
+            unsafe { core::ptr::read_unaligned(self.0.as_ptr().add(at) as *const T) }
+        }
+
+        fn send(&mut self, gpu: &NvidiaGpu, pid: u64) -> Result<usize, i32> {
+            let req = ioc(IOC_WRITE, DRM_IOCTL_TYPE, nv::NR_NVIF, self.0.len());
+            gpu.nouveau_ioctl(req, self.0.as_mut_ptr() as usize, pid)
+        }
+    }
+
+    fn new_body(oclass: i32, object: u64) -> nv::NvifIoctlNewV0 {
+        nv::NvifIoctlNewV0 {
+            version: 0,
+            pad01: [0; 6],
+            route: 0,
+            token: object,
+            object,
+            handle: 0,
+            oclass,
+        }
+    }
+
+    /// `nouveau_ws_device_alloc`: 72 bytes, NEW of NV_DEVICE with a selector.
+    fn device_new(device: u64) -> Nvif {
+        Nvif::new(
+            nv::NVIF_IOCTL_V0_NEW,
+            0,
+            0,
+            0,
+            HDR + NEW + size_of::<nv::NvDeviceV0>(),
+        )
+        .put(HDR, new_body(nv::NVIF_CLASS_NV_DEVICE, 0xd0d0))
+        .put(
+            HDR + NEW,
+            nv::NvDeviceV0 {
+                version: 0,
+                pad01: [0; 7],
+                device,
+            },
+        )
+    }
+
+    /// `nouveau_ws_subchan_alloc`: 56 bytes, NEW of an engine class on a
+    /// channel (route 0xff, token = the channel id).
+    fn subchan_new(channel: u64, oclass: i32, object: u64) -> Nvif {
+        Nvif::new(nv::NVIF_IOCTL_V0_NEW, 0xff, channel, 0, HDR + NEW)
+            .put(HDR, new_body(oclass, object))
+    }
+
+    /// `nouveau_ws_device_info`: 136 bytes, MTHD NV_DEVICE_V0_INFO.
+    fn device_info(method: u8) -> Nvif {
+        Nvif::new(nv::NVIF_IOCTL_V0_MTHD, 0, 0, 0xd0d0, HDR + MTHD + INFO).put(
+            HDR,
+            nv::NvifIoctlMthdV0 {
+                version: 0,
+                method,
+                pad02: [0; 6],
+            },
+        )
+    }
+
+    /// `nouveau_ws_context_query_classes`: SCLASS with `slots` entries of
+    /// room, every one pre-filled so a stale slot is visible.
+    fn sclass(channel: u64, route: u8, count: u8, slots: usize) -> Nvif {
+        let mut r = Nvif::new(
+            nv::NVIF_IOCTL_V0_SCLASS,
+            route,
+            channel,
+            0,
+            HDR + SCLASS + slots * OCLASS,
+        )
+        .put(
+            HDR,
+            nv::NvifIoctlSclassV0 {
+                version: 0,
+                count,
+                pad02: [0; 6],
+            },
+        );
+        for i in 0..slots {
+            r = r.put(
+                HDR + SCLASS + i * OCLASS,
+                nv::NvifSclassOclassV0 {
+                    oclass: 0x7777,
+                    minver: 7,
+                    maxver: 7,
+                },
+            );
+        }
+        r
+    }
+
+    fn classes_in(r: &Nvif) -> (u8, Vec<i32>) {
+        let count = r.get::<nv::NvifIoctlSclassV0>(HDR).count;
+        let slots = (r.0.len() - HDR - SCLASS) / OCLASS;
+        let list = (0..slots)
+            .map(|i| {
+                r.get::<nv::NvifSclassOclassV0>(HDR + SCLASS + i * OCLASS)
+                    .oclass
+            })
+            .collect();
+        (count, list)
+    }
+
+    fn cstr(b: &[u8]) -> &str {
+        let end = b.iter().position(|&c| c == 0).unwrap_or(b.len());
+        core::str::from_utf8(&b[..end]).unwrap()
+    }
+
+    #[test]
+    fn nvif_refuses_a_short_payload_and_an_unknown_type_before_reading_a_body() {
+        let _g = LOCK.lock();
+        let gpu = gpu();
+        assert_eq!(
+            Nvif::new(nv::NVIF_IOCTL_V0_NEW, 0, 0, 0, HDR - 1).send(&gpu, A),
+            Err(nv::EINVAL),
+            "shorter than the header"
+        );
+        assert_eq!(
+            Nvif::new(0x09, 0, 0, 0, HDR + NEW).send(&gpu, A),
+            Err(nv::ENOSYS),
+            "a type this driver has no arm for"
+        );
+        assert_eq!(
+            device_new(u64::MAX).cut(HDR + NEW - 1).send(&gpu, A),
+            Err(nv::EINVAL),
+            "NEW without its 32-byte body, however acceptable the bytes behind"
+        );
+        assert_eq!(
+            Nvif::new(nv::NVIF_IOCTL_V0_MTHD, 0, 0, 0, HDR + MTHD - 1).send(&gpu, A),
+            Err(nv::EINVAL),
+            "MTHD without its 8-byte body"
+        );
+        assert_eq!(
+            device_info(nv::NV_DEVICE_V0_INFO)
+                .cut(HDR + MTHD + INFO - 1)
+                .send(&gpu, A),
+            Err(nv::EINVAL),
+            "INFO with no room for its 104-byte reply"
+        );
+        assert_eq!(channel_alloc(&gpu, A).unwrap().channel, 0);
+        assert_eq!(
+            sclass(0, 0xff, 16, 16).cut(HDR + SCLASS - 1).send(&gpu, A),
+            Err(nv::EINVAL),
+            "SCLASS without its 8-byte body, on a channel that exists"
+        );
+        // An NVIF request has no fixed floor at the dispatch: the 24-byte
+        // DEL is a complete request.
+        assert_eq!(
+            Nvif::new(nv::NVIF_IOCTL_V0_DEL, 0, 0, 0x1234, HDR).send(&gpu, A),
+            Ok(0)
+        );
+    }
+
+    #[test]
+    fn nvif_new_of_the_device_object_takes_only_the_client_default() {
+        let _g = LOCK.lock();
+        let gpu = gpu();
+        assert_eq!(device_new(u64::MAX).send(&gpu, A), Ok(0), "mesa's ~0");
+        assert_eq!(
+            device_new(0).send(&gpu, A),
+            Err(nv::EINVAL),
+            "this node exposes one GPU; selecting another is an error"
+        );
+        assert_eq!(device_new(1).send(&gpu, A), Err(nv::EINVAL));
+        // No class data at all (a 56-byte NEW of NV_DEVICE): the default.
+        assert_eq!(
+            Nvif::new(nv::NVIF_IOCTL_V0_NEW, 0, 0, 0, HDR + NEW)
+                .put(HDR, new_body(nv::NVIF_CLASS_NV_DEVICE, 1))
+                .send(&gpu, A),
+            Ok(0)
+        );
+        // oclass 0 is what mesa sends when SCLASS gave it nothing: refused
+        // even on a channel of the caller's, where any real class is fine.
+        assert_eq!(channel_alloc(&gpu, A).unwrap().channel, 0);
+        assert_eq!(subchan_new(0, 0xc597, 1).send(&gpu, A), Ok(0));
+        assert_eq!(subchan_new(0, 0, 1).send(&gpu, A), Err(nv::EINVAL));
+    }
+
+    #[test]
+    fn nvif_device_info_reports_the_board_and_floors_its_vram() {
+        let _g = LOCK.lock();
+        let gpu = gpu();
+        let mut r = device_info(nv::NV_DEVICE_V0_INFO);
+        assert_eq!(r.send(&gpu, A), Ok(0));
+        let info: nv::NvDeviceInfoV0 = r.get(HDR + MTHD);
+        assert_eq!(info.version, 0);
+        assert_eq!(
+            info.platform,
+            nv::NV_DEVICE_INFO_V0_PCIE,
+            "discrete: NVK's conformance gate needs DIS"
+        );
+        assert_eq!(info.chipset, 0x162, "the same chip GETPARAM reports");
+        assert_eq!(info.revision, 0, "BAR0 reads as zero");
+        assert_eq!(info.family, 0);
+        assert_eq!(
+            (info.ram_size, info.ram_user),
+            (8192 * MIB, 8192 * MIB),
+            "ram_user is what mesa takes as vram_size_B"
+        );
+        assert_eq!(cstr(&info.chip), "TU1xx");
+        assert_eq!(cstr(&info.name), "nvidia-test");
+        assert_eq!(
+            device_info(0x05).send(&gpu, A),
+            Err(nv::ENOSYS),
+            "the only method is INFO"
+        );
+        // A board the id table does not know: the architecture's floor,
+        // never a 0 that would leave NVK with an empty VRAM heap.
+        let unknown = NvidiaGpu::for_test(0x1fff, 0);
+        let mut r = device_info(nv::NV_DEVICE_V0_INFO);
+        assert_eq!(r.send(&unknown, A), Ok(0));
+        let info: nv::NvDeviceInfoV0 = r.get(HDR + MTHD);
+        assert_eq!(info.ram_user, 4096 * MIB);
+    }
+
+    #[test]
+    fn nvif_sclass_lists_the_callers_channels_engines_within_the_room_offered() {
+        let _g = LOCK.lock();
+        let gpu = gpu();
+        assert_eq!(
+            sclass(0, 0xff, 16, 16).send(&gpu, A),
+            Err(nv::EINVAL),
+            "no channel yet"
+        );
+        assert_eq!(channel_alloc(&gpu, A).unwrap().channel, 0);
+        assert_eq!(
+            sclass(0, 0x00, 16, 16).send(&gpu, A),
+            Err(nv::EINVAL),
+            "classes hang off a channel: route must be 0xff"
+        );
+        assert_eq!(
+            sclass(0, 0xff, 16, 16).send(&gpu, B),
+            Err(nv::EINVAL),
+            "not B's channel"
+        );
+        assert_eq!(sclass(7, 0xff, 16, 16).send(&gpu, A), Err(nv::EINVAL));
+        // Mesa's call: 16 slots offered, all five engines come back and
+        // the unused tail is cleared (mesa reads every slot).
+        let turing = [0x902d, 0xa140, 0xc597, 0xc5c0, 0xc5b5];
+        let mut r = sclass(0, 0xff, 16, 16);
+        assert_eq!(r.send(&gpu, A), Ok(0));
+        let (count, list) = classes_in(&r);
+        assert_eq!(count, 5);
+        assert_eq!(&list[..5], &turing);
+        assert!(
+            list[5..].iter().all(|&c| c == 0),
+            "no stale slot: {:?}",
+            list
+        );
+        let mut r = sclass(0, 0xff, 16, 16);
+        assert_eq!(r.send(&gpu, 0), Ok(0), "the kernel reads anyone's");
+        // Less room than engines, said by count: the first ones, and
+        // nothing written past what the caller offered.
+        let mut r = sclass(0, 0xff, 3, 16);
+        assert_eq!(r.send(&gpu, A), Ok(0));
+        let (count, list) = classes_in(&r);
+        assert_eq!(count, 3);
+        assert_eq!(&list[..3], &turing[..3]);
+        assert!(
+            list[3..].iter().all(|&c| c == 0x7777),
+            "beyond count is the caller's: {:?}",
+            list
+        );
+        // Less room than count, said by the payload itself.
+        let mut r = sclass(0, 0xff, 16, 2);
+        assert_eq!(r.send(&gpu, A), Ok(0));
+        assert_eq!(classes_in(&r), (2, alloc::vec![0x902d, 0xa140]));
+        // More slots than the protocol's ceiling: capped at 16.
+        let mut r = sclass(0, 0xff, 40, 40);
+        assert_eq!(r.send(&gpu, A), Ok(0));
+        let (count, list) = classes_in(&r);
+        assert_eq!(count, 5);
+        assert!(list[5..16].iter().all(|&c| c == 0));
+        assert!(
+            list[16..].iter().all(|&c| c == 0x7777),
+            "past 16 is never touched"
+        );
+        // A second GPU of another architecture answers with its own triple.
+        let ampere = NvidiaGpu::for_test(0x2204, 24576);
+        assert_eq!(channel_alloc(&ampere, A).unwrap().channel, 0);
+        let mut r = sclass(0, 0xff, 16, 16);
+        assert_eq!(r.send(&ampere, A), Ok(0));
+        assert_eq!(
+            &classes_in(&r).1[..5],
+            &[0x902d, 0xa140, 0xc797, 0xc7c0, 0xc7b5]
+        );
+    }
+
+    #[test]
+    fn nvif_new_of_a_subchannel_needs_the_callers_channel_and_records_nothing_without_the_rm() {
+        let _g = LOCK.lock();
+        let gpu = gpu();
+        assert_eq!(
+            subchan_new(0, 0xc597, 0x1000).send(&gpu, A),
+            Err(nv::EINVAL),
+            "no channel: Linux's abi16 finds no object for the token"
+        );
+        assert_eq!(channel_alloc(&gpu, A).unwrap().channel, 0);
+        assert_eq!(subchan_new(0, 0xc597, 0x1000).send(&gpu, A), Ok(0));
+        assert_eq!(
+            subchan_new(0, 0xc5c0, 0x1008).send(&gpu, 0),
+            Ok(0),
+            "the kernel"
+        );
+        assert_eq!(
+            subchan_new(0, 0xc597, 0x1000).send(&gpu, B),
+            Err(nv::EINVAL),
+            "A's channel is not B's"
+        );
+        assert_eq!(
+            subchan_new(3, 0xc597, 0x1000).send(&gpu, A),
+            Err(nv::EINVAL)
+        );
+        assert!(
+            nv::class_objects_drain_pid(A).is_empty(),
+            "a discovery channel builds no RM object, so there is nothing to reap"
+        );
+        assert_eq!(channel_free(&gpu, 0, A), Ok(0));
+        assert_eq!(
+            subchan_new(0, 0xc597, 0x1000).send(&gpu, A),
+            Err(nv::EINVAL),
+            "freed: the token means nothing again"
+        );
+    }
+
+    #[test]
+    fn nvif_del_and_the_class_registry_are_scoped_to_the_owner_and_the_channel() {
+        let _g = LOCK.lock();
+        let gpu = gpu();
+        nv::class_object_insert(3, 0x1000, 0x5a5a, A);
+        nv::class_object_insert(3, 0x1000, 0x6b6b, B);
+        nv::class_object_insert(4, 0x2000, 0x7c7c, A);
+        nv::class_object_insert(3, 0x3000, 0x8d8d, A);
+        // A DEL names the object by the cookie mesa passed at NEW (a heap
+        // pointer, so equal across processes): only the caller's goes.
+        assert_eq!(
+            Nvif::new(nv::NVIF_IOCTL_V0_DEL, 0xff, 3, 0x1000, HDR).send(&gpu, STRANGER),
+            Ok(0),
+            "nothing of STRANGER's: a no-op, as in Linux's nvif_object_dtor"
+        );
+        assert_eq!(
+            Nvif::new(nv::NVIF_IOCTL_V0_DEL, 0xff, 3, 0x1000, HDR).send(&gpu, A),
+            Ok(0)
+        );
+        assert_eq!(nv::class_object_remove(0x1000, A), None, "gone");
+        assert_eq!(
+            nv::class_object_remove(0x1000, B),
+            Some(0x6b6b),
+            "B's survived A's DEL"
+        );
+        // CHANNEL_FREE reaps what a process left on THAT channel.
+        assert_eq!(nv::class_objects_drain_channel(3, B), alloc::vec![]);
+        assert_eq!(
+            nv::class_objects_drain_channel(3, A),
+            alloc::vec![(0x3000, 0x8d8d)]
+        );
+        assert_eq!(nv::class_objects_drain_channel(4, B), alloc::vec![]);
+        // Process exit reaps everything of that pid, across channels.
+        nv::class_object_insert(5, 0x5000, 0x9e9e, A);
+        nv::class_object_insert(5, 0x6000, 0xafaf, B);
+        assert_eq!(
+            nv::class_objects_drain_pid(A),
+            alloc::vec![(0x2000, 0x7c7c), (0x5000, 0x9e9e)],
+            "in insertion order"
+        );
+        assert_eq!(nv::class_objects_drain_pid(A), alloc::vec![]);
+        assert_eq!(
+            nv::class_objects_drain_pid(B),
+            alloc::vec![(0x6000, 0xafaf)]
+        );
+    }
+}
+
+/// The RM entry points the host test binary has no C code for: every
+/// `eclipse_rm_*` the `nvidia-rm-sys` crate declares, generated from its
+/// `extern "C"` blocks. Each answers `NV_ERR_NOT_SUPPORTED`. A test GPU
+/// never has an RM instance, so none of them is reached; they exist so the
+/// binary links, which it must the moment a test calls `nouveau_ioctl`.
+/// Global to the test binary, like the `drivers_*` shims in `net/e1000e.rs`.
+#[cfg(test)]
+mod rm_host_shims {
+    const NV_ERR_NOT_SUPPORTED: u32 = 0x56;
+
+    #[no_mangle]
+    extern "C" fn eclipse_rm_attach_gpu(
+        _a0: u32,
+        _a1: u8,
+        _a2: u8,
+        _a3: u64,
+        _a4: *mut u8,
+        _a5: u64,
+        _a6: u64,
+        _a7: u64,
+        _a8: u64,
+        _a9: u64,
+        _a10: *mut u8,
+    ) -> u32 {
+        NV_ERR_NOT_SUPPORTED
+    }
+    #[no_mangle]
+    extern "C" fn eclipse_rm_bench(_a0: u32, _a1: *mut u8) -> u32 {
+        NV_ERR_NOT_SUPPORTED
+    }
+    #[no_mangle]
+    extern "C" fn eclipse_rm_ce_blit(_a0: u32, _a1: u64, _a2: u64, _a3: u64, _a4: *mut u8) -> u32 {
+        NV_ERR_NOT_SUPPORTED
+    }
+    #[no_mangle]
+    extern "C" fn eclipse_rm_ce_blit_p2p(
+        _a0: u32,
+        _a1: u64,
+        _a2: u64,
+        _a3: u64,
+        _a4: *mut u8,
+    ) -> u32 {
+        NV_ERR_NOT_SUPPORTED
+    }
+    #[no_mangle]
+    extern "C" fn eclipse_rm_ce_blit_p2p_2d(
+        _a0: u32,
+        _a1: u64,
+        _a2: u32,
+        _a3: u64,
+        _a4: u32,
+        _a5: u32,
+        _a6: u32,
+        _a7: *mut u8,
+    ) -> u32 {
+        NV_ERR_NOT_SUPPORTED
+    }
+    #[no_mangle]
+    extern "C" fn eclipse_rm_ce_fill_fb(_a0: u32, _a1: u64, _a2: u64, _a3: u32) -> u32 {
+        NV_ERR_NOT_SUPPORTED
+    }
+    #[no_mangle]
+    extern "C" fn eclipse_rm_ce_fill_fb_p2p(_a0: u32, _a1: u64, _a2: u64, _a3: u32) -> u32 {
+        NV_ERR_NOT_SUPPORTED
+    }
+    #[no_mangle]
+    extern "C" fn eclipse_rm_ce_release_inflight() -> u32 {
+        NV_ERR_NOT_SUPPORTED
+    }
+    #[no_mangle]
+    extern "C" fn eclipse_rm_ce_wait(_a0: u32, _a1: u64) -> u32 {
+        NV_ERR_NOT_SUPPORTED
+    }
+    #[no_mangle]
+    extern "C" fn eclipse_rm_chan_notifier_pa(_a0: u32, _a1: *mut u8) -> u32 {
+        NV_ERR_NOT_SUPPORTED
+    }
+    #[no_mangle]
+    extern "C" fn eclipse_rm_class_alloc(
+        _a0: u32,
+        _a1: u32,
+        _a2: u32,
+        _a3: *mut u8,
+        _a4: *mut u8,
+    ) -> u32 {
+        NV_ERR_NOT_SUPPORTED
+    }
+    #[no_mangle]
+    extern "C" fn eclipse_rm_class_free(_a0: u32, _a1: u32) -> u32 {
+        NV_ERR_NOT_SUPPORTED
+    }
+    #[no_mangle]
+    extern "C" fn eclipse_rm_ctx0_reset(_a0: u32) -> u32 {
+        NV_ERR_NOT_SUPPORTED
+    }
+    #[no_mangle]
+    extern "C" fn eclipse_rm_ctx_alloc(_a0: u32, _a1: u32, _a2: *mut u8) -> u32 {
+        NV_ERR_NOT_SUPPORTED
+    }
+    #[no_mangle]
+    extern "C" fn eclipse_rm_ctx_free(_a0: u32, _a1: u32) -> u32 {
+        NV_ERR_NOT_SUPPORTED
+    }
+    #[no_mangle]
+    extern "C" fn eclipse_rm_ctx_prime(_a0: u32, _a1: u32) -> u32 {
+        NV_ERR_NOT_SUPPORTED
+    }
+    #[no_mangle]
+    extern "C" fn eclipse_rm_edid(_a0: u32, _a1: *mut u8) -> u32 {
+        NV_ERR_NOT_SUPPORTED
+    }
+    #[no_mangle]
+    extern "C" fn eclipse_rm_exec_fast_prepare(_a0: u32, _a1: u32, _a2: *mut u8) -> u32 {
+        NV_ERR_NOT_SUPPORTED
+    }
+    #[no_mangle]
+    extern "C" fn eclipse_rm_exec_fast_release(_a0: u32, _a1: u32) -> u32 {
+        NV_ERR_NOT_SUPPORTED
+    }
+    #[no_mangle]
+    extern "C" fn eclipse_rm_exec_submit(
+        _a0: u32,
+        _a1: u32,
+        _a2: u64,
+        _a3: u32,
+        _a4: *mut u8,
+    ) -> u32 {
+        NV_ERR_NOT_SUPPORTED
+    }
+    #[no_mangle]
+    extern "C" fn eclipse_rm_exec_submit_signaled(
+        _a0: u32,
+        _a1: u32,
+        _a2: u64,
+        _a3: u32,
+        _a4: u32,
+        _a5: u32,
+        _a6: *mut u8,
+    ) -> u32 {
+        NV_ERR_NOT_SUPPORTED
+    }
+    #[no_mangle]
+    extern "C" fn eclipse_rm_gem_alloc(_a0: u32, _a1: u64, _a2: u32, _a3: *mut u8) -> u32 {
+        NV_ERR_NOT_SUPPORTED
+    }
+    #[no_mangle]
+    extern "C" fn eclipse_rm_gem_fbmem_offset(_a0: u32, _a1: u32, _a2: *mut u8) -> u32 {
+        NV_ERR_NOT_SUPPORTED
+    }
+    #[no_mangle]
+    extern "C" fn eclipse_rm_gem_free(_a0: u32, _a1: u32) -> u32 {
+        NV_ERR_NOT_SUPPORTED
+    }
+    #[no_mangle]
+    extern "C" fn eclipse_rm_gem_map_cpu(_a0: u32, _a1: u32, _a2: *mut u8) -> u32 {
+        NV_ERR_NOT_SUPPORTED
+    }
+    #[no_mangle]
+    extern "C" fn eclipse_rm_get_gsp_info(_a0: u32, _a1: *mut u8) -> u32 {
+        NV_ERR_NOT_SUPPORTED
+    }
+    #[no_mangle]
+    extern "C" fn eclipse_rm_hdmi_audio(
+        _a0: u32,
+        _a1: u32,
+        _a2: u32,
+        _a3: u8,
+        _a4: *mut u8,
+    ) -> u32 {
+        NV_ERR_NOT_SUPPORTED
+    }
+    #[no_mangle]
+    extern "C" fn eclipse_rm_hwcursor_hide(_a0: u32) -> u32 {
+        NV_ERR_NOT_SUPPORTED
+    }
+    #[no_mangle]
+    extern "C" fn eclipse_rm_hwcursor_image(_a0: u32, _a1: *const u8, _a2: u32, _a3: u32) -> u32 {
+        NV_ERR_NOT_SUPPORTED
+    }
+    #[no_mangle]
+    extern "C" fn eclipse_rm_hwcursor_init(_a0: u32, _a1: u32, _a2: *mut u8) -> u32 {
+        NV_ERR_NOT_SUPPORTED
+    }
+    #[no_mangle]
+    extern "C" fn eclipse_rm_hwcursor_move(_a0: i32, _a1: i32) -> u32 {
+        NV_ERR_NOT_SUPPORTED
+    }
+    #[no_mangle]
+    extern "C" fn eclipse_rm_hwflip_init(_a0: u32, _a1: u32, _a2: *mut u8) -> u32 {
+        NV_ERR_NOT_SUPPORTED
+    }
+    #[no_mangle]
+    extern "C" fn eclipse_rm_hwflip_ready() -> u8 {
+        0
+    }
+    #[no_mangle]
+    extern "C" fn eclipse_rm_hwflip_surface(
+        _a0: u32,
+        _a1: u32,
+        _a2: u64,
+        _a3: u32,
+        _a4: u32,
+        _a5: u32,
+    ) -> u32 {
+        NV_ERR_NOT_SUPPORTED
+    }
+    #[no_mangle]
+    extern "C" fn eclipse_rm_init_core() -> u32 {
+        NV_ERR_NOT_SUPPORTED
+    }
+    #[no_mangle]
+    extern "C" fn eclipse_rm_init_gsp(_a0: u32, _a1: *const u8, _a2: u32) -> u32 {
+        NV_ERR_NOT_SUPPORTED
+    }
+    #[no_mangle]
+    extern "C" fn eclipse_rm_intr_table(_a0: u32, _a1: *mut u8) -> u32 {
+        NV_ERR_NOT_SUPPORTED
+    }
+    #[no_mangle]
+    extern "C" fn eclipse_rm_map_peer_fence(
+        _a0: u32,
+        _a1: u32,
+        _a2: u32,
+        _a3: u64,
+        _a4: *mut u8,
+    ) -> u32 {
+        NV_ERR_NOT_SUPPORTED
+    }
+    #[no_mangle]
+    extern "C" fn eclipse_rm_mark_console_gpu(_a0: u32, _a1: u64, _a2: u8) -> u32 {
+        NV_ERR_NOT_SUPPORTED
+    }
+    #[no_mangle]
+    extern "C" fn eclipse_rm_state_init(_a0: u32, _a1: *mut u8) -> u32 {
+        NV_ERR_NOT_SUPPORTED
+    }
+    #[no_mangle]
+    extern "C" fn eclipse_rm_step10(_a0: u32, _a1: *mut u8) -> u32 {
+        NV_ERR_NOT_SUPPORTED
+    }
+    #[no_mangle]
+    extern "C" fn eclipse_rm_step15(_a0: u32, _a1: *mut u8) -> u32 {
+        NV_ERR_NOT_SUPPORTED
+    }
+    #[no_mangle]
+    extern "C" fn eclipse_rm_step16(_a0: u32, _a1: *mut u8) -> u32 {
+        NV_ERR_NOT_SUPPORTED
+    }
+    #[no_mangle]
+    extern "C" fn eclipse_rm_step17(_a0: u32, _a1: *mut u8) -> u32 {
+        NV_ERR_NOT_SUPPORTED
+    }
+    #[no_mangle]
+    extern "C" fn eclipse_rm_step18(_a0: u32, _a1: *mut u8) -> u32 {
+        NV_ERR_NOT_SUPPORTED
+    }
+    #[no_mangle]
+    extern "C" fn eclipse_rm_step19(_a0: u32, _a1: *mut u8) -> u32 {
+        NV_ERR_NOT_SUPPORTED
+    }
+    #[no_mangle]
+    extern "C" fn eclipse_rm_step20(_a0: u32, _a1: *mut u8) -> u32 {
+        NV_ERR_NOT_SUPPORTED
+    }
+    #[no_mangle]
+    extern "C" fn eclipse_rm_step21(_a0: u32, _a1: *mut u8) -> u32 {
+        NV_ERR_NOT_SUPPORTED
+    }
+    #[no_mangle]
+    extern "C" fn eclipse_rm_step22(_a0: u32, _a1: *mut u8) -> u32 {
+        NV_ERR_NOT_SUPPORTED
+    }
+    #[no_mangle]
+    extern "C" fn eclipse_rm_step23(_a0: u32, _a1: *mut u8) -> u32 {
+        NV_ERR_NOT_SUPPORTED
+    }
+    #[no_mangle]
+    extern "C" fn eclipse_rm_step8(_a0: u32, _a1: *mut u8) -> u32 {
+        NV_ERR_NOT_SUPPORTED
+    }
+    #[no_mangle]
+    extern "C" fn eclipse_rm_vm_bind_map(
+        _a0: u32,
+        _a1: u32,
+        _a2: u32,
+        _a3: u64,
+        _a4: u64,
+        _a5: u64,
+        _a6: u32,
+        _a7: *mut u8,
+    ) -> u32 {
+        NV_ERR_NOT_SUPPORTED
+    }
+    #[no_mangle]
+    extern "C" fn eclipse_rm_vm_bind_unmap(_a0: u32, _a1: u32, _a2: u64, _a3: u64) -> u32 {
+        NV_ERR_NOT_SUPPORTED
     }
 }
