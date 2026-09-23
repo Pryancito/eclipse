@@ -724,6 +724,16 @@ impl Syscall<'_> {
         let attr_size = UserInPtr::<u32>::from(attr_ptr + 4).read()? as usize;
         let attr_size = attr_size.clamp(64, 4096);
         let attr_bytes = UserInPtr::<u8>::from(attr_ptr).read_array(attr_size)?;
+        // A `pid` of 0 means "the calling process", not "the process whose id
+        // is zero" — which is how `perf record ./prog` and every program that
+        // profiles itself opens the event. Passing the literal 0 through made
+        // the sampler compare it against the real pid of whoever was running,
+        // so it matched nothing and the profile came out empty.
+        let pid = if pid == 0 {
+            self.zircon_process().id() as i32
+        } else {
+            pid
+        };
         let event = PerfEvent::new(&attr_bytes, pid, cpu, OpenFlags::from_bits_truncate(flags));
         let fd = self.linux_process().add_file(event)?;
         Ok(fd.into())
