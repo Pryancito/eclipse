@@ -201,9 +201,11 @@ impl Syscall<'_> {
         newpath: UserInPtr<u8>,
         flags: usize,
     ) -> SysResult {
+        // Flags first, as Linux does: a bad flag word is EINVAL whatever the
+        // paths are.
+        let flags = at_flags(flags, LINKAT_FLAGS)?;
         let oldpath = oldpath.as_c_str()?;
         let newpath = newpath.as_c_str()?;
-        let flags = AtFlags::from_bits_truncate(flags);
         info!(
             "linkat: olddirfd={:?}, oldpath={:?}, newdirfd={:?}, newpath={:?}, flags={:?}",
             olddirfd, oldpath, newdirfd, newpath, flags
@@ -545,6 +547,51 @@ bitflags! {
     }
 }
 
+/// `AT_NO_AUTOMOUNT`: do not trigger an automount traversing the path.
+///
+/// There is nothing to automount here, but coreutils' `stat` and `ls` put it
+/// on every `statx` they make, so a kernel that refuses it refuses them.
+pub(crate) const AT_NO_AUTOMOUNT: usize = 0x800;
+
+/// `AT_STATX_SYNC_TYPE`: the two bits `statx(2)` uses to ask for a forced
+/// (`AT_STATX_FORCE_SYNC`, 0x2000) or a skipped (`AT_STATX_DONT_SYNC`,
+/// 0x4000) sync. Nothing here syncs to answer a stat, which is what a local
+/// filesystem does, so they are accepted and ignored -- but they are accepted.
+pub(crate) const AT_STATX_SYNC_TYPE: usize = 0x6000;
+
+/// The `AT_*` bits a syscall accepts, checked against the **raw** flag word.
+///
+/// Every `AT_*` caller in this tree reached for `AtFlags::from_bits_truncate`,
+/// which drops in silence every bit it does not know: the kernel nodding at
+/// something userspace said and it did not understand. Two ways that bites.
+///
+/// The bit that means something to another syscall gets through. `AtFlags`
+/// holds `AT_EACCESS` (0x200), which is `faccessat`'s, so
+/// `fstatat(fd, path, buf, AT_EACCESS)` was a perfectly good stat here and is
+/// `EINVAL` on Linux -- the same collision that already cost `unlinkat` its
+/// `AT_REMOVEDIR` (see [`AT_REMOVEDIR`]).
+///
+/// And the bit `AtFlags` cannot even name is dropped *correctly* by accident,
+/// so the allowed set has to be raw bits: `AT_NO_AUTOMOUNT` and the `statx`
+/// sync bits are ones Linux accepts and this kernel has nothing to do about,
+/// and refusing them would break the callers that send them.
+pub(crate) fn at_flags(flags: usize, allowed: usize) -> Result<AtFlags, LxError> {
+    if flags & !allowed != 0 {
+        return Err(LxError::EINVAL);
+    }
+    Ok(AtFlags::from_bits_truncate(flags))
+}
+
+/// What `fstatat(2)` accepts (`vfs_fstatat`, `fs/stat.c`).
+pub(crate) const FSTATAT_FLAGS: usize =
+    AtFlags::SYMLINK_NOFOLLOW.bits() | AT_NO_AUTOMOUNT | AtFlags::EMPTY_PATH.bits();
+
+/// What `statx(2)` accepts: `fstatat`'s set plus the sync-type bits.
+pub(crate) const STATX_FLAGS: usize = FSTATAT_FLAGS | AT_STATX_SYNC_TYPE;
+
+/// What `linkat(2)` accepts (`do_linkat`, `fs/namei.c`).
+pub(crate) const LINKAT_FLAGS: usize = AtFlags::SYMLINK_FOLLOW.bits() | AtFlags::EMPTY_PATH.bits();
+
 /// `unlinkat(2)`'s `AT_REMOVEDIR`, which turns it into `rmdir`.
 ///
 /// It is not in `AtFlags` and must not be: Linux gives it the same value as
@@ -740,5 +787,115 @@ mod unlinkat_flag_tests {
                 bad
             );
         }
+    }
+}
+
+/// Which `AT_*` bits each syscall will take.
+///
+/// `AtFlags::from_bits_truncate` drops what it does not know, so every one of
+/// these syscalls used to accept any flag word at all and act on whichever
+/// bits it happened to recognise. Two shapes of that, and the tests below
+/// pin both: a bit that means something to a *different* syscall got through,
+/// and a bit Linux accepts is one `AtFlags` cannot even name, so the check
+/// cannot be `from_bits` either.
+#[cfg(test)]
+mod at_flags_tests {
+    use super::*;
+
+    /// `fs/stat.c`, `fs/namei.c`, `include/uapi/linux/fcntl.h`.
+    #[test]
+    fn the_allowed_sets_are_the_numbers_linux_uses() {
+        assert_eq!(AtFlags::SYMLINK_NOFOLLOW.bits(), 0x100);
+        assert_eq!(AtFlags::EACCESS.bits(), 0x200);
+        assert_eq!(AtFlags::SYMLINK_FOLLOW.bits(), 0x400);
+        assert_eq!(AT_NO_AUTOMOUNT, 0x800);
+        assert_eq!(AtFlags::EMPTY_PATH.bits(), 0x1000);
+        assert_eq!(AT_STATX_SYNC_TYPE, 0x6000);
+        assert_eq!(FSTATAT_FLAGS, 0x100 | 0x800 | 0x1000);
+        assert_eq!(STATX_FLAGS, 0x100 | 0x800 | 0x1000 | 0x6000);
+        assert_eq!(LINKAT_FLAGS, 0x400 | 0x1000);
+    }
+
+    /// `AT_EACCESS` is `faccessat`'s and `AT_REMOVEDIR` is `unlinkat`'s, and
+    /// Linux gives them the same bit because they belong to different
+    /// syscalls. `fstatat` has no business with either, and used to take both.
+    #[test]
+    fn fstatat_refuses_the_bit_that_belongs_to_another_syscall() {
+        assert_eq!(AtFlags::EACCESS.bits(), AT_REMOVEDIR);
+        assert_eq!(
+            at_flags(AtFlags::EACCESS.bits(), FSTATAT_FLAGS).err(),
+            Some(LxError::EINVAL)
+        );
+        assert_eq!(
+            at_flags(AtFlags::SYMLINK_FOLLOW.bits(), FSTATAT_FLAGS).err(),
+            Some(LxError::EINVAL),
+            "AT_SYMLINK_FOLLOW is linkat's"
+        );
+    }
+
+    /// The other shape, and the reason the check is on raw bits: coreutils'
+    /// `stat` and `ls` send `AT_NO_AUTOMOUNT` on every call, and `AtFlags`
+    /// has no name for it. A check written as `from_bits(...).ok_or(EINVAL)`
+    /// would have refused `ls`.
+    #[test]
+    fn fstatat_accepts_at_no_automount_which_at_flags_cannot_name() {
+        assert!(AtFlags::from_bits(AT_NO_AUTOMOUNT).is_none());
+        assert_eq!(
+            at_flags(AT_NO_AUTOMOUNT, FSTATAT_FLAGS),
+            Ok(AtFlags::empty())
+        );
+    }
+
+    #[test]
+    fn statx_takes_its_sync_bits_and_fstatat_does_not() {
+        for bit in [0x2000, 0x4000, AT_STATX_SYNC_TYPE] {
+            assert_eq!(at_flags(bit, STATX_FLAGS), Ok(AtFlags::empty()), "{bit:#x}");
+            assert_eq!(
+                at_flags(bit, FSTATAT_FLAGS).err(),
+                Some(LxError::EINVAL),
+                "{bit:#x}"
+            );
+        }
+    }
+
+    #[test]
+    fn linkat_takes_symlink_follow_and_refuses_symlink_nofollow() {
+        assert_eq!(
+            at_flags(AtFlags::SYMLINK_FOLLOW.bits(), LINKAT_FLAGS),
+            Ok(AtFlags::SYMLINK_FOLLOW)
+        );
+        assert_eq!(
+            at_flags(AtFlags::SYMLINK_NOFOLLOW.bits(), LINKAT_FLAGS).err(),
+            Some(LxError::EINVAL)
+        );
+    }
+
+    #[test]
+    fn a_bit_no_syscall_knows_is_einval_everywhere() {
+        for allowed in [FSTATAT_FLAGS, STATX_FLAGS, LINKAT_FLAGS] {
+            assert_eq!(at_flags(0, allowed), Ok(AtFlags::empty()));
+            for bit in 0..usize::BITS as usize {
+                let flag = 1usize << bit;
+                if allowed & flag != 0 {
+                    continue;
+                }
+                assert_eq!(
+                    at_flags(flag, allowed).err(),
+                    Some(LxError::EINVAL),
+                    "{flag:#x} slipped past {allowed:#x}"
+                );
+            }
+        }
+    }
+
+    /// What survives the check still has to arrive parsed, or the syscall
+    /// stops following symlinks and stops honouring AT_EMPTY_PATH.
+    #[test]
+    fn the_bits_that_are_allowed_still_reach_the_caller() {
+        let flags = AtFlags::SYMLINK_NOFOLLOW.bits() | AtFlags::EMPTY_PATH.bits();
+        let parsed = at_flags(flags | AT_NO_AUTOMOUNT, FSTATAT_FLAGS).unwrap();
+        assert!(parsed.contains(AtFlags::SYMLINK_NOFOLLOW));
+        assert!(parsed.contains(AtFlags::EMPTY_PATH));
+        assert!(!parsed.contains(AtFlags::SYMLINK_FOLLOW));
     }
 }

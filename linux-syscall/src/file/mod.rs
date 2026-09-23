@@ -16,5 +16,5 @@ mod poll;
 mod splice;
 mod stat;
 
-use self::dir::AtFlags;
+use self::dir::{at_flags, AtFlags, FSTATAT_FLAGS, STATX_FLAGS};
 pub(crate) use self::poll::poll_timeout_msecs;
