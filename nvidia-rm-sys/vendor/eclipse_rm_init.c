@@ -10532,21 +10532,44 @@ static void hwflip_win_method(NvU32 method, const NvU32 *args, NvU32 count)
     g_hwflip.winPbPut += 4 * (count + 1);
 }
 
-static NV_STATUS hwflip_win_kick(NvU32 timeoutMs)
+/* Ring the window channel (Put = new byte offset) and return. Nothing here
+ * waits for the display FE: a flip is a pushbuffer submission, and as in
+ * nouveau the ioctl is over once the methods are kicked, not once the FE has
+ * fetched them. The wait that used to sit here (Get == Put, polled 1 ms at a
+ * time for up to 200 ms, under RmGate + the RM API and GPU locks) parked the
+ * compositor inside PAGE_FLIP for as long as the FE took to consume the
+ * UPDATE, and every other RM entry spun on the gate behind it. The pushbuffer
+ * is protected instead at the START of the next flip: see
+ * eclipse_rm_hwflip_pending() / the BUSY refusal in eclipse_rm_hwflip_surface(). */
+static void hwflip_win_kick_nowait(void)
 {
-    NvU32 i;
     osFlushCpuWriteCombineBuffer();
     g_hwflip.pWinCtl->Put = g_hwflip.winPbPut;
     osFlushCpuWriteCombineBuffer();
-    for (i = 0; i < timeoutMs; i++)
-    {
-        if (g_hwflip.pWinCtl->Get == g_hwflip.winPbPut)
-            return NV_OK;
-        os_delay_us(1000);
-    }
-    nv_printf(0, "[eclipse-rm-trace] hwflip: win kick TIMEOUT Get=%u Put=%u\n",
-              g_hwflip.pWinCtl->Get, g_hwflip.winPbPut);
-    return NV_ERR_TIMEOUT;
+}
+
+/* Same for the core channel, for the per-flip interlock UPDATE. The cursor
+ * paths keep hwcur_core_kick(): a cursor image change is rare and may wait. */
+static void hwcur_core_kick_nowait(void)
+{
+    osFlushCpuWriteCombineBuffer();
+    g_hwcur.pCoreCtl->Put = g_hwcur.pbPut;
+    osFlushCpuWriteCombineBuffer();
+}
+
+/* True while the display FE has not fetched everything the last flip pushed
+ * (window or core Get behind Put). Reads two mapped control words and no RM
+ * state: callable without RmGate, from a poll loop. Not ready = nothing
+ * pending. */
+NvBool eclipse_rm_hwflip_pending(void)
+{
+    if (!g_hwflip.ready || g_hwflip.pWinCtl == NULL)
+        return NV_FALSE;
+    if (g_hwflip.pWinCtl->Get != g_hwflip.winPbPut)
+        return NV_TRUE;
+    if (g_hwcur.pCoreCtl != NULL && g_hwcur.pCoreCtl->Get != g_hwcur.pbPut)
+        return NV_TRUE;
+    return NV_FALSE;
 }
 
 NV_STATUS eclipse_rm_hwflip_init(NvU32 gpuInstance, NvU32 head, EclipseHwFlipInit *pOut)
@@ -10756,6 +10779,13 @@ NV_STATUS eclipse_rm_hwflip_surface(
 
     if (!g_hwflip.ready || hMemory == 0 || width == 0 || height == 0 || pitchBytes == 0)
         return NV_ERR_INVALID_STATE;
+    /* The previous flip's methods are still being fetched: writing more would
+     * append behind an UPDATE the FE has not executed (and, 4 KiB later, wrap
+     * onto methods it has not read). The caller drains with
+     * eclipse_rm_hwflip_pending() first, outside every lock, so this is the
+     * safety net, not the wait. Nothing has been written when it fires. */
+    if (eclipse_rm_hwflip_pending())
+        return NV_ERR_BUSY_RETRY;
     if ((pitchBytes & 63) != 0)
         return NV_ERR_INVALID_ARGUMENT; /* must be 64 B aligned for ISO pitch units */
     /* Nouveau wndwc57e: SET_OFFSET is in 256-byte units; plane offset must be
@@ -10873,16 +10903,18 @@ NV_STATUS eclipse_rm_hwflip_surface(
 
     args[0] = 0;
     hwflip_win_method(NVC57E_UPDATE, args, 1);
-    status = hwflip_win_kick(200);
-    if (status != NV_OK)
-        goto unlock;
+    hwflip_win_kick_nowait();
 
-    /* Core interlock with this window + RELEASE_ELV so the FE latches. */
+    /* Core interlock with this window + RELEASE_ELV so the FE latches. Kicked
+     * without waiting as well: the flip completes at the panel's next vblank
+     * on its own, and the next flip checks eclipse_rm_hwflip_pending() before
+     * it writes. */
     args[0] = (NvU32)(1u << (g_hwflip.windowIdx & 31));
     hwcur_core_method(NVC57D_SET_WINDOW_INTERLOCK_FLAGS, args, 1);
     args[0] = DRF_DEF(C57D, _UPDATE, _RELEASE_ELV, _TRUE);
     hwcur_core_method(NVC57D_UPDATE, args, 1);
-    status = hwcur_core_kick(200);
+    hwcur_core_kick_nowait();
+    status = NV_OK;
 
 unlock:
     rmGpuLocksRelease(GPUS_LOCK_FLAGS_NONE, NULL);

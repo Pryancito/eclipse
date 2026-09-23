@@ -506,6 +506,89 @@ static CE_PRESENT_LOGGED: AtomicBool = AtomicBool::new(false);
 /// real-hardware test.
 static CE_PRESENT_WEDGED: AtomicBool = AtomicBool::new(false);
 
+/// NVC57E surface-flip ladder: 0 untried, 1 ready, 2 failed (latched for the
+/// boot, the CE/software present takes over). Module-level so a test can
+/// start it over.
+static SURFACEFLIP_STATE: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// How long a flip may wait for the display front end to finish fetching the
+/// PREVIOUS flip before this one is dropped: three 60 Hz frames, enough for a
+/// 24 Hz panel's period plus slack. In steady state the wait is zero -- the
+/// compositor flips once per synthetic vblank and the panel latches one
+/// UPDATE per real vblank -- so anything that reaches this bound is a display
+/// that stopped fetching, not a slow one.
+const SURFACEFLIP_DRAIN_TIMEOUT_US: u64 = 50_000;
+
+/// Surface flips submitted (the window UPDATE was kicked).
+static SURFACEFLIP_FLIPS: AtomicU64 = AtomicU64::new(0);
+/// Flips that found the previous one still being fetched and had to wait.
+static SURFACEFLIP_DRAIN_WAITS: AtomicU64 = AtomicU64::new(0);
+/// Microseconds spent in those waits, total and worst single wait.
+static SURFACEFLIP_DRAIN_US: AtomicU64 = AtomicU64::new(0);
+static SURFACEFLIP_DRAIN_MAX_US: AtomicU64 = AtomicU64::new(0);
+/// Worst time spent inside `hwflip_surface` itself (the RM entry: ctxdma
+/// lookup, method writes, two kicks). With the front-end wait gone this is
+/// the whole cost of a flip on the compositor's thread.
+static SURFACEFLIP_SUBMIT_MAX_US: AtomicU64 = AtomicU64::new(0);
+/// Flips dropped because the display never drained within the bound.
+static SURFACEFLIP_STUCK: AtomicU64 = AtomicU64::new(0);
+/// Flips the RM refused as BUSY although the drain said clear (a cursor
+/// image change kicked the core in between). Dropped like a stuck one.
+static SURFACEFLIP_BUSY_REFUSED: AtomicU64 = AtomicU64::new(0);
+
+/// Wait, outside every lock, until the display front end has fetched the
+/// previous flip's methods, so `hwflip_surface` can write the pushbuffer.
+/// `Some(waited_us)` when clear; `None` when the front end did not drain
+/// within [`SURFACEFLIP_DRAIN_TIMEOUT_US`].
+///
+/// This is where the wait belongs: before the NEXT flip touches the ring,
+/// not after this flip's kick. It used to be the latter -- `hwflip_surface`
+/// polled `Get == Put` 1 ms at a time, under `RmGate` and the RM API/GPU
+/// locks, and returned only when the front end had consumed the UPDATE. The
+/// compositor sat in `PAGE_FLIP` for that long every frame, with every other
+/// RM entry spinning on the gate behind it; the fastest a client could go was
+/// the compositor's cadence.
+fn surfaceflip_drain() -> Option<u64> {
+    let t0 = unsafe { crate::bus::drivers_timer_now_as_micros() };
+    let mut waited = false;
+    while nvidia_rm_sys::rm_init::hwflip_pending() {
+        waited = true;
+        let now = unsafe { crate::bus::drivers_timer_now_as_micros() };
+        if now.wrapping_sub(t0) >= SURFACEFLIP_DRAIN_TIMEOUT_US {
+            SURFACEFLIP_STUCK.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+        gpu_spin();
+    }
+    if !waited {
+        return Some(0);
+    }
+    let us = unsafe { crate::bus::drivers_timer_now_as_micros() }.wrapping_sub(t0);
+    SURFACEFLIP_DRAIN_WAITS.fetch_add(1, Ordering::Relaxed);
+    SURFACEFLIP_DRAIN_US.fetch_add(us, Ordering::Relaxed);
+    SURFACEFLIP_DRAIN_MAX_US.fetch_max(us, Ordering::Relaxed);
+    Some(us)
+}
+
+/// One `/proc/gpudbg` line with the surface-flip counters.
+fn surfaceflip_stats_line() -> String {
+    alloc::format!(
+        "[gpudbg]  surfaceflip: state={} flips={} drain-waits={} drain-total={}us drain-max={}us submit-max={}us stuck-dropped={} busy-refused={}",
+        match SURFACEFLIP_STATE.load(Ordering::Relaxed) {
+            0 => "untried",
+            1 => "ready",
+            _ => "failed",
+        },
+        SURFACEFLIP_FLIPS.load(Ordering::Relaxed),
+        SURFACEFLIP_DRAIN_WAITS.load(Ordering::Relaxed),
+        SURFACEFLIP_DRAIN_US.load(Ordering::Relaxed),
+        SURFACEFLIP_DRAIN_MAX_US.load(Ordering::Relaxed),
+        SURFACEFLIP_SUBMIT_MAX_US.load(Ordering::Relaxed),
+        SURFACEFLIP_STUCK.load(Ordering::Relaxed),
+        SURFACEFLIP_BUSY_REFUSED.load(Ordering::Relaxed),
+    )
+}
+
 #[derive(Debug, Clone, Copy)]
 struct BootFbInfo {
     phys: u64,
@@ -4017,6 +4100,10 @@ impl DrmScheme for NvidiaGpu {
         // Where a frame's kernel time goes: per-ioctl counts/latencies, the
         // direct-submit vs RM split, syncobj spin time, fence latency.
         s.push_str(&super::nouveau_uapi::format_exec_profile());
+        // What a hardware page flip costs the compositor's thread, and how
+        // often the panel was still latching the previous one.
+        s.push_str(&surfaceflip_stats_line());
+        s.push('\n');
 
         s
     }
@@ -7651,9 +7738,7 @@ impl DrmScheme for NvidiaGpu {
             // covers the BO from 0, so plane origin passed to RM is 0.
             if fb.vram_offset.is_some() && fb.h_memory != 0 && self.drives_boot_display() {
                 if let Some(dev) = *self.rm_device_instance.lock() {
-                    use core::sync::atomic::AtomicU8;
-                    static SF_STATE: AtomicU8 = AtomicU8::new(0); // 0 untried, 1 ready, 2 fail
-                    let mut state = SF_STATE.load(Ordering::Acquire);
+                    let mut state = SURFACEFLIP_STATE.load(Ordering::Acquire);
                     if state == 0 {
                         let (st, info) = nvidia_rm_sys::rm_init::hwflip_init(dev, 0);
                         if st == 0 && nvidia_rm_sys::rm_init::hwflip_ready() {
@@ -7664,7 +7749,7 @@ impl DrmScheme for NvidiaGpu {
                                 info.win_chan_status,
                                 info.owner_status
                             );
-                            SF_STATE.store(1, Ordering::Release);
+                            SURFACEFLIP_STATE.store(1, Ordering::Release);
                             state = 1;
                         } else {
                             crate::klog_info!(
@@ -7674,15 +7759,35 @@ impl DrmScheme for NvidiaGpu {
                                 info.win_chan_status,
                                 info.owner_status
                             );
-                            SF_STATE.store(2, Ordering::Release);
+                            SURFACEFLIP_STATE.store(2, Ordering::Release);
                             state = 2;
                         }
                     }
                     if state == 1 {
+                        // The front end must have fetched the PREVIOUS flip
+                        // before this one writes the pushbuffer. Waited for
+                        // here, outside the RM, and normally not at all --
+                        // see `surfaceflip_drain`. A display that never
+                        // drains loses this frame (the completion event
+                        // still goes out, the compositor keeps running) and
+                        // falls to the CE/software present below, as a
+                        // refused flip always did.
+                        let Some(drained_us) = surfaceflip_drain() else {
+                            static SF_STUCK_LOG: AtomicBool = AtomicBool::new(false);
+                            if !SF_STUCK_LOG.swap(true, Ordering::Relaxed) {
+                                crate::klog_warn!(
+                                    "[NVIDIA] surfaceflip: display front end still fetching the previous flip after {}us -- dropping this frame (fb={})",
+                                    SURFACEFLIP_DRAIN_TIMEOUT_US,
+                                    fb_id
+                                );
+                            }
+                            return false;
+                        };
                         // Plane offset within the GEM/ctxdma (0 = whole BO).
                         // Never pass absolute AT_GPU `vram_offset` here —
                         // that programmed the FE past the buffer and tore
                         // the desktop into diagonal snow.
+                        let t0 = unsafe { crate::bus::drivers_timer_now_as_micros() };
                         let st = nvidia_rm_sys::rm_init::hwflip_surface(
                             dev,
                             fb.h_memory,
@@ -7691,24 +7796,40 @@ impl DrmScheme for NvidiaGpu {
                             fb.height,
                             fb.pitch,
                         );
+                        let submit_us =
+                            unsafe { crate::bus::drivers_timer_now_as_micros() }.wrapping_sub(t0);
+                        SURFACEFLIP_SUBMIT_MAX_US.fetch_max(submit_us, Ordering::Relaxed);
                         if st == 0 {
+                            let flips = SURFACEFLIP_FLIPS.fetch_add(1, Ordering::Relaxed) + 1;
                             let now = unsafe { crate::bus::drivers_timer_now_as_micros() };
                             let mut kms = self.kms_state.lock();
                             kms.crtc_fb = fb.id;
                             kms.plane_fb = fb.id;
                             kms.last_vblank_us = now;
-                            static SF_FLIP_LOG: AtomicBool = AtomicBool::new(false);
-                            if !SF_FLIP_LOG.swap(true, Ordering::Relaxed) {
+                            drop(kms);
+                            if flips == 1 {
                                 crate::klog_info!(
-                                    "[NVIDIA] surfaceflip: OK fb={} hMem={:#x} {}x{} pitch={} (plane off=0)",
+                                    "[NVIDIA] surfaceflip: OK fb={} hMem={:#x} {}x{} pitch={} (plane off=0) submit={}us drain={}us",
                                     fb_id,
                                     fb.h_memory,
                                     fb.width,
                                     fb.height,
-                                    fb.pitch
+                                    fb.pitch,
+                                    submit_us,
+                                    drained_us
                                 );
+                            } else if flips == 600 {
+                                // Ten seconds of desktop at 60 Hz: one line with
+                                // what a flip costs the compositor now that it
+                                // no longer waits for the panel. `drain-max` is
+                                // how late the panel ever was; `submit-max` is
+                                // the RM entry itself.
+                                crate::klog_info!("[NVIDIA] {}", surfaceflip_stats_line());
                             }
                             return true;
+                        }
+                        if st == nvidia_rm_sys::types::NV_ERR_BUSY_RETRY {
+                            SURFACEFLIP_BUSY_REFUSED.fetch_add(1, Ordering::Relaxed);
                         }
                         static SF_FAIL_LOG: AtomicBool = AtomicBool::new(false);
                         if !SF_FAIL_LOG.swap(true, Ordering::Relaxed) {
@@ -7870,20 +7991,16 @@ impl DrmScheme for NvidiaGpu {
         nvidia_rm_sys::rm_init::hwcursor_hide(dev) == 0
     }
 
+    /// `WAIT_VBLANK` reaches here only once the surface-flip ladder is up
+    /// (`has_hardware_kms`). There is no vblank interrupt to wait for on
+    /// this driver, and the DRM layer already paces the request against its
+    /// synthetic vblank counter, sleeping in the syscall path before the
+    /// ioctl arm runs. What this did instead was busy-spin the calling CPU
+    /// until 16.7 ms after the last flip -- for EVERY form of the ioctl,
+    /// the event form and the `RELATIVE 0` "what is the current sequence"
+    /// query included -- on top of the sleep already taken. So: nothing to
+    /// wait for, report success.
     fn wait_vblank(&self, _crtc_id: u32) -> bool {
-        const FRAME_US: u64 = 1_000_000 / 60;
-        let state = self.kms_state.lock();
-        let now = unsafe { crate::bus::drivers_timer_now_as_micros() };
-        let target = if state.last_vblank_us == 0 {
-            now.saturating_add(FRAME_US)
-        } else {
-            state.last_vblank_us.saturating_add(FRAME_US)
-        };
-        drop(state);
-        while unsafe { crate::bus::drivers_timer_now_as_micros() } < target {
-            gpu_spin();
-        }
-        self.kms_state.lock().last_vblank_us = target;
         true
     }
 
@@ -16858,6 +16975,237 @@ mod nouveau_bookkeeping_tests {
     }
 }
 
+/// The NVC57E surface flip on the host: `page_flip` against the fake ladder
+/// in `rm_host_shims`, with the front end's fetch of each flip modelled as
+/// a number of `hwflip_pending` polls. What these pin down is WHEN the
+/// driver waits for the panel: never after its own kick, only before the
+/// next flip writes the ring, and never for longer than the bound.
+#[cfg(test)]
+mod surfaceflip_tests {
+    use super::super::nouveau_uapi as nv;
+    use super::rm_host_shims::{reset_fake_hwflip, FAKE_HWFLIP};
+    use super::*;
+    use crate::nvme::nvme_queue::test_clock;
+    use crate::scheme::drm::DrmScheme;
+
+    /// The fixture below writes process-wide state (the boot framebuffer,
+    /// the opt-in flag, the ladder latch and its counters), so the tests
+    /// take turns.
+    static SERIAL: lock::Mutex<()> = lock::Mutex::new(());
+
+    const FB: u32 = 7;
+    const H_MEMORY: u32 = 0x1234;
+
+    /// A GPU that drives the panel (the boot framebuffer lies in its BAR1
+    /// window), RM up, `nvidia.surfaceflip` opted in, with one VRAM-backed
+    /// KMS framebuffer registered -- the shape of the compositor's output
+    /// buffer under NVK.
+    fn console_gpu() -> NvidiaGpu {
+        reset_fake_hwflip();
+        SURFACEFLIP_STATE.store(0, Ordering::Release);
+        for c in [
+            &SURFACEFLIP_FLIPS,
+            &SURFACEFLIP_DRAIN_WAITS,
+            &SURFACEFLIP_DRAIN_US,
+            &SURFACEFLIP_DRAIN_MAX_US,
+            &SURFACEFLIP_SUBMIT_MAX_US,
+            &SURFACEFLIP_STUCK,
+            &SURFACEFLIP_BUSY_REFUSED,
+        ] {
+            c.store(0, Ordering::Relaxed);
+        }
+        test_clock::set(1_000_000);
+        test_clock::set_auto_advance(0);
+        nv::set_enabled(true);
+        nv::set_surfaceflip_enabled(true);
+        set_boot_fb_info(0x1000, 1920, 1080, 1920 * 4);
+        let gpu = NvidiaGpu::for_test(0x1f06, 8192);
+        assert!(gpu.drives_boot_display());
+        *gpu.rm_device_instance.lock() = Some(0);
+        gpu.kms_framebuffers.lock().push(NvidiaKmsFramebuffer {
+            id: FB,
+            handle_id: 1,
+            width: 1920,
+            height: 1080,
+            pitch: 1920 * 4,
+            phys_addr: 0,
+            size: 0,
+            h_memory: H_MEMORY,
+            vram_offset: Some(0),
+        });
+        gpu
+    }
+
+    fn polls() -> u64 {
+        FAKE_HWFLIP.lock().polls
+    }
+
+    fn surfaces() -> usize {
+        FAKE_HWFLIP.lock().surfaces.len()
+    }
+
+    /// The flip is a submission: the ioctl is over once the methods are
+    /// kicked, however long the panel then takes to fetch them.
+    #[test]
+    fn a_flip_returns_as_soon_as_it_is_kicked_and_does_not_wait_for_the_panel() {
+        let _g = SERIAL.lock();
+        let gpu = console_gpu();
+        // A panel that takes a thousand polls to fetch a flip.
+        FAKE_HWFLIP.lock().fetch_polls = 1000;
+        assert!(
+            !gpu.has_hardware_kms(),
+            "the ladder comes up on the first flip"
+        );
+        assert!(gpu.page_flip(FB));
+        let f = FAKE_HWFLIP.lock();
+        assert_eq!(f.init_calls, 1);
+        assert_eq!(f.surfaces, [(H_MEMORY, 0, 1920, 1080, 1920 * 4)]);
+        assert_eq!(
+            f.polls, 1,
+            "one look at the front end before writing, none after the kick"
+        );
+        assert_eq!(
+            f.pending_polls, 1000,
+            "the panel is still fetching, and nobody waited"
+        );
+        drop(f);
+        assert!(gpu.has_hardware_kms());
+        assert_eq!(SURFACEFLIP_FLIPS.load(Ordering::Relaxed), 1);
+        assert_eq!(SURFACEFLIP_DRAIN_WAITS.load(Ordering::Relaxed), 0);
+        let kms = gpu.kms_state.lock();
+        assert_eq!((kms.crtc_fb, kms.plane_fb), (FB, FB));
+    }
+
+    /// The next flip is the one that waits, and only until the front end has
+    /// fetched the previous one -- then it writes.
+    #[test]
+    fn the_next_flip_waits_exactly_until_the_previous_one_has_been_fetched() {
+        let _g = SERIAL.lock();
+        let gpu = console_gpu();
+        FAKE_HWFLIP.lock().fetch_polls = 5;
+        test_clock::set_auto_advance(10);
+        assert!(gpu.page_flip(FB));
+        assert_eq!(polls(), 1);
+        assert!(gpu.page_flip(FB));
+        assert_eq!(surfaces(), 2, "the second flip went through");
+        assert_eq!(
+            polls(),
+            1 + 5 + 1,
+            "five pending answers, then the one that read Get == Put"
+        );
+        assert_eq!(
+            FAKE_HWFLIP.lock().refused_busy,
+            0,
+            "it never wrote into a busy ring"
+        );
+        assert_eq!(SURFACEFLIP_DRAIN_WAITS.load(Ordering::Relaxed), 1);
+        let max = SURFACEFLIP_DRAIN_MAX_US.load(Ordering::Relaxed);
+        assert!((40..=80).contains(&max), "five 10 us polls, got {} us", max);
+        assert_eq!(SURFACEFLIP_DRAIN_US.load(Ordering::Relaxed), max);
+    }
+
+    /// A front end that stopped fetching costs one frame, not the boot: the
+    /// drain gives up at its bound, the flip is refused so the present falls
+    /// back, and nothing is written into the ring behind the stuck UPDATE.
+    #[test]
+    fn a_panel_that_never_fetches_loses_the_frame_at_the_bound_and_no_later() {
+        let _g = SERIAL.lock();
+        let gpu = console_gpu();
+        // Bring the ladder up with one clean flip first.
+        assert!(gpu.page_flip(FB));
+        FAKE_HWFLIP.lock().pending_forever = true;
+        // Every look at the clock moves it 100 us.
+        test_clock::set_auto_advance(100);
+        let t0 = test_clock::now();
+        assert!(!gpu.page_flip(FB), "the frame is dropped");
+        test_clock::set_auto_advance(0);
+        let waited = test_clock::now() - t0;
+        assert!(
+            (SURFACEFLIP_DRAIN_TIMEOUT_US..SURFACEFLIP_DRAIN_TIMEOUT_US + 1_000).contains(&waited),
+            "gave up after {} us, bound is {}",
+            waited,
+            SURFACEFLIP_DRAIN_TIMEOUT_US
+        );
+        let f = FAKE_HWFLIP.lock();
+        assert!(!f.overpolled, "the drain never gave up");
+        assert_eq!(
+            f.surfaces.len(),
+            1,
+            "nothing was written behind the stuck UPDATE"
+        );
+        assert_eq!(f.refused_busy, 0, "the driver did not even ask");
+        drop(f);
+        assert_eq!(SURFACEFLIP_STUCK.load(Ordering::Relaxed), 1);
+        assert_eq!(SURFACEFLIP_FLIPS.load(Ordering::Relaxed), 1);
+    }
+
+    /// The C side's own refusal (something else kicked the core between the
+    /// drain and the write) is a dropped frame too, counted apart, and the
+    /// ladder stays up for the next one.
+    #[test]
+    fn a_busy_refusal_from_the_rm_drops_the_frame_and_keeps_the_ladder() {
+        let _g = SERIAL.lock();
+        let gpu = console_gpu();
+        assert!(gpu.page_flip(FB));
+        FAKE_HWFLIP.lock().refuse_busy_once = true;
+        assert!(!gpu.page_flip(FB));
+        assert_eq!(SURFACEFLIP_BUSY_REFUSED.load(Ordering::Relaxed), 1);
+        assert_eq!(SURFACEFLIP_STUCK.load(Ordering::Relaxed), 0);
+        assert!(gpu.page_flip(FB), "the next frame flips again");
+        assert_eq!(surfaces(), 2);
+        assert_eq!(SURFACEFLIP_FLIPS.load(Ordering::Relaxed), 2);
+        assert!(gpu.has_hardware_kms());
+    }
+
+    /// The ladder is built once; a failed bring-up is latched for the boot
+    /// and every later flip goes straight to the fallback.
+    #[test]
+    fn the_ladder_is_built_once_and_a_failed_build_is_latched() {
+        let _g = SERIAL.lock();
+        let gpu = console_gpu();
+        FAKE_HWFLIP.lock().init_ok = false;
+        assert!(!gpu.page_flip(FB));
+        assert!(!gpu.page_flip(FB));
+        assert_eq!(FAKE_HWFLIP.lock().init_calls, 1, "not retried");
+        assert!(!gpu.has_hardware_kms());
+        assert_eq!(surfaces(), 0);
+        assert_eq!(SURFACEFLIP_STATE.load(Ordering::Relaxed), 2);
+        assert!(surfaceflip_stats_line().contains("state=failed"));
+    }
+
+    /// `WAIT_VBLANK` used to busy-spin a whole frame here on top of the sleep
+    /// the syscall path had already taken. The synthetic vblank counter is
+    /// the pacing; the driver has nothing to add.
+    #[test]
+    fn wait_vblank_does_not_spin_a_frame_on_the_calling_cpu() {
+        let _g = SERIAL.lock();
+        let gpu = console_gpu();
+        assert!(gpu.page_flip(FB), "a flip stamps last_vblank_us");
+        // Each clock read is a microsecond, so a 16.7 ms spin is measurable
+        // and finite either way.
+        test_clock::set_auto_advance(1);
+        let t0 = test_clock::now();
+        assert!(gpu.wait_vblank(0));
+        test_clock::set_auto_advance(0);
+        let spent = test_clock::now() - t0;
+        assert!(spent < 1_000, "wait_vblank spun {} us", spent);
+    }
+
+    /// The counters land in `/proc/gpudbg` with the numbers a boot leaves.
+    #[test]
+    fn the_flip_counters_are_reported() {
+        let _g = SERIAL.lock();
+        let gpu = console_gpu();
+        FAKE_HWFLIP.lock().fetch_polls = 2;
+        assert!(gpu.page_flip(FB));
+        assert!(gpu.page_flip(FB));
+        let line = surfaceflip_stats_line();
+        assert!(line.contains("state=ready"), "{}", line);
+        assert!(line.contains("flips=2 drain-waits=1"), "{}", line);
+        assert!(line.contains("stuck-dropped=0 busy-refused=0"), "{}", line);
+    }
+}
+
 /// The RM entry points the host test binary has no C code for: every
 /// `eclipse_rm_*` the `nvidia-rm-sys` crate declares, generated from its
 /// `extern "C"` blocks. The hardware ladder (GSP, display, the compositor's
@@ -17101,24 +17449,122 @@ mod rm_host_shims {
     extern "C" fn eclipse_rm_hwcursor_move(_a0: i32, _a1: i32) -> u32 {
         NV_ERR_NOT_SUPPORTED
     }
+    /// The NVC57E surface-flip ladder as the host sees it. The display front
+    /// end's fetch of a flip is modelled in polls: each accepted flip leaves
+    /// `fetch_polls` answers of "still pending" behind it, and the drain in
+    /// `surfaceflip_drain` sees them one per `hwflip_pending` call.
+    pub(super) struct FakeHwflip {
+        /// `hwflip_init` succeeds.
+        pub init_ok: bool,
+        pub ready: bool,
+        pub init_calls: usize,
+        /// "Pending" answers still owed before `Get == Put`.
+        pub pending_polls: u64,
+        /// The front end never catches up: a display that stopped fetching.
+        pub pending_forever: bool,
+        /// `pending_forever` was polled ten million times: the drain has no
+        /// bound. The fake then answers "clear" so the test fails instead of
+        /// hanging (a panic cannot unwind out of an `extern "C"` shim).
+        pub overpolled: bool,
+        /// Polls each accepted flip leaves pending.
+        pub fetch_polls: u64,
+        /// Every `hwflip_pending` call.
+        pub polls: u64,
+        /// Accepted flips: `(h_memory, plane offset, width, height, pitch)`.
+        pub surfaces: Vec<(u32, u64, u32, u32, u32)>,
+        /// Flips the C side's safety net refused (`NV_ERR_BUSY_RETRY`)
+        /// because the caller wrote while the front end was still fetching.
+        pub refused_busy: usize,
+        /// Refuse the next flip BUSY although nothing is pending: what a
+        /// cursor image change kicking the core between the drain and the
+        /// flip looks like.
+        pub refuse_busy_once: bool,
+    }
+
+    const EMPTY_HWFLIP: FakeHwflip = FakeHwflip {
+        init_ok: true,
+        ready: false,
+        init_calls: 0,
+        pending_polls: 0,
+        pending_forever: false,
+        overpolled: false,
+        fetch_polls: 0,
+        polls: 0,
+        surfaces: Vec::new(),
+        refused_busy: 0,
+        refuse_busy_once: false,
+    };
+
+    pub(super) static FAKE_HWFLIP: lock::Mutex<FakeHwflip> = lock::Mutex::new(EMPTY_HWFLIP);
+
+    pub(super) fn reset_fake_hwflip() {
+        *FAKE_HWFLIP.lock() = EMPTY_HWFLIP;
+    }
+
     #[no_mangle]
-    extern "C" fn eclipse_rm_hwflip_init(_a0: u32, _a1: u32, _a2: *mut u8) -> u32 {
-        NV_ERR_NOT_SUPPORTED
+    extern "C" fn eclipse_rm_hwflip_init(_a0: u32, _a1: u32, out: *mut u8) -> u32 {
+        let mut f = FAKE_HWFLIP.lock();
+        f.init_calls += 1;
+        if !f.init_ok {
+            return NV_ERR_NOT_SUPPORTED;
+        }
+        // Seven `NV_STATUS` words, every stage NV_OK, window 0.
+        unsafe { core::ptr::write_bytes(out, 0, 7 * 4) };
+        f.ready = true;
+        0
     }
     #[no_mangle]
     extern "C" fn eclipse_rm_hwflip_ready() -> u8 {
-        0
+        FAKE_HWFLIP.lock().ready as u8
+    }
+    #[no_mangle]
+    extern "C" fn eclipse_rm_hwflip_pending() -> u8 {
+        let mut f = FAKE_HWFLIP.lock();
+        f.polls += 1;
+        if !f.ready {
+            return 0;
+        }
+        if f.pending_forever {
+            // A drain with no bound would sit here for good: give in, and
+            // let the test see that it had to.
+            if f.polls >= 10_000_000 {
+                f.overpolled = true;
+                f.pending_forever = false;
+                return 0;
+            }
+            return 1;
+        }
+        if f.pending_polls > 0 {
+            f.pending_polls -= 1;
+            1
+        } else {
+            0
+        }
     }
     #[no_mangle]
     extern "C" fn eclipse_rm_hwflip_surface(
         _a0: u32,
-        _a1: u32,
-        _a2: u64,
-        _a3: u32,
-        _a4: u32,
-        _a5: u32,
+        h_memory: u32,
+        plane_offset: u64,
+        width: u32,
+        height: u32,
+        pitch: u32,
     ) -> u32 {
-        NV_ERR_NOT_SUPPORTED
+        let mut f = FAKE_HWFLIP.lock();
+        if !f.ready {
+            return NV_ERR_INVALID_STATE;
+        }
+        // The C side's safety net: nothing is written while the front end
+        // still owes a fetch.
+        if f.pending_forever || f.pending_polls > 0 || f.refuse_busy_once {
+            f.refuse_busy_once = false;
+            f.refused_busy += 1;
+            return NV_ERR_BUSY_RETRY;
+        }
+        f.surfaces
+            .push((h_memory, plane_offset, width, height, pitch));
+        f.pending_polls = f.fetch_polls;
+        0
     }
     #[no_mangle]
     extern "C" fn eclipse_rm_init_core() -> u32 {

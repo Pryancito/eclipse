@@ -654,6 +654,7 @@ extern "C" {
         pitchBytes: NvU32,
     ) -> NV_STATUS;
     fn eclipse_rm_hwflip_ready() -> NvBool;
+    fn eclipse_rm_hwflip_pending() -> NvBool;
 }
 
 /// Bring up NVC57E window ISO flip (reuses/creates NVC570+NVC57D via hwcursor).
@@ -676,6 +677,11 @@ pub fn hwflip_init(device_instance: u32, head: u32) -> (NV_STATUS, HwFlipInit) {
 /// Flip the window ISO surface to GEM VRAM `h_memory`.
 /// `fbmem_offset` is the **plane offset within the BO/ctxdma** in bytes
 /// (typically 0), in 256-byte units at the HW — not an absolute AT_GPU address.
+///
+/// Returns once the methods are kicked; it does not wait for the front end
+/// to fetch them or for the panel to latch the flip (nouveau does not
+/// either). `NV_ERR_BUSY_RETRY` means the previous flip is still being
+/// fetched and nothing was written: drain with [`hwflip_pending`] first.
 pub fn hwflip_surface(
     device_instance: u32,
     h_memory: u32,
@@ -700,6 +706,19 @@ pub fn hwflip_surface(
 /// Whether the NVC57E surface-flip ladder is ready.
 pub fn hwflip_ready() -> bool {
     unsafe { eclipse_rm_hwflip_ready() != 0 }
+}
+
+/// Whether the display front end is still fetching the last flip's methods
+/// (window or core `Get` behind `Put`). `hwflip_surface` refuses with
+/// `NV_ERR_BUSY_RETRY` while this holds, so a caller polls it first.
+///
+/// Deliberately NOT serialized through `RmGate`: it reads two mapped control
+/// words and no RM state, and the whole point of polling it is to wait for
+/// the panel OUTSIDE the gate, where the wait used to live (inside
+/// `eclipse_rm_hwflip_surface`, 1 ms at a time, with the RM API and GPU
+/// locks held). Not ready = nothing pending.
+pub fn hwflip_pending() -> bool {
+    unsafe { eclipse_rm_hwflip_pending() != 0 }
 }
 
 /// Mirror of `EclipseGrLaunch` (vendor/eclipse_rm_init.c): per-stage
