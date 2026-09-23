@@ -747,6 +747,12 @@ pub struct NvidiaGpu {
     nouveau_pid_ctx: Mutex<Vec<(u64, u32, u32, u32, bool)>>,
     /// Per-context direct-submit state, indexed by ctx_idx (see `FastSlot`).
     nouveau_fast: Mutex<Vec<FastSlot>>,
+    /// `(consumer ctx, producer ctx)` -> the producer's fence semaphore as
+    /// the consumer's channel addresses it (`map_peer_fence`). Mirrors the
+    /// RM's own table, which is dropped when either context is freed: so is
+    /// this one (`forget_peer_fences`), or the next tenant of that index
+    /// would be waited on through a VA the RM has already unmapped.
+    nouveau_peer_fence: Mutex<alloc::collections::BTreeMap<(u32, u32), u64>>,
     /// Driver-private framebuffer objects keyed by driver fb id.
     kms_framebuffers: Mutex<Vec<NvidiaKmsFramebuffer>>,
     /// Driver-side ids for framebuffer objects.
@@ -1148,6 +1154,7 @@ impl NvidiaGpu {
                     .map(|_| FastSlot::Unprepared)
                     .collect(),
             ),
+            nouveau_peer_fence: Mutex::new(alloc::collections::BTreeMap::new()),
             kms_framebuffers: Mutex::new(Vec::new()),
             next_kms_fb_id: AtomicU32::new(1),
             kms_state: Mutex::new(NvidiaKmsState {
@@ -8122,6 +8129,7 @@ impl DrmScheme for NvidiaGpu {
         let ctx_freed = if let (Some(ctx_idx), Some(device_instance)) = (my_ctx, device_instance) {
             if ctx_idx >= 1 {
                 self.fast_release(device_instance, ctx_idx);
+                self.forget_peer_fences(ctx_idx);
                 lock::pump();
                 let status = nvidia_rm_sys::rm_init::ctx_free(device_instance, ctx_idx);
                 super::nouveau_uapi::ctx_clear_wedged(ctx_idx);
@@ -9710,24 +9718,21 @@ impl NvidiaGpu {
     }
 
     /// Map a producer's fence semaphore GPU VA into the consumer channel's
-    /// VAS. Cached in `PEER_FENCE_MAP`. Best-effort via RM; returns `None`
-    /// (CPU wait) when peer mapping is unsupported.
+    /// VAS. Cached in `nouveau_peer_fence` for the life of both contexts.
+    /// Best-effort via RM; returns `None` (CPU wait) when peer mapping is
+    /// unsupported.
     fn map_peer_fence_sem(
         &self,
         consumer_ctx: u32,
         producer_ctx: u32,
         fence_gpu_va_producer: u64,
     ) -> Option<u64> {
-        use alloc::collections::BTreeMap;
-        lazy_static::lazy_static! {
-            static ref PEER_FENCE_MAP: Mutex<BTreeMap<(u32, u32), u64>> =
-                Mutex::new(BTreeMap::new());
-        }
+        if let Some(&va) = self
+            .nouveau_peer_fence
+            .lock()
+            .get(&(consumer_ctx, producer_ctx))
         {
-            let map = PEER_FENCE_MAP.lock();
-            if let Some(&va) = map.get(&(consumer_ctx, producer_ctx)) {
-                return Some(va);
-            }
+            return Some(va);
         }
         let device = (*self.rm_device_instance.lock())?;
         let local = nvidia_rm_sys::rm_init::map_peer_fence_sem(
@@ -9736,10 +9741,22 @@ impl NvidiaGpu {
             producer_ctx,
             fence_gpu_va_producer,
         )?;
-        PEER_FENCE_MAP
+        self.nouveau_peer_fence
             .lock()
             .insert((consumer_ctx, producer_ctx), local);
         Some(local)
+    }
+
+    /// Context `ctx_idx` is being freed: every peer-fence mapping it takes
+    /// part in, as consumer (its VAS goes) or as producer (its buffer goes),
+    /// is freed by the RM with it. Forget them here too, BEFORE `ctx_free`,
+    /// so a wait on the index's next tenant asks the RM for a mapping of the
+    /// new buffer instead of emitting an ACQUIRE at a VA that is no longer
+    /// mapped (an MMU fault on the consumer's channel).
+    fn forget_peer_fences(&self, ctx_idx: u32) {
+        self.nouveau_peer_fence
+            .lock()
+            .retain(|&(consumer, producer), _| consumer != ctx_idx && producer != ctx_idx);
     }
 
     /// The EXEC ioctl body on the direct-submit path (waits already honoured
@@ -10290,6 +10307,7 @@ impl NvidiaGpu {
                     ctx_idx, owner_pid, dev, prime
                 ),
             );
+            self.forget_peer_fences(ctx_idx);
             let _ = nvidia_rm_sys::rm_init::ctx_free(dev, ctx_idx);
             unreserve();
             return (0, 0, 0);
@@ -13353,6 +13371,7 @@ impl NvidiaGpu {
                     .map(|_| FastSlot::Unprepared)
                     .collect(),
             ),
+            nouveau_peer_fence: Mutex::new(alloc::collections::BTreeMap::new()),
             kms_framebuffers: Mutex::new(Vec::new()),
             next_kms_fb_id: AtomicU32::new(1),
             kms_state: Mutex::new(NvidiaKmsState {
@@ -15769,9 +15788,23 @@ mod nouveau_bookkeeping_tests {
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum Fetched {
-        Push { va: u64, len: u32 },
-        Release { sem_va: u64, payload: u32 },
-        Acquire { sem_va: u64, payload: u32 },
+        Push {
+            va: u64,
+            len: u32,
+        },
+        Release {
+            sem_va: u64,
+            payload: u32,
+        },
+        Acquire {
+            sem_va: u64,
+            payload: u32,
+        },
+        /// A semaphore at a VA the channel has no mapping for: the MMU
+        /// fault that kills the channel on hardware.
+        Fault {
+            sem_va: u64,
+        },
     }
 
     fn gpu_rm_fast() -> NvidiaGpu {
@@ -15854,12 +15887,32 @@ mod nouveau_bookkeeping_tests {
                 );
                 let sem_va = (u64::from(w[2] & 0xff) << 32) | u64::from(w[1]);
                 assert_eq!(w[4], 0, "SEM_PAYLOAD_HI");
-                assert!(
-                    (c.gpu_va..c.gpu_va + 0x10000).contains(&sem_va),
-                    "a semaphore outside the channel's own buffer: {:#x}",
-                    sem_va
-                );
-                let sem = c.buf + (sem_va - c.gpu_va) as usize;
+                let sem = if (c.gpu_va..c.gpu_va + 0x10000).contains(&sem_va) {
+                    c.buf + (sem_va - c.gpu_va) as usize
+                } else {
+                    // Another channel's semaphore, through a peer mapping of
+                    // this channel's -- or a VA nothing maps any more.
+                    let producer = FAKE_RM
+                        .lock()
+                        .peer_maps
+                        .iter()
+                        .find(|m| m.0 == ctx && m.3 == sem_va)
+                        .map(|m| m.1);
+                    match producer.and_then(|p| {
+                        FAKE_RM
+                            .lock()
+                            .fast_ctxs
+                            .iter()
+                            .find(|c| c.ctx == p)
+                            .copied()
+                    }) {
+                        Some(pc) => pc.buf + FAST_SEM_OFF as usize,
+                        None => {
+                            out.push(Fetched::Fault { sem_va });
+                            break;
+                        }
+                    }
+                };
                 let payload = w[3];
                 match w[5] {
                     nv::NVC46F_SEM_EXECUTE_RELEASE => {
@@ -16856,6 +16909,284 @@ mod nouveau_bookkeeping_tests {
         gpu.nouveau_release_process(A);
         assert_eq!(FAKE_RM.lock().bad, 0);
     }
+
+    // ---- Waits across channels ---------------------------------------------
+    //
+    // A wait on another client's fence is a GPU ACQUIRE too, once the RM has
+    // mapped the producer's semaphore into the consumer's VAS
+    // (`map_peer_fence`: the compositor waiting on a client's frame, a client
+    // waiting on the compositor's release). With the fake's `peer` switch on,
+    // the shim hands out one consumer VA per (consumer, producer) pair and
+    // remembers it until either context is freed, as the C does; `run_gpu`
+    // resolves an ACQUIRE at such a VA to the producer's landing zone, and an
+    // ACQUIRE at a VA the channel has no mapping for is the MMU fault it
+    // would be on hardware.
+
+    fn peer_map(consumer: u32, producer: u32) -> Option<(u64, u64)> {
+        FAKE_RM
+            .lock()
+            .peer_maps
+            .iter()
+            .find(|m| m.0 == consumer && m.1 == producer)
+            .map(|m| (m.2, m.3))
+    }
+
+    fn peer_maps_made() -> usize {
+        FAKE_RM
+            .lock()
+            .calls
+            .iter()
+            .filter(|c| **c == "map_peer_fence")
+            .count()
+    }
+
+    #[test]
+    fn a_wait_on_another_channel_is_a_gpu_acquire_on_the_producers_fence_mapped_into_the_consumer()
+    {
+        let _g = LOCK.lock();
+        let _live = LiveBytes::hold();
+        let gpu = gpu_rm_fast();
+        FAKE_RM.lock().peer = true;
+        let ch_a = client_with_pushbuf(&gpu, A);
+        let ch_b = client_with_pushbuf(&gpu, B);
+        let out = syncobj::create(false);
+        let out2 = syncobj::create(false);
+        assert_eq!(
+            exec(&gpu, A, ch_a, &[push(PUSH_VA, 16)], &[], &[sync(out)]),
+            Ok(0)
+        );
+        let a = chan(1);
+        // 1 ms per clock read from here on: a CPU wait anywhere below (the
+        // wrong path, nothing runs the GPU) ends after 10 s virtual instead
+        // of hanging.
+        test_clock::set_auto_advance(1_000);
+        let t0 = test_clock::now();
+        assert_eq!(
+            exec(
+                &gpu,
+                B,
+                ch_b,
+                &[push(PUSH_VA, 16)],
+                &[sync(out)],
+                &[sync(out2)]
+            ),
+            Ok(0),
+            "the wait is the GPU's: no CPU wait"
+        );
+        assert!(
+            test_clock::now() - t0 < 1_000_000,
+            "submitted without waiting"
+        );
+        assert_eq!(
+            peer_maps_made(),
+            1,
+            "A's semaphore mapped into B's VAS once"
+        );
+        let (producer_va, local_va) = peer_map(2, 1).expect("the mapping the RM made");
+        assert_eq!(producer_va, sem_va(&a), "of A's fence semaphore");
+        let b = chan(2);
+        assert_ne!(local_va, sem_va(&b));
+        assert_eq!(userd(&b), (0, 3), "acquire, push, fence");
+        assert_eq!(
+            run_gpu(2),
+            [],
+            "B's channel stalls on the acquire: A has not run"
+        );
+        assert_eq!(userd(&b), (0, 3));
+        assert_eq!(syncobj::query(out2), Some(0));
+        assert_eq!(run_gpu(1).len(), 2);
+        assert_eq!(
+            run_gpu(2),
+            [
+                Fetched::Acquire {
+                    sem_va: local_va,
+                    payload: 1
+                },
+                Fetched::Push {
+                    va: PUSH_VA,
+                    len: 16
+                },
+                Fetched::Release {
+                    sem_va: sem_va(&b),
+                    payload: 1
+                }
+            ],
+            "the acquire in front of the push it guards, on B's own ring"
+        );
+        assert_eq!(syncobj::query(out2), Some(1));
+        // The next wait on A reuses the mapping: nothing more from the RM.
+        let out3 = syncobj::create(false);
+        let out4 = syncobj::create(false);
+        assert_eq!(
+            exec(&gpu, A, ch_a, &[push(PUSH_VA, 16)], &[], &[sync(out3)]),
+            Ok(0)
+        );
+        let before = FAKE_RM.lock().calls.len();
+        assert_eq!(
+            exec(
+                &gpu,
+                B,
+                ch_b,
+                &[push(PUSH_VA, 16)],
+                &[sync(out3)],
+                &[sync(out4)]
+            ),
+            Ok(0)
+        );
+        assert_eq!(rm_calls_since(before), [] as [&str; 0]);
+        assert_eq!(run_gpu(1).len(), 2);
+        assert_eq!(
+            run_gpu(2)[0],
+            Fetched::Acquire {
+                sem_va: local_va,
+                payload: 2
+            }
+        );
+        assert_eq!(syncobj::query(out4), Some(1));
+        // The other way round is a mapping of its own.
+        let out5 = syncobj::create(false);
+        assert_eq!(
+            exec(&gpu, B, ch_b, &[push(PUSH_VA, 16)], &[], &[sync(out5)]),
+            Ok(0)
+        );
+        let before = FAKE_RM.lock().calls.len();
+        assert_eq!(
+            exec(&gpu, A, ch_a, &[push(PUSH_VA, 16)], &[sync(out5)], &[]),
+            Ok(0)
+        );
+        assert_eq!(rm_calls_since(before), ["map_peer_fence"]);
+        let (producer_va_b, local_va_b) = peer_map(1, 2).unwrap();
+        assert_eq!(producer_va_b, sem_va(&b));
+        assert_ne!(local_va_b, local_va);
+        assert_eq!(run_gpu(2).len(), 2);
+        assert_eq!(
+            run_gpu(1),
+            [
+                Fetched::Acquire {
+                    sem_va: local_va_b,
+                    payload: 3
+                },
+                Fetched::Push {
+                    va: PUSH_VA,
+                    len: 16
+                }
+            ]
+        );
+        test_clock::set_auto_advance(0);
+        for h in [out, out2, out3, out4, out5] {
+            assert!(syncobj::destroy(h));
+        }
+        gpu.nouveau_release_process(A);
+        assert!(
+            FAKE_RM.lock().peer_maps.is_empty(),
+            "both mappings involve A: gone with its context"
+        );
+        gpu.nouveau_release_process(B);
+        assert_eq!(FAKE_RM.lock().bad, 0);
+    }
+
+    #[test]
+    fn a_context_that_goes_away_takes_its_peer_mappings_with_it_and_the_next_tenant_gets_fresh_ones(
+    ) {
+        let _g = LOCK.lock();
+        let _live = LiveBytes::hold();
+        let gpu = gpu_rm_fast();
+        FAKE_RM.lock().peer = true;
+        // 1 ms per clock read: every wait below is meant to be the GPU's;
+        // one that falls to the CPU ends after 10 s virtual, not never.
+        test_clock::set_auto_advance(1_000);
+        let ch_a = client_with_pushbuf(&gpu, A);
+        let ch_b = client_with_pushbuf(&gpu, B);
+        let out = syncobj::create(false);
+        assert_eq!(
+            exec(&gpu, A, ch_a, &[push(PUSH_VA, 16)], &[], &[sync(out)]),
+            Ok(0)
+        );
+        assert_eq!(
+            exec(&gpu, B, ch_b, &[push(PUSH_VA, 16)], &[sync(out)], &[]),
+            Ok(0)
+        );
+        let (_, stale) = peer_map(2, 1).unwrap();
+        assert_eq!(run_gpu(1).len(), 2);
+        assert_eq!(run_gpu(2).len(), 2);
+        // A exits: the RM frees the mapping of A's buffer in B's VAS along
+        // with A's context. A comes back on the same index with a new
+        // channel; B waiting on it needs a mapping of THAT buffer -- an
+        // acquire at the old VA is an MMU fault on B's channel (the
+        // compositor's, on the desktop: one client come and gone and the
+        // next one's frame kills the compositor).
+        gpu.nouveau_release_process(A);
+        assert_eq!(peer_map(2, 1), None);
+        let ch_a = client_with_pushbuf(&gpu, A);
+        let out2 = syncobj::create(false);
+        assert_eq!(
+            exec(&gpu, A, ch_a, &[push(PUSH_VA, 16)], &[], &[sync(out2)]),
+            Ok(0)
+        );
+        let a2 = chan(1);
+        let before = FAKE_RM.lock().calls.len();
+        assert_eq!(
+            exec(&gpu, B, ch_b, &[push(PUSH_VA, 16)], &[sync(out2)], &[]),
+            Ok(0)
+        );
+        assert_eq!(
+            rm_calls_since(before),
+            ["map_peer_fence"],
+            "a mapping of the new tenant's buffer"
+        );
+        let (producer_va, fresh) = peer_map(2, 1).unwrap();
+        assert_eq!(producer_va, sem_va(&a2));
+        assert_ne!(fresh, stale);
+        assert_eq!(run_gpu(1).len(), 2);
+        assert_eq!(
+            run_gpu(2),
+            [
+                Fetched::Acquire {
+                    sem_va: fresh,
+                    payload: 1
+                },
+                Fetched::Push {
+                    va: PUSH_VA,
+                    len: 16
+                }
+            ],
+            "the acquire resolves on the new channel's landing zone"
+        );
+        // The consumer going away is the same: B's VAS is gone, and the
+        // next B on that index needs a mapping in ITS VAS.
+        gpu.nouveau_release_process(B);
+        assert_eq!(peer_map(2, 1), None);
+        let ch_b = client_with_pushbuf(&gpu, B);
+        let out3 = syncobj::create(false);
+        assert_eq!(
+            exec(&gpu, A, ch_a, &[push(PUSH_VA, 16)], &[], &[sync(out3)]),
+            Ok(0)
+        );
+        let made = peer_maps_made();
+        assert_eq!(
+            exec(&gpu, B, ch_b, &[push(PUSH_VA, 16)], &[sync(out3)], &[]),
+            Ok(0)
+        );
+        assert_eq!(peer_maps_made(), made + 1);
+        let (_, newer) = peer_map(2, 1).unwrap();
+        assert_ne!(newer, fresh);
+        assert_eq!(run_gpu(1).len(), 2);
+        assert_eq!(
+            run_gpu(2)[0],
+            Fetched::Acquire {
+                sem_va: newer,
+                payload: 2
+            }
+        );
+        test_clock::set_auto_advance(0);
+        for h in [out, out2, out3] {
+            assert!(syncobj::destroy(h));
+        }
+        gpu.nouveau_release_process(A);
+        gpu.nouveau_release_process(B);
+        assert!(FAKE_RM.lock().peer_maps.is_empty());
+        assert_eq!(FAKE_RM.lock().bad, 0);
+    }
 }
 
 /// The RM entry points the host test binary has no C code for: every
@@ -17132,15 +17463,46 @@ mod rm_host_shims {
     extern "C" fn eclipse_rm_intr_table(_a0: u32, _a1: *mut u8) -> u32 {
         NV_ERR_NOT_SUPPORTED
     }
+    /// The consumer VAs `map_peer_fence` hands out start here: above every
+    /// channel's own buffer, and each mapping ever made gets its own, so a
+    /// stale one can never alias a fresh one by accident.
+    const PEER_VA_BASE: u64 = 0x7800_0000;
     #[no_mangle]
     extern "C" fn eclipse_rm_map_peer_fence(
-        _a0: u32,
-        _a1: u32,
-        _a2: u32,
-        _a3: u64,
-        _a4: *mut u8,
+        _inst: u32,
+        consumer: u32,
+        producer: u32,
+        producer_va: u64,
+        out: *mut u64,
     ) -> u32 {
-        NV_ERR_NOT_SUPPORTED
+        let mut f = FAKE_RM.lock();
+        f.calls.push("map_peer_fence");
+        if !f.peer {
+            return NV_ERR_NOT_SUPPORTED;
+        }
+        if consumer == producer {
+            unsafe { *out = producer_va };
+            return NV_OK;
+        }
+        // Cached for the life of both contexts, whatever VA is asked for
+        // now: the C compares nothing but the pair.
+        if let Some(m) = f
+            .peer_maps
+            .iter()
+            .find(|m| m.0 == consumer && m.1 == producer)
+        {
+            unsafe { *out = m.3 };
+            return NV_OK;
+        }
+        // The producer's buffer and the consumer's VAS must both exist.
+        if !f.fast_ctxs.iter().any(|c| c.ctx == producer) || !f.ctxs.contains(&consumer) {
+            return NV_ERR_INVALID_STATE;
+        }
+        f.peer_maps_made += 1;
+        let local = PEER_VA_BASE + (u64::from(f.peer_maps_made) << 16) + u64::from(FAST_SEM_OFF);
+        f.peer_maps.push((consumer, producer, producer_va, local));
+        unsafe { *out = local };
+        NV_OK
     }
     #[no_mangle]
     extern "C" fn eclipse_rm_mark_console_gpu(_a0: u32, _a1: u64, _a2: u8) -> u32 {
@@ -17283,6 +17645,13 @@ mod rm_host_shims {
         pub fast_releases: Vec<u32>,
         /// `(ctx, build)`: how many times each index was built.
         ctx_build: Vec<(u32, u32)>,
+        /// `map_peer_fence` maps instead of answering `NV_ERR_NOT_SUPPORTED`.
+        pub peer: bool,
+        /// The live peer-fence mappings: `(consumer, producer, producer VA,
+        /// consumer VA)`. Dropped with either context, as the C does.
+        pub peer_maps: Vec<(u32, u32, u64, u64)>,
+        /// Mappings ever made: each gets a consumer VA of its own.
+        peer_maps_made: u32,
     }
 
     const EMPTY_RM: FakeRm = FakeRm {
@@ -17315,6 +17684,9 @@ mod rm_host_shims {
         fast_ctxs: Vec::new(),
         fast_releases: Vec::new(),
         ctx_build: Vec::new(),
+        peer: false,
+        peer_maps: Vec::new(),
+        peer_maps_made: 0,
     };
 
     pub(super) static FAKE_RM: lock::Mutex<FakeRm> = lock::Mutex::new(EMPTY_RM);
@@ -17454,6 +17826,8 @@ mod rm_host_shims {
         if let Some(pos) = f.ctxs.iter().position(|c| *c == ctx_idx) {
             f.ctxs.remove(pos);
             f.maps.retain(|m| m.1 != ctx_idx);
+            // And every peer-fence mapping it takes part in, as the C does.
+            f.peer_maps.retain(|m| m.0 != ctx_idx && m.1 != ctx_idx);
             f.ctx_frees += 1;
         }
         NV_OK
