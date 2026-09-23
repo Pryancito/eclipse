@@ -72,6 +72,26 @@ jobs:
           # prebuilt userboot blobs is not in a plain checkout, so the test
           # target is built for the Linux personality alone.
           cargo test -p zcore-loader --lib --no-default-features --features linux,libos
+          # rboot, the UEFI bootloader. It is `exclude`d from the workspace
+          # (its own toolchain file and its own target), so nothing in CI ever
+          # built it, let alone tested it -- and it is the first code that
+          # runs on the machine. Its default features pull in `uefi-services`,
+          # whose panic handler collides with `std`'s `panic_impl` lang item
+          # in a test binary, so the library target is built without them;
+          # that still covers everything that does not talk to the firmware:
+          # `rboot.conf` parsing, the kernel cmdline, EDID and graphic-mode
+          # choice, and the splash and progress bar drawn into plain memory.
+          cargo test --manifest-path rboot/Cargo.toml --lib --no-default-features
+
+      - name: Build the bootloader for its real target
+        run: |
+          # Nothing else here compiles rboot, so a change that only breaks the
+          # UEFI build (an `x86_64-unknown-uefi`-only path, a dependency bump)
+          # reaches the ESP unnoticed. Same flags as `rboot/Makefile`.
+          cargo build --manifest-path rboot/Cargo.toml \
+            --target x86_64-unknown-uefi \
+            -Z build-std=core,alloc \
+            -Z build-std-features=compiler-builtins-mem
 
   zircon-core-test-libos:
     name: Zircon Core Test Libos (${{ matrix.name }})

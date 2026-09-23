@@ -18,10 +18,10 @@ extern crate log;
 
 use alloc::boxed::Box;
 use alloc::vec::Vec;
-use config::Resolution;
 use core::arch::asm;
-use log::{warn, LevelFilter};
-use rboot::{BootInfo, GraphicInfo};
+use log::warn;
+use rboot::config::{self, Resolution};
+use rboot::{cmdline, fb, logo, progress, video, BootInfo, GraphicInfo};
 use uefi::proto::console::gop::{GraphicsOutput, ModeInfo, PixelFormat};
 use uefi::proto::media::file::*;
 use uefi::proto::media::fs::SimpleFileSystem;
@@ -34,45 +34,11 @@ use x86_64::structures::paging::*;
 use x86_64::{PhysAddr, VirtAddr};
 use xmas_elf::ElfFile;
 
-mod config;
-mod fb;
 mod idt;
 mod libc_shim;
-mod logo;
 mod page_table;
-mod progress;
 
 const CONFIG_PATH: &str = "\\EFI\\Boot\\rboot.conf";
-
-fn parse_log_level_from_cmdline(cmdline: &str) -> Option<LevelFilter> {
-    // cmdline format example:
-    //   "LOG=debug:ROOTPROC=/bin/busybox?sh:TERM=xterm-256color"
-    // We keep this parser intentionally tiny (no alloc) and tolerant.
-    for part in cmdline.split(':') {
-        let mut it = part.splitn(2, '=');
-        let k = it.next()?.trim();
-        let v = it.next().unwrap_or("").trim();
-        if k.eq_ignore_ascii_case("LOG") {
-            return Some(v.parse().unwrap_or(LevelFilter::Info));
-        }
-    }
-    None
-}
-
-fn has_cmdline_flag(cmdline: &str, key: &str) -> bool {
-    for part in cmdline.split(':') {
-        let mut it = part.splitn(2, '=');
-        let k = it.next().unwrap_or("").trim();
-        let v = it.next().unwrap_or("").trim();
-        if k.eq_ignore_ascii_case(key) {
-            return v.is_empty()
-                || v == "1"
-                || v.eq_ignore_ascii_case("true")
-                || v.eq_ignore_ascii_case("on");
-        }
-    }
-    false
-}
 
 #[entry]
 fn efi_main(image: Handle, mut st: SystemTable<Boot>) -> Status {
@@ -88,7 +54,7 @@ fn efi_main(image: Handle, mut st: SystemTable<Boot>) -> Status {
         config::Config::parse(buf)
     };
 
-    if let Some(level) = parse_log_level_from_cmdline(config.cmdline) {
+    if let Some(level) = cmdline::parse_log_level(config.cmdline) {
         log::set_max_level(level);
     }
     info!("rboot: start (log={:?})", log::max_level());
@@ -106,10 +72,10 @@ fn efi_main(image: Handle, mut st: SystemTable<Boot>) -> Status {
 
     let (graphic_info, edid, edid_size) = init_graphic(bs, config.resolution);
     // Boot progress is continuous across rboot (0..50) and kernel (50..100).
-    if has_cmdline_flag(config.cmdline, "FB_ROT180") {
+    if cmdline::has_flag(config.cmdline, "FB_ROT180") {
         fb::set_rot180(true);
     }
-    if has_cmdline_flag(config.cmdline, "FB_MIRROR_X") {
+    if cmdline::has_flag(config.cmdline, "FB_MIRROR_X") {
         fb::set_mirror_x(true);
     }
     // Draw splash logo immediately after GOP init (this also clears screen to white).
@@ -225,7 +191,7 @@ fn efi_main(image: Handle, mut st: SystemTable<Boot>) -> Status {
 
     // Sanity checks while Boot Services are still alive.
     // If these fault on real hardware, the firmware is much more likely to show a dump.
-    let stacktop = config.kernel_stack_address + config.kernel_stack_size * 0x1000;
+    let stacktop = config.stack_top();
     progress::bar(graphic_info.mode, graphic_info.fb_addr, 47);
     unsafe {
         // 1) Confirm the entry virtual address is mapped & readable.
@@ -450,40 +416,6 @@ fn find_active_gop_handle(bs: &BootServices) -> Option<Handle> {
     best
 }
 
-/// Parse the display's EDID-preferred resolution from the first detailed
-/// timing descriptor (EDID 1.x, bytes 54..71): a non-zero pixel clock marks a
-/// timing descriptor, whose active pixels are 12-bit fields split across
-/// low-byte + high-nibble. Returns `None` for a missing/invalid EDID or an
-/// implausible timing.
-fn edid_preferred_resolution(edid: &[u8; 128], edid_size: u32) -> Option<(usize, usize)> {
-    if edid_size < 72 {
-        return None;
-    }
-    let d = &edid[54..72];
-    let pixel_clock = u16::from_le_bytes([d[0], d[1]]);
-    if pixel_clock == 0 {
-        return None; // not a timing descriptor
-    }
-    let h = d[2] as usize | ((d[4] as usize & 0xF0) << 4);
-    let v = d[5] as usize | ((d[7] as usize & 0xF0) << 4);
-    if !(256..=7680).contains(&h) || !(144..=4320).contains(&v) {
-        return None;
-    }
-    Some((h, v))
-}
-
-/// Auto (and oversized EDID) refuse GOP modes larger than this many pixels.
-///
-/// VirtualBox EFI GOP lists VRAM-filling "modes" (8K = 7680×4320) that are
-/// not a real panel. The kernel shadows each VT at `width×height×4` bytes;
-/// seven 8K consoles (~882 MiB) OOM a 512 MiB heap. 4K (3840×2160) is the
-/// largest desktop panel we still fit. `resolution=WxH` is uncapped.
-const AUTO_MAX_PIXELS: usize = 3840 * 2160;
-
-fn mode_fits_auto_cap(w: usize, h: usize) -> bool {
-    w > 0 && h > 0 && w.saturating_mul(h) <= AUTO_MAX_PIXELS
-}
-
 fn init_graphic(bs: &BootServices, resolution: Resolution) -> (GraphicInfo, [u8; 128], u32) {
     let gop_handle = find_active_gop_handle(bs)
         .or_else(|| bs.get_handle_for_protocol::<GraphicsOutput>().ok())
@@ -495,55 +427,26 @@ fn init_graphic(bs: &BootServices, resolution: Resolution) -> (GraphicInfo, [u8;
     // EDID first: `Resolution::Auto` picks its target from it.
     let (edid, edid_size) = read_active_edid(bs, gop_handle);
 
-    // What resolution do we want, and how hard should we try?
-    // - Exact(w,h): that mode or keep the current one (the old behaviour
-    //   panicked with "graphic mode not found", bricking boot over a config
-    //   value the firmware happens not to offer).
-    // - Auto: the EDID-preferred timing if the firmware offers it *and* it
-    //   fits [`AUTO_MAX_PIXELS`]; otherwise the largest offered mode within
-    //   that cap (GOP modes are firmware-validated against the display, and
-    //   a TV upscales its own standard timings far better than it stretches
-    //   a small 4:3 mode across a 16:9 panel). Uncapped max-by-area is how
-    //   VirtualBox landed on 8K and the kernel OOM'd.
-    let target = match resolution {
-        Resolution::Keep => None,
-        Resolution::Exact(x, y) => Some((x, y)),
-        Resolution::Auto => {
-            edid_preferred_resolution(&edid, edid_size).filter(|&(w, h)| mode_fits_auto_cap(w, h))
+    // What the firmware offers, and which of those `resolution=` asks for.
+    // The policy itself lives in `rboot::video` so it can be tested without a
+    // GOP; `gop.modes()` is a stable enumeration of `query_mode(0..max_mode)`,
+    // so the index it returns is the index we set.
+    let modes: Vec<(usize, usize)> = gop.modes(bs).map(|m| m.info().resolution()).collect();
+    let preferred = video::edid_preferred_resolution(&edid, edid_size);
+    match video::choose_mode(resolution, preferred, &modes).and_then(|i| gop.modes(bs).nth(i)) {
+        Some(mode) => {
+            gop.set_mode(&mode).expect("Failed to set graphics mode");
         }
-    };
-    let exact = target.and_then(|want| gop.modes(bs).find(|mode| mode.info().resolution() == want));
-    let chosen = exact.or_else(|| {
-        if resolution != Resolution::Auto {
-            return None;
+        None => {
+            if resolution != Resolution::Keep {
+                warn!(
+                    "no graphic mode matches {:?} (edid says {:?}); keeping current {:?}",
+                    resolution,
+                    preferred,
+                    gop.current_mode_info().resolution()
+                );
+            }
         }
-        // Largest firmware-offered mode that still fits the cap.
-        gop.modes(bs)
-            .filter(|mode| {
-                let (w, h) = mode.info().resolution();
-                mode_fits_auto_cap(w, h)
-            })
-            .max_by_key(|mode| {
-                let (w, h) = mode.info().resolution();
-                w.saturating_mul(h)
-            })
-            .or_else(|| {
-                // Some VMs only list huge modes: pick the smallest so we
-                // still boot rather than remaining at 8K.
-                gop.modes(bs).min_by_key(|mode| {
-                    let (w, h) = mode.info().resolution();
-                    w.saturating_mul(h)
-                })
-            })
-    });
-    if let Some(mode) = chosen {
-        gop.set_mode(&mode).expect("Failed to set graphics mode");
-    } else if target.is_some() {
-        warn!(
-            "requested graphic mode {:?} not offered by firmware; keeping current {:?}",
-            target,
-            gop.current_mode_info().resolution()
-        );
     }
     let info = GraphicInfo {
         mode: gop.current_mode_info(),
@@ -577,10 +480,6 @@ struct EdidDiscoveredProtocol {
 /// handle first (where the active-display EDID normally lives), then a global
 /// lookup, then the discovered-EDID protocol. Returns `([0; 128], 0)` when no
 /// EDID is available.
-fn edid_header_ok(b: &[u8]) -> bool {
-    b.len() >= 8 && b[0] == 0x00 && b[7] == 0x00 && b[1..7].iter().all(|&x| x == 0xFF)
-}
-
 fn read_active_edid(bs: &BootServices, gop_handle: uefi::Handle) -> ([u8; 128], u32) {
     // Copy one source's bytes into a fresh buffer; returns (buf, len).
     let read_one = |size: u32, ptr: *const u8| -> ([u8; 128], u32) {
@@ -602,7 +501,7 @@ fn read_active_edid(bs: &BootServices, gop_handle: uefi::Handle) -> ([u8; 128], 
         if n == 0 {
             return None;
         }
-        if edid_header_ok(&buf[..n.min(128) as usize]) {
+        if video::edid_header_ok(&buf[..n.min(128) as usize]) {
             return Some((buf, n));
         }
         if first_nonempty.is_none() {
