@@ -186,7 +186,7 @@ static PENDING_COUNT: AtomicUsize = AtomicUsize::new(0);
 /// old synchronous poll used, so the behaviour on a GPU hang is unchanged:
 /// the context is latched wedged (via the timeout hook) and the waiter is
 /// released instead of parking forever.
-const FENCE_TIMEOUT_US: u64 = 10_000_000;
+pub const FENCE_TIMEOUT_US: u64 = 10_000_000;
 
 /// Optional upcall fired whenever a syncobj point advances, so an upper layer
 /// (linux-object) can service `SYNCOBJ_EVENTFD` registrations — deliver an
