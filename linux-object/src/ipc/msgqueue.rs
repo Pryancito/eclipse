@@ -10,6 +10,7 @@ use crate::time::TimeSpec;
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicUsize, Ordering};
 use lazy_static::lazy_static;
 use lock::{Mutex, RwLock};
 
@@ -17,6 +18,14 @@ use lock::{Mutex, RwLock};
 pub const MSGMAX: usize = 8192;
 /// Default queue capacity, bytes (`MSGMNB`).
 pub const MSGMNB: usize = 16384;
+/// How many queues may exist at once (`MSGMNI`, same file).
+///
+/// Linux answers `ENOSPC` past it, and the bound has to be there: a queue is
+/// held by a **strong** `Arc` until `IPC_RMID`, so a loop of
+/// `msgget(IPC_PRIVATE, IPC_CREAT)` from an unprivileged process pins kernel
+/// memory that nothing will ever free. `shared_mem.rs` bounds its own table
+/// at `SHMMNI` and its test says exactly why; this table had no bound at all.
+pub const MSGMNI: usize = 32000;
 
 /// `struct msqid_ds` as 64-bit userland (musl/glibc `msqid64_ds`) lays it out.
 #[repr(C)]
@@ -87,6 +96,21 @@ lazy_static! {
         RwLock::new(BTreeMap::new());
 }
 
+/// The next id `msgget` hands out. Ids are **never** reused.
+///
+/// `(0..).find(|i| !queues.contains_key(i))` handed back the lowest free
+/// number, so the id of a queue `IPC_RMID` had just retired came straight back
+/// out of the next `msgget` -- and a process still holding the old number then
+/// sent into a stranger's queue instead of getting `EIDRM`. Linux carries a
+/// sequence number inside the id for exactly this (`ipc_buildid`), and
+/// [`IpcPerm::__seq`] is the field it lives in; nothing here ever incremented
+/// it. Counting up hands the same number out twice only after 2^64 queues.
+///
+/// It also ends the search. That `find` walked the table on every call, under
+/// the table's own write lock, so filling the table was quadratic in the
+/// number of queues -- which an unprivileged process chooses.
+static NEXT_MSG_ID: AtomicUsize = AtomicUsize::new(0);
+
 impl MsgQueue {
     fn new(key: u32, mode: u32, uid: u32, gid: u32) -> Self {
         MsgQueue {
@@ -128,10 +152,14 @@ impl MsgQueue {
             return Err(MsgSendError::Removed);
         }
         // msgsnd(2) blocks when adding the message would exceed msg_qbytes.
-        if inner.ds.cbytes + data.len() > inner.ds.qbytes {
-            return Err(MsgSendError::Full);
-        }
-        inner.ds.cbytes += data.len();
+        // Checked: `qbytes` is a number a privileged `IPC_SET` chooses and
+        // `cbytes` climbs to meet it, so this sum is not the kernel's to
+        // assume fits -- a queue at the top of the range answers "full".
+        let cbytes = match inner.ds.cbytes.checked_add(data.len()) {
+            Some(total) if total <= inner.ds.qbytes => total,
+            _ => return Err(MsgSendError::Full),
+        };
+        inner.ds.cbytes = cbytes;
         inner.ds.qnum += 1;
         inner.ds.stime = TimeSpec::now().sec;
         inner.ds.lspid = sender;
@@ -176,14 +204,38 @@ impl MsgQueue {
         self.inner.lock().ds
     }
 
-    /// `IPC_SET`: owner/permission bits and `msg_qbytes`, per msgctl(2).
-    pub fn set(&self, new: &MsqidDs) {
+    /// `IPC_SET`: owner, permission bits and `msg_qbytes`, per msgctl(2).
+    ///
+    /// Only the owner, the creator or a privileged caller may do this; anyone
+    /// else gets `EPERM`. Without that check the `msqid_ds` userspace handed
+    /// in rewrote `uid` and `gid`, so naming the id was enough to own the
+    /// queue -- see [`IpcPerm::may_control`].
+    ///
+    /// `qbytes` is what `try_send` measures the queue against, so an
+    /// unprivileged caller may only lower it. Raising `msg_qbytes` above
+    /// `MSGMNB` is `CAP_SYS_RESOURCE` on Linux, and without that a `qbytes` of
+    /// `usize::MAX` turns the queue into unbounded pinned kernel memory, eight
+    /// kilobytes per `msgsnd`.
+    pub fn set(&self, new: &MsqidDs, euid: u32) -> Result<(), LxError> {
         let mut inner = self.inner.lock();
+        if !inner.ds.perm.may_control(euid) {
+            return Err(LxError::EPERM);
+        }
         inner.ds.perm.uid = new.perm.uid;
         inner.ds.perm.gid = new.perm.gid;
         inner.ds.perm.mode = new.perm.mode & 0o777;
-        inner.ds.qbytes = new.qbytes;
+        inner.ds.qbytes = if euid == 0 {
+            new.qbytes
+        } else {
+            new.qbytes.min(MSGMNB)
+        };
         inner.ds.ctime = TimeSpec::now().sec;
+        Ok(())
+    }
+
+    /// Whether `euid` may `IPC_SET` or `IPC_RMID` this queue.
+    fn may_control(&self, euid: u32) -> bool {
+        self.inner.lock().ds.perm.may_control(euid)
     }
 
     fn mark_removed(&self) {
@@ -221,7 +273,18 @@ fn select_message(
                 .map(|(i, _)| i)
         }
     } else {
-        let bound = -msgtyp;
+        // `-isize::MIN` does not fit in an `isize`, and the sign here is
+        // userspace's to choose: `msgrcv(id, buf, sz, LONG_MIN, 0)` arrives as
+        // this argument, unexamined. With `overflow-checks` that negation is a
+        // kernel panic from an unprivileged syscall; without them it wraps
+        // back to `isize::MIN`, and then nothing can match -- `msgsnd` refuses
+        // a type below 1 -- so the caller blocks for ever on a queue that is
+        // full of messages for it. Linux writes the case out on its own line,
+        // and lands on the opposite answer, *every* message (`convert_mode`,
+        // ipc/msg.c):
+        //
+        //     if (*msgtyp == LONG_MIN) *msgtyp = LONG_MAX;
+        let bound = msgtyp.checked_neg().unwrap_or(isize::MAX);
         types
             .enumerate()
             .filter(|&(_, t)| t <= bound)
@@ -246,7 +309,10 @@ pub fn msg_get(key: u32, flags: usize, uid: u32, gid: u32) -> Result<usize, LxEr
             return Err(LxError::ENOENT);
         }
     }
-    let id = (0..).find(|i| !queues.contains_key(i)).unwrap();
+    if queues.len() >= MSGMNI {
+        return Err(LxError::ENOSPC);
+    }
+    let id = NEXT_MSG_ID.fetch_add(1, Ordering::Relaxed);
     queues.insert(id, Arc::new(MsgQueue::new(key, flags as u32, uid, gid)));
     Ok(id)
 }
@@ -259,8 +325,16 @@ pub fn msg_queue(id: usize) -> Option<Arc<MsgQueue>> {
 /// `IPC_RMID`: drop the queue from the table and wake blocked callers into
 /// `EIDRM` via the `removed` latch (their `Arc` keeps the object alive until
 /// they notice).
-pub fn msg_remove(id: usize) -> Result<(), LxError> {
-    let queue = MSG_QUEUES.write().remove(&id).ok_or(LxError::EINVAL)?;
+pub fn msg_remove(id: usize, euid: u32) -> Result<(), LxError> {
+    let mut queues = MSG_QUEUES.write();
+    let queue = queues.get(&id).cloned().ok_or(LxError::EINVAL)?;
+    // Same rule as `IPC_SET`: destroying someone else's queue is `EPERM`, not
+    // a thing any process that can guess an id gets to do (msgctl(2)).
+    if !queue.may_control(euid) {
+        return Err(LxError::EPERM);
+    }
+    queues.remove(&id);
+    drop(queues);
     queue.mark_removed();
     Ok(())
 }
@@ -322,5 +396,316 @@ mod tests {
         assert_eq!(select_message(types(), -4, false), Some(3));
         assert_eq!(select_message(types(), -1, false), Some(3));
         assert_eq!(select_message([5isize].iter().copied(), -4, false), None);
+    }
+}
+
+/// Who may change a System V object, and what bounds the values `IPC_SET`
+/// takes from userspace.
+///
+/// `msgctl(IPC_SET)` and `msgctl(IPC_RMID)` are the two operations Linux gates
+/// on ownership (`ipcctl_obtain_check`, ipc/util.c). Neither was gated here,
+/// in any of the three IPC classes, and the `msqid_ds` came in unexamined, so
+/// a process that could name an id took the queue over, destroyed it, or gave
+/// itself unbounded pinned kernel memory by raising `msg_qbytes`.
+#[cfg(test)]
+mod msg_control_tests {
+    use super::*;
+
+    extern crate std;
+
+    /// `IPC_CREAT`, as userspace spells it.
+    const CREAT: usize = 0o1000;
+    /// A pid; the field is only bookkeeping here.
+    const PID: u32 = 7;
+    /// The owner in these tests.
+    const OWNER: u32 = 1000;
+    /// Somebody else.
+    const STRANGER: u32 = 1001;
+    /// `euid == 0`.
+    const ROOT: u32 = 0;
+
+    /// `MSG_QUEUES` is process-wide and cargo runs a crate's tests in threads.
+    fn test_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn clear_queues() {
+        MSG_QUEUES.write().clear();
+    }
+
+    /// A queue owned by `uid`, off the global table.
+    fn owned_by(uid: u32) -> MsgQueue {
+        MsgQueue::new(0, 0o600, uid, uid)
+    }
+
+    // ---------------------------------------------------------------- msgrcv
+
+    /// `msgrcv(id, buf, sz, LONG_MIN, 0)`. The negative branch used to negate
+    /// `msgtyp` outright: `isize::MIN` has no positive counterpart, so that is
+    /// a kernel panic under `overflow-checks` and, without them, a bound of
+    /// `isize::MIN` that no message can meet -- `msgsnd` refuses a type below
+    /// 1 -- leaving the caller blocked for ever on a queue full of messages
+    /// for it. Linux lands on the opposite answer: every message matches.
+    #[test]
+    fn select_negative_min_matches_every_message() {
+        let types = || [5isize, 3, 4, 1].iter().copied();
+        assert_eq!(select_message(types(), isize::MIN, false), Some(3));
+        // Even a type as large as the bound would have been.
+        assert_eq!(
+            select_message([isize::MAX].iter().copied(), isize::MIN, false),
+            Some(0)
+        );
+        assert_eq!(select_message(core::iter::empty(), isize::MIN, false), None);
+    }
+
+    /// `isize::MIN + 1` negates fine and is the first value that does, so the
+    /// two branches meet here rather than at some arbitrary place.
+    #[test]
+    fn select_negative_just_above_min_still_bounds() {
+        let types = || [isize::MAX, 3].iter().copied();
+        assert_eq!(select_message(types(), isize::MIN + 1, false), Some(1));
+        assert_eq!(
+            select_message([isize::MAX].iter().copied(), isize::MIN + 1, false),
+            Some(0)
+        );
+    }
+
+    // -------------------------------------------------------------- may_control
+
+    #[test]
+    fn only_the_owner_the_creator_and_root_may_control() {
+        let mut perm = IpcPerm {
+            uid: OWNER,
+            cuid: OWNER,
+            ..IpcPerm::default()
+        };
+        assert!(perm.may_control(OWNER));
+        assert!(perm.may_control(ROOT));
+        assert!(!perm.may_control(STRANGER));
+        // Handing ownership over keeps the creator's rights, per ipc/util.c.
+        perm.uid = STRANGER;
+        assert!(perm.may_control(OWNER));
+        assert!(perm.may_control(STRANGER));
+    }
+
+    // ------------------------------------------------------------- IPC_SET
+
+    /// The whole of the old `set`: uid, gid and mode straight out of the
+    /// buffer userspace handed in, with nobody asked.
+    #[test]
+    fn ipc_set_from_a_stranger_is_eperm_and_changes_nothing() {
+        let queue = owned_by(OWNER);
+        let mut ds = queue.stat();
+        ds.perm.uid = STRANGER;
+        ds.perm.gid = STRANGER;
+        ds.perm.mode = 0o666;
+        assert_eq!(queue.set(&ds, STRANGER), Err(LxError::EPERM));
+        let after = queue.stat();
+        assert_eq!(after.perm.uid, OWNER);
+        assert_eq!(after.perm.gid, OWNER);
+        assert_eq!(after.perm.mode, 0o600);
+    }
+
+    #[test]
+    fn ipc_set_from_the_owner_rewrites_owner_and_mode() {
+        let queue = owned_by(OWNER);
+        let mut ds = queue.stat();
+        ds.perm.uid = STRANGER;
+        ds.perm.gid = STRANGER;
+        // Only the low nine bits are permission bits; the rest is userspace's
+        // to send and the kernel's to drop.
+        ds.perm.mode = 0o7654;
+        assert_eq!(queue.set(&ds, OWNER), Ok(()));
+        let after = queue.stat();
+        assert_eq!(after.perm.uid, STRANGER);
+        assert_eq!(after.perm.gid, STRANGER);
+        assert_eq!(after.perm.mode, 0o654);
+    }
+
+    /// Having given the queue away, the creator may still take it back: that
+    /// is what `cuid` is for, and it is a different arm of the check.
+    #[test]
+    fn the_creator_may_still_control_a_queue_it_gave_away() {
+        let queue = owned_by(OWNER);
+        let mut ds = queue.stat();
+        ds.perm.uid = STRANGER;
+        assert_eq!(queue.set(&ds, OWNER), Ok(()));
+        assert_eq!(queue.stat().perm.uid, STRANGER);
+
+        let mut back = queue.stat();
+        back.perm.uid = OWNER;
+        assert_eq!(queue.set(&back, OWNER), Ok(()));
+        assert_eq!(queue.stat().perm.uid, OWNER);
+        // And the stranger it was handed to is now the owner's business too.
+        assert_eq!(queue.set(&back, STRANGER), Err(LxError::EPERM));
+    }
+
+    // -------------------------------------------------------------- qbytes
+
+    /// `try_send` measures the queue against `qbytes`, so an `IPC_SET` with
+    /// `qbytes = usize::MAX` used to turn a queue into unbounded pinned kernel
+    /// memory, `MSGMAX` bytes per `msgsnd`. Raising `msg_qbytes` past `MSGMNB`
+    /// is `CAP_SYS_RESOURCE` on Linux.
+    #[test]
+    fn an_unprivileged_ipc_set_cannot_raise_qbytes() {
+        let queue = owned_by(OWNER);
+        let mut ds = queue.stat();
+        ds.qbytes = usize::MAX;
+        assert_eq!(queue.set(&ds, OWNER), Ok(()));
+        assert_eq!(queue.stat().qbytes, MSGMNB);
+    }
+
+    #[test]
+    fn root_may_raise_qbytes_and_anyone_may_lower_it() {
+        let queue = owned_by(OWNER);
+        let mut up = queue.stat();
+        up.qbytes = MSGMNB * 4;
+        assert_eq!(queue.set(&up, ROOT), Ok(()));
+        assert_eq!(queue.stat().qbytes, MSGMNB * 4);
+
+        let mut down = queue.stat();
+        down.qbytes = 100;
+        assert_eq!(queue.set(&down, OWNER), Ok(()));
+        assert_eq!(queue.stat().qbytes, 100);
+    }
+
+    /// The bound has to reach `try_send`, or it is bookkeeping.
+    #[test]
+    fn a_lowered_qbytes_fills_the_queue() {
+        let queue = owned_by(OWNER);
+        let mut ds = queue.stat();
+        ds.qbytes = 4;
+        assert_eq!(queue.set(&ds, OWNER), Ok(()));
+        assert!(queue.try_send(1, &[0u8; 4], PID).is_ok());
+        assert!(matches!(
+            queue.try_send(1, &[0u8; 1], PID),
+            Err(MsgSendError::Full)
+        ));
+    }
+
+    /// With `qbytes` raised by root, `cbytes + data.len()` is an addition on
+    /// numbers userspace chose: a queue near the top of the address space must
+    /// answer "full", not overflow.
+    #[test]
+    fn a_send_that_would_overflow_the_byte_count_is_full() {
+        let queue = owned_by(OWNER);
+        {
+            let mut inner = queue.inner.lock();
+            inner.ds.qbytes = usize::MAX;
+            inner.ds.cbytes = usize::MAX;
+        }
+        assert!(matches!(
+            queue.try_send(1, &[0u8; 1], PID),
+            Err(MsgSendError::Full)
+        ));
+    }
+
+    // ------------------------------------------------------------- IPC_RMID
+
+    #[test]
+    fn ipc_rmid_from_a_stranger_is_eperm_and_leaves_the_queue_alive() {
+        let _guard = test_lock();
+        clear_queues();
+        let id = msg_get(0, CREAT, OWNER, OWNER).unwrap();
+        assert_eq!(msg_remove(id, STRANGER), Err(LxError::EPERM));
+        let queue = msg_queue(id).expect("queue destroyed by a stranger");
+        // Not even latched as removed: a blocked sender would have woken into
+        // EIDRM on a queue that is still there.
+        assert!(queue.try_send(1, b"still here", PID).is_ok());
+    }
+
+    #[test]
+    fn ipc_rmid_from_the_owner_removes_and_wakes_blocked_callers() {
+        let _guard = test_lock();
+        clear_queues();
+        let id = msg_get(0, CREAT, OWNER, OWNER).unwrap();
+        let queue = msg_queue(id).unwrap();
+        assert_eq!(msg_remove(id, OWNER), Ok(()));
+        assert!(msg_queue(id).is_none());
+        assert!(matches!(
+            queue.try_send(1, b"gone", PID),
+            Err(MsgSendError::Removed)
+        ));
+    }
+
+    #[test]
+    fn root_may_remove_a_queue_it_does_not_own() {
+        let _guard = test_lock();
+        clear_queues();
+        let id = msg_get(0, CREAT, OWNER, OWNER).unwrap();
+        assert_eq!(msg_remove(id, ROOT), Ok(()));
+        assert!(msg_queue(id).is_none());
+    }
+
+    #[test]
+    fn ipc_rmid_of_an_id_that_names_nothing_is_einval() {
+        let _guard = test_lock();
+        clear_queues();
+        assert_eq!(msg_remove(4242, ROOT), Err(LxError::EINVAL));
+    }
+
+    // ------------------------------------------------------------------ ids
+
+    /// `(0..).find(|i| !queues.contains_key(i))` handed the retired id
+    /// straight back out, so a process still holding the old number sent into
+    /// a stranger's queue instead of getting `EIDRM`.
+    #[test]
+    fn an_id_is_never_handed_out_twice() {
+        let _guard = test_lock();
+        clear_queues();
+        let first = msg_get(0, CREAT, OWNER, OWNER).unwrap();
+        assert_eq!(msg_remove(first, OWNER), Ok(()));
+        let second = msg_get(0, CREAT, OWNER, OWNER).unwrap();
+        assert_ne!(second, first);
+        assert!(msg_queue(first).is_none());
+    }
+
+    #[test]
+    fn ipc_private_always_makes_a_fresh_queue() {
+        let _guard = test_lock();
+        clear_queues();
+        let a = msg_get(0, CREAT, OWNER, OWNER).unwrap();
+        let b = msg_get(0, CREAT, OWNER, OWNER).unwrap();
+        assert_ne!(a, b);
+        assert_eq!(MSG_QUEUES.read().len(), 2);
+    }
+
+    // --------------------------------------------------------------- MSGMNI
+
+    /// A queue is held by a strong `Arc` until `IPC_RMID`, so an unbounded
+    /// table is pinned kernel memory an unprivileged loop chooses the size of.
+    /// Filled by hand: going through `msg_get` 32000 times is the quadratic
+    /// key scan, which is the other half of the finding.
+    #[test]
+    fn msgget_stops_at_msgmni() {
+        let _guard = test_lock();
+        clear_queues();
+        {
+            let mut queues = MSG_QUEUES.write();
+            for i in 0..MSGMNI {
+                queues.insert(i, Arc::new(MsgQueue::new(0, 0o600, OWNER, OWNER)));
+            }
+        }
+        assert_eq!(msg_get(0, CREAT, OWNER, OWNER), Err(LxError::ENOSPC));
+        clear_queues();
+    }
+
+    /// A full table still answers a lookup: `msgget(key, 0)` on a queue that
+    /// already exists is not a create, and Linux does not refuse it.
+    #[test]
+    fn a_full_table_still_resolves_a_key_that_exists() {
+        let _guard = test_lock();
+        clear_queues();
+        let id = {
+            let mut queues = MSG_QUEUES.write();
+            for i in 1..MSGMNI {
+                queues.insert(i, Arc::new(MsgQueue::new(0, 0o600, OWNER, OWNER)));
+            }
+            queues.insert(0, Arc::new(MsgQueue::new(77, 0o600, OWNER, OWNER)));
+            0
+        };
+        assert_eq!(msg_get(77, 0, OWNER, OWNER), Ok(id));
+        clear_queues();
     }
 }

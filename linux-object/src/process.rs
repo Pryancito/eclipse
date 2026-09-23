@@ -3262,7 +3262,7 @@ mod fork_inheritance_tests {
         let mut parent = a_configured_parent();
         let id = parent
             .semaphores
-            .add(crate::ipc::SemArray::get_or_create(0, 1, 0o666).unwrap());
+            .add(crate::ipc::SemArray::get_or_create(0, 1, 0o666, 0, 0).unwrap());
         parent.semaphores.add_undo(id, 0, -1);
 
         let child = fork_of(&parent);

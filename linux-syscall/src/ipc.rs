@@ -139,7 +139,9 @@ impl Syscall<'_> {
             return Err(LxError::EINVAL);
         }
 
-        let sem_array = SemArray::get_or_create(key as u32, nsems, flags)?;
+        let proc = self.linux_process();
+        let sem_array =
+            SemArray::get_or_create(key as u32, nsems, flags, proc.euid(), proc.egid())?;
         let id = self.linux_process().semaphores_add(sem_array);
         Ok(id)
     }
@@ -271,6 +273,9 @@ impl Syscall<'_> {
         };
         match cmd {
             SemctlCmds::IPC_RMID => {
+                if !sem_array.may_control(self.linux_process().euid()) {
+                    return Err(LxError::EPERM);
+                }
                 sem_array.remove();
                 self.linux_process().semaphores_remove(id);
                 Ok(0)
@@ -280,7 +285,7 @@ impl Syscall<'_> {
                 let ptr = UserInPtr::from(arg);
                 let ds: SemidDs = ptr.read()?;
                 // update IpcPerm
-                sem_array.set(&ds);
+                sem_array.set(&ds, self.linux_process().euid())?;
                 sem_array.ctime();
                 Ok(0)
             }
@@ -424,11 +429,11 @@ impl Syscall<'_> {
         const IPC_SET: usize = 1;
         const IPC_STAT: usize = 2;
         match cmd {
-            IPC_RMID => msg_remove(id).map(|_| 0),
+            IPC_RMID => msg_remove(id, self.linux_process().euid()).map(|_| 0),
             IPC_SET => {
                 let queue = msg_queue(id).ok_or(LxError::EINVAL)?;
                 let ds: MsqidDs = UserInPtr::from(buf).read()?;
-                queue.set(&ds);
+                queue.set(&ds, self.linux_process().euid())?;
                 Ok(0)
             }
             IPC_STAT => {
@@ -455,11 +460,14 @@ impl Syscall<'_> {
             key, size, shmflg
         );
 
+        let proc = self.linux_process();
         let shared_guard = ShmIdentifier::new_shared_guard(
             key as u32,
             size,
             shmflg,
             self.zircon_process().id() as u32,
+            proc.euid(),
+            proc.egid(),
         )?;
         // The id is system-wide: `shmget` hands out a number that names the
         // same segment in every process, because passing it to another
@@ -584,6 +592,9 @@ impl Syscall<'_> {
         };
         match cmd {
             ShmctlCmds::IPC_RMID => {
+                if !shm_guard.may_control(self.linux_process().euid()) {
+                    return Err(LxError::EPERM);
+                }
                 shm_guard.remove();
                 linux_object::ipc::shm_unregister(id);
                 // The attachment stays. shmget(2): the segment is destroyed
@@ -597,7 +608,7 @@ impl Syscall<'_> {
             ShmctlCmds::IPC_SET => {
                 let buffer: UserInPtr<ShmidDs> = buffer.into();
                 let set_ds = buffer.read()?;
-                shm_guard.set(&set_ds);
+                shm_guard.set(&set_ds, self.linux_process().euid())?;
                 shm_guard.ctime();
                 Ok(0)
             }

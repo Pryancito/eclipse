@@ -152,6 +152,8 @@ impl ShmIdentifier {
         memsize: usize,
         flags: usize,
         cpid: u32,
+        uid: u32,
+        gid: u32,
     ) -> Result<Arc<Mutex<ShmGuard>>, LxError> {
         let mut key2shm = KEY2SHM.write();
         let flag = IpcGetFlag::from_bits_truncate(flags);
@@ -182,10 +184,10 @@ impl ShmIdentifier {
             shmid_ds: Mutex::new(ShmidDs {
                 perm: IpcPerm {
                     key,
-                    uid: 0,
-                    gid: 0,
-                    cuid: 0,
-                    cgid: 0,
+                    uid,
+                    gid,
+                    cuid: uid,
+                    cgid: gid,
                     // least significant 9 bits
                     mode: (flags as u32) & 0x1ff,
                     __seq: 0,
@@ -235,13 +237,26 @@ impl ShmGuard {
         self.shmid_ds.lock().ctime = TimeSpec::now().sec;
     }
 
-    /// for IPC_SET
-    /// see man shmctl(2)
-    pub fn set(&self, new: &ShmidDs) {
+    /// `IPC_SET`: owner and permission bits, per shmctl(2).
+    ///
+    /// Only the owner, the creator or a privileged caller may do this; anyone
+    /// else gets `EPERM`. Without that check the `shmid_ds` userspace handed
+    /// in rewrote `uid` and `gid`, so naming the id was enough to take the
+    /// segment over -- see [`IpcPerm::may_control`].
+    pub fn set(&self, new: &ShmidDs, euid: u32) -> Result<(), LxError> {
         let mut lock = self.shmid_ds.lock();
+        if !lock.perm.may_control(euid) {
+            return Err(LxError::EPERM);
+        }
         lock.perm.uid = new.perm.uid;
         lock.perm.gid = new.perm.gid;
         lock.perm.mode = new.perm.mode & 0x1ff;
+        Ok(())
+    }
+
+    /// Whether `euid` may `IPC_SET` or `IPC_RMID` this segment.
+    pub fn may_control(&self, euid: u32) -> bool {
+        self.shmid_ds.lock().perm.may_control(euid)
     }
 
     /// remove Shared memory
@@ -279,6 +294,12 @@ mod shm_tests {
     const EXCL: usize = 0o2000;
     /// Any pid; the field is only bookkeeping here.
     const PID: u32 = 42;
+    /// `euid == 0`.
+    const ROOT: u32 = 0;
+    /// The owner in the ownership tests.
+    const OWNER: u32 = 1000;
+    /// Somebody else.
+    const STRANGER: u32 = 1001;
 
     /// `KEY2SHM` is process-wide and cargo runs a crate's tests in threads.
     fn test_lock() -> std::sync::MutexGuard<'static, ()> {
@@ -287,7 +308,18 @@ mod shm_tests {
     }
 
     fn get(key: u32, size: usize, flags: usize) -> Result<Arc<Mutex<ShmGuard>>, LxError> {
-        ShmIdentifier::new_shared_guard(key, size, flags, PID)
+        owned_get(key, size, flags, ROOT)
+    }
+
+    /// `shmget` as `uid` -- the creator `shmctl` then measures a caller
+    /// against.
+    fn owned_get(
+        key: u32,
+        size: usize,
+        flags: usize,
+        uid: u32,
+    ) -> Result<Arc<Mutex<ShmGuard>>, LxError> {
+        ShmIdentifier::new_shared_guard(key, size, flags, PID, uid, uid)
     }
 
     /// Clear the system-wide id table between tests: it is process-wide and
@@ -649,12 +681,66 @@ mod shm_tests {
         ds.perm.gid = 1001;
         ds.perm.mode = 0o7654;
         ds.segsz = 1;
-        g.set(&ds);
+        assert_eq!(g.set(&ds, ROOT), Ok(()));
         let now = *g.shmid_ds.lock();
         assert_eq!(now.perm.uid, 1000);
         assert_eq!(now.perm.gid, 1001);
         assert_eq!(now.perm.mode, 0o654);
         assert_eq!(now.perm.key, 0x5b_0009, "IPC_SET never moves the key");
         assert_eq!(now.segsz, 4096, "nor resizes the segment");
+    }
+
+    // ---- who may change the segment --------------------------------------
+
+    /// `shmget` filled `uid`, `gid`, `cuid` and `cgid` with zeros, whoever
+    /// called it, so `shmctl(IPC_STAT)` reported every segment in the system
+    /// as root's and there was nothing for a permission check to read.
+    #[test]
+    fn shmget_records_the_caller_as_owner_and_creator() {
+        let _guard = test_lock();
+        let a =
+            ShmIdentifier::new_shared_guard(0, 4096, CREAT | 0o666, PID, OWNER, OWNER + 5).unwrap();
+        let perm = a.lock().shmid_ds.lock().perm;
+        assert_eq!(perm.uid, OWNER);
+        assert_eq!(perm.gid, OWNER + 5);
+        assert_eq!(perm.cuid, OWNER);
+        assert_eq!(perm.cgid, OWNER + 5);
+    }
+
+    /// The whole of the old `set`: uid, gid and mode straight out of the
+    /// buffer userspace handed in, with nobody asked, so naming the id was
+    /// enough to take the segment over (shmctl(2): `EPERM`).
+    #[test]
+    fn ipc_set_from_a_stranger_is_eperm_and_changes_nothing() {
+        let _guard = test_lock();
+        let a = owned_get(0, 4096, CREAT | 0o600, OWNER).unwrap();
+        let g = a.lock();
+        let mut ds = *g.shmid_ds.lock();
+        ds.perm.uid = STRANGER;
+        ds.perm.mode = 0o666;
+        assert_eq!(g.set(&ds, STRANGER), Err(LxError::EPERM));
+        let now = g.shmid_ds.lock().perm;
+        assert_eq!(now.uid, OWNER);
+        assert_eq!(now.mode, 0o600);
+        assert_eq!(g.set(&ds, OWNER), Ok(()));
+        assert_eq!(g.shmid_ds.lock().perm.uid, STRANGER);
+    }
+
+    /// The same predicate gates `IPC_RMID`, which is how `shmctl` decides
+    /// whether a caller may destroy somebody else's segment.
+    #[test]
+    fn only_the_owner_the_creator_and_root_may_control_a_segment() {
+        let _guard = test_lock();
+        let a = owned_get(0, 4096, CREAT | 0o666, OWNER).unwrap();
+        let g = a.lock();
+        assert!(g.may_control(OWNER));
+        assert!(g.may_control(ROOT));
+        assert!(!g.may_control(STRANGER));
+        // Handed over, the creator keeps its rights (ipcctl_obtain_check).
+        let mut ds = *g.shmid_ds.lock();
+        ds.perm.uid = STRANGER;
+        assert_eq!(g.set(&ds, OWNER), Ok(()));
+        assert!(g.may_control(OWNER));
+        assert!(g.may_control(STRANGER));
     }
 }
