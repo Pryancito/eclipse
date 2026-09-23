@@ -14465,13 +14465,728 @@ mod nouveau_bookkeeping_tests {
             alloc::vec![(0x6000, 0xafaf)]
         );
     }
+
+    // ----- With the fake RM: the arms a GL client reaches once attached -----
+
+    use super::rm_host_shims::{fake_fbmem_offset, fake_sysmem_pa, reset_fake_rm, FAKE_RM};
+
+    /// The compositor's pid: it owns ctx 0, so every other pid is a GL
+    /// client and gets a context of its own.
+    const COMP: u64 = 66_000;
+
+    fn gpu_rm() -> NvidiaGpu {
+        let gpu = gpu();
+        reset_fake_rm();
+        *gpu.rm_device_instance.lock() = Some(0);
+        gpu.ctx0_owner.store(COMP, Ordering::Release);
+        gpu
+    }
+
+    fn gem_new_rm(
+        gpu: &NvidiaGpu,
+        size: u64,
+        domain: u32,
+        pid: u64,
+    ) -> Result<nv::DrmNouveauGemInfo, i32> {
+        let mut r = nv::DrmNouveauGemNew {
+            info: nv::DrmNouveauGemInfo {
+                handle: 0,
+                domain,
+                size,
+                offset: 0,
+                map_handle: 0,
+                tile_mode: 0,
+                tile_flags: 0,
+            },
+            channel_hint: 0,
+            align: 0,
+        };
+        call(gpu, wr::<nv::DrmNouveauGemNew>(nv::NR_GEM_NEW), &mut r, pid).map(|_| r.info)
+    }
+
+    fn op(op: u32, flags: u32, handle: u32, addr: u64, range: u64) -> nv::DrmNouveauVmBindOp {
+        nv::DrmNouveauVmBindOp {
+            op,
+            flags,
+            handle,
+            pad: 0,
+            addr,
+            bo_offset: 0,
+            range,
+        }
+    }
+
+    fn map(handle: u32, addr: u64, range: u64) -> nv::DrmNouveauVmBindOp {
+        op(
+            nv::VM_BIND_OP_MAP,
+            nv::PTE_KIND_GENERIC,
+            handle,
+            addr,
+            range,
+        )
+    }
+
+    fn map_at(handle: u32, addr: u64, range: u64, bo_offset: u64) -> nv::DrmNouveauVmBindOp {
+        nv::DrmNouveauVmBindOp {
+            bo_offset,
+            ..map(handle, addr, range)
+        }
+    }
+
+    fn unmap(addr: u64, range: u64) -> nv::DrmNouveauVmBindOp {
+        op(nv::VM_BIND_OP_UNMAP, 0, 0, addr, range)
+    }
+
+    fn vm_bind_ops(
+        gpu: &NvidiaGpu,
+        pid: u64,
+        ops: &mut [nv::DrmNouveauVmBindOp],
+    ) -> Result<usize, i32> {
+        let mut r = nv::DrmNouveauVmBind {
+            op_count: ops.len() as u32,
+            flags: 0,
+            wait_count: 0,
+            sig_count: 0,
+            wait_ptr: 0,
+            sig_ptr: 0,
+            op_ptr: ops.as_mut_ptr() as u64,
+        };
+        call(gpu, wr::<nv::DrmNouveauVmBind>(nv::NR_VM_BIND), &mut r, pid)
+    }
+
+    fn ctx_of(gpu: &NvidiaGpu, pid: u64) -> Option<(u32, bool)> {
+        gpu.nouveau_pid_ctx
+            .lock()
+            .iter()
+            .find(|t| t.0 == pid)
+            .map(|t| (t.1, t.4))
+    }
+
+    fn rm_backed_channels(gpu: &NvidiaGpu, pid: u64) -> usize {
+        gpu.nouveau_channels
+            .lock()
+            .iter()
+            .filter(|c| c.owner_pid == pid && c.rm_backed)
+            .count()
+    }
+
+    fn driver_maps(gpu: &NvidiaGpu, pid: u64) -> Vec<(u32, u64, u64, u32)> {
+        gpu.nouveau_vm_mappings
+            .lock()
+            .iter()
+            .filter(|m| m.owner_pid == pid)
+            .map(|m| (m.gem_handle, m.va, m.size, m.h_virt))
+            .collect()
+    }
+
+    #[test]
+    fn with_the_rm_a_clients_channel_builds_its_own_context_once_and_falls_back_when_the_rm_refuses(
+    ) {
+        let _g = LOCK.lock();
+        let gpu = gpu_rm();
+        let c = channel_alloc(&gpu, A).unwrap();
+        assert_eq!(c.channel, 0);
+        assert_eq!(c.notifier_handle, 0x6001, "the notifier of CTX 1");
+        assert_eq!(
+            ctx_of(&gpu, A),
+            Some((1, true)),
+            "built, primed, published READY"
+        );
+        assert_eq!(rm_backed_channels(&gpu, A), 1);
+        assert_eq!(FAKE_RM.lock().calls, ["ctx_alloc", "ctx_prime"]);
+        // A second channel of the same pid reuses the context: NVK opens
+        // several per process (labwc runs two Vulkan instances).
+        assert_eq!(channel_alloc(&gpu, A).unwrap().channel, 1);
+        assert_eq!(rm_backed_channels(&gpu, A), 2);
+        assert_eq!(FAKE_RM.lock().ctxs, [1], "still one context");
+        assert_eq!(channel_alloc(&gpu, B).unwrap().notifier_handle, 0x6002);
+        assert_eq!(ctx_of(&gpu, B), Some((2, true)));
+        assert!(gpu.nouveau_rm_vas_ready());
+        // The compositor's own channel is the step16/17 ladder, which the
+        // fake does not carry: the honest answer is ENODEV, not a client
+        // context in disguise.
+        assert_eq!(
+            channel_alloc(&gpu, COMP).map(|c| c.channel),
+            Err(nv::ENODEV)
+        );
+        assert_eq!(ctx_of(&gpu, COMP), None);
+        // ctx_alloc refused: a discovery channel, nothing reserved.
+        FAKE_RM.lock().fail_ctx_alloc = true;
+        let c = channel_alloc(&gpu, STRANGER).unwrap();
+        assert_eq!(c.notifier_handle, 0, "no RM notifier");
+        assert_eq!(rm_backed_channels(&gpu, STRANGER), 0);
+        assert_eq!(ctx_of(&gpu, STRANGER), None, "the reservation was removed");
+        assert_eq!(FAKE_RM.lock().ctxs, [1, 2]);
+        FAKE_RM.lock().fail_ctx_alloc = false;
+        // ctx_alloc returned NV_OK with a failed stage: the C side already
+        // freed what it built, so the driver only drops the reservation and
+        // must neither prime nor ctx_free a context that does not exist.
+        FAKE_RM.lock().incomplete_ctx = true;
+        assert_eq!(channel_alloc(&gpu, STRANGER).unwrap().notifier_handle, 0);
+        assert_eq!(ctx_of(&gpu, STRANGER), None);
+        assert_eq!(
+            FAKE_RM.lock().calls.last(),
+            Some(&"ctx_alloc"),
+            "half-built: not primed, and nothing to free"
+        );
+        assert_eq!(FAKE_RM.lock().ctx_frees, 0);
+        FAKE_RM.lock().incomplete_ctx = false;
+        // Prime failed: the context is torn down again (a kept one hangs
+        // FECS on the first 3D draw) and the client falls back to software.
+        FAKE_RM.lock().fail_prime = true;
+        assert_eq!(channel_alloc(&gpu, STRANGER).unwrap().notifier_handle, 0);
+        assert_eq!(ctx_of(&gpu, STRANGER), None);
+        {
+            let f = FAKE_RM.lock();
+            assert_eq!(f.ctx_frees, 1, "ctx_free after the failed prime");
+            assert_eq!(f.ctxs, [1, 2], "slot 3 is free again");
+        }
+        FAKE_RM.lock().fail_prime = false;
+        assert_eq!(
+            ctx_of(&gpu, A),
+            Some((1, true)),
+            "A's context is untouched by all that"
+        );
+        gpu.nouveau_release_process(A);
+        gpu.nouveau_release_process(B);
+        gpu.nouveau_release_process(STRANGER);
+    }
+
+    #[test]
+    fn with_the_rm_gem_new_registers_what_is_cpu_mappable_and_close_gives_the_memory_back() {
+        let _g = LOCK.lock();
+        let _live = LiveBytes::hold();
+        let gpu = gpu_rm();
+        let gart = gem_new_rm(&gpu, 65536, nv::NOUVEAU_GEM_DOMAIN_GART, A).unwrap();
+        let h_gart = FAKE_RM.lock().gems[0].0;
+        assert_eq!(FAKE_RM.lock().gems, [(h_gart, 65536, true)]);
+        assert_eq!(gart.domain, nv::NOUVEAU_GEM_DOMAIN_GART);
+        assert_eq!(
+            gart.map_handle,
+            u64::from(gart.handle) << 12,
+            "CPU-mappable"
+        );
+        assert_eq!(
+            crate::scheme::gem_mmap::lookup(gart.handle),
+            Some((fake_sysmem_pa(h_gart), 65536)),
+            "registered for mmap and PRIME at the RM's host PA"
+        );
+        assert!(crate::scheme::gem_mmap::holds(gart.handle, A));
+        // GART|VRAM (NVK's DEVICE_LOCAL|HOST_VISIBLE) stays system memory.
+        let both = gem_new_rm(
+            &gpu,
+            4096,
+            nv::NOUVEAU_GEM_DOMAIN_GART | nv::NOUVEAU_GEM_DOMAIN_VRAM,
+            A,
+        )
+        .unwrap();
+        assert_eq!(both.domain, nv::NOUVEAU_GEM_DOMAIN_GART);
+        assert_ne!(both.map_handle, 0);
+        // VRAM-only is DEVICE_LOCAL: no host PA is ever published for it.
+        let vram = gem_new_rm(&gpu, 3 * MIB, nv::NOUVEAU_GEM_DOMAIN_VRAM, A).unwrap();
+        let h_vram = FAKE_RM.lock().gems[2].0;
+        assert_eq!(FAKE_RM.lock().gems[2], (h_vram, 3 * MIB, false));
+        assert_eq!(
+            (vram.domain, vram.map_handle),
+            (nv::NOUVEAU_GEM_DOMAIN_VRAM, 0)
+        );
+        assert!(crate::scheme::gem_mmap::lookup(vram.handle).is_none());
+        assert_eq!(
+            gpu.nouveau_gem
+                .lock()
+                .iter()
+                .find(|o| o.handle == vram.handle)
+                .and_then(|o| o.vram_offset),
+            Some(fake_fbmem_offset(h_vram)),
+            "its FBMEM offset, for scanout by offset"
+        );
+        assert_eq!(getparam(&gpu, nv::NOUVEAU_GETPARAM_VRAM_USED), Ok(3 * MIB));
+        assert_eq!(
+            _live.delta(),
+            65536 + 4096 + 3 * MIB as i64,
+            "every byte the RM holds is counted against the quotas"
+        );
+        assert_eq!(
+            &FAKE_RM.lock().calls[4..],
+            ["gem_alloc", "gem_fbmem_offset"],
+            "VRAM: never asked for a CPU mapping"
+        );
+        assert_eq!(
+            gem_info(&gpu, gart.handle, A).map(|i| (i.size, i.map_handle)),
+            Ok((65536, gart.map_handle))
+        );
+        // The RM put a "GART" object in an aperture the CPU cannot reach:
+        // a live object, but not mmap-able and not registered as such.
+        FAKE_RM.lock().map_cpu_elsewhere = true;
+        let far = gem_new_rm(&gpu, 8192, nv::NOUVEAU_GEM_DOMAIN_GART, A).unwrap();
+        FAKE_RM.lock().map_cpu_elsewhere = false;
+        assert_eq!(far.map_handle, 0);
+        assert!(crate::scheme::gem_mmap::lookup(far.handle).is_none());
+        assert!(has_object(&gpu, far.handle));
+        assert!(gpu.nouveau_gem_close(far.handle, A));
+        assert_eq!(FAKE_RM.lock().gem_frees, 1);
+        // The RM refuses: nothing is left behind, not even the bytes.
+        let counted = _live.delta();
+        FAKE_RM.lock().fail_gem_alloc = true;
+        assert_eq!(
+            gem_new_rm(&gpu, 4096, nv::NOUVEAU_GEM_DOMAIN_GART, A).map(|i| i.handle),
+            Err(nv::ENOMEM)
+        );
+        FAKE_RM.lock().fail_gem_alloc = false;
+        assert_eq!(_live.delta(), counted);
+        assert_eq!(gpu.nouveau_gem.lock().len(), 3);
+        // GEM_CLOSE hands the RM memory back, once, and the registry entry
+        // goes with it.
+        assert!(gpu.nouveau_gem_close(gart.handle, A));
+        assert!(crate::scheme::gem_mmap::lookup(gart.handle).is_none());
+        assert!(gpu.nouveau_gem_close(vram.handle, A));
+        {
+            let f = FAKE_RM.lock();
+            assert_eq!(f.gem_frees, 3);
+            assert_eq!(f.gems.len(), 1, "only the GART|VRAM one is still allocated");
+            assert_eq!(f.bad, 0);
+        }
+        assert!(
+            !gpu.nouveau_gem_close(gart.handle, A),
+            "closed twice: refused, not freed twice"
+        );
+        assert_eq!(FAKE_RM.lock().bad, 0);
+        gpu.nouveau_release_process(A);
+        assert_eq!(FAKE_RM.lock().gems, [], "process exit freed the last one");
+    }
+
+    #[test]
+    fn vm_bind_maps_into_the_callers_own_context_and_a_map_over_a_live_range_replaces_it() {
+        let _g = LOCK.lock();
+        let _live = LiveBytes::hold();
+        let gpu = gpu_rm();
+        const VA: u64 = 0x3f_f000_0000;
+        assert_eq!(
+            vm_bind_ops(&gpu, A, &mut [map(1, VA, 4096)]),
+            Err(nv::ENODEV),
+            "no RM-backed channel on this GPU: no VA space to bind into"
+        );
+        assert_eq!(channel_alloc(&gpu, A).unwrap().channel, 0);
+        let ha = gem_new_rm(&gpu, 65536, nv::NOUVEAU_GEM_DOMAIN_GART, A)
+            .unwrap()
+            .handle;
+        let h_mem_a = FAKE_RM.lock().gems[0].0;
+        assert_eq!(vm_bind_ops(&gpu, A, &mut [map(ha, VA, 65536)]), Ok(0));
+        let f_maps = FAKE_RM.lock().maps.clone();
+        assert_eq!(f_maps.len(), 1);
+        let (h_virt, ctx, h_mem, va, size, bo_offset, kind) = f_maps[0];
+        assert_eq!(
+            (ctx, h_mem, va, size, bo_offset, kind),
+            (1, h_mem_a, VA, 65536, 0, 0x06),
+            "A's context, its memory, the kind verbatim"
+        );
+        assert_eq!(
+            driver_maps(&gpu, A),
+            [(ha, VA, 65536, h_virt)],
+            "the driver's record names the RM's h_virt"
+        );
+        assert_eq!(gem_info(&gpu, ha, A).unwrap().offset, VA);
+        // REPLACE: a MAP over a live range of the same context unmaps it
+        // first (Linux gpuvm semantics; the RM would refuse the fixed VA).
+        assert_eq!(
+            vm_bind_ops(&gpu, A, &mut [map(ha, VA + 0x8000, 65536)]),
+            Ok(0)
+        );
+        {
+            let f = FAKE_RM.lock();
+            assert_eq!(f.unmaps, 1, "the old binding was unmapped in the RM");
+            assert_eq!(f.maps_of_ctx(1), [(VA + 0x8000, 65536, 0x06)]);
+            assert_eq!(f.bad, 0);
+        }
+        assert_eq!(driver_maps(&gpu, A).len(), 1);
+        // A mapping that starts exactly where the new one ends is a
+        // neighbour, not an overlap: it stays. The offset into the object
+        // reaches the RM and the record.
+        assert_eq!(
+            vm_bind_ops(&gpu, A, &mut [map_at(ha, VA + 0x18000, 4096, 0x3000)]),
+            Ok(0)
+        );
+        assert_eq!(
+            vm_bind_ops(&gpu, A, &mut [map(ha, VA + 0x8000, 65536)]),
+            Ok(0),
+            "re-bound over itself"
+        );
+        {
+            let f = FAKE_RM.lock();
+            assert_eq!(f.unmaps, 2, "only the overlapping one was replaced");
+            assert_eq!(
+                f.maps_of_ctx(1),
+                [(VA + 0x18000, 4096, 0x06), (VA + 0x8000, 65536, 0x06)]
+            );
+            assert_eq!(
+                f.maps.iter().find(|m| m.3 == VA + 0x18000).map(|m| m.5),
+                Some(0x3000),
+                "bo_offset handed to the RM"
+            );
+        }
+        assert_eq!(
+            gpu.nouveau_vm_mappings
+                .lock()
+                .iter()
+                .find(|m| m.va == VA + 0x18000)
+                .map(|m| m.bo_offset),
+            Some(0x3000)
+        );
+        assert_eq!(
+            vm_bind_ops(&gpu, A, &mut [unmap(VA + 0x18000, 4096)]),
+            Ok(0)
+        );
+        assert_eq!(driver_maps(&gpu, A).len(), 1);
+        assert_eq!(FAKE_RM.lock().unmaps, 3);
+        // Another process, the same VA: its own context, so no conflict.
+        assert_eq!(channel_alloc(&gpu, B).unwrap().channel, 1);
+        let hb = gem_new_rm(&gpu, 4096, nv::NOUVEAU_GEM_DOMAIN_GART, B)
+            .unwrap()
+            .handle;
+        assert_eq!(
+            vm_bind_ops(&gpu, B, &mut [map(hb, VA + 0x8000, 4096)]),
+            Ok(0)
+        );
+        {
+            let f = FAKE_RM.lock();
+            assert_eq!(f.maps.len(), 2);
+            assert_eq!(f.maps_of_ctx(2), [(VA + 0x8000, 4096, 0x06)]);
+            assert_eq!(f.unmaps, 3, "B replaced nothing of A's");
+        }
+        assert_eq!(driver_maps(&gpu, A).len(), 1);
+        // Binding another process's buffer is a GPU read/write of it: only
+        // a holder may. PRIME makes A a holder.
+        assert_eq!(
+            vm_bind_ops(&gpu, A, &mut [map(hb, VA + 0x10_0000, 4096)]),
+            Err(nv::ENOENT)
+        );
+        assert!(crate::scheme::gem_mmap::add_ref(hb, A).is_some());
+        assert_eq!(
+            vm_bind_ops(&gpu, A, &mut [map(hb, VA + 0x10_0000, 4096)]),
+            Ok(0)
+        );
+        assert_eq!(driver_maps(&gpu, A).len(), 2);
+        // UNMAP is by range, scoped to the caller: A's overlapping mapping
+        // goes, B's identical VA stays. An empty range is a success.
+        assert_eq!(vm_bind_ops(&gpu, A, &mut [unmap(VA + 0x8000, 4096)]), Ok(0));
+        assert_eq!(
+            driver_maps(&gpu, A).iter().map(|m| m.0).collect::<Vec<_>>(),
+            [hb]
+        );
+        assert_eq!(
+            FAKE_RM.lock().maps_of_ctx(2).len(),
+            1,
+            "B's binding is still live"
+        );
+        assert_eq!(
+            vm_bind_ops(&gpu, A, &mut [unmap(0x1000, 0x1000)]),
+            Ok(0),
+            "nothing there: fine"
+        );
+        assert_eq!(FAKE_RM.lock().unmaps, 4);
+        // MAP with handle 0 is Mesa's "unbind, keep the reservation", and
+        // it is scoped like UNMAP: B's mapping at the same VA is not A's.
+        assert_eq!(
+            vm_bind_ops(&gpu, B, &mut [map(hb, VA + 0x10_0000, 4096)]),
+            Ok(0)
+        );
+        assert_eq!(
+            vm_bind_ops(&gpu, A, &mut [map(0, VA + 0x10_0000, 4096)]),
+            Ok(0)
+        );
+        assert_eq!(driver_maps(&gpu, A), []);
+        assert_eq!(FAKE_RM.lock().maps_of_ctx(1), []);
+        assert_eq!(driver_maps(&gpu, B).len(), 2, "B's two bindings untouched");
+        assert_eq!(FAKE_RM.lock().maps_of_ctx(2).len(), 2);
+        // What the arm refuses before touching the RM.
+        let before = FAKE_RM.lock().calls.len();
+        assert_eq!(
+            vm_bind_ops(&gpu, A, &mut [op(7, 0, ha, VA, 4096)]),
+            Err(nv::EINVAL),
+            "unknown op"
+        );
+        assert_eq!(
+            vm_bind_ops(
+                &gpu,
+                A,
+                &mut [op(nv::VM_BIND_OP_MAP, nv::VM_BIND_SPARSE, 0, VA, 4096)]
+            ),
+            Err(nv::EOPNOTSUPP),
+            "sparse regions"
+        );
+        assert_eq!(vm_bind_ops(&gpu, A, &mut []), Err(nv::EINVAL), "no ops");
+        let mut many: Vec<_> = (0..65).map(|_| map(ha, VA, 4096)).collect();
+        assert_eq!(
+            vm_bind_ops(&gpu, A, &mut many),
+            Err(nv::EOPNOTSUPP),
+            "65 ops"
+        );
+        let mut r = nv::DrmNouveauVmBind {
+            op_count: 1,
+            flags: 0,
+            wait_count: 1,
+            sig_count: 0,
+            wait_ptr: 0x1000,
+            sig_ptr: 0,
+            op_ptr: many.as_mut_ptr() as u64,
+        };
+        assert_eq!(
+            call(&gpu, wr::<nv::DrmNouveauVmBind>(nv::NR_VM_BIND), &mut r, A),
+            Err(nv::EOPNOTSUPP),
+            "VM_BIND is synchronous here: no syncobj waits"
+        );
+        assert_eq!(
+            FAKE_RM.lock().calls.len(),
+            before,
+            "none of those reached the RM"
+        );
+        // Ops apply in order and stop at the first failure.
+        let mut ops = [
+            map(ha, VA, 4096),
+            map(ha + 1000, VA + 0x1000, 4096),
+            map(ha, VA + 0x2000, 4096),
+        ];
+        assert_eq!(vm_bind_ops(&gpu, A, &mut ops), Err(nv::ENOENT));
+        assert_eq!(
+            driver_maps(&gpu, A).len(),
+            1,
+            "op[0] applied, op[2] never ran"
+        );
+        assert_eq!(FAKE_RM.lock().maps_of_ctx(1), [(VA, 4096, 0x06)]);
+        // The RM refused the map (a fixed VA it will not reserve): EIO, and
+        // no binding is recorded for a mapping that does not exist.
+        FAKE_RM.lock().refuse_map = true;
+        assert_eq!(
+            vm_bind_ops(&gpu, A, &mut [map(ha, VA + 0x4000, 4096)]),
+            Err(nv::EIO)
+        );
+        FAKE_RM.lock().refuse_map = false;
+        assert_eq!(driver_maps(&gpu, A).len(), 1);
+        assert_eq!(gem_info(&gpu, ha, A).unwrap().offset, VA);
+        gpu.nouveau_release_process(A);
+        gpu.nouveau_release_process(B);
+        assert_eq!(FAKE_RM.lock().bad, 0);
+    }
+
+    #[test]
+    fn vm_bind_programs_uncompressed_kinds_verbatim_and_hands_the_rest_to_the_rm_default() {
+        let _g = LOCK.lock();
+        let _live = LiveBytes::hold();
+        let gpu = gpu_rm();
+        channel_alloc(&gpu, A).unwrap();
+        let h = gem_new_rm(&gpu, 65536, nv::NOUVEAU_GEM_DOMAIN_GART, A)
+            .unwrap()
+            .handle;
+        // (kind asked, kind programmed)
+        let cases = [
+            (0x00, 0x00),
+            (0x01, 0x01),
+            (0x03, 0x03),
+            (0x06, 0x06),
+            (0x0a, 0x0a),
+            (0x0f, 0x0f),
+            (0x07, 0x00),
+            (0x20, 0x00),
+            (0xff, 0x00),
+        ];
+        for (i, (asked, _)) in cases.iter().enumerate() {
+            let va = 0x1000_0000 + (i as u64) * 0x1_0000;
+            assert_eq!(
+                vm_bind_ops(&gpu, A, &mut [op(nv::VM_BIND_OP_MAP, *asked, h, va, 4096)]),
+                Ok(0),
+                "a kind is never refused: kind {:#x}",
+                asked
+            );
+        }
+        let programmed: Vec<u32> = FAKE_RM.lock().maps_of_ctx(1).iter().map(|m| m.2).collect();
+        let expected: Vec<u32> = cases.iter().map(|c| c.1).collect();
+        assert_eq!(programmed, expected);
+        // Bits above the kind byte (bit 8 is SPARSE, refused elsewhere) are
+        // not a kind: 0x0200 programs the default, not 0x02, and 0x0206 is
+        // still GENERIC.
+        assert_eq!(
+            vm_bind_ops(
+                &gpu,
+                A,
+                &mut [op(nv::VM_BIND_OP_MAP, 0x0200, h, 0x2000_0000, 4096)]
+            ),
+            Ok(0)
+        );
+        assert_eq!(
+            FAKE_RM.lock().maps_of_ctx(1).last().map(|m| m.2),
+            Some(0x00)
+        );
+        assert_eq!(
+            vm_bind_ops(
+                &gpu,
+                A,
+                &mut [op(nv::VM_BIND_OP_MAP, 0x0206, h, 0x2001_0000, 4096)]
+            ),
+            Ok(0)
+        );
+        assert_eq!(
+            FAKE_RM.lock().maps_of_ctx(1).last().map(|m| m.2),
+            Some(0x06)
+        );
+        gpu.nouveau_release_process(A);
+    }
+
+    #[test]
+    fn with_the_rm_a_subchannel_new_builds_the_class_on_the_callers_context_and_channel_free_reaps_it(
+    ) {
+        let _g = LOCK.lock();
+        let _live = LiveBytes::hold();
+        let gpu = gpu_rm();
+        channel_alloc(&gpu, A).unwrap();
+        channel_alloc(&gpu, B).unwrap();
+        assert_eq!(subchan_new(0, 0xc597, 0x1000).send(&gpu, A), Ok(0));
+        assert_eq!(subchan_new(0, 0xc5c0, 0x1008).send(&gpu, A), Ok(0));
+        assert_eq!(
+            subchan_new(1, 0xc597, 0x1000).send(&gpu, B),
+            Ok(0),
+            "B's own, same cookie"
+        );
+        {
+            let f = FAKE_RM.lock();
+            assert_eq!(
+                f.classes.iter().map(|c| (c.1, c.2)).collect::<Vec<_>>(),
+                [(1, 0xc597), (1, 0xc5c0), (2, 0xc597)],
+                "each on its caller's context, never on ctx 0"
+            );
+        }
+        // DEL frees the RM object, the caller's only.
+        assert_eq!(
+            Nvif::new(nv::NVIF_IOCTL_V0_DEL, 0xff, 0, 0x1000, HDR).send(&gpu, B),
+            Ok(0)
+        );
+        assert_eq!(FAKE_RM.lock().class_frees, 1);
+        assert_eq!(
+            FAKE_RM
+                .lock()
+                .classes
+                .iter()
+                .map(|c| c.1)
+                .collect::<Vec<_>>(),
+            [1, 1]
+        );
+        // CHANNEL_FREE reaps what was left without DEL, on that channel
+        // only, and leaves the context and its bindings alone (the VAS is
+        // shared by every channel of the pid).
+        let h = gem_new_rm(&gpu, 4096, nv::NOUVEAU_GEM_DOMAIN_GART, A)
+            .unwrap()
+            .handle;
+        assert_eq!(
+            vm_bind_ops(&gpu, A, &mut [map(h, 0x5000_0000, 4096)]),
+            Ok(0)
+        );
+        assert_eq!(channel_free(&gpu, 0, A), Ok(0));
+        {
+            let f = FAKE_RM.lock();
+            assert_eq!(f.class_frees, 3);
+            assert_eq!(f.classes, []);
+            assert_eq!(f.ctxs, [1, 2], "no ctx_free on CHANNEL_FREE");
+            assert_eq!(f.maps.len(), 1);
+            assert_eq!(f.bad, 0);
+        }
+        assert!(nv::class_objects_drain_pid(A).is_empty());
+        // The RM refuses the class: the NEW fails rather than leaving a
+        // class NVK will submit methods of.
+        channel_alloc(&gpu, A).unwrap();
+        FAKE_RM.lock().refuse_class = true;
+        assert_eq!(
+            subchan_new(0, 0xc597, 0x2000).send(&gpu, A),
+            Err(nv::EINVAL)
+        );
+        FAKE_RM.lock().refuse_class = false;
+        assert!(nv::class_objects_drain_pid(A).is_empty());
+        gpu.nouveau_release_process(A);
+        gpu.nouveau_release_process(B);
+    }
+
+    #[test]
+    fn process_exit_with_the_rm_frees_classes_then_the_context_then_memory_and_never_unmaps_a_dead_vas(
+    ) {
+        let _g = LOCK.lock();
+        let _live = LiveBytes::hold();
+        let gpu = gpu_rm();
+        channel_alloc(&gpu, A).unwrap();
+        channel_alloc(&gpu, B).unwrap();
+        let ha = gem_new_rm(&gpu, 65536, nv::NOUVEAU_GEM_DOMAIN_GART, A)
+            .unwrap()
+            .handle;
+        let hb = gem_new_rm(&gpu, 4096, nv::NOUVEAU_GEM_DOMAIN_VRAM, B)
+            .unwrap()
+            .handle;
+        assert_eq!(
+            vm_bind_ops(&gpu, A, &mut [map(ha, 0x1000_0000, 65536)]),
+            Ok(0)
+        );
+        assert_eq!(
+            vm_bind_ops(&gpu, B, &mut [map(hb, 0x1000_0000, 4096)]),
+            Ok(0)
+        );
+        assert_eq!(subchan_new(0, 0xc597, 0x1000).send(&gpu, A), Ok(0));
+        let before = FAKE_RM.lock().calls.len();
+        gpu.nouveau_release_process(A);
+        let f = FAKE_RM.lock();
+        assert_eq!(
+            &f.calls[before..],
+            ["class_free", "ctx_free", "gem_free"],
+            "child before parent, GPU stopped before its memory goes"
+        );
+        assert_eq!(
+            f.unmaps, 0,
+            "ctx_free took the VAS: a second unmap would be a use-after-free"
+        );
+        assert_eq!(f.ctxs, [2]);
+        assert_eq!(f.maps_of_ctx(2).len(), 1, "B's binding is untouched");
+        assert_eq!(f.gems.len(), 1);
+        assert_eq!(f.classes, []);
+        assert_eq!(f.bad, 0);
+        drop(f);
+        assert_eq!(ctx_of(&gpu, A), None);
+        assert_eq!(driver_maps(&gpu, A), []);
+        assert!(!has_object(&gpu, ha));
+        assert!(has_object(&gpu, hb));
+        assert_eq!(rm_backed_channels(&gpu, A), 0);
+        assert_eq!(rm_backed_channels(&gpu, B), 1);
+        // A comes back: a fresh context in the freed slot, primed again.
+        channel_alloc(&gpu, A).unwrap();
+        assert_eq!(ctx_of(&gpu, A), Some((1, true)));
+        assert_eq!(FAKE_RM.lock().primed, [1, 2, 1]);
+        gpu.nouveau_release_process(A);
+        // ctx_free refused for B: its VAS is still alive in the RM, so each
+        // binding IS unmapped before its memory is freed (freeing the backing
+        // under a live h_virt is a use-after-free in the vendor RM).
+        FAKE_RM.lock().fail_ctx_free = true;
+        let before = FAKE_RM.lock().calls.len();
+        gpu.nouveau_release_process(B);
+        FAKE_RM.lock().fail_ctx_free = false;
+        {
+            let f = FAKE_RM.lock();
+            assert_eq!(
+                &f.calls[before..],
+                ["ctx_free", "vm_bind_unmap", "gem_free"]
+            );
+            assert_eq!(f.unmaps, 1);
+            assert_eq!(f.maps, [], "B's binding went through the RM");
+            assert_eq!(f.ctxs, [2], "the context the RM would not free stays");
+            assert_eq!(f.bad, 0);
+            assert_eq!(f.gems, []);
+        }
+        assert_eq!(ctx_of(&gpu, B), None, "forgotten locally either way");
+    }
 }
 
 /// The RM entry points the host test binary has no C code for: every
 /// `eclipse_rm_*` the `nvidia-rm-sys` crate declares, generated from its
-/// `extern "C"` blocks. Each answers `NV_ERR_NOT_SUPPORTED`. A test GPU
-/// never has an RM instance, so none of them is reached; they exist so the
-/// binary links, which it must the moment a test calls `nouveau_ioctl`.
+/// `extern "C"` blocks. The hardware ladder (GSP, display, the compositor's
+/// step16/17 channel, CE, EXEC) answers `NV_ERR_NOT_SUPPORTED`: a test GPU
+/// never reaches it. The eleven a GL client's own path goes through --
+/// context build and prime, GEM alloc/map/free, VM_BIND map/unmap, class
+/// objects -- are a small stateful fake (`FakeRm`), so `VM_BIND`, `GEM_NEW`
+/// and the RM-backed `CHANNEL_ALLOC` can be exercised on the host, with the
+/// RM's real refusals (a VA already taken, an object it never handed out).
 /// Global to the test binary, like the `drivers_*` shims in `net/e1000e.rs`.
 #[cfg(test)]
 mod rm_host_shims {
@@ -14545,33 +15260,7 @@ mod rm_host_shims {
         NV_ERR_NOT_SUPPORTED
     }
     #[no_mangle]
-    extern "C" fn eclipse_rm_class_alloc(
-        _a0: u32,
-        _a1: u32,
-        _a2: u32,
-        _a3: *mut u8,
-        _a4: *mut u8,
-    ) -> u32 {
-        NV_ERR_NOT_SUPPORTED
-    }
-    #[no_mangle]
-    extern "C" fn eclipse_rm_class_free(_a0: u32, _a1: u32) -> u32 {
-        NV_ERR_NOT_SUPPORTED
-    }
-    #[no_mangle]
     extern "C" fn eclipse_rm_ctx0_reset(_a0: u32) -> u32 {
-        NV_ERR_NOT_SUPPORTED
-    }
-    #[no_mangle]
-    extern "C" fn eclipse_rm_ctx_alloc(_a0: u32, _a1: u32, _a2: *mut u8) -> u32 {
-        NV_ERR_NOT_SUPPORTED
-    }
-    #[no_mangle]
-    extern "C" fn eclipse_rm_ctx_free(_a0: u32, _a1: u32) -> u32 {
-        NV_ERR_NOT_SUPPORTED
-    }
-    #[no_mangle]
-    extern "C" fn eclipse_rm_ctx_prime(_a0: u32, _a1: u32) -> u32 {
         NV_ERR_NOT_SUPPORTED
     }
     #[no_mangle]
@@ -14606,22 +15295,6 @@ mod rm_host_shims {
         _a5: u32,
         _a6: *mut u8,
     ) -> u32 {
-        NV_ERR_NOT_SUPPORTED
-    }
-    #[no_mangle]
-    extern "C" fn eclipse_rm_gem_alloc(_a0: u32, _a1: u64, _a2: u32, _a3: *mut u8) -> u32 {
-        NV_ERR_NOT_SUPPORTED
-    }
-    #[no_mangle]
-    extern "C" fn eclipse_rm_gem_fbmem_offset(_a0: u32, _a1: u32, _a2: *mut u8) -> u32 {
-        NV_ERR_NOT_SUPPORTED
-    }
-    #[no_mangle]
-    extern "C" fn eclipse_rm_gem_free(_a0: u32, _a1: u32) -> u32 {
-        NV_ERR_NOT_SUPPORTED
-    }
-    #[no_mangle]
-    extern "C" fn eclipse_rm_gem_map_cpu(_a0: u32, _a1: u32, _a2: *mut u8) -> u32 {
         NV_ERR_NOT_SUPPORTED
     }
     #[no_mangle]
@@ -14747,21 +15420,397 @@ mod rm_host_shims {
     extern "C" fn eclipse_rm_step8(_a0: u32, _a1: *mut u8) -> u32 {
         NV_ERR_NOT_SUPPORTED
     }
+
+    // ----- A fake RM with state, for the arms that cannot run without one -----
+    //
+    // Enough of `eclipse_rm_*` to walk the path a GL client takes: a context
+    // per pid (`ctx_alloc`/`ctx_prime`/`ctx_free`), GEM memory
+    // (`gem_alloc`/`gem_map_cpu`/`gem_fbmem_offset`/`gem_free`), VA bindings
+    // (`vm_bind_map`/`vm_bind_unmap`) and engine classes
+    // (`class_alloc`/`class_free`). It refuses what the real RM refuses (a
+    // fixed VA over a live range of the same VAS, a memory handle it never
+    // handed out) and counts every free or unmap of something it does not
+    // hold, which on hardware is a use-after-free inside the vendor RM. The
+    // compositor's own ladder (`step16`/`step17`) is not faked: the
+    // compositor's channel keeps answering ENODEV, and every test client is
+    // a GL client with a context of its own.
+    use alloc::vec::Vec;
+    use nvidia_rm_sys::rm_init::{CtxAlloc, GemAlloc, GemMapCpu, VmBind, ADDR_SYSMEM};
+
+    const NV_OK: u32 = 0;
+    /// `NV_ERR_OBJECT_NOT_FOUND`.
+    const NV_ERR_OBJECT_NOT_FOUND: u32 = 0x57;
+    /// What the RM's eheap answers to a fixed-address allocation over a
+    /// live range: the status the VM_BIND replace semantics were written for.
+    const RM_VA_TAKEN: u32 = 0x51;
+
+    pub(super) struct FakeRm {
+        next: u32,
+        /// Live context indices.
+        pub ctxs: Vec<u32>,
+        pub primed: Vec<u32>,
+        /// `(h_memory, size, sysmem)`.
+        pub gems: Vec<(u32, u64, bool)>,
+        /// `(h_virt, ctx, h_memory, va, size, bo_offset, pte_kind)`.
+        pub maps: Vec<(u32, u32, u32, u64, u64, u64, u32)>,
+        /// `(h_object, ctx, class)`.
+        pub classes: Vec<(u32, u32, u32)>,
+        pub unmaps: usize,
+        pub gem_frees: usize,
+        pub ctx_frees: usize,
+        pub class_frees: usize,
+        /// Frees and unmaps of something this RM does not hold.
+        pub bad: usize,
+        /// Every entry point in call order.
+        pub calls: Vec<&'static str>,
+        pub fail_ctx_alloc: bool,
+        /// `ctx_alloc` returns `NV_OK` with a non-zero `sched_status`: the
+        /// C side's shape for a ladder that failed part-way. It has already
+        /// freed every handle it made, so nothing of this context lives.
+        pub incomplete_ctx: bool,
+        pub fail_prime: bool,
+        /// `ctx_free` refuses: the context, and its VAS, stay alive.
+        pub fail_ctx_free: bool,
+        /// `gem_alloc` returns `NV_OK` with `alloc_status` set: the C side's
+        /// shape for an allocation the RM refused.
+        pub fail_gem_alloc: bool,
+        /// `gem_map_cpu` answers with an aperture that is not system memory:
+        /// the object exists but the CPU cannot map it.
+        pub map_cpu_elsewhere: bool,
+        pub refuse_map: bool,
+        pub refuse_class: bool,
+    }
+
+    const EMPTY_RM: FakeRm = FakeRm {
+        next: 0x100,
+        ctxs: Vec::new(),
+        primed: Vec::new(),
+        gems: Vec::new(),
+        maps: Vec::new(),
+        classes: Vec::new(),
+        unmaps: 0,
+        gem_frees: 0,
+        ctx_frees: 0,
+        class_frees: 0,
+        bad: 0,
+        calls: Vec::new(),
+        fail_ctx_alloc: false,
+        incomplete_ctx: false,
+        fail_prime: false,
+        fail_ctx_free: false,
+        fail_gem_alloc: false,
+        map_cpu_elsewhere: false,
+        refuse_map: false,
+        refuse_class: false,
+    };
+
+    pub(super) static FAKE_RM: lock::Mutex<FakeRm> = lock::Mutex::new(EMPTY_RM);
+
+    pub(super) fn reset_fake_rm() {
+        *FAKE_RM.lock() = EMPTY_RM;
+    }
+
+    impl FakeRm {
+        fn fresh(&mut self) -> u32 {
+            self.next += 1;
+            self.next
+        }
+
+        fn gem(&self, h_memory: u32) -> Option<(u32, u64, bool)> {
+            self.gems.iter().copied().find(|g| g.0 == h_memory)
+        }
+
+        /// Whether `[va, va + size)` meets a live range of context `ctx`.
+        fn va_taken(&self, ctx: u32, va: u64, size: u64) -> bool {
+            self.maps
+                .iter()
+                .any(|m| m.1 == ctx && m.3 < va.wrapping_add(size) && va < m.3.wrapping_add(m.4))
+        }
+
+        pub fn maps_of_ctx(&self, ctx: u32) -> Vec<(u64, u64, u32)> {
+            self.maps
+                .iter()
+                .filter(|m| m.1 == ctx)
+                .map(|m| (m.3, m.4, m.6))
+                .collect()
+        }
+    }
+
     #[no_mangle]
-    extern "C" fn eclipse_rm_vm_bind_map(
-        _a0: u32,
-        _a1: u32,
-        _a2: u32,
-        _a3: u64,
-        _a4: u64,
-        _a5: u64,
-        _a6: u32,
-        _a7: *mut u8,
-    ) -> u32 {
-        NV_ERR_NOT_SUPPORTED
+    extern "C" fn eclipse_rm_ctx_alloc(_inst: u32, ctx_idx: u32, out: *mut CtxAlloc) -> u32 {
+        let mut f = FAKE_RM.lock();
+        f.calls.push("ctx_alloc");
+        if f.fail_ctx_alloc {
+            return NV_ERR_NOT_SUPPORTED;
+        }
+        let sched_status = if f.incomplete_ctx {
+            NV_ERR_NOT_SUPPORTED
+        } else {
+            if !f.ctxs.contains(&ctx_idx) {
+                f.ctxs.push(ctx_idx);
+            }
+            NV_OK
+        };
+        unsafe {
+            *out = CtxAlloc {
+                vas_status: 0,
+                tsg_status: 0,
+                ctxshare_status: 0,
+                userd_status: 0,
+                buf_status: 0,
+                virt_status: 0,
+                map_status: 0,
+                notif_status: 0,
+                chan_status: 0,
+                compute_status: 0,
+                sched_status,
+                h_vas: 0x5000 + ctx_idx,
+                h_tsg: 0,
+                h_ctxshare: 0,
+                h_userd: 0,
+                h_phys_buf: 0,
+                h_virt_buf: 0,
+                h_notifier: 0x6000 + ctx_idx,
+                h_channel: 0x7000 + ctx_idx,
+                h_compute: 0,
+                channel_class: 0xc46f,
+                userd_size: 0,
+                buf_gpu_va: 0x10_0000 * u64::from(ctx_idx),
+            };
+        }
+        NV_OK
     }
     #[no_mangle]
-    extern "C" fn eclipse_rm_vm_bind_unmap(_a0: u32, _a1: u32, _a2: u64, _a3: u64) -> u32 {
-        NV_ERR_NOT_SUPPORTED
+    extern "C" fn eclipse_rm_ctx_prime(_inst: u32, ctx_idx: u32) -> u32 {
+        let mut f = FAKE_RM.lock();
+        f.calls.push("ctx_prime");
+        if f.fail_prime {
+            return NV_ERR_NOT_SUPPORTED;
+        }
+        f.primed.push(ctx_idx);
+        NV_OK
+    }
+    #[no_mangle]
+    extern "C" fn eclipse_rm_ctx_free(_inst: u32, ctx_idx: u32) -> u32 {
+        let mut f = FAKE_RM.lock();
+        f.calls.push("ctx_free");
+        if f.fail_ctx_free {
+            return NV_ERR_NOT_SUPPORTED;
+        }
+        // Destroying the VAS takes every binding in it with it.
+        if let Some(pos) = f.ctxs.iter().position(|c| *c == ctx_idx) {
+            f.ctxs.remove(pos);
+            f.maps.retain(|m| m.1 != ctx_idx);
+            f.ctx_frees += 1;
+        }
+        NV_OK
+    }
+    #[no_mangle]
+    extern "C" fn eclipse_rm_gem_alloc(
+        _inst: u32,
+        size: u64,
+        sysmem: u32,
+        out: *mut GemAlloc,
+    ) -> u32 {
+        let mut f = FAKE_RM.lock();
+        f.calls.push("gem_alloc");
+        if f.fail_gem_alloc {
+            unsafe {
+                *out = GemAlloc {
+                    alloc_status: NV_ERR_NOT_SUPPORTED,
+                    h_memory: 0,
+                };
+            }
+            return NV_OK;
+        }
+        let h = f.fresh();
+        f.gems.push((h, size, sysmem != 0));
+        unsafe {
+            *out = GemAlloc {
+                alloc_status: 0,
+                h_memory: h,
+            };
+        }
+        NV_OK
+    }
+    #[no_mangle]
+    extern "C" fn eclipse_rm_gem_map_cpu(_inst: u32, h_memory: u32, out: *mut GemMapCpu) -> u32 {
+        let mut f = FAKE_RM.lock();
+        f.calls.push("gem_map_cpu");
+        let elsewhere = f.map_cpu_elsewhere;
+        let r = match f.gem(h_memory) {
+            Some((_, size, true)) if elsewhere => GemMapCpu {
+                lookup_status: 0,
+                address_space: 2,
+                phys_addr: 0xdead_0000,
+                size,
+            },
+            // A host PA only for system memory; vidmem is FBMEM (0).
+            Some((h, size, true)) => GemMapCpu {
+                lookup_status: 0,
+                address_space: ADDR_SYSMEM,
+                phys_addr: fake_sysmem_pa(h),
+                size,
+            },
+            Some((_, _, false)) => GemMapCpu {
+                lookup_status: 0,
+                address_space: 0,
+                phys_addr: 0,
+                size: 0,
+            },
+            None => GemMapCpu {
+                lookup_status: NV_ERR_OBJECT_NOT_FOUND,
+                address_space: 0,
+                phys_addr: 0,
+                size: 0,
+            },
+        };
+        unsafe { *out = r };
+        NV_OK
+    }
+    /// The host PA the fake gives a sysmem object.
+    pub(super) fn fake_sysmem_pa(h_memory: u32) -> u64 {
+        0x1_0000_0000 + (u64::from(h_memory) << 16)
+    }
+    /// The FBMEM offset the fake gives a vidmem object.
+    pub(super) fn fake_fbmem_offset(h_memory: u32) -> u64 {
+        u64::from(h_memory) << 20
+    }
+    #[no_mangle]
+    extern "C" fn eclipse_rm_gem_fbmem_offset(
+        _inst: u32,
+        h_memory: u32,
+        p_offset: *mut u64,
+    ) -> u32 {
+        let mut f = FAKE_RM.lock();
+        f.calls.push("gem_fbmem_offset");
+        match f.gem(h_memory) {
+            Some((h, _, false)) => {
+                unsafe { *p_offset = fake_fbmem_offset(h) };
+                NV_OK
+            }
+            _ => NV_ERR_NOT_SUPPORTED,
+        }
+    }
+    #[no_mangle]
+    extern "C" fn eclipse_rm_gem_free(_inst: u32, h_memory: u32) -> u32 {
+        let mut f = FAKE_RM.lock();
+        f.calls.push("gem_free");
+        match f.gems.iter().position(|g| g.0 == h_memory) {
+            Some(pos) => {
+                f.gems.remove(pos);
+                f.gem_frees += 1;
+                NV_OK
+            }
+            None => {
+                f.bad += 1;
+                NV_ERR_OBJECT_NOT_FOUND
+            }
+        }
+    }
+    #[no_mangle]
+    extern "C" fn eclipse_rm_vm_bind_map(
+        _inst: u32,
+        ctx_idx: u32,
+        h_memory: u32,
+        size: u64,
+        requested_va: u64,
+        bo_offset: u64,
+        pte_kind: u32,
+        out: *mut VmBind,
+    ) -> u32 {
+        let mut f = FAKE_RM.lock();
+        f.calls.push("vm_bind_map");
+        let r = if f.gem(h_memory).is_none() {
+            VmBind {
+                virt_status: 0,
+                map_status: NV_ERR_OBJECT_NOT_FOUND,
+                h_virt: 0,
+                actual_va: 0,
+            }
+        } else if f.refuse_map || f.va_taken(ctx_idx, requested_va, size) {
+            VmBind {
+                virt_status: RM_VA_TAKEN,
+                map_status: RM_VA_TAKEN,
+                h_virt: 0,
+                actual_va: 0,
+            }
+        } else {
+            let h_virt = f.fresh();
+            f.maps.push((
+                h_virt,
+                ctx_idx,
+                h_memory,
+                requested_va,
+                size,
+                bo_offset,
+                pte_kind,
+            ));
+            VmBind {
+                virt_status: 0,
+                map_status: 0,
+                h_virt,
+                actual_va: requested_va,
+            }
+        };
+        unsafe { *out = r };
+        NV_OK
+    }
+    #[no_mangle]
+    extern "C" fn eclipse_rm_vm_bind_unmap(_inst: u32, h_virt: u32, _size: u64, _va: u64) -> u32 {
+        let mut f = FAKE_RM.lock();
+        f.calls.push("vm_bind_unmap");
+        f.unmaps += 1;
+        match f.maps.iter().position(|m| m.0 == h_virt) {
+            Some(pos) => {
+                f.maps.remove(pos);
+                NV_OK
+            }
+            None => {
+                f.bad += 1;
+                NV_ERR_OBJECT_NOT_FOUND
+            }
+        }
+    }
+    #[no_mangle]
+    extern "C" fn eclipse_rm_class_alloc(
+        _inst: u32,
+        ctx_idx: u32,
+        class_id: u32,
+        h_object: *mut u32,
+        alloc_status: *mut u32,
+    ) -> u32 {
+        let mut f = FAKE_RM.lock();
+        f.calls.push("class_alloc");
+        if f.refuse_class {
+            unsafe {
+                *h_object = 0;
+                *alloc_status = NV_ERR_NOT_SUPPORTED;
+            }
+            return NV_OK;
+        }
+        let h = f.fresh();
+        f.classes.push((h, ctx_idx, class_id));
+        unsafe {
+            *h_object = h;
+            *alloc_status = 0;
+        }
+        NV_OK
+    }
+    #[no_mangle]
+    extern "C" fn eclipse_rm_class_free(_inst: u32, h_object: u32) -> u32 {
+        let mut f = FAKE_RM.lock();
+        f.calls.push("class_free");
+        match f.classes.iter().position(|c| c.0 == h_object) {
+            Some(pos) => {
+                f.classes.remove(pos);
+                f.class_frees += 1;
+                NV_OK
+            }
+            None => {
+                f.bad += 1;
+                NV_ERR_OBJECT_NOT_FOUND
+            }
+        }
     }
 }
