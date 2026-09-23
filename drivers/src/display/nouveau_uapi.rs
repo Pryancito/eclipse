@@ -1405,6 +1405,9 @@ pub(super) struct FastCtx {
     pub next_payload: u32,
     pub submits: u64,
     pub fenced: u64,
+    /// The last fence issued, as `(submits once it was in, payload)`: when
+    /// nothing went in after it and it landed, the channel is idle.
+    pub last_fence: Option<(u64, u32)>,
 }
 
 /// One direct-submit failure mode, for the caller to turn into an errno and
