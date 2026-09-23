@@ -12072,7 +12072,20 @@ impl NvidiaGpu {
                         // second -- that starvation is what froze the desktop
                         // and cursor when a hung GL client kept resubmitting.
                         // ctx 0 (the compositor) is never latched.
-                        if ctx_idx >= 1 && r.fence_wait_status != 0 {
+                        //
+                        // Only a wait that actually ran counts. The RM leaves
+                        // every stage it never reached at 0xFFFF_FFFF, and the
+                        // poll above only runs once the submit and the fence
+                        // doorbell succeeded; a submit refused earlier (a full
+                        // GPFIFO's BUSY_RETRY, a lookup failure) also has
+                        // `fence_wait_status != 0`, and latching on that turned
+                        // one transient full ring into a permanent device-lost
+                        // for the client.
+                        if ctx_idx >= 1
+                            && r.submit_status == 0
+                            && r.fence_submit_status == 0
+                            && r.fence_wait_status != 0
+                        {
                             nv::ctx_set_wedged(ctx_idx);
                             crate::klog_warn!(
                                 "[nouveau-uapi] EXEC: CTX {} wedged (fence timeout) -- fast-failing \
@@ -13237,7 +13250,11 @@ impl NvidiaGpu {
     /// RM never attached, and it is enough for every arm that is
     /// bookkeeping rather than hardware.
     pub(super) fn for_test(device_id: u16, vram_size_mb: u32) -> Self {
-        let bar0 = alloc::boxed::Box::leak(alloc::boxed::Box::new([0u32; 4])).as_ptr() as usize;
+        // Zeros, 16 MiB of them: the GR hang probe reads BAR0 up to
+        // 0x00bb_0090. `vec![0; n]` is `alloc_zeroed`, so the pages that are
+        // never touched cost nothing.
+        let bar0 = alloc::boxed::Box::leak(alloc::vec![0u8; 16 << 20].into_boxed_slice()).as_ptr()
+            as usize;
         let gem_handle_slice = crate::scheme::gem_mmap::alloc_handle_slice();
         // The id table decides the architecture as it does for real; an id
         // it does not know stands in for a Turing board it cannot size.
@@ -14468,7 +14485,7 @@ mod nouveau_bookkeeping_tests {
 
     // ----- With the fake RM: the arms a GL client reaches once attached -----
 
-    use super::rm_host_shims::{fake_fbmem_offset, fake_sysmem_pa, reset_fake_rm, FAKE_RM};
+    use super::rm_host_shims::{fake_fbmem_offset, reset_fake_rm, FAKE_RM};
 
     /// The compositor's pid: it owns ctx 0, so every other pid is a GL
     /// client and gets a context of its own.
@@ -14668,7 +14685,7 @@ mod nouveau_bookkeeping_tests {
         );
         assert_eq!(
             crate::scheme::gem_mmap::lookup(gart.handle),
-            Some((fake_sysmem_pa(h_gart), 65536)),
+            Some((FAKE_RM.lock().pa_of(h_gart).unwrap(), 65536)),
             "registered for mmap and PRIME at the RM's host PA"
         );
         assert!(crate::scheme::gem_mmap::holds(gart.handle, A));
@@ -15176,6 +15193,513 @@ mod nouveau_bookkeeping_tests {
         }
         assert_eq!(ctx_of(&gpu, B), None, "forgotten locally either way");
     }
+
+    // ----- EXEC through the fake: the RM per-submit path -----
+    //
+    // `exec_fast_prepare` stays refused in this binary, so every EXEC goes
+    // the way it does on a context whose direct-submit setup failed: one
+    // RM call per push, the last one carrying the fence the syncobjs of
+    // `sig` wait for. The fake's fence lands before the call returns
+    // unless told to stall.
+
+    use crate::scheme::syncobj;
+
+    /// Where the client's pushbuffer object is bound.
+    const PUSH_VA: u64 = 0x7f_0000_0000;
+
+    fn sync(handle: u32) -> nv::DrmNouveauSync {
+        nv::DrmNouveauSync {
+            flags: 0,
+            handle,
+            timeline_value: 0,
+        }
+    }
+
+    fn sync_tl(handle: u32, point: u64) -> nv::DrmNouveauSync {
+        nv::DrmNouveauSync {
+            flags: nv::SYNC_TIMELINE_SYNCOBJ,
+            handle,
+            timeline_value: point,
+        }
+    }
+
+    fn push(va: u64, va_len: u32) -> nv::DrmNouveauExecPush {
+        nv::DrmNouveauExecPush {
+            va,
+            va_len,
+            flags: 0,
+        }
+    }
+
+    fn ptr_of<T>(items: &[T]) -> u64 {
+        if items.is_empty() {
+            0
+        } else {
+            items.as_ptr() as u64
+        }
+    }
+
+    fn exec(
+        gpu: &NvidiaGpu,
+        pid: u64,
+        channel: u32,
+        pushes: &[nv::DrmNouveauExecPush],
+        waits: &[nv::DrmNouveauSync],
+        sigs: &[nv::DrmNouveauSync],
+    ) -> Result<usize, i32> {
+        let mut r = nv::DrmNouveauExec {
+            channel,
+            push_count: pushes.len() as u32,
+            wait_count: waits.len() as u32,
+            sig_count: sigs.len() as u32,
+            wait_ptr: ptr_of(waits),
+            sig_ptr: ptr_of(sigs),
+            push_ptr: ptr_of(pushes),
+        };
+        exec_raw(gpu, pid, &mut r)
+    }
+
+    fn exec_raw(gpu: &NvidiaGpu, pid: u64, r: &mut nv::DrmNouveauExec) -> Result<usize, i32> {
+        call(gpu, wr::<nv::DrmNouveauExec>(nv::NR_EXEC), r, pid)
+    }
+
+    /// A client with its own context (channel 0 of this GPU when called
+    /// first) and a 64 KiB GART object bound at `PUSH_VA`.
+    fn client_with_pushbuf(gpu: &NvidiaGpu, pid: u64) -> u32 {
+        let channel = channel_alloc(gpu, pid).unwrap().channel;
+        let h = gem_new_rm(gpu, 65536, nv::NOUVEAU_GEM_DOMAIN_GART, pid)
+            .unwrap()
+            .handle;
+        assert_eq!(vm_bind_ops(gpu, pid, &mut [map(h, PUSH_VA, 65536)]), Ok(0));
+        channel as u32
+    }
+
+    fn rm_calls_since(before: usize) -> Vec<&'static str> {
+        FAKE_RM.lock().calls[before..].to_vec()
+    }
+
+    #[test]
+    fn exec_needs_the_callers_own_rm_channel_and_a_well_formed_request() {
+        let _g = LOCK.lock();
+        let _live = LiveBytes::hold();
+        let gpu = gpu_rm();
+        let p = [push(PUSH_VA, 16)];
+        // No RM-backed channel on this GPU at all.
+        assert_eq!(exec(&gpu, A, 0, &p, &[], &[]), Err(nv::ENODEV));
+        // A discovery channel is not a GPFIFO.
+        FAKE_RM.lock().fail_ctx_alloc = true;
+        let disc = channel_alloc(&gpu, STRANGER).unwrap().channel as u32;
+        FAKE_RM.lock().fail_ctx_alloc = false;
+        assert_eq!(exec(&gpu, STRANGER, disc, &p, &[], &[]), Err(nv::ENODEV));
+        let ch = client_with_pushbuf(&gpu, A);
+        let before = FAKE_RM.lock().calls.len();
+        assert_eq!(
+            exec(&gpu, STRANGER, disc, &p, &[], &[]),
+            Err(nv::ENODEV),
+            "still discovery-only, whoever else has a real one"
+        );
+        assert_eq!(
+            exec(&gpu, B, ch, &p, &[], &[]),
+            Err(nv::ENODEV),
+            "B owns no RM channel"
+        );
+        channel_alloc(&gpu, B).unwrap();
+        assert_eq!(
+            exec(&gpu, B, ch, &p, &[], &[]),
+            Err(nv::EINVAL),
+            "B has one, but this channel id is A's"
+        );
+        assert_eq!(exec(&gpu, A, ch + 7, &p, &[], &[]), Err(nv::EINVAL));
+        // A channel opened before the RM attached is discovery-only for
+        // good, even once its owner has a real one: the client must free it
+        // and CHANNEL_ALLOC again (the driver's own log says so).
+        *gpu.rm_device_instance.lock() = None;
+        let old = channel_alloc(&gpu, B).unwrap().channel as u32;
+        *gpu.rm_device_instance.lock() = Some(0);
+        assert_eq!(exec(&gpu, B, old, &p, &[], &[]), Err(nv::ENODEV));
+        assert_eq!(channel_free(&gpu, old as i32, B), Ok(0));
+        // The shape of the request, before any push is looked at.
+        let too_many: Vec<_> = (0..65).map(|_| push(PUSH_VA, 16)).collect();
+        assert_eq!(
+            exec(&gpu, A, ch, &too_many, &[], &[]),
+            Err(nv::EOPNOTSUPP),
+            "65 pushes"
+        );
+        let mut r = nv::DrmNouveauExec {
+            channel: ch,
+            push_count: 1,
+            wait_count: 0,
+            sig_count: 0,
+            wait_ptr: 0,
+            sig_ptr: 0,
+            push_ptr: 0,
+        };
+        assert_eq!(
+            exec_raw(&gpu, A, &mut r),
+            Err(nv::EFAULT),
+            "null pushes: a user range check, like any null array"
+        );
+        r.push_ptr = p.as_ptr() as u64;
+        r.wait_count = 1;
+        assert_eq!(exec_raw(&gpu, A, &mut r), Err(nv::EOPNOTSUPP), "null waits");
+        // Sixty-five real, satisfied syncs: a cap that let them through
+        // would submit, not crash.
+        let ready = syncobj::create(true);
+        let many_syncs: Vec<_> = (0..65).map(|_| sync(ready)).collect();
+        r.wait_count = 65;
+        r.wait_ptr = many_syncs.as_ptr() as u64;
+        assert_eq!(exec_raw(&gpu, A, &mut r), Err(nv::EOPNOTSUPP), "65 waits");
+        r.wait_count = 0;
+        r.wait_ptr = 0;
+        r.sig_count = 1;
+        assert_eq!(exec_raw(&gpu, A, &mut r), Err(nv::EOPNOTSUPP), "null sigs");
+        r.sig_count = 65;
+        r.sig_ptr = many_syncs.as_ptr() as u64;
+        assert_eq!(exec_raw(&gpu, A, &mut r), Err(nv::EOPNOTSUPP), "65 sigs");
+        assert!(syncobj::destroy(ready));
+        r.sig_count = 0;
+        r.push_ptr = 0xffff_ffff_ffff_0000;
+        assert_eq!(exec_raw(&gpu, A, &mut r), Err(nv::EFAULT), "kernel address");
+        // Pushes are dword streams.
+        assert_eq!(
+            exec(&gpu, A, ch, &[push(PUSH_VA, 0)], &[], &[]),
+            Err(nv::EINVAL)
+        );
+        assert_eq!(
+            exec(
+                &gpu,
+                A,
+                ch,
+                &[push(PUSH_VA, 16), push(PUSH_VA + 16, 6)],
+                &[],
+                &[]
+            ),
+            Err(nv::EINVAL),
+            "checked for every push before any is submitted"
+        );
+        assert_eq!(
+            rm_calls_since(before),
+            ["ctx_alloc", "ctx_prime"],
+            "none of that reached the ring (B's context build did)"
+        );
+        gpu.nouveau_release_process(A);
+        gpu.nouveau_release_process(B);
+        gpu.nouveau_release_process(STRANGER);
+    }
+
+    #[test]
+    fn exec_submits_every_push_in_order_and_signals_the_syncobjs_after_the_fence_lands() {
+        let _g = LOCK.lock();
+        let _live = LiveBytes::hold();
+        let gpu = gpu_rm();
+        let ch = client_with_pushbuf(&gpu, A);
+        let legacy = nv::EXEC_LEGACY_SUBMITS.load(Ordering::Relaxed);
+        let before = FAKE_RM.lock().calls.len();
+        // No signal: every push is a plain submit, nothing to wait for.
+        assert_eq!(
+            exec(
+                &gpu,
+                A,
+                ch,
+                &[push(PUSH_VA, 16), push(PUSH_VA + 0x100, 32)],
+                &[],
+                &[]
+            ),
+            Ok(0)
+        );
+        assert_eq!(
+            rm_calls_since(before),
+            ["exec_submit", "exec_submit"],
+            "one RM entry per push (the direct-submit setup is refused here)"
+        );
+        assert_eq!(
+            FAKE_RM.lock().submits,
+            [(1, PUSH_VA, 16, None), (1, PUSH_VA + 0x100, 32, None)],
+            "on the caller's own context, in order"
+        );
+        assert_eq!(nv::EXEC_LEGACY_SUBMITS.load(Ordering::Relaxed), legacy + 1);
+        // With signals: the LAST push carries the fence; the syncobjs are
+        // signaled only once it landed, a binary one to 1 and a timeline
+        // one to the point asked for.
+        let bin = syncobj::create(false);
+        let tl = syncobj::create(false);
+        let before = FAKE_RM.lock().calls.len();
+        assert_eq!(
+            exec(
+                &gpu,
+                A,
+                ch,
+                &[
+                    push(PUSH_VA, 16),
+                    push(PUSH_VA + 0x100, 32),
+                    push(PUSH_VA + 0x200, 8)
+                ],
+                &[],
+                &[sync(bin), sync_tl(tl, 5)]
+            ),
+            Ok(0)
+        );
+        assert_eq!(
+            rm_calls_since(before),
+            ["exec_submit", "exec_submit", "exec_submit_signaled"]
+        );
+        {
+            let f = FAKE_RM.lock();
+            let last = f.submits.last().copied().unwrap();
+            assert_eq!((last.0, last.1, last.2), (1, PUSH_VA + 0x200, 8));
+            assert!(
+                last.3.is_some_and(|p| p & 0x8000_0000 != 0),
+                "a fresh fence payload"
+            );
+            assert!(
+                f.submits[2..4].iter().all(|s| s.3.is_none()),
+                "the earlier pushes carry none"
+            );
+        }
+        assert_eq!(syncobj::query(bin), Some(1));
+        assert_eq!(syncobj::query(tl), Some(5));
+        // A signal on a handle nobody has: the work ran, the ioctl says so.
+        let before = FAKE_RM.lock().calls.len();
+        assert_eq!(
+            exec(&gpu, A, ch, &[push(PUSH_VA, 16)], &[], &[sync(0xdead_0000)]),
+            Err(nv::ENOENT)
+        );
+        assert_eq!(rm_calls_since(before), ["exec_submit_signaled"]);
+        // Two channels of one process share the context and the ring.
+        let ch2 = channel_alloc(&gpu, A).unwrap().channel as u32;
+        assert_ne!(ch2, ch);
+        assert_eq!(exec(&gpu, A, ch2, &[push(PUSH_VA, 16)], &[], &[]), Ok(0));
+        assert_eq!(FAKE_RM.lock().submits.last().unwrap().0, 1);
+        assert!(syncobj::destroy(bin));
+        assert!(syncobj::destroy(tl));
+        gpu.nouveau_release_process(A);
+    }
+
+    #[test]
+    fn exec_waits_on_the_cpu_before_submitting_and_never_submits_after_a_wait_fails() {
+        let _g = LOCK.lock();
+        let _live = LiveBytes::hold();
+        let gpu = gpu_rm();
+        let ch = client_with_pushbuf(&gpu, A);
+        let done = syncobj::create(true);
+        let tl = syncobj::create(false);
+        assert!(syncobj::timeline_signal(tl, 3));
+        let out = syncobj::create(false);
+        let before = FAKE_RM.lock().calls.len();
+        assert_eq!(
+            exec(
+                &gpu,
+                A,
+                ch,
+                &[push(PUSH_VA, 16)],
+                &[sync(done), sync_tl(tl, 3)],
+                &[sync(out)]
+            ),
+            Ok(0),
+            "both waits already satisfied"
+        );
+        assert_eq!(rm_calls_since(before), ["exec_submit_signaled"]);
+        assert_eq!(syncobj::query(out), Some(1));
+        // An unknown wait handle: ENOENT, and the ring never heard of it.
+        let before = FAKE_RM.lock().calls.len();
+        assert_eq!(
+            exec(
+                &gpu,
+                A,
+                ch,
+                &[push(PUSH_VA, 16)],
+                &[sync(0xdead_0001)],
+                &[sync(out)]
+            ),
+            Err(nv::ENOENT)
+        );
+        assert_eq!(rm_calls_since(before), [] as [&str; 0]);
+        // A wait that never comes: the 10 s deadline (the clock advances
+        // 1 ms per read here) ends in EIO, the pushes are NOT submitted and
+        // the sig list is NOT signaled -- NVK sees device-lost, not a
+        // frame that was never drawn.
+        crate::nvme::nvme_queue::test_clock::set_auto_advance(1000);
+        assert_eq!(
+            exec(
+                &gpu,
+                A,
+                ch,
+                &[push(PUSH_VA, 16)],
+                &[sync_tl(tl, 4)],
+                &[sync_tl(out, 7)]
+            ),
+            Err(nv::EIO),
+            "the timeline is at 3: point 4 is a wait, not a pass"
+        );
+        assert_eq!(rm_calls_since(before), [] as [&str; 0]);
+        let never = syncobj::create(false);
+        let waited = nv::EXEC_WAIT_US.load(Ordering::Relaxed);
+        assert_eq!(
+            exec(
+                &gpu,
+                A,
+                ch,
+                &[push(PUSH_VA, 16)],
+                &[sync_tl(tl, 4), sync(never)],
+                &[sync_tl(out, 7)]
+            ),
+            Err(nv::EIO)
+        );
+        crate::nvme::nvme_queue::test_clock::set_auto_advance(0);
+        assert_eq!(rm_calls_since(before), [] as [&str; 0]);
+        assert_eq!(syncobj::query(out), Some(1), "not signaled");
+        assert!(
+            nv::EXEC_WAIT_US.load(Ordering::Relaxed) - waited >= 10_000_000,
+            "the wait is accounted"
+        );
+        for h in [done, tl, out, never] {
+            assert!(syncobj::destroy(h));
+        }
+        gpu.nouveau_release_process(A);
+    }
+
+    #[test]
+    fn exec_with_no_pushes_is_the_health_probe_that_waits_and_signals_without_the_ring() {
+        let _g = LOCK.lock();
+        let _live = LiveBytes::hold();
+        let gpu = gpu_rm();
+        let ch = client_with_pushbuf(&gpu, A);
+        let a = syncobj::create(true);
+        let b = syncobj::create(false);
+        let out = syncobj::create(false);
+        let before = FAKE_RM.lock().calls.len();
+        assert_eq!(
+            exec(&gpu, A, ch, &[], &[sync(a)], &[sync(out), sync_tl(b, 9)]),
+            Ok(0)
+        );
+        assert_eq!(rm_calls_since(before), [] as [&str; 0], "no RM call at all");
+        assert_eq!(syncobj::query(out), Some(1));
+        assert_eq!(syncobj::query(b), Some(9));
+        assert_eq!(
+            exec(&gpu, A, ch, &[], &[sync(0xdead_0002)], &[sync(out)]),
+            Err(nv::ENOENT)
+        );
+        assert_eq!(
+            exec(&gpu, A, ch, &[], &[], &[sync(0xdead_0003)]),
+            Err(nv::ENOENT)
+        );
+        // Still a health probe: a wedged context answers ENODEV.
+        nv::ctx_set_wedged(1);
+        assert_eq!(exec(&gpu, A, ch, &[], &[], &[sync(out)]), Err(nv::ENODEV));
+        nv::ctx_clear_wedged(1);
+        assert_eq!(exec(&gpu, A, ch, &[], &[], &[sync_tl(out, 2)]), Ok(0));
+        assert_eq!(syncobj::query(out), Some(2));
+        for h in [a, b, out] {
+            assert!(syncobj::destroy(h));
+        }
+        gpu.nouveau_release_process(A);
+    }
+
+    #[test]
+    fn exec_failures_of_the_ring_are_eio_and_only_a_lost_fence_wedges_the_context_until_exit() {
+        let _g = LOCK.lock();
+        let _live = LiveBytes::hold();
+        let gpu = gpu_rm();
+        let ch = client_with_pushbuf(&gpu, A);
+        let out = syncobj::create(false);
+        // A push outside the caller's bindings: the RM's lookup refuses it
+        // (on hardware it would MMU-fault the channel).
+        assert_eq!(
+            exec(&gpu, A, ch, &[push(PUSH_VA + 0x10000, 16)], &[], &[]),
+            Err(nv::EIO)
+        );
+        assert_eq!(
+            exec(&gpu, A, ch, &[push(PUSH_VA + 0xfff8, 16)], &[], &[]),
+            Err(nv::EIO),
+            "crossing the end of the binding"
+        );
+        assert_eq!(
+            exec(
+                &gpu,
+                A,
+                ch,
+                &[
+                    push(PUSH_VA, 16),
+                    push(PUSH_VA + 0x10000, 16),
+                    push(PUSH_VA, 16)
+                ],
+                &[],
+                &[]
+            ),
+            Err(nv::EIO)
+        );
+        assert_eq!(
+            FAKE_RM.lock().submits.len(),
+            4,
+            "stopped at the refused push; the third never went"
+        );
+        assert_eq!(
+            exec(
+                &gpu,
+                A,
+                ch,
+                &[
+                    push(PUSH_VA, 16),
+                    push(PUSH_VA + 0x10000, 16),
+                    push(PUSH_VA, 16)
+                ],
+                &[],
+                &[sync(out)]
+            ),
+            Err(nv::EIO),
+            "the same with a fence on the last push"
+        );
+        assert_eq!(FAKE_RM.lock().submits.len(), 6);
+        assert_eq!(syncobj::query(out), Some(0));
+        // The ring is full: EIO too, and the fence was never asked for.
+        FAKE_RM.lock().ring_full = true;
+        assert_eq!(
+            exec(&gpu, A, ch, &[push(PUSH_VA, 16)], &[], &[sync(out)]),
+            Err(nv::EIO)
+        );
+        FAKE_RM.lock().ring_full = false;
+        assert_eq!(syncobj::query(out), Some(0));
+        assert!(!nv::ctx_is_wedged(1), "a refused submit is not a hang");
+        assert_eq!(
+            exec(&gpu, A, ch, &[push(PUSH_VA, 16)], &[], &[sync(out)]),
+            Ok(0),
+            "and the next one is fine"
+        );
+        // The push went in but its fence never lands: after the 1 s poll
+        // (1 ms per clock read) the submit is EIO and the context is
+        // latched WEDGED, so the client fast-fails from then on instead of
+        // hanging the compositor's ring behind it.
+        FAKE_RM.lock().fence_stalls = true;
+        crate::nvme::nvme_queue::test_clock::set_auto_advance(1000);
+        assert_eq!(
+            exec(&gpu, A, ch, &[push(PUSH_VA, 16)], &[], &[sync_tl(out, 2)]),
+            Err(nv::EIO)
+        );
+        crate::nvme::nvme_queue::test_clock::set_auto_advance(0);
+        FAKE_RM.lock().fence_stalls = false;
+        assert_eq!(syncobj::query(out), Some(1), "not signaled");
+        assert!(nv::ctx_is_wedged(1));
+        let before = FAKE_RM.lock().calls.len();
+        assert_eq!(
+            exec(&gpu, A, ch, &[push(PUSH_VA, 16)], &[], &[]),
+            Err(nv::EIO),
+            "wedged: nothing more reaches the ring"
+        );
+        assert_eq!(exec(&gpu, A, ch, &[], &[], &[]), Err(nv::ENODEV));
+        assert_eq!(rm_calls_since(before), [] as [&str; 0]);
+        // B is unaffected: its own context.
+        client_with_pushbuf(&gpu, B);
+        assert_eq!(exec(&gpu, B, 1, &[push(PUSH_VA, 16)], &[], &[]), Ok(0));
+        // A exits and comes back: the slot is clean again.
+        gpu.nouveau_release_process(A);
+        assert!(!nv::ctx_is_wedged(1));
+        let ch = client_with_pushbuf(&gpu, A);
+        assert_eq!(exec(&gpu, A, ch, &[push(PUSH_VA, 16)], &[], &[]), Ok(0));
+        assert!(syncobj::destroy(out));
+        gpu.nouveau_release_process(A);
+        gpu.nouveau_release_process(B);
+        assert_eq!(FAKE_RM.lock().bad, 0);
+    }
 }
 
 /// The RM entry points the host test binary has no C code for: every
@@ -15273,28 +15797,6 @@ mod rm_host_shims {
     }
     #[no_mangle]
     extern "C" fn eclipse_rm_exec_fast_release(_a0: u32, _a1: u32) -> u32 {
-        NV_ERR_NOT_SUPPORTED
-    }
-    #[no_mangle]
-    extern "C" fn eclipse_rm_exec_submit(
-        _a0: u32,
-        _a1: u32,
-        _a2: u64,
-        _a3: u32,
-        _a4: *mut u8,
-    ) -> u32 {
-        NV_ERR_NOT_SUPPORTED
-    }
-    #[no_mangle]
-    extern "C" fn eclipse_rm_exec_submit_signaled(
-        _a0: u32,
-        _a1: u32,
-        _a2: u64,
-        _a3: u32,
-        _a4: u32,
-        _a5: u32,
-        _a6: *mut u8,
-    ) -> u32 {
         NV_ERR_NOT_SUPPORTED
     }
     #[no_mangle]
@@ -15435,9 +15937,18 @@ mod rm_host_shims {
     // compositor's channel keeps answering ENODEV, and every test client is
     // a GL client with a context of its own.
     use alloc::vec::Vec;
-    use nvidia_rm_sys::rm_init::{CtxAlloc, GemAlloc, GemMapCpu, VmBind, ADDR_SYSMEM};
+    use core::sync::atomic::{AtomicU32, Ordering};
+    use nvidia_rm_sys::rm_init::{
+        CtxAlloc, ExecSignal, ExecSubmit, GemAlloc, GemMapCpu, VmBind, ADDR_SYSMEM,
+    };
 
     const NV_OK: u32 = 0;
+    const NV_ERR_BUSY_RETRY: u32 = nvidia_rm_sys::types::NV_ERR_BUSY_RETRY;
+
+    /// The channel's fence semaphore. The driver polls it through
+    /// `phys_to_virt(fence_sem_phys)`, which is the identity in this binary,
+    /// so its "physical" address is simply its address.
+    static FENCE_SEM: AtomicU32 = AtomicU32::new(0);
     /// `NV_ERR_OBJECT_NOT_FOUND`.
     const NV_ERR_OBJECT_NOT_FOUND: u32 = 0x57;
     /// What the RM's eheap answers to a fixed-address allocation over a
@@ -15451,6 +15962,12 @@ mod rm_host_shims {
         pub primed: Vec<u32>,
         /// `(h_memory, size, sysmem)`.
         pub gems: Vec<(u32, u64, bool)>,
+        /// The host memory behind each sysmem object: `(h_memory, address)`.
+        /// Real, because `phys_to_virt` is the identity here and the driver
+        /// reads the first pushbuffer through it.
+        bufs: Vec<(u32, usize)>,
+        /// Every submit, in order: `(ctx, push_va, push_len, fence payload)`.
+        pub submits: Vec<(u32, u64, u32, Option<u32>)>,
         /// `(h_virt, ctx, h_memory, va, size, bo_offset, pte_kind)`.
         pub maps: Vec<(u32, u32, u32, u64, u64, u64, u32)>,
         /// `(h_object, ctx, class)`.
@@ -15479,6 +15996,10 @@ mod rm_host_shims {
         pub map_cpu_elsewhere: bool,
         pub refuse_map: bool,
         pub refuse_class: bool,
+        /// The GPFIFO has no room: `submit_status = NV_ERR_BUSY_RETRY`.
+        pub ring_full: bool,
+        /// The submit goes through but the fence never lands.
+        pub fence_stalls: bool,
     }
 
     const EMPTY_RM: FakeRm = FakeRm {
@@ -15486,6 +16007,8 @@ mod rm_host_shims {
         ctxs: Vec::new(),
         primed: Vec::new(),
         gems: Vec::new(),
+        bufs: Vec::new(),
+        submits: Vec::new(),
         maps: Vec::new(),
         classes: Vec::new(),
         unmaps: 0,
@@ -15502,6 +16025,8 @@ mod rm_host_shims {
         map_cpu_elsewhere: false,
         refuse_map: false,
         refuse_class: false,
+        ring_full: false,
+        fence_stalls: false,
     };
 
     pub(super) static FAKE_RM: lock::Mutex<FakeRm> = lock::Mutex::new(EMPTY_RM);
@@ -15525,6 +16050,39 @@ mod rm_host_shims {
             self.maps
                 .iter()
                 .any(|m| m.1 == ctx && m.3 < va.wrapping_add(size) && va < m.3.wrapping_add(m.4))
+        }
+
+        /// The host address of a sysmem object's memory.
+        pub fn pa_of(&self, h_memory: u32) -> Option<u64> {
+            self.bufs
+                .iter()
+                .find(|b| b.0 == h_memory)
+                .map(|b| b.1 as u64)
+        }
+
+        /// Whether `[va, va + len)` lies inside one binding of context
+        /// `ctx`: what the RM's own lookup answers before it rings the
+        /// doorbell.
+        fn push_mapped(&self, ctx: u32, va: u64, len: u32) -> bool {
+            self.maps.iter().any(|m| {
+                m.1 == ctx && va >= m.3 && va.wrapping_add(u64::from(len)) <= m.3.wrapping_add(m.4)
+            })
+        }
+
+        /// One submit through the fake: the RM's lookup of the push VA in
+        /// the context's VAS, then the ring. Returns the four stage statuses
+        /// of `ExecSubmit` the way the C side reports them: a stage that
+        /// was never reached stays at `0xFFFF_FFFF`.
+        fn submit(&mut self, ctx: u32, va: u64, len: u32, payload: Option<u32>) -> [u32; 4] {
+            const UNREACHED: u32 = 0xFFFF_FFFF;
+            self.submits.push((ctx, va, len, payload));
+            if !self.push_mapped(ctx, va, len) {
+                return [NV_ERR_OBJECT_NOT_FOUND, UNREACHED, UNREACHED, UNREACHED];
+            }
+            if self.ring_full {
+                return [0, 0, 0, NV_ERR_BUSY_RETRY];
+            }
+            [0, 0, 0, 0]
         }
 
         pub fn maps_of_ctx(&self, ctx: u32) -> Vec<(u64, u64, u32)> {
@@ -15625,6 +16183,10 @@ mod rm_host_shims {
         }
         let h = f.fresh();
         f.gems.push((h, size, sysmem != 0));
+        if sysmem != 0 {
+            let buf = alloc::boxed::Box::leak(alloc::vec![0u8; size as usize].into_boxed_slice());
+            f.bufs.push((h, buf.as_ptr() as usize));
+        }
         unsafe {
             *out = GemAlloc {
                 alloc_status: 0,
@@ -15649,7 +16211,7 @@ mod rm_host_shims {
             Some((h, size, true)) => GemMapCpu {
                 lookup_status: 0,
                 address_space: ADDR_SYSMEM,
-                phys_addr: fake_sysmem_pa(h),
+                phys_addr: f.pa_of(h).expect("a sysmem object has memory"),
                 size,
             },
             Some((_, _, false)) => GemMapCpu {
@@ -15669,9 +16231,6 @@ mod rm_host_shims {
         NV_OK
     }
     /// The host PA the fake gives a sysmem object.
-    pub(super) fn fake_sysmem_pa(h_memory: u32) -> u64 {
-        0x1_0000_0000 + (u64::from(h_memory) << 16)
-    }
     /// The FBMEM offset the fake gives a vidmem object.
     pub(super) fn fake_fbmem_offset(h_memory: u32) -> u64 {
         u64::from(h_memory) << 20
@@ -15812,5 +16371,69 @@ mod rm_host_shims {
                 NV_ERR_OBJECT_NOT_FOUND
             }
         }
+    }
+    #[no_mangle]
+    extern "C" fn eclipse_rm_exec_submit(
+        _inst: u32,
+        ctx_idx: u32,
+        push_va: u64,
+        push_len: u32,
+        out: *mut ExecSubmit,
+    ) -> u32 {
+        let mut f = FAKE_RM.lock();
+        f.calls.push("exec_submit");
+        let [lookup, map, token, submit] = f.submit(ctx_idx, push_va, push_len, None);
+        unsafe {
+            *out = ExecSubmit {
+                lookup_status: lookup,
+                map_status: map,
+                token_status: token,
+                submit_status: submit,
+                work_token: 0x1000 + ctx_idx,
+                runlist_id: 0,
+                gp_put_after: f.submits.len() as u32,
+            };
+        }
+        NV_OK
+    }
+    #[no_mangle]
+    extern "C" fn eclipse_rm_exec_submit_signaled(
+        _inst: u32,
+        ctx_idx: u32,
+        push_va: u64,
+        push_len: u32,
+        fence_payload: u32,
+        _timeout_ms: u32,
+        out: *mut ExecSignal,
+    ) -> u32 {
+        let mut f = FAKE_RM.lock();
+        f.calls.push("exec_submit_signaled");
+        let [lookup, map, token, submit] =
+            f.submit(ctx_idx, push_va, push_len, Some(fence_payload));
+        let submitted = lookup == 0 && submit == 0;
+        // The GPU "runs" the push before the call returns: the fence lands
+        // unless told to stall. The driver polls it itself (async path).
+        if submitted && !f.fence_stalls {
+            FENCE_SEM.store(fence_payload, Ordering::Release);
+        }
+        unsafe {
+            *out = ExecSignal {
+                lookup_status: lookup,
+                map_status: map,
+                token_status: token,
+                submit_status: submit,
+                fence_submit_status: if submitted { 0 } else { 0xFFFF_FFFF },
+                fence_wait_status: 0xFFFF_FFFF,
+                fence_value: 0,
+                work_token: 0x1000 + ctx_idx,
+                runlist_id: 0,
+                fence_sem_phys: if submitted {
+                    &FENCE_SEM as *const AtomicU32 as u64
+                } else {
+                    0
+                },
+            };
+        }
+        NV_OK
     }
 }

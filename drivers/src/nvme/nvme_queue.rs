@@ -162,10 +162,24 @@ pub mod test_clock {
 
     std::thread_local! {
         static NOW_US: Cell<u64> = const { Cell::new(0) };
+        /// Microseconds the clock moves on every read, for code that polls
+        /// it until a deadline (a fence wait, a syncobj wait): with the
+        /// default 0 such a loop on an unsatisfied condition never ends.
+        static AUTO_ADVANCE_US: Cell<u64> = const { Cell::new(0) };
     }
 
     pub fn now() -> u64 {
-        NOW_US.with(|c| c.get())
+        let step = AUTO_ADVANCE_US.with(|c| c.get());
+        NOW_US.with(|c| {
+            let v = c.get();
+            c.set(v.wrapping_add(step));
+            v
+        })
+    }
+
+    /// Makes every `now()` advance the clock by `us` (0 stops it again).
+    pub fn set_auto_advance(us: u64) {
+        AUTO_ADVANCE_US.with(|c| c.set(us));
     }
 
     pub fn set(us: u64) {
