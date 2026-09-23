@@ -442,7 +442,16 @@ impl UserContext {
             if #[cfg(target_arch = "x86_64")] {
                 self.0.trap_num
             } else if #[cfg(target_arch = "aarch64")] {
-                unimplemented!() // ESR_EL1
+                // `trap_num` is the vector table entry -- source and kind --
+                // not the syndrome, so this is the same read `TrapReason::from`
+                // makes two functions up, for the same reason: the register is
+                // what says *which* fault this was. It was `unimplemented!()`,
+                // and `ExceptionContext::from_user_context` reaches it on every
+                // page fault that becomes an exception report, so the first
+                // unhandled fault in a Zircon process panicked the kernel.
+                use cortex_a::registers::ESR_EL1;
+                use tock_registers::interfaces::Readable;
+                ESR_EL1.get() as usize
             } else if #[cfg(target_arch = "riscv64")] {
                 riscv::register::scause::read().bits()
             } else {
