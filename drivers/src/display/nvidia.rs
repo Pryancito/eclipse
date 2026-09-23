@@ -9580,6 +9580,17 @@ impl NvidiaGpu {
                 None => return Ok(0),
             }
         };
+        // A context latched wedged (a fence of its timed out: the ring is
+        // jammed for good) has nothing that will ever land. nouveau answers
+        // CPU_PREP on a killed channel with 0 -- its fences are signaled with
+        // an error, and `dma_resv_wait_timeout` counts that as signaled --
+        // and the client learns the truth from its next submit or health
+        // probe (ENODEV). Spinning here instead cost the caller the full
+        // timeout per call, on the CPU, and wrote a probe fence into a ring
+        // the GPU stopped reading.
+        if ctx_idx >= 1 && nv::ctx_is_wedged(ctx_idx) {
+            return Ok(0);
+        }
         let queued = match self.nouveau_fast.lock().get(ctx_idx as usize) {
             // Idle when the last thing on the ring is a fence that landed
             // (WFI: the engines were idle when it did): nothing to wait for
@@ -9628,9 +9639,10 @@ impl NvidiaGpu {
                 >= CPU_PREP_TIMEOUT_US
             {
                 crate::klog_warn!(
-                    "[nouveau-uapi] CPU_PREP: ctx{} fence payload {} did not land in 1s -> EBUSY",
+                    "[nouveau-uapi] CPU_PREP: ctx{} fence payload {} did not land in {}s -> EBUSY",
                     ctx_idx,
-                    payload
+                    payload,
+                    CPU_PREP_TIMEOUT_US / 1_000_000
                 );
                 return Err(nv::EBUSY);
             }
@@ -9856,8 +9868,8 @@ impl NvidiaGpu {
             nv::ctx_set_wedged(ctx_idx);
         }
         crate::klog_warn!(
-            "[nouveau-uapi] fence TIMEOUT (direct submit): ctx{} payload={} never landed in 1s (landing zone={}); syncobj handle={} point={} released so its waiter can fail; {}",
-            ctx_idx, payload, current, handle, point,
+            "[nouveau-uapi] fence TIMEOUT (direct submit): ctx{} payload={} never landed in {}s (landing zone={}); syncobj handle={} point={} released so its waiter can fail; {}",
+            ctx_idx, payload, crate::scheme::syncobj::FENCE_TIMEOUT_US / 1_000_000, current, handle, point,
             if ctx_idx >= 1 { "context latched WEDGED (next submit EIO -> device-lost)" } else { "ctx 0 (compositor) is never latched" }
         );
         self.gr_hang_probe(ctx_idx, 0, token, runlist, 1000);
@@ -16576,6 +16588,272 @@ mod nouveau_bookkeeping_tests {
         );
         gpu.nouveau_release_process(A);
         gpu.nouveau_release_process(STRANGER);
+        assert_eq!(FAKE_RM.lock().bad, 0);
+    }
+
+    // ---- The fence-timeout upcall -----------------------------------------
+    //
+    // A fence the GPU never writes is `syncobj`'s to give up on: after
+    // `FENCE_TIMEOUT_US` it advances the point (so the waiter can fail on
+    // its next probe instead of parking forever) and calls the driver back
+    // with `(ctx, landing zone, payload, handle, point)`. The driver's side
+    // of that call, `fast_fence_timeout`, is what these tests drive: the
+    // values come from `pending_hw_fence`, exactly what `syncobj` would pass,
+    // so the hook itself (registered once at boot, shared by every test
+    // binary) stays out of the picture.
+
+    /// The landing zone of context `ctx`, as the CPU (and `syncobj`) sees it.
+    fn landing_zone_va(c: &FastChan) -> usize {
+        c.buf + FAST_SEM_OFF as usize
+    }
+
+    #[test]
+    fn a_fence_that_never_lands_wedges_the_channel_and_the_clients_next_submit_is_device_lost() {
+        let _g = LOCK.lock();
+        let _live = LiveBytes::hold();
+        let gpu = gpu_rm_fast();
+        let ch = client_with_pushbuf(&gpu, A);
+        let ch_b = client_with_pushbuf(&gpu, B);
+        let out = syncobj::create(false);
+        let out_b = syncobj::create(false);
+        assert_eq!(
+            exec(&gpu, A, ch, &[push(PUSH_VA, 16)], &[], &[sync(out)]),
+            Ok(0)
+        );
+        assert_eq!(
+            exec(&gpu, B, ch_b, &[push(PUSH_VA, 16)], &[], &[sync(out_b)]),
+            Ok(0)
+        );
+        let c = chan(1);
+        // What syncobj holds for A's fence names A's channel and its zone.
+        let (fence_va, fence_gpu_va, payload, ctx) =
+            syncobj::pending_hw_fence(out, 1).expect("A's fence is pending on the ring");
+        assert_eq!(ctx, 1);
+        assert_eq!(fence_va, landing_zone_va(&c));
+        assert_eq!(fence_gpu_va, sem_va(&c));
+        assert_eq!(payload, 1);
+        // B's GPU runs; A's never does.
+        assert_eq!(run_gpu(2).len(), 2);
+        assert_eq!(syncobj::poll_pending(), 1);
+        assert_eq!(syncobj::query(out_b), Some(1));
+        test_clock::advance(crate::scheme::syncobj::FENCE_TIMEOUT_US - 1);
+        assert_eq!(
+            syncobj::poll_pending(),
+            1,
+            "one microsecond short of the timeout: still the GPU's"
+        );
+        assert_eq!(syncobj::query(out), Some(0));
+        test_clock::advance(1);
+        assert_eq!(syncobj::poll_pending(), 0, "given up on");
+        assert_eq!(
+            syncobj::query(out),
+            Some(1),
+            "released, so a waiter fails on its next probe instead of parking"
+        );
+        assert!(matches!(
+            syncobj::wait(&[out], None, true, test_clock::now()),
+            syncobj::WaitOutcome::Signaled { .. }
+        ));
+        assert_eq!(landing_zone(&c), 0, "nothing landed");
+        assert!(
+            !nv::ctx_is_wedged(1),
+            "syncobj released the waiter; latching is the driver's, on the upcall"
+        );
+        // The upcall, as syncobj makes it.
+        gpu.fast_fence_timeout(ctx, fence_va, payload, out, 1);
+        assert!(nv::ctx_is_wedged(1));
+        assert!(!nv::ctx_is_wedged(2), "B's channel is B's");
+        assert_eq!(FAKE_RM.lock().bad, 0);
+        // A's next submit: device lost, and nothing more reaches the ring.
+        let (get, put) = userd(&c);
+        assert_eq!(
+            exec(&gpu, A, ch, &[push(PUSH_VA + 0x100, 16)], &[], &[]),
+            Err(nv::EIO)
+        );
+        assert_eq!(userd(&c), (get, put));
+        assert_eq!(
+            exec(&gpu, A, ch, &[], &[], &[]),
+            Err(nv::ENODEV),
+            "the health probe says killed"
+        );
+        // B keeps going.
+        assert_eq!(exec(&gpu, B, ch_b, &[push(PUSH_VA, 16)], &[], &[]), Ok(0));
+        assert_eq!(run_gpu(2).len(), 1);
+        // The GPU catching up later does not unlatch A.
+        assert_eq!(run_gpu(1).len(), 2);
+        assert_eq!(landing_zone(&c), 1);
+        assert_eq!(
+            exec(&gpu, A, ch, &[push(PUSH_VA, 16)], &[], &[]),
+            Err(nv::EIO)
+        );
+        // Exit clears it; A comes back on a fresh channel.
+        gpu.nouveau_release_process(A);
+        assert!(!nv::ctx_is_wedged(1));
+        assert_eq!(FAKE_RM.lock().fast_releases, [1]);
+        let ch = client_with_pushbuf(&gpu, A);
+        assert_eq!(exec(&gpu, A, ch, &[push(PUSH_VA, 16)], &[], &[]), Ok(0));
+        assert_ne!(chan(1).buf, c.buf);
+        for h in [out, out_b] {
+            assert!(syncobj::destroy(h));
+        }
+        gpu.nouveau_release_process(A);
+        gpu.nouveau_release_process(B);
+        assert_eq!(FAKE_RM.lock().bad, 0);
+    }
+
+    #[test]
+    fn a_timeout_for_a_landing_zone_that_is_not_this_channels_does_not_wedge_it() {
+        let _g = LOCK.lock();
+        let _live = LiveBytes::hold();
+        let gpu = gpu_rm_fast();
+        let ch = client_with_pushbuf(&gpu, A);
+        let out = syncobj::create(false);
+        assert_eq!(
+            exec(&gpu, A, ch, &[push(PUSH_VA, 16)], &[], &[sync(out)]),
+            Ok(0)
+        );
+        let c = chan(1);
+        let zone = landing_zone_va(&c);
+        // A zone that is nobody's on this GPU (another GPU's, on a machine
+        // with two: the hook fans out to every GPU).
+        let elsewhere = 0u32;
+        gpu.fast_fence_timeout(1, &elsewhere as *const u32 as usize, 1, out, 1);
+        assert!(!nv::ctx_is_wedged(1));
+        // A's zone named under another index: ctx 0 (the compositor, never
+        // prepared here), one with no slot at all, and B's, not prepared yet.
+        for idx in [0, 2, 40] {
+            gpu.fast_fence_timeout(idx, zone, 1, out, 1);
+            assert!(!nv::ctx_is_wedged(idx), "ctx{}", idx);
+        }
+        assert!(!nv::ctx_is_wedged(1));
+        assert_eq!(
+            exec(&gpu, A, ch, &[push(PUSH_VA, 16)], &[], &[]),
+            Ok(0),
+            "A is untouched"
+        );
+        // A goes away; a late call naming its old zone finds no channel.
+        gpu.nouveau_release_process(A);
+        gpu.fast_fence_timeout(1, zone, 1, out, 1);
+        assert!(!nv::ctx_is_wedged(1));
+        // B inherits the index with a zone of its own; A's old one is not it,
+        // and a latch anything left on the index is not B's either.
+        nv::ctx_set_wedged(1);
+        let ch_b = client_with_pushbuf(&gpu, B);
+        assert_eq!(exec(&gpu, B, ch_b, &[push(PUSH_VA, 16)], &[], &[]), Ok(0));
+        assert_eq!(ctx_of(&gpu, B), Some((1, true)));
+        assert_ne!(landing_zone_va(&chan(1)), zone);
+        gpu.fast_fence_timeout(1, zone, 1, out, 1);
+        assert!(!nv::ctx_is_wedged(1), "A's stale timeout is not B's");
+        assert_eq!(exec(&gpu, B, ch_b, &[push(PUSH_VA, 16)], &[], &[]), Ok(0));
+        // Its own zone is.
+        gpu.fast_fence_timeout(1, landing_zone_va(&chan(1)), 1, out, 1);
+        assert!(nv::ctx_is_wedged(1));
+        assert!(syncobj::destroy(out));
+        gpu.nouveau_release_process(B);
+        assert!(!nv::ctx_is_wedged(1));
+        assert_eq!(FAKE_RM.lock().bad, 0);
+    }
+
+    #[test]
+    fn a_client_that_exits_or_closes_its_syncobj_mid_frame_leaves_nothing_to_time_out() {
+        let _g = LOCK.lock();
+        let _live = LiveBytes::hold();
+        let gpu = gpu_rm_fast();
+        let ch = client_with_pushbuf(&gpu, A);
+        let kept = syncobj::create(false);
+        let closed = syncobj::create(false);
+        assert_eq!(
+            exec(&gpu, A, ch, &[push(PUSH_VA, 16)], &[], &[sync(kept)]),
+            Ok(0)
+        );
+        assert_eq!(
+            exec(&gpu, A, ch, &[push(PUSH_VA, 16)], &[], &[sync(closed)]),
+            Ok(0)
+        );
+        let c = chan(1);
+        assert_eq!(syncobj::poll_pending(), 2);
+        // Closing the handle with its submit in flight takes the fence with
+        // it: there is nothing left to time out ten seconds later, and a
+        // client that drops a fence it stopped caring about (a resized
+        // swapchain) is not a hung one.
+        assert!(syncobj::destroy(closed));
+        assert_eq!(syncobj::poll_pending(), 1);
+        assert_eq!(
+            syncobj::pending_hw_fence(kept, 1),
+            Some((landing_zone_va(&c), sem_va(&c), 1, 1)),
+            "the kept fence is still the GPU's"
+        );
+        // Exit mid-frame: the kept fence is abandoned (signaled, no timeout).
+        gpu.nouveau_release_process(A);
+        assert!(!syncobj::has_pending());
+        assert_eq!(syncobj::query(kept), Some(1));
+        assert!(!nv::ctx_is_wedged(1));
+        test_clock::advance(crate::scheme::syncobj::FENCE_TIMEOUT_US + 1);
+        assert_eq!(syncobj::poll_pending(), 0);
+        assert!(!nv::ctx_is_wedged(1));
+        // B on the same index in the meantime: no ghost from A reaches it.
+        let ch_b = client_with_pushbuf(&gpu, B);
+        assert_eq!(exec(&gpu, B, ch_b, &[push(PUSH_VA, 16)], &[], &[]), Ok(0));
+        assert_eq!(ctx_of(&gpu, B), Some((1, true)));
+        assert_eq!(syncobj::poll_pending(), 0);
+        assert!(!nv::ctx_is_wedged(1));
+        assert!(syncobj::destroy(kept));
+        gpu.nouveau_release_process(B);
+        assert_eq!(FAKE_RM.lock().bad, 0);
+    }
+
+    #[test]
+    fn cpu_prep_on_a_wedged_channel_answers_at_once_and_writes_nothing_to_the_jammed_ring() {
+        let _g = LOCK.lock();
+        let _live = LiveBytes::hold();
+        let gpu = gpu_rm_fast();
+        let ch = client_with_pushbuf(&gpu, A);
+        let h = gem_new_rm(&gpu, 4096, nv::NOUVEAU_GEM_DOMAIN_GART, A)
+            .unwrap()
+            .handle;
+        let out = syncobj::create(false);
+        assert_eq!(
+            exec(&gpu, A, ch, &[push(PUSH_VA, 16)], &[], &[sync(out)]),
+            Ok(0)
+        );
+        let c = chan(1);
+        let (fence_va, _, payload, ctx) = syncobj::pending_hw_fence(out, 1).unwrap();
+        test_clock::advance(crate::scheme::syncobj::FENCE_TIMEOUT_US);
+        assert_eq!(syncobj::poll_pending(), 0);
+        gpu.fast_fence_timeout(ctx, fence_va, payload, out, 1);
+        assert!(nv::ctx_is_wedged(1));
+        assert_eq!(userd(&c), (0, 2));
+        let bell = doorbell(&gpu);
+        // The clock moves 1 ms per read from here on: a prep that waits shows
+        // up as virtual time, and one that waits for a GPU that never comes
+        // ends (EBUSY after 10 s virtual) instead of hanging.
+        test_clock::set_auto_advance(1_000);
+        let t0 = test_clock::now();
+        assert_eq!(
+            cpu_prep(&gpu, h, A),
+            Ok(0),
+            "a killed channel's fences are done: nouveau says 0, the next submit says why"
+        );
+        assert!(
+            test_clock::now() - t0 < 100_000,
+            "answered at once, not after the timeout"
+        );
+        assert_eq!(cpu_prep_nowait(&gpu, h, A), Ok(0));
+        test_clock::set_auto_advance(0);
+        assert_eq!(
+            userd(&c),
+            (0, 2),
+            "no probe fence on a ring the GPU stopped reading"
+        );
+        assert_eq!(doorbell(&gpu), bell);
+        assert!(!syncobj::has_pending());
+        assert_eq!(
+            exec(&gpu, A, ch, &[], &[], &[]),
+            Err(nv::ENODEV),
+            "and the truth comes from the probe"
+        );
+        assert!(syncobj::destroy(out));
+        gpu.nouveau_release_process(A);
         assert_eq!(FAKE_RM.lock().bad, 0);
     }
 }
