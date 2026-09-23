@@ -1802,13 +1802,20 @@ mod ipi_tests {
         let _smp = Smp::with(2);
         let a = std::thread::spawn(|| remote_flush_tlb_on(0, Some(0x1000), None));
         let b = std::thread::spawn(|| remote_flush_tlb_on(1, Some(0x2000), None));
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        // A real deadlock never finishes, so the deadline only decides how
+        // long we wait before calling it one: generous costs nothing, and a
+        // tight one turns a slow runner into a failure. And this thread
+        // sleeps rather than spinning -- `yield_now` in a loop keeps a third
+        // thread runnable while the two that matter are pumping each other,
+        // which on a two-vCPU CI runner already busy with the rest of the
+        // matrix is exactly how a live pair of shootdowns misses its budget.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
         while !(a.is_finished() && b.is_finished()) {
             assert!(
                 std::time::Instant::now() < deadline,
                 "two simultaneous shootdowns deadlocked on each other"
             );
-            std::thread::yield_now();
+            std::thread::sleep(std::time::Duration::from_millis(1));
         }
         a.join().unwrap();
         b.join().unwrap();
