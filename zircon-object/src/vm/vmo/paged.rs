@@ -916,12 +916,17 @@ impl VMObjectTrait for VMObjectPaged {
         let mut range_changes = Vec::new();
         let ret = (|| {
             let mut inner = self.get_inner_mut();
-            if offset + len > inner.size {
+            // Checked, because `zx_vmo_op_range(ZX_VMO_OP_ZERO)` hands both
+            // numbers through from userspace without a bound of its own: a
+            // wrapping sum passed this test in a release build and then drove
+            // `BlockIter` over pages this object does not have.
+            let end = offset.checked_add(len).ok_or(ZxError::OUT_OF_RANGE)?;
+            if end > inner.size {
                 return Err(ZxError::OUT_OF_RANGE);
             }
             let iter = BlockIter {
                 begin: offset,
-                end: offset + len,
+                end,
                 block_size_log2: PAGE_SIZE_LOG2 as u8,
             };
             let mut unwanted = VecDeque::new();
@@ -1363,9 +1368,24 @@ impl VMObjectPagedInner {
         range_changes: &mut Vec<DeferredRangeChange>,
         mut f: impl FnMut(PhysAddr, Range<usize>),
     ) -> ZxResult {
+        // The range has to be inside this object. Without this, `read` and
+        // `write` -- the only two callers -- committed pages past the end:
+        // a `read` at four pages into a one-page VMO answered `Ok(())` after
+        // resolving page 4 through the demand-zero path, and the matching
+        // `write` would have allocated a frame at an index `len()` says does
+        // not exist, where nothing ever frees it. The bound belongs here and
+        // not in the two callers because `zero` below has its own, spelled the
+        // same way. `zx_vmo_read`/`zx_vmo_write` do check their arguments, so
+        // this is the object defending an invariant of its own rather than a
+        // second copy of the syscall's check: `VmMapping::read_memory`
+        // reaches the same method with an offset it derives from a mapping.
+        let end = offset.checked_add(buf_len).ok_or(ZxError::OUT_OF_RANGE)?;
+        if end > self.size {
+            return Err(ZxError::OUT_OF_RANGE);
+        }
         let iter = BlockIter {
             begin: offset,
-            end: offset + buf_len,
+            end,
             block_size_log2: PAGE_SIZE_LOG2 as u8,
         };
         for block in iter {
@@ -1678,18 +1698,16 @@ impl VMObjectPagedInner {
 
     /// Count committed pages of the VMO.
     fn committed_pages_in_range(&self, start_idx: usize, end_idx: usize) -> usize {
-        assert!(
-            start_idx < self.size / PAGE_SIZE || start_idx == 0,
-            "start_idx {:#x}, self.size {:#x}",
-            start_idx,
-            self.size
-        );
-        assert!(
-            end_idx <= self.size / PAGE_SIZE,
-            "end_idx {:#x}, self.size {:#x}",
-            end_idx,
-            self.size
-        );
+        // Clamp to this object rather than assert. A question about pages past
+        // the end has an answer -- nothing is committed there -- and the two
+        // assertions this replaces were a kernel panic on a counting path:
+        // `VmMapping::fill_task_stats`, which is what reading
+        // `/proc/<pid>/status` runs, carries a hand-written clamp and an
+        // early return purely to stay out of them, and `VMObjectSlice`
+        // forwards indices here after shifting them by its own offset.
+        let pages = self.size / PAGE_SIZE;
+        let start_idx = start_idx.min(pages);
+        let end_idx = end_idx.min(pages);
         let mut count = 0;
         for i in start_idx..end_idx {
             if self.frames.contains_key(&i) {
@@ -2443,5 +2461,71 @@ mod tests {
             self.read(page * PAGE_SIZE, &mut buf).unwrap();
             buf[0]
         }
+    }
+
+    /// `read` and `write` had no bound at all: a read four pages into a
+    /// one-page object answered `Ok(())` after resolving page 4 through the
+    /// demand-zero path, and the matching write would have allocated a frame
+    /// at an index `len()` says does not exist, where nothing ever frees it.
+    #[test]
+    fn a_range_outside_the_object_is_refused_by_the_object() {
+        let vmo = VmObject::new_paged(1);
+        let mut buf = [0u8; 8];
+        assert_eq!(vmo.len(), PAGE_SIZE);
+        assert_eq!(vmo.read(PAGE_SIZE - 8, &mut buf), Ok(()));
+
+        assert_eq!(
+            vmo.read(4 * PAGE_SIZE, &mut buf),
+            Err(ZxError::OUT_OF_RANGE)
+        );
+        assert_eq!(
+            vmo.read(PAGE_SIZE - 7, &mut buf),
+            Err(ZxError::OUT_OF_RANGE)
+        );
+        assert_eq!(vmo.write(PAGE_SIZE, &[1u8; 1]), Err(ZxError::OUT_OF_RANGE));
+        assert_eq!(
+            vmo.committed_pages_in_range(0, 1),
+            0,
+            "a refused read must not have committed anything"
+        );
+    }
+
+    /// The three range operations share one shape of bound, and all three of
+    /// them have to survive a sum that wraps -- `zx_vmo_op_range(ZX_VMO_OP_
+    /// ZERO)` passes `offset` and `len` through from userspace untouched.
+    #[test]
+    fn a_range_whose_end_wraps_is_refused_too() {
+        let vmo = VmObject::new_paged(2);
+        let mut buf = [0u8; 8];
+        assert_eq!(
+            vmo.read(usize::MAX - 3, &mut buf),
+            Err(ZxError::OUT_OF_RANGE)
+        );
+        assert_eq!(
+            vmo.write(usize::MAX - 3, &[0u8; 8]),
+            Err(ZxError::OUT_OF_RANGE)
+        );
+        assert_eq!(vmo.zero(usize::MAX - 3, 8), Err(ZxError::OUT_OF_RANGE));
+        assert_eq!(
+            vmo.zero(usize::MAX - PAGE_SIZE + 1, 2 * PAGE_SIZE),
+            Err(ZxError::OUT_OF_RANGE)
+        );
+        // The whole object is still in range.
+        assert_eq!(vmo.zero(0, 2 * PAGE_SIZE), Ok(()));
+    }
+
+    /// Counting pages is a question, not a command: asking about pages the
+    /// object does not have answers zero. It used to assert, and the caller
+    /// that runs on every `/proc/<pid>/status` read carries a hand-written
+    /// clamp and an early return purely to stay out of that assertion.
+    #[test]
+    fn counting_pages_past_the_end_answers_zero_instead_of_panicking() {
+        let vmo = VmObject::new_paged(2);
+        vmo.commit_page(0, MMUFlags::WRITE).unwrap();
+        assert_eq!(vmo.committed_pages_in_range(0, 2), 1);
+        assert_eq!(vmo.committed_pages_in_range(0, 64), 1);
+        assert_eq!(vmo.committed_pages_in_range(2, 64), 0);
+        assert_eq!(vmo.committed_pages_in_range(64, 65), 0);
+        assert_eq!(vmo.committed_pages_in_range(64, 8), 0);
     }
 }
