@@ -286,6 +286,13 @@ struct Deferred {
 }
 
 impl Deferred {
+    /// Fold a second resolve's upcalls into this one, so a function that
+    /// resolves twice under one lock still runs everything once unlocked.
+    fn extend(&mut self, other: Deferred) {
+        self.notify.extend(other.notify);
+        self.timed_out.extend(other.timed_out);
+    }
+
     /// Must be called with the [`TABLE`] lock RELEASED (both upcalls re-enter
     /// this module), and must be called on EVERY path out of the block that
     /// built it: [`resolve_locked`] has already taken those fences out of the
@@ -312,8 +319,16 @@ impl Deferred {
 /// submit fails honestly). Returns the upcalls to make after unlocking.
 fn resolve_locked(table: &mut SyncobjTable) -> Deferred {
     let mut out = Deferred::default();
+    resolve_hw_locked(table, &mut out);
+    resolve_links_locked(table, &mut out);
+    out
+}
+
+/// The hardware half of [`resolve_locked`]: take every landed (or timed-out)
+/// fence out of the table and advance its syncobj.
+fn resolve_hw_locked(table: &mut SyncobjTable, out: &mut Deferred) {
     if table.pending.is_empty() {
-        return out;
+        return;
     }
     let now = now_us();
     let mut i = 0;
@@ -345,7 +360,53 @@ fn resolve_locked(table: &mut SyncobjTable) -> Deferred {
         }
     }
     PENDING_COUNT.store(table.pending.len(), Ordering::Relaxed);
-    out
+}
+
+/// The software half of [`resolve_locked`]: a link whose sources have all
+/// reached their targets is MATERIALISED -- the destination's own counter
+/// takes the point and the link is dropped -- rather than left to be
+/// re-derived from the sources on every read.
+///
+/// A `sync_file` holds the `dma_fence` that was current when it was
+/// exported, and a signaled `dma_fence` never un-signals. A link, by
+/// contrast, names its source BY HANDLE and reads the source's *current*
+/// point, and a binary source is a fence slot the producer's next submit
+/// rewinds to 0 ([`attach_hw_fence`]) and `SYNCOBJ_RESET` clears. Left
+/// live, an importer that had read "signaled" read "unsignaled" again the
+/// moment its source was re-armed for the next frame -- the acquire
+/// semaphore of a swapchain image, whose merged sync_file names the
+/// compositor's release syncobj and the previous present, went back to
+/// waiting for a release that had already happened, one frame behind, and
+/// a frame that waited on itself never came. Materialising at the first
+/// resolve after the sources are reached gives the link the fence's
+/// semantics: a point once reached is kept, whatever the source does next.
+///
+/// Runs to a fixed point so a chain (an import of a transfer of an import)
+/// collapses in one call, and collects the orphans it stops naming.
+fn resolve_links_locked(table: &mut SyncobjTable, out: &mut Deferred) {
+    let mut any = false;
+    let satisfied = |objects: &[Syncobj]| {
+        objects.iter().position(|o| {
+            o.linked.as_ref().is_some_and(|l| {
+                l.deps.iter().all(|&(src, target)| {
+                    effective_point(objects, src, LINK_DEPTH).is_some_and(|p| p >= target)
+                })
+            })
+        })
+    };
+    while let Some(pos) = satisfied(&table.objects) {
+        let obj = &mut table.objects[pos];
+        let link = obj
+            .linked
+            .take()
+            .expect("position() matched a linked object");
+        obj.point = obj.point.max(link.dst_point.max(1));
+        out.notify.push((obj.handle, obj.point));
+        any = true;
+    }
+    if any {
+        collect_orphans(table);
+    }
 }
 
 /// Resolve pending hardware fences now. Returns how many are still pending.
@@ -405,7 +466,17 @@ pub fn attach_hw_fence(
     }
     let deferred = {
         let mut table = TABLE.lock();
+        // Resolve what has already landed BEFORE this signal replaces it: a
+        // binary re-arm discards the slot's previous fence as superseded,
+        // and if that fence had landed with nobody looking (no poll between
+        // the GPU's write and this EXEC) its importers still hold it --
+        // discarding it unresolved took away the only thing that could ever
+        // signal them. Resolving first advances the slot to the landed point,
+        // materialises those links, and only then is the slot rewound.
+        let mut deferred = resolve_locked(&mut table);
         let Some(obj) = table.objects.iter_mut().find(|o| o.handle == handle) else {
+            drop(table);
+            deferred.run();
             return false;
         };
         let dropped_link = obj.linked.take().is_some();
@@ -436,6 +507,8 @@ pub fn attach_hw_fence(
             // binary range any more. Rewinding it would un-signal a genuine
             // timeline, and purging its pending fences would strand a waiter
             // on a point with nothing left to land and signal it.
+            drop(table);
+            deferred.run();
             return true;
         }
         table.pending.push(PendingFence {
@@ -451,7 +524,8 @@ pub fn attach_hw_fence(
         if dropped_link {
             collect_orphans(&mut table);
         }
-        resolve_locked(&mut table)
+        deferred.extend(resolve_locked(&mut table));
+        deferred
     };
     deferred.run();
     // The point is *submitted* even if the GPU has not written the landing
@@ -895,26 +969,37 @@ pub fn merge_fences(fences: &[(u32, u64)]) -> u32 {
 /// `handle` is unknown. Drops any pending hardware fence it carried (the
 /// fence is replaced, as in Linux).
 pub fn reset(handle: u32) -> bool {
-    let mut table = TABLE.lock();
-    let Some(obj) = table.objects.iter_mut().find(|o| o.handle == handle) else {
-        return false;
+    let deferred = {
+        let mut table = TABLE.lock();
+        // As in [`attach_hw_fence`]: a fence that landed unseen is resolved
+        // (and the links that hold it materialised) before the reset throws
+        // it away. The reset empties THIS object; an importer that already
+        // received its fence keeps it.
+        let deferred = resolve_locked(&mut table);
+        let Some(obj) = table.objects.iter_mut().find(|o| o.handle == handle) else {
+            drop(table);
+            deferred.run();
+            return false;
+        };
+        obj.point = 0;
+        let dropped_link = obj.linked.take().is_some();
+        // Every fence, not just the ones inside binary range: `SYNCOBJ_RESET` is
+        // `drm_syncobj_replace_fence(syncobj, NULL)` in Linux, i.e. "this object
+        // carries no fence at all". A timeline fence left in flight across the
+        // reset landed later and drove the counter back up to its point on its
+        // own, so a syncobj Mesa had just reset for reuse re-signaled itself
+        // behind the application's back -- a premature signal, which reads as
+        // corruption nowhere near sync. (This is the opposite case to a binary
+        // *signal*, which supersedes only the slot it replaces and must spare a
+        // timeline fence in flight; a reset supersedes everything.)
+        table.pending.retain(|f| f.handle != handle);
+        PENDING_COUNT.store(table.pending.len(), Ordering::Relaxed);
+        if dropped_link {
+            collect_orphans(&mut table);
+        }
+        deferred
     };
-    obj.point = 0;
-    let dropped_link = obj.linked.take().is_some();
-    // Every fence, not just the ones inside binary range: `SYNCOBJ_RESET` is
-    // `drm_syncobj_replace_fence(syncobj, NULL)` in Linux, i.e. "this object
-    // carries no fence at all". A timeline fence left in flight across the
-    // reset landed later and drove the counter back up to its point on its
-    // own, so a syncobj Mesa had just reset for reuse re-signaled itself
-    // behind the application's back -- a premature signal, which reads as
-    // corruption nowhere near sync. (This is the opposite case to a binary
-    // *signal*, which supersedes only the slot it replaces and must spare a
-    // timeline fence in flight; a reset supersedes everything.)
-    table.pending.retain(|f| f.handle != handle);
-    PENDING_COUNT.store(table.pending.len(), Ordering::Relaxed);
-    if dropped_link {
-        collect_orphans(&mut table);
-    }
+    deferred.run();
     true
 }
 
@@ -2224,5 +2309,211 @@ mod tests {
         assert_eq!(describe(&[], None), "");
         destroy(h);
         destroy(t);
+    }
+
+    // ----- A fence, once signaled, stays signaled -----
+
+    /// A `sync_file` holds the `dma_fence` that was current at export time,
+    /// and a signaled `dma_fence` never un-signals. Here an import is a link
+    /// to its SOURCE, and the source is a binary slot that the next frame's
+    /// submit rewinds to 0 -- so an importer that had read "signaled" read
+    /// "unsignaled" again the moment its source was re-armed.
+    #[test]
+    fn an_importer_stays_signaled_when_its_source_is_rearmed() {
+        let _g = test_lock();
+        arm_hooks();
+        let src = create(false);
+        let mut first = Landing::new();
+        assert!(attach_hw_fence(src, 1, first.va(), 0, 1, 0, true));
+        let dst = create(false);
+        assert!(import_snapshot(dst, src, export_snapshot(src).unwrap()));
+        first.land(1);
+        assert_eq!(
+            query(dst),
+            Some(1),
+            "the fence landed: the importer is signaled"
+        );
+        // Next frame: the producer re-arms its binary syncobj on a new fence.
+        let mut second = Landing::new();
+        assert!(attach_hw_fence(src, 1, second.va(), 0, 2, 0, true));
+        assert_eq!(query(src), Some(0), "the slot is armed on the new fence");
+        assert_eq!(
+            query(dst),
+            Some(1),
+            "but the fence the importer holds has signaled, and stays signaled"
+        );
+        second.land(2);
+        destroy(dst);
+        destroy(src);
+    }
+
+    /// Same source re-arm, with the first fence landed but not yet seen by
+    /// anyone (nobody polled between the GPU's write and the next EXEC): the
+    /// re-arm discarded that fence as "superseded", and with it the only
+    /// thing that could ever signal the importer.
+    #[test]
+    fn a_landed_fence_the_source_replaces_before_anyone_looked_still_signals_the_importer() {
+        let _g = test_lock();
+        arm_hooks();
+        let src = create(false);
+        let mut first = Landing::new();
+        assert!(attach_hw_fence(src, 1, first.va(), 0, 1, 0, true));
+        let dst = create(false);
+        assert!(import_snapshot(dst, src, export_snapshot(src).unwrap()));
+        first.land(1);
+        let mut second = Landing::new();
+        assert!(attach_hw_fence(src, 1, second.va(), 0, 2, 0, true));
+        assert_eq!(query(src), Some(0));
+        assert_eq!(
+            query(dst),
+            Some(1),
+            "the fence it imported landed before the replacement"
+        );
+        second.land(2);
+        destroy(dst);
+        destroy(src);
+    }
+
+    /// Objects still carrying a link (an import or transfer not yet
+    /// materialised into their own counter).
+    #[cfg(test)]
+    fn links_now() -> usize {
+        TABLE
+            .lock()
+            .objects
+            .iter()
+            .filter(|o| o.linked.is_some())
+            .count()
+    }
+
+    /// `SYNCOBJ_RESET` empties the object it names, and nothing else: an
+    /// importer that already received the fence keeps it, whether the
+    /// landing was seen before the reset or not.
+    #[test]
+    fn resetting_a_source_does_not_unsignal_the_fence_it_already_delivered() {
+        let _g = test_lock();
+        arm_hooks();
+        for seen_before_reset in [true, false] {
+            let src = create(false);
+            let mut landing = Landing::new();
+            assert!(attach_hw_fence(src, 1, landing.va(), 0, 1, 0, true));
+            let dst = create(false);
+            assert!(import_snapshot(dst, src, export_snapshot(src).unwrap()));
+            landing.land(1);
+            if seen_before_reset {
+                assert_eq!(query(dst), Some(1));
+            }
+            assert!(reset(src));
+            assert_eq!(query(src), Some(0), "the reset object carries nothing");
+            assert_eq!(
+                query(dst),
+                Some(1),
+                "the importer keeps the fence (landing seen first: {})",
+                seen_before_reset
+            );
+            destroy(dst);
+            destroy(src);
+        }
+    }
+
+    /// The X11 acquire path: the acquire semaphore's sync_file is a MERGE of
+    /// the compositor's release and the previous present, and both sources
+    /// are re-armed every frame. Once merged and signaled it must stay so,
+    /// or the acquire waits for a release that already happened.
+    #[test]
+    fn a_merged_fence_stays_signaled_when_its_sources_are_rearmed() {
+        let _g = test_lock();
+        arm_hooks();
+        let release = create(false);
+        let mut first = Landing::new();
+        assert!(attach_hw_fence(release, 1, first.va(), 0, 1, 0, true));
+        let present = create(false);
+        assert!(timeline_signal(present, 6));
+        let m = merge_fences(&[(release, 1), (present, 6)]);
+        assert_eq!(query(m), Some(0), "the release is still in flight");
+        first.land(1);
+        assert_eq!(query(m), Some(1), "both sources reached");
+        // Next frame: the release slot is re-armed and the present timeline
+        // is reset for reuse.
+        let mut second = Landing::new();
+        assert!(attach_hw_fence(release, 1, second.va(), 0, 2, 0, true));
+        assert!(reset(present));
+        assert_eq!(query(release), Some(0));
+        assert_eq!(query(present), Some(0));
+        assert_eq!(
+            query(m),
+            Some(1),
+            "the merged fence signaled once, and that is for good"
+        );
+        assert!(matches!(
+            wait(&[m], None, true, 0),
+            WaitOutcome::Signaled { .. }
+        ));
+        second.land(2);
+        destroy(m);
+        destroy(present);
+        destroy(release);
+    }
+
+    /// A chain of links (an import of a transfer of a timeline point)
+    /// collapses into plain counters in one resolve once its root is
+    /// reached: no object keeps a link to re-derive, and the destination
+    /// reached the point the transfer asked for, not just 1.
+    #[test]
+    fn a_chain_of_links_collapses_into_counters_once_its_root_is_reached() {
+        let _g = test_lock();
+        arm_hooks();
+        let root = create(false);
+        let mid = create(false);
+        assert!(transfer(mid, 9, root, 3), "deferred: root is at 0");
+        let leaf = create(false);
+        assert!(import_snapshot(leaf, mid, 9));
+        let links = links_now();
+        assert!(links >= 2, "two links recorded, got {}", links);
+        assert!(timeline_signal(root, 3));
+        assert_eq!(links_now(), links - 2, "both links materialised");
+        assert_eq!(query(mid), Some(9), "the transfer's own point, kept");
+        assert_eq!(query(leaf), Some(1));
+        assert!(
+            signals().contains(&(mid, 9)) && signals().contains(&(leaf, 1)),
+            "each materialisation is announced for its eventfd waiters, got {:?}",
+            signals()
+        );
+        // The root can now do anything without touching them.
+        assert!(reset(root));
+        assert_eq!(query(mid), Some(9));
+        assert_eq!(query(leaf), Some(1));
+        destroy(leaf);
+        destroy(mid);
+        destroy(root);
+    }
+
+    /// An orphan (a destroyed source something still links to) is let go as
+    /// soon as the link that named it materialises, not only when that link
+    /// is replaced by a direct signal.
+    #[test]
+    fn a_materialised_link_lets_its_orphaned_source_go() {
+        let _g = test_lock();
+        let src = create(false);
+        let mut landing = Landing::new();
+        assert!(attach_hw_fence(src, 1, landing.va(), 0, 1, 0, true));
+        let dst = create(false);
+        assert!(import_snapshot(dst, src, 1));
+        let objects = object_count();
+        assert!(destroy(src));
+        assert_eq!(
+            object_count(),
+            objects,
+            "kept as an orphan while dst links to it"
+        );
+        landing.land(1);
+        assert_eq!(query(dst), Some(1));
+        assert_eq!(
+            object_count(),
+            objects - 1,
+            "dst holds its point now: nothing names the orphan"
+        );
+        assert_eq!(links_now(), 0);
+        destroy(dst);
     }
 }
