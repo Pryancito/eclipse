@@ -5,7 +5,7 @@ use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::any::Any;
-use core::convert::TryInto;
+use core::convert::{TryFrom, TryInto};
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use btrfs::{Btrfs, Error as BtrfsError, FileKind};
@@ -51,6 +51,35 @@ const IO_CHUNK_BYTES: usize = 128 * 1024;
 const IO_MIN_BYTES: usize = 512;
 
 impl DevAdapter {
+    /// The `usize` start of `[offset, offset + len)`, or `Err` when that is not
+    /// a range this device has. Both directions ask the same question:
+    /// `write_at` used to ask it and go ahead anyway, and `read_at` never asked
+    /// it at all, so an out-of-range transfer reached the driver and only came
+    /// back as a failure — after the whole retry-and-shrink ladder below, which
+    /// also left the transfer cap permanently lowered.
+    fn check_span(&self, offset: u64, len: usize, what: &str) -> btrfs::Result<usize> {
+        // `checked_add`, not `+`: in release a wrapped sum passes every
+        // comparison and hands the chunk loop a `start` somewhere in the middle
+        // of the device, which for `write_at` means writing over live metadata.
+        let start = match offset.checked_add(len as u64) {
+            Some(end) if end <= self.size => usize::try_from(offset).ok(),
+            _ => None,
+        };
+        match start {
+            Some(start) => Ok(start),
+            None => {
+                // btrfs asked for a range outside the device it was told about:
+                // an allocation/geometry bug in the FS layer, not a device
+                // fault. Surface it with the numbers needed to debug.
+                warn!(
+                    "btrfs: {} OUT OF BOUNDS off={:#x} len={} dev_size={:#x}",
+                    what, offset, len, self.size,
+                );
+                Err(BtrfsError::Io)
+            }
+        }
+    }
+
     /// Transfer `len` bytes in chunks via `op`. Each chunk is retried
     /// `IO_RETRIES` times; if it still fails the chunk is halved (down to
     /// `IO_MIN_BYTES`) and retried, so a size-sensitive device failure on a
@@ -67,7 +96,15 @@ impl DevAdapter {
         let mut done = 0usize;
         while done < len {
             let cap = self.max_xfer.load(Ordering::Relaxed).max(IO_MIN_BYTES);
-            let mut piece = (len - done).min(cap);
+            let first_try = (len - done).min(cap);
+            // Only a transfer that was actually as large as the cap can say
+            // anything about the cap. A short tail, or a metadata read, failing
+            // is evidence about that transfer and not about the largest request
+            // the device sustains -- and since the cap only ever ratchets down,
+            // one such failure used to pin the whole mount near `IO_MIN_BYTES`
+            // until it was unmounted.
+            let tests_the_cap = first_try == cap;
+            let mut piece = first_try;
             loop {
                 let mut ok = false;
                 for _ in 0..IO_RETRIES {
@@ -77,16 +114,22 @@ impl DevAdapter {
                     }
                 }
                 if ok {
+                    if tests_the_cap && piece < first_try {
+                        // Remember the size that WORKED, so the rest of this
+                        // (large) file uses it directly instead of re-failing
+                        // the big transfer on every chunk. Recording the sizes
+                        // that failed instead meant a transfer failing at every
+                        // size -- which is not a size problem at all -- left the
+                        // cap at `IO_MIN_BYTES`.
+                        self.max_xfer.fetch_min(piece, Ordering::Relaxed);
+                    }
                     done += piece;
                     break;
                 }
                 if piece > IO_MIN_BYTES {
                     // Re-issuing the same offset/buffer is idempotent; try a
-                    // smaller, more conservative transfer. Remember the smaller
-                    // size so the rest of this (large) file uses it directly
-                    // instead of re-failing the big transfer on every chunk.
+                    // smaller, more conservative transfer.
                     piece = (piece / 2).max(IO_MIN_BYTES);
-                    self.max_xfer.fetch_min(piece, Ordering::Relaxed);
                     warn!(
                         "btrfs: {} transfer shrunk to {} after failure (off={:#x}, +{})",
                         what, piece, offset, done,
@@ -107,32 +150,21 @@ impl DevAdapter {
 impl btrfs::BlockDevice for DevAdapter {
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> btrfs::Result<()> {
         let len = buf.len();
+        let start = self.check_span(offset, len, "read_at")?;
         self.chunked(offset, len, "read_at", |rel, n| {
             matches!(
-                self.inner.read_at(offset as usize + rel, &mut buf[rel..rel + n]),
+                self.inner.read_at(start + rel, &mut buf[rel..rel + n]),
                 Ok(got) if got == n
             )
         })
     }
 
     fn write_at(&self, offset: u64, buf: &[u8]) -> btrfs::Result<()> {
-        let end = offset + buf.len() as u64;
-        if end > self.size {
-            // btrfs asked us to write past the end of the device it was told
-            // about: this is an allocation/geometry bug in the FS layer, not a
-            // device fault. Surface it loudly with the numbers needed to debug.
-            warn!(
-                "btrfs: write_at OUT OF BOUNDS off={:#x} len={} end={:#x} > dev_size={:#x}",
-                offset,
-                buf.len(),
-                end,
-                self.size,
-            );
-        }
         let len = buf.len();
+        let start = self.check_span(offset, len, "write_at")?;
         self.chunked(offset, len, "write_at", |rel, n| {
             matches!(
-                self.inner.write_at(offset as usize + rel, &buf[rel..rel + n]),
+                self.inner.write_at(start + rel, &buf[rel..rel + n]),
                 Ok(got) if got == n
             )
         })
@@ -730,4 +762,390 @@ pub(crate) fn probe_btrfs_superblock(block: &Arc<dyn BlockScheme>) -> bool {
     let total_bytes = u64::from_le_bytes(sb.0[0x70..0x78].try_into().unwrap());
     let device_bytes = block.block_count() as u64 * 512;
     num_devices == 1 && total_bytes > 0 && total_bytes <= device_bytes.saturating_mul(2)
+}
+
+#[cfg(test)]
+mod dev_adapter_tests {
+    //! Host tests for `DevAdapter`, the layer that turns one btrfs transfer
+    //! into the block commands the disk driver actually receives: chunking,
+    //! retry, the shrink-on-failure fallback and the bounds of the device.
+    //! btrfs itself is exonerated by the `btrfs` crate's own suites and the
+    //! driver by its own; this is the glue in between, and on real hardware it
+    //! is the only piece that sees a transient controller error.
+    use super::*;
+    use alloc::vec;
+    use btrfs::BlockDevice as _;
+    use rcore_fs::dev::{DevError, Device, Result as DevResult};
+
+    /// In-memory disk that records every transfer the adapter asks for and can
+    /// be told to fail: `hiccups` many transfers regardless of size (a
+    /// transient controller error), or every transfer at or above `too_big` (a
+    /// controller that rejects large DMA requests).
+    struct FakeDisk {
+        data: Mutex<Vec<u8>>,
+        /// `(offset, len, served)` of every transfer attempted, in order.
+        log: Mutex<Vec<(usize, usize, bool)>>,
+        hiccups: AtomicUsize,
+        too_big: AtomicUsize,
+    }
+
+    impl FakeDisk {
+        fn new(len: usize) -> Arc<Self> {
+            let mut data = vec![0u8; len];
+            // A recognisable pattern, so a transfer landing at the wrong offset
+            // or copied into the wrong part of the buffer shows up as wrong
+            // bytes and not as a coincidence of zeros.
+            for (i, b) in data.iter_mut().enumerate() {
+                *b = (i % 251) as u8;
+            }
+            Arc::new(Self {
+                data: Mutex::new(data),
+                log: Mutex::new(Vec::new()),
+                hiccups: AtomicUsize::new(0),
+                too_big: AtomicUsize::new(usize::MAX),
+            })
+        }
+        /// Fail the next `n` transfers whatever their size.
+        fn hiccup(&self, n: usize) {
+            self.hiccups.store(n, Ordering::Relaxed);
+        }
+        /// Fail every transfer of `n` bytes or more.
+        fn reject_from(&self, n: usize) {
+            self.too_big.store(n, Ordering::Relaxed);
+        }
+        fn heal(&self) {
+            self.hiccups.store(0, Ordering::Relaxed);
+            self.too_big.store(usize::MAX, Ordering::Relaxed);
+        }
+        fn forget(&self) {
+            self.log.lock().clear();
+        }
+        /// `(offset, len)` of every transfer attempted, served or not.
+        fn log(&self) -> Vec<(usize, usize)> {
+            self.log.lock().iter().map(|&(o, n, _)| (o, n)).collect()
+        }
+        /// `(offset, len)` of the transfers the device actually served.
+        fn served(&self) -> Vec<(usize, usize)> {
+            self.log
+                .lock()
+                .iter()
+                .filter(|&&(_, _, ok)| ok)
+                .map(|&(o, n, _)| (o, n))
+                .collect()
+        }
+        /// The size of each transfer attempted, in order.
+        fn sizes(&self) -> Vec<usize> {
+            self.log().into_iter().map(|(_, n)| n).collect()
+        }
+        /// Record the transfer and say whether the device serves it.
+        fn accepts(&self, offset: usize, len: usize) -> bool {
+            let ok = len < self.too_big.load(Ordering::Relaxed)
+                && match self.hiccups.load(Ordering::Relaxed) {
+                    0 => true,
+                    n => {
+                        self.hiccups.store(n - 1, Ordering::Relaxed);
+                        false
+                    }
+                };
+            self.log.lock().push((offset, len, ok));
+            ok
+        }
+    }
+
+    impl Device for FakeDisk {
+        fn read_at(&self, offset: usize, buf: &mut [u8]) -> DevResult<usize> {
+            if !self.accepts(offset, buf.len()) {
+                return Err(DevError);
+            }
+            let d = self.data.lock();
+            let end = offset.checked_add(buf.len()).ok_or(DevError)?;
+            if end > d.len() {
+                return Err(DevError);
+            }
+            buf.copy_from_slice(&d[offset..end]);
+            Ok(buf.len())
+        }
+        fn write_at(&self, offset: usize, buf: &[u8]) -> DevResult<usize> {
+            if !self.accepts(offset, buf.len()) {
+                return Err(DevError);
+            }
+            let mut d = self.data.lock();
+            let end = offset.checked_add(buf.len()).ok_or(DevError)?;
+            if end > d.len() {
+                return Err(DevError);
+            }
+            d[offset..end].copy_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn sync(&self) -> DevResult<()> {
+            Ok(())
+        }
+    }
+
+    /// A 1 MiB disk behind a fresh adapter.
+    fn disk_and_adapter() -> (Arc<FakeDisk>, DevAdapter) {
+        const LEN: usize = 1024 * 1024;
+        let disk = FakeDisk::new(LEN);
+        let adapter = DevAdapter {
+            inner: disk.clone(),
+            size: LEN as u64,
+            max_xfer: AtomicUsize::new(IO_CHUNK_BYTES),
+        };
+        (disk, adapter)
+    }
+
+    /// What a healthy disk holds at `[offset, offset + len)`.
+    fn expected(disk: &FakeDisk, offset: usize, len: usize) -> Vec<u8> {
+        disk.data.lock()[offset..offset + len].to_vec()
+    }
+
+    #[test]
+    /// A read longer than the cap is split into cap-sized commands that tile
+    /// the range exactly, and what lands in the buffer is what is on the disk.
+    fn a_long_read_is_split_into_commands_that_tile_the_range() {
+        let (disk, adapter) = disk_and_adapter();
+        let len = IO_CHUNK_BYTES * 2 + 4096;
+        let mut buf = vec![0u8; len];
+        adapter.read_at(8192, &mut buf).unwrap();
+        assert_eq!(buf, expected(&disk, 8192, len));
+        assert_eq!(
+            disk.sizes(),
+            vec![IO_CHUNK_BYTES, IO_CHUNK_BYTES, 4096],
+            "the last piece is the remainder, not another whole chunk",
+        );
+        // Contiguous, starting where btrfs asked and nowhere else.
+        let mut want = 8192;
+        for (off, n) in disk.log() {
+            assert_eq!(off, want);
+            want += n;
+        }
+        assert_eq!(want, 8192 + len);
+    }
+
+    #[test]
+    /// The same for the write direction, on the disk's own bytes.
+    fn a_long_write_lands_where_it_was_asked_to() {
+        let (disk, adapter) = disk_and_adapter();
+        let len = IO_CHUNK_BYTES + 777;
+        let payload: Vec<u8> = (0..len).map(|i| (i % 97) as u8 ^ 0x5a).collect();
+        adapter.write_at(4096, &payload).unwrap();
+        assert_eq!(expected(&disk, 4096, len), payload);
+        assert_eq!(disk.sizes(), vec![IO_CHUNK_BYTES, 777]);
+        // The byte before and the byte after are untouched.
+        assert_eq!(disk.data.lock()[4095], (4095 % 251) as u8);
+        assert_eq!(disk.data.lock()[4096 + len], ((4096 + len) % 251) as u8,);
+    }
+
+    #[test]
+    /// A transient error is retried at the same offset and length, and the
+    /// caller never sees it.
+    fn a_transient_error_is_retried_in_place() {
+        let (disk, adapter) = disk_and_adapter();
+        disk.hiccup(3);
+        let mut buf = vec![0u8; 4096];
+        adapter.read_at(65536, &mut buf).unwrap();
+        assert_eq!(buf, expected(&disk, 65536, 4096));
+        assert_eq!(
+            disk.log(),
+            vec![(65536, 4096); 4],
+            "three failures then the same transfer once more",
+        );
+    }
+
+    #[test]
+    /// A controller that rejects large requests is discovered once and the
+    /// smaller size is remembered for the rest of the mount.
+    fn a_size_the_controller_refuses_is_learnt_once() {
+        let (disk, adapter) = disk_and_adapter();
+        disk.reject_from(64 * 1024);
+        let len = IO_CHUNK_BYTES * 2;
+        let mut buf = vec![0u8; len];
+        adapter.read_at(0, &mut buf).unwrap();
+        assert_eq!(buf, expected(&disk, 0, len));
+        let sizes = disk.sizes();
+        // 128 KiB refused `IO_RETRIES` times, then 64 KiB the same, then 32 KiB
+        // works.
+        let mut ladder = vec![IO_CHUNK_BYTES; IO_RETRIES];
+        ladder.extend(vec![65536; IO_RETRIES]);
+        ladder.push(32768);
+        assert_eq!(&sizes[..ladder.len()], &ladder[..]);
+        // ... and every command after that is 32 KiB: the big one is not tried
+        // again on the next chunk, which is the whole point of the cap.
+        assert!(
+            sizes[ladder.len()..].iter().all(|&n| n == 32768),
+            "cap not remembered: {:?}",
+            &sizes[ladder.len()..],
+        );
+        assert_eq!(adapter.max_xfer.load(Ordering::Relaxed), 32768);
+    }
+
+    #[test]
+    /// A short transfer failing says nothing about how large a request the
+    /// device sustains, so it must not lower the cap: the cap only ever
+    /// ratchets down, and one transient error on a file's 4 KiB tail used to
+    /// pin every later transfer on the whole mount near `IO_MIN_BYTES`.
+    fn a_short_transfer_failing_does_not_shrink_the_whole_mount() {
+        let (disk, adapter) = disk_and_adapter();
+        // Five failures: enough to exhaust the retries at 4 KiB and force one
+        // shrink, which is exactly the moment the old cap was written.
+        disk.hiccup(IO_RETRIES);
+        let mut tail = vec![0u8; 4096];
+        adapter.read_at(512 * 1024, &mut tail).unwrap();
+        assert_eq!(tail, expected(&disk, 512 * 1024, 4096));
+        assert_eq!(
+            adapter.max_xfer.load(Ordering::Relaxed),
+            IO_CHUNK_BYTES,
+            "a 4 KiB failure is not evidence about a 128 KiB request",
+        );
+
+        disk.forget();
+        let mut big = vec![0u8; IO_CHUNK_BYTES];
+        adapter.read_at(0, &mut big).unwrap();
+        assert_eq!(disk.sizes(), vec![IO_CHUNK_BYTES], "one command, not 256");
+    }
+
+    #[test]
+    /// A transfer that fails at every size down to `IO_MIN_BYTES` is a bad
+    /// range or a dead device, not a size the controller dislikes, so it must
+    /// leave the cap alone too. Otherwise one unreadable spot makes the rest of
+    /// the filesystem run 512 bytes at a time.
+    fn failing_at_every_size_is_not_a_size_problem() {
+        let (disk, adapter) = disk_and_adapter();
+        disk.reject_from(1);
+        let mut buf = vec![0u8; IO_CHUNK_BYTES];
+        assert_eq!(adapter.read_at(0, &mut buf), Err(BtrfsError::Io));
+        assert_eq!(adapter.max_xfer.load(Ordering::Relaxed), IO_CHUNK_BYTES);
+
+        disk.heal();
+        disk.forget();
+        adapter.read_at(0, &mut buf).unwrap();
+        assert_eq!(disk.sizes(), vec![IO_CHUNK_BYTES]);
+    }
+
+    #[test]
+    /// The ladder halves, but it stops at `IO_MIN_BYTES` instead of stepping
+    /// under it: 1000 bytes is the awkward case, because half of it is below
+    /// the floor.
+    fn the_ladder_stops_at_the_smallest_transfer_it_is_allowed() {
+        let (disk, adapter) = disk_and_adapter();
+        disk.reject_from(600);
+        let mut buf = vec![0u8; 1000];
+        adapter.read_at(2048, &mut buf).unwrap();
+        assert_eq!(buf, expected(&disk, 2048, 1000));
+        assert_eq!(
+            disk.log(),
+            vec![
+                (2048, 1000),
+                (2048, 1000),
+                (2048, 1000),
+                (2048, 1000),
+                (2048, 1000),
+                (2048, IO_MIN_BYTES),
+                (2048 + IO_MIN_BYTES, 1000 - IO_MIN_BYTES),
+            ],
+        );
+    }
+
+    #[test]
+    /// However the ladder ends up splitting a range, no command ever leaves it
+    /// and the pieces tile it exactly once.
+    fn no_command_ever_leaves_the_range_it_was_given() {
+        let (disk, adapter) = disk_and_adapter();
+        disk.reject_from(4096);
+        let len = IO_CHUNK_BYTES + 1000;
+        let mut buf = vec![0u8; len];
+        adapter.read_at(1024, &mut buf).unwrap();
+        assert_eq!(buf, expected(&disk, 1024, len));
+        for (off, n) in disk.log() {
+            assert!(off >= 1024 && off + n <= 1024 + len, "{:#x}+{}", off, n);
+        }
+        // The transfers that were served tile the range exactly once, in order.
+        let mut want = 1024;
+        for (off, n) in disk.served() {
+            assert_eq!(off, want, "a gap or an overlap at {:#x}", want);
+            want += n;
+        }
+        assert_eq!(want, 1024 + len);
+    }
+
+    #[test]
+    /// A read past the end of the device is refused before the driver is
+    /// touched. It used to walk the whole retry-and-shrink ladder first --
+    /// forty-five commands that could not possibly succeed -- and lower the cap
+    /// on the way.
+    fn a_read_past_the_end_never_reaches_the_driver() {
+        let (disk, adapter) = disk_and_adapter();
+        let mut buf = vec![0u8; 8192];
+        assert_eq!(
+            adapter.read_at(1024 * 1024 - 4096, &mut buf),
+            Err(BtrfsError::Io)
+        );
+        assert!(disk.log().is_empty(), "{:?}", disk.log());
+        assert_eq!(adapter.max_xfer.load(Ordering::Relaxed), IO_CHUNK_BYTES);
+        // The very last byte is still readable: the bound is the end, not a
+        // guard band in front of it.
+        let mut last = [0u8; 1];
+        adapter.read_at(1024 * 1024 - 1, &mut last).unwrap();
+        assert_eq!(last[0], ((1024 * 1024 - 1) % 251) as u8);
+    }
+
+    #[test]
+    /// A write past the end changes nothing, on either side of the boundary.
+    /// It used to warn and then write the part that fitted.
+    fn a_write_past_the_end_writes_nothing_at_all() {
+        let (disk, adapter) = disk_and_adapter();
+        let before = disk.data.lock().clone();
+        assert_eq!(
+            adapter.write_at(1024 * 1024 - 4, &[0xaa; 8]),
+            Err(BtrfsError::Io)
+        );
+        assert!(disk.log().is_empty());
+        assert_eq!(*disk.data.lock(), before);
+        // A write that ends exactly at the end is fine.
+        adapter.write_at(1024 * 1024 - 8, &[0xaa; 8]).unwrap();
+        assert_eq!(&disk.data.lock()[1024 * 1024 - 8..], &[0xaa; 8]);
+    }
+
+    #[test]
+    /// An offset whose range wraps round is refused rather than folded back
+    /// into the middle of the device. In release the sum does not trap, so the
+    /// unchecked version turned a corrupt on-disk pointer into a write over
+    /// live metadata.
+    fn a_range_that_wraps_does_not_land_back_on_the_disk() {
+        let (disk, adapter) = disk_and_adapter();
+        let before = disk.data.lock().clone();
+        let mut buf = vec![0u8; 8];
+        assert_eq!(adapter.read_at(u64::MAX - 3, &mut buf), Err(BtrfsError::Io));
+        assert_eq!(
+            adapter.write_at(u64::MAX - 3, &[0xaa; 8]),
+            Err(BtrfsError::Io)
+        );
+        assert_eq!(adapter.write_at(u64::MAX, &[0xaa; 1]), Err(BtrfsError::Io));
+        assert!(disk.log().is_empty(), "{:?}", disk.log());
+        assert_eq!(*disk.data.lock(), before);
+    }
+
+    #[test]
+    /// An empty transfer is not an error, and does not become a command.
+    fn an_empty_transfer_asks_the_device_for_nothing() {
+        let (disk, adapter) = disk_and_adapter();
+        adapter.read_at(4096, &mut []).unwrap();
+        adapter.write_at(4096, &[]).unwrap();
+        // Even right at the end, where `offset + 0` is the first byte the
+        // device does not have.
+        adapter.read_at(1024 * 1024, &mut []).unwrap();
+        assert!(disk.log().is_empty());
+        // But one byte past it is still out of bounds.
+        let mut one = [0u8; 1];
+        assert_eq!(adapter.read_at(1024 * 1024, &mut one), Err(BtrfsError::Io));
+    }
+
+    #[test]
+    /// The adapter reports the size it was mounted with, which is what btrfs
+    /// uses to place its superblock mirrors and to grow onto the partition.
+    fn the_adapter_reports_the_size_it_was_given() {
+        let (_disk, adapter) = disk_and_adapter();
+        assert_eq!(adapter.size(), 1024 * 1024);
+        adapter.sync().unwrap();
+    }
 }
