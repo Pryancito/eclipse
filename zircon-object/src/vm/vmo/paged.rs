@@ -514,7 +514,19 @@ impl VMObjectPaged {
     }
 
     /// Create a new VMO backing on contiguous pages.
+    ///
+    /// `align_log2` is an ABSOLUTE log2 alignment, so its floor is
+    /// `PAGE_SIZE_LOG2` and 0 does not mean "no alignment": the frame
+    /// allocator counts in pages, so what it is given is
+    /// `align_log2 - PAGE_SIZE_LOG2`, and anything smaller made that
+    /// subtraction underflow -- a panic in a debug kernel and, in release, a
+    /// colossal alignment handed to `PhysFrame::new_contiguous`. The only
+    /// guard for it lived in `sys_vmo_create_contiguous`, two crates away,
+    /// where the contract is not written down either.
     pub fn new_contiguous(pages: usize, align_log2: usize) -> ZxResult<Arc<Self>> {
+        if align_log2 < PAGE_SIZE_LOG2 {
+            return Err(ZxError::INVALID_ARGS);
+        }
         let vmo = Self::new(pages);
         let mut frames = PhysFrame::new_contiguous(pages, align_log2 - PAGE_SIZE_LOG2);
         if frames.is_empty() {
@@ -2512,6 +2524,25 @@ mod tests {
         );
         // The whole object is still in range.
         assert_eq!(vmo.zero(0, 2 * PAGE_SIZE), Ok(()));
+    }
+
+    /// `align_log2` is an absolute log2, so 0 is not "page alignment": the
+    /// frame allocator is handed `align_log2 - PAGE_SIZE_LOG2`, and anything
+    /// below the page shift made that underflow. `sys_vmo_create_contiguous`
+    /// maps 0 to `PAGE_SIZE_LOG2` and rejects the rest, but it is the only
+    /// caller that knows, and it is two crates away.
+    #[test]
+    fn a_contiguous_vmo_takes_an_absolute_log2_alignment() {
+        assert!(VmObject::new_contiguous(1, PAGE_SIZE_LOG2).is_ok());
+        assert!(VmObject::new_contiguous(1, PAGE_SIZE_LOG2 + 1).is_ok());
+        assert_eq!(
+            VmObject::new_contiguous(1, 0).err(),
+            Some(ZxError::INVALID_ARGS)
+        );
+        assert_eq!(
+            VmObject::new_contiguous(1, PAGE_SIZE_LOG2 - 1).err(),
+            Some(ZxError::INVALID_ARGS)
+        );
     }
 
     /// Counting pages is a question, not a command: asking about pages the
