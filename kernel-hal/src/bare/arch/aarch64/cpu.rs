@@ -49,6 +49,13 @@ pub fn register_logical_id() -> u8 {
         );
         return u8::MAX;
     };
+    // Register the affinity -> logical mapping BEFORE publishing the id in
+    // TPIDR_EL1. TPIDR_EL1 is an ordinary writable system register that reads
+    // whatever reset left in it on a core the kernel has not set up yet, so
+    // `lock` cross-checks it against the ids bring-up actually registered
+    // — exactly as it does with GS on x86_64 — and without this call every
+    // core would look like a lie and resolve through the affinity instead.
+    lock::set_logical_cpu_id(affinity, logical as u8);
     unsafe { core::arch::asm!("msr tpidr_el1, {0}", in(reg) logical as u64) };
     logical as u8
 }

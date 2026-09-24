@@ -427,8 +427,19 @@ impl<'rwlock, T: ?Sized> RwLockReadGuard<'rwlock, T> {
     #[inline]
     pub fn leak(this: Self) -> &'rwlock T {
         pop_off();
-        let Self { data, .. } = this;
-        data
+        // `let Self { data, .. } = this` does NOT consume `this`: `data` is a
+        // shared reference, which is `Copy`, so the pattern copies it out and
+        // leaves the guard standing — to be dropped at the end of this
+        // function. That made `leak` the opposite of what it says: the read
+        // lock was RELEASED, and the `&'rwlock T` handed back outlived it, so
+        // a later `write()` produced an `&mut T` aliasing it. And the
+        // destructor's `pop_off` ran on top of the one above, taking a level
+        // that belongs to whatever this CPU is really holding.
+        let data = this.data as *const T;
+        mem::forget(this);
+        // SAFETY: the read count stays raised for good, so no writer can ever
+        // be handed this data. That is what leaking the guard means.
+        unsafe { &*data }
     }
 }
 
@@ -531,8 +542,15 @@ impl<'rwlock, T: ?Sized> RwLockUpgradableGuard<'rwlock, T> {
 
         let inner = self.inner;
 
-        // Dropping self removes the UPGRADED bit
-        mem::drop(self);
+        // Clear the UPGRADED bit by hand and FORGET the old guard, rather than
+        // dropping it. In upstream `spin` the destructor does nothing else, so
+        // dropping it here is free; in this fork it also calls `pop_off`, and
+        // the read guard handed out below will call `pop_off` again when IT is
+        // dropped. One `push_off`, two `pop_off`s: the lock is still held, but
+        // this CPU has already re-enabled interrupts inside the critical
+        // section — and the second release underflows somebody else's slot.
+        inner.lock.fetch_sub(UPGRADED, Ordering::AcqRel);
+        mem::forget(self);
 
         RwLockReadGuard {
             lock: &inner.lock,
@@ -553,8 +571,20 @@ impl<'rwlock, T: ?Sized> RwLockUpgradableGuard<'rwlock, T> {
     /// ```
     #[inline]
     pub fn leak(this: Self) -> &'rwlock T {
-        let Self { data, .. } = this;
-        data
+        // The lock stays held for the rest of the machine's life; this CPU's
+        // interrupt-disable level must not, since nobody is left to release
+        // it and a CPU with interrupts off forever is deaf to the
+        // TLB-shootdown IPI a peer is spin-waiting on. The read and write
+        // guards' `leak` both do this; this one did not.
+        pop_off();
+        // Same as `RwLockReadGuard::leak`: the pattern copies the reference
+        // out and leaves the guard to be dropped, so this neither leaked the
+        // lock nor kept the level straight.
+        let data = this.data as *const T;
+        mem::forget(this);
+        // SAFETY: the UPGRADED bit stays set for good, so no writer can ever
+        // be handed this data.
+        unsafe { &*data }
     }
 }
 
@@ -590,8 +620,16 @@ impl<'rwlock, T: ?Sized> RwLockWriteGuard<'rwlock, T> {
 
         let inner = self.inner;
 
-        // Dropping self removes the UPGRADED bit
-        mem::drop(self);
+        // Release WRITER (and UPGRADED, which an upgrade attempt may have set
+        // while we held it) by hand and FORGET the old guard — see
+        // `RwLockUpgradableGuard::downgrade` for why dropping it is wrong
+        // here: its destructor calls `pop_off`, and so will the read guard
+        // below, leaving this CPU with interrupts back on inside a critical
+        // section it still holds.
+        inner
+            .lock
+            .fetch_and(!(WRITER | UPGRADED), Ordering::Release);
+        mem::forget(self);
 
         RwLockReadGuard {
             lock: &inner.lock,

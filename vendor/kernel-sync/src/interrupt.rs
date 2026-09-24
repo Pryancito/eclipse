@@ -1,39 +1,42 @@
+//! Per-CPU interrupt-disable bookkeeping, and the answer to "which CPU is
+//! this?" that picks the slot it lives in.
+//!
+//! The architecture-specific part is small and is confined to the `interrupts`
+//! module below: read this CPU's *hardware* id, read the logical id this CPU
+//! *published* about itself (if the architecture has such a thing), and turn
+//! interrupts on and off. Everything built on top of that — the id map, the
+//! cross-check, the nesting counter — is [`crate::cpuid`], which compiles and
+//! is tested on the host.
+
 use core::cell::UnsafeCell;
+
+use crate::cpuid::{LogicalIdMap, PopError};
 
 cfg_if::cfg_if! {
     if #[cfg(all(target_os = "none", any(target_arch = "riscv32", target_arch = "riscv64")))] {
         mod interrupts {
-            use core::sync::atomic::{AtomicU8, Ordering};
             use riscv::register::sstatus;
 
-            /// Maps a hardware hart id (in `tp`, possibly sparse — e.g. boards that
-            /// reserve hart 0) to a dense logical CPU id (0..NCPU). Populated by the
-            /// HAL during SMP bring-up via [`set_logical_cpu_id`]; reads 0 until then
-            /// (correct, since only the boot hart = logical 0 runs that early).
-            static HARTID_TO_LOGICAL: [AtomicU8; 256] = {
-                const ZERO: AtomicU8 = AtomicU8::new(0);
-                [ZERO; 256]
-            };
-
             /// Raw hart id of the current CPU (kernel convention: stored in `tp`).
-            fn raw_hart_id() -> u8 {
+            ///
+            /// The full width, not `as u8`: hart ids are sparse by definition
+            /// (boards reserve hart 0, and cluster numbering leaves gaps), and
+            /// truncating hart 256 to a byte used to land it on hart 0 — the
+            /// boot hart, whose per-CPU slot it would then share.
+            pub(super) fn raw_hw_id() -> u32 {
                 let hart_id: usize;
                 unsafe {
                     core::arch::asm!("mv {0}, tp", out(reg) hart_id);
                 }
-                hart_id as u8
+                hart_id as u32
             }
 
-            /// Register the logical id assigned to a given hart id.
-            pub fn set_logical_cpu_id(hart_id: u32, logical_id: u8) {
-                if let Some(slot) = HARTID_TO_LOGICAL.get(hart_id as usize) {
-                    slot.store(logical_id, Ordering::Release);
-                }
+            /// riscv publishes no logical id: `tp` holds the *hart* id, which
+            /// is a hardware id and goes through the map like any other.
+            pub(super) fn published_cpu_id() -> Option<u8> {
+                None
             }
 
-            pub(crate) fn cpu_id() -> u8 {
-                HARTID_TO_LOGICAL[raw_hart_id() as usize].load(Ordering::Acquire)
-            }
             pub(crate) fn intr_on() {
                 unsafe { sstatus::set_sie() };
             }
@@ -46,10 +49,8 @@ cfg_if::cfg_if! {
         }
     } else if #[cfg(all(target_os = "none", any(target_arch = "x86", target_arch = "x86_64")))] {
         mod interrupts {
-            use core::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
+            use core::sync::atomic::{AtomicU64, Ordering};
             use x86_64::instructions::interrupts;
-
-            use crate::MAX_CORE_NUM;
 
             /// `IA32_APIC_BASE`. Bit 11 = APIC global enable, bit 10 = x2APIC mode.
             const IA32_APIC_BASE: u32 = 0x1B;
@@ -57,44 +58,6 @@ cfg_if::cfg_if! {
             const APIC_BASE_EXTD: u64 = 1 << 10;
             /// `IA32_X2APIC_APICID` — the APIC ID register in x2APIC mode.
             const IA32_X2APIC_APICID: u32 = 0x802;
-
-            /// Maps a hardware Local APIC ID that fits in a byte to a dense logical
-            /// CPU id (0..NCPU). APIC IDs are *not* contiguous on real hardware
-            /// (cores/threads/sockets leave gaps), so using them directly to index
-            /// per-CPU arrays causes out-of-bounds panics. The table is populated by
-            /// the HAL during SMP bring-up via [`set_logical_cpu_id`]. Until then it
-            /// reads 0, which is correct because only the BSP (logical 0) runs before
-            /// the APs are enumerated.
-            static APIC_TO_LOGICAL: [AtomicU8; 256] = {
-                const ZERO: AtomicU8 = AtomicU8::new(0);
-                [ZERO; 256]
-            };
-
-            /// Reverse map, indexed by the *dense logical* id: the hardware APIC ID
-            /// of each registered CPU. Needed because x2APIC IDs are 32-bit and can
-            /// exceed 255, which the byte-indexed table above cannot represent —
-            /// two such CPUs would otherwise alias onto one logical id and silently
-            /// share a per-CPU slot. `APIC_ID_VALID` marks the populated entries
-            /// (APIC ID 0 is a legal BSP id, so 0 cannot mean "unset").
-            static APIC_ID_OF_LOGICAL: [AtomicU32; MAX_CORE_NUM] =
-                [const { AtomicU32::new(0) }; MAX_CORE_NUM];
-            static APIC_ID_VALID: AtomicU64 = AtomicU64::new(0);
-
-            /// Last logical cpu id read out of GS that names no registered CPU,
-            /// and how many times that has happened. Written by [`cpu_id`] on
-            /// the rejection path and read by the kernel's fault/panic
-            /// reporters -- see [`crate::bogus_cpu_id_events`].
-            static BOGUS_GS_CPU_ID: AtomicU32 = AtomicU32::new(u32::MAX);
-            static BOGUS_GS_CPU_ID_COUNT: AtomicU32 = AtomicU32::new(0);
-
-            /// `(last bogus id, count)`; count 0 means GS has always agreed with
-            /// the registered set.
-            pub(super) fn bogus_gs_cpu_id_events() -> (u32, u32) {
-                (
-                    BOGUS_GS_CPU_ID.load(Ordering::Relaxed),
-                    BOGUS_GS_CPU_ID_COUNT.load(Ordering::Relaxed),
-                )
-            }
 
             /// `phys + offset` virtual mapping for the LAPIC MMIO page (set by HAL at boot).
             static PHYS_VIRT_OFFSET: AtomicU64 = AtomicU64::new(0);
@@ -151,7 +114,7 @@ cfg_if::cfg_if! {
 
             /// Raw Local APIC ID of the current CPU (hardware id, sparse and — in
             /// x2APIC mode — up to 32 bits wide).
-            pub(super) fn raw_apic_id() -> u32 {
+            pub(super) fn raw_hw_id() -> u32 {
                 if x2apic_active() {
                     return unsafe {
                         x86_64::registers::model_specific::Msr::new(IA32_X2APIC_APICID).read() as u32
@@ -160,132 +123,24 @@ cfg_if::cfg_if! {
                 read_lapic_id_mmio().unwrap_or_else(cpuid_apic_id)
             }
 
-            /// Register the logical id assigned to a given Local APIC ID. Called once
-            /// per CPU from the HAL before that CPU starts executing kernel code.
-            pub fn set_logical_cpu_id(apic_id: u32, logical_id: u8) {
-                if (logical_id as usize) < MAX_CORE_NUM {
-                    APIC_ID_OF_LOGICAL[logical_id as usize].store(apic_id, Ordering::Release);
-                    APIC_ID_VALID.fetch_or(1u64 << logical_id, Ordering::Release);
-                }
-                if apic_id < 256 {
-                    APIC_TO_LOGICAL[apic_id as usize].store(logical_id, Ordering::Release);
+            /// The logical id this CPU published about itself, in the per-CPU
+            /// area GS points at. One register-relative read, which is what
+            /// keeps `cpu_id()` cheap enough to sit on every lock acquire —
+            /// and a *corruptible* one, which is why the caller cross-checks it.
+            #[cfg(target_arch = "x86_64")]
+            pub(super) fn published_cpu_id() -> Option<u8> {
+                if trapframe::logical_cpu_id_valid() {
+                    Some(trapframe::read_logical_cpu_id())
+                } else {
+                    None
                 }
             }
 
-            /// Resolve a hardware APIC ID to its dense logical id. Byte-sized ids
-            /// hit the direct table; wider (x2APIC) ids scan the registered set,
-            /// which is at most `MAX_CORE_NUM` entries and only reached on the
-            /// pre-GS fallback path.
-            pub(super) fn apic_to_logical(apic: u32) -> u8 {
-                if apic < 256 {
-                    return APIC_TO_LOGICAL[apic as usize].load(Ordering::Acquire);
-                }
-                let mut valid = APIC_ID_VALID.load(Ordering::Acquire);
-                while valid != 0 {
-                    let logical = valid.trailing_zeros() as usize;
-                    valid &= valid - 1;
-                    if APIC_ID_OF_LOGICAL[logical].load(Ordering::Acquire) == apic {
-                        return logical as u8;
-                    }
-                }
-                0
-            }
-
-            /// Dense logical id override while an AP runs [`init_ap`] (GS not
-            /// ready yet). Indexed by the **dense logical id** — unique per AP by
-            /// construction — and looked up by hardware APIC id, so two APs
-            /// booting concurrently can never clobber each other's override even
-            /// if their APIC ids do not fit in a byte.
-            static AP_BOOT_APIC: [AtomicU32; MAX_CORE_NUM] =
-                [const { AtomicU32::new(u32::MAX) }; MAX_CORE_NUM];
-            /// Bitmask of logical ids currently inside a [`with_ap_boot_logical`]
-            /// window. Zero on the steady-state path, which lets [`cpu_id`] skip
-            /// the (expensive) APIC-id read entirely.
-            static AP_BOOT_ACTIVE: AtomicU64 = AtomicU64::new(0);
-
-            pub fn with_ap_boot_logical<R>(logical: u8, f: impl FnOnce() -> R) -> R {
-                let idx = logical as usize;
-                if idx >= MAX_CORE_NUM {
-                    return f();
-                }
-                AP_BOOT_APIC[idx].store(raw_apic_id(), Ordering::Release);
-                AP_BOOT_ACTIVE.fetch_or(1u64 << idx, Ordering::Release);
-                let ret = f();
-                AP_BOOT_ACTIVE.fetch_and(!(1u64 << idx), Ordering::Release);
-                AP_BOOT_APIC[idx].store(u32::MAX, Ordering::Release);
-                ret
-            }
-
-            /// The logical id claimed by an AP currently inside its `init_ap`
-            /// window, if the calling CPU is that AP.
-            fn ap_boot_logical() -> Option<u8> {
-                let mut active = AP_BOOT_ACTIVE.load(Ordering::Acquire);
-                if active == 0 {
-                    return None;
-                }
-                let apic = raw_apic_id();
-                while active != 0 {
-                    let logical = active.trailing_zeros() as usize;
-                    active &= active - 1;
-                    if AP_BOOT_APIC[logical].load(Ordering::Acquire) == apic {
-                        return Some(logical as u8);
-                    }
-                }
+            #[cfg(not(target_arch = "x86_64"))]
+            pub(super) fn published_cpu_id() -> Option<u8> {
                 None
             }
 
-            pub(crate) fn cpu_id() -> u8 {
-                // Prefer the AP-boot override BEFORE touching GS: during
-                // `init_ap`, GSBASE is still 0 and `logical_cpu_id_valid()`
-                // would read linear address ~0 (null-guard #PF or false id).
-                //
-                // The relaxed mask load short-circuits this in the steady state.
-                // It matters: `cpu_id()` runs on every `push_off`/`pop_off`, i.e.
-                // on every kernel lock acquire and release, and resolving an APIC
-                // id costs an RDMSR plus (in xAPIC mode) an uncached MMIO read.
-                if AP_BOOT_ACTIVE.load(Ordering::Relaxed) != 0 {
-                    if let Some(logical) = ap_boot_logical() {
-                        return logical;
-                    }
-                }
-                #[cfg(target_arch = "x86_64")]
-                {
-                    if trapframe::logical_cpu_id_valid() {
-                        let id = trapframe::read_logical_cpu_id();
-                        // Cross-check GS against the ids SMP bring-up actually
-                        // registered. GS is the fast path, but it is also a
-                        // *corruptible* one: a `swapgs` imbalance on a fault
-                        // path, or a wild write into the per-CPU area, makes it
-                        // name a CPU that does not exist. A 6-vCPU guest
-                        // reported `panic cpu=48`, and 48 < MAX_CORE_NUM, so
-                        // `mycpu()`'s bounds assert waved it through -- which is
-                        // far worse than a panic: `push_off`/`pop_off` then
-                        // nest their IRQ-disable depth on a FOREIGN per-CPU
-                        // slot, so this CPU re-enables interrupts inside
-                        // somebody's critical section (or trips `pop_off`'s
-                        // underflow panic). Every "impossible" re-entrancy in
-                        // this hunt is downstream of that.
-                        //
-                        // The registered set is authoritative and free to
-                        // consult: one relaxed load of a line that is read-only
-                        // in the steady state. `valid == 0` is the pre-SMP
-                        // window, where GS is all we have.
-                        let valid = APIC_ID_VALID.load(Ordering::Relaxed);
-                        if valid == 0
-                            || ((id as usize) < MAX_CORE_NUM && valid & (1u64 << id) != 0)
-                        {
-                            return id;
-                        }
-                        // Bogus. Record it -- no printing from here, since every
-                        // console writer takes a lock and would re-enter this
-                        // very function -- and resolve the id from the hardware
-                        // LAPIC instead, which no memory corruption can reach.
-                        BOGUS_GS_CPU_ID.store(id as u32, Ordering::Relaxed);
-                        BOGUS_GS_CPU_ID_COUNT.fetch_add(1, Ordering::Relaxed);
-                    }
-                }
-                apic_to_logical(raw_apic_id())
-            }
             pub(crate) fn intr_on() {
                 interrupts::enable();
             }
@@ -298,15 +153,36 @@ cfg_if::cfg_if! {
         }
     } else if #[cfg(all(target_os = "none", target_arch = "aarch64"))] {
         mod interrupts {
-            pub(crate) fn cpu_id() -> u8 {
-                // Dense logical id, written to TPIDR_EL1 by the kernel per CPU.
-                // MPIDR affinity is sparse across clusters (Aff0 repeats), so it
-                // can't index per-CPU arrays; TPIDR_EL1 holds the logical id
-                // directly (0 on the boot CPU until secondaries are brought up).
+            /// Packed MPIDR_EL1 affinity (Aff3<<24 | Aff2<<16 | Aff1<<8 | Aff0)
+            /// of the current CPU — the hardware id, matching what
+            /// `kernel-hal`'s `cpu::raw_affinity` registers.
+            ///
+            /// Sparse: Aff0 repeats across clusters, so it cannot index a
+            /// per-CPU array; that is what the logical id is for.
+            pub(super) fn raw_hw_id() -> u32 {
+                use cortex_a::registers::MPIDR_EL1;
+                use tock_registers::interfaces::Readable;
+                let mpidr = MPIDR_EL1.get();
+                let aff0 = (mpidr & 0xff) as u32;
+                let aff1 = ((mpidr >> 8) & 0xff) as u32;
+                let aff2 = ((mpidr >> 16) & 0xff) as u32;
+                let aff3 = ((mpidr >> 32) & 0xff) as u32;
+                (aff3 << 24) | (aff2 << 16) | (aff1 << 8) | aff0
+            }
+
+            /// The logical id this CPU published about itself, in TPIDR_EL1.
+            ///
+            /// aarch64's twin of x86's GS, and corruptible the same way: it is
+            /// an ordinary writable system register, it reads whatever reset
+            /// left in it on a core the kernel has not set up yet, and 0 —
+            /// which is what an unset one usually reads — is the boot CPU.
+            /// So it goes through the same cross-check.
+            pub(super) fn published_cpu_id() -> Option<u8> {
                 let id: u64;
                 unsafe { core::arch::asm!("mrs {0}, tpidr_el1", out(reg) id) };
-                id as u8
+                Some(id as u8)
             }
+
             pub(crate) fn intr_on() {
                 unsafe {
                     core::arch::asm!("msr daifclr, #2");
@@ -323,9 +199,62 @@ cfg_if::cfg_if! {
                 !DAIF.is_set(DAIF::I)
             }
         }
+    } else if #[cfg(test)] {
+        /// Host backend for `cargo test`: one simulated CPU per test thread.
+        ///
+        /// See `KERNEL_LOCKS_ON_HOST` in `lib.rs`. There is no such thing as
+        /// "this CPU" on a hosted target, so the test build hands each thread
+        /// its own hardware id and its own interrupt flag; that is enough for
+        /// the question every lock in this crate turns on — whether a guard's
+        /// `push_off` and `pop_off` come in pairs, on one slot.
+        mod interrupts {
+            use core::cell::Cell;
+
+            std::thread_local! {
+                /// This thread's simulated interrupt-enable flag. Starts on,
+                /// like a CPU running ordinary kernel code.
+                static IRQ_ON: Cell<bool> = const { Cell::new(true) };
+                /// This thread's simulated hardware CPU id.
+                static HW_ID: Cell<u32> = const { Cell::new(0) };
+                /// What this thread publishes about itself, if anything.
+                static PUBLISHED: Cell<Option<u8>> = const { Cell::new(None) };
+            }
+
+            pub(super) fn raw_hw_id() -> u32 {
+                HW_ID.with(|c| c.get())
+            }
+
+            pub(super) fn published_cpu_id() -> Option<u8> {
+                PUBLISHED.with(|c| c.get())
+            }
+
+            pub(crate) fn intr_on() {
+                IRQ_ON.with(|c| c.set(true));
+            }
+            pub(crate) fn intr_off() {
+                IRQ_ON.with(|c| c.set(false));
+            }
+            pub(crate) fn intr_get() -> bool {
+                IRQ_ON.with(|c| c.get())
+            }
+
+            /// Make this test thread be hardware CPU `hw`.
+            pub(crate) fn set_test_hw_id(hw: u32) {
+                HW_ID.with(|c| c.set(hw));
+            }
+
+            /// Make this test thread publish `id` about itself (the twin of
+            /// writing GS / TPIDR_EL1).
+            pub(crate) fn set_test_published(id: Option<u8>) {
+                PUBLISHED.with(|c| c.set(id));
+            }
+        }
     } else {
         mod interrupts {
-            pub(crate) fn cpu_id() -> u8 {
+            pub(super) fn raw_hw_id() -> u32 {
+                unimplemented!();
+            }
+            pub(super) fn published_cpu_id() -> Option<u8> {
                 unimplemented!();
             }
             pub(crate) fn intr_on() { unimplemented!(); }
@@ -338,17 +267,59 @@ cfg_if::cfg_if! {
 }
 
 use interrupts::*;
+#[cfg(test)]
+pub(crate) use interrupts::{set_test_hw_id, set_test_published};
 
-/// Current CPU's dense logical id (0..NCPU).
+/// This machine's hardware-id <-> dense-logical-id map.
 ///
-/// On x86 this resolves the sparse Local APIC ID through the table populated by
-/// [`set_logical_cpu_id`]; on riscv/aarch64 the architecture already provides a
-/// dense id (hart id / MPIDR affinity).
+/// One per machine, shared by all three architectures so they cannot drift
+/// apart: each used to keep its own, and two of them answered "the boot CPU"
+/// for a hardware id nobody had ever registered. See [`crate::cpuid`].
+static LOGICAL_IDS: LogicalIdMap = LogicalIdMap::new();
+
+/// Current CPU's dense logical id (0..NCPU), or [`NO_CPU`].
+///
+/// Three sources, in order of how much they can be trusted:
+///
+/// 1. an open AP-boot window, which is the only thing that knows who a CPU is
+///    before its per-CPU publisher exists;
+/// 2. the publisher itself (x86 `GS`, aarch64 `TPIDR_EL1`) — one register read,
+///    and the reason this function is cheap enough to sit on every lock
+///    acquire — *cross-checked* against the ids bring-up actually registered,
+///    because a `swapgs` imbalance or a wild write makes it name a CPU that
+///    does not exist;
+/// 3. the hardware id (Local APIC ID, hart id, MPIDR affinity), which no
+///    memory corruption can reach.
+///
+/// Answering [`NO_CPU`] rather than 0 is the point: 0 is the boot CPU
+/// everywhere, so a wrong 0 does not lose the answer, it silently nests this
+/// CPU's interrupt-disable depth in the BSP's slot.
 pub fn current_cpu_id() -> u8 {
-    cpu_id()
+    // The relaxed mask load short-circuits this in the steady state. It
+    // matters: this runs on every `push_off`/`pop_off`, i.e. on every kernel
+    // lock acquire and release, and reading a hardware id costs an RDMSR plus
+    // (in xAPIC mode) an uncached MMIO read.
+    if LOGICAL_IDS.ap_boot_any() {
+        if let Some(logical) = LOGICAL_IDS.ap_boot_logical(raw_hw_id()) {
+            return logical;
+        }
+    }
+    if let Some(published) = published_cpu_id() {
+        if LOGICAL_IDS.accepts_published(published) {
+            return published;
+        }
+        // No printing from here: every console writer takes a lock and would
+        // re-enter this very function. Record it for the panic reporter and
+        // fall through to the hardware id.
+        LOGICAL_IDS.note_bogus(published);
+    }
+    LOGICAL_IDS.resolve(raw_hw_id())
 }
 
-/// Dense logical id resolved **only** from the Local APIC ID — never from GS.
+pub(crate) use current_cpu_id as cpu_id;
+
+/// Dense logical id resolved **only** from the hardware id — never from the
+/// per-CPU publisher.
 ///
 /// Use this from the NMI path. `syscall_return` does `swapgs` then WRMSR of the
 /// user gsbase while CS is still ring 0; an NMI in that window takes the
@@ -357,63 +328,50 @@ pub fn current_cpu_id() -> u8 {
 /// user mapping looks "valid" and publishes the TLB-shootdown watermark into
 /// the **wrong** `SHOOTDOWN_SEQ` slot — the surviving rival hypothesis for
 /// "NMI ran, nmi_rip fresh, watermark never moved".
-#[cfg(all(target_os = "none", any(target_arch = "x86", target_arch = "x86_64")))]
+///
+/// Which is why this one must not fall back to 0 either: a hardware id that
+/// resolves to nothing used to come back as the boot CPU, publishing that
+/// watermark into slot 0 — the same corruption by a different door.
 pub fn current_cpu_id_via_apic() -> u8 {
-    interrupts::apic_to_logical(interrupts::raw_apic_id())
+    LOGICAL_IDS.resolve(raw_hw_id())
 }
 
-/// Hosted / non-x86 twin: same as [`current_cpu_id`].
-#[cfg(not(all(target_os = "none", any(target_arch = "x86", target_arch = "x86_64"))))]
-pub fn current_cpu_id_via_apic() -> u8 {
-    current_cpu_id()
-}
-
-/// `(last bogus id, count)` for logical cpu ids read out of GS that name no
-/// CPU SMP bring-up ever registered — see [`current_cpu_id`].
-#[cfg(all(target_os = "none", any(target_arch = "x86", target_arch = "x86_64")))]
-pub fn bogus_cpu_id_events() -> (u32, u32) {
-    interrupts::bogus_gs_cpu_id_events()
-}
-
-/// `(last bogus id, count)` for logical cpu ids read out of GS that name no
-/// CPU SMP bring-up ever registered — see [`current_cpu_id`].
+/// `(last bogus id, count)` for logical cpu ids read out of a per-CPU
+/// publisher that name no CPU SMP bring-up ever registered.
 ///
 /// A non-zero count is not a warning, it is a diagnosis: this CPU ran with a
-/// GS that was lying about who it is, so every `push_off`/`pop_off` in that
-/// window nested its IRQ-disable depth on a foreign per-CPU slot. The kernel's
-/// fault and panic reporters print it, because it explains classes of damage
-/// (locks released with interrupts on, re-entrant acquires, scribbled per-CPU
-/// state) that otherwise look impossible from the backtrace alone.
+/// publisher that was lying about who it is, so every `push_off`/`pop_off` in
+/// that window nested its IRQ-disable depth on a foreign per-CPU slot. The
+/// kernel's fault and panic reporters print it, because it explains classes of
+/// damage (locks released with interrupts on, re-entrant acquires, scribbled
+/// per-CPU state) that otherwise look impossible from the backtrace alone.
 ///
 /// Reading it is allocation- and lock-free, so it is safe from a fault path.
-#[cfg(not(all(target_os = "none", any(target_arch = "x86", target_arch = "x86_64"))))]
 pub fn bogus_cpu_id_events() -> (u32, u32) {
-    (u32::MAX, 0)
+    LOGICAL_IDS.bogus_events()
 }
 
 /// Raw hardware Local APIC ID (x86). Sparse, and up to 32 bits wide in x2APIC
 /// mode; use [`current_cpu_id`] to index arrays.
 #[cfg(all(target_os = "none", any(target_arch = "x86", target_arch = "x86_64")))]
 pub fn hardware_apic_id() -> u32 {
-    interrupts::raw_apic_id()
+    interrupts::raw_hw_id()
 }
 
-/// Register the dense logical id assigned to a hardware CPU id (Local APIC ID on
-/// x86, hart id on riscv).
+/// Register the dense logical id assigned to a hardware CPU id (Local APIC ID
+/// on x86, hart id on riscv, packed MPIDR affinity on aarch64).
 ///
 /// Must be called once per CPU (including the BSP) before that CPU executes any
-/// code that takes a lock, so that `cpu_id()` never returns a stale/colliding id.
-#[cfg(all(
-    target_os = "none",
-    any(
-        target_arch = "x86",
-        target_arch = "x86_64",
-        target_arch = "riscv32",
-        target_arch = "riscv64"
-    )
-))]
-pub fn set_logical_cpu_id(hw_id: u32, logical_id: u8) {
-    interrupts::set_logical_cpu_id(hw_id, logical_id)
+/// code that takes a lock, so that `cpu_id()` never returns a stale/colliding
+/// id. Returns `false` for a logical id no per-CPU array can hold, rather than
+/// writing an entry that indexes nothing.
+pub fn set_logical_cpu_id(hw_id: u32, logical_id: u8) -> bool {
+    LOGICAL_IDS.register(hw_id, logical_id)
+}
+
+/// The hardware id registered for a logical id, or `None`.
+pub fn hardware_id_of(logical_id: u8) -> Option<u32> {
+    LOGICAL_IDS.hw_of(logical_id)
 }
 
 /// Register phys→virt linear map offset for LAPIC MMIO reads on x86.
@@ -422,28 +380,24 @@ pub fn set_phys_virt_offset(offset: u64) {
     interrupts::set_phys_virt_offset(offset)
 }
 
-/// Run `f` while [`cpu_id`] returns `logical` (AP [`init_ap`] before GS is ready).
-#[cfg(all(target_os = "none", any(target_arch = "x86", target_arch = "x86_64")))]
+/// Run `f` while [`current_cpu_id`] returns `logical` for the calling CPU.
+///
+/// For the stretch of AP bring-up that runs before the per-CPU publisher is
+/// set up: during `init_ap` on x86, GSBASE is still 0 and reading the
+/// published id would fault or invent one.
 pub fn with_ap_boot_logical<R>(logical: u8, f: impl FnOnce() -> R) -> R {
-    interrupts::with_ap_boot_logical(logical, f)
-}
-
-#[derive(Debug, Default, Clone, Copy)]
-#[repr(align(64))]
-pub struct Cpu {
-    pub noff: i32,              // Depth of push_off() nesting.
-    pub interrupt_enable: bool, // Were interrupts enabled before push_off()?
-}
-
-impl Cpu {
-    const fn new() -> Self {
-        Self {
-            noff: 0,
-            interrupt_enable: false,
-        }
+    if !LOGICAL_IDS.ap_boot_enter(logical, raw_hw_id()) {
+        return f();
     }
+    let ret = f();
+    LOGICAL_IDS.ap_boot_leave(logical);
+    ret
 }
 
+/// Per-CPU interrupt-disable depth, in its own cache line.
+pub use crate::cpuid::IrqDepth as Cpu;
+
+#[repr(align(64))]
 pub struct CpuStorage(UnsafeCell<Cpu>);
 
 // SAFETY: each CPU only ever accesses CPUS[cpu_id()]; wrong ids are fixed at AP boot.
@@ -479,7 +433,14 @@ static CPUS: [CpuStorage; MAX_CORE_NUM] = [DEFAULT_CPU; MAX_CORE_NUM];
 #[inline]
 pub fn mycpu() -> &'static mut Cpu {
     let id = cpu_id() as usize;
-    assert!(id < MAX_CORE_NUM, "cpu_id {} >= MAX_CORE_NUM", id);
+    // Not a bounds check for its own sake: this is the one place that turns
+    // "we do not know which CPU this is" into a stop, instead of letting it
+    // become "slot 0", which is the boot CPU's.
+    assert!(
+        id < MAX_CORE_NUM,
+        "cpu {} has no logical id: it is running kernel code without being registered",
+        id
+    );
     CPUS[id].get()
 }
 
@@ -510,25 +471,43 @@ pub fn lock_depth() -> i32 {
 pub(crate) fn push_off() {
     let old = intr_get();
     intr_off();
-    let cpu = mycpu();
-    if cpu.noff == 0 {
-        cpu.interrupt_enable = old;
-    }
-    cpu.noff += 1;
+    mycpu().push(old);
 }
 
 pub(crate) fn pop_off() {
-    let should_enable = {
-        let cpu = mycpu();
-        if intr_get() || cpu.noff < 1 {
-            panic!("pop_off");
-        }
-        cpu.noff -= 1;
-        cpu.noff == 0 && cpu.interrupt_enable
-    };
     // NOTICE: intr_on() may lead to an immediate interrupt, so the Cpu borrow
-    // above must end before enabling IRQs.
+    // must end before enabling IRQs — it ends with this statement.
+    let should_enable = match mycpu().pop(intr_get()) {
+        Ok(enable) => enable,
+        // Two diagnoses, not one. Both mean the pair came apart, but they come
+        // apart for different reasons and a bare "pop_off" names neither.
+        Err(PopError::InterruptsEnabled) => panic!(
+            "pop_off on cpu {}: interrupts are already on inside a critical section",
+            cpu_id()
+        ),
+        Err(PopError::Underflow) => panic!(
+            "pop_off on cpu {}: more lock releases than acquires on this slot",
+            cpu_id()
+        ),
+    };
     if should_enable {
         intr_on();
     }
+}
+
+// Test-only windows onto the host backend, so the lock tests can put this
+// thread on a given CPU and watch the interrupt flag the guards move.
+#[cfg(test)]
+pub(crate) fn intr_on_for_test() {
+    intr_on()
+}
+
+#[cfg(test)]
+pub(crate) fn intr_off_for_test() {
+    intr_off()
+}
+
+#[cfg(test)]
+pub(crate) fn intr_get_for_test() -> bool {
+    intr_get()
 }

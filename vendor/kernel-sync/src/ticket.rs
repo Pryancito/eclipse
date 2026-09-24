@@ -181,7 +181,7 @@ impl<T: ?Sized> TicketMutex<T> {
         push_off();
         let ticket = self
             .next_ticket
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |ticket| {
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |ticket| {
                 if self.next_serving.load(Ordering::Acquire) == ticket {
                     Some(ticket + 1)
                 } else {

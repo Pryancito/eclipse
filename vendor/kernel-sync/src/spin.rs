@@ -79,7 +79,7 @@ impl<T: ?Sized> SpinMutex<T> {
 
     #[inline(always)]
     #[track_caller]
-    pub fn lock(&self) -> SpinMutexGuard<T> {
+    pub fn lock(&self) -> SpinMutexGuard<'_, T> {
         push_off();
         let caller = core::panic::Location::caller();
         let mut spins: u64 = 0;
@@ -129,7 +129,7 @@ impl<T: ?Sized> SpinMutex<T> {
 
     #[inline]
     #[track_caller]
-    pub fn try_lock(&self) -> Option<SpinMutexGuard<T>> {
+    pub fn try_lock(&self) -> Option<SpinMutexGuard<'_, T>> {
         push_off();
         if self
             .locked
