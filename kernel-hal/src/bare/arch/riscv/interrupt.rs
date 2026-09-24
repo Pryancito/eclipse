@@ -28,7 +28,20 @@ hal_fn_impl! {
             static IRQ_PER_HART: [spin::Once<Arc<dyn IrqScheme>>; crate::config::MAX_CORE_NUM] =
                 [const { spin::Once::new() }; crate::config::MAX_CORE_NUM];
             let hart = super::cpu::raw_hart_id();
-            let arc = IRQ_PER_HART[hart].call_once(|| {
+            // Bounds-checked, not indexed. Hart ids are sparse — that is the
+            // entire reason dense logical ids exist — so a board that numbers
+            // a hart past the table would panic here, inside the interrupt
+            // handler, where a panic takes the machine and buries its cause.
+            // Fall back to the uncached lookup rather than to no interrupt at
+            // all; it is the pre-cache behaviour and it is correct, only slow.
+            let Some(slot) = IRQ_PER_HART.get(hart) else {
+                crate::drivers::all_irq()
+                    .find(alloc::format!("riscv-intc-cpu{}", hart).as_str())
+                    .expect("IRQ device 'riscv-intc' not initialized!")
+                    .handle_irq(cause);
+                return;
+            };
+            let arc = slot.call_once(|| {
                 crate::drivers::all_irq()
                     .find(alloc::format!("riscv-intc-cpu{}", hart).as_str())
                     .expect("IRQ device 'riscv-intc' not initialized!")
@@ -63,12 +76,34 @@ hal_fn_impl! {
             // It also indexed the queue with the caller's `cpuid` unchecked,
             // where x86_64 is covered by its APIC-map lookup and aarch64 by
             // its GICv2 target-list check.
+            // Resolve the hart BEFORE publishing. A logical id no hart was
+            // ever given used to resolve to hart 0 — the boot hart — so the
+            // payload went into the target's queue, the SBI IPI woke the BSP,
+            // and the initiator waited for an acknowledgement from a CPU that
+            // was never signalled. That wait has no timeout. x86_64's
+            // `logical_to_apic` documents the same hazard and refuses; this
+            // side had no notion of an unregistered id at all.
+            let Some(hart) = super::cpu::logical_to_hart(cpuid) else {
+                warn!("send_ipi: logical cpu {} names no hart — dropped", cpuid);
+                return Err(HalError);
+            };
+            // `cpuid` is a dense logical id (queue index); SBI needs a hart
+            // mask, which is one `usize` wide — so a hart the shift cannot
+            // reach is a hart this call cannot address. Hart ids are sparse by
+            // definition, so this is reachable on a real board, and `1 << hart`
+            // past the word width is not a no-op: riscv masks the shift
+            // amount, so it would ring hart `hart % 64` instead.
+            let Some(mask) = crate::common::cpu_topology::sbi_hart_mask(hart) else {
+                warn!(
+                    "send_ipi: hart {} is beyond the legacy SBI hart mask — dropped",
+                    hart
+                );
+                return Err(HalError);
+            };
             if !crate::common::ipi::publish_ipi_entry(cpuid, reason) {
                 warn!("send_ipi: logical cpu {} has no IPI queue — dropped", cpuid);
                 return Err(HalError);
             }
-            // `cpuid` is a dense logical id (queue index); SBI needs a hart mask.
-            let mask: usize = 1 << super::cpu::logical_to_hart(cpuid);
             sbi_rt::legacy::send_ipi(&mask as *const usize as usize);
             Ok(())
         }

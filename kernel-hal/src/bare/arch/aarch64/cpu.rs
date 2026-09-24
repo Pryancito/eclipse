@@ -1,11 +1,9 @@
 //! CPU information.
 
-use core::sync::atomic::{AtomicU32, AtomicU8, Ordering};
-
 use cortex_a::registers::*;
 use tock_registers::interfaces::Readable;
 
-use crate::config::MAX_CORE_NUM;
+use crate::common::cpu_topology::CpuTopology;
 
 // ─── CPU topology: dense logical id  <->  MPIDR affinity ─────────────────────────
 //
@@ -14,11 +12,12 @@ use crate::config::MAX_CORE_NUM;
 // (0..NCPU, boot CPU = 0) which is stored in TPIDR_EL1 (read by `lock`/`cpu_id`).
 // We keep the reverse map (logical -> affinity) for targeting GIC SGIs.
 
-/// Number of logical ids assigned so far.
-static LOGICAL_COUNT: AtomicU8 = AtomicU8::new(0);
-
-/// logical id -> packed MPIDR affinity (Aff3:Aff2:Aff1:Aff0). Index 0 = boot CPU.
-static LOGICAL_TO_AFFINITY: [AtomicU32; MAX_CORE_NUM] = [const { AtomicU32::new(0) }; MAX_CORE_NUM];
+/// This machine's dense logical id <-> packed MPIDR affinity map (index 0 = the
+/// boot CPU). Shared with x86_64 and riscv so the three cannot drift apart
+/// again: this side used to count in a `u8` with no bound, and to answer "which
+/// core is logical N?" with affinity 0 — the boot CPU — for an N nobody had
+/// ever registered.
+static TOPOLOGY: CpuTopology = CpuTopology::new();
 
 /// Packed MPIDR affinity (Aff3<<24 | Aff2<<16 | Aff1<<8 | Aff0) of the current CPU.
 ///
@@ -36,20 +35,33 @@ pub fn raw_affinity() -> u32 {
 /// Assign this CPU its dense logical id, publish it in TPIDR_EL1, and record the
 /// reverse (logical -> affinity) map. Called once per CPU from `percpu::register`.
 pub fn register_logical_id() -> u8 {
-    let logical = LOGICAL_COUNT.fetch_add(1, Ordering::AcqRel);
-    if let Some(slot) = LOGICAL_TO_AFFINITY.get(logical as usize) {
-        slot.store(raw_affinity(), Ordering::Release);
-    }
+    let affinity = raw_affinity();
+    // A core past what the per-CPU tables hold gets no id rather than one that
+    // indexes nothing: the count used to be an `AtomicU8` incremented
+    // unconditionally, so core 64 got id 64, no reverse-map entry (the
+    // `.get()` dropped it silently), and a TPIDR_EL1 value that every per-CPU
+    // array in the kernel would either refuse or alias onto another core.
+    let Some(logical) = TOPOLOGY.register(affinity) else {
+        warn!(
+            "[smp] affinity {:#x} has no logical id left (max {}) — it must not run kernel code",
+            affinity,
+            crate::config::MAX_CORE_NUM
+        );
+        return u8::MAX;
+    };
     unsafe { core::arch::asm!("msr tpidr_el1, {0}", in(reg) logical as u64) };
-    logical
+    logical as u8
 }
 
-/// Translate a dense logical CPU id back to its packed MPIDR affinity.
-pub fn logical_to_affinity(logical: usize) -> u32 {
-    LOGICAL_TO_AFFINITY
-        .get(logical)
-        .map(|a| a.load(Ordering::Acquire))
-        .unwrap_or(0)
+/// Translate a dense logical CPU id back to its packed MPIDR affinity, or
+/// `None` when no core was ever given that id.
+///
+/// `None` rather than a fallback, for the reason x86_64's `logical_to_apic`
+/// gives: affinity 0 is the boot CPU, so answering "unknown" with 0 does not
+/// drop the message — it aims it at the BSP, while the core it was meant for
+/// hears nothing.
+pub fn logical_to_affinity(logical: usize) -> Option<u32> {
+    TOPOLOGY.hw_id(logical)
 }
 
 hal_fn_impl! {
@@ -68,7 +80,7 @@ hal_fn_impl! {
         }
 
         fn cpu_count() -> u8 {
-            LOGICAL_COUNT.load(Ordering::Acquire)
+            TOPOLOGY.count() as u8
         }
 
         fn reset() -> ! {

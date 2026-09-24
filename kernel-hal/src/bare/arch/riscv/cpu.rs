@@ -1,7 +1,5 @@
 //! CPU information.
-use core::sync::atomic::{AtomicU8, Ordering};
-
-use crate::config::MAX_CORE_NUM;
+use crate::common::cpu_topology::CpuTopology;
 use crate::utils::init_once::InitOnce;
 
 pub(super) static CPU_FREQ_MHZ: InitOnce<u16> = InitOnce::new_with_default(1000); // 1GHz
@@ -14,11 +12,11 @@ pub(super) static CPU_FREQ_MHZ: InitOnce<u16> = InitOnce::new_with_default(1000)
 // the lock crate and the kernel share one id space; here we keep the reverse map
 // (logical -> hart) needed to target SBI IPIs.
 
-/// Number of logical ids assigned so far.
-static LOGICAL_COUNT: AtomicU8 = AtomicU8::new(0);
-
-/// logical id -> hart id. Index 0 is the boot hart.
-static LOGICAL_TO_HART: [AtomicU8; MAX_CORE_NUM] = [const { AtomicU8::new(0) }; MAX_CORE_NUM];
+/// This machine's dense logical id <-> hart id map. Shared with x86_64 and
+/// aarch64 so the three cannot drift apart again: this side used to count in a
+/// `u8` with no bound, and to answer "which hart is logical N?" with hart 0 —
+/// the boot hart — for an N nobody had ever registered.
+static TOPOLOGY: CpuTopology = CpuTopology::new();
 
 /// Raw hart id of the current CPU (kernel convention: stored in `tp`).
 ///
@@ -33,21 +31,36 @@ pub fn raw_hart_id() -> usize {
 /// Assign this hart its dense logical id and register the hart<->logical maps.
 /// Called once per hart from `percpu::register`, before any lock-taking code.
 pub fn register_logical_id() -> u8 {
-    let hart_id = raw_hart_id() as u8;
-    let logical = LOGICAL_COUNT.fetch_add(1, Ordering::AcqRel);
-    if let Some(slot) = LOGICAL_TO_HART.get(logical as usize) {
-        slot.store(hart_id, Ordering::Release);
-    }
-    lock::set_logical_cpu_id(hart_id as u32, logical);
-    logical
+    let hart_id = raw_hart_id() as u32;
+    // A hart past what the per-CPU tables hold keeps the id it booted with
+    // rather than being given one that indexes nothing: the count used to be
+    // an `AtomicU8` incremented unconditionally, so hart 64 got id 64, no
+    // reverse-map entry (the `.get()` dropped it silently), and a `lock`
+    // forward-map entry pointing at a per-CPU slot it shares with somebody
+    // else. There is nothing sound to do for such a hart here, but reporting
+    // it is better than letting it corrupt another CPU's state in silence.
+    let Some(logical) = TOPOLOGY.register(hart_id) else {
+        warn!(
+            "[smp] hart {} has no logical id left (max {}) — it must not run kernel code",
+            hart_id,
+            crate::config::MAX_CORE_NUM
+        );
+        return u8::MAX;
+    };
+    lock::set_logical_cpu_id(hart_id, logical as u8);
+    logical as u8
 }
 
-/// Translate a dense logical CPU id back to its hart id (for SBI IPI delivery).
-pub fn logical_to_hart(logical: usize) -> usize {
-    LOGICAL_TO_HART
-        .get(logical)
-        .map(|h| h.load(Ordering::Acquire) as usize)
-        .unwrap_or(logical)
+/// Translate a dense logical CPU id back to its hart id (for SBI IPI delivery),
+/// or `None` when no hart was ever given that id.
+///
+/// `None` rather than a fallback, for the reason x86_64's `logical_to_apic`
+/// gives: hart 0 is the boot hart, so answering "unknown" with 0 does not drop
+/// the IPI — it rings the BSP, which flushes a TLB nobody asked it about, while
+/// the CPU the shootdown was for hears nothing and its initiator waits for an
+/// acknowledgement in a loop that has no timeout.
+pub fn logical_to_hart(logical: usize) -> Option<usize> {
+    TOPOLOGY.hw_id(logical).map(|h| h as usize)
 }
 
 hal_fn_impl! {
@@ -68,7 +81,7 @@ hal_fn_impl! {
         }
 
         fn cpu_count() -> u8 {
-            LOGICAL_COUNT.load(Ordering::Acquire)
+            TOPOLOGY.count() as u8
         }
 
         fn reset() -> ! {

@@ -364,7 +364,7 @@ hal_fn_impl! {
         }
 
         fn cpu_count() -> u8 {
-            super::smp::CPU_COUNT.load(core::sync::atomic::Ordering::Acquire) as u8
+            super::smp::cpu_count() as u8
         }
 
         fn cpu_temperature_mc() -> Option<i32> {
