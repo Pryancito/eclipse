@@ -34,6 +34,19 @@ jobs:
           cargo test --no-fail-fast
           cargo test -p zircon-object --lib --features libos,aspace-separate
           cargo test -p zircon-syscall --features libos,zircon-object/aspace-separate
+          # Both `vendor/` scheduler directories hold a crate named
+          # `executor`, and this line used to name the wrong one. The kernel
+          # links `vendor/PreemptiveScheduler` -- that is what the `[patch]`
+          # in the workspace manifest points `executor` at -- while
+          # `vendor/preemptive-scheduler` is the pristine upstream copy that
+          # nothing depends on. So the job that looked like it tested the
+          # scheduler was testing 1139 lines the machine never executes, and
+          # the 4483-line fork it actually runs (placement, work stealing,
+          # affinity, the reschedule IPI) had no tests at all. Both are run
+          # now: the fork first, because it is the one that matters.
+          # Single-threaded because the cross-CPU tests drive the scheduler's
+          # process-wide masks (EXECUTOR_READY, SLEEPING_CPUS, NEED_RESCHED).
+          cargo test --manifest-path vendor/PreemptiveScheduler/Cargo.toml --lib -- --test-threads=1
           cargo test --manifest-path vendor/preemptive-scheduler/Cargo.toml --lib
           # `default-members = ["xtask"]` in the workspace manifest means the
           # bare `cargo test` above builds ONLY xtask, so these two crates'

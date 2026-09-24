@@ -26,6 +26,13 @@ extern crate alloc;
 #[macro_use]
 extern crate log;
 
+// The unit tests run on the host, where the scheduler's own globals are what
+// they exercise; `std::sync::Mutex` is what serialises them (a `spin::Mutex`
+// held across a failed assertion would hang the rest of the suite instead of
+// reporting it).
+#[cfg(test)]
+extern crate std;
+
 mod context;
 mod diag;
 mod executor;
