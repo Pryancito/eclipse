@@ -284,6 +284,7 @@ impl Syscall<'_> {
             "openat: dir_fd={:?}, path={:?}, flags={:?}, mode={:#o}",
             dir_fd, path, flags, mode
         );
+        let follow = !flags.contains(OpenFlags::NOFOLLOW);
 
         // The whole resolution runs inside a closure so its many `?`/`return`
         // exit points funnel into one `ret`, which the boot-trace recorder
@@ -295,6 +296,12 @@ impl Syscall<'_> {
             // open must yield an independent PTY pair, which the generic INode open
             // path cannot express), and `/dev/pts/N` resolves to the matching slave
             // from the live PTY registry rather than a static device node.
+            // Every path handled specially below hands back a character
+            // device, so an `O_DIRECTORY` over one of them is answered before
+            // the work of minting a PTY starts.
+            if path == "/dev/ptmx" || path == "/dev/tty" || pty::pts_id_from_path(path).is_some() {
+                open_resolved_type(flags, FileType::CharDevice)?;
+            }
             if path == "/dev/ptmx" {
                 let inode = pty::alloc_ptmx();
                 let file = File::new(inode, flags, String::from("/dev/ptmx"));
@@ -356,6 +363,21 @@ impl Syscall<'_> {
                         if flags.contains(OpenFlags::EXCLUSIVE) {
                             return Err(LxError::EEXIST);
                         }
+                        // `O_CREAT` over a name that is already a symbolic
+                        // link still opens what the link points AT:
+                        // `open_last_lookups` resolves the final component
+                        // like any other open, and only `O_EXCL` (the EEXIST
+                        // above) or `O_NOFOLLOW` stop it. `find` hands back
+                        // the link's own inode, so without this the write
+                        // went into the link and not into the file.
+                        let file_inode = if file_inode.metadata()?.type_ == FileType::SymLink {
+                            if !follow {
+                                return Err(LxError::ELOOP);
+                            }
+                            proc.lookup_inode_at(dir_fd, path, true)?
+                        } else {
+                            file_inode
+                        };
                         let metadata = file_inode.metadata()?;
                         if flags.writable() || flags.contains(OpenFlags::TRUNCATE) {
                             proc.check_access(&metadata, 0o2, true)?;
@@ -381,6 +403,23 @@ impl Syscall<'_> {
                     Err(e) => return Err(LxError::from(e)),
                 }
             } else {
+                // `O_NOFOLLOW` refuses a symbolic link as the LAST component
+                // and nothing else: a path through `/var/log` where that is
+                // itself a link resolves as usual. Asking the resolution not
+                // to follow anything would answer the wrong question, because
+                // its budget covers every hop, so the last component is asked
+                // about on its own -- and only when the flag is there, so the
+                // ordinary open pays nothing for it.
+                if !follow {
+                    let (dir_path, file_name) = split_path(path);
+                    let dir_inode = proc.lookup_inode_at(dir_fd, dir_path, true)?;
+                    if matches!(
+                        dir_inode.find(file_name).map(|i| i.metadata()),
+                        Ok(Ok(m)) if m.type_ == FileType::SymLink
+                    ) {
+                        return Err(LxError::ELOOP);
+                    }
+                }
                 let inode = proc.lookup_inode_at(dir_fd, path, true)?;
                 let metadata = inode.metadata()?;
                 if flags.readable() {
@@ -392,9 +431,7 @@ impl Syscall<'_> {
                 inode
             };
             let metadata = inode.metadata()?;
-            if metadata.type_ == FileType::Dir && flags.writable() {
-                return Err(LxError::EISDIR);
-            }
+            open_resolved_type(flags, metadata.type_)?;
             if flags.contains(OpenFlags::TRUNCATE) && metadata.type_ == FileType::File {
                 proc.check_access(&metadata, 0o2, true)?;
                 inode.resize(0)?;
@@ -1160,6 +1197,167 @@ mod perf_attr_size_tests {
     fn a_perf_attr_may_be_anything_from_version_zero_up_to_a_page() {
         for size in [PERF_ATTR_SIZE_VER0, 72, 96, 112, 128, PAGE_SIZE] {
             assert_eq!(perf_attr_size(size as u32), Ok(size), "{size}");
+        }
+    }
+}
+
+/// What the type of the inode an `open(2)` resolved to means for the flags it
+/// was given.
+///
+/// Three of the refusals `may_open` and `do_open` make come down to the type
+/// alone, and they come in this order upstream: `O_DIRECTORY` over a
+/// non-directory, then a symbolic link the resolution stopped at, then a
+/// directory opened for writing. Only the last of the three was made here,
+/// because the first two flags never reached this far: `OpenFlags` did not
+/// name `O_DIRECTORY` or `O_NOFOLLOW`, and `from_bits_truncate` drops what it
+/// cannot name.
+///
+/// That `O_DIRECTORY` goes first matters for the one case where two of them
+/// apply at once: a symbolic link opened with `O_DIRECTORY` is `ENOTDIR`, not
+/// `ELOOP`, because it is not a directory whatever it points at.
+pub(crate) fn open_resolved_type(flags: OpenFlags, type_: FileType) -> Result<(), LxError> {
+    if flags.contains(OpenFlags::DIRECTORY) && type_ != FileType::Dir {
+        return Err(LxError::ENOTDIR);
+    }
+    // Resolution only ever stops at a symbolic link when `O_NOFOLLOW` told it
+    // to, so reaching one here is that flag's answer.
+    if type_ == FileType::SymLink {
+        return Err(LxError::ELOOP);
+    }
+    if type_ == FileType::Dir && flags.writable() {
+        return Err(LxError::EISDIR);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod open_flag_tests {
+    use super::*;
+
+    /// The numbers are UABI and every one of them is a bit userspace sends.
+    /// A constant with the wrong value here is not a compile error anywhere:
+    /// it is a flag that quietly means something else.
+    #[test]
+    fn the_flags_carry_the_numbers_userspace_sends() {
+        for (flag, value) in [
+            (OpenFlags::WRONLY, 0o1),
+            (OpenFlags::RDWR, 0o2),
+            (OpenFlags::CREATE, 0o100),
+            (OpenFlags::EXCLUSIVE, 0o200),
+            (OpenFlags::NOCTTY, 0o400),
+            (OpenFlags::TRUNCATE, 0o1000),
+            (OpenFlags::APPEND, 0o2000),
+            (OpenFlags::NON_BLOCK, 0o4000),
+            (OpenFlags::DSYNC, 0o10000),
+            (OpenFlags::ASYNC, 0o20000),
+            (OpenFlags::DIRECT, 0o40000),
+            (OpenFlags::LARGEFILE, 0o100000),
+            (OpenFlags::DIRECTORY, 0o200000),
+            (OpenFlags::NOFOLLOW, 0o400000),
+            (OpenFlags::NOATIME, 0o1000000),
+            (OpenFlags::CLOEXEC, 0o2000000),
+            (OpenFlags::SYNC, 0o4010000),
+        ] {
+            assert_eq!(flag.bits(), value, "{flag:?}");
+        }
+    }
+
+    /// The two that used to fall out of `from_bits_truncate` are the two that
+    /// change what the call does.
+    #[test]
+    fn the_flags_that_decide_survive_being_parsed() {
+        let parsed = OpenFlags::from_bits_truncate(0o200000 | 0o400000 | 0o2);
+        assert!(parsed.contains(OpenFlags::DIRECTORY));
+        assert!(parsed.contains(OpenFlags::NOFOLLOW));
+        assert!(parsed.writable());
+    }
+
+    /// `O_PATH` and `O_TMPFILE` stay unnamed on purpose: each changes what the
+    /// descriptor IS, and naming a flag this kernel does not honour is the
+    /// same silent lie as dropping one it should.
+    #[test]
+    fn the_flags_this_kernel_does_not_honour_stay_out() {
+        for bit in [0o10000000usize, 0o20000000] {
+            assert_eq!(OpenFlags::from_bits_truncate(bit), OpenFlags::RDONLY);
+        }
+    }
+
+    #[test]
+    fn a_directory_open_wants_a_directory() {
+        let dir_only = OpenFlags::DIRECTORY;
+        assert_eq!(open_resolved_type(dir_only, FileType::Dir), Ok(()));
+        for other in [
+            FileType::File,
+            FileType::CharDevice,
+            FileType::BlockDevice,
+            FileType::NamedPipe,
+            FileType::Socket,
+        ] {
+            assert_eq!(
+                open_resolved_type(dir_only, other),
+                Err(LxError::ENOTDIR),
+                "{other:?}"
+            );
+        }
+    }
+
+    /// A symbolic link is not a directory whatever it points at, so the two
+    /// flags together answer ENOTDIR and not ELOOP.
+    #[test]
+    fn a_link_asked_for_as_a_directory_is_not_a_directory() {
+        assert_eq!(
+            open_resolved_type(OpenFlags::DIRECTORY, FileType::SymLink),
+            Err(LxError::ENOTDIR)
+        );
+        assert_eq!(
+            open_resolved_type(OpenFlags::NOFOLLOW, FileType::SymLink),
+            Err(LxError::ELOOP)
+        );
+    }
+
+    /// Reaching a symbolic link at all means `O_NOFOLLOW` stopped there.
+    #[test]
+    fn a_link_reached_by_the_open_is_the_end_of_it() {
+        assert_eq!(
+            open_resolved_type(OpenFlags::RDONLY, FileType::SymLink),
+            Err(LxError::ELOOP)
+        );
+    }
+
+    /// The one check that was already here keeps its answer, and its place
+    /// after the other two.
+    #[test]
+    fn a_directory_still_cannot_be_opened_for_writing() {
+        assert_eq!(open_resolved_type(OpenFlags::RDONLY, FileType::Dir), Ok(()));
+        assert_eq!(
+            open_resolved_type(OpenFlags::WRONLY, FileType::Dir),
+            Err(LxError::EISDIR)
+        );
+        assert_eq!(
+            open_resolved_type(OpenFlags::RDWR, FileType::Dir),
+            Err(LxError::EISDIR)
+        );
+        // And with O_DIRECTORY beside it the directory is still the thing it
+        // asked for; only the write is wrong.
+        assert_eq!(
+            open_resolved_type(OpenFlags::DIRECTORY | OpenFlags::WRONLY, FileType::Dir),
+            Err(LxError::EISDIR)
+        );
+    }
+
+    #[test]
+    fn an_ordinary_open_of_an_ordinary_file_is_none_of_their_business() {
+        for flags in [
+            OpenFlags::RDONLY,
+            OpenFlags::RDWR,
+            OpenFlags::NOFOLLOW,
+            OpenFlags::NOATIME | OpenFlags::DIRECT | OpenFlags::LARGEFILE,
+        ] {
+            assert_eq!(
+                open_resolved_type(flags, FileType::File),
+                Ok(()),
+                "{flags:?}"
+            );
         }
     }
 }
