@@ -111,4 +111,28 @@ pub fn secondary_init() {
         plic.name()
     );
     plic.init_hart();
+    // Join the online set, exactly as x86's and aarch64's `ap_signal_online`
+    // do at the end of their own `secondary_init`. Without it `CPU_ONLINE`
+    // stayed at "BSP only" forever on riscv however many harts came up, and
+    // three things read that mask:
+    //
+    //  * `wake_kick_wanted`, which every reschedule IPI goes through. A hart
+    //    that is not in the mask "is running no task, so there is nothing on
+    //    it to wake" — so the kick was dropped and the task that had just
+    //    been made runnable waited for the hart's next 250 Hz tick, up to
+    //    4 ms. That is the cost #1398 removed by giving riscv a
+    //    `send_wake_ipi` body at all, taken right back at the gate in front
+    //    of it;
+    //  * `sched_getaffinity`, which hands the mask to userspace, so `nproc`
+    //    answered 1 and every thread pool sized itself for one hart;
+    //  * the `/proc` busy% and perf denominators, which divide by the online
+    //    count.
+    //
+    // This is the end of `secondary_init`, the same point in bring-up the
+    // other two use: the hart has its dense logical id (`register_logical_id`
+    // ran in `percpu`), its page table and its PLIC context. Being online is
+    // deliberately NOT being an IPI target — that is `IPI_READY`, published
+    // later from the executor's own entry path, once this hart runs with
+    // interrupts on and can actually ack a shootdown.
+    crate::common::ipi::mark_cpu_online(crate::cpu::cpu_id() as usize);
 }
