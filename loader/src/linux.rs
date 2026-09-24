@@ -702,7 +702,6 @@ fn handle_signal(
             thread.inner().lock_linux().handling_signal = None;
             return ctx;
         }
-        let code = 128 + signal as i32;
         // Resolve addresses back to "<file>+<offset>" through the process's own
         // mappings. A bare `pc=0x499f8c` is unusable — the same number means a
         // different function in every process — while `libglib-2.0.so.0+0x1f8c`
@@ -725,11 +724,13 @@ fn handle_signal(
         // otherwise vanishes with no trace at all, and a `Done(139)`/silent exit
         // gives no clue which signal took it down.
         error!(
-            "[exit] pid={} ({}) killed by signal {:?} ({}) at pc={:#x} [{}] (default disposition)",
+            "[exit] pid={} ({}) killed by signal {:?} ({}, shells print {}) at pc={:#x} \
+             [{}] (default disposition)",
             thread.proc().id(),
             thread.proc().name(),
             signal,
             signal as i32,
+            128 + signal as i32,
             user_pc,
             resolve(user_pc).unwrap_or_else(|| String::from("unmapped")),
         );
@@ -796,7 +797,12 @@ fn handle_signal(
                 frames
             );
         }
-        thread.proc().exit(code as i64);
+        // `code` above is the number a SHELL prints for a signal death
+        // (128 + n); the STATUS a `wait` reads is a different shape entirely.
+        // Store "killed by this signal", so `WIFSIGNALED` can be true.
+        thread
+            .proc()
+            .exit(linux_object::process::exit_code_killed_by(signal as u8));
         return ctx;
     }
     // The set the handler runs under: what the thread already had blocked,
@@ -879,7 +885,11 @@ fn handle_signal(
                 signal,
                 user_sp,
             );
-            thread.proc().exit(128 + Signal::SIGSEGV as i64);
+            thread
+                .proc()
+                .exit(linux_object::process::exit_code_killed_by(
+                    Signal::SIGSEGV as u8,
+                ));
             return ctx;
         }
     };

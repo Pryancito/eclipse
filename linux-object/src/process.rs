@@ -472,6 +472,39 @@ pub fn wait_status_stopped(sig: u8) -> i32 {
     ((sig as i32) << 8) | 0x7f
 }
 
+/// The exit code a process object carries when a SIGNAL killed it.
+///
+/// Negative, because the `i64` has to say WHICH of the two ways a process can
+/// finish this was, and every ordinary exit code is a byte. The default-action
+/// kill path used to store `128 + signo` -- the number a SHELL prints, which
+/// is the shell's own arithmetic over `WIFSIGNALED`, not a status word -- so
+/// the kernel reported every killed process as one that had called
+/// `exit(128 + n)`, and nothing downstream could tell the two apart (a program
+/// that really does `exit(137)` is not a process killed by SIGKILL).
+pub const fn exit_code_killed_by(sig: u8) -> i64 {
+    -(sig as i64)
+}
+
+/// The `wait(2)` status word for a child that has finished: `WIFEXITED` with
+/// `WEXITSTATUS`, or `WIFSIGNALED` with `WTERMSIG`.
+///
+/// `sys/wait.h`: a status whose low seven bits are zero is an exit, and the
+/// code is the SECOND byte; a status whose low seven bits are a signal number
+/// is a death by that signal. The two are read apart by those seven bits, so
+/// a kernel that only ever writes the first shape leaves `WIFSIGNALED` false
+/// for every process it killed -- `system()` cannot tell a failed command from
+/// an interrupted one, and a shell never prints "Killed".
+pub fn wait_status_exited(raw: i64) -> i32 {
+    if raw < 0 {
+        // Killed by `-raw`. No core-dump bit: this kernel dumps no cores.
+        (-raw as i32) & 0x7f
+    } else {
+        // exit(2) takes an int and the parent sees only its low byte, which
+        // is why `exit(256)` is `exit(0)`.
+        ((raw as i32) & 0xff) << 8
+    }
+}
+
 /// `wait` status word for a continued child: `WIFCONTINUED`.
 pub const WAIT_STATUS_CONTINUED: i32 = 0xffff;
 
@@ -519,7 +552,7 @@ pub async fn wait_child_interest(
                         inner.reaped_children.remove(&pid);
                         inner.add_children_cpu(cpu);
                     }
-                    return Ok(((code as i32) << 8, cpu));
+                    return Ok((wait_status_exited(code), cpu));
                 }
             }
         }
@@ -536,7 +569,7 @@ pub async fn wait_child_interest(
                     inner.reaped_children.remove(&pid);
                     inner.add_children_cpu(cpu);
                 }
-                return Ok(((code as i32) << 8, cpu));
+                return Ok((wait_status_exited(code), cpu));
             }
         }
         if let Some(status) = child
@@ -560,7 +593,7 @@ pub async fn wait_child_interest(
                     inner.reaped_children.remove(&pid);
                     inner.add_children_cpu(cpu);
                 }
-                return Ok(((code as i32) << 8, cpu));
+                return Ok((wait_status_exited(code), cpu));
             }
         }
         if let Some(status) = child
@@ -638,7 +671,7 @@ fn scan_waitable_children(
                 inner.reaped_children.remove(&pid);
                 inner.add_children_cpu(cpu);
             }
-            return Some(Ok((pid, (code as i32) << 8, cpu)));
+            return Some(Ok((pid, wait_status_exited(code), cpu)));
         }
     }
     let kids: Vec<(KoID, Arc<Process>)> = inner
@@ -659,7 +692,7 @@ fn scan_waitable_children(
                     inner.reaped_children.remove(&pid);
                     inner.add_children_cpu(cpu);
                 }
-                return Some(Ok((pid, (code as i32) << 8, cpu)));
+                return Some(Ok((pid, wait_status_exited(code), cpu)));
             }
         }
         if let Some(status) = child
@@ -4748,5 +4781,108 @@ mod signal_send_effect_tests {
         let mut inner = LinuxProcessInner::default();
         assert!(!inner.leave_stop(true));
         assert!(!inner.job_continued_pending);
+    }
+}
+
+#[cfg(test)]
+mod exit_status_tests {
+    //! The status word a `wait(2)` hands back, which is the ONLY thing a
+    //! parent learns about how its child finished.
+    //!
+    //! `sys/wait.h` packs two different endings into one int and tells them
+    //! apart by the low seven bits. This kernel only ever built one of the
+    //! two shapes: the default-action kill path stored `128 + signo` -- the
+    //! number a SHELL prints, which the shell computes ITSELF from
+    //! `WIFSIGNALED` -- and `wait` shifted it up eight bits like any exit
+    //! code. So every process the kernel killed was reported as one that had
+    //! called `exit(128 + n)`.
+
+    use super::*;
+
+    /// The macros from `sys/wait.h`, spelled as glibc spells them, so the
+    /// tests below ask the questions userspace asks.
+    fn wifexited(status: i32) -> bool {
+        status & 0x7f == 0
+    }
+    fn wexitstatus(status: i32) -> i32 {
+        (status >> 8) & 0xff
+    }
+    fn wifsignaled(status: i32) -> bool {
+        // `((signed char) (((status) & 0x7f) + 1) >> 1) > 0`
+        ((((status & 0x7f) + 1) as i8) >> 1) > 0
+    }
+    fn wtermsig(status: i32) -> i32 {
+        status & 0x7f
+    }
+
+    #[test]
+    fn an_ordinary_exit_is_an_exit_with_its_code() {
+        for code in [0i64, 1, 2, 42, 127, 255] {
+            let status = wait_status_exited(code);
+            assert!(wifexited(status), "exit({})", code);
+            assert!(!wifsignaled(status), "exit({})", code);
+            assert_eq!(wexitstatus(status), code as i32);
+        }
+    }
+
+    /// `exit(2)` takes an `int` and the parent sees only its low byte -- which
+    /// is why every shell script that ends in `exit(256)` reports success.
+    #[test]
+    fn only_the_low_byte_of_an_exit_code_reaches_the_parent() {
+        assert_eq!(wexitstatus(wait_status_exited(256)), 0);
+        assert_eq!(wexitstatus(wait_status_exited(257)), 1);
+        // And the whole word, not just what WEXITSTATUS masks back out: a
+        // status carrying bits above the second byte is not the status Linux
+        // hands over, and userspace is free to compare the int itself
+        // (`status == 0` is the idiom for "the command worked").
+        assert_eq!(wait_status_exited(256), 0);
+        assert_eq!(wait_status_exited(0x1234_5601), 1 << 8);
+    }
+
+    /// The shape that did not exist. `system()` and every supervisor use
+    /// `WIFSIGNALED` to tell a command that failed from one that was
+    /// interrupted, and a shell prints "Killed" off it.
+    #[test]
+    fn a_death_by_signal_says_so_and_names_the_signal() {
+        for sig in [
+            LinuxSignal::SIGHUP,
+            LinuxSignal::SIGINT,
+            LinuxSignal::SIGKILL,
+            LinuxSignal::SIGSEGV,
+            LinuxSignal::SIGPIPE,
+            LinuxSignal::SIGTERM,
+        ] {
+            let status = wait_status_exited(exit_code_killed_by(sig as u8));
+            assert!(wifsignaled(status), "killed by {:?}", sig);
+            assert!(!wifexited(status), "killed by {:?}", sig);
+            assert_eq!(wtermsig(status), sig as i32);
+        }
+    }
+
+    /// And the two are distinguishable, which is the whole point: storing
+    /// `128 + signo` made a SIGKILL indistinguishable from a program that
+    /// really does `exit(137)` -- and both then read as an ordinary exit.
+    #[test]
+    fn a_program_that_exits_with_137_is_not_a_process_killed_by_sigkill() {
+        let exited = wait_status_exited(128 + LinuxSignal::SIGKILL as i64);
+        let killed = wait_status_exited(exit_code_killed_by(LinuxSignal::SIGKILL as u8));
+        assert_ne!(exited, killed);
+        assert!(wifexited(exited) && !wifsignaled(exited));
+        assert!(wifsignaled(killed) && !wifexited(killed));
+        assert_eq!(wexitstatus(exited), 137);
+        assert_eq!(wtermsig(killed), 9);
+    }
+
+    /// A stopped child is the third shape, and it must not collide with the
+    /// other two: `0x7f` in the low byte is what `WIFSTOPPED` looks for.
+    #[test]
+    fn a_stop_is_neither_of_the_two() {
+        let status = wait_status_stopped(LinuxSignal::SIGTSTP as u8);
+        assert!(!wifexited(status));
+        assert!(
+            !wifsignaled(status),
+            "0x7f is the stop marker, not a signal"
+        );
+        assert_eq!(status & 0xff, 0x7f);
     }
 }
