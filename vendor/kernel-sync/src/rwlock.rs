@@ -17,9 +17,11 @@ pub struct RwLock<T: ?Sized> {
     data: UnsafeCell<T>,
 }
 
-const READER: usize = 1 << 2;
-const UPGRADED: usize = 1 << 1;
-const WRITER: usize = 1;
+/// One unit of the reader count, which occupies every bit above the two
+/// flags. `pub(crate)` so the tests in `tests.rs` can speak the protocol.
+pub(crate) const READER: usize = 1 << 2;
+pub(crate) const UPGRADED: usize = 1 << 1;
+pub(crate) const WRITER: usize = 1;
 
 /// The one spin discipline this file's four waiting loops share.
 ///
@@ -421,6 +423,26 @@ impl<T: ?Sized> RwLock<T> {
         // there's no need to lock the inner lock.
         unsafe { &mut *self.data.get() }
     }
+
+    /// The raw lock word, for the tests that speak the bit protocol.
+    #[cfg(test)]
+    pub(crate) fn raw_state(&self) -> usize {
+        self.lock.load(Ordering::SeqCst)
+    }
+
+    /// Add a reader count by hand, as `try_read` does *before* it looks at the
+    /// flags — the half-finished state another CPU is in while we hold the
+    /// lock. Paired with [`Self::take_reader_bit_back`], which is the line
+    /// `try_read` runs next when it finds the lock taken.
+    #[cfg(test)]
+    pub(crate) fn add_reader_bit_as_try_read_does(&self) {
+        self.lock.fetch_add(READER, Ordering::AcqRel);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn take_reader_bit_back(&self) {
+        self.lock.fetch_sub(READER, Ordering::AcqRel);
+    }
 }
 
 impl<T: ?Sized + fmt::Debug> fmt::Debug for RwLock<T> {
@@ -690,8 +712,29 @@ impl<'rwlock, T: ?Sized> RwLockWriteGuard<'rwlock, T> {
             WRITER
         );
 
-        // Reserve the read guard for ourselves
-        self.inner.lock.store(UPGRADED, Ordering::Release);
+        // Take UPGRADED first and give WRITER back second, both with
+        // read-modify-write ops.
+        //
+        // This was one blind `store(UPGRADED)`, which is the whole word: it
+        // wiped the reader count in the bits above the two flags. Holding
+        // WRITER does not mean the count is zero. `try_read` adds its READER
+        // *before* it looks at the flags, and takes it back only on the next
+        // line, so at any instant a lock held for writing can read
+        // `WRITER | n*READER` with `n` readers in that window. The store ate
+        // those additions; their `fetch_sub` then underflowed the word to
+        // `0xffff_ffff_ffff_fffe`, and once this guard dropped, to
+        // `…fffc` — WRITER clear, UPGRADED clear, and a reader count of 2^62.
+        // `try_write` compare-exchanges from **0**, so from that moment no
+        // writer can ever take this lock again and no reader can either. A
+        // kernel `RwLock` wedged for good, with interrupts off.
+        //
+        // The two sibling downgrades never had this: both already use
+        // `fetch_add`/`fetch_and`, which leave the other bits alone. Nor does
+        // the lock ever look free in between here — after the `fetch_or` it
+        // reads `WRITER | UPGRADED`, which refuses readers, writers and
+        // upgradeable readers alike.
+        self.inner.lock.fetch_or(UPGRADED, Ordering::Relaxed);
+        self.inner.lock.fetch_and(!WRITER, Ordering::Release);
 
         let inner = self.inner;
 
@@ -902,3 +945,4 @@ mod spin_discipline_tests {
         crate::deadlock::set_deadlock_spins(0);
     }
 }
+

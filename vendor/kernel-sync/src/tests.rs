@@ -544,3 +544,274 @@ fn an_upgrade_waiting_on_a_reader_drains_its_own_shootdown_queue() {
         assert_eq!(*LOCK.read(), 5);
     });
 }
+
+// ── the rwlock's own state word ──────────────────────────────────────────────
+//
+// Everything above tests what the guards do to this CPU's interrupt-disable
+// depth. None of it tests what they do to the lock, and the lock is one
+// `AtomicUsize` carrying three things at once: a WRITER bit, an UPGRADED bit,
+// and a reader count in every bit above them. The three are written by nine
+// different call sites — three acquires, three drops, two downgrades and an
+// upgrade — and one of them wiped the count.
+
+use crate::rwlock::{READER, UPGRADED, WRITER};
+
+#[test]
+fn a_free_lock_is_a_zero_word() {
+    on_a_cpu(|| {
+        let l = RwLock::new(0u32);
+        assert_eq!(l.raw_state(), 0);
+        assert_eq!(l.reader_count(), 0);
+        assert_eq!(l.writer_count(), 0);
+    });
+}
+
+#[test]
+fn a_writer_excludes_everyone_and_says_so() {
+    on_a_cpu(|| {
+        let l = RwLock::new(1u32);
+        let w = l.write();
+        assert_eq!(l.raw_state(), WRITER);
+        assert_eq!(l.writer_count(), 1);
+        assert_eq!(l.reader_count(), 0);
+        assert!(l.try_read().is_none(), "a reader got in under a writer");
+        assert!(l.try_write().is_none(), "two writers at once");
+        assert!(l.try_upgradeable_read().is_none());
+        drop(w);
+        assert_eq!(l.raw_state(), 0, "the writer owes both bits back");
+    });
+}
+
+#[test]
+fn readers_share_and_are_counted_one_by_one() {
+    on_a_cpu(|| {
+        let l = RwLock::new(2u32);
+        let a = l.read();
+        let b = l.read();
+        assert_eq!(l.raw_state(), 2 * READER);
+        assert_eq!(l.reader_count(), 2);
+        assert_eq!(l.writer_count(), 0);
+        assert!(l.try_write().is_none(), "a writer got in under two readers");
+        drop(a);
+        assert_eq!(l.reader_count(), 1);
+        drop(b);
+        assert_eq!(l.raw_state(), 0);
+        assert!(l.try_write().is_some(), "the last reader left it held");
+    });
+}
+
+#[test]
+fn an_upgradeable_reader_shuts_the_door_behind_it() {
+    on_a_cpu(|| {
+        let l = RwLock::new(3u32);
+        let r = l.read();
+        let u = l.upgradeable_read();
+        // It may be taken alongside existing readers, and it counts as one.
+        assert_eq!(l.raw_state(), READER | UPGRADED);
+        assert_eq!(l.reader_count(), 2, "the upgradeable reader is a reader");
+        // But no NEW reader joins, which is what keeps the upgrade from
+        // starving behind an endless stream of them.
+        assert!(l.try_read().is_none());
+        assert!(l.try_upgradeable_read().is_none(), "two upgraders at once");
+        assert!(l.try_write().is_none());
+        drop(u);
+        assert_eq!(l.raw_state(), READER);
+        assert!(l.try_read().is_some(), "the door stayed shut");
+        drop(r);
+    });
+}
+
+#[test]
+fn an_upgrade_waits_for_the_last_reader_and_then_owns_the_lock_alone() {
+    on_a_cpu(|| {
+        let l = RwLock::new(4u32);
+        let r = l.read();
+        let u = l.upgradeable_read();
+        let u = match u.try_upgrade() {
+            Ok(_) => panic!("upgraded while a reader still held the lock"),
+            Err(u) => u,
+        };
+        drop(r);
+        assert_eq!(l.raw_state(), UPGRADED, "only the upgradeable guard left");
+        let mut w = u.try_upgrade().expect("the last reader is gone");
+        assert_eq!(l.raw_state(), WRITER, "an upgrade is a writer, not both");
+        *w = 5;
+        drop(w);
+        assert_eq!(l.raw_state(), 0);
+        assert_eq!(*l.read(), 5);
+    });
+}
+
+#[test]
+fn a_refused_upgrade_keeps_the_lock_exactly_as_it_was() {
+    on_a_cpu(|| {
+        let l = RwLock::new(6u32);
+        let r = l.read();
+        let u = l.upgradeable_read();
+        let before = l.raw_state();
+        let u = u.try_upgrade().err().expect("a reader still holds it");
+        assert_eq!(
+            l.raw_state(),
+            before,
+            "a failed upgrade must give the word back untouched, or the \
+             guard it hands back is no longer describing the lock"
+        );
+        drop(u);
+        drop(r);
+        assert_eq!(l.raw_state(), 0);
+    });
+}
+
+#[test]
+fn a_writer_that_downgrades_keeps_the_lock_the_whole_way() {
+    on_a_cpu(|| {
+        let l = RwLock::new(7u32);
+        let mut w = l.write();
+        *w = 8;
+        let r = w.downgrade();
+        assert_eq!(l.raw_state(), READER, "the writer bit had to go, alone");
+        assert_eq!(*r, 8, "the downgrade read a value the writer never wrote");
+        assert!(l.try_read().is_some(), "a downgrade opens the door to readers");
+        assert!(l.try_write().is_none(), "and keeps it shut to writers");
+        drop(r);
+        assert_eq!(l.raw_state(), 0);
+    });
+}
+
+#[test]
+fn an_upgradeable_reader_that_downgrades_becomes_an_ordinary_one() {
+    on_a_cpu(|| {
+        let l = RwLock::new(9u32);
+        let u = l.upgradeable_read();
+        let r = u.downgrade();
+        assert_eq!(l.raw_state(), READER, "the upgraded bit had to go, alone");
+        assert!(l.try_read().is_some(), "the door has to open again");
+        assert!(l.try_upgradeable_read().is_some());
+        drop(r);
+    });
+}
+
+#[test]
+fn a_writer_that_downgrades_to_upgradeable_keeps_a_reader_in_flight() {
+    // The bug: this downgrade was one blind `store(UPGRADED)` — the whole
+    // word — so it wiped the reader count in the bits above the two flags.
+    //
+    // Holding WRITER does not mean that count is zero. `try_read` adds its
+    // READER *before* it looks at the flags and takes it back only on the
+    // next line, so a lock held for writing reads `WRITER | n*READER` for as
+    // long as `n` readers are in that window. The store ate those additions;
+    // their `fetch_sub` then underflowed the word, and once this guard
+    // dropped the lock read `0xffff_ffff_ffff_fffc`: no WRITER, no UPGRADED,
+    // and a reader count of 2^62. `try_write` compare-exchanges from zero, so
+    // from that instant no writer could ever take this lock again, and no
+    // reader either.
+    on_a_cpu(|| {
+        let l = RwLock::new(10u32);
+        let w = l.write();
+        // Another CPU is halfway through `try_read`.
+        l.add_reader_bit_as_try_read_does();
+        let u = w.downgrade_to_upgradeable();
+        // …and now runs the line it was about to run.
+        l.take_reader_bit_back();
+        assert_eq!(
+            l.raw_state(),
+            UPGRADED,
+            "the reader took back a count this downgrade had already wiped"
+        );
+        drop(u);
+        assert_eq!(l.raw_state(), 0, "the lock has to be free again");
+        assert!(
+            l.try_write().is_some(),
+            "and acquirable — this is the state the lock never came back from"
+        );
+    });
+}
+
+#[test]
+fn a_reader_in_flight_survives_every_release_that_can_race_it() {
+    // The same window, against the other three sites that rewrite the word
+    // while the lock is held. None of them may use a blind store either.
+    on_a_cpu(|| {
+        let l = RwLock::new(11u32);
+
+        let w = l.write();
+        l.add_reader_bit_as_try_read_does();
+        drop(w);
+        l.take_reader_bit_back();
+        assert_eq!(l.raw_state(), 0, "the write guard's drop ate a count");
+
+        let w = l.write();
+        l.add_reader_bit_as_try_read_does();
+        let r = w.downgrade();
+        l.take_reader_bit_back();
+        assert_eq!(l.raw_state(), READER, "the downgrade to a reader ate one");
+        drop(r);
+
+        let u = l.upgradeable_read();
+        l.add_reader_bit_as_try_read_does();
+        let r = u.downgrade();
+        l.take_reader_bit_back();
+        assert_eq!(l.raw_state(), READER, "the upgradeable downgrade ate one");
+        drop(r);
+        assert_eq!(l.raw_state(), 0);
+    });
+}
+
+#[test]
+fn a_refused_try_read_leaves_the_word_as_it_found_it() {
+    on_a_cpu(|| {
+        let l = RwLock::new(12u32);
+        let w = l.write();
+        assert!(l.try_read().is_none());
+        assert!(l.try_read().is_none());
+        assert_eq!(
+            l.raw_state(),
+            WRITER,
+            "a refused reader has to take its own count back"
+        );
+        drop(w);
+        assert_eq!(l.raw_state(), 0);
+    });
+}
+
+#[test]
+fn a_refused_upgradeable_read_leaves_its_bit_for_the_holder_to_clear() {
+    // The one acquire that does NOT tidy up after itself, and on purpose: the
+    // bit it set is indistinguishable from the holder's own, so taking it back
+    // would release somebody else's lock. The holder clears both bits.
+    on_a_cpu(|| {
+        let l = RwLock::new(13u32);
+        let w = l.write();
+        assert!(l.try_upgradeable_read().is_none());
+        assert_eq!(l.raw_state(), WRITER | UPGRADED);
+        drop(w);
+        assert_eq!(
+            l.raw_state(),
+            0,
+            "the writer owes back the upgraded bit a refused acquire left"
+        );
+        assert!(l.try_write().is_some());
+    });
+}
+
+#[test]
+fn the_counts_read_the_word_the_way_the_protocol_writes_it() {
+    on_a_cpu(|| {
+        let l = RwLock::new(14u32);
+        let a = l.read();
+        let b = l.read();
+        let u = l.upgradeable_read();
+        // Three readers' worth, and the flags must not be counted as one of
+        // them: `reader_count` divides by READER, which is 4, so a stray
+        // WRITER or UPGRADED bit would have to be added by hand — and is.
+        assert_eq!(l.reader_count(), 3);
+        assert_eq!(l.writer_count(), 0);
+        drop(u);
+        drop(b);
+        drop(a);
+        let w = l.write();
+        assert_eq!(l.writer_count(), 1);
+        assert_eq!(l.reader_count(), 0, "a writer is not a reader");
+        drop(w);
+    });
+}
