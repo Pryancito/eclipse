@@ -132,6 +132,13 @@ impl SemArray {
         self.semid_ds.lock().perm.may_control(euid)
     }
 
+    /// Whether `euid`/`egid` may use this set for `want`: `IPC_W` for a
+    /// `semop` that alters a semaphore or a `SETVAL`/`SETALL`, `IPC_R` for a
+    /// wait-for-zero, a `GET*` or an `IPC_STAT`. See [`IpcPerm::may_access`].
+    pub fn may_access(&self, euid: u32, egid: u32, want: u32) -> bool {
+        self.semid_ds.lock().perm.may_access(euid, egid, want)
+    }
+
     /// Get the semaphore array with `key`, following semget(2).
     /// If not exist, create a new one with `nsems` elements.
     ///
@@ -169,6 +176,11 @@ impl SemArray {
                     }
                     if nsems > array.len() {
                         return Err(LxError::EINVAL);
+                    }
+                    // Somebody else's set. Asking for a mode it will not grant
+                    // is EACCES, not a working id (`ipc_check_perms`).
+                    if !array.may_access(uid, gid, IpcPerm::requested_mode(flags)) {
+                        return Err(LxError::EACCES);
                     }
                     return Ok(array);
                 }
@@ -228,6 +240,7 @@ impl SemArray {
 #[cfg(test)]
 mod sem_tests {
     use super::*;
+    use crate::ipc::{IPC_R, IPC_W};
 
     use super::test_globals::lock as test_lock;
 
@@ -520,6 +533,57 @@ mod sem_tests {
         assert_eq!(a.set(&ds, OWNER), Ok(()));
         assert!(a.may_control(OWNER));
         assert!(a.may_control(STRANGER));
+    }
+
+    // ---------------------------------------------- who may USE the set
+
+    /// `semget` resolving an existing key is `ipc_check_perms`: the set may
+    /// be somebody else's, and asking it for a mode it will not grant is
+    /// EACCES.
+    #[test]
+    fn semget_refuses_a_key_that_belongs_to_somebody_else() {
+        let _guard = test_lock();
+        let owned = SemArray::get_or_create(7701, 2, CREAT | 0o600, OWNER, OWNER).unwrap();
+        assert!(Arc::ptr_eq(
+            &SemArray::get_or_create(7701, 2, 0o600, OWNER, OWNER).unwrap(),
+            &owned
+        ));
+        assert_eq!(
+            SemArray::get_or_create(7701, 2, 0o600, STRANGER, STRANGER).err(),
+            Some(LxError::EACCES)
+        );
+        assert!(
+            SemArray::get_or_create(7701, 2, 0, STRANGER, STRANGER).is_ok(),
+            "a bare existence probe asks for nothing"
+        );
+        assert!(SemArray::get_or_create(7701, 2, 0o600, ROOT, ROOT).is_ok());
+        drop(owned);
+    }
+
+    /// The size check comes first, as it does in `ipcget_public`
+    /// (`more_checks` runs before `ipc_check_perms`): a set too small is
+    /// EINVAL even for a caller the mode would have refused anyway.
+    #[test]
+    fn a_set_too_small_is_einval_before_it_is_eacces() {
+        let _guard = test_lock();
+        let owned = SemArray::get_or_create(7702, 2, CREAT | 0o600, OWNER, OWNER).unwrap();
+        assert_eq!(
+            SemArray::get_or_create(7702, 9, 0o600, STRANGER, STRANGER).err(),
+            Some(LxError::EINVAL)
+        );
+        drop(owned);
+    }
+
+    /// `semop` needs write for anything that alters a semaphore and read for
+    /// a wait-for-zero; `SETVAL` write, `GETVAL` read.
+    #[test]
+    fn a_set_answers_for_itself_who_may_alter_it() {
+        let _guard = test_lock();
+        let array = SemArray::get_or_create(7703, 1, CREAT | 0o640, OWNER, OWNER).unwrap();
+        assert!(array.may_access(OWNER, OWNER, IPC_R | IPC_W));
+        assert!(array.may_access(STRANGER, OWNER, IPC_R));
+        assert!(!array.may_access(STRANGER, OWNER, IPC_W));
+        assert!(!array.may_access(STRANGER, STRANGER, IPC_R));
     }
 }
 

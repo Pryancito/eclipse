@@ -166,6 +166,21 @@ impl ShmIdentifier {
                         // exclusive
                         return Err(LxError::EEXIST);
                     }
+                    // `semget` already refused an existing set smaller than
+                    // what was asked for; this is the same question, and the
+                    // answer here was a segment the caller believes is bigger
+                    // than it is, so every access past the end is a fault it
+                    // had no way to see coming.
+                    if memsize > guard.lock().segsz() {
+                        return Err(LxError::EINVAL);
+                    }
+                    // Somebody else's segment. See `msg_get`.
+                    if !guard
+                        .lock()
+                        .may_access(uid, gid, IpcPerm::requested_mode(flags))
+                    {
+                        return Err(LxError::EACCES);
+                    }
                     return Ok(guard);
                 }
             }
@@ -259,6 +274,18 @@ impl ShmGuard {
         self.shmid_ds.lock().perm.may_control(euid)
     }
 
+    /// Whether `euid`/`egid` may use this segment for `want`: `IPC_R` to
+    /// attach read-only, `IPC_R | IPC_W` otherwise, `IPC_R` for an
+    /// `IPC_STAT`. See [`IpcPerm::may_access`].
+    pub fn may_access(&self, euid: u32, egid: u32, want: u32) -> bool {
+        self.shmid_ds.lock().perm.may_access(euid, egid, want)
+    }
+
+    /// The segment's size in bytes, as `shmget` and `IPC_STAT` report it.
+    pub fn segsz(&self) -> usize {
+        self.shmid_ds.lock().segsz
+    }
+
     /// remove Shared memory
     ///
     /// A private segment carries key 0 and was never filed under it, so for
@@ -285,6 +312,7 @@ impl ShmGuard {
 #[cfg(test)]
 mod shm_tests {
     use super::*;
+    use crate::ipc::{IPC_R, IPC_W};
 
     extern crate std;
 
@@ -742,5 +770,66 @@ mod shm_tests {
         assert_eq!(g.set(&ds, OWNER), Ok(()));
         assert!(g.may_control(OWNER));
         assert!(g.may_control(STRANGER));
+    }
+
+    // ---------------------------------------------- who may USE the segment
+
+    /// The hole this tanda closes: a `0600` segment could be attached, read
+    /// and written by any process that could name its key or id, because
+    /// naming it *was* the check.
+    #[test]
+    fn shmget_refuses_a_key_that_belongs_to_somebody_else() {
+        let _guard = test_lock();
+        clear_ids();
+        let owned = owned_get(6601, 4096, CREAT | 0o600, OWNER).unwrap();
+        assert!(Arc::ptr_eq(
+            &owned_get(6601, 4096, 0o600, OWNER).unwrap(),
+            &owned
+        ));
+        assert_eq!(
+            owned_get(6601, 4096, 0o600, STRANGER).err(),
+            Some(LxError::EACCES)
+        );
+        assert!(
+            owned_get(6601, 4096, 0, STRANGER).is_ok(),
+            "a bare existence probe asks for nothing"
+        );
+        assert!(owned_get(6601, 4096, 0o600, ROOT).is_ok(), "root passes");
+        drop(owned);
+        clear_ids();
+    }
+
+    /// `semget` already refused an existing set smaller than what was asked
+    /// for. This is the same question about a segment, and the answer used to
+    /// be a segment the caller believes is bigger than it is -- so every
+    /// access past the end is a fault it had no way to see coming.
+    #[test]
+    fn shmget_refuses_an_existing_segment_smaller_than_what_was_asked_for() {
+        let _guard = test_lock();
+        clear_ids();
+        let owned = get(6602, 4096, CREAT | 0o666).unwrap();
+        assert_eq!(get(6602, 8192, 0o600).err(), Some(LxError::EINVAL));
+        assert!(get(6602, 4096, 0o600).is_ok(), "exactly as big is fine");
+        assert!(get(6602, 0, 0o600).is_ok(), "and asking for less");
+        drop(owned);
+        clear_ids();
+    }
+
+    /// `shmat` needs read always and write unless `SHM_RDONLY`; `IPC_STAT`
+    /// needs read.
+    #[test]
+    fn a_segment_answers_for_itself_who_may_attach_it() {
+        let _guard = test_lock();
+        clear_ids();
+        let seg = owned_get(6603, 4096, CREAT | 0o640, OWNER).unwrap();
+        let guard = seg.lock();
+        assert!(guard.may_access(OWNER, OWNER, IPC_R | IPC_W));
+        assert!(guard.may_access(STRANGER, OWNER, IPC_R));
+        assert!(!guard.may_access(STRANGER, OWNER, IPC_R | IPC_W));
+        assert!(!guard.may_access(STRANGER, STRANGER, IPC_R));
+        assert_eq!(guard.segsz(), 4096);
+        drop(guard);
+        drop(seg);
+        clear_ids();
     }
 }
