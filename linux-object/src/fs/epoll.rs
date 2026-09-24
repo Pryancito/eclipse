@@ -10,6 +10,101 @@ use zircon_object::object::*;
 /// past this check couldn't make the check's own recursion unbounded either.
 const EPOLL_MAX_NEST_DEPTH: usize = 4;
 
+/// `epoll_ctl(2)` operations.
+const EPOLL_CTL_ADD: i32 = 1;
+/// See [`EPOLL_CTL_ADD`].
+const EPOLL_CTL_DEL: i32 = 2;
+/// See [`EPOLL_CTL_ADD`].
+const EPOLL_CTL_MOD: i32 = 3;
+
+/// The four `epoll_ctl(2)` event bits that live above the 16 bits a
+/// [`PollEvents`] can hold.
+///
+/// `EpollEvent::events` is a `u32` because Linux's `struct epoll_event` is,
+/// but every reader in this file used to narrow it with `event.events as u16`
+/// before handing it to `PollEvents::from_bits_truncate`. That cast dropped
+/// all four on the floor, and the one that matters is `EPOLLONESHOT`: a
+/// thread pool arms an fd with it precisely so that **one** worker is handed
+/// the event and the rest are not, and re-arms with `EPOLL_CTL_MOD` when it
+/// is done. Losing the bit turned that guarantee into its opposite -- the fd
+/// stayed armed and every waiter got it, which is the race the flag exists to
+/// prevent.
+const EPOLLEXCLUSIVE: u32 = 1 << 28;
+/// See [`EPOLLEXCLUSIVE`]. Keeps the system awake while the event is pending;
+/// this kernel has no suspend, so it is accepted and does nothing.
+const EPOLLWAKEUP: u32 = 1 << 29;
+/// See [`EPOLLEXCLUSIVE`]. Report the fd once, then disable the entry until
+/// an `EPOLL_CTL_MOD` re-arms it.
+const EPOLLONESHOT: u32 = 1 << 30;
+/// See [`EPOLLEXCLUSIVE`]. Edge-triggered. **Still level-triggered here**:
+/// the bit is stored and round-trips, but the readiness scan reports a level.
+/// A half-done edge trigger is worse than none -- a program that misses an
+/// edge waits forever -- so it is left honest and untouched.
+const EPOLLET: u32 = 1 << 31;
+
+/// The bits `EPOLLEXCLUSIVE` may be combined with (Linux's
+/// `EPOLLEXCLUSIVE_OK_BITS`): the two readiness bits, the two that are always
+/// reported, and the three flags that do not change who gets woken.
+const EPOLLEXCLUSIVE_OK_BITS: u32 = PollEvents::IN.bits() as u32
+    | PollEvents::OUT.bits() as u32
+    | PollEvents::ERR.bits() as u32
+    | PollEvents::HUP.bits() as u32
+    | EPOLLWAKEUP
+    | EPOLLET
+    | EPOLLEXCLUSIVE;
+
+/// The events one interest-list entry reports for a readiness status.
+///
+/// The stored mask decides all four bits, `EPOLLERR`/`EPOLLHUP` included.
+/// Those two are reported whether or not the caller asked for them, which is
+/// why [`epoll_ctl_events`] puts them into every mask it stores -- so that the
+/// one mask that reports nothing at all is the empty one, which only an
+/// `EPOLLONESHOT` delivery can produce. `ep_item_poll` is the same `&`.
+fn ready_events(events: u32, status: &PollStatus) -> u32 {
+    let interest = PollEvents::from_bits_truncate(events as u16);
+    let mut ready = PollEvents::empty();
+    if status.read {
+        ready |= PollEvents::IN;
+    }
+    if status.write {
+        ready |= PollEvents::OUT;
+    }
+    if status.error {
+        ready |= PollEvents::ERR;
+    }
+    if status.hangup {
+        ready |= PollEvents::HUP;
+    }
+    (ready & interest).bits() as u32
+}
+
+/// The event mask `epoll_ctl` stores for one interest-list entry, or the
+/// error Linux reports for the request.
+///
+/// `EPOLLEXCLUSIVE` is the only bit `do_epoll_ctl` validates, and it validates
+/// it three ways: it cannot be added by `EPOLL_CTL_MOD`, it cannot be put on a
+/// nested epoll, and it cannot be mixed with a bit outside
+/// [`EPOLLEXCLUSIVE_OK_BITS`]. All three exist because the flag changes *who*
+/// is woken, and a request whose wake-up set is ambiguous is refused rather
+/// than guessed at.
+///
+/// `EPOLLERR` and `EPOLLHUP` are forced in, as `do_epoll_ctl` does, so that
+/// the stored mask alone says what the entry reports. That is what lets an
+/// `EPOLLONESHOT` entry be disabled by zeroing its mask, the way
+/// `ep_send_events` does it, instead of carrying a second flag that every
+/// reader would have to remember to consult.
+fn epoll_ctl_events(op: i32, events: u32, target_is_epoll: bool) -> LxResult<u32> {
+    if events & EPOLLEXCLUSIVE != 0 {
+        if op == EPOLL_CTL_MOD {
+            return Err(LxError::EINVAL);
+        }
+        if target_is_epoll || events & !EPOLLEXCLUSIVE_OK_BITS != 0 {
+            return Err(LxError::EINVAL);
+        }
+    }
+    Ok(events | PollEvents::ERR.bits() as u32 | PollEvents::HUP.bits() as u32)
+}
+
 lazy_static::lazy_static! {
     /// Serializes EPOLL_CTL_ADD of a nested epoll (one epoll fd watching
     /// another) so the cycle/depth check and the insert happen as one atomic
@@ -72,10 +167,23 @@ impl Epoll {
         event: EpollEvent,
         file: Option<Arc<dyn FileLike>>,
     ) -> LxResult<usize> {
+        // The mask is settled before the interest list is touched, as
+        // `do_epoll_ctl` does it: a request this kernel will not honour is
+        // EINVAL whether or not the fd happens to be watched already, and the
+        // stored mask is the one the readiness scan will be held to.
+        let event = if op == EPOLL_CTL_ADD || op == EPOLL_CTL_MOD {
+            let target = file.as_ref().ok_or(LxError::EBADF)?;
+            let target_is_epoll = target.clone().downcast_arc::<Epoll>().is_ok();
+            EpollEvent {
+                events: epoll_ctl_events(op, event.events, target_is_epoll)?,
+                data: event.data,
+            }
+        } else {
+            event
+        };
         let mut inner = self.inner.lock();
         match op {
-            1 => {
-                // EPOLL_CTL_ADD
+            EPOLL_CTL_ADD => {
                 if inner.interest_list.contains_key(&fd) {
                     return Err(LxError::EEXIST);
                 }
@@ -108,12 +216,10 @@ impl Epoll {
                 }
                 inner.interest_list.insert(fd, (event, file));
             }
-            2 => {
-                // EPOLL_CTL_DEL
+            EPOLL_CTL_DEL => {
                 inner.interest_list.remove(&fd).ok_or(LxError::ENOENT)?;
             }
-            3 => {
-                // EPOLL_CTL_MOD
+            EPOLL_CTL_MOD => {
                 let file = file.ok_or(LxError::EBADF)?;
                 let e = inner.interest_list.get_mut(&fd).ok_or(LxError::ENOENT)?;
                 *e = (event, file);
@@ -121,6 +227,32 @@ impl Epoll {
             _ => return Err(LxError::EINVAL),
         }
         Ok(0)
+    }
+
+    /// Disable the entries an `EPOLLONESHOT` delivery has just used up.
+    ///
+    /// `ep_send_events` clears the event bits of a one-shot entry as it hands
+    /// the event out, leaving the entry in the interest list reporting nothing
+    /// until an `EPOLL_CTL_MOD` puts a mask back. Zeroing the mask is the
+    /// whole mechanism, which is why `epoll_ctl` forces `EPOLLERR`/`EPOLLHUP`
+    /// in: an armed entry can never have an empty mask by accident.
+    ///
+    /// The scan runs on a snapshot taken without the lock, so the file handle
+    /// is compared by pointer before anything is written: between the scan and
+    /// here, another thread may have dropped this fd and handed the number to
+    /// a different file, and that one was never delivered anything.
+    fn disarm_oneshot(&self, delivered: &[(FileDesc, Arc<dyn FileLike>)]) {
+        if delivered.is_empty() {
+            return;
+        }
+        let mut inner = self.inner.lock();
+        for (fd, file) in delivered {
+            if let Some((event, current)) = inner.interest_list.get_mut(fd) {
+                if event.events & EPOLLONESHOT != 0 && Arc::ptr_eq(current, file) {
+                    event.events = 0;
+                }
+            }
+        }
     }
 
     /// Whether `needle` (some other epoll, compared by identity) is
@@ -191,11 +323,7 @@ impl Epoll {
             }
             let interest = PollEvents::from_bits_truncate(event.events as u16);
             if let Ok(status) = file.poll(interest) {
-                if (status.read && interest.contains(PollEvents::IN))
-                    || (status.write && interest.contains(PollEvents::OUT))
-                    || status.error
-                    || status.hangup
-                {
+                if ready_events(event.events, &status) != 0 {
                     return true;
                 }
             }
@@ -291,31 +419,24 @@ impl Epoll {
             // in `__from_user` at session start. Wakeups come from the 4 ms
             // IoMultiplexWait tick (and HID/NET IRQ registration there).
             let mut events = Vec::new();
-            for (_fd, event, file) in &interest_list {
+            let mut delivered = Vec::new();
+            for (fd, event, file) in &interest_list {
                 let interest = PollEvents::from_bits_truncate(event.events as u16);
                 let status = match file.poll(interest) {
                     Ok(status) => status,
                     Err(err) => return Err(err),
                 };
-                let mut ready_events = 0u32;
-                if status.read && interest.contains(PollEvents::IN) {
-                    ready_events |= PollEvents::IN.bits() as u32;
-                }
-                if status.write && interest.contains(PollEvents::OUT) {
-                    ready_events |= PollEvents::OUT.bits() as u32;
-                }
-                if status.error {
-                    ready_events |= PollEvents::ERR.bits() as u32;
-                }
-                if status.hangup {
-                    ready_events |= PollEvents::HUP.bits() as u32;
-                }
-
-                if ready_events != 0 {
+                let ready = ready_events(event.events, &status);
+                if ready != 0 {
                     events.push(EpollEvent {
-                        events: ready_events,
+                        events: ready,
                         data: event.data,
                     });
+                    // Which of these is an `EPOLLONESHOT` entry is decided in
+                    // `disarm_oneshot`, under the lock: this snapshot was
+                    // taken without it, and a mask read from it can already
+                    // be stale.
+                    delivered.push((*fd, file.clone()));
                     if events.len() >= maxevents {
                         break;
                     }
@@ -323,6 +444,7 @@ impl Epoll {
             }
 
             if !events.is_empty() {
+                self.disarm_oneshot(&delivered);
                 return Ok(events);
             }
 
@@ -622,5 +744,301 @@ mod tests {
             !copy.poll(PollEvents::IN).unwrap().read,
             "a watch dropped through one fd is dropped for both"
         );
+    }
+}
+
+#[cfg(test)]
+mod flag_tests {
+    //! The four `epoll_ctl(2)` bits that live above the sixteen a
+    //! [`PollEvents`] holds, and what `EPOLLONESHOT` owes the caller once its
+    //! event has been handed out.
+    //!
+    //! `Epoll::wait` needs a process and the timer, so the decisions it makes
+    //! are tested where they live: [`epoll_ctl_events`] for what a request
+    //! stores, [`ready_events`] for what an entry reports, and
+    //! `disarm_oneshot` for what a delivery uses up.
+
+    use super::*;
+    use crate::fs::eventfd::EventFd;
+
+    const ADD: i32 = EPOLL_CTL_ADD;
+    const DEL: i32 = EPOLL_CTL_DEL;
+    const MOD: i32 = EPOLL_CTL_MOD;
+
+    const IN: u32 = PollEvents::IN.bits() as u32;
+    const OUT: u32 = PollEvents::OUT.bits() as u32;
+    const ERR: u32 = PollEvents::ERR.bits() as u32;
+    const HUP: u32 = PollEvents::HUP.bits() as u32;
+
+    fn epoll() -> Arc<Epoll> {
+        Epoll::new(OpenFlags::empty())
+    }
+
+    /// An eventfd, readable iff `ready`. Always writable.
+    fn evfd(ready: bool) -> Arc<dyn FileLike> {
+        let fd = EventFd::new(0, OpenFlags::empty());
+        if ready {
+            fd.write(&1u64.to_ne_bytes()).unwrap();
+        }
+        fd
+    }
+
+    fn ev(events: u32) -> EpollEvent {
+        EpollEvent { events, data: 0 }
+    }
+
+    /// The mask `ep` currently holds for `fd`, or `None` if it holds none.
+    fn stored(ep: &Epoll, fd: FileDesc) -> Option<u32> {
+        ep.inner
+            .lock()
+            .interest_list
+            .get(&fd)
+            .map(|(event, _)| event.events)
+    }
+
+    fn status(read: bool, write: bool, error: bool, hangup: bool) -> PollStatus {
+        PollStatus {
+            read,
+            write,
+            error,
+            hangup,
+        }
+    }
+
+    /// A `FileLike` whose readiness is whatever the test says it is. An
+    /// `EventFd` can be made readable, but nothing in the host tests can be
+    /// made to report `POLLERR`/`POLLHUP` -- which is exactly what an entry's
+    /// stored mask now decides.
+    struct Fixed {
+        base: KObjectBase,
+        status: PollStatus,
+    }
+
+    impl_kobject!(Fixed);
+
+    impl Fixed {
+        fn new(status: PollStatus) -> Arc<Self> {
+            Arc::new(Fixed {
+                base: KObjectBase::new(),
+                status,
+            })
+        }
+    }
+
+    #[async_trait]
+    impl FileLike for Fixed {
+        fn flags(&self) -> OpenFlags {
+            OpenFlags::empty()
+        }
+        fn set_flags(&self, _f: OpenFlags) -> LxResult {
+            Ok(())
+        }
+        async fn read(&self, _buf: &mut [u8]) -> LxResult<usize> {
+            Err(LxError::ENOSYS)
+        }
+        fn write(&self, _buf: &[u8]) -> LxResult<usize> {
+            Err(LxError::ENOSYS)
+        }
+        async fn read_at(&self, _offset: u64, _buf: &mut [u8]) -> LxResult<usize> {
+            Err(LxError::ENOSYS)
+        }
+        fn poll(&self, _events: PollEvents) -> LxResult<PollStatus> {
+            Ok(status(
+                self.status.read,
+                self.status.write,
+                self.status.error,
+                self.status.hangup,
+            ))
+        }
+        async fn async_poll(&self, events: PollEvents) -> LxResult<PollStatus> {
+            self.poll(events)
+        }
+    }
+
+    /// Their `uapi` values, and the reason they went missing: `events` is a
+    /// `u32` and every reader narrowed it to a `u16` first.
+    #[test]
+    fn the_four_flags_above_sixteen_bits_have_their_linux_values() {
+        assert_eq!(EPOLLEXCLUSIVE, 0x1000_0000);
+        assert_eq!(EPOLLWAKEUP, 0x2000_0000);
+        assert_eq!(EPOLLONESHOT, 0x4000_0000);
+        assert_eq!(EPOLLET, 0x8000_0000);
+        for flag in [EPOLLEXCLUSIVE, EPOLLWAKEUP, EPOLLONESHOT, EPOLLET] {
+            assert_eq!(flag as u16, 0, "a u16 cannot carry {flag:#x}");
+        }
+    }
+
+    /// A stored mask always reports `EPOLLERR`/`EPOLLHUP`, so the one mask
+    /// that reports nothing is the empty one -- which is what makes zeroing a
+    /// used-up `EPOLLONESHOT` entry mean "disabled" and nothing else.
+    #[test]
+    fn epoll_ctl_forces_err_and_hup_into_every_stored_mask() {
+        assert_eq!(epoll_ctl_events(ADD, IN, false), Ok(IN | ERR | HUP));
+        assert_eq!(epoll_ctl_events(ADD, 0, false), Ok(ERR | HUP));
+        assert_eq!(epoll_ctl_events(MOD, OUT, false), Ok(OUT | ERR | HUP));
+    }
+
+    /// The bits a `PollEvents` cannot hold reach the interest list intact.
+    #[test]
+    fn oneshot_and_edge_trigger_survive_the_trip_through_epoll_ctl() {
+        let ep = epoll();
+        let fd = FileDesc::from(3);
+        ep.ctl(ADD, fd, ev(IN | EPOLLONESHOT | EPOLLET), Some(evfd(false)))
+            .unwrap();
+        let mask = stored(&ep, fd).unwrap();
+        assert_eq!(mask & EPOLLONESHOT, EPOLLONESHOT);
+        assert_eq!(mask & EPOLLET, EPOLLET);
+        assert_eq!(mask, IN | EPOLLONESHOT | EPOLLET | ERR | HUP);
+        // A MOD is held to the same mask as an ADD: it replaces the entry
+        // outright, so anything it forgets is forgotten for good.
+        ep.ctl(MOD, fd, ev(OUT | EPOLLET), Some(evfd(false)))
+            .unwrap();
+        assert_eq!(stored(&ep, fd), Some(OUT | EPOLLET | ERR | HUP));
+    }
+
+    /// `EPOLLEXCLUSIVE` changes *who* is woken, so Linux refuses every request
+    /// whose wake-up set would be ambiguous instead of guessing.
+    #[test]
+    fn exclusive_is_refused_by_mod_by_a_nested_epoll_and_by_a_bit_it_cannot_share() {
+        assert_eq!(
+            epoll_ctl_events(MOD, IN | EPOLLEXCLUSIVE, false),
+            Err(LxError::EINVAL)
+        );
+        assert_eq!(
+            epoll_ctl_events(ADD, IN | EPOLLEXCLUSIVE, true),
+            Err(LxError::EINVAL)
+        );
+        assert_eq!(
+            epoll_ctl_events(ADD, IN | EPOLLEXCLUSIVE | EPOLLONESHOT, false),
+            Err(LxError::EINVAL)
+        );
+    }
+
+    /// ...and accepts the ones it can share a wake-up with.
+    #[test]
+    fn exclusive_is_accepted_with_the_bits_linux_allows_beside_it() {
+        assert_eq!(
+            epoll_ctl_events(
+                ADD,
+                IN | OUT | EPOLLEXCLUSIVE | EPOLLET | EPOLLWAKEUP,
+                false
+            ),
+            Ok(IN | OUT | EPOLLEXCLUSIVE | EPOLLET | EPOLLWAKEUP | ERR | HUP)
+        );
+        // And the refusal reaches userspace through `ctl`, not just the helper.
+        let ep = epoll();
+        assert_eq!(
+            ep.ctl(
+                ADD,
+                FileDesc::from(4),
+                ev(IN | EPOLLEXCLUSIVE),
+                Some(epoll())
+            ),
+            Err(LxError::EINVAL)
+        );
+    }
+
+    /// An entry reports only what its mask asks for -- `EPOLLERR`/`EPOLLHUP`
+    /// included, which is what lets an empty mask mean "report nothing".
+    #[test]
+    fn an_entry_reports_the_readiness_its_mask_asked_for() {
+        let loud = status(true, true, true, true);
+        assert_eq!(ready_events(IN | ERR | HUP, &loud), IN | ERR | HUP);
+        assert_eq!(ready_events(OUT | ERR | HUP, &loud), OUT | ERR | HUP);
+        assert_eq!(ready_events(0, &loud), 0);
+        // The high flags are not readiness and are never reported back.
+        assert_eq!(
+            ready_events(IN | ERR | HUP | EPOLLONESHOT | EPOLLET, &loud),
+            IN | ERR | HUP
+        );
+        // Nothing ready is nothing reported, however wide the mask.
+        assert_eq!(
+            ready_events(IN | OUT | ERR | HUP, &status(false, false, false, false)),
+            0
+        );
+        // And each of the four stands on its own: a peer that hung up without
+        // leaving anything to read is still a hangup, which is the whole
+        // reason `poll(2)` has a bit for it.
+        let mask = IN | OUT | ERR | HUP;
+        assert_eq!(ready_events(mask, &status(false, false, false, true)), HUP);
+        assert_eq!(ready_events(mask, &status(false, false, true, false)), ERR);
+        assert_eq!(ready_events(mask, &status(false, true, false, false)), OUT);
+        assert_eq!(ready_events(mask, &status(true, false, false, false)), IN);
+    }
+
+    /// The point of the flag: one delivery, then the entry is off until the
+    /// caller re-arms it. Losing the bit meant every waiter kept being handed
+    /// the same fd, which is the race `EPOLLONESHOT` exists to prevent.
+    #[test]
+    fn a_oneshot_entry_stops_reporting_once_its_event_has_been_handed_out() {
+        let ep = epoll();
+        let fd = FileDesc::from(7);
+        let file = evfd(true);
+        ep.ctl(ADD, fd, ev(IN | EPOLLONESHOT), Some(file.clone()))
+            .unwrap();
+        assert!(ep.poll(PollEvents::IN).unwrap().read);
+
+        ep.disarm_oneshot(&[(fd, file.clone())]);
+        assert_eq!(stored(&ep, fd), Some(0), "disabled, not removed");
+        assert!(
+            !ep.poll(PollEvents::IN).unwrap().read,
+            "the fd is still readable; the entry is the thing that is spent"
+        );
+
+        // A re-arm through EPOLL_CTL_MOD brings it back, which is the whole
+        // handshake a thread pool relies on.
+        ep.ctl(MOD, fd, ev(IN | EPOLLONESHOT), Some(file)).unwrap();
+        assert!(ep.poll(PollEvents::IN).unwrap().read);
+    }
+
+    /// A spent entry is silent about everything, errors and hangups included.
+    #[test]
+    fn a_spent_oneshot_entry_reports_neither_error_nor_hangup() {
+        let ep = epoll();
+        let fd = FileDesc::from(8);
+        let file: Arc<dyn FileLike> = Fixed::new(status(false, false, true, true));
+        ep.ctl(ADD, fd, ev(IN | EPOLLONESHOT), Some(file.clone()))
+            .unwrap();
+        assert!(
+            ep.poll(PollEvents::IN).unwrap().read,
+            "an error is reported even though only EPOLLIN was asked for"
+        );
+        ep.disarm_oneshot(&[(fd, file)]);
+        assert!(!ep.poll(PollEvents::IN).unwrap().read);
+    }
+
+    /// Everything else keeps firing for as long as it is ready.
+    #[test]
+    fn an_entry_that_did_not_ask_for_oneshot_is_never_disabled() {
+        let ep = epoll();
+        let fd = FileDesc::from(9);
+        let file = evfd(true);
+        ep.ctl(ADD, fd, ev(IN), Some(file.clone())).unwrap();
+        ep.disarm_oneshot(&[(fd, file)]);
+        assert_eq!(stored(&ep, fd), Some(IN | ERR | HUP));
+        assert!(ep.poll(PollEvents::IN).unwrap().read);
+    }
+
+    /// The scan runs on a snapshot taken without the lock, so between the
+    /// delivery and the disarm the fd number can have been dropped and reused
+    /// for another file -- one that was never handed anything.
+    #[test]
+    fn disarming_leaves_alone_an_fd_that_now_holds_a_different_file() {
+        let ep = epoll();
+        let fd = FileDesc::from(10);
+        let old = evfd(true);
+        ep.ctl(ADD, fd, ev(IN | EPOLLONESHOT), Some(old.clone()))
+            .unwrap();
+        let new = evfd(true);
+        ep.ctl(DEL, fd, ev(0), None).unwrap();
+        ep.ctl(ADD, fd, ev(IN | EPOLLONESHOT), Some(new)).unwrap();
+
+        ep.disarm_oneshot(&[(fd, old)]);
+        assert_eq!(
+            stored(&ep, fd),
+            Some(IN | EPOLLONESHOT | ERR | HUP),
+            "the replacement entry keeps its mask"
+        );
+        assert!(ep.poll(PollEvents::IN).unwrap().read);
     }
 }

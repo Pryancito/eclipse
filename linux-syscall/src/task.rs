@@ -84,6 +84,96 @@ fn comm_from_path(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
 }
 
+/// `wait4`/`waitid` option bits, spelled as `include/uapi/linux/wait.h` does.
+mod wait_opts {
+    /// Return at once if no child has changed state.
+    pub const WNOHANG: u32 = 0x0000_0001;
+    /// Report a child stopped by a signal. `WSTOPPED` is the same bit.
+    pub const WUNTRACED: u32 = 0x0000_0002;
+    /// Report a child that has terminated. **`waitid` only.**
+    pub const WEXITED: u32 = 0x0000_0004;
+    /// Report a stopped child resumed by `SIGCONT`.
+    pub const WCONTINUED: u32 = 0x0000_0008;
+    /// Leave the child waitable: report its status without reaping it.
+    /// **`waitid` only.**
+    pub const WNOWAIT: u32 = 0x0100_0000;
+    /// Do not wait on children of other threads in this group.
+    pub const WNOTHREAD: u32 = 0x2000_0000;
+    /// Wait on every child, whatever its exit signal.
+    pub const WALL: u32 = 0x4000_0000;
+    /// Wait only on children that do not deliver `SIGCHLD`.
+    pub const WCLONE: u32 = 0x8000_0000;
+
+    /// What `kernel_wait4` accepts. `WEXITED` and `WNOWAIT` are NOT on it:
+    /// `wait4` always reaps and always reports an exit, so asking for either
+    /// by name is `EINVAL`.
+    pub const WAIT4: u32 = WNOHANG | WUNTRACED | WCONTINUED | WNOTHREAD | WALL | WCLONE;
+    /// What `do_waitid` accepts: everything `wait4` does, plus the two bits
+    /// that only mean something when the caller can say what it wants.
+    pub const WAITID: u32 = WAIT4 | WEXITED | WNOWAIT;
+    /// One of these must be named by `waitid`: it has no default interest,
+    /// unlike `wait4`, which always means "exited".
+    pub const WAITID_REQUIRED: u32 = WEXITED | WUNTRACED | WCONTINUED;
+}
+
+/// What a `wait*` options word asks for.
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub(crate) struct WaitOptions {
+    /// `WNOHANG`.
+    pub nohang: bool,
+    /// Whether the child's status is consumed (`WNOWAIT` clear).
+    pub reap: bool,
+    /// Which state changes are reported.
+    pub interest: (bool, bool, bool),
+}
+
+/// The options `wait4(2)` was given, or `EINVAL`.
+///
+/// `kernel_wait4` checks the word against its own mask before it looks at a
+/// single child, and that mask is shorter than `waitid`'s by two bits. This
+/// used to be `WaitFlags::from_bits_truncate`, which drops what it does not
+/// know: `wait4(pid, &st, WNOWAIT, NULL)` reaped the zombie it was asked to
+/// leave alone (an extension of this kernel's own, since Linux answers
+/// `EINVAL`), and `WEXITED`, which belongs to `waitid`, passed as well.
+///
+/// The interest is `(exited, stopped, continued)`, and `exited` is always
+/// set: `kernel_wait4` ORs `WEXITED` into its own flags whatever the caller
+/// asked for.
+pub(crate) fn wait4_options(options: u32) -> Result<WaitOptions, LxError> {
+    if options & !wait_opts::WAIT4 != 0 {
+        return Err(LxError::EINVAL);
+    }
+    Ok(WaitOptions {
+        nohang: options & wait_opts::WNOHANG != 0,
+        reap: true,
+        interest: (
+            true,
+            options & wait_opts::WUNTRACED != 0,
+            options & wait_opts::WCONTINUED != 0,
+        ),
+    })
+}
+
+/// The options `waitid(2)` was given, or `EINVAL`.
+///
+/// Two checks, in `do_waitid`'s order: a bit outside the mask, then a word
+/// that names none of `WEXITED`, `WSTOPPED` and `WCONTINUED` -- a wait for
+/// nothing at all, which Linux refuses rather than block on forever.
+pub(crate) fn waitid_options(options: u32) -> Result<WaitOptions, LxError> {
+    if options & !wait_opts::WAITID != 0 || options & wait_opts::WAITID_REQUIRED == 0 {
+        return Err(LxError::EINVAL);
+    }
+    Ok(WaitOptions {
+        nohang: options & wait_opts::WNOHANG != 0,
+        reap: options & wait_opts::WNOWAIT == 0,
+        interest: (
+            options & wait_opts::WEXITED != 0,
+            options & wait_opts::WUNTRACED != 0,
+            options & wait_opts::WCONTINUED != 0,
+        ),
+    })
+}
+
 /// Syscalls for process.
 ///
 /// # Menu
@@ -484,15 +574,9 @@ impl Syscall<'_> {
             Pgid(KoID),
             Pid(KoID),
         }
-        bitflags! {
-            struct WaitFlags: u32 {
-                const NOHANG    = 1;
-                const STOPPED   = 2;
-                const EXITED    = 4;
-                const CONTINUED = 8;
-                const NOWAIT    = 0x100_0000;
-            }
-        }
+        // Validated before anything else, as `kernel_wait4` does: a bit
+        // outside its mask is EINVAL whatever `pid` names.
+        let opts = wait4_options(options)?;
         let target = match pid {
             -1 => WaitTarget::AnyChild,
             0 => WaitTarget::AnyChildInGroup,
@@ -500,22 +584,22 @@ impl Syscall<'_> {
             // pid < -1: any child in process group |pid|.
             p => WaitTarget::Pgid((-p) as KoID),
         };
-        let flags = WaitFlags::from_bits_truncate(options);
-        let nohang = flags.contains(WaitFlags::NOHANG);
-        // Consume (reap) the child's exit status unless WNOWAIT was requested,
-        // which only peeks at it and leaves the zombie for a later wait.
-        let reap = !flags.contains(WaitFlags::NOWAIT);
+        let WaitOptions {
+            nohang,
+            reap,
+            interest: (exited, stopped, continued),
+        } = opts;
         let interest = WaitInterest {
-            exited: true,
-            stopped: flags.contains(WaitFlags::STOPPED),
-            continued: flags.contains(WaitFlags::CONTINUED),
+            exited,
+            stopped,
+            continued,
         };
         // Hot path (shells, fork+exec, sysbench worker reaping): keep at debug
         // so a default `LOG=warn` boot doesn't pay a synchronous serial write
         // on every wait.
         debug!(
-            "wait4: target={:?}, wstatus={:?}, options={:?}",
-            target, wstatus, flags,
+            "wait4: target={:?}, wstatus={:?}, options={:#x}",
+            target, wstatus, options,
         );
         let result = match target {
             WaitTarget::AnyChild => {
@@ -567,43 +651,15 @@ impl Syscall<'_> {
         infop: UserOutPtr<SigInfo>,
         options: u32,
     ) -> SysResult {
-        // Valid options mask: WNOHANG | WSTOPPED | WEXITED | WCONTINUED | WNOWAIT | __WNOTHREAD | __WCLONE | __WALL
-        let valid_mask = 0x0100_0000
-            | 0x0000_0001
-            | 0x0000_0002
-            | 0x0000_0004
-            | 0x0000_0008
-            | 0x2000_0000
-            | 0x4000_0000
-            | 0x8000_0000;
-        if (options & !valid_mask) != 0 {
-            return Err(LxError::EINVAL);
-        }
-        // At least one of WEXITED, WSTOPPED, WCONTINUED must be specified
-        let required_mask = 0x0000_0002 | 0x0000_0004 | 0x0000_0008;
-        if (options & required_mask) == 0 {
-            return Err(LxError::EINVAL);
-        }
-
-        bitflags! {
-            struct WaitIdOptions: u32 {
-                const WNOHANG   = 0x0000_0001;
-                const WSTOPPED  = 0x0000_0002;
-                const WEXITED   = 0x0000_0004;
-                const WCONTINUED = 0x0000_0008;
-                const WNOWAIT   = 0x0100_0000;
-                const WNOTHREAD = 0x2000_0000;
-                const WCLONE    = 0x4000_0000;
-                const WALL      = 0x8000_0000;
-            }
-        }
-        let opts = WaitIdOptions::from_bits_truncate(options);
-        let nohang = opts.contains(WaitIdOptions::WNOHANG);
-        let reap = !opts.contains(WaitIdOptions::WNOWAIT);
+        let WaitOptions {
+            nohang,
+            reap,
+            interest: (exited, stopped, continued),
+        } = waitid_options(options)?;
         let interest = WaitInterest {
-            exited: opts.contains(WaitIdOptions::WEXITED),
-            stopped: opts.contains(WaitIdOptions::WSTOPPED),
-            continued: opts.contains(WaitIdOptions::WCONTINUED),
+            exited,
+            stopped,
+            continued,
         };
         let caller = self.zircon_process();
 
@@ -2147,5 +2203,117 @@ mod clone3_tests {
     fn version_zero_of_the_struct_is_sixty_four_bytes() {
         assert_eq!(CLONE_ARGS_SIZE_VER0, 64);
         assert_eq!(CLONE_ARGS_SIZE_VER0 / 8, 8, "eight u64 fields");
+    }
+}
+
+#[cfg(test)]
+mod wait_option_tests {
+    //! `wait4` and `waitid` read the same options word and Linux holds them
+    //! to two different masks. `waitid` checked its own, but inline, where no
+    //! test could reach it; `wait4` ran the word through
+    //! `WaitFlags::from_bits_truncate` and kept whatever was left.
+
+    use super::*;
+
+    const WNOHANG: u32 = 0x0000_0001;
+    const WUNTRACED: u32 = 0x0000_0002;
+    const WEXITED: u32 = 0x0000_0004;
+    const WCONTINUED: u32 = 0x0000_0008;
+    const WNOWAIT: u32 = 0x0100_0000;
+    const WNOTHREAD: u32 = 0x2000_0000;
+    const WALL: u32 = 0x4000_0000;
+    const WCLONE: u32 = 0x8000_0000;
+
+    /// `__WALL` is 0x40000000 and `__WCLONE` is 0x80000000. They were the
+    /// other way round in `waitid`'s own `bitflags`. Neither changes what
+    /// this kernel does yet, which is exactly why a swap sat there unnoticed
+    /// and would have been believed by the first caller to act on it.
+    #[test]
+    fn the_two_underscore_flags_are_the_bits_linux_gives_them() {
+        assert_eq!(wait_opts::WALL, 0x4000_0000);
+        assert_eq!(wait_opts::WCLONE, 0x8000_0000);
+        assert_eq!(wait_opts::WNOTHREAD, 0x2000_0000);
+        // `WSTOPPED` is `WUNTRACED` under another name, which is why one
+        // field carries both syscalls' meaning.
+        assert_eq!(wait_opts::WUNTRACED, 0x0000_0002);
+        // And the two masks, written out, so a bit cannot move between them
+        // without this failing.
+        assert_eq!(wait_opts::WAIT4, 0xE000_000B);
+        assert_eq!(wait_opts::WAITID, 0xE100_000F);
+        assert_eq!(wait_opts::WAITID_REQUIRED, 0x0000_000E);
+    }
+
+    /// `WEXITED` and `WNOWAIT` belong to `waitid`. `kernel_wait4`'s mask
+    /// leaves both out, so naming either is EINVAL there.
+    #[test]
+    fn wait4_refuses_the_two_bits_that_are_waitids() {
+        assert_eq!(wait4_options(WEXITED), Err(LxError::EINVAL));
+        assert_eq!(wait4_options(WNOWAIT), Err(LxError::EINVAL));
+        assert_eq!(wait4_options(WNOHANG | WNOWAIT), Err(LxError::EINVAL));
+        // And they are fine on waitid, which is the point of the two masks.
+        assert!(waitid_options(WEXITED).is_ok());
+        assert!(waitid_options(WEXITED | WNOWAIT).is_ok());
+    }
+
+    /// `wait4(pid, &st, WNOWAIT, NULL)` used to leave the zombie in place --
+    /// an extension of this kernel's own, since the call is EINVAL in Linux.
+    /// A `wait4` always reaps.
+    #[test]
+    fn a_wait4_always_reaps_and_always_reports_an_exit() {
+        let o = wait4_options(0).unwrap();
+        assert!(o.reap);
+        assert_eq!(o.interest, (true, false, false));
+        assert!(!o.nohang);
+        let o = wait4_options(WNOHANG | WUNTRACED | WCONTINUED).unwrap();
+        assert!(o.nohang);
+        assert!(o.reap);
+        assert_eq!(o.interest, (true, true, true));
+    }
+
+    #[test]
+    fn wait4_takes_every_bit_on_its_own_mask_and_nothing_else() {
+        assert!(
+            wait4_options(WNOHANG | WUNTRACED | WCONTINUED | WNOTHREAD | WALL | WCLONE).is_ok()
+        );
+        for stray in [0x10u32, 0x20, 0x1_0000, 0x1000_0000] {
+            assert_eq!(wait4_options(stray), Err(LxError::EINVAL), "{:#x}", stray);
+        }
+    }
+
+    /// `waitid` has no default interest, so a word naming none of the three
+    /// is a wait for nothing. Linux refuses it rather than block forever.
+    #[test]
+    fn a_waitid_that_asks_for_nothing_is_refused() {
+        assert_eq!(waitid_options(0), Err(LxError::EINVAL));
+        assert_eq!(waitid_options(WNOHANG), Err(LxError::EINVAL));
+        assert_eq!(waitid_options(WNOWAIT | WALL), Err(LxError::EINVAL));
+        for one in [WEXITED, WUNTRACED, WCONTINUED] {
+            assert!(waitid_options(one).is_ok(), "{:#x}", one);
+        }
+    }
+
+    #[test]
+    fn waitid_reports_exactly_what_it_was_asked_for() {
+        let o = waitid_options(WEXITED).unwrap();
+        assert_eq!(o.interest, (true, false, false));
+        assert!(o.reap);
+        let o = waitid_options(WUNTRACED | WNOWAIT | WNOHANG).unwrap();
+        assert_eq!(o.interest, (false, true, false));
+        assert!(!o.reap);
+        assert!(o.nohang);
+        let o = waitid_options(WEXITED | WUNTRACED | WCONTINUED).unwrap();
+        assert_eq!(o.interest, (true, true, true));
+    }
+
+    #[test]
+    fn waitid_refuses_a_bit_outside_its_mask_too() {
+        for stray in [0x10u32, 0x0200_0000, 0x1000_0000] {
+            assert_eq!(
+                waitid_options(stray | WEXITED),
+                Err(LxError::EINVAL),
+                "{:#x}",
+                stray
+            );
+        }
     }
 }

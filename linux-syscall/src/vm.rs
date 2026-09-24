@@ -161,6 +161,7 @@ impl Syscall<'_> {
         offset: u64,
     ) -> SysResult {
         let prot = MmapProt::from_bits_truncate(prot);
+        let shared = mmap_shared(flags, flags & MMAP_ANONYMOUS != 0)?;
         let flags = MmapFlags::from_bits_truncate(flags);
         info!(
             "mmap: addr={:#x}, size={:#x}, prot={:?}, flags={:?}, fd={:?}, offset={:#x}",
@@ -193,7 +194,8 @@ impl Syscall<'_> {
         // aligned-length requirement bounced it with EINVAL, killing every
         // glibc binary at load with "cannot map zero-fill pages" (musl
         // rounds in userspace, which hid the gap for years).
-        if flags.contains(MmapFlags::FIXED) && !addr.is_multiple_of(PAGE_SIZE) {
+        let placement = mmap_placement(flags);
+        if placement != Placement::Hint && !addr.is_multiple_of(PAGE_SIZE) {
             return Err(LxError::EINVAL);
         }
         let len = roundup_pages(len);
@@ -220,8 +222,26 @@ impl Syscall<'_> {
         // half-updated mapping list. Taken before any `inner` access (fd
         // lookups in the file-backed arm) — that is the global lock order.
         let _aspace = self.linux_process().aspace_lock().lock();
-        let fixed = flags.contains(MmapFlags::FIXED);
-        if fixed {
+        // `MAP_FIXED_NOREPLACE` is placed like `MAP_FIXED` and replaces
+        // nothing. The range is read under `aspace_lock`, which every layout
+        // mutation holds (see above), so nothing can take the hole between
+        // this answer and the mapping below.
+        //
+        // Only a range that IS inside this address space can be "already
+        // taken": one that falls outside it is not EEXIST but a placement
+        // failure, and `map_ext_min` reports that one a few lines down. Linux
+        // orders it the same way -- `get_unmapped_area` runs first and the
+        // EEXIST test after it.
+        let in_vmar = addr >= vmar.addr()
+            && addr
+                .checked_add(len)
+                .is_some_and(|end| end <= vmar.end_addr());
+        if placement == Placement::FixedNoReplace && in_vmar && !vmar.range_is_free(addr, len) {
+            return Err(LxError::EEXIST);
+        }
+        let fixed = placement != Placement::Hint;
+        let overwrite = placement == Placement::Fixed;
+        if overwrite {
             // hunter: the range is about to be replaced, so drop its W^X
             // writable-history. (The unmap itself now happens INSIDE
             // map_ext_min -- see `overwrite` below.)
@@ -249,7 +269,7 @@ impl Syscall<'_> {
             // with every future child, not a per-process copy. Without the
             // marker, fork privatized it and preforked pools (nginx, postgres,
             // any parent-child counter page) silently stopped sharing.
-            if flags.contains(MmapFlags::SHARED) {
+            if shared {
                 vmo.set_share_on_fork();
             }
             // Demand-page anonymous memory (`map_range = false`) instead of
@@ -273,7 +293,7 @@ impl Syscall<'_> {
                     vmo.len(),
                     MMUFlags::RXW | MMUFlags::USER,
                     prot.to_flags(),
-                    fixed,
+                    overwrite,
                     false,
                     false,
                     MMAP_MIN_ADDR,
@@ -294,7 +314,7 @@ impl Syscall<'_> {
             // MAP_SHARED must hand every mapper of the file the SAME VmObject
             // (stores propagate between processes — the wl_shm pixel path);
             // MAP_PRIVATE keeps the per-call demand-paged snapshot.
-            let (vmo, vmo_offset) = if flags.contains(MmapFlags::SHARED) {
+            let (vmo, vmo_offset) = if shared {
                 let (vmo, off) = file_like
                     .get_vmo_shared(offset, len)
                     .inspect_err(|e| {
@@ -393,7 +413,7 @@ impl Syscall<'_> {
                         len,
                         ceiling,
                         prot.to_flags(),
-                        fixed,
+                        overwrite,
                         false,
                         false,
                         MMAP_MIN_ADDR,
@@ -434,7 +454,7 @@ impl Syscall<'_> {
                     map_len,
                     ceiling,
                     prot.to_flags(),
-                    fixed,
+                    overwrite,
                     false,
                     false,
                     MMAP_MIN_ADDR,
@@ -619,7 +639,7 @@ impl Syscall<'_> {
         // that, racing a fork's copy loop, gave the child an address space
         // that never existed (llvmpipe's W^X churn vs the Xwayland fork).
         let _aspace = self.linux_process().aspace_lock().lock();
-        let prot = MmapProt::from_bits_truncate(prot);
+        let prot = mprotect_prot(prot)?;
         info!(
             "mprotect: addr={:#x}, size={:#x}, prot={:?}",
             addr, len, prot
@@ -1142,6 +1162,104 @@ fn mprotect_args(addr: usize, len: usize) -> LxResult<Option<usize>> {
     }
 }
 
+/// The low four bits of `mmap`'s flag word (`MAP_TYPE`), which name the
+/// mapping's kind and are not a bitmask: exactly one of three values.
+const MAP_TYPE: usize = 0x0f;
+/// `MAP_SHARED`: stores reach every other mapper of the object.
+const MAP_SHARED: usize = 0x01;
+/// `MAP_PRIVATE`: stores stay in this address space.
+const MAP_PRIVATE: usize = 0x02;
+/// `MAP_SHARED_VALIDATE`: `MAP_SHARED`, but with the rest of the flag word
+/// checked rather than ignored. It is the value 3, not a third bit.
+const MAP_SHARED_VALIDATE: usize = 0x03;
+
+/// Whether a mapping is shared, or `EINVAL` if the caller named no kind at
+/// all -- or one that does not exist.
+///
+/// `MAP_TYPE` is a small enum living in a flag word, and `do_mmap` reads it
+/// with a `switch` whose `default` is `-EINVAL`. Read as a bitmask, which is
+/// what `MmapFlags::contains(SHARED)` does, `mmap(..., MAP_ANONYMOUS, ...)`
+/// with neither bit set is a private mapping the caller never asked for, and
+/// a kind of 4, 5 or 15 is whatever the low bits happen to spell.
+///
+/// `MAP_SHARED_VALIDATE` is shared for a file mapping and `EINVAL` for an
+/// anonymous one: Linux runs a second `switch` in the anonymous arm, and it
+/// knows only `MAP_SHARED` and `MAP_PRIVATE`.
+fn mmap_shared(flags: usize, anonymous: bool) -> LxResult<bool> {
+    match flags & MAP_TYPE {
+        MAP_SHARED => Ok(true),
+        MAP_PRIVATE => Ok(false),
+        MAP_SHARED_VALIDATE if !anonymous => Ok(true),
+        _ => Err(LxError::EINVAL),
+    }
+}
+
+/// Where `mmap` must put the mapping.
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+enum Placement {
+    /// `addr` is a hint; the kernel places the mapping where it likes.
+    Hint,
+    /// `MAP_FIXED`: at exactly `addr`, over whatever is already there.
+    Fixed,
+    /// `MAP_FIXED_NOREPLACE`: at exactly `addr`, or `EEXIST`.
+    FixedNoReplace,
+}
+
+/// How the flag word asks for the mapping to be placed.
+///
+/// `MAP_FIXED_NOREPLACE` used to be dropped by
+/// `MmapFlags::from_bits_truncate`, so a caller asking for "this range or
+/// nothing" got a hint instead: the mapping landed wherever there was room,
+/// the call reported success, and the one thing the flag exists to prevent --
+/// silently ending up somewhere else -- is what happened.
+///
+/// It implies `MAP_FIXED` (`do_mmap` sets the bit itself) and wins over it:
+/// with both set the mapping still refuses to replace anything.
+fn mmap_placement(flags: MmapFlags) -> Placement {
+    if flags.contains(MmapFlags::FIXED_NOREPLACE) {
+        Placement::FixedNoReplace
+    } else if flags.contains(MmapFlags::FIXED) {
+        Placement::Fixed
+    } else {
+        Placement::Hint
+    }
+}
+
+/// `PROT_SEM`, which this kernel does not act on but Linux accepts.
+const PROT_SEM: usize = 0x8;
+/// `PROT_GROWSDOWN`: apply to the whole of a growing-down mapping.
+const PROT_GROWSDOWN: usize = 0x0100_0000;
+/// `PROT_GROWSUP`: the same, upwards.
+const PROT_GROWSUP: usize = 0x0200_0000;
+
+/// The protection `mprotect(2)` was asked for, or `EINVAL`.
+///
+/// `do_mprotect_pkey` rejects a bit it does not know (`arch_validate_prot`)
+/// and the two growth directions together, and only then masks the growth
+/// bits off. Truncating instead, which is what this used to do, turned
+/// `mprotect(p, len, PROT_READ | 0x40)` into a plain read-only mapping --
+/// the caller asked for something this kernel cannot do and was told it had
+/// it.
+///
+/// `mmap` does NOT validate `prot`: `do_mmap` never looks at the unknown
+/// bits, so a flag word that `mprotect` refuses is legal there. The two
+/// differ on purpose, which is why this is not shared with the mmap path.
+fn mprotect_prot(prot: usize) -> LxResult<MmapProt> {
+    const KNOWN: usize = MmapProt::READ.bits()
+        | MmapProt::WRITE.bits()
+        | MmapProt::EXEC.bits()
+        | PROT_SEM
+        | PROT_GROWSDOWN
+        | PROT_GROWSUP;
+    if prot & !KNOWN != 0 {
+        return Err(LxError::EINVAL);
+    }
+    if prot & PROT_GROWSDOWN != 0 && prot & PROT_GROWSUP != 0 {
+        return Err(LxError::EINVAL);
+    }
+    Ok(MmapProt::from_bits_truncate(prot))
+}
+
 /// `msync(2)` flags (`mm/msync.c`).
 const MS_ASYNC: usize = 1;
 /// See [`MS_ASYNC`].
@@ -1481,6 +1599,9 @@ bitflags! {
         const PRIVATE = 1 << 1;
         /// Place the mapping at the exact address
         const FIXED = 1 << 4;
+        /// Place the mapping at the exact address, or fail with `EEXIST`
+        /// rather than replace what is already there.
+        const FIXED_NOREPLACE = 1 << 20;
         /// The mapping is not backed by any file. (non-POSIX)
         const ANONYMOUS = MMAP_ANONYMOUS;
     }
@@ -2018,6 +2139,148 @@ mod mm_walk_tests {
         assert_eq!(
             mincore_residency(&vmar, addr, 1 << 35),
             Err(LxError::ENOMEM)
+        );
+    }
+}
+
+#[cfg(test)]
+mod mmap_flag_tests {
+    //! `mmap`'s flag word carries two things that are not bitmasks: the kind
+    //! of mapping, which is a small enum in the low four bits, and
+    //! `MAP_FIXED_NOREPLACE`, which was not named at all and so was dropped.
+
+    use super::*;
+
+    /// `MAP_FIXED_NOREPLACE` means "exactly here, or fail". Dropped by
+    /// `from_bits_truncate`, it left a plain hint: the mapping went wherever
+    /// there was room and the call reported success, which is the one
+    /// outcome the flag exists to rule out.
+    #[test]
+    fn fixed_noreplace_is_a_placement_and_not_a_hint() {
+        let raw = MmapFlags::from_bits_truncate(0x10_0000);
+        assert!(
+            raw.contains(MmapFlags::FIXED_NOREPLACE),
+            "the bit is being dropped again"
+        );
+        assert_eq!(mmap_placement(raw), Placement::FixedNoReplace);
+    }
+
+    /// It implies `MAP_FIXED` and wins over it: `do_mmap` sets the FIXED bit
+    /// itself, and then refuses to replace anything all the same.
+    #[test]
+    fn fixed_noreplace_wins_over_fixed() {
+        assert_eq!(
+            mmap_placement(MmapFlags::FIXED | MmapFlags::FIXED_NOREPLACE),
+            Placement::FixedNoReplace
+        );
+        assert_eq!(mmap_placement(MmapFlags::FIXED), Placement::Fixed);
+        assert_eq!(mmap_placement(MmapFlags::empty()), Placement::Hint);
+        assert_eq!(mmap_placement(MmapFlags::ANONYMOUS), Placement::Hint);
+    }
+
+    /// The bit is the one the uapi headers give it. If it drifts, the flag
+    /// goes back to being dropped and nothing else complains.
+    #[test]
+    fn the_placement_bits_are_the_ones_userspace_sends() {
+        assert_eq!(MmapFlags::FIXED.bits(), 0x10);
+        assert_eq!(MmapFlags::FIXED_NOREPLACE.bits(), 0x10_0000);
+    }
+
+    /// `MAP_TYPE` is an enum, not a bitmask. Read with `contains(SHARED)` a
+    /// word naming no kind at all came out private, which is a mapping the
+    /// caller never asked for.
+    #[test]
+    fn a_mapping_that_names_no_kind_is_refused() {
+        assert_eq!(mmap_shared(0, true), Err(LxError::EINVAL));
+        assert_eq!(mmap_shared(0, false), Err(LxError::EINVAL));
+        // ... including when the rest of the word is full of valid flags.
+        assert_eq!(
+            mmap_shared(MMAP_ANONYMOUS | MmapFlags::FIXED.bits(), true),
+            Err(LxError::EINVAL)
+        );
+    }
+
+    #[test]
+    fn shared_and_private_are_the_two_ordinary_answers() {
+        for anonymous in [true, false] {
+            assert_eq!(mmap_shared(MAP_SHARED, anonymous), Ok(true));
+            assert_eq!(mmap_shared(MAP_PRIVATE, anonymous), Ok(false));
+            // The high bits of the word are not part of the kind.
+            assert_eq!(
+                mmap_shared(MAP_PRIVATE | MMAP_ANONYMOUS | 0x10_0000, anonymous),
+                Ok(false)
+            );
+        }
+    }
+
+    /// `MAP_SHARED_VALIDATE` is the value 3, not a third bit, and it is a
+    /// file-mapping answer: Linux's anonymous arm is a second `switch` that
+    /// knows only `MAP_SHARED` and `MAP_PRIVATE`.
+    #[test]
+    fn shared_validate_is_a_file_mapping_answer_only() {
+        assert_eq!(mmap_shared(MAP_SHARED_VALIDATE, false), Ok(true));
+        assert_eq!(mmap_shared(MAP_SHARED_VALIDATE, true), Err(LxError::EINVAL));
+    }
+
+    /// A kind in the low four bits that names nothing is `EINVAL`, not
+    /// whatever its bits happen to spell.
+    #[test]
+    fn a_kind_that_does_not_exist_is_refused() {
+        for kind in 4..=15usize {
+            assert_eq!(
+                mmap_shared(kind, false),
+                Err(LxError::EINVAL),
+                "MAP_TYPE {}",
+                kind
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod mprotect_prot_tests {
+    //! `mprotect` validates its protection word and `mmap` does not. Both
+    //! used to truncate, so `mprotect` accepted a protection this kernel
+    //! cannot give and told the caller it had it.
+
+    use super::*;
+
+    #[test]
+    fn the_three_ordinary_protections_come_through() {
+        assert_eq!(mprotect_prot(0), Ok(MmapProt::empty()));
+        assert_eq!(mprotect_prot(1), Ok(MmapProt::READ));
+        assert_eq!(
+            mprotect_prot(7),
+            Ok(MmapProt::READ | MmapProt::WRITE | MmapProt::EXEC)
+        );
+    }
+
+    /// A bit `arch_validate_prot` does not know is `EINVAL`. Truncating
+    /// turned `PROT_READ | 0x40` into a read-only mapping.
+    #[test]
+    fn a_protection_bit_that_does_not_exist_is_refused() {
+        for stray in [0x10usize, 0x40, 1 << 30, 1 << 62] {
+            assert_eq!(mprotect_prot(stray), Err(LxError::EINVAL), "{:#x}", stray);
+            assert_eq!(
+                mprotect_prot(stray | 1),
+                Err(LxError::EINVAL),
+                "{:#x} with PROT_READ",
+                stray
+            );
+        }
+    }
+
+    /// `PROT_SEM` is accepted and does nothing here; the growth bits are
+    /// accepted one at a time and refused together, which is the check Linux
+    /// runs before it masks them off.
+    #[test]
+    fn the_flags_linux_accepts_but_does_not_act_on_are_accepted() {
+        assert_eq!(mprotect_prot(PROT_SEM | 1), Ok(MmapProt::READ));
+        assert_eq!(mprotect_prot(PROT_GROWSDOWN | 1), Ok(MmapProt::READ));
+        assert_eq!(mprotect_prot(PROT_GROWSUP | 1), Ok(MmapProt::READ));
+        assert_eq!(
+            mprotect_prot(PROT_GROWSDOWN | PROT_GROWSUP | 1),
+            Err(LxError::EINVAL)
         );
     }
 }

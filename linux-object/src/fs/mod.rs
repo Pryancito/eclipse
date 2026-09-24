@@ -351,14 +351,70 @@ lazy_static! {
 /// `mmap`/`ftruncate`/`read`/`write` reuse the regular-file machinery. Wayland
 /// (`os_create_anonymous_file`), wlroots and Mesa use this to share xkb keymaps
 /// and shm pools.
+/// `memfd_create(2)` flags. `MFD_HUGETLB` is ignored (there are no huge pages
+/// to back the file with); `MFD_NOEXEC_SEAL` implies sealing is available
+/// (Linux 6.3) and is otherwise a no-op here, since a memfd is never executed.
+pub const MFD_CLOEXEC: usize = 0x0001;
+/// See [`MFD_CLOEXEC`].
+pub const MFD_ALLOW_SEALING: usize = 0x0002;
+/// See [`MFD_CLOEXEC`].
+pub const MFD_HUGETLB: usize = 0x0004;
+/// See [`MFD_CLOEXEC`].
+pub const MFD_NOEXEC_SEAL: usize = 0x0008;
+/// See [`MFD_CLOEXEC`].
+pub const MFD_EXEC: usize = 0x0010;
+
+/// Longest name `memfd_create(2)` accepts: `NAME_MAX` less the `"memfd:"`
+/// Linux prefixes it with, so the name the file ends up carrying still fits a
+/// directory entry.
+pub const MFD_NAME_MAX_LEN: usize = 255 - "memfd:".len();
+
+/// The flag word `memfd_create(2)` will act on, or the error Linux reports for
+/// the request.
+///
+/// Two things were taken on trust before. The flag word was read for three
+/// bits and the rest ignored, so a program probing for a feature this kernel
+/// does not have -- `MFD_EXEC`, say, or a huge-page size encoding -- was told
+/// it got what it asked for. And the name was not measured at all: it arrives
+/// through a C string bounded only by `MAX_C_STR_LEN`, and it is then built
+/// into a directory entry AND into the file's path string, so a four-megabyte
+/// name was two four-megabyte kernel allocations for a file nothing can name.
+///
+/// `flags` is narrowed to 32 bits first because the syscall's argument is an
+/// `unsigned int`: the bits above it never reached `memfd_create` on Linux, so
+/// they cannot be rejected here either.
+pub fn memfd_args(name: &str, flags: usize) -> LxResult<usize> {
+    /// Where a huge-page size is encoded, and how wide. Only meaningful with
+    /// `MFD_HUGETLB`, so only allowed with it.
+    const MFD_HUGE_SHIFT: usize = 26;
+    /// See [`MFD_HUGE_SHIFT`].
+    const MFD_HUGE_MASK: usize = 63;
+    const MFD_ALL_FLAGS: usize =
+        MFD_CLOEXEC | MFD_ALLOW_SEALING | MFD_HUGETLB | MFD_NOEXEC_SEAL | MFD_EXEC;
+
+    let flags = flags & u32::MAX as usize;
+    let allowed = if flags & MFD_HUGETLB != 0 {
+        MFD_ALL_FLAGS | (MFD_HUGE_MASK << MFD_HUGE_SHIFT)
+    } else {
+        MFD_ALL_FLAGS
+    };
+    if flags & !allowed != 0 {
+        return Err(LxError::EINVAL);
+    }
+    // "executable" and "sealed shut against ever becoming executable" are not
+    // two requests that can both be granted.
+    if flags & MFD_EXEC != 0 && flags & MFD_NOEXEC_SEAL != 0 {
+        return Err(LxError::EINVAL);
+    }
+    if name.len() > MFD_NAME_MAX_LEN {
+        return Err(LxError::EINVAL);
+    }
+    Ok(flags)
+}
+
 pub fn new_memfd(name: &str, flags: usize) -> LxResult<Arc<File>> {
     use rcore_fs::vfs::FileType;
-    /// `memfd_create(2)` flags. `MFD_HUGETLB` is ignored; `MFD_NOEXEC_SEAL`
-    /// implies sealing is available (Linux 6.3) and is otherwise a no-op here,
-    /// since a memfd is never executed.
-    const MFD_CLOEXEC: usize = 0x0001;
-    const MFD_ALLOW_SEALING: usize = 0x0002;
-    const MFD_NOEXEC_SEAL: usize = 0x0008;
+    let flags = memfd_args(name, flags)?;
 
     let root = MEMFD_FS.root_inode();
     let seq = MEMFD_SEQ.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
@@ -2724,5 +2780,109 @@ mod user_argument_tests {
                 shift
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod memfd_args_tests {
+    //! What `memfd_create(2)` accepts. The flag word was read for three bits
+    //! and the rest ignored, and the name was never measured at all.
+
+    use super::*;
+
+    /// The `uapi` values, and the length the name has to leave room for.
+    #[test]
+    fn the_memfd_flags_have_their_linux_values() {
+        assert_eq!(MFD_CLOEXEC, 0x0001);
+        assert_eq!(MFD_ALLOW_SEALING, 0x0002);
+        assert_eq!(MFD_HUGETLB, 0x0004);
+        assert_eq!(MFD_NOEXEC_SEAL, 0x0008);
+        assert_eq!(MFD_EXEC, 0x0010);
+        // NAME_MAX (255) less "memfd:", which Linux puts in front of the name.
+        assert_eq!(MFD_NAME_MAX_LEN, 249);
+    }
+
+    /// The five that exist come through; anything else is a caller asking for
+    /// a feature, and answering "granted" to a feature this kernel does not
+    /// have is the failure mode the check exists to stop.
+    #[test]
+    fn a_bit_memfd_create_does_not_have_is_einval() {
+        let all = MFD_CLOEXEC | MFD_ALLOW_SEALING | MFD_HUGETLB | MFD_NOEXEC_SEAL;
+        assert_eq!(memfd_args("x", 0), Ok(0));
+        assert_eq!(memfd_args("x", all), Ok(all));
+        assert_eq!(memfd_args("x", MFD_EXEC), Ok(MFD_EXEC));
+        for bad in [0x20usize, 0x40, 0x80, 0x100, 1 << 20, 1 << 25] {
+            assert_eq!(memfd_args("x", bad), Err(LxError::EINVAL), "{bad:#x}");
+        }
+    }
+
+    /// The huge-page size sits in the top six bits, and only means anything
+    /// next to `MFD_HUGETLB`.
+    #[test]
+    fn the_huge_page_size_encoding_only_rides_along_with_mfd_hugetlb() {
+        let size_2mb = 21usize << 26;
+        assert_eq!(
+            memfd_args("x", MFD_HUGETLB | size_2mb),
+            Ok(MFD_HUGETLB | size_2mb)
+        );
+        assert_eq!(memfd_args("x", size_2mb), Err(LxError::EINVAL));
+        // The whole field, not just the one size.
+        assert_eq!(
+            memfd_args("x", MFD_HUGETLB | (63 << 26)),
+            Ok(MFD_HUGETLB | (63 << 26))
+        );
+    }
+
+    /// "executable" and "sealed shut against ever becoming executable" are not
+    /// two requests that can both be granted.
+    #[test]
+    fn exec_and_noexec_seal_cannot_both_be_asked_for() {
+        assert_eq!(
+            memfd_args("x", MFD_EXEC | MFD_NOEXEC_SEAL),
+            Err(LxError::EINVAL)
+        );
+        assert_eq!(memfd_args("x", MFD_NOEXEC_SEAL), Ok(MFD_NOEXEC_SEAL));
+    }
+
+    /// The name is built into a directory entry AND into the file's path, and
+    /// it arrives through a C string bounded only by `MAX_C_STR_LEN` -- so
+    /// without this the caller picked the size of two kernel allocations.
+    #[test]
+    fn a_name_longer_than_name_max_less_the_prefix_is_refused() {
+        let ok = "a".repeat(MFD_NAME_MAX_LEN);
+        assert_eq!(memfd_args(&ok, 0), Ok(0));
+        let one_too_many = "a".repeat(MFD_NAME_MAX_LEN + 1);
+        assert_eq!(memfd_args(&one_too_many, 0), Err(LxError::EINVAL));
+        let absurd = "a".repeat(1 << 20);
+        assert_eq!(memfd_args(&absurd, 0), Err(LxError::EINVAL));
+    }
+
+    /// The syscall's argument is an `unsigned int`, so the bits above it never
+    /// reached `memfd_create` on Linux and cannot be refused here either.
+    #[test]
+    fn the_flag_word_is_an_unsigned_int() {
+        assert_eq!(memfd_args("x", 1 << 32), Ok(0));
+        assert_eq!(
+            memfd_args("x", (1usize << 40) | MFD_CLOEXEC),
+            Ok(MFD_CLOEXEC)
+        );
+        // ...but a bad bit inside the low word still is.
+        assert_eq!(memfd_args("x", (1usize << 32) | 0x20), Err(LxError::EINVAL));
+    }
+
+    /// And the refusal reaches the caller, not just the helper.
+    #[test]
+    fn new_memfd_is_held_to_the_same_answers() {
+        assert_eq!(new_memfd("x", 0x20).err(), Some(LxError::EINVAL));
+        assert_eq!(
+            new_memfd(&"a".repeat(MFD_NAME_MAX_LEN + 1), 0).err(),
+            Some(LxError::EINVAL)
+        );
+        let f = new_memfd("keymap", MFD_CLOEXEC).unwrap();
+        assert!(f.flags().contains(OpenFlags::CLOEXEC));
+        assert!(new_memfd("keymap", 0)
+            .unwrap()
+            .flags()
+            .contains(OpenFlags::RDWR));
     }
 }
