@@ -51,8 +51,8 @@ cfg_if::cfg_if! {
         // it, and the AP-boot window used to be x86-only exports because the
         // other two kept their own (drifted) maps.
         pub use interrupt::{
-            bogus_cpu_id_events, current_cpu_id, current_cpu_id_via_apic, hardware_id_of,
-            lock_depth, set_logical_cpu_id, with_ap_boot_logical,
+            bogus_cpu_id_events, clear_logical_cpu_id, current_cpu_id, current_cpu_id_via_apic,
+            hardware_id_of, lock_depth, set_logical_cpu_id, with_ap_boot_logical,
         };
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         pub use interrupt::{hardware_apic_id, set_phys_virt_offset};
@@ -73,8 +73,8 @@ cfg_if::cfg_if! {
         // it, and the AP-boot window used to be x86-only exports because the
         // other two kept their own (drifted) maps.
         pub use interrupt::{
-            bogus_cpu_id_events, current_cpu_id, current_cpu_id_via_apic, hardware_id_of,
-            lock_depth, set_logical_cpu_id, with_ap_boot_logical,
+            bogus_cpu_id_events, clear_logical_cpu_id, current_cpu_id, current_cpu_id_via_apic,
+            hardware_id_of, lock_depth, set_logical_cpu_id, with_ap_boot_logical,
         };
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         pub use interrupt::{hardware_apic_id, set_phys_virt_offset};

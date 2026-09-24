@@ -559,3 +559,137 @@ mod percpu_slot_tests {
         assert!((0..MAX_CORE_NUM).all(|cpu| percpu_slot(cpu) != QUARANTINE_SLOT));
     }
 }
+
+/// The two halves of one map, checked against each other.
+///
+/// A CPU's identity is kept twice, on purpose and in two crates: the reverse
+/// map (logical -> hardware) lives here, because that is what addresses an
+/// IPI, and the forward map (hardware -> logical) lives in `lock`, because
+/// that is what answers "who am I?" on every lock acquire — and `lock` cannot
+/// depend on this crate. Nothing else checks that the two say the same thing.
+///
+/// The SMP bring-up writes both for every CPU it starts and clears both for
+/// every id it takes back. A CPU present in one and not the other is not half
+/// registered; it is broken in a specific, named way, and each direction
+/// breaks it differently. These tests are what pins that.
+#[cfg(test)]
+mod both_directions_tests {
+    use super::*;
+    use lock::cpuid::{LogicalIdMap, NO_CPU};
+
+    /// What the bring-up does for a CPU it starts: `register_cpu` in
+    /// `bare/arch/*/…`, on all three architectures.
+    fn bring_up(topo: &CpuTopology, ids: &LogicalIdMap, hw: u32) -> usize {
+        let logical = topo.register(hw).expect("table full");
+        assert!(ids.register(hw, logical as u8));
+        logical
+    }
+
+    /// What it does for an id it takes back: `unregister_cpu`.
+    fn take_back(topo: &CpuTopology, ids: &LogicalIdMap, logical: usize) {
+        topo.unregister(logical);
+        ids.unregister(logical as u8);
+    }
+
+    #[test]
+    fn a_cpu_that_came_up_is_answered_the_same_way_by_both_maps() {
+        let topo = CpuTopology::new();
+        let ids = LogicalIdMap::new();
+        let logical = bring_up(&topo, &ids, 0x1234_5678);
+        assert_eq!(topo.hw_id(logical), Some(0x1234_5678));
+        assert_eq!(ids.resolve(0x1234_5678), logical as u8);
+    }
+
+    #[test]
+    fn an_id_taken_back_leaves_no_cpu_behind_in_either_map() {
+        // Taken back only here, the CPU keeps resolving to a live logical id
+        // in `lock` — so every kernel lock, `percpu::register` and the
+        // scheduler accept it — while `hw_id` is already `None`, so **no IPI
+        // can reach it**. A CPU that runs, takes locks and cannot be signalled
+        // is a shootdown initiator waiting, without a timeout, for an
+        // acknowledgement that cannot come.
+        let topo = CpuTopology::new();
+        let ids = LogicalIdMap::new();
+        bring_up(&topo, &ids, 0x10);
+        let doomed = bring_up(&topo, &ids, 0x20);
+        take_back(&topo, &ids, doomed);
+        assert_eq!(topo.hw_id(doomed), None);
+        assert_eq!(
+            ids.resolve(0x20),
+            NO_CPU,
+            "the AP that never started still answers as a live CPU"
+        );
+    }
+
+    #[test]
+    fn the_ap_that_never_started_does_not_share_an_id_with_the_next_one() {
+        // `unregister` hands the id straight back to be reissued, and the
+        // callers' own comments say the dead AP may still wake up later. Two
+        // CPUs on one logical id share `lock`'s interrupt-disable depth, the
+        // per-CPU block and the scheduler's runtime slot.
+        let topo = CpuTopology::new();
+        let ids = LogicalIdMap::new();
+        bring_up(&topo, &ids, 0x10);
+        let doomed = bring_up(&topo, &ids, 0x20);
+        take_back(&topo, &ids, doomed);
+        let reissued = bring_up(&topo, &ids, 0x30);
+        assert_eq!(reissued, doomed, "the id was not actually given back");
+        assert_eq!(ids.resolve(0x30), reissued as u8);
+        assert_eq!(ids.resolve(0x20), NO_CPU);
+        assert_eq!(topo.hw_id(reissued), Some(0x30));
+    }
+
+    #[test]
+    fn confirming_a_late_hardware_id_keeps_both_maps_in_step() {
+        // `ap_confirm_apic_id`: the AP's first self-registration sees only the
+        // low 8 bits of its LAPIC id, because INIT leaves every AP in xAPIC
+        // mode. The authoritative id arrives later and both maps have to take
+        // it, or the IPIs go to a core that does not exist.
+        let topo = CpuTopology::new();
+        let ids = LogicalIdMap::new();
+        bring_up(&topo, &ids, 0x10);
+        let logical = bring_up(&topo, &ids, 0x21);
+        let real = 0x1_0021;
+        assert_eq!(topo.confirm(logical, real), Some(0x21));
+        assert!(ids.register(real, logical as u8));
+        assert_eq!(topo.hw_id(logical), Some(real));
+        assert_eq!(ids.resolve(real), logical as u8);
+        assert_eq!(
+            ids.resolve(0x21),
+            NO_CPU,
+            "the provisional id still names this CPU"
+        );
+    }
+
+    #[test]
+    fn a_hardware_id_too_wide_for_a_byte_is_not_truncated_by_either_map() {
+        // An x2APIC id is 32 bits. Truncating it to a byte aliases two CPUs
+        // onto one entry and sends everything addressed to one of them, TLB
+        // shootdowns included, to the other.
+        let topo = CpuTopology::new();
+        let ids = LogicalIdMap::new();
+        let a = bring_up(&topo, &ids, 0x0000_0007);
+        let b = bring_up(&topo, &ids, 0x1234_0007);
+        assert_ne!(a, b);
+        assert_eq!(ids.resolve(0x0000_0007), a as u8);
+        assert_eq!(ids.resolve(0x1234_0007), b as u8);
+        assert_eq!(topo.hw_id(a), Some(0x0000_0007));
+        assert_eq!(topo.hw_id(b), Some(0x1234_0007));
+    }
+
+    #[test]
+    fn filling_the_table_stops_both_maps_at_the_same_cpu() {
+        // One map accepting a CPU the other refused is the drift this registry
+        // was written to end: an id that passes every `< MAX_CORE_NUM` check
+        // nowhere, with a forward-map entry pointing at a per-CPU slot it
+        // shares with somebody else.
+        let topo = CpuTopology::new();
+        let ids = LogicalIdMap::new();
+        for i in 0..MAX_CORE_NUM {
+            bring_up(&topo, &ids, 0x1000 + i as u32);
+        }
+        assert_eq!(topo.register(0xdead), None);
+        assert!(!ids.register(0xdead, MAX_CORE_NUM as u8));
+        assert_eq!(ids.resolve(0xdead), NO_CPU);
+    }
+}
