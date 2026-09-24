@@ -673,10 +673,11 @@ impl Syscall<'_> {
     }
 
     /// Announce an intention to access file data in a specific pattern
-    /// (`posix_fadvise`). The hint is purely advisory, so we validate the
-    /// descriptor and otherwise treat it as a no-op returning success. This
-    /// silences the spurious `unknown syscall: FADVISE64` errors emitted by
-    /// tools such as `e2fsck`.
+    /// (`posix_fadvise`). Acting on the hint is optional -- `generic_fadvise`
+    /// itself does nothing for NORMAL, RANDOM and SEQUENTIAL on a backing
+    /// device without readahead tuning -- but *which* hints exist is not, so
+    /// an advice value this kernel has never heard of is `EINVAL` rather than
+    /// a silent success.
     pub fn sys_fadvise64(
         &self,
         fd: FileDesc,
@@ -688,22 +689,49 @@ impl Syscall<'_> {
             "fadvise64: fd={:?}, offset={}, len={}, advice={}",
             fd, offset, len, advice
         );
-        // Honour Linux's EBADF for an invalid descriptor; ignore the hint itself.
-        let _ = self.linux_process().get_file_like(fd)?;
+        // Honour Linux's EBADF for an invalid descriptor.
+        let file = self.linux_process().get_file_like(fd)?;
+        // `generic_fadvise` answers ESPIPE for a FIFO before it ever looks at
+        // the hint. A pipe from `pipe2` is a `File` over a `Pipe` inode, which
+        // has no metadata of its own, so the `S_ISFIFO` test has to be made by
+        // identity as well as by type -- asking only one of the two misses
+        // half the pipes on the machine.
+        if super::splice::pipe_inode(&file).is_some()
+            || matches!(file.metadata(), Ok(m) if m.type_ == FileType::NamedPipe)
+        {
+            return Err(LxError::ESPIPE);
+        }
+        if !fadvise_advice_known(advice) {
+            return Err(LxError::EINVAL);
+        }
         Ok(0)
     }
 
     /// Manipulate the allocated disk space for the file referenced by `fd`
-    /// (`fallocate`). We support the default mode by growing a regular file so
-    /// that `offset + len` bytes are backed; every other mode (and any non
-    /// regular file such as a block device) is treated as a successful no-op.
-    /// That is enough for `resize2fs`/`e2fsck`, which only rely on the size
-    /// effect, and avoids the `unknown syscall: FALLOCATE` errors.
+    /// (`fallocate`).
+    ///
+    /// The `mode` word used to be read only for the one value `0`; everything
+    /// else fell through to a successful no-op. Two of those modes promise the
+    /// caller that the range **reads back as zeros afterwards**, and a no-op
+    /// that claims success is how a caller ends up reading the old bytes out
+    /// of a hole it believes it punched. There is no hole here to punch --
+    /// these filesystems have no extent map to poke a gap into -- but the
+    /// observable half of the promise is a write of zeros, so that is what the
+    /// call does. The modes that shift a file's contents (COLLAPSE_RANGE,
+    /// INSERT_RANGE) cannot be served at all, and say so with the same
+    /// `EOPNOTSUPP` a Linux filesystem without support for them gives.
     pub fn sys_fallocate(&self, fd: FileDesc, mode: usize, offset: usize, len: usize) -> SysResult {
         info!(
             "fallocate: fd={:?}, mode={:#x}, offset={}, len={}",
             fd, mode, offset, len
         );
+        // The order is `ksys_fallocate` then `vfs_fallocate`: the descriptor
+        // first, then the offset and length, then the mode, then the
+        // descriptor's ACCESS mode, then what kind of file this is. Which
+        // matters at the one step where two of them can both be wrong: a
+        // caller probing for a mode on a read-only descriptor is told about
+        // the mode, not about the descriptor.
+        let file = self.linux_process().get_file(fd)?;
         // `fallocate(2)`: EINVAL for a negative offset or a length that is
         // not positive.
         let offset = linux_object::fs::user_len(offset)?;
@@ -711,18 +739,54 @@ impl Syscall<'_> {
         if len == 0 {
             return Err(LxError::EINVAL);
         }
-        let file = self.linux_process().get_file(fd)?;
-        // Only the plain allocate mode (mode == 0) implies the file may need to
-        // grow. KEEP_SIZE, the hole-punch/zero-range variants, and any request
-        // against a non-regular file (e.g. a block device) must leave the size
-        // untouched, so they fall through to a successful no-op.
-        if mode == 0 {
-            let meta = file.metadata()?;
-            if meta.type_ == linux_object::fs::vfs::FileType::File {
-                let end = offset.checked_add(len).ok_or(LxError::EINVAL)?;
-                if end > meta.size {
-                    file.set_len(end as u64)?;
+        let op = fallocate_op(mode)?;
+        let flags = file.flags();
+        // EBADF for a descriptor not open for writing. `set_len` and `write_at`
+        // both check this, but only once they are reached: without the check
+        // here, `fallocate(ro_fd, 0, 0, 1)` on a file already that long
+        // reported success on a descriptor it may not write a byte through.
+        if !flags.writable() {
+            return Err(LxError::EBADF);
+        }
+        let zeroing = matches!(op, FallocateOp::ZeroRange { .. });
+        // "It is not possible to punch hole on an append-only file."
+        if zeroing && flags.is_append() {
+            return Err(LxError::EPERM);
+        }
+        let meta = file.metadata()?;
+        let resizable = match meta.type_ {
+            FileType::File => true,
+            FileType::Dir => return Err(LxError::EISDIR),
+            FileType::NamedPipe => return Err(LxError::ESPIPE),
+            // `S_ISBLK` is allowed. A block device has every one of its blocks
+            // already, so there is nothing to preallocate and no length to
+            // change -- but an order to zero a range is still an order to zero
+            // it, and answering that one with a no-op would be the same lie.
+            FileType::BlockDevice => false,
+            _ => return Err(LxError::ENODEV),
+        };
+        let end = offset.checked_add(len).ok_or(LxError::EFBIG)?;
+        let keep_size = match op {
+            FallocateOp::Allocate { keep_size } | FallocateOp::ZeroRange { keep_size } => keep_size,
+        };
+        let grows = resizable && !keep_size;
+        if grows && end > meta.size {
+            file.set_len(end as u64)?;
+        }
+        if zeroing {
+            // Where the file does not grow, only the part of the range that is
+            // inside it can be made to read as zeros -- past the end it
+            // already does.
+            let zero_end = if grows { end } else { end.min(meta.size) };
+            let mut at = offset;
+            let zeros = alloc::vec![0u8; FALLOCATE_ZERO_CHUNK.min(zero_end.saturating_sub(at))];
+            while at < zero_end {
+                let n = zeros.len().min(zero_end - at);
+                let written = file.write_at(at as u64, &zeros[..n])?;
+                if written == 0 {
+                    return Err(LxError::EIO);
                 }
+                at += written;
             }
         }
         Ok(0)
@@ -754,9 +818,19 @@ impl Syscall<'_> {
             "copy_file_range: in={:?}, out={:?}, in_offset={:?}, out_offset={:?}, count={}, flags={}",
             in_fd, out_fd, in_offset, out_offset, count, flags
         );
+        // `copy_file_range(2)` defines no flags yet and Linux reserves the
+        // word, so that the day one means something a program can tell a
+        // kernel that honoured it from a kernel that dropped it.
+        copy_file_range_flags(flags)?;
         let proc = self.linux_process();
         let in_file = proc.get_file(in_fd)?;
         let out_file = proc.get_file(out_fd)?;
+        // EBADF for descriptors opened the wrong way round. `do_sendfile`
+        // makes the same two checks, so they belong here and not at either
+        // caller.
+        if !in_file.flags().readable() || !out_file.flags().writable() {
+            return Err(LxError::EBADF);
+        }
         let mut buffer = alloc::vec![0u8; 1024];
 
         // for in_offset and out_offset
@@ -886,7 +960,18 @@ impl Syscall<'_> {
     pub fn sys_readahead(&self, fd: FileDesc, offset: u64, count: usize) -> SysResult {
         info!("readahead: fd={:?}, offset={}, count={}", fd, offset, count);
         let proc = self.linux_process();
-        proc.get_file(fd)?;
+        let file = proc.get_file(fd)?;
+        // `ksys_readahead`: EBADF unless the descriptor is open for reading,
+        // then EINVAL unless it names something with a page cache to fill.
+        if !file.flags().readable() {
+            return Err(LxError::EBADF);
+        }
+        if !matches!(
+            file.metadata().map(|m| m.type_),
+            Ok(FileType::File) | Ok(FileType::BlockDevice)
+        ) {
+            return Err(LxError::EINVAL);
+        }
         Ok(0)
     }
 
@@ -2785,5 +2870,267 @@ mod sync_file_ioctl_tests {
         // are another family.
         assert!(!is_sync_ioc_merge(0xc018_64c1));
         assert!(!is_sync_ioc_merge(0xc018_64c2));
+    }
+}
+
+/// `posix_fadvise(2)` advice values. All of zCore's target arches
+/// (x86_64/aarch64/riscv64) share the asm-generic numbering; s390 is the one
+/// architecture that renumbers DONTNEED and NOREUSE, and this tree does not
+/// target it.
+const POSIX_FADV_NORMAL: usize = 0;
+const POSIX_FADV_RANDOM: usize = 1;
+const POSIX_FADV_SEQUENTIAL: usize = 2;
+const POSIX_FADV_WILLNEED: usize = 3;
+const POSIX_FADV_DONTNEED: usize = 4;
+const POSIX_FADV_NOREUSE: usize = 5;
+
+/// Whether `advice` is a value `posix_fadvise(2)` defines.
+///
+/// `madvise` in this same tree already answers this question for its own word
+/// (`madvise_advice_known`, `vm.rs`), and `sync_file_range` answers it for
+/// its flags thirty lines below. `fadvise` did not ask it at all, so every
+/// number in the word -- a typo, a value from another architecture's
+/// numbering, a `madvise` constant reached for by mistake -- came back as a
+/// hint successfully taken. The two words are NOT the same list, which is the
+/// whole reason each needs its own: `madvise` defines 8 (`MADV_FREE`) and
+/// `fadvise` stops at 5.
+pub(crate) fn fadvise_advice_known(advice: usize) -> bool {
+    matches!(
+        advice,
+        POSIX_FADV_NORMAL
+            | POSIX_FADV_RANDOM
+            | POSIX_FADV_SEQUENTIAL
+            | POSIX_FADV_WILLNEED
+            | POSIX_FADV_DONTNEED
+            | POSIX_FADV_NOREUSE
+    )
+}
+
+/// How many zero bytes `fallocate` hands the file per write.
+const FALLOCATE_ZERO_CHUNK: usize = 64 * 1024;
+
+/// `fallocate(2)` modes (`include/uapi/linux/falloc.h`).
+const FALLOC_FL_KEEP_SIZE: usize = 0x01;
+const FALLOC_FL_PUNCH_HOLE: usize = 0x02;
+const FALLOC_FL_COLLAPSE_RANGE: usize = 0x08;
+const FALLOC_FL_ZERO_RANGE: usize = 0x10;
+const FALLOC_FL_INSERT_RANGE: usize = 0x20;
+const FALLOC_FL_UNSHARE_RANGE: usize = 0x40;
+
+/// `FALLOC_FL_SUPPORTED_MASK` (`fs/open.c`). `FALLOC_FL_NO_HIDE_STALE` (0x04)
+/// is deliberately NOT in it: no upstream filesystem implements it, so Linux
+/// turns it away like any bit it does not know.
+const FALLOC_FL_SUPPORTED_MASK: usize = FALLOC_FL_KEEP_SIZE
+    | FALLOC_FL_PUNCH_HOLE
+    | FALLOC_FL_COLLAPSE_RANGE
+    | FALLOC_FL_ZERO_RANGE
+    | FALLOC_FL_INSERT_RANGE
+    | FALLOC_FL_UNSHARE_RANGE;
+
+/// What a `fallocate(2)` `mode` word is asking for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FallocateOp {
+    /// Make sure `[offset, offset + len)` is backed, growing the file to reach
+    /// it unless `keep_size`.
+    Allocate {
+        /// `FALLOC_FL_KEEP_SIZE`: the file's length must not change.
+        keep_size: bool,
+    },
+    /// The range must read back as zeros afterwards. `FALLOC_FL_PUNCH_HOLE`
+    /// (which Linux requires to carry `KEEP_SIZE`) and `FALLOC_FL_ZERO_RANGE`
+    /// both land here; only the second may grow the file.
+    ZeroRange {
+        /// `FALLOC_FL_KEEP_SIZE`: the file's length must not change.
+        keep_size: bool,
+    },
+}
+
+/// Read a `fallocate(2)` `mode` word, as `vfs_fallocate` does.
+///
+/// The three refusals that carry `EOPNOTSUPP` rather than `EINVAL` are not a
+/// slip of the pen upstream: they say "this kernel could define that
+/// combination and does not", which is what a caller probing for a feature
+/// needs to hear, while `EINVAL` says "that combination will never mean
+/// anything".
+pub(crate) fn fallocate_op(mode: usize) -> Result<FallocateOp, LxError> {
+    if mode & !FALLOC_FL_SUPPORTED_MASK != 0 {
+        return Err(LxError::EOPNOTSUPP);
+    }
+    let keep_size = mode & FALLOC_FL_KEEP_SIZE != 0;
+    if mode & FALLOC_FL_PUNCH_HOLE != 0 {
+        // Punching and zeroing the same range are two different orders, and a
+        // punch that is allowed to change the size is not a punch.
+        if mode & FALLOC_FL_ZERO_RANGE != 0 || !keep_size {
+            return Err(LxError::EOPNOTSUPP);
+        }
+    }
+    // Collapse and insert must each be the only flag in the word; unshare
+    // admits `KEEP_SIZE` beside it and nothing else.
+    if mode & FALLOC_FL_COLLAPSE_RANGE != 0 && mode & !FALLOC_FL_COLLAPSE_RANGE != 0 {
+        return Err(LxError::EINVAL);
+    }
+    if mode & FALLOC_FL_INSERT_RANGE != 0 && mode & !FALLOC_FL_INSERT_RANGE != 0 {
+        return Err(LxError::EINVAL);
+    }
+    if mode & FALLOC_FL_UNSHARE_RANGE != 0
+        && mode & !(FALLOC_FL_UNSHARE_RANGE | FALLOC_FL_KEEP_SIZE) != 0
+    {
+        return Err(LxError::EINVAL);
+    }
+    // Shifting every byte after `offset` is not something these filesystems
+    // can do, and `EOPNOTSUPP` is exactly what a Linux filesystem without
+    // support for it answers -- which is most of them.
+    if mode & (FALLOC_FL_COLLAPSE_RANGE | FALLOC_FL_INSERT_RANGE) != 0 {
+        return Err(LxError::EOPNOTSUPP);
+    }
+    if mode & (FALLOC_FL_PUNCH_HOLE | FALLOC_FL_ZERO_RANGE) != 0 {
+        return Ok(FallocateOp::ZeroRange { keep_size });
+    }
+    // `UNSHARE_RANGE` asks for the range to stop being shared with a snapshot.
+    // Nothing here shares extents, so plain allocation is the whole of it.
+    Ok(FallocateOp::Allocate { keep_size })
+}
+
+/// The `flags` word of `copy_file_range(2)`, which defines none.
+pub(crate) fn copy_file_range_flags(flags: usize) -> Result<(), LxError> {
+    if flags != 0 {
+        return Err(LxError::EINVAL);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod fadvise_tests {
+    use super::*;
+
+    #[test]
+    fn the_six_values_posix_fadvise_defines_are_the_ones_taken() {
+        for advice in [
+            POSIX_FADV_NORMAL,
+            POSIX_FADV_RANDOM,
+            POSIX_FADV_SEQUENTIAL,
+            POSIX_FADV_WILLNEED,
+            POSIX_FADV_DONTNEED,
+            POSIX_FADV_NOREUSE,
+        ] {
+            assert!(fadvise_advice_known(advice), "{}", advice);
+        }
+        // The list is exactly 0..=5, so its own length is part of the claim.
+        assert_eq!((0..=64).filter(|a| fadvise_advice_known(*a)).count(), 6);
+    }
+
+    #[test]
+    fn an_advice_value_from_another_word_is_not_a_fadvise_value() {
+        // `MADV_FREE` is 8 and `MADV_HWPOISON` is 100: both are real advice
+        // values, neither is one `fadvise` takes.
+        for advice in [6, 7, 8, 100, 101, usize::MAX] {
+            assert!(!fadvise_advice_known(advice), "{}", advice);
+        }
+    }
+}
+
+#[cfg(test)]
+mod fallocate_mode_tests {
+    use super::*;
+
+    #[test]
+    fn the_plain_mode_may_grow_the_file_and_keep_size_may_not() {
+        assert_eq!(
+            fallocate_op(0),
+            Ok(FallocateOp::Allocate { keep_size: false })
+        );
+        assert_eq!(
+            fallocate_op(FALLOC_FL_KEEP_SIZE),
+            Ok(FallocateOp::Allocate { keep_size: true })
+        );
+    }
+
+    #[test]
+    fn a_bit_fallocate_does_not_define_is_not_supported() {
+        // 0x04 is `FALLOC_FL_NO_HIDE_STALE`, which is a named flag and still
+        // outside the supported mask.
+        for mode in [0x04, 0x80, 0x100, usize::MAX] {
+            assert_eq!(fallocate_op(mode), Err(LxError::EOPNOTSUPP), "{mode:#x}");
+        }
+    }
+
+    #[test]
+    fn a_hole_punch_must_promise_not_to_change_the_size() {
+        assert_eq!(fallocate_op(FALLOC_FL_PUNCH_HOLE), Err(LxError::EOPNOTSUPP));
+        assert_eq!(
+            fallocate_op(FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE),
+            Ok(FallocateOp::ZeroRange { keep_size: true })
+        );
+    }
+
+    #[test]
+    fn punching_and_zeroing_the_same_range_are_two_different_orders() {
+        assert_eq!(
+            fallocate_op(FALLOC_FL_PUNCH_HOLE | FALLOC_FL_ZERO_RANGE | FALLOC_FL_KEEP_SIZE),
+            Err(LxError::EOPNOTSUPP)
+        );
+    }
+
+    #[test]
+    fn zero_range_is_the_one_of_the_two_that_may_grow_the_file() {
+        assert_eq!(
+            fallocate_op(FALLOC_FL_ZERO_RANGE),
+            Ok(FallocateOp::ZeroRange { keep_size: false })
+        );
+        assert_eq!(
+            fallocate_op(FALLOC_FL_ZERO_RANGE | FALLOC_FL_KEEP_SIZE),
+            Ok(FallocateOp::ZeroRange { keep_size: true })
+        );
+    }
+
+    #[test]
+    fn collapse_and_insert_must_travel_alone() {
+        for mode in [FALLOC_FL_COLLAPSE_RANGE, FALLOC_FL_INSERT_RANGE] {
+            // Alone they are understood, and refused for want of an extent map.
+            assert_eq!(fallocate_op(mode), Err(LxError::EOPNOTSUPP), "{mode:#x}");
+            // With any company at all they are not even understood.
+            assert_eq!(
+                fallocate_op(mode | FALLOC_FL_KEEP_SIZE),
+                Err(LxError::EINVAL),
+                "{mode:#x}"
+            );
+        }
+        assert_eq!(
+            fallocate_op(FALLOC_FL_COLLAPSE_RANGE | FALLOC_FL_INSERT_RANGE),
+            Err(LxError::EINVAL)
+        );
+    }
+
+    #[test]
+    fn unshare_travels_with_keep_size_and_with_nothing_else() {
+        assert_eq!(
+            fallocate_op(FALLOC_FL_UNSHARE_RANGE),
+            Ok(FallocateOp::Allocate { keep_size: false })
+        );
+        assert_eq!(
+            fallocate_op(FALLOC_FL_UNSHARE_RANGE | FALLOC_FL_KEEP_SIZE),
+            Ok(FallocateOp::Allocate { keep_size: true })
+        );
+        assert_eq!(
+            fallocate_op(FALLOC_FL_UNSHARE_RANGE | FALLOC_FL_ZERO_RANGE),
+            Err(LxError::EINVAL)
+        );
+    }
+}
+
+#[cfg(test)]
+mod copy_file_range_flag_tests {
+    use super::*;
+
+    #[test]
+    fn the_flags_word_is_reserved_and_has_to_stay_empty() {
+        assert_eq!(copy_file_range_flags(0), Ok(()));
+        for flags in [1, 2, 4, 1 << 31, usize::MAX] {
+            assert_eq!(
+                copy_file_range_flags(flags),
+                Err(LxError::EINVAL),
+                "{flags}"
+            );
+        }
     }
 }

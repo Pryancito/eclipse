@@ -896,12 +896,17 @@ impl Syscall<'_> {
     /// fills the buffer pointed to by `buf` with up to `buflen` random bytes.
     /// - `buf` - buffer that needed to fill
     /// - `buflen` - length of buffer
-    /// - `flag` - a bit mask that can contain zero or more of the following values ORed together:
-    ///   - GRND_RANDOM
-    ///   - GRND_NONBLOCK
+    /// - `flag` - a bit mask of `GRND_NONBLOCK`, `GRND_RANDOM` and
+    ///   `GRND_INSECURE`; anything else is `EINVAL` (see [`getrandom_args`]).
     /// - returns the number of bytes that were copied to the buffer buf.
+    ///
+    /// The entropy source here is always ready and never blocks, so none of
+    /// the three flags changes what comes back -- but which flags *exist* is
+    /// still the caller's question to ask, and a program that probes for
+    /// `GRND_INSECURE` needs to be told whether this kernel knows the bit.
     pub fn sys_getrandom(&mut self, buf: UserOutPtr<u8>, len: usize, flag: u32) -> SysResult {
         info!("getrandom: buf: {:?}, len: {:?}, flag {:?}", buf, len, flag);
+        let len = getrandom_args(len, flag)?;
         let mut written = 0;
         let mut chunk = [0u8; 1024];
         while written < len {
@@ -1341,5 +1346,91 @@ mod futex_deadline_tests {
             );
             assert_eq!(deadline, kernel_now() + timeout);
         }
+    }
+}
+
+/// `getrandom(2)` flags (`include/uapi/linux/random.h`).
+const GRND_NONBLOCK: u32 = 0x0001;
+const GRND_RANDOM: u32 = 0x0002;
+const GRND_INSECURE: u32 = 0x0004;
+
+/// How many bytes a `getrandom(len, flags)` will deliver, or `EINVAL` when
+/// `flags` is not a word `getrandom(2)` defines.
+///
+/// The `flags` argument used to be read by nobody: every bit of it, including
+/// the ones `getrandom` will never define, came back as a successful draw.
+/// That is the wrong answer to a feature probe -- `GRND_INSECURE` arrived in
+/// Linux 5.6, and the way a program finds out whether it has it is by asking
+/// and reading the errno.
+///
+/// The cap is Linux's own (`if (len > INT_MAX) len = INT_MAX;`): the count is
+/// handed back through the syscall's signed return value, and a request past
+/// `INT_MAX` is answered with a short draw rather than a number the caller
+/// cannot use.
+pub(crate) fn getrandom_args(len: usize, flags: u32) -> Result<usize, LxError> {
+    if flags & !(GRND_NONBLOCK | GRND_RANDOM | GRND_INSECURE) != 0 {
+        return Err(LxError::EINVAL);
+    }
+    // "Requesting insecure and blocking randomness at the same time makes no
+    // sense" (`drivers/char/random.c`). `GRND_NONBLOCK` beside `GRND_INSECURE`
+    // does make sense and is accepted.
+    if flags & (GRND_INSECURE | GRND_RANDOM) == GRND_INSECURE | GRND_RANDOM {
+        return Err(LxError::EINVAL);
+    }
+    Ok(len.min(i32::MAX as usize))
+}
+
+#[cfg(test)]
+mod getrandom_tests {
+    use super::*;
+
+    #[test]
+    fn the_three_flags_getrandom_defines_come_through() {
+        for flags in [
+            0,
+            GRND_NONBLOCK,
+            GRND_RANDOM,
+            GRND_INSECURE,
+            GRND_NONBLOCK | GRND_RANDOM,
+            GRND_NONBLOCK | GRND_INSECURE,
+        ] {
+            assert_eq!(getrandom_args(32, flags), Ok(32), "{flags:#x}");
+        }
+    }
+
+    #[test]
+    fn asking_for_insecure_and_blocking_randomness_at_once_makes_no_sense() {
+        assert_eq!(
+            getrandom_args(32, GRND_INSECURE | GRND_RANDOM),
+            Err(LxError::EINVAL)
+        );
+        assert_eq!(
+            getrandom_args(32, GRND_INSECURE | GRND_RANDOM | GRND_NONBLOCK),
+            Err(LxError::EINVAL)
+        );
+    }
+
+    #[test]
+    fn a_bit_getrandom_does_not_define_is_refused() {
+        for flags in [0x8, 0x10, 1 << 31, u32::MAX] {
+            assert_eq!(
+                getrandom_args(32, flags),
+                Err(LxError::EINVAL),
+                "{flags:#x}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_request_larger_than_a_signed_int_is_cut_down_to_one() {
+        assert_eq!(getrandom_args(i32::MAX as usize, 0), Ok(i32::MAX as usize));
+        assert_eq!(
+            getrandom_args(i32::MAX as usize + 1, 0),
+            Ok(i32::MAX as usize)
+        );
+        assert_eq!(getrandom_args(usize::MAX, 0), Ok(i32::MAX as usize));
+        // The cap is a cap, not a rounding: a short request is untouched.
+        assert_eq!(getrandom_args(0, 0), Ok(0));
+        assert_eq!(getrandom_args(1, 0), Ok(1));
     }
 }
