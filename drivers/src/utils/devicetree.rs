@@ -678,7 +678,7 @@ mod tests {
         // The header carries its own length, which `load_from_raw_pointer`
         // reads before anything else; this one is honest about it and wrong
         // about everything after.
-        let mut blob = vec![0u8; 64];
+        let mut blob = [0u8; 64];
         blob[4..8].copy_from_slice(&64u32.to_be_bytes());
         assert_eq!(
             Devicetree::from(blob.as_ptr() as usize).err(),

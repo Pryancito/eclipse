@@ -201,6 +201,14 @@ const FEXTNVM_SW_CONFIG_ICH8M: u32 = 1 << 27;
 const E1000E_FEXTNVM6: usize = 0x00010 / 4;
 const E1000E_FEXTNVM7: usize = 0x000E4 / 4;
 const E1000E_PBA: usize = 0x01000 / 4;
+// 802.3x flow control. Without these the NIC never asks the switch to pause:
+// a gigabit burst that outruns the RX ring is dropped on the floor, and TCP
+// pays for it with a retransmission back-off measured in seconds.
+const E1000E_FCTTV: usize = 0x00170 / 4;
+const E1000E_FCRTL: usize = 0x02160 / 4;
+const E1000E_FCRTH: usize = 0x02168 / 4;
+/// PCH-only flow-control refresh timer (Linux `E1000_FCRTV_PCH`).
+const E1000E_FCRTV_PCH: usize = 0x05F40 / 4;
 const E1000E_ICR: usize = 0x00C0 / 4;
 const E1000E_ITR: usize = 0x00C4 / 4;
 const E1000E_IMS: usize = 0x00D0 / 4;
@@ -267,6 +275,9 @@ const CTRL_SLU: u32 = 1 << 6;
 const CTRL_FRCSPD: u32 = 1 << 11;
 const CTRL_FRCDPX: u32 = 1 << 12;
 const CTRL_RST: u32 = 1 << 26;
+/// CTRL bits 27/28 — honour received PAUSE frames / send our own.
+const CTRL_RFCE: u32 = 0x0800_0000;
+const CTRL_TFCE: u32 = 0x1000_0000;
 const CTRL_PHY_RST: u32 = 1 << 31;
 
 // STATUS register bits
@@ -371,6 +382,148 @@ fn phy_negotiated_link(
         return Some((10, false));
     }
     None
+}
+
+/// Everything MII_ADVERTISE (register 4) should carry for a copper link with
+/// symmetric flow control: all four 10/100 modes plus both PAUSE bits.
+///
+/// Linux's `e1000_phy_setup_autoneg` writes exactly these for
+/// `e1000_fc_full`. The PAUSE bits are the ones that matter for throughput:
+/// without them the link partner never agrees to flow control and the
+/// watermarks in [`fc_settings`] are decoration — the Rx buffer simply
+/// overflows and TCP pays for it in retransmission back-off.
+fn autoneg_advertise_bits() -> u16 {
+    ADVERTISE_ALL_10_100 | ADVERTISE_PAUSE_CAP | ADVERTISE_PAUSE_ASYM
+}
+
+/// What one MDIO pass over the PHY's status registers found.
+struct PhyLink {
+    /// Resolved speed and duplex, or `None` if auto-negotiation has not
+    /// finished (or resolved to nothing in common).
+    negotiated: Option<(u32, bool)>,
+    /// MII_ADVERTISE — what we offered.
+    adv: u16,
+    /// MII_LPA — what the link partner offered.
+    lpa: u16,
+}
+
+/// Which directions of 802.3x PAUSE are in effect (Linux `e1000_fc_mode`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum FcMode {
+    /// Neither side pauses the other.
+    None,
+    /// We honour PAUSE frames we receive, but never send any.
+    RxPause,
+    /// We send PAUSE frames, but ignore the partner's.
+    TxPause,
+    /// Symmetric.
+    Full,
+}
+
+/// Flow-control register values for this part, as Linux's `e1000e_reset`
+/// computes them at standard MTU.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct FcSettings {
+    /// FCRTH — start sending PAUSE once the Rx FIFO fills past this.
+    high_water: u32,
+    /// FCRTL — send XON once it drains back below this.
+    low_water: u32,
+    /// FCTTV — how long the partner is asked to hold off, in pause quanta.
+    pause_time: u32,
+    /// FCRTV_PCH — how often to refresh a still-standing PAUSE. PCH only.
+    refresh_time: u32,
+    /// PBA — Rx packet-buffer allocation, in KB.
+    pba_kb: u32,
+}
+
+/// Port of the flow-control arm of Linux `e1000e_reset`.
+///
+/// PCH2LAN and later at standard MTU take fixed watermarks and a maximum
+/// pause time; everything else derives the high watermark from the Rx packet
+/// buffer — the lower of 90% of it and "all of it bar one full frame", so
+/// there is always room for the frame already on the wire when the PAUSE goes
+/// out. Both watermarks land on an 8-byte boundary because the register only
+/// has bits [15:3].
+fn fc_settings(is_pch: bool, max_frame: u32) -> FcSettings {
+    if is_pch {
+        return FcSettings {
+            high_water: FC_HIGH_WATER_PCH,
+            low_water: FC_LOW_WATER_PCH,
+            pause_time: 0xFFFF,
+            refresh_time: 0xFFFF,
+            pba_kb: PBA_KB_PCH,
+        };
+    }
+    let pba_bytes = PBA_KB_DISCRETE << 10;
+    let hwm = core::cmp::min(pba_bytes / 10 * 9, pba_bytes.saturating_sub(max_frame));
+    let high_water = hwm & FCRT_RTH_MASK;
+    FcSettings {
+        high_water,
+        low_water: high_water.saturating_sub(8),
+        pause_time: FC_PAUSE_TIME_DEFAULT,
+        refresh_time: 0,
+        pba_kb: PBA_KB_DISCRETE,
+    }
+}
+
+/// The value FCRTL takes: the low watermark, plus the XON-enable bit when the
+/// part should send an XON rather than waiting for the PAUSE to time out.
+fn fcrtl_value(low_water: u32, send_xon: bool) -> u32 {
+    if send_xon {
+        low_water | FCRTL_XONE
+    } else {
+        low_water
+    }
+}
+
+/// Port of Linux `e1000e_config_fc_after_link_up`: resolve 802.3x flow control
+/// from the two PAUSE bits each side advertised.
+///
+/// The table is IEEE 802.3ab/D6.0's, reproduced in Linux's comment. The short
+/// version: both sides claiming symmetric PAUSE means full; otherwise the
+/// asymmetric bits decide which single direction, if any, is allowed.
+/// `requested_full` is what we asked for — advertising symmetric PAUSE is the
+/// only way to say "I can receive them", so a driver that only wants Rx pause
+/// has to advertise full and then turn Tx back off here.
+///
+/// Half duplex gets no flow control at all: 802.3x PAUSE is a full-duplex
+/// mechanism, and a half-duplex link uses collisions for backpressure.
+fn fc_mode_from_autoneg(adv: u16, lpa: u16, requested_full: bool, full_duplex: bool) -> FcMode {
+    if !full_duplex {
+        return FcMode::None;
+    }
+    let (adv_cap, adv_asym) = (
+        adv & ADVERTISE_PAUSE_CAP != 0,
+        adv & ADVERTISE_PAUSE_ASYM != 0,
+    );
+    let (lp_cap, lp_asym) = (lpa & LPA_PAUSE_CAP != 0, lpa & LPA_PAUSE_ASYM != 0);
+    if adv_cap && lp_cap {
+        if requested_full {
+            FcMode::Full
+        } else {
+            FcMode::RxPause
+        }
+    // `!adv_cap` is redundant here — the branch above already took every case
+    // where both sides claim symmetric PAUSE — but Linux spells it out and so
+    // do we, because the table it is transcribing does.
+    } else if !adv_cap && adv_asym && lp_cap && lp_asym {
+        FcMode::TxPause
+    } else if adv_cap && adv_asym && !lp_cap && lp_asym {
+        FcMode::RxPause
+    } else {
+        FcMode::None
+    }
+}
+
+/// Port of Linux `e1000e_force_mac_fc`: put the resolved mode into CTRL.
+fn ctrl_for_fc(ctrl: u32, mode: FcMode) -> u32 {
+    let bits = match mode {
+        FcMode::None => 0,
+        FcMode::RxPause => CTRL_RFCE,
+        FcMode::TxPause => CTRL_TFCE,
+        FcMode::Full => CTRL_RFCE | CTRL_TFCE,
+    };
+    (ctrl & !(CTRL_RFCE | CTRL_TFCE)) | bits
 }
 
 /// Port of the TIPG half of Linux `e1000_check_for_copper_link_ich8lan`.
@@ -504,6 +657,10 @@ const HV_OEM_BITS_RESTART_AN: u16 = 0x0400;
 /// Linux `HV_INTC_FC_PAGE_START`: the first HV page reachable at PHY address 1,
 /// and the one page whose select value is written as 0 (see [`hv_page_select`]).
 const HV_INTC_FC_PAGE_START: u32 = 768;
+/// Linux `BM_PORT_CTRL_PAGE`; register 27 on it holds the PHY's copy of the
+/// 802.3x pause time, written alongside FCTTV on PCH parts.
+const BM_PORT_CTRL_PAGE: u32 = 769;
+const BM_PORT_PAUSE_TIME_REG: u32 = 27;
 // CV_SMB_CTRL = PHY_REG(769, 23)
 const CV_SMB_CTRL_PAGE: u32 = 769;
 const CV_SMB_CTRL_REG: u32 = 23;
@@ -590,6 +747,29 @@ const LPA_100FULL: u16 = 0x0100;
 /// STAT1000 (register 10) bits 10/11 — the partner's 1000BASE-T abilities.
 const LPA_1000HALF: u16 = 0x0400;
 const LPA_1000FULL: u16 = 0x0800;
+/// ADVERTISE / LPA bits 10/11 — symmetric and asymmetric PAUSE.
+const ADVERTISE_PAUSE_CAP: u16 = 0x0400;
+const ADVERTISE_PAUSE_ASYM: u16 = 0x0800;
+const LPA_PAUSE_CAP: u16 = 0x0400;
+const LPA_PAUSE_ASYM: u16 = 0x0800;
+
+// --- 802.3x flow control -------------------------------------------------
+/// FCRTL/FCRTH carry the threshold in bits [15:3] (8-byte granularity).
+const FCRT_RTH_MASK: u32 = 0x0000_FFF8;
+/// FCRTL bit 31 — also send an XON once the low watermark is crossed again.
+const FCRTL_XONE: u32 = 0x8000_0000;
+/// Rx packet-buffer allocation in KB. Linux's per-board `.pba`: 26 for every
+/// PCH part, 32 for the discrete 82574 / 82583.
+const PBA_KB_PCH: u32 = 26;
+const PBA_KB_DISCRETE: u32 = 32;
+/// MTU 1500 + Ethernet header + FCS, i.e. Linux's `adapter->max_frame_size`.
+const MAX_FRAME_SIZE: u32 = 1518;
+/// Linux `E1000_FC_PAUSE_TIME` — 858 µs, the pause quantum for discrete parts.
+const FC_PAUSE_TIME_DEFAULT: u32 = 0x0680;
+/// PCH2LAN and later at standard MTU use these fixed watermarks verbatim
+/// (Linux `e1000e_reset`), not the 90%-of-PBA formula.
+const FC_HIGH_WATER_PCH: u32 = 0x0_5C20;
+const FC_LOW_WATER_PCH: u32 = 0x0_5048;
 
 // Legacy RX descriptor status (LK / 8254x §3.2.3.1)
 const RXD_STAT_DD: u8 = 1 << 0;
@@ -1434,18 +1614,22 @@ impl E1000eHw {
     }
 
     /// Read back what auto-negotiation actually resolved to, straight from the
-    /// PHY. Used only for reporting: the MAC's `STATUS` stays the value the
-    /// driver acts on, exactly as in Linux.
-    unsafe fn read_phy_negotiated(&self) -> Option<(u32, bool)> {
+    /// PHY: the speed and duplex (for reporting — the MAC's `STATUS` stays the
+    /// value the driver acts on, exactly as in Linux) and the raw
+    /// advertisement / link-partner-ability words that decide flow control.
+    ///
+    /// One MDIO pass serves both, because this runs under the SW/FW semaphore
+    /// on a link change and each failed register read costs a 100 ms poll.
+    unsafe fn read_phy_link(&self) -> Option<PhyLink> {
         if !self.acquire_swflag() {
             return None;
         }
-        let out = self.read_phy_negotiated_locked();
+        let out = self.read_phy_link_locked();
         self.release_swflag();
         out
     }
 
-    unsafe fn read_phy_negotiated_locked(&self) -> Option<(u32, bool)> {
+    unsafe fn read_phy_link_locked(&self) -> Option<PhyLink> {
         let phy_addrs: [u8; 2] = if self.is_pch() { [2, 1] } else { [1, 2] };
         for phy_addr in phy_addrs {
             let Some(bmsr) = self.mdic_read(phy_addr, MII_BMSR) else {
@@ -1458,9 +1642,133 @@ impl E1000eHw {
             let lpa = self.mdic_read(phy_addr, MII_LPA).unwrap_or(0);
             let ctrl1000 = self.mdic_read(phy_addr, MII_CTRL1000).unwrap_or(0);
             let stat1000 = self.mdic_read(phy_addr, MII_STAT1000).unwrap_or(0);
-            return phy_negotiated_link(bmsr, adv, lpa, ctrl1000, stat1000);
+            return Some(PhyLink {
+                negotiated: phy_negotiated_link(bmsr, adv, lpa, ctrl1000, stat1000),
+                adv,
+                lpa,
+            });
         }
         None
+    }
+
+    /// Program the 802.3x flow-control registers (port of the flow-control
+    /// arm of Linux `e1000e_reset` plus `e1000e_set_fc_watermarks`).
+    ///
+    /// Without this the Rx packet buffer is the only thing standing between a
+    /// gigabit sender and a host that has to checksum every frame in software:
+    /// once it overflows, frames are dropped silently and TCP backs off for
+    /// seconds. PAUSE is how the NIC tells the switch to wait instead.
+    unsafe fn setup_flow_control(&self) {
+        let fc = fc_settings(self.is_pch(), MAX_FRAME_SIZE);
+        self.program_fc_registers(&fc);
+        // The PCH PHY keeps its own copy of the pause time; Linux writes it
+        // alongside FCTTV for the 82577/8/9 and I217 PHYs. Split out from the
+        // MMIO above because it needs the SW/FW semaphore and MDIO, neither of
+        // which exists on a bare register file.
+        if self.is_pch() && self.acquire_swflag() {
+            let _ = self.phy_write_hv(
+                BM_PORT_CTRL_PAGE,
+                BM_PORT_PAUSE_TIME_REG,
+                fc.pause_time as u16,
+            );
+            self.release_swflag();
+        }
+    }
+
+    /// The MMIO half of [`setup_flow_control`]: everything that is a plain
+    /// register write.
+    unsafe fn program_fc_registers(&self, fc: &FcSettings) {
+        mmio_write(self.base, E1000E_PBA, fc.pba_kb);
+        mmio_write(self.base, E1000E_FCTTV, fc.pause_time);
+        if self.is_pch() {
+            mmio_write(self.base, E1000E_FCRTV_PCH, fc.refresh_time);
+        }
+        mmio_write(self.base, E1000E_FCRTL, fcrtl_value(fc.low_water, true));
+        mmio_write(self.base, E1000E_FCRTH, fc.high_water);
+        let _ = mmio_read(self.base, E1000E_STATUS); // flush
+    }
+
+    /// Resolve flow control against what the link partner advertised and put
+    /// the answer in CTRL (port of `e1000e_config_fc_after_link_up` ->
+    /// `e1000e_force_mac_fc`). Returns the mode, for the log line.
+    unsafe fn apply_negotiated_flow_control(
+        &self,
+        adv: u16,
+        lpa: u16,
+        full_duplex: bool,
+    ) -> FcMode {
+        let mode = fc_mode_from_autoneg(adv, lpa, /* requested_full */ true, full_duplex);
+        let ctrl = mmio_read(self.base, E1000E_CTRL);
+        let want = ctrl_for_fc(ctrl, mode);
+        if want != ctrl {
+            mmio_write(self.base, E1000E_CTRL, want);
+            let _ = mmio_read(self.base, E1000E_STATUS); // flush
+        }
+        mode
+    }
+
+    /// Everything that has to happen once, on the transition to carrier up.
+    ///
+    /// This used to live in `watchdog_tick`, but `ensure_rx_armed_if_link_up`
+    /// runs on every poll and almost always won the race to observe carrier —
+    /// it flipped `link_up` behind the watchdog's back, so the watchdog's
+    /// `link != self.link_up` test was false and none of this ran at all. One
+    /// copy, called from both.
+    unsafe fn on_link_up(&self, status: u32) {
+        // Linux re-tunes the inter-packet gap on every link change, because
+        // the right value depends on the speed we just got.
+        self.apply_link_speed_tuning(status);
+        let full_duplex = status & STATUS_FD != 0;
+        crate::klog_warn!(
+            "[e1000e] link UP {}Mb/s {} STATUS={:#010x}\n",
+            status_speed_mbps(status),
+            if full_duplex {
+                "full-duplex"
+            } else {
+                "HALF-duplex"
+            },
+            status
+        );
+        // Second opinion, straight from the PHY, and the words that decide
+        // flow control. STATUS is what the MAC's auto-speed detection made of
+        // the MAC-PHY interconnect; the MII registers are what the two link
+        // partners agreed on. When they disagree the problem is between MAC
+        // and PHY (the interconnect stuck in SMBus mode, say), not on the wire.
+        match self.read_phy_link() {
+            Some(link) => {
+                match link.negotiated {
+                    Some((phy_speed, phy_fd)) => {
+                        if phy_speed != status_speed_mbps(status) || phy_fd != full_duplex {
+                            crate::klog_warn!(
+                                "[e1000e] PHY says {}Mb/s fd={} but MAC STATUS says {}Mb/s fd={} — MAC-PHY interconnect mismatch\n",
+                                phy_speed,
+                                phy_fd,
+                                status_speed_mbps(status),
+                                full_duplex
+                            );
+                        }
+                    }
+                    None => {
+                        crate::klog_warn!(
+                            "[e1000e] link UP but the PHY reports auto-negotiation incomplete\n"
+                        );
+                    }
+                }
+                let mode = self.apply_negotiated_flow_control(link.adv, link.lpa, full_duplex);
+                crate::klog_warn!(
+                    "[e1000e] flow control {:?} (adv={:#06x} lpa={:#06x})\n",
+                    mode,
+                    link.adv,
+                    link.lpa
+                );
+            }
+            None => {
+                // No PHY answered. Leave CTRL's pause bits as the reset left
+                // them rather than guessing: enabling Tx pause against a
+                // partner that never agreed to it is worse than none.
+                crate::klog_warn!("[e1000e] link UP but the PHY did not answer over MDIO\n");
+            }
+        }
     }
 
     /// Speed-dependent MAC tuning Linux applies every time the link changes
@@ -1530,8 +1838,12 @@ impl E1000eHw {
     /// negotiation but never narrow one.
     unsafe fn widen_autoneg_advertisement(&self, phy_addr: u8) {
         if let Some(adv) = self.mdic_read(phy_addr, MII_ADVERTISE) {
-            if adv != 0xFFFF && adv & ADVERTISE_ALL_10_100 != ADVERTISE_ALL_10_100 {
-                let want = adv | ADVERTISE_ALL_10_100;
+            // Symmetric + asymmetric PAUSE go in the same register, and Linux
+            // sets both for `e1000_fc_full`. Without them the partner never
+            // agrees to flow control and the watermarks are decoration.
+            let want_bits = autoneg_advertise_bits();
+            if adv != 0xFFFF && adv & want_bits != want_bits {
+                let want = adv | want_bits;
                 if self.mdic_write(phy_addr, MII_ADVERTISE, want) {
                     crate::klog_warn!(
                         "[e1000e] widened 10/100 autoneg advertisement {:#06x} -> {:#06x}\n",
@@ -2009,6 +2321,12 @@ impl E1000eHw {
             mmio_write(self.base, E1000E_CTRL, ctrl);
             let _ = mmio_read(self.base, E1000E_CTRL);
         }
+
+        // 12.1 Flow control. Programmed before the link comes up so the
+        //      watermarks are already in place for the first burst; which
+        //      directions are actually enabled is decided in `on_link_up`
+        //      from what the partner advertised.
+        self.setup_flow_control();
 
         // 12.3 Kumeran poll timeouts — Linux's e1000_setup_copper_link_ich8lan
         //      sets these right after SLU/ASDE, to stop the MAC giving up on
@@ -2816,50 +3134,13 @@ impl E1000eHw {
             link_changed = true;
             self.link_up = link;
             if link {
-                // Linux re-tunes the inter-packet gap on every link change,
-                // because the right value depends on the speed we just got.
-                self.apply_link_speed_tuning(status);
-                // Report what auto-negotiation actually settled on. Nothing
-                // else in the system surfaces link speed (there is no ethtool
-                // and no /sys/class/net/*/speed), so without this a link that
-                // negotiated 100 Mb/s half duplex on a gigabit switch looks
-                // exactly like a healthy one — and explains a 10x throughput
-                // shortfall that would otherwise be blamed on the stack.
-                crate::klog_warn!(
-                    "[e1000e] link UP {}Mb/s {} STATUS={:#010x}\n",
-                    status_speed_mbps(status),
-                    if status & STATUS_FD != 0 {
-                        "full-duplex"
-                    } else {
-                        "HALF-duplex"
-                    },
-                    status
-                );
-                // Second opinion, straight from the PHY. STATUS is what the
-                // MAC's auto-speed detection made of the MAC-PHY interconnect;
-                // the MII registers are what the two link partners agreed on.
-                // When they disagree the problem is between MAC and PHY (the
-                // interconnect stuck in SMBus mode, say), not on the wire.
-                match self.read_phy_negotiated() {
-                    Some((phy_speed, phy_fd)) => {
-                        if phy_speed != status_speed_mbps(status)
-                            || phy_fd != (status & STATUS_FD != 0)
-                        {
-                            crate::klog_warn!(
-                                "[e1000e] PHY says {}Mb/s fd={} but MAC STATUS says {}Mb/s fd={} — MAC-PHY interconnect mismatch\n",
-                                phy_speed,
-                                phy_fd,
-                                status_speed_mbps(status),
-                                status & STATUS_FD != 0
-                            );
-                        }
-                    }
-                    None => {
-                        crate::klog_warn!(
-                            "[e1000e] link UP but the PHY reports auto-negotiation incomplete\n"
-                        );
-                    }
-                }
+                // Nothing else in the system surfaces link speed (there is no
+                // ethtool and no /sys/class/net/*/speed), so without the
+                // report inside `on_link_up` a link that negotiated 100 Mb/s
+                // half duplex on a gigabit switch looks exactly like a healthy
+                // one — and explains a 10x throughput shortfall that would
+                // otherwise be blamed on the stack.
+                self.on_link_up(status);
             } else {
                 crate::klog_warn!("[e1000e] link DOWN\n");
             }
@@ -3693,23 +3974,14 @@ impl E1000eHw {
         let status = mmio_read(self.base, E1000E_STATUS);
         if status & STATUS_LU != 0 {
             self.link_up = true;
-            // Report it HERE as well as in the watchdog. This runs on every
-            // poll and on every transmit, so it almost always wins the race
-            // to observe carrier — and by flipping `link_up` behind the
-            // watchdog's back it made `watchdog_tick`'s `link != link_up`
-            // test false, so the "link UP" line was in practice never
-            // printed at all. The one message that says what speed and
-            // duplex auto-negotiation settled on was dead code.
-            crate::klog_warn!(
-                "[e1000e] link UP {}Mb/s {} STATUS={:#010x}\n",
-                status_speed_mbps(status),
-                if status & STATUS_FD != 0 {
-                    "full-duplex"
-                } else {
-                    "HALF-duplex"
-                },
-                status
-            );
+            // Do the whole link-up transition HERE, not just flip the flag.
+            // This runs on every poll and on every transmit, so it almost
+            // always wins the race to observe carrier — and flipping
+            // `link_up` behind the watchdog's back made `watchdog_tick`'s
+            // `link != link_up` test false, so everything the watchdog did on
+            // that edge (the speed report, the inter-packet gap, and now flow
+            // control) was in practice dead code.
+            self.on_link_up(status);
         }
     }
 }
@@ -5405,5 +5677,286 @@ mod link_speed_tests {
         reg_write(hw.base, E1000E_TIPG, 0x1234_5678);
         unsafe { hw.apply_link_speed_tuning(0) };
         assert_eq!(reg_read(hw.base, E1000E_TIPG), 0x1234_5678);
+    }
+}
+
+#[cfg(test)]
+mod flow_control_tests {
+    //! 802.3x flow control: the watermarks, the PAUSE resolution table, and
+    //! what lands in CTRL.
+    //!
+    //! This is the backpressure that stops a gigabit sender from overrunning a
+    //! host that checksums every frame in software. QEMU's e1000e never needs
+    //! it — the virtual wire has no queue to overflow — so none of it is
+    //! exercised in CI, which is why it is all pure functions of register
+    //! contents here.
+
+    use super::rx_ring_tests::make_hw;
+    use super::*;
+
+    const I219: u16 = 0x15b8;
+    const FD: u32 = STATUS_FD;
+
+    fn reg_read(base: usize, reg: usize) -> u32 {
+        unsafe { core::ptr::read_volatile((base + reg * 4) as *const u32) }
+    }
+
+    // --------------------------------------------------------- watermarks
+
+    #[test]
+    fn pch_parts_take_the_fixed_watermarks_linux_uses() {
+        // Linux `e1000e_reset`, the pch2lan..pch_nvp arm at standard MTU:
+        // fixed values, not the 90%-of-PBA formula.
+        let fc = fc_settings(true, MAX_FRAME_SIZE);
+        assert_eq!(fc.high_water, 0x5C20);
+        assert_eq!(fc.low_water, 0x5048);
+        assert_eq!(fc.pause_time, 0xFFFF);
+        assert_eq!(fc.refresh_time, 0xFFFF);
+        assert_eq!(fc.pba_kb, 26);
+    }
+
+    #[test]
+    fn discrete_parts_derive_the_high_watermark_from_the_packet_buffer() {
+        // 32 KB of Rx buffer: the lower of 90% of it and all of it bar one
+        // full frame, rounded down to the register's 8-byte granularity.
+        let fc = fc_settings(false, MAX_FRAME_SIZE);
+        let pba = 32u32 << 10;
+        assert_eq!(fc.high_water, (pba / 10 * 9) & FCRT_RTH_MASK);
+        assert_eq!(fc.low_water, fc.high_water - 8);
+        assert_eq!(fc.pause_time, 0x0680);
+        assert_eq!(fc.pba_kb, 32);
+    }
+
+    #[test]
+    fn the_high_watermark_always_leaves_room_for_one_frame_in_flight() {
+        // A PAUSE frame does not stop the wire instantly: whatever the partner
+        // has already started sending still arrives. If the watermark sat at
+        // the top of the buffer that frame would be dropped — the very thing
+        // flow control is there to prevent.
+        for is_pch in [true, false] {
+            let fc = fc_settings(is_pch, MAX_FRAME_SIZE);
+            let pba_bytes = fc.pba_kb << 10;
+            assert!(
+                fc.high_water + MAX_FRAME_SIZE <= pba_bytes,
+                "is_pch={}: high={:#x} leaves no room in {:#x}",
+                is_pch,
+                fc.high_water,
+                pba_bytes
+            );
+            assert!(fc.low_water < fc.high_water);
+        }
+    }
+
+    #[test]
+    fn a_jumbo_frame_pushes_the_discrete_watermark_down_not_negative() {
+        // The "buffer minus one frame" term wins for a big frame, and must not
+        // wrap when the frame is larger than the whole buffer.
+        let fc = fc_settings(false, 9000);
+        assert_eq!(fc.high_water, ((32u32 << 10) - 9000) & FCRT_RTH_MASK);
+        let huge = fc_settings(false, 1 << 20);
+        assert_eq!(huge.high_water, 0);
+        assert_eq!(huge.low_water, 0);
+    }
+
+    #[test]
+    fn watermarks_land_on_the_registers_eight_byte_granularity() {
+        for is_pch in [true, false] {
+            let fc = fc_settings(is_pch, MAX_FRAME_SIZE);
+            assert_eq!(fc.high_water & !FCRT_RTH_MASK, 0);
+            assert_eq!(fc.low_water & !FCRT_RTH_MASK, 0);
+        }
+    }
+
+    #[test]
+    fn fcrtl_carries_the_xon_enable_bit() {
+        assert_eq!(fcrtl_value(0x5048, true), 0x5048 | 0x8000_0000);
+        assert_eq!(fcrtl_value(0x5048, false), 0x5048);
+    }
+
+    // --------------------------------------------- IEEE PAUSE resolution
+
+    #[test]
+    fn both_sides_symmetric_resolves_to_full() {
+        let adv = ADVERTISE_PAUSE_CAP;
+        let lpa = LPA_PAUSE_CAP;
+        assert_eq!(fc_mode_from_autoneg(adv, lpa, true, true), FcMode::Full);
+        // A driver that wanted Rx-only still had to advertise symmetric, so
+        // it turns Tx back off here.
+        assert_eq!(fc_mode_from_autoneg(adv, lpa, false, true), FcMode::RxPause);
+    }
+
+    #[test]
+    fn asymmetric_only_resolves_one_direction_each_way() {
+        // We offer asym but not sym, partner offers both -> we may only send.
+        assert_eq!(
+            fc_mode_from_autoneg(
+                ADVERTISE_PAUSE_ASYM,
+                LPA_PAUSE_CAP | LPA_PAUSE_ASYM,
+                true,
+                true
+            ),
+            FcMode::TxPause
+        );
+        // We offer both, partner offers asym only -> we may only receive.
+        assert_eq!(
+            fc_mode_from_autoneg(
+                ADVERTISE_PAUSE_CAP | ADVERTISE_PAUSE_ASYM,
+                LPA_PAUSE_ASYM,
+                true,
+                true
+            ),
+            FcMode::RxPause
+        );
+    }
+
+    #[test]
+    fn the_whole_ieee_table_matches_linux() {
+        // IEEE 802.3ab/D6.0, as reproduced in e1000e_config_fc_after_link_up.
+        // (local PAUSE, local ASM_DIR, partner PAUSE, partner ASM_DIR) -> mode
+        let table: [(bool, bool, bool, bool, FcMode); 8] = [
+            (false, false, false, false, FcMode::None),
+            (false, true, false, false, FcMode::None),
+            (false, true, true, false, FcMode::None),
+            (false, true, true, true, FcMode::TxPause),
+            (true, false, false, false, FcMode::None),
+            (true, false, true, false, FcMode::Full),
+            (true, true, false, false, FcMode::None),
+            (true, true, false, true, FcMode::RxPause),
+        ];
+        for (a_cap, a_asym, l_cap, l_asym, want) in table {
+            let adv = if a_cap { ADVERTISE_PAUSE_CAP } else { 0 }
+                | if a_asym { ADVERTISE_PAUSE_ASYM } else { 0 };
+            let lpa =
+                if l_cap { LPA_PAUSE_CAP } else { 0 } | if l_asym { LPA_PAUSE_ASYM } else { 0 };
+            assert_eq!(
+                fc_mode_from_autoneg(adv, lpa, true, true),
+                want,
+                "adv={:#06x} lpa={:#06x}",
+                adv,
+                lpa
+            );
+        }
+    }
+
+    #[test]
+    fn half_duplex_gets_no_flow_control_at_all() {
+        // 802.3x PAUSE is full-duplex only; a half-duplex link backs off with
+        // collisions instead. Linux clears the mode after resolving it.
+        assert_eq!(
+            fc_mode_from_autoneg(ADVERTISE_PAUSE_CAP, LPA_PAUSE_CAP, true, false),
+            FcMode::None
+        );
+    }
+
+    #[test]
+    fn the_other_speed_bits_in_the_same_registers_are_ignored() {
+        // ADVERTISE also carries the 10/100 abilities; they must not leak
+        // into the pause decision.
+        let adv = ADVERTISE_ALL_10_100 | ADVERTISE_PAUSE_CAP;
+        let lpa = LPA_10HALF | LPA_100FULL | LPA_PAUSE_CAP;
+        assert_eq!(fc_mode_from_autoneg(adv, lpa, true, true), FcMode::Full);
+        assert_eq!(
+            fc_mode_from_autoneg(ADVERTISE_ALL_10_100, LPA_10HALF | LPA_100FULL, true, true),
+            FcMode::None
+        );
+    }
+
+    #[test]
+    fn what_we_advertise_includes_both_pause_bits() {
+        // The whole chain hangs off this: no PAUSE in register 4, no PAUSE in
+        // the partner's answer, `fc_mode_from_autoneg` resolves to None, and
+        // the watermarks never fire.
+        let bits = autoneg_advertise_bits();
+        assert_ne!(bits & ADVERTISE_PAUSE_CAP, 0);
+        assert_ne!(bits & ADVERTISE_PAUSE_ASYM, 0);
+        assert_eq!(bits & ADVERTISE_ALL_10_100, ADVERTISE_ALL_10_100);
+        // And what we advertise must resolve to full against a partner that
+        // advertises the same.
+        assert_eq!(fc_mode_from_autoneg(bits, bits, true, true), FcMode::Full);
+    }
+
+    // ------------------------------------------------------------- CTRL
+
+    #[test]
+    fn ctrl_gets_exactly_the_bits_for_the_resolved_mode() {
+        assert_eq!(ctrl_for_fc(0, FcMode::None), 0);
+        assert_eq!(ctrl_for_fc(0, FcMode::RxPause), CTRL_RFCE);
+        assert_eq!(ctrl_for_fc(0, FcMode::TxPause), CTRL_TFCE);
+        assert_eq!(ctrl_for_fc(0, FcMode::Full), CTRL_RFCE | CTRL_TFCE);
+    }
+
+    #[test]
+    fn ctrl_clears_a_stale_mode_and_keeps_every_other_bit() {
+        // A re-negotiation that drops to no flow control has to turn the bits
+        // OFF again; leaving TFCE set would have us pausing a partner that
+        // never agreed to it.
+        let ctrl = CTRL_SLU | CTRL_ASDE | CTRL_RFCE | CTRL_TFCE;
+        let got = ctrl_for_fc(ctrl, FcMode::None);
+        assert_eq!(got & (CTRL_RFCE | CTRL_TFCE), 0);
+        assert_eq!(got & (CTRL_SLU | CTRL_ASDE), CTRL_SLU | CTRL_ASDE);
+        assert_eq!(
+            ctrl_for_fc(ctrl, FcMode::RxPause) & (CTRL_RFCE | CTRL_TFCE),
+            CTRL_RFCE
+        );
+    }
+
+    // ------------------------------------------------------- the registers
+
+    #[test]
+    fn setup_writes_the_pch_registers() {
+        let mut hw = make_hw();
+        hw.device_id = I219;
+        unsafe { hw.program_fc_registers(&fc_settings(true, MAX_FRAME_SIZE)) };
+        assert_eq!(reg_read(hw.base, E1000E_PBA), 26);
+        assert_eq!(reg_read(hw.base, E1000E_FCTTV), 0xFFFF);
+        assert_eq!(reg_read(hw.base, E1000E_FCRTV_PCH), 0xFFFF);
+        assert_eq!(reg_read(hw.base, E1000E_FCRTH), 0x5C20);
+        assert_eq!(reg_read(hw.base, E1000E_FCRTL), 0x5048 | FCRTL_XONE);
+    }
+
+    #[test]
+    fn setup_leaves_the_pch_refresh_timer_alone_on_a_discrete_part() {
+        // FCRTV_PCH does not exist on an 82574; writing it would land in
+        // whatever that offset really is.
+        let hw = make_hw();
+        assert!(!hw.is_pch());
+        // Poison the offset first: the discrete refresh time is 0, so a
+        // register left at its reset value and one written with 0 look the
+        // same. A sentinel tells them apart.
+        unsafe {
+            core::ptr::write_volatile((hw.base + E1000E_FCRTV_PCH * 4) as *mut u32, 0xA5A5_A5A5)
+        };
+        unsafe { hw.program_fc_registers(&fc_settings(false, MAX_FRAME_SIZE)) };
+        assert_eq!(reg_read(hw.base, E1000E_FCRTV_PCH), 0xA5A5_A5A5);
+        assert_eq!(reg_read(hw.base, E1000E_PBA), 32);
+        assert_eq!(reg_read(hw.base, E1000E_FCTTV), 0x0680);
+    }
+
+    #[test]
+    fn applying_the_negotiated_mode_updates_ctrl_in_place() {
+        let mut hw = make_hw();
+        hw.device_id = I219;
+        let mode =
+            unsafe { hw.apply_negotiated_flow_control(ADVERTISE_PAUSE_CAP, LPA_PAUSE_CAP, true) };
+        assert_eq!(mode, FcMode::Full);
+        assert_eq!(
+            reg_read(hw.base, E1000E_CTRL) & (CTRL_RFCE | CTRL_TFCE),
+            CTRL_RFCE | CTRL_TFCE
+        );
+        // Re-negotiating with a partner that offers nothing turns them off.
+        let mode = unsafe { hw.apply_negotiated_flow_control(ADVERTISE_PAUSE_CAP, 0, true) };
+        assert_eq!(mode, FcMode::None);
+        assert_eq!(reg_read(hw.base, E1000E_CTRL) & (CTRL_RFCE | CTRL_TFCE), 0);
+    }
+
+    #[test]
+    fn a_half_duplex_link_never_enables_pause_in_ctrl() {
+        let mut hw = make_hw();
+        hw.device_id = I219;
+        let mode =
+            unsafe { hw.apply_negotiated_flow_control(ADVERTISE_PAUSE_CAP, LPA_PAUSE_CAP, false) };
+        assert_eq!(mode, FcMode::None);
+        assert_eq!(reg_read(hw.base, E1000E_CTRL) & (CTRL_RFCE | CTRL_TFCE), 0);
+        let _ = FD;
     }
 }
