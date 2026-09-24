@@ -473,10 +473,6 @@ fn reset_mount_table() {
     MOUNT_TABLE.lock().clear();
 }
 
-fn boot_mount_state() -> Arc<mount_state::MountState> {
-    Arc::new(mount_state::MountState::new(false))
-}
-
 /// Resolve a top-level mount directory on the pivoted block-device root
 /// (btrfs/ext2) without `MNode::find` overlay/metadata overhead (VBox disk
 /// boot).
@@ -537,13 +533,7 @@ fn mount_ramfs_at(root: &Arc<MNode>, rel: &str, target: &str) {
         if last {
             match cur.mount(RamFS::new()) {
                 Ok(_) => {
-                    register_mount(
-                        "tmpfs",
-                        target,
-                        "tmpfs",
-                        "rw,nosuid,nodev",
-                        boot_mount_state(),
-                    );
+                    register_mount("tmpfs", target, "tmpfs", "rw,nosuid,nodev", None);
                     warn!("[boot] tmpfs on {target}");
                 }
                 Err(e) => warn!("[boot] mount {target} failed: {e:?}"),
@@ -571,20 +561,44 @@ pub(crate) fn audio_cards_alsa_order() -> Vec<Arc<dyn zcore_drivers::scheme::Aud
     v.into_iter().map(|(_, _, a)| a).collect()
 }
 
+/// Record a mount in the table `/proc/mounts` is read from.
+///
+/// `state` is the live [`MountState`](mount_state::MountState) the mounted
+/// filesystem is already wrapped in, when there is one. When there is not --
+/// every pseudo-filesystem the kernel provides itself -- the state is built
+/// **from the very options string being recorded**, so the line a program
+/// reads and the behaviour it gets come from one place. They did not before:
+/// `/dev`, `/tmp`, `/run`, `/proc` and `/sys` have always been registered
+/// `nosuid` and given a state that had never heard of the word.
 pub(crate) fn register_mount(
     source: &str,
     target: &str,
     fstype: &str,
     options: &str,
-    state: Arc<mount_state::MountState>,
+    state: Option<Arc<mount_state::MountState>>,
 ) {
-    MOUNT_TABLE.lock().push(MountEntry {
+    MOUNT_TABLE
+        .lock()
+        .push(new_mount_entry(source, target, fstype, options, state));
+}
+
+/// The entry `register_mount` records, built apart from the table so that the
+/// part worth checking -- that a mount with no live state gets one read from
+/// the very options being recorded -- can be checked without mounting.
+fn new_mount_entry(
+    source: &str,
+    target: &str,
+    fstype: &str,
+    options: &str,
+    state: Option<Arc<mount_state::MountState>>,
+) -> MountEntry {
+    MountEntry {
         source: source.to_string(),
         target: target.to_string(),
         fstype: fstype.to_string(),
         options: options.to_string(),
-        state,
-    });
+        state: state.unwrap_or_else(|| Arc::new(mount_state::MountState::from_options(0, options))),
+    }
 }
 
 pub(crate) fn unregister_mount(target: &str) {
@@ -592,14 +606,26 @@ pub(crate) fn unregister_mount(target: &str) {
 }
 
 pub(crate) fn remount_flags(target: &str, flags: usize, data: &str) -> LxResult<()> {
+    remount_entry(&mut MOUNT_TABLE.lock(), target, flags, data)
+}
+
+/// `mount -o remount`, over the table it is given.
+fn remount_entry(
+    mounts: &mut [MountEntry],
+    target: &str,
+    flags: usize,
+    data: &str,
+) -> LxResult<()> {
     let target = normalize_mount_target(target);
-    let mut mounts = MOUNT_TABLE.lock();
     let entry = mounts
         .iter_mut()
         .find(|m| m.target == target)
         .ok_or(LxError::EINVAL)?;
-    let ro = mount_state::flags_read_only(flags, data);
-    entry.state.set_read_only(ro);
+    // `do_remount()` sets the mount's attributes from the flags it was given,
+    // so a remount REPLACES the options rather than adding to them -- which is
+    // why `mount -o remount` reads the current line out of `/proc/mounts` and
+    // passes the whole set back. Both bits move together with the line.
+    entry.state.apply_options(flags, data);
     entry.options = mount_state::build_options_string(flags, data);
     Ok(())
 }
@@ -623,6 +649,55 @@ fn normalize_mount_target(path: &str) -> String {
     } else {
         String::from(path.trim_end_matches('/'))
     }
+}
+
+/// Whether `path` lives on a mount that was mounted `nosuid`.
+///
+/// Answered from the mount table rather than from the inode, because the inode
+/// does not know: the per-mount state rides on the filesystem wrapper, and by
+/// the time a lookup has walked through MountFS what comes back is an `MNode`
+/// that delegates to it without exposing it. The table is the same record
+/// `/proc/mounts` is printed from, so a program that reads `nosuid` there and
+/// the kernel that enforces it are reading one thing.
+///
+/// A relative path matches only the root mount, which is the answer it had
+/// before this existed; callers with a `cwd` should make it absolute first.
+pub fn path_is_nosuid(path: &str) -> bool {
+    let mounts = MOUNT_TABLE.lock();
+    nosuid_from(
+        path,
+        mounts
+            .iter()
+            .map(|m| (m.target.as_str(), m.state.is_nosuid())),
+    )
+}
+
+/// The rule behind [`path_is_nosuid`], over the mount points it is given
+/// rather than over the one live table -- so the part that can be wrong (which
+/// mount a path is on) can be tested without a test having to mount anything.
+///
+/// Longest match wins, which is what makes a mount inside another mount mean
+/// anything at all; and when two entries name the same mount point, the last
+/// registered one does, because that is the one whose filesystem a lookup
+/// reaches.
+fn nosuid_from<'a>(path: &str, mounts: impl Iterator<Item = (&'a str, bool)>) -> bool {
+    let path = normalize_mount_target(path);
+    mounts
+        .filter(|(target, _)| path_is_under(&path, target))
+        .max_by_key(|(target, _)| target.len())
+        .is_some_and(|(_, nosuid)| nosuid)
+}
+
+/// Whether `path` is `mount` itself or something inside it.
+///
+/// The component boundary is the whole of it: a plain `starts_with` puts
+/// `/mnthing/x` on the mount at `/mnt`, and the mount it lands on is what
+/// decides whether a set-user-ID bit there is honoured.
+fn path_is_under(path: &str, mount: &str) -> bool {
+    if mount == "/" || path == mount {
+        return true;
+    }
+    path.len() > mount.len() && path.starts_with(mount) && path.as_bytes()[mount.len()] == b'/'
 }
 
 pub(crate) fn proc_mounts_content() -> String {
@@ -1313,7 +1388,7 @@ pub fn create_root_fs(rootfs: Arc<dyn FileSystem>) -> Arc<dyn INode> {
     warn!("[boot] create_root_fs: root inode");
     let root = rootfs.mountpoint_root_inode();
     reset_mount_table();
-    register_mount(&root_source, "/", root_fstype, "rw", boot_mount_state());
+    register_mount(&root_source, "/", root_fstype, "rw", None);
 
     // mount DevFS at /dev
     let dev = resolve_mount_dir(&rootfs, &root, root_fstype, "dev", 0o666);
@@ -1321,18 +1396,12 @@ pub fn create_root_fs(rootfs: Arc<dyn FileSystem>) -> Arc<dyn INode> {
     if let Err(e) = dev.mount(devfs) {
         warn!("[boot] create_root_fs: mount /dev failed: {:?}", e);
     } else {
-        register_mount("devfs", "/dev", "devtmpfs", "rw,nosuid", boot_mount_state());
+        register_mount("devfs", "/dev", "devtmpfs", "rw,nosuid", None);
         // `/dev/shm` is served by a RamFS inserted directly into devfs (see the
         // `add("shm", ...)` above); it is not a MountFS mount, because `/dev/*`
         // lookups bypass MountFS via the `lookup_virtual_fs` fast path. Register
         // it in the mount table only so `/proc/mounts` reflects reality.
-        register_mount(
-            "tmpfs",
-            "/dev/shm",
-            "tmpfs",
-            "rw,nosuid,nodev",
-            boot_mount_state(),
-        );
+        register_mount("tmpfs", "/dev/shm", "tmpfs", "rw,nosuid,nodev", None);
     }
 
     // mount RamFS at /tmp
@@ -1342,13 +1411,7 @@ pub fn create_root_fs(rootfs: Arc<dyn FileSystem>) -> Arc<dyn INode> {
     if let Err(e) = tmp.mount(ramfs) {
         warn!("[boot] create_root_fs: mount /tmp failed: {:?}", e);
     } else {
-        register_mount(
-            "tmpfs",
-            "/tmp",
-            "tmpfs",
-            "rw,nosuid,nodev",
-            boot_mount_state(),
-        );
+        register_mount("tmpfs", "/tmp", "tmpfs", "rw,nosuid,nodev", None);
     }
 
     // mount RamFS at /run (essential for DHCP clients and other daemons)
@@ -1423,13 +1486,7 @@ pub fn create_root_fs(rootfs: Arc<dyn FileSystem>) -> Arc<dyn INode> {
     if let Err(e) = run.mount(run_ramfs) {
         warn!("[boot] create_root_fs: mount /run failed: {:?}", e);
     } else {
-        register_mount(
-            "tmpfs",
-            "/run",
-            "tmpfs",
-            "rw,nosuid,nodev",
-            boot_mount_state(),
-        );
+        register_mount("tmpfs", "/run", "tmpfs", "rw,nosuid,nodev", None);
     }
 
     // PulseAudio `--system` (change_user) always mkdir+chowns these two
@@ -1461,13 +1518,7 @@ pub fn create_root_fs(rootfs: Arc<dyn FileSystem>) -> Arc<dyn INode> {
                     .expect("failed to mkdir /var/cache/apk")
             });
             if apk_cache.mount(RamFS::new()).is_ok() {
-                register_mount(
-                    "tmpfs",
-                    "/var/cache/apk",
-                    "tmpfs",
-                    "rw,nosuid,nodev",
-                    boot_mount_state(),
-                );
+                register_mount("tmpfs", "/var/cache/apk", "tmpfs", "rw,nosuid,nodev", None);
             } else {
                 warn!("[boot] create_root_fs: mount /var/cache/apk failed");
             }
@@ -1485,7 +1536,7 @@ pub fn create_root_fs(rootfs: Arc<dyn FileSystem>) -> Arc<dyn INode> {
             "/proc",
             "proc",
             "rw,nosuid,nodev,noexec,relatime",
-            boot_mount_state(),
+            None,
         );
     }
 
@@ -1500,7 +1551,7 @@ pub fn create_root_fs(rootfs: Arc<dyn FileSystem>) -> Arc<dyn INode> {
             "/sys",
             "sysfs",
             "rw,nosuid,nodev,noexec,relatime",
-            boot_mount_state(),
+            None,
         );
     }
 
@@ -1846,7 +1897,7 @@ fn mount_fstab(root: &Arc<MNode>) {
 
                         let mount_source = derived_efi.as_deref().unwrap_or(source);
                         let opts = mount_state::build_options_string(flags, options);
-                        register_mount(mount_source, target, fstype_parsed, &opts, state);
+                        register_mount(mount_source, target, fstype_parsed, &opts, Some(state));
                         info!(
                             "mount_fstab: successfully mounted {:?} to {:?}",
                             mount_source, target
@@ -2279,6 +2330,190 @@ pub fn split_path(path: &str) -> (&str, &str) {
         Some(("", file_name)) => ("/", file_name),
         Some((dir_path, file_name)) => (dir_path, file_name),
         None => (".", path),
+    }
+}
+
+#[cfg(test)]
+mod mount_lookup_tests {
+    //! Which mount a path is on. It decides whether a set-user-ID bit on that
+    //! path is honoured, so getting it wrong in one direction hands privilege
+    //! away on a `nosuid` mount and in the other takes it from a mount that
+    //! never asked for the option.
+    //!
+    //! All of it is checked through [`nosuid_from`], over mount points the
+    //! test supplies, so nothing here touches the one live mount table -- a
+    //! test that mounted something would leave it mounted for every test
+    //! after it, and `--test-threads=1` is exactly the setting under which
+    //! that goes unnoticed.
+
+    use super::*;
+
+    /// A plausible boot: the root plus the pseudo-filesystems the kernel
+    /// mounts itself, with the `nosuid` each of them is registered with.
+    const A_BOOT: &[(&str, bool)] = &[
+        ("/", false),
+        ("/dev", true),
+        ("/dev/shm", true),
+        ("/tmp", true),
+        ("/run", true),
+        ("/proc", true),
+        ("/sys", true),
+    ];
+
+    fn nosuid(path: &str) -> bool {
+        nosuid_from(path, A_BOOT.iter().copied())
+    }
+
+    #[test]
+    fn a_mount_with_no_state_of_its_own_gets_one_from_the_line_it_records() {
+        // The pseudo-filesystems the kernel mounts itself have no wrapped
+        // filesystem to carry a state, and they are exactly the ones
+        // registered `nosuid`. Their state used to be built from nothing.
+        let entry = new_mount_entry("proc", "/proc", "proc", "rw,nosuid,nodev,noexec", None);
+        assert!(entry.state.is_nosuid());
+        assert!(!entry.state.is_read_only());
+        let plain = new_mount_entry("/dev/sda2", "/", "btrfs", "rw", None);
+        assert!(!plain.state.is_nosuid());
+    }
+
+    #[test]
+    fn a_mount_that_brought_its_own_state_keeps_it() {
+        // A real mount hands over the very state its filesystem wrapper is
+        // already enforcing; rebuilding it here would give the table a second
+        // copy that a remount could move without the wrapper noticing.
+        let state = alloc::sync::Arc::new(mount_state::MountState::from_options(0, "rw"));
+        let entry = new_mount_entry(
+            "/dev/sdb1",
+            "/mnt",
+            "vfat",
+            "rw,nosuid",
+            Some(state.clone()),
+        );
+        assert!(
+            !entry.state.is_nosuid(),
+            "the line did not win over the state"
+        );
+        state.set_nosuid(true);
+        assert!(entry.state.is_nosuid(), "the table holds the SAME state");
+    }
+
+    #[test]
+    fn a_remount_moves_the_state_the_filesystem_is_enforcing() {
+        // Not a copy of it: the entry and the mounted filesystem share one
+        // `MountState`, which is how a `mount -o remount,ro` reaches the
+        // write path at all.
+        let state = alloc::sync::Arc::new(mount_state::MountState::from_options(0, "rw,nosuid"));
+        let mut table = alloc::vec![new_mount_entry(
+            "tmpfs",
+            "/tmp",
+            "tmpfs",
+            "rw,nosuid",
+            Some(state.clone())
+        )];
+        remount_entry(&mut table, "/tmp", 0, "ro").unwrap();
+        assert!(state.is_read_only(), "the filesystem still thinks it is rw");
+        assert!(
+            !state.is_nosuid(),
+            "nosuid outlived a remount that dropped it"
+        );
+        assert_eq!(table[0].options, "ro");
+    }
+
+    #[test]
+    fn a_remount_of_something_that_is_not_mounted_is_einval() {
+        let mut table = alloc::vec![new_mount_entry("tmpfs", "/tmp", "tmpfs", "rw", None)];
+        assert!(remount_entry(&mut table, "/nowhere", 0, "ro").is_err());
+        // And a trailing slash names the same mount, because `/proc/mounts`
+        // never carries one and the caller typed whatever they typed.
+        assert!(remount_entry(&mut table, "/tmp/", 0, "ro").is_ok());
+    }
+
+    #[test]
+    fn a_program_on_the_root_filesystem_may_be_set_user_id() {
+        // The case every program on this machine is in. Answering the other
+        // way would turn off set-user-ID for the whole system.
+        assert!(!nosuid("/bin/busybox"));
+        assert!(!nosuid("/usr/bin/passwd"));
+        assert!(!nosuid("/"));
+    }
+
+    #[test]
+    fn a_program_dropped_in_tmp_may_not() {
+        // Which is the entire reason `/tmp` is mounted `nosuid`: it is the one
+        // directory anybody can write to.
+        assert!(nosuid("/tmp/x"));
+        assert!(nosuid("/tmp/deep/er/still"));
+        assert!(nosuid("/dev/shm/x"));
+    }
+
+    #[test]
+    fn the_mount_point_itself_is_on_its_own_mount() {
+        assert!(nosuid("/tmp"));
+        assert!(nosuid("/tmp/"));
+    }
+
+    #[test]
+    fn a_mount_point_is_not_a_prefix_of_a_name_that_merely_starts_with_it() {
+        // `/tmpfiles` is a directory on the root filesystem, not something
+        // inside the mount at `/tmp`. A plain `starts_with` puts it there and
+        // silently disarms every set-user-ID program under it.
+        assert!(!nosuid("/tmpfiles/x"));
+        assert!(!nosuid("/tmpfoo"));
+        assert!(!nosuid("/proc-backup/x"));
+    }
+
+    #[test]
+    fn the_longest_mount_point_wins() {
+        // Both directions, because a rule that took the first match would be
+        // right about half of these by luck.
+        let mounts = &[("/", false), ("/mnt", true), ("/mnt/usb", false)];
+        assert!(nosuid_from("/mnt/x", mounts.iter().copied()));
+        assert!(
+            !nosuid_from("/mnt/usb/x", mounts.iter().copied()),
+            "a mount inside a nosuid mount answers for itself"
+        );
+        let inverted = &[("/", false), ("/mnt", false), ("/mnt/usb", true)];
+        assert!(!nosuid_from("/mnt/x", inverted.iter().copied()));
+        assert!(nosuid_from("/mnt/usb/x", inverted.iter().copied()));
+    }
+
+    #[test]
+    fn the_last_mount_on_a_point_is_the_one_that_answers() {
+        // Mounting over an existing mount point pushes a second entry with
+        // the same target; a lookup reaches the newer filesystem, so the
+        // newer entry is the one whose options apply.
+        let stacked = &[("/", false), ("/mnt", false), ("/mnt", true)];
+        assert!(nosuid_from("/mnt/x", stacked.iter().copied()));
+        let unstacked = &[("/", false), ("/mnt", true), ("/mnt", false)];
+        assert!(!nosuid_from("/mnt/x", unstacked.iter().copied()));
+    }
+
+    #[test]
+    fn a_path_on_no_mount_at_all_grants_nothing_extra() {
+        // With no root entry there is nothing to be under. Fail open, which
+        // is what the tree did before any of this existed -- the option is a
+        // restriction, and inventing one nobody asked for is its own bug.
+        assert!(!nosuid_from("/bin/sh", core::iter::empty()));
+        assert!(!nosuid_from("relative/path", A_BOOT.iter().copied()));
+    }
+
+    #[test]
+    fn the_root_mount_covers_a_path_that_matches_nothing_else() {
+        let ro_root = &[("/", true), ("/tmp", false)];
+        assert!(nosuid_from("/bin/sh", ro_root.iter().copied()));
+        assert!(!nosuid_from("/tmp/x", ro_root.iter().copied()));
+    }
+
+    #[test]
+    fn the_boundary_rule_on_its_own() {
+        // `path_is_under` is what the rule above is built from, so it gets its
+        // own test: the failures of the composite are hard to read.
+        assert!(path_is_under("/anything", "/"));
+        assert!(path_is_under("/tmp", "/tmp"));
+        assert!(path_is_under("/tmp/x", "/tmp"));
+        assert!(!path_is_under("/tmpx", "/tmp"));
+        assert!(!path_is_under("/tm", "/tmp"));
+        assert!(!path_is_under("/var/tmp/x", "/tmp"));
     }
 }
 

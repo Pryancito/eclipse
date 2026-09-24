@@ -125,7 +125,7 @@ pub(crate) fn prepare_fs(
     flags: usize,
     data: &str,
 ) -> (Arc<dyn FileSystem>, Arc<mount_state::MountState>) {
-    let state = Arc::new(mount_state::MountState::new(flags_read_only(flags, data)));
+    let state = Arc::new(mount_state::MountState::from_options(flags, data));
     let wrapped = wrap_fs(fs, state.clone());
     (wrapped, state)
 }
@@ -162,7 +162,7 @@ pub fn mount_fs(
         let (fs, state) = prepare_fs(inner, flags, data);
         mount_node.mount(fs).map_err(LxError::from)?;
         let opts = build_options_string(flags, data);
-        super::register_mount(source, &target_norm, "none", &opts, state);
+        super::register_mount(source, &target_norm, "none", &opts, Some(state));
         return Ok(());
     }
 
@@ -175,8 +175,7 @@ pub fn mount_fs(
     // "mounting proc on /proc failed: No such device".
     if is_virtual_fstype(fstype) {
         let opts = build_options_string(flags, data);
-        let state = Arc::new(mount_state::MountState::new(flags_read_only(flags, data)));
-        super::register_mount(source, &target_norm, fstype, &opts, state);
+        super::register_mount(source, &target_norm, fstype, &opts, None);
         return Ok(());
     }
 
@@ -192,7 +191,7 @@ pub fn mount_fs(
     let (fs, state) = prepare_fs(fs, flags, data);
     mount_node.mount(fs).map_err(LxError::from)?;
     let opts = build_options_string(flags, data);
-    super::register_mount(source, &target_norm, fstype, &opts, state);
+    super::register_mount(source, &target_norm, fstype, &opts, Some(state));
     Ok(())
 }
 
@@ -225,6 +224,13 @@ fn mount_move(source: &str, target: &str) -> LxResult<()> {
 
 /// Unmount a filesystem mounted at `target`.
 pub fn umount_fs(target: &str, flags: usize) -> LxResult<()> {
+    // The word first, before anything is unmounted: an option this kernel does
+    // not know must come back as EINVAL, which is how a program finds out --
+    // `umount -l` succeeding while unmounting eagerly is worse than a refusal,
+    // because the caller believes the mount was detached and it was not.
+    mount_state::check_umount_flags(flags)?;
+    // MNT_FORCE and MNT_DETACH are accepted and then not acted on: an unmount
+    // here never reports EBUSY, so there is nothing for either to change.
     let _ = flags & (MNT_FORCE | MNT_DETACH);
     let target_norm = normalize_target(target);
     let mount_node = resolve_mnode(&target_norm)?;

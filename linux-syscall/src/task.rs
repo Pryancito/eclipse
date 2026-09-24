@@ -898,6 +898,15 @@ impl Syscall<'_> {
         let inode = proc.lookup_inode(path_str)?;
         let metadata = inode.metadata()?;
         proc.check_access(&metadata, 0o1, true)?;
+        // `mnt_may_suid(bprm->file->f_path.mnt)`: a set-user-ID bit on a file
+        // that lives on a `nosuid` mount grants nothing. Asked here, where the
+        // path the caller named is still in hand, and made absolute first
+        // because the mount is chosen by path prefix.
+        let may_suid = !linux_object::fs::path_is_nosuid(
+            &proc
+                .get_absolute_path(FileDesc::CWD, path_str)
+                .unwrap_or_else(|_| path_str.to_string()),
+        );
         let vmo = inode.read_as_vmo_cached()?;
 
         // Everything below `vmar.clear()` is past the point of no return: the
@@ -949,7 +958,7 @@ impl Syscall<'_> {
             // and refuses the caller's LD_PRELOAD when it is set. Linux draws
             // the same order: `begin_new_exec()` commits the credentials, and
             // `create_elf_tables()` writes the aux vector afterwards.
-            let privileged = proc.apply_exec_metadata(&metadata);
+            let privileged = proc.apply_exec_metadata(&metadata, may_suid);
             let loaded = LinuxElfLoader {
                 syscall_entry: self.syscall_entry,
                 stack_pages: USER_STACK_PAGES,

@@ -1823,10 +1823,16 @@ impl LinuxProcess {
     /// Returns whether this exec actually RAISED privileges -- Linux's
     /// `bprm->secureexec`, which is what turns on the extra forgetting in
     /// [`Self::reset_for_exec`].
-    pub fn apply_exec_metadata(&self, metadata: &Metadata) -> bool {
-        self.inner
-            .lock()
-            .apply_exec_ids(metadata.mode, metadata.uid as u32, metadata.gid as u32)
+    /// `may_suid` is Linux's `mnt_may_suid()`: false when the image sits on a
+    /// mount that was mounted `nosuid`, which is the whole of what that option
+    /// buys and the reason `/tmp` and `/dev/shm` are mounted with it.
+    pub fn apply_exec_metadata(&self, metadata: &Metadata, may_suid: bool) -> bool {
+        self.inner.lock().apply_exec_ids(
+            metadata.mode,
+            metadata.uid as u32,
+            metadata.gid as u32,
+            may_suid,
+        )
     }
 
     /// FreeBSD's `issetugid(2)`: whether this process's ids have moved since
@@ -2313,19 +2319,20 @@ impl LinuxProcessInner {
     /// keeps its effective id across `execve`, so the ordinary shell it execs
     /// is every bit as privileged -- and every bit as unable to trust the
     /// environment it was handed -- as the image that raised it.
-    fn apply_exec_ids(&mut self, mode: u16, uid: u32, gid: u32) -> bool {
+    fn apply_exec_ids(&mut self, mode: u16, uid: u32, gid: u32, may_suid: bool) -> bool {
         // The ids this exec starts from. `execve` never moves the real ones,
         // so `ruid`/`rgid` below are `old->uid`/`old->gid` as well.
         let old_euid = self.credentials.euid;
         let old_egid = self.credentials.egid;
 
-        // no_new_privs (Documentation/userspace-api/no_new_privs.rst): execve
-        // must not grant privileges the process could not have gained on its
-        // own — setuid/setgid bits on the image are simply not honoured.
-        // Linux returns from `bprm_fill_uid()` here and goes on to compute
-        // `secureexec` regardless, which is the point: refusing to raise a
-        // process says nothing about how privileged it already was.
-        if !self.no_new_privs {
+        // `bprm_fill_uid()` asks two questions before it honours a bit, and
+        // leaves without honouring either if the answer to one of them is no:
+        // `mnt_may_suid(file->f_path.mnt)` -- was the filesystem mounted
+        // `nosuid`? -- and `task_no_new_privs(current)`. It then goes on to
+        // compute `secureexec` regardless, which is the point of doing them
+        // here and not at the return: refusing to raise a process says nothing
+        // about how privileged it already was.
+        if may_suid && !self.no_new_privs {
             if (mode & MODE_SET_UID) != 0 {
                 self.credentials.euid = uid;
                 self.credentials.suid = uid;
@@ -2377,6 +2384,13 @@ impl LinuxProcessInner {
         if self.ids() != before {
             self.sugid = true;
         }
+    }
+
+    /// `apply_exec_ids` for an image on an ordinary mount, which is what every
+    /// test that is not about `nosuid` means.
+    #[cfg(test)]
+    fn apply_exec_ids_from_a_normal_mount(&mut self, mode: u16, uid: u32, gid: u32) -> bool {
+        self.apply_exec_ids(mode, uid, gid, true)
     }
 
     /// The aux-vector identity block for the image about to be loaded.
@@ -3896,7 +3910,7 @@ mod exec_reset_tests {
     #[test]
     fn a_setuid_image_owned_by_another_user_raises_privileges() {
         let mut inner = a_process_about_to_exec();
-        assert!(inner.apply_exec_ids(0o4755, ROOT_UID, 1000));
+        assert!(inner.apply_exec_ids_from_a_normal_mount(0o4755, ROOT_UID, 1000));
         assert_eq!(inner.credentials.euid, ROOT_UID);
         // The saved id follows, which is what lets the program drop and
         // regain the privilege later.
@@ -3911,7 +3925,7 @@ mod exec_reset_tests {
         // -- and a `raised` that only ever looked at the user half would let
         // a set-group-ID program keep the lever.
         let mut inner = a_process_about_to_exec();
-        assert!(inner.apply_exec_ids(0o2755, 1000, 0));
+        assert!(inner.apply_exec_ids_from_a_normal_mount(0o2755, 1000, 0));
         assert_eq!(inner.credentials.egid, 0);
         assert_eq!(inner.credentials.sgid, 0);
         assert_eq!(inner.credentials.rgid, 1000);
@@ -3923,7 +3937,7 @@ mod exec_reset_tests {
         // bits were set. A user's own set-user-ID binary grants that user
         // nothing, so nothing about the process needs hardening.
         let mut inner = a_process_about_to_exec();
-        assert!(!inner.apply_exec_ids(0o6755, 1000, 1000));
+        assert!(!inner.apply_exec_ids_from_a_normal_mount(0o6755, 1000, 1000));
         assert_eq!(inner.credentials.euid, 1000);
         assert_eq!(inner.credentials.egid, 1000);
     }
@@ -3931,7 +3945,7 @@ mod exec_reset_tests {
     #[test]
     fn an_ordinary_image_raises_nothing() {
         let mut inner = a_process_about_to_exec();
-        assert!(!inner.apply_exec_ids(0o0755, ROOT_UID, ROOT_UID));
+        assert!(!inner.apply_exec_ids_from_a_normal_mount(0o0755, ROOT_UID, ROOT_UID));
         assert_eq!(inner.credentials.euid, 1000);
         assert_eq!(inner.credentials.egid, 1000);
     }
@@ -3943,11 +3957,57 @@ mod exec_reset_tests {
         // process hardened against a privilege it never got.
         let mut inner = a_process_about_to_exec();
         inner.no_new_privs = true;
-        assert!(!inner.apply_exec_ids(0o6755, ROOT_UID, ROOT_UID));
+        assert!(!inner.apply_exec_ids_from_a_normal_mount(0o6755, ROOT_UID, ROOT_UID));
         assert_eq!(inner.credentials.euid, 1000);
         assert_eq!(inner.credentials.egid, 1000);
         assert_eq!(inner.credentials.suid, 1000);
         assert_eq!(inner.credentials.sgid, 1000);
+    }
+
+    #[test]
+    fn a_setuid_image_on_a_nosuid_mount_grants_nothing() {
+        // `mnt_may_suid(bprm->file->f_path.mnt)`: this is the whole of what
+        // mounting `/tmp` with `nosuid` buys, and it was bought and never
+        // delivered -- the option reached `/proc/mounts` and stopped there.
+        let mut inner = a_process_about_to_exec();
+        assert!(!inner.apply_exec_ids(0o6755, ROOT_UID, ROOT_UID, false));
+        assert_eq!(inner.credentials.euid, 1000);
+        assert_eq!(inner.credentials.egid, 1000);
+        assert_eq!(inner.credentials.suid, 1000);
+        assert_eq!(inner.credentials.sgid, 1000);
+    }
+
+    #[test]
+    fn nosuid_does_not_hide_a_process_that_was_already_privileged() {
+        // The mount decides what this exec may GRANT. It says nothing about
+        // what the process is already carrying, and a program running as root
+        // has to distrust its environment wherever its image happens to live.
+        let mut inner = a_process_already_setuid_root();
+        assert!(inner.apply_exec_ids(0o0755, ROOT_UID, ROOT_UID, false));
+        assert_eq!(inner.credentials.euid, ROOT_UID);
+    }
+
+    #[test]
+    fn the_mount_and_no_new_privs_are_two_separate_gates() {
+        // Either one refusing is enough, and neither is the other: a table,
+        // so that a rewrite collapsing them into one condition fails here by
+        // name rather than in whichever of the two cases it got wrong.
+        for (may_suid, no_new_privs, honoured) in [
+            (true, false, true),
+            (false, false, false),
+            (true, true, false),
+            (false, true, false),
+        ] {
+            let mut inner = a_process_about_to_exec();
+            inner.no_new_privs = no_new_privs;
+            inner.apply_exec_ids(0o4755, ROOT_UID, ROOT_UID, may_suid);
+            let got = inner.credentials.euid == ROOT_UID;
+            assert_eq!(
+                got, honoured,
+                "may_suid={} no_new_privs={}: euid ended {}",
+                may_suid, no_new_privs, inner.credentials.euid
+            );
+        }
     }
 
     #[test]
@@ -3984,7 +4044,7 @@ mod exec_reset_tests {
         // exactly the same privilege -- and can trust the caller's
         // LD_PRELOAD exactly as little.
         let mut inner = a_process_already_setuid_root();
-        assert!(inner.apply_exec_ids(0o0755, ROOT_UID, ROOT_UID));
+        assert!(inner.apply_exec_ids_from_a_normal_mount(0o0755, ROOT_UID, ROOT_UID));
         assert_eq!(inner.credentials.euid, ROOT_UID);
         assert_eq!(inner.credentials.ruid, 1000);
     }
@@ -3998,7 +4058,7 @@ mod exec_reset_tests {
         let mut inner = a_process_about_to_exec();
         inner.credentials.egid = 0;
         inner.credentials.sgid = 0;
-        assert!(inner.apply_exec_ids(0o0755, ROOT_UID, ROOT_UID));
+        assert!(inner.apply_exec_ids_from_a_normal_mount(0o0755, ROOT_UID, ROOT_UID));
         assert_eq!(inner.credentials.egid, 0);
         assert_eq!(inner.credentials.rgid, 1000);
     }
@@ -4013,7 +4073,7 @@ mod exec_reset_tests {
         // sandbox can exec without granting anything.
         let mut inner = a_process_already_setuid_root();
         inner.no_new_privs = true;
-        assert!(inner.apply_exec_ids(0o6755, 1000, 1000));
+        assert!(inner.apply_exec_ids_from_a_normal_mount(0o6755, 1000, 1000));
         // The bits were still not honoured: the image asked for uid 1000 and
         // got nothing, which is the whole of what no_new_privs promises.
         assert_eq!(inner.credentials.euid, ROOT_UID);
@@ -4032,7 +4092,7 @@ mod exec_reset_tests {
         let mut inner = a_process_about_to_exec();
         inner.credentials.euid = ROOT_UID;
         inner.credentials.suid = ROOT_UID;
-        assert!(inner.apply_exec_ids(0o4755, 1000, ROOT_UID));
+        assert!(inner.apply_exec_ids_from_a_normal_mount(0o4755, 1000, ROOT_UID));
         assert_eq!(inner.credentials.euid, 1000);
         assert_eq!(inner.credentials.ruid, 1000);
         assert_eq!(inner.credentials.egid, inner.credentials.rgid);
@@ -4046,7 +4106,7 @@ mod exec_reset_tests {
         // move a process's effective group for a file that never claimed to
         // be a set-group-ID program at all.
         let mut inner = a_process_about_to_exec();
-        assert!(!inner.apply_exec_ids(0o2744, ROOT_UID, ROOT_UID));
+        assert!(!inner.apply_exec_ids_from_a_normal_mount(0o2744, ROOT_UID, ROOT_UID));
         assert_eq!(inner.credentials.egid, 1000);
         assert_eq!(inner.credentials.sgid, 1000);
     }
@@ -4056,7 +4116,7 @@ mod exec_reset_tests {
         // The other side of the line above, so that the test pair pins the
         // rule and not just one of its answers.
         let mut inner = a_process_about_to_exec();
-        assert!(inner.apply_exec_ids(0o2754, ROOT_UID, ROOT_UID));
+        assert!(inner.apply_exec_ids_from_a_normal_mount(0o2754, ROOT_UID, ROOT_UID));
         assert_eq!(inner.credentials.egid, ROOT_UID);
         assert_eq!(inner.credentials.sgid, ROOT_UID);
     }
@@ -4072,7 +4132,7 @@ mod exec_reset_tests {
         inner.credentials.egid = ROOT_UID;
         inner.credentials.sgid = ROOT_UID;
         inner.credentials.groups = vec![1000];
-        assert!(!inner.apply_exec_ids(0o2754, ROOT_UID, 1000));
+        assert!(!inner.apply_exec_ids_from_a_normal_mount(0o2754, ROOT_UID, 1000));
         assert_eq!(inner.credentials.egid, 1000);
     }
 
@@ -4087,7 +4147,7 @@ mod exec_reset_tests {
         inner.credentials.egid = ROOT_UID;
         inner.credentials.sgid = ROOT_UID;
         inner.credentials.groups = vec![ROOT_UID];
-        assert!(inner.apply_exec_ids(0o2754, ROOT_UID, 1000));
+        assert!(inner.apply_exec_ids_from_a_normal_mount(0o2754, ROOT_UID, 1000));
         assert_eq!(inner.credentials.egid, 1000);
     }
 
@@ -4098,7 +4158,7 @@ mod exec_reset_tests {
         // here puts the whole system in secure mode, which drops LD_PRELOAD
         // everywhere and makes GLib refuse to autolaunch a session bus.
         let mut inner = LinuxProcessInner::default();
-        assert!(!inner.apply_exec_ids(0o0755, ROOT_UID, ROOT_UID));
+        assert!(!inner.apply_exec_ids_from_a_normal_mount(0o0755, ROOT_UID, ROOT_UID));
     }
 
     // --- The aux-vector identity block --------------------------------------
@@ -4242,7 +4302,7 @@ mod sugid_tests {
         // address space away -- so the doubt goes with it.
         let mut inner = LinuxProcessInner::default();
         inner.sugid = true;
-        assert!(!inner.apply_exec_ids(0o0755, ROOT_UID, ROOT_UID));
+        assert!(!inner.apply_exec_ids_from_a_normal_mount(0o0755, ROOT_UID, ROOT_UID));
         assert!(!inner.sugid);
     }
 
@@ -4255,7 +4315,7 @@ mod sugid_tests {
         let mut inner = LinuxProcessInner::default();
         inner.credentials.ruid = 1000;
         inner.sugid = false;
-        assert!(inner.apply_exec_ids(0o0755, ROOT_UID, ROOT_UID));
+        assert!(inner.apply_exec_ids_from_a_normal_mount(0o0755, ROOT_UID, ROOT_UID));
         assert!(inner.sugid);
     }
 
@@ -4270,7 +4330,7 @@ mod sugid_tests {
         inner.credentials.sgid = 1000;
         inner.credentials.groups = vec![1000];
         assert!(!inner.sugid);
-        assert!(inner.apply_exec_ids(0o4755, ROOT_UID, 1000));
+        assert!(inner.apply_exec_ids_from_a_normal_mount(0o4755, ROOT_UID, 1000));
         assert!(inner.sugid);
     }
 }
