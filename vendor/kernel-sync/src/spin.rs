@@ -77,48 +77,78 @@ impl<T: ?Sized> SpinMutex<T> {
             .store(file.as_ptr() as usize, Ordering::Release);
     }
 
+    /// One turn of this lock's waiting: pause, count it, and act on the
+    /// count. Split out so the compare-exchange retry and the read-only wait
+    /// go through the same counter — see [`Self::lock`] for what it cost when
+    /// they did not.
+    #[inline(always)]
+    fn wait_turn(&self, spins: &mut u64, caller: &'static core::panic::Location<'static>) {
+        core::hint::spin_loop();
+        *spins += 1;
+        // Spinning with IRQs off makes this CPU deaf to TLB-shootdown
+        // IPIs, and a peer may be spin-waiting for our ack — drain our
+        // queue at a coarse cadence, exactly as the ticket lock does.
+        if *spins & 511 == 0 {
+            crate::deadlock::spin_pump();
+        }
+        if *spins == crate::deadlock::deadlock_spins() {
+            // Many seconds of continuous spinning with IRQs off: this
+            // CPU is almost certainly part of a deadlock. Self-report
+            // the stuck call site (once), then keep spinning — if the
+            // holder ever releases, we still proceed correctly.
+            report_deadlock(caller.file(), caller.line());
+            // Also report WHO holds the lock (see TicketMutex::lock).
+            let hf = self.holder_file.load(Ordering::Acquire);
+            if hf != 0 {
+                let hl = self.holder_file_len.load(Ordering::Relaxed);
+                let lc = self.holder_line_cpu.load(Ordering::Relaxed);
+                crate::deadlock::report_deadlock_holder(
+                    hf,
+                    hl,
+                    (lc & 0xffff_ffff) as u32,
+                    (lc >> 32) as u32,
+                );
+            }
+        }
+    }
+
     #[inline(always)]
     #[track_caller]
     pub fn lock(&self) -> SpinMutexGuard<'_, T> {
         push_off();
         let caller = core::panic::Location::caller();
         let mut spins: u64 = 0;
+        #[cfg(test)]
+        let mut lost: u64 = 0;
         while self
             .locked
             .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
             .is_err()
         {
-            // Wait until the lock looks unlocked before retrying
+            #[cfg(test)]
+            {
+                lost += 1;
+            }
+            // Count the lost attempt itself, then wait until the lock looks
+            // unlocked before retrying.
+            //
+            // `spins` used to be incremented ONLY inside the inner loop, so a
+            // waiter that kept losing the compare-exchange while the lock read
+            // as free each time it looked — the handover race, which on an
+            // unfair mutex is exactly the CPU that waits longest — spun with
+            // the counter stuck at 0. At 0 it never reaches the 512-turn pump,
+            // so it is an ack black hole for as long as it spins (the thing
+            // `set_spin_pump` exists to end), and it never reaches the
+            // threshold either, so the wedge is never named. The ticket lock
+            // and the rwlock both count every turn of their one loop; this is
+            // the flavour that had two and only counted one of them.
+            self.wait_turn(&mut spins, caller);
             while self.is_locked() {
-                core::hint::spin_loop();
-                spins += 1;
-                // Spinning with IRQs off makes this CPU deaf to TLB-shootdown
-                // IPIs, and a peer may be spin-waiting for our ack — drain our
-                // queue at a coarse cadence, exactly as the ticket lock does.
-                if spins & 511 == 0 {
-                    crate::deadlock::spin_pump();
-                }
-                if spins == crate::deadlock::deadlock_spins() {
-                    // Many seconds of continuous spinning with IRQs off: this
-                    // CPU is almost certainly part of a deadlock. Self-report
-                    // the stuck call site (once), then keep spinning — if the
-                    // holder ever releases, we still proceed correctly.
-                    report_deadlock(caller.file(), caller.line());
-                    // Also report WHO holds the lock (see TicketMutex::lock).
-                    let hf = self.holder_file.load(Ordering::Acquire);
-                    if hf != 0 {
-                        let hl = self.holder_file_len.load(Ordering::Relaxed);
-                        let lc = self.holder_line_cpu.load(Ordering::Relaxed);
-                        crate::deadlock::report_deadlock_holder(
-                            hf,
-                            hl,
-                            (lc & 0xffff_ffff) as u32,
-                            (lc >> 32) as u32,
-                        );
-                    }
-                }
+                self.wait_turn(&mut spins, caller);
             }
         }
+        #[cfg(test)]
+        turn_ledger::record(lost, spins);
         self.record_holder(caller);
         SpinMutexGuard {
             lock: &self.locked,
@@ -260,5 +290,32 @@ impl<'a, T: ?Sized + fmt::Debug> fmt::Debug for SpinMutexGuard<'a, T> {
 impl<'a, T: ?Sized + fmt::Display> fmt::Display for SpinMutexGuard<'a, T> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         fmt::Display::fmt(&**self, f)
+    }
+}
+
+/// Test-only ledger of the acquire this thread last completed: how many
+/// attempts it lost, and how many waiting turns it counted while losing them.
+///
+/// The rule those two numbers state is the one [`SpinMutex::lock`] owes its
+/// waiters — an acquire that lost an attempt waited, and a wait that is not
+/// counted is a wait that never pumps and never gets named. Only the pair is
+/// observable from outside the lock, so the tests assert the implication.
+#[cfg(test)]
+pub(crate) mod turn_ledger {
+    use core::cell::Cell;
+
+    std::thread_local! {
+        static LOST: Cell<u64> = const { Cell::new(0) };
+        static TURNS: Cell<u64> = const { Cell::new(0) };
+    }
+
+    /// `(attempts lost, turns counted)` of this thread's last `lock()`.
+    pub(crate) fn last() -> (u64, u64) {
+        (LOST.with(|c| c.get()), TURNS.with(|c| c.get()))
+    }
+
+    pub(super) fn record(lost: u64, turns: u64) {
+        LOST.with(|c| c.set(lost));
+        TURNS.with(|c| c.set(turns));
     }
 }

@@ -815,3 +815,268 @@ fn the_counts_read_the_word_the_way_the_protocol_writes_it() {
         drop(w);
     });
 }
+
+// ── who holds a lock, and who is asking ──────────────────────────────────────
+//
+// `HeldByCurrentCpu` is not a diagnostic. The global heap allocator asks it
+// before every heap lock it takes and, told "you already hold this", refuses
+// the allocation rather than deadlock against itself. So the answer has to be
+// about *this* CPU and no other.
+
+use crate::spin::SpinMutex as Spin;
+use crate::ticket::TicketMutex as Ticket;
+
+/// Make this test thread a core that bring-up never gave a dense id: no
+/// published id worth believing, and a hardware id in no table. Returns the
+/// id it had, to hand back to [`back_from_nobody`].
+fn become_nobody() -> u8 {
+    let me = this_cpu();
+    set_test_published(None);
+    set_test_hw_id(0x7fff_0000);
+    assert_eq!(current_cpu_id(), NO_CPU);
+    me
+}
+
+fn back_from_nobody(me: u8) {
+    set_test_hw_id(hardware_id_of(me).unwrap());
+    set_test_published(Some(me));
+    assert_eq!(current_cpu_id(), me);
+}
+
+#[test]
+fn a_lock_nobody_holds_is_held_by_nobody() {
+    on_a_cpu(|| {
+        let t = Ticket::new(0u32);
+        assert!(!t.holder_is_current_cpu());
+        let s = Spin::new(0u32);
+        assert!(!s.holder_is_current_cpu());
+    });
+}
+
+#[test]
+fn a_lock_this_cpu_took_says_so_and_forgets_on_release() {
+    on_a_cpu(|| {
+        let t = Ticket::new(0u32);
+        let g = t.try_lock().expect("free");
+        assert!(t.holder_is_current_cpu());
+        drop(g);
+        assert!(
+            !t.holder_is_current_cpu(),
+            "the record has to be cleared before the lock is handed over, or \
+             the next waiter's banner names an owner that already left"
+        );
+
+        let s = Spin::new(0u32);
+        let g = s.try_lock().expect("free");
+        assert!(s.holder_is_current_cpu());
+        drop(g);
+        assert!(!s.holder_is_current_cpu());
+    });
+}
+
+#[test]
+fn a_core_with_no_id_is_stopped_before_it_can_take_a_lock() {
+    // The guarantee the two locks' `(lc >> 32) as u32 == current_cpu_id()`
+    // quietly rests on, said out loud.
+    //
+    // `current_cpu_id` answers `NO_CPU` for **every** core that never got a
+    // dense logical id — one past `MAX_CORE_NUM`, or an AP whose id bring-up
+    // took back — so two of them compared for identity would read as one CPU.
+    // What keeps that out of the lock records is `mycpu`: it refuses to turn
+    // "we do not know which CPU this is" into slot 0, which is the boot CPU's,
+    // and stops instead. So an id-less core cannot acquire, cannot record
+    // itself, and is told it holds nothing.
+    static LOCK: Ticket<u32> = Ticket::new(0);
+    let me = become_nobody();
+    assert!(
+        !LOCK.holder_is_current_cpu(),
+        "a core that cannot take a lock cannot be holding one"
+    );
+    let stopped = std::panic::catch_unwind(|| {
+        let _g = LOCK.try_lock();
+    });
+    assert!(
+        stopped.is_err(),
+        "an id-less core got a lock slot; whichever CPU owns that slot now \
+         shares its interrupt-disable depth with a core it knows nothing about"
+    );
+    back_from_nobody(me);
+    // And the lock is untouched: the stop came before the ticket was drawn.
+    assert!(!LOCK.is_locked());
+}
+
+#[test]
+fn a_core_with_an_id_is_never_confused_with_one_without() {
+    // The other half: an id-less core asking about a lock a real CPU holds
+    // must be told it holds nothing. That is the answer that makes it wait,
+    // and waiting is right whoever the holder turns out to be — whereas being
+    // told "you already hold this" is what makes the heap allocator refuse
+    // the allocation outright. It holds only because `NO_CPU` is a value no
+    // real CPU has; the day `current_cpu_id` answers 0 for an unknown core
+    // instead, every such core becomes the boot CPU's twin.
+    static LOCK: Ticket<u32> = Ticket::new(0);
+    let me = this_cpu();
+    let g = LOCK.try_lock().expect("free");
+    let other = std::thread::spawn(|| {
+        let mine = become_nobody();
+        assert!(!LOCK.holder_is_current_cpu());
+        back_from_nobody(mine);
+    });
+    other.join().unwrap();
+    assert!(LOCK.holder_is_current_cpu(), "it is still ours");
+    drop(g);
+    assert_eq!(current_cpu_id(), me);
+}
+
+// ── the ticket the lock hands out ────────────────────────────────────────────
+
+#[test]
+fn a_ticket_lock_serves_in_the_order_it_handed_the_tickets_out() {
+    // What a ticket lock is *for*: an unfair mutex can starve a waiter
+    // indefinitely, and this one cannot. Three CPUs queue behind a holder in a
+    // known order and must come out in that order — and, while the holder has
+    // it, none of them comes out at all.
+    static LOCK: Ticket<std::vec::Vec<u8>> = Ticket::new(std::vec::Vec::new());
+    static ENTERED: AtomicU32 = AtomicU32::new(0);
+    on_a_cpu(|| {
+        LOCK.lock().clear();
+        ENTERED.store(0, Ordering::SeqCst);
+        let held = LOCK.lock();
+        let mut joins = std::vec::Vec::new();
+        for who in 1u8..=3 {
+            // Each thread draws its ticket before the next one is spawned, so
+            // the queue order is the spawn order and not a coin toss.
+            let before = LOCK.next_ticket_for_test();
+            let t = std::thread::spawn(move || {
+                on_a_cpu(|| {
+                    let mut g = LOCK.lock();
+                    // Counted outside the data, so the check below is a read
+                    // of an atomic and not a race with whoever got in.
+                    ENTERED.fetch_add(1, Ordering::SeqCst);
+                    g.push(who);
+                })
+            });
+            while LOCK.next_ticket_for_test() == before {
+                std::thread::yield_now();
+            }
+            joins.push(t);
+        }
+        assert_eq!(
+            ENTERED.load(Ordering::SeqCst),
+            0,
+            "three CPUs hold a ticket each and one of them is already inside: \
+             the queue is decoration and the lock excludes nobody"
+        );
+        drop(held);
+        for t in joins {
+            t.join().unwrap();
+        }
+        assert_eq!(
+            *LOCK.lock(),
+            std::vec![1u8, 2, 3],
+            "a ticket lock that serves out of order is an unfair mutex with \
+             extra steps"
+        );
+    });
+}
+
+#[test]
+fn a_try_lock_takes_a_ticket_and_gives_the_queue_back_when_it_fails() {
+    on_a_cpu(|| {
+        let l = Ticket::new(0u32);
+        assert!(!l.is_locked());
+        let before = l.next_ticket_for_test();
+        let g = l.try_lock().expect("a free lock cannot refuse");
+        assert!(l.is_locked());
+        assert_eq!(
+            l.next_ticket_for_test(),
+            before + 1,
+            "a successful try_lock draws a ticket like any other acquire"
+        );
+        assert!(l.try_lock().is_none(), "it is taken");
+        assert_eq!(
+            l.next_ticket_for_test(),
+            before + 1,
+            "a refused try_lock must NOT draw one: a ticket nobody will ever \
+             be served wedges every acquire behind it, for good"
+        );
+        drop(g);
+        assert!(!l.is_locked());
+        assert!(l.try_lock().is_some());
+    });
+}
+
+#[test]
+fn releasing_serves_exactly_the_next_ticket() {
+    on_a_cpu(|| {
+        let l = Ticket::new(0u32);
+        let start = l.next_serving_for_test();
+        let g = l.lock();
+        assert_eq!(l.next_serving_for_test(), start, "we are the one served");
+        drop(g);
+        assert_eq!(
+            l.next_serving_for_test(),
+            start + 1,
+            "one release, one ticket: skipping one strands the waiter holding \
+             it and over-serving hands the lock to two CPUs at once"
+        );
+    });
+}
+
+// ── the turn a waiter takes and nobody counted ───────────────────────────────
+
+#[test]
+fn a_spin_waiter_that_loses_an_acquire_counts_the_turn_it_lost() {
+    // `SpinMutex::lock` waits in two loops, not one: the outer one is the
+    // acquire attempt itself, the inner one the read-only wait for the lock to
+    // look free. Only the second used to count turns, and the counter is what
+    // drives both the 512-turn shootdown pump and the stuck-lock report.
+    //
+    // So consider the waiter that loses its attempt and then finds the lock
+    // already free again — the handover race, which on an unfair mutex is what
+    // the most-starved CPU keeps hitting. Its inner loop never runs a single
+    // iteration, so it goes round and round the outer one with the counter
+    // stuck at zero: it never pumps, so it is an ack black hole for as long as
+    // it spins there, and it never crosses the threshold, so the wedge it is
+    // part of is never named.
+    //
+    // The pair the ledger hands back states the rule without reaching inside
+    // the loop: an acquire that lost an attempt waited, and a wait has to be
+    // counted. Two CPUs hammering a critical section of nothing is the
+    // shortest way to make the race happen over and over.
+    static LOCK: Spin<u64> = Spin::new(0);
+    on_a_cpu(|| {
+        let stop = std::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
+        let noise = {
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                on_a_cpu(|| {
+                    while !stop.load(Ordering::Relaxed) {
+                        *LOCK.lock() += 1;
+                    }
+                })
+            })
+        };
+        let mut contended = 0u32;
+        for _ in 0..200_000 {
+            *LOCK.lock() += 1;
+            let (lost, turns) = crate::spin::turn_ledger::last();
+            if lost == 0 {
+                continue;
+            }
+            contended += 1;
+            assert!(
+                turns > 0,
+                "an acquire lost {lost} attempt(s) and counted no waiting at \
+                 all: that waiter drained no shootdown queue and would never \
+                 be reported stuck, however long it span"
+            );
+        }
+        stop.store(true, Ordering::Relaxed);
+        noise.join().unwrap();
+        assert!(
+            contended > 0,
+            "the two CPUs never collided, so this proved nothing"
+        );
+    });
+}
