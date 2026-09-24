@@ -14,6 +14,23 @@ use spin::{Mutex, MutexGuard, Once};
 /// every per-CPU array in the system agrees on one size.
 const MAX_CORE_NUM: usize = lock::MAX_CORE_NUM;
 
+// Two different shapes bound a cpu id in this file, and they must agree.
+//
+// The ready / sleeping / resched sets are `AtomicU64`, so an id has to be
+// under 64 to have a bit. The runtime slots, the steal scratch and the
+// voluntary-yield table are `[_; MAX_CORE_NUM]`, so it has to be under
+// `MAX_CORE_NUM` to have a slot. `lock` asserts `MAX_CORE_NUM <= 64`, which
+// makes the second the tighter of the two — so every guard below reads
+// `MAX_CORE_NUM` and none of them spells 64. They used to: with a smaller
+// `MAX_CORE_NUM` (the obvious way to stop reserving 64 x 2.6 MiB of executor
+// stack on a four-core desktop) `mark_executor_ready` would set a bit for a
+// cpu with no slot, `num_online_cpus` would count up to it, and the steal
+// scan would write past the end of its scratch array through a raw pointer.
+const _: () = assert!(
+    MAX_CORE_NUM <= 64,
+    "the ready/sleeping/resched sets are u64; widen them before raising MAX_CORE_NUM"
+);
+
 /// Bitmask of CPUs that have entered [`run_until_idle`] (executor ready).
 /// Placement, steal and affinity use this — NOT `max(id)+1`, which could mark
 /// holes as online when a higher AP starts before a lower one.
@@ -45,12 +62,12 @@ pub(crate) fn set_executor_ready_mask_for_test(mask: u64) -> u64 {
 
 #[inline]
 pub(crate) fn is_executor_ready(cpu: usize) -> bool {
-    cpu < 64 && (executor_ready_mask() & (1u64 << cpu)) != 0
+    cpu < MAX_CORE_NUM && (executor_ready_mask() & (1u64 << cpu)) != 0
 }
 
 #[inline]
 fn mark_executor_ready(cpu: usize) {
-    if cpu < 64 {
+    if cpu < MAX_CORE_NUM {
         EXECUTOR_READY.fetch_or(1u64 << cpu, Ordering::Release);
     }
 }
@@ -63,7 +80,7 @@ pub(crate) fn num_online_cpus() -> usize {
     if m == 0 {
         return 1;
     }
-    (64 - m.leading_zeros()) as usize
+    ((64 - m.leading_zeros()) as usize).min(MAX_CORE_NUM)
 }
 
 /// Callback invoked by an executor when its CPU runs out of work, right before
@@ -208,7 +225,7 @@ pub fn set_resched_ipi_sender(f: fn(usize)) {
 /// Executor-side: publish/clear this CPU's "about to halt" flag. SeqCst so the
 /// flag RMW orders against the subsequent queue recheck (see `Executor::run`).
 pub(crate) fn set_cpu_sleeping(cpu: usize, sleeping: bool) {
-    if cpu >= 64 {
+    if cpu >= MAX_CORE_NUM {
         return;
     }
     if sleeping {
@@ -237,7 +254,7 @@ fn send_resched_ipi(owner: usize) {
 #[inline]
 pub(crate) fn maybe_send_resched_ipi(owner: u8) {
     let owner = owner as usize;
-    if owner >= 64 || SLEEPING_CPUS.load(Ordering::SeqCst) & (1 << owner) == 0 {
+    if owner >= MAX_CORE_NUM || SLEEPING_CPUS.load(Ordering::SeqCst) & (1 << owner) == 0 {
         return;
     }
     send_resched_ipi(owner);
@@ -264,7 +281,7 @@ pub(crate) fn maybe_send_resched_ipi(owner: u8) {
 /// the CPU that is running the hog is exactly the case that must preempt.
 pub(crate) fn request_resched(owner: u8) {
     let owner = owner as usize;
-    if owner >= 64 {
+    if owner >= MAX_CORE_NUM {
         return;
     }
     let bit = 1u64 << owner;
@@ -344,7 +361,7 @@ pub(crate) fn pick_affinity_kick_target(
     ready: u64,
     sleeping: u64,
 ) -> Option<u8> {
-    let mask = if skip < 64 {
+    let mask = if skip < MAX_CORE_NUM {
         mask & !(1u64 << skip)
     } else {
         mask
@@ -409,7 +426,7 @@ pub(crate) fn kick_for_affinity(mask: u64, skip: usize) {
 /// Returns `true` exactly once per request, to the caller that should yield.
 pub fn take_need_resched() -> bool {
     let cpu = crate::arch::cpu_id() as usize;
-    if cpu >= 64 {
+    if cpu >= MAX_CORE_NUM {
         return false;
     }
     let bit = 1u64 << cpu;
@@ -433,7 +450,7 @@ pub fn take_need_resched() -> bool {
 /// IPI for the next genuine wake.
 #[inline]
 pub(crate) fn clear_need_resched(cpu: usize) {
-    if cpu >= 64 {
+    if cpu >= MAX_CORE_NUM {
         return;
     }
     let bit = 1u64 << cpu;
@@ -576,7 +593,32 @@ impl GlobalRuntimes {
     /// that OWN the slot's existence: the CPU entering its own scheduler
     /// loop, and spawn placement (the new task needs a queue to land in).
     fn force(&self, cpu: usize) -> &Mutex<ExecutorRuntime> {
-        self.slots[cpu].call_once(|| Mutex::new(ExecutorRuntime::new(cpu as u8)))
+        self.try_force(cpu).unwrap_or_else(|| {
+            panic!(
+                "no runtime slot for cpu {} (MAX_CORE_NUM={})",
+                cpu, MAX_CORE_NUM
+            )
+        })
+    }
+
+    /// Like [`force`](Self::force), but `None` instead of a panic for a cpu
+    /// that has no slot at all.
+    ///
+    /// `lock::current_cpu_id()` answers [`lock::NO_CPU`] (255) for a CPU whose
+    /// hardware id never got a dense logical one — a machine with more cores
+    /// than `MAX_CORE_NUM`, or an AP whose registration was refused. Every
+    /// other entry point in this file already reads that answer and declines:
+    /// `steal_task_inner` returns `None`, the sleeping/resched guards return,
+    /// `percpu::register` logs "it must not run kernel code" and does nothing.
+    /// The two that reached `force` did not, and `self.slots[255]` on a
+    /// 64-element array is an index panic — raised on a CPU that `lock` will
+    /// not hand a lock slot to either, so the panic path itself is on thin ice.
+    fn try_force(&self, cpu: usize) -> Option<&Mutex<ExecutorRuntime>> {
+        Some(
+            self.slots
+                .get(cpu)?
+                .call_once(|| Mutex::new(ExecutorRuntime::new(cpu as u8))),
+        )
     }
 
     /// Non-forcing lookup: `None` until `cpu` has built its runtime.
@@ -607,7 +649,28 @@ pub static GLOBAL_RUNTIME: GlobalRuntimes = GlobalRuntimes {
 /// `stack_guard::init`. Idempotent. Other CPUs build their own slot when they
 /// enter [`run_until_idle`]; absent CPUs never build one.
 pub fn warm_runtimes() {
-    let _ = GLOBAL_RUNTIME.force(crate::arch::cpu_id() as usize);
+    let cpu = crate::arch::cpu_id() as usize;
+    if GLOBAL_RUNTIME.try_force(cpu).is_none() {
+        report_cpu_without_slot(cpu, "warm_runtimes");
+    }
+}
+
+/// One line for a CPU that reached the scheduler without a logical id.
+///
+/// Rate-limited to the first few: if this fires it fires on every pass of the
+/// caller's idle loop, and the console lock is the last thing such a CPU
+/// should be contending for.
+#[cold]
+#[inline(never)]
+fn report_cpu_without_slot(cpu: usize, site: &str) {
+    static REPORTED: AtomicU64 = AtomicU64::new(0);
+    if REPORTED.fetch_add(1, Ordering::Relaxed) >= 4 {
+        return;
+    }
+    warn!(
+        "[sched] {}: cpu id {} has no runtime slot (MAX_CORE_NUM={}) — this CPU          has no dense logical id and must not run kernel code; idling it",
+        site, cpu, MAX_CORE_NUM
+    );
 }
 
 /// Instantaneous run-queue length across every built CPU runtime: tasks
@@ -904,7 +967,16 @@ pub fn run_until_idle() -> bool {
     // scans (steal, placement, wake) never see a ready CPU whose slot is
     // still under construction — they would block in `call_once` for the
     // multi-MiB stack setup. Idempotent after the first entry.
-    let _ = GLOBAL_RUNTIME.force(cpu);
+    //
+    // No slot means no dense logical id (see `try_force`). Such a CPU cannot
+    // be a steal victim, a placement target or a wake target, and cannot take
+    // a kernel lock; the honest answer is "nothing to run", which sends the
+    // caller to `wait_for_interrupt` and leaves the machine with one idle
+    // core instead of a panic inside the scheduler.
+    if GLOBAL_RUNTIME.try_force(cpu).is_none() {
+        report_cpu_without_slot(cpu, "run_until_idle");
+        return false;
+    }
     // Make this CPU eligible for task placement and work stealing.
     mark_executor_ready(cpu);
     loop {
@@ -2370,5 +2442,131 @@ mod resched_tests {
         EXECUTOR_READY.store(0, Ordering::SeqCst);
         assert_eq!(num_online_cpus(), 1, "a scan must still cover the boot CPU");
         EXECUTOR_READY.store(saved, Ordering::SeqCst);
+    }
+}
+
+/// Whether a cpu id that the scheduler will act on also has somewhere to put
+/// the state it keeps for it.
+///
+/// Two shapes bound a cpu id here (see the `const _` at the top of the file):
+/// a bit in a `u64` set, and a slot in a `[_; MAX_CORE_NUM]` array. The
+/// interesting ids are the ones that fit one and not the other — `lock`'s
+/// `NO_CPU` (255) for a CPU whose hardware id never got a logical one, and
+/// anything from `MAX_CORE_NUM` up on a build that lowered it.
+#[cfg(test)]
+mod cpu_id_bounds_tests {
+    use super::*;
+
+    /// `lock::current_cpu_id()`'s answer for a CPU with no dense logical id.
+    /// Spelled out rather than imported so the test states the number the
+    /// guards have to survive.
+    const NO_CPU: usize = 255;
+
+    fn test_lock() -> std::sync::MutexGuard<'static, ()> {
+        resched_test_lock()
+    }
+
+    #[test]
+    fn a_cpu_with_no_logical_id_gets_no_runtime_slot() {
+        // The panicking `force` is what `run_until_idle` and `warm_runtimes`
+        // used to call with exactly this number, one line into the scheduler.
+        assert!(GLOBAL_RUNTIME.try_force(NO_CPU).is_none());
+        assert!(GLOBAL_RUNTIME.try_force(MAX_CORE_NUM).is_none());
+        assert!(GLOBAL_RUNTIME.try_force(usize::MAX).is_none());
+        // `get` already answered this correctly; `force` is the one that did not.
+        assert!(GLOBAL_RUNTIME.get(NO_CPU).is_none());
+    }
+
+    #[test]
+    fn the_steal_scan_bound_never_runs_past_its_scratch_array() {
+        // `steal_task_inner` walks `0..num_online_cpus()` and writes
+        // `candidates[n]` — a `[_; MAX_CORE_NUM]` reached through a raw
+        // pointer, with no bounds check to catch it. Whatever the ready mask
+        // says, the bound has to stay inside the array.
+        let _g = test_lock();
+        let saved = EXECUTOR_READY.load(Ordering::SeqCst);
+        EXECUTOR_READY.store(u64::MAX, Ordering::SeqCst);
+        assert!(
+            num_online_cpus() <= MAX_CORE_NUM,
+            "the scan would write past the end of STEAL_CANDIDATES"
+        );
+        EXECUTOR_READY.store(saved, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn a_cpu_without_a_slot_is_never_announced_as_ready() {
+        // Announcing it is what makes the scan count up to it: placement would
+        // then `force` a slot it does not have, and the steal scan would rank
+        // it as a victim.
+        let _g = test_lock();
+        let saved = EXECUTOR_READY.load(Ordering::SeqCst);
+        EXECUTOR_READY.store(0, Ordering::SeqCst);
+        mark_executor_ready(NO_CPU);
+        mark_executor_ready(MAX_CORE_NUM);
+        assert_eq!(
+            EXECUTOR_READY.load(Ordering::SeqCst),
+            0,
+            "a cpu with no runtime slot was announced to the scans"
+        );
+        assert!(!is_executor_ready(NO_CPU));
+        assert!(!is_executor_ready(MAX_CORE_NUM));
+        EXECUTOR_READY.store(saved, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn a_cpu_without_a_slot_cannot_park_itself_in_the_sleeping_set() {
+        // A stuck bit here is worse than a missing one: `request_resched`
+        // would keep sending the wake IPI to a CPU that is not there, on
+        // every wake, for the life of the machine.
+        let _g = test_lock();
+        let saved = SLEEPING_CPUS.load(Ordering::SeqCst);
+        SLEEPING_CPUS.store(0, Ordering::SeqCst);
+        set_cpu_sleeping(NO_CPU, true);
+        set_cpu_sleeping(MAX_CORE_NUM, true);
+        assert_eq!(SLEEPING_CPUS.load(Ordering::SeqCst), 0);
+        SLEEPING_CPUS.store(saved, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn a_wake_aimed_at_a_cpu_without_a_slot_is_dropped_quietly() {
+        // `owner` arrives as a `u8` straight off a waker page, so NO_CPU is
+        // exactly what an unstamped page hands over.
+        let _g = test_lock();
+        let saved = NEED_RESCHED.load(Ordering::SeqCst);
+        NEED_RESCHED.store(0, Ordering::SeqCst);
+        request_resched(NO_CPU as u8);
+        maybe_send_resched_ipi(NO_CPU as u8);
+        assert_eq!(
+            NEED_RESCHED.load(Ordering::SeqCst),
+            0,
+            "a reschedule was published for a cpu that has no run queue"
+        );
+        clear_need_resched(NO_CPU);
+        clear_need_resched(MAX_CORE_NUM);
+        assert_eq!(NEED_RESCHED.load(Ordering::SeqCst), 0);
+        NEED_RESCHED.store(saved, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn an_affinity_kick_never_names_a_cpu_without_a_slot() {
+        // The mask is 64 bits wide and `sched_setaffinity` is not the only way
+        // one is built, so a bit above the slot range has to be treated as the
+        // hole it is rather than followed into `force`.
+        let ready = u64::MAX;
+        let target = pick_affinity_kick_target(u64::MAX, 0, ready, 0);
+        if let Some(t) = target {
+            assert!(
+                usize::from(t) < MAX_CORE_NUM,
+                "picked cpu {} as a kick target, which has no run queue",
+                t
+            );
+        }
+        if let Some(home) = affinity_home(u64::MAX, ready) {
+            assert!(
+                home < MAX_CORE_NUM,
+                "picked cpu {} to be born on, which has no run queue",
+                home
+            );
+        }
     }
 }

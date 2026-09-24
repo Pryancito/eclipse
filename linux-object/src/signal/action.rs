@@ -194,16 +194,53 @@ impl Default for SigInfo {
 }
 
 impl SigInfo {
-    /// `siginfo_t` for a child that exited normally (`CLD_EXITED`).
-    pub fn child_exited(pid: i32, status: i32) -> Self {
-        let mut info = Self {
+    /// `siginfo_t` for a child state change, from the `wait` status word.
+    ///
+    /// `waitid(2)` promises `si_code` and `si_status` as two SEPARATE
+    /// answers -- WHAT happened and the number that goes with it -- which is
+    /// the whole reason it exists next to `wait4`. Both used to be built as
+    /// "exited with `status >> 8`", so every child was `CLD_EXITED` however
+    /// it had finished, and the number was the second byte of a word that,
+    /// for a killed child, does not keep anything there.
+    pub fn child_state_change(pid: i32, status: i32) -> Self {
+        let (code, si_status) = child_si_code_and_status(status);
+        let mut info = SigInfo {
             signo: Signal::SIGCHLD as i32,
             errno: 0,
-            code: SignalCode::CLD_EXITED,
+            code,
             ..Self::default()
         };
-        info.field.write_sigchld(pid, status);
+        info.field.write_sigchld(pid, si_status);
         info
+    }
+}
+
+/// Take a `wait(2)` status word apart into the two things `waitid(2)`
+/// reports separately: `si_code`, which says HOW the child's state changed,
+/// and `si_status`, the number that goes with THAT answer.
+///
+/// The four shapes are read apart exactly as `sys/wait.h` reads them, and in
+/// its order. `0xffff` is the continued marker and its low SEVEN bits are
+/// `0x7f` -- which is where `WIFSIGNALED` looks -- so a continue asked about
+/// last would come back as a child killed by signal 127.
+pub fn child_si_code_and_status(status: i32) -> (SignalCode, i32) {
+    const CONTINUED: i32 = 0xffff;
+    if status == CONTINUED {
+        // `WIFCONTINUED` carries no number of its own; Linux reports the
+        // signal that did it, which is the only one that can.
+        return (SignalCode::CLD_CONTINUED, Signal::SIGCONT as i32);
+    }
+    if status & 0xff == 0x7f {
+        // `WIFSTOPPED` / `WSTOPSIG`.
+        return (SignalCode::CLD_STOPPED, (status >> 8) & 0xff);
+    }
+    match status & 0x7f {
+        // `WIFEXITED` / `WEXITSTATUS`.
+        0 => (SignalCode::CLD_EXITED, (status >> 8) & 0xff),
+        // `WIFSIGNALED` / `WTERMSIG`. The status word keeps NOTHING in its
+        // second byte here, which is why reporting `status >> 8` for every
+        // child made a killed one look like `exit(0)` -- a success.
+        sig => (SignalCode::CLD_KILLED, sig),
     }
 }
 
@@ -223,6 +260,23 @@ pub enum SignalCode {
     /// `SIGCHLD`: child called `_exit`
     #[allow(non_camel_case_types)]
     CLD_EXITED = 1,
+    /// `SIGCHLD`: child killed by a signal.
+    #[allow(non_camel_case_types)]
+    CLD_KILLED = 2,
+    /// `SIGCHLD`: child killed by a signal AND dumped core. Never produced
+    /// here -- this kernel writes no cores -- but named so the numbering is
+    /// the uAPI's and not a count of what happens to be implemented.
+    #[allow(non_camel_case_types)]
+    CLD_DUMPED = 3,
+    /// `SIGCHLD`: traced child has trapped.
+    #[allow(non_camel_case_types)]
+    CLD_TRAPPED = 4,
+    /// `SIGCHLD`: child has stopped.
+    #[allow(non_camel_case_types)]
+    CLD_STOPPED = 5,
+    /// `SIGCHLD`: stopped child has continued.
+    #[allow(non_camel_case_types)]
+    CLD_CONTINUED = 6,
     /// from kernel
     KERNEL = 128,
 }
@@ -646,5 +700,139 @@ mod sigaction_tests {
         assert!(!a
             .handler_mask(Sigset::empty(), Signal::SIGSEGV)
             .contains(Signal::SIGSEGV));
+    }
+}
+
+#[cfg(test)]
+mod child_siginfo_tests {
+    //! What `waitid(2)` puts in `siginfo_t`.
+    //!
+    //! `wait4` hands back one packed int and leaves userspace to take it
+    //! apart with the `sys/wait.h` macros. `waitid` exists because it does
+    //! that work in the kernel and answers the two questions separately:
+    //! `si_code` says WHICH of the four things happened, and `si_status`
+    //! carries the number that belongs to that answer. This kernel built
+    //! both as "exited, with `status >> 8`", so every child came back as
+    //! `CLD_EXITED` -- and a killed child, whose status word keeps nothing
+    //! in its second byte, came back as `CLD_EXITED` with status 0, which
+    //! reads as a clean success.
+
+    use super::*;
+    use crate::signal::Signal;
+
+    /// The status words as the kernel builds them, spelled here the way
+    /// `sys/wait.h` spells them, so a change to either encoding has to
+    /// disagree with this file to pass.
+    fn exited(code: i32) -> i32 {
+        (code & 0xff) << 8
+    }
+    fn killed_by(sig: Signal) -> i32 {
+        sig as i32 & 0x7f
+    }
+    fn stopped_by(sig: Signal) -> i32 {
+        ((sig as i32) << 8) | 0x7f
+    }
+    const CONTINUED: i32 = 0xffff;
+
+    #[test]
+    fn an_exit_reports_its_code() {
+        for code in [0, 1, 42, 255] {
+            assert_eq!(
+                child_si_code_and_status(exited(code)),
+                (SignalCode::CLD_EXITED, code)
+            );
+        }
+    }
+
+    #[test]
+    fn a_death_by_signal_reports_the_signal_and_says_it_was_a_kill() {
+        for sig in [
+            Signal::SIGHUP,
+            Signal::SIGINT,
+            Signal::SIGKILL,
+            Signal::SIGSEGV,
+            Signal::SIGTERM,
+        ] {
+            assert_eq!(
+                child_si_code_and_status(killed_by(sig)),
+                (SignalCode::CLD_KILLED, sig as i32),
+                "{:?}",
+                sig
+            );
+        }
+    }
+
+    /// The shape that made a killed child unreadable: `status >> 8` of a
+    /// death-by-signal word is zero, so `waitid` reported it as a child that
+    /// exited successfully.
+    #[test]
+    fn a_killed_child_is_not_a_child_that_exited_with_zero() {
+        let killed = child_si_code_and_status(killed_by(Signal::SIGKILL));
+        let clean = child_si_code_and_status(exited(0));
+        assert_ne!(killed, clean);
+        assert_eq!(killed.0, SignalCode::CLD_KILLED);
+        assert_ne!(killed.1, 0, "si_status must name the signal, not be empty");
+    }
+
+    #[test]
+    fn a_stop_reports_the_signal_that_stopped_it() {
+        for sig in [
+            Signal::SIGSTOP,
+            Signal::SIGTSTP,
+            Signal::SIGTTIN,
+            Signal::SIGTTOU,
+        ] {
+            assert_eq!(
+                child_si_code_and_status(stopped_by(sig)),
+                (SignalCode::CLD_STOPPED, sig as i32),
+                "{:?}",
+                sig
+            );
+        }
+    }
+
+    /// `0xffff` has `0x7f` in its low seven bits, which is exactly what
+    /// `WIFSIGNALED` looks at, so the continue has to be read FIRST: asked
+    /// about last, every resumed child comes back as one killed by signal
+    /// 127, and a parent in `waitid(WCONTINUED)` is told the job it just
+    /// resumed is dead.
+    #[test]
+    fn a_continue_is_read_before_the_shape_it_would_pass_for() {
+        // Not a stop: `WIFSTOPPED` reads the whole low byte and finds 0xff.
+        assert_ne!(CONTINUED & 0xff, 0x7f);
+        // But `WIFSIGNALED` reads seven bits, and there it is a signal.
+        assert_eq!(CONTINUED & 0x7f, 0x7f, "it really would pass for a kill");
+        assert_eq!(
+            child_si_code_and_status(CONTINUED),
+            (SignalCode::CLD_CONTINUED, Signal::SIGCONT as i32)
+        );
+    }
+
+    /// The numbers are the uAPI's (`include/uapi/asm-generic/siginfo.h`),
+    /// not a count of what this kernel happens to produce: userspace
+    /// compares against its own headers.
+    #[test]
+    fn the_codes_are_the_ones_userspace_has_in_its_headers() {
+        assert_eq!(SignalCode::CLD_EXITED as i32, 1);
+        assert_eq!(SignalCode::CLD_KILLED as i32, 2);
+        assert_eq!(SignalCode::CLD_DUMPED as i32, 3);
+        assert_eq!(SignalCode::CLD_TRAPPED as i32, 4);
+        assert_eq!(SignalCode::CLD_STOPPED as i32, 5);
+        assert_eq!(SignalCode::CLD_CONTINUED as i32, 6);
+    }
+
+    /// And `si_signo` is SIGCHLD whatever happened, because that is the
+    /// signal this `siginfo_t` describes.
+    #[test]
+    fn every_child_state_change_is_a_sigchld() {
+        for status in [
+            exited(3),
+            killed_by(Signal::SIGKILL),
+            stopped_by(Signal::SIGTSTP),
+            CONTINUED,
+        ] {
+            let info = SigInfo::child_state_change(4242, status);
+            assert_eq!(info.signo, Signal::SIGCHLD as i32);
+        }
     }
 }
