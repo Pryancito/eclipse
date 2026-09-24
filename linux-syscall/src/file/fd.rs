@@ -664,7 +664,12 @@ impl Syscall<'_> {
     /// (`fcntl` `F_ADD_SEALS`) are accepted as no-ops. Wayland/wlroots/Mesa use
     /// it to share xkb keymaps and shm pools.
     pub fn sys_memfd_create(&self, name: UserInPtr<u8>, flags: usize) -> SysResult {
-        let name = name.as_c_str().unwrap_or("memfd");
+        // A name that cannot be read is EFAULT, as it is for every other
+        // syscall that takes a string. Substituting a default for it -- which
+        // is what `unwrap_or("memfd")` did -- handed back a working fd for a
+        // pointer the caller got wrong, and the name is the one thing a memfd
+        // carries for the rest of its life.
+        let name = name.as_c_str()?;
         info!("memfd_create: name={:?}, flags={:#x}", name, flags);
         let file = linux_object::fs::new_memfd(name, flags)?;
         let fd = self.linux_process().add_file(file)?;
