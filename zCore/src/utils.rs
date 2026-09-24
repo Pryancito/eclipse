@@ -74,7 +74,20 @@ pub fn boot_options() -> BootOptions {
 
 #[cfg_attr(all(feature = "linux", feature = "zircon"), allow(dead_code))]
 fn check_exit_code(proc: Arc<Process>) -> i32 {
-    let code = proc.exit_code().unwrap_or(-1);
+    let raw = proc.exit_code();
+    // A NEGATIVE code is "killed by signal `-raw`" (see
+    // `linux_object::process::exit_code_killed_by`): the sign is how the
+    // process object says which of the two ways it finished, because every
+    // real exit code is a byte. What a PROCESS EXIT STATUS should carry for
+    // that is `128 + n` -- the shell convention -- and this function's
+    // return value is exactly that: what the libos build exits with, and
+    // what the CI reads. `-1` stays as it was: it means no code at all.
+    let code = match raw {
+        // No code at all: the process has not exited.
+        None => -1,
+        Some(sig) if sig < 0 => 128 - sig,
+        Some(code) => code,
+    };
     if code != 0 {
         error!(
             "process {:?}({}) exited with code {:?}",

@@ -69,7 +69,7 @@ fn write_sigchld_info(mut infop: UserOutPtr<SigInfo>, pid: KoID, status: i32) ->
     if infop.is_null() {
         return Ok(0);
     }
-    infop.write(SigInfo::child_exited(pid as i32, status))?;
+    infop.write(SigInfo::child_state_change(pid as i32, status))?;
     Ok(0)
 }
 
@@ -754,9 +754,12 @@ impl Syscall<'_> {
         let (child_pid, status) = res?;
 
         if child_pid != 0 {
-            // `si_status` is the exit code, stop signal, or continued marker —
-            // extract from the wait status word the same way shells do.
-            write_sigchld_info(infop, child_pid, status >> 8)?;
+            // The WHOLE status word: `si_code` and `si_status` are taken out
+            // of it together (`child_si_code_and_status`), because which
+            // number `si_status` carries depends on which of the three things
+            // happened. Shifting it down eight bits here threw that away and
+            // left every child reported as `CLD_EXITED`.
+            write_sigchld_info(infop, child_pid, status)?;
         }
         Ok(0)
     }
