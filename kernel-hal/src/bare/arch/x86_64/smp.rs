@@ -46,6 +46,65 @@ const SLOT_STACK: usize = 0x6FE8; // usize: AP initial RSP
 const SLOT_ENTRY: usize = 0x6FF0; // usize: 64-bit entry function
 const SLOT_CR3: usize = 0x6FF8; // u32:   BSP CR3 (PML4 physical)
 
+/// Where the 16-bit trampoline points `esp` before the far jump.
+///
+/// A mirror of the assembly's `.equ temp_stack_top`, which cannot read a Rust
+/// constant: the `global_asm!` below spells every one of these addresses out
+/// again as a literal. That duplication is the whole reason for the assertions
+/// that follow — the two halves have to agree, and nothing but a person
+/// reading both made them.
+const TEMP_STACK_TOP: usize = 0x6FD8;
+
+/// The lowest address any slot occupies. The temporary stack grows *down* from
+/// [`TEMP_STACK_TOP`], so its first push lands at `TEMP_STACK_TOP - 8`.
+const LOWEST_SLOT: usize = SLOT_LOGICAL;
+
+// ── the layout, checked rather than described ────────────────────────────────
+//
+// These addresses live twice: once as the Rust constants above, and once as
+// literals inside the `global_asm!` block, which cannot see them. A comment
+// used to be all that held the two halves together, and it did not even list
+// `SLOT_LOGICAL` — the slot whose corruption makes two APs share one logical
+// id, one `PercpuBlock`, one GS base and one scheduler slot. That is the
+// failure `AP_SLOT_CONSUMED` exists to prevent from the BSP side; there was
+// nothing watching the AP's own side of the same page.
+
+/// The SIPI vector *is* the trampoline's page number: the AP starts executing
+/// at `vector << 12`. Change one without the other and every AP begins at an
+/// address holding no code at all.
+const _: () = assert!(
+    TRAMPOLINE_PADDR == (SIPI_VECTOR as usize) << 12,
+    "the SIPI vector and the trampoline address are the same number: vector << 12"
+);
+
+/// The slots have to be in the page the BSP identity-maps and writes through,
+/// and in ascending order with room for what each one holds.
+const _: () = assert!(
+    SLOT_LOGICAL < SLOT_STACK
+        && SLOT_STACK + 8 <= SLOT_ENTRY
+        && SLOT_ENTRY + 8 <= SLOT_CR3
+        && SLOT_CR3 + 4 <= TRAMPOLINE_PADDR + 2 * PAGE_SIZE,
+    "the trampoline slots overlap each other or run off the mapped region"
+);
+
+/// The AP's temporary stack must not grow into the slots it is about to read.
+///
+/// It topped out at `0x6FE0`, eight bytes above `SLOT_LOGICAL` — so the first
+/// push of that stack lands exactly on the dense logical CPU id the AP has not
+/// read yet. Nothing pushes today (the 16-bit stretch does `lgdt` and a far
+/// jump, and `rsp` is reloaded from `SLOT_STACK` before the first `call`), so
+/// this never fired; it was one added instruction, or one exception pushing a
+/// frame, away from handing two APs the same id and corrupting each other's
+/// per-CPU state in silence. The stack now tops out *at* the lowest slot and
+/// grows away from all of them, and this says so in a form that cannot rot.
+const _: () = assert!(
+    TEMP_STACK_TOP <= LOWEST_SLOT,
+    "the AP's temporary stack grows into the trampoline slots it must read"
+);
+
+/// How much room the trampoline blob has before it would overwrite the slots.
+const TRAMPOLINE_CODE_ROOM: usize = LOWEST_SLOT - TRAMPOLINE_PADDR;
+
 // ─── Trampoline assembly ──────────────────────────────────────────────────────
 //
 // Copied verbatim from x86-smpboot/src/boot_ap.S and included here so only
@@ -54,9 +113,15 @@ const SLOT_CR3: usize = 0x6FF8; // u32:   BSP CR3 (PML4 physical)
 //
 // Memory map within physical page 0x6000:
 //   +0x000 : 16-bit/32-bit/64-bit trampoline code  (from ap_trampoline_start)
+//   ...    : free, and the AP's temporary stack grows down through it
+//   +0x6FD8: SLOT_LOGICAL (dense logical cpu id, u8) — and temp_stack_top
 //   +0x6FE8: SLOT_STACK (stack top)
 //   +0x6FF0: SLOT_ENTRY (entry fn ptr)
 //   +0x6FF8: SLOT_CR3   (PML4 physical addr, u32)
+//
+// Every address here appears again as a literal in the assembly below, which
+// cannot read the Rust constants. The `const _: () = assert!` block above is
+// what actually holds the two halves together.
 
 global_asm!(
     // ── Symbolic constants (identical to boot_ap.S) ──
@@ -66,7 +131,10 @@ global_asm!(
     ".equ cr3_ptr,   0x6ff8",
     ".equ entry_ptr, 0x6ff0",
     ".equ stack_ptr, 0x6fe8",
-    ".equ temp_stack_top, 0x6fe0",
+    // Tops out AT the lowest slot and grows away from every one of them, so a
+    // push can never land on the id the AP has not read yet. See
+    // `TEMP_STACK_TOP`.
+    ".equ temp_stack_top, 0x6fd8",
     ".section .text",
     ".code16",
     ".global ap_trampoline_start",
@@ -411,7 +479,9 @@ pub fn start_application_processors() {
     }
 
     // Copy trampoline to physical 0x6000.
-    unsafe { install_trampoline() };
+    if !unsafe { install_trampoline() } {
+        return;
+    }
 
     // Write BSP's CR3 and entry function. 32-bit trampoline loads CR3 before
     // long mode, so the PML4 physical address must fit in u32 (< 4 GiB).
@@ -584,12 +654,31 @@ pub fn ap_trampoline_logical_id() -> u8 {
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
-unsafe fn install_trampoline() {
+/// Copy the trampoline blob to its fixed physical page.
+///
+/// Returns whether it fits. The blob's length is a link-time quantity, so no
+/// assertion above can speak for it, and an unbounded copy here would write
+/// the code straight over the slots the BSP fills in next — and then off the
+/// end of the two identity-mapped pages. A blob that outgrows its room is a
+/// reason to boot single-core and say so, not to corrupt the page and send a
+/// SIPI into it.
+unsafe fn install_trampoline() -> bool {
     let src = ap_trampoline_start as *const u8;
     let end = ap_trampoline_end as *const u8;
     let len = end.offset_from(src) as usize;
+    if len > TRAMPOLINE_CODE_ROOM {
+        crate::klog_warn!(
+            "[smp] trampoline is {} bytes but only {} fit below the data slots \
+             at {:#x} — aborting AP startup rather than overwriting them",
+            len,
+            TRAMPOLINE_CODE_ROOM,
+            LOWEST_SLOT,
+        );
+        return false;
+    }
     let dst = phys_to_virt(TRAMPOLINE_PADDR) as *mut u8;
     core::ptr::copy_nonoverlapping(src, dst, len);
+    true
 }
 
 fn enumerate_aps(acpi_rsdp: usize) -> Option<Vec<u32>> {
