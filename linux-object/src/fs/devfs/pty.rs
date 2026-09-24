@@ -44,15 +44,13 @@ const ICRNL: u32 = 0x0100;
 const OPOST: u32 = 0x0001;
 const ONLCR: u32 = 0x0004;
 // c_lflag
-const ISIG: u32 = 0x0001;
 const ICANON: u32 = 0x0002;
 const ECHO: u32 = 0x0008;
-const ECHOE: u32 = 0x0010;
 // c_cc indices
-const VINTR: usize = 0;
-const VQUIT: usize = 1;
 const VERASE: usize = 2;
 const VEOF: usize = 4;
+// `ISIG`, the signal characters and `VDISABLE` come from `ioctl.rs`, which is
+// where the rule the three line disciplines share now lives.
 
 const PTY_BUF_CAP: usize = 16 * 1024;
 
@@ -64,6 +62,12 @@ struct PtyInner {
     input: VecDeque<u8>,
     /// In-progress canonical line, not yet visible to the slave reader.
     canon: VecDeque<u8>,
+    /// A `VEOF` has been committed and the slave's next read ends at it.
+    ///
+    /// Without this, Ctrl-D on an empty line commits an empty `canon`, the
+    /// slave finds nothing queued and blocks — so end-of-input never arrives
+    /// and the only way out is closing the master.
+    eof_pending: bool,
     termios: Termios,
     winsize: ConsoleWinSize,
     /// Foreground process group of the slave (`TIOCSPGRP`), for job control
@@ -82,6 +86,7 @@ impl PtyInner {
             output: VecDeque::new(),
             input: VecDeque::new(),
             canon: VecDeque::new(),
+            eof_pending: false,
             termios: Termios::default_tty(),
             winsize: ConsoleWinSize {
                 ws_row: 24,
@@ -121,26 +126,49 @@ impl PtyInner {
             b = b'\r';
         }
 
-        // Signals (Ctrl-C / Ctrl-\).
-        if lflag & ISIG != 0 && (b == cc[VINTR] || b == cc[VQUIT]) {
-            let sig = if b == cc[VINTR] {
-                crate::signal::Signal::SIGINT
-            } else {
-                crate::signal::Signal::SIGQUIT
+        // Signals (Ctrl-C / Ctrl-\ / Ctrl-Z).
+        if let Some(which) = self.termios.tty_signal(b) {
+            let sig = match which {
+                TtySignal::Intr => crate::signal::Signal::SIGINT,
+                TtySignal::Quit => crate::signal::Signal::SIGQUIT,
+                TtySignal::Susp => crate::signal::Signal::SIGTSTP,
             };
             if lflag & ECHO != 0 {
                 self.echo_ctrl(b);
             }
+            // `fg_pgrp` is a process *group*, and a job is a group precisely
+            // so that one Ctrl-C reaches every process in a pipeline. Sending
+            // to a *process* numbered `fg_pgrp` reaches the group leader
+            // alone, and nothing at all once the leader has exited while the
+            // rest of the pipeline is still running.
             if self.fg_pgrp > 0 {
-                let _ = crate::process::send_signal_to_process(self.fg_pgrp as usize, sig);
+                let _ = crate::process::send_signal_to_pgrp(self.fg_pgrp as usize, sig);
             }
             return;
         }
 
         if lflag & ICANON != 0 {
             // Erase (Backspace / DEL).
-            if b == cc[VERASE] {
-                if self.canon.pop_back().is_some() && lflag & (ECHO | ECHOE) != 0 {
+            if cc[VERASE] != VDISABLE && b == cc[VERASE] {
+                // One rubout moves the cursor one column, and a character
+                // several bytes long still occupies one. Taking a byte off
+                // leaves half a character in the line, which is not a
+                // character, and leaves the screen disagreeing with the line
+                // about how much is written.
+                let n = if self.termios.utf8_input() {
+                    let tail: alloc::vec::Vec<u8> = self.canon.iter().copied().collect();
+                    utf8_erase_len(&tail)
+                } else {
+                    usize::from(!self.canon.is_empty())
+                };
+                for _ in 0..n {
+                    self.canon.pop_back();
+                }
+                // `ECHO` decides WHETHER to echo, `ECHOE` only decides HOW.
+                // Testing `ECHO | ECHOE` makes a backspace visible on a
+                // terminal that turned echo off, which is what a password
+                // prompt does.
+                if n > 0 && lflag & ECHO != 0 {
                     // Erase the echoed glyph: backspace, space, backspace.
                     self.push_output(0x08);
                     self.push_output(b' ');
@@ -149,8 +177,12 @@ impl PtyInner {
                 return;
             }
             // End of file on an empty line: deliver a zero-length read.
-            if b == cc[VEOF] {
-                self.commit_canon();
+            if cc[VEOF] != VDISABLE && b == cc[VEOF] {
+                if self.canon.is_empty() {
+                    self.eof_pending = true;
+                } else {
+                    self.commit_canon();
+                }
                 return;
             }
             if lflag & ECHO != 0 {
@@ -191,6 +223,16 @@ impl PtyInner {
                 self.input.push_back(b);
             }
         }
+    }
+
+    /// Whether a program reading the slave has something to take.
+    ///
+    /// Three places ask this — the blocking `read_at`, `poll(2)` and the
+    /// future behind `async_poll` — and they must give the same answer or a
+    /// reader parks on input the read would have handed over. So they ask
+    /// here instead of each spelling it out.
+    fn slave_readable(&self) -> bool {
+        !self.input.is_empty() || self.eof_pending || !self.master_open
     }
 
     /// Process bytes written by the slave (program output) toward the master,
@@ -434,10 +476,15 @@ impl INode for PtySlave {
     fn read_at(&self, _offset: usize, buf: &mut [u8]) -> Result<usize> {
         let mut g = self.inner.lock();
         if g.input.is_empty() {
-            if !g.master_open {
-                return Ok(0); // EOF: master closed
+            if !g.slave_readable() {
+                return Err(FsError::Again);
             }
-            return Err(FsError::Again);
+            // A pending `VEOF` is consumed by the read it ends, the way
+            // Ctrl-D does: the next read after it blocks again rather than
+            // reporting end-of-input for ever. A closed master is not
+            // consumed, because it does not come back.
+            g.eof_pending = false;
+            return Ok(0); // end of input
         }
         let mut n = 0;
         while n < buf.len() {
@@ -464,7 +511,7 @@ impl INode for PtySlave {
     fn poll(&self) -> Result<PollStatus> {
         let g = self.inner.lock();
         Ok(PollStatus {
-            read: !g.input.is_empty() || !g.master_open,
+            read: g.slave_readable(),
             write: true,
             error: false,
             hangup: false,
@@ -606,7 +653,7 @@ impl<'a> Future for PtyReadFuture<'a> {
             if this.master {
                 !g.output.is_empty()
             } else {
-                !g.input.is_empty() || !g.master_open
+                g.slave_readable()
             }
         };
         if ready {
@@ -645,5 +692,365 @@ fn chardev_metadata(inode_id: usize, mode: u16) -> Metadata {
         uid: 0,
         gid: 0,
         rdev: 0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Host tests for the third line discipline.
+    //!
+    //! This is the PTY behind `/dev/ptmx`, which is what a terminal emulator
+    //! under TinyX/Xfbdev opens to run a shell. It is a **third** independent
+    //! implementation of the input discipline — the console's is in
+    //! `fs/stdio.rs` and the live PTY's in `fs/pty.rs` — and until these
+    //! existed nothing exercised a single line of it.
+    //!
+    //! Being third is the whole problem: every rule here is a rule the other
+    //! two also have, and this copy answered several of them differently.
+    //!
+    //! `PtyInner` owns all its state, so each test builds its own and nothing
+    //! is shared.
+
+    use super::*;
+    use alloc::vec;
+    use alloc::vec::Vec;
+
+    fn pty() -> PtyInner {
+        PtyInner::new(0)
+    }
+
+    /// Type these bytes at the terminal.
+    fn typed(p: &mut PtyInner, bytes: &[u8]) {
+        for &b in bytes {
+            p.master_input_byte(b);
+        }
+    }
+
+    /// What the program reading the slave would get.
+    fn read_by_the_program(p: &mut PtyInner) -> Vec<u8> {
+        p.input.drain(..).collect()
+    }
+
+    /// What the terminal would display.
+    fn shown_on_screen(p: &mut PtyInner) -> Vec<u8> {
+        p.output.drain(..).collect()
+    }
+
+    fn slave_of(inner: PtyInner) -> PtySlave {
+        PtySlave {
+            inner: Arc::new(Mutex::new(inner)),
+            inode_id: 0,
+        }
+    }
+
+    // ---------------------------------------------------------------- lines
+
+    #[test]
+    fn a_line_reaches_the_program_only_when_enter_ends_it() {
+        let mut p = pty();
+        typed(&mut p, b"hola");
+        assert!(
+            read_by_the_program(&mut p).is_empty(),
+            "una linea a medias no se entrega"
+        );
+        typed(&mut p, b"\n");
+        assert_eq!(read_by_the_program(&mut p), b"hola\n");
+    }
+
+    #[test]
+    fn what_was_typed_is_what_the_terminal_shows() {
+        let mut p = pty();
+        typed(&mut p, b"hola\n");
+        assert_eq!(shown_on_screen(&mut p), b"hola\n");
+    }
+
+    #[test]
+    fn a_return_key_becomes_a_newline() {
+        // ICRNL is on in a cooked terminal, which is why Enter (which sends
+        // CR) ends a line at all.
+        let mut p = pty();
+        typed(&mut p, b"hola\r");
+        assert_eq!(read_by_the_program(&mut p), b"hola\n");
+    }
+
+    #[test]
+    fn a_terminal_told_to_ignore_the_return_key_ignores_it() {
+        let mut p = pty();
+        p.termios.c_iflag |= IGNCR;
+        typed(&mut p, b"ho\rla\n");
+        assert_eq!(read_by_the_program(&mut p), b"hola\n");
+    }
+
+    #[test]
+    fn inlcr_swaps_the_two_the_other_way_round() {
+        let mut p = pty();
+        p.termios.c_iflag &= !ICRNL;
+        p.termios.c_iflag |= INLCR;
+        typed(&mut p, b"a\n");
+        // The newline became a CR, so no line was ever ended.
+        assert!(read_by_the_program(&mut p).is_empty());
+        assert_eq!(p.canon.iter().copied().collect::<Vec<u8>>(), b"a\r");
+    }
+
+    // --------------------------------------------------------------- erase
+
+    #[test]
+    fn backspace_takes_a_whole_character_and_not_a_byte() {
+        // `ñ` is `c3 b1`. Taking one byte off leaves `c3`, which is half a
+        // letter, and half a letter is not a letter.
+        let mut p = pty();
+        assert!(p.termios.utf8_input(), "el terminal arranca en UTF-8");
+        typed(&mut p, "añ".as_bytes());
+        typed(&mut p, &[127]); // DEL
+        typed(&mut p, b"\n");
+        assert_eq!(read_by_the_program(&mut p), b"a\n");
+    }
+
+    #[test]
+    fn one_character_gets_one_rubout_however_many_bytes_it_is() {
+        // `\x08 \x08` moves the cursor one column, and `ñ` occupies one.
+        let mut p = pty();
+        typed(&mut p, "ñ".as_bytes());
+        let _ = shown_on_screen(&mut p);
+        typed(&mut p, &[127]);
+        assert_eq!(shown_on_screen(&mut p), b"\x08 \x08");
+    }
+
+    #[test]
+    fn a_terminal_that_is_not_utf8_erases_a_byte() {
+        // Without IUTF8 the line is a pipe of bytes, and that is what someone
+        // sending raw data through a cooked terminal is asking for.
+        let mut p = pty();
+        p.termios.c_iflag &= !I_IUTF8;
+        typed(&mut p, "añ".as_bytes());
+        typed(&mut p, &[127]);
+        typed(&mut p, b"\n");
+        assert_eq!(read_by_the_program(&mut p), b"a\xc3\n");
+    }
+
+    #[test]
+    fn a_terminal_with_echo_off_does_not_show_the_backspace() {
+        // This is the password prompt: `ECHO` decides WHETHER to echo and
+        // `ECHOE` only decides HOW. Testing `ECHO | ECHOE` makes every
+        // backspace visible on a terminal that was asked to show nothing,
+        // which says how long the password is.
+        let mut p = pty();
+        p.termios.c_lflag &= !ECHO;
+        typed(&mut p, b"secreto");
+        assert!(shown_on_screen(&mut p).is_empty());
+        typed(&mut p, &[127]);
+        assert!(
+            shown_on_screen(&mut p).is_empty(),
+            "el borrado no puede delatar la longitud"
+        );
+        typed(&mut p, b"\n");
+        assert_eq!(read_by_the_program(&mut p), b"secret\n");
+    }
+
+    #[test]
+    fn a_backspace_on_an_empty_line_shows_nothing() {
+        // There is nothing to rub out, and a rubout would eat the prompt.
+        let mut p = pty();
+        typed(&mut p, &[127]);
+        assert!(shown_on_screen(&mut p).is_empty());
+    }
+
+    #[test]
+    fn an_erase_character_switched_off_is_just_a_byte() {
+        let mut p = pty();
+        p.termios.c_cc[VERASE] = VDISABLE;
+        typed(&mut p, b"ab");
+        typed(&mut p, &[0]);
+        typed(&mut p, b"\n");
+        assert_eq!(read_by_the_program(&mut p), b"ab\x00\n");
+    }
+
+    // ----------------------------------------------------------------- eof
+
+    #[test]
+    fn ctrl_d_on_an_empty_line_ends_the_read() {
+        // The comment on this branch has always promised a zero-length read.
+        // Committing an empty line delivers nothing, so the reader found an
+        // empty queue and blocked: end-of-input never arrived and the only
+        // way out was closing the master.
+        let mut p = pty();
+        typed(&mut p, &[4]); // Ctrl-D
+        assert!(p.eof_pending);
+
+        let s = slave_of(p);
+        let mut buf = [0u8; 8];
+        assert_eq!(s.read_at(0, &mut buf).unwrap(), 0, "fin de entrada");
+    }
+
+    #[test]
+    fn ctrl_d_after_a_partial_line_hands_it_over_without_a_newline() {
+        // What `read` returns for a line the user did not end with Enter.
+        let mut p = pty();
+        typed(&mut p, b"hola");
+        typed(&mut p, &[4]);
+        assert!(!p.eof_pending, "habia linea, asi que no es fin de entrada");
+        assert_eq!(read_by_the_program(&mut p), b"hola");
+    }
+
+    #[test]
+    fn the_end_of_input_is_consumed_by_the_read_it_ends() {
+        // Ctrl-D ends one read. A shell that keeps reading after it blocks
+        // again rather than spinning on an end-of-input that never clears.
+        let mut p = pty();
+        typed(&mut p, &[4]);
+        let s = slave_of(p);
+        let mut buf = [0u8; 8];
+        assert_eq!(s.read_at(0, &mut buf).unwrap(), 0);
+        assert_eq!(s.read_at(0, &mut buf), Err(FsError::Again));
+    }
+
+    #[test]
+    fn poll_and_read_agree_about_a_pending_end_of_input() {
+        // Three places answer "can the slave read yet?". A `poll` that says
+        // no on a pending Ctrl-D parks a reader on input that `read_at` would
+        // have handed over right away.
+        let mut p = pty();
+        typed(&mut p, &[4]);
+        let s = slave_of(p);
+        assert!(s.poll().unwrap().read, "poll tiene que decir que si");
+        let mut buf = [0u8; 8];
+        assert_eq!(s.read_at(0, &mut buf).unwrap(), 0);
+        assert!(!s.poll().unwrap().read, "y que no en cuanto se consume");
+    }
+
+    // ------------------------------------------------------------- signals
+
+    #[test]
+    fn a_closed_master_ends_the_read_and_keeps_ending_it() {
+        // The other end-of-input: the terminal went away. Unlike Ctrl-D this
+        // one does not come back, so it is not consumed by a read.
+        let mut p = pty();
+        p.master_open = false;
+        let s = slave_of(p);
+        let mut buf = [0u8; 8];
+        assert_eq!(s.read_at(0, &mut buf).unwrap(), 0);
+        assert_eq!(s.read_at(0, &mut buf).unwrap(), 0, "sigue cerrado");
+        assert!(s.poll().unwrap().read);
+    }
+
+    #[test]
+    fn queued_input_outranks_a_pending_end_of_input() {
+        // Ctrl-D after a full line: the line is delivered first and the
+        // end-of-input waits for the read after it.
+        let mut p = pty();
+        typed(&mut p, b"hola\n");
+        typed(&mut p, &[4]);
+        let s = slave_of(p);
+        let mut buf = [0u8; 16];
+        let n = s.read_at(0, &mut buf).unwrap();
+        assert_eq!(&buf[..n], b"hola\n");
+        assert_eq!(s.read_at(0, &mut buf).unwrap(), 0);
+    }
+
+    #[test]
+    fn a_signal_character_does_not_enter_the_line() {
+        let mut p = pty();
+        typed(&mut p, b"ab");
+        typed(&mut p, &[3]); // Ctrl-C
+        typed(&mut p, b"\n");
+        assert_eq!(read_by_the_program(&mut p), b"ab\n");
+    }
+
+    #[test]
+    fn a_signal_character_is_shown_as_a_caret_pair() {
+        let mut p = pty();
+        typed(&mut p, &[3]);
+        assert_eq!(shown_on_screen(&mut p), b"^C");
+        typed(&mut p, &[26]); // Ctrl-Z, which this discipline did not know
+        assert_eq!(shown_on_screen(&mut p), b"^Z");
+    }
+
+    #[test]
+    fn an_interrupt_character_switched_off_is_just_a_byte() {
+        // `stty intr undef` writes a zero into `c_cc`. Comparing against it
+        // without checking first turns every NUL byte into a Ctrl-C.
+        let mut p = pty();
+        p.termios.c_cc[VINTR_CC] = VDISABLE;
+        typed(&mut p, b"a");
+        typed(&mut p, &[0]);
+        typed(&mut p, b"\n");
+        assert_eq!(read_by_the_program(&mut p), b"a\x00\n");
+    }
+
+    #[test]
+    fn an_end_of_input_character_switched_off_is_just_a_byte() {
+        // Same rule as the interrupt character: a zero in `c_cc` switches it
+        // off, it does not aim it at the NUL byte.
+        let mut p = pty();
+        p.termios.c_cc[VEOF] = VDISABLE;
+        typed(&mut p, &[0]);
+        assert!(!p.eof_pending, "un NUL no es un Ctrl-D");
+        typed(&mut p, b"\n");
+        assert_eq!(read_by_the_program(&mut p), b"\x00\n");
+    }
+
+    #[test]
+    fn a_line_longer_than_the_queue_does_not_grow_it() {
+        // The cap has to hold on the canonical path too, and that is a second
+        // place answering the same question: a terminal nobody reads from can
+        // otherwise take the kernel's memory with it one full line at a time.
+        let mut p = pty();
+        p.termios.c_lflag &= !ECHO; // keep the output queue out of it
+        typed(&mut p, &vec![b'x'; PTY_BUF_CAP + 10]);
+        typed(&mut p, b"\n");
+        assert_eq!(p.input.len(), PTY_BUF_CAP);
+    }
+
+    #[test]
+    fn a_raw_terminal_gets_ctrl_c_as_a_byte() {
+        let mut p = pty();
+        p.termios.c_lflag &= !(L_ISIG | ICANON);
+        typed(&mut p, &[3]);
+        assert_eq!(read_by_the_program(&mut p), &[3]);
+    }
+
+    // ------------------------------------------------------------ raw mode
+
+    #[test]
+    fn raw_mode_hands_every_byte_over_at_once() {
+        let mut p = pty();
+        p.termios.c_lflag &= !ICANON;
+        typed(&mut p, b"ab");
+        assert_eq!(read_by_the_program(&mut p), b"ab");
+    }
+
+    // -------------------------------------------------------------- output
+
+    #[test]
+    fn the_programs_newlines_get_a_carriage_return_in_front() {
+        // A terminal needs CR-LF to return the cursor to column zero;
+        // without ONLCR the output walks off to the right.
+        let mut p = pty();
+        p.slave_output(b"a\nb\n");
+        assert_eq!(shown_on_screen(&mut p), b"a\r\nb\r\n");
+    }
+
+    #[test]
+    fn opost_off_leaves_the_output_exactly_as_written() {
+        let mut p = pty();
+        p.termios.c_oflag &= !OPOST;
+        p.slave_output(b"a\nb");
+        assert_eq!(shown_on_screen(&mut p), b"a\nb");
+    }
+
+    // --------------------------------------------------------------- limits
+
+    #[test]
+    fn neither_queue_grows_without_end() {
+        // A terminal nobody is reading must not take the kernel's memory
+        // with it.
+        let mut p = pty();
+        p.slave_output(&vec![b'x'; PTY_BUF_CAP * 2]);
+        assert_eq!(p.output.len(), PTY_BUF_CAP);
+
+        let mut p = pty();
+        p.termios.c_lflag &= !ICANON;
+        typed(&mut p, &vec![b'x'; PTY_BUF_CAP + 10]);
+        assert_eq!(p.input.len(), PTY_BUF_CAP);
     }
 }
