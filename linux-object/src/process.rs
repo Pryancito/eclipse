@@ -343,7 +343,7 @@ impl ProcessExt for Process {
         };
         let new_linux_proc = LinuxProcess {
             root_inode: linux_parent.root_inode.clone(),
-            parent: Arc::downgrade(parent),
+            parent: Mutex::new(Arc::downgrade(parent)),
             vt: linux_parent.vt,
             perf: crate::perf::ProcPerf::new(),
             itimers: Default::default(),
@@ -707,8 +707,15 @@ pub fn opened_cloexec(file: &Arc<dyn FileLike>) -> bool {
 pub struct LinuxProcess {
     /// The root INode of file system
     root_inode: Arc<dyn INode>,
-    /// Parent process
-    parent: Weak<Process>,
+    /// Parent process.
+    ///
+    /// MUTABLE, because a process can be re-parented: when its parent dies,
+    /// [`reparent_live_children_to_init`] hands it to the nearest subreaper
+    /// or to init, and from that moment THAT is its parent -- `getppid`
+    /// returning 1 is how the daemonize idiom knows the intermediate process
+    /// is gone, and it is the adopter that `wait`s for it and that a
+    /// stop/continue must notify.
+    parent: Mutex<Weak<Process>>,
     /// Virtual terminal this process is attached to (its stdin/stdout VT).
     /// Used to keep background (inactive-VT) shells from busy-polling stdin for
     /// input that can only arrive on the active terminal.
@@ -965,7 +972,7 @@ impl LinuxProcess {
 
         LinuxProcess {
             root_inode,
-            parent: Weak::default(),
+            parent: Mutex::new(Weak::default()),
             vt,
             perf: crate::perf::ProcPerf::new(),
             itimers: Default::default(),
@@ -1055,21 +1062,25 @@ impl LinuxProcess {
     /// Leave a job-control stop (`SIGCONT`). Wakes parked threads and notifies
     /// the parent for `WCONTINUED`. Returns whether the process was stopped.
     pub fn job_continue(&self, proc: &Arc<Process>) -> bool {
-        let was_stopped = {
-            let mut inner = self.inner.lock();
-            let was = inner.job_stopped;
-            inner.job_stopped = false;
-            if was {
-                inner.job_continued_pending = true;
-                inner.job_stop_pending = false;
-            }
-            was
-        };
+        let was_stopped = self.inner.lock().leave_stop(true);
         proc.signal_set(JOB_CONTINUE_SIGNAL);
         if was_stopped {
             notify_parent_child_state(proc);
         }
         was_stopped
+    }
+
+    /// Break a job-control stop because the process is being KILLED.
+    ///
+    /// Like [`Self::job_continue`] it clears the stop and wakes the parked
+    /// threads -- a thread sitting in [`wait_while_job_stopped`] is the one
+    /// that has to run the default SIGKILL action, and it cannot run it while
+    /// it is parked -- but it leaves NO continue notification behind: the
+    /// process is not continuing, and a parent in `wait(WCONTINUED)` must not
+    /// be told that it did.
+    pub fn job_wake_to_die(&self, proc: &Arc<Process>) {
+        self.inner.lock().leave_stop(false);
+        proc.signal_set(JOB_CONTINUE_SIGNAL);
     }
 
     /// Consume a pending stop/continue notification for `wait*` if `interest`
@@ -1923,7 +1934,12 @@ impl LinuxProcess {
 
     /// Get parent process.
     pub fn parent(&self) -> Option<Arc<Process>> {
-        self.parent.upgrade()
+        self.parent.lock().upgrade()
+    }
+
+    /// Hand this process to a new parent (adoption on the old one's death).
+    pub fn set_parent(&self, parent: &Arc<Process>) {
+        *self.parent.lock() = Arc::downgrade(parent);
     }
 
     /// Get current working directory.
@@ -2332,6 +2348,27 @@ impl LinuxProcessInner {
             // that is exactly what the `Clone` drops.
             semaphores: self.semaphores.clone(),
         }
+    }
+
+    /// Leave a job-control stop. `continued` says whether this is a real
+    /// `SIGCONT` -- which owes the parent a `WCONTINUED` notification -- or a
+    /// wake-up to die under `SIGKILL`, which owes it nothing: the process is
+    /// not continuing, and telling `wait` that it did would have the parent
+    /// report a job as resumed at the moment it was killed.
+    ///
+    /// Either way the pending STOP notification goes: a stop the parent never
+    /// collected is not news any more once the process is out of the stop,
+    /// and left behind it would be reported as a current state.
+    ///
+    /// Returns whether the process was in fact stopped.
+    fn leave_stop(&mut self, continued: bool) -> bool {
+        let was = self.job_stopped;
+        self.job_stopped = false;
+        if was {
+            self.job_stop_pending = false;
+            self.job_continued_pending = continued;
+        }
+        was
     }
 
     /// Fold a reaped child's CPU usage into the RUSAGE_CHILDREN totals.
@@ -2894,6 +2931,17 @@ fn reparent_live_children_to_init(dying: &Arc<Process>) {
         };
         let mut adopter_inner = adopter_linux.inner.lock();
         for orphan in orphans {
+            // The adopter is the orphan's PARENT now, and the pointer has to
+            // say so. It never did: `parent` was written once at fork and
+            // never again, so after an adoption `getppid()` still named the
+            // dead process (or 0 once its object went away) where Linux says
+            // 1 -- which is the very thing the daemonize idiom waits for --
+            // `notify_parent_child_state` pulsed SIGCHLD at the corpse
+            // instead of at the adopter blocked in `wait`, and
+            // `nearest_live_subreaper` walked a chain through the dead.
+            if let Some(lp) = orphan.try_linux() {
+                lp.set_parent(&adopter);
+            }
             adopter_inner.children.insert(orphan.id(), orphan);
         }
         for (pid, entry) in zombies {
@@ -3137,6 +3185,70 @@ mod tests {
     }
 }
 
+/// The four signals whose default action is a job-control STOP.
+pub const STOP_SIGNALS: [LinuxSignal; 4] = [
+    LinuxSignal::SIGSTOP,
+    LinuxSignal::SIGTSTP,
+    LinuxSignal::SIGTTIN,
+    LinuxSignal::SIGTTOU,
+];
+
+/// What sending a signal does to the target's job-control state AT THE MOMENT
+/// OF SENDING -- before any mask, handler or `wait` is consulted.
+///
+/// Linux decides this in `prepare_signal()`, in the sender's own context, and
+/// it has to: the work belongs to signals whose whole point is to act on a
+/// process that is NOT running, so the target cannot be the one to do it. This
+/// kernel had nothing here, and left both halves to the target thread's own
+/// `handle_signal` loop -- which a stopped process's threads never reach,
+/// because they are parked in [`wait_while_job_stopped`] waiting for a
+/// continue that only that same loop could have issued.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SendEffect {
+    /// `SIGCONT`: resume the process now, whatever it has this signal set to,
+    /// and drop any stop that had not been acted on yet. Without it,
+    /// `kill -CONT` and a shell's `fg` moved nothing.
+    Resume,
+    /// A stop signal: drop any `SIGCONT` that had not been acted on yet, so
+    /// the last one sent is the one that decides.
+    Stop,
+    /// `SIGKILL`: the process is not continuing, but a parked thread has to
+    /// wake up to die. Without it, `kill -9` on a Ctrl-Z'd process did
+    /// nothing at all and the pid stayed forever.
+    WakeToDie,
+    /// Everything else waits to be received, which is what a signal normally
+    /// does.
+    None,
+}
+
+/// `prepare_signal()`: what [`send_signal_to_process`] must do before the
+/// signal is so much as queued.
+pub fn send_effect(signal: LinuxSignal) -> SendEffect {
+    match signal {
+        LinuxSignal::SIGCONT => SendEffect::Resume,
+        LinuxSignal::SIGKILL => SendEffect::WakeToDie,
+        s if STOP_SIGNALS.contains(&s) => SendEffect::Stop,
+        _ => SendEffect::None,
+    }
+}
+
+/// The pending signals a target is left with once `signal` is sent to it:
+/// `SIGCONT` and the stop signals cancel each other out, so that a process
+/// cannot end up carrying both and stopping or resuming depending on which
+/// its threads happen to dequeue first.
+pub fn pending_after_send(mut pending: Sigset, signal: LinuxSignal) -> Sigset {
+    match send_effect(signal) {
+        SendEffect::Resume => {
+            for stop in STOP_SIGNALS {
+                pending.remove(stop);
+            }
+        }
+        SendEffect::Stop => pending.remove(LinuxSignal::SIGCONT),
+        _ => {}
+    }
+    pending
+}
+
 pub fn send_signal_to_process(pid: usize, signal: LinuxSignal) -> LxResult<()> {
     use crate::thread::ThreadExt;
     if let Some(process) = ROOT_JOB.find_process(pid as KoID) {
@@ -3156,6 +3268,19 @@ pub fn send_signal_to_process(pid: usize, signal: LinuxSignal) -> LxResult<()> {
             );
         }
         let tids = process.thread_ids();
+        // `prepare_signal()`, before the signal is queued: a stop and a
+        // continue cancel each other where they are waiting to be received,
+        // so a process never carries both and the last one sent is the one
+        // that decides.
+        for tid in process.thread_ids() {
+            if let Ok(thread_obj) = process.get_child(tid) {
+                if let Ok(thread) = thread_obj.downcast_arc::<Thread>() {
+                    if let Some(mut lt) = thread.try_lock_linux() {
+                        lt.signals = pending_after_send(lt.signals, signal);
+                    }
+                }
+            }
+        }
         // Prefer a thread that has the signal *unblocked* — it can act on it
         // right away — and deliver there.
         let mut first: Option<Arc<Thread>> = None;
@@ -3179,6 +3304,7 @@ pub fn send_signal_to_process(pid: usize, signal: LinuxSignal) -> LxResult<()> {
                     if delivered {
                         // Wake waitpid(-1): PID 1 blocks on this zircon bit.
                         process.signal_set(Signal::SIGCHLD);
+                        wake_for_job_control(&process, signal);
                         return Ok(());
                     }
                     if first.is_none() {
@@ -3198,9 +3324,31 @@ pub fn send_signal_to_process(pid: usize, signal: LinuxSignal) -> LxResult<()> {
         // Pulse even when every thread had the Linux signal blocked: waitpid
         // still needs to return so the waiter can notice the pending set.
         process.signal_set(Signal::SIGCHLD);
+        wake_for_job_control(&process, signal);
         Ok(())
     } else {
         Err(LxError::ESRCH)
+    }
+}
+
+/// `complete_signal()`: the wake-up half, once the signal is queued.
+///
+/// It goes here, in the SENDER, because the work is only ever needed when the
+/// target is job-control stopped -- and a stopped process's threads are
+/// parked in [`wait_while_job_stopped`], so they cannot do it for themselves.
+/// After the queueing, as Linux does it, so the thread that wakes already has
+/// the signal to act on.
+fn wake_for_job_control(process: &Arc<Process>, signal: LinuxSignal) {
+    let lp = match process.try_linux() {
+        Some(lp) => lp,
+        None => return,
+    };
+    match send_effect(signal) {
+        SendEffect::Resume => {
+            lp.job_continue(process);
+        }
+        SendEffect::WakeToDie => lp.job_wake_to_die(process),
+        SendEffect::Stop | SendEffect::None => {}
     }
 }
 
@@ -3942,7 +4090,7 @@ mod dup_fd_tests {
     fn a_process() -> LinuxProcess {
         LinuxProcess {
             root_inode: Log::new(),
-            parent: Weak::default(),
+            parent: Mutex::new(Weak::default()),
             vt: 0,
             perf: crate::perf::ProcPerf::new(),
             itimers: Default::default(),
@@ -4448,5 +4596,157 @@ mod job_control_membership_tests {
     fn a_pid_that_names_a_group_somebody_else_is_in_counts_too() {
         // The caller sits in group 555; only its child still carries SHELL.
         assert_eq!(setsid_verdict(SHELL, &[555, SHELL]), Err(LxError::EPERM));
+    }
+}
+
+#[cfg(test)]
+mod signal_send_effect_tests {
+    //! What a signal does at the moment it is SENT, before anybody receives
+    //! it.
+    //!
+    //! `prepare_signal()` does this work in the sender's context because the
+    //! signals it covers exist to act on a process that is not running. Here
+    //! there was nothing: every bit of it was left to the target thread's own
+    //! `handle_signal` loop in `loader/src/linux.rs`. A job-control-stopped
+    //! process's threads are parked in `wait_while_job_stopped`, waiting for
+    //! a zircon signal that only `job_continue` raises -- and `job_continue`
+    //! was called from that same loop. So a stopped process could not be
+    //! resumed by `SIGCONT` and could not be killed by `SIGKILL`: both waited
+    //! for the one thread that was waiting for them.
+
+    use super::*;
+
+    #[test]
+    fn a_continue_resumes_at_the_moment_it_is_sent() {
+        assert_eq!(send_effect(LinuxSignal::SIGCONT), SendEffect::Resume);
+    }
+
+    /// `kill -9` on a Ctrl-Z'd process. The default action for SIGKILL runs
+    /// in the target's own loop, so the target has to be out of the park
+    /// before it can die -- otherwise the pid stays stopped forever and no
+    /// signal can ever remove it.
+    #[test]
+    fn a_kill_wakes_a_stopped_process_so_it_can_die() {
+        assert_eq!(send_effect(LinuxSignal::SIGKILL), SendEffect::WakeToDie);
+    }
+
+    #[test]
+    fn the_four_stop_signals_are_the_four() {
+        for sig in STOP_SIGNALS {
+            assert_eq!(send_effect(sig), SendEffect::Stop, "{:?}", sig);
+        }
+        assert_eq!(
+            STOP_SIGNALS,
+            [
+                LinuxSignal::SIGSTOP,
+                LinuxSignal::SIGTSTP,
+                LinuxSignal::SIGTTIN,
+                LinuxSignal::SIGTTOU
+            ]
+        );
+    }
+
+    /// Everything else is an ordinary signal: it waits to be received. A
+    /// SIGTERM must NOT resume a stopped process, or a `kill` of a stopped
+    /// job would restart it just long enough to run a handler.
+    #[test]
+    fn an_ordinary_signal_does_nothing_until_it_is_received() {
+        for sig in [
+            LinuxSignal::SIGTERM,
+            LinuxSignal::SIGINT,
+            LinuxSignal::SIGHUP,
+            LinuxSignal::SIGCHLD,
+            LinuxSignal::SIGUSR1,
+            LinuxSignal::SIGWINCH,
+        ] {
+            assert_eq!(send_effect(sig), SendEffect::None, "{:?}", sig);
+        }
+    }
+
+    /// A stop and a continue cancel each other where they are waiting, so the
+    /// last one sent decides. Carrying both, the outcome depended on which of
+    /// them the target's loop happened to dequeue first.
+    #[test]
+    fn a_continue_cancels_a_stop_that_was_still_waiting() {
+        let mut pending = Sigset::default();
+        for stop in STOP_SIGNALS {
+            pending.insert(stop);
+        }
+        pending.insert(LinuxSignal::SIGTERM);
+        let after = pending_after_send(pending, LinuxSignal::SIGCONT);
+        for stop in STOP_SIGNALS {
+            assert!(!after.contains(stop), "{:?} survived a SIGCONT", stop);
+        }
+        assert!(
+            after.contains(LinuxSignal::SIGTERM),
+            "only the stops are cancelled"
+        );
+    }
+
+    #[test]
+    fn a_stop_cancels_a_continue_that_was_still_waiting() {
+        for stop in STOP_SIGNALS {
+            let mut pending = Sigset::default();
+            pending.insert(LinuxSignal::SIGCONT);
+            pending.insert(LinuxSignal::SIGUSR2);
+            let after = pending_after_send(pending, stop);
+            assert!(
+                !after.contains(LinuxSignal::SIGCONT),
+                "a pending SIGCONT survived {:?}",
+                stop
+            );
+            assert!(after.contains(LinuxSignal::SIGUSR2));
+        }
+    }
+
+    #[test]
+    fn an_ordinary_signal_cancels_nothing() {
+        let mut pending = Sigset::default();
+        pending.insert(LinuxSignal::SIGCONT);
+        pending.insert(LinuxSignal::SIGTSTP);
+        let after = pending_after_send(pending, LinuxSignal::SIGTERM);
+        assert!(after.contains(LinuxSignal::SIGCONT));
+        assert!(after.contains(LinuxSignal::SIGTSTP));
+    }
+
+    /// The wake-to-die is not a continue. A parent in `wait(WCONTINUED)` must
+    /// not be told the job resumed at the very moment it was killed.
+    #[test]
+    fn a_process_woken_to_die_owes_its_parent_no_continue_notification() {
+        let mut inner = LinuxProcessInner {
+            job_stopped: true,
+            job_stop_sig: LinuxSignal::SIGTSTP as u8,
+            job_stop_pending: true,
+            ..Default::default()
+        };
+        assert!(inner.leave_stop(false));
+        assert!(!inner.job_stopped);
+        assert!(!inner.job_continued_pending, "it is not continuing");
+        assert!(
+            !inner.job_stop_pending,
+            "and the stop it never collected is no longer current"
+        );
+    }
+
+    #[test]
+    fn a_real_continue_does_owe_one() {
+        let mut inner = LinuxProcessInner {
+            job_stopped: true,
+            job_stop_pending: true,
+            ..Default::default()
+        };
+        assert!(inner.leave_stop(true));
+        assert!(inner.job_continued_pending);
+        assert!(!inner.job_stop_pending);
+    }
+
+    /// A `SIGCONT` to a process that was not stopped is not a state change,
+    /// so it owes nothing either -- `wait(WCONTINUED)` would otherwise return
+    /// for a job that never went anywhere.
+    #[test]
+    fn a_continue_to_a_running_process_is_not_a_state_change() {
+        let mut inner = LinuxProcessInner::default();
+        assert!(!inner.leave_stop(true));
+        assert!(!inner.job_continued_pending);
     }
 }
