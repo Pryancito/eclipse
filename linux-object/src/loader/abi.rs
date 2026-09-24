@@ -411,6 +411,55 @@ pub const AT_SECURE: u8 = 23;
 pub const AT_RANDOM: u8 = 25;
 pub const AT_EXECFN: u8 = 31;
 
+/// The identity block of the aux vector: who the kernel says this process is,
+/// and whether the `execve` that started it raised its privileges.
+///
+/// Every C library reads these five before `main` and decides from them
+/// whether the environment it was handed can be trusted. glibc sets
+/// `__libc_enable_secure` from `AT_SECURE` alone; musl computes `libc.secure`
+/// as "the four identity entries are not all there, **or** `AT_UID != AT_EUID`,
+/// **or** `AT_GID != AT_EGID`, **or** `AT_SECURE != 0`"; GLib's
+/// `g_check_setuid()` follows glibc. Secure mode is what makes the dynamic
+/// loader drop `LD_PRELOAD`, `LD_LIBRARY_PATH`, `LD_AUDIT`, `GCONV_PATH` and
+/// the `MALLOC_*` hooks -- every knob that names a file the caller chose and
+/// the privileged image then runs.
+///
+/// So the block has to be the truth in both directions. Claiming privilege
+/// that was not granted puts every ordinary process in secure mode (which is
+/// how `waybar` died: GLib refuses to autolaunch a D-Bus session bus under
+/// `AT_SECURE`). Claiming safety that is not there hands a set-user-ID image
+/// the caller's `LD_PRELOAD`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct AuxIdentity {
+    /// Real user id (`AT_UID`).
+    pub uid: u32,
+    /// Effective user id (`AT_EUID`), after any set-user-ID bit on the image.
+    pub euid: u32,
+    /// Real group id (`AT_GID`).
+    pub gid: u32,
+    /// Effective group id (`AT_EGID`), after any set-group-ID bit.
+    pub egid: u32,
+    /// Linux's `bprm->secureexec` (`AT_SECURE`), as computed by
+    /// `cap_bprm_creds_from_file()` once the ids above are final.
+    pub secure: bool,
+}
+
+impl AuxIdentity {
+    /// Write the five entries into an aux vector under construction.
+    ///
+    /// One rule, asked by every path that builds a stack, because the answer
+    /// has to agree with itself: a C library that finds `AT_EUID == AT_UID`
+    /// next to `AT_SECURE == 1` believes the second, and one that finds them
+    /// different next to `AT_SECURE == 0` believes the first.
+    pub fn insert_into(&self, auxv: &mut BTreeMap<u8, usize>) {
+        auxv.insert(AT_UID, self.uid as usize);
+        auxv.insert(AT_EUID, self.euid as usize);
+        auxv.insert(AT_GID, self.gid as usize);
+        auxv.insert(AT_EGID, self.egid as usize);
+        auxv.insert(AT_SECURE, self.secure as usize);
+    }
+}
+
 #[cfg(test)]
 mod initial_stack_tests {
     //! The image `push_at` builds is the very first thing a new process sees:
@@ -701,5 +750,162 @@ mod initial_stack_tests {
         assert_eq!(argc, 4);
         assert_eq!(args[2], "echo a  b");
         assert_eq!(args[3], "", "an empty argument was dropped");
+    }
+
+    // --- The identity block -------------------------------------------------
+    //
+    // Five entries that no program reads on purpose and every C library reads
+    // before `main`. They are the kernel's answer to "who am I, and can I
+    // trust what I was handed", and a wrong answer is not a crash: it is a
+    // privileged image quietly honouring the caller's `LD_PRELOAD`, or an
+    // ordinary one quietly refusing to autolaunch a session bus.
+
+    /// The identity block out of a decoded image, as (uid, euid, gid, egid,
+    /// secure) -- panicking if any of the five is missing, because absent is
+    /// itself an answer to a C library and never the one we mean.
+    fn identity_of(img: &Image) -> (usize, usize, usize, usize, usize) {
+        let (_, _, _, auxv) = img.decode();
+        let get = |key: u8| {
+            auxv.iter()
+                .find(|(k, _)| *k == key as usize)
+                .map(|(_, v)| *v)
+                .unwrap_or_else(|| panic!("the aux vector has no entry {}", key))
+        };
+        (
+            get(AT_UID),
+            get(AT_EUID),
+            get(AT_GID),
+            get(AT_EGID),
+            get(AT_SECURE),
+        )
+    }
+
+    fn image_for(id: AuxIdentity) -> Image {
+        let mut auxv = auxv_of(&[(AT_PAGESZ, 4096)]);
+        id.insert_into(&mut auxv);
+        Image::of(&["/bin/sh"], &["PATH=/bin"], auxv)
+    }
+
+    #[test]
+    fn the_identity_block_reaches_the_new_programs_stack() {
+        let img = image_for(AuxIdentity {
+            uid: 1000,
+            euid: 0,
+            gid: 1001,
+            egid: 0,
+            secure: true,
+        });
+        assert_eq!(identity_of(&img), (1000, 0, 1001, 0, 1));
+    }
+
+    #[test]
+    fn at_uid_is_the_real_id_and_at_euid_the_effective_one() {
+        // The one mistake that cannot be caught downstream: swap these two
+        // and musl's own rule ("ruid != euid means secure") still fires, so
+        // the program looks right while being told the opposite of the truth
+        // about which id its file accesses will be checked against.
+        let img = image_for(AuxIdentity {
+            uid: 1000,
+            euid: 0,
+            gid: 1001,
+            egid: 2,
+            secure: true,
+        });
+        let (uid, euid, gid, egid, _) = identity_of(&img);
+        assert_eq!(uid, 1000, "AT_UID is the REAL user id");
+        assert_eq!(euid, 0, "AT_EUID is the EFFECTIVE user id");
+        assert_eq!(gid, 1001, "AT_GID is the REAL group id");
+        assert_eq!(egid, 2, "AT_EGID is the EFFECTIVE group id");
+    }
+
+    #[test]
+    fn at_secure_is_the_zero_or_one_the_c_library_tests() {
+        // glibc: `__libc_enable_secure = av->a_un.a_val != 0`. A bool written
+        // as anything but 0 and 1 would still work there and still be wrong,
+        // so pin the value rather than its truthiness.
+        let safe = image_for(AuxIdentity::default());
+        assert_eq!(identity_of(&safe).4, 0);
+        let secure = image_for(AuxIdentity {
+            secure: true,
+            ..Default::default()
+        });
+        assert_eq!(identity_of(&secure).4, 1);
+    }
+
+    #[test]
+    fn a_default_identity_is_root_and_not_secure() {
+        // What a process the kernel starts by itself gets, and what every
+        // process on this machine has got until now. Pinned so the change
+        // that gives the block real values cannot quietly move the boot case
+        // with it.
+        let img = image_for(AuxIdentity::default());
+        assert_eq!(identity_of(&img), (0, 0, 0, 0, 0));
+    }
+
+    #[test]
+    fn the_block_replaces_whatever_was_there_before() {
+        // The aux vector is built by accumulation, and the identity block is
+        // written into a map that other code has already touched. A block
+        // that merged instead of replacing would leave a stale AT_SECURE next
+        // to fresh ids -- the exact disagreement that makes a C library pick
+        // the wrong one of the two.
+        let mut auxv = auxv_of(&[(AT_PAGESZ, 4096)]);
+        AuxIdentity {
+            uid: 7,
+            euid: 7,
+            gid: 7,
+            egid: 7,
+            secure: true,
+        }
+        .insert_into(&mut auxv);
+        AuxIdentity::default().insert_into(&mut auxv);
+        let img = Image::of(&["/bin/sh"], &[], auxv);
+        assert_eq!(identity_of(&img), (0, 0, 0, 0, 0));
+    }
+
+    #[test]
+    fn the_identity_block_does_not_displace_the_rest_of_the_aux_vector() {
+        // Five more entries is five more pairs of words between the envp NULL
+        // and the AT_NULL terminator, and `push_at` sizes its buffer up
+        // front. AT_RANDOM and AT_EXECFN are pushed last, after the caller's
+        // map, so they are the ones a miscount would truncate.
+        let img = image_for(AuxIdentity {
+            uid: 1000,
+            euid: 0,
+            gid: 1000,
+            egid: 0,
+            secure: true,
+        });
+        let (_, _, _, auxv) = img.decode();
+        for key in [AT_PAGESZ, AT_RANDOM, AT_EXECFN] {
+            assert!(
+                auxv.iter().any(|(k, _)| *k == key as usize),
+                "entry {} was lost",
+                key
+            );
+        }
+        let random = auxv
+            .iter()
+            .find(|(k, _)| *k == AT_RANDOM as usize)
+            .expect("AT_RANDOM")
+            .1;
+        assert!(
+            img.in_bounds(random, 16),
+            "AT_RANDOM points at {:#x}, outside the image",
+            random
+        );
+    }
+
+    #[test]
+    fn the_five_types_are_the_ones_linux_uses() {
+        // Pinned against the literals from `include/uapi/linux/auxvec.h`, not
+        // against each other. A program asks for these by number through
+        // `getauxval`, so a wrong number is not a missing value: it is a
+        // value delivered under someone else's name.
+        assert_eq!(AT_UID, 11);
+        assert_eq!(AT_EUID, 12);
+        assert_eq!(AT_GID, 13);
+        assert_eq!(AT_EGID, 14);
+        assert_eq!(AT_SECURE, 23);
     }
 }
