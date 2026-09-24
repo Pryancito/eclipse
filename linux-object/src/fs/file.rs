@@ -25,14 +25,33 @@ bitflags::bitflags! {
         const CREATE = 1 << 6;
         /// error if CREATE and the file exists
         const EXCLUSIVE = 1 << 7;
+        /// do not make this the controlling terminal
+        const NOCTTY = 1 << 8;
         /// truncate file upon open
         const TRUNCATE = 1 << 9;
         /// append on each write
         const APPEND = 1 << 10;
         /// non block open
         const NON_BLOCK = 1 << 11;
+        /// a write returns once the data is on the disk (`O_DSYNC`)
+        const DSYNC = 1 << 12;
+        /// signal-driven I/O
+        const ASYNC = 1 << 13;
+        /// bypass the page cache
+        const DIRECT = 1 << 14;
+        /// allow a size that does not fit a 32-bit `off_t`; meaningless here
+        const LARGEFILE = 1 << 15;
+        /// `ENOTDIR` unless the path names a directory
+        const DIRECTORY = 1 << 16;
+        /// `ELOOP` if the last component of the path is a symbolic link
+        const NOFOLLOW = 1 << 17;
+        /// do not update the access time on read
+        const NOATIME = 1 << 18;
         /// close on exec
         const CLOEXEC = 1 << 19;
+        /// a write returns once data AND metadata are on the disk.
+        /// `O_SYNC` is `__O_SYNC | O_DSYNC` upstream, both bits together.
+        const SYNC = (1 << 20) | (1 << 12);
     }
 }
 
