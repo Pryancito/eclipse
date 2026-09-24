@@ -1823,10 +1823,16 @@ impl LinuxProcess {
     /// Returns whether this exec actually RAISED privileges -- Linux's
     /// `bprm->secureexec`, which is what turns on the extra forgetting in
     /// [`Self::reset_for_exec`].
-    pub fn apply_exec_metadata(&self, metadata: &Metadata) -> bool {
-        self.inner
-            .lock()
-            .apply_exec_ids(metadata.mode, metadata.uid as u32, metadata.gid as u32)
+    /// `may_suid` is Linux's `mnt_may_suid()`: false when the image sits on a
+    /// mount that was mounted `nosuid`, which is the whole of what that option
+    /// buys and the reason `/tmp` and `/dev/shm` are mounted with it.
+    pub fn apply_exec_metadata(&self, metadata: &Metadata, may_suid: bool) -> bool {
+        self.inner.lock().apply_exec_ids(
+            metadata.mode,
+            metadata.uid as u32,
+            metadata.gid as u32,
+            may_suid,
+        )
     }
 
     /// FreeBSD's `issetugid(2)`: whether this process's ids have moved since
@@ -2313,19 +2319,20 @@ impl LinuxProcessInner {
     /// keeps its effective id across `execve`, so the ordinary shell it execs
     /// is every bit as privileged -- and every bit as unable to trust the
     /// environment it was handed -- as the image that raised it.
-    fn apply_exec_ids(&mut self, mode: u16, uid: u32, gid: u32) -> bool {
+    fn apply_exec_ids(&mut self, mode: u16, uid: u32, gid: u32, may_suid: bool) -> bool {
         // The ids this exec starts from. `execve` never moves the real ones,
         // so `ruid`/`rgid` below are `old->uid`/`old->gid` as well.
         let old_euid = self.credentials.euid;
         let old_egid = self.credentials.egid;
 
-        // no_new_privs (Documentation/userspace-api/no_new_privs.rst): execve
-        // must not grant privileges the process could not have gained on its
-        // own — setuid/setgid bits on the image are simply not honoured.
-        // Linux returns from `bprm_fill_uid()` here and goes on to compute
-        // `secureexec` regardless, which is the point: refusing to raise a
-        // process says nothing about how privileged it already was.
-        if !self.no_new_privs {
+        // `bprm_fill_uid()` asks two questions before it honours a bit, and
+        // leaves without honouring either if the answer to one of them is no:
+        // `mnt_may_suid(file->f_path.mnt)` -- was the filesystem mounted
+        // `nosuid`? -- and `task_no_new_privs(current)`. It then goes on to
+        // compute `secureexec` regardless, which is the point of doing them
+        // here and not at the return: refusing to raise a process says nothing
+        // about how privileged it already was.
+        if may_suid && !self.no_new_privs {
             if (mode & MODE_SET_UID) != 0 {
                 self.credentials.euid = uid;
                 self.credentials.suid = uid;
@@ -2377,6 +2384,13 @@ impl LinuxProcessInner {
         if self.ids() != before {
             self.sugid = true;
         }
+    }
+
+    /// `apply_exec_ids` for an image on an ordinary mount, which is what every
+    /// test that is not about `nosuid` means.
+    #[cfg(test)]
+    fn apply_exec_ids_from_a_normal_mount(&mut self, mode: u16, uid: u32, gid: u32) -> bool {
+        self.apply_exec_ids(mode, uid, gid, true)
     }
 
     /// The aux-vector identity block for the image about to be loaded.
@@ -3134,6 +3148,56 @@ fn signal_default_action_interrupts(sig: LinuxSignal) -> bool {
     )
 }
 
+/// Whether a pending signal that did NOT interrupt the syscall may also be
+/// thrown away.
+///
+/// This is a **different question** from [`signal_interrupts_syscall`], and
+/// the two were being answered with one predicate. Linux keeps them apart:
+///
+/// - `sig_kernel_ignore()` -- SIGCONT, SIGCHLD, SIGWINCH, SIGURG -- is the
+///   set whose default action is to do nothing at all, and those are the ones
+///   `prepare_signal()` drops on the floor;
+/// - `sig_kernel_stop()` -- SIGSTOP, SIGTSTP, SIGTTIN, SIGTTOU -- does not
+///   raise `EINTR` either, but it most certainly is not a no-op: it is the
+///   whole of job control.
+///
+/// Answering both with "does it interrupt?" made the four stop signals
+/// discardable, so a thread parked in `ppoll`/`epoll_wait`/`read` -- which is
+/// every idle desktop process -- had its pending SIGSTOP removed by the very
+/// loop that was waiting, and `kill -STOP` (or Ctrl-Z, or the SIGTTIN a
+/// background job gets for reading the terminal) did nothing at all. The bit
+/// now survives, so the stop happens when the syscall next returns.
+///
+/// A signal explicitly set to `SIG_IGN` is discardable whatever it is -- that
+/// covers SIGTSTP and friends when a shell has told the kernel to ignore
+/// them. SIGKILL cannot reach here: it interrupts.
+fn signal_is_discarded_when_pending(proc_linux: &LinuxProcess, sig: LinuxSignal) -> bool {
+    discards_when_pending(proc_linux.signal_action(sig).handler, sig)
+}
+
+/// [`signal_is_discarded_when_pending`] over a disposition rather than a
+/// process, so the rule can be compared against
+/// [`interrupts_syscall`] without one.
+fn discards_when_pending(handler: usize, sig: LinuxSignal) -> bool {
+    use crate::signal::{SIG_DFL, SIG_IGN};
+    if handler == SIG_IGN {
+        return true;
+    }
+    handler == SIG_DFL && signal_default_action_ignores(sig)
+}
+
+/// `sig_kernel_ignore()`: the signals whose *default* action is to do nothing.
+///
+/// Deliberately not the complement of [`signal_default_action_interrupts`]:
+/// that list also holds the four stop signals, which do not interrupt and are
+/// not ignored either.
+fn signal_default_action_ignores(sig: LinuxSignal) -> bool {
+    matches!(
+        sig,
+        LinuxSignal::SIGCHLD | LinuxSignal::SIGURG | LinuxSignal::SIGWINCH | LinuxSignal::SIGCONT
+    )
+}
+
 /// Whether a pending signal actually interrupts a blocking syscall.
 ///
 /// Linux only interrupts a syscall for a signal that will run a handler or
@@ -3150,8 +3214,12 @@ fn signal_default_action_interrupts(sig: LinuxSignal) -> bool {
 /// dispatch error. The disposition list here mirrors the default-ignore set in
 /// `handle_signal` (loader/src/linux.rs) so the two agree on what is a no-op.
 fn signal_interrupts_syscall(proc_linux: &LinuxProcess, sig: LinuxSignal) -> bool {
+    interrupts_syscall(proc_linux.signal_action(sig).handler, sig)
+}
+
+/// [`signal_interrupts_syscall`] over a disposition rather than a process.
+fn interrupts_syscall(handler: usize, sig: LinuxSignal) -> bool {
     use crate::signal::{SIG_DFL, SIG_IGN};
-    let handler = proc_linux.signal_action(sig).handler;
     if handler == SIG_IGN {
         return false;
     }
@@ -3223,7 +3291,13 @@ pub fn check_signals() -> LxResult<()> {
                     // syscalls for minutes; if we merely "skip" such signals
                     // here, every unrelated wake re-scans the same stale
                     // pending bit.
-                    discard.insert(sig);
+                    //
+                    // But only those: see
+                    // [`signal_is_discarded_when_pending`] for the four that
+                    // were being thrown away with them.
+                    if signal_is_discarded_when_pending(proc_linux, sig) {
+                        discard.insert(sig);
+                    }
                 }
                 if discard.is_not_empty() {
                     if let Some(mut linux_thread) = thread.try_lock_linux() {
@@ -3896,7 +3970,7 @@ mod exec_reset_tests {
     #[test]
     fn a_setuid_image_owned_by_another_user_raises_privileges() {
         let mut inner = a_process_about_to_exec();
-        assert!(inner.apply_exec_ids(0o4755, ROOT_UID, 1000));
+        assert!(inner.apply_exec_ids_from_a_normal_mount(0o4755, ROOT_UID, 1000));
         assert_eq!(inner.credentials.euid, ROOT_UID);
         // The saved id follows, which is what lets the program drop and
         // regain the privilege later.
@@ -3911,7 +3985,7 @@ mod exec_reset_tests {
         // -- and a `raised` that only ever looked at the user half would let
         // a set-group-ID program keep the lever.
         let mut inner = a_process_about_to_exec();
-        assert!(inner.apply_exec_ids(0o2755, 1000, 0));
+        assert!(inner.apply_exec_ids_from_a_normal_mount(0o2755, 1000, 0));
         assert_eq!(inner.credentials.egid, 0);
         assert_eq!(inner.credentials.sgid, 0);
         assert_eq!(inner.credentials.rgid, 1000);
@@ -3923,7 +3997,7 @@ mod exec_reset_tests {
         // bits were set. A user's own set-user-ID binary grants that user
         // nothing, so nothing about the process needs hardening.
         let mut inner = a_process_about_to_exec();
-        assert!(!inner.apply_exec_ids(0o6755, 1000, 1000));
+        assert!(!inner.apply_exec_ids_from_a_normal_mount(0o6755, 1000, 1000));
         assert_eq!(inner.credentials.euid, 1000);
         assert_eq!(inner.credentials.egid, 1000);
     }
@@ -3931,7 +4005,7 @@ mod exec_reset_tests {
     #[test]
     fn an_ordinary_image_raises_nothing() {
         let mut inner = a_process_about_to_exec();
-        assert!(!inner.apply_exec_ids(0o0755, ROOT_UID, ROOT_UID));
+        assert!(!inner.apply_exec_ids_from_a_normal_mount(0o0755, ROOT_UID, ROOT_UID));
         assert_eq!(inner.credentials.euid, 1000);
         assert_eq!(inner.credentials.egid, 1000);
     }
@@ -3943,11 +4017,57 @@ mod exec_reset_tests {
         // process hardened against a privilege it never got.
         let mut inner = a_process_about_to_exec();
         inner.no_new_privs = true;
-        assert!(!inner.apply_exec_ids(0o6755, ROOT_UID, ROOT_UID));
+        assert!(!inner.apply_exec_ids_from_a_normal_mount(0o6755, ROOT_UID, ROOT_UID));
         assert_eq!(inner.credentials.euid, 1000);
         assert_eq!(inner.credentials.egid, 1000);
         assert_eq!(inner.credentials.suid, 1000);
         assert_eq!(inner.credentials.sgid, 1000);
+    }
+
+    #[test]
+    fn a_setuid_image_on_a_nosuid_mount_grants_nothing() {
+        // `mnt_may_suid(bprm->file->f_path.mnt)`: this is the whole of what
+        // mounting `/tmp` with `nosuid` buys, and it was bought and never
+        // delivered -- the option reached `/proc/mounts` and stopped there.
+        let mut inner = a_process_about_to_exec();
+        assert!(!inner.apply_exec_ids(0o6755, ROOT_UID, ROOT_UID, false));
+        assert_eq!(inner.credentials.euid, 1000);
+        assert_eq!(inner.credentials.egid, 1000);
+        assert_eq!(inner.credentials.suid, 1000);
+        assert_eq!(inner.credentials.sgid, 1000);
+    }
+
+    #[test]
+    fn nosuid_does_not_hide_a_process_that_was_already_privileged() {
+        // The mount decides what this exec may GRANT. It says nothing about
+        // what the process is already carrying, and a program running as root
+        // has to distrust its environment wherever its image happens to live.
+        let mut inner = a_process_already_setuid_root();
+        assert!(inner.apply_exec_ids(0o0755, ROOT_UID, ROOT_UID, false));
+        assert_eq!(inner.credentials.euid, ROOT_UID);
+    }
+
+    #[test]
+    fn the_mount_and_no_new_privs_are_two_separate_gates() {
+        // Either one refusing is enough, and neither is the other: a table,
+        // so that a rewrite collapsing them into one condition fails here by
+        // name rather than in whichever of the two cases it got wrong.
+        for (may_suid, no_new_privs, honoured) in [
+            (true, false, true),
+            (false, false, false),
+            (true, true, false),
+            (false, true, false),
+        ] {
+            let mut inner = a_process_about_to_exec();
+            inner.no_new_privs = no_new_privs;
+            inner.apply_exec_ids(0o4755, ROOT_UID, ROOT_UID, may_suid);
+            let got = inner.credentials.euid == ROOT_UID;
+            assert_eq!(
+                got, honoured,
+                "may_suid={} no_new_privs={}: euid ended {}",
+                may_suid, no_new_privs, inner.credentials.euid
+            );
+        }
     }
 
     #[test]
@@ -3984,7 +4104,7 @@ mod exec_reset_tests {
         // exactly the same privilege -- and can trust the caller's
         // LD_PRELOAD exactly as little.
         let mut inner = a_process_already_setuid_root();
-        assert!(inner.apply_exec_ids(0o0755, ROOT_UID, ROOT_UID));
+        assert!(inner.apply_exec_ids_from_a_normal_mount(0o0755, ROOT_UID, ROOT_UID));
         assert_eq!(inner.credentials.euid, ROOT_UID);
         assert_eq!(inner.credentials.ruid, 1000);
     }
@@ -3998,7 +4118,7 @@ mod exec_reset_tests {
         let mut inner = a_process_about_to_exec();
         inner.credentials.egid = 0;
         inner.credentials.sgid = 0;
-        assert!(inner.apply_exec_ids(0o0755, ROOT_UID, ROOT_UID));
+        assert!(inner.apply_exec_ids_from_a_normal_mount(0o0755, ROOT_UID, ROOT_UID));
         assert_eq!(inner.credentials.egid, 0);
         assert_eq!(inner.credentials.rgid, 1000);
     }
@@ -4013,7 +4133,7 @@ mod exec_reset_tests {
         // sandbox can exec without granting anything.
         let mut inner = a_process_already_setuid_root();
         inner.no_new_privs = true;
-        assert!(inner.apply_exec_ids(0o6755, 1000, 1000));
+        assert!(inner.apply_exec_ids_from_a_normal_mount(0o6755, 1000, 1000));
         // The bits were still not honoured: the image asked for uid 1000 and
         // got nothing, which is the whole of what no_new_privs promises.
         assert_eq!(inner.credentials.euid, ROOT_UID);
@@ -4032,7 +4152,7 @@ mod exec_reset_tests {
         let mut inner = a_process_about_to_exec();
         inner.credentials.euid = ROOT_UID;
         inner.credentials.suid = ROOT_UID;
-        assert!(inner.apply_exec_ids(0o4755, 1000, ROOT_UID));
+        assert!(inner.apply_exec_ids_from_a_normal_mount(0o4755, 1000, ROOT_UID));
         assert_eq!(inner.credentials.euid, 1000);
         assert_eq!(inner.credentials.ruid, 1000);
         assert_eq!(inner.credentials.egid, inner.credentials.rgid);
@@ -4046,7 +4166,7 @@ mod exec_reset_tests {
         // move a process's effective group for a file that never claimed to
         // be a set-group-ID program at all.
         let mut inner = a_process_about_to_exec();
-        assert!(!inner.apply_exec_ids(0o2744, ROOT_UID, ROOT_UID));
+        assert!(!inner.apply_exec_ids_from_a_normal_mount(0o2744, ROOT_UID, ROOT_UID));
         assert_eq!(inner.credentials.egid, 1000);
         assert_eq!(inner.credentials.sgid, 1000);
     }
@@ -4056,7 +4176,7 @@ mod exec_reset_tests {
         // The other side of the line above, so that the test pair pins the
         // rule and not just one of its answers.
         let mut inner = a_process_about_to_exec();
-        assert!(inner.apply_exec_ids(0o2754, ROOT_UID, ROOT_UID));
+        assert!(inner.apply_exec_ids_from_a_normal_mount(0o2754, ROOT_UID, ROOT_UID));
         assert_eq!(inner.credentials.egid, ROOT_UID);
         assert_eq!(inner.credentials.sgid, ROOT_UID);
     }
@@ -4072,7 +4192,7 @@ mod exec_reset_tests {
         inner.credentials.egid = ROOT_UID;
         inner.credentials.sgid = ROOT_UID;
         inner.credentials.groups = vec![1000];
-        assert!(!inner.apply_exec_ids(0o2754, ROOT_UID, 1000));
+        assert!(!inner.apply_exec_ids_from_a_normal_mount(0o2754, ROOT_UID, 1000));
         assert_eq!(inner.credentials.egid, 1000);
     }
 
@@ -4087,7 +4207,7 @@ mod exec_reset_tests {
         inner.credentials.egid = ROOT_UID;
         inner.credentials.sgid = ROOT_UID;
         inner.credentials.groups = vec![ROOT_UID];
-        assert!(inner.apply_exec_ids(0o2754, ROOT_UID, 1000));
+        assert!(inner.apply_exec_ids_from_a_normal_mount(0o2754, ROOT_UID, 1000));
         assert_eq!(inner.credentials.egid, 1000);
     }
 
@@ -4098,7 +4218,7 @@ mod exec_reset_tests {
         // here puts the whole system in secure mode, which drops LD_PRELOAD
         // everywhere and makes GLib refuse to autolaunch a session bus.
         let mut inner = LinuxProcessInner::default();
-        assert!(!inner.apply_exec_ids(0o0755, ROOT_UID, ROOT_UID));
+        assert!(!inner.apply_exec_ids_from_a_normal_mount(0o0755, ROOT_UID, ROOT_UID));
     }
 
     // --- The aux-vector identity block --------------------------------------
@@ -4242,7 +4362,7 @@ mod sugid_tests {
         // address space away -- so the doubt goes with it.
         let mut inner = LinuxProcessInner::default();
         inner.sugid = true;
-        assert!(!inner.apply_exec_ids(0o0755, ROOT_UID, ROOT_UID));
+        assert!(!inner.apply_exec_ids_from_a_normal_mount(0o0755, ROOT_UID, ROOT_UID));
         assert!(!inner.sugid);
     }
 
@@ -4255,7 +4375,7 @@ mod sugid_tests {
         let mut inner = LinuxProcessInner::default();
         inner.credentials.ruid = 1000;
         inner.sugid = false;
-        assert!(inner.apply_exec_ids(0o0755, ROOT_UID, ROOT_UID));
+        assert!(inner.apply_exec_ids_from_a_normal_mount(0o0755, ROOT_UID, ROOT_UID));
         assert!(inner.sugid);
     }
 
@@ -4270,7 +4390,7 @@ mod sugid_tests {
         inner.credentials.sgid = 1000;
         inner.credentials.groups = vec![1000];
         assert!(!inner.sugid);
-        assert!(inner.apply_exec_ids(0o4755, ROOT_UID, 1000));
+        assert!(inner.apply_exec_ids_from_a_normal_mount(0o4755, ROOT_UID, 1000));
         assert!(inner.sugid);
     }
 }
@@ -5247,6 +5367,142 @@ mod signal_send_effect_tests {
         let mut inner = LinuxProcessInner::default();
         assert!(!inner.leave_stop(true));
         assert!(!inner.job_continued_pending);
+    }
+}
+
+#[cfg(test)]
+mod pending_signal_disposition_tests {
+    //! What `check_signals` does with a pending signal that does NOT wake the
+    //! syscall.
+    //!
+    //! One predicate was answering two questions. "Does this interrupt the
+    //! syscall with EINTR?" and "may this be thrown away?" have the same
+    //! answer for most of the enum and a different one for exactly four
+    //! signals -- the job-control stops -- which is why the difference went
+    //! unnoticed: everything the tests looked at agreed.
+    //!
+    //! The consequence was not subtle. A thread parked in `ppoll`/
+    //! `epoll_wait`/`read` is every idle desktop process, and `check_signals`
+    //! runs on each turn of that loop: a `kill -STOP` made the bit pending
+    //! and the next turn of the wait removed it. `kill -STOP` on anything
+    //! idle did nothing whatsoever, and so did Ctrl-Z on a program blocked in
+    //! a read, and so did the SIGTTIN a background job gets for reading the
+    //! terminal.
+    //!
+    //! Both predicates are checked over a disposition rather than a process,
+    //! which is what lets the two be laid side by side here.
+
+    use super::*;
+    use crate::signal::{SIG_DFL, SIG_IGN};
+    use alloc::vec::Vec;
+    use core::convert::TryFrom;
+
+    /// Some address that is neither `SIG_DFL` (0) nor `SIG_IGN` (1): a
+    /// handler the program installed.
+    const CAUGHT: usize = 0x4000_1000;
+
+    fn every_signal() -> Vec<LinuxSignal> {
+        (1u8..=64)
+            .filter_map(|n| LinuxSignal::try_from(n).ok())
+            .collect()
+    }
+
+    /// The whole finding, in one assertion: the set of signals that neither
+    /// interrupt nor may be discarded is exactly the four stop signals. Empty
+    /// before the split, because one predicate answered both questions.
+    #[test]
+    fn the_two_questions_differ_on_exactly_the_four_stop_signals() {
+        let mut neither: Vec<LinuxSignal> = every_signal()
+            .into_iter()
+            .filter(|&s| !interrupts_syscall(SIG_DFL, s) && !discards_when_pending(SIG_DFL, s))
+            .collect();
+        neither.sort_unstable_by_key(|s| *s as u8);
+        assert_eq!(neither, STOP_SIGNALS.to_vec());
+    }
+
+    /// `kill -STOP` on a process sitting in `poll`. The stop itself happens
+    /// when the syscall returns, in `handle_signal`; what this fixes is the
+    /// bit being gone by then.
+    #[test]
+    fn a_pending_stop_signal_is_not_a_signal_to_throw_away() {
+        for sig in STOP_SIGNALS {
+            assert!(
+                !discards_when_pending(SIG_DFL, sig),
+                "{:?} was discarded while the thread waited",
+                sig
+            );
+        }
+    }
+
+    /// And it still does not raise EINTR, which is the half that was right:
+    /// Linux restarts the syscall around a stop rather than failing it, and
+    /// this kernel has no restart machinery to do that with.
+    #[test]
+    fn a_stop_signal_still_does_not_wake_the_syscall_with_eintr() {
+        for sig in STOP_SIGNALS {
+            assert!(!interrupts_syscall(SIG_DFL, sig), "{:?}", sig);
+        }
+    }
+
+    /// `sig_kernel_ignore()`: these four really are no-ops by default, and
+    /// dropping them is what keeps a blocking wait from re-scanning the same
+    /// stale bit on every wake. SIGCHLD in particular: returning EINTR for it
+    /// is what made a compositor's libinput dispatch fail with "Interrupted
+    /// system call" every time an autostart child exited.
+    #[test]
+    fn the_four_whose_default_is_to_do_nothing_are_still_discarded() {
+        for sig in [
+            LinuxSignal::SIGCHLD,
+            LinuxSignal::SIGURG,
+            LinuxSignal::SIGWINCH,
+            LinuxSignal::SIGCONT,
+        ] {
+            assert!(discards_when_pending(SIG_DFL, sig), "{:?}", sig);
+            assert!(!interrupts_syscall(SIG_DFL, sig), "{:?}", sig);
+        }
+    }
+
+    /// A shell that sets SIGTSTP to `SIG_IGN` so it cannot be suspended means
+    /// it: an explicitly ignored signal is discardable whatever it is.
+    #[test]
+    fn a_signal_the_program_ignores_is_discarded_whatever_it_is() {
+        for sig in every_signal() {
+            assert!(discards_when_pending(SIG_IGN, sig), "{:?}", sig);
+            assert!(!interrupts_syscall(SIG_IGN, sig), "{:?}", sig);
+        }
+    }
+
+    /// A signal with a handler has somewhere to go, so it wakes the syscall
+    /// and is never dropped on the way.
+    #[test]
+    fn a_caught_signal_interrupts_and_is_never_discarded() {
+        for sig in every_signal() {
+            assert!(interrupts_syscall(CAUGHT, sig), "{:?}", sig);
+            assert!(!discards_when_pending(CAUGHT, sig), "{:?}", sig);
+        }
+    }
+
+    /// SIGKILL never reaches the discard at all: it interrupts first, and
+    /// `check_signals` returns EINTR before it gets that far. Its disposition
+    /// cannot be changed (`rt_sigaction` refuses), so `SIG_DFL` is the only
+    /// case there is.
+    #[test]
+    fn a_kill_leaves_the_wait_before_anything_can_drop_it() {
+        assert!(interrupts_syscall(SIG_DFL, LinuxSignal::SIGKILL));
+        assert!(!discards_when_pending(SIG_DFL, LinuxSignal::SIGKILL));
+    }
+
+    /// The two lists are near-complements and were treated as exact ones.
+    #[test]
+    fn the_ignore_list_and_the_interrupt_list_are_not_complements() {
+        for sig in every_signal() {
+            if signal_default_action_ignores(sig) {
+                assert!(!signal_default_action_interrupts(sig), "{:?}", sig);
+            }
+        }
+        // ... and four signals are in neither.
+        assert!(!signal_default_action_ignores(LinuxSignal::SIGSTOP));
+        assert!(!signal_default_action_interrupts(LinuxSignal::SIGSTOP));
     }
 }
 

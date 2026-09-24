@@ -671,7 +671,10 @@ fn a_writer_that_downgrades_keeps_the_lock_the_whole_way() {
         let r = w.downgrade();
         assert_eq!(l.raw_state(), READER, "the writer bit had to go, alone");
         assert_eq!(*r, 8, "the downgrade read a value the writer never wrote");
-        assert!(l.try_read().is_some(), "a downgrade opens the door to readers");
+        assert!(
+            l.try_read().is_some(),
+            "a downgrade opens the door to readers"
+        );
         assert!(l.try_write().is_none(), "and keeps it shut to writers");
         drop(r);
         assert_eq!(l.raw_state(), 0);

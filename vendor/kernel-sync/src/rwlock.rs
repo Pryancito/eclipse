@@ -945,4 +945,3 @@ mod spin_discipline_tests {
         crate::deadlock::set_deadlock_spins(0);
     }
 }
-

@@ -17,6 +17,24 @@ use numeric_enum_macro::numeric_enum;
 use zircon_object::object::KernelObject;
 use zircon_object::task::{Thread, ROOT_JOB};
 
+/// The `sigsetsize` every syscall that takes a `sigset_t` from userspace
+/// carries, and what it must be.
+///
+/// The word is the caller telling the kernel how wide its `sigset_t` is, and
+/// the kernel refusing any other width is how the two stay in step: a libc
+/// built against a different `_NSIG` does not get eight bytes read out of a
+/// four-byte object, it gets `EINVAL`.
+///
+/// It was asked in six places in this file and in `install_temp_sigmask`, all
+/// spelled out by hand -- and in `signalfd4`, the eighth caller, not at all.
+/// One function, so the next one to arrive cannot forget.
+pub(crate) fn check_sigsetsize(sigsetsize: usize) -> Result<(), LxError> {
+    if sigsetsize != core::mem::size_of::<Sigset>() {
+        return Err(LxError::EINVAL);
+    }
+    Ok(())
+}
+
 /// The arch-independent 12-byte prefix every `siginfo_t` layout starts with
 /// (`signo`, `errno`, `code`). `rt_sigqueueinfo` reads only this much: the
 /// permission rule is decided on `si_code` alone, and the union payload cannot
@@ -230,10 +248,8 @@ impl Syscall<'_> {
             sigsetsize,
             self.thread.id()
         );
-        if sigsetsize != core::mem::size_of::<Sigset>()
-            || signal == Signal::SIGKILL
-            || signal == Signal::SIGSTOP
-        {
+        check_sigsetsize(sigsetsize)?;
+        if signal == Signal::SIGKILL || signal == Signal::SIGSTOP {
             return Err(LxError::EINVAL);
         }
         let proc = self.linux_process();
@@ -278,9 +294,7 @@ impl Syscall<'_> {
             sigsetsize,
             self.thread.id()
         );
-        if sigsetsize != core::mem::size_of::<Sigset>() {
-            return Err(LxError::EINVAL);
-        }
+        check_sigsetsize(sigsetsize)?;
         let old = self.thread.lock_linux().signal_mask();
         commit_and_report_old(old, &mut oldset, || {
             if set.is_null() {
@@ -555,9 +569,7 @@ impl Syscall<'_> {
         mask: UserInPtr<Sigset>,
         sigsetsize: usize,
     ) -> SysResult {
-        if sigsetsize != core::mem::size_of::<Sigset>() {
-            return Err(LxError::EINVAL);
-        }
+        check_sigsetsize(sigsetsize)?;
         let newmask = mask.read()?;
         info!(
             "rt_sigsuspend: mask={:#x}, thread={}",
@@ -600,9 +612,7 @@ impl Syscall<'_> {
     /// Examine the set of signals that are pending for delivery to the calling
     /// thread — raised while blocked and not yet delivered (see sigpending(2)).
     pub fn sys_rt_sigpending(&self, mut set: UserOutPtr<Sigset>, sigsetsize: usize) -> SysResult {
-        if sigsetsize != core::mem::size_of::<Sigset>() {
-            return Err(LxError::EINVAL);
-        }
+        check_sigsetsize(sigsetsize)?;
         let thread = self.thread.lock_linux();
         // Pending here means "sent but withheld by the mask": what is both in
         // the undelivered set and currently blocked. Unblocked entries are on
@@ -704,9 +714,7 @@ impl Syscall<'_> {
         timeout: UserInPtr<TimeSpec>,
         sigsetsize: usize,
     ) -> SysResult {
-        if sigsetsize != core::mem::size_of::<Sigset>() {
-            return Err(LxError::EINVAL);
-        }
+        check_sigsetsize(sigsetsize)?;
         let mut waitset = set.read()?;
         // SIGKILL/SIGSTOP can never be caught or waited for.
         waitset.remove(Signal::SIGKILL);
@@ -777,9 +785,7 @@ impl Syscall<'_> {
         if sigmask.is_null() {
             return Ok(None);
         }
-        if sigsetsize != core::mem::size_of::<Sigset>() {
-            return Err(LxError::EINVAL);
-        }
+        check_sigsetsize(sigsetsize)?;
         let newmask = sigmask.read()?;
         let thread = alloc::sync::Arc::clone(self.thread);
         let old = {
@@ -856,6 +862,31 @@ mod signal_tests {
         // cannot change which process is named.
         assert_eq!(pid_arg(0xdead_beef_0000_0001u64 as isize), 1);
         assert_eq!(pid_arg(0x0000_0001_0000_002au64 as isize), 42);
+    }
+
+    // ---- how wide the caller says its sigset_t is --------------------------
+
+    /// The width every syscall that takes a `sigset_t` demands. It is the one
+    /// thing that keeps a libc built against a different `_NSIG` from having
+    /// eight bytes read out of a four-byte object -- and `signalfd4`, the
+    /// eighth caller, was not asking: it named the argument `_sizemask` and
+    /// read eight bytes whatever the caller said.
+    #[test]
+    fn the_only_sigset_width_this_kernel_takes_is_its_own() {
+        assert_eq!(check_sigsetsize(8), Ok(()));
+        assert_eq!(core::mem::size_of::<Sigset>(), 8);
+    }
+
+    #[test]
+    fn any_other_width_is_einval() {
+        for n in [0usize, 1, 4, 7, 9, 16, 128, usize::MAX] {
+            assert_eq!(
+                check_sigsetsize(n),
+                Err(LxError::EINVAL),
+                "sigsetsize={}",
+                n
+            );
+        }
     }
 
     #[test]
