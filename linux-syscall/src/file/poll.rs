@@ -15,6 +15,8 @@ use linux_object::fs::{FileDesc, PollEvents};
 use linux_object::signal::Sigset;
 use linux_object::time::*;
 
+use super::fd::{anon_fd_flags, ANON_CLOEXEC};
+
 /// Monotonic time since boot — must match `timer::timer_set` deadlines (not wall clock).
 fn mono_now() -> Duration {
     timer::timer_now()
@@ -133,6 +135,24 @@ const EP_MAX_EVENTS: usize = (i32::MAX as usize) / core::mem::size_of::<EpollEve
 fn epoll_maxevents(raw: usize) -> Result<usize, LxError> {
     let n = raw as u32 as i32;
     if n <= 0 || n as usize > EP_MAX_EVENTS {
+        return Err(LxError::EINVAL);
+    }
+    Ok(n as usize)
+}
+
+/// `epoll_create(2)`'s `size`, which is obsolete and must still be positive.
+///
+/// The argument has been ignored since Linux 2.6.8 -- it used to size the
+/// interest list -- but `ep_alloc` still rejects a non-positive one, so
+/// `epoll_create(0)` is `EINVAL` on every Linux there is. Here it was not
+/// read at all, which made this kernel the one place that accepted it.
+///
+/// `size` arrives as a machine word and the syscall's parameter is an `int`,
+/// so it is narrowed the same way `epoll_maxevents` narrows `maxevents`:
+/// `epoll_create(-1)` is a negative `int`, not four billion.
+fn epoll_create_size(raw: usize) -> Result<usize, LxError> {
+    let n = raw as u32 as i32;
+    if n <= 0 {
         return Err(LxError::EINVAL);
     }
     Ok(n as usize)
@@ -843,8 +863,10 @@ impl Syscall<'_> {
     /// creates an epoll instance
     pub fn sys_epoll_create1(&self, flags: usize) -> SysResult {
         info!("epoll_create1: flags={:#x}", flags);
+        // `EPOLL_CLOEXEC` is the only flag there is.
+        let flags = anon_fd_flags(flags, ANON_CLOEXEC)?;
         let proc = self.linux_process();
-        let epoll = Epoll::new(OpenFlags::from_bits_truncate(flags));
+        let epoll = Epoll::new(flags);
         let fd = proc.add_file(epoll)?;
         Ok(fd.into())
     }
@@ -852,6 +874,7 @@ impl Syscall<'_> {
     /// opens an epoll file descriptor
     pub fn sys_epoll_create(&self, size: usize) -> SysResult {
         info!("epoll_create: size={}", size);
+        epoll_create_size(size)?;
         self.sys_epoll_create1(0)
     }
 
@@ -1453,5 +1476,41 @@ mod poll_tests {
             Some(LxError::EINVAL)
         );
         assert!(FdSet::new(user_fdset(&mut words), MAX_SELECT_NFDS).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod epoll_create_tests {
+    //! `epoll_create(2)`'s obsolete `size`, and the reason an obsolete
+    //! argument still has to be read.
+
+    use super::*;
+
+    /// Linux has rejected a non-positive `size` since before it stopped
+    /// using the value, so `epoll_create(0)` is EINVAL everywhere. Here the
+    /// argument was not looked at, which made this the one kernel where a
+    /// program testing its own error handling got an fd back.
+    #[test]
+    fn a_size_that_is_not_positive_is_refused() {
+        assert_eq!(epoll_create_size(0), Err(LxError::EINVAL));
+        assert_eq!(epoll_create_size(1), Ok(1));
+        assert_eq!(epoll_create_size(1024), Ok(1024));
+    }
+
+    /// The syscall's parameter is an `int`, so the machine word is narrowed
+    /// before it is judged — the same narrowing `epoll_maxevents` does.
+    /// Read as a `usize`, `epoll_create(-1)` is four billion and passes.
+    #[test]
+    fn a_negative_size_is_negative_and_not_four_billion() {
+        for raw in [
+            usize::MAX,
+            (-1i32) as u32 as usize,
+            (i32::MIN as i64) as u64 as usize,
+        ] {
+            assert_eq!(epoll_create_size(raw), Err(LxError::EINVAL), "{:#x}", raw);
+        }
+        // The high half of the word is not part of the argument: a value
+        // whose low 32 bits are positive is positive.
+        assert_eq!(epoll_create_size(0x1_0000_0001), Ok(1));
     }
 }
