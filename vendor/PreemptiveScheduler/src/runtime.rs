@@ -24,6 +24,13 @@ pub(crate) fn executor_ready_mask() -> u64 {
     EXECUTOR_READY.load(Ordering::Acquire)
 }
 
+/// Set the ready mask outright, for the grace-period tests in `executor`,
+/// which have to stand in for CPUs this host does not have.
+#[cfg(test)]
+pub(crate) fn set_executor_ready_mask_for_test(mask: u64) -> u64 {
+    EXECUTOR_READY.swap(mask, Ordering::SeqCst)
+}
+
 #[inline]
 pub(crate) fn is_executor_ready(cpu: usize) -> bool {
     cpu < 64 && (executor_ready_mask() & (1u64 << cpu)) != 0

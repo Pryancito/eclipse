@@ -1220,6 +1220,38 @@ impl Executor {
                         }
                     }
                     debug!("no other tasks, wait for interrupt");
+                    // About to halt with an empty run queue: a quiescent
+                    // point for the retired-stack grace period, and the
+                    // ONLY one an idle CPU ever reaches.
+                    //
+                    // `note_cpu_quiescent` was called from three places, all
+                    // of them in `run_until_idle`'s loop — and this branch
+                    // does not go back there. `sched_yield` below covers the
+                    // weak-executor case, but a CPU whose queue is drained,
+                    // whose steal scan found nothing and whose runtime holds
+                    // no weak executor halts HERE and stays inside
+                    // `Executor::run` until work arrives. It is a perfectly
+                    // ordinary state on a desktop with more cores than
+                    // threads, and while a CPU is in it, its bit in every
+                    // retired block's `pending_cpus` never clears. Those
+                    // blocks then sit in the 256-slot table for good, and once
+                    // it is full every later freed stack is leaked whole
+                    // (~2.6 MiB each, `[stack-retire] retired-stack table
+                    // full`) — on a workload that frees stacks in bursts
+                    // (labwc under GL=1 spawns and kills 30+ threads at a
+                    // time, see `STACK_POOL_CAP`).
+                    //
+                    // Sound, not a relaxation: what the grace period is
+                    // protecting against is a CPU still executing on, or
+                    // about to resume, a frame parked on the retired block.
+                    // This CPU is executing on its OWN executor's stack and
+                    // the only frame it will resume is its own, on the
+                    // instruction after the halt. A parked executor frame is
+                    // only ever resumed by the `switch` in `run_until_idle`,
+                    // which this CPU has left. "Reached the runtime stack" is
+                    // a sufficient condition for quiescence, not the
+                    // necessary one.
+                    note_cpu_quiescent(crate::arch::cpu_id() as usize);
                     // Halt protocol vs lost wakes. Publish "sleeping" FIRST,
                     // then re-check the queue with IRQs off, and only then
                     // halt (`wait_for_interrupt` is an atomic sti;hlt — an IPI
@@ -1530,4 +1562,320 @@ pub unsafe fn push_stack<T>(stack_top: usize, val: T) -> usize {
     let stack_top = (stack_top as *mut T).sub(1);
     *stack_top = val;
     stack_top as _
+}
+
+/// The SMP grace period that decides when a freed coroutine stack may be
+/// handed out again — which had no tests.
+///
+/// Getting it wrong one period early is the `[double-alloc]` / `[null-exec]`
+/// corruption this whole file is built around: a block returned while an SMP
+/// sibling could still resume a parked frame onto it, and then zero-filled by
+/// its next consumer. Getting it wrong the other way leaks 2.6 MiB a time.
+///
+/// These drive the table directly rather than through `Executor::drop`, which
+/// needs a real coroutine stack; the decisions live in
+/// [`retire_stack_after_grace`] and [`observe_cpu_quiescent_locked`], and they
+/// are what is exercised here. They share the module's globals, so they lock.
+#[cfg(test)]
+mod grace_period_tests {
+    use super::*;
+    use core::sync::atomic::Ordering;
+
+    fn test_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Empty every global these tests read, and hand back the ready mask that
+    /// was there. The host's `cpu_id()` is hardwired to 0, so "us" is CPU 0.
+    struct Fresh {
+        _guard: std::sync::MutexGuard<'static, ()>,
+        saved_ready: u64,
+    }
+
+    impl Drop for Fresh {
+        fn drop(&mut self) {
+            crate::runtime::set_executor_ready_mask_for_test(self.saved_ready);
+            *RETIRED_STACKS.lock() = [RetiredStack::EMPTY; RETIRED_STACKS_CAP];
+            for slot in STACK_POOL.iter() {
+                slot.store(0, Ordering::SeqCst);
+            }
+            STACK_OVERFLOW.lock().clear();
+        }
+    }
+
+    fn fresh(ready: u64) -> Fresh {
+        let guard = test_lock();
+        let saved_ready = crate::runtime::set_executor_ready_mask_for_test(ready);
+        *RETIRED_STACKS.lock() = [RetiredStack::EMPTY; RETIRED_STACKS_CAP];
+        for slot in STACK_POOL.iter() {
+            slot.store(0, Ordering::SeqCst);
+        }
+        STACK_OVERFLOW.lock().clear();
+        Fresh {
+            _guard: guard,
+            saved_ready,
+        }
+    }
+
+    /// A hard-guarded block reaches the pool; anything else is leaked. So
+    /// "was it reclaimed" is "is it in the pool".
+    fn pooled(base: usize) -> bool {
+        STACK_POOL.iter().any(|s| s.load(Ordering::SeqCst) == base)
+            || STACK_OVERFLOW.lock().contains(&base)
+    }
+
+    fn parked(base: usize) -> Option<u64> {
+        RETIRED_STACKS
+            .lock()
+            .iter()
+            .find(|s| s.alloc_base == base)
+            .map(|s| s.pending_cpus)
+    }
+
+    fn retire(base: usize) {
+        retire_stack_after_grace(base, true, true, false);
+    }
+
+    #[test]
+    fn on_a_uniprocessor_a_freed_stack_is_reusable_at_once() {
+        // Only CPU 0 has an executor, and CPU 0 is the one retiring: there is
+        // no sibling that could hold a parked frame, so waiting for one would
+        // be waiting forever.
+        let _f = fresh(0b1);
+        retire(0x1000_0000);
+        assert!(pooled(0x1000_0000));
+        assert_eq!(
+            parked(0x1000_0000),
+            None,
+            "nothing to wait for, yet it waited"
+        );
+    }
+
+    #[test]
+    fn a_stack_is_held_until_every_other_ready_cpu_has_passed_through() {
+        let _f = fresh(0b1011); // CPUs 0, 1 and 3 have executors; we are 0.
+        retire(0x2000_0000);
+        assert_eq!(
+            parked(0x2000_0000),
+            Some(0b1010),
+            "the retiring CPU waited on itself"
+        );
+        assert!(!pooled(0x2000_0000));
+
+        note_cpu_quiescent(1);
+        assert_eq!(parked(0x2000_0000), Some(0b1000));
+        assert!(
+            !pooled(0x2000_0000),
+            "reclaimed with CPU 3 still unaccounted for"
+        );
+
+        note_cpu_quiescent(3);
+        assert_eq!(parked(0x2000_0000), None);
+        assert!(pooled(0x2000_0000));
+    }
+
+    #[test]
+    fn a_cpu_reporting_twice_does_not_count_twice() {
+        let _f = fresh(0b0111);
+        retire(0x3000_0000);
+        assert_eq!(parked(0x3000_0000), Some(0b0110));
+        note_cpu_quiescent(1);
+        note_cpu_quiescent(1);
+        note_cpu_quiescent(1);
+        assert_eq!(
+            parked(0x3000_0000),
+            Some(0b0100),
+            "a repeat report cleared CPU 2"
+        );
+        assert!(!pooled(0x3000_0000));
+    }
+
+    #[test]
+    fn a_cpu_that_appears_after_the_retirement_is_not_waited_on() {
+        // The mask is sampled at retirement on purpose: a CPU whose executor
+        // did not exist when the block was freed cannot hold a frame parked on
+        // it, so making the block wait for it would be a leak, not caution.
+        let _f = fresh(0b0011);
+        retire(0x4000_0000);
+        assert_eq!(parked(0x4000_0000), Some(0b0010));
+        crate::runtime::set_executor_ready_mask_for_test(0b1111);
+        note_cpu_quiescent(1);
+        assert!(pooled(0x4000_0000));
+    }
+
+    #[test]
+    fn an_id_past_the_mask_reports_for_nobody() {
+        let _f = fresh(0b0011);
+        // Waited on by the boot CPU and CPU 2 — the shape a block retired by
+        // CPU 1 has. `1u64 << 64` is not a no-op: on x86 the shift amount
+        // wraps, so id 64 would report for CPU 0 and id 127 for CPU 63. Every
+        // other per-CPU accessor in this crate refuses such an id.
+        park_as(0x5000_0000, 0b0101);
+        note_cpu_quiescent(64);
+        note_cpu_quiescent(127);
+        note_cpu_quiescent(usize::MAX);
+        assert_eq!(
+            parked(0x5000_0000),
+            Some(0b0101),
+            "an id with no bit cleared one"
+        );
+        assert!(!pooled(0x5000_0000));
+        note_cpu_quiescent(0);
+        note_cpu_quiescent(2);
+        assert!(pooled(0x5000_0000));
+    }
+
+    /// Park a block as if a CPU other than this host's CPU 0 had retired it,
+    /// so the waited-on set can include bit 0 — which is what a real machine
+    /// looks like whenever the retiring CPU is not the boot CPU.
+    fn park_as(base: usize, pending_cpus: u64) {
+        let mut retired = RETIRED_STACKS.lock();
+        let slot = retired
+            .iter_mut()
+            .find(|s| s.alloc_base == 0)
+            .expect("retired table full");
+        *slot = RetiredStack {
+            alloc_base: base,
+            hard_guard_bottom: true,
+            hard_guard_top: true,
+            protected: false,
+            pending_cpus,
+        };
+    }
+
+    #[test]
+    fn each_block_keeps_its_own_count() {
+        let _f = fresh(0b0111);
+        retire(0x6000_0000);
+        note_cpu_quiescent(1);
+        retire(0x6100_0000);
+        // The second block was retired after CPU 1 reported, so it still waits
+        // for both peers; the first waits only for CPU 2.
+        assert_eq!(parked(0x6000_0000), Some(0b0100));
+        assert_eq!(parked(0x6100_0000), Some(0b0110));
+        note_cpu_quiescent(2);
+        assert!(pooled(0x6000_0000));
+        assert_eq!(
+            parked(0x6100_0000),
+            Some(0b0010),
+            "the second block was let go early"
+        );
+        note_cpu_quiescent(1);
+        assert!(pooled(0x6100_0000));
+    }
+
+    #[test]
+    fn a_soft_guarded_block_is_leaked_rather_than_pooled() {
+        // `Executor::new`'s reuse path assumes hard guards are already
+        // installed, and returning the block to the shared buddy arena is the
+        // aliasing the pool exists to prevent — so the only remaining option
+        // is to leak it. What matters here is that it does not reach the pool.
+        let _f = fresh(0b0001);
+        retire_stack_after_grace(0x7000_0000, true, false, false);
+        retire_stack_after_grace(0x7100_0000, false, true, false);
+        assert!(!pooled(0x7000_0000));
+        assert!(!pooled(0x7100_0000));
+        assert_eq!(
+            parked(0x7000_0000),
+            None,
+            "a leaked block still holds a slot"
+        );
+        assert_eq!(parked(0x7100_0000), None);
+    }
+
+    #[test]
+    fn a_quarantined_block_is_unprotected_before_it_is_handed_back() {
+        use core::sync::atomic::AtomicUsize;
+        static UNPROTECTED: AtomicUsize = AtomicUsize::new(0);
+        fn record(usable_base: usize, _size: usize) {
+            UNPROTECTED.store(usable_base, Ordering::SeqCst);
+        }
+        let _f = fresh(0b0011);
+        UNPROTECTED.store(0, Ordering::SeqCst);
+        // SAFETY: the recorder touches no page tables; this is the host.
+        unsafe { set_stack_quarantine_hooks(|_, _| true, record) };
+
+        retire_stack_after_grace(0x8000_0000, true, true, true);
+        assert_eq!(
+            UNPROTECTED.load(Ordering::SeqCst),
+            0,
+            "unprotected before quiescence"
+        );
+        note_cpu_quiescent(1);
+        assert_eq!(
+            UNPROTECTED.load(Ordering::SeqCst),
+            0x8000_0000 + GUARD_SIZE,
+            "a write-protected block went back to the pool still read-only"
+        );
+        assert!(pooled(0x8000_0000));
+
+        *STACK_QUAR_PROTECT.lock() = None;
+        *STACK_QUAR_UNPROTECT.lock() = None;
+    }
+
+    #[test]
+    fn a_full_table_leaks_the_block_rather_than_handing_it_back_early() {
+        let _f = fresh(0b0011);
+        for i in 0..RETIRED_STACKS_CAP {
+            retire(0x9000_0000 + i * ALLOC_SIZE);
+        }
+        assert_eq!(parked(0x9000_0000), Some(0b0010));
+        let overflow = 0x9000_0000 + RETIRED_STACKS_CAP * ALLOC_SIZE;
+        retire(overflow);
+        // No slot, so no way to know when it is safe: the one thing that must
+        // not happen is for it to be reused anyway.
+        assert_eq!(parked(overflow), None);
+        assert!(
+            !pooled(overflow),
+            "a block with nowhere to wait was handed out anyway"
+        );
+    }
+
+    #[test]
+    fn one_peer_that_never_reports_holds_every_block_retired_after_it() {
+        // Why the call site matters as much as the arithmetic. The mask is
+        // sampled once, at retirement, and only a report clears a bit — so a
+        // single ready CPU that never reaches a quiescent point pins every
+        // block retired from then on, until the table is full and the rest
+        // are leaked outright. `Executor::run`'s idle branch is where an idle
+        // CPU sits, and it is why that branch reports before it halts.
+        let _f = fresh(0b0111);
+        for i in 0..8 {
+            retire(0xb000_0000 + i * ALLOC_SIZE);
+        }
+        for _ in 0..4 {
+            note_cpu_quiescent(1);
+        }
+        for i in 0..8 {
+            let base = 0xb000_0000 + i * ALLOC_SIZE;
+            assert_eq!(parked(base), Some(0b0100), "block {}", i);
+            assert!(!pooled(base));
+        }
+        note_cpu_quiescent(2);
+        for i in 0..8 {
+            assert!(pooled(0xb000_0000 + i * ALLOC_SIZE), "block {}", i);
+        }
+    }
+
+    #[test]
+    fn the_pool_falls_back_to_the_retention_list_instead_of_the_heap() {
+        // A coroutine stack block must never reach the shared buddy arena,
+        // which also backs userspace frames. Past `STACK_POOL_CAP` the
+        // overflow list is what keeps it in stack land.
+        let _f = fresh(0b0001);
+        for i in 0..STACK_POOL_CAP + 4 {
+            retire(0xa000_0000 + i * ALLOC_SIZE);
+        }
+        for i in 0..STACK_POOL_CAP + 4 {
+            assert!(pooled(0xa000_0000 + i * ALLOC_SIZE), "block {} was lost", i);
+        }
+        assert_eq!(STACK_OVERFLOW.lock().len(), 4);
+        // And they come back out, pool first then the retention list.
+        let mut seen = 0;
+        while stack_pool_pop().is_some() {
+            seen += 1;
+        }
+        assert_eq!(seen, STACK_POOL_CAP + 4);
+    }
 }
