@@ -22,6 +22,7 @@ pub mod kstats;
 pub mod ksyms;
 pub mod oops_log;
 pub mod phys_watch;
+pub mod rand;
 pub mod timer_waker;
 pub mod user;
 pub mod watchpoint;

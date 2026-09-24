@@ -287,30 +287,15 @@ hal_fn_def! {
 
     /// Random number generator.
     pub mod rand {
-        /// Fill random bytes to the buffer
-        #[allow(unused_variables)]
+        /// Fill random bytes to the buffer.
+        ///
+        /// One source for the whole tree, and the same one on every
+        /// architecture: see [`common::rand`] for what it is made of and what
+        /// it is not. One RDRAND yields 8 bytes; issuing it per *byte* made
+        /// /dev/urandom ~1000 cycles/byte, which stalls library startups that
+        /// read entropy in bulk, so the word is the unit throughout.
         pub fn fill_random(buf: &mut [u8]) {
-            cfg_if! {
-                if #[cfg(target_arch = "x86_64")] {
-                    // One RDRAND yields 8 bytes; issuing it per *byte* made
-                    // /dev/urandom ~1000 cycles/byte, which stalls library
-                    // startups that read entropy in bulk.
-                    for chunk in buf.chunks_mut(8) {
-                        let mut r: u64 = 0;
-                        unsafe { core::arch::x86_64::_rdrand64_step(&mut r) };
-                        chunk.copy_from_slice(&r.to_ne_bytes()[..chunk.len()]);
-                    }
-                } else {
-                    static mut SEED: u64 = 0xdead_beef_cafe_babe;
-                    for x in buf.iter_mut() {
-                        unsafe {
-                            // from musl
-                            SEED = SEED.wrapping_mul(0x5851_f42d_4c95_7f2d);
-                            *x = (SEED >> 33) as u8;
-                        }
-                    }
-                }
-            }
+            common::rand::fill_random(buf)
         }
     }
 
