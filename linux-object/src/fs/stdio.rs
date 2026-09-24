@@ -1255,7 +1255,12 @@ fn kdgkbent_value(keycode: u16, table: u8) -> u16 {
 pub struct Stdin {
     /// Index of the virtual terminal this stdin belongs to.
     vt: usize,
-    buf: Mutex<VecDeque<char>>,
+    /// Bytes a reader may take. **Bytes, not characters**: this is what
+    /// `read(2)` hands over, and the system speaks UTF-8, so a key that is not
+    /// ASCII goes in as the two to four bytes that spell it. The line being
+    /// edited lives in `canon_buf` as `char`s instead, because erasing works
+    /// on characters and not on the bytes they are made of.
+    buf: Mutex<VecDeque<u8>>,
     canon_buf: Mutex<VecDeque<char>>,
     eventbus: Mutex<EventBus>,
     /// Atomic flag set by `push()` so `SerialFuture` can detect new data
@@ -1273,6 +1278,25 @@ pub struct Stdin {
     /// parked, already lowered to what its buffer can take. The wait sees the
     /// queue but not the buffer, so the read leaves the number behind for it.
     read_need: core::sync::atomic::AtomicUsize,
+}
+
+/// Append one character to a reader's queue as the bytes that spell it.
+///
+/// The queue is what `read(2)` hands over, and this system speaks UTF-8, so a
+/// character outside ASCII is two to four bytes there. Casting it to one byte
+/// instead — which is what this did — writes Latin-1 into a UTF-8 world: on the
+/// Spanish layout `ñ` came out as the single byte `0xf1`, which is not valid
+/// UTF-8 at all, and `€` (U+20AC) came out as `0xac`, which is the byte for
+/// `¬`, so two different keys arrived as the same one.
+///
+/// The character is never split: a reader with room for one byte gets that one
+/// byte and the rest on its next read, which is what a byte queue gives for
+/// free and what `n_tty` does too.
+fn push_utf8(queue: &mut VecDeque<u8>, c: char) {
+    let mut buf = [0u8; 4];
+    for &b in c.encode_utf8(&mut buf).as_bytes() {
+        queue.push_back(b);
+    }
 }
 
 impl Stdin {
@@ -1472,7 +1496,7 @@ impl Stdin {
             self.canon_buf.lock().push_back(c);
             self.echo_char(c);
         } else {
-            self.buf.lock().push_back(c);
+            push_utf8(&mut self.buf.lock(), c);
             self.echo_char(c);
             self.wake_readers();
         }
@@ -1677,7 +1701,7 @@ impl Stdin {
                 let empty = canon.is_empty();
                 let mut buf = self.buf.lock();
                 while let Some(ch) = canon.pop_front() {
-                    buf.push_back(ch);
+                    push_utf8(&mut buf, ch);
                 }
                 drop(buf);
                 drop(canon);
@@ -1698,14 +1722,14 @@ impl Stdin {
                     let mut canon = self.canon_buf.lock();
                     let mut buf = self.buf.lock();
                     while let Some(ch) = canon.pop_front() {
-                        buf.push_back(ch);
+                        push_utf8(&mut buf, ch);
                     }
                     self.wake_readers();
                 }
             }
         } else {
             // Raw mode
-            self.buf.lock().push_back(c);
+            push_utf8(&mut self.buf.lock(), c);
             self.echo_char(c);
             // Wake readers
             self.data_ready.store(true, Ordering::Release);
@@ -1726,8 +1750,8 @@ impl Stdin {
         }
     }
 
-    /// pop a char from the Stdin buffer
-    pub fn pop(&self) -> char {
+    /// pop a byte from the Stdin buffer
+    pub fn pop(&self) -> u8 {
         self.flush_ready_flag();
         let mut buf_lock = self.buf.lock();
         let c = buf_lock.pop_front().unwrap();
@@ -1746,7 +1770,7 @@ impl Stdin {
     pub fn push_bytes(&self, bytes: &[u8]) {
         let mut buf = self.buf.lock();
         for &b in bytes {
-            buf.push_back(b as char);
+            buf.push_back(b);
         }
         drop(buf);
         self.data_ready.store(true, Ordering::Release);
@@ -1895,10 +1919,10 @@ impl INode for Stdin {
         self.vtime_deadline_ns.store(0, Ordering::Release);
         let mut read_bytes = 0;
         while read_bytes < limit && !stdin_buf.is_empty() {
-            let ch = stdin_buf.pop_front().unwrap();
-            buf[read_bytes] = ch as u8;
+            let b = stdin_buf.pop_front().unwrap();
+            buf[read_bytes] = b;
             read_bytes += 1;
-            if is_canon && ch == '\n' {
+            if is_canon && b == b'\n' {
                 break;
             }
         }
@@ -2266,8 +2290,17 @@ mod line_discipline_tests {
     }
 
     /// Everything a reader could take right now, leaving the buffer empty.
+    ///
+    /// Decoded back from the bytes the queue holds, so a test may write what
+    /// the user typed and read it back as such; [`drain_bytes`] is for the
+    /// tests that care about the bytes themselves.
     fn drain(s: &Stdin) -> String {
-        let mut out = String::new();
+        String::from_utf8_lossy(&drain_bytes(s)).into_owned()
+    }
+
+    /// The same, as the bytes a `read(2)` would actually hand over.
+    fn drain_bytes(s: &Stdin) -> Vec<u8> {
+        let mut out = Vec::new();
         while s.can_read() {
             out.push(s.pop());
         }
@@ -2302,6 +2335,98 @@ mod line_discipline_tests {
         // And then the whole line at once, newline included.
         assert_eq!(drain(&s), "hola\n");
         assert!(!s.can_read());
+    }
+
+    #[test]
+    fn a_key_that_is_not_ascii_reaches_the_program_as_utf8() {
+        // The queue used to hold `char`s and the read cast each one to a
+        // single byte. On the Spanish layout that made `ñ` (U+00F1) arrive as
+        // the lone byte 0xf1 — Latin-1 in a system that is UTF-8 everywhere
+        // else, and not a valid character at all.
+        let _g = SERIAL.lock();
+        let s = cooked();
+        feed(&s, "ñ\n");
+        assert_eq!(drain_bytes(&s), b"\xc3\xb1\n");
+    }
+
+    #[test]
+    fn two_different_keys_no_longer_arrive_as_the_same_byte() {
+        // `€` is U+20AC and `¬` is U+00AC. Cast to one byte both came out as
+        // 0xac, so AltGr+5 and AltGr+6 on the Spanish layout were the same
+        // key as far as any program could tell.
+        let _g = SERIAL.lock();
+        let s = cooked();
+        feed(&s, "€\n");
+        let euro = drain_bytes(&s);
+        feed(&s, "¬\n");
+        let not = drain_bytes(&s);
+        assert_eq!(euro, "€\n".as_bytes());
+        assert_eq!(not, "¬\n".as_bytes());
+        assert_ne!(euro, not);
+    }
+
+    #[test]
+    fn every_key_the_spanish_layout_can_produce_survives_the_trip() {
+        // The eleven characters outside ASCII that `symbols/es` can reach.
+        let _g = SERIAL.lock();
+        let s = cooked();
+        let keys = "ñÑ¡¿ºª´¨€·¬";
+        feed(&s, keys);
+        s.push('\n');
+        assert_eq!(drain(&s), alloc::format!("{}\n", keys));
+    }
+
+    #[test]
+    fn a_reader_with_room_for_one_byte_gets_the_character_in_pieces() {
+        // `read(fd, buf, 1)` is what `getchar` does. A character may not be
+        // dropped because it does not fit, and it may not be handed over
+        // whole into a buffer that has no room for it.
+        let _g = SERIAL.lock();
+        let s = cooked();
+        feed(&s, "ñ\n");
+        let mut got = Vec::new();
+        for _ in 0..3 {
+            let mut one = [0u8; 1];
+            assert_eq!(s.read_at(0, &mut one), Ok(1));
+            got.push(one[0]);
+        }
+        assert_eq!(got, b"\xc3\xb1\n");
+    }
+
+    #[test]
+    fn erasing_an_accented_letter_takes_the_whole_letter() {
+        // The console edits the pending line as characters, so this already
+        // worked; the test is here because the pseudo-terminal's discipline
+        // is a separate implementation that did not, and the two are supposed
+        // to agree.
+        let _g = SERIAL.lock();
+        let s = cooked();
+        feed(&s, "añ");
+        s.push(DEL);
+        s.push('\n');
+        assert_eq!(drain_bytes(&s), b"a\n");
+    }
+
+    #[test]
+    fn a_line_with_an_accent_comes_back_in_one_read() {
+        // The read stops at the newline that ends the line, and at nothing
+        // else: no byte inside a character may be mistaken for one.
+        let _g = SERIAL.lock();
+        let s = cooked();
+        feed(&s, "añón\n");
+        let mut buf = [0u8; 64];
+        let n = s.read_at(0, &mut buf).unwrap();
+        assert_eq!(&buf[..n], "añón\n".as_bytes());
+    }
+
+    #[test]
+    fn how_many_bytes_are_waiting_is_bytes_and_not_keys() {
+        // `TIOCINQ`/`FIONREAD` answers in bytes, and a reader sizes its
+        // buffer with it.
+        let _g = SERIAL.lock();
+        let s = cooked();
+        feed(&s, "ñ\n");
+        assert_eq!(s.buf.lock().len(), 3);
     }
 
     #[test]
@@ -2758,11 +2883,11 @@ mod line_discipline_tests {
 
     fn drain_vt_out() -> String {
         let s = vt_stdin(VT_OUT);
-        let mut out = String::new();
+        let mut out = Vec::new();
         while s.can_read() {
             out.push(s.pop());
         }
-        out
+        String::from_utf8_lossy(&out).into_owned()
     }
 
     #[test]
