@@ -61,6 +61,160 @@ impl Termios {
     }
 }
 
+/// Index into [`Termios::c_cc`] of the non-canonical read timer, in
+/// deciseconds (`include/uapi/asm-generic/termbits.h`).
+pub const VTIME_CC: usize = 5;
+/// Index into [`Termios::c_cc`] of the non-canonical read minimum, in bytes.
+pub const VMIN_CC: usize = 6;
+/// Index into [`Termios::c_cc`] of the line-kill character (Ctrl-U).
+pub const VKILL_CC: usize = 3;
+
+/// `c_lflag` bit for canonical (line-at-a-time) input.
+pub const L_ICANON: u32 = 0x0002;
+/// `c_lflag` bit: echo input back to the terminal at all.
+pub const L_ECHO: u32 = 0x0008;
+/// `c_lflag` bit: the line-kill character echoes a newline.
+pub const L_ECHOK: u32 = 0x0020;
+/// `c_lflag` bit: echo a newline even when `ECHO` is off.
+pub const L_ECHONL: u32 = 0x0040;
+/// `c_lflag` bit: the line-kill character rubs the line out instead.
+pub const L_ECHOKE: u32 = 0x0800;
+
+/// What a `read` on a terminal in non-canonical mode may do right now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TtyRead {
+    /// Hand back exactly this many bytes. Never zero.
+    Take(usize),
+    /// Come back with nothing: either the caller asked for nothing, or the
+    /// settings say a read with an empty queue is over rather than waiting.
+    Now,
+    /// Not enough yet. Block, or `EAGAIN` on a non-blocking descriptor.
+    Wait,
+}
+
+/// What the line-kill character (Ctrl-U) writes back to the terminal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KillEcho {
+    /// `ECHOKE`: walk the cursor back over the line that was discarded.
+    Rubout,
+    /// `ECHOK`: leave the line on screen and move to the next one.
+    Newline,
+    /// Neither flag: the line goes away with nothing to show for it.
+    Nothing,
+}
+
+impl Termios {
+    /// True when input is delivered a line at a time (`ICANON`).
+    pub fn canonical(&self) -> bool {
+        self.c_lflag & L_ICANON != 0
+    }
+
+    /// `c_cc[VMIN]`: how many bytes a non-canonical read waits for.
+    pub fn vmin(&self) -> u8 {
+        self.c_cc[VMIN_CC]
+    }
+
+    /// `c_cc[VTIME]`: the non-canonical read timer, in deciseconds.
+    pub fn vtime(&self) -> u8 {
+        self.c_cc[VTIME_CC]
+    }
+
+    /// How many bytes must be queued before a non-canonical read of `buf_len`
+    /// can come back on count alone.
+    ///
+    /// A buffer smaller than VMIN lowers the bar to the buffer: waiting for
+    /// more than the caller has room for would never end. The floor of one is
+    /// what makes this a count and not a way out with nothing — a read that
+    /// returns empty is always the timer's doing, never the count's.
+    ///
+    /// This is the number a blocking reader parks on, so it has to be
+    /// available apart from the decision itself: the thing that wakes the
+    /// reader knows what is queued but not what was asked for.
+    pub fn noncanon_need(&self, buf_len: usize) -> usize {
+        (self.vmin() as usize).min(buf_len).max(1)
+    }
+
+    /// The POSIX non-canonical read rule (`termios(3)`, "Canonical and
+    /// noncanonical mode"), with `queued` bytes buffered and room for
+    /// `buf_len`.
+    ///
+    /// `timed_out` says whether the VTIME timer armed for this read has
+    /// already expired. The clock is a parameter and not a call to it on
+    /// purpose: what a terminal read is allowed to do is a rule about four
+    /// numbers, and a rule that has to be asked through a clock can only be
+    /// checked by a test that waits.
+    ///
+    /// The four cases are Linux's `n_tty_read`, where `minimum` is
+    /// `min(nr, MIN_CHAR(tty))` and the timer is `TIME_CHAR(tty)`:
+    ///
+    /// | VMIN | VTIME | when the read comes back |
+    /// | --- | --- | --- |
+    /// | 0 | 0 | at once, with whatever is queued, even nothing |
+    /// | 0 | >0 | on the first byte, or when the timer runs out |
+    /// | >0 | 0 | on the VMIN'th byte, however long that takes |
+    /// | >0 | >0 | on the VMIN'th byte, or when the gap between bytes runs the timer out (never with nothing) |
+    pub fn noncanon_read(&self, queued: usize, buf_len: usize, timed_out: bool) -> TtyRead {
+        // A read that asked for no bytes is over before any of this; it is the
+        // one way out with nothing that does not depend on the settings.
+        if buf_len == 0 {
+            return TtyRead::Now;
+        }
+        let vmin = self.vmin() as usize;
+        let vtime = self.vtime();
+        let need = self.noncanon_need(buf_len);
+        if queued >= need {
+            return TtyRead::Take(queued.min(buf_len));
+        }
+        if vmin == 0 {
+            // No minimum, so nothing queued is an answer: give it now unless a
+            // timer was asked for and has not run out yet.
+            if vtime == 0 || timed_out {
+                return TtyRead::Now;
+            }
+            return TtyRead::Wait;
+        }
+        // VMIN > 0: the read always comes back with at least one byte, so an
+        // empty queue waits however long it takes. VTIME here is the gap
+        // *between* bytes, and its timer only starts once the first one is in.
+        if queued > 0 && vtime > 0 && timed_out {
+            return TtyRead::Take(queued.min(buf_len));
+        }
+        TtyRead::Wait
+    }
+
+    /// What the line-kill character echoes, given `ECHO`, `ECHOKE` and
+    /// `ECHOK`.
+    ///
+    /// `ECHO` gates all three: a program that turned echo off (a password
+    /// prompt) may not have the line it is hiding painted back over the
+    /// screen, even as rubouts. Past that, `ECHOKE` wins over `ECHOK` —
+    /// that is `n_tty`'s order in `eraser()`, and it matters because the
+    /// cooked default has `ECHOK` on and `ECHOKE` off, so the stock answer
+    /// is a newline and not a rubout.
+    pub fn kill_echo(&self) -> KillEcho {
+        if self.c_lflag & L_ECHO == 0 {
+            return KillEcho::Nothing;
+        }
+        if self.c_lflag & L_ECHOKE != 0 {
+            KillEcho::Rubout
+        } else if self.c_lflag & L_ECHOK != 0 {
+            KillEcho::Newline
+        } else {
+            KillEcho::Nothing
+        }
+    }
+
+    /// True when a newline typed in canonical mode is echoed.
+    ///
+    /// `ECHONL` is the one thing a terminal with echo *off* still shows, and
+    /// it exists for exactly one caller: `getpass(3)` clears `ECHO` and sets
+    /// `ECHONL`, so that the Enter that ends a password still moves the
+    /// cursor off the prompt line.
+    pub fn echoes_newline(&self) -> bool {
+        self.c_lflag & L_ECHO != 0 || self.c_lflag & L_ECHONL != 0
+    }
+}
+
 #[cfg(not(target_arch = "mips"))]
 pub const TIOCGPGRP: usize = 0x540F;
 // _IOR('t', 119, int)
@@ -290,4 +444,200 @@ pub struct KbEntry {
     pub kb_table: u8,
     pub kb_index: u8,
     pub kb_value: u16,
+}
+
+#[cfg(test)]
+mod termios_tests {
+    //! The rules a terminal read and a terminal echo follow, asked directly.
+    //!
+    //! There are two line disciplines in this kernel — the console's in
+    //! `stdio.rs` and the pseudo-terminal's in `pty.rs` — and they are separate
+    //! implementations of the same POSIX text. Anything both must agree on
+    //! belongs here, once, where a test can reach it without a terminal.
+    //!
+    //! These functions touch no clock and no queue, so nothing here is timing
+    //! dependent: `timed_out` is the clock's answer handed in as a fact.
+
+    use super::*;
+
+    fn raw(vmin: u8, vtime: u8) -> Termios {
+        let mut t = Termios::default_tty();
+        t.c_lflag &= !L_ICANON;
+        t.c_cc[VMIN_CC] = vmin;
+        t.c_cc[VTIME_CC] = vtime;
+        t
+    }
+
+    #[test]
+    fn every_number_here_is_the_one_in_termbits_h() {
+        // UABI: these are positions in a word and offsets into an array that
+        // userspace fills in, so a wrong one compiles, runs, and answers a
+        // question nobody asked. Written in octal, which is how
+        // `include/uapi/asm-generic/termbits.h` writes them, so the two can be
+        // read side by side.
+        assert_eq!(L_ICANON, 0o000002);
+        assert_eq!(L_ECHO, 0o000010);
+        assert_eq!(L_ECHOK, 0o000040);
+        assert_eq!(L_ECHONL, 0o000100);
+        assert_eq!(L_ECHOKE, 0o004000);
+        assert_eq!(VKILL_CC, 3);
+        assert_eq!(VTIME_CC, 5);
+        assert_eq!(VMIN_CC, 6);
+        // And the five flags are five different bits.
+        let bits = [L_ICANON, L_ECHO, L_ECHOK, L_ECHONL, L_ECHOKE];
+        for (i, a) in bits.iter().enumerate() {
+            for b in &bits[i + 1..] {
+                assert_ne!(a, b);
+            }
+        }
+    }
+
+    #[test]
+    fn the_cooked_default_is_one_byte_and_no_timer() {
+        let t = Termios::default_tty();
+        assert!(t.canonical(), "the stock terminal is line at a time");
+        // Linux INIT_C_CC: VMIN=1, VTIME=0. A raw-mode read on a terminal
+        // nobody reconfigured therefore blocks for one byte, which is what
+        // every `stty raw` without `min`/`time` relies on.
+        assert_eq!(t.vmin(), 1);
+        assert_eq!(t.vtime(), 0);
+    }
+
+    #[test]
+    fn min_zero_time_zero_comes_back_with_nothing_rather_than_waiting() {
+        // The polling read: `stty -icanon min 0 time 0`. This is the one that
+        // must never block, and the one a queue-only implementation gets
+        // wrong, because "no bytes" looks exactly like "not ready yet".
+        let t = raw(0, 0);
+        assert_eq!(t.noncanon_read(0, 64, false), TtyRead::Now);
+        assert_eq!(t.noncanon_read(3, 64, false), TtyRead::Take(3));
+    }
+
+    #[test]
+    fn min_zero_with_a_timer_waits_until_the_timer_runs_out() {
+        let t = raw(0, 2);
+        assert_eq!(t.noncanon_read(0, 64, false), TtyRead::Wait);
+        assert_eq!(
+            t.noncanon_read(0, 64, true),
+            TtyRead::Now,
+            "the timer running out ends the read with nothing"
+        );
+        assert_eq!(
+            t.noncanon_read(1, 64, false),
+            TtyRead::Take(1),
+            "a byte ends it early, timer or no timer"
+        );
+    }
+
+    #[test]
+    fn a_minimum_of_one_waits_for_its_byte_however_long_that_takes() {
+        let t = raw(1, 0);
+        assert_eq!(t.noncanon_read(0, 64, false), TtyRead::Wait);
+        assert_eq!(t.noncanon_read(0, 64, true), TtyRead::Wait);
+        assert_eq!(t.noncanon_read(1, 64, false), TtyRead::Take(1));
+    }
+
+    #[test]
+    fn a_minimum_above_one_holds_the_bytes_back_until_it_is_met() {
+        let t = raw(4, 0);
+        assert_eq!(t.noncanon_read(1, 64, false), TtyRead::Wait);
+        assert_eq!(t.noncanon_read(3, 64, false), TtyRead::Wait);
+        assert_eq!(t.noncanon_read(4, 64, false), TtyRead::Take(4));
+    }
+
+    #[test]
+    fn everything_queued_goes_back_at_once_and_not_just_the_minimum() {
+        // `n_tty_read` copies up to `nr`; VMIN decides *when* the read returns,
+        // not how much it is allowed to carry. Capping at VMIN would leave the
+        // rest queued and make a reader go round again for bytes it had room
+        // for.
+        let t = raw(4, 0);
+        assert_eq!(t.noncanon_read(9, 64, false), TtyRead::Take(9));
+    }
+
+    #[test]
+    fn a_buffer_smaller_than_the_minimum_lowers_the_bar_to_the_buffer() {
+        // Otherwise a `read(fd, buf, 2)` with `min 4` could never return: the
+        // caller cannot take four bytes, so waiting for four is waiting for
+        // ever.
+        let t = raw(4, 0);
+        assert_eq!(t.noncanon_read(2, 2, false), TtyRead::Take(2));
+        assert_eq!(t.noncanon_read(1, 2, false), TtyRead::Wait);
+    }
+
+    #[test]
+    fn asking_for_no_bytes_is_over_before_the_settings_are_consulted() {
+        for (vmin, vtime) in [(0u8, 0u8), (1, 0), (4, 2), (0, 5)] {
+            assert_eq!(
+                raw(vmin, vtime).noncanon_read(7, 0, false),
+                TtyRead::Now,
+                "min {} time {}",
+                vmin,
+                vtime
+            );
+        }
+    }
+
+    #[test]
+    fn with_both_set_the_timer_is_the_gap_between_bytes_and_not_the_wait_for_the_first() {
+        // POSIX: with VMIN > 0 and VTIME > 0 the timer starts after the first
+        // byte arrives, so a read that has nothing yet is not allowed to give
+        // up. Starting it at the read instead would turn every `min 1 time N`
+        // program — the common terminal setting — into one that returns zero
+        // bytes on an idle terminal, which reads as end of file.
+        let t = raw(4, 1);
+        assert_eq!(t.noncanon_read(0, 64, true), TtyRead::Wait);
+        assert_eq!(t.noncanon_read(2, 64, true), TtyRead::Take(2));
+        assert_eq!(t.noncanon_read(2, 64, false), TtyRead::Wait);
+    }
+
+    #[test]
+    fn the_stock_kill_character_echoes_a_newline_and_not_a_rubout() {
+        // ISIG | ICANON | ECHO | ECHOE | ECHOK | IEXTEN: ECHOK is on and
+        // ECHOKE is off, so Ctrl-U on a terminal nobody reconfigured leaves
+        // the killed line on screen and starts a fresh one.
+        assert_eq!(Termios::default_tty().kill_echo(), KillEcho::Newline);
+    }
+
+    #[test]
+    fn echoke_wins_over_echok_when_a_program_asks_for_both() {
+        let mut t = Termios::default_tty();
+        t.c_lflag |= L_ECHOKE;
+        assert_eq!(t.kill_echo(), KillEcho::Rubout);
+    }
+
+    #[test]
+    fn a_program_that_turned_both_kill_flags_off_gets_no_echo_at_all() {
+        let mut t = Termios::default_tty();
+        t.c_lflag &= !(L_ECHOK | L_ECHOKE);
+        assert_eq!(t.kill_echo(), KillEcho::Nothing);
+    }
+
+    #[test]
+    fn echo_off_hides_the_kill_echo_whatever_the_other_two_say() {
+        // A password prompt clears ECHO and leaves ECHOK where it was. Painting
+        // rubouts back over the screen would say how long the secret is.
+        let mut t = Termios::default_tty();
+        t.c_lflag &= !L_ECHO;
+        t.c_lflag |= L_ECHOKE;
+        assert_eq!(t.kill_echo(), KillEcho::Nothing);
+    }
+
+    #[test]
+    fn echonl_is_what_lets_a_password_prompt_end_its_line() {
+        // getpass(3): ECHO off, ECHONL on. Without it the Enter that ends the
+        // password is invisible and whatever prints next lands on the prompt.
+        let mut t = Termios::default_tty();
+        t.c_lflag &= !L_ECHO;
+        assert!(!t.echoes_newline());
+        t.c_lflag |= L_ECHONL;
+        assert!(t.echoes_newline());
+    }
+
+    #[test]
+    fn a_terminal_with_echo_on_shows_the_newline_without_being_asked() {
+        let t = Termios::default_tty();
+        assert_eq!(t.c_lflag & L_ECHONL, 0, "ECHONL is off in the default");
+        assert!(t.echoes_newline());
+    }
 }

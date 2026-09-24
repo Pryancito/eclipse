@@ -22,8 +22,9 @@ use alloc::sync::Arc;
 use core::any::Any;
 use core::future::Future;
 use core::pin::Pin;
-use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use core::task::{Context, Poll};
+use core::time::Duration;
 use kernel_hal::console::ConsoleWinSize;
 use lazy_static::lazy_static;
 use lock::Mutex;
@@ -43,6 +44,7 @@ const ISIG: u32 = 0x0001;
 const ICANON: u32 = 0x0002;
 const ECHO: u32 = 0x0008;
 const ECHOE: u32 = 0x0010;
+const ECHONL: u32 = 0x0040;
 const NOFLSH: u32 = 0x0080;
 const ECHOCTL: u32 = 0x0200;
 const IEXTEN: u32 = 0x8000;
@@ -109,6 +111,14 @@ pub struct Pty {
     /// `TIOCSPTLCK` flag. Stored for `TIOCGPTLCK`-style queries but not enforced
     /// on slave open, so programs that skip `unlockpt(3)` still work.
     locked: AtomicBool,
+    /// Non-canonical `VTIME`: the monotonic deadline (ns) the slave read in
+    /// progress is waiting on. Zero means no timer is running.
+    vtime_deadline_ns: AtomicU64,
+    /// Non-canonical `VMIN`: how many queued bytes would end the slave read
+    /// that parked, already lowered to what its buffer can take. The thing
+    /// that wakes the reader sees the queue but not the buffer, so the read
+    /// leaves the number behind for it.
+    slave_need: AtomicUsize,
 }
 
 impl Pty {
@@ -131,9 +141,73 @@ impl Pty {
     }
 
     /// Slave read side is satisfiable now (data ready, or master closed → EOF).
+    ///
+    /// This is `poll(2)`'s answer, and deliberately not the blocking read's:
+    /// `poll` reports a terminal readable as soon as one byte is queued,
+    /// whatever `VMIN` says, while the read itself may still have to wait for
+    /// more. See [`Pty::slave_read_ready`].
     fn slave_readable(&self) -> bool {
         let inner = self.inner.lock();
         !inner.input.is_empty() || inner.eof_pending || self.master_closed.load(Ordering::Relaxed)
+    }
+
+    /// Whether the *blocking* slave read parked in [`Pty::slave_read`] can now
+    /// make progress.
+    ///
+    /// `File::read` is `loop { read_at; on EAGAIN await async_poll }`, so this
+    /// and `slave_read` have to give the same answer to the same queue. Wiring
+    /// the wait to `slave_readable` instead would spin the CPU between the
+    /// first byte and the `VMIN`th: `read_at` says not yet, the wait says
+    /// ready, round again with nothing changed.
+    fn slave_read_ready(&self) -> bool {
+        let inner = self.inner.lock();
+        if inner.eof_pending || self.master_closed.load(Ordering::Relaxed) {
+            return true;
+        }
+        if inner.termios.canonical() {
+            return !inner.input.is_empty();
+        }
+        if inner.input.len() >= self.slave_need.load(Ordering::Relaxed).max(1) {
+            return true;
+        }
+        drop(inner);
+        // Short of the count, only the VTIME timer can end this wait. It is
+        // only ever armed where returning on it is allowed, so reaching it is
+        // enough on its own.
+        self.vtime_expired()
+    }
+
+    /// True when the `VTIME` timer armed for the slave read in progress has
+    /// run out.
+    fn vtime_expired(&self) -> bool {
+        let dl = self.vtime_deadline_ns.load(Ordering::Acquire);
+        dl != 0 && kernel_hal::timer::timer_now().as_nanos() as u64 >= dl
+    }
+
+    /// Start the `VTIME` timer for a slave read that is about to wait, if it
+    /// asked for one and has not started it already.
+    ///
+    /// With `VMIN > 0` the timer measures the gap *between* bytes, so it does
+    /// not start until the first one is in. Starting it at the read would turn
+    /// every `min 1 time N` program — the ordinary terminal setting — into one
+    /// that comes back empty on an idle terminal, which a reader reads as end
+    /// of file.
+    fn arm_vtime(&self, termios: &Termios, queued: usize) {
+        if termios.vtime() == 0 || (termios.vmin() > 0 && queued == 0) {
+            return;
+        }
+        if self.vtime_deadline_ns.load(Ordering::Acquire) != 0 {
+            return;
+        }
+        let now = kernel_hal::timer::timer_now().as_nanos() as u64;
+        // VTIME is in deciseconds.
+        let deadline = now.saturating_add((termios.vtime() as u64) * 100_000_000);
+        self.vtime_deadline_ns.store(deadline, Ordering::Release);
+    }
+
+    /// Stop the `VTIME` timer: the read it belonged to is over.
+    fn clear_vtime(&self) {
+        self.vtime_deadline_ns.store(0, Ordering::Release);
     }
 
     /// Feed bytes written to the master through the input line discipline.
@@ -149,6 +223,7 @@ impl Pty {
             let lflag = inner.termios.c_lflag;
             let oflag = inner.termios.c_oflag;
             let cc = inner.termios.c_cc;
+            let kill_echo = inner.termios.kill_echo();
             for &b in data {
                 let mut c = b;
                 // Input CR/NL translation.
@@ -340,11 +415,29 @@ impl Pty {
                     } else if cc[VKILL] != 0 && c == cc[VKILL] {
                         let n = inner.canon.len();
                         inner.canon.clear();
-                        if lflag & ECHO != 0 {
-                            for _ in 0..n {
-                                inner.output.extend(b"\x08 \x08");
+                        // ECHOKE rubs the line out, ECHOK leaves it on screen
+                        // and moves to the next one, neither shows anything.
+                        // This end always rubbed out, which is the answer to a
+                        // flag the cooked default does not even set: ECHOK is
+                        // on there and ECHOKE is off, so the stock Ctrl-U is a
+                        // newline. The console's discipline has had the three
+                        // cases since it was written.
+                        match kill_echo {
+                            KillEcho::Rubout => {
+                                for _ in 0..n {
+                                    inner.output.extend(b"\x08 \x08");
+                                }
+                                wake_master = true;
                             }
-                            wake_master = true;
+                            KillEcho::Newline => {
+                                if oflag & OPOST != 0 && oflag & ONLCR != 0 {
+                                    inner.output.extend(b"\r\n");
+                                } else {
+                                    inner.output.push_back(b'\n');
+                                }
+                                wake_master = true;
+                            }
+                            KillEcho::Nothing => {}
                         }
                     } else if cc[VEOF] != 0 && c == cc[VEOF] {
                         // Commit the pending line without a newline; an empty
@@ -462,24 +555,63 @@ impl Pty {
 
     fn slave_read(&self, buf: &mut [u8]) -> Result<usize> {
         let mut inner = self.inner.lock();
-        let canon = inner.termios.c_lflag & ICANON != 0;
+        let canon = inner.termios.canonical();
         if inner.input.is_empty() {
             if inner.eof_pending {
                 inner.eof_pending = false;
+                self.clear_vtime();
                 drop(inner);
                 if !self.slave_readable() {
                     self.slave_bus.lock().clear(Event::READABLE);
                 }
                 return Ok(0); // VEOF on empty line → EOF
             }
-            drop(inner);
             if self.master_closed.load(Ordering::Relaxed) {
+                self.clear_vtime();
+                drop(inner);
                 return Ok(0); // master closed → EOF
             }
+        }
+        // Non-canonical mode: VMIN and VTIME say when a read is over, not
+        // whether the queue happens to be empty. Without them a `min 0` read —
+        // which POSIX says comes back at once, with nothing if there is
+        // nothing — waited for a byte that may never be typed.
+        // A hang-up or a pending EOF ends the wait whatever VMIN says: no more
+        // input is coming, so holding bytes back for a count that can never be
+        // reached would strand them. `slave_read_ready` says the same, and the
+        // two have to agree.
+        let hungup = inner.eof_pending || self.master_closed.load(Ordering::Relaxed);
+        let limit = if canon || hungup {
+            buf.len()
+        } else {
+            let queued = inner.input.len();
+            match inner
+                .termios
+                .noncanon_read(queued, buf.len(), self.vtime_expired())
+            {
+                TtyRead::Take(n) => n,
+                TtyRead::Now => {
+                    self.clear_vtime();
+                    drop(inner);
+                    return Ok(0);
+                }
+                TtyRead::Wait => {
+                    self.slave_need
+                        .store(inner.termios.noncanon_need(buf.len()), Ordering::Relaxed);
+                    self.arm_vtime(&inner.termios, queued);
+                    drop(inner);
+                    return Err(FsError::Again);
+                }
+            }
+        };
+        if inner.input.is_empty() {
+            // Canonical mode only: non-canonical never reaches here empty.
+            drop(inner);
             return Err(FsError::Again);
         }
+        self.clear_vtime();
         let mut n = 0;
-        while n < buf.len() {
+        while n < limit {
             match inner.input.pop_front() {
                 Some(b) => {
                     buf[n] = b;
@@ -671,7 +803,15 @@ impl Pty {
 /// written. Mirrors the console line discipline's `echo_char`.
 fn echo_byte(out: &mut VecDeque<u8>, c: u8, lflag: u32, oflag: u32) -> bool {
     if lflag & ECHO == 0 {
-        return false;
+        // ECHONL is the one thing a terminal with echo off still shows, and it
+        // has one caller: getpass(3) clears ECHO and sets ECHONL so the Enter
+        // that ends a password still moves the cursor off the prompt line.
+        // Without it the password is invisible *and* so is the newline, and
+        // whatever prints next lands on top of the prompt.
+        let echonl = lflag & ICANON != 0 && lflag & ECHONL != 0;
+        if !(c == b'\n' && echonl) {
+            return false;
+        }
     }
     match c {
         b'\n' => {
@@ -735,6 +875,8 @@ pub fn alloc_ptmx() -> Arc<dyn INode> {
         slave_ever_open: AtomicBool::new(false),
         master_closed: AtomicBool::new(false),
         locked: AtomicBool::new(false),
+        vtime_deadline_ns: AtomicU64::new(0),
+        slave_need: AtomicUsize::new(0),
     });
     PTYS.lock().insert(id, pty.clone());
     Arc::new(PtyMaster { pty })
@@ -862,6 +1004,15 @@ struct PtyReadFuture<'a> {
     bus: Arc<Mutex<EventBus>>,
     check: fn(&Pty) -> bool,
     sub_id: Option<u64>,
+    /// Slave reads only: a waker armed for the `VTIME` deadline, so a
+    /// `min 0 time N` read comes back after N deciseconds instead of waiting
+    /// for a byte. Nothing else would wake it — the only other source of
+    /// wakeups on this end is the master writing, which is exactly what the
+    /// timer is there to stop depending on.
+    timer: Option<kernel_hal::timer_waker::TimerWakerSlot>,
+    /// Whether this is the slave's read side, the only one with a line
+    /// discipline and therefore the only one with a timer.
+    slave: bool,
 }
 
 impl Drop for PtyReadFuture<'_> {
@@ -869,6 +1020,7 @@ impl Drop for PtyReadFuture<'_> {
         if let Some(id) = self.sub_id.take() {
             self.bus.lock().unsubscribe(id);
         }
+        kernel_hal::timer_waker::kill_timer_waker(&mut self.timer);
     }
 }
 
@@ -887,6 +1039,7 @@ impl Future for PtyReadFuture<'_> {
             if let Some(id) = this.sub_id.take() {
                 this.bus.lock().unsubscribe(id);
             }
+            kernel_hal::timer_waker::kill_timer_waker(&mut this.timer);
             return Poll::Ready(ready);
         }
         if this.sub_id.is_none() {
@@ -896,6 +1049,17 @@ impl Future for PtyReadFuture<'_> {
                 true
             }));
         }
+        // A VTIME read has a deadline nothing else will announce.
+        if this.slave {
+            let dl = this.pty.vtime_deadline_ns.load(Ordering::Acquire);
+            if dl != 0 {
+                kernel_hal::timer_waker::ensure_timer_waker(
+                    &mut this.timer,
+                    Duration::from_nanos(dl),
+                    cx,
+                );
+            }
+        }
         // Re-check after subscribing: data may have arrived in the window
         // between the first check and the subscription, which would otherwise
         // be a missed wakeup.
@@ -903,6 +1067,7 @@ impl Future for PtyReadFuture<'_> {
             if let Some(id) = this.sub_id.take() {
                 this.bus.lock().unsubscribe(id);
             }
+            kernel_hal::timer_waker::kill_timer_waker(&mut this.timer);
             Poll::Ready(ready)
         } else {
             Poll::Pending
@@ -914,12 +1079,15 @@ fn readable_future<'a>(
     pty: &'a Pty,
     bus: Arc<Mutex<EventBus>>,
     check: fn(&Pty) -> bool,
+    slave: bool,
 ) -> Pin<Box<dyn Future<Output = Result<PollStatus>> + Send + Sync + 'a>> {
     Box::pin(PtyReadFuture {
         pty,
         bus,
         check,
         sub_id: None,
+        timer: None,
+        slave,
     })
 }
 
@@ -941,7 +1109,12 @@ impl INode for PtyMaster {
     fn async_poll<'a>(
         &'a self,
     ) -> Pin<Box<dyn Future<Output = Result<PollStatus>> + Send + Sync + 'a>> {
-        readable_future(&self.pty, self.pty.master_bus.clone(), Pty::master_readable)
+        readable_future(
+            &self.pty,
+            self.pty.master_bus.clone(),
+            Pty::master_readable,
+            false,
+        )
     }
     fn io_control(&self, cmd: u32, data: usize) -> Result<usize> {
         self.pty.ioctl(cmd, data, true)
@@ -972,7 +1145,12 @@ impl INode for PtySlave {
     fn async_poll<'a>(
         &'a self,
     ) -> Pin<Box<dyn Future<Output = Result<PollStatus>> + Send + Sync + 'a>> {
-        readable_future(&self.pty, self.pty.slave_bus.clone(), Pty::slave_readable)
+        readable_future(
+            &self.pty,
+            self.pty.slave_bus.clone(),
+            Pty::slave_read_ready,
+            true,
+        )
     }
     fn io_control(&self, cmd: u32, data: usize) -> Result<usize> {
         self.pty.ioctl(cmd, data, false)
@@ -1081,6 +1259,8 @@ mod tests {
             slave_ever_open: AtomicBool::new(true),
             master_closed: AtomicBool::new(false),
             locked: AtomicBool::new(false),
+            vtime_deadline_ns: AtomicU64::new(0),
+            slave_need: AtomicUsize::new(0),
         };
         p
     }
@@ -1201,6 +1381,207 @@ mod tests {
         assert_eq!(slave_reads(&p), vec!["una\ndos\n"]);
     }
 
+    /// A raw terminal with `min`/`time` set, as `stty -icanon min N time M`
+    /// leaves it.
+    fn raw(p: &Pty, vmin: u8, vtime: u8) {
+        set_flags(p, |t| {
+            t.c_lflag &= !ICANON;
+            t.c_cc[VMIN_CC] = vmin;
+            t.c_cc[VTIME_CC] = vtime;
+        });
+    }
+
+    #[test]
+    fn a_raw_read_with_min_zero_comes_back_empty_instead_of_waiting() {
+        // `stty -icanon min 0 time 0` is the polling read, and POSIX says it
+        // returns at once with whatever is there, including nothing. This end
+        // answered EAGAIN, so a program with a blocking descriptor waited for
+        // a byte that was never going to be typed. It is the same shape as any
+        // "no data" mistaken for "not ready yet": the queue cannot tell the
+        // two apart, only VMIN can.
+        let p = pty();
+        raw(&p, 0, 0);
+        let mut buf = [0u8; 16];
+        assert_eq!(p.slave_read(&mut buf), Ok(0));
+    }
+
+    #[test]
+    fn nothing_queued_and_nothing_asked_for_is_not_a_reason_to_wake_a_reader() {
+        // The floor of one byte on the count a reader parks on. Without it a
+        // terminal with an empty queue reads as ready before any read has
+        // parked, and the blocking loop goes round on nothing.
+        let p = pty();
+        raw(&p, 1, 0);
+        assert!(!p.slave_read_ready());
+        p.master_write(b"a");
+        assert!(p.slave_read_ready());
+    }
+
+    #[test]
+    fn a_raw_read_with_min_zero_still_takes_what_is_queued() {
+        let p = pty();
+        raw(&p, 0, 0);
+        p.master_write(b"abc");
+        let mut buf = [0u8; 16];
+        assert_eq!(p.slave_read(&mut buf), Ok(3));
+        assert_eq!(&buf[..3], b"abc");
+        // And is empty again straight after, without waiting.
+        assert_eq!(p.slave_read(&mut buf), Ok(0));
+    }
+
+    #[test]
+    fn a_raw_read_with_the_default_minimum_waits_for_its_byte() {
+        // VMIN=1 is the cooked default and the one `stty raw` leaves alone, so
+        // this is the behaviour that must not change: an empty queue waits.
+        let p = pty();
+        raw(&p, 1, 0);
+        let mut buf = [0u8; 16];
+        assert_eq!(p.slave_read(&mut buf), Err(FsError::Again));
+        assert!(!p.slave_read_ready());
+    }
+
+    #[test]
+    fn a_raw_read_holds_the_bytes_back_until_the_minimum_is_met() {
+        let p = pty();
+        raw(&p, 4, 0);
+        let mut buf = [0u8; 16];
+        p.master_write(b"ab");
+        assert_eq!(p.slave_read(&mut buf), Err(FsError::Again));
+        p.master_write(b"cd");
+        assert_eq!(p.slave_read(&mut buf), Ok(4));
+        assert_eq!(&buf[..4], b"abcd");
+    }
+
+    #[test]
+    fn the_wait_and_the_read_agree_on_when_a_raw_read_is_over() {
+        // `File::read` is `loop { read_at; on EAGAIN await the wait }`. If the
+        // wait says ready while the read says not yet, the loop spins at full
+        // tilt on a terminal that is merely half way to its minimum.
+        let p = pty();
+        raw(&p, 4, 0);
+        let mut buf = [0u8; 16];
+        for n in 0..4 {
+            assert_eq!(
+                p.slave_read(&mut buf),
+                Err(FsError::Again),
+                "{} byte(s) queued",
+                n
+            );
+            assert!(!p.slave_read_ready(), "{} byte(s) queued", n);
+            p.master_write(b"x");
+        }
+        assert!(p.slave_read_ready());
+        assert_eq!(p.slave_read(&mut buf), Ok(4));
+    }
+
+    #[test]
+    fn a_buffer_smaller_than_the_minimum_does_not_wait_for_ever() {
+        // `read(fd, buf, 2)` under `min 4`: the caller cannot take four bytes,
+        // so a read that insisted on four would never come back. The wait has
+        // to know this too, or the reader sleeps through the wakeup that would
+        // have let it through.
+        let p = pty();
+        raw(&p, 4, 0);
+        let mut buf = [0u8; 2];
+        assert_eq!(p.slave_read(&mut buf), Err(FsError::Again));
+        p.master_write(b"ab");
+        assert!(p.slave_read_ready());
+        assert_eq!(p.slave_read(&mut buf), Ok(2));
+    }
+
+    #[test]
+    fn a_hangup_hands_over_what_is_queued_however_short_of_the_minimum() {
+        // Nothing more is coming, so a count that can never be reached would
+        // strand the bytes that did arrive.
+        let p = pty();
+        raw(&p, 8, 0);
+        p.master_write(b"ab");
+        let mut buf = [0u8; 16];
+        assert_eq!(p.slave_read(&mut buf), Err(FsError::Again));
+        p.master_closed.store(true, Ordering::Relaxed);
+        assert!(p.slave_read_ready());
+        assert_eq!(p.slave_read(&mut buf), Ok(2));
+        assert_eq!(p.slave_read(&mut buf), Ok(0), "and then end of file");
+    }
+
+    #[test]
+    fn min_zero_does_not_swallow_the_end_of_file_of_a_closed_master() {
+        // Both answers are `Ok(0)`, so the only way to tell them apart is what
+        // happens next; an EOF that is really a poll would have the reader
+        // loop for ever on a terminal that is gone.
+        let p = pty();
+        raw(&p, 0, 0);
+        p.master_closed.store(true, Ordering::Relaxed);
+        let mut buf = [0u8; 16];
+        assert_eq!(p.slave_read(&mut buf), Ok(0));
+        assert!(p.slave_read_ready(), "a closed master stays ready");
+    }
+
+    #[test]
+    fn canonical_mode_is_untouched_by_min_and_time() {
+        // VMIN and VTIME have no meaning with ICANON set, and a line
+        // discipline that consulted them anyway would hold back a whole line
+        // that is already complete.
+        let p = pty();
+        set_flags(&p, |t| {
+            t.c_cc[VMIN_CC] = 8;
+            t.c_cc[VTIME_CC] = 3;
+        });
+        p.master_write(b"hi\n");
+        assert_eq!(slave_reads(&p), vec!["hi\n"]);
+    }
+
+    #[test]
+    fn a_raw_read_never_waits_on_a_timer_it_was_not_asked_for() {
+        // The timer is the only thing that can end a wait short of the count,
+        // so arming one where VTIME is zero would make a `min 4 time 0` read
+        // come back with two bytes.
+        let p = pty();
+        raw(&p, 4, 0);
+        let mut buf = [0u8; 16];
+        p.master_write(b"ab");
+        assert_eq!(p.slave_read(&mut buf), Err(FsError::Again));
+        assert_eq!(
+            p.vtime_deadline_ns.load(Ordering::Relaxed),
+            0,
+            "no deadline without VTIME"
+        );
+    }
+
+    #[test]
+    fn the_between_bytes_timer_does_not_start_on_an_empty_queue() {
+        // With VMIN > 0 the timer measures the gap between bytes. Starting it
+        // at the read would let a `min 1 time N` program — the ordinary
+        // terminal setting — come back empty on an idle terminal, which every
+        // reader takes for end of file.
+        let p = pty();
+        raw(&p, 2, 5);
+        let mut buf = [0u8; 16];
+        assert_eq!(p.slave_read(&mut buf), Err(FsError::Again));
+        assert_eq!(p.vtime_deadline_ns.load(Ordering::Relaxed), 0);
+        p.master_write(b"a");
+        assert_eq!(p.slave_read(&mut buf), Err(FsError::Again));
+        assert_ne!(
+            p.vtime_deadline_ns.load(Ordering::Relaxed),
+            0,
+            "the first byte starts it"
+        );
+    }
+
+    #[test]
+    fn a_read_that_came_back_leaves_no_timer_running_behind_it() {
+        // A stale deadline would end the *next* read early, and that read may
+        // be one whose settings forbid coming back empty at all.
+        let p = pty();
+        raw(&p, 0, 5);
+        let mut buf = [0u8; 16];
+        assert_eq!(p.slave_read(&mut buf), Err(FsError::Again));
+        assert_ne!(p.vtime_deadline_ns.load(Ordering::Relaxed), 0);
+        p.master_write(b"a");
+        assert_eq!(p.slave_read(&mut buf), Ok(1));
+        assert_eq!(p.vtime_deadline_ns.load(Ordering::Relaxed), 0);
+    }
+
     #[test]
     fn icrnl_completes_a_line_but_inlcr_and_igncr_do_not() {
         let p = pty();
@@ -1287,14 +1668,101 @@ mod tests {
     }
 
     #[test]
-    fn vkill_clears_the_line_and_rubs_out_every_character() {
+    fn vkill_clears_the_line_and_the_stock_terminal_echoes_a_newline() {
+        // The cooked default is ECHOK without ECHOKE, so Ctrl-U leaves the
+        // killed line on screen and starts a fresh one. This end used to rub
+        // the line out instead, which is ECHOKE's answer to a flag that is
+        // off — a shell that had not touched either flag looked like the
+        // characters were never typed.
         let p = pty();
         p.master_write(b"abcd");
         let _ = master_drain(&p);
         p.master_write(&[CTRL_U]);
-        assert_eq!(master_drain(&p), "\x08 \x08".repeat(4));
+        assert_eq!(master_drain(&p), "\r\n");
         p.master_write(b"\n");
         assert_eq!(slave_reads(&p), vec!["\n"]);
+    }
+
+    #[test]
+    fn vkill_rubs_the_line_out_when_the_program_asks_for_echoke() {
+        let p = pty();
+        set_flags(&p, |t| t.c_lflag |= L_ECHOKE);
+        p.master_write(b"abcd");
+        let _ = master_drain(&p);
+        p.master_write(&[CTRL_U]);
+        assert_eq!(master_drain(&p), "\x08 \x08".repeat(4));
+    }
+
+    #[test]
+    fn vkill_shows_nothing_when_the_program_asks_for_neither_flag() {
+        let p = pty();
+        set_flags(&p, |t| t.c_lflag &= !(L_ECHOK | L_ECHOKE));
+        p.master_write(b"abcd");
+        let _ = master_drain(&p);
+        p.master_write(&[CTRL_U]);
+        assert_eq!(master_drain(&p), "");
+        // The line is still gone, echo or no echo.
+        p.master_write(b"\n");
+        assert_eq!(slave_reads(&p), vec!["\n"]);
+    }
+
+    #[test]
+    fn vkill_paints_nothing_back_over_a_password_prompt() {
+        // ECHO off with ECHOK left where it was: rubouts or a newline would
+        // both say something about a secret nobody may see the shape of.
+        let p = pty();
+        set_flags(&p, |t| t.c_lflag &= !ECHO);
+        p.master_write(b"hunter2");
+        let _ = master_drain(&p);
+        p.master_write(&[CTRL_U]);
+        assert_eq!(master_drain(&p), "");
+    }
+
+    #[test]
+    fn echonl_ends_the_line_of_a_prompt_that_turned_echo_off() {
+        // getpass(3): ECHO off, ECHONL on. The password stays invisible and
+        // the Enter that ends it does not.
+        let p = pty();
+        set_flags(&p, |t| {
+            t.c_lflag &= !ECHO;
+            t.c_lflag |= ECHONL;
+        });
+        p.master_write(b"hunter2\n");
+        assert_eq!(master_drain(&p), "\r\n");
+        assert_eq!(slave_reads(&p), vec!["hunter2\n"]);
+    }
+
+    #[test]
+    fn echonl_shows_the_newline_and_nothing_else() {
+        let p = pty();
+        set_flags(&p, |t| {
+            t.c_lflag &= !ECHO;
+            t.c_lflag |= ECHONL;
+        });
+        p.master_write(b"ab");
+        assert_eq!(master_drain(&p), "", "the characters stay hidden");
+    }
+
+    #[test]
+    fn echo_off_without_echonl_leaves_the_newline_invisible_too() {
+        let p = pty();
+        set_flags(&p, |t| t.c_lflag &= !ECHO);
+        p.master_write(b"hunter2\n");
+        assert_eq!(master_drain(&p), "");
+    }
+
+    #[test]
+    fn echonl_is_a_canonical_mode_flag_and_does_nothing_raw() {
+        // POSIX: "If ICANON is also set". In raw mode the newline is data
+        // like any other byte, and ECHO is what decides whether data is
+        // shown.
+        let p = pty();
+        set_flags(&p, |t| {
+            t.c_lflag &= !(ICANON | ECHO);
+            t.c_lflag |= ECHONL;
+        });
+        p.master_write(b"a\nb");
+        assert_eq!(master_drain(&p), "");
     }
 
     #[test]

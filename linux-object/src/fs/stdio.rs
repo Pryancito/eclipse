@@ -58,13 +58,13 @@ const ICANON: u32 = 0x0002;
 const XCASE: u32 = 0x0004;
 const ECHO: u32 = 0x0008;
 const ECHOE: u32 = 0x0010;
-const ECHOK: u32 = 0x0020;
 const ECHONL: u32 = 0x0040;
+// ECHOK and ECHOKE are `L_ECHOK`/`L_ECHOKE` in `ioctl.rs`, next to the
+// `Termios::kill_echo` both line disciplines ask.
 const NOFLSH: u32 = 0x0080;
 const TOSTOP: u32 = 0x0100;
 const ECHOCTL: u32 = 0x0200;
 const ECHOPRT: u32 = 0x0400;
-const ECHOKE: u32 = 0x0800;
 const FLUSHO: u32 = 0x1000;
 const PENDIN: u32 = 0x4000;
 const IEXTEN: u32 = 0x8000;
@@ -75,8 +75,8 @@ const VQUIT: usize = 1;
 const VERASE: usize = 2;
 const VKILL: usize = 3;
 const VEOF: usize = 4;
-const VTIME: usize = 5;
-const VMIN: usize = 6;
+// VTIME and VMIN are `VTIME_CC`/`VMIN_CC` in `ioctl.rs`, next to the
+// `Termios::noncanon_read` both line disciplines ask.
 const VSWTC: usize = 7;
 const VSTART: usize = 8;
 const VSTOP: usize = 9;
@@ -1269,6 +1269,10 @@ pub struct Stdin {
     /// Non-canonical `VMIN=0,VTIME>0`: monotonic deadline (ns) after which an
     /// empty read returns `Ok(0)`. Zero means no timer armed.
     vtime_deadline_ns: AtomicU64,
+    /// Non-canonical `VMIN`: how many queued bytes would end the read that
+    /// parked, already lowered to what its buffer can take. The wait sees the
+    /// queue but not the buffer, so the read leaves the number behind for it.
+    read_need: core::sync::atomic::AtomicUsize,
 }
 
 impl Stdin {
@@ -1287,29 +1291,76 @@ impl Stdin {
             lnext: core::sync::atomic::AtomicBool::new(false),
             eof_pending: AtomicBool::new(false),
             vtime_deadline_ns: AtomicU64::new(0),
+            read_need: core::sync::atomic::AtomicUsize::new(0),
         }
     }
 
-    /// True when a blocking reader can make progress (data, EOF, or VTIME done).
+    /// True when the blocking reader parked in `read_at` can make progress.
+    ///
+    /// `File::read` is `loop { read_at; on EAGAIN await the wait }`, so this
+    /// and `read_at` have to give the same answer to the same queue. Answering
+    /// `can_read()` here — which is what this did — spun the CPU at full tilt
+    /// between the first byte and the `VMIN`th under `stty -icanon min 4`:
+    /// `read_at` said not yet, the wait said ready, round again with nothing
+    /// changed.
     fn read_ready(&self) -> bool {
+        if self.eof_pending.load(Ordering::Acquire) {
+            return true;
+        }
+        let termios = *tty_termios(self.vt).lock();
+        if termios.canonical() {
+            return self.can_read();
+        }
+        if termios.vmin() == 0 && termios.vtime() == 0 {
+            // A read that may come back with nothing is never not ready.
+            return true;
+        }
+        if self.buf.lock().len() >= self.read_need.load(Ordering::Relaxed).max(1) {
+            return true;
+        }
+        self.vtime_expired()
+    }
+
+    /// `poll(2)`'s answer, which is not the blocking read's.
+    ///
+    /// Linux's `n_tty_poll` asks `input_available_p` for
+    /// `TIME_CHAR ? 0 : MIN_CHAR` bytes: with a timer running, or with no
+    /// minimum, a read is going to come back shortly whatever is queued, so
+    /// the terminal counts as readable. The wait above may not say that — it
+    /// would spin — which is why the two are separate.
+    fn poll_ready(&self) -> bool {
         if self.can_read() || self.eof_pending.load(Ordering::Acquire) {
             return true;
         }
-        let termios = tty_termios(self.vt).lock();
-        let noncanon = termios.c_lflag & ICANON == 0;
-        let vmin = termios.c_cc[VMIN];
-        let vtime = termios.c_cc[VTIME];
-        drop(termios);
-        if noncanon && vmin == 0 {
-            if vtime == 0 {
-                return true;
-            }
-            let dl = self.vtime_deadline_ns.load(Ordering::Acquire);
-            if dl != 0 && kernel_hal::timer::timer_now().as_nanos() as u64 >= dl {
-                return true;
-            }
+        let termios = *tty_termios(self.vt).lock();
+        if termios.canonical() {
+            return false;
         }
-        false
+        termios.vmin() == 0 || termios.vtime() > 0
+    }
+
+    /// True when the `VTIME` timer armed for the read in progress has run out.
+    fn vtime_expired(&self) -> bool {
+        let dl = self.vtime_deadline_ns.load(Ordering::Acquire);
+        dl != 0 && kernel_hal::timer::timer_now().as_nanos() as u64 >= dl
+    }
+
+    /// Start the `VTIME` timer for a read that is about to wait, if it asked
+    /// for one and has not started it already.
+    ///
+    /// With `VMIN > 0` the timer measures the gap *between* bytes, so it does
+    /// not start until the first one is in.
+    fn arm_vtime(&self, termios: &Termios, queued: usize) {
+        if termios.vtime() == 0 || (termios.vmin() > 0 && queued == 0) {
+            return;
+        }
+        if self.vtime_deadline_ns.load(Ordering::Acquire) != 0 {
+            return;
+        }
+        let now = kernel_hal::timer::timer_now().as_nanos() as u64;
+        // VTIME is in deciseconds.
+        let deadline = now.saturating_add((termios.vtime() as u64) * 100_000_000);
+        self.vtime_deadline_ns.store(deadline, Ordering::Release);
     }
 
     /// Echo to this terminal's console.
@@ -1439,6 +1490,7 @@ impl Stdin {
         let iflag = termios.c_iflag;
         let lflag = termios.c_lflag;
         let c_cc = termios.c_cc;
+        let kill_echo = termios.kill_echo();
         drop(termios);
 
         // 1. Input translations
@@ -1611,14 +1663,14 @@ impl Stdin {
                 let mut canon = self.canon_buf.lock();
                 let len = canon.len();
                 canon.clear();
-                if lflag & ECHO != 0 {
-                    if lflag & ECHOKE != 0 {
+                match kill_echo {
+                    KillEcho::Rubout => {
                         for _ in 0..len {
                             self.echo("\x08 \x08");
                         }
-                    } else if lflag & ECHOK != 0 {
-                        self.echo("\n");
                     }
+                    KillEcho::Newline => self.echo("\n"),
+                    KillEcho::Nothing => {}
                 }
             } else if cc_match(&c_cc, VEOF, c as u8) {
                 let mut canon = self.canon_buf.lock();
@@ -1804,9 +1856,7 @@ impl INode for Stdin {
     fn read_at(&self, _offset: usize, buf: &mut [u8]) -> Result<usize> {
         self.flush_ready_flag();
         let termios = *tty_termios(self.vt).lock();
-        let is_canon = termios.c_lflag & ICANON != 0;
-        let vmin = termios.c_cc[VMIN];
-        let vtime = termios.c_cc[VTIME];
+        let is_canon = termios.canonical();
 
         let mut stdin_buf = self.buf.lock();
         if stdin_buf.is_empty() {
@@ -1815,46 +1865,40 @@ impl INode for Stdin {
             if self.eof_pending.swap(false, Ordering::AcqRel) {
                 return Ok(0);
             }
-            if !is_canon {
-                // POSIX non-canonical VMIN/VTIME.
-                if vmin == 0 && vtime == 0 {
-                    return Ok(0);
-                }
-                if vmin == 0 && vtime > 0 {
-                    let now = kernel_hal::timer::timer_now().as_nanos() as u64;
-                    let dl = self.vtime_deadline_ns.load(Ordering::Acquire);
-                    if dl == 0 {
-                        // VTIME is in deciseconds.
-                        let new_dl = now.saturating_add((vtime as u64) * 100_000_000);
-                        self.vtime_deadline_ns.store(new_dl, Ordering::Release);
-                    } else if now >= dl {
-                        self.vtime_deadline_ns.store(0, Ordering::Release);
-                        return Ok(0);
-                    }
-                }
-            }
-            return Err(FsError::Again);
         }
 
-        // Non-canonical VMIN>1: wait until at least VMIN bytes are buffered
-        // (or the user buffer is smaller — then wait for that many).
-        if !is_canon && vmin > 1 {
-            let need = (vmin as usize).min(buf.len()).max(1);
-            if stdin_buf.len() < need {
-                return Err(FsError::Again);
+        // POSIX non-canonical VMIN/VTIME, the same rule the pseudo-terminal's
+        // line discipline follows (`Termios::noncanon_read`).
+        let limit = if is_canon {
+            buf.len()
+        } else {
+            let queued = stdin_buf.len();
+            match termios.noncanon_read(queued, buf.len(), self.vtime_expired()) {
+                TtyRead::Take(n) => n,
+                TtyRead::Now => {
+                    self.vtime_deadline_ns.store(0, Ordering::Release);
+                    return Ok(0);
+                }
+                TtyRead::Wait => {
+                    self.read_need
+                        .store(termios.noncanon_need(buf.len()), Ordering::Relaxed);
+                    self.arm_vtime(&termios, queued);
+                    return Err(FsError::Again);
+                }
             }
+        };
+        if stdin_buf.is_empty() {
+            // Canonical mode only: non-canonical never reaches here empty.
+            return Err(FsError::Again);
         }
 
         self.vtime_deadline_ns.store(0, Ordering::Release);
         let mut read_bytes = 0;
-        while read_bytes < buf.len() && !stdin_buf.is_empty() {
+        while read_bytes < limit && !stdin_buf.is_empty() {
             let ch = stdin_buf.pop_front().unwrap();
             buf[read_bytes] = ch as u8;
             read_bytes += 1;
             if is_canon && ch == '\n' {
-                break;
-            }
-            if !is_canon && vmin > 1 && read_bytes >= vmin as usize {
                 break;
             }
         }
@@ -1873,7 +1917,7 @@ impl INode for Stdin {
     fn poll(&self) -> Result<PollStatus> {
         self.flush_ready_flag();
         Ok(PollStatus {
-            read: self.read_ready(),
+            read: self.poll_ready(),
             // VT nodes are RDWR (`/dev/ttyN`); Linux always reports POLLOUT.
             write: true,
             error: false,
@@ -1916,24 +1960,15 @@ impl INode for Stdin {
                 let this = self.as_mut().get_mut();
                 this.stdin.flush_ready_flag();
 
-                // Arm / refresh VTIME deadline for non-canonical VMIN=0 waits.
+                // Arm / refresh the VTIME deadline. `read_at` normally does
+                // this on the way past, but the wait is reachable on its own
+                // (splice, a re-poll after a spurious wakeup) and a wait with
+                // no deadline is a wait with no end.
                 {
-                    let termios = tty_termios(this.stdin.vt).lock();
-                    let noncanon = termios.c_lflag & ICANON == 0;
-                    let vmin = termios.c_cc[VMIN];
-                    let vtime = termios.c_cc[VTIME];
-                    drop(termios);
-                    if noncanon
-                        && vmin == 0
-                        && vtime > 0
-                        && !this.stdin.can_read()
-                        && this.stdin.vtime_deadline_ns.load(Ordering::Acquire) == 0
-                    {
-                        let now = kernel_hal::timer::timer_now().as_nanos() as u64;
-                        let new_dl = now.saturating_add((vtime as u64) * 100_000_000);
-                        this.stdin
-                            .vtime_deadline_ns
-                            .store(new_dl, Ordering::Release);
+                    let termios = *tty_termios(this.stdin.vt).lock();
+                    if !termios.canonical() {
+                        let queued = this.stdin.buf.lock().len();
+                        this.stdin.arm_vtime(&termios, queued);
                     }
                 }
 
@@ -2468,6 +2503,140 @@ mod line_discipline_tests {
         assert_eq!(drain(&s), "a");
         feed(&s, "bc");
         assert_eq!(drain(&s), "bc");
+    }
+
+    /// A raw console with `min`/`time` set, as `stty -icanon min N time M`
+    /// leaves it.
+    fn raw_tty(vmin: u8, vtime: u8) -> Stdin {
+        let d = Termios::default_tty();
+        let s = tty(d.c_lflag & !ICANON, d.c_iflag);
+        let mut t = *tty_termios(VT).lock();
+        t.c_cc[VMIN_CC] = vmin;
+        t.c_cc[VTIME_CC] = vtime;
+        *tty_termios(VT).lock() = t;
+        s
+    }
+
+    #[test]
+    fn a_raw_read_with_min_zero_comes_back_empty_instead_of_waiting() {
+        // `stty -icanon min 0 time 0`: POSIX says the read returns at once
+        // with whatever is there, including nothing.
+        let _g = SERIAL.lock();
+        let s = raw_tty(0, 0);
+        let mut buf = [0u8; 16];
+        assert_eq!(s.read_at(0, &mut buf), Ok(0));
+        feed(&s, "abc");
+        assert_eq!(s.read_at(0, &mut buf), Ok(3));
+        assert_eq!(&buf[..3], b"abc");
+    }
+
+    #[test]
+    fn the_wait_and_the_read_agree_on_when_a_raw_read_is_over() {
+        // `File::read` is `loop { read_at; on EAGAIN await the wait }`. The
+        // wait used to answer "is there a byte", so under `min 4` every byte
+        // between the first and the fourth had the loop going round at full
+        // tilt: the read said not yet, the wait said ready, nothing changed.
+        let _g = SERIAL.lock();
+        let s = raw_tty(4, 0);
+        let mut buf = [0u8; 16];
+        for n in 0..4 {
+            assert_eq!(s.read_at(0, &mut buf), Err(FsError::Again), "{} queued", n);
+            assert!(!s.read_ready(), "{} byte(s) queued", n);
+            s.push('x');
+        }
+        assert!(s.read_ready());
+        assert_eq!(s.read_at(0, &mut buf), Ok(4));
+    }
+
+    #[test]
+    fn poll_calls_a_console_readable_as_soon_as_a_byte_is_there() {
+        // `n_tty_poll` and `n_tty_read` do not ask the same question: poll
+        // reports the terminal readable on the first byte whatever VMIN says,
+        // while the read itself still waits. Giving poll the read's answer
+        // would leave a `select` loop asleep on a terminal that has input.
+        let _g = SERIAL.lock();
+        let s = raw_tty(4, 0);
+        let mut buf = [0u8; 16];
+        assert_eq!(s.read_at(0, &mut buf), Err(FsError::Again));
+        s.push('x');
+        assert!(s.poll_ready(), "poll sees the byte");
+        assert!(
+            INode::poll(&s).unwrap().read,
+            "and poll(2) is wired to that answer, not the read's"
+        );
+        assert!(!s.read_ready(), "the read is still short of its minimum");
+    }
+
+    #[test]
+    fn a_raw_read_hands_over_everything_queued_and_not_just_the_minimum() {
+        // `n_tty_read` copies up to the buffer size; VMIN decides when the
+        // read returns, not how much it may carry. Capping at VMIN left the
+        // rest queued and sent the reader round again for bytes it had room
+        // for.
+        let _g = SERIAL.lock();
+        let s = raw_tty(2, 0);
+        feed(&s, "abcdef");
+        let mut buf = [0u8; 16];
+        assert_eq!(s.read_at(0, &mut buf), Ok(6));
+        assert_eq!(&buf[..6], b"abcdef");
+    }
+
+    #[test]
+    fn a_buffer_smaller_than_the_minimum_does_not_wait_for_ever() {
+        // `read(fd, buf, 2)` under `min 4`: the caller cannot take four bytes,
+        // so a read that insisted on four would never come back, and a wait
+        // that insisted on four would sleep through the wakeup.
+        let _g = SERIAL.lock();
+        let s = raw_tty(4, 0);
+        let mut buf = [0u8; 2];
+        assert_eq!(s.read_at(0, &mut buf), Err(FsError::Again));
+        feed(&s, "ab");
+        assert!(s.read_ready());
+        assert_eq!(s.read_at(0, &mut buf), Ok(2));
+    }
+
+    #[test]
+    fn the_between_bytes_timer_does_not_start_on_an_empty_queue() {
+        // With VMIN > 0 the timer measures the gap between bytes. Starting it
+        // at the read would let a `min 1 time N` program come back empty on an
+        // idle terminal, which every reader takes for end of file.
+        let _g = SERIAL.lock();
+        let s = raw_tty(2, 5);
+        let mut buf = [0u8; 16];
+        assert_eq!(s.read_at(0, &mut buf), Err(FsError::Again));
+        assert_eq!(s.vtime_deadline_ns.load(Ordering::Relaxed), 0);
+        s.push('a');
+        assert_eq!(s.read_at(0, &mut buf), Err(FsError::Again));
+        assert_ne!(
+            s.vtime_deadline_ns.load(Ordering::Relaxed),
+            0,
+            "the first byte starts it"
+        );
+    }
+
+    #[test]
+    fn a_read_that_came_back_leaves_no_timer_running_behind_it() {
+        let _g = SERIAL.lock();
+        let s = raw_tty(0, 5);
+        let mut buf = [0u8; 16];
+        assert_eq!(s.read_at(0, &mut buf), Err(FsError::Again));
+        assert_ne!(s.vtime_deadline_ns.load(Ordering::Relaxed), 0);
+        s.push('a');
+        assert_eq!(s.read_at(0, &mut buf), Ok(1));
+        assert_eq!(s.vtime_deadline_ns.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn a_read_of_no_bytes_is_over_before_the_settings_are_consulted() {
+        // Every mode, including `min 1`, which otherwise may not come back
+        // empty.
+        let _g = SERIAL.lock();
+        let s = raw_tty(1, 0);
+        feed(&s, "abc");
+        assert_eq!(s.read_at(0, &mut []), Ok(0));
+        // And the bytes are still there for a read with room.
+        let mut buf = [0u8; 16];
+        assert_eq!(s.read_at(0, &mut buf), Ok(3));
     }
 
     // ---- signals --------------------------------------------------------
