@@ -2263,9 +2263,9 @@ mod ipi_tests {
         // serviced.
         let _g = test_lock();
         let _smp = Smp::with(2);
-        while publish_ipi_entry(1, IpiReason::TlbShutdown { vpn: 1 }.into())
-            && !overflow_pending(1)
-        {}
+        while publish_ipi_entry(1, IpiReason::TlbShutdown { vpn: 1 }.into()) && !overflow_pending(1)
+        {
+        }
         clear_overflow(1);
         SHOOTDOWN_SEQ[1].store(tail(1), Ordering::SeqCst);
         let gen_before = IPI_OVERFLOW_GEN[1].load(Ordering::Acquire);
@@ -2309,10 +2309,7 @@ mod ipi_tests {
         // running and takes the interrupt. So each thread keeps servicing its
         // queue until both shootdowns are done. It cost a 60-second hang in
         // about one host run in five.
-        let done = alloc::sync::Arc::new([
-            AtomicBool::new(false),
-            AtomicBool::new(false),
-        ]);
+        let done = alloc::sync::Arc::new([AtomicBool::new(false), AtomicBool::new(false)]);
         let spawn = |me: usize, page: usize| {
             let done = done.clone();
             std::thread::spawn(move || {
