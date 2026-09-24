@@ -544,11 +544,16 @@ impl TaskCollection {
                     // higher one.
                     for page_idx in 0..inner.pages.len() {
                         let page = &inner.pages[page_idx];
-                        let notified = page.take_notified();
+                        // `pending` is this page's snapshot, minus whatever has
+                        // already been handed out. It must go back into the
+                        // page across every yield: see `park_notified`.
+                        let mut pending = page.take_notified();
                         let dropped = page.take_dropped();
-                        if notified != 0 {
+                        if pending != 0 {
                             let cpu = crate::arch::cpu_id() as usize;
-                            for subpage_idx in BitIter::from(notified) {
+                            while pending != 0 {
+                                let subpage_idx = pending.trailing_zeros() as usize;
+                                pending &= pending - 1;
                                 let key = pack_key(priority, page_idx, subpage_idx);
                                 let allowed = inner
                                     .slab
@@ -567,9 +572,11 @@ impl TaskCollection {
                                 }
                                 found_key = Some(key);
                                 inner.pages[page_idx].mark_borrowed(subpage_idx, true);
+                                inner.pages[page_idx].park_notified(pending);
                                 drop(inner);
                                 yield found_key;
                                 inner = self.get_mut_inner(priority);
+                                pending = inner.pages[page_idx].reclaim_notified(pending);
                             }
                         }
                         if dropped != 0 {
@@ -583,12 +590,14 @@ impl TaskCollection {
                     // Pass 2 — voluntary yields, only when nothing urgent remains.
                     if found_key.is_none() {
                         for page_idx in 0..inner.pages.len() {
-                            let yielded = inner.pages[page_idx].take_yielded();
-                            if yielded == 0 {
+                            let mut pending = inner.pages[page_idx].take_yielded();
+                            if pending == 0 {
                                 continue;
                             }
                             let cpu = crate::arch::cpu_id() as usize;
-                            for subpage_idx in BitIter::from(yielded) {
+                            while pending != 0 {
+                                let subpage_idx = pending.trailing_zeros() as usize;
+                                pending &= pending - 1;
                                 let key = pack_key(priority, page_idx, subpage_idx);
                                 let allowed = inner
                                     .slab
@@ -607,9 +616,11 @@ impl TaskCollection {
                                 }
                                 found_key = Some(key);
                                 inner.pages[page_idx].mark_borrowed(subpage_idx, true);
+                                inner.pages[page_idx].park_yielded(pending);
                                 drop(inner);
                                 yield found_key;
                                 inner = self.get_mut_inner(priority);
+                                pending = inner.pages[page_idx].reclaim_yielded(pending);
                             }
                         }
                     }
@@ -795,5 +806,446 @@ mod key_tests {
         // time and then indexes the new page with the subpage field, so the
         // field has to be exactly as wide as a page is long.
         assert_eq!(1 << PAGE_INDEX_SHIFT, crate::waker_page::WAKER_PAGE_SIZE);
+    }
+}
+
+/// One CPU's run queue: what it will hand its executor, and what it refuses to.
+///
+/// This is the cross-CPU half of the scheduler. A collection belongs to one
+/// logical CPU, its generator is resumed both by that CPU's own executor
+/// (`take_task`) and by thieves from other CPUs (`try_take_task`), and the
+/// three load figures it publishes are what placement and work stealing steer
+/// by. 799 lines of it, and the only tests were of the key packing.
+///
+/// The host `cpu_id()` is hardwired to 0, so "this CPU" is always CPU 0 here
+/// and a mask that excludes it is how a task pinned elsewhere is spelled.
+#[cfg(test)]
+mod collection_tests {
+    use super::*;
+    use alloc::sync::Arc;
+    use alloc::vec::Vec;
+
+    fn pending() -> impl Future<Output = ()> + Send + 'static {
+        core::future::pending::<()>()
+    }
+
+    /// A mask that allows CPU 1 and not CPU 0, i.e. not us.
+    fn pinned_elsewhere() -> Option<Arc<AtomicU64>> {
+        Some(Arc::new(AtomicU64::new(1 << 1)))
+    }
+
+    /// Drain the queue, returning the keys in the order they were handed out.
+    /// Releases each borrow, as a Pending poll would.
+    fn drain(tc: &TaskCollection) -> Vec<Key> {
+        let mut keys = Vec::new();
+        while let Some((key, _task, waker)) = tc.take_task() {
+            keys.push(key);
+            waker.mark_borrowed(false);
+        }
+        keys
+    }
+
+    // ── what the queue hands out ───────────────────────────────────────────
+
+    #[test]
+    fn a_task_is_handed_out_once_and_not_again_until_it_is_given_back() {
+        let tc = TaskCollection::new(0);
+        let key = tc.add_task(pending(), None);
+        let (got, _task, waker) = tc.take_task().expect("a new task is runnable");
+        assert_eq!(got, key);
+        // Checked out to an executor: every reader of the page has to agree
+        // there is nothing here, or a second CPU polls the same future.
+        assert!(tc.take_task().is_none(), "handed out while borrowed");
+        assert!(!tc.has_ready());
+        assert_eq!(tc.ready_num(), Some(0));
+        waker.mark_borrowed(false);
+        // A Pending poll gives the borrow back but publishes no new wake, so
+        // the task waits for one rather than spinning on this CPU.
+        assert!(tc.take_task().is_none(), "a Pending poll re-queued itself");
+    }
+
+    #[test]
+    fn a_task_nobody_has_woken_yet_is_still_polled_once() {
+        // `insert` publishes the slot as notified precisely so the future gets
+        // to run its first line; without it a spawn never starts.
+        let tc = TaskCollection::new(0);
+        tc.add_task(pending(), None);
+        assert!(tc.has_ready());
+        assert_eq!(tc.ready_num(), Some(1));
+        assert_eq!(drain(&tc).len(), 1);
+    }
+
+    #[test]
+    fn every_task_across_two_pages_is_handed_out_exactly_once() {
+        // A page holds 64, so the 65th forces a second one and the generator
+        // has to walk them both.
+        let tc = TaskCollection::new(0);
+        let keys: Vec<Key> = (0..65).map(|_| tc.add_task(pending(), None)).collect();
+        assert_eq!(unpack_key(keys[64]), (DEFAULT_PRIORITY, 1, 0));
+        assert_eq!(tc.task_num(), 65);
+
+        let mut handed = drain(&tc);
+        handed.sort_unstable();
+        let mut expected = keys.clone();
+        expected.sort_unstable();
+        assert_eq!(handed, expected, "the second page was skipped or doubled");
+    }
+
+    #[test]
+    fn an_urgent_wake_is_handed_out_before_a_voluntary_yield() {
+        // The two lanes are the interactivity fix: a CPU-bound hog that yields
+        // must not race an externally woken task for the next poll slot.
+        let tc = TaskCollection::new(0);
+        let yielder = tc.add_task(pending(), None);
+        let woken = tc.add_task(pending(), None);
+        drain(&tc);
+
+        let (py, sy) = {
+            let (_, p, s) = unpack_key(yielder);
+            (p, s)
+        };
+        let (pw, sw) = {
+            let (_, p, s) = unpack_key(woken);
+            (p, s)
+        };
+        {
+            let inner = tc.get_mut_inner(DEFAULT_PRIORITY);
+            inner.pages[py].mark_yielded(sy);
+            inner.pages[pw].notify(sw);
+        }
+        assert_eq!(drain(&tc), alloc::vec![woken, yielder]);
+    }
+
+    // ── what it refuses ────────────────────────────────────────────────────
+
+    #[test]
+    fn a_task_pinned_to_another_cpu_is_refused_and_kept() {
+        let tc = TaskCollection::new(0);
+        tc.add_task(pending(), pinned_elsewhere());
+        assert!(
+            tc.take_task().is_none(),
+            "handed this CPU a task it is not allowed to run"
+        );
+        // Refused, not consumed: the wake has to survive for the CPU that can
+        // run it, or the thread never starts.
+        assert_eq!(tc.task_num(), 1);
+        assert_eq!(tc.ready_num(), Some(1), "the wake was swallowed");
+        assert!(tc.take_task().is_none());
+        assert_eq!(tc.ready_num(), Some(1), "a second pass swallowed it");
+    }
+
+    #[test]
+    fn a_task_pinned_elsewhere_is_not_work_this_cpu_can_halt_through() {
+        // `has_ready` is the pre-halt recheck. Answering "yes" for a task this
+        // CPU may not touch makes it skip the halt, find nothing, and go round
+        // again until some other CPU steals the task.
+        let tc = TaskCollection::new(0);
+        tc.add_task(pending(), pinned_elsewhere());
+        assert!(!tc.has_ready());
+    }
+
+    #[test]
+    fn widening_a_mask_at_runtime_releases_the_task_on_the_next_pass() {
+        // `sched_setaffinity` writes through the shared mask; the scheduler is
+        // meant to observe it on the next placement or steal decision rather
+        // than at the next spawn.
+        let mask = Arc::new(AtomicU64::new(1 << 1));
+        let tc = TaskCollection::new(0);
+        let key = tc.add_task(pending(), Some(mask.clone()));
+        assert!(tc.take_task().is_none());
+        mask.store(1 << 0 | 1 << 1, Ordering::Relaxed);
+        assert_eq!(drain(&tc), alloc::vec![key]);
+    }
+
+    #[test]
+    fn a_mask_that_cannot_name_this_cpu_does_not_refuse_it() {
+        // The mask is 64 bits wide and `MAX_CORE_NUM` is 64, so a cpu id past
+        // the end is a bug elsewhere; refusing it here would strand the task
+        // on a queue nothing can drain.
+        let task = Task::new(pending(), DEFAULT_PRIORITY, pinned_elsewhere());
+        assert!(!task.allowed_on(0));
+        assert!(task.allowed_on(1));
+        assert!(task.allowed_on(64), "a shift of 64 is not a refusal");
+        assert!(task.allowed_on(usize::MAX));
+        // And no mask at all means anywhere.
+        let free = Task::new(pending(), DEFAULT_PRIORITY, None);
+        assert!(free.allowed_on(0) && free.allowed_on(63) && free.allowed_on(usize::MAX));
+    }
+
+    // ── finishing ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn a_completed_task_is_removed_and_counted_down_once() {
+        let tc = TaskCollection::new(0);
+        tc.add_task(pending(), None);
+        let (_key, _task, waker) = tc.take_task().unwrap();
+        // The executor publishes `dropped` and deliberately leaves the borrow
+        // set, so the generator's own remove() is what clears the slot.
+        waker.drop_by_ref();
+        assert!(tc.take_task().is_none());
+        assert_eq!(tc.task_num(), 0, "the count did not follow the removal");
+        assert_eq!(tc.debug_pending(), (0, 0, 0, 0), "a lane was left dirty");
+    }
+
+    #[test]
+    fn a_completed_task_does_not_take_its_neighbours_with_it() {
+        let tc = TaskCollection::new(0);
+        let dying = tc.add_task(pending(), None);
+        let living = tc.add_task(pending(), None);
+        let mut wakers = Vec::new();
+        while let Some((key, _t, w)) = tc.take_task() {
+            if key == dying {
+                w.drop_by_ref();
+            } else {
+                wakers.push((key, w));
+            }
+        }
+        for (_k, w) in &wakers {
+            w.mark_borrowed(false);
+        }
+        assert!(tc.take_task().is_none());
+        assert_eq!(tc.task_num(), 1);
+        // The survivor's slot is still its own, and a wake still reaches it.
+        let (_, p, s) = unpack_key(living);
+        tc.get_mut_inner(DEFAULT_PRIORITY).pages[p].notify(s);
+        assert_eq!(drain(&tc), alloc::vec![living]);
+    }
+
+    #[test]
+    fn a_task_that_finishes_before_it_is_ever_polled_is_still_reclaimed() {
+        // A thread killed between spawn and its first poll: the slot carries
+        // `notified` from `initialize` and `dropped` from the kill.
+        let tc = TaskCollection::new(0);
+        let key = tc.add_task(pending(), None);
+        let (_, p, s) = unpack_key(key);
+        tc.get_mut_inner(DEFAULT_PRIORITY).pages[p].mark_dropped(s);
+        assert!(tc.take_task().is_none(), "polled a task that was retired");
+        assert_eq!(tc.task_num(), 0);
+    }
+
+    // ── the three load figures, which are three on purpose ─────────────────
+
+    #[test]
+    fn a_cpu_mid_poll_advertises_load_for_placement_but_offers_nothing_to_steal() {
+        // `ready_num` picks steal targets: a borrowed task cannot be stolen,
+        // so it is not load. `placement_load` picks where a spawn lands: a CPU
+        // pegged running a hog has that hog borrowed, and reporting 0 there
+        // stacked new hogs onto the busiest cores (the measured 4.46x
+        // unfairness). Same bits, two questions, two answers.
+        let tc = TaskCollection::new(0);
+        tc.add_task(pending(), None);
+        tc.add_task(pending(), None);
+        assert_eq!(tc.ready_num(), Some(2));
+        assert_eq!(tc.placement_load(), Some(2));
+
+        let (_k, _t, waker) = tc.take_task().unwrap();
+        assert_eq!(tc.ready_num(), Some(1), "a borrowed task was offered");
+        assert_eq!(tc.placement_load(), Some(2), "a busy CPU looked idle");
+        waker.mark_borrowed(false);
+        assert_eq!(tc.ready_num(), Some(1));
+    }
+
+    #[test]
+    fn a_sleeping_task_is_not_load_at_all() {
+        // `task_num` counts everything the collection owns; the load figures
+        // count what is runnable. A CPU hosting fifty sleeping daemons looked
+        // fifty times busier than one spinning two threads, so placement
+        // pushed work onto the busy CPU and stealing probed the idle one.
+        let tc = TaskCollection::new(0);
+        for _ in 0..4 {
+            tc.add_task(pending(), None);
+        }
+        drain(&tc);
+        assert_eq!(tc.task_num(), 4);
+        assert_eq!(tc.ready_num(), Some(0));
+        assert_eq!(tc.placement_load(), Some(0));
+    }
+
+    #[test]
+    fn a_collection_somebody_else_is_holding_is_skipped_not_waited_on() {
+        // Both load figures run on the placement and idle/steal paths, which
+        // must never spin on a peer's collection; `None` means "skip me this
+        // pass". `has_ready` answers the opposite way on purpose: it is a
+        // pre-halt recheck, and a peer mid-insert holds the lock, so "yes"
+        // makes this CPU look again instead of halting through a wake it
+        // could not observe.
+        let tc = TaskCollection::new(0);
+        tc.add_task(pending(), None);
+        let held = tc.get_mut_inner(DEFAULT_PRIORITY);
+        assert_eq!(tc.ready_num(), None);
+        assert_eq!(tc.placement_load(), None);
+        assert!(
+            tc.has_ready(),
+            "a locked collection must not let a CPU halt"
+        );
+        drop(held);
+        assert_eq!(tc.ready_num(), Some(1));
+    }
+
+    #[test]
+    fn a_cpu_with_a_backlog_does_not_advertise_itself_as_empty_while_it_polls() {
+        // The generator empties a page's whole lane in one swap and hands out
+        // one task per resume, so the rest used to live only in a local of a
+        // suspended coroutine. Every figure a peer reads — which tasks can be
+        // stolen, how loaded this CPU is, whether it may halt — reads the
+        // page. A CPU with nine tasks queued therefore told every thief it had
+        // nothing, and told spawn placement it was the emptiest CPU on the
+        // machine, for as long as it was polling the one it handed out.
+        let tc = TaskCollection::new(0);
+        for _ in 0..10 {
+            tc.add_task(pending(), None);
+        }
+        let (_k, _t, waker) = tc.take_task().unwrap();
+        assert_eq!(tc.ready_num(), Some(9), "a thief was shown an empty queue");
+        assert_eq!(
+            tc.placement_load(),
+            Some(10),
+            "a backlogged CPU looked idle"
+        );
+        assert!(tc.has_ready());
+        assert_eq!(tc.debug_pending().1, 9);
+        waker.mark_borrowed(false);
+        // And the backlog is still every one of them, handed out once each.
+        assert_eq!(drain(&tc).len(), 9);
+    }
+
+    #[test]
+    fn a_backlog_of_voluntary_yields_stays_visible_too() {
+        // The low-priority lane is emptied by the same one-swap-then-yield, so
+        // it loses its backlog the same way. A CPU running three CPU-bound
+        // threads that are taking turns has two of them queued here at any
+        // moment, and that is exactly the CPU a thief should be probing.
+        let tc = TaskCollection::new(0);
+        let keys: Vec<Key> = (0..3).map(|_| tc.add_task(pending(), None)).collect();
+        drain(&tc);
+        {
+            let inner = tc.get_mut_inner(DEFAULT_PRIORITY);
+            for key in &keys {
+                let (_, p, sp) = unpack_key(*key);
+                inner.pages[p].mark_yielded(sp);
+            }
+        }
+        assert_eq!(tc.ready_num(), Some(3));
+
+        let (_k, _t, waker) = tc.take_task().unwrap();
+        assert_eq!(
+            tc.ready_num(),
+            Some(2),
+            "the yielded backlog went invisible"
+        );
+        assert!(tc.has_ready());
+        waker.mark_borrowed(false);
+        assert_eq!(drain(&tc).len(), 2);
+    }
+
+    #[test]
+    fn a_task_that_finishes_while_the_rest_wait_does_not_come_back() {
+        // The parked set is reclaimed under the same rule the lane itself
+        // applies: a slot retired while its wake was parked is gone, not
+        // handed to an executor that would poll a completed future.
+        let tc = TaskCollection::new(0);
+        let keys: Vec<Key> = (0..3).map(|_| tc.add_task(pending(), None)).collect();
+        let (first, _t, waker) = tc.take_task().unwrap();
+        // Retire one of the two still parked, from "another CPU".
+        let doomed = *keys.iter().find(|k| **k != first).unwrap();
+        let (_, p, sp) = unpack_key(doomed);
+        tc.get_mut_inner(DEFAULT_PRIORITY).pages[p].mark_dropped(sp);
+        waker.mark_borrowed(false);
+
+        let handed = drain(&tc);
+        assert!(!handed.contains(&doomed), "polled a task that was retired");
+        assert_eq!(
+            handed.len(),
+            1,
+            "the third task was lost with the retired one"
+        );
+        // Three went in, one was retired: the one handed out is still alive.
+        assert_eq!(tc.task_num(), 2);
+    }
+
+    #[test]
+    fn a_wake_that_arrives_while_the_rest_wait_is_not_swallowed() {
+        // Reclaiming is masked to exactly what was parked, so a wake published
+        // by another CPU in that window stays in the lane for the next pass
+        // instead of being taken out by a snapshot that predates it.
+        let tc = TaskCollection::new(0);
+        let parked = tc.add_task(pending(), None);
+        let handed = tc.add_task(pending(), None);
+        let latecomer = tc.add_task(pending(), None);
+        // Put the latecomer to sleep so only the other two are runnable: take
+        // the whole lane and park back everything but its bit.
+        let (_, lp, ls) = unpack_key(latecomer);
+        {
+            let inner = tc.get_mut_inner(DEFAULT_PRIORITY);
+            let lane = inner.pages[lp].take_notified();
+            inner.pages[lp].park_notified(lane & !(1u64 << ls));
+        }
+        assert_eq!(tc.ready_num(), Some(2));
+
+        let (first, _t, waker) = tc.take_task().unwrap();
+        assert!(first == parked || first == handed);
+        // Now wake it, mid-poll.
+        tc.get_mut_inner(DEFAULT_PRIORITY).pages[lp].notify(ls);
+        waker.mark_borrowed(false);
+
+        let mut rest = drain(&tc);
+        rest.sort_unstable();
+        let mut expected: Vec<Key> = alloc::vec![parked, handed, latecomer]
+            .into_iter()
+            .filter(|k| *k != first)
+            .collect();
+        expected.sort_unstable();
+        assert_eq!(rest, expected, "a wake was lost or doubled");
+    }
+
+    // ── the thief's entry point ────────────────────────────────────────────
+
+    #[test]
+    fn a_thief_gives_up_rather_than_spinning_on_a_busy_generator() {
+        // The AB-BA this avoids: the thief holds the victim's runtime lock and
+        // spins on its generator; the victim's executor holds that generator
+        // and is interrupted by a timer whose `sched_yield` spins on the
+        // runtime lock with interrupts off. Neither can move.
+        let tc = TaskCollection::new(0);
+        tc.add_task(pending(), None);
+        let busy = tc.generator.as_ref().unwrap().lock();
+        assert!(tc.try_take_task().is_none(), "the thief waited");
+        drop(busy);
+        assert!(tc.try_take_task().is_some());
+    }
+
+    #[test]
+    fn a_collection_with_no_generator_parks_instead_of_panicking() {
+        // A `None` here cannot be a logic error — `new` fills the field before
+        // the Arc is published and nothing clears it — so it means the
+        // collection has been overwritten. The `unwrap` that used to stand
+        // here turned that into a panic inside the executor, on a CPU already
+        // holding scheduler locks, which `oops` can never contain: it took the
+        // machine down and buried the corruption that caused it.
+        let mut tc = TaskCollection::new(0);
+        {
+            let tc = unsafe { Arc::get_mut_unchecked(&mut tc) };
+            tc.generator = None;
+        }
+        assert!(tc.take_task().is_none());
+        assert!(tc.try_take_task().is_none());
+    }
+
+    // ── diagnostics ────────────────────────────────────────────────────────
+
+    #[test]
+    fn the_hang_detector_can_tell_a_lost_wake_from_a_queue_that_will_not_give() {
+        // `debug_pending` exists to separate the two: tasks present with
+        // nothing notified is a lost wake; notified bits with nothing being
+        // polled is a take_task bug.
+        let tc = TaskCollection::new(0);
+        tc.add_task(pending(), None);
+        tc.add_task(pending(), None);
+        assert_eq!(tc.debug_pending(), (2, 2, 0, 0));
+
+        let (_k, _t, waker) = tc.take_task().unwrap();
+        assert_eq!(tc.debug_pending(), (2, 1, 0, 1), "the borrow went unseen");
+        waker.drop_by_ref();
+        assert_eq!(tc.debug_pending(), (2, 1, 1, 1));
     }
 }
