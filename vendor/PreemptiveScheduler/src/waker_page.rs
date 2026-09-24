@@ -197,12 +197,30 @@ impl WakerPage {
         self.dropped.swap(0)
     }
 
-    /// Whether any future on this page has a pending (published) wake. Used by
-    /// the executor's pre-halt recheck; SeqCst load pairs with the SeqCst
-    /// `notified.fetch_or` in `notify`.
+    /// Whether any future on this page has a wake **this CPU could act on**.
+    ///
+    /// The same question [`TaskCollection::has_ready`] asks, and it has to be
+    /// asked the same way: a published bit is not work unless the task is
+    /// neither finished nor already checked out to an executor. This read the
+    /// raw lanes, so a page whose only wake belonged to a task being polled on
+    /// another CPU reported work — and the caller this doc named is a pre-halt
+    /// recheck, so that CPU would skip the halt, drain nothing (both
+    /// `take_*`s defer a borrowed slot), and go round again until the other
+    /// CPU released the borrow.
+    ///
+    /// It has no caller today: the executor asks `TaskCollection::has_ready`,
+    /// which was written with the mask and answers per CPU (it also honours
+    /// affinity). This is the page-local form of it, correct now if anything
+    /// reaches for it.
+    ///
+    /// SeqCst loads pair with the SeqCst `notified.fetch_or` in [`notify`].
+    ///
+    /// [`TaskCollection::has_ready`]: crate::task_collection::TaskCollection::has_ready
     #[inline]
     pub fn has_notified(&self) -> bool {
-        self.notified.load() != 0 || self.yielded.load() != 0
+        let published = self.notified.load() | self.yielded.load();
+        let blocked = self.dropped.load() | self.borrowed.load();
+        published & !blocked != 0
     }
 
     /// Non-destructive snapshot of `(notified | yielded, dropped, borrowed)` for diagnostics.
@@ -259,7 +277,12 @@ impl WakerRef {
             // releasing the borrow and turn every `yield_now` into a reschedule
             // request.
             let in_flight = self.page.is_borrowed(self.idx);
-            let voluntary = crate::runtime::is_voluntary_yield_wake();
+            // Keyed by this waker's own address — the number
+            // `YieldFuture` publishes through `begin_voluntary_yield` — so a
+            // wake raised on this CPU for a *different* task cannot borrow the
+            // yield marker and be filed in the low-priority lane.
+            let voluntary =
+                crate::runtime::is_voluntary_yield_wake(self as *const WakerRef as usize);
             if in_flight && voluntary {
                 // `YieldFuture` self-wake: park in the yielded lane so an
                 // externally woken peer is preferred on the next take_task.
@@ -306,5 +329,290 @@ impl Clone for WakerRef {
             idx: self.idx,
             dropped: self.dropped.clone(),
         }
+    }
+}
+
+/// The scheduler's cross-CPU wake bitmap, which had no tests.
+///
+/// Every wake in the kernel arrives here: a page holds 64 tasks' worth of
+/// state in four `u64`s, and the decisions it makes — which lane a wake goes
+/// in, whether it is deferred, whether it is discarded — are what the
+/// generator hands the executor. Its own comments record what the mistakes
+/// cost: a discarded wake left a task asleep forever, and a completed task
+/// republished as runnable let two executors poll one future (the 8-second
+/// deadlock banner).
+///
+/// These tests share no global state, so they do not need serializing; the
+/// two that go through `WakerRef::wake_by_ref` do touch the runtime's
+/// reschedule globals, and say so.
+#[cfg(test)]
+mod waker_page_tests {
+    use super::*;
+
+    fn page() -> Arc<WakerPage> {
+        WakerPage::new(0)
+    }
+
+    // ── the four lanes ─────────────────────────────────────────────────────
+
+    #[test]
+    fn a_fresh_slot_is_published_as_runnable_and_nothing_else() {
+        let p = page();
+        // A task nobody has woken yet still has to be polled once, or its
+        // future never starts. `initialize` is also reached on a slab index
+        // that a *previous* task used, so every other lane has to be wiped.
+        p.mark_dropped(7);
+        p.mark_borrowed(7, true);
+        p.mark_yielded(7);
+        p.initialize(7);
+        assert_eq!(p.peek(), (1 << 7, 0, 0));
+        assert_eq!(p.take_notified(), 1 << 7);
+        // And nothing in the other lane: `peek` sums the two, so a leftover
+        // yielded bit hides there and would hand the slot out a second time
+        // on the generator's second pass.
+        assert_eq!(p.take_yielded(), 0);
+        assert!(!p.is_borrowed(7));
+    }
+
+    #[test]
+    fn an_external_wake_promotes_a_task_out_of_the_yielded_lane() {
+        let p = page();
+        p.mark_yielded(3);
+        p.notify(3);
+        // Not in both: the yielded lane is drained only after the notified
+        // one, so a task left in it would be handed out twice.
+        assert_eq!(p.take_notified(), 1 << 3);
+        assert_eq!(p.take_yielded(), 0);
+    }
+
+    #[test]
+    fn a_voluntary_yield_does_not_demote_a_wake_that_already_arrived() {
+        let p = page();
+        p.notify(3);
+        p.mark_yielded(3);
+        // `mark_yielded` deliberately does not touch the notified lane: the
+        // urgent wake still wins, and the extra yielded bit is consumed
+        // harmlessly on the pass after it.
+        assert_eq!(p.take_notified(), 1 << 3);
+    }
+
+    // ── deferral: a wake that races an in-flight poll ──────────────────────
+
+    #[test]
+    fn a_wake_that_races_an_in_flight_poll_is_held_not_lost() {
+        let p = page();
+        p.initialize(1);
+        assert_eq!(p.take_notified(), 1 << 1);
+        p.mark_borrowed(1, true);
+        // The task is checked out to an executor (possibly on another CPU, via
+        // work stealing). The wake cannot be handed out now — that is two
+        // executors on one future — and it must not be dropped either.
+        p.notify(1);
+        assert_eq!(p.take_notified(), 0, "a borrowed task was handed out");
+        assert_eq!(p.peek().0, 1 << 1, "the deferred wake was swallowed");
+        p.mark_borrowed(1, false);
+        assert_eq!(
+            p.take_notified(),
+            1 << 1,
+            "the deferred wake never came back"
+        );
+    }
+
+    #[test]
+    fn the_yielded_lane_defers_a_borrowed_task_the_same_way() {
+        let p = page();
+        p.mark_borrowed(2, true);
+        p.mark_yielded(2);
+        assert_eq!(p.take_yielded(), 0);
+        p.mark_borrowed(2, false);
+        assert_eq!(p.take_yielded(), 1 << 2);
+    }
+
+    #[test]
+    fn a_wake_for_a_completed_task_is_discarded_by_both_lanes() {
+        let p = page();
+        p.mark_borrowed(4, true);
+        p.mark_dropped(4);
+        // A stale waker clone (a net-RX slot, an epoll timer) firing after the
+        // poll returned Ready. Republishing it would get the slab slot handed
+        // out and the finished future polled again over its own teardown.
+        p.notify(4);
+        p.mark_yielded(4);
+        assert_eq!(p.take_notified(), 0);
+        assert_eq!(p.take_yielded(), 0);
+        assert_eq!(
+            p.peek().0,
+            0,
+            "a dropped task's wake was republished for the next drain"
+        );
+    }
+
+    #[test]
+    fn taking_the_dropped_bits_reports_them_once() {
+        let p = page();
+        p.mark_dropped(5);
+        p.mark_dropped(9);
+        assert_eq!(p.take_dropped(), (1 << 5) | (1 << 9));
+        assert_eq!(p.take_dropped(), 0);
+    }
+
+    #[test]
+    fn clearing_a_slot_wipes_every_lane_so_the_index_can_be_reused() {
+        let p = page();
+        p.notify(11);
+        p.mark_yielded(11);
+        p.mark_dropped(11);
+        p.mark_borrowed(11, true);
+        p.notify(12);
+        p.clear(11);
+        // Only slot 11: `remove` frees one slab index, and wiping a neighbour
+        // would lose a live task's wake.
+        assert_eq!(p.peek(), (1 << 12, 0, 0));
+        assert!(!p.is_borrowed(11));
+    }
+
+    #[test]
+    fn peeking_consumes_nothing() {
+        let p = page();
+        p.notify(0);
+        p.mark_yielded(1);
+        p.mark_dropped(2);
+        p.mark_borrowed(3, true);
+        let before = p.peek();
+        assert_eq!(before, ((1 << 0) | (1 << 1), 1 << 2, 1 << 3));
+        assert_eq!(p.peek(), before);
+        assert_eq!(p.take_notified(), 1 << 0);
+    }
+
+    #[test]
+    fn a_pending_wake_is_only_pending_while_something_can_act_on_it() {
+        let p = page();
+        // `has_notified` is the cheap "is there anything to do here" question,
+        // and it must answer the same one `TaskCollection::has_ready` asks
+        // with `notified & !dropped & !borrowed`. Answering on the raw bits
+        // instead made a page whose only wake belonged to a task checked out
+        // to another CPU report work this CPU could not take — and the caller
+        // of that question is a pre-halt recheck, so the CPU would skip the
+        // halt, find nothing, and spin until the other CPU released the
+        // borrow.
+        p.mark_borrowed(6, true);
+        p.notify(6);
+        assert!(!p.has_notified(), "a deferred wake is not work for us");
+        p.mark_borrowed(6, false);
+        assert!(p.has_notified());
+
+        let q = page();
+        q.mark_dropped(6);
+        q.notify(6);
+        assert!(!q.has_notified(), "a completed task is not work for anyone");
+    }
+
+    #[test]
+    fn a_page_remembers_which_cpu_owns_it() {
+        // The wake kick is addressed with this: a page stamped with the wrong
+        // CPU sends the reschedule IPI to a core that owns none of its tasks.
+        assert_eq!(WakerPage::new(0).owner_cpu, 0);
+        assert_eq!(WakerPage::new(5).owner_cpu, 5);
+    }
+
+    // ── WakerRef: which lane a wake is filed in ────────────────────────────
+    //
+    // These reach `crate::runtime`'s reschedule globals, which the resched
+    // tests also own, so they take the same kind of lock.
+
+    fn wake_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn waker_for(p: &Arc<WakerPage>, idx: usize) -> Arc<WakerRef> {
+        let flag = Arc::new(AtomicBool::new(false));
+        p.initialize(idx);
+        Arc::new(p.make_waker(idx, &flag))
+    }
+
+    #[test]
+    fn a_tasks_own_yield_is_filed_behind_every_urgent_wake() {
+        let _g = wake_lock();
+        let p = page();
+        let w = waker_for(&p, 20);
+        p.take_notified();
+        p.mark_borrowed(20, true);
+
+        crate::runtime::begin_voluntary_yield(Arc::as_ptr(&w) as usize);
+        w.wake_by_ref();
+        crate::runtime::end_voluntary_yield();
+
+        p.mark_borrowed(20, false);
+        assert_eq!(p.take_notified(), 0, "a yield jumped the urgent lane");
+        assert_eq!(p.take_yielded(), 1 << 20);
+    }
+
+    #[test]
+    fn an_interrupt_inside_the_yield_window_does_not_demote_someone_elses_wake() {
+        let _g = wake_lock();
+        let p = page();
+        let mine = waker_for(&p, 21);
+        let theirs = waker_for(&p, 22);
+        p.take_notified();
+        p.mark_borrowed(21, true);
+        p.mark_borrowed(22, true);
+
+        // We are inside our own `yield_now`, which is three instructions long
+        // and runs with interrupts ON. An IRQ lands there and wakes another
+        // task — net RX, a timer, a futex release. That is an external wake
+        // and belongs in the urgent lane, whatever this CPU happens to be
+        // doing at the time.
+        crate::runtime::begin_voluntary_yield(Arc::as_ptr(&mine) as usize);
+        theirs.wake_by_ref();
+        crate::runtime::end_voluntary_yield();
+
+        p.mark_borrowed(22, false);
+        assert_eq!(
+            p.take_notified(),
+            1 << 22,
+            "an external wake was parked in the low-priority lane"
+        );
+    }
+
+    #[test]
+    fn a_yield_marker_left_behind_cannot_demote_a_later_wake() {
+        let _g = wake_lock();
+        let p = page();
+        let stale = waker_for(&p, 23);
+        let live = waker_for(&p, 24);
+        p.take_notified();
+        p.mark_borrowed(24, true);
+
+        // `end_voluntary_yield` never ran: the poll was abandoned between the
+        // two calls (oops containment). Unkeyed, this CPU would answer
+        // "voluntary" to every external wake it raised from here on.
+        crate::runtime::begin_voluntary_yield(Arc::as_ptr(&stale) as usize);
+        live.wake_by_ref();
+
+        p.mark_borrowed(24, false);
+        assert_eq!(p.take_notified(), 1 << 24);
+        crate::runtime::end_voluntary_yield();
+    }
+
+    #[test]
+    fn a_wake_for_a_finished_task_never_reaches_its_page() {
+        let _g = wake_lock();
+        let p = page();
+        let flag = Arc::new(AtomicBool::new(false));
+        p.initialize(25);
+        let w = Arc::new(p.make_waker(25, &flag));
+        p.take_notified();
+
+        w.drop_by_ref();
+        assert_eq!(p.peek().1, 1 << 25);
+        // The `dropped` flag is shared with `Task::poll`, which returns Ready
+        // without entering the future once it is set; a second retire must not
+        // look like a second completion.
+        w.drop_by_ref();
+
+        w.wake_by_ref();
+        assert_eq!(p.take_notified(), 0);
+        assert_eq!(p.take_yielded(), 0);
     }
 }

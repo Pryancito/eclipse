@@ -111,7 +111,15 @@ hal_fn_impl! {
             // entry — the 0xf3 handler treats an empty drain as a pure wake
             // (no TLB flush, no shootdown-sequence bump), so this is as cheap
             // as an interrupt can be on the receiving side.
+            //
+            // The three ids not worth an interrupt are decided in one shared
+            // place now (`wake_kick_wanted`), because this used to be the only
+            // architecture with a body here at all and the other two are now
+            // written against the same contract.
             const IPI_VECTOR: u8 = 0xf3;
+            if !crate::common::ipi::wake_kick_wanted(cpuid) {
+                return;
+            }
             if zcore_drivers::irq::x86::Apic::local_apic_ready() {
                 if let Some(apic_id) = super::smp::logical_to_apic(cpuid) {
                     zcore_drivers::irq::x86::Apic::send_ipi_to(IPI_VECTOR, apic_id);

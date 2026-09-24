@@ -26,7 +26,7 @@ impl Future for YieldFuture {
             // the woken task instead of re-electing this one. See
             // `executor::begin_voluntary_yield` / `WakerPage::mark_yielded`.
             #[cfg(target_os = "none")]
-            executor::begin_voluntary_yield();
+            executor::begin_voluntary_yield(cx.waker().data() as usize);
             cx.waker().wake_by_ref();
             #[cfg(target_os = "none")]
             executor::end_voluntary_yield();

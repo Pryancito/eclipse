@@ -108,19 +108,33 @@ static NEED_RESCHED: AtomicU64 = AtomicU64::new(0);
 /// the difference either way. This makes the comparison a boot parameter.
 static WAKEUP_PREEMPT: AtomicBool = AtomicBool::new(true);
 
-/// Per-CPU: the current poll is performing a voluntary `yield_now` self-wake.
-/// `WakerRef::wake_by_ref` reads this to park the task in the yielded lane
+/// Per-CPU: **which** waker the current poll is performing a voluntary
+/// `yield_now` self-wake for, by address; `0` when no yield is in flight.
+/// `WakerRef::wake_by_ref` reads this to park that task in the yielded lane
 /// instead of the urgent notified lane (see `waker_page`).
-static VOLUNTARY_YIELD: [AtomicBool; MAX_CORE_NUM] = {
-    const FALSE: AtomicBool = AtomicBool::new(false);
-    [FALSE; MAX_CORE_NUM]
-};
+///
+/// The identity is the point. This was a plain per-CPU flag, set around
+/// `YieldFuture`'s one `wake_by_ref` call — a window of three instructions
+/// with interrupts ON, which is to say a window an interrupt lands in. Any
+/// wake raised on this CPU while the flag was up answered "yes, voluntary",
+/// whatever task it was for: an IRQ-driven wake (net RX, a timer, a futex
+/// release) for a task that happened to be mid-poll elsewhere was filed in the
+/// low-priority lane and then waited behind every urgent notify on its owner's
+/// queue — the exact latency inversion the two lanes exist to prevent.
+///
+/// A missed `end_voluntary_yield` was worse: a flag left up (a poll abandoned
+/// by `oops` containment between begin and end) made that CPU answer "yes" to
+/// every external wake it raised, forever. Keyed by waker, a stale marker can
+/// only ever match the one task it named.
+static VOLUNTARY_YIELD: [AtomicUsize; MAX_CORE_NUM] = [const { AtomicUsize::new(0) }; MAX_CORE_NUM];
 
-/// Mark the current CPU as inside a voluntary yield self-wake.
-pub fn begin_voluntary_yield() {
+/// Mark the current CPU as inside a voluntary yield self-wake for `waker_id`
+/// — the address of the `WakerRef` behind the `Waker` about to be woken
+/// (`Waker::data()`), which is what [`is_voluntary_yield_wake`] compares.
+pub fn begin_voluntary_yield(waker_id: usize) {
     let cpu = crate::arch::cpu_id() as usize;
     if cpu < MAX_CORE_NUM {
-        VOLUNTARY_YIELD[cpu].store(true, Ordering::Relaxed);
+        VOLUNTARY_YIELD[cpu].store(waker_id, Ordering::Relaxed);
     }
 }
 
@@ -128,14 +142,14 @@ pub fn begin_voluntary_yield() {
 pub fn end_voluntary_yield() {
     let cpu = crate::arch::cpu_id() as usize;
     if cpu < MAX_CORE_NUM {
-        VOLUNTARY_YIELD[cpu].store(false, Ordering::Relaxed);
+        VOLUNTARY_YIELD[cpu].store(0, Ordering::Relaxed);
     }
 }
 
 #[inline]
-pub(crate) fn is_voluntary_yield_wake() -> bool {
+pub(crate) fn is_voluntary_yield_wake(waker_id: usize) -> bool {
     let cpu = crate::arch::cpu_id() as usize;
-    cpu < MAX_CORE_NUM && VOLUNTARY_YIELD[cpu].load(Ordering::Relaxed)
+    waker_id != 0 && cpu < MAX_CORE_NUM && VOLUNTARY_YIELD[cpu].load(Ordering::Relaxed) == waker_id
 }
 
 /// Enable/disable wake-up preemption. Called once at boot from the command

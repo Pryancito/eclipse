@@ -200,6 +200,40 @@ pub fn online_cpu_count() -> usize {
     cpu_online_mask().count_ones() as usize
 }
 
+/// Whether a bare reschedule kick for dense logical CPU `cpuid` is worth an
+/// interrupt.
+///
+/// A wake kick carries no payload: it exists only so the target looks at its
+/// run queue now instead of at its next 250 Hz tick, and the receiving side is
+/// the ordinary IPI handler finding nothing to drain. So, unlike a shootdown,
+/// nothing is lost by not sending one — and three ids are never worth the
+/// interrupt:
+///
+///  * one past the per-CPU tables, which names no CPU at all. `send_ipi`
+///    refuses such an id on all three architectures; the wake path had no
+///    notion of it, and every architecture's delivery ends in a `1 << id`
+///    (a hart mask, a GICv2 target list) that is not a no-op past the word.
+///  * our own. `send_wake_ipi(me)` is only ever reached from an interrupt
+///    handler on this CPU — we are executing, so we reach the scheduler
+///    without an interrupt, and the one the LAPIC would deliver to itself is
+///    pure cost. The scheduler already skips the self-kick on one of its two
+///    paths (`request_resched`) and not on the other
+///    (`maybe_send_resched_ipi`), which is exactly the kind of difference this
+///    predicate exists to end.
+///  * one that never came online. It is running no task, so there is nothing
+///    on it to wake; `remote_flush_tlb_on` already refuses to wait on such a
+///    CPU for the same reason.
+///
+/// Deliberately [`cpu_online_mask`] and not [`IPI_READY`]: the narrower set is
+/// published from the executor's own entry path, and a kick exists precisely
+/// to reach a CPU sitting in that loop — gating on it would make the kick
+/// depend on the thing it is trying to poke.
+pub fn wake_kick_wanted(cpuid: usize) -> bool {
+    cpuid < MAX_CORE_NUM
+        && cpuid != crate::cpu::cpu_id() as usize
+        && cpu_online_mask() & (1u64 << cpuid) != 0
+}
+
 /// Bitmask of CPUs that are actually *servicing* IPIs: running the executor
 /// loop with interrupts enabled, so a TLB-shootdown IPI to them will be taken
 /// and acknowledged promptly.
@@ -1312,6 +1346,74 @@ mod ipi_tests {
         assert_eq!(IPI_READY.load(Ordering::Acquire), now);
 
         IPI_READY.store(before, Ordering::Release);
+    }
+
+    // ── the reschedule kick ────────────────────────────────────────────────
+    //
+    // The other interrupt this module sends: no payload, no ack, no wait. It
+    // exists only so a CPU looks at its run queue now instead of at its next
+    // 250 Hz tick, and until this tanda it had a body on x86_64 alone.
+
+    #[test]
+    fn an_id_past_the_tables_is_never_kicked() {
+        let _g = test_lock();
+        // Every delivery ends in a `1 << id` — an SBI hart mask, a GICv2
+        // target list, a table index. Past the word that is not a no-op.
+        assert!(!wake_kick_wanted(MAX_CORE_NUM));
+        assert!(!wake_kick_wanted(64));
+        assert!(!wake_kick_wanted(usize::MAX));
+    }
+
+    #[test]
+    fn we_do_not_interrupt_ourselves_to_look_at_our_own_run_queue() {
+        let _g = test_lock();
+        let me = crate::cpu::cpu_id() as usize;
+        let before = CPU_ONLINE.load(Ordering::Acquire);
+        // Online, so the only thing left to refuse it on is that it is us.
+        // `send_wake_ipi(me)` is reachable: a wake raised from an interrupt
+        // handler on this CPU, for a task this CPU owns, while this CPU's
+        // sleeping bit is still published (it is cleared only after
+        // `wait_for_interrupt` returns).
+        mark_cpu_online(me);
+        assert!(!wake_kick_wanted(me));
+        CPU_ONLINE.store(before, Ordering::Release);
+    }
+
+    #[test]
+    fn a_cpu_that_never_came_online_is_not_worth_an_interrupt() {
+        let _g = test_lock();
+        let cpu = scratch_cpu(9);
+        let before = CPU_ONLINE.load(Ordering::Acquire);
+
+        CPU_ONLINE.fetch_and(!(1u64 << cpu), Ordering::Release);
+        assert!(
+            !wake_kick_wanted(cpu),
+            "an AP that failed to start runs no task to wake"
+        );
+        mark_cpu_online(cpu);
+        assert!(wake_kick_wanted(cpu));
+
+        CPU_ONLINE.store(before, Ordering::Release);
+    }
+
+    #[test]
+    fn the_kick_does_not_wait_for_a_cpu_to_announce_itself_ready_for_ipis() {
+        let _g = test_lock();
+        let cpu = scratch_cpu(10);
+        let before_online = CPU_ONLINE.load(Ordering::Acquire);
+        let before_ready = IPI_READY.load(Ordering::Acquire);
+
+        // `IPI_READY` is published from the executor's own entry path, and a
+        // reschedule kick exists precisely to poke a CPU sitting in that loop.
+        // Gating on it would make the kick depend on the thing it pokes, so a
+        // CPU that is online but has not yet said "ready" is still kicked —
+        // unlike a shootdown, which does wait for that narrower set.
+        mark_cpu_online(cpu);
+        IPI_READY.fetch_and(!(1u64 << cpu), Ordering::Release);
+        assert!(wake_kick_wanted(cpu));
+
+        IPI_READY.store(before_ready, Ordering::Release);
+        CPU_ONLINE.store(before_online, Ordering::Release);
     }
 
     // ── the shootdown protocol ─────────────────────────────────────────────
