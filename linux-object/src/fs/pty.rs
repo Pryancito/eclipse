@@ -224,6 +224,7 @@ impl Pty {
             let oflag = inner.termios.c_oflag;
             let cc = inner.termios.c_cc;
             let kill_echo = inner.termios.kill_echo();
+            let utf8 = inner.termios.utf8_input();
             for &b in data {
                 let mut c = b;
                 // Input CR/NL translation.
@@ -357,23 +358,28 @@ impl Pty {
                         // Word erase: drop trailing blanks, then the word.
                         // ECHO alone gates it: with `stty -echo` nothing at all
                         // may reach the terminal (see VERASE below).
+                        //
+                        // One rubout per column, so the bytes that only
+                        // continue a character do not each ask for one.
                         let echo = lflag & ECHO != 0;
-                        while matches!(inner.canon.back(), Some(&b' ') | Some(&b'\t')) {
-                            inner.canon.pop_back();
-                            if echo {
+                        let rub = |inner: &mut PtyInner, wake: &mut bool| {
+                            let b = match inner.canon.pop_back() {
+                                Some(b) => b,
+                                None => return,
+                            };
+                            if echo && !(utf8 && utf8_continuation(b)) {
                                 inner.output.extend(b"\x08 \x08");
-                                wake_master = true;
+                                *wake = true;
                             }
+                        };
+                        while matches!(inner.canon.back(), Some(&b' ') | Some(&b'\t')) {
+                            rub(&mut inner, &mut wake_master);
                         }
                         while let Some(&b) = inner.canon.back() {
                             if b == b' ' || b == b'\t' {
                                 break;
                             }
-                            inner.canon.pop_back();
-                            if echo {
-                                inner.output.extend(b"\x08 \x08");
-                                wake_master = true;
-                            }
+                            rub(&mut inner, &mut wake_master);
                         }
                     } else if iexten && cc[VREPRINT] != 0 && c == cc[VREPRINT] {
                         // Reprint the pending line on a fresh line.
@@ -404,7 +410,23 @@ impl Pty {
                         // onlooker the secret was being edited. Linux's n_tty
                         // and this kernel's own console (`stdio.rs`) both gate
                         // on ECHO first.
-                        if inner.canon.pop_back().is_some() && lflag & ECHO != 0 {
+                        //
+                        // And it takes a *character*, not a byte. The line is
+                        // kept as bytes, so under IUTF8 a `ñ` is two of them
+                        // and taking one leaves half a character behind, which
+                        // the program then reads as a byte that cannot be
+                        // decoded. One rubout either way: however many bytes
+                        // spell the character, it stands in one column.
+                        let n = if utf8 {
+                            let tail: alloc::vec::Vec<u8> = inner.canon.iter().copied().collect();
+                            utf8_erase_len(&tail)
+                        } else {
+                            usize::from(!inner.canon.is_empty())
+                        };
+                        for _ in 0..n {
+                            inner.canon.pop_back();
+                        }
+                        if n > 0 && lflag & ECHO != 0 {
                             if lflag & ECHOE != 0 {
                                 inner.output.extend(b"\x08 \x08");
                             } else {
@@ -413,7 +435,15 @@ impl Pty {
                             wake_master = true;
                         }
                     } else if cc[VKILL] != 0 && c == cc[VKILL] {
-                        let n = inner.canon.len();
+                        let n = if utf8 {
+                            inner
+                                .canon
+                                .iter()
+                                .filter(|&&b| !utf8_continuation(b))
+                                .count()
+                        } else {
+                            inner.canon.len()
+                        };
                         inner.canon.clear();
                         // ECHOKE rubs the line out, ECHOK leaves it on screen
                         // and moves to the next one, neither shows anything.
@@ -424,6 +454,7 @@ impl Pty {
                         // cases since it was written.
                         match kill_echo {
                             KillEcho::Rubout => {
+                                // One per column, not per byte.
                                 for _ in 0..n {
                                     inner.output.extend(b"\x08 \x08");
                                 }
@@ -1763,6 +1794,94 @@ mod tests {
         });
         p.master_write(b"a\nb");
         assert_eq!(master_drain(&p), "");
+    }
+
+    #[test]
+    fn backspace_over_an_accented_letter_takes_the_whole_letter() {
+        // `ñ` travels as 0xc3 0xb1. Taking one byte would leave the 0xc3 in
+        // the line, and the shell would then read a byte that is not a
+        // character. On a Spanish keyboard this is every `ñ` and every accent.
+        let p = pty();
+        p.master_write("añ".as_bytes());
+        let _ = master_drain(&p);
+        p.master_write(&[DEL]);
+        assert_eq!(master_drain(&p), "\x08 \x08", "one column, one rubout");
+        p.master_write(b"\n");
+        assert_eq!(slave_reads(&p), vec!["a\n"]);
+    }
+
+    #[test]
+    fn backspace_over_a_three_and_a_four_byte_character() {
+        for text in ["a€", "a😀"] {
+            let p = pty();
+            p.master_write(text.as_bytes());
+            let _ = master_drain(&p);
+            p.master_write(&[DEL]);
+            assert_eq!(master_drain(&p), "\x08 \x08", "{}", text);
+            p.master_write(b"\n");
+            assert_eq!(slave_reads(&p), vec!["a\n"], "{}", text);
+        }
+    }
+
+    #[test]
+    fn a_terminal_that_says_it_is_not_utf8_erases_one_byte() {
+        // IUTF8 is what says the line is characters. Without it the terminal
+        // is a byte pipe and Backspace takes a byte, which is what a program
+        // sending raw bytes through a cooked terminal is asking for.
+        let p = pty();
+        set_flags(&p, |t| t.c_iflag &= !I_IUTF8);
+        p.master_write("añ".as_bytes());
+        let _ = master_drain(&p);
+        p.master_write(&[DEL]);
+        p.master_write(b"\n");
+        // The 0xc3 survives, so what is read is not valid UTF-8.
+        let mut buf = [0u8; 16];
+        let n = p.slave_read(&mut buf).unwrap();
+        assert_eq!(&buf[..n], &[b'a', 0xc3, b'\n']);
+    }
+
+    #[test]
+    fn backspace_on_an_empty_line_still_shows_nothing() {
+        let p = pty();
+        p.master_write(&[DEL]);
+        assert_eq!(master_drain(&p), "");
+    }
+
+    #[test]
+    fn word_erase_counts_columns_and_not_bytes() {
+        // `añb` is four bytes and three columns. One rubout per byte would
+        // walk the cursor one place too far and paint over what is left of the
+        // prompt.
+        let p = pty();
+        p.master_write("hola añb".as_bytes());
+        let _ = master_drain(&p);
+        p.master_write(&[CTRL_W]);
+        assert_eq!(master_drain(&p), "\x08 \x08".repeat(3));
+        p.master_write(b"\n");
+        assert_eq!(slave_reads(&p), vec!["hola \n"]);
+    }
+
+    #[test]
+    fn the_kill_rubout_counts_columns_and_not_bytes() {
+        let p = pty();
+        set_flags(&p, |t| t.c_lflag |= L_ECHOKE);
+        p.master_write("añ€".as_bytes());
+        let _ = master_drain(&p);
+        p.master_write(&[CTRL_U]);
+        assert_eq!(master_drain(&p), "\x08 \x08".repeat(3));
+    }
+
+    #[test]
+    fn a_multibyte_character_arrives_whole_however_it_was_written() {
+        // A terminal emulator may hand over the two bytes of `ñ` in separate
+        // writes; the line discipline may not treat the halves as characters
+        // of their own.
+        let p = pty();
+        for b in "ñ".as_bytes() {
+            p.master_write(&[*b]);
+        }
+        p.master_write(b"\n");
+        assert_eq!(slave_reads(&p), vec!["ñ\n"]);
     }
 
     #[test]

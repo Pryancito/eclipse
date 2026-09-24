@@ -40,8 +40,16 @@ impl Termios {
     /// Defaults aligned with Linux `n_tty` cooked TTY settings.
     pub const fn default_tty() -> Self {
         Self {
-            // ICRNL | IXON | IMAXBEL
-            c_iflag: 0x2500,
+            // ICRNL | IXON | IMAXBEL | IUTF8.
+            //
+            // Linux's own `INIT_C_IFLAG` has no `IUTF8`: there it is `agetty`
+            // or `login` that turns it on once it knows the locale, and the
+            // default dates from before terminals were UTF-8 at all. This
+            // system has neither, and its console, its keymaps and every shell
+            // on it are UTF-8, so a terminal that starts without the flag
+            // starts wrong: Backspace over `ñ` would take one of its two bytes
+            // and leave the other.
+            c_iflag: 0x6500,
             // OPOST | ONLCR
             c_oflag: 0x0005,
             // B38400 | CS8 | CREAD | HUPCL
@@ -79,6 +87,40 @@ pub const L_ECHOK: u32 = 0x0020;
 pub const L_ECHONL: u32 = 0x0040;
 /// `c_lflag` bit: the line-kill character rubs the line out instead.
 pub const L_ECHOKE: u32 = 0x0800;
+
+/// `c_iflag` bit: input is UTF-8, so line editing works on characters.
+pub const I_IUTF8: u32 = 0x4000;
+
+/// Whether `b` continues a UTF-8 character rather than starting one.
+///
+/// A rubout moves the cursor one column, and a character several bytes long
+/// still occupies one, so this is what tells a byte that needs its own rubout
+/// from one that rides along with the byte before it.
+pub fn utf8_continuation(b: u8) -> bool {
+    b & 0xc0 == 0x80
+}
+
+/// How many bytes at the end of `line` make up the one character that a single
+/// erase should take away.
+///
+/// A terminal that stores its pending line as bytes has to be told that a
+/// character can be more than one of them, or Backspace over `ñ` leaves the
+/// `0xc3` behind: half a character, which is not a character at all, and which
+/// the program then reads as a byte that cannot be decoded.
+///
+/// Malformed input still moves: a run of continuation bytes with nothing
+/// starting it is capped at the four bytes a character can be, so an erase
+/// always takes at least one byte and never walks off the line.
+pub fn utf8_erase_len(line: &[u8]) -> usize {
+    if line.is_empty() {
+        return 0;
+    }
+    let mut n = 1;
+    while n < line.len() && n < 4 && utf8_continuation(line[line.len() - n]) {
+        n += 1;
+    }
+    n
+}
 
 /// What a `read` on a terminal in non-canonical mode may do right now.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -202,6 +244,12 @@ impl Termios {
         } else {
             KillEcho::Nothing
         }
+    }
+
+    /// True when the terminal says its input is UTF-8 (`IUTF8`), which is what
+    /// makes line editing work on characters instead of bytes.
+    pub fn utf8_input(&self) -> bool {
+        self.c_iflag & I_IUTF8 != 0
     }
 
     /// True when a newline typed in canonical mode is echoed.
@@ -589,6 +637,62 @@ mod termios_tests {
         assert_eq!(t.noncanon_read(0, 64, true), TtyRead::Wait);
         assert_eq!(t.noncanon_read(2, 64, true), TtyRead::Take(2));
         assert_eq!(t.noncanon_read(2, 64, false), TtyRead::Wait);
+    }
+
+    #[test]
+    fn an_erase_takes_the_whole_character_and_not_one_of_its_bytes() {
+        // `ñ` is 0xc3 0xb1 and `€` is 0xe2 0x82 0xac. Taking one byte leaves
+        // half a character, which is not a character at all: the program then
+        // reads a byte that cannot be decoded, and the screen and the line no
+        // longer agree on how much is there.
+        assert_eq!(utf8_erase_len(b"hola"), 1);
+        assert_eq!(utf8_erase_len("añ".as_bytes()), 2);
+        assert_eq!(utf8_erase_len("a€".as_bytes()), 3);
+        assert_eq!(utf8_erase_len("a😀".as_bytes()), 4);
+    }
+
+    #[test]
+    fn an_erase_on_an_empty_line_takes_nothing() {
+        assert_eq!(utf8_erase_len(b""), 0);
+    }
+
+    #[test]
+    fn malformed_input_still_erases_and_never_walks_off_the_line() {
+        // A run of continuation bytes with nothing starting them cannot be a
+        // character. An erase that kept walking would empty the whole line on
+        // one Backspace; one that refused to move would wedge it.
+        assert_eq!(utf8_erase_len(&[0x80]), 1);
+        assert_eq!(utf8_erase_len(&[0x80, 0x80, 0x80, 0x80, 0x80]), 4);
+        assert_eq!(utf8_erase_len(&[b'a', 0x80]), 2);
+    }
+
+    #[test]
+    fn only_the_bytes_that_ride_along_are_continuations() {
+        // One rubout per column: the lead byte of a character asks for one,
+        // the bytes that only continue it do not.
+        for c in ['a', 'ñ', '€', '😀'] {
+            let mut buf = [0u8; 4];
+            let bytes = c.encode_utf8(&mut buf).as_bytes();
+            assert!(!utf8_continuation(bytes[0]), "{} starts a character", c);
+            for &b in &bytes[1..] {
+                assert!(utf8_continuation(b), "{} continues with {:#x}", c, b);
+            }
+            assert_eq!(
+                bytes.iter().filter(|&&b| !utf8_continuation(b)).count(),
+                1,
+                "{} is one column",
+                c
+            );
+        }
+    }
+
+    #[test]
+    fn the_stock_terminal_says_its_input_is_utf8() {
+        // Linux's INIT_C_IFLAG has no IUTF8 — there `agetty` turns it on once
+        // it knows the locale. This system has no `agetty`, and its console,
+        // its keymaps and every shell on it are UTF-8.
+        assert_eq!(I_IUTF8, 0o040000);
+        assert!(Termios::default_tty().utf8_input());
     }
 
     #[test]
