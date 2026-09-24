@@ -26,6 +26,18 @@ pub(crate) fn executor_ready_mask() -> u64 {
 
 /// Set the ready mask outright, for the grace-period tests in `executor`,
 /// which have to stand in for CPUs this host does not have.
+/// The one lock every test that touches this module's reschedule globals
+/// takes. It lives here, and not in each test module, because `waker_page`'s
+/// wake tests reach these same globals through `WakerRef` — two locks would
+/// leave the recorded IPI sender and the sleeping mask racing between the two
+/// files. CI runs `--test-threads=1` and would never notice; anyone running
+/// `cargo test` locally would, intermittently.
+#[cfg(test)]
+pub(crate) fn resched_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 #[cfg(test)]
 pub(crate) fn set_executor_ready_mask_for_test(mask: u64) -> u64 {
     EXECUTOR_READY.swap(mask, Ordering::SeqCst)
@@ -2134,8 +2146,7 @@ mod resched_tests {
     use super::*;
 
     fn test_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+        super::resched_test_lock()
     }
 
     /// CPUs the recording sender has been asked to kick, as a bitmask, and how
