@@ -116,6 +116,37 @@ impl LogicalIdMap {
         true
     }
 
+    /// Forget the registration for `logical`: the CPU it named will never run
+    /// kernel code, or has been given its id back by the SMP bring-up.
+    ///
+    /// Returns whether anything was actually registered.
+    ///
+    /// Clearing the bit is the whole operation. [`Self::resolve`] validates the
+    /// byte-table fast path against `registered` before believing it
+    /// ([`Self::confirms`]) and its fallback [`Self::scan`] walks the
+    /// registered set alone, so a stale `byte_to_logical` or `hw_of_logical`
+    /// entry is unreachable the moment the bit is gone — and leaving them lets
+    /// a later `register` overwrite them in place rather than in two steps.
+    ///
+    /// The caller that needs this is x86 AP bring-up: an AP that never latched
+    /// its trampoline slot is given its dense id back, and its own comment
+    /// says such an AP **may still wake up later**. Without this, that CPU
+    /// resolves to the id it was stripped of and is accepted by every lock, by
+    /// `percpu::register` and by the scheduler — while the reverse map in
+    /// `kernel-hal` no longer knows a hardware id for it, so **no IPI can
+    /// reach it**. A CPU that runs, takes locks and cannot be signalled is the
+    /// shootdown initiator waiting for an acknowledgement that cannot come.
+    /// With the bit cleared it resolves to [`NO_CPU`] instead, which every
+    /// guard above already refuses by name.
+    pub fn unregister(&self, logical: u8) -> bool {
+        let idx = logical as usize;
+        if idx >= MAX_CORE_NUM {
+            return false;
+        }
+        let bit = 1u64 << idx;
+        self.registered.fetch_and(!bit, Ordering::Release) & bit != 0
+    }
+
     /// Whether any CPU has been registered yet.
     ///
     /// Before the first one, the boot CPU is the only thing running and is
@@ -482,6 +513,105 @@ mod logical_id_tests {
         // not keep vouching for the old logical id.
         map.register(4, 2);
         assert_eq!(map.resolve(4), 2);
+    }
+    // ── giving a logical id back ─────────────────────────────────────────
+
+    #[test]
+    fn a_cpu_whose_id_was_taken_back_resolves_to_nobody() {
+        // The x86 bring-up gives an AP its dense id back when it never latched
+        // its trampoline slot, and its own comment says that AP may still wake
+        // up later. If it does, this is the answer it must get.
+        let map = LogicalIdMap::new();
+        assert!(map.register(0x11, 0));
+        assert!(map.register(0x22, 1));
+        assert_eq!(map.resolve(0x22), 1);
+        assert!(map.unregister(1));
+        assert_eq!(map.resolve(0x22), NO_CPU);
+        assert_eq!(map.hw_of(1), None);
+    }
+
+    #[test]
+    fn the_byte_table_does_not_keep_answering_for_a_id_given_back() {
+        // `resolve`'s fast path is a single load of `byte_to_logical`, and an
+        // id below 256 is exactly what a LAPIC in xAPIC mode reports. The
+        // stale byte entry stays behind on purpose; what must not stay is its
+        // being believed.
+        let map = LogicalIdMap::new();
+        assert!(map.register(0, 0));
+        assert!(map.register(7, 3));
+        assert_eq!(map.resolve(7), 3);
+        assert!(map.unregister(3));
+        assert_eq!(
+            map.resolve(7),
+            NO_CPU,
+            "the byte table answered for an id nobody holds"
+        );
+    }
+
+    #[test]
+    fn taking_one_id_back_leaves_its_neighbours_alone() {
+        let map = LogicalIdMap::new();
+        for (hw, logical) in [(0x10, 0), (0x20, 1), (0x30, 2)] {
+            assert!(map.register(hw, logical));
+        }
+        assert!(map.unregister(1));
+        assert_eq!(map.resolve(0x10), 0);
+        assert_eq!(map.resolve(0x20), NO_CPU);
+        assert_eq!(map.resolve(0x30), 2);
+    }
+
+    #[test]
+    fn an_id_handed_to_the_next_cpu_answers_for_that_one_and_not_the_dead_one() {
+        // `CpuTopology::unregister` gives the id back to be handed out again.
+        // Both hardware ids then point at the same slot in the byte table
+        // until the second `register` overwrites it; only one of them may be
+        // believed afterwards.
+        let map = LogicalIdMap::new();
+        assert!(map.register(0, 0));
+        assert!(map.register(9, 1));
+        assert!(map.unregister(1));
+        assert!(map.register(11, 1));
+        assert_eq!(map.resolve(11), 1);
+        assert_eq!(
+            map.resolve(9),
+            NO_CPU,
+            "the AP that never started still answers as a live CPU"
+        );
+    }
+
+    #[test]
+    fn a_published_id_that_was_taken_back_is_no_longer_believed() {
+        // `accepts_published` is the guard against a corrupted GS naming a CPU
+        // that does not exist. An id left registered for nobody is a number
+        // that guard would wave through.
+        let map = LogicalIdMap::new();
+        assert!(map.register(0, 0));
+        assert!(map.register(5, 4));
+        assert!(map.accepts_published(4));
+        assert!(map.unregister(4));
+        assert!(!map.accepts_published(4));
+    }
+
+    #[test]
+    fn taking_back_an_id_nobody_registered_says_so_and_changes_nothing() {
+        let map = LogicalIdMap::new();
+        assert!(map.register(0, 0));
+        assert!(!map.unregister(2));
+        assert!(!map.unregister(NO_CPU));
+        assert_eq!(map.resolve(0), 0);
+    }
+
+    #[test]
+    fn taking_back_the_last_id_returns_to_the_pre_smp_window() {
+        // With nothing registered, `resolve` answers 0 by definition: only the
+        // boot CPU runs there. Clearing the last bit must land back in that
+        // window rather than somewhere in between.
+        let map = LogicalIdMap::new();
+        assert!(map.register(0x40, 0));
+        assert!(map.any_registered());
+        assert!(map.unregister(0));
+        assert!(!map.any_registered());
+        assert_eq!(map.resolve(0x40), 0);
     }
 }
 

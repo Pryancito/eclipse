@@ -294,15 +294,31 @@ fn register_cpu(apic_id: u32) -> Option<usize> {
     Some(logical)
 }
 
-/// Undo the most recent [`register_cpu`] for `logical`.
+/// Undo the most recent [`register_cpu`] for `logical`, in **both** maps.
 ///
 /// Used when an AP that had already been assigned an id turns out not to be
 /// startable (no stack, never latched its trampoline slot). Leaving the id
 /// registered inflates `cpu_count()` — which userspace reads through
 /// `/proc/cpuinfo` and `sched_getaffinity` — with a core that will never run,
 /// and leaves a `logical_to_apic` entry that invites IPIs to a dead CPU.
+///
+/// Both, because `register_cpu` wires both and the two callers below say in
+/// their own comments that such an AP **may still wake up later**. Clearing
+/// only the reverse map left that CPU in the worst of the two states: `lock`'s
+/// forward map still resolved its LAPIC id to `logical`, so every kernel lock,
+/// `percpu::register` and the scheduler accepted it as that CPU — while
+/// `logical_to_apic(logical)` was now `None`, so **no IPI could reach it**. A
+/// CPU that runs, takes locks and cannot be signalled is a shootdown initiator
+/// waiting, without a timeout, for an acknowledgement that cannot come. With
+/// the forward map cleared too it resolves to `lock::NO_CPU`, which every
+/// guard above already refuses by name.
 fn unregister_cpu(logical: usize) {
     TOPOLOGY.unregister(logical);
+    // `MAX_CORE_NUM <= 64` (asserted in `cpu_topology`), so a logical id that
+    // exists always fits the `u8` the forward map is keyed by.
+    if logical < crate::config::MAX_CORE_NUM {
+        lock::clear_logical_cpu_id(logical as u8);
+    }
 }
 
 /// Called by a starting AP once its own LAPIC is fully configured: publish the
