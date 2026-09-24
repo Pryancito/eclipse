@@ -40,9 +40,6 @@ use crate::fs::stdio::wake_tty_intr_waiters;
 const INLCR: u32 = 0x0040;
 const IGNCR: u32 = 0x0080;
 const ICRNL: u32 = 0x0100;
-// c_oflag
-const OPOST: u32 = 0x0001;
-const ONLCR: u32 = 0x0004;
 // c_lflag
 const ICANON: u32 = 0x0002;
 const ECHO: u32 = 0x0008;
@@ -73,6 +70,10 @@ struct PtyInner {
     /// and the only way out is closing the master.
     eof_pending: bool,
     termios: Termios,
+    /// Where the cursor sits on the master's line, counted the way the driver
+    /// counts it. `ONOCR` is defined in terms of this and `ONLRET` exists to
+    /// keep it honest; see [`Termios::output_char`].
+    out_column: usize,
     winsize: ConsoleWinSize,
     /// Foreground process group of the slave (`TIOCSPGRP`), for job control
     /// and signal delivery (Ctrl-C).
@@ -92,6 +93,7 @@ impl PtyInner {
             canon: VecDeque::new(),
             eof_pending: false,
             termios: Termios::default_tty(),
+            out_column: 0,
             winsize: ConsoleWinSize {
                 ws_row: 24,
                 ws_col: 80,
@@ -259,15 +261,13 @@ impl PtyInner {
     }
 
     /// Process bytes written by the slave (program output) toward the master,
-    /// applying `OPOST`/`ONLCR` (NL → CR-NL).
+    /// applying the whole of `c_oflag`, not just `ONLCR`.
     fn slave_output(&mut self, buf: &[u8]) {
-        let opost = self.termios.c_oflag & OPOST != 0;
-        let onlcr = self.termios.c_oflag & ONLCR != 0;
         for &b in buf {
-            if opost && onlcr && b == b'\n' {
-                self.push_output(b'\r');
+            let out = self.termios.output_char(b, &mut self.out_column);
+            for &o in out.as_bytes() {
+                self.push_output(o);
             }
-            self.push_output(b);
         }
     }
 }
@@ -1065,9 +1065,43 @@ mod tests {
     #[test]
     fn opost_off_leaves_the_output_exactly_as_written() {
         let mut p = pty();
-        p.termios.c_oflag &= !OPOST;
+        p.termios.c_oflag &= !O_OPOST;
         p.slave_output(b"a\nb");
         assert_eq!(shown_on_screen(&mut p), b"a\nb");
+    }
+
+    #[test]
+    fn opost_on_its_own_is_not_onlcr() {
+        // This site asked for `OPOST && ONLCR` together, so `stty opost
+        // -onlcr` behaved like raw output instead of post-processed output
+        // with nothing to translate.
+        let mut p = pty();
+        p.termios.c_oflag = O_OPOST;
+        p.slave_output(b"a\nb");
+        assert_eq!(shown_on_screen(&mut p), b"a\nb");
+    }
+
+    #[test]
+    fn ocrnl_and_onocr_reach_the_screen() {
+        let mut p = pty();
+        p.termios.c_oflag = O_OPOST | O_OCRNL;
+        p.slave_output(b"a\rb");
+        assert_eq!(shown_on_screen(&mut p), b"a\nb");
+
+        let mut p = pty();
+        p.termios.c_oflag = O_OPOST | O_ONOCR;
+        p.slave_output(b"\rab\r");
+        assert_eq!(shown_on_screen(&mut p), b"ab\r");
+    }
+
+    #[test]
+    fn the_column_carries_across_separate_writes() {
+        // Where the last write left the cursor is where the next one starts.
+        let mut p = pty();
+        p.termios.c_oflag = O_OPOST | O_ONOCR;
+        p.slave_output(b"ab");
+        p.slave_output(b"\r");
+        assert_eq!(shown_on_screen(&mut p), b"ab\r");
     }
 
     // --------------------------------------------------------------- limits

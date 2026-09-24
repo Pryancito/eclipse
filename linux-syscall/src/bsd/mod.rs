@@ -250,7 +250,13 @@ impl Syscall<'_> {
             // which process group it is in.
             sys::GETSID => BsdRet::from_result(self.sys_getsid(a0 as _)),
             sys::SETSID => BsdRet::from_result(self.sys_setsid()),
-            sys::ISSETUGID => BsdRet::ok(0),
+            // `issetugid(2)`: 1 when this process's ids are not the ones
+            // it was started with. A constant 0 is the answer a program
+            // trusts before it decides that the environment it was handed is
+            // its own -- which is exactly the decision a set-user-ID program
+            // must not make. `P_SUGID` is kept on the process; see
+            // `LinuxProcess::is_sugid`.
+            sys::ISSETUGID => BsdRet::ok(self.linux_process().is_sugid() as usize),
             sys::KILL => BsdRet::from_result(self.sys_kill(a0 as isize, a1)),
             sys::FORK => BsdRet::from_result(self.sys_fork(0, 0)),
             sys::VFORK => BsdRet::from_result(self.sys_vfork(0, 0).await),

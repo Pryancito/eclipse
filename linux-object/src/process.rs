@@ -4,6 +4,7 @@ use crate::{
     error::{LxError, LxResult},
     fs::{File, FileDesc, FileLike, OpenFlags},
     ipc::*,
+    loader::AuxIdentity,
     net::SOCKET_FD,
     signal::{Signal as LinuxSignal, SignalAction, Sigset},
 };
@@ -60,6 +61,9 @@ const ACCESS_EXEC: u16 = 0o1;
 const MODE_PERM_MASK: u16 = 0o7777;
 const MODE_SET_UID: u16 = 0o4000;
 const MODE_SET_GID: u16 = 0o2000;
+/// The group-execute bit. `S_ISGID` means set-group-ID only when it is set
+/// too; on a file without it the bit is the mandatory-locking convention.
+const MODE_EXEC_GRP: u16 = 0o0010;
 const MODE_STICKY: u16 = 0o1000;
 
 #[derive(Clone, Debug)]
@@ -877,6 +881,18 @@ struct LinuxProcessInner {
     /// once set it can never be cleared, is inherited across fork and execve,
     /// and stops `execve` from granting setuid/setgid privilege elevation.
     no_new_privs: bool,
+    /// FreeBSD's `P_SUGID`, which is what `issetugid(2)` reports: this
+    /// process's ids are not the ones it was started with, so neither its
+    /// environment nor its address space can be assumed to be its own.
+    ///
+    /// Sticky on purpose, and `kern_prot.c` says why: "This is significant
+    /// for procs that start as root and 'become' a user without an exec --
+    /// programs cannot know *everything* that libc *might* have put in their
+    /// data segment." So every `set*id` that moves an id latches it, it is
+    /// inherited across `fork` (`p2->p_flag |= p1->p_flag & P_SUGID`), and
+    /// only `execve` can clear it -- by recomputing it, which is the same
+    /// question Linux answers as `bprm->secureexec` ([`Self::apply_exec_ids`]).
+    sugid: bool,
     /// `prctl(PR_SET_DUMPABLE)`: `None` means "never set" and reads as the
     /// Linux default `SUID_DUMP_USER` (1).
     dumpable: Option<u8>,
@@ -1813,6 +1829,25 @@ impl LinuxProcess {
             .apply_exec_ids(metadata.mode, metadata.uid as u32, metadata.gid as u32)
     }
 
+    /// FreeBSD's `issetugid(2)`: whether this process's ids have moved since
+    /// it was started, so that its environment and its data segment were
+    /// arranged by someone who is not who it is now.
+    pub fn is_sugid(&self) -> bool {
+        self.inner.lock().sugid
+    }
+
+    /// The aux-vector identity block to hand the image `execve` is about to
+    /// load: who this process runs as now that the set-user-ID bits have been
+    /// honoured, and `privileged`, which is what
+    /// [`Self::apply_exec_metadata`] just returned.
+    ///
+    /// Built here, under the one lock, so that no caller has to remember
+    /// which of the three user ids `AT_UID` means (the real one -- `AT_EUID`
+    /// is the effective one) or that the block has to agree with itself.
+    pub fn aux_identity(&self, privileged: bool) -> AuxIdentity {
+        self.inner.lock().aux_identity(privileged)
+    }
+
     /// What `execve` must make the PROCESS forget, once the old address space
     /// is gone. `privileged` is Linux's `bprm->secureexec`, which
     /// [`Self::apply_exec_metadata`] returns.
@@ -1826,21 +1861,28 @@ impl LinuxProcess {
 
     /// Set supplementary groups.
     pub fn set_groups(&self, groups: Vec<u32>) {
-        self.inner.lock().credentials.groups = groups;
+        let mut inner = self.inner.lock();
+        inner.credentials.groups = groups;
+        // `kern_setgroups()` calls `setsugid(p)` unconditionally -- it does
+        // not compare the lists first, and neither does this.
+        inner.sugid = true;
     }
 
     /// Set uid according to current privileges.
     pub fn set_uid(&self, uid: u32) -> LxResult {
         let mut inner = self.inner.lock();
+        let before = inner.ids();
         let privileged = inner.credentials.euid == ROOT_UID;
         if privileged {
             inner.credentials.ruid = uid;
             inner.credentials.euid = uid;
             inner.credentials.suid = uid;
+            inner.note_id_change(before);
             return Ok(());
         }
         if Self::setid_allowed(inner.credentials.ruid, inner.credentials.suid, uid) {
             inner.credentials.euid = uid;
+            inner.note_id_change(before);
             Ok(())
         } else {
             Err(LxError::EPERM)
@@ -1850,15 +1892,18 @@ impl LinuxProcess {
     /// Set gid according to current privileges.
     pub fn set_gid(&self, gid: u32) -> LxResult {
         let mut inner = self.inner.lock();
+        let before = inner.ids();
         let privileged = inner.credentials.euid == ROOT_UID;
         if privileged {
             inner.credentials.rgid = gid;
             inner.credentials.egid = gid;
             inner.credentials.sgid = gid;
+            inner.note_id_change(before);
             return Ok(());
         }
         if Self::setid_allowed(inner.credentials.rgid, inner.credentials.sgid, gid) {
             inner.credentials.egid = gid;
+            inner.note_id_change(before);
             Ok(())
         } else {
             Err(LxError::EPERM)
@@ -1868,6 +1913,7 @@ impl LinuxProcess {
     /// Set real/effective uid.
     pub fn set_reuid(&self, ruid: u32, euid: u32) -> LxResult {
         let mut inner = self.inner.lock();
+        let before = inner.ids();
         let privileged = inner.credentials.euid == ROOT_UID;
         if !privileged {
             if ruid != NO_ID
@@ -1889,12 +1935,14 @@ impl LinuxProcess {
         if Self::setreid_updates_saved(ruid, euid, old_ruid) {
             inner.credentials.suid = inner.credentials.euid;
         }
+        inner.note_id_change(before);
         Ok(())
     }
 
     /// Set real/effective gid.
     pub fn set_regid(&self, rgid: u32, egid: u32) -> LxResult {
         let mut inner = self.inner.lock();
+        let before = inner.ids();
         let privileged = inner.credentials.euid == ROOT_UID;
         if !privileged {
             if rgid != NO_ID
@@ -1916,12 +1964,14 @@ impl LinuxProcess {
         if Self::setreid_updates_saved(rgid, egid, old_rgid) {
             inner.credentials.sgid = inner.credentials.egid;
         }
+        inner.note_id_change(before);
         Ok(())
     }
 
     /// Set real/effective/saved uid.
     pub fn set_resuid(&self, ruid: u32, euid: u32, suid: u32) -> LxResult {
         let mut inner = self.inner.lock();
+        let before = inner.ids();
         let privileged = inner.credentials.euid == ROOT_UID;
         if !privileged {
             for uid in [ruid, euid, suid] {
@@ -1939,12 +1989,14 @@ impl LinuxProcess {
         if suid != NO_ID {
             inner.credentials.suid = suid;
         }
+        inner.note_id_change(before);
         Ok(())
     }
 
     /// Set real/effective/saved gid.
     pub fn set_resgid(&self, rgid: u32, egid: u32, sgid: u32) -> LxResult {
         let mut inner = self.inner.lock();
+        let before = inner.ids();
         let privileged = inner.credentials.euid == ROOT_UID;
         if !privileged {
             for gid in [rgid, egid, sgid] {
@@ -1962,6 +2014,7 @@ impl LinuxProcess {
         if sgid != NO_ID {
             inner.credentials.sgid = sgid;
         }
+        inner.note_id_change(before);
         Ok(())
     }
 
@@ -2238,31 +2291,108 @@ impl LinuxProcessInner {
     /// every field out makes the compiler ask the question again each time
     /// one is added.
     /// Honour the set-user-ID / set-group-ID bits of the image `execve` is
-    /// loading, and report whether doing so actually RAISED privileges --
-    /// Linux's `bprm->secureexec`.
+    /// loading, and report Linux's `bprm->secureexec`: whether the image about
+    /// to run is more privileged than whoever asked for it.
     ///
-    /// A set-user-ID bit naming the id the caller already runs as raises
-    /// nothing, and neither does a `no_new_privs` process, where the bits are
-    /// not honoured at all.
+    /// That answer decides two things -- the parent-death signal
+    /// [`Self::reset_for_exec`] drops, and the `AT_SECURE` the C library reads
+    /// before `main` ([`crate::loader::AuxIdentity`]) -- so it has to be
+    /// the whole rule, which `cap_bprm_creds_from_file()` (security/commoncap.c)
+    /// spells out as three questions, any one of which is enough:
+    ///
+    /// ```text
+    /// if (id_changed ||                        // this image granted an id
+    ///     !uid_eq(new->euid, old->uid) ||      // effective != REAL uid
+    ///     !gid_eq(new->egid, old->gid) || ...) // effective != REAL gid
+    ///         bprm->secureexec = 1;
+    /// ```
+    ///
+    /// The first question is about this exec; the other two are about the
+    /// process, and they are the ones that catch the case with no set-user-ID
+    /// bit in sight: a program that is *already* running set-user-ID root
+    /// keeps its effective id across `execve`, so the ordinary shell it execs
+    /// is every bit as privileged -- and every bit as unable to trust the
+    /// environment it was handed -- as the image that raised it.
     fn apply_exec_ids(&mut self, mode: u16, uid: u32, gid: u32) -> bool {
+        // The ids this exec starts from. `execve` never moves the real ones,
+        // so `ruid`/`rgid` below are `old->uid`/`old->gid` as well.
+        let old_euid = self.credentials.euid;
+        let old_egid = self.credentials.egid;
+
         // no_new_privs (Documentation/userspace-api/no_new_privs.rst): execve
         // must not grant privileges the process could not have gained on its
         // own — setuid/setgid bits on the image are simply not honoured.
-        if self.no_new_privs {
-            return false;
+        // Linux returns from `bprm_fill_uid()` here and goes on to compute
+        // `secureexec` regardless, which is the point: refusing to raise a
+        // process says nothing about how privileged it already was.
+        if !self.no_new_privs {
+            if (mode & MODE_SET_UID) != 0 {
+                self.credentials.euid = uid;
+                self.credentials.suid = uid;
+            }
+            // `(mode & (S_ISGID | S_IXGRP)) == (S_ISGID | S_IXGRP)`: a
+            // set-group-ID bit on a file the group cannot execute is not a
+            // set-group-ID program at all.
+            if (mode & (MODE_SET_GID | MODE_EXEC_GRP)) == (MODE_SET_GID | MODE_EXEC_GRP) {
+                self.credentials.egid = gid;
+                self.credentials.sgid = gid;
+            }
         }
-        let mut raised = false;
-        if (mode & MODE_SET_UID) != 0 {
-            raised |= self.credentials.euid != uid;
-            self.credentials.euid = uid;
-            self.credentials.suid = uid;
+
+        // `id_changed = !uid_eq(new->euid, old->euid) || !in_group_p(new->egid)`.
+        // The group half is deliberately not a comparison: joining a group the
+        // caller was already a member of grants nothing, so Linux asks whether
+        // the new effective group is one the caller already had.
+        let egid = self.credentials.egid;
+        let kept_group = egid == old_egid || self.credentials.groups.contains(&egid);
+        let id_changed = self.credentials.euid != old_euid || !kept_group;
+
+        let secure = id_changed
+            || self.credentials.euid != self.credentials.ruid
+            || self.credentials.egid != self.credentials.rgid;
+
+        // `do_execve()` asks the same three questions to decide FreeBSD's
+        // `P_SUGID`: `setsugid(p)` when the image granted an id, and
+        // `p->p_flag &= ~P_SUGID` only when it did not AND the effective ids
+        // already match the real ones. That is this `secure`, so an exec is
+        // the one event that can clear the taint -- by answering it again.
+        self.sugid = secure;
+
+        secure
+    }
+
+    /// The six ids `issetugid(2)` watches.
+    fn ids(&self) -> [u32; 6] {
+        let c = &self.credentials;
+        [c.ruid, c.euid, c.suid, c.rgid, c.egid, c.sgid]
+    }
+
+    /// FreeBSD's `setsugid()`: a `set*id` call that actually MOVED an id
+    /// taints the process for good. Written as a before/after comparison
+    /// rather than a line in each setter, because nine setters each
+    /// remembering to latch a flag is nine chances to forget one -- and the
+    /// one that forgets is a program that asks whether it is tainted and is
+    /// told no.
+    fn note_id_change(&mut self, before: [u32; 6]) {
+        if self.ids() != before {
+            self.sugid = true;
         }
-        if (mode & MODE_SET_GID) != 0 {
-            raised |= self.credentials.egid != gid;
-            self.credentials.egid = gid;
-            self.credentials.sgid = gid;
+    }
+
+    /// The aux-vector identity block for the image about to be loaded.
+    ///
+    /// The mapping is written once, here, because it is the kind that reads
+    /// correct either way round: `AT_UID` is the REAL user id and `AT_EUID`
+    /// the effective one, and a swap leaves a program that is told the
+    /// opposite of the truth about which id its accesses are checked against.
+    fn aux_identity(&self, privileged: bool) -> AuxIdentity {
+        AuxIdentity {
+            uid: self.credentials.ruid,
+            euid: self.credentials.euid,
+            gid: self.credentials.rgid,
+            egid: self.credentials.egid,
+            secure: privileged,
         }
-        raised
     }
 
     /// What `execve` must make the process forget, once the old address space
@@ -2330,6 +2460,10 @@ impl LinuxProcessInner {
             // fork(2)/prctl(2) inheritance: no_new_privs, dumpable, the
             // execution domain and THP setting carry over.
             no_new_privs: self.no_new_privs,
+            // `p2->p_flag |= p1->p_flag & P_SUGID` (kern_fork.c). The child
+            // is a copy of an address space someone else's libc filled in,
+            // so it inherits the doubt along with the memory.
+            sugid: self.sugid,
             dumpable: self.dumpable,
             personality: self.personality,
             abi: self.abi,
@@ -3426,6 +3560,7 @@ mod fork_inheritance_tests {
             job_stop_pending: true,
             job_continued_pending: true,
             has_execed: true,
+            sugid: true,
             ..Default::default()
         };
         p.cloexec_fds.insert(7.into());
@@ -3438,6 +3573,17 @@ mod fork_inheritance_tests {
 
     fn fork_of(parent: &LinuxProcessInner) -> LinuxProcessInner {
         parent.forked_child(41, 42)
+    }
+
+    #[test]
+    fn the_credential_taint_survives_the_fork() {
+        // `p2->p_flag |= p1->p_flag & P_SUGID` (kern_fork.c). The child is a
+        // copy of an address space that a more privileged program filled in,
+        // so it inherits the doubt along with the memory -- and a child that
+        // forgot it would answer `issetugid()` with 0 while holding exactly
+        // the data segment the flag exists to warn about.
+        let child = fork_of(&a_configured_parent());
+        assert!(child.sugid);
     }
 
     #[test]
@@ -3685,6 +3831,10 @@ mod exec_reset_tests {
         inner.credentials.rgid = 1000;
         inner.credentials.egid = 1000;
         inner.credentials.sgid = 1000;
+        // Its own group, not root's: `secureexec` asks whether the effective
+        // group is one this process already held, and a fixture left in group
+        // 0 answers that question for a user who is not in group 0.
+        inner.credentials.groups = vec![1000];
         inner
     }
 
@@ -3806,6 +3956,322 @@ mod exec_reset_tests {
         // that checks a constant with the same constant moves with it.
         assert_eq!(MODE_SET_UID, 0o4000);
         assert_eq!(MODE_SET_GID, 0o2000);
+        assert_eq!(MODE_EXEC_GRP, 0o0010);
+    }
+
+    // --- `bprm->secureexec` -------------------------------------------------
+    //
+    // `cap_bprm_creds_from_file()` asks three questions and takes any one of
+    // them as a yes. The first is about the image being loaded; the other two
+    // are about the process, and they are the ones a rule written only around
+    // the set-user-ID bits cannot see.
+
+    /// A process already running set-user-ID root: its real id is an ordinary
+    /// user's and its effective id is not. Whoever started it chose its
+    /// environment; whoever owns the id it runs as did not.
+    fn a_process_already_setuid_root() -> LinuxProcessInner {
+        let mut inner = a_process_about_to_exec();
+        inner.credentials.euid = ROOT_UID;
+        inner.credentials.suid = ROOT_UID;
+        inner
+    }
+
+    #[test]
+    fn an_already_privileged_process_is_secure_even_exec_ing_an_ordinary_image() {
+        // `!uid_eq(new->euid, old->uid)`. There is no set-user-ID bit in
+        // sight here: the effective id came from the PREVIOUS exec and
+        // survives this one, so the ordinary shell being loaded runs with
+        // exactly the same privilege -- and can trust the caller's
+        // LD_PRELOAD exactly as little.
+        let mut inner = a_process_already_setuid_root();
+        assert!(inner.apply_exec_ids(0o0755, ROOT_UID, ROOT_UID));
+        assert_eq!(inner.credentials.euid, ROOT_UID);
+        assert_eq!(inner.credentials.ruid, 1000);
+    }
+
+    #[test]
+    fn the_group_half_is_asked_on_its_own() {
+        // `!gid_eq(new->egid, old->gid)`. A set-group-ID program that reads
+        // the mail spool is privileged over its caller just as surely as a
+        // set-user-ID one, and a rule that only ever looked at the user half
+        // would hand it the caller's environment.
+        let mut inner = a_process_about_to_exec();
+        inner.credentials.egid = 0;
+        inner.credentials.sgid = 0;
+        assert!(inner.apply_exec_ids(0o0755, ROOT_UID, ROOT_UID));
+        assert_eq!(inner.credentials.egid, 0);
+        assert_eq!(inner.credentials.rgid, 1000);
+    }
+
+    #[test]
+    fn no_new_privs_does_not_make_an_already_privileged_process_look_safe() {
+        // Linux returns early from `bprm_fill_uid()` and computes
+        // `secureexec` afterwards regardless. Refusing to RAISE a process
+        // says nothing about how privileged it already was -- and answering
+        // "not secure" here would hand the caller's LD_PRELOAD to a process
+        // running as root, in the one mode whose whole purpose is that a
+        // sandbox can exec without granting anything.
+        let mut inner = a_process_already_setuid_root();
+        inner.no_new_privs = true;
+        assert!(inner.apply_exec_ids(0o6755, 1000, 1000));
+        // The bits were still not honoured: the image asked for uid 1000 and
+        // got nothing, which is the whole of what no_new_privs promises.
+        assert_eq!(inner.credentials.euid, ROOT_UID);
+        assert_eq!(inner.credentials.egid, 1000);
+    }
+
+    #[test]
+    fn an_exec_that_moves_an_id_is_a_change_even_when_the_ids_end_up_even() {
+        // `id_changed = !uid_eq(new->euid, old->euid)`, and it is a separate
+        // question from the two that compare against the real ids -- this is
+        // the case where only it can answer. A process running set-user-ID
+        // root (ruid 1000, euid 0) execs an image whose set-user-ID bit names
+        // 1000: the ids come out even, so both "effective != real" questions
+        // say no, and the exec still performed an id transition that the new
+        // image must be hardened against.
+        let mut inner = a_process_about_to_exec();
+        inner.credentials.euid = ROOT_UID;
+        inner.credentials.suid = ROOT_UID;
+        assert!(inner.apply_exec_ids(0o4755, 1000, ROOT_UID));
+        assert_eq!(inner.credentials.euid, 1000);
+        assert_eq!(inner.credentials.ruid, 1000);
+        assert_eq!(inner.credentials.egid, inner.credentials.rgid);
+    }
+
+    #[test]
+    fn a_setgid_bit_on_a_file_the_group_cannot_execute_is_not_a_setgid_program() {
+        // `(mode & (S_ISGID | S_IXGRP)) == (S_ISGID | S_IXGRP)`. Without the
+        // group-execute bit, S_ISGID is the mandatory-locking convention --
+        // an old, unrelated use of the same bit -- and honouring it would
+        // move a process's effective group for a file that never claimed to
+        // be a set-group-ID program at all.
+        let mut inner = a_process_about_to_exec();
+        assert!(!inner.apply_exec_ids(0o2744, ROOT_UID, ROOT_UID));
+        assert_eq!(inner.credentials.egid, 1000);
+        assert_eq!(inner.credentials.sgid, 1000);
+    }
+
+    #[test]
+    fn the_same_bit_with_group_execute_is_one() {
+        // The other side of the line above, so that the test pair pins the
+        // rule and not just one of its answers.
+        let mut inner = a_process_about_to_exec();
+        assert!(inner.apply_exec_ids(0o2754, ROOT_UID, ROOT_UID));
+        assert_eq!(inner.credentials.egid, ROOT_UID);
+        assert_eq!(inner.credentials.sgid, ROOT_UID);
+    }
+
+    #[test]
+    fn falling_back_to_a_group_the_caller_already_held_grants_nothing() {
+        // `in_group_p(new->egid)`: the group half of `id_changed` is a
+        // membership test, not a comparison. A process running set-group-ID
+        // root that execs a set-group-ID image naming a group it is already
+        // in has gained nothing to be hardened against -- it has given
+        // something up.
+        let mut inner = a_process_about_to_exec();
+        inner.credentials.egid = ROOT_UID;
+        inner.credentials.sgid = ROOT_UID;
+        inner.credentials.groups = vec![1000];
+        assert!(!inner.apply_exec_ids(0o2754, ROOT_UID, 1000));
+        assert_eq!(inner.credentials.egid, 1000);
+    }
+
+    #[test]
+    fn a_group_the_caller_did_not_hold_is_a_raise_even_back_to_its_own() {
+        // The same shape, minus the membership: Linux asks `in_group_p`,
+        // which knows nothing about the real group id, so a process whose
+        // supplementary list does not carry its own rgid is hardened when it
+        // returns to it. Written down because it looks like a mistake and is
+        // the rule as Linux states it.
+        let mut inner = a_process_about_to_exec();
+        inner.credentials.egid = ROOT_UID;
+        inner.credentials.sgid = ROOT_UID;
+        inner.credentials.groups = vec![ROOT_UID];
+        assert!(inner.apply_exec_ids(0o2754, ROOT_UID, 1000));
+        assert_eq!(inner.credentials.egid, 1000);
+    }
+
+    #[test]
+    fn an_ordinary_process_exec_ing_an_ordinary_image_is_not_secure() {
+        // The case every process on this machine is in, and the one that
+        // matters most to get right in THIS direction: answering "secure"
+        // here puts the whole system in secure mode, which drops LD_PRELOAD
+        // everywhere and makes GLib refuse to autolaunch a session bus.
+        let mut inner = LinuxProcessInner::default();
+        assert!(!inner.apply_exec_ids(0o0755, ROOT_UID, ROOT_UID));
+    }
+
+    // --- The aux-vector identity block --------------------------------------
+
+    #[test]
+    fn the_identity_block_carries_the_ids_the_new_image_will_run_with() {
+        // Built after `apply_exec_ids`, because that is when the ids are
+        // final -- and mapped here, once, so no caller has to remember that
+        // `AT_UID` is the REAL id while `AT_EUID` is the effective one.
+        let mut inner = a_process_already_setuid_root();
+        inner.credentials.rgid = 1001;
+        let id = inner.aux_identity(true);
+        assert_eq!(id.uid, 1000, "AT_UID is the REAL user id");
+        assert_eq!(id.euid, ROOT_UID, "AT_EUID is the EFFECTIVE user id");
+        assert_eq!(id.gid, 1001, "AT_GID is the REAL group id");
+        assert_eq!(id.egid, 1000, "AT_EGID is the EFFECTIVE group id");
+        assert!(id.secure);
+    }
+
+    #[test]
+    fn the_identity_block_reports_an_unprivileged_exec_as_such() {
+        let id = LinuxProcessInner::default().aux_identity(false);
+        assert!(!id.secure);
+        assert_eq!((id.uid, id.euid, id.gid, id.egid), (0, 0, 0, 0));
+    }
+}
+
+#[cfg(test)]
+mod sugid_tests {
+    //! `issetugid(2)`, the question a FreeBSD program asks before it decides
+    //! that the environment and the data segment it woke up with are its own:
+    //! "are my ids the ones I was started with?" It was answered with a
+    //! constant 0, which is the answer that makes a set-user-ID program trust
+    //! whatever its caller left in `MALLOC_OPTIONS` or `LD_*`.
+    //!
+    //! FreeBSD keeps it as `P_SUGID` on the process. It is deliberately
+    //! sticky -- `kern_prot.c` explains that a program that started as root
+    //! and *became* a user without an exec "cannot know everything that libc
+    //! might have put in their data segment" -- so these tests are mostly
+    //! about the two ways it must NOT be forgotten.
+
+    use super::dup_fd_tests::a_process;
+    use super::*;
+
+    #[test]
+    fn a_process_that_has_not_touched_its_ids_is_not_tainted() {
+        // The case every process on this machine is in. Answering 1 here
+        // would put the whole system in the hardened mode, which is the
+        // mirror of the bug and just as wrong.
+        assert!(!a_process().is_sugid());
+    }
+
+    #[test]
+    fn dropping_privilege_taints_the_process_even_though_the_ids_end_up_even() {
+        // Root calling `setuid(1000)` lands on ruid == euid == suid == 1000,
+        // which looks exactly like a process that was started as that user.
+        // It is not one: everything in its memory was put there by root. This
+        // is the case the flag exists for, and the one a rule derived from
+        // the ids alone cannot see.
+        let proc = a_process();
+        proc.set_uid(1000).unwrap();
+        let creds = proc.credentials();
+        assert_eq!((creds.ruid, creds.euid, creds.suid), (1000, 1000, 1000));
+        assert!(proc.is_sugid());
+    }
+
+    #[test]
+    fn a_call_that_moves_no_id_does_not_taint() {
+        // `sys_setuid` latches inside `if (change)`. Root setting its own id
+        // changes nothing about who arranged this process's memory.
+        let proc = a_process();
+        proc.set_uid(ROOT_UID).unwrap();
+        assert!(!proc.is_sugid());
+    }
+
+    #[test]
+    fn a_refused_switch_does_not_taint() {
+        // An unprivileged process asking to become root is told EPERM; it
+        // must not come away marked as though it had succeeded.
+        let proc = a_process();
+        {
+            let mut inner = proc.inner.lock();
+            inner.credentials.ruid = 1000;
+            inner.credentials.euid = 1000;
+            inner.credentials.suid = 1000;
+        }
+        assert!(proc.set_uid(ROOT_UID).is_err());
+        assert!(!proc.is_sugid());
+    }
+
+    #[test]
+    fn setting_the_supplementary_groups_taints_whatever_the_list_says() {
+        // `kern_setgroups()` calls `setsugid(p)` unconditionally -- it never
+        // compares the new list with the old one. A process that has called
+        // `setgroups` has been rearranged by whoever called it.
+        let proc = a_process();
+        proc.set_groups(proc.groups());
+        assert!(proc.is_sugid());
+    }
+
+    #[test]
+    fn every_setter_that_moves_an_id_latches_it() {
+        // Six setters, six chances to forget the latch, and forgetting is
+        // silent: the program asks whether it is tainted and is told no. So
+        // the table is the test -- a seventh setter added without it fails
+        // here by name.
+        type Setter = (&'static str, fn(&LinuxProcess) -> LxResult);
+        let setters: [Setter; 6] = [
+            ("setuid", |p| p.set_uid(1000)),
+            ("setgid", |p| p.set_gid(1000)),
+            ("setreuid", |p| p.set_reuid(1000, 1000)),
+            ("setregid", |p| p.set_regid(1000, 1000)),
+            ("setresuid", |p| p.set_resuid(1000, 1000, 1000)),
+            ("setresgid", |p| p.set_resgid(1000, 1000, 1000)),
+        ];
+        for (name, call) in setters {
+            let proc = a_process();
+            call(&proc).unwrap_or_else(|e| panic!("{} was refused: {:?}", name, e));
+            assert!(proc.is_sugid(), "{} moved an id without tainting", name);
+        }
+    }
+
+    #[test]
+    fn moving_only_the_saved_id_taints_too() {
+        // `setresuid(-1, -1, 1000)` moves nothing a `getuid`/`geteuid` pair
+        // would show, and it is still a change of who this process may
+        // become -- FreeBSD's `sys_setresuid` latches on the saved id like on
+        // the other two. A watch list that only held the real and effective
+        // ids would call this a no-op.
+        let proc = a_process();
+        proc.set_resuid(NO_ID, NO_ID, 1000).unwrap();
+        assert_eq!(proc.credentials().suid, 1000);
+        assert!(proc.is_sugid());
+    }
+
+    #[test]
+    fn an_exec_that_grants_nothing_clears_the_taint() {
+        // `do_execve()`: `p->p_flag &= ~P_SUGID` when the image granted no id
+        // AND the effective ids already match the real ones. The new image
+        // did not inherit the old one's data segment -- `execve` threw the
+        // address space away -- so the doubt goes with it.
+        let mut inner = LinuxProcessInner::default();
+        inner.sugid = true;
+        assert!(!inner.apply_exec_ids(0o0755, ROOT_UID, ROOT_UID));
+        assert!(!inner.sugid);
+    }
+
+    #[test]
+    fn an_exec_cannot_clear_it_while_the_effective_ids_are_uneven() {
+        // The other half of the same `else` branch. A process running
+        // set-user-ID root keeps its effective id across the exec, so the
+        // program it just became is privileged over whoever asked for it --
+        // whether or not this particular image had a set-user-ID bit.
+        let mut inner = LinuxProcessInner::default();
+        inner.credentials.ruid = 1000;
+        inner.sugid = false;
+        assert!(inner.apply_exec_ids(0o0755, ROOT_UID, ROOT_UID));
+        assert!(inner.sugid);
+    }
+
+    #[test]
+    fn a_setuid_exec_taints_a_process_that_was_clean() {
+        let mut inner = LinuxProcessInner::default();
+        inner.credentials.ruid = 1000;
+        inner.credentials.euid = 1000;
+        inner.credentials.suid = 1000;
+        inner.credentials.rgid = 1000;
+        inner.credentials.egid = 1000;
+        inner.credentials.sgid = 1000;
+        inner.credentials.groups = vec![1000];
+        assert!(!inner.sugid);
+        assert!(inner.apply_exec_ids(0o4755, ROOT_UID, 1000));
+        assert!(inner.sugid);
     }
 }
 
@@ -4120,7 +4586,7 @@ mod dup_fd_tests {
         }
     }
 
-    fn a_process() -> LinuxProcess {
+    pub(super) fn a_process() -> LinuxProcess {
         LinuxProcess {
             root_inode: Log::new(),
             parent: Mutex::new(Weak::default()),

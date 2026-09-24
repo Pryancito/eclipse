@@ -160,6 +160,8 @@ const _: () = assert!(
 
 mod abi;
 
+pub use abi::AuxIdentity;
+
 /// Linux ELF Program Loader.
 pub struct LinuxElfLoader {
     /// syscall entry
@@ -168,6 +170,13 @@ pub struct LinuxElfLoader {
     pub stack_pages: usize,
     /// root inode of LinuxElfLoader
     pub root_inode: Arc<dyn INode>,
+    /// Who the new image runs as, and whether this exec raised privileges.
+    ///
+    /// The caller computes it, because only the caller knows: the identity
+    /// the C library must be told is the one the process has *after* the
+    /// set-user-ID bits of the image have been honoured, and that transition
+    /// belongs to `execve`, not to the loader. See [`abi::AuxIdentity`].
+    pub identity: abi::AuxIdentity,
 }
 
 impl LinuxElfLoader {
@@ -601,21 +610,16 @@ impl LinuxElfLoader {
                     map.insert(abi::AT_PHENT, elf.header.pt2.ph_entry_size() as usize);
                     map.insert(abi::AT_PHNUM, elf.header.pt2.ph_count() as usize);
                     map.insert(abi::AT_PAGESZ, PAGE_SIZE);
-                    // Identity + AT_SECURE block. musl computes `libc.secure`
-                    // at startup as "AT_UID/EUID/GID/EGID not all present, or
-                    // ruid != euid, or rgid != egid, or AT_SECURE != 0"; glib's
-                    // g_check_setuid() treats an unreadable AT_SECURE the same
-                    // way. Omitting these made EVERY process run in secure
-                    // mode: musl silently dropped LD_PRELOAD/LD_LIBRARY_PATH
-                    // and GLib refused to autolaunch a D-Bus session bus
+                    // Identity + AT_SECURE block: who this process is and
+                    // whether the exec that is loading it raised privileges.
+                    // These five must be present -- a missing block is itself
+                    // secure mode to musl and to GLib's g_check_setuid(),
+                    // which is what once dropped LD_PRELOAD everywhere and
+                    // made GLib refuse to autolaunch a D-Bus session bus
                     // ("Cannot spawn a message bus when AT_SECURE is set",
-                    // which killed waybar). Everything runs as root (uid 0)
-                    // and nothing is setuid, so publish 0s explicitly.
-                    map.insert(abi::AT_UID, 0usize);
-                    map.insert(abi::AT_EUID, 0usize);
-                    map.insert(abi::AT_GID, 0usize);
-                    map.insert(abi::AT_EGID, 0usize);
-                    map.insert(abi::AT_SECURE, 0usize);
+                    // which killed waybar) -- and they must be true, which is
+                    // why they come from the caller and not from a constant.
+                    self.identity.insert_into(&mut map);
                     map
                 },
             };
@@ -749,14 +753,10 @@ impl LinuxElfLoader {
                 map.insert(abi::AT_PHENT, elf.header.pt2.ph_entry_size() as usize);
                 map.insert(abi::AT_PHNUM, elf.header.pt2.ph_count() as usize);
                 map.insert(abi::AT_PAGESZ, PAGE_SIZE);
-                // Identity + AT_SECURE block — same rationale as the sys_execve
-                // path above: without it musl flips every process into secure
-                // mode (LD_PRELOAD dropped, GLib refuses D-Bus autolaunch).
-                map.insert(abi::AT_UID, 0usize);
-                map.insert(abi::AT_EUID, 0usize);
-                map.insert(abi::AT_GID, 0usize);
-                map.insert(abi::AT_EGID, 0usize);
-                map.insert(abi::AT_SECURE, 0usize);
+                // Identity + AT_SECURE block — the same rule as the
+                // interpreter path above, asked once, so the two stacks a
+                // process can be given cannot disagree about who it is.
+                self.identity.insert_into(&mut map);
                 map
             },
         };

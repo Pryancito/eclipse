@@ -916,6 +916,11 @@ impl Syscall<'_> {
                 syscall_entry: self.syscall_entry,
                 stack_pages: USER_STACK_PAGES,
                 root_inode: proc.root_inode().clone(),
+                // Preflight walks the shebang chain and builds no stack, so
+                // there is no aux vector to be right about here -- and there
+                // could not be one yet: the set-user-ID transition that
+                // decides it has not happened.
+                identity: Default::default(),
             }
             .preflight_interpreters(&head[..n])?;
         }
@@ -930,22 +935,32 @@ impl Syscall<'_> {
         // Notice! About to destroy the user space of the old application, now copy the necessary information into kernel!
         let path_str = path_str.to_string();
         let vmar = self.zircon_process().vmar();
-        let load = {
+        let (load, privileged) = {
             // mmap_lock across the whole swap: tearing down the old image and
             // loading the new one is one layout mutation — a sibling thread's
             // concurrent fork must never clone the half-empty in-between state
             // (see LinuxProcess::aspace_lock).
             let _aspace = proc.aspace_lock().lock();
             vmar.clear()?;
-            LinuxElfLoader {
+            // `bprm->secureexec`: whether the image about to run is more
+            // privileged than whoever asked for it. It has to be decided
+            // HERE, before the stack is built, because the C library reads
+            // the answer out of the aux vector on that stack (`AT_SECURE`)
+            // and refuses the caller's LD_PRELOAD when it is set. Linux draws
+            // the same order: `begin_new_exec()` commits the credentials, and
+            // `create_elf_tables()` writes the aux vector afterwards.
+            let privileged = proc.apply_exec_metadata(&metadata);
+            let loaded = LinuxElfLoader {
                 syscall_entry: self.syscall_entry,
                 stack_pages: USER_STACK_PAGES,
                 root_inode: proc.root_inode().clone(),
+                identity: proc.aux_identity(privileged),
             }
             .load(&vmar, &vmo, args.clone(), envs.clone(), path_str)
             .inspect_err(|&e| {
                 error!("execve: LinuxElfLoader::load failed: {:?}", e);
-            })
+            });
+            (loaded, privileged)
         };
         // Past the point of no return (see the preflight above): `vmar.clear()`
         // has already destroyed the caller's image, so returning this error
@@ -985,9 +1000,6 @@ impl Syscall<'_> {
         // deterministic `sh` crash in musl mallocng's __malloc_alloc_meta seen
         // when `sh -c gendepends.sh` re-execs into the script.
         proc.set_mapped_brk(initial_brk);
-        // `bprm->secureexec`: whether this exec raised privileges, which
-        // decides part of what the process must forget just below.
-        let privileged = proc.apply_exec_metadata(&metadata);
         // The rest of what `execve` forgets, process side -- the attachments
         // to the address space that `vmar.clear()` above destroyed, and the
         // parent-death signal a parent chose for a program that no longer
