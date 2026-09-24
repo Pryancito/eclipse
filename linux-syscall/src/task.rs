@@ -501,8 +501,16 @@ impl Syscall<'_> {
     ///
     /// Everything else is delegated to [`sys_clone`](Self::sys_clone).
     pub async fn sys_clone3(&self, uargs: UserInPtr<u64>, size: usize) -> SysResult {
-        if size < CLONE_ARGS_SIZE_VER0 {
-            return Err(LxError::EINVAL);
+        let size = clone3_size(size)?;
+        // Anything the caller put past version 0 is a field this kernel has
+        // never heard of. Dropping it silently handed back a child that was
+        // not the one asked for; `copy_struct_from_user` answers E2BIG.
+        if size > CLONE_ARGS_SIZE_VER0 {
+            let tail = UserInPtr::<u8>::from(uargs.as_addr() + CLONE_ARGS_SIZE_VER0)
+                .read_array(size - CLONE_ARGS_SIZE_VER0)?;
+            if !extensible_tail_is_empty(&tail) {
+                return Err(LxError::E2BIG);
+            }
         }
         let words = uargs.read_array(CLONE_ARGS_SIZE_VER0 / 8)?;
         let words = <[u64; 8]>::try_from(words).unwrap();
@@ -1356,10 +1364,17 @@ impl Syscall<'_> {
         if flags != 0 {
             return Err(LxError::EINVAL);
         }
-        let a = attr.read()?;
-        if (a.size as usize) < size_of::<SchedAttr>() {
-            return Err(LxError::EINVAL);
+        // The size is read on its own first, as `sched_copy_attr` does it:
+        // it decides how much of the struct is there to read at all.
+        let size = sched_setattr_size(UserInPtr::<u32>::from(attr.as_addr()).read()?)?;
+        if size > SCHED_ATTR_SIZE_VER0 {
+            let tail = UserInPtr::<u8>::from(attr.as_addr() + SCHED_ATTR_SIZE_VER0)
+                .read_array(size - SCHED_ATTR_SIZE_VER0)?;
+            if !extensible_tail_is_empty(&tail) {
+                return Err(LxError::E2BIG);
+            }
         }
+        let a = attr.read()?;
         let policy = (a.sched_policy & !(SCHED_RESET_ON_FORK as u32)) as usize;
         if policy == SCHED_DEADLINE as usize || policy > u8::MAX as usize {
             return Err(LxError::EINVAL);
@@ -1389,12 +1404,10 @@ impl Syscall<'_> {
         if flags != 0 {
             return Err(LxError::EINVAL);
         }
-        if size < size_of::<SchedAttr>() {
-            return Err(LxError::EINVAL);
-        }
+        sched_getattr_size(size)?;
         let thread = self.sched_target(pid)?;
         let a = SchedAttr {
-            size: size_of::<SchedAttr>() as u32,
+            size: SCHED_ATTR_SIZE_VER0 as u32,
             sched_policy: thread.sched_policy() as u32,
             sched_flags: 0,
             sched_nice: thread.sched_nice() as i32,
@@ -1943,6 +1956,57 @@ bitflags! {
 /// Size of `struct clone_args` version 0 (Linux `CLONE_ARGS_SIZE_VER0`).
 pub(crate) const CLONE_ARGS_SIZE_VER0: usize = 64;
 
+use crate::extensible_tail_is_empty;
+use kernel_hal::PAGE_SIZE;
+
+/// Size of `struct sched_attr` version 0 (Linux `SCHED_ATTR_SIZE_VER0`), and
+/// the whole of what this kernel knows of that struct.
+pub(crate) const SCHED_ATTR_SIZE_VER0: usize = 48;
+
+/// How many bytes of `struct clone_args` `clone3` will read, or the errno
+/// Linux answers for that `size`.
+pub(crate) fn clone3_size(size: usize) -> LxResult<usize> {
+    if size > PAGE_SIZE {
+        return Err(LxError::E2BIG);
+    }
+    if size < CLONE_ARGS_SIZE_VER0 {
+        return Err(LxError::EINVAL);
+    }
+    Ok(size)
+}
+
+/// The same question for `sched_setattr`, which answers it differently in two
+/// ways, both of them deliberate in `sched_copy_attr`:
+///
+///  * a `size` of zero means version 0. It is called an "ABI compatibility
+///    quirk" in the source and it is load-bearing: the first `sched_setattr`
+///    users shipped before the field was defined.
+///  * a `size` out of range is **`E2BIG`**, not `EINVAL` -- and
+///    `sched_getattr`, one function away, answers `EINVAL` for what looks
+///    like the same question. It is not the same question: `setattr` reads
+///    the size out of the struct, where it describes what the caller built,
+///    and `getattr` takes it as an argument, where it describes the buffer.
+pub(crate) fn sched_setattr_size(size: u32) -> LxResult<usize> {
+    let size = if size == 0 {
+        SCHED_ATTR_SIZE_VER0
+    } else {
+        size as usize
+    };
+    if !(SCHED_ATTR_SIZE_VER0..=PAGE_SIZE).contains(&size) {
+        return Err(LxError::E2BIG);
+    }
+    Ok(size)
+}
+
+/// And for `sched_getattr`: `EINVAL`, and no zero quirk. See
+/// [`sched_setattr_size`].
+pub(crate) fn sched_getattr_size(size: usize) -> LxResult<usize> {
+    if !(SCHED_ATTR_SIZE_VER0..=PAGE_SIZE).contains(&size) {
+        return Err(LxError::EINVAL);
+    }
+    Ok(size)
+}
+
 /// The legacy-`clone` arguments that a `clone3` `struct clone_args` decodes to.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct Clone3Args {
@@ -2315,5 +2379,118 @@ mod wait_option_tests {
                 stray
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod extensible_struct_tests {
+    //! The `size` a caller puts beside an extensible struct says which
+    //! version of it they built. Three syscalls here take one, and until this
+    //! batch none of them read it for anything but a lower bound -- so the
+    //! fields past what this kernel knows were dropped in silence and the
+    //! call reported success.
+
+    use super::*;
+
+    /// The two struct versions this kernel knows, and the fact that the
+    /// `sched_attr` it defines *is* version 0 -- which is what makes
+    /// "everything past `SCHED_ATTR_SIZE_VER0`" the right thing to demand be
+    /// zero.
+    #[test]
+    fn the_two_version_zero_sizes_are_the_uapi_ones() {
+        assert_eq!(CLONE_ARGS_SIZE_VER0, 64);
+        assert_eq!(SCHED_ATTR_SIZE_VER0, 48);
+        assert_eq!(size_of::<SchedAttr>(), SCHED_ATTR_SIZE_VER0);
+        assert_eq!(CLONE_ARGS_SIZE_VER0 % 8, 0, "read back as eight u64");
+    }
+
+    /// A caller that sets a field this kernel has never heard of is asking
+    /// for a feature it will not get.
+    #[test]
+    fn a_tail_this_kernel_does_not_know_must_be_all_zero() {
+        assert!(extensible_tail_is_empty(&[]));
+        assert!(extensible_tail_is_empty(&[0; 64]));
+        // Wherever the byte is.
+        assert!(!extensible_tail_is_empty(&[1]));
+        assert!(!extensible_tail_is_empty(&[1, 0, 0, 0]));
+        assert!(!extensible_tail_is_empty(&[0, 0, 0, 1]));
+        let mut middle = [0u8; 32];
+        middle[17] = 0x80;
+        assert!(!extensible_tail_is_empty(&middle));
+    }
+
+    /// `clone3`: too small is EINVAL, too big is E2BIG. The two are different
+    /// answers because they are different mistakes -- one is a struct that
+    /// cannot be a `clone_args` at all, the other a size no struct has.
+    #[test]
+    fn clone3_bounds_its_struct_at_both_ends() {
+        assert_eq!(clone3_size(0), Err(LxError::EINVAL));
+        assert_eq!(clone3_size(CLONE_ARGS_SIZE_VER0 - 1), Err(LxError::EINVAL));
+        assert_eq!(clone3_size(CLONE_ARGS_SIZE_VER0), Ok(CLONE_ARGS_SIZE_VER0));
+        assert_eq!(
+            clone3_size(88),
+            Ok(88),
+            "a newer version is read and vetted"
+        );
+        assert_eq!(clone3_size(PAGE_SIZE), Ok(PAGE_SIZE));
+        assert_eq!(clone3_size(PAGE_SIZE + 1), Err(LxError::E2BIG));
+        assert_eq!(clone3_size(usize::MAX), Err(LxError::E2BIG));
+    }
+
+    /// `sched_setattr`'s ABI compatibility quirk: a zero `size` means version
+    /// 0, because the first users of the syscall shipped before the field was
+    /// defined.
+    #[test]
+    fn a_sched_attr_with_no_size_at_all_is_version_zero() {
+        assert_eq!(sched_setattr_size(0), Ok(SCHED_ATTR_SIZE_VER0));
+        // ...and that is the only value below the minimum that is accepted.
+        assert_eq!(sched_setattr_size(1), Err(LxError::E2BIG));
+        assert_eq!(
+            sched_setattr_size(SCHED_ATTR_SIZE_VER0 as u32 - 1),
+            Err(LxError::E2BIG)
+        );
+    }
+
+    /// The asymmetry, pinned: `sched_setattr` answers E2BIG and
+    /// `sched_getattr` EINVAL for what looks like the same question. It is
+    /// not the same question -- `setattr` reads the size out of the struct,
+    /// where it describes what the caller built; `getattr` takes it as an
+    /// argument, where it describes the buffer.
+    #[test]
+    fn the_two_halves_of_sched_attr_refuse_a_bad_size_differently() {
+        assert_eq!(sched_setattr_size(4), Err(LxError::E2BIG));
+        assert_eq!(sched_getattr_size(4), Err(LxError::EINVAL));
+        assert_eq!(sched_setattr_size(u32::MAX), Err(LxError::E2BIG));
+        assert_eq!(sched_getattr_size(usize::MAX), Err(LxError::EINVAL));
+        // And the zero quirk is `setattr`'s alone: a getattr buffer of zero
+        // bytes is a buffer of zero bytes.
+        assert_eq!(sched_setattr_size(0), Ok(SCHED_ATTR_SIZE_VER0));
+        assert_eq!(sched_getattr_size(0), Err(LxError::EINVAL));
+    }
+
+    /// Both accept everything from version 0 up to a page.
+    #[test]
+    fn a_sched_attr_may_be_anything_from_version_zero_up_to_a_page() {
+        for size in [SCHED_ATTR_SIZE_VER0, 56, 64, PAGE_SIZE] {
+            assert_eq!(sched_setattr_size(size as u32), Ok(size), "{size}");
+            assert_eq!(sched_getattr_size(size), Ok(size), "{size}");
+        }
+        assert_eq!(
+            sched_setattr_size(PAGE_SIZE as u32 + 1),
+            Err(LxError::E2BIG)
+        );
+        assert_eq!(sched_getattr_size(PAGE_SIZE + 1), Err(LxError::EINVAL));
+    }
+
+    /// A page is the bound because that is what Linux uses, and because it is
+    /// what keeps a caller from naming a copy the kernel then has to make.
+    #[test]
+    fn a_page_is_the_bound_for_every_one_of_them() {
+        assert!(clone3_size(PAGE_SIZE).is_ok());
+        assert!(sched_setattr_size(PAGE_SIZE as u32).is_ok());
+        assert!(sched_getattr_size(PAGE_SIZE).is_ok());
+        assert!(clone3_size(PAGE_SIZE + 1).is_err());
+        assert!(sched_setattr_size(PAGE_SIZE as u32 + 1).is_err());
+        assert!(sched_getattr_size(PAGE_SIZE + 1).is_err());
     }
 }

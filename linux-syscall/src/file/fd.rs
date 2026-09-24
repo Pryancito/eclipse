@@ -752,10 +752,14 @@ impl Syscall<'_> {
         if attr_ptr == 0 {
             return Err(LxError::EFAULT);
         }
-        // `attr.size` is the u32 at byte offset 4; clamp to a sane window.
-        let attr_size = UserInPtr::<u32>::from(attr_ptr + 4).read()? as usize;
-        let attr_size = attr_size.clamp(64, 4096);
+        // `attr.size` is the u32 at byte offset 4. It used to be clamped to
+        // a window, which answers a request this kernel cannot honour by
+        // quietly reading a different struct than the one the caller built.
+        let attr_size = perf_attr_size(UserInPtr::<u32>::from(attr_ptr + 4).read()?)?;
         let attr_bytes = UserInPtr::<u8>::from(attr_ptr).read_array(attr_size)?;
+        if !crate::extensible_tail_is_empty(&attr_bytes[PERF_ATTR_SIZE_VER0..]) {
+            return Err(LxError::E2BIG);
+        }
         // A `pid` of 0 means "the calling process", not "the process whose id
         // is zero" — which is how `perf record ./prog` and every program that
         // profiles itself opens the event. Passing the literal 0 through made
@@ -770,6 +774,33 @@ impl Syscall<'_> {
         let fd = self.linux_process().add_file(event)?;
         Ok(fd.into())
     }
+}
+
+use kernel_hal::PAGE_SIZE;
+
+/// Size of `struct perf_event_attr` version 0 (Linux `PERF_ATTR_SIZE_VER0`),
+/// and the whole of what this kernel reads of it.
+pub(crate) const PERF_ATTR_SIZE_VER0: usize = 64;
+
+/// How many bytes of `struct perf_event_attr` `perf_event_open` will read, or
+/// the errno Linux answers for that `size`.
+///
+/// `perf_copy_attr` and `sched_copy_attr` give the same two answers -- a zero
+/// `size` means version 0, and anything else out of range is `E2BIG` -- which
+/// is not what `clone3` does (`EINVAL` below the minimum) and not what
+/// `sched_getattr` does (`EINVAL` at both ends). Four syscalls, four answers,
+/// all of them deliberate; the one this code used to give was a fifth, and it
+/// was to clamp, which is not an answer at all.
+pub(crate) fn perf_attr_size(size: u32) -> Result<usize, LxError> {
+    let size = if size == 0 {
+        PERF_ATTR_SIZE_VER0
+    } else {
+        size as usize
+    };
+    if !(PERF_ATTR_SIZE_VER0..=PAGE_SIZE).contains(&size) {
+        return Err(LxError::E2BIG);
+    }
+    Ok(size)
 }
 
 /// `fcntl(F_DUPFD, start)`: `f_dupfd` answers `EINVAL` to a start at or past
@@ -1088,5 +1119,47 @@ mod anon_fd_flag_tests {
         let f = anon_fd_flags(EFD_SEMAPHORE | ANON_NONBLOCK, EFD_FLAGS).unwrap();
         assert_eq!(f.bits() & EFD_SEMAPHORE, EFD_SEMAPHORE);
         assert!(f.non_block());
+    }
+}
+
+#[cfg(test)]
+mod perf_attr_size_tests {
+    //! `perf_event_attr` is the fourth extensible struct this kernel takes
+    //! from userspace with a `size` beside it. It used to `clamp` that size,
+    //! which is not one of the answers Linux gives: it reads a different
+    //! struct than the one the caller built and reports success.
+
+    use super::*;
+
+    /// The window the clamp used to impose, as errors.
+    #[test]
+    fn a_size_outside_the_window_is_e2big_and_not_a_clamp() {
+        // Too small: the clamp read 64 bytes of a struct the caller said was
+        // 8 bytes long, so 56 bytes of whatever followed became the attr.
+        assert_eq!(perf_attr_size(8), Err(LxError::E2BIG));
+        assert_eq!(
+            perf_attr_size(PERF_ATTR_SIZE_VER0 as u32 - 1),
+            Err(LxError::E2BIG)
+        );
+        // Too big: the clamp read a page of a struct the caller said was
+        // bigger, and then acted on it as if nothing had been left out.
+        assert_eq!(perf_attr_size(PAGE_SIZE as u32 + 1), Err(LxError::E2BIG));
+        assert_eq!(perf_attr_size(u32::MAX), Err(LxError::E2BIG));
+    }
+
+    /// `perf_copy_attr` has `sched_copy_attr`'s zero quirk, and for the same
+    /// reason: the field postdates the syscall's first users.
+    #[test]
+    fn a_perf_attr_with_no_size_at_all_is_version_zero() {
+        assert_eq!(perf_attr_size(0), Ok(PERF_ATTR_SIZE_VER0));
+        assert_eq!(PERF_ATTR_SIZE_VER0, 64);
+    }
+
+    /// Everything from version 0 up to a page is read, and vetted.
+    #[test]
+    fn a_perf_attr_may_be_anything_from_version_zero_up_to_a_page() {
+        for size in [PERF_ATTR_SIZE_VER0, 72, 96, 112, 128, PAGE_SIZE] {
+            assert_eq!(perf_attr_size(size as u32), Ok(size), "{size}");
+        }
     }
 }
