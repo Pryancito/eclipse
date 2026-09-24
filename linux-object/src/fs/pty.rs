@@ -36,9 +36,6 @@ const ICRNL: u32 = 0x0100;
 const INLCR: u32 = 0x0040;
 const IXON: u32 = 0x0400;
 const IXANY: u32 = 0x0800;
-// termios c_oflag bits
-const OPOST: u32 = 0x0001;
-const ONLCR: u32 = 0x0004;
 // termios c_lflag bits
 const ISIG: u32 = 0x0001;
 const ICANON: u32 = 0x0002;
@@ -83,6 +80,11 @@ struct PtyInner {
     eof_pending: bool,
     /// Bytes available to the master's `read` (program output + echoed input).
     output: VecDeque<u8>,
+    /// Where the cursor sits on the master's line. One counter for program
+    /// output and echo alike, because they land on one screen: `ONOCR` is
+    /// defined in terms of it and `ONLRET` exists to keep it honest. See
+    /// [`Termios::output_char`].
+    out_column: usize,
     termios: Termios,
     winsize: ConsoleWinSize,
 }
@@ -246,10 +248,13 @@ impl Pty {
             let mut inner = self.inner.lock();
             let iflag = inner.termios.c_iflag;
             let lflag = inner.termios.c_lflag;
-            let oflag = inner.termios.c_oflag;
             let cc = inner.termios.c_cc;
             let kill_echo = inner.termios.kill_echo();
             let utf8 = inner.termios.utf8_input();
+            // Copies, not borrows: `inner` is a guard, so two field borrows of
+            // it in one expression are two borrows of the guard.
+            let termios = inner.termios;
+            let mut out_col = inner.out_column;
             for (i, &b) in data.iter().enumerate() {
                 // Room for one more? The rule is shared with the console and
                 // with `fs/devfs/pty.rs`, so it lives in `ioctl.rs`. Both
@@ -285,12 +290,12 @@ impl Pty {
                         if !overflow {
                             inner.canon.push_back(c);
                         }
-                        if echo_byte(&mut inner.output, c, lflag, oflag) {
+                        if echo_byte(&mut inner.output, c, &termios, &mut out_col) {
                             wake_master = true;
                         }
                     } else {
                         inner.input.push_back(c);
-                        if echo_byte(&mut inner.output, c, lflag, oflag) {
+                        if echo_byte(&mut inner.output, c, &termios, &mut out_col) {
                             wake_master = true;
                         }
                         wake_slave = true;
@@ -431,7 +436,7 @@ impl Pty {
                             let pending: alloc::vec::Vec<u8> =
                                 inner.canon.iter().copied().collect();
                             for b in pending {
-                                echo_byte(&mut inner.output, b, lflag, oflag);
+                                echo_byte(&mut inner.output, b, &termios, &mut out_col);
                             }
                             wake_master = true;
                         }
@@ -496,16 +501,17 @@ impl Pty {
                             KillEcho::Rubout => {
                                 // One per column, not per byte.
                                 for _ in 0..n {
-                                    out_extend(&mut inner.output, b"\x08 \x08");
+                                    out_post(
+                                        &mut inner.output,
+                                        &termios,
+                                        &mut out_col,
+                                        b"\x08 \x08",
+                                    );
                                 }
                                 wake_master = true;
                             }
                             KillEcho::Newline => {
-                                if oflag & OPOST != 0 && oflag & ONLCR != 0 {
-                                    out_extend(&mut inner.output, b"\r\n");
-                                } else {
-                                    out_push(&mut inner.output, b'\n');
-                                }
+                                out_post(&mut inner.output, &termios, &mut out_col, b"\n");
                                 wake_master = true;
                             }
                             KillEcho::Nothing => {}
@@ -527,7 +533,7 @@ impl Pty {
                         if !overflow {
                             inner.canon.push_back(c);
                         }
-                        if echo_byte(&mut inner.output, c, lflag, oflag) {
+                        if echo_byte(&mut inner.output, c, &termios, &mut out_col) {
                             wake_master = true;
                         }
                         // Commit the line on newline or a configured EOL delimiter.
@@ -546,12 +552,13 @@ impl Pty {
                     }
                 } else {
                     inner.input.push_back(c);
-                    if echo_byte(&mut inner.output, c, lflag, oflag) {
+                    if echo_byte(&mut inner.output, c, &termios, &mut out_col) {
                         wake_master = true;
                     }
                     wake_slave = true;
                 }
             }
+            inner.out_column = out_col;
         }
         // Clear latched READABLE before waking: a later VSTART in the same
         // write may re-arm the master bus after a VSTOP cleared it.
@@ -588,27 +595,33 @@ impl Pty {
             return 0;
         }
         let mut n = 0;
+        let mut sent = false;
         {
             let mut inner = self.inner.lock();
-            let oflag = inner.termios.c_oflag;
-            let post = oflag & OPOST != 0 && oflag & ONLCR != 0;
+            let termios = inner.termios;
+            let mut out_col = inner.out_column;
             for &b in data {
                 // Under ONLCR a `\n` leaves as `\r\n`: two bytes of the
                 // budget, and never split across the cap. A `\r` left alone at
                 // the end of the queue is not the line ending the program on
                 // the other side is waiting for.
-                let fitted = if post && b == b'\n' {
-                    out_extend(&mut inner.output, b"\r\n")
-                } else {
-                    out_push(&mut inner.output, b)
-                };
-                if !fitted {
-                    break;
+                //
+                // `Posted::Nothing` is not a failure: the rule swallowed the
+                // byte (`ONOCR` on a carriage return at column zero), so it is
+                // consumed. Counting it as a short write would have the writer
+                // offer the same byte again for ever.
+                match out_post(&mut inner.output, &termios, &mut out_col, &[b]) {
+                    Posted::Full => break,
+                    Posted::Sent => sent = true,
+                    Posted::Nothing => {}
                 }
                 n += 1;
             }
+            inner.out_column = out_col;
         }
-        if n > 0 {
+        // Not `n > 0`: a write of nothing but swallowed carriage returns is
+        // consumed in full and puts not one byte in front of the master.
+        if sent {
             self.wake_master();
         }
         n
@@ -920,9 +933,61 @@ fn out_extend(out: &mut VecDeque<u8>, bytes: &[u8]) -> bool {
     true
 }
 
+/// What happened to a run handed to [`out_post`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Posted {
+    /// The run went out whole.
+    Sent,
+    /// The rule swallowed every byte of it, so there was nothing to send and
+    /// nothing is wrong. Only `ONOCR` does this.
+    ///
+    /// Worth its own answer rather than sharing one with [`Posted::Full`]:
+    /// `slave_write` stops at a full queue and reports a short write, and a
+    /// writer told its carriage return did not fit would offer the same byte
+    /// again forever.
+    Nothing,
+    /// The queue had no room for the whole run, so none of it went.
+    Full,
+}
+
+/// Post-process a short run and put it in front of the master, whole or not
+/// at all.
+///
+/// Every byte that reaches the master goes through here, program output and
+/// echo alike, and they share one column -- which is what Linux does:
+/// `__process_echoes` hands each byte it is about to put out to
+/// `do_output_char` whenever `OPOST` is set (`drivers/tty/n_tty.c`). The
+/// column has to be shared for the same reason: it is one line on one screen,
+/// whatever put the bytes on it.
+fn out_post(out: &mut VecDeque<u8>, termios: &Termios, column: &mut usize, run: &[u8]) -> Posted {
+    // The longest run is the three bytes of a rubout, and the rule turns at
+    // most one byte into two.
+    let mut buf = [0u8; 8];
+    let mut n = 0;
+    let mut col = *column;
+    for &b in run {
+        for &o in termios.output_char(b, &mut col).as_bytes() {
+            buf[n] = o;
+            n += 1;
+        }
+    }
+    if n == 0 {
+        // Nothing to send, but the cursor may still have moved.
+        *column = col;
+        return Posted::Nothing;
+    }
+    if out_extend(out, &buf[..n]) {
+        *column = col;
+        Posted::Sent
+    } else {
+        Posted::Full
+    }
+}
+
 /// Echo one input byte to the master read side. Returns whether anything was
 /// written. Mirrors the console line discipline's `echo_char`.
-fn echo_byte(out: &mut VecDeque<u8>, c: u8, lflag: u32, oflag: u32) -> bool {
+fn echo_byte(out: &mut VecDeque<u8>, c: u8, termios: &Termios, column: &mut usize) -> bool {
+    let lflag = termios.c_lflag;
     if lflag & ECHO == 0 {
         // ECHONL is the one thing a terminal with echo off still shows, and it
         // has one caller: getpass(3) clears ECHO and sets ECHONL so the Enter
@@ -936,28 +1001,19 @@ fn echo_byte(out: &mut VecDeque<u8>, c: u8, lflag: u32, oflag: u32) -> bool {
     }
     // The answer is whether the byte actually went out, not whether the flags
     // said it should: the queue is bounded, and a caller that takes `true` for
-    // "the master has something to read" would wake it for nothing.
-    match c {
-        b'\n' => {
-            if oflag & OPOST != 0 && oflag & ONLCR != 0 {
-                out_extend(out, b"\r\n")
-            } else {
-                out_push(out, b'\n')
-            }
+    // "the master has something to read" would wake it for nothing. A byte the
+    // rule swallowed did not go out either.
+    let posted = match c {
+        // A rubout is one thing on screen, so it goes out whole or not.
+        0x7f | 0x08 => out_post(out, termios, column, b"\x08 \x08"),
+        // `^X`, likewise. `\n`, `\r` and `\t` are control characters that
+        // the terminal acts on rather than shows, so they are not captioned.
+        c if c < 0x20 && c != b'\n' && c != b'\r' && c != b'\t' && lflag & ECHOCTL != 0 => {
+            out_post(out, termios, column, &[b'^', c + 64])
         }
-        b'\r' => out_push(out, b'\r'),
-        0x7f | 0x08 => out_extend(out, b"\x08 \x08"),
-        b'\t' => out_push(out, b'\t'),
-        c if c < 0x20 => {
-            if lflag & ECHOCTL != 0 {
-                // `^X` is one thing on screen, so it goes out whole or not.
-                out_extend(out, &[b'^', c + 64])
-            } else {
-                out_push(out, c)
-            }
-        }
-        c => out_push(out, c),
-    }
+        c => out_post(out, termios, column, &[c]),
+    };
+    posted == Posted::Sent
 }
 
 lazy_static! {
@@ -982,6 +1038,7 @@ pub fn alloc_ptmx() -> Arc<dyn INode> {
             stopped: false,
             eof_pending: false,
             output: VecDeque::new(),
+            out_column: 0,
             termios: Termios::default_tty(),
             winsize: ConsoleWinSize {
                 ws_row: 24,
@@ -1380,6 +1437,7 @@ mod tests {
                 stopped: false,
                 eof_pending: false,
                 output: VecDeque::new(),
+                out_column: 0,
                 termios: Termios::default_tty(),
                 winsize: ConsoleWinSize {
                     ws_row: 24,
@@ -1461,42 +1519,227 @@ mod tests {
 
     // ---- echo_byte, on its own -----------------------------------------
 
+    /// A `Termios` with these `c_lflag` bits and no output post-processing.
+    fn lflag(bits: u32) -> Termios {
+        let mut t = Termios::default_tty();
+        t.c_lflag = bits;
+        t.c_oflag = 0;
+        t
+    }
+
+    /// Echo one byte with a throwaway column, and hand back what went out.
+    fn echoed(t: &Termios, c: u8) -> Vec<u8> {
+        let mut out = VecDeque::new();
+        let mut col = 0usize;
+        echo_byte(&mut out, c, t, &mut col);
+        Vec::from(out)
+    }
+
     #[test]
     fn echo_byte_renders_each_class_of_character() {
-        let d = Termios::default_tty();
         let mut out = VecDeque::new();
+        let mut col = 0usize;
         // ECHO off: nothing written, and the caller is told so.
-        assert!(!echo_byte(&mut out, b'a', 0, d.c_oflag));
+        assert!(!echo_byte(&mut out, b'a', &lflag(0), &mut col));
         assert!(out.is_empty());
 
         // Newline becomes CRLF only when OPOST|ONLCR are both on.
+        let mut t = lflag(ECHO);
+        t.c_oflag = O_OPOST | O_ONLCR;
         let mut out = VecDeque::new();
-        assert!(echo_byte(&mut out, b'\n', ECHO, OPOST | ONLCR));
+        let mut col = 0usize;
+        assert!(echo_byte(&mut out, b'\n', &t, &mut col));
         assert_eq!(Vec::from(out), b"\r\n");
-        let mut out = VecDeque::new();
-        echo_byte(&mut out, b'\n', ECHO, 0);
-        assert_eq!(Vec::from(out), b"\n");
+        assert_eq!(echoed(&lflag(ECHO), b'\n'), b"\n".to_vec());
 
         // Backspace and DEL both erase visually.
         for c in [0x08u8, DEL] {
-            let mut out = VecDeque::new();
-            echo_byte(&mut out, c, ECHO, 0);
-            assert_eq!(Vec::from(out), b"\x08 \x08");
+            assert_eq!(echoed(&lflag(ECHO), c), b"\x08 \x08".to_vec());
         }
 
         // Tab and CR go out as themselves, never as ^I / ^M.
-        let mut out = VecDeque::new();
-        echo_byte(&mut out, b'\t', ECHO | ECHOCTL, 0);
-        echo_byte(&mut out, b'\r', ECHO | ECHOCTL, 0);
-        assert_eq!(Vec::from(out), b"\t\r");
+        assert_eq!(echoed(&lflag(ECHO | ECHOCTL), b'\t'), b"\t".to_vec());
+        assert_eq!(echoed(&lflag(ECHO | ECHOCTL), b'\r'), b"\r".to_vec());
 
         // Other control characters: caret notation under ECHOCTL, raw without.
+        assert_eq!(echoed(&lflag(ECHO | ECHOCTL), CTRL_C), b"^C".to_vec());
+        assert_eq!(echoed(&lflag(ECHO), CTRL_C), alloc::vec![CTRL_C]);
+    }
+
+    #[test]
+    fn an_echoed_byte_goes_through_the_same_output_rule_as_program_output() {
+        // `__process_echoes` hands every byte it is about to put out to
+        // `do_output_char` when OPOST is set (`drivers/tty/n_tty.c`), so a
+        // terminal with OCRNL echoes a typed carriage return as a newline.
+        // Before this the echo path only knew OPOST|ONLCR.
+        let mut t = lflag(ECHO);
+        t.c_oflag = O_OPOST | O_OCRNL;
+        assert_eq!(echoed(&t, b'\r'), b"\n".to_vec());
+    }
+
+    #[test]
+    fn an_echo_the_rule_swallowed_does_not_claim_to_have_written_anything() {
+        // ONOCR at column zero. A `true` here wakes the master for a queue
+        // that has nothing new in it.
+        let mut t = lflag(ECHO);
+        t.c_oflag = O_OPOST | O_ONOCR;
         let mut out = VecDeque::new();
-        echo_byte(&mut out, CTRL_C, ECHO | ECHOCTL, 0);
-        assert_eq!(Vec::from(out), b"^C");
+        let mut col = 0usize;
+        assert!(!echo_byte(&mut out, b'\r', &t, &mut col));
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn echoed_bytes_move_the_same_cursor_the_program_output_moves() {
+        // One line on one screen. If the echo of a typed character did not
+        // count, ONOCR would think the cursor was still at column zero and
+        // swallow the carriage return that ends the line.
+        let mut t = lflag(ECHO);
+        t.c_oflag = O_OPOST | O_ONOCR;
         let mut out = VecDeque::new();
-        echo_byte(&mut out, CTRL_C, ECHO, 0);
-        assert_eq!(Vec::from(out), [CTRL_C]);
+        let mut col = 0usize;
+        echo_byte(&mut out, b'a', &t, &mut col);
+        assert_eq!(col, 1);
+        assert!(echo_byte(&mut out, b'\r', &t, &mut col));
+        assert_eq!(Vec::from(out), b"a\r".to_vec());
+    }
+
+    #[test]
+    fn a_run_that_does_not_fit_leaves_the_cursor_where_it_was() {
+        // out_post is whole-or-nothing, and a column that moved for bytes
+        // that never went out would make every later ONOCR decision wrong.
+        let mut t = Termios::default_tty();
+        t.c_oflag = O_OPOST;
+        let mut out: VecDeque<u8> = (0..TTY_OUTPUT_CAP as u32).map(|_| b'x').collect();
+        let mut col = 7usize;
+        assert_eq!(out_post(&mut out, &t, &mut col, b"ab"), Posted::Full);
+        assert_eq!(col, 7);
+        assert_eq!(out.len(), TTY_OUTPUT_CAP);
+    }
+
+    // ---- the whole of c_oflag, end to end -------------------------------
+
+    /// Set this PTY's output flags, leaving everything else stock.
+    fn with_oflag(p: &Pty, bits: u32) {
+        p.inner.lock().termios.c_oflag = bits;
+    }
+
+    #[test]
+    fn program_output_gets_the_whole_output_word_not_just_onlcr() {
+        // The bug: every site asked `OPOST && ONLCR` together, so `stty opost
+        // -onlcr ocrnl` -- a perfectly ordinary thing to ask for -- fell into
+        // the raw branch and the carriage return went out untranslated.
+        let p = pty();
+        with_oflag(&p, O_OPOST | O_OCRNL);
+        assert_eq!(p.slave_write(b"a\rb"), 3);
+        assert_eq!(master_drain(&p), "a\nb");
+    }
+
+    #[test]
+    fn onocr_swallows_the_carriage_return_without_shortening_the_write() {
+        // The writer must be told all three bytes were taken. A short count
+        // here has it offer the same carriage return again, for ever.
+        let p = pty();
+        with_oflag(&p, O_OPOST | O_ONOCR);
+        assert_eq!(p.slave_write(b"\rab"), 3);
+        assert_eq!(master_drain(&p), "ab");
+    }
+
+    #[test]
+    fn the_column_carries_across_separate_writes() {
+        // It is one line on one screen, so where the last write left the
+        // cursor is where the next one starts. Keeping the column in a local
+        // would make the first byte of every write look like column zero.
+        let p = pty();
+        with_oflag(&p, O_OPOST | O_ONOCR);
+        p.slave_write(b"ab");
+        p.slave_write(b"\r");
+        assert_eq!(master_drain(&p), "ab\r", "mid-line, so the return stands");
+    }
+
+    #[test]
+    fn a_write_of_nothing_but_swallowed_returns_is_consumed_whole() {
+        let p = pty();
+        with_oflag(&p, O_OPOST | O_ONOCR);
+        assert_eq!(p.slave_write(b"\r\r\r"), 3);
+        assert_eq!(master_drain(&p), "");
+    }
+
+    #[test]
+    fn olcuc_reaches_the_terminal() {
+        let p = pty();
+        with_oflag(&p, O_OPOST | O_OLCUC);
+        p.slave_write(b"hola\n");
+        assert_eq!(master_drain(&p), "HOLA\n");
+    }
+
+    #[test]
+    fn the_program_leaves_the_cursor_where_the_echo_picks_it_up() {
+        // The other direction of the shared cursor, and the one a local would
+        // hide: the input path has to start from where the program's last
+        // write left the line, or the first thing the user types after a
+        // prompt looks like column zero and ONOCR swallows the return that
+        // ends it.
+        let p = pty();
+        with_oflag(&p, O_OPOST | O_ONOCR);
+        {
+            let mut inner = p.inner.lock();
+            inner.termios.c_lflag = ECHO;
+            // ICRNL is on in the cooked default and would turn the typed
+            // return into a newline before the echo ever saw it.
+            inner.termios.c_iflag = 0;
+        }
+        p.slave_write(b"$ ");
+        assert_eq!(master_drain(&p), "$ ");
+        // Mid-line now, so the typed return is a real one and is echoed.
+        p.master_write(b"\r");
+        assert_eq!(master_drain(&p), "\r");
+    }
+
+    #[test]
+    fn the_echo_and_the_program_share_one_cursor() {
+        // A typed character is on the same line as the program's output, so
+        // ONOCR has to count it. Two columns would make the terminal drop a
+        // carriage return that was wanted, or send one that was not.
+        let p = pty();
+        with_oflag(&p, O_OPOST | O_ONOCR);
+        // Raw mode so the typed byte is echoed and delivered at once.
+        p.inner.lock().termios.c_lflag = ECHO;
+        p.master_write(b"x");
+        assert_eq!(master_drain(&p), "x");
+        // The cursor is at column 1 now, so a program's return is a real one.
+        p.slave_write(b"\r");
+        assert_eq!(master_drain(&p), "\r");
+    }
+
+    #[test]
+    fn the_stock_terminal_still_turns_a_newline_into_carriage_return_newline() {
+        // The one translation that was already working, and the one every
+        // shell on the machine depends on.
+        let p = pty();
+        p.slave_write(b"hola\n");
+        assert_eq!(master_drain(&p), "hola\r\n");
+    }
+
+    #[test]
+    fn a_raw_terminal_translates_nothing_at_all() {
+        let p = pty();
+        with_oflag(&p, 0);
+        p.slave_write(b"a\r\nb");
+        assert_eq!(master_drain(&p), "a\r\nb");
+    }
+
+    #[test]
+    fn a_swallowed_run_is_not_a_full_queue() {
+        // The two are one answer only if you never have to tell them apart,
+        // and `slave_write` does: a writer told its byte did not fit offers
+        // the same byte again for ever.
+        let mut t = Termios::default_tty();
+        t.c_oflag = O_OPOST | O_ONOCR;
+        let mut out = VecDeque::new();
+        let mut col = 0usize;
+        assert_eq!(out_post(&mut out, &t, &mut col, b"\r"), Posted::Nothing);
+        assert!(out.is_empty());
     }
 
     // ---- canonical input ------------------------------------------------

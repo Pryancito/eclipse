@@ -99,6 +99,21 @@ pub const L_ECHOKE: u32 = 0x0800;
 /// `c_iflag` bit: input is UTF-8, so line editing works on characters.
 pub const I_IUTF8: u32 = 0x4000;
 
+/// `c_oflag` bit: output is post-processed at all. Every other bit in this
+/// word is read only when this one is set.
+pub const O_OPOST: u32 = 0x0001;
+/// `c_oflag` bit: map lower case to upper on output.
+pub const O_OLCUC: u32 = 0x0002;
+/// `c_oflag` bit: a newline also returns the carriage, so it goes out as CR-NL.
+pub const O_ONLCR: u32 = 0x0004;
+/// `c_oflag` bit: a carriage return goes out as a newline instead.
+pub const O_OCRNL: u32 = 0x0008;
+/// `c_oflag` bit: a carriage return at column zero is not sent.
+pub const O_ONOCR: u32 = 0x0010;
+/// `c_oflag` bit: the terminal's own newline returns the carriage, so the
+/// driver's idea of the column must be reset by one even without `ONLCR`.
+pub const O_ONLRET: u32 = 0x0020;
+
 /// The character in `c_cc` that means "this one is switched off".
 ///
 /// `_POSIX_VDISABLE` is 0 on Linux, and `n_tty` checks it before every single
@@ -385,6 +400,131 @@ impl Termios {
     /// cursor off the prompt line.
     pub fn echoes_newline(&self) -> bool {
         self.c_lflag & L_ECHO != 0 || self.c_lflag & L_ECHONL != 0
+    }
+
+    /// What the byte `c` becomes on its way to the terminal, and where that
+    /// leaves the cursor.
+    ///
+    /// `OPOST` is the switch for the whole `c_oflag` word: with it off the
+    /// byte goes out untouched, and with it on every other bit in the word
+    /// gets a say. All three line disciplines in this tree instead asked for
+    /// `OPOST && ONLCR` together and did nothing otherwise, in six separate
+    /// places -- so `OCRNL`, `ONOCR`, `ONLRET` and `OLCUC` were unreachable by
+    /// construction, however a program set them. It is one question, asked
+    /// once per output byte, so it is answered here.
+    ///
+    /// `column` is the driver's own count of how far along the line the cursor
+    /// is. It is not bookkeeping for its own sake: `ONOCR` is *defined* in
+    /// terms of it (a carriage return at column zero is the one that is not
+    /// sent), and `ONLRET` exists only to keep it honest on a terminal whose
+    /// newline returns the carriage by itself. A discipline that tracked no
+    /// column could implement neither.
+    ///
+    /// Follows `do_output_char` (`drivers/tty/n_tty.c`) except for `TABDLY ==
+    /// XTABS`, tab expansion to spaces, which is left out: it is the one rule
+    /// here that turns one byte into up to eight, and nothing in this tree
+    /// sets it. The column still advances to the next tab stop, which is what
+    /// a terminal that expands its own tabs needs.
+    pub fn output_char(&self, c: u8, column: &mut usize) -> Output {
+        if self.c_oflag & O_OPOST == 0 {
+            return Output::one(c);
+        }
+        match c {
+            b'\n' => {
+                if self.c_oflag & O_ONLRET != 0 {
+                    *column = 0;
+                }
+                if self.c_oflag & O_ONLCR != 0 {
+                    *column = 0;
+                    return Output::two(b'\r', b'\n');
+                }
+                // Neither flag: the terminal moves down and stays where it
+                // was across, so the column is deliberately left alone.
+                Output::one(b'\n')
+            }
+            b'\r' => {
+                if self.c_oflag & O_ONOCR != 0 && *column == 0 {
+                    return Output::none();
+                }
+                if self.c_oflag & O_OCRNL != 0 {
+                    if self.c_oflag & O_ONLRET != 0 {
+                        *column = 0;
+                    }
+                    // Deliberately *not* re-entering the newline rule above:
+                    // Linux breaks out of its switch here, so a carriage
+                    // return turned into a newline goes out as the one byte
+                    // even with `ONLCR` set.
+                    return Output::one(b'\n');
+                }
+                *column = 0;
+                Output::one(b'\r')
+            }
+            b'\t' => {
+                *column = column.saturating_add(8 - (*column & 7));
+                Output::one(b'\t')
+            }
+            0x08 => {
+                *column = column.saturating_sub(1);
+                Output::one(0x08)
+            }
+            _ => {
+                let mut c = c;
+                if !c.is_ascii_control() {
+                    if self.c_oflag & O_OLCUC != 0 {
+                        c = c.to_ascii_uppercase();
+                    }
+                    // A character several bytes long occupies one column, so
+                    // only the byte that starts it counts -- and only when the
+                    // terminal has been told its input is UTF-8 at all.
+                    if !(self.utf8_input() && utf8_continuation(c)) {
+                        *column = column.saturating_add(1);
+                    }
+                }
+                Output::one(c)
+            }
+        }
+    }
+}
+
+/// What one byte turns into on its way out of a terminal: nothing at all,
+/// itself, or a short run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Output {
+    buf: [u8; 2],
+    len: u8,
+}
+
+impl Output {
+    /// The byte is swallowed. Only `ONOCR` does this.
+    const fn none() -> Self {
+        Output {
+            buf: [0; 2],
+            len: 0,
+        }
+    }
+
+    const fn one(b: u8) -> Self {
+        Output {
+            buf: [b, 0],
+            len: 1,
+        }
+    }
+
+    const fn two(a: u8, b: u8) -> Self {
+        Output {
+            buf: [a, b],
+            len: 2,
+        }
+    }
+
+    /// The bytes to send, which may be none at all.
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.buf[..self.len as usize]
+    }
+
+    /// True when nothing at all goes out for this byte.
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
     }
 }
 
@@ -1008,5 +1148,278 @@ mod termios_tests {
         let t = Termios::default_tty();
         assert_eq!(t.c_lflag & L_ECHONL, 0, "ECHONL is off in the default");
         assert!(t.echoes_newline());
+    }
+
+    /// Post-process a whole run the way a discipline does, carrying the column
+    /// across bytes, and hand back what the terminal would receive.
+    fn post(t: &Termios, input: &[u8]) -> alloc::vec::Vec<u8> {
+        let mut col = 0usize;
+        let mut out = alloc::vec::Vec::new();
+        for &b in input {
+            out.extend_from_slice(t.output_char(b, &mut col).as_bytes());
+        }
+        out
+    }
+
+    fn oflag(bits: u32) -> Termios {
+        let mut t = Termios::default_tty();
+        t.c_oflag = bits;
+        t
+    }
+
+    #[test]
+    fn opost_off_hands_every_byte_through_untouched() {
+        // Raw mode. Not one bit of c_oflag may be consulted, including the
+        // ones a program left set from before it went raw.
+        let t = oflag(O_ONLCR | O_OCRNL | O_ONOCR | O_OLCUC);
+        assert_eq!(post(&t, b"a\r\nb\tc"), b"a\r\nb\tc".to_vec());
+    }
+
+    #[test]
+    fn opost_alone_is_not_onlcr() {
+        // The bug this whole rule exists for: all six sites asked for
+        // `OPOST && ONLCR` and did nothing otherwise, so OPOST on its own --
+        // which is what `stty opost -onlcr` leaves -- behaved like raw output.
+        // It must still be post-processing, just with nothing to translate.
+        let t = oflag(O_OPOST);
+        assert_eq!(post(&t, b"a\nb"), b"a\nb".to_vec());
+    }
+
+    #[test]
+    fn onlcr_turns_a_newline_into_carriage_return_newline() {
+        let t = oflag(O_OPOST | O_ONLCR);
+        assert_eq!(post(&t, b"a\nb"), b"a\r\nb".to_vec());
+    }
+
+    #[test]
+    fn onlcr_without_opost_does_nothing() {
+        // OPOST is the switch for the whole word. A program that sets ONLCR
+        // and clears OPOST has asked for raw output and must get it.
+        let t = oflag(O_ONLCR);
+        assert_eq!(post(&t, b"a\nb"), b"a\nb".to_vec());
+    }
+
+    #[test]
+    fn ocrnl_turns_a_carriage_return_into_a_newline() {
+        // `stty ocrnl`. Unreachable before this: OCRNL was declared in
+        // stdio.rs and never read.
+        let t = oflag(O_OPOST | O_OCRNL);
+        assert_eq!(post(&t, b"a\rb"), b"a\nb".to_vec());
+    }
+
+    #[test]
+    fn a_carriage_return_that_ocrnl_made_a_newline_is_not_then_expanded() {
+        // Linux breaks out of its switch after OCRNL rather than falling into
+        // the newline case, so the result is one byte even with ONLCR set.
+        // Getting this wrong doubles every line ending on a terminal that has
+        // both, which is `stty onlcr ocrnl`.
+        let t = oflag(O_OPOST | O_OCRNL | O_ONLCR);
+        assert_eq!(post(&t, b"a\rb"), b"a\nb".to_vec());
+        // ...while a real newline still gets its carriage return.
+        assert_eq!(post(&t, b"a\nb"), b"a\r\nb".to_vec());
+    }
+
+    #[test]
+    fn onocr_drops_a_carriage_return_only_at_the_start_of_the_line() {
+        // The point of ONOCR: on a printing terminal a CR at column zero costs
+        // a head movement and shows nothing. Mid-line it is a real return and
+        // must go.
+        let t = oflag(O_OPOST | O_ONOCR);
+        assert_eq!(post(&t, b"\r"), b"".to_vec());
+        assert_eq!(post(&t, b"ab\r"), b"ab\r".to_vec());
+    }
+
+    #[test]
+    fn a_carriage_return_puts_the_cursor_back_at_column_zero() {
+        // So the *second* of two returns is the one ONOCR swallows.
+        let t = oflag(O_OPOST | O_ONOCR);
+        assert_eq!(post(&t, b"ab\r\r"), b"ab\r".to_vec());
+    }
+
+    #[test]
+    fn onlcr_leaves_the_cursor_at_column_zero_so_onocr_sees_it() {
+        // The two flags are usually set together and only agree if the newline
+        // rule updates the column.
+        let t = oflag(O_OPOST | O_ONLCR | O_ONOCR);
+        assert_eq!(post(&t, b"ab\n\r"), b"ab\r\n".to_vec());
+    }
+
+    #[test]
+    fn a_bare_newline_does_not_move_the_cursor_across() {
+        // With neither ONLCR nor ONLRET the terminal drops a line and stays in
+        // the same column, so a following CR is a real one.
+        let t = oflag(O_OPOST | O_ONOCR);
+        assert_eq!(post(&t, b"ab\n\r"), b"ab\n\r".to_vec());
+    }
+
+    #[test]
+    fn onlret_says_the_terminal_returns_its_own_carriage() {
+        // That is all ONLRET does: it emits nothing. It tells the driver the
+        // cursor is back at column zero, which is the only reason ONOCR can
+        // then be right about the CR that follows.
+        let t = oflag(O_OPOST | O_ONLRET | O_ONOCR);
+        assert_eq!(post(&t, b"ab\n\r"), b"ab\n".to_vec());
+    }
+
+    #[test]
+    fn onlret_adds_no_byte_of_its_own() {
+        let t = oflag(O_OPOST | O_ONLRET);
+        assert_eq!(post(&t, b"a\nb"), b"a\nb".to_vec());
+    }
+
+    #[test]
+    fn ocrnl_with_onlret_also_leaves_the_cursor_at_column_zero() {
+        // The return became a newline, and on this terminal a newline returns
+        // the carriage, so the column has to follow it.
+        let t = oflag(O_OPOST | O_OCRNL | O_ONLRET | O_ONOCR);
+        assert_eq!(post(&t, b"ab\r\r"), b"ab\n".to_vec());
+    }
+
+    #[test]
+    fn ocrnl_without_onlret_leaves_the_column_where_it_was() {
+        // No ONLRET: the newline the CR became does not return the carriage,
+        // so the column stands and the next CR is a real one.
+        let t = oflag(O_OPOST | O_OCRNL | O_ONOCR);
+        assert_eq!(post(&t, b"ab\r\r"), b"ab\n\n".to_vec());
+    }
+
+    #[test]
+    fn olcuc_upper_cases_the_letters_and_leaves_the_rest() {
+        let t = oflag(O_OPOST | O_OLCUC);
+        assert_eq!(post(&t, b"ab1-z\n"), b"AB1-Z\n".to_vec());
+    }
+
+    #[test]
+    fn olcuc_does_not_touch_a_control_byte() {
+        // `iscntrl` guards the whole default branch in Linux. 0x01 upper-cased
+        // would still be 0x01, but 0x7f is DEL and must stay DEL.
+        let t = oflag(O_OPOST | O_OLCUC);
+        assert_eq!(post(&t, &[0x01, 0x7f]), alloc::vec![0x01, 0x7f]);
+    }
+
+    #[test]
+    fn a_tab_moves_the_cursor_to_the_next_stop_of_eight() {
+        // Not for the tab's own sake -- it goes out as a tab -- but because
+        // ONOCR asks where the cursor is afterwards.
+        let t = oflag(O_OPOST | O_ONOCR);
+        assert_eq!(post(&t, b"\tx"), b"\tx".to_vec());
+        let mut col = 0usize;
+        t.output_char(b'\t', &mut col);
+        assert_eq!(col, 8);
+        t.output_char(b'\t', &mut col);
+        assert_eq!(col, 16);
+        col = 3;
+        t.output_char(b'\t', &mut col);
+        assert_eq!(col, 8, "a tab from column 3 lands on the stop, not 3 + 8");
+    }
+
+    #[test]
+    fn a_backspace_takes_the_column_back_one_and_stops_at_zero() {
+        let t = oflag(O_OPOST | O_ONOCR);
+        let mut col = 2usize;
+        t.output_char(0x08, &mut col);
+        assert_eq!(col, 1);
+        t.output_char(0x08, &mut col);
+        assert_eq!(col, 0);
+        t.output_char(0x08, &mut col);
+        assert_eq!(col, 0, "the column must not go below zero");
+        // And at column zero a backspace has put us where ONOCR bites.
+        assert!(t.output_char(b'\r', &mut col).is_empty());
+    }
+
+    #[test]
+    fn a_character_several_bytes_long_occupies_one_column() {
+        // Otherwise a line of accented text reports a column three times too
+        // far along, and ONOCR then sends a carriage return that was not
+        // wanted -- the same mistake the erase path made before it learnt
+        // about continuation bytes.
+        let mut t = oflag(O_OPOST | O_ONOCR);
+        t.c_iflag |= I_IUTF8;
+        let mut col = 0usize;
+        for &b in "ñ".as_bytes() {
+            t.output_char(b, &mut col);
+        }
+        assert_eq!(col, 1, "two bytes, one column");
+    }
+
+    #[test]
+    fn a_terminal_that_was_not_told_its_input_is_utf8_counts_bytes() {
+        // IUTF8 off is a terminal that has been told its bytes are characters,
+        // and the column has to agree with it rather than with the truth.
+        let mut t = oflag(O_OPOST | O_ONOCR);
+        t.c_iflag &= !I_IUTF8;
+        let mut col = 0usize;
+        for &b in "ñ".as_bytes() {
+            t.output_char(b, &mut col);
+        }
+        assert_eq!(col, 2);
+    }
+
+    #[test]
+    fn a_control_byte_does_not_move_the_cursor_across() {
+        let t = oflag(O_OPOST | O_ONOCR);
+        let mut col = 0usize;
+        for b in [0x07u8, 0x1b, 0x00] {
+            t.output_char(b, &mut col);
+        }
+        assert_eq!(col, 0, "a bell, an escape and a NUL take no column");
+        assert!(t.output_char(b'\r', &mut col).is_empty());
+    }
+
+    #[test]
+    fn a_byte_above_ascii_is_not_a_control_byte() {
+        // `iscntrl` is false from 0x80 up, so a Latin-1 byte on a terminal
+        // with IUTF8 off takes its column like any other.
+        let mut t = oflag(O_OPOST | O_ONOCR);
+        t.c_iflag &= !I_IUTF8;
+        let mut col = 0usize;
+        t.output_char(0xe9, &mut col);
+        assert_eq!(col, 1);
+    }
+
+    #[test]
+    fn the_column_saturates_instead_of_wrapping() {
+        // Nothing reaches this, but a wrap would put the cursor back at column
+        // zero and make ONOCR swallow a carriage return that was wanted.
+        let t = oflag(O_OPOST);
+        let mut col = usize::MAX;
+        t.output_char(b'x', &mut col);
+        assert_eq!(col, usize::MAX);
+        t.output_char(b'\t', &mut col);
+        assert_eq!(col, usize::MAX);
+    }
+
+    #[test]
+    fn the_cooked_default_is_post_processed_with_onlcr_and_nothing_else() {
+        let t = Termios::default_tty();
+        assert_ne!(t.c_oflag & O_OPOST, 0);
+        assert_ne!(t.c_oflag & O_ONLCR, 0);
+        assert_eq!(t.c_oflag & (O_OCRNL | O_ONOCR | O_ONLRET | O_OLCUC), 0);
+        assert_eq!(post(&t, b"hola\n"), b"hola\r\n".to_vec());
+    }
+
+    #[test]
+    fn nothing_but_onocr_ever_swallows_a_byte() {
+        // A discipline may hand the result straight to its queue, so the empty
+        // case has exactly one cause and it is worth pinning.
+        for bits in [
+            O_OPOST,
+            O_OPOST | O_ONLCR,
+            O_OPOST | O_OCRNL,
+            O_OPOST | O_ONLRET,
+            O_OPOST | O_OLCUC,
+            O_OPOST | O_ONLCR | O_OCRNL | O_ONLRET | O_OLCUC,
+        ] {
+            let t = oflag(bits);
+            for b in 0u8..=255 {
+                let mut col = 0usize;
+                assert!(
+                    !t.output_char(b, &mut col).is_empty(),
+                    "oflag {:#x} swallowed {:#04x}",
+                    bits,
+                    b
+                );
+            }
+        }
     }
 }

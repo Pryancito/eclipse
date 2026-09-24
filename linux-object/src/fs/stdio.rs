@@ -13,7 +13,7 @@ use core::convert::TryFrom;
 use core::future::Future;
 use core::pin::Pin;
 use core::sync::atomic::AtomicBool;
-use core::sync::atomic::{AtomicI32, AtomicU64, AtomicU8, Ordering};
+use core::sync::atomic::{AtomicI32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use core::task::{Context, Poll};
 use core::time::Duration;
 use kernel_hal::console::{self, ConsoleWinSize};
@@ -42,15 +42,12 @@ const IXOFF: u32 = 0x1000;
 const IMAXBEL: u32 = 0x2000;
 const IUTF8: u32 = 0x4000;
 
-// c_oflag
-const OPOST: u32 = 0x0001;
-const OLCUC: u32 = 0x0002;
-const ONLCR: u32 = 0x0004;
-const OCRNL: u32 = 0x0008;
-const ONOCR: u32 = 0x0010;
-const ONLRET: u32 = 0x0020;
-const OFILL: u32 = 0x0040;
-const OFDEL: u32 = 0x0080;
+// c_oflag: the whole word now lives next to `Termios` in `ioctl.rs`, as
+// `O_OPOST`..`O_ONLRET`. It was copied here, and in the two PTYs, and only
+// `OPOST` and `ONLCR` were ever read -- under this file's `allow(dead_code)`,
+// which is why six flags could sit here unread without a word from the
+// compiler. `OFILL` and `OFDEL` are padding delays for a printing terminal
+// and are not implemented anywhere, so they are simply gone.
 
 // c_lflag
 const ISIG: u32 = 0x0001;
@@ -115,6 +112,11 @@ struct TtyState {
     /// VINTR for the same pgrp escalates to SIGKILL (see
     /// [`crate::process::interrupt_or_force_pgrp`]).
     ctrl_c_armed_pgid: AtomicI32,
+    /// Where the cursor sits on this VT's line, counted the way the driver
+    /// counts it. `ONOCR` is defined in terms of it and `ONLRET` exists to
+    /// keep it honest; see [`Termios::output_char`]. Program output and echo
+    /// share it because they share the screen.
+    out_column: AtomicUsize,
 }
 
 lazy_static! {
@@ -128,6 +130,7 @@ lazy_static! {
             flow_stopped: AtomicBool::new(false),
             vt_owner: AtomicU64::new(0),
             ctrl_c_armed_pgid: AtomicI32::new(0),
+            out_column: AtomicUsize::new(0),
         })
         .collect();
 }
@@ -139,6 +142,11 @@ fn vt_clamp(vt: usize) -> usize {
 
 fn tty_termios(vt: usize) -> &'static Mutex<Termios> {
     &TTY_STATES[vt_clamp(vt)].termios
+}
+
+/// This VT's output column. See [`TtyState::out_column`].
+fn tty_column(vt: usize) -> &'static AtomicUsize {
+    &TTY_STATES[vt_clamp(vt)].out_column
 }
 
 fn tty_fg_pgrp(vt: usize) -> &'static AtomicI32 {
@@ -1400,17 +1408,27 @@ impl Stdin {
     }
 
     /// Echo to this terminal's console.
+    ///
+    /// Raw: the bytes go out as they are and the cursor is not tracked. Only
+    /// for runs the discipline has already rendered and post-processed, or
+    /// that carry no `c_oflag` meaning at all.
     fn echo(&self, s: &str) {
         kernel_hal::console::vt_console_write_str(self.vt, s);
     }
 
+    /// Echo a run through the terminal's own output rules, moving its cursor.
+    ///
+    /// Echoed bytes go through the same `c_oflag` as program output and share
+    /// its column: `__process_echoes` hands each byte it is about to put out
+    /// to `do_output_char` whenever `OPOST` is set (`drivers/tty/n_tty.c`).
+    fn echo_post(&self, s: &str) {
+        tty_post_out(self.vt, s.as_bytes());
+    }
+
     fn echo_char(&self, c: char) {
-        let termios = tty_termios(self.vt).lock();
+        let termios = *tty_termios(self.vt).lock();
         let echo = termios.c_lflag & ECHO != 0;
         let echoctl = termios.c_lflag & ECHOCTL != 0;
-        let opost = termios.c_oflag & OPOST != 0;
-        let onlcr = termios.c_oflag & ONLCR != 0;
-        drop(termios);
 
         if !echo {
             return;
@@ -1418,31 +1436,21 @@ impl Stdin {
 
         match c {
             '\u{8}' | '\u{7f}' => {
-                self.echo("\x08 \x08");
+                self.echo_post("\x08 \x08");
             }
-            '\n' => {
-                if opost && onlcr {
-                    self.echo("\r\n");
-                } else {
-                    self.echo("\n");
-                }
-            }
-            '\r' => {
-                self.echo("\r");
-            }
-            c if c.is_control() => {
+            c if c.is_control() && c != '\n' && c != '\r' && c != '\t' => {
                 if echoctl {
                     let mut s = [0u8; 2];
                     s[0] = b'^';
                     s[1] = (c as u8 + 64) & 0x7f;
                     if let Ok(s_str) = core::str::from_utf8(&s) {
-                        self.echo(s_str);
+                        self.echo_post(s_str);
                     }
                 }
             }
             c => {
                 let mut buf = [0u8; 4];
-                self.echo(c.encode_utf8(&mut buf));
+                self.echo_post(c.encode_utf8(&mut buf));
             }
         }
     }
@@ -1858,29 +1866,40 @@ fn tty_write_out(vt: usize, buf: &[u8]) {
         }
         core::hint::spin_loop();
     }
-    let termios = tty_termios(vt).lock();
-    let opost = termios.c_oflag & OPOST != 0;
-    let onlcr = termios.c_oflag & ONLCR != 0;
-    drop(termios);
+    tty_post_out(vt, buf);
+}
 
-    if opost && onlcr {
-        let mut start = 0;
-        for (i, &b) in buf.iter().enumerate() {
-            if b == b'\n' {
-                if i > start {
-                    let s = unsafe { core::str::from_utf8_unchecked(&buf[start..i]) };
-                    kernel_hal::console::vt_console_write_str(vt, s);
-                }
-                kernel_hal::console::vt_console_write_str(vt, "\r\n");
-                start = i + 1;
-            }
-        }
-        if start < buf.len() {
-            let s = unsafe { core::str::from_utf8_unchecked(&buf[start..]) };
+/// Put `buf` on the VT through the terminal's `c_oflag` rules, moving its
+/// cursor. Unlike [`tty_write_out`] this does **not** wait on software flow
+/// control, because the echo path calls it: a Ctrl-S arrives on the same path
+/// as the Ctrl-Q that would release it, so an echo that waited for the flow to
+/// resume would be waiting for itself.
+fn tty_post_out(vt: usize, buf: &[u8]) {
+    let termios = *tty_termios(vt).lock();
+    let mut col = tty_column(vt).load(Ordering::Relaxed);
+
+    // Post-process into a staging buffer rather than a call per byte, and
+    // flush it only where a character ends: `from_utf8_unchecked` on half a
+    // character is not a string. A continuation byte is never a control byte,
+    // so the rule hands it back untouched and one character is at most its own
+    // four bytes -- the headroom below covers that and the one byte that can
+    // become two.
+    let mut staged = [0u8; 256];
+    let mut n = 0;
+    for &b in buf {
+        if n + 8 > staged.len() && !utf8_continuation(b) {
+            let s = unsafe { core::str::from_utf8_unchecked(&staged[..n]) };
             kernel_hal::console::vt_console_write_str(vt, s);
+            n = 0;
         }
-    } else {
-        let s = unsafe { core::str::from_utf8_unchecked(buf) };
+        for &o in termios.output_char(b, &mut col).as_bytes() {
+            staged[n] = o;
+            n += 1;
+        }
+    }
+    tty_column(vt).store(col, Ordering::Relaxed);
+    if n > 0 {
+        let s = unsafe { core::str::from_utf8_unchecked(&staged[..n]) };
         kernel_hal::console::vt_console_write_str(vt, s);
     }
 }
@@ -3151,6 +3170,127 @@ mod line_discipline_tests {
         // Exactly the room that was freed, and nothing the queue had before.
         let tail: Vec<u8> = s.buf.lock().iter().rev().take(10).copied().collect();
         assert_eq!(tail, vec![b'y'; 10]);
+    }
+
+    // ---- the output word, c_oflag ---------------------------------------
+    //
+    // What goes out is not observable here (`vt_console_write_str` is a no-op
+    // without the `graphic` feature), but the cursor is: it is per-VT state,
+    // and it is what `ONOCR` decides on. A wiring mistake shows up as a
+    // column that stops moving, or that moves for the program and not for the
+    // echo.
+
+    /// Install `bits` as this VT's output flags and put the cursor at zero.
+    fn oflag(bits: u32) -> Stdin {
+        let s = cooked();
+        tty_termios(VT).lock().c_oflag = bits;
+        tty_column(VT).store(0, Ordering::Relaxed);
+        s
+    }
+
+    fn column() -> usize {
+        tty_column(VT).load(Ordering::Relaxed)
+    }
+
+    #[test]
+    fn program_output_moves_the_console_cursor() {
+        let _g = SERIAL.lock();
+        let _s = oflag(O_OPOST | O_ONLCR);
+        tty_post_out(VT, b"hola");
+        assert_eq!(column(), 4);
+        // ONLCR takes it back to the start of the next line.
+        tty_post_out(VT, b"\n");
+        assert_eq!(column(), 0);
+    }
+
+    #[test]
+    fn the_cursor_carries_across_separate_writes() {
+        // Not a local: the first byte of every write would look like column
+        // zero, and ONOCR would swallow every carriage return on the machine.
+        let _g = SERIAL.lock();
+        let _s = oflag(O_OPOST | O_ONOCR);
+        tty_post_out(VT, b"ab");
+        tty_post_out(VT, b"cd");
+        assert_eq!(column(), 4);
+    }
+
+    #[test]
+    fn a_raw_console_moves_no_cursor_at_all() {
+        // With OPOST off not one bit of the word is consulted, the column
+        // included -- which is right, because nothing is being translated.
+        let _g = SERIAL.lock();
+        let _s = oflag(0);
+        tty_post_out(VT, b"hola");
+        assert_eq!(column(), 0);
+    }
+
+    #[test]
+    fn the_echo_moves_the_same_cursor_as_the_program() {
+        // One line on one screen. `__process_echoes` post-processes every byte
+        // it puts out when OPOST is set (`drivers/tty/n_tty.c`), so the echo
+        // has to count -- otherwise a terminal with ONOCR drops the carriage
+        // return that ends a line the user typed.
+        let _g = SERIAL.lock();
+        let s = oflag(O_OPOST | O_ONOCR);
+        s.echo_char('x');
+        assert_eq!(column(), 1);
+        s.echo_char('y');
+        assert_eq!(column(), 2);
+        // And the program's output continues from there.
+        tty_post_out(VT, b"z");
+        assert_eq!(column(), 3);
+    }
+
+    #[test]
+    fn a_tab_echoes_as_a_tab_and_not_as_caret_i() {
+        // Linux's `echo_char` spells out the exception: `L_ECHOCTL && iscntrl(c)
+        // && c != '\t'`. This end captioned the tab, which put `^I` on screen
+        // where the user expected the cursor to move, and the live PTY -- the
+        // same rule, written separately -- did not.
+        let _g = SERIAL.lock();
+        let s = oflag(O_OPOST);
+        s.echo_char('\t');
+        assert_eq!(
+            column(),
+            8,
+            "a tab moves to the next stop, it is not two characters"
+        );
+    }
+
+    #[test]
+    fn a_multi_byte_character_takes_one_column() {
+        let _g = SERIAL.lock();
+        let s = oflag(O_OPOST);
+        tty_termios(VT).lock().c_iflag |= I_IUTF8;
+        tty_column(VT).store(0, Ordering::Relaxed);
+        s.echo_char('ñ');
+        assert_eq!(column(), 1);
+    }
+
+    #[test]
+    fn a_staged_run_longer_than_the_buffer_still_comes_out_whole() {
+        // `tty_post_out` flushes a fixed buffer in pieces, and may only do so
+        // where a character ends. The column is what proves every byte was
+        // accounted for across the flushes.
+        let _g = SERIAL.lock();
+        let _s = oflag(O_OPOST);
+        let long = alloc::vec![b'x'; 1000];
+        tty_post_out(VT, &long);
+        assert_eq!(column(), 1000);
+    }
+
+    #[test]
+    fn a_run_of_multi_byte_characters_crosses_the_flush_boundary_intact() {
+        let _g = SERIAL.lock();
+        let _s = oflag(O_OPOST);
+        tty_termios(VT).lock().c_iflag |= I_IUTF8;
+        tty_column(VT).store(0, Ordering::Relaxed);
+        let mut run = alloc::vec::Vec::new();
+        for _ in 0..500 {
+            run.extend_from_slice("ñ".as_bytes());
+        }
+        tty_post_out(VT, &run);
+        assert_eq!(column(), 500, "500 characters, 1000 bytes, 500 columns");
     }
 }
 
