@@ -76,7 +76,15 @@ pub const VTIME_CC: usize = 5;
 pub const VMIN_CC: usize = 6;
 /// Index into [`Termios::c_cc`] of the line-kill character (Ctrl-U).
 pub const VKILL_CC: usize = 3;
+/// Index into [`Termios::c_cc`] of the interrupt character (Ctrl-C).
+pub const VINTR_CC: usize = 0;
+/// Index into [`Termios::c_cc`] of the quit character (Ctrl-\).
+pub const VQUIT_CC: usize = 1;
+/// Index into [`Termios::c_cc`] of the suspend character (Ctrl-Z).
+pub const VSUSP_CC: usize = 10;
 
+/// `c_lflag` bit: the signal-generating characters are active.
+pub const L_ISIG: u32 = 0x0001;
 /// `c_lflag` bit for canonical (line-at-a-time) input.
 pub const L_ICANON: u32 = 0x0002;
 /// `c_lflag` bit: echo input back to the terminal at all.
@@ -90,6 +98,25 @@ pub const L_ECHOKE: u32 = 0x0800;
 
 /// `c_iflag` bit: input is UTF-8, so line editing works on characters.
 pub const I_IUTF8: u32 = 0x4000;
+
+/// The character in `c_cc` that means "this one is switched off".
+///
+/// `_POSIX_VDISABLE` is 0 on Linux, and `n_tty` checks it before every single
+/// `c_cc` comparison. Skipping the check does not disable anything — it aims
+/// the character at byte `0x00` instead, which is a byte a program can
+/// perfectly well send.
+pub const VDISABLE: u8 = 0;
+
+/// Which signal a byte asks for, if any.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TtySignal {
+    /// `VINTR`, Ctrl-C by default: SIGINT.
+    Intr,
+    /// `VQUIT`, Ctrl-\ by default: SIGQUIT.
+    Quit,
+    /// `VSUSP`, Ctrl-Z by default: SIGTSTP.
+    Susp,
+}
 
 /// Whether `b` continues a UTF-8 character rather than starting one.
 ///
@@ -250,6 +277,31 @@ impl Termios {
     /// makes line editing work on characters instead of bytes.
     pub fn utf8_input(&self) -> bool {
         self.c_iflag & I_IUTF8 != 0
+    }
+
+    /// Which signal, if any, the byte `b` asks the line discipline to raise.
+    ///
+    /// Two rules live here rather than in each discipline, because there are
+    /// three of them and they have not agreed before. First, `ISIG` off means
+    /// none of these characters is special at all. Second, a `c_cc` slot set
+    /// to [`VDISABLE`] is *switched off*, so it must not be compared against:
+    /// a terminal that turns Ctrl-C off by writing a zero there would
+    /// otherwise have every `0x00` byte in its input raise SIGINT, which is
+    /// the opposite of what it asked for.
+    pub fn tty_signal(&self, b: u8) -> Option<TtySignal> {
+        if self.c_lflag & L_ISIG == 0 {
+            return None;
+        }
+        for (idx, sig) in [
+            (VINTR_CC, TtySignal::Intr),
+            (VQUIT_CC, TtySignal::Quit),
+            (VSUSP_CC, TtySignal::Susp),
+        ] {
+            if self.c_cc[idx] != VDISABLE && self.c_cc[idx] == b {
+                return Some(sig);
+            }
+        }
+        None
     }
 
     /// True when a newline typed in canonical mode is echoed.
@@ -514,6 +566,74 @@ mod termios_tests {
         t.c_cc[VMIN_CC] = vmin;
         t.c_cc[VTIME_CC] = vtime;
         t
+    }
+
+    #[test]
+    fn the_signal_characters_are_the_ones_termbits_h_names() {
+        // Indices into `c_cc` and the bytes a cooked terminal starts with.
+        // Three line disciplines read these, so they are pinned here once.
+        assert_eq!(VINTR_CC, 0);
+        assert_eq!(VQUIT_CC, 1);
+        assert_eq!(VSUSP_CC, 10);
+        assert_eq!(L_ISIG, 0o000001);
+        assert_eq!(VDISABLE, 0);
+
+        let t = Termios::default_tty();
+        assert_eq!(t.c_cc[VINTR_CC], 3, "Ctrl-C");
+        assert_eq!(t.c_cc[VQUIT_CC], 28, "Ctrl-backslash");
+        assert_eq!(t.c_cc[VSUSP_CC], 26, "Ctrl-Z");
+    }
+
+    #[test]
+    fn a_cooked_terminal_answers_the_three_signal_characters() {
+        let t = Termios::default_tty();
+        assert_eq!(t.tty_signal(3), Some(TtySignal::Intr));
+        assert_eq!(t.tty_signal(28), Some(TtySignal::Quit));
+        assert_eq!(t.tty_signal(26), Some(TtySignal::Susp));
+        assert_eq!(t.tty_signal(b'a'), None);
+    }
+
+    #[test]
+    fn a_signal_character_moved_to_another_byte_follows_it() {
+        // `stty intr ^X` is a real thing people do.
+        let mut t = Termios::default_tty();
+        t.c_cc[VINTR_CC] = 24; // Ctrl-X
+        assert_eq!(t.tty_signal(24), Some(TtySignal::Intr));
+        assert_eq!(t.tty_signal(3), None, "el viejo Ctrl-C ya no es nada");
+    }
+
+    #[test]
+    fn a_signal_character_switched_off_does_not_answer_to_a_zero_byte() {
+        // `stty intr undef` writes VDISABLE, which is the byte 0. Comparing
+        // against it without checking first does not switch the character
+        // off: it points it at 0x00, a byte any program can send.
+        let mut t = Termios::default_tty();
+        t.c_cc[VINTR_CC] = VDISABLE;
+        assert_eq!(t.tty_signal(0), None, "un NUL no es un Ctrl-C");
+        assert_eq!(t.tty_signal(3), None, "y Ctrl-C tampoco lo es ya");
+        // The other two still answer, because only one was switched off.
+        assert_eq!(t.tty_signal(28), Some(TtySignal::Quit));
+        assert_eq!(t.tty_signal(26), Some(TtySignal::Susp));
+    }
+
+    #[test]
+    fn every_c_cc_switched_off_leaves_a_zero_byte_ordinary() {
+        let mut t = Termios::default_tty();
+        for idx in [VINTR_CC, VQUIT_CC, VSUSP_CC] {
+            t.c_cc[idx] = VDISABLE;
+        }
+        assert_eq!(t.tty_signal(0), None);
+    }
+
+    #[test]
+    fn isig_off_means_no_byte_is_special() {
+        // Raw mode: a program driving the terminal itself wants Ctrl-C as a
+        // byte, not as a signal.
+        let mut t = Termios::default_tty();
+        t.c_lflag &= !L_ISIG;
+        for b in [3u8, 28, 26] {
+            assert_eq!(t.tty_signal(b), None, "{}", b);
+        }
     }
 
     #[test]
