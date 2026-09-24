@@ -133,3 +133,14 @@ pub(crate) fn report_deadlock_holder(file_ptr: usize, file_len: usize, line: u32
         f(file_ptr, file_len, line, cpu);
     }
 }
+
+/// The one lock every test that installs this module's process-wide hooks
+/// takes. It lives here, and not in each test module, because `rwlock.rs` and
+/// `tests.rs` both arm the spin pump and the deadlock hook — two locks would
+/// leave them overwriting each other's recorder. The suite runs with
+/// `--test-threads=1` in CI and would never notice.
+#[cfg(test)]
+pub(crate) fn hook_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}

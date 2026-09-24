@@ -21,6 +21,52 @@ const READER: usize = 1 << 2;
 const UPGRADED: usize = 1 << 1;
 const WRITER: usize = 1;
 
+/// The one spin discipline this file's four waiting loops share.
+///
+/// Every mutex flavour in this crate brackets its acquire with `push_off`, so
+/// a waiter that got here from a caller who already had interrupts off spins
+/// with them **still** off — and is therefore deaf to the TLB-shootdown IPI.
+/// A peer performing a shootdown spin-waits for that ack while holding the
+/// VMAR lock, so a silent waiter wedges it, and every CPU queued behind that
+/// lock wedges with it. `deadlock::pump`'s own doc names the shape: *"Only
+/// this crate's own ticket lock pumped; a CPU parked in any other IRQs-off
+/// spinner was an ack black hole."* This file held four of them.
+///
+/// `ticket.rs` and `spin.rs` each answer this with the same two lines —
+/// drain our own queue every 512 spins, report the stuck call site once at
+/// the threshold — so the answer goes in one place and the loops read from
+/// it. Two of the four had neither half: `upgradeable_read` and `upgrade`
+/// spun in complete silence, so a wedge there produced no banner either, and
+/// the machine stopped with nothing on the console.
+///
+/// A pump is one relaxed load when no hook is installed, and one queue-pointer
+/// compare when the queue is empty, so the cadence costs a contended acquire
+/// nothing measurable.
+struct SpinDiscipline {
+    spins: u64,
+    caller: &'static core::panic::Location<'static>,
+}
+
+impl SpinDiscipline {
+    #[inline]
+    fn new(caller: &'static core::panic::Location<'static>) -> Self {
+        Self { spins: 0, caller }
+    }
+
+    /// One turn of a waiting loop.
+    #[inline]
+    fn spin(&mut self) {
+        spin_loop();
+        self.spins += 1;
+        if self.spins & 511 == 0 {
+            crate::deadlock::spin_pump();
+        }
+        if self.spins == crate::deadlock::deadlock_spins() {
+            crate::deadlock::report_deadlock(self.caller.file(), self.caller.line());
+        }
+    }
+}
+
 /// A guard that provides immutable data access.
 ///
 /// When the guard falls out of scope it will decrement the read count,
@@ -143,21 +189,15 @@ impl<T: ?Sized> RwLock<T> {
     /// ```
     #[track_caller]
     pub fn read(&self) -> RwLockReadGuard<'_, T> {
-        let caller = core::panic::Location::caller();
-        let mut spins: u64 = 0;
+        let mut spin = SpinDiscipline::new(core::panic::Location::caller());
         loop {
             match self.try_read() {
                 Some(guard) => return guard,
-                None => {
-                    spin_loop();
-                    spins += 1;
-                    if spins == crate::deadlock::deadlock_spins() {
-                        // Many seconds of continuous spinning: almost certainly
-                        // a deadlock (e.g. a writer wedged while holding this
-                        // lock). Self-report once, keep spinning.
-                        crate::deadlock::report_deadlock(caller.file(), caller.line());
-                    }
-                }
+                // Many seconds of continuous spinning is almost certainly a
+                // deadlock (e.g. a writer wedged while holding this lock);
+                // `SpinDiscipline` self-reports once and keeps spinning, and
+                // drains our own shootdown queue on the way.
+                None => spin.spin(),
             }
         }
     }
@@ -182,19 +222,11 @@ impl<T: ?Sized> RwLock<T> {
     /// ```
     #[track_caller]
     pub fn write(&self) -> RwLockWriteGuard<'_, T> {
-        let caller = core::panic::Location::caller();
-        let mut spins: u64 = 0;
+        let mut spin = SpinDiscipline::new(core::panic::Location::caller());
         loop {
             match self.try_write_internal(false) {
                 Some(guard) => return guard,
-                None => {
-                    spin_loop();
-                    spins += 1;
-                    if spins == crate::deadlock::deadlock_spins() {
-                        // See `read` — same self-report contract.
-                        crate::deadlock::report_deadlock(caller.file(), caller.line());
-                    }
-                }
+                None => spin.spin(),
             }
         }
     }
@@ -202,11 +234,13 @@ impl<T: ?Sized> RwLock<T> {
     /// Obtain a readable lock guard that can later be upgraded to a writable lock guard.
     /// Upgrades can be done through the [`RwLockUpgradableGuard::upgrade`](RwLockUpgradableGuard::upgrade) method.
     #[inline]
+    #[track_caller]
     pub fn upgradeable_read(&self) -> RwLockUpgradableGuard<'_, T> {
+        let mut spin = SpinDiscipline::new(core::panic::Location::caller());
         loop {
             match self.try_upgradeable_read() {
                 Some(guard) => return guard,
-                None => spin_loop(),
+                None => spin.spin(),
             }
         }
     }
@@ -465,14 +499,15 @@ impl<'rwlock, T: ?Sized> RwLockUpgradableGuard<'rwlock, T> {
     /// let writable = upgradeable.upgrade();
     /// ```
     #[inline]
+    #[track_caller]
     pub fn upgrade(mut self) -> RwLockWriteGuard<'rwlock, T> {
+        let mut spin = SpinDiscipline::new(core::panic::Location::caller());
         loop {
             self = match self.try_upgrade_internal(false) {
                 Ok(guard) => return guard,
                 Err(e) => e,
             };
-
-            spin_loop();
+            spin.spin();
         }
     }
 }
@@ -778,5 +813,92 @@ fn compare_exchange(
         atomic.compare_exchange(current, new, success, failure)
     } else {
         atomic.compare_exchange_weak(current, new, success, failure)
+    }
+}
+
+/// The spin discipline itself, driven directly.
+///
+/// The four loops that use it are exercised in `tests.rs`, where a second
+/// thread is a second CPU and the waiting is real. These pin the two numbers
+/// those tests cannot see from outside: how often a waiter drains its own
+/// shootdown queue, and that the stuck call site is named once and not on
+/// every turn afterwards.
+#[cfg(test)]
+mod spin_discipline_tests {
+    use super::*;
+    use core::sync::atomic::AtomicU32;
+
+    /// These install process-wide hooks, so they take the shared hook lock.
+    fn hook_lock() -> std::sync::MutexGuard<'static, ()> {
+        crate::deadlock::hook_test_lock()
+    }
+
+    static PUMPS: AtomicU32 = AtomicU32::new(0);
+    static REPORTS: AtomicU32 = AtomicU32::new(0);
+
+    fn count_pump() {
+        PUMPS.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn count_report(_file: &'static str, _line: u32) {
+        REPORTS.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn armed(threshold: u64) -> std::sync::MutexGuard<'static, ()> {
+        let guard = hook_lock();
+        PUMPS.store(0, Ordering::SeqCst);
+        REPORTS.store(0, Ordering::SeqCst);
+        crate::deadlock::set_spin_pump(count_pump);
+        crate::deadlock::set_deadlock_hook(count_report);
+        crate::deadlock::set_deadlock_spins(threshold);
+        guard
+    }
+
+    fn here() -> &'static core::panic::Location<'static> {
+        core::panic::Location::caller()
+    }
+
+    #[test]
+    fn a_waiter_drains_its_own_queue_every_five_hundred_and_twelve_turns() {
+        let _g = armed(0);
+        let mut spin = SpinDiscipline::new(here());
+        for _ in 0..511 {
+            spin.spin();
+        }
+        assert_eq!(
+            PUMPS.load(Ordering::SeqCst),
+            0,
+            "the cadence is coarse on purpose: a pump per turn would put the \
+             shootdown queue on the hot path of every contended acquire"
+        );
+        spin.spin();
+        assert_eq!(PUMPS.load(Ordering::SeqCst), 1);
+        for _ in 0..512 {
+            spin.spin();
+        }
+        assert_eq!(PUMPS.load(Ordering::SeqCst), 2);
+        crate::deadlock::set_deadlock_spins(0);
+    }
+
+    #[test]
+    fn a_wedged_waiter_names_its_call_site_once_and_keeps_spinning() {
+        let _g = armed(1_000);
+        let mut spin = SpinDiscipline::new(here());
+        for _ in 0..999 {
+            spin.spin();
+        }
+        assert_eq!(REPORTS.load(Ordering::SeqCst), 0);
+        spin.spin();
+        assert_eq!(REPORTS.load(Ordering::SeqCst), 1, "the wedge went unnamed");
+        // The hook paints a banner somewhere lock-free; repeating it every
+        // turn from then on would bury the machine under its own report.
+        for _ in 0..5_000 {
+            spin.spin();
+        }
+        assert_eq!(REPORTS.load(Ordering::SeqCst), 1);
+        // …and it never stops waiting: a lock that is merely very contended
+        // must still be acquired once it frees up.
+        assert!(PUMPS.load(Ordering::SeqCst) > 1);
+        crate::deadlock::set_deadlock_spins(0);
     }
 }
