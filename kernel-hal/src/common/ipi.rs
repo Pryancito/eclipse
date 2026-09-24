@@ -2,8 +2,8 @@ use crate::common::cpu_topology::{percpu_slot, PERCPU_SLOTS};
 use crate::{config::MAX_CORE_NUM, utils::mpsc_queue::MpscQueue};
 use alloc::vec::Vec;
 
-/// Two shapes bound a cpu id in this module. `CPU_ONLINE`, `IPI_READY`,
-/// `IPI_QUEUE_OVERFLOW` and every wait mask are `AtomicU64`, so an id needs a
+/// Two shapes bound a cpu id in this module. `CPU_ONLINE`, `IPI_READY` and
+/// every wait mask are `AtomicU64`, so an id needs a
 /// bit; the per-CPU tables below — the queues, `ACTIVE_VMTOKEN`,
 /// `SHOOTDOWN_SEQ`, `SHOOTDOWN_GOAL` and the overflow counters — are
 /// `[_; MAX_CORE_NUM]`, so it needs a slot. `MAX_CORE_NUM` is the tighter, and
@@ -15,7 +15,7 @@ use alloc::vec::Vec;
 /// with locks held.
 const _: () = assert!(
     MAX_CORE_NUM <= 64,
-    "the online/ready/overflow masks are u64: widen them before raising MAX_CORE_NUM"
+    "the online/ready/wait masks are u64: widen them before raising MAX_CORE_NUM"
 );
 
 const REASON_SIZE: usize = 64;
@@ -433,29 +433,53 @@ pub fn shootdown_queue_state(cpu: usize) -> (usize, usize, usize, bool, bool) {
         q.ptail(),
         q.phead(),
         SHOOTDOWN_ACK_ACTIVE[cpu].load(Ordering::Relaxed),
-        IPI_QUEUE_OVERFLOW.load(Ordering::Relaxed) & (1u64 << cpu) != 0,
+        overflow_pending(cpu),
     )
 }
 
-/// Per-CPU "the IPI queue could not take an entry" flags. A sender that fails
-/// to publish its payload (queue full / lost commit race) sets the target's
-/// bit; the target's next ack then falls back to a full TLB flush, so the
-/// precise per-page path below can never silently skip an invalidation.
-static IPI_QUEUE_OVERFLOW: AtomicU64 = AtomicU64::new(0);
-
-/// Generation bumped by each overflow note, and the generation a drain last
-/// acknowledged. An overflow send does not advance the target queue's `ptail`,
-/// so waiting on `SHOOTDOWN_SEQ >= ptail` can return immediately on a previous
-/// drain's watermark — the initiator then frees frames while the target still
-/// has the stale TLB entry. Waiters that observed a gen bump wait for this
-/// ack instead (the overflow drain always full-flushes).
+/// How many payloads for this CPU could not be published, and how many of
+/// those a drain has covered with a full flush. `GEN > ACK` **is** the demand
+/// for a full flush; there is no separate flag.
+///
+/// A sender that cannot publish (queue full, lost commit race, or a publish
+/// already in flight on its own CPU) has no way to say *which* page to
+/// invalidate, so the target's next drain must full-flush instead. That demand
+/// cannot ride the queue: an overflow advances no queue index, so
+/// `SHOOTDOWN_SEQ >= ptail` can be satisfied by a drain that predates the
+/// dropped request — the initiator would free frames the target still maps.
+/// Initiators that saw the generation move wait on [`IPI_OVERFLOW_ACK`]
+/// instead.
+///
+/// **One counter pair, and deliberately no second flag.** This used to be a
+/// generation *and* an `IPI_QUEUE_OVERFLOW` bitmask, written by one note in
+/// two separate atomic operations — the bit first, the generation second — and
+/// read by a drain in the same two steps. A drain landing between them saw the
+/// bit, read the *old* generation, full-flushed and acknowledged that old
+/// value; the sender then read the new generation and waited for an
+/// acknowledgement of it. Nothing was left to produce one: the bit had been
+/// consumed, so the next drain saw no overflow at all and published nothing,
+/// and a re-kick that fits in the queue notes no overflow either. On x86_64
+/// the NMI rung of [`remote_flush_tlb_on`]'s ladder eventually rescued it,
+/// after ~1M spins; [`nmi_kick_pending_targets`] is empty on riscv and
+/// aarch64, so there the initiator waits for an acknowledgement that can never
+/// arrive — and that wait has no timeout, by design. Deriving the demand from
+/// the counters makes the note a single atomic operation, so the window does
+/// not exist and no future reader can get the two halves out of step.
 static IPI_OVERFLOW_GEN: [AtomicU64; MAX_CORE_NUM] = [ZERO_SEQ; MAX_CORE_NUM];
 static IPI_OVERFLOW_ACK: [AtomicU64; MAX_CORE_NUM] = [ZERO_SEQ; MAX_CORE_NUM];
+
+/// Whether `cpu` still owes a full flush for a payload that never reached its
+/// queue. The one place this question is answered, for the peek, the pump, the
+/// NMI rescue, the initiator's self-pump and the diagnostics alike.
+fn overflow_pending(cpu: usize) -> bool {
+    cpu < MAX_CORE_NUM
+        && IPI_OVERFLOW_GEN[cpu].load(Ordering::Acquire)
+            > IPI_OVERFLOW_ACK[cpu].load(Ordering::Acquire)
+}
 
 /// Note that `cpuid`'s IPI queue dropped an entry (called by the arch sender).
 pub fn note_ipi_queue_overflow(cpuid: usize) {
     if cpuid < MAX_CORE_NUM {
-        IPI_QUEUE_OVERFLOW.fetch_or(1u64 << cpuid, Ordering::Release);
         IPI_OVERFLOW_GEN[cpuid].fetch_add(1, Ordering::Release);
     }
 }
@@ -498,7 +522,7 @@ pub fn tlb_shootdown_pump() {
     let Some(q) = ipi_queue(me) else {
         return;
     };
-    if q.chead() == q.ptail() && IPI_QUEUE_OVERFLOW.load(Ordering::Relaxed) & (1u64 << me) == 0 {
+    if q.chead() == q.ptail() && !overflow_pending(me) {
         return;
     }
     tlb_shootdown_ack();
@@ -537,8 +561,7 @@ fn drain_and_ack_on(me: usize, mut out: Option<&mut Vec<IpiEntry>>) {
         let Some(q) = ipi_queue(me) else {
             return;
         };
-        if q.chead() == q.ptail() && IPI_QUEUE_OVERFLOW.load(Ordering::Acquire) & (1u64 << me) == 0
-        {
+        if q.chead() == q.ptail() && !overflow_pending(me) {
             return;
         }
     }
@@ -547,16 +570,16 @@ fn drain_and_ack_on(me: usize, mut out: Option<&mut Vec<IpiEntry>>) {
     // of double-consuming the queue. Set AFTER the range check so `me` is valid.
     SHOOTDOWN_ACK_ACTIVE[me].store(true, Ordering::SeqCst);
     let _ack_active = AckActiveGuard(me);
-    // Order: consume the overflow flag BEFORE draining. Any sender that set it
-    // did so before ringing the IPI, so either we see the flag here, or the
-    // flag-setter's interrupt is still pending and the NEXT ack handles it.
-    let overflow =
-        IPI_QUEUE_OVERFLOW.fetch_and(!(1u64 << me), Ordering::AcqRel) & (1u64 << me) != 0;
-    let ovf_gen = if overflow {
-        IPI_OVERFLOW_GEN[me].load(Ordering::Acquire)
-    } else {
-        0
-    };
+    // Read the overflow generation BEFORE draining, and acknowledge exactly
+    // the value read, at the end. Any sender that bumped it did so before
+    // ringing the IPI, so either we see it here or its interrupt is still
+    // pending and the NEXT ack handles it — and a note that lands while this
+    // drain runs leaves the counter above this snapshot, so it stays pending
+    // for the next drain instead of being acknowledged by a flush that
+    // predates it.
+    let ovf_seen = IPI_OVERFLOW_GEN[me].load(Ordering::Acquire);
+    let overflow = ovf_seen > IPI_OVERFLOW_ACK[me].load(Ordering::Acquire);
+    let ovf_gen = if overflow { ovf_seen } else { 0 };
     // Non-allocating bounded drain of this CPU's queue (single consumer).
     let Some(q) = ipi_queue(me) else {
         return;
@@ -599,9 +622,10 @@ fn drain_and_ack_on(me: usize, mut out: Option<&mut Vec<IpiEntry>>) {
     // No second pure-wake check here: the peek above already returned for an
     // empty queue with no overflow bit, and neither condition can have become
     // true since. `chead` moves only by this CPU's own drain (single
-    // consumer), `ptail` only grows, and the overflow bit was consumed into
-    // `overflow` rather than cleared. A guard nothing can reach is a guard
-    // nothing can test.
+    // consumer), `ptail` only grows, and the overflow demand was captured
+    // into `ovf_gen` rather than cleared — it is cleared by the
+    // acknowledgement at the bottom, after the flush that honours it. A guard
+    // nothing can reach is a guard nothing can test.
     // Consume exactly the snapshot we serviced — never past it. Entries that
     // commit after `ptail` was read stay queued for the ack their own IPI
     // triggers (the old `discard_entrys()` jumped to the *current* tail, which
@@ -623,14 +647,17 @@ fn drain_and_ack_on(me: usize, mut out: Option<&mut Vec<IpiEntry>>) {
         // full-flush and publish the consumed index. Cost: one extra full
         // flush on the rare non-TLB-only drain; safety: a full flush always
         // over-satisfies whatever the consumed entries asked.
+        //
+        // It falls through to the one publish below rather than carrying its
+        // own copy. The copy it used to carry acknowledged the overflow
+        // generation as well — which this branch can never have, since
+        // `saw_tlb` starts out as `overflow` — and it published the two
+        // watermarks in the opposite order to the copy below. A mutation that
+        // deleted that acknowledgement altogether was caught by no test,
+        // which is how the branch was found: a guard nothing can reach is a
+        // guard nothing can test.
         crate::vm::flush_tlb(None);
-        if ovf_gen != 0 {
-            IPI_OVERFLOW_ACK[me].fetch_max(ovf_gen, Ordering::Release);
-        }
-        SHOOTDOWN_SEQ[me].fetch_max(ptail as u64, Ordering::Release);
-        return;
-    }
-    if precise && !overflow {
+    } else if precise && !overflow {
         for &vpn in &vpns[..n_vpns] {
             crate::vm::flush_tlb(Some(vpn << 12));
         }
@@ -710,8 +737,7 @@ fn tlb_shootdown_ack_nmi_on(me: usize) {
     // The single-consumer drain may only run when no other drain is in flight
     // on this CPU (the NMI may have interrupted a pump/IRQ ack mid-queue).
     if !SHOOTDOWN_ACK_ACTIVE[me].load(Ordering::SeqCst)
-        && (q.chead() != q.ptail()
-            || IPI_QUEUE_OVERFLOW.load(Ordering::Relaxed) & (1u64 << me) != 0)
+        && (q.chead() != q.ptail() || overflow_pending(me))
     {
         tlb_shootdown_ack_on(me);
         // Reinforcement publish: the drain's watermark is its consumed
@@ -1025,9 +1051,7 @@ pub(crate) fn remote_flush_tlb_on(me: usize, vaddr: Option<usize>, aspace: Optio
         }
         // Self-pump: if a peer asked US to flush, do it now (non-allocating) so
         // it isn't blocked on our ack while we block on its.
-        if ipi_queue(me).is_some_and(|q| q.chead() < q.ptail())
-            || IPI_QUEUE_OVERFLOW.load(Ordering::Relaxed) & (1u64 << me) != 0
-        {
+        if ipi_queue(me).is_some_and(|q| q.chead() < q.ptail()) || overflow_pending(me) {
             // `..._on(me)`, not `tlb_shootdown_ack()`: the queue that was just
             // tested is `me`'s, so the queue that gets drained has to be
             // `me`'s too. Re-reading `cpu_id()` here asked the question of one
@@ -1177,17 +1201,27 @@ const _: () = assert!(
 ///
 /// These tests share the module's global queues and masks, so they take
 /// [`test_lock`] and each queue test owns a distinct CPU id.
+/// Serialises every test in this file that writes the module's shared state.
+///
+/// The queue table, `CPU_ONLINE`, `IPI_READY`, the watermarks and the overflow
+/// counters are one set of statics for the whole binary, and CI runs the suite
+/// with `--test-threads=1` so it would never notice a test that raced another.
+/// The host harness does not: `cpu_id_bounds_tests` used to take no lock at
+/// all, and one of its tests sets **every** bit of `IPI_READY` — so a
+/// `remote_flush_tlb_on` spinning in a neighbouring test picked up 62 extra
+/// targets that no thread in the process would ever acknowledge, and sat there
+/// until the deadlock deadline. That is a 60-second hang in roughly one run in
+/// four, and the CI job is a single `set -e` block, so it takes everything
+/// behind it with it. One lock for the file, not one per module.
+#[cfg(test)]
+fn test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 #[cfg(test)]
 mod ipi_tests {
     use super::*;
-
-    /// The globals here (the queue table, `CPU_ONLINE`, `IPI_READY`, the
-    /// overflow mask) are shared, and CI runs the suite with `--test-threads=1`
-    /// so it would never notice. Serialize regardless.
-    fn test_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        LOCK.lock().unwrap_or_else(|e| e.into_inner())
-    }
 
     /// Distinct CPU ids per queue test, so one test's entries are never
     /// another's. Counts down from the top of the table.
@@ -1198,7 +1232,17 @@ mod ipi_tests {
     fn drain(cpu: usize) {
         let q = ipi_queue(cpu).unwrap();
         q.discard_entrys();
-        IPI_QUEUE_OVERFLOW.fetch_and(!(1u64 << cpu), Ordering::SeqCst);
+        clear_overflow(cpu);
+    }
+
+    /// Say that `cpu`'s outstanding full flush has been done. The demand is
+    /// `GEN > ACK`, so settling it is one store and there is nothing else to
+    /// clear — the point of [`the_demand_for_a_full_flush_lives_in_the_counters`].
+    fn clear_overflow(cpu: usize) {
+        IPI_OVERFLOW_ACK[cpu].store(
+            IPI_OVERFLOW_GEN[cpu].load(Ordering::SeqCst),
+            Ordering::SeqCst,
+        );
     }
 
     // ── the wire format ────────────────────────────────────────────────────
@@ -1296,13 +1340,13 @@ mod ipi_tests {
             IpiReason::from(*q.entry_at(chead)),
             IpiReason::TlbShutdown { vpn: 0x5678 }
         );
-        // Publishing does not raise the overflow bit on the way.
-        assert_eq!(IPI_QUEUE_OVERFLOW.load(Ordering::SeqCst) & (1u64 << cpu), 0);
+        // Publishing does not raise the overflow demand on the way.
+        assert!(!overflow_pending(cpu));
         drain(cpu);
     }
 
     #[test]
-    fn a_full_queue_sets_the_overflow_bit_rather_than_losing_the_flush() {
+    fn a_full_queue_notes_an_overflow_rather_than_losing_the_flush() {
         // The bug this pins: what does not fit must still be announced, or the
         // target never flushes and the initiator frees the frame anyway.
         let _g = test_lock();
@@ -1313,18 +1357,16 @@ mod ipi_tests {
         for i in 0..REASON_SIZE {
             assert!(publish_ipi_entry(cpu, reason), "publish {} failed", i);
         }
-        assert_eq!(
-            IPI_QUEUE_OVERFLOW.load(Ordering::SeqCst) & (1u64 << cpu),
-            0,
+        assert!(
+            !overflow_pending(cpu),
             "a queue filled exactly to capacity has not overflowed"
         );
         // One past capacity: the CPU still exists, so the send is not an
         // error — but the target must be told to full-flush.
         assert!(publish_ipi_entry(cpu, reason));
-        assert_ne!(
-            IPI_QUEUE_OVERFLOW.load(Ordering::SeqCst) & (1u64 << cpu),
-            0,
-            "a dropped payload must set the overflow bit"
+        assert!(
+            overflow_pending(cpu),
+            "a dropped payload must leave a demand for a full flush"
         );
         assert!(
             IPI_OVERFLOW_GEN[cpu].load(Ordering::SeqCst) > gen_before,
@@ -1337,23 +1379,31 @@ mod ipi_tests {
     #[test]
     fn publishing_to_a_cpu_that_does_not_exist_reports_it_and_marks_nothing() {
         let _g = test_lock();
-        let before = IPI_QUEUE_OVERFLOW.load(Ordering::SeqCst);
+        let before = gens();
         assert!(!publish_ipi_entry(MAX_CORE_NUM, 1));
         assert!(!publish_ipi_entry(usize::MAX, 1));
         assert_eq!(
-            IPI_QUEUE_OVERFLOW.load(Ordering::SeqCst),
+            gens(),
             before,
-            "an id with no queue must not set some other CPU's bit"
+            "an id with no queue must not note an overflow on some other CPU"
         );
     }
 
     #[test]
-    fn note_ipi_queue_overflow_ignores_an_id_with_no_bit() {
+    fn note_ipi_queue_overflow_ignores_an_id_with_no_row() {
         let _g = test_lock();
-        let before = IPI_QUEUE_OVERFLOW.load(Ordering::SeqCst);
+        let before = gens();
         note_ipi_queue_overflow(64);
         note_ipi_queue_overflow(usize::MAX);
-        assert_eq!(IPI_QUEUE_OVERFLOW.load(Ordering::SeqCst), before);
+        assert_eq!(gens(), before);
+    }
+
+    /// Every CPU's overflow generation, so a test can say "and no other CPU's
+    /// moved" in one comparison.
+    fn gens() -> alloc::vec::Vec<u64> {
+        (0..MAX_CORE_NUM)
+            .map(|c| IPI_OVERFLOW_GEN[c].load(Ordering::SeqCst))
+            .collect()
     }
 
     // ── the CPU masks ──────────────────────────────────────────────────────
@@ -1446,9 +1496,8 @@ mod ipi_tests {
             IpiReason::TlbShutdown { vpn: 0x1234 }.into()
         ));
         assert_eq!(q.phead(), before, "the nested publish took a slot");
-        assert_ne!(
-            IPI_QUEUE_OVERFLOW.load(Ordering::SeqCst) & (1u64 << cpu),
-            0,
+        assert!(
+            overflow_pending(cpu),
             "the payload was dropped without forcing a full flush"
         );
 
@@ -1617,11 +1666,7 @@ mod ipi_tests {
         };
         q.discard_entrys();
         SHOOTDOWN_SEQ[cpu].store(q.ptail() as u64, Ordering::SeqCst);
-        IPI_QUEUE_OVERFLOW.fetch_and(!(1u64 << cpu), Ordering::SeqCst);
-        IPI_OVERFLOW_ACK[cpu].store(
-            IPI_OVERFLOW_GEN[cpu].load(Ordering::SeqCst),
-            Ordering::SeqCst,
-        );
+        clear_overflow(cpu);
         SHOOTDOWN_WAIT_MASK[cpu].store(0, Ordering::SeqCst);
         SHOOTDOWN_ACK_ACTIVE[cpu].store(false, Ordering::SeqCst);
         ACTIVE_VMTOKEN[cpu].store(0, Ordering::SeqCst);
@@ -1804,10 +1849,164 @@ mod ipi_tests {
             IPI_OVERFLOW_ACK[1].load(Ordering::Acquire) >= gen,
             "and the drain has to say which overflow it covered"
         );
+        assert!(
+            !overflow_pending(1),
+            "the demand is settled by the drain that honoured it"
+        );
+    }
+
+    #[test]
+    fn a_cpu_owes_a_flush_exactly_when_its_generation_is_ahead_of_its_acknowledgement() {
+        // The demand and the generation it is owed for are one counter pair,
+        // and a note is one increment. They used to be two things written by
+        // one note in two steps — a bitmask raised first, the generation
+        // bumped second — and a drain landing between the steps saw the
+        // demand, read the OLD generation, full-flushed and acknowledged
+        // that; the sender then read the new generation and waited for an
+        // acknowledgement of it, which nothing was left to publish (the bit
+        // was consumed, and a re-kick that fits the queue notes no overflow).
+        // Nothing here can reach that state, because there is no second step
+        // to land between.
+        let _g = test_lock();
+        let cpu = scratch_cpu(11);
+        clear_overflow(cpu);
+        assert!(!overflow_pending(cpu), "a settled cpu owes nothing");
+
+        let before = IPI_OVERFLOW_GEN[cpu].load(Ordering::SeqCst);
+        note_ipi_queue_overflow(cpu);
         assert_eq!(
-            IPI_QUEUE_OVERFLOW.load(Ordering::Acquire) & (1u64 << 1),
-            0,
-            "the bit is consumed by the drain that honoured it"
+            IPI_OVERFLOW_GEN[cpu].load(Ordering::SeqCst),
+            before + 1,
+            "a note is one increment and nothing else"
+        );
+        assert!(overflow_pending(cpu));
+
+        // Acknowledging the generation the note published is the whole of it.
+        IPI_OVERFLOW_ACK[cpu].store(before + 1, Ordering::SeqCst);
+        assert!(
+            !overflow_pending(cpu),
+            "a second flag would still be raised here, and every path that \
+             asks would still be demanding a flush nobody owes"
+        );
+    }
+
+    #[test]
+    fn every_path_that_asks_whether_a_flush_is_owed_reads_the_same_counters() {
+        // The drain's peek, the NMI rescue's probe and the diagnostics have to
+        // answer this question from the same state. Seeded straight into the
+        // counters — no note, no queue entry — so a path that consulted
+        // anything else would find nothing to do and say so.
+        let _g = test_lock();
+        let _smp = Smp::with(2);
+        let cpu = 1;
+        let gen = IPI_OVERFLOW_GEN[cpu].load(Ordering::SeqCst);
+        IPI_OVERFLOW_ACK[cpu].store(gen, Ordering::SeqCst);
+        assert!(!shootdown_queue_state(cpu).4, "nothing is owed yet");
+
+        IPI_OVERFLOW_GEN[cpu].store(gen + 1, Ordering::SeqCst);
+        assert!(
+            shootdown_queue_state(cpu).4,
+            "the deadlock banner reports the demand"
+        );
+        flush_probe::reset();
+        tlb_shootdown_ack_on(cpu);
+        assert!(
+            flush_probe::saw_full_flush(),
+            "the drain's peek has to see it too: an empty queue with a demand \
+             outstanding is not a pure wake, and treating it as one leaves the \
+             page mapped"
+        );
+        assert!(!overflow_pending(cpu), "and the drain settles it");
+
+        // And the NMI rescue, which is the only thing that reaches a CPU with
+        // interrupts off — the case the demand most often survives into.
+        IPI_OVERFLOW_GEN[cpu].store(gen + 2, Ordering::SeqCst);
+        flush_probe::reset();
+        tlb_shootdown_ack_nmi_on(cpu);
+        assert!(flush_probe::saw_full_flush());
+        assert!(
+            !overflow_pending(cpu),
+            "the rescue exists to end a wait; leaving the demand up would not"
+        );
+    }
+
+    #[test]
+    fn a_drain_covers_the_generation_it_read_and_leaves_a_later_note_pending() {
+        // The acknowledgement names a generation rather than meaning
+        // "everything": a payload dropped after this drain read the counter is
+        // not covered by the flush this drain performed, so its sender is
+        // released by the next drain and not by this one.
+        let _g = test_lock();
+        let _smp = Smp::with(2);
+        note_ipi_queue_overflow(1);
+        let first = IPI_OVERFLOW_GEN[1].load(Ordering::SeqCst);
+        tlb_shootdown_ack_on(1);
+        assert_eq!(IPI_OVERFLOW_ACK[1].load(Ordering::SeqCst), first);
+        assert!(!overflow_pending(1));
+
+        note_ipi_queue_overflow(1);
+        assert!(overflow_pending(1), "the later note is a demand of its own");
+        assert_eq!(
+            IPI_OVERFLOW_ACK[1].load(Ordering::SeqCst),
+            first,
+            "and the earlier drain cannot have covered it"
+        );
+        flush_probe::reset();
+        tlb_shootdown_ack_on(1);
+        assert!(flush_probe::saw_full_flush());
+        assert_eq!(IPI_OVERFLOW_ACK[1].load(Ordering::SeqCst), first + 1);
+    }
+
+    #[test]
+    fn several_dropped_payloads_are_covered_by_one_flush_and_one_acknowledgement() {
+        // A full flush over-satisfies every request that preceded it, so one
+        // drain releases every sender waiting behind it — the acknowledgement
+        // has to jump to the newest generation, not step one at a time, or the
+        // oldest sender is released and the newest waits for a drain that has
+        // nothing left to do.
+        let _g = test_lock();
+        let _smp = Smp::with(2);
+        let before = IPI_OVERFLOW_GEN[1].load(Ordering::SeqCst);
+        for _ in 0..3 {
+            note_ipi_queue_overflow(1);
+        }
+        flush_probe::reset();
+        tlb_shootdown_ack_on(1);
+        assert!(flush_probe::saw_full_flush());
+        assert_eq!(
+            IPI_OVERFLOW_ACK[1].load(Ordering::SeqCst),
+            before + 3,
+            "one flush, every sender released"
+        );
+        assert!(!overflow_pending(1));
+    }
+
+    #[test]
+    fn a_drain_that_carried_only_non_tlb_work_and_a_demand_settles_both() {
+        // Two things arrive together that neither asks for a page: a payload
+        // that never made it into the queue, and an entry that is not a
+        // shootdown at all. The drain owes both watermarks — an exit that
+        // consumes the queue while leaving either one behind is the unsound
+        // state the whole consumed-index protocol exists to rule out, with the
+        // overflow counter standing in for the queue index the dropped
+        // payload never got.
+        let _g = test_lock();
+        let _smp = Smp::with(2);
+        note_ipi_queue_overflow(1);
+        let gen = IPI_OVERFLOW_GEN[1].load(Ordering::SeqCst);
+        assert!(publish_ipi_entry(
+            1,
+            IpiReason::MockBlock { block_info: 7 }.into()
+        ));
+        let goal = tail(1);
+        flush_probe::reset();
+        tlb_shootdown_ack_on(1);
+        assert!(flush_probe::saw_full_flush());
+        assert_eq!(seq(1), goal, "the queue index it consumed");
+        assert_eq!(
+            IPI_OVERFLOW_ACK[1].load(Ordering::SeqCst),
+            gen,
+            "and the generation it covered"
         );
     }
 
@@ -2065,9 +2264,9 @@ mod ipi_tests {
         let _g = test_lock();
         let _smp = Smp::with(2);
         while publish_ipi_entry(1, IpiReason::TlbShutdown { vpn: 1 }.into())
-            && IPI_QUEUE_OVERFLOW.load(Ordering::Acquire) & (1u64 << 1) == 0
+            && !overflow_pending(1)
         {}
-        IPI_QUEUE_OVERFLOW.fetch_and(!(1u64 << 1), Ordering::SeqCst);
+        clear_overflow(1);
         SHOOTDOWN_SEQ[1].store(tail(1), Ordering::SeqCst);
         let gen_before = IPI_OVERFLOW_GEN[1].load(Ordering::Acquire);
 
@@ -2099,8 +2298,34 @@ mod ipi_tests {
         // this is a deadlock with no timeout on either side.
         let _g = test_lock();
         let _smp = Smp::with(2);
-        let a = std::thread::spawn(|| remote_flush_tlb_on(0, Some(0x1000), None));
-        let b = std::thread::spawn(|| remote_flush_tlb_on(1, Some(0x2000), None));
+        // A CPU does not stop taking IPIs when its own shootdown returns, and
+        // here it has to be said out loud: a "CPU" in this test lives only as
+        // long as its thread. The wait loop breaks the instant its targets
+        // have acked, *before* its last self-pump, so whichever thread
+        // finishes first leaves the other's request sitting in a queue no
+        // thread will ever drain again — and the other side then spins out the
+        // deadline for an acknowledgement that has no author. That is this
+        // test's own model failing, not the protocol: on hardware cpu 0 keeps
+        // running and takes the interrupt. So each thread keeps servicing its
+        // queue until both shootdowns are done. It cost a 60-second hang in
+        // about one host run in five.
+        let done = alloc::sync::Arc::new([
+            AtomicBool::new(false),
+            AtomicBool::new(false),
+        ]);
+        let spawn = |me: usize, page: usize| {
+            let done = done.clone();
+            std::thread::spawn(move || {
+                remote_flush_tlb_on(me, Some(page), None);
+                done[me].store(true, Ordering::SeqCst);
+                while !done[1 - me].load(Ordering::SeqCst) {
+                    tlb_shootdown_ack_on(me);
+                    std::thread::yield_now();
+                }
+            })
+        };
+        let a = spawn(0, 0x1000);
+        let b = spawn(1, 0x2000);
         // A real deadlock never finishes, so the deadline only decides how
         // long we wait before calling it one: generous costs nothing, and a
         // tight one turns a slow runner into a failure. And this thread
@@ -2276,7 +2501,7 @@ mod ipi_tests {
 
     #[test]
     fn the_cpu_bitmasks_cover_every_cpu_the_tables_hold() {
-        // `IPI_READY`, `CPU_ONLINE`, `IPI_QUEUE_OVERFLOW` and every wait mask
+        // `IPI_READY`, `CPU_ONLINE` and every wait mask
         // are one `u64`, while the per-CPU tables are `MAX_CORE_NUM` long. Let
         // those two drift apart and the CPUs above 63 get queues, watermarks
         // and goals that no mask can ever name: they are never targeted, never
@@ -2371,7 +2596,7 @@ mod escalation_tests {
 
 /// Which cpu ids this module will act on.
 ///
-/// Every bit set in `CPU_ONLINE`, `IPI_READY` or `IPI_QUEUE_OVERFLOW` becomes
+/// Every bit set in `CPU_ONLINE` or `IPI_READY` becomes
 /// an index into a `[_; MAX_CORE_NUM]` table further down — a shootdown
 /// target's `SHOOTDOWN_GOAL[me][cpu]`, its ack watermark, its overflow
 /// counter — and none of those indexings is bounds-checked at the point of
@@ -2389,7 +2614,6 @@ mod cpu_id_bounds_tests {
     struct Masks {
         online: u64,
         ready: u64,
-        overflow: u64,
     }
 
     impl Masks {
@@ -2397,11 +2621,9 @@ mod cpu_id_bounds_tests {
             let me = Masks {
                 online: CPU_ONLINE.load(Ordering::SeqCst),
                 ready: IPI_READY.load(Ordering::SeqCst),
-                overflow: IPI_QUEUE_OVERFLOW.load(Ordering::SeqCst),
             };
             CPU_ONLINE.store(0, Ordering::SeqCst);
             IPI_READY.store(0, Ordering::SeqCst);
-            IPI_QUEUE_OVERFLOW.store(0, Ordering::SeqCst);
             me
         }
     }
@@ -2410,12 +2632,12 @@ mod cpu_id_bounds_tests {
         fn drop(&mut self) {
             CPU_ONLINE.store(self.online, Ordering::SeqCst);
             IPI_READY.store(self.ready, Ordering::SeqCst);
-            IPI_QUEUE_OVERFLOW.store(self.overflow, Ordering::SeqCst);
         }
     }
 
     #[test]
     fn a_cpu_with_no_slot_is_never_marked_online() {
+        let _g = test_lock();
         // `cpu_online_mask` is what `can_receive_ipi` gates on and what the
         // bring-up counts; a bit for a cpu with no per-CPU row is a target
         // nothing can look up.
@@ -2428,6 +2650,7 @@ mod cpu_id_bounds_tests {
 
     #[test]
     fn a_cpu_with_no_slot_is_never_marked_ready_for_shootdowns() {
+        let _g = test_lock();
         // This is the mask `remote_flush_tlb_on` turns straight into
         // `targets`, and every target is indexed into `SHOOTDOWN_GOAL[me][..]`
         // with no bound of its own.
@@ -2440,18 +2663,34 @@ mod cpu_id_bounds_tests {
 
     #[test]
     fn an_overflow_noted_for_a_cpu_with_no_slot_indexes_nothing() {
+        let _g = test_lock();
         // The sharpest of the three: the guard admitted the id and the very
         // next line indexed `IPI_OVERFLOW_GEN[cpuid]`, from the IPI publish
         // path — interrupt context, locks held.
         let _m = Masks::empty();
+        let before: alloc::vec::Vec<u64> = (0..MAX_CORE_NUM)
+            .map(|c| IPI_OVERFLOW_GEN[c].load(Ordering::SeqCst))
+            .collect();
         note_ipi_queue_overflow(MAX_CORE_NUM);
         note_ipi_queue_overflow(NO_CPU);
         note_ipi_queue_overflow(usize::MAX);
-        assert_eq!(IPI_QUEUE_OVERFLOW.load(Ordering::SeqCst), 0);
+        for cpu in 0..MAX_CORE_NUM {
+            assert_eq!(
+                IPI_OVERFLOW_GEN[cpu].load(Ordering::SeqCst),
+                before[cpu],
+                "cpu {} has no business being touched by those ids",
+                cpu
+            );
+        }
+        // And the demand is still read through the same guard.
+        assert!(!overflow_pending(MAX_CORE_NUM));
+        assert!(!overflow_pending(NO_CPU));
+        assert!(!overflow_pending(usize::MAX));
     }
 
     #[test]
     fn every_cpu_the_guards_do_admit_has_a_row_in_every_table() {
+        let _g = test_lock();
         // The invariant the three guards exist to keep. Stated over the whole
         // admitted range rather than over one id, so it still means something
         // on a build that lowers MAX_CORE_NUM.
@@ -2477,6 +2716,7 @@ mod cpu_id_bounds_tests {
 
     #[test]
     fn a_cpu_with_no_slot_is_never_worth_kicking_even_if_a_mask_names_it() {
+        let _g = test_lock();
         // Belt and braces: `wake_kick_wanted` bounds the id itself, so an
         // online mask corrupted into naming a cpu past the tables stops here.
         let _m = Masks::empty();
