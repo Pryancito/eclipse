@@ -11,5 +11,5 @@ pub use crate::{Device, DeviceError, DeviceResult};
 
 /// Re-export types from [`input`](crate::input).
 pub mod input {
-    pub use crate::input::{Mouse, MouseFlags, MouseState};
+    pub use crate::input::{Mouse, MouseFlags, MouseState, Ps2Mode};
 }
