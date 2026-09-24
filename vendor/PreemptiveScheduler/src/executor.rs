@@ -1301,8 +1301,11 @@ impl Executor {
                     note_cpu_quiescent(crate::arch::cpu_id() as usize);
                     // Halt protocol vs lost wakes. Publish "sleeping" FIRST,
                     // then re-check the queue with IRQs off, and only then
-                    // halt (`wait_for_interrupt` is an atomic sti;hlt — an IPI
-                    // arriving after the sti breaks the hlt). A remote waker
+                    // halt. `wait_for_interrupt` closes the last window
+                    // itself on all three architectures: x86 by the one-
+                    // instruction shadow of `sti; hlt`, riscv and aarch64 by
+                    // stalling with interrupts still masked, which `wfi` is
+                    // specified to allow. A remote waker
                     // does notify -> read sleeping-mask (both SeqCst): either
                     // it sees us sleeping and kicks us with the reschedule
                     // IPI, or its notify is ordered before our recheck and we

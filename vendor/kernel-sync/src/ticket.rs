@@ -256,6 +256,19 @@ impl<T: ?Sized> TicketMutex<T> {
         (lc >> 32) as u32 == crate::interrupt::current_cpu_id() as u32
     }
 
+    /// The next ticket the lock will hand out, for the tests that speak the
+    /// queue protocol.
+    #[cfg(test)]
+    pub(crate) fn next_ticket_for_test(&self) -> usize {
+        self.next_ticket.load(Ordering::SeqCst)
+    }
+
+    /// The ticket the lock is serving right now.
+    #[cfg(test)]
+    pub(crate) fn next_serving_for_test(&self) -> usize {
+        self.next_serving.load(Ordering::SeqCst)
+    }
+
     #[inline(always)]
     pub fn is_locked(&self) -> bool {
         let ticket = self.next_ticket.load(Ordering::Relaxed);
