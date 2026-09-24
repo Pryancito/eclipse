@@ -1,24 +1,61 @@
 #![no_std]
+// The kernel lock implementations below are `cfg(target_os = "none")`, so a
+// host build sees only the shims. A `cargo test` build compiles them anyway
+// (see `KERNEL_LOCKS_ON_HOST`), which leaves whatever the tests do not reach
+// looking unused; that is the point of building them, not a defect.
+#![cfg_attr(test, allow(dead_code))]
+
+#[cfg(test)]
+extern crate std;
 
 /// Single source of truth for the size of every per-CPU array indexed by the
 /// dense logical cpu id (this crate's `CPUS`, the scheduler's `GLOBAL_RUNTIME`,
 /// kernel-hal's percpu storage).
 pub const MAX_CORE_NUM: usize = 64;
 
+pub mod cpuid;
+
+// ── the kernel locks, on the host, under `cargo test` ────────────────────────
+//
+// `KERNEL_LOCKS_ON_HOST`: everything below this line used to be behind
+// `cfg(target_os = "none")` alone — 2289 lines of the machine's most
+// load-bearing code that no `cargo test` could even compile, let alone run.
+// A `cargo test` build gets them too, against the host interrupt backend at
+// the end of `interrupt.rs` (a thread-local IRQ flag and a thread-local cpu
+// id, one simulated CPU per test thread). That is enough to exercise what the
+// bugs live in: whether a guard's `push_off` and `pop_off` come in pairs.
+#[cfg(all(test, not(target_os = "none")))]
+mod deadlock;
+#[cfg(all(test, not(target_os = "none")))]
+mod interrupt;
+#[cfg(all(test, not(target_os = "none")))]
+mod mcslock;
+// The external `spin` crate re-exports a module of the same name from the
+// host branch below; ours takes precedence inside this crate, which is what
+// the test build wants.
+#[allow(hidden_glob_reexports)]
+#[cfg(all(test, not(target_os = "none")))]
+mod rwlock;
+#[cfg(all(test, not(target_os = "none")))]
+mod spin;
+#[cfg(all(test, not(target_os = "none")))]
+mod tests;
+#[cfg(all(test, not(target_os = "none")))]
+mod ticket;
+
 cfg_if::cfg_if! {
     if #[cfg(all(target_os = "none", feature = "ticket"))] {
         extern crate alloc;
         mod interrupt;
-        pub use interrupt::{bogus_cpu_id_events, current_cpu_id, current_cpu_id_via_apic, lock_depth};
-        #[cfg(any(
-            target_arch = "x86",
-            target_arch = "x86_64",
-            target_arch = "riscv32",
-            target_arch = "riscv64"
-        ))]
-        pub use interrupt::set_logical_cpu_id;
+        // One set of names on every architecture: registering a CPU, resolving
+        // it, and the AP-boot window used to be x86-only exports because the
+        // other two kept their own (drifted) maps.
+        pub use interrupt::{
+            bogus_cpu_id_events, current_cpu_id, current_cpu_id_via_apic, hardware_id_of,
+            lock_depth, set_logical_cpu_id, with_ap_boot_logical,
+        };
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-        pub use interrupt::{hardware_apic_id, set_phys_virt_offset, with_ap_boot_logical};
+        pub use interrupt::{hardware_apic_id, set_phys_virt_offset};
         pub mod mcslock;
         pub mod rwlock;
         pub use {rwlock::*, mcslock::*};
@@ -32,16 +69,15 @@ cfg_if::cfg_if! {
     } else if #[cfg(target_os = "none")] {
         extern crate alloc;
         mod interrupt;
-        pub use interrupt::{bogus_cpu_id_events, current_cpu_id, current_cpu_id_via_apic, lock_depth};
-        #[cfg(any(
-            target_arch = "x86",
-            target_arch = "x86_64",
-            target_arch = "riscv32",
-            target_arch = "riscv64"
-        ))]
-        pub use interrupt::set_logical_cpu_id;
+        // One set of names on every architecture: registering a CPU, resolving
+        // it, and the AP-boot window used to be x86-only exports because the
+        // other two kept their own (drifted) maps.
+        pub use interrupt::{
+            bogus_cpu_id_events, current_cpu_id, current_cpu_id_via_apic, hardware_id_of,
+            lock_depth, set_logical_cpu_id, with_ap_boot_logical,
+        };
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-        pub use interrupt::{hardware_apic_id, set_phys_virt_offset, with_ap_boot_logical};
+        pub use interrupt::{hardware_apic_id, set_phys_virt_offset};
         pub mod mcslock;
         pub mod rwlock;
         pub use {rwlock::*, mcslock::*};
@@ -53,7 +89,9 @@ cfg_if::cfg_if! {
         pub mod spin;
         pub use spin::{SpinMutex as Mutex, SpinMutexGuard as MutexGuard};
     } else {
-        pub use spin::*;
+        // `::spin` — the external crate, not this crate's `spin` module, which
+        // a `cargo test` build declares at crate root (see KERNEL_LOCKS_ON_HOST).
+        pub use ::spin::*;
 
         /// Hosted (libos) no-op twin of the bare-metal stuck-lock reporter.
         /// The preemptive executor's diagnostics call it unconditionally, and

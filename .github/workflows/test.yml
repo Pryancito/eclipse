@@ -48,6 +48,13 @@ jobs:
           # process-wide masks (EXECUTOR_READY, SLEEPING_CPUS, NEED_RESCHED).
           cargo test --manifest-path vendor/PreemptiveScheduler/Cargo.toml --lib -- --test-threads=1
           cargo test --manifest-path vendor/preemptive-scheduler/Cargo.toml --lib
+          # `vendor/kernel-sync` is the `lock` crate: every mutex, rwlock and
+          # per-CPU interrupt-disable counter the kernel has. It had no line
+          # here and no tests, and it could not have had any -- the whole
+          # implementation was behind `cfg(target_os = "none")`, so a host
+          # build compiled nothing but no-op shims. A `cargo test` build now
+          # compiles the real thing against a host interrupt backend.
+          cargo test -p lock --lib -- --test-threads=1
           # `default-members = ["xtask"]` in the workspace manifest means the
           # bare `cargo test` above builds ONLY xtask, so these two crates'
           # unit tests -- the DRM/KMS present path, the NVIDIA decode helpers,
