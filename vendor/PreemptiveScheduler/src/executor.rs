@@ -197,18 +197,26 @@ fn stack_reg_remove(alloc_base: usize) {
 /// on every block it dispenses: a hit means the buddy handed out memory that is
 /// still a live executor stack — the double-alloc these crashes are chasing.
 ///
-/// Excludes an exact `alloc_base` match with `len >= ALLOC_SIZE`, which is the
-/// legitimate case of `Executor::new` itself re-allocating a slot the registry
-/// has not recorded yet (insert happens after the allocation returns).
+/// There is no exclusion for `Executor::new` allocating its own stack, and
+/// none is needed: that allocation is what *calls* this, and the two registry
+/// inserts happen on the line after it returns. Both this comment and the
+/// caller's used to promise one ("excludes an exact `alloc_base` match with
+/// `len >= ALLOC_SIZE`"), which the body has never implemented — a stated
+/// guarantee in front of a `panic!` in the global allocator, describing an
+/// exemption nothing has ever needed.
+///
+/// An end that overflows the address space saturates rather than wrapping:
+/// nonsense input must not come back as "no overlap" from a check whose whole
+/// job is to refuse.
 pub fn alloc_overlaps_live_stack(ptr: usize, len: usize) -> Option<usize> {
     use core::sync::atomic::Ordering::Acquire;
-    let a_end = ptr.wrapping_add(len);
+    let a_end = ptr.saturating_add(len);
     for slot in STACK_REG_BASE.iter() {
         let base = slot.load(Acquire);
         if base == 0 {
             continue;
         }
-        let b_end = base + ALLOC_SIZE;
+        let b_end = base.saturating_add(ALLOC_SIZE);
         if ptr < b_end && base < a_end {
             return Some(base);
         }
@@ -549,6 +557,30 @@ fn unregister_stack(alloc_base: usize) {
     }
 }
 
+/// Publish a stack in BOTH registries, as one operation.
+///
+/// They hold the same set and exist for the same check, but they are read by
+/// different callers: `STACK_REG` (via [`overlapping_live_stack`]) by the
+/// frame allocator, `STACK_REG_BASE` (via [`alloc_overlaps_live_stack`]) by
+/// the `GlobalAlloc` hook — and coroutine stacks are allocated through that
+/// second one. The two inserts used to sit at opposite ends of
+/// `Executor::new`, two guard installs (page-table splits with their TLB
+/// shootdowns) and a 2.6 MiB poison loop apart, so for the length of that
+/// window a stack was refused to the frame allocator and waved past the hook
+/// that actually hands stacks out. One function, one call site, no window.
+fn publish_live_stack(alloc_base: usize) {
+    register_stack(alloc_base);
+    stack_reg_insert(alloc_base);
+}
+
+/// Retract a stack from both registries. The twin of [`publish_live_stack`];
+/// a stack left in either one is a permanent false positive, and a false
+/// positive here is a `panic!` inside the global allocator.
+fn retract_live_stack(alloc_base: usize) {
+    stack_reg_remove(alloc_base);
+    unregister_stack(alloc_base);
+}
+
 /// [diag] Does `[start, start + len)` overlap a live coroutine-stack
 /// allocation (guards included)? Returns the offending stack's alloc base.
 ///
@@ -556,11 +588,14 @@ fn unregister_stack(alloc_base: usize) {
 /// an overlap means the block is already spoken for, and reporting it *at
 /// hand-out* names the aliasing before any corruption happens — unlike a
 /// canary or a watchpoint, which can only report damage after the fact.
+/// Saturates on an overflowing end for the same reason as its twin: `?` on a
+/// `checked_add` returned `None`, which this function spells "no overlap" —
+/// the one answer a range it cannot even measure must not give.
 pub fn overlapping_live_stack(start: usize, len: usize) -> Option<usize> {
-    let end = start.checked_add(len)?;
+    let end = start.saturating_add(len);
     for slot in STACK_REG.iter() {
         let base = slot.load(core::sync::atomic::Ordering::Acquire);
-        if base != 0 && start < base + ALLOC_SIZE && base < end {
+        if base != 0 && start < base.saturating_add(ALLOC_SIZE) && base < end {
             return Some(base);
         }
     }
@@ -885,7 +920,22 @@ impl Executor {
             }
         };
         debug_assert_eq!(alloc_base % PAGE_SIZE, 0);
-        register_stack(alloc_base);
+        // Both registries, together, right here.
+        //
+        // They hold the same set and exist for the same check, but they are
+        // read by different callers: `STACK_REG` (via `overlapping_live_stack`)
+        // by the frame allocator, `STACK_REG_BASE` (via
+        // `alloc_overlaps_live_stack`) by the `GlobalAlloc` hook — and
+        // coroutine stacks are allocated through that second one. The insert
+        // for it used to sit at the far end of this function, after two guard
+        // installs (page-table splits with their TLB shootdowns) and a 2.6 MiB
+        // poison loop, carrying a comment that said it recorded the stack
+        // "from the first instant it can be aliased". The first instant is the
+        // one above, where `Global.allocate` returned; everything between was
+        // a window in which a block aliasing this stack could be handed out on
+        // another CPU and the hook would wave it through — which is exactly
+        // the `[double-alloc]` these registries were added to catch.
+        publish_live_stack(alloc_base);
         let stack_base = alloc_base + GUARD_SIZE;
         let top_guard_base = stack_base + STACK_SIZE;
         // Prefer unmapped guards (hard). Soft canary only if hooks are missing
@@ -943,9 +993,6 @@ impl Executor {
             }
         }
         note_first_executor_created(hard_guard_bottom, hard_guard_top);
-        // Record this stack as live BEFORE returning it, so the allocator's
-        // double-alloc check sees it from the first instant it can be aliased.
-        stack_reg_insert(alloc_base);
         let mut pin_executor = Pin::new(Box::new(Executor {
             id: executor_alloc_id(),
             task_collection,
@@ -1485,8 +1532,7 @@ impl Drop for Executor {
             static LEAKED: AtomicUsize = AtomicUsize::new(0);
             let n = LEAKED.fetch_add(1, Ordering::Relaxed) + 1;
             // Drop the tracking entries (bounded registries) but NOT the memory.
-            stack_reg_remove(alloc_base);
-            unregister_stack(alloc_base);
+            retract_live_stack(alloc_base);
             spine_unregister_by_stack(self.stack_base);
             error!(
                 "[null-exec root guard] executor id={} dropped while cpu={} still stands on its \
@@ -1504,8 +1550,7 @@ impl Drop for Executor {
         // Stop tracking this stack BEFORE it goes back to the heap/pool, so a
         // later legitimate reuse of the freed range is not flagged as a
         // double-alloc.
-        stack_reg_remove(alloc_base);
-        unregister_stack(alloc_base);
+        retract_live_stack(alloc_base);
         // Abandoned executors never return from `run`, so their spine slot is
         // still registered here; clear it before the pool re-poison writes
         // through it (a watched write would misreport the poison loop as the
@@ -1877,5 +1922,217 @@ mod grace_period_tests {
             seen += 1;
         }
         assert_eq!(seen, STACK_POOL_CAP + 4);
+    }
+}
+
+/// The two live-stack registries and the two overlap checks over them.
+///
+/// Neither had a test, and a false positive in either one is not a wrong log
+/// line: both callers in `zCore/src/memory.rs` end in `panic!`, inside the
+/// global allocator, with the heap lock just released. A false negative is the
+/// `[double-alloc]` they were written to catch going past unnoticed.
+#[cfg(test)]
+mod stack_registry_tests {
+    use super::*;
+    use core::sync::atomic::Ordering;
+
+    /// Both registries are module globals; every test here empties them.
+    fn test_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    struct Clean(std::sync::MutexGuard<'static, ()>);
+
+    impl Drop for Clean {
+        fn drop(&mut self) {
+            for slot in STACK_REG.iter() {
+                slot.store(0, Ordering::SeqCst);
+            }
+            for slot in STACK_REG_BASE.iter() {
+                slot.store(0, Ordering::SeqCst);
+            }
+            STACK_REG_OVERFLOW.store(0, Ordering::SeqCst);
+            STACK_REG_BASE_OVERFLOW.store(0, Ordering::SeqCst);
+        }
+    }
+
+    fn clean() -> Clean {
+        let g = test_lock();
+        for slot in STACK_REG.iter() {
+            slot.store(0, Ordering::SeqCst);
+        }
+        for slot in STACK_REG_BASE.iter() {
+            slot.store(0, Ordering::SeqCst);
+        }
+        STACK_REG_OVERFLOW.store(0, Ordering::SeqCst);
+        STACK_REG_BASE_OVERFLOW.store(0, Ordering::SeqCst);
+        Clean(g)
+    }
+
+    /// A plausible stack allocation base: page-aligned and far from both ends
+    /// of the address space, so a test that means to overflow has to say so.
+    const BASE: usize = 0x1000_0000;
+
+    use super::{publish_live_stack as publish, retract_live_stack as retract};
+
+    #[test]
+    fn both_registries_answer_for_a_stack_the_moment_it_is_published() {
+        // The frame allocator reads one of them and the `GlobalAlloc` hook the
+        // other. A stack visible to one and not the other is a stack half the
+        // machine can be handed.
+        let _c = clean();
+        publish(BASE);
+        let inside = BASE + ALLOC_SIZE / 2;
+        assert_eq!(overlapping_live_stack(inside, 64), Some(BASE));
+        assert_eq!(alloc_overlaps_live_stack(inside, 64), Some(BASE));
+    }
+
+    #[test]
+    fn a_stack_only_half_published_is_a_hole_in_one_of_the_two_checks() {
+        // This is the shape of the bug: `register_stack` ran at the top of
+        // `Executor::new` and `stack_reg_insert` at the bottom, two guard
+        // installs and a 2.6 MiB poison loop later. In between, the frame
+        // allocator would refuse a block over this stack and the `GlobalAlloc`
+        // hook — the one stacks are actually allocated through — would not.
+        let _c = clean();
+        register_stack(BASE);
+        let inside = BASE + ALLOC_SIZE / 2;
+        assert_eq!(overlapping_live_stack(inside, 64), Some(BASE));
+        assert_eq!(
+            alloc_overlaps_live_stack(inside, 64),
+            None,
+            "this is the window; if it has closed, the test above is the one that matters"
+        );
+    }
+
+    #[test]
+    fn a_retracted_stack_stops_being_reported_by_both() {
+        // A stale entry is a permanent false positive, and a false positive
+        // here panics the kernel out of the global allocator.
+        let _c = clean();
+        publish(BASE);
+        retract(BASE);
+        let inside = BASE + ALLOC_SIZE / 2;
+        assert_eq!(overlapping_live_stack(inside, 64), None);
+        assert_eq!(alloc_overlaps_live_stack(inside, 64), None);
+    }
+
+    #[test]
+    fn a_block_ending_exactly_where_a_stack_begins_does_not_overlap() {
+        // Half-open ranges: the byte at `base` belongs to the stack, the byte
+        // before it does not. Getting this off by one costs a live kernel.
+        let _c = clean();
+        publish(BASE);
+        assert_eq!(overlapping_live_stack(BASE - 4096, 4096), None);
+        assert_eq!(alloc_overlaps_live_stack(BASE - 4096, 4096), None);
+        assert_eq!(overlapping_live_stack(BASE - 4096, 4097), Some(BASE));
+        assert_eq!(alloc_overlaps_live_stack(BASE - 4096, 4097), Some(BASE));
+    }
+
+    #[test]
+    fn a_block_starting_exactly_where_a_stack_ends_does_not_overlap() {
+        let _c = clean();
+        publish(BASE);
+        assert_eq!(overlapping_live_stack(BASE + ALLOC_SIZE, 4096), None);
+        assert_eq!(alloc_overlaps_live_stack(BASE + ALLOC_SIZE, 4096), None);
+        assert_eq!(overlapping_live_stack(BASE + ALLOC_SIZE - 1, 1), Some(BASE));
+        assert_eq!(
+            alloc_overlaps_live_stack(BASE + ALLOC_SIZE - 1, 1),
+            Some(BASE)
+        );
+    }
+
+    #[test]
+    fn a_stack_is_reported_by_the_guard_bands_too_not_only_its_usable_part() {
+        // The registries record `alloc_base`, which is the bottom guard. A
+        // block landing in a guard band is still a block landing on this
+        // allocation, and the guard is what an overflow is supposed to hit.
+        let _c = clean();
+        publish(BASE);
+        assert_eq!(overlapping_live_stack(BASE, 8), Some(BASE));
+        assert_eq!(alloc_overlaps_live_stack(BASE, 8), Some(BASE));
+        let top_guard = BASE + GUARD_SIZE + STACK_SIZE;
+        assert_eq!(overlapping_live_stack(top_guard, 8), Some(BASE));
+        assert_eq!(alloc_overlaps_live_stack(top_guard, 8), Some(BASE));
+    }
+
+    #[test]
+    fn a_range_whose_end_overflows_the_address_space_is_never_called_clean() {
+        // `overlapping_live_stack` used to `?` on a `checked_add`, which this
+        // function spells "no overlap" — the one answer a range it cannot even
+        // measure must not give, when the caller reads it as permission to
+        // hand the block out.
+        let _c = clean();
+        publish(BASE);
+        assert_eq!(overlapping_live_stack(BASE, usize::MAX), Some(BASE));
+        assert_eq!(alloc_overlaps_live_stack(BASE, usize::MAX), Some(BASE));
+    }
+
+    #[test]
+    fn a_fresh_stack_does_not_flag_itself() {
+        // Both doc comments used to promise an exemption for exactly this, and
+        // neither function has ever had one. It works because the check runs
+        // as part of the allocation and the inserts come after it.
+        let _c = clean();
+        assert_eq!(alloc_overlaps_live_stack(BASE, ALLOC_SIZE), None);
+        publish(BASE);
+        // And once published it does flag: a second hand-out of the same block
+        // is the double-alloc, whatever its size.
+        assert_eq!(alloc_overlaps_live_stack(BASE, ALLOC_SIZE), Some(BASE));
+    }
+
+    #[test]
+    fn two_stacks_side_by_side_are_told_apart() {
+        let _c = clean();
+        let second = BASE + ALLOC_SIZE;
+        publish(BASE);
+        publish(second);
+        assert_eq!(alloc_overlaps_live_stack(second + 8, 8), Some(second));
+        retract(second);
+        assert_eq!(alloc_overlaps_live_stack(second + 8, 8), None);
+        assert_eq!(
+            alloc_overlaps_live_stack(BASE + 8, 8),
+            Some(BASE),
+            "retracting one stack unregistered its neighbour"
+        );
+    }
+
+    #[test]
+    fn a_stack_that_did_not_fit_is_counted_rather_than_dropped_in_silence() {
+        // A full table makes both checks return false negatives. The counters
+        // are what stops a clean result being mistaken for a clean machine.
+        let _c = clean();
+        for i in 0..MAX_TRACKED_STACKS {
+            publish(BASE + (i + 1) * ALLOC_SIZE);
+        }
+        assert_eq!(untracked_live_stacks(), 0);
+        assert_eq!(untracked_alloc_stacks(), 0);
+        let overflowing = BASE + (MAX_TRACKED_STACKS + 1) * ALLOC_SIZE;
+        publish(overflowing);
+        assert_eq!(untracked_live_stacks(), 1);
+        assert_eq!(untracked_alloc_stacks(), 1);
+        assert_eq!(
+            alloc_overlaps_live_stack(overflowing + 8, 8),
+            None,
+            "the false negative is real — which is what the counter is for"
+        );
+    }
+
+    #[test]
+    fn the_overflow_counters_never_go_back_down() {
+        // A dropped insert may later be balanced by that stack being freed,
+        // and nothing here can tell. Over-reporting incompleteness is the safe
+        // direction for a counter whose only job is to say when a clean result
+        // means nothing.
+        let _c = clean();
+        for i in 0..MAX_TRACKED_STACKS {
+            publish(BASE + (i + 1) * ALLOC_SIZE);
+        }
+        let overflowing = BASE + (MAX_TRACKED_STACKS + 1) * ALLOC_SIZE;
+        publish(overflowing);
+        retract(overflowing);
+        assert_eq!(untracked_live_stacks(), 1);
+        assert_eq!(untracked_alloc_stacks(), 1);
     }
 }
