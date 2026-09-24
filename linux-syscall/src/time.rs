@@ -652,7 +652,8 @@ impl Syscall<'_> {
     /// signal comes from `sevp` (`struct sigevent`); a null `sevp` defaults to
     /// SIGALRM, `SIGEV_NONE` delivers no signal. The new timer id is written to
     /// `timerid` (an `int`, the kernel's `timer_t`).
-    pub fn sys_timer_create(&self, _clockid: usize, sevp: usize, timerid: usize) -> SysResult {
+    pub fn sys_timer_create(&self, clockid: usize, sevp: usize, timerid: usize) -> SysResult {
+        let clock = posix_timer_clock_base(clockid)?;
         let signo = if sevp == 0 {
             Signal::SIGALRM as usize
         } else {
@@ -674,6 +675,7 @@ impl Syscall<'_> {
             PosixTimer {
                 owner: self.zircon_process().id(),
                 signo,
+                clock,
                 interval: Duration::ZERO,
                 next: Duration::ZERO,
                 generation: 0,
@@ -694,7 +696,6 @@ impl Syscall<'_> {
         new_value: UserInPtr<ITimerSpec>,
         mut old_value: UserOutPtr<ITimerSpec>,
     ) -> SysResult {
-        const TIMER_ABSTIME: usize = 1;
         let owner = self.zircon_process().id();
         let spec = new_value.read()?;
         // Linux validates both timespecs of the itimerspec before arming.
@@ -703,7 +704,10 @@ impl Syscall<'_> {
         }
         let interval = timespec_to_duration(spec.interval);
         let init = timespec_to_duration(spec.value);
+        // Both clocks read before the lock, so the deadline arithmetic below
+        // happens with the map held and no HAL call under it.
         let now = kernel_hal::timer::timer_now();
+        let now_wall = kernel_hal::timer::wall_clock_now();
 
         let (old, arm) = {
             let mut timers = POSIX_TIMERS.lock();
@@ -723,11 +727,11 @@ impl Syscall<'_> {
                 t.next = Duration::ZERO;
                 None
             } else {
-                let deadline = if flags & TIMER_ABSTIME != 0 {
-                    init
-                } else {
-                    now + init
-                };
+                // `init` is a point on the timer's OWN clock when
+                // TIMER_ABSTIME is set, and the kernel timer only takes
+                // monotonic deadlines.
+                let deadline =
+                    timer_arm_deadline(t.clock, flags & TIMER_ABSTIME != 0, init, now, now_wall);
                 t.next = deadline;
                 Some((deadline, t.generation))
             };
@@ -799,6 +803,12 @@ struct PosixTimer {
     owner: KoID,
     /// Signal to deliver on expiry (0 = none, e.g. SIGEV_NONE).
     signo: usize,
+    /// The timeline `timer_create`'s `clockid` names, which is what an
+    /// absolute `timer_settime` counts against. The id used to be dropped
+    /// on the floor (`_clockid`), so a `CLOCK_REALTIME` timer armed with
+    /// `TIMER_ABSTIME` got a monotonic deadline of seconds-since-1970 and
+    /// never fired.
+    clock: ClockBase,
     /// Period for a periodic timer; `ZERO` = one-shot.
     interval: Duration,
     /// Absolute monotonic deadline of the next expiry; `ZERO` = disarmed.
@@ -1169,6 +1179,7 @@ mod exec_timer_tests {
             PosixTimer {
                 owner,
                 signo: Signal::SIGALRM as usize,
+                clock: ClockBase::Monotonic,
                 interval: Duration::from_secs(1),
                 next: Duration::from_secs(1),
                 generation: 0,

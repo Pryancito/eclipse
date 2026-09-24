@@ -431,6 +431,96 @@ pub fn plan_clock_nanosleep(
     }
 }
 
+/// The timeline `timerfd_create(2)` counts `clock` on, or `EINVAL` if it will
+/// not take that clock at all.
+///
+/// Linux (`fs/timerfd.c`) names its five clocks outright and answers `EINVAL`
+/// for everything else. It is a shorter list than [`clock_nanosleep_base`]'s
+/// because a timerfd is armed against a hardware timer: there is no CPU-time
+/// timerfd and no coarse one.
+pub fn timerfd_clock_base(clock: usize) -> crate::error::LxResult<ClockBase> {
+    use crate::error::LxError;
+    // No catch-all arm, for the same reason `clock_nanosleep_base` has none:
+    // a clock added to `ClockId` has to say here what a timerfd on it means.
+    Ok(match ClockId::from_raw(clock)? {
+        ClockId::ClockRealTime => ClockBase::Wall,
+        ClockId::ClockMonotonic => ClockBase::Monotonic,
+        // `timerfd_create` lists neither the CPU clocks nor the coarse ones.
+        ClockId::ClockProcessCpuTimeId
+        | ClockId::ClockThreadCpuTimeId
+        | ClockId::ClockMonotonicRaw
+        | ClockId::ClockRealTimeCoarse
+        | ClockId::ClockMonotonicCoarse => return Err(LxError::EINVAL),
+        // This kernel's monotonic timer does not stop for suspend, so boot
+        // time and monotonic time are the same thing here.
+        ClockId::ClockBootTime => ClockBase::Monotonic,
+        // Linux wants CAP_WAKE_ALARM for these and wakes the machine from
+        // suspend; there is no suspend here, so they are their non-alarm
+        // clocks. Same choice as `clock_nanosleep_base`.
+        ClockId::ClockRealTimeAlarm => ClockBase::Wall,
+        ClockId::ClockBootTimeAlarm => ClockBase::Monotonic,
+    })
+}
+
+/// The timeline `timer_create(2)` counts `clock` on, or why it will not take
+/// that clock at all.
+///
+/// Linux looks the clock up in `posix_clocks[]` and then asks it for a
+/// `timer_create`: an id it has never heard of is `EINVAL`, and one whose
+/// `k_clock` carries no `timer_create` — the raw and coarse clocks — is
+/// `EOPNOTSUPP`. The two CPU clocks do have one, unlike `nsleep`.
+pub fn posix_timer_clock_base(clock: usize) -> crate::error::LxResult<ClockBase> {
+    use crate::error::LxError;
+    Ok(match ClockId::from_raw(clock)? {
+        ClockId::ClockRealTime => ClockBase::Wall,
+        ClockId::ClockMonotonic => ClockBase::Monotonic,
+        // This kernel does not account CPU time, so these tick on elapsed
+        // time instead — the same substitution `clock_nanosleep_base` makes
+        // for the process clock and `sys_setitimer` for ITIMER_VIRTUAL and
+        // ITIMER_PROF.
+        ClockId::ClockProcessCpuTimeId | ClockId::ClockThreadCpuTimeId => ClockBase::Monotonic,
+        // No `timer_create` in their `k_clock`, which is a different answer
+        // from a clock Linux has never heard of.
+        ClockId::ClockMonotonicRaw
+        | ClockId::ClockRealTimeCoarse
+        | ClockId::ClockMonotonicCoarse => return Err(LxError::EOPNOTSUPP),
+        ClockId::ClockBootTime => ClockBase::Monotonic,
+        ClockId::ClockRealTimeAlarm => ClockBase::Wall,
+        ClockId::ClockBootTimeAlarm => ClockBase::Monotonic,
+    })
+}
+
+/// The point on the **monotonic** timeline a timer armed with `value` must
+/// wake at, which is the only kind of deadline the kernel's timer takes.
+///
+/// `value` is a length when `abs` is clear (`TFD_TIMER_ABSTIME` /
+/// `TIMER_ABSTIME` unset), and a point on `base`'s own timeline when it is
+/// set. Arming an absolute wall-clock time as if it were a monotonic one is
+/// what the tree used to do for `clock_nanosleep` — see
+/// [`plan_clock_nanosleep`], which says the same thing about sleeping — and
+/// on `CLOCK_REALTIME` the gap between the two is the whole age of the Unix
+/// epoch, so the timer fires decades late, which is to say never.
+///
+/// A deadline already gone by comes back as `now_monotonic`, not as an
+/// error: `timer_set` serves a past deadline as soon as it can, and Linux
+/// counts one expiration straight away for it.
+pub fn timer_arm_deadline(
+    base: ClockBase,
+    abs: bool,
+    value: Duration,
+    now_monotonic: Duration,
+    now_wall: Duration,
+) -> Duration {
+    if !abs {
+        return now_monotonic.saturating_add(value);
+    }
+    let now = match base {
+        ClockBase::Monotonic => now_monotonic,
+        ClockBase::Wall => now_wall,
+    };
+    now_monotonic.saturating_add(value.saturating_sub(now))
+}
+
 #[cfg(test)]
 mod time_tests {
     //! Tests for the arithmetic every timeout in the kernel goes through.
@@ -1009,5 +1099,173 @@ mod time_tests {
             assert!(t.valid(), "{} ns produced an invalid timespec", ns);
             assert_eq!(t.try_into_duration().unwrap(), Duration::from_nanos(ns));
         }
+    }
+
+    /// A plausible wall clock: seconds since 1970 as this machine would read
+    /// them. The whole hazard is how far this is from a plausible uptime.
+    const NOW_WALL: Duration = Duration::from_secs(1_789_000_000);
+    /// A plausible uptime: forty-two seconds since boot.
+    const NOW_MONO: Duration = Duration::from_secs(42);
+
+    /// `timerfd_create`'s `clockid` was taken, logged and dropped, so every
+    /// timerfd ran on the monotonic clock. Linux names the five clocks a
+    /// timerfd may use and answers EINVAL for the rest.
+    #[test]
+    fn a_timerfd_may_only_be_made_on_a_clock_a_timerfd_can_run_on() {
+        use crate::error::LxError;
+        for (clock, base) in [
+            (0, ClockBase::Wall),      // CLOCK_REALTIME
+            (1, ClockBase::Monotonic), // CLOCK_MONOTONIC
+            (7, ClockBase::Monotonic), // CLOCK_BOOTTIME
+            (8, ClockBase::Wall),      // CLOCK_REALTIME_ALARM
+            (9, ClockBase::Monotonic), // CLOCK_BOOTTIME_ALARM
+        ] {
+            assert_eq!(timerfd_clock_base(clock), Ok(base), "clock {}", clock);
+        }
+        // The CPU clocks and the coarse ones are not on `timerfd_create`'s
+        // list at all, so they are EINVAL and not EOPNOTSUPP.
+        for clock in [2, 3, 4, 5, 6] {
+            assert_eq!(
+                timerfd_clock_base(clock),
+                Err(LxError::EINVAL),
+                "clock {}",
+                clock
+            );
+        }
+        assert_eq!(timerfd_clock_base(10), Err(LxError::EINVAL));
+        // A negative id arrives as a very large `usize`.
+        assert_eq!(timerfd_clock_base(NEG_ONE), Err(LxError::EINVAL));
+    }
+
+    /// `timer_create` took its clock id as `_clockid` — named out of the
+    /// compiler's way and never read. Linux has three answers here, not two:
+    /// a clock it does not know is EINVAL, and one whose `k_clock` carries no
+    /// `timer_create` is EOPNOTSUPP.
+    #[test]
+    fn a_posix_timer_may_only_be_made_on_a_clock_that_can_carry_one() {
+        use crate::error::LxError;
+        for (clock, base) in [
+            (0, ClockBase::Wall),
+            (1, ClockBase::Monotonic),
+            // Unlike `nsleep`, both CPU clocks do carry a `timer_create`.
+            (2, ClockBase::Monotonic),
+            (3, ClockBase::Monotonic),
+            (7, ClockBase::Monotonic),
+            (8, ClockBase::Wall),
+            (9, ClockBase::Monotonic),
+        ] {
+            assert_eq!(posix_timer_clock_base(clock), Ok(base), "clock {}", clock);
+        }
+        for clock in [4, 5, 6] {
+            assert_eq!(
+                posix_timer_clock_base(clock),
+                Err(LxError::EOPNOTSUPP),
+                "clock {}",
+                clock
+            );
+        }
+        assert_eq!(posix_timer_clock_base(10), Err(LxError::EINVAL));
+        assert_eq!(posix_timer_clock_base(NEG_ONE), Err(LxError::EINVAL));
+        // `clock_nanosleep` is the one that says EINVAL for the thread CPU
+        // clock; the two answers are different on purpose.
+        assert_eq!(clock_nanosleep_base(3), Err(LxError::EINVAL));
+    }
+
+    /// The bug this whole vein is about: `timerfd_settime(TFD_TIMER_ABSTIME)`
+    /// and `timer_settime(TIMER_ABSTIME)` both took the caller's absolute
+    /// time and handed it to the kernel timer as a monotonic deadline. On
+    /// `CLOCK_REALTIME` that is seconds since 1970 read as nanoseconds since
+    /// boot: the timer is armed more than fifty years out and never fires.
+    #[test]
+    fn an_absolute_wall_clock_deadline_is_a_distance_not_a_date() {
+        let deadline = timer_arm_deadline(
+            ClockBase::Wall,
+            true,
+            NOW_WALL + Duration::from_secs(5),
+            NOW_MONO,
+            NOW_WALL,
+        );
+        assert_eq!(deadline, NOW_MONO + Duration::from_secs(5));
+        // What the tree used to arm instead, for the same call.
+        assert!(
+            NOW_WALL + Duration::from_secs(5) > NOW_MONO + Duration::from_secs(50 * 31_557_600),
+            "the old deadline was not the half-century it looked like"
+        );
+    }
+
+    /// An absolute deadline on a monotonic clock IS a monotonic deadline, so
+    /// the fix must not move it. Half the callers in the tree (libwayland's
+    /// frame timers) are exactly this, and they worked.
+    #[test]
+    fn an_absolute_monotonic_deadline_is_taken_as_it_stands() {
+        let want = NOW_MONO + Duration::from_millis(500);
+        assert_eq!(
+            timer_arm_deadline(ClockBase::Monotonic, true, want, NOW_MONO, NOW_WALL),
+            want
+        );
+    }
+
+    /// Without TFD_TIMER_ABSTIME the value is a length, and a length means
+    /// the same thing on either clock.
+    #[test]
+    fn a_relative_arm_is_counted_from_now_whatever_the_clock() {
+        for base in [ClockBase::Monotonic, ClockBase::Wall] {
+            assert_eq!(
+                timer_arm_deadline(base, false, Duration::from_secs(3), NOW_MONO, NOW_WALL),
+                NOW_MONO + Duration::from_secs(3),
+                "{:?}",
+                base
+            );
+        }
+    }
+
+    /// An absolute deadline that has already gone by fires at once in Linux
+    /// (one expiration, straight away), which here means a monotonic
+    /// deadline of `now` — `timer_set` serves a past deadline as soon as it
+    /// can. Answering with the past value itself would be the same thing;
+    /// answering with `now + value` would be a timer armed for a second time
+    /// around, which is what a relative reading of it does.
+    #[test]
+    fn an_absolute_deadline_already_gone_by_is_due_now_not_never() {
+        for (base, past) in [
+            (ClockBase::Wall, NOW_WALL - Duration::from_secs(60)),
+            (ClockBase::Monotonic, NOW_MONO - Duration::from_secs(10)),
+        ] {
+            assert_eq!(
+                timer_arm_deadline(base, true, past, NOW_MONO, NOW_WALL),
+                NOW_MONO,
+                "{:?}",
+                base
+            );
+        }
+    }
+
+    /// The `it_value` is a `timespec` filled in by userspace, so the seconds
+    /// can be anything a `time_t` holds. Neither the subtraction nor the
+    /// addition may wrap or panic: `Duration`'s `+` panics on overflow, and
+    /// this arithmetic runs inside `timerfd_settime`.
+    #[test]
+    fn an_absurd_absolute_deadline_saturates_instead_of_overflowing() {
+        let huge = Duration::from_secs(u64::MAX);
+        assert_eq!(
+            timer_arm_deadline(ClockBase::Wall, true, huge, NOW_MONO, NOW_WALL),
+            NOW_MONO.saturating_add(huge - NOW_WALL)
+        );
+        // And the relative arm, which adds without subtracting first.
+        assert_eq!(
+            timer_arm_deadline(ClockBase::Monotonic, false, huge, NOW_MONO, NOW_WALL),
+            Duration::MAX
+        );
+    }
+
+    /// A `CLOCK_BOOTTIME` timer is armed against this kernel's monotonic
+    /// timer, which does not stop for suspend because there is no suspend.
+    /// If that ever changes, boot time stops being monotonic time and both
+    /// functions have to say so here rather than somewhere else.
+    #[test]
+    fn boot_time_is_monotonic_time_in_this_kernel() {
+        assert_eq!(timerfd_clock_base(7), Ok(ClockBase::Monotonic));
+        assert_eq!(posix_timer_clock_base(7), Ok(ClockBase::Monotonic));
+        assert_eq!(clock_nanosleep_base(7), Ok(ClockBase::Monotonic));
     }
 }

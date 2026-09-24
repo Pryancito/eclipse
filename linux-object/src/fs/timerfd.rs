@@ -4,6 +4,7 @@
 
 use super::*;
 use crate::sync::{Event, EventBus};
+use crate::time::{timer_arm_deadline, ClockBase};
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicU64, Ordering::SeqCst};
@@ -27,22 +28,25 @@ struct TimerInner {
 }
 
 impl TimerInner {
-    /// (Re)arm the timer. `value_ns == 0` disarms it. `abs` selects an absolute
-    /// monotonic deadline (`TFD_TIMER_ABSTIME`) rather than a relative one.
-    fn arm(self: &Arc<Self>, value_ns: u64, interval_ns: u64, abs: bool) {
+    /// (Re)arm the timer. `value_ns == 0` disarms it. `abs` selects an
+    /// absolute deadline (`TFD_TIMER_ABSTIME`) rather than a relative one --
+    /// absolute **on `base`**, the clock `timerfd_create` was given, which is
+    /// not always the one the kernel timer runs on.
+    fn arm(self: &Arc<Self>, base: ClockBase, value_ns: u64, interval_ns: u64, abs: bool) {
         let generation = self.generation.fetch_add(1, SeqCst) + 1;
         self.interval_ns.store(interval_ns, SeqCst);
         if value_ns == 0 {
             self.next_deadline_ns.store(0, SeqCst);
             return; // disarmed
         }
-        let now = kernel_hal::timer::timer_now().as_nanos() as u64;
-        let deadline = if abs {
-            value_ns
-        } else {
-            now.saturating_add(value_ns)
-        };
-        self.schedule(deadline, generation);
+        let deadline = timer_arm_deadline(
+            base,
+            abs,
+            Duration::from_nanos(value_ns),
+            kernel_hal::timer::timer_now(),
+            kernel_hal::timer::wall_clock_now(),
+        );
+        self.schedule(deadline.as_nanos() as u64, generation);
     }
 
     /// Publish readiness from the expiration count, which is the only thing
@@ -91,6 +95,12 @@ impl TimerInner {
 pub struct TimerFd {
     base: KObjectBase,
     inner: Arc<TimerInner>,
+    /// The timeline `timerfd_create`'s `clockid` names, which is what an
+    /// absolute `timerfd_settime` counts against. The id itself used to be
+    /// thrown away, so every absolute deadline was read as a monotonic one
+    /// and a `CLOCK_REALTIME` timer was armed for roughly the age of the
+    /// Unix epoch from now.
+    clock: ClockBase,
     /// Behind a lock so `fcntl(F_SETFL)` can change it after creation.
     flags: Mutex<OpenFlags>,
 }
@@ -98,8 +108,8 @@ pub struct TimerFd {
 impl_kobject!(TimerFd);
 
 impl TimerFd {
-    /// Create a disarmed timerfd.
-    pub fn new(flags: OpenFlags) -> Arc<Self> {
+    /// Create a disarmed timerfd on `clock`.
+    pub fn new(flags: OpenFlags, clock: ClockBase) -> Arc<Self> {
         Arc::new(TimerFd {
             base: KObjectBase::new(),
             inner: Arc::new(TimerInner {
@@ -109,8 +119,14 @@ impl TimerFd {
                 generation: AtomicU64::new(0),
                 eventbus: EventBus::new(),
             }),
+            clock,
             flags: Mutex::new(flags),
         })
+    }
+
+    /// The timeline this timerfd's absolute deadlines are counted on.
+    pub fn clock(&self) -> ClockBase {
+        self.clock
     }
 
     /// Arm/disarm (`timerfd_settime`). `abs` = `TFD_TIMER_ABSTIME`.
@@ -123,7 +139,7 @@ impl TimerFd {
         self.inner.generation.fetch_add(1, SeqCst);
         self.inner.count.store(0, SeqCst);
         self.inner.publish_readiness();
-        self.inner.arm(value_ns, interval_ns, abs);
+        self.inner.arm(self.clock, value_ns, interval_ns, abs);
     }
 
     /// `(interval_ns, remaining_ns)` for `timerfd_gettime`.
@@ -229,7 +245,13 @@ mod tests {
     const MS: u64 = 1_000_000;
 
     fn tfd(flags: OpenFlags) -> Arc<TimerFd> {
-        TimerFd::new(flags)
+        TimerFd::new(flags, ClockBase::Monotonic)
+    }
+
+    /// A timerfd on `CLOCK_REALTIME`, the clock `timerfd_create` used to
+    /// throw away.
+    fn wall_tfd(flags: OpenFlags) -> Arc<TimerFd> {
+        TimerFd::new(flags, ClockBase::Wall)
     }
 
     fn nonblock() -> OpenFlags {
@@ -246,6 +268,76 @@ mod tests {
         fd.set_flags(nonblock()).unwrap();
         assert!(fd.flags().non_block());
         assert_eq!(read8(&fd), Err(LxError::EAGAIN));
+    }
+
+    /// The clock the fd was made on is what an absolute deadline is counted
+    /// against. `timerfd_create` used to log its `clockid` and drop it, so
+    /// this was the monotonic clock whatever the caller asked for.
+    #[test]
+    fn a_timerfd_remembers_the_clock_it_was_made_on() {
+        assert_eq!(tfd(nonblock()).clock(), ClockBase::Monotonic);
+        assert_eq!(wall_tfd(nonblock()).clock(), ClockBase::Wall);
+    }
+
+    /// `timerfd_settime(TFD_TIMER_ABSTIME)` on a `CLOCK_REALTIME` fd: the
+    /// value is seconds since 1970, and arming it as a monotonic deadline
+    /// put the expiry more than half a century out. glibc's `sleep`-style
+    /// helpers and every `sd_event` REALTIME source pass exactly this.
+    #[test]
+    fn an_absolute_deadline_on_the_wall_clock_is_not_half_a_century_away() {
+        let fd = wall_tfd(nonblock());
+        let wall_now = kernel_hal::timer::wall_clock_now().as_nanos() as u64;
+        fd.set_time(wall_now + 500 * MS, 0, true);
+        let (_, remaining) = fd.get_time();
+        assert!(
+            remaining > 100 * MS && remaining <= 500 * MS,
+            "remaining {} is not half a second; the wall clock was read as monotonic",
+            remaining
+        );
+    }
+
+    /// And the same deadline on a monotonic fd is decades away, which is
+    /// what every realtime timerfd used to get. Nothing here waits for it:
+    /// the point is that `gettime` reports it, so the timer was armed and
+    /// will not fire in this machine's lifetime.
+    #[test]
+    fn the_same_date_on_a_monotonic_timerfd_is_the_bug_it_used_to_be() {
+        let fd = tfd(nonblock());
+        let wall_now = kernel_hal::timer::wall_clock_now().as_nanos() as u64;
+        fd.set_time(wall_now, 0, true);
+        let (_, remaining) = fd.get_time();
+        const TEN_YEARS: u64 = 10 * 365 * 24 * 3600 * 1_000_000_000;
+        assert!(
+            remaining > TEN_YEARS,
+            "remaining {} should be the decades a monotonic reading gives",
+            remaining
+        );
+    }
+
+    /// A wall-clock deadline already gone by fires at once, the same as a
+    /// monotonic one. Subtracting the wrong `now` would make it a deadline
+    /// far in the future instead of a due one.
+    #[test]
+    fn an_absolute_wall_clock_deadline_already_past_fires_at_once() {
+        let fd = wall_tfd(nonblock());
+        let wall_now = kernel_hal::timer::wall_clock_now().as_nanos() as u64;
+        fd.set_time(wall_now.saturating_sub(500 * MS), 0, true);
+        assert!(within_two_seconds(|| fd.poll(PollEvents::IN).unwrap().read));
+        assert_eq!(read8(&fd).unwrap(), 1);
+    }
+
+    /// A relative arm means the same thing on either clock: it is a length,
+    /// and the wall clock never enters into it.
+    #[test]
+    fn a_relative_arm_on_the_wall_clock_is_still_a_length() {
+        let fd = wall_tfd(nonblock());
+        fd.set_time(300 * MS, 0, false);
+        let (_, remaining) = fd.get_time();
+        assert!(
+            remaining > 0 && remaining <= 300 * MS,
+            "remaining {} is not the 300 ms just armed",
+            remaining
+        );
     }
 
     fn read8(fd: &TimerFd) -> LxResult<u64> {

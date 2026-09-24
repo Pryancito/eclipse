@@ -11,7 +11,7 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use linux_object::error::LxResult;
 use linux_object::fs::{SignalFd, TimerFd};
-use linux_object::time::TimeSpec;
+use linux_object::time::{timerfd_clock_base, TimeSpec};
 use rcore_fs::vfs::INode;
 
 /// `struct itimerspec` for `timerfd_settime`/`timerfd_gettime`.
@@ -119,21 +119,48 @@ fn flock_translate(operation: usize) -> LxResult<(FlockCmd, bool)> {
     Ok((cmd, nonblock))
 }
 
+/// `O_CLOEXEC`, as every anonymous-fd constructor spells it: `EFD_CLOEXEC`,
+/// `TFD_CLOEXEC`, `SFD_CLOEXEC`, `IN_CLOEXEC`, `EPOLL_CLOEXEC` and
+/// `SOCK_CLOEXEC` are all the same bit, and all land on `OpenFlags::CLOEXEC`.
+pub(crate) const ANON_CLOEXEC: usize = 0o2_000_000;
+/// `O_NONBLOCK`, likewise: `EFD_NONBLOCK`, `TFD_NONBLOCK`, `SFD_NONBLOCK`,
+/// `IN_NONBLOCK`. Lands on `OpenFlags::NON_BLOCK`.
+pub(crate) const ANON_NONBLOCK: usize = 0o4_000;
+
+/// The open flags an anonymous-fd constructor was asked for, or `EINVAL` if
+/// the caller set a bit that syscall does not have.
+///
+/// `OpenFlags::from_bits_truncate` alone answers the wrong question: it drops
+/// what it does not recognise in silence, so `eventfd2(0, 0x4000_0000)` used
+/// to hand back an ordinary eventfd instead of the `EINVAL` Linux answers.
+/// Each of these syscalls checks its own word against its own set
+/// (`EFD_FLAGS_SET`, `TFD_CREATE_FLAGS`, `SFD_FLAGS_SET`, ...), and this is
+/// that check, written once. `inotify_init1` was the only one of the five
+/// doing it.
+pub(crate) fn anon_fd_flags(flags: usize, allowed: usize) -> Result<OpenFlags, LxError> {
+    if flags & !allowed != 0 {
+        return Err(LxError::EINVAL);
+    }
+    // Truncating is right now that the word is known to hold nothing else:
+    // a bit inside `allowed` that `OpenFlags` does not name is the syscall's
+    // own (`EFD_SEMAPHORE`), read back through its own name by whoever owns
+    // it.
+    Ok(OpenFlags::from_bits_truncate(flags))
+}
+
 impl Syscall<'_> {
     /// `timerfd_create(2)`: a timer delivered through a readable fd. The
     /// `wl_event_loop` (libwayland) arms one for all its timers.
     pub fn sys_timerfd_create(&self, clockid: usize, flags: usize) -> SysResult {
         info!("timerfd_create: clockid={}, flags={:#x}", clockid, flags);
-        const TFD_CLOEXEC: usize = 0x80000;
-        const TFD_NONBLOCK: usize = 0x800;
-        let mut open_flags = OpenFlags::empty();
-        if flags & TFD_CLOEXEC != 0 {
-            open_flags |= OpenFlags::CLOEXEC;
-        }
-        if flags & TFD_NONBLOCK != 0 {
-            open_flags |= OpenFlags::NON_BLOCK;
-        }
-        let tfd = TimerFd::new(open_flags);
+        // The `clockid` used to be logged and then dropped, so every timerfd
+        // ran on the monotonic clock whatever the caller asked for. An
+        // absolute `CLOCK_REALTIME` deadline -- seconds since 1970 -- was
+        // then armed as monotonic nanoseconds since boot, i.e. decades away:
+        // the timer simply never fired.
+        let clock = timerfd_clock_base(clockid)?;
+        let open_flags = anon_fd_flags(flags, ANON_CLOEXEC | ANON_NONBLOCK)?;
+        let tfd = TimerFd::new(open_flags, clock);
         let fd = self.linux_process().add_file(tfd)?;
         Ok(fd.into())
     }
@@ -146,7 +173,14 @@ impl Syscall<'_> {
         new_value: UserInPtr<ITimerSpec>,
         mut old_value: UserOutPtr<ITimerSpec>,
     ) -> SysResult {
+        // `TFD_SETTIME_FLAGS`. CANCEL_ON_SET is accepted and does nothing:
+        // it asks to be woken with ECANCELED when the realtime clock is
+        // stepped, and nothing here steps it behind a timer's back.
         const TFD_TIMER_ABSTIME: usize = 1;
+        const TFD_TIMER_CANCEL_ON_SET: usize = 2;
+        if flags & !(TFD_TIMER_ABSTIME | TFD_TIMER_CANCEL_ON_SET) != 0 {
+            return Err(LxError::EINVAL);
+        }
         let file_like = self.linux_process().get_file_like(fd)?;
         let tfd = file_like.downcast_ref::<TimerFd>().ok_or(LxError::EINVAL)?;
         let (iv, rem) = tfd.get_time();
@@ -202,8 +236,9 @@ impl Syscall<'_> {
         _sizemask: usize,
         flags: usize,
     ) -> SysResult {
-        const SFD_CLOEXEC: usize = 0x80000;
-        const SFD_NONBLOCK: usize = 0x800;
+        // Checked before anything else, as Linux does: the flag word is
+        // rejected whether or not `fd` names an existing signalfd.
+        let open_flags = anon_fd_flags(flags, ANON_CLOEXEC | ANON_NONBLOCK)?;
         let sigmask = mask.read()?;
         info!(
             "signalfd4: fd={:?}, mask={:#x}, flags={:#x}",
@@ -218,13 +253,6 @@ impl Syscall<'_> {
                 .ok_or(LxError::EINVAL)?;
             sfd.set_mask(sigmask);
             return Ok(fd.into());
-        }
-        let mut open_flags = OpenFlags::empty();
-        if flags & SFD_CLOEXEC != 0 {
-            open_flags |= OpenFlags::CLOEXEC;
-        }
-        if flags & SFD_NONBLOCK != 0 {
-            open_flags |= OpenFlags::NON_BLOCK;
         }
         let sfd = SignalFd::new(sigmask, open_flags);
         let new_fd = proc.add_file(sfd)?;
@@ -647,8 +675,12 @@ impl Syscall<'_> {
     /// and by the kernel to notify user-space applications of events.
     pub fn sys_eventfd2(&self, initval: u32, flags: usize) -> SysResult {
         info!("eventfd2: initval={}, flags={:#x}", initval, flags);
+        // `EFD_FLAGS_SET`. EFD_SEMAPHORE is bit 0, which `OpenFlags` spells
+        // `WRONLY`; `EventFd` reads it back under its own name.
+        const EFD_SEMAPHORE: usize = 1;
+        let flags = anon_fd_flags(flags, EFD_SEMAPHORE | ANON_CLOEXEC | ANON_NONBLOCK)?;
         let proc = self.linux_process();
-        let eventfd = EventFd::new(initval, OpenFlags::from_bits_truncate(flags));
+        let eventfd = EventFd::new(initval, flags);
         let fd = proc.add_file(eventfd)?;
         Ok(fd.into())
     }
@@ -659,13 +691,8 @@ impl Syscall<'_> {
     /// flags = 0. labwc and GTK apps call this to watch their config dirs.
     pub fn sys_inotify_init1(&self, flags: usize) -> SysResult {
         info!("inotify_init1: flags={:#x}", flags);
-        // Only NONBLOCK/CLOEXEC are valid; reject anything else like Linux.
-        const IN_NONBLOCK: usize = 0o4000;
-        const IN_CLOEXEC: usize = 0o2000000;
-        if flags & !(IN_NONBLOCK | IN_CLOEXEC) != 0 {
-            return Err(LxError::EINVAL);
-        }
-        let inotify = linux_object::fs::Inotify::new(OpenFlags::from_bits_truncate(flags));
+        let flags = anon_fd_flags(flags, ANON_CLOEXEC | ANON_NONBLOCK)?;
+        let inotify = linux_object::fs::Inotify::new(flags);
         let fd = self.linux_process().add_file(inotify)?;
         Ok(fd.into())
     }
@@ -967,5 +994,94 @@ mod flock_translate_tests {
             flock_translate(0xdead_beef_0000_0002),
             Ok((FlockCmd::Exclusive, false))
         );
+    }
+}
+
+#[cfg(test)]
+mod anon_fd_flag_tests {
+    //! `eventfd2`, `timerfd_create`, `signalfd4`, `inotify_init1` and
+    //! `epoll_create1` are each handed a flag word by userspace and each has
+    //! its own short list of bits. Four of the five used to run the word
+    //! through `OpenFlags::from_bits_truncate` and keep whatever was left,
+    //! so a flag this kernel had never heard of was not an error — it was
+    //! nothing at all. `inotify_init1` was the one that checked.
+
+    use super::*;
+
+    /// The sets each caller passes, spelled as the uapi headers spell them.
+    const EFD_SEMAPHORE: usize = 1;
+    const EFD_FLAGS: usize = EFD_SEMAPHORE | ANON_CLOEXEC | ANON_NONBLOCK;
+    const TFD_FLAGS: usize = ANON_CLOEXEC | ANON_NONBLOCK;
+    const EPOLL_FLAGS: usize = ANON_CLOEXEC;
+
+    /// `EFD_CLOEXEC`, `TFD_CLOEXEC`, `SFD_CLOEXEC`, `IN_CLOEXEC` and
+    /// `EPOLL_CLOEXEC` are all `O_CLOEXEC`, and the NONBLOCK ones are all
+    /// `O_NONBLOCK`. If these two constants drift from `OpenFlags`, every
+    /// one of those syscalls silently stops honouring its flag: the fd would
+    /// survive an `execve` it was asked to close on.
+    #[test]
+    fn the_shared_bits_are_the_open_flags_they_claim_to_be() {
+        assert_eq!(ANON_CLOEXEC, 0o2_000_000);
+        assert_eq!(ANON_NONBLOCK, 0o4_000);
+        assert_eq!(OpenFlags::CLOEXEC.bits(), ANON_CLOEXEC);
+        assert_eq!(OpenFlags::NON_BLOCK.bits(), ANON_NONBLOCK);
+    }
+
+    #[test]
+    fn the_two_shared_flags_come_through_as_open_flags() {
+        let f = anon_fd_flags(ANON_CLOEXEC | ANON_NONBLOCK, TFD_FLAGS).unwrap();
+        assert!(f.close_on_exec());
+        assert!(f.non_block());
+        let none = anon_fd_flags(0, TFD_FLAGS).unwrap();
+        assert!(!none.close_on_exec());
+        assert!(!none.non_block());
+    }
+
+    /// The bug: a bit the syscall does not have was dropped in silence.
+    #[test]
+    fn a_bit_the_syscall_does_not_have_is_einval_and_not_ignored() {
+        for stray in [1usize << 30, 1 << 21, 0o10, 1 << 63] {
+            assert_eq!(
+                anon_fd_flags(stray, TFD_FLAGS),
+                Err(LxError::EINVAL),
+                "flag {:#x}",
+                stray
+            );
+            // ... including alongside a flag that IS valid, which is how a
+            // truncating read hides it.
+            assert_eq!(
+                anon_fd_flags(stray | ANON_CLOEXEC, TFD_FLAGS),
+                Err(LxError::EINVAL),
+                "flag {:#x}",
+                stray
+            );
+        }
+    }
+
+    /// Each caller's list is its own. `EFD_SEMAPHORE` is bit 0 and belongs
+    /// to `eventfd2` alone; `epoll_create1` has no NONBLOCK at all.
+    #[test]
+    fn each_syscall_is_held_to_its_own_list() {
+        assert!(anon_fd_flags(EFD_SEMAPHORE, EFD_FLAGS).is_ok());
+        assert_eq!(
+            anon_fd_flags(EFD_SEMAPHORE, TFD_FLAGS),
+            Err(LxError::EINVAL)
+        );
+        assert!(anon_fd_flags(ANON_CLOEXEC, EPOLL_FLAGS).is_ok());
+        assert_eq!(
+            anon_fd_flags(ANON_NONBLOCK, EPOLL_FLAGS),
+            Err(LxError::EINVAL)
+        );
+    }
+
+    /// `EFD_SEMAPHORE` shares bit 0 with `OpenFlags::WRONLY`, and `EventFd`
+    /// reads it back by that bit. Masking it away here would turn every
+    /// semaphore eventfd into an ordinary counting one, which is a silent
+    /// behaviour change in a synchronisation primitive.
+    #[test]
+    fn the_eventfd_semaphore_bit_survives_the_check() {
+        let f = anon_fd_flags(EFD_SEMAPHORE | ANON_NONBLOCK, EFD_FLAGS).unwrap();
+        assert_eq!(f.bits() & EFD_SEMAPHORE, EFD_SEMAPHORE);
+        assert!(f.non_block());
     }
 }
