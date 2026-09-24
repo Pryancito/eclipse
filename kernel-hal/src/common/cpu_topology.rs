@@ -229,6 +229,42 @@ pub fn sbi_hart_mask(hart: usize) -> Option<usize> {
     (hart < usize::BITS as usize).then(|| 1usize << hart)
 }
 
+/// How many slots a per-CPU table needs: one per CPU, **plus one**.
+///
+/// See [`percpu_slot`] for what the extra one is.
+pub const PERCPU_SLOTS: usize = MAX_CORE_NUM + 1;
+
+/// The slot a CPU that has no logical id lands in. It belongs to no CPU, so
+/// whatever is written there is written to nobody.
+pub const QUARANTINE_SLOT: usize = MAX_CORE_NUM;
+
+const _: () = assert!(
+    QUARANTINE_SLOT < PERCPU_SLOTS,
+    "the quarantine slot must be inside the table it is an index into"
+);
+
+/// Which slot of a `[_; PERCPU_SLOTS]` table belongs to `cpu_id`.
+///
+/// A per-CPU table has to answer *something* for a CPU whose id resolved to
+/// nothing (`lock`'s `NO_CPU`), because the caller — the per-CPU block, say —
+/// hands out a reference and has nowhere to put a `None`. The answer must not
+/// be slot 0. Slot 0 is the boot CPU's, and its per-CPU block holds, among
+/// other things, *the thread currently running on it*: two CPUs sharing it
+/// means two CPUs that each believe they are running that thread, and both of
+/// them writing its quantum, its timer state and its callback depth.
+///
+/// So the table carries one extra slot that is nobody's, and an unknown CPU
+/// scribbles there instead. It is still wrong for two unknown CPUs to share
+/// it, but nothing correct is lost when they do — whereas sharing the boot
+/// CPU's slot corrupts a CPU that was doing nothing wrong.
+pub fn percpu_slot(cpu_id: usize) -> usize {
+    if cpu_id < MAX_CORE_NUM {
+        cpu_id
+    } else {
+        QUARANTINE_SLOT
+    }
+}
+
 /// The bring-up registry is one of the two places a CPU id is decided (the
 /// other is [`ipi`](super::ipi), which then trusts it to index with), and
 /// neither has ever run in CI: the emulator boots one or two cores, and every
@@ -492,5 +528,34 @@ mod topology_tests {
         );
         assert_eq!(ids.len(), 8);
         assert_eq!(T.count(), 8);
+    }
+}
+
+#[cfg(test)]
+mod percpu_slot_tests {
+    use super::*;
+
+    #[test]
+    fn every_real_cpu_keeps_its_own_slot() {
+        for cpu in 0..MAX_CORE_NUM {
+            assert_eq!(percpu_slot(cpu), cpu);
+        }
+    }
+
+    #[test]
+    fn a_cpu_with_no_logical_id_does_not_land_on_the_boot_cpu() {
+        // `lock`'s NO_CPU, and anything else past the tables.
+        for cpu in [MAX_CORE_NUM, MAX_CORE_NUM + 1, 255, usize::MAX] {
+            let slot = percpu_slot(cpu);
+            assert_ne!(slot, 0, "cpu {} took the boot CPU's slot", cpu);
+            assert_eq!(slot, QUARANTINE_SLOT);
+        }
+    }
+
+    #[test]
+    fn the_quarantine_slot_belongs_to_no_cpu() {
+        // It is inside the table by `const _: () = assert!` at its definition;
+        // what a test has to pin is that no real CPU is ever given it.
+        assert!((0..MAX_CORE_NUM).all(|cpu| percpu_slot(cpu) != QUARANTINE_SLOT));
     }
 }

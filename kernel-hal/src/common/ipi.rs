@@ -645,17 +645,69 @@ fn tlb_shootdown_ack_nmi_on(me: usize) {
     SHOOTDOWN_SEQ[me].fetch_max(tail_snap, Ordering::Release);
 }
 
+/// Whether this architecture has a kick that reaches a CPU with interrupts
+/// disabled — the top rung of [`remote_flush_tlb_on`]'s escalation ladder.
+///
+/// **x86_64 only.** The rungs below it (re-send the IPI, pump our own queue)
+/// all need the target to be *able* to take an interrupt; this one exists for
+/// the target that is not. On riscv a supervisor software interrupt is masked
+/// by `sstatus.SIE` like any other, and on aarch64 the shootdown SGI is a
+/// Group 1 interrupt masked by `DAIF.I` — and `intr_off` sets exactly that
+/// bit. Neither has anything unmaskable wired up today.
+///
+/// That is worth naming rather than leaving as an empty function, because the
+/// `slow ack wait` line is read as "not even the NMI got through" when on two
+/// of the three architectures the honest reading is "the last rung was never
+/// there". On aarch64 the one unmaskable path that *does* exist is FIQ:
+/// `intr_off` never touches `DAIF.F`, and the vector table already has its
+/// four FIQ entries, so routing the shootdown SGI to GIC Group 0 with
+/// `GICC_CTLR.FIQEn` would give that architecture the rung it is missing. Not
+/// done here: it is a GIC and vector-table change that nothing available can
+/// boot-test.
+pub const HAS_UNMASKABLE_KICK: bool = cfg!(all(target_arch = "x86_64", target_os = "none"));
+
 /// Broadcast an NMI to every other CPU so a wedged target services its pending
-/// shootdown ([`tlb_shootdown_ack_nmi`]). x86_64/bare only; a no-op elsewhere.
-/// Healthy CPUs no-op the ack, so the broadcast only actually helps the stuck
-/// one; a targeted NMI would need a new low-level APIC entry point and buys
-/// nothing here, where this runs only once a shootdown is already starving.
+/// shootdown ([`tlb_shootdown_ack_nmi`]). x86_64/bare only; a no-op elsewhere
+/// (see [`HAS_UNMASKABLE_KICK`]). Healthy CPUs no-op the ack, so the broadcast
+/// only actually helps the stuck one; a targeted NMI would need a new
+/// low-level APIC entry point and buys nothing here, where this runs only once
+/// a shootdown is already starving.
 #[cfg(all(target_arch = "x86_64", target_os = "none"))]
 fn nmi_kick_pending_targets() {
     zcore_drivers::irq::x86::Apic::send_nmi_all_others();
 }
 #[cfg(not(all(target_arch = "x86_64", target_os = "none")))]
 fn nmi_kick_pending_targets() {}
+
+/// One spin in `2^REKICK_SHIFT` re-sends the shootdown to the targets still
+/// pending, for the target that took its IPI as a pure wake before our queue
+/// entry was visible and will never be told again.
+const REKICK_SHIFT: u32 = 16;
+
+/// One spin in `2^UNMASKABLE_SHIFT` escalates to the kick that does not need
+/// the target to be able to take an interrupt. Deliberately 16x rarer than the
+/// re-kick, so a plain lost wakeup is handled by the cheap rung first.
+const UNMASKABLE_SHIFT: u32 = 20;
+
+const _: () = assert!(
+    UNMASKABLE_SHIFT > REKICK_SHIFT,
+    "a lost wakeup is likelier than a wedged CPU: the cheap rung must get \
+     several tries before the expensive one fires at all"
+);
+
+/// Whether the ack wait should re-send the shootdown at this spin count.
+fn should_rekick(spins: u64) -> bool {
+    spins != 0 && spins & ((1u64 << REKICK_SHIFT) - 1) == 0
+}
+
+/// Whether the ack wait should escalate past a maskable interrupt at this spin
+/// count. Always `false` where there is nothing to escalate *to*: firing an
+/// empty function on a schedule is not an escalation, and reading the code as
+/// if it were is how "the NMI did not help either" gets written about a
+/// machine that never sent one.
+fn should_escalate(spins: u64, unmaskable: bool) -> bool {
+    unmaskable && spins != 0 && spins & ((1u64 << UNMASKABLE_SHIFT) - 1) == 0
+}
 
 /// Cross-CPU TLB shootdown.
 ///
@@ -885,7 +937,7 @@ pub(crate) fn remote_flush_tlb_on(me: usize, vaddr: Option<usize>, aspace: Optio
         // flush). Gated far past the healthy fast path — which acks within a
         // handful of spins — so the common case never re-kicks, and only the
         // CPUs still in `pending` this iteration are poked.
-        if spins & ((1 << 16) - 1) == 0 {
+        if should_rekick(spins) {
             for_each_cpu(pending, |cpu| {
                 let _ = crate::interrupt::send_ipi(cpu, reason);
             });
@@ -897,7 +949,7 @@ pub(crate) fn remote_flush_tlb_on(me: usize, vaddr: Option<usize>, aspace: Optio
         // (tlb_shootdown_ack_nmi). 16x rarer than the re-kick and far below the
         // deadlock detector's window, so a genuine lost wakeup is still handled
         // by the cheaper targeted IPI first; this is the last-resort unwedge.
-        if spins & ((1 << 20) - 1) == 0 {
+        if should_escalate(spins, HAS_UNMASKABLE_KICK) {
             nmi_kick_pending_targets();
         }
         if spins >= SPIN_WARN && !warned {
@@ -917,8 +969,16 @@ pub(crate) fn remote_flush_tlb_on(me: usize, vaddr: Option<usize>, aspace: Optio
             // it is diagnosing, so losing this one line to a busy lock is the
             // right trade -- the detector's report is the one that matters.
             crate::console::serial_write_fmt(format_args!(
-                "\n[tlb-shootdown] slow ack wait spins={} targets={:#x} me={}\n",
-                spins, targets, me,
+                "\n[tlb-shootdown] slow ack wait spins={} targets={:#x} me={} \
+                 unmaskable-kick={}\n",
+                spins,
+                targets,
+                me,
+                if HAS_UNMASKABLE_KICK {
+                    "sent"
+                } else {
+                    "none on this arch"
+                },
             ));
         }
         core::hint::spin_loop();
@@ -1999,5 +2059,73 @@ mod ipi_tests {
         assert!(!smp_enabled());
         set_smp_enabled(before);
         assert_eq!(smp_enabled(), before);
+    }
+}
+
+/// The escalation ladder of [`remote_flush_tlb_on`]'s ack wait. It is the only
+/// part of that wait a host test can reach — the loop itself spins on other
+/// CPUs — and it is the part that decides whether a starved shootdown ever
+/// gets another chance.
+#[cfg(test)]
+mod escalation_tests {
+    use super::*;
+
+    const REKICK: u64 = 1 << REKICK_SHIFT;
+    const ESCALATE: u64 = 1 << UNMASKABLE_SHIFT;
+
+    #[test]
+    fn the_healthy_fast_path_never_re_kicks() {
+        // A shootdown acks within a handful of spins. Nothing on that path may
+        // re-send an IPI: the cost of the ladder has to be zero when the
+        // protocol is working.
+        for spins in 0..1000u64 {
+            assert!(!should_rekick(spins), "re-kicked at spin {}", spins);
+            assert!(!should_escalate(spins, true), "escalated at spin {}", spins);
+        }
+    }
+
+    #[test]
+    fn the_re_kick_comes_first_and_then_every_period() {
+        assert!(should_rekick(REKICK));
+        assert!(should_rekick(REKICK * 2));
+        assert!(!should_rekick(REKICK - 1));
+        assert!(!should_rekick(REKICK + 1));
+    }
+
+    #[test]
+    fn the_unmaskable_kick_is_much_rarer_than_the_re_kick() {
+        // A lost wakeup is far more likely than a wedged CPU, so the cheap
+        // rung has to get several tries before the expensive one fires at all
+        // (the ordering itself is a `const _: () = assert!` at the shifts).
+        let rekicks = (1..=ESCALATE).filter(|&s| should_rekick(s)).count();
+        let escalations = (1..=ESCALATE).filter(|&s| should_escalate(s, true)).count();
+        assert_eq!(escalations, 1);
+        assert_eq!(rekicks, (ESCALATE / REKICK) as usize);
+    }
+
+    #[test]
+    fn an_escalation_spin_re_kicks_as_well() {
+        // The two rungs are not exclusive: the spin that escalates also sends
+        // the ordinary IPI, so a target that was merely missing a wakeup is
+        // still served by the cheap path on that iteration.
+        assert!(should_escalate(ESCALATE, true));
+        assert!(should_rekick(ESCALATE));
+    }
+
+    #[test]
+    fn an_architecture_with_nothing_unmaskable_never_pretends_to_escalate() {
+        // Where there is no kick that reaches a CPU with interrupts off,
+        // calling an empty function on a schedule is not an escalation. Saying
+        // so is the whole point: `slow ack wait` gets read as "not even the
+        // NMI got through" on architectures that never sent one.
+        for spins in [1u64, REKICK, ESCALATE, ESCALATE * 7, u64::MAX] {
+            assert!(
+                !should_escalate(spins, false),
+                "escalated at spin {}",
+                spins
+            );
+        }
+        // ...and the re-kick, which needs nothing special, still runs there.
+        assert!(should_rekick(ESCALATE));
     }
 }
