@@ -72,6 +72,13 @@ jobs:
           # prebuilt userboot blobs is not in a plain checkout, so the test
           # target is built for the Linux personality alone.
           cargo test -p zcore-loader --lib --no-default-features --features linux,libos
+          # The vDSO. `default-members` hid this one too, and nothing else in
+          # the tree builds it as a test target, so neither the symbol lookup
+          # nor the tests that map the linked image and *call* it had ever run
+          # here. Not `--lib`: the integration test is the half that executes
+          # the image, and it is where a wrong fixed-point multiply or a path
+          # returning -EINVAL instead of -ENOSYS shows up.
+          cargo test -p linux-vdso
           # rboot, the UEFI bootloader. It is `exclude`d from the workspace
           # (its own toolchain file and its own target), so nothing in CI ever
           # built it, let alone tested it -- and it is the first code that
