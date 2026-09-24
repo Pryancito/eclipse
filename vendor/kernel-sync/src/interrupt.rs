@@ -369,6 +369,17 @@ pub fn set_logical_cpu_id(hw_id: u32, logical_id: u8) -> bool {
     LOGICAL_IDS.register(hw_id, logical_id)
 }
 
+/// Undo [`set_logical_cpu_id`] for `logical_id`: after this, the hardware CPU
+/// it named resolves to [`cpuid::NO_CPU`] rather than to an id whose per-CPU
+/// slots belong to nobody. Returns whether anything was registered.
+///
+/// Pairs with `set_logical_cpu_id`, and the pair must stay together: the SMP
+/// bring-up keeps the reverse map (logical -> hardware) of its own, and a CPU
+/// dropped from one map and not the other is worse than a CPU in both.
+pub fn clear_logical_cpu_id(logical_id: u8) -> bool {
+    LOGICAL_IDS.unregister(logical_id)
+}
+
 /// The hardware id registered for a logical id, or `None`.
 pub fn hardware_id_of(logical_id: u8) -> Option<u32> {
     LOGICAL_IDS.hw_of(logical_id)

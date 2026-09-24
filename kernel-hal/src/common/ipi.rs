@@ -2,6 +2,22 @@ use crate::common::cpu_topology::{percpu_slot, PERCPU_SLOTS};
 use crate::{config::MAX_CORE_NUM, utils::mpsc_queue::MpscQueue};
 use alloc::vec::Vec;
 
+/// Two shapes bound a cpu id in this module. `CPU_ONLINE`, `IPI_READY`,
+/// `IPI_QUEUE_OVERFLOW` and every wait mask are `AtomicU64`, so an id needs a
+/// bit; the per-CPU tables below — the queues, `ACTIVE_VMTOKEN`,
+/// `SHOOTDOWN_SEQ`, `SHOOTDOWN_GOAL` and the overflow counters — are
+/// `[_; MAX_CORE_NUM]`, so it needs a slot. `MAX_CORE_NUM` is the tighter, and
+/// the sibling module that hands the ids out says as much: "every guard in
+/// this module is spelled `< MAX_CORE_NUM` rather than `< 64` so the day that
+/// limit moves there is exactly one thing to widen". Three guards here were
+/// spelled 64 — and one of them, `note_ipi_queue_overflow`, indexes a
+/// `MAX_CORE_NUM`-sized array on its very next line, from interrupt context
+/// with locks held.
+const _: () = assert!(
+    MAX_CORE_NUM <= 64,
+    "the online/ready/overflow masks are u64: widen them before raising MAX_CORE_NUM"
+);
+
 const REASON_SIZE: usize = 64;
 
 pub type IpiEntry = usize;
@@ -240,7 +256,7 @@ static CPU_ONLINE: AtomicU64 = AtomicU64::new(1);
 
 /// Mark a logical CPU id as online (called from each CPU's bring-up path).
 pub fn mark_cpu_online(logical_id: usize) {
-    if logical_id < 64 {
+    if logical_id < MAX_CORE_NUM {
         CPU_ONLINE.fetch_or(1u64 << logical_id, Ordering::Release);
     }
 }
@@ -329,7 +345,7 @@ pub fn note_active_vmtoken(token: usize) {
 /// Mark this CPU as ready to service TLB-shootdown IPIs. Called once, when the
 /// CPU enters its executor loop with interrupts enabled.
 pub fn mark_cpu_ipi_ready(logical_id: usize) {
-    if logical_id < 64 {
+    if logical_id < MAX_CORE_NUM {
         IPI_READY.fetch_or(1u64 << logical_id, Ordering::Release);
     }
 }
@@ -438,7 +454,7 @@ static IPI_OVERFLOW_ACK: [AtomicU64; MAX_CORE_NUM] = [ZERO_SEQ; MAX_CORE_NUM];
 
 /// Note that `cpuid`'s IPI queue dropped an entry (called by the arch sender).
 pub fn note_ipi_queue_overflow(cpuid: usize) {
-    if cpuid < 64 {
+    if cpuid < MAX_CORE_NUM {
         IPI_QUEUE_OVERFLOW.fetch_or(1u64 << cpuid, Ordering::Release);
         IPI_OVERFLOW_GEN[cpuid].fetch_add(1, Ordering::Release);
     }
@@ -2350,5 +2366,123 @@ mod escalation_tests {
         }
         // ...and the re-kick, which needs nothing special, still runs there.
         assert!(should_rekick(ESCALATE));
+    }
+}
+
+/// Which cpu ids this module will act on.
+///
+/// Every bit set in `CPU_ONLINE`, `IPI_READY` or `IPI_QUEUE_OVERFLOW` becomes
+/// an index into a `[_; MAX_CORE_NUM]` table further down — a shootdown
+/// target's `SHOOTDOWN_GOAL[me][cpu]`, its ack watermark, its overflow
+/// counter — and none of those indexings is bounds-checked at the point of
+/// use. So the two shapes have to agree, and the guards that admit an id are
+/// the only place they can be made to.
+#[cfg(test)]
+mod cpu_id_bounds_tests {
+    use super::*;
+
+    /// `lock::current_cpu_id()`'s answer for a CPU that never got a dense
+    /// logical id. It arrives here through `cpu_id()` like any other.
+    const NO_CPU: usize = 255;
+
+    /// Restore whichever masks a test disturbs.
+    struct Masks {
+        online: u64,
+        ready: u64,
+        overflow: u64,
+    }
+
+    impl Masks {
+        fn empty() -> Self {
+            let me = Masks {
+                online: CPU_ONLINE.load(Ordering::SeqCst),
+                ready: IPI_READY.load(Ordering::SeqCst),
+                overflow: IPI_QUEUE_OVERFLOW.load(Ordering::SeqCst),
+            };
+            CPU_ONLINE.store(0, Ordering::SeqCst);
+            IPI_READY.store(0, Ordering::SeqCst);
+            IPI_QUEUE_OVERFLOW.store(0, Ordering::SeqCst);
+            me
+        }
+    }
+
+    impl Drop for Masks {
+        fn drop(&mut self) {
+            CPU_ONLINE.store(self.online, Ordering::SeqCst);
+            IPI_READY.store(self.ready, Ordering::SeqCst);
+            IPI_QUEUE_OVERFLOW.store(self.overflow, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn a_cpu_with_no_slot_is_never_marked_online() {
+        // `cpu_online_mask` is what `can_receive_ipi` gates on and what the
+        // bring-up counts; a bit for a cpu with no per-CPU row is a target
+        // nothing can look up.
+        let _m = Masks::empty();
+        mark_cpu_online(MAX_CORE_NUM);
+        mark_cpu_online(NO_CPU);
+        mark_cpu_online(usize::MAX);
+        assert_eq!(cpu_online_mask(), 0);
+    }
+
+    #[test]
+    fn a_cpu_with_no_slot_is_never_marked_ready_for_shootdowns() {
+        // This is the mask `remote_flush_tlb_on` turns straight into
+        // `targets`, and every target is indexed into `SHOOTDOWN_GOAL[me][..]`
+        // with no bound of its own.
+        let _m = Masks::empty();
+        mark_cpu_ipi_ready(MAX_CORE_NUM);
+        mark_cpu_ipi_ready(NO_CPU);
+        mark_cpu_ipi_ready(usize::MAX);
+        assert_eq!(IPI_READY.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn an_overflow_noted_for_a_cpu_with_no_slot_indexes_nothing() {
+        // The sharpest of the three: the guard admitted the id and the very
+        // next line indexed `IPI_OVERFLOW_GEN[cpuid]`, from the IPI publish
+        // path — interrupt context, locks held.
+        let _m = Masks::empty();
+        note_ipi_queue_overflow(MAX_CORE_NUM);
+        note_ipi_queue_overflow(NO_CPU);
+        note_ipi_queue_overflow(usize::MAX);
+        assert_eq!(IPI_QUEUE_OVERFLOW.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn every_cpu_the_guards_do_admit_has_a_row_in_every_table() {
+        // The invariant the three guards exist to keep. Stated over the whole
+        // admitted range rather than over one id, so it still means something
+        // on a build that lowers MAX_CORE_NUM.
+        let _m = Masks::empty();
+        for cpu in 0..MAX_CORE_NUM {
+            mark_cpu_online(cpu);
+            mark_cpu_ipi_ready(cpu);
+        }
+        let admitted = cpu_online_mask() | IPI_READY.load(Ordering::SeqCst);
+        for_each_cpu(admitted, |cpu| {
+            assert!(
+                cpu < MAX_CORE_NUM,
+                "cpu {} was admitted but indexes no per-CPU row",
+                cpu
+            );
+            // Touch the rows a shootdown would, to say which ones they are.
+            let _ = SHOOTDOWN_SEQ[cpu].load(Ordering::Relaxed);
+            let _ = SHOOTDOWN_GOAL[0][cpu].load(Ordering::Relaxed);
+            let _ = IPI_OVERFLOW_GEN[cpu].load(Ordering::Relaxed);
+            let _ = ACTIVE_VMTOKEN[cpu].load(Ordering::Relaxed);
+        });
+    }
+
+    #[test]
+    fn a_cpu_with_no_slot_is_never_worth_kicking_even_if_a_mask_names_it() {
+        // Belt and braces: `wake_kick_wanted` bounds the id itself, so an
+        // online mask corrupted into naming a cpu past the tables stops here.
+        let _m = Masks::empty();
+        CPU_ONLINE.store(u64::MAX, Ordering::SeqCst);
+        assert!(!wake_kick_wanted(MAX_CORE_NUM));
+        assert!(!wake_kick_wanted(NO_CPU));
+        assert!(!wake_kick_wanted(usize::MAX));
     }
 }
