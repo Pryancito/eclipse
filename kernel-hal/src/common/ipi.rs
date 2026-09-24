@@ -1,3 +1,4 @@
+use crate::common::cpu_topology::{percpu_slot, PERCPU_SLOTS};
 use crate::{config::MAX_CORE_NUM, utils::mpsc_queue::MpscQueue};
 use alloc::vec::Vec;
 
@@ -56,6 +57,14 @@ pub fn publish_ipi_entry(cpuid: usize, reason: IpiEntry) -> bool {
     let Some(queue) = ipi_queue(cpuid) else {
         return false;
     };
+    // Reentrancy, not contention: see [`PUBLISHING`]. A publish already in
+    // flight on this CPU owns a reserved slot that only it can commit, so a
+    // nested one must not reserve a second — it would wait for a predecessor
+    // that cannot run until the nested call returns.
+    let Some(_guard) = PublishGuard::enter() else {
+        note_ipi_queue_overflow(cpuid);
+        return true;
+    };
     let delivered = match queue.alloc_entry() {
         Some(idx) => {
             *queue.entry_at(idx) = reason;
@@ -69,6 +78,58 @@ pub fn publish_ipi_entry(cpuid: usize, reason: IpiEntry) -> bool {
         note_ipi_queue_overflow(cpuid);
     }
     true
+}
+
+/// Per-CPU "a publish is in flight here right now".
+///
+/// [`MpscQueue`] publishes strictly in index order: `commit_entry` spins until
+/// `ptail` reaches the slot it reserved, and it deliberately never gives up —
+/// abandoning a reserved slot freezes `ptail` for good, which is the bug its
+/// own comment records. That makes the reserve-write-commit sequence
+/// **non-reentrant**, and this one is reached from interrupt context: nothing
+/// on the shootdown path turns interrupts off (`remote_flush_tlb_on` runs with
+/// whatever state its caller had), so an interrupt can land between the CAS in
+/// `alloc_entry` and the `fetch_add` in `commit_entry`. If its handler
+/// shoots a page down too — a timer tick into the scheduler, into a task drop,
+/// into a VMAR teardown — it reserves the next slot on that same queue and
+/// spins for a predecessor that cannot commit until the handler returns. Both
+/// halves of one CPU, waiting on each other, with no timeout by design.
+///
+/// A nested publish therefore does not queue at all: it sets the target's
+/// overflow bit and returns. That is the same degradation this function
+/// already applies to a full queue, and it is exactly what the bit means —
+/// the payload did not reach the receiver, so its next drain full-flushes
+/// instead of invalidating one page. One flush is the price of not wedging a
+/// CPU, and it never fires outside the nested case.
+///
+/// Indexed by [`percpu_slot`], not by the raw id: a `cpu_id()` past the tables
+/// is a documented failure on this kernel (see [`SMP_ENABLED`]), and it is
+/// precisely the CPU whose publishes must still be guarded — the quarantine
+/// slot costs two such CPUs a full flush each and wedges neither.
+///
+/// [`MpscQueue`]: crate::utils::mpsc_queue::MpscQueue
+/// [`percpu_slot`]: crate::common::cpu_topology::percpu_slot
+static PUBLISHING: [AtomicBool; PERCPU_SLOTS] = [const { AtomicBool::new(false) }; PERCPU_SLOTS];
+
+/// Claims this CPU's publish slot for the duration of one
+/// [`publish_ipi_entry`], and gives it back however that call leaves.
+struct PublishGuard(usize);
+
+impl PublishGuard {
+    /// `None` when a publish is already in flight on this CPU.
+    fn enter() -> Option<Self> {
+        let slot = percpu_slot(crate::cpu::cpu_id() as usize);
+        if PUBLISHING[slot].swap(true, Ordering::Acquire) {
+            return None;
+        }
+        Some(PublishGuard(slot))
+    }
+}
+
+impl Drop for PublishGuard {
+    fn drop(&mut self) {
+        PUBLISHING[self.0].store(false, Ordering::Release);
+    }
 }
 
 /// Arm the hardware write-watch on an IPI ring's `size` word, so the next
@@ -1346,6 +1407,66 @@ mod ipi_tests {
         assert_eq!(IPI_READY.load(Ordering::Acquire), now);
 
         IPI_READY.store(before, Ordering::Release);
+    }
+
+    // ── reentrancy: two publishes on one CPU ───────────────────────────────
+
+    #[test]
+    fn a_nested_publish_does_not_reserve_a_second_slot() {
+        let _g = test_lock();
+        let cpu = scratch_cpu(11);
+        drain(cpu);
+        let q = ipi_queue(cpu).unwrap();
+        let before = q.phead();
+
+        // Stand in for the interrupt: the outer publish is between its
+        // `alloc_entry` CAS and its `commit_entry`, so this CPU's slot is
+        // taken. Reserving another here is the wedge — `commit_entry` would
+        // spin for a predecessor that cannot run until we return, and it
+        // never gives up.
+        let outer = PublishGuard::enter().expect("nothing was in flight");
+        assert!(publish_ipi_entry(
+            cpu,
+            IpiReason::TlbShutdown { vpn: 0x1234 }.into()
+        ));
+        assert_eq!(q.phead(), before, "the nested publish took a slot");
+        assert_ne!(
+            IPI_QUEUE_OVERFLOW.load(Ordering::SeqCst) & (1u64 << cpu),
+            0,
+            "the payload was dropped without forcing a full flush"
+        );
+
+        drop(outer);
+        drain(cpu);
+    }
+
+    #[test]
+    fn the_slot_is_given_back_however_the_publish_ends() {
+        let _g = test_lock();
+        let cpu = scratch_cpu(12);
+        drain(cpu);
+        // A publish that fills the queue, one that names no CPU and an
+        // ordinary one all have to leave the slot free, or this CPU can never
+        // queue another payload for the rest of the boot.
+        let q = ipi_queue(cpu).unwrap();
+        for _ in 0..REASON_SIZE {
+            assert!(publish_ipi_entry(
+                cpu,
+                IpiReason::TlbShutdown { vpn: 1 }.into()
+            ));
+        }
+        assert!(q.alloc_entry().is_none(), "the queue was meant to be full");
+        assert!(publish_ipi_entry(
+            cpu,
+            IpiReason::TlbShutdown { vpn: 2 }.into()
+        ));
+        assert!(!publish_ipi_entry(MAX_CORE_NUM, 0));
+        drain(cpu);
+
+        assert!(
+            PublishGuard::enter().is_some(),
+            "a publish left this CPU's slot claimed"
+        );
     }
 
     // ── the reschedule kick ────────────────────────────────────────────────

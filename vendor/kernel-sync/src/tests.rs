@@ -417,3 +417,130 @@ fn a_whole_rwlock_sequence_comes_back_to_zero() {
         assert_eq!(*l.read(), 4);
     });
 }
+
+// ── waiting without going deaf ───────────────────────────────────────────────
+//
+// Every acquire in this crate brackets itself with `push_off`, so a waiter
+// that got here from a caller who already had interrupts off spins with them
+// still off — deaf to the TLB-shootdown IPI. A peer doing the shootdown
+// spin-waits for that ack while holding the VMAR lock, so a silent waiter
+// wedges it and everything queued behind it. The ticket lock and the spin
+// mutex each drain their own queue every 512 turns; `rwlock.rs` had four
+// waiting loops and not one of them did.
+//
+// A second thread here is a second CPU (see `this_cpu`), so the waiting in
+// these is real: this CPU holds a guard that blocks the other's acquire, and
+// only lets go once the waiter has been seen to drain its queue.
+
+static PUMPS: AtomicU32 = AtomicU32::new(0);
+
+fn count_pump() {
+    PUMPS.fetch_add(1, Ordering::SeqCst);
+}
+
+/// Arm the recording pump. Returns the shared hook lock, so `rwlock.rs`'s own
+/// tests cannot swap the recorder out from under us.
+fn armed() -> std::sync::MutexGuard<'static, ()> {
+    let guard = crate::deadlock::hook_test_lock();
+    PUMPS.store(0, Ordering::SeqCst);
+    crate::deadlock::set_spin_pump(count_pump);
+    guard
+}
+
+/// Wait for the other CPU to go round its waiting loop enough times to drain
+/// its queue once. The deadline is a hang guard, not the assertion: a working
+/// discipline gets there in microseconds, and a broken one has to fail the
+/// test rather than stop the suite.
+fn a_pump_was_seen() -> bool {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while PUMPS.load(Ordering::SeqCst) == 0 {
+        if std::time::Instant::now() > deadline {
+            return false;
+        }
+        std::thread::yield_now();
+    }
+    true
+}
+
+#[test]
+fn a_reader_waiting_on_a_writer_drains_its_own_shootdown_queue() {
+    static LOCK: RwLock<u32> = RwLock::new(7);
+    let _g = armed();
+    on_a_cpu(|| {
+        let w = LOCK.write();
+        let other = std::thread::spawn(|| {
+            on_a_cpu(|| assert_eq!(*LOCK.read(), 7));
+        });
+        let pumped = a_pump_was_seen();
+        drop(w);
+        other.join().unwrap();
+        assert!(pumped, "a reader waited on a writer in silence");
+    });
+}
+
+#[test]
+fn a_writer_waiting_on_a_reader_drains_its_own_shootdown_queue() {
+    static LOCK: RwLock<u32> = RwLock::new(1);
+    let _g = armed();
+    on_a_cpu(|| {
+        let r = LOCK.read();
+        let other = std::thread::spawn(|| {
+            on_a_cpu(|| *LOCK.write() = 2);
+        });
+        let pumped = a_pump_was_seen();
+        drop(r);
+        other.join().unwrap();
+        assert!(pumped, "a writer waited on a reader in silence");
+        assert_eq!(*LOCK.read(), 2);
+    });
+}
+
+#[test]
+fn an_upgradeable_reader_waiting_on_another_drains_its_own_shootdown_queue() {
+    static LOCK: RwLock<u32> = RwLock::new(3);
+    let _g = armed();
+    on_a_cpu(|| {
+        // This loop had neither half of the discipline: no pump and no
+        // deadlock report, so a wedge here left the console empty too.
+        let up = LOCK.upgradeable_read();
+        let other = std::thread::spawn(|| {
+            on_a_cpu(|| assert_eq!(*LOCK.upgradeable_read(), 3));
+        });
+        let pumped = a_pump_was_seen();
+        drop(up);
+        other.join().unwrap();
+        assert!(pumped, "an upgradeable reader waited in silence");
+    });
+}
+
+#[test]
+fn an_upgrade_waiting_on_a_reader_drains_its_own_shootdown_queue() {
+    static LOCK: RwLock<u32> = RwLock::new(4);
+    static READY: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+    let _g = armed();
+    READY.store(false, Ordering::SeqCst);
+    on_a_cpu(|| {
+        // An upgradeable guard may be taken while readers exist; it is the
+        // upgrade that has to wait for the last of them to leave. That is the
+        // fourth loop, and the other one that spun in silence.
+        let r = LOCK.read();
+        let other = std::thread::spawn(|| {
+            on_a_cpu(|| {
+                let up = LOCK.upgradeable_read();
+                READY.store(true, Ordering::SeqCst);
+                *up.upgrade() = 5;
+            });
+        });
+        while !READY.load(Ordering::SeqCst) {
+            std::thread::yield_now();
+        }
+        // Only the upgrade's own waiting counts: the acquire above took the
+        // guard without spinning, but say so rather than rely on it.
+        PUMPS.store(0, Ordering::SeqCst);
+        let pumped = a_pump_was_seen();
+        drop(r);
+        other.join().unwrap();
+        assert!(pumped, "an upgrade waited on a reader in silence");
+        assert_eq!(*LOCK.read(), 5);
+    });
+}

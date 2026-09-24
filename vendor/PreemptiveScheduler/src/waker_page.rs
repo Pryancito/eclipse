@@ -223,6 +223,19 @@ impl WakerPage {
         published & !blocked != 0
     }
 
+    /// Whether the task at `offset` has a wake published and nothing blocking
+    /// it — the state that makes it work for whoever owns this page.
+    ///
+    /// Same mask as [`has_notified`], narrowed to one slot, minus `borrowed`:
+    /// the one caller is [`WakerRef::mark_borrowed`] releasing that very
+    /// borrow, so it asks about the slot it is about to unblock.
+    #[inline]
+    pub fn has_pending_wake(&self, offset: usize) -> bool {
+        debug_assert!(offset < 64);
+        let bit = 1u64 << offset;
+        (self.notified.load() | self.yielded.load()) & !self.dropped.load() & bit != 0
+    }
+
     /// Non-destructive snapshot of `(notified | yielded, dropped, borrowed)` for diagnostics.
     pub fn peek(&self) -> (u64, u64, u64) {
         (
@@ -264,8 +277,43 @@ impl WakerRef {
     //     self.page.mark_completed(self.idx);
     // }
 
+    /// Check this task out to an executor, or hand it back.
+    ///
+    /// Releasing the borrow is a wake in its own right, and until now it was
+    /// the one state change on this page that published nothing and kicked
+    /// nobody. `take_notified` and `take_yielded` both *defer* a wake that
+    /// lands on a borrowed slot — they re-publish it and report nothing — and
+    /// `has_ready`, the owner's pre-halt recheck, masks `borrowed` out for the
+    /// same reason. So while a task is checked out, every reader agrees there
+    /// is no work, correctly. What makes it work again is this call.
+    ///
+    /// On the CPU that owns the queue that costs nothing: it goes straight
+    /// back to `take_task` and finds the task itself. Under work stealing it
+    /// is a lost wake. The borrow is held by the *thief*, the wake was
+    /// published on the *owner's* page, and the owner — having seen the bit
+    /// masked by `borrowed` on its own last look — is halted. The thief then
+    /// releases the borrow and returns to its own run queue. Nothing tells the
+    /// owner, so a task that is runnable right now waits for that CPU's next
+    /// periodic tick: up to 4 ms at 250 Hz, on every wake that races a steal.
+    ///
+    /// So ask, and kick a sleeping owner. The two halves close over each
+    /// other: the waker samples `borrowed` before publishing, we publish
+    /// `borrowed = false` before reading its lanes, and both pairs are SeqCst.
+    /// In the one interleaving where the waker still saw us borrowed and we
+    /// still miss its notify, its own `maybe_send_resched_ipi` ran after the
+    /// notify — and if the owner was not sleeping yet, the owner's halt
+    /// protocol (publish sleeping, then recheck) is ordered after both and
+    /// sees the task runnable. No interleaving leaves everyone silent.
+    ///
+    /// `maybe_send_resched_ipi` and not `request_resched`: the task is already
+    /// on the owner's queue and there is nothing to preempt for, only a halted
+    /// CPU to wake. It also makes the owner's own release free — a CPU that is
+    /// executing is never in the sleeping mask.
     pub fn mark_borrowed(&self, borrowed: bool) {
         self.page.mark_borrowed(self.idx, borrowed);
+        if !borrowed && self.page.has_pending_wake(self.idx) {
+            crate::runtime::maybe_send_resched_ipi(self.page.owner_cpu);
+        }
     }
 
     pub fn wake_by_ref(&self) {
@@ -521,8 +569,7 @@ mod waker_page_tests {
     // tests also own, so they take the same kind of lock.
 
     fn wake_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+        crate::runtime::resched_test_lock()
     }
 
     fn waker_for(p: &Arc<WakerPage>, idx: usize) -> Arc<WakerRef> {
@@ -614,5 +661,151 @@ mod waker_page_tests {
         w.wake_by_ref();
         assert_eq!(p.take_notified(), 0);
         assert_eq!(p.take_yielded(), 0);
+    }
+
+    // ── handing a task back: the wake that was deferred while it ran ───────
+    //
+    // `take_notified`/`take_yielded` defer a wake that lands on a borrowed
+    // slot, and `has_ready` masks `borrowed` out, so while a task is checked
+    // out every reader agrees there is nothing to do. Releasing the borrow is
+    // what makes it work again — and under work stealing the CPU doing the
+    // releasing is not the CPU that owns the queue.
+
+    /// Install the recording sender and put `owner` in (or out of) the
+    /// sleeping mask. Returns the shared lock, so the sender cannot be swapped
+    /// out from under the test by `runtime`'s own resched tests.
+    fn owner_asleep(owner: u8, asleep: bool) -> std::sync::MutexGuard<'static, ()> {
+        let guard = wake_lock();
+        KICKED.store(0, Ordering::SeqCst);
+        for cpu in 0..8 {
+            crate::runtime::set_cpu_sleeping(cpu, false);
+        }
+        crate::runtime::set_cpu_sleeping(owner as usize, asleep);
+        crate::runtime::set_resched_ipi_sender(record_kick);
+        guard
+    }
+
+    static KICKED: AtomicU64 = AtomicU64::new(0);
+
+    fn record_kick(cpu: usize) {
+        if cpu < 64 {
+            KICKED.fetch_or(1u64 << cpu, Ordering::SeqCst);
+        }
+    }
+
+    fn kicked() -> u64 {
+        KICKED.load(Ordering::SeqCst)
+    }
+
+    #[test]
+    fn giving_back_a_stolen_task_wakes_the_halted_owner() {
+        let _g = owner_asleep(3, true);
+        let p = WakerPage::new(3);
+        let w = waker_for(&p, 9);
+        p.take_notified();
+        // CPU 3's task is being polled somewhere else; a wake lands and is
+        // deferred, so CPU 3's own look found nothing and it halted.
+        p.mark_borrowed(9, true);
+        p.notify(9);
+        assert_eq!(p.take_notified(), 0, "a borrowed slot was handed out");
+
+        // The thief finishes the poll and hands the task back. Nothing else
+        // will tell CPU 3, and the task is runnable right now.
+        w.mark_borrowed(false);
+        assert_eq!(kicked(), 1 << 3, "the owner was left halted");
+    }
+
+    #[test]
+    fn a_voluntary_yield_deferred_by_the_steal_wakes_the_owner_too() {
+        let _g = owner_asleep(2, true);
+        let p = WakerPage::new(2);
+        let w = waker_for(&p, 4);
+        p.take_notified();
+        p.mark_borrowed(4, true);
+        // The other lane is deferred by exactly the same rule, and a stolen
+        // task that yields is how a CPU-bound thread gives its slice back.
+        p.mark_yielded(4);
+
+        w.mark_borrowed(false);
+        assert_eq!(kicked(), 1 << 2);
+    }
+
+    #[test]
+    fn handing_back_a_task_nobody_woke_interrupts_nobody() {
+        let _g = owner_asleep(3, true);
+        let p = WakerPage::new(3);
+        let w = waker_for(&p, 9);
+        p.take_notified();
+        p.mark_borrowed(9, true);
+
+        // A poll that returned Pending with no wake pending is the common
+        // case by far. Kicking here would put an IPI on every single one.
+        w.mark_borrowed(false);
+        assert_eq!(kicked(), 0);
+    }
+
+    #[test]
+    fn a_finished_task_does_not_get_its_owner_woken() {
+        let _g = owner_asleep(3, true);
+        let p = WakerPage::new(3);
+        let w = waker_for(&p, 9);
+        p.take_notified();
+        p.mark_borrowed(9, true);
+        // A stale waker re-notifying a completed task is the race `Task::poll`
+        // guards with `finish`; the bit is set but there is nothing to run.
+        p.notify(9);
+        p.mark_dropped(9);
+
+        w.mark_borrowed(false);
+        assert_eq!(kicked(), 0, "a dead task woke a CPU");
+    }
+
+    #[test]
+    fn an_owner_that_is_not_halted_is_not_interrupted() {
+        let _g = owner_asleep(3, false);
+        let p = WakerPage::new(3);
+        let w = waker_for(&p, 9);
+        p.take_notified();
+        p.mark_borrowed(9, true);
+        p.notify(9);
+
+        // A CPU that is executing reaches its own `take_task` without an
+        // interrupt. This is also what makes the un-stolen case free: the
+        // releasing CPU is the owner, and it is never in the sleeping mask.
+        w.mark_borrowed(false);
+        assert_eq!(kicked(), 0);
+    }
+
+    #[test]
+    fn taking_a_task_out_never_kicks() {
+        let _g = owner_asleep(3, true);
+        let p = WakerPage::new(3);
+        let w = waker_for(&p, 9);
+        // The slot is notified from `initialize` and never taken, so the
+        // pending-wake test would say yes — checking out a task must not ask.
+        w.mark_borrowed(true);
+        assert_eq!(kicked(), 0);
+        assert!(p.is_borrowed(9));
+    }
+
+    #[test]
+    fn the_pending_wake_test_answers_for_one_slot_and_not_its_neighbours() {
+        let p = page();
+        p.notify(30);
+        assert!(p.has_pending_wake(30));
+        assert!(!p.has_pending_wake(29));
+        assert!(!p.has_pending_wake(31));
+        // Both lanes count, and `dropped` blocks either.
+        let q = page();
+        q.mark_yielded(30);
+        assert!(q.has_pending_wake(30));
+        q.mark_dropped(30);
+        assert!(!q.has_pending_wake(30));
+        // A borrow does not: the one caller is releasing that very borrow, so
+        // it would answer no to every question it asks.
+        let r = page();
+        r.notify(30);
+        r.mark_borrowed(30, true);
+        assert!(r.has_pending_wake(30));
     }
 }
