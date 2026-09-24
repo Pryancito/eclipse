@@ -3,7 +3,8 @@
 use alloc::{boxed::Box, string::String, sync::Arc, vec::Vec};
 use core::{future::Future, pin::Pin};
 use linux_object::signal::{
-    MachineContext, SigInfo, Signal, SignalStack, SignalUserContext, Sigset, SIG_DFL, SIG_IGN,
+    MachineContext, SigInfo, Signal, SignalAction, SignalStack, SignalUserContext, Sigset, SIG_DFL,
+    SIG_IGN,
 };
 
 use kernel_hal::context::{TrapReason, UserContext, UserContextField};
@@ -797,6 +798,36 @@ fn handle_signal(
         }
         thread.proc().exit(code as i64);
         return ctx;
+    }
+    // The set the handler runs under: what the thread already had blocked,
+    // plus the `sa_mask` this action asked for, plus the signal itself unless
+    // `SA_NODEFER`. `sa_mask` is the whole reason a handler can safely touch
+    // data the signal also touches, and it was stored by the syscall and read
+    // by nobody -- so a handler that asked for SIGTERM to be held off while it
+    // ran was not given that, and a `sigprocmask(SIG_BLOCK, NULL, &old)`
+    // inside it reported the mask from before the signal. `sigmask` below is
+    // the one the frame carries back on `sigreturn`, and stays what it was.
+    {
+        // `thread.inner()` is a temporary, so the guard needs a binding that
+        // outlives it; the one-liners elsewhere get away with it only because
+        // the whole thing is a single statement.
+        let inner = thread.inner();
+        let mut linux = inner.lock_linux();
+        let live = linux.signal_mask();
+        linux.set_signal_mask(action.handler_mask(live, signal));
+    }
+    // `SA_RESETHAND` puts the disposition back to `SIG_DFL` BEFORE the handler
+    // runs: that is what makes a one-shot handler one-shot, and what lets a
+    // handler for a fault re-raise it and die the way it would have. Unread,
+    // the handler stayed installed for good.
+    if action.resets_to_default() {
+        thread.proc().linux().set_signal_action(
+            signal,
+            SignalAction {
+                handler: SIG_DFL,
+                ..action
+            },
+        );
     }
     let signal_info = SigInfo::default();
     let signal_context = SignalUserContext {

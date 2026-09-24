@@ -241,7 +241,12 @@ impl Syscall<'_> {
         commit_and_report_old(old, &mut oldact, || {
             if let Some(act) = act.read_if_not_null()? {
                 info!("new action: {:?} -> {:x?}", signal, act);
-                proc.set_signal_action(signal, act);
+                // `SignalAction::stored` is the fifth door into "which signals
+                // may be blocked", and the only one that was not shut: a
+                // `sa_mask` becomes the thread's blocked set on every delivery
+                // of this signal, so an unfiltered one holds off SIGKILL for as
+                // long as the handler runs.
+                proc.set_signal_action(signal, act.stored());
             }
             Ok(())
         })?;

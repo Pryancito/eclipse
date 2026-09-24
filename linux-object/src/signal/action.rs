@@ -86,6 +86,51 @@ pub struct SignalAction {
     pub mask: Sigset,
 }
 
+impl SignalAction {
+    /// What `do_sigaction` actually stores, which is not quite what userspace
+    /// handed over: `sa_mask` loses the two signals nothing may block.
+    ///
+    /// This is the FIFTH door into that rule -- [`Sigset::blockable`] names
+    /// the other four -- and the one with the longest reach, because a
+    /// `sa_mask` is not a mask for one call: it becomes the thread's blocked
+    /// set every single time the handler runs. It is also read back:
+    /// `sigaction(sig, NULL, &old)` is how a program learns what it actually
+    /// got, so the filtering has to happen on the way IN, not on each use.
+    pub fn stored(mut self) -> Self {
+        self.mask = self.mask.blockable();
+        self
+    }
+
+    /// The set of signals blocked while this action's handler runs
+    /// (`signal_delivered`, `kernel/signal.c`): what the thread already had
+    /// blocked, plus the `sa_mask` the action asked for, plus the signal
+    /// itself unless `SA_NODEFER` said not to.
+    ///
+    /// `sa_mask` is the whole reason a handler can touch data the signal also
+    /// touches: it names the signals that must be held off for the duration.
+    /// It arrived from userspace, was stored, and was read by nobody.
+    pub fn handler_mask(&self, blocked: Sigset, signal: Signal) -> Sigset {
+        let mut out = blocked;
+        out.insert_set(&self.mask);
+        if !self.flags.contains(SignalActionFlags::NODEFER) {
+            out.insert(signal);
+        }
+        out.blockable()
+    }
+
+    /// Whether arranging this delivery puts the disposition back to `SIG_DFL`
+    /// first.
+    ///
+    /// `SA_RESETHAND` (`SA_ONESHOT`) is how a one-shot handler is asked for,
+    /// and the reset happens BEFORE the handler runs, not after it returns --
+    /// so a handler that wants to stay installed re-installs itself, and one
+    /// that does not is gone by the time a second signal arrives. Unread, the
+    /// handler stayed installed for good.
+    pub fn resets_to_default(&self) -> bool {
+        self.flags.contains(SignalActionFlags::RESETHAND)
+    }
+}
+
 #[repr(C)]
 #[derive(Copy, Clone, Eq, PartialEq)]
 pub struct SiginfoFields {
@@ -444,5 +489,162 @@ mod sigset_tests {
             u64::MAX,
             "the 64 signals fill the word exactly"
         );
+    }
+}
+
+#[cfg(test)]
+mod sigaction_tests {
+    //! What `sigaction(2)` stores, and what a handler runs under.
+    //!
+    //! `sa_mask` and the `SA_*` flags come straight from userspace and decide
+    //! control flow: which signals a handler can be interrupted by, and
+    //! whether it is still installed when the next one arrives. Every one of
+    //! them was stored and read by nobody.
+
+    use super::*;
+    use crate::signal::Signal;
+
+    fn act(flags: SignalActionFlags, mask: Sigset) -> SignalAction {
+        SignalAction {
+            handler: 0x1000,
+            flags,
+            restorer: 0x2000,
+            mask,
+        }
+    }
+
+    fn set(sigs: &[Signal]) -> Sigset {
+        let mut s = Sigset::empty();
+        for sig in sigs {
+            s.insert(*sig);
+        }
+        s
+    }
+
+    /// The numbers are UABI: userspace ORs them into `sa_flags` itself, and a
+    /// constant with the wrong value here is not a compile error anywhere --
+    /// it is a flag that quietly means another one.
+    #[test]
+    fn the_action_flags_carry_the_numbers_userspace_sends() {
+        for (flag, value) in [
+            (SignalActionFlags::NOCLDSTOP, 0x0000_0001),
+            (SignalActionFlags::NOCLDWAIT, 0x0000_0002),
+            (SignalActionFlags::SIGINFO, 0x0000_0004),
+            (SignalActionFlags::RESTORER, 0x0400_0000),
+            (SignalActionFlags::ONSTACK, 0x0800_0000),
+            (SignalActionFlags::RESTART, 0x1000_0000),
+            (SignalActionFlags::NODEFER, 0x4000_0000),
+            (SignalActionFlags::RESETHAND, 0x8000_0000),
+        ] {
+            assert_eq!(flag.bits(), value, "{flag:?}");
+        }
+    }
+
+    /// The fifth door into [`Sigset::blockable`]. A `sa_mask` is not a mask
+    /// for one call: it becomes a thread's blocked set on every delivery, so
+    /// an unfiltered one holds off SIGKILL for as long as the handler runs.
+    #[test]
+    fn a_stored_sa_mask_cannot_hold_the_two_unblockable_signals() {
+        let asked = set(&[Signal::SIGKILL, Signal::SIGSTOP, Signal::SIGTERM]);
+        let stored = act(SignalActionFlags::empty(), asked).stored();
+        assert!(!stored.mask.contains(Signal::SIGKILL));
+        assert!(!stored.mask.contains(Signal::SIGSTOP));
+        // And nothing else is lost on the way in.
+        assert!(stored.mask.contains(Signal::SIGTERM));
+    }
+
+    /// Storing changes the mask and nothing else about the action.
+    #[test]
+    fn storing_an_action_leaves_the_rest_of_it_alone() {
+        let a = act(SignalActionFlags::SIGINFO, set(&[Signal::SIGUSR1]));
+        let stored = a.stored();
+        assert_eq!(stored.handler, a.handler);
+        assert_eq!(stored.restorer, a.restorer);
+        assert_eq!(stored.flags, a.flags);
+        assert_eq!(stored.mask.val(), a.mask.val());
+    }
+
+    #[test]
+    fn a_handler_runs_with_what_was_blocked_plus_what_it_asked_for() {
+        let blocked = set(&[Signal::SIGHUP]);
+        let a = act(SignalActionFlags::empty(), set(&[Signal::SIGTERM]));
+        let during = a.handler_mask(blocked, Signal::SIGALRM);
+        // What was already blocked stays blocked.
+        assert!(during.contains(Signal::SIGHUP));
+        // What the action asked for is added.
+        assert!(during.contains(Signal::SIGTERM));
+        // And nothing else is.
+        assert!(!during.contains(Signal::SIGUSR1));
+    }
+
+    /// The default is that a signal does not interrupt its own handler; that
+    /// is exactly what `SA_NODEFER` turns off.
+    #[test]
+    fn a_handler_blocks_its_own_signal_unless_nodefer_says_otherwise() {
+        let plain = act(SignalActionFlags::empty(), Sigset::empty());
+        assert!(plain
+            .handler_mask(Sigset::empty(), Signal::SIGALRM)
+            .contains(Signal::SIGALRM));
+
+        let nodefer = act(SignalActionFlags::NODEFER, Sigset::empty());
+        assert!(!nodefer
+            .handler_mask(Sigset::empty(), Signal::SIGALRM)
+            .contains(Signal::SIGALRM));
+    }
+
+    /// `SA_NODEFER` unblocks only the signal being delivered; it does not
+    /// throw away `sa_mask` or what was already blocked.
+    #[test]
+    fn nodefer_drops_one_signal_and_not_the_rest_of_the_set() {
+        let a = act(SignalActionFlags::NODEFER, set(&[Signal::SIGTERM]));
+        let during = a.handler_mask(set(&[Signal::SIGHUP]), Signal::SIGALRM);
+        assert!(during.contains(Signal::SIGHUP));
+        assert!(during.contains(Signal::SIGTERM));
+        assert!(!during.contains(Signal::SIGALRM));
+    }
+
+    /// Belt and braces: even reached with a mask that was never stored, the
+    /// set a handler runs under is still one a thread may hold.
+    #[test]
+    fn the_mask_a_handler_runs_under_is_still_one_a_thread_may_hold() {
+        let a = act(
+            SignalActionFlags::empty(),
+            set(&[Signal::SIGKILL, Signal::SIGSTOP]),
+        );
+        let during = a.handler_mask(Sigset::empty(), Signal::SIGSTOP);
+        assert!(!during.contains(Signal::SIGKILL));
+        assert!(!during.contains(Signal::SIGSTOP));
+    }
+
+    #[test]
+    fn resethand_is_the_flag_that_makes_a_handler_one_shot() {
+        assert!(act(SignalActionFlags::RESETHAND, Sigset::empty()).resets_to_default());
+        // And it is that one flag, not any of the others.
+        for flags in [
+            SignalActionFlags::empty(),
+            SignalActionFlags::NODEFER,
+            SignalActionFlags::RESTART,
+            SignalActionFlags::SIGINFO | SignalActionFlags::ONSTACK,
+        ] {
+            assert!(
+                !act(flags, Sigset::empty()).resets_to_default(),
+                "{:?}",
+                flags
+            );
+        }
+    }
+
+    /// The two flags are independent: a one-shot handler may also ask not to
+    /// have its own signal blocked.
+    #[test]
+    fn a_one_shot_handler_may_also_ask_for_nodefer() {
+        let a = act(
+            SignalActionFlags::RESETHAND | SignalActionFlags::NODEFER,
+            Sigset::empty(),
+        );
+        assert!(a.resets_to_default());
+        assert!(!a
+            .handler_mask(Sigset::empty(), Signal::SIGSEGV)
+            .contains(Signal::SIGSEGV));
     }
 }
