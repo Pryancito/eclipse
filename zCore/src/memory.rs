@@ -164,12 +164,14 @@ fn frame_alias_check(_vaddr: usize, _size: usize) {}
 /// [`frame_alias_check`], on the buddy arena's other consumer — the one that
 /// zeroing allocations reach without ever touching `frame_alloc`.
 ///
-/// Uses `alloc_overlaps_live_stack` (not `overlapping_live_stack`): it is the
-/// helper purpose-built for the hand-out hook, and it excludes the one benign
-/// case this path uniquely hits — `Executor::new` re-allocating its OWN stack
-/// slot (an exact `alloc_base`, `len >= ALLOC_SIZE`) before the registry insert
-/// that follows the allocation. Coroutine stacks are allocated through this very
-/// `GlobalAlloc`, so without that exclusion a fresh stack could flag itself.
+/// Uses `alloc_overlaps_live_stack` (not `overlapping_live_stack`) because
+/// that is the helper reading `STACK_REG_BASE`, the registry kept for this
+/// hook. It carries no exemption for a fresh stack flagging itself, and needs
+/// none: coroutine stacks are allocated through this very `GlobalAlloc`, so
+/// this check runs *as part of* that allocation and the registry inserts
+/// happen on the line after it returns. This comment used to claim such an
+/// exemption existed; it never did, and a promised exemption in front of a
+/// `panic!` is worse than no comment at all.
 /// A no-op on libos, where scheduler stacks are not carved out of this heap.
 #[cfg(not(feature = "libos"))]
 fn heap_alias_check(vaddr: usize, size: usize) {

@@ -26,6 +26,15 @@ impl AtomicU64SC {
         self.0.fetch_and(val, Ordering::SeqCst);
     }
 
+    /// `fetch_and`, but handing back what was there. The plain one above
+    /// throws the previous value away, and taking a masked set of bits *out*
+    /// of a lane means knowing which of them were actually set.
+    #[inline(always)]
+    #[allow(unused)]
+    pub fn fetch_and_prev(&self, val: u64) -> u64 {
+        self.0.fetch_and(val, Ordering::SeqCst)
+    }
+
     #[inline(always)]
     #[allow(unused)]
     pub fn fetch_add(&self, val: u64) -> u64 {
@@ -184,6 +193,79 @@ impl WakerPage {
     /// across the collection (see the generator's two-pass scan).
     pub fn take_yielded(&self) -> u64 {
         let raw = self.yielded.swap(0);
+        let dropped = self.dropped.load();
+        let borrowed = self.borrowed.load();
+        let deferred = raw & borrowed & !dropped;
+        if deferred != 0 {
+            self.yielded.fetch_or(deferred);
+        }
+        raw & !dropped & !borrowed
+    }
+
+    /// Put back wakes this CPU has taken out of the lane but not handed to an
+    /// executor yet.
+    ///
+    /// [`take_notified`] empties the whole lane in one swap, and the generator
+    /// hands out one task per resume — so between the two, every wake it took
+    /// and has not yet yielded lives only in a local of a suspended coroutine.
+    /// The page, which is what `ready_num`, `placement_load`, `has_ready` and
+    /// `debug_pending` all read, says there is nothing there. A CPU with a
+    /// backlog therefore reported **zero** runnable tasks to every thief, for
+    /// as long as it was polling the one task it handed out, and advertised
+    /// itself to spawn placement as the emptiest CPU on the machine. Both
+    /// answers are the exact opposite of the truth, and they are the two
+    /// decisions those figures exist to make.
+    ///
+    /// So park them where everyone can see them, and take them back with
+    /// [`reclaim_notified`] on the way in.
+    ///
+    /// [`take_notified`]: Self::take_notified
+    /// [`reclaim_notified`]: Self::reclaim_notified
+    pub fn park_notified(&self, mask: u64) {
+        if mask != 0 {
+            self.notified.fetch_or(mask);
+        }
+    }
+
+    /// The voluntary-yield twin of [`park_notified`](Self::park_notified).
+    pub fn park_yielded(&self, mask: u64) {
+        if mask != 0 {
+            self.yielded.fetch_or(mask);
+        }
+    }
+
+    /// Take back exactly the wakes [`park_notified`] parked, leaving anything
+    /// that arrived meanwhile in the lane for the next pass.
+    ///
+    /// Masked rather than a second `take_notified`, so parking and reclaiming
+    /// do not change the order tasks come out in: the generator gets back the
+    /// snapshot it was working through and nothing else. It applies the same
+    /// rule [`take_notified`] does to what it takes — a slot that was dropped
+    /// while we were away is gone, and one that was borrowed stays published
+    /// so the wake survives the poll in flight.
+    ///
+    /// [`park_notified`]: Self::park_notified
+    /// [`take_notified`]: Self::take_notified
+    pub fn reclaim_notified(&self, mask: u64) -> u64 {
+        if mask == 0 {
+            return 0;
+        }
+        let raw = self.notified.fetch_and_prev(!mask) & mask;
+        let dropped = self.dropped.load();
+        let borrowed = self.borrowed.load();
+        let deferred = raw & borrowed & !dropped;
+        if deferred != 0 {
+            self.notified.fetch_or(deferred);
+        }
+        raw & !dropped & !borrowed
+    }
+
+    /// The voluntary-yield twin of [`reclaim_notified`](Self::reclaim_notified).
+    pub fn reclaim_yielded(&self, mask: u64) -> u64 {
+        if mask == 0 {
+            return 0;
+        }
+        let raw = self.yielded.fetch_and_prev(!mask) & mask;
         let dropped = self.dropped.load();
         let borrowed = self.borrowed.load();
         let deferred = raw & borrowed & !dropped;
@@ -661,6 +743,77 @@ mod waker_page_tests {
         w.wake_by_ref();
         assert_eq!(p.take_notified(), 0);
         assert_eq!(p.take_yielded(), 0);
+    }
+
+    // ── parking a snapshot the generator is still working through ─────────
+
+    #[test]
+    fn parking_a_wake_puts_it_back_where_everyone_can_read_it() {
+        let p = page();
+        for i in [3, 9, 40] {
+            p.initialize(i);
+        }
+        let taken = p.take_notified();
+        assert_eq!(taken, (1 << 3) | (1 << 9) | (1 << 40));
+        // The generator hands out the lowest and keeps the rest in a local of
+        // a coroutine nobody else can read. Everything that answers "is there
+        // work on this CPU" reads the page, so the rest has to go back there.
+        p.mark_borrowed(3, true);
+        assert!(
+            !p.has_notified(),
+            "the backlog was still visible by accident"
+        );
+        p.park_notified(taken & !(1 << 3));
+        assert!(p.has_notified());
+        assert_eq!(p.peek().0, (1 << 9) | (1 << 40));
+    }
+
+    #[test]
+    fn reclaiming_takes_back_only_what_was_parked() {
+        let p = page();
+        let parked = (1 << 9) | (1 << 40);
+        p.park_notified(parked);
+        // A wake published by another CPU while we were away belongs to the
+        // next pass, not to the snapshot we are working through: reclaiming
+        // the whole lane would take it out of the page on a decision that
+        // predates it.
+        p.notify(12);
+        assert_eq!(p.reclaim_notified(parked), parked);
+        assert_eq!(p.peek().0, 1 << 12, "a newer wake was swallowed");
+    }
+
+    #[test]
+    fn a_slot_retired_while_its_wake_was_parked_does_not_come_back() {
+        let p = page();
+        let parked = (1 << 9) | (1 << 40);
+        p.park_notified(parked);
+        p.mark_dropped(40);
+        // Same rule `take_notified` applies: a completed future is never
+        // handed to an executor, whichever lane its wake was sitting in.
+        assert_eq!(p.reclaim_notified(parked), 1 << 9);
+        assert_eq!(p.peek().0, 0);
+    }
+
+    #[test]
+    fn a_slot_borrowed_while_its_wake_was_parked_keeps_it_published() {
+        let p = page();
+        let parked = (1 << 9) | (1 << 40);
+        p.park_yielded(parked);
+        // Another CPU stole it and is polling it. The wake is deferred, not
+        // dropped — discarding it here left the task asleep forever.
+        p.mark_borrowed(40, true);
+        assert_eq!(p.reclaim_yielded(parked), 1 << 9);
+        assert_eq!(p.peek().0, 1 << 40, "the deferred wake was thrown away");
+    }
+
+    #[test]
+    fn parking_nothing_is_not_a_wake() {
+        let p = page();
+        p.park_notified(0);
+        p.park_yielded(0);
+        assert_eq!(p.peek(), (0, 0, 0));
+        assert_eq!(p.reclaim_notified(0), 0);
+        assert_eq!(p.reclaim_yielded(0), 0);
     }
 
     // ── handing a task back: the wake that was deferred while it ran ───────
