@@ -161,7 +161,7 @@ pub mod sys {
 ///
 /// FreeBSD and Linux agree through 34 (`ERANGE`) and diverge after it, so a
 /// Linux `errno` cannot be handed back to a FreeBSD binary unchanged — see
-/// [`super::errno::linux_to_freebsd`].
+/// [`super::errno::lx_to_freebsd`].
 pub mod errno {
     pub const EPERM: i32 = 1;
     pub const ENOENT: i32 = 2;
@@ -236,6 +236,9 @@ pub mod errno {
     pub const EBADMSG: i32 = 89;
     pub const ENOTRECOVERABLE: i32 = 95;
     pub const EOWNERDEAD: i32 = 96;
+    /// Largest `errno` FreeBSD defines. Anything above it is not an error
+    /// number on that system, whatever it means on this one.
+    pub const ELAST: i32 = 97;
 }
 
 /// FreeBSD `open(2)` / `fcntl(2)` flags (`sys/sys/fcntl.h`).
@@ -246,6 +249,8 @@ pub mod oflags {
     pub const O_ACCMODE: i32 = 0x0003;
     pub const O_NONBLOCK: i32 = 0x0004;
     pub const O_APPEND: i32 = 0x0008;
+    pub const O_SHLOCK: i32 = 0x0010;
+    pub const O_EXLOCK: i32 = 0x0020;
     pub const O_ASYNC: i32 = 0x0040;
     pub const O_FSYNC: i32 = 0x0080;
     pub const O_NOFOLLOW: i32 = 0x0100;
@@ -256,9 +261,15 @@ pub mod oflags {
     pub const O_DIRECT: i32 = 0x0001_0000;
     pub const O_DIRECTORY: i32 = 0x0002_0000;
     pub const O_EXEC: i32 = 0x0004_0000;
+    pub const O_TTY_INIT: i32 = 0x0008_0000;
     pub const O_CLOEXEC: i32 = 0x0010_0000;
+    pub const O_VERIFY: i32 = 0x0020_0000;
     pub const O_PATH: i32 = 0x0040_0000;
+    pub const O_RESOLVE_BENEATH: i32 = 0x0080_0000;
     pub const O_DSYNC: i32 = 0x0100_0000;
+    pub const O_EMPTY_PATH: i32 = 0x0200_0000;
+    pub const O_NAMEDATTR: i32 = 0x0400_0000;
+    pub const O_CLOFORK: i32 = 0x0800_0000;
 
     /// `AT_FDCWD` for the `*at` syscalls (`sys/sys/fcntl.h`). FreeBSD's value is
     /// `-100`, the same as Linux's, but it is spelled out here so the
@@ -287,7 +298,12 @@ pub mod lin_oflags {
     pub const O_APPEND: i32 = 0o2000;
     pub const O_NONBLOCK: i32 = 0o4000;
     pub const O_DSYNC: i32 = 0o10000;
+    pub const O_ASYNC: i32 = 0o20000;
     pub const O_DIRECT: i32 = 0o40000;
+    /// `__O_SYNC | O_DSYNC`, both bits together, as upstream defines it. A
+    /// program that opens with FreeBSD's `O_FSYNC` and gets only `O_DSYNC`
+    /// here would have its metadata written back lazily after all.
+    pub const O_SYNC: i32 = 0o4010000;
     pub const O_DIRECTORY: i32 = 0o200000;
     pub const O_NOFOLLOW: i32 = 0o400000;
     pub const O_CLOEXEC: i32 = 0o2000000;
@@ -307,6 +323,7 @@ pub mod mman {
     pub const MAP_SHARED: i32 = 0x0001;
     pub const MAP_PRIVATE: i32 = 0x0002;
     pub const MAP_FIXED: i32 = 0x0010;
+    pub const MAP_HASSEMAPHORE: i32 = 0x0200;
     pub const MAP_STACK: i32 = 0x0400;
     pub const MAP_NOSYNC: i32 = 0x0800;
     pub const MAP_ANON: i32 = 0x1000;
@@ -315,6 +332,12 @@ pub mod mman {
     pub const MAP_NOCORE: i32 = 0x0002_0000;
     pub const MAP_PREFAULT_READ: i32 = 0x0004_0000;
     pub const MAP_32BIT: i32 = 0x0008_0000;
+    /// `MAP_ALIGNED(n)` packs a requested alignment into the top eight bits.
+    /// A request, not a hint: a program that asks for a 2 MiB-aligned mapping
+    /// and is handed one aligned to 4 KiB has been told yes to a question it
+    /// did not ask.
+    pub const MAP_ALIGNMENT_SHIFT: i32 = 24;
+    pub const MAP_ALIGNMENT_MASK: i32 = 0xff << MAP_ALIGNMENT_SHIFT;
 }
 
 /// Linux `mmap(2)` flags (`include/uapi/asm-generic/mman-common.h`).
@@ -325,6 +348,9 @@ pub mod lin_mman {
     pub const MAP_ANONYMOUS: i32 = 0x20;
     pub const MAP_STACK: i32 = 0x2_0000;
     pub const MAP_NORESERVE: i32 = 0x4000;
+    /// The peer of FreeBSD's `MAP_FIXED|MAP_EXCL`: this address or `EEXIST`,
+    /// never replacing what is already mapped there.
+    pub const MAP_FIXED_NOREPLACE: i32 = 0x10_0000;
 }
 
 /// `sysctl(2)` top-level identifiers and the `kern.*` / `hw.*` leaves this

@@ -79,6 +79,10 @@ impl BsdRet {
             Err(e) => BsdRet::err(errno::lx_to_freebsd(e)),
         }
     }
+    /// A flag word this layer refused to translate, as a FreeBSD error.
+    fn from_lx(e: LxError) -> Self {
+        BsdRet::err(errno::lx_to_freebsd(e))
+    }
 }
 
 /// Translate a FreeBSD `clockid_t` to the Linux one `sys_clock_*` expects.
@@ -131,14 +135,16 @@ impl Syscall<'_> {
                 BsdRet::from_result(self.sys_pread(a0.into(), a1.into(), a2, a3 as _).await)
             }
             sys::PWRITE => BsdRet::from_result(self.sys_pwrite(a0.into(), a1.into(), a2, a3 as _)),
-            sys::OPEN => {
-                let flags = translate::open_flags_to_linux(a1 as i32) as usize;
-                BsdRet::from_result(self.sys_openat(FileDesc::CWD, a0.into(), flags, a2))
-            }
-            sys::OPENAT => {
-                let flags = translate::open_flags_to_linux(a2 as i32) as usize;
-                BsdRet::from_result(self.sys_openat(a0.into(), a1.into(), flags, a3))
-            }
+            sys::OPEN => match translate::open_flags_to_linux(a1 as i32) {
+                Err(e) => BsdRet::from_lx(e),
+                Ok(f) => {
+                    BsdRet::from_result(self.sys_openat(FileDesc::CWD, a0.into(), f as usize, a2))
+                }
+            },
+            sys::OPENAT => match translate::open_flags_to_linux(a2 as i32) {
+                Err(e) => BsdRet::from_lx(e),
+                Ok(f) => BsdRet::from_result(self.sys_openat(a0.into(), a1.into(), f as usize, a3)),
+            },
             sys::CLOSE => BsdRet::from_result(self.sys_close(a0.into())),
             sys::CLOSE_RANGE => BsdRet::from_result(self.sys_close_range(a0, a1, a2)),
             sys::LSEEK => BsdRet::from_result(self.sys_lseek(a0.into(), a1 as i64, a2)),
@@ -157,34 +163,38 @@ impl Syscall<'_> {
             sys::FCHOWN => BsdRet::from_result(self.sys_fchown(a0.into(), a1, a2)),
             sys::CHMOD => BsdRet::from_result(self.sys_chmod(a0.into(), a1)),
             sys::ACCESS => BsdRet::from_result(self.sys_access(a0.into(), a1)),
-            sys::FACCESSAT => {
-                let flags = translate::at_flags_to_linux(a3 as i32) as usize;
-                BsdRet::from_result(self.sys_faccessat(a0.into(), a1.into(), a2, flags))
-            }
+            sys::FACCESSAT => match translate::at_flags_to_linux(a3 as i32) {
+                Err(e) => BsdRet::from_lx(e),
+                Ok(f) => {
+                    BsdRet::from_result(self.sys_faccessat(a0.into(), a1.into(), a2, f as usize))
+                }
+            },
             sys::FCHMODAT => BsdRet::from_result(self.sys_fchmodat(a0.into(), a1.into(), a2, a3)),
-            sys::FCHOWNAT => {
-                let flags = translate::at_flags_to_linux(a4 as i32) as usize;
-                BsdRet::from_result(self.sys_fchownat(a0.into(), a1.into(), a2, a3, flags))
-            }
+            sys::FCHOWNAT => match translate::at_flags_to_linux(a4 as i32) {
+                Err(e) => BsdRet::from_lx(e),
+                Ok(f) => {
+                    BsdRet::from_result(self.sys_fchownat(a0.into(), a1.into(), a2, a3, f as usize))
+                }
+            },
             sys::MKDIR => BsdRet::from_result(self.sys_mkdir(a0.into(), a1)),
             sys::MKDIRAT => BsdRet::from_result(self.sys_mkdirat(a0.into(), a1.into(), a2)),
             sys::RMDIR => BsdRet::from_result(self.sys_rmdir(a0.into())),
             sys::LINK => BsdRet::from_result(self.sys_link(a0.into(), a1.into())),
-            sys::LINKAT => {
-                let flags = translate::at_flags_to_linux(a4 as i32) as usize;
-                BsdRet::from_result(self.sys_linkat(
+            sys::LINKAT => match translate::at_flags_to_linux(a4 as i32) {
+                Err(e) => BsdRet::from_lx(e),
+                Ok(f) => BsdRet::from_result(self.sys_linkat(
                     a0.into(),
                     a1.into(),
                     a2.into(),
                     a3.into(),
-                    flags,
-                ))
-            }
+                    f as usize,
+                )),
+            },
             sys::UNLINK => BsdRet::from_result(self.sys_unlink(a0.into())),
-            sys::UNLINKAT => {
-                let flags = translate::at_flags_to_linux(a2 as i32) as usize;
-                BsdRet::from_result(self.sys_unlinkat(a0.into(), a1.into(), flags))
-            }
+            sys::UNLINKAT => match translate::at_flags_to_linux(a2 as i32) {
+                Err(e) => BsdRet::from_lx(e),
+                Ok(f) => BsdRet::from_result(self.sys_unlinkat(a0.into(), a1.into(), f as usize)),
+            },
             sys::RENAME => BsdRet::from_result(self.sys_rename(a0.into(), a1.into())),
             sys::RENAMEAT => {
                 BsdRet::from_result(self.sys_renameat(a0.into(), a1.into(), a2.into(), a3.into()))
@@ -200,17 +210,20 @@ impl Syscall<'_> {
 
             // ---- FreeBSD-specific struct layouts ----------------------------
             sys::FSTAT => self.bsd_fstat(a0.into(), a1.into()),
-            sys::FSTATAT => {
-                let flags = translate::at_flags_to_linux(a3 as i32) as usize;
-                self.bsd_fstatat(a0.into(), a1.into(), a2.into(), flags)
-            }
+            sys::FSTATAT => match translate::at_flags_to_linux(a3 as i32) {
+                Err(e) => BsdRet::from_lx(e),
+                Ok(f) => self.bsd_fstatat(a0.into(), a1.into(), a2.into(), f as usize),
+            },
             sys::GETDIRENTRIES => self.bsd_getdirentries(a0.into(), a1.into(), a2, a3.into()),
 
             // ---- memory -----------------------------------------------------
-            sys::MMAP => {
-                let flags = translate::mmap_flags_to_linux(a3 as i32) as usize;
-                BsdRet::from_result(self.sys_mmap(a0, a1, a2, flags, a4.into(), a5 as u64).await)
-            }
+            sys::MMAP => match translate::mmap_flags_to_linux(a3 as i32) {
+                Err(e) => BsdRet::from_lx(e),
+                Ok(f) => BsdRet::from_result(
+                    self.sys_mmap(a0, a1, a2, f as usize, a4.into(), a5 as u64)
+                        .await,
+                ),
+            },
             sys::MUNMAP => BsdRet::from_result(self.sys_munmap(a0, a1)),
             sys::MPROTECT => BsdRet::from_result(self.sys_mprotect(a0, a1, a2)),
             sys::MADVISE => BsdRet::from_result(self.sys_madvise(a0, a1, a2)),
