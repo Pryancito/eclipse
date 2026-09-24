@@ -15,6 +15,7 @@ use alloc::sync::Arc;
 use core::any::Any;
 use core::sync::atomic::{AtomicU32, Ordering};
 
+use crate::common::cpu_topology::{percpu_slot, PERCPU_SLOTS};
 use crate::config::MAX_CORE_NUM;
 use crate::utils::PerCpuCell;
 
@@ -121,7 +122,13 @@ pub fn end_timer_callback() {
 ///
 /// Used both as cross-CPU storage and as the fallback for [`current`] before the
 /// per-CPU register fast-path is established.
-static PERCPU: [PercpuBlock; MAX_CORE_NUM] = [const { PercpuBlock::new() }; MAX_CORE_NUM];
+///
+/// One slot longer than there are CPUs: the last one is the quarantine
+/// ([`percpu_slot`]), where a CPU whose id resolved to nothing lands. It used
+/// to land on slot 0, which is the boot CPU's — and this block holds
+/// `current_thread`, so that made two CPUs believe they were running the same
+/// thread, each writing the other's quantum and timer state.
+static PERCPU: [PercpuBlock; PERCPU_SLOTS] = [const { PercpuBlock::new() }; PERCPU_SLOTS];
 
 /// Architecture fast-path: pointer to the current CPU's block, or null if not
 /// yet established on this CPU / arch.
@@ -153,9 +160,10 @@ pub fn current() -> &'static PercpuBlock {
     let ptr = arch_percpu_ptr();
     if ptr.is_null() {
         // Fallback before the register fast-path is set (or on arches without
-        // one). `cpu_id()` is the dense logical id; bound-check defensively.
-        let id = crate::cpu::cpu_id() as usize;
-        PERCPU.get(id).unwrap_or(&PERCPU[0])
+        // one). `cpu_id()` is the dense logical id, and it can now say "this
+        // CPU has none" (`lock`'s `NO_CPU`) instead of quietly saying 0 —
+        // which is why the table has a slot that belongs to nobody.
+        &PERCPU[percpu_slot(crate::cpu::cpu_id() as usize)]
     } else {
         unsafe { &*ptr }
     }
@@ -173,12 +181,24 @@ pub fn register() {
         crate::cpu::register_logical_id();
     }
     let id = crate::cpu::cpu_id() as usize;
-    if let Some(block) = PERCPU.get(id) {
-        block.cpu_id.store(id as u32, Ordering::Relaxed);
-        #[cfg(target_arch = "x86_64")]
-        unsafe {
-            trapframe::write_logical_cpu_id(id as u8);
-        }
-        set_arch_percpu_ptr(block);
+    if id >= MAX_CORE_NUM {
+        // This CPU has no logical id, so it has no block: registering it would
+        // mean binding it to the quarantine slot and letting it run as if it
+        // had one. Say so instead. It cannot take a kernel lock either — the
+        // `lock` crate refuses the same id by name — so this is a report, not
+        // a recovery.
+        crate::klog_warn!(
+            "[smp] a CPU reached percpu::register with no logical id ({}) \
+             — it must not run kernel code",
+            id
+        );
+        return;
     }
+    let block = &PERCPU[id];
+    block.cpu_id.store(id as u32, Ordering::Relaxed);
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        trapframe::write_logical_cpu_id(id as u8);
+    }
+    set_arch_percpu_ptr(block);
 }
