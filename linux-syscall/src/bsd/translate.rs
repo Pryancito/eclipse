@@ -92,11 +92,11 @@ const OPEN_MAP: &[(i32, i32)] = &[
 const OPEN_IGNORED: i32 = oflags::O_TTY_INIT;
 
 /// `open(2)` flags that promise something this kernel cannot deliver.
-const OPEN_REFUSED: i32 = 0
+const OPEN_REFUSED: i32 =
     // A lock taken by the open itself. Linux has no open flag for it, and a
     // program that asked for one and did not get it goes on to write over
     // another writer without ever finding out.
-    | oflags::O_SHLOCK
+    oflags::O_SHLOCK
     | oflags::O_EXLOCK
     // "Open for execute only": the descriptor may be handed to `fexecve` and
     // to nothing else. Dropping it asks for a readable descriptor to a file
@@ -190,11 +190,11 @@ const MMAP_MAP: &[(i32, i32)] = &[
 ];
 
 /// `mmap(2)` flags whose absence a program cannot see.
-const MMAP_IGNORED: i32 = 0
+const MMAP_IGNORED: i32 =
     // "This region may contain semaphores." A hint left from a time when it
     // decided which pages could be wired; FreeBSD does nothing with it on any
     // architecture it still supports.
-    | mman::MAP_HASSEMAPHORE
+    mman::MAP_HASSEMAPHORE
     // "Page to the file but do not sync it." It changes when dirty pages
     // reach the backing store, not what any program reads back.
     | mman::MAP_NOSYNC
@@ -205,12 +205,12 @@ const MMAP_IGNORED: i32 = 0
     | mman::MAP_PREFAULT_READ;
 
 /// `mmap(2)` flags that promise something this kernel cannot deliver.
-const MMAP_REFUSED: i32 = 0
+const MMAP_REFUSED: i32 =
     // Reserve the range and fault on every access: a guard. Linux says it
     // with `PROT_NONE`, which is not in this word, so it cannot be answered
     // from here — and a guard page quietly turned into ordinary memory is a
     // stack that runs into the next one instead of faulting.
-    | mman::MAP_GUARD
+    mman::MAP_GUARD
     // "In the low 2 GiB of the address space." The programs that ask are the
     // ones that cannot address more than that. `MmapFlags` does not name it,
     // so the promise cannot be passed on.
