@@ -238,6 +238,12 @@ impl MsgQueue {
         self.inner.lock().ds.perm.may_control(euid)
     }
 
+    /// Whether `euid`/`egid` may use this queue for `want`: `IPC_W` to send,
+    /// `IPC_R` to receive or to `IPC_STAT`. See [`IpcPerm::may_access`].
+    pub fn may_access(&self, euid: u32, egid: u32, want: u32) -> bool {
+        self.inner.lock().ds.perm.may_access(euid, egid, want)
+    }
+
     fn mark_removed(&self) {
         self.inner.lock().removed = true;
     }
@@ -299,9 +305,14 @@ pub fn msg_get(key: u32, flags: usize, uid: u32, gid: u32) -> Result<usize, LxEr
     let flag = IpcGetFlag::from_bits_truncate(flags);
     let mut queues = MSG_QUEUES.write();
     if key != 0 {
-        if let Some((&id, _)) = queues.iter().find(|(_, q)| q.key() == key) {
+        if let Some((&id, q)) = queues.iter().find(|(_, q)| q.key() == key) {
             if flag.contains(IpcGetFlag::CREAT) && flag.contains(IpcGetFlag::EXCLUSIVE) {
                 return Err(LxError::EEXIST);
+            }
+            // The key resolved to somebody else's queue. Asking for a mode it
+            // will not grant is EACCES, not a working id (`ipc_check_perms`).
+            if !q.may_access(uid, gid, IpcPerm::requested_mode(flags)) {
+                return Err(LxError::EACCES);
             }
             return Ok(id);
         }
@@ -410,6 +421,7 @@ mod tests {
 #[cfg(test)]
 mod msg_control_tests {
     use super::*;
+    use crate::ipc::{IPC_R, IPC_W};
 
     extern crate std;
 
@@ -707,5 +719,58 @@ mod msg_control_tests {
         };
         assert_eq!(msg_get(77, 0, OWNER, OWNER), Ok(id));
         clear_queues();
+    }
+
+    // ---------------------------------------------- who may USE the queue
+
+    /// `msgget` resolving an existing key is `ipc_check_perms`: the queue may
+    /// be somebody else's, and asking it for a mode it will not grant is
+    /// EACCES. Nothing asked before, so naming the key was the whole check.
+    #[test]
+    fn msgget_refuses_a_key_that_belongs_to_somebody_else() {
+        let _guard = test_lock();
+        clear_queues();
+        let id = msg_get(9901, CREAT | 0o600, OWNER, OWNER).unwrap();
+        assert_eq!(msg_get(9901, 0o600, OWNER, OWNER), Ok(id), "its owner");
+        assert_eq!(
+            msg_get(9901, 0o600, STRANGER, STRANGER),
+            Err(LxError::EACCES),
+            "a stranger gets EACCES, not the id"
+        );
+        assert_eq!(
+            msg_get(9901, 0o400, STRANGER, STRANGER),
+            Err(LxError::EACCES)
+        );
+        assert_eq!(msg_get(9901, 0, ROOT, ROOT), Ok(id), "root passes");
+        // A bare existence probe asks for no access at all, and Linux grants
+        // it: `msgget(key, 0)` is how a program asks whether a queue is there.
+        assert_eq!(msg_get(9901, 0, STRANGER, STRANGER), Ok(id));
+        clear_queues();
+    }
+
+    /// ...and grants exactly what the mode grants.
+    #[test]
+    fn msgget_grants_a_stranger_what_the_mode_grants() {
+        let _guard = test_lock();
+        clear_queues();
+        let id = msg_get(9902, CREAT | 0o644, OWNER, OWNER).unwrap();
+        assert_eq!(msg_get(9902, 0o400, STRANGER, STRANGER), Ok(id));
+        assert_eq!(
+            msg_get(9902, 0o600, STRANGER, STRANGER),
+            Err(LxError::EACCES),
+            "0644 does not grant a stranger a write"
+        );
+        clear_queues();
+    }
+
+    /// The same question, asked of a queue this time rather than of a bare
+    /// `IpcPerm`: `msgsnd` needs write, `msgrcv` and `IPC_STAT` need read.
+    #[test]
+    fn a_queue_answers_for_itself_who_may_send_and_who_may_receive() {
+        let q = MsgQueue::new(0, 0o640, OWNER, OWNER);
+        assert!(q.may_access(OWNER, OWNER, IPC_R | IPC_W));
+        assert!(q.may_access(STRANGER, OWNER, IPC_R));
+        assert!(!q.may_access(STRANGER, OWNER, IPC_W));
+        assert!(!q.may_access(STRANGER, STRANGER, IPC_R));
     }
 }

@@ -98,6 +98,25 @@ pub(crate) const SYSCALL_IO_MAX: usize = 64 * 1024;
 /// ENOMEM for exactly this case. `try_reserve_exact` fails instead of
 /// aborting, and the `resize` that follows cannot reallocate because the
 /// capacity is already there.
+/// Whether the bytes past what this kernel knows of an extensible struct are
+/// all zero.
+///
+/// This is `copy_struct_from_user`'s rule, and the reason it exists: a caller
+/// that sets a field this kernel has never heard of is asking for a feature
+/// it will not get, so the answer is `E2BIG` and not a silent success.
+///
+/// Four syscalls here take such a struct with a `size` beside it saying which
+/// version of it the caller built, and **none of them looked** past the
+/// fields it knew. `clone3` read the first 64 bytes and dropped the rest, so
+/// a `clone3` asking for `set_tid` (which is how CRIU restores a process onto
+/// its old pid) or for `CLONE_INTO_CGROUP` got a child that was neither and
+/// was told it worked. Each syscall keeps its own bounds check next to itself,
+/// the way Linux does (`copy_clone_args_from_user`, `sched_copy_attr`,
+/// `perf_copy_attr`); this is the part they share.
+pub(crate) fn extensible_tail_is_empty(tail: &[u8]) -> bool {
+    tail.iter().all(|&b| b == 0)
+}
+
 pub(crate) fn try_zeroed_buf(n: usize) -> linux_object::error::LxResult<alloc::vec::Vec<u8>> {
     let mut buf = alloc::vec::Vec::new();
     buf.try_reserve_exact(n).map_err(|_| LxError::ENOMEM)?;

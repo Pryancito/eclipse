@@ -16,6 +16,37 @@ const SHM_RND: usize = 0o20000;
 /// aliasing) are ones this kernel does not build for.
 const SHMLBA: usize = PAGE_SIZE;
 
+/// The access `semctl(2)` needs for `cmd`, or `None` when the command is not
+/// `ipcperms`'s question at all.
+///
+/// `IPC_SET` and `IPC_RMID` are the two that are not: they ask who may
+/// *change* the set, which is `may_control`, and they answer `EPERM`. The
+/// rest split the way Linux splits them -- reading a value or the `semid_ds`
+/// needs read, writing one needs write -- and answer `EACCES`.
+fn semctl_access(cmd: &SemctlCmds) -> Option<u32> {
+    match cmd {
+        SemctlCmds::IPC_STAT
+        | SemctlCmds::GETPID
+        | SemctlCmds::GETVAL
+        | SemctlCmds::GETALL
+        | SemctlCmds::GETNCNT
+        | SemctlCmds::GETZCNT => Some(IPC_R),
+        SemctlCmds::SETVAL | SemctlCmds::SETALL => Some(IPC_W),
+        SemctlCmds::IPC_RMID | SemctlCmds::IPC_SET => None,
+    }
+}
+
+/// The access `shmat(2)` needs: read always, write unless the caller asked
+/// for `SHM_RDONLY` (`do_shmat`: `S_IRUGO | (shmflg & SHM_RDONLY ? 0 :
+/// S_IWUGO)`).
+fn shmat_access(shmflg: usize) -> u32 {
+    if shmflg & SHM_RDONLY != 0 {
+        IPC_R
+    } else {
+        IPC_R | IPC_W
+    }
+}
+
 /// Where `shmat` puts the segment.
 #[derive(Debug, PartialEq, Eq)]
 enum ShmatPlace {
@@ -186,6 +217,14 @@ impl Syscall<'_> {
             .linux_process()
             .semaphores_get(id)
             .ok_or(LxError::EINVAL)?;
+        // An operation that changes a semaphore needs write; one that only
+        // waits for zero needs read (`semop` -> `ipcperms`). Nothing asked
+        // before, so naming the id was the whole check.
+        let alter = ops.iter().any(|op| op.op != 0);
+        let proc = self.linux_process();
+        if !sem_array.may_access(proc.euid(), proc.egid(), if alter { IPC_W } else { IPC_R }) {
+            return Err(LxError::EACCES);
+        }
         sem_array.otime();
         let pid = self.zircon_process().id() as usize;
 
@@ -271,6 +310,12 @@ impl Syscall<'_> {
                 return Err(LxError::EINVAL);
             }
         };
+        if let Some(want) = semctl_access(&cmd) {
+            let proc = self.linux_process();
+            if !sem_array.may_access(proc.euid(), proc.egid(), want) {
+                return Err(LxError::EACCES);
+            }
+        }
         match cmd {
             SemctlCmds::IPC_RMID => {
                 if !sem_array.may_control(self.linux_process().euid()) {
@@ -359,6 +404,10 @@ impl Syscall<'_> {
         }
         let data = UserInPtr::<u8>::from(msgp + core::mem::size_of::<isize>()).read_array(msgsz)?;
         let queue = msg_queue(id).ok_or(LxError::EINVAL)?;
+        let proc = self.linux_process();
+        if !queue.may_access(proc.euid(), proc.egid(), IPC_W) {
+            return Err(LxError::EACCES);
+        }
         let sender = self.zircon_process().id() as u32;
         loop {
             match queue.try_send(mtype, &data, sender) {
@@ -396,6 +445,10 @@ impl Syscall<'_> {
             id, msgp, msgsz, msgtyp, msgflg
         );
         let queue = msg_queue(id).ok_or(LxError::EINVAL)?;
+        let proc = self.linux_process();
+        if !queue.may_access(proc.euid(), proc.egid(), IPC_R) {
+            return Err(LxError::EACCES);
+        }
         let receiver = self.zircon_process().id() as u32;
         let noerror = msgflg & MSG_NOERROR != 0;
         let except = msgflg & MSG_EXCEPT != 0;
@@ -438,6 +491,10 @@ impl Syscall<'_> {
             }
             IPC_STAT => {
                 let queue = msg_queue(id).ok_or(LxError::EINVAL)?;
+                let proc = self.linux_process();
+                if !queue.may_access(proc.euid(), proc.egid(), IPC_R) {
+                    return Err(LxError::EACCES);
+                }
                 UserOutPtr::from(buf).write(queue.stat())?;
                 Ok(0)
             }
@@ -497,6 +554,15 @@ impl Syscall<'_> {
         // have been created by another program and passed here -- which is
         // what the X11 shared-memory extension does with every image.
         let guard = linux_object::ipc::shm_lookup(id).ok_or(LxError::EINVAL)?;
+        {
+            let proc = self.linux_process();
+            if !guard
+                .lock()
+                .may_access(proc.euid(), proc.egid(), shmat_access(shmflg))
+            {
+                return Err(LxError::EACCES);
+            }
+        }
         let mut shm_identifier = self
             .linux_process()
             .shm_get(id)
@@ -613,6 +679,10 @@ impl Syscall<'_> {
                 Ok(0)
             }
             ShmctlCmds::IPC_STAT | ShmctlCmds::SHM_STAT => {
+                let proc = self.linux_process();
+                if !shm_guard.may_access(proc.euid(), proc.egid(), IPC_R) {
+                    return Err(LxError::EACCES);
+                }
                 let shmid_ds = shm_guard.shmid_ds.lock();
                 let mut buffer: UserOutPtr<ShmidDs> = buffer.into();
                 buffer.write(*shmid_ds)?;
@@ -1229,5 +1299,52 @@ mod shmat_place_tests {
         let (flags, place) = shmat_flags_and_place(SHM_RDONLY | SHM_RND, 4 * SHMLBA + 3).unwrap();
         assert!(!flags.contains(MMUFlags::WRITE));
         assert_eq!(place, ShmatPlace::At(4 * SHMLBA));
+    }
+}
+
+#[cfg(test)]
+mod ipc_access_tests {
+    //! Which access each `semctl` command and each `shmat` needs. The two are
+    //! the only places where the answer is not simply "read" or "write": the
+    //! rest of the IPC syscalls each want one fixed bit, so they ask for it
+    //! inline.
+
+    use super::*;
+
+    /// `IPC_SET` and `IPC_RMID` are not `ipcperms`'s question: they ask who
+    /// may *change* the set, which is `may_control`, and they answer `EPERM`.
+    #[test]
+    fn the_two_control_commands_are_not_an_access_question() {
+        assert_eq!(semctl_access(&SemctlCmds::IPC_RMID), None);
+        assert_eq!(semctl_access(&SemctlCmds::IPC_SET), None);
+    }
+
+    /// Reading a value or the `semid_ds` needs read; writing one needs write.
+    #[test]
+    fn semctl_splits_its_commands_into_readers_and_writers() {
+        for cmd in [
+            SemctlCmds::IPC_STAT,
+            SemctlCmds::GETPID,
+            SemctlCmds::GETVAL,
+            SemctlCmds::GETALL,
+            SemctlCmds::GETNCNT,
+            SemctlCmds::GETZCNT,
+        ] {
+            assert_eq!(semctl_access(&cmd), Some(IPC_R), "{cmd:?}");
+        }
+        for cmd in [SemctlCmds::SETVAL, SemctlCmds::SETALL] {
+            assert_eq!(semctl_access(&cmd), Some(IPC_W), "{cmd:?}");
+        }
+    }
+
+    /// `do_shmat`: read always, write unless the caller asked for
+    /// `SHM_RDONLY`. Attaching a read-only segment read-write is EACCES, and
+    /// that is the whole reason the two are not the same request.
+    #[test]
+    fn a_read_only_attach_asks_for_less_than_a_writable_one() {
+        assert_eq!(shmat_access(0), IPC_R | IPC_W);
+        assert_eq!(shmat_access(SHM_RDONLY), IPC_R);
+        assert_eq!(shmat_access(SHM_RDONLY | SHM_RND), IPC_R);
+        assert_eq!(shmat_access(SHM_RND), IPC_R | IPC_W);
     }
 }
