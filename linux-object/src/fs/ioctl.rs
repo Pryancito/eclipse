@@ -118,6 +118,79 @@ pub enum TtySignal {
     Susp,
 }
 
+/// How much input a line discipline may keep waiting for its reader.
+///
+/// Linux reads into a fixed `read_buf[N_TTY_BUF_SIZE]` (`drivers/tty/n_tty.c`)
+/// and works out the room left before every batch. The committed input and the
+/// line still being edited are two indices into that one buffer, so they share
+/// the number.
+///
+/// There are three line disciplines in this tree and they gave three answers:
+/// the console (`fs/stdio.rs`) and the live PTY (`fs/pty.rs`) had no bound at
+/// all, and `fs/devfs/pty.rs` had 16 KiB. It is one question, so it is answered
+/// here.
+pub const N_TTY_BUF_SIZE: usize = 4096;
+
+/// How much output may wait for a terminal to read it.
+///
+/// The other direction, which Linux bounds somewhere else: a write to a PTY
+/// slave lands in the master port's flip buffer, capped at
+/// `TTYB_DEFAULT_MEM_LIMIT` (`drivers/tty/tty_buffer.c`). It is what makes
+/// `yes > /dev/pts/N` with nobody reading block instead of eating the machine.
+pub const TTY_OUTPUT_CAP: usize = 640 * 1024;
+
+/// What a line discipline should do with the next input byte.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InputRoom {
+    /// There is room: store it.
+    Store,
+    /// Full, but everything in the queue is one line still being edited.
+    ///
+    /// The byte is still processed -- VERASE and VKILL *have* to reach the
+    /// discipline, or the terminal wedges at the one moment the user needs to
+    /// shorten the line -- and a data character is dropped instead of stored.
+    /// Linux calls this `overflow` and says why in its own comment: "let
+    /// characters through without limit, so that erase characters will be
+    /// handled".
+    Process,
+    /// Full, with committed input a reader has not taken yet.
+    ///
+    /// A discipline with a writer to answer says so, with a short write. One
+    /// fed by a keyboard has nobody to tell and no way to ask it to wait, so it
+    /// treats this like [`InputRoom::Process`]: everything is still
+    /// interpreted -- a Ctrl-C is how a user rescues the program that stopped
+    /// reading in the first place, so losing it here would be losing it exactly
+    /// when it is needed -- and only the storing stops.
+    Full,
+}
+
+/// Room for one more input byte, given what is already queued.
+///
+/// `committed` is what a reader could take right now and `editing` is the line
+/// being assembled behind it, both in **bytes**: a discipline that keeps its
+/// line as characters has to spell it out first, because the bound Linux uses
+/// is a buffer size and not a keystroke count.
+pub fn input_room(committed: usize, editing: usize, canonical: bool) -> InputRoom {
+    if committed + editing < N_TTY_BUF_SIZE {
+        InputRoom::Store
+    } else if canonical && committed == 0 {
+        InputRoom::Process
+    } else {
+        InputRoom::Full
+    }
+}
+
+/// Whether a discipline with nobody to answer should store one more byte.
+///
+/// [`InputRoom::Process`] and [`InputRoom::Full`] are one thing to a console
+/// or to any other end fed by something that cannot be asked to wait: keep
+/// interpreting, stop storing. Only an end with a writer in front of it can
+/// act on the difference, by handing back a short count. So the others ask
+/// here, rather than passing a `canonical` that cannot change the answer.
+pub fn has_input_room(committed: usize, editing: usize) -> bool {
+    input_room(committed, editing, false) == InputRoom::Store
+}
+
 /// Whether `b` continues a UTF-8 character rather than starting one.
 ///
 /// A rubout moves the cursor one column, and a character several bytes long
@@ -634,6 +707,78 @@ mod termios_tests {
         for b in [3u8, 28, 26] {
             assert_eq!(t.tty_signal(b), None, "{}", b);
         }
+    }
+
+    #[test]
+    fn room_is_measured_across_both_queues() {
+        // Two queues here, one `read_buf` in `n_tty`: `canon_head` and
+        // `read_tail` are indices into it. A budget each would double the
+        // bound, and a discipline that reports `TIOCOUTQ` already adds them.
+        assert_eq!(input_room(0, 0, true), InputRoom::Store);
+        assert_eq!(input_room(N_TTY_BUF_SIZE - 1, 0, false), InputRoom::Store);
+        assert_eq!(input_room(0, N_TTY_BUF_SIZE - 1, true), InputRoom::Store);
+        let half = N_TTY_BUF_SIZE / 2;
+        assert_eq!(input_room(half, half - 1, true), InputRoom::Store);
+        assert_eq!(input_room(half, half, true), InputRoom::Full);
+    }
+
+    #[test]
+    fn a_full_line_with_nothing_behind_it_keeps_being_taken() {
+        // The one case the bound may not refuse. Refusing here refuses VERASE
+        // and VKILL with it, and the terminal wedges at exactly the moment the
+        // user needs to shorten the line.
+        assert_eq!(input_room(0, N_TTY_BUF_SIZE, true), InputRoom::Process);
+        assert_eq!(input_room(0, N_TTY_BUF_SIZE * 2, true), InputRoom::Process);
+    }
+
+    #[test]
+    fn committed_input_nobody_has_read_makes_the_queue_full() {
+        // One byte a reader has not taken and the exception is gone: the line
+        // is no longer all there is, so there is somewhere for the pressure to
+        // go and a writer can be told to wait.
+        assert_eq!(input_room(1, N_TTY_BUF_SIZE - 1, true), InputRoom::Full);
+        assert_eq!(input_room(N_TTY_BUF_SIZE, 0, true), InputRoom::Full);
+    }
+
+    #[test]
+    fn the_shortcut_and_the_rule_answer_alike() {
+        // `has_input_room` is the same question asked by an end that cannot
+        // act on the difference between the two ways of being full. It has to
+        // agree with the rule about the one case it does report.
+        for (committed, editing) in [
+            (0, 0),
+            (1, N_TTY_BUF_SIZE - 2),
+            (0, N_TTY_BUF_SIZE - 1),
+            (0, N_TTY_BUF_SIZE),
+            (N_TTY_BUF_SIZE, 0),
+            (1, N_TTY_BUF_SIZE),
+        ] {
+            for canonical in [false, true] {
+                assert_eq!(
+                    has_input_room(committed, editing),
+                    input_room(committed, editing, canonical) == InputRoom::Store,
+                    "{committed} + {editing}, canonical {canonical}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn raw_mode_never_gets_the_editing_exception() {
+        // There is no line being edited without ICANON, so there is nothing
+        // an extra byte could be needed for.
+        assert_eq!(input_room(0, N_TTY_BUF_SIZE, false), InputRoom::Full);
+        assert_eq!(input_room(N_TTY_BUF_SIZE, 0, false), InputRoom::Full);
+    }
+
+    #[test]
+    fn the_two_bounds_are_the_numbers_linux_uses() {
+        // Not arbitrary and not ours to round off: a program sized against a
+        // Linux terminal -- a shell reading a line, a pager filling a screen --
+        // is sized against these. Three disciplines in this tree used to give
+        // three answers: none, none, and 16 KiB for both directions at once.
+        assert_eq!(N_TTY_BUF_SIZE, 4096); // drivers/tty/n_tty.c
+        assert_eq!(TTY_OUTPUT_CAP, 640 * 1024); // TTYB_DEFAULT_MEM_LIMIT
     }
 
     #[test]

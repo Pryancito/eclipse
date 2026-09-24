@@ -52,7 +52,11 @@ const VEOF: usize = 4;
 // `ISIG`, the signal characters and `VDISABLE` come from `ioctl.rs`, which is
 // where the rule the three line disciplines share now lives.
 
-const PTY_BUF_CAP: usize = 16 * 1024;
+// The bound on each queue, and the rule for a queue that is full, come from
+// `ioctl.rs` too: `N_TTY_BUF_SIZE` in, `TTY_OUTPUT_CAP` out, `input_room` for
+// the answer. This end used to have one number of its own for both directions,
+// 16 KiB, which is four times Linux's on the way in and a fortieth of it on
+// the way out -- and `canon` was not bounded by it at all.
 
 /// Shared state of one PTY pair.
 struct PtyInner {
@@ -102,9 +106,17 @@ impl PtyInner {
     }
 
     fn push_output(&mut self, b: u8) {
-        if self.output.len() < PTY_BUF_CAP {
+        if self.output.len() < TTY_OUTPUT_CAP {
             self.output.push_back(b);
         }
+    }
+
+    /// Room for one more input byte. `input` and `canon` share the bound.
+    ///
+    /// No `canonical` to pass: this end has no writer to hand a short count
+    /// to, so the two ways of being full mean the same thing to it.
+    fn has_room(&self) -> bool {
+        has_input_room(self.input.len(), self.canon.len())
     }
 
     /// Process one byte written to the master (a keystroke from the terminal)
@@ -192,16 +204,22 @@ impl PtyInner {
                     self.echo_ctrl(b);
                 }
             }
-            self.canon.push_back(b);
-            if b == b'\n' {
-                self.commit_canon();
+            // A full line that is all there is keeps being taken so VERASE
+            // still reaches the discipline above -- refusing it wedges the
+            // terminal at the one moment the user needs to shorten the line --
+            // but the byte is dropped, and the newline with it.
+            if self.has_room() {
+                self.canon.push_back(b);
+                if b == b'\n' {
+                    self.commit_canon();
+                }
             }
         } else {
             // Raw mode: deliver immediately.
             if lflag & ECHO != 0 {
                 self.echo_ctrl(b);
             }
-            if self.input.len() < PTY_BUF_CAP {
+            if self.has_room() {
                 self.input.push_back(b);
             }
         }
@@ -217,11 +235,16 @@ impl PtyInner {
         }
     }
 
+    /// Move the line being edited to where a reader can take it.
+    ///
+    /// No bound to check: the two queues share one, so what was in `canon` was
+    /// already inside it. Dropping here instead, which is what the old
+    /// per-queue cap did, took bytes out of the **middle** of a line the user
+    /// had already finished and handed the reader the rest as if it were
+    /// whole.
     fn commit_canon(&mut self) {
         while let Some(b) = self.canon.pop_front() {
-            if self.input.len() < PTY_BUF_CAP {
-                self.input.push_back(b);
-            }
+            self.input.push_back(b);
         }
     }
 
@@ -996,9 +1019,18 @@ mod tests {
         // otherwise take the kernel's memory with it one full line at a time.
         let mut p = pty();
         p.termios.c_lflag &= !ECHO; // keep the output queue out of it
-        typed(&mut p, &vec![b'x'; PTY_BUF_CAP + 10]);
+        typed(&mut p, &vec![b'x'; N_TTY_BUF_SIZE + 10]);
+        // The newline does not fit either, so the line is not handed over: the
+        // user still has VERASE to shorten it with, which is the whole reason
+        // the bytes kept being taken.
         typed(&mut p, b"\n");
-        assert_eq!(p.input.len(), PTY_BUF_CAP);
+        assert_eq!(p.canon.len(), N_TTY_BUF_SIZE);
+        assert!(p.input.is_empty());
+        // One column back and the line ends.
+        typed(&mut p, &[0x7f]);
+        typed(&mut p, b"\n");
+        assert_eq!(p.input.len(), N_TTY_BUF_SIZE);
+        assert!(p.canon.is_empty());
     }
 
     #[test]
@@ -1045,12 +1077,12 @@ mod tests {
         // A terminal nobody is reading must not take the kernel's memory
         // with it.
         let mut p = pty();
-        p.slave_output(&vec![b'x'; PTY_BUF_CAP * 2]);
-        assert_eq!(p.output.len(), PTY_BUF_CAP);
+        p.slave_output(&vec![b'x'; TTY_OUTPUT_CAP + 64]);
+        assert_eq!(p.output.len(), TTY_OUTPUT_CAP);
 
         let mut p = pty();
         p.termios.c_lflag &= !ICANON;
-        typed(&mut p, &vec![b'x'; PTY_BUF_CAP + 10]);
-        assert_eq!(p.input.len(), PTY_BUF_CAP);
+        typed(&mut p, &vec![b'x'; N_TTY_BUF_SIZE + 10]);
+        assert_eq!(p.input.len(), N_TTY_BUF_SIZE);
     }
 }
