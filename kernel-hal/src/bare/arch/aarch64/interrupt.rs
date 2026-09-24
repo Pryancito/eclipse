@@ -41,14 +41,37 @@ hal_fn_impl! {
 
         fn send_ipi(cpuid: usize, reason: usize) -> HalResult {
             trace!("ipi [{}] => [{}]: {:x}", super::cpu::cpu_id(), cpuid, reason);
-            // A GICv2 SGI target list is 8 bits wide, so only CPUs 0..=7 can be
-            // addressed. Masking the id (`cpuid & 7`) instead silently aimed
-            // CPU 8's shootdown at CPU 0 while the initiator waited for CPU 8's
-            // acknowledgement — which could never arrive.
-            if cpuid >= 8 {
-                warn!("send_ipi: cpu {} is beyond the GICv2 SGI target list", cpuid);
+            // Resolve the target BEFORE publishing, and resolve it through the
+            // affinity map rather than using the logical id as the target bit.
+            //
+            // A GICv2 SGI target list names CPU *interfaces* — on the
+            // single-cluster systems GICv2 exists on, interface `n` is the core
+            // with `Aff0 == n`. The dense logical id is not that number: ids go
+            // out in the order cores reach `register_logical_id`, and
+            // `start_secondary_cores` fires every `CPU_ON` before waiting for
+            // any of them, so arrival order is whatever order the firmware
+            // schedules them in. `1 << cpuid` therefore aimed the SGI at
+            // whichever core happened to hold that Aff0, and a shootdown that
+            // reaches the wrong core is one the initiator waits for forever:
+            // the core it asked never flushes, and the core it woke
+            // acknowledges nothing on its behalf. `logical_to_affinity` has
+            // existed for this since the map was written, with no caller.
+            //
+            // `None` also covers the two cases the old `cpuid >= 8` check
+            // could not see: a logical id no core was ever given (it used to
+            // resolve to affinity 0, the boot CPU), and a core outside the boot
+            // cluster, whose Aff0 collides with a core in it.
+            let Some(affinity) = super::cpu::logical_to_affinity(cpuid) else {
+                warn!("send_ipi: logical cpu {} names no core — dropped", cpuid);
                 return Err(crate::HalError);
-            }
+            };
+            let Some(target) = crate::common::cpu_topology::gicv2_sgi_target(affinity) else {
+                warn!(
+                    "send_ipi: cpu {} (affinity {:#x}) is beyond the GICv2 SGI target list",
+                    cpuid, affinity
+                );
+                return Err(crate::HalError);
+            };
             // Push reason into per-CPU IPI queue, noting an overflow if it
             // will not fit — shared with the other architectures so the two
             // halves of that contract cannot drift apart again.
@@ -60,7 +83,7 @@ hal_fn_impl! {
             // GICD_SGIR: [25:24]=TargetListFilter=0b00 (use list), [23:16]=CPUTargetList, [3:0]=SGIINTID
             let gic_base = crate::hal_fn::mem::phys_to_virt(crate::KCONFIG.gic_base);
             const GICD_SGIR: usize = 0x0F00;
-            let val: u32 = (1u32 << cpuid) << 16; // SGI 0
+            let val: u32 = target << 16; // SGI 0
             unsafe {
                 core::ptr::write_volatile((gic_base + GICD_SGIR) as *mut u32, val);
             }
