@@ -84,6 +84,37 @@ fn comm_from_path(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
 }
 
+/// The `pid` argument of `setpgid`/`getpgid`/`getsid`: `0` means the caller.
+///
+/// `pid_t` is SIGNED, and `find_task_by_vpid` can only ever fail on a negative
+/// one. Read as a `usize` -- which is how these three used to take it -- a
+/// negative pid arrived sign-extended, so `getpgid(-1)` asked about pid
+/// `0xffff_ffff_ffff_ffff` and `setpgid(-1, 0)` would have made that its own
+/// group leader.
+fn resolve_pid_arg(caller_pid: KoID, pid: i32) -> LxResult<KoID> {
+    match pid {
+        0 => Ok(caller_pid),
+        p if p > 0 => Ok(p as KoID),
+        _ => Err(LxError::ESRCH),
+    }
+}
+
+/// The two arguments of `setpgid(2)`, resolved: which process, and into which
+/// group. `pgid == 0` means "a group of the target's own", and a NEGATIVE
+/// pgid is `EINVAL` -- checked first, before the pid is even looked up, as
+/// `kernel/sys.c:do_setpgid` does. It is the one thing separating
+/// `setpgid(0, -1)` from silently filing the caller under group
+/// `0xffff_ffff_ffff_ffff`, where no signal sent to any real group can reach
+/// it.
+fn setpgid_args(caller_pid: KoID, pid: i32, pgid: i32) -> LxResult<(KoID, KoID)> {
+    if pgid < 0 {
+        return Err(LxError::EINVAL);
+    }
+    let target = resolve_pid_arg(caller_pid, pid)?;
+    let new_pgid = if pgid == 0 { target } else { pgid as KoID };
+    Ok((target, new_pgid))
+}
+
 /// `wait4`/`waitid` option bits, spelled as `include/uapi/linux/wait.h` does.
 mod wait_opts {
     /// Return at once if no child has changed state.
@@ -1594,26 +1625,17 @@ impl Syscall<'_> {
     /// `pid == 0` targets the caller; `pgid == 0` makes the target its own
     /// group leader. Job-control shells rely on this to put each foreground job
     /// into its own process group so a Ctrl-C reaches the job, not the shell.
-    pub fn sys_setpgid(&self, pid: usize, pgid: usize) -> SysResult {
+    pub fn sys_setpgid(&self, pid: i32, pgid: i32) -> SysResult {
         debug!("setpgid: pid={}, pgid={}", pid, pgid);
-        let target = if pid == 0 {
-            self.zircon_process().id()
-        } else {
-            pid as u64
-        };
-        let new_pgid = if pgid == 0 { target } else { pgid as u64 };
-        linux_object::process::set_process_pgid(target, new_pgid)?;
+        let (target, new_pgid) = setpgid_args(self.zircon_process().id(), pid, pgid)?;
+        linux_object::process::set_process_pgid(self.zircon_process(), target, new_pgid)?;
         Ok(0)
     }
 
     /// `getpgid` returns the PGID of the process specified by pid.
-    pub fn sys_getpgid(&self, pid: usize) -> SysResult {
+    pub fn sys_getpgid(&self, pid: i32) -> SysResult {
         debug!("getpgid: pid={}", pid);
-        let target = if pid == 0 {
-            self.zircon_process().id()
-        } else {
-            pid as u64
-        };
+        let target = resolve_pid_arg(self.zircon_process().id(), pid)?;
         let pgid = linux_object::process::get_process_pgid(target)?;
         Ok(pgid as usize)
     }
@@ -1627,11 +1649,7 @@ impl Syscall<'_> {
         // POSIX: a process-group leader may not create a new session (its pid
         // already names an existing group). The daemonize idiom fork()s first
         // precisely so the child is not a leader.
-        let pgid = proc.pgid_raw();
-        if pgid == 0 || pgid == pid {
-            debug!("setsid: pid {} is already a group leader", pid);
-            return Err(LxError::EPERM);
-        }
+        linux_object::process::setsid_verdict(pid, &linux_object::process::live_effective_pgids())?;
         proc.become_session_leader(pid);
         info!("setsid: pid {} starts a new session", pid);
         Ok(pid as usize)
@@ -1639,13 +1657,9 @@ impl Syscall<'_> {
 
     /// `getsid` returns the session ID of the process specified by pid
     /// (0 = the calling process); see getsid(2).
-    pub fn sys_getsid(&self, pid: usize) -> SysResult {
+    pub fn sys_getsid(&self, pid: i32) -> SysResult {
         debug!("getsid: pid={}", pid);
-        let target = if pid == 0 {
-            self.zircon_process().id()
-        } else {
-            pid as u64
-        };
+        let target = resolve_pid_arg(self.zircon_process().id(), pid)?;
         let sid = linux_object::process::get_process_sid(target)?;
         Ok(sid as usize)
     }
@@ -2492,5 +2506,68 @@ mod extensible_struct_tests {
         assert!(clone3_size(PAGE_SIZE + 1).is_err());
         assert!(sched_setattr_size(PAGE_SIZE as u32 + 1).is_err());
         assert!(sched_getattr_size(PAGE_SIZE + 1).is_err());
+    }
+}
+
+#[cfg(test)]
+mod setpgid_argument_tests {
+    //! The two signed arguments of `setpgid(2)` and the pid argument of
+    //! `getpgid`/`getsid`. All three used to take a `usize`, so the sign a
+    //! `pid_t` carries was gone before anything looked at it.
+
+    use super::{resolve_pid_arg, setpgid_args};
+    use linux_object::error::LxError;
+
+    const ME: u64 = 100;
+
+    #[test]
+    fn a_zero_pid_means_the_caller_and_a_zero_pgid_a_group_of_its_own() {
+        assert_eq!(setpgid_args(ME, 0, 0), Ok((ME, ME)));
+        assert_eq!(resolve_pid_arg(ME, 0), Ok(ME));
+    }
+
+    #[test]
+    fn a_zero_pgid_names_the_target_not_the_caller() {
+        // `setpgid(child, 0)` makes the CHILD a group leader. Resolving the
+        // zero against the caller would have filed the child under the
+        // shell's own group instead -- the shell's Ctrl-C would then reach it
+        // for as long as it lived.
+        assert_eq!(setpgid_args(ME, 42, 0), Ok((42, 42)));
+    }
+
+    /// `if (pgid < 0) return -EINVAL`, and it is the FIRST thing `do_setpgid`
+    /// does. Read as a `usize` the number arrived sign-extended, so this was
+    /// `setpgid(0, 0xffff_ffff_ffff_ffff)` returning success: the caller left
+    /// every real process group, and no signal sent to any group could reach
+    /// it again.
+    #[test]
+    fn a_negative_group_is_refused_instead_of_becoming_a_huge_one() {
+        assert_eq!(setpgid_args(ME, 0, -1), Err(LxError::EINVAL));
+        assert_eq!(setpgid_args(ME, 0, i32::MIN), Err(LxError::EINVAL));
+    }
+
+    /// And it is refused before the pid is looked at, so a caller cannot tell
+    /// a bad group from a missing process by which error comes back.
+    #[test]
+    fn the_group_is_judged_before_the_process_is_looked_up() {
+        assert_eq!(setpgid_args(ME, -7, -1), Err(LxError::EINVAL));
+        assert_eq!(setpgid_args(ME, -7, 0), Err(LxError::ESRCH));
+    }
+
+    /// A negative pid names no process: `find_task_by_vpid` can only fail.
+    /// It used to name `0xffff_ffff_ffff_ffff`, which no process has either
+    /// -- but `getpgid(-1)` is meant to say ESRCH, and `setpgid(-1, 0)` would
+    /// have gone looking for a process to make a group leader.
+    #[test]
+    fn a_negative_pid_is_no_process() {
+        assert_eq!(resolve_pid_arg(ME, -1), Err(LxError::ESRCH));
+        assert_eq!(resolve_pid_arg(ME, i32::MIN), Err(LxError::ESRCH));
+        assert_eq!(setpgid_args(ME, -1, 0), Err(LxError::ESRCH));
+    }
+
+    #[test]
+    fn a_positive_pid_is_itself() {
+        assert_eq!(resolve_pid_arg(ME, 1), Ok(1));
+        assert_eq!(resolve_pid_arg(ME, i32::MAX), Ok(i32::MAX as u64));
     }
 }
