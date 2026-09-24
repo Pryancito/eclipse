@@ -343,7 +343,7 @@ impl ProcessExt for Process {
         };
         let new_linux_proc = LinuxProcess {
             root_inode: linux_parent.root_inode.clone(),
-            parent: Arc::downgrade(parent),
+            parent: Mutex::new(Arc::downgrade(parent)),
             vt: linux_parent.vt,
             perf: crate::perf::ProcPerf::new(),
             itimers: Default::default(),
@@ -472,6 +472,39 @@ pub fn wait_status_stopped(sig: u8) -> i32 {
     ((sig as i32) << 8) | 0x7f
 }
 
+/// The exit code a process object carries when a SIGNAL killed it.
+///
+/// Negative, because the `i64` has to say WHICH of the two ways a process can
+/// finish this was, and every ordinary exit code is a byte. The default-action
+/// kill path used to store `128 + signo` -- the number a SHELL prints, which
+/// is the shell's own arithmetic over `WIFSIGNALED`, not a status word -- so
+/// the kernel reported every killed process as one that had called
+/// `exit(128 + n)`, and nothing downstream could tell the two apart (a program
+/// that really does `exit(137)` is not a process killed by SIGKILL).
+pub const fn exit_code_killed_by(sig: u8) -> i64 {
+    -(sig as i64)
+}
+
+/// The `wait(2)` status word for a child that has finished: `WIFEXITED` with
+/// `WEXITSTATUS`, or `WIFSIGNALED` with `WTERMSIG`.
+///
+/// `sys/wait.h`: a status whose low seven bits are zero is an exit, and the
+/// code is the SECOND byte; a status whose low seven bits are a signal number
+/// is a death by that signal. The two are read apart by those seven bits, so
+/// a kernel that only ever writes the first shape leaves `WIFSIGNALED` false
+/// for every process it killed -- `system()` cannot tell a failed command from
+/// an interrupted one, and a shell never prints "Killed".
+pub fn wait_status_exited(raw: i64) -> i32 {
+    if raw < 0 {
+        // Killed by `-raw`. No core-dump bit: this kernel dumps no cores.
+        (-raw as i32) & 0x7f
+    } else {
+        // exit(2) takes an int and the parent sees only its low byte, which
+        // is why `exit(256)` is `exit(0)`.
+        ((raw as i32) & 0xff) << 8
+    }
+}
+
 /// `wait` status word for a continued child: `WIFCONTINUED`.
 pub const WAIT_STATUS_CONTINUED: i32 = 0xffff;
 
@@ -519,7 +552,7 @@ pub async fn wait_child_interest(
                         inner.reaped_children.remove(&pid);
                         inner.add_children_cpu(cpu);
                     }
-                    return Ok(((code as i32) << 8, cpu));
+                    return Ok((wait_status_exited(code), cpu));
                 }
             }
         }
@@ -536,7 +569,7 @@ pub async fn wait_child_interest(
                     inner.reaped_children.remove(&pid);
                     inner.add_children_cpu(cpu);
                 }
-                return Ok(((code as i32) << 8, cpu));
+                return Ok((wait_status_exited(code), cpu));
             }
         }
         if let Some(status) = child
@@ -560,7 +593,7 @@ pub async fn wait_child_interest(
                     inner.reaped_children.remove(&pid);
                     inner.add_children_cpu(cpu);
                 }
-                return Ok(((code as i32) << 8, cpu));
+                return Ok((wait_status_exited(code), cpu));
             }
         }
         if let Some(status) = child
@@ -638,7 +671,7 @@ fn scan_waitable_children(
                 inner.reaped_children.remove(&pid);
                 inner.add_children_cpu(cpu);
             }
-            return Some(Ok((pid, (code as i32) << 8, cpu)));
+            return Some(Ok((pid, wait_status_exited(code), cpu)));
         }
     }
     let kids: Vec<(KoID, Arc<Process>)> = inner
@@ -659,7 +692,7 @@ fn scan_waitable_children(
                     inner.reaped_children.remove(&pid);
                     inner.add_children_cpu(cpu);
                 }
-                return Some(Ok((pid, (code as i32) << 8, cpu)));
+                return Some(Ok((pid, wait_status_exited(code), cpu)));
             }
         }
         if let Some(status) = child
@@ -707,8 +740,15 @@ pub fn opened_cloexec(file: &Arc<dyn FileLike>) -> bool {
 pub struct LinuxProcess {
     /// The root INode of file system
     root_inode: Arc<dyn INode>,
-    /// Parent process
-    parent: Weak<Process>,
+    /// Parent process.
+    ///
+    /// MUTABLE, because a process can be re-parented: when its parent dies,
+    /// [`reparent_live_children_to_init`] hands it to the nearest subreaper
+    /// or to init, and from that moment THAT is its parent -- `getppid`
+    /// returning 1 is how the daemonize idiom knows the intermediate process
+    /// is gone, and it is the adopter that `wait`s for it and that a
+    /// stop/continue must notify.
+    parent: Mutex<Weak<Process>>,
     /// Virtual terminal this process is attached to (its stdin/stdout VT).
     /// Used to keep background (inactive-VT) shells from busy-polling stdin for
     /// input that can only arrive on the active terminal.
@@ -807,6 +847,15 @@ struct LinuxProcessInner {
     /// parent's *effective* sid (children stay in the parent's session);
     /// `setsid` starts a fresh session with `sid == pgid == pid`.
     sid: u64,
+    /// Whether this process has already `execve`'d since the `fork` that
+    /// created it -- the INVERSE of Linux's `PF_FORKNOEXEC`, which
+    /// `copy_process` sets on every new task and `begin_new_exec` clears.
+    /// Its one reader is [`setpgid_verdict`]: a parent may move a child
+    /// between process groups only while the child is still running the
+    /// parent's own code, because once the child has exec'd, the image now
+    /// running never agreed to be job-controlled by whoever forked it
+    /// (`kernel/sys.c`: `if (!(p->flags & PF_FORKNOEXEC)) return -EACCES`).
+    has_execed: bool,
     /// Job-control stop: the process is stopped (SIGSTOP/SIGTSTP/…).
     /// Cleared by SIGCONT. Threads park in `run_user` while this is set.
     job_stopped: bool,
@@ -956,7 +1005,7 @@ impl LinuxProcess {
 
         LinuxProcess {
             root_inode,
-            parent: Weak::default(),
+            parent: Mutex::new(Weak::default()),
             vt,
             perf: crate::perf::ProcPerf::new(),
             itimers: Default::default(),
@@ -1002,6 +1051,12 @@ impl LinuxProcess {
         self.inner.lock().pgid = pgid;
     }
 
+    /// Whether this process has `execve`'d since the fork that created it
+    /// (the inverse of Linux's `PF_FORKNOEXEC`). See the field.
+    pub fn has_execed(&self) -> bool {
+        self.inner.lock().has_execed
+    }
+
     /// Raw session id (`0` = unset → resolves to the process's own pid).
     pub fn sid_raw(&self) -> u64 {
         self.inner.lock().sid
@@ -1040,21 +1095,25 @@ impl LinuxProcess {
     /// Leave a job-control stop (`SIGCONT`). Wakes parked threads and notifies
     /// the parent for `WCONTINUED`. Returns whether the process was stopped.
     pub fn job_continue(&self, proc: &Arc<Process>) -> bool {
-        let was_stopped = {
-            let mut inner = self.inner.lock();
-            let was = inner.job_stopped;
-            inner.job_stopped = false;
-            if was {
-                inner.job_continued_pending = true;
-                inner.job_stop_pending = false;
-            }
-            was
-        };
+        let was_stopped = self.inner.lock().leave_stop(true);
         proc.signal_set(JOB_CONTINUE_SIGNAL);
         if was_stopped {
             notify_parent_child_state(proc);
         }
         was_stopped
+    }
+
+    /// Break a job-control stop because the process is being KILLED.
+    ///
+    /// Like [`Self::job_continue`] it clears the stop and wakes the parked
+    /// threads -- a thread sitting in [`wait_while_job_stopped`] is the one
+    /// that has to run the default SIGKILL action, and it cannot run it while
+    /// it is parked -- but it leaves NO continue notification behind: the
+    /// process is not continuing, and a parent in `wait(WCONTINUED)` must not
+    /// be told that it did.
+    pub fn job_wake_to_die(&self, proc: &Arc<Process>) {
+        self.inner.lock().leave_stop(false);
+        proc.signal_set(JOB_CONTINUE_SIGNAL);
     }
 
     /// Consume a pending stop/continue notification for `wait*` if `interest`
@@ -1908,7 +1967,12 @@ impl LinuxProcess {
 
     /// Get parent process.
     pub fn parent(&self) -> Option<Arc<Process>> {
-        self.parent.upgrade()
+        self.parent.lock().upgrade()
+    }
+
+    /// Hand this process to a new parent (adoption on the old one's death).
+    pub fn set_parent(&self, parent: &Arc<Process>) {
+        *self.parent.lock() = Arc::downgrade(parent);
     }
 
     /// Get current working directory.
@@ -2215,6 +2279,11 @@ impl LinuxProcessInner {
         // `IPC_RMID` on it frees nothing.
         self.shm_identifiers = Default::default();
 
+        // `begin_new_exec()`: `me->flags &= ~PF_FORKNOEXEC`. From here on the
+        // process runs an image of its own choosing, and a `setpgid` from the
+        // parent must be refused with `EACCES`. See `has_execed`.
+        self.has_execed = true;
+
         // `begin_new_exec()`: `if (bprm->secureexec) me->pdeath_signal = 0;`
         // The parent picked this signal while the child was still running
         // code the parent controlled. Keeping it across a privilege-raising
@@ -2290,6 +2359,10 @@ impl LinuxProcessInner {
             // attribute is the parent's own role, not a child's.
             pdeathsig: 0,
             child_subreaper: false,
+            // `copy_process`: `p->flags |= PF_FORKNOEXEC`. A fresh child is
+            // still running the forking program, so its parent may still put
+            // it in a process group (the shell's job-control idiom).
+            has_execed: false,
             // Not stopped, and nothing pending to report to a waiter.
             job_stopped: false,
             job_stop_sig: 0,
@@ -2308,6 +2381,27 @@ impl LinuxProcessInner {
             // that is exactly what the `Clone` drops.
             semaphores: self.semaphores.clone(),
         }
+    }
+
+    /// Leave a job-control stop. `continued` says whether this is a real
+    /// `SIGCONT` -- which owes the parent a `WCONTINUED` notification -- or a
+    /// wake-up to die under `SIGKILL`, which owes it nothing: the process is
+    /// not continuing, and telling `wait` that it did would have the parent
+    /// report a job as resumed at the moment it was killed.
+    ///
+    /// Either way the pending STOP notification goes: a stop the parent never
+    /// collected is not news any more once the process is out of the stop,
+    /// and left behind it would be reported as a current state.
+    ///
+    /// Returns whether the process was in fact stopped.
+    fn leave_stop(&mut self, continued: bool) -> bool {
+        let was = self.job_stopped;
+        self.job_stopped = false;
+        if was {
+            self.job_stop_pending = false;
+            self.job_continued_pending = continued;
+        }
+        was
     }
 
     /// Fold a reaped child's CPU usage into the RUSAGE_CHILDREN totals.
@@ -2521,15 +2615,128 @@ pub async fn wait_while_job_stopped(proc: &Arc<Process>) {
     }
 }
 
-/// `setpgid`: set process `pid`'s group to `pgid`. Permissive (no session/leader
-/// checks): enough for a shell to put a job into its own group.
-pub fn set_process_pgid(pid: KoID, pgid: KoID) -> LxResult<()> {
-    let proc = all_live_processes()
-        .into_iter()
-        .find(|p| p.id() == pid)
-        .ok_or(LxError::ESRCH)?;
-    proc.try_linux().ok_or(LxError::ESRCH)?.set_pgid_raw(pgid);
+/// Everything `setpgid(2)` decides on, read off the two processes involved
+/// before any of them is touched.
+///
+/// A process group is a KILL LIST: [`send_signal_to_pgrp`] walks every live
+/// process whose effective pgid matches and signals it, and the terminal's
+/// Ctrl-C/Ctrl-\\/Ctrl-Z do exactly that to the foreground group. So "which
+/// process may be put into which group" is an access-control decision, and
+/// `kernel/sys.c:do_setpgid` spells out four rules for it. This kernel had
+/// none of them -- any process could move ANY other process, in any session,
+/// into its own group, and then have the tty signal it.
+#[derive(Debug, Clone, Copy)]
+pub struct SetpgidFacts {
+    /// Pid of the process making the call.
+    pub caller_pid: KoID,
+    /// Effective session id of the caller.
+    pub caller_sid: KoID,
+    /// Pid of the process being moved.
+    pub target_pid: KoID,
+    /// Effective session id of the target.
+    pub target_sid: KoID,
+    /// The target is a child of the caller.
+    pub target_is_child: bool,
+    /// The target has already `execve`'d (`!PF_FORKNOEXEC`).
+    pub target_has_execed: bool,
+    /// The target is a session leader (its effective sid is its own pid).
+    pub target_is_session_leader: bool,
+    /// The group the target is being moved into.
+    pub new_pgid: KoID,
+    /// Some live process in the CALLER's session already has `new_pgid` as its
+    /// effective process group.
+    pub group_exists_in_caller_session: bool,
+}
+
+/// `kernel/sys.c:do_setpgid`, rule for rule and in its order.
+pub fn setpgid_verdict(f: &SetpgidFacts) -> LxResult<()> {
+    if f.target_is_child {
+        // A child may be moved only within the caller's own session: a
+        // process that has left for a session of its own (a daemon, another
+        // terminal's shell) is no longer this shell's to job-control.
+        if f.target_sid != f.caller_sid {
+            return Err(LxError::EPERM);
+        }
+        // `if (!(p->flags & PF_FORKNOEXEC)) return -EACCES`. The window in
+        // which a parent may group its child closes at the child's `execve`:
+        // after it the child runs a program that never agreed to this.
+        if f.target_has_execed {
+            return Err(LxError::EACCES);
+        }
+    } else if f.target_pid != f.caller_pid {
+        // Neither the caller nor a child of it. Linux reports this as "no
+        // such process" rather than EPERM, so a caller cannot use `setpgid`
+        // to probe which pids exist outside its own family.
+        return Err(LxError::ESRCH);
+    }
+    // A session leader is pinned to the group that carries its own pid: its
+    // pid IS the session id, and letting it wander would leave the session
+    // named after a group it is not in.
+    if f.target_is_session_leader {
+        return Err(LxError::EPERM);
+    }
+    // Joining an EXISTING group (`pgid != pid`) requires that group to exist
+    // in the caller's session. Creating one (`pgid == pid`) always may.
+    if f.new_pgid != f.target_pid && !f.group_exists_in_caller_session {
+        return Err(LxError::EPERM);
+    }
     Ok(())
+}
+
+/// `setpgid`: `caller` puts process `pid` into process group `pgid`.
+///
+/// The rules are [`setpgid_verdict`]'s; everything here only reads the facts
+/// it decides on off the live process table.
+pub fn set_process_pgid(caller: &Arc<Process>, pid: KoID, pgid: KoID) -> LxResult<()> {
+    let live = all_live_processes();
+    let proc = live
+        .iter()
+        .find(|p| p.id() == pid)
+        .cloned()
+        .ok_or(LxError::ESRCH)?;
+    let target_linux = proc.try_linux().ok_or(LxError::ESRCH)?;
+    let caller_sid = effective_sid(caller);
+    let target_sid = effective_sid(&proc);
+    let facts = SetpgidFacts {
+        caller_pid: caller.id(),
+        caller_sid,
+        target_pid: pid,
+        target_sid,
+        target_is_child: caller
+            .try_linux()
+            .map(|lp| lp.has_child(pid))
+            .unwrap_or(false),
+        target_has_execed: target_linux.has_execed(),
+        target_is_session_leader: target_sid == pid,
+        new_pgid: pgid,
+        group_exists_in_caller_session: live
+            .iter()
+            .any(|p| effective_pgid(p) == pgid && effective_sid(p) == caller_sid),
+    };
+    setpgid_verdict(&facts)?;
+    target_linux.set_pgid_raw(pgid);
+    Ok(())
+}
+
+/// `setsid(2)`: may `caller_pid` start a session of its own?
+///
+/// `kernel/sys.c:ksys_setsid` refuses when the caller's pid already NAMES a
+/// process group (`pid_task(pid, PIDTYPE_PGID)`), because the new session
+/// would be given that same number for its own group and two unrelated groups
+/// would end up sharing an id. The usual case is the caller's own group --
+/// which is why the daemonize idiom forks first -- but a child the caller put
+/// into a group named after the caller counts just the same.
+pub fn setsid_verdict(caller_pid: KoID, live_pgids: &[KoID]) -> LxResult<()> {
+    if live_pgids.contains(&caller_pid) {
+        debug!("setsid: pid {} already names a process group", caller_pid);
+        return Err(LxError::EPERM);
+    }
+    Ok(())
+}
+
+/// The effective process group of every live process, for [`setsid_verdict`].
+pub fn live_effective_pgids() -> Vec<KoID> {
+    all_live_processes().iter().map(effective_pgid).collect()
 }
 
 /// `getpgid`: the effective process-group id of process `pid`.
@@ -2757,6 +2964,17 @@ fn reparent_live_children_to_init(dying: &Arc<Process>) {
         };
         let mut adopter_inner = adopter_linux.inner.lock();
         for orphan in orphans {
+            // The adopter is the orphan's PARENT now, and the pointer has to
+            // say so. It never did: `parent` was written once at fork and
+            // never again, so after an adoption `getppid()` still named the
+            // dead process (or 0 once its object went away) where Linux says
+            // 1 -- which is the very thing the daemonize idiom waits for --
+            // `notify_parent_child_state` pulsed SIGCHLD at the corpse
+            // instead of at the adopter blocked in `wait`, and
+            // `nearest_live_subreaper` walked a chain through the dead.
+            if let Some(lp) = orphan.try_linux() {
+                lp.set_parent(&adopter);
+            }
             adopter_inner.children.insert(orphan.id(), orphan);
         }
         for (pid, entry) in zombies {
@@ -3000,6 +3218,70 @@ mod tests {
     }
 }
 
+/// The four signals whose default action is a job-control STOP.
+pub const STOP_SIGNALS: [LinuxSignal; 4] = [
+    LinuxSignal::SIGSTOP,
+    LinuxSignal::SIGTSTP,
+    LinuxSignal::SIGTTIN,
+    LinuxSignal::SIGTTOU,
+];
+
+/// What sending a signal does to the target's job-control state AT THE MOMENT
+/// OF SENDING -- before any mask, handler or `wait` is consulted.
+///
+/// Linux decides this in `prepare_signal()`, in the sender's own context, and
+/// it has to: the work belongs to signals whose whole point is to act on a
+/// process that is NOT running, so the target cannot be the one to do it. This
+/// kernel had nothing here, and left both halves to the target thread's own
+/// `handle_signal` loop -- which a stopped process's threads never reach,
+/// because they are parked in [`wait_while_job_stopped`] waiting for a
+/// continue that only that same loop could have issued.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SendEffect {
+    /// `SIGCONT`: resume the process now, whatever it has this signal set to,
+    /// and drop any stop that had not been acted on yet. Without it,
+    /// `kill -CONT` and a shell's `fg` moved nothing.
+    Resume,
+    /// A stop signal: drop any `SIGCONT` that had not been acted on yet, so
+    /// the last one sent is the one that decides.
+    Stop,
+    /// `SIGKILL`: the process is not continuing, but a parked thread has to
+    /// wake up to die. Without it, `kill -9` on a Ctrl-Z'd process did
+    /// nothing at all and the pid stayed forever.
+    WakeToDie,
+    /// Everything else waits to be received, which is what a signal normally
+    /// does.
+    None,
+}
+
+/// `prepare_signal()`: what [`send_signal_to_process`] must do before the
+/// signal is so much as queued.
+pub fn send_effect(signal: LinuxSignal) -> SendEffect {
+    match signal {
+        LinuxSignal::SIGCONT => SendEffect::Resume,
+        LinuxSignal::SIGKILL => SendEffect::WakeToDie,
+        s if STOP_SIGNALS.contains(&s) => SendEffect::Stop,
+        _ => SendEffect::None,
+    }
+}
+
+/// The pending signals a target is left with once `signal` is sent to it:
+/// `SIGCONT` and the stop signals cancel each other out, so that a process
+/// cannot end up carrying both and stopping or resuming depending on which
+/// its threads happen to dequeue first.
+pub fn pending_after_send(mut pending: Sigset, signal: LinuxSignal) -> Sigset {
+    match send_effect(signal) {
+        SendEffect::Resume => {
+            for stop in STOP_SIGNALS {
+                pending.remove(stop);
+            }
+        }
+        SendEffect::Stop => pending.remove(LinuxSignal::SIGCONT),
+        _ => {}
+    }
+    pending
+}
+
 pub fn send_signal_to_process(pid: usize, signal: LinuxSignal) -> LxResult<()> {
     use crate::thread::ThreadExt;
     if let Some(process) = ROOT_JOB.find_process(pid as KoID) {
@@ -3019,6 +3301,19 @@ pub fn send_signal_to_process(pid: usize, signal: LinuxSignal) -> LxResult<()> {
             );
         }
         let tids = process.thread_ids();
+        // `prepare_signal()`, before the signal is queued: a stop and a
+        // continue cancel each other where they are waiting to be received,
+        // so a process never carries both and the last one sent is the one
+        // that decides.
+        for tid in process.thread_ids() {
+            if let Ok(thread_obj) = process.get_child(tid) {
+                if let Ok(thread) = thread_obj.downcast_arc::<Thread>() {
+                    if let Some(mut lt) = thread.try_lock_linux() {
+                        lt.signals = pending_after_send(lt.signals, signal);
+                    }
+                }
+            }
+        }
         // Prefer a thread that has the signal *unblocked* — it can act on it
         // right away — and deliver there.
         let mut first: Option<Arc<Thread>> = None;
@@ -3042,6 +3337,7 @@ pub fn send_signal_to_process(pid: usize, signal: LinuxSignal) -> LxResult<()> {
                     if delivered {
                         // Wake waitpid(-1): PID 1 blocks on this zircon bit.
                         process.signal_set(Signal::SIGCHLD);
+                        wake_for_job_control(&process, signal);
                         return Ok(());
                     }
                     if first.is_none() {
@@ -3061,9 +3357,31 @@ pub fn send_signal_to_process(pid: usize, signal: LinuxSignal) -> LxResult<()> {
         // Pulse even when every thread had the Linux signal blocked: waitpid
         // still needs to return so the waiter can notice the pending set.
         process.signal_set(Signal::SIGCHLD);
+        wake_for_job_control(&process, signal);
         Ok(())
     } else {
         Err(LxError::ESRCH)
+    }
+}
+
+/// `complete_signal()`: the wake-up half, once the signal is queued.
+///
+/// It goes here, in the SENDER, because the work is only ever needed when the
+/// target is job-control stopped -- and a stopped process's threads are
+/// parked in [`wait_while_job_stopped`], so they cannot do it for themselves.
+/// After the queueing, as Linux does it, so the thread that wakes already has
+/// the signal to act on.
+fn wake_for_job_control(process: &Arc<Process>, signal: LinuxSignal) {
+    let lp = match process.try_linux() {
+        Some(lp) => lp,
+        None => return,
+    };
+    match send_effect(signal) {
+        SendEffect::Resume => {
+            lp.job_continue(process);
+        }
+        SendEffect::WakeToDie => lp.job_wake_to_die(process),
+        SendEffect::Stop | SendEffect::None => {}
     }
 }
 
@@ -3107,6 +3425,7 @@ mod fork_inheritance_tests {
             job_stop_sig: 19,
             job_stop_pending: true,
             job_continued_pending: true,
+            has_execed: true,
             ..Default::default()
         };
         p.cloexec_fds.insert(7.into());
@@ -3227,6 +3546,18 @@ mod fork_inheritance_tests {
         // or `times(2)` double-counts it up the whole tree.
         assert_eq!(child.children_utime_ns, 0);
         assert_eq!(child.children_stime_ns, 0);
+    }
+
+    /// `copy_process`: `p->flags |= PF_FORKNOEXEC`. The parent has exec'd --
+    /// every process has -- but the child has not, and that flag is what
+    /// gives the shell its window to put the child in a job's process group
+    /// (see [`setpgid_verdict`]). Inherited, the window would never open and
+    /// every `setpgid(child, ...)` would answer EACCES.
+    #[test]
+    fn a_child_has_not_execed_however_long_its_parent_has_been_running() {
+        let parent = a_configured_parent();
+        assert!(parent.has_execed, "the fixture must have exec'd");
+        assert!(!fork_of(&parent).has_execed);
     }
 
     #[test]
@@ -3372,6 +3703,22 @@ mod exec_reset_tests {
         inner.reset_for_exec(false);
         assert_eq!(inner.shm_identifiers.get_id(0x7f00_0000), None);
         assert!(inner.shm_identifiers.get(9).is_none());
+    }
+
+    /// `begin_new_exec`: `me->flags &= ~PF_FORKNOEXEC`. The exec is what
+    /// closes the parent's `setpgid` window, so it is the exec that has to
+    /// record it -- and it does so whether or not the new image is
+    /// privileged, unlike the death signal below.
+    #[test]
+    fn an_exec_is_what_ends_the_window_its_parent_had_to_group_it() {
+        let mut inner = a_process_about_to_exec();
+        assert!(!inner.has_execed, "a forked child has not exec'd yet");
+        inner.reset_for_exec(false);
+        assert!(inner.has_execed);
+
+        let mut privileged = a_process_about_to_exec();
+        privileged.reset_for_exec(true);
+        assert!(privileged.has_execed);
     }
 
     #[test]
@@ -3776,7 +4123,7 @@ mod dup_fd_tests {
     fn a_process() -> LinuxProcess {
         LinuxProcess {
             root_inode: Log::new(),
-            parent: Weak::default(),
+            parent: Mutex::new(Weak::default()),
             vt: 0,
             perf: crate::perf::ProcPerf::new(),
             itimers: Default::default(),
@@ -4074,5 +4421,468 @@ mod dup_fd_tests {
         proc.remove_cloexec_files();
         assert!(proc.get_file_like(kept).is_ok());
         assert_eq!(proc.get_file_like(swept).err(), Some(LxError::EBADF));
+    }
+}
+
+#[cfg(test)]
+mod job_control_membership_tests {
+    //! Who may move whom between process groups and sessions.
+    //!
+    //! A process group is the unit a terminal signals: [`send_signal_to_pgrp`]
+    //! walks every live process whose effective pgid matches the foreground
+    //! group and delivers there, which is how one Ctrl-C reaches a pipeline.
+    //! Membership of that list was writable by anybody: `set_process_pgid`
+    //! said so in its own doc comment ("Permissive (no session/leader
+    //! checks)"), took no caller at all, and set the field. `kernel/sys.c`'s
+    //! `do_setpgid` has four rules and `ksys_setsid` a fifth; these are them.
+
+    use super::*;
+
+    const SHELL: KoID = 100;
+    const CHILD: KoID = 101;
+    const STRANGER: KoID = 900;
+    const OTHER_SESSION: KoID = 800;
+
+    /// A shell that leads its own session, about to group a child of its own
+    /// that has forked but not yet exec'd -- the job-control idiom, which
+    /// must keep working.
+    fn shell_grouping_its_fresh_child() -> SetpgidFacts {
+        SetpgidFacts {
+            caller_pid: SHELL,
+            caller_sid: SHELL,
+            target_pid: CHILD,
+            target_sid: SHELL,
+            target_is_child: true,
+            target_has_execed: false,
+            target_is_session_leader: false,
+            new_pgid: CHILD,
+            group_exists_in_caller_session: false,
+        }
+    }
+
+    #[test]
+    fn a_shell_may_put_its_own_child_in_a_group_of_its_own() {
+        assert_eq!(setpgid_verdict(&shell_grouping_its_fresh_child()), Ok(()));
+    }
+
+    /// The rule this kernel is missing, and the one that matters: a process
+    /// group is a kill list, so filing somebody else's process under your own
+    /// group number hands your terminal's Ctrl-C to a process that never
+    /// agreed to it. Linux answers ESRCH -- not EPERM -- so the call cannot
+    /// double as a probe for which pids exist.
+    #[test]
+    fn a_stranger_is_not_the_callers_to_move() {
+        let mut f = shell_grouping_its_fresh_child();
+        f.target_pid = STRANGER;
+        f.target_is_child = false;
+        f.new_pgid = STRANGER;
+        assert_eq!(setpgid_verdict(&f), Err(LxError::ESRCH));
+    }
+
+    /// ...including into the caller's OWN group, which is the shape that
+    /// actually steals a process: the target then receives every
+    /// terminal-generated signal aimed at the caller's job.
+    #[test]
+    fn a_stranger_cannot_be_dragged_into_the_callers_group() {
+        let mut f = shell_grouping_its_fresh_child();
+        f.target_pid = STRANGER;
+        f.target_is_child = false;
+        f.new_pgid = SHELL;
+        f.group_exists_in_caller_session = true;
+        assert_eq!(setpgid_verdict(&f), Err(LxError::ESRCH));
+    }
+
+    /// `if (!(p->flags & PF_FORKNOEXEC)) return -EACCES`. The parent's window
+    /// closes at the child's `execve`: after it, the program running in that
+    /// child is one the parent did not write.
+    #[test]
+    fn a_child_that_has_already_execed_is_no_longer_groupable() {
+        let mut f = shell_grouping_its_fresh_child();
+        f.target_has_execed = true;
+        assert_eq!(setpgid_verdict(&f), Err(LxError::EACCES));
+    }
+
+    /// That rule is about a CHILD, not about the caller. A shell has exec'd
+    /// itself, obviously, and `setpgid(0, 0)` is how it puts itself into a
+    /// group -- so reading the flag before asking whose process it is would
+    /// break the ordinary self-call.
+    #[test]
+    fn a_process_that_has_execed_may_still_move_itself() {
+        let f = SetpgidFacts {
+            caller_pid: CHILD,
+            caller_sid: SHELL,
+            target_pid: CHILD,
+            target_sid: SHELL,
+            target_is_child: false,
+            target_has_execed: true,
+            target_is_session_leader: false,
+            new_pgid: CHILD,
+            group_exists_in_caller_session: false,
+        };
+        assert_eq!(setpgid_verdict(&f), Ok(()));
+    }
+
+    /// A child that has left for a session of its own (a daemon that called
+    /// `setsid`) is out of this shell's reach, even though it is still its
+    /// child. EPERM, and it is checked BEFORE the exec rule: a child that is
+    /// both gone and exec'd answers for the session, which is the reason it
+    /// can never come back.
+    #[test]
+    fn a_child_in_another_session_is_out_of_reach() {
+        let mut f = shell_grouping_its_fresh_child();
+        f.target_sid = OTHER_SESSION;
+        assert_eq!(setpgid_verdict(&f), Err(LxError::EPERM));
+        f.target_has_execed = true;
+        assert_eq!(
+            setpgid_verdict(&f),
+            Err(LxError::EPERM),
+            "the session rule is the one that answers"
+        );
+    }
+
+    /// A session leader's pid IS its session id. Letting it wander into
+    /// another group would leave the session named after a group its leader
+    /// is not in -- and `getsid` and `getpgid` would stop agreeing about it.
+    #[test]
+    fn a_session_leader_is_pinned_to_its_own_group() {
+        let f = SetpgidFacts {
+            caller_pid: SHELL,
+            caller_sid: SHELL,
+            target_pid: SHELL,
+            target_sid: SHELL,
+            target_is_child: false,
+            target_has_execed: true,
+            target_is_session_leader: true,
+            new_pgid: SHELL,
+            group_exists_in_caller_session: true,
+        };
+        assert_eq!(setpgid_verdict(&f), Err(LxError::EPERM));
+    }
+
+    /// Joining an EXISTING group means the group has to exist, and in the
+    /// caller's session. This is what stops a second job from being filed
+    /// under a number that belongs to another terminal's pipeline.
+    #[test]
+    fn joining_a_group_that_exists_nowhere_is_refused() {
+        let mut f = shell_grouping_its_fresh_child();
+        f.new_pgid = 555;
+        f.group_exists_in_caller_session = false;
+        assert_eq!(setpgid_verdict(&f), Err(LxError::EPERM));
+    }
+
+    #[test]
+    fn joining_a_group_of_the_callers_own_session_is_allowed() {
+        let mut f = shell_grouping_its_fresh_child();
+        f.new_pgid = 555;
+        f.group_exists_in_caller_session = true;
+        assert_eq!(setpgid_verdict(&f), Ok(()));
+    }
+
+    /// Creating one is always allowed, precisely because `pgid == pid` cannot
+    /// collide with a group that is already there: the pid is the target's
+    /// own. This is the second half of the same rule and the first half is
+    /// useless without it -- a shell's first job would have nowhere to go.
+    #[test]
+    fn a_group_named_after_the_target_needs_no_group_to_exist() {
+        let mut f = shell_grouping_its_fresh_child();
+        f.new_pgid = f.target_pid;
+        f.group_exists_in_caller_session = false;
+        assert_eq!(setpgid_verdict(&f), Ok(()));
+    }
+
+    /// Order, again: a stranger with an impossible group answers for WHOSE
+    /// process it is, not for the group. Otherwise the error tells an
+    /// unrelated caller whether that group exists in its session.
+    #[test]
+    fn whose_process_it_is_is_answered_before_which_group() {
+        let mut f = shell_grouping_its_fresh_child();
+        f.target_pid = STRANGER;
+        f.target_is_child = false;
+        f.new_pgid = 555;
+        f.group_exists_in_caller_session = false;
+        assert_eq!(setpgid_verdict(&f), Err(LxError::ESRCH));
+    }
+
+    /// `ksys_setsid`: refused while the caller's pid already names a group,
+    /// because the new session would claim that same number for its group.
+    /// The everyday case is the caller's own group, which is exactly why the
+    /// daemonize idiom `fork`s before calling `setsid`.
+    #[test]
+    fn a_group_leader_may_not_start_a_session() {
+        assert_eq!(
+            setsid_verdict(SHELL, &[SHELL, CHILD]),
+            Err(LxError::EPERM),
+            "the caller's own group carries its pid"
+        );
+    }
+
+    #[test]
+    fn a_process_that_leads_no_group_may() {
+        assert_eq!(setsid_verdict(CHILD, &[SHELL, SHELL]), Ok(()));
+    }
+
+    /// And the case the old check could not see: it read only the CALLER's
+    /// own pgid, so a caller that had moved itself elsewhere while a child of
+    /// its own still carried its pid as a group number passed -- and the new
+    /// session's group would then have had two unrelated members.
+    #[test]
+    fn a_pid_that_names_a_group_somebody_else_is_in_counts_too() {
+        // The caller sits in group 555; only its child still carries SHELL.
+        assert_eq!(setsid_verdict(SHELL, &[555, SHELL]), Err(LxError::EPERM));
+    }
+}
+
+#[cfg(test)]
+mod signal_send_effect_tests {
+    //! What a signal does at the moment it is SENT, before anybody receives
+    //! it.
+    //!
+    //! `prepare_signal()` does this work in the sender's context because the
+    //! signals it covers exist to act on a process that is not running. Here
+    //! there was nothing: every bit of it was left to the target thread's own
+    //! `handle_signal` loop in `loader/src/linux.rs`. A job-control-stopped
+    //! process's threads are parked in `wait_while_job_stopped`, waiting for
+    //! a zircon signal that only `job_continue` raises -- and `job_continue`
+    //! was called from that same loop. So a stopped process could not be
+    //! resumed by `SIGCONT` and could not be killed by `SIGKILL`: both waited
+    //! for the one thread that was waiting for them.
+
+    use super::*;
+
+    #[test]
+    fn a_continue_resumes_at_the_moment_it_is_sent() {
+        assert_eq!(send_effect(LinuxSignal::SIGCONT), SendEffect::Resume);
+    }
+
+    /// `kill -9` on a Ctrl-Z'd process. The default action for SIGKILL runs
+    /// in the target's own loop, so the target has to be out of the park
+    /// before it can die -- otherwise the pid stays stopped forever and no
+    /// signal can ever remove it.
+    #[test]
+    fn a_kill_wakes_a_stopped_process_so_it_can_die() {
+        assert_eq!(send_effect(LinuxSignal::SIGKILL), SendEffect::WakeToDie);
+    }
+
+    #[test]
+    fn the_four_stop_signals_are_the_four() {
+        for sig in STOP_SIGNALS {
+            assert_eq!(send_effect(sig), SendEffect::Stop, "{:?}", sig);
+        }
+        assert_eq!(
+            STOP_SIGNALS,
+            [
+                LinuxSignal::SIGSTOP,
+                LinuxSignal::SIGTSTP,
+                LinuxSignal::SIGTTIN,
+                LinuxSignal::SIGTTOU
+            ]
+        );
+    }
+
+    /// Everything else is an ordinary signal: it waits to be received. A
+    /// SIGTERM must NOT resume a stopped process, or a `kill` of a stopped
+    /// job would restart it just long enough to run a handler.
+    #[test]
+    fn an_ordinary_signal_does_nothing_until_it_is_received() {
+        for sig in [
+            LinuxSignal::SIGTERM,
+            LinuxSignal::SIGINT,
+            LinuxSignal::SIGHUP,
+            LinuxSignal::SIGCHLD,
+            LinuxSignal::SIGUSR1,
+            LinuxSignal::SIGWINCH,
+        ] {
+            assert_eq!(send_effect(sig), SendEffect::None, "{:?}", sig);
+        }
+    }
+
+    /// A stop and a continue cancel each other where they are waiting, so the
+    /// last one sent decides. Carrying both, the outcome depended on which of
+    /// them the target's loop happened to dequeue first.
+    #[test]
+    fn a_continue_cancels_a_stop_that_was_still_waiting() {
+        let mut pending = Sigset::default();
+        for stop in STOP_SIGNALS {
+            pending.insert(stop);
+        }
+        pending.insert(LinuxSignal::SIGTERM);
+        let after = pending_after_send(pending, LinuxSignal::SIGCONT);
+        for stop in STOP_SIGNALS {
+            assert!(!after.contains(stop), "{:?} survived a SIGCONT", stop);
+        }
+        assert!(
+            after.contains(LinuxSignal::SIGTERM),
+            "only the stops are cancelled"
+        );
+    }
+
+    #[test]
+    fn a_stop_cancels_a_continue_that_was_still_waiting() {
+        for stop in STOP_SIGNALS {
+            let mut pending = Sigset::default();
+            pending.insert(LinuxSignal::SIGCONT);
+            pending.insert(LinuxSignal::SIGUSR2);
+            let after = pending_after_send(pending, stop);
+            assert!(
+                !after.contains(LinuxSignal::SIGCONT),
+                "a pending SIGCONT survived {:?}",
+                stop
+            );
+            assert!(after.contains(LinuxSignal::SIGUSR2));
+        }
+    }
+
+    #[test]
+    fn an_ordinary_signal_cancels_nothing() {
+        let mut pending = Sigset::default();
+        pending.insert(LinuxSignal::SIGCONT);
+        pending.insert(LinuxSignal::SIGTSTP);
+        let after = pending_after_send(pending, LinuxSignal::SIGTERM);
+        assert!(after.contains(LinuxSignal::SIGCONT));
+        assert!(after.contains(LinuxSignal::SIGTSTP));
+    }
+
+    /// The wake-to-die is not a continue. A parent in `wait(WCONTINUED)` must
+    /// not be told the job resumed at the very moment it was killed.
+    #[test]
+    fn a_process_woken_to_die_owes_its_parent_no_continue_notification() {
+        let mut inner = LinuxProcessInner {
+            job_stopped: true,
+            job_stop_sig: LinuxSignal::SIGTSTP as u8,
+            job_stop_pending: true,
+            ..Default::default()
+        };
+        assert!(inner.leave_stop(false));
+        assert!(!inner.job_stopped);
+        assert!(!inner.job_continued_pending, "it is not continuing");
+        assert!(
+            !inner.job_stop_pending,
+            "and the stop it never collected is no longer current"
+        );
+    }
+
+    #[test]
+    fn a_real_continue_does_owe_one() {
+        let mut inner = LinuxProcessInner {
+            job_stopped: true,
+            job_stop_pending: true,
+            ..Default::default()
+        };
+        assert!(inner.leave_stop(true));
+        assert!(inner.job_continued_pending);
+        assert!(!inner.job_stop_pending);
+    }
+
+    /// A `SIGCONT` to a process that was not stopped is not a state change,
+    /// so it owes nothing either -- `wait(WCONTINUED)` would otherwise return
+    /// for a job that never went anywhere.
+    #[test]
+    fn a_continue_to_a_running_process_is_not_a_state_change() {
+        let mut inner = LinuxProcessInner::default();
+        assert!(!inner.leave_stop(true));
+        assert!(!inner.job_continued_pending);
+    }
+}
+
+#[cfg(test)]
+mod exit_status_tests {
+    //! The status word a `wait(2)` hands back, which is the ONLY thing a
+    //! parent learns about how its child finished.
+    //!
+    //! `sys/wait.h` packs two different endings into one int and tells them
+    //! apart by the low seven bits. This kernel only ever built one of the
+    //! two shapes: the default-action kill path stored `128 + signo` -- the
+    //! number a SHELL prints, which the shell computes ITSELF from
+    //! `WIFSIGNALED` -- and `wait` shifted it up eight bits like any exit
+    //! code. So every process the kernel killed was reported as one that had
+    //! called `exit(128 + n)`.
+
+    use super::*;
+
+    /// The macros from `sys/wait.h`, spelled as glibc spells them, so the
+    /// tests below ask the questions userspace asks.
+    fn wifexited(status: i32) -> bool {
+        status & 0x7f == 0
+    }
+    fn wexitstatus(status: i32) -> i32 {
+        (status >> 8) & 0xff
+    }
+    fn wifsignaled(status: i32) -> bool {
+        // `((signed char) (((status) & 0x7f) + 1) >> 1) > 0`
+        ((((status & 0x7f) + 1) as i8) >> 1) > 0
+    }
+    fn wtermsig(status: i32) -> i32 {
+        status & 0x7f
+    }
+
+    #[test]
+    fn an_ordinary_exit_is_an_exit_with_its_code() {
+        for code in [0i64, 1, 2, 42, 127, 255] {
+            let status = wait_status_exited(code);
+            assert!(wifexited(status), "exit({})", code);
+            assert!(!wifsignaled(status), "exit({})", code);
+            assert_eq!(wexitstatus(status), code as i32);
+        }
+    }
+
+    /// `exit(2)` takes an `int` and the parent sees only its low byte -- which
+    /// is why every shell script that ends in `exit(256)` reports success.
+    #[test]
+    fn only_the_low_byte_of_an_exit_code_reaches_the_parent() {
+        assert_eq!(wexitstatus(wait_status_exited(256)), 0);
+        assert_eq!(wexitstatus(wait_status_exited(257)), 1);
+        // And the whole word, not just what WEXITSTATUS masks back out: a
+        // status carrying bits above the second byte is not the status Linux
+        // hands over, and userspace is free to compare the int itself
+        // (`status == 0` is the idiom for "the command worked").
+        assert_eq!(wait_status_exited(256), 0);
+        assert_eq!(wait_status_exited(0x1234_5601), 1 << 8);
+    }
+
+    /// The shape that did not exist. `system()` and every supervisor use
+    /// `WIFSIGNALED` to tell a command that failed from one that was
+    /// interrupted, and a shell prints "Killed" off it.
+    #[test]
+    fn a_death_by_signal_says_so_and_names_the_signal() {
+        for sig in [
+            LinuxSignal::SIGHUP,
+            LinuxSignal::SIGINT,
+            LinuxSignal::SIGKILL,
+            LinuxSignal::SIGSEGV,
+            LinuxSignal::SIGPIPE,
+            LinuxSignal::SIGTERM,
+        ] {
+            let status = wait_status_exited(exit_code_killed_by(sig as u8));
+            assert!(wifsignaled(status), "killed by {:?}", sig);
+            assert!(!wifexited(status), "killed by {:?}", sig);
+            assert_eq!(wtermsig(status), sig as i32);
+        }
+    }
+
+    /// And the two are distinguishable, which is the whole point: storing
+    /// `128 + signo` made a SIGKILL indistinguishable from a program that
+    /// really does `exit(137)` -- and both then read as an ordinary exit.
+    #[test]
+    fn a_program_that_exits_with_137_is_not_a_process_killed_by_sigkill() {
+        let exited = wait_status_exited(128 + LinuxSignal::SIGKILL as i64);
+        let killed = wait_status_exited(exit_code_killed_by(LinuxSignal::SIGKILL as u8));
+        assert_ne!(exited, killed);
+        assert!(wifexited(exited) && !wifsignaled(exited));
+        assert!(wifsignaled(killed) && !wifexited(killed));
+        assert_eq!(wexitstatus(exited), 137);
+        assert_eq!(wtermsig(killed), 9);
+    }
+
+    /// A stopped child is the third shape, and it must not collide with the
+    /// other two: `0x7f` in the low byte is what `WIFSTOPPED` looks for.
+    #[test]
+    fn a_stop_is_neither_of_the_two() {
+        let status = wait_status_stopped(LinuxSignal::SIGTSTP as u8);
+        assert!(!wifexited(status));
+        assert!(
+            !wifsignaled(status),
+            "0x7f is the stop marker, not a signal"
+        );
+        assert_eq!(status & 0xff, 0x7f);
     }
 }

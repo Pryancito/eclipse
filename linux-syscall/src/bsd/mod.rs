@@ -229,9 +229,13 @@ impl Syscall<'_> {
             sys::SETEUID => BsdRet::from_result(self.sys_setresuid(usize::MAX, a0, usize::MAX)),
             sys::SETEGID => BsdRet::from_result(self.sys_setresgid(usize::MAX, a0, usize::MAX)),
             sys::GETPGRP => BsdRet::from_result(self.sys_getpgid(0)),
-            sys::GETPGID => BsdRet::from_result(self.sys_getpgid(a0)),
-            sys::SETPGID => BsdRet::from_result(self.sys_setpgid(a0, a1)),
-            sys::GETSID => BsdRet::from_result(self.sys_getpgid(a0)),
+            sys::GETPGID => BsdRet::from_result(self.sys_getpgid(a0 as _)),
+            sys::SETPGID => BsdRet::from_result(self.sys_setpgid(a0 as _, a1 as _)),
+            // getsid(2), not getpgid(2). The two answer the same number only
+            // for a session leader; for every job a shell starts they differ,
+            // and a FreeBSD binary asking which session it is in was told
+            // which process group it is in.
+            sys::GETSID => BsdRet::from_result(self.sys_getsid(a0 as _)),
             sys::SETSID => BsdRet::from_result(self.sys_setsid()),
             sys::ISSETUGID => BsdRet::ok(0),
             sys::KILL => BsdRet::from_result(self.sys_kill(a0 as isize, a1)),

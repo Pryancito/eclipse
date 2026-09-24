@@ -247,7 +247,7 @@ impl RobustExit for CurrentThread {
 
 impl CurrentThreadExt for CurrentThread {
     /// Exit current thread for Linux.
-    fn exit_linux(&self, _exit_code: i32) {
+    fn exit_linux(&self, exit_code: i32) {
         // Linux's `mm_release` does this first, before the `clear_child_tid`
         // wake below: release every robust lock this thread still holds. The
         // list was registered by `set_robust_list` -- which both glibc and
@@ -308,8 +308,31 @@ impl CurrentThreadExt for CurrentThread {
                 }
             }
         }
+        drop(linux_thread);
+        // `exit(2)` from the LAST thread of a process is the process's exit,
+        // and its code is the process's code. Zircon's `remove_thread` ends
+        // the process when its last thread goes, but a process nobody called
+        // `exit` on terminates as `Exited(0)` -- so this argument, which was
+        // spelled `_exit_code` and read by nobody, was dropped on the floor
+        // and every `_exit(3)`/`syscall(SYS_exit, n)` that was not routed
+        // through `exit_group` reported SUCCESS to whoever was in `wait`.
+        // (`exit_group` sets the status itself, and a status already set is
+        // kept, so this changes nothing for the ordinary path.)
+        if last_thread_of(self.proc().thread_count()) {
+            self.proc().exit(exit_code as i64);
+        }
         self.exit();
     }
+}
+
+/// Whether the thread now exiting is the last one its process has, counting
+/// itself: the one whose exit code becomes the PROCESS's exit code.
+///
+/// A separate function because the count is read without the process lock and
+/// the off-by-one is the whole of the decision: `thread_count()` still counts
+/// the caller, so "last" is 1, not 0.
+pub fn last_thread_of(thread_count: usize) -> bool {
+    thread_count <= 1
 }
 
 /// Linux's `struct robust_list_head`: the head of the list of locks a thread
@@ -1801,5 +1824,29 @@ mod clone_inheritance_tests {
         assert!(first.handling_signal.is_none());
         assert!(first.comm.is_empty());
         assert_eq!(first.timerslack_ns, 0);
+    }
+}
+
+#[cfg(test)]
+mod last_thread_tests {
+    //! Whose exit code becomes the process's.
+
+    use super::last_thread_of;
+
+    /// `thread_count()` still counts the thread that is exiting, so "the last
+    /// one" is one, not zero. Off by one here and either every `exit(2)`
+    /// takes the whole process down with it, or none of them sets its code.
+    #[test]
+    fn the_last_thread_is_the_one_that_is_still_counted() {
+        assert!(last_thread_of(1));
+        assert!(!last_thread_of(2));
+        assert!(!last_thread_of(64));
+    }
+
+    /// A count of zero can only mean the caller is already off the list;
+    /// either way there is nobody left, so the code is still this thread's.
+    #[test]
+    fn nobody_left_is_also_the_last_one() {
+        assert!(last_thread_of(0));
     }
 }
