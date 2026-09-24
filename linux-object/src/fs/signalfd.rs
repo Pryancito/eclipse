@@ -31,18 +31,42 @@ pub struct SignalFd {
 impl_kobject!(SignalFd);
 
 impl SignalFd {
+    /// The signals a signalfd is allowed to accept.
+    ///
+    /// `do_signalfd4` filters the set the caller handed over before it is
+    /// stored:
+    ///
+    /// ```c
+    /// sigdelsetmask(&sigmask, sigmask(SIGKILL) | sigmask(SIGSTOP));
+    /// ```
+    ///
+    /// The same two signals every mask in this kernel loses, for a reason of
+    /// its own and a worse one: a signalfd does not merely *defer* what it
+    /// accepts, it **consumes** it -- [`SignalFd::consume_one`] takes the bit
+    /// out of the thread's pending set. So a mask naming SIGKILL is a process
+    /// eating its own death: `pthread_kill(t, SIGKILL)` and any `tgkill` make
+    /// the signal pending, a `read` on the fd removes it, and the delivery
+    /// path never sees it. One naming SIGSTOP swallows every `kill -STOP`.
+    ///
+    /// Filtered here rather than in the syscall because the mask has two
+    /// doors -- a new fd and a replacement on an existing one -- and both
+    /// lead here ([`Sigset::blockable`] names the rest of the family).
+    fn accepted(mask: u64) -> u64 {
+        Sigset::new(mask).blockable().val()
+    }
+
     /// Create a signalfd watching the signals in `mask`.
     pub fn new(mask: u64, flags: OpenFlags) -> Arc<Self> {
         Arc::new(SignalFd {
             base: KObjectBase::new(),
-            mask: Arc::new(AtomicU64::new(mask)),
+            mask: Arc::new(AtomicU64::new(Self::accepted(mask))),
             flags: Mutex::new(flags),
         })
     }
 
     /// Replace the accepted-signal mask (`signalfd4` on an existing fd).
     pub fn set_mask(&self, mask: u64) {
-        self.mask.store(mask, SeqCst);
+        self.mask.store(Self::accepted(mask), SeqCst);
     }
 
     /// The calling thread's pending signals that this fd accepts.
@@ -186,8 +210,71 @@ mod tests {
         assert_eq!(block_on(fd.read(&mut buf)), Err(LxError::EAGAIN));
     }
 
+    /// The one a signalfd must never be allowed to take.
+    ///
+    /// `SignalFd` does not defer what it accepts, it **consumes** it: a read
+    /// takes the bit out of the thread's pending set, and nothing delivers it
+    /// afterwards. So a mask naming SIGKILL is a process eating its own
+    /// death -- `pthread_kill(t, SIGKILL)` is a `tgkill`, which makes the
+    /// signal pending like any other -- and one naming SIGSTOP swallows every
+    /// `kill -STOP`. `do_signalfd4` deletes both before it stores the set.
+    #[test]
+    fn a_signalfd_cannot_accept_the_two_signals_nothing_may_keep() {
+        let fd = sfd(
+            mask_of(&[
+                LinuxSignal::SIGKILL,
+                LinuxSignal::SIGSTOP,
+                LinuxSignal::SIGINT,
+            ]),
+            OpenFlags::NON_BLOCK,
+        );
+        let got = Sigset::new(fd.mask.load(SeqCst));
+        assert!(
+            !got.contains(LinuxSignal::SIGKILL),
+            "it could eat its own kill"
+        );
+        assert!(
+            !got.contains(LinuxSignal::SIGSTOP),
+            "it could eat its own stop"
+        );
+        assert!(
+            got.contains(LinuxSignal::SIGINT),
+            "and lost what it asked for"
+        );
+    }
+
+    /// The set has two doors -- a new fd and a replacement on an existing
+    /// one -- so the filter lives where both arrive rather than at the
+    /// syscall.
+    #[test]
+    fn replacing_the_mask_goes_through_the_same_filter() {
+        let fd = sfd(mask_of(&[LinuxSignal::SIGINT]), OpenFlags::NON_BLOCK);
+        fd.set_mask(u64::MAX);
+        let got = Sigset::new(fd.mask.load(SeqCst));
+        assert!(!got.contains(LinuxSignal::SIGKILL));
+        assert!(!got.contains(LinuxSignal::SIGSTOP));
+        // Everything else a `sigfillset` asked for is still there.
+        assert!(got.contains(LinuxSignal::SIGTERM));
+        assert!(got.contains(LinuxSignal::SIGTSTP));
+    }
+
+    /// The filter takes those two and nothing else: a signalfd that quietly
+    /// lost SIGTSTP would be a shell that cannot see Ctrl-Z.
+    #[test]
+    fn the_filter_takes_exactly_two_signals() {
+        let fd = sfd(u64::MAX, OpenFlags::NON_BLOCK);
+        let want = Sigset::new(u64::MAX).blockable().val();
+        assert_eq!(fd.mask.load(SeqCst), want);
+        assert_eq!(
+            (u64::MAX ^ fd.mask.load(SeqCst)).count_ones(),
+            2,
+            "exactly SIGKILL and SIGSTOP"
+        );
+    }
+
     #[test]
     fn the_accepted_mask_is_what_it_was_created_with_and_can_be_replaced() {
+        // Neither of these is filtered, so the stored set is the whole ask.
         let wanted = mask_of(&[LinuxSignal::SIGINT, LinuxSignal::SIGTERM]);
         let fd = sfd(wanted, OpenFlags::NON_BLOCK);
         assert_eq!(fd.mask.load(SeqCst), wanted);

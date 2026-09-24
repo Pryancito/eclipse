@@ -229,16 +229,23 @@ impl Syscall<'_> {
     /// `fd == -1` a new signalfd is created; otherwise the existing fd's mask is
     /// replaced. The caller is expected to also block those signals
     /// (`sigprocmask`) so they stay pending for the fd — which libwayland does.
+    ///
+    /// The order below is `do_signalfd4`'s: the flag word, then `sizemask`,
+    /// then the set itself.
     pub fn sys_signalfd4(
         &self,
         fd: FileDesc,
         mask: UserInPtr<u64>,
-        _sizemask: usize,
+        sizemask: usize,
         flags: usize,
     ) -> SysResult {
         // Checked before anything else, as Linux does: the flag word is
         // rejected whether or not `fd` names an existing signalfd.
         let open_flags = anon_fd_flags(flags, ANON_CLOEXEC | ANON_NONBLOCK)?;
+        // How wide the caller's `sigset_t` is. Every other syscall in this
+        // tree that takes one asks (see [`check_sigsetsize`]); this one took
+        // the word, named it `_sizemask`, and read eight bytes regardless.
+        crate::signal::check_sigsetsize(sizemask)?;
         let sigmask = mask.read()?;
         info!(
             "signalfd4: fd={:?}, mask={:#x}, flags={:#x}",

@@ -54,13 +54,22 @@ impl Sigset {
     ///
     /// `sigprocmask(2)`: "It is not possible to block SIGKILL or SIGSTOP.
     /// Attempts to do so are silently ignored." Linux enforces it by clearing
-    /// those two bits from every mask that arrives from userspace, in
-    /// `sigprocmask`, in `sigsuspend`, in `ppoll`/`pselect`'s temporary mask
-    /// and in `sigreturn`'s restored one -- four doors into the same field,
-    /// and a process that gets through any of them can no longer be stopped.
+    /// those two bits from every set that arrives from userspace, and there
+    /// are more doors than the field suggests:
     ///
-    /// Two of the four checked it here and two did not, which is why this is a
-    /// method and not another pair of `remove` calls.
+    /// 1. `sigprocmask`, 2. `sigsuspend`, 3. `ppoll`/`pselect`'s temporary
+    ///    mask, 4. `sigreturn`'s restored one -- the blocked set proper, and a
+    ///    process through any of them can no longer be stopped;
+    /// 5. a `sigaction`'s `sa_mask` ([`SignalAction::stored`]), which *becomes*
+    ///    the blocked set on every delivery of that signal;
+    /// 6. `rt_sigtimedwait`'s wait set, and
+    /// 7. a `signalfd`'s accepted set (`SignalFd::accepted`) -- the two that
+    ///    do not block a signal but **consume** it, which is worse: the bit
+    ///    leaves the pending set and nobody delivers it at all.
+    ///
+    /// Two of the first four checked it here and two did not, which is why
+    /// this is a method and not another pair of `remove` calls. The seventh
+    /// door was open until somebody counted them.
     pub fn blockable(&self) -> Sigset {
         let mut out = *self;
         out.remove(Signal::SIGKILL);
