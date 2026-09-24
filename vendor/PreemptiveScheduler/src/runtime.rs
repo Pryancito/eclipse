@@ -268,25 +268,106 @@ pub(crate) fn request_resched(owner: u8) {
     }
 }
 
-/// Waker-forwarding: a notified task cannot run on `skip` (affinity), so make
-/// one of its ALLOWED CPUs look for it. Sleeping CPUs first — they answer in
-/// IPI time and cost nothing to wake — else the lowest allowed, whose
-/// `request_resched` publication coalesces with any outstanding request.
-pub(crate) fn kick_for_affinity(mask: u64, skip: usize) {
+/// The CPUs that could actually pick up a task whose affinity is `mask`:
+/// allowed by the mask **and** inside their executor loop.
+///
+/// Affinity and executor-readiness are two different sets and the difference is
+/// reachable, not theoretical. `sched_setaffinity` validates a mask against
+/// `cpu_online_mask` — the CPUs that reached `secondary_init` — but a CPU is
+/// only a scheduler destination once it enters [`run_until_idle`], which is
+/// several megabytes of runtime construction later. So a thread can be legally
+/// pinned to a CPU that is online and not yet a place a task can be handed to.
+pub(crate) fn reachable_affinity_cpus(mask: u64, ready: u64) -> u64 {
+    mask & ready
+}
+
+/// Which CPU to kick so a task that cannot run on `skip` gets looked at, or
+/// `None` when no reachable CPU is allowed to run it.
+///
+/// Pure, so the choice can be tested: on the host `cpu_id()` is hardwired to 0
+/// and `EXECUTOR_READY`/`SLEEPING_CPUS` are globals, so the only way to ask
+/// "who would you kick on a four-CPU machine?" is to pass the machine in.
+///
+/// Two rules, in order:
+///
+///  * **Only a CPU that is in its executor loop.** This is what the choice used
+///    to be missing, and [`EXECUTOR_READY`]'s own doc comment names affinity as
+///    one of its three consumers. Without it the kick goes to the lowest
+///    *allowed* CPU whatever its state, so a task pinned to `{1, 3}` with only
+///    CPU 3 running its executor kicked CPU 1 — which is not looking at any run
+///    queue — and CPU 3, the one CPU that could have run the task, was never
+///    told. The task then waited for CPU 3's next timer tick or for it to go
+///    idle and steal, which is exactly the wake latency this whole path exists
+///    to remove.
+///  * **A sleeping CPU first.** It answers in IPI time and costs nothing to
+///    wake, where a busy one has to reach a trap first.
+///
+/// `None` is a real answer, not a failure: the allowed CPUs are not in their
+/// executor loops yet, so there is nobody to tell. Each of them runs
+/// `take_task` as soon as it gets there and finds the task waiting.
+pub(crate) fn pick_affinity_kick_target(
+    mask: u64,
+    skip: usize,
+    ready: u64,
+    sleeping: u64,
+) -> Option<u8> {
     let mask = if skip < 64 {
         mask & !(1u64 << skip)
     } else {
         mask
     };
-    if mask == 0 {
-        return;
+    let candidates = reachable_affinity_cpus(mask, ready);
+    if candidates == 0 {
+        return None;
     }
-    let sleeping = SLEEPING_CPUS.load(Ordering::SeqCst) & mask;
+    let sleeping = sleeping & candidates;
     let target = if sleeping != 0 {
         sleeping.trailing_zeros()
     } else {
-        mask.trailing_zeros()
-    } as u8;
+        candidates.trailing_zeros()
+    };
+    Some(target as u8)
+}
+
+/// Where a task whose affinity is `mask` should be born, or `None` when the
+/// mask names no CPU at all.
+///
+/// Prefer a CPU that is already in its executor loop; failing that, take the
+/// lowest CPU the mask *allows*, even though it is not ready yet.
+///
+/// The second half is the part that used to be missing: placement fell back to
+/// **CPU 0** when no allowed CPU was executor-ready, and CPU 0 is in general a
+/// CPU the mask forbids. The task then sits in a queue whose own executor skips
+/// it on every pass (`Task::allowed_on` is checked inside the generator), so
+/// nothing on that CPU will ever run it; it only escapes if some allowed CPU
+/// later goes idle and happens to steal it. Landing it in the queue of a CPU
+/// that is allowed to run it means the wait ends the moment that CPU enters its
+/// loop — `GLOBAL_RUNTIME.force` builds the queue for a CPU that has not got
+/// there yet, which is what `force` is for.
+pub(crate) fn affinity_home(mask: u64, ready: u64) -> Option<usize> {
+    let reachable = reachable_affinity_cpus(mask, ready);
+    if reachable != 0 {
+        return Some(reachable.trailing_zeros() as usize);
+    }
+    if mask != 0 {
+        return Some(mask.trailing_zeros() as usize);
+    }
+    None
+}
+
+/// Waker-forwarding: a notified task cannot run on `skip` (affinity), so make
+/// one of its ALLOWED CPUs look for it. Sleeping CPUs first — they answer in
+/// IPI time and cost nothing to wake — else the lowest allowed, whose
+/// `request_resched` publication coalesces with any outstanding request.
+pub(crate) fn kick_for_affinity(mask: u64, skip: usize) {
+    let Some(target) = pick_affinity_kick_target(
+        mask,
+        skip,
+        executor_ready_mask(),
+        SLEEPING_CPUS.load(Ordering::SeqCst),
+    ) else {
+        return;
+    };
     request_resched(target);
 }
 
@@ -957,11 +1038,13 @@ pub fn spawn_task(
             .as_ref()
             .map(|a| a.load(Ordering::Relaxed))
             .unwrap_or(u64::MAX);
-        // First ready CPU allowed by the mask, used as the fallback home when every
-        // candidate runtime is momentarily locked.
-        let mut best = (0..online)
-            .find(|&i| is_executor_ready(i) && (mask >> i) & 1 != 0)
-            .unwrap_or(0);
+        // Fallback home for when every candidate runtime is momentarily locked:
+        // the lowest CPU the mask allows, preferring one already in its
+        // executor loop. NOT CPU 0 — see `affinity_home`: CPU 0 is in general a
+        // CPU the mask forbids, and a task parked in the queue of a CPU that is
+        // not allowed to poll it is skipped on every pass of that CPU's
+        // generator.
+        let mut best = affinity_home(mask, executor_ready_mask()).unwrap_or(0);
         let mut best_count = usize::MAX;
         for i in 0..online {
             if !is_executor_ready(i) || (mask >> i) & 1 == 0 {
@@ -1778,5 +1861,482 @@ pub fn get_current_executor_id() -> (usize, usize) {
         (executor.id(), executor.task_id())
     } else {
         (0, 0)
+    }
+}
+
+/// The cross-CPU half of the scheduler had no tests, and the job that looks
+/// like it tests this crate was testing a different one: `test.yml` ran
+/// `cargo test --manifest-path vendor/preemptive-scheduler/Cargo.toml`, the
+/// pristine upstream copy, while the kernel links `vendor/PreemptiveScheduler`
+/// through the `[patch]` in the workspace manifest. Both crates are named
+/// `executor`; this is the fork the machine actually runs, and it is four times
+/// the size of the one that was being tested.
+///
+/// What is testable here is the *deciding*, which is where the bugs were: who
+/// gets woken when a task cannot run where it landed, and where a task with an
+/// affinity mask is born. Those choices are pure functions of (mask, ready set,
+/// sleeping set) — made so deliberately, for the same reason the IPI module
+/// grew its `..._on(me)` entry points: on the host `cpu_id()` is hardwired to
+/// `0` and the CPU masks are globals, so the only way to ask "what would you do
+/// on a four-CPU machine?" is to hand the machine over as an argument.
+#[cfg(test)]
+mod affinity_tests {
+    use super::*;
+
+    /// Bitmask from a list of CPU ids, so the tests read as sets of CPUs.
+    fn cpus(ids: &[usize]) -> u64 {
+        ids.iter().fold(0u64, |m, &i| m | (1u64 << i))
+    }
+
+    const NOBODY: u64 = 0;
+
+    // ── who gets kicked ────────────────────────────────────────────────────
+
+    #[test]
+    fn the_cpu_kicked_is_one_that_is_actually_running_its_executor() {
+        // Pinned to CPUs 1 and 3, woken on CPU 0, and only CPU 3 has entered
+        // its executor loop. Kicking the lowest *allowed* CPU picks 1, which is
+        // not looking at any run queue, and CPU 3 — the only CPU that can run
+        // this task — is never told.
+        assert_eq!(
+            pick_affinity_kick_target(cpus(&[1, 3]), 0, cpus(&[0, 3]), NOBODY),
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn a_sleeping_cpu_is_preferred_because_it_answers_in_ipi_time() {
+        // 1 and 2 are both allowed and both ready; 2 is halted, so it can be
+        // woken straight out of `hlt` instead of waiting for 1 to take a trap.
+        assert_eq!(
+            pick_affinity_kick_target(cpus(&[1, 2]), 0, cpus(&[0, 1, 2]), cpus(&[2])),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn a_sleeping_cpu_that_cannot_run_the_task_is_not_the_answer() {
+        // CPU 2 is halted but the mask forbids it; CPU 1 is allowed, ready and
+        // busy. Preferring "sleeping" over "able to run it" wakes a CPU that
+        // will find nothing and leaves the task waiting.
+        assert_eq!(
+            pick_affinity_kick_target(cpus(&[1]), 0, cpus(&[1, 2]), cpus(&[2])),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn the_cpu_that_could_not_run_it_is_never_the_one_kicked() {
+        // `skip` is the CPU whose generator just refused the task. Kicking it
+        // sends the task straight back to the CPU that rejected it — a wake
+        // loop between one CPU and itself.
+        assert_eq!(
+            pick_affinity_kick_target(cpus(&[0, 2]), 0, cpus(&[0, 1, 2]), NOBODY),
+            Some(2)
+        );
+        // And when it is the only allowed CPU there is nobody else to tell.
+        assert_eq!(
+            pick_affinity_kick_target(cpus(&[0]), 0, cpus(&[0, 1, 2]), NOBODY),
+            None
+        );
+    }
+
+    #[test]
+    fn nobody_is_kicked_when_no_allowed_cpu_is_in_its_executor_loop() {
+        // The allowed CPUs are online — `sched_setaffinity` checked that — but
+        // have not reached `run_until_idle`. There is nothing to tell: each of
+        // them runs `take_task` the moment it gets there and finds the task.
+        assert_eq!(
+            pick_affinity_kick_target(cpus(&[2, 3]), 0, cpus(&[0]), NOBODY),
+            None
+        );
+        // Not even when one of them is "sleeping": a CPU cannot be halted in
+        // the executor's idle window before it has entered the executor.
+        assert_eq!(
+            pick_affinity_kick_target(cpus(&[2, 3]), 0, cpus(&[0]), cpus(&[2])),
+            None
+        );
+    }
+
+    #[test]
+    fn an_empty_mask_kicks_no_one() {
+        assert_eq!(pick_affinity_kick_target(0, 0, u64::MAX, u64::MAX), None);
+    }
+
+    #[test]
+    fn a_task_that_may_run_anywhere_kicks_someone_other_than_us() {
+        // The callers pass `u64::MAX` when the task vanished between the two
+        // slab lookups. It must still not resolve to the CPU that asked.
+        assert_eq!(
+            pick_affinity_kick_target(u64::MAX, 0, cpus(&[0, 1]), NOBODY),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn a_skip_that_names_no_cpu_does_not_get_to_shift() {
+        // `1u64 << skip` is undefined past 63 and on x86 wraps to bit
+        // `skip % 64`, which would quietly clear some other CPU's bit.
+        assert_eq!(
+            pick_affinity_kick_target(cpus(&[0, 1]), 64, cpus(&[0, 1]), NOBODY),
+            Some(0)
+        );
+        assert_eq!(
+            pick_affinity_kick_target(cpus(&[0, 1]), usize::MAX, cpus(&[0, 1]), NOBODY),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn the_highest_cpu_the_masks_hold_can_be_kicked() {
+        assert_eq!(
+            pick_affinity_kick_target(cpus(&[63]), 0, cpus(&[63]), NOBODY),
+            Some(63)
+        );
+        assert_eq!(
+            pick_affinity_kick_target(cpus(&[63]), 0, cpus(&[63]), cpus(&[63])),
+            Some(63)
+        );
+    }
+
+    // ── where an affine task is born ───────────────────────────────────────
+
+    #[test]
+    fn an_affine_task_is_born_on_a_cpu_that_is_allowed_to_poll_it() {
+        // The fallback used to be CPU 0, which this mask forbids. A task in
+        // CPU 0's queue is skipped by CPU 0's generator on every pass
+        // (`Task::allowed_on`), so nothing on that CPU ever runs it — it only
+        // escapes if some allowed CPU later goes idle and steals it.
+        assert_eq!(affinity_home(cpus(&[2, 3]), cpus(&[0, 1])), Some(2));
+    }
+
+    #[test]
+    fn a_ready_cpu_is_preferred_over_one_that_is_merely_allowed() {
+        // Allowed on 1 and 3, and 3 is the one in its executor loop: born
+        // there, it runs now instead of when CPU 1 arrives.
+        assert_eq!(affinity_home(cpus(&[1, 3]), cpus(&[0, 3])), Some(3));
+    }
+
+    #[test]
+    fn the_lowest_allowed_and_ready_cpu_is_the_home() {
+        assert_eq!(affinity_home(cpus(&[1, 2, 3]), cpus(&[0, 2, 3])), Some(2));
+    }
+
+    #[test]
+    fn a_task_with_no_affinity_is_born_on_the_first_ready_cpu() {
+        // `u64::MAX` is what `spawn_task` passes for "anywhere".
+        assert_eq!(affinity_home(u64::MAX, cpus(&[0, 1])), Some(0));
+        assert_eq!(affinity_home(u64::MAX, cpus(&[2, 5])), Some(2));
+    }
+
+    #[test]
+    fn a_mask_that_names_no_cpu_has_no_home() {
+        // `sched_setaffinity` rejects an empty effective mask with EINVAL, so
+        // the caller keeps its own fallback rather than this being reachable.
+        assert_eq!(affinity_home(0, u64::MAX), None);
+        assert_eq!(affinity_home(0, 0), None);
+    }
+
+    #[test]
+    fn with_nothing_ready_yet_the_home_is_still_a_cpu_the_mask_allows() {
+        // Early boot: the BSP is the only CPU in its loop and the task is
+        // pinned away from it.
+        assert_eq!(affinity_home(cpus(&[3]), cpus(&[0])), Some(3));
+        assert_eq!(affinity_home(cpus(&[3]), 0), Some(3));
+    }
+
+    // ── the two choices agree with each other ──────────────────────────────
+
+    #[test]
+    fn a_task_is_never_born_somewhere_it_would_have_to_be_kicked_away_from() {
+        // The home must be a CPU the mask allows, for every shape of machine —
+        // otherwise the task lands where its own generator refuses it.
+        for mask in [
+            cpus(&[0]),
+            cpus(&[3]),
+            cpus(&[1, 2]),
+            cpus(&[0, 63]),
+            u64::MAX,
+        ] {
+            for ready in [0, cpus(&[0]), cpus(&[0, 1]), cpus(&[3]), u64::MAX] {
+                let home = affinity_home(mask, ready).expect("a non-empty mask has a home");
+                assert!(
+                    mask & (1u64 << home) != 0,
+                    "born on CPU {} which mask {:#x} forbids",
+                    home,
+                    mask
+                );
+                // And when the home IS ready, nobody needs kicking on its
+                // behalf: it is already looking at the queue the task is in.
+                if ready & (1u64 << home) != 0 {
+                    assert_eq!(
+                        pick_affinity_kick_target(mask, home, ready & !(1u64 << home), 0),
+                        reachable_affinity_cpus(mask & !(1u64 << home), ready & !(1u64 << home))
+                            .ne(&0)
+                            .then(|| {
+                                reachable_affinity_cpus(
+                                    mask & !(1u64 << home),
+                                    ready & !(1u64 << home),
+                                )
+                                .trailing_zeros() as u8
+                            }),
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn reachable_is_the_intersection_and_nothing_else() {
+        assert_eq!(
+            reachable_affinity_cpus(cpus(&[1, 2, 3]), cpus(&[2, 3, 4])),
+            cpus(&[2, 3])
+        );
+        assert_eq!(reachable_affinity_cpus(cpus(&[1]), cpus(&[2])), 0);
+        assert_eq!(reachable_affinity_cpus(u64::MAX, cpus(&[7])), cpus(&[7]));
+        assert_eq!(reachable_affinity_cpus(cpus(&[7]), u64::MAX), cpus(&[7]));
+    }
+}
+
+/// The other half of "who does the scheduler wake": the reschedule request
+/// itself. A wake that lands on a CPU busy running something else, or halted in
+/// `hlt`, reaches its task only because of the bookkeeping below — and the
+/// comment on [`NEED_RESCHED`] puts a number on what it is worth (up to 20 ms
+/// of latency on every interactive wake, which is most of why the system feels
+/// slower than its microbenchmarks).
+///
+/// These share the module's globals, so they take a lock and install a
+/// recording IPI sender. CI runs the suite with `--test-threads=1` and would
+/// therefore never notice if they did not.
+#[cfg(test)]
+mod resched_tests {
+    use super::*;
+
+    fn test_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// CPUs the recording sender has been asked to kick, as a bitmask, and how
+    /// many kicks in total (so a coalesced second kick is distinguishable from
+    /// no second kick).
+    static KICKED: AtomicU64 = AtomicU64::new(0);
+    static KICK_COUNT: AtomicU64 = AtomicU64::new(0);
+
+    fn record_kick(cpu: usize) {
+        if cpu < 64 {
+            KICKED.fetch_or(1u64 << cpu, Ordering::SeqCst);
+        }
+        KICK_COUNT.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Reset every global this module reads, and arm the recorder. The host's
+    /// `cpu_id()` is hardwired to 0, so "us" is always CPU 0 here.
+    fn fresh() -> std::sync::MutexGuard<'static, ()> {
+        let guard = test_lock();
+        NEED_RESCHED.store(0, Ordering::SeqCst);
+        SLEEPING_CPUS.store(0, Ordering::SeqCst);
+        KICKED.store(0, Ordering::SeqCst);
+        KICK_COUNT.store(0, Ordering::SeqCst);
+        WAKEUP_PREEMPT.store(true, Ordering::SeqCst);
+        set_resched_ipi_sender(record_kick);
+        guard
+    }
+
+    fn kicked() -> u64 {
+        KICKED.load(Ordering::SeqCst)
+    }
+
+    fn kicks() -> u64 {
+        KICK_COUNT.load(Ordering::SeqCst)
+    }
+
+    fn pending(cpu: usize) -> bool {
+        NEED_RESCHED.load(Ordering::SeqCst) & (1u64 << cpu) != 0
+    }
+
+    #[test]
+    fn a_wake_for_a_busy_peer_publishes_the_request_and_kicks_it_once() {
+        let _g = fresh();
+        request_resched(2);
+        assert!(pending(2), "CPU 2 was never told to look at its run queue");
+        assert_eq!(kicked(), 1 << 2);
+        assert_eq!(kicks(), 1);
+    }
+
+    #[test]
+    fn a_burst_of_wakes_for_one_cpu_costs_one_ipi() {
+        let _g = fresh();
+        // A 64-entry socket queue draining, or N threads released from one
+        // futex: the first request is what makes the CPU look, and it will see
+        // all of them when it does.
+        for _ in 0..8 {
+            request_resched(3);
+        }
+        assert!(pending(3));
+        assert_eq!(kicks(), 1, "the coalesced burst sent {} IPIs", kicks());
+    }
+
+    #[test]
+    fn a_cpu_that_parks_after_the_request_is_still_kicked_out_of_halt() {
+        let _g = fresh();
+        request_resched(3);
+        assert_eq!(kicks(), 1);
+        // The request is already outstanding, so the cheap path would return
+        // having done nothing — but CPU 3 has since entered the halt window and
+        // will not look again until its next tick without an interrupt.
+        set_cpu_sleeping(3, true);
+        request_resched(3);
+        assert_eq!(kicks(), 2, "a halted CPU slept through the wake");
+    }
+
+    #[test]
+    fn waking_ourselves_publishes_the_request_but_sends_no_interrupt() {
+        let _g = fresh();
+        // Raised from IRQ context on the CPU running the hog: exactly the case
+        // that must preempt, and exactly the case where an IPI to ourselves
+        // buys nothing — we reach the trap path on our own.
+        request_resched(0);
+        assert!(pending(0));
+        assert_eq!(kicks(), 0, "a CPU sent itself an interrupt");
+    }
+
+    #[test]
+    fn waking_ourselves_while_halted_does_send_one() {
+        let _g = fresh();
+        set_cpu_sleeping(0, true);
+        request_resched(0);
+        assert_eq!(kicked(), 1);
+    }
+
+    #[test]
+    fn the_request_is_taken_exactly_once() {
+        let _g = fresh();
+        request_resched(0);
+        assert!(take_need_resched(), "the yield never happened");
+        assert!(!take_need_resched(), "one wake made the thread yield twice");
+        assert!(!pending(0));
+    }
+
+    #[test]
+    fn an_empty_run_queue_drops_the_request_so_the_next_wake_still_kicks() {
+        let _g = fresh();
+        request_resched(1);
+        assert_eq!(kicks(), 1);
+        // The executor found nothing to run: there is nothing left to preempt
+        // *for*, and a bit left set would swallow the next genuine wake's IPI.
+        clear_need_resched(1);
+        assert!(!pending(1));
+        request_resched(1);
+        assert_eq!(
+            kicks(),
+            2,
+            "the next wake was coalesced into a dead request"
+        );
+    }
+
+    #[test]
+    fn the_counters_count_requests_and_the_yields_they_caused() {
+        let _g = fresh();
+        let (req0, taken0) = wakeup_preempt_stats();
+        request_resched(0);
+        request_resched(0); // coalesced: not a second request
+        assert_eq!(wakeup_preempt_stats().0, req0 + 1);
+        assert!(take_need_resched());
+        assert_eq!(wakeup_preempt_stats().1, taken0 + 1);
+    }
+
+    #[test]
+    fn with_wake_preemption_off_a_busy_cpu_finishes_its_slice() {
+        let _g = fresh();
+        set_wakeup_preempt(false);
+        request_resched(2);
+        assert!(!pending(2), "a request was published with preemption off");
+        assert_eq!(kicks(), 0);
+        // …but a halted CPU is still kicked, or the wake waits for its tick.
+        set_cpu_sleeping(2, true);
+        request_resched(2);
+        assert_eq!(kicked(), 1 << 2);
+        set_wakeup_preempt(true);
+    }
+
+    #[test]
+    fn the_plain_delivery_kick_only_fires_for_a_halted_owner() {
+        let _g = fresh();
+        // Nothing to preempt for — the task is already checked out to an
+        // executor — but a halted owner still has to be woken to deliver it.
+        maybe_send_resched_ipi(4);
+        assert_eq!(kicks(), 0);
+        set_cpu_sleeping(4, true);
+        maybe_send_resched_ipi(4);
+        assert_eq!(kicked(), 1 << 4);
+        assert!(
+            !pending(4),
+            "a delivery kick published a preemption request"
+        );
+    }
+
+    #[test]
+    fn an_id_that_names_no_cpu_does_not_get_to_shift_or_index() {
+        let _g = fresh();
+        // `1u64 << n` is undefined past 63 and on x86 wraps to bit `n % 64`, so
+        // an unchecked id does not merely fail — it answers for another CPU.
+        request_resched(64);
+        request_resched(255);
+        maybe_send_resched_ipi(64);
+        maybe_send_resched_ipi(255);
+        set_cpu_sleeping(64, true);
+        set_cpu_sleeping(usize::MAX, true);
+        clear_need_resched(64);
+        clear_need_resched(usize::MAX);
+        assert_eq!(NEED_RESCHED.load(Ordering::SeqCst), 0);
+        assert_eq!(SLEEPING_CPUS.load(Ordering::SeqCst), 0);
+        assert_eq!(kicks(), 0);
+    }
+
+    #[test]
+    fn leaving_the_halt_window_clears_the_bit_it_set() {
+        let _g = fresh();
+        set_cpu_sleeping(5, true);
+        assert_eq!(SLEEPING_CPUS.load(Ordering::SeqCst), 1 << 5);
+        set_cpu_sleeping(5, false);
+        assert_eq!(SLEEPING_CPUS.load(Ordering::SeqCst), 0);
+        // And a wake for a CPU that woke up on its own is not an IPI.
+        request_resched(5);
+        assert_eq!(kicks(), 1); // the busy-CPU preemption kick, not a halt kick
+        assert!(pending(5));
+    }
+
+    // ── the ready set the scans are bounded by ─────────────────────────────
+
+    #[test]
+    fn the_boot_cpu_counts_as_ready_before_anyone_marks_it() {
+        // Tasks are spawned before any CPU reaches `run_until_idle`, and they
+        // have to land somewhere that will actually poll them.
+        assert!(is_executor_ready(0));
+        assert!(executor_ready_mask() & 1 != 0);
+    }
+
+    #[test]
+    fn an_id_past_the_mask_is_never_ready() {
+        assert!(!is_executor_ready(64));
+        assert!(!is_executor_ready(usize::MAX));
+    }
+
+    #[test]
+    fn the_scan_bound_reaches_the_highest_ready_cpu_even_with_holes_below_it() {
+        let _g = test_lock();
+        let saved = EXECUTOR_READY.load(Ordering::SeqCst);
+        // CPU 1 never came up; CPU 2 did. A bound of "number of ready CPUs"
+        // would be 2 and would stop before CPU 2 — the hole has to be counted.
+        EXECUTOR_READY.store(0b101, Ordering::SeqCst);
+        assert_eq!(num_online_cpus(), 3);
+        assert!(!is_executor_ready(1));
+        assert!(is_executor_ready(2));
+        EXECUTOR_READY.store(1u64 << 63, Ordering::SeqCst);
+        assert_eq!(num_online_cpus(), 64);
+        EXECUTOR_READY.store(0, Ordering::SeqCst);
+        assert_eq!(num_online_cpus(), 1, "a scan must still cover the boot CPU");
+        EXECUTOR_READY.store(saved, Ordering::SeqCst);
     }
 }
