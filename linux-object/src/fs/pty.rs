@@ -64,27 +64,6 @@ const VWERASE: usize = 14;
 const VLNEXT: usize = 15;
 const VEOL2: usize = 16;
 
-/// How much cooked input may wait for the slave to read it.
-///
-/// Linux's line discipline reads into a fixed `read_buf[N_TTY_BUF_SIZE]`
-/// (`drivers/tty/n_tty.c`), and works out
-/// `room = N_TTY_BUF_SIZE - (read_head - read_tail)` before every batch; with
-/// no room it consumes nothing and returns a count short of what it was
-/// offered. The committed input and the line still being edited are two
-/// indices into that one buffer, so they share the budget here too -- which is
-/// also what this file's own `TIOCOUTQ` already reports.
-const PTY_INPUT_CAP: usize = 4096;
-
-/// How much program output may wait for the master to read it.
-///
-/// The other direction, which Linux bounds somewhere else: a write to the
-/// slave lands in the master port's flip buffer, capped at
-/// `TTYB_DEFAULT_MEM_LIMIT` (`drivers/tty/tty_buffer.c`), and
-/// `pty_write_room` reports what is left of it. That cap is what makes
-/// `yes > /dev/pts/N` with nobody reading the master block instead of eating
-/// the machine.
-const PTY_OUTPUT_CAP: usize = 640 * 1024;
-
 /// Mutable, lock-protected state shared by a master/slave pair.
 struct PtyInner {
     /// Bytes available to the slave's `read` (cooked input from the master).
@@ -180,13 +159,16 @@ impl Pty {
     /// the queue is full and the discipline keeps taking bytes anyway.
     fn master_writable(&self) -> bool {
         let inner = self.inner.lock();
-        inner.input.len() + inner.canon.len() < PTY_INPUT_CAP
-            || (inner.termios.c_lflag & ICANON != 0 && inner.input.is_empty())
+        input_room(
+            inner.input.len(),
+            inner.canon.len(),
+            inner.termios.c_lflag & ICANON != 0,
+        ) != InputRoom::Full
     }
 
     /// Whether a write to the slave would store anything.
     fn slave_writable(&self) -> bool {
-        self.inner.lock().output.len() < PTY_OUTPUT_CAP
+        self.inner.lock().output.len() < TTY_OUTPUT_CAP
     }
 
     /// Whether the *blocking* slave read parked in [`Pty::slave_read`] can now
@@ -269,26 +251,19 @@ impl Pty {
             let kill_echo = inner.termios.kill_echo();
             let utf8 = inner.termios.utf8_input();
             for (i, &b) in data.iter().enumerate() {
-                // Room for one more? See [`PTY_INPUT_CAP`].
-                //
-                // One case may not refuse: a canonical line long enough to
-                // fill the queue on its own, with nothing committed behind it.
-                // Refusing there refuses VERASE and VKILL along with
-                // everything else, and the terminal wedges at exactly the
-                // moment the user needs to shorten the line -- no way out but
-                // closing it. So the discipline keeps taking bytes (Linux
-                // calls this `overflow`, and says so in its own comment: "let
-                // characters through without limit, so that erase characters
-                // will be handled") and drops the data character instead of
-                // storing it.
-                let mut overflow = false;
-                if inner.input.len() + inner.canon.len() >= PTY_INPUT_CAP {
-                    if lflag & ICANON == 0 || !inner.input.is_empty() {
-                        consumed = i;
-                        break;
-                    }
-                    overflow = true;
-                }
+                // Room for one more? The rule is shared with the console and
+                // with `fs/devfs/pty.rs`, so it lives in `ioctl.rs`. Both
+                // queues here are bytes already, which is the unit it wants.
+                let overflow =
+                    match input_room(inner.input.len(), inner.canon.len(), lflag & ICANON != 0) {
+                        InputRoom::Store => false,
+                        InputRoom::Process => true,
+                        // This end *has* a writer to answer, so it answers.
+                        InputRoom::Full => {
+                            consumed = i;
+                            break;
+                        }
+                    };
                 let mut c = b;
                 // Input CR/NL translation.
                 if c == b'\r' {
@@ -607,7 +582,7 @@ impl Pty {
     /// Program output written to the slave, post-processed for the master.
     ///
     /// Returns how much was taken. Short when the master is not keeping up:
-    /// see [`PTY_OUTPUT_CAP`].
+    /// see [`TTY_OUTPUT_CAP`].
     fn slave_write(&self, data: &[u8]) -> usize {
         if data.is_empty() {
             return 0;
@@ -915,7 +890,7 @@ impl Pty {
     }
 }
 
-/// Append one byte bound for the master, if [`PTY_OUTPUT_CAP`] has room.
+/// Append one byte bound for the master, if [`TTY_OUTPUT_CAP`] has room.
 /// Returns whether it went in.
 ///
 /// Every path that puts something in front of the master comes through here or
@@ -926,7 +901,7 @@ impl Pty {
 /// but Ctrl-C stores not one byte of input and still asks for `^C\r\n` each
 /// time.
 fn out_push(out: &mut VecDeque<u8>, b: u8) -> bool {
-    if out.len() >= PTY_OUTPUT_CAP {
+    if out.len() >= TTY_OUTPUT_CAP {
         return false;
     }
     out.push_back(b);
@@ -938,7 +913,7 @@ fn out_push(out: &mut VecDeque<u8>, b: u8) -> bool {
 /// The runs that come through here are a label or a `\x08 \x08` rubout, and
 /// half of either is worse on screen than neither.
 fn out_extend(out: &mut VecDeque<u8>, bytes: &[u8]) -> bool {
-    if out.len() + bytes.len() > PTY_OUTPUT_CAP {
+    if out.len() + bytes.len() > TTY_OUTPUT_CAP {
         return false;
     }
     out.extend(bytes);
@@ -2348,25 +2323,25 @@ mod tests {
     fn a_raw_write_longer_than_the_input_queue_comes_back_short() {
         let p = pty();
         raw(&p, 1, 0);
-        let big = vec![b'x'; PTY_INPUT_CAP + 512];
-        assert_eq!(p.master_write(&big), PTY_INPUT_CAP);
-        assert_eq!(p.inner.lock().input.len(), PTY_INPUT_CAP);
+        let big = vec![b'x'; N_TTY_BUF_SIZE + 512];
+        assert_eq!(p.master_write(&big), N_TTY_BUF_SIZE);
+        assert_eq!(p.inner.lock().input.len(), N_TTY_BUF_SIZE);
         // And it stays there: the second write is refused outright, which is
         // what stops the caller's loop from being a way to keep allocating.
         assert_eq!(p.master_write(b"x"), 0);
-        assert_eq!(p.inner.lock().input.len(), PTY_INPUT_CAP);
+        assert_eq!(p.inner.lock().input.len(), N_TTY_BUF_SIZE);
     }
 
     #[test]
     fn what_did_not_fit_goes_in_once_the_program_has_read() {
         let p = pty();
         raw(&p, 1, 0);
-        assert_eq!(p.master_write(&vec![b'x'; PTY_INPUT_CAP]), PTY_INPUT_CAP);
+        assert_eq!(p.master_write(&vec![b'x'; N_TTY_BUF_SIZE]), N_TTY_BUF_SIZE);
         let mut buf = [0u8; 100];
         assert_eq!(p.slave_read(&mut buf), Ok(100));
         // Exactly the room that was freed, and not a byte more.
         assert_eq!(p.master_write(&vec![b'y'; 500]), 100);
-        assert_eq!(p.inner.lock().input.len(), PTY_INPUT_CAP);
+        assert_eq!(p.inner.lock().input.len(), N_TTY_BUF_SIZE);
     }
 
     #[test]
@@ -2378,10 +2353,10 @@ mod tests {
         let p = pty();
         p.master_write(b"hecho\n"); // 6 bytes committed to `input`
         assert_eq!(p.inner.lock().input.len(), 6);
-        let rest = PTY_INPUT_CAP - 6;
+        let rest = N_TTY_BUF_SIZE - 6;
         assert_eq!(p.master_write(&vec![b'x'; rest + 100]), rest);
         let inner = p.inner.lock();
-        assert_eq!(inner.input.len() + inner.canon.len(), PTY_INPUT_CAP);
+        assert_eq!(inner.input.len() + inner.canon.len(), N_TTY_BUF_SIZE);
     }
 
     #[test]
@@ -2393,13 +2368,13 @@ mod tests {
         // no way out but closing it.
         let p = pty();
         set_flags(&p, |t| t.c_lflag &= !ECHO);
-        assert_eq!(p.master_write(&vec![b'x'; PTY_INPUT_CAP]), PTY_INPUT_CAP);
-        assert_eq!(p.inner.lock().canon.len(), PTY_INPUT_CAP);
+        assert_eq!(p.master_write(&vec![b'x'; N_TTY_BUF_SIZE]), N_TTY_BUF_SIZE);
+        assert_eq!(p.inner.lock().canon.len(), N_TTY_BUF_SIZE);
         assert_eq!(p.master_write(&[DEL]), 1);
-        assert_eq!(p.inner.lock().canon.len(), PTY_INPUT_CAP - 1);
+        assert_eq!(p.inner.lock().canon.len(), N_TTY_BUF_SIZE - 1);
         // One column free, and the line takes one more character.
         p.master_write(b"z");
-        assert_eq!(p.inner.lock().canon.len(), PTY_INPUT_CAP);
+        assert_eq!(p.inner.lock().canon.len(), N_TTY_BUF_SIZE);
         p.master_write(&[CTRL_U]);
         assert!(p.inner.lock().canon.is_empty());
     }
@@ -2412,24 +2387,24 @@ mod tests {
         // terminator is not one to hand the reader.
         let p = pty();
         set_flags(&p, |t| t.c_lflag &= !ECHO);
-        p.master_write(&vec![b'x'; PTY_INPUT_CAP]);
+        p.master_write(&vec![b'x'; N_TTY_BUF_SIZE]);
         assert_eq!(p.master_write(b"yyy"), 3); // taken
-        assert_eq!(p.inner.lock().canon.len(), PTY_INPUT_CAP); // not stored
+        assert_eq!(p.inner.lock().canon.len(), N_TTY_BUF_SIZE); // not stored
         assert_eq!(p.master_write(b"\n"), 1);
         assert!(p.inner.lock().input.is_empty()); // nothing committed
-        assert_eq!(p.inner.lock().canon.len(), PTY_INPUT_CAP);
+        assert_eq!(p.inner.lock().canon.len(), N_TTY_BUF_SIZE);
         // Erase one column and the newline lands, ending the line.
         p.master_write(&[DEL]);
         p.master_write(b"\n");
         assert_eq!(p.inner.lock().canon.len(), 0);
-        assert_eq!(p.inner.lock().input.len(), PTY_INPUT_CAP);
+        assert_eq!(p.inner.lock().input.len(), N_TTY_BUF_SIZE);
     }
 
     #[test]
     fn a_line_that_fills_the_queue_still_answers_ctrl_c() {
         let p = pty();
         set_flags(&p, |t| t.c_lflag &= !ECHO);
-        p.master_write(&vec![b'x'; PTY_INPUT_CAP]);
+        p.master_write(&vec![b'x'; N_TTY_BUF_SIZE]);
         p.master_write(&[CTRL_C]);
         assert!(p.inner.lock().canon.is_empty());
     }
@@ -2438,11 +2413,11 @@ mod tests {
     fn program_output_stops_at_the_cap_and_says_how_much_it_took() {
         let p = pty();
         set_flags(&p, |t| t.c_oflag = 0); // no ONLCR: one byte is one byte
-        let big = vec![b'x'; PTY_OUTPUT_CAP + 1024];
-        assert_eq!(p.slave_write(&big), PTY_OUTPUT_CAP);
-        assert_eq!(p.inner.lock().output.len(), PTY_OUTPUT_CAP);
+        let big = vec![b'x'; TTY_OUTPUT_CAP + 1024];
+        assert_eq!(p.slave_write(&big), TTY_OUTPUT_CAP);
+        assert_eq!(p.inner.lock().output.len(), TTY_OUTPUT_CAP);
         assert_eq!(p.slave_write(b"x"), 0);
-        assert_eq!(p.inner.lock().output.len(), PTY_OUTPUT_CAP);
+        assert_eq!(p.inner.lock().output.len(), TTY_OUTPUT_CAP);
     }
 
     #[test]
@@ -2452,22 +2427,22 @@ mod tests {
         // that is not the line ending it is waiting for -- and the writer,
         // told one byte went in, would send the `\n` again.
         let p = pty();
-        p.slave_write(&vec![b'x'; PTY_OUTPUT_CAP - 1]);
-        assert_eq!(p.inner.lock().output.len(), PTY_OUTPUT_CAP - 1);
+        p.slave_write(&vec![b'x'; TTY_OUTPUT_CAP - 1]);
+        assert_eq!(p.inner.lock().output.len(), TTY_OUTPUT_CAP - 1);
         assert_eq!(p.slave_write(b"\n"), 0);
-        assert_eq!(p.inner.lock().output.len(), PTY_OUTPUT_CAP - 1);
+        assert_eq!(p.inner.lock().output.len(), TTY_OUTPUT_CAP - 1);
         // One more byte of room and the pair goes in whole.
         let mut buf = [0u8; 1];
         assert_eq!(p.master_read(&mut buf), Ok(1));
         assert_eq!(p.slave_write(b"\n"), 1);
-        assert_eq!(p.inner.lock().output.len(), PTY_OUTPUT_CAP);
+        assert_eq!(p.inner.lock().output.len(), TTY_OUTPUT_CAP);
     }
 
     #[test]
     fn output_room_comes_back_when_the_terminal_reads() {
         let p = pty();
         set_flags(&p, |t| t.c_oflag = 0);
-        p.slave_write(&vec![b'x'; PTY_OUTPUT_CAP]);
+        p.slave_write(&vec![b'x'; TTY_OUTPUT_CAP]);
         let mut buf = [0u8; 300];
         assert_eq!(p.master_read(&mut buf), Ok(300));
         assert_eq!(p.slave_write(&vec![b'y'; 1000]), 300);
@@ -2479,9 +2454,9 @@ mod tests {
         // to, so it is bounded by the same number or it is not bounded at all.
         let p = pty();
         set_flags(&p, |t| t.c_oflag = 0);
-        p.slave_write(&vec![b'x'; PTY_OUTPUT_CAP]);
+        p.slave_write(&vec![b'x'; TTY_OUTPUT_CAP]);
         p.master_write(b"abc\n");
-        assert_eq!(p.inner.lock().output.len(), PTY_OUTPUT_CAP);
+        assert_eq!(p.inner.lock().output.len(), TTY_OUTPUT_CAP);
         // The input itself still went in: the two directions are two budgets.
         assert_eq!(p.inner.lock().input.len(), 4);
     }
@@ -2495,11 +2470,11 @@ mod tests {
         // not just the ones carrying program output.
         let p = pty();
         set_flags(&p, |t| t.c_oflag = 0);
-        for _ in 0..(PTY_OUTPUT_CAP / 2) {
+        for _ in 0..(TTY_OUTPUT_CAP / 2) {
             p.master_write(&[CTRL_C]);
         }
         assert!(p.inner.lock().input.is_empty());
-        assert!(p.inner.lock().output.len() <= PTY_OUTPUT_CAP);
+        assert!(p.inner.lock().output.len() <= TTY_OUTPUT_CAP);
     }
 
     #[test]
@@ -2514,13 +2489,13 @@ mod tests {
         });
         let (master, slave) = ends(p.clone());
         assert_eq!(
-            slave.write_at(0, &vec![b'x'; PTY_OUTPUT_CAP]),
-            Ok(PTY_OUTPUT_CAP)
+            slave.write_at(0, &vec![b'x'; TTY_OUTPUT_CAP]),
+            Ok(TTY_OUTPUT_CAP)
         );
         assert_eq!(slave.write_at(0, b"x"), Err(FsError::Again));
         assert_eq!(
-            master.write_at(0, &vec![b'y'; PTY_INPUT_CAP]),
-            Ok(PTY_INPUT_CAP)
+            master.write_at(0, &vec![b'y'; N_TTY_BUF_SIZE]),
+            Ok(N_TTY_BUF_SIZE)
         );
         assert_eq!(master.write_at(0, b"y"), Err(FsError::Again));
         // An empty write is still a no-op and not an error.
@@ -2541,11 +2516,11 @@ mod tests {
 
         // One end at a time: the two queues are two budgets, so filling the
         // one the program writes to may not report the terminal's end full.
-        p.slave_write(&vec![b'x'; PTY_OUTPUT_CAP]);
+        p.slave_write(&vec![b'x'; TTY_OUTPUT_CAP]);
         assert!(!slave.poll().unwrap().write);
         assert!(master.poll().unwrap().write);
 
-        p.master_write(&vec![b'y'; PTY_INPUT_CAP]);
+        p.master_write(&vec![b'y'; N_TTY_BUF_SIZE]);
         assert!(!master.poll().unwrap().write);
 
         let mut buf = [0u8; 8];
@@ -2564,11 +2539,11 @@ mod tests {
         set_flags(&p, |t| t.c_lflag &= !ECHO);
         let (master, _slave) = ends(p.clone());
         p.master_write(b"hecho\n");
-        p.master_write(&vec![b'x'; PTY_INPUT_CAP - 6]);
+        p.master_write(&vec![b'x'; N_TTY_BUF_SIZE - 6]);
         {
             let inner = p.inner.lock();
             assert_eq!(inner.input.len(), 6);
-            assert_eq!(inner.canon.len(), PTY_INPUT_CAP - 6);
+            assert_eq!(inner.canon.len(), N_TTY_BUF_SIZE - 6);
         }
         assert!(!master.poll().unwrap().write);
         assert_eq!(p.master_write(b"z"), 0);
@@ -2584,8 +2559,8 @@ mod tests {
         // Not arbitrary, and not ours to round off: a program that has been
         // sized against a Linux terminal -- a shell reading a line, a pager
         // filling a screen -- is sized against these.
-        assert_eq!(PTY_INPUT_CAP, 4096); // N_TTY_BUF_SIZE, drivers/tty/n_tty.c
-        assert_eq!(PTY_OUTPUT_CAP, 640 * 1024); // TTYB_DEFAULT_MEM_LIMIT
+        assert_eq!(N_TTY_BUF_SIZE, 4096); // N_TTY_BUF_SIZE, drivers/tty/n_tty.c
+        assert_eq!(TTY_OUTPUT_CAP, 640 * 1024); // TTYB_DEFAULT_MEM_LIMIT
     }
 
     #[test]
@@ -2597,7 +2572,7 @@ mod tests {
         let p = Arc::new(pty());
         set_flags(&p, |t| t.c_lflag &= !ECHO);
         let (master, _slave) = ends(p.clone());
-        p.master_write(&vec![b'x'; PTY_INPUT_CAP]);
+        p.master_write(&vec![b'x'; N_TTY_BUF_SIZE]);
         assert!(master.poll().unwrap().write);
         // Commit the line and the same full queue is no longer writable.
         p.master_write(&[DEL]);

@@ -1280,6 +1280,14 @@ pub struct Stdin {
     read_need: core::sync::atomic::AtomicUsize,
 }
 
+/// The line being edited, in bytes.
+///
+/// `canon_buf` holds `char`s -- erasing works on characters and not on the
+/// bytes that spell them -- but the bound in `ioctl.rs` is a buffer size, so
+/// the line has to be measured in what it would occupy. Walked rather than
+/// tracked alongside: the line is what one person has typed since the last
+/// Enter, and a counter kept in step across VERASE, VWERASE, VKILL and the
+/// commit is a counter that drifts.
 /// Append one character to a reader's queue as the bytes that spell it.
 ///
 /// The queue is what `read(2)` hands over, and this system speaks UTF-8, so a
@@ -1292,6 +1300,10 @@ pub struct Stdin {
 /// The character is never split: a reader with room for one byte gets that one
 /// byte and the rest on its next read, which is what a byte queue gives for
 /// free and what `n_tty` does too.
+fn editing_bytes(canon: &VecDeque<char>) -> usize {
+    canon.iter().map(|c| c.len_utf8()).sum()
+}
+
 fn push_utf8(queue: &mut VecDeque<u8>, c: char) {
     let mut buf = [0u8; 4];
     for &b in c.encode_utf8(&mut buf).as_bytes() {
@@ -1488,16 +1500,48 @@ impl Stdin {
         }
     }
 
+    /// Put one character in front of a reader, if there is room for it.
+    ///
+    /// Returns whether it went in. Canonical mode adds it to the line being
+    /// edited, raw mode makes it readable at once, and both share one bound
+    /// ([`input_room`]): they are two indices into one buffer in `n_tty`.
+    ///
+    /// Every keystroke that ends up queued comes through here, which is what
+    /// makes the bound a bound -- one path pushing straight onto a queue is
+    /// enough to lose it.
+    ///
+    /// What this end cannot do is the third of the rule's three answers. A
+    /// keyboard has no writer to hand a short count to and no way to be asked
+    /// to wait, so `Full` is treated like `Process`: everything is still
+    /// interpreted -- the signal characters above all, since Ctrl-C is how a
+    /// user rescues the program that stopped reading in the first place, and
+    /// losing it here would be losing it exactly when it is needed -- and only
+    /// the storing stops. A character goes in whole or not at all, so a queue
+    /// can end up to three bytes over the bound; what matters is that it stops.
+    fn store_char(&self, c: char, canonical: bool) -> bool {
+        let mut canon = self.canon_buf.lock();
+        let mut buf = self.buf.lock();
+        if !has_input_room(buf.len(), editing_bytes(&canon)) {
+            return false;
+        }
+        if canonical {
+            canon.push_back(c);
+        } else {
+            push_utf8(&mut buf, c);
+        }
+        true
+    }
+
     /// Insert a character verbatim (used after `VLNEXT`): no signal/edit
     /// interpretation. In canonical mode it joins the pending line; in raw mode
     /// it becomes immediately readable.
     fn input_literal(&self, c: char, lflag: u32) {
-        if lflag & ICANON != 0 {
-            self.canon_buf.lock().push_back(c);
-            self.echo_char(c);
-        } else {
-            push_utf8(&mut self.buf.lock(), c);
-            self.echo_char(c);
+        let canonical = lflag & ICANON != 0;
+        if !self.store_char(c, canonical) {
+            return;
+        }
+        self.echo_char(c);
+        if !canonical {
             self.wake_readers();
         }
     }
@@ -1711,14 +1755,18 @@ impl Stdin {
                 }
                 self.wake_readers();
             } else {
-                self.canon_buf.lock().push_back(c);
+                let stored = self.store_char(c, true);
                 self.echo_char(c);
                 // A line is delivered to readers on newline or on either of the
                 // configurable end-of-line delimiters (VEOL / VEOL2).
+                //
+                // Not on one that did not fit: a line that cannot hold its own
+                // terminator is not a line to hand the reader, and the user
+                // still has VERASE and VKILL to shorten it with.
                 let is_eol = c == '\n'
                     || (c_cc[VEOL] != 0 && c as u8 == c_cc[VEOL])
                     || (c_cc[VEOL2] != 0 && c as u8 == c_cc[VEOL2]);
-                if is_eol {
+                if is_eol && stored {
                     let mut canon = self.canon_buf.lock();
                     let mut buf = self.buf.lock();
                     while let Some(ch) = canon.pop_front() {
@@ -1729,7 +1777,7 @@ impl Stdin {
             }
         } else {
             // Raw mode
-            push_utf8(&mut self.buf.lock(), c);
+            self.store_char(c, false);
             self.echo_char(c);
             // Wake readers
             self.data_ready.store(true, Ordering::Release);
@@ -1767,12 +1815,26 @@ impl Stdin {
     }
 
     /// Push raw bytes into stdin without echo (TTY query responses for userland).
+    ///
+    /// Bounded like every other way into the queue, and this is the one a
+    /// program can drive on its own: a `\x1b[5n` written to its **own stdout**
+    /// makes the kernel answer `\x1b[0n` here. A loop of those, never reading
+    /// stdin, is an unprivileged process asking the kernel for memory with no
+    /// keyboard and no privilege involved. There is nobody to hand a short
+    /// count to -- the caller is the kernel answering a query -- so the only
+    /// thing the bound can do is stop.
     pub fn push_bytes(&self, bytes: &[u8]) {
+        let canon = self.canon_buf.lock();
+        let editing = editing_bytes(&canon);
         let mut buf = self.buf.lock();
         for &b in bytes {
+            if !has_input_room(buf.len(), editing) {
+                break;
+            }
             buf.push_back(b);
         }
         drop(buf);
+        drop(canon);
         self.data_ready.store(true, Ordering::Release);
         if let Some(mut eb) = self.eventbus.try_lock() {
             self.data_ready.store(false, Ordering::Relaxed);
@@ -2956,6 +3018,139 @@ mod line_discipline_tests {
         s.push_bytes(&[b'\x1b', b'[', b'0', b'n', 3]);
         assert_eq!(drain(&s), alloc::format!("\x1b[0n{}", CTRL_C));
         assert!(!ctrl_c_pending_peek());
+    }
+
+    // ---- the queue is bounded -------------------------------------------
+    //
+    // A console has no way to ask a keyboard to wait and no writer to hand a
+    // short count to, so all a bound can do at this end is stop storing. What
+    // it may never stop doing is *interpreting*: Ctrl-C is how a user rescues
+    // the program that stopped reading, which is the very thing that filled
+    // the queue.
+
+    #[test]
+    fn the_queue_stops_at_the_bound() {
+        let _g = SERIAL.lock();
+        let s = tty(ECHO, 0); // raw: every character becomes readable at once
+        for _ in 0..(N_TTY_BUF_SIZE + 500) {
+            s.push('x');
+        }
+        assert_eq!(s.buf.lock().len(), N_TTY_BUF_SIZE);
+    }
+
+    #[test]
+    fn a_query_a_program_asks_for_cannot_grow_the_queue_without_end() {
+        // The one path here a program drives on its own, with no keyboard and
+        // no privilege: `\x1b[5n` written to its **own stdout** makes the
+        // kernel answer `\x1b[0n` into its stdin. A loop of those, never
+        // reading, used to be an unprivileged process asking for every page
+        // the kernel had.
+        let _g = SERIAL.lock();
+        let s = vt_stdin(VT);
+        drain_bytes(&s);
+        for _ in 0..N_TTY_BUF_SIZE {
+            tty_handle_outgoing(VT, b"\x1b[5n");
+        }
+        assert_eq!(s.buf.lock().len(), N_TTY_BUF_SIZE);
+        // And the answer is still a whole answer, not a bound cutting through
+        // the middle of one.
+        let got = drain_bytes(&s);
+        assert_eq!(got.len(), N_TTY_BUF_SIZE);
+        assert_eq!(&got[..4], b"\x1b[0n");
+    }
+
+    #[test]
+    fn a_line_that_fills_the_queue_can_still_be_erased() {
+        let _g = SERIAL.lock();
+        let s = cooked();
+        for _ in 0..N_TTY_BUF_SIZE {
+            s.push('x');
+        }
+        assert_eq!(s.canon_buf.lock().len(), N_TTY_BUF_SIZE);
+        // Full, and the erase still gets through -- otherwise the terminal is
+        // wedged with no way out but killing whatever holds it.
+        s.push(DEL);
+        assert_eq!(s.canon_buf.lock().len(), N_TTY_BUF_SIZE - 1);
+        s.push('z');
+        assert_eq!(s.canon_buf.lock().len(), N_TTY_BUF_SIZE);
+        s.push(CTRL_U);
+        assert!(s.canon_buf.lock().is_empty());
+    }
+
+    #[test]
+    fn a_line_that_fills_the_queue_does_not_commit() {
+        let _g = SERIAL.lock();
+        let s = cooked();
+        for _ in 0..N_TTY_BUF_SIZE {
+            s.push('x');
+        }
+        // The newline does not fit either, so the line is not handed over: a
+        // line that cannot hold its own terminator is not one to deliver.
+        s.push('\n');
+        assert!(!s.can_read());
+        assert_eq!(s.canon_buf.lock().len(), N_TTY_BUF_SIZE);
+        // One column back and it ends.
+        s.push(DEL);
+        s.push('\n');
+        assert_eq!(drain_bytes(&s).len(), N_TTY_BUF_SIZE);
+    }
+
+    #[test]
+    fn a_full_queue_still_answers_ctrl_c() {
+        // With a line already waiting for a reader the rule's answer is
+        // `Full`, which a PTY turns into a short write. A keyboard has nobody
+        // to tell, so it keeps interpreting and only stops storing.
+        let _g = SERIAL.lock();
+        let s = cooked();
+        feed(&s, "hecho\n");
+        for _ in 0..N_TTY_BUF_SIZE {
+            s.push('x');
+        }
+        assert_eq!(
+            input_room(s.buf.lock().len(), editing_bytes(&s.canon_buf.lock()), true),
+            InputRoom::Full
+        );
+        assert!(!ctrl_c_pending_peek());
+        s.push(CTRL_C);
+        assert!(ctrl_c_pending_peek());
+        ctrl_c_pending_take();
+    }
+
+    #[test]
+    fn the_line_being_edited_is_measured_in_bytes_and_not_in_keystrokes() {
+        // `canon_buf` holds characters, the bound is a buffer size, and on the
+        // Spanish layout those are not the same count: `ñ` is two bytes, so it
+        // fills the queue in half the keystrokes `x` needs.
+        let _g = SERIAL.lock();
+        let s = cooked();
+        for _ in 0..(N_TTY_BUF_SIZE / 2) {
+            s.push('ñ');
+        }
+        assert_eq!(s.canon_buf.lock().len(), N_TTY_BUF_SIZE / 2);
+        assert_eq!(editing_bytes(&s.canon_buf.lock()), N_TTY_BUF_SIZE);
+        // Full: the next character is dropped, in half the keystrokes.
+        s.push('z');
+        assert_eq!(s.canon_buf.lock().len(), N_TTY_BUF_SIZE / 2);
+    }
+
+    #[test]
+    fn room_comes_back_when_the_program_reads() {
+        let _g = SERIAL.lock();
+        let s = tty(ECHO, 0);
+        for _ in 0..N_TTY_BUF_SIZE {
+            s.push('x');
+        }
+        assert_eq!(s.buf.lock().len(), N_TTY_BUF_SIZE);
+        for _ in 0..10 {
+            s.pop();
+        }
+        for _ in 0..50 {
+            s.push('y');
+        }
+        assert_eq!(s.buf.lock().len(), N_TTY_BUF_SIZE);
+        // Exactly the room that was freed, and nothing the queue had before.
+        let tail: Vec<u8> = s.buf.lock().iter().rev().take(10).copied().collect();
+        assert_eq!(tail, vec![b'y'; 10]);
     }
 }
 
