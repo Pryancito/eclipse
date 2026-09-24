@@ -90,6 +90,33 @@ hal_fn_impl! {
             Ok(())
         }
 
+        /// The scheduler's reschedule kick: the same SGI `send_ipi` delivers,
+        /// with **no queue entry** — `handle_ipi` drains and acknowledges, and
+        /// an empty drain asks for no flush.
+        ///
+        /// Like riscv, this was the empty default in `hal_fn.rs`, so the whole
+        /// wake-preemption path above it (`request_resched`, the coalesced
+        /// IPI, the sleeping mask) ended in a function with no body and every
+        /// cross-CPU wake waited for the target's next tick.
+        fn send_wake_ipi(cpuid: usize) {
+            if !crate::common::ipi::wake_kick_wanted(cpuid) {
+                return;
+            }
+            // Resolved through the affinity map, not `1 << cpuid`: see
+            // `send_ipi` above for what the dense logical id is not.
+            let Some(affinity) = super::cpu::logical_to_affinity(cpuid) else {
+                return;
+            };
+            let Some(target) = crate::common::cpu_topology::gicv2_sgi_target(affinity) else {
+                return;
+            };
+            let gic_base = crate::hal_fn::mem::phys_to_virt(crate::KCONFIG.gic_base);
+            const GICD_SGIR: usize = 0x0F00;
+            unsafe {
+                core::ptr::write_volatile((gic_base + GICD_SGIR) as *mut u32, target << 16);
+            }
+        }
+
         fn ipi_reason() -> Vec<usize> {
             crate::common::ipi::ipi_reason()
         }

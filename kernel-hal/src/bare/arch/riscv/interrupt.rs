@@ -108,6 +108,35 @@ hal_fn_impl! {
             Ok(())
         }
 
+        /// The scheduler's reschedule kick. Same delivery as `send_ipi`, and
+        /// deliberately **no queue entry**: `super_soft` drains and
+        /// acknowledges, and an empty drain asks for no flush and bumps no
+        /// shootdown watermark, so this is as cheap as an interrupt gets on
+        /// the receiving side.
+        ///
+        /// It was the empty default in `hal_fn.rs` until now, on an
+        /// architecture where the rest of the mechanism is fully wired:
+        /// `primary_init` registers the sender on every arch, and
+        /// `request_resched`/`maybe_send_resched_ipi` do all the coalescing
+        /// bookkeeping — and then handed the kick to a function with no body.
+        /// So every cross-CPU wake here waited for the target's next 250 Hz
+        /// tick, or for the task it was running to spend its whole timeslice:
+        /// up to 4 ms on each pipe write, IO completion and process exit, the
+        /// exact latency the mechanism exists to remove.
+        fn send_wake_ipi(cpuid: usize) {
+            if !crate::common::ipi::wake_kick_wanted(cpuid) {
+                return;
+            }
+            let Some(hart) = super::cpu::logical_to_hart(cpuid) else {
+                return;
+            };
+            let Some(mask) = crate::common::cpu_topology::sbi_hart_mask(hart) else {
+                return;
+            };
+            #[allow(deprecated)]
+            sbi_rt::legacy::send_ipi(&mask as *const usize as usize);
+        }
+
         fn ipi_reason() -> Vec<usize> {
             crate::common::ipi::ipi_reason()
         }

@@ -625,27 +625,175 @@ impl TaskCollection {
 
 pub use key::*;
 
+/// A task key is one `usize` with three fields, from the top down:
+///
+/// ```text
+///   63      58 57                        6 5        0
+///  +----------+---------------------------+----------+
+///  | priority |        page number        | subpage  |
+///  +----------+---------------------------+----------+
+/// ```
+///
+/// Each field is given once here, as a shift and a mask, and every function
+/// below is written from them. They used not to be: `pack_key` wrote five
+/// priority bits at 58, `unmask_priority` cleared five bits at 58, and
+/// `unpack_key` cleared five bits off the *top of the word* — one bit too
+/// high. The lowest priority bit therefore stayed inside the page number, so
+/// every odd priority unpacked to page `1 << 52`, and `FutureCollection::page`
+/// indexes `pages` with that, inside the generator, on a CPU holding the
+/// collection lock. Only priority 4 is ever used today (`priority_add_task`
+/// asserts it), which is even, so the tree has never hit it — but a scheduler
+/// that grows a second priority class hits it on the first task.
 pub mod key {
     pub type Key = usize;
     pub const PRIORITY_SHIFT: usize = 58;
     pub const TASK_NUM_PER_PRIORITY: usize = 1 << PRIORITY_SHIFT;
     pub const MAX_PRIORITY: usize = 1 << 5;
+    /// The priority field, five bits wide: the one width all three functions
+    /// have to agree on.
+    pub const PRIORITY_MASK: usize = MAX_PRIORITY - 1;
     pub const DEFAULT_PRIORITY: usize = 4;
 
     pub const PAGE_INDEX_SHIFT: usize = 6;
+    /// A subpage index names one of a [`WakerPage`]'s 64 slots.
+    ///
+    /// [`WakerPage`]: crate::waker_page::WakerPage
+    pub const SUBPAGE_MASK: usize = (1 << PAGE_INDEX_SHIFT) - 1;
+    /// What is left between the two: bits 6..=57.
+    pub const PAGE_INDEX_MASK: usize = (1 << (PRIORITY_SHIFT - PAGE_INDEX_SHIFT)) - 1;
 
     pub fn unpack_key(key: Key) -> (usize, usize, usize) {
-        let subpage_idx = key & 0x3F;
-        let page_idx = (key << 5) >> 11;
-        let priority = key >> PRIORITY_SHIFT;
+        let subpage_idx = key & SUBPAGE_MASK;
+        let page_idx = (key >> PAGE_INDEX_SHIFT) & PAGE_INDEX_MASK;
+        let priority = (key >> PRIORITY_SHIFT) & PRIORITY_MASK;
         (priority, page_idx, subpage_idx)
     }
 
     pub fn pack_key(priority: usize, page_idx: usize, subpage_idx: usize) -> Key {
+        debug_assert!(priority <= PRIORITY_MASK);
+        debug_assert!(page_idx <= PAGE_INDEX_MASK);
+        debug_assert!(subpage_idx <= SUBPAGE_MASK);
         (priority << PRIORITY_SHIFT) | (page_idx << PAGE_INDEX_SHIFT) | subpage_idx
     }
 
     pub fn unmask_priority(key: Key) -> usize {
-        key & !(0x1F << PRIORITY_SHIFT)
+        key & !(PRIORITY_MASK << PRIORITY_SHIFT)
+    }
+}
+
+/// The scheduler's task key: one `usize` carrying three fields, packed by one
+/// function, taken apart by a second and masked by a third — and none of the
+/// three had a test.
+///
+/// The key is not bookkeeping. `FutureCollection::page` indexes `pages` with
+/// the page number this unpacks, inside the generator, on a CPU already
+/// holding the collection lock — which is the one place this file's own
+/// comments say twice must never panic, because `oops` cannot contain a fault
+/// taken with a scheduler lock held.
+#[cfg(test)]
+mod key_tests {
+    use super::key::*;
+
+    /// Page numbers worth trying: the first few, a carry across the subpage
+    /// field, and the largest one the field can hold.
+    fn pages() -> [usize; 6] {
+        [0, 1, 2, 63, 1_000, PAGE_INDEX_MASK]
+    }
+
+    #[test]
+    fn every_key_survives_the_round_trip() {
+        for priority in 0..MAX_PRIORITY {
+            for page_idx in pages() {
+                for subpage_idx in [0usize, 1, 31, 63] {
+                    let key = pack_key(priority, page_idx, subpage_idx);
+                    assert_eq!(
+                        unpack_key(key),
+                        (priority, page_idx, subpage_idx),
+                        "priority {} page {} subpage {}",
+                        priority,
+                        page_idx,
+                        subpage_idx
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_priority_field_is_the_same_width_in_every_function() {
+        // `pack_key` writes it, `unpack_key` reads it and `unmask_priority`
+        // clears it, and they have to agree on where it ends. They did not:
+        // `unpack_key` cleared five bits off the TOP of the word for the page
+        // number, where the field it had to clear starts five bits lower —
+        // so the lowest priority bit stayed in, and every odd priority came
+        // back with a page number of 2^52. `pages[4_503_599_627_370_496]` is
+        // the panic described above.
+        for priority in 0..MAX_PRIORITY {
+            let key = pack_key(priority, 7, 9);
+            assert_eq!(
+                unmask_priority(key),
+                pack_key(0, 7, 9),
+                "priority {} left something behind",
+                priority
+            );
+            assert_eq!(
+                unpack_key(key).1,
+                7,
+                "priority {} leaked into the page",
+                priority
+            );
+        }
+    }
+
+    #[test]
+    fn the_three_fields_do_not_overlap() {
+        // Each field alone, read back with the other two at zero.
+        assert_eq!(
+            unpack_key(pack_key(MAX_PRIORITY - 1, 0, 0)).0,
+            MAX_PRIORITY - 1
+        );
+        assert_eq!(
+            unpack_key(pack_key(0, PAGE_INDEX_MASK, 0)).1,
+            PAGE_INDEX_MASK
+        );
+        assert_eq!(unpack_key(pack_key(0, 0, 63)).2, 63);
+        // And the boundaries: the largest page number must not reach the
+        // priority field, and the largest subpage index must not reach the
+        // page number.
+        assert_eq!(
+            unpack_key(pack_key(0, PAGE_INDEX_MASK, 63)),
+            (0, PAGE_INDEX_MASK, 63)
+        );
+        assert_eq!(pack_key(0, PAGE_INDEX_MASK, 63) >> PRIORITY_SHIFT, 0);
+    }
+
+    #[test]
+    fn no_key_can_name_a_priority_the_collection_does_not_have() {
+        // `TaskCollection::remove_task` reads this priority and hands it to
+        // `get_mut_inner`, which indexes `future_collections` — a `Vec` with
+        // `MAX_PRIORITY` entries — with no bounds check of its own. `pack_key`
+        // never sets bit 63, but a key that reaches there is not always one
+        // this module packed: the generator builds keys from a page bitmap,
+        // and this file's comments record twice what a bitmap that disagrees
+        // with the slab costs. The field is five bits wide, so read five.
+        for key in [usize::MAX, 1 << 63, (1 << 63) | (7 << PRIORITY_SHIFT)] {
+            let (priority, page_idx, subpage_idx) = unpack_key(key);
+            assert!(
+                priority < MAX_PRIORITY,
+                "key {:#x} named priority {}",
+                key,
+                priority
+            );
+            assert!(page_idx <= PAGE_INDEX_MASK);
+            assert!(subpage_idx <= SUBPAGE_MASK);
+        }
+    }
+
+    #[test]
+    fn a_page_holds_exactly_the_slots_a_waker_page_has() {
+        // `FutureCollection::insert` grows `pages` by `WAKER_PAGE_SIZE` at a
+        // time and then indexes the new page with the subpage field, so the
+        // field has to be exactly as wide as a page is long.
+        assert_eq!(1 << PAGE_INDEX_SHIFT, crate::waker_page::WAKER_PAGE_SIZE);
     }
 }
