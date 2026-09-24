@@ -72,6 +72,22 @@ extern "C" {
     fn hal_cpu_idle();
 }
 
+/// Host stand-in for the symbol above.
+///
+/// `cargo test -p executor` links this crate on its own, with no `kernel-hal`
+/// to provide the real one, and the linker demands the symbol as soon as any
+/// test pulls in a path that so much as mentions `wait_for_interrupt` — which
+/// is most of `Executor::run` and everything that reaches the run queue
+/// through it. Without this the whole suite fails to link with `undefined
+/// symbol: hal_cpu_idle`, whatever the test was actually about. Nothing on
+/// the host ever parks a CPU, so an empty body is the honest one; `drivers`
+/// carries the same kind of shim for the same reason.
+/// Exported under the C name rather than declared as another `hal_cpu_idle`,
+/// which would collide with the `extern` declaration above.
+#[cfg(test)]
+#[export_name = "hal_cpu_idle"]
+extern "C" fn hal_cpu_idle_host_shim() {}
+
 pub(crate) fn wait_for_interrupt() {
     // `hal_cpu_idle` preserves the caller's interrupt-enable state itself, the
     // same contract as the previous `enable_and_hlt` + restore did.
