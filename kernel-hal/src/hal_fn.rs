@@ -118,6 +118,15 @@ hal_fn_def! {
 
         /// The kernel's own page-table root, or 0 while unknown. Used to keep
         /// TLB-shootdown target filtering away from kernel-table flushes.
+        ///
+        /// An architecture that leaves this default in place publishes nothing,
+        /// and `crate::common::ipi::aspace_filter` then turns the filtering off
+        /// for every table: correct, and silently worth nothing. It is half of
+        /// a pair -- the other half is `note_active_vmtoken`, called from
+        /// `activate_paging` -- and an arch that implements one without the
+        /// other still filters nobody. aarch64 and riscv64 stored a kernel
+        /// root that no reader ever asked for, and noted no active token at
+        /// all, for exactly as long as this default was theirs.
         pub fn kernel_vmtoken() -> PhysAddr {
             0
         }

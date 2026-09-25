@@ -334,11 +334,53 @@ static IPI_READY: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_VMTOKEN: [core::sync::atomic::AtomicUsize; MAX_CORE_NUM] =
     [const { core::sync::atomic::AtomicUsize::new(0) }; MAX_CORE_NUM];
 
+/// The `aspace` argument [`remote_flush_tlb_aspace`] wants for a flush of the
+/// page table rooted at `root`, given the kernel's own root as
+/// [`crate::vm::kernel_vmtoken`] reports it.
+///
+/// `None` means "target every CPU". Two separate reasons produce it, and they
+/// must not be collapsed:
+///
+///  * `root` **is** the kernel table. Kernel entries can carry the global bit
+///    and survive a page-table switch, so no CPU may be filtered out of their
+///    invalidation.
+///  * `kernel_token` is `0`, i.e. nobody has published a kernel root yet —
+///    early boot, or an architecture that never overrides the defaulted
+///    `kernel_vmtoken`. Without it there is no way to tell the kernel table
+///    from a user one, and guessing the wrong way round would skip CPUs for a
+///    global mapping.
+///
+/// The asymmetry is the whole design: over-targeting costs a wasted IPI,
+/// under-targeting is a missed invalidation.
+///
+/// Compared on the frame base: a root is page-aligned, so the low twelve bits
+/// are slack that an architecture may put flag bits in, and they say nothing
+/// about which table this is. That is the same masking
+/// [`note_active_vmtoken`] does on the way in, so the two sides of the
+/// comparison are cut the same way. It reaches no higher — aarch64's
+/// `USER_TABLE_FLAG` sits at bit 48 and is stripped by `activate_paging`
+/// before any of this, so a root that still carries it is not a root this
+/// answer is meaningful for.
+pub fn aspace_filter(root: usize, kernel_token: usize) -> Option<usize> {
+    if kernel_token == 0 || root & !0xfff == kernel_token & !0xfff {
+        None
+    } else {
+        Some(root)
+    }
+}
+
 /// Record that this CPU is about to load `token` (a page-table root).
 pub fn note_active_vmtoken(token: usize) {
-    let me = crate::cpu::cpu_id() as usize;
-    if me < MAX_CORE_NUM {
-        ACTIVE_VMTOKEN[me].store(token & !0xfff, Ordering::SeqCst);
+    note_active_vmtoken_on(crate::cpu::cpu_id() as usize, token)
+}
+
+/// [`note_active_vmtoken`] for a known dense logical CPU id, split out for the
+/// same reason [`remote_flush_tlb_on`] is: an id that names no CPU indexes no
+/// row here, and the recording must be reachable with an id the test chooses
+/// rather than the one the host's thread happens to have.
+pub(crate) fn note_active_vmtoken_on(cpu: usize, token: usize) {
+    if cpu < MAX_CORE_NUM {
+        ACTIVE_VMTOKEN[cpu].store(token & !0xfff, Ordering::SeqCst);
     }
 }
 
@@ -2520,6 +2562,184 @@ mod ipi_tests {
         assert!(!smp_enabled());
         set_smp_enabled(before);
         assert_eq!(smp_enabled(), before);
+    }
+
+    // ── the address-space filter, and the pair that makes it work ──────────
+    //
+    // Two halves, in two different files, and each is silent on its own:
+    // `kernel_vmtoken` publishes the kernel's root, `note_active_vmtoken`
+    // publishes each CPU's. Whichever is missing, the filter still answers --
+    // it just answers "target everyone" forever. x86_64 had both; aarch64 and
+    // riscv64 had neither, while both of them stored a kernel root into a
+    // static that no reader ever asked for.
+
+    #[test]
+    fn a_user_table_is_filtered_down_to_its_own_root() {
+        assert_eq!(aspace_filter(0x2000, 0x1000), Some(0x2000));
+    }
+
+    #[test]
+    fn the_kernel_table_is_never_filtered() {
+        // Its entries can carry the global bit and survive a page-table
+        // switch, so a CPU that has moved on may still hold them.
+        assert_eq!(aspace_filter(0x1000, 0x1000), None);
+    }
+
+    #[test]
+    fn a_kernel_root_nobody_published_turns_the_filter_off_altogether() {
+        // The defaulted `kernel_vmtoken` returns 0, which is what an arch that
+        // never overrides it reports. With no kernel root there is no way to
+        // tell the kernel table from a user one, and the safe answer is the
+        // one that targets everybody.
+        for root in [0x1000, 0x2000, 0xdead_0000, 0] {
+            assert_eq!(
+                aspace_filter(root, 0),
+                None,
+                "root {:#x} with no published kernel root",
+                root
+            );
+        }
+    }
+
+    #[test]
+    fn the_low_twelve_bits_of_a_root_do_not_make_it_another_table() {
+        // A root is page-aligned; the slack below it is where an arch may keep
+        // flag bits. Both sides are cut the same way, and so is what
+        // `note_active_vmtoken` records.
+        assert_eq!(aspace_filter(0x1fff, 0x1000), None);
+        assert_eq!(aspace_filter(0x1000, 0x1abc), None);
+        // One bit higher is a different frame, and that one counts.
+        assert_eq!(aspace_filter(0x2000, 0x1000), Some(0x2000));
+        assert_eq!(note_and_read(0, 0x4321_0abc), 0x4321_0000);
+    }
+
+    /// Record a token for `cpu` and hand back what the table now holds.
+    fn note_and_read(cpu: usize, token: usize) -> usize {
+        note_active_vmtoken_on(cpu, token);
+        ACTIVE_VMTOKEN[cpu].load(Ordering::SeqCst)
+    }
+
+    #[test]
+    fn a_cpu_id_that_names_no_cpu_records_nothing() {
+        let _g = test_lock();
+        let _smp = Smp::with(2);
+        note_active_vmtoken_on(MAX_CORE_NUM, 0x9000);
+        note_active_vmtoken_on(usize::MAX, 0x9000);
+        for cpu in 0..MAX_CORE_NUM {
+            assert_eq!(
+                ACTIVE_VMTOKEN[cpu].load(Ordering::SeqCst),
+                0,
+                "cpu {} took a recording that was not addressed to it",
+                cpu
+            );
+        }
+    }
+
+    #[test]
+    fn the_two_halves_together_target_only_the_cpus_that_loaded_the_table() {
+        // The end of the chain the two publishers feed: an arch that notes its
+        // switches and publishes its kernel root gets this, and an arch that
+        // does neither gets a broadcast to all three CPUs on every unmap.
+        let _g = test_lock();
+        let _smp = Smp::with(3);
+        const KERNEL: usize = 0x1000;
+        const MINE: usize = 0x2000;
+        const THEIRS: usize = 0x3000;
+
+        note_active_vmtoken_on(1, MINE);
+        note_active_vmtoken_on(2, THEIRS);
+
+        let done = alloc::sync::Arc::new(AtomicBool::new(false));
+        let flag = done.clone();
+        let t = std::thread::spawn(move || {
+            remote_flush_tlb_on(0, Some(0x4000), aspace_filter(MINE, KERNEL));
+            flag.store(true, Ordering::SeqCst);
+        });
+        wait_until_waiting(0, &done);
+        assert_eq!(
+            shootdown_wait_mask(0),
+            1u64 << 1,
+            "only the CPU that loaded this table can hold a stale entry of it"
+        );
+        tlb_shootdown_ack_on(1);
+        wait_until("the shootdown to finish", || done.load(Ordering::SeqCst));
+        t.join().unwrap();
+    }
+
+    #[test]
+    fn a_flush_of_the_kernel_table_still_reaches_a_cpu_running_userspace() {
+        // The same setup, with the kernel's own table: `aspace_filter` gives
+        // `None` and cpu 2 stays targeted although its root differs. Filtering
+        // it out here would be the missed invalidation the whole arrangement
+        // exists to avoid.
+        let _g = test_lock();
+        let _smp = Smp::with(3);
+        const KERNEL: usize = 0x1000;
+
+        note_active_vmtoken_on(1, 0x2000);
+        note_active_vmtoken_on(2, 0x3000);
+
+        let done = alloc::sync::Arc::new(AtomicBool::new(false));
+        let flag = done.clone();
+        let t = std::thread::spawn(move || {
+            remote_flush_tlb_on(0, Some(0x4000), aspace_filter(KERNEL, KERNEL));
+            flag.store(true, Ordering::SeqCst);
+        });
+        wait_until_waiting(0, &done);
+        assert_eq!(shootdown_wait_mask(0), 0b110);
+        tlb_shootdown_ack_on(1);
+        tlb_shootdown_ack_on(2);
+        wait_until("the shootdown to finish", || done.load(Ordering::SeqCst));
+        t.join().unwrap();
+    }
+
+    #[test]
+    fn an_arch_that_publishes_no_kernel_root_broadcasts_every_unmap() {
+        // What aarch64 and riscv64 did: `kernel_vmtoken` left at its default,
+        // so every table looks like it might be the kernel's and every CPU is
+        // targeted for every user-address-space flush.
+        let _g = test_lock();
+        let _smp = Smp::with(3);
+        note_active_vmtoken_on(1, 0x2000);
+        note_active_vmtoken_on(2, 0x3000);
+
+        let done = alloc::sync::Arc::new(AtomicBool::new(false));
+        let flag = done.clone();
+        let t = std::thread::spawn(move || {
+            remote_flush_tlb_on(0, Some(0x4000), aspace_filter(0x2000, 0));
+            flag.store(true, Ordering::SeqCst);
+        });
+        wait_until_waiting(0, &done);
+        assert_eq!(
+            shootdown_wait_mask(0),
+            0b110,
+            "with no kernel root published nobody may be filtered out"
+        );
+        tlb_shootdown_ack_on(1);
+        tlb_shootdown_ack_on(2);
+        wait_until("the shootdown to finish", || done.load(Ordering::SeqCst));
+        t.join().unwrap();
+    }
+
+    #[test]
+    fn an_arch_that_notes_no_switches_filters_nobody_either() {
+        // And the other half: the kernel root is published, so the filter is
+        // asked a real question, but no CPU ever recorded a token. An unknown
+        // token keeps its CPU in, which is why this stayed invisible.
+        let _g = test_lock();
+        let _smp = Smp::with(3);
+        let done = alloc::sync::Arc::new(AtomicBool::new(false));
+        let flag = done.clone();
+        let t = std::thread::spawn(move || {
+            remote_flush_tlb_on(0, Some(0x4000), aspace_filter(0x2000, 0x1000));
+            flag.store(true, Ordering::SeqCst);
+        });
+        wait_until_waiting(0, &done);
+        assert_eq!(shootdown_wait_mask(0), 0b110);
+        tlb_shootdown_ack_on(1);
+        tlb_shootdown_ack_on(2);
+        wait_until("the shootdown to finish", || done.load(Ordering::SeqCst));
+        t.join().unwrap();
     }
 }
 

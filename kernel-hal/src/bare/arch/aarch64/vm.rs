@@ -165,6 +165,22 @@ hal_fn_impl! {
             let vmtoken = vmtoken & PHYS_ADDR_MASK;
             info!("set {} page_table @ {:#x}", if check_if_user { "user" } else { "kernel" }, vmtoken);
             if check_if_user {
+                // Publish BEFORE the hardware switch, for the reason spelled
+                // out in `remote_flush_tlb_aspace`: an initiator that reads
+                // the new token early pays one spurious IPI, one that reads
+                // the old token after the switch skips a CPU that already
+                // runs these tables.
+                //
+                // Only for the user table, and that is not a detail. On
+                // aarch64 the two roots live in two registers: writing TTBR1
+                // leaves whatever user table TTBR0 holds loaded and its
+                // entries valid. Noting the kernel root here would claim this
+                // CPU had left its user address space while it still holds
+                // every one of its translations, and the next shootdown for
+                // that address space would filter it out -- a missed
+                // invalidation, which is the one failure this whole mechanism
+                // is arranged to never have.
+                crate::common::ipi::note_active_vmtoken(vmtoken);
                 TTBR0_EL1.set(vmtoken as _);
             } else {
                 TTBR1_EL1.set(vmtoken as _);
@@ -179,6 +195,10 @@ hal_fn_impl! {
         fn pin_kernel_vmtoken() {
             let token = KERNEL_PT.lock().table_phys();
             KERNEL_VMTOKEN.store(token, Ordering::Release);
+        }
+
+        fn kernel_vmtoken() -> PhysAddr {
+            KERNEL_VMTOKEN.load(Ordering::Acquire)
         }
 
         fn activate_kernel_paging() {
