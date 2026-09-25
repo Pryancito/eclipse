@@ -83,6 +83,22 @@ pub fn is_off(cmdline: &str, key: &str) -> bool {
     value(cmdline, key).and_then(parse_bool) == Some(false)
 }
 
+/// The command line out of a NUL-terminated byte string, which is the shape a
+/// device tree's `/chosen/bootargs` property has.
+///
+/// The NUL is not decoration here. [`pairs`] trims ASCII whitespace and a NUL
+/// is not whitespace, so `LOG=error:smp=off\0` parses with the value
+/// `"off\0"` — which spells no boolean at all, so [`is_off`] says the key was
+/// never written and the switch it guards keeps its default. The last flag on
+/// the line is the one that gets swallowed, and the last flag on the line is
+/// the one somebody just appended to try something.
+///
+/// `None` when the bytes are not UTF-8.
+pub fn from_c_bytes(bytes: &[u8]) -> Option<&str> {
+    let end = bytes.iter().position(|b| *b == 0).unwrap_or(bytes.len());
+    core::str::from_utf8(&bytes[..end]).ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -111,6 +127,30 @@ mod tests {
             let line = alloc::format!("LOG=error:nvidia.hwcursor{on}:ROOT=/dev/sda2");
             assert!(flag(&line, "nvidia.hwcursor"), "spelled {:?}", on);
         }
+    }
+
+    #[test]
+    fn a_bootargs_property_keeps_its_last_flag() {
+        // A device tree hands the command line over NUL-terminated, and the
+        // flag that the NUL lands on is the last one written — which is the
+        // one somebody just added to try something.
+        let raw = b"LOG=error:smp=off\0";
+        let line = from_c_bytes(raw).expect("valid utf-8");
+        assert_eq!(line, "LOG=error:smp=off");
+        assert!(is_off(line, "smp"), "the flag the NUL was stuck to");
+        assert!(
+            !is_off(core::str::from_utf8(raw).unwrap(), "smp"),
+            "and this is what happens without the strip: the value reads \
+             \"off\\0\", which spells no boolean, so the key looks unwritten"
+        );
+    }
+
+    #[test]
+    fn a_bootargs_property_without_a_terminator_is_still_a_command_line() {
+        assert_eq!(from_c_bytes(b"LOG=error"), Some("LOG=error"));
+        assert_eq!(from_c_bytes(b""), Some(""));
+        assert_eq!(from_c_bytes(b"\0"), Some(""));
+        assert_eq!(from_c_bytes(&[0xff, 0xfe]), None, "not utf-8");
     }
 
     #[test]

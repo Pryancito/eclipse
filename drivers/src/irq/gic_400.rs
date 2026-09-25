@@ -1,8 +1,10 @@
 use crate::prelude::IrqHandler;
 use crate::scheme::{IrqScheme, Scheme};
 use crate::sync::Mutex;
+use crate::utils::gic_banked::{bitmap_slot, BankedEnables};
 use crate::utils::IrqManager;
 use crate::DeviceResult;
+use core::sync::atomic::{AtomicU32, Ordering};
 
 pub static GICC_SIZE: usize = 0x1000;
 pub static GICD_SIZE: usize = 0x1000;
@@ -28,6 +30,11 @@ pub struct IntController {
     gicc: GicCpuIf,
     gicd: GicDistIf,
     manager: Mutex<IrqManager<GIC_IRQ_COUNT>>,
+    /// The private interrupt ids something has asked to have enabled, so a
+    /// core coming online can enable them in its own bank -- see
+    /// `utils::gic_banked`. Plain atomic rather than the `Mutex`: it is read
+    /// from `init_hart`, which runs on a core that has no scheduler yet.
+    banked: AtomicU32,
 }
 
 struct GicDistIf {
@@ -55,6 +62,7 @@ impl IntController {
             // at all, while `is_valid_irq` below went on saying every ID was
             // fine. riscv's PLIC already sizes its table to the controller.
             manager: Mutex::new(IrqManager::new(GIC_IRQ_RANGE)),
+            banked: AtomicU32::new(BankedEnables::new().mask()),
         }
     }
 
@@ -95,28 +103,65 @@ impl IntController {
                 self.gicd.write(ext_offset, val);
             }
 
-            // Enable CPU0's GIC interface
-            self.gicc.write(GICC_CTLR, 1);
-
-            // Set CPU0's Interrupt Priority Mask
-            self.gicc.write(GICC_PMR, 0xff);
-
-            // Enable IRQ distribution
+            // Enable IRQ distribution. Global, and the only part of this
+            // that is: everything above touched either an SPI register or
+            // this core's own bank.
             self.gicd.write(GICD_CTLR, 0x1);
         }
+        // This core's CPU interface and private enables, through the same
+        // function every other core will call -- so the boot core cannot
+        // quietly end up with a setup none of the others get.
+        self.init_this_cpu();
     }
 
     pub fn irq_enable(&self, irq: u32) {
+        // Record it first if it is private, because this write only reaches
+        // the bank of whichever core is running: a core that comes up later
+        // replays the recorded set into its own bank from `init_hart`.
+        self.record_banked(irq, true);
+        let (offset, bit) = bitmap_slot(GICD_ISENABLER, irq);
         unsafe {
-            let offset = GICD_ISENABLER + (4 * (irq / 32));
-            self.gicd.write(offset, 1 << (irq % 32));
+            self.gicd.write(offset, bit);
         }
     }
 
     pub fn irq_disable(&self, irq: u32) {
+        self.record_banked(irq, false);
+        let (offset, bit) = bitmap_slot(GICD_ICENABLER, irq);
         unsafe {
-            let offset = GICD_ICENABLER + (4 * (irq / 32));
-            self.gicd.write(offset, 1 << (irq % 32));
+            self.gicd.write(offset, bit);
+        }
+    }
+
+    /// Add or remove a private id from the replay set, leaving a shared one
+    /// alone: an SPI lives in the distributor's one copy, so whoever enabled
+    /// it enabled it for the whole machine.
+    fn record_banked(&self, irq: u32, enable: bool) {
+        let mut set = BankedEnables::from_mask(self.banked.load(Ordering::Relaxed));
+        let changed = if enable {
+            set.record(irq)
+        } else {
+            set.forget(irq)
+        };
+        if changed {
+            self.banked.store(set.mask(), Ordering::Relaxed);
+        }
+    }
+
+    /// Bring *this* core's half of the GIC up: its CPU interface, and its own
+    /// bank of the private interrupt enables.
+    ///
+    /// The boot core does this from `init`. Every other core has to do it for
+    /// itself, and until it does, the generic timer PPI and the shootdown SGI
+    /// are pending at a core the distributor will not forward them to.
+    pub fn init_this_cpu(&self) {
+        let banked = BankedEnables::from_mask(self.banked.load(Ordering::Relaxed));
+        unsafe {
+            // The banked enables before the interface goes up, so nothing is
+            // forwarded to a core that is not yet listening.
+            self.gicd.write(GICD_ISENABLER, banked.mask());
+            self.gicc.write(GICC_CTLR, 1);
+            self.gicc.write(GICC_PMR, 0xff);
         }
     }
 
@@ -197,6 +242,10 @@ impl IrqScheme for IntController {
     fn unregister(&self, _irq_num: usize) -> DeviceResult {
         todo!()
     }
+
+    fn init_hart(&self) {
+        self.init_this_cpu();
+    }
 }
 
 impl GicDistIf {
@@ -227,4 +276,182 @@ pub fn init(gicc_base: usize, gicd_base: usize) -> IntController {
 
 pub fn get_irq_num(gicc_base: usize, gicd_base: usize) -> usize {
     IntController::new(gicc_base, gicd_base).pending_irq()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloc::boxed::Box;
+
+    /// A distributor and a CPU interface backed by host memory. The driver
+    /// reaches both through volatile `u32` accesses at an offset from a base
+    /// address, and never asks the hardware a question whose answer it does
+    /// not also accept as zero, so a zeroed buffer is a GIC that reports one
+    /// CPU interface and 32 interrupt ids -- the private ones and no SPIs.
+    struct FakeGic {
+        gicd: Box<[u32; 1024]>,
+        gicc: Box<[u32; 1024]>,
+    }
+
+    impl FakeGic {
+        fn new() -> Self {
+            Self {
+                gicd: Box::new([0; 1024]),
+                gicc: Box::new([0; 1024]),
+            }
+        }
+
+        fn controller(&mut self) -> IntController {
+            init(self.gicc.as_ptr() as usize, self.gicd.as_ptr() as usize)
+        }
+
+        /// What this core's bank of `GICD_ISENABLER0` holds.
+        fn isenabler0(&self) -> u32 {
+            self.gicd[GICD_ISENABLER as usize / 4]
+        }
+
+        fn gicc_reg(&self, reg: u32) -> u32 {
+            self.gicc[reg as usize / 4]
+        }
+
+        /// Wipe the distributor's private-id words and the CPU interface, the
+        /// way a core that has not been through `init_hart` sees them: the
+        /// banked registers are per-core copies, and a core that just came out
+        /// of reset has its own, at its own reset value.
+        fn as_a_fresh_core_sees_it(&mut self) {
+            self.gicd[GICD_ISENABLER as usize / 4] = 0;
+            self.gicc.fill(0);
+        }
+    }
+
+    /// The three ids the aarch64 port enables at boot.
+    const TIMER_PPI: u32 = 30;
+    const IPI_SGI: u32 = 0;
+    const UART_SPI: u32 = 33;
+
+    #[test]
+    fn enabling_an_id_sets_its_own_bit_in_its_own_word() {
+        // `GICD_ISENABLER` is a *set*-enable register: a written 1 enables, a
+        // written 0 does nothing, so the hardware accumulates the one-bit
+        // writes the driver sends it. The buffer behind this fake is plain
+        // memory and keeps only the last write, so each id is checked as it
+        // goes -- which is also what catches a bit computed from one id
+        // landing in the word of another.
+        let mut gic = FakeGic::new();
+        let ctrl = gic.controller();
+        ctrl.irq_enable(TIMER_PPI);
+        assert_eq!(gic.isenabler0(), 1 << TIMER_PPI);
+        ctrl.irq_enable(IPI_SGI);
+        assert_eq!(gic.isenabler0(), 1 << IPI_SGI);
+        ctrl.irq_enable(UART_SPI);
+        assert_eq!(
+            gic.isenabler0(),
+            1 << IPI_SGI,
+            "an SPI does not touch the private word"
+        );
+        assert_eq!(
+            gic.gicd[(GICD_ISENABLER as usize / 4) + 1],
+            1 << 1,
+            "it is id 33, so the second word, bit one"
+        );
+    }
+
+    #[test]
+    fn a_core_coming_online_enables_the_same_private_ids_for_itself() {
+        // This is the bug: the boot core's writes above reached the boot
+        // core's bank. A core that comes up later starts from its own, which
+        // has nothing in it, and until it repeats those writes the distributor
+        // forwards it neither the scheduler tick nor a shootdown IPI.
+        let mut gic = FakeGic::new();
+        let ctrl = gic.controller();
+        ctrl.irq_enable(TIMER_PPI);
+        ctrl.irq_enable(UART_SPI);
+        ctrl.irq_enable(IPI_SGI);
+
+        gic.as_a_fresh_core_sees_it();
+        assert_eq!(gic.isenabler0(), 0, "a fresh core has nothing enabled");
+
+        ctrl.init_hart();
+        assert_eq!(
+            gic.isenabler0(),
+            (1 << TIMER_PPI) | (1 << IPI_SGI),
+            "and now it has exactly what the boot core enabled"
+        );
+    }
+
+    #[test]
+    fn a_core_coming_online_brings_up_its_cpu_interface_too() {
+        let mut gic = FakeGic::new();
+        let ctrl = gic.controller();
+        gic.as_a_fresh_core_sees_it();
+        assert_eq!(gic.gicc_reg(GICC_CTLR), 0);
+
+        ctrl.init_hart();
+        assert_eq!(gic.gicc_reg(GICC_CTLR), 1, "the interface is listening");
+        assert_eq!(
+            gic.gicc_reg(GICC_PMR),
+            0xff,
+            "and its priority mask lets everything through"
+        );
+    }
+
+    #[test]
+    fn the_boot_core_goes_through_the_same_path_as_every_other_core() {
+        // `init` used to do the CPU-interface writes itself, so the boot core
+        // could be set up in a way no other core was. If these two diverge
+        // again, the machine boots and the divergence is invisible until a
+        // second core needs something the first one happened to have.
+        let mut boot = FakeGic::new();
+        let _ = boot.controller();
+
+        let mut other = FakeGic::new();
+        let ctrl = other.controller();
+        other.as_a_fresh_core_sees_it();
+        ctrl.init_hart();
+
+        assert_eq!(boot.gicc_reg(GICC_CTLR), other.gicc_reg(GICC_CTLR));
+        assert_eq!(boot.gicc_reg(GICC_PMR), other.gicc_reg(GICC_PMR));
+    }
+
+    #[test]
+    fn an_id_that_gets_disabled_is_not_replayed_onto_the_next_core() {
+        let mut gic = FakeGic::new();
+        let ctrl = gic.controller();
+        ctrl.irq_enable(TIMER_PPI);
+        ctrl.irq_enable(IPI_SGI);
+        ctrl.irq_disable(TIMER_PPI);
+
+        gic.as_a_fresh_core_sees_it();
+        ctrl.init_hart();
+        assert_eq!(
+            gic.isenabler0(),
+            1 << IPI_SGI,
+            "the one still wanted, and not the one turned off"
+        );
+    }
+
+    #[test]
+    fn a_core_that_wanted_nothing_private_writes_nothing() {
+        let mut gic = FakeGic::new();
+        let ctrl = gic.controller();
+        ctrl.irq_enable(UART_SPI);
+
+        gic.as_a_fresh_core_sees_it();
+        ctrl.init_hart();
+        assert_eq!(gic.isenabler0(), 0);
+    }
+
+    #[test]
+    fn disabling_an_spi_leaves_the_private_set_alone() {
+        // `GICD_ICENABLER` for a shared id is the distributor's one copy, so
+        // it has nothing to do with what a core replays for itself.
+        let mut gic = FakeGic::new();
+        let ctrl = gic.controller();
+        ctrl.irq_enable(TIMER_PPI);
+        ctrl.irq_disable(UART_SPI);
+
+        gic.as_a_fresh_core_sees_it();
+        ctrl.init_hart();
+        assert_eq!(gic.isenabler0(), 1 << TIMER_PPI);
+    }
 }

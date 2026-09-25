@@ -263,20 +263,12 @@ impl<L: PageTableLevel, PTE: GenericPTE> PageTableImpl<L, PTE> {
 
 /// Public implementation.
 impl<L: PageTableLevel, PTE: GenericPTE> PageTableImpl<L, PTE> {
-    /// Address-space filter for this table's shootdowns: its own root, or
-    /// `None` (target everyone) when this is the kernel's table — kernel
-    /// entries can carry the global bit and survive CR3 switches, so no CPU
-    /// may be skipped for them. Unknown kernel token (early boot, an arch
-    /// that never publishes one) disables filtering entirely: over-targeting
-    /// is a wasted IPI, under-targeting is a missed invalidation.
+    /// Address-space filter for this table's shootdowns. The rule itself, and
+    /// why each half of it exists, lives in
+    /// [`crate::common::ipi::aspace_filter`]; here it is only handed this
+    /// table's root and whatever the architecture publishes as the kernel's.
     fn aspace_filter(&self) -> Option<usize> {
-        let root = self.table_phys();
-        let kernel = crate::vm::kernel_vmtoken();
-        if kernel == 0 || root & !0xfff == kernel & !0xfff {
-            None
-        } else {
-            Some(root)
-        }
+        crate::common::ipi::aspace_filter(self.table_phys(), crate::vm::kernel_vmtoken())
     }
 
     pub fn new() -> Self {

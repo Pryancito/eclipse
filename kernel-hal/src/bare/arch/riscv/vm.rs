@@ -183,6 +183,13 @@ hal_fn_impl! {
             if old_token != vmtoken {
                 #[cfg(target_arch = "riscv64")]
                 let mode = satp::Mode::Sv39;
+                // Publish BEFORE the hardware switch, for the reason spelled
+                // out in `remote_flush_tlb_aspace`. One satp holds both the
+                // kernel and the user root here, exactly as CR3 does on
+                // x86_64, so every switch is noted -- including the one back
+                // to the kernel table, which really does leave the user
+                // address space behind.
+                crate::common::ipi::note_active_vmtoken(vmtoken);
                 unsafe {
                     satp::set(mode, 0, vmtoken >> 12);
                     asm::sfence_vma_all();
@@ -198,6 +205,10 @@ hal_fn_impl! {
         fn pin_kernel_vmtoken() {
             let token = KERNEL_PT.lock().table_phys();
             KERNEL_VMTOKEN.store(token, Ordering::Release);
+        }
+
+        fn kernel_vmtoken() -> PhysAddr {
+            KERNEL_VMTOKEN.load(Ordering::Acquire)
         }
 
         fn activate_kernel_paging() {

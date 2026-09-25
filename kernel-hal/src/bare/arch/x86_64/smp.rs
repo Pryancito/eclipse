@@ -408,13 +408,14 @@ pub fn start_application_processors() {
     // The registry is empty here, so this cannot fail.
     let _ = register_cpu(raw_apic_id());
 
-    // Master gate: unless `smp=on` was on the cmdline, boot single-core. AP
-    // bring-up currently wedges some real hardware at the scheduler hand-off
-    // (100% boot, no further progress); single-core is solid there. Defaulting
-    // off keeps a stock image always-bootable while that hang is root-caused.
+    // Master gate. Default **on**; `smp=off` on the cmdline forces single-core,
+    // as the escape hatch for bringing a suspect machine up without a rebuild
+    // (see `SMP_ENABLED`, which carries the history: this defaulted off while
+    // multi-core wedged real hardware, and the cause — every CPU resolving to
+    // one bogus APIC id once the LAPIC switched to x2APIC — has been fixed).
     // The BSP is already registered above, so single-core is fully functional.
     if !crate::common::ipi::smp_enabled() {
-        warn!("[smp] AP bring-up disabled — single-core (pass `smp=on` on the cmdline to enable multi-core)");
+        warn!("[smp] AP bring-up disabled by `smp=off` — single-core");
         return;
     }
 

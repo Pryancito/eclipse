@@ -4,6 +4,7 @@ pub mod bounded_drain;
 pub mod deferred_job;
 mod event_listener;
 pub mod fat_ptr;
+pub mod gic_banked;
 mod id_allocator;
 mod irq_manager;
 
