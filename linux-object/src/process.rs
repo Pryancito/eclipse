@@ -65,10 +65,15 @@ const ROOT_UID: u32 = 0;
 
 /// `CAP_SETGID`: change group ids, and set the supplementary group list.
 pub const CAP_SETGID: u32 = 6;
+/// `CAP_SETUID`: change user ids, `setfsuid(2)` included.
+pub const CAP_SETUID: u32 = 7;
 /// `CAP_SYS_ADMIN`: the catch-all -- mount, `sethostname`, and much else.
 pub const CAP_SYS_ADMIN: u32 = 21;
 /// `CAP_SYS_BOOT`: `reboot(2)` and `kexec_load(2)`.
 pub const CAP_SYS_BOOT: u32 = 22;
+/// `CAP_SYS_RESOURCE`: raise a hard resource limit, and reach into another
+/// process's limits.
+pub const CAP_SYS_RESOURCE: u32 = 24;
 /// `CAP_SYS_TIME`: set the system clock and discipline it.
 pub const CAP_SYS_TIME: u32 = 25;
 
@@ -117,8 +122,36 @@ pub struct Credentials {
     pub rgid: u32,
     pub egid: u32,
     pub sgid: u32,
+    /// The id a FILESYSTEM access is checked against. Linux keeps it apart
+    /// from `euid` on purpose -- `generic_permission`'s own comment says why:
+    /// "We use `fsuid` for this, letting us set arbitrary permissions for
+    /// filesystem access without changing the 'normal' uids which are used
+    /// for other things." Every `set*id` call drags it along, so it equals
+    /// `euid` unless `setfsuid(2)` has moved it on its own.
+    pub fsuid: u32,
+    /// The group half of the same story, and what `in_group_p()` asks.
+    pub fsgid: u32,
     pub groups: Vec<u32>,
     pub umask: u16,
+}
+
+impl Credentials {
+    /// Move the effective uid, and the filesystem uid with it.
+    ///
+    /// The two fields are one decision in Linux -- every `set*id` path ends
+    /// `new->fsuid = new->euid;` -- so writing `euid` on its own is the bug
+    /// this pair exists to make impossible. `setfsuid(2)` is the only caller
+    /// that moves `fsuid` alone, and it says so by name.
+    pub fn set_euid(&mut self, uid: u32) {
+        self.euid = uid;
+        self.fsuid = uid;
+    }
+
+    /// Move the effective gid, and the filesystem gid with it.
+    pub fn set_egid(&mut self, gid: u32) {
+        self.egid = gid;
+        self.fsgid = gid;
+    }
 }
 
 impl Default for Credentials {
@@ -130,6 +163,8 @@ impl Default for Credentials {
             rgid: ROOT_UID,
             egid: ROOT_UID,
             sgid: ROOT_UID,
+            fsuid: ROOT_UID,
+            fsgid: ROOT_UID,
             groups: vec![ROOT_UID],
             umask: 0o022,
         }
@@ -850,8 +885,14 @@ struct LinuxProcessInner {
     ///
     /// Omit leading '/'.
     current_working_directory: String,
-    /// file open number limit
-    file_limit: RLimit,
+    /// The process's sixteen resource limits, `tsk->signal->rlim` indexed by
+    /// resource number. Only [`RLIMIT_NOFILE`] is enforced (right below, on
+    /// every descriptor this table grows by); the rest are the soft budgets
+    /// `getrlimit`/`setrlimit` remember for the program that set them. Each
+    /// of the two facts is checkable: nothing else in this crate reads the
+    /// array, and the hard limits are what [`LinuxProcess::rlimit`] refuses
+    /// to raise without `CAP_SYS_RESOURCE`.
+    limits: RLimits,
     /// Opened files
     files: HashMap<FileDesc, Arc<dyn FileLike>>,
     /// Per-descriptor `FD_CLOEXEC` state — the set of fds the next `execve`
@@ -999,6 +1040,135 @@ impl Default for RLimit {
         }
     }
 }
+
+/// `RLIM_INFINITY`: no limit at all. Not a very large limit -- code that
+/// enforces a limit has to recognise it and not compare against it.
+pub const RLIM_INFINITY: u64 = u64::MAX;
+
+/// The sixteen resources of `asm-generic/resource.h`, in its order. A number
+/// at or above [`RLIM_NLIMITS`] is `EINVAL`, not a resource this kernel has
+/// not got round to.
+pub const RLIMIT_CPU: usize = 0;
+/// Largest file the process may create, in bytes.
+pub const RLIMIT_FSIZE: usize = 1;
+/// Size of the data segment.
+pub const RLIMIT_DATA: usize = 2;
+/// Size of the main thread's stack.
+pub const RLIMIT_STACK: usize = 3;
+/// Largest core dump, in bytes.
+pub const RLIMIT_CORE: usize = 4;
+/// Resident set size.
+pub const RLIMIT_RSS: usize = 5;
+/// Processes the real uid may have.
+pub const RLIMIT_NPROC: usize = 6;
+/// **One more than** the highest descriptor the process may open. The one
+/// limit this kernel actually enforces.
+pub const RLIMIT_NOFILE: usize = 7;
+/// Memory that may be locked down.
+pub const RLIMIT_MEMLOCK: usize = 8;
+/// Size of the address space.
+pub const RLIMIT_AS: usize = 9;
+/// File locks the process may hold.
+pub const RLIMIT_LOCKS: usize = 10;
+/// Signals that may be queued.
+pub const RLIMIT_SIGPENDING: usize = 11;
+/// Bytes in POSIX message queues.
+pub const RLIMIT_MSGQUEUE: usize = 12;
+/// Ceiling on the nice value, as `20 - nice`.
+pub const RLIMIT_NICE: usize = 13;
+/// Ceiling on the real-time priority.
+pub const RLIMIT_RTPRIO: usize = 14;
+/// Microseconds of CPU a real-time thread may take without blocking.
+pub const RLIMIT_RTTIME: usize = 15;
+/// How many there are.
+pub const RLIM_NLIMITS: usize = 16;
+
+/// Linux's `sysctl_nr_open` default: the ceiling `prlimit64` puts on
+/// `RLIMIT_NOFILE`'s HARD limit, over which it answers `EPERM`. It applies to
+/// that one resource and no other.
+pub const NR_OPEN: u64 = 1024 * 1024;
+
+/// 8 MiB, Linux's `_STK_LIM` and the size this kernel gives a user stack.
+pub const USER_STACK_SIZE: u64 = 8 * 1024 * 1024;
+
+/// A process's sixteen limits, indexed by resource number.
+///
+/// A newtype and not a bare array because `LinuxProcessInner` derives
+/// `Default`, and a derived array default is sixteen copies of one row --
+/// which is how every resource would quietly come out as whatever
+/// [`RLimit::default`] happens to say.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RLimits([RLimit; RLIM_NLIMITS]);
+
+impl Default for RLimits {
+    fn default() -> Self {
+        RLimits(INIT_RLIMITS)
+    }
+}
+
+impl RLimits {
+    /// The limit for `resource`, or `EINVAL` for a number that is not one.
+    pub fn get(&self, resource: usize) -> LxResult<RLimit> {
+        self.0.get(resource).copied().ok_or(LxError::EINVAL)
+    }
+
+    /// Replace one row. The rules live in [`LinuxProcess::rlimit_check`];
+    /// this only stores.
+    pub fn set(&mut self, resource: usize, limit: RLimit) -> LxResult {
+        *self.0.get_mut(resource).ok_or(LxError::EINVAL)? = limit;
+        Ok(())
+    }
+}
+
+/// `INIT_RLIMITS` (`include/asm-generic/resource.h`), one row per resource in
+/// the order above.
+///
+/// One deliberate departure: `RLIMIT_NPROC` and `RLIMIT_SIGPENDING` are
+/// `{0, 0}` in Linux because `init` overwrites them from `max_threads` before
+/// any userspace runs. Nothing counts either here, so `RLIM_INFINITY` is the
+/// truth about this kernel where a literal zero would not be.
+///
+/// What a process used to get was [`RLimit::default`] -- 1024/1024 -- for the
+/// one limit that existed. The soft limit is unchanged; the hard one becomes
+/// Linux's `INR_OPEN_MAX`, so a process can raise its own descriptor budget
+/// to 4096 the way it can anywhere else.
+const INIT_RLIMITS: [RLimit; RLIM_NLIMITS] = {
+    const INF: RLimit = RLimit {
+        cur: RLIM_INFINITY,
+        max: RLIM_INFINITY,
+    };
+    let mut table = [INF; RLIM_NLIMITS];
+    table[RLIMIT_STACK] = RLimit {
+        cur: USER_STACK_SIZE,
+        max: RLIM_INFINITY,
+    };
+    // No core is ever written, so a soft limit of zero is not a policy
+    // this kernel is choosing: it is the size of the dump.
+    table[RLIMIT_CORE] = RLimit {
+        cur: 0,
+        max: RLIM_INFINITY,
+    };
+    // `INR_OPEN_CUR` / `INR_OPEN_MAX`.
+    table[RLIMIT_NOFILE] = RLimit {
+        cur: 1024,
+        max: 4096,
+    };
+    // `MLOCK_LIMIT`.
+    table[RLIMIT_MEMLOCK] = RLimit {
+        cur: USER_STACK_SIZE,
+        max: USER_STACK_SIZE,
+    };
+    // `MQ_BYTES_MAX`.
+    table[RLIMIT_MSGQUEUE] = RLimit {
+        cur: 819_200,
+        max: 819_200,
+    };
+    // A process may not raise its own priority here at all, which is what
+    // Linux's zero means.
+    table[RLIMIT_NICE] = RLimit { cur: 0, max: 0 };
+    table[RLIMIT_RTPRIO] = RLimit { cur: 0, max: 0 };
+    table
+};
 
 /// The type of process exit code.
 pub type ExitCode = i32;
@@ -1340,7 +1510,7 @@ impl LinuxProcess {
         let old = inner.files.remove(&fd);
         // Net table size is unchanged (replace) or +1 (plain insert); apply the
         // same limit check as insert_file for the growth case.
-        if old.is_none() && inner.files.len() >= inner.file_limit.cur as usize {
+        if old.is_none() && inner.files.len() >= inner.nofile() {
             return Err(LxError::EMFILE);
         }
         if cloexec {
@@ -1360,7 +1530,7 @@ impl LinuxProcess {
         file: Arc<dyn FileLike>,
         cloexec: bool,
     ) -> LxResult<FileDesc> {
-        if inner.files.len() < inner.file_limit.cur as usize {
+        if inner.files.len() < inner.nofile() {
             if cloexec {
                 inner.cloexec_fds.insert(fd);
             } else {
@@ -1397,14 +1567,101 @@ impl LinuxProcess {
         Ok(inner.cloexec_fds.contains(&fd))
     }
 
-    /// get and set file limit number
-    pub fn file_limit(&self, new_limit: Option<RLimit>) -> RLimit {
+    /// The soft `RLIMIT_NOFILE`, the one limit this kernel enforces.
+    ///
+    /// **Read only.** The one way to move a limit is [`Self::rlimit`], which
+    /// is where `do_prlimit`'s rules live; a second way in would be a second
+    /// place for them not to be applied.
+    pub fn file_limit(&self) -> RLimit {
+        self.inner
+            .lock()
+            .limits
+            .get(RLIMIT_NOFILE)
+            .unwrap_or_default()
+    }
+
+    /// `do_prlimit()`: read `resource`, and replace it when `new` is given.
+    /// Returns the limit as it was, which is what `prlimit64` reports.
+    ///
+    /// `may_raise_hard` is the CALLER's `capable(CAP_SYS_RESOURCE)`, not this
+    /// process's: `prlimit64(pid, ...)` asks about whoever is calling.
+    pub fn rlimit(
+        &self,
+        resource: usize,
+        new: Option<RLimit>,
+        may_raise_hard: bool,
+    ) -> LxResult<RLimit> {
         let mut inner = self.inner.lock();
-        let old = inner.file_limit;
-        if let Some(limit) = new_limit {
-            inner.file_limit = limit;
+        let old = inner.limits.get(resource)?;
+        if let Some(new) = new {
+            Self::rlimit_check(resource, old, new, may_raise_hard)?;
+            inner.limits.set(resource, new)?;
         }
-        old
+        Ok(old)
+    }
+
+    /// Whether `caller` may read or move **another** process's limits.
+    ///
+    /// `check_prlimit_permission()`:
+    ///
+    /// ```c
+    /// id_match = (uid_eq(cred->uid, tcred->euid) &&
+    ///             uid_eq(cred->uid, tcred->suid) &&
+    ///             uid_eq(cred->uid, tcred->uid)  &&
+    ///             gid_eq(cred->gid, tcred->egid) &&
+    ///             gid_eq(cred->gid, tcred->sgid) &&
+    ///             gid_eq(cred->gid, tcred->gid));
+    /// if (!id_match && !ns_capable(tcred->user_ns, CAP_SYS_RESOURCE))
+    ///         return -EPERM;
+    /// ```
+    ///
+    /// Note which ids: the caller's REAL pair against all three of the
+    /// target's, every one of them. It is not "same user" -- it is "that
+    /// process has no id I do not already have", so a target that is
+    /// part-way through a set-user-ID dance is out of reach even for the
+    /// user who started it.
+    pub fn may_touch_limits_of(caller: &Credentials, target: &Credentials) -> bool {
+        let ids_match = caller.ruid == target.ruid
+            && caller.ruid == target.euid
+            && caller.ruid == target.suid
+            && caller.rgid == target.rgid
+            && caller.rgid == target.egid
+            && caller.rgid == target.sgid;
+        ids_match || has_capability(caller.euid, CAP_SYS_RESOURCE)
+    }
+
+    /// The three rules `do_prlimit` applies to a new limit, and the fourth
+    /// that `prlimit64` applies before it:
+    ///
+    /// ```c
+    /// if (resource >= RLIM_NLIMITS)                                   return -EINVAL;
+    /// if (new_rlim->rlim_cur > new_rlim->rlim_max)                    return -EINVAL;
+    /// if (resource == RLIMIT_NOFILE &&
+    ///     new_rlim->rlim_max > sysctl_nr_open)                        return -EPERM;
+    /// if (new_rlim->rlim_max > rlim->rlim_max && !capable(CAP_SYS_RESOURCE))
+    ///                                                                 return -EPERM;
+    /// ```
+    ///
+    /// The last one is what makes a hard limit a limit. Without it a process
+    /// that wanted a bigger soft limit than its hard one simply set both at
+    /// once, and the hard limit meant nothing: a self-imposed budget with a
+    /// lid the process could lift.
+    fn rlimit_check(
+        resource: usize,
+        old: RLimit,
+        new: RLimit,
+        may_raise_hard: bool,
+    ) -> LxResult<()> {
+        if new.cur > new.max {
+            return Err(LxError::EINVAL);
+        }
+        if resource == RLIMIT_NOFILE && new.max > NR_OPEN {
+            return Err(LxError::EPERM);
+        }
+        if new.max > old.max && !may_raise_hard {
+            return Err(LxError::EPERM);
+        }
+        Ok(())
     }
 
     /// Get the `File` with given `fd`.
@@ -1547,6 +1804,16 @@ impl LinuxProcess {
         self.inner.lock().credentials.sgid
     }
 
+    /// Get the filesystem uid, the id every file access is checked against.
+    pub fn fsuid(&self) -> u32 {
+        self.inner.lock().credentials.fsuid
+    }
+
+    /// Get the filesystem gid.
+    pub fn fsgid(&self) -> u32 {
+        self.inner.lock().credentials.fsgid
+    }
+
     /// Get supplementary groups.
     pub fn groups(&self) -> Vec<u32> {
         self.inner.lock().credentials.groups.clone()
@@ -1631,6 +1898,35 @@ impl LinuxProcess {
         real_arg != NO_ID || (eff_arg != NO_ID && eff_arg != old_real)
     }
 
+    /// `setfsuid(2)`/`setfsgid(2)`: the real, the effective, the saved, or
+    /// **the one already in force**. `__sys_setfsuid`:
+    /// `uid_eq(kuid, old->uid) || uid_eq(kuid, old->euid) ||
+    /// uid_eq(kuid, old->suid) || uid_eq(kuid, old->fsuid)`. The acting id is
+    /// in the set and in none of the other three rules, which is the whole
+    /// point of the call: a program that has already dropped to `nobody` for
+    /// file work can keep doing so after its effective id moves on.
+    fn setfsid_allowed(real: u32, effective: u32, saved: u32, acting: u32, id: u32) -> bool {
+        Self::set_any_allowed(real, effective, saved, id) || id == acting
+    }
+
+    /// Which ids a permission check acts as.
+    ///
+    /// `use_effective` selects the FILESYSTEM ids -- `current_fsuid()` /
+    /// `current_fsgid()`, what `generic_permission` asks on every normal
+    /// path -- and the real ones otherwise, which is `access(2)` asking the
+    /// question as the real user.
+    ///
+    /// Written once because three places used to pick the pair themselves,
+    /// and three places picking it is three places to update the day the
+    /// kernel grows an id they should pick instead. That day was this one.
+    fn acting_fs_ids(creds: &Credentials, use_effective: bool) -> (u32, u32) {
+        if use_effective {
+            (creds.fsuid, creds.fsgid)
+        } else {
+            (creds.ruid, creds.rgid)
+        }
+    }
+
     fn allowed_uid(creds: &Credentials, uid: u32) -> bool {
         Self::set_any_allowed(creds.ruid, creds.euid, creds.suid, uid)
     }
@@ -1644,8 +1940,8 @@ impl LinuxProcess {
     }
 
     /// Whether the credentials belong to group `gid`, the way Linux's
-    /// `in_group_p()` decides it: the ACTING group (fsgid, which is `egid`
-    /// here) plus the supplementary list -- and nothing else.
+    /// `in_group_p()` decides it: the ACTING group (`fsgid`) plus the
+    /// supplementary list -- and nothing else.
     ///
     /// The effective path used to also accept `rgid` (through a helper that
     /// mixed this question up with which gids a caller may switch TO, a
@@ -1656,11 +1952,7 @@ impl LinuxProcess {
     /// normally wider than other bits, so the divergence only ever granted
     /// more than Linux would.
     fn acts_as_group(creds: &Credentials, gid: u32, use_effective: bool) -> bool {
-        let acting = if use_effective {
-            creds.egid
-        } else {
-            creds.rgid
-        };
+        let (_, acting) = Self::acting_fs_ids(creds, use_effective);
         acting == gid || creds.groups.contains(&gid)
     }
 
@@ -1675,11 +1967,7 @@ impl LinuxProcess {
         mode: u16,
         use_effective: bool,
     ) -> u16 {
-        let uid = if use_effective {
-            creds.euid
-        } else {
-            creds.ruid
-        };
+        let (uid, _) = Self::acting_fs_ids(creds, use_effective);
         if uid == ROOT_UID {
             return mode & 0o777;
         }
@@ -1705,11 +1993,7 @@ impl LinuxProcess {
         requested: u16,
         use_effective: bool,
     ) -> LxResult {
-        let selected_uid = if use_effective {
-            creds.euid
-        } else {
-            creds.ruid
-        };
+        let (selected_uid, _) = Self::acting_fs_ids(creds, use_effective);
         if selected_uid == ROOT_UID {
             // CAP_DAC_OVERRIDE semantics: root bypasses permission checks
             // except executing a non-directory with no exec bit set anywhere
@@ -1769,9 +2053,11 @@ impl LinuxProcess {
             return Ok(());
         }
         let creds = self.credentials();
-        if creds.euid == ROOT_UID
-            || creds.euid == dir_metadata.uid as u32
-            || creds.euid == target_metadata.uid as u32
+        // `__check_sticky()` opens with `kuid_t fsuid = current_fsuid();` and
+        // compares that one id against both inodes.
+        if creds.fsuid == ROOT_UID
+            || creds.fsuid == dir_metadata.uid as u32
+            || creds.fsuid == target_metadata.uid as u32
         {
             Ok(())
         } else {
@@ -1802,11 +2088,12 @@ impl LinuxProcess {
         cur_mode: u16,
         mode: u16,
     ) -> LxResult<u16> {
-        if creds.euid != ROOT_UID && creds.euid != owner_uid {
+        // `inode_owner_or_capable()`: `vfsuid_eq_kuid(vfsuid, current_fsuid())`.
+        if creds.fsuid != ROOT_UID && creds.fsuid != owner_uid {
             return Err(LxError::EPERM);
         }
         let mut out = cur_mode & !MODE_PERM_MASK | (mode & MODE_PERM_MASK);
-        if creds.euid != ROOT_UID && !Self::acts_as_group(creds, owner_gid, true) {
+        if creds.fsuid != ROOT_UID && !Self::acts_as_group(creds, owner_gid, true) {
             out &= !MODE_SET_GID;
         }
         Ok(out)
@@ -1828,12 +2115,14 @@ impl LinuxProcess {
     /// Change owner/group following a conservative POSIX-compatible policy.
     pub fn chown_metadata(&self, metadata: &mut Metadata, uid: u32, gid: u32) -> LxResult {
         let creds = self.credentials();
-        let privileged = creds.euid == ROOT_UID;
+        // `chown_ok()`/`chgrp_ok()` (`fs/attr.c`) both open on
+        // `vfsuid_eq_kuid(vfsuid, current_fsuid())`.
+        let privileged = creds.fsuid == ROOT_UID;
         if !privileged {
             if uid != NO_ID && uid != metadata.uid as u32 {
                 return Err(LxError::EPERM);
             }
-            if creds.euid != metadata.uid as u32 {
+            if creds.fsuid != metadata.uid as u32 {
                 return Err(LxError::EPERM);
             }
             // Linux `chgrp_ok`: `in_group_p(gid)` -- the acting gid plus the
@@ -1863,11 +2152,15 @@ impl LinuxProcess {
     ) -> LxResult {
         let creds = self.credentials();
         let mut metadata = inode.metadata()?;
-        metadata.uid = creds.euid as _;
+        // `inode_init_owner()`: `inode_fsuid_set()` / `inode_fsgid_set()`,
+        // which are `current_fsuid()` / `current_fsgid()`. A new file belongs
+        // to the id its creator was acting as, not to the one it kept for
+        // everything else.
+        metadata.uid = creds.fsuid as _;
         metadata.gid = parent_metadata
             .filter(|meta| (meta.mode & MODE_SET_GID) != 0)
             .map(|meta| meta.gid)
-            .unwrap_or(creds.egid as _);
+            .unwrap_or(creds.fsgid as _);
         let mut final_mode = mode & MODE_PERM_MASK;
         if let Some(parent) = parent_metadata {
             if (parent.mode & MODE_SET_GID) != 0 && is_dir {
@@ -2083,6 +2376,57 @@ impl LinuxProcess {
         }
         inner.note_id_change(before);
         Ok(())
+    }
+
+    /// `setfsuid(2)`: move the id file accesses are checked against, on its
+    /// own, and return the id that was in force before the call.
+    ///
+    /// **It cannot fail, and that is the whole difficulty.** `setfsuid`
+    /// returns the OLD id whether or not it changed anything, so its return
+    /// value says nothing about whether it worked; the man page tells a
+    /// program to call `setfsuid(-1)` afterwards and compare. A kernel that
+    /// accepts the id, does nothing and hands back something that looks like
+    /// success is therefore not caught by the caller's error handling --
+    /// there is none to catch it -- and the program goes on touching files
+    /// with the privilege it believes it just put down. That is what this
+    /// used to do.
+    pub fn set_fsuid(&self, uid: u32) -> u32 {
+        let mut inner = self.inner.lock();
+        let c = inner.credentials.clone();
+        // `if (!uid_valid(kuid)) return old_fsuid;` -- `(uid_t)-1` is not a
+        // user id, so `setfsuid(-1)` is the pure query, and an id that is
+        // already in force is `if (!uid_eq(kuid, old->fsuid))` declining to
+        // build new credentials at all. Neither taints the process.
+        if uid == NO_ID || uid == c.fsuid {
+            return c.fsuid;
+        }
+        if Self::setfsid_allowed(c.ruid, c.euid, c.suid, c.fsuid, uid)
+            || has_capability(c.euid, CAP_SETUID)
+        {
+            inner.credentials.fsuid = uid;
+            // `commit_creds()` treats a move of `fsuid` alone exactly like a
+            // `set*id`: `if (!uid_eq(new->fsuid, old->fsuid) || ...)
+            // set_dumpable(task->mm, suid_dumpable);`.
+            inner.sugid = true;
+        }
+        c.fsuid
+    }
+
+    /// `setfsgid(2)`: the group half of [`Self::set_fsuid`], with
+    /// `CAP_SETGID` in place of `CAP_SETUID`.
+    pub fn set_fsgid(&self, gid: u32) -> u32 {
+        let mut inner = self.inner.lock();
+        let c = inner.credentials.clone();
+        if gid == NO_ID || gid == c.fsgid {
+            return c.fsgid;
+        }
+        if Self::setfsid_allowed(c.rgid, c.egid, c.sgid, c.fsgid, gid)
+            || has_capability(c.euid, CAP_SETGID)
+        {
+            inner.credentials.fsgid = gid;
+            inner.sugid = true;
+        }
+        c.fsgid
     }
 
     /// Get parent process.
@@ -2419,6 +2763,12 @@ impl LinuxProcessInner {
             || self.credentials.euid != self.credentials.ruid
             || self.credentials.egid != self.credentials.rgid;
 
+        // `cap_bprm_creds_from_file()` ends with
+        // `new->suid = new->fsuid = new->euid; new->sgid = new->fsgid =
+        // new->egid;`. This path latches its own taint below instead of going
+        // through `note_id_change`, so it asks for the line itself.
+        self.follow_effective_ids();
+
         // `do_execve()` asks the same three questions to decide FreeBSD's
         // `P_SUGID`: `setsugid(p)` when the image granted an id, and
         // `p->p_flag &= ~P_SUGID` only when it did not AND the effective ids
@@ -2430,6 +2780,15 @@ impl LinuxProcessInner {
     }
 
     /// The six ids `issetugid(2)` watches.
+    /// How many descriptors this process may have open: the soft
+    /// `RLIMIT_NOFILE`, and the only limit of the sixteen anything enforces.
+    fn nofile(&self) -> usize {
+        self.limits
+            .get(RLIMIT_NOFILE)
+            .map(|l| l.cur as usize)
+            .unwrap_or(usize::MAX)
+    }
+
     fn ids(&self) -> [u32; 6] {
         let c = &self.credentials;
         [c.ruid, c.euid, c.suid, c.rgid, c.egid, c.sgid]
@@ -2442,9 +2801,38 @@ impl LinuxProcessInner {
     /// one that forgets is a program that asks whether it is tainted and is
     /// told no.
     fn note_id_change(&mut self, before: [u32; 6]) {
+        self.follow_effective_ids();
         if self.ids() != before {
             self.sugid = true;
         }
+    }
+
+    /// `new->fsuid = new->euid;` -- the last line of every `set*id` path in
+    /// `kernel/sys.c`, and of `cap_bprm_creds_from_file()` on the exec path.
+    /// Re-applies the effective ids through [`Credentials::set_euid`], the
+    /// one place in this kernel that writes a filesystem id from an
+    /// effective one. At the END of the path, not beside the write, which is
+    /// where Linux puts it: `setreuid(ruid, -1)` names no effective id and
+    /// still brings a wandered filesystem id home.
+    ///
+    /// One deliberate divergence: `kernel/sys.c` opens `__sys_setresuid`
+    /// with a "check for no-op" that returns before touching credentials, so
+    /// a `setresuid(-1, -1, -1)` there leaves a moved filesystem id where it
+    /// is. Here every path reaches this line, so it comes home. The
+    /// direction is the safe one -- it can only put back the id the caller
+    /// is already acting as everywhere else -- and the alternative is a
+    /// second copy of "did this call ask for anything?" in three setters.
+    ///
+    /// Written once for the same reason [`Self::note_id_change`] is: nine
+    /// setters each remembering a line is nine chances to forget one, and the
+    /// one that forgets leaves a process whose file accesses are still
+    /// checked against an id it just gave away. `setfsuid(2)` is the only
+    /// call that moves a filesystem id on its own, and it is the only one
+    /// that does not come through here.
+    fn follow_effective_ids(&mut self) {
+        let (euid, egid) = (self.credentials.euid, self.credentials.egid);
+        self.credentials.set_euid(euid);
+        self.credentials.set_egid(egid);
     }
 
     /// `apply_exec_ids` for an image on an ordinary mount, which is what every
@@ -2527,7 +2915,7 @@ impl LinuxProcessInner {
             // caps the fd table. Resetting it undid every `ulimit -n` the
             // moment the shell forked -- which is the only way a program ever
             // gets a raised limit.
-            file_limit: self.file_limit,
+            limits: self.limits,
             signal_actions: self.signal_actions.clone(),
             credentials: self.credentials.clone(),
             pgid,
@@ -3008,6 +3396,14 @@ pub fn all_live_processes() -> Vec<Arc<Process>> {
     let mut processes = Vec::new();
     collect_live_processes(&ROOT_JOB, &mut processes);
     processes
+}
+
+/// The process `pid` names, exited or not.
+///
+/// `find_task_by_vpid()`: the lookup a syscall that takes a pid does before
+/// it can ask anything else about it.
+pub fn find_process(pid: KoID) -> Option<Arc<Process>> {
+    ROOT_JOB.find_process(pid)
 }
 
 /// Whether `pid` names a process that has not exited.
@@ -3674,9 +4070,18 @@ mod fork_inheritance_tests {
             cmdline: alloc::vec![String::from("labwc"), String::from("-s")],
             environ: alloc::vec![String::from("WAYLAND_DISPLAY=wayland-0")],
             current_working_directory: String::from("/home/moebius"),
-            file_limit: RLimit {
-                cur: 65536,
-                max: 65536,
+            limits: {
+                let mut limits = RLimits::default();
+                limits
+                    .set(
+                        RLIMIT_NOFILE,
+                        RLimit {
+                            cur: 65536,
+                            max: 65536,
+                        },
+                    )
+                    .unwrap();
+                limits
             },
             brk: 0x5555_0010_0000,
             mapped_brk: 0x5555_0020_0000,
@@ -3728,8 +4133,8 @@ mod fork_inheritance_tests {
         // every raise in the system, silently, and the program hit EMFILE at
         // the default -- the failure a raised limit exists to prevent.
         let child = fork_of(&a_configured_parent());
-        assert_eq!(child.file_limit.cur, 65536);
-        assert_eq!(child.file_limit.max, 65536);
+        assert_eq!(child.limits.get(RLIMIT_NOFILE).unwrap().cur, 65536);
+        assert_eq!(child.limits.get(RLIMIT_NOFILE).unwrap().max, 65536);
     }
 
     #[test]
@@ -3961,10 +4366,10 @@ mod exec_reset_tests {
         inner.shm_identifiers.set(9, ident);
         inner.pdeathsig = crate::signal::Signal::SIGTERM as u8;
         inner.credentials.ruid = 1000;
-        inner.credentials.euid = 1000;
+        inner.credentials.set_euid(1000);
         inner.credentials.suid = 1000;
         inner.credentials.rgid = 1000;
-        inner.credentials.egid = 1000;
+        inner.credentials.set_egid(1000);
         inner.credentials.sgid = 1000;
         // Its own group, not root's: `secureexec` asks whether the effective
         // group is one this process already held, and a fixture left in group
@@ -4152,7 +4557,7 @@ mod exec_reset_tests {
     /// environment; whoever owns the id it runs as did not.
     fn a_process_already_setuid_root() -> LinuxProcessInner {
         let mut inner = a_process_about_to_exec();
-        inner.credentials.euid = ROOT_UID;
+        inner.credentials.set_euid(ROOT_UID);
         inner.credentials.suid = ROOT_UID;
         inner
     }
@@ -4177,7 +4582,7 @@ mod exec_reset_tests {
         // set-user-ID one, and a rule that only ever looked at the user half
         // would hand it the caller's environment.
         let mut inner = a_process_about_to_exec();
-        inner.credentials.egid = 0;
+        inner.credentials.set_egid(0);
         inner.credentials.sgid = 0;
         assert!(inner.apply_exec_ids_from_a_normal_mount(0o0755, ROOT_UID, ROOT_UID));
         assert_eq!(inner.credentials.egid, 0);
@@ -4211,7 +4616,7 @@ mod exec_reset_tests {
         // say no, and the exec still performed an id transition that the new
         // image must be hardened against.
         let mut inner = a_process_about_to_exec();
-        inner.credentials.euid = ROOT_UID;
+        inner.credentials.set_euid(ROOT_UID);
         inner.credentials.suid = ROOT_UID;
         assert!(inner.apply_exec_ids_from_a_normal_mount(0o4755, 1000, ROOT_UID));
         assert_eq!(inner.credentials.euid, 1000);
@@ -4250,7 +4655,7 @@ mod exec_reset_tests {
         // in has gained nothing to be hardened against -- it has given
         // something up.
         let mut inner = a_process_about_to_exec();
-        inner.credentials.egid = ROOT_UID;
+        inner.credentials.set_egid(ROOT_UID);
         inner.credentials.sgid = ROOT_UID;
         inner.credentials.groups = vec![1000];
         assert!(!inner.apply_exec_ids_from_a_normal_mount(0o2754, ROOT_UID, 1000));
@@ -4265,7 +4670,7 @@ mod exec_reset_tests {
         // returns to it. Written down because it looks like a mistake and is
         // the rule as Linux states it.
         let mut inner = a_process_about_to_exec();
-        inner.credentials.egid = ROOT_UID;
+        inner.credentials.set_egid(ROOT_UID);
         inner.credentials.sgid = ROOT_UID;
         inner.credentials.groups = vec![ROOT_UID];
         assert!(inner.apply_exec_ids_from_a_normal_mount(0o2754, ROOT_UID, 1000));
@@ -4363,7 +4768,7 @@ mod sugid_tests {
         {
             let mut inner = proc.inner.lock();
             inner.credentials.ruid = 1000;
-            inner.credentials.euid = 1000;
+            inner.credentials.set_euid(1000);
             inner.credentials.suid = 1000;
         }
         assert!(proc.set_uid(ROOT_UID).is_err());
@@ -4444,10 +4849,10 @@ mod sugid_tests {
     fn a_setuid_exec_taints_a_process_that_was_clean() {
         let mut inner = LinuxProcessInner::default();
         inner.credentials.ruid = 1000;
-        inner.credentials.euid = 1000;
+        inner.credentials.set_euid(1000);
         inner.credentials.suid = 1000;
         inner.credentials.rgid = 1000;
-        inner.credentials.egid = 1000;
+        inner.credentials.set_egid(1000);
         inner.credentials.sgid = 1000;
         inner.credentials.groups = vec![1000];
         assert!(!inner.sugid);
@@ -4560,6 +4965,839 @@ mod capability_tests {
 }
 
 #[cfg(test)]
+mod rlimit_tests {
+    //! The sixteen resource limits, and who may move them.
+    //!
+    //! Twelve of the sixteen used to answer `ENOSYS` and three more answered
+    //! with a constant, whatever the caller had set. And the hard limit was
+    //! not a limit: an earlier batch left a test saying so on the record --
+    //! *"this kernel has no capability model to ask"* -- because Linux's
+    //! fourth rule needs `CAP_SYS_RESOURCE`. It has one now, so the rule is
+    //! here and that test has become its opposite.
+
+    use super::dup_fd_tests::a_process;
+    use super::*;
+
+    const USER: u32 = 1000;
+    const OTHER: u32 = 2000;
+
+    fn limit(cur: u64, max: u64) -> RLimit {
+        RLimit { cur, max }
+    }
+
+    /// Ordinary credentials: every id the same, so two processes built this
+    /// way with the same numbers can reach each other.
+    fn creds(ruid: u32, euid: u32, suid: u32) -> Credentials {
+        Credentials {
+            ruid,
+            euid,
+            suid,
+            rgid: ruid,
+            egid: euid,
+            sgid: suid,
+            fsuid: euid,
+            fsgid: euid,
+            groups: Vec::new(),
+            umask: 0o022,
+        }
+    }
+
+    fn check(resource: usize, old: RLimit, new: RLimit, may_raise: bool) -> LxResult {
+        LinuxProcess::rlimit_check(resource, old, new, may_raise)
+    }
+
+    // ---- the four rules ----------------------------------------------
+
+    #[test]
+    fn a_soft_limit_above_the_hard_one_is_einval() {
+        // The rule that makes the hard limit mean anything at all.
+        assert_eq!(
+            check(RLIMIT_NOFILE, limit(1024, 1024), limit(4096, 1024), true),
+            Err(LxError::EINVAL)
+        );
+        assert_eq!(
+            check(RLIMIT_CORE, limit(0, RLIM_INFINITY), limit(1, 0), true),
+            Err(LxError::EINVAL)
+        );
+    }
+
+    #[test]
+    fn a_soft_limit_equal_to_the_hard_one_is_fine() {
+        // The boundary is `>`, not `>=`: setting both to the same value is
+        // what a process does when it raises itself to its hard limit, the
+        // single most common `setrlimit` call there is.
+        assert_eq!(
+            check(RLIMIT_NOFILE, limit(1024, 4096), limit(4096, 4096), false),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn the_descriptor_ceiling_is_eperm_and_applies_to_that_resource_alone() {
+        // `if (resource == RLIMIT_NOFILE && new_rlim->rlim_max >
+        // sysctl_nr_open) return -EPERM;`. EPERM and not EINVAL, and the
+        // difference is load-bearing: a caller that sees EPERM retries with a
+        // smaller number, one that sees EINVAL concludes it built the struct
+        // wrong.
+        assert_eq!(
+            check(
+                RLIMIT_NOFILE,
+                limit(0, RLIM_INFINITY),
+                limit(NR_OPEN + 1, NR_OPEN + 1),
+                true
+            ),
+            Err(LxError::EPERM)
+        );
+        assert_eq!(
+            check(
+                RLIMIT_MEMLOCK,
+                limit(0, RLIM_INFINITY),
+                limit(NR_OPEN + 1, NR_OPEN + 1),
+                true
+            ),
+            Ok(()),
+            "a million is not a lot of bytes, and this rule is about descriptors"
+        );
+    }
+
+    #[test]
+    fn the_descriptor_ceiling_itself_is_accepted() {
+        assert_eq!(
+            check(
+                RLIMIT_NOFILE,
+                limit(0, RLIM_INFINITY),
+                limit(NR_OPEN, NR_OPEN),
+                true
+            ),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn the_order_of_the_rules_is_linuxs() {
+        // Both wrong at once: `cur > max` is checked first, so this is EINVAL
+        // and not EPERM. A caller that retries on EPERM would otherwise spin
+        // on a struct that is never going to be accepted.
+        assert_eq!(
+            check(
+                RLIMIT_NOFILE,
+                limit(0, RLIM_INFINITY),
+                limit(RLIM_INFINITY, NR_OPEN + 1),
+                true
+            ),
+            Err(LxError::EINVAL)
+        );
+    }
+
+    #[test]
+    fn the_hard_limit_is_a_boundary_now() {
+        // `if (new_rlim->rlim_max > rlim->rlim_max && !capable(CAP_SYS_RESOURCE))
+        //         retval = -EPERM;`
+        //
+        // Without it a process that wanted a soft limit past its hard one set
+        // both at once and got it, so the hard limit was a lid the process
+        // could lift. This is the test that used to assert the opposite.
+        assert_eq!(
+            check(RLIMIT_NOFILE, limit(1024, 4096), limit(4096, 8192), false),
+            Err(LxError::EPERM)
+        );
+        assert_eq!(
+            check(RLIMIT_NOFILE, limit(1024, 4096), limit(4096, 8192), true),
+            Ok(()),
+            "and CAP_SYS_RESOURCE is what lifts it"
+        );
+    }
+
+    #[test]
+    fn lowering_the_hard_limit_needs_nothing_and_does_not_come_back() {
+        // A one-way ratchet is the point of the thing: a program drops its
+        // own ceiling before running something it does not trust, and that
+        // something cannot undo it.
+        assert_eq!(
+            check(RLIMIT_NOFILE, limit(1024, 4096), limit(64, 64), false),
+            Ok(())
+        );
+        assert_eq!(
+            check(RLIMIT_NOFILE, limit(64, 64), limit(64, 4096), false),
+            Err(LxError::EPERM)
+        );
+    }
+
+    #[test]
+    fn a_hard_limit_that_does_not_move_is_not_a_raise() {
+        // The comparison is `>`, so re-setting the same hard limit while
+        // moving the soft one is the ordinary unprivileged call.
+        assert_eq!(
+            check(RLIMIT_NOFILE, limit(1024, 4096), limit(4096, 4096), false),
+            Ok(())
+        );
+    }
+
+    // ---- the sixteen resources ---------------------------------------
+
+    #[test]
+    fn the_resource_numbers_are_the_ones_resource_h_names() {
+        // The order IS the numbering, so a row out of place is a program
+        // asking about its stack and being told about its core dumps.
+        const IN_ORDER: [(usize, &str); RLIM_NLIMITS] = [
+            (RLIMIT_CPU, "RLIMIT_CPU"),
+            (RLIMIT_FSIZE, "RLIMIT_FSIZE"),
+            (RLIMIT_DATA, "RLIMIT_DATA"),
+            (RLIMIT_STACK, "RLIMIT_STACK"),
+            (RLIMIT_CORE, "RLIMIT_CORE"),
+            (RLIMIT_RSS, "RLIMIT_RSS"),
+            (RLIMIT_NPROC, "RLIMIT_NPROC"),
+            (RLIMIT_NOFILE, "RLIMIT_NOFILE"),
+            (RLIMIT_MEMLOCK, "RLIMIT_MEMLOCK"),
+            (RLIMIT_AS, "RLIMIT_AS"),
+            (RLIMIT_LOCKS, "RLIMIT_LOCKS"),
+            (RLIMIT_SIGPENDING, "RLIMIT_SIGPENDING"),
+            (RLIMIT_MSGQUEUE, "RLIMIT_MSGQUEUE"),
+            (RLIMIT_NICE, "RLIMIT_NICE"),
+            (RLIMIT_RTPRIO, "RLIMIT_RTPRIO"),
+            (RLIMIT_RTTIME, "RLIMIT_RTTIME"),
+        ];
+        for (index, (number, name)) in IN_ORDER.iter().enumerate() {
+            assert_eq!(*number, index, "{} is not number {}", name, index);
+        }
+        assert_eq!(RLIM_NLIMITS, 16);
+    }
+
+    #[test]
+    fn every_resource_answers_and_the_seventeenth_is_einval() {
+        // `ulimit -a` walks all sixteen. Twelve of them used to answer
+        // `ENOSYS`, which a program reads as "this kernel has no such call"
+        // rather than "no such resource".
+        let proc = a_process();
+        for resource in 0..RLIM_NLIMITS {
+            assert!(
+                proc.rlimit(resource, None, false).is_ok(),
+                "resource {} has no answer",
+                resource
+            );
+        }
+        assert_eq!(
+            proc.rlimit(RLIM_NLIMITS, None, false),
+            Err(LxError::EINVAL),
+            "past the end is EINVAL, which is what `do_prlimit` says"
+        );
+        assert_eq!(proc.rlimit(usize::MAX, None, false), Err(LxError::EINVAL));
+    }
+
+    #[test]
+    fn what_a_process_starts_with_is_the_table_linux_starts_with() {
+        let proc = a_process();
+        let at = |r| proc.rlimit(r, None, false).unwrap();
+        assert_eq!(at(RLIMIT_NOFILE), limit(1024, 4096), "INR_OPEN_CUR/MAX");
+        assert_eq!(at(RLIMIT_STACK), limit(USER_STACK_SIZE, RLIM_INFINITY));
+        assert_eq!(
+            at(RLIMIT_CORE),
+            limit(0, RLIM_INFINITY),
+            "no core is ever written, so zero is the size and not a policy"
+        );
+        assert_eq!(at(RLIMIT_NICE), limit(0, 0));
+        assert_eq!(at(RLIMIT_RTPRIO), limit(0, 0));
+        assert_eq!(at(RLIMIT_AS), limit(RLIM_INFINITY, RLIM_INFINITY));
+        assert_eq!(
+            at(RLIMIT_NPROC),
+            limit(RLIM_INFINITY, RLIM_INFINITY),
+            "Linux's zero is a placeholder init overwrites; nothing counts here"
+        );
+    }
+
+    #[test]
+    fn a_limit_that_is_set_is_the_limit_that_is_read_back() {
+        // What three of the four answered resources did not do: they reported
+        // a constant, so a program that lowered `RLIMIT_AS` and read it back
+        // was told its own request had not happened -- and no error said so.
+        let proc = a_process();
+        let wanted = limit(64 * 1024 * 1024, 128 * 1024 * 1024);
+        assert_eq!(
+            proc.rlimit(RLIMIT_AS, Some(wanted), false),
+            Ok(limit(RLIM_INFINITY, RLIM_INFINITY)),
+            "and the answer is the limit as it WAS"
+        );
+        assert_eq!(proc.rlimit(RLIMIT_AS, None, false), Ok(wanted));
+    }
+
+    #[test]
+    fn a_refused_change_leaves_the_limit_where_it_was() {
+        let proc = a_process();
+        let before = proc.rlimit(RLIMIT_NOFILE, None, false).unwrap();
+        assert_eq!(
+            proc.rlimit(RLIMIT_NOFILE, Some(limit(8192, 8192)), false),
+            Err(LxError::EPERM)
+        );
+        assert_eq!(proc.rlimit(RLIMIT_NOFILE, None, false), Ok(before));
+    }
+
+    #[test]
+    fn the_soft_limit_is_what_closes_the_descriptor_table() {
+        // The hard limit is a ceiling on what may be ASKED for; the soft one
+        // is the budget in force. A table that checked the hard limit would
+        // hand out descriptors a program had deliberately stopped itself
+        // taking, and `EMFILE` would arrive four thousand files later than
+        // the program arranged.
+        let proc = a_process();
+        proc.rlimit(RLIMIT_NOFILE, Some(limit(2, 4096)), false)
+            .unwrap();
+        let open =
+            || super::dup_fd_tests::an_open_log(super::dup_fd_tests::Log::new(), OpenFlags::WRONLY);
+        assert!(proc.add_file(open()).is_ok());
+        assert!(proc.add_file(open()).is_ok());
+        assert_eq!(proc.add_file(open()), Err(LxError::EMFILE));
+    }
+
+    #[test]
+    fn the_descriptor_limit_that_is_stored_is_the_one_that_is_enforced() {
+        // One table, one row: there is no second place for the number the fd
+        // table checks to drift away from the number `getrlimit` reports.
+        let proc = a_process();
+        proc.rlimit(RLIMIT_NOFILE, Some(limit(64, 4096)), false)
+            .unwrap();
+        assert_eq!(proc.file_limit(), limit(64, 4096));
+    }
+
+    // ---- whose limits they are ---------------------------------------
+
+    #[test]
+    fn a_process_with_the_very_same_ids_is_reachable() {
+        let caller = creds(USER, USER, USER);
+        let target = creds(USER, USER, USER);
+        assert!(LinuxProcess::may_touch_limits_of(&caller, &target));
+    }
+
+    #[test]
+    fn another_users_process_is_not() {
+        let caller = creds(USER, USER, USER);
+        let target = creds(OTHER, OTHER, OTHER);
+        assert!(!LinuxProcess::may_touch_limits_of(&caller, &target));
+    }
+
+    #[test]
+    fn a_target_part_way_through_a_set_user_id_dance_is_out_of_reach() {
+        // `id_match` is all six comparisons, not "same user": a target that
+        // still holds root in its saved uid is beyond the user who started
+        // it, because raising its limits would raise the limits of whatever
+        // it is about to become.
+        let caller = creds(USER, USER, USER);
+        let target = creds(USER, USER, ROOT_UID);
+        assert!(!LinuxProcess::may_touch_limits_of(&caller, &target));
+        let target = creds(USER, ROOT_UID, USER);
+        assert!(!LinuxProcess::may_touch_limits_of(&caller, &target));
+    }
+
+    #[test]
+    fn it_is_the_callers_real_ids_that_are_compared() {
+        // `cred->uid`, not `cred->euid`. A set-user-ID program does not get
+        // to reach further than the user who ran it just by holding an
+        // effective id; what it gets instead is `CAP_SYS_RESOURCE`, and only
+        // if that effective id is root.
+        //
+        // The caller here differs from the target in its real UID and in
+        // NOTHING else, so the effective ids alone would say yes.
+        let mut caller = creds(USER, USER, USER);
+        caller.ruid = OTHER;
+        let target = creds(USER, USER, USER);
+        assert!(
+            !LinuxProcess::may_touch_limits_of(&caller, &target),
+            "the effective id matches and the real one does not"
+        );
+        let mut caller = creds(USER, USER, USER);
+        caller.rgid = OTHER;
+        assert!(
+            !LinuxProcess::may_touch_limits_of(&caller, &target),
+            "and the same on the group side"
+        );
+    }
+
+    #[test]
+    fn the_group_half_is_compared_too() {
+        let caller = creds(USER, USER, USER);
+        let mut target = creds(USER, USER, USER);
+        target.sgid = OTHER;
+        assert!(!LinuxProcess::may_touch_limits_of(&caller, &target));
+    }
+
+    #[test]
+    fn cap_sys_resource_reaches_anybody() {
+        let root = creds(ROOT_UID, ROOT_UID, ROOT_UID);
+        let target = creds(OTHER, USER, ROOT_UID);
+        assert!(LinuxProcess::may_touch_limits_of(&root, &target));
+    }
+
+    #[test]
+    fn a_root_real_uid_without_a_root_effective_one_does_not() {
+        // The capability comes from the EFFECTIVE id, so a root-owned program
+        // that has dropped to a user is on the id-match path like anyone
+        // else.
+        let dropped = creds(ROOT_UID, USER, USER);
+        let target = creds(OTHER, OTHER, OTHER);
+        assert!(!LinuxProcess::may_touch_limits_of(&dropped, &target));
+    }
+}
+
+#[cfg(test)]
+mod fsid_tests {
+    //! `setfsuid(2)`/`setfsgid(2)`, and the id a file access is really
+    //! checked against.
+    //!
+    //! Linux keeps `fsuid` apart from `euid` on purpose;
+    //! `generic_permission()` says why in its own comment: "We use `fsuid`
+    //! for this, letting us set arbitrary permissions for filesystem access
+    //! without changing the 'normal' uids which are used for other things."
+    //! A file server takes an id from the wire, wears it while it touches the
+    //! file, and puts it back -- without giving up the privileges it needs
+    //! for its own sockets and its own log.
+    //!
+    //! This kernel had no `fsuid` at all. `setfsuid` took the argument,
+    //! ignored it and returned the caller's `euid`, which is **exactly what a
+    //! call that worked looks like**: the syscall cannot fail, so it returns
+    //! the previous id either way and there is no error for the caller to
+    //! check. The server went on reading the file as root, with nothing
+    //! anywhere saying so.
+    //!
+    //! Three parts, then: who may move the id, who drags it along (every
+    //! `set*id` path and `execve`, where a forgotten line is a privilege the
+    //! caller believes it put down), and what actually asks it.
+
+    use super::dup_fd_tests::a_process;
+    use super::*;
+    use rcore_fs::vfs::{FileType, FsError, PollStatus, Timespec};
+
+    const REAL: u32 = 1000;
+    const SAVED: u32 = 1500;
+    const OTHER: u32 = 2000;
+    const SPOOL: u32 = 4242;
+
+    /// The credentials of an ordinary, untainted process.
+    fn creds(ruid: u32, euid: u32, suid: u32) -> Credentials {
+        Credentials {
+            ruid,
+            euid,
+            suid,
+            rgid: ruid,
+            egid: euid,
+            sgid: suid,
+            fsuid: euid,
+            fsgid: euid,
+            groups: Vec::new(),
+            umask: 0o022,
+        }
+    }
+
+    /// A live process wearing those ids.
+    fn process_as(ruid: u32, euid: u32, suid: u32) -> LinuxProcess {
+        let proc = a_process();
+        proc.inner.lock().credentials = creds(ruid, euid, suid);
+        proc
+    }
+
+    fn a_metadata(mode: u16, uid: u32, gid: u32) -> Metadata {
+        Metadata {
+            dev: 1,
+            inode: 7,
+            size: 0,
+            blk_size: 4096,
+            blocks: 0,
+            atime: Timespec { sec: 0, nsec: 0 },
+            mtime: Timespec { sec: 0, nsec: 0 },
+            ctime: Timespec { sec: 0, nsec: 0 },
+            type_: FileType::File,
+            mode,
+            nlinks: 1,
+            uid: uid as _,
+            gid: gid as _,
+            rdev: 0,
+        }
+    }
+
+    /// An inode that remembers who it ended up belonging to.
+    struct Owned(Mutex<Metadata>);
+
+    impl Owned {
+        fn new() -> Arc<Self> {
+            Arc::new(Owned(Mutex::new(a_metadata(0o644, NO_ID, NO_ID))))
+        }
+    }
+
+    impl INode for Owned {
+        fn read_at(&self, _: usize, _: &mut [u8]) -> rcore_fs::vfs::Result<usize> {
+            Err(FsError::NotSupported)
+        }
+        fn write_at(&self, _: usize, _: &[u8]) -> rcore_fs::vfs::Result<usize> {
+            Err(FsError::NotSupported)
+        }
+        fn poll(&self) -> rcore_fs::vfs::Result<PollStatus> {
+            Err(FsError::NotSupported)
+        }
+        fn metadata(&self) -> rcore_fs::vfs::Result<Metadata> {
+            Ok(self.0.lock().clone())
+        }
+        fn set_metadata(&self, metadata: &Metadata) -> rcore_fs::vfs::Result<()> {
+            *self.0.lock() = metadata.clone();
+            Ok(())
+        }
+        fn as_any_ref(&self) -> &dyn core::any::Any {
+            self
+        }
+    }
+
+    // ---- who may move it ---------------------------------------------
+
+    #[test]
+    fn the_id_already_in_force_is_in_the_set_and_in_no_other_rule() {
+        // The one thing that tells `setfsid_allowed` apart from the rule
+        // every other `set*id` call uses. Without it a process whose
+        // filesystem id sits somewhere the rest of its ids never were could
+        // not name that id again -- not even to ask for it back.
+        assert!(
+            LinuxProcess::setfsid_allowed(REAL, REAL, REAL, SPOOL, SPOOL),
+            "the acting id must be nameable"
+        );
+        assert!(
+            !LinuxProcess::set_any_allowed(REAL, REAL, REAL, SPOOL),
+            "and no other rule accepts it, which is why this one exists"
+        );
+    }
+
+    #[test]
+    fn the_three_ordinary_ids_are_in_the_set_too() {
+        for id in [REAL, OTHER, SAVED] {
+            assert!(
+                LinuxProcess::setfsid_allowed(REAL, OTHER, SAVED, REAL, id),
+                "{} is one of the caller's own ids",
+                id
+            );
+        }
+    }
+
+    #[test]
+    fn an_id_the_caller_never_held_is_refused() {
+        assert!(!LinuxProcess::setfsid_allowed(
+            REAL, OTHER, SAVED, REAL, SPOOL
+        ));
+    }
+
+    #[test]
+    fn setfsuid_answers_with_the_id_that_was_in_force_not_the_new_one() {
+        // `old_fsuid` is read before anything is decided and is what every
+        // return path hands back; a program keeps it to put the id back.
+        let proc = process_as(REAL, ROOT_UID, ROOT_UID);
+        assert_eq!(proc.set_fsuid(REAL), ROOT_UID);
+        assert_eq!(proc.fsuid(), REAL);
+        assert_eq!(proc.set_fsuid(ROOT_UID), REAL, "and again on the way back");
+        assert_eq!(proc.fsuid(), ROOT_UID);
+    }
+
+    #[test]
+    fn dropping_to_another_user_for_file_work_leaves_the_other_ids_alone() {
+        // The whole point of the call: still root for everything that is not
+        // a file.
+        let proc = process_as(REAL, ROOT_UID, ROOT_UID);
+        proc.set_fsuid(REAL);
+        assert_eq!(proc.fsuid(), REAL);
+        assert_eq!(proc.euid(), ROOT_UID);
+        assert_eq!(proc.uid(), REAL);
+        assert_eq!(proc.suid(), ROOT_UID);
+    }
+
+    #[test]
+    fn minus_one_is_the_query_the_man_page_tells_you_to_make() {
+        // `if (!uid_valid(kuid)) return old_fsuid;`. Since the call cannot
+        // report an error, `setfsuid(-1)` is how a careful program finds out
+        // whether the previous one took.
+        let proc = process_as(REAL, ROOT_UID, ROOT_UID);
+        proc.set_fsuid(REAL);
+        assert_eq!(proc.set_fsuid(NO_ID), REAL);
+        assert_eq!(proc.fsuid(), REAL, "and it changed nothing");
+    }
+
+    #[test]
+    fn an_id_the_caller_never_held_leaves_the_filesystem_id_where_it_was() {
+        let proc = process_as(REAL, REAL, REAL);
+        assert_eq!(proc.set_fsuid(SPOOL), REAL);
+        assert_eq!(
+            proc.fsuid(),
+            REAL,
+            "refused, and the only sign of it is that the id did not move"
+        );
+    }
+
+    #[test]
+    fn root_may_move_it_anywhere_because_of_cap_setuid() {
+        let proc = process_as(ROOT_UID, ROOT_UID, ROOT_UID);
+        assert_eq!(proc.set_fsuid(SPOOL), ROOT_UID);
+        assert_eq!(proc.fsuid(), SPOOL);
+    }
+
+    #[test]
+    fn the_group_half_runs_the_same_rule_with_cap_setgid() {
+        let privileged = process_as(REAL, ROOT_UID, ROOT_UID);
+        assert_eq!(privileged.set_fsgid(SPOOL), ROOT_UID);
+        assert_eq!(privileged.fsgid(), SPOOL, "root, so the capability decides");
+
+        let user = process_as(REAL, REAL, SAVED);
+        assert_eq!(user.set_fsgid(SPOOL), REAL);
+        assert_eq!(user.fsgid(), REAL, "no capability, and not one of its ids");
+        assert_eq!(user.set_fsgid(SAVED), REAL);
+        assert_eq!(user.fsgid(), SAVED, "the saved gid is in the set");
+    }
+
+    #[test]
+    fn a_move_taints_the_process_and_a_refusal_does_not() {
+        // `commit_creds()` runs the same dumpability check on `fsuid` as on
+        // the other ids, and `abort_creds()` never reaches it.
+        let moved = process_as(REAL, ROOT_UID, ROOT_UID);
+        moved.set_fsuid(REAL);
+        assert!(moved.is_sugid());
+
+        let refused = process_as(REAL, REAL, REAL);
+        refused.set_fsuid(SPOOL);
+        assert!(!refused.is_sugid());
+
+        let noop = process_as(REAL, REAL, REAL);
+        noop.set_fsuid(REAL);
+        assert!(
+            !noop.is_sugid(),
+            "asking for the id already in force builds no credentials at all"
+        );
+    }
+
+    // ---- who drags it along ------------------------------------------
+    //
+    // Every `set*id` path in `kernel/sys.c` ends `new->fsuid = new->euid;`.
+    // A path that forgets it leaves a process that dropped to `nobody` still
+    // reading files as root: the same hole from the other side.
+
+    #[test]
+    fn setuid_drags_the_filesystem_id_along() {
+        let proc = process_as(ROOT_UID, ROOT_UID, ROOT_UID);
+        proc.set_fsuid(SPOOL);
+        proc.set_uid(REAL).unwrap();
+        assert_eq!(proc.fsuid(), REAL);
+    }
+
+    #[test]
+    fn setreuid_drags_it_too() {
+        let proc = process_as(ROOT_UID, ROOT_UID, ROOT_UID);
+        proc.set_fsuid(SPOOL);
+        proc.set_reuid(NO_ID, REAL).unwrap();
+        assert_eq!(proc.fsuid(), REAL);
+    }
+
+    #[test]
+    fn setresuid_drags_it_too() {
+        let proc = process_as(ROOT_UID, ROOT_UID, ROOT_UID);
+        proc.set_fsuid(SPOOL);
+        proc.set_resuid(NO_ID, REAL, NO_ID).unwrap();
+        assert_eq!(proc.fsuid(), REAL);
+    }
+
+    #[test]
+    fn setgid_drags_the_filesystem_group_along() {
+        let proc = process_as(ROOT_UID, ROOT_UID, ROOT_UID);
+        proc.set_fsgid(SPOOL);
+        proc.set_gid(REAL).unwrap();
+        assert_eq!(proc.fsgid(), REAL);
+    }
+
+    #[test]
+    fn setregid_drags_it_too() {
+        let proc = process_as(ROOT_UID, ROOT_UID, ROOT_UID);
+        proc.set_fsgid(SPOOL);
+        proc.set_regid(NO_ID, REAL).unwrap();
+        assert_eq!(proc.fsgid(), REAL);
+    }
+
+    #[test]
+    fn setresgid_drags_it_too() {
+        let proc = process_as(ROOT_UID, ROOT_UID, ROOT_UID);
+        proc.set_fsgid(SPOOL);
+        proc.set_resgid(NO_ID, REAL, NO_ID).unwrap();
+        assert_eq!(proc.fsgid(), REAL);
+    }
+
+    #[test]
+    fn a_switch_that_names_no_effective_id_still_brings_the_pair_in_step() {
+        // `setreuid(ruid, -1)` moves the REAL uid and nothing else, and
+        // `__sys_setreuid` still ends `new->fsuid = new->euid;`. So the line
+        // belongs at the end of the path and not beside the write to `euid`:
+        // a filesystem id that had wandered comes home even though no
+        // effective id was named.
+        let proc = process_as(ROOT_UID, ROOT_UID, ROOT_UID);
+        proc.set_fsuid(SPOOL);
+        proc.set_reuid(REAL, NO_ID).unwrap();
+        assert_eq!(proc.euid(), ROOT_UID, "the effective id did not move");
+        assert_eq!(proc.fsuid(), ROOT_UID, "and the filesystem id came back");
+    }
+
+    #[test]
+    fn an_exec_puts_the_filesystem_id_back_on_the_effective_one() {
+        // `cap_bprm_creds_from_file()`: `new->suid = new->fsuid = new->euid;`
+        // `new->sgid = new->fsgid = new->egid;`. An image inherits the id its
+        // accesses are checked against; it does not inherit a stray one the
+        // caller happened to be wearing.
+        let mut inner = LinuxProcessInner::default();
+        inner.credentials = creds(REAL, REAL, REAL);
+        inner.credentials.fsuid = SPOOL;
+        inner.credentials.fsgid = SPOOL;
+        inner.apply_exec_ids_from_a_normal_mount(0o755, OTHER, OTHER);
+        assert_eq!(inner.credentials.fsuid, REAL);
+        assert_eq!(inner.credentials.fsgid, REAL);
+    }
+
+    #[test]
+    fn a_setuid_image_hands_its_own_id_to_the_filesystem_too() {
+        let mut inner = LinuxProcessInner::default();
+        inner.credentials = creds(REAL, REAL, REAL);
+        inner.apply_exec_ids_from_a_normal_mount(0o4755, ROOT_UID, OTHER);
+        assert_eq!(inner.credentials.euid, ROOT_UID);
+        assert_eq!(inner.credentials.fsuid, ROOT_UID);
+    }
+
+    // ---- what asks it ------------------------------------------------
+
+    #[test]
+    fn a_files_permission_bits_are_weighed_against_the_filesystem_id() {
+        // Root that has dropped its filesystem id gets the OTHER bits of a
+        // file it does not own, exactly like the user it stands in for.
+        // Before this change the same process was still root here: a server
+        // asked to read `/root/.ssh/id_rsa` on behalf of user 1000 read it.
+        let mut root = creds(ROOT_UID, ROOT_UID, ROOT_UID);
+        root.fsuid = REAL;
+        root.fsgid = REAL;
+        assert_eq!(
+            LinuxProcess::access_verdict(&root, OTHER, OTHER, 0o600, false, ACCESS_WRITE, true),
+            Err(LxError::EACCES)
+        );
+        assert_eq!(
+            LinuxProcess::access_verdict(
+                &creds(ROOT_UID, ROOT_UID, ROOT_UID),
+                OTHER,
+                OTHER,
+                0o600,
+                false,
+                ACCESS_WRITE,
+                true
+            ),
+            Ok(()),
+            "and with the id left alone it is still root"
+        );
+    }
+
+    #[test]
+    fn the_owner_bits_go_to_whoever_the_filesystem_id_names() {
+        let mut c = creds(REAL, REAL, REAL);
+        c.fsuid = OTHER;
+        assert_eq!(
+            LinuxProcess::access_verdict(&c, OTHER, SPOOL, 0o600, false, ACCESS_WRITE, true),
+            Ok(()),
+            "the file's owner is the id being acted as"
+        );
+    }
+
+    #[test]
+    fn the_group_bits_follow_the_filesystem_group() {
+        let mut c = creds(REAL, REAL, REAL);
+        c.fsgid = SPOOL;
+        assert_eq!(
+            LinuxProcess::access_verdict(&c, OTHER, SPOOL, 0o060, false, ACCESS_WRITE, true),
+            Ok(())
+        );
+        c.fsgid = REAL;
+        assert_eq!(
+            LinuxProcess::access_verdict(&c, OTHER, SPOOL, 0o060, false, ACCESS_WRITE, true),
+            Err(LxError::EACCES)
+        );
+    }
+
+    #[test]
+    fn access_2_still_asks_the_real_ids_and_not_the_filesystem_ones() {
+        // `access(2)` is the one caller that deliberately asks as the real
+        // user; a wandering filesystem id must not answer for it.
+        let mut c = creds(REAL, ROOT_UID, ROOT_UID);
+        c.fsuid = OTHER;
+        c.fsgid = OTHER;
+        assert_eq!(
+            LinuxProcess::access_verdict(&c, OTHER, OTHER, 0o600, false, ACCESS_WRITE, false),
+            Err(LxError::EACCES),
+            "the real uid owns nothing here"
+        );
+    }
+
+    #[test]
+    fn a_chmod_is_refused_to_a_filesystem_id_that_does_not_own_the_file() {
+        // `inode_owner_or_capable()`: `vfsuid_eq_kuid(vfsuid, current_fsuid())`.
+        let mut root = creds(ROOT_UID, ROOT_UID, ROOT_UID);
+        root.fsuid = REAL;
+        assert_eq!(
+            LinuxProcess::chmod_bits(&root, OTHER, OTHER, 0o644, 0o600),
+            Err(LxError::EPERM)
+        );
+        root.fsuid = OTHER;
+        assert_eq!(
+            LinuxProcess::chmod_bits(&root, OTHER, OTHER, 0o644, 0o600),
+            Ok(0o600),
+            "and allowed once the acting id is the owner"
+        );
+    }
+
+    #[test]
+    fn a_new_file_belongs_to_the_id_its_creator_was_acting_as() {
+        // `inode_init_owner()`: `inode_fsuid_set()` / `inode_fsgid_set()`. A
+        // server that creates a file on a user's behalf must leave it owned
+        // by the user, not by the server.
+        let proc = process_as(ROOT_UID, ROOT_UID, ROOT_UID);
+        proc.set_fsuid(REAL);
+        proc.set_fsgid(SPOOL);
+        let inode: Arc<dyn INode> = Owned::new();
+        proc.initialize_created_metadata(&inode, None, 0o644, false)
+            .unwrap();
+        let meta = inode.metadata().unwrap();
+        assert_eq!(meta.uid as u32, REAL);
+        assert_eq!(meta.gid as u32, SPOOL);
+    }
+
+    #[test]
+    fn a_chown_is_weighed_against_the_filesystem_id() {
+        // `chown_ok()`: `vfsuid_eq_kuid(vfsuid, current_fsuid())`.
+        let proc = process_as(ROOT_UID, ROOT_UID, ROOT_UID);
+        proc.set_fsuid(REAL);
+        let mut meta = a_metadata(0o644, OTHER, OTHER);
+        assert_eq!(
+            proc.chown_metadata(&mut meta, NO_ID, SPOOL),
+            Err(LxError::EPERM),
+            "not root here, and not the owner either"
+        );
+    }
+
+    #[test]
+    fn the_sticky_bit_asks_the_filesystem_id_too() {
+        // `__check_sticky()` opens with `kuid_t fsuid = current_fsuid();`.
+        let dir = a_metadata(0o1777, OTHER, OTHER);
+        let victim = a_metadata(0o644, OTHER, OTHER);
+        let proc = process_as(ROOT_UID, ROOT_UID, ROOT_UID);
+        proc.set_fsuid(REAL);
+        assert_eq!(proc.check_sticky(&dir, &victim), Err(LxError::EPERM));
+        proc.set_fsuid(ROOT_UID);
+        assert_eq!(proc.check_sticky(&dir, &victim), Ok(()));
+    }
+
+    #[test]
+    fn the_pair_cannot_be_moved_one_at_a_time_by_hand() {
+        // `Credentials::set_euid` is the only line in this kernel that writes
+        // a filesystem id from an effective one, so a caller holding bare
+        // credentials cannot separate them by accident.
+        let mut c = creds(REAL, REAL, REAL);
+        c.set_euid(OTHER);
+        assert_eq!(c.fsuid, OTHER);
+        c.set_egid(SPOOL);
+        assert_eq!(c.fsgid, SPOOL);
+    }
+}
+
+#[cfg(test)]
 mod dac_tests {
     //! The discretionary-access decisions of `LinuxProcess`, on pure inputs:
     //! who gets which permission bits, what a `chmod` really lands, and which
@@ -4581,6 +5819,8 @@ mod dac_tests {
             rgid: gid,
             egid: gid,
             sgid: gid,
+            fsuid: uid,
+            fsgid: gid,
             groups: Vec::new(),
             umask: 0o022,
         }
@@ -4621,7 +5861,7 @@ mod dac_tests {
     fn a_dropped_effective_gid_loses_group_access() {
         // rgid is still the file's group, egid is not.
         let mut dropped = user(4242, GROUP);
-        dropped.egid = OTHER_GROUP;
+        dropped.set_egid(OTHER_GROUP);
         dropped.sgid = OTHER_GROUP;
 
         assert!(
@@ -4673,7 +5913,7 @@ mod dac_tests {
         // The override follows the SELECTED uid: a setuid-root program asked
         // about its real ids is not root for `access(2)`.
         let mut setuid_root = user(OWNER, GROUP);
-        setuid_root.euid = ROOT_UID;
+        setuid_root.set_euid(ROOT_UID);
         assert!(may(&setuid_root, 0o000, 0o2, true));
         assert!(!may(&setuid_root, 0o000, 0o2, false));
     }
@@ -4723,7 +5963,7 @@ mod dac_tests {
         assert_eq!(chmod(&owner_outside, 0o644, 0o2755), Ok(0o2755));
         // And, per `in_group_p`, the REAL gid is not.
         let mut owner_real_only = user(OWNER, GROUP);
-        owner_real_only.egid = OTHER_GROUP;
+        owner_real_only.set_egid(OTHER_GROUP);
         owner_real_only.sgid = OTHER_GROUP;
         assert_eq!(chmod(&owner_real_only, 0o644, 0o2755), Ok(0o755));
     }
@@ -4813,12 +6053,12 @@ mod dup_fd_tests {
 
     /// An inode that remembers where each write landed, so a test can see the
     /// offset a second descriptor actually used.
-    struct Log {
+    pub(super) struct Log {
         writes: Mutex<Vec<(usize, usize)>>,
     }
 
     impl Log {
-        fn new() -> Arc<Self> {
+        pub(super) fn new() -> Arc<Self> {
             Arc::new(Log {
                 writes: Mutex::new(Vec::new()),
             })
@@ -4883,7 +6123,7 @@ mod dup_fd_tests {
     }
 
     /// `sh -c 'prog >log'`: one open file description, opened for writing.
-    fn an_open_log(inode: Arc<Log>, flags: OpenFlags) -> Arc<dyn FileLike> {
+    pub(super) fn an_open_log(inode: Arc<Log>, flags: OpenFlags) -> Arc<dyn FileLike> {
         File::new(inode, flags, String::from("/var/log/prog.log"))
     }
 

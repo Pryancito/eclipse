@@ -1912,15 +1912,16 @@ impl Syscall<'_> {
     /// `setfsuid` sets the user ID used for filesystem checks.
     pub fn sys_setfsuid(&self, fsuid: usize) -> SysResult {
         debug!("setfsuid: fsuid={}", fsuid);
-        let old_fsuid = self.linux_process().euid() as usize;
-        Ok(old_fsuid)
+        // Truncated to a `uid_t` the way the syscall boundary does, so the
+        // `-1` a program writes reaches the rule as the `(uid_t)-1` that
+        // `uid_valid()` rejects, whatever the register width.
+        Ok(self.linux_process().set_fsuid(fsuid as u32) as usize)
     }
 
     /// `setfsgid` sets the group ID used for filesystem checks.
     pub fn sys_setfsgid(&self, fsgid: usize) -> SysResult {
         debug!("setfsgid: fsgid={}", fsgid);
-        let old_fsgid = self.linux_process().egid() as usize;
-        Ok(old_fsgid)
+        Ok(self.linux_process().set_fsgid(fsgid as u32) as usize)
     }
 }
 
