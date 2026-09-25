@@ -33,6 +33,23 @@ pub fn switch_bounce_snapshot() -> (u64, u64) {
     )
 }
 
+/// This CPU's current stack pointer.
+///
+/// Behind an arch shim because it used to be inline `x86_64` assembly in
+/// `irq_should_skip_heavy_work`, with `return false` for everything else — so
+/// the guard that refuses to dispatch another `Box<dyn Fn>` on a nearly
+/// exhausted coroutine stack simply did not exist on riscv64 and aarch64. The
+/// compiler had been saying so on every build (`unreachable statement`).
+#[inline(always)]
+pub(crate) fn stack_pointer() -> usize {
+    let sp: usize;
+    // SAFETY: reads rsp and nothing else.
+    unsafe {
+        core::arch::asm!("mov {}, rsp", out(reg) sp, options(nostack, nomem, preserves_flags));
+    }
+    sp
+}
+
 pub(crate) fn cpu_id() -> u8 {
     // Dense logical id (0..NCPU), not the sparse Local APIC id — see `lock`.
     #[cfg(target_os = "none")]
