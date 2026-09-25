@@ -239,6 +239,36 @@ pub trait GenericPageTable: Sync + Send {
     }
 }
 
+/// Which translation base a page-table root belongs in, where an architecture
+/// has more than one — aarch64, whose kernel half is walked through `TTBR1_EL1`
+/// and whose user half is walked through `TTBR0_EL1`.
+///
+/// `flagged_user` is what the caller said, by OR-ing `USER_TABLE_FLAG` into the
+/// token it passed to `activate_paging`. It is the **last** thing consulted,
+/// because a caller that forgets it is not a caller that gets a slower kernel:
+/// on aarch64 the unflagged path writes `TTBR1_EL1`, so a user root arriving
+/// without the flag replaces the base register the kernel's own text, stack and
+/// page tables are translated through — with a table that maps none of them.
+/// The next instruction fetch faults, at a point where the vectors it would
+/// need are themselves unreachable. `zircon-object`'s IRELATIVE resolver
+/// (`elf_loader.rs`, the ifunc batch) passes the root of a user VMAR with no
+/// flag, through the same one-argument entry point the flagged call sites use.
+///
+/// So the root decides first, and it can: a root that **is** the kernel's own
+/// is the kernel table, and any other root is a user table. Only while no
+/// kernel root has been published — early boot, before `pin_kernel_vmtoken` —
+/// is there nothing to compare against, and there the caller's word is all
+/// there is.
+///
+/// Compared on the frame base for the reason
+/// [`crate::common::ipi::aspace_filter`] gives.
+pub fn is_user_table_root(root: PhysAddr, kernel_root: PhysAddr, flagged_user: bool) -> bool {
+    if kernel_root == 0 {
+        return flagged_user;
+    }
+    root & !0xfff != kernel_root & !0xfff
+}
+
 /// Every [`PageSize`] is used as a mask: `align_down` and `page_offset` do
 /// `addr & !(size - 1)` and `addr & (size - 1)`, which is only the intended
 /// arithmetic while each value is a power of two. A new variant that is not
@@ -542,5 +572,50 @@ mod page_size_tests {
             let err: PagingResult<u32> = Err(e);
             assert!(err.ignore().is_err(), "only NotMapped is ignorable");
         }
+    }
+}
+
+/// Which of aarch64's two translation bases a page-table root belongs in. The
+/// answer used to be a flag the caller OR-ed into the token, and one caller
+/// does not.
+#[cfg(test)]
+mod translation_base_tests {
+    use super::*;
+
+
+    const KERNEL: usize = 0x4_1000;
+    const USER: usize = 0x9_2000;
+
+    #[test]
+    fn the_kernel_s_own_root_is_the_kernel_table_however_it_was_labelled() {
+        assert!(!is_user_table_root(KERNEL, KERNEL, false));
+        // And a caller that labelled it user does not get the kernel's own
+        // tables moved into TTBR0.
+        assert!(!is_user_table_root(KERNEL, KERNEL, true));
+    }
+
+    #[test]
+    fn any_other_root_is_a_user_table_even_when_the_caller_forgot_to_say_so() {
+        // This is the whole point: the unflagged call in the IRELATIVE
+        // resolver used to put a user root into the register the kernel's own
+        // half is translated through.
+        assert!(is_user_table_root(USER, KERNEL, false));
+        assert!(is_user_table_root(USER, KERNEL, true));
+    }
+
+    #[test]
+    fn with_no_kernel_root_published_the_caller_s_word_is_all_there_is() {
+        // Early boot, before `pin_kernel_vmtoken`: nothing to compare against.
+        assert!(!is_user_table_root(KERNEL, 0, false));
+        assert!(!is_user_table_root(USER, 0, false));
+        assert!(is_user_table_root(USER, 0, true));
+    }
+
+    #[test]
+    fn the_low_twelve_bits_do_not_make_a_root_another_table() {
+        assert!(!is_user_table_root(KERNEL | 0xfff, KERNEL, true));
+        assert!(!is_user_table_root(KERNEL, KERNEL | 0xabc, true));
+        // One frame along is a different table, flag or no flag.
+        assert!(is_user_table_root(KERNEL + 0x1000, KERNEL, false));
     }
 }
