@@ -76,9 +76,16 @@ impl RawSocketState {
     ///
     /// The three rules are Linux's: `length < sizeof(struct iphdr)` and
     /// `iph->ihl * 4 > length` both answer EINVAL, and the version nibble has
-    /// to read 4 -- smoltcp refuses to dispatch a packet whose version or
-    /// protocol does not match the socket and drops it in silence, so without
-    /// that last one `write` reported a success that sent nothing.
+    /// to read 4 -- smoltcp refuses to dispatch a packet whose version does not
+    /// match the socket's and drops it in silence, so without that last one
+    /// `write` reported a success that sent nothing.
+    ///
+    /// The header's `protocol` field is deliberately NOT checked, even though
+    /// smoltcp drops a mismatch just as silently. Linux does not check it
+    /// either: with `IP_HDRINCL` the protocol byte is the caller's to write,
+    /// and refusing one that differs from the socket's would be a rule of our
+    /// own invention. So that one case still reports a success that sends
+    /// nothing, and fixing it belongs in smoltcp's dispatch, not here.
     ///
     /// On a non-empty buffer the length rule and the `ihl` rule coincide (a
     /// header length under 20 is refused either way), so the length rule earns

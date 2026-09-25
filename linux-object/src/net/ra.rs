@@ -204,16 +204,18 @@ fn prefix_is_usable(pfx: &[u8; 16], plen: u8, flags: u8, valid: u32) -> bool {
     if valid == 0 || plen != 64 {
         return false;
     }
-    // Only the prefix half matters: the interface identifier replaces the rest.
-    let prefix = Ipv6Address::from_bytes(pfx);
-    if prefix.is_link_local() || prefix.is_unspecified() || prefix.is_multicast() {
-        return false;
-    }
-    // A loopback prefix is nobody's to advertise either.
-    if prefix.is_loopback() {
-        return false;
-    }
-    true
+    // Only the prefix half forms the address, so only the prefix half is
+    // judged: normalise the option's low 64 bits to zero first. Reading all
+    // 128 let a rogue RA walk past the `::` check by putting anything it liked
+    // in a half nobody uses -- `::/64` with a dirty low half looked like a
+    // perfectly ordinary global prefix, and the address handed out was
+    // `::<interface id>`. `fe80::/64` and a multicast prefix were caught
+    // anyway, since what decides those lives in the high half.
+    let mut high = [0u8; 16];
+    high[..8].copy_from_slice(&pfx[..8]);
+    let prefix = Ipv6Address::from_bytes(&high);
+    // `::1/64` normalises to `::`, so loopback needs no clause of its own.
+    !(prefix.is_link_local() || prefix.is_unspecified() || prefix.is_multicast())
 }
 
 /// `prefix || EUI-64(MAC)`: the interface identifier is the low 64 bits of the
@@ -678,5 +680,32 @@ mod tests {
             route_action(None, router(), 1800, MAX_RA_ROUTES - 1),
             RouteAction::Install
         );
+    }
+
+    #[test]
+    fn slaac_judges_only_the_half_of_the_prefix_it_actually_uses() {
+        // The option's low 64 bits never reach the address -- the interface
+        // identifier replaces them -- so a router may put anything there, and
+        // a rogue one will. Judging all 128 bits let `::/64` walk past the
+        // unspecified check with a dirty low half, and the address handed out
+        // was `::<interface id>`.
+        let mut zero_prefix = [0u8; 16];
+        zero_prefix[8..].copy_from_slice(&[0xde, 0xad, 0xbe, 0xef, 0, 0, 0, 1]);
+        assert!(!prefix_is_usable(&zero_prefix, 64, AUTO_ONLINK, 86400));
+
+        // Same for the other two, which the high half decided already and must
+        // keep deciding once the low half is noise.
+        let mut ll = prefix_of(router());
+        ll[8..].copy_from_slice(&[0xff; 8]);
+        assert!(!prefix_is_usable(&ll, 64, AUTO_ONLINK, 86400), "fe80::/64");
+        let mut mc = prefix_of(all_nodes());
+        mc[8..].copy_from_slice(&[0xff; 8]);
+        assert!(!prefix_is_usable(&mc, 64, AUTO_ONLINK, 86400), "ff02::/64");
+
+        // And a real prefix is still usable with a dirty low half, because
+        // that half is exactly what `slaac_address` throws away.
+        let mut good = global_prefix();
+        good[8..].copy_from_slice(&[0x11; 8]);
+        assert!(prefix_is_usable(&good, 64, AUTO_ONLINK, 86400));
     }
 }
