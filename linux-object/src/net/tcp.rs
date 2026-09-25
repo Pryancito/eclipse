@@ -71,7 +71,7 @@ impl Drop for TcpInner {
         // harmless if `shutdown()` already cleared the entry.
         if self.is_listening {
             if let Some(ep) = self.local_endpoint {
-                crate::net::LISTEN_TABLE.unlisten(ep.port);
+                crate::net::LISTEN_TABLE.unlisten(ep);
             }
         }
         if let Some(ep) = self.bound {
@@ -796,17 +796,24 @@ impl Socket for TcpSocketState {
         };
         info!("socket listening on {:?}", local_endpoint);
 
-        if !crate::net::LISTEN_TABLE.can_listen(local_endpoint.port) {
-            return Err(LxError::EADDRINUSE);
-        }
+        // Take the reservation BEFORE smoltcp opens the socket. This used to
+        // ask `can_listen` here and reserve after `socket.listen()`, two
+        // decisions with the port lock dropped in between: two threads racing
+        // on one port both passed the check, both put their smoltcp socket in
+        // LISTEN, and the loser returned EADDRINUSE with a live listener
+        // behind it -- taking connections that no `accept` would ever see.
+        crate::net::LISTEN_TABLE.listen(local_endpoint)?;
 
-        get_sockets()
+        if get_sockets()
             .lock()
             .get::<TcpSocket>(inner.handle.0)
             .listen(local_endpoint)
-            .map_err(|_| LxError::ENOBUFS)?;
-
-        crate::net::LISTEN_TABLE.listen(local_endpoint)?;
+            .is_err()
+        {
+            // A failed `listen` leaves nothing behind it.
+            crate::net::LISTEN_TABLE.unlisten(local_endpoint);
+            return Err(LxError::ENOBUFS);
+        }
         inner.is_listening = true;
         Ok(0)
     }
@@ -822,7 +829,7 @@ impl Socket for TcpSocketState {
             // (`tcp_disconnect`), SHUT_WR alone leaves it listening.
             if shut_rd {
                 if let Some(ep) = inner.local_endpoint {
-                    crate::net::LISTEN_TABLE.unlisten(ep.port);
+                    crate::net::LISTEN_TABLE.unlisten(ep);
                 }
                 inner.is_listening = false;
                 socket.close();
@@ -1280,6 +1287,14 @@ mod port_tests {
         Endpoint::Ip(ep(IpAddress::v4(127, 0, 0, 1), port))
     }
 
+    fn loep(port: u16) -> IpEndpoint {
+        ep(IpAddress::v4(127, 0, 0, 1), port)
+    }
+
+    fn lan(port: u16) -> IpEndpoint {
+        ep(IpAddress::v4(192, 168, 1, 5), port)
+    }
+
     fn holder(endpoint: IpEndpoint, listening: bool, reuse_addr: bool) -> PortHolder {
         PortHolder {
             endpoint,
@@ -1647,6 +1662,55 @@ mod port_tests {
     }
 
     #[test]
+    fn two_listeners_on_one_port_with_different_addresses_both_listen() {
+        let _g = LOCK.lock();
+        let a = sock();
+        let b = sock();
+        // `bind` asks `endpoints_collide`, so two specific addresses on one
+        // port never conflicted there...
+        assert_eq!(Socket::bind(&a, lo(41082)), Ok(0));
+        assert_eq!(Socket::bind(&b, Endpoint::Ip(lan(41082))), Ok(0));
+        // ...and `listen` asked LISTEN_TABLE, whose only key was the port, so
+        // the second one was refused with EADDRINUSE after a successful bind.
+        assert_eq!(Socket::listen(&a), Ok(0));
+        assert_eq!(Socket::listen(&b), Ok(0), "a different address is free");
+
+        // Each still holds its own address, and nobody else can take either.
+        assert!(!crate::net::LISTEN_TABLE.can_listen(loep(41082)));
+        assert!(!crate::net::LISTEN_TABLE.can_listen(lan(41082)));
+        assert!(!crate::net::LISTEN_TABLE.can_listen(any(41082)), "wildcard");
+        assert!(crate::net::LISTEN_TABLE.can_listen(ep(IpAddress::v4(10, 0, 0, 1), 41082)));
+
+        // Dropping one gives back only its own reservation.
+        assert_eq!(Socket::shutdown(&a, 0), Ok(0));
+        assert!(crate::net::LISTEN_TABLE.can_listen(loep(41082)));
+        assert!(!crate::net::LISTEN_TABLE.can_listen(lan(41082)));
+        drop(b);
+        assert!(crate::net::LISTEN_TABLE.can_listen(any(41082)));
+    }
+
+    #[test]
+    fn a_wildcard_listener_holds_the_port_against_every_address() {
+        let _g = LOCK.lock();
+        let wild = sock();
+        assert_eq!(Socket::bind(&wild, v4(41084)), Ok(0));
+        assert_eq!(Socket::listen(&wild), Ok(0));
+        // `bind` already refuses this (the wildcard overlaps everything), so
+        // the listen table never has to, but it has to agree.
+        assert_eq!(Socket::bind(&sock(), lo(41084)), Err(LxError::EADDRINUSE));
+        assert!(!crate::net::LISTEN_TABLE.can_listen(loep(41084)));
+        assert_eq!(
+            crate::net::LISTEN_TABLE.listen(loep(41084)),
+            Err(LxError::EADDRINUSE)
+        );
+        // A second `listen` on the same socket is a no-op, not a second
+        // reservation, so one `unlisten` still frees the port.
+        assert_eq!(Socket::listen(&wild), Ok(0));
+        drop(wild);
+        assert!(crate::net::LISTEN_TABLE.can_listen(any(41084)));
+    }
+
+    #[test]
     fn shut_wr_leaves_a_listener_listening_and_shut_rd_stops_it() {
         let _g = LOCK.lock();
         let mut iface = loopback();
@@ -1654,7 +1718,7 @@ mod port_tests {
         assert_eq!(Socket::bind(&server, v4(41070)), Ok(0));
         assert_eq!(Socket::listen(&server), Ok(0));
         assert_eq!(Socket::shutdown(&server, 1), Ok(0));
-        assert!(!crate::net::LISTEN_TABLE.can_listen(41070));
+        assert!(!crate::net::LISTEN_TABLE.can_listen(any(41070)));
         let first = sock();
         assert_eq!(connect(&first, lo(41070)), Err(LxError::EINPROGRESS));
         deliver(&mut iface);
@@ -1662,7 +1726,7 @@ mod port_tests {
         assert!(async_std::task::block_on(Socket::accept(&server)).is_ok());
 
         assert_eq!(Socket::shutdown(&server, 0), Ok(0));
-        assert!(crate::net::LISTEN_TABLE.can_listen(41070));
+        assert!(crate::net::LISTEN_TABLE.can_listen(any(41070)));
         assert_eq!(state_of(&server), TcpState::Closed);
         let second = sock();
         assert_eq!(connect(&second, lo(41070)), Err(LxError::EINPROGRESS));
@@ -1678,6 +1742,6 @@ mod port_tests {
         assert_eq!(Socket::bind(&sock(), v4(41070)), Err(LxError::EADDRINUSE));
         assert_eq!(Socket::listen(&server), Ok(0));
         assert_eq!(Socket::shutdown(&server, 2), Ok(0));
-        assert!(crate::net::LISTEN_TABLE.can_listen(41070));
+        assert!(crate::net::LISTEN_TABLE.can_listen(any(41070)));
     }
 }

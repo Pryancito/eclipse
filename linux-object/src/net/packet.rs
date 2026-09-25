@@ -66,7 +66,12 @@ fn wake_readers(inner: &PacketSocketInner) {
 const MAX_FRAME_COPY: usize = 1518;
 
 /// Bytes of L2 header (14, or 18 with 802.1Q) and EtherType.
-fn eth_l2_header_len(frame: &[u8]) -> Option<(usize, u16)> {
+///
+/// Every parser `push_packet` feeds a frame to needs this same answer, so it
+/// lives here once: `arp_cache`, `ndp_cache`, `icmp_rx` and `ra` all call it.
+/// It used to be open-coded in each of them, and `arp_cache` was the one that
+/// never got the 802.1Q clause, so on a VLAN-tagged link it learned nothing.
+pub(crate) fn eth_l2_header_len(frame: &[u8]) -> Option<(usize, u16)> {
     if frame.len() < 14 {
         return None;
     }
