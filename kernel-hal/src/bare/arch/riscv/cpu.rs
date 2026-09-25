@@ -2,7 +2,20 @@
 use crate::common::cpu_topology::CpuTopology;
 use crate::utils::init_once::InitOnce;
 
-pub(super) static CPU_FREQ_MHZ: InitOnce<u16> = InitOnce::new_with_default(1000); // 1GHz
+/// Tick rate of the `time` CSR, in hertz, from the device tree's
+/// `timebase-frequency`. Default: QEMU `virt`'s 10 MHz.
+///
+/// In hertz and not megahertz because that is what the device tree says and
+/// what the clock arithmetic needs. It used to be rounded to whole megahertz
+/// on the way in, which is lossy for most real boards (a StarFive JH7100's
+/// 6.25 MHz became 6) and zero for any board whose timebase is under a
+/// megahertz — and zero is what `timer_now` divided by.
+pub(super) static TIMEBASE_HZ: InitOnce<u64> = InitOnce::new_with_default(10_000_000);
+
+/// The `time` CSR's tick rate in hertz.
+pub(super) fn timebase_hz() -> u64 {
+    *TIMEBASE_HZ
+}
 
 // ─── CPU topology: dense logical id  <->  hart id ───────────────────────────────
 //
@@ -73,7 +86,11 @@ hal_fn_impl! {
         }
 
         fn cpu_frequency() -> u16 {
-            *CPU_FREQ_MHZ
+            // riscv gives the kernel no way to read the core clock, so what
+            // `/proc/cpuinfo` has always shown here is the timebase. Kept as
+            // it was rather than quietly changing what userspace reads; the
+            // clock arithmetic no longer goes through this number.
+            (timebase_hz() / 1_000_000) as u16
         }
 
         fn cpu_brand() -> alloc::string::String {
