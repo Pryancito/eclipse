@@ -11,7 +11,9 @@ use bitflags::bitflags;
 use kernel_hal::context::{UserContext, UserContextField};
 use linux_object::error::LxResult;
 use linux_object::fs::{FileLike, PidFd};
-use linux_object::process::{wait_child_any_interest, wait_child_interest, WaitInterest};
+use linux_object::process::{
+    wait_child_any_interest, wait_child_interest, WaitInterest, CAP_LAST_CAP, CAP_SETGID,
+};
 use linux_object::signal::SigInfo;
 use linux_object::thread::{CurrentThreadExt, RobustList, ThreadExt};
 use linux_object::time::RUsage;
@@ -1633,7 +1635,11 @@ impl Syscall<'_> {
 
     /// `setgroups` updates supplementary group IDs.
     pub fn sys_setgroups(&self, size: usize, list: UserInPtr<u32>) -> SysResult {
-        if !self.linux_process().is_superuser() {
+        // Linux: `if (!may_setgroups()) return -EPERM;`, which is
+        // `ns_capable(CAP_SETGID)`. Asked through the same predicate
+        // `capget` publishes, so a program that reads its own set and a
+        // program that just calls get the same answer.
+        if !self.linux_process().capable(CAP_SETGID) {
             return Err(LxError::EPERM);
         }
         let groups = if size == 0 {
@@ -1717,8 +1723,6 @@ impl Syscall<'_> {
         const PR_GET_TID_ADDRESS: i32 = 40;
         const PR_SET_THP_DISABLE: i32 = 41;
         const PR_GET_THP_DISABLE: i32 = 42;
-        /// Highest capability number this kernel reports (matches `capget`).
-        const CAP_LAST_CAP: usize = 40;
         /// Default timer slack, ns (Linux: 50 µs for every fresh task).
         const TIMERSLACK_DEFAULT_NS: u64 = 50_000;
 
@@ -1785,7 +1789,7 @@ impl Syscall<'_> {
             // without CONFIG_SECCOMP.
             PR_GET_SECCOMP | PR_SET_SECCOMP => Err(LxError::EINVAL),
             PR_CAPBSET_READ => {
-                if a2 > CAP_LAST_CAP {
+                if a2 > CAP_LAST_CAP as usize {
                     return Err(LxError::EINVAL);
                 }
                 // Root-run kernel: every valid capability is in the bounding
@@ -1793,7 +1797,7 @@ impl Syscall<'_> {
                 Ok(1)
             }
             PR_CAPBSET_DROP => {
-                if a2 > CAP_LAST_CAP {
+                if a2 > CAP_LAST_CAP as usize {
                     return Err(LxError::EINVAL);
                 }
                 // There is no stored bounding set to shrink; accepting keeps

@@ -55,6 +55,49 @@ pub trait ProcessExt {
 }
 
 const ROOT_UID: u32 = 0;
+
+// The capability numbers this kernel names, from `include/uapi/linux/
+// capability.h`. Only the ones a gate actually asks about are here: a number
+// nobody asks about is a number nobody can get wrong, and is exactly the kind
+// of write-only constant this change exists to remove. `CAP_SYS_NICE` belongs
+// here the day `setpriority`/`sched_setscheduler` ask -- see the note on
+// `capable`.
+
+/// `CAP_SETGID`: change group ids, and set the supplementary group list.
+pub const CAP_SETGID: u32 = 6;
+/// `CAP_SYS_ADMIN`: the catch-all -- mount, `sethostname`, and much else.
+pub const CAP_SYS_ADMIN: u32 = 21;
+/// `CAP_SYS_BOOT`: `reboot(2)` and `kexec_load(2)`.
+pub const CAP_SYS_BOOT: u32 = 22;
+/// `CAP_SYS_TIME`: set the system clock and discipline it.
+pub const CAP_SYS_TIME: u32 = 25;
+
+/// The highest capability number this kernel reports. 40 is Linux 5.15's
+/// `CAP_LAST_CAP` (`CAP_CHECKPOINT_RESTORE`); `capget`, `prctl`'s bounding
+/// set and [`LinuxProcess::capable`] all measure against this one number.
+pub const CAP_LAST_CAP: u32 = 40;
+
+/// Whether a process with effective uid `euid` holds capability `cap`.
+///
+/// Split from the process so the rule can be read on its own: it is the
+/// whole of this kernel's privilege model, and both [`LinuxProcess::capable`]
+/// and [`published_capabilities`] are it.
+pub fn has_capability(euid: u32, cap: u32) -> bool {
+    cap <= CAP_LAST_CAP && euid == ROOT_UID
+}
+
+/// The capability set `capget(2)` reports for a process with this effective
+/// uid, as the bitmap userspace reads.
+///
+/// Built out of [`has_capability`] one bit at a time rather than written down
+/// as a constant, so the set the kernel *publishes* cannot drift from the one
+/// it *honours*.
+pub fn published_capabilities(euid: u32) -> u64 {
+    (0..=CAP_LAST_CAP)
+        .filter(|&cap| has_capability(euid, cap))
+        .fold(0u64, |set, cap| set | 1u64 << cap)
+}
+
 const NO_ID: u32 = u32::MAX;
 const ACCESS_WRITE: u16 = 0o2;
 const ACCESS_EXEC: u16 = 0o1;
@@ -1525,6 +1568,24 @@ impl LinuxProcess {
     /// Whether the current effective uid is root.
     pub fn is_superuser(&self) -> bool {
         self.euid() == ROOT_UID
+    }
+
+    /// Whether this process holds `cap`, one of the [`CAP_SYS_ADMIN`]-family
+    /// numbers from `linux/capability.h`.
+    ///
+    /// **One answer for two jobs.** `capget(2)` hands userspace a capability
+    /// set, and a program reads it to decide whether to even try a privileged
+    /// call; the kernel then has to honour exactly that set when the call
+    /// arrives. Answering the two separately is how a kernel ends up telling
+    /// `ping` it has no capabilities and rebooting for it anyway. So this is
+    /// the single answer: `sys_capget` builds the set it publishes out of it,
+    /// and every gate asks it.
+    ///
+    /// The model is the one this kernel has everywhere else -- root, or not --
+    /// so there are no per-process sets to store, and a capability number
+    /// above [`CAP_LAST_CAP`] is held by nobody.
+    pub fn capable(&self, cap: u32) -> bool {
+        has_capability(self.euid(), cap)
     }
 
     /// Apply umask to file creation mode.
@@ -4392,6 +4453,109 @@ mod sugid_tests {
         assert!(!inner.sugid);
         assert!(inner.apply_exec_ids_from_a_normal_mount(0o4755, ROOT_UID, 1000));
         assert!(inner.sugid);
+    }
+}
+
+#[cfg(test)]
+mod capability_tests {
+    //! The privilege model, asked directly: what `capget(2)` publishes and
+    //! what every gate honours are the same answer, computed once.
+
+    use super::*;
+    use alloc::vec::Vec;
+
+    /// Every capability number named in this file, so a new one added to the
+    /// list is automatically measured by the tests below.
+    const NAMED: &[(u32, &str)] = &[
+        (CAP_SETGID, "CAP_SETGID"),
+        (CAP_SYS_ADMIN, "CAP_SYS_ADMIN"),
+        (CAP_SYS_BOOT, "CAP_SYS_BOOT"),
+        (CAP_SYS_TIME, "CAP_SYS_TIME"),
+    ];
+
+    #[test]
+    fn the_capability_numbers_are_the_ones_capability_h_names() {
+        // Wrong by one and a gate asks about somebody else's privilege.
+        assert_eq!(CAP_SETGID, 6);
+        assert_eq!(CAP_SYS_ADMIN, 21);
+        assert_eq!(CAP_SYS_BOOT, 22);
+        assert_eq!(CAP_SYS_TIME, 25);
+        // CAP_CHECKPOINT_RESTORE, the last one Linux 5.15 defines.
+        assert_eq!(CAP_LAST_CAP, 40);
+    }
+
+    #[test]
+    fn what_the_kernel_publishes_is_exactly_what_it_honours() {
+        // The whole point of the change. A program reads its capability set
+        // with `capget(2)` and decides from it whether to even try; the
+        // kernel then has to honour exactly that set when the call arrives.
+        for euid in [0u32, 1, 1000, u32::MAX] {
+            let published = published_capabilities(euid);
+            for cap in 0..64u32 {
+                let bit = published & (1u64 << cap) != 0;
+                assert_eq!(
+                    bit,
+                    has_capability(euid, cap),
+                    "euid {}, cap {}: published {}",
+                    euid,
+                    cap,
+                    bit
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn root_holds_every_capability_this_kernel_names() {
+        for &(cap, name) in NAMED {
+            assert!(has_capability(0, cap), "root lacks {}", name);
+        }
+    }
+
+    #[test]
+    fn nobody_else_holds_any_of_them() {
+        for euid in [1u32, 100, 1000, u32::MAX] {
+            for &(cap, name) in NAMED {
+                assert!(!has_capability(euid, cap), "euid {} holds {}", euid, name);
+            }
+            assert_eq!(published_capabilities(euid), 0);
+        }
+    }
+
+    #[test]
+    fn a_capability_number_this_kernel_does_not_reach_is_held_by_nobody() {
+        // Not even by root: `capget` reports bits 0..=CAP_LAST_CAP, so a gate
+        // asking about anything above it would be asking about a privilege
+        // the kernel never told anyone they had.
+        for cap in [CAP_LAST_CAP + 1, 41, 63, 64, u32::MAX] {
+            assert!(!has_capability(0, cap), "cap {}", cap);
+        }
+    }
+
+    #[test]
+    fn the_published_set_is_the_bottom_forty_one_bits_and_no_more() {
+        // What `capget` used to write down as a constant, derived instead.
+        assert_eq!(published_capabilities(0), (1u64 << 41) - 1);
+        assert_eq!(published_capabilities(0).count_ones(), CAP_LAST_CAP + 1);
+    }
+
+    #[test]
+    fn every_named_capability_is_inside_the_range_the_kernel_reports() {
+        let over: Vec<&str> = NAMED
+            .iter()
+            .filter(|&&(cap, _)| cap > CAP_LAST_CAP)
+            .map(|&(_, name)| name)
+            .collect();
+        assert!(over.is_empty(), "past CAP_LAST_CAP: {:?}", over);
+    }
+
+    #[test]
+    fn the_named_capabilities_are_all_different() {
+        for (i, &(a, na)) in NAMED.iter().enumerate() {
+            for &(b, nb) in &NAMED[i + 1..] {
+                assert_ne!(a, b, "{} and {} are the same number", na, nb);
+            }
+        }
     }
 }
 

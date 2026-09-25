@@ -12,6 +12,7 @@ use kernel_hal::{user::UserInOutPtr, user::UserInPtr, user::UserOutPtr};
 use lazy_static::lazy_static;
 use linux_object::error::{LxError, SysResult};
 use linux_object::process::ProcessExt;
+use linux_object::process::CAP_SYS_TIME;
 use linux_object::signal::Signal;
 use linux_object::thread::ThreadExt;
 use linux_object::time::*;
@@ -152,10 +153,58 @@ fn wall_clock_add_ns(delta_ns: i64) {
     kernel_hal::timer::wall_clock_set(new);
 }
 
+/// `ADJ_ADJTIME`: this call is the old `adjtime(3)`, not the NTP interface.
+/// Kernel-internal (`include/linux/timex.h`), not in the uapi header.
+const ADJ_ADJTIME: u32 = 0x8000;
+/// `ADJ_OFFSET_READONLY`: with `ADJ_ADJTIME`, read the leftover offset rather
+/// than set one. Shares a bit with `ADJ_NANO`, which is why it only means
+/// anything inside the `ADJ_ADJTIME` branch.
+const ADJ_OFFSET_READONLY: u32 = 0x2000;
+
+/// Whether these `modes` ask `adjtimex(2)` to *change* the clock, which is
+/// what needs `CAP_SYS_TIME`, as opposed to merely reading its state.
+///
+/// The three privilege tests of `timekeeping_validate_timex`
+/// (`kernel/time/timekeeping.c`), and no more:
+///
+/// ```c
+/// if (txc->modes & ADJ_ADJTIME) {
+///         if (!(txc->modes & ADJ_OFFSET_SINGLESHOT))  return -EINVAL;
+///         if (!(txc->modes & ADJ_OFFSET_READONLY) &&
+///             !capable(CAP_SYS_TIME))                 return -EPERM;
+/// } else {
+///         /* In order to modify anything, you gotta be super-user! */
+///         if (txc->modes && !capable(CAP_SYS_TIME))   return -EPERM;
+/// }
+/// if (txc->modes & ADJ_SETOFFSET) {
+///         /* In order to inject time, you gotta be super-user! */
+///         if (!capable(CAP_SYS_TIME))                 return -EPERM;
+/// ```
+///
+/// `modes == 0` is the pure read every program is entitled to, and
+/// `ADJ_OFFSET_SS_READ` is the read-only `adjtime(3)`; everything else moves
+/// the machine's clock.
+fn adjtimex_changes_the_clock(modes: u32) -> bool {
+    if modes & ADJ_SETOFFSET != 0 {
+        return true;
+    }
+    if modes & ADJ_ADJTIME != 0 {
+        modes & ADJ_OFFSET_READONLY == 0
+    } else {
+        modes != 0
+    }
+}
+
 /// Apply a userspace `timex` and fill the read-only / current fields in place.
 /// Returns the NTP status code (`TIME_OK` / `TIME_ERROR`), not 0-vs-errno.
 fn adjtimex_apply(tx: &mut Timex) -> Result<usize, LxError> {
     let modes = tx.modes;
+    // `ADJ_ADJTIME` is `adjtime(3)`, which is a single-shot offset and
+    // nothing else: `timekeeping_validate_timex` refuses the bit on its own
+    // rather than silently doing nothing with it.
+    if modes & ADJ_ADJTIME != 0 && modes & ADJ_OFFSET_SINGLESHOT != ADJ_OFFSET_SINGLESHOT {
+        return Err(LxError::EINVAL);
+    }
     if modes == ADJ_OFFSET_SS_READ {
         let st = NTP_STATE.lock();
         tx.offset = st.offset_remain;
@@ -318,6 +367,20 @@ impl Syscall<'_> {
         if clock != 0 {
             return Err(LxError::EINVAL);
         }
+        // Linux routes both clock setters through `security_settime64`, whose
+        // default (`security/commoncap.c`) is the whole rule:
+        //
+        // ```c
+        // int cap_settime(const struct timespec64 *ts, const struct timezone *tz)
+        // {
+        //         if (!capable(CAP_SYS_TIME))
+        //                 return -EPERM;
+        //         return 0;
+        // }
+        // ```
+        if !self.linux_process().capable(CAP_SYS_TIME) {
+            return Err(LxError::EPERM);
+        }
         let ts = timespec.read()?;
         let target = Duration::new(ts.sec as u64, ts.nsec as u32);
         kernel_hal::timer::wall_clock_set(target);
@@ -329,6 +392,10 @@ impl Syscall<'_> {
         info!("settimeofday: tv={:?}, tz={:?}", tv, tz);
         if !tz.is_null() {
             return Err(LxError::EINVAL);
+        }
+        // The same `cap_settime` gate as `clock_settime`: one clock, one rule.
+        if !self.linux_process().capable(CAP_SYS_TIME) {
+            return Err(LxError::EPERM);
         }
         let timeval = tv.read()?;
         let target = Duration::new(timeval.sec as u64, timeval.usec as u32 * 1_000);
@@ -345,6 +412,13 @@ impl Syscall<'_> {
             return Err(LxError::EINVAL);
         }
         let mut timex = tx.read()?;
+        // `adjtimex` is two calls in one: a read of the NTP state, which any
+        // program may do (OpenNTPD polls `STA_UNSYNC` this way), and a change
+        // to the system clock, which is `CAP_SYS_TIME`. `modes` is what says
+        // which -- see [`adjtimex_changes_the_clock`].
+        if adjtimex_changes_the_clock(timex.modes) && !self.linux_process().capable(CAP_SYS_TIME) {
+            return Err(LxError::EPERM);
+        }
         let state = adjtimex_apply(&mut timex)?;
         tx.write(timex)?;
         Ok(state)
@@ -1105,6 +1179,110 @@ mod adjtimex_tests {
             ..Default::default()
         };
         assert_eq!(adjtimex_apply(&mut tx), Err(LxError::EINVAL));
+    }
+
+    // ---- who may move the clock -------------------------------------
+
+    #[test]
+    fn a_pure_read_needs_no_privilege() {
+        // `modes == 0` asks for nothing and is how OpenNTPD polls STA_UNSYNC.
+        assert!(!adjtimex_changes_the_clock(0));
+    }
+
+    #[test]
+    fn the_read_only_adjtime_needs_no_privilege_either() {
+        // ADJ_OFFSET_SS_READ is ADJ_ADJTIME | ADJ_OFFSET_SINGLESHOT |
+        // ADJ_OFFSET_READONLY: read the leftover offset, change nothing.
+        assert!(!adjtimex_changes_the_clock(ADJ_OFFSET_SS_READ));
+    }
+
+    #[test]
+    fn the_writing_adjtime_does() {
+        // The same call without the read-only bit sets the offset.
+        assert!(adjtimex_changes_the_clock(ADJ_OFFSET_SINGLESHOT));
+    }
+
+    #[test]
+    fn injecting_an_offset_needs_it_even_alongside_the_read_only_bit() {
+        // Linux asks about ADJ_SETOFFSET on its own, outside the ADJ_ADJTIME
+        // branch, so the read-only bit does not buy a free time injection.
+        assert!(adjtimex_changes_the_clock(ADJ_SETOFFSET));
+        assert!(adjtimex_changes_the_clock(
+            ADJ_OFFSET_SS_READ | ADJ_SETOFFSET
+        ));
+    }
+
+    #[test]
+    fn every_mode_that_writes_something_needs_the_privilege() {
+        // "In order to modify anything, you gotta be super-user!" -- every
+        // bit `adjtimex_apply` acts on, one by one, so a bit added to that
+        // function without a thought lands here.
+        for modes in [
+            ADJ_OFFSET,
+            ADJ_FREQUENCY,
+            ADJ_MAXERROR,
+            ADJ_ESTERROR,
+            ADJ_STATUS,
+            ADJ_TIMECONST,
+            ADJ_TAI,
+            ADJ_SETOFFSET,
+            ADJ_MICRO,
+            ADJ_NANO,
+            ADJ_TICK,
+        ] {
+            assert!(
+                adjtimex_changes_the_clock(modes),
+                "modes {:#x} slipped through",
+                modes
+            );
+        }
+    }
+
+    #[test]
+    fn the_read_only_bit_only_means_anything_with_adjtime() {
+        // It shares a bit with ADJ_NANO, which is a *change* of resolution:
+        // outside the ADJ_ADJTIME branch the same 0x2000 must not excuse it.
+        assert_eq!(ADJ_OFFSET_READONLY, ADJ_NANO);
+        assert!(adjtimex_changes_the_clock(ADJ_NANO));
+    }
+
+    #[test]
+    fn adjtime_without_its_singleshot_bit_is_rejected() {
+        // `timekeeping_validate_timex`: ADJ_ADJTIME means `adjtime(3)`, which
+        // is a single-shot offset and nothing else. Accepting the bare bit
+        // did nothing at all and said it had worked.
+        let _serialised = serialised();
+        *NTP_STATE.lock() = NtpState::default();
+        let mut tx = Timex {
+            modes: ADJ_ADJTIME,
+            ..Default::default()
+        };
+        assert_eq!(adjtimex_apply(&mut tx), Err(LxError::EINVAL));
+
+        let mut tx = Timex {
+            modes: ADJ_ADJTIME | ADJ_FREQUENCY,
+            freq: 1,
+            ..Default::default()
+        };
+        assert_eq!(adjtimex_apply(&mut tx), Err(LxError::EINVAL));
+    }
+
+    #[test]
+    fn the_two_singleshot_calls_still_go_through() {
+        // The bit is only refused on its own: both real spellings carry
+        // ADJ_OFFSET_SINGLESHOT.
+        let _serialised = serialised();
+        *NTP_STATE.lock() = NtpState::default();
+        let mut tx = Timex {
+            modes: ADJ_OFFSET_SS_READ,
+            ..Default::default()
+        };
+        assert!(adjtimex_apply(&mut tx).is_ok());
+        let mut tx = Timex {
+            modes: ADJ_OFFSET_SINGLESHOT,
+            ..Default::default()
+        };
+        assert!(adjtimex_apply(&mut tx).is_ok());
     }
 
     #[test]
