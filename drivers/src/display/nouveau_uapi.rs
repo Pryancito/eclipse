@@ -1408,6 +1408,12 @@ pub(super) struct FastCtx {
     /// The last fence issued, as `(submits once it was in, payload)`: when
     /// nothing went in after it and it landed, the channel is idle.
     pub last_fence: Option<(u64, u32)>,
+    /// GP entries ever written to the ring (acquires, pushes and fences
+    /// alike), never wrapped: with the ring's `GPGet` it says how many the
+    /// channel has consumed, which is how a producer that is going away
+    /// knows whether this channel has passed the ACQUIREs it queued on the
+    /// producer's semaphore ([`super::nvidia`]'s zombie contexts).
+    pub entries_put: u64,
 }
 
 /// One direct-submit failure mode, for the caller to turn into an errno and

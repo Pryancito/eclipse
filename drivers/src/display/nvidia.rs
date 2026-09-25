@@ -52,6 +52,36 @@ enum FastSlot {
     Failed,
 }
 
+/// A context whose process is gone while some other channel still has an
+/// ACQUIRE queued on its fence semaphore, through a peer mapping. `ctx_free`
+/// frees that page and every mapping of it, so a consumer that had not
+/// fetched its ACQUIRE yet would fault on the VA -- an MMU fault that kills
+/// the CONSUMER's channel; on the desktop the consumer is the compositor and
+/// the producer any client closing a window mid-frame. The RM teardown waits
+/// until each such channel has consumed the entries it had queued at the
+/// time (`waiters`), or until the fence timeout, whichever comes first.
+struct ZombieCtx {
+    pid: u64,
+    ctx_idx: u32,
+    born_us: u64,
+    /// `(consumer ctx, entries it had put by then)`: passed once its ring has
+    /// consumed that many.
+    waiters: Vec<(u32, u64)>,
+}
+
+/// How many GP entries a direct-submit channel has consumed: everything ever
+/// put, less what still sits between `GPGet` and `GPPut`.
+fn ring_consumed(f: &super::nouveau_uapi::FastCtx) -> u64 {
+    if f.entries == 0 {
+        return f.entries_put;
+    }
+    // SAFETY: the USERD window of a `Ready` slot, mapped for these reads.
+    let put = unsafe { core::ptr::read_volatile(f.userd_gpput as *const u32) } % f.entries;
+    let get = unsafe { core::ptr::read_volatile(f.userd_gpget as *const u32) } % f.entries;
+    let outstanding = u64::from((put + f.entries - get) % f.entries);
+    f.entries_put.saturating_sub(outstanding)
+}
+
 /// x86 store fence: make the GP entries / method stream (cached sysmem
 /// stores) globally visible before the GPPut and doorbell writes that let
 /// the GPU fetch them. Same `osFlushCpuWriteCombineBuffer` the RM path used.
@@ -836,6 +866,10 @@ pub struct NvidiaGpu {
     /// this one (`forget_peer_fences`), or the next tenant of that index
     /// would be waited on through a VA the RM has already unmapped.
     nouveau_peer_fence: Mutex<alloc::collections::BTreeMap<(u32, u32), u64>>,
+    /// Contexts whose process has exited while another channel still had
+    /// an ACQUIRE queued on their fence semaphore ([`ZombieCtx`]). Their RM
+    /// teardown waits for those channels to pass, or for the fence timeout.
+    nouveau_zombies: Mutex<Vec<ZombieCtx>>,
     /// Driver-private framebuffer objects keyed by driver fb id.
     kms_framebuffers: Mutex<Vec<NvidiaKmsFramebuffer>>,
     /// Driver-side ids for framebuffer objects.
@@ -1238,6 +1272,7 @@ impl NvidiaGpu {
                     .collect(),
             ),
             nouveau_peer_fence: Mutex::new(alloc::collections::BTreeMap::new()),
+            nouveau_zombies: Mutex::new(Vec::new()),
             kms_framebuffers: Mutex::new(Vec::new()),
             next_kms_fb_id: AtomicU32::new(1),
             kms_state: Mutex::new(NvidiaKmsState {
@@ -8209,258 +8244,38 @@ impl DrmScheme for NvidiaGpu {
         if pid == 0 {
             return;
         }
-        // Per-process GPU teardown, OWNER-SCOPED. Stop the GPU before ripping
-        // out VM_BIND / GEM: the old order unmapped and freed buffers while the
-        // channel was still on the runlist, so a dying glxgears (window close
-        // or ^C) left the GPU writing into memory the next shootdown was
-        // tearing down — HOLDER waits TLB ack, 8s panic.
-        let device_instance = *self.rm_device_instance.lock();
-        // 1. Engine-class objects are RM children of the channel. Free them
-        //    while the channel is still alive (child-before-parent). ctx_free
-        //    would reap them; doing it here avoids a double-free of the shared
-        //    handle table. Scope to THIS pid.
-        {
-            use super::nouveau_uapi as nv;
-            let leftovers = nv::class_objects_drain_pid(pid);
-            if !leftovers.is_empty() {
-                if let Some(device_instance) = device_instance {
-                    for (_, h_object) in &leftovers {
-                        lock::pump();
-                        let _ = nvidia_rm_sys::rm_init::class_free(device_instance, *h_object);
-                    }
-                }
-                log::info!(
-                    "[nouveau-uapi] process exit pid={}: freed {} leftover class object(s) before channel",
-                    pid,
-                    leftovers.len()
-                );
-            }
-        }
-        // 2. Take the channel off the runlist (and drop its VAS) BEFORE any
-        //    GEM/VM_BIND teardown. ctx 0 is the compositor singleton and is
-        //    never freed here.
+        // A process going away is one event sure to follow every zombie
+        // context (below): the ones that are due get their teardown first,
+        // and one wearing this very pid (recycled) before this pid's own.
+        self.reap_zombie_contexts();
+        self.reap_zombie_wearing(pid);
+        // Take the channel off the pid registry first, so no submit of a
+        // late thread of this process routes to it from here on.
         let my_ctx = {
             let mut map = self.nouveau_pid_ctx.lock();
             map.iter().position(|t| t.0 == pid).map(|i| map.remove(i).1)
         };
-        let ctx_freed = if let (Some(ctx_idx), Some(device_instance)) = (my_ctx, device_instance) {
-            if ctx_idx >= 1 {
-                self.fast_release(device_instance, ctx_idx);
-                self.forget_peer_fences(ctx_idx);
-                lock::pump();
-                let status = nvidia_rm_sys::rm_init::ctx_free(device_instance, ctx_idx);
-                super::nouveau_uapi::ctx_clear_wedged(ctx_idx);
-                log::info!(
-                    "[nouveau-uapi] process exit pid={}: freed CTX {} -> status={:#x}",
-                    pid,
-                    ctx_idx,
-                    status
-                );
-                // Only skip the later RM unmap when ctx_free actually
-                // destroyed the VAS. A failed free leaves the context (and
-                // its VAS) alive; treating it as gone then gem_free's the
-                // backing while RM still has h_virt — UAF in the vendor RM.
-                status == 0
-            } else {
-                false
-            }
-        } else {
-            false
-        };
-        // 3. Drop local VM_BIND bookkeeping. Skip the RM unmap when ctx_free
-        //    already destroyed the VAS (a second vm_bind_unmap on a stale
-        //    h_virt is a use-after-free in RM).
-        let dropped_maps = self.drain_vm_mappings(
-            &alloc::format!("process exit pid={}", pid),
-            |m| m.owner_pid == pid,
-            !ctx_freed,
-        );
-        // 4. Release this process's GEM objects, RESPECTING the PRIME share
-        //    count. A buffer this process created may still be imported by
-        //    ANOTHER holder: the compositor self-imports a client's on-screen
-        //    buffer to composite it (gem_mmap refcount > 1). The old code freed
-        //    every owned object unconditionally (`gem_mmap::unregister`, which
-        //    ignores the count) + `gem_free`, so a client exiting while the
-        //    compositor still displayed its window tore the buffer out from
-        //    under the compositor -- its next GEM_INFO/VM_BIND/EXEC on that
-        //    handle ENOENT'd or touched freed RM memory -> the COMPOSITOR's own
-        //    VK_ERROR_DEVICE_LOST. That is the "state accumulates over a
-        //    session" wedge: one client exit poisons a live compositor buffer,
-        //    and from then on every client looks broken.
-        //
-        //    Mirror `nouveau_gem_close` instead: `dec_ref`, and free for real
-        //    ONLY when this drops the LAST reference. A still-shared buffer is
-        //    kept alive with its owner detached (`owner_pid = 0`) so no future
-        //    process exit re-reaps it; the last holder's GEM_CLOSE -- which
-        //    finds the entry by handle -- frees it. `dec_ref` (the gem_mmap
-        //    lock) runs with the `nouveau_gem` lock RELEASED, the same order
-        //    GEM_CLOSE takes them, so a concurrent client GEM_CLOSE cannot
-        //    invert the lock order and deadlock.
-        //
-        //    Known residual (benign, documented): a client that self-imports
-        //    its OWN buffer (GBM export -> EGL/NVK re-import; refcount held
-        //    entirely by that one process) and then dies WITHOUT GEM_CLOSE
-        //    (^C/crash) leaks it -- we drop only its creator reference here, not
-        //    its own import references (those are not tracked per-pid). A leak
-        //    until reboot, never a use-after-free; the full fix is per-pid
-        //    reference accounting in gem_mmap. A clean exit closes every
-        //    reference and frees normally.
-        let (freed_gems, freed_bytes) = {
-            // Phase 1+2: drop EVERY reference this pid holds -- its own
-            // creations and every PRIME self-import it never closed (the
-            // per-pid holder list makes those attributable now, so a client
-            // that died mid-frame no longer leaks its imports until reboot).
-            // `release_pid` takes only the gem_mmap lock; the nouveau_gem lock
-            // is taken afterwards, the same order GEM_CLOSE uses.
-            let mut to_free: Vec<u32> = Vec::new();
-            let mut to_orphan: Vec<u32> = Vec::new();
-            for (handle, freed) in crate::scheme::gem_mmap::release_pid(pid) {
-                if freed {
-                    to_free.push(handle);
-                } else {
-                    to_orphan.push(handle);
+        // Another channel may still have an ACQUIRE queued on this context's
+        // fence semaphore through a peer mapping (the compositor's, on the
+        // desktop: it composites every client's frame behind such a wait).
+        // `ctx_free` frees that page and the consumer's mapping of it, and
+        // the consumer's ring faults on the VA when it gets there -- an MMU
+        // fault on the CONSUMER's channel, so a client closing its window
+        // mid-frame killed the compositor. A fence outlives its channel:
+        // the landing zone is written with the last payload this context
+        // ever issued, so every such ACQUIRE passes, and the RM teardown
+        // waits as a zombie until the consumers have passed what they had
+        // queued (`reap_zombie_contexts`), or the fence timeout.
+        if let Some(ctx_idx) = my_ctx.filter(|&c| c >= 1) {
+            if self.rm_device_instance.lock().is_some() {
+                let waiters = self.channels_waiting_on(ctx_idx);
+                if !waiters.is_empty() {
+                    self.park_zombie(pid, ctx_idx, waiters);
+                    return;
                 }
-            }
-            // A no-phys object was never PRIME-registered (cannot be shared),
-            // so it is always its creator's alone -> free.
-            {
-                let gem = self.nouveau_gem.lock();
-                for o in gem.iter() {
-                    if o.owner_pid == pid && o.phys_addr.is_none() && !to_free.contains(&o.handle) {
-                        to_free.push(o.handle);
-                    }
-                }
-            }
-            // Phase 3: apply under the nouveau_gem lock. Collect h_memory ONLY
-            // for entries actually removed here -- a racing GEM_CLOSE that
-            // already reaped one leaves it absent, so it is never double-freed.
-            let mut to_free_mem: Vec<(u32, u32, u64)> = Vec::new(); // (handle, h_memory, size)
-            {
-                let mut gem = self.nouveau_gem.lock();
-                for handle in &to_free {
-                    if let Some(pos) = gem.iter().position(|o| o.handle == *handle) {
-                        let obj = gem.remove(pos);
-                        to_free_mem.push((obj.handle, obj.h_memory, obj.size));
-                    }
-                }
-                for handle in &to_orphan {
-                    // Detach the creator only if it was this pid: an import
-                    // this pid held of a LIVE owner's buffer keeps its owner.
-                    if let Some(o) = gem.iter_mut().find(|o| o.handle == *handle) {
-                        if o.owner_pid == pid {
-                            o.owner_pid = 0;
-                        }
-                    }
-                }
-            }
-            // Phase 4: free RM memory outside every lock.
-            //
-            // Drop each handle's KMS framebuffers first, for the reason spelled
-            // out in `nouveau_gem_close`: an fb caches the backing
-            // `phys_addr`/`h_memory`, so one left behind scans out VRAM that
-            // `gem_free` has already returned to the allocator. This path is
-            // the likelier way to hit that -- a client killed or crashed
-            // mid-session never issues the GEM_CLOSE that would have cleaned up.
-            for (handle, _, _) in &to_free_mem {
-                let dropped = self.drop_kms_fbs_for_handle(*handle);
-                if !dropped.is_empty() {
-                    log::info!(
-                        "[nouveau-uapi] process exit pid={}: handle={} dropped {} KMS fb(s): {:?}",
-                        pid,
-                        handle,
-                        dropped.len(),
-                        dropped
-                    );
-                }
-            }
-            let mut bytes = 0u64;
-            for (handle, h_memory, size) in &to_free_mem {
-                lock::pump();
-                if let Some(device_instance) = device_instance {
-                    let status = nvidia_rm_sys::rm_init::gem_free(device_instance, *h_memory);
-                    if status != 0 {
-                        log::warn!(
-                            "[nouveau-uapi] process exit pid={}: gem_free handle={} h_memory={:#010x} failed, NV_STATUS={:#x}",
-                            pid, handle, h_memory, status
-                        );
-                    }
-                }
-                bytes += size;
-            }
-            if bytes != 0 {
-                NOUVEAU_GEM_BYTES.fetch_sub(bytes, Ordering::Relaxed);
-            }
-            if !to_orphan.is_empty() {
-                log::info!(
-                    "[nouveau-uapi] process exit pid={}: freed {} GEM object(s), kept {} still-imported by another holder (PRIME refcount > 0)",
-                    pid, to_free_mem.len(), to_orphan.len()
-                );
-            }
-            (to_free_mem.len(), bytes)
-        };
-        // Channel bookkeeping. Only the RM-backed channel carries real GPU state,
-        // so a process that merely enumerated (discovery channels) is reclaimed
-        // without the class-object cleanup below.
-        //
-        // The sticky ctx-0 owner gives the singleton back whether or not it
-        // still holds a channel. A compositor that exits cleanly frees its
-        // channels first (NVK destroys its contexts before the device
-        // closes), and inferring the role from the channel table here left
-        // ctx 0 owned by a dead pid: the respawned compositor then ran as a
-        // GL client, on a context of its own, while the singleton's channel
-        // and direct-submit window stayed as the dead one had left them.
-        let owns_ctx0 = self.ctx0_is_owner(pid);
-        let (had_rm_backed, released_ctx0) = {
-            let mut chans = self.nouveau_channels.lock();
-            let before = chans.len();
-            let mut rm_backed = false;
-            let mut ctx0 = owns_ctx0;
-            chans.retain(|c| {
-                if c.owner_pid == pid {
-                    rm_backed |= c.rm_backed;
-                    ctx0 |= c.rm_backed && c.ctx_idx == 0;
-                    false
-                } else {
-                    true
-                }
-            });
-            if before == chans.len() && !owns_ctx0 {
-                if dropped_maps > 0 || freed_gems > 0 || my_ctx.is_some() {
-                    log::info!(
-                        "[nouveau-uapi] process exit pid={}: reclaimed {} mapping(s), {} GEM object(s) ({} KiB), ctx={:?}",
-                        pid, dropped_maps, freed_gems, freed_bytes / 1024, my_ctx
-                    );
-                }
-                return;
-            }
-            (rm_backed, ctx0)
-        };
-        if !had_rm_backed && !released_ctx0 {
-            log::info!(
-                "[nouveau-uapi] process exit pid={}: released discovery channel(s); reclaimed {} mapping(s), {} GEM object(s)",
-                pid, dropped_maps, freed_gems
-            );
-            return;
-        }
-        if released_ctx0 {
-            if let Some(device_instance) = device_instance {
-                self.reset_ctx0_singleton(device_instance, "process exit", pid);
-            } else {
-                crate::klog_warn!(
-                    "[nouveau-uapi] ctx0 reset: process exit pid={} but no RM device instance is attached",
-                    pid
-                );
             }
         }
-        // Class objects and ctx_free already ran (GPU off the runlist, VAS
-        // gone). Only channel bookkeeping remains.
-        log::info!(
-            "[nouveau-uapi] process exit pid={}: released nouveau channel + {} GEM object(s), {} KiB, {} mapping(s)",
-            pid,
-            freed_gems,
-            freed_bytes / 1024,
-            dropped_maps
-        );
+        self.release_process_finish(pid, my_ctx);
     }
 }
 
@@ -9519,6 +9334,7 @@ impl NvidiaGpu {
                     submits: 0,
                     fenced: 0,
                     last_fence: None,
+                    entries_put: 0,
                 };
                 // Landing zone starts BELOW every payload; slot page cleared.
                 unsafe {
@@ -9658,6 +9474,7 @@ impl NvidiaGpu {
                     store_fence();
                     unsafe { core::ptr::write_volatile(f.doorbell_va as *mut u32, f.work_token) };
                     f.submits += 1;
+                    f.entries_put += u64::from(needed);
                     if let Some((_, _, payload)) = fence {
                         f.last_fence = Some((f.submits, payload));
                     }
@@ -9891,6 +9708,404 @@ impl NvidiaGpu {
         self.nouveau_peer_fence
             .lock()
             .retain(|&(consumer, producer), _| consumer != ctx_idx && producer != ctx_idx);
+    }
+
+    /// The RM side of a process exit: its context (`my_ctx`, already off
+    /// the pid registry), its mappings, its GEM objects and its channels.
+    fn release_process_finish(&self, pid: u64, my_ctx: Option<u32>) {
+        // Per-process GPU teardown, OWNER-SCOPED. Stop the GPU before ripping
+        // out VM_BIND / GEM: the old order unmapped and freed buffers while the
+        // channel was still on the runlist, so a dying glxgears (window close
+        // or ^C) left the GPU writing into memory the next shootdown was
+        // tearing down — HOLDER waits TLB ack, 8s panic.
+        let device_instance = *self.rm_device_instance.lock();
+        // 1. Engine-class objects are RM children of the channel. Free them
+        //    while the channel is still alive (child-before-parent). ctx_free
+        //    would reap them; doing it here avoids a double-free of the shared
+        //    handle table. Scope to THIS pid.
+        {
+            use super::nouveau_uapi as nv;
+            let leftovers = nv::class_objects_drain_pid(pid);
+            if !leftovers.is_empty() {
+                if let Some(device_instance) = device_instance {
+                    for (_, h_object) in &leftovers {
+                        lock::pump();
+                        let _ = nvidia_rm_sys::rm_init::class_free(device_instance, *h_object);
+                    }
+                }
+                log::info!(
+                    "[nouveau-uapi] process exit pid={}: freed {} leftover class object(s) before channel",
+                    pid,
+                    leftovers.len()
+                );
+            }
+        }
+        // 2. Take the channel off the runlist (and drop its VAS) BEFORE any
+        //    GEM/VM_BIND teardown. ctx 0 is the compositor singleton and is
+        //    never freed here.
+        let ctx_freed = if let (Some(ctx_idx), Some(device_instance)) = (my_ctx, device_instance) {
+            if ctx_idx >= 1 {
+                self.fast_release(device_instance, ctx_idx);
+                self.forget_peer_fences(ctx_idx);
+                lock::pump();
+                let status = nvidia_rm_sys::rm_init::ctx_free(device_instance, ctx_idx);
+                super::nouveau_uapi::ctx_clear_wedged(ctx_idx);
+                log::info!(
+                    "[nouveau-uapi] process exit pid={}: freed CTX {} -> status={:#x}",
+                    pid,
+                    ctx_idx,
+                    status
+                );
+                // Only skip the later RM unmap when ctx_free actually
+                // destroyed the VAS. A failed free leaves the context (and
+                // its VAS) alive; treating it as gone then gem_free's the
+                // backing while RM still has h_virt — UAF in the vendor RM.
+                status == 0
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        // 3. Drop local VM_BIND bookkeeping. Skip the RM unmap when ctx_free
+        //    already destroyed the VAS (a second vm_bind_unmap on a stale
+        //    h_virt is a use-after-free in RM).
+        let dropped_maps = self.drain_vm_mappings(
+            &alloc::format!("process exit pid={}", pid),
+            |m| m.owner_pid == pid,
+            !ctx_freed,
+        );
+        // 4. Release this process's GEM objects, RESPECTING the PRIME share
+        //    count. A buffer this process created may still be imported by
+        //    ANOTHER holder: the compositor self-imports a client's on-screen
+        //    buffer to composite it (gem_mmap refcount > 1). The old code freed
+        //    every owned object unconditionally (`gem_mmap::unregister`, which
+        //    ignores the count) + `gem_free`, so a client exiting while the
+        //    compositor still displayed its window tore the buffer out from
+        //    under the compositor -- its next GEM_INFO/VM_BIND/EXEC on that
+        //    handle ENOENT'd or touched freed RM memory -> the COMPOSITOR's own
+        //    VK_ERROR_DEVICE_LOST. That is the "state accumulates over a
+        //    session" wedge: one client exit poisons a live compositor buffer,
+        //    and from then on every client looks broken.
+        //
+        //    Mirror `nouveau_gem_close` instead: `dec_ref`, and free for real
+        //    ONLY when this drops the LAST reference. A still-shared buffer is
+        //    kept alive with its owner detached (`owner_pid = 0`) so no future
+        //    process exit re-reaps it; the last holder's GEM_CLOSE -- which
+        //    finds the entry by handle -- frees it. `dec_ref` (the gem_mmap
+        //    lock) runs with the `nouveau_gem` lock RELEASED, the same order
+        //    GEM_CLOSE takes them, so a concurrent client GEM_CLOSE cannot
+        //    invert the lock order and deadlock.
+        //
+        //    Known residual (benign, documented): a client that self-imports
+        //    its OWN buffer (GBM export -> EGL/NVK re-import; refcount held
+        //    entirely by that one process) and then dies WITHOUT GEM_CLOSE
+        //    (^C/crash) leaks it -- we drop only its creator reference here, not
+        //    its own import references (those are not tracked per-pid). A leak
+        //    until reboot, never a use-after-free; the full fix is per-pid
+        //    reference accounting in gem_mmap. A clean exit closes every
+        //    reference and frees normally.
+        let (freed_gems, freed_bytes) = {
+            // Phase 1+2: drop EVERY reference this pid holds -- its own
+            // creations and every PRIME self-import it never closed (the
+            // per-pid holder list makes those attributable now, so a client
+            // that died mid-frame no longer leaks its imports until reboot).
+            // `release_pid` takes only the gem_mmap lock; the nouveau_gem lock
+            // is taken afterwards, the same order GEM_CLOSE uses.
+            let mut to_free: Vec<u32> = Vec::new();
+            let mut to_orphan: Vec<u32> = Vec::new();
+            for (handle, freed) in crate::scheme::gem_mmap::release_pid(pid) {
+                if freed {
+                    to_free.push(handle);
+                } else {
+                    to_orphan.push(handle);
+                }
+            }
+            // A no-phys object was never PRIME-registered (cannot be shared),
+            // so it is always its creator's alone -> free.
+            {
+                let gem = self.nouveau_gem.lock();
+                for o in gem.iter() {
+                    if o.owner_pid == pid && o.phys_addr.is_none() && !to_free.contains(&o.handle) {
+                        to_free.push(o.handle);
+                    }
+                }
+            }
+            // Phase 3: apply under the nouveau_gem lock. Collect h_memory ONLY
+            // for entries actually removed here -- a racing GEM_CLOSE that
+            // already reaped one leaves it absent, so it is never double-freed.
+            let mut to_free_mem: Vec<(u32, u32, u64)> = Vec::new(); // (handle, h_memory, size)
+            {
+                let mut gem = self.nouveau_gem.lock();
+                for handle in &to_free {
+                    if let Some(pos) = gem.iter().position(|o| o.handle == *handle) {
+                        let obj = gem.remove(pos);
+                        to_free_mem.push((obj.handle, obj.h_memory, obj.size));
+                    }
+                }
+                for handle in &to_orphan {
+                    // Detach the creator only if it was this pid: an import
+                    // this pid held of a LIVE owner's buffer keeps its owner.
+                    if let Some(o) = gem.iter_mut().find(|o| o.handle == *handle) {
+                        if o.owner_pid == pid {
+                            o.owner_pid = 0;
+                        }
+                    }
+                }
+            }
+            // Phase 4: free RM memory outside every lock.
+            //
+            // Drop each handle's KMS framebuffers first, for the reason spelled
+            // out in `nouveau_gem_close`: an fb caches the backing
+            // `phys_addr`/`h_memory`, so one left behind scans out VRAM that
+            // `gem_free` has already returned to the allocator. This path is
+            // the likelier way to hit that -- a client killed or crashed
+            // mid-session never issues the GEM_CLOSE that would have cleaned up.
+            for (handle, _, _) in &to_free_mem {
+                let dropped = self.drop_kms_fbs_for_handle(*handle);
+                if !dropped.is_empty() {
+                    log::info!(
+                        "[nouveau-uapi] process exit pid={}: handle={} dropped {} KMS fb(s): {:?}",
+                        pid,
+                        handle,
+                        dropped.len(),
+                        dropped
+                    );
+                }
+            }
+            let mut bytes = 0u64;
+            for (handle, h_memory, size) in &to_free_mem {
+                lock::pump();
+                if let Some(device_instance) = device_instance {
+                    let status = nvidia_rm_sys::rm_init::gem_free(device_instance, *h_memory);
+                    if status != 0 {
+                        log::warn!(
+                            "[nouveau-uapi] process exit pid={}: gem_free handle={} h_memory={:#010x} failed, NV_STATUS={:#x}",
+                            pid, handle, h_memory, status
+                        );
+                    }
+                }
+                bytes += size;
+            }
+            if bytes != 0 {
+                NOUVEAU_GEM_BYTES.fetch_sub(bytes, Ordering::Relaxed);
+            }
+            if !to_orphan.is_empty() {
+                log::info!(
+                    "[nouveau-uapi] process exit pid={}: freed {} GEM object(s), kept {} still-imported by another holder (PRIME refcount > 0)",
+                    pid, to_free_mem.len(), to_orphan.len()
+                );
+            }
+            (to_free_mem.len(), bytes)
+        };
+        // Channel bookkeeping. Only the RM-backed channel carries real GPU state,
+        // so a process that merely enumerated (discovery channels) is reclaimed
+        // without the class-object cleanup below.
+        //
+        // The sticky ctx-0 owner gives the singleton back whether or not it
+        // still holds a channel. A compositor that exits cleanly frees its
+        // channels first (NVK destroys its contexts before the device
+        // closes), and inferring the role from the channel table here left
+        // ctx 0 owned by a dead pid: the respawned compositor then ran as a
+        // GL client, on a context of its own, while the singleton's channel
+        // and direct-submit window stayed as the dead one had left them.
+        let owns_ctx0 = self.ctx0_is_owner(pid);
+        let (had_rm_backed, released_ctx0) = {
+            let mut chans = self.nouveau_channels.lock();
+            let before = chans.len();
+            let mut rm_backed = false;
+            let mut ctx0 = owns_ctx0;
+            chans.retain(|c| {
+                if c.owner_pid == pid {
+                    rm_backed |= c.rm_backed;
+                    ctx0 |= c.rm_backed && c.ctx_idx == 0;
+                    false
+                } else {
+                    true
+                }
+            });
+            if before == chans.len() && !owns_ctx0 {
+                if dropped_maps > 0 || freed_gems > 0 || my_ctx.is_some() {
+                    log::info!(
+                        "[nouveau-uapi] process exit pid={}: reclaimed {} mapping(s), {} GEM object(s) ({} KiB), ctx={:?}",
+                        pid, dropped_maps, freed_gems, freed_bytes / 1024, my_ctx
+                    );
+                }
+                return;
+            }
+            (rm_backed, ctx0)
+        };
+        if !had_rm_backed && !released_ctx0 {
+            log::info!(
+                "[nouveau-uapi] process exit pid={}: released discovery channel(s); reclaimed {} mapping(s), {} GEM object(s)",
+                pid, dropped_maps, freed_gems
+            );
+            return;
+        }
+        if released_ctx0 {
+            if let Some(device_instance) = device_instance {
+                self.reset_ctx0_singleton(device_instance, "process exit", pid);
+            } else {
+                crate::klog_warn!(
+                    "[nouveau-uapi] ctx0 reset: process exit pid={} but no RM device instance is attached",
+                    pid
+                );
+            }
+        }
+        // Class objects and ctx_free already ran (GPU off the runlist, VAS
+        // gone). Only channel bookkeeping remains.
+        log::info!(
+            "[nouveau-uapi] process exit pid={}: released nouveau channel + {} GEM object(s), {} KiB, {} mapping(s)",
+            pid,
+            freed_gems,
+            freed_bytes / 1024,
+            dropped_maps
+        );
+    }
+
+    /// The channels that may still have an ACQUIRE queued on `ctx_idx`'s
+    /// fence semaphore: every consumer that mapped it and whose ring is not
+    /// idle, each with the entries it has put so far -- once its ring has
+    /// consumed that many, every ACQUIRE it queued before now has been
+    /// fetched, and the page can go.
+    fn channels_waiting_on(&self, ctx_idx: u32) -> Vec<(u32, u64)> {
+        let consumers: Vec<u32> = self
+            .nouveau_peer_fence
+            .lock()
+            .keys()
+            .filter(|&&(consumer, producer)| producer == ctx_idx && consumer != ctx_idx)
+            .map(|&(consumer, _)| consumer)
+            .collect();
+        let slots = self.nouveau_fast.lock();
+        consumers
+            .into_iter()
+            .filter_map(|c| match slots.get(c as usize) {
+                Some(FastSlot::Ready(f)) => {
+                    (ring_consumed(f) < f.entries_put).then_some((c, f.entries_put))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Whether channel `consumer` has consumed `entries` GP entries. A
+    /// channel with no direct-submit state any more has been freed, and a
+    /// freed channel fetches nothing.
+    fn channel_passed(&self, consumer: u32, entries: u64) -> bool {
+        match self.nouveau_fast.lock().get(consumer as usize) {
+            Some(FastSlot::Ready(f)) => ring_consumed(f) >= entries,
+            _ => true,
+        }
+    }
+
+    /// Write the last payload `ctx_idx` ever issued into its landing zone,
+    /// as its ring would have: every ACQUIRE another channel queued on it
+    /// passes, whether or not the ring behind it runs again. If it does run,
+    /// its RELEASEs write ascending payloads and end on this same value, so
+    /// an ACQUIRE that sees a lower one in between waits for the ring, as it
+    /// would have anyway; once is enough.
+    fn write_final_payload(&self, ctx_idx: u32) {
+        let slots = self.nouveau_fast.lock();
+        if let Some(FastSlot::Ready(f)) = slots.get(ctx_idx as usize) {
+            if f.fenced > 0 {
+                let last = if f.next_payload == 1 {
+                    u32::MAX
+                } else {
+                    f.next_payload - 1
+                };
+                // SAFETY: `fence_sem_va` is the kernel mapping of the pinned
+                // sysmem landing zone this slot published for exactly this
+                // u32 (`attach_hw_fence`'s contract), alive until `ctx_free`.
+                unsafe { core::ptr::write_volatile(f.fence_sem_va as *mut u32, last) };
+                store_fence();
+            }
+        }
+    }
+
+    /// Keep `ctx_idx`'s RM state past its process's exit until `waiters`
+    /// have passed (see [`ZombieCtx`]). Its fences land now, by writing the
+    /// last payload: a CPU-side waiter in the syncobj table resolves on the
+    /// landing zone as on any landed fence, and `fast_release` abandons
+    /// whatever is left when the teardown runs. Only the teardown waits.
+    fn park_zombie(&self, pid: u64, ctx_idx: u32, waiters: Vec<(u32, u64)>) {
+        self.write_final_payload(ctx_idx);
+        log::info!(
+            "[nouveau-uapi] process exit pid={}: ctx {} kept as a zombie: channel(s) {:?} still have an ACQUIRE queued on its semaphore",
+            pid,
+            ctx_idx,
+            waiters.iter().map(|w| w.0).collect::<Vec<_>>()
+        );
+        self.nouveau_zombies.lock().push(ZombieCtx {
+            pid,
+            ctx_idx,
+            born_us: unsafe { crate::bus::drivers_timer_now_as_micros() },
+            waiters,
+        });
+    }
+
+    /// The teardown of a zombie wearing `pid`, now: pids are recycled, and
+    /// a new process under this pid is about to own nouveau state of its
+    /// own (contexts, GEM objects and channels are all keyed by pid), which
+    /// the zombie's pid-scoped teardown would take with it. The consumer
+    /// runs the risk the zombie was parked against; a pid coming back
+    /// within the fence timeout is the rarer event.
+    fn reap_zombie_wearing(&self, pid: u64) {
+        let mine: Vec<ZombieCtx> = {
+            let mut zombies = self.nouveau_zombies.lock();
+            if zombies.is_empty() {
+                return;
+            }
+            let (mine, rest) = core::mem::take(&mut *zombies)
+                .into_iter()
+                .partition(|z| z.pid == pid);
+            *zombies = rest;
+            mine
+        };
+        for z in mine {
+            log::warn!(
+                "[nouveau-uapi] zombie ctx {}: pid={} is back before its consumer passed; freeing now",
+                z.ctx_idx,
+                z.pid
+            );
+            self.release_process_finish(z.pid, Some(z.ctx_idx));
+        }
+    }
+
+    /// Finish the teardown of every zombie whose waiters have all passed,
+    /// or that has waited the fence timeout (a consumer that has not moved
+    /// in that long is wedged, and its own fence timeout is latching it).
+    /// Called where a zombie can become due: a submit, a process exit, a
+    /// new context being allocated.
+    fn reap_zombie_contexts(&self) {
+        let now = unsafe { crate::bus::drivers_timer_now_as_micros() };
+        let due: Vec<ZombieCtx> = {
+            let mut zombies = self.nouveau_zombies.lock();
+            if zombies.is_empty() {
+                return;
+            }
+            let mut due = Vec::new();
+            let mut i = 0;
+            while i < zombies.len() {
+                let z = &zombies[i];
+                let expired =
+                    now.wrapping_sub(z.born_us) >= crate::scheme::syncobj::FENCE_TIMEOUT_US;
+                let passed = z.waiters.iter().all(|&(c, e)| self.channel_passed(c, e));
+                if expired || passed {
+                    due.push(zombies.swap_remove(i));
+                } else {
+                    i += 1;
+                }
+            }
+            due
+        };
+        for z in due {
+            log::info!(
+                "[nouveau-uapi] zombie ctx {} (pid={}): its waiters passed or timed out; freeing",
+                z.ctx_idx,
+                z.pid
+            );
+            self.release_process_finish(z.pid, Some(z.ctx_idx));
+        }
     }
 
     /// The EXEC ioctl body on the direct-submit path (waits already honoured
@@ -10339,7 +10554,16 @@ impl NvidiaGpu {
                 gpu_spin();
             }
         }
-        let Some(idx) = (1u32..nv::MAX_CTX).find(|i| !map.iter().any(|t| t.1 == *i)) else {
+        // A zombie's index is still the RM's until its teardown runs.
+        let zombies: Vec<u32> = self
+            .nouveau_zombies
+            .lock()
+            .iter()
+            .map(|z| z.ctx_idx)
+            .collect();
+        let Some(idx) =
+            (1u32..nv::MAX_CTX).find(|i| !map.iter().any(|t| t.1 == *i) && !zombies.contains(i))
+        else {
             crate::klog_warn!(
                 "[nouveau-uapi] ctx: no free context slot (max {}) for pid={} -- client falls back to software",
                 nv::MAX_CTX,
@@ -11109,6 +11333,10 @@ impl NvidiaGpu {
         if !nv::enabled() {
             return Err(nv::ENOSYS);
         }
+        // A zombie context (`ZombieCtx`) still wearing this pid: the pid was
+        // recycled, and this process must not share pid-keyed state with
+        // the dead one.
+        self.reap_zombie_wearing(owner_pid);
         // Name every distinct ioctl the first time Mesa issues it, so one
         // real-hardware boot reveals the full vocabulary and, above all, the
         // submission path (legacy GEM_PUSHBUF vs new EXEC). Bounded/de-duped.
@@ -12086,6 +12314,9 @@ impl NvidiaGpu {
                 // written by the kernel itself, fence resolved lazily by the
                 // syncobj layer. Falls through to the RM per-submit path only
                 // when the context could not be prepared (or `nvidia.exec_rm`).
+                // A submit is the event that moves rings: a zombie context
+                // whose waiters have passed can go now.
+                self.reap_zombie_contexts();
                 if self.fast_ctx_ready(device_instance, ctx_idx) {
                     return self.exec_fast(ctx_idx, owner_pid, req, pushes, &hw_acquires);
                 }
@@ -13456,7 +13687,7 @@ impl NvidiaGpu {
         // never touched cost nothing.
         let bar0 = alloc::boxed::Box::leak(alloc::vec![0u8; 16 << 20].into_boxed_slice()).as_ptr()
             as usize;
-        let gem_handle_slice = crate::scheme::gem_mmap::alloc_handle_slice();
+        let gem_handle_slice = crate::scheme::gem_mmap::test_handle_slice();
         // The id table decides the architecture as it does for real; an id
         // it does not know stands in for a Turing board it cannot size.
         let (architecture, gpu_model) = match identify_gpu(device_id) {
@@ -13512,6 +13743,7 @@ impl NvidiaGpu {
                     .collect(),
             ),
             nouveau_peer_fence: Mutex::new(alloc::collections::BTreeMap::new()),
+            nouveau_zombies: Mutex::new(Vec::new()),
             kms_framebuffers: Mutex::new(Vec::new()),
             next_kms_fb_id: AtomicU32::new(1),
             kms_state: Mutex::new(NvidiaKmsState {
@@ -18072,6 +18304,285 @@ mod nouveau_bookkeeping_tests {
         gpu.nouveau_release_process(COMP2);
         assert_eq!(ctx0_resets(), 2);
         assert_eq!(ctx0_owner(&gpu), 0);
+        assert_eq!(FAKE_RM.lock().bad, 0);
+    }
+
+    /// The desktop's every frame: the compositor (context 0) composites a
+    /// client's buffer behind an ACQUIRE on the client's fence, through a
+    /// peer mapping of the client's semaphore page. The client closes its
+    /// window before the compositor's ring got there. `ctx_free` right then
+    /// frees the page and the mapping, and the compositor's ACQUIRE faults
+    /// on a VA nothing maps any more -- an MMU fault on the COMPOSITOR's
+    /// channel. So the client's context outlives its process until the
+    /// compositor has consumed what it had queued.
+    #[test]
+    fn a_client_that_exits_with_the_compositors_acquire_queued_keeps_its_fence_page_until_the_compositor_has_passed(
+    ) {
+        let _g = LOCK.lock();
+        let _live = LiveBytes::hold();
+        let gpu = gpu_rm_ladder();
+        FAKE_RM.lock().peer = true;
+        test_clock::set_auto_advance(1_000);
+        let ch_c = client_with_pushbuf(&gpu, COMP);
+        assert_eq!(ctx0_owner(&gpu), COMP);
+        let ch_a = client_with_pushbuf(&gpu, A);
+        assert_eq!(ctx_of(&gpu, A), Some((1, true)));
+        let out = syncobj::create(false);
+        let out2 = syncobj::create(false);
+        assert_eq!(
+            exec(&gpu, A, ch_a, &[push(PUSH_VA, 16)], &[], &[sync(out)]),
+            Ok(0)
+        );
+        assert_eq!(
+            exec(
+                &gpu,
+                COMP,
+                ch_c,
+                &[push(PUSH_VA, 16)],
+                &[sync(out)],
+                &[sync(out2)]
+            ),
+            Ok(0)
+        );
+        let (producer_va, _) =
+            peer_map(0, 1).expect("the client's semaphore in the compositor's VAS");
+        assert_eq!(producer_va, sem_va(&chan(1)));
+        assert_eq!(
+            userd(&chan(0)),
+            (0, 3),
+            "acquire, push, release: queued, not fetched"
+        );
+        // The window closes. Nothing has run yet on either ring.
+        let before = FAKE_RM.lock().calls.len();
+        gpu.nouveau_release_process(A);
+        assert_eq!(
+            ctx_of(&gpu, A),
+            None,
+            "off the pid registry: no late submit routes here"
+        );
+        assert!(
+            !rm_calls_since(before).contains(&"ctx_free"),
+            "the channel is NOT freed while the compositor's ACQUIRE is queued: {:?}",
+            rm_calls_since(before)
+        );
+        assert!(has_chan(1));
+        assert!(peer_map(0, 1).is_some(), "the compositor's mapping stays");
+        assert_eq!(
+            syncobj::query(out),
+            Some(1),
+            "the CPU side of the client's fence is released at once, as a killed channel's"
+        );
+        assert_eq!(
+            landing_zone(&chan(1)),
+            1,
+            "the landing zone carries the last payload the client issued, written by the CPU"
+        );
+        // A new client does not get the zombie's index: its page is still
+        // the one the compositor's ring is about to read.
+        let ch_b = client_with_pushbuf(&gpu, B);
+        assert_eq!(
+            ctx_of(&gpu, B),
+            Some((2, true)),
+            "the zombie's index is not reused"
+        );
+        // The compositor queues its next frame before its ring has moved:
+        // still nothing freed, the ACQUIRE is still ahead of GPGet.
+        let before = FAKE_RM.lock().calls.len();
+        assert_eq!(
+            exec(&gpu, COMP, ch_c, &[push(PUSH_VA + 0x100, 16)], &[], &[]),
+            Ok(0)
+        );
+        assert!(!rm_calls_since(before).contains(&"ctx_free"));
+        assert!(has_chan(1));
+        // The compositor's ring runs: the ACQUIRE passes on the page the
+        // dead client's ring never wrote (its own ring never ran), and no
+        // entry faults.
+        let fetched = run_gpu(0);
+        assert_eq!(
+            fetched.len(),
+            4,
+            "acquire, push, release, push: {:?}",
+            fetched
+        );
+        assert!(
+            matches!(fetched[0], Fetched::Acquire { sem_va, payload: 1 } if sem_va == peer_map(0, 1).unwrap().1),
+            "the ACQUIRE on the dead client's page passed: {:?}",
+            fetched[0]
+        );
+        assert!(
+            !fetched.iter().any(|f| matches!(f, Fetched::Fault { .. })),
+            "no MMU fault on the compositor's channel: {:?}",
+            fetched
+        );
+        // The compositor's next submit finds the zombie's waiter passed and
+        // finishes the teardown: the channel, the page and the mapping go.
+        let before = FAKE_RM.lock().calls.len();
+        assert_eq!(
+            exec(&gpu, COMP, ch_c, &[push(PUSH_VA + 0x200, 16)], &[], &[]),
+            Ok(0)
+        );
+        assert!(
+            rm_calls_since(before).contains(&"ctx_free"),
+            "the dead client's channel freed once the compositor passed: {:?}",
+            rm_calls_since(before)
+        );
+        assert!(!has_chan(1));
+        assert_eq!(peer_map(0, 1), None);
+        assert!(gpu.nouveau_zombies.lock().is_empty());
+        assert_eq!(
+            run_gpu(0).len(),
+            1,
+            "and the compositor's ring is none the worse"
+        );
+        gpu.nouveau_release_process(B);
+        let _ = ch_b;
+        gpu.nouveau_release_process(COMP);
+        assert!(!has_chan(0));
+        assert!(!has_chan(2));
+        assert_eq!(FAKE_RM.lock().bad, 0);
+    }
+
+    /// Pids are recycled. A new process wearing the dead client's pid must
+    /// not share the pid-keyed state (context, GEM objects, channels) with
+    /// the zombie: its first nouveau ioctl finishes the zombie's teardown,
+    /// consumer or no consumer.
+    #[test]
+    fn a_recycled_pid_finishes_the_zombies_teardown_before_owning_anything() {
+        let _g = LOCK.lock();
+        let _live = LiveBytes::hold();
+        let gpu = gpu_rm_ladder();
+        FAKE_RM.lock().peer = true;
+        test_clock::set_auto_advance(1_000);
+        let ch_c = client_with_pushbuf(&gpu, COMP);
+        let ch_a = client_with_pushbuf(&gpu, A);
+        let out = syncobj::create(false);
+        assert_eq!(
+            exec(&gpu, A, ch_a, &[push(PUSH_VA, 16)], &[], &[sync(out)]),
+            Ok(0)
+        );
+        assert_eq!(
+            exec(&gpu, COMP, ch_c, &[push(PUSH_VA, 16)], &[sync(out)], &[]),
+            Ok(0)
+        );
+        gpu.nouveau_release_process(A);
+        assert_eq!(gpu.nouveau_zombies.lock().len(), 1, "a zombie");
+        let old = chan(1);
+        // The pid comes back (a new process) and allocates a channel.
+        let before = FAKE_RM.lock().calls.len();
+        let ch_a2 = client_with_pushbuf(&gpu, A);
+        let calls = rm_calls_since(before);
+        let freed = calls
+            .iter()
+            .position(|c| *c == "ctx_free")
+            .expect("the zombie freed first");
+        let built = calls
+            .iter()
+            .rposition(|c| *c == "exec_fast_prepare" || *c == "ctx_alloc" || *c == "channel_alloc")
+            .unwrap_or(usize::MAX);
+        assert!(
+            freed < built,
+            "freed BEFORE the new process's own state: {:?}",
+            calls
+        );
+        assert!(gpu.nouveau_zombies.lock().is_empty());
+        assert_eq!(peer_map(0, 1), None, "the dead one's mapping is gone");
+        assert_eq!(
+            ctx_of(&gpu, A),
+            Some((1, true)),
+            "and the new one has a context of its own"
+        );
+        let out2 = syncobj::create(false);
+        assert_eq!(
+            exec(&gpu, A, ch_a2, &[push(PUSH_VA, 16)], &[], &[sync(out2)]),
+            Ok(0)
+        );
+        assert_ne!(chan(1).buf, old.buf, "on a channel of its own");
+        gpu.nouveau_release_process(A);
+        gpu.nouveau_release_process(COMP);
+        assert_eq!(FAKE_RM.lock().bad, 0);
+    }
+
+    /// The same, for a process wearing the recycled pid that exits without
+    /// having touched nouveau: its exit is pid-keyed too (GEM objects,
+    /// channels), so the zombie's teardown goes first, not never.
+    #[test]
+    fn a_recycled_pid_that_exits_without_a_channel_takes_the_zombie_with_it() {
+        let _g = LOCK.lock();
+        let _live = LiveBytes::hold();
+        let gpu = gpu_rm_ladder();
+        FAKE_RM.lock().peer = true;
+        test_clock::set_auto_advance(1_000);
+        let ch_c = client_with_pushbuf(&gpu, COMP);
+        let ch_a = client_with_pushbuf(&gpu, A);
+        let out = syncobj::create(false);
+        assert_eq!(
+            exec(&gpu, A, ch_a, &[push(PUSH_VA, 16)], &[], &[sync(out)]),
+            Ok(0)
+        );
+        assert_eq!(
+            exec(&gpu, COMP, ch_c, &[push(PUSH_VA, 16)], &[sync(out)], &[]),
+            Ok(0)
+        );
+        gpu.nouveau_release_process(A);
+        assert!(has_chan(1), "a zombie");
+        let before = FAKE_RM.lock().calls.len();
+        gpu.nouveau_release_process(A);
+        assert!(
+            rm_calls_since(before).contains(&"ctx_free"),
+            "the zombie freed with the pid's second exit: {:?}",
+            rm_calls_since(before)
+        );
+        assert!(!has_chan(1));
+        assert!(gpu.nouveau_zombies.lock().is_empty());
+        gpu.nouveau_release_process(COMP);
+        assert_eq!(FAKE_RM.lock().bad, 0);
+    }
+
+    /// A consumer that never moves is wedged, and its own fence timeout is
+    /// what latches it: the zombie does not wait on it forever. Past the
+    /// fence timeout the teardown goes through, whatever the consumer's
+    /// ring says.
+    #[test]
+    fn a_zombie_whose_consumer_never_moves_is_freed_after_the_fence_timeout() {
+        let _g = LOCK.lock();
+        let _live = LiveBytes::hold();
+        let gpu = gpu_rm_ladder();
+        FAKE_RM.lock().peer = true;
+        test_clock::set_auto_advance(1_000);
+        let ch_c = client_with_pushbuf(&gpu, COMP);
+        let ch_a = client_with_pushbuf(&gpu, A);
+        let out = syncobj::create(false);
+        assert_eq!(
+            exec(&gpu, A, ch_a, &[push(PUSH_VA, 16)], &[], &[sync(out)]),
+            Ok(0)
+        );
+        assert_eq!(
+            exec(&gpu, COMP, ch_c, &[push(PUSH_VA, 16)], &[sync(out)], &[]),
+            Ok(0)
+        );
+        gpu.nouveau_release_process(A);
+        assert!(has_chan(1), "a zombie: the compositor's ACQUIRE is queued");
+        assert_eq!(gpu.nouveau_zombies.lock().len(), 1);
+        // Short of the timeout, another process's exit reaps nothing.
+        test_clock::advance(syncobj::FENCE_TIMEOUT_US / 2);
+        gpu.nouveau_release_process(STRANGER);
+        assert!(has_chan(1));
+        assert!(peer_map(0, 1).is_some());
+        // Past it, the next event that runs the reaper frees it, with the
+        // compositor's ring still where it was.
+        test_clock::advance(syncobj::FENCE_TIMEOUT_US / 2);
+        let before = FAKE_RM.lock().calls.len();
+        gpu.nouveau_release_process(STRANGER);
+        assert!(
+            rm_calls_since(before).contains(&"ctx_free"),
+            "freed on the timeout: {:?}",
+            rm_calls_since(before)
+        );
+        assert!(!has_chan(1));
+        assert_eq!(peer_map(0, 1), None);
+        assert!(gpu.nouveau_zombies.lock().is_empty());
+        assert_eq!(userd(&chan(0)).0, 0, "the compositor's ring never moved");
+        gpu.nouveau_release_process(COMP);
         assert_eq!(FAKE_RM.lock().bad, 0);
     }
 }

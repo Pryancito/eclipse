@@ -111,6 +111,20 @@ pub fn alloc_handle_slice() -> HandleSlice {
     }
 }
 
+/// The slice a test-built GPU (`NvidiaGpu::for_test`) hands out from: a
+/// fixed one past slot 0, not a reservation. The test suite builds a GPU
+/// per test and the reservations are 64 for the whole binary, so building
+/// one more test than that turned every later slice `exhausted` and failed
+/// tests that never asked for a handle. Tests run one at a time under
+/// their own lock, so two test GPUs never hold this slice at once.
+#[cfg(test)]
+pub fn test_handle_slice() -> HandleSlice {
+    HandleSlice {
+        base: DRIVER_HANDLE_BASE + HANDLES_PER_GPU,
+        end: DRIVER_HANDLE_BASE + 2 * HANDLES_PER_GPU,
+    }
+}
+
 struct MappedGem {
     handle: u32,
     phys_addr: u64,
