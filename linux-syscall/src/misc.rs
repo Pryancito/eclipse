@@ -1,6 +1,7 @@
 use super::*;
 use core::time::Duration;
 use kernel_hal::timer::timer_now;
+use linux_object::process::{CAP_SYS_ADMIN, CAP_SYS_BOOT};
 use linux_object::time::*;
 use zircon_object::task::ThreadState;
 use zircon_object::{ZxError, ZxResult};
@@ -129,6 +130,11 @@ impl Syscall<'_> {
     /// through `uname`, `gethostname` and `/proc/sys/kernel/hostname`.
     pub fn sys_sethostname(&mut self, base: UserInPtr<u8>, len: usize) -> SysResult {
         info!("sethostname: base={:?}, len={}", base, len);
+        // `kernel/sys.c`: `if (!ns_capable(current->nsproxy->uts_ns->user_ns,
+        // CAP_SYS_ADMIN)) return -EPERM;`, ahead of the length check.
+        if !self.linux_process().capable(CAP_SYS_ADMIN) {
+            return Err(LxError::EPERM);
+        }
         if len > linux_object::uname::HOST_NAME_MAX {
             return Err(LxError::EINVAL);
         }
@@ -142,6 +148,11 @@ impl Syscall<'_> {
     /// (see [linux man setdomainname(2)](https://www.man7.org/linux/man-pages/man2/setdomainname.2.html)).
     pub fn sys_setdomainname(&mut self, base: UserInPtr<u8>, len: usize) -> SysResult {
         info!("setdomainname: base={:?}, len={}", base, len);
+        // `kernel/sys.c`: `if (!ns_capable(current->nsproxy->uts_ns->user_ns,
+        // CAP_SYS_ADMIN)) return -EPERM;`, ahead of the length check.
+        if !self.linux_process().capable(CAP_SYS_ADMIN) {
+            return Err(LxError::EPERM);
+        }
         if len > linux_object::uname::HOST_NAME_MAX {
             return Err(LxError::EINVAL);
         }
@@ -257,13 +268,9 @@ impl Syscall<'_> {
         if data.is_null() {
             return Ok(0);
         }
-        // CAP_LAST_CAP is 40 on Linux 5.15: bits 0..=40 are valid.
-        const CAP_FULL_SET: u64 = (1 << 41) - 1;
-        let caps = if self.linux_process().euid() == 0 {
-            CAP_FULL_SET
-        } else {
-            0
-        };
+        // Built out of the same predicate every gate asks, so what this
+        // publishes and what the kernel honours cannot drift apart.
+        let caps = linux_object::process::published_capabilities(self.linux_process().euid());
         let mut out = [CapUserData::default(); 2];
         out[0].effective = caps as u32;
         out[0].permitted = caps as u32;
@@ -847,6 +854,20 @@ impl Syscall<'_> {
             "reboot: magic1={:#x}, magic2={:#x}, cmd={:#x}",
             magic1, magic2, cmd
         );
+        // `kernel/reboot.c`, before the magic numbers are even looked at:
+        //
+        // ```c
+        // /* We only trust the superuser with rebooting the system. */
+        // if (!ns_capable(pid_ns->user_ns, CAP_SYS_BOOT))
+        //         return -EPERM;
+        // ```
+        //
+        // The magic numbers are there to catch a wild call, not to keep
+        // anyone out: they are public constants. Without this line any
+        // process at all could power the machine off.
+        if !self.linux_process().capable(CAP_SYS_BOOT) {
+            return Err(LxError::EPERM);
+        }
         if magic1 != 0xfee1dead
             || (magic2 != 0x28121969
                 && magic2 != 0x05121996
