@@ -31,9 +31,6 @@ use lock::Mutex;
 use rcore_fs::vfs::*;
 
 // termios c_iflag bits
-const IGNCR: u32 = 0x0080;
-const ICRNL: u32 = 0x0100;
-const INLCR: u32 = 0x0040;
 const IXON: u32 = 0x0400;
 const IXANY: u32 = 0x0800;
 // termios c_lflag bits
@@ -269,18 +266,15 @@ impl Pty {
                             break;
                         }
                     };
-                let mut c = b;
-                // Input CR/NL translation.
-                if c == b'\r' {
-                    if iflag & IGNCR != 0 {
-                        continue;
-                    }
-                    if iflag & ICRNL != 0 {
-                        c = b'\n';
-                    }
-                } else if c == b'\n' && iflag & INLCR != 0 {
-                    c = b'\r';
-                }
+                // What the byte becomes on the way in: `ISTRIP`, `IUCLC`,
+                // then the CR/NL rules, in that order. The block used to be
+                // here, again in the console and again in `fs/devfs/pty.rs`,
+                // and none of the three had `ISTRIP` or `IUCLC`; it is one
+                // question per input byte, so it is answered in `ioctl.rs`.
+                let c = match termios.input_char(b) {
+                    Some(c) => c,
+                    None => continue,
+                };
 
                 // Literal-next (VLNEXT, Ctrl-V): the previous byte armed it, so
                 // insert this one verbatim, skipping signal/edit interpretation.
@@ -1982,15 +1976,51 @@ mod tests {
         assert_eq!(slave_reads(&p), vec!["ab\n"]);
 
         let p = pty();
-        set_flags(&p, |t| t.c_iflag = IGNCR);
+        set_flags(&p, |t| t.c_iflag = I_IGNCR);
         p.master_write(b"ab\r");
         assert!(!p.slave_readable());
 
         let p = pty();
-        set_flags(&p, |t| t.c_iflag = INLCR);
+        set_flags(&p, |t| t.c_iflag = I_INLCR);
         p.master_write(b"ab\n");
         // '\n' became '\r', which is not an end of line.
         assert!(!p.slave_readable());
+    }
+
+    #[test]
+    fn a_seven_bit_terminal_ends_its_line_with_the_return_key() {
+        // On a 7-bit line Enter arrives as 0x8d, and ISTRIP is what makes it
+        // a carriage return for ICRNL to end the line with. The copy of the
+        // CR/NL block this file used to carry had no ISTRIP in it, so the key
+        // did nothing.
+        let p = pty();
+        set_flags(&p, |t| t.c_iflag |= I_ISTRIP);
+        p.master_write(&[b'a', b'b', 0x8d]);
+        assert_eq!(slave_reads(&p), vec!["ab\n"]);
+
+        // Without it the byte is just a byte and the line stays open.
+        let p = pty();
+        p.master_write(&[b'a', b'b', 0x8d]);
+        assert!(!p.slave_readable());
+    }
+
+    #[test]
+    fn iuclc_folds_the_keystrokes_and_iexten_turns_it_off() {
+        let p = pty();
+        set_flags(&p, |t| {
+            assert_ne!(t.c_lflag & L_IEXTEN, 0);
+            t.c_iflag |= I_IUCLC;
+        });
+        p.master_write(b"HOLA\r");
+        assert_eq!(slave_reads(&p), vec!["hola\n"]);
+
+        let p = pty();
+        set_flags(&p, |t| {
+            t.c_iflag |= I_IUCLC;
+            t.c_lflag &= !L_IEXTEN;
+        });
+        p.master_write(b"HOLA\r");
+        assert_eq!(slave_reads(&p), vec!["HOLA\n"]);
     }
 
     #[test]
