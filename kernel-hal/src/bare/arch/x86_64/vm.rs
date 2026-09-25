@@ -62,7 +62,11 @@ hal_fn_impl! {
             // write is only needed to drop a lingering user CR3 (lazy TLB);
             // when CR3 already points at the kernel tree there is nothing
             // stale to release.
-            if token != 0 && current_vmtoken() != token {
+            //
+            // One CR3 holds both roots, so the user root this CPU has loaded
+            // is simply the one it is running on. aarch64 has two registers
+            // and asked the wrong one: hence the shared predicate.
+            if crate::common::vm::should_restore_kernel_table(current_vmtoken(), token) {
                 activate_paging(token);
             }
         }

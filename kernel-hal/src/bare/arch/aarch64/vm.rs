@@ -218,12 +218,43 @@ hal_fn_impl! {
         }
 
         fn activate_kernel_paging() {
+            // NOT `current_vmtoken()`, which reads TTBR1_EL1: the kernel's own
+            // root is the only thing ever written there, so asking it whether
+            // this CPU still runs userspace answered "no" on every call after
+            // boot and this function did nothing at all. The user half is
+            // translated through the OTHER register, and dropping it is the
+            // whole job -- see `should_restore_kernel_table`.
             let token = KERNEL_VMTOKEN.load(Ordering::Acquire);
-            // Already on the kernel table: skip the TTBR write + full TLB
-            // flush (the idle callback calls this every idle iteration).
-            if token != 0 && current_vmtoken() != token {
-                activate_paging(token);
+            let loaded = TTBR0_EL1.get() as usize & PHYS_ADDR_MASK;
+            if !crate::common::vm::should_restore_kernel_table(loaded, token) {
+                // Nothing loaded, or nowhere to go back to. The idle callback
+                // runs on every idle iteration, so this is the common case and
+                // it must not flush.
+                return;
             }
+            // TTBR1_EL1 already holds `token` and is left alone: unlike CR3 and
+            // satp, it never held anything else.
+            TTBR0_EL1.set(0);
+            // Local, not inner-shareable: the entries that go stale here are
+            // this core's own. And it has to happen -- user leaves are not
+            // marked non-global (`PTF::NG` is declared in `utils::pte` and
+            // never set by `From<MMUFlags>`), so they are not tagged by the
+            // base register that walked them and the TTBR0 write alone does
+            // not stop the TLB answering from them. That is also why
+            // `tlbi aside1` would not do.
+            unsafe {
+                core::arch::asm!(
+                    "dsb nshst
+                     tlbi vmalle1
+                     dsb nsh
+                     isb"
+                );
+            }
+            // AFTER the flush, and that is the opposite of `activate_paging`'s
+            // order on purpose. There, publishing early costs a spurious IPI;
+            // here, publishing early would let a shootdown initiator skip a
+            // CPU that still holds the entries it is invalidating.
+            crate::common::ipi::note_active_vmtoken(token);
         }
 
         fn flush_tlb(vaddr: Option<VirtAddr>) {

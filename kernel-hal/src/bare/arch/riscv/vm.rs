@@ -215,7 +215,11 @@ hal_fn_impl! {
             let token = KERNEL_VMTOKEN.load(Ordering::Acquire);
             // Already on the kernel table: skip the satp write + fence (the
             // idle callback calls this every idle iteration).
-            if token != 0 && current_vmtoken() != token {
+            //
+            // One satp holds both roots, so the user root this CPU has loaded
+            // is simply the one it is running on. aarch64 has two registers
+            // and asked the wrong one: hence the shared predicate.
+            if crate::common::vm::should_restore_kernel_table(current_vmtoken(), token) {
                 activate_paging(token);
             }
         }
