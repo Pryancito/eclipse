@@ -77,11 +77,23 @@ device tree:       {device_tree_paddr:016x}..{:016x}
         device_tree_paddr + dtb.total_size(),
     );
     // 启动副核
-    boot_secondary_harts(
-        hartid,
-        &dtb,
-        secondary_hart_start as *const () as usize - mem_info.offset(),
-    );
+    //
+    // `smp=off` has to be read from the device tree right here. The harts are
+    // released before `primary_main` exists, so by the time the command line is
+    // parsed into `SMP_ENABLED` every one of them is already running, and the
+    // "single-core boot forced (smp=off)" the boot log then prints is a switch
+    // the kernel says it obeyed and did not. x86_64 checks the same flag inside
+    // `start_application_processors`, which runs late enough to just read it.
+    if dtb_says_smp_off(&dtb) {
+        kernel_hal::set_smp_enabled(false);
+        println!("[smp] secondary harts not started (smp=off)");
+    } else {
+        boot_secondary_harts(
+            hartid,
+            &dtb,
+            secondary_hart_start as *const () as usize - mem_info.offset(),
+        );
+    }
     // 转交控制权
     crate::primary_main(KernelConfig {
         phys_to_virt_offset: mem_info.offset(),
@@ -90,6 +102,34 @@ device tree:       {device_tree_paddr:016x}..{:016x}
     });
     sbi_rt::system_reset(sbi_rt::Shutdown, sbi_rt::NoReason);
     unreachable!()
+}
+
+/// Whether the device tree's `/chosen/bootargs` asks for a single-core boot.
+///
+/// The answer is decided inside the walk rather than carried out of it: the
+/// property's bytes live only as long as the callback. They are the raw,
+/// NUL-terminated property, so `cmdline::from_c_bytes` strips the terminator —
+/// without it the value of the *last* flag on the line reads as `"off\0"`,
+/// which spells no boolean, and the flag looks unwritten.
+fn dtb_says_smp_off(dtb: &Dtb) -> bool {
+    let mut off = false;
+    dtb.walk(|path, obj| match obj {
+        DtbObj::SubNode { name } => {
+            if path.is_root() && name == Str::from("chosen") {
+                StepInto
+            } else {
+                StepOver
+            }
+        }
+        DtbObj::Property(Property::General { name, value }) if name == Str::from("bootargs") => {
+            if let Some(cmdline) = kernel_hal::cmdline::from_c_bytes(value) {
+                off = kernel_hal::cmdline::is_off(cmdline, "smp");
+            }
+            Terminate
+        }
+        DtbObj::Property(_) => StepOver,
+    });
+    off
 }
 
 /// 副核启动。

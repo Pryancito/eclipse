@@ -101,6 +101,15 @@ fn build_identity_ttbr0(tramp_phys: usize) -> u64 {
 /// Start all secondary cores. Called once from the BSP `primary_init`, after the
 /// kernel page table and GIC are initialised.
 pub fn start_secondary_cores() {
+    // `smp=off` is the escape hatch for bringing a suspect machine up
+    // single-core without a rebuild, and it was honoured on exactly one of the
+    // three architectures. `zCore`'s boot log prints "single-core boot forced
+    // (smp=off)" on all three, and this side then started every core it could
+    // find — a switch the kernel says it obeyed and did not.
+    if !crate::common::ipi::smp_enabled() {
+        crate::klog_warn!("[smp] secondary bring-up disabled by `smp=off` — single-core");
+        return;
+    }
     let max_aps = crate::config::MAX_CORE_NUM - 1;
 
     let tramp_phys = virt_to_phys(secondary_trampoline as *const () as usize);
