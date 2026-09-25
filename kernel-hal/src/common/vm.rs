@@ -702,6 +702,16 @@ mod lazy_tlb_restore_tests {
     }
 
     #[test]
+    fn a_bring_up_table_that_is_neither_root_is_dropped_like_any_other() {
+        // aarch64's secondaries reach compiled Rust with the identity table
+        // the trampoline used to keep the PC valid across the MMU-enable step
+        // still in TTBR0_EL1. It belongs to no process and it is not the
+        // kernel's, and nothing had ever dropped it.
+        const TRAMPOLINE: usize = 0x2_3000;
+        assert!(should_restore_kernel_table(TRAMPOLINE, KERNEL));
+    }
+
+    #[test]
     fn the_answer_agrees_with_which_base_register_the_root_belongs_in() {
         // The two questions are asked of the same pair of roots on opposite
         // sides of a thread's life: there is a user table to drop exactly
