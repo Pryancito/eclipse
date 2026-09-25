@@ -49,15 +49,25 @@ pub fn ticks_to_duration(ticks: u64, hz: u64) -> Duration {
         return Duration::ZERO;
     }
     let rem = ticks % hz;
-    let nanos = if hz <= u64::MAX / 1_000_000_000 {
-        rem * 1_000_000_000 / hz
-    } else {
-        // Above ~18 GHz the multiply would overflow, and a counter that fast
-        // cannot be read to nanosecond precision anyway. Scale the rate down
-        // instead of the answer.
-        rem / (hz / 1_000_000_000)
-    };
-    Duration::new(ticks / hz, nanos as u32)
+    // `rem < hz`, so the exact sub-second part is `rem * 1e9 / hz` and it is
+    // always below 1e9 — but only if the multiply is done wide enough to hold
+    // it. In a `u64` it overflows the moment `hz` passes `u64::MAX / 1e9`,
+    // about 18.4 GHz, so this used to scale the *rate* down instead
+    // (`rem / (hz / 1e9)`) and divide by a truncated one.
+    //
+    // That is not a rounding error. The truncated divisor is smaller than the
+    // real one by up to 1e9 in `hz`, so the answer runs high by up to 5.6%,
+    // and a sub-second part that runs high crosses 1e9: at `rem = hz - 1`,
+    // `Duration` carries the excess into the seconds. The very next count —
+    // `rem = 0`, a whole second further on — then reads about 55 ms *earlier*.
+    // A monotonic clock that steps backwards once a second is worse than the
+    // overflow this branch was written to avoid.
+    //
+    // 128 bits hold the product for every `hz`: `rem * 1e9 < 2^64 * 2^30`.
+    // x86_64's `TSC_NS_MULT` reached the same conclusion, for the same reason,
+    // and there is no rate left that needs a second case.
+    let nanos = (rem as u128 * 1_000_000_000 / hz as u128) as u32;
+    Duration::new(ticks / hz, nanos)
 }
 
 /// How many ticks of a counter running at `hz` make one period of a `per_sec`
@@ -384,9 +394,9 @@ mod tick_rate_tests {
 
     #[test]
     fn a_rate_too_high_to_express_in_nanoseconds_is_still_monotone() {
-        // Above ~18 GHz the remainder's multiply would overflow. No counter
-        // runs that fast, but the function is the one three architectures
-        // share and it must not wrap for any of them.
+        // Above ~18 GHz the remainder's multiply would overflow a u64. No
+        // counter runs that fast, but the function is the one three
+        // architectures share and it must not wrap for any of them.
         let hz = 40_000_000_000u64;
         // One nanosecond is 40 counts at this rate, and the fraction still has
         // to be worth reading: a branch that gave up and answered whole
@@ -394,6 +404,57 @@ mod tick_rate_tests {
         assert_eq!(ticks_to_duration(hz + 40, hz), Duration::new(1, 1));
         assert_eq!(ticks_to_duration(hz + 40_000, hz), Duration::new(1, 1_000));
         assert!(ticks_to_duration(hz * 2, hz) > ticks_to_duration(hz + 40, hz));
+    }
+
+    #[test]
+    fn the_sub_second_part_never_reaches_a_whole_second() {
+        // The count just short of a second is where a sub-second part that
+        // runs high spills over: `Duration` carries the excess into the
+        // seconds, and the next count — one whole second further on — reads
+        // *earlier*. The clock steps backwards, once per second, forever.
+        //
+        // 40 GHz exactly is the one rate where dividing by a rate truncated to
+        // whole gigahertz is exact, which is why the test above did not see
+        // this. Every other rate over the threshold has a remainder.
+        for hz in [
+            u64::MAX / 1_000_000_000 + 1, // the first rate past the threshold
+            20_000_000_001,
+            37_123_456_789,
+            u64::MAX / 2,
+            u64::MAX,
+        ] {
+            let last = ticks_to_duration(hz - 1, hz);
+            assert!(
+                last < Duration::from_secs(1),
+                "at {} Hz the count before the first second reads {:?}",
+                hz,
+                last
+            );
+            assert_eq!(ticks_to_duration(hz, hz), Duration::from_secs(1));
+            assert!(
+                ticks_to_duration(hz, hz) > last,
+                "the clock went backwards across the second at {} Hz",
+                hz
+            );
+        }
+    }
+
+    #[test]
+    fn the_sub_second_part_is_the_exact_fraction_at_any_rate() {
+        // Not just below a second: the *right* value. The rate-scaling
+        // shortcut answered 5.6% high at the top of the range, which is 55 ms
+        // on a reading that is supposed to be a nanosecond-resolution clock.
+        let hz = 20_000_000_001u64;
+        // Half a second's worth of counts is half a second.
+        assert_eq!(ticks_to_duration(hz / 2, hz).subsec_nanos(), 499_999_999);
+        // And a tenth.
+        let tenth = ticks_to_duration(hz / 10, hz).subsec_nanos();
+        assert!(
+            (99_999_999..=100_000_000).contains(&tenth),
+            "a tenth of a second at {} Hz read as {} ns",
+            hz,
+            tenth
+        );
     }
 }
 
