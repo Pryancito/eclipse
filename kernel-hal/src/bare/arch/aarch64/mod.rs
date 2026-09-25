@@ -70,13 +70,33 @@ pub fn primary_init() {
 pub fn secondary_init() {
     // CPACR_EL1/CNTKCTL_EL1 are set by the SMP trampoline, before any compiled
     // Rust runs on this core -- see `smp::TransRegs`.
-    // Enable this core's GIC CPU interface so it can receive SGIs/PPIs.
-    unsafe {
-        let gicc = phys_to_virt(KCONFIG.gic_base + 0x1_0000);
-        core::ptr::write_volatile(gicc as *mut u32, 1); // GICC_CTLR = 1 (enable)
-        core::ptr::write_volatile((gicc + 0x4) as *mut u32, 0xff); // GICC_PMR = 0xff
-    }
-    // Re-enable interrupts on this AP; GIC SGI are always-on.
+    //
+    // Bring up this core's half of the GIC. This used to be two writes done
+    // by hand here -- GICC_CTLR and GICC_PMR, the CPU interface -- and it
+    // stopped there, with the comment "GIC SGI are always-on". They are not.
+    //
+    // Interrupt ids 0..32 are private to a core and their distributor
+    // registers are **banked per CPU interface**: `GICD_ISENABLER0` is one
+    // address and one mapping, but the copy an access reaches is the copy
+    // belonging to whichever core issued it. `init_early` enabled the timer
+    // PPI (30) and the shootdown SGI (0) while running on the boot core, so
+    // it enabled them for the boot core, and every core that came up
+    // afterwards had its own bank at reset: nothing enabled.
+    //
+    // A core in that state is not dead, which is why this survived. It takes
+    // the SGI's effect on nothing and the PPI's on nothing:
+    //
+    //  * no timer PPI is no 250 Hz scheduler tick, so the core runs whatever
+    //    task it is handed until that task yields, and never preempts;
+    //  * no IPI SGI is no TLB-shootdown acknowledgement, and the initiator's
+    //    wait for it has no timeout. It is also no reschedule kick, so work
+    //    placed on this core waits for a tick that does not come either.
+    //
+    // `init_hart` is the same call riscv makes here for its PLIC context, for
+    // the same reason, and it now also does the two CPU-interface writes, so
+    // there is one description of what a core needs instead of two.
+    crate::drivers::primary_irq().init_hart();
+    // Re-enable interrupts on this AP.
     interrupt::intr_on();
     smp::ap_signal_online();
 }
