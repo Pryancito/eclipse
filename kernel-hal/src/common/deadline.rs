@@ -28,6 +28,53 @@ use core::time::Duration;
 /// per-CPU fast path compares against to skip the heap lock entirely.
 pub const NO_DEADLINE: u64 = u64::MAX;
 
+/// The time a counter running at `hz` needs to advance `ticks`.
+///
+/// Seconds first and the remainder second, because the obvious spelling
+/// (`ticks * 1_000_000_000 / hz`) overflows a `u64` after about 18 seconds of
+/// a 1 GHz counter. `ticks % hz` is smaller than `hz`, so the remainder's
+/// multiply is safe for any rate a real counter has.
+///
+/// The spelling this replaces dodged the overflow by rounding the rate down to
+/// whole megahertz first, and that is where the precision went: a K210's
+/// 7.8 MHz became 7, so every timestamp the kernel took ran **10% fast**, and
+/// a board with a timebase under 1 MHz — a 32768 Hz one, say — rounded to zero
+/// and divided by it inside the clock read.
+///
+/// A rate of zero still has no answer here, and a zero-length duration is the
+/// one that does least damage: it reads as "no time has passed", where the
+/// division would take the machine down inside the timer path.
+pub fn ticks_to_duration(ticks: u64, hz: u64) -> Duration {
+    if hz == 0 {
+        return Duration::ZERO;
+    }
+    let rem = ticks % hz;
+    let nanos = if hz <= u64::MAX / 1_000_000_000 {
+        rem * 1_000_000_000 / hz
+    } else {
+        // Above ~18 GHz the multiply would overflow, and a counter that fast
+        // cannot be read to nanosecond precision anyway. Scale the rate down
+        // instead of the answer.
+        rem / (hz / 1_000_000_000)
+    };
+    Duration::new(ticks / hz, nanos as u32)
+}
+
+/// How many ticks of a counter running at `hz` make one period of a `per_sec`
+/// hertz tick.
+///
+/// Never zero. A period of zero ticks does not mean "no tick", it means the
+/// timer is already due the instant it is armed — an interrupt that re-arms
+/// itself as fast as the CPU can take it, with no cycles left over for the
+/// thing the tick was supposed to schedule. That is what a timebase rounded
+/// down to zero megahertz used to produce.
+pub fn ticks_per_period(hz: u64, per_sec: u64) -> u64 {
+    if per_sec == 0 {
+        return hz.max(1);
+    }
+    (hz / per_sec).max(1)
+}
+
 /// A `Duration` as whole nanoseconds, saturating.
 ///
 /// The saturation lands on [`NO_DEADLINE`], so a deadline further out than a
@@ -227,6 +274,126 @@ impl TimerHeap {
             ready.push(self.events.pop().unwrap().callback);
         }
         ready
+    }
+}
+
+/// The counter-to-clock conversion was written once per architecture and only
+/// x86_64's had been fixed, in a comment that lists what the other two still
+/// did: a `count * 1_000_000_000` that overflows, and a rate rounded down to
+/// whole megahertz. These pin the rates real boards actually report.
+#[cfg(test)]
+mod tick_rate_tests {
+    use super::*;
+
+    /// QEMU `virt`, riscv64.
+    const QEMU_RISCV: u64 = 10_000_000;
+    /// QEMU `virt`, aarch64 — the generic timer's CNTFRQ.
+    const QEMU_ARM: u64 = 62_500_000;
+    /// Kendryte K210: 7.8 MHz, which is not a whole number of megahertz.
+    const K210: u64 = 7_800_000;
+    /// A timebase below one megahertz, which is what rounding to megahertz
+    /// turned into zero.
+    const RTC_32K: u64 = 32_768;
+
+    #[test]
+    fn a_counter_is_read_exactly_at_the_rates_boards_report() {
+        assert_eq!(ticks_to_duration(QEMU_RISCV, QEMU_RISCV), Duration::from_secs(1));
+        assert_eq!(ticks_to_duration(QEMU_ARM, QEMU_ARM), Duration::from_secs(1));
+        assert_eq!(ticks_to_duration(K210, K210), Duration::from_secs(1));
+        assert_eq!(ticks_to_duration(RTC_32K, RTC_32K), Duration::from_secs(1));
+        assert_eq!(
+            ticks_to_duration(QEMU_RISCV / 1000, QEMU_RISCV),
+            Duration::from_millis(1)
+        );
+    }
+
+    #[test]
+    fn a_rate_that_is_not_a_whole_number_of_megahertz_keeps_its_precision() {
+        // Rounding 7.8 MHz down to 7 is how the previous spelling read the
+        // K210's counter, and 7.8/7 is 11% — every timestamp the kernel took
+        // on that board ran fast by a ninth.
+        let one_second = ticks_to_duration(K210, K210);
+        let as_if_rounded = ticks_to_duration(K210, 7_000_000);
+        assert_eq!(one_second, Duration::from_secs(1));
+        assert!(
+            as_if_rounded > Duration::from_millis(1100),
+            "the rounded rate is meant to be visibly wrong here: {:?}",
+            as_if_rounded
+        );
+    }
+
+    #[test]
+    fn a_rate_below_a_megahertz_still_tells_the_time() {
+        // Rounded to megahertz this rate is zero, and zero is what the clock
+        // read divided by.
+        assert_eq!(ticks_to_duration(RTC_32K * 5, RTC_32K), Duration::from_secs(5));
+        assert_eq!(ticks_to_duration(RTC_32K / 2, RTC_32K), Duration::from_millis(500));
+    }
+
+    #[test]
+    fn the_clock_does_not_wrap_five_minutes_into_the_boot() {
+        // `count * 1_000_000_000` overflows a u64 at 18_446_744_073 counts.
+        // At QEMU's 62.5 MHz that is 295 seconds, and the old spelling turned
+        // the next count after it into a reading in the past.
+        let overflows_at = u64::MAX / 1_000_000_000;
+        let before = ticks_to_duration(overflows_at, QEMU_ARM);
+        let after = ticks_to_duration(overflows_at + 1, QEMU_ARM);
+        assert!(
+            after > before,
+            "the monotonic clock went backwards at {} counts: {:?} then {:?}",
+            overflows_at,
+            before,
+            after
+        );
+        assert_eq!(before.as_secs(), 295);
+    }
+
+    #[test]
+    fn the_clock_still_counts_after_a_century() {
+        // A day, a year and a century at QEMU's aarch64 rate, to say the
+        // arithmetic has no second cliff further out.
+        for secs in [86_400u64, 31_536_000, 3_153_600_000] {
+            assert_eq!(
+                ticks_to_duration(secs * QEMU_ARM, QEMU_ARM),
+                Duration::from_secs(secs)
+            );
+        }
+    }
+
+    #[test]
+    fn a_counter_that_reports_no_rate_does_not_divide_by_it() {
+        // Firmware that leaves CNTFRQ_EL0 at zero, or a device tree with no
+        // `timebase-frequency`: the answer is wrong either way, and the one
+        // that does not panic inside the clock read is the one to give.
+        assert_eq!(ticks_to_duration(12_345, 0), Duration::ZERO);
+    }
+
+    #[test]
+    fn a_tick_period_is_never_zero_counts() {
+        assert_eq!(ticks_per_period(QEMU_RISCV, 250), 40_000);
+        assert_eq!(ticks_per_period(QEMU_ARM, 250), 250_000);
+        assert_eq!(
+            ticks_per_period(0, 250),
+            1,
+            "a period of zero counts is a timer already due when it is armed, \
+             which re-arms itself as fast as the CPU can take it"
+        );
+        assert_eq!(ticks_per_period(100, 250), 1, "a rate slower than the tick");
+        assert_eq!(ticks_per_period(QEMU_ARM, 0), QEMU_ARM);
+    }
+
+    #[test]
+    fn a_rate_too_high_to_express_in_nanoseconds_is_still_monotone() {
+        // Above ~18 GHz the remainder's multiply would overflow. No counter
+        // runs that fast, but the function is the one three architectures
+        // share and it must not wrap for any of them.
+        let hz = 40_000_000_000u64;
+        // One nanosecond is 40 counts at this rate, and the fraction still has
+        // to be worth reading: a branch that gave up and answered whole
+        // seconds would make every sub-second deadline fire at the second.
+        assert_eq!(ticks_to_duration(hz + 40, hz), Duration::new(1, 1));
+        assert_eq!(ticks_to_duration(hz + 40_000, hz), Duration::new(1, 1_000));
+        assert!(ticks_to_duration(hz * 2, hz) > ticks_to_duration(hz + 40, hz));
     }
 }
 

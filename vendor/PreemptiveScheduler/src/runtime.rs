@@ -1202,6 +1202,42 @@ pub(crate) fn run_executor(executor_addr: usize) {
     unreachable!();
 }
 
+/// Whether a stack pointer sitting on the executor stack based at `base` is in
+/// trouble: less than `low_water` bytes of usable depth left, or already out
+/// of the usable region and into one of its guards.
+///
+/// One function because the question was answered three times and the answers
+/// had drifted. [`classify_stack_ptr`] counts `sp == base` as inside the stack;
+/// [`check_current_executor_stack_proximity`] treats it as danger and names the
+/// bottom and top guards; and [`irq_should_skip_heavy_work`] — the only one of
+/// the three that *prevents* anything rather than reporting it — asked
+/// `sp > base && sp < base + STACK_SIZE && sp - base < threshold`, which is
+/// none of the guards and not the base edge either. So the narrowest answer
+/// was the one deciding whether to dispatch another `Box<dyn Fn>` on a stack
+/// that had already left its usable range.
+///
+/// Layout: `[bottom guard GUARD_SIZE][usable STACK_SIZE][top guard TOP_GUARD_SIZE]`.
+pub(crate) fn stack_in_danger(sp: usize, base: usize, low_water: usize) -> bool {
+    use crate::{GUARD_SIZE, STACK_SIZE, TOP_GUARD_SIZE};
+    if sp < base {
+        // Below the usable base. Inside the bottom guard the stack has already
+        // escaped: a large `sub rsp` can step over the unmapped guard pages
+        // without touching one, so no #PF fires and the next write lands in
+        // the neighbour's heap. Further down than the guard is somebody else's
+        // memory and not this stack's business.
+        return sp >= base.saturating_sub(GUARD_SIZE);
+    }
+    let top = base.saturating_add(STACK_SIZE);
+    if sp >= top {
+        // In the top guard, i.e. the executor above is growing down into it.
+        return sp < top.saturating_add(TOP_GUARD_SIZE);
+    }
+    // Inside the usable stack. `sp - base` is what is left, and `sp == base`
+    // means nothing is: the `>` this used to be excluded the single most
+    // dangerous value the pointer can hold.
+    sp - base < low_water
+}
+
 /// [diag] IRQ hook: panic loudly if the currently-running executor's
 /// RSP has grown within `STACK_LOW_WATER_MARK` of its stack base.
 ///
@@ -1227,8 +1263,6 @@ pub fn check_current_executor_stack_proximity(rsp: usize) {
     /// heap clobber. Raised 32→128 KiB after labwc/lunarbar still smashed
     /// past the old mark between 4 ms timer samples (`[rsp0]=0x13446`).
     const STACK_LOW_WATER_MARK: usize = 128 * 1024; // 128 KiB
-                                                    // Keep in sync with `executor::{STACK_SIZE, GUARD_SIZE, TOP_GUARD_SIZE}`.
-    use crate::{GUARD_SIZE, STACK_SIZE, TOP_GUARD_SIZE};
     let cpu = crate::arch::cpu_id() as usize;
     if cpu >= MAX_CORE_NUM {
         return;
@@ -1236,26 +1270,7 @@ pub fn check_current_executor_stack_proximity(rsp: usize) {
     let Some(rt) = GLOBAL_RUNTIME.try_lock_cpu(cpu) else {
         return;
     };
-    let in_danger = |base: usize| -> bool {
-        let stack_top = base + STACK_SIZE;
-        // Past the usable base into the bottom guard / neighbour heap: RSP
-        // already escaped the stack. The hard-guard #PF only fires if the
-        // access touches unmapped pages — a large `sub rsp` can skip them;
-        // catch that here before a later IRQ detonates as rip=0 / [rsp0]=0x13446.
-        if rsp < base && rsp + GUARD_SIZE >= base {
-            return true;
-        }
-        // RSP landed exactly on the base edge (first usable byte / last guard).
-        if rsp == base {
-            return true;
-        }
-        // Past the usable top into the TOP_GUARD (neighbour growing down).
-        if rsp >= stack_top && rsp < stack_top + TOP_GUARD_SIZE {
-            return true;
-        }
-        // Low-water inside the usable region.
-        rsp > base && rsp < stack_top && rsp - base < STACK_LOW_WATER_MARK
-    };
+    let in_danger = |base: usize| -> bool { stack_in_danger(rsp, base, STACK_LOW_WATER_MARK) };
     // Prefer the running executor; if idle, still test whether `rsp` sits on
     // any live executor stack (IRQ nesting after yield left current=None).
     let hit: Option<(usize, usize, usize)> = if let Some(ex) = rt.current_executor.as_ref() {
@@ -1310,26 +1325,7 @@ pub fn irq_should_skip_heavy_work() -> bool {
     /// the (soft or hard) guard stays intact. Raised from 64→128 KiB after
     /// labwc bring-up still smashed with the lower threshold.
     const HEAVY_SKIP_REMAINING: usize = 128 * 1024;
-    #[cfg(target_arch = "x86_64")]
-    let rsp: usize = {
-        let mut rsp: usize;
-        // SAFETY: reading RSP only; no memory side effects.
-        unsafe {
-            core::arch::asm!(
-                "mov {}, rsp",
-                out(reg) rsp,
-                options(nostack, nomem, preserves_flags)
-            );
-        }
-        rsp
-    };
-    #[cfg(not(target_arch = "x86_64"))]
-    let rsp: usize = 0;
-    #[cfg(not(target_arch = "x86_64"))]
-    {
-        let _ = rsp;
-        return false;
-    }
+    let sp = crate::arch::stack_pointer();
     let cpu = crate::arch::cpu_id() as usize;
     if cpu >= MAX_CORE_NUM {
         return false;
@@ -1337,11 +1333,7 @@ pub fn irq_should_skip_heavy_work() -> bool {
     let Some(rt) = GLOBAL_RUNTIME.try_lock_cpu(cpu) else {
         return false;
     };
-    /// Same usable size as `executor::STACK_SIZE` (re-export).
-    use crate::STACK_SIZE;
-    let near = |base: usize| -> bool {
-        rsp > base && rsp < base + STACK_SIZE && rsp.saturating_sub(base) < HEAVY_SKIP_REMAINING
-    };
+    let near = |base: usize| -> bool { stack_in_danger(sp, base, HEAVY_SKIP_REMAINING) };
     // Prefer current; if idle (None), still skip heavy work when RSP sits in
     // the low-water zone of any live executor — that was the blind spot behind
     // `no current thread` + rip=0 after labwc smash.
@@ -2568,5 +2560,119 @@ mod cpu_id_bounds_tests {
                 home
             );
         }
+    }
+}
+
+/// The stack-depth question used to have three answers in this file and the
+/// narrowest of them was the one that decides whether another `Box<dyn Fn>`
+/// gets dispatched. These pin the one answer they now share, at every edge
+/// where they used to differ.
+#[cfg(test)]
+mod stack_danger_tests {
+    use super::*;
+    use crate::{GUARD_SIZE, STACK_SIZE, TOP_GUARD_SIZE};
+
+    /// A plausible `stack_base`: page-aligned, high enough that the bottom
+    /// guard does not run off the bottom of the address space.
+    const BASE: usize = 0x8000_0000 + GUARD_SIZE;
+    const TOP: usize = BASE + STACK_SIZE;
+    /// The threshold both callers use today (128 KiB).
+    const LOW: usize = 128 * 1024;
+
+    #[test]
+    fn a_stack_with_room_to_spare_is_not_in_danger() {
+        assert!(!stack_in_danger(TOP - 8, BASE, LOW), "a nearly empty stack");
+        assert!(!stack_in_danger(BASE + STACK_SIZE / 2, BASE, LOW), "half used");
+        assert!(
+            !stack_in_danger(BASE + LOW, BASE, LOW),
+            "exactly the threshold is still enough room: the check is 'less \
+             than', and moving that edge changes when every IRQ hook fires"
+        );
+    }
+
+    #[test]
+    fn one_byte_past_the_low_water_mark_is_danger() {
+        assert!(stack_in_danger(BASE + LOW - 1, BASE, LOW));
+    }
+
+    #[test]
+    fn a_stack_pointer_exactly_on_the_base_has_nothing_left() {
+        assert!(
+            stack_in_danger(BASE, BASE, LOW),
+            "zero bytes remaining is the most dangerous value the pointer can \
+             hold, and the strict `>` this used to be said it was fine"
+        );
+    }
+
+    #[test]
+    fn a_stack_pointer_in_the_bottom_guard_has_already_escaped() {
+        assert!(
+            stack_in_danger(BASE - 1, BASE, LOW),
+            "one byte under the base: a large `sub rsp` steps over the guard \
+             pages without touching one, so no fault says so"
+        );
+        assert!(
+            stack_in_danger(BASE - GUARD_SIZE, BASE, LOW),
+            "the lowest byte of the bottom guard is still this stack's"
+        );
+        assert!(
+            !stack_in_danger(BASE - GUARD_SIZE - 1, BASE, LOW),
+            "below the guard is somebody else's memory, not this stack's news"
+        );
+    }
+
+    #[test]
+    fn a_stack_pointer_in_the_top_guard_is_the_neighbour_coming_down() {
+        assert!(stack_in_danger(TOP, BASE, LOW), "the first byte past usable");
+        assert!(stack_in_danger(TOP + TOP_GUARD_SIZE - 1, BASE, LOW));
+        assert!(
+            !stack_in_danger(TOP + TOP_GUARD_SIZE, BASE, LOW),
+            "past the top guard is another executor's allocation"
+        );
+    }
+
+    #[test]
+    fn whatever_the_reporter_calls_a_guard_the_preventer_refuses() {
+        // `classify_stack_ptr` is the diagnostic side of the same question. It
+        // is the one that was right about the edges all along, so anything it
+        // places in a guard must also stop heavy IRQ work — that gap is what
+        // let a `Box<dyn Fn>` be dispatched on a stack that had already left
+        // its usable range.
+        for sp in [
+            BASE - GUARD_SIZE,
+            BASE - 1,
+            BASE,
+            TOP,
+            TOP + TOP_GUARD_SIZE - 1,
+        ] {
+            let region = classify_stack_ptr(sp, BASE);
+            assert!(region.is_some(), "the reporter disowns {:#x}", sp);
+            assert!(
+                stack_in_danger(sp, BASE, LOW),
+                "the reporter calls {:#x} {:?} and the preventer calls it fine",
+                sp,
+                region.unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn a_pointer_from_another_stack_belongs_to_nobody_here() {
+        // The callers ask this of every live executor in turn, so a pointer
+        // that is not this stack's must answer no — otherwise an unrelated
+        // CPU's deep stack would silence heavy IRQ work everywhere.
+        let far = BASE + 64 * (STACK_SIZE + GUARD_SIZE + TOP_GUARD_SIZE);
+        assert!(!stack_in_danger(far, BASE, LOW));
+        assert!(classify_stack_ptr(far, BASE).is_none());
+    }
+
+    #[test]
+    fn the_threshold_is_what_decides_and_nothing_else() {
+        // Same pointer, two thresholds: the shared predicate has to answer to
+        // its caller's mark, because the panic hook and the IRQ hook are free
+        // to disagree about how much room is enough.
+        let sp = BASE + 64 * 1024;
+        assert!(stack_in_danger(sp, BASE, 128 * 1024));
+        assert!(!stack_in_danger(sp, BASE, 32 * 1024));
     }
 }

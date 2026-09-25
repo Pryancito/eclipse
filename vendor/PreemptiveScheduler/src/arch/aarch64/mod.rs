@@ -14,6 +14,23 @@ extern "C" {
     pub fn executor_entry();
 }
 
+/// This CPU's current stack pointer.
+///
+/// Behind an arch shim because it used to be inline `x86_64` assembly in
+/// `irq_should_skip_heavy_work`, with `return false` for everything else — so
+/// the guard that refuses to dispatch another `Box<dyn Fn>` on a nearly
+/// exhausted coroutine stack simply did not exist on riscv64 and aarch64. The
+/// compiler had been saying so on every build (`unreachable statement`).
+#[inline(always)]
+pub(crate) fn stack_pointer() -> usize {
+    let sp: usize;
+    // SAFETY: reads sp and nothing else.
+    unsafe {
+        core::arch::asm!("mov {}, sp", out(reg) sp, options(nostack, nomem, preserves_flags));
+    }
+    sp
+}
+
 pub(crate) fn cpu_id() -> u8 {
     // Dense logical id in TPIDR_EL1 (not sparse MPIDR Aff0).
     lock::current_cpu_id()

@@ -53,9 +53,11 @@ pub fn primary_init_early() {
         info!("Load kernel cmdline from DTB: {:?}", cmdline);
         CMDLINE.init_once_by(cmdline.into());
     }
-    if let Some(time_freq) = dt.timebase_frequency() {
-        info!("Load CPU clock frequency from DTB: {} Hz", time_freq);
-        super::cpu::CPU_FREQ_MHZ.init_once_by((time_freq / 1_000_000) as u16);
+    // A device tree that reports no timebase, or reports zero, leaves the
+    // default standing: the clock read divides by this number.
+    if let Some(time_freq) = dt.timebase_frequency().filter(|hz| *hz != 0) {
+        info!("Load timebase frequency from DTB: {} Hz", time_freq);
+        super::cpu::TIMEBASE_HZ.init_once_by(time_freq as u64);
     }
     if let Some(initrd_region) = dt.initrd_region() {
         info!("Load initrd regions from DTB: {:#x?}", initrd_region);

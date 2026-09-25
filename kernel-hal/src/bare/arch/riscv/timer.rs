@@ -5,8 +5,10 @@ fn get_cycle() -> u64 {
 }
 
 pub(super) fn timer_set_next() {
-    let cycles =
-        super::cpu::cpu_frequency() as u64 * 1_000_000 / super::super::timer::TICKS_PER_SEC;
+    let cycles = crate::deadline::ticks_per_period(
+        super::cpu::timebase_hz(),
+        super::super::timer::TICKS_PER_SEC,
+    );
     sbi_rt::set_timer(get_cycle() + cycles);
 }
 
@@ -15,5 +17,5 @@ pub(super) fn init() {
 }
 
 pub(crate) fn timer_now() -> Duration {
-    Duration::from_nanos(get_cycle() * 1000 / super::cpu::cpu_frequency() as u64)
+    crate::deadline::ticks_to_duration(get_cycle(), super::cpu::timebase_hz())
 }
