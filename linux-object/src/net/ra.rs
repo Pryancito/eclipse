@@ -60,19 +60,10 @@ type PrefixInfo = ([u8; 16], u8, u8, u32);
 
 /// Inspect a received Ethernet frame and act on an IPv6 Router Advertisement.
 pub fn process_from_frame(frame: &[u8]) {
-    if frame.len() < 14 {
-        return;
-    }
     // Ethernet header, optionally one 802.1Q VLAN tag, then IPv6.
-    let mut l2 = 14usize;
-    let mut et = u16::from_be_bytes([frame[12], frame[13]]);
-    if et == 0x8100 {
-        if frame.len() < 18 {
-            return;
-        }
-        l2 = 18;
-        et = u16::from_be_bytes([frame[16], frame[17]]);
-    }
+    let Some((l2, et)) = crate::net::packet::eth_l2_header_len(frame) else {
+        return;
+    };
     if et != 0x86dd {
         return;
     }
