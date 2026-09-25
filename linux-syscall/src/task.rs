@@ -12,7 +12,9 @@ use kernel_hal::context::{UserContext, UserContextField};
 use linux_object::error::LxResult;
 use linux_object::fs::{FileLike, PidFd};
 use linux_object::process::{
-    wait_child_any_interest, wait_child_interest, WaitInterest, CAP_LAST_CAP, CAP_SETGID,
+    prio_target, wait_child_any_interest, wait_child_interest, Credentials, LinuxProcess,
+    PrioTarget, SchedFacts, SchedRequest, WaitInterest, CAP_LAST_CAP, CAP_SETGID, RLIMIT_NICE,
+    RLIMIT_RTPRIO,
 };
 use linux_object::signal::SigInfo;
 use linux_object::thread::{CurrentThreadExt, RobustList, ThreadExt};
@@ -37,12 +39,6 @@ const P_PIDFD: i32 = 3;
 /// `SCHED_RESET_ON_FORK`: OR-ed into the policy by `sched_setscheduler` /
 /// `sched_setattr`. Accepted but not modelled (we never fork-reset).
 const SCHED_RESET_ON_FORK: usize = 0x4000_0000;
-/// `setpriority`/`getpriority` `which`: operate on a process (by PID).
-const PRIO_PROCESS: usize = 0;
-/// `setpriority`/`getpriority` `which`: operate on a process group.
-const PRIO_PGRP: usize = 1;
-/// `setpriority`/`getpriority` `which`: operate on a user (by UID).
-const PRIO_USER: usize = 2;
 
 /// Linux `struct sched_attr` (the v0 / 48-byte layout) used by
 /// `sched_setattr(2)` / `sched_getattr(2)`.
@@ -1219,12 +1215,17 @@ impl Syscall<'_> {
         if eff == 0 {
             return Err(LxError::EINVAL);
         }
-        if pid == 0 || pid as u64 == self.thread.id() {
-            self.thread.set_affinity(eff).map_err(|_| LxError::EINVAL)?;
-        } else {
-            let thread = self.find_thread_by_tid(pid).ok_or(LxError::ESRCH)?;
-            thread.set_affinity(eff).map_err(|_| LxError::EINVAL)?;
+        let thread = self.sched_target(pid)?;
+        // __sched_setaffinity() asks `check_same_owner()` and falls back to
+        // CAP_SYS_NICE, which is the same question `setpriority` asks.
+        let linux = thread.proc().try_linux().ok_or(LxError::ESRCH)?;
+        if !LinuxProcess::may_set_priority_of(
+            &self.linux_process().credentials(),
+            &linux.credentials(),
+        ) {
+            return Err(LxError::EPERM);
         }
+        thread.set_affinity(eff).map_err(|_| LxError::EINVAL)?;
         Ok(0)
     }
 
@@ -1298,6 +1299,38 @@ impl Syscall<'_> {
         }
     }
 
+    /// `user_check_sched_setscheduler()` for a request whose parameters have
+    /// already been through [`Self::sched_validate`], which is the order
+    /// Linux uses: `EINVAL` for a request that makes no sense, and only then
+    /// `EPERM` for one the caller may not make.
+    fn check_sched_permission(
+        &self,
+        thread: &Arc<Thread>,
+        policy: u8,
+        nice: i8,
+        rt_priority: u8,
+    ) -> LxResult<()> {
+        // A target whose process is tearing down has no credentials to judge.
+        let linux = thread.proc().try_linux().ok_or(LxError::ESRCH)?;
+        let now = SchedFacts {
+            policy: thread.sched_policy(),
+            nice: thread.sched_nice(),
+            rt_priority: thread.sched_rt_priority(),
+            rlimit_nice: linux.rlimit(RLIMIT_NICE, None, false)?.cur,
+            rlimit_rtprio: linux.rlimit(RLIMIT_RTPRIO, None, false)?.cur,
+        };
+        LinuxProcess::may_set_scheduler(
+            &self.linux_process().credentials(),
+            &linux.credentials(),
+            &now,
+            &SchedRequest {
+                policy,
+                nice,
+                rt_priority,
+            },
+        )
+    }
+
     /// `(min, max)` `sched_priority` for `policy`, or `EINVAL` for an unknown one.
     fn rt_priority_bounds(policy: usize) -> Result<(u8, u8), LxError> {
         if policy == SCHED_FIFO as usize || policy == SCHED_RR as usize {
@@ -1335,6 +1368,7 @@ impl Syscall<'_> {
         let thread = self.sched_target(pid)?;
         let (p, rt, nice) =
             Self::sched_validate(base as u8, sched_priority, thread.sched_nice() as i32)?;
+        self.check_sched_permission(&thread, p, nice, rt)?;
         thread.set_sched(p, nice, rt);
         Ok(0)
     }
@@ -1359,6 +1393,7 @@ impl Syscall<'_> {
             sched_priority,
             thread.sched_nice() as i32,
         )?;
+        self.check_sched_permission(&thread, p, nice, rt)?;
         thread.set_sched(p, nice, rt);
         Ok(0)
     }
@@ -1443,6 +1478,7 @@ impl Syscall<'_> {
         let thread = self.sched_target(pid)?;
         let (p, rt, nice) =
             Self::sched_validate(policy as u8, a.sched_priority as i32, a.sched_nice)?;
+        self.check_sched_permission(&thread, p, nice, rt)?;
         thread.set_sched(p, nice, rt);
         Ok(0)
     }
@@ -1477,43 +1513,113 @@ impl Syscall<'_> {
         Ok(0)
     }
 
-    /// `setpriority` sets the nice value of the target selected by `which`/`who`.
+    /// Every live thread of `proc`.
+    fn threads_of(proc: &Arc<Process>) -> Vec<Arc<Thread>> {
+        proc.thread_ids()
+            .into_iter()
+            .filter_map(|id| proc.get_child(id).ok())
+            .filter_map(|obj| obj.downcast_arc::<Thread>().ok())
+            .collect()
+    }
+
+    /// The tasks a `setpriority`/`getpriority` `which`/`who` pair names.
     ///
-    /// Only `PRIO_PROCESS` resolves to a specific task; `PRIO_PGRP` / `PRIO_USER`
-    /// are accepted and applied to the calling thread so `nice(1)` / `renice`
-    /// behave sensibly. `prio` is clamped to the nice range `-20..=19`.
+    /// The `which`/`who` pair is resolved by [`prio_target`]; this only does
+    /// the looking up. An empty set is `ESRCH`, which is what Linux's
+    /// `error = -ESRCH` before the walk amounts to when the walk visits
+    /// nobody.
+    fn priority_targets(&self, which: usize, who: usize) -> LxResult<Vec<Arc<Thread>>> {
+        let target = prio_target(
+            which,
+            who,
+            self.thread.id(),
+            linux_object::process::effective_pgid(self.zircon_process()),
+            self.linux_process().uid(),
+        )?;
+        let targets = match target {
+            // find_task_by_vpid(): a pid that names nothing simply leaves the
+            // set empty, which is the same ESRCH by another road. sched_target
+            // and not find_thread_by_tid, so the caller's own id still short-
+            // circuits to the running thread instead of being searched for.
+            PrioTarget::Thread(tid) => self
+                .sched_target(tid as usize)
+                .ok()
+                .into_iter()
+                .collect::<Vec<_>>(),
+            PrioTarget::Group(pgid) => linux_object::process::all_live_processes()
+                .iter()
+                .filter(|p| linux_object::process::effective_pgid(p) == pgid)
+                .flat_map(Self::threads_of)
+                .collect(),
+            PrioTarget::User(uid) => linux_object::process::all_live_processes()
+                .iter()
+                .filter(|p| p.try_linux().map(|lp| lp.uid()) == Some(uid))
+                .flat_map(Self::threads_of)
+                .collect(),
+        };
+        if targets.is_empty() {
+            return Err(LxError::ESRCH);
+        }
+        Ok(targets)
+    }
+
+    /// `set_one_prio()`: the two gates, then the store.
+    fn renice_one(&self, caller: &Credentials, thread: &Arc<Thread>, nice: i8) -> LxResult<()> {
+        let proc = thread.proc();
+        // A task whose process is already tearing down has no credentials to
+        // judge, and is gone as far as this call is concerned.
+        let linux = proc.try_linux().ok_or(LxError::ESRCH)?;
+        LinuxProcess::set_priority_verdict(
+            caller,
+            &linux.credentials(),
+            thread.sched_nice(),
+            linux.rlimit(RLIMIT_NICE, None, false)?.cur,
+            nice,
+        )?;
+        thread.set_sched(thread.sched_policy(), nice, thread.sched_rt_priority());
+        Ok(())
+    }
+
+    /// `setpriority` sets the nice value of every task `which`/`who` names.
+    ///
+    /// `prio` is clamped to the nice range `-20..=19` before anything else,
+    /// as Linux does. Each task is judged on its own
+    /// ([`LinuxProcess::set_priority_verdict`]) and the verdicts are folded
+    /// together by [`LinuxProcess::fold_priority_verdict`], so a group with
+    /// one member out of reach still renices the rest and still reports the
+    /// failure.
     ///
     /// See [linux man setpriority(2)](https://www.man7.org/linux/man-pages/man2/setpriority.2.html).
     pub fn sys_setpriority(&self, which: usize, who: usize, prio: i32) -> SysResult {
-        if which != PRIO_PROCESS && which != PRIO_PGRP && which != PRIO_USER {
-            return Err(LxError::EINVAL);
-        }
         let nice = prio.clamp(MIN_NICE as i32, MAX_NICE as i32) as i8;
-        let thread = if which == PRIO_PROCESS {
-            self.sched_target(who)?
-        } else {
-            self.thread.inner()
-        };
         info!("setpriority: which={} who={} nice={}", which, who, nice);
-        thread.set_sched(thread.sched_policy(), nice, thread.sched_rt_priority());
+        let caller = self.linux_process().credentials();
+        let targets = self.priority_targets(which, who)?;
+        let mut result: LxResult<()> = Err(LxError::ESRCH);
+        for thread in targets {
+            let one = self.renice_one(&caller, &thread, nice);
+            result = LinuxProcess::fold_priority_verdict(result, one);
+        }
+        result?;
         Ok(0)
     }
 
-    /// `getpriority` returns the nice value of the target selected by
-    /// `which`/`who`, encoded as `20 - nice` so the raw syscall return stays
-    /// non-negative (glibc converts it back to the user-visible nice value).
+    /// `getpriority` returns the nice value of the most favoured task
+    /// `which`/`who` names, encoded as `20 - nice` so the raw syscall return
+    /// stays non-negative (glibc converts it back to the nice value).
+    ///
+    /// "Most favoured" is why it is a maximum: the encoding runs backwards,
+    /// so the largest number is the smallest nice.
     ///
     /// See [linux man getpriority(2)](https://www.man7.org/linux/man-pages/man2/getpriority.2.html).
     pub fn sys_getpriority(&self, which: usize, who: usize) -> SysResult {
-        if which != PRIO_PROCESS && which != PRIO_PGRP && which != PRIO_USER {
-            return Err(LxError::EINVAL);
-        }
-        let thread = if which == PRIO_PROCESS {
-            self.sched_target(who)?
-        } else {
-            self.thread.inner()
-        };
-        Ok((20 - thread.sched_nice() as isize) as usize)
+        let best = self
+            .priority_targets(which, who)?
+            .iter()
+            .map(|t| LinuxProcess::nice_to_rlimit(t.sched_nice()))
+            .max()
+            .ok_or(LxError::ESRCH)?;
+        Ok(best as usize)
     }
 
     /// `set_tid_address` sets the clear_child_tid value for the calling thread to `tidptr`,

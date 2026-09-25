@@ -25,7 +25,10 @@ use rcore_fs::vfs::{FileSystem, FileType, INode, Metadata};
 use zircon_object::{
     object::{KernelObject, KoID, Signal},
     signal::Futex,
-    task::{Job, Process, Status, Thread, ROOT_JOB},
+    task::{
+        Job, Process, Status, Thread, ROOT_JOB, SCHED_BATCH, SCHED_DEADLINE, SCHED_FIFO,
+        SCHED_IDLE, SCHED_NORMAL, SCHED_RR,
+    },
     ZxError, ZxResult,
 };
 
@@ -59,9 +62,7 @@ const ROOT_UID: u32 = 0;
 // The capability numbers this kernel names, from `include/uapi/linux/
 // capability.h`. Only the ones a gate actually asks about are here: a number
 // nobody asks about is a number nobody can get wrong, and is exactly the kind
-// of write-only constant this change exists to remove. `CAP_SYS_NICE` belongs
-// here the day `setpriority`/`sched_setscheduler` ask -- see the note on
-// `capable`.
+// of write-only constant this change exists to remove.
 
 /// `CAP_SETGID`: change group ids, and set the supplementary group list.
 pub const CAP_SETGID: u32 = 6;
@@ -71,6 +72,9 @@ pub const CAP_SETUID: u32 = 7;
 pub const CAP_SYS_ADMIN: u32 = 21;
 /// `CAP_SYS_BOOT`: `reboot(2)` and `kexec_load(2)`.
 pub const CAP_SYS_BOOT: u32 = 22;
+/// `CAP_SYS_NICE`: raise a task's priority, and set the scheduling
+/// parameters or CPU affinity of a task that is not yours.
+pub const CAP_SYS_NICE: u32 = 23;
 /// `CAP_SYS_RESOURCE`: raise a hard resource limit, and reach into another
 /// process's limits.
 pub const CAP_SYS_RESOURCE: u32 = 24;
@@ -1091,6 +1095,96 @@ pub const NR_OPEN: u64 = 1024 * 1024;
 /// 8 MiB, Linux's `_STK_LIM` and the size this kernel gives a user stack.
 pub const USER_STACK_SIZE: u64 = 8 * 1024 * 1024;
 
+/// `setpriority`/`getpriority` `which`: one task, named by pid.
+pub const PRIO_PROCESS: usize = 0;
+/// `setpriority`/`getpriority` `which`: a process group, named by pgid.
+pub const PRIO_PGRP: usize = 1;
+/// `setpriority`/`getpriority` `which`: everything a user is running, named
+/// by uid.
+pub const PRIO_USER: usize = 2;
+
+/// `fair_policy()`: the two policies that share out what is left over.
+/// `SCHED_IDLE` is NOT one of them -- Linux counts it separately, and the
+/// difference is what makes leaving it a privileged step.
+pub fn is_fair_policy(policy: u8) -> bool {
+    policy == SCHED_NORMAL || policy == SCHED_BATCH
+}
+
+/// `rt_policy()`: the two policies that run ahead of everything.
+pub fn is_rt_policy(policy: u8) -> bool {
+    policy == SCHED_FIFO || policy == SCHED_RR
+}
+
+/// What `user_check_sched_setscheduler()` needs to know about the task whose
+/// scheduling is being set. All five belong to the TARGET, limits included:
+/// the budget spent is the one of the task being moved, not of whoever asks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SchedFacts {
+    /// The policy it runs under now.
+    pub policy: u8,
+    /// Its nice value now.
+    pub nice: i8,
+    /// Its real-time priority now.
+    pub rt_priority: u8,
+    /// Its own soft `RLIMIT_NICE`.
+    pub rlimit_nice: u64,
+    /// Its own soft `RLIMIT_RTPRIO`.
+    pub rlimit_rtprio: u64,
+}
+
+/// What a `sched_setscheduler`/`sched_setparam`/`sched_setattr` call is
+/// asking for, once the parameters have been validated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SchedRequest {
+    /// The policy asked for.
+    pub policy: u8,
+    /// The nice value asked for.
+    pub nice: i8,
+    /// The real-time priority asked for.
+    pub rt_priority: u8,
+}
+
+/// What a `setpriority`/`getpriority` `which`/`who` pair names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrioTarget {
+    /// `PRIO_PROCESS`: the one task with this id.
+    Thread(KoID),
+    /// `PRIO_PGRP`: every task of every process in this group.
+    Group(KoID),
+    /// `PRIO_USER`: every task of every process whose REAL uid is this one.
+    User(u32),
+}
+
+/// Resolve a `which`/`who` pair against the caller's own ids.
+///
+/// `who == 0` means "mine" in all three flavours, and each flavour means a
+/// different "mine": this task, this task's process group, the uid this
+/// process runs as. `who != 0` means exactly what it says, and that is the
+/// whole point -- a `who` that is only ever read for `PRIO_PROCESS` turns
+/// `renice -g <otro>` into a renice of the caller, which is indistinguishable
+/// from doing the job right until someone checks.
+///
+/// The third arm carries Linux's trap: it falls back to the caller's REAL
+/// uid (`cred->uid`), not the effective one, so a set-user-ID program asking
+/// `getpriority(PRIO_USER, 0)` asks about the user who ran it.
+pub fn prio_target(
+    which: usize,
+    who: usize,
+    own_tid: KoID,
+    own_pgid: KoID,
+    own_ruid: u32,
+) -> LxResult<PrioTarget> {
+    match which {
+        PRIO_PROCESS if who == 0 => Ok(PrioTarget::Thread(own_tid)),
+        PRIO_PROCESS => Ok(PrioTarget::Thread(who as KoID)),
+        PRIO_PGRP if who == 0 => Ok(PrioTarget::Group(own_pgid)),
+        PRIO_PGRP => Ok(PrioTarget::Group(who as KoID)),
+        PRIO_USER if who == 0 => Ok(PrioTarget::User(own_ruid)),
+        PRIO_USER => Ok(PrioTarget::User(who as u32)),
+        _ => Err(LxError::EINVAL),
+    }
+}
+
 /// A process's sixteen limits, indexed by resource number.
 ///
 /// A newtype and not a bare array because `LinuxProcessInner` derives
@@ -1662,6 +1756,200 @@ impl LinuxProcess {
             return Err(LxError::EPERM);
         }
         Ok(())
+    }
+
+    /// `nice_to_rlimit()`: a nice value (`19..=-20`) as the rlimit-style
+    /// number (`1..=40`) that `RLIMIT_NICE` is written in, and that
+    /// `getpriority` returns so a raw syscall result stays non-negative.
+    ///
+    /// It runs the other way round: a SMALLER nice (a more favourable task)
+    /// is a BIGGER number here.
+    pub fn nice_to_rlimit(nice: i8) -> u64 {
+        (20 - nice as i64) as u64
+    }
+
+    /// `is_nice_reduction()`: whether the target's own `RLIMIT_NICE` budget
+    /// reaches as far down as `nice`.
+    ///
+    /// The budget belongs to the task being reniced, not to whoever asks: it
+    /// says how far up the queue *that* task may go. Its boot value is `0`
+    /// and [`Self::nice_to_rlimit`] never returns less than 1, so with the
+    /// default limits the answer is always no. That is Linux's answer too,
+    /// and it is why lowering a nice value is a privileged act unless
+    /// somebody raised `RLIMIT_NICE` first.
+    pub fn is_nice_reduction(target_rlimit_nice: u64, nice: i8) -> bool {
+        Self::nice_to_rlimit(nice) <= target_rlimit_nice
+    }
+
+    /// `can_nice()`: the target's budget, or the caller's capability.
+    pub fn can_nice(caller: &Credentials, target_rlimit_nice: u64, nice: i8) -> bool {
+        Self::is_nice_reduction(target_rlimit_nice, nice)
+            || has_capability(caller.euid, CAP_SYS_NICE)
+    }
+
+    /// `check_same_owner()`: whether the task is `caller`'s to schedule.
+    ///
+    /// ```c
+    /// match = (uid_eq(cred->euid, pcred->euid) ||
+    ///          uid_eq(cred->euid, pcred->uid));
+    /// ```
+    ///
+    /// One id of the caller's -- the effective one -- against two of the
+    /// target's. Mind the direction: the target's REAL uid counts, so a
+    /// set-user-ID program stays reniceable by the user who started it, and
+    /// a caller who dropped its effective uid loses the tasks it left behind.
+    /// This is a looser test than the one `prlimit64` makes
+    /// ([`Self::may_touch_limits_of`]), which wants every id to match.
+    pub fn is_same_owner(caller: &Credentials, target: &Credentials) -> bool {
+        target.ruid == caller.euid || target.euid == caller.euid
+    }
+
+    /// `set_one_prio_perm()`, which is also the question `sched_setaffinity`
+    /// asks: whether `caller` may touch this task's scheduling at all.
+    ///
+    /// ```c
+    /// if (uid_eq(pcred->uid,  cred->euid) ||
+    ///     uid_eq(pcred->euid, cred->euid))
+    ///         return true;
+    /// if (ns_capable(pcred->user_ns, CAP_SYS_NICE))
+    ///         return true;
+    /// ```
+    ///
+    /// Linux spells the same rule out in two places -- `set_one_prio_perm()`
+    /// and the `check_same_owner()` in `__sched_setaffinity()` -- and they
+    /// are one rule, so it is written once here.
+    pub fn may_set_priority_of(caller: &Credentials, target: &Credentials) -> bool {
+        Self::is_same_owner(caller, target) || has_capability(caller.euid, CAP_SYS_NICE)
+    }
+
+    /// `set_one_prio()`'s two gates, in order: whether the task is yours,
+    /// then how far down you are asking to push it.
+    ///
+    /// ```c
+    /// if (!set_one_prio_perm(p))                           error = -EPERM;
+    /// if (niceval < task_nice(p) && !can_nice(p, niceval))  error = -EACCES;
+    /// ```
+    ///
+    /// The second gate only fires when the nice value goes DOWN: giving CPU
+    /// away is free, taking it back is not. The two errors say different
+    /// things and userspace can tell them apart -- `EPERM` is "not your
+    /// task", `EACCES` is "your task, and you still may not".
+    pub fn set_priority_verdict(
+        caller: &Credentials,
+        target: &Credentials,
+        target_nice: i8,
+        target_rlimit_nice: u64,
+        nice: i8,
+    ) -> LxResult<()> {
+        if !Self::may_set_priority_of(caller, target) {
+            return Err(LxError::EPERM);
+        }
+        if nice < target_nice && !Self::can_nice(caller, target_rlimit_nice, nice) {
+            return Err(LxError::EACCES);
+        }
+        Ok(())
+    }
+
+    /// How `setpriority` folds one target's verdict into the result of a
+    /// call that may name a whole group.
+    ///
+    /// `set_one_prio(p, niceval, error)` takes the running result in and
+    /// hands it back, and the only thing a success does to it is
+    ///
+    /// ```c
+    /// if (error == -ESRCH)
+    ///         error = 0;
+    /// ```
+    ///
+    /// while a failure overwrites it outright. So: a set with one unreachable
+    /// member reports a failure even though every other member was reniced,
+    /// the LAST failure is the one reported, and a success never clears a
+    /// failure already recorded. Starting at `ESRCH` is what makes an empty
+    /// set come out as `ESRCH`.
+    pub fn fold_priority_verdict(so_far: LxResult<()>, one: LxResult<()>) -> LxResult<()> {
+        match one {
+            Err(e) => Err(e),
+            Ok(()) if so_far == Err(LxError::ESRCH) => Ok(()),
+            Ok(()) => so_far,
+        }
+    }
+
+    /// `user_check_sched_setscheduler()`: whether an unprivileged caller may
+    /// have this request, and `EPERM` when only `CAP_SYS_NICE` could.
+    ///
+    /// Linux reads as a list of `goto req_priv`, every one of them a reason
+    /// the request is privileged, with the capability asked once at the
+    /// bottom. [`Self::sched_request_is_unprivileged`] is that list; this is
+    /// the bottom.
+    ///
+    /// `EINVAL` comes first in Linux and comes first here too: the request is
+    /// validated before anyone asks who is making it, so a nonsense priority
+    /// is `EINVAL` even from a caller who would have been refused.
+    pub fn may_set_scheduler(
+        caller: &Credentials,
+        target: &Credentials,
+        now: &SchedFacts,
+        want: &SchedRequest,
+    ) -> LxResult<()> {
+        if Self::sched_request_is_unprivileged(caller, target, now, want)
+            || has_capability(caller.euid, CAP_SYS_NICE)
+        {
+            return Ok(());
+        }
+        Err(LxError::EPERM)
+    }
+
+    /// Every `goto req_priv` of `user_check_sched_setscheduler()`, read the
+    /// other way round: the request needs no privilege when none of them
+    /// fires.
+    ///
+    /// Not modelled: the `sched_reset_on_fork` clause, because this kernel
+    /// accepts that flag and does not keep it, so there is no flag to clear.
+    fn sched_request_is_unprivileged(
+        caller: &Credentials,
+        target: &Credentials,
+        now: &SchedFacts,
+        want: &SchedRequest,
+    ) -> bool {
+        // A fair policy going DOWN the nice scale spends the task's own
+        // RLIMIT_NICE, the same budget `setpriority` spends.
+        if is_fair_policy(want.policy)
+            && want.nice < now.nice
+            && !Self::is_nice_reduction(now.rlimit_nice, want.nice)
+        {
+            return false;
+        }
+        if is_rt_policy(want.policy) {
+            // A zero RLIMIT_RTPRIO means no real time at all, so entering a
+            // real-time policy is privileged outright. Note it only stops a
+            // CHANGE of policy: a task already running real-time may keep its
+            // priority.
+            if want.policy != now.policy && now.rlimit_rtprio == 0 {
+                return false;
+            }
+            // And going up is capped by the budget, which is why a task can
+            // always lower its own real-time priority.
+            if want.rt_priority > now.rt_priority && want.rt_priority as u64 > now.rlimit_rtprio {
+                return false;
+            }
+        }
+        // SCHED_DEADLINE is privileged outright, "safest behavior for now".
+        // Today it never reaches this far: the parameter check refuses it
+        // with EINVAL first, since there is no deadline runqueue to put it on.
+        if want.policy == SCHED_DEADLINE {
+            return false;
+        }
+        // Leaving SCHED_IDLE is a nice reduction of the value the task
+        // already has: idle sits below nice 19, so anything else is a step up
+        // the queue and is paid for out of the same budget.
+        if now.policy == SCHED_IDLE
+            && want.policy != SCHED_IDLE
+            && !Self::is_nice_reduction(now.rlimit_nice, now.nice)
+        {
+            return false;
+        }
+        // And, last, it has to be your task.
+        Self::is_same_owner(caller, target)
     }
 
     /// Get the `File` with given `fd`.
@@ -3118,7 +3406,7 @@ mod interrupt_escalate_tests {
 
 /// This process's effective process-group id: its raw pgid, or its own pid when
 /// the raw value is unset (`0`).
-fn effective_pgid(proc: &Arc<Process>) -> KoID {
+pub fn effective_pgid(proc: &Arc<Process>) -> KoID {
     // try_linux: called while walking all_live_processes() (e.g. send_signal_to_pgrp
     // on Ctrl-C), so `proc` may be tearing down concurrently under SMP churn.
     // Fall back to the pid when the extension can no longer be resolved.
@@ -5334,6 +5622,748 @@ mod rlimit_tests {
         let dropped = creds(ROOT_UID, USER, USER);
         let target = creds(OTHER, OTHER, OTHER);
         assert!(!LinuxProcess::may_touch_limits_of(&dropped, &target));
+    }
+}
+
+#[cfg(test)]
+mod renice_tests {
+    //! `setpriority(2)`/`getpriority(2)`: who a `which`/`who` pair names, and
+    //! who is allowed to move the nice value once it has been named.
+    //!
+    //! Both halves were missing. `who` was read for `PRIO_PROCESS` only, so
+    //! `renice -g` and `renice -u` aimed at whoever called them, and no gate
+    //! asked anything at all, so any task could put itself at nice -20 and
+    //! renice anybody else's.
+
+    use super::*;
+
+    const USER: u32 = 1000;
+    const OTHER: u32 = 1001;
+    /// The nice range Linux allows, `MIN_NICE..=MAX_NICE`.
+    const NICE_RANGE: core::ops::RangeInclusive<i8> = -20..=19;
+
+    fn creds(ruid: u32, euid: u32) -> Credentials {
+        Credentials {
+            ruid,
+            euid,
+            suid: euid,
+            rgid: ruid,
+            egid: euid,
+            sgid: euid,
+            fsuid: euid,
+            fsgid: euid,
+            groups: Vec::new(),
+            umask: 0o022,
+        }
+    }
+
+    // ---- the encoding -----------------------------------------------------
+
+    #[test]
+    fn the_nice_encoding_runs_backwards_so_the_most_favoured_task_is_the_biggest_number() {
+        assert_eq!(LinuxProcess::nice_to_rlimit(19), 1, "the meekest task");
+        assert_eq!(LinuxProcess::nice_to_rlimit(0), 20, "the default");
+        assert_eq!(LinuxProcess::nice_to_rlimit(-20), 40, "the greediest");
+        // Which is why getpriority takes a MAXIMUM over a group: the largest
+        // number is the smallest nice.
+        let group = [5i8, -3, 11];
+        assert_eq!(
+            group.iter().map(|&n| LinuxProcess::nice_to_rlimit(n)).max(),
+            Some(LinuxProcess::nice_to_rlimit(-3)),
+            "the best-off member is the one reported"
+        );
+    }
+
+    #[test]
+    fn every_nice_value_encodes_to_at_least_one() {
+        for nice in NICE_RANGE {
+            assert!(
+                LinuxProcess::nice_to_rlimit(nice) >= 1,
+                "nice {} encodes to 0 or less",
+                nice
+            );
+        }
+    }
+
+    // ---- the budget -------------------------------------------------------
+
+    #[test]
+    fn the_default_nice_budget_of_zero_reaches_no_nice_value_at_all() {
+        // INIT_RLIMITS gives RLIMIT_NICE {0, 0}, and the encoding never goes
+        // below 1, so an unprivileged task cannot lower its own nice by even
+        // one step. This is Linux's behaviour and the whole reason
+        // CAP_SYS_NICE exists.
+        for nice in NICE_RANGE {
+            assert!(
+                !LinuxProcess::is_nice_reduction(0, nice),
+                "budget 0 should reach nothing, but it reached nice {}",
+                nice
+            );
+        }
+    }
+
+    #[test]
+    fn a_budget_reaches_exactly_down_to_nice_twenty_minus_itself() {
+        // Budget 21 == nice_to_rlimit(-1): it reaches -1 and stops there.
+        assert!(LinuxProcess::is_nice_reduction(21, -1));
+        assert!(!LinuxProcess::is_nice_reduction(21, -2));
+        // And the far end: 40 reaches everything.
+        assert!(LinuxProcess::is_nice_reduction(40, -20));
+    }
+
+    #[test]
+    fn raising_the_budget_never_withdraws_a_nice_value_it_already_allowed() {
+        for nice in NICE_RANGE {
+            for budget in 0..=41u64 {
+                if LinuxProcess::is_nice_reduction(budget, nice) {
+                    assert!(
+                        LinuxProcess::is_nice_reduction(budget + 1, nice),
+                        "budget {} allowed nice {} and {} did not",
+                        budget,
+                        nice,
+                        budget + 1
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_capability_reaches_where_no_budget_does() {
+        let root = creds(ROOT_UID, ROOT_UID);
+        let user = creds(USER, USER);
+        assert!(
+            LinuxProcess::can_nice(&root, 0, -20),
+            "root with no budget still reaches the bottom"
+        );
+        assert!(
+            !LinuxProcess::can_nice(&user, 0, -20),
+            "a user with no budget reaches nothing"
+        );
+    }
+
+    #[test]
+    fn the_budget_works_without_the_capability() {
+        let user = creds(USER, USER);
+        assert!(
+            LinuxProcess::can_nice(&user, 40, -20),
+            "a raised RLIMIT_NICE is the unprivileged way down"
+        );
+    }
+
+    #[test]
+    fn it_is_the_callers_effective_uid_that_carries_the_capability() {
+        // A root program that dropped its effective uid has stopped being
+        // privileged, exactly as everywhere else in this kernel.
+        let dropped = creds(ROOT_UID, USER);
+        assert!(!LinuxProcess::can_nice(&dropped, 0, -1));
+    }
+
+    // ---- whose task is it -------------------------------------------------
+
+    #[test]
+    fn a_task_running_as_you_is_yours_to_renice() {
+        let caller = creds(USER, USER);
+        let target = creds(USER, USER);
+        assert!(LinuxProcess::may_set_priority_of(&caller, &target));
+    }
+
+    #[test]
+    fn a_task_that_merely_turned_into_you_is_yours_too() {
+        // target.euid == caller.euid is the second half of set_one_prio_perm.
+        let caller = creds(USER, USER);
+        let target = creds(OTHER, USER);
+        assert!(LinuxProcess::may_set_priority_of(&caller, &target));
+    }
+
+    #[test]
+    fn a_setuid_program_stays_reniceable_by_the_user_who_started_it() {
+        // Its real uid is still yours even though it is running as root: this
+        // is why set_one_prio_perm compares the target's REAL uid and not only
+        // its effective one.
+        let caller = creds(USER, USER);
+        let setuid_root = creds(USER, ROOT_UID);
+        assert!(LinuxProcess::may_set_priority_of(&caller, &setuid_root));
+    }
+
+    #[test]
+    fn a_strangers_task_needs_the_capability() {
+        let caller = creds(USER, USER);
+        let stranger = creds(OTHER, OTHER);
+        assert!(!LinuxProcess::may_set_priority_of(&caller, &stranger));
+        let root = creds(ROOT_UID, ROOT_UID);
+        assert!(LinuxProcess::may_set_priority_of(&root, &stranger));
+    }
+
+    #[test]
+    fn it_is_the_callers_effective_uid_that_is_compared_not_its_real_one() {
+        // A caller that switched to OTHER reaches OTHER's tasks and loses its
+        // own, which is the point of comparing cred->euid.
+        let switched = creds(USER, OTHER);
+        assert!(LinuxProcess::may_set_priority_of(
+            &switched,
+            &creds(OTHER, OTHER)
+        ));
+        assert!(!LinuxProcess::may_set_priority_of(
+            &switched,
+            &creds(USER, USER)
+        ));
+    }
+
+    #[test]
+    fn reniceing_is_a_looser_test_than_touching_limits() {
+        // prlimit64 wants every one of the target's ids to be the caller's
+        // real id; setpriority wants one of two against the effective one. A
+        // target part-way through a set-user-ID dance shows the difference.
+        let caller = creds(USER, USER);
+        let halfway = creds(USER, ROOT_UID);
+        assert!(LinuxProcess::may_set_priority_of(&caller, &halfway));
+        assert!(!LinuxProcess::may_touch_limits_of(&caller, &halfway));
+    }
+
+    // ---- the verdict ------------------------------------------------------
+
+    fn verdict(
+        caller: &Credentials,
+        target: &Credentials,
+        target_nice: i8,
+        budget: u64,
+        nice: i8,
+    ) -> LxResult<()> {
+        LinuxProcess::set_priority_verdict(caller, target, target_nice, budget, nice)
+    }
+
+    #[test]
+    fn pushing_a_task_further_down_the_queue_is_free() {
+        let user = creds(USER, USER);
+        assert_eq!(verdict(&user, &user, 0, 0, 10), Ok(()));
+    }
+
+    #[test]
+    fn standing_still_is_free_too() {
+        // niceval < task_nice(p) is strict: setting the value it already has
+        // never asks for the budget.
+        let user = creds(USER, USER);
+        assert_eq!(verdict(&user, &user, 5, 0, 5), Ok(()));
+    }
+
+    #[test]
+    fn taking_it_back_is_not_free_and_says_eacces() {
+        let user = creds(USER, USER);
+        assert_eq!(verdict(&user, &user, 5, 0, 4), Err(LxError::EACCES));
+    }
+
+    #[test]
+    fn a_task_that_is_not_yours_is_eperm_before_the_budget_is_even_asked() {
+        // Both gates would fire; EPERM is the one Linux reports, because
+        // "that task is not yours" answers the question first.
+        let caller = creds(USER, USER);
+        let stranger = creds(OTHER, OTHER);
+        assert_eq!(verdict(&caller, &stranger, 0, 0, -20), Err(LxError::EPERM));
+    }
+
+    #[test]
+    fn a_stranger_is_eperm_even_when_the_nice_value_goes_up() {
+        // The first gate does not care which way the value moves.
+        let caller = creds(USER, USER);
+        let stranger = creds(OTHER, OTHER);
+        assert_eq!(verdict(&caller, &stranger, 0, 40, 19), Err(LxError::EPERM));
+    }
+
+    #[test]
+    fn the_budget_that_opens_the_gate_is_the_targets_and_not_the_callers() {
+        // can_nice(p, niceval) reads p's RLIMIT_NICE. The caller here has
+        // nothing of its own; the task it is reniceing has room.
+        let user = creds(USER, USER);
+        assert_eq!(verdict(&user, &user, 0, 40, -20), Ok(()));
+    }
+
+    #[test]
+    fn root_may_take_any_task_all_the_way_back_to_minus_twenty() {
+        let root = creds(ROOT_UID, ROOT_UID);
+        let stranger = creds(OTHER, OTHER);
+        assert_eq!(verdict(&root, &stranger, 19, 0, -20), Ok(()));
+    }
+
+    // ---- folding a group's verdicts --------------------------------------
+
+    fn fold_all(members: &[LxResult<()>]) -> LxResult<()> {
+        members
+            .iter()
+            .copied()
+            .fold(Err(LxError::ESRCH), LinuxProcess::fold_priority_verdict)
+    }
+
+    #[test]
+    fn a_set_nobody_could_be_found_in_stays_esrch() {
+        // How a pgid that names no live process comes out as ESRCH: nothing
+        // ever clears the value the walk starts with.
+        assert_eq!(fold_all(&[]), Err(LxError::ESRCH));
+        assert_eq!(
+            fold_all(&[Err(LxError::ESRCH), Err(LxError::ESRCH)]),
+            Err(LxError::ESRCH),
+            "members that vanished mid-walk are no different"
+        );
+    }
+
+    #[test]
+    fn one_success_turns_the_initial_esrch_into_success() {
+        let r = LinuxProcess::fold_priority_verdict(Err(LxError::ESRCH), Ok(()));
+        assert_eq!(r, Ok(()));
+    }
+
+    #[test]
+    fn a_failure_survives_every_later_success() {
+        // The `if (error == -ESRCH) error = 0;` in set_one_prio only clears
+        // the INITIAL value, so a group with one member out of reach reports
+        // the failure however many members went through.
+        let mut r: LxResult<()> = Err(LxError::ESRCH);
+        r = LinuxProcess::fold_priority_verdict(r, Err(LxError::EPERM));
+        r = LinuxProcess::fold_priority_verdict(r, Ok(()));
+        r = LinuxProcess::fold_priority_verdict(r, Ok(()));
+        assert_eq!(r, Err(LxError::EPERM));
+    }
+
+    #[test]
+    fn a_failure_after_a_success_is_reported_too() {
+        let mut r: LxResult<()> = Err(LxError::ESRCH);
+        r = LinuxProcess::fold_priority_verdict(r, Ok(()));
+        assert_eq!(r, Ok(()), "the first member went through");
+        r = LinuxProcess::fold_priority_verdict(r, Err(LxError::EPERM));
+        assert_eq!(r, Err(LxError::EPERM));
+    }
+
+    #[test]
+    fn the_last_failure_is_the_one_reported() {
+        // set_one_prio overwrites `error` outright on a failure, so of two
+        // different failures it is the later one that reaches userspace.
+        let mut r: LxResult<()> = Err(LxError::ESRCH);
+        r = LinuxProcess::fold_priority_verdict(r, Err(LxError::EACCES));
+        r = LinuxProcess::fold_priority_verdict(r, Err(LxError::EPERM));
+        assert_eq!(r, Err(LxError::EPERM));
+    }
+
+    // ---- who the pair names ----------------------------------------------
+
+    const OWN_TID: KoID = 3;
+    const OWN_PGID: KoID = 7;
+
+    #[test]
+    fn zero_means_mine_in_each_of_the_three_flavours() {
+        assert_eq!(
+            prio_target(PRIO_PROCESS, 0, OWN_TID, OWN_PGID, USER),
+            Ok(PrioTarget::Thread(OWN_TID))
+        );
+        assert_eq!(
+            prio_target(PRIO_PGRP, 0, OWN_TID, OWN_PGID, USER),
+            Ok(PrioTarget::Group(OWN_PGID))
+        );
+        assert_eq!(
+            prio_target(PRIO_USER, 0, OWN_TID, OWN_PGID, USER),
+            Ok(PrioTarget::User(USER))
+        );
+    }
+
+    #[test]
+    fn a_named_who_is_the_one_that_gets_used() {
+        // This is the bug: `who` used to be read for PRIO_PROCESS only, so
+        // `renice -g 99` and `renice -u 1001` aimed at the caller instead.
+        assert_eq!(
+            prio_target(PRIO_PROCESS, 42, OWN_TID, OWN_PGID, USER),
+            Ok(PrioTarget::Thread(42))
+        );
+        assert_eq!(
+            prio_target(PRIO_PGRP, 99, OWN_TID, OWN_PGID, USER),
+            Ok(PrioTarget::Group(99)),
+            "a named group is not the caller's group"
+        );
+        assert_eq!(
+            prio_target(PRIO_USER, OTHER as usize, OWN_TID, OWN_PGID, USER),
+            Ok(PrioTarget::User(OTHER)),
+            "a named user is not the caller"
+        );
+    }
+
+    #[test]
+    fn the_three_flavours_do_not_borrow_each_others_ids() {
+        // Three different own-ids, so a flavour reaching for the wrong one
+        // shows up instead of coinciding.
+        for (which, want) in [
+            (PRIO_PROCESS, PrioTarget::Thread(OWN_TID)),
+            (PRIO_PGRP, PrioTarget::Group(OWN_PGID)),
+            (PRIO_USER, PrioTarget::User(USER)),
+        ] {
+            assert_eq!(
+                prio_target(which, 0, OWN_TID, OWN_PGID, USER),
+                Ok(want),
+                "which={} took the wrong id",
+                which
+            );
+        }
+    }
+
+    #[test]
+    fn a_which_that_is_not_one_of_the_three_is_einval() {
+        assert_eq!(
+            prio_target(3, 0, OWN_TID, OWN_PGID, USER),
+            Err(LxError::EINVAL)
+        );
+        assert_eq!(
+            prio_target(usize::MAX, 0, OWN_TID, OWN_PGID, USER),
+            Err(LxError::EINVAL)
+        );
+    }
+}
+
+#[cfg(test)]
+mod sched_permission_tests {
+    //! `user_check_sched_setscheduler()`: who may change a task's scheduling
+    //! policy, its real-time priority, or its nice value through the
+    //! `sched_set*` family.
+    //!
+    //! Nothing asked before this. Any process could put itself on `SCHED_FIFO`
+    //! at priority 99 and keep the machine to itself, and could do it to
+    //! another user's threads too.
+
+    use super::*;
+
+    const USER: u32 = 1000;
+    const OTHER: u32 = 1001;
+
+    fn creds(ruid: u32, euid: u32) -> Credentials {
+        Credentials {
+            ruid,
+            euid,
+            suid: euid,
+            rgid: ruid,
+            egid: euid,
+            sgid: euid,
+            fsuid: euid,
+            fsgid: euid,
+            groups: Vec::new(),
+            umask: 0o022,
+        }
+    }
+
+    /// A task of USER's, on the default policy, with the boot limits: no nice
+    /// budget and no real-time budget at all.
+    fn on_the_default_policy() -> SchedFacts {
+        SchedFacts {
+            policy: SCHED_NORMAL,
+            nice: 0,
+            rt_priority: 0,
+            rlimit_nice: 0,
+            rlimit_rtprio: 0,
+        }
+    }
+
+    fn want(policy: u8, nice: i8, rt_priority: u8) -> SchedRequest {
+        SchedRequest {
+            policy,
+            nice,
+            rt_priority,
+        }
+    }
+
+    /// USER asking about a task of USER's.
+    fn verdict(now: &SchedFacts, want: &SchedRequest) -> LxResult<()> {
+        let user = creds(USER, USER);
+        LinuxProcess::may_set_scheduler(&user, &user, now, want)
+    }
+
+    // ---- the policy classes ----------------------------------------------
+
+    #[test]
+    fn sched_idle_is_not_one_of_the_fair_policies() {
+        // Linux counts it apart, and that is what makes LEAVING it cost
+        // something: idle sits below nice 19, so everything else is a step up.
+        assert!(is_fair_policy(SCHED_NORMAL));
+        assert!(is_fair_policy(SCHED_BATCH));
+        assert!(!is_fair_policy(SCHED_IDLE));
+        assert!(!is_fair_policy(SCHED_FIFO));
+    }
+
+    #[test]
+    fn only_fifo_and_rr_are_real_time() {
+        assert!(is_rt_policy(SCHED_FIFO));
+        assert!(is_rt_policy(SCHED_RR));
+        assert!(!is_rt_policy(SCHED_NORMAL));
+        assert!(!is_rt_policy(SCHED_BATCH));
+        assert!(!is_rt_policy(SCHED_IDLE));
+        assert!(!is_rt_policy(SCHED_DEADLINE));
+    }
+
+    // ---- the fair half ---------------------------------------------------
+
+    #[test]
+    fn asking_for_what_the_task_already_has_needs_nothing() {
+        assert_eq!(
+            verdict(&on_the_default_policy(), &want(SCHED_NORMAL, 0, 0)),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn a_task_may_always_make_itself_meeker() {
+        assert_eq!(
+            verdict(&on_the_default_policy(), &want(SCHED_NORMAL, 19, 0)),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn lowering_a_nice_value_this_way_says_eperm_where_setpriority_says_eacces() {
+        // The same budget, spent through a different syscall, and Linux
+        // reports it differently: `sched_setattr` has one errno for every one
+        // of its reasons.
+        let now = on_the_default_policy();
+        assert_eq!(
+            verdict(&now, &want(SCHED_NORMAL, -1, 0)),
+            Err(LxError::EPERM)
+        );
+        let user = creds(USER, USER);
+        assert_eq!(
+            LinuxProcess::set_priority_verdict(&user, &user, now.nice, now.rlimit_nice, -1),
+            Err(LxError::EACCES),
+            "setpriority's own answer, for the same move"
+        );
+    }
+
+    #[test]
+    fn a_nice_budget_pays_for_the_fair_half() {
+        let generous = SchedFacts {
+            rlimit_nice: LinuxProcess::nice_to_rlimit(-5),
+            ..on_the_default_policy()
+        };
+        assert_eq!(verdict(&generous, &want(SCHED_NORMAL, -5, 0)), Ok(()));
+        assert_eq!(
+            verdict(&generous, &want(SCHED_NORMAL, -6, 0)),
+            Err(LxError::EPERM),
+            "one step past what the budget covers"
+        );
+    }
+
+    // ---- the real-time half ----------------------------------------------
+
+    #[test]
+    fn entering_a_real_time_policy_with_no_budget_is_privileged() {
+        assert_eq!(
+            verdict(&on_the_default_policy(), &want(SCHED_FIFO, 0, 1)),
+            Err(LxError::EPERM),
+            "the lowest real-time priority there is, and still refused"
+        );
+    }
+
+    #[test]
+    fn a_task_already_running_real_time_may_keep_its_priority_without_a_budget() {
+        // The zero-budget rule only stops a CHANGE of policy. A task that is
+        // already on SCHED_FIFO -- put there by root -- can call
+        // sched_setparam with the priority it has.
+        let running = SchedFacts {
+            policy: SCHED_FIFO,
+            rt_priority: 30,
+            ..on_the_default_policy()
+        };
+        assert_eq!(verdict(&running, &want(SCHED_FIFO, 0, 30)), Ok(()));
+    }
+
+    #[test]
+    fn switching_between_the_two_real_time_policies_still_needs_a_budget() {
+        // The zero-budget rule bars a CHANGE of policy, and FIFO to RR is one
+        // even though the priority does not move -- so this is refused where
+        // asking for the very same policy and priority would go through.
+        let running = SchedFacts {
+            policy: SCHED_FIFO,
+            rt_priority: 30,
+            ..on_the_default_policy()
+        };
+        assert_eq!(
+            verdict(&running, &want(SCHED_RR, 0, 30)),
+            Err(LxError::EPERM)
+        );
+        assert_eq!(
+            verdict(&running, &want(SCHED_FIFO, 0, 30)),
+            Ok(()),
+            "staying put is the case this one is being told apart from"
+        );
+    }
+
+    #[test]
+    fn a_real_time_task_may_always_give_priority_back() {
+        let running = SchedFacts {
+            policy: SCHED_FIFO,
+            rt_priority: 50,
+            ..on_the_default_policy()
+        };
+        assert_eq!(verdict(&running, &want(SCHED_FIFO, 0, 1)), Ok(()));
+    }
+
+    #[test]
+    fn raising_a_real_time_priority_is_capped_by_the_budget() {
+        let running = SchedFacts {
+            policy: SCHED_FIFO,
+            rt_priority: 10,
+            rlimit_rtprio: 20,
+            ..on_the_default_policy()
+        };
+        assert_eq!(verdict(&running, &want(SCHED_FIFO, 0, 20)), Ok(()));
+        assert_eq!(
+            verdict(&running, &want(SCHED_FIFO, 0, 21)),
+            Err(LxError::EPERM)
+        );
+    }
+
+    #[test]
+    fn a_real_time_budget_lets_a_task_in_without_the_capability() {
+        let ready = SchedFacts {
+            rlimit_rtprio: 10,
+            ..on_the_default_policy()
+        };
+        assert_eq!(verdict(&ready, &want(SCHED_RR, 0, 10)), Ok(()));
+        assert_eq!(
+            verdict(&ready, &want(SCHED_RR, 0, 11)),
+            Err(LxError::EPERM),
+            "above the budget, even on the way in"
+        );
+    }
+
+    #[test]
+    fn the_nice_value_carried_along_is_not_checked_under_a_real_time_policy() {
+        // fair_policy(policy) is false for FIFO, so the nice clause does not
+        // run; the value is stored and means nothing until the task goes back
+        // to a fair policy. This is Linux's behaviour, not an oversight here.
+        let ready = SchedFacts {
+            rlimit_rtprio: 10,
+            ..on_the_default_policy()
+        };
+        assert_eq!(verdict(&ready, &want(SCHED_FIFO, -20, 10)), Ok(()));
+    }
+
+    // ---- leaving SCHED_IDLE ----------------------------------------------
+
+    #[test]
+    fn staying_in_sched_idle_is_free() {
+        let idle = SchedFacts {
+            policy: SCHED_IDLE,
+            ..on_the_default_policy()
+        };
+        assert_eq!(verdict(&idle, &want(SCHED_IDLE, 0, 0)), Ok(()));
+    }
+
+    #[test]
+    fn leaving_sched_idle_costs_the_nice_value_the_task_already_has() {
+        // Not the nice value asked for: the one it has. Coming off idle is
+        // itself the step up, so the budget has to cover where the task
+        // lands.
+        let idle = SchedFacts {
+            policy: SCHED_IDLE,
+            ..on_the_default_policy()
+        };
+        assert_eq!(
+            verdict(&idle, &want(SCHED_NORMAL, 0, 0)),
+            Err(LxError::EPERM)
+        );
+        let idle_with_budget = SchedFacts {
+            rlimit_nice: LinuxProcess::nice_to_rlimit(0),
+            ..idle
+        };
+        assert_eq!(
+            verdict(&idle_with_budget, &want(SCHED_NORMAL, 0, 0)),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn leaving_sched_idle_is_judged_on_the_nice_it_has_and_not_the_one_asked_for() {
+        // A task parked on SCHED_IDLE at nice -5, asking for SCHED_NORMAL at
+        // nice 19, is asking to be MEEKER -- and is still refused. Coming off
+        // idle lands it at -5 whatever it says, and -5 is what the budget has
+        // to cover.
+        let idle = SchedFacts {
+            policy: SCHED_IDLE,
+            nice: -5,
+            rlimit_nice: LinuxProcess::nice_to_rlimit(19),
+            ..on_the_default_policy()
+        };
+        assert_eq!(
+            verdict(&idle, &want(SCHED_NORMAL, 19, 0)),
+            Err(LxError::EPERM)
+        );
+        let enough = SchedFacts {
+            rlimit_nice: LinuxProcess::nice_to_rlimit(-5),
+            ..idle
+        };
+        assert_eq!(verdict(&enough, &want(SCHED_NORMAL, 19, 0)), Ok(()));
+    }
+
+    // ---- whose task, and the way past ------------------------------------
+
+    #[test]
+    fn another_users_task_is_eperm_however_modest_the_request() {
+        // Same policy, same nice, nothing asked for: it is still not yours.
+        let caller = creds(USER, USER);
+        let stranger = creds(OTHER, OTHER);
+        assert_eq!(
+            LinuxProcess::may_set_scheduler(
+                &caller,
+                &stranger,
+                &on_the_default_policy(),
+                &want(SCHED_NORMAL, 0, 0)
+            ),
+            Err(LxError::EPERM)
+        );
+    }
+
+    #[test]
+    fn a_setuid_program_stays_schedulable_by_the_user_who_started_it() {
+        let caller = creds(USER, USER);
+        let setuid_root = creds(USER, ROOT_UID);
+        assert_eq!(
+            LinuxProcess::may_set_scheduler(
+                &caller,
+                &setuid_root,
+                &on_the_default_policy(),
+                &want(SCHED_NORMAL, 0, 0)
+            ),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn the_capability_is_the_one_way_past_every_one_of_these() {
+        let root = creds(ROOT_UID, ROOT_UID);
+        let stranger = creds(OTHER, OTHER);
+        let idle = SchedFacts {
+            policy: SCHED_IDLE,
+            ..on_the_default_policy()
+        };
+        // Another user's task, coming off idle, straight to the top of the
+        // real-time range, with every budget at zero.
+        assert_eq!(
+            LinuxProcess::may_set_scheduler(&root, &stranger, &idle, &want(SCHED_FIFO, -20, 99)),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn sched_deadline_is_privileged_outright() {
+        // Unreachable through the syscalls today -- the parameter check
+        // refuses it with EINVAL first, there being no deadline runqueue --
+        // but the rule belongs with the others.
+        assert_eq!(
+            verdict(&on_the_default_policy(), &want(SCHED_DEADLINE, 0, 0)),
+            Err(LxError::EPERM)
+        );
+        let root = creds(ROOT_UID, ROOT_UID);
+        assert_eq!(
+            LinuxProcess::may_set_scheduler(
+                &root,
+                &root,
+                &on_the_default_policy(),
+                &want(SCHED_DEADLINE, 0, 0)
+            ),
+            Ok(())
+        );
     }
 }
 
