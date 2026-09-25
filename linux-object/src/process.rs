@@ -65,6 +65,8 @@ const ROOT_UID: u32 = 0;
 
 /// `CAP_SETGID`: change group ids, and set the supplementary group list.
 pub const CAP_SETGID: u32 = 6;
+/// `CAP_SETUID`: change user ids, `setfsuid(2)` included.
+pub const CAP_SETUID: u32 = 7;
 /// `CAP_SYS_ADMIN`: the catch-all -- mount, `sethostname`, and much else.
 pub const CAP_SYS_ADMIN: u32 = 21;
 /// `CAP_SYS_BOOT`: `reboot(2)` and `kexec_load(2)`.
@@ -117,8 +119,36 @@ pub struct Credentials {
     pub rgid: u32,
     pub egid: u32,
     pub sgid: u32,
+    /// The id a FILESYSTEM access is checked against. Linux keeps it apart
+    /// from `euid` on purpose -- `generic_permission`'s own comment says why:
+    /// "We use `fsuid` for this, letting us set arbitrary permissions for
+    /// filesystem access without changing the 'normal' uids which are used
+    /// for other things." Every `set*id` call drags it along, so it equals
+    /// `euid` unless `setfsuid(2)` has moved it on its own.
+    pub fsuid: u32,
+    /// The group half of the same story, and what `in_group_p()` asks.
+    pub fsgid: u32,
     pub groups: Vec<u32>,
     pub umask: u16,
+}
+
+impl Credentials {
+    /// Move the effective uid, and the filesystem uid with it.
+    ///
+    /// The two fields are one decision in Linux -- every `set*id` path ends
+    /// `new->fsuid = new->euid;` -- so writing `euid` on its own is the bug
+    /// this pair exists to make impossible. `setfsuid(2)` is the only caller
+    /// that moves `fsuid` alone, and it says so by name.
+    pub fn set_euid(&mut self, uid: u32) {
+        self.euid = uid;
+        self.fsuid = uid;
+    }
+
+    /// Move the effective gid, and the filesystem gid with it.
+    pub fn set_egid(&mut self, gid: u32) {
+        self.egid = gid;
+        self.fsgid = gid;
+    }
 }
 
 impl Default for Credentials {
@@ -130,6 +160,8 @@ impl Default for Credentials {
             rgid: ROOT_UID,
             egid: ROOT_UID,
             sgid: ROOT_UID,
+            fsuid: ROOT_UID,
+            fsgid: ROOT_UID,
             groups: vec![ROOT_UID],
             umask: 0o022,
         }
@@ -1547,6 +1579,16 @@ impl LinuxProcess {
         self.inner.lock().credentials.sgid
     }
 
+    /// Get the filesystem uid, the id every file access is checked against.
+    pub fn fsuid(&self) -> u32 {
+        self.inner.lock().credentials.fsuid
+    }
+
+    /// Get the filesystem gid.
+    pub fn fsgid(&self) -> u32 {
+        self.inner.lock().credentials.fsgid
+    }
+
     /// Get supplementary groups.
     pub fn groups(&self) -> Vec<u32> {
         self.inner.lock().credentials.groups.clone()
@@ -1631,6 +1673,35 @@ impl LinuxProcess {
         real_arg != NO_ID || (eff_arg != NO_ID && eff_arg != old_real)
     }
 
+    /// `setfsuid(2)`/`setfsgid(2)`: the real, the effective, the saved, or
+    /// **the one already in force**. `__sys_setfsuid`:
+    /// `uid_eq(kuid, old->uid) || uid_eq(kuid, old->euid) ||
+    /// uid_eq(kuid, old->suid) || uid_eq(kuid, old->fsuid)`. The acting id is
+    /// in the set and in none of the other three rules, which is the whole
+    /// point of the call: a program that has already dropped to `nobody` for
+    /// file work can keep doing so after its effective id moves on.
+    fn setfsid_allowed(real: u32, effective: u32, saved: u32, acting: u32, id: u32) -> bool {
+        Self::set_any_allowed(real, effective, saved, id) || id == acting
+    }
+
+    /// Which ids a permission check acts as.
+    ///
+    /// `use_effective` selects the FILESYSTEM ids -- `current_fsuid()` /
+    /// `current_fsgid()`, what `generic_permission` asks on every normal
+    /// path -- and the real ones otherwise, which is `access(2)` asking the
+    /// question as the real user.
+    ///
+    /// Written once because three places used to pick the pair themselves,
+    /// and three places picking it is three places to update the day the
+    /// kernel grows an id they should pick instead. That day was this one.
+    fn acting_fs_ids(creds: &Credentials, use_effective: bool) -> (u32, u32) {
+        if use_effective {
+            (creds.fsuid, creds.fsgid)
+        } else {
+            (creds.ruid, creds.rgid)
+        }
+    }
+
     fn allowed_uid(creds: &Credentials, uid: u32) -> bool {
         Self::set_any_allowed(creds.ruid, creds.euid, creds.suid, uid)
     }
@@ -1644,8 +1715,8 @@ impl LinuxProcess {
     }
 
     /// Whether the credentials belong to group `gid`, the way Linux's
-    /// `in_group_p()` decides it: the ACTING group (fsgid, which is `egid`
-    /// here) plus the supplementary list -- and nothing else.
+    /// `in_group_p()` decides it: the ACTING group (`fsgid`) plus the
+    /// supplementary list -- and nothing else.
     ///
     /// The effective path used to also accept `rgid` (through a helper that
     /// mixed this question up with which gids a caller may switch TO, a
@@ -1656,11 +1727,7 @@ impl LinuxProcess {
     /// normally wider than other bits, so the divergence only ever granted
     /// more than Linux would.
     fn acts_as_group(creds: &Credentials, gid: u32, use_effective: bool) -> bool {
-        let acting = if use_effective {
-            creds.egid
-        } else {
-            creds.rgid
-        };
+        let (_, acting) = Self::acting_fs_ids(creds, use_effective);
         acting == gid || creds.groups.contains(&gid)
     }
 
@@ -1675,11 +1742,7 @@ impl LinuxProcess {
         mode: u16,
         use_effective: bool,
     ) -> u16 {
-        let uid = if use_effective {
-            creds.euid
-        } else {
-            creds.ruid
-        };
+        let (uid, _) = Self::acting_fs_ids(creds, use_effective);
         if uid == ROOT_UID {
             return mode & 0o777;
         }
@@ -1705,11 +1768,7 @@ impl LinuxProcess {
         requested: u16,
         use_effective: bool,
     ) -> LxResult {
-        let selected_uid = if use_effective {
-            creds.euid
-        } else {
-            creds.ruid
-        };
+        let (selected_uid, _) = Self::acting_fs_ids(creds, use_effective);
         if selected_uid == ROOT_UID {
             // CAP_DAC_OVERRIDE semantics: root bypasses permission checks
             // except executing a non-directory with no exec bit set anywhere
@@ -1769,9 +1828,11 @@ impl LinuxProcess {
             return Ok(());
         }
         let creds = self.credentials();
-        if creds.euid == ROOT_UID
-            || creds.euid == dir_metadata.uid as u32
-            || creds.euid == target_metadata.uid as u32
+        // `__check_sticky()` opens with `kuid_t fsuid = current_fsuid();` and
+        // compares that one id against both inodes.
+        if creds.fsuid == ROOT_UID
+            || creds.fsuid == dir_metadata.uid as u32
+            || creds.fsuid == target_metadata.uid as u32
         {
             Ok(())
         } else {
@@ -1802,11 +1863,12 @@ impl LinuxProcess {
         cur_mode: u16,
         mode: u16,
     ) -> LxResult<u16> {
-        if creds.euid != ROOT_UID && creds.euid != owner_uid {
+        // `inode_owner_or_capable()`: `vfsuid_eq_kuid(vfsuid, current_fsuid())`.
+        if creds.fsuid != ROOT_UID && creds.fsuid != owner_uid {
             return Err(LxError::EPERM);
         }
         let mut out = cur_mode & !MODE_PERM_MASK | (mode & MODE_PERM_MASK);
-        if creds.euid != ROOT_UID && !Self::acts_as_group(creds, owner_gid, true) {
+        if creds.fsuid != ROOT_UID && !Self::acts_as_group(creds, owner_gid, true) {
             out &= !MODE_SET_GID;
         }
         Ok(out)
@@ -1828,12 +1890,14 @@ impl LinuxProcess {
     /// Change owner/group following a conservative POSIX-compatible policy.
     pub fn chown_metadata(&self, metadata: &mut Metadata, uid: u32, gid: u32) -> LxResult {
         let creds = self.credentials();
-        let privileged = creds.euid == ROOT_UID;
+        // `chown_ok()`/`chgrp_ok()` (`fs/attr.c`) both open on
+        // `vfsuid_eq_kuid(vfsuid, current_fsuid())`.
+        let privileged = creds.fsuid == ROOT_UID;
         if !privileged {
             if uid != NO_ID && uid != metadata.uid as u32 {
                 return Err(LxError::EPERM);
             }
-            if creds.euid != metadata.uid as u32 {
+            if creds.fsuid != metadata.uid as u32 {
                 return Err(LxError::EPERM);
             }
             // Linux `chgrp_ok`: `in_group_p(gid)` -- the acting gid plus the
@@ -1863,11 +1927,15 @@ impl LinuxProcess {
     ) -> LxResult {
         let creds = self.credentials();
         let mut metadata = inode.metadata()?;
-        metadata.uid = creds.euid as _;
+        // `inode_init_owner()`: `inode_fsuid_set()` / `inode_fsgid_set()`,
+        // which are `current_fsuid()` / `current_fsgid()`. A new file belongs
+        // to the id its creator was acting as, not to the one it kept for
+        // everything else.
+        metadata.uid = creds.fsuid as _;
         metadata.gid = parent_metadata
             .filter(|meta| (meta.mode & MODE_SET_GID) != 0)
             .map(|meta| meta.gid)
-            .unwrap_or(creds.egid as _);
+            .unwrap_or(creds.fsgid as _);
         let mut final_mode = mode & MODE_PERM_MASK;
         if let Some(parent) = parent_metadata {
             if (parent.mode & MODE_SET_GID) != 0 && is_dir {
@@ -2083,6 +2151,57 @@ impl LinuxProcess {
         }
         inner.note_id_change(before);
         Ok(())
+    }
+
+    /// `setfsuid(2)`: move the id file accesses are checked against, on its
+    /// own, and return the id that was in force before the call.
+    ///
+    /// **It cannot fail, and that is the whole difficulty.** `setfsuid`
+    /// returns the OLD id whether or not it changed anything, so its return
+    /// value says nothing about whether it worked; the man page tells a
+    /// program to call `setfsuid(-1)` afterwards and compare. A kernel that
+    /// accepts the id, does nothing and hands back something that looks like
+    /// success is therefore not caught by the caller's error handling --
+    /// there is none to catch it -- and the program goes on touching files
+    /// with the privilege it believes it just put down. That is what this
+    /// used to do.
+    pub fn set_fsuid(&self, uid: u32) -> u32 {
+        let mut inner = self.inner.lock();
+        let c = inner.credentials.clone();
+        // `if (!uid_valid(kuid)) return old_fsuid;` -- `(uid_t)-1` is not a
+        // user id, so `setfsuid(-1)` is the pure query, and an id that is
+        // already in force is `if (!uid_eq(kuid, old->fsuid))` declining to
+        // build new credentials at all. Neither taints the process.
+        if uid == NO_ID || uid == c.fsuid {
+            return c.fsuid;
+        }
+        if Self::setfsid_allowed(c.ruid, c.euid, c.suid, c.fsuid, uid)
+            || has_capability(c.euid, CAP_SETUID)
+        {
+            inner.credentials.fsuid = uid;
+            // `commit_creds()` treats a move of `fsuid` alone exactly like a
+            // `set*id`: `if (!uid_eq(new->fsuid, old->fsuid) || ...)
+            // set_dumpable(task->mm, suid_dumpable);`.
+            inner.sugid = true;
+        }
+        c.fsuid
+    }
+
+    /// `setfsgid(2)`: the group half of [`Self::set_fsuid`], with
+    /// `CAP_SETGID` in place of `CAP_SETUID`.
+    pub fn set_fsgid(&self, gid: u32) -> u32 {
+        let mut inner = self.inner.lock();
+        let c = inner.credentials.clone();
+        if gid == NO_ID || gid == c.fsgid {
+            return c.fsgid;
+        }
+        if Self::setfsid_allowed(c.rgid, c.egid, c.sgid, c.fsgid, gid)
+            || has_capability(c.euid, CAP_SETGID)
+        {
+            inner.credentials.fsgid = gid;
+            inner.sugid = true;
+        }
+        c.fsgid
     }
 
     /// Get parent process.
@@ -2419,6 +2538,12 @@ impl LinuxProcessInner {
             || self.credentials.euid != self.credentials.ruid
             || self.credentials.egid != self.credentials.rgid;
 
+        // `cap_bprm_creds_from_file()` ends with
+        // `new->suid = new->fsuid = new->euid; new->sgid = new->fsgid =
+        // new->egid;`. This path latches its own taint below instead of going
+        // through `note_id_change`, so it asks for the line itself.
+        self.follow_effective_ids();
+
         // `do_execve()` asks the same three questions to decide FreeBSD's
         // `P_SUGID`: `setsugid(p)` when the image granted an id, and
         // `p->p_flag &= ~P_SUGID` only when it did not AND the effective ids
@@ -2442,9 +2567,38 @@ impl LinuxProcessInner {
     /// one that forgets is a program that asks whether it is tainted and is
     /// told no.
     fn note_id_change(&mut self, before: [u32; 6]) {
+        self.follow_effective_ids();
         if self.ids() != before {
             self.sugid = true;
         }
+    }
+
+    /// `new->fsuid = new->euid;` -- the last line of every `set*id` path in
+    /// `kernel/sys.c`, and of `cap_bprm_creds_from_file()` on the exec path.
+    /// Re-applies the effective ids through [`Credentials::set_euid`], the
+    /// one place in this kernel that writes a filesystem id from an
+    /// effective one. At the END of the path, not beside the write, which is
+    /// where Linux puts it: `setreuid(ruid, -1)` names no effective id and
+    /// still brings a wandered filesystem id home.
+    ///
+    /// One deliberate divergence: `kernel/sys.c` opens `__sys_setresuid`
+    /// with a "check for no-op" that returns before touching credentials, so
+    /// a `setresuid(-1, -1, -1)` there leaves a moved filesystem id where it
+    /// is. Here every path reaches this line, so it comes home. The
+    /// direction is the safe one -- it can only put back the id the caller
+    /// is already acting as everywhere else -- and the alternative is a
+    /// second copy of "did this call ask for anything?" in three setters.
+    ///
+    /// Written once for the same reason [`Self::note_id_change`] is: nine
+    /// setters each remembering a line is nine chances to forget one, and the
+    /// one that forgets leaves a process whose file accesses are still
+    /// checked against an id it just gave away. `setfsuid(2)` is the only
+    /// call that moves a filesystem id on its own, and it is the only one
+    /// that does not come through here.
+    fn follow_effective_ids(&mut self) {
+        let (euid, egid) = (self.credentials.euid, self.credentials.egid);
+        self.credentials.set_euid(euid);
+        self.credentials.set_egid(egid);
     }
 
     /// `apply_exec_ids` for an image on an ordinary mount, which is what every
@@ -3961,10 +4115,10 @@ mod exec_reset_tests {
         inner.shm_identifiers.set(9, ident);
         inner.pdeathsig = crate::signal::Signal::SIGTERM as u8;
         inner.credentials.ruid = 1000;
-        inner.credentials.euid = 1000;
+        inner.credentials.set_euid(1000);
         inner.credentials.suid = 1000;
         inner.credentials.rgid = 1000;
-        inner.credentials.egid = 1000;
+        inner.credentials.set_egid(1000);
         inner.credentials.sgid = 1000;
         // Its own group, not root's: `secureexec` asks whether the effective
         // group is one this process already held, and a fixture left in group
@@ -4152,7 +4306,7 @@ mod exec_reset_tests {
     /// environment; whoever owns the id it runs as did not.
     fn a_process_already_setuid_root() -> LinuxProcessInner {
         let mut inner = a_process_about_to_exec();
-        inner.credentials.euid = ROOT_UID;
+        inner.credentials.set_euid(ROOT_UID);
         inner.credentials.suid = ROOT_UID;
         inner
     }
@@ -4177,7 +4331,7 @@ mod exec_reset_tests {
         // set-user-ID one, and a rule that only ever looked at the user half
         // would hand it the caller's environment.
         let mut inner = a_process_about_to_exec();
-        inner.credentials.egid = 0;
+        inner.credentials.set_egid(0);
         inner.credentials.sgid = 0;
         assert!(inner.apply_exec_ids_from_a_normal_mount(0o0755, ROOT_UID, ROOT_UID));
         assert_eq!(inner.credentials.egid, 0);
@@ -4211,7 +4365,7 @@ mod exec_reset_tests {
         // say no, and the exec still performed an id transition that the new
         // image must be hardened against.
         let mut inner = a_process_about_to_exec();
-        inner.credentials.euid = ROOT_UID;
+        inner.credentials.set_euid(ROOT_UID);
         inner.credentials.suid = ROOT_UID;
         assert!(inner.apply_exec_ids_from_a_normal_mount(0o4755, 1000, ROOT_UID));
         assert_eq!(inner.credentials.euid, 1000);
@@ -4250,7 +4404,7 @@ mod exec_reset_tests {
         // in has gained nothing to be hardened against -- it has given
         // something up.
         let mut inner = a_process_about_to_exec();
-        inner.credentials.egid = ROOT_UID;
+        inner.credentials.set_egid(ROOT_UID);
         inner.credentials.sgid = ROOT_UID;
         inner.credentials.groups = vec![1000];
         assert!(!inner.apply_exec_ids_from_a_normal_mount(0o2754, ROOT_UID, 1000));
@@ -4265,7 +4419,7 @@ mod exec_reset_tests {
         // returns to it. Written down because it looks like a mistake and is
         // the rule as Linux states it.
         let mut inner = a_process_about_to_exec();
-        inner.credentials.egid = ROOT_UID;
+        inner.credentials.set_egid(ROOT_UID);
         inner.credentials.sgid = ROOT_UID;
         inner.credentials.groups = vec![ROOT_UID];
         assert!(inner.apply_exec_ids_from_a_normal_mount(0o2754, ROOT_UID, 1000));
@@ -4363,7 +4517,7 @@ mod sugid_tests {
         {
             let mut inner = proc.inner.lock();
             inner.credentials.ruid = 1000;
-            inner.credentials.euid = 1000;
+            inner.credentials.set_euid(1000);
             inner.credentials.suid = 1000;
         }
         assert!(proc.set_uid(ROOT_UID).is_err());
@@ -4444,10 +4598,10 @@ mod sugid_tests {
     fn a_setuid_exec_taints_a_process_that_was_clean() {
         let mut inner = LinuxProcessInner::default();
         inner.credentials.ruid = 1000;
-        inner.credentials.euid = 1000;
+        inner.credentials.set_euid(1000);
         inner.credentials.suid = 1000;
         inner.credentials.rgid = 1000;
-        inner.credentials.egid = 1000;
+        inner.credentials.set_egid(1000);
         inner.credentials.sgid = 1000;
         inner.credentials.groups = vec![1000];
         assert!(!inner.sugid);
@@ -4560,6 +4714,466 @@ mod capability_tests {
 }
 
 #[cfg(test)]
+mod fsid_tests {
+    //! `setfsuid(2)`/`setfsgid(2)`, and the id a file access is really
+    //! checked against.
+    //!
+    //! Linux keeps `fsuid` apart from `euid` on purpose;
+    //! `generic_permission()` says why in its own comment: "We use `fsuid`
+    //! for this, letting us set arbitrary permissions for filesystem access
+    //! without changing the 'normal' uids which are used for other things."
+    //! A file server takes an id from the wire, wears it while it touches the
+    //! file, and puts it back -- without giving up the privileges it needs
+    //! for its own sockets and its own log.
+    //!
+    //! This kernel had no `fsuid` at all. `setfsuid` took the argument,
+    //! ignored it and returned the caller's `euid`, which is **exactly what a
+    //! call that worked looks like**: the syscall cannot fail, so it returns
+    //! the previous id either way and there is no error for the caller to
+    //! check. The server went on reading the file as root, with nothing
+    //! anywhere saying so.
+    //!
+    //! Three parts, then: who may move the id, who drags it along (every
+    //! `set*id` path and `execve`, where a forgotten line is a privilege the
+    //! caller believes it put down), and what actually asks it.
+
+    use super::dup_fd_tests::a_process;
+    use super::*;
+    use rcore_fs::vfs::{FileType, FsError, PollStatus, Timespec};
+
+    const REAL: u32 = 1000;
+    const SAVED: u32 = 1500;
+    const OTHER: u32 = 2000;
+    const SPOOL: u32 = 4242;
+
+    /// The credentials of an ordinary, untainted process.
+    fn creds(ruid: u32, euid: u32, suid: u32) -> Credentials {
+        Credentials {
+            ruid,
+            euid,
+            suid,
+            rgid: ruid,
+            egid: euid,
+            sgid: suid,
+            fsuid: euid,
+            fsgid: euid,
+            groups: Vec::new(),
+            umask: 0o022,
+        }
+    }
+
+    /// A live process wearing those ids.
+    fn process_as(ruid: u32, euid: u32, suid: u32) -> LinuxProcess {
+        let proc = a_process();
+        proc.inner.lock().credentials = creds(ruid, euid, suid);
+        proc
+    }
+
+    fn a_metadata(mode: u16, uid: u32, gid: u32) -> Metadata {
+        Metadata {
+            dev: 1,
+            inode: 7,
+            size: 0,
+            blk_size: 4096,
+            blocks: 0,
+            atime: Timespec { sec: 0, nsec: 0 },
+            mtime: Timespec { sec: 0, nsec: 0 },
+            ctime: Timespec { sec: 0, nsec: 0 },
+            type_: FileType::File,
+            mode,
+            nlinks: 1,
+            uid: uid as _,
+            gid: gid as _,
+            rdev: 0,
+        }
+    }
+
+    /// An inode that remembers who it ended up belonging to.
+    struct Owned(Mutex<Metadata>);
+
+    impl Owned {
+        fn new() -> Arc<Self> {
+            Arc::new(Owned(Mutex::new(a_metadata(0o644, NO_ID, NO_ID))))
+        }
+    }
+
+    impl INode for Owned {
+        fn read_at(&self, _: usize, _: &mut [u8]) -> rcore_fs::vfs::Result<usize> {
+            Err(FsError::NotSupported)
+        }
+        fn write_at(&self, _: usize, _: &[u8]) -> rcore_fs::vfs::Result<usize> {
+            Err(FsError::NotSupported)
+        }
+        fn poll(&self) -> rcore_fs::vfs::Result<PollStatus> {
+            Err(FsError::NotSupported)
+        }
+        fn metadata(&self) -> rcore_fs::vfs::Result<Metadata> {
+            Ok(self.0.lock().clone())
+        }
+        fn set_metadata(&self, metadata: &Metadata) -> rcore_fs::vfs::Result<()> {
+            *self.0.lock() = metadata.clone();
+            Ok(())
+        }
+        fn as_any_ref(&self) -> &dyn core::any::Any {
+            self
+        }
+    }
+
+    // ---- who may move it ---------------------------------------------
+
+    #[test]
+    fn the_id_already_in_force_is_in_the_set_and_in_no_other_rule() {
+        // The one thing that tells `setfsid_allowed` apart from the rule
+        // every other `set*id` call uses. Without it a process whose
+        // filesystem id sits somewhere the rest of its ids never were could
+        // not name that id again -- not even to ask for it back.
+        assert!(
+            LinuxProcess::setfsid_allowed(REAL, REAL, REAL, SPOOL, SPOOL),
+            "the acting id must be nameable"
+        );
+        assert!(
+            !LinuxProcess::set_any_allowed(REAL, REAL, REAL, SPOOL),
+            "and no other rule accepts it, which is why this one exists"
+        );
+    }
+
+    #[test]
+    fn the_three_ordinary_ids_are_in_the_set_too() {
+        for id in [REAL, OTHER, SAVED] {
+            assert!(
+                LinuxProcess::setfsid_allowed(REAL, OTHER, SAVED, REAL, id),
+                "{} is one of the caller's own ids",
+                id
+            );
+        }
+    }
+
+    #[test]
+    fn an_id_the_caller_never_held_is_refused() {
+        assert!(!LinuxProcess::setfsid_allowed(
+            REAL, OTHER, SAVED, REAL, SPOOL
+        ));
+    }
+
+    #[test]
+    fn setfsuid_answers_with_the_id_that_was_in_force_not_the_new_one() {
+        // `old_fsuid` is read before anything is decided and is what every
+        // return path hands back; a program keeps it to put the id back.
+        let proc = process_as(REAL, ROOT_UID, ROOT_UID);
+        assert_eq!(proc.set_fsuid(REAL), ROOT_UID);
+        assert_eq!(proc.fsuid(), REAL);
+        assert_eq!(proc.set_fsuid(ROOT_UID), REAL, "and again on the way back");
+        assert_eq!(proc.fsuid(), ROOT_UID);
+    }
+
+    #[test]
+    fn dropping_to_another_user_for_file_work_leaves_the_other_ids_alone() {
+        // The whole point of the call: still root for everything that is not
+        // a file.
+        let proc = process_as(REAL, ROOT_UID, ROOT_UID);
+        proc.set_fsuid(REAL);
+        assert_eq!(proc.fsuid(), REAL);
+        assert_eq!(proc.euid(), ROOT_UID);
+        assert_eq!(proc.uid(), REAL);
+        assert_eq!(proc.suid(), ROOT_UID);
+    }
+
+    #[test]
+    fn minus_one_is_the_query_the_man_page_tells_you_to_make() {
+        // `if (!uid_valid(kuid)) return old_fsuid;`. Since the call cannot
+        // report an error, `setfsuid(-1)` is how a careful program finds out
+        // whether the previous one took.
+        let proc = process_as(REAL, ROOT_UID, ROOT_UID);
+        proc.set_fsuid(REAL);
+        assert_eq!(proc.set_fsuid(NO_ID), REAL);
+        assert_eq!(proc.fsuid(), REAL, "and it changed nothing");
+    }
+
+    #[test]
+    fn an_id_the_caller_never_held_leaves_the_filesystem_id_where_it_was() {
+        let proc = process_as(REAL, REAL, REAL);
+        assert_eq!(proc.set_fsuid(SPOOL), REAL);
+        assert_eq!(
+            proc.fsuid(),
+            REAL,
+            "refused, and the only sign of it is that the id did not move"
+        );
+    }
+
+    #[test]
+    fn root_may_move_it_anywhere_because_of_cap_setuid() {
+        let proc = process_as(ROOT_UID, ROOT_UID, ROOT_UID);
+        assert_eq!(proc.set_fsuid(SPOOL), ROOT_UID);
+        assert_eq!(proc.fsuid(), SPOOL);
+    }
+
+    #[test]
+    fn the_group_half_runs_the_same_rule_with_cap_setgid() {
+        let privileged = process_as(REAL, ROOT_UID, ROOT_UID);
+        assert_eq!(privileged.set_fsgid(SPOOL), ROOT_UID);
+        assert_eq!(privileged.fsgid(), SPOOL, "root, so the capability decides");
+
+        let user = process_as(REAL, REAL, SAVED);
+        assert_eq!(user.set_fsgid(SPOOL), REAL);
+        assert_eq!(user.fsgid(), REAL, "no capability, and not one of its ids");
+        assert_eq!(user.set_fsgid(SAVED), REAL);
+        assert_eq!(user.fsgid(), SAVED, "the saved gid is in the set");
+    }
+
+    #[test]
+    fn a_move_taints_the_process_and_a_refusal_does_not() {
+        // `commit_creds()` runs the same dumpability check on `fsuid` as on
+        // the other ids, and `abort_creds()` never reaches it.
+        let moved = process_as(REAL, ROOT_UID, ROOT_UID);
+        moved.set_fsuid(REAL);
+        assert!(moved.is_sugid());
+
+        let refused = process_as(REAL, REAL, REAL);
+        refused.set_fsuid(SPOOL);
+        assert!(!refused.is_sugid());
+
+        let noop = process_as(REAL, REAL, REAL);
+        noop.set_fsuid(REAL);
+        assert!(
+            !noop.is_sugid(),
+            "asking for the id already in force builds no credentials at all"
+        );
+    }
+
+    // ---- who drags it along ------------------------------------------
+    //
+    // Every `set*id` path in `kernel/sys.c` ends `new->fsuid = new->euid;`.
+    // A path that forgets it leaves a process that dropped to `nobody` still
+    // reading files as root: the same hole from the other side.
+
+    #[test]
+    fn setuid_drags_the_filesystem_id_along() {
+        let proc = process_as(ROOT_UID, ROOT_UID, ROOT_UID);
+        proc.set_fsuid(SPOOL);
+        proc.set_uid(REAL).unwrap();
+        assert_eq!(proc.fsuid(), REAL);
+    }
+
+    #[test]
+    fn setreuid_drags_it_too() {
+        let proc = process_as(ROOT_UID, ROOT_UID, ROOT_UID);
+        proc.set_fsuid(SPOOL);
+        proc.set_reuid(NO_ID, REAL).unwrap();
+        assert_eq!(proc.fsuid(), REAL);
+    }
+
+    #[test]
+    fn setresuid_drags_it_too() {
+        let proc = process_as(ROOT_UID, ROOT_UID, ROOT_UID);
+        proc.set_fsuid(SPOOL);
+        proc.set_resuid(NO_ID, REAL, NO_ID).unwrap();
+        assert_eq!(proc.fsuid(), REAL);
+    }
+
+    #[test]
+    fn setgid_drags_the_filesystem_group_along() {
+        let proc = process_as(ROOT_UID, ROOT_UID, ROOT_UID);
+        proc.set_fsgid(SPOOL);
+        proc.set_gid(REAL).unwrap();
+        assert_eq!(proc.fsgid(), REAL);
+    }
+
+    #[test]
+    fn setregid_drags_it_too() {
+        let proc = process_as(ROOT_UID, ROOT_UID, ROOT_UID);
+        proc.set_fsgid(SPOOL);
+        proc.set_regid(NO_ID, REAL).unwrap();
+        assert_eq!(proc.fsgid(), REAL);
+    }
+
+    #[test]
+    fn setresgid_drags_it_too() {
+        let proc = process_as(ROOT_UID, ROOT_UID, ROOT_UID);
+        proc.set_fsgid(SPOOL);
+        proc.set_resgid(NO_ID, REAL, NO_ID).unwrap();
+        assert_eq!(proc.fsgid(), REAL);
+    }
+
+    #[test]
+    fn a_switch_that_names_no_effective_id_still_brings_the_pair_in_step() {
+        // `setreuid(ruid, -1)` moves the REAL uid and nothing else, and
+        // `__sys_setreuid` still ends `new->fsuid = new->euid;`. So the line
+        // belongs at the end of the path and not beside the write to `euid`:
+        // a filesystem id that had wandered comes home even though no
+        // effective id was named.
+        let proc = process_as(ROOT_UID, ROOT_UID, ROOT_UID);
+        proc.set_fsuid(SPOOL);
+        proc.set_reuid(REAL, NO_ID).unwrap();
+        assert_eq!(proc.euid(), ROOT_UID, "the effective id did not move");
+        assert_eq!(proc.fsuid(), ROOT_UID, "and the filesystem id came back");
+    }
+
+    #[test]
+    fn an_exec_puts_the_filesystem_id_back_on_the_effective_one() {
+        // `cap_bprm_creds_from_file()`: `new->suid = new->fsuid = new->euid;`
+        // `new->sgid = new->fsgid = new->egid;`. An image inherits the id its
+        // accesses are checked against; it does not inherit a stray one the
+        // caller happened to be wearing.
+        let mut inner = LinuxProcessInner::default();
+        inner.credentials = creds(REAL, REAL, REAL);
+        inner.credentials.fsuid = SPOOL;
+        inner.credentials.fsgid = SPOOL;
+        inner.apply_exec_ids_from_a_normal_mount(0o755, OTHER, OTHER);
+        assert_eq!(inner.credentials.fsuid, REAL);
+        assert_eq!(inner.credentials.fsgid, REAL);
+    }
+
+    #[test]
+    fn a_setuid_image_hands_its_own_id_to_the_filesystem_too() {
+        let mut inner = LinuxProcessInner::default();
+        inner.credentials = creds(REAL, REAL, REAL);
+        inner.apply_exec_ids_from_a_normal_mount(0o4755, ROOT_UID, OTHER);
+        assert_eq!(inner.credentials.euid, ROOT_UID);
+        assert_eq!(inner.credentials.fsuid, ROOT_UID);
+    }
+
+    // ---- what asks it ------------------------------------------------
+
+    #[test]
+    fn a_files_permission_bits_are_weighed_against_the_filesystem_id() {
+        // Root that has dropped its filesystem id gets the OTHER bits of a
+        // file it does not own, exactly like the user it stands in for.
+        // Before this change the same process was still root here: a server
+        // asked to read `/root/.ssh/id_rsa` on behalf of user 1000 read it.
+        let mut root = creds(ROOT_UID, ROOT_UID, ROOT_UID);
+        root.fsuid = REAL;
+        root.fsgid = REAL;
+        assert_eq!(
+            LinuxProcess::access_verdict(&root, OTHER, OTHER, 0o600, false, ACCESS_WRITE, true),
+            Err(LxError::EACCES)
+        );
+        assert_eq!(
+            LinuxProcess::access_verdict(
+                &creds(ROOT_UID, ROOT_UID, ROOT_UID),
+                OTHER,
+                OTHER,
+                0o600,
+                false,
+                ACCESS_WRITE,
+                true
+            ),
+            Ok(()),
+            "and with the id left alone it is still root"
+        );
+    }
+
+    #[test]
+    fn the_owner_bits_go_to_whoever_the_filesystem_id_names() {
+        let mut c = creds(REAL, REAL, REAL);
+        c.fsuid = OTHER;
+        assert_eq!(
+            LinuxProcess::access_verdict(&c, OTHER, SPOOL, 0o600, false, ACCESS_WRITE, true),
+            Ok(()),
+            "the file's owner is the id being acted as"
+        );
+    }
+
+    #[test]
+    fn the_group_bits_follow_the_filesystem_group() {
+        let mut c = creds(REAL, REAL, REAL);
+        c.fsgid = SPOOL;
+        assert_eq!(
+            LinuxProcess::access_verdict(&c, OTHER, SPOOL, 0o060, false, ACCESS_WRITE, true),
+            Ok(())
+        );
+        c.fsgid = REAL;
+        assert_eq!(
+            LinuxProcess::access_verdict(&c, OTHER, SPOOL, 0o060, false, ACCESS_WRITE, true),
+            Err(LxError::EACCES)
+        );
+    }
+
+    #[test]
+    fn access_2_still_asks_the_real_ids_and_not_the_filesystem_ones() {
+        // `access(2)` is the one caller that deliberately asks as the real
+        // user; a wandering filesystem id must not answer for it.
+        let mut c = creds(REAL, ROOT_UID, ROOT_UID);
+        c.fsuid = OTHER;
+        c.fsgid = OTHER;
+        assert_eq!(
+            LinuxProcess::access_verdict(&c, OTHER, OTHER, 0o600, false, ACCESS_WRITE, false),
+            Err(LxError::EACCES),
+            "the real uid owns nothing here"
+        );
+    }
+
+    #[test]
+    fn a_chmod_is_refused_to_a_filesystem_id_that_does_not_own_the_file() {
+        // `inode_owner_or_capable()`: `vfsuid_eq_kuid(vfsuid, current_fsuid())`.
+        let mut root = creds(ROOT_UID, ROOT_UID, ROOT_UID);
+        root.fsuid = REAL;
+        assert_eq!(
+            LinuxProcess::chmod_bits(&root, OTHER, OTHER, 0o644, 0o600),
+            Err(LxError::EPERM)
+        );
+        root.fsuid = OTHER;
+        assert_eq!(
+            LinuxProcess::chmod_bits(&root, OTHER, OTHER, 0o644, 0o600),
+            Ok(0o600),
+            "and allowed once the acting id is the owner"
+        );
+    }
+
+    #[test]
+    fn a_new_file_belongs_to_the_id_its_creator_was_acting_as() {
+        // `inode_init_owner()`: `inode_fsuid_set()` / `inode_fsgid_set()`. A
+        // server that creates a file on a user's behalf must leave it owned
+        // by the user, not by the server.
+        let proc = process_as(ROOT_UID, ROOT_UID, ROOT_UID);
+        proc.set_fsuid(REAL);
+        proc.set_fsgid(SPOOL);
+        let inode: Arc<dyn INode> = Owned::new();
+        proc.initialize_created_metadata(&inode, None, 0o644, false)
+            .unwrap();
+        let meta = inode.metadata().unwrap();
+        assert_eq!(meta.uid as u32, REAL);
+        assert_eq!(meta.gid as u32, SPOOL);
+    }
+
+    #[test]
+    fn a_chown_is_weighed_against_the_filesystem_id() {
+        // `chown_ok()`: `vfsuid_eq_kuid(vfsuid, current_fsuid())`.
+        let proc = process_as(ROOT_UID, ROOT_UID, ROOT_UID);
+        proc.set_fsuid(REAL);
+        let mut meta = a_metadata(0o644, OTHER, OTHER);
+        assert_eq!(
+            proc.chown_metadata(&mut meta, NO_ID, SPOOL),
+            Err(LxError::EPERM),
+            "not root here, and not the owner either"
+        );
+    }
+
+    #[test]
+    fn the_sticky_bit_asks_the_filesystem_id_too() {
+        // `__check_sticky()` opens with `kuid_t fsuid = current_fsuid();`.
+        let dir = a_metadata(0o1777, OTHER, OTHER);
+        let victim = a_metadata(0o644, OTHER, OTHER);
+        let proc = process_as(ROOT_UID, ROOT_UID, ROOT_UID);
+        proc.set_fsuid(REAL);
+        assert_eq!(proc.check_sticky(&dir, &victim), Err(LxError::EPERM));
+        proc.set_fsuid(ROOT_UID);
+        assert_eq!(proc.check_sticky(&dir, &victim), Ok(()));
+    }
+
+    #[test]
+    fn the_pair_cannot_be_moved_one_at_a_time_by_hand() {
+        // `Credentials::set_euid` is the only line in this kernel that writes
+        // a filesystem id from an effective one, so a caller holding bare
+        // credentials cannot separate them by accident.
+        let mut c = creds(REAL, REAL, REAL);
+        c.set_euid(OTHER);
+        assert_eq!(c.fsuid, OTHER);
+        c.set_egid(SPOOL);
+        assert_eq!(c.fsgid, SPOOL);
+    }
+}
+
+#[cfg(test)]
 mod dac_tests {
     //! The discretionary-access decisions of `LinuxProcess`, on pure inputs:
     //! who gets which permission bits, what a `chmod` really lands, and which
@@ -4581,6 +5195,8 @@ mod dac_tests {
             rgid: gid,
             egid: gid,
             sgid: gid,
+            fsuid: uid,
+            fsgid: gid,
             groups: Vec::new(),
             umask: 0o022,
         }
@@ -4621,7 +5237,7 @@ mod dac_tests {
     fn a_dropped_effective_gid_loses_group_access() {
         // rgid is still the file's group, egid is not.
         let mut dropped = user(4242, GROUP);
-        dropped.egid = OTHER_GROUP;
+        dropped.set_egid(OTHER_GROUP);
         dropped.sgid = OTHER_GROUP;
 
         assert!(
@@ -4673,7 +5289,7 @@ mod dac_tests {
         // The override follows the SELECTED uid: a setuid-root program asked
         // about its real ids is not root for `access(2)`.
         let mut setuid_root = user(OWNER, GROUP);
-        setuid_root.euid = ROOT_UID;
+        setuid_root.set_euid(ROOT_UID);
         assert!(may(&setuid_root, 0o000, 0o2, true));
         assert!(!may(&setuid_root, 0o000, 0o2, false));
     }
@@ -4723,7 +5339,7 @@ mod dac_tests {
         assert_eq!(chmod(&owner_outside, 0o644, 0o2755), Ok(0o2755));
         // And, per `in_group_p`, the REAL gid is not.
         let mut owner_real_only = user(OWNER, GROUP);
-        owner_real_only.egid = OTHER_GROUP;
+        owner_real_only.set_egid(OTHER_GROUP);
         owner_real_only.sgid = OTHER_GROUP;
         assert_eq!(chmod(&owner_real_only, 0o644, 0o2755), Ok(0o755));
     }

@@ -297,8 +297,14 @@ mod tick_rate_tests {
 
     #[test]
     fn a_counter_is_read_exactly_at_the_rates_boards_report() {
-        assert_eq!(ticks_to_duration(QEMU_RISCV, QEMU_RISCV), Duration::from_secs(1));
-        assert_eq!(ticks_to_duration(QEMU_ARM, QEMU_ARM), Duration::from_secs(1));
+        assert_eq!(
+            ticks_to_duration(QEMU_RISCV, QEMU_RISCV),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            ticks_to_duration(QEMU_ARM, QEMU_ARM),
+            Duration::from_secs(1)
+        );
         assert_eq!(ticks_to_duration(K210, K210), Duration::from_secs(1));
         assert_eq!(ticks_to_duration(RTC_32K, RTC_32K), Duration::from_secs(1));
         assert_eq!(
@@ -326,8 +332,14 @@ mod tick_rate_tests {
     fn a_rate_below_a_megahertz_still_tells_the_time() {
         // Rounded to megahertz this rate is zero, and zero is what the clock
         // read divided by.
-        assert_eq!(ticks_to_duration(RTC_32K * 5, RTC_32K), Duration::from_secs(5));
-        assert_eq!(ticks_to_duration(RTC_32K / 2, RTC_32K), Duration::from_millis(500));
+        assert_eq!(
+            ticks_to_duration(RTC_32K * 5, RTC_32K),
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            ticks_to_duration(RTC_32K / 2, RTC_32K),
+            Duration::from_millis(500)
+        );
     }
 
     #[test]
