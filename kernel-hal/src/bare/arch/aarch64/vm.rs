@@ -161,8 +161,24 @@ pub fn flush_tlb_all() {
 hal_fn_impl! {
     impl mod crate::hal_fn::vm {
         fn activate_paging(vmtoken: PhysAddr) {
-            let check_if_user = (vmtoken & USER_TABLE_FLAG) != 0;
+            let flagged_user = (vmtoken & USER_TABLE_FLAG) != 0;
             let vmtoken = vmtoken & PHYS_ADDR_MASK;
+            // Which base register this root belongs in is a property of the
+            // root, not of a flag every caller has to remember to set: see
+            // `is_user_table_root`, and the caller that does not set it.
+            let check_if_user = crate::common::vm::is_user_table_root(
+                vmtoken,
+                KERNEL_VMTOKEN.load(Ordering::Acquire),
+                flagged_user,
+            );
+            if check_if_user != flagged_user {
+                crate::klog_warn!(
+                    "[vm] page_table {:#x} activated as {} although the caller said {}",
+                    vmtoken,
+                    if check_if_user { "user" } else { "kernel" },
+                    if flagged_user { "user" } else { "kernel" },
+                );
+            }
             info!("set {} page_table @ {:#x}", if check_if_user { "user" } else { "kernel" }, vmtoken);
             if check_if_user {
                 // Publish BEFORE the hardware switch, for the reason spelled
