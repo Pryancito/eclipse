@@ -96,6 +96,23 @@ pub const L_ECHONL: u32 = 0x0040;
 /// `c_lflag` bit: the line-kill character rubs the line out instead.
 pub const L_ECHOKE: u32 = 0x0800;
 
+/// `c_lflag` bit: the extended (implementation-defined) input processing --
+/// `VLNEXT`, `VREPRINT`, `VWERASE`, `VDISCARD`, and `IUCLC` -- is active.
+pub const L_IEXTEN: u32 = 0x8000;
+
+/// `c_iflag` bit: strip the eighth bit off every input byte.
+pub const I_ISTRIP: u32 = 0x0020;
+/// `c_iflag` bit: a newline arriving on input goes into the queue as a
+/// carriage return.
+pub const I_INLCR: u32 = 0x0040;
+/// `c_iflag` bit: a carriage return arriving on input is dropped outright.
+pub const I_IGNCR: u32 = 0x0080;
+/// `c_iflag` bit: a carriage return arriving on input goes into the queue as a
+/// newline. This is the one a cooked terminal has on, which is what makes the
+/// Enter key (which sends CR) end a line.
+pub const I_ICRNL: u32 = 0x0100;
+/// `c_iflag` bit: map upper case to lower on input. Only with `IEXTEN`.
+pub const I_IUCLC: u32 = 0x0200;
 /// `c_iflag` bit: input is UTF-8, so line editing works on characters.
 pub const I_IUTF8: u32 = 0x4000;
 
@@ -483,6 +500,62 @@ impl Termios {
                 Output::one(c)
             }
         }
+    }
+
+    /// What a byte becomes on its way **in**, before anything else looks at
+    /// it: line editing, the signal characters, flow control, the lot.
+    ///
+    /// `None` is the byte that never enters the queue at all (`IGNCR`).
+    ///
+    /// Follows the head of `n_tty_receive_char_special` (`drivers/tty/
+    /// n_tty.c`), whose order is the whole point:
+    ///
+    /// ```c
+    /// if (I_ISTRIP(tty))
+    ///         c &= 0x7f;
+    /// if (I_IUCLC(tty) && L_IEXTEN(tty))
+    ///         c = tolower(c);
+    /// if (c == '\r') {
+    ///         if (I_IGNCR(tty))  return;
+    ///         if (I_ICRNL(tty))  c = '\n';
+    /// } else if (c == '\n' && I_INLCR(tty))
+    ///         c = '\r';
+    /// ```
+    ///
+    /// `ISTRIP` comes first because it decides what the byte *is*: `0x8d` is
+    /// not a carriage return, and `0x8d` with the eighth bit taken off is.
+    /// Doing the CR/NL rules first -- which is what the three line
+    /// disciplines did, each with its own copy of that block and no `ISTRIP`
+    /// at all -- means a 7-bit terminal's Enter key never ends a line.
+    ///
+    /// `IUCLC` is the input twin of `OLCUC` and, unlike it, is gated on
+    /// `IEXTEN`: it is one of the implementation-defined behaviours that flag
+    /// turns off. Case folding is ASCII-only, as `tolower()` is in the kernel.
+    ///
+    /// Not here, and not anywhere, on purpose: `IGNBRK`, `BRKINT`, `IGNPAR`,
+    /// `PARMRK` and `INPCK` all answer a break or a parity error, which is a
+    /// *flag* the UART hands up alongside the byte. Nothing in this tree
+    /// reports one -- a PTY cannot have one -- so there is no question to
+    /// answer yet.
+    pub fn input_char(&self, c: u8) -> Option<u8> {
+        let mut c = c;
+        if self.c_iflag & I_ISTRIP != 0 {
+            c &= 0x7f;
+        }
+        if self.c_iflag & I_IUCLC != 0 && self.c_lflag & L_IEXTEN != 0 {
+            c = c.to_ascii_lowercase();
+        }
+        if c == b'\r' {
+            if self.c_iflag & I_IGNCR != 0 {
+                return None;
+            }
+            if self.c_iflag & I_ICRNL != 0 {
+                c = b'\n';
+            }
+        } else if c == b'\n' && self.c_iflag & I_INLCR != 0 {
+            c = b'\r';
+        }
+        Some(c)
     }
 }
 
@@ -1421,5 +1494,193 @@ mod termios_tests {
                 );
             }
         }
+    }
+
+    /// Run a byte in through a terminal with exactly these input flags set.
+    fn iflag(bits: u32) -> Termios {
+        let mut t = Termios::default_tty();
+        t.c_iflag = bits;
+        t
+    }
+
+    #[test]
+    fn the_input_flag_numbers_are_the_ones_termbits_h_names() {
+        // Three line disciplines used to carry their own copy of these, so
+        // they are pinned here once, against `asm-generic/termbits.h`.
+        assert_eq!(I_ISTRIP, 0o000040);
+        assert_eq!(I_INLCR, 0o000100);
+        assert_eq!(I_IGNCR, 0o000200);
+        assert_eq!(I_ICRNL, 0o000400);
+        assert_eq!(I_IUCLC, 0o001000);
+        assert_eq!(L_IEXTEN, 0o100000);
+    }
+
+    #[test]
+    fn istrip_takes_the_eighth_bit_off_every_byte() {
+        let t = iflag(I_ISTRIP);
+        for b in 0u8..=255 {
+            assert_eq!(t.input_char(b), Some(b & 0x7f), "byte {:#04x}", b);
+        }
+    }
+
+    #[test]
+    fn istrip_runs_before_the_carriage_return_rules() {
+        // The whole reason the order matters. On a 7-bit line the Enter key
+        // arrives as 0x8d; with ISTRIP it is a carriage return and ICRNL ends
+        // the line, and asking the CR/NL question first -- which is what the
+        // three disciplines did -- means it never does.
+        let t = iflag(I_ISTRIP | I_ICRNL);
+        assert_eq!(t.input_char(0x8d), Some(b'\n'));
+        // Without ISTRIP the same byte is just a byte.
+        let t = iflag(I_ICRNL);
+        assert_eq!(t.input_char(0x8d), Some(0x8d));
+    }
+
+    #[test]
+    fn istrip_runs_before_the_flag_that_swallows_a_byte() {
+        let t = iflag(I_ISTRIP | I_IGNCR);
+        assert_eq!(t.input_char(0x8d), None);
+        let t = iflag(I_IGNCR);
+        assert_eq!(t.input_char(0x8d), Some(0x8d));
+    }
+
+    #[test]
+    fn icrnl_turns_a_carriage_return_into_a_newline() {
+        let t = iflag(I_ICRNL);
+        assert_eq!(t.input_char(b'\r'), Some(b'\n'));
+        assert_eq!(t.input_char(b'\n'), Some(b'\n'));
+    }
+
+    #[test]
+    fn inlcr_turns_a_newline_into_a_carriage_return() {
+        let t = iflag(I_INLCR);
+        assert_eq!(t.input_char(b'\n'), Some(b'\r'));
+        assert_eq!(t.input_char(b'\r'), Some(b'\r'));
+    }
+
+    #[test]
+    fn with_both_set_the_two_bytes_swap_rather_than_collapsing() {
+        // `else if` in the kernel, so a carriage return ICRNL just made a
+        // newline is not then put back by INLCR, and the other way round.
+        let t = iflag(I_ICRNL | I_INLCR);
+        assert_eq!(t.input_char(b'\r'), Some(b'\n'));
+        assert_eq!(t.input_char(b'\n'), Some(b'\r'));
+    }
+
+    #[test]
+    fn igncr_wins_over_icrnl() {
+        // IGNCR returns before ICRNL is even asked: the byte is gone, not
+        // turned into a newline.
+        let t = iflag(I_IGNCR | I_ICRNL);
+        assert_eq!(t.input_char(b'\r'), None);
+        assert_eq!(t.input_char(b'\n'), Some(b'\n'));
+    }
+
+    #[test]
+    fn igncr_is_the_only_flag_that_ever_swallows_a_byte() {
+        // A discipline may hand the result straight to its queue, so the
+        // empty case has exactly one cause and it is worth pinning -- the
+        // same promise `nothing_but_onocr_ever_swallows_a_byte` makes going
+        // the other way.
+        for bits in [
+            0,
+            I_ISTRIP,
+            I_ICRNL,
+            I_INLCR,
+            I_IUCLC,
+            I_ISTRIP | I_ICRNL | I_INLCR | I_IUCLC,
+        ] {
+            let mut t = iflag(bits);
+            t.c_lflag |= L_IEXTEN;
+            for b in 0u8..=255 {
+                assert!(
+                    t.input_char(b).is_some(),
+                    "iflag {:#x} swallowed {:#04x}",
+                    bits,
+                    b
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn iuclc_lower_cases_the_letters_and_leaves_the_rest() {
+        let mut t = iflag(I_IUCLC);
+        t.c_lflag |= L_IEXTEN;
+        assert_eq!(t.input_char(b'A'), Some(b'a'));
+        assert_eq!(t.input_char(b'Z'), Some(b'z'));
+        assert_eq!(t.input_char(b'a'), Some(b'a'));
+        assert_eq!(t.input_char(b'7'), Some(b'7'));
+        assert_eq!(t.input_char(b'{'), Some(b'{'));
+    }
+
+    #[test]
+    fn iuclc_is_the_one_input_flag_iexten_turns_off() {
+        // Its output twin OLCUC is not gated on anything; this one is, and
+        // it is the only place on the way in where IEXTEN decides.
+        let mut t = iflag(I_IUCLC);
+        t.c_lflag &= !L_IEXTEN;
+        assert_eq!(t.input_char(b'A'), Some(b'A'));
+        t.c_lflag |= L_IEXTEN;
+        assert_eq!(t.input_char(b'A'), Some(b'a'));
+    }
+
+    #[test]
+    fn iuclc_folds_ascii_only() {
+        // `tolower()` in the kernel is the ASCII one: a byte above 0x7f is a
+        // byte, not a letter of somebody's alphabet.
+        let mut t = iflag(I_IUCLC);
+        t.c_lflag |= L_IEXTEN;
+        for b in 0x80u8..=0xff {
+            assert_eq!(t.input_char(b), Some(b), "byte {:#04x}", b);
+        }
+        assert_eq!(t.input_char(0x00), Some(0x00));
+        assert_eq!(t.input_char(0x1b), Some(0x1b));
+    }
+
+    #[test]
+    fn iuclc_runs_before_the_carriage_return_rules_too() {
+        // Nothing observable turns on it -- neither CR nor NL is a letter --
+        // but the order is the kernel's and a rewrite that moved it would be
+        // changing the answer for no reason.
+        let mut t = iflag(I_IUCLC | I_ICRNL);
+        t.c_lflag |= L_IEXTEN;
+        assert_eq!(t.input_char(b'\r'), Some(b'\n'));
+    }
+
+    #[test]
+    fn the_cooked_default_only_ends_the_line() {
+        // What every program gets until it asks for something else: ICRNL
+        // and nothing else this function reads. So the whole change is
+        // dormant on a stock terminal, which is the point.
+        let t = Termios::default_tty();
+        assert_ne!(t.c_iflag & I_ICRNL, 0);
+        assert_eq!(t.c_iflag & (I_ISTRIP | I_INLCR | I_IGNCR | I_IUCLC), 0);
+        assert_eq!(t.input_char(b'\r'), Some(b'\n'));
+        for b in 0u8..=255 {
+            if b != b'\r' {
+                assert_eq!(t.input_char(b), Some(b), "byte {:#04x}", b);
+            }
+        }
+    }
+
+    #[test]
+    fn a_terminal_with_no_input_flags_hands_every_byte_through_untouched() {
+        // There is no OPOST on the way in: the flags are read one by one,
+        // so clearing c_iflag is the only way to get a byte through whole.
+        let t = iflag(0);
+        for b in 0u8..=255 {
+            assert_eq!(t.input_char(b), Some(b), "byte {:#04x}", b);
+        }
+    }
+
+    #[test]
+    fn raw_mode_is_not_a_master_switch_on_the_way_in() {
+        // ICANON off does not stop the input flags being consulted -- unlike
+        // OPOST going out. A program that goes raw without clearing c_iflag
+        // still gets ICRNL, and Linux agrees.
+        let mut t = Termios::default_tty();
+        t.c_lflag &= !L_ICANON;
+        assert_eq!(t.input_char(b'\r'), Some(b'\n'));
     }
 }

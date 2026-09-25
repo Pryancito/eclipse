@@ -31,11 +31,6 @@ const BRKINT: u32 = 0x0002;
 const IGNPAR: u32 = 0x0004;
 const PARMRK: u32 = 0x0008;
 const INPCK: u32 = 0x0010;
-const ISTRIP: u32 = 0x0020;
-const INLCR: u32 = 0x0040;
-const IGNCR: u32 = 0x0080;
-const ICRNL: u32 = 0x0100;
-const IUCLC: u32 = 0x0200;
 const IXON: u32 = 0x0400;
 const IXANY: u32 = 0x0800;
 const IXOFF: u32 = 0x1000;
@@ -64,7 +59,6 @@ const ECHOCTL: u32 = 0x0200;
 const ECHOPRT: u32 = 0x0400;
 const FLUSHO: u32 = 0x1000;
 const PENDIN: u32 = 0x4000;
-const IEXTEN: u32 = 0x8000;
 
 // c_cc indices
 const VINTR: usize = 0;
@@ -1562,22 +1556,30 @@ impl Stdin {
     /// EventBus is contended the flag is left set for the next
     /// executor-side flush_ready_flag() call.
     pub fn push(&self, mut c: char) {
-        let termios = tty_termios(self.vt).lock();
-        let iflag = termios.c_iflag;
-        let lflag = termios.c_lflag;
-        let c_cc = termios.c_cc;
-        let kill_echo = termios.kill_echo();
-        drop(termios);
+        // Copied out, so the lock is gone by the end of this statement.
+        let t = *tty_termios(self.vt).lock();
+        let iflag = t.c_iflag;
+        let lflag = t.c_lflag;
+        let c_cc = t.c_cc;
+        let kill_echo = t.kill_echo();
 
-        // 1. Input translations
-        if c == '\r' {
-            if iflag & IGNCR != 0 {
-                return;
-            } else if iflag & ICRNL != 0 {
-                c = '\n';
+        // 1. What the character becomes on the way in: `I_ISTRIP`, `I_IUCLC`,
+        //    then the CR/NL rules, in that order. The block used to be here,
+        //    again in `fs/pty.rs` and again in `fs/devfs/pty.rs`, and none of
+        //    the three had `I_ISTRIP` or `I_IUCLC`; it is one question per input
+        //    byte, so it is answered in `ioctl.rs`.
+        //
+        //    A terminal's unit is the byte everywhere but here, where the
+        //    queue is `char`. A scalar that does not fit in one is left
+        //    alone: no 7- or 8-bit terminal can send it, and `I_ISTRIP` over a
+        //    UTF-8 sequence is not a character this queue could hold. `\r`
+        //    and `\n` are ASCII, so the CR/NL half sees everything either
+        //    way.
+        if let Ok(b) = u8::try_from(c as u32) {
+            match t.input_char(b) {
+                Some(b) => c = b as char,
+                None => return,
             }
-        } else if c == '\n' && iflag & INLCR != 0 {
-            c = '\r';
         }
 
         // 1b. Literal-next (VLNEXT): the previous keystroke was Ctrl-V, so take
@@ -1608,7 +1610,7 @@ impl Stdin {
         // 1d. Discard (VDISCARD, Ctrl-O): toggles output flushing. The console
         // has no output queue to drop, so just consume the byte when IEXTEN is
         // on so it doesn't leak into the cooked line.
-        if lflag & IEXTEN != 0 && c_cc[VDISCARD] != 0 && c as u8 == c_cc[VDISCARD] {
+        if lflag & L_IEXTEN != 0 && c_cc[VDISCARD] != 0 && c as u8 == c_cc[VDISCARD] {
             return;
         }
 
@@ -1710,7 +1712,7 @@ impl Stdin {
         if lflag & ICANON != 0 {
             // Extended line editing (VWERASE / VREPRINT / VLNEXT) is gated on
             // IEXTEN, as in Linux n_tty. A c_cc of 0 means the char is disabled.
-            let iexten = lflag & IEXTEN != 0;
+            let iexten = lflag & L_IEXTEN != 0;
             if iexten && c_cc[VWERASE] != 0 && c as u8 == c_cc[VWERASE] {
                 self.word_erase(lflag);
             } else if iexten && c_cc[VREPRINT] != 0 && c as u8 == c_cc[VREPRINT] {
@@ -2515,12 +2517,12 @@ mod line_discipline_tests {
         let _g = SERIAL.lock();
         let d = Termios::default_tty();
         // ICRNL (the default): Enter sends CR, and it must land as '\n'.
-        let s = tty(d.c_lflag, ICRNL);
+        let s = tty(d.c_lflag, I_ICRNL);
         feed(&s, "ab\r");
         assert_eq!(drain(&s), "ab\n");
 
         // IGNCR: the CR is dropped outright, so the line stays open.
-        let s = tty(d.c_lflag, IGNCR);
+        let s = tty(d.c_lflag, I_IGNCR);
         feed(&s, "ab\r");
         assert!(!s.can_read());
         s.push('\n');
@@ -2528,9 +2530,66 @@ mod line_discipline_tests {
 
         // INLCR: '\n' becomes '\r', which is not an end-of-line, so the line
         // does NOT complete -- the translation runs before the EOL test.
-        let s = tty(d.c_lflag, INLCR);
+        let s = tty(d.c_lflag, I_INLCR);
         feed(&s, "ab\n");
         assert!(!s.can_read());
+    }
+
+    #[test]
+    fn a_seven_bit_terminal_ends_its_line_with_the_return_key() {
+        let _g = SERIAL.lock();
+        let d = Termios::default_tty();
+        // On a 7-bit line Enter arrives as 0x8d, and ISTRIP is what makes it
+        // a carriage return for ICRNL to end the line with. This discipline
+        // carried its own copy of the CR/NL block with no ISTRIP in it, so
+        // the key did nothing at all.
+        let s = tty(d.c_lflag, I_ISTRIP | I_ICRNL);
+        feed(&s, "ab\u{8d}");
+        assert_eq!(drain(&s), "ab\n");
+
+        // Without it the byte is just a byte and the line stays open.
+        let s = tty(d.c_lflag, I_ICRNL);
+        feed(&s, "ab\u{8d}");
+        assert!(!s.can_read());
+    }
+
+    #[test]
+    fn iuclc_folds_what_is_typed_and_iexten_turns_it_off() {
+        let _g = SERIAL.lock();
+        let d = Termios::default_tty();
+        let s = tty(d.c_lflag, I_IUCLC | I_ICRNL);
+        assert_ne!(d.c_lflag & L_IEXTEN, 0);
+        feed(&s, "HOLA\r");
+        assert_eq!(drain(&s), "hola\n");
+
+        let s = tty(d.c_lflag & !L_IEXTEN, I_IUCLC | I_ICRNL);
+        feed(&s, "HOLA\r");
+        assert_eq!(drain(&s), "HOLA\n");
+    }
+
+    #[test]
+    fn a_latin1_keystroke_is_the_byte_the_line_sent() {
+        let _g = SERIAL.lock();
+        let d = Termios::default_tty();
+        // This queue is chars where the other two disciplines are bytes, and
+        // the input flags are a byte's rules. The serial console is the
+        // caller ISTRIP exists for and it hands in `byte as char`, so a
+        // scalar that fits in a byte IS that byte: `Ñ` is 0xd1, and a 7-bit
+        // line carrying 0xd1 delivered 0x51.
+        let s = tty(d.c_lflag, I_ISTRIP | I_ICRNL);
+        feed(&s, "Ñ\r");
+        assert_eq!(drain(&s), "Q\n");
+    }
+
+    #[test]
+    fn a_scalar_no_byte_could_have_carried_goes_through_untouched() {
+        let _g = SERIAL.lock();
+        let d = Termios::default_tty();
+        // Above U+00FF there is no byte to apply a byte's rules to, and the
+        // char must reach the queue whole rather than be truncated into one.
+        let s = tty(d.c_lflag, I_ISTRIP | I_IUCLC | I_ICRNL);
+        feed(&s, "€\r");
+        assert_eq!(drain(&s), "€\n");
     }
 
     #[test]
@@ -2623,7 +2682,7 @@ mod line_discipline_tests {
         let _g = SERIAL.lock();
         let d = Termios::default_tty();
         // Without IEXTEN, Ctrl-W / Ctrl-R / Ctrl-V are ordinary input.
-        let s = tty(d.c_lflag & !IEXTEN, d.c_iflag);
+        let s = tty(d.c_lflag & !L_IEXTEN, d.c_iflag);
         feed(&s, "ab");
         s.push(CTRL_W);
         s.push(CTRL_R);
@@ -2890,7 +2949,7 @@ mod line_discipline_tests {
     fn ixon_consumes_stop_and_start_without_delivering_them() {
         let _g = SERIAL.lock();
         let d = Termios::default_tty();
-        let s = tty(d.c_lflag, IXON | ICRNL);
+        let s = tty(d.c_lflag, IXON | I_ICRNL);
         feed(&s, "a");
         s.push(CTRL_S);
         assert!(flow_stopped());
@@ -2905,7 +2964,7 @@ mod line_discipline_tests {
     fn ixany_lets_any_character_resume_stopped_output() {
         let _g = SERIAL.lock();
         let d = Termios::default_tty();
-        let s = tty(d.c_lflag, IXON | IXANY | ICRNL);
+        let s = tty(d.c_lflag, IXON | IXANY | I_ICRNL);
         s.push(CTRL_S);
         assert!(flow_stopped());
         // The resuming byte is still delivered as input.
@@ -2919,7 +2978,7 @@ mod line_discipline_tests {
     fn without_ixany_input_does_not_resume_stopped_output() {
         let _g = SERIAL.lock();
         let d = Termios::default_tty();
-        let s = tty(d.c_lflag, IXON | ICRNL);
+        let s = tty(d.c_lflag, IXON | I_ICRNL);
         s.push(CTRL_S);
         s.push('z');
         assert!(flow_stopped());
@@ -2929,7 +2988,7 @@ mod line_discipline_tests {
     fn a_job_control_signal_lifts_an_output_freeze() {
         let _g = SERIAL.lock();
         let d = Termios::default_tty();
-        let s = tty(d.c_lflag, IXON | ICRNL);
+        let s = tty(d.c_lflag, IXON | I_ICRNL);
         s.push(CTRL_S);
         assert!(flow_stopped());
         // Otherwise the signalled process stays blocked behind the Ctrl-S and
@@ -2949,7 +3008,7 @@ mod line_discipline_tests {
         s.push('\n');
         assert_eq!(drain(&s), "ab\n");
         // Without IEXTEN it is ordinary input.
-        let s = tty(d.c_lflag & !IEXTEN, d.c_iflag);
+        let s = tty(d.c_lflag & !L_IEXTEN, d.c_iflag);
         feed(&s, "ab");
         s.push(CTRL_O);
         s.push('\n');

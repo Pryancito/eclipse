@@ -37,9 +37,6 @@ use super::super::ioctl::*;
 use crate::fs::stdio::wake_tty_intr_waiters;
 
 // c_iflag
-const INLCR: u32 = 0x0040;
-const IGNCR: u32 = 0x0080;
-const ICRNL: u32 = 0x0100;
 // c_lflag
 const ICANON: u32 = 0x0002;
 const ECHO: u32 = 0x0008;
@@ -123,22 +120,16 @@ impl PtyInner {
 
     /// Process one byte written to the master (a keystroke from the terminal)
     /// through the slave's input line discipline.
-    fn master_input_byte(&mut self, mut b: u8) {
-        let iflag = self.termios.c_iflag;
+    fn master_input_byte(&mut self, b: u8) {
         let lflag = self.termios.c_lflag;
         let cc = self.termios.c_cc;
 
-        // CR/NL input translation.
-        if b == b'\r' {
-            if iflag & IGNCR != 0 {
-                return;
-            }
-            if iflag & ICRNL != 0 {
-                b = b'\n';
-            }
-        } else if b == b'\n' && iflag & INLCR != 0 {
-            b = b'\r';
-        }
+        // `ISTRIP`, `IUCLC` and the CR/NL rules, in `ioctl.rs` because the
+        // other two line disciplines ask the same question.
+        let b = match self.termios.input_char(b) {
+            Some(b) => b,
+            None => return,
+        };
 
         // Signals (Ctrl-C / Ctrl-\ / Ctrl-Z).
         if let Some(which) = self.termios.tty_signal(b) {
@@ -799,7 +790,7 @@ mod tests {
     #[test]
     fn a_terminal_told_to_ignore_the_return_key_ignores_it() {
         let mut p = pty();
-        p.termios.c_iflag |= IGNCR;
+        p.termios.c_iflag |= I_IGNCR;
         typed(&mut p, b"ho\rla\n");
         assert_eq!(read_by_the_program(&mut p), b"hola\n");
     }
@@ -807,12 +798,44 @@ mod tests {
     #[test]
     fn inlcr_swaps_the_two_the_other_way_round() {
         let mut p = pty();
-        p.termios.c_iflag &= !ICRNL;
-        p.termios.c_iflag |= INLCR;
+        p.termios.c_iflag &= !I_ICRNL;
+        p.termios.c_iflag |= I_INLCR;
         typed(&mut p, b"a\n");
         // The newline became a CR, so no line was ever ended.
         assert!(read_by_the_program(&mut p).is_empty());
         assert_eq!(p.canon.iter().copied().collect::<Vec<u8>>(), b"a\r");
+    }
+
+    #[test]
+    fn a_seven_bit_terminal_ends_its_line_with_the_return_key() {
+        // On a 7-bit line Enter arrives as 0x8d, and ISTRIP is what makes it
+        // a carriage return for ICRNL to end the line with. The copy of the
+        // CR/NL block this file used to carry had no ISTRIP in it, so the key
+        // did nothing.
+        let mut p = pty();
+        p.termios.c_iflag |= I_ISTRIP;
+        typed(&mut p, &[b'h', b'i', 0x8d]);
+        assert_eq!(read_by_the_program(&mut p), b"hi\n");
+
+        // Without it the byte is just a byte and the line stays open.
+        let mut p = pty();
+        typed(&mut p, &[b'h', b'i', 0x8d]);
+        assert!(read_by_the_program(&mut p).is_empty());
+    }
+
+    #[test]
+    fn iuclc_folds_the_keystrokes_and_iexten_turns_it_off() {
+        let mut p = pty();
+        assert_ne!(p.termios.c_lflag & L_IEXTEN, 0);
+        p.termios.c_iflag |= I_IUCLC;
+        typed(&mut p, b"HOLA\r");
+        assert_eq!(read_by_the_program(&mut p), b"hola\n");
+
+        let mut p = pty();
+        p.termios.c_iflag |= I_IUCLC;
+        p.termios.c_lflag &= !L_IEXTEN;
+        typed(&mut p, b"HOLA\r");
+        assert_eq!(read_by_the_program(&mut p), b"HOLA\n");
     }
 
     // --------------------------------------------------------------- erase
