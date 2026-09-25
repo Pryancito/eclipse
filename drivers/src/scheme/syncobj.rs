@@ -138,7 +138,7 @@ fn effective_point(objects: &[Syncobj], handle: u32, depth: u8) -> Option<u64> {
 /// compositor imported its render fence into -> that fence's syncobj.
 const LINK_DEPTH: u8 = 8;
 
-/// The hardware fence in flight that delivers `target` on `handle`, seen
+/// The hardware fences in flight that deliver `target` on `handle`, seen
 /// THROUGH the link an import, a deferred transfer or a merge carries.
 ///
 /// A link names its source by handle, so the fence the GPU will write sits
@@ -147,45 +147,60 @@ const LINK_DEPTH: u8 = 8;
 /// swapchain image is always such an importer, so looked up by its own
 /// handle it had no fence, and EXEC parked on the CPU instead of emitting
 /// a GPU ACQUIRE for it. The lowest of `handle`'s own fences covering
-/// `target` wins; otherwise a link that delivers at least `target` and has
-/// exactly ONE source still short of its point is followed to that source.
-/// Two sources still in flight are not one ACQUIRE, and a source with
-/// nothing submitted has no fence: both report nothing, and the caller
-/// waits on the CPU as before.
+/// `target` wins, alone; otherwise a link that delivers at least `target`
+/// is followed to EVERY source still short of its point, and the list is
+/// what a `dma_fence_array` is to Linux's scheduler: one dependency per
+/// fence, so a merge of two fences in flight is two ACQUIREs. That merge is
+/// the X11 acquire itself -- "the compositor released the image" on the
+/// compositor's channel AND "our previous present of it completed" on our
+/// own -- and while the client's own half was still running, following
+/// only a lone source left the whole wait on the CPU, inside the ioctl,
+/// until the compositor's frame had run. A source with nothing submitted
+/// has no fence: then the list is empty, and the caller waits on the CPU
+/// as before.
 ///
 /// Callers must hold the table lock, with pending fences resolved.
-fn fence_through_link(
+fn fences_through_link(
     table: &SyncobjTable,
     handle: u32,
     target: u64,
     depth: u8,
-) -> Option<PendingFence> {
+) -> alloc::vec::Vec<PendingFence> {
     let own = table
         .pending
         .iter()
         .filter(|f| f.handle == handle && f.point >= target)
         .min_by_key(|f| f.point)
         .copied();
-    if own.is_some() || depth == 0 {
-        return own;
+    if let Some(own) = own {
+        return alloc::vec![own];
     }
-    let link = table
+    if depth == 0 {
+        return alloc::vec::Vec::new();
+    }
+    let Some(link) = table
         .objects
         .iter()
-        .find(|o| o.handle == handle)?
-        .linked
-        .as_ref()?;
+        .find(|o| o.handle == handle)
+        .and_then(|o| o.linked.as_ref())
+    else {
+        return alloc::vec::Vec::new();
+    };
     if link.dst_point.max(1) < target {
-        return None;
+        return alloc::vec::Vec::new();
     }
-    let mut short = link.deps.iter().filter(|&&(src, t)| {
-        !effective_point(&table.objects, src, LINK_DEPTH).is_some_and(|p| p >= t)
-    });
-    let &(src, t) = short.next()?;
-    if short.next().is_some() {
-        return None;
+    let mut fences = alloc::vec::Vec::new();
+    for &(src, t) in &link.deps {
+        if effective_point(&table.objects, src, LINK_DEPTH).is_some_and(|p| p >= t) {
+            continue;
+        }
+        let behind = fences_through_link(table, src, t, depth - 1);
+        if behind.is_empty() {
+            return behind;
+        }
+        fences.extend(behind);
     }
-    fence_through_link(table, src, t, depth - 1)
+    fences
 }
 
 /// Whether `target` on `handle` is SUBMITTED: reached, covered by a fence
@@ -787,13 +802,15 @@ pub fn destroy(handle: u32) -> bool {
     true
 }
 
-/// If `handle` has an unresolved HW fence that will deliver at least `point`,
-/// return `(fence_va_cpu, fence_gpu_va, payload, ctx_idx)`. Used by EXEC to
-/// emit a GPU ACQUIRE instead of spinning on the CPU. `fence_gpu_va` is 0
-/// when the producer did not publish one. An importer, a deferred transfer
-/// or a merge has no fence of its own: the one behind its link is returned
-/// when a single source still owes it ([`fence_through_link`]).
-pub fn pending_hw_fence(handle: u32, point: u64) -> Option<(usize, u64, u32, u32)> {
+/// The unresolved HW fences that will deliver at least `point` on `handle`,
+/// each as `(fence_va_cpu, fence_gpu_va, payload, ctx_idx)`. Used by EXEC to
+/// emit a GPU ACQUIRE per fence instead of spinning on the CPU. `fence_gpu_va`
+/// is 0 when the producer did not publish one. The handle's own fence comes
+/// alone; an importer, a deferred transfer or a merge has no fence of its
+/// own, and the ones behind its link are returned, one per source still in
+/// flight ([`fences_through_link`]). Empty means nothing to acquire: either
+/// nothing is owed, or a source has nothing submitted yet.
+pub fn pending_hw_fences(handle: u32, point: u64) -> alloc::vec::Vec<(usize, u64, u32, u32)> {
     let (r, deferred) = {
         let mut table = TABLE.lock();
         let d = resolve_locked(&mut table);
@@ -814,10 +831,17 @@ pub fn pending_hw_fence(handle: u32, point: u64) -> Option<(usize, u64, u32, u32
                 .min_by_key(|f| f.point)
                 .copied()
         };
-        let found = own
-            .or_else(|| fence_through_link(&table, handle, point.max(1), LINK_DEPTH))
-            .map(|f| (f.fence_va, f.fence_gpu_va, f.payload, f.ctx_idx));
-        (found, d)
+        let found = match own {
+            Some(f) => alloc::vec![f],
+            None => fences_through_link(&table, handle, point.max(1), LINK_DEPTH),
+        };
+        (
+            found
+                .into_iter()
+                .map(|f| (f.fence_va, f.fence_gpu_va, f.payload, f.ctx_idx))
+                .collect(),
+            d,
+        )
     };
     deferred.run();
     r
@@ -1205,7 +1229,7 @@ pub fn wait_available(
 /// counts as satisfied without waiting, because the GPFIFO executes in order
 /// -- the new submission cannot run before the fence lands, which is the
 /// only guarantee the wait exists to give, whether the fence is the handle's
-/// own or the one behind its link ([`fence_through_link`]). Fences on other
+/// own or every one behind its link ([`fences_through_link`]). Fences on other
 /// channels (another process's work) are still waited for on the CPU. The
 /// syncobj itself stays pending until the fence really lands.
 pub fn wait_ordered(
@@ -1353,8 +1377,10 @@ fn wait_inner(
                             .pending
                             .iter()
                             .any(|f| f.handle == h && f.ctx_idx == ctx && f.point >= target)
-                            || fence_through_link(&table, h, target, LINK_DEPTH)
-                                .is_some_and(|f| f.ctx_idx == ctx)
+                            || {
+                                let behind = fences_through_link(&table, h, target, LINK_DEPTH);
+                                !behind.is_empty() && behind.iter().all(|f| f.ctx_idx == ctx)
+                            }
                     }
                     None => false,
                 };
@@ -1453,6 +1479,18 @@ mod tests {
     extern crate std;
 
     use super::*;
+
+    /// [`pending_hw_fences`] where the caller expects at most one fence: the
+    /// handle's own, or the lone source behind its link.
+    fn pending_hw_fence(handle: u32, point: u64) -> Option<(usize, u64, u32, u32)> {
+        let fences = pending_hw_fences(handle, point);
+        assert!(
+            fences.len() <= 1,
+            "{handle:#x}@{point} has {} fences in flight; ask for the list",
+            fences.len()
+        );
+        fences.first().copied()
+    }
     use crate::nvme::nvme_queue::test_clock;
     use core::cell::RefCell;
 
@@ -2745,10 +2783,11 @@ mod tests {
         assert_eq!(pending_now(), 0, "src's fences at 2 and 6 went with it");
     }
 
-    /// A merged fence is submitted once EVERY source is, and can be one GPU
-    /// ACQUIRE only while exactly one source is still in flight.
+    /// A merged fence is submitted once EVERY source is, and is one GPU
+    /// ACQUIRE per source still in flight: with both halves running, the
+    /// two fences, in the link's order; once one lands, the other alone.
     #[test]
-    fn a_merge_is_available_once_every_source_is_submitted_and_acquirable_when_one_remains() {
+    fn a_merge_is_available_once_every_source_is_submitted_and_acquires_every_fence_in_flight() {
         let _g = test_lock();
         arm_hooks();
         let a = create(false);
@@ -2775,9 +2814,9 @@ mod tests {
         assert_eq!(query_submitted(m), Some(1));
         assert_eq!(query(m), Some(0));
         assert_eq!(
-            pending_hw_fence(m, 1),
-            None,
-            "two fences in flight are not one ACQUIRE"
+            pending_hw_fences(m, 1),
+            [(za.va(), 0, 1, 0), (zb.va(), 0, 2, 1)],
+            "two fences in flight are two ACQUIREs, a's then b's"
         );
         za.land(1);
         assert_eq!(
@@ -2790,6 +2829,123 @@ mod tests {
         for h in [m, a, b] {
             assert!(destroy(h));
         }
+    }
+
+    /// The list follows every source of a merge to its own fence, through a
+    /// source that is itself a link; a source still short of its point with
+    /// nothing submitted empties it, whatever the others hold: half a wait
+    /// on the GPU and half nowhere would let the submit run early.
+    #[test]
+    fn a_merge_lists_the_fence_behind_each_source_or_nothing_when_one_has_none() {
+        let _g = test_lock();
+        arm_hooks();
+        let a = create(false);
+        let b = create(false);
+        let c = create(false);
+        let mut za = Landing::new();
+        let mut zb = Landing::new();
+        let mut zc = Landing::new();
+        assert!(attach_hw_fence(a, 1, za.va(), 0x1000, 1, 1, true));
+        assert!(attach_hw_fence(b, 1, zb.va(), 0x2000, 2, 2, true));
+        // Mesa's surrogate: a's fence transferred into a binary of its own.
+        let via_a = create(false);
+        assert!(transfer(via_a, 0, a, 0));
+        // An importer of b: a link, not a fence.
+        let via_b = create(false);
+        assert!(import_snapshot(via_b, b, 1));
+        let m = merge_fences(&[(via_a, 1), (via_b, 1), (c, 1)]);
+        assert_eq!(
+            pending_hw_fences(m, 1),
+            [],
+            "c has nothing submitted: nothing to acquire"
+        );
+        assert!(attach_hw_fence(c, 1, zc.va(), 0x3000, 3, 1, true));
+        assert_eq!(
+            pending_hw_fences(m, 1),
+            [
+                (za.va(), 0x1000, 1, 1),
+                (zb.va(), 0x2000, 2, 2),
+                (zc.va(), 0x3000, 3, 1)
+            ],
+            "one fence per source, in the link's order, through the surrogate and the import"
+        );
+        assert_eq!(
+            pending_hw_fences(m, 2),
+            [],
+            "a binary merge promises point 1 only"
+        );
+        zb.land(2);
+        assert_eq!(
+            pending_hw_fences(m, 1),
+            [(za.va(), 0x1000, 1, 1), (zc.va(), 0x3000, 3, 1)],
+            "b reached: its fence leaves the list"
+        );
+        assert!(destroy(via_a));
+        assert!(destroy(via_b));
+        assert_eq!(
+            pending_hw_fences(m, 1),
+            [(za.va(), 0x1000, 1, 1), (zc.va(), 0x3000, 3, 1)],
+            "the surrogates gone, as Mesa leaves them: the fences are still theirs"
+        );
+        za.land(1);
+        zc.land(3);
+        assert_eq!(query(m), Some(1));
+        assert_eq!(pending_hw_fences(m, 1), []);
+        for h in [m, a, b, c] {
+            assert!(destroy(h));
+        }
+        assert_eq!(pending_now(), 0);
+    }
+
+    /// A merge is ordered for a channel only when EVERY fence behind it is
+    /// that channel's: two of its own, yes; one of its own and the
+    /// compositor's, a wait from either side.
+    #[test]
+    fn a_merge_is_ordered_only_when_every_fence_behind_it_is_the_channels_own() {
+        let _g = test_lock();
+        arm_hooks();
+        let a = create(false);
+        let b = create(false);
+        let c = create(false);
+        let mut za = Landing::new();
+        let mut zb = Landing::new();
+        let mut zc = Landing::new();
+        assert!(attach_hw_fence(a, 1, za.va(), 0, 1, 1, true));
+        assert!(attach_hw_fence(b, 1, zb.va(), 0, 2, 1, true));
+        assert!(attach_hw_fence(c, 1, zc.va(), 0, 3, 2, true));
+        let ours = merge_fences(&[(a, 1), (b, 1)]);
+        let mixed = merge_fences(&[(a, 1), (c, 1)]);
+        assert!(matches!(
+            wait_ordered(&[ours], None, 0, 1),
+            WaitOutcome::Signaled { .. }
+        ));
+        assert!(matches!(
+            wait_ordered(&[ours], None, 0, 2),
+            WaitOutcome::Timeout
+        ));
+        assert!(matches!(
+            wait_ordered(&[mixed], None, 0, 1),
+            WaitOutcome::Timeout
+        ));
+        assert!(matches!(
+            wait_ordered(&[mixed], None, 0, 2),
+            WaitOutcome::Timeout
+        ));
+        zc.land(3);
+        assert!(
+            matches!(
+                wait_ordered(&[mixed], None, 0, 1),
+                WaitOutcome::Signaled { .. }
+            ),
+            "the compositor's half landed: what is left is ours"
+        );
+        assert_eq!(query(mixed), Some(0), "ordered is not signaled");
+        za.land(1);
+        zb.land(2);
+        for h in [ours, mixed, a, b, c] {
+            assert!(destroy(h));
+        }
+        assert_eq!(pending_now(), 0);
     }
 
     /// The in-order guarantee of a channel holds through a link as well: a
