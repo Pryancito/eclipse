@@ -614,7 +614,6 @@ mod page_size_tests {
 mod translation_base_tests {
     use super::*;
 
-
     const KERNEL: usize = 0x4_1000;
     const USER: usize = 0x9_2000;
 
