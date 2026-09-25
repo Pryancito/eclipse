@@ -2582,7 +2582,10 @@ mod stack_danger_tests {
     #[test]
     fn a_stack_with_room_to_spare_is_not_in_danger() {
         assert!(!stack_in_danger(TOP - 8, BASE, LOW), "a nearly empty stack");
-        assert!(!stack_in_danger(BASE + STACK_SIZE / 2, BASE, LOW), "half used");
+        assert!(
+            !stack_in_danger(BASE + STACK_SIZE / 2, BASE, LOW),
+            "half used"
+        );
         assert!(
             !stack_in_danger(BASE + LOW, BASE, LOW),
             "exactly the threshold is still enough room: the check is 'less \
@@ -2623,7 +2626,10 @@ mod stack_danger_tests {
 
     #[test]
     fn a_stack_pointer_in_the_top_guard_is_the_neighbour_coming_down() {
-        assert!(stack_in_danger(TOP, BASE, LOW), "the first byte past usable");
+        assert!(
+            stack_in_danger(TOP, BASE, LOW),
+            "the first byte past usable"
+        );
         assert!(stack_in_danger(TOP + TOP_GUARD_SIZE - 1, BASE, LOW));
         assert!(
             !stack_in_danger(TOP + TOP_GUARD_SIZE, BASE, LOW),
