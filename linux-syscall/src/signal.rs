@@ -117,7 +117,7 @@ fn single_task_id(raw: usize) -> Result<KoID, LxError> {
 ///
 /// Read once, before the walk: `check_kill_permission()` asks about the
 /// SENDER, and the sender does not change while the call runs.
-struct KillContext {
+pub(crate) struct KillContext {
     caller: Arc<zircon_object::task::Process>,
     credentials: Credentials,
     sid: KoID,
@@ -198,17 +198,27 @@ fn queue_signal_to_thread(thread: &Arc<Thread>, signal: Signal) {
 /// `si_code` of a signal `tkill`/`tgkill` sent, which userland may not forge.
 const SI_TKILL: i32 = -6;
 
-/// `rt_sigqueueinfo(2)`/`rt_tgsigqueueinfo(2)`: userland may not pretend a
-/// signal came from the kernel, nor impersonate a `tkill`, at another process.
-/// Written once because both syscalls make the same call:
+/// `rt_sigqueueinfo(2)`/`rt_tgsigqueueinfo(2)`/`pidfd_send_signal(2)`: userland
+/// may not pretend a signal came from the kernel, nor impersonate a `tkill`, at
+/// another process. Written once because all three make the same call:
 ///
 /// ```c
 /// if ((info->si_code >= 0 || info->si_code == SI_TKILL) &&
 ///     (task_pid_vnr(current) != pid))
 ///         return -EPERM;
 /// ```
-fn may_queue_siginfo(code: i32, target_is_caller: bool) -> bool {
-    target_is_caller || (code < 0 && code != SI_TKILL)
+///
+/// `target_is_self` is the one thing the three do NOT agree on, so each caller
+/// answers it with its own ids. `rt_sigqueueinfo` and `pidfd_send_signal` name
+/// a process, so "self" is the caller's own thread group;
+/// `rt_tgsigqueueinfo` names ONE THREAD, and Linux compares
+/// `task_pid_vnr(current)` -- the caller's own tid -- against it, so a sibling
+/// thread of your own process is somebody else there. This kernel numbers
+/// threads and processes out of one counter but in disjoint sets, so each call
+/// site has to say which id it means; passing the wrong one reads as
+/// harmless.
+pub(crate) fn may_queue_siginfo(code: i32, target_is_self: bool) -> bool {
+    target_is_self || (code < 0 && code != SI_TKILL)
 }
 
 /// `MINSIGSTKSZ` on the architectures this kernel runs.
@@ -376,7 +386,7 @@ impl Syscall<'_> {
         Ok(0)
     }
 
-    fn kill_context(&self, signal: Option<Signal>) -> KillContext {
+    pub(crate) fn kill_context(&self, signal: Option<Signal>) -> KillContext {
         let caller = self.zircon_process().clone();
         let sid = linux_object::process::effective_sid(&caller);
         KillContext {
@@ -388,7 +398,7 @@ impl Syscall<'_> {
     }
 
     /// `check_kill_permission()` for one target process, with no delivery.
-    fn may_signal_process(
+    pub(crate) fn may_signal_process(
         &self,
         cx: &KillContext,
         process: &Arc<zircon_object::task::Process>,
@@ -409,7 +419,7 @@ impl Syscall<'_> {
     }
 
     /// The gate, then the delivery, for one process.
-    fn signal_one_process(
+    pub(crate) fn signal_one_process(
         &self,
         cx: &KillContext,
         process: &Arc<zircon_object::task::Process>,
@@ -703,27 +713,20 @@ impl Syscall<'_> {
             "rt_sigqueueinfo: pid={}, sig={}, si_code={}",
             pid, signum, head.code
         );
-        let caller = self.zircon_process().clone();
         let pid = pid_arg(pid as isize);
-        if !may_queue_siginfo(head.code, pid as i64 == caller.id() as i64) {
+        if !may_queue_siginfo(head.code, pid as i64 == self.zircon_process().id() as i64) {
             return Err(LxError::EPERM);
         }
         let process = ROOT_JOB.find_process(pid as KoID).ok_or(LxError::ESRCH)?;
-        let Some(signal) = Signal::from_syscall_arg(signum)? else {
-            // Existence probe, like kill(pid, 0).
-            return Ok(0);
-        };
-        if signal == Signal::SIGKILL {
-            // Through the same decision `kill(2)` makes, which is the point:
-            // this used to call `Process::exit` straight out, so
-            // `sigqueue(1, SIGKILL, v)` removed init where `kill -9 1` is
-            // refused.
-            deliver_direct_sigkill(&caller, &process);
-            return Ok(0);
-        }
-        drop(process);
-        linux_object::process::send_signal_to_process(pid as usize, signal)?;
-        Ok(0)
+        // `kill_proc_info()`, the same one `kill(2)` walks into: the
+        // credentials, then the delivery -- including the refusal to end init
+        // from another process, which this syscall used to bypass by calling
+        // `Process::exit` straight out. The signal number is parsed after the
+        // target is found so that `ESRCH` keeps winning over `EINVAL`, as it
+        // did before.
+        let signal = Signal::from_syscall_arg(signum)?;
+        self.signal_one_process(&self.kill_context(signal), &process)
+            .map(|_| 0)
     }
 
     /// Queue a signal plus `siginfo` to a specific thread of a thread group
@@ -742,17 +745,25 @@ impl Syscall<'_> {
         );
         let tgid = single_task_id(tgid)?;
         let tid = single_task_id(tid)?;
-        if !may_queue_siginfo(head.code, tgid == self.zircon_process().id()) {
+        // The target THREAD, not its thread group: forging an `si_code` at a
+        // sibling thread is forging it at somebody else, and asking about the
+        // group let that through.
+        if !may_queue_siginfo(head.code, tid == self.thread.id()) {
             return Err(LxError::EPERM);
         }
         let process = ROOT_JOB.find_process(tgid).ok_or(LxError::ESRCH)?;
         let thread_obj = process.get_child(tid).map_err(|_| LxError::ESRCH)?;
         let thread: Arc<Thread> = thread_obj.downcast_arc().map_err(|_| LxError::ESRCH)?;
-        let Some(signal) = Signal::from_syscall_arg(signum)? else {
-            // Existence probe, like kill(pid, 0).
-            return Ok(0);
-        };
-        queue_signal_to_thread(&thread, signal);
+        let signal = Signal::from_syscall_arg(signum)?;
+        // `do_send_specific()`, which is `tgkill`'s own path: the credentials
+        // of the thread GROUP, since a thread has none of its own.
+        self.may_signal_process(&self.kill_context(signal), &process)?;
+        // rt_tgsigqueueinfo(tgid, tid, 0) probes and delivers nothing -- but
+        // it is refused just the same, so it cannot report the existence of a
+        // thread you may not signal.
+        if let Some(signal) = signal {
+            queue_signal_to_thread(&thread, signal);
+        }
         Ok(0)
     }
 

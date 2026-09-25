@@ -70,6 +70,9 @@ pub const CAP_KILL: u32 = 5;
 pub const CAP_SETGID: u32 = 6;
 /// `CAP_SETUID`: change user ids, `setfsuid(2)` included.
 pub const CAP_SETUID: u32 = 7;
+/// `CAP_SYS_PTRACE`: trace, inspect or reach into the innards of a process
+/// that is not yours -- `pidfd_getfd(2)` included.
+pub const CAP_SYS_PTRACE: u32 = 19;
 /// `CAP_SYS_ADMIN`: the catch-all -- mount, `sethostname`, and much else.
 pub const CAP_SYS_ADMIN: u32 = 21;
 /// `CAP_SYS_BOOT`: `reboot(2)` and `kexec_load(2)`.
@@ -1724,6 +1727,63 @@ impl LinuxProcess {
             && caller.rgid == target.egid
             && caller.rgid == target.sgid;
         ids_match || has_capability(caller.euid, CAP_SYS_RESOURCE)
+    }
+
+    /// Whether `caller` may reach INTO `target`: read its memory, trace it, or
+    /// take one of its open files.
+    ///
+    /// `__ptrace_may_access()` under `PTRACE_MODE_ATTACH_REALCREDS`, which is
+    /// the mode `pidfd_getfd(2)` asks for:
+    ///
+    /// ```c
+    /// if (same_thread_group(task, current))
+    ///         return 0;
+    /// caller_uid = cred->uid;  /* REALCREDS: the real pair, not the effective one */
+    /// caller_gid = cred->gid;
+    /// if (uid_eq(caller_uid, tcred->euid) && uid_eq(caller_uid, tcred->suid) &&
+    ///     uid_eq(caller_uid, tcred->uid)  && gid_eq(caller_gid, tcred->egid) &&
+    ///     gid_eq(caller_gid, tcred->sgid) && gid_eq(caller_gid, tcred->gid))
+    ///         goto ok;
+    /// if (ptrace_has_cap(tcred->user_ns, mode))
+    ///         goto ok;
+    /// return -EPERM;
+    /// ```
+    ///
+    /// The six comparisons are [`Self::may_touch_limits_of`]'s, to the letter
+    /// -- and that is the trap. The two rules differ in the two places the
+    /// comparisons do not show: the capability that lifts them
+    /// (`CAP_SYS_PTRACE` here, `CAP_SYS_RESOURCE` there) and the escape
+    /// hatch, which `prlimit64` does not have at all. Taking an fd out of
+    /// your OWN process is a `dup`, so the thread group goes through before
+    /// any id is read; `check_prlimit_permission()` compares `current ==
+    /// task` instead and leaves a sibling thread to the ids.
+    ///
+    /// Linux has a seventh test after these: a target that dropped privileges
+    /// and became non-dumpable is out of reach even for an id match. There is
+    /// no `dumpable` flag in this kernel, so it is not written here -- and
+    /// that omission is the permissive direction, which is why it is written
+    /// down.
+    ///
+    /// Which capability is named cannot be tested: [`has_capability`] asks only
+    /// whether the effective uid is root, so `CAP_SYS_PTRACE` and
+    /// `CAP_SYS_RESOURCE` are the same word here. It is spelled correctly
+    /// anyway, because the day this kernel keeps a real capability set the two
+    /// rules part company and nothing will point at this line.
+    pub fn may_attach_to(
+        caller: &Credentials,
+        target: &Credentials,
+        same_thread_group: bool,
+    ) -> bool {
+        if same_thread_group {
+            return true;
+        }
+        let ids_match = caller.ruid == target.ruid
+            && caller.ruid == target.euid
+            && caller.ruid == target.suid
+            && caller.rgid == target.rgid
+            && caller.rgid == target.egid
+            && caller.rgid == target.sgid;
+        ids_match || has_capability(caller.euid, CAP_SYS_PTRACE)
     }
 
     /// The three rules `do_prlimit` applies to a new limit, and the fourth
@@ -6461,6 +6521,248 @@ mod sched_permission_tests {
             ),
             Ok(())
         );
+    }
+}
+
+#[cfg(test)]
+mod ptrace_access_tests {
+    //! `__ptrace_may_access(PTRACE_MODE_ATTACH_REALCREDS)`: who may reach INTO
+    //! another process rather than merely signal it.
+    //!
+    //! `pidfd_getfd(2)` asked nothing, so any process could take any open file
+    //! out of any other. It is the fifth syscall in a row to touch another
+    //! process with no gate, and the fourth DIFFERENT set of ids: `kill` reads
+    //! two of the target's, the renice two others, `prlimit64` all six, and
+    //! this one all six again but for another capability. Copying the
+    //! neighbour's rule is the bug this module exists to catch.
+
+    use super::*;
+
+    const USER: u32 = 1000;
+    const GROUP: u32 = 1000;
+    const OTHER: u32 = 1001;
+    const OTHER_GROUP: u32 = 1001;
+
+    fn ids(ruid: u32, euid: u32, suid: u32, rgid: u32, egid: u32, sgid: u32) -> Credentials {
+        Credentials {
+            ruid,
+            euid,
+            suid,
+            rgid,
+            egid,
+            sgid,
+            fsuid: euid,
+            fsgid: egid,
+            groups: Vec::new(),
+            umask: 0o022,
+        }
+    }
+
+    /// A process that has done nothing clever: one uid and one gid, three times
+    /// over.
+    fn plain(uid: u32, gid: u32) -> Credentials {
+        ids(uid, uid, uid, gid, gid, gid)
+    }
+
+    // ---- the six comparisons ----------------------------------------------
+
+    #[test]
+    fn a_process_of_yours_is_yours_to_reach_into() {
+        assert!(LinuxProcess::may_attach_to(
+            &plain(USER, GROUP),
+            &plain(USER, GROUP),
+            false
+        ));
+    }
+
+    #[test]
+    fn another_users_process_is_not() {
+        assert!(!LinuxProcess::may_attach_to(
+            &plain(USER, GROUP),
+            &plain(OTHER, OTHER_GROUP),
+            false
+        ));
+    }
+
+    #[test]
+    fn every_one_of_the_targets_three_uids_has_to_match() {
+        // Not "same user": "that process holds no id I do not already hold".
+        // One id out of six is enough to put it out of reach, so each is named
+        // on its own rather than swept in a loop -- a loop would pass if the
+        // predicate read one field six times.
+        let caller = plain(USER, GROUP);
+        assert!(!LinuxProcess::may_attach_to(
+            &caller,
+            &ids(OTHER, USER, USER, GROUP, GROUP, GROUP),
+            false
+        ));
+        assert!(!LinuxProcess::may_attach_to(
+            &caller,
+            &ids(USER, OTHER, USER, GROUP, GROUP, GROUP),
+            false
+        ));
+        assert!(!LinuxProcess::may_attach_to(
+            &caller,
+            &ids(USER, USER, OTHER, GROUP, GROUP, GROUP),
+            false
+        ));
+    }
+
+    #[test]
+    fn and_every_one_of_its_three_gids() {
+        // The groups are half the rule and the half a signal check does not
+        // have at all: `may_signal_cred` never looks at a gid. A caller in
+        // another group may kill the process and may not read its files.
+        let caller = plain(USER, GROUP);
+        assert!(!LinuxProcess::may_attach_to(
+            &caller,
+            &ids(USER, USER, USER, OTHER_GROUP, GROUP, GROUP),
+            false
+        ));
+        assert!(!LinuxProcess::may_attach_to(
+            &caller,
+            &ids(USER, USER, USER, GROUP, OTHER_GROUP, GROUP),
+            false
+        ));
+        assert!(!LinuxProcess::may_attach_to(
+            &caller,
+            &ids(USER, USER, USER, GROUP, GROUP, OTHER_GROUP),
+            false
+        ));
+        assert!(LinuxProcess::may_signal_cred(
+            &caller,
+            &ids(USER, USER, USER, OTHER_GROUP, OTHER_GROUP, OTHER_GROUP)
+        ));
+    }
+
+    // ---- which of the CALLER's ids ----------------------------------------
+
+    #[test]
+    fn it_is_the_callers_real_pair_that_is_compared() {
+        // `PTRACE_MODE_REALCREDS`, and Linux's own comment says using the
+        // effective uid "would make more sense here" -- but userland relies on
+        // the old behaviour, so the real one it is. A process whose effective
+        // uid has moved keeps the reach its real one gives it.
+        let moved_euid = ids(USER, OTHER, USER, GROUP, OTHER_GROUP, GROUP);
+        assert!(LinuxProcess::may_attach_to(
+            &moved_euid,
+            &plain(USER, GROUP),
+            false
+        ));
+    }
+
+    #[test]
+    fn an_effective_uid_you_borrowed_does_not_reach_into_anything() {
+        // The mirror image, and the one that matters: `kill` accepts the
+        // caller's EFFECTIVE uid against the target's real one, so this same
+        // pair may be killed. Two rules over one pair of credentials, two
+        // answers.
+        let borrowed = ids(OTHER, USER, OTHER, OTHER_GROUP, GROUP, OTHER_GROUP);
+        let target = plain(USER, GROUP);
+        assert!(LinuxProcess::may_signal_cred(&borrowed, &target));
+        assert!(!LinuxProcess::may_attach_to(&borrowed, &target, false));
+    }
+
+    #[test]
+    fn a_setuid_program_is_out_of_reach_for_the_user_who_started_it() {
+        // The headline case, and why the rule is this strict: the user's own
+        // shell started a set-user-ID root program, so the user may still KILL
+        // it -- its real and saved uids are theirs. Taking its open files would
+        // be taking root's files, so the reach stops at the effective uid it
+        // holds.
+        let user = plain(USER, GROUP);
+        let setuid_root = ids(USER, ROOT_UID, ROOT_UID, GROUP, ROOT_UID, ROOT_UID);
+        assert!(LinuxProcess::may_signal_cred(&user, &setuid_root));
+        assert!(!LinuxProcess::may_attach_to(&user, &setuid_root, false));
+    }
+
+    // ---- the capability, and the escape -----------------------------------
+
+    #[test]
+    fn cap_sys_ptrace_is_nineteen() {
+        // From the ABI (`include/uapi/linux/capability.h`), so asserted
+        // against the literal and not against another name for it.
+        assert_eq!(CAP_SYS_PTRACE, 19);
+    }
+
+    #[test]
+    fn the_capability_lifts_the_six_comparisons() {
+        assert!(LinuxProcess::may_attach_to(
+            &plain(ROOT_UID, ROOT_UID),
+            &plain(OTHER, OTHER_GROUP),
+            false
+        ));
+    }
+
+    #[test]
+    fn the_capability_is_read_from_the_callers_effective_uid() {
+        // Not the real one the comparisons use: the ids ask who you ARE and
+        // the capability asks what you may DO, and in this kernel the second
+        // is the effective uid. A root program that dropped to a user keeps
+        // neither.
+        let root_by_real_uid_only = ids(ROOT_UID, USER, USER, ROOT_UID, GROUP, GROUP);
+        assert!(!LinuxProcess::may_attach_to(
+            &root_by_real_uid_only,
+            &plain(OTHER, OTHER_GROUP),
+            false
+        ));
+        let root_by_effective_uid = ids(USER, ROOT_UID, USER, GROUP, ROOT_UID, GROUP);
+        assert!(LinuxProcess::may_attach_to(
+            &root_by_effective_uid,
+            &plain(OTHER, OTHER_GROUP),
+            false
+        ));
+    }
+
+    #[test]
+    fn your_own_thread_group_is_reached_without_reading_an_id() {
+        // Linux short-circuits the whole check for your own thread group, and
+        // it is kept because a pidfd on yourself is how `pidfd_getfd` spells
+        // `dup`. With one credential set per thread group the ids would say
+        // yes anyway, so this cannot change an answer here -- it is Linux's
+        // seventh test, the non-dumpable one this kernel does not have, that
+        // the escape exists to get past.
+        let me = ids(USER, ROOT_UID, ROOT_UID, GROUP, ROOT_UID, ROOT_UID);
+        assert!(LinuxProcess::may_attach_to(&me, &me, true));
+        assert!(LinuxProcess::may_attach_to(&me, &me, false));
+    }
+
+    // ---- the rule next door -----------------------------------------------
+
+    #[test]
+    fn the_six_comparisons_are_the_ones_prlimit_makes() {
+        // `check_prlimit_permission()` and `__ptrace_may_access()` are the same
+        // six lines in Linux, and they are two functions here on purpose: they
+        // ask for different capabilities and they escape differently. This
+        // pins the half they do share, so moving one id in one of them has to
+        // be a decision about both.
+        let pairs = [
+            (plain(USER, GROUP), plain(USER, GROUP)),
+            (plain(USER, GROUP), plain(OTHER, OTHER_GROUP)),
+            (
+                plain(USER, GROUP),
+                ids(USER, OTHER, USER, GROUP, GROUP, GROUP),
+            ),
+            (
+                plain(USER, GROUP),
+                ids(USER, USER, USER, GROUP, GROUP, OTHER_GROUP),
+            ),
+            (
+                ids(USER, OTHER, USER, GROUP, OTHER_GROUP, GROUP),
+                plain(USER, GROUP),
+            ),
+            (plain(ROOT_UID, ROOT_UID), plain(OTHER, OTHER_GROUP)),
+            (plain(USER, GROUP), plain(ROOT_UID, ROOT_UID)),
+        ];
+        for (caller, target) in pairs.iter() {
+            assert_eq!(
+                LinuxProcess::may_attach_to(caller, target, false),
+                LinuxProcess::may_touch_limits_of(caller, target),
+                "{:?} against {:?}",
+                caller,
+                target
+            );
+        }
     }
 }
 
