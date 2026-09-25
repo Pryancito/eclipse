@@ -134,8 +134,18 @@ hal_fn_def! {
 
     /// Interrupts management.
     pub mod interrupt {
-        /// Suspend the CPU (also enable interrupts) and wait for an interrupt
-        /// to occurs, then disable interrupts.
+        /// Park the CPU until an interrupt arrives, service it, and return with
+        /// the caller's interrupt-enable state exactly as it was.
+        ///
+        /// Both halves of that are load-bearing and both have been got wrong
+        /// here. The wait must be entered with the interrupts *still* in the
+        /// caller's state: every architecture's park instruction wakes on a
+        /// pending interrupt whether or not it is masked, so unmasking first
+        /// only opens a window where the interrupt meant to end the wait is
+        /// taken before the wait begins — and then the CPU sleeps to the next
+        /// periodic tick. And the state must be restored rather than chosen,
+        /// because the one caller that matters (`zCore`'s idle loop) runs with
+        /// interrupts enabled and keeps running after this returns.
         pub fn wait_for_interrupt() {
             core::hint::spin_loop();
         }

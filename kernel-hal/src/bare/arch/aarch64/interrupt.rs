@@ -6,9 +6,35 @@ use cortex_a::asm::wfi;
 hal_fn_impl! {
     impl mod crate::hal_fn::interrupt {
         fn wait_for_interrupt() {
-            intr_on();
+            let enable = intr_get();
+            let idle_start = crate::hal_fn::timer::timer_now();
+            crate::kstats::set_cpu_idle(true);
+            // `wfi` is not gated by `PSTATE.{I,F}`: ARMv8-A says a WFI wake-up
+            // event is taken as a wake-up whether or not it is masked. So
+            // unmasking first bought nothing and cost the wake — an SGI landing
+            // between the `daifclr` and the `wfi` was taken and retired there,
+            // and the `wfi` then slept until the next periodic tick.
+            //
+            // The unconditional `intr_off()` afterwards was worse: it did not
+            // restore the caller's state, it imposed one. The idle loop in
+            // `zCore` runs with interrupts enabled, so its first nap here
+            // returned with them masked and every later `run_until_idle` ran
+            // that way — no timer preemption, and no maskable TLB-shootdown
+            // acknowledgement, which is what a shootdown initiator waits for
+            // without a timeout.
             wfi();
-            intr_off();
+            if !enable {
+                // Caller had them masked and the wake is still pending: give it
+                // one instruction's window, then put the caller's state back.
+                intr_on();
+                intr_off();
+            }
+            crate::kstats::set_cpu_idle(false);
+            let idle_ns = crate::hal_fn::timer::timer_now()
+                .checked_sub(idle_start)
+                .unwrap_or_default()
+                .as_nanos() as u64;
+            crate::kstats::note_idle(idle_ns);
         }
 
         fn handle_irq(vector: usize) {

@@ -7,13 +7,35 @@ hal_fn_impl! {
     impl mod crate::hal_fn::interrupt {
         fn wait_for_interrupt() {
             let enable = sstatus::read().sie();
-            if !enable {
-                unsafe { sstatus::set_sie() };
-            }
+            let idle_start = crate::hal_fn::timer::timer_now();
+            crate::kstats::set_cpu_idle(true);
+            // `wfi` is not gated by `sstatus.sie`. The privileged spec says its
+            // operation is "unaffected by the global interrupt bits" and that
+            // it honours the individual enables alone, so a hart parked here
+            // wakes on an IPI whether or not `sie` is set.
+            //
+            // Opening `sie` first therefore bought nothing and cost the wake:
+            // an IPI landing in the window between the `set_sie` and the `wfi`
+            // was taken and retired *there*, and the `wfi` that followed had
+            // nothing left to wake it until the next periodic tick — 4 ms at
+            // 250 Hz, on the path the reschedule kick exists to make fast.
+            // The scheduler's own copy of this function had the same fault.
             unsafe { asm::wfi(); }
             if !enable {
+                // The caller had interrupts masked, so whatever woke the hart
+                // is still pending and unserviced. Open one instruction's worth
+                // of window for it, then put the caller's state back: parking
+                // the CPU is this function's job, deciding the caller's
+                // interrupt state is not.
+                unsafe { sstatus::set_sie() };
                 unsafe { sstatus::clear_sie() };
             }
+            crate::kstats::set_cpu_idle(false);
+            let idle_ns = crate::hal_fn::timer::timer_now()
+                .checked_sub(idle_start)
+                .unwrap_or_default()
+                .as_nanos() as u64;
+            crate::kstats::note_idle(idle_ns);
         }
 
         fn handle_irq(cause: usize) {
