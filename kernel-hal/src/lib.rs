@@ -44,6 +44,18 @@ cfg_if! {
     }
 }
 
+/// The per-CPU block, pulled into the host build for its tests alone.
+///
+/// `bare/` is `not(feature = "libos")`, and the host suite is a `libos` build,
+/// so nothing outside a kernel build had ever compiled this module — while the
+/// emulator, which does, boots one or two cores and never exercises what it
+/// decides. The module carries its own seams for the two things it cannot have
+/// on a host (the per-CPU register and the hardware CPU id); everything else it
+/// runs here is the code the machine runs.
+#[cfg(all(test, feature = "libos"))]
+#[path = "bare/percpu.rs"]
+mod bare_percpu;
+
 pub(crate) use config::KCONFIG;
 pub(crate) use kernel_handler::KHANDLER;
 

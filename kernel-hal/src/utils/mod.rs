@@ -1,4 +1,4 @@
-#[cfg(not(feature = "libos"))]
+#[cfg(any(not(feature = "libos"), test))]
 use core::cell::UnsafeCell;
 
 pub(crate) mod page_table;
@@ -13,14 +13,14 @@ pub mod deferred_job;
 pub mod lazy_init;
 pub mod mpsc_queue;
 
-#[cfg(not(feature = "libos"))]
+#[cfg(any(not(feature = "libos"), test))]
 pub struct PerCpuCell<T>(pub UnsafeCell<T>);
 
-#[cfg(not(feature = "libos"))]
+#[cfg(any(not(feature = "libos"), test))]
 // #Safety: Only the corresponding cpu will access it.
 unsafe impl<T> Sync for PerCpuCell<T> {}
 
-#[cfg(not(feature = "libos"))]
+#[cfg(any(not(feature = "libos"), test))]
 impl<T> PerCpuCell<T> {
     pub const fn new(t: T) -> Self {
         Self(UnsafeCell::new(t))

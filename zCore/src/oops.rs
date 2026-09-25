@@ -195,6 +195,23 @@ pub fn try_contain(what: &str, restore_kd: Option<u32>) {
     let victim = kernel_hal::thread::get_current_thread()
         .and_then(|thread| thread.downcast::<Thread>().ok());
 
+    // A per-CPU block pointer this CPU refused to dereference. Zero on a
+    // healthy machine — and when it is not, it names the author of everything
+    // printed above: the GS region was written by something that is not
+    // bring-up, which is how "heap corruption with no culprit" starts.
+    #[cfg(not(feature = "libos"))]
+    {
+        let (refused, last) = kernel_hal::percpu::bogus_percpu_ptrs();
+        if refused != 0 {
+            oops_report!(
+                "\n[isolate] {} per-CPU block pointer(s) refused, last {:#x} — \
+                 this CPU's GS region held something bring-up never published\n",
+                refused,
+                last,
+            );
+        }
+    }
+
     // Printed BEFORE any kill/abandon so the heuristic survives even if the
     // corrupt heap re-faults the isolation path (the re-entrancy guard then
     // halts, but this line already escaped).
