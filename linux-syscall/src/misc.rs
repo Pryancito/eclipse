@@ -1,7 +1,7 @@
 use super::*;
 use core::time::Duration;
 use kernel_hal::timer::timer_now;
-use linux_object::process::{CAP_SYS_ADMIN, CAP_SYS_BOOT};
+use linux_object::process::{CAP_SYS_ADMIN, CAP_SYS_BOOT, CAP_SYS_RESOURCE};
 use linux_object::time::*;
 use zircon_object::task::ThreadState;
 use zircon_object::{ZxError, ZxResult};
@@ -779,6 +779,19 @@ impl Syscall<'_> {
     }
 
     /// Combines and extends the functionality of setrlimit() and getrlimit()
+    ///
+    /// Four of the sixteen resources used to be answered -- three of them
+    /// with a constant, whatever the caller had asked for -- and the other
+    /// twelve with `ENOSYS`, which is not an answer a program expects:
+    /// `ulimit -a` walks all sixteen, and a daemon that turns its core dumps
+    /// off with `setrlimit(RLIMIT_CORE, {0, 0})` was told the call does not
+    /// exist.
+    ///
+    /// And `pid` was read only to be printed. Every call landed on the
+    /// CALLER, so `prlimit(other, RLIMIT_NOFILE, &new)` moved the caller's
+    /// own descriptor budget and reported success: a program asking about
+    /// somebody else got its own answer, and a program *setting* somebody
+    /// else's limit changed the wrong process.
     pub fn sys_prlimit64(
         &mut self,
         pid: usize,
@@ -790,33 +803,42 @@ impl Syscall<'_> {
             "prlimit64: pid: {}, resource: {}, new_limit: {:x?}, old_limit: {:x?}",
             pid, resource, new_limit, old_limit
         );
-        let proc = self.linux_process();
-        match resource {
-            RLIMIT_STACK => {
-                old_limit.write_if_not_null(RLimit {
-                    cur: USER_STACK_SIZE as u64,
-                    max: USER_STACK_SIZE as u64,
-                })?;
-                Ok(0)
-            }
-            RLIMIT_NOFILE => {
-                let new_limit = new_limit.read_if_not_null()?;
-                // `cur` is what actually caps this process's fd table
-                // (`LinuxProcess::file_limit`), and nothing checked it before:
-                // a soft limit above the hard one was simply installed, so the
-                // hard limit meant nothing at all.
-                let new_limit = new_limit.map(rlimit_validate).transpose()?;
-                old_limit.write_if_not_null(proc.file_limit(new_limit))?;
-                Ok(0)
-            }
-            RLIMIT_RSS | RLIMIT_AS => {
-                old_limit.write_if_not_null(RLimit {
-                    cur: 1024 * 1024 * 1024,
-                    max: 1024 * 1024 * 1024,
-                })?;
-                Ok(0)
-            }
-            _ => Err(LxError::ENOSYS),
+        let new_limit = new_limit.read_if_not_null()?;
+        // `capable(CAP_SYS_RESOURCE)` is asked of whoever is CALLING, both
+        // here and inside `prlimit_target`; the target's own privileges never
+        // enter into it.
+        let may_raise_hard = self.linux_process().capable(CAP_SYS_RESOURCE);
+        // `tsk = pid ? find_task_by_vpid(pid) : current;`
+        let target = self.prlimit_target(pid)?;
+        let old = target.try_linux().ok_or(LxError::ESRCH)?.rlimit(
+            resource,
+            new_limit,
+            may_raise_hard,
+        )?;
+        old_limit.write_if_not_null(old)?;
+        Ok(0)
+    }
+
+    /// The process `prlimit64(pid, ...)` is about: the caller for `pid == 0`
+    /// or for its own pid, otherwise whichever process that is -- `ESRCH`
+    /// when there is none, `EPERM` when it is not the caller's to touch.
+    fn prlimit_target(&self, pid: usize) -> linux_object::error::LxResult<Arc<Process>> {
+        let me = self.zircon_process();
+        if pid == 0 || pid as u64 == me.id() {
+            return Ok(me.clone());
+        }
+        let target = linux_object::process::find_process(pid as u64).ok_or(LxError::ESRCH)?;
+        let allowed = {
+            let other = target.try_linux().ok_or(LxError::ESRCH)?;
+            LinuxProcess::may_touch_limits_of(
+                &self.linux_process().credentials(),
+                &other.credentials(),
+            )
+        };
+        if allowed {
+            Ok(target)
+        } else {
+            Err(LxError::EPERM)
         }
     }
 
@@ -990,42 +1012,6 @@ pub fn futex_deadline(
     }
 }
 
-const USER_STACK_SIZE: usize = 8 * 1024 * 1024; // 8 MB, the default config of Linux
-
-/// Linux's `sysctl_nr_open` default: the ceiling `prlimit64` puts on
-/// `RLIMIT_NOFILE`'s hard limit, over which it answers `EPERM`.
-const NR_OPEN: u64 = 1024 * 1024;
-
-/// Check a `new_limit` from `setrlimit(2)` / `prlimit64(2)`.
-///
-/// Two of the three rules `do_prlimit` applies:
-///
-/// ```c
-/// if (new_rlim->rlim_cur > new_rlim->rlim_max)                        return -EINVAL;
-/// if (resource == RLIMIT_NOFILE && new_rlim->rlim_max > sysctl_nr_open) return -EPERM;
-/// ```
-///
-/// The third -- raising the hard limit above its old value needs
-/// `CAP_SYS_RESOURCE` -- is deliberately **not** implemented, because this
-/// kernel has no capability model to ask. So the hard limit here stops a
-/// process from raising its soft limit past it *by mistake*; it does not stop
-/// a process that sets both at once. Worth knowing before anyone relies on
-/// `RLIMIT_NOFILE` as a boundary rather than as a self-imposed budget.
-fn rlimit_validate(new: RLimit) -> Result<RLimit, LxError> {
-    if new.cur > new.max {
-        return Err(LxError::EINVAL);
-    }
-    if new.max > NR_OPEN {
-        return Err(LxError::EPERM);
-    }
-    Ok(new)
-}
-
-const RLIMIT_STACK: usize = 3;
-const RLIMIT_RSS: usize = 5;
-const RLIMIT_NOFILE: usize = 7;
-const RLIMIT_AS: usize = 9;
-
 /// `struct __user_cap_header_struct` from `linux/capability.h`, the in/out
 /// header both `capget(2)` and `capset(2)` start with.
 #[repr(C)]
@@ -1064,109 +1050,6 @@ fn cap_version_elems(version: u32) -> Option<usize> {
         LINUX_CAPABILITY_VERSION_1 => Some(1),
         LINUX_CAPABILITY_VERSION_2 | LINUX_CAPABILITY_VERSION_3 => Some(2),
         _ => None,
-    }
-}
-
-#[cfg(test)]
-mod rlimit_tests {
-    //! `RLIMIT_NOFILE`'s soft limit is what actually caps this process's fd
-    //! table, and nothing checked the pair before: a soft limit above the hard
-    //! one was installed as given, so the hard limit meant nothing at all.
-
-    use super::{rlimit_validate, LxError, RLimit, NR_OPEN};
-
-    #[test]
-    fn a_soft_limit_above_the_hard_one_is_einval() {
-        // The rule that makes the hard limit mean anything.
-        assert_eq!(
-            rlimit_validate(RLimit {
-                cur: 4096,
-                max: 1024
-            }),
-            Err(LxError::EINVAL)
-        );
-        assert_eq!(
-            rlimit_validate(RLimit { cur: 1, max: 0 }),
-            Err(LxError::EINVAL)
-        );
-    }
-
-    #[test]
-    fn a_soft_limit_equal_to_the_hard_one_is_fine() {
-        // The boundary is `>`, not `>=`: setting both to the same value is
-        // what a process does when it raises itself to its hard limit, which
-        // is the single most common `setrlimit` call there is.
-        let l = RLimit {
-            cur: 1024,
-            max: 1024,
-        };
-        assert_eq!(rlimit_validate(l), Ok(l));
-        let l = RLimit { cur: 0, max: 0 };
-        assert_eq!(rlimit_validate(l), Ok(l));
-    }
-
-    #[test]
-    fn a_hard_limit_past_nr_open_is_eperm_not_einval() {
-        // Linux answers EPERM here and EINVAL above, and the difference is
-        // load-bearing: a caller that sees EPERM retries with a smaller
-        // number, and one that sees EINVAL concludes it built the struct
-        // wrong. `RLIM_INFINITY` is the value every "just give me all the
-        // file descriptors" program passes.
-        assert_eq!(
-            rlimit_validate(RLimit {
-                cur: NR_OPEN,
-                max: NR_OPEN + 1
-            }),
-            Err(LxError::EPERM)
-        );
-        assert_eq!(
-            rlimit_validate(RLimit {
-                cur: u64::MAX,
-                max: u64::MAX
-            }),
-            Err(LxError::EPERM)
-        );
-    }
-
-    #[test]
-    fn nr_open_itself_is_accepted() {
-        let l = RLimit {
-            cur: NR_OPEN,
-            max: NR_OPEN,
-        };
-        assert_eq!(rlimit_validate(l), Ok(l));
-    }
-
-    #[test]
-    fn the_order_of_the_two_rules_is_linuxs() {
-        // Both wrong at once: `cur > max` is checked first, so this is EINVAL
-        // and not EPERM. A caller that retries on EPERM would otherwise spin
-        // on a struct that is never going to be accepted.
-        assert_eq!(
-            rlimit_validate(RLimit {
-                cur: u64::MAX,
-                max: NR_OPEN + 1,
-            }),
-            Err(LxError::EINVAL)
-        );
-    }
-
-    #[test]
-    fn the_hard_limit_is_not_a_security_boundary_here() {
-        // Documented on purpose: Linux also needs `CAP_SYS_RESOURCE` to raise
-        // the hard limit above its old value, and this kernel has no
-        // capability model to ask, so that rule is not implemented. A process
-        // can still lift both at once, and this test is here so that the gap
-        // is a decision on the record rather than a surprise.
-        let l = RLimit {
-            cur: NR_OPEN,
-            max: NR_OPEN,
-        };
-        assert_eq!(
-            rlimit_validate(l),
-            Ok(l),
-            "raising both at once is accepted; see the note on rlimit_validate"
-        );
     }
 }
 

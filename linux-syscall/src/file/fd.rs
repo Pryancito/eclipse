@@ -581,7 +581,7 @@ impl Syscall<'_> {
     pub fn sys_dup2(&self, fd1: FileDesc, fd2: usize) -> SysResult {
         info!("dup2: from {:?} to {}", fd1, fd2);
         let proc = self.linux_process();
-        let fd2 = dup_target(fd2, proc.file_limit(None).cur)?;
+        let fd2 = dup_target(fd2, proc.file_limit().cur)?;
         if fd1 == fd2 {
             let _ = proc.get_file_like(fd1)?;
             return Ok(fd2.into());
@@ -621,7 +621,7 @@ impl Syscall<'_> {
     /// process with no privileges.
     pub fn sys_dupfd(&self, fd1: FileDesc, start: usize) -> SysResult {
         let proc = self.linux_process();
-        let nofile = proc.file_limit(None).cur;
+        let nofile = proc.file_limit().cur;
         let start = dupfd_start(start, nofile)?;
         let new_fd = dupfd_picked(proc.get_free_fd_from(start).into(), nofile)?;
         // sys_dup2 registers the new fd with CLOEXEC off (POSIX dup

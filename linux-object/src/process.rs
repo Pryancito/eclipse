@@ -71,6 +71,9 @@ pub const CAP_SETUID: u32 = 7;
 pub const CAP_SYS_ADMIN: u32 = 21;
 /// `CAP_SYS_BOOT`: `reboot(2)` and `kexec_load(2)`.
 pub const CAP_SYS_BOOT: u32 = 22;
+/// `CAP_SYS_RESOURCE`: raise a hard resource limit, and reach into another
+/// process's limits.
+pub const CAP_SYS_RESOURCE: u32 = 24;
 /// `CAP_SYS_TIME`: set the system clock and discipline it.
 pub const CAP_SYS_TIME: u32 = 25;
 
@@ -882,8 +885,14 @@ struct LinuxProcessInner {
     ///
     /// Omit leading '/'.
     current_working_directory: String,
-    /// file open number limit
-    file_limit: RLimit,
+    /// The process's sixteen resource limits, `tsk->signal->rlim` indexed by
+    /// resource number. Only [`RLIMIT_NOFILE`] is enforced (right below, on
+    /// every descriptor this table grows by); the rest are the soft budgets
+    /// `getrlimit`/`setrlimit` remember for the program that set them. Each
+    /// of the two facts is checkable: nothing else in this crate reads the
+    /// array, and the hard limits are what [`LinuxProcess::rlimit`] refuses
+    /// to raise without `CAP_SYS_RESOURCE`.
+    limits: RLimits,
     /// Opened files
     files: HashMap<FileDesc, Arc<dyn FileLike>>,
     /// Per-descriptor `FD_CLOEXEC` state — the set of fds the next `execve`
@@ -1031,6 +1040,135 @@ impl Default for RLimit {
         }
     }
 }
+
+/// `RLIM_INFINITY`: no limit at all. Not a very large limit -- code that
+/// enforces a limit has to recognise it and not compare against it.
+pub const RLIM_INFINITY: u64 = u64::MAX;
+
+/// The sixteen resources of `asm-generic/resource.h`, in its order. A number
+/// at or above [`RLIM_NLIMITS`] is `EINVAL`, not a resource this kernel has
+/// not got round to.
+pub const RLIMIT_CPU: usize = 0;
+/// Largest file the process may create, in bytes.
+pub const RLIMIT_FSIZE: usize = 1;
+/// Size of the data segment.
+pub const RLIMIT_DATA: usize = 2;
+/// Size of the main thread's stack.
+pub const RLIMIT_STACK: usize = 3;
+/// Largest core dump, in bytes.
+pub const RLIMIT_CORE: usize = 4;
+/// Resident set size.
+pub const RLIMIT_RSS: usize = 5;
+/// Processes the real uid may have.
+pub const RLIMIT_NPROC: usize = 6;
+/// **One more than** the highest descriptor the process may open. The one
+/// limit this kernel actually enforces.
+pub const RLIMIT_NOFILE: usize = 7;
+/// Memory that may be locked down.
+pub const RLIMIT_MEMLOCK: usize = 8;
+/// Size of the address space.
+pub const RLIMIT_AS: usize = 9;
+/// File locks the process may hold.
+pub const RLIMIT_LOCKS: usize = 10;
+/// Signals that may be queued.
+pub const RLIMIT_SIGPENDING: usize = 11;
+/// Bytes in POSIX message queues.
+pub const RLIMIT_MSGQUEUE: usize = 12;
+/// Ceiling on the nice value, as `20 - nice`.
+pub const RLIMIT_NICE: usize = 13;
+/// Ceiling on the real-time priority.
+pub const RLIMIT_RTPRIO: usize = 14;
+/// Microseconds of CPU a real-time thread may take without blocking.
+pub const RLIMIT_RTTIME: usize = 15;
+/// How many there are.
+pub const RLIM_NLIMITS: usize = 16;
+
+/// Linux's `sysctl_nr_open` default: the ceiling `prlimit64` puts on
+/// `RLIMIT_NOFILE`'s HARD limit, over which it answers `EPERM`. It applies to
+/// that one resource and no other.
+pub const NR_OPEN: u64 = 1024 * 1024;
+
+/// 8 MiB, Linux's `_STK_LIM` and the size this kernel gives a user stack.
+pub const USER_STACK_SIZE: u64 = 8 * 1024 * 1024;
+
+/// A process's sixteen limits, indexed by resource number.
+///
+/// A newtype and not a bare array because `LinuxProcessInner` derives
+/// `Default`, and a derived array default is sixteen copies of one row --
+/// which is how every resource would quietly come out as whatever
+/// [`RLimit::default`] happens to say.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RLimits([RLimit; RLIM_NLIMITS]);
+
+impl Default for RLimits {
+    fn default() -> Self {
+        RLimits(INIT_RLIMITS)
+    }
+}
+
+impl RLimits {
+    /// The limit for `resource`, or `EINVAL` for a number that is not one.
+    pub fn get(&self, resource: usize) -> LxResult<RLimit> {
+        self.0.get(resource).copied().ok_or(LxError::EINVAL)
+    }
+
+    /// Replace one row. The rules live in [`LinuxProcess::rlimit_check`];
+    /// this only stores.
+    pub fn set(&mut self, resource: usize, limit: RLimit) -> LxResult {
+        *self.0.get_mut(resource).ok_or(LxError::EINVAL)? = limit;
+        Ok(())
+    }
+}
+
+/// `INIT_RLIMITS` (`include/asm-generic/resource.h`), one row per resource in
+/// the order above.
+///
+/// One deliberate departure: `RLIMIT_NPROC` and `RLIMIT_SIGPENDING` are
+/// `{0, 0}` in Linux because `init` overwrites them from `max_threads` before
+/// any userspace runs. Nothing counts either here, so `RLIM_INFINITY` is the
+/// truth about this kernel where a literal zero would not be.
+///
+/// What a process used to get was [`RLimit::default`] -- 1024/1024 -- for the
+/// one limit that existed. The soft limit is unchanged; the hard one becomes
+/// Linux's `INR_OPEN_MAX`, so a process can raise its own descriptor budget
+/// to 4096 the way it can anywhere else.
+const INIT_RLIMITS: [RLimit; RLIM_NLIMITS] = {
+    const INF: RLimit = RLimit {
+        cur: RLIM_INFINITY,
+        max: RLIM_INFINITY,
+    };
+    let mut table = [INF; RLIM_NLIMITS];
+    table[RLIMIT_STACK] = RLimit {
+        cur: USER_STACK_SIZE,
+        max: RLIM_INFINITY,
+    };
+    // No core is ever written, so a soft limit of zero is not a policy
+    // this kernel is choosing: it is the size of the dump.
+    table[RLIMIT_CORE] = RLimit {
+        cur: 0,
+        max: RLIM_INFINITY,
+    };
+    // `INR_OPEN_CUR` / `INR_OPEN_MAX`.
+    table[RLIMIT_NOFILE] = RLimit {
+        cur: 1024,
+        max: 4096,
+    };
+    // `MLOCK_LIMIT`.
+    table[RLIMIT_MEMLOCK] = RLimit {
+        cur: USER_STACK_SIZE,
+        max: USER_STACK_SIZE,
+    };
+    // `MQ_BYTES_MAX`.
+    table[RLIMIT_MSGQUEUE] = RLimit {
+        cur: 819_200,
+        max: 819_200,
+    };
+    // A process may not raise its own priority here at all, which is what
+    // Linux's zero means.
+    table[RLIMIT_NICE] = RLimit { cur: 0, max: 0 };
+    table[RLIMIT_RTPRIO] = RLimit { cur: 0, max: 0 };
+    table
+};
 
 /// The type of process exit code.
 pub type ExitCode = i32;
@@ -1372,7 +1510,7 @@ impl LinuxProcess {
         let old = inner.files.remove(&fd);
         // Net table size is unchanged (replace) or +1 (plain insert); apply the
         // same limit check as insert_file for the growth case.
-        if old.is_none() && inner.files.len() >= inner.file_limit.cur as usize {
+        if old.is_none() && inner.files.len() >= inner.nofile() {
             return Err(LxError::EMFILE);
         }
         if cloexec {
@@ -1392,7 +1530,7 @@ impl LinuxProcess {
         file: Arc<dyn FileLike>,
         cloexec: bool,
     ) -> LxResult<FileDesc> {
-        if inner.files.len() < inner.file_limit.cur as usize {
+        if inner.files.len() < inner.nofile() {
             if cloexec {
                 inner.cloexec_fds.insert(fd);
             } else {
@@ -1429,14 +1567,101 @@ impl LinuxProcess {
         Ok(inner.cloexec_fds.contains(&fd))
     }
 
-    /// get and set file limit number
-    pub fn file_limit(&self, new_limit: Option<RLimit>) -> RLimit {
+    /// The soft `RLIMIT_NOFILE`, the one limit this kernel enforces.
+    ///
+    /// **Read only.** The one way to move a limit is [`Self::rlimit`], which
+    /// is where `do_prlimit`'s rules live; a second way in would be a second
+    /// place for them not to be applied.
+    pub fn file_limit(&self) -> RLimit {
+        self.inner
+            .lock()
+            .limits
+            .get(RLIMIT_NOFILE)
+            .unwrap_or_default()
+    }
+
+    /// `do_prlimit()`: read `resource`, and replace it when `new` is given.
+    /// Returns the limit as it was, which is what `prlimit64` reports.
+    ///
+    /// `may_raise_hard` is the CALLER's `capable(CAP_SYS_RESOURCE)`, not this
+    /// process's: `prlimit64(pid, ...)` asks about whoever is calling.
+    pub fn rlimit(
+        &self,
+        resource: usize,
+        new: Option<RLimit>,
+        may_raise_hard: bool,
+    ) -> LxResult<RLimit> {
         let mut inner = self.inner.lock();
-        let old = inner.file_limit;
-        if let Some(limit) = new_limit {
-            inner.file_limit = limit;
+        let old = inner.limits.get(resource)?;
+        if let Some(new) = new {
+            Self::rlimit_check(resource, old, new, may_raise_hard)?;
+            inner.limits.set(resource, new)?;
         }
-        old
+        Ok(old)
+    }
+
+    /// Whether `caller` may read or move **another** process's limits.
+    ///
+    /// `check_prlimit_permission()`:
+    ///
+    /// ```c
+    /// id_match = (uid_eq(cred->uid, tcred->euid) &&
+    ///             uid_eq(cred->uid, tcred->suid) &&
+    ///             uid_eq(cred->uid, tcred->uid)  &&
+    ///             gid_eq(cred->gid, tcred->egid) &&
+    ///             gid_eq(cred->gid, tcred->sgid) &&
+    ///             gid_eq(cred->gid, tcred->gid));
+    /// if (!id_match && !ns_capable(tcred->user_ns, CAP_SYS_RESOURCE))
+    ///         return -EPERM;
+    /// ```
+    ///
+    /// Note which ids: the caller's REAL pair against all three of the
+    /// target's, every one of them. It is not "same user" -- it is "that
+    /// process has no id I do not already have", so a target that is
+    /// part-way through a set-user-ID dance is out of reach even for the
+    /// user who started it.
+    pub fn may_touch_limits_of(caller: &Credentials, target: &Credentials) -> bool {
+        let ids_match = caller.ruid == target.ruid
+            && caller.ruid == target.euid
+            && caller.ruid == target.suid
+            && caller.rgid == target.rgid
+            && caller.rgid == target.egid
+            && caller.rgid == target.sgid;
+        ids_match || has_capability(caller.euid, CAP_SYS_RESOURCE)
+    }
+
+    /// The three rules `do_prlimit` applies to a new limit, and the fourth
+    /// that `prlimit64` applies before it:
+    ///
+    /// ```c
+    /// if (resource >= RLIM_NLIMITS)                                   return -EINVAL;
+    /// if (new_rlim->rlim_cur > new_rlim->rlim_max)                    return -EINVAL;
+    /// if (resource == RLIMIT_NOFILE &&
+    ///     new_rlim->rlim_max > sysctl_nr_open)                        return -EPERM;
+    /// if (new_rlim->rlim_max > rlim->rlim_max && !capable(CAP_SYS_RESOURCE))
+    ///                                                                 return -EPERM;
+    /// ```
+    ///
+    /// The last one is what makes a hard limit a limit. Without it a process
+    /// that wanted a bigger soft limit than its hard one simply set both at
+    /// once, and the hard limit meant nothing: a self-imposed budget with a
+    /// lid the process could lift.
+    fn rlimit_check(
+        resource: usize,
+        old: RLimit,
+        new: RLimit,
+        may_raise_hard: bool,
+    ) -> LxResult<()> {
+        if new.cur > new.max {
+            return Err(LxError::EINVAL);
+        }
+        if resource == RLIMIT_NOFILE && new.max > NR_OPEN {
+            return Err(LxError::EPERM);
+        }
+        if new.max > old.max && !may_raise_hard {
+            return Err(LxError::EPERM);
+        }
+        Ok(())
     }
 
     /// Get the `File` with given `fd`.
@@ -2555,6 +2780,15 @@ impl LinuxProcessInner {
     }
 
     /// The six ids `issetugid(2)` watches.
+    /// How many descriptors this process may have open: the soft
+    /// `RLIMIT_NOFILE`, and the only limit of the sixteen anything enforces.
+    fn nofile(&self) -> usize {
+        self.limits
+            .get(RLIMIT_NOFILE)
+            .map(|l| l.cur as usize)
+            .unwrap_or(usize::MAX)
+    }
+
     fn ids(&self) -> [u32; 6] {
         let c = &self.credentials;
         [c.ruid, c.euid, c.suid, c.rgid, c.egid, c.sgid]
@@ -2681,7 +2915,7 @@ impl LinuxProcessInner {
             // caps the fd table. Resetting it undid every `ulimit -n` the
             // moment the shell forked -- which is the only way a program ever
             // gets a raised limit.
-            file_limit: self.file_limit,
+            limits: self.limits,
             signal_actions: self.signal_actions.clone(),
             credentials: self.credentials.clone(),
             pgid,
@@ -3162,6 +3396,14 @@ pub fn all_live_processes() -> Vec<Arc<Process>> {
     let mut processes = Vec::new();
     collect_live_processes(&ROOT_JOB, &mut processes);
     processes
+}
+
+/// The process `pid` names, exited or not.
+///
+/// `find_task_by_vpid()`: the lookup a syscall that takes a pid does before
+/// it can ask anything else about it.
+pub fn find_process(pid: KoID) -> Option<Arc<Process>> {
+    ROOT_JOB.find_process(pid)
 }
 
 /// Whether `pid` names a process that has not exited.
@@ -3828,9 +4070,18 @@ mod fork_inheritance_tests {
             cmdline: alloc::vec![String::from("labwc"), String::from("-s")],
             environ: alloc::vec![String::from("WAYLAND_DISPLAY=wayland-0")],
             current_working_directory: String::from("/home/moebius"),
-            file_limit: RLimit {
-                cur: 65536,
-                max: 65536,
+            limits: {
+                let mut limits = RLimits::default();
+                limits
+                    .set(
+                        RLIMIT_NOFILE,
+                        RLimit {
+                            cur: 65536,
+                            max: 65536,
+                        },
+                    )
+                    .unwrap();
+                limits
             },
             brk: 0x5555_0010_0000,
             mapped_brk: 0x5555_0020_0000,
@@ -3882,8 +4133,8 @@ mod fork_inheritance_tests {
         // every raise in the system, silently, and the program hit EMFILE at
         // the default -- the failure a raised limit exists to prevent.
         let child = fork_of(&a_configured_parent());
-        assert_eq!(child.file_limit.cur, 65536);
-        assert_eq!(child.file_limit.max, 65536);
+        assert_eq!(child.limits.get(RLIMIT_NOFILE).unwrap().cur, 65536);
+        assert_eq!(child.limits.get(RLIMIT_NOFILE).unwrap().max, 65536);
     }
 
     #[test]
@@ -4714,6 +4965,379 @@ mod capability_tests {
 }
 
 #[cfg(test)]
+mod rlimit_tests {
+    //! The sixteen resource limits, and who may move them.
+    //!
+    //! Twelve of the sixteen used to answer `ENOSYS` and three more answered
+    //! with a constant, whatever the caller had set. And the hard limit was
+    //! not a limit: an earlier batch left a test saying so on the record --
+    //! *"this kernel has no capability model to ask"* -- because Linux's
+    //! fourth rule needs `CAP_SYS_RESOURCE`. It has one now, so the rule is
+    //! here and that test has become its opposite.
+
+    use super::dup_fd_tests::a_process;
+    use super::*;
+
+    const USER: u32 = 1000;
+    const OTHER: u32 = 2000;
+
+    fn limit(cur: u64, max: u64) -> RLimit {
+        RLimit { cur, max }
+    }
+
+    /// Ordinary credentials: every id the same, so two processes built this
+    /// way with the same numbers can reach each other.
+    fn creds(ruid: u32, euid: u32, suid: u32) -> Credentials {
+        Credentials {
+            ruid,
+            euid,
+            suid,
+            rgid: ruid,
+            egid: euid,
+            sgid: suid,
+            fsuid: euid,
+            fsgid: euid,
+            groups: Vec::new(),
+            umask: 0o022,
+        }
+    }
+
+    fn check(resource: usize, old: RLimit, new: RLimit, may_raise: bool) -> LxResult {
+        LinuxProcess::rlimit_check(resource, old, new, may_raise)
+    }
+
+    // ---- the four rules ----------------------------------------------
+
+    #[test]
+    fn a_soft_limit_above_the_hard_one_is_einval() {
+        // The rule that makes the hard limit mean anything at all.
+        assert_eq!(
+            check(RLIMIT_NOFILE, limit(1024, 1024), limit(4096, 1024), true),
+            Err(LxError::EINVAL)
+        );
+        assert_eq!(
+            check(RLIMIT_CORE, limit(0, RLIM_INFINITY), limit(1, 0), true),
+            Err(LxError::EINVAL)
+        );
+    }
+
+    #[test]
+    fn a_soft_limit_equal_to_the_hard_one_is_fine() {
+        // The boundary is `>`, not `>=`: setting both to the same value is
+        // what a process does when it raises itself to its hard limit, the
+        // single most common `setrlimit` call there is.
+        assert_eq!(
+            check(RLIMIT_NOFILE, limit(1024, 4096), limit(4096, 4096), false),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn the_descriptor_ceiling_is_eperm_and_applies_to_that_resource_alone() {
+        // `if (resource == RLIMIT_NOFILE && new_rlim->rlim_max >
+        // sysctl_nr_open) return -EPERM;`. EPERM and not EINVAL, and the
+        // difference is load-bearing: a caller that sees EPERM retries with a
+        // smaller number, one that sees EINVAL concludes it built the struct
+        // wrong.
+        assert_eq!(
+            check(
+                RLIMIT_NOFILE,
+                limit(0, RLIM_INFINITY),
+                limit(NR_OPEN + 1, NR_OPEN + 1),
+                true
+            ),
+            Err(LxError::EPERM)
+        );
+        assert_eq!(
+            check(
+                RLIMIT_MEMLOCK,
+                limit(0, RLIM_INFINITY),
+                limit(NR_OPEN + 1, NR_OPEN + 1),
+                true
+            ),
+            Ok(()),
+            "a million is not a lot of bytes, and this rule is about descriptors"
+        );
+    }
+
+    #[test]
+    fn the_descriptor_ceiling_itself_is_accepted() {
+        assert_eq!(
+            check(
+                RLIMIT_NOFILE,
+                limit(0, RLIM_INFINITY),
+                limit(NR_OPEN, NR_OPEN),
+                true
+            ),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn the_order_of_the_rules_is_linuxs() {
+        // Both wrong at once: `cur > max` is checked first, so this is EINVAL
+        // and not EPERM. A caller that retries on EPERM would otherwise spin
+        // on a struct that is never going to be accepted.
+        assert_eq!(
+            check(
+                RLIMIT_NOFILE,
+                limit(0, RLIM_INFINITY),
+                limit(RLIM_INFINITY, NR_OPEN + 1),
+                true
+            ),
+            Err(LxError::EINVAL)
+        );
+    }
+
+    #[test]
+    fn the_hard_limit_is_a_boundary_now() {
+        // `if (new_rlim->rlim_max > rlim->rlim_max && !capable(CAP_SYS_RESOURCE))
+        //         retval = -EPERM;`
+        //
+        // Without it a process that wanted a soft limit past its hard one set
+        // both at once and got it, so the hard limit was a lid the process
+        // could lift. This is the test that used to assert the opposite.
+        assert_eq!(
+            check(RLIMIT_NOFILE, limit(1024, 4096), limit(4096, 8192), false),
+            Err(LxError::EPERM)
+        );
+        assert_eq!(
+            check(RLIMIT_NOFILE, limit(1024, 4096), limit(4096, 8192), true),
+            Ok(()),
+            "and CAP_SYS_RESOURCE is what lifts it"
+        );
+    }
+
+    #[test]
+    fn lowering_the_hard_limit_needs_nothing_and_does_not_come_back() {
+        // A one-way ratchet is the point of the thing: a program drops its
+        // own ceiling before running something it does not trust, and that
+        // something cannot undo it.
+        assert_eq!(
+            check(RLIMIT_NOFILE, limit(1024, 4096), limit(64, 64), false),
+            Ok(())
+        );
+        assert_eq!(
+            check(RLIMIT_NOFILE, limit(64, 64), limit(64, 4096), false),
+            Err(LxError::EPERM)
+        );
+    }
+
+    #[test]
+    fn a_hard_limit_that_does_not_move_is_not_a_raise() {
+        // The comparison is `>`, so re-setting the same hard limit while
+        // moving the soft one is the ordinary unprivileged call.
+        assert_eq!(
+            check(RLIMIT_NOFILE, limit(1024, 4096), limit(4096, 4096), false),
+            Ok(())
+        );
+    }
+
+    // ---- the sixteen resources ---------------------------------------
+
+    #[test]
+    fn the_resource_numbers_are_the_ones_resource_h_names() {
+        // The order IS the numbering, so a row out of place is a program
+        // asking about its stack and being told about its core dumps.
+        const IN_ORDER: [(usize, &str); RLIM_NLIMITS] = [
+            (RLIMIT_CPU, "RLIMIT_CPU"),
+            (RLIMIT_FSIZE, "RLIMIT_FSIZE"),
+            (RLIMIT_DATA, "RLIMIT_DATA"),
+            (RLIMIT_STACK, "RLIMIT_STACK"),
+            (RLIMIT_CORE, "RLIMIT_CORE"),
+            (RLIMIT_RSS, "RLIMIT_RSS"),
+            (RLIMIT_NPROC, "RLIMIT_NPROC"),
+            (RLIMIT_NOFILE, "RLIMIT_NOFILE"),
+            (RLIMIT_MEMLOCK, "RLIMIT_MEMLOCK"),
+            (RLIMIT_AS, "RLIMIT_AS"),
+            (RLIMIT_LOCKS, "RLIMIT_LOCKS"),
+            (RLIMIT_SIGPENDING, "RLIMIT_SIGPENDING"),
+            (RLIMIT_MSGQUEUE, "RLIMIT_MSGQUEUE"),
+            (RLIMIT_NICE, "RLIMIT_NICE"),
+            (RLIMIT_RTPRIO, "RLIMIT_RTPRIO"),
+            (RLIMIT_RTTIME, "RLIMIT_RTTIME"),
+        ];
+        for (index, (number, name)) in IN_ORDER.iter().enumerate() {
+            assert_eq!(*number, index, "{} is not number {}", name, index);
+        }
+        assert_eq!(RLIM_NLIMITS, 16);
+    }
+
+    #[test]
+    fn every_resource_answers_and_the_seventeenth_is_einval() {
+        // `ulimit -a` walks all sixteen. Twelve of them used to answer
+        // `ENOSYS`, which a program reads as "this kernel has no such call"
+        // rather than "no such resource".
+        let proc = a_process();
+        for resource in 0..RLIM_NLIMITS {
+            assert!(
+                proc.rlimit(resource, None, false).is_ok(),
+                "resource {} has no answer",
+                resource
+            );
+        }
+        assert_eq!(
+            proc.rlimit(RLIM_NLIMITS, None, false),
+            Err(LxError::EINVAL),
+            "past the end is EINVAL, which is what `do_prlimit` says"
+        );
+        assert_eq!(proc.rlimit(usize::MAX, None, false), Err(LxError::EINVAL));
+    }
+
+    #[test]
+    fn what_a_process_starts_with_is_the_table_linux_starts_with() {
+        let proc = a_process();
+        let at = |r| proc.rlimit(r, None, false).unwrap();
+        assert_eq!(at(RLIMIT_NOFILE), limit(1024, 4096), "INR_OPEN_CUR/MAX");
+        assert_eq!(at(RLIMIT_STACK), limit(USER_STACK_SIZE, RLIM_INFINITY));
+        assert_eq!(
+            at(RLIMIT_CORE),
+            limit(0, RLIM_INFINITY),
+            "no core is ever written, so zero is the size and not a policy"
+        );
+        assert_eq!(at(RLIMIT_NICE), limit(0, 0));
+        assert_eq!(at(RLIMIT_RTPRIO), limit(0, 0));
+        assert_eq!(at(RLIMIT_AS), limit(RLIM_INFINITY, RLIM_INFINITY));
+        assert_eq!(
+            at(RLIMIT_NPROC),
+            limit(RLIM_INFINITY, RLIM_INFINITY),
+            "Linux's zero is a placeholder init overwrites; nothing counts here"
+        );
+    }
+
+    #[test]
+    fn a_limit_that_is_set_is_the_limit_that_is_read_back() {
+        // What three of the four answered resources did not do: they reported
+        // a constant, so a program that lowered `RLIMIT_AS` and read it back
+        // was told its own request had not happened -- and no error said so.
+        let proc = a_process();
+        let wanted = limit(64 * 1024 * 1024, 128 * 1024 * 1024);
+        assert_eq!(
+            proc.rlimit(RLIMIT_AS, Some(wanted), false),
+            Ok(limit(RLIM_INFINITY, RLIM_INFINITY)),
+            "and the answer is the limit as it WAS"
+        );
+        assert_eq!(proc.rlimit(RLIMIT_AS, None, false), Ok(wanted));
+    }
+
+    #[test]
+    fn a_refused_change_leaves_the_limit_where_it_was() {
+        let proc = a_process();
+        let before = proc.rlimit(RLIMIT_NOFILE, None, false).unwrap();
+        assert_eq!(
+            proc.rlimit(RLIMIT_NOFILE, Some(limit(8192, 8192)), false),
+            Err(LxError::EPERM)
+        );
+        assert_eq!(proc.rlimit(RLIMIT_NOFILE, None, false), Ok(before));
+    }
+
+    #[test]
+    fn the_soft_limit_is_what_closes_the_descriptor_table() {
+        // The hard limit is a ceiling on what may be ASKED for; the soft one
+        // is the budget in force. A table that checked the hard limit would
+        // hand out descriptors a program had deliberately stopped itself
+        // taking, and `EMFILE` would arrive four thousand files later than
+        // the program arranged.
+        let proc = a_process();
+        proc.rlimit(RLIMIT_NOFILE, Some(limit(2, 4096)), false)
+            .unwrap();
+        let open =
+            || super::dup_fd_tests::an_open_log(super::dup_fd_tests::Log::new(), OpenFlags::WRONLY);
+        assert!(proc.add_file(open()).is_ok());
+        assert!(proc.add_file(open()).is_ok());
+        assert_eq!(proc.add_file(open()), Err(LxError::EMFILE));
+    }
+
+    #[test]
+    fn the_descriptor_limit_that_is_stored_is_the_one_that_is_enforced() {
+        // One table, one row: there is no second place for the number the fd
+        // table checks to drift away from the number `getrlimit` reports.
+        let proc = a_process();
+        proc.rlimit(RLIMIT_NOFILE, Some(limit(64, 4096)), false)
+            .unwrap();
+        assert_eq!(proc.file_limit(), limit(64, 4096));
+    }
+
+    // ---- whose limits they are ---------------------------------------
+
+    #[test]
+    fn a_process_with_the_very_same_ids_is_reachable() {
+        let caller = creds(USER, USER, USER);
+        let target = creds(USER, USER, USER);
+        assert!(LinuxProcess::may_touch_limits_of(&caller, &target));
+    }
+
+    #[test]
+    fn another_users_process_is_not() {
+        let caller = creds(USER, USER, USER);
+        let target = creds(OTHER, OTHER, OTHER);
+        assert!(!LinuxProcess::may_touch_limits_of(&caller, &target));
+    }
+
+    #[test]
+    fn a_target_part_way_through_a_set_user_id_dance_is_out_of_reach() {
+        // `id_match` is all six comparisons, not "same user": a target that
+        // still holds root in its saved uid is beyond the user who started
+        // it, because raising its limits would raise the limits of whatever
+        // it is about to become.
+        let caller = creds(USER, USER, USER);
+        let target = creds(USER, USER, ROOT_UID);
+        assert!(!LinuxProcess::may_touch_limits_of(&caller, &target));
+        let target = creds(USER, ROOT_UID, USER);
+        assert!(!LinuxProcess::may_touch_limits_of(&caller, &target));
+    }
+
+    #[test]
+    fn it_is_the_callers_real_ids_that_are_compared() {
+        // `cred->uid`, not `cred->euid`. A set-user-ID program does not get
+        // to reach further than the user who ran it just by holding an
+        // effective id; what it gets instead is `CAP_SYS_RESOURCE`, and only
+        // if that effective id is root.
+        //
+        // The caller here differs from the target in its real UID and in
+        // NOTHING else, so the effective ids alone would say yes.
+        let mut caller = creds(USER, USER, USER);
+        caller.ruid = OTHER;
+        let target = creds(USER, USER, USER);
+        assert!(
+            !LinuxProcess::may_touch_limits_of(&caller, &target),
+            "the effective id matches and the real one does not"
+        );
+        let mut caller = creds(USER, USER, USER);
+        caller.rgid = OTHER;
+        assert!(
+            !LinuxProcess::may_touch_limits_of(&caller, &target),
+            "and the same on the group side"
+        );
+    }
+
+    #[test]
+    fn the_group_half_is_compared_too() {
+        let caller = creds(USER, USER, USER);
+        let mut target = creds(USER, USER, USER);
+        target.sgid = OTHER;
+        assert!(!LinuxProcess::may_touch_limits_of(&caller, &target));
+    }
+
+    #[test]
+    fn cap_sys_resource_reaches_anybody() {
+        let root = creds(ROOT_UID, ROOT_UID, ROOT_UID);
+        let target = creds(OTHER, USER, ROOT_UID);
+        assert!(LinuxProcess::may_touch_limits_of(&root, &target));
+    }
+
+    #[test]
+    fn a_root_real_uid_without_a_root_effective_one_does_not() {
+        // The capability comes from the EFFECTIVE id, so a root-owned program
+        // that has dropped to a user is on the id-match path like anyone
+        // else.
+        let dropped = creds(ROOT_UID, USER, USER);
+        let target = creds(OTHER, OTHER, OTHER);
+        assert!(!LinuxProcess::may_touch_limits_of(&dropped, &target));
+    }
+}
+
+#[cfg(test)]
 mod fsid_tests {
     //! `setfsuid(2)`/`setfsgid(2)`, and the id a file access is really
     //! checked against.
@@ -5429,12 +6053,12 @@ mod dup_fd_tests {
 
     /// An inode that remembers where each write landed, so a test can see the
     /// offset a second descriptor actually used.
-    struct Log {
+    pub(super) struct Log {
         writes: Mutex<Vec<(usize, usize)>>,
     }
 
     impl Log {
-        fn new() -> Arc<Self> {
+        pub(super) fn new() -> Arc<Self> {
             Arc::new(Log {
                 writes: Mutex::new(Vec::new()),
             })
@@ -5499,7 +6123,7 @@ mod dup_fd_tests {
     }
 
     /// `sh -c 'prog >log'`: one open file description, opened for writing.
-    fn an_open_log(inode: Arc<Log>, flags: OpenFlags) -> Arc<dyn FileLike> {
+    pub(super) fn an_open_log(inode: Arc<Log>, flags: OpenFlags) -> Arc<dyn FileLike> {
         File::new(inode, flags, String::from("/var/log/prog.log"))
     }
 
