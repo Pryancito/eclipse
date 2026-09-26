@@ -111,8 +111,12 @@ impl Syscall<'_> {
                 MMUFlags::WRITE,
             )?;
         }
+        // The buffer is sized by the fifo, not by `count`: see
+        // `Fifo::read_buffer_elems`. Clamping cannot change the answer, since a
+        // read never returns more elements than the fifo holds.
+        let count = fifo.read_buffer_elems(elem_size, count)?;
         // TODO: uninit buffer
-        let mut data = vec![0; byte_count];
+        let mut data = vec![0; count * elem_size];
         let actual_count = fifo.read(elem_size, &mut data, count)?;
         actual_count_ptr.write_if_not_null(actual_count)?;
         user_bytes.write_array(&data[..actual_count * elem_size])?;

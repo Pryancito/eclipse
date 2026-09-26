@@ -95,18 +95,27 @@ impl Syscall<'_> {
         if contiguous && (compress_results || !vmo.is_contiguous()) {
             return Err(ZxError::INVALID_ARGS);
         }
-        let pmt = bti.pin(vmo, offset, size, options.to_iommu_perms())?;
-        let encoded_addrs = pmt.encode_addrs(compress_results, contiguous)?;
-        if encoded_addrs.len() != addrs_count {
-            warn!(
-                "bti.pin addrs_count = {}, but encoded_addrs.len = {}",
-                addrs_count,
-                encoded_addrs.len()
-            );
-            return Err(ZxError::INVALID_ARGS);
+        let (pmt, encoded_addrs) = bti.pin_and_encode(
+            vmo,
+            offset,
+            size,
+            options.to_iommu_perms(),
+            compress_results,
+            contiguous,
+            addrs_count,
+        )?;
+        // Everything past the pin undoes it when it fails, for the same reason
+        // `pin_and_encode` does: an error here would otherwise answer the
+        // caller with the pages pinned and no handle to let them go.
+        let mut hand_over = || -> ZxResult {
+            addrs.write_array(&encoded_addrs)?;
+            install_handle(proc, Handle::new(pmt.clone(), Rights::INSPECT), &mut out)
+        };
+        let handed_over = hand_over();
+        if handed_over.is_err() {
+            pmt.unpin();
         }
-        addrs.write_array(&encoded_addrs)?;
-        install_handle(proc, Handle::new(pmt, Rights::INSPECT), &mut out)
+        handed_over
     }
 
     /// Unpins pages that were previously pinned by `zx_bti_pin()`.

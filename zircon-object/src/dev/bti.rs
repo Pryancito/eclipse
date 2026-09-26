@@ -5,6 +5,7 @@ use {
     alloc::{sync::Arc, vec::Vec},
     dev::Iommu,
     kernel_hal::sync::Mutex,
+    kernel_hal::DevVAddr,
 };
 
 /// Bus Transaction Initiator.
@@ -62,6 +63,48 @@ impl BusTransactionInitiator {
         let pmt = PinnedMemoryToken::create(self, vmo, perms, offset, size)?;
         self.inner.lock().pmts.push(pmt.clone());
         Ok(pmt)
+    }
+
+    /// Pin a buffer and encode the device addresses a caller expecting
+    /// `addrs_count` of them will be handed, or leave nothing pinned.
+    ///
+    /// `zx_bti_pin` used to pin first and encode after, in the syscall layer:
+    /// an encoding the options made impossible, or a count the caller got
+    /// wrong, answered an error with the pages **still pinned** and the token
+    /// sitting in this initiator's list with no handle to it. From there the
+    /// buffer could never be decommitted or resized again, and the only way
+    /// out was `zx_bti_release_quarantine`, which needs a right on the
+    /// initiator that a caller holding only `MAP` need not have. Doing both
+    /// steps here means a failure undoes the pin.
+    #[allow(clippy::too_many_arguments)]
+    pub fn pin_and_encode(
+        self: &Arc<Self>,
+        vmo: Arc<VmObject>,
+        offset: usize,
+        size: usize,
+        perms: IommuPerms,
+        compress_results: bool,
+        contiguous: bool,
+        addrs_count: usize,
+    ) -> ZxResult<(Arc<PinnedMemoryToken>, Vec<DevVAddr>)> {
+        let pmt = self.pin(vmo, offset, size, perms)?;
+        let encoded = match pmt.encode_addrs(compress_results, contiguous) {
+            Ok(encoded) if encoded.len() == addrs_count => encoded,
+            Ok(encoded) => {
+                warn!(
+                    "bti.pin: the caller has room for {} addresses and the pin needs {}",
+                    addrs_count,
+                    encoded.len(),
+                );
+                pmt.unpin();
+                return Err(ZxError::INVALID_ARGS);
+            }
+            Err(err) => {
+                pmt.unpin();
+                return Err(err);
+            }
+        };
+        Ok((pmt, encoded))
     }
 
     /// Releases all quarantined PMTs.

@@ -6,6 +6,12 @@ use {
     zircon_object::{dev::*, task::PolicyCondition, vm::*},
 };
 
+/// The kernel-side buffer one `zx_vmo_read` copies through at a time.
+///
+/// A read is served whole however long it is; only the staging buffer is
+/// bounded, so no caller can pick the size of a kernel allocation.
+const VMO_READ_CHUNK: usize = 64 * 1024;
+
 impl Syscall<'_> {
     /// Create a new virtual memory object(VMO).
     pub fn sys_vmo_create(
@@ -34,7 +40,7 @@ impl Syscall<'_> {
     pub fn sys_vmo_read(
         &self,
         handle_value: HandleValue,
-        mut buf: UserOutPtr<u8>,
+        buf: UserOutPtr<u8>,
         offset: u64,
         buf_size: usize,
     ) -> ZxResult {
@@ -50,10 +56,16 @@ impl Syscall<'_> {
         }
         proc.vmar()
             .check_user_range(buf.as_addr(), buf_size, MMUFlags::WRITE)?;
-        // TODO: optimize
-        let mut buffer = vec![0u8; buf_size];
-        vmo.read(offset as usize, &mut buffer)?;
-        buf.write_array(&buffer)?;
+        // Through a bounded kernel buffer, a chunk at a time. `vec![0u8;
+        // buf_size]` was an allocation of whatever the caller asked for: a VMO
+        // may be gigabytes long, and a request the heap cannot serve is not an
+        // error here but a kernel panic. The same reason `process_read_memory`
+        // reads in chunks.
+        let mut chunk = vec![0u8; buf_size.min(VMO_READ_CHUNK)];
+        for (done, want) in read_chunks(buf_size, VMO_READ_CHUNK) {
+            vmo.read(offset as usize + done, &mut chunk[..want])?;
+            buf.add(done).write_array(&chunk[..want])?;
+        }
         Ok(())
     }
 
@@ -385,5 +397,50 @@ numeric_enum! {
         CacheClean = 8,
         CacheCleanInvalidate = 9,
         Zero = 10,
+    }
+}
+
+/// The pieces one staged read is copied through: an offset into the caller's
+/// buffer and a length, together covering `buf_size` once, in order, with no
+/// piece longer than `chunk`.
+///
+/// The whole read is still served; only the kernel buffer behind it is bounded.
+fn read_chunks(buf_size: usize, chunk: usize) -> impl Iterator<Item = (usize, usize)> {
+    let chunk = chunk.max(1);
+    (0..buf_size)
+        .step_by(chunk)
+        .map(move |done| (done, (buf_size - done).min(chunk)))
+}
+
+#[cfg(test)]
+mod read_chunk_tests {
+    use super::*;
+    use alloc::vec::Vec;
+
+    /// Every byte of the read is copied exactly once, in order: the caller asked
+    /// for the whole of it and gets the whole of it, however small the kernel
+    /// buffer in between.
+    #[test]
+    fn the_chunks_cover_the_read_once_and_in_order() {
+        for &buf_size in &[0usize, 1, 7, 8, 9, 64, 4096, 4097, 1 << 20] {
+            for &chunk in &[1usize, 8, 4096, 1 << 16] {
+                let pieces: Vec<_> = read_chunks(buf_size, chunk).collect();
+                let mut at = 0;
+                for &(done, want) in &pieces {
+                    assert_eq!(done, at, "a gap or an overlap at {}", at);
+                    assert!(want > 0, "an empty piece at {}", at);
+                    assert!(want <= chunk, "a piece of {} over the {} cap", want, chunk);
+                    at += want;
+                }
+                assert_eq!(at, buf_size, "{} bytes were covered of {}", at, buf_size);
+            }
+        }
+    }
+
+    /// A read of nothing copies nothing rather than one empty piece.
+    #[test]
+    fn a_read_of_no_bytes_has_no_chunks() {
+        assert_eq!(read_chunks(0, 4096).count(), 0);
+        assert_eq!(read_chunks(1, 4096).count(), 1);
     }
 }

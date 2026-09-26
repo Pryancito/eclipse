@@ -100,7 +100,8 @@ impl Syscall<'_> {
                 MMUFlags::WRITE,
             )?;
         }
-        let mut data = vec![0; count];
+        // Sized by the socket and not by `count`: see `Socket::read_buffer_len`.
+        let mut data = vec![0; Socket::read_buffer_len(count)];
         let peek = options.contains(SocketFlags::SOCKET_PEEK);
         let actual_count = socket.read(peek, &mut data)?;
         user_bytes.write_array(&data[..actual_count])?;
