@@ -319,19 +319,22 @@ impl<T: TextBuffer> Handler for ConsoleInner<T> {
         self.goto(self.cursor.row.saturating_sub(rows), self.cursor.col)
     }
 
+    /// `goto` already clamps the row to the last one that exists, so the clamp
+    /// that used to be here was not only redundant, it was the unsafe copy:
+    /// `self.buf.height() - 1` underflows for a buffer with no rows, which is
+    /// what a frame buffer shorter than one character cell reports.
     #[inline]
     fn move_down(&mut self, rows: usize) {
         trace!("Moving down: {}", rows);
-        self.goto(
-            min(self.cursor.row + rows, self.buf.height() - 1) as _,
-            self.cursor.col,
-        )
+        self.goto(self.cursor.row + rows, self.cursor.col)
     }
 
     #[inline]
     fn move_forward(&mut self, cols: usize) {
         trace!("Moving forward: {}", cols);
-        self.cursor.col = min(self.cursor.col + cols, self.buf.width() - 1);
+        // Same `- 1` as above, and this one cannot defer to `goto`: CUF must
+        // leave the row alone.
+        self.cursor.col = min(self.cursor.col + cols, self.buf.width().saturating_sub(1));
     }
 
     #[inline]
@@ -343,7 +346,7 @@ impl<T: TextBuffer> Handler for ConsoleInner<T> {
     #[inline]
     fn move_down_and_cr(&mut self, rows: usize) {
         trace!("Moving down and cr: {}", rows);
-        self.goto(min(self.cursor.row + rows, self.buf.height() - 1) as _, 0)
+        self.goto(self.cursor.row + rows, 0)
     }
 
     #[inline]
@@ -415,6 +418,12 @@ impl<T: TextBuffer> Handler for ConsoleInner<T> {
             return;
         }
         let bg = self.temp.bg();
+        // This clamp is presentational, not protective, and mutation is right
+        // that removing it changes nothing: with a `count` larger than the line
+        // the test below is false for every cell, so the whole range becomes
+        // background either way -- which is what clamping produces too. The
+        // underflow it would otherwise risk is already ruled out by the
+        // `col >= width` return above.
         let count = count.min(width - col);
         for c in (col..width).rev() {
             let cell = if c >= col + count {
@@ -477,18 +486,45 @@ impl<T: TextBuffer> Handler for ConsoleInner<T> {
             self.buf.write(self.cursor.row, i, bg);
         }
     }
+    /// DCH: delete `count` characters at the cursor, pulling the rest of the
+    /// line left.
+    ///
+    /// The clamp used to be `columns - self.cursor.col - 1`, which **underflows
+    /// and panics the kernel** the moment the cursor sits one past the last
+    /// column -- and that is not a corner case: [`Self::input`] parks it there
+    /// every time a line is filled exactly, because a VT terminal defers the
+    /// wrap until the next character arrives. So filling a line to the right
+    /// edge and pressing Delete, which is `\e[P` from readline, took the
+    /// machine down. The `- 1` was also one too few for a cursor inside the
+    /// line: from column 0 it refused to delete the last column.
     #[inline]
     fn delete_chars(&mut self, count: usize) {
         let columns = self.buf.width();
-        let count = min(count, columns - self.cursor.col - 1);
+        // Belt and braces: with the clamp below spelled `columns - start` this
+        // guard no longer changes the outcome (at `col == columns` the count
+        // clamps to 0 and both loops are empty), so mutation reports it as
+        // redundant. It stays because it is what the `- 1` version needed and
+        // did not have, and because a cursor further past the edge than one
+        // column would underflow again.
+        if self.cursor.col >= columns {
+            return;
+        }
         let row = self.cursor.row;
-
         let start = self.cursor.col;
-        let end = start + count;
-
+        let count = min(count, columns - start);
         let bg = self.temp.bg();
-        for i in end..columns {
-            self.buf.write(row, i - count, self.buf.read(row, i));
+        // Pull left whatever survives the deletion...
+        for i in (start + count)..columns {
+            let cell = self.buf.read(row, i);
+            self.buf.write(row, i - count, cell);
+        }
+        // ...and blank the tail it vacated. This second loop is what was
+        // missing: the old code blanked each cell as it copied it, inside the
+        // shift loop, so a `count` reaching the end of the line left the shift
+        // loop empty and **deleted nothing at all** -- `\e[8P` in the first
+        // column of an eight-column line came back unchanged. Its mirror,
+        // `insert_blank`, has always written every cell of the range it covers.
+        for i in columns.saturating_sub(count)..columns {
             self.buf.write(row, i, bg);
         }
     }
@@ -516,7 +552,13 @@ impl<T: TextBuffer> Handler for ConsoleInner<T> {
                 }
             }
             LineClearMode::Left => {
-                for i in 0..=self.cursor.col {
+                // `0..=cursor.col` names the column one past the end whenever
+                // the cursor is parked there after an exactly-full line, and
+                // the cache indexes its rows before the renderer gets a chance
+                // to ignore it: `\e[1K` on a full line was an index out of
+                // bounds inside the kernel.
+                let last = min(self.cursor.col, self.buf.width().saturating_sub(1));
+                for i in 0..=last {
                     self.buf.write(self.cursor.row, i, bg);
                 }
             }
@@ -643,7 +685,12 @@ impl<T: TextBuffer> Handler for ConsoleInner<T> {
                 }
             }
             6 => {
-                let s = alloc::format!("\x1b[{};{}R", self.cursor.row + 1, self.cursor.col + 1);
+                // The cursor parked one past the last column would be reported
+                // as a column that does not exist, and an app that sizes
+                // itself from CPR would believe the screen is one wider than
+                // it is. xterm reports the last column for that state.
+                let col = min(self.cursor.col, self.buf.width().saturating_sub(1));
+                let s = alloc::format!("\x1b[{};{}R", self.cursor.row + 1, col + 1);
                 for c in s.bytes() {
                     self.report.push_back(c);
                 }

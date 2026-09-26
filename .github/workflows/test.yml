@@ -70,7 +70,12 @@ jobs:
           # shadow framebuffer and their tests are all behind it, and without
           # it they are filtered out silently -- a green run that checked
           # nothing.
-          cargo test -p zcore-drivers --lib --features graphic -- --test-threads=1
+          # `virtio` is not optional either, and for a harder reason: it is
+          # the disk, the GPU, the console and the input devices of every QEMU
+          # boot -- every baremetal job in this file runs on them -- and with
+          # the feature off, `drivers/src/virtio/` (696 lines) was not compiled
+          # by anything, here or in `make clippy`.
+          cargo test -p zcore-drivers --lib --features graphic,virtio -- --test-threads=1
           cargo test -p linux-object --lib -- --test-threads=1
           # Three more crates whose unit tests `default-members` hid the same
           # way: the syscall entry points, the HAL (user-pointer copies, CPU
@@ -95,6 +100,53 @@ jobs:
           # and `--features std` is what gives its tests a file-backed device
           # (without it the test target does not even compile).
           cargo test -p rcore-fs-sfs --features std
+          # The three filesystems the kernel mounts over everything else, and
+          # none of them had a line here or a single test. `mountfs` is what
+          # every path in the system is resolved through; `ramfs` is /tmp, /run
+          # and /dev/shm; `devfs` is /dev. 1400 lines that no job compiled as a
+          # test target: they are reached only through `[patch]`, and the bare
+          # `cargo test` above builds `default-members` alone.
+          cargo test -p rcore-fs-mountfs --lib
+          cargo test -p rcore-fs-ramfs --lib
+          cargo test -p rcore-fs-devfs --lib
+          # And the crate underneath all of them: the `INode` trait, the path
+          # walk every `open(2)` goes through, and the block layer the root
+          # filesystem reads the disk with -- the LRU buffer cache included.
+          # It did have three tests, and they had never run either: `mod std`
+          # is gated on `any(test, feature = "std")` but its `libc` dependency
+          # only arrived with the feature, so the test target did not compile.
+          cargo test -p rcore-fs --lib
+          # The virtio drivers themselves: the virtqueue every one of those
+          # devices talks through. The tree vendored them and then built the
+          # git revision anyway -- there was no `[patch]` for this one -- so
+          # `vendor/virtio-drivers` was a copy nothing compiled, let alone
+          # tested. The suite stands a device up out of ordinary memory: the
+          # header is a `#[repr(C)]` register map and the four `virtio_*`
+          # symbols are answered from a bump arena, so a read of a sector goes
+          # through the real ring and comes back.
+          cargo test -p virtio-drivers --lib -- --test-threads=1
+          # The allocator that decides where every PCI BAR window lands: the
+          # 32-bit MMIO, 64-bit MMIO, prefetchable and port-I/O free lists of
+          # every upstream node. It sat in the workspace `exclude` list while
+          # being a path dependency of `zircon-object`, so every kernel build
+          # compiled it and no `cargo test`, `cargo fmt` or `cargo clippy` line
+          # in the tree named it.
+          cargo test -p region-alloc --lib -- --test-threads=1
+          # The text console the kernel prints through, escape sequences and
+          # all. This one was unreachable for a reason: three SDL2 example
+          # programs pulled in `embedded-graphics-simulator`, whose `sdl2-sys`
+          # collides with the one `zcore-drivers` already links, so cargo
+          # refused the crate as a workspace member at all. The demos now sit
+          # out of the build graph (`autoexamples = false`) and the console
+          # itself is tested over a `Vec` standing in for the frame buffer.
+          #
+          # `--no-default-features` on purpose: that turns the `log` feature off,
+          # which is how the kernel takes this crate (`zcore-drivers` asks for it
+          # with `default-features = false`), and it swaps the real `log` macros
+          # for the dummy ones in `src/log.rs`. Those accept a narrower shape of
+          # argument, so a `trace!` that compiles with the feature on can still
+          # fail to build the kernel. This line builds what the kernel builds.
+          cargo test -p rcore-console --lib --no-default-features -- --test-threads=1
           # The loader -- the code around user mode: the signal frame a
           # handler returns from, the CPU-exception-to-signal table. Its
           # default features pull in `zircon`, whose `include_bytes!` of the

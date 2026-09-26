@@ -8,6 +8,18 @@ authors = [
 ]
 edition = "2018"
 description = "The virtual console embedded in rCore kernel: receive text input and print to a framebuffer."
+# `examples/` holds three SDL2 demos of this console running on the host. They
+# are not built, and **cannot be**: every one of them needs
+# `embedded-graphics-simulator`, whose `sdl2 0.32` brings `sdl2-sys 0.32`,
+# while `zcore-drivers` already brings `sdl2-sys 0.34` for its own mock
+# display. Both declare `links = "SDL2"`, and cargo allows exactly one package
+# per `links` value, so with those dev-dependencies in the manifest this crate
+# **cannot be a workspace member at all** -- which is why 2200 lines of the
+# kernel's text console had nowhere to put a test that runs.
+#
+# So the demos stay on disk and out of the build graph. Anyone who wants to
+# run one adds the dev-dependencies back in a scratch checkout.
+autoexamples = false
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -17,14 +29,6 @@ vte = "0.10"
 log = { version = "0.4", default-features = false, optional = true }
 bitflags = "1.3"
 lazy_static = "1.4"
-
-[dev-dependencies]
-embedded-graphics-simulator = "0.3"
-env_logger = "0.7"
-libc = "0.2"
-pty = "0.2"
-mio = "0.6"
-termios = "0.3"
 
 [features]
 default = ["log"]

@@ -1,6 +1,8 @@
 mod bus;
 mod caps;
 mod config;
+#[cfg(test)]
+mod harness;
 mod nodes;
 pub mod pci_init_args;
 mod pmio;

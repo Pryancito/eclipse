@@ -66,3 +66,75 @@ impl<T: Debug> Debug for Dirty<T> {
         write!(f, "[{}] {:?}", tag, self.value)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloc::format;
+
+    #[test]
+    fn a_new_value_is_clean_and_a_read_does_not_dirty_it() {
+        let d = Dirty::new(7u32);
+        assert!(!d.dirty());
+        assert_eq!(*d, 7);
+        assert!(!d.dirty(), "reading the value marked it dirty");
+        drop(d);
+    }
+
+    #[test]
+    fn writing_through_the_deref_dirties_it() {
+        let mut d = Dirty::new(7u32);
+        *d = 8;
+        assert!(d.dirty());
+        assert_eq!(*d, 8);
+        d.sync();
+    }
+
+    #[test]
+    fn new_dirty_starts_owing_the_disk() {
+        let mut d = Dirty::new_dirty(1u8);
+        assert!(d.dirty(), "a value made dirty did not say so");
+        d.sync();
+        assert!(!d.dirty());
+    }
+
+    #[test]
+    fn sync_is_what_clears_it_and_a_later_write_dirties_it_again() {
+        let mut d = Dirty::new(0u8);
+        *d = 1;
+        d.sync();
+        assert!(!d.dirty());
+        *d = 2;
+        assert!(d.dirty());
+        d.sync();
+    }
+
+    #[test]
+    fn the_tag_in_the_debug_output_says_which_it_is() {
+        let mut d = Dirty::new(5u8);
+        assert_eq!(format!("{:?}", d), "[Clean] 5");
+        *d = 6;
+        assert_eq!(format!("{:?}", d), "[Dirty] 6");
+        d.sync();
+    }
+
+    #[test]
+    fn dropping_a_dirty_value_is_refused_loudly() {
+        // The guard exists because a `Dirty` that goes out of scope still
+        // owing the disk is data the caller believes it wrote. Every user in
+        // this tree holds one inside a lock, so the panic is the only notice
+        // anybody would get.
+        let err = std::panic::catch_unwind(|| {
+            let mut d = Dirty::new(0u8);
+            *d = 1;
+            drop(d);
+        })
+        .expect_err("a dirty value was dropped in silence");
+        let msg = err
+            .downcast_ref::<&str>()
+            .map(|s| s.to_string())
+            .or_else(|| err.downcast_ref::<String>().cloned())
+            .unwrap_or_default();
+        assert!(msg.contains("dirty when dropping"), "message: {:?}", msg);
+    }
+}

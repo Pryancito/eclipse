@@ -9,6 +9,10 @@ pub trait IdAllocatorWrapper: Send + Sync {
     fn new(range: Range<usize>) -> Self
     where
         Self: Sized;
+    // Only `IrqManager::register_handler`'s "allocate one" branch asks for an
+    // id without naming it, and aarch64's GIC-400 does not use that door: see
+    // the comment on it.
+    #[cfg_attr(target_arch = "aarch64", allow(dead_code))]
     fn alloc(&mut self) -> DeviceResult<usize>;
     fn alloc_fixed(&mut self, id: usize) -> DeviceResult;
     fn alloc_contiguous(&mut self, count: usize, align_log2: usize) -> DeviceResult<usize>;

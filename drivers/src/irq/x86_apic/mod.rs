@@ -8,7 +8,8 @@ use self::lapic::LocalApic;
 use crate::prelude::{IrqHandler, IrqPolarity, IrqTriggerMode};
 use crate::scheme::{IrqScheme, Scheme};
 use crate::sync::Mutex;
-use crate::{utils::IrqManager, DeviceError, DeviceResult, PhysAddr, VirtAddr};
+use crate::utils::{run_irq_handler, IrqManager};
+use crate::{DeviceError, DeviceResult, PhysAddr, VirtAddr};
 use core::ops::Range;
 
 const IOAPIC_IRQ_RANGE: Range<usize> = X86_INT_BASE..X86_INT_LOCAL_APIC_BASE;
@@ -161,29 +162,14 @@ impl Scheme for Apic {
         } else {
             self.manager_ioapic.lock().get(vector)
         };
-        match handler {
-            Some(f) => {
-                // Sticky smash / null stack-top: same policy as timer_tick —
-                // device IRQs (PS/2/UART/xHCI) were still calling through after
-                // a null-[rsp] soft-smash with in_timer_callback=false.
-                if crate::utils::heap_smash_suspected() {
-                    core::mem::forget(f);
-                    return;
-                }
-                // Same check as EventListener / timer: null or non-kernel
-                // vtable → skip + leak.
-                if crate::utils::dyn_fat_ptr_live(&f) {
-                    f();
-                } else {
-                    core::mem::forget(f);
-                    warn!(
-                        "IRQ vector {}: handler fat-pointer is dead (heap smash?); \
-                         skipping to avoid null-range EXECUTE #PF",
-                        vector
-                    );
-                }
-            }
-            None => warn!("no registered handler for interrupt vector {}!", vector),
+        // The two gates this file worked out -- a sticky heap smash (device
+        // IRQs from PS/2, the UART and xHCI were still calling through after a
+        // null-[rsp] soft-smash with in_timer_callback=false) and a null or
+        // non-kernel vtable -- now live in `run_irq_handler`, which every
+        // architecture's dispatcher calls once it has let its table lock go.
+        // The PLIC had only the second and the GIC-400 had neither.
+        if let Err(DeviceError::InvalidParam) = run_irq_handler(vector, handler) {
+            warn!("no registered handler for interrupt vector {}!", vector);
         }
     }
 }
@@ -230,7 +216,7 @@ impl IrqScheme for Apic {
     fn configure(&self, gsi: usize, tm: IrqTriggerMode, pol: IrqPolarity) -> DeviceResult {
         let gsi = gsi as u32;
         self.with_ioapic(gsi, |apic| {
-            apic.configure(gsi, tm, pol, LocalApic::bsp_id(), 0);
+            apic.configure(gsi, tm, pol, LocalApic::bsp_id());
             Ok(())
         })
     }
