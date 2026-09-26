@@ -37,6 +37,7 @@ use zircon_object::vm::VirtAddr;
 
 use self::consts::SyscallType as Sys;
 use self::file::poll_timeout_msecs;
+use self::file::{XattrOp, XattrTarget};
 
 mod consts {
     // generated from syscall.h.in
@@ -659,17 +660,66 @@ impl Syscall<'_> {
             Sys::GETRANDOM => self.sys_getrandom(a0.into(), a1, a2 as u32),
             Sys::STATX => self.sys_statx(a0.into(), a1.into(), a2, a3 as u32, a4.into()),
 
-            // Extended attributes: this kernel's filesystems do not implement
-            // xattrs. Answer the standard "no xattr support" way and quietly —
-            // letting these fall through to `unknown_syscall` returned ENOSYS
-            // but logged an `error!` per call, which floods the console (e.g.
-            // busybox init probing files: `unknown syscall: LISTXATTR`).
-            // `listxattr` -> 0 (empty name list); `getxattr` -> ENODATA (no such
-            // attribute); `setxattr` -> EOPNOTSUPP; `removexattr` -> ENODATA.
-            Sys::LISTXATTR | Sys::LLISTXATTR | Sys::FLISTXATTR => Ok(0),
-            Sys::GETXATTR | Sys::LGETXATTR | Sys::FGETXATTR => Err(LxError::ENODATA),
-            Sys::SETXATTR | Sys::LSETXATTR | Sys::FSETXATTR => Err(LxError::EOPNOTSUPP),
-            Sys::REMOVEXATTR | Sys::LREMOVEXATTR | Sys::FREMOVEXATTR => Err(LxError::ENODATA),
+            // Extended attributes: this kernel's filesystems do not keep
+            // them, and answering from here, by syscall name, kept busybox
+            // init's probing off the console. But `fs/xattr.c` reads the
+            // name and the flags and looks the file up BEFORE the filesystem
+            // answers, and these arms did none of it: a missing path was
+            // ENODATA, a closed fd was 0. `sys_xattr` makes those checks and
+            // then gives the same four answers.
+            Sys::GETXATTR => {
+                self.sys_xattr(XattrOp::Get, XattrTarget::Path(a0.into(), true), a1.into())
+            }
+            Sys::LGETXATTR => {
+                self.sys_xattr(XattrOp::Get, XattrTarget::Path(a0.into(), false), a1.into())
+            }
+            Sys::FGETXATTR => self.sys_xattr(XattrOp::Get, XattrTarget::Fd(a0.into()), a1.into()),
+            Sys::SETXATTR => self.sys_xattr(
+                XattrOp::Set {
+                    size: a3,
+                    flags: a4,
+                },
+                XattrTarget::Path(a0.into(), true),
+                a1.into(),
+            ),
+            Sys::LSETXATTR => self.sys_xattr(
+                XattrOp::Set {
+                    size: a3,
+                    flags: a4,
+                },
+                XattrTarget::Path(a0.into(), false),
+                a1.into(),
+            ),
+            Sys::FSETXATTR => self.sys_xattr(
+                XattrOp::Set {
+                    size: a3,
+                    flags: a4,
+                },
+                XattrTarget::Fd(a0.into()),
+                a1.into(),
+            ),
+            Sys::LISTXATTR => {
+                self.sys_xattr(XattrOp::List, XattrTarget::Path(a0.into(), true), a1.into())
+            }
+            Sys::LLISTXATTR => self.sys_xattr(
+                XattrOp::List,
+                XattrTarget::Path(a0.into(), false),
+                a1.into(),
+            ),
+            Sys::FLISTXATTR => self.sys_xattr(XattrOp::List, XattrTarget::Fd(a0.into()), a1.into()),
+            Sys::REMOVEXATTR => self.sys_xattr(
+                XattrOp::Remove,
+                XattrTarget::Path(a0.into(), true),
+                a1.into(),
+            ),
+            Sys::LREMOVEXATTR => self.sys_xattr(
+                XattrOp::Remove,
+                XattrTarget::Path(a0.into(), false),
+                a1.into(),
+            ),
+            Sys::FREMOVEXATTR => {
+                self.sys_xattr(XattrOp::Remove, XattrTarget::Fd(a0.into()), a1.into())
+            }
 
             // kernel module
             //            Sys::INIT_MODULE => self.sys_init_module(a0.into(), a1 as usize, a2.into()),
