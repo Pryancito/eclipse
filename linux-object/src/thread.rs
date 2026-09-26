@@ -33,6 +33,9 @@ pub trait ThreadExt {
     fn try_lock_linux(&self) -> Option<MutexGuard<'_, LinuxThread>>;
     /// Set pointer to thread ID.
     fn set_tid_address(&self, tidptr: UserOutPtr<i32>);
+    /// The word `set_tid_address` (or `CLONE_CHILD_CLEARTID`) registered:
+    /// what thread exit zeroes and wakes, null when nothing was registered.
+    fn tid_address(&self) -> UserOutPtr<i32>;
     /// Get robust list.
     fn get_robust_list(
         &self,
@@ -147,6 +150,10 @@ impl ThreadExt for Thread {
     /// Set pointer to thread ID.
     fn set_tid_address(&self, tidptr: UserPtr<i32, Out>) {
         self.lock_linux().clear_child_tid = tidptr;
+    }
+
+    fn tid_address(&self) -> UserPtr<i32, Out> {
+        UserPtr::from(self.lock_linux().clear_child_tid.as_addr())
     }
 
     fn get_robust_list(

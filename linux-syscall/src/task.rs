@@ -292,81 +292,35 @@ impl Syscall<'_> {
     ///   Each file descriptor in the child refers to the same open file description (see [`Self::sys_open`])
     ///   as the corresponding file descriptor in the parent.
     ///   This means that the two file descriptors share open file status flags and file offset.
-    fn fork_impl(&self, newsp: usize, newtls: usize) -> LxResult<Arc<Process>> {
+    fn fork_impl(
+        &self,
+        newsp: usize,
+        newtls: usize,
+        ctid: ChildTidRequest,
+    ) -> LxResult<(Arc<Process>, KoID)> {
         info!("fork: newsp={:#x} newtls={:#x}", newsp, newtls);
         let new_proc = Process::fork_from(self.zircon_process())?;
         let path = new_proc.linux().execute_path();
         if !path.is_empty() {
             new_proc.set_name(comm_from_path(&path));
         }
-        // What the child thread takes from this one -- the signal mask above
-        // all, which a `fork` inherits (sigprocmask(2)). `false`: a fork does
-        // not share the address space, so the alternate signal stack comes
-        // across too.
-        let inherited = self.thread.lock_linux().forked_child();
-        let new_thread = Thread::create_linux_with(&new_proc, inherited)?;
-        let mut new_ctx = self.thread.context_cloned()?;
-        if newsp != 0 {
-            new_ctx.set_field(UserContextField::StackPointer, newsp);
-        }
-        if newtls != 0 {
-            new_ctx.set_field(UserContextField::ThreadPointer, newtls);
-        }
-        new_ctx.set_field(UserContextField::ReturnValue, 0);
-        // A FreeBSD child returns 0 in %rax, 1 in %rdx and a clear carry flag
-        // (cpu_fork, sys/amd64/amd64/vm_machdep.c). libc's fork() stub branches
-        // on carry, so a stale CF inherited from the parent's context would make
-        // the child believe fork() failed. Linux needs only %rax = 0.
-        #[cfg(target_arch = "x86_64")]
-        if self.linux_process().abi() == linux_object::process::Abi::Freebsd {
-            let g = new_ctx.general_mut();
-            g.rdx = 1;
-            g.rflags &= !1;
-        }
-        new_thread.with_context(|ctx| *ctx = new_ctx)?;
-        new_thread.start(self.thread_fn)?;
-        // hunter: inherit the parent's syscall whitelist into the child so a
-        // process cannot shed its policy merely by forking, and seed a fresh
-        // anomaly window for the new pid.
-        hunter::task_fork(self.zircon_process().id(), new_proc.id());
+        let tid = self.start_forked_thread(&new_proc, newsp, newtls, ctid)?;
         info!("fork: {} -> {}", self.zircon_process().id(), new_proc.id());
-        Ok(new_proc)
+        Ok((new_proc, tid))
     }
 
-    async fn vfork_impl(&self, newsp: usize, newtls: usize) -> LxResult<Arc<Process>> {
+    async fn vfork_impl(
+        &self,
+        newsp: usize,
+        newtls: usize,
+        ctid: ChildTidRequest,
+    ) -> LxResult<(Arc<Process>, KoID)> {
         info!("vfork: newsp={:#x} newtls={:#x}", newsp, newtls);
         // A real vfork shares the parent's address space until execve or exit. The VMAR
         // implementation cannot replace a shared address space on execve, so use a copy
         // here while retaining vfork's parent-suspension semantics.
         let new_proc = Process::fork_from(self.zircon_process())?;
-        // `false`: Linux's rule is `(clone_flags & (CLONE_VM|CLONE_VFORK)) ==
-        // CLONE_VM`, and a vfork sets BOTH bits, so the alternate signal
-        // stack comes across just as it does for a fork -- doubly right here,
-        // where the address space is copied anyway (see above).
-        let inherited = self.thread.lock_linux().forked_child();
-        let new_thread = Thread::create_linux_with(&new_proc, inherited)?;
-        let mut new_ctx = self.thread.context_cloned()?;
-        if newsp != 0 {
-            new_ctx.set_field(UserContextField::StackPointer, newsp);
-        }
-        if newtls != 0 {
-            new_ctx.set_field(UserContextField::ThreadPointer, newtls);
-        }
-        new_ctx.set_field(UserContextField::ReturnValue, 0);
-        // A FreeBSD child returns 0 in %rax, 1 in %rdx and a clear carry flag
-        // (cpu_fork, sys/amd64/amd64/vm_machdep.c). libc's fork() stub branches
-        // on carry, so a stale CF inherited from the parent's context would make
-        // the child believe fork() failed. Linux needs only %rax = 0.
-        #[cfg(target_arch = "x86_64")]
-        if self.linux_process().abi() == linux_object::process::Abi::Freebsd {
-            let g = new_ctx.general_mut();
-            g.rdx = 1;
-            g.rflags &= !1;
-        }
-        new_thread.with_context(|ctx| *ctx = new_ctx)?;
-        new_thread.start(self.thread_fn)?;
-        // hunter: same lifecycle hook as fork (see fork_impl).
-        hunter::task_fork(self.zircon_process().id(), new_proc.id());
+        let tid = self.start_forked_thread(&new_proc, newsp, newtls, ctid)?;
 
         let new_proc_obj: Arc<dyn KernelObject> = new_proc.clone();
         info!(
@@ -377,19 +331,73 @@ impl Syscall<'_> {
         new_proc_obj
             .wait_signal(Signal::USER_SIGNAL_0 | Signal::PROCESS_TERMINATED)
             .await; // wait for execve or termination
-        Ok(new_proc)
+        Ok((new_proc, tid))
+    }
+
+    /// The one thread a forked (or vforked) child starts with: this thread's
+    /// context with the stack, TLS and return value the caller asked for,
+    /// and the TID bookkeeping of `ctid` done BEFORE it runs a single user
+    /// instruction. Returns the child's thread id.
+    ///
+    /// The child's copy of the address space already exists (`fork_from`),
+    /// so `CLONE_CHILD_SETTID` cannot go through this thread's `UserOutPtr`:
+    /// that writes the parent's memory, which the child does not see. It is
+    /// written into the child's VMAR instead; see [`publish_child_tid`].
+    fn start_forked_thread(
+        &self,
+        new_proc: &Arc<Process>,
+        newsp: usize,
+        newtls: usize,
+        ctid: ChildTidRequest,
+    ) -> LxResult<KoID> {
+        // What the child thread takes from this one -- the signal mask above
+        // all, which a `fork` inherits (sigprocmask(2)). `false`: a fork does
+        // not share the address space, so the alternate signal stack comes
+        // across too. (For a vfork, Linux's rule is `(clone_flags &
+        // (CLONE_VM|CLONE_VFORK)) == CLONE_VM`, and a vfork sets BOTH bits,
+        // so the stack comes across there just the same -- doubly right here,
+        // where the address space is copied anyway.)
+        let inherited = self.thread.lock_linux().forked_child();
+        let new_thread = Thread::create_linux_with(new_proc, inherited)?;
+        let mut new_ctx = self.thread.context_cloned()?;
+        if newsp != 0 {
+            new_ctx.set_field(UserContextField::StackPointer, newsp);
+        }
+        if newtls != 0 {
+            new_ctx.set_field(UserContextField::ThreadPointer, newtls);
+        }
+        new_ctx.set_field(UserContextField::ReturnValue, 0);
+        // A FreeBSD child returns 0 in %rax, 1 in %rdx and a clear carry flag
+        // (cpu_fork, sys/amd64/amd64/vm_machdep.c). libc's fork() stub branches
+        // on carry, so a stale CF inherited from the parent's context would make
+        // the child believe fork() failed. Linux needs only %rax = 0.
+        #[cfg(target_arch = "x86_64")]
+        if self.linux_process().abi() == linux_object::process::Abi::Freebsd {
+            let g = new_ctx.general_mut();
+            g.rdx = 1;
+            g.rflags &= !1;
+        }
+        new_thread.with_context(|ctx| *ctx = new_ctx)?;
+        publish_child_tid(&new_thread, ctid);
+        new_thread.start(self.thread_fn)?;
+        // hunter: inherit the parent's syscall whitelist into the child so a
+        // process cannot shed its policy merely by forking, and seed a fresh
+        // anomaly window for the new pid.
+        hunter::task_fork(self.zircon_process().id(), new_proc.id());
+        Ok(new_thread.id())
     }
 
     /// `sys_fork` creates a child process.
     pub fn sys_fork(&self, newsp: usize, newtls: usize) -> SysResult {
-        self.fork_impl(newsp, newtls).map(|proc| proc.id() as usize)
+        self.fork_impl(newsp, newtls, ChildTidRequest::none())
+            .map(|(proc, _)| proc.id() as usize)
     }
 
     /// `sys_vfork` creates a child process and blocks the parent until the child terminates or execs.
     pub async fn sys_vfork(&self, newsp: usize, newtls: usize) -> SysResult {
-        self.vfork_impl(newsp, newtls)
+        self.vfork_impl(newsp, newtls, ChildTidRequest::none())
             .await
-            .map(|proc| proc.id() as usize)
+            .map(|(proc, _)| proc.id() as usize)
     }
 
     /// `sys_clone` create a new thread in the current process.
@@ -414,6 +422,13 @@ impl Syscall<'_> {
             flags, newsp, parent_tid, child_tid, newtls
         );
         if clone_flags.contains(CloneFlags::PIDFD) && clone_flags.contains(CloneFlags::THREAD) {
+            return Err(LxError::EINVAL);
+        }
+        // Legacy clone reports the pidfd through the parent_tid slot, so the
+        // two cannot both be asked for (`legacy_clone_args_valid`).
+        if clone_flags.contains(CloneFlags::PIDFD)
+            && clone_flags.contains(CloneFlags::PARENT_SETTID)
+        {
             return Err(LxError::EINVAL);
         }
         // This kernel has no namespaces. `from_bits_truncate` silently DROPPED
@@ -470,14 +485,36 @@ impl Syscall<'_> {
             } else {
                 0
             };
-            let process = if clone_flags.contains(CloneFlags::VFORK) {
+            // The TID bookkeeping flags are not a thread-only affair: glibc's
+            // fork() is
+            //     clone(CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID | SIGCHLD,
+            //           0, NULL, &THREAD_SELF->tid, 0)
+            // and nothing in the child ever calls gettid() to fix `tid` up --
+            // the kernel is expected to have stored it (arch_fork, _Fork.c).
+            // Ignored here, the child kept its parent's tid in its TCB, and
+            // everything that reads pthread_self()->tid named the wrong
+            // task: pthread_setname_np opened another process's
+            // /proc/self/task/<tid>/comm, pthread_setaffinity_np and
+            // pthread_setschedparam reached for a thread that is not in this
+            // process (ESRCH), pthread_getcpuclockid clocked the parent.
+            // (musl fixes its own `tid` up with gettid() after the clone,
+            // which is why nothing in the base image noticed.)
+            let ctid = ChildTidRequest::from_clone(clone_flags, child_tid);
+            let (process, tid) = if clone_flags.contains(CloneFlags::VFORK) {
                 info!("sys_clone: dispatching to sys_vfork for flags {:#x}", flags);
-                self.vfork_impl(newsp, tls).await?
+                self.vfork_impl(newsp, tls, ctid).await?
             } else {
                 info!("sys_clone: dispatching to sys_fork for flags {:#x}", flags);
-                self.fork_impl(newsp, tls)?
+                self.fork_impl(newsp, tls, ctid)?
             };
             let pid = process.id() as usize;
+            // In the parent, once the child exists (Linux writes it before the
+            // child runs, but from the same clone_process, i.e. in the same
+            // window -- a caller that races its own child on this word gets
+            // the same answer there).
+            if clone_flags.contains(CloneFlags::PARENT_SETTID) {
+                parent_tid.write_if_not_null(tid as i32)?;
+            }
 
             if clone_flags.contains(CloneFlags::PIDFD) {
                 let pidfd =
@@ -2215,6 +2252,73 @@ pub(crate) struct Clone3Args {
 /// Decodes the eight `u64` of `struct clone_args` into legacy `clone`
 /// arguments, or the `errno` Linux answers for that struct.
 ///
+/// What a fork-like clone owes the caller about the child's TID, read off
+/// the `CLONE_CHILD_SETTID` and `CLONE_CHILD_CLEARTID` bits: whether the
+/// child's tid is stored at `ptr` (in the CHILD, before it runs) and whether
+/// that word is zeroed and futex-woken when the child's thread exits.
+///
+/// Both refer to `ptr` in the child's address space, which for a fork is a
+/// copy the parent's `UserOutPtr` cannot reach; see [`publish_child_tid`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ChildTidRequest {
+    /// The word's address, 0 for none.
+    ptr: usize,
+    set: bool,
+    clear: bool,
+}
+
+impl ChildTidRequest {
+    /// A plain `fork(2)` / `vfork(2)`: no flags, nothing to do.
+    pub(crate) fn none() -> Self {
+        Self {
+            ptr: 0,
+            set: false,
+            clear: false,
+        }
+    }
+
+    /// The request the clone flags make of the `child_tid` argument.
+    pub(crate) fn from_clone(flags: CloneFlags, ptr: UserOutPtr<i32>) -> Self {
+        Self {
+            ptr: ptr.as_addr(),
+            set: flags.contains(CloneFlags::CHILD_SETTID),
+            clear: flags.contains(CloneFlags::CHILD_CLEARTID),
+        }
+    }
+}
+
+/// Do a [`ChildTidRequest`] for `thread`, the (not yet started) sole thread
+/// of a forked child, in that child's own address space.
+///
+/// `CLONE_CHILD_SETTID`: the tid goes through the child's VMAR, because the
+/// parent's `UserOutPtr` writes the parent's copy of the page. Linux does
+/// this store from the child itself (`schedule_tail`) and ignores a fault
+/// on it, so an unmapped word is logged and skipped rather than failing a
+/// fork whose child already exists. `CLONE_CHILD_CLEARTID`: the word is
+/// registered exactly as `set_tid_address(2)` would, and thread exit does
+/// the zero-and-wake.
+pub(crate) fn publish_child_tid(thread: &Arc<Thread>, ctid: ChildTidRequest) {
+    if ctid.ptr == 0 {
+        return;
+    }
+    if ctid.set {
+        let word = (thread.id() as i32).to_ne_bytes();
+        let vaddr = ctid.ptr;
+        match thread.proc().vmar().write_memory(vaddr, &word) {
+            Ok(n) if n == word.len() => {}
+            other => warn!(
+                "clone: CLONE_CHILD_SETTID word {:#x} not writable in child {}: {:?}",
+                vaddr,
+                thread.proc().id(),
+                other
+            ),
+        }
+    }
+    if ctid.clear {
+        thread.set_tid_address(UserOutPtr::from(ctid.ptr));
+    }
+}
+
 /// Pulled out of [`Syscall::sys_clone3`] because it is the whole of what
 /// `clone3` does differently, and because until this batch **none of it ran**:
 /// the dispatch table carried `Sys::CLONE3 => Err(LxError::ENOSYS)` above the
@@ -2263,6 +2367,180 @@ pub(crate) fn clone3_to_clone(words: [u64; 8]) -> LxResult<Clone3Args> {
         tls: tls as usize,
         child_tid: child_tid as usize,
     })
+}
+
+#[cfg(test)]
+mod fork_child_tid_tests {
+    use super::*;
+    use kernel_hal::PAGE_SIZE;
+    use linux_object::process::LinuxProcess;
+    use rcore_fs_ramfs::RamFS;
+    use zircon_object::task::ROOT_JOB;
+    use zircon_object::vm::{MMUFlags, VmObject};
+
+    /// glibc's `arch_fork`: `CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID | SIGCHLD`.
+    const GLIBC_FORK: usize = 0x0120_0011;
+    /// The word every fork-time bit will be stored at (the parent's page is
+    /// seeded with this so the test can tell whose copy got written).
+    const SENTINEL: i32 = 0x5a5a_5a5a;
+
+    fn flags(bits: usize) -> CloneFlags {
+        CloneFlags::from_bits_truncate(bits)
+    }
+
+    /// A parent with one thread and one writable page holding a word set to
+    /// [`SENTINEL`]; returns it with that word's address.
+    fn a_parent(pid: KoID) -> (Arc<Process>, usize) {
+        let parent = Process::create_with_fixed_id_ext(
+            &ROOT_JOB,
+            pid,
+            "parent",
+            LinuxProcess::new(RamFS::new(), 0),
+        )
+        .unwrap();
+        let _main = Thread::create_linux(&parent).unwrap();
+        // At a fixed, non-zero offset: an auto-placed page can land at 0,
+        // which every caller of these functions reads as "no pointer".
+        let page = parent
+            .vmar()
+            .map(
+                Some(0x10_0000),
+                VmObject::new_paged(1),
+                0,
+                PAGE_SIZE,
+                MMUFlags::READ | MMUFlags::WRITE | MMUFlags::USER,
+            )
+            .unwrap();
+        assert_ne!(page, 0);
+        // Inside the page, not at its start: a tid word is a field of the
+        // TCB, and a page-aligned one would let a rounded address pass.
+        let word = page + 0x40;
+        assert_eq!(
+            parent
+                .vmar()
+                .write_memory(word, &SENTINEL.to_ne_bytes())
+                .unwrap(),
+            4
+        );
+        (parent, word)
+    }
+
+    fn word_at(proc: &Arc<Process>, vaddr: usize) -> i32 {
+        let mut b = [0u8; 4];
+        assert_eq!(proc.vmar().read_memory(vaddr, &mut b).unwrap(), 4);
+        i32::from_ne_bytes(b)
+    }
+
+    /// A forked child of `parent` with its one, unstarted thread.
+    fn a_forked_child(parent: &Arc<Process>) -> (Arc<Process>, Arc<Thread>) {
+        let child = Process::fork_from(parent).unwrap();
+        let thread = Thread::create_linux(&child).unwrap();
+        (child, thread)
+    }
+
+    #[test]
+    fn glibcs_fork_flags_ask_for_both_the_store_and_the_clear() {
+        let req = ChildTidRequest::from_clone(flags(GLIBC_FORK), 0x7000_0010.into());
+        assert_eq!(
+            req,
+            ChildTidRequest {
+                ptr: 0x7000_0010,
+                set: true,
+                clear: true
+            }
+        );
+        // musl's fork is a bare SIGCHLD: nothing asked, nothing done.
+        let req = ChildTidRequest::from_clone(flags(0x11), 0x7000_0010.into());
+        assert_eq!(
+            req,
+            ChildTidRequest {
+                ptr: 0x7000_0010,
+                set: false,
+                clear: false
+            }
+        );
+        assert_eq!(ChildTidRequest::none().ptr, 0);
+    }
+
+    #[test]
+    fn the_childs_tid_lands_in_the_childs_copy_of_the_page_not_the_parents() {
+        // The very bug: the store went through the parent's pointer, i.e.
+        // into the parent's copy, and the child's TCB kept the parent's tid.
+        let (parent, page) = a_parent(43_361);
+        let (child, thread) = a_forked_child(&parent);
+        publish_child_tid(
+            &thread,
+            ChildTidRequest::from_clone(flags(GLIBC_FORK), page.into()),
+        );
+        assert_eq!(word_at(&child, page), thread.id() as i32, "child's copy");
+        assert_eq!(word_at(&parent, page), SENTINEL, "parent's copy");
+        // (The first thread of a process carries the pid as its tid, as on
+        // Linux, so the word also reads as the child's getpid().)
+        assert_eq!(thread.id(), child.id());
+    }
+
+    #[test]
+    fn the_clear_on_exit_is_registered_as_set_tid_address_would() {
+        let (parent, page) = a_parent(43_362);
+        let (_child, thread) = a_forked_child(&parent);
+        assert!(thread.tid_address().is_null());
+        publish_child_tid(
+            &thread,
+            ChildTidRequest::from_clone(flags(GLIBC_FORK), page.into()),
+        );
+        assert_eq!(thread.tid_address().as_addr(), page);
+    }
+
+    #[test]
+    fn without_the_flags_the_word_is_left_alone() {
+        // A `clone(SIGCHLD, ..., ctid)` with a live ctid and neither bit
+        // (musl leaves the register holding whatever): nothing may be written
+        // and nothing registered, or exit would zero a word nobody gave it.
+        let (parent, page) = a_parent(43_363);
+        let (child, thread) = a_forked_child(&parent);
+        publish_child_tid(
+            &thread,
+            ChildTidRequest::from_clone(flags(0x11), page.into()),
+        );
+        assert_eq!(word_at(&child, page), SENTINEL);
+        assert!(thread.tid_address().is_null());
+        // CLEARTID alone registers and does not store (pthread-style callers
+        // that pass the two separately).
+        publish_child_tid(
+            &thread,
+            ChildTidRequest::from_clone(flags(0x0020_0011), page.into()),
+        );
+        assert_eq!(word_at(&child, page), SENTINEL);
+        assert_eq!(thread.tid_address().as_addr(), page);
+    }
+
+    #[test]
+    fn a_word_the_child_has_not_mapped_is_skipped_not_fatal() {
+        // Linux stores from the child (`schedule_tail`) and ignores the
+        // fault; the fork has already happened, so failing it here would
+        // leave a child the caller was told does not exist.
+        let (parent, page) = a_parent(43_364);
+        let (child, thread) = a_forked_child(&parent);
+        publish_child_tid(
+            &thread,
+            ChildTidRequest::from_clone(flags(GLIBC_FORK), (page + 0x10_0000).into()),
+        );
+        assert_eq!(word_at(&child, page), SENTINEL);
+        // The clear is still registered: exit tolerates an unmapped word.
+        assert_eq!(thread.tid_address().as_addr(), page + 0x10_0000);
+    }
+
+    #[test]
+    fn a_null_word_is_a_no_op_whatever_the_flags() {
+        let (parent, page) = a_parent(43_365);
+        let (child, thread) = a_forked_child(&parent);
+        publish_child_tid(
+            &thread,
+            ChildTidRequest::from_clone(flags(GLIBC_FORK), 0.into()),
+        );
+        assert_eq!(word_at(&child, page), SENTINEL);
+        assert!(thread.tid_address().is_null());
+    }
 }
 
 #[cfg(test)]
