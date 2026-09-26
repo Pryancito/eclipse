@@ -53,6 +53,8 @@ use core::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering}
 use lock::Mutex;
 use x86_64::registers::model_specific::Msr;
 
+use crate::common::cpu_power;
+
 // ── Intel HWP / EPB MSRs ────────────────────────────────────────────────────
 /// IA32_PM_ENABLE — bit 0 turns HWP on (a write-once latch, sticky to reset).
 const IA32_PM_ENABLE: u32 = 0x770;
@@ -218,11 +220,7 @@ fn intel_temperature_mc() -> Option<i32> {
             return None; // no Digital Thermal Sensor
         }
         let status = Msr::new(IA32_THERM_STATUS).read();
-        if status & (1 << 31) == 0 {
-            return None; // reading not valid
-        }
-        let below_tjmax = ((status >> 16) & 0x7f) as i32;
-        Some((intel_tjmax_c() - below_tjmax) * 1000)
+        cpu_power::intel_temp_mc(status, intel_tjmax_c())
     }
 }
 
@@ -232,21 +230,12 @@ fn intel_temperature_mc() -> Option<i32> {
 /// SAFETY: reads `MSR_TEMPERATURE_TARGET`; only valid on a part with the DTS
 /// (CPUID.06H:EAX[0]) — gated by the callers.
 unsafe fn intel_tjmax_c() -> i32 {
-    let t = ((Msr::new(MSR_TEMPERATURE_TARGET).read() >> 16) & 0xff) as i32;
-    if t > 0 {
-        t
-    } else {
-        100
-    }
+    cpu_power::intel_tjmax_c(Msr::new(MSR_TEMPERATURE_TARGET).read())
 }
 
 // ── AMD temperature (k10temp-style SMN read) ────────────────────────────────
 /// SMN address of the reported-temperature control register on Family 17h+.
 const ZEN_REPORTED_TEMP_CTRL: u32 = 0x0005_9800;
-/// `CurTmp` field starts at bit 21 (each step is 0.125 °C = 125 m°C).
-const ZEN_CUR_TEMP_SHIFT: u32 = 21;
-/// When set, `CurTmp` uses the extended range and is offset by -49 °C.
-const ZEN_CUR_TEMP_RANGE_SEL: u32 = 1 << 19;
 
 /// Read a 32-bit PCI config dword via the legacy 0xCF8/0xCFC mechanism, with
 /// interrupts masked so the address→data pair can't be torn by a local IRQ that
@@ -294,15 +283,7 @@ static AMD_SMN_LOCK: Mutex<()> = Mutex::new(());
 
 /// Inner AMD `Tctl` read, in milli-°C. Caller must hold [`AMD_SMN_LOCK`].
 unsafe fn amd_temperature_raw() -> Option<i32> {
-    let eax = __cpuid(1).eax;
-    let base_family = (eax >> 8) & 0xf;
-    let ext_family = (eax >> 20) & 0xff;
-    let family = if base_family == 0xf {
-        base_family + ext_family
-    } else {
-        base_family
-    };
-    if family < 0x17 {
+    if cpu_power::cpu_family(__cpuid(1).eax) < 0x17 {
         return None; // pre-Zen uses a different (older) path; not supported
     }
     // Confirm the Data Fabric function 0 really is an AMD device before
@@ -310,12 +291,7 @@ unsafe fn amd_temperature_raw() -> Option<i32> {
     if pci_cfg_read32(0, 0x18, 0, 0x00) & 0xFFFF != 0x1022 {
         return None;
     }
-    let regval = amd_smn_read(ZEN_REPORTED_TEMP_CTRL);
-    let mut temp = ((regval >> ZEN_CUR_TEMP_SHIFT) as i32) * 125;
-    if regval & ZEN_CUR_TEMP_RANGE_SEL != 0 {
-        temp -= 49_000;
-    }
-    Some(temp)
+    Some(cpu_power::amd_tctl_mc(amd_smn_read(ZEN_REPORTED_TEMP_CTRL)))
 }
 
 /// AMD core temperature (`Tctl`), Family 17h (Zen) and later, read from the SMU
@@ -355,27 +331,18 @@ unsafe fn enable_hwp(has_epp: bool) -> (u8, u8, bool) {
     // once this bit is set.
     Msr::new(IA32_PM_ENABLE).write(HWP_ENABLE);
 
-    let caps = Msr::new(IA32_HWP_CAPABILITIES).read();
-    let highest = (caps & 0xff) as u8; // [7:0]   Highest_Performance (turbo)
-    let guaranteed = ((caps >> 8) & 0xff) as u8; // [15:8]  Guaranteed_Performance (base)
-    let lowest = ((caps >> 24) & 0xff) as u8; // [31:24] Lowest_Performance
-
-    // Cap the ceiling at the base clock to disable turbo, unless `guaranteed` is
-    // unreported (0) or nonsensical, in which case keep the full range.
-    let cap = cap_at_base_clock() && guaranteed >= lowest && guaranteed > 0;
-    let max = if cap { guaranteed } else { highest };
+    let caps = cpu_power::hwp_caps(Msr::new(IA32_HWP_CAPABILITIES).read());
+    // Cap the ceiling at the base clock to disable turbo.
+    let (max, cap) = cpu_power::ceiling(cap_at_base_clock(), caps);
 
     // Minimum = lowest → an idle core may drop to its lowest P-state (coolest).
     // Maximum = max    → the ceiling (base clock when turbo is capped).
-    // Desired = 0      → hardware chooses the operating point autonomously.
     // EPP only exists when CPUID.06H:EAX[10] is set; otherwise bits [31:24] are
     // reserved-zero and IA32_ENERGY_PERF_BIAS provides the bias instead.
     let epp = if has_epp { EPP_PREF } else { 0 };
-    // Desired[23:16] = 0 (autonomous) is elided from the OR chain.
-    let request = (lowest as u64) | ((max as u64) << 8) | (epp << 24);
-    Msr::new(IA32_HWP_REQUEST).write(request);
+    Msr::new(IA32_HWP_REQUEST).write(cpu_power::hwp_request(caps.lowest, max, epp));
 
-    (lowest, max, cap)
+    (caps.lowest, max, cap)
 }
 
 /// Enable AMD CPPC on this CPU and request hardware-autonomous scaling across
@@ -386,22 +353,14 @@ unsafe fn enable_hwp(has_epp: bool) -> (u8, u8, bool) {
 unsafe fn enable_amd_cppc() -> (u8, u8, bool) {
     Msr::new(MSR_AMD_CPPC_ENABLE).write(1);
 
-    let cap1 = Msr::new(MSR_AMD_CPPC_CAP1).read();
-    let highest = ((cap1 >> 24) & 0xff) as u8; // [31:24] Highest_Performance (boost)
-    let nominal = ((cap1 >> 16) & 0xff) as u8; // [23:16] Nominal_Performance (base)
-    let lowest = (cap1 & 0xff) as u8; // [7:0]    Lowest_Performance
+    let caps = cpu_power::cppc_caps(Msr::new(MSR_AMD_CPPC_CAP1).read());
+    // Cap the ceiling at nominal (base) to disable Precision Boost.
+    let (max, cap) = cpu_power::ceiling(cap_at_base_clock(), caps);
 
-    // Cap the ceiling at nominal (base) to disable Precision Boost, unless it is
-    // unreported (0) or nonsensical.
-    let cap = cap_at_base_clock() && nominal >= lowest && nominal > 0;
-    let max = if cap { nominal } else { highest };
+    // Out-of-range fields are clamped by hardware to [lowest, highest].
+    Msr::new(MSR_AMD_CPPC_REQUEST).write(cpu_power::cppc_request(caps.lowest, max, EPP_PREF));
 
-    // REQUEST: Max[7:0]=max, Min[15:8]=lowest, Desired[23:16]=0 (autonomous),
-    // EPP[31:24]. Out-of-range fields are clamped by hardware to [lowest,highest].
-    let request = (max as u64) | ((lowest as u64) << 8) | (EPP_PREF << 24);
-    Msr::new(MSR_AMD_CPPC_REQUEST).write(request);
-
-    (lowest, max, cap)
+    (caps.lowest, max, cap)
 }
 
 /// Set the legacy Intel Energy-Performance Bias hint, preserving reserved bits.
@@ -649,12 +608,8 @@ const GOV_INTERVAL_NS: u64 = 1_000_000_000; // 1 s
 /// Logical CPUs the per-core governor tracks. Cores past this keep their
 /// init-time ceiling (no adaptive throttling); the array index just bails.
 const GOV_MAX_CPUS: usize = 256;
-/// AMD `Tctl` throttle band, milli-°C (Zen exposes no fixed TjMax MSR).
-const GOV_AMD_HOT_MC: i32 = 88_000;
-const GOV_AMD_COOL_MC: i32 = 78_000;
-/// Intel band as a °C offset below TjMax.
-const GOV_INTEL_HOT_BELOW_TJMAX: i32 = 12;
-const GOV_INTEL_COOL_BELOW_TJMAX: i32 = 22;
+// The band itself, and how far below the throttle point it sits on Intel,
+// live with the arithmetic in `crate::common::cpu_power`.
 
 /// P-state mechanism in use: 0 = none, 1 = Intel HWP, 2 = AMD CPPC.
 static GOV_MECH: AtomicU8 = AtomicU8::new(0);
@@ -701,17 +656,25 @@ fn governor_init_cpu(pstate: Option<(PStateMech, (u8, u8, bool))>, has_epp: bool
 /// `(cool_mc, hot_mc)` governor hysteresis band for the running vendor.
 fn governor_band_mc() -> (i32, i32) {
     if is_intel() {
-        let tjmax = unsafe { intel_tjmax_c() };
-        let cool = (tjmax - GOV_INTEL_COOL_BELOW_TJMAX).max(40) * 1000;
-        let hot = (tjmax - GOV_INTEL_HOT_BELOW_TJMAX).max(50) * 1000;
-        (cool, hot)
+        // Reached only after `governor_temperature_mc` returned a reading,
+        // which is what gates `MSR_TEMPERATURE_TARGET` on the digital sensor
+        // being there at all.
+        cpu_power::intel_band_mc(unsafe { intel_tjmax_c() })
     } else {
-        (GOV_AMD_COOL_MC, GOV_AMD_HOT_MC)
+        (cpu_power::AMD_COOL_MC, cpu_power::AMD_HOT_MC)
     }
 }
 
 /// Non-blocking temperature read for the governor (timer-IRQ context).
 fn governor_temperature_mc() -> Option<i32> {
+    // The same reason `cpu_temperature_mc` skips it: a VM can advertise the
+    // sensor without implementing the MSR behind it, and reading it would #GP.
+    // `init` already refuses to arm anything under a hypervisor, so today this
+    // cannot be reached there -- it is written here too because the two are
+    // one question with one answer, and the guard belongs beside the read.
+    if hypervisor_present() {
+        return None;
+    }
     if is_intel() {
         intel_temperature_mc()
     } else if is_amd() {
@@ -735,12 +698,10 @@ unsafe fn governor_program_ceiling(mech: u8, lowest: u8, max: u8) {
             } else {
                 0
             };
-            let request = (lowest as u64) | ((max as u64) << 8) | (epp << 24);
-            Msr::new(IA32_HWP_REQUEST).write(request);
+            Msr::new(IA32_HWP_REQUEST).write(cpu_power::hwp_request(lowest, max, epp));
         }
         2 => {
-            let request = (max as u64) | ((lowest as u64) << 8) | (EPP_PREF << 24);
-            Msr::new(MSR_AMD_CPPC_REQUEST).write(request);
+            Msr::new(MSR_AMD_CPPC_REQUEST).write(cpu_power::cppc_request(lowest, max, EPP_PREF));
         }
         _ => {}
     }
@@ -779,22 +740,12 @@ pub(crate) fn thermal_governor_tick() {
         Some(t) => t,
         None => return,
     };
-    let (cool, hot) = governor_band_mc();
-
     let ceiling = GOV_CEILING[cpu].load(Ordering::Relaxed);
-    // One step ≈ 1/8 of the dynamic range → a full swing takes ~8 s: gentle
-    // enough to avoid oscillation, quick enough to react before PROCHOT.
-    let step = core::cmp::max(1, (ceil_max - lowest) / 8);
-    let new_ceiling = if temp >= hot {
-        ceiling.saturating_sub(step).max(lowest)
-    } else if temp <= cool {
-        core::cmp::min(ceil_max, ceiling.saturating_add(step))
-    } else {
-        return; // inside the hysteresis band: hold
-    };
-    if new_ceiling == ceiling {
-        return;
-    }
+    let new_ceiling =
+        match cpu_power::next_ceiling(temp, governor_band_mc(), ceiling, lowest, ceil_max) {
+            Some(c) => c,
+            None => return, // inside the band, or already at the end
+        };
 
     unsafe { governor_program_ceiling(mech, lowest, new_ceiling) };
     GOV_CEILING[cpu].store(new_ceiling, Ordering::Relaxed);
