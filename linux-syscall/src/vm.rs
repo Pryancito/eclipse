@@ -3,6 +3,7 @@ use alloc::vec::Vec;
 use bitflags::bitflags;
 use linux_object::error::LxResult;
 use linux_object::loader::heap_base;
+use linux_object::process::{RLIMIT_DATA, RLIM_INFINITY};
 use zircon_object::vm::{
     pages, round_down_pages, roundup_pages, MMUFlags, VmAddressRegion, VmObject, PAGE_SIZE,
     USER_ASPACE_BASE, USER_ASPACE_SIZE,
@@ -537,6 +538,24 @@ impl Syscall<'_> {
         // `/oscomp/brk` case does exactly that, because it prints and
         // round-trips the break through a 32-bit int and the heap base is a
         // round power of two whose low 32 bits are zero.
+        // `check_data_rlimit()`, and Linux runs it before the "same page"
+        // shortcut, so it governs every break the caller names and not only a
+        // grow that reaches for new pages. `RLIMIT_DATA` was stored, reported
+        // back by `prlimit64`, and enforced nowhere: `ulimit -d` was a number
+        // the shell could set and the kernel ignored, so the malloc-failure
+        // path of everything run under it -- a CI budget, a fuzzer, a
+        // `ulimit`-sandboxed script -- never once fired.
+        let data_rlimit = proc
+            .rlimit(RLIMIT_DATA, None, false)
+            .map(|l| l.cur)
+            .unwrap_or(RLIM_INFINITY);
+        if !brk_within_data_rlimit(new_brk, heap_base(&vmar), data_rlimit) {
+            info!(
+                "brk: {:#x} would take the data segment past RLIMIT_DATA ({}), keeping {:#x}",
+                new_brk, data_rlimit, current_brk
+            );
+            return Ok(current_brk);
+        }
         let Some(plan) = brk_plan(new_brk, current_brk, heap_base(&vmar)) else {
             info!(
                 "brk: {:#x} is not a break this address space can take, keeping {:#x}",
@@ -1594,6 +1613,30 @@ struct BrkPlan {
     moved: BrkMove,
 }
 
+/// `check_data_rlimit()`: whether `RLIMIT_DATA` leaves room for a break at
+/// `new_brk`.
+///
+/// ```c
+/// if (rlim < RLIM_INFINITY) {
+///         if (((new - start) + (end_data - start_data)) > rlim)
+///                 return -ENOSPC;
+/// }
+/// ```
+///
+/// `RLIM_INFINITY` is `u64::MAX` and Linux spells the comparison `rlim <
+/// RLIM_INFINITY`, so the limit is off only at that exact value -- one below
+/// it is a real limit no address space can reach, which is the answer a
+/// program that set it asked for. `end_data - start_data`, the ELF data
+/// segment, is not tracked here, so the budget this measures is the heap
+/// alone: too generous by a fixed amount, never too tight.
+///
+/// The failure Linux reports is not an errno the caller sees: `__do_sys_brk`
+/// jumps to `out`, which returns the OLD break, and that is how `brk` says no
+/// to everything.
+fn brk_within_data_rlimit(new_brk: usize, heap_base: usize, rlimit_data: u64) -> bool {
+    rlimit_data == RLIM_INFINITY || new_brk.saturating_sub(heap_base) as u64 <= rlimit_data
+}
+
 fn brk_plan(new_brk: usize, current_brk: usize, heap_base: usize) -> Option<BrkPlan> {
     let mapped_end = brk_target(new_brk, heap_base)?;
     let current_end = roundup_pages(current_brk);
@@ -2321,6 +2364,64 @@ mod mm_range_tests {
         assert_eq!(brk_target(heap, heap), Some(heap));
         assert_eq!(brk_target(heap + 1, heap), Some(heap + PAGE));
         assert_eq!(brk_target(USER_ASPACE_END, heap), Some(USER_ASPACE_END));
+    }
+}
+
+#[cfg(test)]
+mod brk_data_rlimit_tests {
+    //! `RLIMIT_DATA` against the break the caller names. The limit was stored
+    //! and reported and never once consulted, so these pin that it is.
+
+    use super::*;
+
+    const HEAP: usize = 0x40_0000;
+
+    #[test]
+    fn the_default_limit_allows_any_break() {
+        for brk in [HEAP, HEAP + PAGE_SIZE, HEAP + (1 << 40), usize::MAX] {
+            assert!(
+                brk_within_data_rlimit(brk, HEAP, RLIM_INFINITY),
+                "brk {:#x} under no limit",
+                brk
+            );
+        }
+    }
+
+    #[test]
+    fn a_break_inside_the_budget_is_allowed_and_one_past_it_is_not() {
+        // `ulimit -d 64`, which is 64 KiB of heap.
+        let rlim = 64 * 1024;
+        assert!(brk_within_data_rlimit(HEAP, HEAP, rlim));
+        assert!(brk_within_data_rlimit(HEAP + rlim as usize, HEAP, rlim));
+        assert!(!brk_within_data_rlimit(
+            HEAP + rlim as usize + 1,
+            HEAP,
+            rlim
+        ));
+    }
+
+    #[test]
+    fn only_rlim_infinity_itself_turns_the_limit_off() {
+        // Linux spells it `if (rlim < RLIM_INFINITY)`, so one below the
+        // sentinel is a real limit -- and one no heap can reach, which is
+        // what a program that set it wants.
+        // The heap base has to be 0 for a size that big to exist at all.
+        assert!(!brk_within_data_rlimit(usize::MAX, 0, RLIM_INFINITY - 1));
+        assert!(brk_within_data_rlimit(usize::MAX, 0, RLIM_INFINITY));
+    }
+
+    #[test]
+    fn a_break_below_where_the_heap_starts_does_not_wrap_the_subtraction() {
+        // `brk_plan` refuses it afterwards; this only has to not wrap into a
+        // huge "size" that every limit rejects (a build with overflow checks
+        // would panic here instead).
+        assert!(brk_within_data_rlimit(HEAP - PAGE_SIZE, HEAP, 0));
+    }
+
+    #[test]
+    fn a_zero_limit_allows_only_an_empty_heap() {
+        assert!(brk_within_data_rlimit(HEAP, HEAP, 0));
+        assert!(!brk_within_data_rlimit(HEAP + 1, HEAP, 0));
     }
 }
 
