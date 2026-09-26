@@ -159,7 +159,7 @@ pub const DIRENT_HDR: usize = 24;
 
 /// Round a record length up to the 8-byte boundary FreeBSD's `_GENERIC_DIRSIZ`
 /// enforces, so consecutive entries stay naturally aligned.
-fn dirsiz(namlen: usize) -> usize {
+pub(crate) fn dirsiz(namlen: usize) -> usize {
     let raw = DIRENT_HDR + namlen + 1; // +1 for the terminating NUL.
     raw.div_ceil(8) * 8
 }

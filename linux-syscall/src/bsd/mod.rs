@@ -405,21 +405,17 @@ impl Syscall<'_> {
             Err(e) => return BsdRet::err(errno::lx_to_freebsd(e)),
         }
         let mut writer = fs::BsdDirentWriter::new(nbytes.min(256 * 1024));
-        // The entry that does not fit goes back to the directory position
-        // instead of being lost; see `collect_dirents`.
         let mut file = file;
-        let collected = crate::file::collect_dirents(&mut file, |next, meta, name| {
-            writer.try_push(meta.inode as u64, next, fs::dirent_type(meta.type_), name)
-        });
-        if let Err(e) = collected {
-            return BsdRet::err(errno::lx_to_freebsd(e));
-        }
+        let base = match read_dirents_with_base(&mut file, &mut writer) {
+            Ok(base) => base,
+            Err(e) => return BsdRet::err(errno::lx_to_freebsd(e)),
+        };
         if let Err(e) = buf.write_array(writer.as_slice()) {
             return BsdRet::err(errno::lx_to_freebsd(LxError::from(e)));
         }
-        // basep is the (opaque) directory offset; report the current file
-        // offset best-effort. Not all callers pass it.
-        let _ = basep.write_if_not_null(0);
+        // Not all callers pass `basep`; libc's `readdir` does, and keeps it
+        // as the position `telldir` reports for this buffer.
+        let _ = basep.write_if_not_null(base);
         BsdRet::ok(writer.len())
     }
 
@@ -556,9 +552,65 @@ impl Syscall<'_> {
     }
 }
 
+/// The body of `getdirentries(2)`: the records that fit in `writer`, and
+/// `*basep`, the directory position BEFORE the read. `kern_getdirentries`
+/// takes `loff = auio.uio_offset` ahead of `VOP_READDIR` and stores that;
+/// libc's `readdir` keeps it as `dd_seek`, the value `telldir` hands back for
+/// an entry of this buffer and `seekdir` gives to `lseek`. Reporting 0 made
+/// every `telldir` say "the start", so `seekdir(telldir())` rewound.
+///
+/// The entry that does not fit goes back to the directory position instead
+/// of being lost; see `collect_dirents`.
+fn read_dirents_with_base(
+    file: &mut Arc<linux_object::fs::File>,
+    writer: &mut fs::BsdDirentWriter,
+) -> linux_object::error::LxResult<i64> {
+    let base = file.dir_position() as i64;
+    crate::file::collect_dirents(file, |next, meta, name| {
+        writer.try_push(meta.inode as u64, next, fs::dirent_type(meta.type_), name)
+    })?;
+    Ok(base)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use linux_object::fs::vfs::{FileSystem, FileType};
+    use linux_object::fs::{File, OpenFlags};
+    use rcore_fs_ramfs::RamFS;
+
+    /// An open directory on a fresh ramfs holding `names`.
+    fn dir(names: &[&str]) -> Arc<File> {
+        let root = RamFS::new().root_inode();
+        for name in names {
+            root.create(name, FileType::File, 0o644).unwrap();
+        }
+        File::new(root, OpenFlags::RDONLY, alloc::string::String::from("/"))
+    }
+
+    /// `basep` is where the directory was BEFORE each read, the value
+    /// `telldir` reports for an entry of that buffer. Two entries fit per
+    /// call here and the ramfs lists `.` and `..` too, so the bases go
+    /// 0, 2, 4, 6 with the last call short.
+    #[test]
+    fn getdirentries_reports_the_position_before_each_read_in_basep() {
+        let mut d = dir(&["a", "b", "c", "d", "e"]);
+        let one = fs::dirsiz(1);
+        let mut bases = alloc::vec::Vec::new();
+        let mut lens = alloc::vec::Vec::new();
+        loop {
+            let mut w = fs::BsdDirentWriter::new(2 * one);
+            let base = read_dirents_with_base(&mut d, &mut w).unwrap();
+            if w.is_empty() {
+                break;
+            }
+            bases.push(base);
+            lens.push(w.len() / one);
+        }
+        assert_eq!(lens, [2, 2, 2, 1]);
+        assert_eq!(bases, [0, 2, 4, 6]);
+    }
 
     #[test]
     fn bsdret_encodes_success_and_error() {
