@@ -485,6 +485,214 @@ pub fn make_rdev(major: usize, minor: usize) -> usize {
 }
 
 #[cfg(test)]
+mod lookup_tests {
+    use super::*;
+    use alloc::collections::BTreeMap;
+    use alloc::sync::Weak;
+    use spin::Mutex;
+
+    /// The smallest tree `lookup_follow` can walk: directories with
+    /// children, files, and symlinks whose contents are their target.
+    struct Node {
+        type_: FileType,
+        content: Vec<u8>,
+        children: Mutex<BTreeMap<String, Arc<Node>>>,
+        parent: Mutex<Weak<Node>>,
+        this: Mutex<Weak<Node>>,
+        fs: Mutex<Weak<Tree>>,
+    }
+
+    struct Tree {
+        root: Arc<Node>,
+    }
+
+    fn node(type_: FileType, content: &[u8]) -> Arc<Node> {
+        let node = Arc::new(Node {
+            type_,
+            content: content.to_vec(),
+            children: Mutex::new(BTreeMap::new()),
+            parent: Mutex::new(Weak::new()),
+            this: Mutex::new(Weak::new()),
+            fs: Mutex::new(Weak::new()),
+        });
+        *node.this.lock() = Arc::downgrade(&node);
+        node
+    }
+
+    fn tree() -> Arc<Tree> {
+        let tree = Arc::new(Tree {
+            root: node(FileType::Dir, b""),
+        });
+        *tree.root.fs.lock() = Arc::downgrade(&tree);
+        *tree.root.parent.lock() = Arc::downgrade(&tree.root);
+        tree
+    }
+
+    impl Node {
+        fn add(self: &Arc<Self>, name: &str, child: Arc<Node>) -> Arc<Node> {
+            *child.parent.lock() = Arc::downgrade(self);
+            *child.fs.lock() = self.fs.lock().clone();
+            self.children
+                .lock()
+                .insert(String::from(name), child.clone());
+            child
+        }
+        fn dir(self: &Arc<Self>, name: &str) -> Arc<Node> {
+            self.add(name, node(FileType::Dir, b""))
+        }
+        fn file(self: &Arc<Self>, name: &str, content: &[u8]) -> Arc<Node> {
+            self.add(name, node(FileType::File, content))
+        }
+        fn link(self: &Arc<Self>, name: &str, target: &str) -> Arc<Node> {
+            self.add(name, node(FileType::SymLink, target.as_bytes()))
+        }
+    }
+
+    impl FileSystem for Tree {
+        fn sync(&self) -> Result<()> {
+            Ok(())
+        }
+        fn root_inode(&self) -> Arc<dyn INode> {
+            self.root.clone()
+        }
+        fn info(&self) -> FsInfo {
+            no_fs().info()
+        }
+    }
+
+    impl INode for Node {
+        fn read_at(&self, offset: usize, buf: &mut [u8]) -> Result<usize> {
+            if self.type_ == FileType::Dir {
+                return Err(FsError::IsDir);
+            }
+            let start = offset.min(self.content.len());
+            let n = buf.len().min(self.content.len() - start);
+            buf[..n].copy_from_slice(&self.content[start..start + n]);
+            Ok(n)
+        }
+        fn write_at(&self, _offset: usize, _buf: &[u8]) -> Result<usize> {
+            Err(FsError::NotSupported)
+        }
+        fn poll(&self) -> Result<PollStatus> {
+            Ok(PollStatus::default())
+        }
+        fn metadata(&self) -> Result<Metadata> {
+            Ok(Metadata {
+                dev: 0,
+                inode: self as *const Node as usize,
+                size: self.content.len(),
+                blk_size: 0,
+                blocks: 0,
+                atime: Timespec { sec: 0, nsec: 0 },
+                mtime: Timespec { sec: 0, nsec: 0 },
+                ctime: Timespec { sec: 0, nsec: 0 },
+                type_: self.type_,
+                mode: 0o777,
+                nlinks: 1,
+                uid: 0,
+                gid: 0,
+                rdev: 0,
+            })
+        }
+        fn find(&self, name: &str) -> Result<Arc<dyn INode>> {
+            if self.type_ != FileType::Dir {
+                return Err(FsError::NotDir);
+            }
+            let found: Arc<Node> = match name {
+                "." => self.this.lock().upgrade().unwrap(),
+                ".." => self.parent.lock().upgrade().unwrap(),
+                _ => self
+                    .children
+                    .lock()
+                    .get(name)
+                    .cloned()
+                    .ok_or(FsError::EntryNotFound)?,
+            };
+            Ok(found)
+        }
+        fn fs(&self) -> Arc<dyn FileSystem> {
+            self.fs.lock().upgrade().unwrap()
+        }
+        fn as_any_ref(&self) -> &dyn Any {
+            self
+        }
+    }
+
+    fn same(a: &Arc<dyn INode>, b: &Arc<Node>) -> bool {
+        a.metadata().unwrap().inode == b.metadata().unwrap().inode
+    }
+
+    #[test]
+    fn a_symlink_target_longer_than_256_bytes_is_followed_whole() {
+        let tree = tree();
+        let root = &tree.root;
+        // A directory name of 300 bytes: the first 256 of the target name a
+        // directory that does not exist.
+        let long = "d".repeat(300);
+        let file = root.dir(&long).file("file", b"hello");
+        let target = long.clone() + "/file";
+        root.link("link", &target);
+        root.dir("etc").file("hosts", b"");
+        root.link("abs", &("/".to_string() + &target));
+
+        let hit = (&**root as &dyn INode).lookup_follow("link", 4).unwrap();
+        assert!(
+            same(&hit, &file),
+            "the target is read whole, not cut at 256"
+        );
+        let hit = (&**root as &dyn INode).lookup_follow("abs", 4).unwrap();
+        assert!(same(&hit, &file), "an absolute target too");
+
+        // Exactly SYMLINK_MAX bytes is still a name; one more is not.
+        let edge = "e".repeat(SYMLINK_MAX - "/file".len());
+        let edge_file = root.dir(&edge).file("file", b"");
+        root.link("edge", &(edge.clone() + "/file"));
+        let hit = (&**root as &dyn INode).lookup_follow("edge", 4).unwrap();
+        assert!(same(&hit, &edge_file));
+        root.link("past", &("x".repeat(SYMLINK_MAX + 1)));
+        assert_eq!(
+            (&**root as &dyn INode).lookup_follow("past", 4).err(),
+            Some(FsError::NameTooLong)
+        );
+    }
+
+    #[test]
+    fn a_symlink_loop_is_eloop_and_not_the_link_itself() {
+        let tree = tree();
+        let root = &tree.root;
+        root.link("self", "self");
+        root.link("a", "b");
+        root.link("b", "a");
+        let inode = &**root as &dyn INode;
+        assert_eq!(
+            inode.lookup_follow("self", 40).err(),
+            Some(FsError::SymLoop),
+            "a link to itself used to come back as a file"
+        );
+        assert_eq!(inode.lookup_follow("a", 40).err(), Some(FsError::SymLoop));
+        assert_eq!(
+            inode.lookup_follow("self/x", 40).err(),
+            Some(FsError::SymLoop),
+            "on the way as well"
+        );
+
+        // A chain that fits the budget resolves; one hop too many does not.
+        let file = root.file("file", b"");
+        root.link("l1", "file");
+        root.link("l2", "l1");
+        root.link("l3", "l2");
+        assert!(same(&inode.lookup_follow("l3", 3).unwrap(), &file));
+        assert_eq!(inode.lookup_follow("l3", 2).err(), Some(FsError::SymLoop));
+
+        // Without a budget the symlink is what `lstat` and `readlink` want.
+        let link = root.children.lock()["self"].clone();
+        assert!(same(&inode.lookup("self").unwrap(), &link));
+        assert_eq!(inode.lookup("self/x").err(), Some(FsError::NotDir));
+        assert_eq!(inode.lookup("l3/x").err(), Some(FsError::NotDir));
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use alloc::collections::BTreeMap;

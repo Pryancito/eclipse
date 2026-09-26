@@ -34,16 +34,34 @@ pub(crate) fn vfs_root() -> Option<Arc<MNode>> {
     VFS_ROOT.lock().clone()
 }
 
+/// The one spelling of a mount point, used both to resolve it and to name it
+/// in `/proc/mounts`.
+///
+/// It used to trim a trailing slash and nothing else, which left two spellings
+/// of the same path that this kernel then treated as different paths:
+///
+/// - `"//"` came out as the EMPTY string, not `"/"`, so
+///   `mount --move // /somewhere` walked straight past the `source == "/"`
+///   guard and moved the ROOT mount, which is the one move Linux refuses.
+/// - `"///mnt"` came out unchanged, because it does not end in a slash.
+///   `resolve_mnode` skips the empty components and finds the right node, so
+///   the mount succeeds and `/proc/mounts` records `///mnt` -- and a later
+///   `umount /mnt` normalises to `/mnt`, matches nothing, and leaves the line
+///   behind after the filesystem is gone.
+///
+/// It also trimmed whitespace. A directory may be called `" "`, and Linux
+/// mounts on the path it was given, so trimming silently mounted somewhere
+/// else. Splitting on the separator and rebuilding is all three at once.
 fn normalize_target(path: &str) -> String {
-    let path = path.trim();
-    if path.is_empty() || path == "/" {
-        return String::from("/");
+    let mut out = String::with_capacity(path.len());
+    for comp in path.split('/').filter(|s| !s.is_empty()) {
+        out.push('/');
+        out.push_str(comp);
     }
-    if path.ends_with('/') {
-        String::from(path.trim_end_matches('/'))
-    } else {
-        String::from(path)
+    if out.is_empty() {
+        out.push('/');
     }
+    out
 }
 
 fn resolve_mnode(target: &str) -> LxResult<Arc<MNode>> {
@@ -215,10 +233,27 @@ fn mount_move(source: &str, target: &str) -> LxResult<()> {
     if target_node.is_mountpoint() {
         return Err(LxError::EBUSY);
     }
+    move_mount_between(&source_node, &target_node)?;
+    super::move_mount_entry(&source_norm, &target_norm)?;
+    Ok(())
+}
+
+/// Detach the filesystem mounted at `source_node` and attach it at
+/// `target_node`, leaving it where it was if the destination refuses it.
+///
+/// A move that fails has to leave the mount alone. Detaching first and finding
+/// out afterwards left the filesystem mounted **nowhere** -- unreachable from
+/// any path, with `/proc/mounts` still naming the old one, and the caller told
+/// only that the move had failed. The checks in [`mount_move`] make a refusal
+/// rare, not impossible: `mount` also refuses a poisoned node and anything
+/// that is not a directory.
+fn move_mount_between(source_node: &Arc<MNode>, target_node: &Arc<MNode>) -> LxResult<()> {
     let fs = source_node.mounted_inner_fs().ok_or(LxError::EINVAL)?;
     source_node.umount().map_err(LxError::from)?;
-    target_node.mount(fs).map_err(LxError::from)?;
-    super::move_mount_entry(&source_norm, &target_norm)?;
+    if let Err(e) = target_node.mount(fs.clone()) {
+        let _ = source_node.mount(fs);
+        return Err(LxError::from(e));
+    }
     Ok(())
 }
 
@@ -240,4 +275,140 @@ pub fn umount_fs(target: &str, flags: usize) -> LxResult<()> {
     mount_node.umount().map_err(LxError::from)?;
     super::unregister_mount(&target_norm);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    //! The three pure decisions `mount(2)` and `umount2(2)` take before they
+    //! touch the tree: what path was asked for, what filesystem was asked for,
+    //! and whether this kernel already provides it. Everything past them needs
+    //! a block device.
+
+    use super::{is_virtual_fstype, normalize_target, parse_fstype};
+    use crate::error::LxError;
+
+    #[test]
+    fn a_path_spelled_with_extra_slashes_is_one_path() {
+        assert_eq!(normalize_target("/mnt"), "/mnt");
+        assert_eq!(normalize_target("/mnt/"), "/mnt");
+        assert_eq!(normalize_target("/mnt//"), "/mnt");
+        // The spelling that used to come through untouched, because it does
+        // not END in a slash: mounted as `///mnt`, recorded in /proc/mounts as
+        // `///mnt`, and never matched again by a `umount /mnt`.
+        assert_eq!(normalize_target("///mnt"), "/mnt");
+        assert_eq!(normalize_target("/a//b///c/"), "/a/b/c");
+    }
+
+    #[test]
+    fn the_root_is_the_root_however_many_slashes_it_is_spelled_with() {
+        assert_eq!(normalize_target("/"), "/");
+        assert_eq!(normalize_target(""), "/");
+        // `"//"` used to come out EMPTY, and the empty string is not `"/"`:
+        // `mount --move // /elsewhere` walked past the guard that exists to
+        // refuse moving the root mount.
+        assert_eq!(normalize_target("//"), "/");
+        assert_eq!(normalize_target("/////"), "/");
+    }
+
+    #[test]
+    fn a_directory_whose_name_is_spaces_is_not_trimmed_away() {
+        // A mount point may be called `" "`, and Linux mounts on the path it
+        // was handed. Trimming mounted somewhere else and said nothing.
+        assert_eq!(normalize_target("/ "), "/ ");
+        assert_eq!(normalize_target("/a /b"), "/a /b");
+        assert_eq!(normalize_target(" "), "/ ");
+    }
+
+    #[test]
+    fn the_filesystem_names_userland_uses_all_reach_the_same_driver() {
+        assert_eq!(parse_fstype("btrfs"), Ok("btrfs"));
+        assert_eq!(parse_fstype("BTRFS"), Ok("btrfs"));
+        // `mount -t vfat`, `-t msdos` and what a fstab or a udisks helper
+        // writes: five spellings, one driver.
+        for name in ["vfat", "fat", "fat32", "fat16", "msdos", "MSDOS", "FAT32"] {
+            assert_eq!(parse_fstype(name), Ok("vfat"), "{}", name);
+        }
+    }
+
+    #[test]
+    fn a_filesystem_this_kernel_has_no_driver_for_is_told_apart_from_none_at_all() {
+        // `mount` with no `-t` is not the same complaint as `-t ext4`, and a
+        // program reading errno acts on the difference.
+        assert_eq!(parse_fstype(""), Err(LxError::EINVAL));
+        assert_eq!(parse_fstype("ext4"), Err(LxError::ENODEV));
+        assert_eq!(parse_fstype("xfs"), Err(LxError::ENODEV));
+    }
+
+    #[test]
+    fn the_pseudo_filesystems_the_kernel_already_provides_are_recognised() {
+        for name in ["proc", "sysfs", "devtmpfs", "devpts", "tmpfs", "cgroup2"] {
+            assert!(is_virtual_fstype(name), "{}", name);
+        }
+        assert!(is_virtual_fstype("PROC"));
+        assert!(!is_virtual_fstype("btrfs"));
+        assert!(!is_virtual_fstype("vfat"));
+        assert!(!is_virtual_fstype(""));
+    }
+}
+
+#[cfg(test)]
+mod move_tests {
+    //! `mount --move`, on a tree built here rather than through `VFS_ROOT`:
+    //! that root is process-wide and set once at boot, so a test that pointed
+    //! it somewhere would point it for every other test in the binary.
+
+    use super::move_mount_between;
+    use alloc::sync::Arc;
+    use rcore_fs::vfs::{FileSystem, FileType};
+    use rcore_fs_mountfs::MountFS;
+    use rcore_fs_ramfs::RamFS;
+
+    #[test]
+    fn a_move_that_the_destination_refuses_leaves_the_mount_where_it_was() {
+        let vfs = MountFS::new(RamFS::new());
+        let root = vfs.mountpoint_root_inode();
+        let from = root.create("from", FileType::Dir, 0o755).unwrap();
+        // A file is not a mount point and never can be, so this stands in for
+        // every reason `mount` can refuse a destination.
+        let onto = root.create("onto", FileType::File, 0o644).unwrap();
+
+        from.mount(RamFS::new()).unwrap();
+        assert!(from.is_mountpoint());
+
+        assert!(move_mount_between(&from, &onto).is_err());
+        assert!(
+            from.is_mountpoint(),
+            "a refused move left the filesystem mounted nowhere"
+        );
+        assert!(!onto.is_mountpoint());
+    }
+
+    #[test]
+    fn a_move_the_destination_accepts_takes_the_mount_with_it() {
+        let vfs = MountFS::new(RamFS::new());
+        let root = vfs.mountpoint_root_inode();
+        let from = root.create("from", FileType::Dir, 0o755).unwrap();
+        let onto = root.create("onto", FileType::Dir, 0o755).unwrap();
+
+        let inner = RamFS::new();
+        from.mount(inner.clone()).unwrap();
+        move_mount_between(&from, &onto).unwrap();
+        assert!(!from.is_mountpoint());
+        assert!(onto.is_mountpoint());
+        assert!(Arc::ptr_eq(
+            &onto.mounted_inner_fs().unwrap(),
+            &(inner as Arc<dyn FileSystem>)
+        ));
+    }
+
+    #[test]
+    fn moving_something_that_is_not_a_mount_point_changes_nothing() {
+        let vfs = MountFS::new(RamFS::new());
+        let root = vfs.mountpoint_root_inode();
+        let from = root.create("from", FileType::Dir, 0o755).unwrap();
+        let onto = root.create("onto", FileType::Dir, 0o755).unwrap();
+        assert!(move_mount_between(&from, &onto).is_err());
+        assert!(!from.is_mountpoint());
+        assert!(!onto.is_mountpoint());
+    }
 }
