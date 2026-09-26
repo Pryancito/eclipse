@@ -420,12 +420,13 @@ impl Syscall<'_> {
     /// `pthread_getcpuclockid(3)` hand back. See [`clock_gettime_source`].
     pub fn sys_clock_gettime(&self, clock: usize, mut buf: UserOutPtr<TimeSpec>) -> SysResult {
         trace!("clock_gettime: id={:?} buf={:?}", clock, buf);
-        if buf.is_null() {
-            return Err(LxError::EINVAL);
-        }
+        // The clock first (EINVAL), then the read, then `put_timespec64`,
+        // which is where a NULL buffer fails: EFAULT. A NULL was EINVAL
+        // here, the answer for a clock that does not exist.
         let ts = match clock_gettime_source(clock)? {
             ClockSource::Wall => TimeSpec::now(),
             ClockSource::Monotonic => TimeSpec::now_monotonic(),
+            ClockSource::Tai => tai_time(TimeSpec::now(), NTP_STATE.lock().tai),
             ClockSource::Cpu(cpu) => {
                 TimeSpec::from_duration(Duration::from_nanos(self.cpu_clock_ns(cpu)?))
             }
@@ -1151,6 +1152,17 @@ lazy_static! {
     static ref POSIX_TIMERS: Mutex<BTreeMap<usize, PosixTimer>> = Mutex::new(BTreeMap::new());
 }
 static NEXT_TIMER_ID: AtomicUsize = AtomicUsize::new(1);
+
+/// `CLOCK_TAI` (`posix_get_tai_timespec`): the wall clock plus the offset
+/// `adjtimex(ADJ_TAI)` set, in whole seconds, which `ADJ_TAI` refuses to
+/// make negative. Until a daemon sets it the two clocks agree, as on a
+/// freshly booted Linux.
+fn tai_time(wall: TimeSpec, tai_offset: i32) -> TimeSpec {
+    TimeSpec {
+        sec: wall.sec.wrapping_add(tai_offset.max(0) as usize),
+        nsec: wall.nsec,
+    }
+}
 
 /// The tail of `do_timer_create`: the timer goes into the table under a
 /// fresh id, then the id goes to the caller through `deliver`, and if that
@@ -2128,6 +2140,32 @@ mod adjtimex_tests {
         assert_eq!(setoffset_ns(&ns, true).unwrap(), 250);
         let neg = TimeValI64 { sec: -1, usec: 0 };
         assert_eq!(setoffset_ns(&neg, false).unwrap(), -1_000_000_000);
+    }
+}
+
+#[cfg(test)]
+mod tai_tests {
+    //! `clock_gettime(CLOCK_TAI)`, which was `EINVAL`.
+
+    use super::*;
+
+    /// TAI is the wall clock plus the whole-second offset; zero until set.
+    #[test]
+    fn tai_is_the_wall_clock_plus_the_offset() {
+        let wall = TimeSpec {
+            sec: 1_800_000_000,
+            nsec: 123_456_789,
+        };
+        assert_eq!(tai_time(wall, 0), wall);
+        assert_eq!(
+            tai_time(wall, 37),
+            TimeSpec {
+                sec: 1_800_000_037,
+                nsec: 123_456_789
+            }
+        );
+        // The offset only shifts the seconds: the nanoseconds are shared.
+        assert_eq!(tai_time(wall, 37).nsec, wall.nsec);
     }
 }
 
