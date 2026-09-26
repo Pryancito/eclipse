@@ -834,6 +834,22 @@ impl FileLike for File {
         self.inner.read().flags
     }
 
+    /// A regular file or a directory has no `poll` operation on any disk
+    /// filesystem, so `epoll_ctl` on one is `EPERM`. procfs and sysfs are
+    /// the exception Linux itself makes: `sysfs_notify` and `mounts_poll`
+    /// give their nodes a real poll, so those stay pollable here. Every
+    /// other kind of node (a device, a FIFO, a socket) polls.
+    fn can_epoll(&self) -> bool {
+        let type_ = match self.inner.read().inode.metadata() {
+            Ok(m) => m.type_,
+            Err(_) => return true,
+        };
+        if type_ != FileType::File && type_ != FileType::Dir {
+            return true;
+        }
+        self.path.starts_with("/proc/") || self.path.starts_with("/sys/")
+    }
+
     fn set_flags(&self, f: OpenFlags) -> LxResult {
         self.inner.write().flags.take_settable(f);
         Ok(())

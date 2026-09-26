@@ -164,19 +164,12 @@ impl Syscall<'_> {
     ///
     /// The argument nsems can be 0 (a don't care) when a semaphore set is not being created.
     /// Otherwise, nsems must be greater than 0 and
-    /// less than or equal to the maximum number of semaphores per semaphore set (SEMMSL, constant 256).
+    /// less than or equal to the maximum number of semaphores per semaphore set (`SEMMSL`, 32000).
     ///
     /// If the semaphore set already exists, the permissions are verified.
     pub fn sys_semget(&self, key: usize, nsems: usize, flags: usize) -> SysResult {
         info!("semget: key: {} nsems: {} flags: {:#x}", key, nsems, flags);
-
-        /// The maximum semaphores per semaphore set
-        const SEMMSL: usize = 256;
-
-        if nsems > SEMMSL {
-            return Err(LxError::EINVAL);
-        }
-
+        let nsems = semget_nsems(nsems)?;
         let proc = self.linux_process();
         let sem_array =
             SemArray::get_or_create(key as u32, nsems, flags, proc.euid(), proc.egid())?;
@@ -937,6 +930,19 @@ pub(crate) fn msgctl_subject(cmd: usize, arg: usize) -> IpcSubject {
     }
 }
 
+/// `ksys_semget`'s first line: `if (nsems < 0 || nsems > ns->sc_semmsl)
+/// return -EINVAL;`. `nsems` is an `int`, read as one, and the bound is the
+/// `SEMMSL` that `semctl(IPC_INFO)` reports: 32000, not the 256 this used to
+/// enforce while telling `IPC_INFO`'s readers 32000. (Zero passes here: it is
+/// a don't-care for a lookup, and `newary` refuses it for a create.)
+pub(crate) fn semget_nsems(raw: usize) -> LxResult<usize> {
+    let nsems = crate::intarg::int_arg(raw);
+    if nsems < 0 || nsems as usize > linux_object::ipc::SEMMSL {
+        return Err(LxError::EINVAL);
+    }
+    Ok(nsems as usize)
+}
+
 /// `struct seminfo` for `semctl(IPC_INFO | SEM_INFO)`: ten `int`s.
 #[repr(C)]
 #[derive(Default, Debug, PartialEq, Eq)]
@@ -959,7 +965,7 @@ impl SemInfo {
     /// sets in `semusz` and of semaphores in `semaem`.
     fn linux_limits(for_sem_info: bool, sets: usize, sems: usize) -> Self {
         const SEMMNI: i32 = 32000;
-        const SEMMSL: i32 = 32000;
+        const SEMMSL: i32 = linux_object::ipc::SEMMSL as i32;
         let mut info = SemInfo {
             semmap: SEMMNI * SEMMSL,
             semmni: SEMMNI,
@@ -1253,11 +1259,11 @@ impl ShmInfo64 {
     /// `ULONG_MAX - (1UL << 24)`, `SHMMIN` 1, `SHMMNI` and `SHMSEG` 4096.
     fn linux_defaults() -> Self {
         ShmInfo64 {
-            shmmax: usize::MAX - (1 << 24),
-            shmmin: 1,
+            shmmax: linux_object::ipc::SHMMAX,
+            shmmin: linux_object::ipc::SHMMIN,
             shmmni: 4096,
             shmseg: 4096,
-            shmall: usize::MAX - (1 << 24),
+            shmall: linux_object::ipc::SHMMAX,
             unused: [0; 4],
         }
     }
@@ -1635,6 +1641,34 @@ mod ipc_table_command_tests {
         let counts = MsgInfo::linux_limits(true, 2, 30, 3);
         assert_eq!((counts.msgpool, counts.msgmap, counts.msgtot), (2, 30, 3));
         assert_eq!(counts.msgseg, 0xffff);
+    }
+}
+
+#[cfg(test)]
+mod semget_nsems_tests {
+    //! `semget`'s `nsems`: an `int`, bounded by the `SEMMSL` the kernel
+    //! itself reports.
+
+    use super::*;
+
+    #[test]
+    fn nsems_is_an_int_bounded_by_the_semmsl_ipc_info_reports() {
+        assert_eq!(semget_nsems(0), Ok(0), "a don't-care for a lookup");
+        assert_eq!(semget_nsems(1), Ok(1));
+        assert_eq!(semget_nsems(256), Ok(256));
+        assert_eq!(semget_nsems(257), Ok(257), "the old 256 was not Linux's");
+        assert_eq!(semget_nsems(32000), Ok(32000));
+        assert_eq!(semget_nsems(32001), Err(LxError::EINVAL));
+        // -1, zero- and sign-extended.
+        assert_eq!(semget_nsems(0xffff_ffff), Err(LxError::EINVAL));
+        assert_eq!(semget_nsems(usize::MAX), Err(LxError::EINVAL));
+        // The high half of the register is not the argument.
+        assert_eq!(semget_nsems(0x1_0000_0002), Ok(2));
+        // And the bound is the one `IPC_INFO` reports, by construction.
+        assert_eq!(
+            SemInfo::linux_limits(false, 0, 0).semmsl as usize,
+            linux_object::ipc::SEMMSL
+        );
     }
 }
 

@@ -393,6 +393,8 @@ impl Syscall<'_> {
         mut base: UserOutPtr<u8>,
         len: usize,
     ) -> SysResult {
+        // `do_readlinkat`: `bufsiz <= 0` is EINVAL before the path is read.
+        let len = crate::intarg::readlink_bufsiz(len)?;
         let path = path.as_c_str()?;
         info!(
             "readlinkat: dirfd={:?}, path={:?}, base={:?}, len={}",

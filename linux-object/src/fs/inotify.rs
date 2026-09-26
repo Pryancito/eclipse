@@ -43,6 +43,71 @@ struct InotifyInner {
 
 impl_kobject!(Inotify);
 
+/// `IN_ALL_EVENTS`: the twelve event bits a watch may ask for.
+pub const IN_ALL_EVENTS: u32 = 0x0000_0fff;
+/// `IN_UNMOUNT`, `IN_Q_OVERFLOW`, `IN_IGNORED`: the three the kernel sends
+/// on its own, which a caller may name in a mask without it being an error.
+const IN_KERNEL_EVENTS: u32 = 0x0000_2000 | 0x0000_4000 | 0x0000_8000;
+/// `IN_ONLYDIR`: watch the path only if it is a directory (`ENOTDIR`).
+pub const IN_ONLYDIR: u32 = 0x0100_0000;
+/// `IN_DONT_FOLLOW`: do not dereference a symlink at the end of the path.
+pub const IN_DONT_FOLLOW: u32 = 0x0200_0000;
+/// `IN_EXCL_UNLINK`: stop events for children once they are unlinked.
+pub const IN_EXCL_UNLINK: u32 = 0x0400_0000;
+/// `IN_MASK_CREATE`: this call must create a watch, `EEXIST` if one exists.
+pub const IN_MASK_CREATE: u32 = 0x1000_0000;
+/// `IN_MASK_ADD`: merge the events into an existing watch's mask.
+pub const IN_MASK_ADD: u32 = 0x2000_0000;
+/// `IN_ISDIR`: an event flag the kernel sets; harmless in a mask.
+const IN_ISDIR: u32 = 0x4000_0000;
+/// `IN_ONESHOT`: remove the watch after its first event.
+pub const IN_ONESHOT: u32 = 0x8000_0000;
+/// `ALL_INOTIFY_BITS`: every bit `inotify_add_watch` knows. A mask with no
+/// bit in it is `EINVAL`.
+pub const ALL_INOTIFY_BITS: u32 = IN_ALL_EVENTS
+    | IN_KERNEL_EVENTS
+    | IN_ONLYDIR
+    | IN_DONT_FOLLOW
+    | IN_EXCL_UNLINK
+    | IN_MASK_CREATE
+    | IN_MASK_ADD
+    | IN_ISDIR
+    | IN_ONESHOT;
+
+/// How `inotify_add_watch` must look the path up, decided from the mask
+/// before the path is touched.
+#[derive(Debug, PartialEq, Eq)]
+pub struct WatchLookup {
+    /// Dereference a trailing symlink (`!IN_DONT_FOLLOW`, `LOOKUP_FOLLOW`).
+    pub follow: bool,
+    /// The path must be a directory (`IN_ONLYDIR`, `LOOKUP_DIRECTORY`).
+    pub only_dir: bool,
+}
+
+/// `inotify_add_watch`'s two refusals of the mask, in its order: no known
+/// bit at all (`!(mask & ALL_INOTIFY_BITS)`, `EINVAL`), then `IN_MASK_ADD`
+/// together with `IN_MASK_CREATE` (`EINVAL`, they contradict). Then how to
+/// look the path up.
+///
+/// Nothing was checked, and the path was never looked up at all: a mask of
+/// zero took a watch, `IN_MASK_ADD|IN_MASK_CREATE` took one, and
+/// `inotifywait /nonexistent` reported success and waited forever where
+/// Linux says `ENOENT`, which is the answer glib's `GFileMonitor`, systemd's
+/// path units and Python's watchdog read to fall back to watching the
+/// parent directory.
+pub fn inotify_watch_lookup(mask: u32) -> LxResult<WatchLookup> {
+    if mask & ALL_INOTIFY_BITS == 0 {
+        return Err(LxError::EINVAL);
+    }
+    if mask & IN_MASK_ADD != 0 && mask & IN_MASK_CREATE != 0 {
+        return Err(LxError::EINVAL);
+    }
+    Ok(WatchLookup {
+        follow: mask & IN_DONT_FOLLOW == 0,
+        only_dir: mask & IN_ONLYDIR != 0,
+    })
+}
+
 impl Inotify {
     /// Create an inotify instance. `flags` carries `IN_NONBLOCK`/`IN_CLOEXEC`,
     /// which share the `O_NONBLOCK`/`O_CLOEXEC` bit values.
@@ -59,17 +124,37 @@ impl Inotify {
     }
 
     /// Add or update a watch. Returns the watch descriptor. Re-watching an
-    /// existing path returns its existing wd with the mask merged/replaced,
-    /// matching `inotify_add_watch(2)`.
+    /// existing path returns its existing wd, and what happens to its mask
+    /// is `inotify_update_existing_watch`'s: `IN_MASK_CREATE` refuses with
+    /// `EEXIST` (the caller asked for a new watch and there is one),
+    /// `IN_MASK_ADD` merges the events into the old mask, and neither
+    /// replaces it. What is stored is `inotify_arg_to_mask`'s share of the
+    /// word: the events, `IN_ONESHOT` and `IN_EXCL_UNLINK`; the lookup flags
+    /// (`IN_ONLYDIR`, `IN_DONT_FOLLOW`) and the two `IN_MASK_*` are consumed
+    /// by the call and never part of a watch.
+    ///
+    /// Both were ignored: `IN_MASK_CREATE` (which glib's file monitor and
+    /// systemd use to learn whether a path is already watched) got the old
+    /// watch back as if new, and `IN_MASK_ADD` replaced the mask it was
+    /// asked to extend, so the watch lost the events it had.
     pub fn add_watch(&self, path: &str, mask: u32) -> LxResult<usize> {
+        let stored = mask & (IN_ALL_EVENTS | IN_ONESHOT | IN_EXCL_UNLINK);
         let mut inner = self.inner.lock();
-        if let Some((&wd, _)) = inner.watches.iter().find(|(_, (p, _))| p == path) {
-            inner.watches.insert(wd, (path.into(), mask));
+        if let Some((&wd, &(_, old))) = inner.watches.iter().find(|(_, (p, _))| p == path) {
+            if mask & IN_MASK_CREATE != 0 {
+                return Err(LxError::EEXIST);
+            }
+            let new = if mask & IN_MASK_ADD != 0 {
+                old | stored
+            } else {
+                stored
+            };
+            inner.watches.insert(wd, (path.into(), new));
             return Ok(wd as usize);
         }
         let wd = inner.next_wd;
         inner.next_wd += 1;
-        inner.watches.insert(wd, (path.into(), mask));
+        inner.watches.insert(wd, (path.into(), stored));
         Ok(wd as usize)
     }
 
@@ -207,9 +292,71 @@ mod tests {
         // on every config reload would otherwise leak a descriptor each time.
         assert_eq!(i.add_watch("/etc/labwc", IN_CREATE).unwrap(), wd);
         assert_eq!(watched(&i).len(), 1);
-        // The mask is replaced, not merged. (IN_MASK_ADD, which asks for a
-        // merge, is not honoured — inert while no events are delivered.)
+        // The mask is replaced, not merged, unless IN_MASK_ADD asks.
         assert_eq!(watched(&i)[0].2, IN_CREATE);
+    }
+
+    /// `inotify_update_existing_watch`: `IN_MASK_CREATE` on a watched path
+    /// is `EEXIST`, `IN_MASK_ADD` merges, and the lookup flags are never
+    /// stored in the mask.
+    #[test]
+    fn mask_create_refuses_a_watched_path_and_mask_add_merges() {
+        let i = inotify(OpenFlags::empty());
+        let wd = i.add_watch("/etc/labwc", IN_MODIFY | IN_ONLYDIR).unwrap();
+        assert_eq!(watched(&i)[0].2, IN_MODIFY, "IN_ONLYDIR is a lookup flag");
+        assert_eq!(
+            i.add_watch("/etc/labwc", IN_CREATE | IN_MASK_CREATE),
+            Err(LxError::EEXIST)
+        );
+        assert_eq!(
+            watched(&i)[0].2,
+            IN_MODIFY,
+            "and the refusal changed nothing"
+        );
+        assert_eq!(
+            i.add_watch("/etc/labwc", IN_CREATE | IN_MASK_ADD).unwrap(),
+            wd
+        );
+        assert_eq!(watched(&i)[0].2, IN_MODIFY | IN_CREATE);
+        // A new path with IN_MASK_CREATE is simply created.
+        assert_eq!(
+            i.add_watch("/etc/foot", IN_MODIFY | IN_MASK_CREATE | IN_ONESHOT)
+                .unwrap(),
+            wd + 1
+        );
+        assert_eq!(watched(&i)[1].2, IN_MODIFY | IN_ONESHOT);
+    }
+
+    /// The mask checks `inotify_add_watch` makes before it looks anything
+    /// up, and what it decides about the lookup.
+    #[test]
+    fn a_mask_needs_a_known_bit_and_may_not_both_add_and_create() {
+        assert_eq!(inotify_watch_lookup(0), Err(LxError::EINVAL));
+        assert_eq!(inotify_watch_lookup(0x0000_1000), Err(LxError::EINVAL));
+        assert_eq!(inotify_watch_lookup(0x0080_0000), Err(LxError::EINVAL));
+        assert_eq!(
+            inotify_watch_lookup(IN_MODIFY | IN_MASK_ADD | IN_MASK_CREATE),
+            Err(LxError::EINVAL)
+        );
+        assert_eq!(
+            inotify_watch_lookup(IN_MODIFY),
+            Ok(WatchLookup {
+                follow: true,
+                only_dir: false
+            })
+        );
+        // An unknown bit beside a known one is ignored, as Linux ignores it.
+        assert_eq!(
+            inotify_watch_lookup(IN_MODIFY | 0x0000_1000 | IN_DONT_FOLLOW | IN_ONLYDIR),
+            Ok(WatchLookup {
+                follow: false,
+                only_dir: true
+            })
+        );
+        // The lookup flags alone are a mask with a known bit.
+        assert!(inotify_watch_lookup(IN_ONLYDIR).is_ok());
+        assert!(inotify_watch_lookup(IN_MASK_CREATE).is_ok());
+        assert_eq!(ALL_INOTIFY_BITS, 0xf700_efff);
     }
 
     #[test]

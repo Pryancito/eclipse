@@ -105,6 +105,27 @@ fn epoll_ctl_events(op: i32, events: u32, target_is_epoll: bool) -> LxResult<u32
     Ok(events | PollEvents::ERR.bits() as u32 | PollEvents::HUP.bits() as u32)
 }
 
+/// The two refusals `do_epoll_ctl` makes of the target file before it
+/// looks at the op or the mask, in its order: a file with no poll
+/// operation (`!file_can_poll`, `EPERM`), then the epoll itself
+/// (`f.file == tf.file`, `EINVAL`).
+///
+/// A regular file was accepted and reported always ready, so an event
+/// loop handed one (a log written by another process, a config file)
+/// spun at full speed where Linux tells it `EPERM` and it falls back to
+/// inotify or a timer. And adding an epoll to itself was `ELOOP`, the
+/// answer for a cycle through other epolls, not the `EINVAL` Linux gives
+/// the direct case.
+fn epoll_target_verdict(target_can_epoll: bool, target_is_self: bool) -> LxResult<()> {
+    if !target_can_epoll {
+        return Err(LxError::EPERM);
+    }
+    if target_is_self {
+        return Err(LxError::EINVAL);
+    }
+    Ok(())
+}
+
 lazy_static::lazy_static! {
     /// Serializes EPOLL_CTL_ADD of a nested epoll (one epoll fd watching
     /// another) so the cycle/depth check and the insert happen as one atomic
@@ -167,6 +188,16 @@ impl Epoll {
         event: EpollEvent,
         file: Option<Arc<dyn FileLike>>,
     ) -> LxResult<usize> {
+        // The target is judged first, for every op, as `do_epoll_ctl` does
+        // it: a file that cannot be polled is EPERM and this epoll itself is
+        // EINVAL, before the op, the mask or the interest list.
+        if let Some(target) = file.as_ref() {
+            let target_is_self = core::ptr::eq(
+                Arc::as_ptr(target) as *const u8,
+                self as *const Self as *const u8,
+            );
+            epoll_target_verdict(target.can_epoll(), target_is_self)?;
+        }
         // The mask is settled before the interest list is touched, as
         // `do_epoll_ctl` does it: a request this kernel will not honour is
         // EINVAL whether or not the fd happens to be watched already, and the
@@ -698,9 +729,90 @@ mod tests {
         assert!(readable(&outer));
     }
 
+    /// A file with no poll operation, the way a regular file on ext4 is.
+    struct Unpollable {
+        base: KObjectBase,
+    }
+
+    impl_kobject!(Unpollable);
+
+    #[async_trait]
+    impl FileLike for Unpollable {
+        fn flags(&self) -> OpenFlags {
+            OpenFlags::empty()
+        }
+        fn set_flags(&self, _f: OpenFlags) -> LxResult {
+            Ok(())
+        }
+        async fn read(&self, _buf: &mut [u8]) -> LxResult<usize> {
+            Err(LxError::ENOSYS)
+        }
+        fn write(&self, _buf: &[u8]) -> LxResult<usize> {
+            Err(LxError::ENOSYS)
+        }
+        async fn read_at(&self, _offset: u64, _buf: &mut [u8]) -> LxResult<usize> {
+            Err(LxError::ENOSYS)
+        }
+        fn can_epoll(&self) -> bool {
+            false
+        }
+        fn poll(&self, _events: PollEvents) -> LxResult<PollStatus> {
+            Ok(PollStatus {
+                read: true,
+                write: true,
+                error: false,
+                hangup: false,
+            })
+        }
+        async fn async_poll(&self, events: PollEvents) -> LxResult<PollStatus> {
+            self.poll(events)
+        }
+    }
+
+    /// `do_epoll_ctl`: a target with no poll operation is `EPERM` for
+    /// every op, judged before the op, the mask and the interest list; and
+    /// it is never added, so `poll(2)` on the epoll stays quiet.
+    #[test]
+    fn a_file_that_cannot_be_polled_is_eperm_for_every_op() {
+        let ep = epoll();
+        let plain: Arc<dyn FileLike> = Arc::new(Unpollable {
+            base: KObjectBase::new(),
+        });
+        for op in [ADD, MOD, DEL, 9] {
+            assert_eq!(
+                ep.ctl(
+                    op,
+                    FileDesc::from(7),
+                    ev(PollEvents::IN, 0),
+                    Some(plain.clone())
+                ),
+                Err(LxError::EPERM),
+                "op {op}"
+            );
+        }
+        // EPERM comes before the mask is looked at.
+        assert_eq!(
+            ep.ctl(
+                MOD,
+                FileDesc::from(7),
+                EpollEvent {
+                    events: EPOLLEXCLUSIVE,
+                    data: 0
+                },
+                Some(plain)
+            ),
+            Err(LxError::EPERM)
+        );
+        assert!(!readable(&ep), "a refused file was watched anyway");
+        assert_eq!(epoll_target_verdict(true, false), Ok(()));
+        assert_eq!(epoll_target_verdict(false, true), Err(LxError::EPERM));
+    }
+
     #[test]
     fn an_epoll_cannot_watch_itself_or_close_a_cycle() {
         let a = epoll();
+        // The direct case is `f.file == tf.file`, EINVAL; a cycle through
+        // another epoll is `ep_loop_check`, ELOOP.
         assert_eq!(
             a.ctl(
                 ADD,
@@ -708,7 +820,17 @@ mod tests {
                 ev(PollEvents::IN, 0),
                 Some(a.clone())
             ),
-            Err(LxError::ELOOP)
+            Err(LxError::EINVAL)
+        );
+        assert_eq!(
+            a.ctl(
+                DEL,
+                FileDesc::from(1),
+                ev(PollEvents::IN, 0),
+                Some(a.clone())
+            ),
+            Err(LxError::EINVAL),
+            "for DEL too: the target is judged before the op"
         );
         let b = epoll();
         // a watches b is fine...

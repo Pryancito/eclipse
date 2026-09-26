@@ -295,7 +295,7 @@ fn adjtimex_apply(tx: &mut Timex) -> Result<usize, LxError> {
         st.tick = tx.tick;
     }
     if modes & ADJ_FREQUENCY != 0 {
-        st.freq = tx.freq;
+        st.freq = clamp_freq(tx.freq);
     }
     if modes & ADJ_MAXERROR != 0 {
         st.maxerror = tx.maxerror;
@@ -320,7 +320,8 @@ fn adjtimex_apply(tx: &mut Timex) -> Result<usize, LxError> {
 
     let singleshot = (modes & ADJ_OFFSET_SINGLESHOT) == ADJ_OFFSET_SINGLESHOT;
     if modes & ADJ_SETOFFSET != 0 {
-        let nsec = setoffset_ns(&tx.time, st.nano)?;
+        // The unit is this call's `ADJ_NANO`, not the stored `STA_NANO`.
+        let nsec = setoffset_ns(&tx.time, modes & ADJ_NANO != 0)?;
         wall_clock_add_ns(nsec);
     } else if singleshot || modes & ADJ_OFFSET != 0 {
         let nsec = if st.nano {
@@ -342,10 +343,33 @@ fn adjtimex_apply(tx: &mut Timex) -> Result<usize, LxError> {
     Ok(ntp_time_state(&st))
 }
 
+/// `MAXFREQ_SCALED` in `timex` units: 500 ppm, the most `ADJ_FREQUENCY` may
+/// ask for, which is also the `tolerance` every read reports.
+const MAXFREQ_SCALED: i64 = 500 << 16;
+
+/// `process_adjtimex_modes` on `ADJ_FREQUENCY`: `time_freq = min(time_freq,
+/// MAXFREQ_SCALED); time_freq = max(time_freq, -MAXFREQ_SCALED);`. The value
+/// was stored as sent, so a daemon asking for more than the clock can do was
+/// told it got it, and read the impossible number back.
+fn clamp_freq(freq: i64) -> i64 {
+    freq.clamp(-MAXFREQ_SCALED, MAXFREQ_SCALED)
+}
+
+/// The offset `ADJ_SETOFFSET` injects, in nanoseconds, from a `timeval` whose
+/// fraction is in the unit THIS CALL names: `do_adjtimex` reads
+/// `txc->modes & ADJ_NANO` for it, and `timekeeping_validate_timex` refuses
+/// a fraction that is negative or a whole second or more, in that unit.
+///
+/// The unit came from the stored `STA_NANO` instead. chrony and ntpd set
+/// `STA_NANO` once, early, and later inject a step in microseconds (a
+/// `timeval`, as the header says): read as nanoseconds, the step was a
+/// thousand times too small, and the clock never converged. And a negative
+/// fraction passed (Linux: `EINVAL`), so `{-1, -500000}` stepped by
+/// something no `timespec` normalisation would produce.
 fn setoffset_ns(tv: &TimeValI64, nano: bool) -> Result<i64, LxError> {
     let frac = tv.usec;
     let limit = if nano { 1_000_000_000 } else { 1_000_000 };
-    if frac <= -limit || frac >= limit {
+    if frac < 0 || frac >= limit {
         return Err(LxError::EINVAL);
     }
     let sec_ns = tv.sec.saturating_mul(1_000_000_000);
@@ -364,7 +388,7 @@ fn fill_timex_readonly(tx: &mut Timex, st: &NtpState) {
     tx.status = st.status;
     tx.constant = st.constant;
     tx.precision = 1;
-    tx.tolerance = 32_768_000; // Linux MAXFREQ (500 ppm, scaled)
+    tx.tolerance = MAXFREQ_SCALED;
     tx.tick = st.tick;
     tx.tai = st.tai;
     let now = TimeSpec::now();
@@ -889,21 +913,20 @@ impl Syscall<'_> {
             timer_notify_from_sigevent(&event, |tid| proc.get_child(tid).is_ok())?
         };
         ensure_posix_timers_die_with_their_owner();
-        let id = NEXT_TIMER_ID.fetch_add(1, Ordering::Relaxed);
-        POSIX_TIMERS.lock().insert(
-            id,
-            PosixTimer {
-                owner: self.zircon_process().id(),
-                notify,
-                clock,
-                interval: Duration::ZERO,
-                next: Duration::ZERO,
-                generation: 0,
-                overrun_last: 0,
-            },
-        );
-        let mut out: UserOutPtr<i32> = timerid.into();
-        out.write(id as i32)?;
+        let timer = PosixTimer {
+            owner: self.zircon_process().id(),
+            notify,
+            clock,
+            interval: Duration::ZERO,
+            next: Duration::ZERO,
+            generation: 0,
+            overrun_last: 0,
+        };
+        register_posix_timer(timer, |id| {
+            let mut out: UserOutPtr<i32> = timerid.into();
+            out.write(id as i32)?;
+            Ok(())
+        })?;
         Ok(0)
     }
 
@@ -1128,6 +1151,30 @@ lazy_static! {
     static ref POSIX_TIMERS: Mutex<BTreeMap<usize, PosixTimer>> = Mutex::new(BTreeMap::new());
 }
 static NEXT_TIMER_ID: AtomicUsize = AtomicUsize::new(1);
+
+/// The tail of `do_timer_create`: the timer goes into the table under a
+/// fresh id, then the id goes to the caller through `deliver`, and if that
+/// fails (`copy_to_user` of `created_timer_id`, `EFAULT`) the timer is
+/// released again (`release_posix_timer(new_timer, IT_ID_SET)`), so a
+/// failed `timer_create` creates nothing.
+///
+/// The timer was left in the table: `timer_create(clock, NULL, NULL)`
+/// answered `EFAULT` and kept a timer nobody held an id for, one per
+/// call, until the process exited or exec'd. A program probing whether
+/// the call exists, or one handed a bad pointer, grew the table with each
+/// try, and every timer of it was walked by each expiry and each exec.
+fn register_posix_timer(
+    timer: PosixTimer,
+    deliver: impl FnOnce(usize) -> linux_object::error::LxResult<()>,
+) -> linux_object::error::LxResult<()> {
+    let id = NEXT_TIMER_ID.fetch_add(1, Ordering::Relaxed);
+    POSIX_TIMERS.lock().insert(id, timer);
+    if let Err(e) = deliver(id) {
+        POSIX_TIMERS.lock().remove(&id);
+        return Err(e);
+    }
+    Ok(())
+}
 
 fn timespec_to_duration(ts: TimeSpec) -> Duration {
     Duration::from_secs(ts.sec as u64) + Duration::from_nanos(ts.nsec as u64)
@@ -1829,6 +1876,101 @@ mod adjtimex_tests {
         assert_eq!(tx.status & STA_UNSYNC, 0);
     }
 
+    /// `ADJ_SETOFFSET`'s fraction is in the unit of this call's `ADJ_NANO`,
+    /// whatever `STA_NANO` the daemon set earlier.
+    #[test]
+    fn setoffset_takes_its_unit_from_this_call_and_not_from_sta_nano() {
+        let tv = TimeValI64 {
+            sec: 1,
+            usec: 500_000,
+        };
+        assert_eq!(setoffset_ns(&tv, false), Ok(1_500_000_000));
+        assert_eq!(setoffset_ns(&tv, true), Ok(1_000_500_000));
+        // A whole second or more in the fraction is refused, in that unit.
+        let big = TimeValI64 {
+            sec: 0,
+            usec: 999_999_999,
+        };
+        assert_eq!(setoffset_ns(&big, true), Ok(999_999_999));
+        assert_eq!(setoffset_ns(&big, false), Err(LxError::EINVAL));
+        assert_eq!(
+            setoffset_ns(
+                &TimeValI64 {
+                    sec: 0,
+                    usec: 1_000_000_000
+                },
+                true
+            ),
+            Err(LxError::EINVAL)
+        );
+        // And a negative fraction is refused whatever the unit.
+        let neg = TimeValI64 { sec: -1, usec: -1 };
+        assert_eq!(setoffset_ns(&neg, false), Err(LxError::EINVAL));
+        assert_eq!(setoffset_ns(&neg, true), Err(LxError::EINVAL));
+        // Through `adjtimex_apply`: with STA_NANO stored, a call without
+        // ADJ_NANO is still in microseconds, so a million is refused.
+        let _serialised = serialised();
+        *NTP_STATE.lock() = NtpState {
+            nano: true,
+            ..NtpState::default()
+        };
+        let mut tx = Timex {
+            modes: ADJ_SETOFFSET,
+            time: TimeValI64 {
+                sec: 0,
+                usec: 1_000_000,
+            },
+            ..Default::default()
+        };
+        assert_eq!(adjtimex_apply(&mut tx), Err(LxError::EINVAL));
+        // And with ADJ_NANO on the call, the same million is a millisecond
+        // of nanoseconds and is taken (the clock moves by that much here).
+        let mut tx = Timex {
+            modes: ADJ_SETOFFSET | ADJ_NANO,
+            time: TimeValI64 {
+                sec: 0,
+                usec: 1_000_000,
+            },
+            ..Default::default()
+        };
+        assert!(adjtimex_apply(&mut tx).is_ok());
+        // ADJ_MICRO is the other bit, and it does not make nanoseconds.
+        let mut tx = Timex {
+            modes: ADJ_SETOFFSET | ADJ_MICRO,
+            time: TimeValI64 {
+                sec: 0,
+                usec: 1_000_000,
+            },
+            ..Default::default()
+        };
+        assert_eq!(adjtimex_apply(&mut tx), Err(LxError::EINVAL));
+        *NTP_STATE.lock() = NtpState::default();
+    }
+
+    /// `ADJ_FREQUENCY` is clamped to +-MAXFREQ (500 ppm), the `tolerance`
+    /// the same call reports, and the clamped value is what reads back.
+    #[test]
+    fn frequency_is_clamped_to_the_tolerance_the_kernel_reports() {
+        assert_eq!(clamp_freq(0), 0);
+        assert_eq!(clamp_freq(MAXFREQ_SCALED), MAXFREQ_SCALED);
+        assert_eq!(clamp_freq(MAXFREQ_SCALED + 1), MAXFREQ_SCALED);
+        assert_eq!(clamp_freq(-MAXFREQ_SCALED - 1), -MAXFREQ_SCALED);
+        assert_eq!(clamp_freq(i64::MAX), MAXFREQ_SCALED);
+        assert_eq!(clamp_freq(i64::MIN), -MAXFREQ_SCALED);
+        assert_eq!(MAXFREQ_SCALED, 32_768_000, "500 ppm << 16");
+        let _serialised = serialised();
+        *NTP_STATE.lock() = NtpState::default();
+        let mut tx = Timex {
+            modes: ADJ_FREQUENCY,
+            freq: i64::MAX / 2,
+            ..Default::default()
+        };
+        adjtimex_apply(&mut tx).unwrap();
+        assert_eq!(tx.freq, MAXFREQ_SCALED);
+        assert_eq!(tx.tolerance, MAXFREQ_SCALED);
+        *NTP_STATE.lock() = NtpState::default();
+    }
+
     #[test]
     fn setoffset_rejects_out_of_range_usec() {
         let _serialised = serialised();
@@ -2072,6 +2214,49 @@ mod exec_timer_tests {
         a_timer_of(owner);
         assert_eq!(drop_posix_timers_of(owner), 1);
         assert_eq!(drop_posix_timers_of(owner), 0);
+    }
+
+    /// `do_timer_create`: a timer whose id cannot be written back
+    /// (`timer_create(CLOCK_MONOTONIC, NULL, NULL)`, `EFAULT`) is released
+    /// again, and one whose id is delivered is in the table by the time the
+    /// caller could use the id.
+    #[test]
+    fn a_timer_whose_id_cannot_be_written_back_is_not_kept() {
+        let _guard = serialised();
+        let owner = 0x4711_0007;
+        let fresh = || PosixTimer {
+            owner,
+            notify: TimerNotify::SIGALRM_TO_PROCESS,
+            clock: ClockBase::Monotonic,
+            interval: Duration::ZERO,
+            next: Duration::ZERO,
+            generation: 0,
+            overrun_last: 0,
+        };
+        assert_eq!(
+            register_posix_timer(fresh(), |_| Err(LxError::EFAULT)),
+            Err(LxError::EFAULT)
+        );
+        assert_eq!(
+            drop_posix_timers_of(owner),
+            0,
+            "the timer of a failed timer_create stayed in the table"
+        );
+        let mut delivered = None;
+        assert_eq!(
+            register_posix_timer(fresh(), |id| {
+                assert!(
+                    still_there(id),
+                    "the id is handed out before the timer exists"
+                );
+                delivered = Some(id);
+                Ok(())
+            }),
+            Ok(())
+        );
+        let id = delivered.expect("the id was delivered");
+        assert!(still_there(id));
+        assert_eq!(drop_posix_timers_of(owner), 1);
     }
 
     #[test]
