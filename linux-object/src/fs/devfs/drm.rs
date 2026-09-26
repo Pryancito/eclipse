@@ -1840,6 +1840,95 @@ fn dma_sync_scanout_src_from_device(
     zcore_drivers::utils::dma_sync::dma_sync_wb_from_device(vaddr + byte_off, byte_len);
 }
 
+/// The half-open run of pixels [`dma_sync_scanout_src_from_device`] invalidates
+/// for `(x, y, w, h)`, so a caller can ask whether a read it is about to do is
+/// already covered.
+///
+/// It is ONE contiguous run — the first row's left edge to the last row's right
+/// edge — not a set of rows, because that is what that function flushes: every
+/// byte in between, pitch padding and all. So a rectangle is covered exactly
+/// when its own first and last byte both fall inside the run.
+fn sync_run_px(stride_px: usize, x: u32, y: u32, w: u32, h: u32) -> Option<(usize, usize)> {
+    if stride_px == 0 || w == 0 || h == 0 {
+        return None;
+    }
+    let start = (y as usize)
+        .saturating_mul(stride_px)
+        .saturating_add(x as usize);
+    let end = (y as usize)
+        .saturating_add(h as usize - 1)
+        .saturating_mul(stride_px)
+        .saturating_add(x as usize)
+        .saturating_add(w as usize);
+    (end > start).then_some((start, end))
+}
+
+/// `(x, y, w, h)` clipped the way [`dma_sync_gem_rect_from_device`] clips
+/// before it touches a line, so "what would be invalidated" and "what is
+/// already invalidated" are compared in the same coordinates. `None` means the
+/// rectangle falls entirely outside the buffer and nothing would be read.
+fn clip_rect_for_read(
+    x: i32,
+    y: i32,
+    w: u32,
+    h: u32,
+    clip_w: u32,
+    clip_h: u32,
+) -> Option<(u32, u32, u32, u32)> {
+    // Widened to i64 before anything is added. `w`/`h` are `u32`, and casting
+    // one to `i32` wraps it negative past `i32::MAX` -- which `clamp` then
+    // turns into an empty rect, i.e. "nothing will be read", the answer that
+    // SKIPS the flush. Wrong direction for a value that decides whether a read
+    // is safe, so the cast that could produce it is gone. Every input fits i64
+    // (`x`/`y` are i32, the rest u32), so nothing here can overflow.
+    let x0 = (x as i64).max(0);
+    let y0 = (y as i64).max(0);
+    let x1 = (x as i64 + w as i64).clamp(0, clip_w as i64);
+    let y1 = (y as i64 + h as i64).clamp(0, clip_h as i64);
+    (x1 > x0 && y1 > y0).then(|| (x0 as u32, y0 as u32, (x1 - x0) as u32, (y1 - y0) as u32))
+}
+
+/// Has this present already invalidated every byte the cursor blend is about
+/// to read?
+///
+/// `blit` is the region the present copied, `cpu_src_synced` says whether it
+/// ran [`dma_sync_scanout_src_from_device`] over it at all, and `read` is the
+/// window [`blit_cursor_patch`] will read — x already widened by
+/// [`expand_x_for_wc`], because that is what it reads, not what it was asked
+/// for.
+///
+/// A full-frame present covers the pointer wherever it is. A damage-clipped
+/// one covers only its own box's rows, which is why this has to be asked
+/// rather than assumed.
+fn cursor_read_is_synced(
+    src_stride: usize,
+    blit: (u32, u32, u32, u32),
+    cpu_src_synced: bool,
+    read: (i32, i32, u32, u32),
+    clip_w: u32,
+    clip_h: u32,
+) -> bool {
+    let read = match clip_rect_for_read(read.0, read.1, read.2, read.3, clip_w, clip_h) {
+        // None of the pointer lands in the buffer, so nothing will be read.
+        None => return true,
+        Some(r) => r,
+    };
+    if !cpu_src_synced {
+        return false;
+    }
+    let Some((s0, s1)) = sync_run_px(src_stride, blit.0, blit.1, blit.2, blit.3) else {
+        return false;
+    };
+    // `is_some_and`, not `is_none_or`: `read` is already known non-empty, so
+    // the `None` arm is only reachable if the run cannot be computed at all,
+    // and the answer to "I cannot tell" is "flush", never "covered". Every
+    // unknown in this function has to fall the same way -- a needless flush of
+    // a 64x64 window costs microseconds, a skipped one puts stale pixels on
+    // the screen.
+    sync_run_px(src_stride, read.0, read.1, read.2, read.3)
+        .is_some_and(|(c0, c1)| c0 >= s0 && c1 <= s1)
+}
+
 /// FromDevice clflush of one rectangle, row by row, so a 64×64 cursor does not
 /// clflush a megabyte of pitch padding. Used after CE-direct present so
 /// [`blit_cursor_patch`] can read GPU pixels from sysmem without a full-frame
@@ -2296,17 +2385,55 @@ pub fn scanout_region_checked(
         snap
     };
     if let Some((cx, cy, cw, ch, bmp)) = cursor {
-        let cursor_pitch_px = (src_stride as u32).min(info.pitch() / 4).max(fb_width);
-        // CE-direct skipped the full-frame FromDevice. Invalidate just the
-        // cursor window so the CPU blend sees GPU pixels; counted in cursor
-        // time, not `sync`, so the klog keeps showing ~0us sync on CE.
-        if blitted_by_ce && !cpu_src_synced && gem_cpu_mapped {
-            // Widened for the same reason as the invalidate in
-            // `repaint_for_cursor`: `blit_cursor_patch` reads out to the
-            // write-combining boundary and to the row pitch, so invalidating
-            // only `cw` columns clipped to `fb_width` leaves the margins it
-            // reads coming from stale cache lines.
-            let (ex, ew) = expand_x_for_wc(cx.max(0) as u32, cw, cursor_pitch_px);
+        // Capped at `src_stride` on the way out, after the `.max(fb_width)`:
+        // `cursor_read_is_synced` linearises with `src_stride`, so a limit
+        // above it would put the read's last byte in the NEXT row and tip the
+        // containment test towards "covered" -- the direction that skips a
+        // flush. `create_fb` already rejects `pitch < width * 4`, so
+        // `fb_width <= src_stride` holds for every registered framebuffer and
+        // the cap never fires; it keeps the two arguments consistent by
+        // construction rather than by an invariant enforced a thousand lines
+        // away.
+        let cursor_pitch_px = (src_stride as u32)
+            .min(info.pitch() / 4)
+            .max(fb_width)
+            .min(src_stride as u32);
+        // `blit_cursor_patch` below READS the framebuffer under the pointer --
+        // through the WB physmap alias of a GEM the GPU writes -- to blend the
+        // cursor over it. Those lines have to be invalidated first or the blend
+        // composites the pointer over whatever the cache still holds and writes
+        // that to the screen.
+        //
+        // Widened for the same reason as the invalidate in
+        // `repaint_for_cursor`: the patch reads out to the write-combining
+        // boundary and to the row pitch, so invalidating only `cw` columns
+        // clipped to `fb_width` leaves the margins it reads stale.
+        let (ex, ew) = expand_x_for_wc(cx.max(0) as u32, cw, cursor_pitch_px);
+        // What this present has already invalidated. `dma_sync_scanout_src_from_device`
+        // flushes ONE contiguous run, so a full-frame present covers the
+        // pointer wherever it is -- and that is the only case the old
+        // `blitted_by_ce && !cpu_src_synced` guard was written for.
+        //
+        // A DAMAGE-CLIPPED present does not: its run spans the damage box's
+        // rows only. A pointer outside those rows had nothing invalidate the
+        // lines the blend reads -- the CE branch does not run (`cpu_src_synced`
+        // is true on the CPU path) and the rect sync stopped at the box -- so
+        // the blend composited it over whatever the cache still held and wrote
+        // that to the screen. A menu or a calendar opening is precisely the
+        // small damage box that does not reach the pointer's rows. It only
+        // shows where the GPU recently rewrote those pixels, so a flat
+        // wallpaper hides it and a freshly composited shadow does not.
+        let covered = cursor_read_is_synced(
+            src_stride,
+            (blit_x, blit_y, blit_w, blit_h),
+            cpu_src_synced,
+            (ex as i32, cy, ew, ch),
+            cursor_pitch_px,
+            fb_height,
+        );
+        if gem_cpu_mapped && !covered {
+            // Counted in cursor time, not `sync`, so the klog keeps showing
+            // ~0us sync on CE-direct.
             dma_sync_gem_rect_from_device(
                 vaddr,
                 fb.size,
@@ -6356,6 +6483,182 @@ mod cursor_invalidate_tests {
             short > 0,
             "expected the unexpanded invalidate to fall short somewhere; \
              if this fires, the widening is no longer load-bearing"
+        );
+    }
+}
+
+/// The other half of "invalidate what you READ": whether the present
+/// invalidated the pointer's window *at all*.
+///
+/// [`cursor_invalidate_tests`] above is about the columns within that window.
+/// This one is about a present that never reaches the window: a damage-clipped
+/// commit. `dma_sync_scanout_src_from_device` flushes one contiguous run from
+/// the damage box's first row to its last, so a pointer sitting outside those
+/// rows is blended from lines nothing invalidated.
+///
+/// The screen cannot show this in a host test — there is no stale cache to
+/// read — so what is checked is the decision itself, through the same
+/// [`cursor_read_is_synced`] the present calls.
+#[cfg(test)]
+mod partial_present_cursor_sync_tests {
+    use super::{cursor_read_is_synced, expand_x_for_wc};
+
+    const STRIDE: usize = 1920;
+    const FB_H: u32 = 1080;
+    const CURSOR: u32 = 64;
+
+    /// The pointer window as the present computes it: x widened to the
+    /// write-combining boundary, then handed in as the read rect.
+    fn ptr(x: u32, y: u32) -> (i32, u32, u32, u32) {
+        let (ex, ew) = expand_x_for_wc(x, CURSOR, STRIDE as u32);
+        (ex as i32, y, ew, CURSOR)
+    }
+
+    fn synced_for(blit: (u32, u32, u32, u32), at: (u32, u32)) -> bool {
+        let (ex, py, ew, ph) = ptr(at.0, at.1);
+        cursor_read_is_synced(
+            STRIDE,
+            blit,
+            true,
+            (ex, py as i32, ew, ph),
+            STRIDE as u32,
+            FB_H,
+        )
+    }
+
+    /// A full-frame present invalidates the whole buffer in one run, so the
+    /// pointer is covered wherever it is and the present must not pay for a
+    /// second flush. This is the case the old guard was written for, and it
+    /// has to keep behaving exactly as it did.
+    #[test]
+    fn a_full_frame_present_covers_the_pointer_anywhere() {
+        let full = (0, 0, STRIDE as u32, FB_H);
+        for x in [0u32, 1, 15, 700, 1855, 1919] {
+            for y in [0u32, 1, 540, 1015, 1079] {
+                assert!(
+                    synced_for(full, (x, y)),
+                    "full frame left the pointer at ({}, {}) unsynced",
+                    x,
+                    y
+                );
+            }
+        }
+    }
+
+    /// The bug: a popup's damage box does not reach the pointer's rows, and
+    /// nothing else in the present invalidates them. A menu or a calendar is
+    /// exactly this box.
+    #[test]
+    fn a_popup_damage_box_does_not_cover_a_pointer_outside_its_rows() {
+        // A 320x240 menu near the top left.
+        let menu = (48, 64, 320, 240);
+        // The pointer well below the menu's last row (64 + 240 = 304).
+        for y in [320u32, 500, 900] {
+            for x in [64u32, 900, 1600] {
+                assert!(
+                    !synced_for(menu, (x, y)),
+                    "the pointer at ({}, {}) is outside the damage box's rows, so the \
+                     present did not invalidate what the blend reads -- it must flush",
+                    x,
+                    y
+                );
+            }
+        }
+    }
+
+    /// And when the box does span the pointer's rows *and* its columns, the
+    /// run already covers it: no second flush, so the common case of a popup
+    /// opening under the pointer stays as cheap as it was.
+    #[test]
+    fn a_damage_box_around_the_pointer_needs_no_second_flush() {
+        // The box starts left of the widened window and ends right of it, on
+        // every row the pointer occupies.
+        let wide = (0, 100, STRIDE as u32, 400);
+        for y in [100u32, 200, 435] {
+            for x in [0u32, 33, 900, 1855] {
+                assert!(
+                    synced_for(wide, (x, y)),
+                    "pointer at ({}, {}) is inside the damage run and was flushed twice",
+                    x,
+                    y
+                );
+            }
+        }
+    }
+
+    /// A box that spans the pointer's ROWS but stops short of its COLUMNS is
+    /// still covered, because the invalidate is one contiguous run and not a
+    /// set of rows -- the columns in between are flushed on the way past. This
+    /// is what makes the cheap containment test correct rather than merely
+    /// conservative; getting it wrong the other way would flush on every
+    /// frame.
+    #[test]
+    fn the_run_between_the_first_and_last_row_counts_as_covered() {
+        // Columns [0, 200) only, rows [100, 500) -- the pointer at x = 1600 is
+        // far to its right, but between row 100's left edge and row 499's
+        // right edge in linear order.
+        let narrow = (0, 100, 200, 400);
+        assert!(
+            synced_for(narrow, (1600, 300)),
+            "a row strictly inside the run is covered whatever its column"
+        );
+        // The pointer's LAST row must still be inside the run: at row 436 the
+        // window ends on row 499, the run's last row, past its right edge.
+        assert!(
+            !synced_for(narrow, (1600, 436)),
+            "the pointer's last row runs past the end of the run"
+        );
+    }
+
+    /// Every unknown falls towards "flush". A needless flush of a 64x64 window
+    /// costs microseconds; a skipped one puts stale pixels on the screen, so
+    /// there is no input for which "I cannot tell" may answer "covered".
+    #[test]
+    fn what_cannot_be_decided_is_flushed() {
+        let full = (0, 0, STRIDE as u32, FB_H);
+        let (ex, py, ew, ph) = ptr(700, 500);
+        // A stride of zero cannot be linearised at all.
+        assert!(
+            !cursor_read_is_synced(0, full, true, (ex, py as i32, ew, ph), STRIDE as u32, FB_H),
+            "a stride nothing can be linearised against must flush"
+        );
+        // The present ran no FromDevice of its own.
+        assert!(
+            !cursor_read_is_synced(
+                STRIDE,
+                full,
+                false,
+                (ex, py as i32, ew, ph),
+                STRIDE as u32,
+                FB_H
+            ),
+            "no sync ran, so nothing is covered"
+        );
+        // A degenerate blit rect invalidated nothing.
+        assert!(
+            !cursor_read_is_synced(
+                STRIDE,
+                (0, 0, 0, 0),
+                true,
+                (ex, py as i32, ew, ph),
+                STRIDE as u32,
+                FB_H
+            ),
+            "an empty blit rect covers nothing"
+        );
+        // A width past `i32::MAX` used to wrap negative through an `as i32`
+        // and read as an empty rect -- "nothing to read", which skips the
+        // flush. It has to clip to the buffer and be treated as a real read.
+        assert!(
+            !cursor_read_is_synced(
+                STRIDE,
+                (0, 900, 16, 8),
+                true,
+                (0, 0, u32::MAX, u32::MAX),
+                STRIDE as u32,
+                FB_H
+            ),
+            "an out-of-range read window must clip, not vanish"
         );
     }
 }
