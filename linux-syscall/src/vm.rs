@@ -551,13 +551,51 @@ impl Syscall<'_> {
 
         match plan.moved {
             BrkMove::Shrink => {
-                // Shrink: just move the user-visible break. The reserved
-                // pages stay mapped until they are reused on the next grow.
-                // Linux glibc essentially never shrinks brk, and skipping the
-                // unmap avoids the VMAR churn + TLB shootdown for transient
-                // shrink/grow patterns.
+                // Shrink: unmap what the break no longer covers, as
+                // `__do_sys_brk` does (`do_vmi_align_munmap(..., newbrk,
+                // oldbrk, ...)`). Keeping the pages mapped "to reuse them on
+                // the next grow" is what this did before, and it is wrong for
+                // a reason that has nothing to do with the address space:
+                // memory a program gets from `brk` HAS to read as zero, and
+                // the only thing that makes it so is that the unmap threw the
+                // pages away.
+                //
+                // glibc's `calloc` depends on exactly that. Under
+                // `MORECORE_CLEARS` it clears only the part of the block that
+                // came from the OLD top chunk --
+                //
+                //     if (p == oldtop && csz > oldtopsize) csz = oldtopsize;
+                //
+                // -- and leaves the freshly-`sbrk`ed tail alone, because the
+                // kernel is supposed to have zeroed it. With the pages kept,
+                // that tail came back holding the program's own freed heap:
+                // `calloc` returning non-zero memory, which is a bug nobody
+                // debugs in the allocator. And glibc DOES shrink the break --
+                // `systrim()` calls `MORECORE(-extra)` from `free()` whenever
+                // the top chunk passes the 128 KiB trim threshold -- so
+                // "glibc essentially never shrinks brk" was the part that was
+                // not true.
+                //
+                // The unmap covers everything above the new break, the
+                // reserved-ahead chunk included: that is the only way the
+                // next grow reaches `map_at` and gets fresh pages. If it
+                // fails the reservation stays where it was, so `mapped_brk`
+                // only moves down when it really moved.
+                if mapped_brk > plan.mapped_end {
+                    match vmar.unmap_why(
+                        plan.mapped_end,
+                        mapped_brk - plan.mapped_end,
+                        "sys_brk shrink",
+                    ) {
+                        Ok(()) => proc.set_mapped_brk(plan.mapped_end),
+                        Err(e) => warn!(
+                            "brk: shrink to {:#x} could not unmap [{:#x}, {:#x}): {:?}",
+                            plan.brk, plan.mapped_end, mapped_brk, e
+                        ),
+                    }
+                }
                 proc.set_brk(plan.brk);
-                info!("brk: shrunk to {:#x} (mapping kept)", plan.brk);
+                info!("brk: shrunk to {:#x}", plan.brk);
                 return Ok(plan.brk);
             }
             BrkMove::WithinPage => {
