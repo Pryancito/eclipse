@@ -276,7 +276,7 @@ impl Syscall<'_> {
     /// otherwise (`write(2)` cannot say it): a writer whose reader has gone
     /// is killed unless it asked to be told instead. Without the signal,
     /// `yes | head -1` ran `yes` for ever.
-    fn raise_sigpipe_if_due(&self, e: LxError, stream: bool) {
+    pub(super) fn raise_sigpipe_if_due(&self, e: LxError, stream: bool) {
         if sigpipe_due(e, stream) {
             self.thread
                 .lock_linux()

@@ -165,7 +165,7 @@ pub use file::{cache_truncate, fs_grow_error, File, OpenFlags, PollEvents, SeekF
 pub use inotify::Inotify;
 pub use perf::{sample_user as perf_sample_user, PerfEvent};
 pub use pidfd::{PidFd, PIDFD_THREAD};
-pub use pipe::Pipe;
+pub use pipe::{Pipe, PIPE_BUF, PIPE_DEFAULT_CAPACITY};
 pub use rcore_fs::vfs::{self, PollStatus};
 pub use signalfd::SignalFd;
 pub use stdio::{STDIN, STDOUT};

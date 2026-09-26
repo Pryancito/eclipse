@@ -77,6 +77,17 @@ impl PipeData {
             self.eventbus.clear(Event::WRITABLE);
         }
     }
+
+    /// Remove `len` bytes (at most what is queued) and publish what that
+    /// changes: an empty queue is no longer readable, the freed room may make
+    /// the write end ready.
+    fn drain_front(&mut self, len: usize) {
+        self.buf.drain(..len);
+        if self.buf.is_empty() {
+            self.eventbus.clear(Event::READABLE);
+        }
+        self.publish_room();
+    }
 }
 
 /// pipe struct
@@ -209,6 +220,27 @@ impl Pipe {
         Some((out, data.write_cnt > 0))
     }
 
+    /// Bytes a write could add right now, `None` once every read end is gone
+    /// (a write would be `Broken`). `splice(2)` asks before it takes anything
+    /// out of its input, so that nothing is consumed that cannot be delivered.
+    pub fn write_room(&self) -> Option<usize> {
+        let data = self.data.lock();
+        (data.read_cnt > 0).then(|| data.room())
+    }
+
+    /// Drop the first `len` buffered bytes (`splice(2)` after it has delivered
+    /// what `peek_data` showed it), returning how many went; `None` on the
+    /// write end. Readiness moves exactly as after a `read_at` of that size.
+    pub fn consume(&self, len: usize) -> Option<usize> {
+        if self.direction != PipeEnd::Read {
+            return None;
+        }
+        let mut data = self.data.lock();
+        let len = min(len, data.buf.len());
+        data.drain_front(len);
+        Some(len)
+    }
+
     /// whether the pipe struct is readable
     fn can_read(&self) -> bool {
         if let PipeEnd::Read = self.direction {
@@ -253,11 +285,7 @@ impl INode for Pipe {
                     buf[..front.len()].copy_from_slice(front);
                     buf[front.len()..len].copy_from_slice(&back[..len - front.len()]);
                 }
-                data.buf.drain(..len);
-                if data.buf.is_empty() {
-                    data.eventbus.clear(Event::READABLE);
-                }
-                data.publish_room();
+                data.drain_front(len);
                 Ok(len)
             }
         } else {
@@ -595,6 +623,60 @@ mod tests {
                 other.map(|r| r.map(|s| s.write))
             ),
         }
+    }
+
+    /// `splice(2)` looks at the room before it takes anything out of its
+    /// input, and a pipe with no reader left has none to offer: the answer
+    /// must be `EPIPE`, not a write that fails after the input was consumed.
+    #[test]
+    fn write_room_is_what_fits_and_nothing_once_the_readers_are_gone() {
+        let (r, w) = Pipe::create_pair();
+        assert_eq!(w.write_room(), Some(PIPE_DEFAULT_CAPACITY));
+        fill(&w, PIPE_DEFAULT_CAPACITY - 100);
+        assert_eq!(w.write_room(), Some(100));
+        fill(&w, 100);
+        assert_eq!(w.write_room(), Some(0), "full: no room, but not broken");
+        drop(r);
+        assert_eq!(w.write_room(), None, "no reader: a write would be EPIPE");
+    }
+
+    /// After `tee`-style peeking, `consume` drops exactly the delivered bytes
+    /// and leaves the rest in order; readiness moves as a read of that size
+    /// would move it.
+    #[test]
+    fn consume_drops_only_the_delivered_bytes_and_publishes_readiness() {
+        let (r, w) = Pipe::create_pair();
+        assert_eq!(w.write_at(0, b"abcdef"), Ok(6));
+        assert_eq!(w.consume(3), None, "only the read end consumes");
+        assert_eq!(r.consume(2), Some(2));
+        let (rest, _) = r.peek_data(10).unwrap();
+        assert_eq!(rest, b"cdef", "the rest keeps its order");
+        assert!(r.data.lock().eventbus.events().contains(Event::READABLE));
+        assert_eq!(r.consume(100), Some(4), "at most what is queued");
+        assert!(
+            !r.data.lock().eventbus.events().contains(Event::READABLE),
+            "an emptied pipe is no longer readable"
+        );
+    }
+
+    /// Consuming a `PIPE_BUF` out of a full pipe wakes a parked writer, as a
+    /// read would: `splice` draining a full pipe into a file must let the
+    /// producer go on.
+    #[test]
+    fn consume_frees_room_for_a_parked_writer() {
+        static WOKE: AtomicBool = AtomicBool::new(false);
+        WOKE.store(false, Ordering::SeqCst);
+
+        let (r, w) = Pipe::create_pair();
+        fill(&w, PIPE_DEFAULT_CAPACITY);
+        let waker = flag_waker(&WOKE);
+        let mut cx = Context::from_waker(&waker);
+        let mut fut = w.async_poll();
+        assert!(matches!(fut.as_mut().poll(&mut cx), Poll::Pending));
+        assert_eq!(r.consume(PIPE_BUF), Some(PIPE_BUF));
+        assert!(WOKE.load(Ordering::SeqCst), "a PIPE_BUF of room wakes it");
+        assert!(w.can_write());
+        assert_eq!(w.write_at(0, &[0u8; PIPE_BUF]), Ok(PIPE_BUF));
     }
 
     /// `F_SETPIPE_SZ` below what is queued is `EBUSY` (`pipe_set_size`);
