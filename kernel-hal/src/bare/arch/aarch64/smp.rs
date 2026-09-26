@@ -54,6 +54,29 @@ struct SecondaryContext {
     cntkctl: u64, // +64
 }
 
+/// The trampoline reads this struct by hand-written byte offsets in a
+/// `naked_asm!` block that cannot see a single Rust name. That duplication was
+/// held together by the `// +0`, `// +8` comments above and by nothing else;
+/// reorder a field and the secondary loads its `SCTLR` out of the `MAIR` slot,
+/// with the MMU off, before anything can print. Say the offsets once more in a
+/// form the compiler checks -- this is the same thing x86_64's `smp.rs` does
+/// for its trampoline slots.
+const _: () = {
+    use core::mem::{offset_of, size_of};
+    assert!(offset_of!(SecondaryContext, ttbr0) == 0);
+    assert!(offset_of!(SecondaryContext, ttbr1) == 8);
+    assert!(offset_of!(SecondaryContext, tcr) == 16);
+    assert!(offset_of!(SecondaryContext, mair) == 24);
+    assert!(offset_of!(SecondaryContext, sctlr) == 32);
+    assert!(offset_of!(SecondaryContext, sp) == 40);
+    assert!(offset_of!(SecondaryContext, entry) == 48);
+    assert!(offset_of!(SecondaryContext, cpacr) == 56);
+    assert!(offset_of!(SecondaryContext, cntkctl) == 64);
+    // And nothing past the last offset the trampoline knows about, so a field
+    // added at the end is a field no secondary would ever read.
+    assert!(size_of::<SecondaryContext>() == 72);
+};
+
 /// Physical address of a kernel virtual address.
 fn virt_to_phys(va: usize) -> usize {
     va - KCONFIG.phys_to_virt_offset
@@ -96,6 +119,41 @@ fn build_identity_ttbr0(tramp_phys: usize) -> u64 {
     let token = pt.table_phys() as u64;
     core::mem::forget(pt); // keep the table alive for the lifetime of the APs
     token
+}
+
+/// Clean `[base, base + len)` out of this PE's data caches to the **point of
+/// coherency**.
+///
+/// A secondary starts with the MMU off, and with the MMU off every data access
+/// it makes is Device-nGnRnE: non-cacheable, and by the architecture's own
+/// rules (ARM ARM, "Mismatched memory attributes") *not coherent* with the
+/// cacheable writes the BSP made to the same bytes. The
+/// [`SecondaryContext`] is built through an ordinary cacheable kernel mapping
+/// moments before `CPU_ON`, so without this its stores can still be sitting in
+/// the BSP's own L1 when the secondary reads the address -- and what the
+/// secondary reads then is whatever the heap happened to hold before, i.e. a
+/// junk `TTBR1`, a junk `SCTLR` and a junk entry point, taken in that order
+/// with no way to report any of it.
+///
+/// QEMU does not model caches, so this costs nothing there and shows up
+/// nowhere; on silicon it is the difference between a core that boots and a
+/// core that never speaks again.
+fn clean_dcache_to_poc(base: usize, len: usize) {
+    let ctr: u64;
+    // CTR_EL0 is readable at EL1 and reports the *minimum* line length over
+    // every cache in the coherency domain, which is exactly the stride that is
+    // safe to use for all of them.
+    unsafe { core::arch::asm!("mrs {0}, ctr_el0", out(reg) ctr, options(nomem, nostack)) };
+    let line = crate::common::cache_maint::dcache_line_size(ctr);
+    crate::common::cache_maint::for_each_line(base, len, line, |addr| {
+        // By virtual address, so this is the BSP's own mapping of the object,
+        // not the physical address handed to PSCI.
+        unsafe {
+            core::arch::asm!("dc cvac, {0}", in(reg) addr, options(nostack, preserves_flags))
+        };
+    });
+    // The clean must have landed before `CPU_ON` lets the other core look.
+    unsafe { core::arch::asm!("dsb sy", options(nostack, preserves_flags)) };
 }
 
 /// Start all secondary cores. Called once from the BSP `primary_init`, after the
@@ -157,6 +215,12 @@ pub fn start_secondary_cores() {
         // and leaking the stack + context of every failed probe threw away a
         // 256 KiB stack on every boot.
         let ctx_phys = virt_to_phys(ctx.as_ref() as *const _ as usize) as u64;
+        // The secondary reads this with the MMU off, so the BSP's cacheable
+        // stores have to be pushed out to memory first; see below.
+        clean_dcache_to_poc(
+            ctx.as_ref() as *const _ as usize,
+            core::mem::size_of::<SecondaryContext>(),
+        );
 
         // Fire CPU_ON and move on: the AP only proceeds past its `STARTED` gate
         // once the BSP finishes init, so waiting for it to come online here would
