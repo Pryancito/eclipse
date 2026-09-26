@@ -1360,6 +1360,7 @@ dependencies = [
  "log",
  "numeric-enum-macro",
  "rcore-fs",
+ "rcore-fs-ramfs",
  "static_assertions",
  "zcore-drivers",
  "zircon-object",
