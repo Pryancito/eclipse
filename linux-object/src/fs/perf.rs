@@ -112,6 +112,11 @@ struct Ring {
     data_size: usize,
 }
 
+/// The monotonic clock, in nanoseconds, as every time field here reads it.
+fn now_ns() -> u64 {
+    kernel_hal::timer::timer_now().as_nanos() as u64
+}
+
 struct PerfInner {
     /// `type` field of `perf_event_attr` (PERF_TYPE_*).
     _type: u32,
@@ -125,6 +130,11 @@ struct PerfInner {
     period: u64,
     id: u64,
     enabled: bool,
+    /// Nanoseconds this event has been enabled, not counting the stretch it is
+    /// in now. `enabled_since` carries that one.
+    time_enabled: u64,
+    /// When the current enabled stretch began, or `None` while disabled.
+    enabled_since: Option<u64>,
     /// Free-running write counter (bytes ever written to the data region).
     data_head: u64,
     /// Accumulated event count, returned by `read(2)`.
@@ -132,6 +142,36 @@ struct PerfInner {
     /// Dropped samples because the ring was full (reported as LOST is TODO).
     lost: u64,
     ring: Option<Ring>,
+}
+
+impl PerfInner {
+    /// Nanoseconds this event has been enabled, the stretch it is in now
+    /// included.
+    fn time_ns(&self) -> u64 {
+        let running = self
+            .enabled_since
+            .map(|since| now_ns().saturating_sub(since))
+            .unwrap_or(0);
+        self.time_enabled.saturating_add(running)
+    }
+
+    /// Enable or disable, closing or opening the current stretch. Called twice
+    /// with the same answer it changes nothing, which is what an `ENABLE` on an
+    /// already-enabled event has to do: restarting the stretch would lose the
+    /// time already run.
+    fn set_enabled(&mut self, on: bool) {
+        if on == self.enabled {
+            return;
+        }
+        self.enabled = on;
+        if on {
+            self.enabled_since = Some(now_ns());
+        } else if let Some(since) = self.enabled_since.take() {
+            self.time_enabled = self
+                .time_enabled
+                .saturating_add(now_ns().saturating_sub(since));
+        }
+    }
 }
 
 /// A single `perf_event_open` file descriptor.
@@ -193,6 +233,8 @@ impl PerfEvent {
                 period,
                 id: alloc_id(),
                 enabled,
+                time_enabled: 0,
+                enabled_since: enabled.then(now_ns),
                 data_head: 0,
                 count: 0,
                 lost: 0,
@@ -207,6 +249,7 @@ impl PerfEvent {
     }
 
     /// Append a `PERF_RECORD_SAMPLE` for an interrupted user instruction.
+    ///
     fn record_sample(&self, pid: i32, tid: i32, cpu: u32, ip: u64, time_ns: u64) {
         let mut inner = self.inner.lock();
         if !inner.enabled {
@@ -412,20 +455,32 @@ impl FileLike for PerfEvent {
         let inner = self.inner.lock();
         let mut out: Vec<u8> = Vec::new();
         out.extend_from_slice(&inner.count.to_ne_bytes());
+        // Both of these used to be a hardcoded zero, and a zero
+        // `time_running` is not a missing extra: `perf_counts_values__scale`
+        // is `if (count->run == 0) { scaled = -1; count->val = 0; }`, and
+        // `perf stat` prints that as `<not counted>`. `evsel__config` asks for
+        // both fields on every event it opens, so every count this file
+        // computed was thrown away by the one tool that reads it. Nothing here
+        // multiplexes a counter off its PMU, so running == enabled, which is
+        // also what the sampling path has always written.
+        let time = inner.time_ns();
         if inner.read_format & PERF_FORMAT_TOTAL_TIME_ENABLED != 0 {
-            out.extend_from_slice(&0u64.to_ne_bytes());
+            out.extend_from_slice(&time.to_ne_bytes());
         }
         if inner.read_format & PERF_FORMAT_TOTAL_TIME_RUNNING != 0 {
-            out.extend_from_slice(&0u64.to_ne_bytes());
+            out.extend_from_slice(&time.to_ne_bytes());
         }
         if inner.read_format & PERF_FORMAT_ID != 0 {
             out.extend_from_slice(&inner.id.to_ne_bytes());
         }
-        // A short buffer is EINVAL, not a prefix: half of a `u64` count is
-        // not a smaller count, it is a wrong one, and the caller has no way
-        // to tell the difference from the return value.
+        // A short buffer is refused rather than filled with a prefix: half of
+        // a `u64` count is not a smaller count, it is a wrong one, and the
+        // caller has no way to tell the difference from the return value.
+        // `__perf_read` is `if (count < event->read_size) return -ENOSPC;`,
+        // and a caller that sizes its buffer from `read_format` and retries on
+        // `ENOSPC` was getting `EINVAL`.
         if buf.len() < out.len() {
-            return Err(LxError::EINVAL);
+            return Err(LxError::ENOSPC);
         }
         buf[..out.len()].copy_from_slice(&out);
         Ok(out.len())
@@ -466,22 +521,27 @@ impl FileLike for PerfEvent {
     fn ioctl(&self, request: usize, arg1: usize, _arg2: usize, _arg3: usize) -> LxResult<usize> {
         match request {
             PERF_EVENT_IOC_ENABLE => {
-                self.inner.lock().enabled = true;
+                self.inner.lock().set_enabled(true);
                 ANY_ENABLED.store(true, Ordering::Relaxed);
                 Ok(0)
             }
             PERF_EVENT_IOC_DISABLE => {
-                self.inner.lock().enabled = false;
+                self.inner.lock().set_enabled(false);
                 Ok(0)
             }
             PERF_EVENT_IOC_RESET => {
                 let mut inner = self.inner.lock();
                 inner.count = 0;
+                // `perf_event_reset` zeroes the times with the count: a `read`
+                // right after a reset must not scale by a window that has
+                // already gone by.
+                inner.time_enabled = 0;
+                inner.enabled_since = inner.enabled.then(now_ns);
                 Ok(0)
             }
             PERF_EVENT_IOC_REFRESH => {
                 // arg is a refresh count; treat as enable.
-                self.inner.lock().enabled = true;
+                self.inner.lock().set_enabled(true);
                 ANY_ENABLED.store(true, Ordering::Relaxed);
                 Ok(0)
             }
@@ -855,12 +915,25 @@ mod tests {
         let mut buf = [0u8; 24];
         assert_eq!(ev.read(&mut buf).await.unwrap(), 24);
         assert_eq!(u64_at(&buf, 0), 1, "count");
-        assert_eq!(u64_at(&buf, 8), 0, "time enabled");
+        // Not zero: a zero `time_running` is what `perf stat` prints as
+        // `<not counted>`, so both time fields used to throw the count away.
+        assert_ne!(u64_at(&buf, 8), 0, "time enabled");
         assert_eq!(u64_at(&buf, 16), id, "id");
 
-        // Half of a u64 is not a smaller count, it is a wrong one.
+        // A disabled event stops the clock, and enabling it again does not
+        // lose what it had already run.
+        let before = ev.inner.lock().time_ns();
+        ev.ioctl(PERF_EVENT_IOC_DISABLE, 0, 0, 0).unwrap();
+        let stopped = ev.inner.lock().time_ns();
+        assert!(stopped >= before, "the clock does not go backwards");
+        assert_eq!(stopped, ev.inner.lock().time_ns(), "and it is stopped");
+        ev.ioctl(PERF_EVENT_IOC_ENABLE, 0, 0, 0).unwrap();
+        assert!(ev.inner.lock().time_ns() >= stopped, "and it carries on");
+
+        // Half of a u64 is not a smaller count, it is a wrong one. ENOSPC, as
+        // `__perf_read` answers it.
         let mut short = [0u8; 16];
-        assert_eq!(ev.read(&mut short).await.unwrap_err(), LxError::EINVAL);
+        assert_eq!(ev.read(&mut short).await.unwrap_err(), LxError::ENOSPC);
         assert_eq!(short, [0u8; 16]);
     }
 
