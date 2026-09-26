@@ -397,7 +397,18 @@ mod fat_ptr_tests {
         // machine keep running. Latching here would stop the keyboard, the
         // serial port, the xHCI and every timer over one lost callback.
         let _gate = GateForTest::new();
-        let ceiling = a_genuine_vtable() + 0x1000;
+        // The ceiling sits a page above BOTH vtables this test dispatches
+        // through: the linker puts the closure's wherever it likes, and in a
+        // binary with enough other tests it landed more than a page past
+        // `()`'s, which read the real pointer below as a heap one.
+        let arc: Arc<dyn Fn()> = Arc::new(|| {});
+        // SAFETY: `Arc<dyn Fn()>` is exactly two words, `{ data, vtable }`,
+        // and `arc` is a live local, so the second word is in bounds.
+        let arc_vtable = unsafe {
+            let words = &arc as *const Arc<dyn Fn()> as *const usize;
+            core::ptr::read_volatile(words.add(1))
+        };
+        let ceiling = a_genuine_vtable().max(arc_vtable) + 0x1000;
         set_vtable_max(ceiling);
         assert!(!dyn_fat_ptr_live(&pointer(1, ceiling)), "at the ceiling");
         assert!(!dyn_fat_ptr_live(&pointer(1, ceiling + 0x800)), "above it");
@@ -406,7 +417,6 @@ mod fat_ptr_tests {
             "a contained use-after-free must not disable every handler"
         );
         // And a real pointer still goes through with the ceiling registered.
-        let arc: Arc<dyn Fn()> = Arc::new(|| {});
         assert!(dyn_fat_ptr_live(&arc));
     }
 
