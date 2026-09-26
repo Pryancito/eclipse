@@ -131,6 +131,35 @@ pub fn sem_register(array: &Arc<SemArray>) -> Result<SemId, LxError> {
     Ok(id)
 }
 
+/// `/proc/sysvipc/sem` (Documentation/filesystems/proc.rst): one line per
+/// set in the kernel's column layout (`sysvipc_sem_proc_show`, ipc/sem.c),
+/// consumed by `ipcs -s`. The key is printed as the signed `int` it is in
+/// `struct ipc_perm`, so a key past `i32::MAX` shows negative, as on Linux.
+pub fn sem_proc_table() -> alloc::string::String {
+    use core::fmt::Write as _;
+    let mut out = alloc::string::String::from(
+        "       key      semid perms      nsems   uid   gid  cuid  cgid      otime      ctime\n",
+    );
+    for (id, array) in SEMID2SEM.read().iter() {
+        let ds = *array.semid_ds.lock();
+        let _ = writeln!(
+            out,
+            "{:>10} {:>10} {:>5o} {:>10} {:>5} {:>5} {:>5} {:>5} {:>10} {:>10}",
+            ds.perm.key as i32,
+            id,
+            ds.perm.mode,
+            ds.nsems,
+            ds.perm.uid,
+            ds.perm.gid,
+            ds.perm.cuid,
+            ds.perm.cgid,
+            ds.otime,
+            ds.ctime,
+        );
+    }
+    out
+}
+
 /// The set an id names, from any process.
 pub fn sem_lookup(id: SemId) -> Option<Arc<SemArray>> {
     SEMID2SEM.read().get(&id).cloned()
@@ -755,6 +784,48 @@ mod sem_registry_tests {
         // still replays its SEM_UNDO records against it at exit.
         array.get_sem(0).unwrap().set(3);
         assert_eq!(array.get_sem(0).unwrap().get(), 3);
+        clear_ids();
+    }
+
+    /// `ipcs -s` reads `/proc/sysvipc/sem`, which did not exist: every set
+    /// in the system was invisible to it, and to `ipcrm`'s `-a`.
+    #[test]
+    fn the_proc_table_lists_every_registered_set_in_the_kernels_layout() {
+        let _guard = test_lock();
+        clear_ids();
+        assert_eq!(
+            sem_proc_table(),
+            "       key      semid perms      nsems   uid   gid  cuid  cgid      otime      ctime\n",
+            "an empty system is the header alone"
+        );
+        // A key past i32::MAX: `struct ipc_perm.key` is an `int`, so Linux
+        // prints it negative and `ipcs` reads it back with `%d`.
+        let a = SemArray::get_or_create(0xffff_fff0, 3, CREAT | 0o640, 1000, 100).unwrap();
+        let b = private_set();
+        let id_a = sem_register(&a).unwrap();
+        let id_b = sem_register(&b).unwrap();
+        let table = sem_proc_table();
+        let lines: std::vec::Vec<&str> = table.lines().collect();
+        assert_eq!(lines.len(), 3, "a header and one line per set:\n{table}");
+        use alloc::string::ToString as _;
+        let cols = |line: &str| -> std::vec::Vec<std::string::String> {
+            line.split_whitespace().map(|c| c.to_string()).collect()
+        };
+        let row_a = cols(lines[1]);
+        assert_eq!(row_a[0], "-16", "the key, as a signed int");
+        assert_eq!(row_a[1], id_a.to_string());
+        assert_eq!(row_a[2], "640", "the mode, in octal");
+        assert_eq!(row_a[3], "3", "nsems");
+        assert_eq!(&row_a[4..8], ["1000", "100", "1000", "100"]);
+        assert_eq!(row_a[8], "0", "never operated on");
+        assert_ne!(row_a[9], "0", "created now");
+        assert_eq!(row_a.len(), 10);
+        let row_b = cols(lines[2]);
+        assert_eq!(row_b[0], "0", "a private set has key 0");
+        assert_eq!(row_b[1], id_b.to_string());
+        // A retired id is gone from the table.
+        assert!(sem_unregister(id_a));
+        assert_eq!(sem_proc_table().lines().count(), 2);
         clear_ids();
     }
 

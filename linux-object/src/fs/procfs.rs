@@ -853,12 +853,14 @@ impl INode for ProcNetDirINode {
 }
 
 /// `/proc/sysvipc` — per-mechanism System V IPC tables
-/// (Documentation/filesystems/proc.rst); `msg` is what `ipcs -q` reads.
+/// (Documentation/filesystems/proc.rst): `msg`, `sem` and `shm` are what
+/// `ipcs -q`, `ipcs -s` and `ipcs -m` read. Only `msg` was here, so `ipcs`
+/// (and `ipcrm -a`) saw no semaphore set and no shared segment at all.
 struct ProcSysvipcDirINode;
 
 impl ProcSysvipcDirINode {
-    fn entries() -> [&'static str; 3] {
-        [".", "..", "msg"]
+    fn entries() -> [&'static str; 5] {
+        [".", "..", "msg", "sem", "shm"]
     }
 }
 
@@ -891,6 +893,8 @@ impl INode for ProcSysvipcDirINode {
             "." => Ok(PROC_SYSVIPC_DIR.clone()),
             ".." => Ok(PROC_ROOT.clone()),
             "msg" => Ok(PROC_SYSVIPC_MSG.clone()),
+            "sem" => Ok(PROC_SYSVIPC_SEM.clone()),
+            "shm" => Ok(PROC_SYSVIPC_SHM.clone()),
             _ => Err(FsError::EntryNotFound),
         }
     }
@@ -1412,6 +1416,16 @@ fn proc_sys_overcommit_content() -> String {
 /// `/proc/sysvipc/msg`: the live System V message-queue table.
 fn proc_sysvipc_msg_content() -> String {
     crate::ipc::msg_proc_table()
+}
+
+/// `/proc/sysvipc/sem`: the live System V semaphore-set table.
+fn proc_sysvipc_sem_content() -> String {
+    crate::ipc::sem_proc_table()
+}
+
+/// `/proc/sysvipc/shm`: the live System V shared-memory table.
+fn proc_sysvipc_shm_content() -> String {
+    crate::ipc::shm_proc_table()
 }
 
 /// Linux's default vm.max_map_count. Address-space-hungry runtimes (JVMs,
@@ -3300,6 +3314,14 @@ lazy_static! {
         inode: 22,
         generate: proc_sysvipc_msg_content,
     });
+    static ref PROC_SYSVIPC_SEM: Arc<dyn INode> = Arc::new(ProcSeqINode {
+        inode: 23,
+        generate: proc_sysvipc_sem_content,
+    });
+    static ref PROC_SYSVIPC_SHM: Arc<dyn INode> = Arc::new(ProcSeqINode {
+        inode: 24,
+        generate: proc_sysvipc_shm_content,
+    });
     static ref PROC_SYS_VM_DIR: Arc<dyn INode> = Arc::new(ProcSysVmDirINode);
     static ref PROC_SYS_OVERCOMMIT: Arc<dyn INode> = Arc::new(ProcSeqINode {
         inode: 63,
@@ -3401,6 +3423,75 @@ mod pid_status_tests {
             status.contains("PPid:\t0\nUid:\t1000\t1000\t1000\t1000\nGid:\t100\t100\t100\t100\nGroups:\t100 27 \nVmSize:"),
             "{:?}",
             status
+        );
+    }
+}
+
+/// `ipcs` walks `/proc/sysvipc/{msg,sem,shm}`; a table that is not there is
+/// a mechanism whose objects nobody can list or clean up.
+#[cfg(test)]
+mod sysvipc_dir_tests {
+    use super::*;
+
+    fn read_all(inode: &Arc<dyn INode>) -> String {
+        let mut buf = alloc::vec![0u8; 4096];
+        let n = inode.read_at(0, &mut buf).unwrap();
+        String::from_utf8(buf[..n].to_vec()).unwrap()
+    }
+
+    #[test]
+    fn the_directory_lists_and_resolves_all_three_tables() {
+        let dir = PROC_SYSVIPC_DIR.clone();
+        let mut names = alloc::vec::Vec::new();
+        let mut i = 0;
+        while let Ok(name) = dir.get_entry(i) {
+            names.push(name);
+            i += 1;
+        }
+        for table in ["msg", "sem", "shm"] {
+            assert!(names.iter().any(|n| n == table), "{} is listed", table);
+            let inode = dir
+                .find(table)
+                .unwrap_or_else(|_| panic!("{} resolves", table));
+            let text = read_all(&inode);
+            assert!(
+                text.starts_with("       key "),
+                "{} reads as a kernel table:\n{}",
+                table,
+                text
+            );
+        }
+        assert!(dir.find("nope").is_err());
+    }
+
+    #[test]
+    fn each_table_has_its_own_inode() {
+        let sem = PROC_SYSVIPC_DIR
+            .find("sem")
+            .unwrap()
+            .metadata()
+            .unwrap()
+            .inode;
+        let shm = PROC_SYSVIPC_DIR
+            .find("shm")
+            .unwrap()
+            .metadata()
+            .unwrap()
+            .inode;
+        let msg = PROC_SYSVIPC_DIR
+            .find("msg")
+            .unwrap()
+            .metadata()
+            .unwrap()
+            .inode;
+        assert!(sem != shm && shm != msg && sem != msg);
+        assert!(
+            read_all(&PROC_SYSVIPC_DIR.find("sem").unwrap()).contains("semid"),
+            "sem is the semaphore table"
+        );
+        assert!(
+            read_all(&PROC_SYSVIPC_DIR.find("shm").unwrap()).contains("shmid"),
+            "shm is the shared-memory table"
         );
     }
 }

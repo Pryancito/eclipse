@@ -65,6 +65,43 @@ pub fn shm_register(guard: &Arc<Mutex<ShmGuard>>) -> Result<ShmId, LxError> {
     Ok(id)
 }
 
+/// `/proc/sysvipc/shm`: one line per segment in the 64-bit kernel's column
+/// layout (`sysvipc_shm_proc_show`, ipc/shm.c), consumed by `ipcs -m`. `rss`
+/// is what the segment has committed; there is no swap.
+pub fn shm_proc_table() -> alloc::string::String {
+    use core::fmt::Write as _;
+    let mut out = alloc::string::String::from(
+        "       key      shmid perms                  size  cpid  lpid nattch   uid   gid  cuid  cgid      atime      dtime      ctime                   rss                  swap\n",
+    );
+    for (id, guard) in SHMID2SHM.read().iter() {
+        let guard = guard.lock();
+        let ds = *guard.shmid_ds.lock();
+        let vmo = &guard.shared_guard;
+        let rss = vmo.committed_pages_in_range(0, pages(vmo.len())) * PAGE_SIZE;
+        let _ = writeln!(
+            out,
+            "{:>10} {:>10} {:>5o} {:>21} {:>5} {:>5}  {:>5} {:>5} {:>5} {:>5} {:>5} {:>10} {:>10} {:>10} {:>21} {:>21}",
+            ds.perm.key as i32,
+            id,
+            ds.perm.mode,
+            ds.segsz,
+            ds.cpid,
+            ds.lpid,
+            ds.nattch,
+            ds.perm.uid,
+            ds.perm.gid,
+            ds.perm.cuid,
+            ds.perm.cgid,
+            ds.atime,
+            ds.dtime,
+            ds.ctime,
+            rss,
+            0,
+        );
+    }
+    out
+}
+
 /// The segment an id names, from any process.
 pub fn shm_lookup(id: ShmId) -> Option<Arc<Mutex<ShmGuard>>> {
     SHMID2SHM.read().get(&id).cloned()
@@ -377,6 +414,54 @@ mod shm_tests {
     /// so the number a client sent to the X server named a different segment
     /// there -- or nothing at all. It has to mean the same segment
     /// everywhere, because passing it to another program is what it is for.
+    /// `ipcs -m` reads `/proc/sysvipc/shm`, which did not exist.
+    #[test]
+    fn the_proc_table_lists_every_registered_segment_in_the_kernels_layout() {
+        let _guard = test_lock();
+        clear_ids();
+        let header = "       key      shmid perms                  size  cpid  lpid nattch   uid   gid  cuid  cgid      atime      dtime      ctime                   rss                  swap\n";
+        assert_eq!(
+            shm_proc_table(),
+            header,
+            "an empty system is the header alone"
+        );
+        let seg = owned_get(0xffff_fff0, 8192, CREAT | 0o640, OWNER).unwrap();
+        let id = shm_register(&seg).unwrap();
+        seg.lock().attach(77);
+        let table = shm_proc_table();
+        let lines: std::vec::Vec<&str> = table.lines().collect();
+        assert_eq!(
+            lines.len(),
+            2,
+            "a header and one line per segment:\n{table}"
+        );
+        use alloc::string::ToString as _;
+        let row: std::vec::Vec<&str> = lines[1].split_whitespace().collect();
+        assert_eq!(row[0], "-16", "the key, as a signed int");
+        assert_eq!(row[1], id.to_string());
+        assert_eq!(row[2], "640");
+        assert_eq!(row[3], "8192", "segsz");
+        assert_eq!(row[4], PID.to_string(), "cpid");
+        assert_eq!(row[5], "77", "lpid, the last to attach");
+        assert_eq!(row[6], "1", "nattch");
+        assert_eq!(
+            &row[7..11],
+            [
+                OWNER.to_string(),
+                OWNER.to_string(),
+                OWNER.to_string(),
+                OWNER.to_string()
+            ]
+        );
+        assert_ne!(row[11], "0", "atime: attached now");
+        assert_eq!(row[12], "0", "dtime: never detached");
+        assert_ne!(row[13], "0", "ctime");
+        assert_eq!(row.len(), 16, "rss and swap close the line");
+        assert!(shm_unregister(id));
+        assert_eq!(shm_proc_table(), header);
+        clear_ids();
+    }
+
     #[test]
     fn an_id_names_the_same_segment_from_anywhere() {
         let _guard = test_lock();
