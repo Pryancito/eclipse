@@ -502,7 +502,7 @@ impl Syscall<'_> {
         let mapped_brk = {
             let m = proc.mapped_brk();
             if m == 0 {
-                current_brk
+                roundup_pages(current_brk)
             } else {
                 m
             }
@@ -527,85 +527,93 @@ impl Syscall<'_> {
         // `/oscomp/brk` case does exactly that, because it prints and
         // round-trips the break through a 32-bit int and the heap base is a
         // round power of two whose low 32 bits are zero.
-        let Some(new_brk_aligned) = brk_target(new_brk, heap_base(&vmar)) else {
+        let Some(plan) = brk_plan(new_brk, current_brk, heap_base(&vmar)) else {
             info!(
                 "brk: {:#x} is not a break this address space can take, keeping {:#x}",
                 new_brk, current_brk
             );
             return Ok(current_brk);
         };
+        // The break the caller asked for is what is stored and returned
+        // (`mm->brk = brk; return brk;`); only the mapping is page-aligned.
+        // Storing the aligned one made `sbrk(100)` move the break by 4096.
+        let new_brk_aligned = plan.mapped_end;
 
-        if new_brk_aligned < current_brk {
-            // Shrink: just move the user-visible break. The reserved pages
-            // stay mapped until they are reused on the next grow. Linux glibc
-            // essentially never shrinks brk, and skipping the unmap avoids
-            // the VMAR churn + TLB shootdown for transient shrink/grow
-            // patterns.
-            proc.set_brk(new_brk_aligned);
-            info!("brk: shrunk to {:#x} (mapping kept)", new_brk_aligned);
-            Ok(new_brk_aligned)
-        } else if new_brk_aligned > current_brk {
-            // Inside the already-reserved heap region — bookkeeping only.
-            if new_brk_aligned <= mapped_brk {
-                proc.set_brk(new_brk_aligned);
-                info!(
-                    "brk: extended to {:#x} (within reserved mapping)",
-                    new_brk_aligned
-                );
-                return Ok(new_brk_aligned);
+        match plan.moved {
+            BrkMove::Shrink => {
+                // Shrink: just move the user-visible break. The reserved
+                // pages stay mapped until they are reused on the next grow.
+                // Linux glibc essentially never shrinks brk, and skipping the
+                // unmap avoids the VMAR churn + TLB shootdown for transient
+                // shrink/grow patterns.
+                proc.set_brk(plan.brk);
+                info!("brk: shrunk to {:#x} (mapping kept)", plan.brk);
+                return Ok(plan.brk);
             }
-            // Extend the mapping. Round the request up to BRK_CHUNK so a
-            // burst of small grows is satisfied by a single map_at.
-            let want = new_brk_aligned - mapped_brk;
-            let size = want
-                .checked_next_multiple_of(BRK_CHUNK)
-                .unwrap_or(want)
-                .max(BRK_CHUNK);
-            if size > MAX_MMAP_LEN {
-                return Ok(current_brk);
+            BrkMove::WithinPage => {
+                // Same last page as before: bookkeeping only.
+                proc.set_brk(plan.brk);
+                return Ok(plan.brk);
             }
-            let flags = MMUFlags::READ | MMUFlags::WRITE | MMUFlags::USER;
-            // Reserving ahead is only an optimization, so it must never cost a
-            // grow that would otherwise have fit. The rounded-up chunk can run
-            // into whatever the loader placed after the heap -- glibc's first
-            // brk on Firefox asked for a few KiB, got rounded to 1 MiB, and hit
-            // the next mapping -- so on failure fall back to the exact amount
-            // asked for. Linux reserves nothing ahead and never has this
-            // problem; this keeps the batching and its failure mode both.
-            let mut last_err = None;
-            for size in [size, roundup_pages(want)] {
-                let vmo = VmObject::new_paged(pages(size));
-                // `map_at` takes an offset into the VMAR, not an address:
-                // `addr()` is 0 for a bare-metal user address space but not for
-                // the window a libos process gets, where passing the absolute
-                // break made every growth INVALID_ARGS. Same conversion
-                // `sys_mmap` does for MAP_FIXED.
-                match vmar.map_at(mapped_brk - vmar.addr(), vmo, 0, size, flags) {
-                    Ok(_) => {
-                        let new_mapped_brk = mapped_brk + size;
-                        proc.set_brk(new_brk_aligned);
-                        proc.set_mapped_brk(new_mapped_brk);
-                        info!(
-                            "brk: extended to {:#x}, mapping reserved up to {:#x}",
-                            new_brk_aligned, new_mapped_brk
-                        );
-                        return Ok(new_brk_aligned);
-                    }
-                    Err(e) => last_err = Some((size, e)),
-                }
-            }
-            if let Some((size, e)) = last_err {
-                error!(
-                    "brk: failed to map {:#x} bytes at {:#x}: {:?}",
-                    size, mapped_brk, e
-                );
-            }
-            // Return current break on failure (Linux semantics).
-            Ok(current_brk)
-        } else {
-            // Already at requested break (after rounding).
-            Ok(current_brk)
+            BrkMove::Grow => {}
         }
+        // Inside the already-reserved heap region — bookkeeping only.
+        if new_brk_aligned <= mapped_brk {
+            proc.set_brk(plan.brk);
+            info!(
+                "brk: extended to {:#x} (within reserved mapping up to {:#x})",
+                plan.brk, new_brk_aligned
+            );
+            return Ok(plan.brk);
+        }
+        // Extend the mapping. Round the request up to BRK_CHUNK so a
+        // burst of small grows is satisfied by a single map_at.
+        let want = new_brk_aligned - mapped_brk;
+        let size = want
+            .checked_next_multiple_of(BRK_CHUNK)
+            .unwrap_or(want)
+            .max(BRK_CHUNK);
+        if size > MAX_MMAP_LEN {
+            return Ok(current_brk);
+        }
+        let flags = MMUFlags::READ | MMUFlags::WRITE | MMUFlags::USER;
+        // Reserving ahead is only an optimization, so it must never cost a
+        // grow that would otherwise have fit. The rounded-up chunk can run
+        // into whatever the loader placed after the heap -- glibc's first
+        // brk on Firefox asked for a few KiB, got rounded to 1 MiB, and hit
+        // the next mapping -- so on failure fall back to the exact amount
+        // asked for. Linux reserves nothing ahead and never has this
+        // problem; this keeps the batching and its failure mode both.
+        let mut last_err = None;
+        for size in [size, roundup_pages(want)] {
+            let vmo = VmObject::new_paged(pages(size));
+            // `map_at` takes an offset into the VMAR, not an address:
+            // `addr()` is 0 for a bare-metal user address space but not for
+            // the window a libos process gets, where passing the absolute
+            // break made every growth INVALID_ARGS. Same conversion
+            // `sys_mmap` does for MAP_FIXED.
+            match vmar.map_at(mapped_brk - vmar.addr(), vmo, 0, size, flags) {
+                Ok(_) => {
+                    let new_mapped_brk = mapped_brk + size;
+                    proc.set_brk(plan.brk);
+                    proc.set_mapped_brk(new_mapped_brk);
+                    info!(
+                        "brk: extended to {:#x}, mapping reserved up to {:#x}",
+                        plan.brk, new_mapped_brk
+                    );
+                    return Ok(plan.brk);
+                }
+                Err(e) => last_err = Some((size, e)),
+            }
+        }
+        if let Some((size, e)) = last_err {
+            error!(
+                "brk: failed to map {:#x} bytes at {:#x}: {:?}",
+                size, mapped_brk, e
+            );
+        }
+        // Return current break on failure (Linux semantics).
+        Ok(current_brk)
     }
 
     /// Set protection on a region of memory
@@ -1384,6 +1392,50 @@ fn brk_target(new_brk: usize, heap_base: usize) -> Option<usize> {
     Some(roundup_pages(new_brk))
 }
 
+/// Which way `brk(2)` moves the heap's mapping, page for page.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BrkMove {
+    /// The new break ends on an earlier page.
+    Shrink,
+    /// The new break ends on a later page.
+    Grow,
+    /// The new break ends on the same page as the old one: nothing to map
+    /// or unmap (`if (oldbrk == newbrk) { mm->brk = brk; goto success; }`).
+    WithinPage,
+}
+
+/// What `brk(2)` does with a break it can reach, as `__do_sys_brk` does it:
+/// the number STORED, and RETURNED, is the one the caller asked for
+/// (`mm->brk = brk; ... return brk;`); the page-aligned one only says where
+/// the mapping ends. This kernel used to store and return the aligned one,
+/// so glibc's `sbrk(100)`, which keeps the syscall's answer as `__curbrk`,
+/// moved the break by 4096, and `sbrk(0)` never agreed with `start + n`.
+#[derive(Debug, PartialEq, Eq)]
+struct BrkPlan {
+    /// The break to store and return: what was asked for.
+    brk: usize,
+    /// Where the heap mapping must end for it: the break rounded up to a
+    /// page.
+    mapped_end: usize,
+    /// How the mapping moves relative to the old break's page.
+    moved: BrkMove,
+}
+
+fn brk_plan(new_brk: usize, current_brk: usize, heap_base: usize) -> Option<BrkPlan> {
+    let mapped_end = brk_target(new_brk, heap_base)?;
+    let current_end = roundup_pages(current_brk);
+    let moved = match mapped_end.cmp(&current_end) {
+        core::cmp::Ordering::Less => BrkMove::Shrink,
+        core::cmp::Ordering::Greater => BrkMove::Grow,
+        core::cmp::Ordering::Equal => BrkMove::WithinPage,
+    };
+    Some(BrkPlan {
+        brk: new_brk,
+        mapped_end,
+        moved,
+    })
+}
+
 /// Every page of `[start, end)` must belong to a mapping, else `ENOMEM`.
 ///
 /// This is the address-range validation `msync(2)` and `mlock(2)`/`munlock(2)`
@@ -2002,6 +2054,51 @@ mod mm_range_tests {
         assert_eq!(brk_target(heap, heap), Some(heap));
         assert_eq!(brk_target(heap + 1, heap), Some(heap + PAGE));
         assert_eq!(brk_target(USER_ASPACE_END, heap), Some(USER_ASPACE_END));
+    }
+}
+
+#[cfg(test)]
+mod brk_plan_tests {
+    //! The number `brk(2)` stores and returns, against the page it maps.
+
+    use super::*;
+
+    const HEAP: usize = 0x40_0000;
+
+    /// `sbrk(100)`: the break moves by 100, the mapping by a page.
+    #[test]
+    fn the_break_stored_is_the_one_asked_for_not_the_page() {
+        let plan = brk_plan(HEAP + 100, HEAP, HEAP).unwrap();
+        assert_eq!(plan.brk, HEAP + 100);
+        assert_eq!(plan.mapped_end, HEAP + PAGE_SIZE);
+        assert_eq!(plan.moved, BrkMove::Grow);
+    }
+
+    /// A move that stays on the last page, up or down, maps nothing and
+    /// still moves the break.
+    #[test]
+    fn a_move_within_the_last_page_is_bookkeeping_only() {
+        let plan = brk_plan(HEAP + 200, HEAP + 100, HEAP).unwrap();
+        assert_eq!((plan.brk, plan.moved), (HEAP + 200, BrkMove::WithinPage));
+        let plan = brk_plan(HEAP + 50, HEAP + 100, HEAP).unwrap();
+        assert_eq!((plan.brk, plan.moved), (HEAP + 50, BrkMove::WithinPage));
+        assert_eq!(plan.mapped_end, HEAP + PAGE_SIZE);
+        // Exactly on the page boundary, from an unaligned break on it.
+        let plan = brk_plan(HEAP + PAGE_SIZE, HEAP + 100, HEAP).unwrap();
+        assert_eq!(plan.moved, BrkMove::WithinPage);
+    }
+
+    /// Across pages, the mapping shrinks or grows, and the break is still
+    /// the number asked for.
+    #[test]
+    fn across_a_page_the_mapping_moves_with_it() {
+        let plan = brk_plan(HEAP + 100, HEAP + 2 * PAGE_SIZE, HEAP).unwrap();
+        assert_eq!((plan.brk, plan.moved), (HEAP + 100, BrkMove::Shrink));
+        assert_eq!(plan.mapped_end, HEAP + PAGE_SIZE);
+        let plan = brk_plan(HEAP + PAGE_SIZE + 1, HEAP + 100, HEAP).unwrap();
+        assert_eq!(plan.moved, BrkMove::Grow);
+        assert_eq!(plan.mapped_end, HEAP + 2 * PAGE_SIZE);
+        assert_eq!(brk_plan(HEAP - 1, HEAP, HEAP), None);
     }
 }
 
