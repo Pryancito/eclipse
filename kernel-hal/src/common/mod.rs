@@ -29,5 +29,6 @@ pub mod phys_watch;
 pub mod rand;
 pub mod rtc;
 pub mod timer_waker;
+pub mod tsc_cal;
 pub mod user;
 pub mod watchpoint;
