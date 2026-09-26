@@ -179,6 +179,21 @@ pub(crate) fn set_counters_for_test(refused: u32, unjudged: u32) {
     UNJUDGED.store(unjudged, Ordering::Relaxed);
 }
 
+/// The one lock every test that publishes a `.text` window takes.
+///
+/// It lives here rather than inside this module's own `mod tests` because the
+/// window is process-wide and two modules now publish one: a published window
+/// refuses every host function pointer, so a test that publishes one while
+/// another is asserting that its hook ran makes that other test fail, and a
+/// test that clears one underneath a refusal assertion makes *it* fail. The
+/// same reason `deadlock::hook_test_lock` exists, and the same blind spot: CI
+/// runs `--test-threads=1` and would never see either.
+#[cfg(test)]
+pub(crate) fn window_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -189,10 +204,10 @@ mod tests {
     const TEXT_HI_ADDR: usize = 0xffff_ff00_0020_0000;
 
     /// The globals are shared by the whole test binary, so the few tests that
-    /// touch them take this.
+    /// touch them take this -- and it is the crate's one window lock, not a
+    /// second one: `deadlock`'s tests publish a window too.
     fn global_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+        super::window_test_lock()
     }
 
     /// Holds that lock and leaves the globals as this boot found them.

@@ -160,3 +160,284 @@ pub(crate) fn hook_test_lock() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
+
+/// The hook registry every spinner in the kernel depends on, which had no
+/// tests of its own.
+///
+/// Four slots and one threshold, and all of it runs on the spin path with
+/// interrupts off: the deadlock banner (the only thing that turns a silent
+/// freeze into a named call site), the holder report (the only thing that names
+/// the culprit rather than the innocent waiters), and the spin pump (the only
+/// thing that keeps an IRQs-off spinner from being a TLB-shootdown ack black
+/// hole). Every one of them is a word that is `transmute`d and **called**, and
+/// the rule that word must pass — judged against the `.text` window before the
+/// jump — was exercised only where `fn_slot` tests the predicate, never where
+/// these four slots use it.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Everything here is process-wide: the four slots, the threshold, and the
+    /// `.text` window that decides whether a slot may be called. Two locks,
+    /// because two different sets of tests share each of them.
+    struct Hooks(
+        #[allow(dead_code)] std::sync::MutexGuard<'static, ()>,
+        #[allow(dead_code)] std::sync::MutexGuard<'static, ()>,
+    );
+
+    fn hooks() -> Hooks {
+        let held = hook_test_lock();
+        let window = crate::fn_slot::window_test_lock();
+        clear();
+        Hooks(held, window)
+    }
+
+    impl Drop for Hooks {
+        fn drop(&mut self) {
+            clear();
+        }
+    }
+
+    /// The resting state of the suite: no hook, no window, no threshold
+    /// override. It has to be restored, and not only out of tidiness -- a
+    /// window left published refuses every *host* function pointer, so the
+    /// hooks the rest of this crate's tests install would silently stop being
+    /// called and those tests would fail somewhere else entirely.
+    fn clear() {
+        DEADLOCK_HOOK.store(0, Ordering::SeqCst);
+        DEADLOCK_HOLDER_HOOK.store(0, Ordering::SeqCst);
+        SPIN_PUMP.store(0, Ordering::SeqCst);
+        set_deadlock_spins(0);
+        crate::fn_slot::clear_text_range_for_test();
+        crate::fn_slot::set_counters_for_test(0, 0);
+    }
+
+    static BANNERS: AtomicUsize = AtomicUsize::new(0);
+    static OTHER_BANNERS: AtomicUsize = AtomicUsize::new(0);
+    static PUMPS: AtomicUsize = AtomicUsize::new(0);
+    static HOLDERS: AtomicUsize = AtomicUsize::new(0);
+    static LAST_FILE: AtomicUsize = AtomicUsize::new(0);
+    static LAST_LINE: AtomicU64 = AtomicU64::new(0);
+    static LAST_HOLDER: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+    fn record_banner(file: &'static str, line: u32) {
+        LAST_FILE.store(file.as_ptr() as usize, Ordering::SeqCst);
+        LAST_LINE.store(line as u64, Ordering::SeqCst);
+        BANNERS.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn record_other_banner(_file: &'static str, _line: u32) {
+        OTHER_BANNERS.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn record_pump() {
+        PUMPS.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn record_holder(file_ptr: usize, file_len: usize, line: u32, cpu: u32) {
+        LAST_HOLDER[0].store(file_ptr as u64, Ordering::SeqCst);
+        LAST_HOLDER[1].store(file_len as u64, Ordering::SeqCst);
+        LAST_HOLDER[2].store(line as u64, Ordering::SeqCst);
+        LAST_HOLDER[3].store(cpu as u64, Ordering::SeqCst);
+        HOLDERS.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn zero_counters() {
+        BANNERS.store(0, Ordering::SeqCst);
+        OTHER_BANNERS.store(0, Ordering::SeqCst);
+        PUMPS.store(0, Ordering::SeqCst);
+        HOLDERS.store(0, Ordering::SeqCst);
+    }
+
+    /// A `.text` window that contains no host code: the kernel's own image
+    /// range, which every function in this test binary is outside of. Publishing
+    /// it is how a test says "this slot is now residue, not code".
+    const KERNEL_TEXT_LO: usize = 0xffff_ff00_0000_0000;
+    const KERNEL_TEXT_HI: usize = 0xffff_ff00_0020_0000;
+
+    fn publish_a_window_that_excludes_host_code() {
+        assert!(
+            crate::fn_slot::set_text_range(KERNEL_TEXT_LO, KERNEL_TEXT_HI),
+            "the window has to be taken, or the test proves nothing"
+        );
+    }
+
+    fn refusals() -> u32 {
+        crate::fn_slot::slot_stats().0
+    }
+
+    // ── the threshold ───────────────────────────────────────────────────────
+
+    #[test]
+    fn the_threshold_is_the_one_the_boot_line_asked_for() {
+        // `DEADLOCKSPINS=<n>` exists because the default is calibrated for real
+        // hardware and is unreachable under TCG, where it turns every deadlock
+        // into "no banner appeared, so it is not a deadlock".
+        let _h = hooks();
+        set_deadlock_spins(4096);
+        assert_eq!(deadlock_spins(), 4096);
+    }
+
+    #[test]
+    fn asking_for_zero_restores_the_eight_second_default() {
+        // Zero is how the cmdline says "no override", so it must not mean "fire
+        // the banner on the first spin" -- which would paint the framebuffer
+        // over a machine under ordinary contention.
+        let _h = hooks();
+        set_deadlock_spins(1);
+        set_deadlock_spins(0);
+        assert_eq!(deadlock_spins(), 1_000_000_000);
+    }
+
+    // ── the banner ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn the_banner_is_called_with_the_stuck_call_site() {
+        let _h = hooks();
+        zero_counters();
+        set_deadlock_hook(record_banner);
+        let file = "src/vm/vmar.rs";
+        report_deadlock(file, 1234);
+        assert!(BANNERS.load(Ordering::SeqCst) >= 1);
+        assert_eq!(LAST_FILE.load(Ordering::SeqCst), file.as_ptr() as usize);
+        assert_eq!(LAST_LINE.load(Ordering::SeqCst), 1234);
+    }
+
+    #[test]
+    fn the_public_stuck_report_is_the_same_banner() {
+        // Other crates' spinners (the scheduler's runtime locks, the RM glue,
+        // the IPI ring) report through `report_stuck`. If it stopped reaching
+        // the hook, every spinner outside this crate would freeze silently
+        // again and nothing in this crate would notice.
+        let _h = hooks();
+        zero_counters();
+        set_deadlock_hook(record_banner);
+        report_stuck("src/ipi.rs", 77);
+        assert!(BANNERS.load(Ordering::SeqCst) >= 1);
+        assert_eq!(LAST_LINE.load(Ordering::SeqCst), 77);
+    }
+
+    #[test]
+    fn the_hook_installed_last_is_the_one_that_is_called() {
+        // The kernel installs the framebuffer banner once the console is up,
+        // over whatever early stand-in was there.
+        let _h = hooks();
+        zero_counters();
+        set_deadlock_hook(record_other_banner);
+        set_deadlock_hook(record_banner);
+        report_deadlock("src/late.rs", 9);
+        assert!(BANNERS.load(Ordering::SeqCst) >= 1);
+        assert_eq!(OTHER_BANNERS.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn a_banner_slot_that_is_not_text_is_not_jumped_into() {
+        // The soft smash leaves plausible residue in exactly this kind of slot.
+        // A banner that jumps into it replaces a diagnosable deadlock with an
+        // undiagnosable triple fault -- on the machine that was mid-freeze.
+        let _h = hooks();
+        zero_counters();
+        set_deadlock_hook(record_banner);
+        publish_a_window_that_excludes_host_code();
+        let before = refusals();
+        report_deadlock("src/vmar.rs", 5);
+        assert_eq!(BANNERS.load(Ordering::SeqCst), 0);
+        assert!(refusals() > before, "and the refusal is counted");
+    }
+
+    // ── the spin pump ───────────────────────────────────────────────────────
+
+    #[test]
+    fn the_public_pump_is_the_hook_the_ticket_lock_pumps() {
+        // Every IRQs-off spinner outside this crate pumps through here. A CPU
+        // spinning with interrupts off cannot take the shootdown IPI, so one
+        // that does not pump is an ack black hole and the peer waiting for it
+        // wedges -- which is the convoy that measured 4 CPUs 80x slower than 1.
+        let _h = hooks();
+        zero_counters();
+        set_spin_pump(record_pump);
+        pump();
+        assert!(PUMPS.load(Ordering::SeqCst) >= 1);
+    }
+
+    #[test]
+    fn a_pump_slot_that_is_not_text_is_not_jumped_into() {
+        let _h = hooks();
+        zero_counters();
+        set_spin_pump(record_pump);
+        publish_a_window_that_excludes_host_code();
+        let before = refusals();
+        pump();
+        assert_eq!(PUMPS.load(Ordering::SeqCst), 0);
+        assert!(refusals() > before);
+    }
+
+    // ── the holder report ───────────────────────────────────────────────────
+
+    #[test]
+    fn the_holder_report_carries_the_four_numbers_that_name_the_culprit() {
+        // The spinners a banner lists are usually innocent; this is the line
+        // that names the holder. The file travels as raw parts because it is
+        // snapshotted out of the lock's atomics, so nothing but the order of
+        // the arguments keeps the length from being printed as a line number.
+        let _h = hooks();
+        zero_counters();
+        set_deadlock_holder_hook(record_holder);
+        let file = "src/fs/fatfs.rs";
+        report_deadlock_holder(file.as_ptr() as usize, file.len(), 4242, 3);
+        assert!(HOLDERS.load(Ordering::SeqCst) >= 1);
+        assert_eq!(LAST_HOLDER[0].load(Ordering::SeqCst), file.as_ptr() as u64);
+        assert_eq!(LAST_HOLDER[1].load(Ordering::SeqCst), file.len() as u64);
+        assert_eq!(LAST_HOLDER[2].load(Ordering::SeqCst), 4242);
+        assert_eq!(LAST_HOLDER[3].load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn a_holder_slot_that_is_not_text_is_not_jumped_into() {
+        let _h = hooks();
+        zero_counters();
+        set_deadlock_holder_hook(record_holder);
+        publish_a_window_that_excludes_host_code();
+        let before = refusals();
+        report_deadlock_holder(0x1000, 4, 1, 0);
+        assert_eq!(HOLDERS.load(Ordering::SeqCst), 0);
+        assert!(refusals() > before);
+    }
+
+    // ── the resting state ───────────────────────────────────────────────────
+
+    #[test]
+    fn a_slot_nobody_installed_calls_nothing_and_is_not_a_refusal() {
+        // Which is the state of all four on every boot until their owners
+        // install them, so counting it as a refusal would make the boot report
+        // claim the guard had rejected something.
+        let _h = hooks();
+        zero_counters();
+        let before = refusals();
+        report_deadlock("src/early.rs", 1);
+        report_stuck("src/early.rs", 2);
+        pump();
+        report_deadlock_holder(0, 0, 0, 0);
+        assert_eq!(BANNERS.load(Ordering::SeqCst), 0);
+        assert_eq!(PUMPS.load(Ordering::SeqCst), 0);
+        assert_eq!(HOLDERS.load(Ordering::SeqCst), 0);
+        assert_eq!(refusals(), before, "an empty slot is not a rejected one");
+    }
+
+    #[test]
+    fn the_three_slots_are_three_slots() {
+        // One `AtomicUsize` per hook, and the banner, the holder report and the
+        // pump have different signatures: a slot shared between two of them is
+        // a call through the wrong prototype.
+        let _h = hooks();
+        zero_counters();
+        set_spin_pump(record_pump);
+        report_deadlock("src/a.rs", 1);
+        report_deadlock_holder(0x2000, 2, 3, 4);
+        assert_eq!(BANNERS.load(Ordering::SeqCst), 0);
+        assert_eq!(HOLDERS.load(Ordering::SeqCst), 0);
+        assert_eq!(PUMPS.load(Ordering::SeqCst), 0, "and nothing called it yet");
+        pump();
+        assert!(PUMPS.load(Ordering::SeqCst) >= 1);
+    }
+}
