@@ -96,62 +96,39 @@ unsafe fn calibrate_tsc_hz_via_pit() -> Option<u64> {
 /// SAFETY: dereferences firmware tables through the physical map; the RSDP
 /// address must be the one firmware handed to the bootloader.
 unsafe fn pm_timer_port_from_fadt(rsdp_pa: usize) -> Option<(u16, bool)> {
-    let p2v = crate::mem::phys_to_virt;
-    let rd8 = |va: usize| core::ptr::read_unaligned(va as *const u8);
-    let rd32 = |va: usize| core::ptr::read_unaligned(va as *const u32);
-    let rd64 = |va: usize| core::ptr::read_unaligned(va as *const u64);
-    let rsdp = p2v(rsdp_pa);
-    if core::slice::from_raw_parts(rsdp as *const u8, 8) != b"RSD PTR " {
-        return None;
-    }
-    // Revision 2+ carries an XSDT (64-bit entries); revision 0 only an RSDT.
-    let (sdt_pa, wide) = if rd8(rsdp + 15) >= 2 && rd64(rsdp + 24) != 0 {
-        (rd64(rsdp + 24) as usize, true)
-    } else {
-        (rd32(rsdp + 16) as usize, false)
+    use crate::common::acpi_tables as acpi;
+
+    // The only thing in here that touches memory. Everything below is
+    // `common::acpi_tables` deciding what the bytes mean, which is where the
+    // tests are: this used to be a hand-rolled walk of `read_unaligned` at
+    // literal offsets that took the `RSD PTR ` signature on faith and never
+    // looked at a checksum or at the `RSDT`/`XSDT` signature -- and what
+    // follows an accepted RSDP is a list of physical addresses this function
+    // then dereferences, at boot, with no fault handler worth the name.
+    let at = |pa: u64, len: usize| -> &'static [u8] {
+        core::slice::from_raw_parts(crate::mem::phys_to_virt(pa as usize) as *const u8, len)
     };
-    if sdt_pa == 0 {
+    // 36 bytes: an ACPI 2.0 RSDP in full. `rsdp_sdt` checks the signature and
+    // both checksums before any of it is believed.
+    let sdt_ptr = acpi::rsdp_sdt(at(rsdp_pa as u64, 36))?;
+    let len = acpi::table_length(at(sdt_ptr.phys, acpi::SDT_HEADER_LEN))?;
+    let sdt = at(sdt_ptr.phys, len);
+    if !acpi::table_is(sdt, if sdt_ptr.wide { b"XSDT" } else { b"RSDT" }) {
+        crate::klog_warn!("[acpi] the RSDP names something that is not an RSDT/XSDT");
         return None;
     }
-    let sdt = p2v(sdt_pa);
-    let len = rd32(sdt + 4) as usize;
-    if !(36..=0x10000).contains(&len) {
-        return None;
-    }
-    let entry_size = if wide { 8 } else { 4 };
-    let mut off = 36;
-    while off + entry_size <= len {
-        let table_pa = if wide {
-            rd64(sdt + off) as usize
-        } else {
-            rd32(sdt + off) as usize
-        };
-        off += entry_size;
-        if table_pa == 0 {
+    for pa in acpi::sdt_entries(sdt, sdt_ptr.wide) {
+        let header = at(pa, acpi::SDT_HEADER_LEN);
+        if &header[..4] != b"FACP" {
             continue;
         }
-        let t = p2v(table_pa);
-        if core::slice::from_raw_parts(t as *const u8, 4) != b"FACP" {
-            continue;
+        let len = acpi::table_length(header)?;
+        let fadt = at(pa, len);
+        if !acpi::table_is(fadt, b"FACP") {
+            crate::klog_warn!("[acpi] the FADT does not check out; not calibrating against it");
+            return None;
         }
-        let fadt_len = rd32(t + 4) as usize;
-        // ACPI 2.0+: X_PM_TMR_BLK (GAS at 208) wins when it names an I/O port.
-        if fadt_len >= 220 && rd8(t + 208) == 1 && rd64(t + 212) != 0 {
-            let port = rd64(t + 212);
-            if port <= u16::MAX as u64 {
-                let ext = rd32(t + 112) & (1 << 8) != 0;
-                return Some((port as u16, ext));
-            }
-        }
-        // Legacy PM_TMR_BLK (u32 at 76), PM_TMR_LEN (u8 at 91) must be 4.
-        if fadt_len >= 116 && rd8(t + 91) == 4 && rd32(t + 76) != 0 {
-            let port = rd32(t + 76);
-            if port <= u16::MAX as u32 {
-                let ext = rd32(t + 112) & (1 << 8) != 0;
-                return Some((port as u16, ext));
-            }
-        }
-        return None;
+        return acpi::pm_timer_from_fadt(fadt);
     }
     None
 }

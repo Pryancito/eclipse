@@ -5,6 +5,7 @@ pub(super) mod thread;
 pub(super) mod vdso;
 pub(super) mod vm;
 
+pub mod acpi_tables;
 pub mod addr;
 #[cfg(feature = "graphic")]
 pub mod boot_logo;
