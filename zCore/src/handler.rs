@@ -1,5 +1,4 @@
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-
+use kernel_hal::fault_diag::{DiagTurn, FaultDiagLatch};
 use kernel_hal::{KernelHandler, MMUFlags};
 use zircon_object::object::KernelObject;
 use zircon_object::task::Thread;
@@ -26,79 +25,43 @@ fn report_bogus_cpu_id_events() {
     ));
 }
 
-/// Set while we are already diagnosing a kernel #PF (null-range OR an address
-/// the user vmar can't resolve). A second fault during `format_args!` / a
-/// console write / `panic!` (heap/vtable already smashed, or the graphic
-/// framebuffer torn down mid-redraw) must NOT recurse into another formatted
-/// dump — that was the infinite `[KERNEL PAGE FAULT]` cascade after the first
-/// null fn-ptr, especially under DRM redraw storms (QEMU resize). Both the
-/// null-range path and `report_unresolved_kernel_fault` acquire this latch, so
-/// a re-fault in EITHER diagnosis (including one that started in the other)
-/// halts with a single literal serial line instead of scrolling forever.
-static FAULT_DIAG_ACTIVE: AtomicBool = AtomicBool::new(false);
+/// Set while this machine is already diagnosing a kernel #PF (null-range OR an
+/// address the user vmar cannot resolve). A second fault during
+/// `format_args!` / a console write / `panic!` (heap or vtable already
+/// smashed, or the graphic framebuffer torn down mid-redraw) must NOT recurse
+/// into another formatted dump -- that was the infinite `[KERNEL PAGE FAULT]`
+/// cascade after the first null fn-ptr, especially under DRM redraw storms
+/// (QEMU resize). Both the null-range path and `report_unresolved_kernel_fault`
+/// go through it, so a re-fault in EITHER diagnosis halts with a single
+/// literal serial line instead of scrolling for ever.
+///
+/// Telling a re-entry from a peer, and why the two need opposite answers, is
+/// `kernel_hal::fault_diag`.
+static FAULT_DIAG: FaultDiagLatch = FaultDiagLatch::new();
 
-/// Which CPU owns [`FAULT_DIAG_ACTIVE`] (`!0` = nobody).
-///
-/// The latch alone cannot tell a genuine re-entry from a second CPU faulting
-/// at the same time, and the two need opposite answers: a re-entry must halt,
-/// a peer must not. Treating a peer as a re-entry cost the whole machine. The
-/// QEMU monitor caught it mid-freeze, with two CPUs parked in the "re-entrant"
-/// spin below, one halted, and the other three stuck on ordinary locks those
-/// two were holding:
-///
-///     CPU#0 RIP=...197f2  handler.rs:114   (this spin)
-///     CPU#4 RIP=...197f2  handler.rs:114   (this spin)
-///     CPU#1 RIP=...fe125  TicketMutex<[ItimerSlot; 3]>::lock
-///     CPU#2 RIP=...327f1  TicketMutex<ExceptionateInner>::lock
-///     CPU#5 RIP=...36155  TicketMutex<ThreadInner>::lock
-///
-/// and not one word on the serial console, because the literal below is
-/// written with the try_lock writer and the CPU that got there second found
-/// the console busy and dropped it.
-static FAULT_DIAG_CPU: AtomicUsize = AtomicUsize::new(usize::MAX);
+/// How long this CPU waits for a peer's diagnosis before reporting anyway.
+const PEER_DIAG_BUDGET: core::time::Duration = core::time::Duration::from_secs(2);
 
-/// Take the diagnosis latch. `Ok(())` means this CPU may report; `Err(())`
-/// means it must not (see [`FAULT_DIAG_CPU`]); the bool says whether the
-/// blocker is this same CPU re-entering, which is the only case that has to
-/// halt rather than wait its turn.
-fn take_fault_diag_latch() -> Result<(), bool> {
-    let me = kernel_hal::cpu::cpu_id() as usize;
-    if !FAULT_DIAG_ACTIVE.swap(true, Ordering::SeqCst) {
-        FAULT_DIAG_CPU.store(me, Ordering::SeqCst);
-        return Ok(());
-    }
-    Err(FAULT_DIAG_CPU.load(Ordering::SeqCst) == me)
+/// Take the diagnosis latch on behalf of this CPU.
+fn take_fault_diag_latch() -> DiagTurn {
+    FAULT_DIAG.take(kernel_hal::cpu::cpu_id() as usize)
 }
 
 /// Release the latch taken by [`take_fault_diag_latch`].
 fn release_fault_diag_latch() {
-    FAULT_DIAG_CPU.store(usize::MAX, Ordering::SeqCst);
-    FAULT_DIAG_ACTIVE.store(false, Ordering::SeqCst);
+    FAULT_DIAG.release();
 }
 
 /// Wait for a peer CPU's diagnosis to finish, then report anyway.
-///
-/// A peer fault is not a re-entry: this CPU's own state is intact and its
-/// report is worth as much as the first one. Bounded so a peer that halts
-/// mid-diagnosis cannot park this CPU forever -- after the wait it goes ahead
-/// regardless, since by then the alternative is the silent freeze above.
 fn wait_for_peer_fault_diag() {
-    let deadline = kernel_hal::timer::timer_now() + core::time::Duration::from_secs(2);
-    while FAULT_DIAG_ACTIVE.load(Ordering::SeqCst) {
-        if kernel_hal::timer::timer_now() >= deadline {
-            break;
-        }
-        // Two seconds is a very long time to be deaf to a TLB-shootdown IPI,
-        // and this runs from a fault with interrupts off. A peer that
-        // spin-waits for this CPU's acknowledgement has a budget, and when it
-        // runs out on riscv64 or aarch64 there is no NMI rescue behind it: a
-        // fault that `try_contain` was about to survive takes the machine with
-        // it anyway, from a CPU that had nothing to do with it. Draining our
-        // own queue here is lock-free, allocation-free queue work -- see
-        // `lock::pump`.
-        lock::pump();
-        core::hint::spin_loop();
-    }
+    FAULT_DIAG.wait_for_peer(
+        PEER_DIAG_BUDGET,
+        kernel_hal::timer::timer_now,
+        // Lock-free, allocation-free queue work: this runs from a fault with
+        // interrupts off, and two seconds is a very long time to be deaf to a
+        // TLB-shootdown IPI.
+        lock::pump,
+    );
 }
 
 /// Write a literal to the serial console, waiting for the lock rather than
@@ -200,8 +163,8 @@ impl KernelHandler for ZcoreKernelHandler {
             // heap enough that `format_args!`/`Write` vtables are NULL. A second
             // entry must halt with a literal string only — no fmt, no panic!.
             match take_fault_diag_latch() {
-                Ok(()) => {}
-                Err(true) => {
+                DiagTurn::Mine => {}
+                DiagTurn::ReEntry => {
                     // Genuine re-entry on this CPU: the first diagnosis itself
                     // faulted, so formatting anything more would cascade.
                     serial_literal_spin(
@@ -211,7 +174,7 @@ impl KernelHandler for ZcoreKernelHandler {
                         core::hint::spin_loop();
                     }
                 }
-                Err(false) => {
+                DiagTurn::PeerBusy => {
                     // A PEER is diagnosing. Wait for it and report too.
                     wait_for_peer_fault_diag();
                     let _ = take_fault_diag_latch();
@@ -477,7 +440,7 @@ impl KernelHandler for ZcoreKernelHandler {
 /// resolve, then contain it (retire just the faulting coroutine) or halt
 /// cleanly. Never returns.
 ///
-/// SERIAL ONLY, and behind the `FAULT_DIAG_ACTIVE` re-entrancy latch — this is
+/// SERIAL ONLY, and behind the `FAULT_DIAG` re-entrancy latch — this is
 /// the fix for the infinite `[KERNEL PAGE FAULT]` cascade. The previous version
 /// logged through `console_write_fmt`, i.e. the *graphic* console trait object.
 /// When the faulting address was itself a torn framebuffer mapping — routine
@@ -499,8 +462,8 @@ fn report_unresolved_kernel_fault(
     // console write itself — now removed — but also any re-fault in the walk):
     // one literal line, then halt. Never recurse into another formatted dump.
     match take_fault_diag_latch() {
-        Ok(()) => {}
-        Err(true) => {
+        DiagTurn::Mine => {}
+        DiagTurn::ReEntry => {
             serial_literal_spin(
                 "\n[KERNEL PAGE FAULT] re-entrant fault while diagnosing — halting\n",
             );
@@ -508,7 +471,7 @@ fn report_unresolved_kernel_fault(
                 core::hint::spin_loop();
             }
         }
-        Err(false) => {
+        DiagTurn::PeerBusy => {
             wait_for_peer_fault_diag();
             let _ = take_fault_diag_latch();
         }
