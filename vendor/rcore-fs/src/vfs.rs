@@ -126,9 +126,6 @@ pub trait INode: Any + Sync + Send {
     fn as_any_ref(&self) -> &dyn Any;
 }
 
-/// Longest symlink target the path walk will follow, Linux's `PATH_MAX`.
-pub const MAX_SYMLINK_LEN: usize = 4096;
-
 impl dyn INode {
     /// Downcast the INode to specific struct
     pub fn downcast_ref<T: INode>(&self) -> Option<&T> {
@@ -214,28 +211,22 @@ fn lookup_with_budget(
                 name = String::from(&rest_path[0..pos]);
                 rest_path = String::from(&rest_path[pos + 1..]);
             }
-            let inode = result.find(&name)?;
-            // Handle symlink
-            if inode.metadata()?.type_ == FileType::SymLink && follow_times > 0 {
-                let mut content = alloc::vec![0u8; MAX_SYMLINK_LEN + 1];
-                let len = inode.read_at(0, &mut content)?;
-                // A target that fills the buffer is a target we have not seen
-                // the end of, and half a path names a different file -- or an
-                // existing one. The old buffer was 256 bytes on the stack and
-                // truncated in silence.
-                if len > MAX_SYMLINK_LEN {
-                    return Err(FsError::InvalidParam);
-                }
-                let link_path =
-                    String::from(str::from_utf8(&content[..len]).map_err(|_| FsError::NotDir)?);
-                // result remains unchanged
-                let new_path = link_path + "/" + &rest_path;
-                return result.lookup_follow(&new_path, follow_times - 1);
-            } else {
-                result = inode
+        };
+        if name.is_empty() {
+            continue;
+        }
+        let inode = result.find(&name)?;
+        // Handle symlink. `following` stays true after the budget is spent, so
+        // the next link is `SymLoop` rather than the link itself. A walk that
+        // was never asked to follow (`follow_times == 0`) leaves the link in
+        // place: the last component for `lstat`, `NotDir` if the path goes on.
+        if inode.metadata()?.type_ == FileType::SymLink && following {
+            if follow_times == 0 {
+                return Err(FsError::SymLoop);
             }
             let link_path = read_symlink(&*inode)?;
-            // result remains unchanged
+            // result remains unchanged: a relative target is resolved from the
+            // directory that holds the link.
             let new_path = link_path + "/" + &rest_path;
             return lookup_with_budget(&*result, &new_path, follow_times - 1, following);
         } else {
@@ -933,12 +924,12 @@ mod tests {
                 .unwrap()),
             f.ino
         );
-        // With two, the last hop stops on a link, which is not a directory to
-        // walk into and not the file either.
-        let stopped = (root.as_ref() as &dyn INode)
-            .lookup_follow("l3", 2)
-            .unwrap();
-        assert_ne!(ino(&stopped), f.ino, "the chain was followed too far");
+        // One hop short of the file is ELOOP, not the link where the walk
+        // stopped and not the file.
+        assert_eq!(
+            (root.as_ref() as &dyn INode).lookup_follow("l3", 2).err(),
+            Some(FsError::SymLoop)
+        );
     }
 
     #[test]
@@ -946,10 +937,12 @@ mod tests {
         let t = Tree::new();
         let root = t.root_node();
         t.link(&root, "l", "l");
-        let got = (root.as_ref() as &dyn INode).lookup_follow("l", 8).unwrap();
-        // Whatever it answers, it answers: what must not happen is a walk that
-        // never ends.
-        assert_eq!(got.metadata().unwrap().type_, FileType::SymLink);
+        // The walk answers: what must not happen is a walk that never ends,
+        // nor the link coming back as an ordinary file of its own name.
+        assert_eq!(
+            (root.as_ref() as &dyn INode).lookup_follow("l", 8).err(),
+            Some(FsError::SymLoop)
+        );
     }
 
     #[test]
@@ -957,7 +950,7 @@ mod tests {
         let t = Tree::new();
         let root = t.root_node();
         // A target of exactly PATH_MAX is the last one allowed.
-        let name = "x".repeat(MAX_SYMLINK_LEN);
+        let name = "x".repeat(SYMLINK_MAX);
         t.link(&root, "long", &name);
         assert_eq!(
             (root.as_ref() as &dyn INode).lookup_follow("long", 1).err(),
@@ -965,13 +958,13 @@ mod tests {
             "the target was cut short and named something else"
         );
         // One byte more and the walk refuses it rather than following a prefix.
-        let over = "y".repeat(MAX_SYMLINK_LEN + 1);
+        let over = "y".repeat(SYMLINK_MAX + 1);
         t.link(&root, "toolong", &over);
         assert_eq!(
             (root.as_ref() as &dyn INode)
                 .lookup_follow("toolong", 1)
                 .err(),
-            Some(FsError::InvalidParam)
+            Some(FsError::NameTooLong)
         );
     }
 
