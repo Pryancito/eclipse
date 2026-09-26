@@ -629,15 +629,12 @@ impl Syscall<'_> {
     /// retained.
     pub fn sys_getrusage(&mut self, who: usize, mut rusage: UserOutPtr<RUsage>) -> SysResult {
         info!("getrusage: who: {}, rusage: {:?}", who, rusage);
-        use crate::intarg::{rusage_who, RusageWho};
-        if rusage.is_null() {
-            return Err(LxError::EINVAL);
-        }
+        use crate::intarg::RusageWho;
         // `who` is an `int`: `RUSAGE_CHILDREN` is -1, and read out of all 64
         // bits of the register it was 4294967295 (EINVAL) whenever the
         // caller's compiler had zero-extended it, which is what a varargs
         // `syscall(SYS_getrusage, RUSAGE_CHILDREN, &ru)` does.
-        let (utime_ns, stime_ns) = match rusage_who(who)? {
+        let (utime_ns, stime_ns) = match getrusage_args(who, rusage.is_null())? {
             RusageWho::Process => (
                 process_user_time_ns(self.zircon_process()),
                 self.linux_process().perf().totals().1,
@@ -2528,6 +2525,46 @@ pub(crate) fn alarm_remaining_secs(remaining: Duration) -> usize {
     let nanos = remaining.subsec_nanos();
     let up = nanos >= 500_000_000 || (secs == 0 && nanos > 0);
     secs + usize::from(up)
+}
+
+/// `sys_getrusage`'s two refusals, in Linux's order: a `who` that is not
+/// `RUSAGE_SELF`, `RUSAGE_CHILDREN` or `RUSAGE_THREAD` is `EINVAL`, checked
+/// first; then the usage is gathered and `copy_to_user` into a null pointer
+/// fails, which is `EFAULT`.
+///
+/// A null pointer was `EINVAL`, and checked ahead of `who`: the errno glibc's
+/// tests and any program telling "bad argument" from "bad pointer" read was
+/// the wrong one, and `getrusage(99, NULL)` said the pointer was fine.
+fn getrusage_args(
+    who: usize,
+    rusage_is_null: bool,
+) -> linux_object::error::LxResult<crate::intarg::RusageWho> {
+    let who = crate::intarg::rusage_who(who)?;
+    if rusage_is_null {
+        return Err(LxError::EFAULT);
+    }
+    Ok(who)
+}
+
+#[cfg(test)]
+mod getrusage_args_tests {
+    //! What `getrusage(2)` refuses, and with which errno.
+
+    use super::*;
+    use crate::intarg::RusageWho;
+
+    /// A null `rusage` is `EFAULT`, the errno of the failed copy, not
+    /// `EINVAL`; and `who` is judged first, so `getrusage(99, NULL)` is
+    /// `EINVAL`.
+    #[test]
+    fn a_null_rusage_is_efault_and_who_is_judged_first() {
+        assert_eq!(getrusage_args(0, true), Err(LxError::EFAULT));
+        assert_eq!(getrusage_args(1, true), Err(LxError::EFAULT));
+        assert_eq!(getrusage_args(99, true), Err(LxError::EINVAL));
+        assert_eq!(getrusage_args(0, false), Ok(RusageWho::Process));
+        assert_eq!(getrusage_args(1, false), Ok(RusageWho::Thread));
+        assert_eq!(getrusage_args(99, false), Err(LxError::EINVAL));
+    }
 }
 
 #[cfg(test)]

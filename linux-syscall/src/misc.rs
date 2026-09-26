@@ -1,7 +1,9 @@
 use super::*;
 use core::time::Duration;
 use kernel_hal::timer::timer_now;
-use linux_object::process::{CAP_SYS_ADMIN, CAP_SYS_BOOT, CAP_SYS_NICE, CAP_SYS_RESOURCE};
+use linux_object::process::{
+    CAP_SYSLOG, CAP_SYS_ADMIN, CAP_SYS_BOOT, CAP_SYS_NICE, CAP_SYS_RESOURCE,
+};
 use linux_object::thread::ThreadExt;
 use linux_object::time::*;
 use zircon_object::task::ThreadState;
@@ -351,38 +353,13 @@ impl Syscall<'_> {
     /// Read and/or clear kernel message ring buffer; set console_loglevel
     pub fn sys_syslog(&self, type_: i32, mut buf: UserOutPtr<u8>, len: i32) -> SysResult {
         info!("syslog: type={}, buf={:?}, len={}", type_, buf, len);
-        // syslog(2) action codes
-        const SYSLOG_ACTION_CLOSE: i32 = 0;
-        const SYSLOG_ACTION_OPEN: i32 = 1;
-        const SYSLOG_ACTION_READ: i32 = 2; // read & clear (we treat as READ_ALL)
-        const SYSLOG_ACTION_READ_ALL: i32 = 3;
-        const SYSLOG_ACTION_READ_CLEAR: i32 = 4;
-        const SYSLOG_ACTION_CLEAR: i32 = 5;
-        const SYSLOG_ACTION_CONSOLE_OFF: i32 = 6;
-        const SYSLOG_ACTION_CONSOLE_ON: i32 = 7;
-        const SYSLOG_ACTION_CONSOLE_LEVEL: i32 = 8;
-        const SYSLOG_ACTION_SIZE_UNREAD: i32 = 9;
-        const SYSLOG_ACTION_SIZE_BUFFER: i32 = 10;
-
-        match type_ {
-            SYSLOG_ACTION_CLOSE
-            | SYSLOG_ACTION_OPEN
-            | SYSLOG_ACTION_CLEAR
-            | SYSLOG_ACTION_CONSOLE_OFF
-            | SYSLOG_ACTION_CONSOLE_ON
-            | SYSLOG_ACTION_CONSOLE_LEVEL => Ok(0),
-
-            SYSLOG_ACTION_SIZE_BUFFER => Ok(kernel_hal::console::klog_buf_size()),
-
-            SYSLOG_ACTION_SIZE_UNREAD => Ok(kernel_hal::console::klog_buf_size()),
-
-            SYSLOG_ACTION_READ | SYSLOG_ACTION_READ_ALL | SYSLOG_ACTION_READ_CLEAR => {
-                // A negative `len` would sign-extend to a huge `usize`, letting
-                // the read write past the (smaller) user buffer.
-                if len < 0 {
-                    return Err(LxError::EINVAL);
-                }
-                let cap = (len as usize).min(kernel_hal::console::klog_buf_size().max(1));
+        let privileged =
+            self.linux_process().capable(CAP_SYSLOG) || self.linux_process().capable(CAP_SYS_ADMIN);
+        match syslog_plan(type_, buf.is_null(), len, privileged)? {
+            SyslogPlan::Nothing => Ok(0),
+            SyslogPlan::BufferSize | SyslogPlan::Unread => Ok(kernel_hal::console::klog_buf_size()),
+            SyslogPlan::Read(len) => {
+                let cap = len.min(kernel_hal::console::klog_buf_size().max(1));
                 let mut tmp = vec![0u8; cap];
                 let n = kernel_hal::console::klog_read(&mut tmp);
                 if n > 0 {
@@ -390,8 +367,6 @@ impl Syscall<'_> {
                 }
                 Ok(n)
             }
-
-            _ => Ok(0),
         }
     }
 
@@ -1143,6 +1118,85 @@ fn process_of_task(pid: KoID) -> Option<Arc<zircon_object::task::Process>> {
     })
 }
 
+/// What `do_syslog` decided to do with a call, once it has refused what it
+/// refuses.
+#[derive(Debug, PartialEq, Eq)]
+enum SyslogPlan {
+    /// Answer 0 and touch nothing: open, close, the console switches, a
+    /// clear (this log has no clear), a level change, or a read of zero bytes.
+    Nothing,
+    /// Copy up to this many bytes of the log out.
+    Read(usize),
+    /// `SYSLOG_ACTION_SIZE_UNREAD`: how much is unread.
+    Unread,
+    /// `SYSLOG_ACTION_SIZE_BUFFER`: the size of the ring.
+    BufferSize,
+}
+
+const SYSLOG_ACTION_CLOSE: i32 = 0;
+const SYSLOG_ACTION_OPEN: i32 = 1;
+const SYSLOG_ACTION_READ: i32 = 2;
+const SYSLOG_ACTION_READ_ALL: i32 = 3;
+const SYSLOG_ACTION_READ_CLEAR: i32 = 4;
+const SYSLOG_ACTION_CLEAR: i32 = 5;
+const SYSLOG_ACTION_CONSOLE_OFF: i32 = 6;
+const SYSLOG_ACTION_CONSOLE_ON: i32 = 7;
+const SYSLOG_ACTION_CONSOLE_LEVEL: i32 = 8;
+const SYSLOG_ACTION_SIZE_UNREAD: i32 = 9;
+const SYSLOG_ACTION_SIZE_BUFFER: i32 = 10;
+
+/// `do_syslog` up to the point where it touches the log, in its order.
+///
+/// First `check_syslog_permissions`: with `dmesg_restrict` off (the default,
+/// and the only setting here), every action but `SYSLOG_ACTION_READ_ALL` and
+/// `SYSLOG_ACTION_SIZE_BUFFER` needs `CAP_SYSLOG` (or `CAP_SYS_ADMIN`, with a
+/// warning), and the check runs before the action is even looked at, so an
+/// unprivileged caller of an unknown action hears `EPERM`, not `EINVAL`.
+/// Then the `switch`: a read needs a buffer and a non-negative length
+/// (`EINVAL`) and a read of zero bytes is answered 0 without looking;
+/// `SYSLOG_ACTION_CONSOLE_LEVEL` takes 1 to 8 (`EINVAL`); and an action the
+/// kernel does not know is `EINVAL`.
+///
+/// None of that was asked. `dmesg -C`, `dmesg -c` and `dmesg -n 1` from an
+/// unprivileged user were answered 0 (Linux: "Operation not permitted");
+/// `klogctl(11, ...)`, or any garbage action, was answered 0 too, which a
+/// program probing the kernel for a new action reads as support; a level
+/// of 0 or 99 was taken; and a read into a null buffer went to the copy,
+/// which answers `EFAULT` where Linux says `EINVAL` before it copies.
+fn syslog_plan(type_: i32, buf_is_null: bool, len: i32, privileged: bool) -> LxResult<SyslogPlan> {
+    let restricted = type_ != SYSLOG_ACTION_READ_ALL && type_ != SYSLOG_ACTION_SIZE_BUFFER;
+    if restricted && !privileged {
+        return Err(LxError::EPERM);
+    }
+    match type_ {
+        SYSLOG_ACTION_CLOSE
+        | SYSLOG_ACTION_OPEN
+        | SYSLOG_ACTION_CLEAR
+        | SYSLOG_ACTION_CONSOLE_OFF
+        | SYSLOG_ACTION_CONSOLE_ON => Ok(SyslogPlan::Nothing),
+        SYSLOG_ACTION_READ | SYSLOG_ACTION_READ_ALL | SYSLOG_ACTION_READ_CLEAR => {
+            // A negative `len` would sign-extend to a huge `usize`, letting
+            // the read write past the (smaller) user buffer.
+            if buf_is_null || len < 0 {
+                return Err(LxError::EINVAL);
+            }
+            if len == 0 {
+                return Ok(SyslogPlan::Nothing);
+            }
+            Ok(SyslogPlan::Read(len as usize))
+        }
+        SYSLOG_ACTION_CONSOLE_LEVEL => {
+            if !(1..=8).contains(&len) {
+                return Err(LxError::EINVAL);
+            }
+            Ok(SyslogPlan::Nothing)
+        }
+        SYSLOG_ACTION_SIZE_UNREAD => Ok(SyslogPlan::Unread),
+        SYSLOG_ACTION_SIZE_BUFFER => Ok(SyslogPlan::BufferSize),
+        _ => Err(LxError::EINVAL),
+    }
+}
+
 /// `capset(2)`'s only target is the caller: `SYSCALL_DEFINE2(capset)`, `/*
 /// may only affect current now */ if (pid != 0 && pid != task_pid_vnr(current))
 /// return -EPERM;`. There is no `EINVAL` for a negative pid, unlike `capget`:
@@ -1455,6 +1509,116 @@ mod ioprio_tests {
         assert_eq!(ioprio_which(3), Ok(2));
         assert_eq!(ioprio_which(0), Err(LxError::EINVAL));
         assert_eq!(ioprio_which(4), Err(LxError::EINVAL));
+    }
+}
+
+#[cfg(test)]
+mod syslog_tests {
+    //! `do_syslog` before it touches the log: who may ask what, and what a
+    //! malformed ask is answered.
+
+    use super::*;
+
+    /// `check_syslog_permissions`: only `READ_ALL` and `SIZE_BUFFER` (what
+    /// plain `dmesg` uses) are open to everyone; clearing, the console
+    /// switches and the level need `CAP_SYSLOG`. They were all answered 0.
+    #[test]
+    fn everything_but_reading_the_whole_log_and_its_size_needs_cap_syslog() {
+        assert_eq!(
+            syslog_plan(SYSLOG_ACTION_READ_ALL, false, 100, false),
+            Ok(SyslogPlan::Read(100))
+        );
+        assert_eq!(
+            syslog_plan(SYSLOG_ACTION_SIZE_BUFFER, true, 0, false),
+            Ok(SyslogPlan::BufferSize)
+        );
+        for action in [
+            SYSLOG_ACTION_CLOSE,
+            SYSLOG_ACTION_OPEN,
+            SYSLOG_ACTION_READ,
+            SYSLOG_ACTION_READ_CLEAR,
+            SYSLOG_ACTION_CLEAR,
+            SYSLOG_ACTION_CONSOLE_OFF,
+            SYSLOG_ACTION_CONSOLE_ON,
+            SYSLOG_ACTION_CONSOLE_LEVEL,
+            SYSLOG_ACTION_SIZE_UNREAD,
+        ] {
+            assert_eq!(
+                syslog_plan(action, false, 1, false),
+                Err(LxError::EPERM),
+                "action {}",
+                action
+            );
+            assert!(
+                syslog_plan(action, false, 1, true).is_ok(),
+                "action {}",
+                action
+            );
+        }
+    }
+
+    /// The permission check runs before the action is looked at: an unknown
+    /// action is `EPERM` to an unprivileged caller and `EINVAL` to root, and
+    /// never 0.
+    #[test]
+    fn an_unknown_action_is_refused_and_the_permission_check_comes_first() {
+        for action in [11, 12, 100, -1, i32::MIN, i32::MAX] {
+            assert_eq!(
+                syslog_plan(action, false, 0, true),
+                Err(LxError::EINVAL),
+                "{}",
+                action
+            );
+            assert_eq!(
+                syslog_plan(action, false, 0, false),
+                Err(LxError::EPERM),
+                "{}",
+                action
+            );
+        }
+    }
+
+    /// A read needs a buffer and a non-negative length, both `EINVAL` before
+    /// anything is copied; a length of 0 is answered 0 without looking.
+    #[test]
+    fn a_read_needs_a_buffer_and_a_length_and_reads_nothing_for_zero() {
+        for action in [
+            SYSLOG_ACTION_READ,
+            SYSLOG_ACTION_READ_ALL,
+            SYSLOG_ACTION_READ_CLEAR,
+        ] {
+            assert_eq!(syslog_plan(action, true, 100, true), Err(LxError::EINVAL));
+            assert_eq!(syslog_plan(action, false, -1, true), Err(LxError::EINVAL));
+            assert_eq!(syslog_plan(action, true, -1, true), Err(LxError::EINVAL));
+            assert_eq!(syslog_plan(action, false, 0, true), Ok(SyslogPlan::Nothing));
+            assert_eq!(
+                syslog_plan(action, false, 4096, true),
+                Ok(SyslogPlan::Read(4096))
+            );
+        }
+    }
+
+    /// `SYSLOG_ACTION_CONSOLE_LEVEL` takes a level of 1 to 8 in `len`.
+    #[test]
+    fn the_console_level_is_one_to_eight() {
+        for level in 1..=8 {
+            assert_eq!(
+                syslog_plan(SYSLOG_ACTION_CONSOLE_LEVEL, true, level, true),
+                Ok(SyslogPlan::Nothing)
+            );
+        }
+        for level in [0, 9, -1, 99, i32::MAX] {
+            assert_eq!(
+                syslog_plan(SYSLOG_ACTION_CONSOLE_LEVEL, true, level, true),
+                Err(LxError::EINVAL),
+                "{}",
+                level
+            );
+        }
+        assert_eq!(
+            syslog_plan(SYSLOG_ACTION_SIZE_UNREAD, true, 0, true),
+            Ok(SyslogPlan::Unread)
+        );
     }
 }
 

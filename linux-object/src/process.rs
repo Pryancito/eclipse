@@ -85,6 +85,10 @@ pub const CAP_SYS_NICE: u32 = 23;
 pub const CAP_SYS_RESOURCE: u32 = 24;
 /// `CAP_SYS_TIME`: set the system clock and discipline it.
 pub const CAP_SYS_TIME: u32 = 25;
+/// `CAP_SYSLOG`: the `syslog(2)` actions that change the kernel log or the
+/// console (clear, read-and-clear, console on/off/level) -- and, under
+/// `dmesg_restrict`, reading it at all.
+pub const CAP_SYSLOG: u32 = 34;
 
 /// The highest capability number this kernel reports. 40 is Linux 5.15's
 /// `CAP_LAST_CAP` (`CAP_CHECKPOINT_RESTORE`); `capget`, `prctl`'s bounding
@@ -6223,6 +6227,7 @@ mod capability_tests {
         (CAP_SYS_ADMIN, "CAP_SYS_ADMIN"),
         (CAP_SYS_BOOT, "CAP_SYS_BOOT"),
         (CAP_SYS_TIME, "CAP_SYS_TIME"),
+        (CAP_SYSLOG, "CAP_SYSLOG"),
     ];
 
     #[test]
@@ -6232,6 +6237,7 @@ mod capability_tests {
         assert_eq!(CAP_SYS_ADMIN, 21);
         assert_eq!(CAP_SYS_BOOT, 22);
         assert_eq!(CAP_SYS_TIME, 25);
+        assert_eq!(CAP_SYSLOG, 34);
         // CAP_CHECKPOINT_RESTORE, the last one Linux 5.15 defines.
         assert_eq!(CAP_LAST_CAP, 40);
     }
