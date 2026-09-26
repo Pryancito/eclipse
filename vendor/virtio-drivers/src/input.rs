@@ -412,7 +412,7 @@ mod tests {
         // to put an event except a buffer the driver has already published, so
         // a queue built with fewer than `QUEUE_SIZE` buffers silently caps how
         // many events can arrive between interrupts.
-        let (input, ring) = driver();
+        let (_input, ring) = driver();
         assert_eq!(
             ring.avail_idx(),
             QUEUE_SIZE as u16,
