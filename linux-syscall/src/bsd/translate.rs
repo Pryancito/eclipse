@@ -33,7 +33,10 @@
 //! tests at the bottom parse every bit this module can produce back through
 //! those two types and demand that it survives.
 
-use super::consts::{fcntl, lin_fcntl, lin_mman, lin_oflags, lin_wait, mman, oflags, wait};
+use super::consts::{
+    fcntl, lin_fcntl, lin_madv, lin_mman, lin_msync, lin_oflags, lin_wait, madv, mman, msync,
+    oflags, wait,
+};
 use linux_object::error::{LxError, LxResult};
 
 /// The only page size this kernel maps with, as a shift.
@@ -396,6 +399,54 @@ const WAIT_IGNORED: i32 = wait::WEXITED | wait::WTRAPPED;
 /// program asking to look without reaping reaped.
 pub fn wait_options_to_linux(bsd: i32) -> LxResult<i32> {
     sift(bsd, WAIT_MAP, WAIT_IGNORED, 0)
+}
+
+/// FreeBSD `madvise(2)` advice in Linux's numbering.
+///
+/// It used to go through untouched, and the two tables only agree up to 4.
+/// FreeBSD's `MADV_FREE` is 5, which Linux does not have, so every purge
+/// jemalloc (FreeBSD's `malloc`) made was `EINVAL`. Worse, FreeBSD's
+/// `MADV_NOCORE` is 8, which is Linux's `MADV_FREE`: a program that asked for
+/// its key material to stay out of core dumps (libsodium's `sodium_mlock`
+/// does exactly this) was telling this kernel it could throw the pages away,
+/// and it did, so the keys read back as zeros.
+///
+/// FreeBSD's `MADV_DONTNEED` is a paging hint that keeps the contents, not
+/// Linux's, which empties the pages, so it becomes `MADV_NORMAL`: a hint not
+/// taken loses nothing, a page emptied loses the program's data. `NOSYNC`,
+/// `AUTOSYNC` and `PROTECT` have no Linux peer and no effect a program can
+/// see, so they are accepted as hints too.
+pub fn madvise_to_linux(bsd: usize) -> LxResult<usize> {
+    Ok(match bsd {
+        madv::MADV_NORMAL => lin_madv::MADV_NORMAL,
+        madv::MADV_RANDOM => lin_madv::MADV_RANDOM,
+        madv::MADV_SEQUENTIAL => lin_madv::MADV_SEQUENTIAL,
+        madv::MADV_WILLNEED => lin_madv::MADV_WILLNEED,
+        madv::MADV_DONTNEED => lin_madv::MADV_NORMAL,
+        madv::MADV_FREE => lin_madv::MADV_FREE,
+        madv::MADV_NOSYNC | madv::MADV_AUTOSYNC | madv::MADV_PROTECT => lin_madv::MADV_NORMAL,
+        madv::MADV_NOCORE => lin_madv::MADV_DONTDUMP,
+        madv::MADV_CORE => lin_madv::MADV_DODUMP,
+        _ => return Err(LxError::EINVAL),
+    })
+}
+
+/// The `msync(2)` flag pairs.
+const MSYNC_MAP: &[(i32, i32)] = &[
+    (msync::MS_ASYNC, lin_msync::MS_ASYNC),
+    (msync::MS_INVALIDATE, lin_msync::MS_INVALIDATE),
+    (msync::MS_SYNC, lin_msync::MS_SYNC),
+];
+
+/// FreeBSD `msync(2)` flags in Linux's spelling.
+///
+/// `MS_SYNC` is `0x10` on FreeBSD and `4` on Linux, so passed through it was
+/// a flag Linux does not have: every `msync(addr, len, MS_SYNC)` from a
+/// FreeBSD program was `EINVAL`, and a database that fsyncs its mapped file
+/// that way believed the write never reached the disk. `MS_ASYNC` and
+/// `MS_INVALIDATE` happen to agree.
+pub fn msync_flags_to_linux(bsd: i32) -> LxResult<i32> {
+    sift(bsd, MSYNC_MAP, 0, 0)
 }
 
 #[cfg(test)]
@@ -795,5 +846,80 @@ mod tests {
             Ok(lin_wait::WCLONE)
         );
         assert_eq!(wait_options_to_linux(0x40), Err(LxError::EINVAL));
+    }
+}
+
+/// `madvise(2)` and `msync(2)`, which used to hand their numbers through.
+#[cfg(test)]
+mod advice_tests {
+    use super::*;
+
+    #[test]
+    fn the_advice_the_two_systems_agree_on_passes_unchanged() {
+        for n in [0, 1, 2, 3] {
+            assert_eq!(madvise_to_linux(n), Ok(n));
+        }
+    }
+
+    #[test]
+    fn freebsd_madv_free_is_linux_madv_free_not_an_unknown_five() {
+        assert_eq!(madvise_to_linux(madv::MADV_FREE), Ok(lin_madv::MADV_FREE));
+        assert_eq!(lin_madv::MADV_FREE, 8);
+    }
+
+    #[test]
+    fn keeping_pages_out_of_a_core_dump_does_not_throw_them_away() {
+        // FreeBSD's 8 is Linux's MADV_FREE; passed through it discarded the
+        // very pages the program wanted kept private.
+        assert_eq!(
+            madvise_to_linux(madv::MADV_NOCORE),
+            Ok(lin_madv::MADV_DONTDUMP)
+        );
+        assert_ne!(madvise_to_linux(madv::MADV_NOCORE), Ok(lin_madv::MADV_FREE));
+        assert_eq!(madvise_to_linux(madv::MADV_CORE), Ok(lin_madv::MADV_DODUMP));
+    }
+
+    #[test]
+    fn freebsd_dontneed_keeps_the_contents_so_it_is_a_hint_here() {
+        assert_eq!(
+            madvise_to_linux(madv::MADV_DONTNEED),
+            Ok(lin_madv::MADV_NORMAL)
+        );
+        assert_ne!(
+            madvise_to_linux(madv::MADV_DONTNEED),
+            Ok(lin_madv::MADV_DONTNEED)
+        );
+    }
+
+    #[test]
+    fn the_hints_without_a_linux_peer_are_accepted_and_the_rest_refused() {
+        for n in [madv::MADV_NOSYNC, madv::MADV_AUTOSYNC, madv::MADV_PROTECT] {
+            assert_eq!(madvise_to_linux(n), Ok(lin_madv::MADV_NORMAL));
+        }
+        for n in [11, 16, 17, 100, usize::MAX] {
+            assert_eq!(madvise_to_linux(n), Err(LxError::EINVAL), "advice {}", n);
+        }
+    }
+
+    #[test]
+    fn ms_sync_moves_from_bit_four_to_bit_two() {
+        assert_eq!(msync_flags_to_linux(msync::MS_SYNC), Ok(lin_msync::MS_SYNC));
+        assert_eq!(lin_msync::MS_SYNC, 4);
+        assert_eq!(
+            msync_flags_to_linux(msync::MS_SYNC | msync::MS_INVALIDATE),
+            Ok(lin_msync::MS_SYNC | lin_msync::MS_INVALIDATE)
+        );
+        assert_eq!(
+            msync_flags_to_linux(msync::MS_ASYNC),
+            Ok(lin_msync::MS_ASYNC)
+        );
+        assert_eq!(msync_flags_to_linux(0), Ok(0));
+    }
+
+    #[test]
+    fn a_bit_that_is_no_msync_flag_anywhere_is_einval() {
+        // Linux's own MS_SYNC bit is not a FreeBSD flag.
+        assert_eq!(msync_flags_to_linux(4), Err(LxError::EINVAL));
+        assert_eq!(msync_flags_to_linux(0x100), Err(LxError::EINVAL));
     }
 }

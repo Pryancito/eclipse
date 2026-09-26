@@ -244,8 +244,14 @@ impl Syscall<'_> {
             },
             sys::MUNMAP => BsdRet::from_result(self.sys_munmap(a0, a1)),
             sys::MPROTECT => BsdRet::from_result(self.sys_mprotect(a0, a1, a2)),
-            sys::MADVISE => BsdRet::from_result(self.sys_madvise(a0, a1, a2)),
-            sys::MSYNC => BsdRet::from_result(self.sys_msync(a0, a1, a2)),
+            sys::MADVISE => match translate::madvise_to_linux(a2) {
+                Err(e) => BsdRet::from_lx(e),
+                Ok(advice) => BsdRet::from_result(self.sys_madvise(a0, a1, advice)),
+            },
+            sys::MSYNC => match translate::msync_flags_to_linux(a2 as i32) {
+                Err(e) => BsdRet::from_lx(e),
+                Ok(f) => BsdRet::from_result(self.sys_msync(a0, a1, f as usize)),
+            },
             sys::BREAK => BsdRet::from_result(self.sys_brk(a0)),
 
             // ---- process ----------------------------------------------------

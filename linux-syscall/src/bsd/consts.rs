@@ -353,6 +353,57 @@ pub mod lin_mman {
     pub const MAP_FIXED_NOREPLACE: i32 = 0x10_0000;
 }
 
+/// FreeBSD `madvise(2)` advice (`sys/sys/mman.h`). Not flags: one number.
+pub mod madv {
+    pub const MADV_NORMAL: usize = 0;
+    pub const MADV_RANDOM: usize = 1;
+    pub const MADV_SEQUENTIAL: usize = 2;
+    pub const MADV_WILLNEED: usize = 3;
+    /// A priority hint on FreeBSD: the pages may be paged out sooner, and
+    /// their contents are kept. Not Linux's `MADV_DONTNEED`, which empties
+    /// them.
+    pub const MADV_DONTNEED: usize = 4;
+    /// The contents are no longer needed and may be dropped: Linux's
+    /// `MADV_FREE`, which is 8 there.
+    pub const MADV_FREE: usize = 5;
+    pub const MADV_NOSYNC: usize = 6;
+    pub const MADV_AUTOSYNC: usize = 7;
+    /// Leave these pages out of a core dump: Linux's `MADV_DONTDUMP`.
+    pub const MADV_NOCORE: usize = 8;
+    /// And back in: `MADV_DODUMP`.
+    pub const MADV_CORE: usize = 9;
+    /// Exempt the process from the OOM killer (superuser only).
+    pub const MADV_PROTECT: usize = 10;
+}
+
+/// Linux `madvise(2)` advice (`include/uapi/asm-generic/mman-common.h`).
+pub mod lin_madv {
+    pub const MADV_NORMAL: usize = 0;
+    pub const MADV_RANDOM: usize = 1;
+    pub const MADV_SEQUENTIAL: usize = 2;
+    pub const MADV_WILLNEED: usize = 3;
+    pub const MADV_DONTNEED: usize = 4;
+    pub const MADV_FREE: usize = 8;
+    pub const MADV_DONTDUMP: usize = 16;
+    pub const MADV_DODUMP: usize = 17;
+}
+
+/// FreeBSD `msync(2)` flags (`sys/sys/mman.h`).
+pub mod msync {
+    pub const MS_ASYNC: i32 = 0x0001;
+    pub const MS_INVALIDATE: i32 = 0x0002;
+    /// `0x10` here, `4` on Linux: the one bit the two systems put in
+    /// different places.
+    pub const MS_SYNC: i32 = 0x0010;
+}
+
+/// Linux `msync(2)` flags (`include/uapi/asm-generic/mman-common.h`).
+pub mod lin_msync {
+    pub const MS_ASYNC: i32 = 1;
+    pub const MS_INVALIDATE: i32 = 2;
+    pub const MS_SYNC: i32 = 4;
+}
+
 /// `sysctl(2)` top-level identifiers and the `kern.*` / `hw.*` leaves this
 /// layer answers (`sys/sys/sysctl.h`).
 pub mod ctl {
