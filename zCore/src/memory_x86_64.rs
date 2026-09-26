@@ -87,43 +87,62 @@ fn frame_idx_to_phys_addr(idx: usize) -> PhysAddr {
     idx << PAGE_BITS
 }
 
+/// The frames wholly inside `region`, clamped to what the bitmap can address.
+///
+/// Both ends round **inward**, and that is the whole point: a frame the
+/// allocator hands out must be free for its whole length. Rounding the start
+/// down (which `addr >> PAGE_BITS` does by itself) or the end up gives away a
+/// page that straddles the region's edge -- so the page holding the tail of the
+/// kernel image, or the head of whatever reserved range comes next, becomes
+/// ordinary RAM and gets a second owner. Which is the bug shape this file's own
+/// `reserve_active_page_table_frames` exists to undo.
+///
+/// On x86_64 every UEFI descriptor is page-aligned, so today this changes
+/// nothing; the clamping right below it is equally defensive, and a guard that
+/// rounds the wrong way is worse than no guard.
+fn frames_inside(region: &Range<PhysAddr>) -> Range<usize> {
+    const PAGE_SIZE: usize = 1 << PAGE_BITS;
+    // Frame 0 is never handed out: a null physical address is how every
+    // "allocation failed" is spelled elsewhere.
+    let start = region.start.clamp(PAGE_SIZE, MAX_MANAGED_PADDR_EXCLUSIVE);
+    let end = region.end.min(MAX_MANAGED_PADDR_EXCLUSIVE);
+    let frame_start = phys_addr_to_frame_idx(start + PAGE_SIZE - 1);
+    let frame_end = phys_addr_to_frame_idx(end);
+    // An empty answer is always `0..0` and never a backwards range: callers ask
+    // `is_empty()`, and a `2..1` handed to anything that iterates is a trap.
+    // This also covers a backwards or empty `region`, since `start` is at least
+    // one page and an `end` below it cannot reach `frame_start`.
+    if frame_start >= frame_end {
+        return 0..0;
+    }
+    frame_start..frame_end
+}
+
 pub fn insert_regions(regions: &[Range<PhysAddr>]) {
     debug!("init_frame_allocator regions: {regions:x?}");
     let mut ba = FRAME_ALLOCATOR.lock();
     for region in regions {
-        let mut start = region.start.min(MAX_MANAGED_PADDR_EXCLUSIVE);
-        let end = region.end.min(MAX_MANAGED_PADDR_EXCLUSIVE);
-        if start < 0x1000 {
-            start = 0x1000;
-        }
-        if end <= start {
+        let frames = frames_inside(region);
+        if frames.is_empty() {
             continue;
         }
-        if end != region.end {
+        let range_start = frame_idx_to_phys_addr(frames.start);
+        let range_end = frame_idx_to_phys_addr(frames.end);
+        if range_end != region.end {
             crate::klog_warn!(
                 "memory: frame allocator region clipped (>64GiB): {:#x?} -> {:#x?}",
                 region,
-                start..end
+                range_start..range_end
             );
         }
-        let frame_start = phys_addr_to_frame_idx(start);
-        let frame_end = phys_addr_to_frame_idx(end - 1) + 1;
-        if frame_start < frame_end {
-            ba.insert(frame_start..frame_end);
-            TOTAL_MEMORY.fetch_add(
-                frame_idx_to_phys_addr(frame_end - frame_start),
-                Ordering::Relaxed,
-            );
-            let range_start = frame_idx_to_phys_addr(frame_start);
-            let range_end = frame_idx_to_phys_addr(frame_end);
-            let mib = (range_end - range_start) / (1024 * 1024);
-            crate::klog_info!(
-                "memory: free RAM range {:#x}..{:#x} ({} MiB)",
-                range_start,
-                range_end,
-                mib
-            );
-        }
+        ba.insert(frames.clone());
+        TOTAL_MEMORY.fetch_add(range_end - range_start, Ordering::Relaxed);
+        crate::klog_info!(
+            "memory: free RAM range {:#x}..{:#x} ({} MiB)",
+            range_start,
+            range_end,
+            (range_end - range_start) / (1024 * 1024)
+        );
     }
     let (frames_used, frames_total) = frame_stats();
     crate::klog_info!(
@@ -1344,5 +1363,201 @@ mod rvm_extern_fn {
     #[rvm::extern_fn(is_host_serial_interrupt)]
     fn rvm_is_host_serial_interrupt(vector: u8) -> bool {
         vector == 36
+    }
+}
+
+/// The physical frame allocator's arithmetic.
+///
+/// `insert_regions` decides what RAM the kernel may hand out, and nothing had
+/// ever compiled this file as a test target. `frames_inside` is pure, so the
+/// interesting half is testable without a bitmap; the shared `FRAME_ALLOCATOR`
+/// is a process global, so the tests that use it take a turnstile.
+#[cfg(test)]
+mod frame_tests {
+    use super::*;
+
+    const PAGE: usize = 1 << PAGE_BITS;
+
+    /// The whole allocator lives in one `static`, and `insert` is not
+    /// idempotent, so two tests inserting overlapping ranges see each other's
+    /// frames. Serialise them.
+    #[must_use = "bind it to `_alone`: a bare `_` releases the turnstile at once"]
+    fn alone_with_the_allocator() -> spin::MutexGuard<'static, ()> {
+        static GUARD: spin::Mutex<()> = spin::Mutex::new(());
+        GUARD.lock()
+    }
+
+    // --- the two conversions ---------------------------------------------
+
+    #[test]
+    fn a_frame_index_and_its_address_are_the_same_thing() {
+        for idx in [0usize, 1, 0xff, 0x1_0000, (1 << 24) - 1] {
+            assert_eq!(phys_addr_to_frame_idx(frame_idx_to_phys_addr(idx)), idx);
+        }
+        // Any address inside a frame names that frame.
+        assert_eq!(phys_addr_to_frame_idx(0x1000), 1);
+        assert_eq!(phys_addr_to_frame_idx(0x1fff), 1);
+        assert_eq!(phys_addr_to_frame_idx(0x2000), 2);
+    }
+
+    /// The bitmap and the address cap have to agree: a `remove`/`insert` past
+    /// the bitmap's last bit is what `MAX_MANAGED_PADDR_EXCLUSIVE` exists to
+    /// prevent, and the two are written as unrelated literals.
+    #[test]
+    fn the_address_cap_is_exactly_what_the_bitmap_can_hold() {
+        assert_eq!(
+            phys_addr_to_frame_idx(MAX_MANAGED_PADDR_EXCLUSIVE),
+            FrameAlloc::CAP,
+            "MAX_MANAGED_PADDR_EXCLUSIVE and the BitAlloc type have drifted apart"
+        );
+    }
+
+    // --- frames_inside ----------------------------------------------------
+
+    #[test]
+    fn an_aligned_region_is_taken_whole() {
+        assert_eq!(frames_inside(&(0x10_0000..0x20_0000)), 0x100..0x200);
+    }
+
+    /// The bug. Both ends used to round OUTWARD -- the start implicitly (a bare
+    /// `addr >> PAGE_BITS`) and the end explicitly (`idx(end - 1) + 1`) -- so an
+    /// unaligned region handed out the page straddling each of its edges. That
+    /// page belongs to whatever is on the other side: the tail of the kernel
+    /// image, or the head of the next reserved range, now with two owners.
+    #[test]
+    fn an_unaligned_region_gives_up_the_partial_page_at_each_end() {
+        // 0x1800..0x4800 covers all of frame 2 and part of frames 1 and 4.
+        assert_eq!(frames_inside(&(0x1800..0x4800)), 2..4);
+    }
+
+    #[test]
+    fn a_region_too_small_to_hold_one_whole_page_yields_nothing() {
+        assert!(frames_inside(&(0x1800..0x1900)).is_empty());
+        assert!(frames_inside(&(0x1001..0x2000)).is_empty());
+        assert!(frames_inside(&(0x1000..0x1fff)).is_empty());
+        // ...and exactly one page does yield it.
+        assert_eq!(frames_inside(&(0x1000..0x2000)), 1..2);
+    }
+
+    #[test]
+    fn an_empty_or_backwards_region_yields_nothing() {
+        assert!(frames_inside(&(0x2000..0x2000)).is_empty());
+        assert!(frames_inside(&(0x4000..0x2000)).is_empty());
+    }
+
+    /// Frame 0 is never handed out: a physical address of 0 is how every
+    /// "allocation failed" is spelled, so a real frame at 0 would be
+    /// indistinguishable from a failure.
+    #[test]
+    fn frame_zero_is_never_handed_out() {
+        assert_eq!(frames_inside(&(0..0x4000)), 1..4);
+        assert!(frames_inside(&(0..0x1000)).is_empty());
+    }
+
+    #[test]
+    fn a_region_past_the_bitmap_is_clipped_to_it() {
+        let cap = MAX_MANAGED_PADDR_EXCLUSIVE;
+        assert_eq!(
+            frames_inside(&(cap - 2 * PAGE..cap + 0x1_0000)),
+            FrameAlloc::CAP - 2..FrameAlloc::CAP,
+        );
+        assert!(
+            frames_inside(&(cap..cap + 0x1_0000)).is_empty(),
+            "a region entirely above the cap is not ours to manage"
+        );
+    }
+
+    // --- insert_regions and the allocator --------------------------------
+
+    /// What `insert_regions` promises: every frame it reports as managed can be
+    /// allocated, and none outside the region can.
+    #[test]
+    fn the_frames_a_region_contributes_are_the_ones_it_hands_out() {
+        let _alone = alone_with_the_allocator();
+        let base = 0x40_0000; // frame 0x400, well away from the other tests
+        insert_regions(&[base..base + 3 * PAGE]);
+        let mut got = alloc::vec::Vec::new();
+        for _ in 0..3 {
+            let addr = frame_alloc(1, 0).expect("three frames went in");
+            assert!(
+                (base..base + 3 * PAGE).contains(&addr),
+                "{addr:#x} is outside the region that was inserted"
+            );
+            got.push(addr);
+        }
+        got.sort_unstable();
+        got.dedup();
+        assert_eq!(got.len(), 3, "the same frame was handed out twice");
+        for addr in got {
+            frame_dealloc(addr);
+        }
+    }
+
+    /// The accounting `/proc/meminfo` reads: bytes in, bytes out, and back to
+    /// where it started.
+    #[test]
+    fn allocating_and_freeing_leaves_the_counters_where_they_were() {
+        let _alone = alone_with_the_allocator();
+        let base = 0x50_0000;
+        let (used_before, total_before) = frame_stats();
+        insert_regions(&[base..base + 4 * PAGE]);
+        assert_eq!(
+            frame_stats().1 - total_before,
+            4 * PAGE,
+            "four pages of managed memory"
+        );
+        let addr = frame_alloc(2, 0).expect("two contiguous frames");
+        assert_eq!(frame_stats().0 - used_before, 2 * PAGE);
+        frame_dealloc(addr);
+        frame_dealloc(addr + PAGE);
+        assert_eq!(frame_stats().0, used_before);
+    }
+
+    #[test]
+    fn a_contiguous_request_comes_back_contiguous_and_aligned() {
+        let _alone = alone_with_the_allocator();
+        let base = 0x60_0000;
+        insert_regions(&[base..base + 16 * PAGE]);
+        let addr = frame_alloc(4, 2).expect("four frames aligned to four");
+        assert_eq!(addr % (4 * PAGE), 0, "{addr:#x} is not 4-page aligned");
+        assert!((base..base + 16 * PAGE).contains(&addr));
+        for i in 0..4 {
+            frame_dealloc(addr + i * PAGE);
+        }
+    }
+
+    /// The managed total is the bytes that went INTO the allocator, not the
+    /// span of the descriptor they came from: reporting more than was inserted
+    /// is how `/proc/meminfo` ends up with free RAM nobody can allocate.
+    #[test]
+    fn only_the_whole_pages_of_a_region_are_counted_as_managed() {
+        let _alone = alone_with_the_allocator();
+        let total_before = frame_stats().1;
+        // Four pages of span, three whole pages inside it.
+        insert_regions(&[0x80_0800..0x80_4800]);
+        assert_eq!(frame_stats().1 - total_before, 3 * PAGE);
+    }
+
+    /// Inserting nothing is not an error, and it must not move the counters --
+    /// this is the path an all-reserved memory map takes.
+    #[test]
+    fn a_region_that_contributes_no_whole_page_is_not_counted() {
+        let _alone = alone_with_the_allocator();
+        let before = frame_stats();
+        insert_regions(&[0x7000_0001..0x7000_0fff, 0x8000..0x8000]);
+        assert_eq!(frame_stats(), before);
+    }
+
+    /// libos has no paging context, so this is the branch that must do nothing
+    /// rather than walk a page table that is not there.
+    #[test]
+    fn reserving_the_boot_page_tables_is_a_no_op_without_paging() {
+        let _alone = alone_with_the_allocator();
+        assert_eq!(
+            kernel_hal::vm::current_vmtoken(),
+            0,
+            "libos reports no page-table root; this test would walk a null tree"
+        );
+        reserve_active_page_table_frames();
     }
 }

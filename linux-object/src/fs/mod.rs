@@ -695,29 +695,49 @@ fn normalize_mount_target(path: &str) -> String {
 /// A relative path matches only the root mount, which is the answer it had
 /// before this existed; callers with a `cwd` should make it absolute first.
 pub fn path_is_nosuid(path: &str) -> bool {
+    mount_flag_at(path, |s| s.is_nosuid())
+}
+
+/// Whether `execve` must refuse an image at `path`: `path_noexec()`, which
+/// `do_open_execat()` answers `EACCES` for.
+pub fn path_is_noexec(path: &str) -> bool {
+    mount_flag_at(path, |s| s.is_noexec())
+}
+
+/// Whether `open` must refuse a device node at `path`: `may_open_dev()`, which
+/// `may_open()` answers `EACCES` for.
+pub fn path_is_nodev(path: &str) -> bool {
+    mount_flag_at(path, |s| s.is_nodev())
+}
+
+/// Ask one mount flag of the mount `path` is on.
+///
+/// One implementation for the three questions, because the part that can be
+/// wrong is not the flag -- it is working out which mount a path is on, and
+/// three copies of that would be three chances to get it wrong differently.
+fn mount_flag_at(path: &str, flag: impl Fn(&mount_state::MountState) -> bool) -> bool {
     let mounts = MOUNT_TABLE.lock();
-    nosuid_from(
+    mount_flag_from(
         path,
-        mounts
-            .iter()
-            .map(|m| (m.target.as_str(), m.state.is_nosuid())),
+        mounts.iter().map(|m| (m.target.as_str(), flag(&m.state))),
     )
 }
 
-/// The rule behind [`path_is_nosuid`], over the mount points it is given
-/// rather than over the one live table -- so the part that can be wrong (which
-/// mount a path is on) can be tested without a test having to mount anything.
+/// The rule behind [`path_is_nosuid`] and its two neighbours, over the mount
+/// points it is given rather than over the one live table -- so the part that
+/// can be wrong (which mount a path is on) can be tested without a test having
+/// to mount anything.
 ///
 /// Longest match wins, which is what makes a mount inside another mount mean
 /// anything at all; and when two entries name the same mount point, the last
 /// registered one does, because that is the one whose filesystem a lookup
 /// reaches.
-fn nosuid_from<'a>(path: &str, mounts: impl Iterator<Item = (&'a str, bool)>) -> bool {
+fn mount_flag_from<'a>(path: &str, mounts: impl Iterator<Item = (&'a str, bool)>) -> bool {
     let path = normalize_mount_target(path);
     mounts
         .filter(|(target, _)| path_is_under(&path, target))
         .max_by_key(|(target, _)| target.len())
-        .is_some_and(|(_, nosuid)| nosuid)
+        .is_some_and(|(_, set)| set)
 }
 
 /// Whether `path` is `mount` itself or something inside it.
@@ -2511,7 +2531,7 @@ mod mount_lookup_tests {
     //! away on a `nosuid` mount and in the other takes it from a mount that
     //! never asked for the option.
     //!
-    //! All of it is checked through [`nosuid_from`], over mount points the
+    //! All of it is checked through [`mount_flag_from`], over mount points the
     //! test supplies, so nothing here touches the one live mount table -- a
     //! test that mounted something would leave it mounted for every test
     //! after it, and `--test-threads=1` is exactly the setting under which
@@ -2532,7 +2552,7 @@ mod mount_lookup_tests {
     ];
 
     fn nosuid(path: &str) -> bool {
-        nosuid_from(path, A_BOOT.iter().copied())
+        mount_flag_from(path, A_BOOT.iter().copied())
     }
 
     #[test]
@@ -2633,19 +2653,100 @@ mod mount_lookup_tests {
         assert!(!nosuid("/proc-backup/x"));
     }
 
+    /// The pseudo-filesystems as `create_root_fs` actually registers them,
+    /// option strings and all, so the table these tests reason over is the one
+    /// the kernel builds rather than a guess at it.
+    const AS_REGISTERED: &[(&str, &str)] = &[
+        ("/", "rw"),
+        ("/dev", "rw,nosuid"),
+        ("/dev/shm", "rw,nosuid,nodev"),
+        ("/tmp", "rw,nosuid,nodev"),
+        ("/run", "rw,nosuid,nodev"),
+        ("/proc", "rw,nosuid,nodev,noexec,relatime"),
+        ("/sys", "rw,nosuid,nodev,noexec,relatime"),
+    ];
+
+    fn asked(path: &str, flag: fn(&mount_state::MountState) -> bool) -> bool {
+        let states: Vec<(&str, bool)> = AS_REGISTERED
+            .iter()
+            .map(|(target, opts)| {
+                (
+                    *target,
+                    flag(&mount_state::MountState::from_options(0, opts)),
+                )
+            })
+            .collect();
+        mount_flag_from(path, states.iter().copied())
+    }
+
+    #[test]
+    /// What the boot table means once the two options reach something. Both
+    /// directions matter equally: refusing where nothing asked for a refusal
+    /// breaks the desktop, and allowing where the line promised otherwise is
+    /// the bug.
+    fn the_boot_table_refuses_exactly_where_it_says_it_does() {
+        let noexec = |p: &str| asked(p, |s| s.is_noexec());
+        let nodev = |p: &str| asked(p, |s| s.is_nodev());
+
+        // `noexec`: the two pseudo-filesystems that say so, and nowhere else.
+        assert!(noexec("/proc/1/mem"));
+        assert!(noexec("/sys/kernel/whatever"));
+        assert!(!noexec("/bin/sh"), "the root filesystem is not noexec");
+        // The pair that makes busybox work. `/proc/self/exe` is under a
+        // `noexec` mount and would be refused if `execve` asked about the name
+        // the caller wrote -- which is why it canonicalises the magic link to
+        // the real binary FIRST, and the real binary is on the root.
+        assert!(
+            noexec("/proc/self/exe"),
+            "the name itself is on a noexec mount"
+        );
+        assert!(
+            !noexec("/bin/busybox"),
+            "the path the magic link canonicalises to must stay executable"
+        );
+        assert!(!noexec("/tmp/script.sh"), "/tmp is not registered noexec");
+        assert!(!noexec("/usr/lib/libc.so"));
+
+        // `nodev`: the three tmpfs mounts, and NOT `/dev`.
+        assert!(nodev("/tmp/fakedisk"));
+        assert!(nodev("/run/x"));
+        assert!(nodev("/dev/shm/x"));
+        assert!(!nodev("/dev/null"), "/dev is where the nodes live");
+        assert!(!nodev("/dev/sda"));
+        // `/dev/pts` is a plain directory, not a mount, so a pty slave answers
+        // to `/dev`. If this ever came back `true`, every terminal on the
+        // machine would stop opening -- which is the whole reason it is pinned
+        // here rather than left to be noticed on hardware.
+        assert!(!nodev("/dev/pts/0"), "pty slaves must still open");
+        assert!(!nodev("/dev/ptmx"));
+    }
+
+    #[test]
+    /// `/dev/shm` is inside `/dev`, and the two disagree about `nodev`. That is
+    /// the longest-match rule doing the only job it has, on the one pair of
+    /// real mounts where getting it wrong is the difference between a working
+    /// `/dev` and none.
+    fn dev_shm_is_nodev_without_making_dev_nodev() {
+        let nodev = |p: &str| asked(p, |s| s.is_nodev());
+        assert!(nodev("/dev/shm/sem.foo"));
+        assert!(!nodev("/dev/tty0"));
+        // And the boundary: a name that merely starts with `/dev/shm`.
+        assert!(!nodev("/dev/shmfoo"), "a prefix is not a mount point");
+    }
+
     #[test]
     fn the_longest_mount_point_wins() {
         // Both directions, because a rule that took the first match would be
         // right about half of these by luck.
         let mounts = &[("/", false), ("/mnt", true), ("/mnt/usb", false)];
-        assert!(nosuid_from("/mnt/x", mounts.iter().copied()));
+        assert!(mount_flag_from("/mnt/x", mounts.iter().copied()));
         assert!(
-            !nosuid_from("/mnt/usb/x", mounts.iter().copied()),
+            !mount_flag_from("/mnt/usb/x", mounts.iter().copied()),
             "a mount inside a nosuid mount answers for itself"
         );
         let inverted = &[("/", false), ("/mnt", false), ("/mnt/usb", true)];
-        assert!(!nosuid_from("/mnt/x", inverted.iter().copied()));
-        assert!(nosuid_from("/mnt/usb/x", inverted.iter().copied()));
+        assert!(!mount_flag_from("/mnt/x", inverted.iter().copied()));
+        assert!(mount_flag_from("/mnt/usb/x", inverted.iter().copied()));
     }
 
     #[test]
@@ -2654,9 +2755,9 @@ mod mount_lookup_tests {
         // the same target; a lookup reaches the newer filesystem, so the
         // newer entry is the one whose options apply.
         let stacked = &[("/", false), ("/mnt", false), ("/mnt", true)];
-        assert!(nosuid_from("/mnt/x", stacked.iter().copied()));
+        assert!(mount_flag_from("/mnt/x", stacked.iter().copied()));
         let unstacked = &[("/", false), ("/mnt", true), ("/mnt", false)];
-        assert!(!nosuid_from("/mnt/x", unstacked.iter().copied()));
+        assert!(!mount_flag_from("/mnt/x", unstacked.iter().copied()));
     }
 
     #[test]
@@ -2664,15 +2765,15 @@ mod mount_lookup_tests {
         // With no root entry there is nothing to be under. Fail open, which
         // is what the tree did before any of this existed -- the option is a
         // restriction, and inventing one nobody asked for is its own bug.
-        assert!(!nosuid_from("/bin/sh", core::iter::empty()));
-        assert!(!nosuid_from("relative/path", A_BOOT.iter().copied()));
+        assert!(!mount_flag_from("/bin/sh", core::iter::empty()));
+        assert!(!mount_flag_from("relative/path", A_BOOT.iter().copied()));
     }
 
     #[test]
     fn the_root_mount_covers_a_path_that_matches_nothing_else() {
         let ro_root = &[("/", true), ("/tmp", false)];
-        assert!(nosuid_from("/bin/sh", ro_root.iter().copied()));
-        assert!(!nosuid_from("/tmp/x", ro_root.iter().copied()));
+        assert!(mount_flag_from("/bin/sh", ro_root.iter().copied()));
+        assert!(!mount_flag_from("/tmp/x", ro_root.iter().copied()));
     }
 
     #[test]
