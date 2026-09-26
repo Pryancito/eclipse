@@ -183,8 +183,10 @@ impl BsdDirentWriter {
 
     /// Try to append one directory entry. Returns `false` (and appends
     /// nothing) when the record would not fit in the remaining budget — the
-    /// caller stops and reports what was written so far.
-    pub fn try_push(&mut self, ino: u64, dtype: u8, name: &str) -> bool {
+    /// caller stops and reports what was written so far. `off` is the entry's
+    /// `d_off`: the directory position that follows it, where an `lseek`
+    /// resumes.
+    pub fn try_push(&mut self, ino: u64, off: u64, dtype: u8, name: &str) -> bool {
         let namlen = name.len();
         let reclen = dirsiz(namlen);
         if self.buf.len() + reclen > self.cap {
@@ -192,7 +194,7 @@ impl BsdDirentWriter {
         }
         let start = self.buf.len();
         self.buf.extend_from_slice(&ino.to_le_bytes()); // d_fileno
-        self.buf.extend_from_slice(&0u64.to_le_bytes()); // d_off (unused here)
+        self.buf.extend_from_slice(&off.to_le_bytes()); // d_off
         self.buf.extend_from_slice(&(reclen as u16).to_le_bytes()); // d_reclen
         self.buf.push(dtype); // d_type
         self.buf.push(0); // d_pad0
@@ -255,16 +257,19 @@ mod tests {
     #[test]
     fn writer_respects_budget_and_lays_out_fields() {
         let mut w = BsdDirentWriter::new(64);
-        assert!(w.try_push(0x1122, c::DT_REG, "hi"));
+        assert!(w.try_push(0x1122, 1, c::DT_REG, "hi"));
         // "hi" -> reclen 32; a second 32-byte record still fits in 64.
-        assert!(w.try_push(0x3344, c::DT_DIR, "yo"));
+        assert!(w.try_push(0x3344, 2, c::DT_DIR, "yo"));
         // Third would overflow 64 bytes.
-        assert!(!w.try_push(0x5566, c::DT_REG, "no"));
+        assert!(!w.try_push(0x5566, 3, c::DT_REG, "no"));
         assert_eq!(w.len(), 64);
 
         let b = w.as_slice();
         // First record: d_fileno little-endian.
         assert_eq!(u64::from_le_bytes(b[0..8].try_into().unwrap()), 0x1122);
+        // d_off at offset 8: the position that follows the entry.
+        assert_eq!(u64::from_le_bytes(b[8..16].try_into().unwrap()), 1);
+        assert_eq!(u64::from_le_bytes(b[40..48].try_into().unwrap()), 2);
         // d_reclen at offset 16.
         assert_eq!(u16::from_le_bytes(b[16..18].try_into().unwrap()), 32);
         // d_type at offset 18.

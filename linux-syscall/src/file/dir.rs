@@ -171,8 +171,13 @@ impl Syscall<'_> {
         let mut kbuf = vec![0; cap_size];
         let mut writer = DirentBufWriter::new(&mut kbuf);
         let mut file = file;
-        collect_dirents(&mut file, |meta, name| {
-            writer.try_write(meta.inode as u64, DirentType::from(meta.type_).bits(), name)
+        collect_dirents(&mut file, |next, meta, name| {
+            writer.try_write(
+                meta.inode as u64,
+                next,
+                DirentType::from(meta.type_).bits(),
+                name,
+            )
         })?;
         buf.write_array(writer.as_slice())?;
         Ok(writer.written_size)
@@ -445,6 +450,9 @@ pub(crate) trait DirEntries {
     fn next_entry(&mut self) -> LxResult<Option<(Metadata, String)>>;
     /// Hand back the entry `next_entry` just returned.
     fn unread_entry(&mut self);
+    /// The position an `lseek` takes to resume right after the entry
+    /// `next_entry` just returned: the entry's `d_off`.
+    fn position(&self) -> u64;
 }
 
 impl DirEntries for Arc<File> {
@@ -459,11 +467,17 @@ impl DirEntries for Arc<File> {
     fn unread_entry(&mut self) {
         File::unread_entry(self);
     }
+
+    fn position(&self) -> u64 {
+        self.dir_position()
+    }
 }
 
 /// Feed directory entries to `push` until it refuses one or the directory
-/// ends. `push` returns whether the entry fitted; the one it refuses is
-/// handed back to `src`, so the next call starts with it.
+/// ends. `push` gets the position that follows the entry (its `d_off`: what
+/// `lseek` takes to resume after it, and what glibc's `telldir` reports),
+/// and returns whether the entry fitted; the one it refuses is handed back
+/// to `src`, so the next call starts with it.
 ///
 /// Returns how many entries were pushed. Refusing the very first one is
 /// `EINVAL`, as Linux answers a buffer too small to hold a single record
@@ -471,11 +485,11 @@ impl DirEntries for Arc<File> {
 /// would otherwise take an empty answer for the end of the directory.
 pub(crate) fn collect_dirents(
     src: &mut impl DirEntries,
-    mut push: impl FnMut(&Metadata, &str) -> bool,
+    mut push: impl FnMut(u64, &Metadata, &str) -> bool,
 ) -> LxResult<usize> {
     let mut pushed = 0;
     while let Some((meta, name)) = src.next_entry()? {
-        if !push(&meta, &name) {
+        if !push(src.position(), &meta, &name) {
             src.unread_entry();
             if pushed == 0 {
                 return Err(LxError::EINVAL);
@@ -491,6 +505,7 @@ pub(crate) fn collect_dirents(
 mod dirent_collection_tests {
     use super::*;
     use alloc::vec::Vec;
+    use core::convert::TryInto;
     use linux_object::fs::vfs::Timespec;
 
     /// A directory that hands out the names it was given, once each, and
@@ -532,12 +547,16 @@ mod dirent_collection_tests {
         fn unread_entry(&mut self) {
             self.pos -= 1;
         }
+
+        fn position(&self) -> u64 {
+            self.pos as u64
+        }
     }
 
     /// Collect with room for `room` entries per call.
     fn call(src: &mut Names, room: usize) -> LxResult<Vec<String>> {
         let mut got = Vec::new();
-        collect_dirents(src, |_, name| {
+        collect_dirents(src, |_, _, name| {
             if got.len() == room {
                 return false;
             }
@@ -568,13 +587,45 @@ mod dirent_collection_tests {
             pos: 0,
         };
         let mut seen = 0;
-        let n = collect_dirents(&mut dir, |_, _| {
+        let n = collect_dirents(&mut dir, |_, _, _| {
             seen += 1;
             seen <= 2
         })
         .unwrap();
         assert_eq!(n, 2);
         assert_eq!(dir.pos, 2, "the refused entry is back in the directory");
+    }
+
+    /// `d_off` is where `lseek` resumes after the entry, so it is the
+    /// position *after* it, and it climbs with the listing. It was 0 for
+    /// every entry, which made `seekdir(telldir())` a `rewinddir`.
+    #[test]
+    fn each_entry_carries_the_position_that_follows_it() {
+        let mut dir = Names {
+            names: vec!["a", "b", "c"],
+            pos: 0,
+        };
+        let mut offs = Vec::new();
+        collect_dirents(&mut dir, |next, _, _| {
+            offs.push(next);
+            true
+        })
+        .unwrap();
+        assert_eq!(offs, [1, 2, 3]);
+        // Read back from where the second entry said to resume: the third.
+        dir.pos = offs[1] as usize;
+        assert_eq!(call(&mut dir, 8).unwrap(), ["c"]);
+    }
+
+    #[test]
+    fn the_writer_puts_the_offset_it_was_given_in_d_off() {
+        let mut buf = [0u8; 64];
+        let mut w = DirentBufWriter::new(&mut buf);
+        assert!(w.try_write(7, 0x1234, DirentType::REG.bits(), "hi"));
+        let b = w.as_slice();
+        assert_eq!(u64::from_le_bytes(b[0..8].try_into().unwrap()), 7);
+        // `d_off` is the second field of `linux_dirent64`.
+        assert_eq!(u64::from_le_bytes(b[8..16].try_into().unwrap()), 0x1234);
     }
 
     #[test]
@@ -596,8 +647,14 @@ mod dirent_collection_tests {
                 Err(LxError::EIO)
             }
             fn unread_entry(&mut self) {}
+            fn position(&self) -> u64 {
+                0
+            }
         }
-        assert_eq!(collect_dirents(&mut Broken, |_, _| true), Err(LxError::EIO));
+        assert_eq!(
+            collect_dirents(&mut Broken, |_, _, _| true),
+            Err(LxError::EIO)
+        );
     }
 }
 
@@ -633,8 +690,9 @@ impl<'a> DirentBufWriter<'a> {
         }
     }
 
-    /// write data
-    fn try_write(&mut self, inode: u64, type_: u8, name: &str) -> bool {
+    /// write data; `offset` is the entry's `d_off`, the directory position
+    /// that follows it.
+    fn try_write(&mut self, inode: u64, offset: u64, type_: u8, name: &str) -> bool {
         let len = core::mem::size_of::<LinuxDirent64>() + name.len() + 1;
         let len = len.div_ceil(8) * 8; // align up
         if self.rest_size < len {
@@ -642,7 +700,7 @@ impl<'a> DirentBufWriter<'a> {
         }
         let dent = LinuxDirent64 {
             ino: inode,
-            offset: 0,
+            offset,
             reclen: len as u16,
             type_,
             name: [],

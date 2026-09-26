@@ -754,6 +754,20 @@ impl File {
         inner.offset = inner.offset.saturating_sub(1);
     }
 
+    /// The directory position after the entry
+    /// [`read_entry_with_metadata`](Self::read_entry_with_metadata) just
+    /// returned: what `lseek(fd, pos, SEEK_SET)` takes to resume right after
+    /// it, and therefore what `getdents64` has to report as that entry's
+    /// `d_off`.
+    ///
+    /// It was reported as 0 for every entry. glibc's `telldir` is the `d_off`
+    /// of the last entry `readdir` handed out, and `seekdir` is an `lseek` to
+    /// it, so `seekdir(dir, telldir(dir))`, the way a program marks a place
+    /// in a listing and comes back to it, rewound to the start instead.
+    pub fn dir_position(&self) -> u64 {
+        self.inner.read().offset
+    }
+
     /// get the next directory entry and its metadata
     pub fn read_entry_with_metadata(&self) -> LxResult<(Metadata, String)> {
         let mut inner = self.inner.write();
@@ -1247,6 +1261,30 @@ mod seek_tests {
         }
         assert_eq!(rest.len() + 2, 5, "\".\", \"..\", a, b and c: {:?}", rest);
         assert!(!rest.contains(&first) && !rest.contains(&second));
+    }
+
+    #[test]
+    fn the_directory_position_is_where_a_seek_resumes() {
+        let d = dir(&["a", "b", "c"]);
+        let first = d.read_entry().unwrap();
+        let second = d.read_entry().unwrap();
+        let after_second = d.dir_position();
+        let third = d.read_entry().unwrap();
+        assert_ne!(
+            after_second, 0,
+            "the position after an entry is never the start"
+        );
+        // Seeking to the position reported after the second entry lands on
+        // the third, which is the contract `d_off` and `seekdir` rest on.
+        File::seek(&d, SeekFrom::Start(after_second)).unwrap();
+        assert_eq!(d.read_entry().unwrap(), third);
+        // And the positions climb with the entries.
+        File::seek(&d, SeekFrom::Start(0)).unwrap();
+        assert_eq!(d.read_entry().unwrap(), first);
+        let after_first = d.dir_position();
+        assert!(after_first < after_second);
+        File::seek(&d, SeekFrom::Start(after_first)).unwrap();
+        assert_eq!(d.read_entry().unwrap(), second);
     }
 
     #[test]

@@ -408,8 +408,8 @@ impl Syscall<'_> {
         // The entry that does not fit goes back to the directory position
         // instead of being lost; see `collect_dirents`.
         let mut file = file;
-        let collected = crate::file::collect_dirents(&mut file, |meta, name| {
-            writer.try_push(meta.inode as u64, fs::dirent_type(meta.type_), name)
+        let collected = crate::file::collect_dirents(&mut file, |next, meta, name| {
+            writer.try_push(meta.inode as u64, next, fs::dirent_type(meta.type_), name)
         });
         if let Err(e) = collected {
             return BsdRet::err(errno::lx_to_freebsd(e));
