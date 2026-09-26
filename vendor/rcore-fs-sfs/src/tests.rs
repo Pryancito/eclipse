@@ -234,9 +234,12 @@ fn test_symlinks() -> Result<()> {
         Arc::ptr_eq(&root.lookup_follow("link2", 0)?, &link2),
         "failed to find link2 by link2"
     );
-    assert!(
-        Arc::ptr_eq(&root.lookup_follow("link2", 1)?, &link1),
-        "failed to find link1 by link2"
+    // Running out of budget on the way is ELOOP, as on Linux, not the link
+    // where the walk stopped: a loop used to come back as a file.
+    assert_eq!(
+        root.lookup_follow("link2", 1).err(),
+        Some(FsError::SymLoop),
+        "link2 with one hop left stops at link1, which is a symlink"
     );
     assert!(
         Arc::ptr_eq(&root.lookup_follow("link2", 2)?, &file1),
@@ -254,14 +257,8 @@ fn test_symlinks() -> Result<()> {
         Arc::ptr_eq(&root.lookup_follow("link3", 0)?, &link3),
         "failed to find link3 by link3"
     );
-    assert!(
-        Arc::ptr_eq(&root.lookup_follow("link3", 1)?, &link2),
-        "failed to find link2 by link3"
-    );
-    assert!(
-        Arc::ptr_eq(&root.lookup_follow("link3", 2)?, &link1),
-        "failed to find link1 by link3"
-    );
+    assert_eq!(root.lookup_follow("link3", 1).err(), Some(FsError::SymLoop));
+    assert_eq!(root.lookup_follow("link3", 2).err(), Some(FsError::SymLoop));
     assert!(
         Arc::ptr_eq(&root.lookup_follow("link3", 3)?, &file1),
         "failed to find file1 by link2"

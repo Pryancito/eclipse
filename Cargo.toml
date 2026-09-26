@@ -17,6 +17,9 @@ members = [
     # rcore-fs-sfs`); the `[patch]` below is what makes the rest of the tree
     # use this copy.
     "vendor/rcore-fs-sfs",
+    # Same reason: the path walk of every file system (`INode::lookup_follow`)
+    # lives here and nothing else compiled it as a test target.
+    "vendor/rcore-fs",
     "hunter",
 ]
 default-members = ["xtask"]

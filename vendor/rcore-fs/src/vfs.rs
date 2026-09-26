@@ -151,52 +151,85 @@ impl dyn INode {
     }
 
     /// Lookup path from current INode, and follow symlinks at most `follow_times` times
+    ///
+    /// With `follow_times == 0` no symlink is followed: one met as the last
+    /// component is returned as it is (`lstat`, `readlink`), one met on the
+    /// way is `NotDir`. With a budget, running out of it is `SymLoop`, as
+    /// `ELOOP` on Linux, never the symlink itself: a link that points at
+    /// itself used to come back as an ordinary file whose contents were its
+    /// own name.
     pub fn lookup_follow(&self, path: &str, follow_times: usize) -> Result<Arc<dyn INode>> {
-        if self.metadata()?.type_ != FileType::Dir {
+        lookup_with_budget(self, path, follow_times, follow_times > 0)
+    }
+}
+
+/// The longest symlink target `lookup_follow` resolves: Linux's `PATH_MAX`.
+/// A longer one is `NameTooLong`. It used to be read into 256 bytes and cut
+/// there without a word, so a long target resolved to whatever its first 256
+/// bytes named.
+pub const SYMLINK_MAX: usize = 4096;
+
+/// What a symlink points at, whole.
+fn read_symlink(inode: &dyn INode) -> Result<String> {
+    let mut content = alloc::vec![0u8; SYMLINK_MAX + 1];
+    let len = inode.read_at(0, &mut content)?;
+    if len > SYMLINK_MAX {
+        return Err(FsError::NameTooLong);
+    }
+    content.truncate(len);
+    String::from_utf8(content).map_err(|_| FsError::NotDir)
+}
+
+fn lookup_with_budget(
+    start: &dyn INode,
+    path: &str,
+    follow_times: usize,
+    following: bool,
+) -> Result<Arc<dyn INode>> {
+    if start.metadata()?.type_ != FileType::Dir {
+        return Err(FsError::NotDir);
+    }
+
+    // handle absolute path
+    let (mut result, mut rest_path) = if let Some(rest) = path.strip_prefix('/') {
+        (start.fs().root_inode(), String::from(rest))
+    } else {
+        (start.find(".")?, String::from(path))
+    };
+
+    while !rest_path.is_empty() {
+        if result.metadata()?.type_ != FileType::Dir {
             return Err(FsError::NotDir);
         }
-
-        // handle absolute path
-        let (mut result, mut rest_path) = if let Some(rest) = path.strip_prefix('/') {
-            (self.fs().root_inode(), String::from(rest))
-        } else {
-            (self.find(".")?, String::from(path))
+        let name;
+        match rest_path.find('/') {
+            None => {
+                name = rest_path;
+                rest_path = String::new();
+            }
+            Some(pos) => {
+                name = String::from(&rest_path[0..pos]);
+                rest_path = String::from(&rest_path[pos + 1..]);
+            }
         };
-
-        while !rest_path.is_empty() {
-            if result.metadata()?.type_ != FileType::Dir {
-                return Err(FsError::NotDir);
-            }
-            let name;
-            match rest_path.find('/') {
-                None => {
-                    name = rest_path;
-                    rest_path = String::new();
-                }
-                Some(pos) => {
-                    name = String::from(&rest_path[0..pos]);
-                    rest_path = String::from(&rest_path[pos + 1..]);
-                }
-            };
-            if name.is_empty() {
-                continue;
-            }
-            let inode = result.find(&name)?;
-            // Handle symlink
-            if inode.metadata()?.type_ == FileType::SymLink && follow_times > 0 {
-                let mut content = [0u8; 256];
-                let len = inode.read_at(0, &mut content)?;
-                let link_path =
-                    String::from(str::from_utf8(&content[..len]).map_err(|_| FsError::NotDir)?);
-                // result remains unchanged
-                let new_path = link_path + "/" + &rest_path;
-                return result.lookup_follow(&new_path, follow_times - 1);
-            } else {
-                result = inode
-            }
+        if name.is_empty() {
+            continue;
         }
-        Ok(result)
+        let inode = result.find(&name)?;
+        // Handle symlink
+        if inode.metadata()?.type_ == FileType::SymLink && following {
+            if follow_times == 0 {
+                return Err(FsError::SymLoop);
+            }
+            let link_path = read_symlink(&*inode)?;
+            // result remains unchanged
+            let new_path = link_path + "/" + &rest_path;
+            return lookup_with_budget(&*result, &new_path, follow_times - 1, following);
+        } else {
+            result = inode
+        }
     }
+    Ok(result)
 }
 
 pub enum IOCTLError {
@@ -335,6 +368,7 @@ pub enum FsError {
     Again,          // E_AGAIN, when no data is available, never happens in fs
     TimedOut,       // E_TIME (62), a wait reached its deadline -- e.g. DRM_IOCTL_SYNCOBJ_WAIT
     SymLoop,        // E_LOOP
+    NameTooLong,    // E_NAMETOOLONG, e.g. a symlink target past `SYMLINK_MAX`
     Busy,           // E_BUSY
     ReadOnly,       // E_ROFS
     Interrupted,    // E_INTR
@@ -444,4 +478,212 @@ impl INode for NoINode {
 
 pub fn make_rdev(major: usize, minor: usize) -> usize {
     ((major & 0xfff) << 8) | (minor & 0xff)
+}
+
+#[cfg(test)]
+mod lookup_tests {
+    use super::*;
+    use alloc::collections::BTreeMap;
+    use alloc::sync::Weak;
+    use spin::Mutex;
+
+    /// The smallest tree `lookup_follow` can walk: directories with
+    /// children, files, and symlinks whose contents are their target.
+    struct Node {
+        type_: FileType,
+        content: Vec<u8>,
+        children: Mutex<BTreeMap<String, Arc<Node>>>,
+        parent: Mutex<Weak<Node>>,
+        this: Mutex<Weak<Node>>,
+        fs: Mutex<Weak<Tree>>,
+    }
+
+    struct Tree {
+        root: Arc<Node>,
+    }
+
+    fn node(type_: FileType, content: &[u8]) -> Arc<Node> {
+        let node = Arc::new(Node {
+            type_,
+            content: content.to_vec(),
+            children: Mutex::new(BTreeMap::new()),
+            parent: Mutex::new(Weak::new()),
+            this: Mutex::new(Weak::new()),
+            fs: Mutex::new(Weak::new()),
+        });
+        *node.this.lock() = Arc::downgrade(&node);
+        node
+    }
+
+    fn tree() -> Arc<Tree> {
+        let tree = Arc::new(Tree {
+            root: node(FileType::Dir, b""),
+        });
+        *tree.root.fs.lock() = Arc::downgrade(&tree);
+        *tree.root.parent.lock() = Arc::downgrade(&tree.root);
+        tree
+    }
+
+    impl Node {
+        fn add(self: &Arc<Self>, name: &str, child: Arc<Node>) -> Arc<Node> {
+            *child.parent.lock() = Arc::downgrade(self);
+            *child.fs.lock() = self.fs.lock().clone();
+            self.children
+                .lock()
+                .insert(String::from(name), child.clone());
+            child
+        }
+        fn dir(self: &Arc<Self>, name: &str) -> Arc<Node> {
+            self.add(name, node(FileType::Dir, b""))
+        }
+        fn file(self: &Arc<Self>, name: &str, content: &[u8]) -> Arc<Node> {
+            self.add(name, node(FileType::File, content))
+        }
+        fn link(self: &Arc<Self>, name: &str, target: &str) -> Arc<Node> {
+            self.add(name, node(FileType::SymLink, target.as_bytes()))
+        }
+    }
+
+    impl FileSystem for Tree {
+        fn sync(&self) -> Result<()> {
+            Ok(())
+        }
+        fn root_inode(&self) -> Arc<dyn INode> {
+            self.root.clone()
+        }
+        fn info(&self) -> FsInfo {
+            no_fs().info()
+        }
+    }
+
+    impl INode for Node {
+        fn read_at(&self, offset: usize, buf: &mut [u8]) -> Result<usize> {
+            if self.type_ == FileType::Dir {
+                return Err(FsError::IsDir);
+            }
+            let start = offset.min(self.content.len());
+            let n = buf.len().min(self.content.len() - start);
+            buf[..n].copy_from_slice(&self.content[start..start + n]);
+            Ok(n)
+        }
+        fn write_at(&self, _offset: usize, _buf: &[u8]) -> Result<usize> {
+            Err(FsError::NotSupported)
+        }
+        fn poll(&self) -> Result<PollStatus> {
+            Ok(PollStatus::default())
+        }
+        fn metadata(&self) -> Result<Metadata> {
+            Ok(Metadata {
+                dev: 0,
+                inode: self as *const Node as usize,
+                size: self.content.len(),
+                blk_size: 0,
+                blocks: 0,
+                atime: Timespec { sec: 0, nsec: 0 },
+                mtime: Timespec { sec: 0, nsec: 0 },
+                ctime: Timespec { sec: 0, nsec: 0 },
+                type_: self.type_,
+                mode: 0o777,
+                nlinks: 1,
+                uid: 0,
+                gid: 0,
+                rdev: 0,
+            })
+        }
+        fn find(&self, name: &str) -> Result<Arc<dyn INode>> {
+            if self.type_ != FileType::Dir {
+                return Err(FsError::NotDir);
+            }
+            let found: Arc<Node> = match name {
+                "." => self.this.lock().upgrade().unwrap(),
+                ".." => self.parent.lock().upgrade().unwrap(),
+                _ => self
+                    .children
+                    .lock()
+                    .get(name)
+                    .cloned()
+                    .ok_or(FsError::EntryNotFound)?,
+            };
+            Ok(found)
+        }
+        fn fs(&self) -> Arc<dyn FileSystem> {
+            self.fs.lock().upgrade().unwrap()
+        }
+        fn as_any_ref(&self) -> &dyn Any {
+            self
+        }
+    }
+
+    fn same(a: &Arc<dyn INode>, b: &Arc<Node>) -> bool {
+        a.metadata().unwrap().inode == b.metadata().unwrap().inode
+    }
+
+    #[test]
+    fn a_symlink_target_longer_than_256_bytes_is_followed_whole() {
+        let tree = tree();
+        let root = &tree.root;
+        // A directory name of 300 bytes: the first 256 of the target name a
+        // directory that does not exist.
+        let long = "d".repeat(300);
+        let file = root.dir(&long).file("file", b"hello");
+        let target = long.clone() + "/file";
+        root.link("link", &target);
+        root.dir("etc").file("hosts", b"");
+        root.link("abs", &("/".to_string() + &target));
+
+        let hit = (&**root as &dyn INode).lookup_follow("link", 4).unwrap();
+        assert!(
+            same(&hit, &file),
+            "the target is read whole, not cut at 256"
+        );
+        let hit = (&**root as &dyn INode).lookup_follow("abs", 4).unwrap();
+        assert!(same(&hit, &file), "an absolute target too");
+
+        // Exactly SYMLINK_MAX bytes is still a name; one more is not.
+        let edge = "e".repeat(SYMLINK_MAX - "/file".len());
+        let edge_file = root.dir(&edge).file("file", b"");
+        root.link("edge", &(edge.clone() + "/file"));
+        let hit = (&**root as &dyn INode).lookup_follow("edge", 4).unwrap();
+        assert!(same(&hit, &edge_file));
+        root.link("past", &("x".repeat(SYMLINK_MAX + 1)));
+        assert_eq!(
+            (&**root as &dyn INode).lookup_follow("past", 4).err(),
+            Some(FsError::NameTooLong)
+        );
+    }
+
+    #[test]
+    fn a_symlink_loop_is_eloop_and_not_the_link_itself() {
+        let tree = tree();
+        let root = &tree.root;
+        root.link("self", "self");
+        root.link("a", "b");
+        root.link("b", "a");
+        let inode = &**root as &dyn INode;
+        assert_eq!(
+            inode.lookup_follow("self", 40).err(),
+            Some(FsError::SymLoop),
+            "a link to itself used to come back as a file"
+        );
+        assert_eq!(inode.lookup_follow("a", 40).err(), Some(FsError::SymLoop));
+        assert_eq!(
+            inode.lookup_follow("self/x", 40).err(),
+            Some(FsError::SymLoop),
+            "on the way as well"
+        );
+
+        // A chain that fits the budget resolves; one hop too many does not.
+        let file = root.file("file", b"");
+        root.link("l1", "file");
+        root.link("l2", "l1");
+        root.link("l3", "l2");
+        assert!(same(&inode.lookup_follow("l3", 3).unwrap(), &file));
+        assert_eq!(inode.lookup_follow("l3", 2).err(), Some(FsError::SymLoop));
+
+        // Without a budget the symlink is what `lstat` and `readlink` want.
+        let link = root.children.lock()["self"].clone();
+        assert!(same(&inode.lookup("self").unwrap(), &link));
+        assert_eq!(inode.lookup("self/x").err(), Some(FsError::NotDir));
+        assert_eq!(inode.lookup("l3/x").err(), Some(FsError::NotDir));
+    }
 }

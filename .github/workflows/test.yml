@@ -91,6 +91,10 @@ jobs:
           # and `--features std` is what gives its tests a file-backed device
           # (without it the test target does not even compile).
           cargo test -p rcore-fs-sfs --features std
+          # The VFS trait under every file system: the path walk that follows
+          # symlinks (`INode::lookup_follow`). Reached only through `[patch]`
+          # too, so its tests had never run anywhere.
+          cargo test -p rcore-fs --features std
           # The loader -- the code around user mode: the signal frame a
           # handler returns from, the CPU-exception-to-signal table. Its
           # default features pull in `zircon`, whose `include_bytes!` of the
