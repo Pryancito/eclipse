@@ -205,6 +205,26 @@ impl Socket {
         Ok(actual_count)
     }
 
+    /// The buffer a read of `count` bytes needs, which is never more than the
+    /// socket can hold.
+    ///
+    /// A socket holds at most `SOCKET_SIZE` bytes and a datagram is bounded
+    /// by the same size, so bytes past it can never be filled. The syscall
+    /// layer sizes its buffer with this rather than with `count`, because
+    /// `count` arrives raw from userspace and `vec![0; count]` cannot fail:
+    /// without the bound a caller that maps a gigabyte of its own can ask the
+    /// kernel for a gigabyte too, and panic it.
+    ///
+    /// Clamping cannot change what a read returns, which is why it is a clamp
+    /// and not an error.
+    pub const fn read_buffer_len(count: usize) -> usize {
+        if count > SOCKET_SIZE {
+            SOCKET_SIZE
+        } else {
+            count
+        }
+    }
+
     /// Read data from the socket. If successful, the number of bytes actually read are returned.
     ///
     /// If the socket was created with **SOCKET_DATAGRAM**, this method reads
@@ -487,6 +507,41 @@ pub struct SocketInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The buffer the syscall layer allocates for a read is bounded by the
+    /// socket and not by what the caller asked for. The bug: `sys_socket_read`
+    /// sized it with `count` straight from userspace, an allocation that cannot
+    /// fail, so a caller with a large mapping of its own could ask the kernel
+    /// for that much and panic it.
+    #[test]
+    fn a_read_buffer_is_never_larger_than_the_socket_itself() {
+        assert_eq!(Socket::read_buffer_len(0), 0);
+        assert_eq!(Socket::read_buffer_len(1), 1);
+        assert_eq!(Socket::read_buffer_len(SOCKET_SIZE), SOCKET_SIZE);
+        for count in [SOCKET_SIZE + 1, 1 << 30, usize::MAX] {
+            assert_eq!(
+                Socket::read_buffer_len(count),
+                SOCKET_SIZE,
+                "a count of {:#x} was not bounded by the socket",
+                count
+            );
+        }
+    }
+
+    /// The clamp is sound only because a read can never hand back more than the
+    /// socket holds: a write of twice the capacity keeps exactly the capacity,
+    /// so nothing past it was ever there to read.
+    #[test]
+    fn the_socket_never_holds_more_than_the_clamp_allows() {
+        let (end0, end1) = Socket::create(0).unwrap();
+        assert_eq!(end0.write(&[7u8; SOCKET_SIZE * 2]).unwrap(), SOCKET_SIZE);
+        let mut buf = vec![0u8; Socket::read_buffer_len(usize::MAX)];
+        assert_eq!(end1.read(false, &mut buf).unwrap(), SOCKET_SIZE);
+        assert_eq!(
+            end1.read(false, &mut buf).unwrap_err(),
+            ZxError::SHOULD_WAIT
+        );
+    }
 
     #[test]
     fn test_basics() {

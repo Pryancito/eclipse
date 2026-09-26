@@ -134,6 +134,27 @@ impl Fifo {
         Ok(read_size / elem_size)
     }
 
+    /// The number of elements a `read` of `count` elements could ever return.
+    ///
+    /// A fifo holds at most `elem_count` elements, so a caller asking for more
+    /// is asking for bytes that cannot exist. The syscall layer sizes its
+    /// buffer with this rather than with `count`, because both `count` and
+    /// `elem_size` arrive raw from userspace and `vec![0; count * elem_size]`
+    /// cannot fail: without the bound it is a kernel panic a caller can ask
+    /// for, by naming a buffer of its own and a count to match.
+    ///
+    /// The mismatched `elem_size` is refused here and not only in [`read`],
+    /// because otherwise a single element of a gigabyte would be allocated
+    /// before `read` ever looked at it.
+    ///
+    /// [`read`]: Fifo::read
+    pub fn read_buffer_elems(&self, elem_size: usize, count: usize) -> ZxResult<usize> {
+        if elem_size != self.elem_size || count == 0 {
+            return Err(ZxError::OUT_OF_RANGE);
+        }
+        Ok(count.min(self.elem_count))
+    }
+
     /// Get capacity in bytes.
     fn capacity(&self) -> usize {
         self.elem_size * self.elem_count
@@ -166,6 +187,43 @@ mod tests {
         drop(end1);
         assert_eq!(end0.peer().unwrap_err(), ZxError::PEER_CLOSED);
         assert_eq!(end0.related_koid(), 0);
+    }
+
+    /// The buffer the syscall layer allocates for a read is bounded by the fifo
+    /// and not by what the caller asked for. The bug: `sys_fifo_read` sized it
+    /// with `count * elem_size` straight from userspace, an allocation that
+    /// cannot fail, so a caller with a large mapping of its own could ask the
+    /// kernel for that much and panic it.
+    #[test]
+    fn a_read_buffer_is_never_larger_than_the_fifo_itself() {
+        let (end0, _end1) = Fifo::create(10, 5);
+        assert_eq!(end0.read_buffer_elems(5, 1), Ok(1));
+        assert_eq!(end0.read_buffer_elems(5, 10), Ok(10));
+        for count in [11usize, 4096, 1 << 20, usize::MAX / 5] {
+            assert_eq!(
+                end0.read_buffer_elems(5, count),
+                Ok(10),
+                "a count of {:#x} was not bounded by the fifo",
+                count
+            );
+        }
+    }
+
+    /// An element size that is not the fifo's is refused before anything is
+    /// sized by it: one element of a gigabyte is the same panic as a billion
+    /// one-byte ones.
+    #[test]
+    fn a_read_buffer_of_the_wrong_element_size_is_refused_not_allocated() {
+        let (end0, _end1) = Fifo::create(10, 5);
+        for elem_size in [1usize, 4, 6, 1 << 30, usize::MAX] {
+            assert_eq!(
+                end0.read_buffer_elems(elem_size, 1),
+                Err(ZxError::OUT_OF_RANGE),
+                "an element size of {:#x} was accepted",
+                elem_size
+            );
+        }
+        assert_eq!(end0.read_buffer_elems(5, 0), Err(ZxError::OUT_OF_RANGE));
     }
 
     #[test]
