@@ -240,6 +240,85 @@ mod tests {
     }
 
     #[test]
+    /// A pin whose addresses will not fit what the caller has room for is no
+    /// pin at all. The bug lived in the syscall layer: `zx_bti_pin` pinned
+    /// first and counted after, so a caller that got `addrs_count` wrong
+    /// answered `INVALID_ARGS` with the pages still pinned and the token in the
+    /// initiator's list with no handle to it. The buffer could then never be
+    /// decommitted or resized, and the only way out needed a right on the
+    /// initiator that a caller holding `MAP` need not have.
+    fn a_pin_the_caller_has_no_room_for_leaves_nothing_pinned() {
+        let (vmo, bti) = pinned_page();
+        for asked in [0usize, 1, 3, 17] {
+            assert_eq!(
+                bti.pin_and_encode(
+                    vmo.clone(),
+                    0,
+                    2 * PAGE_SIZE,
+                    IommuPerms::PERM_READ,
+                    false,
+                    false,
+                    asked,
+                )
+                .err(),
+                Some(ZxError::INVALID_ARGS),
+                "room for {} addresses was accepted for a two-page pin",
+                asked
+            );
+            assert_eq!(
+                vmo.decommit(0, 2 * PAGE_SIZE),
+                Ok(()),
+                "the pages of a refused pin are still pinned"
+            );
+            vmo.commit(0, 2 * PAGE_SIZE).unwrap();
+        }
+        // The count the pin really needs is served, and then it holds.
+        let (pmt, addrs) = bti
+            .pin_and_encode(
+                vmo.clone(),
+                0,
+                2 * PAGE_SIZE,
+                IommuPerms::PERM_READ,
+                false,
+                false,
+                2,
+            )
+            .unwrap();
+        assert_eq!(addrs.len(), 2);
+        assert_eq!(vmo.decommit(0, PAGE_SIZE), Err(ZxError::BAD_STATE));
+        pmt.unpin();
+        drop(pmt);
+        vmo.decommit(0, 2 * PAGE_SIZE).unwrap();
+    }
+
+    #[test]
+    /// An encoding the options make impossible undoes its pin too: asking for
+    /// one contiguous address from a paged object is the caller's error, and
+    /// used to be the caller's error with the pages pinned.
+    fn an_encoding_the_options_forbid_leaves_nothing_pinned() {
+        let (vmo, bti) = pinned_page();
+        assert_eq!(
+            bti.pin_and_encode(
+                vmo.clone(),
+                0,
+                2 * PAGE_SIZE,
+                IommuPerms::PERM_READ,
+                false,
+                true,
+                1,
+            )
+            .err(),
+            Some(ZxError::INVALID_ARGS)
+        );
+        assert_eq!(
+            vmo.decommit(0, 2 * PAGE_SIZE),
+            Ok(()),
+            "the pages of a refused pin are still pinned"
+        );
+        vmo.set_len(PAGE_SIZE).unwrap();
+    }
+
+    #[test]
     /// Two tokens over the same page hold it until both are gone.
     fn a_page_stays_pinned_until_the_last_token_lets_go() {
         let (vmo, bti) = pinned_page();
