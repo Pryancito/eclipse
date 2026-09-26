@@ -257,10 +257,20 @@ impl INode for MiceDev {
         Ok(buf.len())
     }
 
+    /// Writable, which `write_at` above has been all along.
+    ///
+    /// This said `write: false` while the write right above it works and is the
+    /// whole point of the node: a client talks to it the way it would talk to a
+    /// mouse (set-sample-rate, get-device-id, reset, enable) and reads the
+    /// answers back. A client that waits for the device to be writable before
+    /// sending that conversation waits for ever, and what it concludes from
+    /// getting no answer is that there is nothing here but a plain three-byte
+    /// mouse -- which is the same wrong conclusion the discarded writes used to
+    /// produce, reached a different way. `poll` and `write_at` have to agree.
     fn poll(&self) -> Result<PollStatus> {
         Ok(PollStatus {
             read: self.can_read(),
-            write: false,
+            write: true,
             error: false,
             hangup: false,
         })
@@ -652,5 +662,60 @@ mod mice_tests {
         // Letting go does.
         d.handle_mouse_packet(&moved(0, 0, 0));
         assert_eq!(read(&mut d).unwrap()[0] & 0x07, 0);
+    }
+}
+
+#[cfg(test)]
+mod mice_poll_tests {
+    //! `poll` said the node was not writable while `write_at` right above it
+    //! works and is the whole point of the node.
+
+    use super::*;
+
+    /// A node with no mice behind it: enough for `poll`, which asks the inner
+    /// buffer and nothing else when there is no device to ask.
+    fn a_node() -> MiceDev {
+        MiceDev {
+            id: 0,
+            inode_id: 0,
+            mice: Vec::new(),
+            inner: Arc::new(Mutex::new(MiceDevInner {
+                mode: Ps2Mode::Ps2,
+                imps_seq: 0,
+                imex_seq: 0,
+                stage: [0; STAGE_LEN],
+                stage_len: 0,
+                stage_pos: 0,
+                last_buttons: MouseFlags::empty(),
+                buf: VecDeque::new(),
+            })),
+        }
+    }
+
+    #[test]
+    fn poll_says_writable_because_the_write_works() {
+        let node = a_node();
+        // The write it used to deny: this is the conversation a client has with
+        // the node before it decides what kind of mouse is there.
+        assert_eq!(node.write_at(0, &[0xf2]).unwrap(), 1);
+        assert!(
+            node.poll().unwrap().write,
+            "a client that waits for writability before talking waits for ever"
+        );
+    }
+
+    #[test]
+    fn the_answer_to_that_write_is_what_makes_it_readable() {
+        // And the two halves of `poll` stay independent: writability does not
+        // depend on there being something to read, and the read side still
+        // answers no until the write puts an answer in front of the reader.
+        let node = a_node();
+        assert!(!node.poll().unwrap().read, "nothing staged yet");
+        assert!(node.poll().unwrap().write);
+        node.write_at(0, &[0xf2]).unwrap();
+        assert!(
+            node.poll().unwrap().read,
+            "the device id is waiting to be read"
+        );
     }
 }

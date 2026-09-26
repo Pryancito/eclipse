@@ -1,9 +1,13 @@
 use alloc::sync::Arc;
 use core::any::Any;
+use kernel_hal::console::{self, ConsoleWinSize};
+use kernel_hal::user::{UserInPtr, UserOutPtr};
 use lock::Mutex;
 use rcore_fs::vfs::{make_rdev, FileType, FsError, INode, Metadata, PollStatus, Result, Timespec};
 use rcore_fs_devfs::DevFS;
 use zcore_drivers::{scheme::UartScheme, DeviceError};
+
+use crate::fs::ioctl::{Termios, TCFLSH, TCGETS, TCSETS, TCSETSF, TCSETSW, TIOCGWINSZ, TIOCSWINSZ};
 
 /// First minor of the serial range on major 4.
 ///
@@ -26,6 +30,12 @@ pub struct UartDev {
     port: Arc<dyn UartScheme>,
     /// Byte peeked by `poll` via consuming `try_recv`, held until `read_at`.
     pending: Mutex<Option<u8>>,
+    /// This line's terminal settings, its own: the kernel's console does not
+    /// go through these nodes (it writes via `console`), so nothing else reads
+    /// them and two serial ports do not share one `stty`.
+    termios: Mutex<Termios>,
+    /// `TIOCSWINSZ` from this line, or `None` to answer with the console's.
+    winsize: Mutex<Option<ConsoleWinSize>>,
     inode_id: usize,
 }
 
@@ -35,6 +45,8 @@ impl UartDev {
             index,
             port,
             pending: Mutex::new(None),
+            termios: Mutex::new(Termios::default_tty()),
+            winsize: Mutex::new(None),
             inode_id: DevFS::new_inode_id(),
         }
     }
@@ -151,15 +163,75 @@ impl INode for UartDev {
         })
     }
 
-    #[allow(unsafe_code)]
-    fn io_control(&self, _cmd: u32, _data: usize) -> Result<usize> {
-        warn!("uart ioctl unimplemented");
-        Err(FsError::NotSupported)
+    fn io_control(&self, cmd: u32, data: usize) -> Result<usize> {
+        match cmd as usize {
+            // `isatty(3)` is `tcgetattr(3)` is this, and nothing else: a line
+            // that answers it with `ENOSYS` is not a terminal as far as every
+            // program on the machine is concerned, however the kernel thinks
+            // of it. `File::is_terminal` lists `UartDev` by name -- so the two
+            // halves of the tree disagreed, and the half userspace can see was
+            // the wrong one. A shell on a serial line then runs as if its input
+            // were a file: no line editing, no colour, no job control.
+            TCGETS => {
+                copy(UserOutPtr::<Termios>::from(data).write(*self.termios.lock()))?;
+                Ok(0)
+            }
+            // A UART has no queue of its own to drain or discard, so the three
+            // forms differ only in what `TCSETSF` throws away: the byte `poll`
+            // peeked. Answering `ENOSYS` to these is what makes `stty` on a
+            // serial line fail, and with it every `getty` that sets the line up
+            // before handing it to `login`.
+            TCSETS | TCSETSW | TCSETSF => {
+                let t = copy(UserInPtr::<Termios>::from(data).read())?;
+                *self.termios.lock() = t;
+                if cmd as usize == TCSETSF {
+                    *self.pending.lock() = None;
+                }
+                Ok(0)
+            }
+            TCFLSH => {
+                // TCIFLUSH (0) and TCIOFLUSH (2) take the input side.
+                if data != 1 {
+                    *self.pending.lock() = None;
+                }
+                Ok(0)
+            }
+            TIOCGWINSZ => {
+                let ws = self
+                    .winsize
+                    .lock()
+                    .unwrap_or_else(console::console_win_size);
+                copy(UserOutPtr::<ConsoleWinSize>::from(data).write(ws))?;
+                Ok(0)
+            }
+            // The framebuffer-derived default is right for the screen and much
+            // too large for a serial viewer, which is why `resize` and `stty`
+            // send this. A 0x0 size gives the console's answer back.
+            TIOCSWINSZ => {
+                let ws = copy(UserInPtr::<ConsoleWinSize>::from(data).read())?;
+                *self.winsize.lock() = if ws.ws_row == 0 && ws.ws_col == 0 {
+                    None
+                } else {
+                    Some(ws)
+                };
+                Ok(0)
+            }
+            _ => {
+                warn!("uart ioctl {:#x} unimplemented", cmd);
+                Err(FsError::NotSupported)
+            }
+        }
     }
 
     fn as_any_ref(&self) -> &dyn Any {
         self
     }
+}
+
+/// A copy to or from userspace that failed is `EINVAL` here, as it is on the
+/// console's own nodes.
+fn copy<T>(r: core::result::Result<T, kernel_hal::user::Error>) -> Result<T> {
+    r.map_err(|_| FsError::InvalidParam)
 }
 
 fn convert_error(e: DeviceError) -> FsError {
@@ -313,6 +385,59 @@ mod uart_dev_tests {
         assert_eq!(d.write_at(0, b"hello").unwrap(), 5);
         assert_eq!(d.write_at(0, b"").unwrap(), 0);
         assert_eq!(&port.sent.lock()[..], b"hello");
+    }
+
+    #[test]
+    fn a_serial_line_answers_the_question_that_makes_it_a_terminal() {
+        // `isatty(3)` is `tcgetattr(3)` is `TCGETS`, and this answered `ENOSYS`
+        // to every ioctl while `File::is_terminal` listed `UartDev` by name.
+        // The half userspace can see was the wrong one.
+        let d = dev(FakePort::new(&[], false, 0), 0);
+        let mut t = Termios::default_tty();
+        t.c_lflag = 0;
+        assert_eq!(
+            d.io_control(TCGETS as u32, &mut t as *mut Termios as usize),
+            Ok(0)
+        );
+        assert_eq!(
+            t.c_lflag,
+            Termios::default_tty().c_lflag,
+            "a fresh line is a cooked terminal"
+        );
+        // And what `stty` sets is what the next `tcgetattr` reads back.
+        t.c_lflag = 0;
+        assert_eq!(
+            d.io_control(TCSETS as u32, &t as *const Termios as usize),
+            Ok(0)
+        );
+        let mut back = Termios::default_tty();
+        assert_eq!(
+            d.io_control(TCGETS as u32, &mut back as *mut Termios as usize),
+            Ok(0)
+        );
+        assert_eq!(back.c_lflag, 0, "raw, as it was set");
+    }
+
+    #[test]
+    fn flushing_the_input_side_drops_the_byte_poll_peeked() {
+        // The one thing a UART has to throw away: `poll` consumes a byte from
+        // the receive register to answer, and `TCIFLUSH` means the program does
+        // not want what was typed ahead -- a password prompt, usually.
+        let d = dev(FakePort::new(b"typed-ahead", false, 0), 0);
+        assert!(d.poll().unwrap().read);
+        assert_eq!(d.io_control(TCFLSH as u32, 0), Ok(0));
+        assert!(d.pending.lock().is_none(), "the peeked byte is gone");
+        // TCOFLUSH is the other side, and leaves the input alone.
+        let d = dev(FakePort::new(b"x", false, 0), 0);
+        assert!(d.poll().unwrap().read);
+        assert_eq!(d.io_control(TCFLSH as u32, 1), Ok(0));
+        assert!(d.pending.lock().is_some(), "output flush, not input");
+    }
+
+    #[test]
+    fn an_ioctl_this_line_does_not_know_is_still_refused() {
+        let d = dev(FakePort::new(&[], false, 0), 0);
+        assert_eq!(d.io_control(0x1234, 0), Err(FsError::NotSupported));
     }
 
     #[test]

@@ -39,8 +39,27 @@ impl ProcInitInfo {
         let needed = 16 + strings + table_entries * 8 + 32;
         let mut writer = Stack::new(stack_top, needed.max(0x4000));
 
-        // 1. Random bytes for AT_RANDOM (16 bytes)
-        let random_bytes = [0u8; 16]; // TODO: use real random
+        // 1. Random bytes for AT_RANDOM (16 bytes).
+        //
+        // These were sixteen zeros and a `// TODO: use real random`. They are
+        // not decoration: glibc's `_dl_setup_stack_chk_guard` and
+        // `_dl_setup_pointer_guard` read them straight through this pointer at
+        // start-up and that IS the process's **stack canary** and **pointer
+        // guard** (musl's `__init_tls` does the same). Sixteen zeros make both
+        // a compile-time constant, the same in every process and on every
+        // boot: a stack overflow that reaches the canary only has to write
+        // zeros over it to pass the check, so `-fstack-protector` stops being
+        // a check at all, and `PTR_MANGLE` stops protecting the `setjmp` and
+        // `atexit` pointers it exists for.
+        //
+        // `kernel_hal::rand::fill_random` is the tree's only source of random
+        // bytes, and its own module documentation already names this as what it
+        // feeds -- "the one that decides whether a bug is a crash or an
+        // exploit". It was the last of the consumers it lists that did not
+        // call it. The FreeBSD stack builder below always did, for the same
+        // canary.
+        let mut random_bytes = [0u8; 16];
+        kernel_hal::rand::fill_random(&mut random_bytes);
         writer.push_slice(&random_bytes);
         let random_ptr = writer.sp;
 
@@ -520,6 +539,13 @@ mod initial_stack_tests {
             addr >= self.sp && addr + len <= TOP
         }
 
+        /// The `len` raw bytes at address `addr`, which is how a C library
+        /// reads `AT_RANDOM`.
+        fn bytes_at(&self, addr: usize, len: usize) -> Vec<u8> {
+            let off = addr - self.sp;
+            self.bytes[off..off + len].to_vec()
+        }
+
         /// `argc`, then the argv strings, the envp strings, and the auxv pairs
         /// -- read exactly as `_start` walks them.
         fn decode(&self) -> (usize, Vec<String>, Vec<String>, Vec<(usize, usize)>) {
@@ -665,6 +691,48 @@ mod initial_stack_tests {
             "AT_RANDOM points at {:#x}, outside the image",
             random
         );
+    }
+
+    /// The bytes themselves, which are the canary.
+    ///
+    /// They were `[0u8; 16]` with a `// TODO: use real random`, so glibc's
+    /// `_dl_setup_stack_chk_guard` derived the same canary and the same pointer
+    /// guard in every process and on every boot. A stack overflow only had to
+    /// write zeros over the canary to pass the check.
+    #[test]
+    fn at_random_is_not_sixteen_zeros() {
+        let img = Image::of(&["/bin/true"], &[], BTreeMap::new());
+        let (_, _, _, auxv) = img.decode();
+        let at = auxv
+            .iter()
+            .find(|(k, _)| *k == AT_RANDOM as usize)
+            .expect("AT_RANDOM must always be supplied")
+            .1;
+        let bytes = img.bytes_at(at, 16);
+        assert_ne!(
+            bytes,
+            alloc::vec![0u8; 16],
+            "the stack canary is a compile-time constant"
+        );
+    }
+
+    /// And a different one per process, which is the other half of the point:
+    /// a canary shared between two processes is a canary one of them can read
+    /// out of its own stack and use against the other.
+    #[test]
+    fn two_processes_do_not_get_the_same_canary() {
+        let at_random_of = |img: &Image| {
+            let (_, _, _, auxv) = img.decode();
+            let at = auxv
+                .iter()
+                .find(|(k, _)| *k == AT_RANDOM as usize)
+                .unwrap()
+                .1;
+            img.bytes_at(at, 16)
+        };
+        let first = Image::of(&["/bin/true"], &[], BTreeMap::new());
+        let second = Image::of(&["/bin/true"], &[], BTreeMap::new());
+        assert_ne!(at_random_of(&first), at_random_of(&second));
     }
 
     #[test]
