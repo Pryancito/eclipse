@@ -21,6 +21,18 @@ impl<T> Pmio<T> {
             _phantom: PhantomData,
         }
     }
+
+    /// The port this unit was built for.
+    ///
+    /// `#[cfg(test)]`, and it exists so a register map can be checked without a
+    /// serial port: `read`/`write` below are `in`/`out`, which fault outside
+    /// ring 0, so the ports themselves are the only part of a PMIO driver a host
+    /// test can inspect -- and in a PMIO map the port number IS the register,
+    /// exactly as the field offset is in an MMIO one.
+    #[cfg(test)]
+    pub(crate) fn port(&self) -> u16 {
+        self.port
+    }
 }
 
 // 逐字节端口映射读写。

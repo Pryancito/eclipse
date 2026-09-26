@@ -56,6 +56,16 @@ impl<I: Io> ReadOnly<I> {
     }
 }
 
+impl<I> ReadOnly<I> {
+    /// The wrapped unit, for a test that needs to ask *where* the register is
+    /// rather than read it. `&I` cannot write (`Io::write` takes `&mut self`),
+    /// so this does not weaken the wrapper; it is `#[cfg(test)]` all the same.
+    #[cfg(test)]
+    pub(crate) fn unit(&self) -> &I {
+        &self.0
+    }
+}
+
 // 外设地址空间的一个只写单元。
 /// A write-only unit in device address space.
 #[repr(transparent)]

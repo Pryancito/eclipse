@@ -73,10 +73,6 @@ x86_64 = "0.15.5"
 # blob for that target); it must not enter the aarch64/riscv64 link.
 nvidia-rm-sys = { path = "../nvidia-rm-sys" }
 
-[[test]]
-name = "deferred_job"
-path = "tests/deferred_job.rs"
-required-features = ["mock"]
 
 [target.'cfg(any(target_arch = "riscv32", target_arch = "riscv64"))'.dependencies]
 riscv = "0.9"

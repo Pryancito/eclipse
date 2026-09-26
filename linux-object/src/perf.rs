@@ -696,10 +696,15 @@ pub fn kernel_report() -> String {
         rate(ks.idle_cb_total),
         cb_work_pct
     );
+    // The eviction count belongs next to the pending count: the queue is capped
+    // at 256 and reads "full" whether it is merely busy or has been discarding
+    // NIC bottom-halves, and a non-zero total here is the difference between a
+    // slow NIC and one that lost a poll.
     let _ = writeln!(
         out,
-        "deferred jobs pending now: {}",
-        kernel_hal::deferred_job::pending_deferred_jobs()
+        "deferred jobs pending now: {} ({} evicted unrun since boot)",
+        kernel_hal::deferred_job::pending_deferred_jobs(),
+        kernel_hal::deferred_job::evicted_deferred_jobs()
     );
     // `sched_polled`/`sched_weak` were sampled above for the attribution summary.
     let _ = writeln!(
