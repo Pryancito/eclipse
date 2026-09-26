@@ -344,6 +344,38 @@ impl Syscall<'_> {
                 ptr.write(*sem_array.semid_ds.lock())?;
                 Ok(0)
             }
+            // The two whole-set commands: `arg.array` is `unsigned short[nsems]`.
+            // Both fell into the per-semaphore arm below and were EINVAL, so a
+            // set could be initialised only one `SETVAL` at a time and never
+            // read back at once.
+            SemctlCmds::GETALL => {
+                let values = {
+                    let _atomic = sem_array.semop_guard();
+                    getall_values(&sem_array.snapshot())
+                };
+                let mut ptr: UserOutPtr<u16> = UserOutPtr::from(arg);
+                ptr.write_array(&values)?;
+                Ok(0)
+            }
+            SemctlCmds::SETALL => {
+                let ptr: UserInPtr<u16> = UserInPtr::from(arg);
+                let raw = ptr.read_array(sem_array.len())?;
+                // Every value is judged before any is applied: an out-of-range
+                // one is ERANGE and the set is untouched.
+                let values = setall_values(&raw)?;
+                let pid = self.zircon_process().id() as usize;
+                {
+                    let _atomic = sem_array.semop_guard();
+                    for (i, &value) in values.iter().enumerate() {
+                        if let Some(sem) = sem_array.get_sem(i) {
+                            sem.set(value);
+                            sem.set_pid(pid);
+                        }
+                    }
+                }
+                sem_array.ctime();
+                Ok(0)
+            }
             _ => {
                 // `num` comes from userspace. This used to index the set
                 // directly, so `semctl(id, 9999, GETVAL)` from any process was
@@ -762,6 +794,27 @@ const SEMVMX: i32 = 32767;
 /// program passes by mistake into 4294967295 and sets the semaphore to it,
 /// rather than answering. Linux reads the `int`, and `semctl(2)` says ERANGE
 /// for anything outside `[0, SEMVMX]`.
+/// `semctl(GETALL)`: the value of every semaphore of the set as the
+/// `unsigned short[]` userspace reads. Values never exceed `SEMVMX`, so the
+/// narrowing loses nothing; a value below zero cannot exist either, and is
+/// clamped rather than wrapped in case it ever does.
+fn getall_values(snapshot: &[(isize, u64)]) -> Vec<u16> {
+    snapshot
+        .iter()
+        .map(|&(value, _)| value.clamp(0, SEMVMX as isize) as u16)
+        .collect()
+}
+
+/// `semctl(SETALL)`: the `unsigned short[]` userspace wrote, judged whole
+/// before any of it is applied (`semctl_main`: "for (i = 0; i < nsems; i++)
+/// if (sem_io[i] > SEMVMX) return -ERANGE", ahead of the assignment loop).
+fn setall_values(raw: &[u16]) -> Result<Vec<isize>, LxError> {
+    if raw.iter().any(|&v| v as i32 > SEMVMX) {
+        return Err(LxError::ERANGE);
+    }
+    Ok(raw.iter().map(|&v| v as isize).collect())
+}
+
 fn setval_from_arg(arg: usize) -> Result<isize, LxError> {
     let val = arg as u32 as i32;
     if (0..=SEMVMX).contains(&val) {
@@ -1346,6 +1399,35 @@ mod semop_plan_tests {
             (1, 1),
             "one missing unit holds the whole array"
         );
+    }
+}
+
+#[cfg(test)]
+mod semctl_all_tests {
+    //! `GETALL` and `SETALL`, which used to be EINVAL.
+
+    use super::*;
+
+    /// `GETALL` hands out one `unsigned short` per semaphore, in order.
+    #[test]
+    fn getall_is_one_unsigned_short_per_semaphore_in_order() {
+        assert_eq!(
+            getall_values(&[(3, 0), (0, 5), (32767, 1)]),
+            vec![3, 0, 32767]
+        );
+        assert_eq!(getall_values(&[]), Vec::<u16>::new());
+        // A value that cannot exist is clamped, not wrapped to 65535.
+        assert_eq!(getall_values(&[(-1, 0)]), vec![0]);
+    }
+
+    /// `SETALL` refuses the whole array on one value over `SEMVMX`, before
+    /// touching any semaphore; anything up to `SEMVMX` goes through.
+    #[test]
+    fn setall_is_all_or_nothing_at_semvmx() {
+        assert_eq!(setall_values(&[0, 1, 32767]), Ok(vec![0, 1, 32767]));
+        assert_eq!(setall_values(&[]), Ok(vec![]));
+        assert_eq!(setall_values(&[1, 32768, 0]), Err(LxError::ERANGE));
+        assert_eq!(setall_values(&[65535]), Err(LxError::ERANGE));
     }
 }
 
