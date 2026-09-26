@@ -682,6 +682,14 @@ struct ProcPidDirINode {
     pid: u64,
 }
 
+/// `/proc/<pid>`, which is what `/proc/<pid>/fd`'s `..` names.
+///
+/// `proc_self::ProcSelfFdDir` serves that `fd` directory for any pid and lives
+/// in another module, so it needs a way to name its parent.
+pub(crate) fn pid_dir_inode(pid: u64) -> Arc<dyn INode> {
+    Arc::new(ProcPidDirINode { pid })
+}
+
 impl ProcPidDirINode {
     fn process(&self) -> Option<Arc<Process>> {
         ROOT_JOB.find_process(self.pid as _)
