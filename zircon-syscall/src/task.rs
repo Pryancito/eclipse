@@ -133,10 +133,14 @@ impl Syscall<'_> {
         );
         let proc = self.thread.proc();
         let thread = proc.get_object_with_rights::<Thread>(handle, Rights::READ)?;
-        //TODO: Remove allocation
-        let mut buf = vec![0; buffer_size];
-        thread.read_state(kind, &mut buf)?;
-        buffer.write_array(&buf[..])?;
+        // The kernel buffer is as large as a state can be, not as large as the
+        // caller says: `vec![0; buffer_size]` with a `buffer_size` from
+        // userspace was an allocation of any size, and past what the heap
+        // has, a kernel panic. Only the bytes of the state come back, as
+        // `zx_thread_read_state` promises.
+        let mut buf = vec![0; buffer_size.min(MAX_THREAD_STATE_SIZE)];
+        let len = thread.read_state(kind, &mut buf)?;
+        buffer.write_array(&buf[..len])?;
         Ok(())
     }
 
@@ -174,12 +178,12 @@ impl Syscall<'_> {
             "job.set_critical: job={:#x?}, options={:#x}, process={:#x?}",
             job_handle, options, process_handle,
         );
-        let retcode_nonzero = if options == 1 {
-            true
-        } else if options == 0 {
-            false
-        } else {
-            unimplemented!()
+        // Any other option is the caller's mistake, not a kernel panic: this
+        // used to be `unimplemented!()`.
+        let retcode_nonzero = match options {
+            0 => false,
+            1 => true,
+            _ => return Err(ZxError::INVALID_ARGS),
         };
         let proc = self.thread.proc();
         let job = proc.get_object_with_rights::<Job>(job_handle, Rights::DESTROY)?;
@@ -277,22 +281,35 @@ impl Syscall<'_> {
     ) -> ZxResult {
         info!("task.suspend_token: handle={:?}, token={:?}", handle, token);
         let proc = self.thread.proc();
-        if let Ok(thread) = proc.get_object_with_rights::<Thread>(handle, Rights::WRITE) {
-            if Arc::ptr_eq(&thread, self.thread) {
-                return Err(ZxError::NOT_SUPPORTED);
+        // A handle that is not a thread's is an error that says which: a
+        // process is `NOT_SUPPORTED`, anything else `WRONG_TYPE`, a thread
+        // without the write right `ACCESS_DENIED`. All three used to answer
+        // `OK` and write no token, so the caller read one that was never
+        // there.
+        let (object, rights) = proc.get_dyn_object_and_rights(handle)?;
+        let thread = match object.downcast_arc::<Thread>() {
+            Ok(thread) => thread,
+            Err(object) => {
+                return Err(if object.downcast_arc::<Process>().is_ok() {
+                    ZxError::NOT_SUPPORTED
+                } else {
+                    ZxError::WRONG_TYPE
+                })
             }
-            if thread.state() == ThreadState::Dying || thread.state() == ThreadState::Dead {
-                return Err(ZxError::BAD_STATE);
-            }
-            let thread: Arc<dyn Task> = thread;
-            let token_handle =
-                Handle::new(SuspendToken::create(&thread), Rights::DEFAULT_SUSPEND_TOKEN);
-            token.write(proc.add_handle(token_handle))?;
-            return Ok(());
+        };
+        if !rights.contains(Rights::WRITE) {
+            return Err(ZxError::ACCESS_DENIED);
         }
-        if let Ok(_process) = proc.get_object_with_rights::<Process>(handle, Rights::WRITE) {
+        if Arc::ptr_eq(&thread, self.thread) {
             return Err(ZxError::NOT_SUPPORTED);
         }
+        if thread.state() == ThreadState::Dying || thread.state() == ThreadState::Dead {
+            return Err(ZxError::BAD_STATE);
+        }
+        let thread: Arc<dyn Task> = thread;
+        let token_handle =
+            Handle::new(SuspendToken::create(&thread), Rights::DEFAULT_SUSPEND_TOKEN);
+        token.write(proc.add_handle(token_handle))?;
         Ok(())
     }
 
@@ -436,3 +453,5 @@ const JOB_POL_RELATIVE: u32 = 0;
 const JOB_POL_ABSOLUTE: u32 = 1;
 
 const MAX_BLOCK: usize = 64 * 1024 * 1024; //64M
+/// Larger than any register set `zx_thread_read_state` can answer with.
+const MAX_THREAD_STATE_SIZE: usize = 4096;

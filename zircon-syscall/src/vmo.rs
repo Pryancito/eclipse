@@ -324,7 +324,24 @@ impl Syscall<'_> {
                 }
                 vmo.zero(offset, len)
             }
-            _ => unimplemented!(),
+            // The caches these keep coherent are coherent on their own here,
+            // so the range is checked and nothing is done. Any of them used
+            // to be `unimplemented!()`: a kernel panic a driver could ask for
+            // with `ZX_VMO_OP_CACHE_SYNC` after a DMA transfer.
+            VmoOpType::CacheSync | VmoOpType::CacheClean | VmoOpType::CacheCleanInvalidate => {
+                if !rights.contains(Rights::READ) {
+                    return Err(ZxError::ACCESS_DENIED);
+                }
+                vmo_range_check(&vmo, offset, len)
+            }
+            VmoOpType::CacheInvalidate => {
+                if !rights.contains(Rights::WRITE) {
+                    return Err(ZxError::ACCESS_DENIED);
+                }
+                vmo_range_check(&vmo, offset, len)
+            }
+            // Locking is for discardable objects, which do not exist here.
+            VmoOpType::Lock | VmoOpType::Unlock => Err(ZxError::NOT_SUPPORTED),
         }
     }
 
@@ -334,6 +351,14 @@ impl Syscall<'_> {
         let vmo = proc.get_object_with_rights::<VmObject>(handle_value, Rights::MAP)?;
         let policy = CachePolicy::try_from(policy).or(Err(ZxError::INVALID_ARGS))?;
         (*vmo).set_cache_policy(policy)
+    }
+}
+
+/// `[offset, offset + len)` lies inside the object, or `OUT_OF_RANGE`.
+fn vmo_range_check(vmo: &VmObject, offset: usize, len: usize) -> ZxResult {
+    match offset.checked_add(len) {
+        Some(end) if end <= vmo.len() => Ok(()),
+        _ => Err(ZxError::OUT_OF_RANGE),
     }
 }
 

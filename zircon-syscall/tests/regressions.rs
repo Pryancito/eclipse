@@ -425,3 +425,100 @@ fn stream_writev_answers_what_it_wrote_when_the_vmo_fills_mid_vector() {
         Box::pin(async move { drop(ct) })
     });
 }
+
+/// Four things userspace could ask for and get a kernel panic, or an `OK`
+/// with nothing behind it, instead of an error: a cache operation or a lock
+/// in `zx_vmo_op_range` (`unimplemented!()`), an option `zx_job_set_critical`
+/// did not know (`unimplemented!()`), a `zx_thread_read_state` with a
+/// buffer size the heap cannot hold (the kernel allocated it whole), and a
+/// `zx_task_suspend_token` on a job, a bad handle or a thread without the
+/// write right (`OK`, with no token written).
+#[test]
+fn syscalls_that_used_to_panic_or_answer_ok_for_nothing_answer_errors() {
+    with_test_thread(|ct| {
+        let base = map_user_memory(&ct);
+        let sc = Syscall {
+            thread: &ct,
+            thread_fn: finish_thread,
+        };
+        let vmo = ct
+            .proc()
+            .add_handle(Handle::new(VmObject::new_paged(2), Rights::DEFAULT_VMO));
+        const CACHE_SYNC: u32 = 6;
+        const CACHE_INVALIDATE: u32 = 7;
+        const LOCK: u32 = 3;
+        sc.sys_vmo_op_range(vmo, CACHE_SYNC, 0, 2 * PAGE_SIZE, 0.into(), 0)
+            .unwrap();
+        sc.sys_vmo_op_range(vmo, CACHE_INVALIDATE, PAGE_SIZE, PAGE_SIZE, 0.into(), 0)
+            .unwrap();
+        assert_eq!(
+            sc.sys_vmo_op_range(vmo, CACHE_SYNC, PAGE_SIZE, 2 * PAGE_SIZE, 0.into(), 0),
+            Err(ZxError::OUT_OF_RANGE)
+        );
+        assert_eq!(
+            sc.sys_vmo_op_range(vmo, CACHE_SYNC, usize::MAX, 2, 0.into(), 0),
+            Err(ZxError::OUT_OF_RANGE)
+        );
+        assert_eq!(
+            sc.sys_vmo_op_range(vmo, LOCK, 0, PAGE_SIZE, 0.into(), 0),
+            Err(ZxError::NOT_SUPPORTED)
+        );
+
+        let job = ct
+            .proc()
+            .add_handle(Handle::new(Job::root(), Rights::DEFAULT_JOB));
+        let process = ct
+            .proc()
+            .add_handle(Handle::new(ct.proc().clone(), Rights::DEFAULT_PROCESS));
+        assert_eq!(
+            sc.sys_job_set_critical(job, 2, process),
+            Err(ZxError::INVALID_ARGS)
+        );
+
+        let other = Thread::create(ct.proc(), "never-started").unwrap();
+        let thread = ct
+            .proc()
+            .add_handle(Handle::new(other.clone(), Rights::DEFAULT_THREAD));
+        assert_eq!(
+            sc.sys_thread_read_state(thread, 0, base.into(), usize::MAX / 2),
+            Err(ZxError::BAD_STATE),
+            "a thread that never ran has no state to read, and the size is no panic"
+        );
+
+        let token = base + 64;
+        unsafe { (token as *mut u32).write(0xdead_beef) };
+        assert_eq!(
+            sc.sys_task_suspend_token(job, token.into()),
+            Err(ZxError::WRONG_TYPE)
+        );
+        assert_eq!(
+            sc.sys_task_suspend_token(process, token.into()),
+            Err(ZxError::NOT_SUPPORTED)
+        );
+        assert_eq!(
+            sc.sys_task_suspend_token(0x7777_7777, token.into()),
+            Err(ZxError::BAD_HANDLE)
+        );
+        let read_only = ct.proc().add_handle(Handle::new(other, Rights::READ));
+        assert_eq!(
+            sc.sys_task_suspend_token(read_only, token.into()),
+            Err(ZxError::ACCESS_DENIED)
+        );
+        unsafe {
+            assert_eq!(
+                (token as *const u32).read(),
+                0xdead_beef,
+                "no token was written"
+            );
+        }
+        sc.sys_task_suspend_token(thread, token.into()).unwrap();
+        unsafe {
+            assert_ne!(
+                (token as *const u32).read(),
+                0xdead_beef,
+                "a thread gets its token"
+            );
+        }
+        Box::pin(async move { drop(ct) })
+    });
+}
