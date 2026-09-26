@@ -138,6 +138,7 @@ pub fn published_capabilities(euid: u32) -> u64 {
 }
 
 const NO_ID: u32 = u32::MAX;
+const ACCESS_READ: u16 = 0o4;
 const ACCESS_WRITE: u16 = 0o2;
 const ACCESS_EXEC: u16 = 0o1;
 const MODE_PERM_MASK: u16 = 0o7777;
@@ -2739,6 +2740,68 @@ impl LinuxProcess {
             metadata.mode,
             metadata.type_ == FileType::Dir,
             explicit,
+        )
+    }
+
+    /// Whether `creds` may make a new hard link to a file owned by
+    /// `owner_uid:owner_gid` with mode `mode` and type `type_`.
+    ///
+    /// `vfs_link`: a directory is never linkable, by anyone (`EPERM`). Then
+    /// `may_linkat` with `fs.protected_hardlinks` on, the default since Linux
+    /// 3.6: the owner and root link what they like; anyone else only a "safe
+    /// source" (`safe_hardlink_source`): a regular file, not setuid, not
+    /// setgid-and-group-executable, that they could open for reading AND
+    /// writing. Everything else is `EPERM`, the way Linux answers it, not the
+    /// `EACCES` of the access check underneath.
+    ///
+    /// Nothing checked this before: any process could pin `/etc/shadow`, a
+    /// setuid binary or another user's private file under a name of its own
+    /// choosing, and keep its content across the owner's replace-and-unlink
+    /// (which is exactly the attack `protected_hardlinks` exists to stop).
+    fn link_verdict(
+        creds: &Credentials,
+        owner_uid: u32,
+        owner_gid: u32,
+        mode: u16,
+        type_: FileType,
+    ) -> LxResult {
+        if type_ == FileType::Dir {
+            return Err(LxError::EPERM);
+        }
+        // `inode_owner_or_capable()`: `vfsuid_eq_kuid(vfsuid, current_fsuid())`.
+        if creds.fsuid == ROOT_UID || creds.fsuid == owner_uid {
+            return Ok(());
+        }
+        if type_ != FileType::File {
+            return Err(LxError::EPERM);
+        }
+        if mode & MODE_SET_UID != 0 {
+            return Err(LxError::EPERM);
+        }
+        if mode & (MODE_SET_GID | MODE_EXEC_GRP) == (MODE_SET_GID | MODE_EXEC_GRP) {
+            return Err(LxError::EPERM);
+        }
+        Self::access_verdict(
+            creds,
+            owner_uid,
+            owner_gid,
+            mode,
+            false,
+            ACCESS_READ | ACCESS_WRITE,
+            true,
+        )
+        .map_err(|_| LxError::EPERM)
+    }
+
+    /// [`link_verdict`](Self::link_verdict) for this process on the file
+    /// `metadata` describes, the one `linkat(2)` was asked to link.
+    pub fn check_link(&self, metadata: &Metadata) -> LxResult {
+        Self::link_verdict(
+            &self.credentials(),
+            metadata.uid as u32,
+            metadata.gid as u32,
+            metadata.mode,
+            metadata.type_,
         )
     }
 
@@ -8210,6 +8273,123 @@ mod utimes_permission_tests {
         let mut meta = meta;
         meta.mode = 0o666;
         assert_eq!(proc.check_utimes(&meta, false), Ok(()));
+    }
+}
+
+#[cfg(test)]
+mod link_permission_tests {
+    use super::*;
+
+    const OWNER: u32 = 1000;
+    const OTHER: u32 = 2000;
+
+    fn creds(uid: u32) -> Credentials {
+        Credentials {
+            ruid: uid,
+            euid: uid,
+            suid: uid,
+            rgid: uid,
+            egid: uid,
+            sgid: uid,
+            fsuid: uid,
+            fsgid: uid,
+            groups: Vec::new(),
+            umask: 0o022,
+        }
+    }
+
+    fn verdict(uid: u32, mode: u16, type_: FileType) -> LxResult {
+        LinuxProcess::link_verdict(&creds(uid), OWNER, OWNER, mode, type_)
+    }
+
+    #[test]
+    fn nobody_links_a_directory_not_even_root() {
+        // `vfs_link`: `if (S_ISDIR(inode->i_mode)) return -EPERM;`
+        assert_eq!(verdict(ROOT_UID, 0o777, FileType::Dir), Err(LxError::EPERM));
+        assert_eq!(verdict(OWNER, 0o777, FileType::Dir), Err(LxError::EPERM));
+    }
+
+    #[test]
+    fn the_owner_and_root_link_whatever_they_own_however_it_is_set() {
+        assert_eq!(verdict(OWNER, 0o000, FileType::File), Ok(()));
+        assert_eq!(verdict(OWNER, 0o4755, FileType::File), Ok(()));
+        assert_eq!(verdict(OWNER, 0o600, FileType::NamedPipe), Ok(()));
+        assert_eq!(verdict(ROOT_UID, 0o000, FileType::File), Ok(()));
+        assert_eq!(verdict(ROOT_UID, 0o4755, FileType::CharDevice), Ok(()));
+    }
+
+    #[test]
+    fn someone_else_needs_a_safe_source_they_can_read_and_write() {
+        // The `protected_hardlinks` case: `ln /etc/shadow ~/mine`.
+        assert_eq!(verdict(OTHER, 0o600, FileType::File), Err(LxError::EPERM));
+        assert_eq!(
+            verdict(OTHER, 0o644, FileType::File),
+            Err(LxError::EPERM),
+            "readable is not enough"
+        );
+        assert_eq!(
+            verdict(OTHER, 0o622, FileType::File),
+            Err(LxError::EPERM),
+            "writable is not enough either"
+        );
+        assert_eq!(verdict(OTHER, 0o666, FileType::File), Ok(()));
+    }
+
+    #[test]
+    fn a_setuid_or_setgid_executable_is_never_a_safe_source() {
+        assert_eq!(verdict(OTHER, 0o4666, FileType::File), Err(LxError::EPERM));
+        assert_eq!(verdict(OTHER, 0o2676, FileType::File), Err(LxError::EPERM));
+        // Setgid WITHOUT group-exec is mandatory locking, not privilege:
+        // still a safe source (`(S_ISGID | S_IXGRP)` both, or neither counts).
+        assert_eq!(verdict(OTHER, 0o2666, FileType::File), Ok(()));
+    }
+
+    #[test]
+    fn a_special_file_is_never_a_safe_source_for_someone_else() {
+        // "Special files should not get pinned to the filesystem."
+        assert_eq!(
+            verdict(OTHER, 0o666, FileType::NamedPipe),
+            Err(LxError::EPERM)
+        );
+        assert_eq!(
+            verdict(OTHER, 0o666, FileType::CharDevice),
+            Err(LxError::EPERM)
+        );
+        assert_eq!(
+            verdict(OTHER, 0o777, FileType::SymLink),
+            Err(LxError::EPERM)
+        );
+        assert_eq!(verdict(OTHER, 0o777, FileType::Socket), Err(LxError::EPERM));
+    }
+
+    #[test]
+    fn the_answer_is_eperm_not_the_eacces_of_the_access_check() {
+        // `may_linkat` returns -EPERM whatever `inode_permission` said: the
+        // caller is told the link is forbidden, not that the file is.
+        assert_eq!(verdict(OTHER, 0o000, FileType::File), Err(LxError::EPERM));
+        let mut c = creds(OTHER);
+        c.fsuid = OWNER;
+        assert_eq!(
+            LinuxProcess::link_verdict(&c, OWNER, OWNER, 0o000, FileType::File),
+            Ok(()),
+            "and ownership is the filesystem uid"
+        );
+        // The read-and-write test is on the FILESYSTEM ids too
+        // (`inode_permission` -> `current_fsuid()`/`current_fsgid()`): a
+        // process whose real ids are strangers to the file but whose fs gid
+        // is the file's group may link a group-rw file.
+        let mut c = creds(3000);
+        c.fsuid = OTHER;
+        c.fsgid = OTHER;
+        assert_eq!(
+            LinuxProcess::link_verdict(&c, OWNER, OTHER, 0o660, FileType::File),
+            Ok(())
+        );
+        c.fsgid = 3000;
+        assert_eq!(
+            LinuxProcess::link_verdict(&c, OWNER, OTHER, 0o660, FileType::File),
+            Err(LxError::EPERM)
+        );
     }
 }
 

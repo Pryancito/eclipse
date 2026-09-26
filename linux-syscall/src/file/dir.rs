@@ -216,6 +216,14 @@ impl Syscall<'_> {
         let new_dir_inode = proc.lookup_inode_at(newdirfd, new_dir_path, true)?;
         let new_dir_metadata = new_dir_inode.metadata()?;
         proc.check_access(&new_dir_metadata, 0o3, true)?;
+        // `do_linkat`: the new name is looked up (`filename_create`, EEXIST)
+        // before `may_linkat` and `vfs_link` decide whether THIS file may be
+        // linked at all: a directory never, another user's file only when it
+        // is a safe source (`protected_hardlinks`). See `check_link`.
+        if new_dir_inode.find(new_file_name).is_ok() {
+            return Err(LxError::EEXIST);
+        }
+        proc.check_link(&inode.metadata()?)?;
         new_dir_inode.link(new_file_name, &inode)?;
         linux_object::fs::dcache_invalidate();
         Ok(0)
