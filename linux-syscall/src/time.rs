@@ -763,6 +763,7 @@ impl Syscall<'_> {
                 interval: Duration::ZERO,
                 next: Duration::ZERO,
                 generation: 0,
+                overrun_last: 0,
             },
         );
         let mut out: UserOutPtr<i32> = timerid.into();
@@ -870,12 +871,13 @@ impl Syscall<'_> {
         }
     }
 
-    /// `timer_getoverrun`: we don't accumulate overruns, so report 0.
+    /// `timer_getoverrun`: the overrun count of the timer's last expiry,
+    /// which used to be a fixed 0 (see [`forward_periodic`]).
     pub fn sys_timer_getoverrun(&self, id: usize) -> SysResult {
         let owner = self.zircon_process().id();
         let timers = POSIX_TIMERS.lock();
         match timers.get(&id) {
-            Some(t) if t.owner == owner => Ok(0),
+            Some(t) if t.owner == owner => Ok(t.overrun_last.min(DELAYTIMER_MAX) as usize),
             _ => Err(LxError::EINVAL),
         }
     }
@@ -980,6 +982,10 @@ struct PosixTimer {
     /// Bumped by settime/delete to invalidate an already-scheduled one-shot
     /// (`timer_set` callbacks are not cancellable, so they check this).
     generation: u64,
+    /// The overrun count of the last expiry (`it_overrun_last`): the
+    /// periods that went by without a signal of their own because the
+    /// timer was late, what `timer_getoverrun(2)` and `si_overrun` report.
+    overrun_last: u32,
 }
 
 lazy_static! {
@@ -1044,39 +1050,78 @@ fn itimerval_from_slot(slot: &ItimerSlot, now: Duration) -> ITimerVal {
 fn arm_itimer(owner: KoID, which: usize, deadline: Duration, gen: u64) {
     kernel_hal::timer::timer_set(
         deadline,
-        Box::new(move |_now| {
-            let mut fire = false;
-            let mut rearm = None;
-            if let Some(proc) = ROOT_JOB.find_process(owner) {
-                if let Some(lp) = proc.try_linux() {
-                    let mut slots = lp.itimers().lock();
-                    let slot = &mut slots[which];
-                    if slot.generation == gen {
-                        if let Some(expiry) = slot.deadline {
-                            fire = true;
-                            if slot.interval.is_zero() {
-                                slot.deadline = None;
-                            } else {
-                                // Drift-free: step from the programmed expiry,
-                                // not from whenever the wheel got to us.
-                                let next = expiry + slot.interval;
-                                slot.deadline = Some(next);
-                                rearm = Some(next);
-                            }
-                        }
-                    }
-                }
-            }
-            if fire {
-                if let Some((signal, info)) = itimer_expiry_signal(which) {
-                    deliver_timer_signal(owner, None, signal, info);
-                }
-            }
-            if let Some(next) = rearm {
+        Box::new(move |now| {
+            if let Some(next) = expire_itimer(owner, which, gen, now) {
                 arm_itimer(owner, which, next, gen);
             }
         }),
     );
+}
+
+/// The largest overrun count `timer_getoverrun(2)` and `si_overrun` report
+/// (`DELAYTIMER_MAX`, `i32::MAX` on Linux).
+const DELAYTIMER_MAX: u32 = i32::MAX as u32;
+
+/// Where a periodic timer whose expiry was at `expiry` fires next, given
+/// that the wheel got to it at `now`, and how many periods went by in
+/// between without a signal of their own: `hrtimer_forward`. Drift-free
+/// (the next expiry is a whole number of periods after the programmed
+/// one), and never in the past.
+///
+/// Both timer callbacks used to step exactly one period from the
+/// programmed expiry, whatever the time was: a process stopped for ten
+/// seconds with a 1 ms timer got its next expiry 9 999 ms in the past, and
+/// the wheel fired it again at once, and again, ten thousand back-to-back
+/// expiries -- one signal per missed period, each `timer_set` with a
+/// deadline already gone -- where Linux delivers ONE, with `si_overrun` and
+/// `timer_getoverrun(2)` saying how many were skipped.
+fn forward_periodic(expiry: Duration, interval: Duration, now: Duration) -> (Duration, u32) {
+    let next = expiry + interval;
+    if next > now {
+        return (next, 0);
+    }
+    // `now - expiry` whole periods have gone by since the programmed
+    // expiry; the first one is the expiry that fires now, the rest are
+    // overruns, and the next expiry is the period after all of them.
+    let elapsed = now - expiry;
+    let periods = elapsed.as_nanos() / interval.as_nanos();
+    let overrun = periods.min(DELAYTIMER_MAX as u128) as u32;
+    // Saturating all the way: `interval` comes from userspace.
+    let advance = (periods + 1).saturating_mul(interval.as_nanos());
+    let advance = Duration::from_nanos(advance.min(u64::MAX as u128) as u64);
+    (expiry.saturating_add(advance), overrun)
+}
+
+/// One expiry of the `setitimer(2)` slot `which` of `owner`, at `now`:
+/// deliver its signal and say when it fires next, if it is periodic.
+/// Nothing if the slot was re-armed or disarmed since (`gen`).
+fn expire_itimer(owner: KoID, which: usize, gen: u64, now: Duration) -> Option<Duration> {
+    let mut fire = false;
+    let mut rearm = None;
+    if let Some(proc) = ROOT_JOB.find_process(owner) {
+        if let Some(lp) = proc.try_linux() {
+            let mut slots = lp.itimers().lock();
+            let slot = &mut slots[which];
+            if slot.generation == gen {
+                if let Some(expiry) = slot.deadline {
+                    fire = true;
+                    if slot.interval.is_zero() {
+                        slot.deadline = None;
+                    } else {
+                        let (next, _overrun) = forward_periodic(expiry, slot.interval, now);
+                        slot.deadline = Some(next);
+                        rearm = Some(next);
+                    }
+                }
+            }
+        }
+    }
+    if fire {
+        if let Some((signal, info)) = itimer_expiry_signal(which) {
+            deliver_timer_signal(owner, None, signal, info);
+        }
+    }
+    rearm
 }
 
 /// Disarm and delete every POSIX timer owned by `owner`, returning how many
@@ -1114,12 +1159,20 @@ fn itimer_expiry_signal(which: usize) -> Option<(Signal, SigInfo)> {
 /// What an expiring POSIX timer delivers: `SI_TIMER` with the timer's id
 /// and the `sigev_value` it was created with (`posix_timer_event` ->
 /// `send_sigqueue`), or nothing for `SIGEV_NONE`.
-fn posix_timer_expiry_signal(id: usize, notify: TimerNotify) -> Option<(Signal, SigInfo)> {
+fn posix_timer_expiry_signal(
+    id: usize,
+    notify: TimerNotify,
+    overrun: u32,
+) -> Option<(Signal, SigInfo)> {
     if notify.signo == 0 {
         return None;
     }
     let signal = Signal::try_from(notify.signo as u8).ok()?;
-    Some((signal, SigInfo::timer(signal, id as i32, 0, notify.value)))
+    let overrun = overrun.min(DELAYTIMER_MAX) as i32;
+    Some((
+        signal,
+        SigInfo::timer(signal, id as i32, overrun, notify.value),
+    ))
 }
 
 /// Deliver an expired timer's signal, once: to the process (`kill_pid_info`:
@@ -1162,33 +1215,45 @@ fn deliver_timer_signal(owner: KoID, target: Option<KoID>, signal: Signal, info:
 fn arm_posix_timer(id: usize, deadline: Duration, gen: u64) {
     kernel_hal::timer::timer_set(
         deadline,
-        Box::new(move |_now| {
-            let mut fire = None;
-            let mut rearm = None;
-            {
-                let mut timers = POSIX_TIMERS.lock();
-                if let Some(t) = timers.get_mut(&id) {
-                    if t.generation == gen {
-                        fire = Some((t.owner, t.notify));
-                        if t.interval.is_zero() {
-                            t.next = Duration::ZERO;
-                        } else {
-                            t.next += t.interval;
-                            rearm = Some(t.next);
-                        }
-                    }
-                }
-            }
-            if let Some((owner, notify)) = fire {
-                if let Some((signal, info)) = posix_timer_expiry_signal(id, notify) {
-                    deliver_timer_signal(owner, notify.thread, signal, info);
-                }
-            }
-            if let Some(deadline) = rearm {
-                arm_posix_timer(id, deadline, gen);
+        Box::new(move |now| {
+            if let Some(next) = expire_posix_timer(id, gen, now) {
+                arm_posix_timer(id, next, gen);
             }
         }),
     );
+}
+
+/// One expiry of POSIX timer `id`, at `now`: deliver its signal, with the
+/// overrun count of this expiry in `si_overrun` and kept for
+/// `timer_getoverrun`, and say when it fires next if it is periodic.
+/// Nothing if the timer was deleted or re-armed since (`gen`).
+fn expire_posix_timer(id: usize, gen: u64, now: Duration) -> Option<Duration> {
+    let mut fire = None;
+    let mut rearm = None;
+    {
+        let mut timers = POSIX_TIMERS.lock();
+        if let Some(t) = timers.get_mut(&id) {
+            if t.generation == gen {
+                let overrun = if t.interval.is_zero() {
+                    t.next = Duration::ZERO;
+                    0
+                } else {
+                    let (next, overrun) = forward_periodic(t.next, t.interval, now);
+                    t.next = next;
+                    rearm = Some(next);
+                    overrun
+                };
+                t.overrun_last = overrun;
+                fire = Some((t.owner, t.notify, overrun));
+            }
+        }
+    }
+    if let Some((owner, notify, overrun)) = fire {
+        if let Some((signal, info)) = posix_timer_expiry_signal(id, notify, overrun) {
+            deliver_timer_signal(owner, notify.thread, signal, info);
+        }
+    }
+    rearm
 }
 
 #[cfg(test)]
@@ -1487,6 +1552,7 @@ mod exec_timer_tests {
                 interval: Duration::from_secs(1),
                 next: Duration::from_secs(1),
                 generation: 0,
+                overrun_last: 0,
             },
         );
         id
@@ -1543,6 +1609,149 @@ mod exec_timer_tests {
         assert_eq!(drop_posix_timers_of(0x4711_0006), 0);
         assert!(still_there(theirs));
         POSIX_TIMERS.lock().remove(&theirs);
+    }
+}
+
+#[cfg(test)]
+mod overrun_tests {
+    //! A periodic timer that fell behind fired once per missed period, back
+    //! to back, and `timer_getoverrun` always said 0.
+
+    use super::*;
+    use linux_object::process::LinuxProcess;
+    use linux_object::signal::SignalCode;
+    use rcore_fs_ramfs::RamFS;
+    use zircon_object::task::Process;
+
+    fn ms(n: u64) -> Duration {
+        Duration::from_millis(n)
+    }
+
+    fn a_process(pid: KoID) -> (alloc::sync::Arc<Process>, alloc::sync::Arc<Thread>) {
+        let proc = Process::create_with_fixed_id_ext(
+            &ROOT_JOB,
+            pid,
+            "t",
+            LinuxProcess::new(RamFS::new(), 0),
+        )
+        .unwrap();
+        let thread = Thread::create_linux(&proc).unwrap();
+        (proc, thread)
+    }
+
+    /// A periodic POSIX timer of `owner` whose expiry was programmed at
+    /// 1 s, every 10 ms.
+    fn a_periodic_timer(owner: KoID) -> usize {
+        let id = NEXT_TIMER_ID.fetch_add(1, Ordering::Relaxed);
+        POSIX_TIMERS.lock().insert(
+            id,
+            PosixTimer {
+                owner,
+                notify: TimerNotify::SIGALRM_TO_PROCESS,
+                clock: ClockBase::Monotonic,
+                interval: ms(10),
+                next: ms(1000),
+                generation: 0,
+                overrun_last: 0,
+            },
+        );
+        id
+    }
+
+    /// `si_overrun` where glibc reads it.
+    fn si_overrun(info: &SigInfo) -> i32 {
+        let b = info.as_bytes();
+        i32::from_ne_bytes([b[20], b[21], b[22], b[23]])
+    }
+
+    #[test]
+    fn a_timer_on_time_steps_one_period_with_no_overrun() {
+        assert_eq!(forward_periodic(ms(1000), ms(10), ms(1000)), (ms(1010), 0));
+        assert_eq!(forward_periodic(ms(1000), ms(10), ms(1009)), (ms(1010), 0));
+    }
+
+    #[test]
+    fn a_late_timer_skips_to_the_first_period_after_now_and_counts_the_rest() {
+        // 3.5 periods late: this expiry, three skipped, next at 1040.
+        assert_eq!(forward_periodic(ms(1000), ms(10), ms(1035)), (ms(1040), 3));
+        // Exactly two periods late: the next expiry has to be AFTER now.
+        assert_eq!(forward_periodic(ms(1000), ms(10), ms(1020)), (ms(1030), 2));
+        // Ten seconds late on a 1 ms timer: one expiry, not ten thousand.
+        let (next, overrun) = forward_periodic(ms(1000), ms(1), ms(11000));
+        assert!(next > ms(11000), "next expiry {:?} already gone", next);
+        assert_eq!(overrun, 10_000);
+        // Nothing to overflow on: a 1 ns period a year behind.
+        let (next, overrun) = forward_periodic(
+            Duration::from_secs(1),
+            Duration::from_nanos(1),
+            Duration::from_secs(365 * 24 * 3600),
+        );
+        assert!(next > Duration::from_secs(365 * 24 * 3600));
+        assert_eq!(overrun, DELAYTIMER_MAX);
+    }
+
+    #[test]
+    fn a_late_expiry_delivers_one_signal_with_the_overrun_and_keeps_it_for_getoverrun() {
+        let (proc, thread) = a_process(43_701);
+        let id = a_periodic_timer(proc.id());
+        // The wheel got to the 1 s expiry at 1.5 s: the expiries at 1010,
+        // 1020, ... 1500 went by, fifty of them, and only this one fires.
+        let next = expire_posix_timer(id, 0, ms(1500));
+        assert_eq!(next, Some(ms(1510)), "the next expiry must be after now");
+        let info = thread.lock_linux().take_siginfo(Signal::SIGALRM);
+        assert_eq!(
+            info.code,
+            SignalCode::TIMER,
+            "not SI_TIMER: a POSIX timer expiry"
+        );
+        assert_eq!(si_overrun(&info), 50, "si_overrun");
+        let timers = POSIX_TIMERS.lock();
+        let t = timers.get(&id).unwrap();
+        assert_eq!(t.overrun_last, 50, "timer_getoverrun would answer this");
+        assert_eq!(t.next, ms(1510));
+        assert!(
+            !thread.lock_linux().signals.contains(Signal::SIGALRM),
+            "a second signal was delivered for the same expiry"
+        );
+    }
+
+    #[test]
+    fn a_one_shot_expiry_disarms_and_a_stale_generation_fires_nothing() {
+        let (proc, thread) = a_process(43_702);
+        let id = a_periodic_timer(proc.id());
+        POSIX_TIMERS.lock().get_mut(&id).unwrap().interval = Duration::ZERO;
+        assert_eq!(expire_posix_timer(id, 0, ms(1500)), None);
+        assert!(thread.lock_linux().signals.contains(Signal::SIGALRM));
+        assert_eq!(POSIX_TIMERS.lock().get(&id).unwrap().next, Duration::ZERO);
+
+        let id = a_periodic_timer(proc.id());
+        POSIX_TIMERS.lock().get_mut(&id).unwrap().generation = 3;
+        thread.lock_linux().take_siginfo(Signal::SIGALRM);
+        assert_eq!(expire_posix_timer(id, 0, ms(1500)), None);
+        assert!(!thread.lock_linux().signals.contains(Signal::SIGALRM));
+    }
+
+    #[test]
+    fn a_late_interval_timer_fires_once_and_lands_after_now() {
+        let (proc, thread) = a_process(43_703);
+        {
+            let lp = proc.linux();
+            let mut slots = lp.itimers().lock();
+            slots[ITIMER_REAL] = ItimerSlot {
+                interval: ms(10),
+                deadline: Some(ms(1000)),
+                generation: 5,
+            };
+        }
+        let next = expire_itimer(proc.id(), ITIMER_REAL, 5, ms(1500));
+        assert_eq!(next, Some(ms(1510)), "the next expiry must be after now");
+        assert_eq!(
+            proc.linux().itimers().lock()[ITIMER_REAL].deadline,
+            Some(ms(1510))
+        );
+        assert!(thread.lock_linux().signals.contains(Signal::SIGALRM));
+        // A stale generation is a slot that was re-armed since: nothing.
+        assert_eq!(expire_itimer(proc.id(), ITIMER_REAL, 4, ms(1600)), None);
     }
 }
 
@@ -1617,7 +1826,7 @@ mod timer_signal_tests {
             value: 0xfeed_f00d,
             thread: Some(target.id()),
         };
-        let (signal, info) = posix_timer_expiry_signal(7, notify).unwrap();
+        let (signal, info) = posix_timer_expiry_signal(7, notify, 0).unwrap();
         deliver_timer_signal(proc.id(), notify.thread, signal, info);
         assert!(
             !has_pending(&other, signal),
@@ -1642,7 +1851,7 @@ mod timer_signal_tests {
     fn sigev_none_arms_a_timer_that_delivers_nothing() {
         let notify = timer_notify_from_sigevent(&event(5, 0, SIGEV_NONE, 0), |_| false).unwrap();
         assert_eq!(notify.signo, 0);
-        assert!(posix_timer_expiry_signal(1, notify).is_none());
+        assert!(posix_timer_expiry_signal(1, notify, 0).is_none());
     }
 
     #[test]
