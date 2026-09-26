@@ -74,8 +74,8 @@ pub const LIBOS: bool = cfg!(feature = "libos");
 pub use common::boot_logo;
 pub use common::{
     addr, cache_maint, cmdline, console, context, deadline, defs::*, dma_pin, dma_quarantine,
-    fault_diag, fault_slots, ipi::*, kaddr, kstats, ksyms, oops_log, phys_watch, timer_waker, user,
-    watchpoint,
+    fault_diag, fault_slots, ipi::*, kaddr, kstats, ksyms, oops_log, panic_lock, phys_watch,
+    timer_waker, user, watchpoint,
 };
 pub use config::KernelConfig;
 pub use imp::{

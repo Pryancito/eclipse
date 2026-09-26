@@ -1,5 +1,6 @@
 //! Console input and output.
 
+use crate::common::panic_lock::{ConsoleLock, PANIC_SPIN_BUDGET};
 use crate::drivers;
 use core::fmt::{Arguments, Result, Write};
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
@@ -65,7 +66,11 @@ pub fn klog_emit(priority: u8, msg: &str) {
 
 struct SerialWriter;
 
-static SERIAL_WRITER: spin::Mutex<SerialWriter> = spin::Mutex::new(SerialWriter);
+/// Not a `spin::Mutex`: the panic path has to be able to get out of this one.
+/// See [`crate::panic_lock`] — `SerialWriter::write_str` below ends in an
+/// `unwrap` inside the critical section, so a panic there used to ask this very
+/// CPU to hand back a lock it was still holding, with interrupts off.
+static SERIAL_LOCK: ConsoleLock = ConsoleLock::new();
 
 impl Write for SerialWriter {
     fn write_str(&mut self, s: &str) -> Result {
@@ -84,7 +89,7 @@ impl Write for SerialWriter {
 
 struct DebugWriter;
 
-static DEBUG_WRITER: spin::Mutex<DebugWriter> = spin::Mutex::new(DebugWriter);
+static DEBUG_LOCK: ConsoleLock = ConsoleLock::new();
 
 impl Write for DebugWriter {
     fn write_str(&mut self, s: &str) -> Result {
@@ -640,39 +645,63 @@ pub fn request_clear_graphic_on_next_write() {
     crate::hal_fn::console::console_progress_early(100);
 }
 
+/// This CPU, as the console locks name it.
+fn me() -> u32 {
+    crate::cpu::cpu_id() as u32
+}
+
 /// Writes a string slice into the serial.
 pub fn serial_write_str(s: &str) {
-    if let Some(mut w) = SERIAL_WRITER.try_lock() {
-        let _ = w.write_str(s);
+    if let Some(how) = SERIAL_LOCK.try_acquire(me()) {
+        let _ = SerialWriter.write_str(s);
+        SERIAL_LOCK.release(how);
     }
 }
 
 /// Writes formatted data into the serial.
 pub fn serial_write_fmt(fmt: Arguments) {
-    if let Some(mut w) = SERIAL_WRITER.try_lock() {
-        let _ = w.write_fmt(fmt);
+    if let Some(how) = SERIAL_LOCK.try_acquire(me()) {
+        let _ = SerialWriter.write_fmt(fmt);
+        SERIAL_LOCK.release(how);
     }
 }
 
-/// Writes formatted data into the serial, spinning until the lock is free.
+/// Writes formatted data into the serial, waiting for the lock rather than
+/// dropping the output.
 ///
-/// Use in panic/abort context where dropping output silently is unacceptable.
-/// Caller must ensure interrupts are disabled to avoid deadlock on the same CPU.
+/// Use in panic/abort context, where a silently dropped report is the real
+/// failure. Unlike a plain `lock()`, this always returns: a nested write from
+/// the CPU that already holds the lock goes straight through, and a holder that
+/// never comes back has the lock taken away after [`PANIC_SPIN_BUDGET`] spins.
+/// Interleaved output is a bad report; no output is not a report.
+///
+/// Caller should still have interrupts disabled, so an IRQ cannot interleave
+/// mid-line on this CPU.
 pub fn serial_write_fmt_spin(fmt: Arguments) {
-    let _ = SERIAL_WRITER.lock().write_fmt(fmt);
+    let how = SERIAL_LOCK.acquire_for_panic(me(), PANIC_SPIN_BUDGET, core::hint::spin_loop);
+    let _ = SerialWriter.write_fmt(fmt);
+    SERIAL_LOCK.release(how);
+}
+
+/// How many times a panic write has had to take the serial lock away from a
+/// holder that never gave it back. Non-zero means a CPU died mid-print.
+pub fn serial_lock_steals() -> u32 {
+    SERIAL_LOCK.steals()
 }
 
 /// Writes a string slice into the serial through sbi call.
 pub fn debug_write_str(s: &str) {
-    if let Some(mut w) = DEBUG_WRITER.try_lock() {
-        let _ = w.write_str(s);
+    if let Some(how) = DEBUG_LOCK.try_acquire(me()) {
+        let _ = DebugWriter.write_str(s);
+        DEBUG_LOCK.release(how);
     }
 }
 
 /// Writes formatted data into the serial through sbi call..
 pub fn debug_write_fmt(fmt: Arguments) {
-    if let Some(mut w) = DEBUG_WRITER.try_lock() {
-        let _ = w.write_fmt(fmt);
+    if let Some(how) = DEBUG_LOCK.try_acquire(me()) {
+        let _ = DebugWriter.write_fmt(fmt);
+        DEBUG_LOCK.release(how);
     }
 }
 

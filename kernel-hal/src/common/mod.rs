@@ -26,6 +26,7 @@ pub mod kaddr;
 pub mod kstats;
 pub mod ksyms;
 pub mod oops_log;
+pub mod panic_lock;
 pub mod phys_watch;
 pub mod rand;
 pub mod rtc;
