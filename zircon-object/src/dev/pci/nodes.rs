@@ -1153,7 +1153,7 @@ impl PcieDevice {
             block.register_handler(
                 i,
                 Box::new(move || Self::msi_irq_handler(arc_self.clone(), handler_copy.clone())),
-            );
+            )?;
         }
         self.set_msi_enb(inner, true);
         Ok(())
@@ -1166,7 +1166,11 @@ impl PcieDevice {
             let block = msi.irq_block.lock();
             if block.allocated {
                 for i in 0..block.num_irq {
-                    block.register_handler(i, Box::new(|| {}));
+                    // Unhooking a vector on the way out: nothing to unwind to
+                    // if the interrupt layer has already forgotten the block.
+                    if let Err(err) = block.register_handler(i, Box::new(|| {})) {
+                        warn!("could not unhook MSI vector {}: {:?}", i, err);
+                    }
                 }
                 block.free();
             }
@@ -1187,12 +1191,12 @@ impl PcieDevice {
         let cfg = self.cfg.as_ref().unwrap();
         let addr_reg = std.base + 0x4;
         let addr_reg_upper = std.base + 0x8;
-        let data_reg = std.base + PciCapabilityMsi::addr_offset(msi.is_64bit) as u16;
+        let data_reg = msi.data_offset;
         cfg.write32_(addr_reg as usize, target_addr as u32);
         if msi.is_64bit {
             cfg.write32_(addr_reg_upper as usize, (target_addr >> 32) as u32);
         }
-        cfg.write16_(data_reg as usize, target_data as u16);
+        cfg.write16_(data_reg, target_data as u16);
     }
     fn set_msi_multi_message_enb(
         &self,
@@ -1788,56 +1792,17 @@ pub struct PcieIrqModeCaps {
 #[cfg(test)]
 mod pci_bar_and_config_tests {
     use super::*;
-    use crate::dev::pci::PciAddrSpace;
     use crate::dev::Interrupt;
 
-    /// One PCI function's configuration space, in memory.
-    ///
-    /// [`PciConfig`] in [`PciAddrSpace::MMIO`] mode reads and writes through
-    /// `base` as a raw pointer, so a correctly aligned page of memory is a
-    /// configuration space as far as this module can tell. That is what makes
-    /// the tests below possible at all: the PCI bus driver here only runs
-    /// under Zircon userboot against a real bus, so not one line of it is
+    /// One PCI function's configuration space, in memory: the thing that makes
+    /// the tests below possible at all, since the PCI bus driver only runs
+    /// under Zircon userboot against a real bus and not one line of it is
     /// executed by CI.
-    #[repr(C, align(4096))]
-    struct ConfigSpace([u8; PCIE_EXTENDED_CONFIG_SIZE]);
-
-    impl ConfigSpace {
-        fn new() -> alloc::boxed::Box<Self> {
-            alloc::boxed::Box::new(ConfigSpace([0; PCIE_EXTENDED_CONFIG_SIZE]))
-        }
-
-        /// Hand out the accessor the driver will use. Takes `&mut self` so the
-        /// pointer it keeps may be written through, as a real device's is.
-        fn config(&mut self) -> Arc<PciConfig> {
-            Arc::new(PciConfig {
-                addr_space: PciAddrSpace::MMIO,
-                base: self.0.as_mut_ptr() as usize,
-            })
-        }
-
-        /// Seed a register, as firmware would have left it.
-        fn poke32(&mut self, offset: usize, val: u32) {
-            self.0[offset..offset + 4].copy_from_slice(&val.to_le_bytes());
-        }
-
-        fn peek32(&self, offset: usize) -> u32 {
-            u32::from_le_bytes([
-                self.0[offset],
-                self.0[offset + 1],
-                self.0[offset + 2],
-                self.0[offset + 3],
-            ])
-        }
-
-        fn peek16(&self, offset: usize) -> u16 {
-            u16::from_le_bytes([self.0[offset], self.0[offset + 1]])
-        }
-
-        fn peek8(&self, offset: usize) -> u8 {
-            self.0[offset]
-        }
-    }
+    ///
+    /// It lives in `harness.rs` now, because `caps.rs` and `config.rs` need the
+    /// same one and three copies of a device are three devices that can
+    /// disagree.
+    use super::super::harness::ConfigSpace;
 
     /// A device with nothing but a configuration space behind it: the
     /// identifiers are a real RTX 2060 SUPER (TU106), the card this kernel is
