@@ -76,19 +76,65 @@ impl TimerInner {
             Duration::from_nanos(deadline_ns),
             Box::new(move |_now| {
                 let Some(inner) = weak.upgrade() else { return };
-                if inner.generation.load(SeqCst) != generation {
-                    return; // disarmed / re-armed: this callback is stale
-                }
-                inner.count.fetch_add(1, SeqCst);
-                inner.publish_readiness();
-                let interval = inner.interval_ns.load(SeqCst);
-                if interval > 0 {
-                    let next = kernel_hal::timer::timer_now().as_nanos() as u64 + interval;
+                let now = kernel_hal::timer::timer_now().as_nanos() as u64;
+                if let Some(next) = inner.expire(deadline_ns, generation, now) {
                     inner.schedule(next, generation);
                 }
             }),
         );
     }
+
+    /// The kernel timer scheduled for `deadline_ns` has fired, at `now_ns`.
+    /// Counts the expirations it stands for and says where a periodic timer
+    /// fires next, or `None` for a one-shot or a stale callback.
+    ///
+    /// A periodic timer used to be re-armed at `now + interval` and counted
+    /// as one expiration, however late the callback ran. That is not what a
+    /// period is: Linux keeps the timer on the grid the arm laid down
+    /// (`hrtimer_forward`), so the next expiry is a whole number of periods
+    /// after the programmed one, and every period that went by while the
+    /// timer could not fire (the process was stopped, the CPU was busy, the
+    /// callback ran late) is an expiration the next `read` reports. Here
+    /// each late callback pushed the whole grid back by its own lateness --
+    /// a 16 ms frame timer drifted by every tick's latency, for good -- and
+    /// a timer that missed five periods reported one, so a program pacing
+    /// work by the count it reads did one fifth of it.
+    fn expire(&self, deadline_ns: u64, generation: u64, now_ns: u64) -> Option<u64> {
+        if self.generation.load(SeqCst) != generation {
+            return None; // disarmed / re-armed: this callback is stale
+        }
+        let interval = self.interval_ns.load(SeqCst);
+        let (next, expirations) = if interval > 0 {
+            forward_periodic_ns(deadline_ns, interval, now_ns)
+        } else {
+            (0, 1)
+        };
+        self.count.fetch_add(expirations, SeqCst);
+        self.publish_readiness();
+        (interval > 0).then_some(next)
+    }
+}
+
+/// Where a periodic timer whose expiry was at `expiry_ns` fires next, given
+/// that the callback ran at `now_ns`, and how many expirations that stands
+/// for: `hrtimer_forward`. The next expiry is a whole number of periods
+/// after the programmed one and strictly after `now_ns`; the count is the
+/// expiry that fired plus every whole period that had already gone by.
+/// The twin for POSIX timers and `setitimer` is `forward_periodic` in
+/// linux-syscall's `time.rs`, which reports the overruns separately.
+///
+/// `interval_ns` must be non-zero.
+fn forward_periodic_ns(expiry_ns: u64, interval_ns: u64, now_ns: u64) -> (u64, u64) {
+    let next = expiry_ns.saturating_add(interval_ns);
+    if next > now_ns {
+        return (next, 1);
+    }
+    // Whole periods since the programmed expiry, at least one: the first is
+    // the expiry that fires now, the rest went by unfired.
+    let periods = (now_ns - expiry_ns) / interval_ns;
+    // Saturating all the way: `interval_ns` comes from userspace.
+    let advance = (periods + 1).saturating_mul(interval_ns);
+    (expiry_ns.saturating_add(advance), periods + 1)
 }
 
 /// timerfd implementation.
@@ -576,5 +622,99 @@ mod tests {
             within_two_seconds(|| WOKE.load(Ordering::SeqCst)),
             "the expiry never reached the parked poller"
         );
+    }
+}
+
+/// A periodic timerfd stays on its grid and counts the periods it missed.
+#[cfg(test)]
+mod periodic_grid_tests {
+    use super::*;
+
+    const MS: u64 = 1_000_000;
+
+    #[test]
+    fn a_callback_that_runs_a_little_late_steps_from_the_deadline_not_from_now() {
+        // Armed for 100 ms with a 16 ms period, the callback ran at 101 ms.
+        assert_eq!(
+            forward_periodic_ns(100 * MS, 16 * MS, 101 * MS),
+            (116 * MS, 1)
+        );
+        // Running exactly on time is the same step.
+        assert_eq!(
+            forward_periodic_ns(100 * MS, 16 * MS, 100 * MS),
+            (116 * MS, 1)
+        );
+    }
+
+    #[test]
+    fn periods_that_went_by_unfired_are_counted_and_skipped() {
+        // Two and a half periods late: this expiry, the two it missed, and
+        // the next one is the first grid point after now.
+        assert_eq!(
+            forward_periodic_ns(100 * MS, 16 * MS, 140 * MS),
+            (148 * MS, 3)
+        );
+        // Exactly one period late: `hrtimer_forward` never returns an expiry
+        // at or before now, so the one at 116 counts as passed too.
+        assert_eq!(
+            forward_periodic_ns(100 * MS, 16 * MS, 116 * MS),
+            (132 * MS, 2)
+        );
+    }
+
+    #[test]
+    fn a_stopped_process_s_timer_does_not_fire_ten_thousand_times_to_catch_up() {
+        let (next, count) = forward_periodic_ns(0, MS, 10_000 * MS + MS / 2);
+        assert_eq!(count, 10_001);
+        assert_eq!(next, 10_001 * MS);
+    }
+
+    #[test]
+    fn an_interval_that_overflows_saturates_instead_of_wrapping() {
+        // Armed at 0 with a period of 2^63 ns, reached at the end of time:
+        // one period went by, and two of them do not fit in a u64.
+        let (next, count) = forward_periodic_ns(0, 1 << 63, u64::MAX);
+        assert_eq!(count, 2);
+        assert_eq!(next, u64::MAX);
+        let (next, count) = forward_periodic_ns(u64::MAX - 5, u64::MAX / 2, u64::MAX);
+        assert_eq!(count, 1);
+        assert_eq!(next, u64::MAX);
+    }
+
+    fn inner(interval_ns: u64) -> Arc<TimerInner> {
+        Arc::new(TimerInner {
+            count: AtomicU64::new(0),
+            interval_ns: AtomicU64::new(interval_ns),
+            next_deadline_ns: AtomicU64::new(0),
+            generation: AtomicU64::new(7),
+            eventbus: EventBus::new(),
+        })
+    }
+
+    #[test]
+    fn a_late_expiry_adds_every_missed_period_to_the_count_and_reschedules_on_the_grid() {
+        let t = inner(5 * MS);
+        // Scheduled for 50 ms, ran at 63 ms: 50 fired, 55 and 60 went by.
+        assert_eq!(t.expire(50 * MS, 7, 63 * MS), Some(65 * MS));
+        assert_eq!(t.count.load(SeqCst), 3);
+        assert!(t.eventbus.lock().events().contains(Event::READABLE));
+        // The next one on time adds one more.
+        assert_eq!(t.expire(65 * MS, 7, 65 * MS + 100), Some(70 * MS));
+        assert_eq!(t.count.load(SeqCst), 4);
+    }
+
+    #[test]
+    fn a_one_shot_counts_once_and_asks_for_nothing_more() {
+        let t = inner(0);
+        assert_eq!(t.expire(50 * MS, 7, 90 * MS), None);
+        assert_eq!(t.count.load(SeqCst), 1);
+    }
+
+    #[test]
+    fn a_stale_callback_counts_nothing() {
+        let t = inner(5 * MS);
+        assert_eq!(t.expire(50 * MS, 6, 63 * MS), None);
+        assert_eq!(t.count.load(SeqCst), 0);
+        assert!(!t.eventbus.lock().events().contains(Event::READABLE));
     }
 }
