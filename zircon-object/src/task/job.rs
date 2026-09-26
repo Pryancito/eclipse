@@ -38,8 +38,17 @@ pub struct Job {
     parent_policy: JobPolicy,
     exceptionate: Arc<Exceptionate>,
     debug_exceptionate: Arc<Exceptionate>,
+    /// How many more levels of jobs may hang under this one.
+    max_height: u32,
     inner: Mutex<JobInner>,
 }
+
+/// How deep the job tree goes under the root: Zircon's `kRootJobMaxHeight`.
+///
+/// `kill`, `find_process` and `Drop` walk the tree one frame per level,
+/// so a tree as deep as userspace cared to nest it was a kernel stack
+/// overflow waiting for the first walk.
+pub const ROOT_JOB_MAX_HEIGHT: u32 = 32;
 
 impl_kobject!(Job
     fn get_child(&self, id: KoID) -> ZxResult<Arc<dyn KernelObject>> {
@@ -100,6 +109,7 @@ impl Job {
             parent_policy: JobPolicy::default(),
             exceptionate: Exceptionate::new(ExceptionChannelType::Job),
             debug_exceptionate: Exceptionate::new(ExceptionChannelType::JobDebugger),
+            max_height: ROOT_JOB_MAX_HEIGHT,
             inner: Mutex::new(JobInner::default()),
         });
         job.inner.lock().self_ref = Arc::downgrade(&job);
@@ -107,7 +117,13 @@ impl Job {
     }
 
     /// Create a new child job object.
+    ///
+    /// Fails with `OUT_OF_RANGE` when this job already sits
+    /// [`ROOT_JOB_MAX_HEIGHT`] levels under the root, as `zx_job_create` does.
     pub fn create_child(self: &Arc<Self>) -> ZxResult<Arc<Self>> {
+        if self.max_height == 0 {
+            return Err(ZxError::OUT_OF_RANGE);
+        }
         let mut inner = self.inner.lock();
         if inner.killed {
             return Err(ZxError::BAD_STATE);
@@ -119,6 +135,7 @@ impl Job {
             parent_policy: inner.policy.merge(&self.parent_policy),
             exceptionate: Exceptionate::new(ExceptionChannelType::Job),
             debug_exceptionate: Exceptionate::new(ExceptionChannelType::JobDebugger),
+            max_height: self.max_height - 1,
             inner: Mutex::new(JobInner::default()),
         });
         let child_weak = Arc::downgrade(&child);
@@ -363,6 +380,28 @@ mod tests {
 
         root_job.kill();
         assert_eq!(root_job.create_child().err(), Some(ZxError::BAD_STATE));
+    }
+
+    /// Jobs nested without limit, and every walk of the tree (`kill`,
+    /// `find_process`, `Drop`) is one stack frame per level. The tree stops
+    /// `ROOT_JOB_MAX_HEIGHT` levels under the root, where `zx_job_create`
+    /// answers `OUT_OF_RANGE`.
+    #[test]
+    fn the_job_tree_stops_at_the_root_max_height() {
+        let root = Job::root();
+        let mut job = root.clone();
+        for level in 1..=ROOT_JOB_MAX_HEIGHT {
+            job = job
+                .create_child()
+                .unwrap_or_else(|e| panic!("level {} refused: {:?}", level, e));
+        }
+        assert_eq!(job.create_child().err(), Some(ZxError::OUT_OF_RANGE));
+        assert!(
+            job.parent().unwrap().create_child().is_ok(),
+            "one level up there is still room"
+        );
+        root.kill();
+        assert_eq!(job.create_child().err(), Some(ZxError::OUT_OF_RANGE));
     }
 
     /// `ZX_JOB_POL_RELATIVE` means "applied for the conditions not
