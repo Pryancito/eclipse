@@ -1743,19 +1743,33 @@ impl LinuxProcess {
         file: Arc<dyn FileLike>,
         cloexec: bool,
     ) -> LxResult<Option<Arc<dyn FileLike>>> {
-        let mut inner = self.inner.lock();
-        let old = inner.files.remove(&fd);
-        // Net table size is unchanged (replace) or +1 (plain insert); apply the
-        // same limit check as insert_file for the growth case.
-        if old.is_none() && inner.files.len() >= inner.nofile() {
-            return Err(LxError::EMFILE);
+        let forget;
+        let old = {
+            let mut inner = self.inner.lock();
+            let old = inner.files.remove(&fd);
+            // Net table size is unchanged (replace) or +1 (plain insert); apply the
+            // same limit check as insert_file for the growth case.
+            if old.is_none() && inner.files.len() >= inner.nofile() {
+                return Err(LxError::EMFILE);
+            }
+            if cloexec {
+                inner.cloexec_fds.insert(fd);
+            } else {
+                inner.cloexec_fds.remove(&fd);
+            }
+            inner.files.insert(fd, file);
+            // `dup2` onto an open descriptor closes it, and closing it tells
+            // the epolls, like `close` does. Planned after the insert so the
+            // new file at `fd` counts as a holder if it is the same
+            // description (`dup2(fd, fd)` is a no-op in Linux too).
+            forget = old
+                .as_ref()
+                .map(|f| inner.epoll_forget_plan(vec![(fd, f.clone())]));
+            old
+        };
+        if let Some(forget) = forget {
+            forget.run();
         }
-        if cloexec {
-            inner.cloexec_fds.insert(fd);
-        } else {
-            inner.cloexec_fds.remove(&fd);
-        }
-        inner.files.insert(fd, file);
         Ok(old)
     }
 
@@ -2329,11 +2343,18 @@ impl LinuxProcess {
     /// same spinlock. Seen live as a hard SMP deadlock:
     ///   [DEADLOCK cpu=1 at pgid_raw, HOLDER cpu=1 at close_file].
     pub fn close_file(&self, fd: FileDesc) -> LxResult {
-        let removed = {
+        let (removed, forget) = {
             let mut inner = self.inner.lock();
             inner.cloexec_fds.remove(&fd);
-            inner.files.remove(&fd)
+            let removed = inner.files.remove(&fd);
+            let forget = removed
+                .as_ref()
+                .map(|f| inner.epoll_forget_plan(vec![(fd, f.clone())]));
+            (removed, forget)
         };
+        if let Some(forget) = forget {
+            forget.run();
+        }
         removed.map(drop).ok_or(LxError::EBADF)
     }
 
@@ -2364,7 +2385,7 @@ impl LinuxProcess {
     pub fn close_range(&self, first: FileDesc, last: FileDesc) {
         // Collect the removed files and drop them only after `inner` is
         // released — see `close_file` for the re-entrancy deadlock this avoids.
-        let removed: Vec<(FileDesc, Arc<dyn FileLike>)> = {
+        let (removed, forget): (Vec<(FileDesc, Arc<dyn FileLike>)>, _) = {
             let mut inner = self.inner.lock();
             let fds: Vec<_> = inner
                 .files
@@ -2372,13 +2393,17 @@ impl LinuxProcess {
                 .filter(|&&fd| fd >= first && fd <= last)
                 .cloned()
                 .collect();
-            fds.into_iter()
+            let removed: Vec<_> = fds
+                .into_iter()
                 .filter_map(|fd| {
                     inner.cloexec_fds.remove(&fd);
                     inner.files.remove(&fd).map(|f| (fd, f))
                 })
-                .collect()
+                .collect();
+            let forget = inner.epoll_forget_plan(removed.clone());
+            (removed, forget)
         };
+        forget.run();
         for (fd, f) in removed {
             // DRM diagnostics: see fs::drm_fd_desc.
             if let Some(desc) = crate::fs::drm_fd_desc(&f) {
@@ -3440,17 +3465,19 @@ impl LinuxProcess {
         // Remove under the lock, DROP outside it — see `close_file` for the
         // re-entrancy deadlock this avoids.
         type RemovedFds = Vec<(FileDesc, Arc<dyn FileLike>)>;
-        let (removed, exec_path): (RemovedFds, String) = {
+        let (removed, forget, exec_path): (RemovedFds, _, String) = {
             let mut inner = self.inner.lock();
             // Per-fd state is authoritative — NOT the flag inside the (possibly
             // fork-shared) `File` objects, which is only a creation-time record.
             let close_fds = inner.cloexec_fds.drain().collect::<Vec<_>>();
-            let removed = close_fds
+            let removed: RemovedFds = close_fds
                 .into_iter()
                 .filter_map(|fd| inner.files.remove(&fd).map(|f| (fd, f)))
                 .collect();
-            (removed, inner.execute_path.clone())
+            let forget = inner.epoll_forget_plan(removed.clone());
+            (removed, forget, inner.execute_path.clone())
         };
+        forget.run();
         for (fd, f) in removed {
             // DRM diagnostics: removal of a DRM/dmabuf fd — see
             // fs::drm_fd_desc. debug level: this is NORMAL CLOEXEC behavior
@@ -3552,7 +3579,59 @@ impl LinuxProcess {
     }
 }
 
+/// What a close has to tell this process's epolls, decided under the table
+/// lock and delivered after it: [`LinuxProcessInner::epoll_forget_plan`].
+pub(crate) struct EpollForgetPlan {
+    epolls: Vec<Arc<crate::fs::Epoll>>,
+    gone: Vec<(FileDesc, Arc<dyn FileLike>)>,
+}
+
+impl EpollForgetPlan {
+    /// Remove every `gone` entry from every epoll. Called with the table lock
+    /// released: an epoll takes its own lock, and the `Arc`s dropped here may
+    /// be the description's last, whose teardown re-enters the process (see
+    /// [`LinuxProcess::close_file`]).
+    pub(crate) fn run(self) {
+        for epoll in &self.epolls {
+            for (_, file) in &self.gone {
+                epoll.forget_closed(file);
+            }
+        }
+    }
+}
+
 impl LinuxProcessInner {
+    /// The closed descriptors whose open file description no descriptor of
+    /// this table holds any more, with the epolls of this table that may
+    /// watch them.
+    ///
+    /// Linux drops an epoll entry from `__fput`, when the LAST reference to
+    /// the description goes: a `dup` of a watched descriptor keeps its entry
+    /// alive through the close of the original, and epoll(7) tells the
+    /// program to `EPOLL_CTL_DEL` explicitly in that case. The references
+    /// this table can see are its own, which is where every dup made by
+    /// `dup`, `dup2` and `fcntl(F_DUPFD)` lives; a fork's copy of the same
+    /// description in another process is not counted, and its own close
+    /// tells its own epolls.
+    ///
+    /// `closed` must already be out of `files`.
+    fn epoll_forget_plan(&self, closed: Vec<(FileDesc, Arc<dyn FileLike>)>) -> EpollForgetPlan {
+        let epolls: Vec<Arc<crate::fs::Epoll>> = self
+            .files
+            .values()
+            .filter_map(|f| f.clone().downcast_arc::<crate::fs::Epoll>().ok())
+            .collect();
+        let gone = if epolls.is_empty() {
+            Vec::new()
+        } else {
+            closed
+                .into_iter()
+                .filter(|(_, file)| !self.files.values().any(|f| Arc::ptr_eq(f, file)))
+                .collect()
+        };
+        EpollForgetPlan { epolls, gone }
+    }
+
     /// Everything a `fork(2)` child starts life with, decided field by field.
     ///
     /// Written out in full, with no `..Default::default()`, on purpose: a
