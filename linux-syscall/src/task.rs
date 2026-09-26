@@ -103,13 +103,45 @@ pub(crate) async fn sleep_or_eintr(
     }
 }
 
-fn write_sigchld_info(mut infop: UserOutPtr<SigInfo>, pid: KoID, status: i32) -> SysResult {
-    if infop.is_null() {
-        return Ok(0);
+/// The child's final CPU usage as `wait4(2)` and `waitid(2)` hand it out:
+/// what `time(1)` prints. The struct is written in the FULL Linux layout,
+/// the fields this kernel does not account for as zero.
+fn child_rusage(cpu: linux_object::process::ChildCpu) -> RUsage {
+    RUsage {
+        utime: core::time::Duration::from_nanos(cpu.utime_ns).into(),
+        stime: core::time::Duration::from_nanos(cpu.stime_ns).into(),
+        ..RUsage::default()
     }
-    let uid = linux_object::process::real_uid_of(pid);
-    infop.write(SigInfo::child_state_change(pid as i32, uid, status))?;
-    Ok(0)
+}
+
+/// What `waitid(2)` leaves in its two out-pointers.
+pub(crate) struct WaitidReport {
+    /// `infop`, always written: the `SIGCHLD` `siginfo_t` of the child
+    /// reported, or, when `WNOHANG` found nothing, a `siginfo_t` with
+    /// `si_signo` and `si_pid` zero, which is how the caller tells the two
+    /// apart (`waitid(2)`, and `sys_waitid` in `kernel/exit.c`, which
+    /// writes the six fields whatever `kernel_waitid` found).
+    pub info: SigInfo,
+    /// `rusage`, written only when a child was reported: `sys_waitid`
+    /// copies it out under `if (err > 0)`.
+    pub rusage: Option<RUsage>,
+}
+
+/// The `waitid(2)` report for what `do_wait` found: the child's pid, real
+/// uid, status word and CPU time, or nothing.
+pub(crate) fn waitid_report(
+    child: Option<(i32, u32, i32, linux_object::process::ChildCpu)>,
+) -> WaitidReport {
+    match child {
+        Some((pid, uid, status, cpu)) => WaitidReport {
+            info: SigInfo::child_state_change(pid, uid, status),
+            rusage: Some(child_rusage(cpu)),
+        },
+        None => WaitidReport {
+            info: SigInfo::default(),
+            rusage: None,
+        },
+    }
 }
 
 fn is_child_process(
@@ -746,25 +778,23 @@ impl Syscall<'_> {
             Err(e) => return Err(e),
         };
         wstatus.write_if_not_null(code)?;
-        // The child's final CPU usage, captured at its exit — what `time(1)`
-        // prints. The argument used to be dropped entirely, leaving callers to
-        // read whatever stack garbage sat in their buffer; the struct is
-        // written in the FULL Linux layout.
-        rusage.write_if_not_null(RUsage {
-            utime: core::time::Duration::from_nanos(cpu.utime_ns).into(),
-            stime: core::time::Duration::from_nanos(cpu.stime_ns).into(),
-            ..RUsage::default()
-        })?;
+        // The argument used to be dropped entirely, leaving callers to read
+        // whatever stack garbage sat in their buffer.
+        rusage.write_if_not_null(child_rusage(cpu))?;
         Ok(pid as usize)
     }
 
     /// Wait for a child state change (`waitid(2)`). Supports `P_PID`, `P_PIDFD`, and `P_ALL`.
+    ///
+    /// The fifth argument is `struct rusage *`, the child's CPU time, as in
+    /// `wait4(2)`; the dispatcher used to stop at the fourth.
     pub async fn sys_waitid(
         &self,
         idtype: i32,
         id: usize,
-        infop: UserOutPtr<SigInfo>,
+        mut infop: UserOutPtr<SigInfo>,
         options: u32,
+        mut rusage: UserOutPtr<RUsage>,
     ) -> SysResult {
         let WaitOptions {
             nohang,
@@ -783,8 +813,8 @@ impl Syscall<'_> {
                 // `kernel_waitid`: an `id_t` read as a `pid_t`, positive.
                 let id = crate::intarg::waitid_id(id, false)?;
                 match wait_child_interest(caller, id as KoID, nohang, reap, interest).await {
-                    Ok((code, _cpu)) => Ok((id as KoID, code)),
-                    Err(LxError::EAGAIN) if nohang => Ok((0, 0)),
+                    Ok((code, cpu)) => Ok(Some((id as KoID, code, cpu))),
+                    Err(LxError::EAGAIN) if nohang => Ok(None),
                     Err(e) => Err(e),
                 }
             }
@@ -801,14 +831,14 @@ impl Syscall<'_> {
                     return Err(LxError::EAGAIN);
                 }
                 match wait_child_interest(caller, target.id(), nohang, reap, interest).await {
-                    Ok((code, _cpu)) => Ok((target.id(), code)),
-                    Err(LxError::EAGAIN) if nohang => Ok((0, 0)),
+                    Ok((code, cpu)) => Ok(Some((target.id(), code, cpu))),
+                    Err(LxError::EAGAIN) if nohang => Ok(None),
                     Err(e) => Err(e),
                 }
             }
             P_ALL => match wait_child_any_interest(caller, nohang, reap, interest, None).await {
-                Ok((pid, code, _cpu)) => Ok((pid, code)),
-                Err(LxError::EAGAIN) if nohang => Ok((0, 0)),
+                Ok((pid, code, cpu)) => Ok(Some((pid, code, cpu))),
+                Err(LxError::EAGAIN) if nohang => Ok(None),
                 Err(e) => Err(e),
             },
             P_PGID => {
@@ -820,23 +850,34 @@ impl Syscall<'_> {
                     id as KoID
                 };
                 match wait_child_any_interest(caller, nohang, reap, interest, Some(pgid)).await {
-                    Ok((pid, code, _cpu)) => Ok((pid, code)),
-                    Err(LxError::EAGAIN) if nohang => Ok((0, 0)),
+                    Ok((pid, code, cpu)) => Ok(Some((pid, code, cpu))),
+                    Err(LxError::EAGAIN) if nohang => Ok(None),
                     Err(e) => Err(e),
                 }
             }
             _ => return Err(LxError::EINVAL),
         };
 
-        let (child_pid, status) = res?;
-
-        if child_pid != 0 {
-            // The WHOLE status word: `si_code` and `si_status` are taken out
-            // of it together (`child_si_code_and_status`), because which
-            // number `si_status` carries depends on which of the three things
-            // happened. Shifting it down eight bits here threw that away and
-            // left every child reported as `CLD_EXITED`.
-            write_sigchld_info(infop, child_pid, status)?;
+        // The WHOLE status word goes into the report: `si_code` and
+        // `si_status` are taken out of it together
+        // (`child_si_code_and_status`), because which number `si_status`
+        // carries depends on which of the three things happened. Shifting it
+        // down eight bits here threw that away and left every child reported
+        // as `CLD_EXITED`.
+        let report = waitid_report(res?.map(|(pid, status, cpu)| {
+            (
+                pid as i32,
+                linux_object::process::real_uid_of(pid),
+                status,
+                cpu,
+            )
+        }));
+        // `infop` is written whether or not a child was found: a `WNOHANG`
+        // that found nothing leaves `si_pid` zero, and used to leave the
+        // caller's struct untouched, with the previous call's child in it.
+        infop.write_if_not_null(report.info)?;
+        if let Some(rusage_of_child) = report.rusage {
+            rusage.write_if_not_null(rusage_of_child)?;
         }
         Ok(0)
     }
@@ -2854,6 +2895,69 @@ mod wait_option_tests {
                 stray
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod waitid_report_tests {
+    //! The two out-pointers of `waitid(2)`. The fifth argument, `struct
+    //! rusage *`, was never read by the dispatcher, so `waitid` could not
+    //! report a child's CPU time; and `infop` was written only when a child
+    //! was found, so a `WNOHANG` that found nothing handed the caller back
+    //! whatever the previous call had left there.
+
+    use super::*;
+    use linux_object::process::ChildCpu;
+    use linux_object::signal::Signal as LinuxSignal;
+
+    fn word(info: &SigInfo, at: usize) -> i32 {
+        let b = info.as_bytes();
+        i32::from_ne_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]])
+    }
+
+    /// `sys_waitid` in `kernel/exit.c` writes `si_signo`, `si_errno`,
+    /// `si_code`, `si_pid`, `si_uid` and `si_status` whatever
+    /// `kernel_waitid` found; when it found nothing they are all zero, and
+    /// `si_pid == 0` is how `waitid(2)` says to tell.
+    #[test]
+    fn nothing_found_zeroes_infop_and_leaves_rusage_alone() {
+        let report = waitid_report(None);
+        assert!(report.info.as_bytes().iter().all(|&b| b == 0));
+        assert_eq!(word(&report.info, 16), 0, "si_pid");
+        assert!(report.rusage.is_none());
+    }
+
+    /// A child found is a `SIGCHLD` `siginfo_t` with its pid where glibc
+    /// reads `si_pid`, and its CPU time in the `rusage`.
+    #[test]
+    fn a_reported_child_carries_its_pid_and_its_cpu_time() {
+        let cpu = ChildCpu {
+            utime_ns: 1_500_000_000,
+            stime_ns: 250_000,
+        };
+        let report = waitid_report(Some((4242, 1000, 7 << 8, cpu)));
+        assert_eq!(report.info.signo, LinuxSignal::SIGCHLD as i32);
+        assert_eq!(word(&report.info, 16), 4242, "si_pid");
+        assert_eq!(word(&report.info, 20), 1000, "si_uid");
+        assert_eq!(word(&report.info, 24), 7, "si_status");
+        let rusage = report.rusage.expect("a child was reported");
+        assert_eq!((rusage.utime.sec, rusage.utime.usec), (1, 500_000));
+        assert_eq!((rusage.stime.sec, rusage.stime.usec), (0, 250));
+        assert!(rusage.other.iter().all(|&f| f == 0), "the rest is zero");
+    }
+
+    /// The same struct `wait4` writes: `time(1)` over either call agrees.
+    #[test]
+    fn waitid_and_wait4_hand_out_the_same_rusage() {
+        let cpu = ChildCpu {
+            utime_ns: 3_000_000_000,
+            stime_ns: 2_000_000_000,
+        };
+        let via_wait4 = child_rusage(cpu);
+        let via_waitid = waitid_report(Some((1, 0, 0, cpu))).rusage.unwrap();
+        assert_eq!(via_wait4.utime.sec, via_waitid.utime.sec);
+        assert_eq!(via_wait4.stime.sec, via_waitid.stime.sec);
+        assert_eq!(via_wait4.stime.sec, 2);
     }
 }
 
