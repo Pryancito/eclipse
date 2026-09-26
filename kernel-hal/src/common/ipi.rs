@@ -160,9 +160,11 @@ impl Drop for PublishGuard {
 /// It is also the probe that fires most: `entry_at` has caught this word
 /// wrong on most recent boots, and what it holds is telling —
 ///
-///     len=0xffffff00218688e0  size=0xffffff00006567c1   (two kernel pointers)
-///     len=18446742974756925680  size=18446742974756926704  (a pair 1024 apart)
-///     len=6  size=0
+/// ```text
+/// len=0xffffff00218688e0  size=0xffffff00006567c1   (two kernel pointers)
+/// len=18446742974756925680  size=18446742974756926704  (a pair 1024 apart)
+/// len=6  size=0
+/// ```
 ///
 /// — foreign data, not a single stray byte. A `Vec` that is allocated once by
 /// a `lazy_static` and never freed cannot be written by its owner, so either

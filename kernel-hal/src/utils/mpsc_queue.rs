@@ -154,7 +154,9 @@ impl<'a, T: Copy> MpscQueue<'a, T> {
     /// wild write has landed on the queue's own fat pointer. Both observed
     /// values were kernel addresses —
     ///
-    ///     len=0xffffff00218688e0 (a coroutine stack)  size=0xffffff00006567c1
+    /// ```text
+    /// len=0xffffff00218688e0 (a coroutine stack)  size=0xffffff00006567c1
+    /// ```
     ///
     /// — so *neither* bound may be used. An earlier version wrapped by `len`,
     /// which stops the panic but is worse than it: the slice claims that
