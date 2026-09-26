@@ -53,6 +53,38 @@ fn stream_full(error: ZxError, written: usize) -> ZxResult {
     }
 }
 
+/// Feed the iovecs of a gather to `write` one by one and answer the bytes
+/// that went in. A write the VMO cut short (it ran out of room part-way
+/// through an iovec) ends the gather there, with what was written so far:
+/// the bytes after it have no room either, and `writev_at` used to advance
+/// its offset by the iovec's full length past such a cut, so the next iovec
+/// would have started beyond the bytes actually written. A refusal is
+/// `stream_full`'s to judge.
+///
+/// `write` gets each iovec's bytes and the bytes written before it, which is
+/// the distance from the gather's starting offset.
+fn write_gather<'a>(
+    iovecs: impl Iterator<Item = ZxResult<&'a [u8]>>,
+    mut write: impl FnMut(&[u8], usize) -> ZxResult<usize>,
+) -> ZxResult<usize> {
+    let mut written = 0;
+    for data in iovecs {
+        let data = data?;
+        let count = match write(data, written) {
+            Ok(count) => count,
+            Err(error) => {
+                stream_full(error, written)?;
+                break;
+            }
+        };
+        written += count;
+        if count < data.len() {
+            break;
+        }
+    }
+    Ok(written)
+}
+
 impl Syscall<'_> {
     /// Create a stream from a VMO.
     ///   
@@ -113,16 +145,12 @@ impl Syscall<'_> {
             None,
         )?;
         validate_iovec_buffers(proc, &data, MMUFlags::READ)?;
-        let mut actual_count = 0;
-        for io_vec in data.iter() {
-            match stream.write(io_vec.as_slice()?, options.contains(WriteOptions::APPEND)) {
-                Ok(count) => actual_count += count,
-                Err(error) => {
-                    stream_full(error, actual_count)?;
-                    break;
-                }
-            }
-        }
+        let append = options.contains(WriteOptions::APPEND);
+        let actual_count = write_gather(
+            data.iter()
+                .map(|io_vec| io_vec.as_slice().map_err(ZxError::from)),
+            |bytes, _| stream.write(bytes, append),
+        )?;
         actual_count_ptr.write_if_not_null(actual_count)?;
         Ok(())
     }
@@ -132,7 +160,7 @@ impl Syscall<'_> {
         &self,
         handle_value: HandleValue,
         options: u32,
-        mut offset: usize,
+        offset: usize,
         vector: UserInPtr<IoVecIn>,
         vector_size: usize,
         mut actual_count_ptr: UserOutPtr<usize>,
@@ -149,17 +177,13 @@ impl Syscall<'_> {
         let data = read_iovecs(proc, vector, vector_size)?;
         stream.check_write_size(data.total_len(), false, Some(offset))?;
         validate_iovec_buffers(proc, &data, MMUFlags::READ)?;
-        let mut actual_count = 0;
-        for io_vec in data.iter() {
-            match stream.write_at(io_vec.as_slice()?, offset) {
-                Ok(count) => actual_count += count,
-                Err(error) => {
-                    stream_full(error, actual_count)?;
-                    break;
-                }
-            }
-            offset += io_vec.len();
-        }
+        // Each iovec goes right after the bytes written before it, not after
+        // the bytes asked for: they differ once the VMO cut a write short.
+        let actual_count = write_gather(
+            data.iter()
+                .map(|io_vec| io_vec.as_slice().map_err(ZxError::from)),
+            |bytes, written| stream.write_at(bytes, offset + written),
+        )?;
         actual_count_ptr.write_if_not_null(actual_count)?;
         Ok(())
     }
@@ -245,5 +269,81 @@ impl Syscall<'_> {
         let new_seek = stream.seek(whence, offset)?;
         out_seek.write_if_not_null(new_seek)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod write_gather_tests {
+    //! `zx_stream_writev_at` advanced its offset by each iovec's full length,
+    //! not by what the VMO took: after a write the VMO cut short, the next
+    //! iovec would have been placed past the cut. Both gathers share one
+    //! loop now, and it stops at the first short write.
+
+    use super::*;
+    use alloc::vec::Vec;
+
+    fn iovecs<'a>(parts: &'a [&'a [u8]]) -> impl Iterator<Item = ZxResult<&'a [u8]>> {
+        parts.iter().map(|part| Ok(*part))
+    }
+
+    /// A VMO of `room` bytes: each write takes what fits after `written`
+    /// and refuses with `OUT_OF_RANGE` once nothing does. Records where
+    /// each write was asked to go and how much went in, a refused one as
+    /// 0 bytes.
+    fn vmo_of(
+        room: usize,
+        placed: &mut Vec<(usize, usize)>,
+    ) -> impl FnMut(&[u8], usize) -> ZxResult<usize> + '_ {
+        move |bytes, written| {
+            let count = bytes.len().min(room.saturating_sub(written));
+            placed.push((written, count));
+            if count == 0 {
+                return Err(ZxError::OUT_OF_RANGE);
+            }
+            Ok(count)
+        }
+    }
+
+    #[test]
+    fn every_iovec_goes_right_after_the_bytes_the_one_before_it_wrote() {
+        let mut placed = Vec::new();
+        let got = write_gather(
+            iovecs(&[&[1; 30], &[2; 30], &[3; 30]]),
+            vmo_of(100, &mut placed),
+        );
+        assert_eq!(got, Ok(90));
+        assert_eq!(placed, [(0, 30), (30, 30), (60, 30)]);
+    }
+
+    #[test]
+    fn a_write_the_vmo_cut_short_ends_the_gather_with_what_went_in() {
+        let mut placed = Vec::new();
+        let got = write_gather(
+            iovecs(&[&[1; 30], &[2; 30], &[3; 30]]),
+            vmo_of(45, &mut placed),
+        );
+        assert_eq!(got, Ok(45));
+        // The third iovec is never offered to the VMO: it would have been
+        // asked to go at 60, past the 45 bytes that exist.
+        assert_eq!(placed, [(0, 30), (30, 15)]);
+    }
+
+    #[test]
+    fn a_refusal_after_some_bytes_is_a_short_answer_and_before_any_an_error() {
+        let mut placed = Vec::new();
+        let got = write_gather(iovecs(&[&[1; 30], &[2; 30]]), vmo_of(30, &mut placed));
+        assert_eq!(got, Ok(30));
+        assert_eq!(placed, [(0, 30), (30, 0)]);
+        let got = write_gather(iovecs(&[&[1; 30]]), vmo_of(0, &mut placed));
+        assert_eq!(got, Err(ZxError::OUT_OF_RANGE));
+        let got = write_gather(iovecs(&[&[1; 30]]), |_, _| Err(ZxError::BAD_STATE));
+        assert_eq!(got, Err(ZxError::BAD_STATE));
+    }
+
+    #[test]
+    fn an_iovec_that_cannot_be_read_is_the_caller_s_error() {
+        let parts: Vec<ZxResult<&[u8]>> = alloc::vec![Ok(&[1; 4]), Err(ZxError::INVALID_ARGS)];
+        let got = write_gather(parts.into_iter(), |bytes, _| Ok(bytes.len()));
+        assert_eq!(got, Err(ZxError::INVALID_ARGS));
     }
 }
