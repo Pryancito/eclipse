@@ -91,6 +91,31 @@ pub const CAP_SYS_TIME: u32 = 25;
 /// set and [`LinuxProcess::capable`] all measure against this one number.
 pub const CAP_LAST_CAP: u32 = 40;
 
+/// Whether one id pair holds **every** id of `target` -- all three uids and all
+/// three gids.
+///
+/// The six comparisons of `check_prlimit_permission()` and
+/// `__ptrace_may_access()`, which are the same six lines written twice in
+/// Linux and once here. They are not "same user": they are "that process holds
+/// no id I do not already have", so a target part-way through a set-user-ID
+/// dance is out of reach even for the user who started it.
+///
+/// What the three callers disagree about is **which pair of the caller's ids**
+/// they hand in, and that one argument is the whole difference between them:
+/// the real pair for `prlimit64` and `pidfd_getfd`
+/// (`PTRACE_MODE_*_REALCREDS`), the filesystem pair for the gated files of
+/// `/proc/<pid>/` (`PTRACE_MODE_READ_FSCREDS`). Passing the wrong one reads as
+/// correct code, so each caller says which it means in one line and there is a
+/// test per caller that moves the two apart.
+fn holds_every_id_of(caller_uid: u32, caller_gid: u32, target: &Credentials) -> bool {
+    caller_uid == target.ruid
+        && caller_uid == target.euid
+        && caller_uid == target.suid
+        && caller_gid == target.rgid
+        && caller_gid == target.egid
+        && caller_gid == target.sgid
+}
+
 /// Whether a process with effective uid `euid` holds capability `cap`.
 ///
 /// Split from the process so the rule can be read on its own: it is the
@@ -1714,19 +1739,11 @@ impl LinuxProcess {
     ///         return -EPERM;
     /// ```
     ///
-    /// Note which ids: the caller's REAL pair against all three of the
-    /// target's, every one of them. It is not "same user" -- it is "that
-    /// process has no id I do not already have", so a target that is
-    /// part-way through a set-user-ID dance is out of reach even for the
-    /// user who started it.
+    /// The six comparisons are [`holds_every_id_of`]; what this rule chooses is
+    /// the caller's **REAL** pair, and `CAP_SYS_RESOURCE` as the way past them.
     pub fn may_touch_limits_of(caller: &Credentials, target: &Credentials) -> bool {
-        let ids_match = caller.ruid == target.ruid
-            && caller.ruid == target.euid
-            && caller.ruid == target.suid
-            && caller.rgid == target.rgid
-            && caller.rgid == target.egid
-            && caller.rgid == target.sgid;
-        ids_match || has_capability(caller.euid, CAP_SYS_RESOURCE)
+        holds_every_id_of(caller.ruid, caller.rgid, target)
+            || has_capability(caller.euid, CAP_SYS_RESOURCE)
     }
 
     /// Whether `caller` may reach INTO `target`: read its memory, trace it, or
@@ -1749,14 +1766,15 @@ impl LinuxProcess {
     /// return -EPERM;
     /// ```
     ///
-    /// The six comparisons are [`Self::may_touch_limits_of`]'s, to the letter
-    /// -- and that is the trap. The two rules differ in the two places the
-    /// comparisons do not show: the capability that lifts them
-    /// (`CAP_SYS_PTRACE` here, `CAP_SYS_RESOURCE` there) and the escape
-    /// hatch, which `prlimit64` does not have at all. Taking an fd out of
-    /// your OWN process is a `dup`, so the thread group goes through before
-    /// any id is read; `check_prlimit_permission()` compares `current ==
-    /// task` instead and leaves a sibling thread to the ids.
+    /// The six comparisons are [`holds_every_id_of`], the same ones
+    /// [`Self::may_touch_limits_of`] makes -- Linux writes them out twice, and
+    /// they are written once here precisely so they cannot drift apart. What
+    /// this rule chooses is the caller's **REAL** pair (`REALCREDS`),
+    /// `CAP_SYS_PTRACE` as the way past them, and an escape hatch `prlimit64`
+    /// does not have at all: taking an fd out of your OWN process is a `dup`,
+    /// so the thread group goes through before any id is read, where
+    /// `check_prlimit_permission()` compares `current == task` and leaves a
+    /// sibling thread to the ids.
     ///
     /// Linux has a seventh test after these: a target that dropped privileges
     /// and became non-dumpable is out of reach even for an id match. There is
@@ -1777,13 +1795,40 @@ impl LinuxProcess {
         if same_thread_group {
             return true;
         }
-        let ids_match = caller.ruid == target.ruid
-            && caller.ruid == target.euid
-            && caller.ruid == target.suid
-            && caller.rgid == target.rgid
-            && caller.rgid == target.egid
-            && caller.rgid == target.sgid;
-        ids_match || has_capability(caller.euid, CAP_SYS_PTRACE)
+        holds_every_id_of(caller.ruid, caller.rgid, target)
+            || has_capability(caller.euid, CAP_SYS_PTRACE)
+    }
+
+    /// Whether `caller` may READ what `target` is doing: its environment, its
+    /// address map, the targets of its open file descriptors.
+    ///
+    /// The same `__ptrace_may_access()`, under `PTRACE_MODE_READ_FSCREDS`,
+    /// which is the mode every gated file of `/proc/<pid>/` asks for. The one
+    /// line that changes is the pair: `FSCREDS` compares the caller's
+    /// **filesystem** ids, and Linux says why in the comment on the branch
+    /// this does not take -- "using the euid would make more sense here, but
+    /// something in userland might rely on the old behavior [...]
+    /// PTRACE_MODE_REALCREDS implies that the caller explicitly used a syscall
+    /// that requests access to another process (and not a filesystem syscall
+    /// to procfs)". So a path through the filesystem is judged on the identity
+    /// the filesystem uses, and a syscall that names a process is judged on
+    /// the one the caller cannot lay down.
+    ///
+    /// The two are only ever different for a process that moved its `fsuid`
+    /// with `setfsuid(2)`, which is why the pair is the whole test:
+    /// [`Self::may_attach_to`] and this one answer differently for the same
+    /// credentials, and reading somebody's environment is not taking their
+    /// open files.
+    pub fn may_read_process_innards(
+        caller: &Credentials,
+        target: &Credentials,
+        same_thread_group: bool,
+    ) -> bool {
+        if same_thread_group {
+            return true;
+        }
+        holds_every_id_of(caller.fsuid, caller.fsgid, target)
+            || has_capability(caller.euid, CAP_SYS_PTRACE)
     }
 
     /// The three rules `do_prlimit` applies to a new limit, and the fourth
@@ -6564,6 +6609,14 @@ mod ptrace_access_tests {
         ids(uid, uid, uid, gid, gid, gid)
     }
 
+    /// The same, after a `setfsuid`/`setfsgid` that moved the filesystem pair
+    /// off the effective one.
+    fn with_fs(mut creds: Credentials, fsuid: u32, fsgid: u32) -> Credentials {
+        creds.fsuid = fsuid;
+        creds.fsgid = fsgid;
+        creds
+    }
+
     // ---- the six comparisons ----------------------------------------------
 
     #[test]
@@ -6727,42 +6780,121 @@ mod ptrace_access_tests {
         assert!(LinuxProcess::may_attach_to(&me, &me, false));
     }
 
-    // ---- the rule next door -----------------------------------------------
+    // ---- READ_FSCREDS: the same six comparisons, the other pair -----------
+
+    /// A caller whose filesystem pair has moved off its real one: a
+    /// set-user-ID-`OTHER` program, started by `USER`, that called
+    /// `setfsuid(OTHER)`. That is the only way the two rules can disagree, and
+    /// `setfsuid(2)` only ever moves the pair to an id the process already
+    /// holds.
+    fn moved_fs_pair() -> Credentials {
+        with_fs(
+            ids(USER, OTHER, OTHER, GROUP, OTHER_GROUP, OTHER_GROUP),
+            OTHER,
+            OTHER_GROUP,
+        )
+    }
 
     #[test]
-    fn the_six_comparisons_are_the_ones_prlimit_makes() {
-        // `check_prlimit_permission()` and `__ptrace_may_access()` are the same
-        // six lines in Linux, and they are two functions here on purpose: they
-        // ask for different capabilities and they escape differently. This
-        // pins the half they do share, so moving one id in one of them has to
-        // be a decision about both.
-        let pairs = [
+    fn reading_a_process_goes_by_the_filesystem_pair() {
+        // `PTRACE_MODE_READ_FSCREDS`, which every gated file of `/proc/<pid>/`
+        // asks for: a path through the filesystem is judged on the identity the
+        // filesystem uses.
+        assert!(LinuxProcess::may_read_process_innards(
+            &moved_fs_pair(),
+            &plain(OTHER, OTHER_GROUP),
+            false
+        ));
+    }
+
+    #[test]
+    fn taking_its_files_goes_by_the_real_pair() {
+        // The same caller, the same target, the other answer. `REALCREDS`
+        // exists for exactly this: a syscall that names a process is judged on
+        // the identity the caller cannot lay down with `setfsuid`.
+        assert!(!LinuxProcess::may_attach_to(
+            &moved_fs_pair(),
+            &plain(OTHER, OTHER_GROUP),
+            false
+        ));
+    }
+
+    #[test]
+    fn so_does_moving_its_limits() {
+        assert!(!LinuxProcess::may_touch_limits_of(
+            &moved_fs_pair(),
+            &plain(OTHER, OTHER_GROUP)
+        ));
+    }
+
+    #[test]
+    fn and_the_mirror_image_answers_the_other_way_round() {
+        // A caller whose real pair is the target's and whose filesystem pair
+        // has moved away: now the procfs rule refuses and the other two allow.
+        // Without this half, reading `fsuid` where `ruid` was meant would still
+        // pass the three tests above.
+        let moved_off = with_fs(plain(OTHER, OTHER_GROUP), USER, GROUP);
+        let target = plain(OTHER, OTHER_GROUP);
+        assert!(!LinuxProcess::may_read_process_innards(
+            &moved_off, &target, false
+        ));
+        assert!(LinuxProcess::may_attach_to(&moved_off, &target, false));
+        assert!(LinuxProcess::may_touch_limits_of(&moved_off, &target));
+    }
+
+    #[test]
+    fn a_process_that_never_called_setfsuid_gets_one_answer() {
+        // The ordinary case, and why a wrong pair hides: `fsuid` follows `euid`
+        // everywhere else, so for almost every process in the machine the two
+        // rules agree and the wrong argument reads as correct code.
+        for (caller, target) in [
             (plain(USER, GROUP), plain(USER, GROUP)),
             (plain(USER, GROUP), plain(OTHER, OTHER_GROUP)),
             (
                 plain(USER, GROUP),
                 ids(USER, OTHER, USER, GROUP, GROUP, GROUP),
             ),
-            (
-                plain(USER, GROUP),
-                ids(USER, USER, USER, GROUP, GROUP, OTHER_GROUP),
-            ),
-            (
-                ids(USER, OTHER, USER, GROUP, OTHER_GROUP, GROUP),
-                plain(USER, GROUP),
-            ),
             (plain(ROOT_UID, ROOT_UID), plain(OTHER, OTHER_GROUP)),
-            (plain(USER, GROUP), plain(ROOT_UID, ROOT_UID)),
-        ];
-        for (caller, target) in pairs.iter() {
+        ] {
             assert_eq!(
-                LinuxProcess::may_attach_to(caller, target, false),
-                LinuxProcess::may_touch_limits_of(caller, target),
+                LinuxProcess::may_read_process_innards(&caller, &target, false),
+                LinuxProcess::may_attach_to(&caller, &target, false),
                 "{:?} against {:?}",
                 caller,
                 target
             );
         }
+    }
+
+    #[test]
+    fn your_own_process_is_readable_whatever_its_ids() {
+        // `/proc/self/environ` is how a program reads its own environment and
+        // `/proc/self/maps` how it reads its own map: the thread group goes
+        // through first, as in Linux.
+        let me = with_fs(
+            ids(USER, ROOT_UID, ROOT_UID, GROUP, ROOT_UID, ROOT_UID),
+            OTHER,
+            OTHER_GROUP,
+        );
+        assert!(LinuxProcess::may_read_process_innards(&me, &me, true));
+    }
+
+    #[test]
+    fn the_capability_lifts_the_procfs_rule_from_the_effective_uid() {
+        // Still the effective uid, not the filesystem one: `setfsuid` moves
+        // what you are for a file, never what you may do.
+        let dropped_fsuid = with_fs(plain(ROOT_UID, ROOT_UID), USER, GROUP);
+        assert!(LinuxProcess::may_read_process_innards(
+            &dropped_fsuid,
+            &plain(OTHER, OTHER_GROUP),
+            false
+        ));
+        let root_by_fsuid_only = with_fs(plain(USER, GROUP), ROOT_UID, ROOT_UID);
+        assert!(!LinuxProcess::may_read_process_innards(
+            &root_by_fsuid_only,
+            &plain(OTHER, OTHER_GROUP),
+            false
+        ));
     }
 }
 
