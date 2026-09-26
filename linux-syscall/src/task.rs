@@ -1571,12 +1571,15 @@ impl Syscall<'_> {
         if base > u8::MAX as usize {
             return Err(LxError::EINVAL);
         }
+        // `do_sched_setscheduler`: `!param || pid < 0` is EINVAL before the
+        // parameters are read (EFAULT) and before the pid is looked up.
+        let pid = crate::intarg::sched_param_pid(pid, param.is_null())?;
         let sched_priority = param.read()?;
         info!(
             "sched_setscheduler: pid={} policy={} priority={}",
             pid, base, sched_priority
         );
-        let thread = self.sched_target(crate::intarg::sched_pid(pid)?)?;
+        let thread = self.sched_target(pid)?;
         let (p, rt, nice) =
             Self::sched_validate(base as u8, sched_priority, thread.sched_nice() as i32)?;
         self.check_sched_permission(&thread, p, nice, rt)?;
@@ -1597,8 +1600,9 @@ impl Syscall<'_> {
     ///
     /// See [linux man sched_setparam(2)](https://www.man7.org/linux/man-pages/man2/sched_setparam.2.html).
     pub fn sys_sched_setparam(&self, pid: usize, param: UserInPtr<i32>) -> SysResult {
+        let pid = crate::intarg::sched_param_pid(pid, param.is_null())?;
         let sched_priority = param.read()?;
-        let thread = self.sched_target(crate::intarg::sched_pid(pid)?)?;
+        let thread = self.sched_target(pid)?;
         let (p, rt, nice) = Self::sched_validate(
             thread.sched_policy(),
             sched_priority,
@@ -1614,7 +1618,8 @@ impl Syscall<'_> {
     ///
     /// See [linux man sched_getparam(2)](https://www.man7.org/linux/man-pages/man2/sched_getparam.2.html).
     pub fn sys_sched_getparam(&self, pid: usize, mut param: UserOutPtr<i32>) -> SysResult {
-        let thread = self.sched_target(crate::intarg::sched_pid(pid)?)?;
+        let pid = crate::intarg::sched_param_pid(pid, param.is_null())?;
+        let thread = self.sched_target(pid)?;
         param.write(thread.sched_rt_priority() as i32)?;
         Ok(0)
     }

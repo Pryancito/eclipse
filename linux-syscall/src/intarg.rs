@@ -56,6 +56,32 @@ pub fn sched_pid(raw: usize) -> LxResult<usize> {
     Ok(pid as usize)
 }
 
+/// The `(pid, param)` pair of `sched_setscheduler`, `sched_setparam` and
+/// `sched_getparam`, which open with `if (!param || pid < 0) return
+/// -EINVAL;`: a NULL `struct sched_param` is `EINVAL`, judged before the
+/// pointer is read (`EFAULT`) and before the pid is looked up (`ESRCH`).
+/// A NULL was `EFAULT` here, and an unreadable pointer was `EFAULT` before
+/// a negative pid was `EINVAL`.
+pub fn sched_param_pid(raw: usize, param_is_null: bool) -> LxResult<usize> {
+    if param_is_null {
+        return Err(LxError::EINVAL);
+    }
+    sched_pid(raw)
+}
+
+/// The `int bufsiz` of `readlink(2)` and `readlinkat(2)`: `do_readlinkat`
+/// opens with `if (bufsiz <= 0) return -EINVAL;`, before the path is even
+/// copied in. Read as a `usize`, zero returned zero bytes of a link that
+/// exists and a negative one was a huge buffer clamped to a page, so
+/// `readlink(path, buf, -1)` filled `buf` past its end.
+pub fn readlink_bufsiz(raw: usize) -> LxResult<usize> {
+    let bufsiz = int_arg(raw);
+    if bufsiz <= 0 {
+        return Err(LxError::EINVAL);
+    }
+    Ok(bufsiz as usize)
+}
+
 /// A `pid_t` that names a task with no rule of its own for negatives:
 /// `sched_setaffinity`, `sched_getaffinity` and `prlimit64` hand it to
 /// `find_task_by_vpid`, which finds nothing, so a negative one is `ESRCH`.
@@ -307,6 +333,38 @@ mod tests {
         // A pid with junk in the high half is the pid in the low half.
         assert_eq!(sched_pid(0x1_0000_0000 | 42), Ok(42));
         assert_eq!(task_pid(0x1_0000_0000 | 42), Ok(42));
+    }
+
+    /// `sched_getparam(pid, NULL)` is `EINVAL` before anything else, and
+    /// a negative pid with a good pointer is `EINVAL` too; a good pair is
+    /// the pid.
+    #[test]
+    fn a_null_sched_param_is_einval_before_the_pid() {
+        assert_eq!(sched_param_pid(0, true), Err(LxError::EINVAL));
+        assert_eq!(sched_param_pid(1234, true), Err(LxError::EINVAL));
+        assert_eq!(sched_param_pid(MINUS_ONE_SX, true), Err(LxError::EINVAL));
+        assert_eq!(sched_param_pid(0, false), Ok(0));
+        assert_eq!(sched_param_pid(1234, false), Ok(1234));
+        assert_eq!(sched_param_pid(MINUS_ONE_ZX, false), Err(LxError::EINVAL));
+        assert_eq!(sched_param_pid(MINUS_ONE_SX, false), Err(LxError::EINVAL));
+    }
+
+    /// `readlink(p, buf, 0)` and `readlink(p, buf, -1)` are `EINVAL`; the
+    /// size is an `int`, so junk in the high half is not part of it.
+    #[test]
+    fn a_readlink_buffer_size_must_be_positive() {
+        assert_eq!(readlink_bufsiz(0), Err(LxError::EINVAL));
+        assert_eq!(readlink_bufsiz(MINUS_ONE_ZX), Err(LxError::EINVAL));
+        assert_eq!(readlink_bufsiz(MINUS_ONE_SX), Err(LxError::EINVAL));
+        assert_eq!(
+            readlink_bufsiz(0x8000_0000),
+            Err(LxError::EINVAL),
+            "INT_MIN"
+        );
+        assert_eq!(readlink_bufsiz(1), Ok(1));
+        assert_eq!(readlink_bufsiz(4096), Ok(4096));
+        assert_eq!(readlink_bufsiz(0x7fff_ffff), Ok(0x7fff_ffff));
+        assert_eq!(readlink_bufsiz(0x1_0000_0000 | 64), Ok(64));
     }
 
     /// `P_PID` wants a positive pid; `P_PGID` takes zero for the caller's
