@@ -22,6 +22,33 @@ use zircon_object::task::{Status, Thread, ROOT_JOB};
 
 const USEC_PER_TICK: usize = 10000;
 
+/// What `times(2)` returns: the monotonic clock in `USER_HZ` (100 Hz)
+/// ticks, Linux's `jiffies_64_to_clock_t(get_jiffies_64())`. A clock that
+/// nobody can set, so the difference of two calls is elapsed time whatever
+/// `settimeofday` did in between.
+fn clock_ticks_since_boot(monotonic: Duration) -> usize {
+    (monotonic.as_micros() / USEC_PER_TICK as u128) as usize
+}
+
+#[cfg(test)]
+mod times_tests {
+    use super::*;
+
+    #[test]
+    fn the_return_value_of_times_is_the_monotonic_clock_in_user_hz_ticks() {
+        // 12.345 s since boot is 1234 ticks of 10 ms, the fraction dropped.
+        assert_eq!(clock_ticks_since_boot(Duration::from_millis(12_345)), 1234);
+        assert_eq!(clock_ticks_since_boot(Duration::ZERO), 0);
+        assert_eq!(clock_ticks_since_boot(Duration::from_micros(9_999)), 0);
+        assert_eq!(clock_ticks_since_boot(Duration::from_micros(10_000)), 1);
+        // A year of uptime still fits.
+        assert_eq!(
+            clock_ticks_since_boot(Duration::from_secs(365 * 24 * 3600)),
+            3_153_600_000
+        );
+    }
+}
+
 /// Linux `struct timex` (x86_64 / LP64): `adjtimex(2)` / `clock_adjtime(2)`.
 /// Layout is 208 bytes (modes u32 + pad + longs + timeval + PPS + TAI + reserved).
 #[repr(C)]
@@ -551,17 +578,21 @@ impl Syscall<'_> {
     ///
     /// `tms_utime`/`tms_stime` come from the same accounting as
     /// [`sys_getrusage`](Self::sys_getrusage), converted to clock ticks
-    /// (100 Hz here). Times of terminated children are not retained, so
-    /// `tms_cutime`/`tms_cstime` read zero. The return value stays the
-    /// wall-clock tick count since boot.
+    /// (100 Hz here); `tms_cutime`/`tms_cstime` are the reaped children's,
+    /// the same totals `RUSAGE_CHILDREN` reports. The return value is the
+    /// clock-tick count of the MONOTONIC clock, as Linux's
+    /// `jiffies_64_to_clock_t(get_jiffies_64())`: it used to be the wall
+    /// clock's, so every `settimeofday` -- `hwclock -s` at boot, an NTP step
+    /// -- moved it, backwards included, under every program that measures
+    /// elapsed time as the difference of two `times()` calls (the way
+    /// `time(1)` in busybox and many benchmarks do).
     pub fn sys_times(&mut self, mut buf: UserOutPtr<Tms>) -> SysResult {
         info!("times: buf: {:?}", buf);
 
         // 10_000 us per tick (100 Hz) → 10_000_000 ns per tick.
         const NSEC_PER_TICK: u64 = USEC_PER_TICK as u64 * 1_000;
 
-        let tv = TimeVal::now();
-        let tick = (tv.sec * 1_000_000 + tv.usec) / USEC_PER_TICK;
+        let tick = clock_ticks_since_boot(kernel_hal::timer::timer_now());
 
         if !buf.is_null() {
             let utime_ns = process_user_time_ns(self.zircon_process());

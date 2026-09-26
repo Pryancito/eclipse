@@ -503,7 +503,11 @@ impl ProcessExt for Process {
             perf: crate::perf::ProcPerf::new(),
             itimers: Default::default(),
             aspace_lock: Mutex::new(()),
-            inner: Mutex::new(linux_parent_inner.forked_child(parent_pgid, parent_sid)),
+            inner: Mutex::new(linux_parent_inner.forked_child(
+                parent_pgid,
+                parent_sid,
+                monotonic_now_ns(),
+            )),
         };
         let new_proc = Process::create_with_ext(&parent.job(), "", new_linux_proc)?;
         // Batch the fork's cross-CPU TLB shootdowns into one, but only when
@@ -1039,6 +1043,13 @@ struct LinuxProcessInner {
     children_utime_ns: u64,
     /// Kernel-side counterpart of `children_utime_ns`.
     children_stime_ns: u64,
+    /// When this process was created, in nanoseconds of the monotonic clock
+    /// (`task->start_boottime`): what field 22 of `/proc/<pid>/stat` reports
+    /// in clock ticks, and what `ps -o etime,start` and `top`'s TIME+ column
+    /// derive from. A fork stamps the child with its own birth; an exec
+    /// keeps it, since Linux's `start_time` is the task's and not the
+    /// image's.
+    start_ns: u64,
     /// Process group id (job control). `0` means "unset" and resolves to the
     /// process's own pid, so a fresh session/group leader is its own group.
     /// `fork` copies the parent's *effective* pgid (children join the parent's
@@ -1458,9 +1469,24 @@ impl LinuxProcess {
             aspace_lock: Mutex::new(()),
             inner: Mutex::new(LinuxProcessInner {
                 files,
+                start_ns: monotonic_now_ns(),
                 ..Default::default()
             }),
         }
+    }
+
+    /// When this process was created, in nanoseconds of the monotonic clock
+    /// (`task->start_boottime`). See `LinuxProcessInner::start_ns`.
+    pub fn start_time_ns(&self) -> u64 {
+        self.inner.lock().start_ns
+    }
+
+    /// Credit the CPU time of a reaped child, as `wait*` does when it reaps
+    /// one: what `RUSAGE_CHILDREN`, `times()` and fields 16/17 of
+    /// `/proc/<pid>/stat` add up.
+    #[cfg(test)]
+    pub(crate) fn credit_children_cpu(&self, cpu: ChildCpu) {
+        self.inner.lock().add_children_cpu(cpu);
     }
 
     /// The process's `mmap_lock` (see the field doc): hold it across any
@@ -3733,8 +3759,13 @@ impl LinuxProcessInner {
         old_attachments
     }
 
-    fn forked_child(&self, pgid: KoID, sid: KoID) -> Self {
+    fn forked_child(&self, pgid: KoID, sid: KoID, start_ns: u64) -> Self {
         LinuxProcessInner {
+            // `copy_process`: `p->start_time = ktime_get_ns()`. The child is
+            // born now, whenever its parent was; carried over, every child
+            // of a long-lived shell would claim the shell's start time and
+            // `ps -o etime` would show the shell's age for all of them.
+            start_ns,
             // --- copied from the parent -------------------------------------
             execute_path: self.execute_path.clone(),
             cmdline: self.cmdline.clone(),
@@ -4311,6 +4342,12 @@ pub fn all_live_processes() -> Vec<Arc<Process>> {
 /// it can ask anything else about it.
 pub fn find_process(pid: KoID) -> Option<Arc<Process>> {
     ROOT_JOB.find_process(pid)
+}
+
+/// The monotonic clock now, in nanoseconds: what a process's birth is
+/// stamped with (`ktime_get_ns()` in `copy_process`).
+fn monotonic_now_ns() -> u64 {
+    kernel_hal::timer::timer_now().as_nanos() as u64
 }
 
 /// The real uid of the process `pid` names, exited or not; 0 when there is
@@ -5169,7 +5206,16 @@ mod fork_inheritance_tests {
     }
 
     fn fork_of(parent: &LinuxProcessInner) -> LinuxProcessInner {
-        parent.forked_child(41, 42)
+        parent.forked_child(41, 42, 999)
+    }
+
+    #[test]
+    fn a_child_is_born_now_not_when_its_parent_was() {
+        // `copy_process`: `p->start_time = ktime_get_ns()`, never the
+        // parent's. `/proc/<pid>/stat` field 22 comes from this.
+        let mut parent = a_configured_parent();
+        parent.start_ns = 5;
+        assert_eq!(parent.forked_child(41, 42, 999).start_ns, 999);
     }
 
     #[test]
@@ -5261,7 +5307,7 @@ mod fork_inheritance_tests {
         let mut parent = a_configured_parent();
         parent.pgid = 0;
         parent.sid = 0;
-        let child = parent.forked_child(1234, 5678);
+        let child = parent.forked_child(1234, 5678, 0);
         assert_eq!(child.pgid, 1234);
         assert_eq!(child.sid, 5678);
     }

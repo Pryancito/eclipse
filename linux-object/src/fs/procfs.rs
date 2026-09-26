@@ -318,6 +318,29 @@ fn proc_pid_stat(proc: &Process) -> String {
     let utime = (utime_ns / NS_PER_TICK) as i64;
     let stime = (stime_ns / NS_PER_TICK) as i64;
 
+    // Fields 16/17 (cutime/cstime), 22 (starttime), 23 (vsize) and 24 (rss):
+    // `do_task_stat` publishes the reaped children's times, the task's
+    // `start_boottime` in clock ticks, `mm->total_vm` in BYTES and
+    // `get_mm_rss` in PAGES. All five read 0 here while `status`, `statm`,
+    // `getrusage(RUSAGE_CHILDREN)` and `times()` had the numbers, so `ps
+    // aux` showed VSZ 0 and RSS 0 for every process, `ps -o etime` the age
+    // of the machine, and `top`'s TIME+ never counted a finished child.
+    let (cutime_ns, cstime_ns) = proc
+        .try_linux()
+        .map(|lp| lp.children_cpu_ns())
+        .unwrap_or((0, 0));
+    let cutime = (cutime_ns / NS_PER_TICK) as i64;
+    let cstime = (cstime_ns / NS_PER_TICK) as i64;
+    let starttime = proc
+        .try_linux()
+        .map(|lp| (lp.start_time_ns() / NS_PER_TICK) as i64)
+        .unwrap_or(0);
+    let stats = proc.vmar().get_task_stats();
+    let (vsize, rss) = stat_memory_fields(
+        stats.mapped_bytes(),
+        stats.private_bytes() + stats.shared_bytes(),
+    );
+
     // Field 39 (processor): the CPU the leader thread last ran on.
     let processor = first_thread
         .as_ref()
@@ -344,9 +367,14 @@ fn proc_pid_stat(proc: &Process) -> String {
     rest[8 - 5] = tpgid;
     rest[14 - 5] = utime;
     rest[15 - 5] = stime;
+    rest[16 - 5] = cutime;
+    rest[17 - 5] = cstime;
     rest[18 - 5] = priority;
     rest[19 - 5] = nice;
     rest[20 - 5] = nthreads;
+    rest[22 - 5] = starttime;
+    rest[23 - 5] = vsize;
+    rest[24 - 5] = rss;
     rest[39 - 5] = processor;
     rest[40 - 5] = rt_priority;
     rest[41 - 5] = policy;
@@ -357,6 +385,17 @@ fn proc_pid_stat(proc: &Process) -> String {
     }
     out.push('\n');
     out
+}
+
+/// Fields 23 and 24 of `/proc/<pid>/stat` from the task's memory totals:
+/// `vsize` is `mm->total_vm << PAGE_SHIFT`, in BYTES, and `rss` is
+/// `get_mm_rss(mm)`, in PAGES (`do_task_stat`, `fs/proc/array.c`). The two
+/// units differ, and `ps` divides the first by 1024 and multiplies the
+/// second by the page size, so a byte count in `rss` would show every
+/// process at four thousand times its size.
+fn stat_memory_fields(mapped_bytes: u64, resident_bytes: u64) -> (i64, i64) {
+    const PAGE: u64 = 4096;
+    (mapped_bytes as i64, (resident_bytes / PAGE) as i64)
 }
 
 fn proc_pid_status(proc: &Process) -> String {
@@ -3424,6 +3463,123 @@ mod pid_status_tests {
             "{:?}",
             status
         );
+    }
+}
+
+#[cfg(test)]
+mod pid_stat_tests {
+    //! `/proc/<pid>/stat` fields 16/17 (cutime/cstime), 22 (starttime), 23
+    //! (vsize) and 24 (rss) were written as 0 for every process, while
+    //! `status`, `statm`, `getrusage` and `times()` already had the numbers:
+    //! `ps aux` showed VSZ 0 and RSS 0, `ps -o etime` the uptime of the
+    //! machine for everything, and `top`'s TIME+ never counted a reaped child.
+
+    use super::*;
+    use crate::process::{ChildCpu, LinuxProcess};
+    use rcore_fs_ramfs::RamFS;
+    use zircon_object::vm::{MMUFlags, VmObject, PAGE_SIZE};
+
+    fn a_process(pid: u64) -> Arc<Process> {
+        Process::create_with_fixed_id_ext(
+            &Job::root(),
+            pid,
+            "stat",
+            LinuxProcess::new(RamFS::new(), 0),
+        )
+        .unwrap()
+    }
+
+    /// Field `n` (1-based, as proc(5) numbers them) of the stat line. The
+    /// comm is in parentheses and may hold spaces, so the split starts
+    /// after the closing one.
+    fn field(line: &str, n: usize) -> i64 {
+        assert!(n >= 3);
+        let after_comm = &line[line.rfind(')').unwrap() + 2..];
+        after_comm
+            .split(' ')
+            .nth(n - 3)
+            .unwrap_or_else(|| panic!("field {} of {:?}", n, line))
+            .trim()
+            .parse()
+            .unwrap()
+    }
+
+    #[test]
+    fn the_children_times_are_the_reaped_children_s_cpu_in_ticks() {
+        let proc = a_process(4301);
+        let line = proc_pid_stat(&proc);
+        assert_eq!((field(&line, 16), field(&line, 17)), (0, 0));
+        // The child's CPU is what `wait4` credited: 2.5 s user and 30 ms
+        // system, in USER_HZ ticks.
+        proc.linux().credit_children_cpu(ChildCpu {
+            utime_ns: 2_500_000_000,
+            stime_ns: 30_000_000,
+        });
+        let line = proc_pid_stat(&proc);
+        assert_eq!(field(&line, 16), 250, "{:?}", line);
+        assert_eq!(field(&line, 17), 3, "{:?}", line);
+    }
+
+    #[test]
+    fn starttime_is_the_process_s_birth_on_the_monotonic_clock_in_ticks() {
+        let before = kernel_hal::timer::timer_now().as_nanos() as u64;
+        let proc = a_process(4302);
+        let after = kernel_hal::timer::timer_now().as_nanos() as u64;
+        // Born between the two readings, not at 0 (the boot) and not on the
+        // wall clock.
+        let born = proc.linux().start_time_ns();
+        assert!(
+            before <= born && born <= after,
+            "{} <= {} <= {}",
+            before,
+            born,
+            after
+        );
+        let expected = (born / 10_000_000) as i64;
+        let line = proc_pid_stat(&proc);
+        assert_eq!(field(&line, 22), expected, "{:?}", line);
+        // A process born later is born later: the value is per process, not
+        // the boot or a constant.
+        let later = a_process(4303);
+        assert!(later.linux().start_time_ns() >= proc.linux().start_time_ns());
+    }
+
+    #[test]
+    fn vsize_is_in_bytes_and_rss_in_pages_of_what_is_mapped_and_resident() {
+        let proc = a_process(4304);
+        let line = proc_pid_stat(&proc);
+        assert_eq!((field(&line, 23), field(&line, 24)), (0, 0), "{:?}", line);
+        // Three pages mapped and written, so all three are resident.
+        let vmo = VmObject::new_paged(3);
+        vmo.write(0, &[1u8; 3 * PAGE_SIZE]).unwrap();
+        let flags = MMUFlags::READ | MMUFlags::WRITE | MMUFlags::USER;
+        proc.vmar()
+            .map(None, vmo.clone(), 0, 3 * PAGE_SIZE, flags)
+            .unwrap();
+        let line = proc_pid_stat(&proc);
+        assert_eq!(field(&line, 23), (3 * PAGE_SIZE) as i64, "{:?}", line);
+        assert_eq!(field(&line, 24), 3, "{:?}", line);
+        // And they agree with `statm`, which `top` reads: size and resident
+        // there are both in pages.
+        assert_eq!(proc_pid_statm(&proc), "3 3 0 0 0 0 0\n");
+        // Mapped a second time the pages are shared, and shared pages are
+        // resident too: `get_mm_rss` is file + anon + shmem, and `ps` would
+        // otherwise show RSS 0 for a process that lives on shared memory.
+        proc.vmar().map(None, vmo, 0, 3 * PAGE_SIZE, flags).unwrap();
+        let line = proc_pid_stat(&proc);
+        assert_eq!(field(&line, 23), (6 * PAGE_SIZE) as i64, "{:?}", line);
+        assert_eq!(field(&line, 24), 6, "{:?}", line);
+        assert_eq!(proc_pid_statm(&proc), "6 6 6 0 0 0 0\n");
+    }
+
+    #[test]
+    fn the_two_memory_fields_have_different_units() {
+        // `do_task_stat`: `vsize` is `total_vm << PAGE_SHIFT` (bytes), `rss`
+        // is `get_mm_rss` (pages). `ps` divides the one by 1024 and
+        // multiplies the other by the page size.
+        assert_eq!(stat_memory_fields(3 * 4096, 2 * 4096), (3 * 4096, 2));
+        assert_eq!(stat_memory_fields(0, 0), (0, 0));
+        assert_eq!(stat_memory_fields(4096, 4095), (4096, 0));
     }
 }
 
