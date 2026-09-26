@@ -4264,52 +4264,11 @@ mod rx_ring_tests {
     use alloc::vec;
     use alloc::vec::Vec;
     extern crate std;
-    use std::alloc::{alloc_zeroed, Layout};
 
-    // --- mock kernel hooks: identity-mapped host memory, no-op the rest ---
-    #[no_mangle]
-    extern "C" fn drivers_dma_alloc(pages: usize) -> usize {
-        let layout = Layout::from_size_align(pages * 4096, 4096).unwrap();
-        unsafe { alloc_zeroed(layout) as usize }
-    }
-    #[no_mangle]
-    extern "C" fn drivers_dma_dealloc(_p: usize, _pages: usize) -> i32 {
-        0
-    }
-    #[no_mangle]
-    extern "C" fn drivers_phys_to_virt(p: usize) -> usize {
-        p
-    }
-    #[no_mangle]
-    extern "C" fn drivers_virt_to_phys(v: usize) -> usize {
-        v
-    }
-    #[no_mangle]
-    extern "C" fn drivers_dma_mark_uncached(_p: usize, _pages: usize) -> i32 {
-        0
-    }
-    #[no_mangle]
-    extern "C" fn drivers_dma_verify_uncached(_p: usize, _pages: usize) -> i32 {
-        0
-    }
-    #[no_mangle]
-    extern "C" fn drivers_timer_now_as_micros() -> u64 {
-        crate::nvme::nvme_queue::test_clock::now()
-    }
-    #[no_mangle]
-    extern "C" fn drivers_klog_emit(_priority: u8, _msg: *const u8, _len: usize) {}
-    #[no_mangle]
-    extern "C" fn drivers_intr_on() {}
-    #[no_mangle]
-    extern "C" fn drivers_intr_off() {}
-    #[no_mangle]
-    extern "C" fn drivers_intr_get() -> bool {
-        false
-    }
-    #[no_mangle]
-    extern "C" fn drivers_wake_net_rx_waiters() {}
-    #[no_mangle]
-    extern "C" fn drivers_net_drain() {}
+    // The kernel hooks these tests need are doubled once for the whole crate, in
+    // `crate::utils::host_hooks`: `#[no_mangle]` allows exactly ONE definition
+    // per binary, so keeping them in here meant no other module could have them
+    // (`utils/dma.rs` got `symbol ... is already defined` and no test at all).
 
     fn reg_read(base: usize, reg: usize) -> u32 {
         unsafe { core::ptr::read_volatile((base + reg * 4) as *const u32) }
