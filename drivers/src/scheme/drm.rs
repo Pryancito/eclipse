@@ -179,6 +179,32 @@ pub trait DrmScheme: Scheme {
         false
     }
 
+    /// The GPU fence that says every submission which may still be writing
+    /// into `gem_handle` has landed, as `(kernel VA of the fence landing
+    /// zone, payload)`, for a caller that is about to scan that buffer out.
+    ///
+    /// This is the implicit-sync side of a present. An atomic commit can hand
+    /// the plane an `IN_FENCE_FD` and the sync arm waits on it, but the legacy
+    /// path -- `SETCRTC` and `PAGE_FLIP`, which is what wlroots drives while
+    /// `drm.atomic` is off, and so what this kernel actually runs -- carries
+    /// no fence at all. Linux covers that case from the buffer's reservation
+    /// object: `drm_atomic_helper_prepare_planes` picks up the fences on the
+    /// fb's BO and the commit waits for them. There is no reservation object
+    /// here, and nouveau's `EXEC` carries no buffer list, so nothing says
+    /// *which* submissions touched this buffer; what a driver can answer is
+    /// which channel its owner submits on, and whether that channel has
+    /// drained. That is the same question `GEM_CPU_PREP` answers, and it is
+    /// conservative in the right direction: it can wait for work that never
+    /// touched the buffer, never miss work that did.
+    ///
+    /// `owner_pid` is the pid that created the framebuffer, used only when the
+    /// driver does not know `gem_handle` -- a dumb buffer from the generic
+    /// table, or a handle from another GPU's slice. Default: no fence to wait
+    /// for, which leaves the present exactly as unsynchronised as before.
+    fn render_fence_for_scanout(&self, _gem_handle: u32, _owner_pid: u64) -> Option<(usize, u32)> {
+        None
+    }
+
     /// Retrieve the raw 128-byte EDID for a connector, if available.
     fn get_connector_edid(&self, _id: u32) -> Option<[u8; 128]> {
         None

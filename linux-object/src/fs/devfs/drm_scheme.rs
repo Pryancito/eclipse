@@ -277,17 +277,16 @@ impl DrmDev {
                 Some(_) => return,
                 None => {
                     let now = kernel_hal::timer::timer_now();
-                    // Absolute CLOCK_MONOTONIC deadline in Duration form.
-                    let abs = core::time::Duration::from_micros(deadline_us);
-                    let tick = core::time::Duration::from_millis(1);
-                    let next = now + tick;
-                    let wake = if abs < next { abs } else { next };
                     // If the absolute deadline is already behind `timer_now`,
-                    // wait_ready should have returned Timeout; still avoid an
-                    // unbounded sleep if the clocks disagree slightly.
-                    if wake <= now {
+                    // wait_ready should have returned Timeout; the helper still
+                    // refuses to sleep past it if the clocks disagree slightly.
+                    let Some(wake) = next_poll_wake(
+                        now,
+                        core::time::Duration::from_micros(deadline_us),
+                        FENCE_POLL_TICK,
+                    ) else {
                         return;
-                    }
+                    };
                     kernel_hal::thread::sleep_until(wake).await;
                 }
             }
@@ -314,15 +313,8 @@ impl DrmDev {
         let Some((handle, point)) = self.atomic_in_fence(data) else {
             return;
         };
-        // Bounded on purpose. Linux waits on an in-fence indefinitely, but a
-        // fence that never signals must not freeze the desktop: presenting a
-        // frame early is a visible glitch, presenting nothing ever is a hang.
-        // 100 ms is several frames at any refresh rate we drive, so a fence
-        // that misses it is broken rather than slow -- and the cost of being
-        // wrong is a stutter, not a freeze.
-        const IN_FENCE_TIMEOUT_US: u64 = 100_000;
         let now = kernel_hal::timer::timer_now();
-        let deadline_us = now.as_micros() as u64 + IN_FENCE_TIMEOUT_US;
+        let deadline_us = now.as_micros() as u64 + PRESENT_FENCE_TIMEOUT_US;
         let handles = [handle];
         let points = [point];
         loop {
@@ -353,7 +345,7 @@ impl DrmDev {
                                  signal within {} us; presenting anyway (frame may tear){}",
                                 handle,
                                 point,
-                                IN_FENCE_TIMEOUT_US,
+                                PRESENT_FENCE_TIMEOUT_US,
                                 if n + 1 == MAX_TIMEOUT_REPORTS {
                                     " -- further in-fence timeouts will not be reported"
                                 } else {
@@ -365,16 +357,113 @@ impl DrmDev {
                     return;
                 }
                 None => {
-                    let now = kernel_hal::timer::timer_now();
-                    let abs = core::time::Duration::from_micros(deadline_us);
-                    let next = now + core::time::Duration::from_millis(1);
-                    let wake = if abs < next { abs } else { next };
-                    if wake <= now {
+                    let Some(wake) = next_poll_wake(
+                        kernel_hal::timer::timer_now(),
+                        core::time::Duration::from_micros(deadline_us),
+                        FENCE_POLL_TICK,
+                    ) else {
                         return;
-                    }
+                    };
                     kernel_hal::thread::sleep_until(wake).await;
                 }
             }
+        }
+    }
+
+    /// Wait for the GPU to finish writing the buffer a **legacy** present is
+    /// about to scan out.
+    ///
+    /// The implicit-sync half of [`Self::atomic_in_fence_sleep`], and the half
+    /// that this kernel actually runs: `drm.atomic` is opt-in, so wlroots
+    /// drives `SETCRTC` and `PAGE_FLIP`, and neither carries a fence. Linux
+    /// gets the same guarantee from the framebuffer's reservation object --
+    /// `drm_atomic_helper_prepare_planes` collects the fences sitting on the
+    /// BO and the commit waits for them before the flip is programmed. Here
+    /// nothing was waited for at all: `present_now_checked` read the buffer
+    /// the instant the ioctl arrived, so a compositor that submitted its
+    /// rendering and flipped without a round trip had whatever the GPU had
+    /// finished so far put on screen. That is the *same* class of defect the
+    /// atomic in-fence wait was written for, on the path with all the mileage.
+    ///
+    /// What is waited on comes from the driver ([`drm::scanout_render_fence`]):
+    /// the fence that says the ring belonging to the buffer's owner has
+    /// drained. It is conservative in the safe direction -- it can wait for
+    /// work that never touched this buffer, and cannot miss work that did.
+    ///
+    /// Same async split and same failure policy as the atomic wait: every
+    /// early return leaves the present exactly as it behaved before this
+    /// existed, and a fence that misses the bound is reported and presented
+    /// anyway -- a torn frame is a glitch, a frame that never comes is a hang.
+    pub async fn present_fence_sleep(&self, cmd: u32, data: usize) {
+        // The only fences that exist here are the nouveau-uAPI ring's, so with
+        // that surface off there is nothing to ask about -- and this runs on
+        // every flip of the software desktop too, which must stay untouched.
+        if !zcore_drivers::display::nouveau_uapi_enabled() {
+            return;
+        }
+        let Some(kind) = legacy_present_kind(cmd) else {
+            return;
+        };
+        // Read-only, and anything malformed simply does not wait: the sync arm
+        // is about to reject it with EFAULT/EINVAL on its own.
+        let fb_id = match kind {
+            LegacyPresent::PageFlip => {
+                if ucheck(data, core::mem::size_of::<DrmModeCrtcPageFlip>()).is_err() {
+                    return;
+                }
+                unsafe { (*(data as *const DrmModeCrtcPageFlip)).fb_id }
+            }
+            LegacyPresent::SetCrtc => {
+                if ucheck(data, core::mem::size_of::<DrmModeGetCrtc>()).is_err() {
+                    return;
+                }
+                unsafe { (*(data as *const DrmModeGetCrtc)).fb_id }
+            }
+        };
+        // A `SETCRTC` with a null fb turns the pipe off. It presents nothing,
+        // so there is nothing to wait for.
+        if fb_id == 0 {
+            return;
+        }
+        let fences = drm::scanout_render_fence(fb_id);
+        if fences.is_empty() {
+            return;
+        }
+        let deadline = kernel_hal::timer::timer_now()
+            + core::time::Duration::from_micros(PRESENT_FENCE_TIMEOUT_US);
+        loop {
+            if fences
+                .iter()
+                .all(|&(va, payload)| zcore_drivers::scheme::syncobj::hw_fence_landed(va, payload))
+            {
+                return;
+            }
+            let Some(wake) =
+                next_poll_wake(kernel_hal::timer::timer_now(), deadline, FENCE_POLL_TICK)
+            else {
+                // Budgeted for the same reason as the atomic wait: a ring that
+                // stopped landing fences misses this bound on EVERY frame, and
+                // klog writes synchronously to the UART.
+                static TIMEOUT_REPORTS: AtomicU32 = AtomicU32::new(0);
+                const MAX_TIMEOUT_REPORTS: u32 = 8;
+                let n = TIMEOUT_REPORTS.fetch_add(1, Ordering::Relaxed);
+                if n < MAX_TIMEOUT_REPORTS {
+                    log::warn!(
+                        "[drm] present fence: fb {} ({} fence(s)) did not land within {} us; \
+                         presenting anyway (frame may tear){}",
+                        fb_id,
+                        fences.len(),
+                        PRESENT_FENCE_TIMEOUT_US,
+                        if n + 1 == MAX_TIMEOUT_REPORTS {
+                            " -- further present-fence timeouts will not be reported"
+                        } else {
+                            ""
+                        }
+                    );
+                }
+                return;
+            };
+            kernel_hal::thread::sleep_until(wake).await;
         }
     }
 
@@ -2428,6 +2517,72 @@ pub mod nr {
     pub const MODE_CREATE_LEASE: (u32, usize) = (0xC6, 24);
     /// `struct drm_syncobj_eventfd` (24 B).
     pub const SYNCOBJ_EVENTFD: (u32, usize) = (0xCF, 24);
+    /// `struct drm_mode_crtc` (104 B, frozen).
+    pub const MODE_SETCRTC: (u32, usize) = (0xA2, 104);
+    /// `struct drm_mode_crtc_page_flip` (24 B, frozen).
+    pub const MODE_PAGE_FLIP: (u32, usize) = (0xB0, 24);
+}
+
+/// How long a pre-present fence wait may hold the frame.
+///
+/// Bounded on purpose, and the bound is shared by both waits ([`DrmDev::
+/// atomic_in_fence_sleep`] and [`DrmDev::present_fence_sleep`]) because the
+/// trade-off is identical. Linux waits on a pre-flip fence indefinitely, but a
+/// fence that never signals must not freeze the desktop: presenting a frame
+/// early is a visible glitch, presenting nothing ever is a hang. 100 ms is
+/// several frames at any refresh rate we drive, so a fence that misses it is
+/// broken rather than slow -- and the cost of being wrong is a stutter.
+const PRESENT_FENCE_TIMEOUT_US: u64 = 100_000;
+
+/// How long a fence poll sleeps between probes.
+const FENCE_POLL_TICK: Duration = Duration::from_millis(1);
+
+/// When a bounded fence poll should wake for its next probe, or `None` when
+/// the deadline leaves no time to sleep and the caller must give up.
+///
+/// The clamp to `deadline` is what makes the bound a bound: sleeping a whole
+/// tick past it turns a 100 ms cap into 101 ms, every frame, on the path that
+/// times out. The `None` at the boundary is what keeps a missed deadline from
+/// becoming an unbounded sleep -- `sleep_until` takes an absolute instant, and
+/// `wake <= now` is either "already expired" or a clock that stepped
+/// backwards; both must end the wait, not park on a deadline in the past.
+fn next_poll_wake(now: Duration, deadline: Duration, tick: Duration) -> Option<Duration> {
+    let next = now + tick;
+    let wake = if deadline < next { deadline } else { next };
+    if wake <= now {
+        None
+    } else {
+        Some(wake)
+    }
+}
+
+/// Which legacy-KMS present ioctl `cmd` is, for the pre-present fence wait.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LegacyPresent {
+    /// `DRM_IOCTL_MODE_SETCRTC`: binds a fb to a CRTC, and presents it.
+    SetCrtc,
+    /// `DRM_IOCTL_MODE_PAGE_FLIP`.
+    PageFlip,
+}
+
+/// The legacy present `cmd` asks for, or `None` for anything else.
+///
+/// Matched by ioctl NUMBER like every other pre-dispatch helper here, never by
+/// the full 32-bit command: the size is encoded in it, and pinning one size is
+/// how this tree has lost a wait to a struct that grew a field three times
+/// already (see [`is_drm_ioctl_nr`]). The size floor is what *this* helper
+/// parses, so a command encoding fewer bytes falls through to the sync arm
+/// untouched instead of being read past its end.
+pub fn legacy_present_kind(cmd: u32) -> Option<LegacyPresent> {
+    let (crtc_nr, crtc_min) = nr::MODE_SETCRTC;
+    if is_drm_ioctl_nr(cmd, crtc_nr, crtc_min) {
+        return Some(LegacyPresent::SetCrtc);
+    }
+    let (flip_nr, flip_min) = nr::MODE_PAGE_FLIP;
+    if is_drm_ioctl_nr(cmd, flip_nr, flip_min) {
+        return Some(LegacyPresent::PageFlip);
+    }
+    None
 }
 
 /// The atomic-commit ioctl. Used by `sys_ioctl` to run
@@ -9372,5 +9527,141 @@ mod out_fence_tests {
                 what
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod present_fence_tests {
+    //! The pre-present fence wait: which ioctls take it, and its clock.
+    //!
+    //! Both halves are pure, and both are the part that can be got wrong
+    //! silently. The router decides whether a frame waits at all -- miss
+    //! `PAGE_FLIP` and the whole implicit-sync path is dead code on a running
+    //! desktop, with nothing in any log to say so, because the present still
+    //! happens and merely shows a half-drawn buffer. The clock decides whether
+    //! a wait that times out ends: `sleep_until` takes an ABSOLUTE instant, so
+    //! a deadline already in the past must end the wait rather than park the
+    //! compositor on it.
+    //!
+    //! What is not covered here, because it needs a live device and a driver:
+    //! the fb lookup, the driver's fence answer, and the timeout warning.
+
+    use super::*;
+
+    /// `SETCRTC` and `PAGE_FLIP` both present, and both must wait.
+    #[test]
+    fn the_two_legacy_presents_are_recognised_at_their_real_sizes() {
+        assert_eq!(
+            legacy_present_kind(DRM_IOCTL_MODE_SETCRTC),
+            Some(LegacyPresent::SetCrtc)
+        );
+        assert_eq!(
+            legacy_present_kind(DRM_IOCTL_MODE_PAGE_FLIP),
+            Some(LegacyPresent::PageFlip)
+        );
+    }
+
+    /// The struct sizes the `nr` table claims are the ones the dispatch arms
+    /// actually read, so a struct that changes shape breaks here first.
+    #[test]
+    fn the_size_floors_match_the_structs_the_wait_parses() {
+        assert_eq!(nr::MODE_SETCRTC.1, core::mem::size_of::<DrmModeGetCrtc>());
+        assert_eq!(
+            nr::MODE_PAGE_FLIP.1,
+            core::mem::size_of::<DrmModeCrtcPageFlip>()
+        );
+    }
+
+    /// A struct that grows a trailing field keeps waiting. This is the bug
+    /// `is_drm_ioctl_nr` exists for, and pinning the 32-bit command instead
+    /// would have made a wider `drm_mode_crtc` skip the wait in silence.
+    #[test]
+    fn a_larger_encoded_struct_is_still_the_same_present() {
+        for extra in [8usize, 16, 64] {
+            assert_eq!(
+                legacy_present_kind(drm_iowr_core(
+                    nr::MODE_SETCRTC.0,
+                    nr::MODE_SETCRTC.1 + extra
+                )),
+                Some(LegacyPresent::SetCrtc)
+            );
+            assert_eq!(
+                legacy_present_kind(drm_iowr_core(
+                    nr::MODE_PAGE_FLIP.0,
+                    nr::MODE_PAGE_FLIP.1 + extra
+                )),
+                Some(LegacyPresent::PageFlip)
+            );
+        }
+    }
+
+    /// Below the floor the helper would read past the request, so it must fall
+    /// through to the sync arm, which zero-pads it the way Linux does.
+    #[test]
+    fn a_short_request_does_not_take_the_wait() {
+        assert_eq!(
+            legacy_present_kind(drm_iowr_core(nr::MODE_SETCRTC.0, nr::MODE_SETCRTC.1 - 1)),
+            None
+        );
+        assert_eq!(
+            legacy_present_kind(drm_iowr_core(nr::MODE_PAGE_FLIP.0, 8)),
+            None
+        );
+    }
+
+    /// Everything else, including the ioctls with their own waits: a present
+    /// fence wait on an atomic commit would wait twice, and on a syncobj wait
+    /// it would wait for the wrong thing entirely.
+    #[test]
+    fn no_other_ioctl_takes_the_present_wait() {
+        for cmd in [
+            ATOMIC_IOCTL,
+            WAIT_VBLANK_IOCTL,
+            DRM_IOCTL_SYNCOBJ_WAIT,
+            DRM_IOCTL_MODE_DIRTYFB,
+            DRM_IOCTL_MODE_SETPLANE,
+        ] {
+            assert_eq!(legacy_present_kind(cmd), None, "cmd {:#x} waits", cmd);
+        }
+        // Right NR, wrong ioctl type byte: another subsystem's 0xA2.
+        let foreign = drm_iowr_core(nr::MODE_SETCRTC.0, nr::MODE_SETCRTC.1) & !(0xff << 8);
+        assert_eq!(legacy_present_kind(foreign), None);
+    }
+
+    fn ms(n: u64) -> Duration {
+        Duration::from_millis(n)
+    }
+
+    /// The ordinary tick, while the deadline is far away.
+    #[test]
+    fn a_poll_far_from_its_deadline_sleeps_one_tick() {
+        assert_eq!(next_poll_wake(ms(10), ms(110), ms(1)), Some(ms(11)));
+    }
+
+    /// Clamped to the deadline, or a 100 ms cap becomes 101 ms on every frame
+    /// that times out.
+    #[test]
+    fn the_last_poll_never_sleeps_past_the_deadline() {
+        assert_eq!(
+            next_poll_wake(ms(10), ms(10) + ms(1) / 2, ms(1)),
+            Some(ms(10) + ms(1) / 2)
+        );
+    }
+
+    /// At or past the deadline the wait ends. Parking on an instant already
+    /// behind `timer_now` is what would hang the compositor instead of
+    /// presenting a possibly-torn frame.
+    #[test]
+    fn an_expired_deadline_ends_the_wait_instead_of_sleeping() {
+        assert_eq!(next_poll_wake(ms(10), ms(10), ms(1)), None);
+        assert_eq!(next_poll_wake(ms(10), ms(9), ms(1)), None);
+        assert_eq!(next_poll_wake(ms(10), Duration::ZERO, ms(1)), None);
+    }
+
+    /// A zero tick is a busy loop, not a sleep: `wake == now` ends the wait
+    /// rather than yielding forever at the same instant.
+    #[test]
+    fn a_zero_tick_ends_the_wait_rather_than_spinning() {
+        assert_eq!(next_poll_wake(ms(10), ms(110), Duration::ZERO), None);
     }
 }

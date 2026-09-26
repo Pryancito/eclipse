@@ -396,6 +396,62 @@ pub fn atomic_enabled() -> bool {
     ATOMIC_ENABLED.load(Ordering::Relaxed)
 }
 
+/// Whether a legacy present waits for the GPU to finish writing the buffer it
+/// is about to scan out. ON by default; the `drm.flip_fence=off` cmdline turns
+/// it off (see zCore/src/main.rs).
+///
+/// A default of ON is the whole point: the atomic path has waited on
+/// `IN_FENCE_FD` since it was written, and the legacy path -- the one this
+/// kernel actually runs, because `drm.atomic` is opt-in -- waited for nothing
+/// at all, so a frame could be scanned out while the GPU was still drawing it.
+/// The hatch is there because the wait is bounded by a clock and reads a fence
+/// the driver supplies: if it ever misbehaves on real hardware, a boot without
+/// it goes straight back to the old behaviour with no rebuild.
+static FLIP_FENCE_ENABLED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(true);
+
+/// Turn the pre-present fence wait off (or back on) for this boot.
+pub fn set_flip_fence_enabled(on: bool) {
+    FLIP_FENCE_ENABLED.store(on, Ordering::Relaxed);
+}
+
+/// Whether a legacy present should wait for the scanout buffer's render fence.
+pub fn flip_fence_enabled() -> bool {
+    FLIP_FENCE_ENABLED.load(Ordering::Relaxed)
+}
+
+/// The render fences a legacy present on `fb_id` has to wait for, each as
+/// `(fence landing-zone kernel VA, payload)`. Empty when there is nothing to
+/// wait for: the switch is off, the fb is unknown, no driver is registered, or
+/// no driver has work in flight that could be writing that buffer.
+///
+/// EVERY registered driver is asked, not just the primary. On a two-GPU box the
+/// GPU that draws need not be the GPU that scans out -- that is exactly the
+/// split this kernel runs, where the console GPU owns the panel and the compute
+/// GPU renders (see the CE/P2P present path) -- so asking only the primary
+/// would ask the one card that did not touch the pixels. A driver that does not
+/// recognise the buffer's handle and has no channel for its owner answers
+/// `None`, so in practice this is one fence, or none.
+pub fn scanout_render_fence(fb_id: u32) -> Vec<(usize, u32)> {
+    if !flip_fence_enabled() {
+        return Vec::new();
+    }
+    // One lock acquisition for both, and the guard is dropped before any driver
+    // call: `render_fence_for_scanout` takes the driver's own locks and may
+    // append a probe to a GPU ring.
+    let (fb, drivers) = {
+        let state = DRM_STATE.lock();
+        let Some(fb) = state.framebuffers.iter().find(|f| f.id == fb_id).copied() else {
+            return Vec::new();
+        };
+        (fb, state.drivers.clone())
+    };
+    drivers
+        .iter()
+        .filter_map(|d| d.render_fence_for_scanout(fb.gem_handle_id, fb.owner))
+        .collect()
+}
+
 /// Per-open DRM file state (Linux `struct drm_file`).
 ///
 /// `ATOMIC_CLIENT` and the readable event queue belong to the fd that
