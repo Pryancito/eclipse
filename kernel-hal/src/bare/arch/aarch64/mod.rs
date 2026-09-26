@@ -71,6 +71,22 @@ pub fn secondary_init() {
     // CPACR_EL1/CNTKCTL_EL1 are set by the SMP trampoline, before any compiled
     // Rust runs on this core -- see `smp::TransRegs`.
     //
+    // First, put this core's TTBR0_EL1 back where the boot core's is. The
+    // trampoline loads it with the identity table `build_identity_ttbr0` made
+    // so the PC stays valid while the MMU comes on, and after the `br` to the
+    // high-half entry nothing needs it again -- but nothing dropped it either,
+    // so every secondary kept the trampoline's two physical pages mapped RWX
+    // at their own addresses, for as long as the machine ran or until the core
+    // first entered userspace. The boot core does not: `vm::init` clears
+    // TTBR0_EL1 the moment it activates the kernel table, and riscv's
+    // secondaries reach the same place by calling `vm::init` themselves from
+    // their own `secondary_init`. This is the third answer to that question.
+    //
+    // It also publishes this core's active address space, which until now was
+    // the "unknown" that makes a core a target of every TLB shootdown in the
+    // system regardless of whose address space it is flushing.
+    crate::vm::activate_kernel_paging();
+    //
     // Bring up this core's half of the GIC. This used to be two writes done
     // by hand here -- GICC_CTLR and GICC_PMR, the CPU interface -- and it
     // stopped there, with the comment "GIC SGI are always-on". They are not.

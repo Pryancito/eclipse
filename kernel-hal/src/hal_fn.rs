@@ -132,6 +132,14 @@ hal_fn_def! {
         }
 
         /// Restore the kernel page table after running userspace on this CPU.
+        ///
+        /// The lazy-TLB restore point. The kernel leaves the process page table
+        /// loaded across polls, so this is the one place that promises a CPU
+        /// cannot go idle still holding an address space a concurrent process
+        /// exit may free. Whether it has one to drop is
+        /// [`crate::common::vm::should_restore_kernel_table`], which exists
+        /// because the register to ask is not the same on all three
+        /// architectures — and aarch64 asked the wrong one.
         pub fn activate_kernel_paging() {}
 
         /// Flush TLB by the associated `vaddr`, or flush the entire TLB. (`vaddr` is `None`).

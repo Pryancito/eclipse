@@ -269,6 +269,38 @@ pub fn is_user_table_root(root: PhysAddr, kernel_root: PhysAddr, flagged_user: b
     root & !0xfff != kernel_root & !0xfff
 }
 
+/// Whether this CPU still holds a user page table that the lazy-TLB restore
+/// point has to drop.
+///
+/// The kernel keeps the process page table loaded after a poll instead of
+/// reloading the kernel root every time, because that reload is a TLB flush
+/// and it dominated syscall- and yield-heavy workloads. What makes that safe
+/// is the promise that the user root is dropped before the CPU can idle, so
+/// it cannot sit holding translations for an address space a concurrent
+/// process exit is about to free. `activate_kernel_paging`, called from the
+/// executor's idle callback, is where that promise is kept.
+///
+/// `loaded_user_root` is whatever this CPU's hardware says the user half is
+/// being translated through: `CR3` on x86_64 and `satp`'s root on riscv64,
+/// where one register holds both roots and loading the kernel root evicts the
+/// user one; `TTBR0_EL1` on aarch64, where it does not. **That difference is
+/// the whole reason this is a shared function.** aarch64 asked the question of
+/// `current_vmtoken()`, which reads `TTBR1_EL1` — the register the kernel's
+/// own half is translated through, which nothing but the kernel root is ever
+/// written to. The answer was therefore "no" on every call after boot, and the
+/// restore point had been doing nothing at all: an idle aarch64 core kept
+/// `TTBR0_EL1` pointing at a page table any other core was free to free.
+///
+/// A CPU with nothing loaded has nothing to drop, and while no kernel root has
+/// been published there is nothing to restore *to*, so neither is a restore.
+/// Compared on the frame base for the reason [`crate::common::ipi::aspace_filter`]
+/// gives.
+pub fn should_restore_kernel_table(loaded_user_root: PhysAddr, kernel_root: PhysAddr) -> bool {
+    kernel_root != 0
+        && loaded_user_root & !0xfff != 0
+        && loaded_user_root & !0xfff != kernel_root & !0xfff
+}
+
 /// Every [`PageSize`] is used as a mask: `align_down` and `page_offset` do
 /// `addr & !(size - 1)` and `addr & (size - 1)`, which is only the intended
 /// arithmetic while each value is a power of two. A new variant that is not
@@ -582,7 +614,6 @@ mod page_size_tests {
 mod translation_base_tests {
     use super::*;
 
-
     const KERNEL: usize = 0x4_1000;
     const USER: usize = 0x9_2000;
 
@@ -617,5 +648,80 @@ mod translation_base_tests {
         assert!(!is_user_table_root(KERNEL, KERNEL | 0xabc, true));
         // One frame along is a different table, flag or no flag.
         assert!(is_user_table_root(KERNEL + 0x1000, KERNEL, false));
+    }
+}
+
+/// The lazy-TLB restore point: a CPU that ran userspace must drop the user
+/// page table before it can idle, and the three architectures were asking
+/// three different registers whether it still had one.
+#[cfg(test)]
+mod lazy_tlb_restore_tests {
+    use super::*;
+
+    const KERNEL: usize = 0x4_1000;
+    const USER: usize = 0x9_2000;
+
+    #[test]
+    fn a_cpu_that_still_holds_a_user_table_has_to_drop_it() {
+        assert!(should_restore_kernel_table(USER, KERNEL));
+    }
+
+    #[test]
+    fn a_cpu_already_back_on_the_kernel_table_pays_nothing() {
+        // The idle callback runs on EVERY idle iteration, so the second one
+        // and all the rest must cost a register read and no flush.
+        assert!(!should_restore_kernel_table(KERNEL, KERNEL));
+    }
+
+    #[test]
+    fn a_cpu_with_no_user_table_loaded_has_nothing_to_drop() {
+        // aarch64 after the drop, and after `vm::init`, leaves TTBR0_EL1 at
+        // zero. Asking again must not flush again.
+        assert!(!should_restore_kernel_table(0, KERNEL));
+    }
+
+    #[test]
+    fn nothing_is_restored_before_a_kernel_root_has_been_published() {
+        // Early boot, before `pin_kernel_vmtoken`: there is no root to go
+        // back to, so dropping the one that is loaded would leave the CPU
+        // translating through nothing.
+        assert!(!should_restore_kernel_table(USER, 0));
+        assert!(!should_restore_kernel_table(0, 0));
+    }
+
+    #[test]
+    fn the_low_twelve_bits_do_not_make_a_restore_necessary() {
+        // The registers carry more than the frame base -- an ASID, table
+        // walk attributes -- and none of it names another address space.
+        assert!(!should_restore_kernel_table(KERNEL | 0xfff, KERNEL));
+        assert!(!should_restore_kernel_table(KERNEL, KERNEL | 0xabc));
+        assert!(!should_restore_kernel_table(0xfff, KERNEL));
+        // One frame along really is another table.
+        assert!(should_restore_kernel_table(KERNEL + 0x1000, KERNEL));
+    }
+
+    #[test]
+    fn a_bring_up_table_that_is_neither_root_is_dropped_like_any_other() {
+        // aarch64's secondaries reach compiled Rust with the identity table
+        // the trampoline used to keep the PC valid across the MMU-enable step
+        // still in TTBR0_EL1. It belongs to no process and it is not the
+        // kernel's, and nothing had ever dropped it.
+        const TRAMPOLINE: usize = 0x2_3000;
+        assert!(should_restore_kernel_table(TRAMPOLINE, KERNEL));
+    }
+
+    #[test]
+    fn the_answer_agrees_with_which_base_register_the_root_belongs_in() {
+        // The two questions are asked of the same pair of roots on opposite
+        // sides of a thread's life: there is a user table to drop exactly
+        // when the root loaded is one `activate_paging` would have put in the
+        // user base register.
+        for root in [KERNEL, USER, KERNEL + 0x1000, 0x1000] {
+            assert_eq!(
+                should_restore_kernel_table(root, KERNEL),
+                is_user_table_root(root, KERNEL, false),
+                "root {root:#x}",
+            );
+        }
     }
 }
