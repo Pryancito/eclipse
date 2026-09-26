@@ -529,7 +529,6 @@ impl Canvas {
         true
     }
 
-    #[allow(dead_code)]
     /// Nearest-neighbour upscale into a `scale`-times-larger ARGB buffer.
     pub fn blit_argb_scaled(&self, dst: &mut [u8], scale: u32) -> bool {
         let scale = scale.max(1) as usize;
@@ -628,4 +627,133 @@ fn rounded_rect_path(x: f32, y: f32, w: f32, h: f32, r: f32) -> Option<Path> {
     pb.cubic_to(x, y + r - K * r, x + r - K * r, y, x + r, y);
     pb.close();
     pb.finish()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Fetch one BGRA pixel out of a blitted buffer.
+    fn px(buf: &[u8], w: usize, x: usize, y: usize) -> (u8, u8, u8, u8) {
+        let o = (y * w + x) * 4;
+        (buf[o], buf[o + 1], buf[o + 2], buf[o + 3])
+    }
+
+    /// The scrim is the whole reason the overlay is ARGB: it must reach the
+    /// compositor PREMULTIPLIED, because that is what `wl_shm`'s Argb8888
+    /// means. A straight-alpha scrim would composite far too bright.
+    #[test]
+    fn translucent_fill_is_premultiplied() {
+        let mut cv = Canvas::try_new(2, 2).unwrap();
+        // The app menu's backdrop, exactly: black at 35%.
+        cv.fill_rect_a(0, 0, 2, 2, (0, 0, 0), 0.35);
+        let mut buf = vec![0u8; 2 * 2 * 4];
+        assert!(cv.blit_argb(&mut buf));
+        let (b, g, r, a) = px(&buf, 2, 0, 0);
+        // Black premultiplied by any alpha is still black; alpha is ~0.35.
+        assert_eq!((b, g, r), (0, 0, 0));
+        assert!((a as i32 - 89).abs() <= 2, "alpha {a} is not ~0.35*255");
+
+        // A COLOURED translucent fill is where straight alpha would show: the
+        // colour channels must already be scaled down by the alpha.
+        let mut cv = Canvas::try_new(1, 1).unwrap();
+        cv.fill_rect_a(0, 0, 1, 1, (255, 255, 255), 0.5);
+        let mut buf = vec![0u8; 4];
+        assert!(cv.blit_argb(&mut buf));
+        let (b, g, r, a) = px(&buf, 1, 0, 0);
+        assert!((a as i32 - 128).abs() <= 2, "alpha {a}");
+        for c in [b, g, r] {
+            assert!(c <= a, "channel {c} exceeds alpha {a}: not premultiplied");
+            assert!((c as i32 - a as i32).abs() <= 2, "channel {c} vs alpha {a}");
+        }
+    }
+
+    /// Nothing drawn means fully transparent, not opaque black — the overlay
+    /// covers the whole output, so an opaque clear would black out the desktop.
+    #[test]
+    fn untouched_overlay_pixels_are_transparent() {
+        let cv = Canvas::try_new(3, 3).unwrap();
+        let mut buf = vec![0xabu8; 3 * 3 * 4];
+        assert!(cv.blit_argb(&mut buf));
+        assert!(buf.iter().all(|&b| b == 0), "a fresh overlay canvas is not clear");
+    }
+
+    /// The swizzle is RGBA -> BGRA, alpha carried through untouched.
+    #[test]
+    fn blit_argb_swizzles_and_keeps_alpha() {
+        let mut cv = Canvas::try_new(1, 1).unwrap();
+        cv.fill_rect_a(0, 0, 1, 1, (200, 100, 50), 1.0);
+        let mut buf = vec![0u8; 4];
+        assert!(cv.blit_argb(&mut buf));
+        assert_eq!(px(&buf, 1, 0, 0), (50, 100, 200, 255));
+    }
+
+    /// The bars' XRGB path forces the alpha byte opaque whatever was drawn.
+    #[test]
+    fn blit_xrgb_forces_opaque() {
+        let mut cv = Canvas::try_new(1, 1).unwrap();
+        cv.fill_rect_a(0, 0, 1, 1, (10, 20, 30), 0.25);
+        let mut buf = vec![0u8; 4];
+        assert!(cv.blit_xrgb(&mut buf));
+        assert_eq!(px(&buf, 1, 0, 0).3, 0xff);
+    }
+
+    /// HiDPI: the overlay canvas is LOGICAL pixels and the wl_buffer is
+    /// `scale` times that, so each logical pixel must land as a scale x scale
+    /// block — alpha included, or the scrim would gain a grid of holes.
+    #[test]
+    fn blit_argb_scaled_replicates_every_pixel() {
+        let mut cv = Canvas::try_new(2, 2).unwrap();
+        cv.fill_rect_a(0, 0, 1, 1, (255, 0, 0), 1.0);
+        cv.fill_rect_a(1, 1, 1, 1, (0, 0, 255), 0.5);
+        let (bw, bh) = (4, 4);
+        let mut buf = vec![0u8; bw * bh * 4];
+        assert!(cv.blit_argb_scaled(&mut buf, 2));
+        for (x, y) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+            assert_eq!(px(&buf, bw, x, y), (0, 0, 255, 255), "red block at {x},{y}");
+        }
+        for (x, y) in [(2, 2), (3, 2), (2, 3), (3, 3)] {
+            let (b, g, r, a) = px(&buf, bw, x, y);
+            assert!((a as i32 - 128).abs() <= 2, "alpha {a} at {x},{y}");
+            assert_eq!((g, r), (0, 0));
+            assert!((b as i32 - a as i32).abs() <= 2, "blue {b} not premultiplied");
+        }
+        // The untouched top-right quadrant stays clear.
+        assert_eq!(px(&buf, bw, 3, 0), (0, 0, 0, 0));
+    }
+
+    /// Scale 1 is the same bytes as the unscaled blit — the popup takes the
+    /// scaled path unconditionally now, so the common case must not change.
+    #[test]
+    fn blit_argb_scaled_one_matches_unscaled() {
+        let mut cv = Canvas::try_new(4, 3).unwrap();
+        cv.fill_rect_a(0, 0, 4, 3, (0, 0, 0), 0.35);
+        cv.round_rect_a(1, 1, 2, 2, 1, (30, 60, 90), 0.98);
+        let mut a = vec![0u8; 4 * 3 * 4];
+        let mut b = vec![0u8; 4 * 3 * 4];
+        assert!(cv.blit_argb(&mut a));
+        assert!(cv.blit_argb_scaled(&mut b, 1));
+        assert_eq!(a, b);
+    }
+
+    /// A short destination must be refused, never panic: a bad configure from
+    /// the compositor has to leave the panel up.
+    #[test]
+    fn blits_refuse_a_short_destination() {
+        let cv = Canvas::try_new(4, 4).unwrap();
+        let mut small = vec![0u8; 4 * 4 * 4 - 1];
+        assert!(!cv.blit_argb(&mut small));
+        assert!(!cv.blit_xrgb(&mut small));
+        let mut scaled = vec![0u8; 8 * 8 * 4 - 1];
+        assert!(!cv.blit_argb_scaled(&mut scaled, 2));
+        assert!(!cv.blit_xrgb_scaled(&mut scaled, 2));
+    }
+
+    /// Scale 0 would divide by zero in the nearest-neighbour walk.
+    #[test]
+    fn blit_argb_scaled_clamps_zero_scale() {
+        let cv = Canvas::try_new(2, 2).unwrap();
+        let mut buf = vec![0u8; 2 * 2 * 4];
+        assert!(cv.blit_argb_scaled(&mut buf, 0));
+    }
 }
