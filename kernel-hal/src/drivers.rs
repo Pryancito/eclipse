@@ -22,19 +22,24 @@ impl<T: Scheme + ?Sized> DeviceList<T> {
         self.0.write().push(dev);
     }
 
-    /// Drop the entry that IS `dev` (same allocation, not merely equal),
-    /// returning whether one was found. Hosted builds only -- see
+    /// Drop EVERY entry that IS `dev` (same allocation, not merely equal),
+    /// returning whether any were found. Hosted builds only -- see
     /// [`remove_device_hosted`].
+    ///
+    /// Every entry, not the first one: [`Self::add`] is an unconditional
+    /// `push`, so the same `Arc` can be in here twice (`sysfs`'s `Disks` adds
+    /// one per disk name it is given, and the software-KMS emulation attaches
+    /// its pair on each `open`). Dropping only the first and answering `true`
+    /// said the device was gone while a live copy stayed in the list -- and
+    /// because every lookup that matters takes the FIRST entry
+    /// (`primary_display`, `all_uart().first()`), the copy is the one the
+    /// kernel would then go on using.
     #[cfg(feature = "libos")]
     fn remove(&self, dev: &Arc<T>) -> bool {
         let mut list = self.0.write();
-        match list.iter().position(|d| Arc::ptr_eq(d, dev)) {
-            Some(pos) => {
-                list.remove(pos);
-                true
-            }
-            None => false,
-        }
+        let before = list.len();
+        list.retain(|d| !Arc::ptr_eq(d, dev));
+        before != list.len()
     }
 
     /// Convert self into a vector.
@@ -97,10 +102,21 @@ impl AllDeviceList {
             Device::Net(d) => self.net.remove(d),
             Device::Uart(d) => self.uart.remove(d),
             Device::Drm(d) => self.drm.remove(d),
+            // Registered as a pair, so "removed" means both halves went. `||`
+            // reported success when only one did, and the caller -- which is a
+            // test emulation detaching the display it attached -- believed it
+            // and moved on, leaving the other half registered for every later
+            // test in the same process.
             Device::DrmDisplay(drm, display) => {
                 let a = self.drm.remove(drm);
                 let b = self.display.remove(display);
-                a || b
+                if a != b {
+                    warn!(
+                        "remove_device: half a DrmDisplay pair was registered (drm={}, display={})",
+                        a, b
+                    );
+                }
+                a && b
             }
             Device::Audio(d) => self.audio.remove(d),
         }
@@ -197,10 +213,23 @@ pub fn all_irq() -> &'static DeviceList<dyn IrqScheme> {
 /// would acquire an `RwLock` and clone an `Arc` per interrupt. The primary
 /// controller is registered at boot and never replaced, so we can stash it
 /// once and hand out a borrowed reference.
+///
+/// The lookup happens OUTSIDE `call_once`. `first_unwrap` panics while no
+/// controller is registered yet, and a panic that escapes `call_once` poisons a
+/// `spin::Once` **permanently**: every later call then panics with
+/// `Once panicked` instead of resolving, even once the controller exists. One
+/// early call -- a device IRQ arriving before `irq_init`, or a probe asking
+/// whether a GSI is valid -- would therefore have turned the interrupt path
+/// into a panic for the rest of the boot, which is not something a second
+/// attempt could undo. Panicking on the way in is fine; panicking inside is
+/// what costs the cache.
 pub fn primary_irq() -> &'static (dyn IrqScheme + Send + Sync + 'static) {
     static PRIMARY_IRQ: spin::Once<Arc<dyn IrqScheme>> = spin::Once::new();
-    let arc = PRIMARY_IRQ.call_once(|| all_irq().first_unwrap());
-    &**arc
+    if let Some(arc) = PRIMARY_IRQ.get() {
+        return &**arc;
+    }
+    let first = all_irq().first_unwrap();
+    &**PRIMARY_IRQ.call_once(|| first)
 }
 
 /// Returns all devices which implement the [`NetScheme`].
@@ -230,6 +259,15 @@ pub fn all_audio() -> &'static DeviceList<dyn AudioScheme> {
 #[cfg(target_arch = "x86_64")]
 pub fn hdmi_audio_status() -> alloc::string::String {
     zcore_drivers::display::hdmi_audio_status()
+}
+/// The only one of these display knobs that had no non-x86_64 half, so its one
+/// caller (`/proc/gpusnd`) had to carry the `cfg` itself -- and a second caller
+/// written without it would simply not build on aarch64 or riscv64.
+#[cfg(not(target_arch = "x86_64"))]
+pub fn hdmi_audio_status() -> alloc::string::String {
+    alloc::string::String::from(
+        "[gpusnd] display side: no NVIDIA display engine on this architecture\n",
+    )
 }
 
 /// Enables the nouveau-compatible driver-specific ioctl surface on the
@@ -391,6 +429,43 @@ pub fn klog_graphics_device_summary(active_console: Option<&str>) {
             #[cfg(feature = "graphic")]
             crate::klog_info!("graphics: active framebuffer console: (none — serial/text only)");
         }
+    }
+}
+
+/// Publish one kernel-log line that arrived across the C ABI, keeping whatever
+/// prefix of it is valid UTF-8.
+///
+/// `zcore_drivers`' `klog_emit` formats into a fixed 256-byte buffer and
+/// truncates at a byte boundary, so any line longer than that whose cut lands
+/// inside a multi-byte character arrives here as invalid UTF-8 -- and driver log
+/// lines do carry them (`—` in the e1000e MAC warning and the AHCI reset
+/// timeout, `≈` in the graphics summary below). Dropping the line on a failed
+/// `from_utf8` threw away the readable part too, so the one dmesg line saying
+/// what a driver had just decided disappeared for the sake of its last three
+/// bytes. Publish the valid prefix instead, and when not even the first byte is
+/// valid, leave a line saying a line was lost: a driver log that goes silent
+/// looks exactly like a driver that stopped logging.
+///
+/// # Safety
+///
+/// `msg` must be valid for reads of `len` bytes, as `drivers_klog_emit`'s
+/// contract requires.
+unsafe fn klog_emit_ffi(priority: u8, msg: *const u8, len: usize) {
+    if msg.is_null() || len == 0 {
+        return;
+    }
+    let slice = core::slice::from_raw_parts(msg, len);
+    match core::str::from_utf8(slice) {
+        Ok(s) => crate::console::klog_emit(priority, s),
+        Err(e) if e.valid_up_to() > 0 => {
+            // `valid_up_to()` is by definition a UTF-8 boundary.
+            let good = core::str::from_utf8_unchecked(&slice[..e.valid_up_to()]);
+            crate::console::klog_emit(priority, good);
+        }
+        Err(_) => crate::console::klog_emit(
+            priority,
+            "[klog] a driver log line was dropped: not UTF-8 from its first byte\n",
+        ),
     }
 }
 
@@ -601,16 +676,12 @@ mod drivers_ffi_libos {
     // `zcore_drivers` always links its kernel-log helper; provide the emitter in
     // libos too (forwards to the registered dmesg sink, or a no-op if none),
     // otherwise the hosted build fails to link with `undefined: drivers_klog_emit`.
-    use crate::console::klog_emit;
+    // Both copies of this shim are the same three lines over `klog_emit_ffi`,
+    // which is where the byte-slice handling lives: it used to be duplicated,
+    // and a fix to one copy would have left the other as it was.
     #[no_mangle]
     extern "C" fn drivers_klog_emit(priority: u8, msg: *const u8, len: usize) {
-        if msg.is_null() || len == 0 {
-            return;
-        }
-        let slice = unsafe { core::slice::from_raw_parts(msg, len) };
-        if let Ok(s) = core::str::from_utf8(slice) {
-            klog_emit(priority, s);
-        }
+        unsafe { super::klog_emit_ffi(priority, msg, len) }
     }
 
     // `zcore_drivers::utils::dma::DmaRegion` (used by every PCI NIC/storage
@@ -849,21 +920,608 @@ mod drivers_ffi {
         intr_get()
     }
 
-    use crate::console::klog_emit;
     #[no_mangle]
     extern "C" fn drivers_klog_emit(priority: u8, msg: *const u8, len: usize) {
-        if msg.is_null() || len == 0 {
-            return;
-        }
-        let slice = unsafe { core::slice::from_raw_parts(msg, len) };
-        if let Ok(s) = core::str::from_utf8(slice) {
-            klog_emit(priority, s);
-        }
+        unsafe { super::klog_emit_ffi(priority, msg, len) }
     }
 
     /// Wake tasks blocked on NIC RX (TCP/UDP recv, poll/epoll).
     #[no_mangle]
     extern "C" fn drivers_wake_net_rx_waiters() {
         crate::net::wake_net_rx_waiters();
+    }
+}
+
+#[cfg(test)]
+mod registry_tests {
+    use super::*;
+    use alloc::string::String;
+    use alloc::vec::Vec;
+    use zcore_drivers::prelude::{ColorFormat, DisplayInfo, FrameBuffer, IrqHandler};
+    use zcore_drivers::scheme::drm::{DrmCaps, DrmConnector, DrmCrtc, DrmPlane};
+    use zcore_drivers::DeviceResult;
+
+    // ── the process-wide bits ────────────────────────────────────────────────
+
+    /// `primary_irq` and `klog_graphics_device_summary` read the ONE device list
+    /// the whole process shares, and the dmesg sink below is equally global, so
+    /// the handful of tests that touch either run one at a time whatever
+    /// `--test-threads` says.
+    ///
+    /// The body runs inside `catch_unwind` and the panic is raised again after
+    /// the guard is dropped: a `spin::Mutex` neither poisons nor unlocks on
+    /// unwind, so a failed assertion would otherwise leave the lock held and
+    /// turn one red test into a hung suite.
+    fn one_at_a_time<R>(f: impl FnOnce() -> R) -> R {
+        static GUARD: spin::Mutex<()> = spin::Mutex::new(());
+        let held = GUARD.lock();
+        let out = ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(f));
+        drop(held);
+        match out {
+            Ok(v) => v,
+            Err(e) => ::std::panic::resume_unwind(e),
+        }
+    }
+
+    static SINK: spin::Mutex<Vec<(u8, String)>> = spin::Mutex::new(Vec::new());
+
+    fn sink_emit(priority: u8, msg: &str) {
+        SINK.lock().push((priority, String::from(msg)));
+    }
+    fn sink_read(_dst: &mut [u8]) -> usize {
+        0
+    }
+    fn sink_size() -> usize {
+        0
+    }
+
+    /// Install the recording dmesg sink (once per process) and start from an
+    /// empty transcript.
+    ///
+    /// `console::klog_emit` judges its slot through `lock::fn_slot::live_fn`
+    /// first. Nothing publishes a `.text` window in a hosted build --
+    /// `set_kernel_text` is only called from `bare/arch/x86_64` -- so the slot
+    /// comes back `Unchecked`, which is allowed, and the sink really is reached.
+    fn sink_reset() {
+        static INSTALLED: spin::Once<()> = spin::Once::new();
+        INSTALLED.call_once(|| crate::console::klog_register(sink_read, sink_size, sink_emit));
+        SINK.lock().clear();
+    }
+
+    fn sink_lines() -> Vec<(u8, String)> {
+        SINK.lock().clone()
+    }
+
+    fn line_with(lines: &[(u8, String)], needle: &str) -> Option<String> {
+        lines
+            .iter()
+            .find(|(_, m)| m.contains(needle))
+            .map(|(_, m)| m.clone())
+    }
+
+    // ── devices of mentira ───────────────────────────────────────────────────
+
+    struct FakeBlock(String);
+    impl Scheme for FakeBlock {
+        fn name(&self) -> &str {
+            &self.0
+        }
+    }
+    impl BlockScheme for FakeBlock {
+        fn read_block(&self, _b: usize, _buf: &mut [u8]) -> DeviceResult {
+            Ok(())
+        }
+        fn write_block(&self, _b: usize, _buf: &[u8]) -> DeviceResult {
+            Ok(())
+        }
+        fn flush(&self) -> DeviceResult {
+            Ok(())
+        }
+        fn block_count(&self) -> usize {
+            8
+        }
+    }
+
+    fn block(name: &str) -> Arc<dyn BlockScheme> {
+        Arc::new(FakeBlock(String::from(name)))
+    }
+
+    struct FakeDisplay(String);
+    impl Scheme for FakeDisplay {
+        fn name(&self) -> &str {
+            &self.0
+        }
+    }
+    impl DisplayScheme for FakeDisplay {
+        fn info(&self) -> DisplayInfo {
+            DisplayInfo {
+                width: 8,
+                height: 4,
+                pitch: 32,
+                format: ColorFormat::ARGB8888,
+                fb_base_vaddr: 0,
+                fb_size: 128,
+            }
+        }
+        fn fb(&self) -> FrameBuffer<'_> {
+            static mut BUF: [u8; 128] = [0; 128];
+            unsafe { FrameBuffer::from_raw_parts_mut(core::ptr::addr_of_mut!(BUF) as *mut u8, 128) }
+        }
+    }
+
+    fn display(name: &str) -> Arc<dyn DisplayScheme> {
+        Arc::new(FakeDisplay(String::from(name)))
+    }
+
+    struct FakeDrm(String);
+    impl Scheme for FakeDrm {
+        fn name(&self) -> &str {
+            &self.0
+        }
+    }
+    impl DrmScheme for FakeDrm {
+        fn get_caps(&self) -> DrmCaps {
+            DrmCaps {
+                has_3d: false,
+                has_cursor: true,
+                max_width: 8,
+                max_height: 4,
+            }
+        }
+        fn create_fb(&self, _h: u32, _w: u32, _ht: u32, _p: u32) -> Option<u32> {
+            None
+        }
+        fn page_flip(&self, _fb: u32) -> bool {
+            false
+        }
+        fn set_cursor(&self, _c: u32, _x: i32, _y: i32, _h: u32, _f: u32) -> bool {
+            false
+        }
+        fn wait_vblank(&self, _c: u32) -> bool {
+            false
+        }
+        fn get_resources(&self) -> (Vec<u32>, Vec<u32>, Vec<u32>) {
+            (Vec::new(), Vec::new(), Vec::new())
+        }
+        fn get_connector(&self, _id: u32) -> Option<DrmConnector> {
+            None
+        }
+        fn get_crtc(&self, _id: u32) -> Option<DrmCrtc> {
+            None
+        }
+        fn get_plane(&self, _id: u32) -> Option<DrmPlane> {
+            None
+        }
+        fn get_planes(&self) -> Vec<u32> {
+            Vec::new()
+        }
+        #[allow(clippy::too_many_arguments)]
+        fn set_plane(
+            &self,
+            _p: u32,
+            _c: u32,
+            _fb: u32,
+            _x: i32,
+            _y: i32,
+            _w: u32,
+            _h: u32,
+            _sx: u32,
+            _sy: u32,
+            _sw: u32,
+            _sh: u32,
+        ) -> bool {
+            false
+        }
+    }
+
+    fn drm(name: &str) -> Arc<dyn DrmScheme> {
+        Arc::new(FakeDrm(String::from(name)))
+    }
+
+    struct FakeIrq(String);
+    impl Scheme for FakeIrq {
+        fn name(&self) -> &str {
+            &self.0
+        }
+    }
+    impl IrqScheme for FakeIrq {
+        fn is_valid_irq(&self, _n: usize) -> bool {
+            true
+        }
+        fn mask(&self, _n: usize) -> DeviceResult {
+            Ok(())
+        }
+        fn unmask(&self, _n: usize) -> DeviceResult {
+            Ok(())
+        }
+        fn register_handler(&self, _n: usize, _h: IrqHandler) -> DeviceResult {
+            Ok(())
+        }
+        fn unregister(&self, _n: usize) -> DeviceResult {
+            Ok(())
+        }
+    }
+
+    // ── DeviceList, on lists of its own ─────────────────────────────────────
+
+    #[test]
+    fn una_lista_de_dispositivos_recien_hecha_esta_vacia() {
+        let list = DeviceList::<dyn BlockScheme>::default();
+        assert!(list.as_vec().is_empty());
+        assert!(list.first().is_none());
+        assert!(list.try_get(0).is_none());
+        assert!(list.find("cualquiera").is_none());
+    }
+
+    #[test]
+    fn first_es_el_primero_que_se_registro_y_no_el_ultimo() {
+        let list = DeviceList::<dyn BlockScheme>::default();
+        list.add(block("sda"));
+        list.add(block("sdb"));
+        // `primary_display` and `all_uart().first()` are this call, so which end
+        // of the list it takes decides which device the kernel actually drives.
+        assert_eq!(list.first().unwrap().name(), "sda");
+        assert_eq!(list.try_get(1).unwrap().name(), "sdb");
+        assert!(list.try_get(2).is_none());
+    }
+
+    #[test]
+    fn find_busca_por_nombre_y_no_se_inventa_ninguno() {
+        let list = DeviceList::<dyn BlockScheme>::default();
+        list.add(block("sda"));
+        list.add(block("sdb"));
+        assert_eq!(list.find("sdb").unwrap().name(), "sdb");
+        assert!(list.find("sdc").is_none());
+        // Prefixes are not matches: `find("sd")` must not hand back `sda`.
+        assert!(list.find("sd").is_none());
+    }
+
+    #[test]
+    fn first_unwrap_dice_de_que_rasgo_era_la_lista_vacia() {
+        let list = DeviceList::<dyn IrqScheme>::default();
+        let err = ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(|| {
+            list.first_unwrap();
+        }))
+        .unwrap_err();
+        let msg = err
+            .downcast_ref::<String>()
+            .cloned()
+            .unwrap_or_else(|| String::from("?"));
+        assert!(msg.contains("device not initialized"), "{}", msg);
+        // The trait name is the whole diagnostic value of this panic: it is what
+        // tells you WHICH device list was empty when the kernel died.
+        assert!(msg.contains("IrqScheme"), "{}", msg);
+    }
+
+    #[test]
+    fn un_dispositivo_registrado_dos_veces_se_va_entero_al_desregistrarlo() {
+        let list = DeviceList::<dyn BlockScheme>::default();
+        let disk = block("sda");
+        list.add(disk.clone());
+        list.add(disk.clone());
+        assert_eq!(list.as_vec().len(), 2);
+        // Used to drop only the first copy and answer `true` anyway, so the
+        // caller believed the device was gone while `first()` still found it.
+        assert!(list.remove(&disk));
+        assert!(
+            list.as_vec().is_empty(),
+            "quedo una copia viva: {}",
+            list.as_vec().len()
+        );
+        assert!(list.first().is_none());
+    }
+
+    #[test]
+    fn desregistrar_un_dispositivo_que_no_esta_contesta_que_no() {
+        let list = DeviceList::<dyn BlockScheme>::default();
+        list.add(block("sda"));
+        let otro = block("sdb");
+        assert!(!list.remove(&otro));
+        assert_eq!(list.as_vec().len(), 1);
+    }
+
+    #[test]
+    fn dos_dispositivos_con_el_mismo_nombre_se_distinguen_por_identidad() {
+        let list = DeviceList::<dyn BlockScheme>::default();
+        let uno = block("sda");
+        let otro = block("sda");
+        list.add(uno.clone());
+        list.add(otro.clone());
+        // Same name, different allocation: removal is by `Arc::ptr_eq`, so the
+        // one that stays is the one that was not asked for.
+        assert!(list.remove(&uno));
+        assert_eq!(list.as_vec().len(), 1);
+        assert!(Arc::ptr_eq(&list.first().unwrap(), &otro));
+    }
+
+    // ── AllDeviceList, and the DrmDisplay pair ──────────────────────────────
+
+    #[test]
+    fn cada_dispositivo_va_a_la_lista_de_su_rasgo() {
+        let all = AllDeviceList::default();
+        all.add_device(Device::Block(block("sda")));
+        all.add_device(Device::Display(display("fb0")));
+        all.add_device(Device::Drm(drm("card0")));
+        assert_eq!(all.block.as_vec().len(), 1);
+        assert_eq!(all.display.as_vec().len(), 1);
+        assert_eq!(all.drm.as_vec().len(), 1);
+        assert!(all.net.as_vec().is_empty());
+        assert!(all.uart.as_vec().is_empty());
+        assert!(all.irq.as_vec().is_empty());
+        assert!(all.audio.as_vec().is_empty());
+        assert!(all.input.as_vec().is_empty());
+    }
+
+    #[test]
+    fn un_par_drm_display_se_registra_en_las_dos_listas() {
+        let all = AllDeviceList::default();
+        all.add_device(Device::DrmDisplay(drm("card0"), display("fb0")));
+        assert_eq!(all.drm.as_vec().len(), 1);
+        assert_eq!(all.display.as_vec().len(), 1);
+    }
+
+    #[test]
+    fn un_par_drm_display_entero_se_va_de_las_dos_listas() {
+        let all = AllDeviceList::default();
+        let pair = Device::DrmDisplay(drm("card0"), display("fb0"));
+        all.add_device(pair.clone());
+        assert!(all.remove_device(&pair));
+        assert!(all.drm.as_vec().is_empty());
+        assert!(all.display.as_vec().is_empty());
+    }
+
+    #[test]
+    fn un_par_drm_display_a_medias_no_dice_que_se_fue_entero() {
+        let all = AllDeviceList::default();
+        let card = drm("card0");
+        let fb = display("fb0");
+        let pair = Device::DrmDisplay(card.clone(), fb.clone());
+        // Only the DRM half is registered -- the state the software-KMS
+        // emulation is in between its two registrations.
+        all.add_device(Device::Drm(card));
+        // Used to answer `a || b`: `true`, because one half did go. The caller
+        // then stopped worrying about a display that was still registered.
+        assert!(!all.remove_device(&pair));
+        // What was there is still removed: only the answer changes.
+        assert!(all.drm.as_vec().is_empty());
+    }
+
+    #[test]
+    fn un_par_drm_display_con_solo_la_pantalla_tampoco_se_fue_entero() {
+        let all = AllDeviceList::default();
+        let card = drm("card0");
+        let fb = display("fb0");
+        let pair = Device::DrmDisplay(card.clone(), fb.clone());
+        // The other way round from the test above, because a wrong answer here
+        // is just as wrong: neither half alone is the pair.
+        all.add_device(Device::Display(fb));
+        assert!(!all.remove_device(&pair));
+        assert!(all.display.as_vec().is_empty());
+    }
+
+    #[test]
+    fn desregistrar_un_par_que_no_esta_contesta_que_no() {
+        let all = AllDeviceList::default();
+        let pair = Device::DrmDisplay(drm("card0"), display("fb0"));
+        assert!(!all.remove_device(&pair));
+    }
+
+    #[test]
+    fn desregistrar_un_dispositivo_no_toca_las_demas_listas() {
+        let all = AllDeviceList::default();
+        let disk = block("sda");
+        all.add_device(Device::Block(disk.clone()));
+        all.add_device(Device::Display(display("fb0")));
+        assert!(all.remove_device(&Device::Block(disk)));
+        assert!(all.block.as_vec().is_empty());
+        assert_eq!(all.display.as_vec().len(), 1);
+    }
+
+    // ── primary_irq's one-shot cache ────────────────────────────────────────
+
+    /// The regression test for the cache that poisoned itself.
+    ///
+    /// There is exactly one of these because `PRIMARY_IRQ` is a process-wide
+    /// `spin::Once`: whatever this test leaves it in, it stays in for the rest
+    /// of the binary, so a second test could not ask the same question.
+    #[test]
+    fn primary_irq_no_se_envenena_cuando_todavia_no_hay_controlador() {
+        one_at_a_time(|| {
+            // Nothing registered yet: the panic comes from `first_unwrap`, on
+            // the way in.
+            let sin = ::std::panic::catch_unwind(|| primary_irq().name());
+            assert!(sin.is_err(), "sin controlador no deberia haber contestado");
+
+            let irq: Arc<dyn IrqScheme> = Arc::new(FakeIrq(String::from("fake-plic")));
+            add_device_hosted(Device::Irq(irq.clone()));
+
+            // The bug: that first panic happened INSIDE `call_once`, so the
+            // `Once` was poisoned for good and this call panicked with
+            // "Once panicked" -- on bare metal, every interrupt for the rest of
+            // the boot.
+            let con = ::std::panic::catch_unwind(|| primary_irq().name());
+            assert_eq!(con.ok(), Some("fake-plic"));
+
+            // And it is a cache: the second answer is the first one, not a
+            // fresh lookup.
+            assert_eq!(primary_irq().name(), "fake-plic");
+
+            assert!(remove_device_hosted(&Device::Irq(irq)));
+            // And it outlives the list it was taken from, which is what makes it
+            // a cache and not just a shortcut: the IRQ-dispatch path reads this
+            // on every interrupt and must not go back to the `RwLock`.
+            assert_eq!(primary_irq().name(), "fake-plic");
+        });
+    }
+
+    // ── the log line that came in over the C ABI ─────────────────────────────
+
+    fn emit_bytes(priority: u8, bytes: &[u8]) {
+        unsafe { klog_emit_ffi(priority, bytes.as_ptr(), bytes.len()) }
+    }
+
+    #[test]
+    fn una_linea_de_log_legible_se_publica_tal_cual_y_con_su_prioridad() {
+        one_at_a_time(|| {
+            sink_reset();
+            emit_bytes(
+                crate::console::LOG_WARNING,
+                b"[e1000e] link down, renegotiating\n",
+            );
+            let lines = sink_lines();
+            assert_eq!(lines.len(), 1);
+            assert_eq!(lines[0].0, crate::console::LOG_WARNING);
+            assert_eq!(lines[0].1, "[e1000e] link down, renegotiating\n");
+        });
+    }
+
+    #[test]
+    fn una_linea_de_log_cortada_a_media_letra_publica_lo_legible() {
+        one_at_a_time(|| {
+            sink_reset();
+            // Exactly what `zcore_drivers::bus::klog` produces for a line that
+            // does not fit its 256-byte buffer: the cut lands inside the em
+            // dash, and there is no way to put those three bytes back.
+            let mut bytes = Vec::from(&b"[e1000e] MAC all-zero/FF after reset "[..]);
+            bytes.extend_from_slice(&"\u{2014}".as_bytes()[..2]);
+            assert!(core::str::from_utf8(&bytes).is_err());
+
+            emit_bytes(crate::console::LOG_WARNING, &bytes);
+            let lines = sink_lines();
+            // Used to publish nothing at all: the whole line was thrown away
+            // for the sake of its last two bytes.
+            assert_eq!(lines.len(), 1, "no publico nada");
+            assert_eq!(lines[0].1, "[e1000e] MAC all-zero/FF after reset ");
+        });
+    }
+
+    #[test]
+    fn una_linea_de_log_ilegible_desde_el_primer_byte_deja_constancia() {
+        one_at_a_time(|| {
+            sink_reset();
+            emit_bytes(crate::console::LOG_ERR, &[0xff, 0xfe, 0xfd]);
+            let lines = sink_lines();
+            // A driver log that goes silent looks exactly like a driver that
+            // stopped logging, so say a line was lost rather than lose it.
+            assert_eq!(lines.len(), 1);
+            assert!(lines[0].1.contains("not UTF-8"), "{}", lines[0].1);
+            assert_eq!(lines[0].0, crate::console::LOG_ERR);
+        });
+    }
+
+    #[test]
+    fn una_linea_de_log_vacia_o_sin_puntero_no_publica_nada() {
+        one_at_a_time(|| {
+            sink_reset();
+            emit_bytes(crate::console::LOG_INFO, b"");
+            unsafe { klog_emit_ffi(crate::console::LOG_INFO, core::ptr::null(), 32) };
+            assert!(sink_lines().is_empty());
+        });
+    }
+
+    // ── the graphics summary Moebius reads at boot ──────────────────────────
+
+    #[test]
+    fn el_resumen_de_graficos_sin_dispositivos_lo_dice() {
+        one_at_a_time(|| {
+            sink_reset();
+            klog_graphics_device_summary(None);
+            let lines = sink_lines();
+            assert!(
+                line_with(&lines, "no framebuffer (Display) or DRM devices registered").is_some(),
+                "{:?}",
+                lines
+            );
+        });
+    }
+
+    #[test]
+    fn el_resumen_de_graficos_nombra_cada_pantalla_con_su_modo() {
+        one_at_a_time(|| {
+            sink_reset();
+            let fb = display("resumen-fb");
+            add_device_hosted(Device::Display(fb.clone()));
+            klog_graphics_device_summary(None);
+            let lines = sink_lines();
+            assert!(remove_device_hosted(&Device::Display(fb)));
+
+            let cuenta = line_with(&lines, "framebuffer device(s)").expect("falta la cuenta");
+            assert!(cuenta.contains("1 framebuffer device(s)"), "{}", cuenta);
+            assert!(cuenta.contains("0 DRM / GPU device(s)"), "{}", cuenta);
+
+            let linea = line_with(&lines, "resumen-fb").expect("falta la pantalla");
+            assert!(linea.contains("display[0]"), "{}", linea);
+            assert!(linea.contains("8x4"), "{}", linea);
+            assert!(linea.contains("pitch=32"), "{}", linea);
+        });
+    }
+
+    #[test]
+    fn el_resumen_de_graficos_nombra_cada_gpu_con_sus_capacidades() {
+        one_at_a_time(|| {
+            sink_reset();
+            let card = drm("resumen-gpu");
+            add_device_hosted(Device::Drm(card.clone()));
+            klog_graphics_device_summary(None);
+            let lines = sink_lines();
+            assert!(remove_device_hosted(&Device::Drm(card)));
+
+            let cuenta = line_with(&lines, "DRM / GPU device(s)").expect("falta la cuenta");
+            assert!(cuenta.contains("1 DRM / GPU device(s)"), "{}", cuenta);
+
+            let linea = line_with(&lines, "resumen-gpu").expect("falta la gpu");
+            assert!(linea.contains("drm[0]"), "{}", linea);
+            assert!(linea.contains("max_mode=8x4"), "{}", linea);
+            assert!(linea.contains("cursor=true"), "{}", linea);
+            assert!(linea.contains("3d=false"), "{}", linea);
+        });
+    }
+
+    #[test]
+    fn el_resumen_de_graficos_dice_cual_es_la_consola_activa() {
+        one_at_a_time(|| {
+            sink_reset();
+            klog_graphics_device_summary(Some("nvidia-drm scanout"));
+            let lines = sink_lines();
+            let linea = line_with(&lines, "active framebuffer console").expect("falta la consola");
+            assert!(linea.contains("nvidia-drm scanout"), "{}", linea);
+        });
+    }
+
+    #[test]
+    fn el_resumen_de_graficos_con_una_consola_sin_nombre_no_se_la_inventa() {
+        one_at_a_time(|| {
+            sink_reset();
+            // An empty note is not a name: it must read the same as `None`.
+            klog_graphics_device_summary(Some(""));
+            let vacia = sink_lines();
+            sink_reset();
+            klog_graphics_device_summary(None);
+            let ninguna = sink_lines();
+            assert_eq!(vacia, ninguna);
+        });
+    }
+
+    // ── what a DeviceError becomes ──────────────────────────────────────────
+
+    #[test]
+    fn cualquier_error_de_dispositivo_se_vuelve_el_mismo_halerror() {
+        // `HalError` is a unit struct, so the conversion is lossy by
+        // construction: which of these it was survives only in the `warn!`.
+        // Pinned here so that stops being a surprise to whoever adds the first
+        // real variant.
+        for e in [
+            DeviceError::BufferTooSmall,
+            DeviceError::NotReady,
+            DeviceError::InvalidParam,
+            DeviceError::DmaError,
+            DeviceError::IoError,
+            DeviceError::AlreadyExists,
+            DeviceError::NoResources,
+            DeviceError::NotSupported,
+        ] {
+            let hal: crate::HalError = e.into();
+            assert_eq!(::std::format!("{:?}", hal), "HalError");
+        }
     }
 }
