@@ -13,7 +13,7 @@ use core::convert::TryFrom;
 use core::future::Future;
 use core::pin::Pin;
 use core::sync::atomic::AtomicBool;
-use core::sync::atomic::{AtomicI32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use core::task::{Context, Poll};
 use core::time::Duration;
 use kernel_hal::console::{self, ConsoleWinSize};
@@ -760,6 +760,12 @@ pub fn get_foreground_pgrp() -> i32 {
     tty_fg_pgrp(kernel_hal::console::active_vt()).load(Ordering::Relaxed)
 }
 
+/// The foreground process group of a *named* VT, for a Ctrl-C that was typed
+/// on a VT other than the one on screen.
+pub fn vt_foreground_pgrp(vt: usize) -> i32 {
+    tty_fg_pgrp(vt).load(Ordering::Relaxed)
+}
+
 pub fn set_foreground_pgrp(pgid: i32) {
     tty_fg_pgrp(kernel_hal::console::active_vt()).store(pgid, Ordering::Relaxed);
 }
@@ -788,9 +794,14 @@ pub fn set_active_vt_termios_flush(termios: Termios) {
     sin.eventbus.lock().clear(Event::READABLE);
 }
 
-// Global Ctrl+C latch. Since many programs (e.g. udhcpc) never read stdin while running,
-// we need a way for syscalls like recvfrom/poll to observe a pending terminal interrupt.
-static CTRL_C_PENDING: AtomicBool = AtomicBool::new(false);
+/// Global Ctrl-C latch. Many programs (udhcpc among them) never read stdin
+/// while they run, so `recvfrom`, `poll` and the rest need a way to notice a
+/// terminal interrupt and answer `EINTR`.
+///
+/// One word, so a consumer takes the whole thing at once: 0 is nothing
+/// pending, and otherwise bit 0 is the latch, bit 1 says the `SIGINT` has
+/// still to be sent, and the rest is the VT the keystroke arrived on.
+static CTRL_C_PENDING: AtomicU32 = AtomicU32::new(0);
 static CTRL_DOWN: AtomicBool = AtomicBool::new(false);
 static SHIFT_DOWN: AtomicBool = AtomicBool::new(false);
 /// AltGr (Alt derecho) — third XKB level on the console layout.
@@ -804,20 +815,42 @@ static CAPSLOCK_ON: AtomicBool = AtomicBool::new(false);
 /// igual que `vc_decckm` en el VT de Linux.
 static APP_CURSOR_KEYS: AtomicBool = AtomicBool::new(false);
 
-#[allow(dead_code)]
-pub fn ctrl_c_pending_take() -> bool {
-    CTRL_C_PENDING.swap(false, Ordering::SeqCst)
+/// A latched Ctrl-C, and what is left to do about it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CtrlCInterrupt {
+    /// The VT the keystroke arrived on -- **not** the one on screen. A Ctrl-C
+    /// typed on the serial console while the desktop holds the graphics VT
+    /// belongs to the serial VT's foreground group, and answering with
+    /// `active_vt()` signalled the desktop's group instead.
+    pub vt: usize,
+    /// Whether the `SIGINT` still has to be sent. The keystroke handler sends
+    /// it itself whenever the VT has a foreground group, so this is false in
+    /// the ordinary case: sending it again is how one keypress came to deliver
+    /// two `SIGINT`s, which a handler ("press Ctrl-C twice to quit", a shell
+    /// `trap`, python's `KeyboardInterrupt`) sees as two interrupts.
+    pub signal_owed: bool,
 }
 
-#[allow(dead_code)]
-pub fn ctrl_c_pending_set() {
-    CTRL_C_PENDING.store(true, Ordering::SeqCst);
+/// Take the latch, if anything is latched.
+pub fn ctrl_c_pending_take() -> Option<CtrlCInterrupt> {
+    let state = CTRL_C_PENDING.swap(0, Ordering::SeqCst);
+    (state & 1 != 0).then_some(CtrlCInterrupt {
+        vt: (state >> 8) as usize,
+        signal_owed: state & 2 != 0,
+    })
+}
+
+/// Latch a Ctrl-C from VT `vt`. `signal_owed` says whether the caller has
+/// already signalled the VT's foreground group.
+pub fn ctrl_c_pending_set(vt: usize, signal_owed: bool) {
+    let state = 1 | u32::from(signal_owed) << 1 | (vt_clamp(vt) as u32) << 8;
+    CTRL_C_PENDING.store(state, Ordering::SeqCst);
     wake_tty_intr_waiters();
 }
 
 /// Non-consuming check for multiplex wait loops.
 pub fn ctrl_c_pending_peek() -> bool {
-    CTRL_C_PENDING.load(Ordering::SeqCst)
+    CTRL_C_PENDING.load(Ordering::SeqCst) & 1 != 0
 }
 
 lazy_static! {
@@ -1628,7 +1661,6 @@ impl Stdin {
                     .store(false, Ordering::Relaxed);
             }
             if cc_match(&c_cc, VINTR, c as u8) {
-                ctrl_c_pending_set();
                 let pgid = tty_fg_pgrp(self.vt).load(Ordering::Relaxed);
                 let vt_i = vt_clamp(self.vt);
                 let sent = if pgid > 0 {
@@ -1642,6 +1674,10 @@ impl Stdin {
                 } else {
                     crate::signal::Signal::SIGINT
                 };
+                // The latch is for the `EINTR` and the wakeup. The signal has
+                // gone out already unless this VT has no foreground group,
+                // which is the only case the consumer still has to deliver.
+                ctrl_c_pending_set(self.vt, pgid <= 0);
                 if lflag & NOFLSH == 0 {
                     self.buf.lock().clear();
                     self.canon_buf.lock().clear();
@@ -1881,28 +1917,65 @@ fn tty_post_out(vt: usize, buf: &[u8]) {
     let mut col = tty_column(vt).load(Ordering::Relaxed);
 
     // Post-process into a staging buffer rather than a call per byte, and
-    // flush it only where a character ends: `from_utf8_unchecked` on half a
-    // character is not a string. A continuation byte is never a control byte,
-    // so the rule hands it back untouched and one character is at most its own
-    // four bytes -- the headroom below covers that and the one byte that can
-    // become two.
+    // prefer to flush it where a character ends, so the console is handed
+    // whole characters.
     let mut staged = [0u8; 256];
     let mut n = 0;
     for &b in buf {
-        if n + 8 > staged.len() && !utf8_continuation(b) {
-            let s = unsafe { core::str::from_utf8_unchecked(&staged[..n]) };
-            kernel_hal::console::vt_console_write_str(vt, s);
+        let out = termios.output_char(b, &mut col);
+        let out = out.as_bytes();
+        // Two rules, and the second one is what the old single rule got
+        // wrong. "Nearly full and at a character boundary" is the one that
+        // keeps a character whole; "would not fit" is the one that guarantees
+        // room, because a boundary may never come: a continuation byte
+        // (0x80..=0xbf) is not a control byte, so `output_char` hands it back
+        // as itself and the boundary test says "not here". Eight orphan
+        // continuation bytes in a row -- `cat` on any binary file, or on
+        // /dev/urandom -- walked `n` from 248 to 256 without ever flushing
+        // and indexed off the end of the array: a kernel panic in the console
+        // write path, from an unprivileged `write(1, ...)`.
+        if n + out.len() > staged.len() || (n + 8 > staged.len() && !utf8_continuation(b)) {
+            tty_write_staged(vt, &staged[..n]);
             n = 0;
         }
-        for &o in termios.output_char(b, &mut col).as_bytes() {
-            staged[n] = o;
-            n += 1;
-        }
+        staged[n..n + out.len()].copy_from_slice(out);
+        n += out.len();
     }
     tty_column(vt).store(col, Ordering::Relaxed);
-    if n > 0 {
-        let s = unsafe { core::str::from_utf8_unchecked(&staged[..n]) };
-        kernel_hal::console::vt_console_write_str(vt, s);
+    tty_write_staged(vt, &staged[..n]);
+}
+
+/// Write `bytes` to VT `vt` as text, without taking it on faith that they are
+/// valid UTF-8.
+///
+/// `tty_post_out` used to hand its staging buffer to `from_utf8_unchecked`,
+/// which is undefined behaviour for anything a program actually writes to a
+/// terminal: a lone byte from 0x80 up is not a character, and every `cat` of a
+/// binary file, every mis-encoded log line and every byte of `/dev/urandom` is
+/// made of them. What a terminal does with one is show a replacement glyph, so
+/// that is what this does -- the valid run, then U+FFFD for the byte that is
+/// not part of a character, then on with the rest.
+fn tty_write_staged(vt: usize, mut bytes: &[u8]) {
+    while !bytes.is_empty() {
+        let (good, skip) = match core::str::from_utf8(bytes) {
+            Ok(_) => (bytes.len(), 0),
+            // `error_len() == None` is a character cut short by the end of the
+            // buffer. There is no state kept between calls to finish it with,
+            // and the caller only cuts at a boundary it chose, so the tail is
+            // as unfinished as any other broken sequence.
+            Err(e) => (e.valid_up_to(), e.error_len().unwrap_or(usize::MAX)),
+        };
+        if good > 0 {
+            // SAFETY: `from_utf8` has just said that these bytes decode.
+            let s = unsafe { core::str::from_utf8_unchecked(&bytes[..good]) };
+            kernel_hal::console::vt_console_write_str(vt, s);
+        }
+        if good == bytes.len() {
+            return;
+        }
+        kernel_hal::console::vt_console_write_str(vt, "\u{fffd}");
+        // `skip` is at least one, so this always makes progress.
+        bytes = &bytes[(good + skip.max(1)).min(bytes.len())..];
     }
 }
 
@@ -2713,7 +2786,7 @@ mod line_discipline_tests {
         // The latch is one-shot: the next Ctrl-C is a signal again.
         feed(&s, "y");
         s.push(CTRL_C);
-        assert!(ctrl_c_pending_take());
+        assert!(ctrl_c_pending_take().is_some());
         assert!(!s.can_read());
     }
 
@@ -2913,7 +2986,7 @@ mod line_discipline_tests {
         feed(&s, "a medio escribir");
         s.push(CTRL_C);
         assert!(!s.can_read());
-        assert!(ctrl_c_pending_take());
+        assert!(ctrl_c_pending_take().is_some());
         // And the latch is consumed by that take.
         assert!(!ctrl_c_pending_peek());
     }
@@ -2925,7 +2998,7 @@ mod line_discipline_tests {
         let s = tty(d.c_lflag | NOFLSH, d.c_iflag);
         feed(&s, "abc");
         s.push(CTRL_C);
-        assert!(ctrl_c_pending_take());
+        assert!(ctrl_c_pending_take().is_some());
         // The half-typed line is still there, so the newline still delivers it.
         s.push('\n');
         assert_eq!(drain(&s), "abc\n");
@@ -2995,7 +3068,7 @@ mod line_discipline_tests {
         // the terminal looks hung.
         s.push(CTRL_C);
         assert!(!flow_stopped());
-        assert!(ctrl_c_pending_take());
+        assert!(ctrl_c_pending_take().is_some());
     }
 
     #[test]

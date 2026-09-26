@@ -169,11 +169,18 @@ impl Syscall<'_> {
         }
         // Race-safe: another syscall may have claimed the latch between the
         // peek and the swap.
-        if !linux_object::fs::stdio::ctrl_c_pending_take() {
+        let Some(intr) = linux_object::fs::stdio::ctrl_c_pending_take() else {
             return Ok(0);
-        }
+        };
+        // Only when the keystroke handler could not signal the group itself:
+        // it already did whenever the VT had one, and delivering again is how
+        // a single Ctrl-C came to raise two `SIGINT`s. The VT comes from the
+        // latch, because the keystroke may not have arrived on the one on
+        // screen.
         // Do not use sys_kill(-pgid): pgid==1 becomes kill(-1) ("every process") on Linux.
-        linux_object::process::deliver_sigint_to_foreground();
+        if intr.signal_owed {
+            linux_object::process::deliver_sigint_for_vt(Some(intr.vt));
+        }
         Err(LxError::EINTR)
     }
 

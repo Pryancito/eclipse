@@ -43,7 +43,7 @@ const MAX_MMAP_LEN: usize = 64 * 1024 * 1024 * 1024;
 /// `dd bs=4096` failing "Bad address" because glibc placed its I/O buffer
 /// there). Also restores NULL-dereference protection for user processes.
 /// MAP_FIXED requests are exempt, matching Linux for privileged tooling.
-const MMAP_MIN_ADDR: usize = 0x1_0000;
+pub(crate) const MMAP_MIN_ADDR: usize = 0x1_0000;
 
 /// Syscalls for virtual memory.
 ///

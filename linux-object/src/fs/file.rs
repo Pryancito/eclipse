@@ -111,6 +111,9 @@ bitflags::bitflags! {
     pub struct PollEvents: u16 {
         /// There is data to read.
         const IN = 0x0001;
+        /// There is urgent data to read. Nothing here has out-of-band data,
+        /// so it is accepted and never reported.
+        const PRI = 0x0002;
         /// Writing is now possible.
         const OUT = 0x0004;
         /// Error condition (return only)
@@ -119,6 +122,79 @@ bitflags::bitflags! {
         const HUP = 0x0010;
         /// Invalid request: fd not open (return only)
         const INVAL = 0x0020;
+        /// Normal data may be read: the same condition as `IN`, under the
+        /// name System V streams gave it. Linux reports the two together
+        /// (`EPOLLIN | EPOLLRDNORM` in every `poll` method), so a caller
+        /// that asks for this one alone is woken and told.
+        const RDNORM = 0x0040;
+        /// Priority band data may be read. Never reported, like `PRI`.
+        const RDBAND = 0x0080;
+        /// Normal data may be written: `OUT` under its streams name, and
+        /// reported with it.
+        const WRNORM = 0x0100;
+        /// Priority data may be written. Never reported.
+        const WRBAND = 0x0200;
+    }
+}
+
+impl PollEvents {
+    /// Every bit that asks about reading: `IN` and its streams alias, plus
+    /// the urgent-data pair, which a poller sets to be woken by the same
+    /// readable transition.
+    pub const READ_INTEREST: Self = Self::from_bits_truncate(
+        Self::IN.bits() | Self::PRI.bits() | Self::RDNORM.bits() | Self::RDBAND.bits(),
+    );
+    /// Every bit that asks about writing. See [`READ_INTEREST`](Self::READ_INTEREST).
+    pub const WRITE_INTEREST: Self =
+        Self::from_bits_truncate(Self::OUT.bits() | Self::WRNORM.bits() | Self::WRBAND.bits());
+
+    /// Whether this interest set asks about reading. Every reader that used
+    /// to spell this `contains(IN)` answered "no" to a set of `RDNORM`
+    /// alone, so a pidfd, an eventfd or a syncobj polled under the streams
+    /// name was never reported and never woken.
+    pub fn wants_read(self) -> bool {
+        self.intersects(Self::READ_INTEREST)
+    }
+
+    /// Whether this interest set asks about writing. See
+    /// [`wants_read`](Self::wants_read).
+    pub fn wants_write(self) -> bool {
+        self.intersects(Self::WRITE_INTEREST)
+    }
+
+    /// The readiness a [`PollStatus`] stands for, as the bits every Linux
+    /// `poll` method returns for it before the caller's mask is applied:
+    /// `IN | RDNORM` when there is something to read, `OUT | WRNORM` when a
+    /// write would not block, `ERR` and `HUP` as they are.
+    ///
+    /// The `RDNORM`/`WRNORM` half used to be missing, so a `pollfd` asking
+    /// for `POLLRDNORM` alone (the shape Windows-born code and the streams
+    /// manuals use) never had its `revents` set: `poll` slept through the
+    /// data and `epoll_wait` never reported the fd.
+    pub fn ready(status: &PollStatus) -> Self {
+        let mut ready = Self::empty();
+        if status.read {
+            ready |= Self::IN | Self::RDNORM;
+        }
+        if status.write {
+            ready |= Self::OUT | Self::WRNORM;
+        }
+        if status.error {
+            ready |= Self::ERR;
+        }
+        if status.hangup {
+            ready |= Self::HUP;
+        }
+        ready
+    }
+
+    /// What `poll(2)` writes to `revents` for a status, given the `events`
+    /// the caller asked for: [`ready`](Self::ready) masked by the request,
+    /// except that `ERR` and `HUP` are reported whether asked for or not
+    /// (`poll(2)`: "these bits are output only"). `epoll` does the same by
+    /// forcing the two into every stored mask.
+    pub fn revents(status: &PollStatus, events: Self) -> Self {
+        Self::ready(status) & (events | Self::ERR | Self::HUP)
     }
 }
 
@@ -1011,8 +1087,8 @@ impl FileLike for File {
         // behind INode::async_poll (no nested async-loop state machine).
         use super::devfs::DrmDev;
         if let Some(drmdev) = inode.downcast_ref::<DrmDev>() {
-            let want_read = _events.contains(PollEvents::IN);
-            let want_write = _events.contains(PollEvents::OUT);
+            let want_read = _events.wants_read();
+            let want_write = _events.wants_write();
             let status = drmdev.poll()?;
             let ready = (want_read && status.read)
                 || (want_write && status.write)
