@@ -3451,13 +3451,7 @@ impl LinuxProcess {
     /// (e.g. SIGINT) jumps into the shell's handler with the new applet's
     /// uninitialised globals (`ptr_to_globals == NULL`) and crashes.
     pub fn reset_signal_actions_for_exec(&self) {
-        use crate::signal::{SIG_DFL, SIG_IGN};
-        let mut inner = self.inner.lock();
-        for action in inner.signal_actions.table.iter_mut() {
-            if action.handler != SIG_DFL && action.handler != SIG_IGN {
-                *action = SignalAction::default();
-            }
-        }
+        flush_signal_handlers(&mut self.inner.lock().signal_actions.table);
     }
 
     /// Close file that FD_CLOEXEC is set
@@ -4689,6 +4683,58 @@ fn discards_when_pending(handler: usize, sig: LinuxSignal) -> bool {
         return true;
     }
     handler == SIG_DFL && signal_default_action_ignores(sig)
+}
+
+/// `flush_signal_handlers(t, force_default = 0)` (kernel/signal.c), what an
+/// `execve` does to the disposition table: a caught signal goes back to
+/// `SIG_DFL`, an ignored one stays ignored, and EVERY entry loses its
+/// `sa_flags`, `sa_mask` and restorer, the ignored and default ones too.
+///
+/// The flags of a `SIG_DFL`/`SIG_IGN` entry used to survive the exec. A
+/// parent that set SIGCHLD to `SIG_DFL` with `SA_NOCLDWAIT` and then
+/// exec'd a shell handed that shell a table in which its children are
+/// reaped on their own, so its `waitpid` got ECHILD for every job; and a
+/// `sigaction(sig, NULL, &old)` after the exec reported the stale flags.
+pub fn flush_signal_handlers(table: &mut [SignalAction]) {
+    use crate::signal::SIG_IGN;
+    for action in table.iter_mut() {
+        *action = if action.handler == SIG_IGN {
+            SignalAction {
+                handler: SIG_IGN,
+                ..SignalAction::default()
+            }
+        } else {
+            SignalAction::default()
+        };
+    }
+}
+
+/// `do_sigaction` after storing a disposition: when the new one ignores the
+/// signal (`SIG_IGN`, or `SIG_DFL` for a signal whose default is to ignore),
+/// "any pending instances of the signal are discarded" (sigaction(2)), from
+/// every thread of the process, blocked or not
+/// (`flush_sigqueue_mask` over `shared_pending` and each `t->pending`).
+///
+/// The table store used to be all there was: block SIGUSR1, raise it, set
+/// it to `SIG_IGN`, and `sigpending()` still listed it; a handler installed
+/// again before unblocking then got the stale signal.
+pub fn set_signal_action_in(process: &Arc<Process>, signal: LinuxSignal, action: SignalAction) {
+    use crate::thread::ThreadExt;
+    process.linux().set_signal_action(signal, action);
+    if !discards_when_pending(action.handler, signal) {
+        return;
+    }
+    for tid in process.thread_ids() {
+        if let Ok(thread) = process.get_child(tid) {
+            if let Ok(thread) = thread.downcast_arc::<Thread>() {
+                if let Some(mut lt) = thread.try_lock_linux() {
+                    if lt.signals.contains(signal) {
+                        lt.take_siginfo(signal);
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// `sig_kernel_ignore()`: the signals whose *default* action is to do nothing.
@@ -10394,6 +10440,119 @@ mod sigchld_tests {
         let (pid, status, _) =
             async_std::task::block_on(wait_child_any(&parent, true, true)).unwrap();
         assert_eq!((pid, status), (child.id(), wait_status_exited(5)));
+    }
+}
+
+#[cfg(test)]
+mod disposition_change_tests {
+    //! What changing a disposition does beyond the table: an exec, and a
+    //! new disposition that ignores.
+
+    extern crate std;
+
+    use super::*;
+    use crate::signal::{SignalAction, SignalActionFlags, SIG_DFL, SIG_IGN};
+    use crate::thread::ThreadExt;
+    use rcore_fs_ramfs::RamFS;
+
+    const CAUGHT: usize = 0x4000_1000;
+
+    fn entry(handler: usize) -> SignalAction {
+        SignalAction {
+            handler,
+            flags: SignalActionFlags::NOCLDWAIT | SignalActionFlags::RESTART,
+            restorer: 0x5000,
+            mask: Sigset::new(0xff),
+        }
+    }
+
+    /// An exec puts a caught signal back to default, keeps an ignored one
+    /// ignored, and strips flags, mask and restorer from all three.
+    #[test]
+    fn an_exec_keeps_only_whether_a_signal_is_ignored() {
+        let mut table = [entry(CAUGHT), entry(SIG_IGN), entry(SIG_DFL)];
+        flush_signal_handlers(&mut table);
+        assert_eq!(table[0].handler, SIG_DFL, "caught goes to default");
+        assert_eq!(table[1].handler, SIG_IGN, "ignored stays ignored");
+        assert_eq!(table[2].handler, SIG_DFL);
+        for (i, action) in table.iter().enumerate() {
+            assert!(action.flags.is_empty(), "entry {} kept its flags", i);
+            assert_eq!(action.restorer, 0, "entry {}", i);
+            assert!(action.mask.is_empty(), "entry {} kept its mask", i);
+        }
+    }
+
+    /// A process with two threads, SIGUSR1 blocked in both and pending in
+    /// the first (blocked at send time, so it was queued rather than
+    /// delivered), and SIGCHLD pending in the second.
+    fn with_pending(pid: KoID) -> (Arc<Process>, Arc<Thread>, Arc<Thread>) {
+        let proc = Process::create_with_fixed_id_ext(
+            &ROOT_JOB,
+            pid,
+            "pending",
+            LinuxProcess::new(RamFS::new(), 0),
+        )
+        .unwrap();
+        let first = Thread::create_linux(&proc).unwrap();
+        let second = Thread::create_linux(&proc).unwrap();
+        let usr1 = Sigset::new(1 << (LinuxSignal::SIGUSR1 as u64 - 1));
+        first.lock_linux().set_signal_mask(usr1);
+        second.lock_linux().set_signal_mask(usr1);
+        proc.linux()
+            .set_signal_action(LinuxSignal::SIGCHLD, entry(CAUGHT));
+        send_signal_to_process(pid as usize, LinuxSignal::SIGUSR1).unwrap();
+        second.lock_linux().queue_signal(
+            LinuxSignal::SIGCHLD,
+            Some(SigInfo::bare(LinuxSignal::SIGCHLD)),
+        );
+        assert!(first.lock_linux().signals.contains(LinuxSignal::SIGUSR1));
+        assert!(second.lock_linux().signals.contains(LinuxSignal::SIGCHLD));
+        (proc, first, second)
+    }
+
+    /// `SIG_IGN` discards the pending instance in the thread that holds it,
+    /// blocked though it is, and the `siginfo_t` with it.
+    #[test]
+    fn ignoring_a_signal_discards_what_was_pending_in_every_thread() {
+        let (proc, first, second) = with_pending(43_501);
+        set_signal_action_in(&proc, LinuxSignal::SIGUSR1, entry(SIG_IGN));
+        assert!(!first.lock_linux().signals.contains(LinuxSignal::SIGUSR1));
+        assert!(
+            second.lock_linux().signals.contains(LinuxSignal::SIGCHLD),
+            "others stay"
+        );
+        assert_eq!(
+            proc.linux().signal_action(LinuxSignal::SIGUSR1).handler,
+            SIG_IGN
+        );
+    }
+
+    /// `SIG_DFL` discards only for a signal whose default is to ignore.
+    #[test]
+    fn default_discards_only_when_the_default_ignores() {
+        let (proc, first, second) = with_pending(43_502);
+        set_signal_action_in(&proc, LinuxSignal::SIGUSR1, entry(SIG_DFL));
+        assert!(
+            first.lock_linux().signals.contains(LinuxSignal::SIGUSR1),
+            "SIGUSR1's default kills"
+        );
+        set_signal_action_in(&proc, LinuxSignal::SIGCHLD, entry(SIG_DFL));
+        assert!(
+            !second.lock_linux().signals.contains(LinuxSignal::SIGCHLD),
+            "SIGCHLD's default ignores"
+        );
+    }
+
+    /// A handler keeps what is pending: it is about to be delivered.
+    #[test]
+    fn a_handler_keeps_what_is_pending() {
+        let (proc, first, _second) = with_pending(43_503);
+        set_signal_action_in(&proc, LinuxSignal::SIGUSR1, entry(CAUGHT));
+        assert!(first.lock_linux().signals.contains(LinuxSignal::SIGUSR1));
+        assert_eq!(
+            proc.linux().signal_action(LinuxSignal::SIGUSR1).handler,
+            CAUGHT
+        );
     }
 }
 

@@ -397,7 +397,13 @@ impl Syscall<'_> {
                 // `sa_mask` becomes the thread's blocked set on every delivery
                 // of this signal, so an unfiltered one holds off SIGKILL for as
                 // long as the handler runs.
-                proc.set_signal_action(signal, act.stored());
+                // Stored, and what was pending discarded when the new
+                // disposition ignores (sigaction(2)).
+                linux_object::process::set_signal_action_in(
+                    self.zircon_process(),
+                    signal,
+                    act.stored(),
+                );
             }
             Ok(())
         })?;
