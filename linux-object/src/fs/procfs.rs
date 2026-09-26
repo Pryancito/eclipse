@@ -655,6 +655,29 @@ impl INode for ProcRootINode {
     }
 }
 
+/// Inode numbers of `/proc/<pid>` and everything under it.
+///
+/// Linux gives every one of those a number of its own (`proc_pid_make_inode`
+/// takes a fresh one per entry). Here the directory was `100 + pid`, every
+/// file under it `200 + pid` whatever the file, and `fd` `40 + pid`, all on
+/// device 0 with the fixed files of `/proc` living in 10..=999: `/proc/1`
+/// was the same (dev, ino) as a fixed file, `/proc/61/fd` as `/proc/1`, and
+/// `/proc/<pid>/stat`, `status`, `cmdline`, `environ`... were one inode to
+/// every tool that compares files by identity (`cmp`, `diff`, `cp`, `tar`,
+/// `[ a -ef b ]`), which then takes them for the same file without reading.
+///
+/// The numbers start above every fixed one and leave `PID_INODE_SLOTS` per
+/// process: slot 0 is the directory, the rest its entries.
+pub(crate) const PID_INODE_BASE: usize = 0x1_0000;
+pub(crate) const PID_INODE_SLOTS: usize = 16;
+/// Slot of `/proc/<pid>/fd` (`proc_self.rs`); the files use their kind's.
+pub(crate) const PID_FD_DIR_SLOT: usize = 10;
+
+pub(crate) fn pid_inode(pid: u64, slot: usize) -> usize {
+    debug_assert!(slot < PID_INODE_SLOTS);
+    PID_INODE_BASE + (pid as usize) * PID_INODE_SLOTS + slot
+}
+
 /// `/proc/<pid>/` — `stat`, `cmdline`, `status` for BusyBox `ps`.
 struct ProcPidDirINode {
     pid: u64,
@@ -709,7 +732,7 @@ impl INode for ProcPidDirINode {
     fn metadata(&self) -> Result<Metadata> {
         Ok(Metadata {
             dev: 0,
-            inode: 100 + self.pid as usize,
+            inode: pid_inode(self.pid, 0),
             size: 0,
             blk_size: 0,
             blocks: 0,
@@ -1687,7 +1710,8 @@ impl INode for ProcSelfSymINode {
             .unwrap_or_else(|| "1".into());
         Ok(Metadata {
             dev: 0,
-            inode: 12,
+            // Its own: 12 is `/proc/cpuinfo`'s.
+            inode: 19,
             size: target.len(),
             blk_size: 0,
             blocks: 0,
@@ -1723,6 +1747,24 @@ enum ProcPidFileKind {
     Environ,
     Statm,
     Threads,
+}
+
+impl ProcPidFileKind {
+    /// The file's slot in its process's inode numbers (see `pid_inode`):
+    /// one per kind, none of them the directory's 0 or `PID_FD_DIR_SLOT`.
+    fn slot(self) -> usize {
+        match self {
+            Self::Stat => 1,
+            Self::Cmdline => 2,
+            Self::Status => 3,
+            Self::Perf => 4,
+            Self::Maps => 5,
+            Self::Comm => 6,
+            Self::Environ => 7,
+            Self::Statm => 8,
+            Self::Threads => 9,
+        }
+    }
 }
 
 /// `/proc/<pid>/maps` in the format of Documentation/filesystems/proc.rst:
@@ -1827,7 +1869,7 @@ impl INode for ProcPidFileINode {
         let size = self.bytes()?.len();
         Ok(Metadata {
             dev: 0,
-            inode: 200 + self.pid as usize,
+            inode: pid_inode(self.pid, self.kind.slot()),
             size,
             blk_size: 4096,
             blocks: size.div_ceil(4096),
@@ -3353,7 +3395,8 @@ lazy_static! {
         generate: proc_sys_threads_max_content,
     });
     static ref PROC_SYS_OVERFLOWUID: Arc<dyn INode> = Arc::new(ProcSeqINode {
-        inode: 107,
+        // Its own: 107 is `/proc/gpuroles`'s.
+        inode: 112,
         generate: proc_sys_overflowuid_content,
     });
     static ref PROC_SYS_OVERFLOWGID: Arc<dyn INode> = Arc::new(ProcSeqINode {
@@ -3601,6 +3644,165 @@ mod pid_stat_tests {
         assert_eq!(stat_memory_fields(3 * 4096, 2 * 4096), (3 * 4096, 2));
         assert_eq!(stat_memory_fields(0, 0), (0, 0));
         assert_eq!(stat_memory_fields(4096, 4095), (4096, 0));
+    }
+}
+
+#[cfg(test)]
+mod proc_inode_tests {
+    //! Every entry of `/proc` had to have an inode number of its own, and
+    //! did not: `/proc/self` was `/proc/cpuinfo`'s, `/proc/sys/kernel/
+    //! overflowuid` was `/proc/gpuroles`'s, `/proc/<pid>` sat on the fixed
+    //! files' numbers, and the nine files under a process were one inode.
+
+    use super::*;
+    use crate::process::LinuxProcess;
+    use alloc::collections::BTreeMap;
+    use rcore_fs_ramfs::RamFS;
+
+    /// Walk the fixed part of `/proc` (no process directories, no `self`),
+    /// collecting `(path, inode)`.
+    fn fixed_entries(dir: &Arc<dyn INode>, path: &str, out: &mut Vec<(String, usize)>) {
+        let mut i = 0;
+        while let Ok(name) = dir.get_entry(i) {
+            i += 1;
+            if name == "." || name == ".." || name == "self" || name.parse::<u64>().is_ok() {
+                continue;
+            }
+            let child = dir
+                .find(&name)
+                .unwrap_or_else(|e| panic!("{}/{}: {:?}", path, name, e));
+            let md = child.metadata().unwrap();
+            let child_path = alloc::format!("{}/{}", path, name);
+            out.push((child_path.clone(), md.inode));
+            if md.type_ == FileType::Dir {
+                fixed_entries(&child, &child_path, out);
+            }
+        }
+    }
+
+    fn duplicates(entries: &[(String, usize)]) -> Vec<(usize, Vec<String>)> {
+        let mut by_inode: BTreeMap<usize, Vec<String>> = BTreeMap::new();
+        for (path, inode) in entries {
+            by_inode.entry(*inode).or_default().push(path.clone());
+        }
+        by_inode
+            .into_iter()
+            .filter(|(_, paths)| paths.len() > 1)
+            .collect()
+    }
+
+    #[test]
+    fn every_fixed_file_of_proc_has_an_inode_of_its_own_below_the_pids() {
+        let root: Arc<dyn INode> = PROC_ROOT.clone();
+        let mut entries = alloc::vec![(String::from("/proc"), root.metadata().unwrap().inode)];
+        fixed_entries(&root, "/proc", &mut entries);
+        assert!(
+            entries.len() > 50,
+            "the walk saw the tree: {}",
+            entries.len()
+        );
+        assert_eq!(duplicates(&entries), Vec::new());
+        for (path, inode) in &entries {
+            assert!(
+                *inode < PID_INODE_BASE,
+                "{} at {} is in the pid range",
+                path,
+                inode
+            );
+        }
+        // The two that shared a number with another file.
+        let inode_of = |name: &str| root.find(name).unwrap().metadata().unwrap().inode;
+        assert_ne!(inode_of("self"), inode_of("cpuinfo"));
+        assert_ne!(
+            PROC_SYS_DIR
+                .find("kernel")
+                .unwrap()
+                .find("overflowuid")
+                .unwrap()
+                .metadata()
+                .unwrap()
+                .inode,
+            inode_of("gpuroles")
+        );
+    }
+
+    #[test]
+    fn a_process_s_directory_and_each_file_under_it_are_distinct_inodes() {
+        let kinds = [
+            ProcPidFileKind::Stat,
+            ProcPidFileKind::Cmdline,
+            ProcPidFileKind::Status,
+            ProcPidFileKind::Perf,
+            ProcPidFileKind::Maps,
+            ProcPidFileKind::Comm,
+            ProcPidFileKind::Environ,
+            ProcPidFileKind::Statm,
+            ProcPidFileKind::Threads,
+        ];
+        let inodes_of = |pid: u64| -> Vec<usize> {
+            let mut v = alloc::vec![ProcPidDirINode { pid }.metadata().unwrap().inode];
+            v.extend(
+                kinds
+                    .iter()
+                    .map(|&kind| ProcPidFileINode { pid, kind }.metadata().unwrap().inode),
+            );
+            v.push(pid_inode(pid, PID_FD_DIR_SLOT));
+            v
+        };
+        // The files answer `metadata` from the process, so it must exist.
+        let pids = [4601u64, 4607, 4661];
+        let _alive: Vec<Arc<Process>> = pids
+            .iter()
+            .map(|&pid| {
+                // Under `ROOT_JOB`, where `/proc` looks processes up.
+                Process::create_with_fixed_id_ext(
+                    &ROOT_JOB,
+                    pid,
+                    "ino",
+                    LinuxProcess::new(RamFS::new(), 0),
+                )
+                .unwrap()
+            })
+            .collect();
+        let mut all: Vec<(String, usize)> = Vec::new();
+        for pid in pids {
+            for (i, inode) in inodes_of(pid).into_iter().enumerate() {
+                assert!(
+                    inode >= PID_INODE_BASE,
+                    "pid {} slot {} at {}",
+                    pid,
+                    i,
+                    inode
+                );
+                all.push((alloc::format!("{}/{}", pid, i), inode));
+            }
+        }
+        assert_eq!(duplicates(&all), Vec::new());
+    }
+
+    #[test]
+    fn the_fd_directory_of_a_process_is_its_own_inode_too() {
+        // `/proc/61/fd` was `40 + 61 = 101`, the inode of `/proc/1`.
+        let proc = Process::create_with_fixed_id_ext(
+            &Job::root(),
+            4501,
+            "fd",
+            LinuxProcess::new(RamFS::new(), 0),
+        )
+        .unwrap();
+        let fd_dir = super::super::proc_self::ProcSelfFdDir {
+            process: proc.clone(),
+        };
+        let inode = fd_dir.metadata().unwrap().inode;
+        assert_eq!(inode, pid_inode(4501, PID_FD_DIR_SLOT));
+        assert_ne!(
+            inode,
+            ProcPidDirINode { pid: 4501 }.metadata().unwrap().inode
+        );
+        assert_ne!(
+            inode,
+            ProcPidDirINode { pid: 4461 }.metadata().unwrap().inode
+        );
     }
 }
 
