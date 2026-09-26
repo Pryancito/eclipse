@@ -32,7 +32,12 @@ jobs:
         run: |
           python3 -m unittest discover -s scripts/tests
           cargo test --no-fail-fast
-          cargo test -p zircon-object --lib --features libos,aspace-separate
+          # `elf` too: `util::elf_loader` is behind that feature, so without
+          # it this line compiles neither the 1112 lines that parse every
+          # binary the system executes nor their tests. They ran only as
+          # part of the workspace pass above, where feature unification
+          # turns `elf` on because `linux-object` asks for it.
+          cargo test -p zircon-object --lib --features libos,aspace-separate,elf
           cargo test -p zircon-syscall --features libos,zircon-object/aspace-separate
           # Both `vendor/` scheduler directories hold a crate named
           # `executor`, and this line used to name the wrong one. The kernel
