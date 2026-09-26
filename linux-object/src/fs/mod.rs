@@ -203,6 +203,34 @@ lazy_static! {
     static ref MEMFD_LIVE: Mutex<Vec<MemfdEntry>> = Mutex::new(Vec::new());
 }
 
+/// Registry size at which `new_memfd` next prunes the dead entries. It starts
+/// at `MEMFD_PRUNE_MIN` and, after each prune, is twice what survived (never
+/// under the minimum), so the pruning is amortised O(1) per creation and the
+/// registry stays within about twice the number of memfds actually alive.
+///
+/// It used to be pruned only by `memfd_stats`, from the OOM report: every
+/// memfd ever created stayed in the list until then, and `memfd_seals`
+/// walks the whole list, upgrading every weak ref, from the `write_at`
+/// chokepoint of EVERY file (`memfd_write_allowed`) and from `ftruncate`.
+/// A desktop creates memfds without end (a wl_shm pool per resize, a segment
+/// per Firefox IPC message, a scratch file per cursor), so each `write(2)`
+/// on any file cost as many atomic upgrades as memfds had ever existed, and
+/// the list itself grew for as long as the machine stayed up.
+static MEMFD_PRUNE_AT: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(MEMFD_PRUNE_MIN);
+const MEMFD_PRUNE_MIN: usize = 64;
+
+/// Drop the entries whose inode is gone and re-arm the threshold. Runs under
+/// the registry lock and allocates nothing (`retain` works in place), which
+/// is the rule for that lock: see `new_memfd`.
+fn prune_dead_memfds(live: &mut Vec<MemfdEntry>) {
+    live.retain(|(_, w, _)| w.strong_count() > 0);
+    MEMFD_PRUNE_AT.store(
+        (live.len() * 2).max(MEMFD_PRUNE_MIN),
+        core::sync::atomic::Ordering::Relaxed,
+    );
+}
+
 /// One live memfd: its creation sequence, a weak ref to its inode, and its
 /// seals.
 ///
@@ -439,6 +467,9 @@ pub fn new_memfd(name: &str, flags: usize) -> LxResult<Arc<File>> {
         loop {
             let cap = {
                 let mut live = MEMFD_LIVE.lock();
+                if live.len() >= MEMFD_PRUNE_AT.load(core::sync::atomic::Ordering::Relaxed) {
+                    prune_dead_memfds(&mut live);
+                }
                 if live.len() < live.capacity() {
                     live.push(elem.take().unwrap());
                     break;
@@ -3015,6 +3046,63 @@ mod user_argument_tests {
                 shift
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod memfd_registry_tests {
+    //! The registry of live memfds is walked on every `write(2)` of every
+    //! file and grew with every memfd ever created: only the OOM report
+    //! pruned it. Now `new_memfd` prunes the dead entries as it goes.
+    //!
+    //! The bounds here are loose on purpose: other tests of this binary
+    //! create memfds too, and CI runs with `--test-threads=1` while a
+    //! developer may not.
+    use super::*;
+
+    fn registry_len() -> usize {
+        MEMFD_LIVE.lock().len()
+    }
+
+    fn churn(n: usize) {
+        for _ in 0..n {
+            drop(new_memfd("churn", 0).unwrap());
+        }
+    }
+
+    #[test]
+    fn dead_memfds_leave_the_registry_as_new_ones_are_created() {
+        churn(5000);
+        let len = registry_len();
+        assert!(
+            len < 1000,
+            "{} entries in the registry after five thousand memfds came and went",
+            len
+        );
+    }
+
+    #[test]
+    fn a_live_memfd_survives_the_prune_with_its_seals() {
+        let f = new_memfd("keymap", MFD_ALLOW_SEALING).unwrap();
+        memfd_add_seals(&f.inode(), F_SEAL_SHRINK).unwrap();
+        churn(5000);
+        assert_eq!(
+            memfd_seals(&f.inode()),
+            Some(F_SEAL_SHRINK),
+            "a memfd still open was pruned, or lost its seals"
+        );
+    }
+
+    #[test]
+    fn the_registry_stays_within_a_multiple_of_what_is_alive() {
+        let held: Vec<_> = (0..100).map(|_| new_memfd("held", 0).unwrap()).collect();
+        churn(5000);
+        let len = registry_len();
+        // Two hundred is what a prune leaves room for with a hundred alive
+        // (twice the survivors), and the rest is what other tests of this
+        // binary may be holding.
+        assert!(len <= 100 * 2 + MEMFD_PRUNE_MIN + 200, "{} entries", len);
+        drop(held);
     }
 }
 
