@@ -359,7 +359,7 @@ impl Syscall<'_> {
                 return Ok(fd.into());
             }
 
-            let inode = if flags.contains(OpenFlags::CREATE) {
+            let (inode, created) = if flags.contains(OpenFlags::CREATE) {
                 let (dir_path, file_name) = split_path(path);
                 // relative to cwd
                 let dir_inode = proc.lookup_inode_at(dir_fd, dir_path, true)?;
@@ -386,13 +386,16 @@ impl Syscall<'_> {
                             file_inode
                         };
                         let metadata = file_inode.metadata()?;
+                        // `do_open`: what the name turned out to be is judged
+                        // before what the caller may do with it.
+                        open_resolved_type(flags, metadata.type_)?;
                         if flags.writable() || flags.contains(OpenFlags::TRUNCATE) {
                             proc.check_access(&metadata, 0o2, true)?;
                         }
                         if flags.readable() {
                             proc.check_access(&metadata, 0o4, true)?;
                         }
-                        file_inode
+                        (file_inode, false)
                     }
                     Err(FsError::EntryNotFound) => {
                         let create_mode = proc.apply_umask(mode as u16);
@@ -405,7 +408,7 @@ impl Syscall<'_> {
                             create_mode,
                             false,
                         )?;
-                        inode
+                        (inode, true)
                     }
                     Err(e) => return Err(LxError::from(e)),
                 }
@@ -429,17 +432,25 @@ impl Syscall<'_> {
                 }
                 let inode = proc.lookup_inode_at(dir_fd, path, true)?;
                 let metadata = inode.metadata()?;
+                // `may_open`: the type's refusals (ELOOP, EISDIR) come before
+                // `inode_permission`.
+                open_resolved_type(flags, metadata.type_)?;
                 if flags.readable() {
                     proc.check_access(&metadata, 0o4, true)?;
                 }
                 if flags.writable() {
                     proc.check_access(&metadata, 0o2, true)?;
                 }
-                inode
+                (inode, false)
             };
             let metadata = inode.metadata()?;
             open_resolved_type(flags, metadata.type_)?;
-            if flags.contains(OpenFlags::TRUNCATE) && metadata.type_ == FileType::File {
+            // `may_open`: "O_NOATIME can only be set by the owner or
+            // superuser", after the permission checks.
+            if flags.contains(OpenFlags::NOATIME) {
+                proc.check_owner_or_capable(&metadata)?;
+            }
+            if truncates_on_open(flags, metadata.type_, created) {
                 proc.check_access(&metadata, 0o2, true)?;
                 inode.resize(0)?;
                 linux_object::fs::cache_truncate(&inode, 0);
@@ -1250,6 +1261,12 @@ mod perf_attr_size_tests {
 /// apply at once: a symbolic link opened with `O_DIRECTORY` is `ENOTDIR`, not
 /// `ELOOP`, because it is not a directory whatever it points at.
 pub(crate) fn open_resolved_type(flags: OpenFlags, type_: FileType) -> Result<(), LxError> {
+    // `do_open`: `if (open_flag & O_CREAT) { ... if (d_is_dir(dentry))
+    // return -EISDIR; }`, ahead of the `O_DIRECTORY` test. An `O_CREAT`
+    // over a name that is a directory used to open the directory.
+    if flags.contains(OpenFlags::CREATE) && type_ == FileType::Dir {
+        return Err(LxError::EISDIR);
+    }
     if flags.contains(OpenFlags::DIRECTORY) && type_ != FileType::Dir {
         return Err(LxError::ENOTDIR);
     }
@@ -1258,10 +1275,28 @@ pub(crate) fn open_resolved_type(flags: OpenFlags, type_: FileType) -> Result<()
     if type_ == FileType::SymLink {
         return Err(LxError::ELOOP);
     }
-    if type_ == FileType::Dir && flags.writable() {
+    // `build_open_flags`: `if (flags & O_TRUNC) acc_mode |= MAY_WRITE;` and
+    // `may_open`: `case S_IFDIR: if (acc_mode & MAY_WRITE) return -EISDIR;`.
+    // A read-only `O_TRUNC` of a directory used to open it, truncating
+    // nothing and saying nothing.
+    if type_ == FileType::Dir && (flags.writable() || flags.contains(OpenFlags::TRUNCATE)) {
         return Err(LxError::EISDIR);
     }
     Ok(())
+}
+
+/// Whether this open truncates what it opened: `O_TRUNC` on a regular file
+/// that the open did not itself just create.
+///
+/// `do_open`: `if (file->f_mode & FMODE_CREATED) { /* Don't check for write
+/// permission, don't truncate */ open_flag &= ~O_TRUNC; acc_mode = 0; }`. A
+/// file created by this very call is empty already and belongs to whoever
+/// created it, whatever mode they gave it; asking it for write permission
+/// made `open("new", O_WRONLY|O_CREAT|O_TRUNC, 0444)` fail with `EACCES`
+/// for its own creator (a `umask 222` shell's `> file`). On the other types
+/// `may_open` drops the flag (`flag &= ~O_TRUNC`).
+pub(crate) fn truncates_on_open(flags: OpenFlags, type_: FileType, created: bool) -> bool {
+    !created && flags.contains(OpenFlags::TRUNCATE) && type_ == FileType::File
 }
 
 #[cfg(test)]
@@ -1393,5 +1428,61 @@ mod open_flag_tests {
                 "{flags:?}"
             );
         }
+    }
+
+    #[test]
+    fn o_creat_over_a_directory_is_eisdir_whatever_else_was_asked() {
+        // `do_open`: `if (open_flag & O_CREAT) { ... if (d_is_dir(...))
+        // return -EISDIR; }` -- even a read-only open, which used to succeed.
+        assert_eq!(
+            open_resolved_type(OpenFlags::CREATE, FileType::Dir),
+            Err(LxError::EISDIR)
+        );
+        assert_eq!(
+            open_resolved_type(OpenFlags::CREATE | OpenFlags::DIRECTORY, FileType::Dir),
+            Err(LxError::EISDIR)
+        );
+        // Over anything else `O_CREAT` is none of this function's business.
+        assert_eq!(
+            open_resolved_type(OpenFlags::CREATE, FileType::File),
+            Ok(())
+        );
+        assert_eq!(
+            open_resolved_type(OpenFlags::CREATE | OpenFlags::DIRECTORY, FileType::File),
+            Err(LxError::ENOTDIR)
+        );
+    }
+
+    #[test]
+    fn o_trunc_counts_as_a_write_where_a_directory_is_concerned() {
+        assert_eq!(
+            open_resolved_type(OpenFlags::RDONLY | OpenFlags::TRUNCATE, FileType::Dir),
+            Err(LxError::EISDIR)
+        );
+        // And nowhere else: on a file it is the truncation, on a device or a
+        // pipe `may_open` drops it.
+        for type_ in [FileType::File, FileType::CharDevice, FileType::NamedPipe] {
+            assert_eq!(
+                open_resolved_type(OpenFlags::RDONLY | OpenFlags::TRUNCATE, type_),
+                Ok(()),
+                "{type_:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_file_the_open_just_created_is_not_truncated_and_not_asked_for_write_permission() {
+        let flags = OpenFlags::WRONLY | OpenFlags::CREATE | OpenFlags::TRUNCATE;
+        assert!(truncates_on_open(flags, FileType::File, false));
+        assert!(!truncates_on_open(flags, FileType::File, true));
+        // Without the flag nothing is truncated; on other types the flag is
+        // dropped.
+        assert!(!truncates_on_open(
+            OpenFlags::WRONLY | OpenFlags::CREATE,
+            FileType::File,
+            false
+        ));
+        assert!(!truncates_on_open(flags, FileType::CharDevice, false));
+        assert!(!truncates_on_open(flags, FileType::NamedPipe, false));
     }
 }
