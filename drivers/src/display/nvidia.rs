@@ -7737,6 +7737,29 @@ impl DrmScheme for NvidiaGpu {
         super::nouveau_uapi::surfaceflip_enabled() && nvidia_rm_sys::rm_init::hwflip_ready()
     }
 
+    fn render_fence_for_scanout(&self, gem_handle: u32, owner_pid: u64) -> Option<(usize, u32)> {
+        // The pid whose ring may still be writing this buffer is the pid that
+        // ALLOCATED it, not the one that made the framebuffer out of it. With
+        // direct scanout those differ: the client renders into its own GEM
+        // object and the compositor imports it and calls ADDFB, so the fb
+        // wears the compositor's pid while the pixels are still coming from
+        // the client's channel. Waiting on the compositor's ring there would
+        // wait for the wrong GPU entirely.
+        //
+        // The lock is dropped before `ring_idle_probe`, which takes
+        // `nouveau_fast` and `nouveau_pid_ctx`: the documented order in
+        // `nouveau_release_process` never holds `nouveau_gem` across those.
+        let pid = self
+            .nouveau_gem
+            .lock()
+            .iter()
+            .find(|o| o.handle == gem_handle)
+            .map(|o| o.owner_pid)
+            .unwrap_or(owner_pid);
+        let probe = self.ring_idle_probe(pid)?;
+        Some((probe.fence_va, probe.payload))
+    }
+
     fn nouveau_gem_close(&self, handle: u32, owner_pid: u64) -> bool {
         // A close is where an earlier close's ring may have passed.
         self.reap_deferred_frees();

@@ -1930,6 +1930,23 @@ impl Syscall<'_> {
                 }
             }
         }
+        // And the implicit-sync half, for the legacy presents this kernel
+        // actually runs (`drm.atomic` is opt-in, so wlroots drives SETCRTC and
+        // PAGE_FLIP). Neither ioctl carries a fence, so the buffer used to be
+        // scanned out the instant the ioctl arrived -- while the GPU could
+        // still be drawing into it. The wait comes from the driver's own
+        // per-owner ring fence; see `DrmDev::present_fence_sleep`.
+        if linux_object::fs::devfs::drm_scheme::legacy_present_kind(request as u32).is_some() {
+            if let Some(file) = file_like.downcast_ref::<File>() {
+                if let Some(dev) = file
+                    .inode()
+                    .as_any_ref()
+                    .downcast_ref::<linux_object::fs::devfs::DrmDev>()
+                {
+                    dev.present_fence_sleep(request as u32, arg1).await;
+                }
+            }
+        }
         // File ioctls served at the VFS layer, como en Linux (fs/ioctl.c
         // `do_vfs_ioctl`): they apply to EVERY fd kind — pipes, sockets,
         // files, device nodes — so the per-inode handlers never need to know

@@ -572,6 +572,19 @@ fn primary_main(config: kernel_hal::KernelConfig) {
                 linux_object::fs::devfs::drm::set_atomic_enabled(true);
                 klog_info!("Eclipse: DRM atomic modesetting ENABLED (drm.atomic)");
             }
+            // Pre-present fence wait, ON by default: a legacy SETCRTC /
+            // PAGE_FLIP waits for the GPU to finish writing the buffer before
+            // it is scanned out, the way the atomic path already waits on
+            // IN_FENCE_FD. `drm.flip_fence=off` restores the old behaviour
+            // (present immediately, tear if the GPU is still drawing) without
+            // a rebuild, in case the wait misbehaves on real hardware.
+            if kernel_hal::cmdline::is_off(&options.cmdline, "drm.flip_fence") {
+                linux_object::fs::devfs::drm::set_flip_fence_enabled(false);
+                klog_info!(
+                    "Eclipse: drm.flip_fence=off -- el present legacy NO espera al fence de \
+                     dibujado (puede aparecer tearing)"
+                );
+            }
             // Nouveau-compatible driver-specific ioctl surface on the NVIDIA
             // DRM node (GETPARAM, CHANNEL_ALLOC, GEM_NEW/INFO, VM_INIT --
             // see drivers/src/display/nouveau_uapi.rs and

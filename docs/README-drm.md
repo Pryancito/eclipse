@@ -229,6 +229,52 @@ cursor atómico (el cursor legacy sigue compuesto por el kernel) y solo sobre la
 ruta software-KMS (con un driver KMS por hardware la negociación atómica se
 rechaza).
 
+## Espera de fence antes de presentar (sincronía implícita)
+
+La ruta atómica espera a `IN_FENCE_FD` desde que se escribió, pero la ruta
+**legacy** — `SETCRTC` y `PAGE_FLIP`, la que de verdad corre esta máquina
+porque `drm.atomic` es opt-in — no llevaba ninguna fence encima y no esperaba a
+nada: `present_now_checked` leía el búfer en el instante en que llegaba el
+ioctl. Un compositor que envía su dibujado y voltea sin dar la vuelta por la GPU
+ponía en pantalla lo que la GPU hubiera terminado hasta ese momento, o sea
+basura en la parte de abajo del frame.
+
+Linux resuelve ese caso desde el *reservation object* del búfer:
+`drm_atomic_helper_prepare_planes` recoge las fences que cuelgan del BO y el
+commit las espera antes de programar el flip. Aquí no hay reservation object, y
+el `EXEC` de nouveau **no lleva lista de búferes**, así que nada dice *qué*
+envíos tocaron este búfer. Lo que sí se puede saber es en qué canal envía su
+dueño y si ese canal ha drenado — la misma pregunta que responde
+`GEM_CPU_PREP`—, y se equivoca en la dirección segura: puede esperar por
+trabajo que no tocó el búfer, nunca pasar por alto trabajo que sí.
+
+El dueño es quien **asignó** el objeto GEM, no quien creó el framebuffer: con
+*direct scanout* el cliente dibuja en su propio objeto y el compositor lo
+importa y hace `ADDFB`, así que el fb lleva el pid del compositor mientras los
+píxeles siguen saliendo del canal del cliente.
+
+Detalles:
+
+- Tope de **100 ms**, el mismo que la espera atómica y por el mismo motivo:
+  presentar un frame a medias es un defecto visible, no presentar nunca es un
+  cuelgue. Pasado el tope se presenta igual y se avisa por consola con
+  presupuesto (8 líneas, luego calla).
+- Se espera en la ruta **asíncrona** del `ioctl` (`sys_ioctl`, antes del brazo
+  síncrono), durmiendo ~1 ms entre sondeos, no haciendo *spin*: girar aquí se
+  come un núcleo entero, que es la inanición que ya causó `WAIT_VBLANK`.
+- Un `SETCRTC` con `fb_id=0` apaga el pipe y no presenta nada, así que no
+  espera.
+- **Encendido por defecto.** La escotilla es `drm.flip_fence=off` en la
+  `cmdline`, que devuelve el comportamiento anterior (presentar al instante,
+  con *tearing* si la GPU sigue dibujando) sin recompilar.
+- Se pregunta a **todos** los drivers registrados, no solo al primario: en una
+  caja de dos GPUs la que dibuja no tiene por qué ser la que escanea (es
+  justamente el reparto que corre este kernel, con la GPU de consola dueña del
+  panel y la de cómputo dibujando).
+- Sin driver NVIDIA registrado la espera no existe: el gancho del *trait*
+  (`DrmScheme::render_fence_for_scanout`) devuelve `None` por defecto, así que
+  el escritorio software de QEMU se comporta exactamente como antes.
+
 ## Huecos conocidos y justificación
 
 - **`GET_UNIQUE` no devuelve un busid `pci:…`**. libdrm moderno deriva el bus
