@@ -917,13 +917,28 @@ impl Task for Process {
     }
 }
 
+/// Handle ids are 30 bits: a value is `(id << 2) | 3`.
+const HANDLE_ID_MASK: u32 = (1 << 30) - 1;
+
 impl ProcessInner {
     /// Add a handle to the process
     fn add_handle(&mut self, handle: Handle) -> HandleValue {
-        // FIXME: handle value from ptr
-        let key = (self.max_handle_id << 2) | 0x3u32;
+        // A handle value is a 30-bit id shifted up two, with the low bits
+        // set so no value is 0 (`INVALID_HANDLE`). The id used to be a
+        // counter that was never masked: after `2^30` handles in a process's
+        // life the shift dropped its top bits and the next value was `3`
+        // again, and `insert` silently replaced the handle still holding
+        // it, which the process went on using as if it were its own. Now
+        // the id wraps and skips the values still in use; a table that
+        // holds all `2^30` would have exhausted memory long before.
+        let key = loop {
+            let key = (self.max_handle_id << 2) | 0x3u32;
+            self.max_handle_id = (self.max_handle_id + 1) & HANDLE_ID_MASK;
+            if !self.handles.contains_key(&key) {
+                break key;
+            }
+        };
         info!("add handle: {:#x}, {:?}", key, handle.object);
-        self.max_handle_id += 1;
         self.handles.insert(key, (handle, Vec::new()));
         key
     }
@@ -976,6 +991,7 @@ pub struct ProcessInfo {
 mod tests {
     use super::*;
     use crate::object::KernelObject;
+    use crate::signal::Event;
     use crate::task::*;
 
     #[test]
@@ -985,6 +1001,42 @@ mod tests {
 
         assert_eq!(proc.related_koid(), root_job.id());
         assert!(Arc::ptr_eq(&root_job, &proc.job()));
+    }
+
+    /// After `2^30` handles the value counter wrapped through the shift and
+    /// the next handle took value `3` from whatever still held it. The
+    /// counter now wraps and skips the values in use.
+    #[test]
+    fn a_handle_value_never_lands_on_one_still_in_use() {
+        let proc = Process::create(&Job::root(), "proc").unwrap();
+        let first = Event::new();
+        let first_value = proc.add_handle(Handle::new(first.clone(), Rights::DEFAULT_EVENT));
+        assert_eq!(first_value, 3);
+        proc.inner.lock().max_handle_id = HANDLE_ID_MASK;
+        let last_value = proc.add_handle(Handle::new(Event::new(), Rights::DEFAULT_EVENT));
+        assert_eq!(last_value, u32::MAX, "the last id before the wrap");
+        assert_eq!(
+            proc.inner.lock().max_handle_id,
+            0,
+            "the id counter stays within its 30 bits"
+        );
+        let wrapped = Event::new();
+        let wrapped_value = proc.add_handle(Handle::new(wrapped.clone(), Rights::DEFAULT_EVENT));
+        assert_eq!(wrapped_value, 7, "value 3 is taken, so the wrap skips it");
+        assert!(Arc::ptr_eq(
+            &proc.get_object::<Event>(first_value).unwrap(),
+            &first
+        ));
+        assert!(Arc::ptr_eq(
+            &proc.get_object::<Event>(wrapped_value).unwrap(),
+            &wrapped
+        ));
+        proc.remove_handle(first_value).unwrap();
+        assert_eq!(
+            proc.add_handle(Handle::new(Event::new(), Rights::DEFAULT_EVENT)),
+            11,
+            "a freed value is not reused until the counter comes round again"
+        );
     }
 
     #[test]
