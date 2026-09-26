@@ -3,8 +3,8 @@
 use alloc::{boxed::Box, string::String, sync::Arc, vec::Vec};
 use core::{future::Future, pin::Pin};
 use linux_object::signal::{
-    MachineContext, SigInfo, Signal, SignalAction, SignalStack, SignalUserContext, Sigset, SIG_DFL,
-    SIG_IGN,
+    MachineContext, SigInfo, Signal, SignalAction, SignalCode, SignalStack, SignalUserContext,
+    Sigset, SIG_DFL, SIG_IGN,
 };
 
 use kernel_hal::context::{TrapReason, UserContext, UserContextField};
@@ -1017,7 +1017,27 @@ fn dump_user_fault_context(
 /// disposition is the default/ignore action, terminate the process. Only a
 /// not-yet-faulted custom handler gets to run, exactly once — a fault inside it
 /// sets `handling_signal`, so the next fault terminates instead of looping.
-fn force_fault_signal(thread: &CurrentThread, signal: Signal) {
+/// The exit code of a process a fault kills: a death by `signal`, which
+/// `wait` reports as `WIFSIGNALED`. `128 + signo` here was a shell's number,
+/// not a status word: `bash` printed nothing for a segfault and `system()`
+/// saw a program that had exited with 139.
+fn undeliverable_fault_exit_code(signal: Signal) -> i64 {
+    linux_object::process::exit_code_killed_by(signal as u8)
+}
+
+/// What a page fault the process could not have caused on purpose is told
+/// about itself (`force_sig_fault`): `SEGV_MAPERR` when nothing is mapped at
+/// the address, `SEGV_ACCERR` when something is but not for this access, and
+/// `si_addr` in both cases.
+fn page_fault_info(vaddr: usize, err: ZxError) -> SigInfo {
+    let code = match err {
+        ZxError::NOT_FOUND => SignalCode::SEGV_MAPERR,
+        _ => SignalCode::SEGV_ACCERR,
+    };
+    SigInfo::fault(Signal::SIGSEGV, code, vaddr)
+}
+
+fn force_fault_signal(thread: &CurrentThread, signal: Signal, info: SigInfo) {
     let action = thread.proc().linux().signal_action(signal);
     let inner = thread.inner();
     let undeliverable = {
@@ -1048,15 +1068,15 @@ fn force_fault_signal(thread: &CurrentThread, signal: Signal) {
             signal,
             signal as i32,
         );
-        thread.proc().exit(128 + signal as i64);
+        thread.proc().exit(undeliverable_fault_exit_code(signal));
     } else {
         // Deliverable custom handler: unblock so it cannot be deferred and queue
-        // it for the next pass of the run loop.
+        // it for the next pass of the run loop, with where and why.
         let mut linux = inner.lock_linux();
         let mut unblock = Sigset::empty();
         unblock.insert(signal);
         linux.unblock_signals(&unblock);
-        linux.signals.insert(signal);
+        linux.queue_signal(signal, Some(info));
     }
 }
 
@@ -1213,13 +1233,20 @@ async fn handle_user_trap(thread: &CurrentThread, mut ctx: Box<UserContext>) -> 
                     pc,
                     !flags.contains(kernel_hal::MMUFlags::EXECUTE),
                 );
-                force_fault_signal(thread, Signal::SIGSEGV);
+                force_fault_signal(thread, Signal::SIGSEGV, page_fault_info(vaddr, err));
             }
             Ok(())
         }
         TrapReason::UndefinedInstruction => {
             warn!("undefined instruction from user mode, pid={}", pid);
-            force_fault_signal(thread, Signal::SIGILL);
+            let pc = thread
+                .with_context(|ctx| ctx.get_field(UserContextField::InstrPointer))
+                .unwrap_or(0);
+            force_fault_signal(
+                thread,
+                Signal::SIGILL,
+                SigInfo::fault(Signal::SIGILL, SignalCode::ILL_ILLOPC, pc),
+            );
             Ok(())
         }
         TrapReason::SoftwareBreakpoint | TrapReason::HardwareBreakpoint => {
@@ -1229,7 +1256,12 @@ async fn handle_user_trap(thread: &CurrentThread, mut ctx: Box<UserContext>) -> 
         }
         TrapReason::UnalignedAccess => {
             warn!("unaligned access from user mode, pid={}", pid);
-            force_fault_signal(thread, Signal::SIGBUS);
+            // The data address is not in the trap frame here; the code is.
+            force_fault_signal(
+                thread,
+                Signal::SIGBUS,
+                SigInfo::fault(Signal::SIGBUS, SignalCode::BUS_ADRALN, 0),
+            );
             Ok(())
         }
         TrapReason::GernelFault(trap_num) => {
@@ -1254,7 +1286,13 @@ async fn handle_user_trap(thread: &CurrentThread, mut ctx: Box<UserContext>) -> 
                 describe_addr(&vmar, pc),
             );
             dump_user_fault_context(thread, &vmar, pc, true);
-            force_fault_signal(thread, signal);
+            // A #DE is `FPE_INTDIV` at the instruction; a #GP and the rest
+            // are what Linux sends as `SI_KERNEL` with no address.
+            let info = match signal {
+                Signal::SIGFPE => SigInfo::fault(signal, SignalCode::FPE_INTDIV, pc),
+                _ => SigInfo::fault(signal, SignalCode::KERNEL, 0),
+            };
+            force_fault_signal(thread, signal, info);
             Ok(())
         }
         _ => {
@@ -1329,6 +1367,35 @@ fn syscall_args(ctx: &UserContext) -> [usize; 6] {
         } else {
             unimplemented!()
         }
+    }
+}
+
+#[cfg(test)]
+mod fault_signal_tests {
+    //! What a process is told, or its parent, when the CPU faults it.
+
+    use super::*;
+    use core::convert::TryInto;
+    use linux_object::process::wait_status_exited;
+
+    #[test]
+    fn a_fault_nobody_handles_is_a_death_by_that_signal_not_an_exit_with_139() {
+        let status = wait_status_exited(undeliverable_fault_exit_code(Signal::SIGSEGV));
+        // WIFSIGNALED: the low seven bits are the signal, and not 0.
+        assert_eq!(status & 0x7f, Signal::SIGSEGV as i32);
+        assert_eq!(status & 0xff00, 0, "no exit code on a kill");
+    }
+
+    #[test]
+    fn a_page_fault_says_whether_the_address_was_mapped_and_where_it_was() {
+        let info = page_fault_info(0x1234_5000, ZxError::NOT_FOUND);
+        assert_eq!(info.code, SignalCode::SEGV_MAPERR);
+        let addr = usize::from_ne_bytes(info.as_bytes()[16..24].try_into().unwrap());
+        assert_eq!(addr, 0x1234_5000);
+        assert_eq!(
+            page_fault_info(0x1234_5000, ZxError::ACCESS_DENIED).code,
+            SignalCode::SEGV_ACCERR
+        );
     }
 }
 

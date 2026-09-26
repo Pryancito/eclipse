@@ -177,6 +177,11 @@ impl SiginfoFields {
         self.pad[4..8].copy_from_slice(&uid.to_ne_bytes());
     }
 
+    /// `_sigfault`: `si_addr`, the address the fault was at.
+    fn write_fault(&mut self, addr: usize) {
+        self.pad[..core::mem::size_of::<usize>()].copy_from_slice(&addr.to_ne_bytes());
+    }
+
     /// `_sigchld`: `si_pid`, `si_uid` (the child's REAL uid, `task_uid`),
     /// `si_status`.
     fn write_sigchld(&mut self, pid: i32, uid: u32, status: i32) {
@@ -253,6 +258,22 @@ impl SigInfo {
         info
     }
 
+    /// `siginfo_t` for a fault the CPU raised (`force_sig_fault`): `code`
+    /// says which kind (`SEGV_MAPERR`, `SEGV_ACCERR`, `BUS_ADRALN`,
+    /// `ILL_ILLOPC`, `FPE_INTDIV`) and `addr` is `si_addr`, the address it
+    /// happened at. A wasm engine or a garbage collector that traps on a
+    /// guard page reads `si_addr` to know whether the fault was its own.
+    pub fn fault(signal: Signal, code: SignalCode, addr: usize) -> Self {
+        let mut info = SigInfo {
+            signo: signal as i32,
+            errno: 0,
+            code,
+            ..Self::default()
+        };
+        info.field.write_fault(addr);
+        info
+    }
+
     /// What a signal sent with no information carries: its number, and
     /// `SI_USER` from nobody (`SEND_SIG_NOINFO`).
     pub fn bare(signal: Signal) -> Self {
@@ -304,41 +325,61 @@ pub fn child_si_code_and_status(status: i32) -> (SignalCode, i32) {
     }
 }
 
-/// A code identifying the cause of the signal.
-#[repr(i32)]
+/// `si_code`: why the signal was sent.
+///
+/// A plain number and not an enum, because the uAPI reuses the positive
+/// values per signal: `SEGV_MAPERR`, `BUS_ADRALN`, `ILL_ILLOPC`, `FPE_INTDIV`
+/// and `CLD_EXITED` are all `1`. The negative ones (`SI_USER` and below) are
+/// shared by every signal.
+#[repr(transparent)]
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
-pub enum SignalCode {
-    ASYNCNL = -60,
-    TKILL = -6,
-    SIGIO = -5,
-    ASYNCIO = -4,
-    MESGQ = -3,
-    TIMER = -2,
-    QUEUE = -1,
+pub struct SignalCode(pub i32);
+
+#[allow(non_upper_case_globals)]
+impl SignalCode {
+    pub const ASYNCNL: SignalCode = SignalCode(-60);
+    pub const TKILL: SignalCode = SignalCode(-6);
+    pub const SIGIO: SignalCode = SignalCode(-5);
+    pub const ASYNCIO: SignalCode = SignalCode(-4);
+    pub const MESGQ: SignalCode = SignalCode(-3);
+    pub const TIMER: SignalCode = SignalCode(-2);
+    pub const QUEUE: SignalCode = SignalCode(-1);
     /// from user
-    USER = 0,
+    pub const USER: SignalCode = SignalCode(0);
+    /// from kernel
+    pub const KERNEL: SignalCode = SignalCode(128);
     /// `SIGCHLD`: child called `_exit`
-    #[allow(non_camel_case_types)]
-    CLD_EXITED = 1,
+    pub const CLD_EXITED: SignalCode = SignalCode(1);
     /// `SIGCHLD`: child killed by a signal.
-    #[allow(non_camel_case_types)]
-    CLD_KILLED = 2,
+    pub const CLD_KILLED: SignalCode = SignalCode(2);
     /// `SIGCHLD`: child killed by a signal AND dumped core. Never produced
     /// here -- this kernel writes no cores -- but named so the numbering is
     /// the uAPI's and not a count of what happens to be implemented.
-    #[allow(non_camel_case_types)]
-    CLD_DUMPED = 3,
+    pub const CLD_DUMPED: SignalCode = SignalCode(3);
     /// `SIGCHLD`: traced child has trapped.
-    #[allow(non_camel_case_types)]
-    CLD_TRAPPED = 4,
+    pub const CLD_TRAPPED: SignalCode = SignalCode(4);
     /// `SIGCHLD`: child has stopped.
-    #[allow(non_camel_case_types)]
-    CLD_STOPPED = 5,
+    pub const CLD_STOPPED: SignalCode = SignalCode(5);
     /// `SIGCHLD`: stopped child has continued.
-    #[allow(non_camel_case_types)]
-    CLD_CONTINUED = 6,
-    /// from kernel
-    KERNEL = 128,
+    pub const CLD_CONTINUED: SignalCode = SignalCode(6);
+    /// `SIGSEGV`: address not mapped to object.
+    pub const SEGV_MAPERR: SignalCode = SignalCode(1);
+    /// `SIGSEGV`: invalid permissions for mapped object.
+    pub const SEGV_ACCERR: SignalCode = SignalCode(2);
+    /// `SIGBUS`: invalid address alignment.
+    pub const BUS_ADRALN: SignalCode = SignalCode(1);
+    /// `SIGILL`: illegal opcode.
+    pub const ILL_ILLOPC: SignalCode = SignalCode(1);
+    /// `SIGFPE`: integer divide by zero.
+    pub const FPE_INTDIV: SignalCode = SignalCode(1);
+    /// `SIGTRAP`: process breakpoint.
+    pub const TRAP_BRKPT: SignalCode = SignalCode(1);
+
+    /// Whether this code says a PROCESS sent the signal (`SI_FROMUSER`):
+    /// `si_pid`/`si_uid` are then the sender's.
+    pub fn from_a_process(self) -> bool {
+        self.0 <= 0
+    }
 }
 
 bitflags! {
@@ -873,12 +914,12 @@ mod child_siginfo_tests {
     /// compares against its own headers.
     #[test]
     fn the_codes_are_the_ones_userspace_has_in_its_headers() {
-        assert_eq!(SignalCode::CLD_EXITED as i32, 1);
-        assert_eq!(SignalCode::CLD_KILLED as i32, 2);
-        assert_eq!(SignalCode::CLD_DUMPED as i32, 3);
-        assert_eq!(SignalCode::CLD_TRAPPED as i32, 4);
-        assert_eq!(SignalCode::CLD_STOPPED as i32, 5);
-        assert_eq!(SignalCode::CLD_CONTINUED as i32, 6);
+        assert_eq!(SignalCode::CLD_EXITED.0, 1);
+        assert_eq!(SignalCode::CLD_KILLED.0, 2);
+        assert_eq!(SignalCode::CLD_DUMPED.0, 3);
+        assert_eq!(SignalCode::CLD_TRAPPED.0, 4);
+        assert_eq!(SignalCode::CLD_STOPPED.0, 5);
+        assert_eq!(SignalCode::CLD_CONTINUED.0, 6);
     }
 
     /// And `si_signo` is SIGCHLD whatever happened, because that is the
@@ -894,6 +935,42 @@ mod child_siginfo_tests {
             let info = SigInfo::child_state_change(4242, 0, status);
             assert_eq!(info.signo, Signal::SIGCHLD as i32);
         }
+    }
+}
+
+#[cfg(test)]
+mod fault_info_tests {
+    //! What a handler for a CPU fault is told about it.
+
+    use super::*;
+    use core::convert::TryInto;
+
+    #[test]
+    fn a_fault_carries_its_address_where_si_addr_is() {
+        // glibc: si_addr at byte 16, a pointer.
+        let info = SigInfo::fault(Signal::SIGSEGV, SignalCode::SEGV_MAPERR, 0xdead_beef_0000);
+        let b = info.as_bytes();
+        let addr = usize::from_ne_bytes(b[16..24].try_into().unwrap());
+        assert_eq!(addr, 0xdead_beef_0000);
+        assert_eq!(info.code, SignalCode::SEGV_MAPERR);
+        assert_eq!(info.signo, Signal::SIGSEGV as i32);
+    }
+
+    #[test]
+    fn the_codes_the_uapi_reuses_are_the_same_number() {
+        for code in [
+            SignalCode::SEGV_MAPERR,
+            SignalCode::BUS_ADRALN,
+            SignalCode::ILL_ILLOPC,
+            SignalCode::FPE_INTDIV,
+            SignalCode::CLD_EXITED,
+        ] {
+            assert_eq!(code.0, 1);
+            assert!(!code.from_a_process());
+        }
+        assert_eq!(SignalCode::SEGV_ACCERR.0, 2);
+        assert!(SignalCode::USER.from_a_process());
+        assert!(SignalCode::TKILL.from_a_process());
     }
 }
 
@@ -919,7 +996,7 @@ mod layout_tests {
         let b = info.as_bytes();
         let word = |at: usize| i32::from_ne_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]]);
         assert_eq!(word(0), Signal::SIGCHLD as i32, "si_signo");
-        assert_eq!(word(8), SignalCode::CLD_EXITED as i32, "si_code");
+        assert_eq!(word(8), SignalCode::CLD_EXITED.0, "si_code");
         assert_eq!(word(16), 4242, "si_pid");
         assert_eq!(word(20), 1000, "si_uid");
         assert_eq!(word(24), 7, "si_status");
