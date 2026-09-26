@@ -1101,15 +1101,31 @@ impl Syscall<'_> {
         let inode = proc.lookup_inode(path_str)?;
         let metadata = inode.metadata()?;
         proc.check_access(&metadata, 0o1, true)?;
+        // Both mount questions are asked of the same absolute path, because both
+        // are decided by which mount it is on, and the path the caller named is
+        // still in hand here.
+        let absolute = proc
+            .get_absolute_path(FileDesc::CWD, path_str)
+            .unwrap_or_else(|_| path_str.to_string());
+        // `do_open_execat`: `if (path_noexec(&file->f_path)) return -EACCES;`.
+        // Before the `bprm` is built and long before the address space is
+        // touched, so a refusal comes back to the caller as an ordinary errno.
+        // `/proc` and `/sys` are mounted `noexec` here, and said so in
+        // `/proc/mounts` the whole time executing from them worked fine.
+        //
+        // Asked of the name, where Linux asks it of the resolved file's own
+        // mount. The two differ only for a symbolic link that crosses a mount
+        // boundary, and the one that matters is `/proc/self/exe`, which busybox
+        // re-executes for every applet: it is canonicalised to the real on-disk
+        // path above, before this line, so what gets asked about is the binary
+        // and not `/proc`. Were it asked here as written by the caller, every
+        // busybox applet would answer EACCES.
+        if linux_object::fs::path_is_noexec(&absolute) {
+            return Err(LxError::EACCES);
+        }
         // `mnt_may_suid(bprm->file->f_path.mnt)`: a set-user-ID bit on a file
-        // that lives on a `nosuid` mount grants nothing. Asked here, where the
-        // path the caller named is still in hand, and made absolute first
-        // because the mount is chosen by path prefix.
-        let may_suid = !linux_object::fs::path_is_nosuid(
-            &proc
-                .get_absolute_path(FileDesc::CWD, path_str)
-                .unwrap_or_else(|_| path_str.to_string()),
-        );
+        // that lives on a `nosuid` mount grants nothing.
+        let may_suid = !linux_object::fs::path_is_nosuid(&absolute);
         let vmo = inode.read_as_vmo_cached()?;
 
         // Everything below `vmar.clear()` is past the point of no return: the
