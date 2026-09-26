@@ -11,6 +11,7 @@ pub mod boot_logo;
 pub mod cmdline;
 pub mod console;
 pub mod context;
+pub mod cpu_power;
 pub mod cpu_topology;
 pub mod deadline;
 pub mod dma_pin;
