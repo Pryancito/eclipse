@@ -6,6 +6,7 @@
 
 use super::consts::stat as c;
 use alloc::vec::Vec;
+use linux_object::error::{LxError, LxResult};
 use linux_object::fs::vfs::{FileType, Metadata};
 
 /// FreeBSD `struct stat` for amd64 (`sys/sys/stat.h`, default — i.e. without
@@ -173,12 +174,21 @@ pub struct BsdDirentWriter {
 }
 
 impl BsdDirentWriter {
-    /// Create a writer that will emit at most `cap` bytes.
-    pub fn new(cap: usize) -> Self {
-        BsdDirentWriter {
-            buf: Vec::with_capacity(cap.min(256 * 1024)),
-            cap,
-        }
+    /// A writer that will emit at most `cap` bytes, or `ENOMEM`.
+    ///
+    /// `Vec::with_capacity` is an infallible allocation, and `cap` is the
+    /// caller's own `nbytes`: `getdirentries(fd, buf, 262144, &base)` asked
+    /// the kernel for a quarter of a megabyte of its fixed heap up front, and
+    /// when the heap could not give it `alloc_error` panicked the machine
+    /// instead of the call answering `ENOMEM`. It is the same rule as
+    /// [`crate::try_zeroed_buf`], which every other user-sized buffer in this
+    /// crate goes through; this one could not, because it was built behind a
+    /// constructor that had no way to fail.
+    pub fn try_new(cap: usize) -> LxResult<Self> {
+        let mut buf = Vec::new();
+        buf.try_reserve_exact(cap.min(256 * 1024))
+            .map_err(|_| LxError::ENOMEM)?;
+        Ok(BsdDirentWriter { buf, cap })
     }
 
     /// Try to append one directory entry. Returns `false` (and appends
@@ -256,7 +266,7 @@ mod tests {
 
     #[test]
     fn writer_respects_budget_and_lays_out_fields() {
-        let mut w = BsdDirentWriter::new(64);
+        let mut w = BsdDirentWriter::try_new(64).unwrap();
         assert!(w.try_push(0x1122, 1, c::DT_REG, "hi"));
         // "hi" -> reclen 32; a second 32-byte record still fits in 64.
         assert!(w.try_push(0x3344, 2, c::DT_DIR, "yo"));
@@ -278,5 +288,32 @@ mod tests {
         assert_eq!(u16::from_le_bytes(b[20..22].try_into().unwrap()), 2);
         // name bytes at offset 24.
         assert_eq!(&b[24..26], b"hi");
+    }
+}
+
+#[cfg(test)]
+mod dirent_writer_alloc_tests {
+    use super::*;
+
+    #[test]
+    fn a_hostile_nbytes_is_not_asked_of_the_allocator() {
+        // `getdirentries` hands `nbytes` straight through, so this is the
+        // caller's own number. The reservation is clamped; `cap` is not,
+        // because it is the byte budget `try_push` measures against.
+        let w = BsdDirentWriter::try_new(usize::MAX).expect("a clamped reservation fits");
+        assert_eq!(w.len(), 0);
+        assert!(w.buf.capacity() <= 256 * 1024, "{}", w.buf.capacity());
+        assert_eq!(w.cap, usize::MAX);
+    }
+
+    #[test]
+    fn the_reservation_is_exact_for_a_request_under_the_clamp() {
+        // `try_reserve_exact`, so the buffer a 4 KiB `getdirentries` gets is
+        // 4 KiB and not the next power of two, and the `try_push`es that
+        // follow never reallocate -- a reallocation is the infallible path
+        // again, which is what this constructor exists to avoid.
+        let w = BsdDirentWriter::try_new(4096).expect("4 KiB fits");
+        assert_eq!(w.buf.capacity(), 4096);
+        assert_eq!(w.cap, 4096);
     }
 }

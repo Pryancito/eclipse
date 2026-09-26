@@ -519,7 +519,10 @@ impl Syscall<'_> {
             Ok(_) => return BsdRet::err(consts::errno::ENOTDIR),
             Err(e) => return BsdRet::err(errno::lx_to_freebsd(e)),
         }
-        let mut writer = fs::BsdDirentWriter::new(nbytes.min(256 * 1024));
+        let mut writer = match fs::BsdDirentWriter::try_new(nbytes.min(256 * 1024)) {
+            Ok(w) => w,
+            Err(e) => return BsdRet::err(errno::lx_to_freebsd(e)),
+        };
         let mut file = file;
         let base = match read_dirents_with_base(&mut file, &mut writer) {
             Ok(base) => base,
@@ -715,7 +718,7 @@ mod tests {
         let mut bases = alloc::vec::Vec::new();
         let mut lens = alloc::vec::Vec::new();
         loop {
-            let mut w = fs::BsdDirentWriter::new(2 * one);
+            let mut w = fs::BsdDirentWriter::try_new(2 * one).unwrap();
             let base = read_dirents_with_base(&mut d, &mut w).unwrap();
             if w.is_empty() {
                 break;
