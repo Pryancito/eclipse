@@ -79,6 +79,74 @@ pub fn waitid_id(raw: usize, zero_allowed: bool) -> LxResult<usize> {
     Ok(id as usize)
 }
 
+/// A `(loff_t offset, loff_t len)` pair, as `ksys_sync_file_range` judges
+/// it before it looks the descriptor up: `loff_t` is signed, so a register
+/// with the top bit set is a negative offset or length (`EINVAL`), and an
+/// end past `LLONG_MAX` (`(s64)(offset + nbytes) < 0`) is `EINVAL` too.
+/// Read as `u64` these were huge, and accepted.
+pub fn loff_range(offset: usize, len: usize) -> LxResult<(u64, u64)> {
+    let (offset, len) = (offset as i64, len as i64);
+    if offset < 0 || len < 0 || offset.checked_add(len).is_none() {
+        return Err(LxError::EINVAL);
+    }
+    Ok((offset as u64, len as u64))
+}
+
+/// A `loff_t len` on its own, as `generic_fadvise` judges it (`len < 0` is
+/// `EINVAL`; the offset is not looked at). `readahead(2)` goes through the
+/// same test with its `size_t count` widened to `loff_t`.
+pub fn loff_len(len: usize) -> LxResult<u64> {
+    if (len as i64) < 0 {
+        return Err(LxError::EINVAL);
+    }
+    Ok(len as u64)
+}
+
+#[cfg(test)]
+mod loff_tests {
+    //! The signed 64-bit lengths, which were read unsigned.
+
+    use super::*;
+
+    /// `sync_file_range(fd, -1, 0, 0)` is EINVAL in Linux; it was a sync of
+    /// everything from byte 2^64-1 on, which is to say a success.
+    #[test]
+    fn a_negative_offset_or_length_is_einval() {
+        assert_eq!(loff_range(0, 0), Ok((0, 0)));
+        assert_eq!(loff_range(4096, 1 << 20), Ok((4096, 1 << 20)));
+        assert_eq!(loff_range(i64::MAX as usize, 0), Ok((i64::MAX as u64, 0)));
+        for (offset, len) in [(usize::MAX, 0), (0, usize::MAX), (1 << 63, 1), (1, 1 << 63)] {
+            assert_eq!(
+                loff_range(offset, len),
+                Err(LxError::EINVAL),
+                "{:#x} {:#x}",
+                offset,
+                len
+            );
+        }
+    }
+
+    /// An end past `LLONG_MAX` is EINVAL, and exactly at it is not.
+    #[test]
+    fn an_end_past_llong_max_is_einval() {
+        let max = i64::MAX as usize;
+        assert_eq!(loff_range(max - 1, 1), Ok(((max - 1) as u64, 1)));
+        assert_eq!(loff_range(max, 1), Err(LxError::EINVAL));
+        assert_eq!(loff_range(1, max), Err(LxError::EINVAL));
+        assert_eq!(loff_range(max / 2 + 1, max / 2 + 1), Err(LxError::EINVAL));
+    }
+
+    /// `fadvise64(fd, off, -1, advice)` is EINVAL; `readahead(fd, off,
+    /// (size_t)-1)` too, once the count is a `loff_t`.
+    #[test]
+    fn a_negative_length_alone_is_einval() {
+        assert_eq!(loff_len(0), Ok(0));
+        assert_eq!(loff_len(i64::MAX as usize), Ok(i64::MAX as u64));
+        assert_eq!(loff_len(1 << 63), Err(LxError::EINVAL));
+        assert_eq!(loff_len(usize::MAX), Err(LxError::EINVAL));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     //! The `(int)` of each argument, with `-1` spelled both ways a register

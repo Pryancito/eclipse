@@ -743,6 +743,10 @@ impl Syscall<'_> {
         {
             return Err(LxError::ESPIPE);
         }
+        // `generic_fadvise`: `len < 0` is EINVAL, judged after the FIFO test
+        // and before the advice word. `len` is a `loff_t`; as a `usize` a
+        // negative one was a very long hint, taken.
+        crate::intarg::loff_len(len)?;
         if !fadvise_advice_known(advice) {
             return Err(LxError::EINVAL);
         }
@@ -1079,6 +1083,9 @@ impl Syscall<'_> {
         ) {
             return Err(LxError::EINVAL);
         }
+        // Then `vfs_fadvise(POSIX_FADV_WILLNEED)`, which reads the count as
+        // a `loff_t` and refuses a negative one.
+        crate::intarg::loff_len(count)?;
         Ok(0)
     }
 
@@ -1092,8 +1099,8 @@ impl Syscall<'_> {
     pub fn sys_sync_file_range(
         &self,
         fd: FileDesc,
-        offset: u64,
-        nbytes: u64,
+        offset: usize,
+        nbytes: usize,
         flags: usize,
     ) -> SysResult {
         const SYNC_FILE_RANGE_WAIT_BEFORE: usize = 1;
@@ -1109,6 +1116,11 @@ impl Syscall<'_> {
         {
             return Err(LxError::EINVAL);
         }
+        // `ksys_sync_file_range`: the range is judged after the flags and
+        // before the descriptor. Both are `loff_t`, so a negative offset or
+        // length, or an end past `LLONG_MAX`, is EINVAL; read as `u64` they
+        // were accepted and the whole file synced.
+        crate::intarg::loff_range(offset, nbytes)?;
         let proc = self.linux_process();
         let file = proc.get_file(fd)?;
         if flags != 0 {
