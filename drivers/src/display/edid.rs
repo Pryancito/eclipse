@@ -879,6 +879,52 @@ mod tests {
     }
 
     #[test]
+    fn every_condition_a_valid_mode_has_to_meet_is_checked_on_its_own() {
+        // `is_valid` is public and is the gate between a monitor's descriptor
+        // and a mode a compositor is handed, so each of its nine conditions is
+        // broken one at a time. Two of them are unreachable through
+        // `preferred_timing` -- a zero clock marks a *display* descriptor, so
+        // that branch never even asks -- and a caller building a timing itself
+        // still has to be told no.
+        let ok = DetailedTiming {
+            clock_khz: 148_500,
+            hdisplay: 1920,
+            hsync_start: 2008,
+            hsync_end: 2052,
+            htotal: 2200,
+            vdisplay: 1080,
+            vsync_start: 1084,
+            vsync_end: 1089,
+            vtotal: 1125,
+            interlaced: false,
+            separate_sync: true,
+            hsync_positive: false,
+            vsync_positive: true,
+        };
+        assert!(ok.is_valid(), "the DMT 1080p60 timing must be valid");
+        let cases: [(&str, fn(&mut DetailedTiming)); 9] = [
+            ("a zero pixel clock", |t| t.clock_khz = 0),
+            ("a zero width", |t| t.hdisplay = 0),
+            ("hsync starting before the active area", |t| {
+                t.hsync_start = 1919
+            }),
+            ("hsync ending before it starts", |t| t.hsync_end = 2007),
+            ("hsync ending past the total", |t| t.htotal = 2051),
+            ("a zero height", |t| t.vdisplay = 0),
+            ("vsync starting before the active area", |t| {
+                t.vsync_start = 1079
+            }),
+            ("vsync ending before it starts", |t| t.vsync_end = 1083),
+            ("vsync ending past the total", |t| t.vtotal = 1088),
+        ];
+        for (what, break_it) in cases {
+            let mut t = ok;
+            break_it(&mut t);
+            assert!(!t.is_valid(), "{} was accepted as a mode", what);
+        }
+    }
+
+    #[test]
     fn the_refresh_of_an_impossible_timing_is_zero_and_not_a_panic() {
         // `refresh_*` are public and take a `DetailedTiming` the caller may
         // have built itself, so they cannot assume `is_valid`. A zero total
