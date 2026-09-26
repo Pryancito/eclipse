@@ -85,23 +85,6 @@ impl BsdRet {
     }
 }
 
-/// Translate a FreeBSD `clockid_t` to the Linux one `sys_clock_*` expects.
-///
-/// The two disagree past `CLOCK_REALTIME` (both 0): FreeBSD `CLOCK_MONOTONIC`
-/// is 4 where Linux uses 1, and the CPU-time clocks are renumbered too
-/// (`sys/sys/_clock_id.h` vs `include/uapi/linux/time.h`).
-fn clockid_to_linux(bsd: usize) -> usize {
-    match bsd {
-        // REALTIME and its _PRECISE(9)/_FAST(10)/SECOND(13) variants.
-        0 | 9 | 10 | 13 => 0,
-        // MONOTONIC(4) and the UPTIME(5,7,8) / MONOTONIC_PRECISE(11)/_FAST(12) family.
-        4 | 5 | 7 | 8 | 11 | 12 => 1,
-        15 => 2, // PROCESS_CPUTIME_ID
-        14 => 3, // THREAD_CPUTIME_ID
-        other => other,
-    }
-}
-
 impl Syscall<'_> {
     /// Dispatch one FreeBSD/amd64 system call and return its FreeBSD-encoded
     /// result. Called by the trap handler when the faulting process's
@@ -338,16 +321,21 @@ impl Syscall<'_> {
 
             // ---- time -------------------------------------------------------
             sys::NANOSLEEP => BsdRet::from_result(self.sys_nanosleep(a0.into(), a1.into()).await),
-            sys::CLOCK_NANOSLEEP => BsdRet::from_result(
-                self.sys_clock_nanosleep(clockid_to_linux(a0), a1, a2.into(), a3.into())
-                    .await,
-            ),
-            sys::CLOCK_GETTIME => {
-                BsdRet::from_result(self.sys_clock_gettime(clockid_to_linux(a0), a1.into()))
-            }
-            sys::CLOCK_GETRES => {
-                BsdRet::from_result(self.sys_clock_getres(clockid_to_linux(a0), a1.into()))
-            }
+            sys::CLOCK_NANOSLEEP => match translate::clockid_to_linux(a0) {
+                Err(e) => BsdRet::from_lx(e),
+                Ok(clock) => BsdRet::from_result(
+                    self.sys_clock_nanosleep(clock, a1, a2.into(), a3.into())
+                        .await,
+                ),
+            },
+            sys::CLOCK_GETTIME => match translate::clockid_to_linux(a0) {
+                Err(e) => BsdRet::from_lx(e),
+                Ok(clock) => BsdRet::from_result(self.sys_clock_gettime(clock, a1.into())),
+            },
+            sys::CLOCK_GETRES => match translate::clockid_to_linux(a0) {
+                Err(e) => BsdRet::from_lx(e),
+                Ok(clock) => BsdRet::from_result(self.sys_clock_getres(clock, a1.into())),
+            },
             sys::GETTIMEOFDAY => BsdRet::from_result(self.sys_gettimeofday(a0.into(), a1.into())),
 
             // ---- machine / sysctl -------------------------------------------
@@ -677,15 +665,5 @@ mod tests {
         // Linux ENOSYS(38) -> FreeBSD ENOSYS(78).
         let r = BsdRet::from_result(Err(LxError::ENOSYS));
         assert_eq!((r.rax, r.error), (78, true));
-    }
-
-    #[test]
-    fn clockid_translation_matches_freebsd_numbering() {
-        assert_eq!(clockid_to_linux(0), 0); // REALTIME
-        assert_eq!(clockid_to_linux(4), 1); // MONOTONIC (FreeBSD 4 -> Linux 1)
-        assert_eq!(clockid_to_linux(11), 1); // MONOTONIC_PRECISE
-        assert_eq!(clockid_to_linux(9), 0); // REALTIME_PRECISE
-        assert_eq!(clockid_to_linux(15), 2); // PROCESS_CPUTIME
-        assert_eq!(clockid_to_linux(14), 3); // THREAD_CPUTIME
     }
 }

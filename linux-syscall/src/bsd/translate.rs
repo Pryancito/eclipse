@@ -573,6 +573,39 @@ pub fn wait_status_to_freebsd(status: i32) -> i32 {
     }
 }
 
+/// A FreeBSD `clockid_t` as the Linux `clockid_t` that `sys_clock_*` reads.
+///
+/// The two tables agree only on `CLOCK_REALTIME` (`sys/sys/_clock_id.h` vs
+/// `include/uapi/linux/time.h`): FreeBSD `CLOCK_MONOTONIC` is 4 where Linux
+/// uses 1, the CPU-time clocks are renumbered, and FreeBSD's `CLOCK_VIRTUAL`
+/// (1) and `CLOCK_PROF` (2), the process's user time and its user plus
+/// system time, are Linux's `CLOCK_MONOTONIC` and `CLOCK_PROCESS_CPUTIME_ID`
+/// by number: a FreeBSD program timing itself with `CLOCK_VIRTUAL` read
+/// the uptime. They are Linux's own CPU clocks of the calling process,
+/// `MAKE_PROCESS_CPUCLOCK(0, CPUCLOCK_VIRT | PROF)`, which are negative ids
+/// (`~0 << 3 | kind`). A number FreeBSD does not define (3, 6, 16 and up) is
+/// `EINVAL`, as its `clock_gettime` answers, rather than whatever Linux
+/// clock happens to sit at that number.
+pub fn clockid_to_linux(bsd: usize) -> LxResult<usize> {
+    /// `MAKE_PROCESS_CPUCLOCK(0, kind)`, read from the register as an `int`.
+    const fn own_process_cpuclock(kind: i32) -> usize {
+        ((!0i32 << 3) | kind) as u32 as usize
+    }
+    const CPUCLOCK_PROF: i32 = 0;
+    const CPUCLOCK_VIRT: i32 = 1;
+    Ok(match bsd {
+        // REALTIME and its _PRECISE(9)/_FAST(10)/SECOND(13) variants.
+        0 | 9 | 10 | 13 => 0,
+        // MONOTONIC(4) and the UPTIME(5,7,8) / MONOTONIC_PRECISE(11)/_FAST(12) family.
+        4 | 5 | 7 | 8 | 11 | 12 => 1,
+        1 => own_process_cpuclock(CPUCLOCK_VIRT), // CLOCK_VIRTUAL
+        2 => own_process_cpuclock(CPUCLOCK_PROF), // CLOCK_PROF
+        15 => 2,                                  // PROCESS_CPUTIME_ID
+        14 => 3,                                  // THREAD_CPUTIME_ID
+        _ => return Err(LxError::EINVAL),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1214,5 +1247,61 @@ mod wait_status_tests {
     fn a_signal_freebsd_lacks_keeps_its_linux_number() {
         assert_eq!(wait_status_to_freebsd(30), 30);
         assert_eq!(wait_status_to_freebsd((30 << 8) | 0x7f), (30 << 8) | 0x7f);
+    }
+}
+
+/// The FreeBSD clock ids, which passed through by number where they had
+/// no entry.
+#[cfg(test)]
+mod clockid_tests {
+    use super::*;
+    use linux_object::time::{clock_gettime_source, ClockSource, CpuClockKind, CpuClockOwner};
+
+    #[test]
+    fn the_wall_and_monotonic_families_map_to_realtime_and_monotonic() {
+        for bsd in [0, 9, 10, 13] {
+            assert_eq!(clockid_to_linux(bsd), Ok(0), "{}", bsd);
+        }
+        for bsd in [4, 5, 7, 8, 11, 12] {
+            assert_eq!(clockid_to_linux(bsd), Ok(1), "{}", bsd);
+        }
+        assert_eq!(clockid_to_linux(15), Ok(2)); // PROCESS_CPUTIME_ID
+        assert_eq!(clockid_to_linux(14), Ok(3)); // THREAD_CPUTIME_ID
+    }
+
+    /// `CLOCK_VIRTUAL` is the process's user time and `CLOCK_PROF` its user
+    /// plus system time. They used to reach `sys_clock_gettime` as 1 and 2:
+    /// the uptime, and (once that clock could be read) the scheduler's count.
+    #[test]
+    fn virtual_and_prof_are_the_callers_own_cpu_clocks() {
+        let virt = clockid_to_linux(1).unwrap();
+        let prof = clockid_to_linux(2).unwrap();
+        assert_eq!(
+            virt as u32 as i32, -7,
+            "MAKE_PROCESS_CPUCLOCK(0, CPUCLOCK_VIRT)"
+        );
+        assert_eq!(
+            prof as u32 as i32, -8,
+            "MAKE_PROCESS_CPUCLOCK(0, CPUCLOCK_PROF)"
+        );
+        for (id, kind) in [(virt, CpuClockKind::Virt), (prof, CpuClockKind::Prof)] {
+            match clock_gettime_source(id) {
+                Ok(ClockSource::Cpu(cpu)) => {
+                    assert_eq!(cpu.owner, CpuClockOwner::Process(0));
+                    assert_eq!(cpu.kind, kind);
+                }
+                other => panic!("{:#x} reads {:?}", id, other),
+            }
+        }
+    }
+
+    /// The holes in FreeBSD's table (3 and 6) and everything past its end
+    /// are `EINVAL`, not the Linux clock that shares the number: 3 was
+    /// `CLOCK_THREAD_CPUTIME_ID` and 6 `CLOCK_MONOTONIC_COARSE`.
+    #[test]
+    fn a_number_freebsd_does_not_define_is_einval() {
+        for bsd in [3, 6, 16, 17, 99, usize::MAX] {
+            assert_eq!(clockid_to_linux(bsd), Err(LxError::EINVAL), "{}", bsd);
+        }
     }
 }
