@@ -27,6 +27,13 @@ pub const SDT_HEADER_LEN: usize = 36;
 /// and the 32-bit `RsdtAddress`.
 pub const RSDP_V1_LEN: usize = 20;
 
+/// The `RSDP` as ACPI 2.0 extended it: the 1.0 part plus a length, the 64-bit
+/// `XsdtAddress` and an extended checksum.
+///
+/// Only worth reading once [`rsdp_revision`] has said so, which is why it is a
+/// separate number from [`RSDP_V1_LEN`].
+pub const RSDP_V2_LEN: usize = 36;
+
 /// Offsets within the `RSDP`.
 mod rsdp {
     pub const SIGNATURE: usize = 0;
@@ -89,6 +96,24 @@ pub struct SdtPointer {
     pub wide: bool,
 }
 
+/// The revision an `RSDP` declares, once its signature and its ACPI 1.0
+/// checksum hold.
+///
+/// `None` means these bytes are not an `RSDP`, so nothing beyond them should be
+/// read at all. Asking this with the [`RSDP_V1_LEN`] bytes ACPI 1.0 defines is
+/// what lets a caller read the extended part **only** when the answer is 2 or
+/// more, instead of dereferencing sixteen bytes it has no reason to believe are
+/// there.
+pub fn rsdp_revision(rsdp: &[u8]) -> Option<u8> {
+    if rsdp.get(rsdp::SIGNATURE..8)? != b"RSD PTR " {
+        return None;
+    }
+    if !checksum_ok(rsdp.get(..RSDP_V1_LEN)?) {
+        return None;
+    }
+    Some(*rsdp.get(rsdp::REVISION)?)
+}
+
 /// Validate an `RSDP` and say which system description table it names.
 ///
 /// Revision 2 and above carry a second length and a second checksum over the
@@ -96,24 +121,28 @@ pub struct SdtPointer {
 /// bytes are checked either way. A revision-2 `RSDP` whose `XsdtAddress` is
 /// zero falls back to the 32-bit `RsdtAddress`, which is what firmware that
 /// fills in only one of them expects.
+///
+/// A slice of only [`RSDP_V1_LEN`] bytes is fine: every read past it is bounds
+/// checked, so a revision-2 `RSDP` handed over short simply falls back to its
+/// `RsdtAddress`.
 pub fn rsdp_sdt(rsdp: &[u8]) -> Option<SdtPointer> {
-    if rsdp.get(rsdp::SIGNATURE..8)? != b"RSD PTR " {
-        return None;
-    }
-    if !checksum_ok(rsdp.get(..RSDP_V1_LEN)?) {
-        return None;
-    }
-    let revision = *rsdp.get(rsdp::REVISION)?;
+    let revision = rsdp_revision(rsdp)?;
     if revision >= 2 {
-        let len = u32_at(rsdp, rsdp::LENGTH)? as usize;
-        // The extended checksum covers `length` bytes, and a length that does
-        // not even reach the field it was read from is firmware talking
-        // nonsense, not a table.
-        if len >= rsdp::XSDT_ADDRESS + 8 && checksum_ok(rsdp.get(..len)?) {
-            let phys = u64_at(rsdp, rsdp::XSDT_ADDRESS)?;
-            if phys != 0 {
-                return Some(SdtPointer { phys, wide: true });
-            }
+        // Every read of the extended part is optional rather than fatal: the
+        // extended checksum covers `length` bytes, and a length that does not
+        // even reach the field it was read from is firmware talking nonsense,
+        // not a table. A caller holding only the ACPI 1.0 bytes lands in the
+        // same place -- the 32-bit `RsdtAddress` below -- instead of being
+        // refused outright or having its slice read past.
+        let wide = u32_at(rsdp, rsdp::LENGTH)
+            .map(|len| len as usize)
+            .filter(|len| *len >= rsdp::XSDT_ADDRESS + 8)
+            .and_then(|len| rsdp.get(..len))
+            .filter(|bytes| checksum_ok(bytes))
+            .and_then(|_| u64_at(rsdp, rsdp::XSDT_ADDRESS))
+            .filter(|phys| *phys != 0);
+        if let Some(phys) = wide {
+            return Some(SdtPointer { phys, wide: true });
         }
     }
     let phys = u32_at(rsdp, rsdp::RSDT_ADDRESS)? as u64;
@@ -127,6 +156,12 @@ pub fn rsdp_sdt(rsdp: &[u8]) -> Option<SdtPointer> {
 /// the header first, then maps this many bytes -- so a length that is not
 /// checked here is a length that decides how much memory gets read.
 pub fn table_length(header: &[u8]) -> Option<usize> {
+    // A whole header, not just the four bytes the length field needs: the
+    // caller is about to map `len` bytes on the strength of this answer, and a
+    // slice too short to hold a header is not a table to take a length from.
+    if header.len() < SDT_HEADER_LEN {
+        return None;
+    }
     let len = u32_at(header, 4)? as usize;
     (SDT_HEADER_LEN..=0x10000).contains(&len).then_some(len)
 }
@@ -341,14 +376,69 @@ mod tests {
         );
     }
 
+    #[test]
+    fn the_revision_can_be_had_from_the_twenty_bytes_acpi_one_defined() {
+        // The point of asking separately: a caller holding only the ACPI 1.0
+        // RSDP can find out whether the extended part is worth reading, without
+        // dereferencing it to find out.
+        let v1 = rsdp_v1(0x1000);
+        assert_eq!(v1.len(), RSDP_V1_LEN);
+        assert_eq!(rsdp_revision(&v1), Some(0));
+
+        let v2 = rsdp_v2(0x1000, 0x2000);
+        assert_eq!(v2.len(), RSDP_V2_LEN);
+        assert_eq!(rsdp_revision(&v2[..RSDP_V1_LEN]), Some(2));
+    }
+
+    #[test]
+    fn the_revision_is_refused_by_whatever_refuses_the_rsdp() {
+        let mut bad_sig = rsdp_v1(0x1000);
+        bad_sig[0] = b'X';
+        assert_eq!(rsdp_revision(&bad_sig), None);
+
+        let mut bad_sum = rsdp_v1(0x1000);
+        bad_sum[8] = bad_sum[8].wrapping_add(1);
+        assert_eq!(rsdp_revision(&bad_sum), None);
+
+        let short = rsdp_v1(0x1000);
+        assert_eq!(rsdp_revision(&short[..RSDP_V1_LEN - 1]), None);
+    }
+
+    #[test]
+    fn a_wide_rsdp_handed_over_short_falls_back_instead_of_reading_past_it() {
+        // What the caller does when the revision says 2: it goes back and reads
+        // the other sixteen bytes. If it did not, the walk still has to be
+        // sound, and soundness here means the 32-bit RsdtAddress, never a
+        // half-read XsdtAddress.
+        let v2 = rsdp_v2(0x1000, 0x2000);
+        let short = rsdp_sdt(&v2[..RSDP_V1_LEN]).unwrap();
+        assert_eq!((short.phys, short.wide), (0x1000, false));
+        let whole = rsdp_sdt(&v2).unwrap();
+        assert_eq!((whole.phys, whole.wide), (0x2000, true));
+    }
+
     // ── the system description table ────────────────────────────────────────
 
     #[test]
     fn a_table_declares_how_long_it_is() {
         let t = table(b"XSDT", &[0u8; 16]);
         assert_eq!(table_length(&t), Some(SDT_HEADER_LEN + 16));
-        assert_eq!(table_length(&t[..8]), Some(SDT_HEADER_LEN + 16));
-        assert_eq!(table_length(&t[..3]), None);
+        assert_eq!(
+            table_length(&t[..SDT_HEADER_LEN]),
+            Some(SDT_HEADER_LEN + 16)
+        );
+    }
+
+    #[test]
+    fn a_length_is_not_taken_from_fewer_bytes_than_a_header() {
+        // Eight bytes are enough to *read* the length field, which is not the
+        // same as being enough to believe it: the caller maps `len` bytes on
+        // the strength of the answer, so anything shorter than a header is not
+        // a table to take a length from.
+        let t = table(b"XSDT", &[0u8; 16]);
+        for short in [0, 3, 8, SDT_HEADER_LEN - 1] {
+            assert_eq!(table_length(&t[..short]), None, "{short} bytes");
+        }
     }
 
     #[test]

@@ -105,12 +105,27 @@ unsafe fn pm_timer_port_from_fadt(rsdp_pa: usize) -> Option<(u16, bool)> {
     // looked at a checksum or at the `RSDT`/`XSDT` signature -- and what
     // follows an accepted RSDP is a list of physical addresses this function
     // then dereferences, at boot, with no fault handler worth the name.
+    // `'static` is the truth here and not a shortcut: `phys_to_virt` lands in
+    // the kernel's permanent direct map of physical memory, which is set up
+    // before this runs and never torn down. None of these slices leave this
+    // function -- every `acpi_tables` call below returns an owned value -- so
+    // the lifetime is an honest statement about the mapping, not a claim about
+    // the firmware tables.
     let at = |pa: u64, len: usize| -> &'static [u8] {
         core::slice::from_raw_parts(crate::mem::phys_to_virt(pa as usize) as *const u8, len)
     };
-    // 36 bytes: an ACPI 2.0 RSDP in full. `rsdp_sdt` checks the signature and
-    // both checksums before any of it is believed.
-    let sdt_ptr = acpi::rsdp_sdt(at(rsdp_pa as u64, 36))?;
+    // Twenty bytes first: an ACPI 1.0 RSDP in full, and all `rsdp_revision`
+    // needs to check the signature and the checksum. The sixteen further bytes
+    // that hold the 64-bit XSDT pointer are only read once the revision says
+    // they are there -- the same "do not dereference more than you have reason
+    // to" this whole function is about.
+    let head = at(rsdp_pa as u64, acpi::RSDP_V1_LEN);
+    let whole = if acpi::rsdp_revision(head)? >= 2 {
+        at(rsdp_pa as u64, acpi::RSDP_V2_LEN)
+    } else {
+        head
+    };
+    let sdt_ptr = acpi::rsdp_sdt(whole)?;
     let len = acpi::table_length(at(sdt_ptr.phys, acpi::SDT_HEADER_LEN))?;
     let sdt = at(sdt_ptr.phys, len);
     if !acpi::table_is(sdt, if sdt_ptr.wide { b"XSDT" } else { b"RSDT" }) {
@@ -119,16 +134,24 @@ unsafe fn pm_timer_port_from_fadt(rsdp_pa: usize) -> Option<(u16, bool)> {
     }
     for pa in acpi::sdt_entries(sdt, sdt_ptr.wide) {
         let header = at(pa, acpi::SDT_HEADER_LEN);
-        if &header[..4] != b"FACP" {
+        if header.get(..4) != Some(&b"FACP"[..]) {
             continue;
         }
-        let len = acpi::table_length(header)?;
+        // One bad FACP does not end the walk. Firmware can list more than one,
+        // and the entry we just read is only as trustworthy as the table that
+        // named it: giving up on the first that does not check out would let a
+        // single corrupt entry hide a sound FADT further down the list.
+        let Some(len) = acpi::table_length(header) else {
+            continue;
+        };
         let fadt = at(pa, len);
         if !acpi::table_is(fadt, b"FACP") {
-            crate::klog_warn!("[acpi] the FADT does not check out; not calibrating against it");
-            return None;
+            crate::klog_warn!("[acpi] a FADT does not check out; looking for another");
+            continue;
         }
-        return acpi::pm_timer_from_fadt(fadt);
+        if let Some(pm) = acpi::pm_timer_from_fadt(fadt) {
+            return Some(pm);
+        }
     }
     None
 }
