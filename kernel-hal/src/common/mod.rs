@@ -16,6 +16,7 @@ pub mod deadline;
 pub mod dma_pin;
 pub mod dma_quarantine;
 pub mod fault_slots;
+pub mod guard_band;
 pub mod ipi;
 pub mod kaddr;
 pub mod kstats;
