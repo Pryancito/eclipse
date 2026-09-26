@@ -450,6 +450,28 @@ impl Syscall<'_> {
             };
             let metadata = inode.metadata()?;
             open_resolved_type(flags, metadata.type_)?;
+            // `may_open`: `case S_IFBLK: case S_IFCHR: if (!may_open_dev(path))
+            // return -EACCES;`. Here, because every branch above funnels through
+            // this line, so one check covers all of them.
+            //
+            // `/tmp`, `/run` and `/dev/shm` are mounted `nodev` and have said so
+            // in `/proc/mounts` all along, while a device node `mknod`ed there
+            // opened perfectly well. `/dev` itself is deliberately not `nodev` --
+            // it is where the nodes live -- and `/dev/pts` is a plain directory
+            // rather than a mount, so a pty slave answers to `/dev`.
+            //
+            // The type test comes first and short-circuits: an ordinary file
+            // open pays one comparison, not a mount-table lock and a path
+            // allocation.
+            if nodev_applies_to(metadata.type_)
+                && linux_object::fs::path_is_nodev(
+                    &proc
+                        .get_absolute_path(dir_fd, path)
+                        .unwrap_or_else(|_| String::from(path)),
+                )
+            {
+                return Err(LxError::EACCES);
+            }
             // `may_open`: "O_NOATIME can only be set by the owner or
             // superuser", after the permission checks.
             if flags.contains(OpenFlags::NOATIME) {
@@ -1366,6 +1388,17 @@ mod perf_attr_size_tests {
 /// That `O_DIRECTORY` goes first matters for the one case where two of them
 /// apply at once: a symbolic link opened with `O_DIRECTORY` is `ENOTDIR`, not
 /// `ELOOP`, because it is not a directory whatever it points at.
+/// Which file types the `nodev` mount option is about.
+///
+/// `may_open`'s switch names `S_IFBLK` and `S_IFCHR` and nothing else. The set
+/// is narrow on purpose and worth pinning, because the mounts that carry
+/// `nodev` -- `/tmp`, `/run`, `/dev/shm` -- are exactly where FIFOs and Unix
+/// sockets live: a `NamedPipe` or a `Socket` added to this list would stop
+/// every one of them opening, on the mounts where they are most used.
+pub(crate) fn nodev_applies_to(type_: FileType) -> bool {
+    matches!(type_, FileType::CharDevice | FileType::BlockDevice)
+}
+
 pub(crate) fn open_resolved_type(flags: OpenFlags, type_: FileType) -> Result<(), LxError> {
     // `do_open`: `if (open_flag & O_CREAT) { ... if (d_is_dir(dentry))
     // return -EISDIR; }`, ahead of the `O_DIRECTORY` test. An `O_CREAT`
@@ -1434,6 +1467,31 @@ mod open_flag_tests {
             (OpenFlags::SYNC, 0o4010000),
         ] {
             assert_eq!(flag.bits(), value, "{flag:?}");
+        }
+    }
+
+    #[test]
+    /// `nodev` is about device nodes and nothing else.
+    ///
+    /// `may_open`'s switch names `S_IFBLK` and `S_IFCHR`. The mounts that carry
+    /// `nodev` here -- `/tmp`, `/run`, `/dev/shm` -- are precisely where FIFOs
+    /// and Unix sockets live, so a type added to this set does not fail
+    /// somewhere obscure: it stops the desktop's own sockets opening.
+    fn nodev_is_about_device_nodes_and_nothing_else() {
+        assert!(nodev_applies_to(FileType::CharDevice));
+        assert!(nodev_applies_to(FileType::BlockDevice));
+        for other in [
+            FileType::File,
+            FileType::Dir,
+            FileType::SymLink,
+            FileType::NamedPipe,
+            FileType::Socket,
+        ] {
+            assert!(
+                !nodev_applies_to(other),
+                "{:?} is not a device node; a nodev mount must still open it",
+                other
+            );
         }
     }
 

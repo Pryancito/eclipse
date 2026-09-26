@@ -72,22 +72,33 @@ pub fn boot_options() -> BootOptions {
     }
 }
 
-#[cfg_attr(all(feature = "linux", feature = "zircon"), allow(dead_code))]
-fn check_exit_code(proc: Arc<Process>) -> i32 {
-    let raw = proc.exit_code();
-    // A NEGATIVE code is "killed by signal `-raw`" (see
-    // `linux_object::process::exit_code_killed_by`): the sign is how the
-    // process object says which of the two ways it finished, because every
-    // real exit code is a byte. What a PROCESS EXIT STATUS should carry for
-    // that is `128 + n` -- the shell convention -- and this function's
-    // return value is exactly that: what the libos build exits with, and
-    // what the CI reads. `-1` stays as it was: it means no code at all.
+/// The process exit status a raw [`Process::exit_code`] maps to.
+///
+/// A NEGATIVE code is "killed by signal `-raw`" (see
+/// `linux_object::process::exit_code_killed_by`): the sign is how the process
+/// object says which of the two ways it finished, because every real exit code
+/// is a byte. What a PROCESS EXIT STATUS should carry for that is `128 + n` --
+/// the shell convention -- and this is what the libos build exits with, and
+/// what the CI reads. `-1` means no code at all: the process has not exited.
+///
+/// `saturating_*` throughout, not because either bound is reachable today
+/// (`exit_code_killed_by` takes a `u8` and an exit code comes from an `i32`)
+/// but because this maps a value from another crate's public API: an `i64`
+/// whose extremes would otherwise panic the kernel's own shutdown path in a
+/// debug build, and wrap in a release one. A saturating bound is a wrong
+/// number; an overflow here is no number at all.
+fn exit_status(raw: Option<i64>) -> i32 {
     let code = match raw {
-        // No code at all: the process has not exited.
         None => -1,
-        Some(sig) if sig < 0 => 128 - sig,
+        Some(sig) if sig < 0 => 128i64.saturating_sub(sig),
         Some(code) => code,
     };
+    code.clamp(i32::MIN as i64, i32::MAX as i64) as i32
+}
+
+#[cfg_attr(all(feature = "linux", feature = "zircon"), allow(dead_code))]
+fn check_exit_code(proc: Arc<Process>) -> i32 {
+    let code = exit_status(proc.exit_code());
     if code != 0 {
         error!(
             "process {:?}({}) exited with code {:?}",
@@ -102,7 +113,7 @@ fn check_exit_code(proc: Arc<Process>) -> i32 {
             proc.id()
         )
     }
-    code as i32
+    code
 }
 
 #[cfg(feature = "libos")]
@@ -281,3 +292,61 @@ pub fn mock_disk() -> ! {
 //     let _r = nvme_block.read_block(1, &mut read_buf);
 //     warn!("read_buf: {:?}", read_buf);
 // }
+
+/// The exit status the libos build returns to the shell, which is what the CI
+/// reads to decide whether a run passed.
+#[cfg(test)]
+mod exit_status_tests {
+    use super::exit_status;
+
+    #[test]
+    fn a_process_that_has_not_exited_has_no_status() {
+        assert_eq!(exit_status(None), -1);
+    }
+
+    #[test]
+    fn an_ordinary_exit_code_passes_through() {
+        for code in [0i64, 1, 42, 127, 255] {
+            assert_eq!(exit_status(Some(code)), code as i32);
+        }
+    }
+
+    /// The sign is how the process object says WHICH of the two ways it
+    /// finished, and the shell convention for "killed by signal n" is `128 + n`.
+    /// `linux_object::process::exit_code_killed_by` stores `-n`.
+    #[test]
+    fn a_process_killed_by_a_signal_reports_the_shell_convention() {
+        assert_eq!(exit_status(Some(-9)), 137, "SIGKILL is 128 + 9");
+        assert_eq!(exit_status(Some(-11)), 139, "SIGSEGV is 128 + 11");
+        assert_eq!(exit_status(Some(-1)), 129);
+        assert_eq!(exit_status(Some(-64)), 192, "the highest real-time signal");
+    }
+
+    /// The two halves must not collide: a program that really calls `exit(137)`
+    /// is not a process killed by SIGKILL, and the kernel already went to the
+    /// trouble of keeping them apart (see `exit_code_killed_by`'s own comment).
+    /// What this function does is join them back together for the shell, so the
+    /// only thing left to pin is that a signal cannot be mistaken for `None`.
+    #[test]
+    fn no_signal_maps_onto_the_no_status_answer() {
+        for sig in 1i64..=255 {
+            assert_ne!(
+                exit_status(Some(-sig)),
+                -1,
+                "signal {sig} collided with 'has not exited'"
+            );
+        }
+    }
+
+    /// `exit_code()` is another crate's `i64`, and `128 - i64::MIN` panics in a
+    /// debug build and wraps in a release one. Neither extreme is reachable
+    /// today -- a signal is a `u8`, an exit code an `i32` -- so this pins that
+    /// the shutdown path answers with a number either way rather than taking
+    /// the kernel down on its way out.
+    #[test]
+    fn an_absurd_raw_code_saturates_instead_of_overflowing() {
+        assert_eq!(exit_status(Some(i64::MIN)), i32::MAX);
+        assert_eq!(exit_status(Some(i64::MAX)), i32::MAX);
+        assert_eq!(exit_status(Some(i32::MAX as i64 + 1)), i32::MAX);
+    }
+}

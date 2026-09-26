@@ -2,7 +2,13 @@
 #![cfg_attr(not(feature = "libos"), feature(alloc_error_handler))]
 #![deny(warnings)]
 #![allow(unexpected_cfgs)]
-#![no_main]
+#![cfg_attr(not(test), no_main)]
+// Under `cfg(test)` the harness owns `main`, so the kernel entry point is gated
+// out and *everything it reaches* -- the frame allocator, the logger, the klog
+// ring, `primary_main` itself -- has no caller left. That is 39 dead-code
+// errors under `#![deny(warnings)]`, none of which means anything: the code is
+// reachable in every build that actually boots. The deny still holds there.
+#![cfg_attr(test, allow(dead_code, unused_imports))]
 
 use core::sync::atomic::{AtomicBool, Ordering};
 

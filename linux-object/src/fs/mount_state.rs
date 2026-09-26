@@ -52,6 +52,25 @@ pub struct MountState {
     /// recording: a flag that reaches `/proc/mounts` and nothing else tells a
     /// program it is protected when it is not.
     nosuid: Mutex<bool>,
+    /// `MS_NOEXEC`: nothing on this mount may be executed. Linux asks it as
+    /// `path_noexec()` in `do_open_execat()` and answers `EACCES`.
+    ///
+    /// Recorded for the reason the line above gives. `/proc` and `/sys` have
+    /// said `noexec` in `/proc/mounts` since this kernel first had a
+    /// `/proc/mounts`, and the word did not reach anything: a hardening script
+    /// that remounts a directory `noexec` and checks the line was reading a
+    /// promise nobody had made.
+    noexec: Mutex<bool>,
+    /// `MS_NODEV`: a character or block device node on this mount cannot be
+    /// opened. Linux asks it as `may_open_dev()` from `may_open()` and answers
+    /// `EACCES`.
+    ///
+    /// The same story: `/tmp`, `/run` and `/dev/shm` are all `nodev` in
+    /// `/proc/mounts`, so a `mknod` there followed by an open was refused on
+    /// every other Unix and allowed here. `/dev` itself is deliberately NOT
+    /// `nodev` -- it is where the nodes live -- and `/dev/pts` is a plain
+    /// directory rather than a mount, so its slaves answer to `/dev`.
+    nodev: Mutex<bool>,
 }
 
 impl MountState {
@@ -64,6 +83,8 @@ impl MountState {
         Self {
             read_only: Mutex::new(flags_read_only(flags, data)),
             nosuid: Mutex::new(flags_nosuid(flags, data)),
+            noexec: Mutex::new(flags_noexec(flags, data)),
+            nodev: Mutex::new(flags_nodev(flags, data)),
         }
     }
 
@@ -84,6 +105,24 @@ impl MountState {
         *self.nosuid.lock() = nosuid;
     }
 
+    /// Whether `execve` must refuse an image here.
+    pub fn is_noexec(&self) -> bool {
+        *self.noexec.lock()
+    }
+
+    pub fn set_noexec(&self, noexec: bool) {
+        *self.noexec.lock() = noexec;
+    }
+
+    /// Whether `open` must refuse a device node here.
+    pub fn is_nodev(&self) -> bool {
+        *self.nodev.lock()
+    }
+
+    pub fn set_nodev(&self, nodev: bool) {
+        *self.nodev.lock() = nodev;
+    }
+
     /// Adopt a new set of options, the way `do_remount()` does: the flags it
     /// is given REPLACE what the mount had, which is why `mount -o remount`
     /// reads the current line out of `/proc/mounts` and passes the whole set
@@ -92,6 +131,8 @@ impl MountState {
     pub fn apply_options(&self, flags: usize, data: &str) {
         self.set_read_only(flags_read_only(flags, data));
         self.set_nosuid(flags_nosuid(flags, data));
+        self.set_noexec(flags_noexec(flags, data));
+        self.set_nodev(flags_nodev(flags, data));
     }
 }
 
@@ -110,6 +151,22 @@ pub fn flags_nosuid(flags: usize, data: &str) -> bool {
         return true;
     }
     parse_option_flag(data, "nosuid")
+}
+
+/// `MS_NOEXEC`, from the flag word or from an `-o noexec` in the data string.
+pub fn flags_noexec(flags: usize, data: &str) -> bool {
+    if flags & MS_NOEXEC != 0 {
+        return true;
+    }
+    parse_option_flag(data, "noexec")
+}
+
+/// `MS_NODEV`, from the flag word or from an `-o nodev` in the data string.
+pub fn flags_nodev(flags: usize, data: &str) -> bool {
+    if flags & MS_NODEV != 0 {
+        return true;
+    }
+    parse_option_flag(data, "nodev")
 }
 
 pub fn parse_option_flag(data: &str, key: &str) -> bool {
@@ -134,13 +191,19 @@ pub fn build_options_string(flags: usize, data: &str) -> alloc::string::String {
     } else {
         String::from("rw")
     };
-    if flags & MS_NOSUID != 0 {
+    // Through the same `flags_*` predicates the behaviour is read from, not off
+    // the flag bit alone: `mount -o nodev` puts the word in `data` and no bit in
+    // `flags`, so the bit tests that used to be here printed `nodev` only for
+    // half the ways of asking for it -- and the line reached `/proc/mounts`
+    // anyway, because `data` is appended whole below. One question, one answer,
+    // which is the rule [`MountState::from_options`] already states.
+    if flags_nosuid(flags, data) {
         opts.push_str(",nosuid");
     }
-    if flags & MS_NODEV != 0 {
+    if flags_nodev(flags, data) {
         opts.push_str(",nodev");
     }
-    if flags & MS_NOEXEC != 0 {
+    if flags_noexec(flags, data) {
         opts.push_str(",noexec");
     }
     if flags & MS_BIND != 0 {
@@ -231,25 +294,34 @@ mod mount_option_tests {
             (MS_RDONLY | MS_NOSUID, ""),
             (0, "ro,nosuid,nodev"),
             (MS_NOSUID, "ro"),
+            (MS_NOEXEC, ""),
+            (0, "noexec"),
+            (MS_NODEV, ""),
+            (0, "nodev"),
+            (MS_NOSUID | MS_NODEV | MS_NOEXEC, "relatime"),
+            (0, "rw,nosuid,nodev,noexec,relatime"),
         ] {
             let state = MountState::from_options(flags, data);
             let line = build_options_string(flags, data);
-            assert_eq!(
-                state.is_nosuid(),
-                line.split(',').any(|o| o == "nosuid"),
-                "state and line disagree for ({:#x}, {:?}): {:?}",
-                flags,
-                data,
-                line
-            );
-            assert_eq!(
-                state.is_read_only(),
-                line.split(',').any(|o| o == "ro"),
-                "state and line disagree for ({:#x}, {:?}): {:?}",
-                flags,
-                data,
-                line
-            );
+            // Every option the state carries, not just the two it started
+            // with: `nodev` and `noexec` were printed and never recorded, so
+            // this loop passed while the line promised what nothing enforced.
+            for (word, held) in [
+                ("ro", state.is_read_only()),
+                ("nosuid", state.is_nosuid()),
+                ("noexec", state.is_noexec()),
+                ("nodev", state.is_nodev()),
+            ] {
+                assert_eq!(
+                    held,
+                    line.split(',').any(|o| o == word),
+                    "state and line disagree about {} for ({:#x}, {:?}): {:?}",
+                    word,
+                    flags,
+                    data,
+                    line
+                );
+            }
         }
     }
 
@@ -303,6 +375,93 @@ mod mount_option_tests {
         state.apply_options(0, "ro,nosuid");
         assert!(state.is_nosuid());
         assert!(state.is_read_only());
+    }
+
+    #[test]
+    /// `noexec` and `nodev` were parsed, printed and asked of nobody.
+    ///
+    /// `/proc` and `/sys` are registered `rw,nosuid,nodev,noexec,relatime` and
+    /// have said exactly that in `/proc/mounts` since this kernel first had
+    /// one; `/tmp`, `/run` and `/dev/shm` are registered `nodev`. Executing out
+    /// of `/proc` worked, and a device node `mknod`ed in `/tmp` opened, because
+    /// the only thing either word reached was the string.
+    fn the_two_options_that_only_reached_proc_mounts() {
+        let pseudo = MountState::from_options(0, "rw,nosuid,nodev,noexec,relatime");
+        assert!(pseudo.is_noexec(), "noexec did not reach the state");
+        assert!(pseudo.is_nodev(), "nodev did not reach the state");
+        assert!(pseudo.is_nosuid());
+        assert!(!pseudo.is_read_only());
+
+        // And `/dev`, which must NOT be `nodev`: it is where the nodes live.
+        let dev = MountState::from_options(0, "rw,nosuid");
+        assert!(!dev.is_nodev(), "/dev would refuse every device node");
+        assert!(!dev.is_noexec());
+    }
+
+    #[test]
+    /// Either spelling, like `ro` and `nosuid`: a program types the option one
+    /// way or the other, and `mount -o nodev` puts the word in the data string
+    /// with no bit in the flag word at all.
+    fn noexec_and_nodev_can_be_asked_for_either_way() {
+        assert!(flags_noexec(MS_NOEXEC, ""));
+        assert!(flags_noexec(0, "noexec"));
+        assert!(flags_noexec(0, "rw,nosuid,noexec,relatime"));
+        assert!(!flags_noexec(0, "rw,nosuid"));
+        assert!(!flags_noexec(0, ""));
+
+        assert!(flags_nodev(MS_NODEV, ""));
+        assert!(flags_nodev(0, "nodev"));
+        assert!(flags_nodev(0, "rw,nosuid,nodev,relatime"));
+        assert!(!flags_nodev(0, "rw,nosuid"));
+    }
+
+    #[test]
+    /// And a word that merely contains one is not one. `/proc/mounts` is a
+    /// comma-separated list and the option is a whole element of it.
+    fn a_word_that_merely_contains_the_option_is_not_the_option() {
+        for data in ["noexecute", "xnoexec", "no-exec", "nodevice", "xnodev"] {
+            assert!(!flags_noexec(0, data), "{:?} read as noexec", data);
+            assert!(!flags_nodev(0, data), "{:?} read as nodev", data);
+        }
+    }
+
+    #[test]
+    /// A remount moves all four together. One left behind is a mount doing
+    /// something its own line no longer says.
+    fn a_remount_moves_the_new_options_too() {
+        let state = MountState::from_options(MS_NOEXEC | MS_NODEV, "");
+        assert!(state.is_noexec());
+        assert!(state.is_nodev());
+        state.apply_options(0, "rw");
+        assert!(!state.is_noexec(), "noexec outlived the remount");
+        assert!(!state.is_nodev(), "nodev outlived the remount");
+        state.apply_options(0, "noexec,nodev");
+        assert!(state.is_noexec());
+        assert!(state.is_nodev());
+        // One at a time, because moving them together is a weaker statement:
+        // a remount that wired both to the same question would pass every
+        // assertion above and still be wrong.
+        state.apply_options(0, "noexec");
+        assert!(state.is_noexec());
+        assert!(!state.is_nodev(), "nodev followed noexec");
+        state.apply_options(MS_NODEV, "");
+        assert!(!state.is_noexec(), "noexec followed nodev");
+        assert!(state.is_nodev());
+    }
+
+    #[test]
+    /// The line says each of them once, whichever way they were asked for.
+    fn the_options_line_says_the_new_options_once() {
+        assert_eq!(build_options_string(MS_NOEXEC, "noexec"), "rw,noexec");
+        assert_eq!(build_options_string(MS_NODEV, "nodev"), "rw,nodev");
+        assert_eq!(
+            build_options_string(0, "rw,nosuid,nodev,noexec,relatime"),
+            "rw,nosuid,nodev,noexec,relatime"
+        );
+        assert_eq!(
+            build_options_string(MS_NOSUID | MS_NODEV | MS_NOEXEC, "relatime"),
+            "rw,nosuid,nodev,noexec,relatime"
+        );
     }
 
     #[test]

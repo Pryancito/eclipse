@@ -10,7 +10,7 @@ default-run = "zcore"
 [[bin]]
 # Disable cargo test, bench and doc for this package
 name = "zcore"
-test = false
+test = true
 bench = false
 doc = false
 
