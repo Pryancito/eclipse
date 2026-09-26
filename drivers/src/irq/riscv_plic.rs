@@ -181,16 +181,6 @@ impl Scheme for Plic {
             trace!("riscv plic handle irq: {}", irq_num);
             // The vtable and heap-smash gates live in `run_irq_handler`, once,
             // for all three architectures.
-            // And for whoever mutates this next: widening the pattern to any
-            // error survives the suite, because no test in this process can
-            // reach the other two errors. Tripping either gate latches
-            // `heap_smash_suspected`, which is per-CPU, has no reset, and on the
-            // host resolves to slot 0 for the whole binary -- so the test that
-            // tripped it would silently stop every later test's handler from
-            // running. It is a real difference in the kernel: a handler that is
-            // registered and healthy, refused because the heap is suspect, would
-            // have its source dropped to priority 0 and be lost for the rest of
-            // the boot.
             if let Err(DeviceError::InvalidParam) = run_irq_handler(irq_num, handler) {
                 warn!("no registered handler for IRQ {}!", irq_num);
                 // Silence it: priority 0 is "never interrupt". `irq_num` came
@@ -517,6 +507,32 @@ mod plic_tests {
         fake.offer(0, 5);
         plic.handle_irq(0);
         assert_eq!(fake.priority(5), 0, "the source was left interrupting");
+    }
+
+    #[test]
+    fn a_handler_refused_because_the_heap_is_suspect_does_not_lose_its_source() {
+        // "Nothing registered" and "registered but refused" are different
+        // answers and only the first earns priority 0. Dropping the priority of
+        // a live device because this hart has seen corruption somewhere else
+        // would lose that device for the rest of the boot, on top of the
+        // interrupt that was already skipped.
+        let _hart = OnHart::new(0);
+        let _gate = crate::utils::fat_ptr::GateForTest::new();
+        let mut fake = Fake::new();
+        let plic = fake.plic();
+        let (handler, hits) = counting();
+        plic.register_handler(9, handler).unwrap();
+        assert_eq!(fake.priority(9), 7);
+
+        crate::utils::fat_ptr::note_heap_smash_suspected();
+        fake.offer(0, 9);
+        plic.handle_irq(0);
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            0,
+            "the handler was called through after a smash"
+        );
+        assert_eq!(fake.priority(9), 7, "a refused handler lost its source");
     }
 
     #[test]

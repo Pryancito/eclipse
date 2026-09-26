@@ -186,15 +186,6 @@ pub fn run_irq_handler(irq_num: usize, handler: Option<IrqHandler>) -> DeviceRes
     let Some(f) = handler else {
         return Err(DeviceError::InvalidParam);
     };
-    // For whoever mutates this next: **neither gate below can be tested in
-    // process**, and taking either out leaves the whole suite green. Both latch
-    // `fat_ptr::heap_smash_suspected`, which is a per-CPU flag with no reset
-    // that resolves to slot 0 on a hosted build -- so a test that tripped one
-    // would stop every handler in every later test of the same binary, which is
-    // exactly the failure the gate exists to cause on purpose in a kernel that
-    // is already corrupt. `fat_ptr.rs` has no tests of its own either; that is
-    // a vein, not a licence to delete these.
-    //
     // Leaked rather than dropped, here and below: dropping the `Arc` runs its
     // destructor through the same vtable we have just refused to call.
     if super::fat_ptr::heap_smash_suspected() {
@@ -421,6 +412,51 @@ mod irq_manager_tests {
             let (third, _) = counting();
             assert!(mgr.register_handler(0, third).is_ok());
         }
+    }
+
+    #[test]
+    fn a_handler_is_not_called_through_once_the_heap_is_suspect() {
+        // The gate this file inherited from `x86_apic` and the other two
+        // architectures did not have. A handler that is perfectly healthy is
+        // still not dispatched on a CPU that has already seen corruption:
+        // continuing is how a second fault cascades inside the same pass.
+        let _gate = super::super::fat_ptr::GateForTest::new();
+        let (handler, hits) = counting();
+        super::super::fat_ptr::note_heap_smash_suspected();
+        assert!(matches!(
+            run_irq_handler(1, Some(handler)),
+            Err(DeviceError::NotSupported)
+        ));
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+        // And a different error from "nothing registered", which the PLIC acts
+        // on by dropping the source's priority to zero -- doing that here would
+        // lose a working device for the rest of the boot.
+    }
+
+    #[test]
+    fn a_handler_whose_fat_pointer_is_dead_is_leaked_rather_than_called() {
+        // The only way a test can put a smashed handler in front of the gate:
+        // the two words a smash leaves. Nothing ever dereferences it -- the
+        // whole point of the gate is that the value is neither called nor
+        // dropped, and `run_irq_handler` leaks it -- which is also why this is
+        // the one place a transmute is the honest tool.
+        //
+        // The data word has to be non-null, and not because the gate says so:
+        // `Arc` is a `NonNull`, so `Option<IrqHandler>` uses a null data word as
+        // its `None`. A smash that nulls *that* word does not arrive here as a
+        // dead handler at all -- it arrives as "no handler registered", which is
+        // worth knowing, because that is the answer the PLIC acts on by dropping
+        // the source's priority to zero.
+        let _gate = super::super::fat_ptr::GateForTest::new();
+        let dead: IrqHandler = unsafe { core::mem::transmute::<[usize; 2], IrqHandler>([8, 0]) };
+        assert!(matches!(
+            run_irq_handler(1, Some(dead)),
+            Err(DeviceError::NotSupported)
+        ));
+
+        let nulled: Option<IrqHandler> =
+            unsafe { core::mem::transmute::<[usize; 2], Option<IrqHandler>>([0, 8]) };
+        assert!(nulled.is_none(), "a null data word is Option's None");
     }
 
     #[test]
