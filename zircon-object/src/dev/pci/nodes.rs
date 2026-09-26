@@ -1804,6 +1804,10 @@ mod pci_bar_and_config_tests {
     /// disagree.
     use super::super::harness::ConfigSpace;
 
+    /// The kernel object `zx_pci_get_nth_device` hands back, and the thing
+    /// `zx_pci_map_interrupt` is called on. It lives with the bus driver.
+    use super::super::bus::PcieDeviceKObject;
+
     /// A device with nothing but a configuration space behind it: the
     /// identifiers are a real RTX 2060 SUPER (TU106), the card this kernel is
     /// actually run on.
@@ -2730,5 +2734,64 @@ mod pci_bar_and_config_tests {
         assert_eq!(irq.destroy(), Ok(()));
         assert_eq!(space.peek32(0x60), 0xFFFF_FFFB);
         assert!(dev.inner.lock().irq.handlers[2].has_handler());
+    }
+
+    #[test]
+    fn a_vector_past_the_tenth_can_still_be_mapped() {
+        // The other half of the same syscall, on the object userspace holds.
+        // `PcieDeviceKObject::map_interrupt` checked the vector against
+        // `irqs_avail_cnt`, a field every device object was built with as the
+        // number **ten**. A device given sixteen MSI vectors -- which is what
+        // `msi_multi_message_encoding` negotiates -- could not have vectors ten
+        // and up mapped at all: the answer was `INVALID_ARGS` for a vector the
+        // device has, has a handler slot for, and will raise.
+        let mut space = ConfigSpace::new();
+        let dev = device_in_msi_mode(&mut space, 16);
+        let object = PcieDeviceKObject::new(node_of(dev.clone()));
+        let irq = object.map_interrupt(11).expect("vector 11 of 16");
+        assert!(dev.inner.lock().irq.handlers[11].has_handler());
+        assert_eq!(irq.destroy(), Ok(()));
+        // And the device is still the one that says where its vectors stop.
+        assert_eq!(object.map_interrupt(16).err(), Some(ZxError::INVALID_ARGS));
+        assert_eq!(object.map_interrupt(32).err(), Some(ZxError::INVALID_ARGS));
+    }
+
+    #[test]
+    fn a_vector_number_that_is_not_a_vector_number_is_refused() {
+        // `irq` arrives from `zx_pci_map_interrupt` as a signed integer, and
+        // that is the one thing left for this end to check: `-1 as u32` is
+        // vector 4294967295.
+        let mut space = ConfigSpace::new();
+        let dev = device_in_msi_mode(&mut space, 4);
+        let object = PcieDeviceKObject::new(node_of(dev));
+        assert_eq!(object.map_interrupt(-1).err(), Some(ZxError::INVALID_ARGS));
+        assert_eq!(
+            object.map_interrupt(i32::MIN).err(),
+            Some(ZxError::INVALID_ARGS)
+        );
+    }
+
+    #[test]
+    fn a_device_whose_bridge_is_gone_is_left_unlinked_instead_of_panicking() {
+        // `link_device_to_upstream` ran `up.upgrade().unwrap().as_upstream()
+        // .unwrap()`: a `Weak` that may have died and a node that may not be
+        // an upstream. The scan links each device it finds to the bridge above
+        // it, after the device object exists, so a bridge dropped in between
+        // -- a `scan_downstream` that failed and let its bridge go, a teardown
+        // racing the scan -- took the kernel down. This test is the call: a
+        // mutant that puts the `unwrap`s back panics here.
+        let bus = PCIeBusDriver::new();
+        let mut space = ConfigSpace::new();
+        let dev = Arc::new(device_with(space.config()));
+        let dead: Weak<dyn IPciNode> = {
+            let root = PciRoot::new(7, PciIrqSwizzleLut::zeroed(), &bus);
+            Arc::downgrade(&(root as Arc<dyn IPciNode>))
+        };
+        assert!(dead.upgrade().is_none(), "the bridge has to be gone");
+        bus.link_device_to_upstream(node_of(dev.clone()), dead);
+        // The device kept the dead `Weak` it was handed and appears below
+        // nobody, which is what it did before for a live bridge that was not
+        // an upstream.
+        assert!(dev.inner.lock().upstream.upgrade().is_none());
     }
 }
