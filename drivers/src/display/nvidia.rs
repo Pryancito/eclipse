@@ -121,6 +121,35 @@ struct ZombieCtx {
     submits_at_park: u64,
 }
 
+/// A fence that will say a ring has passed everything it had queued when
+/// it was issued (see `ring_idle_probe`): the probe's payload, and how many
+/// entries the ring had put by then. Both are checked: a zombie's park
+/// writes its last payload from the CPU, so a landed payload alone is not
+/// the ring's word that it has consumed its entries.
+#[derive(Clone, Copy)]
+struct RingProbe {
+    ctx_idx: u32,
+    fence_va: usize,
+    payload: u32,
+    entries_put: u64,
+}
+
+/// A GEM object its last holder closed while a ring still had work queued
+/// that may read it. Linux frees a BO only once the fences on its
+/// reservation have signaled (`ttm_bo_release` waits, or defers the
+/// delete); here the close appended a probe to every such ring, and the
+/// object's RM memory and VAS mappings go once each probe has passed, or
+/// once the fence timeout has (a ring that has not moved in that long is
+/// wedged). The handle itself went at the close.
+struct DeferredGemFree {
+    handle: u32,
+    h_memory: u32,
+    size: u64,
+    mappings: Vec<super::nouveau_uapi::NouveauVmMapping>,
+    probes: Vec<RingProbe>,
+    born_us: u64,
+}
+
 /// How many GP entries a direct-submit channel has consumed: everything ever
 /// put, less what still sits between `GPGet` and `GPPut`.
 fn ring_consumed(f: &super::nouveau_uapi::FastCtx) -> u64 {
@@ -922,6 +951,10 @@ pub struct NvidiaGpu {
     /// an ACQUIRE queued on their fence semaphore ([`ZombieCtx`]). Their RM
     /// teardown waits for those channels to pass, or for the fence timeout.
     nouveau_zombies: Mutex<Vec<ZombieCtx>>,
+    /// GEM objects their last holder closed while a ring still had them
+    /// queued: memory and mappings go once every probe has landed
+    /// (`reap_deferred_frees`).
+    nouveau_deferred_frees: Mutex<Vec<DeferredGemFree>>,
     /// Context indices whose RM teardown is in flight: taken out of
     /// `nouveau_pid_ctx` at exit (no late submit routes to them), freed in
     /// the RM tens of milliseconds later, in `release_process_finish`, and
@@ -1342,6 +1375,7 @@ impl NvidiaGpu {
             ),
             nouveau_peer_fence: Mutex::new(alloc::collections::BTreeMap::new()),
             nouveau_zombies: Mutex::new(Vec::new()),
+            nouveau_deferred_frees: Mutex::new(Vec::new()),
             nouveau_ctx_teardown: Mutex::new(Vec::new()),
             kms_framebuffers: Mutex::new(Vec::new()),
             next_kms_fb_id: AtomicU32::new(1),
@@ -7695,6 +7729,8 @@ impl DrmScheme for NvidiaGpu {
     }
 
     fn nouveau_gem_close(&self, handle: u32, owner_pid: u64) -> bool {
+        // A close is where an earlier close's ring may have passed.
+        self.reap_deferred_frees();
         // PRIME share-count gate. A swapchain buffer is referenced by more than
         // one holder at once: the compositor's original GEM_NEW owner plus every
         // PRIME self-import NVK/EGL made of the same buffer (each handed back
@@ -7763,6 +7799,50 @@ impl DrmScheme for NvidiaGpu {
                 dropped_fbs.len(),
                 dropped_fbs
             );
+        }
+        // Linux frees a BO only once the fences on its reservation have
+        // signaled (`ttm_bo_release`): a close by the last holder while a
+        // ring still has the buffer queued -- the compositor's blit of a
+        // client's frame, a pushbuffer its client is done with -- must not
+        // hand the memory back under the GPU, nor unmap it from a VAS the
+        // ring is still translating through. Every ring whose VM maps the
+        // object, and the caller's own, that still has work queued gets a
+        // probe fence (`ring_idle_probe`, as `CPU_PREP` waits); the memory
+        // and the mappings go once those have passed
+        // (`reap_deferred_frees`), the handle went above.
+        let mut pids: Vec<u64> = alloc::vec![owner_pid];
+        pids.extend(
+            self.nouveau_vm_mappings
+                .lock()
+                .iter()
+                .filter(|m| m.gem_handle == handle)
+                .map(|m| m.owner_pid),
+        );
+        pids.sort_unstable();
+        pids.dedup();
+        let probes: Vec<RingProbe> = pids
+            .iter()
+            .filter_map(|&pid| self.ring_idle_probe(pid))
+            .collect();
+        if !probes.is_empty() {
+            let mappings = self.take_vm_mappings(|m| m.gem_handle == handle);
+            log::info!(
+                "[nouveau-uapi] GEM_CLOSE handle={} h_memory={:#010x}: {} ring(s) still have it queued (ctx {:?}); {} mapping(s) and the memory go once they have passed",
+                handle,
+                obj.h_memory,
+                probes.len(),
+                probes.iter().map(|p| p.ctx_idx).collect::<Vec<_>>(),
+                mappings.len()
+            );
+            self.nouveau_deferred_frees.lock().push(DeferredGemFree {
+                handle,
+                h_memory: obj.h_memory,
+                size: obj.size,
+                mappings,
+                probes,
+                born_us: unsafe { crate::bus::drivers_timer_now_as_micros() },
+            });
+            return true;
         }
         // Drain any VM_BIND mappings still referencing this handle BEFORE
         // freeing the backing memory below -- the real nouveau contract
@@ -8507,23 +8587,10 @@ impl NvidiaGpu {
     fn drain_vm_mappings(
         &self,
         context: &str,
-        mut matches: impl FnMut(&super::nouveau_uapi::NouveauVmMapping) -> bool,
+        matches: impl FnMut(&super::nouveau_uapi::NouveauVmMapping) -> bool,
         rm_unmap: bool,
     ) -> usize {
-        let device_instance = *self.rm_device_instance.lock();
-        let stale = {
-            let mut maps = self.nouveau_vm_mappings.lock();
-            let mut drained = Vec::new();
-            let mut i = 0;
-            while i < maps.len() {
-                if matches(&maps[i]) {
-                    drained.push(maps.remove(i));
-                } else {
-                    i += 1;
-                }
-            }
-            drained
-        };
+        let stale = self.take_vm_mappings(matches);
         let drained_count = stale.len();
         if !rm_unmap {
             if drained_count > 0 {
@@ -8535,6 +8602,33 @@ impl NvidiaGpu {
             }
             return drained_count;
         }
+        self.rm_unmap_mappings(context, stale);
+        drained_count
+    }
+
+    /// Take every mapping `matches` out of the table, in order, without
+    /// touching the RM: the caller unmaps them (`rm_unmap_mappings`) now or
+    /// later.
+    fn take_vm_mappings(
+        &self,
+        mut matches: impl FnMut(&super::nouveau_uapi::NouveauVmMapping) -> bool,
+    ) -> Vec<super::nouveau_uapi::NouveauVmMapping> {
+        let mut maps = self.nouveau_vm_mappings.lock();
+        let mut drained = Vec::new();
+        let mut i = 0;
+        while i < maps.len() {
+            if matches(&maps[i]) {
+                drained.push(maps.remove(i));
+            } else {
+                i += 1;
+            }
+        }
+        drained
+    }
+
+    /// Unmap mappings already taken out of the table from the RM's VAS.
+    fn rm_unmap_mappings(&self, context: &str, stale: Vec<super::nouveau_uapi::NouveauVmMapping>) {
+        let device_instance = *self.rm_device_instance.lock();
         for mapping in stale {
             lock::pump();
             let Some(device_instance) = device_instance else {
@@ -8555,7 +8649,6 @@ impl NvidiaGpu {
                 context, mapping.va, mapping.gem_handle, status
             );
         }
-        drained_count
     }
 
     /// Applies a single `VM_BIND` op (`MAP` or `UNMAP`). Factored out so
@@ -9630,6 +9723,41 @@ impl NvidiaGpu {
     fn cpu_prep_wait(&self, owner_pid: u64, nowait: bool) -> Result<usize, i32> {
         use super::nouveau_uapi as nv;
         const CPU_PREP_TIMEOUT_US: u64 = 10_000_000;
+        let Some(probe) = self.ring_idle_probe(owner_pid) else {
+            return Ok(0);
+        };
+        let (ctx_idx, fence_va, payload) = (probe.ctx_idx, probe.fence_va, probe.payload);
+        let start = unsafe { crate::bus::drivers_timer_now_as_micros() };
+        loop {
+            if crate::scheme::syncobj::hw_fence_landed(fence_va, payload) {
+                return Ok(0);
+            }
+            if nowait {
+                return Err(nv::EBUSY);
+            }
+            if unsafe { crate::bus::drivers_timer_now_as_micros() }.wrapping_sub(start)
+                >= CPU_PREP_TIMEOUT_US
+            {
+                crate::klog_warn!(
+                    "[nouveau-uapi] CPU_PREP: ctx{} fence payload {} did not land in {}s -> EBUSY",
+                    ctx_idx,
+                    payload,
+                    CPU_PREP_TIMEOUT_US / 1_000_000
+                );
+                return Err(nv::EBUSY);
+            }
+            gpu_spin();
+        }
+    }
+
+    /// The fence that will say the ring `owner_pid` submits on has passed
+    /// everything it had queued: a probe appended now, or, when the ring is
+    /// full, the last fence it issued (which covers all but an unfenced
+    /// tail). `None` when there is nothing to wait for: no ring, a wedged
+    /// one, or an idle one. What `CPU_PREP` waits on, and what a
+    /// `GEM_CLOSE` with the buffer still queued defers the free behind.
+    fn ring_idle_probe(&self, owner_pid: u64) -> Option<RingProbe> {
+        use super::nouveau_uapi as nv;
         // Resolve the channel this pid submits on WITHOUT defaulting to ctx 0:
         // a client whose own context is not ready yet has queued nothing, and
         // only the compositor (no per-pid entry, owner of the RM channel)
@@ -9666,11 +9794,11 @@ impl NvidiaGpu {
             };
             match entry {
                 Some((ctx, true)) => (ctx, 0),
-                Some((_, false)) => return Ok(0),
+                Some((_, false)) => return None,
                 None => match zombie(owner_pid) {
                     Some(z) => z,
                     None if self.nouveau_owns_rm_channel(owner_pid) => (0, 0),
-                    None => return Ok(0),
+                    None => return None,
                 },
             }
         };
@@ -9683,7 +9811,7 @@ impl NvidiaGpu {
         // timeout per call, on the CPU, and wrote a probe fence into a ring
         // the GPU stopped reading.
         if ctx_idx >= 1 && nv::ctx_is_wedged(ctx_idx) {
-            return Ok(0);
+            return None;
         }
         let queued = match self.nouveau_fast.lock().get(ctx_idx as usize) {
             // Idle when the last thing on the ring is a fence that landed
@@ -9703,11 +9831,11 @@ impl NvidiaGpu {
             _ => false,
         };
         if !queued {
-            return Ok(0);
+            return None;
         }
         let (fence_va, _fence_gpu_va, payload) = match self.fast_submit(ctx_idx, &[], true, &[]) {
             Ok(Some(fence)) => fence,
-            Ok(None) => return Ok(0),
+            Ok(None) => return None,
             Err(_) => {
                 // Ring full or context gone: fall back to the last fence
                 // that was issued, which covers all but a trailing
@@ -9718,31 +9846,20 @@ impl NvidiaGpu {
                         f.buf_gpu_va + f.fence_sem_off as u64,
                         f.next_payload.wrapping_sub(1),
                     ),
-                    _ => return Ok(0),
+                    _ => return None,
                 }
             }
         };
-        let start = unsafe { crate::bus::drivers_timer_now_as_micros() };
-        loop {
-            if crate::scheme::syncobj::hw_fence_landed(fence_va, payload) {
-                return Ok(0);
-            }
-            if nowait {
-                return Err(nv::EBUSY);
-            }
-            if unsafe { crate::bus::drivers_timer_now_as_micros() }.wrapping_sub(start)
-                >= CPU_PREP_TIMEOUT_US
-            {
-                crate::klog_warn!(
-                    "[nouveau-uapi] CPU_PREP: ctx{} fence payload {} did not land in {}s -> EBUSY",
-                    ctx_idx,
-                    payload,
-                    CPU_PREP_TIMEOUT_US / 1_000_000
-                );
-                return Err(nv::EBUSY);
-            }
-            gpu_spin();
-        }
+        let entries_put = match self.nouveau_fast.lock().get(ctx_idx as usize) {
+            Some(FastSlot::Ready(f)) => f.entries_put,
+            _ => 0,
+        };
+        Some(RingProbe {
+            ctx_idx,
+            fence_va,
+            payload,
+            entries_put,
+        })
     }
 
     /// Token/runlist of a prepared context, for the hang probe.
@@ -9917,6 +10034,19 @@ impl NvidiaGpu {
         // touch may take it.
         if let Some(idx) = my_ctx.filter(|&c| c >= 1) {
             self.nouveau_ctx_teardown.lock().retain(|&i| i != idx);
+        }
+        // The VAS went with the context: a closed object still waiting on
+        // this ring (`DeferredGemFree`) keeps its mappings of that VAS, and
+        // unmapping them later would be the same stale-h_virt unmap.
+        if ctx_freed {
+            let dropped = self.forget_deferred_mappings_of(pid);
+            if dropped > 0 {
+                log::info!(
+                    "[nouveau-uapi] process exit pid={}: dropped {} mapping(s) of closed objects still waiting on its ring (VAS freed)",
+                    pid,
+                    dropped
+                );
+            }
         }
         // 3. Drop local VM_BIND bookkeeping. Skip the RM unmap when ctx_free
         //    already destroyed the VAS (a second vm_bind_unmap on a stale
@@ -10261,9 +10391,14 @@ impl NvidiaGpu {
             let gems = rekey_owners(&mut self.nouveau_gem.lock(), pid, tomb, |o| {
                 &mut o.owner_pid
             });
-            let maps = rekey_owners(&mut self.nouveau_vm_mappings.lock(), pid, tomb, |m| {
+            let mut maps = rekey_owners(&mut self.nouveau_vm_mappings.lock(), pid, tomb, |m| {
                 &mut m.owner_pid
             });
+            // The mappings a closed object still waiting on a ring carries
+            // are the zombie's too: its teardown drops them by this pid.
+            for d in self.nouveau_deferred_frees.lock().iter_mut() {
+                maps += rekey_owners(&mut d.mappings, pid, tomb, |m| &mut m.owner_pid);
+            }
             let classes = super::nouveau_uapi::class_objects_rekey_pid(pid, tomb);
             let refs = crate::scheme::gem_mmap::rekey_pid(pid, tomb);
             z.pid = tomb;
@@ -10287,6 +10422,8 @@ impl NvidiaGpu {
     /// Called where a zombie can become due: a submit, a process exit, a
     /// new context being allocated.
     fn reap_zombie_contexts(&self) {
+        // The same events move rings past a closed object's probes.
+        self.reap_deferred_frees();
         let now = unsafe { crate::bus::drivers_timer_now_as_micros() };
         let due: Vec<ZombieCtx> = {
             let mut zombies = self.nouveau_zombies.lock();
@@ -10315,6 +10452,81 @@ impl NvidiaGpu {
                 z.pid
             );
             self.release_process_finish(z.pid, Some(z.ctx_idx));
+        }
+    }
+
+    /// Free every closed object (`DeferredGemFree`) whose rings have passed
+    /// their probes, or that has waited the fence timeout: a ring that has
+    /// not moved in that long is wedged, and its own fence timeout is
+    /// latching it. Called wherever a zombie is reaped -- a submit, a
+    /// process exit, a context allocation -- and at every close.
+    fn reap_deferred_frees(&self) {
+        let now = unsafe { crate::bus::drivers_timer_now_as_micros() };
+        let due: Vec<DeferredGemFree> = {
+            let mut list = self.nouveau_deferred_frees.lock();
+            if list.is_empty() {
+                return;
+            }
+            let mut due = Vec::new();
+            let mut i = 0;
+            while i < list.len() {
+                let d = &list[i];
+                let expired =
+                    now.wrapping_sub(d.born_us) >= crate::scheme::syncobj::FENCE_TIMEOUT_US;
+                if expired || d.probes.iter().all(|p| self.ring_probe_passed(p)) {
+                    due.push(list.swap_remove(i));
+                } else {
+                    i += 1;
+                }
+            }
+            due
+        };
+        for d in due {
+            let DeferredGemFree {
+                handle,
+                h_memory,
+                size,
+                mappings,
+                ..
+            } = d;
+            let context = alloc::format!("deferred GEM_CLOSE handle={}", handle);
+            self.rm_unmap_mappings(&context, mappings);
+            NOUVEAU_GEM_BYTES.fetch_sub(size, Ordering::Relaxed);
+            let status = (*self.rm_device_instance.lock())
+                .map(|device_instance| nvidia_rm_sys::rm_init::gem_free(device_instance, h_memory));
+            log::info!(
+                "[nouveau-uapi] {}: its ring(s) passed (or timed out) -> gem_free h_memory={:#010x} status={:?}",
+                context,
+                h_memory,
+                status
+            );
+        }
+    }
+
+    /// Drop, without an RM unmap, the mappings owned by `pid` that closed
+    /// objects still waiting on a ring carry: `pid`'s VAS has just been
+    /// freed with its context.
+    fn forget_deferred_mappings_of(&self, pid: u64) -> usize {
+        let mut n = 0;
+        for d in self.nouveau_deferred_frees.lock().iter_mut() {
+            let before = d.mappings.len();
+            d.mappings.retain(|m| m.owner_pid != pid);
+            n += before - d.mappings.len();
+        }
+        n
+    }
+
+    /// Whether the ring behind `probe` has passed it: the probe landed and
+    /// the ring has consumed the entries it had put by then. A ring that is
+    /// gone (its slot freed, or prepared again on another buffer) has passed
+    /// everything it ever had.
+    fn ring_probe_passed(&self, probe: &RingProbe) -> bool {
+        match self.nouveau_fast.lock().get(probe.ctx_idx as usize) {
+            Some(FastSlot::Ready(f)) if f.fence_sem_va == probe.fence_va => {
+                crate::scheme::syncobj::hw_fence_landed(probe.fence_va, probe.payload)
+                    && ring_consumed(f) >= probe.entries_put
+            }
+            _ => true,
         }
     }
 
@@ -14098,6 +14310,7 @@ impl NvidiaGpu {
             ),
             nouveau_peer_fence: Mutex::new(alloc::collections::BTreeMap::new()),
             nouveau_zombies: Mutex::new(Vec::new()),
+            nouveau_deferred_frees: Mutex::new(Vec::new()),
             nouveau_ctx_teardown: Mutex::new(Vec::new()),
             kms_framebuffers: Mutex::new(Vec::new()),
             next_kms_fb_id: AtomicU32::new(1),
@@ -18011,6 +18224,291 @@ mod nouveau_bookkeeping_tests {
         }
         gpu.nouveau_release_process(A);
         gpu.nouveau_release_process(B);
+        assert_eq!(FAKE_RM.lock().bad, 0);
+    }
+
+    /// `GEM_CLOSE` by the last holder freed the RM memory and unmapped the
+    /// VAS at once, with a ring that still had the buffer queued: the
+    /// compositor's blit of a client's frame, or a pushbuffer the client
+    /// was done with, read (or scanned out) freed memory. Linux frees a BO
+    /// only once the fences on its reservation have signaled
+    /// (`ttm_bo_release` waits, or defers the delete). Here the close
+    /// appends a probe fence behind every ring whose VM maps the object
+    /// (and the caller's own), and the free waits for them, reaped at the
+    /// next submit, close or exit; the handle itself goes at once.
+    #[test]
+    fn gem_close_of_a_buffer_a_ring_still_reads_frees_it_once_the_ring_has_passed() {
+        let _g = LOCK.lock();
+        let _live = LiveBytes::hold();
+        let gpu = gpu_rm_ladder();
+        let ch_c = client_with_pushbuf(&gpu, COMP);
+        let ch_a = client_with_pushbuf(&gpu, A);
+        const FRAME_VA: u64 = PUSH_VA + 0x10_0000;
+        let h = gem_new_rm(&gpu, 65536, nv::NOUVEAU_GEM_DOMAIN_GART, A)
+            .unwrap()
+            .handle;
+        assert_eq!(vm_bind_ops(&gpu, A, &mut [map(h, FRAME_VA, 65536)]), Ok(0));
+        assert!(crate::scheme::gem_mmap::add_ref(h, COMP).is_some());
+        assert_eq!(
+            vm_bind_ops(&gpu, COMP, &mut [map(h, FRAME_VA, 65536)]),
+            Ok(0)
+        );
+        // The compositor samples the frame from its own ring (unfenced, not
+        // fetched yet) and lets go of its import; the client, whose ring
+        // has nothing queued, is done with it and closes last.
+        assert_eq!(
+            exec(&gpu, COMP, ch_c, &[push(PUSH_VA, 16)], &[], &[]),
+            Ok(0)
+        );
+        let c0 = chan(0);
+        assert_eq!(userd(&c0), (0, 1));
+        let (frees, unmaps) = {
+            let f = FAKE_RM.lock();
+            (f.gem_frees, f.unmaps)
+        };
+        assert!(gpu.nouveau_gem_close(h, COMP), "one holder letting go");
+        assert!(has_object(&gpu, h));
+        assert_eq!(mappings_of(&gpu, h), 2);
+        assert_eq!(userd(&c0), (0, 1), "nothing probed for that");
+        // The last holder: the handle goes now, the memory and the
+        // mappings once the COMPOSITOR's ring has passed the blit.
+        assert!(gpu.nouveau_gem_close(h, A));
+        assert!(!has_object(&gpu, h), "the handle is gone at once");
+        assert_eq!(
+            mappings_of(&gpu, h),
+            0,
+            "and carries no mapping a new object with the same handle could inherit"
+        );
+        assert_eq!(
+            FAKE_RM.lock().gem_frees,
+            frees,
+            "the memory stays until the ring has passed"
+        );
+        assert_eq!(
+            FAKE_RM.lock().unmaps,
+            unmaps,
+            "and so does its place in the VAS"
+        );
+        assert_eq!(userd(&c0), (0, 2), "a probe fence behind the blit");
+        assert!(!has_chan(1), "the client's idle ring was not even prepared");
+        // A submit is a reap point, but the ring has not moved.
+        assert_eq!(exec(&gpu, A, ch_a, &[push(PUSH_VA, 16)], &[], &[]), Ok(0));
+        assert_eq!(FAKE_RM.lock().gem_frees, frees);
+        // The ring passes the blit and the probe: the next reap frees.
+        assert_eq!(
+            run_gpu(0),
+            [
+                Fetched::Push {
+                    va: PUSH_VA,
+                    len: 16
+                },
+                Fetched::Release {
+                    sem_va: sem_va(&c0),
+                    payload: 1
+                }
+            ]
+        );
+        assert_eq!(FAKE_RM.lock().gem_frees, frees, "nobody has looked yet");
+        assert_eq!(exec(&gpu, A, ch_a, &[push(PUSH_VA, 16)], &[], &[]), Ok(0));
+        {
+            let f = FAKE_RM.lock();
+            assert_eq!(f.gem_frees, frees + 1, "freed");
+            assert_eq!(f.unmaps, unmaps + 2, "both VMs unmapped");
+        }
+        // Nothing queued anywhere: freed on the spot, as before.
+        let h_idle = gem_new_rm(&gpu, 4096, nv::NOUVEAU_GEM_DOMAIN_GART, COMP)
+            .unwrap()
+            .handle;
+        assert_eq!(
+            vm_bind_ops(&gpu, COMP, &mut [map(h_idle, FRAME_VA, 4096)]),
+            Ok(0)
+        );
+        assert!(gpu.nouveau_gem_close(h_idle, COMP));
+        {
+            let f = FAKE_RM.lock();
+            assert_eq!(f.gem_frees, frees + 2);
+            assert_eq!(f.unmaps, unmaps + 3);
+        }
+        assert_eq!(userd(&c0), (2, 2), "no probe on an idle ring");
+        // The caller's own ring counts, mapped or not: a buffer of the
+        // client's that no VM maps, closed with its two pushes queued.
+        let h_own = gem_new_rm(&gpu, 4096, nv::NOUVEAU_GEM_DOMAIN_GART, A)
+            .unwrap()
+            .handle;
+        let c1 = chan(1);
+        assert_eq!(userd(&c1), (0, 2), "A's two submits, unfetched");
+        assert!(gpu.nouveau_gem_close(h_own, A));
+        assert_eq!(userd(&c1), (0, 3), "a probe behind them");
+        assert_eq!(FAKE_RM.lock().gem_frees, frees + 2);
+        assert_eq!(run_gpu(1).len(), 3);
+        assert!(
+            !gpu.nouveau_gem_close(h + 1000, A),
+            "no such handle, but a close is a reap point too"
+        );
+        assert_eq!(FAKE_RM.lock().gem_frees, frees + 3);
+        assert_eq!(FAKE_RM.lock().unmaps, unmaps + 3, "nothing was mapped");
+        // A ring that never passes holds the memory for the fence timeout,
+        // no longer: a ring that has not moved in that long is wedged.
+        let h_stuck = gem_new_rm(&gpu, 4096, nv::NOUVEAU_GEM_DOMAIN_GART, COMP)
+            .unwrap()
+            .handle;
+        assert_eq!(
+            vm_bind_ops(&gpu, COMP, &mut [map(h_stuck, FRAME_VA, 4096)]),
+            Ok(0)
+        );
+        assert_eq!(
+            exec(&gpu, COMP, ch_c, &[push(PUSH_VA, 16)], &[], &[]),
+            Ok(0)
+        );
+        assert!(gpu.nouveau_gem_close(h_stuck, COMP));
+        assert_eq!(userd(&c0), (2, 4), "the push and the probe");
+        assert_eq!(exec(&gpu, A, ch_a, &[push(PUSH_VA, 16)], &[], &[]), Ok(0));
+        assert_eq!(FAKE_RM.lock().gem_frees, frees + 3, "still held");
+        test_clock::advance(syncobj::FENCE_TIMEOUT_US + 1);
+        assert_eq!(exec(&gpu, A, ch_a, &[push(PUSH_VA, 16)], &[], &[]), Ok(0));
+        {
+            let f = FAKE_RM.lock();
+            assert_eq!(f.gem_frees, frees + 4, "given up on, as a fence would be");
+            assert_eq!(f.unmaps, unmaps + 4);
+        }
+        // The client exits with a close of its own still waiting on its
+        // ring: the exit frees the ring, and with it the wait -- and the
+        // VAS, so the mapping is dropped rather than unmapped twice.
+        let h_exit = gem_new_rm(&gpu, 4096, nv::NOUVEAU_GEM_DOMAIN_GART, A)
+            .unwrap()
+            .handle;
+        assert_eq!(
+            vm_bind_ops(&gpu, A, &mut [map(h_exit, FRAME_VA, 4096)]),
+            Ok(0)
+        );
+        assert_eq!(userd(&c1), (3, 5), "A's two later submits, unfetched");
+        assert!(gpu.nouveau_gem_close(h_exit, A));
+        assert_eq!(userd(&c1), (3, 6));
+        assert_eq!(FAKE_RM.lock().gem_frees, frees + 4);
+        gpu.nouveau_release_process(A);
+        assert!(!has_chan(1));
+        {
+            let f = FAKE_RM.lock();
+            assert_eq!(f.gem_frees, frees + 5, "freed with the ring");
+            assert_eq!(f.unmaps, unmaps + 4, "its VAS went with the context");
+            assert_eq!(f.bad, 0);
+        }
+        gpu.nouveau_release_process(COMP);
+        assert_eq!(FAKE_RM.lock().bad, 0);
+    }
+
+    /// A client that exits with a consumer's ACQUIRE queued on its
+    /// semaphore leaves a zombie whose ring still runs, and the park lands
+    /// its last payload from the CPU (`write_final_payload`): a close of
+    /// its buffer that was waiting on that ring must not take the landed
+    /// payload for the ring's word, only the entries it has consumed.
+    #[test]
+    fn a_closed_buffer_of_a_zombie_waits_for_the_zombies_ring_not_for_its_parked_payload() {
+        let _g = LOCK.lock();
+        let _live = LiveBytes::hold();
+        let gpu = gpu_rm_ladder();
+        FAKE_RM.lock().peer = true;
+        let ch_c = client_with_pushbuf(&gpu, COMP);
+        let ch_a = client_with_pushbuf(&gpu, A);
+        const FRAME_VA: u64 = PUSH_VA + 0x10_0000;
+        let h = gem_new_rm(&gpu, 65536, nv::NOUVEAU_GEM_DOMAIN_GART, A)
+            .unwrap()
+            .handle;
+        assert_eq!(vm_bind_ops(&gpu, A, &mut [map(h, FRAME_VA, 65536)]), Ok(0));
+        assert!(crate::scheme::gem_mmap::add_ref(h, COMP).is_some());
+        assert_eq!(
+            vm_bind_ops(&gpu, COMP, &mut [map(h, FRAME_VA, 65536)]),
+            Ok(0)
+        );
+        let out = syncobj::create(false);
+        let out2 = syncobj::create(false);
+        assert_eq!(
+            exec(&gpu, A, ch_a, &[push(PUSH_VA, 16)], &[], &[sync(out)]),
+            Ok(0)
+        );
+        assert_eq!(
+            exec(
+                &gpu,
+                COMP,
+                ch_c,
+                &[push(PUSH_VA, 16)],
+                &[sync(out)],
+                &[sync(out2)]
+            ),
+            Ok(0)
+        );
+        let (c0, c1) = (chan(0), chan(1));
+        assert_eq!(userd(&c1), (0, 2));
+        assert_eq!(userd(&c0), (0, 3), "acquire, push, fence");
+        let (frees, unmaps) = {
+            let f = FAKE_RM.lock();
+            (f.gem_frees, f.unmaps)
+        };
+        assert!(gpu.nouveau_gem_close(h, COMP));
+        assert!(
+            gpu.nouveau_gem_close(h, A),
+            "the last holder, both rings busy"
+        );
+        assert_eq!(userd(&c1), (0, 3), "a probe on the client's ring");
+        assert_eq!(userd(&c0), (0, 4), "and one on the compositor's");
+        assert_eq!(FAKE_RM.lock().gem_frees, frees);
+        // The client exits before its ring ran: a zombie. Its last payload
+        // -- the probe's -- landed at the park; the ring has consumed
+        // nothing, and the buffer stays.
+        gpu.nouveau_release_process(A);
+        assert_eq!(gpu.nouveau_zombies.lock().len(), 1);
+        assert!(syncobj::hw_fence_landed(
+            sem_va(&c1) as usize - c1.gpu_va as usize + c1.buf,
+            2
+        ));
+        assert_eq!(userd(&c1), (0, 3), "the zombie's ring has not moved");
+        assert_eq!(FAKE_RM.lock().gem_frees, frees, "not freed at the exit");
+        // The pid comes back before the consumer passed: the close's
+        // mappings wear the tombstone with the rest of the zombie's.
+        gpu.rekey_zombie_wearing(A);
+        assert_eq!(
+            exec(&gpu, COMP, ch_c, &[push(PUSH_VA, 16)], &[], &[]),
+            Ok(0)
+        );
+        assert_eq!(
+            FAKE_RM.lock().gem_frees,
+            frees,
+            "nobody has passed anything"
+        );
+        assert_eq!(run_gpu(0).len(), 5, "the compositor passes its acquire");
+        // The consumer passed: the zombie is torn down, ring, VAS and all,
+        // whether or not its ring ran (that is what a zombie is for) -- and
+        // with the ring gone the close has nothing left to wait for. Its
+        // mapping of the freed VAS is dropped, not unmapped a second time.
+        assert_eq!(
+            exec(&gpu, COMP, ch_c, &[push(PUSH_VA, 16)], &[], &[]),
+            Ok(0)
+        );
+        assert!(gpu.nouveau_zombies.lock().is_empty(), "reaped");
+        assert!(!has_chan(1));
+        assert_eq!(
+            exec(&gpu, COMP, ch_c, &[push(PUSH_VA, 16)], &[], &[]),
+            Ok(0)
+        );
+        {
+            let f = FAKE_RM.lock();
+            assert_eq!(
+                f.gem_frees,
+                frees + 2,
+                "the closed frame, freed with the zombie's ring, and the zombie's own pushbuffer"
+            );
+            assert_eq!(
+                f.unmaps,
+                unmaps + 1,
+                "the compositor's mapping; the zombie's VAS was gone"
+            );
+            assert_eq!(f.bad, 0);
+        }
+        for h in [out, out2] {
+            assert!(syncobj::destroy(h));
+        }
+        gpu.nouveau_release_process(COMP);
+        gpu.reap_zombie_contexts();
         assert_eq!(FAKE_RM.lock().bad, 0);
     }
 
