@@ -1,6 +1,10 @@
 [workspace]
 resolver = "1"
 members = [
+    # The VFS trait every file system implements: the path walk that follows
+    # symlinks (`INode::lookup_follow`) lives here, and nothing compiled it as
+    # a test target (it is reached only through the `[patch]` below).
+    "vendor/rcore-fs",
     "drivers",
     "nvidia-rm-sys",
     "kernel-hal",
@@ -17,9 +21,6 @@ members = [
     # rcore-fs-sfs`); the `[patch]` below is what makes the rest of the tree
     # use this copy.
     "vendor/rcore-fs-sfs",
-    # Same reason: the path walk of every file system (`INode::lookup_follow`)
-    # lives here and nothing else compiled it as a test target.
-    "vendor/rcore-fs",
     "hunter",
 ]
 default-members = ["xtask"]
