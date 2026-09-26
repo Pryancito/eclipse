@@ -304,6 +304,9 @@ pub enum ClockId {
     ClockRealTimeAlarm = 8,
     /// `CLOCK_BOOTTIME` that also wakes the machine from suspend.
     ClockBootTimeAlarm = 9,
+    /// International Atomic Time: the wall clock plus the offset
+    /// `adjtimex(ADJ_TAI)` sets (37 s in 2026, 0 until a daemon says so).
+    ClockTai = 11,
 }
 
 impl ClockId {
@@ -324,9 +327,15 @@ impl ClockId {
             7 => Self::ClockBootTime,
             8 => Self::ClockRealTimeAlarm,
             9 => Self::ClockBootTimeAlarm,
+            // 10 is `CLOCK_SGI_CYCLE`, which Linux has not had a clock for
+            // since 2.6; `CLOCK_TAI` was `EINVAL` here too, and it is a
+            // clock every Linux since 3.10 reads: `clock_gettime(CLOCK_TAI)`
+            // is how chrony and ptp4l (`-c TAI` is the PTP default timescale)
+            // and anything using Go's or Rust's TAI-aware time crates ask.
+            11 => Self::ClockTai,
             // Every negative id lands here too, as a very large `usize`:
             // Linux routes those to the per-process CPU clocks, which this
-            // kernel does not have. `CLOCK_TAI` is not modelled either.
+            // kernel does not have.
             _ => return Err(crate::error::LxError::EINVAL),
         })
     }
@@ -392,6 +401,11 @@ pub fn clock_nanosleep_base(clock: usize) -> crate::error::LxResult<ClockBase> {
         // clocks.
         ClockId::ClockRealTimeAlarm => ClockBase::Wall,
         ClockId::ClockBootTimeAlarm => ClockBase::Monotonic,
+        // `clock_tai` carries `common_nsleep`: a sleep on the wall clock. An
+        // absolute deadline on it is a TAI instant, which is the wall clock
+        // plus the `ADJ_TAI` offset; that offset is not applied here, so
+        // such a sleep ends early by the offset once a daemon has set one.
+        ClockId::ClockTai => ClockBase::Wall,
     })
 }
 
@@ -445,12 +459,14 @@ pub fn timerfd_clock_base(clock: usize) -> crate::error::LxResult<ClockBase> {
     Ok(match ClockId::from_raw(clock)? {
         ClockId::ClockRealTime => ClockBase::Wall,
         ClockId::ClockMonotonic => ClockBase::Monotonic,
-        // `timerfd_create` lists neither the CPU clocks nor the coarse ones.
+        // `timerfd_create` lists neither the CPU clocks nor the coarse ones,
+        // nor `CLOCK_TAI`.
         ClockId::ClockProcessCpuTimeId
         | ClockId::ClockThreadCpuTimeId
         | ClockId::ClockMonotonicRaw
         | ClockId::ClockRealTimeCoarse
-        | ClockId::ClockMonotonicCoarse => return Err(LxError::EINVAL),
+        | ClockId::ClockMonotonicCoarse
+        | ClockId::ClockTai => return Err(LxError::EINVAL),
         // This kernel's monotonic timer does not stop for suspend, so boot
         // time and monotonic time are the same thing here.
         ClockId::ClockBootTime => ClockBase::Monotonic,
@@ -487,6 +503,9 @@ pub fn posix_timer_clock_base(clock: usize) -> crate::error::LxResult<ClockBase>
         ClockId::ClockBootTime => ClockBase::Monotonic,
         ClockId::ClockRealTimeAlarm => ClockBase::Wall,
         ClockId::ClockBootTimeAlarm => ClockBase::Monotonic,
+        // `clock_tai` carries `common_timer_create`; the same offset remark
+        // as in `clock_nanosleep_base` applies to an absolute expiry.
+        ClockId::ClockTai => ClockBase::Wall,
     })
 }
 
@@ -626,6 +645,8 @@ pub enum ClockSource {
     Wall,
     /// The monotonic clock, counted from boot.
     Monotonic,
+    /// The wall clock plus the TAI offset `adjtimex(ADJ_TAI)` set.
+    Tai,
     /// A task's CPU time.
     Cpu(CpuClock),
 }
@@ -652,6 +673,7 @@ pub fn clock_gettime_source(clock: usize) -> crate::error::LxResult<ClockSource>
         | ClockId::ClockMonotonicCoarse
         | ClockId::ClockBootTime
         | ClockId::ClockBootTimeAlarm => ClockSource::Monotonic,
+        ClockId::ClockTai => ClockSource::Tai,
         // Named by number above, before `ClockId` is asked.
         ClockId::ClockProcessCpuTimeId => ClockSource::Cpu(CpuClock {
             owner: CpuClockOwner::Process(0),
@@ -772,7 +794,11 @@ mod cpu_clock_tests {
             );
             assert_eq!(CpuClock::from_raw(clock), Ok(None));
         }
-        for clock in [10, 11, 99, i32::MAX as usize] {
+        // `CLOCK_TAI` reads the wall clock shifted by the TAI offset; it
+        // was EINVAL, and `CLOCK_SGI_CYCLE` (10) still is.
+        assert_eq!(clock_gettime_source(11), Ok(ClockSource::Tai));
+        assert_eq!(ClockId::from_raw(11), Ok(ClockId::ClockTai));
+        for clock in [10, 12, 99, i32::MAX as usize] {
             assert_eq!(
                 clock_gettime_source(clock),
                 Err(LxError::EINVAL),
@@ -824,6 +850,7 @@ mod time_tests {
             (7, ClockBase::Monotonic),
             (8, ClockBase::Wall),
             (9, ClockBase::Monotonic),
+            (11, ClockBase::Wall), // CLOCK_TAI: `common_nsleep`
         ] {
             assert_eq!(clock_nanosleep_base(clock), Ok(base), "clock {}", clock);
         }
@@ -840,7 +867,7 @@ mod time_tests {
         }
         // Past the end of the table, and every negative id, which reaches
         // this kernel as a very large `usize`.
-        for clock in [10, 11, 99, usize::MAX, -1_isize as usize, -6_isize as usize] {
+        for clock in [10, 12, 99, usize::MAX, -1_isize as usize, -6_isize as usize] {
             assert_eq!(
                 clock_nanosleep_base(clock),
                 Err(LxError::EINVAL),
@@ -1404,6 +1431,8 @@ mod time_tests {
             );
         }
         assert_eq!(timerfd_clock_base(10), Err(LxError::EINVAL));
+        // Nor is CLOCK_TAI, which `clock_gettime` and `timer_create` take.
+        assert_eq!(timerfd_clock_base(11), Err(LxError::EINVAL));
         // A negative id arrives as a very large `usize`.
         assert_eq!(timerfd_clock_base(NEG_ONE), Err(LxError::EINVAL));
     }
@@ -1424,6 +1453,7 @@ mod time_tests {
             (7, ClockBase::Monotonic),
             (8, ClockBase::Wall),
             (9, ClockBase::Monotonic),
+            (11, ClockBase::Wall), // CLOCK_TAI: `common_timer_create`
         ] {
             assert_eq!(posix_timer_clock_base(clock), Ok(base), "clock {}", clock);
         }
