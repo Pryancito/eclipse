@@ -28,6 +28,11 @@
 //!   the already-active window), middle click closes, the scroll wheel cycles
 //!   through windows, and minimized windows draw dimmed. Hovering a truncated
 //!   button pops a tooltip with the full title.
+//! - The menus (application list, calendar, power, window context, volume) are
+//!   real xdg_popups parented to the bar's layer surface, so the compositor
+//!   places them against the button that opened them, keeps them on the
+//!   output and owns the grab that dismisses them. Each draws its own drop
+//!   shadow; the desktop behind is left alone.
 //! - The ◑/☾ launcher opens an application menu (icon + name per row) with
 //!   search-as-you-type filtering (accent-insensitive), ↑/↓ + Enter keyboard
 //!   navigation, and wheel scrolling with a scrollbar when the list overflows.
@@ -81,6 +86,18 @@ use wayland_protocols_wlr::foreign_toplevel::v1::client::{
 use wayland_protocols_wlr::layer_shell::v1::client::{
     zwlr_layer_shell_v1::{self, ZwlrLayerShellV1},
     zwlr_layer_surface_v1::{self, Anchor, KeyboardInteractivity, ZwlrLayerSurfaceV1},
+};
+// xdg-shell, for the menus. A layer surface can parent a real xdg_popup
+// (`zwlr_layer_surface_v1.get_popup`), which is what a panel menu is supposed
+// to be: the compositor places it, constrains it to the output and owns the
+// grab. The alternative this replaced — an output-sized overlay with a dim
+// scrim — made every hover cost a full-screen composite and left the bar
+// itself dimmed and unclickable underneath.
+use wayland_protocols::xdg::shell::client::{
+    xdg_popup::{self, XdgPopup},
+    xdg_positioner::{self, XdgPositioner},
+    xdg_surface::{self, XdgSurface},
+    xdg_wm_base::{self, XdgWmBase},
 };
 
 use wp_cursor_shape_device_v1::Shape;
@@ -405,17 +422,22 @@ enum PopupKind {
         scroll: usize,
     },
     /// The month calendar, opened from the clock (bottom) or date (top) pill.
-    Calendar { year: i32, month: u32, at_top: bool },
-    /// Power / Session menu popup. `at_top` when opened from the top bar, so
-    /// the panel hugs the bar that spawned it (the button is on both bars).
-    PowerMenu { at_top: bool },
+    Calendar { year: i32, month: u32 },
+    /// Power / Session menu popup.
+    PowerMenu,
     /// Right-click context menu for one window, keyed by its foreign-toplevel
     /// protocol id (never a list index — the window can close while the menu
     /// is open, and an index would then act on whoever took its slot).
-    TaskMenu { tid: u32, title: String, at_top: bool },
+    TaskMenu { tid: u32, title: String },
     /// Volume control popup slider.
-    Volume { level: u32, at_top: bool },
+    Volume { level: u32 },
 }
+
+/// Which side of the panel the popup's shadow occupies, in surface pixels.
+/// The panel is inset by this on every edge, and `set_window_geometry` tells
+/// the compositor to position the PANEL and ignore the shadow — which is what
+/// window geometry is for.
+const POPUP_SHADOW: i32 = 12;
 
 /// A clickable region inside the popup panel.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -438,19 +460,32 @@ enum Action {
     VolumeGauge,
 }
 
-/// What a popup draw pass reports back: the panel rect (x,y,w,h) — clicks
-/// outside it dismiss — and the absolute hit rects with their actions.
-type PopupFrame = ((i32, i32, i32, i32), Vec<(i32, i32, i32, i32, Action)>);
-
-/// The launcher menu / calendar: a full-output translucent overlay surface
-/// (Overlay layer, ARGB) with a clickable panel. Created on demand, torn down
-/// when dismissed.
+/// A menu: an ARGB xdg_popup parented to the bar's layer surface, holding the
+/// panel and its drop shadow. Created on demand, torn down when dismissed —
+/// by us, or by the compositor's grab sending `popup_done`.
 struct Popup {
     surface: wl_surface::WlSurface,
-    layer: ZwlrLayerSurfaceV1,
-    /// Logical (surface) size from the layer-shell configure.
+    /// The xdg_surface role object; `ack_configure` goes here.
+    xdg: XdgSurface,
+    /// The popup itself. Parented to the bar's layer surface, so the
+    /// compositor places it, keeps it on the output and owns the grab.
+    popup: XdgPopup,
+    /// Panel size the compositor last configured, before the shadow margin.
+    panel_w: u32,
+    panel_h: u32,
+    /// Logical (surface) size: the panel plus `POPUP_SHADOW` on every edge.
     width: u32,
     height: u32,
+    /// The anchor rect (the button's rect in the parent bar's surface
+    /// coordinates), the bar's edge and the output height: everything
+    /// `reposition` needs to rebuild the positioner when the panel has to
+    /// change size, which the app menu does on every keystroke that changes
+    /// how many results there are.
+    anchor: (i32, i32, i32, i32),
+    at_top: bool,
+    output_h: i32,
+    /// Incrementing token for `xdg_popup.reposition`.
+    repos_token: u32,
     /// Integer HiDPI scale of the output this overlay maps on (clamped 1..=8).
     /// The bars have always honoured `wl_output.scale`; the overlay did not,
     /// so on a scale-2 desk the menu drew at half the bar's resolution.
@@ -490,7 +525,10 @@ impl Drop for Popup {
         if !self.map.is_null() {
             unsafe { libc::munmap(self.map as *mut libc::c_void, self.map_len) };
         }
-        self.layer.destroy();
+        // Innermost role object first: destroying the wl_surface while the
+        // xdg_popup still references it is a protocol error.
+        self.popup.destroy();
+        self.xdg.destroy();
         self.surface.destroy();
     }
 }
@@ -556,6 +594,9 @@ struct State {
     compositor: Option<wl_compositor::WlCompositor>,
     shm: Option<wl_shm::WlShm>,
     layer_shell: Option<ZwlrLayerShellV1>,
+    /// xdg-shell, for the menus. Without it there is no popup and the
+    /// launcher, clock, power and volume buttons simply do nothing.
+    xdg_wm_base: Option<XdgWmBase>,
     foreign_mgr: Option<ZwlrForeignToplevelManagerV1>,
     seat: Option<wl_seat::WlSeat>,
     pointer: Option<wl_pointer::WlPointer>,
@@ -594,6 +635,10 @@ struct State {
     ptr_x: f64,
     ptr_y: f64,
     ptr_serial: u32,       // serial of the last pointer Enter (for set_shape)
+    /// Serial of the last pointer Button press. An xdg_popup grab is only
+    /// granted against a serial the compositor can tie to a real click, so the
+    /// Enter serial above will not do.
+    ptr_btn_serial: u32,
     ptr_bar: Option<u32>,  // layer id the pointer is over
     ptr_on_popup: bool,    // pointer is over the popup overlay
     scroll_acc: f64,       // accumulated wheel distance until one notch
@@ -1134,7 +1179,7 @@ impl State {
     // ── Popup (app menu / calendar) ─────────────────────────────────────────
 
     /// Launcher click: toggle the application menu.
-    fn toggle_apps(&mut self, qh: &QueueHandle<State>) {
+    fn toggle_apps(&mut self, qh: &QueueHandle<State>, at_top: bool) {
         if matches!(&self.popup, Some(p) if matches!(p.kind, PopupKind::Apps { .. })) {
             self.close_popup();
             return;
@@ -1172,6 +1217,7 @@ impl State {
                 sel: 0,
                 scroll: 0,
             },
+            at_top,
         );
     }
 
@@ -1184,20 +1230,20 @@ impl State {
         let Some((year, month, _)) = sysinfo::today() else {
             return;
         };
-        self.open_popup(qh, PopupKind::Calendar { year, month, at_top });
+        self.open_popup(qh, PopupKind::Calendar { year, month }, at_top);
     }
 
     /// Power button click: toggle the session power menu.
     fn toggle_power(&mut self, qh: &QueueHandle<State>, at_top: bool) {
-        if matches!(&self.popup, Some(p) if matches!(p.kind, PopupKind::PowerMenu { .. })) {
+        if matches!(&self.popup, Some(p) if matches!(p.kind, PopupKind::PowerMenu)) {
             self.close_popup();
             return;
         }
-        self.open_popup(qh, PopupKind::PowerMenu { at_top });
+        self.open_popup(qh, PopupKind::PowerMenu, at_top);
     }
 
     /// Right click on window button: toggle task context menu.
-    fn toggle_task_menu(&mut self, qh: &QueueHandle<State>, tid: u32) {
+    fn toggle_task_menu(&mut self, qh: &QueueHandle<State>, tid: u32, at_top: bool) {
         if matches!(&self.popup, Some(p) if matches!(p.kind, PopupKind::TaskMenu { tid: open_tid, .. } if open_tid == tid)) {
             self.close_popup();
             return;
@@ -1208,14 +1254,7 @@ impl State {
             .find(|t| t.handle.id().protocol_id() == tid)
             .map(|t| t.title.clone())
             .unwrap_or_default();
-        self.open_popup(
-            qh,
-            PopupKind::TaskMenu {
-                tid,
-                title,
-                at_top: false,
-            },
-        );
+        self.open_popup(qh, PopupKind::TaskMenu { tid, title }, at_top);
     }
 
     /// Volume module click: toggle volume slider popup.
@@ -1225,54 +1264,106 @@ impl State {
             return;
         }
         let level = self.vol.unwrap_or(0);
-        self.open_popup(qh, PopupKind::Volume { level, at_top });
+        self.open_popup(qh, PopupKind::Volume { level }, at_top);
     }
 
-    /// Map a full-output overlay surface for `kind`, replacing any open popup.
-    fn open_popup(&mut self, qh: &QueueHandle<State>, kind: PopupKind) {
-        let (Some(comp), Some(ls)) = (&self.compositor, &self.layer_shell) else {
+    /// The bar-surface rect of the button that opens `kind`, used as the
+    /// positioner's anchor so the menu hangs off the thing that was clicked
+    /// instead of being glued to a screen edge.
+    fn popup_anchor(&self, idx: usize, kind: &PopupKind) -> (i32, i32, i32, i32) {
+        let bar = &self.bars[idx];
+        let (x0, x1) = match kind {
+            PopupKind::Apps { .. } => bar.launcher_hit,
+            PopupKind::Calendar { .. } => bar.clock_hit,
+            PopupKind::PowerMenu => bar.power_hit,
+            PopupKind::Volume { .. } => bar.vol_hit,
+            PopupKind::TaskMenu { tid, .. } => bar
+                .task_hits
+                .iter()
+                .find(|h| h.tid == *tid)
+                .map(|h| (h.x0, h.x1))
+                .unwrap_or((0, 0)),
+        };
+        // A zero hitbox (the module is not drawn on this bar) would make the
+        // compositor place the menu at x=0; fall back to the whole bar, which
+        // the constraint adjustment then resolves sensibly.
+        if x1 <= x0 {
+            return (0, 0, bar.width.max(1) as i32, bar.height.max(1) as i32);
+        }
+        (x0, 0, x1 - x0, bar.height.max(1) as i32)
+    }
+
+    /// Map an xdg_popup for `kind` off the bar that was clicked, replacing any
+    /// open popup. `at_top` is the bar's own edge: the menu opens downward
+    /// from the top bar and upward from the bottom one.
+    fn open_popup(&mut self, qh: &QueueHandle<State>, kind: PopupKind, at_top: bool) {
+        // Cloned, not borrowed: everything below mutates `self`, and these
+        // are refcounted proxies.
+        let (Some(comp), Some(wm)) = (self.compositor.clone(), self.xdg_wm_base.clone()) else {
             return;
         };
         self.tooltip = None;
         self.tip_pending = None;
-        self.popup = None; // Drop tears down any previous overlay first
+        self.popup = None; // Drop tears down any previous popup first
 
-        // Map on the output whose bar was clicked. Passing None would let the
-        // compositor choose, so on a multi-monitor desk the menu (and the
-        // scrim that catches its dismiss-click) could land on another screen
-        // than the button that opened it.
-        let bar = self.ptr_bar.and_then(|id| self.bar_index(id));
-        let output = bar.map(|i| self.bars[i].output.clone());
-        // Same integer scale as the bar that spawned it, so the menu is as
-        // sharp as the panel it hangs off instead of a scale-1 upscale.
-        let scale = bar.map(|i| self.bars[i].scale).unwrap_or(1).clamp(1, 8);
+        // Parent the popup to the bar that was clicked. On a multi-monitor
+        // desk that also decides the output, without us naming one.
+        let Some(idx) = self.ptr_bar.and_then(|id| self.bar_index(id)) else {
+            return;
+        };
+        let anchor = self.popup_anchor(idx, &kind);
+        let bar = &self.bars[idx];
+        let scale = bar.scale.clamp(1, 8);
+        let parent = bar.layer.clone();
+        // The output height decides how many app rows fit; the bar's own
+        // configure never carries it.
+        let oh = self
+            .outputs
+            .iter()
+            .find(|o| o.global_name == bar.output_global)
+            .map(|o| o.mode_h)
+            .filter(|h| *h > 0)
+            .unwrap_or(720) as i32;
+        let (pw, ph) = popup_size(&kind, oh, self.height as i32);
+
+        let pos = make_positioner(&wm, qh, &kind, anchor, at_top, pw, ph);
 
         let surface = comp.create_surface(qh, ());
-        let layer = ls.get_layer_surface(
-            &surface,
-            output.as_ref(),
-            zwlr_layer_shell_v1::Layer::Overlay,
-            "menu".into(),
-            qh,
-            PopupId,
-        );
-        layer.set_anchor(Anchor::Top | Anchor::Bottom | Anchor::Left | Anchor::Right);
-        layer.set_size(0, 0);
-        // -1: span the FULL output. With the default zone 0 the compositor
-        // would size this surface to the usable area (already minus both
-        // bars' exclusive zones) and every bar_h offset in the popup math
-        // would double-subtract — and the scrim would not cover the bars, so
-        // taskbar clicks would land on windows while we hold the keyboard.
-        layer.set_exclusive_zone(-1);
-        // Exclusive: grab the keyboard while the popup is up, so search typing
-        // and arrow navigation work no matter where focus was before.
-        layer.set_keyboard_interactivity(KeyboardInteractivity::Exclusive);
+        let xdg = wm.get_xdg_surface(&surface, qh, ());
+        // Window geometry is the PANEL, shadow excluded, so the positioner
+        // places the panel and not the margin around it. Set again on every
+        // configure, because `reposition` changes the panel's size.
+        xdg.set_window_geometry(POPUP_SHADOW, POPUP_SHADOW, pw, ph);
+        // Parent NULL: the layer surface adopts it on the next line, which is
+        // what wlr-layer-shell requires before the popup's first commit.
+        let popup = xdg.get_popup(None, &pos, qh, ());
+        parent.get_popup(&popup);
+        pos.destroy();
+        // The grab is what makes this a menu: the compositor routes the
+        // keyboard here and sends `popup_done` on a click outside, so neither
+        // needs hand-rolling (and the rest of the desktop keeps its focus).
+        if let Some(seat) = &self.seat {
+            if self.ptr_btn_serial != 0 {
+                popup.grab(seat, self.ptr_btn_serial);
+            }
+        }
         surface.commit();
+
         self.popup = Some(Popup {
             surface,
-            layer,
+            xdg,
+            popup,
+            // Seeded with the size asked for: xdg_popup.configure normally
+            // arrives first and overrides it, but a surface configure that
+            // beat it must still be able to map.
+            panel_w: pw as u32,
+            panel_h: ph as u32,
             width: 0,
             height: 0,
+            anchor,
+            at_top,
+            output_h: oh,
+            repos_token: 0,
             scale,
             map: std::ptr::null_mut(),
             map_len: 0,
@@ -1290,53 +1381,34 @@ impl State {
         });
     }
 
-    /// When a popup repaint that the frame gate deferred must go out anyway.
-    /// `None` when nothing is waiting.
-    fn popup_deadline(&self) -> Option<Instant> {
-        let p = self.popup.as_ref()?;
-        if !p.dirty || !p.frame_pending {
-            return None;
-        }
-        Some(p.frame_at? + FRAME_FALLBACK)
-    }
-
-    /// Tear down the popup overlay (Drop destroys its surfaces and mapping).
+    /// Tear down the popup (Drop destroys its objects and mapping).
     fn close_popup(&mut self) {
         self.popup = None;
         self.ptr_on_popup = false;
     }
 
-    /// (Re)allocate the popup overlay's ARGB shm pool after a configure.
-    fn configure_popup(&mut self, qh: &QueueHandle<State>, mut w: u32, mut h: u32) {
+    /// (Re)allocate the popup's ARGB shm pool for a panel `pw`x`ph`, then
+    /// paint it. Sizes are logical; the buffer is `scale` times each.
+    fn configure_popup(&mut self, qh: &QueueHandle<State>, pw: u32, ph: u32) {
         let Some(shm) = self.shm.clone() else {
             return;
         };
-        if w == 0 || h == 0 {
-            // Client decides — use the largest known mode as a fallback.
-            let (mw, mh) = self
-                .outputs
-                .iter()
-                .map(|o| (o.mode_w, o.mode_h))
-                .max_by_key(|(a, b)| (*a as u64) * (*b as u64))
-                .unwrap_or((1280, 720));
-            if w == 0 {
-                w = mw.max(1);
-            }
-            if h == 0 {
-                h = mh.max(1);
-            }
-        }
-        w = w.max(1);
-        h = h.max(1);
-        if matches!(self.popup.as_ref(), Some(popup) if popup.configured && popup.width == w && popup.height == h) {
+        let comp = self.compositor.clone();
+        let pw = pw.max(1);
+        let ph = ph.max(1);
+        let margin = 2 * POPUP_SHADOW as u32;
+        let w = pw + margin;
+        let h = ph + margin;
+        if matches!(self.popup.as_ref(), Some(p) if p.configured && p.width == w && p.height == h) {
             self.render_popup(qh);
             return;
         }
         let scale = self.popup.as_ref().map(|p| p.scale).unwrap_or(1).max(1);
         // The configure is in SURFACE (logical) pixels; the wl_buffer is in
-        // buffer pixels, which is `scale` times that — the same split the bars
-        // already made. Every guard below is on the buffer size, since that is
-        // what actually gets mapped.
+        // buffer pixels, which is `scale` times that. Every guard is on the
+        // buffer size, and it SKIPS rather than clamps: with
+        // `set_buffer_scale` declared the compositor requires exactly
+        // `logical * scale`.
         let bw = w.saturating_mul(scale);
         let bh = h.saturating_mul(scale);
         if bw > fill_guard::MAX_BUFFER_DIM || bh > fill_guard::MAX_BUFFER_DIM {
@@ -1387,6 +1459,20 @@ impl State {
                 }
             }
             let old = (popup.map, popup.map_len);
+            popup.panel_w = pw;
+            popup.panel_h = ph;
+            // Geometry and input both describe the panel, and `reposition`
+            // moves them: a stale input region would leave a band of the menu
+            // dead to the pointer, or take clicks meant for what is behind.
+            popup.xdg.set_window_geometry(POPUP_SHADOW, POPUP_SHADOW, pw as i32, ph as i32);
+            if let Some(comp) = comp.as_ref() {
+                let region = comp.create_region(qh, ());
+                region.add(POPUP_SHADOW, POPUP_SHADOW, pw as i32, ph as i32);
+                // Input stops at the panel: a click on the shadow ring belongs
+                // to whatever is behind it, and under the grab it dismisses.
+                popup.surface.set_input_region(Some(&region));
+                region.destroy();
+            }
             popup.width = w;
             popup.height = h;
             popup.map = map;
@@ -1408,20 +1494,17 @@ impl State {
         self.render_popup(qh);
     }
 
-    /// Paint the popup overlay into a free buffer and commit it.
+    /// Paint the popup into a free buffer and commit it.
     fn render_popup(&mut self, qh: &QueueHandle<State>) {
-        let bar_h = self.height as i32;
         let Some(popup) = self.popup.as_mut() else {
             return;
         };
         if !popup.configured || popup.map.is_null() {
             return;
         }
-        // Throttle to the compositor's frame clock. Repainting this surface
-        // means an output-sized tiny-skia render plus an output-sized swizzle;
-        // pointer motion fires far faster than the display refreshes, so
-        // without this every mouse sweep across the app menu builds frames the
-        // compositor throws away, while holding the shm pool the whole time.
+        // Throttle to the compositor's frame clock: pointer motion fires far
+        // faster than the display refreshes, so without this a mouse sweep
+        // down the app menu builds frames nobody sees.
         if popup.frame_pending
             && popup.frame_at.map(|t| t.elapsed() < FRAME_FALLBACK).unwrap_or(false)
         {
@@ -1448,48 +1531,20 @@ impl State {
             popup.busy[i] = false;
             return;
         };
-        let (panel, hits) = match &mut popup.kind {
-            PopupKind::Apps {
-                all,
-                filter,
-                visible,
-                sel,
-                scroll,
-            } => {
-                // Clamp the scroll window and selection against the current
-                // layout before painting (the output size may have changed).
-                let rows_fit = apps_rows_fit(h as i32, bar_h);
-                if !visible.is_empty() && *sel >= visible.len() {
-                    *sel = visible.len() - 1;
-                }
-                let max_scroll = visible.len().saturating_sub(rows_fit);
-                if *scroll > max_scroll {
-                    *scroll = max_scroll;
-                }
-                draw_apps(
-                    &mut cv, w, h, bar_h, all, visible, filter, *sel, *scroll,
-                    &mut self.icons,
-                )
-            }
-            PopupKind::Calendar { year, month, at_top } => {
-                draw_calendar(&mut cv, w, h, bar_h, *year, *month, *at_top)
-            }
-            PopupKind::PowerMenu { at_top } => draw_power_menu(&mut cv, w, h, bar_h, *at_top),
-            PopupKind::TaskMenu { tid, title, at_top } => {
-                draw_task_menu(&mut cv, w, h, bar_h, *tid, title, *at_top)
-            }
-            PopupKind::Volume { level, at_top } => {
-                draw_volume_menu(&mut cv, w, h, bar_h, *level, *at_top)
-            }
-        };
+        // The panel sits inside the shadow margin; everything outside it stays
+        // fully transparent, which is why the surface is ARGB.
+        let (px, py) = (POPUP_SHADOW, POPUP_SHADOW);
+        let (pw, ph) = (popup.panel_w as i32, popup.panel_h as i32);
+        let hits = draw_popup(&mut cv, px, py, pw, ph, &mut popup.kind, &mut self.icons);
+        popup.panel = (px, py, pw, ph);
+        popup.hits = hits;
+
         let data: &mut [u8] =
             unsafe { std::slice::from_raw_parts_mut(popup.map.add(i * frame_size), frame_size) };
         if !cv.blit_argb_scaled(data, scale as u32) {
             popup.busy[i] = false;
             return;
         }
-        popup.panel = panel;
-        popup.hits = hits;
 
         if let Some(buf) = popup.buffers[i].as_ref() {
             popup.surface.attach(Some(buf), 0, 0);
@@ -1497,23 +1552,63 @@ impl State {
             // request is queued on the surface and applied by that commit.
             // Only ever ONE outstanding: a wl_callback is destroyed by its own
             // `done` and cannot be cancelled, so a compositor that never
-            // answers (it owes no frame to a surface it is not drawing) would
-            // otherwise leave one object behind per FRAME_FALLBACK repaint,
-            // for as long as the menu stays open. On that fallback path the
-            // callback already in flight stays the gate; only the deadline is
-            // pushed out, so the next repaint is another FRAME_FALLBACK away
-            // and not a spin.
+            // answers would otherwise leave one object behind per
+            // FRAME_FALLBACK repaint, for as long as the menu stays open.
             if !popup.frame_pending {
                 popup.surface.frame(qh, PopupId);
                 popup.frame_pending = true;
             }
             popup.frame_at = Some(Instant::now());
-            // Full-surface damage, in BUFFER pixels. Sub-rect dirty on popups
-            // left stale tiles around the panel (same class of artifact as KMS
-            // DIRTYFB clips).
+            // The menu is its own size now, so this is a small damage rect and
+            // not a whole-output one.
             damage(&popup.surface, scale as u32, 0, 0, bw as i32, bh as i32);
             popup.surface.commit();
         }
+    }
+
+    /// Ask the compositor to re-place and re-size the popup, because the panel
+    /// wants a different size than it was given.
+    ///
+    /// The app menu shrinks with every keystroke that narrows the result list,
+    /// and an xdg_popup is only as big as its panel — so unlike the
+    /// output-sized overlay this replaced, the surface itself has to change.
+    /// `reposition` is exactly that request; the compositor answers with a
+    /// fresh xdg_popup.configure and xdg_surface.configure, which reallocate.
+    /// Returns true when a reposition went out, in which case the repaint is
+    /// the compositor's configure to trigger and not the caller's.
+    fn reposition_popup(&mut self, qh: &QueueHandle<State>) -> bool {
+        let Some(wm) = self.xdg_wm_base.clone() else {
+            return false;
+        };
+        let bar_h = self.height as i32;
+        let Some(popup) = self.popup.as_mut() else {
+            return false;
+        };
+        // reposition arrived in xdg_popup v3. Against an older compositor the
+        // menu simply keeps the size it opened with, which is what it did
+        // before any of this — never a protocol error.
+        if popup.popup.version() < 3 {
+            return false;
+        }
+        let (pw, ph) = popup_size(&popup.kind, popup.output_h, bar_h);
+        if pw as u32 == popup.panel_w && ph as u32 == popup.panel_h {
+            return false;
+        }
+        popup.repos_token = popup.repos_token.wrapping_add(1);
+        let pos = make_positioner(&wm, qh, &popup.kind, popup.anchor, popup.at_top, pw, ph);
+        popup.popup.reposition(&pos, popup.repos_token);
+        pos.destroy();
+        true
+    }
+
+    /// When a popup repaint that the frame gate deferred must go out anyway.
+    /// `None` when nothing is waiting.
+    fn popup_deadline(&self) -> Option<Instant> {
+        let p = self.popup.as_ref()?;
+        if !p.dirty || !p.frame_pending {
+            return None;
+        }
+        Some(p.frame_at? + FRAME_FALLBACK)
     }
 
     /// The popup hit under (x,y), if any.
@@ -1656,13 +1751,12 @@ impl State {
 
     /// One wheel notch over the popup: scroll the app list / shift the month.
     fn popup_scroll(&mut self, qh: &QueueHandle<State>, dir: i32) {
-        let bar_h = self.height as i32;
         let Some(popup) = self.popup.as_mut() else {
             return;
         };
         match &mut popup.kind {
             PopupKind::Apps { visible, scroll, .. } => {
-                let rows_fit = apps_rows_fit(popup.height.max(1) as i32, bar_h);
+                let rows_fit = panel_rows_fit(popup.panel_h as i32);
                 let max_scroll = visible.len().saturating_sub(rows_fit);
                 let new = (*scroll as i32 + dir).clamp(0, max_scroll as i32) as usize;
                 if new != *scroll {
@@ -1684,7 +1778,6 @@ impl State {
             Cal(i32),
             Render,
         }
-        let bar_h = self.height as i32;
         let mut act = Do::Nothing;
         if let Some(popup) = self.popup.as_mut() {
             match &mut popup.kind {
@@ -1695,7 +1788,7 @@ impl State {
                     sel,
                     scroll,
                 } => {
-                    let rows_fit = apps_rows_fit(popup.height.max(1) as i32, bar_h);
+                    let rows_fit = panel_rows_fit(popup.panel_h as i32);
                     match key {
                         KEY_ESC_WL if !filter.is_empty() => {
                             filter.clear();
@@ -1776,7 +1869,14 @@ impl State {
                 self.spawn(&cmd);
             }
             Do::Cal(d) => self.cal_shift(qh, d),
-            Do::Render => self.render_popup(qh),
+            // A keystroke that narrowed (or widened) the result list changes
+            // how tall the panel has to be; the configure that answers the
+            // reposition repaints it, so do not paint the old size first.
+            Do::Render => {
+                if !self.reposition_popup(qh) {
+                    self.render_popup(qh);
+                }
+            }
         }
     }
 
@@ -2562,48 +2662,173 @@ const APPS_PAD: i32 = 8;
 /// field would silently hide what the user typed).
 const APPS_FILTER_MAX: usize = ((APPS_PW - 20 - 24) / GLYPH_W) as usize;
 
+// Calendar panel geometry, shared by `popup_size` and `draw_calendar`.
+const CAL_CELL_W: i32 = 30;
+const CAL_CELL_H: i32 = 24;
+const CAL_PAD: i32 = 12;
+const CAL_HEADER_H: i32 = 36;
+const CAL_WKD_H: i32 = 20;
+
 /// How many app rows fit between the bars on an output `oh` tall.
 fn apps_rows_fit(oh: i32, bar_h: i32) -> usize {
     let span = (oh - bar_h - 6) - (bar_h + 8);
     ((span - APPS_HEADER_H - APPS_SEARCH_H - APPS_PAD) / APPS_ROW_H).max(1) as usize
 }
 
-/// Paint the application menu overlay: a dim scrim over the whole output and
-/// a rounded panel anchored above the bottom bar's launcher, holding a header,
-/// a live search field, the filtered app rows (icon + name, scrolled to
-/// `scroll`, `sel` highlighted) and a scrollbar when the list overflows.
-/// Returns the panel rect and the row/arrow hitboxes.
+/// Build the positioner for a popup: how big the panel is, which button it
+/// hangs off and which way it grows. Split out because `reposition` has to
+/// build the same thing again when the panel changes size.
+fn make_positioner(
+    wm: &XdgWmBase,
+    qh: &QueueHandle<State>,
+    kind: &PopupKind,
+    anchor: (i32, i32, i32, i32),
+    at_top: bool,
+    pw: i32,
+    ph: i32,
+) -> XdgPositioner {
+    let pos = wm.create_positioner(qh, ());
+    pos.set_size(pw.max(1), ph.max(1));
+    pos.set_anchor_rect(anchor.0, anchor.1, anchor.2.max(1), anchor.3.max(1));
+    // Menus that hang off a left-hand button align their left edge with it;
+    // the right-hand pills (clock, power, volume) align right. That is the
+    // direction each one has room to grow in.
+    let left = matches!(kind, PopupKind::Apps { .. } | PopupKind::TaskMenu { .. });
+    let (a, g) = match (at_top, left) {
+        (false, true) => (xdg_positioner::Anchor::TopLeft, xdg_positioner::Gravity::TopRight),
+        (false, false) => (xdg_positioner::Anchor::TopRight, xdg_positioner::Gravity::TopLeft),
+        (true, true) => (xdg_positioner::Anchor::BottomLeft, xdg_positioner::Gravity::BottomRight),
+        (true, false) => (xdg_positioner::Anchor::BottomRight, xdg_positioner::Gravity::BottomLeft),
+    };
+    pos.set_anchor(a);
+    pos.set_gravity(g);
+    // Let the compositor keep the menu on the output. Slide and flip only:
+    // NOT resize, so the size it configures is the size asked for and the
+    // layout never has to re-flow.
+    pos.set_constraint_adjustment(
+        xdg_positioner::ConstraintAdjustment::SlideX
+            | xdg_positioner::ConstraintAdjustment::SlideY
+            | xdg_positioner::ConstraintAdjustment::FlipY,
+    );
+    pos
+}
+
+/// How many app rows a panel `ph` tall can show. The panel is sized from the
+/// result list at open time, so this and `popup_size` must agree.
+fn panel_rows_fit(ph: i32) -> usize {
+    ((ph - APPS_HEADER_H - APPS_SEARCH_H - APPS_PAD) / APPS_ROW_H).max(1) as usize
+}
+
+/// The panel size a popup kind wants, in logical pixels, on an output `oh`
+/// tall with bars `bar_h` tall. The compositor places it from here on, so this
+/// is the only geometry the client still decides.
+fn popup_size(kind: &PopupKind, oh: i32, bar_h: i32) -> (i32, i32) {
+    match kind {
+        PopupKind::Apps { visible, .. } => {
+            let rows_fit = apps_rows_fit(oh, bar_h);
+            // At least one row, so an empty filter still has somewhere to say
+            // it found nothing.
+            let shown = visible.len().clamp(1, rows_fit) as i32;
+            (
+                APPS_PW,
+                APPS_HEADER_H + APPS_SEARCH_H + shown * APPS_ROW_H + APPS_PAD,
+            )
+        }
+        PopupKind::Calendar { .. } => (
+            7 * CAL_CELL_W + 2 * CAL_PAD,
+            CAL_HEADER_H + CAL_WKD_H + 6 * CAL_CELL_H + CAL_PAD,
+        ),
+        PopupKind::PowerMenu => (180, 160),
+        PopupKind::TaskMenu { .. } => (200, 130),
+        PopupKind::Volume { .. } => (180, 80),
+    }
+}
+
+/// The panel ground: a soft drop shadow, then the rounded panel itself.
+///
+/// This is what replaced the full-output scrim. A menu that dims the whole
+/// desktop to separate itself from it is not what the protocol offers a panel
+/// — an xdg_popup is only as big as the menu, so the separation has to be
+/// drawn, the way every other toolkit draws it.
+fn draw_panel(cv: &mut Canvas, px: i32, py: i32, pw: i32, ph: i32, rad: i32) {
+    // Concentric rounded rects, each a thin veil: they accumulate to a dark
+    // core at the panel's edge and fade to nothing at the margin. Offset down
+    // by a couple of pixels so the light reads as coming from above.
+    for i in (1..=POPUP_SHADOW).rev() {
+        cv.round_rect_a(
+            px - i,
+            py - i + 2,
+            pw + 2 * i,
+            ph + 2 * i,
+            rad + i,
+            (0, 0, 0),
+            0.06,
+        );
+    }
+    cv.round_rect_a(px, py, pw, ph, rad, pal().menu_panel, 0.98);
+}
+
+/// Paint whichever popup is open into `cv` with its panel at `px`,`py`, and
+/// return its hit rects in the same coordinates.
+fn draw_popup(
+    cv: &mut Canvas,
+    px: i32,
+    py: i32,
+    pw: i32,
+    ph: i32,
+    kind: &mut PopupKind,
+    icons: &mut IconCache,
+) -> Vec<(i32, i32, i32, i32, Action)> {
+    match kind {
+        PopupKind::Apps {
+            all,
+            filter,
+            visible,
+            sel,
+            scroll,
+        } => {
+            // Clamp the scroll window and selection against the panel the
+            // compositor actually gave us before painting.
+            let rows_fit = panel_rows_fit(ph);
+            if !visible.is_empty() && *sel >= visible.len() {
+                *sel = visible.len() - 1;
+            }
+            let max_scroll = visible.len().saturating_sub(rows_fit);
+            if *scroll > max_scroll {
+                *scroll = max_scroll;
+            }
+            draw_apps(cv, px, py, pw, ph, all, visible, filter, *sel, *scroll, icons)
+        }
+        PopupKind::Calendar { year, month } => draw_calendar(cv, px, py, pw, ph, *year, *month),
+        PopupKind::PowerMenu => draw_power_menu(cv, px, py, pw, ph),
+        PopupKind::TaskMenu { tid, title } => draw_task_menu(cv, px, py, pw, ph, *tid, title),
+        PopupKind::Volume { level } => draw_volume_menu(cv, px, py, pw, ph, *level),
+    }
+}
+
+/// Paint the application menu into the panel rect `px`,`py`,`pw`,`ph`: a
+/// header, a live search field, the filtered app rows (icon + name, scrolled
+/// to `scroll`, `sel` highlighted) and a scrollbar when the list overflows.
+/// The compositor places the panel, so this only fills it. Returns the row and
+/// arrow hitboxes, in the same coordinates.
 #[allow(clippy::too_many_arguments)]
 fn draw_apps(
     cv: &mut Canvas,
-    ow: usize,
-    oh: usize,
-    bar_h: i32,
+    px: i32,
+    py: i32,
+    pw: i32,
+    ph: i32,
     all: &[apps::AppEntry],
     visible: &[usize],
     filter: &str,
     sel: usize,
     scroll: usize,
     icons: &mut IconCache,
-) -> PopupFrame {
-    // Dim backdrop (the canvas starts fully transparent).
-    cv.fill_rect_a(0, 0, ow as i32, oh as i32, (0, 0, 0), 0.35);
+) -> Vec<(i32, i32, i32, i32, Action)> {
+    // How many rows this panel was sized for (see `popup_size`).
+    let rows_fit = panel_rows_fit(ph);
 
-    let pw = APPS_PW;
-    // Pinned to the left edge, under the launcher — except in the Windows 11
-    // look, where the launcher itself is centred and so is its menu.
-    let px = if centered_tasks() {
-        ((ow as i32 - pw) / 2).max(8)
-    } else {
-        8
-    };
-    let rows_fit = apps_rows_fit(oh as i32, bar_h);
-    let shown = visible.len().clamp(1, rows_fit) as i32; // >=1: empty-state row
-    let ph = APPS_HEADER_H + APPS_SEARCH_H + shown * APPS_ROW_H + APPS_PAD;
-    let bottom = oh as i32 - bar_h - 6;
-    let py = (bottom - ph).max(bar_h + 8);
-
-    cv.round_rect_a(px, py, pw, ph, 12, pal().menu_panel, 0.98);
+    draw_panel(cv, px, py, pw, ph, 12);
     // Violet accent rule under the header.
     cv.hline(px + 10, py + APPS_HEADER_H - 1, pw - 20, pal().rule, 0.7);
 
@@ -2639,8 +2864,8 @@ fn draw_apps(
         // here — so the whole filter always renders.
         sx + 10 + cv.text(filter, sx + 10, f_y, pal().text)
     };
-    // Solid, not blinking: the overlay is output-sized, so a blink would cost
-    // a full-screen repaint + composite every second (see the tick loop).
+    // Solid, not blinking: a caret that blinks is a repaint (and a composite)
+    // every second for one cursor, which the tick loop deliberately skips.
     cv.fill_rect_a(caret_x + 1, sy + 4, 2, sh - 8, pal().accent, 0.9);
 
     // Rows (the scroll window over `visible`).
@@ -2661,7 +2886,7 @@ fn draw_apps(
             if selected {
                 cv.round_rect_a(px + 5, y + 1, pw - 10, APPS_ROW_H - 2, 6, pal().menu_hover, 1.0);
             }
-            let e = &all[ai];
+            let Some(e) = all.get(ai) else { continue };
             // Icon slot: the entry's Icon=, else its name against the theme
             // index, else the letter badge.
             let iy = y + (APPS_ROW_H - is) / 2;
@@ -2703,40 +2928,27 @@ fn draw_apps(
         }
     }
 
-    ((px, py, pw, ph), hits)
+    hits
 }
 
 // ── Calendar drawing ─────────────────────────────────────────────────────────
 
-/// Paint the calendar overlay: a dim scrim and a month panel anchored to the
-/// right edge — under the top bar when opened from the date pill, above the
-/// bottom bar when opened from the clock. Today is highlighted; ◂/▸ hitboxes
-/// shift the month. Returns the panel rect and the arrow hitboxes.
+/// Paint the month calendar into the panel rect. Today is highlighted; ◂/▸
+/// hitboxes shift the month. Returns the arrow hitboxes.
 fn draw_calendar(
     cv: &mut Canvas,
-    ow: usize,
-    oh: usize,
-    bar_h: i32,
+    px: i32,
+    py: i32,
+    pw: i32,
+    ph: i32,
     year: i32,
     month: u32,
-    at_top: bool,
-) -> PopupFrame {
-    cv.fill_rect_a(0, 0, ow as i32, oh as i32, (0, 0, 0), 0.35);
-
-    let (cell_w, cell_h) = (30, 24);
-    let pad = 12;
-    let pw = 7 * cell_w + 2 * pad;
-    let header_h = 36;
-    let wkd_h = 20;
-    let ph = header_h + wkd_h + 6 * cell_h + pad;
-    let px = (ow as i32 - pw - 8).max(0);
-    let py = if at_top {
-        bar_h + 6
-    } else {
-        (oh as i32 - bar_h - 6 - ph).max(bar_h + 6)
-    };
-
-    cv.round_rect_a(px, py, pw, ph, 12, pal().menu_panel, 0.98);
+) -> Vec<(i32, i32, i32, i32, Action)> {
+    let (cell_w, cell_h) = (CAL_CELL_W, CAL_CELL_H);
+    let pad = CAL_PAD;
+    let header_h = CAL_HEADER_H;
+    let wkd_h = CAL_WKD_H;
+    draw_panel(cv, px, py, pw, ph, 12);
     cv.hline(px + 10, py + header_h - 1, pw - 20, pal().rule, 0.7);
 
     // Header: ◂ month year ▸.
@@ -2786,29 +2998,19 @@ fn draw_calendar(
         }
     }
 
-    ((px, py, pw, ph), hits)
+    hits
 }
 
 // ── Power menu drawing ───────────────────────────────────────────────────────
 
 fn draw_power_menu(
     cv: &mut Canvas,
-    ow: usize,
-    oh: usize,
-    bar_h: i32,
-    _at_top: bool,
-) -> PopupFrame {
-    cv.fill_rect_a(0, 0, ow as i32, oh as i32, (0, 0, 0), 0.35);
-
-    let (pw, ph) = (180, 160);
-    let px = (ow as i32 - pw - 10).max(0);
-    let py = if _at_top {
-        bar_h + 6
-    } else {
-        (oh as i32 - bar_h - 6 - ph).max(bar_h + 6)
-    };
-
-    cv.round_rect_a(px, py, pw, ph, 10, pal().menu_panel, 0.98);
+    px: i32,
+    py: i32,
+    pw: i32,
+    ph: i32,
+) -> Vec<(i32, i32, i32, i32, Action)> {
+    draw_panel(cv, px, py, pw, ph, 10);
     cv.round_rect_a(px, py, pw, ph, 10, pal().rule, 0.4);
 
     let items = [
@@ -2843,27 +3045,21 @@ fn draw_power_menu(
         hits.push((px + 6, ry, px + pw - 6, ry + row_h, *act));
     }
 
-    ((px, py, pw, ph), hits)
+    hits
 }
 
 // ── Window context menu drawing ──────────────────────────────────────────────
 
 fn draw_task_menu(
     cv: &mut Canvas,
-    ow: usize,
-    oh: usize,
-    bar_h: i32,
+    px: i32,
+    py: i32,
+    pw: i32,
+    ph: i32,
     tid: u32,
     title: &str,
-    _at_top: bool,
-) -> PopupFrame {
-    cv.fill_rect_a(0, 0, ow as i32, oh as i32, (0, 0, 0), 0.35);
-
-    let (pw, ph) = (200, 130);
-    let px = (ow as i32 - pw - 10).max(0);
-    let py = (oh as i32 - bar_h - 6 - ph).max(bar_h + 6);
-
-    cv.round_rect_a(px, py, pw, ph, 10, pal().menu_panel, 0.98);
+) -> Vec<(i32, i32, i32, i32, Action)> {
+    draw_panel(cv, px, py, pw, ph, 10);
     cv.round_rect_a(px, py, pw, ph, 10, pal().rule, 0.4);
 
     let max_chars = ((pw - 24) / GLYPH_W) as usize;
@@ -2893,26 +3089,20 @@ fn draw_task_menu(
         hits.push((px + 6, ry, px + pw - 6, ry + row_h, *act));
     }
 
-    ((px, py, pw, ph), hits)
+    hits
 }
 
 // ── Volume control popup drawing ─────────────────────────────────────────────
 
 fn draw_volume_menu(
     cv: &mut Canvas,
-    ow: usize,
-    oh: usize,
-    bar_h: i32,
+    px: i32,
+    py: i32,
+    pw: i32,
+    ph: i32,
     vol: u32,
-    _at_top: bool,
-) -> PopupFrame {
-    cv.fill_rect_a(0, 0, ow as i32, oh as i32, (0, 0, 0), 0.35);
-
-    let (pw, ph) = (180, 80);
-    let px = (ow as i32 - pw - 60).max(0);
-    let py = (oh as i32 - bar_h - 6 - ph).max(bar_h + 6);
-
-    cv.round_rect_a(px, py, pw, ph, 10, pal().menu_panel, 0.98);
+) -> Vec<(i32, i32, i32, i32, Action)> {
+    draw_panel(cv, px, py, pw, ph, 10);
 
     cv.volume_icon(px + 14, py + 14, 16, pal().white, vol == 0);
     let label = format!("volumen {}%", vol);
@@ -2925,7 +3115,7 @@ fn draw_volume_menu(
     // One continuous hitbox — percent is derived from the click x.
     hits.push((px + 15, gy - 10, px + 15 + gw, gy + 20, Action::VolumeGauge));
 
-    ((px, py, pw, ph), hits)
+    hits
 }
 
 // ── Tooltip drawing ──────────────────────────────────────────────────────────
@@ -3033,6 +3223,14 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
                     "wl_shm" => state.shm = Some(registry.bind(name, 1, qh, ())),
                     "zwlr_layer_shell_v1" => {
                         state.layer_shell = Some(registry.bind(name, version.min(4), qh, ()))
+                    }
+                    // v3 for `xdg_popup.reposition`, which the app menu needs
+                    // to shrink as a search filters it; `set_window_geometry`,
+                    // the positioner and the grab are all v1, so an older
+                    // compositor still gets working menus, just fixed-size
+                    // ones (see `reposition_popup`).
+                    "xdg_wm_base" => {
+                        state.xdg_wm_base = Some(registry.bind(name, version.min(3), qh, ()))
                     }
                     "zwlr_foreign_toplevel_manager_v1" => {
                         state.foreign_mgr = Some(registry.bind(name, version.min(3), qh, ()))
@@ -3231,8 +3429,15 @@ impl Dispatch<wl_pointer::WlPointer, ()> for State {
                 }
             }
             wl_pointer::Event::Button {
-                button, state: bs, ..
+                serial,
+                button,
+                state: bs,
+                ..
             } => {
+                // Every press, not just the ones that open a menu: the grab a
+                // popup takes is only granted against a serial the compositor
+                // can tie to a real click.
+                state.ptr_btn_serial = serial;
                 let pressed = matches!(bs, WEnum::Value(wl_pointer::ButtonState::Pressed));
                 if !pressed {
                     return;
@@ -3255,7 +3460,7 @@ impl Dispatch<wl_pointer::WlPointer, ()> for State {
                 let (px0, px1) = state.bars[idx].power_hit;
                 let (kx0, kx1) = state.bars[idx].kbd_hit;
                 if button == BTN_LEFT && x >= lx0 && x < lx1 {
-                    state.toggle_apps(qh);
+                    state.toggle_apps(qh, role == Role::Info);
                 } else if button == BTN_LEFT && x >= cx0 && x < cx1 {
                     state.toggle_calendar(qh, role == Role::Info);
                 } else if button == BTN_LEFT && x >= vx0 && x < vx1 {
@@ -3272,7 +3477,7 @@ impl Dispatch<wl_pointer::WlPointer, ()> for State {
                         .map(|h| h.tid);
                     if let Some(tid) = hit {
                         if button == BTN_RIGHT {
-                            state.toggle_task_menu(qh, tid);
+                            state.toggle_task_menu(qh, tid, role == Role::Info);
                         } else {
                             state.task_click(tid, button);
                         }
@@ -3301,35 +3506,89 @@ impl Dispatch<wl_pointer::WlPointer, ()> for State {
     }
 }
 
-// Popup overlay: its own layer surface (PopupId udata) and ARGB buffers.
-impl Dispatch<ZwlrLayerSurfaceV1, PopupId> for State {
+// xdg-shell base. The ping MUST be answered: a client that does not pong is
+// one the compositor is entitled to treat as hung and kill.
+impl Dispatch<XdgWmBase, ()> for State {
+    fn event(
+        _: &mut Self,
+        wm: &XdgWmBase,
+        event: xdg_wm_base::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<State>,
+    ) {
+        if let xdg_wm_base::Event::Ping { serial } = event {
+            wm.pong(serial);
+        }
+    }
+}
+
+// The popup's xdg_surface: its configure is what makes a buffer legal.
+impl Dispatch<XdgSurface, ()> for State {
     fn event(
         state: &mut Self,
-        layer: &ZwlrLayerSurfaceV1,
-        event: zwlr_layer_surface_v1::Event,
-        _: &PopupId,
+        xdg: &XdgSurface,
+        event: xdg_surface::Event,
+        _: &(),
         _: &Connection,
         qh: &QueueHandle<State>,
     ) {
+        if let xdg_surface::Event::Configure { serial } = event {
+            xdg.ack_configure(serial);
+            // A configure for a REPLACED popup (clicking the clock while the
+            // app menu is up tears one down and builds another) must not be
+            // applied to its successor: that would attach a buffer to a
+            // surface whose own first configure has not arrived, which
+            // xdg-shell forbids and wlroots answers with a protocol error —
+            // and this event loop exits on one, so the panel would vanish.
+            if !matches!(state.popup.as_ref(), Some(p) if p.xdg.id() == xdg.id()) {
+                return;
+            }
+            let Some((pw, ph)) = state.popup.as_ref().map(|p| (p.panel_w, p.panel_h)) else {
+                return;
+            };
+            state.configure_popup(qh, pw, ph);
+        }
+    }
+}
+
+// The popup proper: `configure` carries the geometry the compositor settled
+// on, `popup_done` is the dismissal it performed for us (a click outside, or
+// the parent going away) — which is the whole point of taking the grab.
+impl Dispatch<XdgPopup, ()> for State {
+    fn event(
+        state: &mut Self,
+        popup: &XdgPopup,
+        event: xdg_popup::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<State>,
+    ) {
         match event {
-            zwlr_layer_surface_v1::Event::Configure {
-                serial,
-                width,
-                height,
-            } => {
-                layer.ack_configure(serial);
-                // A configure for a REPLACED overlay (clicking the clock while
-                // the app menu is up tears one down and builds another) must
-                // not be applied to its successor: that would size and — worse
-                // — attach a buffer to a surface whose own first configure has
-                // not arrived, which layer-shell forbids and wlroots answers
-                // with a protocol error, i.e. the panel disappears.
-                if !matches!(state.popup.as_ref(), Some(p) if p.layer.id() == layer.id()) {
+            xdg_popup::Event::Configure { width, height, .. } => {
+                let Some(p) = state.popup.as_mut() else { return };
+                if p.popup.id() != popup.id() {
                     return;
                 }
-                state.configure_popup(qh, width, height);
+                // Geometry only, and deliberately so. xdg_surface.configure
+                // "marks the END of a configure sequence", and the roles
+                // "extend this event as a latched state sent as events BEFORE
+                // the xdg_surface.configure event... where the
+                // xdg_surface.configure commits the accumulated state". So
+                // this always arrives first and the surface configure that
+                // closes the sequence is what allocates and paints. Acting
+                // here instead would reallocate and commit a buffer against a
+                // configure that has not been acked yet.
+                if width > 0 && height > 0 {
+                    p.panel_w = width as u32;
+                    p.panel_h = height as u32;
+                }
             }
-            zwlr_layer_surface_v1::Event::Closed => state.close_popup(),
+            xdg_popup::Event::PopupDone => {
+                if matches!(state.popup.as_ref(), Some(p) if p.popup.id() == popup.id()) {
+                    state.close_popup();
+                }
+            }
             _ => {}
         }
     }
@@ -3683,6 +3942,8 @@ impl Dispatch<wl_seat::WlSeat, ()> for State {
     }
 }
 wayland_client::delegate_noop!(State: ignore ZwlrLayerShellV1);
+// The positioner is write-only and destroyed right after `get_popup`.
+wayland_client::delegate_noop!(State: ignore XdgPositioner);
 
 /// Connect to the Wayland compositor, auto-detecting the socket when the
 /// environment does not point at one.
@@ -3975,8 +4236,23 @@ fn main() {
         let want_power = std::env::var("LUNARBAR_DUMP_POWER").is_ok();
         if want_menu || want_cal || want_power {
             let mut cv = Canvas::new(w, full_h);
+            // The compositor places the real thing; here the preview has to,
+            // so it hangs the panel off the bottom bar the way the positioner
+            // would (left for the menu, right for the calendar and power).
+            let place = |kind: &PopupKind, left: bool| -> (i32, i32, i32, i32) {
+                let (pw, ph) = popup_size(kind, full_h as i32, bh as i32);
+                let px = if left {
+                    POPUP_SHADOW
+                } else {
+                    (w as i32 - pw - POPUP_SHADOW).max(POPUP_SHADOW)
+                };
+                let py = (full_h as i32 - bh as i32 - POPUP_SHADOW - ph).max(POPUP_SHADOW);
+                (px, py, pw, ph)
+            };
             if want_power {
-                draw_power_menu(&mut cv, w, full_h, bh as i32, false);
+                let k = PopupKind::PowerMenu;
+                let (px, py, pw, ph) = place(&k, false);
+                draw_power_menu(&mut cv, px, py, pw, ph);
             } else if want_menu {
                 let mut all = vec![apps::AppEntry {
                     name: "Terminal".into(),
@@ -3993,10 +4269,20 @@ fn main() {
                 }
                 let visible: Vec<usize> = (0..all.len()).collect();
                 let mut ic = IconCache::default();
-                draw_apps(&mut cv, w, full_h, bh as i32, &all, &visible, "", 1, 0, &mut ic);
+                let k = PopupKind::Apps {
+                    all: Vec::new(),
+                    filter: String::new(),
+                    visible: visible.clone(),
+                    sel: 0,
+                    scroll: 0,
+                };
+                let (px, py, pw, ph) = place(&k, true);
+                draw_apps(&mut cv, px, py, pw, ph, &all, &visible, "", 1, 0, &mut ic);
             } else {
                 let (y, mo, _) = sysinfo::today().unwrap_or((2026, 0, 1));
-                draw_calendar(&mut cv, w, full_h, bh as i32, y, mo, false);
+                let k = PopupKind::Calendar { year: y, month: mo };
+                let (px, py, pw, ph) = place(&k, false);
+                draw_calendar(&mut cv, px, py, pw, ph, y, mo);
             }
             // Alpha-composite the overlay over the opaque preview.
             let mut over = vec![0u8; w * full_h * 4];
@@ -4054,6 +4340,9 @@ fn main() {
     }
     if state.foreign_mgr.is_none() {
         eprintln!("lunarbar: no wlr-foreign-toplevel-management — taskbar will be empty");
+    }
+    if state.xdg_wm_base.is_none() {
+        eprintln!("lunarbar: no xdg_wm_base — the menus cannot open");
     }
     // Build the icon indexes before the bars map, so the first taskbar paint
     // does not stall the event loop on a cold-cache theme walk.
@@ -4134,11 +4423,9 @@ fn main() {
             state.tick = state.tick.wrapping_add(1);
             state.render_all();
             // Popups are static between interactions and repaint from their
-            // own events. Nothing is redrawn here: the overlay is an
-            // output-sized surface, so a per-second repaint would mean a
-            // full-screen render, an ~8 MB swizzle and a whole-screen damage
-            // (forcing a full re-composite) just to toggle a caret — the
-            // caret is drawn solid instead.
+            // own events, so nothing is redrawn here: a per-second repaint
+            // just to toggle a caret is a render, a swizzle and a composite
+            // for one blinking cursor. The caret is drawn solid instead.
             next_tick += interval;
             let now = std::time::Instant::now();
             if next_tick < now {
@@ -4146,4 +4433,167 @@ fn main() {
             }
         }
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn apps(n: usize) -> PopupKind {
+        PopupKind::Apps {
+            all: (0..n)
+                .map(|i| apps::AppEntry {
+                    name: format!("app {i}"),
+                    exec: String::new(),
+                    icon: None,
+                })
+                .collect(),
+            filter: String::new(),
+            visible: (0..n).collect(),
+            sel: 0,
+            scroll: 0,
+        }
+    }
+
+    const KINDS: [fn() -> PopupKind; 4] = [
+        || PopupKind::Calendar { year: 2026, month: 8 },
+        || PopupKind::PowerMenu,
+        || PopupKind::TaskMenu { tid: 1, title: String::new() },
+        || PopupKind::Volume { level: 50 },
+    ];
+
+    /// The panel is sized from the result list, and the scroll clamp, the
+    /// keyboard navigation and the drawing all re-derive the row count from
+    /// the panel HEIGHT. If those two disagree the menu scrolls past its own
+    /// last row, or hides one.
+    #[test]
+    fn panel_height_and_row_count_agree() {
+        for oh in [600, 768, 1080, 1440, 2160] {
+            let fits = apps_rows_fit(oh, 34);
+            for n in [0, 1, 2, 7, 40, 500] {
+                let (_, ph) = popup_size(&apps(n), oh, 34);
+                let shown = n.clamp(1, fits);
+                assert_eq!(
+                    panel_rows_fit(ph),
+                    shown,
+                    "oh={oh} n={n}: panel {ph}px was sized for {shown} rows"
+                );
+            }
+        }
+    }
+
+    /// An empty result list still needs a row to say so in.
+    #[test]
+    fn an_empty_result_list_still_gets_a_row() {
+        let (_, ph) = popup_size(&apps(0), 1080, 34);
+        assert_eq!(panel_rows_fit(ph), 1);
+        assert!(ph > APPS_HEADER_H + APPS_SEARCH_H);
+    }
+
+    /// The app menu must fit between the two bars: it is an xdg_popup now, so
+    /// a panel taller than the output is one the compositor has to slide or
+    /// flip, and either way the user loses rows off an edge.
+    #[test]
+    fn the_app_menu_fits_between_the_bars() {
+        for oh in [480, 600, 768, 1080, 1440] {
+            let bar_h = 34;
+            let (_, ph) = popup_size(&apps(10_000), oh, bar_h);
+            let span = (oh - bar_h - 6) - (bar_h + 8);
+            assert!(ph <= span.max(1), "oh={oh}: panel {ph}px over a {span}px gap");
+        }
+    }
+
+    /// Every kind must ask for a positive size: `xdg_positioner.set_size`
+    /// rejects zero, and a rejected positioner is a protocol error, which this
+    /// event loop exits on.
+    #[test]
+    fn every_popup_asks_for_a_positive_size() {
+        for oh in [0, 1, 100, 1080] {
+            for bar_h in [0, 34, 4096] {
+                for mk in KINDS {
+                    let (w, h) = popup_size(&mk(), oh, bar_h);
+                    assert!(w > 0 && h > 0, "{w}x{h} at oh={oh} bar_h={bar_h}");
+                }
+                for n in [0, 3, 900] {
+                    let (w, h) = popup_size(&apps(n), oh, bar_h);
+                    assert!(w > 0 && h > 0, "apps({n}) {w}x{h} at oh={oh} bar_h={bar_h}");
+                }
+            }
+        }
+    }
+
+    /// A shorter output means fewer rows, never more — the scroll window is
+    /// sized from this and a non-monotonic count would make it jump.
+    #[test]
+    fn a_shorter_output_never_fits_more_rows() {
+        let mut last = usize::MAX;
+        for oh in (200..=2160).rev().step_by(37) {
+            let fits = apps_rows_fit(oh, 34);
+            assert!(fits <= last, "oh={oh} fits {fits} > {last}");
+            assert!(fits >= 1);
+            last = fits;
+        }
+    }
+
+    /// The search field's character cap is what the field can actually show.
+    /// If the cap were the larger of the two, typing would silently vanish.
+    #[test]
+    fn the_filter_cap_fits_the_search_field() {
+        let field_px = APPS_PW - 20 - 24;
+        assert!(APPS_FILTER_MAX as i32 * GLYPH_W <= field_px);
+    }
+
+    /// The drop shadow replaced the full-output scrim, so it has to actually
+    /// be there: alpha outside the panel that falls off with distance, and an
+    /// opaque panel inside. Alpha 0 all round would mean the menu floats with
+    /// nothing separating it from what is behind.
+    #[test]
+    fn the_panel_draws_a_shadow_that_fades_outward() {
+        let (pw, ph) = (60, 40);
+        let (px, py) = (POPUP_SHADOW, POPUP_SHADOW);
+        let (w, h) = ((pw + 2 * POPUP_SHADOW) as usize, (ph + 2 * POPUP_SHADOW) as usize);
+        let mut cv = Canvas::try_new(w, h).unwrap();
+        draw_panel(&mut cv, px, py, pw, ph, 10);
+        let mut buf = vec![0u8; w * h * 4];
+        assert!(cv.blit_argb(&mut buf));
+        let alpha = |x: i32, y: i32| buf[((y as usize * w) + x as usize) * 4 + 3];
+
+        // Inside the panel: effectively opaque.
+        assert!(alpha(px + pw / 2, py + ph / 2) > 240);
+        // Just outside its left edge: the shadow's dark core.
+        let near = alpha(px - 2, py + ph / 2);
+        // Out at the margin: still shadow, but faint.
+        let far = alpha(px - POPUP_SHADOW, py + ph / 2);
+        assert!(near > 0, "no shadow beside the panel");
+        assert!(far > 0, "no shadow at the margin");
+        assert!(near > far, "shadow does not fade outward: {near} then {far}");
+        // The very corner of the surface is past the shadow: clear.
+        assert_eq!(alpha(0, 0), 0);
+    }
+
+    /// Every hit rect a popup returns has to land inside the panel it was
+    /// drawn in. A hit outside is one the pointer can never reach, because
+    /// the popup's input region stops at the panel.
+    #[test]
+    fn popup_hits_stay_inside_the_panel() {
+        let (px, py) = (POPUP_SHADOW, POPUP_SHADOW);
+        let mut icons = IconCache::default();
+        let mut kinds: Vec<PopupKind> = KINDS.iter().map(|mk| mk()).collect();
+        kinds.push(apps(6));
+        for kind in kinds.iter_mut() {
+            let (pw, ph) = popup_size(kind, 1080, 34);
+            let (w, h) = ((pw + 2 * POPUP_SHADOW) as usize, (ph + 2 * POPUP_SHADOW) as usize);
+            let mut cv = Canvas::try_new(w, h).unwrap();
+            let hits = draw_popup(&mut cv, px, py, pw, ph, kind, &mut icons);
+            assert!(!hits.is_empty(), "a popup with nothing to click");
+            for (x0, y0, x1, y1, _) in hits {
+                assert!(x1 > x0 && y1 > y0, "empty hit {x0},{y0}..{x1},{y1}");
+                assert!(
+                    x0 >= px && y0 >= py && x1 <= px + pw && y1 <= py + ph,
+                    "hit {x0},{y0}..{x1},{y1} outside the {pw}x{ph} panel at {px},{py}"
+                );
+            }
+        }
+    }
+
 }
