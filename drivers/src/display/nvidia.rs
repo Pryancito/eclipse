@@ -11589,16 +11589,24 @@ impl NvidiaGpu {
                     );
                     return Err(nv::EBUSY);
                 }
-                // Sticky ctx-0 owner wins over "who currently has an rm_backed
-                // channel": a throwaway CHANNEL_FREE must not let a client take
-                // the compositor ladder (F-M15). Fall back to the live table
-                // only while nobody has claimed yet (first boot claimer).
+                // The sticky ctx-0 owner decides who is the compositor, and
+                // nothing else does: it is claimed BEFORE the ctx-0 channel
+                // goes into the table and released at exit AFTER the table has
+                // been purged of that process, so an RM-backed ctx-0 channel
+                // never exists without its owner in `ctx0_owner`. A throwaway
+                // CHANNEL_FREE keeps the claim (F-M15).
+                //
+                // Before this, the unclaimed case fell back to the live table,
+                // asking whether anyone ELSE held an RM-backed channel -- any
+                // channel, not one on context 0. A GL client's channel is
+                // RM-backed too, on a context of its own, so the compositor's
+                // respawn was made a client whenever one of the dead
+                // compositor's clients was still alive (Firefox, Xwayland:
+                // they outlive labwc's crash by milliseconds) -- for the rest
+                // of its life, with context 0 unclaimed, latchable wedged like
+                // any client, and the singleton idle.
                 let sticky = self.ctx0_owner.load(Ordering::Acquire);
-                let other_holds_ctx0 = if sticky != 0 {
-                    sticky != owner_pid
-                } else {
-                    chan.iter().any(|c| c.rm_backed && c.owner_pid != owner_pid)
-                };
+                let other_holds_ctx0 = sticky != 0 && sticky != owner_pid;
                 drop(chan);
                 if other_holds_ctx0 {
                     // The compositor holds context 0. This is a GL CLIENT: give it
@@ -18907,6 +18915,49 @@ mod nouveau_bookkeeping_tests {
         assert!(syncobj::destroy(out2));
         gpu.nouveau_release_process(A);
         gpu.nouveau_release_process(B);
+        assert_eq!(FAKE_RM.lock().bad, 0);
+    }
+
+    /// labwc's respawn after a crash finds its clients still alive for a few
+    /// milliseconds (Firefox, Xwayland). Its CHANNEL_ALLOC must still claim
+    /// context 0: a client's RM-backed channel is on a context of its own
+    /// and holds nothing of the singleton.
+    #[test]
+    fn the_compositors_respawn_claims_ctx0_while_a_client_of_the_dead_one_is_still_alive() {
+        let _g = LOCK.lock();
+        let _live = LiveBytes::hold();
+        let gpu = gpu_rm_ladder();
+        FAKE_RM.lock().peer = true;
+        test_clock::set_auto_advance(1_000);
+        let _ch_c = client_with_pushbuf(&gpu, COMP);
+        assert_eq!(ctx0_owner(&gpu), COMP);
+        let ch_a = client_with_pushbuf(&gpu, A);
+        assert_eq!(
+            ctx_of(&gpu, A),
+            Some((1, true)),
+            "the client is RM-backed, on its own context"
+        );
+        gpu.nouveau_release_process(COMP);
+        assert_eq!(ctx0_owner(&gpu), 0, "the role is free");
+        // The respawn, with A still alive.
+        let ch_c2 = client_with_pushbuf(&gpu, COMP2);
+        assert_eq!(
+            ctx0_owner(&gpu),
+            COMP2,
+            "the respawn is the compositor, not a client"
+        );
+        assert_eq!(step17_builds(), 2, "on a fresh singleton channel");
+        assert_eq!(ctx_of(&gpu, COMP2), None, "no client context for it");
+        assert_eq!(
+            exec(&gpu, COMP2, ch_c2, &[push(PUSH_VA, 16)], &[], &[]),
+            Ok(0)
+        );
+        assert_eq!(run_gpu(0).len(), 1);
+        // And the client is none the worse.
+        assert_eq!(exec(&gpu, A, ch_a, &[push(PUSH_VA, 16)], &[], &[]), Ok(0));
+        assert_eq!(run_gpu(1).len(), 1);
+        gpu.nouveau_release_process(A);
+        gpu.nouveau_release_process(COMP2);
         assert_eq!(FAKE_RM.lock().bad, 0);
     }
 
