@@ -420,6 +420,140 @@ pub fn flip_fence_enabled() -> bool {
     FLIP_FENCE_ENABLED.load(Ordering::Relaxed)
 }
 
+/// Whether every present reads the pixels it just put on screen a second time
+/// and reports the ones that changed under it (`drm.present_probe` on the
+/// cmdline). OFF by default, and not something to leave on: it re-reads a
+/// quarter of the damage box per frame.
+///
+/// It answers one question and nothing else: **were the pixels already wrong
+/// when the kernel got them?** Everything between the client's buffer and the
+/// panel has been walked and tested -- the damage-box blit on both store paths,
+/// the cursor patch's geometry, the cache invalidate, the scanout pause -- and
+/// none of it can invent a pixel. What no test here can see is a compositor
+/// that is still writing the buffer while the kernel reads it: llvmpipe and
+/// pixman rasterise on worker threads, and a present that arrives before they
+/// have drained scans out a frame that is complete in some tiles and not in
+/// others. On screen that is a band or a comb of stale pixels, visible only
+/// where the frame actually changed -- so a flat wallpaper hides it and a
+/// freshly blended window shadow does not.
+///
+/// The probe catches exactly that: checksum the window, blit it, invalidate and
+/// checksum it again. The two reads bracket the blit, so a mismatch means
+/// somebody else wrote those pixels while the kernel was copying them, and a
+/// run of frames with no mismatch means the buffer was settled and the defect
+/// is somewhere the kernel can be held responsible for.
+static PRESENT_PROBE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Turn the present probe on (or back off) for this boot.
+pub fn set_present_probe_enabled(on: bool) {
+    PRESENT_PROBE.store(on, Ordering::Relaxed);
+}
+
+/// Whether the present probe is armed for this boot.
+pub fn present_probe_enabled() -> bool {
+    PRESENT_PROBE.load(Ordering::Relaxed)
+}
+
+/// Rows the probe samples: every 4th one, every pixel within it.
+///
+/// Along a row it reads every pixel, because a single changed pixel is a real
+/// answer and a strided read could step over a one-pixel-wide comb. Across rows
+/// it samples, because a torn frame is never one row -- a rasteriser hands over
+/// tiles, so the smallest thing this is looking for is tens of rows tall.
+const PROBE_ROW_STEP: usize = 4;
+
+/// Order-dependent checksum of the `(x, y, w, h)` window of `pixels`, sampling
+/// every `row_step`-th row and every pixel within it.
+///
+/// Order-dependent matters: two frames can hold the same pixels in different
+/// places (a scrolled list, a window dragged by a pixel) and a sum or an XOR
+/// would call those equal. FNV-1a gives that for nothing -- each pixel is
+/// multiplied into the accumulator in turn, so the sequence is what is hashed,
+/// not the multiset. This used to fold the row and column in as well, which was
+/// two extra multiplies per pixel on a per-frame path buying nothing the chain
+/// did not already provide; the mutation that removed it could not be killed,
+/// and the honest resolution was to remove it here too.
+///
+/// `stride_px` of 0, an empty window, or a window whose first sampled row is
+/// already past the end of `pixels` all give `None`: there is nothing to
+/// compare, which is not the same answer as "these two match".
+fn probe_checksum(
+    pixels: &[u32],
+    stride_px: usize,
+    x: u32,
+    y: u32,
+    w: u32,
+    h: u32,
+    row_step: usize,
+) -> Option<u64> {
+    if stride_px == 0 || w == 0 || h == 0 || row_step == 0 {
+        return None;
+    }
+    // FNV-1a's 64-bit basis and prime. Wrapping on purpose: this is a hash, and
+    // a debug build must not panic on the overflow that is the whole mechanism.
+    let mut acc: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut sampled = 0usize;
+    let mut r = 0usize;
+    while r < h as usize {
+        let off = (y as usize)
+            .saturating_add(r)
+            .saturating_mul(stride_px)
+            .saturating_add(x as usize);
+        let end = off.saturating_add(w as usize);
+        if end > pixels.len() {
+            break;
+        }
+        for px in pixels[off..end].iter() {
+            acc ^= *px as u64;
+            acc = acc.wrapping_mul(0x100_0000_01b3);
+        }
+        sampled += 1;
+        r += row_step;
+    }
+    (sampled > 0).then_some(acc)
+}
+
+/// Whether the two reads bracketing a blit say somebody else was writing the
+/// window while the kernel copied it.
+///
+/// `after` is an `Option` because the second read can fail to produce an answer
+/// at all -- the framebuffer shrank, the mapping went away -- and that counts as
+/// changed. "I could not tell" must never come out as "the compositor is in the
+/// clear": this whole flag exists to decide who is responsible, and a wrong
+/// acquittal sends the search back to the code that has already been walked.
+fn probe_says_changed(before: u64, after: Option<u64>) -> bool {
+    after != Some(before)
+}
+
+/// How many probe mismatches have been reported, so a compositor that tears
+/// every frame does not turn the klog into the bottleneck. `klog` writes
+/// synchronously to the UART, which at 115200 baud is slower than the frame it
+/// is describing.
+static PROBE_REPORTS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+const MAX_PROBE_REPORTS: u32 = 12;
+
+/// How many probe mismatches this process has reported, so an end-to-end test
+/// can assert that a settled buffer produced none.
+#[cfg(test)]
+pub(crate) fn probe_reports_for_test() -> u32 {
+    PROBE_REPORTS.load(Ordering::Relaxed)
+}
+
+/// Whether this mismatch gets a line in the klog, and whether it is the last
+/// one. `(report, say_it_is_the_last)`.
+///
+/// `saturating_add`, because `already` is a counter this function does not own:
+/// [`PROBE_REPORTS`] is bumped with `fetch_add` on every mismatch and nothing
+/// stops it, so a boot that tears for long enough hands this `u32::MAX` and a
+/// plain `+ 1` panics the kernel from inside a diagnostic. A probe that brings
+/// the machine down is worse than no probe.
+fn probe_report_decision(already: u32) -> (bool, bool) {
+    (
+        already < MAX_PROBE_REPORTS,
+        already.saturating_add(1) == MAX_PROBE_REPORTS,
+    )
+}
+
 /// The render fences a legacy present on `fb_id` has to wait for, each as
 /// `(fence landing-zone kernel VA, payload)`. Empty when there is nothing to
 /// wait for: the switch is off, the fb is unknown, no driver is registered, or
@@ -2557,6 +2691,22 @@ pub fn scanout_region_checked(
             sync_elapsed = kernel_hal::timer::timer_now().saturating_sub(ts);
             cpu_src_synced = true;
         }
+        // Armed by `drm.present_probe` only: what the pixels looked like going
+        // in, so the read after the blit can say whether anybody else was
+        // writing them at the same time. See [`PRESENT_PROBE`].
+        let probe_before = if present_probe_enabled() {
+            probe_checksum(
+                pixels,
+                src_stride,
+                blit_x,
+                blit_y,
+                blit_w,
+                blit_h,
+                PROBE_ROW_STEP,
+            )
+        } else {
+            None
+        };
         // Banded blit with IRQs briefly re-enabled between bands — see
         // [`blit_chunked`]. Honours a DIRTYFB damage rect when present.
         if src_off < pixels.len() {
@@ -2569,6 +2719,46 @@ pub fn scanout_region_checked(
                 blit_w,
                 blit_h,
             );
+        }
+        if let Some(before) = probe_before {
+            // Invalidate before reading again, or the second read is served
+            // from the very lines the first one pulled in and the answer is
+            // always "unchanged" -- which is the answer that hides the defect.
+            if gem_cpu_mapped {
+                dma_sync_scanout_src_from_device(
+                    vaddr, fb.size, src_stride, blit_x, blit_y, blit_w, blit_h,
+                );
+            }
+            let after = probe_checksum(
+                pixels,
+                src_stride,
+                blit_x,
+                blit_y,
+                blit_w,
+                blit_h,
+                PROBE_ROW_STEP,
+            );
+            if probe_says_changed(before, after) {
+                let n = PROBE_REPORTS.fetch_add(1, Ordering::Relaxed);
+                let (report, last) = probe_report_decision(n);
+                if report {
+                    kernel_hal::klog_info!(
+                        "[drm] present probe: fb {} window {}x{}+{}+{} changed while it was \
+                         being scanned out -- the client is still writing the buffer it \
+                         presented{}",
+                        fb_id,
+                        blit_w,
+                        blit_h,
+                        blit_x,
+                        blit_y,
+                        if last {
+                            " (further mismatches will not be reported)"
+                        } else {
+                            ""
+                        }
+                    );
+                }
+            }
         }
     }
     let t_blit = kernel_hal::timer::timer_now();
@@ -4985,6 +5175,12 @@ pub(crate) fn reset_output_state_for_test() {
     HW_CURSOR.store(0, Ordering::Relaxed);
     // And back to the default boot, where the atomic uAPI is off.
     set_atomic_enabled(false);
+    // The probe is a diagnostic armed from the cmdline, so a test that armed it
+    // must not leave it armed: it makes every later present read its window
+    // twice and can put a line in the klog for a frame nobody was looking at.
+    // Its report budget goes back too, or the last test to run finds it spent.
+    set_present_probe_enabled(false);
+    PROBE_REPORTS.store(0, Ordering::Relaxed);
     let mut st = DRM_STATE.lock();
     st.cursor = CursorState::default();
     st.crtc_fb = 0;
@@ -7682,5 +7878,341 @@ mod scanout_pause_tests {
         assert!(!scanout_paused(), "a pause survived the reset");
         assert_eq!(SCANOUT_PAUSE_DEADLINE_NS.load(Ordering::SeqCst), 0);
         assert!(!SCANOUT_STALE.load(Ordering::SeqCst));
+    }
+}
+
+/// Tests for the present probe: the thing that answers whether the pixels were
+/// already wrong when the kernel got them.
+///
+/// The probe is a diagnostic, and a diagnostic that lies is worse than none: if
+/// it can miss a change inside the window it is asked about, a clean log
+/// wrongly clears the compositor; if it can fire on a change outside that
+/// window, every frame reports and the log says nothing. Both directions are
+/// pinned here, as is the blind spot it does have -- the rows it steps over --
+/// because that one is a deliberate trade and not an accident.
+#[cfg(test)]
+mod present_probe_tests {
+    extern crate std;
+
+    use self::std::vec;
+    use self::std::vec::Vec;
+    use super::*;
+
+    /// Put the process-global latches back however the body leaves them, and
+    /// serialise against every other test that touches them.
+    struct Restored {
+        _serialised: self::std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl Drop for Restored {
+        fn drop(&mut self) {
+            reset_output_state_for_test();
+        }
+    }
+
+    fn serialised() -> Restored {
+        let g = Restored {
+            _serialised: super::test_globals::lock(),
+        };
+        reset_output_state_for_test();
+        g
+    }
+
+    /// A buffer whose every pixel is distinct, so any change the checksum does
+    /// not notice is the checksum's fault and not a collision of equal values.
+    fn buf(stride_px: usize, rows: usize) -> Vec<u32> {
+        (0..stride_px * rows)
+            .map(|n| 0xFF00_0000 | n as u32)
+            .collect()
+    }
+
+    fn sum(pixels: &[u32], stride: usize, x: u32, y: u32, w: u32, h: u32) -> Option<u64> {
+        probe_checksum(pixels, stride, x, y, w, h, PROBE_ROW_STEP)
+    }
+
+    // --- what it must notice ---
+
+    /// The baseline every other test leans on: read the same window twice with
+    /// nothing touching it in between and the two answers match. Without this
+    /// the probe would report on every single frame and the log would carry no
+    /// information at all.
+    #[test]
+    fn the_same_window_read_twice_is_the_same_answer() {
+        let p = buf(64, 32);
+        assert_eq!(sum(&p, 64, 4, 4, 40, 20), sum(&p, 64, 4, 4, 40, 20));
+        assert!(sum(&p, 64, 4, 4, 40, 20).is_some());
+    }
+
+    /// The whole point. One pixel rewritten inside a row the probe samples, and
+    /// the second read says so.
+    #[test]
+    fn one_pixel_changed_inside_a_sampled_row_is_caught() {
+        let mut p = buf(64, 32);
+        let before = sum(&p, 64, 0, 0, 64, 32);
+        // Row 8 is a multiple of the step, so it is one the probe reads.
+        assert_eq!(8 % PROBE_ROW_STEP, 0);
+        p[8 * 64 + 17] ^= 0x00FF_00FF;
+        assert_ne!(before, sum(&p, 64, 0, 0, 64, 32));
+    }
+
+    /// Every pixel of a sampled row is read, not a stride of them -- so the
+    /// last column counts too. A comb of stale pixels can be one column wide,
+    /// and a probe that stepped along the row would walk straight past it.
+    #[test]
+    fn the_last_column_of_a_sampled_row_counts() {
+        let mut p = buf(64, 32);
+        let before = sum(&p, 64, 8, 0, 40, 12);
+        // x + w - 1, the rightmost pixel the window covers, on row 0.
+        p[47] ^= 0x0000_00FF;
+        assert_ne!(before, sum(&p, 64, 8, 0, 40, 12));
+    }
+
+    /// Two pixels swapped within a row: the same pixels, in different places.
+    /// A sum or an XOR would call that unchanged, which is why each pixel is
+    /// folded with the position it was read from. A scrolled list or a window
+    /// dragged by one pixel is exactly this shape.
+    #[test]
+    fn the_same_pixels_in_a_different_order_are_not_the_same_answer() {
+        let mut p = buf(64, 32);
+        let before = sum(&p, 64, 0, 0, 64, 8);
+        p.swap(3, 40);
+        assert_ne!(before, sum(&p, 64, 0, 0, 64, 8));
+    }
+
+    /// Two pixels swapped between two sampled ROWS, not just within one. The
+    /// row is no longer folded into the hash, so this is the case that says the
+    /// sequence itself is what distinguishes them.
+    #[test]
+    fn the_same_pixels_swapped_between_rows_are_not_the_same_answer() {
+        let mut p = buf(64, 32);
+        let before = sum(&p, 64, 0, 0, 64, 32);
+        p.swap(0 * 64 + 9, 4 * 64 + 9);
+        assert_ne!(before, sum(&p, 64, 0, 0, 64, 32));
+    }
+
+    /// The hardest case for a value-only hash: every pixel identical, so only
+    /// how many of them there were can tell the two windows apart. FNV-1a folds
+    /// each one in turn even when they are equal, so it does -- which is why
+    /// dropping the position fold cost nothing. A flat wallpaper is exactly this
+    /// buffer.
+    #[test]
+    fn a_window_of_all_equal_pixels_still_depends_on_how_many_there_were() {
+        let p = vec![0xFF80_8080u32; 64 * 32];
+        assert_ne!(sum(&p, 64, 0, 0, 64, 32), sum(&p, 64, 0, 0, 64, 16));
+        assert_ne!(sum(&p, 64, 0, 0, 64, 8), sum(&p, 64, 0, 0, 32, 8));
+        // And the same window twice is still the same answer.
+        assert_eq!(sum(&p, 64, 0, 0, 64, 32), sum(&p, 64, 0, 0, 64, 32));
+    }
+
+    // --- what it must NOT notice ---
+
+    /// A change outside the window is not this present's business. The probe
+    /// names a rectangle in its report, so it has to be reporting on that
+    /// rectangle: a checksum that covered the whole buffer would fire on every
+    /// frame of an animated clock in another corner and the log would be noise.
+    #[test]
+    fn a_change_outside_the_window_is_not_reported() {
+        let mut p = buf(64, 32);
+        let before = sum(&p, 64, 8, 8, 16, 16);
+        // Left of the window, right of it, above it and below it.
+        p[8 * 64 + 7] ^= 0xFFFF_FFFF;
+        p[8 * 64 + 24] ^= 0xFFFF_FFFF;
+        p[7 * 64 + 12] ^= 0xFFFF_FFFF;
+        p[24 * 64 + 12] ^= 0xFFFF_FFFF;
+        assert_eq!(before, sum(&p, 64, 8, 8, 16, 16));
+    }
+
+    /// The blind spot, written down rather than discovered later. Rows are
+    /// sampled, so a change confined to the rows in between is invisible. That
+    /// is the trade: a torn frame comes from a rasteriser handing over tiles,
+    /// which is tens of rows tall, and reading every row would double the cost
+    /// of the present the probe is measuring.
+    #[test]
+    fn a_change_only_in_the_rows_the_step_skips_is_missed() {
+        let mut p = buf(64, 32);
+        let before = sum(&p, 64, 0, 0, 64, 32);
+        for r in 0..32 {
+            if r % PROBE_ROW_STEP != 0 {
+                p[r * 64 + 5] ^= 0xFFFF_FFFF;
+            }
+        }
+        assert_eq!(
+            before,
+            sum(&p, 64, 0, 0, 64, 32),
+            "the row step is what it is; if this starts failing the step changed"
+        );
+        // Pinned by value, not by the constant. Read through `PROBE_ROW_STEP`
+        // the loop above selects nothing at all when the step is 1, so the test
+        // would keep passing while the trade it describes silently went away --
+        // and a step of 1 doubles the cost of every present the probe measures.
+        assert_eq!(
+            PROBE_ROW_STEP, 4,
+            "the step changed: re-read what the blind spot above now covers, and \
+             what the second read now costs per frame"
+        );
+    }
+
+    // --- "I cannot tell" is its own answer ---
+
+    /// `None` is never equal to a checksum, so a window the probe could not
+    /// read does not come back as "unchanged". The call site compares
+    /// `after != Some(before)`, so a `None` after a `Some` reports -- which is
+    /// the safe direction for something whose job is to find a defect.
+    #[test]
+    fn nothing_to_compare_is_not_the_same_as_a_match() {
+        let p = buf(64, 8);
+        let real = sum(&p, 64, 0, 0, 8, 4);
+        assert!(real.is_some());
+        // Degenerate in each of the four ways.
+        assert_eq!(probe_checksum(&p, 0, 0, 0, 8, 4, PROBE_ROW_STEP), None);
+        assert_eq!(probe_checksum(&p, 64, 0, 0, 0, 4, PROBE_ROW_STEP), None);
+        assert_eq!(probe_checksum(&p, 64, 0, 0, 8, 0, PROBE_ROW_STEP), None);
+        assert_eq!(probe_checksum(&p, 64, 0, 0, 8, 4, 0), None);
+        assert_ne!(real, None);
+    }
+
+    /// A window whose very first row is already past the end of the buffer has
+    /// nothing to checksum at all.
+    #[test]
+    fn a_window_past_the_end_of_the_buffer_has_no_answer() {
+        let p = buf(64, 8);
+        assert_eq!(sum(&p, 64, 0, 64, 64, 4), None);
+        // And one whose first row starts inside the buffer but runs off its end.
+        assert_eq!(sum(&p, 64, 32, 7, 64, 4), None);
+    }
+
+    /// A row is `w` pixels from where it starts, the way `blit_from` reads it --
+    /// so a window wider than the stride runs into the next row rather than
+    /// being clipped or refused. Worth pinning because it looks like a bug: it
+    /// is not reachable from the present path (`expand_x_for_wc` caps the right
+    /// edge at the pitch), and the probe has to read exactly what the blit read,
+    /// not what a tidier rule would have read.
+    #[test]
+    fn a_window_wider_than_the_stride_reads_into_the_next_row() {
+        let p = buf(64, 8);
+        assert!(sum(&p, 64, 60, 0, 64, 4).is_some());
+        // Which means a pixel two rows down, at the far end of that run, counts.
+        let mut q = p.clone();
+        q[64 + 20] ^= 0xFFFF_FFFF;
+        assert_ne!(sum(&p, 64, 60, 0, 64, 4), sum(&q, 64, 60, 0, 64, 4));
+    }
+
+    /// A window that starts inside the buffer and runs off the bottom
+    /// checksums the rows that fit instead of giving up on all of them, so a
+    /// present whose last rows fall outside the mapping is still measured.
+    #[test]
+    fn a_window_that_runs_off_the_bottom_measures_the_rows_that_fit() {
+        let p = buf(64, 10);
+        let partial = sum(&p, 64, 0, 4, 64, 40);
+        assert!(partial.is_some());
+        // Rows 4 and 8 fit, row 12 does not -- so this is the same read as a
+        // window two sampled rows tall, and a different one from a window that
+        // only covers the first of them.
+        assert_eq!(partial, sum(&p, 64, 0, 4, 64, 8));
+        assert_ne!(partial, sum(&p, 64, 0, 4, 64, 4));
+    }
+
+    /// The number of rows that were read is part of the answer, so a window
+    /// that shrank between the two reads does not pass as unchanged.
+    #[test]
+    fn a_window_of_a_different_height_is_a_different_answer() {
+        let p = buf(64, 32);
+        assert_ne!(sum(&p, 64, 0, 0, 64, 32), sum(&p, 64, 0, 0, 64, 16));
+    }
+
+    /// Same pixels, read through a different stride: a different set of
+    /// pixels. The probe is handed the framebuffer's own pitch, and a
+    /// mismatched one would silently be measuring a diagonal.
+    #[test]
+    fn the_stride_is_part_of_what_is_being_read() {
+        let p = buf(64, 32);
+        assert_ne!(sum(&p, 64, 0, 0, 16, 16), sum(&p, 32, 0, 0, 16, 16));
+    }
+
+    // --- the rule that turns two reads into a verdict ---
+
+    /// Two equal reads: nobody touched it, no report.
+    #[test]
+    fn two_equal_reads_are_not_a_report() {
+        assert!(!probe_says_changed(0x1234, Some(0x1234)));
+    }
+
+    /// Two different reads: somebody wrote the window while the kernel was
+    /// copying it, which is the entire finding.
+    #[test]
+    fn two_different_reads_are_a_report() {
+        assert!(probe_says_changed(0x1234, Some(0x1235)));
+    }
+
+    /// And a second read that could not produce an answer reports too. The
+    /// probe exists to decide who is responsible for a wrong pixel, so the one
+    /// direction it must never fall in is quietly clearing the compositor.
+    #[test]
+    fn a_second_read_with_no_answer_reports_rather_than_clearing_anyone() {
+        assert!(probe_says_changed(0x1234, None));
+    }
+
+    // --- the report budget ---
+
+    /// A compositor that tears every frame must not turn the klog into the
+    /// bottleneck: `klog` writes synchronously to the UART, slower than the
+    /// frame it is describing. Twelve reports, then silence.
+    #[test]
+    fn the_report_budget_runs_out_and_says_so_on_the_way_past() {
+        assert_eq!(probe_report_decision(0), (true, false));
+        assert_eq!(
+            probe_report_decision(MAX_PROBE_REPORTS - 2),
+            (true, false),
+            "the one before the last is not the last"
+        );
+        assert_eq!(
+            probe_report_decision(MAX_PROBE_REPORTS - 1),
+            (true, true),
+            "the last report has to say it is the last, or the log looks truncated"
+        );
+        assert_eq!(probe_report_decision(MAX_PROBE_REPORTS), (false, false));
+        assert_eq!(probe_report_decision(u32::MAX), (false, false));
+    }
+
+    // --- the latch ---
+
+    /// Off unless a boot asks for it. The probe reads the damage box a second
+    /// time on every present, so a default of on would be a permanent tax on
+    /// the frame rate for a measurement nobody requested.
+    #[test]
+    fn the_probe_is_off_unless_the_cmdline_arms_it() {
+        let _g = serialised();
+        assert!(!present_probe_enabled());
+        set_present_probe_enabled(true);
+        assert!(present_probe_enabled());
+    }
+
+    /// And a test that armed it does not leave it armed for the next one --
+    /// which would make every later present test read its window twice and log
+    /// about a frame nobody was looking at.
+    #[test]
+    fn the_reset_between_tests_disarms_a_leaked_probe() {
+        let _g = serialised();
+        set_present_probe_enabled(true);
+        PROBE_REPORTS.store(MAX_PROBE_REPORTS, Ordering::Relaxed);
+        reset_output_state_for_test();
+        assert!(!present_probe_enabled());
+        assert_eq!(
+            probe_report_decision(PROBE_REPORTS.load(Ordering::Relaxed)),
+            (true, false),
+            "the budget has to come back too, or the last test to run finds it spent"
+        );
+    }
+
+    /// The buffer helper really does hand out distinct pixels, so
+    /// "the checksum did not notice" can never be a collision of equal values.
+    #[test]
+    fn the_test_buffer_has_no_two_equal_pixels() {
+        let p = buf(16, 4);
+        let mut seen = vec![];
+        for px in &p {
+            assert!(!seen.contains(px));
+            seen.push(*px);
+        }
     }
 }
