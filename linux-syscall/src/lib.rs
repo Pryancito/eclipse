@@ -28,7 +28,7 @@ use alloc::sync::Arc;
 use core::convert::TryFrom;
 
 use kernel_hal::user::{IoVecIn, IoVecOut, UserInOutPtr, UserInPtr, UserOutPtr};
-use linux_object::error::{LxError, SysResult};
+use linux_object::error::{LxError, LxResult, SysResult};
 use linux_object::fs::FileDesc;
 use linux_object::process::{LinuxProcess, ProcessExt, RLimit};
 use zircon_object::object::{KernelObject, KoID};

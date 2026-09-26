@@ -1606,7 +1606,7 @@ impl Syscall<'_> {
     /// the looking up. An empty set is `ESRCH`, which is what Linux's
     /// `error = -ESRCH` before the walk amounts to when the walk visits
     /// nobody.
-    fn priority_targets(&self, which: usize, who: usize) -> LxResult<Vec<Arc<Thread>>> {
+    pub(crate) fn priority_targets(&self, which: usize, who: usize) -> LxResult<Vec<Arc<Thread>>> {
         let target = prio_target(
             which,
             who,

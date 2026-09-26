@@ -523,6 +523,12 @@ pub struct LinuxThread {
     /// set → reads as the Linux default of 50 µs. Recorded and read back;
     /// timers here do not apply slack coalescing.
     pub timerslack_ns: u64,
+    /// I/O priority (`ioprio_set(2)`), as the `(class << 13) | level` word
+    /// userspace passes; `0` (`IOPRIO_CLASS_NONE`) = never set → reads as the
+    /// best-effort level derived from the nice value, as Linux's
+    /// `get_task_ioprio` does. Recorded and read back: there is no I/O
+    /// scheduler here to act on it, but `ionice` must see what it set.
+    pub ioprio: u16,
     /// The `siginfo_t` that goes with each pending signal in `signals`, when
     /// the sender left one: who sent a `kill`, which child a `SIGCHLD` is
     /// about and how it ended. `signals` is a bitmap, so a signal is pending
@@ -538,6 +544,11 @@ pub struct LinuxThread {
 /// (`TASK_COMM_LEN` in `include/linux/sched.h`): names are truncated to 15
 /// bytes.
 pub const TASK_COMM_LEN: usize = 16;
+
+/// `IOPRIO_PRIO_VALUE(IOPRIO_CLASS_IDLE, 0)`: the io priority `ionice -c3`
+/// sets, for fixtures that must not sit at the never-set default.
+#[cfg(test)]
+const IDLE_IOPRIO: u16 = 3 << 13;
 
 fn unmodified_check(siginfo: &SigInfo, delivered: &SigInfo, user_ctx: &SignalUserContext) -> usize {
     let mut check = 0usize;
@@ -659,6 +670,7 @@ impl LinuxThread {
             handling_signal: None,
             comm: String::new(),
             timerslack_ns: 0,
+            ioprio: 0,
             pending_info: BTreeMap::new(),
             handling_info: SigInfo::default(),
         }
@@ -707,6 +719,11 @@ impl LinuxThread {
             // created via fork(2)"; `copy_process` copies it to a new thread
             // along with the rest of the task struct.
             timerslack_ns: self.timerslack_ns,
+            // `copy_io()`: without CLONE_IO the new task gets an io_context
+            // of its own with `ioc->ioprio` copied from the creator's, so a
+            // child of `ionice -c3 make` is idle-class too; with CLONE_IO it
+            // shares the creator's, which reads the same.
+            ioprio: self.ioprio,
             // sigaltstack(2): "A child created via fork(2) inherits a copy of
             // its parent's alternate signal stack settings" -- but a THREAD
             // must not, or two threads take their signal frames to the same
@@ -781,6 +798,9 @@ impl LinuxThread {
             handling_signal,
             comm,
             timerslack_ns: _,
+            // The io_context is not part of the image: `ionice -c3 cmd` is
+            // an `ioprio_set` followed by an `execve`, and it must stick.
+            ioprio: _,
             // Pending signals survive `execve`, and what went with them too.
             pending_info: _,
             handling_info: _,
@@ -905,6 +925,7 @@ mod signal_delivery_tests {
             handling_signal: None,
             comm: String::new(),
             timerslack_ns: 0,
+            ioprio: IDLE_IOPRIO,
             pending_info: BTreeMap::new(),
             handling_info: SigInfo::default(),
         }
@@ -1627,6 +1648,7 @@ mod exec_reset_tests {
             comm: String::from("programa-viejo"),
             sigwait: Sigset::default(),
             timerslack_ns: 1_234_567,
+            ioprio: IDLE_IOPRIO,
             pending_info: BTreeMap::new(),
             handling_info: SigInfo::default(),
         }
@@ -1755,6 +1777,16 @@ mod exec_reset_tests {
         t.reset_for_exec();
         assert_eq!(t.timerslack_ns, 1_234_567);
     }
+
+    #[test]
+    fn the_io_priority_survives_the_exec() {
+        // `ionice -c3 cmd` is `ioprio_set(IOPRIO_WHO_PROCESS, 0, idle)` and
+        // then `execve(cmd)`: the io_context is the task's, not the image's,
+        // and `begin_new_exec()` never touches it.
+        let mut t = a_thread_in_full_swing();
+        t.reset_for_exec();
+        assert_eq!(t.ioprio, IDLE_IOPRIO);
+    }
 }
 
 #[cfg(test)]
@@ -1793,6 +1825,7 @@ mod clone_inheritance_tests {
             comm: String::from("el-que-crea"),
             sigwait: Sigset::default(),
             timerslack_ns: 1_234_567,
+            ioprio: IDLE_IOPRIO,
             pending_info: BTreeMap::new(),
             handling_info: SigInfo::default(),
         }
@@ -1932,6 +1965,15 @@ mod clone_inheritance_tests {
         // basename, which is what a thread with no `prctl(PR_SET_NAME)` of
         // its own reports.
         assert!(the_creating_thread().new_thread().comm.is_empty());
+    }
+
+    #[test]
+    fn a_forked_child_and_a_new_thread_keep_the_io_priority() {
+        // `copy_io()`: the new task's io_context takes `ioc->ioprio` from
+        // the creator's (or shares it, with CLONE_IO). `ionice -c3 make`
+        // would otherwise idle only the `make` and none of the compilers.
+        assert_eq!(the_creating_thread().forked_child().ioprio, IDLE_IOPRIO);
+        assert_eq!(the_creating_thread().new_thread().ioprio, IDLE_IOPRIO);
     }
 
     #[test]

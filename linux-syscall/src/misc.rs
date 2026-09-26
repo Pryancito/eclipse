@@ -1,7 +1,8 @@
 use super::*;
 use core::time::Duration;
 use kernel_hal::timer::timer_now;
-use linux_object::process::{CAP_SYS_ADMIN, CAP_SYS_BOOT, CAP_SYS_RESOURCE};
+use linux_object::process::{CAP_SYS_ADMIN, CAP_SYS_BOOT, CAP_SYS_NICE, CAP_SYS_RESOURCE};
+use linux_object::thread::ThreadExt;
 use linux_object::time::*;
 use zircon_object::task::ThreadState;
 use zircon_object::{ZxError, ZxResult};
@@ -198,40 +199,56 @@ impl Syscall<'_> {
         Ok(0)
     }
 
-    /// get I/O scheduling class and priority
-    /// (see [linux man ioprio_get(2)](https://www.man7.org/linux/man-pages/man2/ioprio_set.2.html)).
+    /// `ioprio_get(2)`: the I/O priority of the task `which`/`who` names,
+    /// or the best (numerically lowest) one across a process group or a
+    /// user's tasks, as `ioprio_best` folds them.
     ///
-    /// There is no I/O scheduler to carry the value, so every task reports the
-    /// Linux default: best-effort class, priority 4 (what a task with nice 0
-    /// gets). `ionice` and `tar --ioprio` run happily against this.
+    /// A task that never set one reports what `get_task_ioprio` derives
+    /// from its nice value: best-effort, level `(nice + 20) / 5`. See
+    /// [`effective_ioprio`].
     pub fn sys_ioprio_get(&self, which: usize, who: usize) -> SysResult {
         info!("ioprio_get: which={}, who={}", which, who);
-        // IOPRIO_WHO_PROCESS / _PGRP / _USER
-        if !(1..=3).contains(&which) {
-            return Err(LxError::EINVAL);
-        }
-        const IOPRIO_CLASS_BE: usize = 2;
-        const IOPRIO_CLASS_SHIFT: usize = 13;
-        Ok((IOPRIO_CLASS_BE << IOPRIO_CLASS_SHIFT) | 4)
+        let which = ioprio_which(which)?;
+        let best = self
+            .priority_targets(which, who)?
+            .iter()
+            .map(|t| effective_ioprio(t.lock_linux().ioprio, t.sched_nice()))
+            .reduce(ioprio_best)
+            .ok_or(LxError::ESRCH)?;
+        Ok(best as usize)
     }
 
-    /// set I/O scheduling class and priority
-    /// (see [linux man ioprio_set(2)](https://www.man7.org/linux/man-pages/man2/ioprio_set.2.html)).
+    /// `ioprio_set(2)`: record the I/O priority of every task `which`/`who`
+    /// names.
     ///
-    /// Accepted and not acted upon (there is no I/O scheduler); arguments are
-    /// still validated so misuse fails loudly like on Linux.
+    /// This used to validate the class and answer 0, storing nothing and
+    /// asking nothing: `ionice -c3 -p PID` on a pid that did not exist
+    /// succeeded, on somebody else's process succeeded, `-c1` (real-time)
+    /// was granted to anyone, and `ionice -p PID` afterwards reported the
+    /// default whatever had been set. There is still no I/O scheduler to
+    /// act on the value, but a setting that reads back as set is what every
+    /// caller checks; the rest is Linux's order: `ioprio_check_cap` first
+    /// (`EINVAL`/`EPERM` before anybody is looked up), then the tasks
+    /// (`ESRCH` when there is none), then `set_task_ioprio`'s owner test on
+    /// each, stopping at the first refusal like the kernel's loop does.
+    ///
+    /// See [linux man ioprio_set(2)](https://www.man7.org/linux/man-pages/man2/ioprio_set.2.html).
     pub fn sys_ioprio_set(&self, which: usize, who: usize, ioprio: usize) -> SysResult {
         info!(
             "ioprio_set: which={}, who={}, ioprio={:#x}",
             which, who, ioprio
         );
-        if !(1..=3).contains(&which) {
-            return Err(LxError::EINVAL);
-        }
-        const IOPRIO_CLASS_SHIFT: usize = 13;
-        // Classes: 0 = none (inherit), 1 = RT, 2 = BE, 3 = IDLE.
-        if ioprio >> IOPRIO_CLASS_SHIFT > 3 {
-            return Err(LxError::EINVAL);
+        let caller = self.linux_process().credentials();
+        let capable = self.linux_process().capable(CAP_SYS_NICE)
+            || self.linux_process().capable(CAP_SYS_ADMIN);
+        let ioprio = ioprio_set_verdict(ioprio, capable)?;
+        let which = ioprio_which(which)?;
+        for thread in self.priority_targets(which, who)? {
+            let linux = thread.proc().try_linux().ok_or(LxError::ESRCH)?;
+            if !LinuxProcess::may_set_ioprio_of(&caller, &linux.credentials()) {
+                return Err(LxError::EPERM);
+            }
+            thread.lock_linux().ioprio = ioprio;
         }
         Ok(0)
     }
@@ -1050,6 +1067,243 @@ fn cap_version_elems(version: u32) -> Option<usize> {
         LINUX_CAPABILITY_VERSION_1 => Some(1),
         LINUX_CAPABILITY_VERSION_2 | LINUX_CAPABILITY_VERSION_3 => Some(2),
         _ => None,
+    }
+}
+
+/// `IOPRIO_CLASS_SHIFT`: the class sits above a 13-bit level.
+const IOPRIO_CLASS_SHIFT: u16 = 13;
+/// `IOPRIO_CLASS_NONE`: never set; reads as the nice-derived best-effort.
+const IOPRIO_CLASS_NONE: u16 = 0;
+/// `IOPRIO_CLASS_RT`: real-time, `CAP_SYS_NICE`/`CAP_SYS_ADMIN` only.
+const IOPRIO_CLASS_RT: u16 = 1;
+/// `IOPRIO_CLASS_BE`: best-effort, the default class.
+const IOPRIO_CLASS_BE: u16 = 2;
+/// `IOPRIO_CLASS_IDLE`: served when nobody else wants the disk.
+const IOPRIO_CLASS_IDLE: u16 = 3;
+/// `IOPRIO_NR_LEVELS`: RT and BE have levels `0..8`.
+const IOPRIO_NR_LEVELS: u16 = 8;
+/// `IOPRIO_BE_NORM`: the best-effort level of a nice-0 task.
+const IOPRIO_BE_NORM: u16 = 4;
+
+/// `IOPRIO_PRIO_VALUE(class, level)`.
+const fn ioprio_value(class: u16, level: u16) -> u16 {
+    (class << IOPRIO_CLASS_SHIFT) | level
+}
+
+/// `IOPRIO_PRIO_CLASS` and `IOPRIO_PRIO_LEVEL` (`IOPRIO_PRIO_DATA`).
+fn ioprio_class_and_level(ioprio: u16) -> (u16, u16) {
+    (
+        ioprio >> IOPRIO_CLASS_SHIFT,
+        ioprio & ((1 << IOPRIO_CLASS_SHIFT) - 1),
+    )
+}
+
+/// `IOPRIO_WHO_PROCESS`/`_PGRP`/`_USER` are `1`/`2`/`3`; `setpriority`'s
+/// `PRIO_PROCESS`/`_PGRP`/`_USER` are `0`/`1`/`2` and mean the same three
+/// things (`who == 0` is "mine" in every flavour, in both calls). Anything
+/// else is `EINVAL`.
+fn ioprio_which(which: usize) -> LxResult<usize> {
+    match which {
+        1..=3 => Ok(which - 1),
+        _ => Err(LxError::EINVAL),
+    }
+}
+
+/// `ioprio_check_cap()`: what an `ioprio_set` word may say, and who may
+/// say it.
+///
+/// ```c
+/// switch (class) {
+/// case IOPRIO_CLASS_RT:
+///         if (!capable(CAP_SYS_NICE) && !capable(CAP_SYS_ADMIN))
+///                 return -EPERM;
+///         fallthrough;
+/// case IOPRIO_CLASS_BE:
+///         if (level >= IOPRIO_NR_LEVELS)
+///                 return -EINVAL;
+///         break;
+/// case IOPRIO_CLASS_IDLE:
+///         break;
+/// case IOPRIO_CLASS_NONE:
+///         if (level)
+///                 return -EINVAL;
+///         break;
+/// default:
+///         return -EINVAL;
+/// }
+/// ```
+///
+/// `capable` is the caller's `CAP_SYS_NICE || CAP_SYS_ADMIN`. The word
+/// comes back as the `u16` a thread stores.
+pub(crate) fn ioprio_set_verdict(ioprio: usize, capable: bool) -> LxResult<u16> {
+    let word = u16::try_from(ioprio).map_err(|_| LxError::EINVAL)?;
+    let (class, level) = ioprio_class_and_level(word);
+    match class {
+        IOPRIO_CLASS_RT | IOPRIO_CLASS_BE => {
+            if class == IOPRIO_CLASS_RT && !capable {
+                return Err(LxError::EPERM);
+            }
+            if level >= IOPRIO_NR_LEVELS {
+                return Err(LxError::EINVAL);
+            }
+        }
+        IOPRIO_CLASS_IDLE => {}
+        IOPRIO_CLASS_NONE => {
+            if level != 0 {
+                return Err(LxError::EINVAL);
+            }
+        }
+        _ => return Err(LxError::EINVAL),
+    }
+    Ok(word)
+}
+
+/// `task_nice_ioprio()`: the best-effort level a task that never set an I/O
+/// priority is served at, `(nice + 20) / 5`, so nice 0 is level 4 and the
+/// two ends of the nice range are levels 0 and 7.
+pub(crate) fn nice_ioprio(nice: i8) -> u16 {
+    let level = (nice as i16 + 20) / 5;
+    ioprio_value(IOPRIO_CLASS_BE, level as u16)
+}
+
+/// `get_task_ioprio()`: what a task reports -- the word it set, or, when
+/// its class is `IOPRIO_CLASS_NONE` (never set), [`nice_ioprio`].
+pub(crate) fn effective_ioprio(stored: u16, nice: i8) -> u16 {
+    if ioprio_class_and_level(stored).0 == IOPRIO_CLASS_NONE {
+        nice_ioprio(nice)
+    } else {
+        stored
+    }
+}
+
+/// `ioprio_best()`: of two effective priorities, the one served first. The
+/// word orders the right way round -- RT (1) below BE (2) below IDLE (3),
+/// and level 0 before level 7 within a class -- so it is the minimum; a
+/// class of NONE is read as the best-effort default first.
+pub(crate) fn ioprio_best(a: u16, b: u16) -> u16 {
+    let default = ioprio_value(IOPRIO_CLASS_BE, IOPRIO_BE_NORM);
+    let valid = |p: u16| {
+        if ioprio_class_and_level(p).0 == IOPRIO_CLASS_NONE {
+            default
+        } else {
+            p
+        }
+    };
+    valid(a).min(valid(b))
+}
+
+#[cfg(test)]
+mod ioprio_tests {
+    use super::*;
+
+    const RT: u16 = IOPRIO_CLASS_RT;
+    const BE: u16 = IOPRIO_CLASS_BE;
+    const IDLE: u16 = IOPRIO_CLASS_IDLE;
+
+    fn word(class: u16, level: u16) -> usize {
+        ioprio_value(class, level) as usize
+    }
+
+    #[test]
+    fn real_time_is_for_cap_sys_nice_only() {
+        assert_eq!(ioprio_set_verdict(word(RT, 4), false), Err(LxError::EPERM));
+        assert_eq!(
+            ioprio_set_verdict(word(RT, 4), true),
+            Ok(ioprio_value(RT, 4))
+        );
+        // The capability opens the class, not the level range.
+        assert_eq!(ioprio_set_verdict(word(RT, 8), true), Err(LxError::EINVAL));
+    }
+
+    #[test]
+    fn best_effort_has_eight_levels() {
+        for level in 0..IOPRIO_NR_LEVELS {
+            assert_eq!(
+                ioprio_set_verdict(word(BE, level), false),
+                Ok(ioprio_value(BE, level))
+            );
+        }
+        assert_eq!(ioprio_set_verdict(word(BE, 8), false), Err(LxError::EINVAL));
+        assert_eq!(
+            ioprio_set_verdict(word(BE, 0x1fff), true),
+            Err(LxError::EINVAL)
+        );
+    }
+
+    #[test]
+    fn idle_is_for_anyone_and_none_takes_no_level() {
+        assert_eq!(
+            ioprio_set_verdict(word(IDLE, 0), false),
+            Ok(ioprio_value(IDLE, 0))
+        );
+        assert_eq!(ioprio_set_verdict(word(IOPRIO_CLASS_NONE, 0), false), Ok(0));
+        assert_eq!(
+            ioprio_set_verdict(word(IOPRIO_CLASS_NONE, 1), false),
+            Err(LxError::EINVAL)
+        );
+    }
+
+    #[test]
+    fn an_unknown_class_or_a_word_too_wide_is_einval() {
+        assert_eq!(ioprio_set_verdict(word(4, 0), true), Err(LxError::EINVAL));
+        assert_eq!(ioprio_set_verdict(word(7, 3), true), Err(LxError::EINVAL));
+        assert_eq!(ioprio_set_verdict(1 << 16, true), Err(LxError::EINVAL));
+        assert_eq!(ioprio_set_verdict(usize::MAX, true), Err(LxError::EINVAL));
+    }
+
+    #[test]
+    fn a_task_that_never_set_one_is_best_effort_at_its_nice_level() {
+        assert_eq!(nice_ioprio(0), ioprio_value(BE, 4));
+        assert_eq!(nice_ioprio(-20), ioprio_value(BE, 0));
+        assert_eq!(nice_ioprio(19), ioprio_value(BE, 7));
+        assert_eq!(nice_ioprio(10), ioprio_value(BE, 6));
+        assert_eq!(nice_ioprio(-1), ioprio_value(BE, 3));
+        assert_eq!(effective_ioprio(0, 10), ioprio_value(BE, 6));
+    }
+
+    #[test]
+    fn what_was_set_is_what_is_read_back_whatever_the_nice() {
+        assert_eq!(
+            effective_ioprio(ioprio_value(IDLE, 0), -20),
+            ioprio_value(IDLE, 0)
+        );
+        assert_eq!(
+            effective_ioprio(ioprio_value(RT, 7), 19),
+            ioprio_value(RT, 7)
+        );
+        assert_eq!(
+            effective_ioprio(ioprio_value(BE, 0), 19),
+            ioprio_value(BE, 0)
+        );
+    }
+
+    #[test]
+    fn the_best_of_a_group_is_the_one_served_first() {
+        assert_eq!(
+            ioprio_best(ioprio_value(IDLE, 0), ioprio_value(BE, 7)),
+            ioprio_value(BE, 7)
+        );
+        assert_eq!(
+            ioprio_best(ioprio_value(BE, 7), ioprio_value(RT, 7)),
+            ioprio_value(RT, 7)
+        );
+        assert_eq!(
+            ioprio_best(ioprio_value(BE, 2), ioprio_value(BE, 5)),
+            ioprio_value(BE, 2)
+        );
+        // NONE reads as the best-effort default, so it loses to BE 2 and
+        // beats BE 5 -- it is not the numerically smallest word.
+        assert_eq!(ioprio_best(0, ioprio_value(BE, 5)), ioprio_value(BE, 4));
+        assert_eq!(ioprio_best(0, ioprio_value(BE, 2)), ioprio_value(BE, 2));
+    }
+
+    #[test]
+    fn the_who_flavours_are_offset_by_one_from_setpriority() {
+        assert_eq!(ioprio_which(1), Ok(0));
+        assert_eq!(ioprio_which(2), Ok(1));
+        assert_eq!(ioprio_which(3), Ok(2));
+        assert_eq!(ioprio_which(0), Err(LxError::EINVAL));
+        assert_eq!(ioprio_which(4), Err(LxError::EINVAL));
     }
 }
 

@@ -2015,6 +2015,26 @@ impl LinuxProcess {
         Self::is_same_owner(caller, target) || has_capability(caller.euid, CAP_SYS_NICE)
     }
 
+    /// `set_task_ioprio()` (`block/ioprio.c`): whether `caller` may change
+    /// the I/O priority of a task running under `target`'s credentials.
+    ///
+    /// ```c
+    /// if (!uid_eq(tcred->uid, cred->euid) &&
+    ///     !uid_eq(tcred->uid, cred->uid) && !capable(CAP_SYS_NICE)) {
+    ///         err = -EPERM;
+    /// ```
+    ///
+    /// Not the same rule as [`Self::may_set_priority_of`]: it is the target's
+    /// REAL uid that is compared, against either of the caller's, so a task
+    /// running set-uid as somebody else is still its real owner's to renice
+    /// for I/O, and a caller's real uid counts where `setpriority` only
+    /// looks at the effective one.
+    pub fn may_set_ioprio_of(caller: &Credentials, target: &Credentials) -> bool {
+        target.ruid == caller.euid
+            || target.ruid == caller.ruid
+            || has_capability(caller.euid, CAP_SYS_NICE)
+    }
+
     /// `set_one_prio()`'s two gates, in order: whether the task is yours,
     /// then how far down you are asking to push it.
     ///
@@ -8464,6 +8484,54 @@ mod link_permission_tests {
             LinuxProcess::link_verdict(&c, OWNER, OTHER, 0o660, FileType::File),
             Err(LxError::EPERM)
         );
+    }
+}
+
+/// `may_set_ioprio_of`: which of the caller's ids and the target's ids
+/// `set_task_ioprio` compares.
+#[cfg(test)]
+mod ioprio_permission_tests {
+    use super::*;
+
+    fn creds(ruid: u32, euid: u32) -> Credentials {
+        Credentials {
+            ruid,
+            euid,
+            suid: euid,
+            rgid: ruid,
+            egid: euid,
+            sgid: euid,
+            fsuid: euid,
+            fsgid: euid,
+            groups: Vec::new(),
+            umask: 0o022,
+        }
+    }
+
+    #[test]
+    fn the_targets_real_uid_against_either_of_the_callers() {
+        let alice = creds(1000, 1000);
+        let bob = creds(2000, 2000);
+        assert!(LinuxProcess::may_set_ioprio_of(&alice, &alice));
+        assert!(!LinuxProcess::may_set_ioprio_of(&alice, &bob));
+        // A set-uid-root task Alice started is still hers.
+        let alices_setuid = creds(1000, ROOT_UID);
+        assert!(LinuxProcess::may_set_ioprio_of(&alice, &alices_setuid));
+        // A caller running set-uid as Bob reaches Bob's tasks through its
+        // effective id and its own through its real one.
+        let alice_as_bob = creds(1000, 2000);
+        assert!(LinuxProcess::may_set_ioprio_of(&alice_as_bob, &bob));
+        assert!(LinuxProcess::may_set_ioprio_of(&alice_as_bob, &alice));
+        // But the target's EFFECTIVE id is not what is compared: Bob's task
+        // running set-uid as Alice is not Alice's to touch.
+        let bobs_setuid_alice = creds(2000, 1000);
+        assert!(!LinuxProcess::may_set_ioprio_of(&alice, &bobs_setuid_alice));
+    }
+
+    #[test]
+    fn cap_sys_nice_reaches_everyone() {
+        let root = creds(ROOT_UID, ROOT_UID);
+        assert!(LinuxProcess::may_set_ioprio_of(&root, &creds(2000, 2000)));
     }
 }
 
