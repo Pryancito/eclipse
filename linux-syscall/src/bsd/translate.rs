@@ -517,6 +517,62 @@ pub fn signal_to_linux(bsd: usize) -> LxResult<usize> {
     })
 }
 
+/// A Linux signal number in FreeBSD's numbering: the inverse of
+/// [`signal_to_linux`], for what the kernel reports rather than what the
+/// program sends. `None` for the two Linux signals FreeBSD lacks
+/// (`SIGSTKFLT`, `SIGPWR`).
+pub fn signal_from_linux(lin: usize) -> Option<usize> {
+    Some(match lin {
+        0..=6 | 8 | 9 | 11 | 13..=15 | 21 | 22 | 24..=28 => lin,
+        7 => sig::SIGBUS,
+        31 => sig::SIGSYS,
+        23 => sig::SIGURG,
+        19 => sig::SIGSTOP,
+        20 => sig::SIGTSTP,
+        18 => sig::SIGCONT,
+        17 => sig::SIGCHLD,
+        29 => sig::SIGIO,
+        10 => sig::SIGUSR1,
+        12 => sig::SIGUSR2,
+        _ => return None,
+    })
+}
+
+/// The `wait(2)` status word `sys_wait4` wrote, with its signal number in
+/// FreeBSD's numbering.
+///
+/// The two systems encode the word the same way (`sys/wait.h` is older than
+/// either): low seven bits zero is an exit with the code in the second byte,
+/// `0x7f` is a stop with the signal in the second byte, `0xffff` is a
+/// continue, and anything else is a death by the signal in the low seven
+/// bits, with `0x80` for a core dump. Only the signal NUMBER inside it is
+/// Linux's, so a FreeBSD parent whose child died of `SIGUSR1` read
+/// `WTERMSIG` as 10, its `SIGBUS`, and one whose child was stopped read
+/// `WSTOPSIG` 19 as `SIGCONT`. A number FreeBSD lacks is left as it is.
+pub fn wait_status_to_freebsd(status: i32) -> i32 {
+    const CONTINUED: i32 = 0xffff;
+    const STOPPED: i32 = 0x7f;
+    const CORE: i32 = 0x80;
+    if status == CONTINUED {
+        return status;
+    }
+    let low = status & 0x7f;
+    if low == 0 {
+        return status; // exited
+    }
+    if low == STOPPED {
+        let signal = ((status >> 8) & 0xff) as usize;
+        return match signal_from_linux(signal) {
+            Some(bsd) => ((bsd as i32) << 8) | STOPPED,
+            None => status,
+        };
+    }
+    match signal_from_linux(low as usize) {
+        Some(bsd) => (status & CORE) | bsd as i32,
+        None => status,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1105,5 +1161,58 @@ mod number_tests {
         ] {
             assert_eq!(signal_to_linux(n), Err(LxError::EINVAL), "signal {}", n);
         }
+    }
+}
+
+/// What `wait4` reports, in FreeBSD's signal numbers.
+#[cfg(test)]
+mod wait_status_tests {
+    use super::*;
+
+    #[test]
+    fn from_linux_undoes_to_linux_for_every_signal_with_a_peer() {
+        for bsd in 1..=33 {
+            if let Ok(lin) = signal_to_linux(bsd) {
+                assert_eq!(signal_from_linux(lin), Some(bsd), "{} -> {} -> ?", bsd, lin);
+            }
+        }
+        // And the two Linux signals FreeBSD lacks come back as nothing.
+        assert_eq!(signal_from_linux(16), None);
+        assert_eq!(signal_from_linux(30), None);
+        assert_eq!(signal_from_linux(32), None);
+    }
+
+    #[test]
+    fn an_exit_and_a_continue_are_left_alone() {
+        assert_eq!(wait_status_to_freebsd(0), 0);
+        assert_eq!(wait_status_to_freebsd(1 << 8), 1 << 8);
+        assert_eq!(wait_status_to_freebsd(255 << 8), 255 << 8);
+        assert_eq!(wait_status_to_freebsd(0xffff), 0xffff);
+    }
+
+    #[test]
+    fn a_child_killed_by_usr1_says_usr1_not_bus() {
+        // Linux SIGUSR1 is 10, which is FreeBSD's SIGBUS; FreeBSD SIGUSR1 is 30.
+        assert_eq!(wait_status_to_freebsd(10), 30);
+        // The core-dump bit rides along.
+        assert_eq!(wait_status_to_freebsd(10 | 0x80), 30 | 0x80);
+        // The old Unix signals are the same number on both.
+        assert_eq!(wait_status_to_freebsd(15), 15);
+        assert_eq!(wait_status_to_freebsd(9), 9);
+    }
+
+    #[test]
+    fn a_stopped_child_says_stop_not_cont() {
+        // Linux SIGSTOP 19 is FreeBSD's SIGCONT; FreeBSD SIGSTOP is 17.
+        assert_eq!(wait_status_to_freebsd((19 << 8) | 0x7f), (17 << 8) | 0x7f);
+        assert_eq!(wait_status_to_freebsd((20 << 8) | 0x7f), (18 << 8) | 0x7f);
+        // SIGTTIN is 21 on both.
+        assert_eq!(wait_status_to_freebsd((21 << 8) | 0x7f), (21 << 8) | 0x7f);
+    }
+
+    #[test]
+    fn a_signal_freebsd_lacks_keeps_its_linux_number() {
+        assert_eq!(wait_status_to_freebsd(30), 30);
+        assert_eq!(wait_status_to_freebsd((30 << 8) | 0x7f), (30 << 8) | 0x7f);
     }
 }

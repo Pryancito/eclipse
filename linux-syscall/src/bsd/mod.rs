@@ -187,7 +187,12 @@ impl Syscall<'_> {
                     BsdRet::from_result(self.sys_faccessat(a0.into(), a1.into(), a2, f as usize))
                 }
             },
-            sys::FCHMODAT => BsdRet::from_result(self.sys_fchmodat(a0.into(), a1.into(), a2, a3)),
+            sys::FCHMODAT => match translate::at_flags_to_linux(a3 as i32) {
+                Err(e) => BsdRet::from_lx(e),
+                Ok(f) => {
+                    BsdRet::from_result(self.sys_fchmodat(a0.into(), a1.into(), a2, f as usize))
+                }
+            },
             sys::FCHOWNAT => match translate::at_flags_to_linux(a4 as i32) {
                 Err(e) => BsdRet::from_lx(e),
                 Ok(f) => {
@@ -291,10 +296,15 @@ impl Syscall<'_> {
             // positions from Linux's; see `translate::wait_options_to_linux`.
             sys::WAIT4 => match translate::wait_options_to_linux(a2 as i32) {
                 Err(e) => BsdRet::from_lx(e),
-                Ok(options) => BsdRet::from_result(
-                    self.sys_wait4(a0 as _, a1.into(), options as u32, a3.into())
-                        .await,
-                ),
+                Ok(options) => {
+                    let r = self
+                        .sys_wait4(a0 as _, a1.into(), options as u32, a3.into())
+                        .await;
+                    if matches!(r, Ok(pid) if pid > 0) {
+                        self.bsd_wait_status(a1);
+                    }
+                    BsdRet::from_result(r)
+                }
             },
             sys::EXECVE => BsdRet::from_result(self.sys_execve(a0.into(), a1.into(), a2.into())),
             sys::EXIT => BsdRet::from_result(self.sys_exit(a0 as _)),
@@ -356,6 +366,23 @@ impl Syscall<'_> {
                 warn!("freebsd: unhandled syscall {} -> ENOSYS", other);
                 BsdRet::enosys()
             }
+        }
+    }
+
+    /// Rewrite the status word `sys_wait4` just wrote at `status` with its
+    /// signal number in FreeBSD's numbering (`translate::wait_status_to_freebsd`).
+    /// A null pointer is a caller that did not ask; a read or write that
+    /// fails leaves what `sys_wait4` wrote.
+    fn bsd_wait_status(&self, status: usize) {
+        if status == 0 {
+            return;
+        }
+        let read: UserInPtr<i32> = status.into();
+        let Ok(word) = read.read() else { return };
+        let fixed = translate::wait_status_to_freebsd(word);
+        if fixed != word {
+            let mut write: UserOutPtr<i32> = status.into();
+            let _ = write.write(fixed);
         }
     }
 
