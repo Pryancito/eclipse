@@ -70,6 +70,9 @@ pub const CAP_KILL: u32 = 5;
 pub const CAP_SETGID: u32 = 6;
 /// `CAP_SETUID`: change user ids, `setfsuid(2)` included.
 pub const CAP_SETUID: u32 = 7;
+/// `CAP_SETPCAP`: drop capabilities from the bounding set
+/// (`prctl(PR_CAPBSET_DROP)`), among other things.
+pub const CAP_SETPCAP: u32 = 8;
 /// `CAP_SYS_PTRACE`: trace, inspect or reach into the innards of a process
 /// that is not yours -- `pidfd_getfd(2)` included.
 pub const CAP_SYS_PTRACE: u32 = 19;
@@ -6224,6 +6227,7 @@ mod capability_tests {
     /// list is automatically measured by the tests below.
     const NAMED: &[(u32, &str)] = &[
         (CAP_SETGID, "CAP_SETGID"),
+        (CAP_SETPCAP, "CAP_SETPCAP"),
         (CAP_SYS_ADMIN, "CAP_SYS_ADMIN"),
         (CAP_SYS_BOOT, "CAP_SYS_BOOT"),
         (CAP_SYS_TIME, "CAP_SYS_TIME"),
@@ -6234,6 +6238,7 @@ mod capability_tests {
     fn the_capability_numbers_are_the_ones_capability_h_names() {
         // Wrong by one and a gate asks about somebody else's privilege.
         assert_eq!(CAP_SETGID, 6);
+        assert_eq!(CAP_SETPCAP, 8);
         assert_eq!(CAP_SYS_ADMIN, 21);
         assert_eq!(CAP_SYS_BOOT, 22);
         assert_eq!(CAP_SYS_TIME, 25);

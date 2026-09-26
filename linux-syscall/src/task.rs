@@ -125,6 +125,64 @@ pub(crate) fn keepcaps_arg(a2: usize) -> LxResult<bool> {
     }
 }
 
+/// `cap_prctl_drop`, what `prctl(PR_CAPBSET_DROP, cap)` refuses: a caller
+/// without `CAP_SETPCAP` (`EPERM`), asked before the number is even looked
+/// at, then a number that is not a capability (`EINVAL`).
+///
+/// Anyone was answered 0. A sandbox that drops its bounding set as an
+/// unprivileged user (a browser's content process, `bwrap` without setuid)
+/// believed it had, and a probe of the unprivileged answer read "allowed".
+pub(crate) fn capbset_drop_verdict(cap: usize, may_set_pcap: bool) -> LxResult<()> {
+    if !may_set_pcap {
+        return Err(LxError::EPERM);
+    }
+    if cap > CAP_LAST_CAP as usize {
+        return Err(LxError::EINVAL);
+    }
+    Ok(())
+}
+
+/// The slack `prctl(PR_SET_TIMERSLACK, arg2)` stores: `arg2` is a `long`,
+/// and `if (arg2 <= 0) current->timer_slack_ns = current->default_timer_slack_ns;
+/// else current->timer_slack_ns = arg2;`. Here 0 is the stored spelling of
+/// "the default", which `PR_GET_TIMERSLACK` already reports as 50 µs.
+///
+/// The register went into the `u64` as it was, so `-1` became an
+/// 18-billion-second slack that `PR_GET_TIMERSLACK` then reported back.
+pub(crate) fn timerslack_arg(a2: usize) -> u64 {
+    if (a2 as isize) <= 0 {
+        0
+    } else {
+        a2 as u64
+    }
+}
+
+/// The name `prctl(PR_SET_NAME)` stores from the bytes the caller passed:
+/// `set_task_comm` copies `TASK_COMM_LEN - 1` bytes at most, to the first
+/// NUL, and the kernel keeps them as bytes. `comm` is a `String` here, so
+/// a byte that is not UTF-8 becomes `?` rather than a refusal.
+///
+/// The name used to go through `as_c_str`, which refused any invalid UTF-8
+/// with `EINVAL`: a JVM's `pthread_setname_np`, which cuts a thread name to
+/// 15 bytes and can cut a multibyte character in half doing so, and any
+/// Latin-1 name, failed where Linux stores the bytes.
+pub(crate) fn comm_from_user_bytes(bytes: &[u8]) -> alloc::string::String {
+    use linux_object::thread::TASK_COMM_LEN;
+    let end = bytes
+        .iter()
+        .position(|&b| b == 0)
+        .unwrap_or(bytes.len())
+        .min(TASK_COMM_LEN - 1);
+    let mut comm = alloc::string::String::with_capacity(end);
+    for chunk in bytes[..end].utf8_chunks() {
+        comm.push_str(chunk.valid());
+        for _ in 0..chunk.invalid().len() {
+            comm.push('?');
+        }
+    }
+    comm
+}
+
 /// The end of `wait4(2)`: the pid of the child found, with its status and
 /// CPU time in the two out-pointers, or 0 with both left alone.
 ///
@@ -2016,17 +2074,21 @@ impl Syscall<'_> {
                 Ok(0)
             }
             PR_SET_NAME => {
+                // `strncpy_from_user(comm, arg2, sizeof(comm) - 1)`: at most
+                // 15 bytes are read, byte by byte, and the copy stops at
+                // the first NUL, so a name of 15 bytes with no terminator
+                // at the end of a mapping is read without touching what
+                // lies past it.
                 let name_ptr: UserInPtr<u8> = a2.into();
-                let name = name_ptr.as_c_str()?;
-                let mut comm = alloc::string::String::new();
-                // TASK_COMM_LEN includes the NUL: keep at most 15 bytes.
-                for c in name.chars() {
-                    if comm.len() + c.len_utf8() > TASK_COMM_LEN - 1 {
+                let mut bytes = alloc::vec::Vec::with_capacity(TASK_COMM_LEN - 1);
+                for i in 0..TASK_COMM_LEN - 1 {
+                    let b = name_ptr.add(i).read()?;
+                    if b == 0 {
                         break;
                     }
-                    comm.push(c);
+                    bytes.push(b);
                 }
-                self.thread.lock_linux().comm = comm;
+                self.thread.lock_linux().comm = comm_from_user_bytes(&bytes);
                 Ok(0)
             }
             PR_GET_NAME => {
@@ -2061,16 +2123,14 @@ impl Syscall<'_> {
                 Ok(1)
             }
             PR_CAPBSET_DROP => {
-                if a2 > CAP_LAST_CAP as usize {
-                    return Err(LxError::EINVAL);
-                }
+                capbset_drop_verdict(a2, proc.capable(linux_object::process::CAP_SETPCAP))?;
                 // There is no stored bounding set to shrink; accepting keeps
                 // privilege-dropping daemons on their happy path, consistent
                 // with sys_capset.
                 Ok(0)
             }
             PR_SET_TIMERSLACK => {
-                self.thread.lock_linux().timerslack_ns = a2 as u64;
+                self.thread.lock_linux().timerslack_ns = timerslack_arg(a2);
                 Ok(0)
             }
             PR_GET_TIMERSLACK => {
@@ -2932,6 +2992,63 @@ mod wait_option_tests {
                 stray
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod prctl_arg_tests {
+    //! Three `prctl(2)` options that took their argument as it came.
+
+    use super::*;
+
+    /// `PR_CAPBSET_DROP` needs `CAP_SETPCAP`, judged before the number:
+    /// an unprivileged caller hears `EPERM` even for a number that is not
+    /// a capability, and root hears `EINVAL` for that one.
+    #[test]
+    fn dropping_from_the_bounding_set_needs_cap_setpcap_first() {
+        assert_eq!(capbset_drop_verdict(0, false), Err(LxError::EPERM));
+        assert_eq!(capbset_drop_verdict(999, false), Err(LxError::EPERM));
+        assert_eq!(capbset_drop_verdict(0, true), Ok(()));
+        assert_eq!(capbset_drop_verdict(CAP_LAST_CAP as usize, true), Ok(()));
+        assert_eq!(
+            capbset_drop_verdict(CAP_LAST_CAP as usize + 1, true),
+            Err(LxError::EINVAL)
+        );
+        assert_eq!(capbset_drop_verdict(usize::MAX, true), Err(LxError::EINVAL));
+    }
+
+    /// `PR_SET_TIMERSLACK`'s argument is a `long`: zero or negative means
+    /// the default, and nothing else is clamped.
+    #[test]
+    fn a_non_positive_timer_slack_is_the_default() {
+        assert_eq!(timerslack_arg(0), 0);
+        assert_eq!(timerslack_arg(usize::MAX), 0, "-1 is the default, not 2^64");
+        assert_eq!(timerslack_arg(isize::MIN as usize), 0);
+        assert_eq!(timerslack_arg(1), 1);
+        assert_eq!(timerslack_arg(50_000), 50_000);
+        assert_eq!(timerslack_arg(isize::MAX as usize), isize::MAX as u64);
+    }
+
+    /// `PR_SET_NAME` stores bytes: to the first NUL, at most 15, and a byte
+    /// that is not UTF-8 is kept as a `?` rather than refused.
+    #[test]
+    fn the_comm_is_bytes_to_the_first_nul_and_never_refused() {
+        assert_eq!(comm_from_user_bytes(b"worker junk"), "worker");
+        assert_eq!(comm_from_user_bytes(b"worker"), "worker");
+        assert_eq!(comm_from_user_bytes(b""), "");
+        assert_eq!(
+            comm_from_user_bytes(b"0123456789abcdefXYZ"),
+            "0123456789abcde",
+            "15 bytes at most"
+        );
+        // Latin-1 "Señal": the ñ is one byte that is not UTF-8.
+        assert_eq!(comm_from_user_bytes(b"Se\xf1al"), "Se?al");
+        // A JVM cutting "Thread-ñ" at 15 bytes leaves half a character.
+        let mut cut = b"pool-1-thread-".to_vec();
+        cut.push(0xc3); // first byte of a two-byte sequence, no second
+        assert_eq!(comm_from_user_bytes(&cut), "pool-1-thread-?");
+        // Whole multibyte characters survive.
+        assert_eq!(comm_from_user_bytes("señal".as_bytes()), "señal");
     }
 }
 

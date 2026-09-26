@@ -564,7 +564,7 @@ impl Syscall<'_> {
             proc.set_brk(plan.brk);
             info!(
                 "brk: extended to {:#x} (within reserved mapping up to {:#x})",
-                plan.brk, new_brk_aligned
+                plan.brk, mapped_brk
             );
             return Ok(plan.brk);
         }
