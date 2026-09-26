@@ -96,10 +96,17 @@ pub(crate) fn spin_pump() {
     }
 }
 
-/// Public variant for OTHER crates' IRQs-off spin loops (the scheduler's
-/// `spin::Mutex`-based runtime locks in `diag_lock`, the RM's `os_*_spinlock`
-/// glue) to drain their OWN pending TLB-shootdown queue while spinning, exactly
-/// as this crate's ticket lock does at `set_spin_pump`.
+/// Public variant for OTHER crates' IRQs-off spin loops to drain their OWN
+/// pending TLB-shootdown queue while spinning, exactly as this crate's ticket
+/// lock does at `set_spin_pump`.
+///
+/// The ones there are, which is a list worth keeping honest because a spinner
+/// that is missing from it is invisible until a machine wedges: the
+/// scheduler's `spin::Mutex`-based runtime locks in `diag_lock`; the RM's
+/// `os_*_spinlock` glue; the IPI ring's own `MpscQueue::commit_entry`, where a
+/// producer waits for a peer's earlier reservation; the fault handler's wait
+/// for a peer's diagnosis, which is bounded at two whole seconds; and the
+/// NMI RIP capture's wait for the peers to answer.
 ///
 /// A CPU spinning with interrupts disabled is deaf to the shootdown IPI, so a
 /// peer that spin-waits for its ack (while holding, say, the VMAR lock) wedges —

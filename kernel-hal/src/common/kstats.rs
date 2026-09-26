@@ -556,6 +556,13 @@ pub fn capture_cpu_rips() {
     zcore_drivers::irq::x86::Apic::send_nmi_all_others();
     let start = crate::timer::timer_now();
     while crate::timer::timer_now() < start + core::time::Duration::from_millis(2) {
+        // Same reason as every other spin a CPU can reach with interrupts
+        // off: while we wait for the peers' NMI handlers we may not be
+        // acknowledging shootdowns, and a peer waiting on ours is spending
+        // its budget. Draining our own queue here is lock-free,
+        // allocation-free queue work, and a no-op when it is empty. See
+        // `lock::pump`.
+        lock::pump();
         core::hint::spin_loop();
     }
 }

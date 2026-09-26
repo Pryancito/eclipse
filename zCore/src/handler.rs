@@ -88,6 +88,15 @@ fn wait_for_peer_fault_diag() {
         if kernel_hal::timer::timer_now() >= deadline {
             break;
         }
+        // Two seconds is a very long time to be deaf to a TLB-shootdown IPI,
+        // and this runs from a fault with interrupts off. A peer that
+        // spin-waits for this CPU's acknowledgement has a budget, and when it
+        // runs out on riscv64 or aarch64 there is no NMI rescue behind it: a
+        // fault that `try_contain` was about to survive takes the machine with
+        // it anyway, from a CPU that had nothing to do with it. Draining our
+        // own queue here is lock-free, allocation-free queue work -- see
+        // `lock::pump`.
+        lock::pump();
         core::hint::spin_loop();
     }
 }
