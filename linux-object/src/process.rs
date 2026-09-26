@@ -530,8 +530,24 @@ impl ProcessExt for Process {
                     }
                     if let Some(reaper) = reaper_for(&parent) {
                         if let Some(reaper_lp) = reaper.try_linux() {
+                            let policy = child_death_policy(reaper_lp);
+                            // The zircon bit wakes a blocked `wait*` either
+                            // way: with nothing left to collect it comes back
+                            // ECHILD, which is how POSIX says a `wait` ends
+                            // when SIGCHLD is ignored.
                             reaper.signal_set(Signal::SIGCHLD);
-                            reaper_lp.record_child_exit(child.id(), exit_code, child_cpu(&child));
+                            if policy.autoreap {
+                                reaper_lp.forget_child(child.id());
+                            } else {
+                                reaper_lp.record_child_exit(
+                                    child.id(),
+                                    exit_code,
+                                    child_cpu(&child),
+                                );
+                            }
+                            if !policy.notify {
+                                return true;
+                            }
                             // The zircon bit above wakes a blocked `wait*`;
                             // the LINUX signal is what a SIGCHLD handler, a
                             // signalfd or a `sigwait` is waiting for
@@ -1334,6 +1350,17 @@ impl LinuxProcess {
         let mut inner = self.inner.lock();
         inner.children.remove(&child_id);
         inner.reaped_children.insert(child_id, (exit_code, cpu));
+    }
+
+    /// Drop a dead child without keeping anything for `wait*`: the reaper
+    /// ignores `SIGCHLD` (or set `SA_NOCLDWAIT`), so Linux releases the
+    /// task in `exit_notify` instead of leaving a zombie, and its CPU never
+    /// reaches the reaper's `RUSAGE_CHILDREN` (that only counts children
+    /// that were waited for).
+    pub fn forget_child(&self, child_id: KoID) {
+        let mut inner = self.inner.lock();
+        inner.children.remove(&child_id);
+        inner.reaped_children.remove(&child_id);
     }
 
     /// CPU totals of already-reaped children, in nanoseconds (utime, stime).
@@ -3722,6 +3749,44 @@ fn parent_wants_sigchld_for_stops(parent: &Arc<Process>) -> bool {
                 .contains(crate::signal::SignalActionFlags::NOCLDSTOP)
         })
         .unwrap_or(false)
+}
+
+/// What a reaper's `SIGCHLD` disposition says to do with a child that just
+/// died: `do_notify_parent`'s `autoreap`, and whether the signal is sent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ChildDeathPolicy {
+    /// Release the child at once instead of leaving a zombie for `wait*`.
+    autoreap: bool,
+    /// Queue the Linux `SIGCHLD` at all.
+    notify: bool,
+}
+
+/// `SIG_IGN` on `SIGCHLD` means "I will never wait for them": the child is
+/// released without a zombie and no signal is sent. `SA_NOCLDWAIT` with a
+/// handler means the same for the zombie, but the handler still runs
+/// (sigaction(2), and the `psig->action[SIGCHLD-1]` test in
+/// `do_notify_parent`). Anything else leaves the zombie and sends the signal.
+fn child_death_policy(reaper: &LinuxProcess) -> ChildDeathPolicy {
+    let action = reaper.signal_action(LinuxSignal::SIGCHLD);
+    if action.handler == crate::signal::SIG_IGN {
+        ChildDeathPolicy {
+            autoreap: true,
+            notify: false,
+        }
+    } else if action
+        .flags
+        .contains(crate::signal::SignalActionFlags::NOCLDWAIT)
+    {
+        ChildDeathPolicy {
+            autoreap: true,
+            notify: true,
+        }
+    } else {
+        ChildDeathPolicy {
+            autoreap: false,
+            notify: true,
+        }
+    }
 }
 
 /// Park the current task until this process leaves a job-control stop (or dies).
@@ -9097,5 +9162,63 @@ mod sigchld_tests {
             pending_sigchld(&thread),
             "a death is never covered by SA_NOCLDSTOP"
         );
+    }
+
+    fn sigchld_action(parent: &Arc<Process>, handler: usize, flags: SignalActionFlags) {
+        parent.linux().set_signal_action(
+            LinuxSignal::SIGCHLD,
+            SignalAction {
+                handler,
+                flags,
+                restorer: 0,
+                mask: Sigset::default(),
+            },
+        );
+    }
+
+    /// A daemon that sets SIGCHLD to SIG_IGN and never waits (sigaction(2):
+    /// "children that terminate do not become zombies") used to leave every
+    /// child as a zombie in `reaped_children`, for good, and a later
+    /// `wait4(-1)` handed back a child the program had said it would never
+    /// collect.
+    #[test]
+    fn sig_ign_on_sigchld_releases_the_child_with_no_zombie_and_no_signal() {
+        let (parent, thread) = a_parent(43_007);
+        sigchld_action(&parent, crate::signal::SIG_IGN, SignalActionFlags::empty());
+        let child = Process::fork_from(&parent).unwrap();
+        child.exit(3);
+        assert!(
+            !parent.linux().is_zombie_child(child.id()),
+            "the child stayed a zombie although SIGCHLD is ignored"
+        );
+        assert!(!parent.linux().has_child(child.id()));
+        assert!(!pending_sigchld(&thread), "SIG_IGN still queued a SIGCHLD");
+        let r = async_std::task::block_on(wait_child_any(&parent, true, true));
+        assert_eq!(r.err(), Some(LxError::ECHILD));
+    }
+
+    #[test]
+    fn sa_nocldwait_releases_the_child_but_the_handler_still_runs() {
+        let (parent, thread) = a_parent(43_008);
+        sigchld_action(&parent, 0x1000, SignalActionFlags::NOCLDWAIT);
+        let child = Process::fork_from(&parent).unwrap();
+        child.exit(0);
+        assert!(!parent.linux().has_child(child.id()), "zombie left behind");
+        assert!(
+            pending_sigchld(&thread),
+            "SA_NOCLDWAIT is not SIG_IGN: the signal is still sent"
+        );
+    }
+
+    #[test]
+    fn a_parent_that_wants_its_zombies_keeps_them() {
+        let (parent, _thread) = a_parent(43_009);
+        sigchld_action(&parent, 0x1000, SignalActionFlags::NOCLDSTOP);
+        let child = Process::fork_from(&parent).unwrap();
+        child.exit(5);
+        assert!(parent.linux().is_zombie_child(child.id()));
+        let (pid, status, _) =
+            async_std::task::block_on(wait_child_any(&parent, true, true)).unwrap();
+        assert_eq!((pid, status), (child.id(), wait_status_exited(5)));
     }
 }
