@@ -658,19 +658,52 @@ impl Syscall<'_> {
     /// performs the control operation specified by cmd on the shared memory segment whose identifier is given in id
     pub fn sys_shmctl(&self, id: usize, cmd: usize, buffer: usize) -> SysResult {
         info!("shmctl: id: {}, cmd: {} buffer: {:#x}", id, cmd, buffer);
-        // System-wide, like `shmat`: a program may be asked to remove or stat
-        // a segment it never created itself.
-        let guard = linux_object::ipc::shm_lookup(id)
-            .or_else(|| self.linux_process().shm_get(id).map(|i| i.guard))
-            .ok_or(LxError::EINVAL)?;
-        let shm_guard = guard.lock();
         let cmd = match ShmctlCmds::try_from(cmd) {
             Ok(t) => t,
             Err(_) => {
-                error!("invalid semctl cmd: {}", cmd);
+                error!("invalid shmctl cmd: {}", cmd);
                 return Err(LxError::EINVAL);
             }
         };
+        // What the first argument names depends on the command: the two
+        // table commands ignore it, the two `SHM_STAT`s take an INDEX, the
+        // rest an id. Looking the id up first, for every command, made
+        // `shmctl(0, SHM_INFO, ..)` EINVAL whenever there was no segment 0
+        // (busybox `ipcs -m`: "kernel not configured for shared memory").
+        let (id, guard) = match shmctl_subject(cmd, id) {
+            ShmctlSubject::Table => {
+                let max_index = linux_object::ipc::shm_max_index();
+                match cmd {
+                    ShmctlCmds::IPC_INFO => {
+                        let mut buffer: UserOutPtr<ShmInfo64> = buffer.into();
+                        buffer.write(ShmInfo64::linux_defaults())?;
+                    }
+                    _ => {
+                        let (used_ids, shm_tot, shm_rss) = linux_object::ipc::shm_totals();
+                        let mut buffer: UserOutPtr<ShmInfo> = buffer.into();
+                        buffer.write(ShmInfo {
+                            used_ids: used_ids as i32,
+                            shm_tot,
+                            shm_rss,
+                            ..ShmInfo::default()
+                        })?;
+                    }
+                }
+                return Ok(shm_info_result(max_index));
+            }
+            ShmctlSubject::Index(idx) => {
+                linux_object::ipc::shm_at_index(idx).ok_or(LxError::EINVAL)?
+            }
+            // System-wide, like `shmat`: a program may be asked to remove or
+            // stat a segment it never created itself.
+            ShmctlSubject::Segment(id) => (
+                id,
+                linux_object::ipc::shm_lookup(id)
+                    .or_else(|| self.linux_process().shm_get(id).map(|i| i.guard))
+                    .ok_or(LxError::EINVAL)?,
+            ),
+        };
+        let shm_guard = guard.lock();
         match cmd {
             ShmctlCmds::IPC_RMID => {
                 if !shm_guard.may_control(self.linux_process().euid()) {
@@ -693,20 +726,20 @@ impl Syscall<'_> {
                 shm_guard.ctime();
                 Ok(0)
             }
-            ShmctlCmds::IPC_STAT | ShmctlCmds::SHM_STAT => {
+            ShmctlCmds::IPC_STAT | ShmctlCmds::SHM_STAT | ShmctlCmds::SHM_STAT_ANY => {
                 let proc = self.linux_process();
-                if !shm_guard.may_access(proc.euid(), proc.egid(), IPC_R) {
+                // `SHM_STAT_ANY` skips the read-permission check.
+                if cmd != ShmctlCmds::SHM_STAT_ANY
+                    && !shm_guard.may_access(proc.euid(), proc.egid(), IPC_R)
+                {
                     return Err(LxError::EACCES);
                 }
                 let shmid_ds = shm_guard.shmid_ds.lock();
                 let mut buffer: UserOutPtr<ShmidDs> = buffer.into();
                 buffer.write(*shmid_ds)?;
-                Ok(0)
-            }
-            ShmctlCmds::SHM_INFO => {
-                let mut buffer: UserOutPtr<ShmInfo> = buffer.into();
-                buffer.write(ShmInfo::default())?;
-                Ok(0)
+                // The `SHM_STAT`s answer the segment's id: it is how the
+                // caller learns it from the index it walked to.
+                Ok(shmctl_stat_result(cmd, id))
             }
             _ => {
                 warn!("unsupported shmctl cmd: {:?}", cmd);
@@ -770,9 +803,9 @@ numeric_enum! {
 
 numeric_enum! {
     #[repr(usize)]
-    #[derive(Debug, Eq, PartialEq)]
+    #[derive(Debug, Eq, PartialEq, Clone, Copy)]
     #[allow(non_camel_case_types)]
-    /// for the third argument of semctl(), specified the control operation
+    /// for the third argument of shmctl(), specified the control operation
     pub enum ShmctlCmds {
         /// Mark the segment to be destroyed, actually be destroyed after the last process detaches it
         IPC_RMID = 0,
@@ -781,6 +814,9 @@ numeric_enum! {
         /// Copy information from the kernel data structure associated with
         /// shmid into the shmid_ds structure pointed to by arg.buf.
         IPC_STAT = 2,
+        /// Returns a `shminfo` structure with the system's limits; the first
+        /// argument is ignored.
+        IPC_INFO = 3,
         /// Prevent swapping of the shared memory segment
         SHM_LOCK = 11,
         /// Unlock the segment, allowing it to be swapped out.
@@ -790,6 +826,45 @@ numeric_enum! {
         /// Returns a shm_info structure whose fields contain information
         /// about system resources consumed by shared memory.
         SHM_INFO = 14,
+        /// `SHM_STAT` without the read-permission check (Linux 4.17).
+        SHM_STAT_ANY = 15,
+    }
+}
+
+/// What the first argument of `shmctl(2)` names, by command
+/// (`ipc/shm.c`, `ksys_shmctl`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ShmctlSubject {
+    /// `IPC_INFO`, `SHM_INFO`: the table as a whole; the argument is ignored.
+    Table,
+    /// `SHM_STAT`, `SHM_STAT_ANY`: an INDEX into the table, not an id.
+    Index(usize),
+    /// Everything else: a segment id.
+    Segment(usize),
+}
+
+pub(crate) fn shmctl_subject(cmd: ShmctlCmds, arg: usize) -> ShmctlSubject {
+    match cmd {
+        ShmctlCmds::IPC_INFO | ShmctlCmds::SHM_INFO => ShmctlSubject::Table,
+        ShmctlCmds::SHM_STAT | ShmctlCmds::SHM_STAT_ANY => ShmctlSubject::Index(arg),
+        _ => ShmctlSubject::Segment(arg),
+    }
+}
+
+/// What `IPC_INFO` and `SHM_INFO` return: the highest index in use, and 0
+/// when the table is empty (`if (err < 0) err = 0;`). busybox `ipcs -m`
+/// walks `SHM_STAT` from 0 to this number inclusive.
+pub(crate) fn shm_info_result(max_index: Option<usize>) -> usize {
+    max_index.unwrap_or(0)
+}
+
+/// What a stat command returns: 0 for `IPC_STAT`, and for the two
+/// `SHM_STAT`s the id of the segment found at the index, which is how the
+/// caller learns it. Both used to return 0.
+pub(crate) fn shmctl_stat_result(cmd: ShmctlCmds, id: usize) -> usize {
+    match cmd {
+        ShmctlCmds::SHM_STAT | ShmctlCmds::SHM_STAT_ANY => id,
+        _ => 0,
     }
 }
 
@@ -911,7 +986,8 @@ pub fn plan_semop(values: &[isize], ops: &[SemBuf]) -> Result<SemopPlan, LxError
     ))
 }
 
-/// shm_info structure for shmctl
+/// `struct shm_info` for `shmctl(SHM_INFO)`: 48 bytes on 64-bit. It used to
+/// stop at `shm_swp`, 40, so the last two fields were never written.
 #[repr(C)]
 #[derive(Default)]
 struct ShmInfo {
@@ -923,6 +999,45 @@ struct ShmInfo {
     shm_rss: usize,
     /// of swapped shared memory pages
     shm_swp: usize,
+    /// Unused since Linux 2.4; written as zero.
+    swap_attempts: usize,
+    /// Unused since Linux 2.4; written as zero.
+    swap_successes: usize,
+}
+
+static_assertions::const_assert_eq!(48, core::mem::size_of::<ShmInfo>());
+
+/// `struct shminfo64` for `shmctl(IPC_INFO)`: the system's limits.
+#[repr(C)]
+#[derive(Default)]
+struct ShmInfo64 {
+    /// Maximum segment size (`SHMMAX`).
+    shmmax: usize,
+    /// Minimum segment size (`SHMMIN`).
+    shmmin: usize,
+    /// Maximum number of segments (`SHMMNI`).
+    shmmni: usize,
+    /// Maximum segments per process (`SHMSEG`).
+    shmseg: usize,
+    /// Maximum pages of shared memory system-wide (`SHMALL`).
+    shmall: usize,
+    /// Padding, zero.
+    unused: [usize; 4],
+}
+
+impl ShmInfo64 {
+    /// `include/uapi/linux/shm.h` defaults: `SHMMAX` and `SHMALL` are
+    /// `ULONG_MAX - (1UL << 24)`, `SHMMIN` 1, `SHMMNI` and `SHMSEG` 4096.
+    fn linux_defaults() -> Self {
+        ShmInfo64 {
+            shmmax: usize::MAX - (1 << 24),
+            shmmin: 1,
+            shmmni: 4096,
+            shmseg: 4096,
+            shmall: usize::MAX - (1 << 24),
+            unused: [0; 4],
+        }
+    }
 }
 
 bitflags! {
@@ -1231,6 +1346,76 @@ mod semop_plan_tests {
             (1, 1),
             "one missing unit holds the whole array"
         );
+    }
+}
+
+#[cfg(test)]
+mod shmctl_subject_tests {
+    //! What `shmctl`'s first argument means, which used to be "an id" for
+    //! every command: `shmctl(0, SHM_INFO, ..)` was EINVAL whenever there
+    //! was no segment 0, and busybox `ipcs -m` reported "kernel not
+    //! configured for shared memory".
+
+    use super::*;
+
+    /// The two table commands ignore the argument; the two stats take an
+    /// index; the rest an id.
+    #[test]
+    fn the_first_argument_is_an_index_an_id_or_nothing_by_command() {
+        assert_eq!(
+            shmctl_subject(ShmctlCmds::SHM_INFO, 0),
+            ShmctlSubject::Table
+        );
+        assert_eq!(
+            shmctl_subject(ShmctlCmds::IPC_INFO, 77),
+            ShmctlSubject::Table
+        );
+        assert_eq!(
+            shmctl_subject(ShmctlCmds::SHM_STAT, 3),
+            ShmctlSubject::Index(3)
+        );
+        assert_eq!(
+            shmctl_subject(ShmctlCmds::SHM_STAT_ANY, 3),
+            ShmctlSubject::Index(3)
+        );
+        for cmd in [
+            ShmctlCmds::IPC_STAT,
+            ShmctlCmds::IPC_SET,
+            ShmctlCmds::IPC_RMID,
+            ShmctlCmds::SHM_LOCK,
+            ShmctlCmds::SHM_UNLOCK,
+        ] {
+            assert_eq!(
+                shmctl_subject(cmd, 3),
+                ShmctlSubject::Segment(3),
+                "{:?}",
+                cmd
+            );
+        }
+    }
+
+    /// `SHM_INFO` returns the highest index, 0 for an empty table; the
+    /// `SHM_STAT`s return the id found there; `IPC_STAT` returns 0.
+    #[test]
+    fn the_return_values_ipcs_walks_by() {
+        assert_eq!(shm_info_result(None), 0);
+        assert_eq!(shm_info_result(Some(0)), 0);
+        assert_eq!(shm_info_result(Some(6)), 6);
+        assert_eq!(shmctl_stat_result(ShmctlCmds::SHM_STAT, 7), 7);
+        assert_eq!(shmctl_stat_result(ShmctlCmds::SHM_STAT_ANY, 7), 7);
+        assert_eq!(shmctl_stat_result(ShmctlCmds::IPC_STAT, 7), 0);
+    }
+
+    /// The two structs userspace reads, in the 64-bit layout: `shm_info` is
+    /// 48 bytes, `shminfo64` is 72, and `IPC_INFO` carries Linux's limits.
+    #[test]
+    fn the_info_structs_have_the_uapi_size_and_values() {
+        assert_eq!(core::mem::size_of::<ShmInfo>(), 48);
+        assert_eq!(core::mem::size_of::<ShmInfo64>(), 72);
+        let d = ShmInfo64::linux_defaults();
+        assert_eq!((d.shmmin, d.shmmni, d.shmseg), (1, 4096, 4096));
+        assert_eq!(d.shmmax, usize::MAX - (1 << 24));
+        assert_eq!(d.shmall, d.shmmax);
     }
 }
 
