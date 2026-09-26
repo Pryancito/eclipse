@@ -345,17 +345,26 @@ fn ntp_time_state(st: &NtpState) -> usize {
 }
 
 impl Syscall<'_> {
-    /// finds the resolution (precision) of the specified clock clockid, and,
-    /// if buffer is non-NULL, stores it in the struct timespec pointed to by buffer
+    /// `clock_gettime(2)`: the time of the clock `clock` names.
+    ///
+    /// The wall and monotonic clocks, and the CPU clocks, which used to be
+    /// `EINVAL` here (a `match` on the numbers 0, 1 and 4 to 7) while the
+    /// accounting behind them was already reported by `getrusage(2)` and
+    /// `times(2)`: `clock()` in glibc and musl is
+    /// `clock_gettime(CLOCK_PROCESS_CPUTIME_ID)` and returned -1 to every
+    /// program, and so did what `clock_getcpuclockid(3)` and
+    /// `pthread_getcpuclockid(3)` hand back. See [`clock_gettime_source`].
     pub fn sys_clock_gettime(&self, clock: usize, mut buf: UserOutPtr<TimeSpec>) -> SysResult {
         trace!("clock_gettime: id={:?} buf={:?}", clock, buf);
         if buf.is_null() {
             return Err(LxError::EINVAL);
         }
-        let ts = match clock {
-            0 | 5 => TimeSpec::now(), // CLOCK_REALTIME, CLOCK_REALTIME_COARSE
-            1 | 4 | 6 | 7 => TimeSpec::now_monotonic(),
-            _ => return Err(LxError::EINVAL),
+        let ts = match clock_gettime_source(clock)? {
+            ClockSource::Wall => TimeSpec::now(),
+            ClockSource::Monotonic => TimeSpec::now_monotonic(),
+            ClockSource::Cpu(cpu) => {
+                TimeSpec::from_duration(Duration::from_nanos(self.cpu_clock_ns(cpu)?))
+            }
         };
         buf.write(ts)?;
 
@@ -370,18 +379,57 @@ impl Syscall<'_> {
     /// unwritten resolution as a fatal condition, so always fill the struct.
     pub fn sys_clock_getres(&self, clock: usize, mut buf: UserOutPtr<TimeSpec>) -> SysResult {
         trace!("clock_getres: id={:?} buf={:?}", clock, buf);
-        // Reject unknown clocks the same way clock_gettime does.
-        match clock {
-            0..=7 => {}
-            _ => return Err(LxError::EINVAL),
+        // Exactly the clocks `clock_gettime` reads, and for a CPU clock the
+        // same look-up of whose (`posix_cpu_clock_getres` validates the
+        // task first): a resolution for a clock that cannot be read was
+        // what this answered for the two CPU clocks.
+        if let ClockSource::Cpu(cpu) = clock_gettime_source(clock)? {
+            self.cpu_clock_ns(cpu)?;
         }
         if buf.is_null() {
             return Ok(0);
         }
-        // We service these clocks from a nanosecond-granularity timer source.
+        // We service these clocks from a nanosecond-granularity timer
+        // source, and the CPU clocks are `posix_cpu_clock_getres`'s 1 ns.
         let res = TimeSpec { sec: 0, nsec: 1 };
         buf.write(res)?;
         Ok(0)
+    }
+
+    /// What a CPU clock reads now, in nanoseconds: the accounting
+    /// `getrusage(2)` and `times(2)` report, user time per thread and the
+    /// process's kernel time from the syscall accounting (which is not split
+    /// per thread, so a thread clock counts user time alone, as
+    /// `RUSAGE_THREAD` does). Whose is resolved as `pid_for_clock` does:
+    /// `0` is the caller, a thread clock names a thread of the caller's own
+    /// process, a process clock names any process, and anything else is
+    /// `EINVAL`.
+    fn cpu_clock_ns(&self, clock: CpuClock) -> Result<u64, LxError> {
+        let (utime_ns, stime_ns) = match clock.owner {
+            CpuClockOwner::Thread(0) => (self.thread.get_time(), 0),
+            CpuClockOwner::Thread(tid) => {
+                let thread = self
+                    .zircon_process()
+                    .get_child(tid as KoID)
+                    .ok()
+                    .and_then(|obj| obj.downcast_arc::<Thread>().ok())
+                    .ok_or(LxError::EINVAL)?;
+                (thread.get_time(), 0)
+            }
+            CpuClockOwner::Process(pid) => {
+                let proc = if pid == 0 {
+                    self.zircon_process().clone()
+                } else {
+                    linux_object::process::find_process(pid as KoID).ok_or(LxError::EINVAL)?
+                };
+                let stime_ns = proc
+                    .try_linux()
+                    .map(|linux| linux.perf().totals().1)
+                    .unwrap_or(0);
+                (process_user_time_ns(&proc), stime_ns)
+            }
+        };
+        Ok(clock.kind.value_ns(utime_ns, stime_ns))
     }
 
     /// set the time of the clock with id clockid

@@ -521,6 +521,277 @@ pub fn timer_arm_deadline(
     now_monotonic.saturating_add(value.saturating_sub(now))
 }
 
+/// Whose CPU time a CPU clock adds up. `0` is the caller's own process or
+/// thread, which is what `CPUCLOCK_PID(clock) == 0` means in Linux.
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub enum CpuClockOwner {
+    /// A whole process (a thread group), by pid.
+    Process(usize),
+    /// One thread, by tid.
+    Thread(usize),
+}
+
+/// Which of a task's times a CPU clock adds up: Linux's `CPUCLOCK_PROF`,
+/// `CPUCLOCK_VIRT` and `CPUCLOCK_SCHED`, in that order.
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub enum CpuClockKind {
+    /// User plus kernel time (`utime + stime`).
+    Prof,
+    /// User time only.
+    Virt,
+    /// Time on the CPU as the scheduler counts it (`sum_exec_runtime`).
+    Sched,
+}
+
+impl CpuClockKind {
+    /// The clock's reading, from a task's user and kernel nanoseconds. The
+    /// scheduler's count is the two added, the only account this kernel
+    /// keeps of time on the CPU.
+    pub fn value_ns(self, utime_ns: u64, stime_ns: u64) -> u64 {
+        match self {
+            Self::Virt => utime_ns,
+            Self::Prof | Self::Sched => utime_ns.saturating_add(stime_ns),
+        }
+    }
+}
+
+/// A CPU-time clock: whose time, and which of their times.
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub struct CpuClock {
+    /// Whose.
+    pub owner: CpuClockOwner,
+    /// Which.
+    pub kind: CpuClockKind,
+}
+
+impl CpuClock {
+    /// The CPU clock `raw` names; `Ok(None)` when it names a system clock
+    /// (or nothing) instead, and the error Linux gives for a CPU clock id
+    /// that is malformed.
+    ///
+    /// `clockid_t` is a 32-bit `int`, and Linux spells the CPU clocks in two
+    /// ways (`include/linux/posix-timers.h`): `CLOCK_PROCESS_CPUTIME_ID` (2)
+    /// and `CLOCK_THREAD_CPUTIME_ID` (3) for the caller's own, and every
+    /// **negative** id, which is what `clock_getcpuclockid(3)` and
+    /// `pthread_getcpuclockid(3)` hand back: `~pid << 3 | kind`, with bit 2
+    /// set for a thread. Bits 0-2 all set (`CLOCKFD`) is a dynamic clock, a
+    /// PTP device's fd, which this kernel has none of, so `EBADF`, as
+    /// `get_clock_desc` answers for an fd that is not one; a kind of 3 on a
+    /// thread is `EINVAL`, from `pid_for_clock`.
+    pub fn from_raw(raw: usize) -> crate::error::LxResult<Option<Self>> {
+        use crate::error::LxError;
+        // The register carries the `int` zero- or sign-extended: read the
+        // low 32 bits either way.
+        let id = raw as u32 as i32;
+        if id >= 0 {
+            return Ok(match id {
+                2 => Some(Self {
+                    owner: CpuClockOwner::Process(0),
+                    kind: CpuClockKind::Sched,
+                }),
+                3 => Some(Self {
+                    owner: CpuClockOwner::Thread(0),
+                    kind: CpuClockKind::Sched,
+                }),
+                _ => None,
+            });
+        }
+        const CLOCKFD: i32 = 3;
+        const CLOCKFD_MASK: i32 = 7;
+        if id & CLOCKFD_MASK == CLOCKFD {
+            return Err(LxError::EBADF);
+        }
+        let kind = match id & 3 {
+            0 => CpuClockKind::Prof,
+            1 => CpuClockKind::Virt,
+            2 => CpuClockKind::Sched,
+            _ => return Err(LxError::EINVAL),
+        };
+        // `CPUCLOCK_PID`: the complement of what is left above the three
+        // low bits, with the sign kept while shifting.
+        let pid = !(id >> 3) as usize;
+        let owner = if id & 4 != 0 {
+            CpuClockOwner::Thread(pid)
+        } else {
+            CpuClockOwner::Process(pid)
+        };
+        Ok(Some(Self { owner, kind }))
+    }
+}
+
+/// Where `clock_gettime(2)` reads a clock from.
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub enum ClockSource {
+    /// The wall clock, counted from the Unix epoch.
+    Wall,
+    /// The monotonic clock, counted from boot.
+    Monotonic,
+    /// A task's CPU time.
+    Cpu(CpuClock),
+}
+
+/// What `clock_gettime(2)` and `clock_getres(2)` read for `clock`, or
+/// `EINVAL` if it is not a clock.
+///
+/// Every clock `ClockId` knows can be read, whatever `clock_nanosleep` or
+/// `timer_create` think of it: `posix_clocks[]` gives each one a
+/// `clock_get_timespec`. The two CPU clocks used to be `EINVAL` here, with
+/// the CPU accounting that `getrusage(2)` and `times(2)` report sitting
+/// right there, so `clock()` in glibc and musl, which is
+/// `clock_gettime(CLOCK_PROCESS_CPUTIME_ID)`, returned -1 to every program.
+pub fn clock_gettime_source(clock: usize) -> crate::error::LxResult<ClockSource> {
+    if let Some(cpu) = CpuClock::from_raw(clock)? {
+        return Ok(ClockSource::Cpu(cpu));
+    }
+    Ok(match ClockId::from_raw(clock)? {
+        ClockId::ClockRealTime | ClockId::ClockRealTimeCoarse | ClockId::ClockRealTimeAlarm => {
+            ClockSource::Wall
+        }
+        ClockId::ClockMonotonic
+        | ClockId::ClockMonotonicRaw
+        | ClockId::ClockMonotonicCoarse
+        | ClockId::ClockBootTime
+        | ClockId::ClockBootTimeAlarm => ClockSource::Monotonic,
+        // Named by number above, before `ClockId` is asked.
+        ClockId::ClockProcessCpuTimeId => ClockSource::Cpu(CpuClock {
+            owner: CpuClockOwner::Process(0),
+            kind: CpuClockKind::Sched,
+        }),
+        ClockId::ClockThreadCpuTimeId => ClockSource::Cpu(CpuClock {
+            owner: CpuClockOwner::Thread(0),
+            kind: CpuClockKind::Sched,
+        }),
+    })
+}
+
+/// The CPU clocks of `clock_gettime(2)`, which it refused.
+#[cfg(test)]
+mod cpu_clock_tests {
+    use super::*;
+    use crate::error::LxError;
+    use CpuClockKind::{Prof, Sched, Virt};
+    use CpuClockOwner::{Process, Thread};
+
+    fn cpu(owner: CpuClockOwner, kind: CpuClockKind) -> ClockSource {
+        ClockSource::Cpu(CpuClock { owner, kind })
+    }
+
+    /// Linux's `MAKE_PROCESS_CPUCLOCK` / `MAKE_THREAD_CPUCLOCK`, as a
+    /// 32-bit `clockid_t`.
+    fn cpuclock(pid: i32, kind: i32, thread: bool) -> i32 {
+        (!pid << 3) | kind | if thread { 4 } else { 0 }
+    }
+
+    /// `clock()` in glibc and musl is `clock_gettime(CLOCK_PROCESS_CPUTIME_ID)`,
+    /// and Python's `time.thread_time()` is the thread one: both were EINVAL.
+    #[test]
+    fn two_and_three_are_the_callers_own_cpu_clocks() {
+        assert_eq!(clock_gettime_source(2), Ok(cpu(Process(0), Sched)));
+        assert_eq!(clock_gettime_source(3), Ok(cpu(Thread(0), Sched)));
+        // The negative spellings of the same two, as the kernel defines them.
+        assert_eq!(cpuclock(0, 2, false), -6);
+        assert_eq!(cpuclock(0, 2, true), -2);
+        assert_eq!(
+            clock_gettime_source(-6_i32 as u32 as usize),
+            Ok(cpu(Process(0), Sched))
+        );
+        assert_eq!(
+            clock_gettime_source(-2_i32 as u32 as usize),
+            Ok(cpu(Thread(0), Sched))
+        );
+    }
+
+    /// What `clock_getcpuclockid(3)` and `pthread_getcpuclockid(3)` hand
+    /// back for another task: the pid or tid, and the kind, in one number.
+    /// The register may carry the `int` zero-extended (`mov edi`) or
+    /// sign-extended: both are read the same.
+    #[test]
+    fn a_negative_id_names_a_task_and_a_kind() {
+        for pid in [1, 77, 1234, 0x0fff_ffff] {
+            for (kind, expect) in [(0, Prof), (1, Virt), (2, Sched)] {
+                for thread in [false, true] {
+                    let id = cpuclock(pid, kind, thread);
+                    assert!(id < 0, "{}", id);
+                    let owner = if thread {
+                        Thread(pid as usize)
+                    } else {
+                        Process(pid as usize)
+                    };
+                    for raw in [id as u32 as usize, id as isize as usize] {
+                        assert_eq!(
+                            clock_gettime_source(raw),
+                            Ok(cpu(owner, expect)),
+                            "pid {} kind {} thread {} raw {:#x}",
+                            pid,
+                            kind,
+                            thread,
+                            raw
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The two malformed shapes get Linux's two different answers.
+    #[test]
+    fn a_dynamic_clock_is_ebadf_and_a_fourth_kind_on_a_thread_is_einval() {
+        // `CLOCKFD`: low three bits 011 name a PTP device's fd.
+        assert_eq!(
+            clock_gettime_source(cpuclock(5, 3, false) as u32 as usize),
+            Err(LxError::EBADF)
+        );
+        // Kind 3 with the thread bit: `pid_for_clock` says no such kind.
+        assert_eq!(
+            clock_gettime_source(cpuclock(5, 3, true) as u32 as usize),
+            Err(LxError::EINVAL)
+        );
+    }
+
+    /// The system clocks read the wall or the monotonic clock, the alarm
+    /// pair included: `CLOCK_REALTIME_ALARM` and `CLOCK_BOOTTIME_ALARM` are
+    /// readable by anyone in Linux (`alarm_clock_get_timespec`); only a
+    /// timer on them wants `CAP_WAKE_ALARM`. They were EINVAL here too.
+    #[test]
+    fn the_system_clocks_read_the_wall_or_the_monotonic_clock() {
+        for clock in [0, 5, 8] {
+            assert_eq!(
+                clock_gettime_source(clock),
+                Ok(ClockSource::Wall),
+                "{}",
+                clock
+            );
+            assert_eq!(CpuClock::from_raw(clock), Ok(None));
+        }
+        for clock in [1, 4, 6, 7, 9] {
+            assert_eq!(
+                clock_gettime_source(clock),
+                Ok(ClockSource::Monotonic),
+                "{}",
+                clock
+            );
+            assert_eq!(CpuClock::from_raw(clock), Ok(None));
+        }
+        for clock in [10, 11, 99, i32::MAX as usize] {
+            assert_eq!(
+                clock_gettime_source(clock),
+                Err(LxError::EINVAL),
+                "{}",
+                clock
+            );
+        }
+    }
+
+    /// `CPUCLOCK_VIRT` is user time alone; the other two add the kernel's.
+    #[test]
+    fn virt_is_user_time_and_the_other_two_add_kernel_time() {
+        assert_eq!(Virt.value_ns(700, 300), 700);
+        assert_eq!(Prof.value_ns(700, 300), 1000);
+        assert_eq!(Sched.value_ns(700, 300), 1000);
+        assert_eq!(Prof.value_ns(u64::MAX, 1), u64::MAX);
+    }
+}
+
 #[cfg(test)]
 mod time_tests {
     //! Tests for the arithmetic every timeout in the kernel goes through.
