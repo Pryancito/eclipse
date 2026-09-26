@@ -165,7 +165,12 @@ fn deliver_direct_sigkill(
     caller: &Arc<zircon_object::task::Process>,
     process: &Arc<zircon_object::task::Process>,
 ) {
-    let retcode = (128 + Signal::SIGKILL as i32) as i64;
+    // A death by signal, not an `exit(137)`: `137` is the shell's own
+    // arithmetic over `WIFSIGNALED`, and stored as the exit code it made
+    // `kill -9` look like a program that had exited normally with 137 --
+    // `WIFSIGNALED` false, bash silent instead of "Killed", the parent's
+    // SIGCHLD saying `CLD_EXITED`.
+    let retcode = linux_object::process::exit_code_killed_by(Signal::SIGKILL as u8);
     match sigkill_outcome(caller.id(), process.id()) {
         KillOutcome::Caller => {
             // Same trace as send_signal_to_process: this path ends the target
@@ -1331,5 +1336,50 @@ mod queued_siginfo_tests {
             (info.code, word(16), word(20)),
             (SignalCode::TKILL, 31, 1000)
         );
+    }
+}
+
+#[cfg(test)]
+mod direct_sigkill_tests {
+    //! The direct `SIGKILL` of `kill(2)` and `rt_sigqueueinfo(2)` ended the
+    //! target with the literal `128 + 9`: to `wait4` and to the SIGCHLD that
+    //! was an `exit(137)`, `WIFSIGNALED` false, and bash printed nothing
+    //! where it prints "Killed".
+
+    use super::*;
+    use linux_object::process::{exit_code_killed_by, wait_status_exited, LinuxProcess};
+    use rcore_fs_ramfs::RamFS;
+    use zircon_object::task::{Status, ROOT_JOB};
+
+    fn a_process(pid: KoID) -> Arc<zircon_object::task::Process> {
+        Process::create_with_fixed_id_ext(&ROOT_JOB, pid, "p", LinuxProcess::new(RamFS::new(), 0))
+            .unwrap()
+    }
+
+    fn killed_by_sigkill(proc: &Arc<zircon_object::task::Process>) {
+        let code = match proc.status() {
+            Status::Exited(code) => code,
+            other => panic!("not exited: {:?}", other),
+        };
+        assert_eq!(code, exit_code_killed_by(Signal::SIGKILL as u8));
+        let status = wait_status_exited(code);
+        assert_eq!(status & 0x7f, 9, "WTERMSIG of {:#x}", status);
+        assert_ne!(status >> 8 & 0xff, 137, "still the shell's 137");
+    }
+
+    #[test]
+    fn a_direct_sigkill_at_another_process_is_a_death_by_signal() {
+        let caller = a_process(43_202);
+        let target = a_process(43_203);
+        deliver_direct_sigkill(&caller, &target);
+        killed_by_sigkill(&target);
+        assert!(!matches!(caller.status(), Status::Exited(_)));
+    }
+
+    #[test]
+    fn a_direct_sigkill_at_oneself_is_a_death_by_signal_too() {
+        let caller = a_process(43_204);
+        deliver_direct_sigkill(&caller, &caller);
+        killed_by_sigkill(&caller);
     }
 }

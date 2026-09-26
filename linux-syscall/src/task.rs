@@ -63,6 +63,16 @@ pub struct SchedAttr {
     pub sched_period: u64,
 }
 
+/// What a process that failed `execve` AFTER its address space was replaced
+/// finishes with: Linux kills it with SIGSEGV (`force_sigsegv` in
+/// `flush_old_exec`'s failure path), so its parent sees a death by signal,
+/// `WIFSIGNALED` with `WTERMSIG == 11`. This used to be the literal `139`,
+/// the number a SHELL prints for that, stored as if the process had called
+/// `exit(139)`.
+fn exit_code_after_failed_exec() -> i64 {
+    linux_object::process::exit_code_killed_by(linux_object::signal::Signal::SIGSEGV as u8)
+}
+
 fn write_sigchld_info(mut infop: UserOutPtr<SigInfo>, pid: KoID, status: i32) -> SysResult {
     if infop.is_null() {
         return Ok(0);
@@ -987,8 +997,7 @@ impl Syscall<'_> {
                     e,
                     self.zircon_process().id()
                 );
-                // 11 = SIGSEGV, in the "128 + signal" form a shell reports.
-                self.zircon_process().exit(139);
+                self.zircon_process().exit(exit_code_after_failed_exec());
                 return Err(e);
             }
         };
@@ -2705,5 +2714,23 @@ mod setpgid_argument_tests {
     fn a_positive_pid_is_itself() {
         assert_eq!(resolve_pid_arg(ME, 1), Ok(1));
         assert_eq!(resolve_pid_arg(ME, i32::MAX), Ok(i32::MAX as u64));
+    }
+}
+
+#[cfg(test)]
+mod failed_exec_exit_tests {
+    //! A process whose `execve` failed after its address space was gone
+    //! finished with the literal `139`: `WIFEXITED` with status 139, the
+    //! shell's number, instead of the death by SIGSEGV Linux gives it.
+
+    use super::exit_code_after_failed_exec;
+    use linux_object::process::wait_status_exited;
+
+    #[test]
+    fn a_failed_exec_is_a_death_by_sigsegv_not_an_exit_139() {
+        let status = wait_status_exited(exit_code_after_failed_exec());
+        let wifsignaled = (status & 0x7f) != 0 && (status & 0x7f) != 0x7f;
+        assert!(wifsignaled, "status {:#x} says WIFEXITED", status);
+        assert_eq!(status & 0x7f, 11, "WTERMSIG");
     }
 }
