@@ -860,57 +860,155 @@ fn placement_load(runtime: &ExecutorRuntime) -> usize {
 /// keeps running.
 ///
 /// x86_64-only (the 0x38 layout is switch.S's); other arches return true.
+/// Size of a parked switch-out frame: `size_of::<ContextData>()` on x86_64,
+/// which `switch.S` builds by hand and `switch_contract.rs` pins.
+#[cfg(target_arch = "x86_64")]
+const FRAME_SIZE: usize = 0x40;
+/// Byte offset of the saved resume `rip` inside that frame (`[rsp + 0x38]`).
+#[cfg(target_arch = "x86_64")]
+const FRAME_RIP_OFFSET: usize = 0x38;
+/// The kernel image's virtual range. A resume address outside it is a `ret` to
+/// nowhere. The spine registry applies the same range to the same kind of
+/// value (`executor::spine_register`'s `val`), and the two have to agree.
+#[cfg(target_arch = "x86_64")]
+const KERNEL_TEXT: core::ops::Range<u64> = 0xffff_ff00_0000_0000..0xffff_ff00_0100_0000;
+
+/// [null-exec guard] What a parked switch-out frame looks like from outside.
+///
+/// Split out of [`executor_frame_resumable`] so the rules can be tested at all:
+/// the gate took an `&Executor`, and an `Executor` allocates a 2.6 MiB stack, so
+/// the one decision standing between the scheduler and a `ret` into a dead
+/// frame had no tests. What is left in the gate is the logging.
+#[cfg(target_arch = "x86_64")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FrameVerdict {
+    /// A whole frame on this executor's own stack, with a live page-table root
+    /// and a resume address inside the kernel image.
+    Resumable,
+    /// The saved sp does not name a whole frame on this stack: misaligned, below
+    /// the base, or with its tail past the top. Nothing is read in this case,
+    /// which is the point of checking it first.
+    SpNotOnStack,
+    /// `cr3 == 0`: a frame already consumed, or overwritten where it sat.
+    DeadPageTable,
+    /// The resume `rip` is not in the kernel image.
+    RipNotInText { rip: u64 },
+}
+
+#[cfg(target_arch = "x86_64")]
+impl FrameVerdict {
+    /// Whether this verdict is evidence of the write the whole `[null-exec]`
+    /// hunt is after.
+    ///
+    /// The two verdicts read *out of the frame* say the frame itself was
+    /// rewritten in place, which is that write. A saved sp that is not on the
+    /// stack is a bogus or stale **pointer** and says nothing about anyone
+    /// else's memory, so it must not push the kernel into its
+    /// heap-smash-suspected mode and the degraded paths that go with it.
+    pub(crate) fn looks_like_a_smash(self) -> bool {
+        matches!(self, Self::DeadPageTable | Self::RipNotInText { .. })
+    }
+}
+
+/// Classify the frame parked at `sp`, belonging to the stack `[base, top)`.
+///
+/// The order is the contract: the geometry decides before either word is read,
+/// because reading a frame that is not on the stack is the fault this gate
+/// exists to prevent — in the resume path, on the CPU that was about to switch
+/// onto it.
+///
+/// # Safety
+///
+/// `[base, top)` must be mapped memory. Nothing outside it is read.
+#[cfg(target_arch = "x86_64")]
+pub(crate) unsafe fn classify_parked_frame(sp: usize, base: usize, top: usize) -> FrameVerdict {
+    // The init frame (`ContextData` pushed at the stack top) and every real
+    // switch-out frame live on the executor's own stack.
+    //
+    // Saturating, because `sp` is the number this gate is here not to trust: a
+    // frame overwritten with a high value (`0xffff_ffff_ffff_ffc0` is 8-aligned
+    // and above any `base`) made `sp + FRAME_SIZE` wrap to a small number, so
+    // the bound passed and the reads below went wherever the garbage pointed.
+    // That is the gate handing the resume path the exact fault it was written
+    // to catch. The sibling registry learned this one already
+    // (`executor::alloc_overlaps_live_stack`).
+    if sp & 7 != 0 || sp < base || sp.saturating_add(FRAME_SIZE) > top {
+        return FrameVerdict::SpNotOnStack;
+    }
+    // SAFETY: sp names a whole frame inside `[base, top)`, checked above.
+    let cr3 = unsafe { core::ptr::read_volatile(sp as *const u64) };
+    if cr3 == 0 {
+        return FrameVerdict::DeadPageTable;
+    }
+    // SAFETY: as above; the frame's last word is at `sp + FRAME_SIZE - 8`.
+    let rip = unsafe { core::ptr::read_volatile((sp + FRAME_RIP_OFFSET) as *const u64) };
+    if !KERNEL_TEXT.contains(&rip) {
+        return FrameVerdict::RipNotInText { rip };
+    }
+    FrameVerdict::Resumable
+}
+
+/// How many words of the frame at `sp` the refusal report may read.
+///
+/// Nine: the frame's own eight, plus the word above it — which for the init
+/// frame is the executor address `push_stack` put there, and for a real
+/// switch-out frame is whatever parked it. Minus whatever would leave the
+/// stack: above `top` is the top guard, unmapped on purpose, and a report that
+/// faults inside the fault handler takes the machine down at the one moment it
+/// was about to say why. `sp` is corrupt by the time this runs, so the frame it
+/// names can sit anywhere the geometry check allows, the very top included.
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn frame_dump_words(sp: usize, top: usize) -> usize {
+    (top.saturating_sub(sp) / 8).min(9)
+}
+
 fn executor_frame_resumable(ex: &Executor) -> bool {
     #[cfg(target_arch = "x86_64")]
     {
         let sp = ex.context.get_sp();
         let base = ex.stack_base();
         let top = base + crate::executor::STACK_SIZE;
-        // The init frame (ContextData pushed at stack top) and every real
-        // switch-out frame live on the executor's own stack.
-        if sp & 7 != 0 || sp < base || sp + 0x40 > top {
-            error!(
+        // SAFETY: the executor's own live stack, mapped for as long as the
+        // executor exists.
+        let verdict = unsafe { classify_parked_frame(sp, base, top) };
+        match verdict {
+            FrameVerdict::Resumable => return true,
+            FrameVerdict::SpNotOnStack => error!(
                 "[stale-resume] executor id={} saved sp {:#x} OUTSIDE its stack \
                  {:#x}..{:#x} — refusing to resume",
                 ex.id(),
                 sp,
                 base,
                 top
-            );
-            return false;
-        }
-        // SAFETY: sp validated within this executor's live stack.
-        let cr3 = unsafe { core::ptr::read_volatile(sp as *const u64) };
-        if cr3 == 0 {
-            error!(
+            ),
+            FrameVerdict::DeadPageTable => error!(
                 "[stale-resume] executor id={} saved frame at {:#x} has cr3=0 — \
                  dead/overwritten frame; refusing to resume",
                 ex.id(),
                 sp
-            );
-            note_heap_smash_suspected();
-            return false;
-        }
-        let rip = unsafe { core::ptr::read_volatile((sp + 0x38) as *const u64) };
-        let text = 0xffff_ff00_0000_0000u64..0xffff_ff00_0100_0000u64;
-        if !text.contains(&rip) {
-            error!(
-                "[stale-resume] executor id={} saved frame at {:#x} has non-text \
-                 resume rip {:#x} — dead/overwritten frame (double resume or \
-                 stack smash); refusing to resume. frame:",
-                ex.id(),
-                sp,
-                rip
-            );
-            for k in 0..9usize {
-                let a = sp + k * 8;
-                let v = unsafe { core::ptr::read_volatile(a as *const u64) };
-                error!("[stale-resume]   @{:#x} = {:#018x}", a, v);
+            ),
+            FrameVerdict::RipNotInText { rip } => {
+                error!(
+                    "[stale-resume] executor id={} saved frame at {:#x} has non-text \
+                     resume rip {:#x} — dead/overwritten frame (double resume or \
+                     stack smash); refusing to resume. frame:",
+                    ex.id(),
+                    sp,
+                    rip
+                );
+                for k in 0..frame_dump_words(sp, top) {
+                    let a = sp + k * 8;
+                    // SAFETY: inside `[sp, top)`, which `frame_dump_words`
+                    // bounds and the geometry check put on this stack.
+                    let v = unsafe { core::ptr::read_volatile(a as *const u64) };
+                    error!("[stale-resume]   @{:#x} = {:#018x}", a, v);
+                }
             }
-            note_heap_smash_suspected();
-            return false;
         }
-        true
+        if verdict.looks_like_a_smash() {
+            note_heap_smash_suspected();
+        }
+        false
     }
     #[cfg(not(target_arch = "x86_64"))]
     {
@@ -2683,5 +2781,248 @@ mod stack_danger_tests {
         let sp = BASE + 64 * 1024;
         assert!(stack_in_danger(sp, BASE, 128 * 1024));
         assert!(!stack_in_danger(sp, BASE, 32 * 1024));
+    }
+}
+
+/// The parked-frame gate, which had no tests.
+///
+/// It is the last thing that runs before a CPU switches onto a coroutine
+/// stack, and the only thing between the scheduler and a `ret` into a frame
+/// that was overwritten, already consumed, or never a frame at all — the
+/// `[null-exec]` crash the whole of `docs/README-crash-repro.md` is about. It
+/// had no tests because the decision was inside a function taking an
+/// `&Executor`, and an `Executor` allocates a 2.6 MiB stack with guard pages.
+///
+/// Every frame here is real memory this test owns, because the gate reads two
+/// words out of it. That is also why two of the mutations these tests kill
+/// **abort the process** instead of printing a FAILED line: dropping the
+/// alignment check, or reading the frame before deciding the geometry, makes
+/// the gate perform the misaligned or wild read it exists to prevent, which is
+/// a non-unwinding panic. The thread name and the backtrace still say which
+/// test was in flight, and it is the test whose point is that nothing is read.
+#[cfg(all(test, target_arch = "x86_64"))]
+mod parked_frame_tests {
+    use super::*;
+
+    /// A resume address inside the kernel image: what `switch.S` pops into
+    /// `rip` when the frame is sound.
+    const A_TEXT_ADDRESS: u64 = 0xffff_ff00_0004_2000;
+    /// A page-table root that is not zero, which is all the gate asks of it.
+    const A_LIVE_CR3: u64 = 0x0000_0001_2345_6000;
+    /// Nothing the gate accepts, in either slot it reads.
+    const GARBAGE: u64 = 0xdead_beef_dead_beef;
+
+    /// A stand-in for an executor stack big enough to park frames in.
+    struct Stack {
+        mem: alloc::vec::Vec<u64>,
+    }
+
+    impl Stack {
+        fn new(words: usize) -> Self {
+            let mut mem = alloc::vec::Vec::with_capacity(words);
+            mem.resize(words, GARBAGE);
+            Self { mem }
+        }
+
+        fn base(&self) -> usize {
+            self.mem.as_ptr() as usize
+        }
+
+        fn top(&self) -> usize {
+            self.base() + self.mem.len() * 8
+        }
+
+        /// Park a sound frame at `sp` and hand it back.
+        fn park(&mut self, sp: usize) -> usize {
+            self.write(sp, A_LIVE_CR3);
+            self.write(sp + 0x38, A_TEXT_ADDRESS);
+            sp
+        }
+
+        fn write(&mut self, addr: usize, val: u64) {
+            let i = (addr - self.base()) / 8;
+            self.mem[i] = val;
+        }
+
+        fn verdict(&self, sp: usize) -> FrameVerdict {
+            // SAFETY: `[base, top)` is this vector's own memory.
+            unsafe { classify_parked_frame(sp, self.base(), self.top()) }
+        }
+    }
+
+    #[test]
+    fn a_frame_with_a_live_page_table_and_a_text_return_is_resumable() {
+        let mut stack = Stack::new(64);
+        let sp = stack.park(stack.base() + 16 * 8);
+        assert_eq!(stack.verdict(sp), FrameVerdict::Resumable);
+    }
+
+    #[test]
+    fn the_two_words_the_gate_reads_are_the_ones_the_switch_pushes() {
+        // `switch.S` builds the frame by hand and `switch_contract.rs` pins the
+        // offsets: `[rsp]` is cr3 and `[rsp + 0x38]` is rip. Reading either
+        // from the wrong place reads a saved register, which is a number with
+        // no rules at all -- so the gate would pass a dead frame or refuse a
+        // live one depending on what was in r12.
+        let mut stack = Stack::new(64);
+        let sp = stack.base() + 16 * 8;
+        // Every word of the frame is garbage except those two.
+        let frame = stack.park(sp);
+        assert_eq!(stack.verdict(frame), FrameVerdict::Resumable);
+    }
+
+    #[test]
+    fn a_saved_stack_pointer_below_the_stack_is_not_a_frame() {
+        let mut stack = Stack::new(64);
+        stack.park(stack.base() + 16 * 8);
+        let below = stack.base() - 8;
+        assert_eq!(stack.verdict(below), FrameVerdict::SpNotOnStack);
+    }
+
+    #[test]
+    fn a_frame_that_ends_exactly_at_the_top_is_still_on_the_stack() {
+        // The init frame is pushed against the stack top, so the boundary is
+        // the common case, not the corner case.
+        let mut stack = Stack::new(64);
+        let sp = stack.park(stack.top() - 0x40);
+        assert_eq!(stack.verdict(sp), FrameVerdict::Resumable);
+    }
+
+    #[test]
+    fn a_frame_whose_tail_would_run_past_the_top_is_refused() {
+        // Above the top is the top guard page, unmapped on purpose: reading a
+        // frame that reaches into it faults on the CPU that was about to
+        // resume, which is the fault this gate exists to prevent.
+        let mut stack = Stack::new(64);
+        stack.park(stack.top() - 0x40);
+        assert_eq!(
+            stack.verdict(stack.top() - 0x38),
+            FrameVerdict::SpNotOnStack
+        );
+    }
+
+    #[test]
+    fn an_unaligned_saved_stack_pointer_is_refused_before_anything_is_read() {
+        // A frame of `u64`s at an odd address is not a frame, and reading one
+        // as `*const u64` is undefined behaviour rather than a wrong answer.
+        let mut stack = Stack::new(64);
+        let sp = stack.park(stack.base() + 16 * 8);
+        assert_eq!(stack.verdict(sp + 1), FrameVerdict::SpNotOnStack);
+    }
+
+    #[test]
+    fn a_saved_stack_pointer_that_overflows_the_address_space_is_refused() {
+        // `sp` is the number this gate is here not to trust. This value is
+        // 8-aligned and above any base, and adding the frame size to it wraps
+        // to a small number -- so the upper bound passed and the gate read
+        // whatever the garbage pointed at, handing the resume path the fault it
+        // was written to catch.
+        let stack = Stack::new(64);
+        let wrapping = usize::MAX - 0x3f;
+        assert_eq!(
+            wrapping & 7,
+            0,
+            "the value has to get past the alignment check"
+        );
+        assert_eq!(stack.verdict(wrapping), FrameVerdict::SpNotOnStack);
+    }
+
+    #[test]
+    fn the_geometry_is_decided_before_the_frame_is_read() {
+        // An sp off the stack pointing at a word that reads as a dead frame
+        // must come back as bad geometry: the verdict that reads nothing. The
+        // other order returns an answer it had to fault or read out of bounds
+        // to get.
+        let mut stack = Stack::new(64);
+        let off = stack.base() + 16 * 8;
+        stack.write(off, 0);
+        let sp_out_of_range = off;
+        // Same memory, but a stack that does not contain it.
+        // SAFETY: nothing is read, which is what the test is about.
+        let verdict = unsafe { classify_parked_frame(sp_out_of_range, off + 8, stack.top()) };
+        assert_eq!(verdict, FrameVerdict::SpNotOnStack);
+    }
+
+    #[test]
+    fn a_frame_whose_page_table_word_is_zero_is_a_dead_frame() {
+        // `cr3 = 0` is a frame already consumed or overwritten; resuming it
+        // loads a null page-table root, which is the end of the machine.
+        let mut stack = Stack::new(64);
+        let sp = stack.park(stack.base() + 16 * 8);
+        stack.write(sp, 0);
+        assert_eq!(stack.verdict(sp), FrameVerdict::DeadPageTable);
+    }
+
+    #[test]
+    fn a_resume_address_outside_the_kernel_image_is_a_dead_frame() {
+        let mut stack = Stack::new(64);
+        let sp = stack.park(stack.base() + 16 * 8);
+        // The captured case: the slot reads zero.
+        stack.write(sp + 0x38, 0);
+        assert_eq!(stack.verdict(sp), FrameVerdict::RipNotInText { rip: 0 });
+        // And a plausible-looking pointer that is simply not code.
+        stack.write(sp + 0x38, 0x0000_7fff_dead_0000);
+        assert_eq!(
+            stack.verdict(sp),
+            FrameVerdict::RipNotInText {
+                rip: 0x0000_7fff_dead_0000
+            }
+        );
+    }
+
+    #[test]
+    fn the_accepted_range_is_the_kernel_image_and_not_a_byte_more() {
+        // The bound is what tells a resume address from a stack address or a
+        // heap pointer, and both live just outside it.
+        let mut stack = Stack::new(64);
+        let sp = stack.park(stack.base() + 16 * 8);
+        for (rip, resumable) in [
+            (0xffff_ff00_0000_0000u64, true),
+            (0xffff_ff00_00ff_fff8, true),
+            (0xffff_ff00_0100_0000, false),
+            (0xffff_feff_ffff_fff8, false),
+        ] {
+            stack.write(sp + 0x38, rip);
+            assert_eq!(
+                stack.verdict(sp) == FrameVerdict::Resumable,
+                resumable,
+                "rip {:#x}",
+                rip
+            );
+        }
+    }
+
+    #[test]
+    fn only_the_words_read_out_of_the_frame_are_evidence_of_a_smash() {
+        // The two read out of the frame say the frame was rewritten where it
+        // sat, which is the write the hunt is after. A saved sp that is not on
+        // the stack is a bogus pointer and says nothing about anyone else's
+        // memory -- calling it a heap smash puts the whole kernel into its
+        // degraded mode over a stale number.
+        assert!(!FrameVerdict::Resumable.looks_like_a_smash());
+        assert!(!FrameVerdict::SpNotOnStack.looks_like_a_smash());
+        assert!(FrameVerdict::DeadPageTable.looks_like_a_smash());
+        assert!(FrameVerdict::RipNotInText { rip: 0 }.looks_like_a_smash());
+    }
+
+    #[test]
+    fn the_refusal_report_reads_the_frame_and_the_word_that_parked_it() {
+        // Nine words: the frame's eight plus the one above it, which for the
+        // init frame is the executor address `push_stack` left there.
+        let stack = Stack::new(64);
+        assert_eq!(frame_dump_words(stack.top() - 0x48, stack.top()), 9);
+        // And never more than nine, however much stack there is above it.
+        assert_eq!(frame_dump_words(stack.base(), stack.top()), 9);
+    }
+
+    #[test]
+    fn the_refusal_report_stops_at_the_top_guard() {
+        // A frame flush against the top has no word above it, and the page
+        // there is unmapped: a report that reads it faults while explaining a
+        // fault, and the machine dies without saying why.
+        let stack = Stack::new(64);
+        assert_eq!(frame_dump_words(stack.top() - 0x40, stack.top()), 8);
+        assert_eq!(frame_dump_words(stack.top() - 8, stack.top()), 1);
+        assert_eq!(frame_dump_words(stack.top(), stack.top()), 0);
     }
 }
