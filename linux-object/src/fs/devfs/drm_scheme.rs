@@ -6358,6 +6358,418 @@ mod kms_scanout_tests {
         c.rmfb(fb).expect("RMFB");
         c.destroy_dumb(buf.handle).expect("DESTROY_DUMB");
     }
+
+    /// Drain whatever flip completions are outstanding, so a later read only
+    /// sees the ones the test is about.
+    ///
+    /// One read is not a drain: the queue hands out as much as fits and keeps the
+    /// rest, and an empty queue answers EAGAIN rather than zero. A test that
+    /// queued more than this buffer holds would leave completions behind for a
+    /// later assertion to trip over -- a suite that fails somewhere else, which
+    /// is the worst kind of noise to build in. Read until the queue says it has
+    /// nothing, with a bound so a queue that always answers cannot hang the
+    /// suite instead of failing it.
+    fn drain_completions(c: &Client) {
+        drm::flush_pending_flip_completions();
+        let mut sink = [0u8; 256];
+        for _ in 0..1024 {
+            match c.read_events(&mut sink) {
+                Ok(n) if n > 0 => continue,
+                _ => return,
+            }
+        }
+        panic!("the event queue never drained");
+    }
+
+    /// The bug the pause machinery had, from the compositor's side. During the
+    /// deferred console-GPU bring-up scanout is parked: every flip is reported
+    /// complete and no pixel is written, which is deliberate -- labwc's BAR1
+    /// traffic must stay out of the SEC2 window. What was missing is the other
+    /// half. The compositor was TOLD those frames landed, so it will not draw
+    /// them again, and nothing put the last one up when the window closed: an
+    /// idle desktop sat on a pre-pause frame with scanout fully alive.
+    #[test]
+    fn the_frame_dropped_while_scanout_was_paused_reaches_the_panel_on_resume() {
+        let screen = kms_emu::attach(64, 16);
+        let c = Client::open(0);
+
+        let before = c.create_dumb(64, 16);
+        paint(&before, |x, y| tag(0x0011_0000, x, y));
+        let fb_before = c.addfb2(&before);
+        c.page_flip(drm::SYNTH_CRTC_ID, fb_before, 1)
+            .expect("the frame before the pause");
+        assert_eq!(
+            screen.pixel(7, 3),
+            tag(0x0011_0000, 7, 3),
+            "frame one is up"
+        );
+        drain_completions(&c);
+
+        // The bring-up parks scanout. labwc knows nothing about it and renders.
+        drm::set_scanout_paused_for(drm::SCANOUT_PAUSE_MAX);
+        let during = c.create_dumb(64, 16);
+        paint(&during, |x, y| tag(0x0022_0000, x, y));
+        let fb_during = c.addfb2(&during);
+        c.page_flip(drm::SYNTH_CRTC_ID, fb_during, 2)
+            .expect("a flip during the pause is still accepted");
+
+        // Nothing reached the panel: that is what the pause is for.
+        assert_eq!(
+            screen.pixel(7, 3),
+            tag(0x0011_0000, 7, 3),
+            "the pause let a frame through to the framebuffer"
+        );
+        // And the client was told it completed, which is why it will never
+        // draw that frame again and why the kernel owes it a repaint.
+        drm::flush_pending_flip_completions();
+        let mut b = [0u8; 32];
+        assert_eq!(c.read_events(&mut b).expect("completion"), 32);
+        assert_eq!(parse_events(&b)[0].user_data, 2);
+
+        drm::set_scanout_paused(false);
+
+        for y in 0..16 {
+            for x in 0..64 {
+                assert_eq!(
+                    screen.pixel(x, y),
+                    tag(0x0022_0000, x, y),
+                    "pixel ({}, {}) is still the pre-pause frame: the resume \
+                     left the desktop frozen with scanout running",
+                    x,
+                    y
+                );
+            }
+        }
+
+        c.rmfb(fb_before).expect("RMFB");
+        c.rmfb(fb_during).expect("RMFB");
+        c.destroy_dumb(before.handle).expect("DESTROY_DUMB");
+        c.destroy_dumb(during.handle).expect("DESTROY_DUMB");
+    }
+
+    /// And the visible half of the same disagreement. A pointer move does not
+    /// re-blit the frame; it restores the two ~64x64 windows it touches FROM
+    /// `crtc_fb`. With the panel a frame behind that buffer -- which is exactly
+    /// what a dropped present leaves -- those windows paste pieces of a frame
+    /// nobody has seen into the one still on screen: a ring of garbage that
+    /// follows the cursor, invisible on a flat wallpaper and obvious over a
+    /// window shadow.
+    ///
+    /// The watchdog is what gets there: it lifts the pause on a clock read
+    /// without anyone presenting, so the first thing to run afterwards can well
+    /// be a mouse move. A zero-length window is that same code path without a
+    /// test that sleeps.
+    #[test]
+    fn a_pointer_move_after_the_watchdog_does_not_paste_pieces_of_the_unseen_frame() {
+        let screen = kms_emu::attach(64, 16);
+        let c = Client::open(0);
+
+        let before = c.create_dumb(64, 16);
+        paint(&before, |x, y| tag(0x0011_0000, x, y));
+        let fb_before = c.addfb2(&before);
+        set_crtc(&c, drm::SYNTH_CRTC_ID, fb_before, 64, 16);
+        drain_completions(&c);
+
+        // A pointer the kernel composites itself, placed off to one side.
+        let ptr = c.create_dumb(8, 8);
+        paint(&ptr, |_, _| 0xFFFF_FFFF);
+        set_cursor(&c, drm::SYNTH_CRTC_ID, ptr.handle, 8, 8, 4, 4);
+        drain_completions(&c);
+
+        drm::set_scanout_paused_for(drm::SCANOUT_PAUSE_MAX);
+        let during = c.create_dumb(64, 16);
+        paint(&during, |x, y| tag(0x0022_0000, x, y));
+        let fb_during = c.addfb2(&during);
+        c.page_flip(drm::SYNTH_CRTC_ID, fb_during, 3)
+            .expect("a flip during the pause is still accepted");
+        drain_completions(&c);
+
+        // The bring-up never came back, so the watchdog is what resumes -- with
+        // no present of its own. `Duration::ZERO` is a window already closed.
+        drm::set_scanout_paused_for(core::time::Duration::ZERO);
+        assert!(
+            !drm::scanout_paused(),
+            "the watchdog did not lift the pause"
+        );
+
+        move_cursor(&c, drm::SYNTH_CRTC_ID, 40, 8);
+
+        // Every pixel the pointer does not cover belongs to ONE frame. Before
+        // the fix the answer was "frame one, except two windows of frame two".
+        let mut saw_second = false;
+        for y in 0..16 {
+            for x in 0..64 {
+                let px = screen.pixel(x, y);
+                if px == tag(0x0022_0000, x, y) {
+                    saw_second = true;
+                    continue;
+                }
+                assert_ne!(
+                    px,
+                    tag(0x0011_0000, x, y),
+                    "pixel ({}, {}) is still the frame the panel was showing \
+                     while the rest came from the one it never saw -- that is \
+                     the garbage around the cursor",
+                    x,
+                    y
+                );
+            }
+        }
+        assert!(saw_second, "the pointer move put nothing on the screen");
+
+        c.rmfb(fb_before).expect("RMFB");
+        c.rmfb(fb_during).expect("RMFB");
+        c.destroy_dumb(before.handle).expect("DESTROY_DUMB");
+        c.destroy_dumb(during.handle).expect("DESTROY_DUMB");
+        c.destroy_dumb(ptr.handle).expect("DESTROY_DUMB");
+    }
+
+    /// The other side of the damage rule: a `DIRTYFB` clip that covers the whole
+    /// framebuffer IS a catch-up, so it clears the mark. Leaving it set would
+    /// cost a redundant full repaint on the next pointer move.
+    #[test]
+    fn a_damage_rect_over_the_whole_screen_does_catch_the_panel_up() {
+        let _screen = kms_emu::attach(64, 16);
+        let c = Client::open(0);
+
+        let before = c.create_dumb(64, 16);
+        paint(&before, |x, y| tag(0x0011_0000, x, y));
+        let fb_before = c.addfb2(&before);
+        set_crtc(&c, drm::SYNTH_CRTC_ID, fb_before, 64, 16);
+        drain_completions(&c);
+
+        drm::set_scanout_paused_for(drm::SCANOUT_PAUSE_MAX);
+        let during = c.create_dumb(64, 16);
+        paint(&during, |x, y| tag(0x0022_0000, x, y));
+        let fb_during = c.addfb2(&during);
+        c.page_flip(drm::SYNTH_CRTC_ID, fb_during, 5)
+            .expect("a flip during the pause is still accepted");
+        drain_completions(&c);
+        drm::set_scanout_paused_for(core::time::Duration::ZERO);
+        assert!(!drm::scanout_paused());
+        assert!(drm::scanout_is_stale_for_test());
+
+        dirtyfb(&c, fb_during, &[clip(0, 0, 64, 16)]);
+
+        assert!(
+            !drm::scanout_is_stale_for_test(),
+            "a clip over the whole framebuffer put every row up, so the mark \
+             must go -- keeping it costs a full repaint on the next mouse move"
+        );
+
+        c.rmfb(fb_before).expect("RMFB");
+        c.rmfb(fb_during).expect("RMFB");
+        c.destroy_dumb(before.handle).expect("DESTROY_DUMB");
+        c.destroy_dumb(during.handle).expect("DESTROY_DUMB");
+    }
+
+    /// The popup's geometry, swept. Moebius's power menu comes up with whole
+    /// runs of it missing -- the desktop showing through where the panel should
+    /// be -- and the runs are in the same place on every frame, so whatever
+    /// drops them is arithmetic tied to the box, not a race or a stale cache.
+    ///
+    /// This asks the narrowest version of that question the kernel can answer on
+    /// its own: for a damage box, does the present write EVERY pixel inside it?
+    /// A box is not a set of independent rows here -- the blit widens columns to
+    /// write-combining lines and walks bands -- so an off-by-one in any of that
+    /// arithmetic shows up as pixels inside the box still carrying the previous
+    /// frame, which is exactly the symptom. Geometries chosen to be hostile:
+    /// the real panel (152x135) at several offsets, odd sizes, the single pixel,
+    /// a box on each edge, and the whole frame.
+    #[test]
+    fn every_pixel_inside_a_damage_box_is_written_whatever_its_geometry() {
+        const W: u32 = 200;
+        const H: u32 = 160;
+        let screen = kms_emu::attach(W, H);
+        let c = Client::open(0);
+        let buf = c.create_dumb(W, H);
+        let fb = c.addfb2(&buf);
+
+        let boxes: [(u32, u32, u32, u32); 10] = [
+            (0, 0, 152, 135),   // the panel, flush at the origin
+            (7, 3, 152, 135),   // and at an odd offset, both axes
+            (48, 25, 152, 135), // and where it does not fit: clipped right
+            (1, 1, 7, 2),       // narrower than one WC line
+            (13, 11, 31, 17),   // odd on every number
+            (W - 1, H - 1, 1, 1),
+            (0, H - 1, W, 1), // the last row, whole
+            (W - 3, 0, 3, H), // the last columns, whole
+            (0, 0, W, H),     // the whole frame through the damage path
+            (9, 9, 16, 16),   // exactly one WC line wide, aligned to none
+        ];
+
+        for (i, &(bx, by, bw, bh)) in boxes.iter().enumerate() {
+            let old = 0x0100_0000 * (2 * i as u32 + 1);
+            let new = 0x0100_0000 * (2 * i as u32 + 2);
+
+            // The frame that is already on the panel.
+            paint(&buf, |x, y| tag(old, x, y));
+            c.page_flip(drm::SYNTH_CRTC_ID, fb, 200 + i as u64)
+                .expect("the frame before the damage");
+            drain_completions(&c);
+            assert_eq!(
+                screen.pixel(0, 0),
+                tag(old, 0, 0),
+                "box {:?}: the first frame never got up",
+                (bx, by, bw, bh)
+            );
+
+            // The client repaints the same buffer and names only its box.
+            paint(&buf, |x, y| tag(new, x, y));
+            dirtyfb(
+                &c,
+                fb,
+                &[clip(
+                    bx as u16,
+                    by as u16,
+                    (bx + bw) as u16,
+                    (by + bh) as u16,
+                )],
+            );
+
+            let (cw, ch) = (bw.min(W - bx), bh.min(H - by));
+            for y in by..by + ch {
+                for x in bx..bx + cw {
+                    assert_eq!(
+                        screen.pixel(x, y),
+                        tag(new, x, y),
+                        "box {:?}: pixel ({}, {}) inside it still carries the \
+                         previous frame",
+                        (bx, by, bw, bh),
+                        x,
+                        y
+                    );
+                }
+            }
+            // Columns are widened to write-combining lines on purpose, so only
+            // the ROWS outside the box are guaranteed untouched.
+            for y in (0..by).chain(by + ch..H) {
+                for x in 0..W {
+                    assert_eq!(
+                        screen.pixel(x, y),
+                        tag(old, x, y),
+                        "box {:?}: row {} is outside it and was repainted",
+                        (bx, by, bw, bh),
+                        y
+                    );
+                }
+            }
+        }
+
+        c.rmfb(fb).expect("RMFB");
+        c.destroy_dumb(buf.handle).expect("DESTROY_DUMB");
+    }
+
+    /// The same sweep on a WRITE-COMBINING output with a padded scanline, which
+    /// is what real hardware is: UEFI reports a `PixelsPerScanLine` wider than
+    /// the mode, the framebuffer is mapped WC, and on x86_64 `blit_from` then
+    /// takes the non-temporal store loop instead of the ordinary copy. That loop
+    /// is a different implementation of the same promise, so the promise has to
+    /// be checked against it too -- and it is the one that runs on the machine
+    /// where Moebius sees the popup come up with pieces missing.
+    #[test]
+    fn every_pixel_inside_a_damage_box_is_written_on_a_write_combining_output() {
+        const W: u32 = 204;
+        const H: u32 = 184;
+        // 204 -> the pitch UEFI would report, wider than the mode.
+        let screen = kms_emu::attach_with(W, H, 256, true);
+        let c = Client::open(0);
+        let buf = c.create_dumb(W, H);
+        let fb = c.addfb2(&buf);
+
+        // The popup's own surface, and the offsets the report names: pieces
+        // missing every 64 px, i.e. every 256 bytes of a row.
+        let boxes: [(u32, u32, u32, u32); 6] = [
+            (0, 0, 204, 184),
+            (0, 0, 180, 160),
+            (12, 12, 180, 160),
+            (13, 11, 63, 65),
+            (64, 0, 8, H),
+            (W - 1, H - 1, 1, 1),
+        ];
+
+        for (i, &(bx, by, bw, bh)) in boxes.iter().enumerate() {
+            let old = 0x0100_0000 * (2 * i as u32 + 1);
+            let new = 0x0100_0000 * (2 * i as u32 + 2);
+
+            paint(&buf, |x, y| tag(old, x, y));
+            c.page_flip(drm::SYNTH_CRTC_ID, fb, 300 + i as u64)
+                .expect("the frame before the damage");
+            drain_completions(&c);
+
+            paint(&buf, |x, y| tag(new, x, y));
+            dirtyfb(
+                &c,
+                fb,
+                &[clip(
+                    bx as u16,
+                    by as u16,
+                    (bx + bw) as u16,
+                    (by + bh) as u16,
+                )],
+            );
+
+            let (cw, ch) = (bw.min(W - bx), bh.min(H - by));
+            for y in by..by + ch {
+                for x in bx..bx + cw {
+                    assert_eq!(
+                        screen.pixel(x, y),
+                        tag(new, x, y),
+                        "box {:?}: pixel ({}, {}) inside it still carries the \
+                         previous frame -- byte {} of its row",
+                        (bx, by, bw, bh),
+                        x,
+                        y,
+                        x * 4
+                    );
+                }
+            }
+        }
+
+        c.rmfb(fb).expect("RMFB");
+        c.destroy_dumb(buf.handle).expect("DESTROY_DUMB");
+    }
+
+    /// A damage rect is not a catch-up. `DRM_IOCTL_MODE_DIRTYFB` copies the
+    /// boxes the client names and nothing else, so after a dropped present the
+    /// panel is still a frame behind everywhere outside them -- and the cursor
+    /// repaint would go back to restoring rects from a buffer the panel does not
+    /// show. Only a whole frame may clear the mark.
+    #[test]
+    fn a_damage_rect_does_not_catch_a_panel_up_from_a_dropped_frame() {
+        let _screen = kms_emu::attach(64, 16);
+        let c = Client::open(0);
+
+        let before = c.create_dumb(64, 16);
+        paint(&before, |x, y| tag(0x0011_0000, x, y));
+        let fb_before = c.addfb2(&before);
+        set_crtc(&c, drm::SYNTH_CRTC_ID, fb_before, 64, 16);
+        drain_completions(&c);
+
+        drm::set_scanout_paused_for(drm::SCANOUT_PAUSE_MAX);
+        let during = c.create_dumb(64, 16);
+        paint(&during, |x, y| tag(0x0022_0000, x, y));
+        let fb_during = c.addfb2(&during);
+        c.page_flip(drm::SYNTH_CRTC_ID, fb_during, 4)
+            .expect("a flip during the pause is still accepted");
+        drain_completions(&c);
+        drm::set_scanout_paused_for(core::time::Duration::ZERO);
+        assert!(!drm::scanout_paused());
+
+        // A four-pixel box, the way a blinking cursor in a terminal damages.
+        dirtyfb(&c, fb_during, &[clip(0, 0, 4, 4)]);
+
+        assert!(
+            drm::scanout_is_stale_for_test(),
+            "a damage rect cleared the mark, so the next pointer move will \
+             restore its windows from a frame the panel is not showing"
+        );
+
+        c.rmfb(fb_before).expect("RMFB");
+        c.rmfb(fb_during).expect("RMFB");
+        c.destroy_dumb(before.handle).expect("DESTROY_DUMB");
+        c.destroy_dumb(during.handle).expect("DESTROY_DUMB");
+    }
 }
 
 /// The hardware-KMS path: what changes when a driver owns scanout.
