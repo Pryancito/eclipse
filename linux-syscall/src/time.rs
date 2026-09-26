@@ -13,7 +13,7 @@ use lazy_static::lazy_static;
 use linux_object::error::{LxError, SysResult};
 use linux_object::process::ProcessExt;
 use linux_object::process::CAP_SYS_TIME;
-use linux_object::signal::Signal;
+use linux_object::signal::{SigInfo, Signal};
 use linux_object::thread::ThreadExt;
 use linux_object::time::*;
 use lock::Mutex;
@@ -728,27 +728,31 @@ impl Syscall<'_> {
     /// `timerid` (an `int`, the kernel's `timer_t`).
     pub fn sys_timer_create(&self, clockid: usize, sevp: usize, timerid: usize) -> SysResult {
         let clock = posix_timer_clock_base(clockid)?;
-        let signo = if sevp == 0 {
-            Signal::SIGALRM as usize
+        let notify = if sevp == 0 {
+            TimerNotify::SIGALRM_TO_PROCESS
         } else {
-            // struct sigevent: sigev_value (8B), sigev_signo @ +8, sigev_notify @ +12.
+            // struct sigevent: sigev_value (8 bytes) @ 0, sigev_signo @ 8,
+            // sigev_notify @ 12, and sigev_notify_thread_id @ 16 (64 bytes in
+            // all, so the four reads are inside it whatever the notify).
+            let value_p: UserInPtr<usize> = sevp.into();
             let signo_p: UserInPtr<i32> = (sevp + 8).into();
             let notify_p: UserInPtr<i32> = (sevp + 12).into();
-            let signo = signo_p.read()?;
-            let notify = notify_p.read()?;
-            const SIGEV_NONE: i32 = 1;
-            if notify == SIGEV_NONE {
-                0
-            } else {
-                signo as usize
-            }
+            let tid_p: UserInPtr<i32> = (sevp + 16).into();
+            let event = SigEvent {
+                value: value_p.read()?,
+                signo: signo_p.read()?,
+                notify: notify_p.read()?,
+                thread_id: tid_p.read()?,
+            };
+            let proc = self.zircon_process();
+            timer_notify_from_sigevent(&event, |tid| proc.get_child(tid).is_ok())?
         };
         let id = NEXT_TIMER_ID.fetch_add(1, Ordering::Relaxed);
         POSIX_TIMERS.lock().insert(
             id,
             PosixTimer {
                 owner: self.zircon_process().id(),
-                signo,
+                notify,
                 clock,
                 interval: Duration::ZERO,
                 next: Duration::ZERO,
@@ -871,12 +875,92 @@ impl Syscall<'_> {
     }
 }
 
+/// What `timer_create(2)` was told to do on expiry: its `struct sigevent`,
+/// decoded once by `good_sigevent`'s rules.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TimerNotify {
+    /// Signal to deliver; 0 for `SIGEV_NONE`.
+    signo: usize,
+    /// `sigev_value`, handed back to the handler as `si_value`. glibc's
+    /// `SIGEV_THREAD` helper thread keeps the timer it must run the
+    /// callback for in here, so with it dropped no `SIGEV_THREAD` timer
+    /// ever ran its function.
+    value: usize,
+    /// `SIGEV_THREAD_ID`: the one thread the signal goes to. `None` is a
+    /// process-directed signal, like `kill(2)`.
+    thread: Option<KoID>,
+}
+
+impl TimerNotify {
+    /// A null `sevp`: `SIGALRM` to the process, `si_value` = the timer id
+    /// (the kernel fills `sigev_value.sival_int` with it, timer_create(2)).
+    const SIGALRM_TO_PROCESS: Self = TimerNotify {
+        signo: Signal::SIGALRM as usize,
+        value: 0,
+        thread: None,
+    };
+}
+
+/// The fields of `struct sigevent` a timer reads.
+#[derive(Debug, Clone, Copy)]
+struct SigEvent {
+    value: usize,
+    signo: i32,
+    notify: i32,
+    thread_id: i32,
+}
+
+const SIGEV_SIGNAL: i32 = 0;
+const SIGEV_NONE: i32 = 1;
+const SIGEV_THREAD: i32 = 2;
+const SIGEV_THREAD_ID: i32 = 4;
+const SIGRTMAX: i32 = 64;
+
+/// `good_sigevent()`: which notifications a timer may be created with.
+/// `SIGEV_THREAD_ID` names a thread of the caller's own process, or it is
+/// `EINVAL`; the signal has to be a real one; `SIGEV_THREAD` reaches the
+/// kernel only from a program bypassing libc, and is a plain signal there.
+///
+/// This used to take `sigev_signo` as it came (0 and 200 both "worked":
+/// nothing was ever delivered), accept any `sigev_notify`, and read neither
+/// `sigev_value` nor the thread id, so every timer fired at the process.
+fn timer_notify_from_sigevent(
+    event: &SigEvent,
+    is_my_thread: impl Fn(KoID) -> bool,
+) -> Result<TimerNotify, LxError> {
+    let thread = match event.notify {
+        SIGEV_NONE => {
+            return Ok(TimerNotify {
+                signo: 0,
+                value: event.value,
+                thread: None,
+            })
+        }
+        SIGEV_SIGNAL | SIGEV_THREAD => None,
+        SIGEV_THREAD_ID => {
+            if event.thread_id <= 0 || !is_my_thread(event.thread_id as KoID) {
+                return Err(LxError::EINVAL);
+            }
+            Some(event.thread_id as KoID)
+        }
+        _ => return Err(LxError::EINVAL),
+    };
+    if event.signo <= 0 || event.signo > SIGRTMAX {
+        return Err(LxError::EINVAL);
+    }
+    Ok(TimerNotify {
+        signo: event.signo as usize,
+        value: event.value,
+        thread,
+    })
+}
+
 /// A per-process POSIX interval timer (`timer_create`).
 struct PosixTimer {
     /// Owning process KoID; a process may only operate on its own timers.
     owner: KoID,
-    /// Signal to deliver on expiry (0 = none, e.g. SIGEV_NONE).
-    signo: usize,
+    /// Where the expiry goes: signal, `si_value`, and which thread.
+    notify: TimerNotify,
     /// The timeline `timer_create`'s `clockid` names, which is what an
     /// absolute `timer_settime` counts against. The id used to be dropped
     /// on the floor (`_clockid`), so a `CLOCK_REALTIME` timer armed with
@@ -978,7 +1062,9 @@ fn arm_itimer(owner: KoID, which: usize, deadline: Duration, gen: u64) {
                 }
             }
             if fire {
-                deliver_timer_signal(owner, itimer_signo(which));
+                if let Some((signal, info)) = itimer_expiry_signal(which) {
+                    deliver_timer_signal(owner, None, signal, info);
+                }
             }
             if let Some(next) = rearm {
                 arm_itimer(owner, which, next, gen);
@@ -987,7 +1073,6 @@ fn arm_itimer(owner: KoID, which: usize, deadline: Duration, gen: u64) {
     );
 }
 
-/// Deliver `signo` to every thread of process `owner` (mirrors setitimer/alarm).
 /// Disarm and delete every POSIX timer owned by `owner`, returning how many
 /// there were.
 ///
@@ -1012,20 +1097,52 @@ pub fn drop_posix_timers_of(owner: KoID) -> usize {
     before - timers.len()
 }
 
-fn deliver_timer_signal(owner: KoID, signo: usize) {
-    if signo == 0 {
-        return;
+/// What an expiring `setitimer(2)` slot delivers: its signal, sent by the
+/// kernel with nobody behind it (`it_real_fn` -> `SEND_SIG_PRIV`: `SI_KERNEL`,
+/// pid and uid 0).
+fn itimer_expiry_signal(which: usize) -> Option<(Signal, SigInfo)> {
+    let signal = Signal::try_from(itimer_signo(which) as u8).ok()?;
+    Some((signal, SigInfo::from_kernel(signal)))
+}
+
+/// What an expiring POSIX timer delivers: `SI_TIMER` with the timer's id
+/// and the `sigev_value` it was created with (`posix_timer_event` ->
+/// `send_sigqueue`), or nothing for `SIGEV_NONE`.
+fn posix_timer_expiry_signal(id: usize, notify: TimerNotify) -> Option<(Signal, SigInfo)> {
+    if notify.signo == 0 {
+        return None;
     }
-    let signal = match Signal::try_from(signo as u8) {
-        Ok(s) => s,
-        Err(_) => return,
-    };
-    if let Some(proc) = ROOT_JOB.find_process(owner) {
-        for tid in proc.thread_ids() {
-            if let Ok(obj) = proc.get_child(tid) {
-                if let Ok(thread) = obj.downcast_arc::<Thread>() {
-                    thread.lock_linux().signals.insert(signal);
-                    thread.signal_set(zircon_object::object::Signal::USER_SIGNAL_0);
+    let signal = Signal::try_from(notify.signo as u8).ok()?;
+    Some((signal, SigInfo::timer(signal, id as i32, 0, notify.value)))
+}
+
+/// Deliver an expired timer's signal, once: to the process (`kill_pid_info`:
+/// one thread that has it unblocked, else pending on the process until one
+/// does) or, for `SIGEV_THREAD_ID`, to the one thread the timer named.
+///
+/// This used to set the bit on EVERY thread of the process, straight into
+/// the pending set, with no `siginfo_t` and without the disposition being
+/// looked at: a threaded program with a `SIGALRM` or `SIGPROF` handler ran
+/// it once per thread per expiry, and one `alarm(2)` came back as `EINTR`
+/// in every thread's blocking syscall at once.
+fn deliver_timer_signal(owner: KoID, target: Option<KoID>, signal: Signal, info: SigInfo) {
+    match target {
+        None => {
+            let _ = linux_object::process::send_signal_to_process_with_info(
+                owner as usize,
+                signal,
+                Some(info),
+            );
+        }
+        Some(tid) => {
+            // The thread may be gone by now: a timer is deleted with its
+            // process, not with one of its threads, and Linux drops the
+            // signal then too.
+            if let Some(proc) = ROOT_JOB.find_process(owner) {
+                if let Ok(obj) = proc.get_child(tid) {
+                    if let Ok(thread) = obj.downcast_arc::<Thread>() {
+                        thread.lock_linux().queue_signal(signal, Some(info));
+                    }
                 }
             }
         }
@@ -1045,7 +1162,7 @@ fn arm_posix_timer(id: usize, deadline: Duration, gen: u64) {
                 let mut timers = POSIX_TIMERS.lock();
                 if let Some(t) = timers.get_mut(&id) {
                     if t.generation == gen {
-                        fire = Some((t.owner, t.signo));
+                        fire = Some((t.owner, t.notify));
                         if t.interval.is_zero() {
                             t.next = Duration::ZERO;
                         } else {
@@ -1055,8 +1172,10 @@ fn arm_posix_timer(id: usize, deadline: Duration, gen: u64) {
                     }
                 }
             }
-            if let Some((owner, signo)) = fire {
-                deliver_timer_signal(owner, signo);
+            if let Some((owner, notify)) = fire {
+                if let Some((signal, info)) = posix_timer_expiry_signal(id, notify) {
+                    deliver_timer_signal(owner, notify.thread, signal, info);
+                }
             }
             if let Some(deadline) = rearm {
                 arm_posix_timer(id, deadline, gen);
@@ -1356,7 +1475,7 @@ mod exec_timer_tests {
             id,
             PosixTimer {
                 owner,
-                signo: Signal::SIGALRM as usize,
+                notify: TimerNotify::SIGALRM_TO_PROCESS,
                 clock: ClockBase::Monotonic,
                 interval: Duration::from_secs(1),
                 next: Duration::from_secs(1),
@@ -1417,5 +1536,153 @@ mod exec_timer_tests {
         assert_eq!(drop_posix_timers_of(0x4711_0006), 0);
         assert!(still_there(theirs));
         POSIX_TIMERS.lock().remove(&theirs);
+    }
+}
+
+#[cfg(test)]
+mod timer_signal_tests {
+    //! A timer that expired set its signal's bit on EVERY thread of the
+    //! process, with no `siginfo_t`; `timer_create` read neither
+    //! `sigev_value` nor the thread of `SIGEV_THREAD_ID`, and took any
+    //! `sigev_signo` or `sigev_notify`.
+
+    use super::*;
+    use linux_object::process::LinuxProcess;
+    use linux_object::signal::SignalCode;
+    use rcore_fs_ramfs::RamFS;
+    use zircon_object::task::Process;
+
+    fn a_process_with_two_threads(
+        pid: KoID,
+    ) -> (alloc::sync::Arc<Process>, [alloc::sync::Arc<Thread>; 2]) {
+        let proc = Process::create_with_fixed_id_ext(
+            &ROOT_JOB,
+            pid,
+            "t",
+            LinuxProcess::new(RamFS::new(), 0),
+        )
+        .unwrap();
+        let a = Thread::create_linux(&proc).unwrap();
+        let b = Thread::create_linux(&proc).unwrap();
+        (proc, [a, b])
+    }
+
+    fn has_pending(thread: &Thread, signal: Signal) -> bool {
+        thread.lock_linux().signals.contains(signal)
+    }
+
+    /// `(si_code, si_timerid, si_overrun, si_value)` where glibc reads them.
+    fn timer_fields(info: &SigInfo) -> (SignalCode, i32, i32, usize) {
+        let b = info.as_bytes();
+        let word = |at: usize| i32::from_ne_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]]);
+        let mut v = [0u8; core::mem::size_of::<usize>()];
+        let n = v.len();
+        v.copy_from_slice(&b[24..24 + n]);
+        (info.code, word(16), word(20), usize::from_ne_bytes(v))
+    }
+
+    fn event(value: usize, signo: i32, notify: i32, thread_id: i32) -> SigEvent {
+        SigEvent {
+            value,
+            signo,
+            notify,
+            thread_id,
+        }
+    }
+
+    #[test]
+    fn an_expired_timer_signals_one_thread_not_every_thread() {
+        let (proc, threads) = a_process_with_two_threads(43_301);
+        let (signal, info) = itimer_expiry_signal(ITIMER_REAL).unwrap();
+        deliver_timer_signal(proc.id(), None, signal, info);
+        let hit = threads
+            .iter()
+            .filter(|t| has_pending(t, Signal::SIGALRM))
+            .count();
+        assert_eq!(hit, 1, "SIGALRM pending on {} of 2 threads", hit);
+    }
+
+    #[test]
+    fn sigev_thread_id_goes_to_that_thread_with_si_timer_and_the_value() {
+        let (proc, [other, target]) = a_process_with_two_threads(43_302);
+        let notify = TimerNotify {
+            signo: 34,
+            value: 0xfeed_f00d,
+            thread: Some(target.id()),
+        };
+        let (signal, info) = posix_timer_expiry_signal(7, notify).unwrap();
+        deliver_timer_signal(proc.id(), notify.thread, signal, info);
+        assert!(
+            !has_pending(&other, signal),
+            "delivered to the wrong thread"
+        );
+        let got = target.lock_linux().take_siginfo(signal);
+        assert_eq!(
+            timer_fields(&got),
+            (SignalCode::TIMER, 7, 0, 0xfeed_f00d),
+            "not the SI_TIMER glibc's helper thread looks for"
+        );
+    }
+
+    #[test]
+    fn an_interval_timer_signal_comes_from_the_kernel_not_from_a_process() {
+        let (signal, info) = itimer_expiry_signal(ITIMER_PROF).unwrap();
+        assert_eq!(signal, Signal::SIGPROF);
+        assert_eq!(timer_fields(&info), (SignalCode::KERNEL, 0, 0, 0));
+    }
+
+    #[test]
+    fn sigev_none_arms_a_timer_that_delivers_nothing() {
+        let notify = timer_notify_from_sigevent(&event(5, 0, SIGEV_NONE, 0), |_| false).unwrap();
+        assert_eq!(notify.signo, 0);
+        assert!(posix_timer_expiry_signal(1, notify).is_none());
+    }
+
+    #[test]
+    fn the_sigevent_has_to_name_a_real_signal_and_a_known_notify() {
+        // `sigev_signo` 0 used to be "no signal" and 200 was silently
+        // dropped at expiry; `good_sigevent` refuses both up front.
+        for signo in [0, -1, SIGRTMAX + 1, 200] {
+            assert_eq!(
+                timer_notify_from_sigevent(&event(0, signo, SIGEV_SIGNAL, 0), |_| true).err(),
+                Some(LxError::EINVAL),
+                "signo {}",
+                signo
+            );
+        }
+        for notify in [3, 5, 8, -1] {
+            assert_eq!(
+                timer_notify_from_sigevent(&event(0, 14, notify, 0), |_| true).err(),
+                Some(LxError::EINVAL),
+                "notify {}",
+                notify
+            );
+        }
+        let ok =
+            timer_notify_from_sigevent(&event(9, SIGRTMAX, SIGEV_SIGNAL, 0), |_| false).unwrap();
+        assert_eq!(
+            ok,
+            TimerNotify {
+                signo: 64,
+                value: 9,
+                thread: None
+            }
+        );
+    }
+
+    #[test]
+    fn sigev_thread_id_must_be_a_thread_of_the_caller() {
+        let mine = |tid: KoID| tid == 77;
+        assert_eq!(
+            timer_notify_from_sigevent(&event(0, 34, SIGEV_THREAD_ID, 78), mine).err(),
+            Some(LxError::EINVAL)
+        );
+        assert_eq!(
+            timer_notify_from_sigevent(&event(0, 34, SIGEV_THREAD_ID, 0), mine).err(),
+            Some(LxError::EINVAL)
+        );
+        let ok = timer_notify_from_sigevent(&event(1, 34, SIGEV_THREAD_ID, 77), mine).unwrap();
+        assert_eq!(ok.thread, Some(77));
+        assert_eq!((ok.signo, ok.value), (34, 1));
     }
 }

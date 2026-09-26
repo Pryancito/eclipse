@@ -279,6 +279,35 @@ impl SigInfo {
         info
     }
 
+    /// The `siginfo_t` of an expired POSIX timer (`timer_create(2)`):
+    /// `SI_TIMER`, then `si_timerid`, `si_overrun` and the `sigev_value` the
+    /// timer was created with (`_timer` shares the union's layout with
+    /// `_rt`: two `int`s, then the `sigval`). glibc's `SIGEV_THREAD` helper
+    /// only acts on a signal whose code is `SI_TIMER` and whose `si_ptr` is
+    /// the timer it registered.
+    pub fn timer(signal: Signal, timerid: i32, overrun: i32, value: usize) -> Self {
+        let mut info = SigInfo {
+            signo: signal as i32,
+            errno: 0,
+            code: SignalCode::TIMER,
+            ..Self::default()
+        };
+        info.field.write_rt(timerid, overrun as u32, value);
+        info
+    }
+
+    /// The `siginfo_t` of a signal the kernel itself sends with no sender
+    /// behind it (`SEND_SIG_PRIV`): `SI_KERNEL`, pid and uid 0. What an
+    /// interval timer's `SIGALRM` (`it_real_fn`) carries.
+    pub fn from_kernel(signal: Signal) -> Self {
+        SigInfo {
+            signo: signal as i32,
+            errno: 0,
+            code: SignalCode::KERNEL,
+            ..Self::default()
+        }
+    }
+
     /// `siginfo_t` for a fault the CPU raised (`force_sig_fault`): `code`
     /// says which kind (`SEGV_MAPERR`, `SEGV_ACCERR`, `BUS_ADRALN`,
     /// `ILL_ILLOPC`, `FPE_INTDIV`) and `addr` is `si_addr`, the address it
