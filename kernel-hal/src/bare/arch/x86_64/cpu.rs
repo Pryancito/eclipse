@@ -2,9 +2,12 @@
 
 use raw_cpuid::CpuId;
 
-/// PIT (8254) channel 0 reference frequency in Hz. Fixed by the spec — every
-/// x86 PC (and QEMU) clocks the PIT at 1.193182 MHz.
-const PIT_REF_HZ: u64 = 1_193_182;
+// What the three calibrators below decide, as opposed to what they read, is
+// in `common::tsc_cal`, where a host test can drive it: the reference
+// frequencies, the arithmetic of a measurement window, the range of
+// frequencies a TSC can have, and the bound on waiting for a counter that may
+// have stopped.
+use crate::common::tsc_cal::{self, Verdict, WaitEnd, PIT_REF_HZ, PM_TIMER_HZ};
 
 /// Measure the TSC frequency by counting TSC cycles while the PIT channel 2
 /// counts down a known number of ticks. Channel 2 is the speaker channel and
@@ -81,17 +84,8 @@ unsafe fn calibrate_tsc_hz_via_pit() -> Option<u64> {
     gate.write(saved);
 
     let cycles = t1.saturating_sub(t0);
-    // hz = cycles * PIT_REF_HZ / PIT_COUNT
-    let hz = cycles.saturating_mul(PIT_REF_HZ) / PIT_COUNT as u64;
-    if (100_000_000..=20_000_000_000).contains(&hz) {
-        Some(hz)
-    } else {
-        None
-    }
+    tsc_cal::hz_from_window(cycles, PIT_REF_HZ, PIT_COUNT as u64)
 }
-
-/// ACPI PM timer reference frequency in Hz. Fixed by the ACPI spec.
-const PM_TIMER_HZ: u64 = 3_579_545;
 
 /// Locate the FADT's PM timer I/O port by walking RSDP -> XSDT/RSDT -> FACP
 /// by hand. Deliberately allocation-free: the `acpi` crate builds a table
@@ -174,38 +168,36 @@ unsafe fn calibrate_tsc_hz_via_pm_timer(port: u16, wide: bool) -> Option<u64> {
     let mask: u32 = if wide { u32::MAX } else { 0x00ff_ffff };
     // 50 ms of PM ticks: long enough that jitter on the port reads is noise.
     const WINDOW_TICKS: u32 = (PM_TIMER_HZ / 20) as u32;
+    // Reads, not time: the time is the thing being measured. A PM timer read
+    // is an I/O port cycle, on the order of a microsecond, so the window needs
+    // some tens of thousands of them and this is two orders of magnitude of
+    // headroom over that.
+    const WINDOW_READS: u32 = 2_000_000;
+    // A dead port reads all ones or all zeros and never moves. Ask for one
+    // single tick first so that costs a tenth of a second rather than the
+    // whole window's budget.
+    const ALIVE_READS: u32 = 100_000;
     let mut pm = Port::<u32>::new(port);
-    let first = pm.read() & mask;
-    // A dead port reads all ones or all zeros and never moves.
-    let mut moved = false;
-    for _ in 0..100_000 {
-        if pm.read() & mask != first {
-            moved = true;
-            break;
-        }
-        core::hint::spin_loop();
-    }
-    if !moved {
+    if matches!(
+        tsc_cal::wait_for_ticks(1, mask, ALIVE_READS, || pm.read()),
+        WaitEnd::Stalled(_)
+    ) {
         return None;
     }
-    let pm0 = pm.read() & mask;
+    // And now the window. This loop used to have **no bound at all**: it read
+    // the port until the counter had advanced far enough, so a PM timer parked
+    // by an SMI or by firmware after the liveness probe spun the boot CPU for
+    // ever, with nothing printed and nothing to say why. The liveness probe
+    // above bounded its own wait and this one did not, which is the whole of
+    // the bug: two waits on the same counter, one of them careful.
     let t0 = core::arch::x86_64::_rdtsc();
-    let mut elapsed;
-    loop {
-        elapsed = pm.read().wrapping_sub(pm0) & mask;
-        if elapsed >= WINDOW_TICKS {
-            break;
-        }
-        core::hint::spin_loop();
-    }
-    let t1 = core::arch::x86_64::_rdtsc();
-    let cycles = t1.saturating_sub(t0);
-    let hz = cycles.saturating_mul(PM_TIMER_HZ) / elapsed as u64;
-    if (100_000_000..=20_000_000_000).contains(&hz) {
-        Some(hz)
-    } else {
-        None
-    }
+    let WaitEnd::Reached(elapsed) =
+        tsc_cal::wait_for_ticks(WINDOW_TICKS, mask, WINDOW_READS, || pm.read())
+    else {
+        return None;
+    };
+    let cycles = core::arch::x86_64::_rdtsc().saturating_sub(t0);
+    tsc_cal::hz_from_window(cycles, PM_TIMER_HZ, elapsed as u64)
 }
 
 /// 0 until first asked. The first caller gets a provisional answer -- CPUID
@@ -274,8 +266,7 @@ pub fn recalibrate_tsc_hz() -> TscRecalibration {
         return TscRecalibration::Unavailable;
     };
     let provisional = tsc_hz();
-    let diff = provisional.abs_diff(measured);
-    if diff * 200 <= provisional {
+    if tsc_cal::verdict(provisional, measured) == Verdict::Confirmed {
         return TscRecalibration::Confirmed {
             hz: provisional,
             measured,
@@ -295,18 +286,14 @@ fn tsc_hz_from_cpuid() -> Option<u64> {
     let max = __cpuid(0).eax;
     if max >= 0x15 {
         let r = __cpuid(0x15);
-        if r.eax != 0 && r.ebx != 0 && r.ecx != 0 {
-            let hz = (r.ecx as u64).saturating_mul(r.ebx as u64) / r.eax as u64;
-            if (100_000_000..=20_000_000_000).contains(&hz) {
-                return Some(hz);
-            }
+        if let Some(hz) = tsc_cal::tsc_hz_from_15h(r.eax, r.ebx, r.ecx) {
+            return Some(hz);
         }
     }
     CpuId::new()
         .get_processor_frequency_info()
         .map(|info| info.processor_base_frequency())
-        .filter(|&f| f >= 100)
-        .map(|mhz| mhz as u64 * 1_000_000)
+        .and_then(|mhz| tsc_cal::tsc_hz_from_base_mhz(mhz as u32))
 }
 
 /// Flush GPUs and block devices before a reboot or power-off. A warm reset
