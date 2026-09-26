@@ -3533,18 +3533,29 @@ impl LinuxProcess {
         self.inner.lock().semaphores.add(id, array)
     }
 
-    /// Get an semaphore set by `id`
+    /// The set `id` names for a `semop` or `semctl` of this process, or
+    /// `None` (`EINVAL`) when it names none.
+    ///
+    /// `sem_obtain_object_check`: the id must name a set in the system
+    /// table now. One removed with `IPC_RMID` names nothing, to the process
+    /// that created it as much as to anyone else (a sleeper in `semop` is
+    /// woken into `EIDRM` by [`SemArray::remove`]; the next call is
+    /// `EINVAL`). The per-process table is for the `SEM_UNDO` replay at
+    /// exit, not a second namespace: it used to be consulted first, so a
+    /// process kept operating by id on a set another had removed (`ipcrm
+    /// -s`, a daemon's own `IPC_RMID` on restart), with values nobody else
+    /// could see, and a lock built on it held nothing.
+    ///
+    /// The id may have been created by another program and passed here,
+    /// which is what a system-wide id is for; it is recorded in the table
+    /// so the `SEM_UNDO` records `semop` leaves have a set to replay
+    /// against.
     pub fn semaphores_get(&self, id: usize) -> Option<Arc<SemArray>> {
-        let mut inner = self.inner.lock();
-        if let Some(array) = inner.semaphores.get(id) {
-            return Some(array);
-        }
-        // Not one this process `semget`-ed: the id may have been created by
-        // another program and passed here, which is what a system-wide id is
-        // for. Record it, so the `SEM_UNDO` records `semop` leaves have a set
-        // to replay against at exit.
         let array = crate::ipc::sem_lookup(id)?;
-        inner.semaphores.add(id, array.clone());
+        let mut inner = self.inner.lock();
+        if inner.semaphores.get(id).is_none() {
+            inner.semaphores.add(id, array.clone());
+        }
         Some(array)
     }
 
@@ -10870,11 +10881,17 @@ mod sem_id_from_elsewhere_tests {
         // ...and it is now this process's set too, so a SEM_UNDO record left
         // on it has something to replay against at exit.
         assert!(lp.inner.lock().semaphores.get(id).is_some());
-        // Retired, the id names nothing to a process that never had it.
+        // Retired with IPC_RMID, the id names nothing to anyone, the
+        // holder included: its next semop is EINVAL, as in Linux.
         sem_unregister(id);
         assert!(sem_lookup(id).is_none());
-        assert!(lp.semaphores_get(id).is_some(), "but a holder keeps it");
+        assert!(
+            lp.semaphores_get(id).is_none(),
+            "a removed set stayed reachable by id through the holder's table"
+        );
         assert!(lp.semaphores_get(id + 1).is_none());
+        // The table still holds the object, for the SEM_UNDO replay at exit.
+        assert!(lp.inner.lock().semaphores.get(id).is_some());
     }
 }
 
