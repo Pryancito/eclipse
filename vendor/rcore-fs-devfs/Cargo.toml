@@ -7,3 +7,9 @@ edition = "2018"
 [dependencies]
 rcore-fs = { path = "../rcore-fs" }
 spin = "0.9"
+
+# `lib.rs` asks `not(any(test, feature = "std"))` for its `no_std`, so without
+# this the compiler warns that no `std` feature exists -- and the crate has a
+# CI line of its own now, where a warning is noise that hides the next one.
+[features]
+std = []

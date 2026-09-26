@@ -13,10 +13,16 @@ members = [
     "zCore",
     "z-config",
     "xtask",
-    # A workspace member so its unit tests can run (`cargo test -p
-    # rcore-fs-sfs`); the `[patch]` below is what makes the rest of the tree
-    # use this copy.
+    # Workspace members so their unit tests can run (`cargo test -p
+    # rcore-fs-sfs` and friends); the `[patch]` below is what makes the rest of
+    # the tree use these copies. `rcore-fs-mountfs` has no choice about it:
+    # testing it needs a filesystem to mount, so it has a dev-dependency, and
+    # cargo refuses to test a non-member that has one. The other two are here so
+    # that `cargo fmt --all` -- the "Check format" job -- covers them too.
     "vendor/rcore-fs-sfs",
+    "vendor/rcore-fs-mountfs",
+    "vendor/rcore-fs-ramfs",
+    "vendor/rcore-fs-devfs",
     "hunter",
 ]
 default-members = ["xtask"]

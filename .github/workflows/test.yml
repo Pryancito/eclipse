@@ -91,6 +91,15 @@ jobs:
           # and `--features std` is what gives its tests a file-backed device
           # (without it the test target does not even compile).
           cargo test -p rcore-fs-sfs --features std
+          # The three filesystems the kernel mounts over everything else, and
+          # none of them had a line here or a single test. `mountfs` is what
+          # every path in the system is resolved through; `ramfs` is /tmp, /run
+          # and /dev/shm; `devfs` is /dev. 1400 lines that no job compiled as a
+          # test target: they are reached only through `[patch]`, and the bare
+          # `cargo test` above builds `default-members` alone.
+          cargo test -p rcore-fs-mountfs --lib
+          cargo test -p rcore-fs-ramfs --lib
+          cargo test -p rcore-fs-devfs --lib
           # The loader -- the code around user mode: the signal frame a
           # handler returns from, the CPU-exception-to-signal table. Its
           # default features pull in `zircon`, whose `include_bytes!` of the
