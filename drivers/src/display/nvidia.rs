@@ -12,6 +12,12 @@ use alloc::sync::Arc;
 use lock::Mutex;
 use pci::{PCIDevice, BAR};
 
+/// What the host tests run on every [`gpu_spin`]: the fake GPU's PBDMA,
+/// for a wait that is only satisfied by a ring the driver does not drive.
+#[cfg(test)]
+pub(super) static GPU_SPIN_HOOK: Mutex<Option<alloc::boxed::Box<dyn Fn() + Send>>> =
+    Mutex::new(None);
+
 /// Busy-wait heartbeat for the GPU register/fence poll loops in this driver.
 ///
 /// Like the RM's `osSpinLoop` (nvidia-rm-sys/src/os_boundary.rs), this drains
@@ -26,6 +32,16 @@ use pci::{PCIDevice, BAR};
 /// empty) and safe to call under locks; the RM already relies on exactly that.
 #[inline]
 fn gpu_spin() {
+    #[cfg(test)]
+    {
+        // Taken out for the call, so a hook that spins itself does not
+        // re-enter, and put back after.
+        let hook = GPU_SPIN_HOOK.lock().take();
+        if let Some(hook) = hook {
+            hook();
+            *GPU_SPIN_HOOK.lock() = Some(hook);
+        }
+    }
     static SPIN: AtomicUsize = AtomicUsize::new(0);
     let n = SPIN.fetch_add(1, Ordering::Relaxed) + 1;
     if n & 511 == 0 {
@@ -51,6 +67,13 @@ enum FastSlot {
     Ready(super::nouveau_uapi::FastCtx),
     Failed,
 }
+
+/// How long the compositor's exit waits for its clients' rings to fetch
+/// past the ACQUIREs they queued on its semaphore, before its page goes
+/// (`let_consumers_pass`). A ring sitting on such an ACQUIRE passes within
+/// microseconds of the payload landing; this is the bound for one that is
+/// behind other work.
+const CTX0_EXIT_GRACE_US: u64 = 20_000;
 
 /// A context whose process is gone while some other channel still has an
 /// ACQUIRE queued on its fence semaphore, through a peer mapping. `ctx_free`
@@ -10022,6 +10045,46 @@ impl NvidiaGpu {
         }
     }
 
+    /// Before `ctx_idx`'s landing zone goes away for good: land its last
+    /// payload (every ACQUIRE another channel queued on it passes) and give
+    /// those channels `budget_us` to fetch past what they had queued, so
+    /// they are not left with an ACQUIRE on a page that no longer maps.
+    /// The compositor's exit, where the page cannot be kept: context 0 is
+    /// the singleton the respawn rebuilds, so it is never a zombie, and its
+    /// reset frees the page every client waits on for its buffers back. A
+    /// ring sitting on that ACQUIRE passes within microseconds of the
+    /// write; one that does not move in the budget is stuck elsewhere and
+    /// gets the fault it was going to get.
+    fn let_consumers_pass(&self, ctx_idx: u32, budget_us: u64) {
+        self.write_final_payload(ctx_idx);
+        let waiters = self.channels_waiting_on(ctx_idx);
+        if waiters.is_empty() {
+            return;
+        }
+        let start = unsafe { crate::bus::drivers_timer_now_as_micros() };
+        loop {
+            if waiters.iter().all(|&(c, e)| self.channel_passed(c, e)) {
+                log::info!(
+                    "[nouveau-uapi] ctx {}: channel(s) {:?} passed their ACQUIREs on its semaphore before its page went",
+                    ctx_idx,
+                    waiters.iter().map(|w| w.0).collect::<Vec<_>>()
+                );
+                return;
+            }
+            if unsafe { crate::bus::drivers_timer_now_as_micros() }.wrapping_sub(start) >= budget_us
+            {
+                crate::klog_warn!(
+                    "[nouveau-uapi] ctx {}: channel(s) {:?} still have an ACQUIRE queued on its semaphore after {} ms; its page goes anyway",
+                    ctx_idx,
+                    waiters.iter().map(|w| w.0).collect::<Vec<_>>(),
+                    budget_us / 1000
+                );
+                return;
+            }
+            gpu_spin();
+        }
+    }
+
     /// Keep `ctx_idx`'s RM state past its process's exit until `waiters`
     /// have passed (see [`ZombieCtx`]). Its fences land now, by writing the
     /// last payload: a CPU-side waiter in the syncobj table resolves on the
@@ -10314,6 +10377,12 @@ impl NvidiaGpu {
     /// wedged one across labwc respawns.
     fn reset_ctx0_singleton(&self, device_instance: u32, reason: &str, owner_pid: u64) {
         self.ctx0_release(owner_pid);
+        // Every client with a frame in flight waits on this channel's
+        // semaphore (its buffer's release) through a peer mapping the reset
+        // below frees: let those ACQUIREs pass first, or each such client
+        // channel takes an MMU fault -- and the RM's recovery of it can
+        // reach the engine the respawned compositor is about to use.
+        self.let_consumers_pass(0, CTX0_EXIT_GRACE_US);
         self.fast_release(device_instance, 0);
         // The RM's `ctx0_reset` frees every peer-fence mapping context 0
         // takes part in, as consumer and as producer, along with the fence
@@ -18667,6 +18736,177 @@ mod nouveau_bookkeeping_tests {
         assert!(syncobj::destroy(out2));
         gpu.nouveau_release_process(A);
         gpu.nouveau_release_process(COMP);
+        assert_eq!(FAKE_RM.lock().bad, 0);
+    }
+
+    /// The other side of the zombie: the compositor is context 0, the
+    /// singleton its respawn rebuilds, so its page cannot be kept past its
+    /// exit -- and every client with a frame in flight has an ACQUIRE
+    /// queued on that page (its buffer's release). Its exit lands its last
+    /// payload and waits for those rings to fetch past it before the reset
+    /// frees the page, so no client channel faults.
+    #[test]
+    fn the_compositors_exit_lets_its_clients_pass_their_acquires_before_its_page_goes() {
+        let _g = LOCK.lock();
+        let _live = LiveBytes::hold();
+        let gpu = gpu_rm_ladder();
+        FAKE_RM.lock().peer = true;
+        test_clock::set_auto_advance(1_000);
+        let ch_c = client_with_pushbuf(&gpu, COMP);
+        let ch_a = client_with_pushbuf(&gpu, A);
+        let out2 = syncobj::create(false);
+        assert_eq!(
+            exec(&gpu, COMP, ch_c, &[push(PUSH_VA, 16)], &[], &[sync(out2)]),
+            Ok(0)
+        );
+        assert_eq!(
+            exec(&gpu, A, ch_a, &[push(PUSH_VA, 16)], &[sync(out2)], &[]),
+            Ok(0)
+        );
+        assert!(
+            peer_map(1, 0).is_some(),
+            "the compositor's semaphore in the client's VAS"
+        );
+        assert!(run_gpu(1).is_empty(), "the client sits on the ACQUIRE");
+        assert_eq!(userd(&chan(1)), (0, 2));
+        // The compositor dies with its ring never run. While its exit
+        // waits, the client's PBDMA keeps fetching (the hook is the GPU).
+        let fetched: std::sync::Arc<std::sync::Mutex<Vec<Fetched>>> = Default::default();
+        let sink = fetched.clone();
+        *GPU_SPIN_HOOK.lock() = Some(alloc::boxed::Box::new(move || {
+            sink.lock().unwrap().extend(run_gpu(1));
+        }));
+        let t0 = test_clock::now();
+        gpu.nouveau_release_process(COMP);
+        *GPU_SPIN_HOOK.lock() = None;
+        let elapsed = test_clock::now().wrapping_sub(t0);
+        assert_eq!(ctx0_owner(&gpu), 0);
+        assert!(!has_chan(0));
+        assert_eq!(peer_map(1, 0), None, "the mapping went with the page");
+        let fetched = fetched.lock().unwrap();
+        assert_eq!(
+            fetched.len(),
+            2,
+            "the client fetched acquire and push while the exit waited: {:?}",
+            *fetched
+        );
+        assert!(
+            matches!(fetched[0], Fetched::Acquire { payload: 1, .. }),
+            "{:?}",
+            fetched[0]
+        );
+        assert!(has_chan(1), "the client's channel is intact");
+        assert_eq!(userd(&chan(1)).0, 2);
+        assert!(
+            elapsed < CTX0_EXIT_GRACE_US,
+            "the wait ended when the client passed, not on the budget ({} us)",
+            elapsed
+        );
+        // Nothing is left on the client's ring to fault.
+        assert!(run_gpu(1).is_empty());
+        assert!(syncobj::destroy(out2));
+        gpu.nouveau_release_process(A);
+        assert_eq!(FAKE_RM.lock().bad, 0);
+    }
+
+    /// A client whose ring does not move in the grace period is stuck
+    /// elsewhere: the compositor's exit does not wait on it past the budget,
+    /// and the respawn is not held up.
+    #[test]
+    fn a_client_that_does_not_move_holds_the_compositors_exit_only_for_the_grace_period() {
+        let _g = LOCK.lock();
+        let _live = LiveBytes::hold();
+        let gpu = gpu_rm_ladder();
+        FAKE_RM.lock().peer = true;
+        test_clock::set_auto_advance(1_000);
+        let ch_c = client_with_pushbuf(&gpu, COMP);
+        let ch_a = client_with_pushbuf(&gpu, A);
+        let out2 = syncobj::create(false);
+        assert_eq!(
+            exec(&gpu, COMP, ch_c, &[push(PUSH_VA, 16)], &[], &[sync(out2)]),
+            Ok(0)
+        );
+        assert_eq!(
+            exec(&gpu, A, ch_a, &[push(PUSH_VA, 16)], &[sync(out2)], &[]),
+            Ok(0)
+        );
+        let t0 = test_clock::now();
+        gpu.nouveau_release_process(COMP);
+        let elapsed = test_clock::now().wrapping_sub(t0);
+        assert!(
+            elapsed >= CTX0_EXIT_GRACE_US,
+            "waited the grace period for the stuck client ({} us)",
+            elapsed
+        );
+        assert!(
+            elapsed < CTX0_EXIT_GRACE_US + 5_000,
+            "and not much more ({} us)",
+            elapsed
+        );
+        assert!(!has_chan(0), "the reset went through");
+        assert_eq!(peer_map(1, 0), None);
+        assert_eq!(userd(&chan(1)).0, 0, "the client never moved");
+        // The client goes (its socket is gone) and the respawn is not held
+        // up: a fresh channel behind index 0.
+        assert!(syncobj::destroy(out2));
+        gpu.nouveau_release_process(A);
+        let ch_c2 = client_with_pushbuf(&gpu, COMP2);
+        assert_eq!(ctx0_owner(&gpu), COMP2);
+        assert_eq!(
+            exec(&gpu, COMP2, ch_c2, &[push(PUSH_VA, 16)], &[], &[]),
+            Ok(0)
+        );
+        assert_eq!(run_gpu(0).len(), 1);
+        gpu.nouveau_release_process(COMP2);
+        assert_eq!(FAKE_RM.lock().bad, 0);
+    }
+
+    /// With two clients waiting, one that passes does not end the wait for
+    /// the one that has not: the page goes only when every waiter passed or
+    /// the grace period ran out.
+    #[test]
+    fn the_compositors_exit_waits_for_every_client_not_the_first_to_pass() {
+        let _g = LOCK.lock();
+        let _live = LiveBytes::hold();
+        let gpu = gpu_rm_ladder();
+        FAKE_RM.lock().peer = true;
+        test_clock::set_auto_advance(1_000);
+        let ch_c = client_with_pushbuf(&gpu, COMP);
+        let ch_a = client_with_pushbuf(&gpu, A);
+        let ch_b = client_with_pushbuf(&gpu, B);
+        let out2 = syncobj::create(false);
+        assert_eq!(
+            exec(&gpu, COMP, ch_c, &[push(PUSH_VA, 16)], &[], &[sync(out2)]),
+            Ok(0)
+        );
+        assert_eq!(
+            exec(&gpu, A, ch_a, &[push(PUSH_VA, 16)], &[sync(out2)], &[]),
+            Ok(0)
+        );
+        assert_eq!(
+            exec(&gpu, B, ch_b, &[push(PUSH_VA, 16)], &[sync(out2)], &[]),
+            Ok(0)
+        );
+        assert!(run_gpu(1).is_empty() && run_gpu(2).is_empty());
+        // A's PBDMA runs during the exit; B's is stuck.
+        *GPU_SPIN_HOOK.lock() = Some(alloc::boxed::Box::new(|| {
+            let _ = run_gpu(1);
+        }));
+        let t0 = test_clock::now();
+        gpu.nouveau_release_process(COMP);
+        *GPU_SPIN_HOOK.lock() = None;
+        let elapsed = test_clock::now().wrapping_sub(t0);
+        assert_eq!(userd(&chan(1)).0, 2, "A passed");
+        assert_eq!(userd(&chan(2)).0, 0, "B did not");
+        assert!(
+            elapsed >= CTX0_EXIT_GRACE_US,
+            "A passing did not end the wait for B ({} us)",
+            elapsed
+        );
+        assert!(!has_chan(0));
+        assert!(syncobj::destroy(out2));
+        gpu.nouveau_release_process(A);
+        gpu.nouveau_release_process(B);
         assert_eq!(FAKE_RM.lock().bad, 0);
     }
 
