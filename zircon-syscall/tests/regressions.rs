@@ -740,3 +740,143 @@ fn a_bad_out_pointer_leaves_no_handle_behind() {
         Box::pin(async move { drop(ct) })
     });
 }
+
+/// `ZX_JOB_POL_BASIC_V2` entries are twelve bytes (condition, action, flags)
+/// and were read as v1's eight, so from the second entry on the kernel took
+/// each `flags` for the next condition. The SDK has sent v2 since 2020.
+#[test]
+fn job_set_policy_reads_v2_entries_at_their_own_size() {
+    use zircon_object::task::{PolicyAction, PolicyCondition};
+    with_test_thread(|ct| {
+        let base = map_user_memory(&ct);
+        let sc = Syscall {
+            thread: &ct,
+            thread_fn: finish_thread,
+        };
+        let proc = ct.proc();
+        let job = Job::root().create_child().unwrap();
+        let handle = proc.add_handle(Handle::new(job.clone(), Rights::DEFAULT_JOB));
+        const JOB_POL_BASIC_V2: u32 = 0x0100_0000;
+        const JOB_POL_RELATIVE: u32 = 0;
+        const NEW_VMO: u32 = 4;
+        const NEW_CHANNEL: u32 = 5;
+        const ALLOW: u32 = 0;
+        const DENY: u32 = 1;
+        const OVERRIDE_ALLOW: u32 = 0;
+        let write = |words: &[u32]| unsafe {
+            for (i, w) in words.iter().enumerate() {
+                ((base + 4 * i) as *mut u32).write(*w);
+            }
+        };
+        // [NEW_VMO deny, NEW_CHANNEL allow], in v2 layout.
+        write(&[
+            NEW_VMO,
+            DENY,
+            OVERRIDE_ALLOW,
+            NEW_CHANNEL,
+            ALLOW,
+            OVERRIDE_ALLOW,
+        ]);
+        sc.sys_job_set_policy(handle, JOB_POL_RELATIVE, JOB_POL_BASIC_V2, base, 2)
+            .unwrap();
+        let policy = job.policy();
+        assert_eq!(
+            policy.get_action(PolicyCondition::NewVMO),
+            Some(PolicyAction::Deny)
+        );
+        assert_eq!(
+            policy.get_action(PolicyCondition::NewChannel),
+            Some(PolicyAction::Allow)
+        );
+        assert_eq!(
+            policy.get_action(PolicyCondition::BadHandle),
+            None,
+            "a flags word is not a condition"
+        );
+        // A flags word that is neither override value is refused.
+        let other = Job::root().create_child().unwrap();
+        let other_handle = proc.add_handle(Handle::new(other.clone(), Rights::DEFAULT_JOB));
+        write(&[NEW_VMO, DENY, 2]);
+        assert_eq!(
+            sc.sys_job_set_policy(other_handle, JOB_POL_RELATIVE, JOB_POL_BASIC_V2, base, 1),
+            Err(ZxError::INVALID_ARGS)
+        );
+        assert_eq!(other.policy().get_action(PolicyCondition::NewVMO), None);
+        Box::pin(async move { drop(ct) })
+    });
+}
+
+/// `zx_task_kill` used to answer `WRONG_TYPE` to everything it could not
+/// kill: a handle that is not one, and a task handle without the right.
+#[test]
+fn task_kill_says_why_it_refused() {
+    with_test_thread(|ct| {
+        let mut sc = Syscall {
+            thread: &ct,
+            thread_fn: finish_thread,
+        };
+        let proc = ct.proc();
+        assert_eq!(sc.sys_task_kill(0xdead_beef), Err(ZxError::BAD_HANDLE));
+        // A job with every right but DESTROY is the right kind of object and
+        // not enough rights to it.
+        let job = Job::root().create_child().unwrap();
+        let read_only = proc.add_handle(Handle::new(
+            job.clone(),
+            Rights::DEFAULT_JOB & !Rights::DESTROY,
+        ));
+        assert_eq!(sc.sys_task_kill(read_only), Err(ZxError::ACCESS_DENIED));
+        // A killed job refuses children; a refused kill kills nothing.
+        assert!(job.create_child().is_ok());
+        // An event with the DESTROY right is the wrong kind of object.
+        let event = proc.add_handle(Handle::new(Event::new(), Rights::DESTROY));
+        assert_eq!(sc.sys_task_kill(event), Err(ZxError::WRONG_TYPE));
+        // And with the right, the job dies.
+        let full = proc.add_handle(Handle::new(job.clone(), Rights::DEFAULT_JOB));
+        assert_eq!(sc.sys_task_kill(full), Ok(()));
+        assert_eq!(job.create_child().err(), Some(ZxError::BAD_STATE));
+        Box::pin(async move { drop(ct) })
+    });
+}
+
+/// `zx_process_read_memory` copies through a kernel buffer of at most 64 KiB
+/// now, however much is asked for; a read longer than that has to come out
+/// whole and in order.
+#[test]
+fn process_read_memory_reads_past_one_kernel_buffer_in_order() {
+    with_test_thread(|ct| {
+        let src = map_user_memory(&ct);
+        let dst = map_user_memory(&ct);
+        let sc = Syscall {
+            thread: &ct,
+            thread_fn: finish_thread,
+        };
+        let proc = ct.proc();
+        let len = 20 * PAGE_SIZE;
+        assert!(len > 64 * 1024, "the read has to span two chunks");
+        for i in 0..len {
+            unsafe { ((src + i) as *mut u8).write((i % 251) as u8) };
+        }
+        let handle = proc.add_handle(Handle::new(proc.clone(), Rights::DEFAULT_PROCESS));
+        // `actual` lives in the destination window's last word; the read is
+        // one word shorter so the two never overlap.
+        let actual = dst + len - 8;
+        let want = len - 8;
+        sc.sys_process_read_memory(handle, src, dst.into(), want, actual.into())
+            .unwrap();
+        assert_eq!(unsafe { (actual as *const usize).read() }, want);
+        for i in (0..want).step_by(4093) {
+            assert_eq!(
+                unsafe { ((dst + i) as *const u8).read() },
+                (i % 251) as u8,
+                "byte {} of the copy",
+                i
+            );
+        }
+        // Past the end of the mapping the read is short, not an error.
+        let tail = 3 * PAGE_SIZE;
+        sc.sys_process_read_memory(handle, src + len - tail, dst.into(), want, actual.into())
+            .unwrap();
+        assert_eq!(unsafe { (actual as *const usize).read() }, tail);
+        Box::pin(async move { drop(ct) })
+    });
+}

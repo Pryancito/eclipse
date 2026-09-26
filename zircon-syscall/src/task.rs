@@ -1,3 +1,4 @@
+use alloc::vec::Vec;
 use core::convert::TryFrom;
 use kernel_hal::context::UserContextField;
 use {super::*, zircon_object::task::*};
@@ -322,17 +323,30 @@ impl Syscall<'_> {
         info!("task.kill: handle={:?}", handle);
         let proc = self.thread.proc();
 
-        if let Ok(job) = proc.get_object_with_rights::<Job>(handle, Rights::DESTROY) {
-            job.kill();
-        } else if let Ok(process) = proc.get_object_with_rights::<Process>(handle, Rights::DESTROY)
-        {
-            process.kill();
-        } else if let Ok(thread) = proc.get_object_with_rights::<Thread>(handle, Rights::DESTROY) {
-            thread.kill();
-        } else {
-            return Err(ZxError::WRONG_TYPE);
+        // As `sys_task_kill` in Zircon: the handle and its DESTROY right
+        // first, whatever the object is, then the three task types. This
+        // used to try the three types in turn and answer `WRONG_TYPE` to
+        // whatever failed all three, so a bad handle was `WRONG_TYPE` instead
+        // of `BAD_HANDLE`, and a job, process or thread handle without the
+        // right was `WRONG_TYPE` instead of `ACCESS_DENIED`: the caller was
+        // told it had the wrong kind of object when it had the right one and
+        // not enough rights to it.
+        let (object, rights) = proc.get_dyn_object_and_rights(handle)?;
+        if !rights.contains(Rights::DESTROY) {
+            return Err(ZxError::ACCESS_DENIED);
         }
-        Ok(())
+        let object = match object.downcast_arc::<Job>() {
+            Ok(job) => return Ok(job.kill()),
+            Err(object) => object,
+        };
+        let object = match object.downcast_arc::<Process>() {
+            Ok(process) => return Ok(process.kill()),
+            Err(object) => object,
+        };
+        match object.downcast_arc::<Thread>() {
+            Ok(thread) => Ok(thread.kill()),
+            Err(_) => Err(ZxError::WRONG_TYPE),
+        }
     }
 
     /// Create a new child job object given a parent job.
@@ -380,12 +394,9 @@ impl Syscall<'_> {
                     JOB_POL_ABSOLUTE => SetPolicyOptions::Absolute,
                     _ => return Err(ZxError::INVALID_ARGS),
                 };
-                job.set_policy_basic(
-                    policy_option,
-                    UserInPtr::from(policy).as_slice(count as usize)?,
-                )
+                let policies = basic_policies(topic, policy, count)?;
+                job.set_policy_basic(policy_option, &policies)
             }
-            //JOB_POL_BASE_V2 => unimplemented!(),
             JOB_POL_TIMER_SLACK => {
                 if options != JOB_POL_RELATIVE {
                     return Err(ZxError::INVALID_ARGS);
@@ -407,7 +418,7 @@ impl Syscall<'_> {
         &self,
         handle_value: HandleValue,
         vaddr: usize,
-        mut buffer: UserOutPtr<u8>,
+        buffer: UserOutPtr<u8>,
         buffer_size: usize,
         mut actual: UserOutPtr<usize>,
     ) -> ZxResult {
@@ -417,10 +428,27 @@ impl Syscall<'_> {
         let proc = self.thread.proc();
         let process =
             proc.get_object_with_rights::<Process>(handle_value, Rights::READ | Rights::WRITE)?;
-        let mut data = vec![0u8; buffer_size];
-        let len = process.vmar().read_memory(vaddr, &mut data)?;
-        buffer.write_array(&data[..len])?;
-        actual.write(len)?;
+        // Through a bounded kernel buffer, a chunk at a time. `vec![0u8;
+        // buffer_size]` was an allocation of whatever the caller asked for, up
+        // to `MAX_BLOCK`: 64 MiB of kernel heap that a machine may not have
+        // to spare, and an allocation the heap cannot serve is not an error
+        // here but a kernel panic. Zircon copies straight into the caller's
+        // pages for the same reason.
+        let vmar = process.vmar();
+        let mut chunk = vec![0u8; buffer_size.min(READ_MEMORY_CHUNK)];
+        let mut done = 0;
+        while done < buffer_size {
+            let want = (buffer_size - done).min(chunk.len());
+            let len = vmar.read_memory(vaddr + done, &mut chunk[..want])?;
+            buffer.add(done).write_array(&chunk[..len])?;
+            done += len;
+            // The mapping ends here: what `read_memory` answers, and the
+            // whole of what Zircon reads for one call.
+            if len < want {
+                break;
+            }
+        }
+        actual.write(done)?;
         Ok(())
     }
 
@@ -458,3 +486,55 @@ const JOB_POL_ABSOLUTE: u32 = 1;
 const MAX_BLOCK: usize = 64 * 1024 * 1024; //64M
 /// Larger than any register set `zx_thread_read_state` can answer with.
 const MAX_THREAD_STATE_SIZE: usize = 4096;
+/// The kernel buffer `zx_process_read_memory` copies through, per round.
+const READ_MEMORY_CHUNK: usize = 64 * 1024;
+
+/// `zx_policy_basic_v2_t`: `zx_policy_basic_v1_t` (condition, action) plus a
+/// `flags` word, twelve bytes to the v1's eight.
+///
+/// `ZX_JOB_POL_BASIC_V2` used to be read with the v1 layout: the first entry
+/// came out right, and from the second on the kernel was reading each
+/// entry's `flags` as the next entry's condition and each condition as an
+/// action. Two v2 entries `[NEW_VMO deny, NEW_CHANNEL allow]` were parsed as
+/// `[NEW_VMO deny, BAD_HANDLE action=5]`, which is not an action, so the call
+/// was `INVALID_ARGS`; other arrays parsed into policies nobody asked for.
+/// `ZX_JOB_POL_BASIC` has meant the v2 layout in the Zircon SDK since 2020,
+/// so this is what every policy-setting program sends.
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+struct BasicPolicyV2 {
+    condition: u32,
+    action: u32,
+    /// `ZX_POL_OVERRIDE_ALLOW` (0) or `ZX_POL_OVERRIDE_DENY` (1): whether a
+    /// child job may set this condition differently. Every policy here
+    /// behaves as `OVERRIDE_DENY`, which is what a v1 policy is; the value is
+    /// checked, not modelled.
+    flags: u32,
+}
+
+const ZX_POL_OVERRIDE_ALLOW: u32 = 0;
+const ZX_POL_OVERRIDE_DENY: u32 = 1;
+
+/// The basic policies of a `zx_job_set_policy` call, read at the size the
+/// topic says they have.
+fn basic_policies(topic: u32, policy: usize, count: u32) -> ZxResult<Vec<BasicPolicy>> {
+    let count = count as usize;
+    if topic == JOB_POL_BASE_V1 {
+        return UserInPtr::<BasicPolicy>::from(policy)
+            .read_array(count)
+            .map_err(ZxError::from);
+    }
+    UserInPtr::<BasicPolicyV2>::from(policy)
+        .read_array(count)?
+        .into_iter()
+        .map(|v2| {
+            if v2.flags != ZX_POL_OVERRIDE_ALLOW && v2.flags != ZX_POL_OVERRIDE_DENY {
+                return Err(ZxError::INVALID_ARGS);
+            }
+            Ok(BasicPolicy {
+                condition: v2.condition,
+                action: v2.action,
+            })
+        })
+        .collect()
+}
