@@ -751,13 +751,13 @@ pub(crate) fn proc_mounts_content() -> String {
 pub fn poll_events_to_bus_mask(events: PollEvents) -> crate::sync::Event {
     use crate::sync::Event;
     let mut mask = Event::ERROR | Event::CLOSED;
-    if events.contains(PollEvents::IN) {
+    if events.wants_read() {
         mask |= Event::READABLE;
     }
-    if events.contains(PollEvents::OUT) {
+    if events.wants_write() {
         mask |= Event::WRITABLE;
     }
-    if !events.intersects(PollEvents::IN | PollEvents::OUT) {
+    if !events.wants_read() && !events.wants_write() {
         // Error/hup-only interest (or an empty set): any transition may
         // matter to the poller's re-scan.
         mask |= Event::READABLE | Event::WRITABLE;
