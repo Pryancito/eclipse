@@ -102,6 +102,110 @@ pub fn loff_len(len: usize) -> LxResult<u64> {
     Ok(len as u64)
 }
 
+/// A `uid_t`/`gid_t` argument of `setuid(2)`, `setgid(2)` and `setgroups(2)`:
+/// `make_kuid` + `uid_valid` reject `(uid_t)-1` with `EINVAL` before any
+/// privilege is looked at. It used to go through: as root, `setuid(-1)`
+/// returned 0 and left every id at 4294967295; unprivileged it was `EPERM`.
+pub fn set_id(raw: usize) -> LxResult<u32> {
+    let id = raw as u32;
+    if id == u32::MAX {
+        return Err(LxError::EINVAL);
+    }
+    Ok(id)
+}
+
+/// `NGROUPS_MAX`: the most supplementary groups a process may hold.
+pub const NGROUPS_MAX: usize = 65536;
+
+/// The `int gidsetsize` of `getgroups(2)` and `setgroups(2)`. `getgroups`
+/// refuses a negative one (`EINVAL`); `setgroups` reads it as unsigned and
+/// refuses anything over `NGROUPS_MAX` (`EINVAL`), which is also what keeps
+/// the kernel from allocating whatever size the caller names.
+pub fn groups_size(raw: usize, for_set: bool) -> LxResult<usize> {
+    let size = int_arg(raw);
+    if for_set {
+        if size as u32 as usize > NGROUPS_MAX {
+            return Err(LxError::EINVAL);
+        }
+        Ok(size as u32 as usize)
+    } else {
+        if size < 0 {
+            return Err(LxError::EINVAL);
+        }
+        Ok(size as usize)
+    }
+}
+
+/// The list `setgroups(2)` was handed, once read: `groups_from_user` puts
+/// every entry through `gid_valid`, so a `(gid_t)-1` anywhere in it is
+/// `EINVAL` and nothing is changed.
+pub fn groups_list(groups: alloc::vec::Vec<u32>) -> LxResult<alloc::vec::Vec<u32>> {
+    if groups.contains(&u32::MAX) {
+        return Err(LxError::EINVAL);
+    }
+    Ok(groups)
+}
+
+#[cfg(test)]
+mod id_arg_tests {
+    //! The id and count arguments Linux refuses before looking at privilege.
+
+    use super::*;
+
+    /// `-1` is not an id, however the register carries it; anything else is.
+    #[test]
+    fn minus_one_is_not_an_id() {
+        assert_eq!(set_id(0xffff_ffff), Err(LxError::EINVAL));
+        assert_eq!(set_id(usize::MAX), Err(LxError::EINVAL));
+        assert_eq!(set_id(0), Ok(0));
+        assert_eq!(set_id(1000), Ok(1000));
+        assert_eq!(set_id(0xffff_fffe), Ok(0xffff_fffe));
+        // Only the low 32 bits are the argument.
+        assert_eq!(set_id(0x1_0000_03e8), Ok(1000));
+    }
+
+    /// `getgroups` refuses a negative size; `setgroups` reads it unsigned
+    /// and refuses more than `NGROUPS_MAX`.
+    #[test]
+    fn a_negative_or_oversized_group_count_is_refused() {
+        assert_eq!(groups_size(0, false), Ok(0));
+        assert_eq!(groups_size(0xffff_ffff, false), Err(LxError::EINVAL), "-1");
+        assert_eq!(groups_size(usize::MAX, false), Err(LxError::EINVAL));
+        assert_eq!(
+            groups_size(100_000, false),
+            Ok(100_000),
+            "getgroups has no ceiling"
+        );
+        assert_eq!(groups_size(0, true), Ok(0));
+        assert_eq!(groups_size(NGROUPS_MAX, true), Ok(NGROUPS_MAX));
+        assert_eq!(groups_size(NGROUPS_MAX + 1, true), Err(LxError::EINVAL));
+        assert_eq!(
+            groups_size(0xffff_ffff, true),
+            Err(LxError::EINVAL),
+            "-1 is huge unsigned"
+        );
+        assert_eq!(groups_size(usize::MAX, true), Err(LxError::EINVAL));
+    }
+
+    /// A `-1` anywhere in the list refuses the whole list.
+    #[test]
+    fn a_minus_one_in_the_group_list_refuses_it_whole() {
+        assert_eq!(groups_list(alloc::vec![]), Ok(alloc::vec![]));
+        assert_eq!(
+            groups_list(alloc::vec![0, 1000, 4]),
+            Ok(alloc::vec![0, 1000, 4])
+        );
+        assert_eq!(
+            groups_list(alloc::vec![1000, u32::MAX]),
+            Err(LxError::EINVAL)
+        );
+        assert_eq!(
+            groups_list(alloc::vec![u32::MAX, 1000]),
+            Err(LxError::EINVAL)
+        );
+    }
+}
+
 #[cfg(test)]
 mod loff_tests {
     //! The signed 64-bit lengths, which were read unsigned.

@@ -1832,13 +1832,13 @@ impl Syscall<'_> {
 
     /// `setuid` changes the calling process user identity.
     pub fn sys_setuid(&self, uid: usize) -> SysResult {
-        self.linux_process().set_uid(uid as u32)?;
+        self.linux_process().set_uid(crate::intarg::set_id(uid)?)?;
         Ok(0)
     }
 
     /// `setgid` changes the calling process group identity.
     pub fn sys_setgid(&self, gid: usize) -> SysResult {
-        self.linux_process().set_gid(gid as u32)?;
+        self.linux_process().set_gid(crate::intarg::set_id(gid)?)?;
         Ok(0)
     }
 
@@ -1870,6 +1870,7 @@ impl Syscall<'_> {
 
     /// `getgroups` returns supplementary group IDs.
     pub fn sys_getgroups(&self, size: usize, mut list: UserOutPtr<u32>) -> SysResult {
+        let size = crate::intarg::groups_size(size, false)?;
         let groups = self.linux_process().groups();
         if size == 0 {
             return Ok(groups.len());
@@ -1890,11 +1891,13 @@ impl Syscall<'_> {
         if !self.linux_process().capable(CAP_SETGID) {
             return Err(LxError::EPERM);
         }
+        let size = crate::intarg::groups_size(size, true)?;
         let groups = if size == 0 {
             Vec::new()
         } else {
             list.read_array(size)?
         };
+        let groups = crate::intarg::groups_list(groups)?;
         self.linux_process().set_groups(groups);
         Ok(0)
     }
