@@ -216,6 +216,12 @@ impl ShmIdentifier {
     /// that does not exist and no `IPC_CREAT` is `ENOENT`, not a silent
     /// create. Programs use a bare `shmget(key, 0, 0)` to ask whether a
     /// segment is there.
+    ///
+    /// And a segment is created only at a size `newseg` accepts: between
+    /// `SHMMIN` and `SHMMAX` (`EINVAL`). Zero created an empty segment, and a
+    /// size near `usize::MAX` had `pages()` wrap to nothing while `shm_segsz`
+    /// reported the whole request, so `shmat` handed out a mapping of no
+    /// pages under a size the caller believed in.
     pub fn new_shared_guard(
         key: u32,
         memsize: usize,
@@ -257,9 +263,10 @@ impl ShmIdentifier {
                 return Err(LxError::ENOENT);
             }
         }
+        let npages = shm_segment_pages(memsize)?;
         let shared_guard = Arc::new(Mutex::new(ShmGuard {
             shared_guard: {
-                let vmo = VmObject::new_paged(pages(memsize));
+                let vmo = VmObject::new_paged(npages);
                 // A SysV segment is shared memory by definition; a fork must
                 // never privatize an attached segment.
                 vmo.set_share_on_fork();
@@ -392,6 +399,22 @@ impl ShmGuard {
 /// small for what it was about to write. Wayland allocates through `memfd` and
 /// never comes here, which is the shape of "it works under Wayland and not
 /// under X".
+/// `SHMMIN`: the smallest segment `shmget` creates (`include/uapi/linux/shm.h`).
+pub const SHMMIN: usize = 1;
+/// `SHMMAX`: the largest, Linux's `ULONG_MAX - (1UL << 24)` default. The
+/// same number `shmctl(IPC_INFO)` reports.
+pub const SHMMAX: usize = usize::MAX - (1 << 24);
+
+/// `newseg`'s size check, and the page count the segment gets: `size <
+/// SHMMIN || size > ns->shm_ctlmax` is `EINVAL`; what is left cannot
+/// overflow the page rounding, which is what `SHMMAX` is for.
+pub fn shm_segment_pages(size: usize) -> Result<usize, LxError> {
+    if !(SHMMIN..=SHMMAX).contains(&size) {
+        return Err(LxError::EINVAL);
+    }
+    Ok(pages(size))
+}
+
 #[cfg(test)]
 mod shm_tests {
     use super::*;
@@ -991,5 +1014,65 @@ mod shm_tests {
         drop(guard);
         drop(seg);
         clear_ids();
+    }
+}
+
+#[cfg(test)]
+mod shm_size_tests {
+    //! The size a segment may be created at, which was never checked.
+
+    use super::*;
+
+    extern crate std;
+
+    const CREAT: usize = 0o1000;
+
+    fn test_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn get(key: u32, size: usize, flags: usize) -> Result<Arc<Mutex<ShmGuard>>, LxError> {
+        ShmIdentifier::new_shared_guard(key, size, flags, 42, 0, 0)
+    }
+
+    /// `newseg`: below `SHMMIN` or above `SHMMAX` is `EINVAL`, and the page
+    /// count of what passes rounds up without wrapping.
+    #[test]
+    fn a_segment_is_created_between_shmmin_and_shmmax_and_rounds_up_to_pages() {
+        assert_eq!(shm_segment_pages(0), Err(LxError::EINVAL));
+        assert_eq!(shm_segment_pages(1), Ok(1));
+        assert_eq!(shm_segment_pages(PAGE_SIZE), Ok(1));
+        assert_eq!(shm_segment_pages(PAGE_SIZE + 1), Ok(2));
+        // The cap is Linux's, and it is what keeps the rounding from wrapping.
+        assert_eq!(SHMMAX, usize::MAX - (1 << 24));
+        assert_eq!(
+            shm_segment_pages(SHMMAX),
+            Ok((usize::MAX >> 12) - (1 << 12) + 1)
+        );
+        assert_eq!(shm_segment_pages(SHMMAX + 1), Err(LxError::EINVAL));
+        assert_eq!(shm_segment_pages(usize::MAX), Err(LxError::EINVAL));
+    }
+
+    /// The check is a creation check: a lookup by key passes size 0, as
+    /// `shmget(key, 0, 0)` always has.
+    #[test]
+    fn the_size_is_checked_on_create_and_not_on_lookup() {
+        let _guard = test_lock();
+        assert_eq!(get(0, 0, CREAT | 0o666).err(), Some(LxError::EINVAL));
+        assert_eq!(
+            get(0, usize::MAX, CREAT | 0o666).err(),
+            Some(LxError::EINVAL)
+        );
+        const KEY: u32 = 0x5a5a_0e01;
+        assert_eq!(get(KEY, 0, CREAT | 0o666).err(), Some(LxError::EINVAL));
+        assert_eq!(
+            get(KEY, 0, 0o666).err(),
+            Some(LxError::ENOENT),
+            "nothing was made"
+        );
+        let made = get(KEY, PAGE_SIZE + 1, CREAT | 0o666).unwrap();
+        assert_eq!(made.lock().segsz(), PAGE_SIZE + 1);
+        assert!(Arc::ptr_eq(&made, &get(KEY, 0, 0o666).unwrap()));
     }
 }

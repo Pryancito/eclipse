@@ -270,6 +270,10 @@ impl SemArray {
     /// - Asking an existing set for more semaphores than it has is `EINVAL`.
     ///   Without it the caller walked away believing in semaphores that do not
     ///   exist, and every index past the end came back `EFBIG` from `semop`.
+    /// - A set cannot be created empty: `newary` answers `EINVAL` to
+    ///   `nsems == 0`, which is only a "don't care" for a lookup. An empty
+    ///   set was created, took an id and a key, and every `semop` on it was
+    ///   `EFBIG`.
     pub fn get_or_create(
         key: u32,
         nsems: usize,
@@ -306,6 +310,9 @@ impl SemArray {
         }
 
         // not found, create one
+        if nsems == 0 {
+            return Err(LxError::EINVAL);
+        }
         let mut semaphores = Vec::new();
         for _ in 0..nsems {
             semaphores.push(Semaphore::new(0));
@@ -343,6 +350,14 @@ impl SemArray {
     }
 }
 
+/// `SEMMSL`, the most semaphores one set may hold: Linux's default
+/// (`include/uapi/linux/sem.h`), the number `semctl(IPC_INFO)` reports, and
+/// the bound `semget` enforces. One constant for both, because they were two:
+/// `IPC_INFO` said 32000 and `semget` refused past 256, so PostgreSQL's
+/// sizing (which reads the limit first and then asks for it) was told yes
+/// and then no.
+pub const SEMMSL: usize = 32000;
+
 /// System V semaphore sets had no tests, and `semget` turned out to differ
 /// from `msgget` — its own sibling, three files away — on every rule the two
 /// share.
@@ -374,6 +389,21 @@ mod sem_tests {
     /// about ownership wants.
     fn get(key: u32, nsems: usize, flags: usize) -> Result<Arc<SemArray>, LxError> {
         SemArray::get_or_create(key, nsems, flags, ROOT, ROOT)
+    }
+
+    /// `newary`: a set is never created with no semaphores in it. Zero is a
+    /// "don't care" for a lookup, and only for a lookup.
+    #[test]
+    fn a_set_cannot_be_created_empty() {
+        let _guard = test_lock();
+        assert_eq!(get(0, 0, CREAT | 0o666).err(), Some(LxError::EINVAL));
+        const KEY: u32 = 0x5e00_0e00;
+        assert_eq!(get(KEY, 0, CREAT | 0o666).err(), Some(LxError::EINVAL));
+        // Nothing was created under the key by the refused call.
+        assert_eq!(get(KEY, 0, 0o666).err(), Some(LxError::ENOENT));
+        // A lookup with zero finds the set whatever its size.
+        let made = get(KEY, 3, CREAT | 0o666).unwrap();
+        assert!(Arc::ptr_eq(&made, &get(KEY, 0, 0o666).unwrap()));
     }
 
     #[test]
@@ -502,17 +532,6 @@ mod sem_tests {
         assert!(a.get_sem(2).is_none());
         assert!(a.get_sem(9999).is_none());
         assert!(a.get_sem(usize::MAX).is_none());
-    }
-
-    #[test]
-    fn an_empty_set_has_no_semaphore_zero() {
-        let _guard = test_lock();
-        // semget with nsems == 0 on a *new* key really does make an empty set,
-        // so even index 0 has to answer None rather than panic.
-        let a = get(0, 0, CREAT | 0o666).unwrap();
-        assert!(a.is_empty());
-        assert_eq!(a.len(), 0);
-        assert!(a.get_sem(0).is_none());
     }
 
     #[test]
