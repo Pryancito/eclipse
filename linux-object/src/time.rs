@@ -48,6 +48,28 @@ pub struct ITimerSpec {
 pub const NSEC_PER_SEC: usize = 1_000_000_000;
 /// Microseconds in a second, likewise for `tv_usec`.
 pub const USEC_PER_SEC: usize = 1_000_000;
+/// Nanoseconds in a millisecond.
+const NSEC_PER_MSEC: usize = 1_000_000;
+/// Microseconds in a millisecond.
+const USEC_PER_MSEC: usize = 1_000;
+
+/// A poll timeout in whole milliseconds, rounded **up**: `frac` is the
+/// sub-second part and `frac_per_msec` its units per millisecond.
+///
+/// `poll`, `ppoll`, `select` and `pselect6` all wait in whole milliseconds
+/// here, and the conversion truncated. A timeout under a millisecond --
+/// `select(0, ..., &{0, 200})` as a short sleep, or a 500 us poll in an audio
+/// or input loop -- therefore came out as 0, which for all four of them does
+/// not mean "wait a very short time", it means "look now and return". The
+/// program got an immediate return, looped, and spun at 100 % CPU on a
+/// timeout it had asked to sleep through.
+///
+/// Zero still converts to zero, which is the one value that has to survive
+/// exactly: it is how a caller asks for a non-blocking check.
+fn poll_msecs(sec: usize, frac: usize, frac_per_msec: usize) -> usize {
+    sec.saturating_mul(1_000)
+        .saturating_add(frac.div_ceil(frac_per_msec))
+}
 
 impl From<TimeVal> for Duration {
     fn from(t: TimeVal) -> Self {
@@ -108,7 +130,7 @@ impl TimeVal {
     /// as a `timeval`.
     pub fn try_into_poll_msecs(&self) -> crate::error::LxResult<isize> {
         if self.valid() {
-            Ok(self.to_msec().min(isize::MAX as usize) as isize)
+            Ok(poll_msecs(self.sec, self.usec, USEC_PER_MSEC).min(isize::MAX as usize) as isize)
         } else {
             Err(crate::error::LxError::EINVAL)
         }
@@ -184,7 +206,7 @@ impl TimeSpec {
     /// one and hang with no way to tell why. Clamping keeps it finite.
     pub fn try_into_poll_msecs(&self) -> crate::error::LxResult<isize> {
         if self.valid() {
-            Ok(self.to_msec().min(isize::MAX as usize) as isize)
+            Ok(poll_msecs(self.sec, self.nsec, NSEC_PER_MSEC).min(isize::MAX as usize) as isize)
         } else {
             Err(crate::error::LxError::EINVAL)
         }
@@ -1318,6 +1340,77 @@ mod time_tests {
             .to_msec(),
             usize::MAX
         );
+    }
+
+    /// The four that wait in whole milliseconds: a timeout under one of them
+    /// truncated to 0, and 0 is not a short wait for any of them, it is
+    /// "return now". A program using a 200 us `select` as a sleep got an
+    /// immediate return and spun.
+    #[test]
+    fn a_timeout_under_a_millisecond_still_waits() {
+        assert_eq!(
+            TimeVal { sec: 0, usec: 200 }.try_into_poll_msecs().unwrap(),
+            1
+        );
+        assert_eq!(
+            TimeSpec { sec: 0, nsec: 1 }.try_into_poll_msecs().unwrap(),
+            1
+        );
+        // And a wait that is not a whole number of milliseconds rounds up
+        // rather than losing its tail.
+        assert_eq!(
+            TimeVal {
+                sec: 0,
+                usec: 1_500
+            }
+            .try_into_poll_msecs()
+            .unwrap(),
+            2
+        );
+        assert_eq!(
+            TimeSpec {
+                sec: 2,
+                nsec: 1_999_999
+            }
+            .try_into_poll_msecs()
+            .unwrap(),
+            2_002
+        );
+    }
+
+    /// Zero is the one value that must convert exactly: it is how a caller
+    /// asks `poll` for a non-blocking check, and rounding it up would make
+    /// every one of those sleep a millisecond.
+    #[test]
+    fn a_zero_timeout_is_still_zero() {
+        assert_eq!(
+            TimeVal { sec: 0, usec: 0 }.try_into_poll_msecs().unwrap(),
+            0
+        );
+        assert_eq!(
+            TimeSpec { sec: 0, nsec: 0 }.try_into_poll_msecs().unwrap(),
+            0
+        );
+    }
+
+    /// The rounding must not open a way past the clamp: a hostile `timespec`
+    /// is still refused, and a huge valid one is still finite.
+    #[test]
+    fn rounding_up_does_not_reach_past_the_clamp() {
+        assert_eq!(
+            TimeSpec {
+                sec: usize::MAX,
+                nsec: NSEC_PER_SEC - 1,
+            }
+            .try_into_poll_msecs(),
+            Err(crate::error::LxError::EINVAL),
+            "a negative tv_sec read through an unsigned field"
+        );
+        let huge = TimeSpec {
+            sec: isize::MAX as usize,
+            nsec: NSEC_PER_SEC - 1,
+        };
+        assert_eq!(huge.try_into_poll_msecs().unwrap(), isize::MAX);
     }
 
     #[test]
