@@ -2948,8 +2948,6 @@ fn draw_calendar(
     let pad = CAL_PAD;
     let header_h = CAL_HEADER_H;
     let wkd_h = CAL_WKD_H;
-    let _ = ph;
-
     draw_panel(cv, px, py, pw, ph, 12);
     cv.hline(px + 10, py + header_h - 1, pw - 20, pal().rule, 0.7);
 
@@ -3104,7 +3102,6 @@ fn draw_volume_menu(
     ph: i32,
     vol: u32,
 ) -> Vec<(i32, i32, i32, i32, Action)> {
-    let _ = ph;
     draw_panel(cv, px, py, pw, ph, 10);
 
     cv.volume_icon(px + 14, py + 14, 16, pal().white, vol == 0);
@@ -3227,9 +3224,11 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
                     "zwlr_layer_shell_v1" => {
                         state.layer_shell = Some(registry.bind(name, version.min(4), qh, ()))
                     }
-                    // v3 is enough: `set_window_geometry`, the positioner and
-                    // the popup grab are all in v1, and v3 only adds
-                    // `xdg_popup.reposition`, which nothing here uses.
+                    // v3 for `xdg_popup.reposition`, which the app menu needs
+                    // to shrink as a search filters it; `set_window_geometry`,
+                    // the positioner and the grab are all v1, so an older
+                    // compositor still gets working menus, just fixed-size
+                    // ones (see `reposition_popup`).
                     "xdg_wm_base" => {
                         state.xdg_wm_base = Some(registry.bind(name, version.min(3), qh, ()))
                     }
@@ -3571,8 +3570,15 @@ impl Dispatch<XdgPopup, ()> for State {
                 if p.popup.id() != popup.id() {
                     return;
                 }
-                // Geometry only; the xdg_surface.configure that follows is
-                // what releases the buffer.
+                // Geometry only, and deliberately so. xdg_surface.configure
+                // "marks the END of a configure sequence", and the roles
+                // "extend this event as a latched state sent as events BEFORE
+                // the xdg_surface.configure event... where the
+                // xdg_surface.configure commits the accumulated state". So
+                // this always arrives first and the surface configure that
+                // closes the sequence is what allocates and paints. Acting
+                // here instead would reallocate and commit a buffer against a
+                // configure that has not been acked yet.
                 if width > 0 && height > 0 {
                     p.panel_w = width as u32;
                     p.panel_h = height as u32;
