@@ -16,6 +16,10 @@ mod shadow_fb;
 pub mod devicetree;
 pub mod dma;
 pub mod dma_sync;
+/// The kernel hooks, doubled for the host test build -- one definition for the
+/// whole crate, because `#[no_mangle]` allows exactly one.
+#[cfg(test)]
+pub mod host_hooks;
 
 pub(super) use id_allocator::IdAllocator;
 pub(super) use irq_manager::{run_irq_handler, IrqManager};
