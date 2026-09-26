@@ -570,7 +570,7 @@ impl Syscall<'_> {
             "clock_nanosleep: clockid={}, flags={:#x}, req={:?}, rem={:?}",
             clockid, flags, req, rem
         );
-        use kernel_hal::{thread, timer};
+        use kernel_hal::timer;
         // Same rule as `nanosleep`: reject an out-of-range `timespec`
         // instead of sleeping for whatever it happens to convert to.
         let request: Duration = req.read()?.try_into_duration()?;
@@ -587,10 +587,16 @@ impl Syscall<'_> {
         )?;
         // `rem` only ever carries what a signal left over from a *relative*
         // sleep. Linux does not write it on success, and ignores it entirely
-        // when TIMER_ABSTIME is set.
-        let _ = rem;
+        // when TIMER_ABSTIME is set. The sleep itself is the interruptible
+        // one of `nanosleep`: this was a plain `sleep_until`, which no
+        // signal could cut short.
+        let rem = if flags & TIMER_ABSTIME != 0 {
+            UserOutPtr::from(0)
+        } else {
+            rem
+        };
         if let SleepPlan::Until(deadline) = plan {
-            thread::sleep_until(deadline).await;
+            crate::task::sleep_or_eintr(self.thread, deadline, rem).await?;
         }
         Ok(0)
     }
@@ -1142,6 +1148,7 @@ fn deliver_timer_signal(owner: KoID, target: Option<KoID>, signal: Signal, info:
                 if let Ok(obj) = proc.get_child(tid) {
                     if let Ok(thread) = obj.downcast_arc::<Thread>() {
                         thread.lock_linux().queue_signal(signal, Some(info));
+                        linux_object::process::wake_signal_sleeper(&thread);
                     }
                 }
             }

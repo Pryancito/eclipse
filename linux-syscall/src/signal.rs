@@ -209,6 +209,7 @@ fn deliver_direct_sigkill(
 /// busy, which is when a signal matters.
 fn queue_signal_to_thread(thread: &Arc<Thread>, signal: Signal, info: SigInfo) {
     thread.lock_linux().queue_signal(signal, Some(info));
+    linux_object::process::wake_signal_sleeper(thread);
 }
 
 /// The `siginfo_t` a process queues with `rt_sigqueueinfo(2)`,

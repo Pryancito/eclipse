@@ -73,6 +73,36 @@ fn exit_code_after_failed_exec() -> i64 {
     linux_object::process::exit_code_killed_by(linux_object::signal::Signal::SIGSEGV as u8)
 }
 
+/// What `nanosleep(2)` leaves in `rem` when a signal cuts the sleep short:
+/// the time that was still to go, so a loop that restarts the sleep on
+/// `EINTR` with `rem` picks up where it left off.
+fn nanosleep_remaining(deadline: core::time::Duration, now: core::time::Duration) -> TimeSpec {
+    TimeSpec::from_duration(deadline.saturating_sub(now))
+}
+
+/// Sleep until `deadline` or until a signal is pending (see
+/// `interruptible_sleep_until`); on `EINTR` the remaining time goes to
+/// `rem`, when the caller gave one. Shared by `nanosleep` and the relative
+/// form of `clock_nanosleep`.
+pub(crate) async fn sleep_or_eintr(
+    thread: &Arc<Thread>,
+    deadline: core::time::Duration,
+    mut rem: UserOutPtr<TimeSpec>,
+) -> LxResult<()> {
+    match linux_object::process::interruptible_sleep_until(thread, deadline).await {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            if e == LxError::EINTR {
+                rem.write_if_not_null(nanosleep_remaining(
+                    deadline,
+                    kernel_hal::timer::timer_now(),
+                ))?;
+            }
+            Err(e)
+        }
+    }
+}
+
 fn write_sigchld_info(mut infop: UserOutPtr<SigInfo>, pid: KoID, status: i32) -> SysResult {
     if infop.is_null() {
         return Ok(0);
@@ -1140,25 +1170,26 @@ impl Syscall<'_> {
     /// in the calling thread or that terminates the process.
     ///
     /// To represent a duration, see TimeSpec.
-    pub async fn sys_nanosleep(&self, req: UserInPtr<TimeSpec>) -> SysResult {
+    pub async fn sys_nanosleep(
+        &self,
+        req: UserInPtr<TimeSpec>,
+        rem: UserOutPtr<TimeSpec>,
+    ) -> SysResult {
         info!("nanosleep: deadline={:?}", req);
         // A `timespec` out of range is EINVAL, not a sleep of some other
         // length: `tv_nsec` has to be a fraction of a second and `tv_sec`
         // must not be negative.
         let duration = req.read()?.try_into_duration()?;
         let deadline = kernel_hal::timer::deadline_after(duration);
-        // Check for pending signals before blocking.
-        linux_object::process::check_signals()?;
-        if kernel_hal::timer::timer_now() >= deadline {
-            return Ok(0);
-        }
-        // Sleep efficiently until the deadline instead of spinning with
-        // yield_now(). This eliminates per-tick rescheduling noise for all
-        // sleeping tasks, which was the primary source of scheduler lag.
-        // A signal check after wakeup preserves EINTR semantics for signals
-        // that arrive while the task is dormant.
-        kernel_hal::thread::sleep_until(deadline).await;
-        linux_object::process::check_signals()?;
+        // One timer for the whole sleep, and the thread's signal-wake bit
+        // beside it: no per-tick rescheduling, and a signal that arrives
+        // while the task is dormant ends the sleep then, not at the
+        // deadline. This used to be one uninterruptible `sleep_until` with
+        // a signal check after it, and `rem` was not even an argument: a
+        // daemon in `sleep(60)` saw its SIGTERM a minute late, and a
+        // `nanosleep` loop that restarts on EINTR with `rem` restarted from
+        // whatever was in the buffer.
+        sleep_or_eintr(self.thread, deadline, rem).await?;
         Ok(0)
     }
 
@@ -2732,5 +2763,80 @@ mod failed_exec_exit_tests {
         let wifsignaled = (status & 0x7f) != 0 && (status & 0x7f) != 0x7f;
         assert!(wifsignaled, "status {:#x} says WIFEXITED", status);
         assert_eq!(status & 0x7f, 11, "WTERMSIG");
+    }
+}
+
+#[cfg(test)]
+mod nanosleep_rem_tests {
+    //! `nanosleep(2)` took no `rem` at all, and its sleep could not be cut
+    //! short by a signal: a signal that arrived in the middle was seen at
+    //! the deadline, and a loop that restarts on `EINTR` with `rem`
+    //! restarted from whatever was in the buffer.
+    extern crate std;
+
+    use super::*;
+    use core::time::Duration;
+    use linux_object::process::send_signal_to_process;
+    use linux_object::signal::{Signal as LinuxSignal, SignalAction, SignalActionFlags, Sigset};
+    use rcore_fs_ramfs::RamFS;
+    use zircon_object::task::ROOT_JOB;
+
+    // `libos` addresses are ordinary host addresses, so a local is the
+    // caller's buffer.
+    fn user_out<T>(slot: &mut T) -> UserOutPtr<T> {
+        UserOutPtr::from(slot as *mut T as usize)
+    }
+
+    #[test]
+    fn what_is_left_is_the_deadline_minus_now_and_never_negative() {
+        let rem = nanosleep_remaining(Duration::from_millis(2_750), Duration::from_millis(1_000));
+        assert_eq!((rem.sec, rem.nsec), (1, 750_000_000));
+        let rem = nanosleep_remaining(Duration::from_secs(1), Duration::from_secs(5));
+        assert_eq!((rem.sec, rem.nsec), (0, 0));
+    }
+
+    #[test]
+    fn a_signal_ends_the_sleep_and_leaves_the_rest_in_rem() {
+        let proc = Process::create_with_fixed_id_ext(
+            &ROOT_JOB,
+            43_501,
+            "sleeper",
+            LinuxProcess::new(RamFS::new(), 0),
+        )
+        .unwrap();
+        let thread = Thread::create_linux(&proc).unwrap();
+        proc.linux().set_signal_action(
+            LinuxSignal::SIGUSR1,
+            SignalAction {
+                handler: 0x1000,
+                flags: SignalActionFlags::empty(),
+                restorer: 0,
+                mask: Sigset::default(),
+            },
+        );
+        let pid = proc.id() as usize;
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            let _ = send_signal_to_process(pid, LinuxSignal::SIGUSR1);
+        });
+        let mut slot = TimeSpec { sec: 99, nsec: 99 };
+        let deadline = kernel_hal::timer::timer_now() + Duration::from_secs(3);
+        let start = std::time::Instant::now();
+        let r = async_std::task::block_on(sleep_or_eintr(&thread, deadline, user_out(&mut slot)));
+        assert_eq!(r, Err(LxError::EINTR));
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "slept past the signal"
+        );
+        assert_eq!(
+            slot.sec, 2,
+            "rem {:?} is not what was left of the 3 s",
+            slot
+        );
+        assert!(
+            slot.nsec > 500_000_000 && slot.nsec < 1_000_000_000,
+            "rem {:?}",
+            slot
+        );
     }
 }

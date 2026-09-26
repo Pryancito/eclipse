@@ -312,7 +312,7 @@ impl Syscall<'_> {
             sys::THR_SET_NAME => BsdRet::ok(0),
 
             // ---- time -------------------------------------------------------
-            sys::NANOSLEEP => BsdRet::from_result(self.sys_nanosleep(a0.into()).await),
+            sys::NANOSLEEP => BsdRet::from_result(self.sys_nanosleep(a0.into(), a1.into()).await),
             sys::CLOCK_NANOSLEEP => BsdRet::from_result(
                 self.sys_clock_nanosleep(clockid_to_linux(a0), a1, a2.into(), a3.into())
                     .await,

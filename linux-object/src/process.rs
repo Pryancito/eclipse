@@ -4302,6 +4302,17 @@ fn interrupts_syscall(handler: usize, sig: LinuxSignal) -> bool {
 pub fn check_signals() -> LxResult<()> {
     if let Some(arc) = kernel_hal::thread::get_current_thread() {
         if let Ok(thread) = arc.downcast::<Thread>() {
+            return check_signals_of(&thread);
+        }
+    }
+    Ok(())
+}
+
+/// [`check_signals`] for a named thread rather than the current one: what an
+/// interruptible sleep asks about the thread it is putting to sleep.
+pub fn check_signals_of(thread: &Arc<Thread>) -> LxResult<()> {
+    {
+        {
             use crate::thread::ThreadExt;
             use zircon_object::task::ThreadState;
             if thread.state() == ThreadState::Dying {
@@ -4373,6 +4384,63 @@ pub fn check_signals() -> LxResult<()> {
         }
     }
     Ok(())
+}
+
+/// The zircon bit on a Linux THREAD object that says "a signal was just
+/// queued to you": what [`interruptible_sleep_until`] parks on. Set by every
+/// path that makes a signal pending on a thread ([`wake_signal_sleeper`]).
+pub const SIGNAL_WAKE: Signal = Signal::USER_SIGNAL_0;
+
+/// The zircon bit the sleep's own deadline timer sets on the thread.
+const SLEEP_DEADLINE: Signal = Signal::USER_SIGNAL_2;
+
+/// Tell `thread` a signal was queued to it, so a sleep it is in ends now.
+pub fn wake_signal_sleeper(thread: &Arc<Thread>) {
+    thread.signal_set(SIGNAL_WAKE);
+}
+
+/// Sleep until `deadline`, or until a signal that would interrupt a syscall
+/// is pending on `thread`, whichever comes first: `TASK_INTERRUPTIBLE`, the
+/// sleep of `nanosleep(2)`, `clock_nanosleep(2)` and `pause(2)`. `Ok` at the
+/// deadline; `EINTR` with the signal still pending otherwise.
+///
+/// `nanosleep` used to be one uninterruptible `sleep_until(deadline)` with a
+/// signal check after it: a daemon in `sleep(60)` took up to a minute to see
+/// the `SIGTERM` its handler was waiting for, and `alarm(1)` did nothing to a
+/// `sleep(10)` until the ten seconds were up.
+///
+/// The bit is cleared BEFORE the pending set is looked at, so a signal that
+/// arrives after the look sets it again and the wait returns at once; the
+/// deadline is a timer that sets a second bit, and a stale one from an
+/// earlier sleep only costs a spurious pass through the loop.
+pub async fn interruptible_sleep_until(
+    thread: &Arc<Thread>,
+    deadline: core::time::Duration,
+) -> LxResult<()> {
+    let object: Arc<dyn KernelObject> = thread.clone();
+    let mut armed = false;
+    loop {
+        object.signal_clear(SIGNAL_WAKE | SLEEP_DEADLINE);
+        check_signals_of(thread)?;
+        if kernel_hal::timer::timer_now() >= deadline {
+            return Ok(());
+        }
+        if !armed {
+            armed = true;
+            // Weak: the timer must not keep a dead thread's object alive
+            // for the length of a long sleep.
+            let weak = Arc::downgrade(thread);
+            kernel_hal::timer::timer_set(
+                deadline,
+                Box::new(move |_now| {
+                    if let Some(thread) = weak.upgrade() {
+                        thread.signal_set(SLEEP_DEADLINE);
+                    }
+                }),
+            );
+        }
+        object.wait_signal(SIGNAL_WAKE | SLEEP_DEADLINE).await;
+    }
 }
 
 /// Send a signal to a process by its KoID.
@@ -4619,6 +4687,7 @@ pub fn send_signal_to_process_with_info(
                         false
                     };
                     if delivered {
+                        wake_signal_sleeper(&thread);
                         // Wake waitpid(-1): PID 1 blocks on this zircon bit.
                         process.signal_set(Signal::SIGCHLD);
                         wake_for_job_control(&process, signal);
@@ -4637,6 +4706,7 @@ pub fn send_signal_to_process_with_info(
         // blocks SIGINT for its signalfd never saw Ctrl-C.
         if let Some(thread) = first {
             thread.lock_linux().queue_signal(signal, info);
+            wake_signal_sleeper(&thread);
         }
         // Pulse even when every thread had the Linux signal blocked: waitpid
         // still needs to return so the waiter can notice the pending set.
@@ -9220,5 +9290,125 @@ mod sigchld_tests {
         let (pid, status, _) =
             async_std::task::block_on(wait_child_any(&parent, true, true)).unwrap();
         assert_eq!((pid, status), (child.id(), wait_status_exited(5)));
+    }
+}
+
+#[cfg(test)]
+mod interruptible_sleep_tests {
+    //! `nanosleep` slept the whole way and looked for a signal only when it
+    //! woke: a handler installed for `SIGTERM` waited out the entire
+    //! `sleep(60)`, and `alarm(1)` never cut a `sleep(10)` short.
+    extern crate std;
+
+    use super::*;
+    use crate::signal::{SignalAction, SignalActionFlags, SIG_IGN};
+    use crate::thread::ThreadExt;
+    use core::time::Duration;
+    use rcore_fs_ramfs::RamFS;
+
+    fn a_sleeper(pid: KoID) -> (Arc<Process>, Arc<Thread>) {
+        let proc = Process::create_with_fixed_id_ext(
+            &ROOT_JOB,
+            pid,
+            "sleeper",
+            LinuxProcess::new(RamFS::new(), 0),
+        )
+        .unwrap();
+        let thread = Thread::create_linux(&proc).unwrap();
+        (proc, thread)
+    }
+
+    fn usr1_action(proc: &Arc<Process>, handler: usize) {
+        proc.linux().set_signal_action(
+            LinuxSignal::SIGUSR1,
+            SignalAction {
+                handler,
+                flags: SignalActionFlags::empty(),
+                restorer: 0,
+                mask: Sigset::default(),
+            },
+        );
+    }
+
+    /// SIGUSR1 at `pid`, from another host thread, `after` from now.
+    fn usr1_later(pid: KoID, after: Duration) {
+        std::thread::spawn(move || {
+            std::thread::sleep(after);
+            let _ = send_signal_to_process(pid as usize, LinuxSignal::SIGUSR1);
+        });
+    }
+
+    fn sleep_for(thread: &Arc<Thread>, length: Duration) -> (LxResult<()>, Duration) {
+        let start = std::time::Instant::now();
+        let deadline = kernel_hal::timer::timer_now() + length;
+        let r = async_std::task::block_on(interruptible_sleep_until(thread, deadline));
+        (r, start.elapsed())
+    }
+
+    #[test]
+    fn a_caught_signal_ends_the_sleep_at_once_with_eintr() {
+        let (proc, thread) = a_sleeper(43_401);
+        usr1_action(&proc, 0x1000);
+        usr1_later(proc.id(), Duration::from_millis(50));
+        let (r, took) = sleep_for(&thread, Duration::from_secs(3));
+        assert_eq!(r, Err(LxError::EINTR));
+        assert!(
+            took < Duration::from_secs(1),
+            "slept {:?} past the signal",
+            took
+        );
+        assert!(
+            thread.lock_linux().signals.contains(LinuxSignal::SIGUSR1),
+            "the signal that woke the sleep must still be pending for delivery"
+        );
+    }
+
+    #[test]
+    fn a_signal_already_pending_never_starts_the_sleep() {
+        let (proc, thread) = a_sleeper(43_402);
+        usr1_action(&proc, 0x1000);
+        send_signal_to_process(proc.id() as usize, LinuxSignal::SIGUSR1).unwrap();
+        let (r, took) = sleep_for(&thread, Duration::from_secs(3));
+        assert_eq!(r, Err(LxError::EINTR));
+        assert!(took < Duration::from_millis(500), "slept {:?}", took);
+    }
+
+    #[test]
+    fn with_no_signal_the_sleep_lasts_until_its_deadline() {
+        let (_proc, thread) = a_sleeper(43_403);
+        let (r, took) = sleep_for(&thread, Duration::from_millis(150));
+        assert_eq!(r, Ok(()));
+        assert!(
+            took >= Duration::from_millis(150),
+            "woke early after {:?}",
+            took
+        );
+    }
+
+    #[test]
+    fn an_ignored_or_blocked_signal_does_not_end_the_sleep() {
+        let (proc, thread) = a_sleeper(43_404);
+        usr1_action(&proc, SIG_IGN);
+        usr1_later(proc.id(), Duration::from_millis(30));
+        let (r, took) = sleep_for(&thread, Duration::from_millis(250));
+        assert_eq!(r, Ok(()), "an ignored signal interrupted the sleep");
+        assert!(
+            took >= Duration::from_millis(250),
+            "woke early after {:?}",
+            took
+        );
+
+        usr1_action(&proc, 0x1000);
+        thread
+            .lock_linux()
+            .set_signal_mask(Sigset::new(1 << (LinuxSignal::SIGUSR1 as u64 - 1)));
+        usr1_later(proc.id(), Duration::from_millis(30));
+        let (r, took) = sleep_for(&thread, Duration::from_millis(250));
+        assert_eq!(r, Ok(()), "a blocked signal interrupted the sleep");
+        assert!(
+            took >= Duration::from_millis(250),
+            "woke early after {:?}",
+            took
+        );
     }
 }

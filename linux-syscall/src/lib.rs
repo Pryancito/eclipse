@@ -517,7 +517,7 @@ impl Syscall<'_> {
             Sys::PIDFD_GETFD => self.sys_pidfd_getfd(a0.into(), a1 as i32, a2 as u32),
 
             // time
-            Sys::NANOSLEEP => self.sys_nanosleep(a0.into()).await,
+            Sys::NANOSLEEP => self.sys_nanosleep(a0.into(), a1.into()).await,
             Sys::CLOCK_NANOSLEEP => self.sys_clock_nanosleep(a0, a1, a2.into(), a3.into()).await,
             Sys::SETITIMER => self.sys_setitimer(a0, a1.into(), a2.into()),
             // `alarm` only exists in the x86_64 syscall table; the generic ABI
