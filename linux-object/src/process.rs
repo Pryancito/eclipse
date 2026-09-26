@@ -242,16 +242,20 @@ impl ProcessExt for Process {
                         // Take the file table out and drop it AFTER the lock is
                         // released — file teardown can re-enter this process's
                         // accessors (see close_file).
-                        let dropped_files = {
+                        // The shared-memory table goes the same way: its
+                        // drop is the detach of every attachment, which
+                        // locks each segment, and `fork` locks the segments
+                        // under this process's lock.
+                        let dropped = {
                             let mut inner = lp.inner.lock();
                             let files = core::mem::take(&mut inner.files);
                             inner.cloexec_fds.clear();
                             inner.futexes.clear();
                             inner.semaphores = Default::default();
-                            inner.shm_identifiers = Default::default();
-                            files
+                            let shm = core::mem::take(&mut inner.shm_identifiers);
+                            (files, shm)
                         };
-                        drop(dropped_files);
+                        drop(dropped);
                     }
                 }
                 return true;
@@ -517,16 +521,20 @@ impl ProcessExt for Process {
                         // Drop the file table AFTER releasing the lock — file
                         // teardown can re-enter process accessors (see
                         // close_file).
-                        let dropped_files = {
+                        // The shared-memory table goes the same way: its
+                        // drop is the detach of every attachment, which
+                        // locks each segment, and `fork` locks the segments
+                        // under this process's lock.
+                        let dropped = {
                             let mut inner = lp.inner.lock();
                             let files = core::mem::take(&mut inner.files);
                             inner.cloexec_fds.clear();
                             inner.futexes.clear();
                             inner.semaphores = Default::default();
-                            inner.shm_identifiers = Default::default();
-                            files
+                            let shm = core::mem::take(&mut inner.shm_identifiers);
+                            (files, shm)
                         };
-                        drop(dropped_files);
+                        drop(dropped);
                     }
                     if let Some(reaper) = reaper_for(&parent) {
                         if let Some(reaper_lp) = reaper.try_linux() {
@@ -2746,7 +2754,10 @@ impl LinuxProcess {
     /// [`Self::reset_signal_actions_for_exec`] and, per thread,
     /// [`LinuxThread::reset_for_exec`](crate::thread::LinuxThread::reset_for_exec).
     pub fn reset_for_exec(&self, privileged: bool) {
-        self.inner.lock().reset_for_exec(privileged)
+        // The old attachments come out under the lock and are dropped after
+        // it: dropping them locks each segment (see `ShmProc`).
+        let old_attachments = self.inner.lock().reset_for_exec(privileged);
+        drop(old_attachments);
     }
 
     /// Set supplementary groups.
@@ -3220,6 +3231,20 @@ impl LinuxProcess {
     pub fn shm_set(&self, id: usize, shm_id: ShmIdentifier) {
         self.inner.lock().shm_identifiers.set(id, shm_id)
     }
+
+    /// Record an attachment of segment `id` at `addr`: what `shmat` mapped.
+    pub fn shm_attach(&self, id: usize, shared_guard: Arc<Mutex<ShmGuard>>, addr: usize) {
+        self.inner
+            .lock()
+            .shm_identifiers
+            .attach(id, shared_guard, addr)
+    }
+
+    /// Forget the attachment at `addr`, and say what was there; `None` when
+    /// nothing was, which `shmdt` answers with `EINVAL`.
+    pub fn shm_detach(&self, addr: usize) -> Option<ShmIdentifier> {
+        self.inner.lock().shm_identifiers.detach(addr)
+    }
 }
 
 impl LinuxProcessInner {
@@ -3390,7 +3415,11 @@ impl LinuxProcessInner {
 
     /// What `execve` must make the process forget, once the old address space
     /// is gone. `privileged` is `bprm->secureexec`.
-    fn reset_for_exec(&mut self, privileged: bool) {
+    ///
+    /// Returns the shared-memory table the old image had, for the caller to
+    /// drop once the process lock is released: its drop accounts a detach on
+    /// every segment it had attached, and that locks each segment.
+    fn reset_for_exec(&mut self, privileged: bool) -> ShmProc {
         // Every System V segment this process had attached was mapped in the
         // address space `execve` just cleared; Linux unmaps them with the
         // rest of the old mm and each `shm_close` accounts its detach. Kept,
@@ -3398,9 +3427,8 @@ impl LinuxProcessInner {
         // NEW image, and `shmdt` trusts them: it looks the address up in this
         // very map and unmaps that many bytes there (`sys_shmdt`), so a
         // detach of a segment the process no longer has punches a hole in the
-        // new program. The segment's attach count never drops either, so an
-        // `IPC_RMID` on it frees nothing.
-        self.shm_identifiers = Default::default();
+        // new program. The detach itself is the table's drop.
+        let old_attachments = core::mem::take(&mut self.shm_identifiers);
 
         // `begin_new_exec()`: `me->flags &= ~PF_FORKNOEXEC`. From here on the
         // process runs an image of its own choosing, and a `setpgid` from the
@@ -3424,6 +3452,7 @@ impl LinuxProcessInner {
         // interval timers, which setitimer(2) preserves across an exec.
         // `brk`/`mapped_brk`, `environ`, `cmdline`, `execute_path` and `abi`
         // are all overwritten by the caller from the new image.
+        old_attachments
     }
 
     fn forked_child(&self, pgid: KoID, sid: KoID) -> Self {
@@ -3473,7 +3502,7 @@ impl LinuxProcessInner {
             // shmat(2): the attachments come along with the copied address
             // space, so the child must be able to `shmdt` them. Without the
             // record it cannot, and the mapping stays for the child's life.
-            shm_identifiers: self.shm_identifiers.clone(),
+            shm_identifiers: self.shm_identifiers.inherited(),
 
             // --- deliberately fresh -----------------------------------------
             // A child has no children of its own, and no accumulated times
@@ -5075,6 +5104,34 @@ mod fork_inheritance_tests {
     }
 
     #[test]
+    fn the_fork_counts_the_child_as_one_more_attachment() {
+        // `shm_open` on the copied mapping: the segment's `shm_nattch` goes
+        // up by one for the child, as `ipcs -m` shows on Linux, and comes
+        // back down when the child dies. It used to move only on an explicit
+        // `shmat`/`shmdt`, so a forked child was invisible to the count and
+        // a parent that died with the segment attached left it one too high
+        // for ever.
+        use crate::ipc::ShmGuard;
+        use zircon_object::vm::VmObject;
+        let mut parent = a_configured_parent();
+        let guard = Arc::new(kernel_hal::sync::Mutex::new(ShmGuard {
+            shared_guard: VmObject::new_paged(1),
+            shmid_ds: kernel_hal::sync::Mutex::new(Default::default()),
+        }));
+        guard.lock().attach(1);
+        parent.shm_identifiers.attach(9, guard.clone(), 0x7f00_0000);
+        let nattch = || guard.lock().shmid_ds.lock().nattch;
+        assert_eq!(nattch(), 1);
+
+        let child = fork_of(&parent);
+        assert_eq!(nattch(), 2, "the child holds the mapping too");
+        drop(child);
+        assert_eq!(nattch(), 1, "the child's death is a detach");
+        drop(parent);
+        assert_eq!(nattch(), 0, "and so is the parent's");
+    }
+
+    #[test]
     fn the_kernel_side_futex_objects_are_not_inherited() {
         // They are keyed by address in the parent's address space and hold
         // its waiters. The child's memory is a copy: same addresses,
@@ -5143,6 +5200,26 @@ mod exec_reset_tests {
         inner.reset_for_exec(false);
         assert_eq!(inner.shm_identifiers.get_id(0x7f00_0000), None);
         assert!(inner.shm_identifiers.get(9).is_none());
+    }
+
+    #[test]
+    fn an_exec_detaches_the_segments_on_the_segment_side_too() {
+        // Linux unmaps the old mm's segments with `shm_close` on each, so
+        // `shm_nattch` drops. Here the record was cleared and the count
+        // stayed: a program that exec'd with a segment attached counted as
+        // its user for ever.
+        let mut inner = a_process_about_to_exec();
+        let guard = inner.shm_identifiers.get(9).unwrap().guard;
+        guard.lock().attach(1);
+        assert_eq!(guard.lock().shmid_ds.lock().nattch, 1);
+        let old = inner.reset_for_exec(false);
+        assert_eq!(
+            guard.lock().shmid_ds.lock().nattch,
+            1,
+            "the detach happens when the old table is dropped, outside the lock"
+        );
+        drop(old);
+        assert_eq!(guard.lock().shmid_ds.lock().nattch, 0);
     }
 
     /// `begin_new_exec`: `me->flags &= ~PF_FORKNOEXEC`. The exec is what

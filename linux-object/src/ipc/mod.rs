@@ -21,11 +21,34 @@ pub struct SemProc {
     undos: BTreeMap<(SemId, SemNum), SemOp>,
 }
 
-/// Shared_memory table in a process
-#[derive(Default, Clone)]
+/// A process's own view of the System V shared memory it is using: the
+/// segments it knows by id, and where each `shmat` put one.
+///
+/// An attachment is a mapping in the address space, so it lives and dies
+/// with the address space: `exit` and `execve` tear every one of them down,
+/// and `fork` copies every one of them into the child. Linux accounts each
+/// of those on the segment (`shm_close` and `shm_open` in ipc/shm.c move
+/// `shm_nattch`), and this table is what does it here: dropping it is the
+/// detach of everything attached, and [`inherited`](Self::inherited) is the
+/// attach of the copy. The count used to move only on an explicit `shmat`
+/// or `shmdt`, so a process that died or exec'd with a segment attached
+/// left `shm_nattch` one too high for ever -- and `ipcs -m`, or a program
+/// that reads `shm_nattch` to decide whether a segment is still in use
+/// (PostgreSQL's postmaster does exactly that to tell a stale segment from
+/// a live one), saw phantom users.
+///
+/// One entry per attachment, not per segment: a segment may be attached
+/// more than once (shmat(2) allows it, and a program mapping the same
+/// buffer at two addresses does it), and a table keyed by id kept only the
+/// last address, so `shmdt` of the first found nothing, unmapped nothing
+/// and answered 0.
+#[derive(Default)]
 pub struct ShmProc {
-    /// Shared_memory identifier sets
-    shm_identifiers: BTreeMap<ShmId, ShmIdentifier>,
+    /// The segments this process has named through `shmget` or `shmat`,
+    /// attached or not.
+    segments: BTreeMap<ShmId, Arc<Mutex<ShmGuard>>>,
+    /// Where each attachment is mapped, by the address `shmat` returned.
+    attached: BTreeMap<usize, ShmId>,
 }
 
 bitflags! {
@@ -237,39 +260,236 @@ impl ShmProc {
     /// Record that this process is using the segment `id` names.
     ///
     /// The id comes from [`shared_mem::shm_register`] and is the same number
-    /// in every process; this map is only what THIS process has attached, so
-    /// `shmdt(addr)` can find its way back to the segment.
+    /// in every process; this map is only what THIS process knows, so
+    /// `shmctl` can still find a segment it created after the id was retired.
     pub fn add(&mut self, id: ShmId, shared_guard: Arc<Mutex<ShmGuard>>) {
-        let shm_identifier = ShmIdentifier {
-            addr: 0,
-            guard: shared_guard,
-        };
-        self.shm_identifiers.entry(id).or_insert(shm_identifier);
+        self.segments.entry(id).or_insert(shared_guard);
     }
 
-    /// Get an semaphore set by `id`
+    /// The segment `id` names for this process, with the address of one of
+    /// its attachments (0 when it is not attached).
     pub fn get(&self, id: ShmId) -> Option<ShmIdentifier> {
-        self.shm_identifiers.get(&id).cloned()
+        let guard = self.segments.get(&id)?.clone();
+        let addr = self
+            .attached
+            .iter()
+            .find(|(_, &i)| i == id)
+            .map(|(&addr, _)| addr)
+            .unwrap_or(0);
+        Some(ShmIdentifier { addr, guard })
     }
 
-    /// Used to set Virtual Addr
+    /// Record an attachment of `id` at `addr`, what `shmat` just mapped.
+    ///
+    /// The accounting on the segment (`nattch`, `atime`, `lpid`) is the
+    /// caller's, through [`ShmGuard::attach`]; this only remembers where.
+    pub fn attach(&mut self, id: ShmId, shared_guard: Arc<Mutex<ShmGuard>>, addr: usize) {
+        self.segments.insert(id, shared_guard);
+        self.attached.insert(addr, id);
+    }
+
+    /// Record a segment and, when `shm_id.addr` is not 0, an attachment of it
+    /// there. The older spelling of [`attach`](Self::attach).
     pub fn set(&mut self, id: ShmId, shm_id: ShmIdentifier) {
-        self.shm_identifiers.insert(id, shm_id);
+        if shm_id.addr != 0 {
+            self.attach(id, shm_id.guard, shm_id.addr);
+        } else {
+            self.segments.insert(id, shm_id.guard);
+        }
     }
 
-    /// get id from virtaddr
+    /// The segment attached at `addr`, if any: what `shmdt(addr)` asks.
     pub fn get_id(&self, addr: usize) -> Option<ShmId> {
-        for (key, value) in &self.shm_identifiers {
-            if value.addr == addr {
-                return Some(*key);
+        self.attached.get(&addr).copied()
+    }
+
+    /// Forget the attachment at `addr` -- that one only: the same segment
+    /// attached elsewhere stays attached there, and the segment itself stays
+    /// known. Returns what was attached, or `None` when nothing was, which
+    /// shmdt(2) answers with `EINVAL`.
+    ///
+    /// The accounting on the segment is the caller's, through
+    /// [`ShmGuard::detach`], because it carries the pid.
+    pub fn detach(&mut self, addr: usize) -> Option<ShmIdentifier> {
+        let id = self.attached.remove(&addr)?;
+        let guard = self.segments.get(&id)?.clone();
+        Some(ShmIdentifier { addr, guard })
+    }
+
+    /// Forget the segment `id` and every attachment of it, without
+    /// accounting anything on the segment.
+    pub fn pop(&mut self, id: ShmId) {
+        self.segments.remove(&id);
+        self.attached.retain(|_, i| *i != id);
+    }
+
+    /// How many attachments this process holds.
+    pub fn attachment_count(&self) -> usize {
+        self.attached.len()
+    }
+
+    /// The table a `fork` gives the child: the same segments at the same
+    /// addresses, because the address space was copied with them mapped,
+    /// and each attachment counted once more on its segment (`shm_open`).
+    pub fn inherited(&self) -> Self {
+        for id in self.attached.values() {
+            if let Some(guard) = self.segments.get(id) {
+                guard.lock().account_attach();
             }
         }
-        None
+        ShmProc {
+            segments: self.segments.clone(),
+            attached: self.attached.clone(),
+        }
+    }
+}
+
+impl Drop for ShmProc {
+    /// The address space that held these attachments is gone (`exit`,
+    /// `execve`): each of them is a detach on its segment (`shm_close`).
+    /// A segment only known, never attached, is not.
+    fn drop(&mut self) {
+        for id in self.attached.values() {
+            if let Some(guard) = self.segments.get(id) {
+                guard.lock().account_detach();
+            }
+        }
+    }
+}
+
+/// System V shared memory attachments are mappings, and Linux counts them
+/// as the address space does: `shm_nattch` goes up on `shmat` and on the
+/// copy a `fork` makes, and down on `shmdt`, on `exit` and on `execve`.
+/// Here it moved only on the two explicit calls, so every process that died
+/// or exec'd while attached left the count one too high for ever. And a
+/// segment attached twice was recorded once, under its id, at the last
+/// address only.
+#[cfg(test)]
+mod shm_proc_tests {
+    use super::*;
+    use zircon_object::vm::VmObject;
+
+    extern crate std;
+
+    const PID: u32 = 42;
+    const ID: ShmId = 9;
+    const HERE: usize = 0x7f00_0000;
+    const THERE: usize = 0x7f10_0000;
+
+    fn a_segment() -> Arc<Mutex<ShmGuard>> {
+        Arc::new(Mutex::new(ShmGuard {
+            shared_guard: VmObject::new_paged(1),
+            shmid_ds: Mutex::new(Default::default()),
+        }))
     }
 
-    /// Pop Shared Area
-    pub fn pop(&mut self, id: ShmId) {
-        self.shm_identifiers.remove(&id);
+    fn nattch(guard: &Arc<Mutex<ShmGuard>>) -> usize {
+        guard.lock().shmid_ds.lock().nattch
+    }
+
+    /// `shmat`, as `sys_shmat` does it: account on the segment, record in
+    /// the process.
+    fn shmat(proc: &mut ShmProc, guard: &Arc<Mutex<ShmGuard>>, addr: usize) {
+        guard.lock().attach(PID);
+        proc.attach(ID, guard.clone(), addr);
+    }
+
+    /// The process dies with the segment attached: the segment must see the
+    /// detach, or it counts a user that no longer exists.
+    #[test]
+    fn dropping_the_table_detaches_everything_it_had_attached() {
+        let guard = a_segment();
+        let mut proc = ShmProc::default();
+        shmat(&mut proc, &guard, HERE);
+        shmat(&mut proc, &guard, THERE);
+        assert_eq!(nattch(&guard), 2);
+        drop(proc);
+        assert_eq!(nattch(&guard), 0, "exit must detach every attachment");
+        assert_ne!(
+            guard.lock().shmid_ds.lock().dtime,
+            0,
+            "and it is a detach, with its time"
+        );
+    }
+
+    /// A segment the process only named (`shmget`) is not attached, so its
+    /// death detaches nothing from it.
+    #[test]
+    fn a_segment_only_known_is_not_detached_at_exit() {
+        let guard = a_segment();
+        let mut proc = ShmProc::default();
+        proc.add(ID, guard.clone());
+        // Somebody else is attached; that is who the count belongs to.
+        guard.lock().attach(PID + 1);
+        drop(proc);
+        assert_eq!(nattch(&guard), 1, "a known segment is not an attached one");
+    }
+
+    /// `fork` copies the mapping, so the child is one more user of the
+    /// segment, and its own death is one fewer.
+    #[test]
+    fn a_fork_attaches_the_child_and_its_exit_detaches_it() {
+        let guard = a_segment();
+        let mut parent = ShmProc::default();
+        shmat(&mut parent, &guard, HERE);
+        let child = parent.inherited();
+        assert_eq!(nattch(&guard), 2, "the child holds the mapping too");
+        assert_eq!(child.get_id(HERE), Some(ID));
+        drop(child);
+        assert_eq!(nattch(&guard), 1, "the child's exit is a detach");
+        drop(parent);
+        assert_eq!(nattch(&guard), 0);
+    }
+
+    /// shmat(2) allows attaching the same segment more than once. Recorded
+    /// once, under the id, `shmdt` of the first address found nothing and
+    /// unmapped nothing.
+    #[test]
+    fn a_segment_attached_twice_is_recorded_at_both_addresses() {
+        let guard = a_segment();
+        let mut proc = ShmProc::default();
+        shmat(&mut proc, &guard, HERE);
+        shmat(&mut proc, &guard, THERE);
+        assert_eq!(proc.get_id(HERE), Some(ID));
+        assert_eq!(proc.get_id(THERE), Some(ID));
+        assert_eq!(proc.attachment_count(), 2);
+
+        // Detaching one leaves the other attached, and the segment known.
+        let gone = proc.detach(HERE).expect("HERE was attached");
+        assert_eq!(gone.addr, HERE);
+        assert!(Arc::ptr_eq(&gone.guard, &guard));
+        assert_eq!(proc.get_id(HERE), None);
+        assert_eq!(proc.get_id(THERE), Some(ID), "the other attachment stays");
+        assert!(proc.get(ID).is_some(), "and the segment is still known");
+        assert_eq!(proc.attachment_count(), 1);
+    }
+
+    /// `shmdt(addr)` of an address nothing is attached at is `EINVAL`: the
+    /// table has nothing to give back.
+    #[test]
+    fn detaching_an_address_nothing_is_attached_at_finds_nothing() {
+        let guard = a_segment();
+        let mut proc = ShmProc::default();
+        shmat(&mut proc, &guard, HERE);
+        assert!(proc.detach(THERE).is_none());
+        assert!(proc.detach(HERE + 0x1000).is_none(), "not even inside it");
+        assert_eq!(proc.attachment_count(), 1, "and nothing was forgotten");
+    }
+
+    /// The explicit `shmdt` accounts through the caller (it carries the
+    /// pid); once detached, the table's own drop must not count it again.
+    #[test]
+    fn an_explicit_detach_is_not_counted_twice_at_exit() {
+        let guard = a_segment();
+        let mut proc = ShmProc::default();
+        shmat(&mut proc, &guard, HERE);
+        proc.detach(HERE).expect("attached");
+        guard.lock().detach(PID);
+        assert_eq!(nattch(&guard), 0);
+        // Somebody else attaches; our exit must leave them alone.
+        guard.lock().attach(PID + 1);
+        drop(proc);
+        assert_eq!(nattch(&guard), 1);
     }
 }
 

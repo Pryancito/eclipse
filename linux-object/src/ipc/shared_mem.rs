@@ -228,23 +228,37 @@ impl ShmIdentifier {
 }
 
 impl ShmGuard {
-    /// set last attach time
+    /// `shmat(2)` by `pid`: one more attachment, and the last pid to touch
+    /// the segment.
     pub fn attach(&self, pid: u32) {
+        self.account_attach();
+        self.shmid_ds.lock().lpid = pid;
+    }
+
+    /// `shmdt(2)` by `pid`: one attachment fewer, and the last pid to touch
+    /// the segment.
+    pub fn detach(&self, pid: u32) {
+        self.account_detach();
+        self.shmid_ds.lock().lpid = pid;
+    }
+
+    /// One more attachment, with its time: what `shmat` and the copy a
+    /// `fork` makes have in common (`shm_open` in ipc/shm.c).
+    pub fn account_attach(&self) {
         let mut ds = self.shmid_ds.lock();
         ds.atime = TimeSpec::now().sec;
         ds.nattch += 1;
-        ds.lpid = pid;
     }
 
-    /// set last detach time
-    pub fn detach(&self, pid: u32) {
+    /// One attachment fewer, with its time: what `shmdt`, `exit` and
+    /// `execve` have in common (`shm_close`).
+    pub fn account_detach(&self) {
         let mut ds = self.shmid_ds.lock();
         ds.dtime = TimeSpec::now().sec;
         // Guard against underflow if detach is called without a matching
         // attach, which would otherwise wrap `nattch` to a huge value and
         // prevent the segment from ever being cleaned up.
         ds.nattch = ds.nattch.saturating_sub(1);
-        ds.lpid = pid;
     }
 
     /// set last change time

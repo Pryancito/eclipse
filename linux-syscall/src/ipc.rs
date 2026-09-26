@@ -568,15 +568,9 @@ impl Syscall<'_> {
                 return Err(LxError::EACCES);
             }
         }
-        let mut shm_identifier = self
-            .linux_process()
-            .shm_get(id)
-            .unwrap_or(ShmIdentifier { addr: 0, guard });
-
         let proc = self.zircon_process();
         let vmar = proc.vmar();
-        let shm_guard = shm_identifier.guard.lock();
-        let vmo = shm_guard.shared_guard.clone();
+        let vmo = guard.lock().shared_guard.clone();
         info!(
             "shmat: id: {}, place = {:?}, size = {}, flags = {:?}",
             id,
@@ -592,10 +586,14 @@ impl Syscall<'_> {
             ShmatPlace::At(want) => Some(want - vmar.addr()),
         };
         let addr = vmar.map(vmar_offset, vmo.clone(), 0, vmo.len(), flags)?;
-        shm_identifier.addr = addr;
-        self.linux_process().shm_set(id, shm_identifier.clone());
-
-        shm_guard.attach(proc.id() as u32);
+        // Account on the segment, then record where in the process -- one
+        // record per attachment, so a segment attached twice can be
+        // detached twice (the old table kept one address per id and lost
+        // the first). Neither lock is held while taking the other: the
+        // process lock is taken with segments locked under it by `fork` and
+        // by the table's drop at `exit`.
+        guard.lock().attach(proc.id() as u32);
+        self.linux_process().shm_attach(id, guard, addr);
         Ok(addr)
     }
 
@@ -614,31 +612,30 @@ impl Syscall<'_> {
             id, addr, shmflg
         );
         let proc = self.linux_process();
-        let opt_id = proc.shm_get_id(addr);
-        if let Some(id) = opt_id {
-            let shm_identifier = proc.shm_get(id).ok_or(LxError::EINVAL)?;
-            // shmat() mapped the shared VMO into this address space; shmdt() must
-            // remove that mapping. Previously it only dropped the tracking entry
-            // and decremented nattch, leaving the segment MAPPED after detach:
-            // the region stayed writable, its shared frames stayed pinned, and a
-            // later MAP_FIXED mmap or re-attach at the same VA collided with the
-            // stale mapping in the address space's VMAR. Under GL=1, Mesa's DRI
-            // buffers churn shmat/shmdt hard and concurrently, so that stale-
-            // mapping / VMAR inconsistency is exactly the kind of state a
-            // parallel munmap/teardown then trips over. Unmap first, best-effort
-            // (the addr came from our own attach record), then drop the tracking
-            // entry and account the detach.
-            let size = shm_identifier.guard.lock().shared_guard.len();
-            let _ = self
-                .zircon_process()
-                .vmar()
-                .unmap(shm_identifier.addr, size);
-            proc.shm_pop(id);
-            shm_identifier
-                .guard
-                .lock()
-                .detach(self.zircon_process().id() as u32);
-        }
+        // shmdt(2): an address nothing is attached at is EINVAL. It used to
+        // answer 0, which also covered the second attachment of a segment
+        // the old table had forgotten.
+        let shm_identifier = proc.shm_detach(addr).ok_or(LxError::EINVAL)?;
+        // shmat() mapped the shared VMO into this address space; shmdt() must
+        // remove that mapping. Previously it only dropped the tracking entry
+        // and decremented nattch, leaving the segment MAPPED after detach:
+        // the region stayed writable, its shared frames stayed pinned, and a
+        // later MAP_FIXED mmap or re-attach at the same VA collided with the
+        // stale mapping in the address space's VMAR. Under GL=1, Mesa's DRI
+        // buffers churn shmat/shmdt hard and concurrently, so that stale-
+        // mapping / VMAR inconsistency is exactly the kind of state a
+        // parallel munmap/teardown then trips over. Unmap first, best-effort
+        // (the addr came from our own attach record), then account the
+        // detach.
+        let size = shm_identifier.guard.lock().shared_guard.len();
+        let _ = self
+            .zircon_process()
+            .vmar()
+            .unmap(shm_identifier.addr, size);
+        shm_identifier
+            .guard
+            .lock()
+            .detach(self.zircon_process().id() as u32);
         Ok(0)
     }
 
