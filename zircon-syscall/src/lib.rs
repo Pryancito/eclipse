@@ -353,10 +353,23 @@ impl Syscall<'_> {
                 }),
             Sys::FUTEX_WAKE_HANDLE_CLOSE_THREAD_EXIT => {
                 // atomic_store_explicit(value_ptr, new_value, memory_order_release)
-                UserInPtr::<AtomicI32>::from(a0)
-                    .as_ref()
-                    .store(a2 as i32, Ordering::Release);
-                let _ = self.sys_futex_wake(a0.into(), a1 as _);
+                // The store used to go through `as_ref()` with no check at
+                // all: a word anywhere, the kernel's own memory included,
+                // was written as the kernel. Zircon's vDSO does this store
+                // in user mode, where a bad word faults the caller; here a
+                // bad word skips the store and the wake, and the thread
+                // still exits.
+                let value_ptr = UserInPtr::<AtomicI32>::from(a0);
+                if futex::check_futex_word(
+                    self.thread.proc(),
+                    &value_ptr,
+                    kernel_hal::MMUFlags::WRITE,
+                )
+                .is_ok()
+                {
+                    value_ptr.as_ref().store(a2 as i32, Ordering::Release);
+                    let _ = self.sys_futex_wake(a0.into(), a1 as _);
+                }
                 let _ = self.sys_handle_close(a3 as _);
                 self.sys_thread_exit()
             }

@@ -3,10 +3,15 @@ use {
     zircon_object::task::{Thread, ThreadState},
 };
 
-/// A futex word the kernel will read: non-null, aligned, and readable in the
-/// caller's own address space. `zx_futex_wake` needs only the first two, as
-/// an unallocated address is not an error there.
-fn check_futex_word(proc: &zircon_object::task::Process, word: &UserInPtr<AtomicI32>) -> ZxResult {
+/// A futex word the kernel will read (or, with `access` = WRITE, store to):
+/// non-null, aligned, and mapped that way in the caller's own address
+/// space. `zx_futex_wake` needs only the first two, as an unallocated
+/// address is not an error there.
+pub(crate) fn check_futex_word(
+    proc: &zircon_object::task::Process,
+    word: &UserInPtr<AtomicI32>,
+    access: kernel_hal::MMUFlags,
+) -> ZxResult {
     if word.is_null() || !word.as_addr().is_multiple_of(4) {
         return Err(ZxError::INVALID_ARGS);
     }
@@ -14,7 +19,7 @@ fn check_futex_word(proc: &zircon_object::task::Process, word: &UserInPtr<Atomic
         proc,
         word.as_addr(),
         core::mem::size_of::<AtomicI32>(),
-        kernel_hal::MMUFlags::READ,
+        access,
     )
 }
 
@@ -39,7 +44,7 @@ impl Syscall<'_> {
         // be the caller's own mapped memory: a null check and an alignment
         // check were all there was, and `as_ref` on any other address read
         // it as the kernel, a fault with no fixup behind it.
-        check_futex_word(proc, &value_ptr)?;
+        check_futex_word(proc, &value_ptr, kernel_hal::MMUFlags::READ)?;
         let value = value_ptr.as_ref();
         let futex = proc.get_futex(value);
         let new_owner = if new_futex_owner == INVALID_HANDLE {
@@ -74,7 +79,7 @@ impl Syscall<'_> {
         // The wake word is read (compared with `current_value`); the requeue
         // word only names a queue, but it still has to be a word: a null or
         // misaligned `requeue_ptr` went unchecked.
-        check_futex_word(proc, &value_ptr)?;
+        check_futex_word(proc, &value_ptr, kernel_hal::MMUFlags::READ)?;
         if requeue_ptr.is_null() || !requeue_ptr.as_addr().is_multiple_of(4) {
             return Err(ZxError::INVALID_ARGS);
         }

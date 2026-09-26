@@ -599,6 +599,37 @@ fn futex_words_are_validated_and_iommu_create_refuses_other_types() {
         );
         sc.sys_iommu_create(root, 0, base.into(), 1, out.into())
             .unwrap();
+
+        // The vDSO's combined `futex_wake_handle_close_thread_exit` stored
+        // `new_value` through `as_ref()` on whatever word it was given: a
+        // write to any address, as the kernel. A bad word now skips the
+        // store and the thread still exits.
+        const FUTEX_WAKE_HANDLE_CLOSE_THREAD_EXIT: u32 = 1005;
+        let mut exit_storing = |word: usize, new_value: usize| {
+            let mut f = Box::pin(sc.syscall(
+                FUTEX_WAKE_HANDLE_CLOSE_THREAD_EXIT,
+                [word, 1, new_value, INVALID_HANDLE, 0, 0, 0, 0],
+            ));
+            f.as_mut().poll(&mut Context::from_waker(Waker::noop()))
+        };
+        unsafe { (base as *mut i32).write(7) };
+        assert_eq!(
+            exit_storing(unmapped, 42),
+            Poll::Ready(0),
+            "no store, no fault"
+        );
+        assert_eq!(
+            exit_storing(base + 2, 42),
+            Poll::Ready(0),
+            "misaligned: no store"
+        );
+        assert_eq!(unsafe { (base as *const i32).read() }, 7);
+        assert_eq!(exit_storing(base, 42), Poll::Ready(0));
+        assert_eq!(
+            unsafe { (base as *const i32).read() },
+            42,
+            "a mapped word is stored"
+        );
         Box::pin(async move { drop(ct) })
     });
 }
