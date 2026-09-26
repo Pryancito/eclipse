@@ -487,6 +487,33 @@ pub fn msg_queue(id: usize) -> Option<Arc<MsgQueue>> {
     MSG_QUEUES.read().get(&id).cloned()
 }
 
+/// `ipc_get_maxidx` for the queue table: the highest INDEX in use, `None`
+/// when there is no queue. Ids are handed out from 0 and never reused, so
+/// the slot IS the id; `MSG_INFO` and `IPC_INFO` return this and `ipcs -q`
+/// walks `MSG_STAT` up to it.
+pub fn msg_max_index() -> Option<usize> {
+    MSG_QUEUES.read().keys().next_back().copied()
+}
+
+/// `msgctl(idx, MSG_STAT, ..)`: the queue in slot `idx`, with the id the
+/// call returns for it; `None` is `EINVAL`.
+pub fn msg_at_index(idx: usize) -> Option<(usize, Arc<MsgQueue>)> {
+    msg_queue(idx).map(|queue| (idx, queue))
+}
+
+/// For `MSG_INFO`: how many queues exist (`msgpool`), the bytes queued in
+/// all of them (`msgmap`) and the messages (`msgtot`).
+pub fn msg_totals() -> (usize, usize, usize) {
+    let table = MSG_QUEUES.read();
+    let (mut bytes, mut messages) = (0, 0);
+    for queue in table.values() {
+        let ds = queue.stat();
+        bytes += ds.cbytes;
+        messages += ds.qnum;
+    }
+    (table.len(), bytes, messages)
+}
+
 /// `IPC_RMID`: drop the queue from the table and wake blocked callers into
 /// `EIDRM` via the `removed` latch (their `Arc` keeps the object alive until
 /// they notice).
@@ -598,6 +625,29 @@ mod msg_control_tests {
 
     fn clear_queues() {
         MSG_QUEUES.write().clear();
+    }
+
+    /// busybox `ipcs -q`: `maxid = msgctl(0, MSG_INFO, &info)`, then
+    /// `MSG_STAT` over `0..=maxid`. Neither command existed.
+    #[test]
+    fn the_index_walk_of_ipcs_finds_every_queue() {
+        let _guard = test_lock();
+        clear_queues();
+        assert_eq!(msg_max_index(), None);
+        assert_eq!(msg_totals(), (0, 0, 0));
+        let a = msg_get(0, CREAT, OWNER, OWNER).unwrap();
+        let b = msg_get(0, CREAT, OWNER, OWNER).unwrap();
+        assert_eq!(msg_max_index(), Some(b));
+        assert_eq!(msg_at_index(a).unwrap().0, a);
+        assert_eq!(msg_at_index(b).unwrap().0, b);
+        assert!(msg_at_index(b + 1).is_none(), "one past the last slot");
+        assert_eq!(msg_totals(), (2, 0, 0));
+        assert!(msg_queue(a).unwrap().try_send(1, &[0u8; 10], OWNER).is_ok());
+        assert_eq!(msg_totals(), (2, 10, 1), "queues, bytes, messages");
+        msg_remove(a, OWNER).unwrap();
+        assert!(msg_at_index(a).is_none());
+        assert_eq!(msg_max_index(), Some(b));
+        assert_eq!(msg_totals(), (1, 0, 0));
     }
 
     /// A queue owned by `uid`, off the global table.

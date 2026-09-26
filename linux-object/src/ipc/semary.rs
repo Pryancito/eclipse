@@ -165,6 +165,28 @@ pub fn sem_lookup(id: SemId) -> Option<Arc<SemArray>> {
     SEMID2SEM.read().get(&id).cloned()
 }
 
+/// `ipc_get_maxidx` for the set table: the highest INDEX in use, `None`
+/// when there is no set. Ids are handed out from 1 and never reused, so
+/// slot `i` is id `i + 1`; `SEM_INFO` and `IPC_INFO` return this and `ipcs
+/// -s` walks `SEM_STAT` up to it.
+pub fn sem_max_index() -> Option<usize> {
+    SEMID2SEM.read().keys().next_back().map(|&id| id - 1)
+}
+
+/// `semctl(idx, 0, SEM_STAT, ..)`: the set in slot `idx`, with the id the
+/// call returns for it; `None` is `EINVAL`.
+pub fn sem_at_index(idx: usize) -> Option<(SemId, Arc<SemArray>)> {
+    let id = idx.checked_add(1)?;
+    sem_lookup(id).map(|array| (id, array))
+}
+
+/// For `SEM_INFO`: how many sets exist (`semusz`) and how many semaphores
+/// they hold between them (`semaem`).
+pub fn sem_totals() -> (usize, usize) {
+    let table = SEMID2SEM.read();
+    (table.len(), table.values().map(|a| a.len()).sum())
+}
+
 /// `semctl(id, IPC_RMID, ..)`: the id stops naming the set. A process still
 /// holding it in its own table keeps the object (its waiters wake into
 /// `EIDRM` through [`SemArray::remove`]); nobody can find it again.
@@ -700,6 +722,29 @@ mod sem_registry_tests {
 
     fn private_set() -> Arc<SemArray> {
         SemArray::get_or_create(0, 1, CREAT | 0o666, 0, 0).unwrap()
+    }
+
+    /// busybox `ipcs -s`: `maxid = semctl(0, 0, SEM_INFO, &info)`, then
+    /// `SEM_STAT` over `0..=maxid`. `SEM_INFO` did not exist, and the id was
+    /// looked up before the command was read.
+    #[test]
+    fn the_index_walk_of_ipcs_finds_every_set() {
+        let _guard = test_lock();
+        clear_ids();
+        assert_eq!(sem_max_index(), None);
+        assert_eq!(sem_totals(), (0, 0));
+        let a = sem_register(&SemArray::get_or_create(0, 2, CREAT | 0o600, 0, 0).unwrap()).unwrap();
+        let b = sem_register(&SemArray::get_or_create(0, 3, CREAT | 0o600, 0, 0).unwrap()).unwrap();
+        assert_eq!(sem_max_index(), Some(b - 1));
+        assert_eq!(sem_at_index(a - 1).unwrap().0, a);
+        assert_eq!(sem_at_index(b - 1).unwrap().0, b);
+        assert!(sem_at_index(b).is_none(), "one past the last slot");
+        assert!(sem_at_index(usize::MAX).is_none());
+        assert_eq!(sem_totals(), (2, 5), "sets, and semaphores in all");
+        sem_unregister(a);
+        assert!(sem_at_index(a - 1).is_none());
+        assert_eq!(sem_max_index(), Some(b - 1));
+        assert_eq!(sem_totals(), (1, 3));
     }
 
     #[test]
