@@ -253,6 +253,14 @@ impl Drop for SemProc {
             let Some(sem) = sem_array.get_sem(num as usize) else {
                 continue;
             };
+            // Under the set-wide lock, as `exit_sem` replays the whole undo
+            // list under `sem_lock_and_putref(sma)`. Without it the adjustment
+            // was lost the same way a `SETVAL` was: `sys_semop` plans against
+            // a snapshot and writes absolute values, so an undo applied
+            // between the two vanishes -- and a vanished undo is a semaphore
+            // held for ever by a process that no longer exists, which is the
+            // exact failure `SEM_UNDO` is for.
+            let _atomic = sem_array.semop_guard();
             sem.adjust(adj as isize);
         }
     }
