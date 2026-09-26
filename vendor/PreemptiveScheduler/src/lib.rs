@@ -23,6 +23,10 @@ cfg_if::cfg_if! {
 }
 
 extern crate alloc;
+
+/// What the three `switch.S` files take for granted; see the module docs.
+#[cfg(test)]
+mod switch_contract;
 #[macro_use]
 extern crate log;
 
