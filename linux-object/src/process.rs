@@ -24,7 +24,7 @@ use rcore_fs::vfs::{FileSystem, FileType, INode, Metadata};
 
 use zircon_object::{
     object::{KernelObject, KoID, Signal},
-    signal::Futex,
+    signal::{Futex, FutexTable},
     task::{
         Job, Process, Status, Thread, ROOT_JOB, SCHED_BATCH, SCHED_DEADLINE, SCHED_FIFO,
         SCHED_IDLE, SCHED_NORMAL, SCHED_RR,
@@ -946,7 +946,7 @@ struct LinuxProcessInner {
     /// Share Memory
     shm_identifiers: ShmProc,
     /// Futexes
-    futexes: HashMap<VirtAddr, Arc<Futex>>,
+    futexes: FutexTable,
     /// Child processes
     children: HashMap<KoID, Arc<Process>>,
     /// Exit codes and final CPU usage for children already detached (freed
@@ -1557,17 +1557,10 @@ impl LinuxProcess {
         if uaddr == 0 || !uaddr.is_multiple_of(core::mem::align_of::<AtomicI32>()) {
             return None;
         }
-        let mut inner = self.inner.lock();
-        Some(
-            inner
-                .futexes
-                .entry(uaddr)
-                .or_insert_with(|| {
-                    let value = unsafe { &*(uaddr as *const AtomicI32) };
-                    Futex::new(value)
-                })
-                .clone(),
-        )
+        Some(self.inner.lock().futexes.get_or_create(uaddr, || {
+            let value = unsafe { &*(uaddr as *const AtomicI32) };
+            Futex::new(value)
+        }))
     }
 
     /// Get lowest free fd
@@ -4823,7 +4816,7 @@ mod fork_inheritance_tests {
         // threads of the parent that are waiting on their own memory.
         static WORD: AtomicI32 = AtomicI32::new(0);
         let mut parent = a_configured_parent();
-        parent.futexes.insert(0x1000, Futex::new(&WORD));
+        parent.futexes.get_or_create(0x1000, || Futex::new(&WORD));
 
         let child = fork_of(&parent);
         assert!(child.futexes.is_empty());

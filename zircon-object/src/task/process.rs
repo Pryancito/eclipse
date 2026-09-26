@@ -14,7 +14,11 @@ use super::{Job, Task, Thread, ThreadFn};
 use crate::object::{Handle, HandleBasicInfo, HandleValue, INVALID_HANDLE};
 use crate::object::{KObjectBase, KernelObject, KoID, Rights, Signal};
 use crate::{define_count_helper, impl_kobject};
-use crate::{signal::Futex, vm::VmAddressRegion, ZxError, ZxResult};
+use crate::{
+    signal::{Futex, FutexTable},
+    vm::VmAddressRegion,
+    ZxError, ZxResult,
+};
 
 /// A callback run once per process teardown, for per-pid resources owned by
 /// crates this one cannot depend on.
@@ -197,7 +201,7 @@ struct ProcessInner {
     status: Status,
     max_handle_id: u32,
     handles: HashMap<HandleValue, (Handle, Vec<Sender<()>>)>,
-    futexes: HashMap<usize, Arc<Futex>>,
+    futexes: FutexTable,
     threads: Vec<Arc<Thread>>,
 
     // special info
@@ -665,12 +669,10 @@ impl Process {
 
     /// Get a futex from the process
     pub fn get_futex(&self, addr: &'static AtomicI32) -> Arc<Futex> {
-        let mut inner = self.inner.lock();
-        inner
+        self.inner
+            .lock()
             .futexes
-            .entry(addr as *const AtomicI32 as usize)
-            .or_insert_with(|| Futex::new(addr))
-            .clone()
+            .get_or_create(addr as *const AtomicI32 as usize, || Futex::new(addr))
     }
 
     /// Duplicate a handle with new `rights`, return the new handle value.
