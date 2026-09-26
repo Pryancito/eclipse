@@ -19,6 +19,7 @@ members = [
     # testing it needs a filesystem to mount, so it has a dev-dependency, and
     # cargo refuses to test a non-member that has one. The other two are here so
     # that `cargo fmt --all` -- the "Check format" job -- covers them too.
+    "vendor/rcore-fs",
     "vendor/rcore-fs-sfs",
     "vendor/rcore-fs-mountfs",
     "vendor/rcore-fs-ramfs",

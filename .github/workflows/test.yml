@@ -100,6 +100,13 @@ jobs:
           cargo test -p rcore-fs-mountfs --lib
           cargo test -p rcore-fs-ramfs --lib
           cargo test -p rcore-fs-devfs --lib
+          # And the crate underneath all of them: the `INode` trait, the path
+          # walk every `open(2)` goes through, and the block layer the root
+          # filesystem reads the disk with -- the LRU buffer cache included.
+          # It did have three tests, and they had never run either: `mod std`
+          # is gated on `any(test, feature = "std")` but its `libc` dependency
+          # only arrived with the feature, so the test target did not compile.
+          cargo test -p rcore-fs --lib
           # The loader -- the code around user mode: the signal frame a
           # handler returns from, the CPU-exception-to-signal table. Its
           # default features pull in `zircon`, whose `include_bytes!` of the
