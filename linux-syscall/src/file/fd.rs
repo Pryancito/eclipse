@@ -686,21 +686,48 @@ impl Syscall<'_> {
     }
 
     /// apply or remove an advisory lock on an open file
+    /// (see [linux man flock(2)](https://man7.org/linux/man-pages/man2/flock.2.html)).
     ///
-    /// The lock itself is still not taken -- this validates the request and
-    /// reports success, which is what an advisory lock on a single-user system
-    /// amounts to. What it must not do is report success for a request Linux
-    /// refuses, because that is how a caller probes for support.
-    pub fn sys_flock(&mut self, fd: FileDesc, operation: usize) -> SysResult {
+    /// The lock is held by the open file description, which here is the
+    /// `Arc<File>` behind the fd: `dup`ed and inherited descriptors share it,
+    /// and the drop of the last of them releases it (`fs::flock`). A
+    /// conflicting lock makes the call wait, unless `LOCK_NB` asks for
+    /// `EWOULDBLOCK` instead; a signal ends the wait with `EINTR`.
+    ///
+    /// It used to validate the request and answer 0 without taking anything,
+    /// so two `LOCK_EX` on the same file both succeeded: `flock(1)`, dpkg's
+    /// and apt's frontend locks and every `LOCK_EX | LOCK_NB` "is another
+    /// instance running?" probe found the file free every time.
+    pub async fn sys_flock(&self, fd: FileDesc, operation: usize) -> SysResult {
+        use linux_object::fs::flock;
         let (cmd, nonblock) = flock_translate(operation)?;
         info!(
             "flock: fd: {:?}, cmd: {:?}, nonblock: {}",
             fd, cmd, nonblock
         );
-        let proc = self.linux_process();
-
-        proc.get_file(fd)?;
-        Ok(0)
+        let file = self.linux_process().get_file(fd)?;
+        let meta = file.metadata()?;
+        let key = (meta.dev, meta.inode);
+        let owner = Arc::as_ptr(&file) as usize;
+        let exclusive = match cmd {
+            FlockCmd::Unlock => {
+                flock::unlock(key, owner);
+                return Ok(0);
+            }
+            FlockCmd::Shared => false,
+            FlockCmd::Exclusive => true,
+        };
+        loop {
+            match flock::try_lock(key, owner, exclusive) {
+                Ok(()) => return Ok(0),
+                Err(since) => {
+                    if nonblock {
+                        return Err(LxError::EAGAIN);
+                    }
+                    flock::wait_for_change(since).await?;
+                }
+            }
+        }
     }
 
     /// `memfd_create(2)`: create an anonymous in-RAM file referred to by the

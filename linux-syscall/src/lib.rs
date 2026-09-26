@@ -304,7 +304,7 @@ impl Syscall<'_> {
             }
             Sys::SENDFILE => self.sys_sendfile(a0.into(), a1.into(), a2.into(), a3).await,
             Sys::FCNTL => self.sys_fcntl(a0.into(), a1, a2).await,
-            Sys::FLOCK => self.sys_flock(a0.into(), a1),
+            Sys::FLOCK => self.sys_flock(a0.into(), a1).await,
             Sys::FSYNC => self.sys_fsync(a0.into()),
             Sys::FDATASYNC => self.sys_fdatasync(a0.into()),
             Sys::TRUNCATE => self.sys_truncate(a0.into(), a1),

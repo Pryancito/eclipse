@@ -156,6 +156,16 @@ pub struct File {
 
 impl_kobject!(File);
 
+impl Drop for File {
+    /// The last close of this open file description: the `flock(2)` locks
+    /// it holds go with it (see `fs::flock`), which is what lets a process
+    /// that took `LOCK_EX` and then exited, or just closed the fd, stop
+    /// holding the file.
+    fn drop(&mut self) {
+        crate::fs::flock::release_owner(self as *const File as usize);
+    }
+}
+
 /// Demand-paging source for a file-backed `mmap` (see [`get_vmo`]).
 ///
 /// Reads one page from the backing inode the first time that page is touched,

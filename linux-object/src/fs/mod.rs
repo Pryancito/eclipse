@@ -9,6 +9,7 @@ mod eventfd;
 mod fat_mount;
 mod file;
 mod flagged_fs;
+pub mod flock;
 pub mod hunter_config;
 mod inotify;
 pub mod ioctl;

@@ -173,7 +173,7 @@ impl Syscall<'_> {
                     })
                 }
             },
-            sys::FLOCK => BsdRet::from_result(self.sys_flock(a0.into(), a1)),
+            sys::FLOCK => BsdRet::from_result(self.sys_flock(a0.into(), a1).await),
             sys::GETCWD => BsdRet::from_result(self.sys_getcwd(a0.into(), a1)),
             sys::FCHDIR => BsdRet::from_result(self.sys_fchdir(a0.into())),
             sys::CHDIR => BsdRet::from_result(self.sys_chdir(a0.into())),
