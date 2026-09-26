@@ -121,6 +121,13 @@ jobs:
           # symbols are answered from a bump arena, so a read of a sector goes
           # through the real ring and comes back.
           cargo test -p virtio-drivers --lib -- --test-threads=1
+          # The allocator that decides where every PCI BAR window lands: the
+          # 32-bit MMIO, 64-bit MMIO, prefetchable and port-I/O free lists of
+          # every upstream node. It sat in the workspace `exclude` list while
+          # being a path dependency of `zircon-object`, so every kernel build
+          # compiled it and no `cargo test`, `cargo fmt` or `cargo clippy` line
+          # in the tree named it.
+          cargo test -p region-alloc --lib -- --test-threads=1
           # The text console the kernel prints through, escape sequences and
           # all. This one was unreachable for a reason: three SDL2 example
           # programs pulled in `embedded-graphics-simulator`, whose `sdl2-sys`

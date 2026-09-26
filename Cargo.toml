@@ -30,6 +30,11 @@ members = [
     # in `drivers/Cargo.toml` and **nothing here ever built this directory**.
     "vendor/virtio-drivers",
     "vendor/rcore-console",
+    # The region allocator: 138 lines that decide where every PCI BAR window
+    # lands. It was in `exclude` while being a path dependency of
+    # `zircon-object`, so it was built on every kernel build and **no `cargo
+    # test`, `cargo fmt` or `cargo clippy` line in the tree ever named it**.
+    "vendor/region-allocator",
     "hunter",
 ]
 default-members = ["xtask"]
@@ -38,7 +43,6 @@ exclude = [
     "rboot",
     "vendor/preemptive-scheduler",
     "vendor/PreemptiveScheduler",
-    "vendor/region-allocator",
     # Path-patched vendor crates (see the `[patch]` tables below) that carry no
     # `[workspace]` table of their own. Without listing them here `cargo fmt
     # --all` (the CI "Check format" step) aborts in `cargo metadata` with
