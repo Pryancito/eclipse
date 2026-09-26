@@ -92,6 +92,14 @@ mod ino {
     pub const INPUT_EVENT: usize = 0x6000;
     /// Plus the interface's index.
     pub const NET_IFACE: usize = 0x7000;
+    /// The compute-only alias device, which has no index on the bus: its
+    /// [`super::COMPUTE_ALIAS_INDEX`] is `usize::MAX`, a sentinel, so adding it
+    /// to `PCI_DEV` or `DRM_DIR` overflows -- a panic in a build with overflow
+    /// checks and a wrap to an arbitrary number in the kernel's, which is not
+    /// the unique inode the sum was there to produce. One number each instead.
+    pub const PCI_DEV_COMPUTE_ALIAS: usize = 0x8000;
+    /// The `drm` directory of that same alias device.
+    pub const DRM_DIR_COMPUTE_ALIAS: usize = 0x8001;
 }
 
 /// Where an interface sits in the list `/sys/class/net` shows, which is all
@@ -909,7 +917,11 @@ impl INode for SysPciDevDirINode {
         })
     }
     fn metadata(&self) -> Result<Metadata> {
-        Ok(dir_metadata(ino::PCI_DEV + self.index))
+        Ok(dir_metadata(if self.index == COMPUTE_ALIAS_INDEX {
+            ino::PCI_DEV_COMPUTE_ALIAS
+        } else {
+            ino::PCI_DEV + self.index
+        }))
     }
     fn as_any_ref(&self) -> &dyn Any {
         self
@@ -1621,7 +1633,11 @@ impl INode for SysDrmDeviceDrmDirINode {
         })
     }
     fn metadata(&self) -> Result<Metadata> {
-        Ok(dir_metadata(ino::DRM_DIR + self.pci_index))
+        Ok(dir_metadata(if self.pci_index == COMPUTE_ALIAS_INDEX {
+            ino::DRM_DIR_COMPUTE_ALIAS
+        } else {
+            ino::DRM_DIR + self.pci_index
+        }))
     }
     fn as_any_ref(&self) -> &dyn Any {
         self
@@ -3042,6 +3058,56 @@ mod drm_name_tests {
             "it parses as a render minor; whether a node exists is the table's call"
         );
         assert!(drm_node_pci_index(u32::MAX).is_none());
+    }
+}
+
+#[cfg(test)]
+mod compute_alias_inode_tests {
+    //! The compute-only alias device has no index on the bus, so its index is
+    //! the sentinel `usize::MAX`. Adding a sentinel to an inode base is an
+    //! overflow, and it was done twice.
+
+    use super::*;
+
+    fn alias_dir() -> SysPciDevDirINode {
+        SysPciDevDirINode {
+            index: COMPUTE_ALIAS_INDEX,
+            name: COMPUTE_ALIAS_BDF.into(),
+            vendor: "0x0000".into(),
+            device: "0x0000".into(),
+            class: COMPUTE_ALIAS_CLASS.into(),
+        }
+    }
+
+    /// `ino::PCI_DEV + usize::MAX` panics in a build with overflow checks --
+    /// this test is one -- and wraps to an arbitrary number in the kernel's,
+    /// which is not the unique inode the sum exists to produce. A plain
+    /// `ls -l /sys/bus/pci/devices/` is enough to ask for it.
+    #[test]
+    fn the_alias_device_has_an_inode_that_does_not_overflow() {
+        let m = alias_dir().metadata().unwrap();
+        assert_eq!(m.inode, ino::PCI_DEV_COMPUTE_ALIAS);
+        assert_eq!(m.type_, FileType::Dir);
+    }
+
+    /// And so does its `drm` directory.
+    #[test]
+    fn the_alias_drm_directory_has_one_too() {
+        let drm = SysDrmDeviceDrmDirINode {
+            pci_index: COMPUTE_ALIAS_INDEX,
+        };
+        assert_eq!(drm.metadata().unwrap().inode, ino::DRM_DIR_COMPUTE_ALIAS);
+    }
+
+    /// Neither number may be one a real device on the bus could reach, which is
+    /// the whole point of giving the alias its own.
+    #[test]
+    fn the_alias_numbers_are_outside_every_real_devices_range() {
+        for index in [0usize, 1, 7, 255] {
+            assert_ne!(ino::PCI_DEV + index, ino::PCI_DEV_COMPUTE_ALIAS);
+            assert_ne!(ino::DRM_DIR + index, ino::DRM_DIR_COMPUTE_ALIAS);
+        }
+        assert_ne!(ino::PCI_DEV_COMPUTE_ALIAS, ino::DRM_DIR_COMPUTE_ALIAS);
     }
 }
 
