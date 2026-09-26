@@ -375,10 +375,39 @@ fn proc_pid_status(proc: &Process) -> String {
     let vm_size_kb = stats.mapped_bytes() / 1024;
     let vm_rss_kb = (stats.private_bytes() + stats.shared_bytes()) / 1024;
     let threads = proc.thread_ids().len().max(1);
+    // The ids are the process's own, not a constant: `polkit`, `sudo`,
+    // `ps -u` and `pkexec` read the `Uid:` line to decide who is asking.
+    let ids = proc
+        .try_linux()
+        .map(|lp| credential_lines(&lp.credentials()))
+        .unwrap_or_default();
     format!(
-        "Name:\t{}\nState:\t{}\nTgid:\t{}\nPid:\t{}\nPPid:\t{}\nUid:\t0\t0\t0\t0\nGid:\t0\t0\t0\t0\nVmSize:\t{:8} kB\nVmRSS:\t{:8} kB\nThreads:\t{}\n",
-        name, state, pid, pid, ppid, vm_size_kb, vm_rss_kb, threads
+        "Name:\t{}\nState:\t{}\nTgid:\t{}\nPid:\t{}\nPPid:\t{}\n{}VmSize:\t{:8} kB\nVmRSS:\t{:8} kB\nThreads:\t{}\n",
+        name, state, pid, pid, ppid, ids, vm_size_kb, vm_rss_kb, threads
     )
+}
+
+/// The `Uid:`, `Gid:` and `Groups:` lines of `/proc/<pid>/status`, in the
+/// order proc(5) gives them: real, effective, saved, filesystem. `Groups:`
+/// follows `task_state()` in `fs/proc/array.c`: each id followed by a space,
+/// then the newline.
+fn credential_lines(creds: &crate::process::Credentials) -> String {
+    let mut out = format!(
+        "Uid:\t{}\t{}\t{}\t{}\nGid:\t{}\t{}\t{}\t{}\nGroups:\t",
+        creds.ruid,
+        creds.euid,
+        creds.suid,
+        creds.fsuid,
+        creds.rgid,
+        creds.egid,
+        creds.sgid,
+        creds.fsgid
+    );
+    for group in &creds.groups {
+        let _ = write!(out, "{} ", group);
+    }
+    out.push('\n');
+    out
 }
 
 /// `/proc/<pid>/statm`: memory usage in PAGES — "size resident shared text
@@ -3310,6 +3339,70 @@ lazy_static! {
         generate: proc_kbd_content,
         store: store_kbd,
     });
+}
+
+#[cfg(test)]
+mod pid_status_tests {
+    //! `/proc/<pid>/status` said `Uid:\t0\t0\t0\t0` and `Gid:\t0\t0\t0\t0`
+    //! for every process on the machine, whoever it belonged to. That line is
+    //! what `polkit`, `pkexec`, `sudo` and `ps -u` read to learn who is
+    //! asking, so every unprivileged process looked like root to them.
+
+    use super::*;
+    use crate::process::{Credentials, LinuxProcess};
+    use rcore_fs_ramfs::RamFS;
+
+    fn creds() -> Credentials {
+        Credentials {
+            ruid: 1000,
+            euid: 1001,
+            suid: 1002,
+            rgid: 2000,
+            egid: 2001,
+            sgid: 2002,
+            fsuid: 1003,
+            fsgid: 2003,
+            groups: alloc::vec![1000, 4, 24],
+            umask: 0o022,
+        }
+    }
+
+    #[test]
+    fn the_uid_and_gid_lines_are_the_process_s_own_ids_in_proc_5_order() {
+        // Real, effective, saved, filesystem: the order proc(5) gives, and
+        // the one `ps` and `polkit` parse by position.
+        let lines = credential_lines(&creds());
+        assert!(lines.starts_with("Uid:\t1000\t1001\t1002\t1003\nGid:\t2000\t2001\t2002\t2003\n"));
+    }
+
+    #[test]
+    fn the_groups_line_lists_every_supplementary_group() {
+        let lines = credential_lines(&creds());
+        assert!(lines.ends_with("Groups:\t1000 4 24 \n"), "{:?}", lines);
+    }
+
+    #[test]
+    fn a_process_that_dropped_to_a_user_reports_that_user() {
+        // The whole file, on a real process: root that became uid 1000 via
+        // setresuid, the way `login` and `su` end up.
+        let proc = Process::create_with_fixed_id_ext(
+            &Job::root(),
+            4242,
+            "root",
+            LinuxProcess::new(RamFS::new(), 0),
+        )
+        .unwrap();
+        let lp = proc.linux();
+        lp.set_resgid(100, 100, 100).unwrap();
+        lp.set_groups(alloc::vec![100, 27]);
+        lp.set_resuid(1000, 1000, 1000).unwrap();
+        let status = proc_pid_status(&proc);
+        assert!(
+            status.contains("PPid:\t0\nUid:\t1000\t1000\t1000\t1000\nGid:\t100\t100\t100\t100\nGroups:\t100 27 \nVmSize:"),
+            "{:?}",
+            status
+        );
+    }
 }
 
 #[cfg(test)]
