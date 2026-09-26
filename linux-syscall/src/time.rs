@@ -30,6 +30,46 @@ fn clock_ticks_since_boot(monotonic: Duration) -> usize {
     (monotonic.as_micros() / USEC_PER_TICK as u128) as usize
 }
 
+/// `time(2)`: the seconds since the epoch, in the return value and, when
+/// `tloc` is not NULL, in `*tloc` as well. `time(NULL)` is the usual call
+/// and used to be `EINVAL`: glibc reaches this syscall when the vDSO is
+/// missing, and a raw `syscall(SYS_time, 0)` got -1, the last second of
+/// 1969.
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn time_into(sec: usize, mut tloc: UserOutPtr<u64>) -> SysResult {
+    tloc.write_if_not_null(sec as u64)?;
+    Ok(sec)
+}
+
+#[cfg(all(test, target_arch = "x86_64"))]
+mod time_tloc_tests {
+    //! `time(2)` with and without its out-pointer.
+
+    use super::*;
+
+    /// `time(NULL)` is the usual call: the seconds come back in `rax`
+    /// alone, and no pointer is touched.
+    #[test]
+    fn a_null_tloc_is_not_einval() {
+        assert_eq!(
+            time_into(1_700_000_000, UserOutPtr::from(0)),
+            Ok(1_700_000_000)
+        );
+    }
+
+    /// With a pointer, the same number goes in both places.
+    #[test]
+    fn a_tloc_gets_the_same_seconds_the_call_returns() {
+        let mut out = 0u64;
+        let r = time_into(
+            1_700_000_000,
+            UserOutPtr::from(&mut out as *mut u64 as usize),
+        );
+        assert_eq!(r, Ok(1_700_000_000));
+        assert_eq!(out, 1_700_000_000);
+    }
+}
+
 #[cfg(test)]
 mod times_tests {
     use super::*;
@@ -555,14 +595,9 @@ impl Syscall<'_> {
 
     /// get time in seconds
     #[cfg(target_arch = "x86_64")]
-    pub fn sys_time(&mut self, mut time: UserOutPtr<u64>) -> SysResult {
+    pub fn sys_time(&mut self, time: UserOutPtr<u64>) -> SysResult {
         trace!("time: time: {:?}", time);
-        if time.is_null() {
-            return Err(LxError::EINVAL);
-        }
-        let sec = TimeSpec::now().sec;
-        time.write(sec as u64)?;
-        Ok(sec)
+        time_into(TimeSpec::now().sec, time)
     }
 
     /// JUST FOR TEST, DO NOT USE IT
@@ -594,15 +629,12 @@ impl Syscall<'_> {
     /// retained.
     pub fn sys_getrusage(&mut self, who: usize, mut rusage: UserOutPtr<RUsage>) -> SysResult {
         info!("getrusage: who: {}, rusage: {:?}", who, rusage);
-        use crate::intarg::{rusage_who, RusageWho};
-        if rusage.is_null() {
-            return Err(LxError::EINVAL);
-        }
+        use crate::intarg::RusageWho;
         // `who` is an `int`: `RUSAGE_CHILDREN` is -1, and read out of all 64
         // bits of the register it was 4294967295 (EINVAL) whenever the
         // caller's compiler had zero-extended it, which is what a varargs
         // `syscall(SYS_getrusage, RUSAGE_CHILDREN, &ru)` does.
-        let (utime_ns, stime_ns) = match rusage_who(who)? {
+        let (utime_ns, stime_ns) = match getrusage_args(who, rusage.is_null())? {
             RusageWho::Process => (
                 process_user_time_ns(self.zircon_process()),
                 self.linux_process().perf().totals().1,
@@ -813,9 +845,7 @@ impl Syscall<'_> {
                 .deadline
                 .map(|d| d.saturating_sub(now))
                 .unwrap_or_default();
-            // Round up: returning 0 would mean "no alarm was pending".
-            let remaining_secs =
-                remaining.as_secs() as usize + usize::from(remaining.subsec_nanos() > 0);
+            let remaining_secs = alarm_remaining_secs(remaining);
             slot.generation += 1;
             slot.interval = Duration::ZERO;
             if seconds == 0 {
@@ -2481,5 +2511,80 @@ mod timer_signal_tests {
         let ok = timer_notify_from_sigevent(&event(1, 34, SIGEV_THREAD_ID, 77), mine).unwrap();
         assert_eq!(ok.thread, Some(77));
         assert_eq!((ok.signo, ok.value), (34, 1));
+    }
+}
+
+/// What `alarm(2)` returns for the alarm it replaced: the seconds left,
+/// rounded as `alarm_setitimer` (kernel/time/itimer.c) rounds them. A
+/// remainder of half a second or more rounds up; below that it rounds down,
+/// except that anything at all left never reads as 0, since 0 means no alarm
+/// was pending. It used to round every remainder up, so an alarm with 3.2 s
+/// to go reported 4.
+pub(crate) fn alarm_remaining_secs(remaining: Duration) -> usize {
+    let secs = remaining.as_secs() as usize;
+    let nanos = remaining.subsec_nanos();
+    let up = nanos >= 500_000_000 || (secs == 0 && nanos > 0);
+    secs + usize::from(up)
+}
+
+/// `sys_getrusage`'s two refusals, in Linux's order: a `who` that is not
+/// `RUSAGE_SELF`, `RUSAGE_CHILDREN` or `RUSAGE_THREAD` is `EINVAL`, checked
+/// first; then the usage is gathered and `copy_to_user` into a null pointer
+/// fails, which is `EFAULT`.
+///
+/// A null pointer was `EINVAL`, and checked ahead of `who`: the errno glibc's
+/// tests and any program telling "bad argument" from "bad pointer" read was
+/// the wrong one, and `getrusage(99, NULL)` said the pointer was fine.
+fn getrusage_args(
+    who: usize,
+    rusage_is_null: bool,
+) -> linux_object::error::LxResult<crate::intarg::RusageWho> {
+    let who = crate::intarg::rusage_who(who)?;
+    if rusage_is_null {
+        return Err(LxError::EFAULT);
+    }
+    Ok(who)
+}
+
+#[cfg(test)]
+mod getrusage_args_tests {
+    //! What `getrusage(2)` refuses, and with which errno.
+
+    use super::*;
+    use crate::intarg::RusageWho;
+
+    /// A null `rusage` is `EFAULT`, the errno of the failed copy, not
+    /// `EINVAL`; and `who` is judged first, so `getrusage(99, NULL)` is
+    /// `EINVAL`.
+    #[test]
+    fn a_null_rusage_is_efault_and_who_is_judged_first() {
+        assert_eq!(getrusage_args(0, true), Err(LxError::EFAULT));
+        assert_eq!(getrusage_args(1, true), Err(LxError::EFAULT));
+        assert_eq!(getrusage_args(99, true), Err(LxError::EINVAL));
+        assert_eq!(getrusage_args(0, false), Ok(RusageWho::Process));
+        assert_eq!(getrusage_args(1, false), Ok(RusageWho::Thread));
+        assert_eq!(getrusage_args(99, false), Err(LxError::EINVAL));
+    }
+}
+
+#[cfg(test)]
+mod alarm_rounding_tests {
+    //! The seconds `alarm(2)` reports, rounded as Linux rounds them.
+
+    use super::*;
+
+    /// Half a second and up rounds up, less rounds down, and a fraction of
+    /// the first second is 1 rather than "no alarm".
+    #[test]
+    fn the_seconds_left_round_to_nearest_and_never_to_zero() {
+        let ms = Duration::from_millis;
+        assert_eq!(alarm_remaining_secs(ms(0)), 0, "no alarm was pending");
+        assert_eq!(alarm_remaining_secs(ms(1)), 1);
+        assert_eq!(alarm_remaining_secs(ms(499)), 1);
+        assert_eq!(alarm_remaining_secs(ms(3_000)), 3);
+        assert_eq!(alarm_remaining_secs(ms(3_200)), 3, "used to be 4");
+        assert_eq!(alarm_remaining_secs(ms(3_499)), 3);
+        assert_eq!(alarm_remaining_secs(ms(3_500)), 4);
+        assert_eq!(alarm_remaining_secs(ms(3_999)), 4);
     }
 }

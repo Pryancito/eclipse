@@ -107,6 +107,38 @@ pub fn shm_lookup(id: ShmId) -> Option<Arc<Mutex<ShmGuard>>> {
     SHMID2SHM.read().get(&id).cloned()
 }
 
+/// `ipc_get_maxidx` for the segment table: the highest INDEX in use, or
+/// `None` when there is no segment. Linux's index is the slot in its idr and
+/// `SHM_STAT` is asked by index; here ids are handed out from 1 and never
+/// reused, so slot `i` is id `i + 1`. `SHM_INFO` and `IPC_INFO` return this
+/// so that `ipcs -m` knows how far to walk with `SHM_STAT`.
+pub fn shm_max_index() -> Option<usize> {
+    SHMID2SHM.read().keys().next_back().map(|&id| id - 1)
+}
+
+/// `shmctl(idx, SHM_STAT, ..)`: the segment in slot `idx`, with the id the
+/// call returns for it. `None` is `EINVAL` (`ipc_lock` fails on an empty
+/// slot).
+pub fn shm_at_index(idx: usize) -> Option<(ShmId, Arc<Mutex<ShmGuard>>)> {
+    let id = idx.checked_add(1)?;
+    shm_lookup(id).map(|guard| (id, guard))
+}
+
+/// `shm_get_stat`, for `SHM_INFO`: how many segments exist, the pages they
+/// add up to (`shm_tot`) and the pages of those that are resident
+/// (`shm_rss`). It used to answer zero for all three.
+pub fn shm_totals() -> (usize, usize, usize) {
+    let table = SHMID2SHM.read();
+    let (mut tot, mut rss) = (0, 0);
+    for guard in table.values() {
+        let vmo = &guard.lock().shared_guard;
+        let len = pages(vmo.len());
+        tot += len;
+        rss += vmo.committed_pages_in_range(0, len);
+    }
+    (table.len(), tot, rss)
+}
+
 /// `shmctl(id, IPC_RMID, ..)`: the id stops naming the segment and no further
 /// `shmat` can find it.
 ///
@@ -460,6 +492,35 @@ mod shm_tests {
         assert!(shm_unregister(id));
         assert_eq!(shm_proc_table(), header);
         clear_ids();
+    }
+
+    /// busybox `ipcs -m`: `maxid = shmctl(0, SHM_INFO, &info)`, then
+    /// `SHM_STAT` over `0..=maxid`, skipping the indexes that answer EINVAL.
+    /// `SHM_INFO` used to answer 0 and all-zero totals whatever existed,
+    /// and `SHM_STAT` took its argument as an id, not an index.
+    #[test]
+    fn the_index_walk_of_ipcs_finds_every_segment() {
+        let _guard = test_lock();
+        clear_ids();
+        assert_eq!(shm_max_index(), None, "nothing to walk");
+        assert_eq!(shm_totals(), (0, 0, 0));
+        let a = shm_register(&get(0xffff_ff01, 8192, CREAT | 0o600).unwrap()).unwrap();
+        let b = shm_register(&get(0xffff_ff02, 4096 * 3, CREAT | 0o600).unwrap()).unwrap();
+        assert_eq!(shm_max_index(), Some(b - 1));
+        let (id, _) = shm_at_index(b - 1).unwrap();
+        assert_eq!(id, b);
+        assert_eq!(shm_at_index(a - 1).unwrap().0, a);
+        assert!(shm_at_index(b).is_none(), "one past the last slot");
+        assert!(shm_at_index(usize::MAX).is_none());
+        let (used, tot, rss) = shm_totals();
+        assert_eq!(used, 2);
+        assert_eq!(tot, 2 + 3, "pages, not bytes");
+        assert!(rss <= tot);
+        // A removed segment leaves its slot empty and the walk skips it.
+        shm_unregister(a);
+        assert!(shm_at_index(a - 1).is_none());
+        assert_eq!(shm_max_index(), Some(b - 1));
+        assert_eq!(shm_totals().0, 1);
     }
 
     #[test]

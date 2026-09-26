@@ -26,13 +26,20 @@ const SHMLBA: usize = PAGE_SIZE;
 fn semctl_access(cmd: &SemctlCmds) -> Option<u32> {
     match cmd {
         SemctlCmds::IPC_STAT
+        | SemctlCmds::SEM_STAT
         | SemctlCmds::GETPID
         | SemctlCmds::GETVAL
         | SemctlCmds::GETALL
         | SemctlCmds::GETNCNT
         | SemctlCmds::GETZCNT => Some(IPC_R),
         SemctlCmds::SETVAL | SemctlCmds::SETALL => Some(IPC_W),
-        SemctlCmds::IPC_RMID | SemctlCmds::IPC_SET => None,
+        // `SEM_STAT_ANY` is `SEM_STAT` without the permission check; the
+        // table commands have no set to check against.
+        SemctlCmds::IPC_RMID
+        | SemctlCmds::IPC_SET
+        | SemctlCmds::IPC_INFO
+        | SemctlCmds::SEM_INFO
+        | SemctlCmds::SEM_STAT_ANY => None,
     }
 }
 
@@ -301,17 +308,36 @@ impl Syscall<'_> {
             "semctl: id: {}, num: {}, cmd: {} arg: {:#x}",
             id, num, cmd, arg
         );
-        let sem_array = self
-            .linux_process()
-            .semaphores_get(id)
-            .ok_or(LxError::EINVAL)?;
-
         let cmd = match SemctlCmds::try_from(cmd) {
             Ok(t) => t,
             Err(_) => {
                 error!("invalid semctl cmd: {}", cmd);
                 return Err(LxError::EINVAL);
             }
+        };
+        // As in `shmctl`: what the first argument names depends on the
+        // command, and looking it up as an id first made `semctl(0, 0,
+        // SEM_INFO)` EINVAL (busybox `ipcs -s`: "kernel not configured").
+        let (id, sem_array) = match semctl_subject(cmd, id) {
+            IpcSubject::Table => {
+                let (sets, sems) = linux_object::ipc::sem_totals();
+                let mut ptr: UserOutPtr<SemInfo> = UserOutPtr::from(arg);
+                ptr.write(SemInfo::linux_limits(
+                    cmd == SemctlCmds::SEM_INFO,
+                    sets,
+                    sems,
+                ))?;
+                return Ok(ipc_info_result(linux_object::ipc::sem_max_index()));
+            }
+            IpcSubject::Index(idx) => {
+                linux_object::ipc::sem_at_index(idx).ok_or(LxError::EINVAL)?
+            }
+            IpcSubject::Id(id) => (
+                id,
+                self.linux_process()
+                    .semaphores_get(id)
+                    .ok_or(LxError::EINVAL)?,
+            ),
         };
         if let Some(want) = semctl_access(&cmd) {
             let proc = self.linux_process();
@@ -338,10 +364,42 @@ impl Syscall<'_> {
                 sem_array.ctime();
                 Ok(0)
             }
-            SemctlCmds::IPC_STAT => {
+            SemctlCmds::IPC_STAT | SemctlCmds::SEM_STAT | SemctlCmds::SEM_STAT_ANY => {
                 // arg is struct semid_ds
                 let mut ptr = UserOutPtr::from(arg);
                 ptr.write(*sem_array.semid_ds.lock())?;
+                Ok(ipc_stat_result(cmd != SemctlCmds::IPC_STAT, id))
+            }
+            // The two whole-set commands: `arg.array` is `unsigned short[nsems]`.
+            // Both fell into the per-semaphore arm below and were EINVAL, so a
+            // set could be initialised only one `SETVAL` at a time and never
+            // read back at once.
+            SemctlCmds::GETALL => {
+                let values = {
+                    let _atomic = sem_array.semop_guard();
+                    getall_values(&sem_array.snapshot())
+                };
+                let mut ptr: UserOutPtr<u16> = UserOutPtr::from(arg);
+                ptr.write_array(&values)?;
+                Ok(0)
+            }
+            SemctlCmds::SETALL => {
+                let ptr: UserInPtr<u16> = UserInPtr::from(arg);
+                let raw = ptr.read_array(sem_array.len())?;
+                // Every value is judged before any is applied: an out-of-range
+                // one is ERANGE and the set is untouched.
+                let values = setall_values(&raw)?;
+                let pid = self.zircon_process().id() as usize;
+                {
+                    let _atomic = sem_array.semop_guard();
+                    for (i, &value) in values.iter().enumerate() {
+                        if let Some(sem) = sem_array.get_sem(i) {
+                            sem.set(value);
+                            sem.set_pid(pid);
+                        }
+                    }
+                }
+                sem_array.ctime();
                 Ok(0)
             }
             _ => {
@@ -498,14 +556,32 @@ impl Syscall<'_> {
                 queue.set(&ds, self.linux_process().euid())?;
                 Ok(0)
             }
-            IPC_STAT => {
-                let queue = msg_queue(id).ok_or(LxError::EINVAL)?;
+            IPC_STAT | MSG_STAT | MSG_STAT_ANY => {
+                // The two `MSG_STAT`s take an index, not an id, and answer
+                // the id (`ipcs -q` walks the table with them); neither
+                // existed. `MSG_STAT_ANY` skips the permission check.
+                let (id, queue) = match msgctl_subject(cmd, id) {
+                    IpcSubject::Index(idx) => {
+                        linux_object::ipc::msg_at_index(idx).ok_or(LxError::EINVAL)?
+                    }
+                    _ => (id, msg_queue(id).ok_or(LxError::EINVAL)?),
+                };
                 let proc = self.linux_process();
-                if !queue.may_access(proc.euid(), proc.egid(), IPC_R) {
+                if cmd != MSG_STAT_ANY && !queue.may_access(proc.euid(), proc.egid(), IPC_R) {
                     return Err(LxError::EACCES);
                 }
                 UserOutPtr::from(buf).write(queue.stat())?;
-                Ok(0)
+                Ok(ipc_stat_result(cmd != IPC_STAT, id))
+            }
+            IPC_INFO | MSG_INFO => {
+                let (queues, bytes, messages) = linux_object::ipc::msg_totals();
+                UserOutPtr::from(buf).write(MsgInfo::linux_limits(
+                    cmd == MSG_INFO,
+                    queues,
+                    bytes,
+                    messages,
+                ))?;
+                Ok(ipc_info_result(linux_object::ipc::msg_max_index()))
             }
             _ => {
                 warn!("msgctl: unsupported cmd {}", cmd);
@@ -658,19 +734,52 @@ impl Syscall<'_> {
     /// performs the control operation specified by cmd on the shared memory segment whose identifier is given in id
     pub fn sys_shmctl(&self, id: usize, cmd: usize, buffer: usize) -> SysResult {
         info!("shmctl: id: {}, cmd: {} buffer: {:#x}", id, cmd, buffer);
-        // System-wide, like `shmat`: a program may be asked to remove or stat
-        // a segment it never created itself.
-        let guard = linux_object::ipc::shm_lookup(id)
-            .or_else(|| self.linux_process().shm_get(id).map(|i| i.guard))
-            .ok_or(LxError::EINVAL)?;
-        let shm_guard = guard.lock();
         let cmd = match ShmctlCmds::try_from(cmd) {
             Ok(t) => t,
             Err(_) => {
-                error!("invalid semctl cmd: {}", cmd);
+                error!("invalid shmctl cmd: {}", cmd);
                 return Err(LxError::EINVAL);
             }
         };
+        // What the first argument names depends on the command: the two
+        // table commands ignore it, the two `SHM_STAT`s take an INDEX, the
+        // rest an id. Looking the id up first, for every command, made
+        // `shmctl(0, SHM_INFO, ..)` EINVAL whenever there was no segment 0
+        // (busybox `ipcs -m`: "kernel not configured for shared memory").
+        let (id, guard) = match shmctl_subject(cmd, id) {
+            IpcSubject::Table => {
+                let max_index = linux_object::ipc::shm_max_index();
+                match cmd {
+                    ShmctlCmds::IPC_INFO => {
+                        let mut buffer: UserOutPtr<ShmInfo64> = buffer.into();
+                        buffer.write(ShmInfo64::linux_defaults())?;
+                    }
+                    _ => {
+                        let (used_ids, shm_tot, shm_rss) = linux_object::ipc::shm_totals();
+                        let mut buffer: UserOutPtr<ShmInfo> = buffer.into();
+                        buffer.write(ShmInfo {
+                            used_ids: used_ids as i32,
+                            shm_tot,
+                            shm_rss,
+                            ..ShmInfo::default()
+                        })?;
+                    }
+                }
+                return Ok(ipc_info_result(max_index));
+            }
+            IpcSubject::Index(idx) => {
+                linux_object::ipc::shm_at_index(idx).ok_or(LxError::EINVAL)?
+            }
+            // System-wide, like `shmat`: a program may be asked to remove or
+            // stat a segment it never created itself.
+            IpcSubject::Id(id) => (
+                id,
+                linux_object::ipc::shm_lookup(id)
+                    .or_else(|| self.linux_process().shm_get(id).map(|i| i.guard))
+                    .ok_or(LxError::EINVAL)?,
+            ),
+        };
+        let shm_guard = guard.lock();
         match cmd {
             ShmctlCmds::IPC_RMID => {
                 if !shm_guard.may_control(self.linux_process().euid()) {
@@ -693,20 +802,20 @@ impl Syscall<'_> {
                 shm_guard.ctime();
                 Ok(0)
             }
-            ShmctlCmds::IPC_STAT | ShmctlCmds::SHM_STAT => {
+            ShmctlCmds::IPC_STAT | ShmctlCmds::SHM_STAT | ShmctlCmds::SHM_STAT_ANY => {
                 let proc = self.linux_process();
-                if !shm_guard.may_access(proc.euid(), proc.egid(), IPC_R) {
+                // `SHM_STAT_ANY` skips the read-permission check.
+                if cmd != ShmctlCmds::SHM_STAT_ANY
+                    && !shm_guard.may_access(proc.euid(), proc.egid(), IPC_R)
+                {
                     return Err(LxError::EACCES);
                 }
                 let shmid_ds = shm_guard.shmid_ds.lock();
                 let mut buffer: UserOutPtr<ShmidDs> = buffer.into();
                 buffer.write(*shmid_ds)?;
-                Ok(0)
-            }
-            ShmctlCmds::SHM_INFO => {
-                let mut buffer: UserOutPtr<ShmInfo> = buffer.into();
-                buffer.write(ShmInfo::default())?;
-                Ok(0)
+                // The `SHM_STAT`s answer the segment's id: it is how the
+                // caller learns it from the index it walked to.
+                Ok(ipc_stat_result(cmd != ShmctlCmds::IPC_STAT, id))
             }
             _ => {
                 warn!("unsupported shmctl cmd: {:?}", cmd);
@@ -729,6 +838,27 @@ const SEMVMX: i32 = 32767;
 /// program passes by mistake into 4294967295 and sets the semaphore to it,
 /// rather than answering. Linux reads the `int`, and `semctl(2)` says ERANGE
 /// for anything outside `[0, SEMVMX]`.
+/// `semctl(GETALL)`: the value of every semaphore of the set as the
+/// `unsigned short[]` userspace reads. Values never exceed `SEMVMX`, so the
+/// narrowing loses nothing; a value below zero cannot exist either, and is
+/// clamped rather than wrapped in case it ever does.
+fn getall_values(snapshot: &[(isize, u64)]) -> Vec<u16> {
+    snapshot
+        .iter()
+        .map(|&(value, _)| value.clamp(0, SEMVMX as isize) as u16)
+        .collect()
+}
+
+/// `semctl(SETALL)`: the `unsigned short[]` userspace wrote, judged whole
+/// before any of it is applied (`semctl_main`: "for (i = 0; i < nsems; i++)
+/// if (sem_io[i] > SEMVMX) return -ERANGE", ahead of the assignment loop).
+fn setall_values(raw: &[u16]) -> Result<Vec<isize>, LxError> {
+    if raw.iter().any(|&v| v as i32 > SEMVMX) {
+        return Err(LxError::ERANGE);
+    }
+    Ok(raw.iter().map(|&v| v as isize).collect())
+}
+
 fn setval_from_arg(arg: usize) -> Result<isize, LxError> {
     let val = arg as u32 as i32;
     if (0..=SEMVMX).contains(&val) {
@@ -740,7 +870,7 @@ fn setval_from_arg(arg: usize) -> Result<isize, LxError> {
 
 numeric_enum! {
     #[repr(usize)]
-    #[derive(Debug, Eq, PartialEq)]
+    #[derive(Debug, Eq, PartialEq, Clone, Copy)]
     #[allow(non_camel_case_types)]
     /// for the third argument of semctl(), specified the control operation
     pub enum SemctlCmds {
@@ -751,6 +881,9 @@ numeric_enum! {
         /// Copy information from the kernel data structure associated with
         /// semid into the semid_ds structure pointed to by arg.buf.
         IPC_STAT = 2,
+        /// Returns a `seminfo` structure with the system's limits; the first
+        /// argument is ignored.
+        IPC_INFO = 3,
         /// Get the value of sempid
         GETPID = 11,
         /// Get the value of semval
@@ -765,14 +898,152 @@ numeric_enum! {
         SETVAL = 16,
         /// Set semval for all semaphores of the set using arg.array
         SETALL = 17,
+        /// `IPC_STAT` by table INDEX, returning the id.
+        SEM_STAT = 18,
+        /// `IPC_INFO` with the counts of what exists; the first argument is
+        /// ignored.
+        SEM_INFO = 19,
+        /// `SEM_STAT` without the read-permission check (Linux 4.17).
+        SEM_STAT_ANY = 20,
+    }
+}
+
+/// `msgctl(2)` commands beyond `IPC_RMID`/`IPC_SET`/`IPC_STAT`.
+const IPC_INFO: usize = 3;
+/// `MSG_STAT`: `IPC_STAT` by table index, returning the id.
+const MSG_STAT: usize = 11;
+/// `MSG_INFO`: `IPC_INFO` with the counts of what exists.
+const MSG_INFO: usize = 12;
+/// `MSG_STAT_ANY`: `MSG_STAT` without the permission check (Linux 4.17).
+const MSG_STAT_ANY: usize = 13;
+
+/// What the first argument of `semctl(2)` names, by command
+/// (`ipc/sem.c`, `ksys_semctl`).
+pub(crate) fn semctl_subject(cmd: SemctlCmds, arg: usize) -> IpcSubject {
+    match cmd {
+        SemctlCmds::IPC_INFO | SemctlCmds::SEM_INFO => IpcSubject::Table,
+        SemctlCmds::SEM_STAT | SemctlCmds::SEM_STAT_ANY => IpcSubject::Index(arg),
+        _ => IpcSubject::Id(arg),
+    }
+}
+
+/// What the first argument of `msgctl(2)` names, by command
+/// (`ipc/msg.c`, `ksys_msgctl`).
+pub(crate) fn msgctl_subject(cmd: usize, arg: usize) -> IpcSubject {
+    match cmd {
+        IPC_INFO | MSG_INFO => IpcSubject::Table,
+        MSG_STAT | MSG_STAT_ANY => IpcSubject::Index(arg),
+        _ => IpcSubject::Id(arg),
+    }
+}
+
+/// `struct seminfo` for `semctl(IPC_INFO | SEM_INFO)`: ten `int`s.
+#[repr(C)]
+#[derive(Default, Debug, PartialEq, Eq)]
+struct SemInfo {
+    semmap: i32,
+    semmni: i32,
+    semmns: i32,
+    semmnu: i32,
+    semmsl: i32,
+    semopm: i32,
+    semume: i32,
+    semusz: i32,
+    semvmx: i32,
+    semaem: i32,
+}
+
+impl SemInfo {
+    /// `include/uapi/linux/sem.h` defaults, as `semctl_info` fills them.
+    /// `IPC_INFO` reports the limits alone; `SEM_INFO` puts the number of
+    /// sets in `semusz` and of semaphores in `semaem`.
+    fn linux_limits(for_sem_info: bool, sets: usize, sems: usize) -> Self {
+        const SEMMNI: i32 = 32000;
+        const SEMMSL: i32 = 32000;
+        let mut info = SemInfo {
+            semmap: SEMMNI * SEMMSL,
+            semmni: SEMMNI,
+            semmns: SEMMNI * SEMMSL,
+            semmnu: SEMMNI * SEMMSL,
+            semmsl: SEMMSL,
+            semopm: 500,
+            semume: SEMMSL,
+            semusz: 20,
+            semvmx: SEMVMX,
+            semaem: SEMVMX,
+        };
+        if for_sem_info {
+            info.semusz = sets as i32;
+            info.semaem = sems as i32;
+        }
+        info
+    }
+}
+
+/// `struct msginfo` for `msgctl(IPC_INFO | MSG_INFO)`: seven `int`s and an
+/// `unsigned short`, 32 bytes with the padding.
+#[repr(C)]
+#[derive(Default, Debug, PartialEq, Eq)]
+struct MsgInfo {
+    msgpool: i32,
+    msgmap: i32,
+    msgmax: i32,
+    msgmnb: i32,
+    msgmni: i32,
+    msgssz: i32,
+    msgtot: i32,
+    msgseg: u16,
+}
+
+impl MsgInfo {
+    /// `include/uapi/linux/msg.h` defaults, as `msgctl_info` fills them.
+    /// `MSG_INFO` puts the number of queues in `msgpool`, the bytes queued
+    /// in `msgmap` and the messages in `msgtot`.
+    fn linux_limits(for_msg_info: bool, queues: usize, bytes: usize, messages: usize) -> Self {
+        const MSGMNI: i32 = 32000;
+        const MSGMAX: i32 = 8192;
+        const MSGMNB: i32 = 16384;
+        let mut info = MsgInfo {
+            msgpool: MSGMNI * MSGMNB / 1024,
+            msgmap: MSGMNB,
+            msgmax: MSGMAX,
+            msgmnb: MSGMNB,
+            msgmni: MSGMNI,
+            msgssz: 16,
+            msgtot: MSGMNB,
+            msgseg: 0xffff,
+        };
+        if for_msg_info {
+            info.msgpool = queues as i32;
+            info.msgmap = bytes as i32;
+            info.msgtot = messages as i32;
+        }
+        info
+    }
+}
+
+/// What `IPC_INFO` and the `*_INFO`s return: the highest index in use, and 0
+/// when the table is empty (`if (err < 0) err = 0;`). busybox `ipcs` walks
+/// the `*_STAT` from 0 to this number inclusive.
+pub(crate) fn ipc_info_result(max_index: Option<usize>) -> usize {
+    max_index.unwrap_or(0)
+}
+
+/// What a stat command returns: 0 for `IPC_STAT`, and for a stat by index
+/// the id of the object found there, which is how the caller learns it.
+pub(crate) fn ipc_stat_result(by_index: bool, id: usize) -> usize {
+    if by_index {
+        id
+    } else {
+        0
     }
 }
 
 numeric_enum! {
     #[repr(usize)]
-    #[derive(Debug, Eq, PartialEq)]
+    #[derive(Debug, Eq, PartialEq, Clone, Copy)]
     #[allow(non_camel_case_types)]
-    /// for the third argument of semctl(), specified the control operation
+    /// for the third argument of shmctl(), specified the control operation
     pub enum ShmctlCmds {
         /// Mark the segment to be destroyed, actually be destroyed after the last process detaches it
         IPC_RMID = 0,
@@ -781,6 +1052,9 @@ numeric_enum! {
         /// Copy information from the kernel data structure associated with
         /// shmid into the shmid_ds structure pointed to by arg.buf.
         IPC_STAT = 2,
+        /// Returns a `shminfo` structure with the system's limits; the first
+        /// argument is ignored.
+        IPC_INFO = 3,
         /// Prevent swapping of the shared memory segment
         SHM_LOCK = 11,
         /// Unlock the segment, allowing it to be swapped out.
@@ -790,6 +1064,30 @@ numeric_enum! {
         /// Returns a shm_info structure whose fields contain information
         /// about system resources consumed by shared memory.
         SHM_INFO = 14,
+        /// `SHM_STAT` without the read-permission check (Linux 4.17).
+        SHM_STAT_ANY = 15,
+    }
+}
+
+/// What the first argument of `shmctl(2)`, `semctl(2)` and `msgctl(2)`
+/// names, by command (`ksys_shmctl`, `ksys_semctl`, `ksys_msgctl`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IpcSubject {
+    /// `IPC_INFO`, `SHM_INFO`, `SEM_INFO`, `MSG_INFO`: the table as a whole;
+    /// the argument is ignored.
+    Table,
+    /// `SHM_STAT`, `SEM_STAT`, `MSG_STAT` and their `_ANY`s: an INDEX into
+    /// the table, not an id.
+    Index(usize),
+    /// Everything else: an id.
+    Id(usize),
+}
+
+pub(crate) fn shmctl_subject(cmd: ShmctlCmds, arg: usize) -> IpcSubject {
+    match cmd {
+        ShmctlCmds::IPC_INFO | ShmctlCmds::SHM_INFO => IpcSubject::Table,
+        ShmctlCmds::SHM_STAT | ShmctlCmds::SHM_STAT_ANY => IpcSubject::Index(arg),
+        _ => IpcSubject::Id(arg),
     }
 }
 
@@ -911,7 +1209,8 @@ pub fn plan_semop(values: &[isize], ops: &[SemBuf]) -> Result<SemopPlan, LxError
     ))
 }
 
-/// shm_info structure for shmctl
+/// `struct shm_info` for `shmctl(SHM_INFO)`: 48 bytes on 64-bit. It used to
+/// stop at `shm_swp`, 40, so the last two fields were never written.
 #[repr(C)]
 #[derive(Default)]
 struct ShmInfo {
@@ -923,6 +1222,45 @@ struct ShmInfo {
     shm_rss: usize,
     /// of swapped shared memory pages
     shm_swp: usize,
+    /// Unused since Linux 2.4; written as zero.
+    swap_attempts: usize,
+    /// Unused since Linux 2.4; written as zero.
+    swap_successes: usize,
+}
+
+static_assertions::const_assert_eq!(48, core::mem::size_of::<ShmInfo>());
+
+/// `struct shminfo64` for `shmctl(IPC_INFO)`: the system's limits.
+#[repr(C)]
+#[derive(Default)]
+struct ShmInfo64 {
+    /// Maximum segment size (`SHMMAX`).
+    shmmax: usize,
+    /// Minimum segment size (`SHMMIN`).
+    shmmin: usize,
+    /// Maximum number of segments (`SHMMNI`).
+    shmmni: usize,
+    /// Maximum segments per process (`SHMSEG`).
+    shmseg: usize,
+    /// Maximum pages of shared memory system-wide (`SHMALL`).
+    shmall: usize,
+    /// Padding, zero.
+    unused: [usize; 4],
+}
+
+impl ShmInfo64 {
+    /// `include/uapi/linux/shm.h` defaults: `SHMMAX` and `SHMALL` are
+    /// `ULONG_MAX - (1UL << 24)`, `SHMMIN` 1, `SHMMNI` and `SHMSEG` 4096.
+    fn linux_defaults() -> Self {
+        ShmInfo64 {
+            shmmax: usize::MAX - (1 << 24),
+            shmmin: 1,
+            shmmni: 4096,
+            shmseg: 4096,
+            shmall: usize::MAX - (1 << 24),
+            unused: [0; 4],
+        }
+    }
 }
 
 bitflags! {
@@ -1231,6 +1569,157 @@ mod semop_plan_tests {
             (1, 1),
             "one missing unit holds the whole array"
         );
+    }
+}
+
+#[cfg(test)]
+mod ipc_table_command_tests {
+    //! The table commands of `semctl` and `msgctl`, which did not exist,
+    //! and what their first argument names.
+
+    use super::*;
+
+    #[test]
+    fn semctl_and_msgctl_read_their_first_argument_by_command() {
+        assert_eq!(semctl_subject(SemctlCmds::SEM_INFO, 0), IpcSubject::Table);
+        assert_eq!(semctl_subject(SemctlCmds::IPC_INFO, 9), IpcSubject::Table);
+        assert_eq!(
+            semctl_subject(SemctlCmds::SEM_STAT, 4),
+            IpcSubject::Index(4)
+        );
+        assert_eq!(
+            semctl_subject(SemctlCmds::SEM_STAT_ANY, 4),
+            IpcSubject::Index(4)
+        );
+        for cmd in [SemctlCmds::IPC_STAT, SemctlCmds::GETALL, SemctlCmds::SETVAL] {
+            assert_eq!(semctl_subject(cmd, 4), IpcSubject::Id(4), "{:?}", cmd);
+        }
+        assert_eq!(msgctl_subject(MSG_INFO, 0), IpcSubject::Table);
+        assert_eq!(msgctl_subject(IPC_INFO, 9), IpcSubject::Table);
+        assert_eq!(msgctl_subject(MSG_STAT, 4), IpcSubject::Index(4));
+        assert_eq!(msgctl_subject(MSG_STAT_ANY, 4), IpcSubject::Index(4));
+        assert_eq!(msgctl_subject(2, 4), IpcSubject::Id(4));
+        assert_eq!(ipc_info_result(None), 0);
+        assert_eq!(ipc_info_result(Some(3)), 3);
+        assert_eq!(ipc_stat_result(true, 7), 7);
+        assert_eq!(ipc_stat_result(false, 7), 0);
+    }
+
+    /// `seminfo` is ten `int`s; `SEM_INFO` carries the counts where
+    /// `ipcs -s -u` reads them, `IPC_INFO` the limits alone.
+    #[test]
+    fn seminfo_carries_the_counts_only_for_sem_info() {
+        assert_eq!(core::mem::size_of::<SemInfo>(), 40);
+        let limits = SemInfo::linux_limits(false, 2, 5);
+        assert_eq!((limits.semusz, limits.semaem), (20, SEMVMX));
+        assert_eq!(
+            (limits.semmni, limits.semmsl, limits.semopm),
+            (32000, 32000, 500)
+        );
+        let counts = SemInfo::linux_limits(true, 2, 5);
+        assert_eq!((counts.semusz, counts.semaem), (2, 5));
+        assert_eq!(counts.semvmx, SEMVMX);
+    }
+
+    /// `msginfo` is 32 bytes; `MSG_INFO` carries queues, bytes and messages
+    /// in `msgpool`, `msgmap` and `msgtot`.
+    #[test]
+    fn msginfo_carries_the_counts_only_for_msg_info() {
+        assert_eq!(core::mem::size_of::<MsgInfo>(), 32);
+        let limits = MsgInfo::linux_limits(false, 2, 30, 3);
+        assert_eq!(
+            (limits.msgmax, limits.msgmnb, limits.msgmni),
+            (8192, 16384, 32000)
+        );
+        assert_eq!(limits.msgpool, 32000 * 16384 / 1024);
+        let counts = MsgInfo::linux_limits(true, 2, 30, 3);
+        assert_eq!((counts.msgpool, counts.msgmap, counts.msgtot), (2, 30, 3));
+        assert_eq!(counts.msgseg, 0xffff);
+    }
+}
+
+#[cfg(test)]
+mod semctl_all_tests {
+    //! `GETALL` and `SETALL`, which used to be EINVAL.
+
+    use super::*;
+
+    /// `GETALL` hands out one `unsigned short` per semaphore, in order.
+    #[test]
+    fn getall_is_one_unsigned_short_per_semaphore_in_order() {
+        assert_eq!(
+            getall_values(&[(3, 0), (0, 5), (32767, 1)]),
+            vec![3, 0, 32767]
+        );
+        assert_eq!(getall_values(&[]), Vec::<u16>::new());
+        // A value that cannot exist is clamped, not wrapped to 65535.
+        assert_eq!(getall_values(&[(-1, 0)]), vec![0]);
+    }
+
+    /// `SETALL` refuses the whole array on one value over `SEMVMX`, before
+    /// touching any semaphore; anything up to `SEMVMX` goes through.
+    #[test]
+    fn setall_is_all_or_nothing_at_semvmx() {
+        assert_eq!(setall_values(&[0, 1, 32767]), Ok(vec![0, 1, 32767]));
+        assert_eq!(setall_values(&[]), Ok(vec![]));
+        assert_eq!(setall_values(&[1, 32768, 0]), Err(LxError::ERANGE));
+        assert_eq!(setall_values(&[65535]), Err(LxError::ERANGE));
+    }
+}
+
+#[cfg(test)]
+mod shmctl_subject_tests {
+    //! What `shmctl`'s first argument means, which used to be "an id" for
+    //! every command: `shmctl(0, SHM_INFO, ..)` was EINVAL whenever there
+    //! was no segment 0, and busybox `ipcs -m` reported "kernel not
+    //! configured for shared memory".
+
+    use super::*;
+
+    /// The two table commands ignore the argument; the two stats take an
+    /// index; the rest an id.
+    #[test]
+    fn the_first_argument_is_an_index_an_id_or_nothing_by_command() {
+        assert_eq!(shmctl_subject(ShmctlCmds::SHM_INFO, 0), IpcSubject::Table);
+        assert_eq!(shmctl_subject(ShmctlCmds::IPC_INFO, 77), IpcSubject::Table);
+        assert_eq!(
+            shmctl_subject(ShmctlCmds::SHM_STAT, 3),
+            IpcSubject::Index(3)
+        );
+        assert_eq!(
+            shmctl_subject(ShmctlCmds::SHM_STAT_ANY, 3),
+            IpcSubject::Index(3)
+        );
+        for cmd in [
+            ShmctlCmds::IPC_STAT,
+            ShmctlCmds::IPC_SET,
+            ShmctlCmds::IPC_RMID,
+            ShmctlCmds::SHM_LOCK,
+            ShmctlCmds::SHM_UNLOCK,
+        ] {
+            assert_eq!(shmctl_subject(cmd, 3), IpcSubject::Id(3), "{:?}", cmd);
+        }
+    }
+
+    /// `SHM_INFO` returns the highest index, 0 for an empty table; the
+    /// `SHM_STAT`s return the id found there; `IPC_STAT` returns 0.
+    #[test]
+    fn the_return_values_ipcs_walks_by() {
+        assert_eq!(ipc_info_result(None), 0);
+        assert_eq!(ipc_info_result(Some(0)), 0);
+        assert_eq!(ipc_info_result(Some(6)), 6);
+    }
+
+    /// The two structs userspace reads, in the 64-bit layout: `shm_info` is
+    /// 48 bytes, `shminfo64` is 72, and `IPC_INFO` carries Linux's limits.
+    #[test]
+    fn the_info_structs_have_the_uapi_size_and_values() {
+        assert_eq!(core::mem::size_of::<ShmInfo>(), 48);
+        assert_eq!(core::mem::size_of::<ShmInfo64>(), 72);
+        let d = ShmInfo64::linux_defaults();
+        assert_eq!((d.shmmin, d.shmmni, d.shmseg), (1, 4096, 4096));
+        assert_eq!(d.shmmax, usize::MAX - (1 << 24));
+        assert_eq!(d.shmall, d.shmmax);
     }
 }
 

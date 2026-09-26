@@ -39,6 +39,16 @@ pub(crate) fn check_sigsetsize(sigsetsize: usize) -> Result<(), LxError> {
     Ok(())
 }
 
+/// `do_sigaction`: `(act && sig_kernel_only(sig))` is EINVAL. `SIGKILL` and
+/// `SIGSTOP` cannot be given a disposition, but their (default) disposition
+/// can be asked for with a null `act`. Both were refused whatever `act`
+/// was, so a loop that saves every disposition from 1 to `NSIG` (a
+/// daemoniser, a test harness restoring the table afterwards) stopped with
+/// EINVAL at 9.
+pub(crate) fn sigaction_refused(signal: Signal, act_is_null: bool) -> bool {
+    matches!(signal, Signal::SIGKILL | Signal::SIGSTOP) && !act_is_null
+}
+
 /// The arch-independent 12-byte prefix every `siginfo_t` layout starts with
 /// (`signo`, `errno`, `code`): what the permission rule of `rt_sigqueueinfo`
 /// and `pidfd_send_signal` is decided on. Plain integers, because the
@@ -374,7 +384,7 @@ impl Syscall<'_> {
             self.thread.id()
         );
         check_sigsetsize(sigsetsize)?;
-        if signal == Signal::SIGKILL || signal == Signal::SIGSTOP {
+        if sigaction_refused(signal, act.is_null()) {
             return Err(LxError::EINVAL);
         }
         let proc = self.linux_process();
@@ -387,7 +397,13 @@ impl Syscall<'_> {
                 // `sa_mask` becomes the thread's blocked set on every delivery
                 // of this signal, so an unfiltered one holds off SIGKILL for as
                 // long as the handler runs.
-                proc.set_signal_action(signal, act.stored());
+                // Stored, and what was pending discarded when the new
+                // disposition ignores (sigaction(2)).
+                linux_object::process::set_signal_action_in(
+                    self.zircon_process(),
+                    signal,
+                    act.stored(),
+                );
             }
             Ok(())
         })?;
@@ -1003,6 +1019,27 @@ impl Drop for TempSigmaskGuard {
 ///
 /// Everything below is a pure decision lifted out of a syscall body, so it can
 /// be exercised without a thread, a process or a job.
+#[cfg(test)]
+mod sigaction_query_tests {
+    //! Asking for the disposition of `SIGKILL` and `SIGSTOP`.
+
+    use super::*;
+
+    /// A query (null `act`) of the two kernel-only signals is allowed; setting
+    /// them is not; every other signal is fine either way.
+    #[test]
+    fn kill_and_stop_can_be_asked_about_but_not_set() {
+        for sig in [Signal::SIGKILL, Signal::SIGSTOP] {
+            assert!(sigaction_refused(sig, false), "{:?} set", sig);
+            assert!(!sigaction_refused(sig, true), "{:?} query", sig);
+        }
+        for sig in [Signal::SIGINT, Signal::SIGCHLD, Signal::SIGSEGV] {
+            assert!(!sigaction_refused(sig, false), "{:?}", sig);
+            assert!(!sigaction_refused(sig, true), "{:?}", sig);
+        }
+    }
+}
+
 #[cfg(test)]
 mod signal_tests {
     use super::*;

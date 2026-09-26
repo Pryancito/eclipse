@@ -11,7 +11,7 @@ use core::pin::Pin;
 use core::task::{Context, Poll};
 use core::time::Duration;
 use kernel_hal::timer;
-use linux_object::fs::{FileDesc, PollEvents};
+use linux_object::fs::{FileDesc, PollEvents, PollStatus};
 use linux_object::signal::Sigset;
 use linux_object::time::*;
 
@@ -20,6 +20,32 @@ use super::fd::{anon_fd_flags, ANON_CLOEXEC};
 /// Monotonic time since boot — must match `timer::timer_set` deadlines (not wall clock).
 fn mono_now() -> Duration {
     timer::timer_now()
+}
+
+/// `STICKY_TIMEOUTS` (`include/uapi/linux/personality.h`): the persona bit
+/// under which `select` leaves its timeout alone.
+const STICKY_TIMEOUTS: u32 = 0x0400_0000;
+
+/// What `poll_select_finish` (`fs/select.c`) writes back into the caller's
+/// `timeval`/`timespec` once a `select` or `pselect6` returns, on every
+/// path, a timeout and `EINTR` included: the time LEFT of the timeout,
+/// zero once it has run out. `None` means the struct is not touched: no
+/// timeout (NULL), a zero timeout ("No update for zero timeout"), or the
+/// `STICKY_TIMEOUTS` persona. It used to be never written, so glibc's
+/// `select()`, which is `pselect6` on a local `timespec` copied back into
+/// the caller's `timeval`, handed back the original timeout: a
+/// `while (select(...) < 0 && errno == EINTR)` loop restarted the whole
+/// wait after each signal.
+pub(crate) fn select_time_left(
+    timeout: Option<Duration>,
+    elapsed: Duration,
+    sticky: bool,
+) -> Option<Duration> {
+    let timeout = timeout?;
+    if sticky || timeout.is_zero() {
+        return None;
+    }
+    Some(timeout.saturating_sub(elapsed))
 }
 
 fn schedule_poll_wakeup(
@@ -536,7 +562,7 @@ impl Syscall<'_> {
         read: UserInOutPtr<u32>,
         write: UserInOutPtr<u32>,
         err: UserInOutPtr<u32>,
-        timeout: UserInPtr<TimeSpec>,
+        mut timeout: UserInOutPtr<TimeSpec>,
         sigset_arg: usize,
     ) -> SysResult {
         // pselect6's timeout is a `timespec` (NANOseconds). It was previously
@@ -544,11 +570,14 @@ impl Syscall<'_> {
         // timeout by 1000x: glibc routes plain select() through pselect6, so a
         // 100 ms select slept 100 SECONDS. busybox ash's line editor and every
         // terminal-probe wait sat "wedged" exactly this way.
-        let timeout_msecs = if timeout.is_null() {
-            -1
+        let (timeout_msecs, timeout_left) = if timeout.is_null() {
+            (-1, None)
         } else {
-            timeout.read()?.try_into_poll_msecs()?
+            let ts = timeout.read()?;
+            (ts.try_into_poll_msecs()?, Some(ts.try_into_duration()?))
         };
+        let sticky = self.linux_process().personality() & STICKY_TIMEOUTS != 0;
+        let begin = mono_now();
         // 6th arg is a pointer to `{ const sigset_t *ss; size_t ss_len; }`.
         let (sigmask, sigsetsize) = if sigset_arg == 0 {
             (UserInPtr::<Sigset>::from(0), 0)
@@ -570,6 +599,13 @@ impl Syscall<'_> {
                 g.keep_for_signal();
             }
         }
+        if let Some(left) = select_time_left(timeout_left, mono_now().saturating_sub(begin), sticky)
+        {
+            // A `timespec` in read-only memory must not turn a completed
+            // select into EFAULT (`fs/select.c`, "sticky"): the write's
+            // failure is ignored.
+            let _ = timeout.write(TimeSpec::from_duration(left));
+        }
         result
     }
 
@@ -583,7 +619,7 @@ impl Syscall<'_> {
         read: UserInOutPtr<u32>,
         write: UserInOutPtr<u32>,
         err: UserInOutPtr<u32>,
-        timeout: UserInPtr<TimeVal>,
+        mut timeout: UserInOutPtr<TimeVal>,
     ) -> SysResult {
         let _ = self.maybe_handle_tty_intr()?;
         info!(
@@ -594,15 +630,24 @@ impl Syscall<'_> {
         if nfds as u64 == 0 {
             return Ok(0);
         } */
-        let timeout_msecs = if !timeout.is_null() {
-            let timeout = timeout.read()?;
-            timeout.try_into_poll_msecs()?
+        let (timeout_msecs, timeout_left) = if !timeout.is_null() {
+            let tv = timeout.read()?;
+            (tv.try_into_poll_msecs()?, Some(tv.try_into_duration()?))
         } else {
             // infinity
-            -1
+            (-1, None)
         };
-        self.select_core(nfds, read, write, err, timeout_msecs)
-            .await
+        let sticky = self.linux_process().personality() & STICKY_TIMEOUTS != 0;
+        let begin = mono_now();
+        let result = self
+            .select_core(nfds, read, write, err, timeout_msecs)
+            .await;
+        if let Some(left) = select_time_left(timeout_left, mono_now().saturating_sub(begin), sticky)
+        {
+            // See `sys_pselect6`: a failed write-back is ignored.
+            let _ = timeout.write(TimeVal::from(left));
+        }
+        result
     }
 
     /// Shared body of `select`/`pselect6` once the timeout is normalized to
@@ -623,6 +668,22 @@ impl Syscall<'_> {
         let mut read_fds = FdSet::new(read, nfds)?;
         let mut write_fds = FdSet::new(write, nfds)?;
         let mut err_fds = FdSet::new(err, nfds)?;
+        // `max_select_fd`: a closed fd in any of the three sets is EBADF
+        // before the wait begins. It used to be skipped, so a program that
+        // closed a socket and left its bit set waited for the timeout (or for
+        // ever) instead of learning which fd to drop.
+        {
+            let files = self.linux_process().get_files()?;
+            let in_any = |fd: usize| {
+                let fd = FileDesc::from(fd);
+                read_fds.contains(fd) || write_fds.contains(fd) || err_fds.contains(fd)
+            };
+            if select_closed_fd(nfds, in_any, |fd| files.contains_key(&FileDesc::from(fd)))
+                .is_some()
+            {
+                return Err(LxError::EBADF);
+            }
+        }
         let begin_time = mono_now();
 
         // The select set membership (`origin`) does not change while the future
@@ -725,15 +786,16 @@ impl Syscall<'_> {
                             break;
                         }
                     };
-                    if status.error && this.err_fds.contains(fd) {
+                    let ready = select_ready(&status);
+                    if ready.except && this.err_fds.contains(fd) {
                         this.err_fds.set(fd);
                         events += 1;
                     }
-                    if status.read && this.read_fds.contains(fd) {
+                    if ready.read && this.read_fds.contains(fd) {
                         this.read_fds.set(fd);
                         events += 1;
                     }
-                    if status.write && this.write_fds.contains(fd) {
+                    if ready.write && this.write_fds.contains(fd) {
                         this.write_fds.set(fd);
                         events += 1;
                     }
@@ -993,6 +1055,45 @@ const FD_PER_ITEM: usize = u32::BITS as usize;
 /// max Fdset size
 const MAX_FDSET_SIZE: usize = 1024 / FD_PER_ITEM;
 
+/// The lowest fd below `nfds` that is in one of the three sets and not
+/// open: `max_select_fd` (fs/select.c) makes it EBADF before anything is
+/// waited on. `in_any` says whether an fd is in a set, `is_open` whether the
+/// process has it.
+pub(crate) fn select_closed_fd(
+    nfds: usize,
+    in_any: impl Fn(usize) -> bool,
+    is_open: impl Fn(usize) -> bool,
+) -> Option<usize> {
+    (0..nfds).find(|&fd| in_any(fd) && !is_open(fd))
+}
+
+/// Which of the three sets a poll status lights up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SelectReady {
+    /// `readfds`.
+    pub read: bool,
+    /// `writefds`.
+    pub write: bool,
+    /// `exceptfds`.
+    pub except: bool,
+}
+
+/// `do_select`'s three masks: `POLLIN_SET` is IN, HUP and ERR; `POLLOUT_SET`
+/// is OUT and ERR; `POLLEX_SET` is PRI alone (which nothing here reports).
+///
+/// An error used to go to `exceptfds` only, and a hangup nowhere: a pipe
+/// whose reader had gone (`write: false, error: true`) never left
+/// `select(writefds)`, when Linux returns it writable so the write can fail
+/// with EPIPE; and a socket that hung up was not readable to `select`, though
+/// its `read` of 0 was waiting.
+pub(crate) fn select_ready(status: &PollStatus) -> SelectReady {
+    SelectReady {
+        read: status.read || status.hangup || status.error,
+        write: status.write || status.error,
+        except: false,
+    }
+}
+
 /// FdSet data struct for select
 struct FdSet {
     /// input addr, for update Fdset use
@@ -1079,6 +1180,116 @@ mod abi_tests {
     #[test]
     fn pollfd_matches_linux_uapi() {
         assert_eq!(size_of::<PollFd>(), 8);
+    }
+}
+
+#[cfg(test)]
+mod select_ready_tests {
+    //! `select`'s answer for a closed fd, and which set each condition lands
+    //! in.
+
+    use super::*;
+
+    fn status(read: bool, write: bool, error: bool, hangup: bool) -> PollStatus {
+        PollStatus {
+            read,
+            write,
+            error,
+            hangup,
+        }
+    }
+
+    /// A closed fd in any set is found, and only below `nfds`; an fd in no
+    /// set is nobody's business, open or not.
+    #[test]
+    fn a_closed_fd_in_a_set_is_found_below_nfds() {
+        let in_set = |fd: usize| fd == 3 || fd == 7;
+        let open = |fd: usize| fd != 7;
+        assert_eq!(select_closed_fd(8, in_set, open), Some(7));
+        assert_eq!(
+            select_closed_fd(7, in_set, open),
+            None,
+            "7 is not below nfds"
+        );
+        assert_eq!(select_closed_fd(8, in_set, |_| true), None);
+        assert_eq!(select_closed_fd(8, |_| false, |_| false), None, "in no set");
+        assert_eq!(select_closed_fd(0, |_| true, |_| false), None);
+        // The first of several, as `max_select_fd` stops at the first.
+        assert_eq!(select_closed_fd(8, |_| true, |fd| fd > 4), Some(0));
+    }
+
+    /// Error is readable and writable, hangup readable, and `exceptfds` is
+    /// for urgent data alone.
+    #[test]
+    fn error_and_hangup_land_where_do_select_puts_them() {
+        let ready = |st| select_ready(&st);
+        let r = |read, write, except| SelectReady {
+            read,
+            write,
+            except,
+        };
+        assert_eq!(
+            ready(status(true, false, false, false)),
+            r(true, false, false)
+        );
+        assert_eq!(
+            ready(status(false, true, false, false)),
+            r(false, true, false)
+        );
+        // The write end of a pipe whose reader is gone.
+        assert_eq!(
+            ready(status(false, false, true, true)),
+            r(true, true, false)
+        );
+        // A socket both sides of which are shut.
+        assert_eq!(
+            ready(status(false, false, false, true)),
+            r(true, false, false)
+        );
+        assert_eq!(
+            ready(status(false, false, true, false)),
+            r(true, true, false)
+        );
+        assert_eq!(
+            ready(status(false, false, false, false)),
+            r(false, false, false)
+        );
+    }
+}
+
+#[cfg(test)]
+mod select_time_left_tests {
+    //! The Linux-only write-back of `select`'s timeout, which never happened.
+
+    use super::*;
+
+    const S: fn(u64) -> Duration = Duration::from_secs;
+
+    /// The time left of the timeout, and zero once it has run out: never
+    /// "nothing" for a timeout that was given.
+    #[test]
+    fn the_time_left_is_written_back_zero_once_it_ran_out() {
+        assert_eq!(select_time_left(Some(S(5)), S(2), false), Some(S(3)));
+        assert_eq!(select_time_left(Some(S(5)), S(5), false), Some(S(0)));
+        assert_eq!(select_time_left(Some(S(5)), S(7), false), Some(S(0)));
+        assert_eq!(
+            select_time_left(
+                Some(Duration::from_millis(100)),
+                Duration::from_millis(1),
+                false
+            ),
+            Some(Duration::from_millis(99))
+        );
+    }
+
+    /// `fs/select.c`: no pointer, "No update for zero timeout", and the
+    /// `STICKY_TIMEOUTS` persona all leave the caller's struct alone.
+    #[test]
+    fn null_zero_and_sticky_timeouts_are_left_alone() {
+        assert_eq!(select_time_left(None, S(2), false), None);
+        assert_eq!(select_time_left(Some(S(0)), S(0), false), None);
+        assert_eq!(select_time_left(Some(S(5)), S(2), true), None);
+        assert_eq!(STICKY_TIMEOUTS, 0x0400_0000);
     }
 }
 

@@ -85,6 +85,10 @@ pub const CAP_SYS_NICE: u32 = 23;
 pub const CAP_SYS_RESOURCE: u32 = 24;
 /// `CAP_SYS_TIME`: set the system clock and discipline it.
 pub const CAP_SYS_TIME: u32 = 25;
+/// `CAP_SYSLOG`: the `syslog(2)` actions that change the kernel log or the
+/// console (clear, read-and-clear, console on/off/level) -- and, under
+/// `dmesg_restrict`, reading it at all.
+pub const CAP_SYSLOG: u32 = 34;
 
 /// The highest capability number this kernel reports. 40 is Linux 5.15's
 /// `CAP_LAST_CAP` (`CAP_CHECKPOINT_RESTORE`); `capget`, `prctl`'s bounding
@@ -1114,6 +1118,14 @@ struct LinuxProcessInner {
     /// `prctl(PR_SET_THP_DISABLE)`: recorded and read back; there is no
     /// transparent-hugepage machinery for it to steer.
     thp_disable: bool,
+    /// `prctl(PR_SET_KEEPCAPS)`, `SECBIT_KEEP_CAPS`: recorded, read back by
+    /// `PR_GET_KEEPCAPS`, inherited by `fork` and cleared by `execve`
+    /// (`cap_bprm_creds_from_file`). Capabilities here follow the effective
+    /// uid alone, so there is nothing for it to keep, but a daemon that
+    /// drops privilege asks for it before `setuid` and treats a refusal as
+    /// fatal: `prctl(PR_SET_KEEPCAPS, 1)` was EINVAL and ntpd, chrony and
+    /// dumpcap (and libcap's `cap_setuid`) stopped at startup.
+    keep_caps: bool,
     /// Signal actions
     signal_actions: SignalActions,
     /// Program break (top of heap).
@@ -1665,6 +1677,16 @@ impl LinuxProcess {
     /// Record `PR_SET_THP_DISABLE`.
     pub fn set_thp_disable(&self, on: bool) {
         self.inner.lock().thp_disable = on;
+    }
+
+    /// `prctl(PR_GET_KEEPCAPS)`.
+    pub fn keep_caps(&self) -> bool {
+        self.inner.lock().keep_caps
+    }
+
+    /// Record `PR_SET_KEEPCAPS`.
+    pub fn set_keep_caps(&self, on: bool) {
+        self.inner.lock().keep_caps = on;
     }
 
     /// Get futex object.
@@ -3451,13 +3473,7 @@ impl LinuxProcess {
     /// (e.g. SIGINT) jumps into the shell's handler with the new applet's
     /// uninitialised globals (`ptr_to_globals == NULL`) and crashes.
     pub fn reset_signal_actions_for_exec(&self) {
-        use crate::signal::{SIG_DFL, SIG_IGN};
-        let mut inner = self.inner.lock();
-        for action in inner.signal_actions.table.iter_mut() {
-            if action.handler != SIG_DFL && action.handler != SIG_IGN {
-                *action = SignalAction::default();
-            }
-        }
+        flush_signal_handlers(&mut self.inner.lock().signal_actions.table);
     }
 
     /// Close file that FD_CLOEXEC is set
@@ -3828,6 +3844,9 @@ impl LinuxProcessInner {
         if privileged {
             self.pdeathsig = 0;
         }
+        // `cap_bprm_creds_from_file`: `SECBIT_KEEP_CAPS` does not survive an
+        // exec, privileged or not.
+        self.keep_caps = false;
 
         // Left alone on purpose, because execve(2) and friends say so: the
         // file table (minus close-on-exec, done by `remove_cloexec_files`),
@@ -3880,6 +3899,7 @@ impl LinuxProcessInner {
             personality: self.personality,
             abi: self.abi,
             thp_disable: self.thp_disable,
+            keep_caps: self.keep_caps,
             // The heap. `fork` copies the address space, so the heap is there
             // in the child -- but the bookkeeping that says where it ends was
             // starting from zero, and `sys_brk` answers every call with the
@@ -4691,6 +4711,58 @@ fn discards_when_pending(handler: usize, sig: LinuxSignal) -> bool {
     handler == SIG_DFL && signal_default_action_ignores(sig)
 }
 
+/// `flush_signal_handlers(t, force_default = 0)` (kernel/signal.c), what an
+/// `execve` does to the disposition table: a caught signal goes back to
+/// `SIG_DFL`, an ignored one stays ignored, and EVERY entry loses its
+/// `sa_flags`, `sa_mask` and restorer, the ignored and default ones too.
+///
+/// The flags of a `SIG_DFL`/`SIG_IGN` entry used to survive the exec. A
+/// parent that set SIGCHLD to `SIG_DFL` with `SA_NOCLDWAIT` and then
+/// exec'd a shell handed that shell a table in which its children are
+/// reaped on their own, so its `waitpid` got ECHILD for every job; and a
+/// `sigaction(sig, NULL, &old)` after the exec reported the stale flags.
+pub fn flush_signal_handlers(table: &mut [SignalAction]) {
+    use crate::signal::SIG_IGN;
+    for action in table.iter_mut() {
+        *action = if action.handler == SIG_IGN {
+            SignalAction {
+                handler: SIG_IGN,
+                ..SignalAction::default()
+            }
+        } else {
+            SignalAction::default()
+        };
+    }
+}
+
+/// `do_sigaction` after storing a disposition: when the new one ignores the
+/// signal (`SIG_IGN`, or `SIG_DFL` for a signal whose default is to ignore),
+/// "any pending instances of the signal are discarded" (sigaction(2)), from
+/// every thread of the process, blocked or not
+/// (`flush_sigqueue_mask` over `shared_pending` and each `t->pending`).
+///
+/// The table store used to be all there was: block SIGUSR1, raise it, set
+/// it to `SIG_IGN`, and `sigpending()` still listed it; a handler installed
+/// again before unblocking then got the stale signal.
+pub fn set_signal_action_in(process: &Arc<Process>, signal: LinuxSignal, action: SignalAction) {
+    use crate::thread::ThreadExt;
+    process.linux().set_signal_action(signal, action);
+    if !discards_when_pending(action.handler, signal) {
+        return;
+    }
+    for tid in process.thread_ids() {
+        if let Ok(thread) = process.get_child(tid) {
+            if let Ok(thread) = thread.downcast_arc::<Thread>() {
+                if let Some(mut lt) = thread.try_lock_linux() {
+                    if lt.signals.contains(signal) {
+                        lt.take_siginfo(signal);
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// `sig_kernel_ignore()`: the signals whose *default* action is to do nothing.
 ///
 /// Deliberately not the complement of [`signal_default_action_interrupts`]:
@@ -5281,6 +5353,7 @@ mod fork_inheritance_tests {
             dumpable: Some(0),
             personality: 0x0004_0000,
             thp_disable: true,
+            keep_caps: true,
             children_utime_ns: 111,
             children_stime_ns: 222,
             pdeathsig: 15,
@@ -5408,6 +5481,7 @@ mod fork_inheritance_tests {
         assert_eq!(child.dumpable, Some(0));
         assert_eq!(child.personality, 0x0004_0000);
         assert!(child.thp_disable);
+        assert!(child.keep_caps, "SECBIT_KEEP_CAPS is inherited");
     }
 
     #[test]
@@ -5620,6 +5694,19 @@ mod exec_reset_tests {
         // 0 answers that question for a user who is not in group 0.
         inner.credentials.groups = vec![1000];
         inner
+    }
+
+    /// `SECBIT_KEEP_CAPS` is cleared by every exec, the unprivileged one
+    /// included, while `pdeathsig` (checked elsewhere) goes only with the
+    /// privileged one.
+    #[test]
+    fn an_exec_clears_keep_caps_whether_or_not_it_is_privileged() {
+        for privileged in [false, true] {
+            let mut inner = a_process_about_to_exec();
+            inner.keep_caps = true;
+            inner.reset_for_exec(privileged);
+            assert!(!inner.keep_caps, "privileged = {}", privileged);
+        }
     }
 
     #[test]
@@ -6140,6 +6227,7 @@ mod capability_tests {
         (CAP_SYS_ADMIN, "CAP_SYS_ADMIN"),
         (CAP_SYS_BOOT, "CAP_SYS_BOOT"),
         (CAP_SYS_TIME, "CAP_SYS_TIME"),
+        (CAP_SYSLOG, "CAP_SYSLOG"),
     ];
 
     #[test]
@@ -6149,6 +6237,7 @@ mod capability_tests {
         assert_eq!(CAP_SYS_ADMIN, 21);
         assert_eq!(CAP_SYS_BOOT, 22);
         assert_eq!(CAP_SYS_TIME, 25);
+        assert_eq!(CAP_SYSLOG, 34);
         // CAP_CHECKPOINT_RESTORE, the last one Linux 5.15 defines.
         assert_eq!(CAP_LAST_CAP, 40);
     }
@@ -10394,6 +10483,119 @@ mod sigchld_tests {
         let (pid, status, _) =
             async_std::task::block_on(wait_child_any(&parent, true, true)).unwrap();
         assert_eq!((pid, status), (child.id(), wait_status_exited(5)));
+    }
+}
+
+#[cfg(test)]
+mod disposition_change_tests {
+    //! What changing a disposition does beyond the table: an exec, and a
+    //! new disposition that ignores.
+
+    extern crate std;
+
+    use super::*;
+    use crate::signal::{SignalAction, SignalActionFlags, SIG_DFL, SIG_IGN};
+    use crate::thread::ThreadExt;
+    use rcore_fs_ramfs::RamFS;
+
+    const CAUGHT: usize = 0x4000_1000;
+
+    fn entry(handler: usize) -> SignalAction {
+        SignalAction {
+            handler,
+            flags: SignalActionFlags::NOCLDWAIT | SignalActionFlags::RESTART,
+            restorer: 0x5000,
+            mask: Sigset::new(0xff),
+        }
+    }
+
+    /// An exec puts a caught signal back to default, keeps an ignored one
+    /// ignored, and strips flags, mask and restorer from all three.
+    #[test]
+    fn an_exec_keeps_only_whether_a_signal_is_ignored() {
+        let mut table = [entry(CAUGHT), entry(SIG_IGN), entry(SIG_DFL)];
+        flush_signal_handlers(&mut table);
+        assert_eq!(table[0].handler, SIG_DFL, "caught goes to default");
+        assert_eq!(table[1].handler, SIG_IGN, "ignored stays ignored");
+        assert_eq!(table[2].handler, SIG_DFL);
+        for (i, action) in table.iter().enumerate() {
+            assert!(action.flags.is_empty(), "entry {} kept its flags", i);
+            assert_eq!(action.restorer, 0, "entry {}", i);
+            assert!(action.mask.is_empty(), "entry {} kept its mask", i);
+        }
+    }
+
+    /// A process with two threads, SIGUSR1 blocked in both and pending in
+    /// the first (blocked at send time, so it was queued rather than
+    /// delivered), and SIGCHLD pending in the second.
+    fn with_pending(pid: KoID) -> (Arc<Process>, Arc<Thread>, Arc<Thread>) {
+        let proc = Process::create_with_fixed_id_ext(
+            &ROOT_JOB,
+            pid,
+            "pending",
+            LinuxProcess::new(RamFS::new(), 0),
+        )
+        .unwrap();
+        let first = Thread::create_linux(&proc).unwrap();
+        let second = Thread::create_linux(&proc).unwrap();
+        let usr1 = Sigset::new(1 << (LinuxSignal::SIGUSR1 as u64 - 1));
+        first.lock_linux().set_signal_mask(usr1);
+        second.lock_linux().set_signal_mask(usr1);
+        proc.linux()
+            .set_signal_action(LinuxSignal::SIGCHLD, entry(CAUGHT));
+        send_signal_to_process(pid as usize, LinuxSignal::SIGUSR1).unwrap();
+        second.lock_linux().queue_signal(
+            LinuxSignal::SIGCHLD,
+            Some(SigInfo::bare(LinuxSignal::SIGCHLD)),
+        );
+        assert!(first.lock_linux().signals.contains(LinuxSignal::SIGUSR1));
+        assert!(second.lock_linux().signals.contains(LinuxSignal::SIGCHLD));
+        (proc, first, second)
+    }
+
+    /// `SIG_IGN` discards the pending instance in the thread that holds it,
+    /// blocked though it is, and the `siginfo_t` with it.
+    #[test]
+    fn ignoring_a_signal_discards_what_was_pending_in_every_thread() {
+        let (proc, first, second) = with_pending(43_501);
+        set_signal_action_in(&proc, LinuxSignal::SIGUSR1, entry(SIG_IGN));
+        assert!(!first.lock_linux().signals.contains(LinuxSignal::SIGUSR1));
+        assert!(
+            second.lock_linux().signals.contains(LinuxSignal::SIGCHLD),
+            "others stay"
+        );
+        assert_eq!(
+            proc.linux().signal_action(LinuxSignal::SIGUSR1).handler,
+            SIG_IGN
+        );
+    }
+
+    /// `SIG_DFL` discards only for a signal whose default is to ignore.
+    #[test]
+    fn default_discards_only_when_the_default_ignores() {
+        let (proc, first, second) = with_pending(43_502);
+        set_signal_action_in(&proc, LinuxSignal::SIGUSR1, entry(SIG_DFL));
+        assert!(
+            first.lock_linux().signals.contains(LinuxSignal::SIGUSR1),
+            "SIGUSR1's default kills"
+        );
+        set_signal_action_in(&proc, LinuxSignal::SIGCHLD, entry(SIG_DFL));
+        assert!(
+            !second.lock_linux().signals.contains(LinuxSignal::SIGCHLD),
+            "SIGCHLD's default ignores"
+        );
+    }
+
+    /// A handler keeps what is pending: it is about to be delivered.
+    #[test]
+    fn a_handler_keeps_what_is_pending() {
+        let (proc, first, _second) = with_pending(43_503);
+        set_signal_action_in(&proc, LinuxSignal::SIGUSR1, entry(CAUGHT));
+        assert!(first.lock_linux().signals.contains(LinuxSignal::SIGUSR1));
+        assert_eq!(
+            proc.linux().signal_action(LinuxSignal::SIGUSR1).handler,
+            CAUGHT
+        );
     }
 }
 
