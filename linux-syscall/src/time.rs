@@ -848,9 +848,7 @@ impl Syscall<'_> {
                 .deadline
                 .map(|d| d.saturating_sub(now))
                 .unwrap_or_default();
-            // Round up: returning 0 would mean "no alarm was pending".
-            let remaining_secs =
-                remaining.as_secs() as usize + usize::from(remaining.subsec_nanos() > 0);
+            let remaining_secs = alarm_remaining_secs(remaining);
             slot.generation += 1;
             slot.interval = Duration::ZERO;
             if seconds == 0 {
@@ -2516,5 +2514,40 @@ mod timer_signal_tests {
         let ok = timer_notify_from_sigevent(&event(1, 34, SIGEV_THREAD_ID, 77), mine).unwrap();
         assert_eq!(ok.thread, Some(77));
         assert_eq!((ok.signo, ok.value), (34, 1));
+    }
+}
+
+/// What `alarm(2)` returns for the alarm it replaced: the seconds left,
+/// rounded as `alarm_setitimer` (kernel/time/itimer.c) rounds them. A
+/// remainder of half a second or more rounds up; below that it rounds down,
+/// except that anything at all left never reads as 0, since 0 means no alarm
+/// was pending. It used to round every remainder up, so an alarm with 3.2 s
+/// to go reported 4.
+pub(crate) fn alarm_remaining_secs(remaining: Duration) -> usize {
+    let secs = remaining.as_secs() as usize;
+    let nanos = remaining.subsec_nanos();
+    let up = nanos >= 500_000_000 || (secs == 0 && nanos > 0);
+    secs + usize::from(up)
+}
+
+#[cfg(test)]
+mod alarm_rounding_tests {
+    //! The seconds `alarm(2)` reports, rounded as Linux rounds them.
+
+    use super::*;
+
+    /// Half a second and up rounds up, less rounds down, and a fraction of
+    /// the first second is 1 rather than "no alarm".
+    #[test]
+    fn the_seconds_left_round_to_nearest_and_never_to_zero() {
+        let ms = Duration::from_millis;
+        assert_eq!(alarm_remaining_secs(ms(0)), 0, "no alarm was pending");
+        assert_eq!(alarm_remaining_secs(ms(1)), 1);
+        assert_eq!(alarm_remaining_secs(ms(499)), 1);
+        assert_eq!(alarm_remaining_secs(ms(3_000)), 3);
+        assert_eq!(alarm_remaining_secs(ms(3_200)), 3, "used to be 4");
+        assert_eq!(alarm_remaining_secs(ms(3_499)), 3);
+        assert_eq!(alarm_remaining_secs(ms(3_500)), 4);
+        assert_eq!(alarm_remaining_secs(ms(3_999)), 4);
     }
 }

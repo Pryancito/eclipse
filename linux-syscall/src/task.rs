@@ -114,6 +114,29 @@ fn child_rusage(cpu: linux_object::process::ChildCpu) -> RUsage {
     }
 }
 
+/// The end of `wait4(2)`: the pid of the child found, with its status and
+/// CPU time in the two out-pointers, or 0 with both left alone.
+///
+/// `kernel_wait4` writes `*wstatus` only `if (ret > 0 && stat_addr)`.
+/// `WNOHANG` finding nothing used to write 0 there, so a caller that kept
+/// the last status in the variable (a `while (waitpid(-1, &status,
+/// WNOHANG) > 0)` loop that reads `status` afterwards is the common shape)
+/// had it zeroed by the call that ended the loop. The `rusage`
+/// used to be dropped entirely, leaving callers to read whatever stack
+/// garbage sat in their buffer.
+pub(crate) fn wait4_finish(
+    mut wstatus: UserOutPtr<i32>,
+    mut rusage: UserOutPtr<RUsage>,
+    found: Option<(KoID, i32, linux_object::process::ChildCpu)>,
+) -> SysResult {
+    let Some((pid, code, cpu)) = found else {
+        return Ok(0);
+    };
+    wstatus.write_if_not_null(code)?;
+    rusage.write_if_not_null(child_rusage(cpu))?;
+    Ok(pid as usize)
+}
+
 /// What `waitid(2)` leaves in its two out-pointers.
 pub(crate) struct WaitidReport {
     /// `infop`, always written: the `SIGCHLD` `siginfo_t` of the child
@@ -710,9 +733,9 @@ impl Syscall<'_> {
     pub async fn sys_wait4(
         &self,
         pid: i32,
-        mut wstatus: UserOutPtr<i32>,
+        wstatus: UserOutPtr<i32>,
         options: u32,
-        mut rusage: UserOutPtr<RUsage>,
+        rusage: UserOutPtr<RUsage>,
     ) -> SysResult {
         #[derive(Debug)]
         enum WaitTarget {
@@ -768,20 +791,13 @@ impl Syscall<'_> {
                     .map(|(code, cpu)| (pid, code, cpu))
             }
         };
-        let (pid, code, cpu) = match result {
-            Ok(tuple) => tuple,
-            Err(LxError::EAGAIN) if nohang => {
-                // WNOHANG: no child ready yet — return 0 per POSIX waitpid(2).
-                wstatus.write_if_not_null(0)?;
-                return Ok(0);
-            }
+        let found = match result {
+            Ok(tuple) => Some(tuple),
+            // WNOHANG: no child ready yet, which is 0 (waitpid(2)).
+            Err(LxError::EAGAIN) if nohang => None,
             Err(e) => return Err(e),
         };
-        wstatus.write_if_not_null(code)?;
-        // The argument used to be dropped entirely, leaving callers to read
-        // whatever stack garbage sat in their buffer.
-        rusage.write_if_not_null(child_rusage(cpu))?;
-        Ok(pid as usize)
+        wait4_finish(wstatus, rusage, found)
     }
 
     /// Wait for a child state change (`waitid(2)`). Supports `P_PID`, `P_PIDFD`, and `P_ALL`.
@@ -2895,6 +2911,59 @@ mod wait_option_tests {
                 stray
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod wait4_finish_tests {
+    //! `wait4(2)`'s out-pointers when `WNOHANG` finds nothing.
+
+    use super::*;
+    use linux_object::process::ChildCpu;
+
+    /// Nothing found is 0 and both out-pointers untouched: the status the
+    /// caller kept there stays.
+    #[test]
+    fn nothing_found_leaves_the_status_and_the_rusage_alone() {
+        let mut status: i32 = 0x1234;
+        let mut rusage = RUsage::default();
+        rusage.utime.sec = 9;
+        let ws = UserOutPtr::from(&mut status as *mut i32 as usize);
+        let ru = UserOutPtr::from(&mut rusage as *mut RUsage as usize);
+        assert_eq!(wait4_finish(ws, ru, None), Ok(0));
+        assert_eq!(status, 0x1234, "the status the caller kept");
+        assert_eq!(rusage.utime.sec, 9);
+        // Null pointers are fine either way.
+        assert_eq!(
+            wait4_finish(UserOutPtr::from(0), UserOutPtr::from(0), None),
+            Ok(0)
+        );
+    }
+
+    /// A child found is its pid, its status and its CPU time.
+    #[test]
+    fn a_child_found_is_its_pid_with_status_and_cpu_time_written() {
+        let mut status: i32 = 0x1234;
+        let mut rusage = RUsage::default();
+        let ws = UserOutPtr::from(&mut status as *mut i32 as usize);
+        let ru = UserOutPtr::from(&mut rusage as *mut RUsage as usize);
+        let cpu = ChildCpu {
+            utime_ns: 1_500_000_000,
+            stime_ns: 250_000,
+        };
+        assert_eq!(wait4_finish(ws, ru, Some((4242, 7 << 8, cpu))), Ok(4242));
+        assert_eq!(status, 7 << 8);
+        assert_eq!((rusage.utime.sec, rusage.utime.usec), (1, 500_000));
+        assert_eq!((rusage.stime.sec, rusage.stime.usec), (0, 250));
+        // With null pointers the pid still comes back.
+        let cpu = ChildCpu {
+            utime_ns: 0,
+            stime_ns: 0,
+        };
+        assert_eq!(
+            wait4_finish(UserOutPtr::from(0), UserOutPtr::from(0), Some((5, 0, cpu))),
+            Ok(5)
+        );
     }
 }
 
