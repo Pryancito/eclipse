@@ -2,6 +2,6 @@
 //! Re-exported from zcore-drivers to avoid circular dependencies.
 
 pub use crate::drivers::utils::deferred_job::{
-    drain_deferred_jobs, drain_deferred_jobs_max, pending_deferred_jobs, push_deferred_job,
-    push_deferred_job_front,
+    drain_deferred_jobs, drain_deferred_jobs_max, evicted_deferred_jobs, pending_deferred_jobs,
+    push_deferred_job, push_deferred_job_front,
 };
