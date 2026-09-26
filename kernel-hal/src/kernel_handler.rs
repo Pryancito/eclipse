@@ -33,7 +33,9 @@ pub trait KernelHandler: Send + Sync + 'static {
     /// physical frames. The heap is a fixed arena, and exhausting it kills the
     /// machine through `alloc_error` — on hardware:
     ///
-    ///     [PANIC] cpu=10 ... memory allocation of 24576 bytes failed
+    /// ```text
+    /// [PANIC] cpu=10 ... memory allocation of 24576 bytes failed
+    /// ```
     ///
     /// Nothing in `/proc` showed that number, so the growth could only be seen
     /// as the crash. `/proc/meminfo` and `/proc/kheap` report it now.
@@ -58,8 +60,10 @@ pub trait KernelHandler: Send + Sync + 'static {
     /// a wild pointer from a library, a freed mapping — the kernel takes a page
     /// fault it has no fixup for and the machine dies:
     ///
-    ///     [KERNEL PAGE FAULT] vaddr=0x7125048a65 rip=<sys_futex...>
+    /// ```text
+    /// [KERNEL PAGE FAULT] vaddr=0x7125048a65 rip=<sys_futex...>
     ///         (unresolved by the user vmar)
+    /// ```
     ///
     /// which is a kernel DoS reachable from any syscall, by any process.
     ///

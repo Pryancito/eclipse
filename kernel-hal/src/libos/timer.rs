@@ -41,7 +41,9 @@ static WALL_CLOCK_OFFSET_NS: AtomicI64 = AtomicI64::new(0);
 /// timestamp the kernel stamps on a file said 1970 while hostfs handed back the
 /// host's real mtimes, and `functional/stat.exe` failed on exactly that:
 ///
-///     st.st_ctime<=t failed: 1790001664 > 2497
+/// ```text
+/// st.st_ctime<=t failed: 1790001664 > 2497
+/// ```
 ///
 /// Anything that compares a file's time against the clock -- `make`, `find
 /// -newer`, a cache's freshness check -- saw the whole filesystem dated decades

@@ -302,9 +302,6 @@ pub fn set_clock_observer(observer: fn()) {
 /// Invoke the observer, if one is registered.
 pub(crate) fn notify_clock_changed() {
     let observer = CLOCK_OBSERVER.load(Ordering::Acquire);
-    if observer == 0 {
-        return;
-    }
     // Soft-smash can leave a truncated .text low32 in this AtomicUsize, and
     // this is about to `transmute` it and *call* it. The high-bits test this
     // used to be caught the truncation and nothing else: every stack and
@@ -312,12 +309,25 @@ pub(crate) fn notify_clock_changed() {
     // scribbled with a stack pointer -- the commonest residue of all, and the
     // one the whole soft-smash hunt is about -- passed the guard and was
     // jumped to. A function pointer belongs in `.text`; ask that.
-    #[cfg(all(target_arch = "x86_64", not(test)))]
-    {
-        if !crate::kaddr::is_kernel_text(observer as u64) {
+    //
+    // Asked through `lock::fn_slot`, which is where the kernel's other six hook
+    // slots ask it too, and no longer only on x86_64: the window is published
+    // from the x86_64 boot path alone, so the other two get `Unchecked` and the
+    // same behaviour they had, but the day either publishes one they are
+    // covered without a second guard being written.
+    //
+    // `classify` and not `live_fn` because the two refusals are not the same
+    // news: an unregistered observer is every boot before the vDSO is built,
+    // and a foreign word is a smash to note.
+    use lock::fn_slot::Slot;
+    let (text_lo, text_hi) = lock::fn_slot::text_range();
+    match lock::fn_slot::classify(observer, text_lo, text_hi) {
+        Slot::Empty => return,
+        Slot::Foreign => {
             zcore_drivers::utils::note_heap_smash_suspected();
             return;
         }
+        Slot::Text | Slot::Unchecked => {}
     }
     // Safe: the only value ever stored is a `fn()` cast from a live
     // function pointer, and it is never unregistered (unless smashed).

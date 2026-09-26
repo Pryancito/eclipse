@@ -86,6 +86,13 @@ impl CpuTopology {
     /// Hand out the next dense logical id to the CPU whose hardware id is
     /// `hw_id`, or `None` when the table is full.
     ///
+    /// A CPU already registered gets back the id it already has: one hardware
+    /// CPU has one logical id, and nothing outside this registry can enforce
+    /// that, because nothing outside it ever sees a hardware id again. Callers
+    /// that must tell "already known" from "newly handed out" -- x86_64's AP
+    /// bring-up, which is about to send INIT to this id -- ask
+    /// [`logical_of_hw`](Self::logical_of_hw) first.
+    ///
     /// `None` rather than a panic: this runs on the BSP in the middle of AP
     /// bring-up, where the caller's answer to "one core too many" is to stop
     /// launching APs and boot with the ones it has, not to take the machine
@@ -94,6 +101,39 @@ impl CpuTopology {
     /// firmware reports, and `count` is what userspace reads as the CPU count
     /// through `/proc/cpuinfo` and `sched_getaffinity`.
     pub fn register(&self, hw_id: u32) -> Option<usize> {
+        // A hardware id this registry already holds keeps the id it already
+        // has, and consumes nothing. Nothing used to stop one physical CPU
+        // holding two dense ids, and the registry is the only place that can
+        // tell: everything above it sees ids, not hardware.
+        //
+        // It is reachable on every architecture. The `acpi` crate decides
+        // which MADT entry is the boot processor purely by *order* -- the
+        // first Local APIC entry it reads -- and never compares it against
+        // the id of the CPU actually running, so on a machine whose firmware
+        // does not list the boot core first, x86_64's AP list contains the
+        // BSP's own LAPIC id. Firmware that lists one core twice does the
+        // same thing directly. On riscv and aarch64 each CPU registers
+        // itself, so any path that reaches `register_logical_id` a second
+        // time on one core is the same fault.
+        //
+        // What a second id costs: `count()` is what userspace reads as the
+        // CPU count through `/proc/cpuinfo` and `sched_getaffinity`, so it
+        // gains a core that does not exist; both ids answer `hw_id` with the
+        // same hardware id, so a shootdown "broadcast" reaches that core
+        // twice and its initiator waits for two acknowledgements when only
+        // one CPU is there to send them -- the wait with no timeout in
+        // [`remote_flush_tlb_on`](super::ipi::remote_flush_tlb_on); and the
+        // second `set_logical_cpu_id` the caller makes hands `lock` a new
+        // identity for a CPU that is already running under the old one.
+        //
+        // The scan and the claim are not one atomic step. They do not need to
+        // be: two callers racing here with the *same* hardware id are two
+        // callers each claiming to be the same CPU, which no bring-up path
+        // does -- x86_64 registers every CPU from the BSP alone, and the
+        // other two have each CPU register the one id only it can read.
+        if let Some(logical) = self.logical_of_hw(hw_id) {
+            return Some(logical);
+        }
         let logical = self
             .count
             .try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
@@ -150,6 +190,33 @@ impl CpuTopology {
         let previous = self.hw_of_logical[logical].swap(hw_id, Ordering::AcqRel);
         self.registered.fetch_or(1u64 << logical, Ordering::Release);
         (was_registered && previous != hw_id).then_some(previous)
+    }
+
+    /// The dense logical id already handed out to `hw_id`, or `None` when no
+    /// CPU with that hardware id is wired right now.
+    ///
+    /// The reverse of [`hw_id`](Self::hw_id), and the question bring-up has to
+    /// ask *before* it starts a core: a hardware id this registry already
+    /// knows is not a CPU waiting to be launched, it is a CPU that is already
+    /// running -- possibly the one asking. x86_64 sends INIT to the id the
+    /// firmware handed it, and INIT at the boot processor's own LAPIC resets
+    /// the machine in the middle of bring-up.
+    ///
+    /// Only the wired ids are looked at. `hw_of_logical` reads zero in every
+    /// slot nobody registered, and zero is the boot CPU's hardware id on all
+    /// three architectures, so a scan that trusted the table alone would
+    /// answer "hardware id 0 is logical 1" on a machine where logical 1 does
+    /// not exist.
+    pub fn logical_of_hw(&self, hw_id: u32) -> Option<usize> {
+        let mut wired = self.registered.load(Ordering::Acquire);
+        while wired != 0 {
+            let logical = wired.trailing_zeros() as usize;
+            wired &= wired - 1;
+            if self.hw_of_logical[logical].load(Ordering::Acquire) == hw_id {
+                return Some(logical);
+            }
+        }
+        None
     }
 
     /// The hardware id to address `logical` with, or `None` when no CPU was
@@ -434,8 +501,10 @@ mod topology_tests {
     #[test]
     fn the_last_id_the_tables_hold_is_a_usable_one() {
         let t = topology();
-        for _ in 0..MAX_CORE_NUM - 1 {
-            t.register(0);
+        // Distinct hardware ids, because one CPU registered twice keeps the one
+        // id it has: filling the table takes as many real cores as it holds.
+        for i in 0..MAX_CORE_NUM - 1 {
+            t.register(i as u32);
         }
         let last = t.register(0x7f).unwrap();
         assert_eq!(last, MAX_CORE_NUM - 1);
@@ -691,5 +760,210 @@ mod both_directions_tests {
         assert_eq!(topo.register(0xdead), None);
         assert!(!ids.register(0xdead, MAX_CORE_NUM as u8));
         assert_eq!(ids.resolve(0xdead), NO_CPU);
+    }
+}
+
+/// One hardware CPU, one dense logical id.
+///
+/// The registry is the last place that can hold this: above it nothing sees a
+/// hardware id again, so a physical core holding two logical ids is invisible
+/// from there — and it is not a cosmetic double-count. Both ids answer
+/// [`hw_id`](CpuTopology::hw_id) with the same hardware id, so a shootdown
+/// addressed to both reaches one core and its initiator waits for two
+/// acknowledgements in the loop that has no timeout; [`count`](
+/// CpuTopology::count) is what userspace reads as the CPU count through
+/// `/proc/cpuinfo` and `sched_getaffinity`; and on x86_64 the bring-up was
+/// about to send INIT to that id, which — when the id is the boot processor's
+/// own — resets the machine in the middle of bring-up.
+///
+/// It is reachable without any firmware being wrong on purpose. The `acpi`
+/// crate names the boot processor by MADT *order*, the first Local APIC entry
+/// it reads, and never compares it against the id of the CPU actually running.
+#[cfg(test)]
+mod one_cpu_one_id_tests {
+    use super::*;
+    use lock::cpuid::{LogicalIdMap, NO_CPU};
+
+    #[test]
+    fn the_same_hardware_cpu_registered_twice_keeps_one_logical_id() {
+        let t = CpuTopology::new();
+        assert_eq!(t.register(0x00), Some(0));
+        assert_eq!(t.register(0x04), Some(1));
+        assert_eq!(
+            t.register(0x04),
+            Some(1),
+            "the second registration handed out a second id for one core"
+        );
+        assert_eq!(
+            t.count(),
+            2,
+            "the CPU count gained a core that does not exist, and that count is \
+             what /proc/cpuinfo and sched_getaffinity report"
+        );
+        assert_eq!(t.hw_id(2), None, "logical 2 answers for a CPU nobody has");
+    }
+
+    #[test]
+    fn a_second_registration_of_one_cpu_does_not_spend_an_id_a_real_cpu_needs() {
+        let t = CpuTopology::new();
+        for i in 0..MAX_CORE_NUM - 1 {
+            assert_eq!(t.register(0x100 + i as u32), Some(i));
+        }
+        // One slot left. A CPU the registry already knows must not take it.
+        assert_eq!(t.register(0x100), Some(0));
+        assert_eq!(
+            t.register(0xbeef),
+            Some(MAX_CORE_NUM - 1),
+            "a duplicate consumed the last id, so the last real core got none"
+        );
+        assert_eq!(t.register(0xf00d), None);
+    }
+
+    #[test]
+    fn the_boot_cpu_listed_among_the_application_processors_is_recognised() {
+        // Exactly what x86_64 bring-up faces: the BSP registers itself first,
+        // then walks the AP list the MADT gave it. `logical_of_hw` answering
+        // `Some` is the whole of what stops `send_init_ipi` at the boot
+        // processor's own LAPIC.
+        let t = CpuTopology::new();
+        let bsp = 0x1e;
+        assert_eq!(t.register(bsp), Some(0));
+        for &ap in &[0x20u32, bsp, 0x22] {
+            if let Some(known) = t.logical_of_hw(ap) {
+                assert_eq!(known, 0, "the id already held is the BSP's");
+                continue;
+            }
+            assert!(t.register(ap).is_some());
+        }
+        assert_eq!(t.count(), 3, "the BSP was started as if it were an AP");
+        assert_eq!(t.hw_id(1), Some(0x20));
+        assert_eq!(t.hw_id(2), Some(0x22));
+    }
+
+    #[test]
+    fn a_core_the_firmware_lists_twice_is_started_once() {
+        // What the bring-up loop consults, over a list with one core in it
+        // twice — a firmware quirk, not a corrupted table. Each extra entry
+        // cost a 256 KiB AP stack and a phantom core in the CPU count.
+        let t = CpuTopology::new();
+        let mut launched = 0usize;
+        for &ap in &[0x40u32, 0x41, 0x40, 0x41, 0x42] {
+            if t.logical_of_hw(ap).is_none() {
+                assert!(t.register(ap).is_some());
+                launched += 1;
+            }
+        }
+        assert_eq!(launched, 3, "one core was launched twice");
+        assert_eq!(t.count(), 3);
+    }
+
+    #[test]
+    fn a_hardware_id_nobody_registered_has_no_logical_id() {
+        let t = CpuTopology::new();
+        t.register(0x07);
+        assert_eq!(t.logical_of_hw(0x08), None);
+        assert_eq!(t.logical_of_hw(0xffff_ffff), None);
+    }
+
+    #[test]
+    fn hardware_id_zero_is_told_apart_from_the_slots_nobody_wired() {
+        // `hw_of_logical` reads zero in every slot nobody registered, and zero
+        // is the boot CPU's hardware id on all three architectures. A scan
+        // that trusted the table instead of the `registered` mask would answer
+        // "hardware id 0 is logical 1" on a machine that has one core, and the
+        // bring-up would then skip the real boot CPU as already known.
+        let t = CpuTopology::new();
+        assert_eq!(t.register(0x05), Some(0));
+        assert_eq!(
+            t.logical_of_hw(0x00),
+            None,
+            "an empty slot answered for hardware id 0"
+        );
+        assert_eq!(t.logical_of_hw(0x05), Some(0));
+        // And once a CPU really does have hardware id 0, it is found.
+        assert_eq!(t.register(0x00), Some(1));
+        assert_eq!(t.logical_of_hw(0x00), Some(1));
+    }
+
+    #[test]
+    fn an_id_given_back_stops_answering_for_the_cpu_it_named() {
+        let t = CpuTopology::new();
+        t.register(0x00);
+        assert_eq!(t.register(0x30), Some(1));
+        assert!(t.unregister(1));
+        assert_eq!(
+            t.logical_of_hw(0x30),
+            None,
+            "an AP that was never startable still answers for its LAPIC id, so \
+             bring-up would skip the core when firmware lists it again"
+        );
+        // The stale hardware id is still in the table — only the mask says it
+        // is not wired, which is what the scan has to honour.
+        assert_eq!(t.register(0x30), Some(1));
+        assert_eq!(t.logical_of_hw(0x30), Some(1));
+    }
+
+    #[test]
+    fn a_reused_id_answers_for_its_new_cpu_and_not_the_old_one() {
+        let t = CpuTopology::new();
+        t.register(0x00);
+        assert_eq!(t.register(0x30), Some(1));
+        assert!(t.unregister(1));
+        assert_eq!(t.register(0x31), Some(1));
+        assert_eq!(t.logical_of_hw(0x31), Some(1));
+        assert_eq!(
+            t.logical_of_hw(0x30),
+            None,
+            "logical 1 still answers for the CPU it used to be"
+        );
+    }
+
+    #[test]
+    fn a_cpu_that_turns_out_to_be_another_cpu_can_be_noticed_before_it_is_confirmed() {
+        // The ids bring-up knows are provisional: the MADT's, and the 8-bit one
+        // an AP can read before its own LAPIC leaves xAPIC mode. When the truth
+        // an AP reports is a hardware id another logical id already holds, the
+        // two alias from that moment on, and `confirm` alone cannot say so —
+        // it only reports the id it replaced.
+        let t = CpuTopology::new();
+        assert_eq!(t.register(0x04), Some(0));
+        assert_eq!(t.register(0x99), Some(1));
+        // Logical 1 wakes up and reports 0x04, which is logical 0's.
+        assert_eq!(
+            t.logical_of_hw(0x04),
+            Some(0),
+            "the alias is invisible, so two logical ids IPI one core in silence"
+        );
+        assert_eq!(t.confirm(1, 0x04), Some(0x99));
+    }
+
+    #[test]
+    fn the_boot_cpu_in_the_ap_list_does_not_get_a_second_identity_in_either_map() {
+        // The forward map is the half that costs the running CPU. A second
+        // `set_logical_cpu_id` for the BSP's own LAPIC id replaces the identity
+        // it is already running under, so `lock` brackets its guards on another
+        // CPU's depth counter while its per-CPU block still says logical 0 —
+        // the split that makes `pop_off` panic on a lock it is told it does not
+        // hold.
+        let topo = CpuTopology::new();
+        let ids = LogicalIdMap::new();
+        let bsp = 0x1e;
+        assert_eq!(topo.register(bsp), Some(0));
+        assert!(ids.register(bsp, 0));
+        for &ap in &[0x20u32, bsp] {
+            if topo.logical_of_hw(ap).is_some() {
+                continue;
+            }
+            let logical = topo.register(ap).expect("table full");
+            assert!(ids.register(ap, logical as u8));
+        }
+        assert_eq!(
+            ids.resolve(bsp),
+            0,
+            "the BSP now resolves to another CPU's logical id"
+        );
+        assert_eq!(ids.resolve(0x20), 1);
+        assert_eq!(ids.resolve(0x21), NO_CPU);
+        assert_eq!(topo.count(), 2);
     }
 }

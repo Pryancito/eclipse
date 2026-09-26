@@ -160,9 +160,11 @@ impl Drop for PublishGuard {
 /// It is also the probe that fires most: `entry_at` has caught this word
 /// wrong on most recent boots, and what it holds is telling —
 ///
-///     len=0xffffff00218688e0  size=0xffffff00006567c1   (two kernel pointers)
-///     len=18446742974756925680  size=18446742974756926704  (a pair 1024 apart)
-///     len=6  size=0
+/// ```text
+/// len=0xffffff00218688e0  size=0xffffff00006567c1   (two kernel pointers)
+/// len=18446742974756925680  size=18446742974756926704  (a pair 1024 apart)
+/// len=6  size=0
+/// ```
 ///
 /// — foreign data, not a single stray byte. A `Vec` that is allocated once by
 /// a `lazy_static` and never freed cannot be written by its owner, so either
@@ -888,6 +890,151 @@ fn should_escalate(spins: u64, unmaskable: bool) -> bool {
     unmaskable && spins != 0 && spins & ((1u64 << UNMASKABLE_SHIFT) - 1) == 0
 }
 
+// ─── When a slow ack wait is worth saying out loud ───────────────────────────
+//
+// The wait below has no timeout, on purpose: a shootdown that gives up leaves a
+// stale TLB entry, and that is worse than waiting. What it does instead is
+// report -- and the report was a local `bool`, so it fired **once per call to
+// `remote_flush_tlb_on`**, at a fixed spin count, and never again.
+//
+// That one knob is wrong in both directions at once:
+//
+//  * On a machine that is merely slow -- four vCPUs on one host thread under
+//    TCG, where a peer genuinely takes that long to be scheduled -- every
+//    shootdown that crosses the threshold prints a line. The init spawn issues
+//    thousands, so the console fills with a warning about a machine that is
+//    working.
+//  * On a machine that is wedged, the line prints once and then the machine
+//    goes quiet forever, however long it stays there. And that one line is
+//    deliberately written with the non-spinning console writer (a diagnostic
+//    must not be able to freeze the machine it is diagnosing), so it may be
+//    dropped on a busy lock -- leaving **no evidence at all** of a wait that is
+//    never going to end.
+//
+// The two cases want opposite things, so they have to be told apart, and the
+// wait already holds what tells them apart: the set of targets it is still
+// waiting on. A set that keeps shrinking is progress. A set that has not moved
+// for longer than it takes to have tried the unmaskable kick is not a slow
+// peer, it is a CPU that is not coming back -- and that is the one worth
+// repeating, because nothing else on that machine is going to say it.
+
+/// Spins before a wait says anything at all. Far past the healthy path, which
+/// acks in a handful of spins, and past several re-kicks and escalations.
+pub const STALL_FIRST_REPORT: u64 = 1 << 24;
+
+/// Each report past the first waits twice as long as the one before, up to this
+/// many doublings. Capped rather than unbounded so a wedged machine keeps
+/// leaving a trail at a fixed cadence instead of falling silent once the gaps
+/// outgrow anyone's patience.
+pub const STALL_MAX_DOUBLINGS: u32 = 4;
+
+/// How many reports a wait that is still making progress is allowed before it
+/// stops talking. Small, because the machine is working: what the line is worth
+/// is "this took a while", said once or twice, not once per shootdown.
+pub const STALL_MOVING_BUDGET: u32 = 2;
+
+/// How long the pending set must sit unchanged before the wait is called
+/// wedged. One full escalation interval, so by then the unmaskable kick has
+/// been sent at least once and did not move it -- which is the difference
+/// between a peer that is slow and a peer that is gone.
+pub const STALL_WEDGED_AFTER: u64 = 1u64 << UNMASKABLE_SHIFT;
+
+const _: () = assert!(
+    STALL_FIRST_REPORT > STALL_WEDGED_AFTER,
+    "the first report must come late enough that the wedged/slow question has \
+     an answer by then: a wait reported before one escalation interval has \
+     passed can only ever say 'slow'"
+);
+
+/// What a slow ack wait looks like when it is worth reporting.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum Stall {
+    /// The set of targets still owing an acknowledgement is changing, so peers
+    /// are answering; this wait is merely long.
+    Moving,
+    /// The same targets have owed the same acknowledgement across a full
+    /// escalation interval. They are not slow.
+    Wedged,
+}
+
+/// Decides when a slow ack wait speaks, and what it has the standing to claim.
+///
+/// One per wait, on the waiter's stack: the question it answers is about *this*
+/// wait's targets, and a shared one would mix two waits' pending sets into a
+/// progress claim that belongs to neither.
+pub struct StallWatch {
+    seen: bool,
+    pending: u64,
+    since: u64,
+    next_at: u64,
+    reports: u32,
+}
+
+impl Default for StallWatch {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl StallWatch {
+    pub const fn new() -> Self {
+        Self {
+            seen: false,
+            pending: 0,
+            since: 0,
+            next_at: STALL_FIRST_REPORT,
+            reports: 0,
+        }
+    }
+
+    /// Feed one turn of the wait: `pending` is the set of targets that still
+    /// owe an acknowledgement and `spins` the turn count. Answers `Some` on the
+    /// turns worth a line, and what that line may claim.
+    pub fn poll(&mut self, pending: u64, spins: u64) -> Option<Stall> {
+        if !self.seen || pending != self.pending {
+            self.seen = true;
+            self.pending = pending;
+            self.since = spins;
+        }
+        if spins < self.next_at {
+            return None;
+        }
+        let stall = if spins - self.since >= STALL_WEDGED_AFTER {
+            Stall::Wedged
+        } else {
+            Stall::Moving
+        };
+        // Arm the next report and count this one **before** deciding whether to
+        // say it. A suppressed report that left `next_at` where it was would
+        // come due again on the very next turn, so the budget would stop the
+        // line and not the work of deciding to drop it -- once per spin, in the
+        // hot loop the whole cadence exists to stay out of.
+        let step = STALL_FIRST_REPORT << self.reports.min(STALL_MAX_DOUBLINGS);
+        self.next_at = spins.saturating_add(step);
+        self.reports = self.reports.saturating_add(1);
+        if stall == Stall::Moving && self.reports > STALL_MOVING_BUDGET {
+            return None;
+        }
+        Some(stall)
+    }
+
+    /// Reports this wait has come due for, said or suppressed. Both count: they
+    /// are what the widening cadence is measured in.
+    pub fn reports(&self) -> u32 {
+        self.reports
+    }
+
+    /// How many turns the pending set has sat unchanged, for the report to
+    /// name. Zero before the first [`poll`](Self::poll).
+    pub fn unchanged_for(&self, spins: u64) -> u64 {
+        if self.seen {
+            spins.saturating_sub(self.since)
+        } else {
+            0
+        }
+    }
+}
+
 /// Cross-CPU TLB shootdown.
 ///
 /// x86 `flush_tlb` only invalidates the *local* CPU's TLB. Without this, after
@@ -1058,9 +1205,8 @@ pub(crate) fn remote_flush_tlb_on(me: usize, vaddr: Option<usize>, aspace: Optio
     // a CPU can leave idle and run user code with a stale TLB before taking the
     // pending IPI (TOCTOU). Spin-pump on ticket locks covers IRQs-off holders.
     // Soft warn after a long wait; keep waiting (correctness > latency).
-    const SPIN_WARN: u64 = 1 << 24;
     let mut spins: u64 = 0;
-    let mut warned = false;
+    let mut watch = StallWatch::new();
     loop {
         let mut all_acked = true;
         let mut pending = 0u64;
@@ -1129,8 +1275,7 @@ pub(crate) fn remote_flush_tlb_on(me: usize, vaddr: Option<usize>, aspace: Optio
         if should_escalate(spins, HAS_UNMASKABLE_KICK) {
             nmi_kick_pending_targets();
         }
-        if spins >= SPIN_WARN && !warned {
-            warned = true;
+        if let Some(stall) = watch.poll(pending, spins) {
             // try_lock, NOT `serial_write_fmt_spin`. This runs from a hot wait
             // loop with interrupts off, and the spinning writer takes the
             // console lock unconditionally -- its contract ("caller must
@@ -1143,13 +1288,20 @@ pub(crate) fn remote_flush_tlb_on(me: usize, vaddr: Option<usize>, aspace: Optio
             // writer, can never report it either. That is a silent full-machine
             // freeze: no serial, no screen, nothing, caused purely by the
             // diagnostic. A diagnostic must never be able to kill the machine
-            // it is diagnosing, so losing this one line to a busy lock is the
-            // right trade -- the detector's report is the one that matters.
+            // it is diagnosing, so losing a line to a busy lock is the right
+            // trade -- and it is survivable now that a wedged wait says it
+            // again rather than having had its one chance.
             crate::console::serial_write_fmt(format_args!(
-                "\n[tlb-shootdown] slow ack wait spins={} targets={:#x} me={} \
-                 unmaskable-kick={}\n",
+                "\n[tlb-shootdown] {} ack wait spins={} targets={:#x} pending={:#x} \
+                 unmoved-for={} me={} unmaskable-kick={}\n",
+                match stall {
+                    Stall::Wedged => "WEDGED",
+                    Stall::Moving => "slow",
+                },
                 spins,
                 targets,
+                pending,
+                watch.unchanged_for(spins),
                 me,
                 if HAS_UNMASKABLE_KICK {
                     "sent"
@@ -2753,6 +2905,371 @@ mod escalation_tests {
 
     const REKICK: u64 = 1 << REKICK_SHIFT;
     const ESCALATE: u64 = 1 << UNMASKABLE_SHIFT;
+
+    // ── When a slow ack wait speaks ─────────────────────────────────────────
+    //
+    // Drives `StallWatch` turn by turn, the way the wait loop does. `spins` is
+    // stepped rather than incremented one at a time because the thresholds are
+    // in the millions, and every rule here is about *which* turn reports, not
+    // about how the turns are counted.
+
+    /// One turn of the wait every `STALL_WEDGED_AFTER / 4` spins. Fine enough
+    /// that the watch sees the set well before the first report is due, which
+    /// is what the kernel loop does -- it polls every single turn.
+    const WATCH_STEP: u64 = STALL_WEDGED_AFTER / 4;
+
+    /// Run a wait to `turns`, returning the spin count and verdict of every
+    /// report it made. `moving` picks the two cases the cadence has to tell
+    /// apart: a set that changes on every turn (peers are answering) against one
+    /// that never changes at all (they are not).
+    fn run_watch(moving: bool, turns: usize) -> alloc::vec::Vec<(u64, Stall)> {
+        let mut watch = StallWatch::new();
+        let mut said = alloc::vec::Vec::new();
+        let mut pending = 0b1011u64;
+        for turn in 0..turns {
+            let spins = turn as u64 * WATCH_STEP;
+            if moving {
+                // A different set of targets still owes an ack than last turn.
+                pending = pending.rotate_left(1);
+            }
+            if let Some(stall) = watch.poll(pending, spins) {
+                said.push((spins, stall));
+            }
+        }
+        said
+    }
+
+    #[test]
+    fn a_wait_that_ends_quickly_never_says_anything() {
+        // The overwhelming majority of shootdowns ack in a handful of spins.
+        // The cadence must cost them nothing and say nothing.
+        let mut watch = StallWatch::new();
+        for spins in 0..1000u64 {
+            assert_eq!(watch.poll(0b110, spins), None, "spoke at spin {}", spins);
+        }
+        assert_eq!(watch.reports(), 0);
+    }
+
+    #[test]
+    fn the_first_report_comes_at_the_threshold_and_not_before() {
+        let mut watch = StallWatch::new();
+        assert_eq!(watch.poll(0b1, STALL_FIRST_REPORT - 1), None);
+        assert!(watch.poll(0b1, STALL_FIRST_REPORT).is_some());
+    }
+
+    #[test]
+    fn a_wait_whose_targets_keep_answering_stops_after_its_budget() {
+        // A machine that is working -- four vCPUs on one host thread under TCG
+        // -- issues thousands of shootdowns during the init spawn. A line per
+        // shootdown is a console full of warnings about a machine that is fine.
+        let said = run_watch(true, 8_000);
+        assert!(
+            said.len() <= STALL_MOVING_BUDGET as usize,
+            "a wait that was making progress spoke {} times",
+            said.len()
+        );
+        assert!(said.iter().all(|(_, s)| *s == Stall::Moving));
+    }
+
+    #[test]
+    fn a_wait_whose_targets_never_answer_keeps_speaking() {
+        // The other half, and the one the old single `bool` got backwards: a
+        // machine that is never coming back said its one line and then went
+        // quiet, however long it stayed there.
+        let said = run_watch(false, 8_000);
+        assert!(
+            said.len() > STALL_MOVING_BUDGET as usize,
+            "a wedged wait spoke only {} times",
+            said.len()
+        );
+        assert!(said.iter().all(|(_, s)| *s == Stall::Wedged));
+    }
+
+    #[test]
+    fn a_set_that_has_not_moved_for_a_full_escalation_interval_reads_as_wedged() {
+        // One escalation interval is what it takes for the unmaskable kick to
+        // have been sent and to have changed nothing. Before that, a target
+        // that has not answered is a target that has not answered *yet*.
+        let mut watch = StallWatch::new();
+        assert_eq!(watch.poll(0b1, 0), None);
+        assert_eq!(
+            watch.poll(0b1, STALL_FIRST_REPORT),
+            Some(Stall::Wedged),
+            "unchanged since spin 0, which is more than one escalation interval"
+        );
+    }
+
+    #[test]
+    fn a_set_that_moved_recently_reads_as_slow_and_not_as_wedged() {
+        let mut watch = StallWatch::new();
+        assert_eq!(watch.poll(0b11, 0), None);
+        // The set changes just before the report is due, so it has been still
+        // for less than an escalation interval.
+        let moved_at = STALL_FIRST_REPORT - STALL_WEDGED_AFTER / 2;
+        assert_eq!(watch.poll(0b1, moved_at), None);
+        assert_eq!(watch.poll(0b1, STALL_FIRST_REPORT), Some(Stall::Moving));
+    }
+
+    #[test]
+    fn a_target_answering_resets_the_clock_that_calls_the_wait_wedged() {
+        // Without the reset, a long wait that was in fact draining one target
+        // at a time would be reported as wedged, and the word would stop
+        // meaning anything.
+        let mut watch = StallWatch::new();
+        assert_eq!(watch.poll(0b111, 0), None);
+        assert!(watch.unchanged_for(STALL_WEDGED_AFTER) >= STALL_WEDGED_AFTER);
+        watch.poll(0b11, STALL_WEDGED_AFTER);
+        assert_eq!(watch.unchanged_for(STALL_WEDGED_AFTER), 0);
+    }
+
+    #[test]
+    fn a_wait_that_goes_from_slow_to_wedged_speaks_again_after_its_budget() {
+        // The budget is for a machine that is working. A wait that spent it
+        // while draining and *then* froze is the case worth hearing about, so
+        // the budget must not have silenced it for good.
+        let mut watch = StallWatch::new();
+        let mut spins = STALL_FIRST_REPORT;
+        let mut pending = 0b1011u64;
+        let mut moving = 0;
+        while watch.reports() <= STALL_MOVING_BUDGET {
+            pending = pending.rotate_left(1);
+            if watch.poll(pending, spins).is_some() {
+                moving += 1;
+            }
+            spins += STALL_FIRST_REPORT << STALL_MAX_DOUBLINGS;
+        }
+        assert_eq!(moving, STALL_MOVING_BUDGET as usize);
+        // Now it freezes: the same set, for longer than an escalation interval.
+        watch.poll(pending, spins);
+        spins += STALL_FIRST_REPORT << STALL_MAX_DOUBLINGS;
+        assert_eq!(watch.poll(pending, spins), Some(Stall::Wedged));
+    }
+
+    #[test]
+    fn each_report_waits_longer_than_the_one_before_it() {
+        // A wedged machine is reported for as long as it stays wedged, and the
+        // gaps widen so the trail does not become the flood the budget exists
+        // to prevent.
+        let said = run_watch(false, 8_000);
+        let mut gaps = alloc::vec::Vec::new();
+        for pair in said.windows(2) {
+            gaps.push(pair[1].0 - pair[0].0);
+        }
+        assert!(gaps.len() >= 6, "only {} gaps to compare", gaps.len());
+        // The gaps land on turn boundaries, so `>=` is all a whole run can
+        // claim -- but the first few must actually *grow*, or "widening" is a
+        // word for a fixed cadence. Written against the first gap and not
+        // against `STALL_MAX_DOUBLINGS`, so a cap of zero cannot make this pass
+        // by moving with it.
+        assert!(
+            gaps[1] > gaps[0] && gaps[2] > gaps[1] && gaps[3] > gaps[2],
+            "the first gaps did not widen: {:?}",
+            &gaps[..4]
+        );
+        for pair in gaps.windows(2) {
+            assert!(
+                pair[1] >= pair[0],
+                "a report came sooner after the one before it: {} then {}",
+                pair[0],
+                pair[1]
+            );
+        }
+    }
+
+    #[test]
+    fn the_widening_stops_so_a_wedged_wait_never_goes_quiet() {
+        // Unbounded doubling reaches gaps nobody is still watching for. The cap
+        // is what turns "it said it once" into "it keeps saying it".
+        // Sixteen times the first interval, written out: naming
+        // `STALL_MAX_DOUBLINGS` here would let the test follow the constant
+        // wherever it went, including to zero -- which is no widening at all.
+        let capped = STALL_FIRST_REPORT * 16;
+        assert_eq!(capped, STALL_FIRST_REPORT << STALL_MAX_DOUBLINGS);
+        let mut w = StallWatch::new();
+        // A wait that has been reporting for a long time, frozen on one set
+        // since spin zero.
+        w.seen = true;
+        w.pending = 0b1;
+        w.since = 0;
+        w.reports = STALL_MAX_DOUBLINGS + 8;
+        w.next_at = 0;
+        let now = 10 * capped;
+        assert_eq!(w.poll(0b1, now), Some(Stall::Wedged));
+        assert_eq!(
+            w.next_at - now,
+            capped,
+            "the interval past the cap must stay at the cap"
+        );
+    }
+
+    #[test]
+    fn a_suppressed_report_still_arms_the_next_one() {
+        // A report the budget drops must still consume its slot. Leaving the
+        // trigger where it was would make the watch decide -- and drop -- a
+        // report on every single turn of the hot loop the cadence exists to
+        // stay out of.
+        let mut watch = StallWatch::new();
+        let mut pending = 0b1011u64;
+        let mut spins = STALL_FIRST_REPORT;
+        for _ in 0..STALL_MOVING_BUDGET + 1 {
+            pending = pending.rotate_left(1);
+            watch.poll(pending, spins);
+            spins += STALL_FIRST_REPORT << STALL_MAX_DOUBLINGS;
+        }
+        let armed = watch.next_at;
+        assert!(
+            armed > spins - (STALL_FIRST_REPORT << STALL_MAX_DOUBLINGS),
+            "the suppressed report left the trigger in the past"
+        );
+        pending = pending.rotate_left(1);
+        assert_eq!(watch.poll(pending, armed - 1), None);
+    }
+
+    #[test]
+    fn a_wait_counts_the_reports_it_swallowed_as_well_as_the_ones_it_said() {
+        // The cadence is measured in reports come due, not reports printed:
+        // counting only what was said would make a silenced wait widen its gaps
+        // more slowly than a noisy one.
+        let mut watch = StallWatch::new();
+        let mut pending = 0b1011u64;
+        let mut spins = STALL_FIRST_REPORT;
+        let mut said = 0;
+        for _ in 0..6 {
+            pending = pending.rotate_left(1);
+            if watch.poll(pending, spins).is_some() {
+                said += 1;
+            }
+            spins += STALL_FIRST_REPORT << STALL_MAX_DOUBLINGS;
+        }
+        assert_eq!(said, STALL_MOVING_BUDGET as usize);
+        assert_eq!(watch.reports(), 6);
+    }
+
+    #[test]
+    fn a_fresh_watch_has_nothing_to_say_about_how_long_anything_has_been_still() {
+        // `unchanged_for` before the first poll would otherwise answer with the
+        // whole spin count, and the report would open by claiming a freeze that
+        // has not been observed.
+        let watch = StallWatch::new();
+        assert_eq!(watch.unchanged_for(0), 0);
+        assert_eq!(watch.unchanged_for(STALL_FIRST_REPORT), 0);
+    }
+
+    #[test]
+    fn the_first_pending_set_a_wait_sees_starts_its_clock_where_it_saw_it() {
+        // Not at spin zero. A wait that reached its first poll late -- the
+        // common case, since the fast path never polls -- would otherwise be
+        // credited with a freeze that began before it was looking.
+        let mut watch = StallWatch::new();
+        let late = STALL_WEDGED_AFTER * 3;
+        watch.poll(0b1, late);
+        assert_eq!(watch.unchanged_for(late), 0);
+        assert_eq!(watch.unchanged_for(late + 7), 7);
+    }
+
+    #[test]
+    fn a_pending_set_of_zero_is_a_set_like_any_other() {
+        // The loop breaks before polling when everything has acked, so this
+        // never happens in the kernel -- but a watch that treated the empty set
+        // as "nothing seen yet" would restart its clock on it, and the rule is
+        // that the clock follows the set, whatever the set is.
+        let mut watch = StallWatch::new();
+        watch.poll(0, 100);
+        assert_eq!(watch.unchanged_for(400), 300);
+    }
+
+    #[test]
+    fn a_set_still_for_exactly_one_escalation_interval_is_already_wedged() {
+        // The constant is what "for a full interval" means, so the boundary
+        // belongs to `Wedged`: at exactly one interval the unmaskable kick has
+        // provably fired -- any window that long contains an escalation
+        // boundary -- and it changed nothing. An off-by-one here does not lose
+        // the report, it mislabels it, which is worse: "slow" is what the reader
+        // shrugs at.
+        let mut at = StallWatch::new();
+        at.seen = true;
+        at.pending = 0b1;
+        at.since = 100;
+        at.next_at = 0;
+        assert_eq!(at.poll(0b1, 100 + STALL_WEDGED_AFTER), Some(Stall::Wedged));
+
+        let mut before = StallWatch::new();
+        before.seen = true;
+        before.pending = 0b1;
+        before.since = 100;
+        before.next_at = 0;
+        assert_eq!(
+            before.poll(0b1, 100 + STALL_WEDGED_AFTER - 1),
+            Some(Stall::Moving),
+            "one spin short of a full interval is still only slow"
+        );
+    }
+
+    #[test]
+    fn the_report_count_stops_at_the_top_instead_of_starting_over() {
+        // A wait with no timeout on a machine that stays up can report a very
+        // large number of times. A counter that wrapped would take the cadence
+        // back to its narrowest -- the gaps would collapse from sixteen
+        // intervals to one and the trail would become the flood the budget
+        // exists to prevent -- and it would hand a wedged wait a fresh moving
+        // budget as well.
+        let mut watch = StallWatch::new();
+        watch.seen = true;
+        watch.pending = 0b1;
+        watch.since = 0;
+        watch.next_at = 0;
+        watch.reports = u32::MAX;
+        let now = 100 * STALL_FIRST_REPORT;
+        assert_eq!(watch.poll(0b1, now), Some(Stall::Wedged));
+        assert_eq!(watch.reports(), u32::MAX);
+        assert_eq!(
+            watch.next_at - now,
+            STALL_FIRST_REPORT * 16,
+            "the cadence started over instead of staying at the cap"
+        );
+    }
+
+    #[test]
+    fn a_turn_before_the_set_was_seen_is_not_a_freeze_that_outlasted_the_machine() {
+        // `unchanged_for` is what the report prints. Asked about a turn earlier
+        // than the one the set was first seen on -- which a caller may do, since
+        // both the method and the struct are public -- an unsaturated
+        // subtraction would answer with eighteen quintillion turns, and the line
+        // would claim a freeze longer than the universe.
+        let mut watch = StallWatch::new();
+        watch.poll(0b1, 5_000);
+        assert_eq!(watch.unchanged_for(4_999), 0);
+        assert_eq!(watch.unchanged_for(0), 0);
+        assert_eq!(watch.unchanged_for(5_007), 7);
+    }
+
+    #[test]
+    fn the_report_cannot_come_before_the_wedged_question_has_an_answer() {
+        // A wait reported before one escalation interval has passed could only
+        // ever say "slow", whatever the truth: nothing had had time to sit
+        // still. The `const` assert pins it; this says what it buys.
+        assert!(STALL_FIRST_REPORT > STALL_WEDGED_AFTER);
+        assert!(STALL_WEDGED_AFTER > 1u64 << REKICK_SHIFT);
+    }
+
+    #[test]
+    fn the_spin_counts_cannot_run_off_the_end_of_the_counter() {
+        // The wait has no timeout, so `spins` is only bounded by how long the
+        // machine stays up. An interval that overflowed would come due on every
+        // turn from then on.
+        let mut watch = StallWatch::new();
+        watch.seen = true;
+        watch.pending = 0b1;
+        watch.since = 0;
+        watch.next_at = 0;
+        watch.reports = u32::MAX - 1;
+        assert_eq!(watch.poll(0b1, u64::MAX), Some(Stall::Wedged));
+        assert_eq!(watch.next_at, u64::MAX, "the next report ran off the end");
+        assert_eq!(watch.reports(), u32::MAX);
+        // And the report's own number, read from a spin count below `since`,
+        // must not wrap into a freeze that lasted longer than the machine.
+        assert_eq!(watch.unchanged_for(0), 0);
+    }
 
     #[test]
     fn the_healthy_fast_path_never_re_kicks() {

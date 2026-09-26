@@ -577,6 +577,20 @@ fn panic(info: &PanicInfo) -> ! {
         ));
     }
 
+    // Whether getting this report out required taking the serial lock away from
+    // somebody. Non-zero means a CPU was holding it and never gave it back --
+    // it died mid-print, or is wedged -- so the lines above may be interleaved
+    // with half of its line, and there is a second casualty besides this panic.
+    // Snapshotted before the write, which would otherwise count itself.
+    let steals = kernel_hal::console::serial_lock_steals();
+    if steals > 0 {
+        kernel_hal::console::serial_write_fmt_spin(format_args!(
+            "[console] serial lock taken from a holder that never returned it: {} time(s) \
+             -- output above may be interleaved\n",
+            steals
+        ));
+    }
+
     // Last resort before halting: if this panic happened while serving one
     // particular task -- and only then -- kill that task and hand the CPU back
     // to the scheduler instead of taking the whole system down. Does not return
