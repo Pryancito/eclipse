@@ -1875,11 +1875,17 @@ fn clip_rect_for_read(
     clip_w: u32,
     clip_h: u32,
 ) -> Option<(u32, u32, u32, u32)> {
-    let x0 = x.max(0) as u32;
-    let y0 = y.max(0) as u32;
-    let x1 = (x.saturating_add(w as i32)).clamp(0, clip_w as i32) as u32;
-    let y1 = (y.saturating_add(h as i32)).clamp(0, clip_h as i32) as u32;
-    (x1 > x0 && y1 > y0).then(|| (x0, y0, x1 - x0, y1 - y0))
+    // Widened to i64 before anything is added. `w`/`h` are `u32`, and casting
+    // one to `i32` wraps it negative past `i32::MAX` -- which `clamp` then
+    // turns into an empty rect, i.e. "nothing will be read", the answer that
+    // SKIPS the flush. Wrong direction for a value that decides whether a read
+    // is safe, so the cast that could produce it is gone. Every input fits i64
+    // (`x`/`y` are i32, the rest u32), so nothing here can overflow.
+    let x0 = (x as i64).max(0);
+    let y0 = (y as i64).max(0);
+    let x1 = (x as i64 + w as i64).clamp(0, clip_w as i64);
+    let y1 = (y as i64 + h as i64).clamp(0, clip_h as i64);
+    (x1 > x0 && y1 > y0).then(|| (x0 as u32, y0 as u32, (x1 - x0) as u32, (y1 - y0) as u32))
 }
 
 /// Has this present already invalidated every byte the cursor blend is about
@@ -1913,8 +1919,14 @@ fn cursor_read_is_synced(
     let Some((s0, s1)) = sync_run_px(src_stride, blit.0, blit.1, blit.2, blit.3) else {
         return false;
     };
+    // `is_some_and`, not `is_none_or`: `read` is already known non-empty, so
+    // the `None` arm is only reachable if the run cannot be computed at all,
+    // and the answer to "I cannot tell" is "flush", never "covered". Every
+    // unknown in this function has to fall the same way -- a needless flush of
+    // a 64x64 window costs microseconds, a skipped one puts stale pixels on
+    // the screen.
     sync_run_px(src_stride, read.0, read.1, read.2, read.3)
-        .is_none_or(|(c0, c1)| c0 >= s0 && c1 <= s1)
+        .is_some_and(|(c0, c1)| c0 >= s0 && c1 <= s1)
 }
 
 /// FromDevice clflush of one rectangle, row by row, so a 64×64 cursor does not
@@ -2373,7 +2385,19 @@ pub fn scanout_region_checked(
         snap
     };
     if let Some((cx, cy, cw, ch, bmp)) = cursor {
-        let cursor_pitch_px = (src_stride as u32).min(info.pitch() / 4).max(fb_width);
+        // Capped at `src_stride` on the way out, after the `.max(fb_width)`:
+        // `cursor_read_is_synced` linearises with `src_stride`, so a limit
+        // above it would put the read's last byte in the NEXT row and tip the
+        // containment test towards "covered" -- the direction that skips a
+        // flush. `create_fb` already rejects `pitch < width * 4`, so
+        // `fb_width <= src_stride` holds for every registered framebuffer and
+        // the cap never fires; it keeps the two arguments consistent by
+        // construction rather than by an invariant enforced a thousand lines
+        // away.
+        let cursor_pitch_px = (src_stride as u32)
+            .min(info.pitch() / 4)
+            .max(fb_width)
+            .min(src_stride as u32);
         // `blit_cursor_patch` below READS the framebuffer under the pointer --
         // through the WB physmap alias of a GEM the GPU writes -- to blend the
         // cursor over it. Those lines have to be invalidated first or the blend
@@ -6583,6 +6607,58 @@ mod partial_present_cursor_sync_tests {
         assert!(
             !synced_for(narrow, (1600, 436)),
             "the pointer's last row runs past the end of the run"
+        );
+    }
+
+    /// Every unknown falls towards "flush". A needless flush of a 64x64 window
+    /// costs microseconds; a skipped one puts stale pixels on the screen, so
+    /// there is no input for which "I cannot tell" may answer "covered".
+    #[test]
+    fn what_cannot_be_decided_is_flushed() {
+        let full = (0, 0, STRIDE as u32, FB_H);
+        let (ex, py, ew, ph) = ptr(700, 500);
+        // A stride of zero cannot be linearised at all.
+        assert!(
+            !cursor_read_is_synced(0, full, true, (ex, py as i32, ew, ph), STRIDE as u32, FB_H),
+            "a stride nothing can be linearised against must flush"
+        );
+        // The present ran no FromDevice of its own.
+        assert!(
+            !cursor_read_is_synced(
+                STRIDE,
+                full,
+                false,
+                (ex, py as i32, ew, ph),
+                STRIDE as u32,
+                FB_H
+            ),
+            "no sync ran, so nothing is covered"
+        );
+        // A degenerate blit rect invalidated nothing.
+        assert!(
+            !cursor_read_is_synced(
+                STRIDE,
+                (0, 0, 0, 0),
+                true,
+                (ex, py as i32, ew, ph),
+                STRIDE as u32,
+                FB_H
+            ),
+            "an empty blit rect covers nothing"
+        );
+        // A width past `i32::MAX` used to wrap negative through an `as i32`
+        // and read as an empty rect -- "nothing to read", which skips the
+        // flush. It has to clip to the buffer and be treated as a real read.
+        assert!(
+            !cursor_read_is_synced(
+                STRIDE,
+                (0, 900, 16, 8),
+                true,
+                (0, 0, u32::MAX, u32::MAX),
+                STRIDE as u32,
+                FB_H
+            ),
+            "an out-of-range read window must clip, not vanish"
         );
     }
 }
