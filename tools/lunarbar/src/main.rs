@@ -1495,8 +1495,18 @@ impl State {
             popup.surface.attach(Some(buf), 0, 0);
             // Ask for a frame callback BEFORE the commit it belongs to: the
             // request is queued on the surface and applied by that commit.
-            popup.surface.frame(qh, PopupId);
-            popup.frame_pending = true;
+            // Only ever ONE outstanding: a wl_callback is destroyed by its own
+            // `done` and cannot be cancelled, so a compositor that never
+            // answers (it owes no frame to a surface it is not drawing) would
+            // otherwise leave one object behind per FRAME_FALLBACK repaint,
+            // for as long as the menu stays open. On that fallback path the
+            // callback already in flight stays the gate; only the deadline is
+            // pushed out, so the next repaint is another FRAME_FALLBACK away
+            // and not a spin.
+            if !popup.frame_pending {
+                popup.surface.frame(qh, PopupId);
+                popup.frame_pending = true;
+            }
             popup.frame_at = Some(Instant::now());
             // Full-surface damage, in BUFFER pixels. Sub-rect dirty on popups
             // left stale tiles around the panel (same class of artifact as KMS
@@ -1940,16 +1950,28 @@ impl State {
         let Some(shm) = self.shm.clone() else {
             return;
         };
-        let w = w.max(1).min(fill_guard::MAX_BUFFER_DIM);
-        let h = h.max(1).min(fill_guard::MAX_BUFFER_DIM);
+        let w = w.max(1);
+        let h = h.max(1);
         if matches!(self.tooltip.as_ref(), Some(tip) if tip.width == w && tip.height == h && !tip.map.is_null()) {
             self.render_tip();
             return;
         }
         let scale = self.tooltip.as_ref().map(|t| t.scale).unwrap_or(1).max(1);
-        // Logical size in, buffer size out — see `configure_popup`.
-        let bw = w.saturating_mul(scale).min(fill_guard::MAX_BUFFER_DIM);
-        let bh = h.saturating_mul(scale).min(fill_guard::MAX_BUFFER_DIM);
+        // Logical size in, buffer size out — see `configure_popup`. The
+        // ceilings SKIP rather than clamp: once `set_buffer_scale(scale)` is
+        // declared the compositor requires the buffer to be exactly
+        // `logical * scale`, so a clamped buffer is a rejected buffer, not a
+        // smaller tooltip.
+        let bw = w.saturating_mul(scale);
+        let bh = h.saturating_mul(scale);
+        if bw > fill_guard::MAX_BUFFER_DIM || bh > fill_guard::MAX_BUFFER_DIM {
+            eprintln!("lunarbar: tooltip {bw}x{bh} past MAX_BUFFER_DIM; skipping");
+            return;
+        }
+        if (bw as usize).saturating_mul(bh as usize) > fill_guard::MAX_BUFFER_PIXELS {
+            eprintln!("lunarbar: tooltip {bw}x{bh} past MAX_BUFFER_PIXELS; skipping");
+            return;
+        }
         let Some(total) = (bw as usize)
             .checked_mul(4)
             .and_then(|s| s.checked_mul(bh as usize))
