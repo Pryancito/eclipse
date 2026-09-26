@@ -1540,9 +1540,25 @@ impl Syscall<'_> {
     /// and return the normalised `(policy, rt_priority, nice)` to store.
     ///
     /// Real-time policies require `sched_priority` in `1..=99`; the fair
-    /// policies require it to be `0`. The nice value is clamped to `-20..=19`.
+    /// policies require it to be `0`. A nice value outside `-20..=19` is
+    /// `EINVAL`.
+    ///
+    /// Not a clamp: `__sched_setscheduler` refuses it outright,
+    /// `if (attr->sched_nice < MIN_NICE || attr->sched_nice > MAX_NICE)
+    /// return -EINVAL;`. Clamping is right for `setpriority(2)`, which Linux
+    /// really does clamp (and [`Self::sys_setpriority`] with it), and wrong
+    /// here: `sched_setattr(0, {policy = SCHED_OTHER, nice = 100})` came back
+    /// SUCCESSFUL with nice 19, so a caller probing for the accepted range --
+    /// which is how a library finds out what it may ask for -- got told 100
+    /// was fine and then ran at a priority it never chose. The other two
+    /// callers hand in `thread.sched_nice()`, a value that is in range by
+    /// construction, so this only ever fires on what `sched_setattr` was
+    /// given.
     fn sched_validate(policy: u8, sched_priority: i32, nice: i32) -> Result<(u8, u8, i8), LxError> {
-        let nice = nice.clamp(MIN_NICE as i32, MAX_NICE as i32) as i8;
+        if !(MIN_NICE as i32..=MAX_NICE as i32).contains(&nice) {
+            return Err(LxError::EINVAL);
+        }
+        let nice = nice as i8;
         match policy {
             SCHED_FIFO | SCHED_RR => {
                 if !(MIN_RT_PRIO as i32..=MAX_RT_PRIO as i32).contains(&sched_priority) {
@@ -1769,9 +1785,17 @@ impl Syscall<'_> {
         };
         let (p, rt, nice) = Self::sched_validate(policy as u8, priority, nice)?;
         self.check_sched_permission(&thread, p, nice, rt)?;
-        if !plan.keep_params {
-            thread.set_sched(p, nice, rt);
-        }
+        // `KEEP_PARAMS` keeps the PARAMETERS, and that is all it keeps: the
+        // class change goes through. `sys_sched_setattr` uses the flag only to
+        // overwrite `attr`'s priority and nice from the task (`get_params`)
+        // and then runs the ordinary `sched_setattr` path, which applies
+        // `attr.sched_policy`. Skipping the store made
+        // `sched_setattr(tid, {policy = SCHED_FIFO, flags = KEEP_PARAMS})` --
+        // "move this thread to real time and leave its numbers alone", which
+        // is what a program with a nice it already tuned asks for -- a silent
+        // no-op that returned 0. Storing is safe either way: with the flag,
+        // `nice` and `rt` ARE the thread's own, read out of it a few lines up.
+        thread.set_sched(p, nice, rt);
         Ok(0)
     }
 
@@ -2458,8 +2482,9 @@ pub(crate) const SCHED_FLAG_RESET_ON_FORK: u64 = 0x01;
 /// `SCHED_FLAG_KEEP_POLICY`: keep the thread's policy, ignore `sched_policy`.
 pub(crate) const SCHED_FLAG_KEEP_POLICY: u64 = 0x08;
 /// `SCHED_FLAG_KEEP_PARAMS`: keep the thread's priority and nice, ignore
-/// `sched_priority` and `sched_nice` (and, in `__sched_setscheduler`, the
-/// policy too: the class change is skipped along with the parameters).
+/// `sched_priority` and `sched_nice`. The policy still changes: the flag only
+/// makes `sys_sched_setattr` copy the task's own parameters over the caller's
+/// (`get_params`) before the ordinary `sched_setattr` path runs.
 pub(crate) const SCHED_FLAG_KEEP_PARAMS: u64 = 0x10;
 /// `SCHED_FLAG_ALL`: every flag `sched_setattr` knows (`RESET_ON_FORK`,
 /// `RECLAIM`, `DL_OVERRUN`, `KEEP_POLICY`, `KEEP_PARAMS`, `UTIL_CLAMP_MIN`,
@@ -2474,8 +2499,9 @@ pub(crate) struct SchedAttrPlan {
     /// The policy to set, or `None` to keep the thread's own
     /// (`SCHED_FLAG_KEEP_POLICY`, `SETPARAM_POLICY`).
     pub policy: Option<u32>,
-    /// `SCHED_FLAG_KEEP_PARAMS`: validate and check permission against the
-    /// thread's own priority and nice, and store nothing.
+    /// `SCHED_FLAG_KEEP_PARAMS`: validate, check permission against and store
+    /// the thread's own priority and nice instead of the caller's. The policy
+    /// is stored either way.
     pub keep_params: bool,
 }
 
@@ -2483,7 +2509,7 @@ pub(crate) struct SchedAttrPlan {
 /// `SCHED_FLAG_ALL` is `EINVAL`; `SCHED_FLAG_KEEP_POLICY` makes the policy
 /// `SETPARAM_POLICY`, which is "the one the thread has"; and
 /// `SCHED_FLAG_KEEP_PARAMS` copies the thread's priority and nice over the
-/// caller's (`get_params`) and then skips the store. A negative
+/// caller's (`get_params`). A negative
 /// `sched_policy` (`(int)attr.sched_policy < 0`) is `EINVAL` before any of
 /// that, and before the pid is looked up.
 ///
