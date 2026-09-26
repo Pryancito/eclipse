@@ -21,6 +21,21 @@ pub(super) static GPU_SPIN_HOOK: Mutex<Option<alloc::boxed::Box<dyn Fn() + Send>
 /// (`wait_for_ctx0_reset`); the harness models the respawn with it.
 #[cfg(test)]
 pub(super) static CTX0_RESET_WAITERS: AtomicUsize = AtomicUsize::new(0);
+/// Runs inside a client context's teardown, between its removal from the pid
+/// registry and the RM's `ctx_free`: the harness lands a newcomer there.
+#[cfg(test)]
+pub(super) static CTX_TEARDOWN_HOOK: Mutex<Option<alloc::boxed::Box<dyn Fn() + Send>>> =
+    Mutex::new(None);
+/// Run a harness hook once. It is taken out for the call, so a hook that
+/// reaches the same point itself does not re-enter, and put back after.
+#[cfg(test)]
+fn run_test_hook(slot: &Mutex<Option<alloc::boxed::Box<dyn Fn() + Send>>>) {
+    let hook = slot.lock().take();
+    if let Some(hook) = hook {
+        hook();
+        *slot.lock() = Some(hook);
+    }
+}
 
 /// Busy-wait heartbeat for the GPU register/fence poll loops in this driver.
 ///
@@ -37,15 +52,7 @@ pub(super) static CTX0_RESET_WAITERS: AtomicUsize = AtomicUsize::new(0);
 #[inline]
 fn gpu_spin() {
     #[cfg(test)]
-    {
-        // Taken out for the call, so a hook that spins itself does not
-        // re-enter, and put back after.
-        let hook = GPU_SPIN_HOOK.lock().take();
-        if let Some(hook) = hook {
-            hook();
-            *GPU_SPIN_HOOK.lock() = Some(hook);
-        }
-    }
+    run_test_hook(&GPU_SPIN_HOOK);
     static SPIN: AtomicUsize = AtomicUsize::new(0);
     let n = SPIN.fetch_add(1, Ordering::Relaxed) + 1;
     if n & 511 == 0 {
@@ -902,6 +909,14 @@ pub struct NvidiaGpu {
     /// an ACQUIRE queued on their fence semaphore ([`ZombieCtx`]). Their RM
     /// teardown waits for those channels to pass, or for the fence timeout.
     nouveau_zombies: Mutex<Vec<ZombieCtx>>,
+    /// Context indices whose RM teardown is in flight: taken out of
+    /// `nouveau_pid_ctx` at exit (no late submit routes to them), freed in
+    /// the RM tens of milliseconds later, in `release_process_finish`, and
+    /// reserved here in between (and across a zombie wait). A client whose
+    /// first touch landed in that gap found the index free, `ctx_alloc` ran
+    /// on an index the RM still had, and the dying client's `ctx_free` took
+    /// the newcomer's context with it.
+    nouveau_ctx_teardown: Mutex<Vec<u32>>,
     /// Driver-private framebuffer objects keyed by driver fb id.
     kms_framebuffers: Mutex<Vec<NvidiaKmsFramebuffer>>,
     /// Driver-side ids for framebuffer objects.
@@ -1314,6 +1329,7 @@ impl NvidiaGpu {
             ),
             nouveau_peer_fence: Mutex::new(alloc::collections::BTreeMap::new()),
             nouveau_zombies: Mutex::new(Vec::new()),
+            nouveau_ctx_teardown: Mutex::new(Vec::new()),
             kms_framebuffers: Mutex::new(Vec::new()),
             next_kms_fb_id: AtomicU32::new(1),
             kms_state: Mutex::new(NvidiaKmsState {
@@ -8295,7 +8311,14 @@ impl DrmScheme for NvidiaGpu {
         // late thread of this process routes to it from here on.
         let my_ctx = {
             let mut map = self.nouveau_pid_ctx.lock();
-            map.iter().position(|t| t.0 == pid).map(|i| map.remove(i).1)
+            let mine = map.iter().position(|t| t.0 == pid).map(|i| map.remove(i).1);
+            // Reserved until the RM has freed it (`release_process_finish`),
+            // under the same lock, so no first touch finds it free in between
+            // -- see `nouveau_ctx_teardown`.
+            if let Some(idx) = mine.filter(|&c| c >= 1) {
+                self.nouveau_ctx_teardown.lock().push(idx);
+            }
+            mine
         };
         // Another channel may still have an ACQUIRE queued on this context's
         // fence semaphore through a peer mapping (the compositor's, on the
@@ -9790,6 +9813,8 @@ impl NvidiaGpu {
                 self.fast_release(device_instance, ctx_idx);
                 self.forget_peer_fences(ctx_idx);
                 lock::pump();
+                #[cfg(test)]
+                run_test_hook(&CTX_TEARDOWN_HOOK);
                 let status = nvidia_rm_sys::rm_init::ctx_free(device_instance, ctx_idx);
                 super::nouveau_uapi::ctx_clear_wedged(ctx_idx);
                 log::info!(
@@ -9809,6 +9834,11 @@ impl NvidiaGpu {
         } else {
             false
         };
+        // The RM is done with the index (or never had it): the next first
+        // touch may take it.
+        if let Some(idx) = my_ctx.filter(|&c| c >= 1) {
+            self.nouveau_ctx_teardown.lock().retain(|&i| i != idx);
+        }
         // 3. Drop local VM_BIND bookkeeping. Skip the RM unmap when ctx_free
         //    already destroyed the VAS (a second vm_bind_unmap on a stale
         //    h_virt is a use-after-free in RM).
@@ -10702,16 +10732,18 @@ impl NvidiaGpu {
                 gpu_spin();
             }
         }
-        // A zombie's index is still the RM's until its teardown runs.
+        // A zombie's index is still the RM's until its teardown runs, and so
+        // is one whose teardown is running right now.
         let zombies: Vec<u32> = self
             .nouveau_zombies
             .lock()
             .iter()
             .map(|z| z.ctx_idx)
             .collect();
-        let Some(idx) =
-            (1u32..nv::MAX_CTX).find(|i| !map.iter().any(|t| t.1 == *i) && !zombies.contains(i))
-        else {
+        let tearing: Vec<u32> = self.nouveau_ctx_teardown.lock().clone();
+        let Some(idx) = (1u32..nv::MAX_CTX).find(|i| {
+            !map.iter().any(|t| t.1 == *i) && !zombies.contains(i) && !tearing.contains(i)
+        }) else {
             crate::klog_warn!(
                 "[nouveau-uapi] ctx: no free context slot (max {}) for pid={} -- client falls back to software",
                 nv::MAX_CTX,
@@ -13905,6 +13937,7 @@ impl NvidiaGpu {
             ),
             nouveau_peer_fence: Mutex::new(alloc::collections::BTreeMap::new()),
             nouveau_zombies: Mutex::new(Vec::new()),
+            nouveau_ctx_teardown: Mutex::new(Vec::new()),
             kms_framebuffers: Mutex::new(Vec::new()),
             next_kms_fb_id: AtomicU32::new(1),
             kms_state: Mutex::new(NvidiaKmsState {
@@ -19117,6 +19150,141 @@ mod nouveau_bookkeeping_tests {
         assert!(syncobj::destroy(out3));
         gpu.nouveau_release_process(A);
         gpu.nouveau_release_process(COMP2);
+        assert_eq!(FAKE_RM.lock().bad, 0);
+    }
+
+    // ----- A client index in teardown is nobody's until the RM has freed it -----
+
+    /// The exit takes a client's context out of the pid registry first (no
+    /// late submit routes to it) and frees it in the RM afterwards, tens of
+    /// milliseconds later. A client whose first touch landed in between
+    /// found the index free in the registry, so `ctx_alloc` ran on an index
+    /// the RM still had, and the dying client's `ctx_free` then took the
+    /// newcomer's context with it.
+    #[test]
+    fn an_index_whose_teardown_is_in_flight_is_not_handed_to_the_next_client() {
+        let _g = LOCK.lock();
+        let _live = LiveBytes::hold();
+        let gpu: &'static NvidiaGpu =
+            alloc::boxed::Box::leak(alloc::boxed::Box::new(gpu_rm_fast()));
+        let _ch_a = client_with_pushbuf(gpu, A);
+        assert_eq!(ctx_of(gpu, A), Some((1, true)));
+        // A goes away; the newcomer's first touch lands between the registry
+        // and the RM (the hook runs right before `ctx_free`).
+        let newcomer: std::sync::Arc<std::sync::Mutex<Option<(u32, Option<(u32, bool)>)>>> =
+            Default::default();
+        let sink = newcomer.clone();
+        *CTX_TEARDOWN_HOOK.lock() = Some(alloc::boxed::Box::new(move || {
+            if sink.lock().unwrap().is_some() {
+                return;
+            }
+            let ch = client_with_pushbuf(gpu, B);
+            *sink.lock().unwrap() = Some((ch, ctx_of(gpu, B)));
+        }));
+        gpu.nouveau_release_process(A);
+        *CTX_TEARDOWN_HOOK.lock() = None;
+        let (ch_b, ctx_b) = newcomer
+            .lock()
+            .unwrap()
+            .take()
+            .expect("the newcomer came during the teardown");
+        assert_eq!(ctx_b, Some((2, true)), "not the index being torn down");
+        assert_eq!(
+            FAKE_RM.lock().ctx_frees,
+            1,
+            "the dead client's context went"
+        );
+        assert!(
+            FAKE_RM.lock().ctxs.contains(&2),
+            "the newcomer's context is still the RM's"
+        );
+        let out = syncobj::create(false);
+        assert_eq!(
+            exec(gpu, B, ch_b, &[push(PUSH_VA, 16)], &[], &[sync(out)]),
+            Ok(0),
+            "the newcomer renders on its own context"
+        );
+        assert_eq!(run_gpu(2).len(), 2, "push and fence");
+        // Once the teardown is over, the index is free again.
+        let _ = client_with_pushbuf(gpu, STRANGER);
+        assert_eq!(
+            ctx_of(gpu, STRANGER),
+            Some((1, true)),
+            "the dead client's index, once the RM is done with it"
+        );
+        assert!(syncobj::destroy(out));
+        gpu.nouveau_release_process(B);
+        gpu.nouveau_release_process(STRANGER);
+        assert_eq!(FAKE_RM.lock().bad, 0);
+    }
+
+    /// The same gap on the zombie's way out: the reap takes it off the
+    /// zombie list before its teardown runs, and a first touch in between
+    /// found the index free in the registry and the list both.
+    #[test]
+    fn a_zombies_index_is_not_handed_to_the_next_client_while_its_teardown_runs() {
+        let _g = LOCK.lock();
+        let _live = LiveBytes::hold();
+        let gpu: &'static NvidiaGpu =
+            alloc::boxed::Box::leak(alloc::boxed::Box::new(gpu_rm_ladder()));
+        FAKE_RM.lock().peer = true;
+        test_clock::set_auto_advance(1_000);
+        let ch_c = client_with_pushbuf(gpu, COMP);
+        let ch_a = client_with_pushbuf(gpu, A);
+        assert_eq!(ctx_of(gpu, A), Some((1, true)));
+        let out = syncobj::create(false);
+        assert_eq!(
+            exec(gpu, A, ch_a, &[push(PUSH_VA, 16)], &[], &[sync(out)]),
+            Ok(0)
+        );
+        assert_eq!(
+            exec(gpu, COMP, ch_c, &[push(PUSH_VA, 16)], &[sync(out)], &[]),
+            Ok(0)
+        );
+        // A exits with the compositor's ACQUIRE queued on its fence: a
+        // zombie. The compositor passes, so the zombie is due; the newcomer
+        // arrives inside the reap's teardown of it.
+        gpu.nouveau_release_process(A);
+        assert_eq!(gpu.nouveau_zombies.lock().len(), 1);
+        assert_eq!(run_gpu(1).len(), 2, "the dead client's push and fence");
+        assert_eq!(run_gpu(0).len(), 2, "the compositor passes its acquire");
+        let newcomer: std::sync::Arc<std::sync::Mutex<Option<(u32, Option<(u32, bool)>)>>> =
+            Default::default();
+        let sink = newcomer.clone();
+        *CTX_TEARDOWN_HOOK.lock() = Some(alloc::boxed::Box::new(move || {
+            if sink.lock().unwrap().is_some() {
+                return;
+            }
+            let ch = client_with_pushbuf(gpu, B);
+            *sink.lock().unwrap() = Some((ch, ctx_of(gpu, B)));
+        }));
+        gpu.reap_zombie_contexts();
+        *CTX_TEARDOWN_HOOK.lock() = None;
+        assert!(
+            gpu.nouveau_zombies.lock().is_empty(),
+            "the zombie was reaped"
+        );
+        let (ch_b, ctx_b) = newcomer
+            .lock()
+            .unwrap()
+            .take()
+            .expect("the newcomer came during the zombie's teardown");
+        assert_eq!(ctx_b, Some((2, true)), "not the zombie's index");
+        assert_eq!(FAKE_RM.lock().ctx_frees, 1);
+        assert!(FAKE_RM.lock().ctxs.contains(&2));
+        let out2 = syncobj::create(false);
+        assert_eq!(
+            exec(gpu, B, ch_b, &[push(PUSH_VA, 16)], &[], &[sync(out2)]),
+            Ok(0)
+        );
+        assert_eq!(run_gpu(2).len(), 2);
+        let _ = client_with_pushbuf(gpu, STRANGER);
+        assert_eq!(ctx_of(gpu, STRANGER), Some((1, true)), "free once freed");
+        assert!(syncobj::destroy(out));
+        assert!(syncobj::destroy(out2));
+        gpu.nouveau_release_process(B);
+        gpu.nouveau_release_process(STRANGER);
+        gpu.nouveau_release_process(COMP);
         assert_eq!(FAKE_RM.lock().bad, 0);
     }
 
