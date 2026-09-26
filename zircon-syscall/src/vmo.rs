@@ -27,9 +27,7 @@ impl Syscall<'_> {
         let unbounded = options & UNBOUNDED != 0;
         let proc = self.thread.proc();
         let vmo = VmObject::new_paged_with_options(resizable, unbounded, size as usize)?;
-        let handle_value = proc.add_handle(Handle::new(vmo, Rights::DEFAULT_VMO));
-        out.write(handle_value)?;
-        Ok(())
+        install_handle(proc, Handle::new(vmo, Rights::DEFAULT_VMO), &mut out)
     }
 
     /// Read bytes from a VMO.
@@ -104,12 +102,14 @@ impl Syscall<'_> {
             proc.check_policy(PolicyCondition::AmbientMarkVMOExec)?;
         }
         let _ = proc.get_object_and_rights::<VmObject>(handle)?;
+        // The old handle goes away below, so a bad `out` used to leave the
+        // caller with no handle to its VMO at all.
+        check_out(proc, &out)?;
         let new_handle = proc.dup_handle_operating_rights(handle, |handle_rights| {
             Ok(handle_rights | Rights::EXECUTE)
         })?;
         proc.remove_handle(handle)?;
-        out.write(new_handle)?;
-        Ok(())
+        install_handle_value(proc, new_handle, &mut out)
     }
 
     /// Obtain the current size of a VMO object.
@@ -201,8 +201,7 @@ impl Syscall<'_> {
             "parent_rights: {:?} child_rights: {:?}",
             parent_rights, child_rights
         );
-        out.write(proc.add_handle(Handle::new(child_vmo, child_rights)))?;
-        Ok(())
+        install_handle(proc, Handle::new(child_vmo, child_rights), &mut out)
     }
 
     /// Create a VM object referring to a specific contiguous range of physical memory.
@@ -229,9 +228,11 @@ impl Syscall<'_> {
             return Err(ZxError::INVALID_ARGS);
         }
         let vmo = VmObject::new_physical(paddr, size / PAGE_SIZE);
-        let handle_value = proc.add_handle(Handle::new(vmo, Rights::DEFAULT_VMO | Rights::EXECUTE));
-        out.write(handle_value)?;
-        Ok(())
+        install_handle(
+            proc,
+            Handle::new(vmo, Rights::DEFAULT_VMO | Rights::EXECUTE),
+            &mut out,
+        )
     }
 
     /// Create a VM object referring to a specific contiguous range of physical frame.
@@ -261,9 +262,7 @@ impl Syscall<'_> {
         proc.check_policy(PolicyCondition::NewVMO)?;
         let _bti = proc.get_object_with_rights::<BusTransactionInitiator>(bti, Rights::MAP)?;
         let vmo = VmObject::new_contiguous(pages(size), align_log2)?;
-        let handle_value = proc.add_handle(Handle::new(vmo, Rights::DEFAULT_VMO));
-        out.write(handle_value)?;
-        Ok(())
+        install_handle(proc, Handle::new(vmo, Rights::DEFAULT_VMO), &mut out)
     }
 
     /// Resize a VMO object.

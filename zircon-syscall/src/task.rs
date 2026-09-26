@@ -36,14 +36,17 @@ impl Syscall<'_> {
             (),
         )?;
         let new_vmar = new_proc.vmar();
-        let proc_handle_value = proc.add_handle(Handle::new(new_proc, Rights::DEFAULT_PROCESS));
-        let vmar_handle_value = proc.add_handle(Handle::new(
-            new_vmar,
-            Rights::DEFAULT_VMAR | Rights::READ | Rights::WRITE | Rights::EXECUTE,
-        ));
-        proc_handle.write(proc_handle_value)?;
-        vmar_handle.write(vmar_handle_value)?;
-        Ok(())
+        install_handle_pair(
+            proc,
+            (
+                Handle::new(new_proc, Rights::DEFAULT_PROCESS),
+                Handle::new(
+                    new_vmar,
+                    Rights::DEFAULT_VMAR | Rights::READ | Rights::WRITE | Rights::EXECUTE,
+                ),
+            ),
+            (&mut proc_handle, &mut vmar_handle),
+        )
     }
 
     /// Exits the currently running process.
@@ -76,9 +79,11 @@ impl Syscall<'_> {
         let proc = self.thread.proc();
         let process = proc.get_object_with_rights::<Process>(proc_handle, Rights::MANAGE_THREAD)?;
         let thread = Thread::create(&process, name)?;
-        let handle = proc.add_handle(Handle::new(thread, Rights::DEFAULT_THREAD));
-        thread_handle.write(handle)?;
-        Ok(())
+        install_handle(
+            proc,
+            Handle::new(thread, Rights::DEFAULT_THREAD),
+            &mut thread_handle,
+        )
     }
 
     /// Start execution on a process.
@@ -309,8 +314,7 @@ impl Syscall<'_> {
         let thread: Arc<dyn Task> = thread;
         let token_handle =
             Handle::new(SuspendToken::create(&thread), Rights::DEFAULT_SUSPEND_TOKEN);
-        token.write(proc.add_handle(token_handle))?;
-        Ok(())
+        install_handle(proc, token_handle, &mut token)
     }
 
     /// Kill the provided task (job, process, or thread).
@@ -350,8 +354,7 @@ impl Syscall<'_> {
                 .get_object_with_rights::<Job>(parent, Rights::MANAGE_JOB)
                 .or_else(|_| proc.get_object_with_rights::<Job>(parent, Rights::WRITE))?;
             let child = parent_job.create_child()?;
-            out.write(proc.add_handle(Handle::new(child, Rights::DEFAULT_JOB)))?;
-            Ok(())
+            install_handle(proc, Handle::new(child, Rights::DEFAULT_JOB), &mut out)
         }
     }
 

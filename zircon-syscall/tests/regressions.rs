@@ -633,3 +633,110 @@ fn futex_words_are_validated_and_iommu_create_refuses_other_types() {
         Box::pin(async move { drop(ct) })
     });
 }
+
+/// Every `*_create` syscall installed the handle before writing the out
+/// pointer, so a bad pointer answered `INVALID_ARGS` with the handle (and
+/// its object) left in the table where the caller could never reach it. The
+/// `replace` syscalls were worse: the old handle was already gone.
+#[test]
+fn a_bad_out_pointer_leaves_no_handle_behind() {
+    with_test_thread(|ct| {
+        let base = map_user_memory(&ct);
+        let sc = Syscall {
+            thread: &ct,
+            thread_fn: finish_thread,
+        };
+        let proc = ct.proc();
+        let unmapped = base + 20 * PAGE_SIZE;
+        let good = base;
+        let read_out = || unsafe { (good as *const u32).read() };
+        let installed = |value: u32| proc.get_handle_info(value).is_ok();
+
+        sc.sys_event_create(0, good.into()).unwrap();
+        let first = read_out();
+        for bad in [unmapped, 0, base + 2] {
+            assert_eq!(
+                sc.sys_event_create(0, bad.into()),
+                Err(ZxError::INVALID_ARGS)
+            );
+            assert!(
+                !installed(first + 4),
+                "the event of the failed create ({:#x}) stays out of the table",
+                bad
+            );
+        }
+        sc.sys_event_create(0, good.into()).unwrap();
+        assert_eq!(read_out(), first + 4, "no handle value was consumed");
+        let next = first + 8;
+
+        // Pairs: neither handle stays, and the good pointer is not written.
+        unsafe { (good as *mut u32).write(0xdead_beef) };
+        assert_eq!(
+            sc.sys_channel_create(0, good.into(), unmapped.into()),
+            Err(ZxError::INVALID_ARGS)
+        );
+        assert_eq!(
+            sc.sys_channel_create(0, unmapped.into(), good.into()),
+            Err(ZxError::INVALID_ARGS)
+        );
+        assert_eq!(read_out(), 0xdead_beef, "the good half is not written");
+        assert!(!installed(next) && !installed(next + 4));
+
+        // A duplicate that cannot be handed over is closed again.
+        let rights = Rights::DEFAULT_EVENT.bits();
+        assert_eq!(
+            sc.sys_handle_duplicate(first, rights, unmapped.into()),
+            Err(ZxError::INVALID_ARGS)
+        );
+        assert!(!installed(next));
+
+        // A replace that cannot be handed over keeps the old handle.
+        assert_eq!(
+            sc.sys_handle_replace(first, rights, unmapped.into()),
+            Err(ZxError::INVALID_ARGS)
+        );
+        assert!(installed(first), "the caller keeps its event");
+        assert!(!installed(next));
+
+        // vmar_allocate looks at both out pointers before allocating.
+        let vmar = proc.add_handle(Handle::new(
+            proc.vmar(),
+            Rights::DEFAULT_VMAR | Rights::READ | Rights::WRITE,
+        ));
+        // The duplicate and the replace above took a value each before being
+        // closed again, so the next value is whatever the table says now.
+        let next = vmar + 4;
+        const CAN_MAP_READ: u32 = 1 << 7;
+        const CAN_MAP_WRITE: u32 = 1 << 8;
+        let options = CAN_MAP_READ | CAN_MAP_WRITE;
+        for (out_vmar, out_addr) in [(unmapped, good + 8), (good, unmapped)] {
+            assert_eq!(
+                sc.sys_vmar_allocate(
+                    vmar,
+                    options,
+                    0,
+                    PAGE_SIZE as u64,
+                    out_vmar.into(),
+                    out_addr.into()
+                ),
+                Err(ZxError::INVALID_ARGS)
+            );
+            assert!(!installed(next), "no child vmar handle");
+        }
+        sc.sys_vmar_allocate(
+            vmar,
+            options,
+            0,
+            PAGE_SIZE as u64,
+            good.into(),
+            (good + 8).into(),
+        )
+        .unwrap();
+        assert_eq!(
+            read_out(),
+            next,
+            "the failed allocations left no child behind"
+        );
+        Box::pin(async move { drop(ct) })
+    });
+}

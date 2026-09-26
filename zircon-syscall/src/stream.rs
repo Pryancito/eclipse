@@ -82,9 +82,7 @@ impl Syscall<'_> {
         let proc = self.thread.proc();
         let vmo = proc.get_object_with_rights::<VmObject>(vmo_handle, vmo_rights)?;
         let stream = Stream::create(vmo, seek, options.bits());
-        let handle = proc.add_handle(Handle::new(stream, rights));
-        out.write(handle)?;
-        Ok(())
+        install_handle(proc, Handle::new(stream, rights), &mut out)
     }
 
     /// Write data to a stream at the current seek offset.   

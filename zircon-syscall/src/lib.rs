@@ -23,6 +23,7 @@ use zircon_object::{ZxError, ZxResult};
 
 use self::consts::SyscallType as Sys;
 use self::time::Deadline;
+use self::user_memory::{check_out, install_handle, install_handle_pair, install_handle_value};
 
 mod channel;
 mod consts;

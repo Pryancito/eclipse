@@ -45,8 +45,7 @@ impl Syscall<'_> {
             }
             replacement_rights(handle_rights, rights)
         })?;
-        new_handle_value.write(new_value)?;
-        Ok(())
+        install_handle_value(proc, new_value, &mut new_handle_value)
     }
 
     /// Close a handle and reclaim the underlying object if no other handles to it exist.
@@ -94,12 +93,14 @@ impl Syscall<'_> {
             handle_value, rights
         );
         let proc = self.thread.proc();
+        // The old handle goes away below, so a bad `out` used to leave the
+        // caller with no handle to the object at all.
+        check_out(proc, &out)?;
         let new_value = proc.dup_handle_operating_rights(handle_value, |handle_rights| {
             replacement_rights(handle_rights, rights)
         })?;
         proc.remove_handle(handle_value)?;
-        out.write(new_value)?;
-        Ok(())
+        install_handle_value(proc, new_value, &mut out)
     }
 }
 

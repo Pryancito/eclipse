@@ -159,9 +159,11 @@ impl Syscall<'_> {
         let proc = self.thread.proc();
         let dev = proc.get_object_with_rights::<PcieDeviceKObject>(dev, Rights::READ)?;
         let interrupt = dev.map_interrupt(irq)?;
-        let handle = proc.add_handle(Handle::new(interrupt, Rights::DEFAULT_PCI_INTERRUPT));
-        out_handle.write(handle)?;
-        Ok(())
+        install_handle(
+            proc,
+            Handle::new(interrupt, Rights::DEFAULT_PCI_INTERRUPT),
+            &mut out_handle,
+        )
     }
 
     pub fn sys_pci_get_nth_device(
@@ -179,10 +181,12 @@ impl Syscall<'_> {
         proc.get_object::<Resource>(handle)?
             .validate(ResourceKind::ROOT)?;
         let (info, device) = PCIeBusDriver::get_nth_device(index as usize)?;
-        let handle = proc.add_handle(Handle::new(device, Rights::DEFAULT_DEVICE));
         out_info.write(info)?;
-        out_handle.write(handle)?;
-        Ok(())
+        install_handle(
+            proc,
+            Handle::new(device, Rights::DEFAULT_DEVICE),
+            &mut out_handle,
+        )
     }
 
     pub fn sys_pci_get_bar(
@@ -205,8 +209,7 @@ impl Syscall<'_> {
         };
         if info.is_mmio {
             let vmo = VmObject::new_physical(info.bus_addr as usize, pages(info.size as usize));
-            let handle = proc.add_handle(Handle::new(vmo, Rights::DEFAULT_VMO));
-            out_handle.write(handle)?;
+            install_handle(proc, Handle::new(vmo, Rights::DEFAULT_VMO), &mut out_handle)?;
             device.enable_mmio()?;
         } else {
             bar_.addr = info.bus_addr;

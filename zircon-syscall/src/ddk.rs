@@ -36,10 +36,7 @@ impl Syscall<'_> {
         }
         let _copied_desc = desc.read_array(desc_size)?;
         let iommu = Iommu::create();
-        let handle = proc.add_handle(Handle::new(iommu, Rights::DEFAULT_CHANNEL));
-        info!("iommu handle value {:#x}", handle);
-        out.write(handle)?;
-        Ok(())
+        install_handle(proc, Handle::new(iommu, Rights::DEFAULT_CHANNEL), &mut out)
     }
     /// Creates a new bus transaction initiator.
     ///
@@ -66,9 +63,7 @@ impl Syscall<'_> {
             return Err(ZxError::INVALID_ARGS);
         }
         let bti = BusTransactionInitiator::create(iommu, bti_id);
-        let handle = proc.add_handle(Handle::new(bti, Rights::DEFAULT_BTI));
-        out.write(handle)?;
-        Ok(())
+        install_handle(proc, Handle::new(bti, Rights::DEFAULT_BTI), &mut out)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -111,9 +106,7 @@ impl Syscall<'_> {
             return Err(ZxError::INVALID_ARGS);
         }
         addrs.write_array(&encoded_addrs)?;
-        let handle = proc.add_handle(Handle::new(pmt, Rights::INSPECT));
-        out.write(handle)?;
-        Ok(())
+        install_handle(proc, Handle::new(pmt, Rights::INSPECT), &mut out)
     }
 
     /// Unpins pages that were previously pinned by `zx_bti_pin()`.
@@ -181,9 +174,11 @@ impl Syscall<'_> {
             resource.validate_ranged_resource(ResourceKind::IRQ, src_num, 1)?;
             Interrupt::new_physical(src_num, options)?
         };
-        let handle = proc.add_handle(Handle::new(interrupt, Rights::DEFAULT_INTERRUPT));
-        out.write(handle)?;
-        Ok(())
+        install_handle(
+            proc,
+            Handle::new(interrupt, Rights::DEFAULT_INTERRUPT),
+            &mut out,
+        )
     }
 
     /// Binds or unbinds an interrupt object to a port.

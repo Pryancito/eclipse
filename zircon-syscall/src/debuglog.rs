@@ -27,9 +27,7 @@ impl Syscall<'_> {
         } else {
             Rights::DEFAULT_DEBUGLOG | Rights::READ
         };
-        let dlog_handle = proc.add_handle(Handle::new(dlog, dlog_right));
-        target.write(dlog_handle)?;
-        Ok(())
+        install_handle(proc, Handle::new(dlog, dlog_right), &mut target)
     }
 
     /// Write log entry to debuglog.

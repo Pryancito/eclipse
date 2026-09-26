@@ -32,8 +32,7 @@ impl Syscall<'_> {
             _ => return Err(ZxError::INVALID_ARGS),
         };
         let handle = Handle::new(Timer::with_slack(slack), Rights::DEFAULT_TIMER);
-        out.write(proc.add_handle(handle))?;
-        Ok(())
+        install_handle(proc, handle, &mut out)
     }
 
     /// Create an event.  
@@ -45,8 +44,7 @@ impl Syscall<'_> {
         let proc = self.thread.proc();
         proc.check_policy(PolicyCondition::NewEvent)?;
         let handle = Handle::new(Event::new(), Rights::DEFAULT_EVENT);
-        out.write(proc.add_handle(handle))?;
-        Ok(())
+        install_handle(proc, handle, &mut out)
     }
 
     /// Create an event pair.  
@@ -65,9 +63,7 @@ impl Syscall<'_> {
         let (event0, event1) = EventPair::create();
         let handle0 = Handle::new(event0, Rights::DEFAULT_EVENTPAIR);
         let handle1 = Handle::new(event1, Rights::DEFAULT_EVENTPAIR);
-        out0.write(proc.add_handle(handle0))?;
-        out1.write(proc.add_handle(handle1))?;
-        Ok(())
+        install_handle_pair(proc, (handle0, handle1), (&mut out0, &mut out1))
     }
 
     /// Start a timer.  
