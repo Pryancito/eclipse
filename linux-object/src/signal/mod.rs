@@ -219,7 +219,7 @@ impl Signal {
 /// `kill(pid, 265)` killed the target outright, and the low byte of 0 is 0,
 /// which no `Signal` variant matches, so `kill(pid, 0)` — the existence probe
 /// every lock file in userspace is built on — answered EINVAL. The comment in
-/// `sys_kill`'s own `send_to_pid` describes what a profile lock does with
+/// `sys_kill`'s own `signal_pid` describes what a profile lock does with
 /// ESRCH versus anything else, and the probe never reached it.
 #[cfg(test)]
 mod signal_arg_tests {

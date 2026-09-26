@@ -10,6 +10,8 @@
 
 use super::*;
 use crate::outparams::commit_and_report_old;
+use linux_object::error::LxResult;
+use linux_object::process::{Credentials, LinuxProcess};
 use linux_object::signal::{SigInfo, Signal, SignalAction, SignalStack, SignalStackFlags, Sigset};
 use linux_object::thread::ThreadExt;
 use linux_object::time::TimeSpec;
@@ -111,6 +113,17 @@ fn single_task_id(raw: usize) -> Result<KoID, LxError> {
     }
 }
 
+/// What every target of one `kill(2)` call is judged against.
+///
+/// Read once, before the walk: `check_kill_permission()` asks about the
+/// SENDER, and the sender does not change while the call runs.
+pub(crate) struct KillContext {
+    caller: Arc<zircon_object::task::Process>,
+    credentials: Credentials,
+    sid: KoID,
+    signal: Option<Signal>,
+}
+
 /// What a `SIGKILL` that has found a live process actually does.
 #[derive(Debug, PartialEq, Eq)]
 enum KillOutcome {
@@ -185,17 +198,27 @@ fn queue_signal_to_thread(thread: &Arc<Thread>, signal: Signal) {
 /// `si_code` of a signal `tkill`/`tgkill` sent, which userland may not forge.
 const SI_TKILL: i32 = -6;
 
-/// `rt_sigqueueinfo(2)`/`rt_tgsigqueueinfo(2)`: userland may not pretend a
-/// signal came from the kernel, nor impersonate a `tkill`, at another process.
-/// Written once because both syscalls make the same call:
+/// `rt_sigqueueinfo(2)`/`rt_tgsigqueueinfo(2)`/`pidfd_send_signal(2)`: userland
+/// may not pretend a signal came from the kernel, nor impersonate a `tkill`, at
+/// another process. Written once because all three make the same call:
 ///
 /// ```c
 /// if ((info->si_code >= 0 || info->si_code == SI_TKILL) &&
 ///     (task_pid_vnr(current) != pid))
 ///         return -EPERM;
 /// ```
-fn may_queue_siginfo(code: i32, target_is_caller: bool) -> bool {
-    target_is_caller || (code < 0 && code != SI_TKILL)
+///
+/// `target_is_self` is the one thing the three do NOT agree on, so each caller
+/// answers it with its own ids. `rt_sigqueueinfo` and `pidfd_send_signal` name
+/// a process, so "self" is the caller's own thread group;
+/// `rt_tgsigqueueinfo` names ONE THREAD, and Linux compares
+/// `task_pid_vnr(current)` -- the caller's own tid -- against it, so a sibling
+/// thread of your own process is somebody else there. This kernel numbers
+/// threads and processes out of one counter but in disjoint sets, so each call
+/// site has to say which id it means; passing the wrong one reads as
+/// harmless.
+pub(crate) fn may_queue_siginfo(code: i32, target_is_self: bool) -> bool {
+    target_is_self || (code < 0 && code != SI_TKILL)
 }
 
 /// `MINSIGSTKSZ` on the architectures this kernel runs.
@@ -363,8 +386,118 @@ impl Syscall<'_> {
         Ok(0)
     }
 
+    pub(crate) fn kill_context(&self, signal: Option<Signal>) -> KillContext {
+        let caller = self.zircon_process().clone();
+        let sid = linux_object::process::effective_sid(&caller);
+        KillContext {
+            credentials: self.linux_process().credentials(),
+            caller,
+            sid,
+            signal,
+        }
+    }
+
+    /// `check_kill_permission()` for one target process, with no delivery.
+    pub(crate) fn may_signal_process(
+        &self,
+        cx: &KillContext,
+        process: &Arc<zircon_object::task::Process>,
+    ) -> LxResult<()> {
+        let Some(linux) = process.try_linux() else {
+            // A process whose Linux extension has already gone has no
+            // credentials left to judge. `effective_pgid` tolerates the same
+            // teardown race; refusing here would turn it into an EPERM.
+            return Ok(());
+        };
+        LinuxProcess::may_signal(
+            &cx.credentials,
+            &linux.credentials(),
+            process.id() == cx.caller.id(),
+            linux_object::process::effective_sid(process) == cx.sid,
+            cx.signal,
+        )
+    }
+
+    /// The gate, then the delivery, for one process.
+    pub(crate) fn signal_one_process(
+        &self,
+        cx: &KillContext,
+        process: &Arc<zircon_object::task::Process>,
+    ) -> LxResult<()> {
+        self.may_signal_process(cx, process)?;
+        match cx.signal {
+            // kill(pid, 0): finding the process was the whole answer.
+            None => Ok(()),
+            Some(Signal::SIGKILL) => {
+                deliver_direct_sigkill(&cx.caller, process);
+                Ok(())
+            }
+            Some(sig) => linux_object::process::send_signal_to_process(process.id() as usize, sig),
+        }
+    }
+
+    /// `kill(pid, sig)` with a positive pid.
+    fn signal_pid(&self, cx: &KillContext, pid: KoID) -> LxResult<()> {
+        let Some(process) = ROOT_JOB.find_process(pid) else {
+            // A child that exited but was not waited for is gone from the
+            // job yet still a valid target: Linux delivers nothing and
+            // returns 0. Firefox's parent logged "failed to send SIGKILL
+            // to process N" for every content process it had already
+            // seen die, and its profile lock's `kill(pid, 0)` probe
+            // treats ESRCH as "stale lock" but any other answer as
+            // "still running".
+            if self.linux_process().is_zombie_child(pid) {
+                return Ok(());
+            }
+            return Err(LxError::ESRCH);
+        };
+        self.signal_one_process(cx, &process)
+    }
+
+    /// `__kill_pgrp_info()`: `kill(0, sig)` and `kill(-pgid, sig)` reach
+    /// EVERY process of the group, not its leader.
+    ///
+    /// The group is the one `send_signal_to_pgrp` walks for Ctrl-C, by the
+    /// same `effective_pgid`. The walk is written out again here rather than
+    /// shared because a signal sent by a process has a sender to judge and
+    /// one sent by a terminal has none.
+    fn signal_group(&self, cx: &KillContext, pgid: KoID) -> LxResult<()> {
+        let mut result: LxResult<()> = Err(LxError::ESRCH);
+        for process in linux_object::process::all_live_processes() {
+            if linux_object::process::effective_pgid(&process) != pgid {
+                continue;
+            }
+            let one = self.signal_one_process(cx, &process);
+            result = LinuxProcess::fold_group_signal(result, one);
+        }
+        result
+    }
+
+    /// `kill(-1, sig)` reaches every process EXCEPT the caller and init
+    /// (PID 1), as on Linux. The old code included the caller: a previous
+    /// eclipse-init shutdown() did `kill(-1, SIGTERM)`, a grace sleep,
+    /// `kill(-1, SIGKILL)` and only then reboot(2), so PID 1 killed itself
+    /// and never reached reboot(2). Init no longer broadcasts; it
+    /// force-reboots like busybox `reboot -f`.
+    fn signal_broadcast(&self, cx: &KillContext) -> LxResult<()> {
+        let mut counted = false;
+        let mut result: LxResult<()> = Ok(());
+        for process in linux_object::process::all_live_processes() {
+            if process.id() == cx.caller.id() || process.id() == linux_object::process::INIT_PID {
+                continue;
+            }
+            counted = true;
+            let one = self.signal_one_process(cx, &process);
+            result = LinuxProcess::fold_broadcast_signal(result, one);
+        }
+        if counted {
+            result
+        } else {
+            Err(LxError::ESRCH)
+        }
+    }
+
     /// Send a signal to a process specified by pid
-    /// TODO: support all the arguments
     pub fn sys_kill(&self, pid: isize, signum: usize) -> SysResult {
         // `None` is signal 0: deliver nothing, but still report whether the
         // target exists. (An invalid number is EINVAL here, before the target
@@ -377,93 +510,16 @@ impl Syscall<'_> {
             pid,
             signal
         );
-        // NOTE: process-group sends use a minimal "pgid == leader pid" model and
-        // a signal is delivered to one not-blocking thread of the target process
-        // (see `send_to_pid`). This is sufficient for the shells/job-control we
-        // run; it is intentionally not a full POSIX implementation. (Previously a
-        // warn! fired on every kill() to say so, which only spammed the log.)
-        let target = kill_target(pid_arg(pid));
-        let caller = self.zircon_process().clone();
-        let send_to_pid = |pid: KoID| -> SysResult {
-            let Some(process) = ROOT_JOB.find_process(pid) else {
-                // A child that exited but was not waited for is gone from the
-                // job yet still a valid target: Linux delivers nothing and
-                // returns 0. Firefox's parent logged "failed to send SIGKILL
-                // to process N" for every content process it had already
-                // seen die, and its profile lock's `kill(pid, 0)` probe
-                // treats ESRCH as "stale lock" but any other answer as
-                // "still running".
-                if self.linux_process().is_zombie_child(pid) {
-                    return Ok(0);
-                }
-                return Err(LxError::ESRCH);
-            };
-            match signal {
-                // kill(pid, 0): the lookup just above is the whole answer.
-                None => Ok(0),
-                Some(Signal::SIGKILL) => {
-                    deliver_direct_sigkill(&caller, &process);
-                    Ok(0)
-                }
-                Some(sig) => {
-                    linux_object::process::send_signal_to_process(pid as usize, sig).map(|_| 0)
-                }
-            }
-        };
-        match target {
-            SendTarget::Pid(pid) => send_to_pid(pid),
+        let cx = self.kill_context(signal);
+        match kill_target(pid_arg(pid)) {
+            SendTarget::Pid(pid) => self.signal_pid(&cx, pid),
             SendTarget::EveryProcessInGroup => {
-                // Minimal process-group support: without a real setpgid/pgid table,
-                // treat "current process group" as the current process ID.
-                send_to_pid(caller.id() as KoID)
+                self.signal_group(&cx, linux_object::process::effective_pgid(&cx.caller))
             }
-            SendTarget::EveryProcessInGroupByPID(pgid) => {
-                // Minimal process-group support: treat pgid as the leader's pid.
-                // This matches the common shell behavior of setting fg_pgrp = child pid.
-                send_to_pid(pgid)
-            }
-            SendTarget::EveryProcess => {
-                // kill(-1, sig) reaches every process EXCEPT the caller and
-                // init (PID 1), as on Linux. The old code included the caller:
-                // a previous eclipse-init shutdown() did `kill(-1, SIGTERM)`,
-                // a grace sleep, `kill(-1, SIGKILL)` and only then reboot(2),
-                // so PID 1 killed itself and never reached reboot(2). Init no
-                // longer broadcasts; it force-reboots like busybox `reboot -f`.
-                let skip = |proc: &Arc<zircon_object::task::Process>| {
-                    proc.id() == caller.id() || proc.id() == linux_object::process::INIT_PID
-                };
-                let mut any = false;
-                for proc in linux_object::process::all_live_processes() {
-                    if skip(&proc) {
-                        continue;
-                    }
-                    match signal {
-                        // Signal 0 broadcast: every process we could have
-                        // reached counts as reached.
-                        None => any = true,
-                        Some(Signal::SIGKILL) => {
-                            proc.exit((128 + Signal::SIGKILL as i32) as i64);
-                            any = true;
-                        }
-                        Some(sig) => {
-                            if linux_object::process::send_signal_to_process(
-                                proc.id() as usize,
-                                sig,
-                            )
-                            .is_ok()
-                            {
-                                any = true;
-                            }
-                        }
-                    }
-                }
-                if any {
-                    Ok(0)
-                } else {
-                    Err(LxError::ESRCH)
-                }
-            }
+            SendTarget::EveryProcessInGroupByPID(pgid) => self.signal_group(&cx, pgid),
+            SendTarget::EveryProcess => self.signal_broadcast(&cx),
         }
+        .map(|_| 0)
     }
 
     /// Send a signal to a thread specified by tid
@@ -495,6 +551,11 @@ impl Syscall<'_> {
 
     /// Send a signal to a thread specified by tgid (i.e., process) and pid
     /// Note: the job of the target process should be the same as the calling thread
+    ///
+    /// This one reaches into ANOTHER process, so `check_kill_permission()`
+    /// applies exactly as it does to `kill(2)`. (`tkill(2)` next door does
+    /// not: it only ever looks inside the caller's own process, which is
+    /// narrower than Linux and needs no gate of its own.)
     pub fn sys_tgkill(&mut self, tgid: usize, tid: usize, signum: usize) -> SysResult {
         let tgid = single_task_id(tgid)?;
         let tid = single_task_id(tid)?;
@@ -507,20 +568,30 @@ impl Syscall<'_> {
             signum
         );
         let parent = self.zircon_process().clone();
-        match parent.job().get_child(tgid).map(|proc| proc.get_child(tid)) {
-            Ok(Ok(obj)) => {
-                let thread: Arc<Thread> = match obj.downcast_arc() {
-                    Ok(t) => t,
-                    Err(_) => return Err(LxError::ESRCH),
-                };
-                // tgkill(tgid, tid, 0) probes the thread and delivers nothing.
-                if let Some(signal) = signal {
-                    queue_signal_to_thread(&thread, signal);
-                }
-                Ok(0)
-            }
-            _ => Err(LxError::ESRCH),
+        let Ok(process) = parent
+            .job()
+            .get_child(tgid)
+            .map_err(|_| LxError::ESRCH)
+            .and_then(|obj| {
+                obj.downcast_arc::<zircon_object::task::Process>()
+                    .map_err(|_| LxError::ESRCH)
+            })
+        else {
+            return Err(LxError::ESRCH);
+        };
+        let Ok(obj) = process.get_child(tid) else {
+            return Err(LxError::ESRCH);
+        };
+        let thread: Arc<Thread> = match obj.downcast_arc() {
+            Ok(t) => t,
+            Err(_) => return Err(LxError::ESRCH),
+        };
+        self.may_signal_process(&self.kill_context(signal), &process)?;
+        // tgkill(tgid, tid, 0) probes the thread and delivers nothing.
+        if let Some(signal) = signal {
+            queue_signal_to_thread(&thread, signal);
         }
+        Ok(0)
     }
 
     /// Return from handling some signal
@@ -642,27 +713,20 @@ impl Syscall<'_> {
             "rt_sigqueueinfo: pid={}, sig={}, si_code={}",
             pid, signum, head.code
         );
-        let caller = self.zircon_process().clone();
         let pid = pid_arg(pid as isize);
-        if !may_queue_siginfo(head.code, pid as i64 == caller.id() as i64) {
+        if !may_queue_siginfo(head.code, pid as i64 == self.zircon_process().id() as i64) {
             return Err(LxError::EPERM);
         }
         let process = ROOT_JOB.find_process(pid as KoID).ok_or(LxError::ESRCH)?;
-        let Some(signal) = Signal::from_syscall_arg(signum)? else {
-            // Existence probe, like kill(pid, 0).
-            return Ok(0);
-        };
-        if signal == Signal::SIGKILL {
-            // Through the same decision `kill(2)` makes, which is the point:
-            // this used to call `Process::exit` straight out, so
-            // `sigqueue(1, SIGKILL, v)` removed init where `kill -9 1` is
-            // refused.
-            deliver_direct_sigkill(&caller, &process);
-            return Ok(0);
-        }
-        drop(process);
-        linux_object::process::send_signal_to_process(pid as usize, signal)?;
-        Ok(0)
+        // `kill_proc_info()`, the same one `kill(2)` walks into: the
+        // credentials, then the delivery -- including the refusal to end init
+        // from another process, which this syscall used to bypass by calling
+        // `Process::exit` straight out. The signal number is parsed after the
+        // target is found so that `ESRCH` keeps winning over `EINVAL`, as it
+        // did before.
+        let signal = Signal::from_syscall_arg(signum)?;
+        self.signal_one_process(&self.kill_context(signal), &process)
+            .map(|_| 0)
     }
 
     /// Queue a signal plus `siginfo` to a specific thread of a thread group
@@ -681,17 +745,25 @@ impl Syscall<'_> {
         );
         let tgid = single_task_id(tgid)?;
         let tid = single_task_id(tid)?;
-        if !may_queue_siginfo(head.code, tgid == self.zircon_process().id()) {
+        // The target THREAD, not its thread group: forging an `si_code` at a
+        // sibling thread is forging it at somebody else, and asking about the
+        // group let that through.
+        if !may_queue_siginfo(head.code, tid == self.thread.id()) {
             return Err(LxError::EPERM);
         }
         let process = ROOT_JOB.find_process(tgid).ok_or(LxError::ESRCH)?;
         let thread_obj = process.get_child(tid).map_err(|_| LxError::ESRCH)?;
         let thread: Arc<Thread> = thread_obj.downcast_arc().map_err(|_| LxError::ESRCH)?;
-        let Some(signal) = Signal::from_syscall_arg(signum)? else {
-            // Existence probe, like kill(pid, 0).
-            return Ok(0);
-        };
-        queue_signal_to_thread(&thread, signal);
+        let signal = Signal::from_syscall_arg(signum)?;
+        // `do_send_specific()`, which is `tgkill`'s own path: the credentials
+        // of the thread GROUP, since a thread has none of its own.
+        self.may_signal_process(&self.kill_context(signal), &process)?;
+        // rt_tgsigqueueinfo(tgid, tid, 0) probes and delivers nothing -- but
+        // it is refused just the same, so it cannot report the existence of a
+        // thread you may not signal.
+        if let Some(signal) = signal {
+            queue_signal_to_thread(&thread, signal);
+        }
         Ok(0)
     }
 
