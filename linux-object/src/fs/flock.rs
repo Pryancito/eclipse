@@ -254,9 +254,11 @@ impl Future for ChangeFuture {
 #[cfg(test)]
 mod tests {
     //! `flock(2)` on the table, with descriptions named by number, and on
-    //! real `File`s for the release at the last close. Every file key here
-    //! is its own, so the tests hold with the rest of the binary in
-    //! parallel; only the waiter count is asserted relative to itself.
+    //! real `File`s for the release at the last close. Every file key here is
+    //! its own, but a key only keeps the `locks` map apart: the generation and
+    //! the waiter list are ONE table for the binary, so every test in here
+    //! takes [`alone_on_the_table`] on its first line. A new test belongs in
+    //! that queue too, whatever it asserts -- see the note there.
     extern crate std;
     use super::*;
     use crate::fs::{File, OpenFlags};
@@ -287,8 +289,39 @@ mod tests {
         Pin::new(f).poll(&mut cx)
     }
 
+    /// Hold the flock tests' turnstile until the end of the test.
+    ///
+    /// The per-test file key looked like enough isolation, and it is not:
+    /// `Table::touch` bumps ONE `generation` for the whole table and drains
+    /// EVERY parked waker, whichever file the released lock was on. So any
+    /// test that unlocks -- which is nearly all of them -- can, from another
+    /// harness thread:
+    ///
+    /// * wake and unpark a waiter another test had just parked, which is how
+    ///   `waiter_count()` came back one short and how the wake counter came
+    ///   back non-zero for a take that woke nobody;
+    /// * move the generation between a failed `try_lock` and the
+    ///   `wait_for_change` built from the number it returned, so the wait
+    ///   resolves at once instead of parking.
+    ///
+    /// `a_dropped_wait_takes_its_waker_with_it` failed two runs in three on
+    /// master because of it. Serialising is the fix rather than loosening the
+    /// assertions: the exact waiter count IS the property -- a cancelled
+    /// `flock` that leaves its waker behind leaks one per cancelled wait --
+    /// and so is "a take wakes nobody".
+    ///
+    /// The guard travels in a `let _alone = ...` binding so it is released by
+    /// the unwind of a failed assertion; naming it `_` instead would drop it
+    /// on the spot and serialise nothing.
+    #[must_use = "bind it to `_alone`: a bare `_` releases the turnstile at once"]
+    fn alone_on_the_table() -> spin::MutexGuard<'static, ()> {
+        static GUARD: spin::Mutex<()> = spin::Mutex::new(());
+        GUARD.lock()
+    }
+
     #[test]
     fn two_exclusive_locks_from_two_descriptions_do_not_both_succeed() {
+        let _alone = alone_on_the_table();
         // What `flock -n` and dpkg rely on, and what used to be answered 0
         // for both callers.
         let k = key(1);
@@ -308,6 +341,7 @@ mod tests {
 
     #[test]
     fn shared_locks_coexist_and_an_exclusive_one_waits_for_all_of_them() {
+        let _alone = alone_on_the_table();
         let k = key(2);
         assert_eq!(try_lock(k, 200, false), Ok(()));
         assert_eq!(try_lock(k, 201, false), Ok(()));
@@ -321,6 +355,7 @@ mod tests {
 
     #[test]
     fn a_lock_on_one_file_says_nothing_about_another() {
+        let _alone = alone_on_the_table();
         assert_eq!(try_lock(key(3), 300, true), Ok(()));
         assert_eq!(try_lock(key(4), 301, true), Ok(()));
         unlock(key(3), 300);
@@ -329,6 +364,7 @@ mod tests {
 
     #[test]
     fn the_same_description_locking_again_is_a_no_op_and_dup_shares_it() {
+        let _alone = alone_on_the_table();
         // `dup`, `fork`: the same description, so the same owner id. Asking
         // for what it already holds changes nothing, and a release through
         // any of the descriptors is the release.
@@ -342,6 +378,7 @@ mod tests {
 
     #[test]
     fn a_conversion_drops_the_old_lock_first_and_waits_holding_nothing() {
+        let _alone = alone_on_the_table();
         // `flock_lock_inode`: the existing lock of the same description is
         // deleted before the new type is tried, so a reader that wants to
         // become the writer while another reader is there loses its read
@@ -371,6 +408,7 @@ mod tests {
 
     #[test]
     fn unlocking_what_is_not_held_is_nothing() {
+        let _alone = alone_on_the_table();
         let k = key(7);
         unlock(k, 700);
         assert!(holders(k).is_empty());
@@ -386,6 +424,7 @@ mod tests {
 
     #[test]
     fn the_last_close_of_a_description_releases_its_locks_on_every_file() {
+        let _alone = alone_on_the_table();
         let k1 = key(8);
         let k2 = key(9);
         assert_eq!(try_lock(k1, 800, true), Ok(()));
@@ -405,6 +444,7 @@ mod tests {
 
     #[test]
     fn dropping_the_file_is_the_last_close() {
+        let _alone = alone_on_the_table();
         // The syscall names the description by the `File`'s address, and
         // nothing else knows when the last descriptor to it is gone: the
         // drop has to be the release, or a process that took `LOCK_EX` and
@@ -428,6 +468,7 @@ mod tests {
 
     #[test]
     fn a_release_wakes_the_parked_waiter_and_a_stale_generation_does_not_park() {
+        let _alone = alone_on_the_table();
         let k = key(11);
         assert_eq!(try_lock(k, 1100, true), Ok(()));
         let since = try_lock(k, 1101, true).unwrap_err();
@@ -435,7 +476,7 @@ mod tests {
         let mut wait = Box::pin(wait_for_change(since));
         let parked = waiter_count();
         assert!(poll_once(&mut wait, &waker).is_pending());
-        assert!(waiter_count() > 0);
+        assert_eq!(waiter_count(), parked + 1);
 
         unlock(k, 1100);
 
@@ -444,7 +485,7 @@ mod tests {
             "the release woke nobody"
         );
         assert!(matches!(poll_once(&mut wait, &waker), Poll::Ready(Ok(()))));
-        assert!(waiter_count() <= parked, "the waiter stayed parked");
+        assert_eq!(waiter_count(), parked, "the waiter stayed parked");
         assert_eq!(try_lock(k, 1101, true), Ok(()));
         unlock(k, 1101);
 
@@ -455,6 +496,7 @@ mod tests {
 
     #[test]
     fn a_dropped_wait_takes_its_waker_with_it() {
+        let _alone = alone_on_the_table();
         let k = key(12);
         assert_eq!(try_lock(k, 1200, true), Ok(()));
         let since = try_lock(k, 1201, true).unwrap_err();
@@ -470,6 +512,7 @@ mod tests {
 
     #[test]
     fn taking_a_lock_does_not_wake_anyone_but_releasing_does() {
+        let _alone = alone_on_the_table();
         // A parked writer has nothing to gain from one more reader arriving;
         // a spurious wake would have it re-scan for nothing.
         let k = key(13);
@@ -486,5 +529,95 @@ mod tests {
         assert!(matches!(poll_once(&mut wait, &waker), Poll::Ready(Ok(()))));
         assert_eq!(try_lock(k, 1301, true), Ok(()));
         unlock(k, 1301);
+    }
+
+    /// One generation for the whole table means a release on ANY file wakes
+    /// every parked `flock`, including those waiting on a file that did not
+    /// change. They re-read the table, find their own lock still held and park
+    /// again, so the answer stays right -- `sys_flock` loops on `try_lock` --
+    /// but N blocked `flock`s cost N wakes per unrelated release. Worth
+    /// pinning: it is the behaviour every waiter-count assertion in here
+    /// depends on, and it is exactly what the per-file `locks` map does NOT
+    /// give you.
+    #[test]
+    fn a_release_on_one_file_wakes_the_flocks_parked_on_another() {
+        let _alone = alone_on_the_table();
+        let mine = key(14);
+        let other = key(15);
+        assert_eq!(try_lock(mine, 1400, true), Ok(()));
+        assert_eq!(try_lock(other, 1500, true), Ok(()));
+        let since = try_lock(mine, 1401, true).unwrap_err();
+        let waker = Arc::new(CountWaker(AtomicUsize::new(0)));
+        let mut wait = Box::pin(wait_for_change(since));
+        assert!(poll_once(&mut wait, &waker).is_pending());
+
+        // Nothing at all happened to `mine`.
+        unlock(other, 1500);
+
+        assert_eq!(
+            waker.0.load(Ordering::SeqCst),
+            1,
+            "a release elsewhere left the waiter asleep"
+        );
+        assert_eq!(
+            waiter_count(),
+            0,
+            "the wake did not take the waker off the table"
+        );
+        assert!(matches!(poll_once(&mut wait, &waker), Poll::Ready(Ok(()))));
+        // And the lock it actually wanted is still held by 1400.
+        assert!(try_lock(mine, 1401, true).is_err());
+        unlock(mine, 1400);
+    }
+
+    /// A waiter is charged once, not once per poll. The future carries its
+    /// `sub_id` and refreshes the waker in place on a second poll; pushing
+    /// again instead would leak one entry per poll, and a parked `flock` is
+    /// re-polled every 100 ms by its own interrupt-check timer.
+    #[test]
+    fn polling_the_same_wait_twice_parks_one_waiter_not_two() {
+        let _alone = alone_on_the_table();
+        let k = key(16);
+        assert_eq!(try_lock(k, 1600, true), Ok(()));
+        let since = try_lock(k, 1601, true).unwrap_err();
+        let first = Arc::new(CountWaker(AtomicUsize::new(0)));
+        let second = Arc::new(CountWaker(AtomicUsize::new(0)));
+        let mut wait = Box::pin(wait_for_change(since));
+        assert!(poll_once(&mut wait, &first).is_pending());
+        assert_eq!(waiter_count(), 1);
+        assert!(poll_once(&mut wait, &second).is_pending());
+        assert_eq!(waiter_count(), 1, "the second poll parked a second waker");
+
+        // The waker on the table is the one from the LAST poll, which is why
+        // refreshing it matters: a future moved to another task has to be woken
+        // through that task's waker, not the one that polled it first.
+        unlock(k, 1600);
+        assert_eq!(first.0.load(Ordering::SeqCst), 0);
+        assert_eq!(second.0.load(Ordering::SeqCst), 1);
+        assert_eq!(waiter_count(), 0);
+    }
+
+    /// A wait built on a generation the table has already left never parks, so
+    /// a release landing between the failed `try_lock` and the wait cannot be
+    /// missed. This is the other half of that: a wait built on the CURRENT
+    /// generation does park. The two together say the decision is the
+    /// generation, and not always-park or never-park.
+    #[test]
+    fn a_wait_parks_on_the_current_generation_and_not_on_an_older_one() {
+        let _alone = alone_on_the_table();
+        let k = key(17);
+        assert_eq!(try_lock(k, 1700, true), Ok(()));
+        let since = try_lock(k, 1701, true).unwrap_err();
+        let waker = Arc::new(CountWaker(AtomicUsize::new(0)));
+
+        let mut now = Box::pin(wait_for_change(since));
+        assert!(poll_once(&mut now, &waker).is_pending());
+        assert_eq!(waiter_count(), 1);
+        drop(now);
+
+        let mut older = Box::pin(wait_for_change(since.wrapping_sub(1)));
+        assert!(matches!(poll_once(&mut older, &waker), Poll::Ready(Ok(()))));
+        assert_eq!(waiter_count(), 0, "a stale wait parked anyway");
+        unlock(k, 1700);
     }
 }

@@ -848,6 +848,34 @@ mod shebang_tests {
 #[cfg(test)]
 mod elf_bounds_tests {
     use super::*;
+    use core::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A base address in the host's address space that no other test in this
+    /// binary will map at.
+    ///
+    /// Under libos a mapping is a real host `mmap` AT THE ADDRESS ASKED FOR,
+    /// `MAP_FIXED`, over a mock page table that is one table for the whole test
+    /// binary. So a root VMAR of one's own is not an address space of one's
+    /// own: two tests that name the same address map over each other's pages,
+    /// and the loser dies inside the mock --
+    /// `mprotect(EXECUTE) right after mmap found no mapping at 0x400000` --
+    /// which is what `a_stripped_binary_still_loads` did about once in ten runs
+    /// of the whole suite, whenever it landed beside
+    /// `a_segments_page_permissions_are_the_ones_its_header_asked_for`. The
+    /// relocation tests shared 0x10_0000 the same way, three of them at once
+    /// inside a single test, and got away with it only because none of them
+    /// reads back a word another had written.
+    ///
+    /// Windows are 256 KiB, more than anything here maps, and start at 1 MiB:
+    /// above the host's `vm.mmap_min_addr` -- 64 KiB on an ordinary runner,
+    /// which answers EPERM below it -- and below where a PIE test binary or the
+    /// mock's own direct map (`PMEM_MAP_VADDR`, 32 GiB) sit. **A new test that
+    /// maps anything asks for its window here rather than naming an address.**
+    fn own_window() -> usize {
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        const WINDOW: usize = 0x4_0000;
+        0x10_0000 + NEXT.fetch_add(1, Ordering::Relaxed) * WINDOW
+    }
 
     /// `EI_CLASS` = 64-bit, `EI_DATA` = little-endian.
     const CLASS64: u8 = 2;
@@ -1253,11 +1281,9 @@ mod elf_bounds_tests {
             p_type: 1,    // PT_LOAD
             flags: 0b101, // R+X
             offset: payload_at(1),
-            // Above the host's `vm.mmap_min_addr`, like the flags test below:
-            // this one really does `mmap` at the address the header names, and
-            // a runner with the usual 64 KiB answers EPERM where a container
-            // with 4 KiB maps it happily.
-            virtual_addr: 0x40_0000,
+            // This one really does `mmap` at the address the header names, so
+            // it asks for a window of its own -- see `own_window`.
+            virtual_addr: own_window() as u64,
             file_size: 4,
             mem_size: 0x1000,
             ..Default::default()
@@ -1959,7 +1985,7 @@ mod elf_bounds_tests {
     fn image_vmar() -> (Arc<VmAddressRegion>, Arc<VmAddressRegion>) {
         let root = VmAddressRegion::new_root();
         let image = root
-            .allocate_at(0x10_0000, 0x4000, VmarFlags::CAN_MAP_RXW, PAGE_SIZE)
+            .allocate_at(own_window(), 0x4000, VmarFlags::CAN_MAP_RXW, PAGE_SIZE)
             .unwrap();
         image
             .map_at(0, VmObject::new_paged(1), 0, PAGE_SIZE, MMUFlags::RXW)
@@ -2213,7 +2239,7 @@ mod elf_bounds_tests {
     fn the_mapping_cache_never_writes_through_the_wrong_mapping() {
         let root = VmAddressRegion::new_root();
         let image = root
-            .allocate_at(0x10_0000, 0x4000, VmarFlags::CAN_MAP_RXW, PAGE_SIZE)
+            .allocate_at(own_window(), 0x4000, VmarFlags::CAN_MAP_RXW, PAGE_SIZE)
             .unwrap();
         // Two separate mappings, a page apart, with a hole between them.
         image
@@ -2252,17 +2278,17 @@ mod elf_bounds_tests {
     fn a_segments_page_permissions_are_the_ones_its_header_asked_for() {
         // PF_X = 1, PF_W = 2, PF_R = 4.
         //
-        // The segment has to sit above the host's `vm.mmap_min_addr`: under
-        // libos this really does `mmap` at the address the header names, and
-        // a runner with the usual 64 KiB answers EPERM where a container with
-        // 4 KiB maps it happily. 4 MiB is where a non-PIE image starts anyway.
-        const BASE: usize = 0x40_0000;
+        // Under libos this really does `mmap` at the address the header
+        // names, so it asks for a window of its own -- see `own_window`. The
+        // six mappings below are sequential and each drops its VMAR, so one
+        // window serves them all.
+        let base = own_window();
         let flags_of = |p_flags: u32| {
             let image = Elf::new()
                 .phdr(Phdr {
                     p_type: 1, // PT_LOAD
                     flags: p_flags,
-                    virtual_addr: BASE as u64,
+                    virtual_addr: base as u64,
                     mem_size: 0x1000,
                     ..Default::default()
                 })
@@ -2270,7 +2296,7 @@ mod elf_bounds_tests {
             let elf = ElfFile::new(&image).unwrap();
             let vmar = VmAddressRegion::new_root();
             vmar.load_from_elf(&elf).unwrap();
-            vmar.find_mapping(BASE).unwrap().get_flags(BASE).unwrap()
+            vmar.find_mapping(base).unwrap().get_flags(base).unwrap()
         };
         let user = MMUFlags::USER;
         assert_eq!(flags_of(4), user | MMUFlags::READ);
@@ -2299,7 +2325,7 @@ mod elf_bounds_tests {
     fn a_relocation_straddling_the_end_of_its_mapping_is_written_in_part() {
         let root = VmAddressRegion::new_root();
         let image = root
-            .allocate_at(0x10_0000, 0x4000, VmarFlags::CAN_MAP_RXW, PAGE_SIZE)
+            .allocate_at(own_window(), 0x4000, VmarFlags::CAN_MAP_RXW, PAGE_SIZE)
             .unwrap();
         image
             .map_at(0, VmObject::new_paged(1), 0, PAGE_SIZE, MMUFlags::RXW)
