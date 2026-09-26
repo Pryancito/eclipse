@@ -6607,6 +6607,76 @@ mod kms_scanout_tests {
         c.destroy_dumb(buf.handle).expect("DESTROY_DUMB");
     }
 
+    /// The same sweep on a WRITE-COMBINING output with a padded scanline, which
+    /// is what real hardware is: UEFI reports a `PixelsPerScanLine` wider than
+    /// the mode, the framebuffer is mapped WC, and on x86_64 `blit_from` then
+    /// takes the non-temporal store loop instead of the ordinary copy. That loop
+    /// is a different implementation of the same promise, so the promise has to
+    /// be checked against it too -- and it is the one that runs on the machine
+    /// where Moebius sees the popup come up with pieces missing.
+    #[test]
+    fn every_pixel_inside_a_damage_box_is_written_on_a_write_combining_output() {
+        const W: u32 = 204;
+        const H: u32 = 184;
+        // 204 -> the pitch UEFI would report, wider than the mode.
+        let screen = kms_emu::attach_with(W, H, 256, true);
+        let c = Client::open(0);
+        let buf = c.create_dumb(W, H);
+        let fb = c.addfb2(&buf);
+
+        // The popup's own surface, and the offsets the report names: pieces
+        // missing every 64 px, i.e. every 256 bytes of a row.
+        let boxes: [(u32, u32, u32, u32); 6] = [
+            (0, 0, 204, 184),
+            (0, 0, 180, 160),
+            (12, 12, 180, 160),
+            (13, 11, 63, 65),
+            (64, 0, 8, H),
+            (W - 1, H - 1, 1, 1),
+        ];
+
+        for (i, &(bx, by, bw, bh)) in boxes.iter().enumerate() {
+            let old = 0x0100_0000 * (2 * i as u32 + 1);
+            let new = 0x0100_0000 * (2 * i as u32 + 2);
+
+            paint(&buf, |x, y| tag(old, x, y));
+            c.page_flip(drm::SYNTH_CRTC_ID, fb, 300 + i as u64)
+                .expect("the frame before the damage");
+            drain_completions(&c);
+
+            paint(&buf, |x, y| tag(new, x, y));
+            dirtyfb(
+                &c,
+                fb,
+                &[clip(
+                    bx as u16,
+                    by as u16,
+                    (bx + bw) as u16,
+                    (by + bh) as u16,
+                )],
+            );
+
+            let (cw, ch) = (bw.min(W - bx), bh.min(H - by));
+            for y in by..by + ch {
+                for x in bx..bx + cw {
+                    assert_eq!(
+                        screen.pixel(x, y),
+                        tag(new, x, y),
+                        "box {:?}: pixel ({}, {}) inside it still carries the \
+                         previous frame -- byte {} of its row",
+                        (bx, by, bw, bh),
+                        x,
+                        y,
+                        x * 4
+                    );
+                }
+            }
+        }
+
+        c.rmfb(fb).expect("RMFB");
+        c.destroy_dumb(buf.handle).expect("DESTROY_DUMB");
+    }
+
     /// A damage rect is not a catch-up. `DRM_IOCTL_MODE_DIRTYFB` copies the
     /// boxes the client names and nothing else, so after a dropped present the
     /// panel is still a frame behind everywhere outside them -- and the cursor
