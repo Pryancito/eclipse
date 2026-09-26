@@ -1,7 +1,15 @@
 //! Filesystem wrapper that enforces per-mount flags (e.g. read-only).
+//!
+//! A wrapper in the inode chain has two obligations beyond the flag it is
+//! there for. It must be **transparent to a downcast**, which is what
+//! `as_any_ref` below is about. And it must **stay in the chain**: an inode's
+//! `fs()` is a way back to the root of its filesystem, so handing back the
+//! wrapped filesystem let anyone walk out of a read-only mount and write
+//! through the front door.
 
 use alloc::boxed::Box;
 use alloc::sync::Arc;
+use alloc::sync::Weak;
 use core::any::Any;
 use core::future::Future;
 use core::pin::Pin;
@@ -18,12 +26,31 @@ fn ro_err() -> FsError {
 }
 
 pub fn wrap_fs(inner: Arc<dyn FileSystem>, state: Arc<MountState>) -> Arc<dyn FileSystem> {
-    Arc::new(FlaggedFs { inner, state })
+    // `new_cyclic` so every inode can hold a way back to this wrapper, which is
+    // what `INode::fs` owes its caller. The back-reference is weak and the root
+    // inode is built once here: the strong direction is filesystem -> root, so
+    // there is no cycle to leak, and `root_inode` can hand back the same `Arc`
+    // every time.
+    Arc::new_cyclic(|me: &Weak<FlaggedFs>| {
+        let root = Arc::new(FlaggedINode {
+            inner: inner.root_inode(),
+            state: state.clone(),
+            fs: me.clone(),
+        });
+        FlaggedFs { inner, root }
+    })
 }
 
 struct FlaggedFs {
     inner: Arc<dyn FileSystem>,
-    state: Arc<MountState>,
+    // No `state` here: `FsInfo` has no room for a read-only bit, so there is
+    // nothing at this level to gate, and the flags live where they are read --
+    // on the inodes.
+    /// The wrapped root, built once. `root_inode` used to allocate a fresh
+    /// wrapper per call, so two calls answered with two different `Arc`s and
+    /// every `Arc::ptr_eq` against the root -- which is how a mount root is
+    /// recognised -- was false.
+    root: Arc<FlaggedINode>,
 }
 
 impl FileSystem for FlaggedFs {
@@ -35,18 +62,20 @@ impl FileSystem for FlaggedFs {
         }
     }
 
-    // root_inode must re-wrap so the flags propagate to the returned inode.
+    // root_inode must answer with the wrapped root, so the flags propagate --
+    // and with the SAME one each time.
     fn root_inode(&self) -> Arc<dyn INode> {
-        Arc::new(FlaggedINode {
-            inner: self.inner.root_inode(),
-            state: self.state.clone(),
-        })
+        self.root.clone()
     }
 }
 
 struct FlaggedINode {
     inner: Arc<dyn INode>,
     state: Arc<MountState>,
+    /// The wrapper this inode belongs to, for [`INode::fs`]. Weak because the
+    /// filesystem owns the root inode: a strong link both ways would leak the
+    /// mount.
+    fs: Weak<FlaggedFs>,
 }
 
 impl FlaggedINode {
@@ -61,6 +90,7 @@ impl FlaggedINode {
         Arc::new(FlaggedINode {
             inner: inode,
             state: self.state.clone(),
+            fs: self.fs.clone(),
         })
     }
 }
@@ -80,7 +110,24 @@ impl INode for FlaggedINode {
             ) -> Result<(Metadata, alloc::string::String)>;
             fn io_control(&self, cmd: u32, data: usize) -> Result<usize>;
             fn mmap(&self, area: MMapArea) -> Result<()>;
-            fn fs(&self) -> Arc<dyn FileSystem>;
+        }
+    }
+
+    /// The filesystem this inode belongs to -- **the wrapper**, not what it
+    /// wraps.
+    ///
+    /// This was delegated straight to the inner inode, so `inode.fs()` handed
+    /// back the unwrapped filesystem and `inode.fs().root_inode()` was a way
+    /// out of a read-only mount: the root it returned carried no flags, and
+    /// every write from there down went through. `rcore-fs-mountfs` answers
+    /// with its own `vfs` for the same reason.
+    fn fs(&self) -> Arc<dyn FileSystem> {
+        match self.fs.upgrade() {
+            Some(fs) => fs,
+            // The mount is gone, so there is no flag left to enforce and
+            // nothing this can widen: an inode that outlived its mount is
+            // already detached from the tree.
+            None => self.inner.fs(),
         }
     }
 
@@ -237,6 +284,7 @@ mod flagged_fs_tests {
         let wrapped: Arc<dyn INode> = Arc::new(FlaggedINode {
             inner: dir.clone(),
             state: state.clone(),
+            fs: Weak::new(),
         });
         (dir, wrapped)
     }
@@ -294,6 +342,207 @@ mod flagged_fs_tests {
         assert_eq!(
             d.find("c").unwrap().metadata().unwrap().inode,
             root.find("b").unwrap().metadata().unwrap().inode
+        );
+    }
+}
+
+#[cfg(test)]
+mod chain_tests {
+    //! The other half of what a wrapper owes: staying in the chain. An
+    //! inode's `fs()` is a way back to the root of its filesystem, so
+    //! answering with the filesystem underneath handed out an unwrapped root
+    //! and a read-only mount could be written through it. The mount root also
+    //! has to be one inode, not a fresh allocation per call, because that is
+    //! what `Arc::ptr_eq` against it is asking.
+
+    use super::*;
+    use crate::fs::mount_state::{MountState, MS_RDONLY};
+    use rcore_fs_ramfs::RamFS;
+
+    fn mount(flags: usize) -> Arc<dyn FileSystem> {
+        wrap_fs(RamFS::new(), Arc::new(MountState::from_options(flags, "")))
+    }
+
+    fn mount_with(state: Arc<MountState>) -> Arc<dyn FileSystem> {
+        wrap_fs(RamFS::new(), state)
+    }
+
+    #[test]
+    fn the_filesystem_an_inode_names_is_the_mount_and_not_what_it_wraps() {
+        let fs = mount(0);
+        let root = fs.root_inode();
+        let child = root.create("d", FileType::Dir, 0o755).unwrap();
+        assert!(Arc::ptr_eq(&root.fs(), &fs));
+        assert!(Arc::ptr_eq(&child.fs(), &fs));
+        assert!(Arc::ptr_eq(&root.find("d").unwrap().fs(), &fs));
+    }
+
+    #[test]
+    fn a_read_only_mount_cannot_be_written_through_the_filesystem_it_names() {
+        let fs = mount(MS_RDONLY);
+        let root = fs.root_inode();
+        assert_eq!(
+            root.create("x", FileType::File, 0o644).err(),
+            Some(FsError::ReadOnly)
+        );
+        // The way back out: an inode names its filesystem, and its root used
+        // to come back unwrapped.
+        let back = root.fs().root_inode();
+        assert_eq!(
+            back.create("x", FileType::File, 0o644).err(),
+            Some(FsError::ReadOnly)
+        );
+    }
+
+    #[test]
+    fn the_root_of_a_mount_is_the_same_inode_every_time() {
+        let fs = mount(0);
+        assert!(Arc::ptr_eq(&fs.root_inode(), &fs.root_inode()));
+    }
+
+    #[test]
+    fn an_inode_whose_mount_is_gone_still_names_a_filesystem() {
+        let inner = RamFS::new();
+        let root = {
+            let fs = wrap_fs(inner.clone(), Arc::new(MountState::from_options(0, "")));
+            fs.root_inode()
+        };
+        // The back-reference to the wrapper is weak, so this is the one case
+        // where the answer is the filesystem underneath -- and by then there
+        // is no mount left and no flag left to enforce.
+        assert!(Arc::ptr_eq(&root.fs(), &(inner as Arc<dyn FileSystem>)));
+    }
+
+    // ---- the flag it is there for ----
+
+    #[test]
+    fn a_read_only_mount_refuses_every_way_of_changing_a_file() {
+        let rw = mount(0);
+        let root = rw.root_inode();
+        let d = root.create("d", FileType::Dir, 0o755).unwrap();
+        let f = d.create("f", FileType::File, 0o644).unwrap();
+        drop((root, d, f));
+
+        let fs = mount(MS_RDONLY);
+        let root = fs.root_inode();
+        let f = root.create("f", FileType::File, 0o644);
+        assert_eq!(f.err(), Some(FsError::ReadOnly));
+        assert_eq!(
+            root.create2("f", FileType::File, 0o644, 0).err(),
+            Some(FsError::ReadOnly)
+        );
+        assert_eq!(root.unlink("anything").err(), Some(FsError::ReadOnly));
+        assert_eq!(root.resize(0).err(), Some(FsError::ReadOnly));
+        assert_eq!(root.write_at(0, b"x").err(), Some(FsError::ReadOnly));
+        assert_eq!(root.link("l", &root).err(), Some(FsError::ReadOnly));
+        assert_eq!(root.move_("a", &root, "b").err(), Some(FsError::ReadOnly));
+        let meta = root.metadata().unwrap();
+        assert_eq!(root.set_metadata(&meta).err(), Some(FsError::ReadOnly));
+    }
+
+    #[test]
+    fn reading_a_read_only_mount_goes_through() {
+        let fs = mount(MS_RDONLY);
+        let root = fs.root_inode();
+        assert!(root.metadata().is_ok());
+        assert!(root.sync_all().is_ok());
+        assert!(root.sync_data().is_ok());
+        let mut buf = [0u8; 4];
+        // A directory is not readable as bytes, but the call must reach the
+        // filesystem to say so rather than being refused as a write.
+        assert_ne!(root.read_at(0, &mut buf).err(), Some(FsError::ReadOnly));
+    }
+
+    #[test]
+    fn poll_says_a_file_on_a_read_only_mount_cannot_be_written() {
+        let state = Arc::new(MountState::from_options(0, ""));
+        let fs = mount_with(state.clone());
+        let f = fs.root_inode().create("f", FileType::File, 0o644).unwrap();
+        assert!(f.poll().unwrap().write);
+        // What `poll` answers is what `select`/`epoll` tell a program about
+        // whether writing is worth trying.
+        state.set_read_only(true);
+        assert!(!f.poll().unwrap().write);
+        assert!(f.poll().unwrap().read);
+    }
+
+    #[test]
+    fn a_mount_made_read_only_after_the_fact_starts_refusing() {
+        let state = Arc::new(MountState::from_options(0, ""));
+        let fs = mount_with(state.clone());
+        let root = fs.root_inode();
+        let d = root.create("d", FileType::Dir, 0o755).unwrap();
+        // `mount -o remount,ro` changes the state the mount already has, and
+        // every inode already handed out has to start refusing -- which is why
+        // they share one `Arc<MountState>` rather than a copy of the flag.
+        state.set_read_only(true);
+        assert_eq!(
+            root.create("x", FileType::File, 0o644).err(),
+            Some(FsError::ReadOnly)
+        );
+        assert_eq!(
+            d.create("x", FileType::File, 0o644).err(),
+            Some(FsError::ReadOnly)
+        );
+        state.set_read_only(false);
+        assert!(d.create("x", FileType::File, 0o644).is_ok());
+    }
+
+    #[test]
+    fn a_writable_mount_changes_nothing_about_the_filesystem_under_it() {
+        let fs = mount(0);
+        let root = fs.root_inode();
+        let f = root.create("f", FileType::File, 0o644).unwrap();
+        assert_eq!(f.write_at(0, b"hola").unwrap(), 4);
+        let mut buf = [0u8; 4];
+        assert_eq!(f.read_at(0, &mut buf).unwrap(), 4);
+        assert_eq!(&buf, b"hola");
+        f.resize(2).unwrap();
+        assert_eq!(f.metadata().unwrap().size, 2);
+        root.unlink("f").unwrap();
+        assert_eq!(root.find("f").err(), Some(FsError::EntryNotFound));
+    }
+
+    #[test]
+    fn a_directory_walked_through_the_mount_keeps_its_flags_all_the_way_down() {
+        let rw = mount(0);
+        let root = rw.root_inode();
+        let a = root.create("a", FileType::Dir, 0o755).unwrap();
+        let b = a.create("b", FileType::Dir, 0o755).unwrap();
+        b.create("c", FileType::Dir, 0o755).unwrap();
+        drop((root, a, b));
+
+        let state = Arc::new(MountState::from_options(0, ""));
+        let fs = mount_with(state.clone());
+        let root = fs.root_inode();
+        let a = root.create("a", FileType::Dir, 0o755).unwrap();
+        let b = a.create("b", FileType::Dir, 0o755).unwrap();
+        state.set_read_only(true);
+        // Three levels down, reached by `create` and by `find`, and both have
+        // to answer for the mount.
+        assert_eq!(
+            b.create("c", FileType::Dir, 0o755).err(),
+            Some(FsError::ReadOnly)
+        );
+        let found = root.find("a").unwrap().find("b").unwrap();
+        assert_eq!(
+            found.create("c", FileType::Dir, 0o755).err(),
+            Some(FsError::ReadOnly)
+        );
+        assert!(Arc::ptr_eq(&found.fs(), &fs));
+    }
+
+    #[test]
+    fn what_a_read_only_mount_does_not_refuse_is_written_down() {
+        // `io_control` reaches the filesystem whatever the mount says: most
+        // ioctls read, Linux gates the mutating ones one by one inside the
+        // filesystem, and there is nothing here that can tell them apart. The
+        // test is here so the day someone gives this wrapper a list, they find
+        // the line that says the list is the only way.
+        let fs = mount(MS_RDONLY);
+        assert_ne!(
+            fs.root_inode().io_control(0, 0).err(),
+            Some(FsError::ReadOnly)
         );
     }
 }

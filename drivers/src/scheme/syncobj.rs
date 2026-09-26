@@ -282,6 +282,19 @@ fn collect_orphans(table: &mut SyncobjTable) {
     PENDING_COUNT.store(table.pending.len(), Ordering::Relaxed);
 }
 
+/// `drm_syncobj_replace_fence` on a binary syncobj: whatever fence the slot
+/// carried is superseded by the one being installed -- a hardware fence
+/// still in flight, and the timeout mark of one that was given up on. Only
+/// the slot's own range: a timeline fence at a higher point is not this
+/// slot's (see [`attach_hw_fence`]). Callers must hold the table lock.
+fn drop_binary_fence(table: &mut SyncobjTable, handle: u32) {
+    table
+        .pending
+        .retain(|f| !(f.handle == handle && f.point <= 1));
+    table.errored.retain(|e| !(e.handle == handle && e.to <= 1));
+    PENDING_COUNT.store(table.pending.len(), Ordering::Relaxed);
+}
+
 /// Whether `target` on `handle` was reached only by a fence that timed out
 /// (see [`Errored`]). Callers must hold the table lock, resolved.
 fn errored_locked(table: &SyncobjTable, handle: u32, target: u64) -> bool {
@@ -669,10 +682,7 @@ pub fn attach_hw_fence(
             // for NVK's INT64_MAX is forever. Linux cannot hit this at all: a
             // binary replace swaps the single fence slot and cannot delete a
             // `dma_fence_chain` node at a higher seqno.
-            table
-                .pending
-                .retain(|f| !(f.handle == handle && f.point <= 1));
-            table.errored.retain(|e| !(e.handle == handle && e.to <= 1));
+            drop_binary_fence(&mut table, handle);
         } else if point <= cur {
             // Already past that point: nothing to wait for.
             //
@@ -872,9 +882,21 @@ pub fn pending_hw_fences(handle: u32, point: u64) -> alloc::vec::Vec<(usize, u64
     let (r, deferred) = {
         let mut table = TABLE.lock();
         let d = resolve_locked(&mut table);
+        // A point the handle has reached (its counter, or a link whose
+        // sources all have) has no fence left to deliver it: the wait is
+        // over, whatever later fence is still in flight on the handle. Read
+        // off the fences alone, a timeline wait on a point already
+        // delivered took the NEXT fence pending, and a wait on point 1 the
+        // highest, so a consumer that waited for frame N stalled behind
+        // frame N+1, in front of pushes nobody asked to hold back. Linux
+        // drops a dependency on a signaled fence before the job runs.
+        let reached =
+            effective_point(&table.objects, handle, LINK_DEPTH).is_some_and(|p| p >= point.max(1));
         // Binary waits (point 0/1): the highest pending fence on this handle.
         // Timeline: the lowest pending fence that covers `point`.
-        let own = if point <= 1 {
+        let own = if reached {
+            None
+        } else if point <= 1 {
             table
                 .pending
                 .iter()
@@ -891,6 +913,7 @@ pub fn pending_hw_fences(handle: u32, point: u64) -> alloc::vec::Vec<(usize, u64
         };
         let found = match own {
             Some(f) => alloc::vec![f],
+            None if reached => alloc::vec::Vec::new(),
             None => fences_through_link(&table, handle, point.max(1), LINK_DEPTH),
         };
         (
@@ -1010,6 +1033,12 @@ pub fn import_snapshot(dst: u32, src: u32, target: u64) -> bool {
         };
         let reached = src_point >= target;
         let tainted = reached && errored_locked(&table, src, target);
+        // The import REPLACES the destination's fence: one still in flight
+        // from an EXEC that signaled it stayed in `pending` beside the new
+        // link, and when it landed it advanced the object -- a waiter went
+        // through before the source the import stood for had been reached,
+        // and EXEC acquired that stale fence instead of the source's.
+        drop_binary_fence(&mut table, dst);
         let Some(obj) = table.objects.iter_mut().find(|o| o.handle == dst) else {
             drop(table);
             d.run();
@@ -1027,7 +1056,12 @@ pub fn import_snapshot(dst: u32, src: u32, target: u64) -> bool {
             Some(after)
         } else {
             // A binary import: `dst_point` is 1, because `IMPORT_SYNC_FILE`
-            // really does replace the binary fence.
+            // really does replace the binary fence -- a signaled slot goes
+            // back to waiting, for this source (a `VkSemaphore` imported
+            // into again: signal, wait, import, wait).
+            if obj.point <= 1 {
+                obj.point = 0;
+            }
             obj.linked = Some(Link {
                 deps: alloc::vec![(src, target)],
                 dst_point: 1,
@@ -1080,6 +1114,11 @@ pub fn transfer(dst: u32, dst_point: u64, src: u32, src_point: u64) -> bool {
             .filter(|f| f.handle == src && f.point >= need)
             .min_by_key(|f| f.point)
             .copied();
+        if dst_point <= 1 {
+            // A binary transfer replaces the destination's fence, as an
+            // import does (above); a timeline point is added to the chain.
+            drop_binary_fence(&mut table, dst);
+        }
         let Some(obj) = table.objects.iter_mut().find(|o| o.handle == dst) else {
             drop(table);
             d.run();
@@ -1098,6 +1137,10 @@ pub fn transfer(dst: u32, dst_point: u64, src: u32, src_point: u64) -> bool {
         } else if let Some(f) = hw {
             obj.linked = None;
             let point = dst_point.max(1);
+            if point == 1 && obj.point == 1 {
+                // The binary slot is replaced: signaled no more.
+                obj.point = 0;
+            }
             if point > obj.point {
                 table.pending.push(PendingFence {
                     handle: dst,
@@ -1112,6 +1155,10 @@ pub fn transfer(dst: u32, dst_point: u64, src: u32, src_point: u64) -> bool {
             }
             None
         } else {
+            if dst_point <= 1 && obj.point == 1 {
+                // The binary slot is replaced: signaled no more.
+                obj.point = 0;
+            }
             obj.linked = Some(Link {
                 deps: alloc::vec![(src, need)],
                 dst_point: dst_point.max(1),
@@ -1781,6 +1828,66 @@ mod tests {
             assert!(destroy(h));
         }
         assert!(TABLE.lock().errored.is_empty(), "nothing left behind");
+    }
+
+    /// EXEC turns a wait into an ACQUIRE of the fence that delivers its
+    /// point, and a point the counter has already reached has no such
+    /// fence: the wait is over. The list looked only at what was still in
+    /// flight, so a timeline wait on a point already delivered came back
+    /// with the NEXT fence pending on the handle, and a wait on point 1,
+    /// read as binary, with the HIGHEST: a consumer that had waited for
+    /// frame N stalled behind frame N+1, which nobody asked it to wait for.
+    /// Linux drops a dependency on a signaled `dma_fence` before the job
+    /// is scheduled.
+    #[test]
+    fn a_wait_on_a_point_already_reached_has_nothing_to_acquire_whatever_is_still_in_flight() {
+        let _g = test_lock();
+        arm_hooks();
+        let tl = create(false);
+        let mut z = Landing::new();
+        for point in 1..=3u64 {
+            assert!(attach_hw_fence(
+                tl,
+                point,
+                z.va(),
+                0,
+                point as u32,
+                0,
+                false
+            ));
+        }
+        z.land(2);
+        assert_eq!(query(tl), Some(2), "points 1 and 2 are the GPU's word");
+        assert_eq!(
+            pending_hw_fences(tl, 2),
+            [],
+            "point 2 is reached: nothing to acquire, not the fence of point 3"
+        );
+        assert_eq!(
+            pending_hw_fences(tl, 1),
+            [],
+            "point 1 is reached too, and no binary wait on the highest fence in flight"
+        );
+        assert_eq!(
+            pending_hw_fences(tl, 3),
+            [(z.va(), 0, 3, 0)],
+            "point 3 is the fence still in flight"
+        );
+        // A binary syncobj re-armed is at 0 with its fence in flight; one
+        // signaled by the CPU has no fence at all. Neither changes.
+        let b = create(true);
+        assert_eq!(pending_hw_fences(b, 1), []);
+        let mut zb = Landing::new();
+        assert!(attach_hw_fence(b, 1, zb.va(), 0, 7, 1, true));
+        assert_eq!(pending_hw_fences(b, 1), [(zb.va(), 0, 7, 1)]);
+        zb.land(7);
+        assert_eq!(query(b), Some(1));
+        assert_eq!(pending_hw_fences(b, 1), []);
+        z.land(3);
+        assert_eq!(query(tl), Some(3));
+        for h in [tl, b] {
+            assert!(destroy(h));
+        }
     }
 
     /// The bug this guards: a binary syncobj is a fence SLOT, not a counter.
@@ -2751,6 +2858,142 @@ mod tests {
         );
         second.land(2);
         destroy(dst);
+        destroy(src);
+    }
+
+    /// `IMPORT_SYNC_FILE` and a binary `TRANSFER` REPLACE the destination's
+    /// fence (`drm_syncobj_replace_fence` in Linux: the old `dma_fence` may
+    /// still signal, but the syncobj no longer carries it). The destination
+    /// here kept its previous hardware fence in `pending` next to the new
+    /// link, so when that superseded fence landed it advanced the object,
+    /// and a waiter went through before the fence the import stood for had
+    /// been reached; `pending_hw_fences` handed EXEC the same stale fence to
+    /// ACQUIRE. And a slot whose fence had already landed stayed signaled
+    /// through the import, so the next wait on it passed at once (a
+    /// `VkSemaphore` imported into again: signal, wait, import, wait).
+    /// Three shapes, each over a fence in flight and over one landed: an
+    /// import, a transfer whose source has nothing submitted (software
+    /// link) and a transfer whose source has its own fence in flight (which
+    /// moves onto the destination, alone). A timeline transfer ADDS to the
+    /// chain and keeps the binary fence; a slot already driven past binary
+    /// range is not a slot (as for a stray binary signal).
+    #[test]
+    fn an_import_or_a_binary_transfer_replaces_the_fence_the_object_was_carrying() {
+        let _g = test_lock();
+        arm_hooks();
+        for (shape, landed_first) in [
+            ("import", false),
+            ("transfer-link", false),
+            ("transfer-hw", false),
+            ("import", true),
+            ("transfer-link", true),
+            ("transfer-hw", true),
+        ] {
+            let sem = create(false);
+            let mut old = Landing::new();
+            assert!(attach_hw_fence(sem, 1, old.va(), 0, 7, 3, true));
+            if landed_first {
+                old.land(7);
+                assert_eq!(query(sem), Some(1), "{}: signaled, and seen", shape);
+            }
+            let src = create(false);
+            let mut theirs = Landing::new();
+            match shape {
+                "import" => assert!(import_snapshot(sem, src, 1)),
+                "transfer-link" => assert!(transfer(sem, 0, src, 0)),
+                _ => {
+                    assert!(attach_hw_fence(src, 1, theirs.va(), 0, 9, 4, true));
+                    assert!(transfer(sem, 0, src, 0));
+                }
+            }
+            // (`attach_hw_fence` itself notifies the submitted point, so the
+            // eventfd check below starts counting here.)
+            let notified = signals().len();
+            let fences = pending_hw_fences(sem, 1);
+            assert!(
+                !fences.iter().any(|f| f.0 == old.va()),
+                "{}: EXEC must not acquire the fence the import replaced: {:?}",
+                shape,
+                fences
+            );
+            if shape == "transfer-hw" {
+                assert_eq!(
+                    fences,
+                    alloc::vec![(theirs.va(), 0u64, 9u32, 4u32)],
+                    "{}: the source's fence, alone",
+                    shape
+                );
+            }
+            old.land(7);
+            assert_eq!(
+                query(sem),
+                Some(0),
+                "{}: the replaced fence landed ({}), the object waits for its source",
+                shape,
+                if landed_first { "before" } else { "after" }
+            );
+            assert!(
+                matches!(
+                    wait_ready(&[sem], None, true, 0),
+                    Some(Err(WaitOutcome::Timeout))
+                ),
+                "{}: a waiter must not go through",
+                shape
+            );
+            assert!(
+                signals()[notified..].iter().all(|&(h, _)| h != sem),
+                "{}: no eventfd for the replaced fence",
+                shape
+            );
+            if shape == "transfer-hw" {
+                theirs.land(9);
+            } else {
+                assert!(signal(src));
+            }
+            assert_eq!(query(sem), Some(1), "{}: reached through the source", shape);
+            destroy(sem);
+            destroy(src);
+        }
+        // A fence given up on leaves its timeout mark; the import replaces
+        // that too, so the point the source then delivers is a clean one.
+        let sem = create(false);
+        let dead = Landing::new();
+        assert!(attach_hw_fence(sem, 1, dead.va(), 0, 7, 3, true));
+        test_clock::advance(FENCE_TIMEOUT_US + 1);
+        assert!(reached_by_timeout(&[sem], None));
+        let src = create(false);
+        assert!(import_snapshot(sem, src, 1));
+        assert_eq!(query(sem), Some(0));
+        assert!(signal(src));
+        assert_eq!(query(sem), Some(1));
+        assert!(
+            !reached_by_timeout(&[sem], None),
+            "the dead fence went with the import"
+        );
+        destroy(sem);
+        destroy(src);
+        // A timeline transfer adds a point to the chain: the binary fence in
+        // flight on the destination stays.
+        let tl = create(false);
+        let mut own = Landing::new();
+        assert!(attach_hw_fence(tl, 1, own.va(), 0, 7, 3, true));
+        let src = create(false);
+        assert!(transfer(tl, 5, src, 0));
+        assert_eq!(
+            pending_hw_fences(tl, 1),
+            alloc::vec![(own.va(), 0u64, 7u32, 3u32)],
+            "a transfer at point 5 replaces nothing at point 1"
+        );
+        own.land(7);
+        assert_eq!(query(tl), Some(1));
+        // A handle already driven past binary range is not a slot: an import
+        // does not rewind it (as a stray binary signal does not).
+        assert!(timeline_signal(tl, 9));
+        assert!(import_snapshot(tl, src, 1));
+        assert_eq!(query(tl), Some(9), "a timeline keeps its point");
+        assert!(transfer(tl, 0, src, 0));
+        assert_eq!(query(tl), Some(9), "through a binary transfer too");
+        destroy(tl);
         destroy(src);
     }
 

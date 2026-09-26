@@ -8761,6 +8761,27 @@ impl NvidiaGpu {
             );
             return Err(nv::EOPNOTSUPP);
         }
+        // What Linux refuses before it touches anything
+        // (`bind_validate_region`): a VA or a range off the page, an empty
+        // range, one that wraps. Checked here, ahead of the "last binder
+        // wins" drain below, so a malformed op never costs the caller the
+        // live mapping it overlaps: that drain unmaps in the RM first, and
+        // a map the RM then refuses cannot put the old one back.
+        const VM_PAGE: u64 = 4096;
+        if op.range == 0
+            || !op.addr.is_multiple_of(VM_PAGE)
+            || !op.range.is_multiple_of(VM_PAGE)
+            || op.addr.checked_add(op.range).is_none()
+        {
+            crate::klog_warn!(
+                "[nouveau-uapi] VM_BIND: op={} VA={:#x} range={:#x} is empty, wraps, or is off the \
+                 page -> EINVAL",
+                op.op,
+                op.addr,
+                op.range
+            );
+            return Err(nv::EINVAL);
+        }
         match op.op {
             nv::VM_BIND_OP_MAP => {
                 // MAP with handle=0 is how Mesa spells "unmap this range but
@@ -8780,7 +8801,7 @@ impl NvidiaGpu {
                     );
                     return Ok(());
                 }
-                let h_memory = {
+                let (h_memory, obj_size) = {
                     let gem = self.nouveau_gem.lock();
                     // Only a holder may bind the object into its VAS: binding
                     // another process's buffer is a GPU read/write of it.
@@ -8790,8 +8811,31 @@ impl NvidiaGpu {
                     else {
                         return Err(nv::ENOENT);
                     };
-                    obj.h_memory
+                    (obj.h_memory, obj.size)
                 };
+                // The window must lie inside the object (`bind_validate_op`:
+                // the offset on a page, below the end, the range within what
+                // is left). The object's size is what was asked for; Linux
+                // rounds a BO up to whole pages, so measure against that,
+                // or a 100-byte object could never be mapped for its page.
+                // Past the end the RM either refused (EIO, after the drain
+                // had already unmapped the live range) or mapped whatever
+                // followed the allocation into the caller's VAS.
+                let obj_pages = obj_size.div_ceil(VM_PAGE).saturating_mul(VM_PAGE);
+                if !op.bo_offset.is_multiple_of(VM_PAGE)
+                    || op.bo_offset >= obj_pages
+                    || op.range > obj_pages - op.bo_offset
+                {
+                    crate::klog_warn!(
+                        "[nouveau-uapi] VM_BIND MAP handle={} bo_offset={:#x} range={:#x} does not \
+                         fit the object ({} bytes) -> EINVAL",
+                        op.handle,
+                        op.bo_offset,
+                        op.range,
+                        obj_size
+                    );
+                    return Err(nv::EINVAL);
+                }
                 // REPLACE semantics, like Linux's gpuvm: a MAP over an
                 // already-mapped range unmaps the old mapping first instead
                 // of failing. On real hardware the missing half of this bit:
@@ -9645,7 +9689,10 @@ impl NvidiaGpu {
                         let gp = (f.gpfifo_va + slot as usize * 8) as *mut u32;
                         unsafe {
                             core::ptr::write_volatile(gp, nv::gp_entry0(p.va));
-                            core::ptr::write_volatile(gp.add(1), nv::gp_entry1(p.va, p.va_len));
+                            core::ptr::write_volatile(
+                                gp.add(1),
+                                nv::gp_entry1_push(p.va, p.va_len, p.flags),
+                            );
                         }
                         slot = (slot + 1) % entries;
                     }
@@ -12642,6 +12689,19 @@ impl NvidiaGpu {
                         );
                         return Err(nv::EINVAL);
                     }
+                    // Longer than a GPFIFO entry's LENGTH can name: encoded
+                    // anyway, the field wrapped and the GPU ran a push of
+                    // `va_len mod 8 MiB`, the rest of the command buffer
+                    // silently skipped. Linux refuses it here too.
+                    if push.va_len > nv::EXEC_PUSH_MAX_LENGTH {
+                        crate::klog_warn!(
+                            "[nouveau-uapi] EXEC: push va={:#x} va_len={:#x} exceeds the {:#x} one GPFIFO entry can name",
+                            push.va,
+                            push.va_len,
+                            nv::EXEC_PUSH_MAX_LENGTH
+                        );
+                        return Err(nv::EINVAL);
+                    }
                 }
                 // One-shot: dump the head of the FIRST push Mesa ever submits.
                 // With the self-test proving (or disproving) the plumbing, the
@@ -12893,6 +12953,22 @@ impl NvidiaGpu {
                 let (last, rest) = pushes
                     .split_last()
                     .expect("push_count > 0 already checked above");
+                // The RM's own submit builds the GPFIFO entry in C and has
+                // no SYNC bit to give: a NO_PREFETCH push (one the GPU is
+                // still writing) goes in prefetchable here. The direct path
+                // honours it; say so once when this fallback drops it.
+                if pushes
+                    .iter()
+                    .any(|p| p.flags & nv::EXEC_PUSH_NO_PREFETCH != 0)
+                {
+                    static NO_PREFETCH_DROPPED: AtomicBool = AtomicBool::new(false);
+                    if !NO_PREFETCH_DROPPED.swap(true, Ordering::Relaxed) {
+                        crate::klog_warn!(
+                            "[nouveau-uapi] EXEC: NO_PREFETCH push submitted through the RM, which \
+                             cannot mark the entry SYNC_WAIT (direct submit does); reported once"
+                        );
+                    }
+                }
                 for push in rest {
                     self.submit_push_plain(device_instance, ctx_idx, push)?;
                 }
@@ -16241,6 +16317,15 @@ mod nouveau_bookkeeping_tests {
         }
     }
 
+    /// A push the GPU is still writing when it is submitted.
+    fn push_no_prefetch(va: u64, va_len: u32) -> nv::DrmNouveauExecPush {
+        nv::DrmNouveauExecPush {
+            va,
+            va_len,
+            flags: nv::EXEC_PUSH_NO_PREFETCH,
+        }
+    }
+
     fn ptr_of<T>(items: &[T]) -> u64 {
         if items.is_empty() {
             0
@@ -18509,6 +18594,409 @@ mod nouveau_bookkeeping_tests {
         }
         gpu.nouveau_release_process(COMP);
         gpu.reap_zombie_contexts();
+        assert_eq!(FAKE_RM.lock().bad, 0);
+    }
+
+    /// A wait on a timeline point the producer has already delivered is
+    /// over. EXEC handed it the producer's NEXT fence to acquire
+    /// (`pending_hw_fences` looked only at what was in flight), so a
+    /// consumer that waited for frame N stalled behind frame N+1, on the
+    /// GPU, in front of pushes nobody asked to hold back; a wait on point
+    /// 1 fared worse, read as binary it took the HIGHEST fence in flight.
+    /// Linux drops a dependency on a signaled fence before scheduling.
+    #[test]
+    fn a_wait_on_a_point_already_delivered_is_no_acquire_on_the_producers_next_fence() {
+        let _g = LOCK.lock();
+        let _live = LiveBytes::hold();
+        let gpu = gpu_rm_fast();
+        FAKE_RM.lock().peer = true;
+        let ch_a = client_with_pushbuf(&gpu, A);
+        let ch_b = client_with_pushbuf(&gpu, B);
+        let tl = syncobj::create(false);
+        for point in 1..=2u64 {
+            assert_eq!(
+                exec(
+                    &gpu,
+                    A,
+                    ch_a,
+                    &[push(PUSH_VA, 16)],
+                    &[],
+                    &[sync_tl(tl, point)]
+                ),
+                Ok(0)
+            );
+        }
+        assert_eq!(
+            run_gpu(1).len(),
+            4,
+            "two pushes and two fences: points 1 and 2 delivered"
+        );
+        assert_eq!(syncobj::query(tl), Some(2));
+        // Frame 3 still running on A's ring.
+        assert_eq!(
+            exec(&gpu, A, ch_a, &[push(PUSH_VA, 16)], &[], &[sync_tl(tl, 3)]),
+            Ok(0)
+        );
+        let out = syncobj::create(false);
+        // 1 ms per clock read: a CPU wait anywhere below ends after 10 s
+        // virtual instead of hanging.
+        test_clock::set_auto_advance(1_000);
+        let t0 = test_clock::now();
+        assert_eq!(
+            exec(
+                &gpu,
+                B,
+                ch_b,
+                &[push(PUSH_VA, 16)],
+                &[sync_tl(tl, 2)],
+                &[sync(out)]
+            ),
+            Ok(0)
+        );
+        assert!(test_clock::now() - t0 < 1_000_000, "nothing to wait for");
+        assert_eq!(
+            peer_maps_made(),
+            0,
+            "no fence to acquire: A's semaphore stays unmapped in B"
+        );
+        let b = chan(2);
+        assert_eq!(userd(&b), (0, 2), "push and fence, no acquire");
+        assert_eq!(
+            run_gpu(2),
+            [
+                Fetched::Push {
+                    va: PUSH_VA,
+                    len: 16
+                },
+                Fetched::Release {
+                    sem_va: sem_va(&b),
+                    payload: 1
+                }
+            ],
+            "B's ring runs: A's third fence, still in flight, is not its business"
+        );
+        assert_eq!(syncobj::query(out), Some(1));
+        // Point 1 is a timeline point like any other, not a binary wait on
+        // the highest fence in flight.
+        let out2 = syncobj::create(false);
+        assert_eq!(
+            exec(
+                &gpu,
+                B,
+                ch_b,
+                &[push(PUSH_VA, 16)],
+                &[sync_tl(tl, 1)],
+                &[sync(out2)]
+            ),
+            Ok(0)
+        );
+        assert_eq!(peer_maps_made(), 0);
+        assert_eq!(
+            run_gpu(2),
+            [
+                Fetched::Push {
+                    va: PUSH_VA,
+                    len: 16
+                },
+                Fetched::Release {
+                    sem_va: sem_va(&b),
+                    payload: 2
+                }
+            ]
+        );
+        assert_eq!(syncobj::query(out2), Some(1));
+        // The genuine wait, point 3, is still A's fence in flight: an
+        // acquire on B's ring, which stalls until A gets there.
+        let out3 = syncobj::create(false);
+        assert_eq!(
+            exec(
+                &gpu,
+                B,
+                ch_b,
+                &[push(PUSH_VA, 16)],
+                &[sync_tl(tl, 3)],
+                &[sync(out3)]
+            ),
+            Ok(0)
+        );
+        assert_eq!(
+            peer_maps_made(),
+            1,
+            "A's semaphore mapped into B's VAS for it"
+        );
+        assert_eq!(run_gpu(2), [], "stalls on A's third fence");
+        assert_eq!(run_gpu(1).len(), 2);
+        let (_, local_va) = peer_map(2, 1).expect("the mapping the RM made");
+        assert_eq!(
+            run_gpu(2),
+            [
+                Fetched::Acquire {
+                    sem_va: local_va,
+                    payload: 3
+                },
+                Fetched::Push {
+                    va: PUSH_VA,
+                    len: 16
+                },
+                Fetched::Release {
+                    sem_va: sem_va(&b),
+                    payload: 3
+                }
+            ]
+        );
+        assert_eq!(syncobj::query(out3), Some(1));
+        test_clock::set_auto_advance(0);
+        for h in [tl, out, out2, out3] {
+            assert!(syncobj::destroy(h));
+        }
+        gpu.nouveau_release_process(A);
+        gpu.nouveau_release_process(B);
+        assert_eq!(FAKE_RM.lock().bad, 0);
+    }
+
+    /// The GPFIFO entry's SYNC bit, `SYNC_WAIT` when the host must not
+    /// fetch the entry before the one ahead of it has completed.
+    fn gp_sync_wait(ctx: u32, index: u64) -> bool {
+        let c = chan(ctx);
+        peek(c.buf + FAST_GPFIFO_OFF as usize + index as usize * 8 + 4) >> 31 == 1
+    }
+
+    /// A GPFIFO entry names its push's length in 21 bits of dwords. A
+    /// longer push was encoded regardless, the field wrapped, and the GPU
+    /// ran a push of `va_len mod 8 MiB`: the tail of a long command
+    /// buffer never executed, without a word from anyone; Linux refuses it
+    /// with EINVAL. And a push flagged NO_PREFETCH (one the GPU itself is
+    /// still writing: device-generated commands) went into the ring like
+    /// any other, so the host could fetch its methods before the copy that
+    /// fills them had landed; the entry now carries `SYNC_WAIT`, as Linux's
+    /// `nv50_dma_push` writes it.
+    #[test]
+    fn a_push_longer_than_an_entry_can_name_is_einval_and_no_prefetch_holds_the_host() {
+        let _g = LOCK.lock();
+        let _live = LiveBytes::hold();
+        let gpu = gpu_rm_fast();
+        let ch = client_with_pushbuf(&gpu, A);
+        let out = syncobj::create(false);
+        // One byte over the limit (rounded to a dword), and exactly 8 MiB,
+        // which the wrap would have run as a push of nothing.
+        for len in [nv::EXEC_PUSH_MAX_LENGTH + 1, 0x80_0000, 0x80_0010] {
+            assert_eq!(
+                exec(
+                    &gpu,
+                    A,
+                    ch,
+                    &[push(PUSH_VA, 16), push(PUSH_VA + 0x100, len)],
+                    &[],
+                    &[sync(out)]
+                ),
+                Err(nv::EINVAL),
+                "va_len={:#x}",
+                len
+            );
+        }
+        assert!(
+            !has_chan(1),
+            "refused before the channel was even prepared: nothing reached the ring"
+        );
+        assert_eq!(syncobj::query(out), Some(0), "and nothing was signaled");
+        // The longest push that fits, and a NO_PREFETCH push behind it.
+        let longest = nv::EXEC_PUSH_MAX_LENGTH & !3;
+        assert_eq!(
+            exec(
+                &gpu,
+                A,
+                ch,
+                &[
+                    push(PUSH_VA, longest),
+                    push_no_prefetch(PUSH_VA + 0x100, 32),
+                    push(PUSH_VA + 0x200, 16)
+                ],
+                &[],
+                &[sync(out)]
+            ),
+            Ok(0)
+        );
+        let c = chan(1);
+        assert_eq!(userd(&c), (0, 4), "three pushes and the fence");
+        assert!(!gp_sync_wait(1, 0), "an ordinary push is prefetched");
+        assert!(
+            gp_sync_wait(1, 1),
+            "the host waits for the push ahead before fetching the one the GPU writes"
+        );
+        assert!(
+            !gp_sync_wait(1, 2),
+            "the flag is the push's own, not sticky"
+        );
+        assert!(!gp_sync_wait(1, 3), "nor the fence's");
+        assert_eq!(
+            run_gpu(1),
+            [
+                Fetched::Push {
+                    va: PUSH_VA,
+                    len: longest
+                },
+                Fetched::Push {
+                    va: PUSH_VA + 0x100,
+                    len: 32
+                },
+                Fetched::Push {
+                    va: PUSH_VA + 0x200,
+                    len: 16
+                },
+                Fetched::Release {
+                    sem_va: sem_va(&c),
+                    payload: 1
+                }
+            ],
+            "the longest push keeps its whole length in the entry"
+        );
+        assert_eq!(syncobj::query(out), Some(1));
+        assert!(syncobj::destroy(out));
+        gpu.nouveau_release_process(A);
+        assert_eq!(FAKE_RM.lock().bad, 0);
+    }
+
+    /// Linux refuses a VM_BIND op that is off the page, empty, wrapping, or
+    /// (a MAP) a window that does not fit its object, before it touches
+    /// anything. Here nothing was checked: the "last binder wins" drain had
+    /// already unmapped whatever the op overlapped when the RM refused it,
+    /// so a malformed op cost the caller a live mapping and its next EXEC
+    /// faulted; and a window past the end of the object went to the RM as
+    /// is, which either refused it or mapped what followed the allocation.
+    #[test]
+    fn a_vm_bind_off_a_page_or_past_the_object_is_einval_before_anything_is_unmapped() {
+        let _g = LOCK.lock();
+        let _live = LiveBytes::hold();
+        let gpu = gpu_rm();
+        const VA: u64 = 0x3f_f000_0000;
+        assert_eq!(channel_alloc(&gpu, A).unwrap().channel, 0);
+        let ha = gem_new_rm(&gpu, 65536, nv::NOUVEAU_GEM_DOMAIN_GART, A)
+            .unwrap()
+            .handle;
+        assert_eq!(vm_bind_ops(&gpu, A, &mut [map(ha, VA, 65536)]), Ok(0));
+        let live = driver_maps(&gpu, A);
+        assert_eq!(live.len(), 1);
+        let before = FAKE_RM.lock().calls.len();
+        let bad = [
+            ("a range past the end", map(ha, VA, 65536 + 4096)),
+            ("an offset at the end", map_at(ha, VA, 4096, 65536)),
+            ("offset and range past the end", map_at(ha, VA, 65536, 4096)),
+            ("an offset past the end", map_at(ha, VA, 4096, 65536 + 4096)),
+            ("a VA off the page", map(ha, VA + 1, 4096)),
+            ("a range off the page", map(ha, VA, 4095)),
+            ("an offset off the page", map_at(ha, VA, 4096, 1)),
+            ("an empty range", map(ha, VA, 0)),
+            ("a range that wraps", map(ha, u64::MAX - 4095, 8192)),
+            ("an unmap off the page", unmap(VA + 1, 4096)),
+            ("an empty unmap", unmap(VA, 0)),
+            ("a map of nothing off the page", map(0, VA, 100)),
+        ];
+        for (what, op) in bad {
+            assert_eq!(vm_bind_ops(&gpu, A, &mut [op]), Err(nv::EINVAL), "{}", what);
+            assert_eq!(
+                driver_maps(&gpu, A),
+                live,
+                "{}: the live mapping it overlaps is untouched",
+                what
+            );
+        }
+        assert_eq!(
+            rm_calls_since(before),
+            [] as [&str; 0],
+            "refused before the RM was asked anything: no unmap, no map"
+        );
+        assert_eq!(FAKE_RM.lock().maps_of_ctx(1), [(VA, 65536, 0x06)]);
+        // The last page of the object, at its offset: fits.
+        assert_eq!(
+            vm_bind_ops(
+                &gpu,
+                A,
+                &mut [map_at(ha, VA + 0x10_0000, 4096, 65536 - 4096)]
+            ),
+            Ok(0)
+        );
+        // An object of 100 bytes is a page to the GPU, as in Linux: the
+        // whole page maps, the next one does not.
+        let hb = gem_new_rm(&gpu, 100, nv::NOUVEAU_GEM_DOMAIN_GART, A)
+            .unwrap()
+            .handle;
+        assert_eq!(
+            vm_bind_ops(&gpu, A, &mut [map(hb, VA + 0x20_0000, 4096)]),
+            Ok(0)
+        );
+        assert_eq!(
+            vm_bind_ops(&gpu, A, &mut [map(hb, VA + 0x30_0000, 8192)]),
+            Err(nv::EINVAL)
+        );
+        assert_eq!(driver_maps(&gpu, A).len(), 3);
+        gpu.nouveau_release_process(A);
+        assert_eq!(FAKE_RM.lock().bad, 0);
+    }
+
+    /// A `sync_file` imported into a binary semaphore REPLACES its fence
+    /// (`drm_syncobj_replace_fence`). The semaphore an EXEC had just
+    /// signaled kept that fence in flight beside the import, so once A's
+    /// ring passed it the semaphore read signaled with the imported source
+    /// still unsignaled, and B's EXEC waiting on it submitted behind a
+    /// release that had not happened.
+    #[test]
+    fn an_import_over_a_semaphore_an_exec_just_signaled_replaces_the_fence_the_ring_is_writing() {
+        let _g = LOCK.lock();
+        let _live = LiveBytes::hold();
+        let gpu = gpu_rm_fast();
+        FAKE_RM.lock().peer = true;
+        let ch_a = client_with_pushbuf(&gpu, A);
+        let ch_b = client_with_pushbuf(&gpu, B);
+        let sem = syncobj::create(false);
+        assert_eq!(
+            exec(&gpu, A, ch_a, &[push(PUSH_VA, 16)], &[], &[sync(sem)]),
+            Ok(0)
+        );
+        // A release fence nobody has signaled yet, imported over it.
+        let release = syncobj::create(false);
+        assert!(syncobj::import_snapshot(sem, release, 1));
+        assert_eq!(run_gpu(1).len(), 2, "A's ring passes the superseded fence");
+        assert_eq!(
+            syncobj::query(sem),
+            Some(0),
+            "the semaphore now stands for the release, which has not happened"
+        );
+        let out = syncobj::create(false);
+        // 1 ms per clock read: the CPU wait ends after 10 s virtual.
+        test_clock::set_auto_advance(1_000);
+        assert_eq!(
+            exec(
+                &gpu,
+                B,
+                ch_b,
+                &[push(PUSH_VA, 16)],
+                &[sync(sem)],
+                &[sync(out)]
+            ),
+            Err(nv::EIO),
+            "the release never came: nothing is submitted behind it"
+        );
+        test_clock::set_auto_advance(0);
+        assert!(!has_chan(2), "B's ring was never opened");
+        assert_eq!(peer_maps_made(), 0, "no fence of A's to acquire");
+        assert_eq!(syncobj::query(out), Some(0));
+        // The release arrives: the semaphore follows its source and B goes.
+        assert!(syncobj::signal(release));
+        assert_eq!(syncobj::query(sem), Some(1));
+        assert_eq!(
+            exec(
+                &gpu,
+                B,
+                ch_b,
+                &[push(PUSH_VA, 16)],
+                &[sync(sem)],
+                &[sync(out)]
+            ),
+            Ok(0)
+        );
+        assert_eq!(userd(&chan(2)), (0, 2), "push and fence, no acquire");
+        assert_eq!(run_gpu(2).len(), 2);
+        assert_eq!(syncobj::query(out), Some(1));
         assert_eq!(FAKE_RM.lock().bad, 0);
     }
 
