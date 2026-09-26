@@ -376,7 +376,10 @@ impl Syscall<'_> {
         // `uptime`/`top` always report "up 0 min". Fill the fields we can
         // source cheaply so userspace tools show real numbers.
         let (used, total) = kernel_hal::mem::memory_usage();
-        let (procs, _running) = linux_object::loadavg::count_processes();
+        // `do_sysinfo`: `info->procs = nr_threads`, which is TASKS. A count
+        // of processes made `top`'s task total smaller than the list it was
+        // printing, by one per thread any program had started.
+        let procs = linux_object::loadavg::count_threads();
         let sysinfo = SysInfo {
             // Seconds since boot, from the monotonic timer (same source as
             // /proc/uptime).

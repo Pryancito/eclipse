@@ -29,6 +29,7 @@
 use super::*;
 use consts::sys;
 use kernel_hal::context::UserContextField;
+use linux_object::thread::ThreadExt;
 
 pub mod consts;
 pub mod errno;
@@ -83,6 +84,30 @@ impl BsdRet {
     fn from_lx(e: LxError) -> Self {
         BsdRet::err(errno::lx_to_freebsd(e))
     }
+}
+
+/// A Linux signal mask as FreeBSD's `sigset_t`: four `u32`s, bit `signo - 1`
+/// of the whole, with each signal renumbered ([`translate::signal_from_linux`]).
+///
+/// A copy would have been wrong in both halves: FreeBSD's `SIGUSR1` is 30 and
+/// Linux's is 10, so a mask copied straight across says a different set of
+/// signals is blocked. The two Linux signals FreeBSD lacks (`SIGSTKFLT`,
+/// `SIGPWR`) have no bit to land in and are dropped, which is the only answer
+/// available: there is no way to tell a FreeBSD program that a signal it cannot
+/// name is blocked.
+fn sigset_to_freebsd(linux: u64) -> [u32; 4] {
+    let mut out = [0u32; 4];
+    for lin in 1..=64usize {
+        if linux >> (lin - 1) & 1 == 0 {
+            continue;
+        }
+        if let Some(bsd) = translate::signal_from_linux(lin) {
+            if (1..=128).contains(&bsd) {
+                out[(bsd - 1) >> 5] |= 1u32 << ((bsd - 1) & 31);
+            }
+        }
+    }
+    out
 }
 
 impl Syscall<'_> {
@@ -347,13 +372,73 @@ impl Syscall<'_> {
             // Installing a handler returns success so startup code proceeds;
             // actual delivery uses the default disposition because the FreeBSD
             // sigframe/sigreturn path is not implemented.
-            sys::SIGACTION => BsdRet::ok(0),
-            sys::SIGPROCMASK => BsdRet::ok(0),
+            sys::SIGACTION => self.bsd_sigaction(a2),
+            sys::SIGPROCMASK => self.bsd_sigprocmask(a2),
 
             other => {
                 warn!("freebsd: unhandled syscall {} -> ENOSYS", other);
                 BsdRet::enosys()
             }
+        }
+    }
+
+    /// The `oset` half of `sigprocmask(how, set, oset)`.
+    ///
+    /// Not blocking the signals is the documented gap above, and `set` is
+    /// still accepted and ignored. Leaving `oset` alone was not part of it: a
+    /// syscall that answers 0 has written every out-parameter it was handed,
+    /// and this one wrote nothing, so the caller read whatever its stack held.
+    /// The shape that matters is
+    ///
+    /// ```c
+    /// sigprocmask(SIG_BLOCK, &all, &old);
+    /// ...
+    /// sigprocmask(SIG_SETMASK, &old, NULL);
+    /// ```
+    ///
+    /// -- the save/restore every library does around a critical section --
+    /// where the restore fed rubbish back in; and a program that simply ASKS
+    /// what is blocked (a runtime deciding whether to start a signal thread, a
+    /// shell before it forks) acted on that rubbish straight away.
+    ///
+    /// What goes out is the thread's real mask, which is the truthful answer
+    /// here: nothing this personality was asked to block was blocked.
+    /// FreeBSD's `sigset_t` is four `u32`s with bit `signo - 1` of the whole,
+    /// and its numbering is not Linux's, so the mask is translated signal by
+    /// signal rather than copied ([`translate::signal_from_linux`]).
+    fn bsd_sigprocmask(&self, oset: usize) -> BsdRet {
+        if oset == 0 {
+            return BsdRet::ok(0);
+        }
+        let out = sigset_to_freebsd(self.thread.lock_linux().signal_mask().val());
+        let mut ptr = UserOutPtr::<u32>::from(oset);
+        match ptr.write_array(&out) {
+            Ok(()) => BsdRet::ok(0),
+            Err(e) => BsdRet::from_lx(LxError::from(e)),
+        }
+    }
+
+    /// The `oact` half of `sigaction(sig, act, oact)`, for the same reason as
+    /// [`Self::bsd_sigprocmask`]: the call answered 0 and left the struct the
+    /// caller passed untouched, so a program that saved the old disposition to
+    /// put it back, or that read it to find out whether something was already
+    /// handled, got its own stack.
+    ///
+    /// Zeros are the honest answer and not a placeholder: this personality
+    /// installs no handler, so the disposition IS `SIG_DFL` (0), with no flags
+    /// and an empty mask, whatever was asked for. Writing the struct as zeros
+    /// also makes the answer independent of where FreeBSD's `struct sigaction`
+    /// puts its three fields, which a hand-built struct would have to get
+    /// right: it is 32 bytes on amd64 (`sa_handler`, `sa_flags` with its
+    /// padding, `sa_mask`).
+    fn bsd_sigaction(&self, oact: usize) -> BsdRet {
+        if oact == 0 {
+            return BsdRet::ok(0);
+        }
+        let mut ptr = UserOutPtr::<u8>::from(oact);
+        match ptr.write_array(&[0u8; 32]) {
+            Ok(()) => BsdRet::ok(0),
+            Err(e) => BsdRet::from_lx(LxError::from(e)),
         }
     }
 
@@ -665,5 +750,52 @@ mod tests {
         // Linux ENOSYS(38) -> FreeBSD ENOSYS(78).
         let r = BsdRet::from_result(Err(LxError::ENOSYS));
         assert_eq!((r.rax, r.error), (78, true));
+    }
+
+    /// Bit `signo - 1` of the four-word set, for a FreeBSD signal number.
+    fn bit(set: &[u32; 4], bsd: usize) -> bool {
+        set[(bsd - 1) >> 5] >> ((bsd - 1) & 31) & 1 == 1
+    }
+
+    #[test]
+    fn a_blocked_signal_lands_on_its_freebsd_number() {
+        // Linux SIGUSR1 is 10, which FreeBSD spells 30; bit 10 is its SIGBUS,
+        // so a mask copied straight across would say the wrong signal.
+        let set = sigset_to_freebsd(1 << (10 - 1));
+        assert!(bit(&set, consts::sig::SIGUSR1));
+        assert!(!bit(&set, 10));
+        // A signal the two systems agree on stays put.
+        let set = sigset_to_freebsd(1 << (9 - 1));
+        assert!(bit(&set, 9));
+    }
+
+    #[test]
+    fn a_signal_past_the_first_word_lands_in_the_right_word() {
+        // FreeBSD SIGUSR2 is 31, still word 0; its SIGRTMIN is 65, word 2.
+        let set = sigset_to_freebsd(1 << (12 - 1));
+        assert_eq!(set, [1 << (31 - 1), 0, 0, 0]);
+        // Linux SIGRTMIN is 32, which this table has no answer for, so it is
+        // dropped rather than landing on a number that means something else.
+        assert_eq!(sigset_to_freebsd(1 << (32 - 1)), [0; 4]);
+    }
+
+    #[test]
+    fn the_two_signals_freebsd_lacks_are_dropped() {
+        // Linux SIGSTKFLT(16) and SIGPWR(30) have no FreeBSD number.
+        assert_eq!(sigset_to_freebsd(1 << (16 - 1)), [0; 4]);
+        assert_eq!(sigset_to_freebsd(1 << (30 - 1)), [0; 4]);
+        // And they do not take the rest of the mask down with them.
+        let set = sigset_to_freebsd(1 << (16 - 1) | 1 << (9 - 1));
+        assert!(bit(&set, 9));
+    }
+
+    #[test]
+    fn an_empty_mask_stays_empty_and_a_full_one_blocks_nothing_twice() {
+        assert_eq!(sigset_to_freebsd(0), [0; 4]);
+        // Every Linux signal blocked: of the 64 bits only 1..=31 have a
+        // FreeBSD number at all, minus the two above, and none may collide.
+        let set = sigset_to_freebsd(u64::MAX);
+        let blocked = set.iter().map(|w| w.count_ones()).sum::<u32>();
+        assert_eq!(blocked, 29);
     }
 }
