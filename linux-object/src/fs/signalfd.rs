@@ -69,16 +69,55 @@ impl SignalFd {
         self.mask.store(Self::accepted(mask), SeqCst);
     }
 
+    /// The calling thread, when it is a Linux thread.
+    fn current_thread() -> Option<Arc<Thread>> {
+        kernel_hal::thread::get_current_thread()?
+            .downcast::<Thread>()
+            .ok()
+    }
+
     /// The calling thread's pending signals that this fd accepts.
     fn pending_matched(&self) -> Sigset {
         let mask = self.mask.load(SeqCst);
-        if let Some(arc) = kernel_hal::thread::get_current_thread() {
-            if let Ok(thread) = arc.downcast::<Thread>() {
-                let tl = thread.lock_linux();
-                return Sigset::new(tl.signals.val() & mask);
-            }
+        if let Some(thread) = Self::current_thread() {
+            let tl = thread.lock_linux();
+            return Sigset::new(tl.signals.val() & mask);
         }
         Sigset::empty()
+    }
+
+    /// A blocking `read` with nothing to take yet: park the calling thread
+    /// until a signal is queued to it, or until one outside the mask
+    /// interrupts (`signalfd_dequeue` -> `wait_event_interruptible`, so
+    /// `EINTR`). While it waits the thread announces the mask as its
+    /// `sigwait` set, the way `rt_sigtimedwait` does: the signals a
+    /// signalfd takes are blocked, and a process-directed one has to reach
+    /// the thread reading the fd rather than whichever thread comes first
+    /// (Linux reads them off the shared pending set; here, see
+    /// `LinuxThread::wants_signal`). Without that, a program with a
+    /// dedicated signal thread and every other thread blocking the signal
+    /// never had its `read` return.
+    ///
+    /// This used to be a 20 ms sleep in a loop: a daemon parked in the read
+    /// woke fifty times a second for nothing, and took up to 20 ms to see
+    /// the signal.
+    async fn wait_for_one(&self, buf: &mut [u8], thread: &Arc<Thread>) -> LxResult<usize> {
+        use crate::process::{check_signals_of, SignalPark};
+        thread.lock_linux().sigwait = Sigset::new(self.mask.load(SeqCst));
+        let mut park = SignalPark::new(thread);
+        let outcome = loop {
+            park.prepare();
+            if let Some(info) = self.consume_one() {
+                buf[..SIGINFO_SIZE].copy_from_slice(&signalfd_record(&info));
+                break Ok(SIGINFO_SIZE);
+            }
+            if let Err(e) = check_signals_of(thread) {
+                break Err(e);
+            }
+            park.park(None).await;
+        };
+        thread.lock_linux().sigwait = Sigset::empty();
+        outcome
     }
 
     /// Consume and return the lowest-numbered accepted pending signal, removing
@@ -86,8 +125,7 @@ impl SignalFd {
     /// came with it.
     fn consume_one(&self) -> Option<SigInfo> {
         let mask = self.mask.load(SeqCst);
-        let arc = kernel_hal::thread::get_current_thread()?;
-        let thread = arc.downcast::<Thread>().ok()?;
+        let thread = Self::current_thread()?;
         let mut tl = thread.lock_linux();
         let sig = Sigset::new(tl.signals.val() & mask).find_first_signal()?;
         Some(tl.take_siginfo(sig))
@@ -136,20 +174,18 @@ impl FileLike for SignalFd {
         if buf.len() < SIGINFO_SIZE {
             return Err(LxError::EINVAL);
         }
-        loop {
-            if let Some(info) = self.consume_one() {
-                buf[..SIGINFO_SIZE].copy_from_slice(&signalfd_record(&info));
-                return Ok(SIGINFO_SIZE);
-            }
-            if self.flags().non_block() {
-                return Err(LxError::EAGAIN);
-            }
-            // Block until a matching signal is pending. Signals don't fire a
-            // per-fd waker, so re-check on a short timer rather than spinning.
-            // The realistic user (libwayland) polls via epoll and never reaches
-            // this path; epoll's own re-poll tick bounds its latency.
-            let deadline = kernel_hal::timer::timer_now() + core::time::Duration::from_millis(20);
-            kernel_hal::thread::sleep_until(deadline).await;
+        if let Some(info) = self.consume_one() {
+            buf[..SIGINFO_SIZE].copy_from_slice(&signalfd_record(&info));
+            return Ok(SIGINFO_SIZE);
+        }
+        if self.flags().non_block() {
+            return Err(LxError::EAGAIN);
+        }
+        match Self::current_thread() {
+            Some(thread) => self.wait_for_one(buf, &thread).await,
+            // No Linux thread behind the call: nothing can ever be queued
+            // to it, so there is nothing to wait for.
+            None => Err(LxError::EAGAIN),
         }
     }
 
@@ -394,5 +430,137 @@ mod record_tests {
         let r = signalfd_record(&SigInfo::bare(LinuxSignal::SIGINT));
         assert_eq!(word(&r, 0), LinuxSignal::SIGINT as i32);
         assert!(r[4..].iter().all(|&b| b == 0), "{:?}", &r[4..48]);
+    }
+}
+
+#[cfg(test)]
+mod blocking_read_tests {
+    //! A blocking `read` slept 20 ms at a time and looked only at the
+    //! calling thread; a program whose other threads all blocked the signal
+    //! never had the read return, because the signal went to the first
+    //! thread of the process.
+    extern crate std;
+
+    use super::*;
+    use crate::process::ProcessExt;
+    use crate::process::{send_signal_to_process, LinuxProcess};
+    use crate::signal::{SignalAction, SignalActionFlags};
+    use core::time::Duration;
+    use rcore_fs_ramfs::RamFS;
+    use std::sync::mpsc;
+    use zircon_object::object::KoID;
+    use zircon_object::task::{Process, ROOT_JOB};
+
+    fn bit(signal: LinuxSignal) -> u64 {
+        1 << (signal as u64 - 1)
+    }
+
+    /// A process of two threads, both blocking SIGUSR1; the second one is
+    /// the reader.
+    fn program(pid: KoID) -> (Arc<Process>, Arc<Thread>, Arc<Thread>) {
+        let proc = Process::create_with_fixed_id_ext(
+            &ROOT_JOB,
+            pid,
+            "sfd",
+            LinuxProcess::new(RamFS::new(), 0),
+        )
+        .unwrap();
+        let main = Thread::create_linux(&proc).unwrap();
+        let reader = Thread::create_linux(&proc).unwrap();
+        main.lock_linux()
+            .set_signal_mask(Sigset::new(bit(LinuxSignal::SIGUSR1)));
+        reader
+            .lock_linux()
+            .set_signal_mask(Sigset::new(bit(LinuxSignal::SIGUSR1)));
+        (proc, main, reader)
+    }
+
+    fn later(pid: KoID, signal: LinuxSignal, after: Duration) {
+        std::thread::spawn(move || {
+            std::thread::sleep(after);
+            let _ = send_signal_to_process(pid as usize, signal);
+        });
+    }
+
+    /// `read` on `fd` as `thread`, on a host thread of its own so a read
+    /// that never returns fails the test instead of hanging it.
+    fn read_as(
+        fd: Arc<SignalFd>,
+        thread: Arc<Thread>,
+    ) -> (LxResult<usize>, [u8; SIGINFO_SIZE], Duration) {
+        let (tx, rx) = mpsc::channel();
+        let start = std::time::Instant::now();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; SIGINFO_SIZE];
+            let r = async_std::task::block_on(async {
+                kernel_hal::thread::set_current_thread(Some(thread.clone()));
+                fd.read(&mut buf).await
+            });
+            let _ = tx.send((r, buf));
+        });
+        let (r, buf) = rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("the read never returned");
+        (r, buf, start.elapsed())
+    }
+
+    #[test]
+    fn a_blocking_read_returns_the_signal_the_moment_it_arrives() {
+        let (proc, _main, reader) = program(43_801);
+        let fd = SignalFd::new(bit(LinuxSignal::SIGUSR1), OpenFlags::empty());
+        later(proc.id(), LinuxSignal::SIGUSR1, Duration::from_millis(50));
+        let (r, buf, took) = read_as(fd, reader.clone());
+        assert_eq!(r, Ok(SIGINFO_SIZE));
+        let signo = u32::from_ne_bytes([buf[0], buf[1], buf[2], buf[3]]);
+        assert_eq!(signo, LinuxSignal::SIGUSR1 as u32);
+        assert!(took < Duration::from_secs(1), "returned after {:?}", took);
+        assert_eq!(
+            reader.lock_linux().sigwait.val(),
+            0,
+            "the wait set must be cleared once the read returns"
+        );
+    }
+
+    #[test]
+    fn the_thread_reading_the_fd_is_the_one_a_process_signal_reaches() {
+        // Every thread blocks SIGUSR1 (as signalfd asks); the signal must go
+        // to the reader, not to the first thread of the process.
+        let (proc, main, reader) = program(43_802);
+        let fd = SignalFd::new(bit(LinuxSignal::SIGUSR1), OpenFlags::empty());
+        later(proc.id(), LinuxSignal::SIGUSR1, Duration::from_millis(50));
+        let (r, _buf, _took) = read_as(fd, reader);
+        assert_eq!(r, Ok(SIGINFO_SIZE), "the signal went elsewhere");
+        assert!(
+            !main.lock_linux().signals.contains(LinuxSignal::SIGUSR1),
+            "the signal was queued to the first thread"
+        );
+    }
+
+    #[test]
+    fn a_caught_signal_outside_the_mask_interrupts_the_read() {
+        let (proc, main, reader) = program(43_803);
+        // Aimed at the reader: the main thread blocks SIGUSR2 as well.
+        let mut both = Sigset::new(bit(LinuxSignal::SIGUSR1));
+        both.insert(LinuxSignal::SIGUSR2);
+        main.lock_linux().set_signal_mask(both);
+        proc.linux().set_signal_action(
+            LinuxSignal::SIGUSR2,
+            SignalAction {
+                handler: 0x1000,
+                flags: SignalActionFlags::empty(),
+                restorer: 0,
+                mask: Sigset::default(),
+            },
+        );
+        let fd = SignalFd::new(bit(LinuxSignal::SIGUSR1), OpenFlags::empty());
+        later(proc.id(), LinuxSignal::SIGUSR2, Duration::from_millis(50));
+        let (r, _buf, took) = read_as(fd, reader.clone());
+        assert_eq!(r, Err(LxError::EINTR));
+        assert!(
+            took < Duration::from_secs(1),
+            "interrupted after {:?}",
+            took
+        );
+        assert_eq!(reader.lock_linux().sigwait.val(), 0);
     }
 }
