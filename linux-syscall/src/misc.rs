@@ -360,7 +360,7 @@ impl Syscall<'_> {
             SyslogPlan::BufferSize | SyslogPlan::Unread => Ok(kernel_hal::console::klog_buf_size()),
             SyslogPlan::Read(len) => {
                 let cap = len.min(kernel_hal::console::klog_buf_size().max(1));
-                let mut tmp = vec![0u8; cap];
+                let mut tmp = crate::try_zeroed_buf(cap)?;
                 let n = kernel_hal::console::klog_read(&mut tmp);
                 if n > 0 {
                     buf.write_array(&tmp[..n])?;

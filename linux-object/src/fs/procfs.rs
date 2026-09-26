@@ -3676,8 +3676,18 @@ mod pid_stat_tests {
         let vmo = VmObject::new_paged(3);
         vmo.write(0, &[1u8; 3 * PAGE_SIZE]).unwrap();
         let flags = MMUFlags::READ | MMUFlags::WRITE | MMUFlags::USER;
+        // Explicit offsets, and not `None`: a Linux root VMAR starts at
+        // `USER_ASPACE_BASE`, which is **zero** for this personality (a non-PIE
+        // image has to land on the absolute vaddrs baked into its code), and
+        // `find_free_area` hands out the base of an empty VMAR. So `None` here
+        // means guest vaddr 0, which under libos is a host `MAP_FIXED` at 0 --
+        // allowed only to a process holding `CAP_SYS_RAWIO`. The test passed
+        // for anyone running it as root and failed in CI with
+        // `failed to mmap: ... vaddr=0x0: EPERM`. What it measures is the size
+        // and residency of what is mapped, so where it is mapped is incidental.
+        const AT: usize = 0x1000_0000;
         proc.vmar()
-            .map(None, vmo.clone(), 0, 3 * PAGE_SIZE, flags)
+            .map(Some(AT), vmo.clone(), 0, 3 * PAGE_SIZE, flags)
             .unwrap();
         let line = proc_pid_stat(&proc);
         assert_eq!(field(&line, 23), (3 * PAGE_SIZE) as i64, "{:?}", line);
@@ -3688,7 +3698,9 @@ mod pid_stat_tests {
         // Mapped a second time the pages are shared, and shared pages are
         // resident too: `get_mm_rss` is file + anon + shmem, and `ps` would
         // otherwise show RSS 0 for a process that lives on shared memory.
-        proc.vmar().map(None, vmo, 0, 3 * PAGE_SIZE, flags).unwrap();
+        proc.vmar()
+            .map(Some(AT + 3 * PAGE_SIZE), vmo, 0, 3 * PAGE_SIZE, flags)
+            .unwrap();
         let line = proc_pid_stat(&proc);
         assert_eq!(field(&line, 23), (6 * PAGE_SIZE) as i64, "{:?}", line);
         assert_eq!(field(&line, 24), 6, "{:?}", line);

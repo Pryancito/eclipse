@@ -612,22 +612,34 @@ impl Syscall<'_> {
                 // next grow reaches `map_at` and gets fresh pages. If it
                 // fails the reservation stays where it was, so `mapped_brk`
                 // only moves down when it really moved.
-                if mapped_brk > plan.mapped_end {
+                let pages_released = if mapped_brk > plan.mapped_end {
                     match vmar.unmap_why(
                         plan.mapped_end,
                         mapped_brk - plan.mapped_end,
                         "sys_brk shrink",
                     ) {
-                        Ok(()) => proc.set_mapped_brk(plan.mapped_end),
-                        Err(e) => warn!(
-                            "brk: shrink to {:#x} could not unmap [{:#x}, {:#x}): {:?}",
-                            plan.brk, plan.mapped_end, mapped_brk, e
-                        ),
+                        Ok(()) => {
+                            proc.set_mapped_brk(plan.mapped_end);
+                            true
+                        }
+                        Err(e) => {
+                            warn!(
+                                "brk: shrink to {:#x} could not unmap [{:#x}, {:#x}): {:?}, \
+                                 keeping {:#x}",
+                                plan.brk, plan.mapped_end, mapped_brk, e, current_brk
+                            );
+                            false
+                        }
                     }
-                }
-                proc.set_brk(plan.brk);
-                info!("brk: shrunk to {:#x}", plan.brk);
-                return Ok(plan.brk);
+                } else {
+                    // Nothing above the new break was mapped, so there is
+                    // nothing to release and the shrink stands.
+                    true
+                };
+                let brk = shrunk_brk(plan.brk, current_brk, pages_released);
+                proc.set_brk(brk);
+                info!("brk: shrunk to {:#x}", brk);
+                return Ok(brk);
             }
             BrkMove::WithinPage => {
                 // Same last page as before: bookkeeping only.
@@ -1639,6 +1651,25 @@ struct BrkPlan {
     moved: BrkMove,
 }
 
+/// The break a shrink may report, given whether the pages above the new one
+/// were actually released.
+///
+/// `brk(2)` answers with the break it managed to set, and the only reason this
+/// kernel unmaps on a shrink is the twenty lines above: memory a later grow
+/// hands back has to read as zero, and the unmap is what makes it so. When the
+/// unmap fails the pages are still there holding the program's old heap -- and
+/// the next grow takes the `new_brk_aligned <= mapped_brk` path, bookkeeping
+/// only, no fresh pages -- so committing the lower break is a promise the next
+/// `calloc` breaks, quietly, in the allocator. The break moves down only when
+/// the pages did.
+fn shrunk_brk(asked: usize, current: usize, pages_released: bool) -> usize {
+    if pages_released {
+        asked
+    } else {
+        current
+    }
+}
+
 /// `check_data_rlimit()`: whether `RLIMIT_DATA` leaves room for a break at
 /// `new_brk`.
 ///
@@ -2502,6 +2533,26 @@ mod brk_plan_tests {
         assert_eq!(plan.moved, BrkMove::Grow);
         assert_eq!(plan.mapped_end, HEAP + 2 * PAGE_SIZE);
         assert_eq!(brk_plan(HEAP - 1, HEAP, HEAP), None);
+    }
+
+    /// A shrink whose unmap failed must not report the lower break.
+    ///
+    /// Copilot raised this on the #1475 review, after the merge. The pages
+    /// above the break are the ones a later grow hands straight back --
+    /// `new_brk_aligned <= mapped_brk` is bookkeeping only -- so a break
+    /// reported as lower over pages that are still mapped is exactly the
+    /// non-zero `calloc` this whole branch exists to prevent, and silent.
+    #[test]
+    fn a_shrink_whose_unmap_failed_keeps_the_old_break() {
+        assert_eq!(
+            shrunk_brk(HEAP + 100, HEAP + 2 * PAGE_SIZE, true),
+            HEAP + 100
+        );
+        assert_eq!(
+            shrunk_brk(HEAP + 100, HEAP + 2 * PAGE_SIZE, false),
+            HEAP + 2 * PAGE_SIZE,
+            "the pages are still there, so the break has not moved"
+        );
     }
 }
 

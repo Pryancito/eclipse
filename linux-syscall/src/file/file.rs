@@ -384,7 +384,7 @@ impl Syscall<'_> {
         const STACK_BUF: usize = 512;
         let mut stack_buf = [0u8; STACK_BUF];
         let mut heap_buf: alloc::vec::Vec<u8> = if total_len > STACK_BUF {
-            vec![0u8; total_len]
+            crate::try_zeroed_buf(total_len)?
         } else {
             alloc::vec::Vec::new()
         };
@@ -429,7 +429,7 @@ impl Syscall<'_> {
         let proc = self.linux_process();
         let file_like = proc.get_file_like(fd)?;
         let waits = self.waits_for_room(&file_like);
-        let mut buf = vec![0u8; total.min(super::SYSCALL_IO_MAX)];
+        let mut buf = crate::try_zeroed_buf(total.min(super::SYSCALL_IO_MAX))?;
         let mut written = 0usize;
         while written < total {
             let n = iovs.read_bytes_at(written, &mut buf)?;
@@ -492,7 +492,7 @@ impl Syscall<'_> {
         let proc = self.linux_process();
         let file_like = proc.get_file_like(fd)?;
         let total_len = iovs.total_len().min(super::SYSCALL_IO_MAX);
-        let mut buf = vec![0u8; total_len];
+        let mut buf = crate::try_zeroed_buf(total_len)?;
         let len = file_like.read_at(offset, &mut buf).await?;
         iovs.write_from_buf(&buf[..len])?;
         Ok(len)
@@ -522,7 +522,7 @@ impl Syscall<'_> {
         let total = iovs.total_len();
         let proc = self.linux_process();
         let file_like = proc.get_file_like(fd)?;
-        let mut buf = vec![0u8; total.min(super::SYSCALL_IO_MAX)];
+        let mut buf = crate::try_zeroed_buf(total.min(super::SYSCALL_IO_MAX))?;
         let mut written = 0usize;
         while written < total {
             let n = iovs.read_bytes_at(written, &mut buf)?;
