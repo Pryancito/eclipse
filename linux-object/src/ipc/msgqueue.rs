@@ -315,8 +315,12 @@ impl MsgQueue {
 
     /// Whether `euid`/`egid` may use this queue for `want`: `IPC_W` to send,
     /// `IPC_R` to receive or to `IPC_STAT`. See [`IpcPerm::may_access`].
-    pub fn may_access(&self, euid: u32, egid: u32, want: u32) -> bool {
-        self.inner.lock().ds.perm.may_access(euid, egid, want)
+    pub fn may_access(&self, euid: u32, egid: u32, groups: &[u32], want: u32) -> bool {
+        self.inner
+            .lock()
+            .ds
+            .perm
+            .may_access(euid, egid, groups, want)
     }
 
     fn mark_removed(&self) {
@@ -455,7 +459,13 @@ fn select_message(
 
 /// `msgget(2)`: resolve `key` to a queue id, creating the queue as the flags
 /// demand. `key == 0` is `IPC_PRIVATE` (always a fresh queue).
-pub fn msg_get(key: u32, flags: usize, uid: u32, gid: u32) -> Result<usize, LxError> {
+pub fn msg_get(
+    key: u32,
+    flags: usize,
+    uid: u32,
+    gid: u32,
+    groups: &[u32],
+) -> Result<usize, LxError> {
     let flag = IpcGetFlag::from_bits_truncate(flags);
     let mut queues = MSG_QUEUES.write();
     if key != 0 {
@@ -465,7 +475,7 @@ pub fn msg_get(key: u32, flags: usize, uid: u32, gid: u32) -> Result<usize, LxEr
             }
             // The key resolved to somebody else's queue. Asking for a mode it
             // will not grant is EACCES, not a working id (`ipc_check_perms`).
-            if !q.may_access(uid, gid, IpcPerm::requested_mode(flags)) {
+            if !q.may_access(uid, gid, groups, IpcPerm::requested_mode(flags)) {
                 return Err(LxError::EACCES);
             }
             return Ok(id);
@@ -635,8 +645,8 @@ mod msg_control_tests {
         clear_queues();
         assert_eq!(msg_max_index(), None);
         assert_eq!(msg_totals(), (0, 0, 0));
-        let a = msg_get(0, CREAT, OWNER, OWNER).unwrap();
-        let b = msg_get(0, CREAT, OWNER, OWNER).unwrap();
+        let a = msg_get(0, CREAT, OWNER, OWNER, &[]).unwrap();
+        let b = msg_get(0, CREAT, OWNER, OWNER, &[]).unwrap();
         assert_eq!(msg_max_index(), Some(b));
         assert_eq!(msg_at_index(a).unwrap().0, a);
         assert_eq!(msg_at_index(b).unwrap().0, b);
@@ -823,7 +833,7 @@ mod msg_control_tests {
     fn ipc_rmid_from_a_stranger_is_eperm_and_leaves_the_queue_alive() {
         let _guard = test_lock();
         clear_queues();
-        let id = msg_get(0, CREAT, OWNER, OWNER).unwrap();
+        let id = msg_get(0, CREAT, OWNER, OWNER, &[]).unwrap();
         assert_eq!(msg_remove(id, STRANGER), Err(LxError::EPERM));
         let queue = msg_queue(id).expect("queue destroyed by a stranger");
         // Not even latched as removed: a blocked sender would have woken into
@@ -835,7 +845,7 @@ mod msg_control_tests {
     fn ipc_rmid_from_the_owner_removes_and_wakes_blocked_callers() {
         let _guard = test_lock();
         clear_queues();
-        let id = msg_get(0, CREAT, OWNER, OWNER).unwrap();
+        let id = msg_get(0, CREAT, OWNER, OWNER, &[]).unwrap();
         let queue = msg_queue(id).unwrap();
         assert_eq!(msg_remove(id, OWNER), Ok(()));
         assert!(msg_queue(id).is_none());
@@ -849,7 +859,7 @@ mod msg_control_tests {
     fn root_may_remove_a_queue_it_does_not_own() {
         let _guard = test_lock();
         clear_queues();
-        let id = msg_get(0, CREAT, OWNER, OWNER).unwrap();
+        let id = msg_get(0, CREAT, OWNER, OWNER, &[]).unwrap();
         assert_eq!(msg_remove(id, ROOT), Ok(()));
         assert!(msg_queue(id).is_none());
     }
@@ -870,9 +880,9 @@ mod msg_control_tests {
     fn an_id_is_never_handed_out_twice() {
         let _guard = test_lock();
         clear_queues();
-        let first = msg_get(0, CREAT, OWNER, OWNER).unwrap();
+        let first = msg_get(0, CREAT, OWNER, OWNER, &[]).unwrap();
         assert_eq!(msg_remove(first, OWNER), Ok(()));
-        let second = msg_get(0, CREAT, OWNER, OWNER).unwrap();
+        let second = msg_get(0, CREAT, OWNER, OWNER, &[]).unwrap();
         assert_ne!(second, first);
         assert!(msg_queue(first).is_none());
     }
@@ -881,8 +891,8 @@ mod msg_control_tests {
     fn ipc_private_always_makes_a_fresh_queue() {
         let _guard = test_lock();
         clear_queues();
-        let a = msg_get(0, CREAT, OWNER, OWNER).unwrap();
-        let b = msg_get(0, CREAT, OWNER, OWNER).unwrap();
+        let a = msg_get(0, CREAT, OWNER, OWNER, &[]).unwrap();
+        let b = msg_get(0, CREAT, OWNER, OWNER, &[]).unwrap();
         assert_ne!(a, b);
         assert_eq!(MSG_QUEUES.read().len(), 2);
     }
@@ -903,7 +913,7 @@ mod msg_control_tests {
                 queues.insert(i, Arc::new(MsgQueue::new(0, 0o600, OWNER, OWNER)));
             }
         }
-        assert_eq!(msg_get(0, CREAT, OWNER, OWNER), Err(LxError::ENOSPC));
+        assert_eq!(msg_get(0, CREAT, OWNER, OWNER, &[]), Err(LxError::ENOSPC));
         clear_queues();
     }
 
@@ -921,7 +931,7 @@ mod msg_control_tests {
             queues.insert(0, Arc::new(MsgQueue::new(77, 0o600, OWNER, OWNER)));
             0
         };
-        assert_eq!(msg_get(77, 0, OWNER, OWNER), Ok(id));
+        assert_eq!(msg_get(77, 0, OWNER, OWNER, &[]), Ok(id));
         clear_queues();
     }
 
@@ -934,21 +944,21 @@ mod msg_control_tests {
     fn msgget_refuses_a_key_that_belongs_to_somebody_else() {
         let _guard = test_lock();
         clear_queues();
-        let id = msg_get(9901, CREAT | 0o600, OWNER, OWNER).unwrap();
-        assert_eq!(msg_get(9901, 0o600, OWNER, OWNER), Ok(id), "its owner");
+        let id = msg_get(9901, CREAT | 0o600, OWNER, OWNER, &[]).unwrap();
+        assert_eq!(msg_get(9901, 0o600, OWNER, OWNER, &[]), Ok(id), "its owner");
         assert_eq!(
-            msg_get(9901, 0o600, STRANGER, STRANGER),
+            msg_get(9901, 0o600, STRANGER, STRANGER, &[]),
             Err(LxError::EACCES),
             "a stranger gets EACCES, not the id"
         );
         assert_eq!(
-            msg_get(9901, 0o400, STRANGER, STRANGER),
+            msg_get(9901, 0o400, STRANGER, STRANGER, &[]),
             Err(LxError::EACCES)
         );
-        assert_eq!(msg_get(9901, 0, ROOT, ROOT), Ok(id), "root passes");
+        assert_eq!(msg_get(9901, 0, ROOT, ROOT, &[]), Ok(id), "root passes");
         // A bare existence probe asks for no access at all, and Linux grants
         // it: `msgget(key, 0)` is how a program asks whether a queue is there.
-        assert_eq!(msg_get(9901, 0, STRANGER, STRANGER), Ok(id));
+        assert_eq!(msg_get(9901, 0, STRANGER, STRANGER, &[]), Ok(id));
         clear_queues();
     }
 
@@ -957,10 +967,10 @@ mod msg_control_tests {
     fn msgget_grants_a_stranger_what_the_mode_grants() {
         let _guard = test_lock();
         clear_queues();
-        let id = msg_get(9902, CREAT | 0o644, OWNER, OWNER).unwrap();
-        assert_eq!(msg_get(9902, 0o400, STRANGER, STRANGER), Ok(id));
+        let id = msg_get(9902, CREAT | 0o644, OWNER, OWNER, &[]).unwrap();
+        assert_eq!(msg_get(9902, 0o400, STRANGER, STRANGER, &[]), Ok(id));
         assert_eq!(
-            msg_get(9902, 0o600, STRANGER, STRANGER),
+            msg_get(9902, 0o600, STRANGER, STRANGER, &[]),
             Err(LxError::EACCES),
             "0644 does not grant a stranger a write"
         );
@@ -972,10 +982,10 @@ mod msg_control_tests {
     #[test]
     fn a_queue_answers_for_itself_who_may_send_and_who_may_receive() {
         let q = MsgQueue::new(0, 0o640, OWNER, OWNER);
-        assert!(q.may_access(OWNER, OWNER, IPC_R | IPC_W));
-        assert!(q.may_access(STRANGER, OWNER, IPC_R));
-        assert!(!q.may_access(STRANGER, OWNER, IPC_W));
-        assert!(!q.may_access(STRANGER, STRANGER, IPC_R));
+        assert!(q.may_access(OWNER, OWNER, &[], IPC_R | IPC_W));
+        assert!(q.may_access(STRANGER, OWNER, &[], IPC_R));
+        assert!(!q.may_access(STRANGER, OWNER, &[], IPC_W));
+        assert!(!q.may_access(STRANGER, STRANGER, &[], IPC_R));
     }
 }
 

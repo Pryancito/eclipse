@@ -189,8 +189,14 @@ impl Syscall<'_> {
         info!("semget: key: {} nsems: {} flags: {:#x}", key, nsems, flags);
         let nsems = semget_nsems(nsems)?;
         let proc = self.linux_process();
-        let sem_array =
-            SemArray::get_or_create(key as u32, nsems, flags, proc.euid(), proc.egid())?;
+        let sem_array = SemArray::get_or_create(
+            key as u32,
+            nsems,
+            flags,
+            proc.euid(),
+            proc.egid(),
+            &proc.groups(),
+        )?;
         // The id is system-wide and the registry is what keeps the set alive
         // past this process, per sysvipc(7). See `sem_register`.
         let id = linux_object::ipc::sem_register(&sem_array)?;
@@ -243,7 +249,12 @@ impl Syscall<'_> {
         // before, so naming the id was the whole check.
         let alter = ops.iter().any(|op| op.op != 0);
         let proc = self.linux_process();
-        if !sem_array.may_access(proc.euid(), proc.egid(), if alter { IPC_W } else { IPC_R }) {
+        if !sem_array.may_access(
+            proc.euid(),
+            proc.egid(),
+            &proc.groups(),
+            if alter { IPC_W } else { IPC_R },
+        ) {
             return Err(LxError::EACCES);
         }
         let pid = self.zircon_process().id() as usize;
@@ -359,7 +370,7 @@ impl Syscall<'_> {
         };
         if let Some(want) = semctl_access(&cmd) {
             let proc = self.linux_process();
-            if !sem_array.may_access(proc.euid(), proc.egid(), want) {
+            if !sem_array.may_access(proc.euid(), proc.egid(), &proc.groups(), want) {
                 return Err(LxError::EACCES);
             }
         }
@@ -467,7 +478,7 @@ impl Syscall<'_> {
     pub fn sys_msgget(&self, key: usize, msgflg: usize) -> SysResult {
         info!("msgget: key={}, flags={:#x}", key, msgflg);
         let proc = self.linux_process();
-        msg_get(key as u32, msgflg, proc.euid(), proc.egid())
+        msg_get(key as u32, msgflg, proc.euid(), proc.egid(), &proc.groups())
     }
 
     /// Append a message to a System V queue
@@ -498,7 +509,7 @@ impl Syscall<'_> {
         let data = UserInPtr::<u8>::from(msgp + core::mem::size_of::<isize>()).read_array(msgsz)?;
         let queue = msg_queue(id).ok_or(LxError::EINVAL)?;
         let proc = self.linux_process();
-        if !queue.may_access(proc.euid(), proc.egid(), IPC_W) {
+        if !queue.may_access(proc.euid(), proc.egid(), &proc.groups(), IPC_W) {
             return Err(LxError::EACCES);
         }
         let sender = self.zircon_process().id() as u32;
@@ -543,7 +554,7 @@ impl Syscall<'_> {
         );
         let queue = msg_queue(id).ok_or(LxError::EINVAL)?;
         let proc = self.linux_process();
-        if !queue.may_access(proc.euid(), proc.egid(), IPC_R) {
+        if !queue.may_access(proc.euid(), proc.egid(), &proc.groups(), IPC_R) {
             return Err(LxError::EACCES);
         }
         let receiver = self.zircon_process().id() as u32;
@@ -598,7 +609,9 @@ impl Syscall<'_> {
                     _ => (id, msg_queue(id).ok_or(LxError::EINVAL)?),
                 };
                 let proc = self.linux_process();
-                if cmd != MSG_STAT_ANY && !queue.may_access(proc.euid(), proc.egid(), IPC_R) {
+                if cmd != MSG_STAT_ANY
+                    && !queue.may_access(proc.euid(), proc.egid(), &proc.groups(), IPC_R)
+                {
                     return Err(LxError::EACCES);
                 }
                 UserOutPtr::from(buf).write(queue.stat())?;
@@ -641,6 +654,7 @@ impl Syscall<'_> {
             self.zircon_process().id() as u32,
             proc.euid(),
             proc.egid(),
+            &proc.groups(),
         )?;
         // The id is system-wide: `shmget` hands out a number that names the
         // same segment in every process, because passing it to another
@@ -672,10 +686,12 @@ impl Syscall<'_> {
         let guard = linux_object::ipc::shm_lookup(id).ok_or(LxError::EINVAL)?;
         {
             let proc = self.linux_process();
-            if !guard
-                .lock()
-                .may_access(proc.euid(), proc.egid(), shmat_access(shmflg))
-            {
+            if !guard.lock().may_access(
+                proc.euid(),
+                proc.egid(),
+                &proc.groups(),
+                shmat_access(shmflg),
+            ) {
                 return Err(LxError::EACCES);
             }
         }
@@ -856,7 +872,7 @@ impl Syscall<'_> {
                 let proc = self.linux_process();
                 // `SHM_STAT_ANY` skips the read-permission check.
                 if cmd != ShmctlCmds::SHM_STAT_ANY
-                    && !shm_guard.may_access(proc.euid(), proc.egid(), IPC_R)
+                    && !shm_guard.may_access(proc.euid(), proc.egid(), &proc.groups(), IPC_R)
                 {
                     return Err(LxError::EACCES);
                 }

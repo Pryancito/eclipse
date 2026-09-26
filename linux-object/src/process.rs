@@ -5665,7 +5665,7 @@ mod fork_inheritance_tests {
         let id = 7;
         parent.semaphores.add(
             id,
-            crate::ipc::SemArray::get_or_create(0, 1, 0o666, 0, 0).unwrap(),
+            crate::ipc::SemArray::get_or_create(0, 1, 0o666, 0, 0, &[]).unwrap(),
         );
         parent.semaphores.add_undo(id, 0, -1);
 
@@ -10947,7 +10947,7 @@ mod sem_id_from_elsewhere_tests {
     fn a_set_named_by_id_from_another_process_is_found_and_remembered() {
         let _guard = crate::ipc::sem_test_globals::lock();
         // The set exists system-wide; this process never called semget on it.
-        let array = SemArray::get_or_create(0, 1, 0o1000 | 0o666, 0, 0).unwrap();
+        let array = SemArray::get_or_create(0, 1, 0o1000 | 0o666, 0, 0, &[]).unwrap();
         let id = sem_register(&array).unwrap();
         let proc = Process::create_with_fixed_id_ext(
             &ROOT_JOB,

@@ -229,6 +229,7 @@ impl ShmIdentifier {
         cpid: u32,
         uid: u32,
         gid: u32,
+        groups: &[u32],
     ) -> Result<Arc<Mutex<ShmGuard>>, LxError> {
         let mut key2shm = KEY2SHM.write();
         let flag = IpcGetFlag::from_bits_truncate(flags);
@@ -252,7 +253,7 @@ impl ShmIdentifier {
                     // Somebody else's segment. See `msg_get`.
                     if !guard
                         .lock()
-                        .may_access(uid, gid, IpcPerm::requested_mode(flags))
+                        .may_access(uid, gid, groups, IpcPerm::requested_mode(flags))
                     {
                         return Err(LxError::EACCES);
                     }
@@ -367,8 +368,11 @@ impl ShmGuard {
     /// Whether `euid`/`egid` may use this segment for `want`: `IPC_R` to
     /// attach read-only, `IPC_R | IPC_W` otherwise, `IPC_R` for an
     /// `IPC_STAT`. See [`IpcPerm::may_access`].
-    pub fn may_access(&self, euid: u32, egid: u32, want: u32) -> bool {
-        self.shmid_ds.lock().perm.may_access(euid, egid, want)
+    pub fn may_access(&self, euid: u32, egid: u32, groups: &[u32], want: u32) -> bool {
+        self.shmid_ds
+            .lock()
+            .perm
+            .may_access(euid, egid, groups, want)
     }
 
     /// The segment's size in bytes, as `shmget` and `IPC_STAT` report it.
@@ -453,7 +457,7 @@ mod shm_tests {
         flags: usize,
         uid: u32,
     ) -> Result<Arc<Mutex<ShmGuard>>, LxError> {
-        ShmIdentifier::new_shared_guard(key, size, flags, PID, uid, uid)
+        ShmIdentifier::new_shared_guard(key, size, flags, PID, uid, uid, &[])
     }
 
     /// Clear the system-wide id table between tests: it is process-wide and
@@ -909,8 +913,8 @@ mod shm_tests {
     #[test]
     fn shmget_records_the_caller_as_owner_and_creator() {
         let _guard = test_lock();
-        let a =
-            ShmIdentifier::new_shared_guard(0, 4096, CREAT | 0o666, PID, OWNER, OWNER + 5).unwrap();
+        let a = ShmIdentifier::new_shared_guard(0, 4096, CREAT | 0o666, PID, OWNER, OWNER + 5, &[])
+            .unwrap();
         let perm = a.lock().shmid_ds.lock().perm;
         assert_eq!(perm.uid, OWNER);
         assert_eq!(perm.gid, OWNER + 5);
@@ -1006,10 +1010,10 @@ mod shm_tests {
         clear_ids();
         let seg = owned_get(6603, 4096, CREAT | 0o640, OWNER).unwrap();
         let guard = seg.lock();
-        assert!(guard.may_access(OWNER, OWNER, IPC_R | IPC_W));
-        assert!(guard.may_access(STRANGER, OWNER, IPC_R));
-        assert!(!guard.may_access(STRANGER, OWNER, IPC_R | IPC_W));
-        assert!(!guard.may_access(STRANGER, STRANGER, IPC_R));
+        assert!(guard.may_access(OWNER, OWNER, &[], IPC_R | IPC_W));
+        assert!(guard.may_access(STRANGER, OWNER, &[], IPC_R));
+        assert!(!guard.may_access(STRANGER, OWNER, &[], IPC_R | IPC_W));
+        assert!(!guard.may_access(STRANGER, STRANGER, &[], IPC_R));
         assert_eq!(guard.segsz(), 4096);
         drop(guard);
         drop(seg);
@@ -1033,7 +1037,7 @@ mod shm_size_tests {
     }
 
     fn get(key: u32, size: usize, flags: usize) -> Result<Arc<Mutex<ShmGuard>>, LxError> {
-        ShmIdentifier::new_shared_guard(key, size, flags, 42, 0, 0)
+        ShmIdentifier::new_shared_guard(key, size, flags, 42, 0, 0, &[])
     }
 
     /// `newseg`: below `SHMMIN` or above `SHMMAX` is `EINVAL`, and the page
