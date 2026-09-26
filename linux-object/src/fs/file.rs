@@ -1079,29 +1079,6 @@ impl FileLike for File {
     async fn async_poll(&self, _events: PollEvents) -> LxResult<PollStatus> {
         let inode = self.inner.read().inode.clone();
 
-        // `INode::async_poll` takes no events, so every inode that implements it
-        // waits for READABLE whatever the caller asked about: `PtyReadFuture`
-        // subscribes to the bus and re-checks `slave_read_ready`, the DRM wait
-        // waits for a vblank. A caller that asked only about writability then
-        // parks until something arrives to *read* -- on a terminal nobody is
-        // typing into, that is for ever, and it is the wait `sys_write` uses to
-        // hold a blocking writer until there is room.
-        //
-        // So ask the synchronous `poll`, which does answer both halves, before
-        // parking on the wrong one. This was done for `DrmDev` alone, by name;
-        // every other inode fell through. `poll` is best-effort here for the
-        // same reason as in `poll` below: a socket answers `ENOSYS` to
-        // `metadata` and must still reach its own `async_poll`.
-        let want_read = _events.wants_read();
-        let want_write = _events.wants_write();
-        if want_read != want_write {
-            if let Ok(status) = inode.poll() {
-                if (want_read && status.read) || (want_write && status.write) {
-                    return Ok(status);
-                }
-            }
-        }
-
         // See `poll`: special-case an empty FIFO so the reader blocks, but only
         // when metadata() is available — sockets/special devices return ENOSYS
         // and must fall through to the inode's own async_poll() rather than
@@ -1114,6 +1091,31 @@ impl FileLike for File {
                     error: false,
                     hangup: false,
                 });
+            }
+        }
+
+        // `INode::async_poll` takes no events, so every inode that implements it
+        // waits for READABLE whatever the caller asked about: `PtyReadFuture`
+        // subscribes to the bus and re-checks `slave_read_ready`, the DRM wait
+        // waits for a vblank. A caller that asked only about writability then
+        // parks until something arrives to *read* -- on a terminal nobody is
+        // typing into, that is for ever, and it is the wait `sys_write` uses to
+        // hold a blocking writer until there is room.
+        //
+        // So ask the synchronous `poll`, which does answer both halves, before
+        // parking on the wrong one. This was done for `DrmDev` alone, by name;
+        // every other inode fell through. `poll` is best-effort here for the
+        // same reason as in `poll` below: a socket answers `ENOSYS` to
+        // `metadata` and must still reach its own `async_poll`. And after the
+        // FIFO answer above, not before: that one contradicts the node's own
+        // `poll`, which calls a FIFO readable whether or not it holds bytes.
+        let want_read = _events.wants_read();
+        let want_write = _events.wants_write();
+        if want_read != want_write {
+            if let Ok(status) = inode.poll() {
+                if (want_read && status.read) || (want_write && status.write) {
+                    return Ok(status);
+                }
             }
         }
         Ok(inode.async_poll().await?)
@@ -1728,6 +1730,28 @@ mod async_poll_tests {
         match poll_once(&f, PollEvents::OUT) {
             Poll::Ready(Ok(s)) => assert!(s.write),
             other => panic!("parked on readability instead: {:?}", other.is_pending()),
+        }
+    }
+
+    #[test]
+    fn an_empty_fifo_keeps_its_own_answer_and_not_the_nodes() {
+        // The FIFO case above the fast path says `read: meta.size > 0`, and the
+        // ramfs node's own `poll` says a file is always readable. The order
+        // decides which one a reader hears, and hearing "readable" over an
+        // empty FIFO is the 0-byte read the FIFO case exists to stop.
+        use rcore_fs::vfs::FileSystem;
+        use rcore_fs_ramfs::RamFS;
+        let fs = RamFS::new();
+        let inode = fs
+            .root_inode()
+            .create("fifo", FileType::NamedPipe, 0o644)
+            .unwrap();
+        core::mem::forget(fs);
+        assert!(inode.poll().unwrap().read, "the node says readable");
+        let f: Arc<dyn FileLike> = File::new(inode, OpenFlags::RDWR, String::from("/fifo"));
+        match poll_once(&f, PollEvents::IN) {
+            Poll::Ready(Ok(s)) => assert!(!s.read, "empty, so not readable"),
+            other => panic!("unexpected: pending={}", other.is_pending()),
         }
     }
 
