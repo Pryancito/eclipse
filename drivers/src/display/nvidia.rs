@@ -12322,43 +12322,146 @@ impl NvidiaGpu {
                     return Err(nv::ENODEV);
                 }
                 let req = unsafe { &*(arg as *const nv::DrmNouveauVmBind) };
-                if req.wait_count != 0 || req.sig_count != 0 {
+                // NVK's bind context (`vkQueueBindSparse`) submits every
+                // sparse bind as an ASYNC VM_BIND carrying the semaphores
+                // it waits for and the fence it signals; the ops themselves
+                // may be none (a flush at a signal). Linux runs the ops on
+                // the bind scheduler behind the waits and signals the sigs
+                // once they land; here each op is a synchronous RM call, so
+                // the ioctl waits on the CPU first, binds, then signals.
+                // Refusing any sync list with EOPNOTSUPP (as this arm did)
+                // failed every sparse bind that had a fence, that is every
+                // one NVK sends, and the queue was lost with it.
+                let run_async = req.flags & nv::VM_BIND_RUN_ASYNC != 0;
+                if !run_async && (req.wait_count != 0 || req.sig_count != 0) {
+                    // `nouveau_job_init`: a synchronous job takes no syncs.
                     log::warn!(
-                        "[nouveau-uapi] VM_BIND: wait_count/sig_count must be 0 -- VM_BIND ops complete synchronously within this ioctl (real RM calls, not queued GPU work), so there is nothing async to wait for or signal after (got wait_count={} sig_count={})",
+                        "[nouveau-uapi] VM_BIND: a synchronous bind (no RUN_ASYNC) carries no syncs (got wait_count={} sig_count={})",
                         req.wait_count, req.sig_count
                     );
-                    return Err(nv::EOPNOTSUPP);
-                }
-                const MAX_VM_BIND_OPS: u32 = 64;
-                if req.op_count == 0 || req.op_ptr == 0 {
                     return Err(nv::EINVAL);
                 }
-                if req.op_count > MAX_VM_BIND_OPS {
+                // NVK batches up to 4096 ops and 256 syncs per call
+                // (`NVKMD_NOUVEAU_MAX_BINDS`, `NVKMD_NOUVEAU_MAX_SYNCS`).
+                const MAX_VM_BIND_OPS: u32 = 4096;
+                const MAX_VM_BIND_SYNC: u32 = 256;
+                if req.op_count > MAX_VM_BIND_OPS
+                    || req.wait_count > MAX_VM_BIND_SYNC
+                    || req.sig_count > MAX_VM_BIND_SYNC
+                {
                     log::warn!(
-                        "[nouveau-uapi] VM_BIND: op_count={} exceeds the {} this milestone supports per call",
-                        req.op_count, MAX_VM_BIND_OPS
+                        "[nouveau-uapi] VM_BIND: op_count={} wait_count={} sig_count={} exceed the {} ops / {} syncs this milestone supports per call",
+                        req.op_count, req.wait_count, req.sig_count, MAX_VM_BIND_OPS, MAX_VM_BIND_SYNC
                     );
                     return Err(nv::EOPNOTSUPP);
+                }
+                if req.op_count == 0 && req.wait_count == 0 && req.sig_count == 0 {
+                    return Err(nv::EINVAL);
+                }
+                if req.op_count > 0 && req.op_ptr == 0 {
+                    return Err(nv::EINVAL);
                 }
                 let Some(device_instance) = *self.rm_device_instance.lock() else {
                     crate::klog_warn!("[nouveau-uapi] VM_BIND: GPU not attached to the RM yet");
                     return Err(nv::ENODEV);
                 };
+                if !user_slice_ok::<nv::DrmNouveauVmBindOp>(req.op_ptr, req.op_count)
+                    || !user_slice_ok::<nv::DrmNouveauSync>(req.wait_ptr, req.wait_count)
+                    || !user_slice_ok::<nv::DrmNouveauSync>(req.sig_ptr, req.sig_count)
+                {
+                    return Err(nv::EFAULT);
+                }
+                let ops = if req.op_count > 0 {
+                    unsafe {
+                        core::slice::from_raw_parts(
+                            req.op_ptr as *const nv::DrmNouveauVmBindOp,
+                            req.op_count as usize,
+                        )
+                    }
+                } else {
+                    &[]
+                };
+                let waits = if req.wait_count > 0 {
+                    unsafe {
+                        core::slice::from_raw_parts(
+                            req.wait_ptr as *const nv::DrmNouveauSync,
+                            req.wait_count as usize,
+                        )
+                    }
+                } else {
+                    &[]
+                };
+                let sigs = if req.sig_count > 0 {
+                    unsafe {
+                        core::slice::from_raw_parts(
+                            req.sig_ptr as *const nv::DrmNouveauSync,
+                            req.sig_count as usize,
+                        )
+                    }
+                } else {
+                    &[]
+                };
+                // Every sig handle must exist BEFORE anything is waited for,
+                // bound or signaled (Linux looks the whole list up in
+                // `nouveau_job_fence_attach_prepare` before the job runs).
+                if let Some(sig) = sigs
+                    .iter()
+                    .find(|s| !crate::scheme::syncobj::exists(s.handle))
+                {
+                    crate::klog_warn!(
+                        "[nouveau-uapi] VM_BIND: sig syncobj handle={} is unknown -- nothing bound (ENOENT) pid={}",
+                        sig.handle,
+                        owner_pid
+                    );
+                    return Err(nv::ENOENT);
+                }
+                // The waits, on the CPU: the ops below are RM calls the GPU
+                // never orders behind a semaphore, so the ioctl blocks until
+                // every wait has landed. A wait that never comes is EIO,
+                // like EXEC's, with nothing bound and nothing signaled.
+                if !waits.is_empty() {
+                    let handles: Vec<u32> = waits.iter().map(|s| s.handle).collect();
+                    let points: Vec<u64> = waits
+                        .iter()
+                        .map(|s| {
+                            if s.flags & nv::SYNC_TYPE_MASK == nv::SYNC_TIMELINE_SYNCOBJ {
+                                s.timeline_value
+                            } else {
+                                1
+                            }
+                        })
+                        .collect();
+                    const WAIT_TIMEOUT_US: u64 = 10_000_000;
+                    let deadline_us =
+                        unsafe { crate::bus::drivers_timer_now_as_micros() } + WAIT_TIMEOUT_US;
+                    match crate::scheme::syncobj::wait(&handles, Some(&points), true, deadline_us) {
+                        crate::scheme::syncobj::WaitOutcome::Signaled { .. } => {
+                            if exec_wait_reached_by_timeout(&handles, &points, owner_pid) {
+                                return Err(nv::EIO);
+                            }
+                        }
+                        crate::scheme::syncobj::WaitOutcome::Timeout => {
+                            crate::klog_warn!(
+                                "[nouveau-uapi] VM_BIND: {} wait syncobj(s) still unsignaled after {}us -- nothing bound, nothing signaled (EIO) pid={}:{}",
+                                req.wait_count,
+                                WAIT_TIMEOUT_US,
+                                owner_pid,
+                                crate::scheme::syncobj::describe(&handles, Some(&points))
+                            );
+                            return Err(nv::EIO);
+                        }
+                        crate::scheme::syncobj::WaitOutcome::Invalid => {
+                            return Err(nv::ENOENT);
+                        }
+                    }
+                }
                 // Ops are applied in order, one real RM call each -- NOT
                 // atomic across the array: if op[i] fails, op[0..i] already
                 // happened and stay applied, and op[i+1..] never run. Real
                 // nouveau's own VM_BIND jobs behave the same way (each op
                 // is validated/applied as it's processed, not as a single
                 // all-or-nothing transaction).
-                if !user_slice_ok::<nv::DrmNouveauVmBindOp>(req.op_ptr, req.op_count) {
-                    return Err(nv::EFAULT);
-                }
-                let ops = unsafe {
-                    core::slice::from_raw_parts(
-                        req.op_ptr as *const nv::DrmNouveauVmBindOp,
-                        req.op_count as usize,
-                    )
-                };
+                //
                 // Sticky ctx-0 owner (F-M15): do not re-infer from live channels —
                 // a throwaway CHANNEL_FREE must not rebuild a client context for
                 // the compositor or hand ctx 0's VAS to a stranger.
@@ -12373,6 +12476,14 @@ impl NvidiaGpu {
                             );
                         }
                         return Err(e);
+                    }
+                }
+                // The sigs, once every op is in: the bind's "fence".
+                for sig in sigs {
+                    let timeline = sig.flags & nv::SYNC_TYPE_MASK == nv::SYNC_TIMELINE_SYNCOBJ;
+                    let target = if timeline { sig.timeline_value } else { 1 };
+                    if !crate::scheme::syncobj::timeline_signal(sig.handle, target) {
+                        return Err(nv::ENOENT);
                     }
                 }
                 Ok(0)
@@ -15645,14 +15756,31 @@ mod nouveau_bookkeeping_tests {
         pid: u64,
         ops: &mut [nv::DrmNouveauVmBindOp],
     ) -> Result<usize, i32> {
+        vm_bind_sync(gpu, pid, ops, 0, &[], &[])
+    }
+
+    /// `VM_BIND` as NVK's bind context issues it for `vkQueueBindSparse`:
+    /// `flags` (`RUN_ASYNC`), the submit's waits and its sigs.
+    fn vm_bind_sync(
+        gpu: &NvidiaGpu,
+        pid: u64,
+        ops: &mut [nv::DrmNouveauVmBindOp],
+        flags: u32,
+        waits: &[nv::DrmNouveauSync],
+        sigs: &[nv::DrmNouveauSync],
+    ) -> Result<usize, i32> {
         let mut r = nv::DrmNouveauVmBind {
             op_count: ops.len() as u32,
-            flags: 0,
-            wait_count: 0,
-            sig_count: 0,
-            wait_ptr: 0,
-            sig_ptr: 0,
-            op_ptr: ops.as_mut_ptr() as u64,
+            flags,
+            wait_count: waits.len() as u32,
+            sig_count: sigs.len() as u32,
+            wait_ptr: ptr_of(waits),
+            sig_ptr: ptr_of(sigs),
+            op_ptr: if ops.is_empty() {
+                0
+            } else {
+                ops.as_mut_ptr() as u64
+            },
         };
         call(gpu, wr::<nv::DrmNouveauVmBind>(nv::NR_VM_BIND), &mut r, pid)
     }
@@ -16018,11 +16146,11 @@ mod nouveau_bookkeeping_tests {
             "sparse regions"
         );
         assert_eq!(vm_bind_ops(&gpu, A, &mut []), Err(nv::EINVAL), "no ops");
-        let mut many: Vec<_> = (0..65).map(|_| map(ha, VA, 4096)).collect();
+        let mut many: Vec<_> = (0..4097).map(|_| map(ha, VA, 4096)).collect();
         assert_eq!(
             vm_bind_ops(&gpu, A, &mut many),
             Err(nv::EOPNOTSUPP),
-            "65 ops"
+            "4097 ops"
         );
         let mut r = nv::DrmNouveauVmBind {
             op_count: 1,
@@ -16035,8 +16163,8 @@ mod nouveau_bookkeeping_tests {
         };
         assert_eq!(
             call(&gpu, wr::<nv::DrmNouveauVmBind>(nv::NR_VM_BIND), &mut r, A),
-            Err(nv::EOPNOTSUPP),
-            "VM_BIND is synchronous here: no syncobj waits"
+            Err(nv::EINVAL),
+            "a synchronous VM_BIND (no RUN_ASYNC) carries no syncs"
         );
         assert_eq!(
             FAKE_RM.lock().calls.len(),
@@ -18853,6 +18981,256 @@ mod nouveau_bookkeeping_tests {
         assert_eq!(syncobj::query(out), Some(1));
         assert!(syncobj::destroy(out));
         gpu.nouveau_release_process(A);
+        assert_eq!(FAKE_RM.lock().bad, 0);
+    }
+    /// `vkQueueBindSparse` is a `VM_BIND` with `RUN_ASYNC`, the submit's
+    /// wait semaphores as its wait list and its signal semaphores and fence
+    /// as its sig list (NVK's bind context, `nvkmd_nouveau_bind_ctx_flush`,
+    /// up to 4096 coalesced ops per call, flushed at every signal -- so a
+    /// submit with nothing to bind still carries its syncs). Every such
+    /// call was refused with EOPNOTSUPP, and more than 64 ops too, so any
+    /// sparse bind with a fence to signal was `DRM_NOUVEAU_VM_BIND failed`
+    /// and the queue was lost. Linux runs the ops behind the waits and
+    /// signals the sigs after them; here the ops are synchronous RM calls,
+    /// so the ioctl waits first, binds, then signals. Without `RUN_ASYNC`
+    /// a sync list is EINVAL, as in `nouveau_job_init`.
+    #[test]
+    fn a_sparse_bind_waits_its_semaphores_and_signals_its_fence_like_vkqueuebindsparse() {
+        let _g = LOCK.lock();
+        let _live = LiveBytes::hold();
+        let gpu = gpu_rm_fast();
+        let ch_a = client_with_pushbuf(&gpu, A);
+        let ha = gem_new_rm(&gpu, 65536, nv::NOUVEAU_GEM_DOMAIN_GART, A)
+            .unwrap()
+            .handle;
+        const VA: u64 = 0x7f_2000_0000;
+        let bound = driver_maps(&gpu, A).len();
+        let ready = syncobj::create(false);
+        assert!(syncobj::signal(ready));
+        let tl = syncobj::create(false);
+        assert!(syncobj::timeline_signal(tl, 3));
+        let done = syncobj::create(false);
+        let fence_tl = syncobj::create(false);
+        // Syncs without RUN_ASYNC: EINVAL, nothing bound, nothing signaled.
+        let before = FAKE_RM.lock().calls.len();
+        assert_eq!(
+            vm_bind_sync(
+                &gpu,
+                A,
+                &mut [map(ha, VA, 65536)],
+                0,
+                &[sync(ready)],
+                &[sync(done)]
+            ),
+            Err(nv::EINVAL),
+            "a synchronous bind cannot carry syncs"
+        );
+        assert_eq!(driver_maps(&gpu, A).len(), bound);
+        assert_eq!(syncobj::query(done), Some(0));
+        assert_eq!(rm_calls_since(before), [] as [&str; 0]);
+        // An op list with no pointer is EINVAL, not a fault.
+        let mut r = nv::DrmNouveauVmBind {
+            op_count: 1,
+            flags: nv::VM_BIND_RUN_ASYNC,
+            wait_count: 0,
+            sig_count: 0,
+            wait_ptr: 0,
+            sig_ptr: 0,
+            op_ptr: 0,
+        };
+        assert_eq!(
+            call(&gpu, wr::<nv::DrmNouveauVmBind>(nv::NR_VM_BIND), &mut r, A),
+            Err(nv::EINVAL),
+            "ops with no pointer"
+        );
+        // The sparse submit: two waits already satisfied, the bind, and a
+        // binary and a timeline signal after it.
+        assert_eq!(
+            vm_bind_sync(
+                &gpu,
+                A,
+                &mut [map(ha, VA, 65536)],
+                nv::VM_BIND_RUN_ASYNC,
+                &[sync(ready), sync_tl(tl, 2)],
+                &[sync(done), sync_tl(fence_tl, 7)]
+            ),
+            Ok(0)
+        );
+        assert_eq!(driver_maps(&gpu, A).len(), bound + 1, "bound");
+        assert_eq!(syncobj::query(done), Some(1), "the binary sig");
+        assert_eq!(syncobj::query(fence_tl), Some(7), "the timeline sig");
+        // A submit with nothing to bind still flushes its syncs.
+        let only = syncobj::create(false);
+        assert_eq!(
+            vm_bind_sync(
+                &gpu,
+                A,
+                &mut [],
+                nv::VM_BIND_RUN_ASYNC,
+                &[],
+                &[sync_tl(only, 4)]
+            ),
+            Ok(0),
+            "no ops, one signal"
+        );
+        assert_eq!(syncobj::query(only), Some(4));
+        // A wait that never comes: EIO, the unmap never runs, the sig stays.
+        let never = syncobj::create(false);
+        let late = syncobj::create(false);
+        let before = FAKE_RM.lock().calls.len();
+        test_clock::set_auto_advance(1_000);
+        assert_eq!(
+            vm_bind_sync(
+                &gpu,
+                A,
+                &mut [unmap(VA, 65536)],
+                nv::VM_BIND_RUN_ASYNC,
+                &[sync(ready), sync(never)],
+                &[sync(late)]
+            ),
+            Err(nv::EIO)
+        );
+        test_clock::set_auto_advance(0);
+        assert_eq!(driver_maps(&gpu, A).len(), bound + 1, "still bound");
+        assert_eq!(syncobj::query(late), Some(0), "not signaled");
+        assert_eq!(rm_calls_since(before), [] as [&str; 0]);
+        // A timeline point not yet reached is a wait too: EIO, not "3 >= 1".
+        test_clock::set_auto_advance(1_000);
+        assert_eq!(
+            vm_bind_sync(
+                &gpu,
+                A,
+                &mut [unmap(VA, 65536)],
+                nv::VM_BIND_RUN_ASYNC,
+                &[sync_tl(tl, 5)],
+                &[sync(late)]
+            ),
+            Err(nv::EIO),
+            "the timeline is at 3, the bind waits for 5"
+        );
+        test_clock::set_auto_advance(0);
+        assert_eq!(driver_maps(&gpu, A).len(), bound + 1);
+        assert_eq!(syncobj::query(late), Some(0));
+        // A semaphore A's own EXEC signals, on a ring that never gets to
+        // it: the fence times out, syncobj reads the point as reached, and
+        // the bind behind it is EIO (a sparse bind behind a hung queue),
+        // whichever of the two clocks ticked first.
+        let rel = syncobj::create(false);
+        assert_eq!(
+            exec(&gpu, A, ch_a, &[push(PUSH_VA, 16)], &[], &[sync(rel)]),
+            Ok(0)
+        );
+        test_clock::advance(syncobj::FENCE_TIMEOUT_US + 1);
+        assert_eq!(syncobj::query(rel), Some(1), "reached, by the timeout");
+        let before = FAKE_RM.lock().calls.len();
+        assert_eq!(
+            vm_bind_sync(
+                &gpu,
+                A,
+                &mut [unmap(VA, 65536)],
+                nv::VM_BIND_RUN_ASYNC,
+                &[sync(rel)],
+                &[sync(late)]
+            ),
+            Err(nv::EIO),
+            "the release never happened"
+        );
+        assert_eq!(driver_maps(&gpu, A).len(), bound + 1);
+        assert_eq!(syncobj::query(late), Some(0));
+        assert_eq!(rm_calls_since(before), [] as [&str; 0]);
+        // An op the bind refuses leaves its sigs unsignaled: the fence of
+        // a failed bind never fires (Linux: the job never ran).
+        assert_eq!(
+            vm_bind_sync(
+                &gpu,
+                A,
+                &mut [unmap(VA + 1, 65536)],
+                nv::VM_BIND_RUN_ASYNC,
+                &[sync(ready)],
+                &[sync(late)]
+            ),
+            Err(nv::EINVAL),
+            "off the page"
+        );
+        assert_eq!(
+            syncobj::query(late),
+            Some(0),
+            "not signaled: nothing was bound"
+        );
+        // Unknown handles are ENOENT before anything is bound or signaled,
+        // a sig as much as a wait.
+        assert_eq!(
+            vm_bind_sync(
+                &gpu,
+                A,
+                &mut [unmap(VA, 65536)],
+                nv::VM_BIND_RUN_ASYNC,
+                &[sync(ready)],
+                &[sync(late), sync(0xdead_0001)]
+            ),
+            Err(nv::ENOENT)
+        );
+        assert_eq!(
+            vm_bind_sync(
+                &gpu,
+                A,
+                &mut [unmap(VA, 65536)],
+                nv::VM_BIND_RUN_ASYNC,
+                &[sync(0xdead_0002)],
+                &[sync(late)]
+            ),
+            Err(nv::ENOENT)
+        );
+        assert_eq!(driver_maps(&gpu, A).len(), bound + 1);
+        assert_eq!(syncobj::query(late), Some(0));
+        assert_eq!(rm_calls_since(before), [] as [&str; 0]);
+        // NVK's batch: 4096 ops in one call, and 256 syncs.
+        let mut many: Vec<_> = (0..4096)
+            .map(|i| unmap(VA + 0x1000_0000 + i * 4096, 4096))
+            .collect();
+        assert_eq!(
+            vm_bind_sync(
+                &gpu,
+                A,
+                &mut many,
+                nv::VM_BIND_RUN_ASYNC,
+                &[],
+                &[sync(late)]
+            ),
+            Ok(0),
+            "4096 ops"
+        );
+        assert_eq!(syncobj::query(late), Some(1));
+        many.push(unmap(VA + 0x2000_0000, 4096));
+        assert_eq!(
+            vm_bind_sync(&gpu, A, &mut many, nv::VM_BIND_RUN_ASYNC, &[], &[]),
+            Err(nv::EOPNOTSUPP),
+            "4097 ops"
+        );
+        let waits: Vec<_> = (0..256).map(|_| sync(ready)).collect();
+        assert_eq!(
+            vm_bind_sync(
+                &gpu,
+                A,
+                &mut [],
+                nv::VM_BIND_RUN_ASYNC,
+                &waits,
+                &[sync_tl(only, 5)]
+            ),
+            Ok(0),
+            "256 waits"
+        );
+        assert_eq!(syncobj::query(only), Some(5));
+        let waits: Vec<_> = (0..257).map(|_| sync(ready)).collect();
+        assert_eq!(
+            vm_bind_sync(&gpu, A, &mut [], nv::VM_BIND_RUN_ASYNC, &waits, &[]),
+            Err(nv::EOPNOTSUPP),
+            "257 waits"
+        );
+        assert_eq!(driver_maps(&gpu, A).len(), bound + 1);
+        for h in [ready, tl, done, fence_tl, only, never, late, rel] {
+            syncobj::destroy(h);
+        }
         assert_eq!(FAKE_RM.lock().bad, 0);
     }
 
