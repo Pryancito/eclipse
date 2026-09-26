@@ -38,8 +38,23 @@ fn validate_iovec_buffers<P: kernel_hal::user::Policy>(
     Ok(())
 }
 
+/// What a gather does with a write the VMO refused for lack of room once
+/// earlier iovecs went in: nothing, since `zx_stream_writev` answers the
+/// bytes it wrote and a caller retries from there. It used to answer
+/// `OUT_OF_RANGE` for the whole call after the VMO filled part-way through
+/// the vector, so the bytes already written were reported as not written.
+/// A refusal before anything went in, or for any other reason, is still the
+/// caller's error.
+fn stream_full(error: ZxError, written: usize) -> ZxResult {
+    if error == ZxError::OUT_OF_RANGE && written > 0 {
+        Ok(())
+    } else {
+        Err(error)
+    }
+}
+
 impl Syscall<'_> {
-    /// Create a stream from a VMO.    
+    /// Create a stream from a VMO.
     ///   
     /// Stream for reads and writes the data in an underlying VMO.  
     pub fn sys_stream_create(
@@ -102,8 +117,13 @@ impl Syscall<'_> {
         validate_iovec_buffers(proc, &data, MMUFlags::READ)?;
         let mut actual_count = 0;
         for io_vec in data.iter() {
-            actual_count +=
-                stream.write(io_vec.as_slice()?, options.contains(WriteOptions::APPEND))?;
+            match stream.write(io_vec.as_slice()?, options.contains(WriteOptions::APPEND)) {
+                Ok(count) => actual_count += count,
+                Err(error) => {
+                    stream_full(error, actual_count)?;
+                    break;
+                }
+            }
         }
         actual_count_ptr.write_if_not_null(actual_count)?;
         Ok(())
@@ -133,7 +153,13 @@ impl Syscall<'_> {
         validate_iovec_buffers(proc, &data, MMUFlags::READ)?;
         let mut actual_count = 0;
         for io_vec in data.iter() {
-            actual_count += stream.write_at(io_vec.as_slice()?, offset)?;
+            match stream.write_at(io_vec.as_slice()?, offset) {
+                Ok(count) => actual_count += count,
+                Err(error) => {
+                    stream_full(error, actual_count)?;
+                    break;
+                }
+            }
             offset += io_vec.len();
         }
         actual_count_ptr.write_if_not_null(actual_count)?;

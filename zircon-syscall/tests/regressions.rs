@@ -359,3 +359,69 @@ fn info_versions_preserve_short_buffer_counts_and_boundaries() {
         Box::pin(async move { drop(ct) })
     });
 }
+
+/// `zx_stream_writev` answers the bytes it wrote when the VMO fills part-way
+/// through the vector: a 4096-byte VMO takes 3000 + 1096 of three iovecs and
+/// says 4096. It used to answer `OUT_OF_RANGE` for the call, once the iovec
+/// after the one that filled it was refused, so the caller was told nothing
+/// went in and sent the head of its data again. Only a write with no room at
+/// all is an error.
+#[test]
+fn stream_writev_answers_what_it_wrote_when_the_vmo_fills_mid_vector() {
+    use zircon_object::vm::{Stream, StreamOptions};
+    with_test_thread(|ct| {
+        let base = map_user_memory(&ct);
+        let vmo = VmObject::new_paged(1);
+        vmo.set_content_size(0).unwrap();
+        let stream = ct.proc().add_handle(Handle::new(
+            Stream::create(vmo.clone(), 0, StreamOptions::MODE_WRITE.bits()),
+            Rights::DEFAULT_STREAM | Rights::WRITE,
+        ));
+        let (a, b, c) = (base + 8192, base + 12288, base + 16384);
+        unsafe {
+            core::ptr::write_bytes(a as *mut u8, b'a', 3000);
+            core::ptr::write_bytes(b as *mut u8, b'b', 3000);
+            core::ptr::write_bytes(c as *mut u8, b'c', 10);
+            (base as *mut [[usize; 2]; 3]).write([[a, 3000], [b, 3000], [c, 10]]);
+        }
+        let actual = base + 256;
+        let sc = Syscall {
+            thread: &ct,
+            thread_fn: finish_thread,
+        };
+        sc.sys_stream_writev(stream, 0, base.into(), 3, actual.into())
+            .unwrap();
+        let mut content = [0u8; PAGE_SIZE];
+        vmo.read(0, &mut content).unwrap();
+        unsafe {
+            assert_eq!((actual as *const usize).read(), PAGE_SIZE);
+        }
+        assert!(content[..3000].iter().all(|&byte| byte == b'a'));
+        assert!(content[3000..].iter().all(|&byte| byte == b'b'));
+        // The seek is at the end now: a write with no room at all is refused.
+        unsafe {
+            (base as *mut [[usize; 2]; 1]).write([[c, 10]]);
+        }
+        assert_eq!(
+            sc.sys_stream_writev(stream, 0, base.into(), 1, actual.into()),
+            Err(ZxError::OUT_OF_RANGE)
+        );
+        // The same by offset: two iovecs from 2000 fill the page and say so.
+        unsafe {
+            (base as *mut [[usize; 2]; 2]).write([[c, 10], [b, 3000]]);
+        }
+        sc.sys_stream_writev_at(stream, 0, 2000, base.into(), 2, actual.into())
+            .unwrap();
+        unsafe {
+            assert_eq!((actual as *const usize).read(), PAGE_SIZE - 2000);
+        }
+        vmo.read(0, &mut content).unwrap();
+        assert!(content[2000..2010].iter().all(|&byte| byte == b'c'));
+        assert!(content[2010..].iter().all(|&byte| byte == b'b'));
+        assert_eq!(
+            sc.sys_stream_writev_at(stream, 0, PAGE_SIZE, base.into(), 2, actual.into()),
+            Err(ZxError::OUT_OF_RANGE)
+        );
+        Box::pin(async move { drop(ct) })
+    });
+}
