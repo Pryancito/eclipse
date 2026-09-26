@@ -616,6 +616,44 @@ impl Syscall<'_> {
         Ok(mode as u16)
     }
 
+    /// What `truncate(2)` says about the type of what the path names, before
+    /// it asks anything about permissions (`do_sys_truncate`, `fs/open.c`):
+    ///
+    /// ```c
+    /// error = -EISDIR;
+    /// if (S_ISDIR(inode->i_mode)) goto dput_and_out;
+    /// error = -EINVAL;
+    /// if (!S_ISREG(inode->i_mode)) goto dput_and_out;
+    /// ...
+    /// error = inode_permission(idmap, inode, MAY_WRITE);
+    /// ```
+    ///
+    /// Nothing asked this here: the write check went first, so `truncate`
+    /// of a directory the caller could not write was `EACCES`, and of a
+    /// device, a fifo or a socket in a ramfs it was whatever `resize` on a
+    /// non-file answered (`EISDIR`, for a character device).
+    fn truncate_type(type_: FileType) -> linux_object::error::LxResult {
+        match type_ {
+            FileType::Dir => Err(LxError::EISDIR),
+            FileType::File => Ok(()),
+            _ => Err(LxError::EINVAL),
+        }
+    }
+
+    /// What `ftruncate(2)` says about the type of what the descriptor is open
+    /// on: `EINVAL` for anything but a regular file (`do_sys_ftruncate`:
+    /// `if (!S_ISREG(inode->i_mode) || !(f.file->f_mode & FMODE_WRITE))
+    /// goto out_putf;` with `error = -EINVAL`). A directory is not `EISDIR`
+    /// here, unlike `truncate`; the descriptor's own openness for writing is
+    /// still the file's to judge.
+    fn ftruncate_type(type_: FileType) -> linux_object::error::LxResult {
+        if type_ == FileType::File {
+            Ok(())
+        } else {
+            Err(LxError::EINVAL)
+        }
+    }
+
     /// cause the regular file named by path to be truncated to a size of precisely length bytes.
     pub fn sys_truncate(&self, path: UserInPtr<u8>, len: usize) -> SysResult {
         let path = path.as_c_str()?;
@@ -624,6 +662,7 @@ impl Syscall<'_> {
         let proc = self.linux_process();
         let inode = proc.lookup_inode(path)?;
         let metadata = inode.metadata()?;
+        Self::truncate_type(metadata.type_)?;
         proc.check_access(&metadata, 0o2, true)?;
         inode
             .resize(len)
@@ -640,6 +679,7 @@ impl Syscall<'_> {
         let len = linux_object::fs::user_len(len)?;
         let proc = self.linux_process();
         let file = proc.get_file(fd)?;
+        Self::ftruncate_type(file.metadata()?.type_)?;
         // The desktop OOM was a single ftruncate growing one RAM-backed file
         // to ~456 MiB (117k live 4 KiB ramfs blocks in one resize). Name any
         // suspicious-sized truncate loudly: which file, how big, and who.
@@ -2315,7 +2355,7 @@ impl Syscall<'_> {
         flags: usize,
     ) -> SysResult {
         let path = path.as_c_str()?;
-        let flags = AtFlags::from_bits_truncate(flags);
+        let flags = super::dir::at_flags(flags, super::dir::FACCESSAT_FLAGS)?;
         info!(
             "faccessat: dirfd={:?}, path={:?}, mode={:#o}, flags={:?}",
             dirfd, path, mode, flags
@@ -2349,10 +2389,16 @@ impl Syscall<'_> {
         flags: usize,
     ) -> SysResult {
         let path = path.as_c_str()?;
-        let flags = AtFlags::from_bits_truncate(flags);
+        let flags = super::dir::at_flags(flags, super::dir::FCHMODAT_FLAGS)?;
         let follow = !flags.contains(AtFlags::SYMLINK_NOFOLLOW);
         let proc = self.linux_process();
-        let inode = proc.lookup_inode_at(dirfd, path, follow)?;
+        // `AT_EMPTY_PATH` names the file `dirfd` is open on (`do_fchmodat`
+        // takes `LOOKUP_EMPTY`); without it an empty path is `ENOENT`.
+        let inode = if flags.contains(AtFlags::EMPTY_PATH) && path.is_empty() {
+            super::dir::inode_of_dirfd(proc, dirfd)?
+        } else {
+            proc.lookup_inode_at(dirfd, path, follow)?
+        };
         let mut metadata = inode.metadata()?;
         proc.chmod_metadata(&mut metadata, mode as u16)?;
         inode.set_metadata(&metadata)?;
@@ -2907,6 +2953,56 @@ mod seek_and_access_tests {
         assert_eq!(Syscall::access_mode(0o10), Err(LxError::EINVAL));
         assert_eq!(Syscall::access_mode(0o17), Err(LxError::EINVAL));
         assert_eq!(Syscall::access_mode(usize::MAX), Err(LxError::EINVAL));
+    }
+}
+
+#[cfg(test)]
+mod truncate_type_tests {
+    use super::*;
+
+    /// Every type `rcore_fs` names that is not a regular file or a directory.
+    const OTHER_TYPES: [FileType; 5] = [
+        FileType::SymLink,
+        FileType::CharDevice,
+        FileType::BlockDevice,
+        FileType::NamedPipe,
+        FileType::Socket,
+    ];
+
+    #[test]
+    fn truncate_takes_a_regular_file_and_nothing_else() {
+        assert_eq!(Syscall::truncate_type(FileType::File), Ok(()));
+        // `do_sys_truncate`: a directory is EISDIR, ahead of the permission
+        // check. It used to be EACCES for a directory the caller could not
+        // write, and EISDIR only because the ramfs said so for the rest.
+        assert_eq!(Syscall::truncate_type(FileType::Dir), Err(LxError::EISDIR));
+        // Not a regular file: EINVAL. A character device in a ramfs used to
+        // get the ramfs's own answer for "not a file", which is EISDIR.
+        for type_ in OTHER_TYPES {
+            assert_eq!(
+                Syscall::truncate_type(type_),
+                Err(LxError::EINVAL),
+                "{:?}",
+                type_
+            );
+        }
+    }
+
+    #[test]
+    fn ftruncate_is_einval_on_anything_but_a_regular_file_a_directory_included() {
+        assert_eq!(Syscall::ftruncate_type(FileType::File), Ok(()));
+        // `do_sys_ftruncate` has one errno for every non-file, and it is
+        // not `truncate`'s EISDIR: `if (!S_ISREG(inode->i_mode) || ...)
+        // goto out_putf;` with `error = -EINVAL`.
+        assert_eq!(Syscall::ftruncate_type(FileType::Dir), Err(LxError::EINVAL));
+        for type_ in OTHER_TYPES {
+            assert_eq!(
+                Syscall::ftruncate_type(type_),
+                Err(LxError::EINVAL),
+                "{:?}",
+                type_
+            );
+        }
     }
 }
 

@@ -882,6 +882,17 @@ pub(crate) const LINKAT_FLAGS: usize = AtFlags::SYMLINK_FOLLOW.bits() | AtFlags:
 pub(crate) const FCHOWNAT_FLAGS: usize =
     AtFlags::SYMLINK_NOFOLLOW.bits() | AtFlags::EMPTY_PATH.bits();
 
+/// What `faccessat2(2)` accepts (`do_faccessat`, `fs/open.c`: `if (flags &
+/// ~(AT_EACCESS | AT_SYMLINK_NOFOLLOW)) return -EINVAL;`).
+pub(crate) const FACCESSAT_FLAGS: usize =
+    AtFlags::EACCESS.bits() | AtFlags::SYMLINK_NOFOLLOW.bits();
+
+/// What `fchmodat2(2)` accepts (`do_fchmodat`, `fs/open.c`), which is what
+/// the FreeBSD `fchmodat` translation hands `sys_fchmodat`; the Linux
+/// `fchmodat` number carries no flags at all.
+pub(crate) const FCHMODAT_FLAGS: usize =
+    AtFlags::SYMLINK_NOFOLLOW.bits() | AtFlags::EMPTY_PATH.bits();
+
 /// The file `dirfd` is open on, for a syscall given `AT_EMPTY_PATH` and an
 /// empty path (`LOOKUP_EMPTY`): `AT_FDCWD` names the working directory.
 pub(crate) fn inode_of_dirfd(
@@ -1420,7 +1431,14 @@ mod at_flags_tests {
 
     #[test]
     fn a_bit_no_syscall_knows_is_einval_everywhere() {
-        for allowed in [FSTATAT_FLAGS, STATX_FLAGS, LINKAT_FLAGS, FCHOWNAT_FLAGS] {
+        for allowed in [
+            FSTATAT_FLAGS,
+            STATX_FLAGS,
+            LINKAT_FLAGS,
+            FCHOWNAT_FLAGS,
+            FACCESSAT_FLAGS,
+            FCHMODAT_FLAGS,
+        ] {
             assert_eq!(at_flags(0, allowed), Ok(AtFlags::empty()));
             for bit in 0..usize::BITS as usize {
                 let flag = 1usize << bit;

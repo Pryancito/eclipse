@@ -269,25 +269,28 @@ impl Syscall<'_> {
     ) -> SysResult {
         let hdr = header.read()?;
         info!("capget: version={:#x}, pid={}", hdr.version, hdr.pid);
-        let elems = match cap_version_elems(hdr.version) {
-            Some(n) => n,
-            None => {
-                header.write(CapUserHeader {
-                    version: LINUX_CAPABILITY_VERSION_3,
-                    pid: hdr.pid,
-                })?;
-                return Err(LxError::EINVAL);
-            }
+        if cap_version_elems(hdr.version).is_none() {
+            header.write(CapUserHeader {
+                version: LINUX_CAPABILITY_VERSION_3,
+                pid: hdr.pid,
+            })?;
+        }
+        let elems = match capget_plan(hdr.version, hdr.pid, data.is_null())? {
+            Some(elems) => elems,
+            None => return Ok(0),
         };
-        if hdr.pid < 0 {
-            return Err(LxError::EINVAL);
-        }
-        if data.is_null() {
-            return Ok(0);
-        }
-        // Built out of the same predicate every gate asks, so what this
-        // publishes and what the kernel honours cannot drift apart.
-        let caps = linux_object::process::published_capabilities(self.linux_process().euid());
+        // `cap_get_target_pid`: the caller's own sets, or those of the task
+        // `pid` names, which must exist (`ESRCH`). Built out of the same
+        // predicate every gate asks, so what this publishes and what the
+        // kernel honours cannot drift apart.
+        let euid = if capget_names_the_caller(hdr.pid, self.zircon_process().id()) {
+            self.linux_process().euid()
+        } else {
+            process_of_task(hdr.pid as KoID)
+                .and_then(|p| p.try_linux().map(|lp| lp.euid()))
+                .ok_or(LxError::ESRCH)?
+        };
+        let caps = linux_object::process::published_capabilities(euid);
         let mut out = [CapUserData::default(); 2];
         out[0].effective = caps as u32;
         out[0].permitted = caps as u32;
@@ -300,11 +303,18 @@ impl Syscall<'_> {
     /// set capabilities of a process
     /// (see [linux man capset(2)](https://www.man7.org/linux/man-pages/man2/capset.2.html)).
     ///
-    /// Version/pid validation matches [`sys_capget`](Self::sys_capget); the new
-    /// sets are then accepted without being stored — every root process already
-    /// holds the full set here and there is no privilege machinery for a
-    /// reduced set to constrain. Capability-dropping daemons proceed as if it
-    /// worked, which on this single-user kernel it effectively has.
+    /// The version negotiation is [`sys_capget`](Self::sys_capget)'s; then
+    /// Linux's own order (`SYSCALL_DEFINE2(capset)`, then `cap_capset`): the
+    /// call may only affect the caller (`EPERM` for any other pid, negative
+    /// ones included: there is no `EINVAL` for a bad pid here, unlike
+    /// `capget`), and the new sets must fit inside the old ones
+    /// ([`capset_sets_verdict`]). A set that passes is then accepted without
+    /// being stored: every root process holds the full set here and there is
+    /// no privilege machinery for a reduced set to constrain, so a daemon
+    /// dropping capabilities proceeds as if it worked, which on this
+    /// single-user kernel it effectively has. What is refused is what Linux
+    /// refuses: an unprivileged process granting itself capabilities, or
+    /// anyone making effective what is not permitted.
     pub fn sys_capset(
         &self,
         mut header: UserInOutPtr<CapUserHeader>,
@@ -322,10 +332,18 @@ impl Syscall<'_> {
                 return Err(LxError::EINVAL);
             }
         };
-        if hdr.pid < 0 {
-            return Err(LxError::EINVAL);
-        }
-        let _sets = data.read_array(elems)?;
+        capset_target(hdr.pid, self.zircon_process().id())?;
+        let new = CapSets::from_user(&data.read_array(elems)?);
+        // What this process holds now: the published set is both its
+        // permitted and its effective set, nothing is inheritable, and the
+        // bounding set is every capability (`PR_CAPBSET_READ` says so).
+        let held = linux_object::process::published_capabilities(self.linux_process().euid());
+        let old = CapSets {
+            effective: held,
+            permitted: held,
+            inheritable: 0,
+        };
+        capset_sets_verdict(&old, CAP_FULL_SET, &new)?;
         Ok(0)
     }
 
@@ -1070,6 +1088,135 @@ fn cap_version_elems(version: u32) -> Option<usize> {
     }
 }
 
+/// Every capability there is: the bounding set of a process nothing has
+/// ever narrowed (`CAP_FULL_SET`).
+const CAP_FULL_SET: u64 = (1u64 << (linux_object::process::CAP_LAST_CAP + 1)) - 1;
+
+/// What `capget(2)` does before it looks at any process, from
+/// `SYSCALL_DEFINE2(capget)`:
+///
+/// ```c
+/// ret = cap_validate_magic(header, &tocopy);
+/// if ((dataptr == NULL) || (ret != 0))
+///         return ((dataptr == NULL) && (ret == -EINVAL)) ? 0 : ret;
+/// if (get_user(pid, &header->pid)) return -EFAULT;
+/// if (pid < 0) return -EINVAL;
+/// ```
+///
+/// `Ok(None)` is the probe: a null `data` is answered 0 whatever the header
+/// says, after the version was written back if it was unknown. That is how
+/// libcap learns the kernel's version (`capget(&hdr, NULL)` with version 0).
+/// It used to be `EINVAL` here whenever the version was unknown, null data or
+/// not, and `EINVAL` for a negative pid ahead of the null test as well.
+/// `Ok(Some(n))` is a real read of `n` elements.
+fn capget_plan(version: u32, pid: i32, data_is_null: bool) -> LxResult<Option<usize>> {
+    let elems = cap_version_elems(version);
+    if data_is_null {
+        return Ok(None);
+    }
+    let elems = elems.ok_or(LxError::EINVAL)?;
+    if pid < 0 {
+        return Err(LxError::EINVAL);
+    }
+    Ok(Some(elems))
+}
+
+/// Whether a `capget` `pid` names the caller: 0, or its own process id
+/// (`cap_get_target_pid`: `if (pid && (pid != task_pid_vnr(current)))`
+/// looks the task up, else `current`).
+fn capget_names_the_caller(pid: i32, self_pid: KoID) -> bool {
+    pid == 0 || pid as KoID == self_pid
+}
+
+/// The process the task `pid` belongs to: the process of that id, or the
+/// one owning a thread of that id, since Linux's `find_task_by_vpid` takes a
+/// TID. `None` when there is no such task.
+fn process_of_task(pid: KoID) -> Option<Arc<zircon_object::task::Process>> {
+    linux_object::process::find_process(pid).or_else(|| {
+        linux_object::process::all_live_processes()
+            .into_iter()
+            .find(|proc| proc.get_child(pid).is_ok())
+    })
+}
+
+/// `capset(2)`'s only target is the caller: `SYSCALL_DEFINE2(capset)`, `/*
+/// may only affect current now */ if (pid != 0 && pid != task_pid_vnr(current))
+/// return -EPERM;`. There is no `EINVAL` for a negative pid, unlike `capget`:
+/// -1 is just another process that is not the caller.
+///
+/// It used to answer 0 for any other pid, which told `setcap`-style tooling
+/// and anything that drops another process's capabilities that it had.
+fn capset_target(pid: i32, self_pid: KoID) -> LxResult {
+    if pid == 0 || pid as KoID == self_pid {
+        Ok(())
+    } else {
+        Err(LxError::EPERM)
+    }
+}
+
+/// The three capability sets as 64-bit masks, assembled from the one or two
+/// `CapUserData` elements the negotiated version transfers. Version 1
+/// sends one element, and the upper 32 bits are then zero (the kernel:
+/// `if (i < tocopy) ... else effective.val |= 0`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CapSets {
+    effective: u64,
+    permitted: u64,
+    inheritable: u64,
+}
+
+impl CapSets {
+    fn from_user(data: &[CapUserData]) -> Self {
+        let mut sets = CapSets {
+            effective: 0,
+            permitted: 0,
+            inheritable: 0,
+        };
+        for (i, elem) in data.iter().take(2).enumerate() {
+            let shift = 32 * i as u32;
+            sets.effective |= (elem.effective as u64) << shift;
+            sets.permitted |= (elem.permitted as u64) << shift;
+            sets.inheritable |= (elem.inheritable as u64) << shift;
+        }
+        sets
+    }
+}
+
+/// `cap_capset` (`security/commoncap.c`): may a process holding `old`, with
+/// bounding set `bset`, make `new` its sets? Four subset tests, each
+/// `EPERM`, in the kernel's order:
+///
+/// ```c
+/// if (!cap_issubset(*inheritable, cap_combine(old->cap_inheritable, old->cap_permitted)))
+///         return -EPERM;   /* incapable of using this inheritable set */
+/// if (!cap_issubset(*inheritable, cap_combine(old->cap_inheritable, old->cap_bset)))
+///         return -EPERM;   /* no new pI capabilities outside bounding set */
+/// if (!cap_issubset(*permitted, old->cap_permitted))
+///         return -EPERM;   /* verify restrictions on target's new Permitted set */
+/// if (!cap_issubset(*effective, *permitted))
+///         return -EPERM;   /* verify the _new_Effective_ is a subset of the _new_Permitted_ */
+/// ```
+///
+/// A set may only ever shrink: nothing checked this before, so a process
+/// running as any user could `capset` itself every capability and be told
+/// it had them (nothing stored them, but the answer was the lie).
+fn capset_sets_verdict(old: &CapSets, bset: u64, new: &CapSets) -> LxResult {
+    let subset = |part: u64, whole: u64| part & !whole == 0;
+    if !subset(new.inheritable, old.inheritable | old.permitted) {
+        return Err(LxError::EPERM);
+    }
+    if !subset(new.inheritable, old.inheritable | bset) {
+        return Err(LxError::EPERM);
+    }
+    if !subset(new.permitted, old.permitted) {
+        return Err(LxError::EPERM);
+    }
+    if !subset(new.effective, new.permitted) {
+        return Err(LxError::EPERM);
+    }
+    Ok(())
+}
+
 /// `IOPRIO_CLASS_SHIFT`: the class sits above a 13-bit level.
 const IOPRIO_CLASS_SHIFT: u16 = 13;
 /// `IOPRIO_CLASS_NONE`: never set; reads as the nice-derived best-effort.
@@ -1324,6 +1471,179 @@ mod capability_tests {
         for v in [0u32, 1, 0x2008_0523, u32::MAX] {
             assert_eq!(cap_version_elems(v), None, "version {:#x}", v);
         }
+    }
+
+    const V1: u32 = LINUX_CAPABILITY_VERSION_1;
+    const V3: u32 = LINUX_CAPABILITY_VERSION_3;
+
+    #[test]
+    fn a_capget_with_null_data_is_a_probe_that_always_answers_zero() {
+        // libcap: `capget(&hdr, NULL)` with version 0 to learn the kernel's
+        // version from the written-back header. The kernel answers 0 to a
+        // null `dataptr` whatever the header held, even a negative pid.
+        assert_eq!(capget_plan(0, 0, true), Ok(None));
+        assert_eq!(capget_plan(V3, 0, true), Ok(None));
+        assert_eq!(capget_plan(0, -1, true), Ok(None));
+        assert_eq!(capget_plan(V3, -1, true), Ok(None));
+    }
+
+    #[test]
+    fn a_capget_that_reads_needs_a_known_version_and_a_non_negative_pid() {
+        assert_eq!(capget_plan(V1, 0, false), Ok(Some(1)));
+        assert_eq!(capget_plan(V3, 42, false), Ok(Some(2)));
+        // The version first, then the pid: `cap_validate_magic` runs before
+        // the pid is even read.
+        assert_eq!(capget_plan(0, 0, false), Err(LxError::EINVAL));
+        assert_eq!(capget_plan(0, -1, false), Err(LxError::EINVAL));
+        assert_eq!(capget_plan(V3, -1, false), Err(LxError::EINVAL));
+        assert_eq!(capget_plan(V3, i32::MIN, false), Err(LxError::EINVAL));
+    }
+
+    #[test]
+    fn capget_looks_up_any_pid_but_zero_and_its_own() {
+        assert!(capget_names_the_caller(0, 7));
+        assert!(capget_names_the_caller(7, 7));
+        // Another process: `cap_get_target_pid` finds it (or ESRCH). It used
+        // to be answered with the caller's own sets, whether it existed or not.
+        assert!(!capget_names_the_caller(8, 7));
+        assert!(!capget_names_the_caller(1, 7));
+    }
+
+    #[test]
+    fn capset_may_only_affect_the_caller_and_says_eperm_to_everyone_else() {
+        assert_eq!(capset_target(0, 7), Ok(()));
+        assert_eq!(capset_target(7, 7), Ok(()));
+        // Another pid, existing or not, was answered 0 before.
+        assert_eq!(capset_target(8, 7), Err(LxError::EPERM));
+        assert_eq!(capset_target(1, 7), Err(LxError::EPERM));
+        // `SYSCALL_DEFINE2(capset)` has no `pid < 0` rule: -1 is EPERM like
+        // any other pid that is not the caller, not capget's EINVAL.
+        assert_eq!(capset_target(-1, 7), Err(LxError::EPERM));
+        assert_eq!(capset_target(i32::MIN, 7), Err(LxError::EPERM));
+    }
+
+    #[test]
+    fn the_sets_are_assembled_low_element_first_and_v1_leaves_the_top_half_zero() {
+        let low = CapUserData {
+            effective: 0x1,
+            permitted: 0x3,
+            inheritable: 0x7,
+        };
+        let high = CapUserData {
+            effective: 0x10,
+            permitted: 0x30,
+            inheritable: 0x70,
+        };
+        assert_eq!(
+            CapSets::from_user(&[low]),
+            CapSets {
+                effective: 0x1,
+                permitted: 0x3,
+                inheritable: 0x7
+            }
+        );
+        assert_eq!(
+            CapSets::from_user(&[low, high]),
+            CapSets {
+                effective: 0x10_0000_0001,
+                permitted: 0x30_0000_0003,
+                inheritable: 0x70_0000_0007
+            }
+        );
+        assert_eq!(
+            CapSets::from_user(&[]),
+            CapSets {
+                effective: 0,
+                permitted: 0,
+                inheritable: 0
+            }
+        );
+    }
+
+    #[test]
+    fn the_full_set_is_every_capability_up_to_cap_last_cap() {
+        use linux_object::process::CAP_LAST_CAP;
+        assert_eq!(CAP_FULL_SET.count_ones(), CAP_LAST_CAP + 1);
+        assert_ne!(CAP_FULL_SET & (1 << CAP_LAST_CAP), 0);
+        assert_eq!(CAP_FULL_SET & (1 << (CAP_LAST_CAP + 1)), 0);
+    }
+
+    fn sets(effective: u64, permitted: u64, inheritable: u64) -> CapSets {
+        CapSets {
+            effective,
+            permitted,
+            inheritable,
+        }
+    }
+
+    #[test]
+    fn a_process_may_drop_capabilities_but_never_gain_them() {
+        let root = sets(CAP_FULL_SET, CAP_FULL_SET, 0);
+        // Dropping to a subset, or to nothing, is what daemons do.
+        assert_eq!(
+            capset_sets_verdict(&root, CAP_FULL_SET, &sets(0x3, 0x3, 0)),
+            Ok(())
+        );
+        assert_eq!(
+            capset_sets_verdict(&root, CAP_FULL_SET, &sets(0, 0, 0)),
+            Ok(())
+        );
+        assert_eq!(capset_sets_verdict(&root, CAP_FULL_SET, &root), Ok(()));
+        // An unprivileged process holds nothing, so any bit is a gain: EPERM.
+        // It used to be answered 0.
+        let nobody = sets(0, 0, 0);
+        assert_eq!(capset_sets_verdict(&nobody, CAP_FULL_SET, &nobody), Ok(()));
+        assert_eq!(
+            capset_sets_verdict(&nobody, CAP_FULL_SET, &sets(0, 0x1, 0)),
+            Err(LxError::EPERM)
+        );
+        assert_eq!(
+            capset_sets_verdict(&nobody, CAP_FULL_SET, &sets(0, 0, 0x1)),
+            Err(LxError::EPERM)
+        );
+        // A permitted bit outside the old permitted set is a gain for root
+        // too: bit 41 is above CAP_LAST_CAP and root does not hold it.
+        assert_eq!(
+            capset_sets_verdict(&root, CAP_FULL_SET, &sets(0, 1 << 41, 0)),
+            Err(LxError::EPERM)
+        );
+    }
+
+    #[test]
+    fn the_effective_set_must_fit_in_the_new_permitted_set() {
+        let root = sets(CAP_FULL_SET, CAP_FULL_SET, 0);
+        // Keep bit 0 permitted and make bit 1 effective: `cap_capset`'s
+        // last test, against the NEW permitted set, not the old one.
+        assert_eq!(
+            capset_sets_verdict(&root, CAP_FULL_SET, &sets(0x2, 0x1, 0)),
+            Err(LxError::EPERM)
+        );
+        assert_eq!(
+            capset_sets_verdict(&root, CAP_FULL_SET, &sets(0x1, 0x1, 0)),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn the_inheritable_set_is_bounded_by_what_is_held_and_by_the_bounding_set() {
+        let held = sets(0x7, 0x7, 0x8);
+        // Old inheritable | old permitted = 0xf; bit 4 is in neither.
+        assert_eq!(
+            capset_sets_verdict(&held, CAP_FULL_SET, &sets(0, 0x7, 0xf)),
+            Ok(())
+        );
+        assert_eq!(
+            capset_sets_verdict(&held, CAP_FULL_SET, &sets(0, 0x7, 0x10)),
+            Err(LxError::EPERM)
+        );
+        // Bit 2 is permitted but outside a bounding set of {0, 1, 3}: no new
+        // inheritable capability outside the bounding set.
+        assert_eq!(
+            capset_sets_verdict(&held, 0xb, &sets(0, 0x7, 0x4)),
+            Err(LxError::EPERM)
+        );
+        // ...unless it was inheritable already (old inheritable | bset).
+        assert_eq!(capset_sets_verdict(&held, 0x7, &sets(0, 0x7, 0x8)), Ok(()));
     }
 }
 
