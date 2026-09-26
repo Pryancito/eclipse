@@ -90,6 +90,38 @@ pub fn count_processes() -> (usize, usize) {
     (total, running)
 }
 
+/// Linux's `nr_threads`: how many live TASKS there are, which is what both
+/// the denominator of `/proc/loadavg` and the `procs` field of `sysinfo(2)`
+/// are (`loadavg_proc_show`, `do_sysinfo`).
+///
+/// Both printed a count of PROCESSES, and the two numbers differ by every
+/// thread any program has started -- which is most of them: a shell with one
+/// job, a JVM, or anything linked against a runtime with a reaper thread. The
+/// denominator being the smaller of the two is what made `x/y` come out with
+/// `x` bigger than `y` (see [`loadavg_tasks`]), and `top`, which parses that
+/// field as its task total, showed fewer tasks than it was listing.
+pub fn count_threads() -> usize {
+    let mut procs = Vec::new();
+    collect(&ROOT_JOB, &mut procs);
+    procs.iter().map(|p| p.thread_count()).sum()
+}
+
+/// The `running/total` pair `/proc/loadavg` prints, from the runnable count
+/// and the live thread count.
+///
+/// Two floors that the raw numbers do not have. `total` is at least 1,
+/// because the process doing the read is itself a live task and a `0` there
+/// makes every parser that divides by it fall over. `running` is at least 1
+/// for the same reason and never more than `total`: the runnable count comes
+/// from the executor's run queue, which counts kernel tasks the thread walk
+/// above knows nothing about, so on an idle box with one process it read as
+/// `2/1` -- two of one task running, which `top` renders as a task count that
+/// goes backwards.
+pub fn loadavg_tasks(runnable: usize, threads: usize) -> (usize, usize) {
+    let total = threads.max(1);
+    (runnable.saturating_add(1).min(total), total)
+}
+
 /// Number of runnable tasks system-wide, excluding the caller.
 ///
 /// Prefers the executor's run-queue length (queued + currently-polled tasks,
@@ -406,5 +438,27 @@ mod loadavg_tests {
             "the cap covers {}s, less than the 15-minute window",
             covered,
         );
+    }
+
+    /// The pair `/proc/loadavg` prints. `2/1` was what an idle box with one
+    /// process actually showed.
+    #[test]
+    fn the_running_count_never_passes_the_total() {
+        assert_eq!(loadavg_tasks(0, 1), (1, 1));
+        assert_eq!(loadavg_tasks(5, 1), (1, 1));
+        assert_eq!(loadavg_tasks(3, 40), (4, 40));
+    }
+
+    /// Nothing may divide by zero on this line, and the reader itself is a
+    /// live task, so neither field is ever 0.
+    #[test]
+    fn neither_field_is_ever_zero() {
+        assert_eq!(loadavg_tasks(0, 0), (1, 1));
+    }
+
+    /// A runnable count at the top of the range must not wrap the `+ 1`.
+    #[test]
+    fn a_runnable_count_at_the_top_of_the_range_does_not_wrap() {
+        assert_eq!(loadavg_tasks(usize::MAX, 7), (7, 7));
     }
 }

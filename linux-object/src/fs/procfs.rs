@@ -2075,13 +2075,20 @@ fn boot_time_secs(realtime: Duration, monotonic: Duration) -> u64 {
 /// `/proc/loadavg` — one-line load averages for `top` header.
 fn proc_loadavg_content() -> String {
     let procs = all_processes();
-    let total = procs.len().max(1);
-    // Runnable count (excludes idle/blocked tasks), not the live-process count —
-    // see `loadavg::runnable_count`. `+1` so the field is never below 1: the
-    // process reading `/proc/loadavg` is itself runnable but is excluded by the
-    // sampler's self-subtraction, and Linux always reports at least 1 here.
-    let running = crate::loadavg::runnable_count() + 1;
-    let last_pid = procs.last().map(|p| p.id()).unwrap_or(1);
+    // Runnable count (excludes idle/blocked tasks), not the live-task count —
+    // see `loadavg::runnable_count`. The denominator is Linux's `nr_threads`
+    // and the two floors are `loadavg::loadavg_tasks`; a denominator of live
+    // PROCESSES came out below the numerator.
+    let (running, total) = crate::loadavg::loadavg_tasks(
+        crate::loadavg::runnable_count(),
+        crate::loadavg::count_threads(),
+    );
+    // `idr_get_cursor() - 1`: the last pid HANDED OUT. This was the last
+    // process the job-tree walk reached, which is an order the tree decides
+    // and not an order in time, so a shell's own pid was printed as the
+    // newest long after it had forked. KoIDs are handed out in increasing
+    // order, so the largest live one is the newest.
+    let last_pid = procs.iter().map(|p| p.id()).max().unwrap_or(1);
     let [l1, l5, l15] = crate::loadavg::loadavg_f64();
     format!("{l1:.2} {l5:.2} {l15:.2} {running}/{total} {last_pid}\n")
 }
