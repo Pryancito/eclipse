@@ -10233,8 +10233,29 @@ impl NvidiaGpu {
         if ctx_idx >= 1 {
             nv::ctx_set_wedged(ctx_idx);
         }
+        // syncobj has just released this fence's CPU-side waiters: the point
+        // is signaled, so the client's `WAIT` fails on its next probe instead
+        // of parking. The GPU side needs the same release. Every consumer
+        // that waited on this fence through EXEC did so with an ACQUIRE on
+        // this very landing zone, through a peer mapping (the compositor's
+        // ring, for every client frame it composites), and a host semaphore
+        // ACQUIRE has no timeout: with the zone never written, that ring
+        // stopped for good, its own fences timed out in turn, and one hung
+        // GL client froze the whole desktop. The ring behind this zone is
+        // jammed by definition (latched above, and its process's next
+        // submit is EIO), so nothing else will ever write the payload: land
+        // it from the CPU. Only forward, as the ring would: a zone already
+        // past this payload (the ring caught up between the resolve and
+        // this upcall) is left to the ring.
+        if (current.wrapping_sub(payload) as i32) < 0 {
+            // SAFETY: `fence_va` is this slot's own landing zone (checked
+            // above), a kernel mapping of pinned sysmem alive until
+            // `ctx_free`.
+            unsafe { core::ptr::write_volatile(fence_va as *mut u32, payload) };
+            store_fence();
+        }
         crate::klog_warn!(
-            "[nouveau-uapi] fence TIMEOUT (direct submit): ctx{} payload={} never landed in {}s (landing zone={}); syncobj handle={} point={} released so its waiter can fail; {}",
+            "[nouveau-uapi] fence TIMEOUT (direct submit): ctx{} payload={} never landed in {}s (landing zone={}, now written so the ACQUIREs queued on it pass); syncobj handle={} point={} released so its waiter can fail; {}",
             ctx_idx, payload, crate::scheme::syncobj::FENCE_TIMEOUT_US / 1_000_000, current, handle, point,
             if ctx_idx >= 1 { "context latched WEDGED (next submit EIO -> device-lost)" } else { "ctx 0 (compositor) is never latched" }
         );
@@ -18534,6 +18555,117 @@ mod nouveau_bookkeeping_tests {
         );
         assert!(!has_chan(1));
         assert!(gpu.nouveau_zombies.lock().is_empty());
+        gpu.nouveau_release_process(COMP);
+        assert_eq!(FAKE_RM.lock().bad, 0);
+    }
+
+    /// The compositor composites every client frame behind an ACQUIRE on the
+    /// client's fence, on the client's landing zone through a peer mapping.
+    /// A client whose ring hangs never writes it. syncobj gives up on the
+    /// fence after 10 s and releases its CPU-side waiters; the GPU-side one
+    /// is a host semaphore ACQUIRE with no timeout, so the compositor's ring
+    /// stopped for good behind the hung client: one hung GL client froze the
+    /// desktop. The timeout upcall lands the payload from the CPU.
+    #[test]
+    fn a_wedged_clients_fence_releases_the_compositors_acquire_too() {
+        let _g = LOCK.lock();
+        let _live = LiveBytes::hold();
+        let gpu = gpu_rm_ladder();
+        FAKE_RM.lock().peer = true;
+        test_clock::set_auto_advance(1_000);
+        let ch_c = client_with_pushbuf(&gpu, COMP);
+        let ch_a = client_with_pushbuf(&gpu, A);
+        let out = syncobj::create(false);
+        let out2 = syncobj::create(false);
+        assert_eq!(
+            exec(&gpu, A, ch_a, &[push(PUSH_VA, 16)], &[], &[sync(out)]),
+            Ok(0)
+        );
+        assert_eq!(
+            exec(
+                &gpu,
+                COMP,
+                ch_c,
+                &[push(PUSH_VA, 16)],
+                &[sync(out)],
+                &[sync(out2)]
+            ),
+            Ok(0)
+        );
+        let (fence_va, _, payload, ctx) =
+            pending_hw_fence(out, 1).expect("the client's fence is pending on its ring");
+        assert_eq!((ctx, payload), (1, 1));
+        // The compositor's ring is behind the client's fence: it fetches
+        // nothing while the zone is unwritten.
+        assert!(run_gpu(0).is_empty(), "stalled on the ACQUIRE");
+        assert_eq!(userd(&chan(0)).0, 0);
+        // The client's ring never runs. syncobj gives up on the fence...
+        test_clock::advance(syncobj::FENCE_TIMEOUT_US);
+        assert_eq!(syncobj::poll_pending(), 0);
+        assert_eq!(syncobj::query(out), Some(1), "the CPU side is released");
+        assert_eq!(landing_zone(&chan(1)), 0);
+        // ...and the upcall lands it on the GPU side too.
+        gpu.fast_fence_timeout(ctx, fence_va, payload, out, 1);
+        assert!(nv::ctx_is_wedged(1));
+        assert_eq!(landing_zone(&chan(1)), 1, "written by the CPU");
+        let fetched = run_gpu(0);
+        assert_eq!(fetched.len(), 3, "acquire, push, release: {:?}", fetched);
+        assert!(matches!(fetched[0], Fetched::Acquire { payload: 1, .. }));
+        assert_eq!(syncobj::poll_pending(), 0);
+        assert_eq!(
+            syncobj::query(out2),
+            Some(1),
+            "the compositor's frame landed"
+        );
+        // The compositor keeps going.
+        assert_eq!(
+            exec(&gpu, COMP, ch_c, &[push(PUSH_VA + 0x100, 16)], &[], &[]),
+            Ok(0)
+        );
+        assert_eq!(run_gpu(0).len(), 1);
+        for h in [out, out2] {
+            assert!(syncobj::destroy(h));
+        }
+        gpu.nouveau_release_process(A);
+        gpu.nouveau_release_process(COMP);
+        assert_eq!(FAKE_RM.lock().bad, 0);
+    }
+
+    /// The same the other way round: a client waits on the compositor's
+    /// release fence (the buffer it may draw into again) through a mapping
+    /// of context 0's zone. Context 0 is never latched wedged, but its fence
+    /// timing out releases the client's CPU-side waiter all the same, so it
+    /// releases the ACQUIRE too.
+    #[test]
+    fn the_compositors_own_fence_timing_out_releases_a_clients_acquire_on_it() {
+        let _g = LOCK.lock();
+        let _live = LiveBytes::hold();
+        let gpu = gpu_rm_ladder();
+        FAKE_RM.lock().peer = true;
+        test_clock::set_auto_advance(1_000);
+        let ch_c = client_with_pushbuf(&gpu, COMP);
+        let ch_a = client_with_pushbuf(&gpu, A);
+        let out2 = syncobj::create(false);
+        assert_eq!(
+            exec(&gpu, COMP, ch_c, &[push(PUSH_VA, 16)], &[], &[sync(out2)]),
+            Ok(0)
+        );
+        assert_eq!(
+            exec(&gpu, A, ch_a, &[push(PUSH_VA, 16)], &[sync(out2)], &[]),
+            Ok(0)
+        );
+        let (fence_va, _, payload, ctx) =
+            pending_hw_fence(out2, 1).expect("the compositor's fence is pending on ring 0");
+        assert_eq!((ctx, payload), (0, 1));
+        assert!(run_gpu(1).is_empty(), "the client is behind the compositor");
+        test_clock::advance(syncobj::FENCE_TIMEOUT_US);
+        assert_eq!(syncobj::poll_pending(), 0);
+        gpu.fast_fence_timeout(ctx, fence_va, payload, out2, 1);
+        assert!(!nv::ctx_is_wedged(0), "context 0 is never latched");
+        assert_eq!(landing_zone(&chan(0)), 1, "but its zone is landed");
+        assert_eq!(run_gpu(1).len(), 2, "acquire, push");
+        assert!(syncobj::destroy(out2));
+        gpu.nouveau_release_process(A);
         gpu.nouveau_release_process(COMP);
         assert_eq!(FAKE_RM.lock().bad, 0);
     }
