@@ -55,6 +55,11 @@ pub trait TextBuffer {
         if top > bottom || bottom >= self.height() {
             return;
         }
+        // Clamping `n` to the height of the region is tidiness, not safety, and
+        // mutation is right that dropping it changes nothing: a larger `n` makes
+        // the test below false for every row, so the region fills with `blank`,
+        // which is what clamping gives too. `bottom - top + 1` cannot underflow
+        // because `top > bottom` returned above.
         let n = n.min(bottom - top + 1);
         let width = self.width();
         for r in top..=bottom {

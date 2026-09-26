@@ -121,6 +121,21 @@ jobs:
           # symbols are answered from a bump arena, so a read of a sector goes
           # through the real ring and comes back.
           cargo test -p virtio-drivers --lib -- --test-threads=1
+          # The text console the kernel prints through, escape sequences and
+          # all. This one was unreachable for a reason: three SDL2 example
+          # programs pulled in `embedded-graphics-simulator`, whose `sdl2-sys`
+          # collides with the one `zcore-drivers` already links, so cargo
+          # refused the crate as a workspace member at all. The demos now sit
+          # out of the build graph (`autoexamples = false`) and the console
+          # itself is tested over a `Vec` standing in for the frame buffer.
+          #
+          # `--no-default-features` on purpose: that turns the `log` feature off,
+          # which is how the kernel takes this crate (`zcore-drivers` asks for it
+          # with `default-features = false`), and it swaps the real `log` macros
+          # for the dummy ones in `src/log.rs`. Those accept a narrower shape of
+          # argument, so a `trace!` that compiles with the feature on can still
+          # fail to build the kernel. This line builds what the kernel builds.
+          cargo test -p rcore-console --lib --no-default-features -- --test-threads=1
           # The loader -- the code around user mode: the signal frame a
           # handler returns from, the CPU-exception-to-signal table. Its
           # default features pull in `zircon`, whose `include_bytes!` of the

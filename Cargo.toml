@@ -29,6 +29,7 @@ members = [
     # no `[patch]` either, so `cargo` resolved `virtio-drivers` to the git rev
     # in `drivers/Cargo.toml` and **nothing here ever built this directory**.
     "vendor/virtio-drivers",
+    "vendor/rcore-console",
     "hunter",
 ]
 default-members = ["xtask"]
