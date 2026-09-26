@@ -522,3 +522,83 @@ fn syscalls_that_used_to_panic_or_answer_ok_for_nothing_answer_errors() {
         Box::pin(async move { drop(ct) })
     });
 }
+
+/// `zx_futex_wait` and `zx_futex_requeue` read the futex word to compare it
+/// with `current_value`; only null and alignment were checked, so any other
+/// address (unmapped, or the kernel's own) was read as the kernel: a fault
+/// with no fixup behind it. `zx_futex_requeue` did not check its requeue
+/// word at all, and `zx_iommu_create` with a type other than the dummy one
+/// was `unimplemented!()`, a kernel panic for whoever holds the root
+/// resource.
+#[test]
+fn futex_words_are_validated_and_iommu_create_refuses_other_types() {
+    with_test_thread(|ct| {
+        let base = map_user_memory(&ct);
+        let mut sc = Syscall {
+            thread: &ct,
+            thread_fn: finish_thread,
+        };
+        const FUTEX_WAIT: u32 = 40;
+        const INVALID_HANDLE: usize = 0;
+        let unmapped = base + 20 * PAGE_SIZE;
+        let mut wait = |word: usize, current: i32| {
+            let mut f = Box::pin(sc.syscall(
+                FUTEX_WAIT,
+                [
+                    word,
+                    current as u32 as usize,
+                    INVALID_HANDLE,
+                    i64::MAX as usize,
+                    0,
+                    0,
+                    0,
+                    0,
+                ],
+            ));
+            f.as_mut().poll(&mut Context::from_waker(Waker::noop()))
+        };
+        assert_eq!(
+            wait(unmapped, 0),
+            Poll::Ready(ZxError::INVALID_ARGS as isize),
+            "an unmapped word is an error, not a kernel fault"
+        );
+        assert_eq!(
+            wait(0, 0),
+            Poll::Ready(ZxError::INVALID_ARGS as isize),
+            "the null word"
+        );
+        assert_eq!(
+            wait(base + 2, 0),
+            Poll::Ready(ZxError::INVALID_ARGS as isize),
+            "a misaligned word"
+        );
+        unsafe { (base as *mut i32).write(7) };
+        assert_eq!(
+            wait(base, 8),
+            Poll::Ready(ZxError::BAD_STATE as isize),
+            "a mapped word is read and compared"
+        );
+
+        let requeue = |wake: usize, requeue: usize| {
+            sc.sys_futex_requeue(wake.into(), 1, 7, requeue.into(), 1, INVALID_HANDLE as u32)
+        };
+        assert_eq!(requeue(unmapped, base + 4), Err(ZxError::INVALID_ARGS));
+        assert_eq!(requeue(base, 0), Err(ZxError::INVALID_ARGS));
+        assert_eq!(requeue(base, base + 6), Err(ZxError::INVALID_ARGS));
+        assert_eq!(requeue(base, base), Err(ZxError::INVALID_ARGS));
+        requeue(base, base + 4).unwrap();
+
+        let root = ct.proc().add_handle(Handle::new(
+            Resource::create("root", ResourceKind::ROOT, 0, 0, ResourceFlags::empty()),
+            Rights::DEFAULT_RESOURCE,
+        ));
+        let out = base + 64;
+        assert_eq!(
+            sc.sys_iommu_create(root, 1, base.into(), 1, out.into()),
+            Err(ZxError::NOT_SUPPORTED)
+        );
+        sc.sys_iommu_create(root, 0, base.into(), 1, out.into())
+            .unwrap();
+        Box::pin(async move { drop(ct) })
+    });
+}

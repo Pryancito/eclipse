@@ -28,8 +28,11 @@ impl Syscall<'_> {
         if desc_size != IOMMU_DESC_SIZE {
             return Err(ZxError::INVALID_ARGS);
         }
+        // Only the dummy IOMMU exists; asking for another kind is the
+        // caller's error, and used to be `unimplemented!()`, a kernel panic
+        // for whoever holds the root resource.
         if type_ != IOMMU_TYPE_DUMMY {
-            unimplemented!("IOMMU {} is not implemented", type_);
+            return Err(ZxError::NOT_SUPPORTED);
         }
         let _copied_desc = desc.read_array(desc_size)?;
         let iommu = Iommu::create();

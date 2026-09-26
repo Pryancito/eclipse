@@ -3,6 +3,21 @@ use {
     zircon_object::task::{Thread, ThreadState},
 };
 
+/// A futex word the kernel will read: non-null, aligned, and readable in the
+/// caller's own address space. `zx_futex_wake` needs only the first two, as
+/// an unallocated address is not an error there.
+fn check_futex_word(proc: &zircon_object::task::Process, word: &UserInPtr<AtomicI32>) -> ZxResult {
+    if word.is_null() || !word.as_addr().is_multiple_of(4) {
+        return Err(ZxError::INVALID_ARGS);
+    }
+    crate::user_memory::validate_user_range(
+        proc,
+        word.as_addr(),
+        core::mem::size_of::<AtomicI32>(),
+        kernel_hal::MMUFlags::READ,
+    )
+}
+
 impl Syscall<'_> {
     /// Wait on a futex.
     ///
@@ -19,11 +34,13 @@ impl Syscall<'_> {
             "futex.wait: value_ptr={:#x?}, current_value={:#x}, new_futex_owner={:#x}, deadline={:?}",
             value_ptr, current_value, new_futex_owner, deadline
         );
-        if value_ptr.is_null() || !value_ptr.as_addr().is_multiple_of(4) {
-            return Err(ZxError::INVALID_ARGS);
-        }
-        let value = value_ptr.as_ref();
         let proc = self.thread.proc();
+        // The word is read to compare it with `current_value`, so it has to
+        // be the caller's own mapped memory: a null check and an alignment
+        // check were all there was, and `as_ref` on any other address read
+        // it as the kernel, a fault with no fixup behind it.
+        check_futex_word(proc, &value_ptr)?;
+        let value = value_ptr.as_ref();
         let futex = proc.get_futex(value);
         let new_owner = if new_futex_owner == INVALID_HANDLE {
             None
@@ -53,7 +70,12 @@ impl Syscall<'_> {
             "futex.requeue: value_ptr={:?}, wake_count={:#x}, current_value={:#x}, requeue_ptr={:?}, requeue_count={:#x}, new_requeue_owner={:?}",
             value_ptr, wake_count, current_value, requeue_ptr, requeue_count, new_requeue_owner
         );
-        if value_ptr.is_null() || !value_ptr.as_addr().is_multiple_of(4) {
+        let proc = self.thread.proc();
+        // The wake word is read (compared with `current_value`); the requeue
+        // word only names a queue, but it still has to be a word: a null or
+        // misaligned `requeue_ptr` went unchecked.
+        check_futex_word(proc, &value_ptr)?;
+        if requeue_ptr.is_null() || !requeue_ptr.as_addr().is_multiple_of(4) {
             return Err(ZxError::INVALID_ARGS);
         }
         let value = value_ptr.as_ref();
@@ -61,7 +83,6 @@ impl Syscall<'_> {
         if value_ptr.as_addr() == requeue_ptr.as_addr() {
             return Err(ZxError::INVALID_ARGS);
         }
-        let proc = self.thread.proc();
         let new_requeue_owner = if new_requeue_owner == INVALID_HANDLE {
             None
         } else {
