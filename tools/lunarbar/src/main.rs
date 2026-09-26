@@ -65,8 +65,8 @@ use icons::IconCache;
 use sysinfo::{CpuMeter, NetMeter, NetRate};
 use wayland_client::{
     protocol::{
-        wl_buffer, wl_compositor, wl_keyboard, wl_output, wl_pointer, wl_region, wl_registry,
-        wl_seat, wl_shm, wl_shm_pool, wl_surface,
+        wl_buffer, wl_callback, wl_compositor, wl_keyboard, wl_output, wl_pointer, wl_region,
+        wl_registry, wl_seat, wl_shm, wl_shm_pool, wl_surface,
     },
     Connection, Dispatch, Proxy, QueueHandle, WEnum,
 };
@@ -237,6 +237,15 @@ struct TipId;
 
 /// Hover dwell before the taskbar tooltip appears.
 const TIP_DELAY: Duration = Duration::from_millis(450);
+
+/// How long a `wl_surface.frame` callback may stay outstanding before the
+/// popup repaints anyway. The frame callback is a THROTTLE, never a
+/// dependency: a compositor is free to never answer one (an occluded or
+/// off-screen surface is not drawn, so it is owed no frame), and a menu that
+/// waits forever for a callback that is not coming is a frozen menu. 100 ms is
+/// past any real refresh period (6 frames at 60 Hz) and still under the
+/// threshold where a stall reads as one.
+const FRAME_FALLBACK: Duration = Duration::from_millis(100);
 
 /// Post surface damage for a rect in BUFFER pixels. `damage_buffer` needs
 /// wl_surface v4; fall back to v1 `damage` in surface coords (÷ scale).
@@ -439,8 +448,13 @@ type PopupFrame = ((i32, i32, i32, i32), Vec<(i32, i32, i32, i32, Action)>);
 struct Popup {
     surface: wl_surface::WlSurface,
     layer: ZwlrLayerSurfaceV1,
+    /// Logical (surface) size from the layer-shell configure.
     width: u32,
     height: u32,
+    /// Integer HiDPI scale of the output this overlay maps on (clamped 1..=8).
+    /// The bars have always honoured `wl_output.scale`; the overlay did not,
+    /// so on a scale-2 desk the menu drew at half the bar's resolution.
+    scale: u32,
     map: *mut u8,
     map_len: usize,
     buffers: [Option<wl_buffer::WlBuffer>; BUFFERS],
@@ -450,6 +464,17 @@ struct Popup {
     generation: u64,
     configured: bool,
     dirty: bool,
+    /// A `wl_surface.frame` callback is outstanding: the compositor has not
+    /// yet drawn the last commit, so a new one would be overwritten before it
+    /// was ever shown. Hover over the app menu repaints an OUTPUT-SIZED ARGB
+    /// surface, and pointer motion arrives far faster than the refresh rate,
+    /// so without this gate one mouse sweep queues dozens of full-screen
+    /// renders, swizzles and whole-output damages that nobody sees.
+    frame_pending: bool,
+    /// When the pending frame callback was requested. A compositor owes no
+    /// callback for a surface it is not drawing, so a stuck one must never
+    /// wedge the menu: past [`FRAME_FALLBACK`] the gate opens anyway.
+    frame_at: Option<Instant>,
     kind: PopupKind,
     /// Absolute hit rects (x0,y0,x1,y1) and what clicking them does.
     hits: Vec<(i32, i32, i32, i32, Action)>,
@@ -478,6 +503,8 @@ struct Tooltip {
     layer: ZwlrLayerSurfaceV1,
     width: u32,
     height: u32,
+    /// See [`Popup::scale`] — the tooltip drew at scale 1 for the same reason.
+    scale: u32,
     map: *mut u8,
     map_len: usize,
     buffers: [Option<wl_buffer::WlBuffer>; BUFFERS],
@@ -856,6 +883,26 @@ impl State {
             }
             old
         };
+        // Tell the compositor the bar is opaque when it IS opaque. Without an
+        // opaque region wlroots must assume every panel pixel may be
+        // translucent, so it cannot cull the wallpaper and windows underneath
+        // and blends the full bar on every frame — two bars' worth of
+        // needless per-frame blending on a surface that is a solid ground.
+        // The region is in SURFACE coordinates, not buffer pixels.
+        if let Some(comp) = self.compositor.clone() {
+            let bar = &self.bars[idx];
+            if translucent() {
+                // A translucent look must NOT claim opacity: the compositor
+                // would skip what shows through and the bar would read as a
+                // black strip.
+                bar.surface.set_opaque_region(None);
+            } else {
+                let region = comp.create_region(qh, ());
+                region.add(0, 0, w as i32, h as i32);
+                bar.surface.set_opaque_region(Some(&region));
+                region.destroy();
+            }
+        }
         self.retire_map(old_map, old_len);
         self.render(layer_id);
     }
@@ -1194,10 +1241,11 @@ impl State {
         // compositor choose, so on a multi-monitor desk the menu (and the
         // scrim that catches its dismiss-click) could land on another screen
         // than the button that opened it.
-        let output = self
-            .ptr_bar
-            .and_then(|id| self.bar_index(id))
-            .map(|i| self.bars[i].output.clone());
+        let bar = self.ptr_bar.and_then(|id| self.bar_index(id));
+        let output = bar.map(|i| self.bars[i].output.clone());
+        // Same integer scale as the bar that spawned it, so the menu is as
+        // sharp as the panel it hangs off instead of a scale-1 upscale.
+        let scale = bar.map(|i| self.bars[i].scale).unwrap_or(1).clamp(1, 8);
 
         let surface = comp.create_surface(qh, ());
         let layer = ls.get_layer_surface(
@@ -1225,6 +1273,7 @@ impl State {
             layer,
             width: 0,
             height: 0,
+            scale,
             map: std::ptr::null_mut(),
             map_len: 0,
             buffers: [None, None],
@@ -1233,10 +1282,22 @@ impl State {
             generation: 0,
             configured: false,
             dirty: false,
+            frame_pending: false,
+            frame_at: None,
             kind,
             hits: Vec::new(),
             panel: (0, 0, 0, 0),
         });
+    }
+
+    /// When a popup repaint that the frame gate deferred must go out anyway.
+    /// `None` when nothing is waiting.
+    fn popup_deadline(&self) -> Option<Instant> {
+        let p = self.popup.as_ref()?;
+        if !p.dirty || !p.frame_pending {
+            return None;
+        }
+        Some(p.frame_at? + FRAME_FALLBACK)
     }
 
     /// Tear down the popup overlay (Drop destroys its surfaces and mapping).
@@ -1268,27 +1329,34 @@ impl State {
         w = w.max(1);
         h = h.max(1);
         if matches!(self.popup.as_ref(), Some(popup) if popup.configured && popup.width == w && popup.height == h) {
-            self.render_popup();
+            self.render_popup(qh);
             return;
         }
-        if w > fill_guard::MAX_BUFFER_DIM || h > fill_guard::MAX_BUFFER_DIM {
-            eprintln!("lunarbar: popup {w}x{h} past MAX_BUFFER_DIM; skipping");
+        let scale = self.popup.as_ref().map(|p| p.scale).unwrap_or(1).max(1);
+        // The configure is in SURFACE (logical) pixels; the wl_buffer is in
+        // buffer pixels, which is `scale` times that — the same split the bars
+        // already made. Every guard below is on the buffer size, since that is
+        // what actually gets mapped.
+        let bw = w.saturating_mul(scale);
+        let bh = h.saturating_mul(scale);
+        if bw > fill_guard::MAX_BUFFER_DIM || bh > fill_guard::MAX_BUFFER_DIM {
+            eprintln!("lunarbar: popup {bw}x{bh} past MAX_BUFFER_DIM; skipping");
             return;
         }
-        if (w as usize).saturating_mul(h as usize) > fill_guard::MAX_BUFFER_PIXELS {
-            eprintln!("lunarbar: popup {w}x{h} past MAX_BUFFER_PIXELS; skipping");
+        if (bw as usize).saturating_mul(bh as usize) > fill_guard::MAX_BUFFER_PIXELS {
+            eprintln!("lunarbar: popup {bw}x{bh} past MAX_BUFFER_PIXELS; skipping");
             return;
         }
-        let Some(total) = (w as usize)
+        let Some(total) = (bw as usize)
             .checked_mul(4)
-            .and_then(|s| s.checked_mul(h as usize))
+            .and_then(|s| s.checked_mul(bh as usize))
             .and_then(|f| f.checked_mul(BUFFERS))
             .filter(|t| *t <= i32::MAX as usize)
         else {
             return;
         };
-        let stride = w as usize * 4;
-        let frame_size = stride * h as usize;
+        let stride = bw as usize * 4;
+        let frame_size = stride * bh as usize;
         let Some((map, fd)) = Self::map_shm_pool(total) else {
             return;
         };
@@ -1297,8 +1365,8 @@ impl State {
         let mk = |i: usize| {
             pool.create_buffer(
                 (i * frame_size) as i32,
-                w as i32,
-                h as i32,
+                bw as i32,
+                bh as i32,
                 stride as i32,
                 wl_shm::Format::Argb8888,
                 qh,
@@ -1328,14 +1396,20 @@ impl State {
             popup.next = 0;
             popup.generation = generation;
             popup.configured = true;
+            // Must be set BEFORE the commit that attaches the scaled buffer,
+            // or the compositor reads a buffer `scale` times the surface it
+            // was told to expect and rejects it (invalid size).
+            if popup.surface.version() >= 3 {
+                popup.surface.set_buffer_scale(scale as i32);
+            }
             old
         };
         self.retire_map(old_map, old_len);
-        self.render_popup();
+        self.render_popup(qh);
     }
 
     /// Paint the popup overlay into a free buffer and commit it.
-    fn render_popup(&mut self) {
+    fn render_popup(&mut self, qh: &QueueHandle<State>) {
         let bar_h = self.height as i32;
         let Some(popup) = self.popup.as_mut() else {
             return;
@@ -1343,8 +1417,21 @@ impl State {
         if !popup.configured || popup.map.is_null() {
             return;
         }
+        // Throttle to the compositor's frame clock. Repainting this surface
+        // means an output-sized tiny-skia render plus an output-sized swizzle;
+        // pointer motion fires far faster than the display refreshes, so
+        // without this every mouse sweep across the app menu builds frames the
+        // compositor throws away, while holding the shm pool the whole time.
+        if popup.frame_pending
+            && popup.frame_at.map(|t| t.elapsed() < FRAME_FALLBACK).unwrap_or(false)
+        {
+            popup.dirty = true;
+            return;
+        }
+        let scale = popup.scale.max(1) as usize;
         let (w, h) = (popup.width as usize, popup.height as usize);
-        let frame_size = w * h * 4;
+        let (bw, bh) = (w * scale, h * scale);
+        let frame_size = bw * bh * 4;
         // Pick a released buffer or defer to the next Release.
         let i = if !popup.busy[popup.next] {
             popup.next
@@ -1397,7 +1484,7 @@ impl State {
         };
         let data: &mut [u8] =
             unsafe { std::slice::from_raw_parts_mut(popup.map.add(i * frame_size), frame_size) };
-        if !cv.blit_argb(data) {
+        if !cv.blit_argb_scaled(data, scale as u32) {
             popup.busy[i] = false;
             return;
         }
@@ -1406,9 +1493,25 @@ impl State {
 
         if let Some(buf) = popup.buffers[i].as_ref() {
             popup.surface.attach(Some(buf), 0, 0);
-            // Full-surface damage. Sub-rect dirty on popups left stale tiles
-            // around the panel (same class of artifact as KMS DIRTYFB clips).
-            damage(&popup.surface, 1, 0, 0, w as i32, h as i32);
+            // Ask for a frame callback BEFORE the commit it belongs to: the
+            // request is queued on the surface and applied by that commit.
+            // Only ever ONE outstanding: a wl_callback is destroyed by its own
+            // `done` and cannot be cancelled, so a compositor that never
+            // answers (it owes no frame to a surface it is not drawing) would
+            // otherwise leave one object behind per FRAME_FALLBACK repaint,
+            // for as long as the menu stays open. On that fallback path the
+            // callback already in flight stays the gate; only the deadline is
+            // pushed out, so the next repaint is another FRAME_FALLBACK away
+            // and not a spin.
+            if !popup.frame_pending {
+                popup.surface.frame(qh, PopupId);
+                popup.frame_pending = true;
+            }
+            popup.frame_at = Some(Instant::now());
+            // Full-surface damage, in BUFFER pixels. Sub-rect dirty on popups
+            // left stale tiles around the panel (same class of artifact as KMS
+            // DIRTYFB clips).
+            damage(&popup.surface, scale as u32, 0, 0, bw as i32, bh as i32);
             popup.surface.commit();
         }
     }
@@ -1424,7 +1527,7 @@ impl State {
     }
 
     /// Handle a pointer click on the popup overlay.
-    fn popup_click(&mut self, x: i32, y: i32) {
+    fn popup_click(&mut self, qh: &QueueHandle<State>, x: i32, y: i32) {
         let Some(popup) = self.popup.as_ref() else {
             return;
         };
@@ -1439,8 +1542,8 @@ impl State {
                     }
                 }
             }
-            Some(Action::PrevMonth) => self.cal_shift(-1),
-            Some(Action::NextMonth) => self.cal_shift(1),
+            Some(Action::PrevMonth) => self.cal_shift(qh, -1),
+            Some(Action::NextMonth) => self.cal_shift(qh, 1),
             Some(Action::PowerLock) => {
                 self.close_popup();
                 self.spawn("eclipse-lock || swaylock || lock");
@@ -1506,7 +1609,7 @@ impl State {
                 self.spawn(&format!(
                     "pactl set-sink-volume @DEFAULT_SINK@ {v}% >/dev/null 2>&1 || amixer set Master {v}% >/dev/null 2>&1 || wpctl set-volume @DEFAULT_AUDIO_SINK@ {v}%"
                 ));
-                self.render_popup();
+                self.render_popup(qh);
                 self.render_all();
             }
             None => {
@@ -1520,7 +1623,7 @@ impl State {
 
     /// Pointer motion over the popup: track the highlighted app row and keep
     /// the cursor shape in sync (hand over clickables).
-    fn popup_motion(&mut self, x: i32, y: i32) {
+    fn popup_motion(&mut self, qh: &QueueHandle<State>, x: i32, y: i32) {
         let hit = self.popup_hit(x, y);
         let mut changed = false;
         if let Some(popup) = self.popup.as_mut() {
@@ -1532,13 +1635,13 @@ impl State {
             }
         }
         if changed {
-            self.render_popup();
+            self.render_popup(qh);
         }
         self.set_cursor(if hit.is_some() { Shape::Pointer } else { Shape::Default });
     }
 
     /// Move the calendar by `dir` months (wrapping the year).
-    fn cal_shift(&mut self, dir: i32) {
+    fn cal_shift(&mut self, qh: &QueueHandle<State>, dir: i32) {
         let Some(popup) = self.popup.as_mut() else {
             return;
         };
@@ -1548,11 +1651,11 @@ impl State {
         let m = *month as i32 + dir;
         *year += m.div_euclid(12);
         *month = m.rem_euclid(12) as u32;
-        self.render_popup();
+        self.render_popup(qh);
     }
 
     /// One wheel notch over the popup: scroll the app list / shift the month.
-    fn popup_scroll(&mut self, dir: i32) {
+    fn popup_scroll(&mut self, qh: &QueueHandle<State>, dir: i32) {
         let bar_h = self.height as i32;
         let Some(popup) = self.popup.as_mut() else {
             return;
@@ -1564,16 +1667,16 @@ impl State {
                 let new = (*scroll as i32 + dir).clamp(0, max_scroll as i32) as usize;
                 if new != *scroll {
                     *scroll = new;
-                    self.render_popup();
+                    self.render_popup(qh);
                 }
             }
-            PopupKind::Calendar { .. } => self.cal_shift(dir),
+            PopupKind::Calendar { .. } => self.cal_shift(qh, dir),
             _ => {}
         }
     }
 
     /// A key press while the popup holds the keyboard.
-    fn popup_key(&mut self, key: u32) {
+    fn popup_key(&mut self, qh: &QueueHandle<State>, key: u32) {
         enum Do {
             Nothing,
             Close,
@@ -1672,8 +1775,8 @@ impl State {
                 self.close_popup();
                 self.spawn(&cmd);
             }
-            Do::Cal(d) => self.cal_shift(d),
-            Do::Render => self.render_popup(),
+            Do::Cal(d) => self.cal_shift(qh, d),
+            Do::Render => self.render_popup(qh),
         }
     }
 
@@ -1801,6 +1904,7 @@ impl State {
         let center = (hit.x0 + hit.x1) / 2;
         let left = (center - w / 2).clamp(4, (bar.width as i32 - w - 4).max(4));
 
+        let scale = bar.scale.clamp(1, 8);
         let surface = comp.create_surface(qh, ());
         // Empty input region: the tooltip must never steal pointer focus from
         // the button it annotates (that would flicker enter/leave forever).
@@ -1827,6 +1931,7 @@ impl State {
             layer,
             width: 0,
             height: 0,
+            scale,
             map: std::ptr::null_mut(),
             map_len: 0,
             buffers: [None, None],
@@ -1845,22 +1950,38 @@ impl State {
         let Some(shm) = self.shm.clone() else {
             return;
         };
-        let w = w.max(1).min(fill_guard::MAX_BUFFER_DIM);
-        let h = h.max(1).min(fill_guard::MAX_BUFFER_DIM);
+        let w = w.max(1);
+        let h = h.max(1);
         if matches!(self.tooltip.as_ref(), Some(tip) if tip.width == w && tip.height == h && !tip.map.is_null()) {
             self.render_tip();
             return;
         }
-        let Some(total) = (w as usize)
+        let scale = self.tooltip.as_ref().map(|t| t.scale).unwrap_or(1).max(1);
+        // Logical size in, buffer size out — see `configure_popup`. The
+        // ceilings SKIP rather than clamp: once `set_buffer_scale(scale)` is
+        // declared the compositor requires the buffer to be exactly
+        // `logical * scale`, so a clamped buffer is a rejected buffer, not a
+        // smaller tooltip.
+        let bw = w.saturating_mul(scale);
+        let bh = h.saturating_mul(scale);
+        if bw > fill_guard::MAX_BUFFER_DIM || bh > fill_guard::MAX_BUFFER_DIM {
+            eprintln!("lunarbar: tooltip {bw}x{bh} past MAX_BUFFER_DIM; skipping");
+            return;
+        }
+        if (bw as usize).saturating_mul(bh as usize) > fill_guard::MAX_BUFFER_PIXELS {
+            eprintln!("lunarbar: tooltip {bw}x{bh} past MAX_BUFFER_PIXELS; skipping");
+            return;
+        }
+        let Some(total) = (bw as usize)
             .checked_mul(4)
-            .and_then(|s| s.checked_mul(h as usize))
+            .and_then(|s| s.checked_mul(bh as usize))
             .and_then(|f| f.checked_mul(BUFFERS))
             .filter(|t| *t <= i32::MAX as usize)
         else {
             return;
         };
-        let stride = w as usize * 4;
-        let frame_size = stride * h as usize;
+        let stride = bw as usize * 4;
+        let frame_size = stride * bh as usize;
         let Some((map, fd)) = Self::map_shm_pool(total) else {
             return;
         };
@@ -1869,8 +1990,8 @@ impl State {
         let mk = |i: usize| {
             pool.create_buffer(
                 (i * frame_size) as i32,
-                w as i32,
-                h as i32,
+                bw as i32,
+                bh as i32,
                 stride as i32,
                 wl_shm::Format::Argb8888,
                 qh,
@@ -1899,6 +2020,11 @@ impl State {
             tip.busy = [false, false];
             tip.next = 0;
             tip.generation = generation;
+            // Before the commit that attaches the scaled buffer; see
+            // `configure_popup`.
+            if tip.surface.version() >= 3 {
+                tip.surface.set_buffer_scale(scale as i32);
+            }
             old
         };
         self.retire_map(old_map, old_len);
@@ -1912,8 +2038,10 @@ impl State {
         if tip.map.is_null() {
             return;
         }
+        let scale = tip.scale.max(1) as usize;
         let (w, h) = (tip.width as usize, tip.height as usize);
-        let frame_size = w * h * 4;
+        let (bw, bh) = (w * scale, h * scale);
+        let frame_size = bw * bh * 4;
         let i = if !tip.busy[tip.next] {
             tip.next
         } else if !tip.busy[1 - tip.next] {
@@ -1931,21 +2059,21 @@ impl State {
         draw_tooltip(&mut cv, w, h, &tip.text);
         let data: &mut [u8] =
             unsafe { std::slice::from_raw_parts_mut(tip.map.add(i * frame_size), frame_size) };
-        if !cv.blit_argb(data) {
+        if !cv.blit_argb_scaled(data, scale as u32) {
             tip.busy[i] = false;
             return;
         }
         if let Some(buf) = tip.buffers[i].as_ref() {
             tip.surface.attach(Some(buf), 0, 0);
-            damage(&tip.surface, 1, 0, 0, w as i32, h as i32);
+            damage(&tip.surface, scale as u32, 0, 0, bw as i32, bh as i32);
             tip.surface.commit();
         }
     }
 
     /// Route one wheel notch by pointer position.
-    fn scroll_step(&mut self, dir: i32) {
+    fn scroll_step(&mut self, qh: &QueueHandle<State>, dir: i32) {
         if self.ptr_on_popup {
-            self.popup_scroll(dir);
+            self.popup_scroll(qh, dir);
             return;
         }
         if let Some(id) = self.ptr_bar {
@@ -3068,7 +3196,7 @@ impl Dispatch<wl_pointer::WlPointer, ()> for State {
                     .find(|b| b.surface.id() == surface.id())
                     .map(|b| b.layer.id().protocol_id());
                 if state.ptr_on_popup {
-                    state.popup_motion(surface_x as i32, surface_y as i32);
+                    state.popup_motion(qh, surface_x as i32, surface_y as i32);
                 } else if let Some(id) = state.ptr_bar {
                     state.bar_motion(id, surface_x as i32);
                 } else {
@@ -3097,7 +3225,7 @@ impl Dispatch<wl_pointer::WlPointer, ()> for State {
                 state.ptr_x = surface_x;
                 state.ptr_y = surface_y;
                 if state.ptr_on_popup {
-                    state.popup_motion(surface_x as i32, surface_y as i32);
+                    state.popup_motion(qh, surface_x as i32, surface_y as i32);
                 } else if let Some(id) = state.ptr_bar {
                     state.bar_motion(id, surface_x as i32);
                 }
@@ -3114,7 +3242,7 @@ impl Dispatch<wl_pointer::WlPointer, ()> for State {
                 state.tip_pending = None;
                 if state.ptr_on_popup {
                     if button == BTN_LEFT {
-                        state.popup_click(x, y);
+                        state.popup_click(qh, x, y);
                     }
                     return;
                 }
@@ -3161,11 +3289,11 @@ impl Dispatch<wl_pointer::WlPointer, ()> for State {
                 state.scroll_acc += value;
                 while state.scroll_acc >= WHEEL_NOTCH {
                     state.scroll_acc -= WHEEL_NOTCH;
-                    state.scroll_step(1);
+                    state.scroll_step(qh, 1);
                 }
                 while state.scroll_acc <= -WHEEL_NOTCH {
                     state.scroll_acc += WHEEL_NOTCH;
-                    state.scroll_step(-1);
+                    state.scroll_step(qh, -1);
                 }
             }
             _ => {}
@@ -3190,6 +3318,15 @@ impl Dispatch<ZwlrLayerSurfaceV1, PopupId> for State {
                 height,
             } => {
                 layer.ack_configure(serial);
+                // A configure for a REPLACED overlay (clicking the clock while
+                // the app menu is up tears one down and builds another) must
+                // not be applied to its successor: that would size and — worse
+                // — attach a buffer to a surface whose own first configure has
+                // not arrived, which layer-shell forbids and wlroots answers
+                // with a protocol error, i.e. the panel disappears.
+                if !matches!(state.popup.as_ref(), Some(p) if p.layer.id() == layer.id()) {
+                    return;
+                }
                 state.configure_popup(qh, width, height);
             }
             zwlr_layer_surface_v1::Event::Closed => state.close_popup(),
@@ -3205,7 +3342,7 @@ impl Dispatch<wl_buffer::WlBuffer, (PopupId, usize, u64)> for State {
         event: wl_buffer::Event,
         (_, i, generation): &(PopupId, usize, u64),
         _: &Connection,
-        _: &QueueHandle<State>,
+        qh: &QueueHandle<State>,
     ) {
         if let wl_buffer::Event::Release = event {
             let mut redo = false;
@@ -3220,7 +3357,7 @@ impl Dispatch<wl_buffer::WlBuffer, (PopupId, usize, u64)> for State {
                 }
             }
             if redo {
-                state.render_popup();
+                state.render_popup(qh);
             }
         }
     }
@@ -3243,6 +3380,12 @@ impl Dispatch<ZwlrLayerSurfaceV1, TipId> for State {
                 height,
             } => {
                 layer.ack_configure(serial);
+                // See the popup handler: hovering from one truncated button
+                // straight to the next replaces the tooltip, and the old
+                // surface's configure must not land on the new one.
+                if !matches!(state.tooltip.as_ref(), Some(t) if t.layer.id() == layer.id()) {
+                    return;
+                }
                 state.configure_tip(qh, width, height);
             }
             zwlr_layer_surface_v1::Event::Closed => state.tooltip = None,
@@ -3278,14 +3421,14 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for State {
         event: wl_keyboard::Event,
         _: &(),
         _: &Connection,
-        _: &QueueHandle<State>,
+        qh: &QueueHandle<State>,
     ) {
         // Keys only reach us while the popup holds the keyboard (Exclusive);
         // raw evdev keycodes, no xkb needed.
         if let wl_keyboard::Event::Key { key, state: ks, .. } = event {
             let pressed = matches!(ks, WEnum::Value(wl_keyboard::KeyState::Pressed));
             if pressed {
-                state.popup_key(key);
+                state.popup_key(qh, key);
             }
         }
     }
@@ -3386,6 +3529,37 @@ impl Dispatch<ZwlrForeignToplevelHandleV1, ()> for State {
                 state.render_task_bars();
             }
             _ => {}
+        }
+    }
+}
+
+// The popup's frame callback: the compositor drew the last commit, so the
+// next repaint may go out. Each `wl_surface.frame` makes a ONE-SHOT callback
+// object; `done` is its destructor, so nothing is torn down here.
+impl Dispatch<wl_callback::WlCallback, PopupId> for State {
+    fn event(
+        state: &mut Self,
+        _: &wl_callback::WlCallback,
+        event: wl_callback::Event,
+        _: &PopupId,
+        _: &Connection,
+        qh: &QueueHandle<State>,
+    ) {
+        if let wl_callback::Event::Done { .. } = event {
+            let mut redo = false;
+            if let Some(popup) = state.popup.as_mut() {
+                popup.frame_pending = false;
+                popup.frame_at = None;
+                // A repaint the gate deferred (a hover the compositor had not
+                // caught up with) goes out now, at the display's rate.
+                if popup.dirty {
+                    popup.dirty = false;
+                    redo = true;
+                }
+            }
+            if redo {
+                state.render_popup(qh);
+            }
         }
     }
 }
@@ -3912,6 +4086,11 @@ fn main() {
             if let Some((_, _, t0)) = state.tip_pending {
                 deadline = deadline.min(t0 + TIP_DELAY);
             }
+            // A popup repaint the frame gate deferred must not sit here until
+            // the 1 Hz tick if the callback never lands.
+            if let Some(t0) = state.popup_deadline() {
+                deadline = deadline.min(t0);
+            }
             // Round UP: truncating sub-ms waits asks for poll(0) and busy-spins.
             let left = deadline.saturating_duration_since(std::time::Instant::now());
             let timeout_ms = (left.as_micros().div_ceil(1000)).min(1000) as i32;
@@ -3937,6 +4116,11 @@ fn main() {
         if let Err(e) = queue.dispatch_pending(&mut state) {
             eprintln!("lunarbar: protocol error: {e}");
             std::process::exit(1);
+        }
+        // A frame callback the compositor never sent (it owes none for a
+        // surface it is not drawing) must not strand the deferred repaint.
+        if state.popup_deadline().map(|t| t <= std::time::Instant::now()).unwrap_or(false) {
+            state.render_popup(&qh);
         }
         // Tooltip dwell elapsed while the pointer stayed on the same button?
         if let Some((id, k, t0)) = state.tip_pending {

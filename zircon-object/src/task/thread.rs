@@ -1459,10 +1459,20 @@ mod tests {
 
         let cancel_token = proc.get_cancel_token(handle_value).unwrap();
         let future = object.wait_signal(Signal::READABLE);
-        let deadline = timer_now() + Duration::from_millis(20);
+        // Two seconds, where this used to be twenty milliseconds. What is being
+        // tested is that closing the handle cancels a wait parked on it; the
+        // deadline is only a backstop, so that a cancel which never arrives
+        // fails the test instead of hanging it. Sized at 20 ms it was a race
+        // against the 10 ms sleep below -- and the sleep is an `async_std` task,
+        // so it resumes when the executor gets a core, which at 32 test threads
+        // took longer than the deadline about one run in thirty: `TIMED_OUT`
+        // came back instead of `CANCELED`.
+        let deadline = timer_now() + Duration::from_secs(2);
         async_std::task::spawn({
             let proc = proc.clone();
             async move {
+                // Long enough that `blocking_run` has parked on the signal
+                // before the handle goes away, and far from the deadline.
                 async_std::task::sleep(Duration::from_millis(10)).await;
                 proc.remove_handle(handle_value).unwrap();
             }

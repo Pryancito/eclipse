@@ -138,32 +138,85 @@ impl Timer {
 
 #[cfg(test)]
 mod tests {
+    //! Two properties, and each needs its own timescale to be asserted without
+    //! racing the clock.
+    //!
+    //! "It has not fired yet" is only safe to assert against a deadline that is
+    //! still a long way off, because a host `sleep` takes AT LEAST as long as
+    //! asked and, on a loaded machine, a great deal longer: reading a
+    //! `sleep(10ms)` as "we are still before the 15 ms deadline" is a guess.
+    //! "It fired" is only safe to assert by WAITING for it, because under libos
+    //! the callback is an `async_std` task ([`kernel_hal::timer::timer_set`]),
+    //! so it runs when the executor gets a core -- and a test binary has dozens
+    //! of threads competing for those.
+    //!
+    //! `set` used to sleep 10 ms and then 15 ms against a 20 ms deadline and
+    //! assert both halves off those sleeps. It failed about one run in fifteen
+    //! of the suite, and **at `--test-threads=1` too**, so the CI could hit it.
+    //! A new test here picks [`FAR`] for the first kind of assertion and
+    //! [`wait_signaled`] for the second, rather than a sleep sized to the
+    //! deadline.
+
     use super::*;
     use kernel_hal::timer::timer_now;
 
+    /// A deadline far enough out that "it has not fired yet" can be asserted
+    /// with no wait at all: the host would have to stall for two seconds
+    /// between two adjacent statements for this to go wrong.
+    const FAR: Duration = Duration::from_secs(2);
+
+    /// How long a deadline that has already passed is given to show up as
+    /// `SIGNALED` before it counts as never having arrived. Generous on
+    /// purpose -- see the module note.
+    const SETTLE: Duration = Duration::from_secs(2);
+
+    /// Wait for `timer` to signal, and fail if it never does.
+    fn wait_signaled(timer: &Arc<Timer>) {
+        let give_up = timer_now() + SETTLE;
+        while timer.signal() != Signal::SIGNALED {
+            assert!(
+                timer_now() < give_up,
+                "the deadline passed and the timer never signalled, {:?} later",
+                SETTLE
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
     #[test]
     fn one_shot() {
-        let timer = Timer::one_shot(timer_now() + Duration::from_millis(15));
-        std::thread::sleep(Duration::from_millis(10));
-        assert_eq!(timer.signal(), Signal::empty());
+        // Before its deadline: nothing.
+        let early = Timer::one_shot(timer_now() + FAR);
+        assert_eq!(early.signal(), Signal::empty());
 
-        std::thread::sleep(Duration::from_millis(20));
-        assert_eq!(timer.signal(), Signal::SIGNALED);
+        // Past it: signalled, once the callback gets a turn.
+        let fired = Timer::one_shot(timer_now() + Duration::from_millis(5));
+        wait_signaled(&fired);
     }
 
     #[test]
     fn set() {
         let timer = Timer::new();
-        timer.set(timer_now() + Duration::from_millis(10), Duration::default());
-        timer.set(timer_now() + Duration::from_millis(20), Duration::default());
 
-        std::thread::sleep(Duration::from_millis(10));
-        assert_eq!(timer.signal(), Signal::empty());
+        // A second `set` cancels the first, so the first deadline goes by
+        // without a signal. The sleep can only overshoot, and the deadline now
+        // standing is two seconds out, so a signal here could only have come
+        // from the deadline that was replaced.
+        timer.set(timer_now() + Duration::from_millis(5), Duration::default());
+        timer.set(timer_now() + FAR, Duration::default());
+        std::thread::sleep(Duration::from_millis(20));
+        assert_eq!(
+            timer.signal(),
+            Signal::empty(),
+            "the replaced deadline signalled anyway"
+        );
 
-        std::thread::sleep(Duration::from_millis(15));
-        assert_eq!(timer.signal(), Signal::SIGNALED);
+        // A deadline that does arrive signals.
+        timer.set(timer_now() + Duration::from_millis(5), Duration::default());
+        wait_signaled(&timer);
 
-        timer.set(timer_now() + Duration::from_millis(10), Duration::default());
+        // And `set` de-asserts the signal the arrived deadline raised.
+        timer.set(timer_now() + FAR, Duration::default());
         assert_eq!(timer.signal(), Signal::empty());
     }
 

@@ -3506,10 +3506,21 @@ impl Modeline {
 /// The native timing of the monitor firmware read at boot, if it stated one.
 fn panel_timing() -> Option<edid::DetailedTiming> {
     let (block, len) = zcore_drivers::display::boot_edid()?;
-    if len < 128 {
+    panel_timing_in(&block, len)
+}
+
+/// [`panel_timing`] with the bytes handed in, because the boot EDID is a
+/// process-wide global that no test sets and every test reads.
+///
+/// `len` is how much of the block firmware actually read off the DDC line, and
+/// the buffer is a fixed 128 bytes whatever that was: a short read leaves the
+/// tail as whatever was there before. So a partial read is refused rather than
+/// decoded, the same rule `/dev/fb0` applies to the same global.
+fn panel_timing_in(block: &[u8], len: u32) -> Option<edid::DetailedTiming> {
+    if (len as usize) < edid::BLOCK_LEN {
         return None;
     }
-    edid::preferred_timing(&block)
+    edid::preferred_timing(block)
 }
 
 /// Build a `struct drm_mode_modeinfo` (68 bytes) for the mode at `w`x`h`.
@@ -4829,6 +4840,42 @@ mod render_node_and_mode_tests {
         assert_ne!(m, make_modeinfo_with(1920, 1080, None));
         let (_, hor, _, _) = timings(&m);
         assert_eq!(hor, [1920, 1920, 2000, 2000]);
+    }
+
+    #[test]
+    fn a_partly_read_edid_is_refused_rather_than_decoded() {
+        // The buffer is a fixed 128 bytes whatever firmware managed to read, so
+        // a short read leaves the tail as whatever was there before it. Taking
+        // those bytes gives a pixel clock for a monitor that may not even be
+        // plugged in, and from there a vblank period for a mode nobody has.
+        let mut block = [0u8; edid::BLOCK_LEN];
+        block[..8].copy_from_slice(&[0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00]);
+        block[18] = 1;
+        block[19] = 4;
+        // The DMT 1080p60 descriptor, written straight into slot 0.
+        let d: [u8; 18] = [
+            0x02, 0x3A, 0x80, 0x18, 0x71, 0x38, 0x2D, 0x40, 0x58, 0x2C, 0x45, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x1E,
+        ];
+        block[54..72].copy_from_slice(&d);
+        let sum = block[..edid::BLOCK_LEN - 1]
+            .iter()
+            .fold(0u8, |a, b| a.wrapping_add(*b));
+        block[edid::BLOCK_LEN - 1] = sum.wrapping_neg();
+
+        // A whole block decodes.
+        let whole = panel_timing_in(&block, 128).expect("a whole block was refused");
+        assert_eq!((whole.hdisplay, whole.vdisplay), (1920, 1080));
+        assert_eq!(whole.refresh_hz(), 60);
+        // And the same bytes, reported as a short read, do not.
+        for len in [0u32, 1, 64, 127] {
+            assert_eq!(
+                panel_timing_in(&block, len),
+                None,
+                "a {}-byte read was decoded as a whole block",
+                len
+            );
+        }
     }
 
     #[test]
