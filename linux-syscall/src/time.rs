@@ -6,7 +6,7 @@ use crate::Syscall;
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use core::convert::TryFrom;
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use core::time::Duration;
 use kernel_hal::{user::UserInOutPtr, user::UserInPtr, user::UserOutPtr};
 use lazy_static::lazy_static;
@@ -18,7 +18,7 @@ use linux_object::thread::ThreadExt;
 use linux_object::time::*;
 use lock::Mutex;
 use zircon_object::object::{KernelObject, KoID};
-use zircon_object::task::{Thread, ROOT_JOB};
+use zircon_object::task::{Status, Thread, ROOT_JOB};
 
 const USEC_PER_TICK: usize = 10000;
 
@@ -753,6 +753,7 @@ impl Syscall<'_> {
             let proc = self.zircon_process();
             timer_notify_from_sigevent(&event, |tid| proc.get_child(tid).is_ok())?
         };
+        ensure_posix_timers_die_with_their_owner();
         let id = NEXT_TIMER_ID.fetch_add(1, Ordering::Relaxed);
         POSIX_TIMERS.lock().insert(
             id,
@@ -1148,6 +1149,38 @@ pub fn drop_posix_timers_of(owner: KoID) -> usize {
     before - timers.len()
 }
 
+/// Whether the process-exit hook that deletes a dead process's timers is in
+/// place. Registered on the first `timer_create`, once: `linux-object` runs its
+/// exit hooks from the `PROCESS_TERMINATED` callback and cannot name this
+/// crate's table itself.
+static EXIT_HOOK_REGISTERED: AtomicBool = AtomicBool::new(false);
+
+/// `exit_itimers()` in `do_exit()`: a process's POSIX timers die with it.
+///
+/// They did not. The table is keyed by the owner's pid and nothing consulted
+/// it when a process ended, so a timer outlived its creator: a periodic one
+/// went on re-arming itself from its own callback and firing a signal at the
+/// dead pid on every period, for as long as the machine stayed up, and every
+/// one-shot or disarmed entry stayed in the table. A program that runs on a
+/// `timer_create` tick and is started and killed a few hundred times leaves
+/// that many timers ticking behind it.
+fn ensure_posix_timers_die_with_their_owner() {
+    if !EXIT_HOOK_REGISTERED.swap(true, Ordering::AcqRel) {
+        linux_object::process::register_process_exit_hook(|pid| {
+            drop_posix_timers_of(pid);
+        });
+    }
+}
+
+/// Whether `pid` is a live process: present and not yet exited. A zombie
+/// counts as dead, because Linux deletes the timers in `do_exit`, before the
+/// parent has reaped anything.
+fn process_is_alive(pid: KoID) -> bool {
+    ROOT_JOB
+        .find_process(pid)
+        .is_some_and(|p| !matches!(p.status(), Status::Exited(_)))
+}
+
 /// What an expiring `setitimer(2)` slot delivers: its signal, sent by the
 /// kernel with nobody behind it (`it_real_fn` -> `SEND_SIG_PRIV`: `SI_KERNEL`,
 /// pid and uid 0).
@@ -1228,6 +1261,19 @@ fn arm_posix_timer(id: usize, deadline: Duration, gen: u64) {
 /// `timer_getoverrun`, and say when it fires next if it is periodic.
 /// Nothing if the timer was deleted or re-armed since (`gen`).
 fn expire_posix_timer(id: usize, gen: u64, now: Duration) -> Option<Duration> {
+    // The owner first, and outside the table's lock: `find_process` takes the
+    // job's. A timer whose owner has died since it was armed (the exit hook
+    // and this callback can race) is deleted here instead of fired, and a
+    // periodic one is not re-armed: nothing is left to receive its signal.
+    let owner = POSIX_TIMERS
+        .lock()
+        .get(&id)
+        .filter(|t| t.generation == gen)
+        .map(|t| t.owner)?;
+    if !process_is_alive(owner) {
+        POSIX_TIMERS.lock().remove(&id);
+        return None;
+    }
     let mut fire = None;
     let mut rearm = None;
     {
@@ -1609,6 +1655,145 @@ mod exec_timer_tests {
         assert_eq!(drop_posix_timers_of(0x4711_0006), 0);
         assert!(still_there(theirs));
         POSIX_TIMERS.lock().remove(&theirs);
+    }
+}
+
+#[cfg(test)]
+mod exit_timer_tests {
+    //! `exit_itimers()`: a process's POSIX timers die with it. They did not:
+    //! nothing looked at the table when a process ended, so a periodic timer
+    //! kept re-arming itself and firing at the dead pid for ever, and every
+    //! other entry of the dead process stayed in the table.
+    //!
+    //! Each test owns its pids and asserts only on its own ids, so it holds
+    //! with the rest of the binary running in parallel.
+    use super::*;
+    use linux_object::process::LinuxProcess;
+    use rcore_fs_ramfs::RamFS;
+    use zircon_object::task::Process;
+
+    fn a_periodic_timer_of(owner: KoID) -> usize {
+        let id = NEXT_TIMER_ID.fetch_add(1, Ordering::Relaxed);
+        POSIX_TIMERS.lock().insert(
+            id,
+            PosixTimer {
+                owner,
+                notify: TimerNotify::SIGALRM_TO_PROCESS,
+                clock: ClockBase::Monotonic,
+                interval: Duration::from_secs(1),
+                next: Duration::from_secs(1),
+                generation: 0,
+                overrun_last: 0,
+            },
+        );
+        id
+    }
+
+    fn still_there(id: usize) -> bool {
+        POSIX_TIMERS.lock().contains_key(&id)
+    }
+
+    /// The death of a process built the way the kernel builds them, through
+    /// `create_linux`, which is where the exit callback is registered.
+    #[test]
+    fn a_process_that_dies_takes_its_timers_with_it_and_nobody_elses() {
+        let (mine, neighbour) = (0x4712_0001, 0x4712_0002);
+        let proc = Process::create_linux(&ROOT_JOB, RamFS::new(), 0, None, mine).unwrap();
+        ensure_posix_timers_die_with_their_owner();
+        let one = a_periodic_timer_of(mine);
+        let two = a_periodic_timer_of(mine);
+        let theirs = a_periodic_timer_of(neighbour);
+
+        proc.exit(0);
+
+        assert!(!still_there(one), "the dead process's timer is still armed");
+        assert!(!still_there(two));
+        assert!(
+            still_there(theirs),
+            "a death in one process took another process's timer"
+        );
+        POSIX_TIMERS.lock().remove(&theirs);
+    }
+
+    /// The hook is registered once however many timers are created: a second
+    /// `timer_create` must not stack a second copy that would run at every
+    /// death (the exit path of every process is not the place to grow).
+    #[test]
+    fn the_exit_hook_is_registered_once() {
+        let before = linux_object::process::process_exit_hook_count();
+        ensure_posix_timers_die_with_their_owner();
+        ensure_posix_timers_die_with_their_owner();
+        ensure_posix_timers_die_with_their_owner();
+        let after = linux_object::process::process_exit_hook_count();
+        assert!(after <= before + 1, "{} hooks stacked up", after - before);
+        assert!(EXIT_HOOK_REGISTERED.load(Ordering::Acquire));
+    }
+
+    /// The callback of a timer whose owner has already died (exited, whether
+    /// or not the parent has reaped it): the timer is deleted there and then,
+    /// no signal goes anywhere, and there is no next expiry to arm.
+    #[test]
+    fn an_expiry_after_the_owners_death_deletes_the_timer_and_does_not_rearm() {
+        let owner = 0x4712_0003;
+        // Built without the exit callback, so the death alone leaves the
+        // entry in place and it is the expiry that must clean up.
+        let proc = Process::create_with_fixed_id_ext(
+            &ROOT_JOB,
+            owner,
+            "p",
+            LinuxProcess::new(RamFS::new(), 0),
+        )
+        .unwrap();
+        // A thread that never ran keeps the process in the job after
+        // `exit`: findable, `Exited`, its threads still dying. That is the
+        // zombie the check has to call dead, not only a pid that names
+        // nothing any more.
+        let _thread = Thread::create_linux(&proc).unwrap();
+        let id = a_periodic_timer_of(owner);
+        proc.exit(0);
+        assert!(still_there(id), "the setup: nothing else deleted it");
+        assert!(
+            matches!(
+                ROOT_JOB.find_process(owner).map(|p| p.status()),
+                Some(Status::Exited(_))
+            ),
+            "the setup: the owner is a zombie the job still lists"
+        );
+
+        let next = expire_posix_timer(id, 0, Duration::from_secs(1));
+
+        assert_eq!(next, None, "a dead owner's periodic timer was re-armed");
+        assert!(!still_there(id), "and its entry was kept");
+    }
+
+    /// A pid that names no process at all, which is what the callback sees
+    /// once the dead process is gone from the job.
+    #[test]
+    fn an_expiry_for_a_pid_that_names_no_process_deletes_the_timer() {
+        let id = a_periodic_timer_of(0x4712_0004);
+        assert_eq!(expire_posix_timer(id, 0, Duration::from_secs(1)), None);
+        assert!(!still_there(id));
+    }
+
+    /// The other side of the check: a live owner's periodic timer goes on
+    /// as before, with the next expiry a period later and the entry kept.
+    #[test]
+    fn a_live_owners_periodic_timer_still_rearms() {
+        let owner = 0x4712_0005;
+        let _proc = Process::create_with_fixed_id_ext(
+            &ROOT_JOB,
+            owner,
+            "p",
+            LinuxProcess::new(RamFS::new(), 0),
+        )
+        .unwrap();
+        let id = a_periodic_timer_of(owner);
+
+        let next = expire_posix_timer(id, 0, Duration::from_secs(1));
+
+        assert_eq!(next, Some(Duration::from_secs(2)));
+        assert!(still_there(id), "a live owner's timer was deleted");
+        POSIX_TIMERS.lock().remove(&id);
     }
 }
 

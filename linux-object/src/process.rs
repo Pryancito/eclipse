@@ -205,6 +205,37 @@ impl Default for Credentials {
     }
 }
 
+lazy_static::lazy_static! {
+    /// What else dies with a process, registered by the layers above this
+    /// crate for the state they keep by pid and this crate cannot name: the
+    /// POSIX timers of `timer_create(2)` live in `linux-syscall`. Each hook
+    /// runs once per process death, with the dead process's pid, from the
+    /// `PROCESS_TERMINATED` callbacks below, after the process's own tables
+    /// have been torn down.
+    static ref PROCESS_EXIT_HOOKS: Mutex<Vec<fn(KoID)>> = Mutex::new(Vec::new());
+}
+
+/// Run `hook(pid)` whenever a process dies. Registration is not deduplicated:
+/// a layer that may register more than once keeps its own once-flag.
+pub fn register_process_exit_hook(hook: fn(KoID)) {
+    PROCESS_EXIT_HOOKS.lock().push(hook);
+}
+
+/// How many hooks are registered, for a layer to check that its own once-flag
+/// holds.
+pub fn process_exit_hook_count() -> usize {
+    PROCESS_EXIT_HOOKS.lock().len()
+}
+
+/// The death of `pid`, told to every registered hook. The list is copied out
+/// first: a hook may take locks of its own, and must not run under this one.
+fn run_process_exit_hooks(pid: KoID) {
+    let hooks: Vec<fn(KoID)> = PROCESS_EXIT_HOOKS.lock().clone();
+    for hook in hooks {
+        hook(pid);
+    }
+}
+
 impl ProcessExt for Process {
     fn create_linux(
         job: &Arc<Job>,
@@ -234,6 +265,9 @@ impl ProcessExt for Process {
                     // Record locks die with the process (same as the
                     // fork path below; see `record_lock::release_owner`).
                     crate::fs::record_lock::release_owner(proc.id());
+                    // And so does what the layers above keep by pid (the
+                    // POSIX timers); see `register_process_exit_hook`.
+                    run_process_exit_hooks(proc.id());
                     // try_linux (not linux): this callback runs from the
                     // object layer on PROCESS_TERMINATED, concurrently with
                     // SMP teardown churn. If the extension can no longer be
@@ -513,6 +547,9 @@ impl ProcessExt for Process {
                     // lazy liveness prune in `record_lock` cannot tell a dead
                     // owner from a recycled pid (see `release_owner`).
                     crate::fs::record_lock::release_owner(child.id());
+                    // And what the layers above keep by pid (the POSIX
+                    // timers); see `register_process_exit_hook`.
+                    run_process_exit_hooks(child.id());
                     // try_linux (not linux): this callback fires from the object
                     // layer on PROCESS_TERMINATED, concurrently with SMP teardown
                     // churn. A process whose extension can no longer be resolved
@@ -9714,5 +9751,41 @@ mod sem_id_from_elsewhere_tests {
         assert!(sem_lookup(id).is_none());
         assert!(lp.semaphores_get(id).is_some(), "but a holder keeps it");
         assert!(lp.semaphores_get(id + 1).is_none());
+    }
+}
+
+#[cfg(test)]
+mod exit_hook_tests {
+    //! The death of a process, told to the layers above this crate that keep
+    //! state by pid (`register_process_exit_hook`): the POSIX timers of
+    //! `linux-syscall` outlived their process because nothing here could
+    //! reach their table.
+    use super::*;
+    use core::sync::atomic::{AtomicU64, AtomicUsize};
+    use rcore_fs_ramfs::RamFS;
+
+    static DEATHS: AtomicUsize = AtomicUsize::new(0);
+    static LAST_DEAD: AtomicU64 = AtomicU64::new(0);
+
+    fn note_death(pid: KoID) {
+        DEATHS.fetch_add(1, Ordering::SeqCst);
+        LAST_DEAD.store(pid, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn a_hook_runs_once_per_death_with_the_dead_pid() {
+        register_process_exit_hook(note_death);
+        let pid = 0x5e12;
+        let proc = Process::create_linux(&ROOT_JOB, RamFS::new(), 0, None, pid).unwrap();
+        let before = DEATHS.load(Ordering::SeqCst);
+
+        proc.exit(3);
+
+        assert_eq!(
+            DEATHS.load(Ordering::SeqCst),
+            before + 1,
+            "the hook ran a different number of times than the process died"
+        );
+        assert_eq!(LAST_DEAD.load(Ordering::SeqCst), pid);
     }
 }
