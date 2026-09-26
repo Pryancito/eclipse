@@ -7,6 +7,7 @@ pub(super) mod vm;
 
 pub mod acpi_tables;
 pub mod addr;
+pub mod affinity_walk;
 #[cfg(feature = "graphic")]
 pub mod boot_logo;
 pub mod cache_maint;
