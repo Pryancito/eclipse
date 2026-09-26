@@ -7904,13 +7904,20 @@ impl DrmScheme for NvidiaGpu {
         let connected = d.connected_mask & did != 0;
         if connected && d.edid_valid == 1 && d.edid_display_id == did {
             if let Some((boot_e, boot_len)) = boot_edid() {
-                if boot_len >= 128 && boot_e[8..12] == d.edid_head[8..12] {
+                if boot_len as usize >= crate::display::edid::BLOCK_LEN
+                    && boot_e[8..12] == d.edid_head[8..12]
+                {
                     return Some(boot_e);
                 }
             }
-            let mut edid = [0u8; 128];
-            edid[..32].copy_from_slice(&d.edid_head);
-            return Some(edid);
+            // The RM gives us the first 32 bytes and nothing more, and the
+            // connector property has to be a whole block. Zero-padding them --
+            // which is what this did -- fails the checksum, so every client
+            // that checks (libdisplay-info, so wlroots) throws away the make,
+            // the model and the stated size that WERE in those 32 bytes.
+            // Completing the block keeps them and declares no timings, which is
+            // legal: the client falls back to the mode it was given.
+            return crate::display::edid::finish_partial_block(&d.edid_head);
         }
         None
     }

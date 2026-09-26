@@ -7720,6 +7720,74 @@ mod hw_kms_tests {
         c.destroy_dumb(cur.handle).expect("DESTROY_DUMB cursor");
         c.destroy_dumb(buf.handle).expect("DESTROY_DUMB");
     }
+    // ---- the EDID a driver reports, and whether the core serves it ----
+
+    /// A whole block with a correct header and checksum, as a monitor sends one.
+    fn real_edid() -> [u8; 128] {
+        let mut b = [0u8; 128];
+        b[..8].copy_from_slice(&[0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00]);
+        b[18] = 1;
+        b[19] = 4;
+        b[21] = 60;
+        b[22] = 34;
+        let sum = b[..127].iter().fold(0u8, |s, x| s.wrapping_add(*x));
+        b[127] = sum.wrapping_neg();
+        b
+    }
+
+    /// The defect this pair of tests exists for. `NvidiaGpu::get_connector_edid`
+    /// used to build a block out of the 32 bytes the RM gives it by padding the
+    /// rest with zeros, and the DRM core served whatever a driver reported after
+    /// a length check alone. Those bytes cannot pass a checksum, so wlroots --
+    /// through libdisplay-info, which checks -- threw the whole block away and
+    /// the output lost the make, the model and the size that WERE in the 32 real
+    /// bytes. Worse, the kernel refused the same block for its own mode (every
+    /// decoder gates on `block_valid`), so the EDID it handed out and the mode it
+    /// advertised could disagree about the same monitor.
+    #[test]
+    fn a_driver_that_reports_something_that_is_not_an_edid_has_it_refused() {
+        let screen = kms_emu::attach(64, 16);
+        let mut padded = real_edid();
+        // Keep the header, drop the checksum: exactly the shape zero-padding
+        // produces, and exactly the shape a length check lets through.
+        padded[127] = padded[127].wrapping_add(1);
+        let gpu = screen.attach_gpu(EmuGpu::new("emu-edid").with_edid(padded));
+
+        assert_eq!(
+            drm::get_connector_edid(41),
+            None,
+            "a block that fails its own checksum was served as a monitor's identity"
+        );
+        drop(gpu);
+    }
+
+    /// And the other direction, so the refusal is not simply "always none":
+    /// a driver reporting a real block still has it served, byte for byte.
+    #[test]
+    fn a_driver_that_reports_a_real_edid_has_it_served_unchanged() {
+        let screen = kms_emu::attach(64, 16);
+        let good = real_edid();
+        let gpu = screen.attach_gpu(EmuGpu::new("emu-edid").with_edid(good));
+
+        assert_eq!(drm::get_connector_edid(41), Some(good));
+        drop(gpu);
+    }
+
+    /// The 32 bytes the RM actually gives, completed the way the driver now
+    /// completes them, go through. The two halves of the fix have to agree: a
+    /// core that refuses without a driver that repairs would just lose the
+    /// monitor's identity instead of keeping it.
+    #[test]
+    fn the_thirty_two_byte_head_the_rm_gives_is_served_once_completed() {
+        let screen = kms_emu::attach(64, 16);
+        let head = &real_edid()[..32];
+        let completed = zcore_drivers::display::edid::finish_partial_block(head)
+            .expect("a real head completes");
+        let gpu = screen.attach_gpu(EmuGpu::new("emu-edid").with_edid(completed));
+
+        assert_eq!(drm::get_connector_edid(41), Some(completed));
+        drop(gpu);
+    }
 }
 
 #[cfg(test)]

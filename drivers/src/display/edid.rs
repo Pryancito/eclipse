@@ -47,6 +47,52 @@ pub fn block_valid(block: &[u8]) -> bool {
         == 0
 }
 
+/// Complete a PARTIAL EDID read into a whole, self-consistent block.
+///
+/// The NVIDIA RM hands back only the first 32 bytes of the active panel's EDID
+/// (`edid_head`), and the connector's EDID property has to be a whole 128-byte
+/// block. Zero-padding those 32 bytes produces something that fails
+/// [`block_valid`] on the checksum, so every client that checks -- and
+/// `libdisplay-info`, which wlroots uses, checks -- throws the whole thing away
+/// and the monitor ends up with no make, no model and no stated size, even
+/// though all three were in the bytes we had.
+///
+/// Completing it instead keeps them. Bytes 0-22 carry the header, the
+/// manufacturer, the product code, the serial, the date, the EDID version and
+/// the size in whole centimetres; the rest of a block is timings, and a block
+/// that declares none is legal -- a client falls back to the mode it was given,
+/// which is what it would have done with no EDID at all. So this fills the tail
+/// with zeros, leaves the extension count at zero because there is no extension
+/// block to point at, and writes byte 127 so the block sums to zero.
+///
+/// `None` when the head does not start with the EDID header (whatever those
+/// bytes are, they are not an EDID and giving them a valid checksum would only
+/// make line noise look authoritative), or when it is shorter than the basic
+/// display parameters, or when it is already a whole block -- recomputing the
+/// checksum of a full block would mask exactly the corruption [`block_valid`]
+/// exists to catch, so a caller holding 128 bytes must use that instead.
+pub fn finish_partial_block(head: &[u8]) -> Option<[u8; BLOCK_LEN]> {
+    // Through byte 22, the vertical size in centimetres: the last field that is
+    // worth completing a block for. Shorter than that and all we would be
+    // serving is a header.
+    const MIN_USEFUL: usize = 23;
+    if head.len() < MIN_USEFUL || head.len() >= BLOCK_LEN {
+        return None;
+    }
+    if head[..8] != HEADER {
+        return None;
+    }
+    let mut block = [0u8; BLOCK_LEN];
+    block[..head.len()].copy_from_slice(head);
+    // Byte 127 is defined so the whole block sums to zero, and it is the only
+    // byte this sets: everything from `head.len()` to 126 is already zero.
+    let sum = block[..BLOCK_LEN - 1]
+        .iter()
+        .fold(0u8, |acc, b| acc.wrapping_add(*b));
+    block[BLOCK_LEN - 1] = sum.wrapping_neg();
+    Some(block)
+}
+
 /// The four 18-byte descriptors, in order.
 fn descriptors(block: &[u8]) -> impl Iterator<Item = &[u8]> {
     (0..4).filter_map(move |i| {
@@ -959,5 +1005,110 @@ mod tests {
             u32::MAX,
             "saturates instead of wrapping"
         );
+    }
+
+    // ---- completing a partial read ----
+
+    /// A 32-byte head from the RM, made whole. The point of the exercise: the
+    /// result passes the same validation the decoders apply, so a client no
+    /// longer throws away a manufacturer and a model it could have had.
+    #[test]
+    fn a_thirty_two_byte_head_becomes_a_block_the_decoders_accept() {
+        let mut head = [0u8; 32];
+        head[..8].copy_from_slice(&HEADER);
+        head[8] = 0x04; // manufacturer id, high byte
+        head[9] = 0x72;
+        head[18] = 1;
+        head[19] = 4;
+        head[21] = 60; // 60 cm wide
+        head[22] = 34; // 34 cm tall
+        let block = finish_partial_block(&head).expect("a real head completes");
+        assert!(
+            block_valid(&block),
+            "the completed block still fails the check it was completed for"
+        );
+        // And the bytes we actually had are the ones served.
+        assert_eq!(&block[..32], &head[..]);
+        assert_eq!(physical_size_mm(&block), Some((600, 340)));
+    }
+
+    /// A completed block declares no timings, which is legal and is what makes
+    /// the trade honest: the client gets the identity and falls back to the mode
+    /// it was given for the timing, exactly as it would with no EDID at all.
+    #[test]
+    fn a_completed_block_states_no_timings_rather_than_inventing_one() {
+        let mut head = [0u8; 32];
+        head[..8].copy_from_slice(&HEADER);
+        head[18] = 1;
+        head[19] = 4;
+        let block = finish_partial_block(&head).unwrap();
+        assert_eq!(preferred_timing(&block), None);
+        assert_eq!(preferred_mode(&block), None);
+        // No extension block is pointed at, because there is none to point at.
+        assert_eq!(block[126], 0);
+    }
+
+    /// Bytes that are not an EDID stay not an EDID. Giving line noise a correct
+    /// checksum is the one thing this must never do: it would turn a block
+    /// `block_valid` refuses into one it accepts, which is the whole defect
+    /// inverted.
+    #[test]
+    fn a_head_without_the_edid_header_is_refused() {
+        let mut garbage = [0xA5u8; 32];
+        garbage[18] = 1;
+        assert_eq!(finish_partial_block(&garbage), None);
+        // One byte of the header wrong is still not an EDID.
+        let mut nearly = [0u8; 32];
+        nearly[..8].copy_from_slice(&HEADER);
+        nearly[7] = 0x01;
+        assert_eq!(finish_partial_block(&nearly), None);
+    }
+
+    /// A head too short to carry the basic display parameters is only a header,
+    /// and completing it would serve a block that says nothing at all.
+    #[test]
+    fn a_head_shorter_than_the_basic_parameters_is_refused() {
+        let mut head = [0u8; 22];
+        head[..8].copy_from_slice(&HEADER);
+        assert_eq!(finish_partial_block(&head), None);
+        // 23 bytes -- through the vertical size in centimetres -- is enough.
+        let mut just_enough = [0u8; 23];
+        just_enough[..8].copy_from_slice(&HEADER);
+        just_enough[22] = 34;
+        assert!(finish_partial_block(&just_enough).is_some());
+    }
+
+    /// A caller holding a whole block must use `block_valid`, not this.
+    /// Recomputing byte 127 over 128 bytes we did not read ourselves would mask
+    /// exactly the corruption the checksum is there to catch -- a monitor whose
+    /// EDID arrived with one bit flipped would come out looking authoritative.
+    #[test]
+    fn a_whole_block_is_refused_so_its_checksum_is_never_rewritten() {
+        let mut whole = edid(|b| b[21] = 60);
+        assert!(block_valid(&whole));
+        assert_eq!(finish_partial_block(&whole), None);
+        // Including -- especially -- a corrupt one.
+        whole[40] ^= 0xFF;
+        assert!(!block_valid(&whole));
+        assert_eq!(finish_partial_block(&whole), None);
+    }
+
+    /// The zero-padding this replaces, spelled out: 32 real bytes with 96 zeros
+    /// after them is a block every checking client rejects. That is what was
+    /// being served.
+    #[test]
+    fn zero_padding_a_head_is_what_used_to_be_served_and_it_does_not_validate() {
+        let mut head = [0u8; 32];
+        head[..8].copy_from_slice(&HEADER);
+        head[18] = 1;
+        head[21] = 60;
+        let mut padded = [0u8; BLOCK_LEN];
+        padded[..32].copy_from_slice(&head);
+        assert!(
+            !block_valid(&padded),
+            "if zero-padding validates, the checksum byte happened to land on \
+             zero and this test needs a different head"
+        );
+        assert!(block_valid(&finish_partial_block(&head).unwrap()));
     }
 }
