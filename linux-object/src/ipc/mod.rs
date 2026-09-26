@@ -2,6 +2,8 @@
 #![deny(missing_docs)]
 mod msgqueue;
 mod semary;
+#[cfg(test)]
+pub(crate) use self::semary::test_globals as sem_test_globals;
 mod shared_mem;
 
 pub use self::msgqueue::*;
@@ -153,8 +155,9 @@ pub const IPC_R: u32 = 0o4;
 /// `msgsnd` always, `shmat` unless the caller asked for `SHM_RDONLY`.
 pub const IPC_W: u32 = 0o2;
 
-/// Semaphore set identifier (in a process)
-type SemId = usize;
+/// Semaphore set identifier. System-wide, like [`ShmId`]: `semget(2)`'s id
+/// means the same set in every process. See [`semary::sem_register`].
+pub type SemId = usize;
 /// Shared memory identifier. System-wide: `shmget(2)`'s id means the same
 /// segment in every process, which is how two programs with no common
 /// ancestor share memory. See [`shared_mem::shm_register`].
@@ -167,11 +170,15 @@ type SemNum = u16;
 type SemOp = i16;
 
 impl SemProc {
-    /// Insert the `array` and return its ID
-    pub fn add(&mut self, array: Arc<SemArray>) -> SemId {
-        let id = self.get_free_id();
+    /// Record that this process is using the set `id` names.
+    ///
+    /// The id comes from [`semary::sem_register`] and is the same number in
+    /// every process; this table is what THIS process has used, so its
+    /// `SEM_UNDO` records have a set to replay against at exit. It used to
+    /// hand out its own ids, indices from 0 into this very map, so the same
+    /// number named a different set in every process.
+    pub fn add(&mut self, id: SemId, array: Arc<SemArray>) {
         self.arrays.insert(id, array);
-        id
     }
 
     /// Remove an `array` by ID
@@ -184,11 +191,6 @@ impl SemProc {
     pub fn remove(&mut self, id: SemId) {
         self.arrays.remove(&id);
         self.undos.retain(|&(undo_id, _), _| undo_id != id);
-    }
-
-    /// Get a free ID
-    fn get_free_id(&self) -> SemId {
-        (0..).find(|i| !self.arrays.contains_key(i)).unwrap()
     }
 
     /// Get an semaphore set by `id`
@@ -530,7 +532,8 @@ mod sem_proc_tests {
         // semop(.., SEM_UNDO); semctl(.., IPC_RMID); exit. Three ordinary
         // syscalls, and the third one used to panic inside `Drop`.
         let mut proc = SemProc::default();
-        let id = proc.add(set(1));
+        let id = 7;
+        proc.add(id, set(1));
         proc.add_undo(id, 0, -1);
         proc.remove(id);
         drop(proc);
@@ -540,8 +543,9 @@ mod sem_proc_tests {
     fn removing_a_set_drops_its_undo_records_and_leaves_the_others() {
         let _guard = test_lock();
         let mut proc = SemProc::default();
-        let a = proc.add(set(1));
-        let b = proc.add(set(1));
+        let (a, b) = (7, 8);
+        proc.add(a, set(1));
+        proc.add(b, set(1));
         proc.add_undo(a, 0, -1);
         proc.add_undo(b, 0, -1);
         proc.remove(a);
@@ -555,7 +559,8 @@ mod sem_proc_tests {
         // semop(-1) takes one; the undo puts it back.
         let array = set(1);
         let mut proc = SemProc::default();
-        let id = proc.add(array.clone());
+        let id = 7;
+        proc.add(id, array.clone());
         array.get_sem(0).unwrap().set(3);
         proc.add_undo(id, 0, -1);
         drop(proc);
@@ -569,7 +574,8 @@ mod sem_proc_tests {
         // of -1, which is not 1 and not 0.
         let array = set(1);
         let mut proc = SemProc::default();
-        let id = proc.add(array.clone());
+        let id = 7;
+        proc.add(id, array.clone());
         array.get_sem(0).unwrap().set(3);
         proc.add_undo(id, 0, 1);
         drop(proc);
@@ -582,7 +588,8 @@ mod sem_proc_tests {
         // Two waits in a row record 2, which was the other `unimplemented!()`.
         let array = set(1);
         let mut proc = SemProc::default();
-        let id = proc.add(array.clone());
+        let id = 7;
+        proc.add(id, array.clone());
         proc.add_undo(id, 0, -1);
         proc.add_undo(id, 0, -1);
         proc.add_undo(id, 0, -1);
@@ -596,7 +603,8 @@ mod sem_proc_tests {
         let _guard = test_lock();
         let array = set(1);
         let mut proc = SemProc::default();
-        let id = proc.add(array.clone());
+        let id = 7;
+        proc.add(id, array.clone());
         array.get_sem(0).unwrap().set(5);
         proc.add_undo(id, 0, -1);
         proc.add_undo(id, 0, 1);
@@ -610,7 +618,8 @@ mod sem_proc_tests {
         let _guard = test_lock();
         let array = set(3);
         let mut proc = SemProc::default();
-        let id = proc.add(array.clone());
+        let id = 7;
+        proc.add(id, array.clone());
         proc.add_undo(id, 0, -1);
         proc.add_undo(id, 2, -2);
         drop(proc);
@@ -626,7 +635,8 @@ mod sem_proc_tests {
         // one step down: 32768 syscalls, which any process can afford, and a
         // subtraction overflow panic in a debug kernel.
         let mut proc = SemProc::default();
-        let id = proc.add(set(1));
+        let id = 7;
+        proc.add(id, set(1));
         for _ in 0..40_000 {
             proc.add_undo(id, 0, 1);
         }
@@ -644,7 +654,8 @@ mod sem_proc_tests {
         // checked the number first, but `Drop` must not be the place that
         // finds out otherwise.
         let mut proc = SemProc::default();
-        let id = proc.add(set(1));
+        let id = 7;
+        proc.add(id, set(1));
         proc.add_undo(id, 9, -1);
         drop(proc);
     }
@@ -664,7 +675,8 @@ mod sem_proc_tests {
         // Otherwise both halves of a fork undo the same operation.
         let array = set(1);
         let mut parent = SemProc::default();
-        let id = parent.add(array.clone());
+        let id = 7;
+        parent.add(id, array.clone());
         parent.add_undo(id, 0, -1);
         let child = parent.clone();
         assert!(child.undos.is_empty());
@@ -680,15 +692,22 @@ mod sem_proc_tests {
     }
 
     #[test]
-    fn ids_are_handed_out_from_the_lowest_free_one() {
+    fn the_table_records_sets_under_the_id_it_is_given() {
         let _guard = test_lock();
-        let mut proc = SemProc::default();
-        assert_eq!(proc.add(set(1)), 0);
-        assert_eq!(proc.add(set(1)), 1);
-        assert_eq!(proc.add(set(1)), 2);
-        proc.remove(1);
-        assert!(proc.get(1).is_none());
-        assert_eq!(proc.add(set(1)), 1, "the hole is filled before the end");
+        // The id is the system-wide one `sem_register` handed out, not a
+        // number of this table's own choosing: two processes recording the
+        // same set do it under the same number.
+        let array = set(1);
+        let mut a = SemProc::default();
+        let mut b = SemProc::default();
+        a.add(4242, array.clone());
+        b.add(4242, array.clone());
+        assert!(Arc::ptr_eq(&a.get(4242).unwrap(), &array));
+        assert!(Arc::ptr_eq(&b.get(4242).unwrap(), &array));
+        assert!(a.get(0).is_none(), "nothing was ever numbered from 0");
+        a.remove(4242);
+        assert!(a.get(4242).is_none());
+        assert!(b.get(4242).is_some(), "each table is its own process's");
     }
 }
 

@@ -79,7 +79,71 @@ impl SemArray {
 
 lazy_static! {
     static ref KEY2SEM: RwLock<BTreeMap<u32, Weak<SemArray>>> = RwLock::new(BTreeMap::new());
+    /// Every semaphore set in the system, under the id `semget(2)` handed
+    /// out for it. See [`sem_register`].
+    static ref SEMID2SEM: RwLock<BTreeMap<SemId, Arc<SemArray>>> =
+        RwLock::new(BTreeMap::new());
+    /// The next id to hand out. Ids are never reused, so a stale `semid` kept
+    /// by a program whose set was removed names nothing rather than somebody
+    /// else's set (Linux gets the same property from the sequence number it
+    /// packs into the id).
+    static ref NEXT_SEMID: Mutex<SemId> = Mutex::new(1);
 }
+
+/// `SEMMNI`: how many sets may exist at once, Linux's own default.
+pub const SEMMNI: usize = 32000;
+
+/// Register a set under a **system-wide** id and return it, or return the id
+/// it already has.
+///
+/// `semget(2)` returns an identifier that means the same set in every
+/// process, and the set lives until `semctl(IPC_RMID)` whether or not its
+/// creator is still around (sysvipc(7)). Neither was true here. The id was an
+/// index into the CALLING process's own table, counted from 0 per process, so
+/// an id passed to an unrelated program (`ipcrm -s`, a cleanup script, a
+/// lock daemon handing its clients a semid through a file) named a different
+/// set there or nothing at all. And the only strong references to a set were
+/// the tables of the processes that had `semget`-ed it: a setup program that
+/// created a set, initialised it with `SETALL` and exited took the set with
+/// it, and the daemon that came next got `ENOENT` for the key -- and every
+/// value it had been given was gone.
+///
+/// `msg_get` and `shm_register` already keep their objects this way; the
+/// semaphore sets were the last of the three left behind.
+pub fn sem_register(array: &Arc<SemArray>) -> Result<SemId, LxError> {
+    let mut table = SEMID2SEM.write();
+    // `semget` on an existing key answers with the id that key already has,
+    // as Linux does -- not a second id for the same set.
+    if let Some((&id, _)) = table.iter().find(|(_, a)| Arc::ptr_eq(a, array)) {
+        return Ok(id);
+    }
+    // The table is what keeps a set alive past its creator, so without a
+    // bound a loop of `semget(IPC_PRIVATE, ...)` from an ordinary process
+    // would pin kernel memory for ever. Linux bounds it the same way and
+    // with the same error.
+    if table.len() >= SEMMNI {
+        return Err(LxError::ENOSPC);
+    }
+    let mut next = NEXT_SEMID.lock();
+    let id = *next;
+    *next += 1;
+    table.insert(id, array.clone());
+    Ok(id)
+}
+
+/// The set an id names, from any process.
+pub fn sem_lookup(id: SemId) -> Option<Arc<SemArray>> {
+    SEMID2SEM.read().get(&id).cloned()
+}
+
+/// `semctl(id, IPC_RMID, ..)`: the id stops naming the set. A process still
+/// holding it in its own table keeps the object (its waiters wake into
+/// `EIDRM` through [`SemArray::remove`]); nobody can find it again.
+pub fn sem_unregister(id: SemId) -> bool {
+    SEMID2SEM.write().remove(&id).is_some()
+}
+
+lazy_static! {}
 
 impl SemArray {
     fn purge_stale_keys(map: &mut BTreeMap<u32, Weak<SemArray>>) {
@@ -587,9 +651,134 @@ mod sem_tests {
     }
 }
 
+/// The id `semget` hands out was an index into the calling process's own
+/// table, and a set lived only as long as some process's table held it. Both
+/// are wrong by sysvipc(7): the id is system-wide, and the set stays until
+/// `IPC_RMID`.
+#[cfg(test)]
+mod sem_registry_tests {
+    use super::*;
+    use crate::ipc::semary::test_globals::lock as test_lock;
+
+    extern crate std;
+
+    /// `IPC_CREAT`, as userspace spells it.
+    const CREAT: usize = 0o1000;
+
+    fn clear_ids() {
+        SEMID2SEM.write().clear();
+    }
+
+    fn private_set() -> Arc<SemArray> {
+        SemArray::get_or_create(0, 1, CREAT | 0o666, 0, 0).unwrap()
+    }
+
+    #[test]
+    fn an_id_names_the_same_set_from_anywhere() {
+        let _guard = test_lock();
+        clear_ids();
+        let array = private_set();
+        let id = sem_register(&array).unwrap();
+        // Another process, knowing only the number.
+        let found = sem_lookup(id).expect("the id must name the set anywhere");
+        assert!(Arc::ptr_eq(&found, &array));
+        clear_ids();
+    }
+
+    /// A setup program creates the set, sets its values and exits. The daemon
+    /// that comes next must find it by key, values and all -- the set used to
+    /// die with the last table that held it, and the daemon got `ENOENT`.
+    #[test]
+    fn a_set_outlives_the_process_that_made_it() {
+        let _guard = test_lock();
+        clear_ids();
+        const KEY: u32 = 0x5e5e_0001;
+        let id = {
+            let array = SemArray::get_or_create(KEY, 1, CREAT | 0o666, 0, 0).unwrap();
+            array.get_sem(0).unwrap().set(7);
+            sem_register(&array).unwrap()
+            // ...and the creator's reference is gone.
+        };
+        let again = SemArray::get_or_create(KEY, 0, 0o666, 0, 0)
+            .expect("the key must still name the set after its creator exits");
+        assert_eq!(again.get_sem(0).unwrap().get(), 7, "with its value");
+        assert_eq!(sem_register(&again), Ok(id), "under the same id");
+        assert!(sem_lookup(id).is_some());
+        // Until IPC_RMID.
+        again.remove();
+        assert!(sem_unregister(id));
+        drop(again);
+        assert_eq!(
+            SemArray::get_or_create(KEY, 0, 0o666, 0, 0).err(),
+            Some(LxError::ENOENT)
+        );
+        clear_ids();
+    }
+
+    #[test]
+    fn the_same_set_keeps_the_same_id_and_two_sets_never_share_one() {
+        let _guard = test_lock();
+        clear_ids();
+        let a = private_set();
+        let b = private_set();
+        let id_a = sem_register(&a).unwrap();
+        let id_b = sem_register(&b).unwrap();
+        assert_ne!(id_a, id_b);
+        assert_eq!(sem_register(&a), Ok(id_a), "asking again is the same id");
+        clear_ids();
+    }
+
+    /// A stale id kept past `IPC_RMID` must name nothing, never a newer set.
+    #[test]
+    fn an_id_is_never_reused() {
+        let _guard = test_lock();
+        clear_ids();
+        let old = private_set();
+        let old_id = sem_register(&old).unwrap();
+        assert!(sem_unregister(old_id));
+        assert!(sem_lookup(old_id).is_none());
+        let new_id = sem_register(&private_set()).unwrap();
+        assert_ne!(new_id, old_id);
+        assert!(sem_lookup(old_id).is_none(), "the retired id stays retired");
+        clear_ids();
+    }
+
+    #[test]
+    fn removing_the_id_does_not_take_the_set_from_whoever_holds_it() {
+        let _guard = test_lock();
+        clear_ids();
+        let array = private_set();
+        let id = sem_register(&array).unwrap();
+        assert!(sem_unregister(id));
+        assert!(!sem_unregister(id), "only once");
+        // The holder's copy is intact: a process that had it in its table
+        // still replays its SEM_UNDO records against it at exit.
+        array.get_sem(0).unwrap().set(3);
+        assert_eq!(array.get_sem(0).unwrap().get(), 3);
+        clear_ids();
+    }
+
+    /// The registry is what pins a set past its creator, so it has to be
+    /// bounded or `semget(IPC_PRIVATE, ...)` in a loop is unbounded pinned
+    /// kernel memory from an ordinary process.
+    #[test]
+    fn the_number_of_sets_is_bounded() {
+        let _guard = test_lock();
+        clear_ids();
+        {
+            let mut table = SEMID2SEM.write();
+            for i in 0..SEMMNI {
+                table.insert(i + 1_000_000, private_set());
+            }
+        }
+        assert_eq!(sem_register(&private_set()), Err(LxError::ENOSPC));
+        clear_ids();
+    }
+}
+
 /// The one lock every test that reaches `KEY2SEM` takes first.
 #[cfg(test)]
-pub(super) mod test_globals {
+pub(crate) mod test_globals {
     extern crate std;
 
     /// `KEY2SEM` is process-wide and cargo runs a crate's tests in threads, so

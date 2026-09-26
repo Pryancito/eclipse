@@ -3188,13 +3188,23 @@ impl LinuxProcess {
     }
 
     /// Insert a `SemArray` and return its ID
-    pub fn semaphores_add(&self, array: Arc<SemArray>) -> usize {
-        self.inner.lock().semaphores.add(array)
+    pub fn semaphores_add(&self, id: usize, array: Arc<SemArray>) {
+        self.inner.lock().semaphores.add(id, array)
     }
 
     /// Get an semaphore set by `id`
     pub fn semaphores_get(&self, id: usize) -> Option<Arc<SemArray>> {
-        self.inner.lock().semaphores.get(id)
+        let mut inner = self.inner.lock();
+        if let Some(array) = inner.semaphores.get(id) {
+            return Some(array);
+        }
+        // Not one this process `semget`-ed: the id may have been created by
+        // another program and passed here, which is what a system-wide id is
+        // for. Record it, so the `SEM_UNDO` records `semop` leaves have a set
+        // to replay against at exit.
+        let array = crate::ipc::sem_lookup(id)?;
+        inner.semaphores.add(id, array.clone());
+        Some(array)
     }
 
     /// Add an undo operation
@@ -5056,9 +5066,11 @@ mod fork_inheritance_tests {
         // own exit, semaphore operations that its parent performed and that
         // the parent will undo again.
         let mut parent = a_configured_parent();
-        let id = parent
-            .semaphores
-            .add(crate::ipc::SemArray::get_or_create(0, 1, 0o666, 0, 0).unwrap());
+        let id = 7;
+        parent.semaphores.add(
+            id,
+            crate::ipc::SemArray::get_or_create(0, 1, 0o666, 0, 0).unwrap(),
+        );
         parent.semaphores.add_undo(id, 0, -1);
 
         let child = fork_of(&parent);
@@ -9665,5 +9677,42 @@ mod interruptible_sleep_tests {
             "woke early after {:?}",
             took
         );
+    }
+}
+
+/// A semaphore id is system-wide: a process handed one it never `semget`-ed
+/// (by a parent through a file, by `ipcrm -s`) must reach the set through it.
+#[cfg(test)]
+mod sem_id_from_elsewhere_tests {
+    use super::*;
+    use crate::ipc::{sem_lookup, sem_register, sem_unregister, SemArray};
+    use rcore_fs_ramfs::RamFS;
+
+    #[test]
+    fn a_set_named_by_id_from_another_process_is_found_and_remembered() {
+        let _guard = crate::ipc::sem_test_globals::lock();
+        // The set exists system-wide; this process never called semget on it.
+        let array = SemArray::get_or_create(0, 1, 0o1000 | 0o666, 0, 0).unwrap();
+        let id = sem_register(&array).unwrap();
+        let proc = Process::create_with_fixed_id_ext(
+            &ROOT_JOB,
+            0x5e11,
+            "stranger",
+            LinuxProcess::new(RamFS::new(), 0),
+        )
+        .unwrap();
+        let lp = proc.linux();
+        let found = lp
+            .semaphores_get(id)
+            .expect("a system-wide id names the set anywhere");
+        assert!(Arc::ptr_eq(&found, &array));
+        // ...and it is now this process's set too, so a SEM_UNDO record left
+        // on it has something to replay against at exit.
+        assert!(lp.inner.lock().semaphores.get(id).is_some());
+        // Retired, the id names nothing to a process that never had it.
+        sem_unregister(id);
+        assert!(sem_lookup(id).is_none());
+        assert!(lp.semaphores_get(id).is_some(), "but a holder keeps it");
+        assert!(lp.semaphores_get(id + 1).is_none());
     }
 }

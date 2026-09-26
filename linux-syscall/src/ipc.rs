@@ -173,7 +173,10 @@ impl Syscall<'_> {
         let proc = self.linux_process();
         let sem_array =
             SemArray::get_or_create(key as u32, nsems, flags, proc.euid(), proc.egid())?;
-        let id = self.linux_process().semaphores_add(sem_array);
+        // The id is system-wide and the registry is what keeps the set alive
+        // past this process, per sysvipc(7). See `sem_register`.
+        let id = linux_object::ipc::sem_register(&sem_array)?;
+        self.linux_process().semaphores_add(id, sem_array);
         Ok(id)
     }
 
@@ -322,6 +325,7 @@ impl Syscall<'_> {
                     return Err(LxError::EPERM);
                 }
                 sem_array.remove();
+                linux_object::ipc::sem_unregister(id);
                 self.linux_process().semaphores_remove(id);
                 Ok(0)
             }
