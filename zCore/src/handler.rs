@@ -550,15 +550,17 @@ fn print_fault_backtrace(access_flags: MMUFlags) {
         // Align with an explicit u64 mask — `rsp0` is u64; `!(0x7usize)` would
         // be a type error against it.
         let sp0 = rsp0 & !0x7u64;
-        let plausible_sp = |a: u64| (0xffff_ff00_0000_0000..0xffff_ff01_0000_0000).contains(&a);
-        if plausible_sp(sp0) && mapped(sp0) {
+        if kernel_hal::kaddr::is_kernel_stack_qword(sp0) && mapped(sp0) {
             let top = unsafe { core::ptr::read_volatile(sp0 as *const u64) };
-            let looks_like_rflags =
-                (top >> 32) == 0 && (top & 0x2) != 0 && (top & !0x3f_ffffu64) == 0;
-            let truncated_text = (top >> 32) == 0
-                && (0x10_000u64..0x0100_0000u64).contains(&(top & 0xffff_ffff))
-                && !looks_like_rflags;
-            if truncated_text {
+            // `kaddr`, not a literal window. This used to ask the question
+            // itself -- "low half in 64 KiB..16 MiB and not RFLAGS-shaped" --
+            // against a range three times the image's real `.text` (which
+            // ends around 5.7 MiB). Everything between `etext` and 16 MiB was
+            // therefore read as a half-overwritten return address, and this
+            // branch does not merely print: inside a timer callback it sets
+            // the sticky smash flag and **halts the machine on purpose**. A
+            // wrong `.text` bound here turns a recoverable fault into a hang.
+            if kernel_hal::kaddr::looks_truncated_text(top) {
                 // Soft-smash (NOT unmapped [stack-guard] #PF): sticky + mode proof.
                 #[cfg(not(feature = "libos"))]
                 {
@@ -643,7 +645,8 @@ fn print_fault_backtrace(access_flags: MMUFlags) {
     //    fixed offsets from it (the stack scan advances by 8 bytes at a time,
     //    at most 4 KiB total) -- addresses that stay local to a known-live
     //    pointer regardless of how wide this bound is.
-    let plausible = |a: u64| (0xffff_ff00_0000_0000..0xffff_ff01_0000_0000).contains(&a);
+    // `kaddr::is_kernel_addr` is that bound, written once.
+    let plausible = kernel_hal::kaddr::is_kernel_addr;
     // The frame-pointer walk runs FIRST, and unconditionally.
     //
     // It used to be skipped whenever `[rsp0]` looked like smash residue -- which
@@ -697,7 +700,7 @@ fn print_fault_backtrace(access_flags: MMUFlags) {
     // here. See the top-of-function comment for why this needed widening at
     // all: two real captures showed a live rsp being rejected by the
     // original 256 MiB bound.
-    let plausible_sp = |a: u64| (0xffff_ff00_0000_0000..0xffff_ff01_0000_0000).contains(&a);
+    let plausible_sp = kernel_hal::kaddr::is_kernel_addr;
     // [diag] The single most reliable value here, but its interpretation
     // depends on the fault type:
     //   EXECUTE fault (indirect `call` through a null/corrupted fn-ptr):
@@ -791,11 +794,11 @@ fn report_soft_smash_stack_attr(rsp: usize, rbp: usize) {
     #[cfg(all(target_arch = "x86_64", not(feature = "libos")))]
     {
         use kernel_hal::vm::{GenericPageTable, PageTable};
-        // .text is [image_base, etext); etext ~= 0x...005b_bb27 for this build.
-        // 0x...0060_0000 is a conservative upper bound that stays well below the
-        // kernel HEAP (0x...0153_a950), so nothing here can match a heap pointer.
-        const TEXT_LO: u64 = 0xffff_ff00_0000_0000;
-        const TEXT_HI: u64 = 0xffff_ff00_0060_0000;
+        // The window is the image's own `stext`..`etext`, via `kaddr`. It was
+        // a pair of literals whose comment named the `etext` of one single
+        // build ("~= 0x...005b_bb27"), rounded up to 6 MiB: the next build
+        // that grows past that bound silently stops naming return addresses,
+        // which is the one thing this scan exists to do.
         let pt = PageTable::from_current();
         let mapped = |a: u64| {
             pt.query(a as usize)
@@ -812,7 +815,7 @@ fn report_soft_smash_stack_attr(rsp: usize, rbp: usize) {
         while a < end && printed < 60 {
             if mapped(a) {
                 let v = unsafe { core::ptr::read_volatile(a as *const u64) };
-                if (TEXT_LO..TEXT_HI).contains(&v) {
+                if kernel_hal::kaddr::is_kernel_text(v) {
                     kernel_hal::console::serial_write_fmt_spin(format_args!(
                         "[kchain]   @{:#x} ret={}\n",
                         a,

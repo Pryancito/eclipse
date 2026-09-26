@@ -425,7 +425,7 @@ cfg_if! {
             let mut rbp: usize;
             unsafe { core::arch::asm!("mov {}, rbp", out(reg) rbp) };
             for _ in 0..24 {
-                if rbp == 0 || rbp & 0x7 != 0 || rbp < 0xffff_ff00_0000_0000 {
+                if !kernel_hal::kaddr::is_kernel_stack_qword(rbp as u64) {
                     break;
                 }
                 let ret = unsafe { core::ptr::read_volatile((rbp + 8) as *const usize) };
@@ -476,7 +476,7 @@ cfg_if! {
             let mut rbp: usize;
             unsafe { core::arch::asm!("mov {}, rbp", out(reg) rbp) };
             for _ in 0..20 {
-                if rbp == 0 || rbp & 0x7 != 0 || rbp < 0xffff_ff00_0000_0000 {
+                if !kernel_hal::kaddr::is_kernel_stack_qword(rbp as u64) {
                     break;
                 }
                 let ret = unsafe { core::ptr::read_volatile((rbp + 8) as *const usize) };
@@ -539,7 +539,7 @@ cfg_if! {
             let mut rbp: usize;
             unsafe { core::arch::asm!("mov {}, rbp", out(reg) rbp) };
             for slot in site.iter_mut() {
-                if rbp == 0 || rbp & 0x7 != 0 || rbp < 0xffff_ff00_0000_0000 {
+                if !kernel_hal::kaddr::is_kernel_stack_qword(rbp as u64) {
                     break;
                 }
                 let ret = unsafe { core::ptr::read_volatile((rbp + 8) as *const usize) };
@@ -963,13 +963,17 @@ cfg_if! {
                 "\n[leaktrace] {}B live={} stack-scan:",
                 size, live
             ));
-            const TEXT_LO: usize = 0xffff_ff00_0000_1000;
-            const TEXT_HI: usize = 0xffff_ff00_0100_0000;
+            // `kaddr`, against the image's own `stext`..`etext`. These were
+            // two more literals, a third window again (one page in, 16 MiB
+            // out) that agreed with neither of the two in `handler.rs` nor
+            // with the image: `.text` starts at its first page and ends
+            // around 5.7 MiB, so this both dropped real return addresses and
+            // printed heap-shaped words as if they were code.
             let mut printed = 0;
             let mut p = rsp;
             while printed < 24 && p < rsp + 32 * 1024 {
                 let v = unsafe { core::ptr::read_volatile(p as *const usize) };
-                if (TEXT_LO..TEXT_HI).contains(&v) {
+                if kernel_hal::kaddr::is_kernel_text(v as u64) {
                     kernel_hal::console::serial_write_fmt_spin(format_args!(" {:#x}", v));
                     printed += 1;
                 }

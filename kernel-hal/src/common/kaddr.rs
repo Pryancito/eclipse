@@ -409,6 +409,101 @@ mod tests {
         assert!(truncated_text(TEXT, early));
     }
 
+    // ── the windows the copies used ─────────────────────────────────────────
+    //
+    // Four places decided "is this word a kernel code pointer" by hand, each
+    // with its own literal window and none of them the image's:
+    //
+    //   zCore/src/handler.rs, truncated-residue probe   +0x1_0000 .. +0x100_0000
+    //   zCore/src/handler.rs, `[kchain]` stack scan     +0        .. +0x60_0000
+    //   zCore/src/memory_x86_64.rs, `[leaktrace]`       +0x1000   .. +0x100_0000
+    //   this module's own FALLBACK_TEXT                 +0x1_0000 .. +0x100_0000
+    //
+    // `.text` of the build those comments were written against ends at
+    // `etext ~= 0x5b_bb27`, so every one of them is wrong in one direction or
+    // the other. These tests pin the two ways they are wrong.
+
+    /// `.text` of a real build: from the image base to a measured `etext`.
+    const IMAGE: (u64, u64) = (KERNEL_LO, KERNEL_LO + 0x5b_bb27);
+
+    #[test]
+    fn a_word_past_etext_is_not_a_return_address_however_low_it_is() {
+        // The residue probe accepted anything under 16 MiB, i.e. nearly three
+        // times the image. And it does not merely print: inside a timer
+        // callback that branch arms the sticky heap-smash flag and halts the
+        // machine on purpose, so a word off the end of `.text` -- a small
+        // scalar, a low heap offset, an index -- was a deliberate hang.
+        let past_etext = 0x80_0000u64;
+        assert!(
+            (0x1_0000..0x100_0000).contains(&past_etext),
+            "the old window took it"
+        );
+        assert!(!truncated_text(IMAGE, past_etext));
+        assert!(!in_text(IMAGE, KERNEL_LO + past_etext));
+    }
+
+    #[test]
+    fn the_first_page_of_text_is_text() {
+        // Two of the copies started their window one page or 64 KiB above the
+        // image base, and `.text` starts *at* it (`. = KERNEL_BEGIN; stext =
+        // .;`), so a return into the entry code was not a return address.
+        for a in [KERNEL_LO, KERNEL_LO + 0x40, KERNEL_LO + 0x800] {
+            assert!(in_text(IMAGE, a), "{:#x} is inside the image", a);
+            assert!(!in_text((KERNEL_LO + 0x1000, IMAGE.1), a));
+            assert!(!in_text(FALLBACK_TEXT, a));
+        }
+    }
+
+    #[test]
+    fn a_window_pinned_to_one_build_loses_the_next_one() {
+        // The `[kchain]` scan's upper bound was 6 MiB, chosen as "a
+        // conservative upper bound" over that build's `etext` of 5.7 MiB. It
+        // is conservative for exactly as long as the image stays smaller than
+        // it, and the only symptom of growing past it is a scan that prints
+        // nothing and says so in the same breath.
+        const SIX_MIB: (u64, u64) = (KERNEL_LO, KERNEL_LO + 0x60_0000);
+        const GROWN: (u64, u64) = (KERNEL_LO, KERNEL_LO + 0x70_0000);
+        let ret = KERNEL_LO + 0x68_0000;
+        assert!(in_text(GROWN, ret));
+        assert!(!in_text(SIX_MIB, ret));
+    }
+
+    #[test]
+    fn an_eight_aligned_address_past_the_kernel_half_is_not_a_stack_qword() {
+        // The frame-pointer walks tested `rbp >= KERNEL_LO` and nothing else,
+        // so a `saved_rbp` that had been scribbled into a huge value passed
+        // the guard and the walk chased it. The bound is half-open at both
+        // ends now.
+        assert!(is_kernel_stack_qword(KERNEL_HI - 8));
+        assert!(!is_kernel_stack_qword(KERNEL_HI));
+        assert!(!is_kernel_stack_qword(KERNEL_HI + 0x1000));
+        assert!(!is_kernel_stack_qword(u64::MAX & !7));
+    }
+
+    #[test]
+    fn nothing_but_the_window_decides_whether_a_word_is_text() {
+        // The property the four copies each broke: the answer is a function of
+        // the installed pair and the address, and of nothing else -- no
+        // literal floor, no literal ceiling, no rounding.
+        for (lo, hi) in [
+            (KERNEL_LO, KERNEL_LO + 0x1000),
+            (KERNEL_LO + 0x1000, KERNEL_LO + 0x2_0000),
+            IMAGE,
+            FALLBACK_TEXT,
+        ] {
+            assert!(in_text((lo, hi), lo));
+            assert!(in_text((lo, hi), hi - 1));
+            assert!(!in_text((lo, hi), lo - 1));
+            assert!(!in_text((lo, hi), hi));
+            // ...and the residue question is the same one asked about a word
+            // that has lost its top half, so it moves with the window too.
+            assert_eq!(
+                truncated_text((lo, hi), hi - 1 - KERNEL_LO),
+                !looks_like_rflags(hi - 1 - KERNEL_LO)
+            );
+        }
+    }
+
     // ── the #GP top-byte repair ─────────────────────────────────────────────
 
     #[test]
