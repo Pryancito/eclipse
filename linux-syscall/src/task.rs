@@ -1687,8 +1687,14 @@ impl Syscall<'_> {
         let a = attr.read()?;
         let plan = sched_setattr_plan(a.sched_flags, a.sched_policy)?;
         info!(
-            "sched_setattr: pid={} policy={:?} flags={:#x} nice={}",
-            pid, plan.policy, a.sched_flags, a.sched_nice
+            "sched_setattr: pid={} policy={:?} flags={:#x} reset_on_fork={} nice={}",
+            pid,
+            plan.policy,
+            a.sched_flags,
+            // Read for the log only: fork-reset is not modelled (see
+            // `SCHED_RESET_ON_FORK`).
+            a.sched_flags & SCHED_FLAG_RESET_ON_FORK != 0,
+            a.sched_nice
         );
         let thread = self.sched_target(pid)?;
         // `SETPARAM_POLICY`: the thread's own policy stands in for the one
