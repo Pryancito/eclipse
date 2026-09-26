@@ -85,20 +85,6 @@ mod perf_accounting {
 /// exhaust or fragment it after long network sessions.
 pub(crate) const SYSCALL_IO_MAX: usize = 64 * 1024;
 
-/// A zeroed kernel buffer of `n` bytes that answers `ENOMEM` instead of
-/// panicking the machine.
-///
-/// `vec![0u8; n]` is an infallible allocation: when the fixed kernel heap
-/// cannot satisfy it, Rust calls `alloc_error`, which panics — so one
-/// process's ordinary read took the whole kernel down:
-///
-///     [PANIC] cpu=10 ... memory allocation of 24576 bytes failed
-///       <linux_syscall::Syscall>::sys_read::{closure#0}
-///
-/// A user-sized allocation must never be able to do that; Linux returns
-/// ENOMEM for exactly this case. `try_reserve_exact` fails instead of
-/// aborting, and the `resize` that follows cannot reallocate because the
-/// capacity is already there.
 /// Whether the bytes past what this kernel knows of an extensible struct are
 /// all zero.
 ///
@@ -118,11 +104,66 @@ pub(crate) fn extensible_tail_is_empty(tail: &[u8]) -> bool {
     tail.iter().all(|&b| b == 0)
 }
 
+/// A zeroed kernel buffer of `n` bytes that answers `ENOMEM` instead of
+/// panicking the machine.
+///
+/// `vec![0u8; n]` is an infallible allocation: when the fixed kernel heap
+/// cannot satisfy it, Rust calls `alloc_error`, which panics — so one
+/// process's ordinary read took the whole kernel down:
+///
+///     [PANIC] cpu=10 ... memory allocation of 24576 bytes failed
+///       <linux_syscall::Syscall>::sys_read::{closure#0}
+///
+/// A user-sized allocation must never be able to do that; Linux returns
+/// ENOMEM for exactly this case. `try_reserve_exact` fails instead of
+/// aborting, and the `resize` that follows cannot reallocate because the
+/// capacity is already there.
+///
+/// **Every allocation in this crate whose size comes from userspace comes
+/// through here**, and for a while only `sys_read`, `sys_pread` and `splice`
+/// did: `readv`, `writev`, `preadv` and `pwritev` built the same buffer with
+/// `vec![0u8; n]`, `getdents64` built one four times the size of the read
+/// ceiling (up to 256 KiB, its own cap), and `readlinkat` and `syslog` did
+/// too. The panic above is at 24 576 bytes, well under any of those caps, so
+/// clamping the length is not what keeps the machine up -- asking for the
+/// memory fallibly is. `sys_readv`'s buffer even carries the comment
+/// "Mirror the sys_read hybrid buffer": it mirrored the stack/heap split and
+/// not the part that cannot panic.
 pub(crate) fn try_zeroed_buf(n: usize) -> linux_object::error::LxResult<alloc::vec::Vec<u8>> {
     let mut buf = alloc::vec::Vec::new();
     buf.try_reserve_exact(n).map_err(|_| LxError::ENOMEM)?;
     buf.resize(n, 0);
     Ok(buf)
+}
+
+#[cfg(test)]
+mod zeroed_buf_tests {
+    use super::*;
+
+    #[test]
+    fn a_buffer_the_heap_cannot_hold_is_enomem_and_not_a_panic() {
+        // The whole point: a length that no allocator can satisfy comes back
+        // as an error the syscall can return, not as `alloc_error` taking the
+        // machine with it. `vec![0u8; n]` here would abort the test process.
+        assert_eq!(try_zeroed_buf(usize::MAX).err(), Some(LxError::ENOMEM));
+    }
+
+    #[test]
+    fn a_buffer_that_fits_is_n_zeroed_bytes_and_no_more() {
+        let buf = try_zeroed_buf(4096).expect("4 KiB fits");
+        assert_eq!(buf.len(), 4096);
+        assert!(buf.iter().all(|&b| b == 0));
+        // `try_reserve_exact` then `resize`: the resize must not have to
+        // reallocate, because a reallocation is the infallible path again.
+        assert_eq!(buf.capacity(), 4096);
+    }
+
+    #[test]
+    fn a_zero_length_buffer_is_empty_and_not_an_error() {
+        // `read(fd, buf, 0)` and `getdents64` with a zero-sized buffer reach
+        // here; both are legal calls that answer 0, not ENOMEM.
+        assert_eq!(try_zeroed_buf(0).expect("zero is fine").len(), 0);
+    }
 }
 
 #[cfg(test)]

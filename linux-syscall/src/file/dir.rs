@@ -192,7 +192,7 @@ impl Syscall<'_> {
             return Err(LxError::ENOTDIR);
         }
         let cap_size = buf_size.min(256 * 1024);
-        let mut kbuf = vec![0; cap_size];
+        let mut kbuf = crate::try_zeroed_buf(cap_size)?;
         let mut writer = DirentBufWriter::new(&mut kbuf);
         let mut file = file;
         collect_dirents(&mut file, |next, meta, name| {
@@ -470,7 +470,7 @@ impl Syscall<'_> {
         }
         // TODO: recursive link resolution and loop detection
         let cap_len = len.min(4096);
-        let mut buf = vec![0; cap_len];
+        let mut buf = crate::try_zeroed_buf(cap_len)?;
         let len = inode.read_at(0, &mut buf)?;
         base.write_array(&buf[..len])?;
         Ok(len)
