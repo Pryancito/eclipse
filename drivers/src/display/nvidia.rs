@@ -8761,6 +8761,27 @@ impl NvidiaGpu {
             );
             return Err(nv::EOPNOTSUPP);
         }
+        // What Linux refuses before it touches anything
+        // (`bind_validate_region`): a VA or a range off the page, an empty
+        // range, one that wraps. Checked here, ahead of the "last binder
+        // wins" drain below, so a malformed op never costs the caller the
+        // live mapping it overlaps: that drain unmaps in the RM first, and
+        // a map the RM then refuses cannot put the old one back.
+        const VM_PAGE: u64 = 4096;
+        if op.range == 0
+            || !op.addr.is_multiple_of(VM_PAGE)
+            || !op.range.is_multiple_of(VM_PAGE)
+            || op.addr.checked_add(op.range).is_none()
+        {
+            crate::klog_warn!(
+                "[nouveau-uapi] VM_BIND: op={} VA={:#x} range={:#x} is empty, wraps, or is off the \
+                 page -> EINVAL",
+                op.op,
+                op.addr,
+                op.range
+            );
+            return Err(nv::EINVAL);
+        }
         match op.op {
             nv::VM_BIND_OP_MAP => {
                 // MAP with handle=0 is how Mesa spells "unmap this range but
@@ -8780,7 +8801,7 @@ impl NvidiaGpu {
                     );
                     return Ok(());
                 }
-                let h_memory = {
+                let (h_memory, obj_size) = {
                     let gem = self.nouveau_gem.lock();
                     // Only a holder may bind the object into its VAS: binding
                     // another process's buffer is a GPU read/write of it.
@@ -8790,8 +8811,31 @@ impl NvidiaGpu {
                     else {
                         return Err(nv::ENOENT);
                     };
-                    obj.h_memory
+                    (obj.h_memory, obj.size)
                 };
+                // The window must lie inside the object (`bind_validate_op`:
+                // the offset on a page, below the end, the range within what
+                // is left). The object's size is what was asked for; Linux
+                // rounds a BO up to whole pages, so measure against that,
+                // or a 100-byte object could never be mapped for its page.
+                // Past the end the RM either refused (EIO, after the drain
+                // had already unmapped the live range) or mapped whatever
+                // followed the allocation into the caller's VAS.
+                let obj_pages = obj_size.div_ceil(VM_PAGE).saturating_mul(VM_PAGE);
+                if !op.bo_offset.is_multiple_of(VM_PAGE)
+                    || op.bo_offset >= obj_pages
+                    || op.range > obj_pages - op.bo_offset
+                {
+                    crate::klog_warn!(
+                        "[nouveau-uapi] VM_BIND MAP handle={} bo_offset={:#x} range={:#x} does not \
+                         fit the object ({} bytes) -> EINVAL",
+                        op.handle,
+                        op.bo_offset,
+                        op.range,
+                        obj_size
+                    );
+                    return Err(nv::EINVAL);
+                }
                 // REPLACE semantics, like Linux's gpuvm: a MAP over an
                 // already-mapped range unmaps the old mapping first instead
                 // of failing. On real hardware the missing half of this bit:
@@ -18808,6 +18852,83 @@ mod nouveau_bookkeeping_tests {
         );
         assert_eq!(syncobj::query(out), Some(1));
         assert!(syncobj::destroy(out));
+        gpu.nouveau_release_process(A);
+        assert_eq!(FAKE_RM.lock().bad, 0);
+    }
+
+    /// Linux refuses a VM_BIND op that is off the page, empty, wrapping, or
+    /// (a MAP) a window that does not fit its object, before it touches
+    /// anything. Here nothing was checked: the "last binder wins" drain had
+    /// already unmapped whatever the op overlapped when the RM refused it,
+    /// so a malformed op cost the caller a live mapping and its next EXEC
+    /// faulted; and a window past the end of the object went to the RM as
+    /// is, which either refused it or mapped what followed the allocation.
+    #[test]
+    fn a_vm_bind_off_a_page_or_past_the_object_is_einval_before_anything_is_unmapped() {
+        let _g = LOCK.lock();
+        let _live = LiveBytes::hold();
+        let gpu = gpu_rm();
+        const VA: u64 = 0x3f_f000_0000;
+        assert_eq!(channel_alloc(&gpu, A).unwrap().channel, 0);
+        let ha = gem_new_rm(&gpu, 65536, nv::NOUVEAU_GEM_DOMAIN_GART, A)
+            .unwrap()
+            .handle;
+        assert_eq!(vm_bind_ops(&gpu, A, &mut [map(ha, VA, 65536)]), Ok(0));
+        let live = driver_maps(&gpu, A);
+        assert_eq!(live.len(), 1);
+        let before = FAKE_RM.lock().calls.len();
+        let bad = [
+            ("a range past the end", map(ha, VA, 65536 + 4096)),
+            ("an offset at the end", map_at(ha, VA, 4096, 65536)),
+            ("offset and range past the end", map_at(ha, VA, 65536, 4096)),
+            ("an offset past the end", map_at(ha, VA, 4096, 65536 + 4096)),
+            ("a VA off the page", map(ha, VA + 1, 4096)),
+            ("a range off the page", map(ha, VA, 4095)),
+            ("an offset off the page", map_at(ha, VA, 4096, 1)),
+            ("an empty range", map(ha, VA, 0)),
+            ("a range that wraps", map(ha, u64::MAX - 4095, 8192)),
+            ("an unmap off the page", unmap(VA + 1, 4096)),
+            ("an empty unmap", unmap(VA, 0)),
+            ("a map of nothing off the page", map(0, VA, 100)),
+        ];
+        for (what, op) in bad {
+            assert_eq!(vm_bind_ops(&gpu, A, &mut [op]), Err(nv::EINVAL), "{}", what);
+            assert_eq!(
+                driver_maps(&gpu, A),
+                live,
+                "{}: the live mapping it overlaps is untouched",
+                what
+            );
+        }
+        assert_eq!(
+            rm_calls_since(before),
+            [] as [&str; 0],
+            "refused before the RM was asked anything: no unmap, no map"
+        );
+        assert_eq!(FAKE_RM.lock().maps_of_ctx(1), [(VA, 65536, 0x06)]);
+        // The last page of the object, at its offset: fits.
+        assert_eq!(
+            vm_bind_ops(
+                &gpu,
+                A,
+                &mut [map_at(ha, VA + 0x10_0000, 4096, 65536 - 4096)]
+            ),
+            Ok(0)
+        );
+        // An object of 100 bytes is a page to the GPU, as in Linux: the
+        // whole page maps, the next one does not.
+        let hb = gem_new_rm(&gpu, 100, nv::NOUVEAU_GEM_DOMAIN_GART, A)
+            .unwrap()
+            .handle;
+        assert_eq!(
+            vm_bind_ops(&gpu, A, &mut [map(hb, VA + 0x20_0000, 4096)]),
+            Ok(0)
+        );
+        assert_eq!(
+            vm_bind_ops(&gpu, A, &mut [map(hb, VA + 0x30_0000, 8192)]),
+            Err(nv::EINVAL)
+        );
+        assert_eq!(driver_maps(&gpu, A).len(), 3);
         gpu.nouveau_release_process(A);
         assert_eq!(FAKE_RM.lock().bad, 0);
     }
