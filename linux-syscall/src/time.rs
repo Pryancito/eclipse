@@ -913,21 +913,20 @@ impl Syscall<'_> {
             timer_notify_from_sigevent(&event, |tid| proc.get_child(tid).is_ok())?
         };
         ensure_posix_timers_die_with_their_owner();
-        let id = NEXT_TIMER_ID.fetch_add(1, Ordering::Relaxed);
-        POSIX_TIMERS.lock().insert(
-            id,
-            PosixTimer {
-                owner: self.zircon_process().id(),
-                notify,
-                clock,
-                interval: Duration::ZERO,
-                next: Duration::ZERO,
-                generation: 0,
-                overrun_last: 0,
-            },
-        );
-        let mut out: UserOutPtr<i32> = timerid.into();
-        out.write(id as i32)?;
+        let timer = PosixTimer {
+            owner: self.zircon_process().id(),
+            notify,
+            clock,
+            interval: Duration::ZERO,
+            next: Duration::ZERO,
+            generation: 0,
+            overrun_last: 0,
+        };
+        register_posix_timer(timer, |id| {
+            let mut out: UserOutPtr<i32> = timerid.into();
+            out.write(id as i32)?;
+            Ok(())
+        })?;
         Ok(0)
     }
 
@@ -1152,6 +1151,30 @@ lazy_static! {
     static ref POSIX_TIMERS: Mutex<BTreeMap<usize, PosixTimer>> = Mutex::new(BTreeMap::new());
 }
 static NEXT_TIMER_ID: AtomicUsize = AtomicUsize::new(1);
+
+/// The tail of `do_timer_create`: the timer goes into the table under a
+/// fresh id, then the id goes to the caller through `deliver`, and if that
+/// fails (`copy_to_user` of `created_timer_id`, `EFAULT`) the timer is
+/// released again (`release_posix_timer(new_timer, IT_ID_SET)`), so a
+/// failed `timer_create` creates nothing.
+///
+/// The timer was left in the table: `timer_create(clock, NULL, NULL)`
+/// answered `EFAULT` and kept a timer nobody held an id for, one per
+/// call, until the process exited or exec'd. A program probing whether
+/// the call exists, or one handed a bad pointer, grew the table with each
+/// try, and every timer of it was walked by each expiry and each exec.
+fn register_posix_timer(
+    timer: PosixTimer,
+    deliver: impl FnOnce(usize) -> linux_object::error::LxResult<()>,
+) -> linux_object::error::LxResult<()> {
+    let id = NEXT_TIMER_ID.fetch_add(1, Ordering::Relaxed);
+    POSIX_TIMERS.lock().insert(id, timer);
+    if let Err(e) = deliver(id) {
+        POSIX_TIMERS.lock().remove(&id);
+        return Err(e);
+    }
+    Ok(())
+}
 
 fn timespec_to_duration(ts: TimeSpec) -> Duration {
     Duration::from_secs(ts.sec as u64) + Duration::from_nanos(ts.nsec as u64)
@@ -2191,6 +2214,49 @@ mod exec_timer_tests {
         a_timer_of(owner);
         assert_eq!(drop_posix_timers_of(owner), 1);
         assert_eq!(drop_posix_timers_of(owner), 0);
+    }
+
+    /// `do_timer_create`: a timer whose id cannot be written back
+    /// (`timer_create(CLOCK_MONOTONIC, NULL, NULL)`, `EFAULT`) is released
+    /// again, and one whose id is delivered is in the table by the time the
+    /// caller could use the id.
+    #[test]
+    fn a_timer_whose_id_cannot_be_written_back_is_not_kept() {
+        let _guard = serialised();
+        let owner = 0x4711_0007;
+        let fresh = || PosixTimer {
+            owner,
+            notify: TimerNotify::SIGALRM_TO_PROCESS,
+            clock: ClockBase::Monotonic,
+            interval: Duration::ZERO,
+            next: Duration::ZERO,
+            generation: 0,
+            overrun_last: 0,
+        };
+        assert_eq!(
+            register_posix_timer(fresh(), |_| Err(LxError::EFAULT)),
+            Err(LxError::EFAULT)
+        );
+        assert_eq!(
+            drop_posix_timers_of(owner),
+            0,
+            "the timer of a failed timer_create stayed in the table"
+        );
+        let mut delivered = None;
+        assert_eq!(
+            register_posix_timer(fresh(), |id| {
+                assert!(
+                    still_there(id),
+                    "the id is handed out before the timer exists"
+                );
+                delivered = Some(id);
+                Ok(())
+            }),
+            Ok(())
+        );
+        let id = delivered.expect("the id was delivered");
+        assert!(still_there(id));
+        assert_eq!(drop_posix_timers_of(owner), 1);
     }
 
     #[test]
