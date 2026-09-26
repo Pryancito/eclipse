@@ -262,9 +262,23 @@ fn adjtimex_changes_the_clock(modes: u32) -> bool {
     }
 }
 
-/// Apply a userspace `timex` and fill the read-only / current fields in place.
-/// Returns the NTP status code (`TIME_OK` / `TIME_ERROR`), not 0-vs-errno.
-fn adjtimex_apply(tx: &mut Timex) -> Result<usize, LxError> {
+/// Everything `timekeeping_validate_timex` refuses, all of it before anything
+/// is stored.
+///
+/// Linux runs this whole check first and `__do_adjtimex` only after it passes,
+/// and that order is the guarantee: an `adjtimex` that answers `EINVAL`
+/// changed nothing. Here the three refusals were spread through the applying
+/// code with the NTP state already locked and partly written, so a rejected
+/// call left half of itself behind -- and the half most likely to be first is
+/// `ADJ_STATUS`, the word that says whether the clock is synchronised. A
+/// chrony or ntpd doing what the header invites, `ADJ_STATUS | ADJ_SETOFFSET`
+/// in one call with a `timeval` fraction out of range, got `EINVAL` with
+/// `STA_UNSYNC` already replaced behind its back, and every later read
+/// reported a state nobody had asked for.
+///
+/// `ADJ_FREQUENCY` is not here on purpose: Linux clamps that one
+/// ([`clamp_freq`]) rather than refusing it.
+fn adjtimex_validate(tx: &Timex) -> Result<(), LxError> {
     let modes = tx.modes;
     // `ADJ_ADJTIME` is `adjtime(3)`, which is a single-shot offset and
     // nothing else: `timekeeping_validate_timex` refuses the bit on its own
@@ -272,6 +286,28 @@ fn adjtimex_apply(tx: &mut Timex) -> Result<usize, LxError> {
     if modes & ADJ_ADJTIME != 0 && modes & ADJ_OFFSET_SINGLESHOT != ADJ_OFFSET_SINGLESHOT {
         return Err(LxError::EINVAL);
     }
+    // Linux rejects ticks outside [900000/USER_HZ, 1100000/USER_HZ].
+    if modes & ADJ_TICK != 0 && (tx.tick < 9000 || tx.tick > 11000) {
+        return Err(LxError::EINVAL);
+    }
+    if modes & ADJ_TAI != 0 && tx.tai < 0 {
+        return Err(LxError::EINVAL);
+    }
+    if modes & ADJ_SETOFFSET != 0 {
+        // The unit is this call's `ADJ_NANO`, not the stored `STA_NANO`.
+        setoffset_ns(&tx.time, modes & ADJ_NANO != 0)?;
+    }
+    Ok(())
+}
+
+/// Apply a userspace `timex` and fill the read-only / current fields in place.
+/// Returns the NTP status code (`TIME_OK` / `TIME_ERROR`), not 0-vs-errno.
+///
+/// Every refusal is [`adjtimex_validate`]'s and happens before this runs, so
+/// from here on nothing fails and nothing is left half done.
+fn adjtimex_apply(tx: &mut Timex) -> Result<usize, LxError> {
+    let modes = tx.modes;
+    adjtimex_validate(tx)?;
     if modes == ADJ_OFFSET_SS_READ {
         let st = NTP_STATE.lock();
         tx.offset = st.offset_remain;
@@ -288,10 +324,6 @@ fn adjtimex_apply(tx: &mut Timex) -> Result<usize, LxError> {
     }
 
     if modes & ADJ_TICK != 0 {
-        // Linux rejects ticks outside [900000/USER_HZ, 1100000/USER_HZ].
-        if tx.tick < 9000 || tx.tick > 11000 {
-            return Err(LxError::EINVAL);
-        }
         st.tick = tx.tick;
     }
     if modes & ADJ_FREQUENCY != 0 {
@@ -307,9 +339,6 @@ fn adjtimex_apply(tx: &mut Timex) -> Result<usize, LxError> {
         st.constant = tx.constant;
     }
     if modes & ADJ_TAI != 0 {
-        if tx.tai < 0 {
-            return Err(LxError::EINVAL);
-        }
         st.tai = tx.tai;
     }
     if modes & ADJ_STATUS != 0 {
@@ -320,7 +349,7 @@ fn adjtimex_apply(tx: &mut Timex) -> Result<usize, LxError> {
 
     let singleshot = (modes & ADJ_OFFSET_SINGLESHOT) == ADJ_OFFSET_SINGLESHOT;
     if modes & ADJ_SETOFFSET != 0 {
-        // The unit is this call's `ADJ_NANO`, not the stored `STA_NANO`.
+        // Checked above, in the unit this call names.
         let nsec = setoffset_ns(&tx.time, modes & ADJ_NANO != 0)?;
         wall_clock_add_ns(nsec);
     } else if singleshot || modes & ADJ_OFFSET != 0 {
@@ -2129,6 +2158,82 @@ mod adjtimex_tests {
         let mut readback = Timex::default();
         adjtimex_apply(&mut readback).unwrap();
         assert_eq!(readback.freq, 65536);
+    }
+
+    /// The order Linux guarantees: validate the whole `timex`, then apply it.
+    /// `ADJ_STATUS` is applied before the three refusals used to happen, so a
+    /// rejected call left the synchronisation word replaced.
+    #[test]
+    fn a_rejected_adjtimex_changes_nothing_at_all() {
+        let _serialised = serialised();
+        *NTP_STATE.lock() = NtpState::default();
+        let before = {
+            let st = NTP_STATE.lock();
+            (st.status, st.tick, st.tai, st.nano)
+        };
+        // Status plus an out-of-range fraction, which is what a daemon
+        // injecting a step in one call looks like. The refusal is the LAST
+        // thing the applying code reaches and the status the first, which is
+        // why this pair is the one that showed the bug.
+        let mut tx = Timex {
+            modes: ADJ_STATUS | ADJ_SETOFFSET,
+            status: 0,
+            time: TimeValI64 {
+                sec: 0,
+                usec: 2_000_000,
+            },
+            ..Default::default()
+        };
+        assert_eq!(adjtimex_apply(&mut tx), Err(LxError::EINVAL));
+        let after = {
+            let st = NTP_STATE.lock();
+            (st.status, st.tick, st.tai, st.nano)
+        };
+        assert_eq!(after, before, "a rejected call left something behind");
+    }
+
+    /// Each of the three refusals on its own, from the validator, with no
+    /// state to restore afterwards.
+    #[test]
+    fn the_three_refusals_are_decided_before_anything_is_stored() {
+        let base = Timex::default();
+        assert_eq!(
+            adjtimex_validate(&Timex {
+                modes: ADJ_TICK,
+                tick: 12_000,
+                ..base
+            }),
+            Err(LxError::EINVAL)
+        );
+        assert_eq!(
+            adjtimex_validate(&Timex {
+                modes: ADJ_TAI,
+                tai: -1,
+                ..base
+            }),
+            Err(LxError::EINVAL)
+        );
+        assert_eq!(
+            adjtimex_validate(&Timex {
+                modes: ADJ_SETOFFSET,
+                time: TimeValI64 {
+                    sec: 1,
+                    usec: -500_000,
+                },
+                ..base
+            }),
+            Err(LxError::EINVAL)
+        );
+        // And a `timex` with none of them is accepted by the validator
+        // whatever else it asks for.
+        assert_eq!(
+            adjtimex_validate(&Timex {
+                modes: ADJ_STATUS | ADJ_FREQUENCY | ADJ_NANO,
+                freq: i64::MAX,
+                ..base
+            }),
+            Ok(())
+        );
     }
 
     #[test]
