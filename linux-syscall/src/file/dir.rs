@@ -1170,7 +1170,13 @@ mod rename_trap_tests {
     fn the_walk_stops_at_the_root_whose_parent_is_itself() {
         // Reaching the root without meeting the ancestor answers `false`
         // rather than walking `..` of the root forever.
-        let (_, _, b, other) = a_tree();
+        //
+        // The root and `a` are held for the length of the test: a ramfs child
+        // points at its parent with a `Weak`, and the only strong reference to
+        // `a` is the root's `children` map, so dropping these two handles
+        // leaves `b` with a `..` that no longer resolves and the walk answers
+        // `ENOENT` before it ever reaches the root.
+        let (_root, _a, b, other) = a_tree();
         assert_eq!(is_same_or_below(&b, &other.metadata().unwrap()), Ok(false));
     }
 }
