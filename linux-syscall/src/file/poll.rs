@@ -11,7 +11,7 @@ use core::pin::Pin;
 use core::task::{Context, Poll};
 use core::time::Duration;
 use kernel_hal::timer;
-use linux_object::fs::{FileDesc, PollEvents};
+use linux_object::fs::{FileDesc, PollEvents, PollStatus};
 use linux_object::signal::Sigset;
 use linux_object::time::*;
 
@@ -668,6 +668,22 @@ impl Syscall<'_> {
         let mut read_fds = FdSet::new(read, nfds)?;
         let mut write_fds = FdSet::new(write, nfds)?;
         let mut err_fds = FdSet::new(err, nfds)?;
+        // `max_select_fd`: a closed fd in any of the three sets is EBADF
+        // before the wait begins. It used to be skipped, so a program that
+        // closed a socket and left its bit set waited for the timeout (or for
+        // ever) instead of learning which fd to drop.
+        {
+            let files = self.linux_process().get_files()?;
+            let in_any = |fd: usize| {
+                let fd = FileDesc::from(fd);
+                read_fds.contains(fd) || write_fds.contains(fd) || err_fds.contains(fd)
+            };
+            if select_closed_fd(nfds, in_any, |fd| files.contains_key(&FileDesc::from(fd)))
+                .is_some()
+            {
+                return Err(LxError::EBADF);
+            }
+        }
         let begin_time = mono_now();
 
         // The select set membership (`origin`) does not change while the future
@@ -770,15 +786,16 @@ impl Syscall<'_> {
                             break;
                         }
                     };
-                    if status.error && this.err_fds.contains(fd) {
+                    let ready = select_ready(&status);
+                    if ready.except && this.err_fds.contains(fd) {
                         this.err_fds.set(fd);
                         events += 1;
                     }
-                    if status.read && this.read_fds.contains(fd) {
+                    if ready.read && this.read_fds.contains(fd) {
                         this.read_fds.set(fd);
                         events += 1;
                     }
-                    if status.write && this.write_fds.contains(fd) {
+                    if ready.write && this.write_fds.contains(fd) {
                         this.write_fds.set(fd);
                         events += 1;
                     }
@@ -1038,6 +1055,45 @@ const FD_PER_ITEM: usize = u32::BITS as usize;
 /// max Fdset size
 const MAX_FDSET_SIZE: usize = 1024 / FD_PER_ITEM;
 
+/// The lowest fd below `nfds` that is in one of the three sets and not
+/// open: `max_select_fd` (fs/select.c) makes it EBADF before anything is
+/// waited on. `in_any` says whether an fd is in a set, `is_open` whether the
+/// process has it.
+pub(crate) fn select_closed_fd(
+    nfds: usize,
+    in_any: impl Fn(usize) -> bool,
+    is_open: impl Fn(usize) -> bool,
+) -> Option<usize> {
+    (0..nfds).find(|&fd| in_any(fd) && !is_open(fd))
+}
+
+/// Which of the three sets a poll status lights up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SelectReady {
+    /// `readfds`.
+    pub read: bool,
+    /// `writefds`.
+    pub write: bool,
+    /// `exceptfds`.
+    pub except: bool,
+}
+
+/// `do_select`'s three masks: `POLLIN_SET` is IN, HUP and ERR; `POLLOUT_SET`
+/// is OUT and ERR; `POLLEX_SET` is PRI alone (which nothing here reports).
+///
+/// An error used to go to `exceptfds` only, and a hangup nowhere: a pipe
+/// whose reader had gone (`write: false, error: true`) never left
+/// `select(writefds)`, when Linux returns it writable so the write can fail
+/// with EPIPE; and a socket that hung up was not readable to `select`, though
+/// its `read` of 0 was waiting.
+pub(crate) fn select_ready(status: &PollStatus) -> SelectReady {
+    SelectReady {
+        read: status.read || status.hangup || status.error,
+        write: status.write || status.error,
+        except: false,
+    }
+}
+
 /// FdSet data struct for select
 struct FdSet {
     /// input addr, for update Fdset use
@@ -1124,6 +1180,80 @@ mod abi_tests {
     #[test]
     fn pollfd_matches_linux_uapi() {
         assert_eq!(size_of::<PollFd>(), 8);
+    }
+}
+
+#[cfg(test)]
+mod select_ready_tests {
+    //! `select`'s answer for a closed fd, and which set each condition lands
+    //! in.
+
+    use super::*;
+
+    fn status(read: bool, write: bool, error: bool, hangup: bool) -> PollStatus {
+        PollStatus {
+            read,
+            write,
+            error,
+            hangup,
+        }
+    }
+
+    /// A closed fd in any set is found, and only below `nfds`; an fd in no
+    /// set is nobody's business, open or not.
+    #[test]
+    fn a_closed_fd_in_a_set_is_found_below_nfds() {
+        let in_set = |fd: usize| fd == 3 || fd == 7;
+        let open = |fd: usize| fd != 7;
+        assert_eq!(select_closed_fd(8, in_set, open), Some(7));
+        assert_eq!(
+            select_closed_fd(7, in_set, open),
+            None,
+            "7 is not below nfds"
+        );
+        assert_eq!(select_closed_fd(8, in_set, |_| true), None);
+        assert_eq!(select_closed_fd(8, |_| false, |_| false), None, "in no set");
+        assert_eq!(select_closed_fd(0, |_| true, |_| false), None);
+        // The first of several, as `max_select_fd` stops at the first.
+        assert_eq!(select_closed_fd(8, |_| true, |fd| fd > 4), Some(0));
+    }
+
+    /// Error is readable and writable, hangup readable, and `exceptfds` is
+    /// for urgent data alone.
+    #[test]
+    fn error_and_hangup_land_where_do_select_puts_them() {
+        let ready = |st| select_ready(&st);
+        let r = |read, write, except| SelectReady {
+            read,
+            write,
+            except,
+        };
+        assert_eq!(
+            ready(status(true, false, false, false)),
+            r(true, false, false)
+        );
+        assert_eq!(
+            ready(status(false, true, false, false)),
+            r(false, true, false)
+        );
+        // The write end of a pipe whose reader is gone.
+        assert_eq!(
+            ready(status(false, false, true, true)),
+            r(true, true, false)
+        );
+        // A socket both sides of which are shut.
+        assert_eq!(
+            ready(status(false, false, false, true)),
+            r(true, false, false)
+        );
+        assert_eq!(
+            ready(status(false, false, true, false)),
+            r(true, true, false)
+        );
+        assert_eq!(
+            ready(status(false, false, false, false)),
+            r(false, false, false)
+        );
     }
 }
 
