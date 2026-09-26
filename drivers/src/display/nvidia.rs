@@ -18512,6 +18512,163 @@ mod nouveau_bookkeeping_tests {
         assert_eq!(FAKE_RM.lock().bad, 0);
     }
 
+    /// A wait on a timeline point the producer has already delivered is
+    /// over. EXEC handed it the producer's NEXT fence to acquire
+    /// (`pending_hw_fences` looked only at what was in flight), so a
+    /// consumer that waited for frame N stalled behind frame N+1, on the
+    /// GPU, in front of pushes nobody asked to hold back; a wait on point
+    /// 1 fared worse, read as binary it took the HIGHEST fence in flight.
+    /// Linux drops a dependency on a signaled fence before scheduling.
+    #[test]
+    fn a_wait_on_a_point_already_delivered_is_no_acquire_on_the_producers_next_fence() {
+        let _g = LOCK.lock();
+        let _live = LiveBytes::hold();
+        let gpu = gpu_rm_fast();
+        FAKE_RM.lock().peer = true;
+        let ch_a = client_with_pushbuf(&gpu, A);
+        let ch_b = client_with_pushbuf(&gpu, B);
+        let tl = syncobj::create(false);
+        for point in 1..=2u64 {
+            assert_eq!(
+                exec(
+                    &gpu,
+                    A,
+                    ch_a,
+                    &[push(PUSH_VA, 16)],
+                    &[],
+                    &[sync_tl(tl, point)]
+                ),
+                Ok(0)
+            );
+        }
+        assert_eq!(
+            run_gpu(1).len(),
+            4,
+            "two pushes and two fences: points 1 and 2 delivered"
+        );
+        assert_eq!(syncobj::query(tl), Some(2));
+        // Frame 3 still running on A's ring.
+        assert_eq!(
+            exec(&gpu, A, ch_a, &[push(PUSH_VA, 16)], &[], &[sync_tl(tl, 3)]),
+            Ok(0)
+        );
+        let out = syncobj::create(false);
+        // 1 ms per clock read: a CPU wait anywhere below ends after 10 s
+        // virtual instead of hanging.
+        test_clock::set_auto_advance(1_000);
+        let t0 = test_clock::now();
+        assert_eq!(
+            exec(
+                &gpu,
+                B,
+                ch_b,
+                &[push(PUSH_VA, 16)],
+                &[sync_tl(tl, 2)],
+                &[sync(out)]
+            ),
+            Ok(0)
+        );
+        assert!(test_clock::now() - t0 < 1_000_000, "nothing to wait for");
+        assert_eq!(
+            peer_maps_made(),
+            0,
+            "no fence to acquire: A's semaphore stays unmapped in B"
+        );
+        let b = chan(2);
+        assert_eq!(userd(&b), (0, 2), "push and fence, no acquire");
+        assert_eq!(
+            run_gpu(2),
+            [
+                Fetched::Push {
+                    va: PUSH_VA,
+                    len: 16
+                },
+                Fetched::Release {
+                    sem_va: sem_va(&b),
+                    payload: 1
+                }
+            ],
+            "B's ring runs: A's third fence, still in flight, is not its business"
+        );
+        assert_eq!(syncobj::query(out), Some(1));
+        // Point 1 is a timeline point like any other, not a binary wait on
+        // the highest fence in flight.
+        let out2 = syncobj::create(false);
+        assert_eq!(
+            exec(
+                &gpu,
+                B,
+                ch_b,
+                &[push(PUSH_VA, 16)],
+                &[sync_tl(tl, 1)],
+                &[sync(out2)]
+            ),
+            Ok(0)
+        );
+        assert_eq!(peer_maps_made(), 0);
+        assert_eq!(
+            run_gpu(2),
+            [
+                Fetched::Push {
+                    va: PUSH_VA,
+                    len: 16
+                },
+                Fetched::Release {
+                    sem_va: sem_va(&b),
+                    payload: 2
+                }
+            ]
+        );
+        assert_eq!(syncobj::query(out2), Some(1));
+        // The genuine wait, point 3, is still A's fence in flight: an
+        // acquire on B's ring, which stalls until A gets there.
+        let out3 = syncobj::create(false);
+        assert_eq!(
+            exec(
+                &gpu,
+                B,
+                ch_b,
+                &[push(PUSH_VA, 16)],
+                &[sync_tl(tl, 3)],
+                &[sync(out3)]
+            ),
+            Ok(0)
+        );
+        assert_eq!(
+            peer_maps_made(),
+            1,
+            "A's semaphore mapped into B's VAS for it"
+        );
+        assert_eq!(run_gpu(2), [], "stalls on A's third fence");
+        assert_eq!(run_gpu(1).len(), 2);
+        let (_, local_va) = peer_map(2, 1).expect("the mapping the RM made");
+        assert_eq!(
+            run_gpu(2),
+            [
+                Fetched::Acquire {
+                    sem_va: local_va,
+                    payload: 3
+                },
+                Fetched::Push {
+                    va: PUSH_VA,
+                    len: 16
+                },
+                Fetched::Release {
+                    sem_va: sem_va(&b),
+                    payload: 3
+                }
+            ]
+        );
+        assert_eq!(syncobj::query(out3), Some(1));
+        test_clock::set_auto_advance(0);
+        for h in [tl, out, out2, out3] {
+            assert!(syncobj::destroy(h));
+        }
+        gpu.nouveau_release_process(A);
+        gpu.nouveau_release_process(B);
+        assert_eq!(FAKE_RM.lock().bad, 0);
+    }
+
     // ---- The fence-timeout upcall -----------------------------------------
     //
     // A fence the GPU never writes is `syncobj`'s to give up on: after

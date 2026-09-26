@@ -872,9 +872,21 @@ pub fn pending_hw_fences(handle: u32, point: u64) -> alloc::vec::Vec<(usize, u64
     let (r, deferred) = {
         let mut table = TABLE.lock();
         let d = resolve_locked(&mut table);
+        // A point the handle has reached (its counter, or a link whose
+        // sources all have) has no fence left to deliver it: the wait is
+        // over, whatever later fence is still in flight on the handle. Read
+        // off the fences alone, a timeline wait on a point already
+        // delivered took the NEXT fence pending, and a wait on point 1 the
+        // highest, so a consumer that waited for frame N stalled behind
+        // frame N+1, in front of pushes nobody asked to hold back. Linux
+        // drops a dependency on a signaled fence before the job runs.
+        let reached =
+            effective_point(&table.objects, handle, LINK_DEPTH).is_some_and(|p| p >= point.max(1));
         // Binary waits (point 0/1): the highest pending fence on this handle.
         // Timeline: the lowest pending fence that covers `point`.
-        let own = if point <= 1 {
+        let own = if reached {
+            None
+        } else if point <= 1 {
             table
                 .pending
                 .iter()
@@ -891,6 +903,7 @@ pub fn pending_hw_fences(handle: u32, point: u64) -> alloc::vec::Vec<(usize, u64
         };
         let found = match own {
             Some(f) => alloc::vec![f],
+            None if reached => alloc::vec::Vec::new(),
             None => fences_through_link(&table, handle, point.max(1), LINK_DEPTH),
         };
         (
@@ -1781,6 +1794,66 @@ mod tests {
             assert!(destroy(h));
         }
         assert!(TABLE.lock().errored.is_empty(), "nothing left behind");
+    }
+
+    /// EXEC turns a wait into an ACQUIRE of the fence that delivers its
+    /// point, and a point the counter has already reached has no such
+    /// fence: the wait is over. The list looked only at what was still in
+    /// flight, so a timeline wait on a point already delivered came back
+    /// with the NEXT fence pending on the handle, and a wait on point 1,
+    /// read as binary, with the HIGHEST: a consumer that had waited for
+    /// frame N stalled behind frame N+1, which nobody asked it to wait for.
+    /// Linux drops a dependency on a signaled `dma_fence` before the job
+    /// is scheduled.
+    #[test]
+    fn a_wait_on_a_point_already_reached_has_nothing_to_acquire_whatever_is_still_in_flight() {
+        let _g = test_lock();
+        arm_hooks();
+        let tl = create(false);
+        let mut z = Landing::new();
+        for point in 1..=3u64 {
+            assert!(attach_hw_fence(
+                tl,
+                point,
+                z.va(),
+                0,
+                point as u32,
+                0,
+                false
+            ));
+        }
+        z.land(2);
+        assert_eq!(query(tl), Some(2), "points 1 and 2 are the GPU's word");
+        assert_eq!(
+            pending_hw_fences(tl, 2),
+            [],
+            "point 2 is reached: nothing to acquire, not the fence of point 3"
+        );
+        assert_eq!(
+            pending_hw_fences(tl, 1),
+            [],
+            "point 1 is reached too, and no binary wait on the highest fence in flight"
+        );
+        assert_eq!(
+            pending_hw_fences(tl, 3),
+            [(z.va(), 0, 3, 0)],
+            "point 3 is the fence still in flight"
+        );
+        // A binary syncobj re-armed is at 0 with its fence in flight; one
+        // signaled by the CPU has no fence at all. Neither changes.
+        let b = create(true);
+        assert_eq!(pending_hw_fences(b, 1), []);
+        let mut zb = Landing::new();
+        assert!(attach_hw_fence(b, 1, zb.va(), 0, 7, 1, true));
+        assert_eq!(pending_hw_fences(b, 1), [(zb.va(), 0, 7, 1)]);
+        zb.land(7);
+        assert_eq!(query(b), Some(1));
+        assert_eq!(pending_hw_fences(b, 1), []);
+        z.land(3);
+        assert_eq!(query(tl), Some(3));
+        for h in [tl, b] {
+            assert!(destroy(h));
+        }
     }
 
     /// The bug this guards: a binary syncobj is a fence SLOT, not a counter.
