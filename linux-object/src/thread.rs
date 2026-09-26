@@ -493,6 +493,14 @@ pub struct LinuxThread {
     /// returns. Set by `rt_sigsuspend` so that the original mask is restored
     /// after the temporarily-unblocked signal is delivered.
     pub saved_sigmask: Option<Sigset>,
+    /// The signals this thread is parked in `rt_sigtimedwait(2)` for, empty
+    /// otherwise. They are BLOCKED (POSIX has the caller block them, and the
+    /// wait is what consumes them), yet a process-directed signal must land
+    /// on this thread and not on whichever thread comes first: Linux keeps
+    /// such a signal in the shared pending set, where any thread's
+    /// `sigwait` dequeues it, and unblocks the set for the length of the
+    /// wait so `wants_signal()` picks the waiter. See [`Self::wants_signal`].
+    pub sigwait: Sigset,
     /// signal alternate stack
     pub signal_alternate_stack: SignalStack,
     /// robust_list
@@ -581,6 +589,19 @@ impl LinuxThread {
         self.signal_mask = mask.blockable();
     }
 
+    /// Whether a signal aimed at the whole process should be queued to THIS
+    /// thread: it has the signal unblocked, or it is parked in
+    /// `rt_sigtimedwait` waiting for exactly that signal (`wants_signal()`,
+    /// which sees the wait as an unblocked window). Without the second half
+    /// a program that blocks a signal in every thread and dedicates one
+    /// thread to `sigwait(3)` -- the pattern of dbus-daemon, of glib's
+    /// `g_unix_signal_source` helpers, of every Java and Python runtime --
+    /// never had its signal reach the waiter: it was queued to the first
+    /// thread, where it stayed blocked for good, and the waiter timed out.
+    pub fn wants_signal(&self, signal: Signal) -> bool {
+        !self.signal_mask.contains(signal) || self.sigwait.contains(signal)
+    }
+
     /// `SIG_BLOCK`: add `set` to what is blocked.
     pub fn block_signals(&mut self, set: &Sigset) {
         let mut new = self.signal_mask;
@@ -618,6 +639,7 @@ impl LinuxThread {
             signals: Sigset::default(),
             signal_mask: Sigset::default(),
             saved_sigmask: None,
+            sigwait: Sigset::default(),
             signal_alternate_stack: SignalStack::default(),
             robust_list: 0.into(),
             robust_list_len: 0,
@@ -709,6 +731,7 @@ impl LinuxThread {
             // belongs to a `sigreturn` frame, and the child has its own.
             handling_signal: None,
             saved_sigmask: None,
+            sigwait: Sigset::default(),
             // Pending signals are fresh (above), and so is what went with them.
             pending_info: BTreeMap::new(),
             handling_info: SigInfo::default(),
@@ -737,6 +760,8 @@ impl LinuxThread {
             signals: _,
             signal_mask: _,
             saved_sigmask,
+            // A thread inside `execve` is not inside `rt_sigtimedwait`.
+            sigwait: _,
             signal_alternate_stack,
             robust_list,
             robust_list_len,
@@ -860,6 +885,7 @@ mod signal_delivery_tests {
             signals: Sigset::default(),
             signal_mask: Sigset::default(),
             saved_sigmask: None,
+            sigwait: Sigset::default(),
             signal_alternate_stack: SignalStack::default(),
             robust_list: 0.into(),
             robust_list_len: 0,
@@ -1550,6 +1576,7 @@ mod exec_reset_tests {
             robust_list_len: core::mem::size_of::<RobustList>(),
             handling_signal: Some(Signal::SIGUSR2 as u32),
             comm: String::from("programa-viejo"),
+            sigwait: Sigset::default(),
             timerslack_ns: 1_234_567,
             pending_info: BTreeMap::new(),
             handling_info: SigInfo::default(),
@@ -1715,6 +1742,7 @@ mod clone_inheritance_tests {
             robust_list_len: core::mem::size_of::<RobustList>(),
             handling_signal: Some(Signal::SIGUSR2 as u32),
             comm: String::from("el-que-crea"),
+            sigwait: Sigset::default(),
             timerslack_ns: 1_234_567,
             pending_info: BTreeMap::new(),
             handling_info: SigInfo::default(),

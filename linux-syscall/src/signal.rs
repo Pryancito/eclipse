@@ -224,6 +224,57 @@ fn queue_signal_to_thread(thread: &Arc<Thread>, signal: Signal, info: SigInfo) {
 /// The syscalls used to read only the 12-byte head, decide the permission on
 /// it and then deliver the `siginfo_t` of a plain `kill(2)`: `SI_USER` and a
 /// zero `si_value`, whatever `sigqueue(pid, sig, value)` had sent.
+/// The wait of `rt_sigtimedwait(2)`: park `thread` until one of `waitset`
+/// is pending on it, dequeue that signal and return it with its `siginfo`.
+/// `EINTR` if an unblocked signal outside the set interrupts the wait,
+/// `EAGAIN` once `deadline` passes with nothing (`None`: no deadline).
+///
+/// Two things the old 10 ms polling loop got wrong. The wait is now
+/// announced in the thread's `sigwait` set, so a process-directed signal is
+/// queued to THIS thread although it is blocked here, as it is blocked
+/// everywhere: before, it went to the first thread of the process and the
+/// waiter never saw it (a program with a dedicated signal thread got no
+/// signal at all). And the wake is the signal itself, not a tick: a
+/// `sigwait` answers at once instead of up to 10 ms later, and an idle
+/// busybox `init` parked here no longer wakes a hundred times a second.
+///
+/// The set is cleared again on every way out, so a thread that has left
+/// the wait is not offered signals it no longer takes.
+pub(crate) async fn sigtimedwait_on(
+    thread: &Arc<Thread>,
+    waitset: Sigset,
+    deadline: Option<core::time::Duration>,
+) -> LxResult<(Signal, SigInfo)> {
+    use linux_object::process::SignalPark;
+    thread.lock_linux().sigwait = waitset;
+    let mut park = SignalPark::new(thread);
+    let outcome = loop {
+        park.prepare();
+        // A waited-for signal pending? Dequeue and return it.
+        {
+            let mut lt = thread.lock_linux();
+            let ready = Sigset::new(lt.signals.val() & waitset.val());
+            if let Some(sig) = ready.find_first_signal() {
+                let si = lt.take_siginfo(sig);
+                break Ok((sig, si));
+            }
+        }
+        // An unblocked signal *outside* `set` interrupts the wait (EINTR).
+        if let Err(e) = linux_object::process::check_signals_of(thread) {
+            break Err(e);
+        }
+        // Timed out with nothing delivered.
+        if let Some(end) = deadline {
+            if kernel_hal::timer::timer_now() >= end {
+                break Err(LxError::EAGAIN);
+            }
+        }
+        park.park(deadline).await;
+    };
+    thread.lock_linux().sigwait = Sigset::empty();
+    outcome
+}
+
 pub(crate) fn queued_from_user(signal: Signal, mut user: SigInfo) -> SigInfo {
     user.signo = signal as i32;
     user
@@ -745,11 +796,7 @@ impl Syscall<'_> {
         // (or the thread/process is being torn down). `check_signals` reports
         // this as `EINTR`, which is exactly the return value `sigsuspend` owes
         // its caller.
-        loop {
-            linux_object::process::check_signals()?;
-            let deadline = kernel_hal::timer::deadline_after(core::time::Duration::from_millis(10));
-            kernel_hal::thread::sleep_until(deadline).await;
-        }
+        Err(linux_object::process::wait_for_signal(self.thread).await)
     }
 
     /// Suspend the calling thread until a signal is delivered that either
@@ -758,11 +805,7 @@ impl Syscall<'_> {
     /// Always returns `-EINTR`.
     pub async fn sys_pause(&mut self) -> SysResult {
         info!("pause: thread {}", self.thread.id());
-        loop {
-            linux_object::process::check_signals()?;
-            let deadline = kernel_hal::timer::deadline_after(core::time::Duration::from_millis(10));
-            kernel_hal::thread::sleep_until(deadline).await;
-        }
+        Err(linux_object::process::wait_for_signal(self.thread).await)
     }
 
     /// Examine the set of signals that are pending for delivery to the calling
@@ -894,36 +937,13 @@ impl Syscall<'_> {
             deadline,
             self.thread.id()
         );
-        loop {
-            // A waited-for signal already pending? Dequeue and return it. We do
-            // not have per-signal queued `siginfo` (pending signals are a plain
-            // bitmask), so only `si_signo` is reported — enough for callers like
-            // busybox init that follow up with `waitpid`.
-            {
-                let mut thread = self.thread.lock_linux();
-                let ready = Sigset::new(thread.signals.val() & waitset.val());
-                if let Some(sig) = ready.find_first_signal() {
-                    // With what came with it: who sent it, which child it is
-                    // about. `sigwaitinfo(3)` is how a program asks for that.
-                    let si = thread.take_siginfo(sig);
-                    drop(thread);
-                    if !info.is_null() {
-                        info.write(si)?;
-                    }
-                    return Ok(sig as usize);
-                }
-            }
-            // An unblocked signal *outside* `set` interrupts the wait (EINTR).
-            linux_object::process::check_signals()?;
-            // Timed out with nothing delivered.
-            if let Some(end) = deadline {
-                if kernel_hal::timer::timer_now() >= end {
-                    return Err(LxError::EAGAIN);
-                }
-            }
-            let next = kernel_hal::timer::deadline_after(core::time::Duration::from_millis(10));
-            kernel_hal::thread::sleep_until(next).await;
+        let (sig, si) = sigtimedwait_on(self.thread, waitset, deadline).await?;
+        // With what came with it: who sent it, which child it is about.
+        // `sigwaitinfo(3)` is how a program asks for that.
+        if !info.is_null() {
+            info.write(si)?;
         }
+        Ok(sig as usize)
     }
 
     /// Install a temporary blocked-signal mask for wait syscalls that take a
@@ -1498,5 +1518,139 @@ mod direct_sigkill_tests {
         let caller = a_process(43_204);
         deliver_direct_sigkill(&caller, &caller);
         killed_by_sigkill(&caller);
+    }
+}
+
+#[cfg(test)]
+mod sigtimedwait_tests {
+    //! A program that blocks a signal in every thread and dedicates one to
+    //! `sigwait(3)` never got it: the signal was queued to the first thread
+    //! of the process, blocked there for good, and the waiter timed out.
+    extern crate std;
+
+    use super::*;
+    use core::time::Duration;
+    use linux_object::process::{send_signal_to_process, LinuxProcess};
+    use linux_object::signal::{SignalAction, SignalActionFlags, Sigset};
+    use rcore_fs_ramfs::RamFS;
+    use zircon_object::task::Process;
+
+    fn set_of(signal: Signal) -> Sigset {
+        Sigset::new(1 << (signal as u64 - 1))
+    }
+
+    /// A process whose two threads both block SIGUSR1; the second is the
+    /// one that will wait.
+    fn program(pid: KoID) -> (Arc<Process>, Arc<Thread>, Arc<Thread>) {
+        let proc = Process::create_with_fixed_id_ext(
+            &ROOT_JOB,
+            pid,
+            "sigwaiter",
+            LinuxProcess::new(RamFS::new(), 0),
+        )
+        .unwrap();
+        let main = Thread::create_linux(&proc).unwrap();
+        let waiter = Thread::create_linux(&proc).unwrap();
+        main.lock_linux().set_signal_mask(set_of(Signal::SIGUSR1));
+        waiter.lock_linux().set_signal_mask(set_of(Signal::SIGUSR1));
+        (proc, main, waiter)
+    }
+
+    fn later(pid: KoID, signal: Signal, after: Duration) {
+        std::thread::spawn(move || {
+            std::thread::sleep(after);
+            let _ = send_signal_to_process(pid as usize, signal);
+        });
+    }
+
+    fn wait(
+        thread: &Arc<Thread>,
+        signal: Signal,
+        timeout: Duration,
+    ) -> (LxResult<(Signal, SigInfo)>, Duration) {
+        let start = std::time::Instant::now();
+        let deadline = Some(kernel_hal::timer::timer_now() + timeout);
+        let r = async_std::task::block_on(sigtimedwait_on(thread, set_of(signal), deadline));
+        (r, start.elapsed())
+    }
+
+    #[test]
+    fn the_dedicated_signal_thread_receives_what_is_sent_to_its_process() {
+        let (proc, main, waiter) = program(43_601);
+        later(proc.id(), Signal::SIGUSR1, Duration::from_millis(50));
+        let (r, took) = wait(&waiter, Signal::SIGUSR1, Duration::from_secs(3));
+        let (sig, si) = r.expect("the waiter timed out: the signal went elsewhere");
+        assert_eq!(sig, Signal::SIGUSR1);
+        assert_eq!(si.signo, Signal::SIGUSR1 as i32);
+        assert!(took < Duration::from_secs(1), "answered after {:?}", took);
+        assert!(
+            !main.lock_linux().signals.contains(Signal::SIGUSR1),
+            "the signal was queued to the main thread too"
+        );
+        assert_eq!(waiter.lock_linux().sigwait.val(), 0, "wait set left behind");
+    }
+
+    #[test]
+    fn nothing_pending_times_out_with_eagain_and_leaves_no_wait_set_behind() {
+        let (_proc, _main, waiter) = program(43_602);
+        let (r, took) = wait(&waiter, Signal::SIGUSR1, Duration::from_millis(100));
+        assert_eq!(r.map(|(s, _)| s), Err(LxError::EAGAIN));
+        assert!(
+            took >= Duration::from_millis(100),
+            "gave up after {:?}",
+            took
+        );
+        assert_eq!(
+            waiter.lock_linux().sigwait.val(),
+            0,
+            "a thread that left the wait is still offered the signal"
+        );
+    }
+
+    #[test]
+    fn a_signal_already_pending_is_taken_without_waiting() {
+        let (proc, _main, waiter) = program(43_603);
+        waiter.lock_linux().queue_signal(
+            Signal::SIGUSR1,
+            Some(SigInfo::from_user(Signal::SIGUSR1, 7, 0, SignalCode::USER)),
+        );
+        let _ = proc;
+        let (r, took) = wait(&waiter, Signal::SIGUSR1, Duration::from_secs(3));
+        let (_, si) = r.unwrap();
+        let b = si.as_bytes();
+        assert_eq!(
+            i32::from_ne_bytes([b[16], b[17], b[18], b[19]]),
+            7,
+            "si_pid"
+        );
+        assert!(took < Duration::from_millis(500), "waited {:?}", took);
+    }
+
+    #[test]
+    fn a_caught_signal_outside_the_set_interrupts_the_wait() {
+        let (proc, main, waiter) = program(43_604);
+        // Aimed at the waiter: the main thread, which has SIGUSR2 unblocked
+        // as well, would otherwise be the thread to take it.
+        let mut both = set_of(Signal::SIGUSR1);
+        both.insert(Signal::SIGUSR2);
+        main.lock_linux().set_signal_mask(both);
+        proc.linux().set_signal_action(
+            Signal::SIGUSR2,
+            SignalAction {
+                handler: 0x1000,
+                flags: SignalActionFlags::empty(),
+                restorer: 0,
+                mask: Sigset::default(),
+            },
+        );
+        later(proc.id(), Signal::SIGUSR2, Duration::from_millis(50));
+        let (r, took) = wait(&waiter, Signal::SIGUSR1, Duration::from_secs(3));
+        assert_eq!(r.map(|(s, _)| s), Err(LxError::EINTR));
+        assert!(
+            took < Duration::from_secs(1),
+            "interrupted after {:?}",
+            took
+        );
+        assert_eq!(waiter.lock_linux().sigwait.val(), 0, "wait set left behind");
     }
 }

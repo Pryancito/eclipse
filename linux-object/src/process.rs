@@ -4417,29 +4417,88 @@ pub async fn interruptible_sleep_until(
     thread: &Arc<Thread>,
     deadline: core::time::Duration,
 ) -> LxResult<()> {
-    let object: Arc<dyn KernelObject> = thread.clone();
-    let mut armed = false;
+    let mut park = SignalPark::new(thread);
     loop {
-        object.signal_clear(SIGNAL_WAKE | SLEEP_DEADLINE);
+        park.prepare();
         check_signals_of(thread)?;
         if kernel_hal::timer::timer_now() >= deadline {
             return Ok(());
         }
-        if !armed {
-            armed = true;
-            // Weak: the timer must not keep a dead thread's object alive
-            // for the length of a long sleep.
-            let weak = Arc::downgrade(thread);
-            kernel_hal::timer::timer_set(
-                deadline,
-                Box::new(move |_now| {
-                    if let Some(thread) = weak.upgrade() {
-                        thread.signal_set(SLEEP_DEADLINE);
-                    }
-                }),
-            );
+        park.park(Some(deadline)).await;
+    }
+}
+
+/// Park until a signal that would interrupt a syscall is pending on
+/// `thread`: `pause(2)` and `rt_sigsuspend(2)`, which return only through
+/// that signal, so this returns the error to hand back (`EINTR`, or what
+/// [`check_signals_of`] says about a thread being torn down).
+///
+/// Both used to spin on a 10 ms `sleep_until`: a shell parked in `pause`
+/// woke a hundred times a second for nothing, and a hundred idle daemons
+/// were ten thousand wakeups a second on a machine doing nothing.
+pub async fn wait_for_signal(thread: &Arc<Thread>) -> LxError {
+    let mut park = SignalPark::new(thread);
+    loop {
+        park.prepare();
+        if let Err(e) = check_signals_of(thread) {
+            return e;
         }
-        object.wait_signal(SIGNAL_WAKE | SLEEP_DEADLINE).await;
+        park.park(None).await;
+    }
+}
+
+/// The parking half of an interruptible wait on a Linux thread: wake when a
+/// signal is queued to `thread` -- blocked or not, which is what a
+/// `sigtimedwait` on a blocked set needs -- or when a deadline passes.
+///
+/// The protocol is two calls per pass, [`Self::prepare`] then
+/// [`Self::park`], with the caller's own look at its condition in between:
+/// `prepare` clears the wake bits BEFORE the look, so a signal queued after
+/// the look sets a bit again and the park returns at once. A stale deadline
+/// bit from an earlier pass only costs one spurious pass.
+pub struct SignalPark {
+    thread: Arc<Thread>,
+    object: Arc<dyn KernelObject>,
+    armed: bool,
+}
+
+impl SignalPark {
+    /// A park on `thread`.
+    pub fn new(thread: &Arc<Thread>) -> Self {
+        SignalPark {
+            thread: thread.clone(),
+            object: thread.clone(),
+            armed: false,
+        }
+    }
+
+    /// Clear the wake bits. Call this before looking at the condition the
+    /// park waits for, never after.
+    pub fn prepare(&self) {
+        self.object.signal_clear(SIGNAL_WAKE | SLEEP_DEADLINE);
+    }
+
+    /// Wait for a signal queued to the thread, or for `deadline` (`None`:
+    /// only a signal ends the wait). The deadline timer is armed once per
+    /// park, on the first call that passes one.
+    pub async fn park(&mut self, deadline: Option<core::time::Duration>) {
+        if let Some(deadline) = deadline {
+            if !self.armed {
+                self.armed = true;
+                // Weak: the timer must not keep a dead thread's object alive
+                // for the length of a long sleep.
+                let weak = Arc::downgrade(&self.thread);
+                kernel_hal::timer::timer_set(
+                    deadline,
+                    Box::new(move |_now| {
+                        if let Some(thread) = weak.upgrade() {
+                            thread.signal_set(SLEEP_DEADLINE);
+                        }
+                    }),
+                );
+            }
+        }
+        self.object.wait_signal(SIGNAL_WAKE | SLEEP_DEADLINE).await;
     }
 }
 
@@ -4674,11 +4733,13 @@ pub fn send_signal_to_process_with_info(
                 if let Ok(thread) = thread_obj.downcast_arc::<Thread>() {
                     // Peek without holding the guard across a move of `thread`.
                     let delivered = if let Some(mut lt) = thread.try_lock_linux() {
-                        if lt.signal_mask().contains(signal) {
-                            false
-                        } else {
+                        // `wants_signal()`: unblocked, or parked in
+                        // `rt_sigtimedwait` for exactly this signal.
+                        if lt.wants_signal(signal) {
                             lt.queue_signal(signal, info);
                             true
+                        } else {
+                            false
                         }
                     } else {
                         // Lock held (e.g. PID 1 in waitpid): queue below rather
@@ -9290,6 +9351,123 @@ mod sigchld_tests {
         let (pid, status, _) =
             async_std::task::block_on(wait_child_any(&parent, true, true)).unwrap();
         assert_eq!((pid, status), (child.id(), wait_status_exited(5)));
+    }
+}
+
+#[cfg(test)]
+mod signal_park_tests {
+    //! A process-directed signal that every thread blocks went to the first
+    //! thread, whatever the others were waiting for; and `pause`,
+    //! `sigsuspend` and `sigtimedwait` looked for it every 10 ms.
+    extern crate std;
+
+    use super::*;
+    use crate::signal::{SignalAction, SignalActionFlags};
+    use crate::thread::ThreadExt;
+    use core::time::Duration;
+    use rcore_fs_ramfs::RamFS;
+
+    fn usr1() -> Sigset {
+        Sigset::new(1 << (LinuxSignal::SIGUSR1 as u64 - 1))
+    }
+
+    /// A process with two threads, both blocking SIGUSR1.
+    fn two_blocking_threads(pid: KoID) -> (Arc<Process>, Arc<Thread>, Arc<Thread>) {
+        let proc = Process::create_with_fixed_id_ext(
+            &ROOT_JOB,
+            pid,
+            "two",
+            LinuxProcess::new(RamFS::new(), 0),
+        )
+        .unwrap();
+        let first = Thread::create_linux(&proc).unwrap();
+        let second = Thread::create_linux(&proc).unwrap();
+        first.lock_linux().set_signal_mask(usr1());
+        second.lock_linux().set_signal_mask(usr1());
+        (proc, first, second)
+    }
+
+    fn usr1_later(pid: KoID, after: Duration) {
+        std::thread::spawn(move || {
+            std::thread::sleep(after);
+            let _ = send_signal_to_process(pid as usize, LinuxSignal::SIGUSR1);
+        });
+    }
+
+    #[test]
+    fn a_process_signal_lands_on_the_thread_waiting_for_it_though_blocked() {
+        let (proc, first, second) = two_blocking_threads(43_411);
+        second.lock_linux().sigwait = usr1();
+        send_signal_to_process(proc.id() as usize, LinuxSignal::SIGUSR1).unwrap();
+        assert!(
+            second.lock_linux().signals.contains(LinuxSignal::SIGUSR1),
+            "the sigtimedwait thread never got the signal"
+        );
+        assert!(
+            !first.lock_linux().signals.contains(LinuxSignal::SIGUSR1),
+            "the signal was queued to the first thread as well"
+        );
+    }
+
+    #[test]
+    fn with_nobody_waiting_a_blocked_signal_still_goes_to_the_first_thread() {
+        let (proc, first, second) = two_blocking_threads(43_412);
+        send_signal_to_process(proc.id() as usize, LinuxSignal::SIGUSR1).unwrap();
+        assert!(first.lock_linux().signals.contains(LinuxSignal::SIGUSR1));
+        assert!(!second.lock_linux().signals.contains(LinuxSignal::SIGUSR1));
+    }
+
+    #[test]
+    fn a_blocked_signal_still_ends_the_park() {
+        // What `sigtimedwait` relies on: the caller has the set blocked, and
+        // the park must wake on the queueing, not on the deadline.
+        let (proc, first, _second) = two_blocking_threads(43_413);
+        let mut park = SignalPark::new(&first);
+        park.prepare();
+        usr1_later(proc.id(), Duration::from_millis(50));
+        let start = std::time::Instant::now();
+        let deadline = kernel_hal::timer::timer_now() + Duration::from_secs(3);
+        async_std::task::block_on(park.park(Some(deadline)));
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "parked {:?}: the blocked signal did not wake it",
+            start.elapsed()
+        );
+        assert!(first.lock_linux().signals.contains(LinuxSignal::SIGUSR1));
+    }
+
+    #[test]
+    fn pause_returns_eintr_the_moment_a_caught_signal_arrives() {
+        let proc = Process::create_with_fixed_id_ext(
+            &ROOT_JOB,
+            43_414,
+            "paused",
+            LinuxProcess::new(RamFS::new(), 0),
+        )
+        .unwrap();
+        let thread = Thread::create_linux(&proc).unwrap();
+        proc.linux().set_signal_action(
+            LinuxSignal::SIGUSR1,
+            SignalAction {
+                handler: 0x1000,
+                flags: SignalActionFlags::empty(),
+                restorer: 0,
+                mask: Sigset::default(),
+            },
+        );
+        usr1_later(proc.id(), Duration::from_millis(50));
+        let start = std::time::Instant::now();
+        let e = async_std::task::block_on(wait_for_signal(&thread));
+        assert_eq!(e, LxError::EINTR);
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "woke after {:?}",
+            start.elapsed()
+        );
+        assert!(
+            thread.lock_linux().signals.contains(LinuxSignal::SIGUSR1),
+            "the signal must still be pending for delivery"
+        );
     }
 }
 
