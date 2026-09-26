@@ -30,3 +30,4 @@ async-std = { version = "1.10", features = ["unstable", "attributes"] }
 kernel-hal = { path = "../kernel-hal", features = ["libos"] }
 zcore-drivers = { path = "../drivers", features = ["mock"] }
 rcore-fs-ramfs = { git = "https://github.com/rcore-os/rcore-fs", rev = "1a3246b" }
+async-trait = "0.1.92"
