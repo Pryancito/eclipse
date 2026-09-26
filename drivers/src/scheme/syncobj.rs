@@ -277,13 +277,52 @@ fn collect_orphans(table: &mut SyncobjTable) {
     {
         let gone = table.objects.swap_remove(pos).handle;
         table.pending.retain(|f| f.handle != gone);
+        table.errored.retain(|e| e.handle != gone);
     }
     PENDING_COUNT.store(table.pending.len(), Ordering::Relaxed);
+}
+
+/// Whether `target` on `handle` was reached only by a fence that timed out
+/// (see [`Errored`]). Callers must hold the table lock, resolved.
+fn errored_locked(table: &SyncobjTable, handle: u32, target: u64) -> bool {
+    table
+        .errored
+        .iter()
+        .any(|e| e.handle == handle && e.from < target && target <= e.to)
+}
+
+/// Record that `handle` went from `from` to `to` on the strength of a
+/// timed-out fence (or of a link to one). Nothing to mark when the counter
+/// did not move.
+fn mark_errored(table: &mut SyncobjTable, handle: u32, from: u64, to: u64) {
+    if to > from {
+        table.errored.push(Errored { handle, from, to });
+    }
+}
+
+/// The points of `handle` in `(from, to]` were reached by a fence the GPU
+/// never wrote: [`resolve_hw_locked`] gave up on it after
+/// [`FENCE_TIMEOUT_US`], and a link that materialised on such a point
+/// carries the mark on (a `dma_fence_array` takes its members' error).
+///
+/// A timed-out fence still advances the counter -- `SYNCOBJ_QUERY` and
+/// `SYNCOBJ_WAIT` read it as reached, as Linux reads a fence signaled with
+/// an error -- but the driver's EXEC asks [`reached_by_timeout`] before it
+/// submits behind such a wait, so its answer is EIO whichever of the two
+/// 10 s clocks (this timeout, EXEC's own deadline) ticked first. Cleared by
+/// whatever replaces the fence: a signal from the CPU at or past `to`, a
+/// binary re-arm, a reset, the object going away.
+#[derive(Clone, Copy)]
+struct Errored {
+    handle: u32,
+    from: u64,
+    to: u64,
 }
 
 struct SyncobjTable {
     objects: Vec<Syncobj>,
     pending: Vec<PendingFence>,
+    errored: Vec<Errored>,
 }
 
 static NEXT_HANDLE: AtomicU32 = AtomicU32::new(1);
@@ -292,6 +331,7 @@ lazy_static::lazy_static! {
     static ref TABLE: Mutex<SyncobjTable> = Mutex::new(SyncobjTable {
         objects: Vec::new(),
         pending: Vec::new(),
+        errored: Vec::new(),
     });
 }
 
@@ -467,10 +507,15 @@ fn resolve_hw_locked(table: &mut SyncobjTable, out: &mut Deferred) {
             FENCES_TIMED_OUT.fetch_add(1, Ordering::Relaxed);
         }
         if let Some(obj) = table.objects.iter_mut().find(|o| o.handle == f.handle) {
+            let before = obj.point;
             if f.point > obj.point {
                 obj.point = f.point;
             }
-            out.notify.push((f.handle, obj.point));
+            let after = obj.point;
+            out.notify.push((f.handle, after));
+            if timed_out {
+                mark_errored(table, f.handle, before, after);
+            }
         }
         if timed_out {
             out.timed_out.push(f);
@@ -517,8 +562,19 @@ fn resolve_links_locked(table: &mut SyncobjTable, out: &mut Deferred) {
             .linked
             .take()
             .expect("position() matched a linked object");
+        let before = obj.point;
         obj.point = obj.point.max(link.dst_point.max(1));
-        out.notify.push((obj.handle, obj.point));
+        let (handle, after) = (obj.handle, obj.point);
+        out.notify.push((handle, after));
+        // A member that was given up on taints the array, as the error of
+        // one `dma_fence` taints the `dma_fence_array` it sits in.
+        if link
+            .deps
+            .iter()
+            .any(|&(src, t)| errored_locked(table, src, t))
+        {
+            mark_errored(table, handle, before, after);
+        }
         any = true;
     }
     if any {
@@ -616,6 +672,7 @@ pub fn attach_hw_fence(
             table
                 .pending
                 .retain(|f| !(f.handle == handle && f.point <= 1));
+            table.errored.retain(|e| !(e.handle == handle && e.to <= 1));
         } else if point <= cur {
             // Already past that point: nothing to wait for.
             //
@@ -766,6 +823,7 @@ pub fn destroy(handle: u32) -> bool {
         // drops its `dma_fence` reference and the fence is just a refcounted
         // object with no back-pointer to it.
         table.pending.retain(|f| f.handle != handle);
+        table.errored.retain(|e| e.handle != handle);
         PENDING_COUNT.store(table.pending.len(), Ordering::Relaxed);
         // A still-deferred import/transfer names its source BY HANDLE (a
         // real one holds the `dma_fence` itself, which outlives the syncobj
@@ -870,10 +928,14 @@ pub fn timeline_signal(handle: u32, point: u64) -> bool {
         // sync_file included — same as real drm_syncobj.
         let dropped_link = obj.linked.take().is_some();
         let p = obj.point;
-        // Pending hardware fences at or below the new point are moot.
+        // Pending hardware fences at or below the new point are moot, and so
+        // is a fence that was given up on there: the CPU's word replaces it.
         table
             .pending
             .retain(|f| !(f.handle == handle && f.point <= p));
+        table
+            .errored
+            .retain(|e| !(e.handle == handle && e.to <= point));
         PENDING_COUNT.store(table.pending.len(), Ordering::Relaxed);
         if dropped_link {
             collect_orphans(&mut table);
@@ -947,6 +1009,7 @@ pub fn import_snapshot(dst: u32, src: u32, target: u64) -> bool {
             return false;
         };
         let reached = src_point >= target;
+        let tainted = reached && errored_locked(&table, src, target);
         let Some(obj) = table.objects.iter_mut().find(|o| o.handle == dst) else {
             drop(table);
             d.run();
@@ -954,9 +1017,14 @@ pub fn import_snapshot(dst: u32, src: u32, target: u64) -> bool {
         };
         let had_link = obj.linked.is_some();
         let adv = if reached {
+            let before = obj.point;
             obj.point = obj.point.max(1);
             obj.linked = None;
-            Some(obj.point)
+            let after = obj.point;
+            if tainted {
+                mark_errored(&mut table, dst, before, after);
+            }
+            Some(after)
         } else {
             // A binary import: `dst_point` is 1, because `IMPORT_SYNC_FILE`
             // really does replace the binary fence.
@@ -1004,6 +1072,7 @@ pub fn transfer(dst: u32, dst_point: u64, src: u32, src_point: u64) -> bool {
         };
         let need = src_point.max(1);
         let reached = src_eff >= need;
+        let tainted = reached && errored_locked(&table, src, need);
         // The lowest pending hardware fence on `src` that covers `need`.
         let hw = table
             .pending
@@ -1018,9 +1087,14 @@ pub fn transfer(dst: u32, dst_point: u64, src: u32, src_point: u64) -> bool {
         };
         let had_link = obj.linked.is_some();
         let np = if reached {
+            let before = obj.point;
             obj.point = obj.point.max(dst_point.max(1));
             obj.linked = None;
-            Some(obj.point)
+            let after = obj.point;
+            if tainted {
+                mark_errored(&mut table, dst, before, after);
+            }
+            Some(after)
         } else if let Some(f) = hw {
             obj.linked = None;
             let point = dst_point.max(1);
@@ -1081,6 +1155,10 @@ pub fn merge_fences(fences: &[(u32, u64)]) -> u32 {
                 effective_point(&table.objects, src, LINK_DEPTH).is_some_and(|p| p < target)
             })
             .collect();
+        let tainted = deps.is_empty()
+            && fences
+                .iter()
+                .any(|&(src, target)| errored_locked(&table, src, target));
         table.objects.push(Syncobj {
             handle,
             point: if deps.is_empty() { 1 } else { 0 },
@@ -1091,6 +1169,9 @@ pub fn merge_fences(fences: &[(u32, u64)]) -> u32 {
                 Some(Link { deps, dst_point: 1 })
             },
         });
+        if tainted {
+            mark_errored(&mut table, handle, 0, 1);
+        }
         d
     };
     deferred.run();
@@ -1125,6 +1206,7 @@ pub fn reset(handle: u32) -> bool {
         // *signal*, which supersedes only the slot it replaces and must spare a
         // timeline fence in flight; a reset supersedes everything.)
         table.pending.retain(|f| f.handle != handle);
+        table.errored.retain(|e| e.handle != handle);
         PENDING_COUNT.store(table.pending.len(), Ordering::Relaxed);
         if dropped_link {
             collect_orphans(&mut table);
@@ -1133,6 +1215,35 @@ pub fn reset(handle: u32) -> bool {
     };
     deferred.run();
     true
+}
+
+/// Whether `handle` names a live syncobj: the lookup EXEC makes of every
+/// sig handle before it queues anything (`drm_syncobj_find` in Linux). A
+/// plain lookup, on purpose: unlike [`query`] it resolves no landed fence,
+/// so refusing a bad list changes nothing about the good handles in it.
+pub fn exists(handle: u32) -> bool {
+    TABLE.lock().objects.iter().any(|o| o.handle == handle)
+}
+
+/// Whether any `(handle, point)` of a wait that [`wait`] reported satisfied
+/// got there only because a fence behind it TIMED OUT (see [`Errored`]),
+/// through a merge, an import or a transfer as much as on the handle
+/// itself. The driver asks this before submitting behind a CPU wait: the
+/// release it waited for never happened, and its EXEC contract for that is
+/// EIO, not a push behind a buffer nobody let go of. A point of 0 is the
+/// binary fence, as everywhere else.
+pub fn reached_by_timeout(handles: &[u32], points: Option<&[u64]>) -> bool {
+    let (r, deferred) = {
+        let mut table = TABLE.lock();
+        let d = resolve_locked(&mut table);
+        let r = handles.iter().enumerate().any(|(i, &h)| {
+            let target = points.map(|p| p[i]).unwrap_or(1).max(1);
+            errored_locked(&table, h, target)
+        });
+        (r, d)
+    };
+    deferred.run();
+    r
 }
 
 /// Current timeline point (`SYNCOBJ_QUERY`), or `None` if `handle` is
@@ -1556,6 +1667,120 @@ mod tests {
         fn land(&mut self, payload: u32) {
             *self.0 = payload;
         }
+    }
+
+    /// A fence given up on after [`FENCE_TIMEOUT_US`] still advances the
+    /// point (QUERY and WAIT read it as reached, like a `dma_fence` signaled
+    /// with an error), but [`reached_by_timeout`] remembers which points got
+    /// there that way -- on the handle, and on every import, transfer and
+    /// merge that took the point from it -- until the CPU's own signal, a
+    /// re-arm or a reset replaces the dead fence.
+    #[test]
+    fn a_point_reached_by_a_timed_out_fence_is_remembered_and_carried_by_its_links() {
+        let _g = test_lock();
+        arm_hooks();
+        let src = create(false);
+        let mut first = Landing::new();
+        let dead = Landing::new();
+        assert!(attach_hw_fence(src, 2, first.va(), 0, 1, 0, false));
+        first.land(1);
+        assert_eq!(query(src), Some(2), "point 2 is the GPU's word");
+        assert!(attach_hw_fence(src, 5, dead.va(), 0, 2, 0, false));
+        // Links made while the fence is still in flight: they materialise
+        // when it is given up on.
+        let importer = create(false);
+        assert!(import_snapshot(importer, src, 5));
+        let moved = create(false);
+        assert!(transfer(moved, 9, src, 5));
+        let merged = merge_fences(&[(src, 5)]);
+        assert!(!reached_by_timeout(&[src], Some(&[5])), "still in flight");
+        test_clock::advance(FENCE_TIMEOUT_US + 1);
+        assert_eq!(query(src), Some(5));
+        assert_eq!(
+            timeouts().len(),
+            2,
+            "the fence itself, and its copy the transfer put on `moved`"
+        );
+        assert!(
+            !reached_by_timeout(&[src], Some(&[2])),
+            "2 was reached for real"
+        );
+        assert!(reached_by_timeout(&[src], Some(&[3])));
+        assert!(reached_by_timeout(&[src], Some(&[5])));
+        assert!(
+            !reached_by_timeout(&[src], Some(&[6])),
+            "6 is not reached at all, by anything"
+        );
+        assert_eq!(query(importer), Some(1));
+        assert!(reached_by_timeout(&[importer], None));
+        assert_eq!(query(moved), Some(9));
+        assert!(reached_by_timeout(&[moved], Some(&[9])));
+        assert!(
+            reached_by_timeout(&[moved], Some(&[0])),
+            "0 is the binary fence"
+        );
+        assert_eq!(query(merged), Some(1));
+        assert!(reached_by_timeout(&[merged], Some(&[1])));
+        // Links made AFTER the fence died take the point, and the taint,
+        // at once.
+        let late_import = create(false);
+        assert!(import_snapshot(late_import, src, 5));
+        assert!(reached_by_timeout(&[late_import], Some(&[1])));
+        let late_move = create(false);
+        assert!(transfer(late_move, 3, src, 5));
+        assert!(reached_by_timeout(&[late_move], Some(&[3])));
+        let late_merge = merge_fences(&[(src, 5)]);
+        assert!(reached_by_timeout(&[late_merge], Some(&[1])));
+        // But not from the good point.
+        let good_import = create(false);
+        assert!(import_snapshot(good_import, src, 2));
+        assert!(!reached_by_timeout(&[good_import], Some(&[1])));
+        // The whole list: one dead handle among good ones is enough.
+        assert!(reached_by_timeout(&[good_import, late_move], Some(&[1, 3])));
+        // What replaces the dead fence clears it: the CPU's own signal at or
+        // past the point...
+        assert!(timeline_signal(src, 5));
+        assert!(!reached_by_timeout(&[src], Some(&[5])));
+        assert!(!reached_by_timeout(&[src], Some(&[3])));
+        // ...a reset...
+        assert!(reset(late_move));
+        assert!(!reached_by_timeout(&[late_move], Some(&[3])));
+        // ...and a binary re-arm on the slot, which the next landing then
+        // makes good.
+        let mut again = Landing::new();
+        assert!(attach_hw_fence(importer, 1, again.va(), 0, 1, 0, true));
+        assert_eq!(query(importer), Some(0));
+        assert!(!reached_by_timeout(&[importer], None));
+        again.land(1);
+        assert_eq!(query(importer), Some(1));
+        assert!(!reached_by_timeout(&[importer], None));
+        // A signal below the dead point leaves it dead.
+        assert!(timeline_signal(moved, 4));
+        assert!(reached_by_timeout(&[moved], Some(&[9])));
+        // Gone is gone: the mark leaves with the object.
+        assert!(destroy(moved));
+        assert!(!reached_by_timeout(&[moved], Some(&[9])));
+        assert_eq!(
+            TABLE
+                .lock()
+                .errored
+                .iter()
+                .filter(|e| e.handle == moved)
+                .count(),
+            0
+        );
+        for h in [
+            src,
+            importer,
+            merged,
+            late_import,
+            late_merge,
+            good_import,
+            late_move,
+        ] {
+            assert!(destroy(h));
+        }
+        assert!(TABLE.lock().errored.is_empty(), "nothing left behind");
     }
 
     /// The bug this guards: a binary syncobj is a fence SLOT, not a counter.
