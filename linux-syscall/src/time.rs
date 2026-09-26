@@ -783,18 +783,12 @@ impl Syscall<'_> {
         new_value: UserInPtr<ITimerVal>,
         mut old_value: UserOutPtr<ITimerVal>,
     ) -> SysResult {
-        let val = new_value.read()?;
+        let val = itimer_request(new_value.read_if_not_null()?)?;
         info!(
             "setitimer: which={}, new_value={:?}, old_value={:?}",
             which, val, old_value
         );
         if which > ITIMER_PROF {
-            return Err(LxError::EINVAL);
-        }
-        // Linux validates both fields of both timevals: the microseconds
-        // have to be a fraction of a second and the seconds must not be
-        // negative.
-        if !val.value.valid() || !val.interval.valid() {
             return Err(LxError::EINVAL);
         }
         let value = Duration::from(val.value);
@@ -1157,6 +1151,26 @@ static NEXT_TIMER_ID: AtomicUsize = AtomicUsize::new(1);
 /// `adjtimex(ADJ_TAI)` set, in whole seconds, which `ADJ_TAI` refuses to
 /// make negative. Until a daemon sets it the two clocks agree, as on a
 /// freshly booted Linux.
+/// The `itimerval` a `setitimer` asks for, from what the caller passed.
+///
+/// A null `new_value` is NOT a fault: `sys_setitimer` takes it as an all-zero
+/// `itimerval`, which disarms the timer, so `setitimer(which, NULL, &old)` is
+/// the documented way to read the old value while cancelling (glibc's
+/// `alarm(0)` on some ports, and every program that copied it). It used to be
+/// `EFAULT` here, with the timer left running.
+///
+/// A value that is there is validated field by field, as `get_itimerval`
+/// does: the microseconds have to be a fraction of a second and the seconds
+/// must not be negative, on the value and on the interval alike, else
+/// `EINVAL`.
+fn itimer_request(new_value: Option<ITimerVal>) -> linux_object::error::LxResult<ITimerVal> {
+    let val = new_value.unwrap_or_default();
+    if !val.value.valid() || !val.interval.valid() {
+        return Err(LxError::EINVAL);
+    }
+    Ok(val)
+}
+
 fn tai_time(wall: TimeSpec, tai_offset: i32) -> TimeSpec {
     TimeSpec {
         sec: wall.sec.wrapping_add(tai_offset.max(0) as usize),
@@ -2140,6 +2154,71 @@ mod adjtimex_tests {
         assert_eq!(setoffset_ns(&ns, true).unwrap(), 250);
         let neg = TimeValI64 { sec: -1, usec: 0 };
         assert_eq!(setoffset_ns(&neg, false).unwrap(), -1_000_000_000);
+    }
+}
+
+#[cfg(test)]
+mod itimer_request_tests {
+    use super::*;
+
+    fn tv(sec: usize, usec: usize) -> TimeVal {
+        TimeVal { sec, usec }
+    }
+
+    /// `setitimer(which, NULL, old)` is "disarm and tell me what was there",
+    /// not a fault: Linux zeroes the request when the pointer is null.
+    #[test]
+    fn a_null_new_value_disarms_instead_of_faulting() {
+        let val = itimer_request(None).expect("a null new_value is a zeroed one");
+        assert_eq!((val.value.sec, val.value.usec), (0, 0));
+        assert_eq!((val.interval.sec, val.interval.usec), (0, 0));
+    }
+
+    /// Both timevals are checked, and each field of each.
+    #[test]
+    fn a_value_that_is_there_is_validated_field_by_field() {
+        let ok = ITimerVal {
+            value: tv(1, 999_999),
+            interval: tv(0, 500_000),
+        };
+        assert!(itimer_request(Some(ok)).is_ok());
+        for (label, bad) in [
+            (
+                "value.usec",
+                ITimerVal {
+                    value: tv(1, 1_000_000),
+                    ..ok
+                },
+            ),
+            (
+                "interval.usec",
+                ITimerVal {
+                    interval: tv(0, 1_000_000),
+                    ..ok
+                },
+            ),
+            (
+                "value.sec",
+                ITimerVal {
+                    value: tv(usize::MAX, 0),
+                    ..ok
+                },
+            ),
+            (
+                "interval.sec",
+                ITimerVal {
+                    interval: tv(usize::MAX, 0),
+                    ..ok
+                },
+            ),
+        ] {
+            assert_eq!(
+                itimer_request(Some(bad)).map(|_| ()),
+                Err(LxError::EINVAL),
+                "{}",
+                label
+            );
+        }
     }
 }
 

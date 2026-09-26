@@ -519,34 +519,13 @@ impl Syscall<'_> {
         uaddr2: usize,
         val3: u32,
     ) -> SysResult {
-        const FUTEX_WAIT: u32 = 0;
-        const FUTEX_WAKE: u32 = 1;
-        const FUTEX_REQUEUE: u32 = 3;
-        const FUTEX_CMP_REQUEUE: u32 = 4;
-        const FUTEX_WAIT_BITSET: u32 = 9;
-        const FUTEX_WAKE_BITSET: u32 = 10;
-        const FUTEX_LOCK_PI: u32 = 6;
-        const FUTEX_UNLOCK_PI: u32 = 7;
-        const FUTEX_TRYLOCK_PI: u32 = 8;
-        const FUTEX_WAIT_REQUEUE_PI: u32 = 11;
-        const FUTEX_CMP_REQUEUE_PI: u32 = 12;
-        const FUTEX_LOCK_PI2: u32 = 13;
-        const FUTEX_PRIVATE_FLAG: u32 = 0x80;
-        const FUTEX_CLOCK_REALTIME: u32 = 0x100;
-
         debug!(
             "Futex uaddr: {:#x}, op: {:x}, val: {}, val2(timeout_addr): {:x}",
             uaddr, op, val, val2,
         );
-        // NOTE: do NOT parse `op` as bitflags — command values are an enum
-        // (WAIT_BITSET=9 would alias WAKE=1 when bits are truncated).
-        let cmd = op & !(FUTEX_PRIVATE_FLAG | FUTEX_CLOCK_REALTIME);
-        // The requeue-PI pair (glibc condvars over PI mutexes) is not
-        // implemented; glibc falls back to plain requeue on ENOSYS. Answer it
-        // HERE, before `get_futex`, so the reply never depends on the address.
-        if matches!(cmd, FUTEX_WAIT_REQUEUE_PI | FUTEX_CMP_REQUEUE_PI) {
-            return Err(LxError::ENOSYS);
-        }
+        // Everything Linux decides from `op` and `val3` alone is decided
+        // here, before the address is looked at: see `futex_op_check`.
+        let cmd = futex_op_check(op, val3)?;
         // Validate the futex word EVERY call, not just when the `Futex` is
         // created. `get_futex` caches an `&AtomicI32` made from this address
         // and keeps it in the process for good, so a check at insert time says
@@ -981,6 +960,74 @@ impl Syscall<'_> {
 /// out never to fire, and the same "no deadline" this kernel already uses for
 /// a thread blocked on an exception (`Thread::handle_exception`).
 pub const NO_FUTEX_DEADLINE: Duration = Duration::from_nanos(u64::MAX);
+
+/// `FUTEX_*` command numbers and the two flag bits `op` carries
+/// (`include/uapi/linux/futex.h`).
+///
+/// They are NOT bitflags: `FUTEX_WAIT_BITSET` (9) would alias `FUTEX_WAKE`
+/// (1) if the command were read a bit at a time, so the command is `op` with
+/// the two flag bits masked off, compared as a whole.
+pub(crate) const FUTEX_WAIT: u32 = 0;
+pub(crate) const FUTEX_WAKE: u32 = 1;
+pub(crate) const FUTEX_REQUEUE: u32 = 3;
+pub(crate) const FUTEX_CMP_REQUEUE: u32 = 4;
+pub(crate) const FUTEX_LOCK_PI: u32 = 6;
+pub(crate) const FUTEX_UNLOCK_PI: u32 = 7;
+pub(crate) const FUTEX_TRYLOCK_PI: u32 = 8;
+pub(crate) const FUTEX_WAIT_BITSET: u32 = 9;
+pub(crate) const FUTEX_WAKE_BITSET: u32 = 10;
+pub(crate) const FUTEX_WAIT_REQUEUE_PI: u32 = 11;
+pub(crate) const FUTEX_CMP_REQUEUE_PI: u32 = 12;
+pub(crate) const FUTEX_LOCK_PI2: u32 = 13;
+pub(crate) const FUTEX_PRIVATE_FLAG: u32 = 0x80;
+pub(crate) const FUTEX_CLOCK_REALTIME: u32 = 0x100;
+
+/// What `do_futex` decides from `op` and `val3` BEFORE it touches `uaddr`,
+/// answered in the same order Linux answers it, with the command it settled
+/// on:
+///
+/// * `FUTEX_CLOCK_REALTIME` is only defined for `FUTEX_WAIT_BITSET`,
+///   `FUTEX_WAIT_REQUEUE_PI` and `FUTEX_LOCK_PI2`: on any other command it
+///   is `ENOSYS`. It used to be silently ignored, so a `FUTEX_WAIT` carrying
+///   it (a relative timeout, which has no clock to select) was accepted where
+///   Linux refuses it, and a program probing for the flag got the wrong
+///   answer.
+/// * A command number Linux does not have is `ENOSYS`, and the requeue-PI
+///   pair (glibc condvars over PI mutexes) is not implemented here, so it is
+///   `ENOSYS` too. Both come BEFORE the futex word is checked: an unknown
+///   command on an unmapped address used to be `EFAULT`, and the answer to
+///   "does this kernel know the command" must not depend on the address.
+/// * The bitset a `FUTEX_WAIT_BITSET` or `FUTEX_WAKE_BITSET` names is
+///   `val3`, and an empty one is `EINVAL` in `futex_wait` and `futex_wake`
+///   alike (a wait no wake could ever match; a wake that matches no waiter).
+///   `FUTEX_WAIT` and `FUTEX_WAKE` do not read `val3` at all: they pass
+///   `FUTEX_BITSET_MATCH_ANY` themselves.
+pub(crate) fn futex_op_check(op: u32, val3: u32) -> LxResult<u32> {
+    let cmd = op & !(FUTEX_PRIVATE_FLAG | FUTEX_CLOCK_REALTIME);
+    if op & FUTEX_CLOCK_REALTIME != 0
+        && !matches!(
+            cmd,
+            FUTEX_WAIT_BITSET | FUTEX_WAIT_REQUEUE_PI | FUTEX_LOCK_PI2
+        )
+    {
+        return Err(LxError::ENOSYS);
+    }
+    match cmd {
+        FUTEX_WAIT | FUTEX_WAKE | FUTEX_REQUEUE | FUTEX_CMP_REQUEUE | FUTEX_LOCK_PI
+        | FUTEX_UNLOCK_PI | FUTEX_TRYLOCK_PI | FUTEX_LOCK_PI2 => Ok(cmd),
+        FUTEX_WAIT_BITSET | FUTEX_WAKE_BITSET => {
+            if val3 == 0 {
+                Err(LxError::EINVAL)
+            } else {
+                Ok(cmd)
+            }
+        }
+        // The requeue-PI pair (glibc condvars over PI mutexes) is not
+        // implemented; glibc falls back to plain requeue on ENOSYS.
+        FUTEX_WAIT_REQUEUE_PI | FUTEX_CMP_REQUEUE_PI => Err(LxError::ENOSYS),
+        _ => Err(LxError::ENOSYS),
+    }
+}
 
 /// How long a `futex` wait blocks, as a deadline on the kernel's monotonic
 /// clock.
@@ -1843,6 +1890,122 @@ pub struct SysInfo {
     freehigh: u64,
     /// Memory unit size in bytes
     mem_unit: u32,
+}
+
+#[cfg(test)]
+mod futex_op_tests {
+    use super::*;
+
+    /// `FUTEX_CLOCK_REALTIME` picks the clock an ABSOLUTE timeout is read on,
+    /// so only the commands that take one may carry it; on the rest Linux
+    /// answers `ENOSYS`, and it used to be ignored here.
+    #[test]
+    fn clock_realtime_is_only_for_the_commands_with_an_absolute_timeout() {
+        for cmd in [FUTEX_WAIT_BITSET, FUTEX_LOCK_PI2] {
+            assert_eq!(
+                futex_op_check(cmd | FUTEX_CLOCK_REALTIME | FUTEX_PRIVATE_FLAG, 1),
+                Ok(cmd),
+                "cmd {cmd} takes an absolute timeout and so takes the flag"
+            );
+        }
+        for cmd in [
+            FUTEX_WAIT,
+            FUTEX_WAKE,
+            FUTEX_REQUEUE,
+            FUTEX_CMP_REQUEUE,
+            FUTEX_LOCK_PI,
+            FUTEX_UNLOCK_PI,
+            FUTEX_TRYLOCK_PI,
+            FUTEX_WAKE_BITSET,
+        ] {
+            assert_eq!(
+                futex_op_check(cmd | FUTEX_CLOCK_REALTIME, 1),
+                Err(LxError::ENOSYS),
+                "cmd {cmd} has no clock to select"
+            );
+            assert_eq!(
+                futex_op_check(cmd, 1),
+                Ok(cmd),
+                "cmd {cmd} without the flag"
+            );
+        }
+    }
+
+    /// A command Linux does not have, and the requeue-PI pair this kernel
+    /// does not implement, are `ENOSYS` from `op` alone: the address is not
+    /// looked at, so it cannot turn the answer into `EFAULT` or `EINVAL`.
+    #[test]
+    fn an_unknown_command_is_enosys_before_the_word_is_read() {
+        // 0x11 is FUTEX_WAKE with a bit above the highest command set: a
+        // command read from its low bits alone would take it for a wake.
+        for cmd in [
+            2,
+            5,
+            14,
+            15,
+            0x11,
+            0x7f,
+            FUTEX_WAIT_REQUEUE_PI,
+            FUTEX_CMP_REQUEUE_PI,
+        ] {
+            assert_eq!(futex_op_check(cmd, 1), Err(LxError::ENOSYS), "cmd {cmd}");
+            assert_eq!(
+                futex_op_check(cmd | FUTEX_PRIVATE_FLAG, 1),
+                Err(LxError::ENOSYS),
+                "cmd {cmd}, private"
+            );
+        }
+        // `FUTEX_CLOCK_REALTIME` on the requeue-PI wait is a legal `op`; the
+        // answer is still ENOSYS, for the command this time.
+        assert_eq!(
+            futex_op_check(FUTEX_WAIT_REQUEUE_PI | FUTEX_CLOCK_REALTIME, 1),
+            Err(LxError::ENOSYS)
+        );
+    }
+
+    /// The bitset is `val3` on the `_BITSET` commands and nothing else: empty
+    /// there is `EINVAL`, and a plain `FUTEX_WAIT`/`FUTEX_WAKE` ignores
+    /// whatever `val3` holds (glibc passes garbage in it for those).
+    #[test]
+    fn an_empty_bitset_is_einval_only_where_the_bitset_is_read() {
+        for cmd in [FUTEX_WAIT_BITSET, FUTEX_WAKE_BITSET] {
+            assert_eq!(futex_op_check(cmd, 0), Err(LxError::EINVAL), "cmd {cmd}");
+            assert_eq!(
+                futex_op_check(cmd | FUTEX_PRIVATE_FLAG, 0),
+                Err(LxError::EINVAL),
+                "cmd {cmd}, private"
+            );
+            assert_eq!(futex_op_check(cmd, u32::MAX), Ok(cmd), "match-any");
+            assert_eq!(futex_op_check(cmd, 0x4), Ok(cmd), "one bit is a bitset");
+        }
+        for cmd in [FUTEX_WAIT, FUTEX_WAKE, FUTEX_LOCK_PI] {
+            assert_eq!(
+                futex_op_check(cmd, 0),
+                Ok(cmd),
+                "cmd {cmd} does not read val3"
+            );
+        }
+    }
+
+    /// The command is `op` minus the two flag bits, read as a whole: a
+    /// bit-by-bit reading would take `FUTEX_WAIT_BITSET` (9 = 8|1) for
+    /// `FUTEX_WAKE` (1). Pins the uapi numbers while it is at it.
+    #[test]
+    fn the_command_is_the_op_minus_its_two_flags() {
+        assert_eq!((FUTEX_WAIT_BITSET, FUTEX_WAKE_BITSET), (9, 10));
+        assert_eq!((FUTEX_PRIVATE_FLAG, FUTEX_CLOCK_REALTIME), (0x80, 0x100));
+        assert_eq!(
+            futex_op_check(
+                FUTEX_WAIT_BITSET | FUTEX_PRIVATE_FLAG | FUTEX_CLOCK_REALTIME,
+                1
+            ),
+            Ok(FUTEX_WAIT_BITSET)
+        );
+        assert_eq!(
+            futex_op_check(FUTEX_WAKE | FUTEX_PRIVATE_FLAG, 0),
+            Ok(FUTEX_WAKE)
+        );
+    }
 }
 
 #[cfg(test)]
