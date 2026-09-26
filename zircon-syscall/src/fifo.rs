@@ -115,8 +115,12 @@ impl Syscall<'_> {
         // `Fifo::read_buffer_elems`. Clamping cannot change the answer, since a
         // read never returns more elements than the fifo holds.
         let count = fifo.read_buffer_elems(elem_size, count)?;
+        // The product cannot overflow: `byte_count` above is the same one with a
+        // count at least this large, and it was checked. Checked again all the
+        // same, so nobody reading this has to go and prove it.
+        let data_len = count.checked_mul(elem_size).ok_or(ZxError::INVALID_ARGS)?;
         // TODO: uninit buffer
-        let mut data = vec![0; count * elem_size];
+        let mut data = vec![0; data_len];
         let actual_count = fifo.read(elem_size, &mut data, count)?;
         actual_count_ptr.write_if_not_null(actual_count)?;
         user_bytes.write_array(&data[..actual_count * elem_size])?;

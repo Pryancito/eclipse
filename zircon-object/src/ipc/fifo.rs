@@ -134,7 +134,14 @@ impl Fifo {
         Ok(read_size / elem_size)
     }
 
-    /// The number of elements a `read` of `count` elements could ever return.
+    /// The number of elements a `read` of `count` elements could ever return,
+    /// or `OUT_OF_RANGE` for the two requests a read refuses outright.
+    ///
+    /// A `count` of zero is one of them, and answers `OUT_OF_RANGE` rather than
+    /// `Ok(0)`: `zx_fifo_read` requires a nonzero count, [`read`] refuses it,
+    /// and `sys_fifo_read` has already refused it before this is reached. The
+    /// number this would naturally be is zero, so the error is the contract
+    /// speaking and not the arithmetic.
     ///
     /// A fifo holds at most `elem_count` elements, so a caller asking for more
     /// is asking for bytes that cannot exist. The syscall layer sizes its

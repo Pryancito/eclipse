@@ -61,9 +61,12 @@ impl Syscall<'_> {
         // may be gigabytes long, and a request the heap cannot serve is not an
         // error here but a kernel panic. The same reason `process_read_memory`
         // reads in chunks.
+        // `base + done` stays inside the object: the check above establishes
+        // `base + buf_size <= vmo.len()`, and `done` never reaches `buf_size`.
+        let base = offset as usize;
         let mut chunk = vec![0u8; buf_size.min(VMO_READ_CHUNK)];
         for (done, want) in read_chunks(buf_size, VMO_READ_CHUNK) {
-            vmo.read(offset as usize + done, &mut chunk[..want])?;
+            vmo.read(base + done, &mut chunk[..want])?;
             buf.add(done).write_array(&chunk[..want])?;
         }
         Ok(())
