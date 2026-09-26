@@ -2,6 +2,7 @@
 
 use alloc::{fmt::Write as _, string::String, sync::Arc, vec::Vec};
 use core::any::Any;
+use core::time::Duration;
 use lazy_static::lazy_static;
 
 use kernel_hal::drivers;
@@ -1959,10 +1960,22 @@ fn proc_uptime_content() -> String {
 /// spent blocked in a syscall — and `idle` from the same halt-time counter
 /// `/proc/perf/kernel` and `/proc/uptime` already use, so all three views
 /// agree with each other and with reality.
+///
+/// `btime` is the boot time in seconds since the epoch, `intr` the interrupts
+/// handled since boot and `processes` the processes created since boot
+/// (`total_forks`). All three read 0 (`processes` read the number ALIVE): `ps
+/// -o lstart` adds the process's start ticks to `btime`, so every process
+/// started on 1 January 1970, and `vmstat` differentiated `processes` and
+/// `intr` into forks and interrupts per second, both 0 or negative.
 fn proc_stat_content() -> String {
-    let procs = all_processes();
     let running = crate::loadavg::runnable_count();
     let ncpus = kernel_hal::online_cpu_count().max(1);
+    let btime = boot_time_secs(
+        kernel_hal::timer::timer_now_realtime(),
+        kernel_hal::timer::timer_now(),
+    );
+    let intr = kernel_hal::kstats::snapshot().irq_total;
+    let forks = crate::process::processes_created();
 
     let (mut total_user, mut total_sys, mut total_idle) = (0u64, 0u64, 0u64);
     let mut per_cpu = String::new();
@@ -1978,15 +1991,23 @@ fn proc_stat_content() -> String {
     format!(
         "cpu  {total_user} 0 {total_sys} {total_idle} 0 0 0 0 0 0\n\
          {per_cpu}\
-         intr 0\n\
+         intr {intr}\n\
          ctxt 0\n\
-         btime 0\n\
-         processes {}\n\
+         btime {btime}\n\
+         processes {forks}\n\
          procs_running {}\n\
          procs_blocked 0\n",
-        procs.len(),
         running
     )
+}
+
+/// The `btime` of `/proc/stat`: when the machine booted, in seconds since
+/// the epoch, which is the wall clock now minus how long it has been up
+/// (`getboottime64`). `ps` adds a process's start ticks to it to print
+/// `lstart`/`start_time`, so a `btime` of 0 dates every process to 1970.
+/// A wall clock behind the uptime (unset RTC) gives 0 rather than a wrap.
+fn boot_time_secs(realtime: Duration, monotonic: Duration) -> u64 {
+    realtime.saturating_sub(monotonic).as_secs()
 }
 
 /// `/proc/loadavg` — one-line load averages for `top` header.
@@ -3580,6 +3601,101 @@ mod pid_stat_tests {
         assert_eq!(stat_memory_fields(3 * 4096, 2 * 4096), (3 * 4096, 2));
         assert_eq!(stat_memory_fields(0, 0), (0, 0));
         assert_eq!(stat_memory_fields(4096, 4095), (4096, 0));
+    }
+}
+
+#[cfg(test)]
+mod stat_file_tests {
+    //! `/proc/stat` said `btime 0`, `intr 0` and gave the number of live
+    //! processes as `processes`: `ps -o lstart` dated every process to 1970
+    //! and `vmstat` had no forks or interrupts per second to show.
+
+    use super::*;
+    use crate::process::LinuxProcess;
+    use rcore_fs_ramfs::RamFS;
+
+    fn line_value(text: &str, key: &str) -> u64 {
+        text.lines()
+            .find_map(|line| {
+                line.strip_prefix(key)
+                    .and_then(|rest| rest.strip_prefix(' '))
+            })
+            .unwrap_or_else(|| panic!("{} in {:?}", key, text))
+            .trim()
+            .parse()
+            .unwrap()
+    }
+
+    #[test]
+    fn btime_is_the_wall_clock_minus_the_uptime() {
+        assert_eq!(
+            boot_time_secs(Duration::from_secs(1_700_000_100), Duration::from_secs(100)),
+            1_700_000_000
+        );
+        // Seconds, whole: `ps` reads an integer.
+        assert_eq!(
+            boot_time_secs(Duration::from_millis(10_900), Duration::from_millis(400)),
+            10
+        );
+        // A wall clock behind the uptime is a clock nobody set, not a wrap.
+        assert_eq!(
+            boot_time_secs(Duration::from_secs(5), Duration::from_secs(50)),
+            0
+        );
+        // And the file carries it: what the two clocks say around the read.
+        let before = boot_time_secs(
+            kernel_hal::timer::timer_now_realtime(),
+            kernel_hal::timer::timer_now(),
+        );
+        let btime = line_value(&proc_stat_content(), "btime");
+        let after = boot_time_secs(
+            kernel_hal::timer::timer_now_realtime(),
+            kernel_hal::timer::timer_now(),
+        );
+        assert!(
+            before.saturating_sub(1) <= btime && btime <= after + 1,
+            "{}",
+            btime
+        );
+        assert!(btime > 0);
+    }
+
+    #[test]
+    fn processes_counts_the_forks_since_boot_not_the_processes_alive() {
+        let before = line_value(&proc_stat_content(), "processes");
+        let created = Process::create_with_fixed_id_ext(
+            &Job::root(),
+            4401,
+            "stat",
+            LinuxProcess::new(RamFS::new(), 0),
+        )
+        .unwrap();
+        let alive = all_processes().len() as u64;
+        let with_one_more = line_value(&proc_stat_content(), "processes");
+        assert!(
+            with_one_more >= before + 1,
+            "{} then {}",
+            before,
+            with_one_more
+        );
+        // It is a counter of births, so it does not track how many live.
+        drop(created);
+        assert!(line_value(&proc_stat_content(), "processes") >= with_one_more);
+        assert!(
+            with_one_more >= alive,
+            "{} forks, {} alive",
+            with_one_more,
+            alive
+        );
+    }
+
+    #[test]
+    fn intr_is_the_interrupts_handled_since_boot() {
+        let before = line_value(&proc_stat_content(), "intr");
+        for _ in 0..3 {
+            kernel_hal::kstats::note_irq(0xF2);
+        }
+        assert!(line_value(&proc_stat_content(), "intr") >= before + 3);
     }
 }
 

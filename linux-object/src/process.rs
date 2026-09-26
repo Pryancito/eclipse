@@ -16,7 +16,7 @@ use alloc::{
     vec::Vec,
 };
 use core::convert::TryFrom;
-use core::sync::atomic::{AtomicI32, Ordering};
+use core::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 use hashbrown::{HashMap, HashSet};
 use kernel_hal::sync::{Mutex, MutexGuard};
 use kernel_hal::VirtAddr;
@@ -1460,6 +1460,7 @@ impl LinuxProcess {
         files.insert(1.into(), stdout);
         files.insert(2.into(), stderr);
 
+        note_process_created();
         LinuxProcess {
             root_inode,
             parent: Mutex::new(Weak::default()),
@@ -3760,6 +3761,7 @@ impl LinuxProcessInner {
     }
 
     fn forked_child(&self, pgid: KoID, sid: KoID, start_ns: u64) -> Self {
+        note_process_created();
         LinuxProcessInner {
             // `copy_process`: `p->start_time = ktime_get_ns()`. The child is
             // born now, whenever its parent was; carried over, every child
@@ -4348,6 +4350,21 @@ pub fn find_process(pid: KoID) -> Option<Arc<Process>> {
 /// stamped with (`ktime_get_ns()` in `copy_process`).
 fn monotonic_now_ns() -> u64 {
     kernel_hal::timer::timer_now().as_nanos() as u64
+}
+
+/// Processes created since boot, exited or not: Linux's `total_forks`,
+/// bumped once per `copy_process`, which the `processes` line of
+/// `/proc/stat` publishes and `vmstat` differentiates into forks per second.
+static PROCESSES_CREATED: AtomicU64 = AtomicU64::new(0);
+
+fn note_process_created() {
+    PROCESSES_CREATED.fetch_add(1, Ordering::Relaxed);
+}
+
+/// How many processes have been created since boot (`total_forks`): a
+/// counter that only grows, not the number alive now.
+pub fn processes_created() -> u64 {
+    PROCESSES_CREATED.load(Ordering::Relaxed)
 }
 
 /// The real uid of the process `pid` names, exited or not; 0 when there is
@@ -5216,6 +5233,21 @@ mod fork_inheritance_tests {
         let mut parent = a_configured_parent();
         parent.start_ns = 5;
         assert_eq!(parent.forked_child(41, 42, 999).start_ns, 999);
+    }
+
+    #[test]
+    fn every_fork_counts_once_in_the_processes_created_since_boot() {
+        // `total_forks` in `copy_process`: a counter, never the live count.
+        // Other tests create processes too, so the count can grow by more
+        // than ours, never by less and never shrink.
+        let parent = a_configured_parent();
+        let before = processes_created();
+        let _first = parent.forked_child(41, 42, 1);
+        let _second = parent.forked_child(41, 42, 2);
+        assert!(processes_created() >= before + 2);
+        // A dropped child stays counted.
+        drop(_first);
+        assert!(processes_created() >= before + 2);
     }
 
     #[test]
