@@ -1284,6 +1284,57 @@ impl VmAddressRegion {
         Err(PagingError::NoMemory)
     }
 
+    /// Whether a user mapping covers `[addr, addr + len)` from end to end.
+    ///
+    /// **Both ends being mapped does not mean the range is.** The obvious
+    /// two-lookup check -- `find_mapping(addr)` and `find_mapping(end)` -- says
+    /// yes for a range whose two halves sit in different mappings with an
+    /// unmapped hole between them, and a process's address space is full of
+    /// exactly that shape: every library, heap and stack with a gap after it. A
+    /// syscall whose buffer spans such a gap then gets a green light, and the
+    /// kernel takes a page fault it has no fixup for, which is the machine.
+    ///
+    /// So this walks **mappings**, not pages: one lookup per mapping the range
+    /// touches, which for the overwhelmingly common single-mapping buffer is
+    /// one lookup -- cheaper than the two-lookup version it replaces.
+    ///
+    /// It is about MAPPINGS and not about present pages, so demand paging keeps
+    /// working: a mapped-but-uncommitted range answers `true` and faults in as
+    /// usual. It says nothing about permissions either; for that ask
+    /// [`Self::check_user_range`].
+    pub fn range_is_mapped(&self, addr: usize, len: usize) -> bool {
+        if len == 0 {
+            // No byte is touched, so no mapping is needed. This is what a
+            // zero-length `read`/`write` relies on.
+            return true;
+        }
+        // A length that wraps the address space names no range at all. Refusing
+        // is the only safe answer: this is a bounds check, and an overflow that
+        // answers "fine" is the one failure mode it must not have.
+        let Some(end) = addr.checked_add(len - 1) else {
+            return false;
+        };
+        let mut at = addr;
+        loop {
+            let Some(mapping) = self.find_mapping(at) else {
+                return false;
+            };
+            let mapping_end = mapping.inner.lock().end_addr();
+            if mapping_end > end {
+                return true;
+            }
+            if mapping_end <= at {
+                // A mapping that does not contain the address it was found for
+                // would make this loop spin for ever. It cannot happen, and a
+                // refusal is the right answer if it ever does.
+                return false;
+            }
+            // Continue from the first byte the mapping does not cover: the next
+            // mapping must start exactly there, or there is a hole.
+            at = mapping_end;
+        }
+    }
+
     /// Validate that a complete user address range is mapped with `access` permissions.
     pub fn check_user_range(&self, addr: usize, len: usize, access: MMUFlags) -> ZxResult {
         if len == 0 {
@@ -3376,6 +3427,101 @@ mod tests {
     impl Drop for FaultPublishHookGuard {
         fn drop(&mut self) {
             *FAULT_PUBLISH_HOOK.lock() = None;
+        }
+    }
+
+    /// `range_is_mapped`: what a syscall asks before it dereferences a user
+    /// pointer, and the question the obvious two-lookup version gets wrong.
+    mod range_is_mapped {
+        use super::*;
+
+        /// A root VMAR with `[base, base+0x1000)` and `[base+0x2000, base+0x3000)`
+        /// mapped and the page between them left unmapped -- the shape of any
+        /// address space with two libraries and a gap.
+        fn vmar_with_a_hole() -> (Arc<VmAddressRegion>, usize) {
+            let vmar = VmAddressRegion::new_root();
+            let base = vmar.addr();
+            let vmo = VmObject::new_paged(1);
+            let flags = MMUFlags::READ | MMUFlags::WRITE | MMUFlags::USER;
+            vmar.map_at(0, vmo.clone(), 0, 0x1000, flags).unwrap();
+            vmar.map_at(0x2000, vmo, 0, 0x1000, flags).unwrap();
+            (vmar, base)
+        }
+
+        #[test]
+        fn a_range_inside_one_mapping_is_mapped() {
+            let (vmar, base) = vmar_with_a_hole();
+            assert!(vmar.range_is_mapped(base, 1));
+            assert!(vmar.range_is_mapped(base, 0x1000));
+            assert!(vmar.range_is_mapped(base + 0xfff, 1));
+        }
+
+        /// The bug. The two ends both resolve, so `find_mapping(addr).is_some()
+        /// && find_mapping(end).is_some()` answered yes -- and the page in
+        /// between is not mapped at all. A syscall buffer of this shape used to
+        /// get a green light and then take a kernel page fault with no fixup
+        /// behind it, which is a kernel DoS reachable from any syscall.
+        #[test]
+        fn a_range_that_spans_a_hole_is_not_mapped() {
+            let (vmar, base) = vmar_with_a_hole();
+            let end = base + 0x2000;
+            assert!(vmar.find_mapping(base).is_some(), "the first end resolves");
+            assert!(vmar.find_mapping(end).is_some(), "so does the last");
+            assert!(
+                vmar.find_mapping(base + 0x1000).is_none(),
+                "and the page between them is not mapped"
+            );
+            assert!(
+                !vmar.range_is_mapped(base, 0x2001),
+                "a range with an unmapped page in the middle is not mapped"
+            );
+        }
+
+        /// ...but two mappings that abut must still be crossable, or a buffer
+        /// straddling two adjacent `mmap`s gets a spurious EFAULT.
+        #[test]
+        fn a_range_that_spans_two_touching_mappings_is_mapped() {
+            let vmar = VmAddressRegion::new_root();
+            let base = vmar.addr();
+            let vmo = VmObject::new_paged(1);
+            let flags = MMUFlags::READ | MMUFlags::WRITE | MMUFlags::USER;
+            vmar.map_at(0, vmo.clone(), 0, 0x1000, flags).unwrap();
+            vmar.map_at(0x1000, vmo, 0, 0x1000, flags).unwrap();
+            assert!(vmar.range_is_mapped(base, 0x2000));
+            assert!(vmar.range_is_mapped(base + 0xfff, 2), "across the seam");
+        }
+
+        #[test]
+        fn a_range_that_starts_or_ends_outside_any_mapping_is_not_mapped() {
+            let (vmar, base) = vmar_with_a_hole();
+            assert!(
+                !vmar.range_is_mapped(base + 0x1000, 1),
+                "starts in the hole"
+            );
+            assert!(!vmar.range_is_mapped(base, 0x1001), "runs into the hole");
+            assert!(
+                !vmar.range_is_mapped(base + 0x2fff, 2),
+                "runs off the end of the last mapping"
+            );
+        }
+
+        /// No byte is touched, so no mapping is needed -- what a zero-length
+        /// `read` or `write` relies on.
+        #[test]
+        fn a_zero_length_range_needs_no_mapping_at_all() {
+            let (vmar, base) = vmar_with_a_hole();
+            assert!(vmar.range_is_mapped(base, 0));
+            assert!(vmar.range_is_mapped(base + 0x1000, 0), "even in the hole");
+            assert!(vmar.range_is_mapped(usize::MAX, 0));
+        }
+
+        /// A bounds check whose arithmetic overflows must refuse, not accept.
+        /// The version this replaces answered `true` here.
+        #[test]
+        fn a_length_that_wraps_the_address_space_is_refused() {
+            let (vmar, base) = vmar_with_a_hole();
+            assert!(!vmar.range_is_mapped(usize::MAX, 2));
+            assert!(!vmar.range_is_mapped(base, usize::MAX));
         }
     }
 

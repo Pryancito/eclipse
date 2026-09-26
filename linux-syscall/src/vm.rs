@@ -66,26 +66,38 @@ pub(crate) const MMAP_MIN_ADDR: usize = 0x1_0000;
 /// it fires HERE only in the first case, and stays silent in the second (the
 /// crash then proves the range was destroyed later).
 ///
-/// Only the first and last page are probed, so the cost is two lookups, not one
-/// per page — and the first page is exactly the word mallocng writes.
+/// `range_is_mapped` walks MAPPINGS rather than pages, so the cost is one
+/// lookup for a range inside one mapping -- the case this check is about -- and
+/// it cannot miss a hole in the middle. Probing only the first and last page,
+/// as this did, stayed silent for a range installed with a gap in it, which is
+/// one of the two failure modes it exists to tell apart.
 fn verify_installed(
     vmar: &alloc::sync::Arc<zircon_object::vm::VmAddressRegion>,
     addr: usize,
     len: usize,
     kind: &str,
 ) {
-    let last = addr + len - PAGE_SIZE;
-    let first_ok = vmar.find_mapping(addr).is_some();
-    let last_ok = vmar.find_mapping(last).is_some();
-    if !first_ok || !last_ok {
+    if !vmar.range_is_mapped(addr, len) {
+        // The last BYTE, not `addr + len - PAGE_SIZE`: `find_mapping` takes any
+        // address inside the page, and this cannot underflow for the `len >= 1`
+        // that getting here implies (a zero `len` is mapped by definition).
+        let last = addr + len - 1;
         kernel_hal::klog_info!(
             "[mmap-lost] {} mmap returned {:#x} len={:#x} but the range is NOT installed \
-             (first_page={}, last_page={})",
+             end to end (first_page={}, last_page={})",
             kind,
             addr,
             len,
-            if first_ok { "ok" } else { "MISSING" },
-            if last_ok { "ok" } else { "MISSING" },
+            if vmar.find_mapping(addr).is_some() {
+                "ok"
+            } else {
+                "MISSING"
+            },
+            if vmar.find_mapping(last).is_some() {
+                "ok"
+            } else {
+                "MISSING"
+            },
         );
     }
 }

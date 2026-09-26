@@ -409,30 +409,29 @@ impl KernelHandler for ZcoreKernelHandler {
     /// See [`KernelHandler::check_user_range`]: does the current process map
     /// anything over `[vaddr, vaddr + len)`?
     ///
-    /// Deliberately conservative — it answers `false` ONLY when it has a vmar
-    /// in hand and that vmar definitively has no mapping covering the range.
-    /// No current thread, a `len` that overflows, a downcast that fails: all
-    /// answer `true` and leave behaviour exactly as it was. A false `false`
-    /// would turn a working syscall into a spurious EFAULT, which is worse
-    /// than the fault this is here to prevent.
+    /// Deliberately conservative about WHOSE range it is: with no current
+    /// thread, or a thread this kernel did not make, there is no user address
+    /// space to ask and the answer is `true` -- the access is not a user-pointer
+    /// access at all. A false `false` would turn a working syscall into a
+    /// spurious EFAULT, which is worse than the fault this is here to prevent.
     ///
-    /// Checks the first and last byte's pages rather than walking the whole
-    /// range: a mapping is page-granular and contiguous, so a range that
-    /// starts and ends inside one cannot have a hole that a syscall-sized
-    /// access would reach. This runs on every user-pointer access, so the cost
-    /// has to stay at two lookups.
+    /// Once there IS a vmar, though, the question is answered properly, by
+    /// [`VmAddressRegion::range_is_mapped`]. This used to check the first and
+    /// last byte and nothing between, on the stated grounds that "a mapping is
+    /// page-granular and contiguous, so a range that starts and ends inside one
+    /// cannot have a hole" -- which is true of ONE mapping and says nothing
+    /// about two. A buffer whose ends land in different mappings with a gap
+    /// between them, which is the shape of every address space with libraries in
+    /// it, passed. And an overflowing `len` answered `true`: an overflow in a
+    /// bounds check is the one failure mode it must not have.
     fn check_user_range(&self, vaddr: usize, len: usize) -> bool {
-        let Some(end) = vaddr.checked_add(len.saturating_sub(1)) else {
-            return true;
-        };
         let Some(thread) = kernel_hal::thread::get_current_thread() else {
             return true;
         };
         let Ok(thread) = thread.downcast::<Thread>() else {
             return true;
         };
-        let vmar = thread.proc().vmar();
-        vmar.find_mapping(vaddr).is_some() && (end == vaddr || vmar.find_mapping(end).is_some())
+        thread.proc().vmar().range_is_mapped(vaddr, len)
     }
 }
 
@@ -831,5 +830,120 @@ fn report_soft_smash_stack_attr(rsp: usize, rbp: usize) {
             "[kchain] end — {} .text words in [{:#x},{:#x})\n",
             printed, base, end,
         ));
+    }
+}
+
+/// The guard in front of every user-pointer dereference.
+///
+/// `UserPtr::check_len` asks this before handing a raw pointer to a syscall,
+/// and a wrong `true` is a kernel page fault with no fixup behind it -- which
+/// is to say, a kernel DoS reachable from any syscall by any process. The
+/// interesting cases live with the walk itself, in
+/// `VmAddressRegion::range_is_mapped`; what is pinned here is the wiring.
+#[cfg(test)]
+mod check_user_range_tests {
+    use super::*;
+    use alloc::sync::Arc;
+    use kernel_hal::MMUFlags;
+    use zircon_object::task::{Job, Process};
+    use zircon_object::vm::{VmAddressRegion, VmObject};
+
+    const USER_RW: MMUFlags = MMUFlags::from_bits_truncate(
+        MMUFlags::READ.bits() | MMUFlags::WRITE.bits() | MMUFlags::USER.bits(),
+    );
+
+    /// Run `f` inside an `async_std` task, which is where the current-thread
+    /// slot lives: `kernel_hal`'s libos `set_current_thread` writes a
+    /// `task_local!`, so outside a task it has nowhere to go and
+    /// `get_current_thread` answers `None`.
+    fn in_a_task(f: impl FnOnce()) {
+        async_std::task::block_on(async move { f() });
+    }
+
+    /// A process whose address space has two mapped pages with an unmapped one
+    /// between them, made the current thread's.
+    fn a_process_with_a_hole_in_its_address_space() -> (Arc<VmAddressRegion>, usize) {
+        let proc = Process::create(&Job::root(), "check_user_range").unwrap();
+        let thread = Thread::create(&proc, "t").unwrap();
+        kernel_hal::thread::set_current_thread(Some(thread));
+        let vmar = proc.vmar();
+        let base = vmar.addr();
+        let vmo = VmObject::new_paged(1);
+        vmar.map_at(0, vmo.clone(), 0, 0x1000, USER_RW).unwrap();
+        vmar.map_at(0x2000, vmo, 0, 0x1000, USER_RW).unwrap();
+        (vmar, base)
+    }
+
+    /// With no current thread there is no user address space to ask, so the
+    /// access is not a user-pointer access and the answer is yes. A `false`
+    /// here would turn every kernel-internal access into a spurious EFAULT.
+    #[test]
+    fn with_no_current_thread_there_is_nothing_to_refuse() {
+        assert!(
+            kernel_hal::thread::get_current_thread().is_none(),
+            "a plain #[test] runs outside any task, which is the case under test"
+        );
+        assert!(ZcoreKernelHandler.check_user_range(0, 0));
+        assert!(ZcoreKernelHandler.check_user_range(0xdead_beef, 0x1000));
+    }
+
+    #[test]
+    fn a_range_the_process_maps_is_allowed() {
+        in_a_task(|| {
+            let (_vmar, base) = a_process_with_a_hole_in_its_address_space();
+            assert!(ZcoreKernelHandler.check_user_range(base, 1));
+            assert!(ZcoreKernelHandler.check_user_range(base, 0x1000));
+        });
+    }
+
+    #[test]
+    fn a_range_the_process_does_not_map_is_refused() {
+        in_a_task(|| {
+            let (_vmar, base) = a_process_with_a_hole_in_its_address_space();
+            assert!(!ZcoreKernelHandler.check_user_range(base + 0x1000, 1));
+            assert!(!ZcoreKernelHandler.check_user_range(base + 0x8000, 0x1000));
+        });
+    }
+
+    /// The bug this guard had: both ends of the range are mapped and the page
+    /// between them is not, and the old first-and-last-byte check said yes.
+    #[test]
+    fn a_range_that_spans_a_hole_is_refused() {
+        in_a_task(|| {
+            let (vmar, base) = a_process_with_a_hole_in_its_address_space();
+            assert!(
+                vmar.find_mapping(base).is_some(),
+                "the first byte is mapped"
+            );
+            assert!(
+                vmar.find_mapping(base + 0x2000).is_some(),
+                "and so is the last"
+            );
+            assert!(
+                !ZcoreKernelHandler.check_user_range(base, 0x2001),
+                "a buffer spanning an unmapped page must not get a green light"
+            );
+        });
+    }
+
+    /// An overflowing length is refused rather than waved through: this is a
+    /// bounds check, and it used to answer `true` here.
+    #[test]
+    fn a_length_that_wraps_the_address_space_is_refused() {
+        in_a_task(|| {
+            let (_vmar, base) = a_process_with_a_hole_in_its_address_space();
+            assert!(!ZcoreKernelHandler.check_user_range(base, usize::MAX));
+            assert!(!ZcoreKernelHandler.check_user_range(usize::MAX, 2));
+        });
+    }
+
+    /// A zero-length access touches no byte, so it needs no mapping -- what a
+    /// zero-length `read` or `write` relies on.
+    #[test]
+    fn a_zero_length_access_needs_no_mapping() {
+        in_a_task(|| {
+            let (_vmar, base) = a_process_with_a_hole_in_its_address_space();
+            assert!(ZcoreKernelHandler.check_user_range(base + 0x1000, 0));
+        });
     }
 }
