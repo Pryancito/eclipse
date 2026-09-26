@@ -1,7 +1,12 @@
 //! Hardware Abstraction Layer
 
 #![cfg_attr(not(feature = "libos"), no_std)]
-#![cfg_attr(feature = "libos", feature(thread_id_value))]
+// Only the test harness needs this now: `utils::test_frames` keys its frame
+// accounting on the host thread id to tell one `#[test]` from another.
+// `libos::cpu` used to want it too, for a `cpu_id()` that was the host thread
+// id cast to `u8` -- which is why that gate was unconditional, and why it is
+// not any more.
+#![cfg_attr(all(feature = "libos", test), feature(thread_id_value))]
 #![feature(doc_cfg)]
 // #![feature(core_intrinsics)]
 #![allow(clippy::uninit_vec)]

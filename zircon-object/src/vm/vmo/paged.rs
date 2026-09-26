@@ -2934,20 +2934,36 @@ mod range_bound_tests {
     /// committed. Every accounting and memory-pressure figure in the kernel
     /// reads those clamped counters, so an unprivileged process could hold
     /// physical memory that nothing could account for.
+    ///
+    /// Counted on the object's own frame map, which means going one level below
+    /// [`VmObject`] to the [`VMObjectPaged`] under it. Two reasons, and both
+    /// rule out the obvious alternatives:
+    ///
+    /// * `vmo_page_bytes()`, which this test used to compare before and after,
+    ///   is `VMO_PAGE_ALLOC - VMO_PAGE_DEALLOC` for the WHOLE PROCESS. Any
+    ///   other test in the binary that commits or drops a page moves it under
+    ///   this one, which it did about twice in sixty parallel runs of the
+    ///   suite. It is not a witness a parallel test can read.
+    /// * `committed_pages_in_range` -- and so `get_info().committed_bytes` --
+    ///   clamps both indices to `size`, so it cannot see a frame at an index
+    ///   past the end. That is exactly the frame the bug left behind, which is
+    ///   why the lying counter cannot be the one that catches it.
+    ///
+    /// `frames.len()` is the honest witness restricted to this object: nothing
+    /// else can touch it, and it counts frames at any index.
     fn a_commit_past_the_end_allocates_nothing() {
-        let vmo = one_page();
-        let before = vmo_page_bytes();
+        let vmo = VMObjectPaged::new(1);
         assert_eq!(
             vmo.commit(0, 64 * PAGE_SIZE),
             Err(ZxError::OUT_OF_RANGE),
             "a one-page object accepted a sixty-four-page commit"
         );
         assert_eq!(
-            vmo_page_bytes(),
-            before,
+            vmo.get_inner().frames.len(),
+            0,
             "the refused commit still allocated frames"
         );
-        assert_eq!(vmo.get_info().committed_bytes, 0);
+        assert_eq!(vmo.committed_pages_in_range(0, 64), 0);
     }
 
     #[test]
