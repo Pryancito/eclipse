@@ -823,15 +823,11 @@ impl Syscall<'_> {
         // kernel that honoured it from a kernel that dropped it.
         copy_file_range_flags(flags)?;
         let proc = self.linux_process();
-        let in_file = proc.get_file(in_fd)?;
-        let out_file = proc.get_file(out_fd)?;
-        // EBADF for descriptors opened the wrong way round. `do_sendfile`
-        // makes the same two checks, so they belong here and not at either
-        // caller.
-        if !in_file.flags().readable() || !out_file.flags().writable() {
-            return Err(LxError::EBADF);
-        }
-        let mut buffer = alloc::vec![0u8; 1024];
+        // Any file-like will do on either side: `sendfile(2)`'s reason to
+        // exist is `out_fd` being a socket, and a socket is not a `File`, so
+        // `get_file` used to answer EBADF to every web server's fast path.
+        let in_file = proc.get_file_like(in_fd)?;
+        let out_file = proc.get_file_like(out_fd)?;
 
         // for in_offset and out_offset
         // null means update file offset
@@ -842,80 +838,149 @@ impl Syscall<'_> {
         // just the starting position -- see `user_offset_end`. Unvalidated, a
         // negative one arrived here as a number near 2^64 and went straight
         // into `read_at`/`seek`, and the `+=` further down wrapped on top.
-        let mut read_offset = if !in_offset.is_null() {
+        let read_offset = if !in_offset.is_null() {
             let offset = in_offset.read()?;
             linux_object::fs::user_offset_end(offset, count)?;
-            offset
+            Some(offset)
         } else {
-            in_file.seek(SeekFrom::Current(0))?
+            None
         };
-
-        let orig_out_file_offset = out_file.seek(SeekFrom::Current(0))?;
         let write_offset = if !out_offset.is_null() {
             let offset = out_offset.read()?;
             linux_object::fs::user_offset_end(offset, count)?;
-            out_file.seek(SeekFrom::Start(offset))?
+            Some(offset)
         } else {
-            0
+            None
         };
 
-        // read from specified offset and write new offset back
-        let mut bytes_read = 0;
-        let mut total_written = 0;
-        while bytes_read < count {
-            let len = buffer.len().min(count - bytes_read);
-            let read_len = in_file.read_at(read_offset, &mut buffer[..len]).await?;
-            if read_len == 0 {
+        let waits = self.waits_for_room(&out_file);
+        let copied = copy_range(&in_file, read_offset, &out_file, write_offset, count, waits)
+            .await
+            .inspect_err(|&e| self.raise_sigpipe_if_due(e, self.is_stream(&out_file)))?;
+        if let Some(off) = copied.in_offset {
+            in_offset.write(off)?;
+        }
+        if let Some(off) = copied.out_offset {
+            out_offset.write(off)?;
+        }
+        Ok(copied.moved)
+    }
+}
+
+/// What `copy_range` moved and where the explicit offsets now stand: each
+/// advanced by the bytes that reached the output, `None` where the caller gave
+/// none (that side used and moved its own position).
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct Copied {
+    pub moved: usize,
+    pub in_offset: Option<u64>,
+    pub out_offset: Option<u64>,
+}
+
+/// Copy up to `count` bytes from `in_file` to `out_file`, the way
+/// `do_splice_direct` does for `sendfile(2)` and `copy_file_range(2)`: **what
+/// the input hands over is what the output took**, and a call that moved
+/// anything reports that count rather than an error.
+///
+/// The old loop read a chunk, then wrote it with `?` on every write: a full
+/// socket or pipe answered `EAGAIN` after some chunks were already out, the
+/// error came back with no count, and the caller -- a web server sending a
+/// file -- resent from the same offset, so the peer received the head of the
+/// file twice. A blocking socket got that `EAGAIN` too, where `write(2)` on
+/// the same fd waits. And a write of 0 bytes was reported as `EBADF`.
+///
+/// Now a write error goes through `after_write_error`, exactly as `write(2)`
+/// does: wait for room when the fd is a blocking pipe or socket, report the
+/// bytes already moved when there are any, and only fail when nothing moved.
+/// The input position (`*off_in` or the fd's own) ends after the last byte
+/// delivered, the output fd's own position is never touched when `off_out`
+/// is given, and a chunk is `SYSCALL_IO_MAX`, not 1 KiB.
+pub(crate) async fn copy_range(
+    in_file: &Arc<dyn FileLike>,
+    in_offset: Option<u64>,
+    out_file: &Arc<dyn FileLike>,
+    out_offset: Option<u64>,
+    count: usize,
+    waits: bool,
+) -> linux_object::error::LxResult<Copied> {
+    // EBADF for descriptors opened the wrong way round. `do_sendfile`
+    // makes the same two checks, so they belong here and not at either
+    // caller.
+    if !in_file.flags().readable() || !out_file.flags().writable() {
+        return Err(LxError::EBADF);
+    }
+    let read_start = match in_offset {
+        Some(off) => off,
+        None => in_file.seek(SeekFrom::Current(0))?,
+    };
+    let mut buffer = crate::try_zeroed_buf(count.min(super::SYSCALL_IO_MAX))?;
+    let mut moved = 0usize;
+    let mut error = None;
+    'copy: while moved < count {
+        let len = buffer.len().min(count - moved);
+        // `user_offset_end` bounds the whole window for an explicit offset;
+        // `checked_add` keeps the fd's own position honest too.
+        let read_at = read_start
+            .checked_add(moved as u64)
+            .ok_or(LxError::EOVERFLOW)?;
+        let read_len = match in_file.read_at(read_at, &mut buffer[..len]).await {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) => {
+                error = Some(e);
                 break;
             }
-            bytes_read += read_len;
-            // `user_offset_end` above bounds the whole window, so this cannot
-            // wrap for a checked call; `checked_add` keeps it true for the
-            // arm that took the file's own position instead.
-            read_offset = read_offset
-                .checked_add(read_len as u64)
-                .ok_or(LxError::EOVERFLOW)?;
-
-            let mut bytes_written = 0;
-            let mut rlen = read_len;
-            while bytes_written < read_len {
-                let write_len = out_file.write(&buffer[bytes_written..(bytes_written + rlen)])?;
-                if write_len == 0 {
-                    info!(
-                        "copy_file_range:END_ERR in={:?}, out={:?}, in_offset={:?}, out_offset={:?}, count={} = bytes_read {}, bytes_written {}, write_len {}",
-                        in_fd,
-                        out_fd,
-                        in_offset,
-                        out_offset,
-                        count,
-                        bytes_read,
-                        bytes_written,
-                        write_len
-                    );
-                    return Err(LxError::EBADF);
+        };
+        let mut written = 0usize;
+        while written < read_len {
+            let chunk = &buffer[written..read_len];
+            let res = match out_offset {
+                Some(off) => out_file.write_at(off + (moved + written) as u64, chunk),
+                None => out_file.write(chunk),
+            };
+            match res {
+                Ok(0) => {
+                    moved += written;
+                    break 'copy;
                 }
-                bytes_written += write_len;
-                rlen -= write_len;
+                Ok(n) => written += n,
+                Err(e) => match after_write_error(e, waits, moved + written) {
+                    AfterWriteError::Wait => {
+                        out_file.async_poll(PollEvents::OUT).await?;
+                    }
+                    AfterWriteError::Partial => {
+                        moved += written;
+                        break 'copy;
+                    }
+                    AfterWriteError::Fail => {
+                        error = Some(e);
+                        break 'copy;
+                    }
+                },
             }
-            total_written += bytes_written;
         }
-
-        if !in_offset.is_null() {
-            in_offset.write(read_offset)?;
-        } else {
-            in_file.seek(SeekFrom::Current(bytes_read as i64))?;
-        }
-        out_offset.write_if_not_null(
-            write_offset
-                .checked_add(total_written as u64)
-                .ok_or(LxError::EOVERFLOW)?,
-        )?;
-        if !out_offset.is_null() {
-            out_file.seek(SeekFrom::Start(orig_out_file_offset))?;
-        }
-        Ok(total_written)
+        moved += written;
     }
+    if moved == 0 {
+        if let Some(e) = error {
+            return Err(e);
+        }
+    }
+    let in_offset = match in_offset {
+        Some(_) => Some(read_start + moved as u64),
+        None => {
+            in_file.seek(SeekFrom::Current(moved as i64))?;
+            None
+        }
+    };
+    Ok(Copied {
+        moved,
+        in_offset,
+        out_offset: out_offset.map(|off| off + moved as u64),
+    })
+}
 
+impl Syscall<'_> {
     /// causes all buffered modifications to file metadata and data to be written to the underlying file systems.
     pub fn sys_sync(&self) -> SysResult {
         info!("sync:");
@@ -3132,5 +3197,270 @@ mod copy_file_range_flag_tests {
                 "{flags}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod copy_range_tests {
+    //! `sendfile(2)` and `copy_file_range(2)` on a ramfs file and a bounded,
+    //! socket-like output that is not a `File`. Every test names bytes the
+    //! old loop reported wrong: a chunk already out when `EAGAIN` came back,
+    //! which the caller then sent again.
+
+    use super::{copy_range, Copied};
+    use alloc::boxed::Box;
+    use alloc::string::String;
+    use alloc::sync::Arc;
+    use alloc::vec::Vec;
+    use core::sync::atomic::{AtomicUsize, Ordering};
+    use linux_object::error::{LxError, LxResult};
+    use linux_object::fs::vfs::FileType;
+    use linux_object::fs::{File, FileLike, OpenFlags, PollEvents, PollStatus, SeekFrom};
+    use rcore_fs::vfs::FileSystem;
+    use rcore_fs_ramfs::RamFS;
+    use zircon_object::object::*;
+
+    /// A ramfs file holding `content`, opened read-write at offset 0.
+    fn file(content: &[u8]) -> Arc<dyn FileLike> {
+        let fs = RamFS::new();
+        let inode = fs.root_inode().create("f", FileType::File, 0o644).unwrap();
+        if !content.is_empty() {
+            inode.write_at(0, content).unwrap();
+        }
+        // The inode only holds a `Weak` to its filesystem, and `File::write`
+        // upgrades it; keep the ramfs alive for the test.
+        core::mem::forget(fs);
+        File::new(inode, OpenFlags::RDWR, String::from("/f"))
+    }
+
+    fn bytes(n: usize) -> Vec<u8> {
+        (0..n).map(|i| (i % 251) as u8).collect()
+    }
+
+    /// A socket-like output, not a `File`: takes what fits in `room`, then
+    /// answers `EAGAIN` (or, with `stall`, a write of 0), and gets `refill`
+    /// bytes of room back each time a writer waits on it.
+    struct Bounded {
+        base: KObjectBase,
+        taken: lock::Mutex<Vec<u8>>,
+        room: AtomicUsize,
+        refill: usize,
+        stall: bool,
+        waits: AtomicUsize,
+    }
+
+    impl_kobject!(Bounded);
+
+    impl Bounded {
+        fn new(room: usize, refill: usize, stall: bool) -> Arc<Self> {
+            Arc::new(Bounded {
+                base: KObjectBase::new(),
+                taken: lock::Mutex::new(Vec::new()),
+                room: AtomicUsize::new(room),
+                refill,
+                stall,
+                waits: AtomicUsize::new(0),
+            })
+        }
+        fn as_file_like(self: &Arc<Self>) -> Arc<dyn FileLike> {
+            self.clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl FileLike for Bounded {
+        fn flags(&self) -> OpenFlags {
+            OpenFlags::RDWR
+        }
+        fn set_flags(&self, _: OpenFlags) -> LxResult {
+            Ok(())
+        }
+        async fn read(&self, _: &mut [u8]) -> LxResult<usize> {
+            Err(LxError::ENOSYS)
+        }
+        fn write(&self, buf: &[u8]) -> LxResult<usize> {
+            let room = self.room.load(Ordering::SeqCst);
+            if room == 0 {
+                return if self.stall {
+                    Ok(0)
+                } else {
+                    Err(LxError::EAGAIN)
+                };
+            }
+            let take = buf.len().min(room);
+            self.taken.lock().extend_from_slice(&buf[..take]);
+            self.room.fetch_sub(take, Ordering::SeqCst);
+            Ok(take)
+        }
+        async fn read_at(&self, _: u64, _: &mut [u8]) -> LxResult<usize> {
+            Err(LxError::ENOSYS)
+        }
+        fn poll(&self, _: PollEvents) -> LxResult<PollStatus> {
+            Ok(PollStatus::default())
+        }
+        async fn async_poll(&self, _: PollEvents) -> LxResult<PollStatus> {
+            self.waits.fetch_add(1, Ordering::SeqCst);
+            self.room.fetch_add(self.refill, Ordering::SeqCst);
+            Ok(PollStatus::default())
+        }
+    }
+
+    /// A non-blocking socket that fills after the first chunk: the answer is
+    /// the bytes that went out, not `EAGAIN`. With the error and no count, a
+    /// server resent from the same offset and the peer got the head twice.
+    #[async_std::test]
+    async fn a_socket_that_fills_after_some_bytes_reports_them_not_eagain() {
+        let f = file(&bytes(3000));
+        let sock = Bounded::new(1000, 0, false);
+        let c = copy_range(&f, Some(0), &sock.as_file_like(), None, 3000, false)
+            .await
+            .unwrap();
+        assert_eq!(
+            c,
+            Copied {
+                moved: 1000,
+                in_offset: Some(1000),
+                out_offset: None
+            }
+        );
+        assert_eq!(sock.taken.lock().as_slice(), &bytes(3000)[..1000]);
+    }
+
+    /// Nothing went out: then, and only then, the error is the answer.
+    #[async_std::test]
+    async fn a_socket_with_no_room_at_all_is_eagain() {
+        let f = file(&bytes(100));
+        let sock = Bounded::new(0, 0, false);
+        assert_eq!(
+            copy_range(&f, None, &sock.as_file_like(), None, 100, false)
+                .await
+                .unwrap_err(),
+            LxError::EAGAIN
+        );
+        assert_eq!(f.seek(SeekFrom::Current(0)).unwrap(), 0);
+    }
+
+    /// A blocking socket waits for room and carries on, as `write(2)` on it
+    /// does: the whole file goes out, in as many waits as it takes.
+    #[async_std::test]
+    async fn a_blocking_socket_waits_for_room_until_everything_is_out() {
+        let f = file(&bytes(3000));
+        let sock = Bounded::new(1000, 1000, false);
+        let c = copy_range(&f, None, &sock.as_file_like(), None, 3000, true)
+            .await
+            .unwrap();
+        assert_eq!(c.moved, 3000);
+        assert_eq!(sock.taken.lock().as_slice(), &bytes(3000)[..]);
+        assert_eq!(sock.waits.load(Ordering::SeqCst), 2);
+        assert_eq!(f.seek(SeekFrom::Current(0)).unwrap(), 3000);
+    }
+
+    /// Without an explicit input offset the fd's own position moves by the
+    /// bytes delivered, so the next `sendfile` from the same fd resumes at
+    /// the first byte the socket did not take.
+    #[async_std::test]
+    async fn the_input_fd_position_ends_at_the_first_undelivered_byte() {
+        let f = file(&bytes(3000));
+        f.seek(SeekFrom::Start(500)).unwrap();
+        let sock = Bounded::new(1000, 0, false);
+        let c = copy_range(&f, None, &sock.as_file_like(), None, 3000, false)
+            .await
+            .unwrap();
+        assert_eq!(c.moved, 1000);
+        assert_eq!(f.seek(SeekFrom::Current(0)).unwrap(), 1500);
+        assert_eq!(sock.taken.lock().as_slice(), &bytes(3000)[500..1500]);
+    }
+
+    /// A write that takes nothing ends the copy with the count so far. It
+    /// used to be reported as `EBADF`, with the bytes already out unreported.
+    #[async_std::test]
+    async fn a_write_of_nothing_ends_the_copy_with_what_went_out() {
+        let f = file(&bytes(3000));
+        let sock = Bounded::new(1000, 0, true);
+        let c = copy_range(&f, Some(0), &sock.as_file_like(), None, 3000, true)
+            .await
+            .unwrap();
+        assert_eq!(c.moved, 1000);
+        assert_eq!(c.in_offset, Some(1000));
+    }
+
+    /// `copy_file_range` between two files with both offsets: the bytes land
+    /// at `off_out`, each offset advances by the count, and neither fd's own
+    /// position moves. The output used to be seeked to `off_out` and back.
+    #[async_std::test]
+    async fn explicit_offsets_advance_and_the_fd_positions_stay() {
+        let src = file(&bytes(100));
+        let dst = file(&[0u8; 64]);
+        src.seek(SeekFrom::Start(7)).unwrap();
+        dst.seek(SeekFrom::Start(5)).unwrap();
+        let c = copy_range(&src, Some(10), &dst, Some(8), 20, false)
+            .await
+            .unwrap();
+        assert_eq!(
+            c,
+            Copied {
+                moved: 20,
+                in_offset: Some(30),
+                out_offset: Some(28)
+            }
+        );
+        assert_eq!(src.seek(SeekFrom::Current(0)).unwrap(), 7);
+        assert_eq!(dst.seek(SeekFrom::Current(0)).unwrap(), 5);
+        let mut got = [0u8; 28];
+        dst.read_at(0, &mut got).await.unwrap();
+        assert_eq!(&got[..8], &[0u8; 8]);
+        assert_eq!(&got[8..], &bytes(100)[10..30]);
+    }
+
+    /// Reading past the end stops the copy at the file's size, with the
+    /// count of what there was; a count of zero moves nothing.
+    #[async_std::test]
+    async fn the_copy_stops_at_the_end_of_the_input() {
+        let src = file(&bytes(50));
+        let dst = file(b"");
+        let c = copy_range(&src, Some(30), &dst, None, 1000, false)
+            .await
+            .unwrap();
+        assert_eq!(c.moved, 20);
+        assert_eq!(c.in_offset, Some(50));
+        let c = copy_range(&src, Some(0), &dst, None, 0, false)
+            .await
+            .unwrap();
+        assert_eq!(c.moved, 0);
+    }
+
+    /// The wrong ends are `EBADF` before anything is read or written.
+    #[async_std::test]
+    async fn the_wrong_ends_are_ebadf() {
+        let ro = File::new(
+            RamFS::new()
+                .root_inode()
+                .create("r", FileType::File, 0o644)
+                .unwrap(),
+            OpenFlags::RDONLY,
+            String::from("/r"),
+        );
+        let src = file(b"data");
+        assert_eq!(
+            copy_range(&src, Some(0), &(ro as Arc<dyn FileLike>), None, 4, false)
+                .await
+                .unwrap_err(),
+            LxError::EBADF
+        );
+        let wo = File::new(
+            RamFS::new()
+                .root_inode()
+                .create("w", FileType::File, 0o644)
+                .unwrap(),
+            OpenFlags::WRONLY,
+            String::from("/w"),
+        );
+        let dst = file(b"");
+        assert_eq!(
+            copy_range(&(wo as Arc<dyn FileLike>), Some(0), &dst, None, 4, false)
+                .await
+                .unwrap_err(),
+            LxError::EBADF
+        );
     }
 }
