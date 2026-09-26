@@ -337,14 +337,6 @@ pub(crate) fn may_queue_siginfo(code: i32, target_is_self: bool) -> bool {
     target_is_self || (code < 0 && code != SI_TKILL)
 }
 
-/// `MINSIGSTKSZ` on the architectures this kernel runs.
-const MIN_SIGSTACK_SIZE: usize = 2048;
-
-/// The flags `sigaltstack(2)` accepts in `ss_flags`.
-const VALID_SIGSTACK_FLAGS: SignalStackFlags = SignalStackFlags::from_bits_truncate(
-    SignalStackFlags::AUTODISARM.bits() | SignalStackFlags::DISABLE.bits(),
-);
-
 /// Validate the stack `sigaltstack(2)` was handed, in the order Linux does it.
 ///
 /// `do_sigaltstack` answers `EPERM` for a thread running *on* the alternate
@@ -358,13 +350,7 @@ fn check_sigaltstack(ss: SignalStack, on_alternate_stack: bool) -> Result<(), Lx
     if on_alternate_stack {
         return Err(LxError::EPERM);
     }
-    if !VALID_SIGSTACK_FLAGS.contains(ss.flags) {
-        return Err(LxError::EINVAL);
-    }
-    if !ss.flags.contains(SignalStackFlags::DISABLE) && ss.size < MIN_SIGSTACK_SIZE {
-        return Err(LxError::ENOMEM);
-    }
-    Ok(())
+    ss.validate()
 }
 
 impl Syscall<'_> {
@@ -486,17 +472,13 @@ impl Syscall<'_> {
             if ss.is_null() {
                 return Ok(());
             }
-            let mut ss = ss.read()?;
+            let ss = ss.read()?;
             check_sigaltstack(ss, old.flags.contains(SignalStackFlags::ONSTACK))?;
             // `SS_DISABLE` forgets the stack, it does not merely park it:
             // Linux zeroes `ss_sp`/`ss_size` here, so the next
             // `sigaltstack(NULL, &old)` reports nothing installed rather
             // than an address the program may already have freed.
-            if ss.flags.contains(SignalStackFlags::DISABLE) {
-                ss.sp = 0;
-                ss.size = 0;
-            }
-            self.thread.lock_linux().signal_alternate_stack = ss;
+            self.thread.lock_linux().signal_alternate_stack = ss.as_installed();
             Ok(())
         })?;
         Ok(0)
@@ -1024,6 +1006,7 @@ impl Drop for TempSigmaskGuard {
 #[cfg(test)]
 mod signal_tests {
     use super::*;
+    use linux_object::signal::{MIN_SIGSTACK_SIZE, VALID_SIGSTACK_FLAGS};
 
     /// `pid_t` in a register, the way a caller leaves it there.
     fn reg(value: i32) -> usize {

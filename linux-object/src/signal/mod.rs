@@ -30,6 +30,18 @@ bitflags! {
     }
 }
 
+/// `MINSIGSTKSZ` on the architectures this kernel runs.
+pub const MIN_SIGSTACK_SIZE: usize = 2048;
+
+/// The flags `sigaltstack(2)` accepts in `ss_flags`: `SS_AUTODISARM`, and
+/// the modes `SS_DISABLE` and `SS_ONSTACK` (the latter for compatibility,
+/// as `do_sigaltstack` takes it; it means "install").
+pub const VALID_SIGSTACK_FLAGS: SignalStackFlags = SignalStackFlags::from_bits_truncate(
+    SignalStackFlags::AUTODISARM.bits()
+        | SignalStackFlags::DISABLE.bits()
+        | SignalStackFlags::ONSTACK.bits(),
+);
+
 /// Linux struct stack_t
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -69,6 +81,77 @@ impl SignalStack {
     /// disqualifies it, and so does never having been given a size.
     pub fn usable_from(&self, sp: usize) -> bool {
         self.size != 0 && !self.flags.contains(SignalStackFlags::DISABLE) && !self.contains_sp(sp)
+    }
+
+    /// A stack with nothing installed: `sas_ss_reset()`.
+    pub fn disabled() -> SignalStack {
+        SignalStack::default()
+    }
+
+    /// The `stack_t` a signal frame carries in `uc_stack`, taken as a signal
+    /// is delivered: the stack as stored (`__save_altstack`), which
+    /// [`Self::restore_from_frame`] puts back at `sigreturn`. With
+    /// `SS_AUTODISARM` the delivery also disarms the stack
+    /// (`signal_delivered()` -> `sas_ss_reset()`), so the handler may
+    /// `swapcontext` away from it and a second signal cannot land on the
+    /// frames it left there.
+    ///
+    /// Neither half existed: `uc_stack` went to userspace as zeros and
+    /// `SS_AUTODISARM` was stored and never acted on, so a handler that
+    /// switched contexts (the fibers of libco, boost.context, QEMU's
+    /// coroutines) ran the next signal's frame on top of its own.
+    pub fn take_for_frame(&mut self) -> SignalStack {
+        let saved = *self;
+        if self.flags.contains(SignalStackFlags::AUTODISARM) {
+            *self = SignalStack::disabled();
+        }
+        saved
+    }
+
+    /// `sigreturn`'s `restore_altstack()`: install the `uc_stack` the frame
+    /// came back with, as a `sigaltstack(&uc_stack, NULL)` from a thread at
+    /// `sp` would, and ignore what that call would refuse (Linux drops the
+    /// error too: the frame is userspace's to doctor). That is how an
+    /// auto-disarmed stack comes back once its handler returns.
+    pub fn restore_from_frame(&mut self, from: SignalStack, sp: usize) {
+        // `on_sig_stack()`: a thread on its alternate stack may not change
+        // it (`EPERM`), and an auto-disarming stack counts as never being
+        // stood on. Judged on the stack as it is NOW, after any disarm.
+        if !self.flags.contains(SignalStackFlags::AUTODISARM) && self.contains_sp(sp) {
+            return;
+        }
+        if from.validate().is_err() {
+            return;
+        }
+        *self = from.as_installed();
+    }
+
+    /// What `sigaltstack(2)` refuses, in Linux's order: unknown flags
+    /// (`EINVAL`), then, when the call installs rather than disables a
+    /// stack, one smaller than `MINSIGSTKSZ` (`ENOMEM`). `SS_ONSTACK` is
+    /// accepted as a mode for compatibility, as `do_sigaltstack` does.
+    pub fn validate(&self) -> LxResult<()> {
+        if !VALID_SIGSTACK_FLAGS.contains(self.flags) {
+            return Err(LxError::EINVAL);
+        }
+        if !self.flags.contains(SignalStackFlags::DISABLE) && self.size < MIN_SIGSTACK_SIZE {
+            return Err(LxError::ENOMEM);
+        }
+        Ok(())
+    }
+
+    /// This stack as the task stores it once `sigaltstack(2)` accepts it:
+    /// `SS_DISABLE` forgets the address and size, Linux zeroes both, so a
+    /// later `sigaltstack(NULL, &old)` does not hand back memory the program
+    /// may have freed; `SS_ONSTACK` is a report, never stored.
+    pub fn as_installed(&self) -> SignalStack {
+        let mut out = *self;
+        out.flags.remove(SignalStackFlags::ONSTACK);
+        if out.flags.contains(SignalStackFlags::DISABLE) {
+            out.sp = 0;
+            out.size = 0;
+        }
+        out
     }
 
     /// This stack as `sigaltstack(2)` reports it to a thread using `sp`.
@@ -335,6 +418,14 @@ mod sigaltstack_tests {
         }
     }
 
+    /// `ss_flags` as the syscall reads them off the user's `stack_t`: a raw
+    /// word, unknown bits included (`from_bits_truncate` would drop them and
+    /// test nothing).
+    #[allow(unsafe_code)]
+    fn raw_flags(bits: u32) -> SignalStackFlags {
+        unsafe { SignalStackFlags::from_bits_unchecked(bits) }
+    }
+
     #[test]
     fn the_stack_holds_every_pointer_that_could_have_pushed_onto_it() {
         let alt = alt();
@@ -474,6 +565,107 @@ mod sigaltstack_tests {
         let reported = alt.as_reported_from(BASE + SIZE / 2);
         assert!(reported.flags.contains(SignalStackFlags::AUTODISARM));
         assert!(reported.flags.contains(SignalStackFlags::ONSTACK));
+    }
+
+    #[test]
+    fn a_delivery_disarms_an_autodisarm_stack_and_hands_the_old_one_to_the_frame() {
+        let mut alt = alt();
+        alt.flags.insert(SignalStackFlags::AUTODISARM);
+        let mut task = alt;
+        let uc_stack = task.take_for_frame();
+        assert_eq!(uc_stack, alt, "uc_stack must carry the stack as it was");
+        assert!(
+            !task.usable_from(0xffff_0000),
+            "the stack must be disarmed while the handler runs"
+        );
+        assert_eq!((task.sp, task.size), (0, 0));
+        assert!(task.flags.contains(SignalStackFlags::DISABLE));
+    }
+
+    #[test]
+    fn without_autodisarm_the_stack_stays_installed_across_a_delivery() {
+        let mut task = alt();
+        let uc_stack = task.take_for_frame();
+        assert_eq!(uc_stack, alt());
+        assert_eq!(task, alt());
+        assert!(task.usable_from(0xffff_0000));
+    }
+
+    #[test]
+    fn sigreturn_puts_the_autodisarmed_stack_back() {
+        let mut alt = alt();
+        alt.flags.insert(SignalStackFlags::AUTODISARM);
+        let mut task = alt;
+        let uc_stack = task.take_for_frame();
+        // The handler returns from the alternate stack itself: with the
+        // stack disarmed that is not "standing on it", so the restore goes
+        // through, AUTODISARM included.
+        task.restore_from_frame(uc_stack, BASE + SIZE / 2);
+        assert_eq!(task, alt, "the stack did not come back at sigreturn");
+        assert!(task.usable_from(0xffff_0000));
+    }
+
+    #[test]
+    fn a_handler_on_the_stack_cannot_change_it_from_its_frame() {
+        // No AUTODISARM: the handler runs on the stack, so `sigaltstack`
+        // from there is EPERM and the restore is a no-op, doctored or not.
+        let mut task = alt();
+        let doctored = SignalStack {
+            sp: 0x1000_0000,
+            flags: SignalStackFlags::empty(),
+            size: SIZE,
+        };
+        task.restore_from_frame(doctored, BASE + SIZE / 2);
+        assert_eq!(task, alt(), "a frame changed the stack the handler runs on");
+        // Off the stack (a handler that ran on the normal stack) it does.
+        task.restore_from_frame(doctored, 0xffff_0000);
+        assert_eq!(task, doctored);
+    }
+
+    #[test]
+    fn sigreturn_ignores_a_frame_stack_that_sigaltstack_would_refuse() {
+        let mut task = alt();
+        let bad_flags = SignalStack {
+            sp: 0x1000_0000,
+            flags: raw_flags(0x40),
+            size: SIZE,
+        };
+        task.restore_from_frame(bad_flags, 0xffff_0000);
+        assert_eq!(task, alt(), "unknown flags were installed");
+        let too_small = SignalStack {
+            sp: 0x1000_0000,
+            flags: SignalStackFlags::empty(),
+            size: MIN_SIGSTACK_SIZE - 1,
+        };
+        task.restore_from_frame(too_small, 0xffff_0000);
+        assert_eq!(task, alt(), "a stack under MINSIGSTKSZ was installed");
+        // And a disabling one forgets the address, as the syscall does.
+        let disable = SignalStack {
+            sp: 0x1000_0000,
+            flags: SignalStackFlags::DISABLE,
+            size: SIZE,
+        };
+        task.restore_from_frame(disable, 0xffff_0000);
+        assert_eq!(task, SignalStack::disabled());
+    }
+
+    #[test]
+    fn ss_onstack_is_a_mode_sigaltstack_accepts_and_never_stores() {
+        // `do_sigaltstack`: the mode may be SS_DISABLE, SS_ONSTACK or 0.
+        // A program handing back the stack it read with `sigaltstack(NULL,
+        // &old)` from a handler passes SS_ONSTACK, and was refused.
+        let mut alt = alt();
+        alt.flags.insert(SignalStackFlags::ONSTACK);
+        assert_eq!(alt.validate(), Ok(()));
+        assert_eq!(alt.as_installed(), self::alt());
+        assert_eq!(
+            SignalStack {
+                flags: raw_flags(0x40),
+                ..alt
+            }
+            .validate(),
+            Err(LxError::EINVAL)
+        );
     }
 
     #[test]

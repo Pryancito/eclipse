@@ -843,7 +843,16 @@ fn handle_signal(
     // What the sender left for the handler: `si_pid`/`si_uid` of a `kill`,
     // the child and its status of a `SIGCHLD`. Bare (number only) otherwise.
     let signal_info = thread.inner().lock_linux().take_siginfo(signal);
+    // `uc_stack`: the alternate stack as it was, for `sigreturn` to put
+    // back; taking it disarms an `SS_AUTODISARM` stack for the length of
+    // the handler (`signal_delivered()`). It went to userspace as zeros.
+    let uc_stack = thread
+        .inner()
+        .lock_linux()
+        .signal_alternate_stack
+        .take_for_frame();
     let signal_context = SignalUserContext {
+        stack: uc_stack,
         sig_mask: sigmask,
         context: MachineContext::new(user_pc),
         ..Default::default()

@@ -539,7 +539,8 @@ fn unmodified_check(siginfo: &SigInfo, delivered: &SigInfo, user_ctx: &SignalUse
     check |= (*siginfo != *delivered) as usize;
     check |= ((user_ctx.flags != default_ctx.flags) as usize) << 1;
     check |= ((user_ctx.link != default_ctx.link) as usize) << 2;
-    check |= ((user_ctx.stack != default_ctx.stack) as usize) << 3;
+    // `uc_stack` is not compared: the kernel fills it (`__save_altstack`)
+    // and the handler may change it, which `sigreturn` honours.
     check |= ((user_ctx._pad != default_ctx._pad) as usize) << 4;
     check |= ((user_ctx.context != default_ctx.context) as usize) << 5;
     #[cfg(target_arch = "x86_64")]
@@ -568,6 +569,11 @@ impl LinuxThread {
             // Be tolerant: userland may legally modify parts of ucontext/siginfo.
             // We restore the saved context and only honor the restored PC/mask below.
         }
+        // `restore_altstack()`: judged from the handler's own stack pointer,
+        // the one it is making the `sigreturn` call with.
+        let handler_sp = ctx.get_field(UserContextField::StackPointer);
+        self.signal_alternate_stack
+            .restore_from_frame(user_ctx.stack, handler_sp);
         *ctx = *old_ctx;
         ctx.set_field(UserContextField::InstrPointer, user_ctx.context.get_pc());
         // The ucontext is userland's to modify between the handler running
@@ -1122,6 +1128,42 @@ mod signal_delivery_tests {
         assert!(
             !t.signal_mask().contains(Signal::SIGTERM),
             "unblocking SIGTERM blocked it"
+        );
+    }
+
+    #[test]
+    fn sigreturn_reinstalls_the_alternate_stack_the_frame_carries() {
+        // The frame's `uc_stack` is what `sigreturn` installs back: for an
+        // `SS_AUTODISARM` stack, disarmed for the length of the handler,
+        // this is the only way it ever comes back. It never did.
+        use crate::signal::{SignalStack, SignalStackFlags};
+        let alt = SignalStack {
+            sp: 0x7000_0000,
+            flags: SignalStackFlags::AUTODISARM,
+            size: 0x4000,
+        };
+        let mut t = thread();
+        t.handling_signal = Some(Signal::SIGUSR1 as u32);
+        t.signal_alternate_stack = alt;
+        let uc_stack = t.signal_alternate_stack.take_for_frame();
+        assert!(!t.signal_alternate_stack.usable_from(0x7fff_0000));
+
+        let info = SigInfo::default();
+        let mut uctx = SignalUserContext::default();
+        uctx.stack = uc_stack;
+        let old_ctx = UserContext::default();
+        let mut ctx = UserContext::default();
+        // The handler returns from the alternate stack.
+        ctx.set_field(UserContextField::StackPointer, alt.sp + alt.size / 2);
+        t.restore_after_handle_signal(
+            &mut ctx,
+            &old_ctx,
+            &info as *const SigInfo as usize,
+            &uctx as *const SignalUserContext as usize,
+        );
+        assert_eq!(
+            t.signal_alternate_stack, alt,
+            "sigreturn did not put the auto-disarmed stack back"
         );
     }
 
