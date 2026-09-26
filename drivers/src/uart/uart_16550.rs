@@ -250,22 +250,114 @@ mod pmio {
         }
     }
 
+    /// The seven 16550 registers as consecutive byte ports from `base`.
+    ///
+    /// Separate from [`Uart16550Pmio::new`] because `new` goes straight on to
+    /// `init`, which issues `out`: the map is the half that can be got wrong
+    /// *and* checked without a serial port. Its MMIO twin derives each address
+    /// from the `#[repr(C)]` layout, so it follows the field order on its own;
+    /// here every address is written out by hand, and a wrong `base + n` sends
+    /// one register's traffic to another's port. On x86_64 -- the only place
+    /// this exists -- that is the console every panic banner leaves by.
+    fn ports(base: u16) -> Uart16550Inner<Pmio<u8>> {
+        Uart16550Inner::<Pmio<u8>> {
+            data: Pmio::new(base),
+            int_en: Pmio::new(base + 1),
+            fifo_ctrl: Pmio::new(base + 2),
+            line_ctrl: Pmio::new(base + 3),
+            modem_ctrl: Pmio::new(base + 4),
+            line_sts: ReadOnly::new(Pmio::new(base + 5)),
+            modem_sts: ReadOnly::new(Pmio::new(base + 6)),
+        }
+    }
+
     impl Uart16550Pmio {
         /// Construct a `Uart16550Pmio` whose address starts at `base`.
         pub fn new(base: u16) -> Self {
-            let mut uart = Uart16550Inner::<Pmio<u8>> {
-                data: Pmio::new(base),
-                int_en: Pmio::new(base + 1),
-                fifo_ctrl: Pmio::new(base + 2),
-                line_ctrl: Pmio::new(base + 3),
-                modem_ctrl: Pmio::new(base + 4),
-                line_sts: ReadOnly::new(Pmio::new(base + 5)),
-                modem_sts: ReadOnly::new(Pmio::new(base + 6)),
-            };
+            let mut uart = ports(base);
             uart.init();
             Self {
                 inner: Mutex::new(uart),
                 listener: EventListener::new(),
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod pmio_tests {
+        use super::*;
+
+        /// The MMIO map has `every_register_sits_at_its_own_offset_in_the_16550_map`
+        /// to hold its addresses in place; the PMIO map had nothing, and it is the
+        /// one the x86_64 kernel actually opens (`0x3F8`, and `0x2F8` for the
+        /// second port). A single wrong `base + n` is silent and total: send
+        /// reading line status from the modem-status port never sees
+        /// `OUTPUT_EMPTY`, so it spins out its whole bounded wait on every byte
+        /// and the console stops -- on the path whose only job is to carry the
+        /// evidence when everything else has already failed.
+        #[test]
+        fn every_register_sits_at_its_own_port_in_the_pmio_16550_map() {
+            for base in [0x3F8u16, 0x2F8, 0] {
+                let map = ports(base);
+                for (i, (name, port)) in [
+                    ("data", map.data.port()),
+                    ("int_en", map.int_en.port()),
+                    ("fifo_ctrl", map.fifo_ctrl.port()),
+                    ("line_ctrl", map.line_ctrl.port()),
+                    ("modem_ctrl", map.modem_ctrl.port()),
+                    ("line_sts", map.line_sts.unit().port()),
+                    ("modem_sts", map.modem_sts.unit().port()),
+                ]
+                .iter()
+                .enumerate()
+                {
+                    assert_eq!(
+                        *port - base,
+                        i as u16,
+                        "register {} is at the wrong port from base {:#x}",
+                        name,
+                        base
+                    );
+                }
+            }
+        }
+
+        /// And the two maps must agree with each other: the PMIO offsets are
+        /// hand-written while the MMIO ones come from the struct layout, so a
+        /// register inserted, removed or reordered moves one and not the other.
+        #[test]
+        fn the_pmio_ports_and_the_mmio_offsets_are_the_same_map() {
+            let map = ports(0);
+            let mmio = core::mem::MaybeUninit::<Uart16550Inner<Mmio<u8>>>::uninit();
+            let at = mmio.as_ptr() as usize;
+            // SAFETY: `addr_of!` only takes each field's address; nothing in the
+            // uninitialised map is read.
+            let offsets = unsafe {
+                [
+                    core::ptr::addr_of!((*mmio.as_ptr()).data) as usize - at,
+                    core::ptr::addr_of!((*mmio.as_ptr()).int_en) as usize - at,
+                    core::ptr::addr_of!((*mmio.as_ptr()).fifo_ctrl) as usize - at,
+                    core::ptr::addr_of!((*mmio.as_ptr()).line_ctrl) as usize - at,
+                    core::ptr::addr_of!((*mmio.as_ptr()).modem_ctrl) as usize - at,
+                    core::ptr::addr_of!((*mmio.as_ptr()).line_sts) as usize - at,
+                    core::ptr::addr_of!((*mmio.as_ptr()).modem_sts) as usize - at,
+                ]
+            };
+            let ports = [
+                map.data.port(),
+                map.int_en.port(),
+                map.fifo_ctrl.port(),
+                map.line_ctrl.port(),
+                map.modem_ctrl.port(),
+                map.line_sts.unit().port(),
+                map.modem_sts.unit().port(),
+            ];
+            for (i, (offset, port)) in offsets.iter().zip(ports.iter()).enumerate() {
+                assert_eq!(
+                    *offset, *port as usize,
+                    "register {} is at {:#x} over MMIO and port {:#x} over PMIO",
+                    i, offset, port
+                );
             }
         }
     }
