@@ -5229,6 +5229,42 @@ pub fn pending_after_send(mut pending: Sigset, signal: LinuxSignal) -> Sigset {
     pending
 }
 
+/// `prepare_signal()`: a stop and a continue cancel each other where they are
+/// waiting to be received, so a process never carries both and the last one
+/// sent is the one that decides.
+///
+/// Process-wide whoever the signal was aimed at, because the state it touches
+/// is: Linux's `prepare_signal` reaches the shared `task->signal`, so a
+/// `SIGCONT` aimed at one thread flushes the pending stop of the whole group.
+/// The thread-directed path did not call this at all -- see
+/// [`complete_signal_for_job_control`].
+pub fn prepare_signal(process: &Arc<Process>, signal: LinuxSignal) {
+    use crate::thread::ThreadExt;
+    for tid in process.thread_ids() {
+        if let Ok(thread_obj) = process.get_child(tid) {
+            if let Ok(thread) = thread_obj.downcast_arc::<Thread>() {
+                if let Some(mut lt) = thread.try_lock_linux() {
+                    lt.signals = pending_after_send(lt.signals, signal);
+                }
+            }
+        }
+    }
+}
+
+/// The job-control half of `complete_signal()`, for a signal aimed at ONE
+/// thread (`tkill`, `tgkill`, `rt_tgsigqueueinfo`, and so `pthread_kill`).
+///
+/// Queueing the signal on the thread is not enough, and this is the half that
+/// was missing: a thread of a job-control-stopped process is parked in
+/// `wait_while_job_stopped`, which nothing but `job_continue` clears, and a
+/// stopped thread does not run to notice a pending `SIGKILL` either. So
+/// `tgkill(pid, tid, SIGCONT)` on a Ctrl-Z'd process never resumed it and
+/// `tgkill(pid, tid, SIGKILL)` never woke it to die -- and Go, the JVM and
+/// glibc route nearly every signal they send through `tgkill`.
+pub fn complete_signal_for_job_control(process: &Arc<Process>, signal: LinuxSignal) {
+    wake_for_job_control(process, signal)
+}
+
 pub fn send_signal_to_process(pid: usize, signal: LinuxSignal) -> LxResult<()> {
     send_signal_to_process_with_info(pid, signal, None)
 }
@@ -5259,19 +5295,7 @@ pub fn send_signal_to_process_with_info(
             );
         }
         let tids = process.thread_ids();
-        // `prepare_signal()`, before the signal is queued: a stop and a
-        // continue cancel each other where they are waiting to be received,
-        // so a process never carries both and the last one sent is the one
-        // that decides.
-        for tid in process.thread_ids() {
-            if let Ok(thread_obj) = process.get_child(tid) {
-                if let Ok(thread) = thread_obj.downcast_arc::<Thread>() {
-                    if let Some(mut lt) = thread.try_lock_linux() {
-                        lt.signals = pending_after_send(lt.signals, signal);
-                    }
-                }
-            }
-        }
+        prepare_signal(&process, signal);
         // Prefer a thread that has the signal *unblocked* — it can act on it
         // right away — and deliver there.
         let mut first: Option<Arc<Thread>> = None;
