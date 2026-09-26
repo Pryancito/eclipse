@@ -230,7 +230,7 @@ impl IrqScheme for Apic {
     fn configure(&self, gsi: usize, tm: IrqTriggerMode, pol: IrqPolarity) -> DeviceResult {
         let gsi = gsi as u32;
         self.with_ioapic(gsi, |apic| {
-            apic.configure(gsi, tm, pol, LocalApic::bsp_id(), 0);
+            apic.configure(gsi, tm, pol, LocalApic::bsp_id());
             Ok(())
         })
     }
