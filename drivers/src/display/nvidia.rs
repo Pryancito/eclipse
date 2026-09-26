@@ -13229,14 +13229,38 @@ impl NvidiaGpu {
                     return Err(nv::ENOENT);
                 }
                 // Linux waits for the BO's reservation fences (up to 30 s;
-                // `NOWAIT` -> EBUSY if busy). There is no per-BO fence here,
-                // so wait for everything this process queued on its channel
-                // instead -- a superset of the BO's fences. EXEC is
-                // asynchronous on the direct-submit path, so returning
-                // immediately (as this did) let Mesa's `nouveau_ws_bo_wait`
-                // read a buffer the GPU was still writing.
+                // `NOWAIT` -> EBUSY if busy), and every EXEC attaches its
+                // fence, as WRITE usage, to every BO mapped in the submitting
+                // VM (drm_gpuvm): a PRIME-shared BO's reservation carries the
+                // fences of every VM that maps it. There is no per-BO fence
+                // here, so wait for everything queued on the channel of every
+                // process whose VM_BIND maps this BO, plus the caller's own
+                // (a NO_SHARE BO shares its VM's reservation, mapped or not)
+                // -- a superset of the BO's fences. EXEC is asynchronous on
+                // the direct-submit path, so returning immediately (as this
+                // did) let Mesa's `nouveau_ws_bo_wait` read a buffer the GPU
+                // was still writing; and waiting for the caller's channel
+                // alone (as this did next) let a consumer's prep on a buffer
+                // the producer was still rendering into answer at once, and
+                // a producer write into a buffer the compositor was still
+                // sampling.
                 const NOUVEAU_GEM_CPU_PREP_NOWAIT: u32 = 0x2;
-                self.cpu_prep_wait(owner_pid, req.flags & NOUVEAU_GEM_CPU_PREP_NOWAIT != 0)
+                let nowait = req.flags & NOUVEAU_GEM_CPU_PREP_NOWAIT != 0;
+                // A pid listed twice (the caller maps it too, or maps it at
+                // two VAs) costs nothing: once its channel has been waited
+                // for it is idle and the next wait appends no probe.
+                let mut pids: Vec<u64> = alloc::vec![owner_pid];
+                pids.extend(
+                    self.nouveau_vm_mappings
+                        .lock()
+                        .iter()
+                        .filter(|m| m.gem_handle == req.handle)
+                        .map(|m| m.owner_pid),
+                );
+                for pid in pids {
+                    self.cpu_prep_wait(pid, nowait)?;
+                }
+                Ok(0)
             }
 
             nv::NR_GEM_CPU_FINI => {
@@ -17264,6 +17288,152 @@ mod nouveau_bookkeeping_tests {
         );
         gpu.nouveau_release_process(A);
         gpu.nouveau_release_process(STRANGER);
+        assert_eq!(FAKE_RM.lock().bad, 0);
+    }
+
+    #[test]
+    fn cpu_prep_waits_for_every_channel_whose_vm_maps_the_buffer_not_only_the_callers() {
+        let _g = LOCK.lock();
+        let _live = LiveBytes::hold();
+        let gpu = gpu_rm_ladder();
+        let ch_c = client_with_pushbuf(&gpu, COMP);
+        assert_eq!(ctx0_owner(&gpu), COMP);
+        let ch_a = client_with_pushbuf(&gpu, A);
+        // The client's frame: bound in its own VAS, then imported over PRIME
+        // and bound by the compositor, which samples it from its own ring.
+        const FRAME_VA: u64 = PUSH_VA + 0x10_0000;
+        let h = gem_new_rm(&gpu, 65536, nv::NOUVEAU_GEM_DOMAIN_GART, A)
+            .unwrap()
+            .handle;
+        assert_eq!(vm_bind_ops(&gpu, A, &mut [map(h, FRAME_VA, 65536)]), Ok(0));
+        assert!(crate::scheme::gem_mmap::add_ref(h, COMP).is_some());
+        assert_eq!(
+            vm_bind_ops(&gpu, COMP, &mut [map(h, FRAME_VA, 65536)]),
+            Ok(0)
+        );
+        // Another buffer of the client's, shared the same way but bound in
+        // no VM: nothing on any ring can touch it.
+        let h_idle = gem_new_rm(&gpu, 4096, nv::NOUVEAU_GEM_DOMAIN_GART, A)
+            .unwrap()
+            .handle;
+        assert!(crate::scheme::gem_mmap::add_ref(h_idle, COMP).is_some());
+        assert_eq!(
+            cpu_prep_nowait(&gpu, h, COMP),
+            Ok(0),
+            "nothing queued anywhere"
+        );
+        // The client renders the frame: queued on ring 1, not fetched yet.
+        // The clock moves 1 us per read from here on, so a wait that
+        // blocks shows up as virtual time and one for a GPU that never
+        // comes ends (EBUSY after 10 s virtual) instead of hanging.
+        assert_eq!(exec(&gpu, A, ch_a, &[push(PUSH_VA, 16)], &[], &[]), Ok(0));
+        let c1 = chan(1);
+        assert_eq!(userd(&c1), (0, 1));
+        assert!(!has_chan(0), "the compositor has submitted nothing yet");
+        test_clock::set_auto_advance(1);
+        let t0 = test_clock::now();
+        // The compositor about to read the frame with the CPU: busy, because
+        // the PRODUCER's channel still has it queued. Before this, only the
+        // caller's channel was asked, and the compositor's was idle.
+        assert_eq!(
+            cpu_prep_nowait(&gpu, h, COMP),
+            Err(nv::EBUSY),
+            "the producer's channel still has the frame queued"
+        );
+        assert!(test_clock::now() - t0 < 1_000, "answered without waiting");
+        assert_eq!(
+            userd(&c1),
+            (0, 2),
+            "the probe went behind the producer's push"
+        );
+        assert!(
+            !has_chan(0),
+            "no channel is prepared for the caller just to find that out"
+        );
+        assert_eq!(
+            cpu_prep_nowait(&gpu, h_idle, COMP),
+            Ok(0),
+            "a shared buffer no VM maps has no fence to wait for"
+        );
+        assert_eq!(userd(&c1), (0, 2), "and probes nothing");
+        // A blocking prep returns once the producer's ring ran past the
+        // probe it appended (GPPut at 3).
+        let now = test_clock::now();
+        let sem = sem_va(&c1);
+        std::thread::scope(|s| {
+            let t = s.spawn(move || {
+                test_clock::set(now);
+                for _ in 0..5_000 {
+                    if userd(&c1).1 >= 3 {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                assert_eq!(userd(&c1), (0, 3), "the blocking prep queued its probe");
+                let mut fetched = Vec::new();
+                for _ in 0..5_000 {
+                    fetched.extend(run_gpu(1));
+                    if fetched.contains(&Fetched::Release {
+                        sem_va: sem,
+                        payload: 2,
+                    }) {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                fetched
+            });
+            assert_eq!(cpu_prep(&gpu, h, COMP), Ok(0));
+            assert_eq!(
+                t.join().unwrap(),
+                [
+                    Fetched::Push {
+                        va: PUSH_VA,
+                        len: 16
+                    },
+                    Fetched::Release {
+                        sem_va: sem,
+                        payload: 1
+                    },
+                    Fetched::Release {
+                        sem_va: sem,
+                        payload: 2
+                    }
+                ]
+            );
+        });
+        assert_eq!(userd(&c1), (3, 3));
+        assert!(!has_chan(0));
+        // The other way round: the compositor sampling the frame is a
+        // reader the client must wait for before it writes the buffer
+        // again. Its own ring is idle and gets no probe.
+        assert_eq!(
+            exec(&gpu, COMP, ch_c, &[push(PUSH_VA, 16)], &[], &[]),
+            Ok(0)
+        );
+        let c0 = chan(0);
+        assert_eq!(userd(&c0), (0, 1));
+        assert_eq!(
+            cpu_prep_nowait(&gpu, h, A),
+            Err(nv::EBUSY),
+            "the compositor's channel still has the sample queued"
+        );
+        assert_eq!(
+            userd(&c0),
+            (0, 2),
+            "the probe went behind the compositor's push"
+        );
+        assert_eq!(userd(&c1), (3, 3), "the caller's idle ring gets no probe");
+        // The compositor asking about a buffer it maps itself: caller and
+        // mapper at once, and one probe on its channel.
+        assert_eq!(cpu_prep_nowait(&gpu, h, COMP), Err(nv::EBUSY));
+        assert_eq!(userd(&c0), (0, 3), "one probe, not one per role");
+        assert_eq!(run_gpu(0).len(), 3, "push and both probes");
+        assert_eq!(cpu_prep_nowait(&gpu, h, A), Ok(0));
+        assert_eq!(cpu_prep_nowait(&gpu, h, COMP), Ok(0));
+        test_clock::set_auto_advance(0);
+        gpu.nouveau_release_process(A);
+        gpu.nouveau_release_process(COMP);
         assert_eq!(FAKE_RM.lock().bad, 0);
     }
 
