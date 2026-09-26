@@ -665,11 +665,22 @@ impl Syscall<'_> {
     pub fn sys_pipe2(&self, mut fds: UserOutPtr<[i32; 2]>, flags: usize) -> SysResult {
         info!("pipe2: fds={:?}, flags: {:#x}", fds, flags);
 
+        // The sixth caller of the same flag word, and the one the sweep that
+        // wrote `anon_fd_flags` missed: this masked the word down to the two
+        // bits it knows and kept going, so a flag this kernel has never heard
+        // of was not an error, it was nothing at all.
+        //
+        // `O_DIRECT` is the bit that costs something. Linux has had packet
+        // mode on pipes since 3.4, and this kernel has not: masked away, a
+        // caller asking for it got a working fd and byte-stream semantics,
+        // with message boundaries silently gone -- and a reader that trusts
+        // one `read` to be one message is the whole point of asking. EINVAL
+        // is what a pre-3.4 kernel answers, so the caller falls back to
+        // framing the stream itself, which is the behaviour it was going to
+        // get either way.
+        let base_flags = anon_fd_flags(flags, ANON_CLOEXEC | ANON_NONBLOCK)?;
         let proc = self.linux_process();
         let (read, write) = Pipe::create_pair();
-
-        let base_flags =
-            OpenFlags::from_bits_truncate(flags) & (OpenFlags::NON_BLOCK | OpenFlags::CLOEXEC);
         let read_fd = proc.add_file(File::new(
             Arc::new(read),
             base_flags | OpenFlags::RDONLY,
@@ -1223,12 +1234,12 @@ mod flock_translate_tests {
 
 #[cfg(test)]
 mod anon_fd_flag_tests {
-    //! `eventfd2`, `timerfd_create`, `signalfd4`, `inotify_init1` and
-    //! `epoll_create1` are each handed a flag word by userspace and each has
-    //! its own short list of bits. Four of the five used to run the word
-    //! through `OpenFlags::from_bits_truncate` and keep whatever was left,
-    //! so a flag this kernel had never heard of was not an error — it was
-    //! nothing at all. `inotify_init1` was the one that checked.
+    //! `eventfd2`, `timerfd_create`, `signalfd4`, `inotify_init1`,
+    //! `epoll_create1` and `pipe2` are each handed a flag word by userspace
+    //! and each has its own short list of bits. Five of the six used to run
+    //! the word through `OpenFlags::from_bits_truncate` and keep whatever was
+    //! left, so a flag this kernel had never heard of was not an error — it
+    //! was nothing at all. `inotify_init1` was the one that checked.
 
     use super::*;
 
@@ -1237,6 +1248,9 @@ mod anon_fd_flag_tests {
     const EFD_FLAGS: usize = EFD_SEMAPHORE | ANON_CLOEXEC | ANON_NONBLOCK;
     const TFD_FLAGS: usize = ANON_CLOEXEC | ANON_NONBLOCK;
     const EPOLL_FLAGS: usize = ANON_CLOEXEC;
+    const PIPE_FLAGS: usize = ANON_CLOEXEC | ANON_NONBLOCK;
+    /// `O_DIRECT`, which on Linux puts a pipe in packet mode.
+    const O_DIRECT: usize = 0o40_000;
 
     /// `EFD_CLOEXEC`, `TFD_CLOEXEC`, `SFD_CLOEXEC`, `IN_CLOEXEC` and
     /// `EPOLL_CLOEXEC` are all `O_CLOEXEC`, and the NONBLOCK ones are all
@@ -1296,6 +1310,22 @@ mod anon_fd_flag_tests {
             anon_fd_flags(ANON_NONBLOCK, EPOLL_FLAGS),
             Err(LxError::EINVAL)
         );
+    }
+
+    /// `pipe2`'s own list, and the bit that made it worth checking:
+    /// `O_DIRECT` asks for packet mode, which this kernel does not have.
+    /// Masked away, the caller got a byte stream and believed it had message
+    /// boundaries.
+    #[test]
+    fn a_pipe_asking_for_packet_mode_is_told_no_rather_than_given_a_byte_stream() {
+        assert_eq!(anon_fd_flags(O_DIRECT, PIPE_FLAGS), Err(LxError::EINVAL));
+        assert_eq!(
+            anon_fd_flags(O_DIRECT | ANON_CLOEXEC, PIPE_FLAGS),
+            Err(LxError::EINVAL)
+        );
+        // The two it does have still come through.
+        let f = anon_fd_flags(ANON_CLOEXEC | ANON_NONBLOCK, PIPE_FLAGS).unwrap();
+        assert!(f.close_on_exec() && f.non_block());
     }
 
     /// `EFD_SEMAPHORE` shares bit 0 with `OpenFlags::WRONLY`, and `EventFd`
