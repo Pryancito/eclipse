@@ -27,6 +27,21 @@ fn map_x(x: u32, width: u32) -> u32 {
     }
 }
 
+/// Whether a pixel of `bytes` bytes written at `offset` fits inside an aperture
+/// of `fb_size` bytes.
+///
+/// The bound has to cover every byte the write touches. Checking only the first
+/// (`offset < fb_size`) lets a pixel whose last byte falls past the end through,
+/// and that write lands outside the mapping -- a device aperture on real
+/// hardware. The addition is `checked_add` because `offset` comes from
+/// `y * pitch + x * bytes`: an aperture whose reported size does not cover
+/// `pitch * height` is exactly the case this exists for, and a wrap there would
+/// answer "fits".
+#[inline]
+fn pixel_fits(offset: usize, bytes: usize, fb_size: usize) -> bool {
+    matches!(offset.checked_add(bytes), Some(end) if end <= fb_size)
+}
+
 #[repr(transparent)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RgbColor(u32);
@@ -168,7 +183,11 @@ impl<'a> FrameBuffer<'a> {
 
             let (r, g, b) = (color.r(), color.g(), color.b());
             let ptr = self.raw.as_mut_ptr().add(offset);
-            let dst = core::slice::from_raw_parts_mut(ptr, 4);
+            // As wide as the format, not a flat four. A three-byte pixel at the
+            // end of an unpadded scanline has only three bytes left, so a
+            // four-byte slice there reaches one past the mapping -- nothing is
+            // written to it, but forming the slice at all is not allowed.
+            let dst = core::slice::from_raw_parts_mut(ptr, format.bytes() as usize);
             match format {
                 ColorFormat::RGB332 => {
                     *ptr = pack_channel(r >> (8 - 3), 3, g >> (8 - 3), 3, b >> (8 - 2), 2) as u8
@@ -246,7 +265,7 @@ pub trait DisplayScheme: Scheme {
         let x = map_x(x, info.width);
         let offset =
             (y as usize * info.pitch() as usize) + (x as usize * info.format.bytes() as usize);
-        if offset < info.fb_size {
+        if pixel_fits(offset, info.format.bytes() as usize, info.fb_size) {
             unsafe { self.fb().write_color(offset, color, info.format) };
         }
     }
@@ -964,5 +983,686 @@ mod blit_tests {
                 label
             );
         }
+    }
+
+    // ------------------------------------------------------------------
+    // The primitives `blit_from`'s tests above never reached. `fill_rect`,
+    // `copy_rect`, `blit_argb_over`, `clear` and `draw_pixel` are the rest of
+    // what every backend inherits: the console's own scroll and fill, and the
+    // alpha composite the DRM path uses to put a cursor over a frame without
+    // re-rendering it. Same fake aperture, same byte-for-byte inspection --
+    // including the off-screen padding of each scanline, because a primitive
+    // that spills into it is a primitive writing on the next row's neighbours.
+    // ------------------------------------------------------------------
+
+    /// Like [`FakeDisplay::new`], but the aperture is `short_by` bytes smaller
+    /// than `pitch * height`, which is what a mode whose padded pitch was not
+    /// accounted for in the reported size looks like. The last pixels of the
+    /// last row then straddle the end of the buffer, and every primitive has to
+    /// notice.
+    fn truncated(width: u32, height: u32, pitch_px: u32, short_by: usize) -> Arc<FakeDisplay> {
+        let pitch = pitch_px * 4;
+        let size = (pitch * height) as usize - short_by;
+        Arc::new(FakeDisplay {
+            info: DisplayInfo {
+                width,
+                height,
+                pitch,
+                format: ColorFormat::ARGB8888,
+                fb_base_vaddr: 0,
+                fb_size: size,
+            },
+            mem: Mutex::new(alloc::vec![0u8; size]),
+        })
+    }
+
+    const RED: RgbColor = RgbColor(0x00FF_0000);
+    const BLUE: RgbColor = RgbColor(0x0000_00FF);
+
+    // ---- fill_rect ----
+
+    #[test]
+    fn a_fill_covers_exactly_the_rectangle_it_was_given() {
+        let d = FakeDisplay::new(8, 4, 8);
+        d.fill_rect(
+            &Rectangle {
+                x: 2,
+                y: 1,
+                width: 3,
+                height: 2,
+            },
+            RED,
+        );
+        for y in 0..4 {
+            for x in 0..8 {
+                let inside = (2..5).contains(&x) && (1..3).contains(&y);
+                let want = if inside { RED.raw_value() } else { 0 };
+                assert_eq!(d.px(x, y), want, "pixel ({}, {})", x, y);
+            }
+        }
+    }
+
+    #[test]
+    fn a_fill_is_clipped_at_every_edge_instead_of_wrapping_to_the_next_row() {
+        // A rectangle that runs off the right edge must stop at the visible
+        // width: the bytes past it are the next scanline's, and writing them is
+        // how a fill turns into a diagonal stripe.
+        let d = FakeDisplay::new(4, 3, 6); // 4 visible, 6 pitch
+        d.fill_rect(
+            &Rectangle {
+                x: 2,
+                y: 0,
+                width: 100,
+                height: 100,
+            },
+            RED,
+        );
+        for y in 0..3 {
+            assert_eq!(d.px(0, y), 0);
+            assert_eq!(d.px(1, y), 0);
+            assert_eq!(d.px(2, y), RED.raw_value());
+            assert_eq!(d.px(3, y), RED.raw_value());
+            // The off-screen padding of the scanline stays untouched.
+            assert_eq!(d.px(4, y), 0, "padding of row {}", y);
+            assert_eq!(d.px(5, y), 0, "padding of row {}", y);
+        }
+    }
+
+    #[test]
+    fn a_rectangle_that_starts_past_the_edge_writes_nothing() {
+        for rect in [
+            Rectangle {
+                x: 4,
+                y: 0,
+                width: 4,
+                height: 4,
+            },
+            Rectangle {
+                x: 0,
+                y: 3,
+                width: 4,
+                height: 4,
+            },
+            Rectangle {
+                x: 0,
+                y: 0,
+                width: 0,
+                height: 4,
+            },
+            Rectangle {
+                x: 0,
+                y: 0,
+                width: 4,
+                height: 0,
+            },
+        ] {
+            let d = FakeDisplay::new(4, 3, 4);
+            let before = d.snapshot();
+            d.fill_rect(&rect, RED);
+            assert_eq!(d.snapshot(), before, "rect {:?} wrote something", rect);
+        }
+    }
+
+    #[test]
+    fn a_rectangle_whose_corner_overflows_a_u32_is_clipped_not_wrapped() {
+        // `x + width` past `u32::MAX` wraps to a small number, which would turn
+        // "entirely off screen" into "fills from 0". `saturating_add` is what
+        // stops it, and this is the input that tells the two apart.
+        let d = FakeDisplay::new(4, 2, 4);
+        let before = d.snapshot();
+        d.fill_rect(
+            &Rectangle {
+                x: u32::MAX - 1,
+                y: 0,
+                width: 8,
+                height: 2,
+            },
+            RED,
+        );
+        assert_eq!(d.snapshot(), before);
+        d.fill_rect(
+            &Rectangle {
+                x: 0,
+                y: u32::MAX - 1,
+                width: 4,
+                height: 8,
+            },
+            RED,
+        );
+        assert_eq!(d.snapshot(), before);
+    }
+
+    #[test]
+    fn a_fill_stops_at_the_end_of_a_truncated_aperture() {
+        // The aperture is one pixel short of `pitch * height`, so the last row
+        // does not fit. Writing it would run off the end of the mapping.
+        let d = truncated(4, 3, 4, 4);
+        d.fill_rect(
+            &Rectangle {
+                x: 0,
+                y: 0,
+                width: 4,
+                height: 3,
+            },
+            RED,
+        );
+        let m = d.mem.lock();
+        assert_eq!(m.len(), 4 * 4 * 3 - 4);
+        // Rows 0 and 1 are filled; row 2 did not fit and was left alone.
+        for i in 0..8 {
+            let off = i * 4;
+            assert_eq!(
+                u32::from_ne_bytes([m[off], m[off + 1], m[off + 2], m[off + 3]]),
+                RED.raw_value(),
+                "pixel {}",
+                i
+            );
+        }
+        assert!(
+            m[32..].iter().all(|&b| b == 0),
+            "the row that did not fit was written anyway"
+        );
+    }
+
+    #[test]
+    fn the_two_fill_paths_paint_the_same_rectangle() {
+        // ARGB8888 takes a word-store loop; every other format goes pixel by
+        // pixel through `draw_pixel`. The same decision written twice, so the
+        // set of pixels they cover has to be the same one -- each read in its
+        // own units, because a 24-bit pixel is three bytes, not four.
+        let painted = |format: ColorFormat| {
+            let mut d = FakeDisplay::new(6, 4, 8);
+            Arc::get_mut(&mut d).unwrap().info.format = format;
+            d.fill_rect(
+                &Rectangle {
+                    x: 1,
+                    y: 1,
+                    width: 4,
+                    height: 2,
+                },
+                RED,
+            );
+            let bytes = format.bytes() as usize;
+            let pitch = d.info.pitch as usize;
+            let m = d.mem.lock();
+            let mut set = alloc::vec::Vec::new();
+            for y in 0..4usize {
+                for x in 0..8usize {
+                    let off = y * pitch + x * bytes;
+                    if off + bytes <= m.len() && m[off..off + bytes].iter().any(|&b| b != 0) {
+                        set.push((x, y));
+                    }
+                }
+            }
+            set
+        };
+        let argb = painted(ColorFormat::ARGB8888);
+        assert_eq!(
+            argb,
+            alloc::vec![
+                (1, 1),
+                (2, 1),
+                (3, 1),
+                (4, 1),
+                (1, 2),
+                (2, 2),
+                (3, 2),
+                (4, 2)
+            ]
+        );
+        for format in [
+            ColorFormat::RGB888,
+            ColorFormat::RGB565,
+            ColorFormat::RGB332,
+        ] {
+            assert_eq!(
+                painted(format),
+                argb,
+                "{:?} covers a different rectangle than ARGB8888",
+                format
+            );
+        }
+    }
+
+    #[test]
+    fn clearing_the_screen_leaves_the_off_screen_padding_alone() {
+        let d = FakeDisplay::new(4, 3, 6);
+        d.clear(BLUE);
+        for y in 0..3 {
+            for x in 0..4 {
+                assert_eq!(d.px(x, y), BLUE.raw_value(), "({}, {})", x, y);
+            }
+            assert_eq!(d.px(4, y), 0, "padding of row {}", y);
+            assert_eq!(d.px(5, y), 0, "padding of row {}", y);
+        }
+    }
+
+    // ---- copy_rect: the console scroll ----
+
+    /// Paint row `y` with the colour `0x00_0y_0y_0y` so a row that lands in the
+    /// wrong place names itself.
+    fn rows(d: &Arc<FakeDisplay>) {
+        for y in 0..d.info.height {
+            d.fill_rect(
+                &Rectangle {
+                    x: 0,
+                    y,
+                    width: d.info.width,
+                    height: 1,
+                },
+                RgbColor(0x0001_0101 * (y + 1)),
+            );
+        }
+    }
+
+    fn row_of(d: &Arc<FakeDisplay>, y: u32) -> u32 {
+        d.px(0, y)
+    }
+
+    #[test]
+    fn scrolling_up_moves_every_row_once_and_does_not_smear() {
+        // The console scroll: copy rows 1..h up by one. Source and destination
+        // overlap, and the copy runs top to bottom so a row is read before the
+        // row above it is overwritten.
+        let d = FakeDisplay::new(4, 5, 4);
+        rows(&d);
+        d.copy_rect(0, 1, 0, 0, 4, 4);
+        for y in 0..4 {
+            assert_eq!(
+                row_of(&d, y),
+                0x0001_0101 * (y + 2),
+                "row {} after the scroll",
+                y
+            );
+        }
+        // The last row is left as it was, for the caller to clear.
+        assert_eq!(row_of(&d, 4), 0x0001_0101 * 5);
+    }
+
+    #[test]
+    fn scrolling_down_runs_bottom_to_top_so_it_does_not_smear_either() {
+        // The other overlap direction. Walking top to bottom here would copy
+        // row 0 down onto row 1 and then read it back as the source for row 2,
+        // painting the whole region with row 0.
+        let d = FakeDisplay::new(4, 5, 4);
+        rows(&d);
+        d.copy_rect(0, 0, 0, 1, 4, 4);
+        for y in 1..5 {
+            assert_eq!(row_of(&d, y), 0x0001_0101 * y, "row {} after the scroll", y);
+        }
+        assert_eq!(row_of(&d, 0), 0x0001_0101);
+    }
+
+    #[test]
+    fn a_copy_that_overlaps_within_one_row_moves_the_pixels_not_the_first_one() {
+        // Horizontal overlap: shifting a run right by one. A plain forward
+        // byte copy would replicate the leftmost pixel across the whole run.
+        let d = FakeDisplay::new(6, 1, 6);
+        for x in 0..6u32 {
+            d.draw_pixel(x, 0, RgbColor(0x0010_0000 + x));
+        }
+        d.copy_rect(0, 0, 1, 0, 5, 1);
+        assert_eq!(d.px(0, 0), 0x0010_0000);
+        for x in 1..6u32 {
+            assert_eq!(d.px(x, 0), 0x0010_0000 + (x - 1), "pixel {}", x);
+        }
+    }
+
+    #[test]
+    fn a_copy_is_clipped_by_both_ends_of_the_move() {
+        // The width is limited by whichever of source and destination runs out
+        // of screen first, and the same for the height. Taking only the source
+        // into account writes past the right edge of the destination row.
+        let d = FakeDisplay::new(8, 2, 8);
+        for x in 0..8u32 {
+            d.draw_pixel(x, 0, RgbColor(0x0020_0000 + x));
+        }
+        // From x=0 to x=5, six pixels asked for: only three fit.
+        d.copy_rect(0, 0, 5, 1, 6, 1);
+        for x in 5..8u32 {
+            assert_eq!(d.px(x, 1), 0x0020_0000 + (x - 5), "pixel {}", x);
+        }
+        // Nothing before the destination was touched...
+        for x in 0..5u32 {
+            assert_eq!(d.px(x, 1), 0, "pixel {} of row 1", x);
+        }
+        // ...and the source row is unchanged.
+        for x in 0..8u32 {
+            assert_eq!(d.px(x, 0), 0x0020_0000 + x);
+        }
+    }
+
+    /// Like [`FakeDisplay::new`], but the aperture is two rows LARGER than the
+    /// mode -- which is the normal case on real hardware, where the mode is
+    /// whatever the firmware set and the aperture is the whole BAR. It matters
+    /// because the slack below the visible screen is inside the mapping, so a
+    /// primitive that clips by the buffer's length instead of by the screen's
+    /// height writes there and nothing stops it.
+    fn oversized(width: u32, height: u32, pitch_px: u32) -> Arc<FakeDisplay> {
+        let pitch = pitch_px * 4;
+        let size = (pitch * (height + 2)) as usize;
+        Arc::new(FakeDisplay {
+            info: DisplayInfo {
+                width,
+                height,
+                pitch,
+                format: ColorFormat::ARGB8888,
+                fb_base_vaddr: 0,
+                fb_size: size,
+            },
+            mem: Mutex::new(alloc::vec![0u8; size]),
+        })
+    }
+
+    #[test]
+    fn a_copy_does_not_scroll_rows_below_the_visible_screen() {
+        // The aperture holds two rows more than the mode. A copy whose
+        // destination runs off the bottom has to be clipped by the SCREEN, not
+        // by the buffer: the slack below is inside the mapping, so the bound
+        // check cannot catch it and the rows land off screen.
+        let d = oversized(2, 4, 2);
+        rows(&d);
+        // Three rows from y=0 down to y=2: only two are on screen.
+        d.copy_rect(0, 0, 0, 2, 2, 3);
+        assert_eq!(row_of(&d, 2), 0x0001_0101);
+        assert_eq!(row_of(&d, 3), 0x0002_0202);
+        assert_eq!(row_of(&d, 4), 0, "scrolled a row below the visible screen");
+        assert_eq!(row_of(&d, 5), 0);
+    }
+
+    #[test]
+    fn a_fill_does_not_paint_rows_below_the_visible_screen() {
+        let d = oversized(2, 3, 2);
+        d.fill_rect(
+            &Rectangle {
+                x: 0,
+                y: 0,
+                width: 2,
+                height: 100,
+            },
+            RED,
+        );
+        for y in 0..3 {
+            assert_eq!(d.px(0, y), RED.raw_value(), "row {}", y);
+        }
+        assert_eq!(d.px(0, 3), 0, "painted a row below the visible screen");
+        assert_eq!(d.px(0, 4), 0);
+    }
+
+    #[test]
+    fn a_copy_is_clipped_by_the_lower_of_the_two_bottom_edges() {
+        // The height, like the width, is limited by whichever end runs out of
+        // screen first. Taking only the source into account writes rows past
+        // the bottom of the destination -- into the next thing in the aperture.
+        let d = FakeDisplay::new(2, 4, 2);
+        rows(&d);
+        // Three rows asked for from y=0 to y=2: only two fit below y=2.
+        d.copy_rect(0, 0, 0, 2, 2, 3);
+        assert_eq!(row_of(&d, 2), 0x0001_0101, "row 0 did not land at y=2");
+        assert_eq!(row_of(&d, 3), 0x0002_0202, "row 1 did not land at y=3");
+        // The rows above the destination are untouched.
+        assert_eq!(row_of(&d, 0), 0x0001_0101);
+        assert_eq!(row_of(&d, 1), 0x0002_0202);
+    }
+
+    #[test]
+    fn a_copy_with_nothing_to_move_writes_nothing() {
+        for (sx, sy, dx, dy, w, h) in [
+            (0u32, 0u32, 0u32, 0u32, 0u32, 4u32),
+            (0, 0, 0, 0, 4, 0),
+            (4, 0, 0, 0, 4, 4),
+            (0, 4, 0, 0, 4, 4),
+            (0, 0, 4, 0, 4, 4),
+        ] {
+            let d = FakeDisplay::new(4, 4, 4);
+            rows(&d);
+            let before = d.snapshot();
+            d.copy_rect(sx, sy, dx, dy, w, h);
+            assert_eq!(
+                d.snapshot(),
+                before,
+                "copy_rect({}, {}, {}, {}, {}, {}) wrote something",
+                sx,
+                sy,
+                dx,
+                dy,
+                w,
+                h
+            );
+        }
+    }
+
+    // ---- blit_argb_over: the alpha composite ----
+
+    /// A `width` x `height` source, every pixel `argb`.
+    fn solid(argb: u32, width: usize, height: usize) -> alloc::vec::Vec<u32> {
+        alloc::vec![argb; width * height]
+    }
+
+    #[test]
+    fn a_fully_transparent_pixel_leaves_the_destination_alone() {
+        // Laid down with `blit_from`, so the destination's alpha byte is 0xFF
+        // and every byte of the pixel is a witness. Blending a transparent
+        // source instead of skipping it gives the same three colour channels
+        // back (`inv` is 255), so without a non-zero byte to watch the two are
+        // indistinguishable -- and the alpha byte is that witness.
+        let d = FakeDisplay::new(4, 2, 4);
+        let frame = (0..8u32)
+            .map(|n| 0xFF00_0000 | (0x1000 + n))
+            .collect::<alloc::vec::Vec<_>>();
+        d.blit_from(0, 0, &frame, 4, 4, 2);
+        let before = d.snapshot();
+        d.blit_argb_over(0, 0, &solid(0x0000_0000, 4, 2), 4, 4, 2);
+        assert_eq!(
+            d.snapshot(),
+            before,
+            "a transparent pixel touched the destination"
+        );
+    }
+
+    /// The opaque fast path is a *performance* shortcut, not a different answer:
+    /// with `a == 0xff` the blend's `inv` is 0, so `src + dst * 0 / 255` is the
+    /// source either way. What the shortcut buys is not reading back through a
+    /// PCIe aperture, and a heap buffer cannot show a read. So this fixes the
+    /// result, and removing the shortcut is a mutation no test can catch --
+    /// proven equivalent rather than left unexplained.
+    #[test]
+    fn a_fully_opaque_pixel_replaces_the_destination() {
+        let d = FakeDisplay::new(4, 2, 4);
+        d.clear(RED);
+        d.blit_argb_over(1, 0, &solid(0xFF00_00FF, 2, 1), 2, 2, 1);
+        assert_eq!(d.px(0, 0), RED.raw_value());
+        assert_eq!(d.px(1, 0), 0x0000_00FF);
+        assert_eq!(d.px(2, 0), 0x0000_00FF);
+        assert_eq!(d.px(3, 0), RED.raw_value());
+        assert_eq!(d.px(0, 1), RED.raw_value());
+    }
+
+    #[test]
+    fn a_half_transparent_pixel_is_the_premultiplied_over_operator() {
+        // wlroots hands over premultiplied alpha, so the operator is
+        // `out = src + dst * (255 - a) / 255`. A source of 0x80404040 over a
+        // destination of 0x00FF0000 gives 0x40C04040... computed, not asserted
+        // from memory:
+        //   r = 0x40 + 0xFF * 0x7F / 0xFF = 0x40 + 0x7F = 0xBF
+        //   g = 0x40 + 0x00        = 0x40
+        //   b = 0x40 + 0x00        = 0x40
+        let d = FakeDisplay::new(1, 1, 1);
+        d.clear(RED);
+        d.blit_argb_over(0, 0, &solid(0x8040_4040, 1, 1), 1, 1, 1);
+        assert_eq!(d.px(0, 0) & 0x00FF_FFFF, 0x00BF_4040);
+    }
+
+    #[test]
+    fn a_source_that_is_not_premultiplied_clamps_instead_of_bleeding() {
+        // A non-premultiplied source can push a channel past 255, and without
+        // the clamp the carry lands in the channel above -- red bleeding out of
+        // an overflowing green. `0x01FFFFFF` over white is that input.
+        let d = FakeDisplay::new(1, 1, 1);
+        d.clear(RgbColor(0x00FF_FFFF));
+        d.blit_argb_over(0, 0, &solid(0x01FF_FFFF, 1, 1), 1, 1, 1);
+        assert_eq!(d.px(0, 0) & 0x00FF_FFFF, 0x00FF_FFFF);
+    }
+
+    #[test]
+    fn a_composite_partly_off_the_top_left_draws_only_what_is_on_screen() {
+        // The cursor hotspot puts the blit at a negative origin every time it
+        // touches the top or left edge, so this is the common case, not an
+        // edge one.
+        let d = FakeDisplay::new(3, 3, 3);
+        let src = numbered(2, 2)
+            .iter()
+            .map(|p| 0xFF00_0000 | p)
+            .collect::<alloc::vec::Vec<_>>();
+        d.blit_argb_over(-1, -1, &src, 2, 2, 2);
+        // Only the source's bottom-right pixel lands, at (0, 0).
+        assert_eq!(d.px(0, 0), 0x1003);
+        assert_eq!(d.px(1, 0), 0);
+        assert_eq!(d.px(0, 1), 0);
+    }
+
+    #[test]
+    fn a_composite_partly_off_the_bottom_right_draws_only_what_is_on_screen() {
+        let d = FakeDisplay::new(3, 2, 4); // 3 visible, 4 pitch
+        d.blit_argb_over(2, 1, &solid(0xFF00_00FF, 2, 2), 2, 2, 2);
+        assert_eq!(d.px(2, 1), 0x0000_00FF);
+        // Not into the scanline padding, and not off the bottom.
+        assert_eq!(d.px(3, 1), 0, "wrote into the off-screen padding");
+        assert_eq!(d.px(2, 0), 0);
+    }
+
+    #[test]
+    fn a_composite_stops_at_the_end_of_a_truncated_aperture() {
+        // Two bytes short of `pitch * height`, so the last pixel of the last
+        // row starts inside the mapping and ends outside it.
+        let d = truncated(4, 3, 4, 2);
+        d.blit_argb_over(0, 0, &solid(0xFF00_00FF, 4, 3), 4, 4, 3);
+        let m = d.mem.lock();
+        assert_eq!(m.len(), 4 * 4 * 3 - 2);
+        // The eleven pixels that fit are composited...
+        for i in 0..11usize {
+            let off = i * 4;
+            assert_eq!(&m[off..off + 4], &[0xFF, 0x00, 0x00, 0x00], "pixel {}", i);
+        }
+        // ...and the two bytes of the twelfth that do fit are left alone.
+        assert_eq!(&m[44..], &[0u8, 0], "wrote a pixel that does not fit");
+    }
+
+    #[test]
+    fn a_composite_reads_no_further_than_the_source_it_was_given() {
+        // A short source must not be read past its end: the row stride says
+        // where a row starts, and the slice length is the only thing that says
+        // where the pixels stop.
+        let d = FakeDisplay::new(4, 4, 4);
+        d.blit_argb_over(0, 0, &solid(0xFF00_00FF, 4, 1), 4, 4, 4);
+        for x in 0..4 {
+            assert_eq!(d.px(x, 0), 0x0000_00FF);
+        }
+        for y in 1..4 {
+            for x in 0..4 {
+                assert_eq!(d.px(x, y), 0, "({}, {}) came from past the source", x, y);
+            }
+        }
+    }
+
+    #[test]
+    fn a_composite_onto_a_format_it_cannot_blend_writes_nothing() {
+        // The blend reads and writes 32-bit words, so anything else is refused
+        // rather than reinterpreted.
+        let mut d = FakeDisplay::new(4, 2, 4);
+        Arc::get_mut(&mut d).unwrap().info.format = ColorFormat::RGB565;
+        let before = d.snapshot();
+        d.blit_argb_over(0, 0, &solid(0xFF00_00FF, 4, 2), 4, 4, 2);
+        assert_eq!(d.snapshot(), before);
+        // And a source with no stride is not a source.
+        let mut d = FakeDisplay::new(4, 2, 4);
+        Arc::get_mut(&mut d).unwrap().info.format = ColorFormat::ARGB8888;
+        let before = d.snapshot();
+        d.blit_argb_over(0, 0, &solid(0xFF00_00FF, 4, 2), 0, 4, 2);
+        assert_eq!(d.snapshot(), before);
+    }
+
+    #[test]
+    fn the_composite_zeroes_the_alpha_byte_the_bulk_blit_preserves() {
+        // Pinned, not endorsed. `blit_from` copies the source word whole, so a
+        // wlroots frame lands with its alpha byte at 0xFF; `blit_argb_over`
+        // builds its output from three channels and writes a fourth byte of
+        // zero, so every pixel the cursor touches ends up with alpha 0. On an
+        // XRGB scanout the byte is ignored and neither matters, which is why
+        // this has never been noticed -- but the two primitives write the same
+        // buffer and disagree about the same byte, and if a display plane is
+        // ever configured to honour per-pixel alpha the difference is a
+        // cursor-shaped hole. Changing it needs a real display to check
+        // against, so for now the difference is written down here.
+        let d = FakeDisplay::new(2, 1, 2);
+        d.blit_from(0, 0, &[0xFF11_2233, 0xFF44_5566], 2, 2, 1);
+        assert_eq!(d.px(0, 0) >> 24, 0xFF, "blit_from drops the source alpha");
+        d.blit_argb_over(0, 0, &solid(0xFF00_00FF, 1, 1), 1, 1, 1);
+        assert_eq!(
+            d.px(0, 0) >> 24,
+            0x00,
+            "blit_argb_over no longer zeroes the alpha byte -- if that is on \
+             purpose, `blit_from` and `fill_rect` need the same answer"
+        );
+        // The pixel the composite did not touch keeps its own alpha.
+        assert_eq!(d.px(1, 0) >> 24, 0xFF);
+    }
+
+    // ---- draw_pixel ----
+
+    #[test]
+    fn a_pixel_outside_the_visible_area_is_not_drawn() {
+        let d = FakeDisplay::new(4, 2, 6);
+        let before = d.snapshot();
+        d.draw_pixel(4, 0, RED);
+        d.draw_pixel(0, 2, RED);
+        d.draw_pixel(u32::MAX, u32::MAX, RED);
+        assert_eq!(d.snapshot(), before);
+    }
+
+    #[test]
+    fn a_pixel_is_only_drawn_when_the_whole_pixel_fits() {
+        // The bound has to cover all the bytes the write touches, not just the
+        // first: a pixel whose last byte is past the end of the mapping is a
+        // write past the end of the mapping.
+        assert!(pixel_fits(0, 4, 8));
+        assert!(pixel_fits(4, 4, 8));
+        assert!(!pixel_fits(5, 4, 8), "a pixel straddling the end fits?");
+        assert!(!pixel_fits(8, 4, 8));
+        assert!(!pixel_fits(usize::MAX, 4, 8), "no overflow, no wrap");
+        // And the narrower formats get the bound their own width needs.
+        assert!(pixel_fits(5, 3, 8));
+        assert!(!pixel_fits(6, 3, 8));
+    }
+
+    #[test]
+    fn a_pixel_that_straddles_the_end_of_the_aperture_is_not_drawn() {
+        let d = truncated(4, 3, 4, 2);
+        let before = d.snapshot();
+        // The last pixel of the last row starts inside the mapping and ends
+        // two bytes past it.
+        d.draw_pixel(3, 2, RED);
+        assert_eq!(d.snapshot(), before, "wrote past the end of the aperture");
+        // The one before it fits and is drawn.
+        d.draw_pixel(2, 2, RED);
+        assert_ne!(d.snapshot(), before);
+    }
+
+    #[test]
+    fn a_twenty_four_bit_pixel_writes_three_bytes_and_leaves_the_fourth() {
+        // `write_color` used to build a four-byte slice for every format,
+        // including the three-byte one, so the last pixel of an unpadded RGB888
+        // scanline covered one byte past the mapping. Nothing is written there,
+        // but the slice itself must not reach it either.
+        let mut mem = alloc::vec![0xAAu8; 8];
+        {
+            let mut fb = FrameBuffer::from_slice(&mut mem);
+            unsafe { fb.write_color(4, RgbColor(0x0011_2233), ColorFormat::RGB888) };
+        }
+        assert_eq!(&mem[4..7], &[0x33, 0x22, 0x11]);
+        assert_eq!(
+            mem[7], 0xAA,
+            "the fourth byte of a 24-bit pixel was written"
+        );
     }
 }
