@@ -99,7 +99,15 @@ const CTX0_RESET_WAIT_US: u64 = 2_000_000;
 /// the producer any client closing a window mid-frame. The RM teardown waits
 /// until each such channel has consumed the entries it had queued at the
 /// time (`waiters`), or until the fence timeout, whichever comes first.
+/// The pid a zombie's state is re-keyed to once its real pid is recycled
+/// (`rekey_zombie_wearing`): `ZOMBIE_PID_BASE | ctx_idx`, unique per zombie
+/// (one zombie per index), above any pid the pool hands out (below 2^22, or a
+/// high monotonic id past it) and below `gem_mmap::DMABUF_HOLDER`.
+const ZOMBIE_PID_BASE: u64 = 1 << 62;
+
 struct ZombieCtx {
+    /// The process's pid, or its tombstone (`ZOMBIE_PID_BASE | ctx_idx`)
+    /// once the pool has handed the pid to a new process.
     pid: u64,
     ctx_idx: u32,
     born_us: u64,
@@ -3775,6 +3783,25 @@ fn parse_gpubench_elapsed_ns(report: &str) -> u64 {
         }
     }
     0
+}
+
+/// Re-keys every entry of `items` whose owner (as `owner` picks it) is
+/// `from` to `to`; returns how many. See `NvidiaGpu::rekey_zombie_wearing`.
+fn rekey_owners<T>(
+    items: &mut [T],
+    from: u64,
+    to: u64,
+    owner: impl Fn(&mut T) -> &mut u64,
+) -> usize {
+    let mut n = 0;
+    for item in items.iter_mut() {
+        let o = owner(item);
+        if *o == from {
+            *o = to;
+            n += 1;
+        }
+    }
+    n
 }
 
 /// Whether `pid` may act on GEM object `o`: it created it, or it holds a
@@ -8304,9 +8331,10 @@ impl DrmScheme for NvidiaGpu {
         }
         // A process going away is one event sure to follow every zombie
         // context (below): the ones that are due get their teardown first,
-        // and one wearing this very pid (recycled) before this pid's own.
+        // and one still wearing this very pid (recycled) is re-keyed, so
+        // this pid's own teardown takes nothing of the zombie's.
         self.reap_zombie_contexts();
-        self.reap_zombie_wearing(pid);
+        self.rekey_zombie_wearing(pid);
         // Take the channel off the pid registry first, so no submit of a
         // late thread of this process routes to it from here on.
         let my_ctx = {
@@ -10155,31 +10183,45 @@ impl NvidiaGpu {
         });
     }
 
-    /// The teardown of a zombie wearing `pid`, now: pids are recycled, and
-    /// a new process under this pid is about to own nouveau state of its
-    /// own (contexts, GEM objects and channels are all keyed by pid), which
-    /// the zombie's pid-scoped teardown would take with it. The consumer
-    /// runs the risk the zombie was parked against; a pid coming back
-    /// within the fence timeout is the rarer event.
-    fn reap_zombie_wearing(&self, pid: u64) {
-        let mine: Vec<ZombieCtx> = {
-            let mut zombies = self.nouveau_zombies.lock();
-            if zombies.is_empty() {
-                return;
-            }
-            let (mine, rest) = core::mem::take(&mut *zombies)
-                .into_iter()
-                .partition(|z| z.pid == pid);
-            *zombies = rest;
-            mine
-        };
-        for z in mine {
+    /// A zombie wearing `pid`, whose pid the pool has handed to a new
+    /// process: contexts, GEM objects, mappings, channels, class objects and
+    /// PRIME references are all keyed by pid, so from here on the zombie's
+    /// are keyed by a tombstone of its own (`ZOMBIE_PID_BASE | ctx_idx`).
+    /// The new process starts with nothing of the zombie's, and the zombie's
+    /// teardown, once its consumers have passed, takes nothing of the new
+    /// process's. Tearing the zombie down here instead (as this did) put
+    /// its consumer's ring on the freed page -- the very fault it was parked
+    /// against -- and a pid comes back fast: the pool is a FIFO of freed
+    /// ids that thread churn drains in seconds, well inside the fence
+    /// timeout. Under the zombie lock throughout, so two threads of the new
+    /// process cannot interleave a re-key with the other's first objects.
+    fn rekey_zombie_wearing(&self, pid: u64) {
+        let mut zombies = self.nouveau_zombies.lock();
+        for z in zombies.iter_mut().filter(|z| z.pid == pid) {
+            let tomb = ZOMBIE_PID_BASE | u64::from(z.ctx_idx);
+            let channels = rekey_owners(&mut self.nouveau_channels.lock(), pid, tomb, |c| {
+                &mut c.owner_pid
+            });
+            let gems = rekey_owners(&mut self.nouveau_gem.lock(), pid, tomb, |o| {
+                &mut o.owner_pid
+            });
+            let maps = rekey_owners(&mut self.nouveau_vm_mappings.lock(), pid, tomb, |m| {
+                &mut m.owner_pid
+            });
+            let classes = super::nouveau_uapi::class_objects_rekey_pid(pid, tomb);
+            let refs = crate::scheme::gem_mmap::rekey_pid(pid, tomb);
+            z.pid = tomb;
             log::warn!(
-                "[nouveau-uapi] zombie ctx {}: pid={} is back before its consumer passed; freeing now",
+                "[nouveau-uapi] zombie ctx {}: pid={} is back before its consumer passed; the zombie's {} channel(s), {} GEM object(s), {} mapping(s), {} class object(s) and {} reference(s) now wear {:#x}",
                 z.ctx_idx,
-                z.pid
+                pid,
+                channels,
+                gems,
+                maps,
+                classes,
+                refs,
+                tomb
             );
-            self.release_process_finish(z.pid, Some(z.ctx_idx));
         }
     }
 
@@ -11516,7 +11558,7 @@ impl NvidiaGpu {
         // A zombie context (`ZombieCtx`) still wearing this pid: the pid was
         // recycled, and this process must not share pid-keyed state with
         // the dead one.
-        self.reap_zombie_wearing(owner_pid);
+        self.rekey_zombie_wearing(owner_pid);
         // Name every distinct ioctl the first time Mesa issues it, so one
         // real-hardware boot reveals the full vocabulary and, above all, the
         // submission path (legacy GEM_PUSHBUF vs new EXEC). Bounded/de-duped.
@@ -18642,19 +18684,34 @@ mod nouveau_bookkeeping_tests {
         assert_eq!(FAKE_RM.lock().bad, 0);
     }
 
-    /// Pids are recycled. A new process wearing the dead client's pid must
-    /// not share the pid-keyed state (context, GEM objects, channels) with
-    /// the zombie: its first nouveau ioctl finishes the zombie's teardown,
-    /// consumer or no consumer.
+    /// Pids are recycled, and fast: the pool is a FIFO of freed ids that
+    /// thread churn drains in seconds. A new process wearing the dead
+    /// client's pid must not share the pid-keyed state (context, GEM
+    /// objects, mappings, channels, class objects, PRIME references) with
+    /// the zombie -- and the zombie must not be torn down for it either:
+    /// its consumer still has an ACQUIRE queued on its page, the fault it
+    /// was parked against. So the zombie's state is re-keyed to a tombstone
+    /// of its own, the new process starts with nothing of it, and the
+    /// zombie's teardown, once the consumer has passed, takes nothing of
+    /// the new process's.
     #[test]
-    fn a_recycled_pid_finishes_the_zombies_teardown_before_owning_anything() {
+    fn a_recycled_pid_owns_nothing_of_the_zombie_and_the_zombie_still_waits_for_its_consumer() {
         let _g = LOCK.lock();
         let _live = LiveBytes::hold();
         let gpu = gpu_rm_ladder();
         FAKE_RM.lock().peer = true;
         test_clock::set_auto_advance(1_000);
         let ch_c = client_with_pushbuf(&gpu, COMP);
-        let ch_a = client_with_pushbuf(&gpu, A);
+        let ch_a = channel_alloc(&gpu, A).unwrap().channel as u32;
+        let h_a = gem_new_rm(&gpu, 65536, nv::NOUVEAU_GEM_DOMAIN_GART, A)
+            .unwrap()
+            .handle;
+        assert_eq!(vm_bind_ops(&gpu, A, &mut [map(h_a, PUSH_VA, 65536)]), Ok(0));
+        // A class object of A's: reaped with the zombie, not with the new A.
+        assert_eq!(
+            subchan_new(u64::from(ch_a), 0xc597, 0x1000).send(&gpu, A),
+            Ok(0)
+        );
         let out = syncobj::create(false);
         assert_eq!(
             exec(&gpu, A, ch_a, &[push(PUSH_VA, 16)], &[], &[sync(out)]),
@@ -18667,36 +18724,121 @@ mod nouveau_bookkeeping_tests {
         gpu.nouveau_release_process(A);
         assert_eq!(gpu.nouveau_zombies.lock().len(), 1, "a zombie");
         let old = chan(1);
-        // The pid comes back (a new process) and allocates a channel.
+        // The pid comes back as a new process and allocates a channel: the
+        // zombie is not torn down (its consumer has not passed), and the new
+        // process owns nothing of it.
         let before = FAKE_RM.lock().calls.len();
+        let bytes_before = NOUVEAU_GEM_BYTES.load(Ordering::Relaxed);
         let ch_a2 = client_with_pushbuf(&gpu, A);
         let calls = rm_calls_since(before);
-        let freed = calls
-            .iter()
-            .position(|c| *c == "ctx_free")
-            .expect("the zombie freed first");
-        let built = calls
-            .iter()
-            .rposition(|c| *c == "exec_fast_prepare" || *c == "ctx_alloc" || *c == "channel_alloc")
-            .unwrap_or(usize::MAX);
         assert!(
-            freed < built,
-            "freed BEFORE the new process's own state: {:?}",
+            !calls.contains(&"ctx_free") && !calls.contains(&"class_free"),
+            "the zombie waits for its consumer still: {:?}",
             calls
         );
-        assert!(gpu.nouveau_zombies.lock().is_empty());
-        assert_eq!(peer_map(0, 1), None, "the dead one's mapping is gone");
+        assert_eq!(gpu.nouveau_zombies.lock().len(), 1);
         assert_eq!(
             ctx_of(&gpu, A),
-            Some((1, true)),
-            "and the new one has a context of its own"
+            Some((2, true)),
+            "a context of its own, not the zombie's index"
+        );
+        assert!(
+            peer_map(0, 1).is_some(),
+            "the compositor's mapping of the zombie's page stays"
+        );
+        assert_eq!(
+            NOUVEAU_GEM_BYTES.load(Ordering::Relaxed) - bytes_before,
+            65536,
+            "the new process's pushbuf, on top of the zombie's"
+        );
+        assert_eq!(
+            gem_info(&gpu, h_a, A).map(|_| ()),
+            Err(nv::ENOENT),
+            "the zombie's buffer is not the new process's to touch"
+        );
+        assert_eq!(
+            gpu.nouveau_vm_mappings
+                .lock()
+                .iter()
+                .filter(|m| m.va == PUSH_VA && m.owner_pid != COMP)
+                .count(),
+            2,
+            "the zombie's mapping in its VAS and the new process's in its own: the \
+             new bind at the same VA replaced nothing of the zombie's"
         );
         let out2 = syncobj::create(false);
         assert_eq!(
             exec(&gpu, A, ch_a2, &[push(PUSH_VA, 16)], &[], &[sync(out2)]),
             Ok(0)
         );
-        assert_ne!(chan(1).buf, old.buf, "on a channel of its own");
+        assert_eq!(
+            run_gpu(2).len(),
+            2,
+            "push and fence on a channel of its own"
+        );
+        assert_ne!(chan(2).buf, old.buf);
+        // The zombie's ring and its consumer run: the compositor passes its
+        // ACQUIRE on a page that is still there.
+        let zombie_ran = run_gpu(1);
+        assert_eq!(zombie_ran.len(), 2, "the zombie's push and fence");
+        assert!(
+            !zombie_ran
+                .iter()
+                .any(|f| matches!(f, Fetched::Fault { .. })),
+            "its pushbuf is still mapped in its VAS: {:?}",
+            zombie_ran
+        );
+        assert_eq!(run_gpu(0).len(), 2, "acquire and push, no fault");
+        // Now the zombie is due. Its teardown takes its own state -- the
+        // channel, the pushbuf, the mapping, the class object -- and nothing
+        // of the new process's.
+        let before = FAKE_RM.lock().calls.len();
+        let bytes_before = NOUVEAU_GEM_BYTES.load(Ordering::Relaxed);
+        gpu.reap_zombie_contexts();
+        let calls = rm_calls_since(before);
+        assert!(
+            calls.contains(&"class_free"),
+            "the zombie's class object: {:?}",
+            calls
+        );
+        assert!(calls.contains(&"ctx_free"), "and its context: {:?}", calls);
+        assert!(gpu.nouveau_zombies.lock().is_empty());
+        assert_eq!(
+            bytes_before - NOUVEAU_GEM_BYTES.load(Ordering::Relaxed),
+            65536,
+            "the zombie's pushbuf went, and only it"
+        );
+        assert_eq!(peer_map(0, 1), None);
+        assert!(!has_chan(1));
+        assert!(
+            !gpu.nouveau_channels.lock().iter().any(|c| c.ctx_idx == 1),
+            "the zombie's channel entry went with it"
+        );
+        assert_eq!(
+            gpu.nouveau_vm_mappings
+                .lock()
+                .iter()
+                .filter(|m| m.owner_pid == A)
+                .count(),
+            1,
+            "the new process's mapping; the zombie's is gone"
+        );
+        assert_eq!(
+            ctx_of(&gpu, A),
+            Some((2, true)),
+            "the new process keeps its context"
+        );
+        assert!(has_chan(2));
+        let out3 = syncobj::create(false);
+        assert_eq!(
+            exec(&gpu, A, ch_a2, &[push(PUSH_VA, 16)], &[], &[sync(out3)]),
+            Ok(0),
+            "and renders on"
+        );
+        assert_eq!(run_gpu(2).len(), 2);
+        assert!(syncobj::destroy(out));
+        assert!(syncobj::destroy(out2));
+        assert!(syncobj::destroy(out3));
         gpu.nouveau_release_process(A);
         gpu.nouveau_release_process(COMP);
         assert_eq!(FAKE_RM.lock().bad, 0);
@@ -18704,9 +18846,10 @@ mod nouveau_bookkeeping_tests {
 
     /// The same, for a process wearing the recycled pid that exits without
     /// having touched nouveau: its exit is pid-keyed too (GEM objects,
-    /// channels), so the zombie's teardown goes first, not never.
+    /// channels), and it takes nothing of the zombie's, whose teardown is
+    /// its consumer's to release, not this exit's.
     #[test]
-    fn a_recycled_pid_that_exits_without_a_channel_takes_the_zombie_with_it() {
+    fn a_recycled_pid_that_exits_without_a_channel_leaves_the_zombie_to_its_consumer() {
         let _g = LOCK.lock();
         let _live = LiveBytes::hold();
         let gpu = gpu_rm_ladder();
@@ -18728,12 +18871,18 @@ mod nouveau_bookkeeping_tests {
         let before = FAKE_RM.lock().calls.len();
         gpu.nouveau_release_process(A);
         assert!(
-            rm_calls_since(before).contains(&"ctx_free"),
-            "the zombie freed with the pid's second exit: {:?}",
+            !rm_calls_since(before).contains(&"ctx_free"),
+            "the zombie is its consumer's to release, not this exit's: {:?}",
             rm_calls_since(before)
         );
-        assert!(!has_chan(1));
+        assert!(has_chan(1));
+        assert_eq!(gpu.nouveau_zombies.lock().len(), 1);
+        assert_eq!(run_gpu(1).len(), 2);
+        assert_eq!(run_gpu(0).len(), 2, "the compositor passes, no fault");
+        gpu.reap_zombie_contexts();
+        assert!(!has_chan(1), "freed once the consumer passed");
         assert!(gpu.nouveau_zombies.lock().is_empty());
+        assert!(syncobj::destroy(out));
         gpu.nouveau_release_process(COMP);
         assert_eq!(FAKE_RM.lock().bad, 0);
     }

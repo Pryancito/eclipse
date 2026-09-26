@@ -278,6 +278,27 @@ pub fn release_pid(pid: u64) -> Vec<(u32, bool)> {
     out
 }
 
+/// Moves every reference `from` holds to `to`, across all objects: a zombie
+/// context whose pid the pool has handed to a new process
+/// (`NvidiaGpu::rekey_zombie_wearing`), so [`release_pid`] of the zombie's
+/// teardown later drops the zombie's references and none of the new
+/// process's. Returns how many moved.
+pub fn rekey_pid(from: u64, to: u64) -> usize {
+    if from == 0 {
+        return 0;
+    }
+    let mut n = 0;
+    for e in MAPPINGS.lock().iter_mut() {
+        for h in e.holders.iter_mut() {
+            if *h == from {
+                *h = to;
+                n += 1;
+            }
+        }
+    }
+    n
+}
+
 /// Drops `handle`'s mapping unconditionally, ignoring the share count. Returns
 /// whether one existed. A hard reset primitive: unlike [`dec_ref`], it frees the
 /// entry no matter how many holders remain, so it must NOT be used where another

@@ -200,6 +200,21 @@ pub(super) fn class_objects_drain_pid(pid: u64) -> alloc::vec::Vec<(u64, u32)> {
     out
 }
 
+/// Re-keys the class objects owned by `from` to `to`: a zombie context
+/// whose pid the pool has handed to a new process (`NvidiaGpu::
+/// rekey_zombie_wearing`), so the zombie's pid-scoped teardown later takes
+/// nothing of the new process's. Returns how many moved.
+pub(super) fn class_objects_rekey_pid(from: u64, to: u64) -> usize {
+    let mut n = 0;
+    for e in CLASS_OBJECTS.lock().iter_mut() {
+        if e.3 == from {
+            e.3 = to;
+            n += 1;
+        }
+    }
+    n
+}
+
 /// Per-context "wedged" latch (bit `i` = context `i`). Set when a client
 /// context's EXEC fence times out: its ring is jammed (GPGet frozen) and every
 /// further submit would just re-poll a dead fence for the full timeout while
