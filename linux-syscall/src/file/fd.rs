@@ -836,6 +836,14 @@ impl Syscall<'_> {
             "perf_event_open: attr={:#x} pid={} cpu={} group_fd={} flags={:#x}",
             attr_ptr, pid, cpu, group_fd, flags
         );
+        // The flag word first, as `SYSCALL_DEFINE5(perf_event_open)` reads
+        // it before the attr. It used to go through
+        // `OpenFlags::from_bits_truncate`, which reads `PERF_FLAG_*` bits as
+        // `O_*` bits: `PERF_FLAG_FD_CLOEXEC` (8) is no open flag, so the fd
+        // `perf record` opens with it survived the `execve` of the profiled
+        // program; `PERF_FLAG_FD_NO_GROUP` (1) read as `O_WRONLY`; and a
+        // flag this kernel had never heard of was accepted.
+        let plan = perf_open_plan(flags, pid, cpu, group_fd, kernel_hal::online_cpu_count())?;
         if attr_ptr == 0 {
             return Err(LxError::EFAULT);
         }
@@ -847,6 +855,17 @@ impl Syscall<'_> {
         if !crate::extensible_tail_is_empty(&attr_bytes[PERF_ATTR_SIZE_VER0..]) {
             return Err(LxError::E2BIG);
         }
+        // `perf_fget_light`: a `group_fd` other than -1 has to be an open
+        // perf event, or the call is EBADF. It was not looked at, so a
+        // bogus one opened an event anyway. Groups themselves are not
+        // modelled (every event samples on its own), so the leader is only
+        // checked, not joined.
+        if let Some(group_fd) = plan.group_fd {
+            self.linux_process()
+                .get_file_like(group_fd.into())?
+                .downcast_arc::<PerfEvent>()
+                .map_err(|_| LxError::EBADF)?;
+        }
         // A `pid` of 0 means "the calling process", not "the process whose id
         // is zero" — which is how `perf record ./prog` and every program that
         // profiles itself opens the event. Passing the literal 0 through made
@@ -857,10 +876,79 @@ impl Syscall<'_> {
         } else {
             pid
         };
-        let event = PerfEvent::new(&attr_bytes, pid, cpu, OpenFlags::from_bits_truncate(flags));
+        let event = PerfEvent::new(&attr_bytes, pid, cpu, plan.open_flags);
         let fd = self.linux_process().add_file(event)?;
         Ok(fd.into())
     }
+}
+
+/// `PERF_FLAG_FD_NO_GROUP`: `group_fd` is checked but the event is its own
+/// leader.
+const PERF_FLAG_FD_NO_GROUP: usize = 1;
+/// `PERF_FLAG_FD_OUTPUT` (2): the event writes into the leader's ring
+/// buffer. Accepted and not modelled: every event here has its own ring.
+/// `PERF_FLAG_PID_CGROUP`: `pid` is the fd of a cgroup directory.
+const PERF_FLAG_PID_CGROUP: usize = 4;
+/// `PERF_FLAG_FD_CLOEXEC`: the new fd is close-on-exec.
+const PERF_FLAG_FD_CLOEXEC: usize = 8;
+const PERF_FLAG_ALL: usize =
+    PERF_FLAG_FD_NO_GROUP | 2 | PERF_FLAG_PID_CGROUP | PERF_FLAG_FD_CLOEXEC;
+
+/// What `perf_event_open(2)` decided from its flag word, `pid` and `cpu`
+/// before it read anything from user memory.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct PerfOpenPlan {
+    /// The open flags of the new fd: `O_CLOEXEC` when `PERF_FLAG_FD_CLOEXEC`
+    /// asked for it, nothing otherwise. The perf flags are not open flags.
+    pub open_flags: OpenFlags,
+    /// The group leader to check: `group_fd` when it is not -1.
+    pub group_fd: Option<i32>,
+}
+
+/// The checks `perf_event_open` makes on its arguments alone, in Linux's
+/// order: a flag outside `PERF_FLAG_ALL` is `EINVAL`; with
+/// `PERF_FLAG_PID_CGROUP` neither `pid` nor `cpu` may be -1 (`EINVAL`),
+/// and then `pid` is a cgroup directory's fd, which this kernel has none
+/// of, so the `fdget` in `perf_cgroup_connect` finds no cgroup: `EBADF`.
+/// An event with no task (`pid == -1`) needs a CPU, and a CPU has to exist:
+/// `find_get_context` answers `EINVAL` for `cpu < 0 || cpu >= nr_cpu_ids`,
+/// and a task event with a `cpu` other than -1 goes through the same test.
+pub(crate) fn perf_open_plan(
+    flags: usize,
+    pid: i32,
+    cpu: i32,
+    group_fd: i32,
+    ncpus: usize,
+) -> Result<PerfOpenPlan, LxError> {
+    if flags & !PERF_FLAG_ALL != 0 {
+        return Err(LxError::EINVAL);
+    }
+    if flags & PERF_FLAG_PID_CGROUP != 0 {
+        if pid == -1 || cpu == -1 {
+            return Err(LxError::EINVAL);
+        }
+        return Err(LxError::EBADF);
+    }
+    if pid == -1 && cpu == -1 {
+        return Err(LxError::EINVAL);
+    }
+    if cpu != -1 && (cpu < 0 || cpu as usize >= ncpus) {
+        return Err(LxError::EINVAL);
+    }
+    let open_flags = if flags & PERF_FLAG_FD_CLOEXEC != 0 {
+        OpenFlags::CLOEXEC
+    } else {
+        OpenFlags::empty()
+    };
+    // `perf_fget_light` runs on any `group_fd` other than -1 before either
+    // `PERF_FLAG_FD_NO_GROUP` or `PERF_FLAG_FD_OUTPUT` is looked at, so the
+    // fd is checked whatever the flags say; `FD_NO_GROUP` only means the
+    // event is not joined to it, which is all this kernel does anyway.
+    let group_fd = (group_fd != -1).then_some(group_fd);
+    Ok(PerfOpenPlan {
+        open_flags,
+        group_fd,
+    })
 }
 
 use kernel_hal::PAGE_SIZE;
@@ -1489,5 +1577,94 @@ mod open_flag_tests {
         ));
         assert!(!truncates_on_open(flags, FileType::CharDevice, false));
         assert!(!truncates_on_open(flags, FileType::NamedPipe, false));
+    }
+}
+
+/// `perf_event_open(2)`'s flag word, which was read as open flags.
+#[cfg(test)]
+mod perf_open_flag_tests {
+    use super::*;
+
+    fn plan(flags: usize) -> Result<PerfOpenPlan, LxError> {
+        perf_open_plan(flags, 0, -1, -1, 4)
+    }
+
+    /// `perf record` opens every event with `PERF_FLAG_FD_CLOEXEC` (perf
+    /// tools probe for it since Linux 3.14): the fd must not reach the
+    /// profiled program's `execve`. Read as an open flag, 8 is nothing,
+    /// so it did.
+    #[test]
+    fn fd_cloexec_is_close_on_exec_and_nothing_else_is() {
+        assert_eq!(
+            plan(PERF_FLAG_FD_CLOEXEC).unwrap().open_flags,
+            OpenFlags::CLOEXEC
+        );
+        assert_eq!(plan(0).unwrap().open_flags, OpenFlags::empty());
+        // `PERF_FLAG_FD_NO_GROUP` is 1, which is `O_WRONLY`: it is not.
+        assert_eq!(
+            plan(PERF_FLAG_FD_NO_GROUP).unwrap().open_flags,
+            OpenFlags::empty()
+        );
+        assert_eq!(plan(2).unwrap().open_flags, OpenFlags::empty());
+        assert!(plan(PERF_FLAG_FD_CLOEXEC)
+            .unwrap()
+            .open_flags
+            .close_on_exec());
+    }
+
+    /// A flag Linux does not define is EINVAL, whatever else is set.
+    #[test]
+    fn an_unknown_flag_is_einval() {
+        for flags in [16, 32, 0x100, PERF_FLAG_FD_CLOEXEC | 16, usize::MAX] {
+            assert_eq!(plan(flags), Err(LxError::EINVAL), "{:#x}", flags);
+        }
+        assert!(plan(PERF_FLAG_ALL & !PERF_FLAG_PID_CGROUP).is_ok());
+    }
+
+    /// `group_fd` is checked whenever it is not -1, `FD_NO_GROUP` or not:
+    /// Linux does `perf_fget_light` first and reads the flag after.
+    #[test]
+    fn a_group_fd_other_than_minus_one_is_checked() {
+        assert_eq!(perf_open_plan(0, 0, -1, -1, 4).unwrap().group_fd, None);
+        assert_eq!(perf_open_plan(0, 0, -1, 7, 4).unwrap().group_fd, Some(7));
+        assert_eq!(
+            perf_open_plan(PERF_FLAG_FD_NO_GROUP, 0, -1, 7, 4)
+                .unwrap()
+                .group_fd,
+            Some(7)
+        );
+        // A closed or negative fd is still handed over: the lookup says EBADF.
+        assert_eq!(perf_open_plan(0, 0, -1, -2, 4).unwrap().group_fd, Some(-2));
+    }
+
+    /// `PERF_FLAG_PID_CGROUP`: -1 for either of `pid`/`cpu` is EINVAL first;
+    /// then `pid` is a cgroup fd, and there are no cgroups here: EBADF.
+    #[test]
+    fn a_cgroup_event_is_einval_without_a_cpu_and_ebadf_with_one() {
+        assert_eq!(
+            perf_open_plan(PERF_FLAG_PID_CGROUP, -1, 0, -1, 4),
+            Err(LxError::EINVAL)
+        );
+        assert_eq!(
+            perf_open_plan(PERF_FLAG_PID_CGROUP, 3, -1, -1, 4),
+            Err(LxError::EINVAL)
+        );
+        assert_eq!(
+            perf_open_plan(PERF_FLAG_PID_CGROUP, 3, 0, -1, 4),
+            Err(LxError::EBADF)
+        );
+    }
+
+    /// No task and no CPU is nothing to count (`find_get_context`: EINVAL),
+    /// and a CPU number has to exist.
+    #[test]
+    fn an_event_needs_a_task_or_a_cpu_and_the_cpu_must_exist() {
+        assert_eq!(perf_open_plan(0, -1, -1, -1, 4), Err(LxError::EINVAL));
+        assert!(perf_open_plan(0, -1, 0, -1, 4).is_ok());
+        assert!(perf_open_plan(0, -1, 3, -1, 4).is_ok());
+        assert_eq!(perf_open_plan(0, -1, 4, -1, 4), Err(LxError::EINVAL));
+        assert_eq!(perf_open_plan(0, 0, 4, -1, 4), Err(LxError::EINVAL));
+        assert_eq!(perf_open_plan(0, 0, -2, -1, 4), Err(LxError::EINVAL));
+        assert!(perf_open_plan(0, 0, -1, -1, 4).is_ok());
     }
 }
