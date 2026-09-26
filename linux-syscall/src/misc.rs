@@ -858,6 +858,9 @@ impl Syscall<'_> {
     /// or for its own pid, otherwise whichever process that is -- `ESRCH`
     /// when there is none, `EPERM` when it is not the caller's to touch.
     fn prlimit_target(&self, pid: usize) -> linux_object::error::LxResult<Arc<Process>> {
+        // A `pid_t`: the low 32 bits of the register, and a negative one is
+        // a task `find_task_by_vpid` does not find.
+        let pid = crate::intarg::task_pid(pid)?;
         let me = self.zircon_process();
         if pid == 0 || pid as u64 == me.id() {
             return Ok(me.clone());

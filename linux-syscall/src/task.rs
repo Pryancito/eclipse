@@ -780,9 +780,8 @@ impl Syscall<'_> {
 
         let res = match idtype {
             P_PID => {
-                if id == 0 {
-                    return Err(LxError::EINVAL);
-                }
+                // `kernel_waitid`: an `id_t` read as a `pid_t`, positive.
+                let id = crate::intarg::waitid_id(id, false)?;
                 match wait_child_interest(caller, id as KoID, nohang, reap, interest).await {
                     Ok((code, _cpu)) => Ok((id as KoID, code)),
                     Err(LxError::EAGAIN) if nohang => Ok((0, 0)),
@@ -813,6 +812,8 @@ impl Syscall<'_> {
                 Err(e) => Err(e),
             },
             P_PGID => {
+                // Zero is the caller's own group; a negative id is EINVAL.
+                let id = crate::intarg::waitid_id(id, true)?;
                 let pgid = if id == 0 {
                     linux_object::process::get_process_pgid(caller.id()).unwrap_or(caller.id())
                 } else {
@@ -1324,6 +1325,7 @@ impl Syscall<'_> {
         if cpusetsize == 0 {
             return Err(LxError::EINVAL);
         }
+        let pid = crate::intarg::task_pid(pid)?;
         let mask = if pid == 0 || pid as u64 == self.thread.id() {
             self.thread.affinity()
         } else {
@@ -1346,6 +1348,11 @@ impl Syscall<'_> {
     /// which also accepts a process id for single-threaded programs. Missing
     /// targets yield `ESRCH`, matching Linux.
     fn sched_target(&self, pid: usize) -> Result<Arc<Thread>, LxError> {
+        // A `pid_t`: the low 32 bits of the register. The `sched_*` calls
+        // that answer EINVAL for a negative one have already said so through
+        // `intarg::sched_pid`; what reaches here negative is a task that
+        // `find_task_by_vpid` does not find.
+        let pid = crate::intarg::task_pid(pid)?;
         if pid == 0 || pid as u64 == self.thread.id() {
             Ok(self.thread.inner())
         } else {
@@ -1443,7 +1450,7 @@ impl Syscall<'_> {
             "sched_setscheduler: pid={} policy={} priority={}",
             pid, base, sched_priority
         );
-        let thread = self.sched_target(pid)?;
+        let thread = self.sched_target(crate::intarg::sched_pid(pid)?)?;
         let (p, rt, nice) =
             Self::sched_validate(base as u8, sched_priority, thread.sched_nice() as i32)?;
         self.check_sched_permission(&thread, p, nice, rt)?;
@@ -1455,7 +1462,7 @@ impl Syscall<'_> {
     ///
     /// See [linux man sched_getscheduler(2)](https://www.man7.org/linux/man-pages/man2/sched_getscheduler.2.html).
     pub fn sys_sched_getscheduler(&self, pid: usize) -> SysResult {
-        let thread = self.sched_target(pid)?;
+        let thread = self.sched_target(crate::intarg::sched_pid(pid)?)?;
         Ok(thread.sched_policy() as usize)
     }
 
@@ -1465,7 +1472,7 @@ impl Syscall<'_> {
     /// See [linux man sched_setparam(2)](https://www.man7.org/linux/man-pages/man2/sched_setparam.2.html).
     pub fn sys_sched_setparam(&self, pid: usize, param: UserInPtr<i32>) -> SysResult {
         let sched_priority = param.read()?;
-        let thread = self.sched_target(pid)?;
+        let thread = self.sched_target(crate::intarg::sched_pid(pid)?)?;
         let (p, rt, nice) = Self::sched_validate(
             thread.sched_policy(),
             sched_priority,
@@ -1481,7 +1488,7 @@ impl Syscall<'_> {
     ///
     /// See [linux man sched_getparam(2)](https://www.man7.org/linux/man-pages/man2/sched_getparam.2.html).
     pub fn sys_sched_getparam(&self, pid: usize, mut param: UserOutPtr<i32>) -> SysResult {
-        let thread = self.sched_target(pid)?;
+        let thread = self.sched_target(crate::intarg::sched_pid(pid)?)?;
         param.write(thread.sched_rt_priority() as i32)?;
         Ok(0)
     }
@@ -1507,7 +1514,7 @@ impl Syscall<'_> {
         pid: usize,
         mut interval: UserOutPtr<TimeSpec>,
     ) -> SysResult {
-        let thread = self.sched_target(pid)?;
+        let thread = self.sched_target(crate::intarg::sched_pid(pid)?)?;
         let ts = if thread.sched_policy() == SCHED_RR {
             TimeSpec {
                 sec: 0,
@@ -1553,7 +1560,7 @@ impl Syscall<'_> {
             "sched_setattr: pid={} policy={} nice={}",
             pid, policy, a.sched_nice
         );
-        let thread = self.sched_target(pid)?;
+        let thread = self.sched_target(crate::intarg::sched_pid(pid)?)?;
         let (p, rt, nice) =
             Self::sched_validate(policy as u8, a.sched_priority as i32, a.sched_nice)?;
         self.check_sched_permission(&thread, p, nice, rt)?;
@@ -1576,7 +1583,7 @@ impl Syscall<'_> {
             return Err(LxError::EINVAL);
         }
         sched_getattr_size(size)?;
-        let thread = self.sched_target(pid)?;
+        let thread = self.sched_target(crate::intarg::sched_pid(pid)?)?;
         let a = SchedAttr {
             size: SCHED_ATTR_SIZE_VER0 as u32,
             sched_policy: thread.sched_policy() as u32,

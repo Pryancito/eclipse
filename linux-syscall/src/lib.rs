@@ -134,6 +134,7 @@ mod abi;
 #[cfg(target_arch = "x86_64")]
 pub mod bsd;
 mod file;
+mod intarg;
 mod ipc;
 mod misc;
 mod net;

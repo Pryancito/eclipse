@@ -594,24 +594,25 @@ impl Syscall<'_> {
     /// retained.
     pub fn sys_getrusage(&mut self, who: usize, mut rusage: UserOutPtr<RUsage>) -> SysResult {
         info!("getrusage: who: {}, rusage: {:?}", who, rusage);
-        const RUSAGE_SELF: isize = 0;
-        const RUSAGE_CHILDREN: isize = -1;
-        const RUSAGE_THREAD: isize = 1;
+        use crate::intarg::{rusage_who, RusageWho};
         if rusage.is_null() {
             return Err(LxError::EINVAL);
         }
-        let (utime_ns, stime_ns) = match who as isize {
-            RUSAGE_SELF => (
+        // `who` is an `int`: `RUSAGE_CHILDREN` is -1, and read out of all 64
+        // bits of the register it was 4294967295 (EINVAL) whenever the
+        // caller's compiler had zero-extended it, which is what a varargs
+        // `syscall(SYS_getrusage, RUSAGE_CHILDREN, &ru)` does.
+        let (utime_ns, stime_ns) = match rusage_who(who)? {
+            RusageWho::Process => (
                 process_user_time_ns(self.zircon_process()),
                 self.linux_process().perf().totals().1,
             ),
             // Per-thread kernel time is not split out of the process total;
             // report the thread's user time and zero kernel time.
-            RUSAGE_THREAD => (self.thread.get_time(), 0),
+            RusageWho::Thread => (self.thread.get_time(), 0),
             // Totals of children this process has reaped, accumulated at
             // wait4/waitid time exactly like Linux does.
-            RUSAGE_CHILDREN => self.linux_process().children_cpu_ns(),
-            _ => return Err(LxError::EINVAL),
+            RusageWho::Children => self.linux_process().children_cpu_ns(),
         };
         rusage.write(RUsage {
             utime: Duration::from_nanos(utime_ns).into(),
