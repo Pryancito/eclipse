@@ -585,6 +585,19 @@ fn primary_main(config: kernel_hal::KernelConfig) {
                      dibujado (puede aparecer tearing)"
                 );
             }
+            // Diagnostico, apagado siempre salvo que se pida: cada present
+            // lee la caja de dano una segunda vez y avisa si los pixeles
+            // cambiaron mientras el kernel los copiaba, o sea si el cliente
+            // sigue dibujando el buffer que acaba de presentar. Responde a una
+            // sola pregunta -- si los pixeles ya venian mal -- y cuesta una
+            // relectura por frame, asi que no se deja puesto.
+            if kernel_hal::cmdline::flag(&options.cmdline, "drm.present_probe") {
+                linux_object::fs::devfs::drm::set_present_probe_enabled(true);
+                klog_info!(
+                    "Eclipse: drm.present_probe ON -- cada present comprueba si el cliente \
+                     sigue escribiendo el buffer que presento"
+                );
+            }
             // Nouveau-compatible driver-specific ioctl surface on the NVIDIA
             // DRM node (GETPARAM, CHANNEL_ALLOC, GEM_NEW/INFO, VM_INIT --
             // see drivers/src/display/nouveau_uapi.rs and
