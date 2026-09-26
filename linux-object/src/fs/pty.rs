@@ -389,8 +389,8 @@ impl Pty {
                             } else {
                                 b"^C"
                             };
-                            out_extend(&mut inner.output, label);
-                            out_extend(&mut inner.output, b"\r\n");
+                            out_post(&mut inner.output, &termios, &mut out_col, label);
+                            out_post(&mut inner.output, &termios, &mut out_col, b"\n");
                             wake_master = true;
                         }
                         continue;
@@ -414,8 +414,8 @@ impl Pty {
                             wake_master = true;
                         }
                         if lflag & ECHO != 0 {
-                            out_extend(&mut inner.output, label.as_bytes());
-                            out_extend(&mut inner.output, b"\r\n");
+                            out_post(&mut inner.output, &termios, &mut out_col, label.as_bytes());
+                            out_post(&mut inner.output, &termios, &mut out_col, b"\n");
                             wake_master = true;
                         }
                         signals.push(signal);
@@ -433,32 +433,32 @@ impl Pty {
                         // One rubout per column, so the bytes that only
                         // continue a character do not each ask for one.
                         let echo = lflag & ECHO != 0;
-                        let rub = |inner: &mut PtyInner, wake: &mut bool| {
+                        let rub = |inner: &mut PtyInner, col: &mut usize, wake: &mut bool| {
                             let b = match inner.canon.pop_back() {
                                 Some(b) => b,
                                 None => return,
                             };
                             if echo && !(utf8 && utf8_continuation(b)) {
-                                out_extend(&mut inner.output, b"\x08 \x08");
+                                out_post(&mut inner.output, &termios, col, b"\x08 \x08");
                                 *wake = true;
                             }
                         };
                         while matches!(inner.canon.back(), Some(&b' ') | Some(&b'\t')) {
-                            rub(&mut inner, &mut wake_master);
+                            rub(&mut inner, &mut out_col, &mut wake_master);
                         }
                         while let Some(&b) = inner.canon.back() {
                             if b == b' ' || b == b'\t' {
                                 break;
                             }
-                            rub(&mut inner, &mut wake_master);
+                            rub(&mut inner, &mut out_col, &mut wake_master);
                         }
                     } else if iexten && cc[VREPRINT] != 0 && c == cc[VREPRINT] {
                         // Reprint the pending line on a fresh line.
                         if lflag & ECHO != 0 {
                             if lflag & ECHOCTL != 0 {
-                                out_extend(&mut inner.output, b"^R");
+                                out_post(&mut inner.output, &termios, &mut out_col, b"^R");
                             }
-                            out_extend(&mut inner.output, b"\r\n");
+                            out_post(&mut inner.output, &termios, &mut out_col, b"\n");
                             let pending: alloc::vec::Vec<u8> =
                                 inner.canon.iter().copied().collect();
                             for b in pending {
@@ -469,7 +469,7 @@ impl Pty {
                     } else if iexten && cc[VLNEXT] != 0 && c == cc[VLNEXT] {
                         inner.lnext = true;
                         if lflag & ECHO != 0 && lflag & ECHOCTL != 0 {
-                            out_extend(&mut inner.output, b"^\x08");
+                            out_post(&mut inner.output, &termios, &mut out_col, b"^\x08");
                             wake_master = true;
                         }
                     } else if cc[VERASE] != 0 && c == cc[VERASE] {
@@ -499,9 +499,9 @@ impl Pty {
                         }
                         if n > 0 && lflag & ECHO != 0 {
                             if lflag & ECHOE != 0 {
-                                out_extend(&mut inner.output, b"\x08 \x08");
+                                out_post(&mut inner.output, &termios, &mut out_col, b"\x08 \x08");
                             } else {
-                                out_push(&mut inner.output, cc[VERASE]);
+                                out_post(&mut inner.output, &termios, &mut out_col, &[cc[VERASE]]);
                             }
                             wake_master = true;
                         }
@@ -997,28 +997,19 @@ impl Pty {
     }
 }
 
-/// Append one byte bound for the master, if [`TTY_OUTPUT_CAP`] has room.
-/// Returns whether it went in.
+/// Append a post-processed run bound for the master: all of it, or none of it,
+/// if [`TTY_OUTPUT_CAP`] has room. Returns whether it went in.
 ///
-/// Every path that puts something in front of the master comes through here or
-/// through [`out_extend`]: program output, the echo of a keystroke, the `^C`
-/// label, a rubout. Leaving one of them to push straight onto the queue would
-/// be enough to lose the bound, because the ones that are not program output
-/// are driven by input the discipline *consumes* -- a master sending nothing
-/// but Ctrl-C stores not one byte of input and still asks for `^C\r\n` each
-/// time.
-fn out_push(out: &mut VecDeque<u8>, b: u8) -> bool {
-    if out.len() >= TTY_OUTPUT_CAP {
-        return false;
-    }
-    out.push_back(b);
-    true
-}
-
-/// Append a run bound for the master: all of it, or none of it.
+/// Half a run is worse on screen than neither: the runs that reach here are a
+/// label, a `\x08 \x08` rubout or a byte the rule turned into two.
 ///
-/// The runs that come through here are a label or a `\x08 \x08` rubout, and
-/// half of either is worse on screen than neither.
+/// Every path that puts something in front of the master comes through
+/// [`out_post`] and so through here: program output, the echo of a keystroke,
+/// the `^C` label, a rubout. Leaving one of them to push straight onto the
+/// queue would be enough to lose the bound, because the ones that are not
+/// program output are driven by input the discipline *consumes* -- a master
+/// sending nothing but Ctrl-C stores not one byte of input and still asks for
+/// `^C\r\n` each time.
 fn out_extend(out: &mut VecDeque<u8>, bytes: &[u8]) -> bool {
     if out.len() + bytes.len() > TTY_OUTPUT_CAP {
         return false;
@@ -1054,9 +1045,10 @@ enum Posted {
 /// column has to be shared for the same reason: it is one line on one screen,
 /// whatever put the bytes on it.
 fn out_post(out: &mut VecDeque<u8>, termios: &Termios, column: &mut usize, run: &[u8]) -> Posted {
-    // The longest run is the three bytes of a rubout, and the rule turns at
-    // most one byte into two.
-    let mut buf = [0u8; 8];
+    // The longest run is the eleven bytes of `^C (killed)`, and the rule turns
+    // at most one byte into two. It used to be sized for the three bytes of a
+    // rubout, because the labels went out raw -- see the callers.
+    let mut buf = [0u8; 32];
     let mut n = 0;
     let mut col = *column;
     for &b in run {
@@ -1931,6 +1923,56 @@ mod tests {
         let mut col = 0usize;
         assert_eq!(out_post(&mut out, &t, &mut col, b"\r"), Posted::Nothing);
         assert!(out.is_empty());
+    }
+
+    #[test]
+    fn a_rubout_takes_the_shared_column_back_with_it() {
+        // The rubout is three bytes that leave the cursor one column to the
+        // left of where it was, and the column has to know. VKILL's identical
+        // `\x08 \x08` went through the rule two lines away from VERASE's,
+        // which did not.
+        let p = pty();
+        p.master_write(b"abc");
+        assert_eq!(p.inner.lock().out_column, 3);
+        p.master_write(b"\x7f");
+        assert_eq!(master_drain(&p), "abc\x08 \x08");
+        assert_eq!(p.inner.lock().out_column, 2, "the cursor moved left");
+    }
+
+    #[test]
+    fn a_tab_after_a_rubout_lands_on_the_stop_the_cursor_is_actually_on() {
+        // What a drifted column costs, in the one rule that reads it: a tab
+        // expands from the column, so one byte of drift across a tab stop is
+        // eight columns of difference on screen. Eight typed, one rubbed out,
+        // so the cursor is at seven and the tab is worth one column -- with
+        // the column stuck at eight it is worth a whole stop.
+        let p = pty();
+        p.master_write(b"12345678");
+        p.master_write(b"\x7f");
+        assert_eq!(p.inner.lock().out_column, 7);
+        let _ = master_drain(&p);
+        p.slave_write(b"\t");
+        assert_eq!(p.inner.lock().out_column, 8, "one column, not a whole stop");
+    }
+
+    #[test]
+    fn the_signal_label_goes_out_through_the_output_rule_like_everything_else() {
+        // The `^C` and its newline were written straight onto the queue as
+        // `^C\r\n`, around the rule the same bytes from a program obey. With
+        // ONLCR off the terminal returns its own carriage, so the extra one is
+        // a column the cursor loses.
+        let p = pty();
+        with_oflag(&p, O_OPOST);
+        p.master_write(b"\x03");
+        assert_eq!(master_drain(&p), "^C\n");
+    }
+
+    #[test]
+    fn the_reprint_label_does_too() {
+        let p = pty();
+        with_oflag(&p, O_OPOST);
+        p.master_write(b"ab\x12");
+        assert_eq!(master_drain(&p), "ab^R\nab");
     }
 
     // ---- canonical input ------------------------------------------------
