@@ -18933,6 +18933,73 @@ mod nouveau_bookkeeping_tests {
         assert_eq!(FAKE_RM.lock().bad, 0);
     }
 
+    /// A `sync_file` imported into a binary semaphore REPLACES its fence
+    /// (`drm_syncobj_replace_fence`). The semaphore an EXEC had just
+    /// signaled kept that fence in flight beside the import, so once A's
+    /// ring passed it the semaphore read signaled with the imported source
+    /// still unsignaled, and B's EXEC waiting on it submitted behind a
+    /// release that had not happened.
+    #[test]
+    fn an_import_over_a_semaphore_an_exec_just_signaled_replaces_the_fence_the_ring_is_writing() {
+        let _g = LOCK.lock();
+        let _live = LiveBytes::hold();
+        let gpu = gpu_rm_fast();
+        FAKE_RM.lock().peer = true;
+        let ch_a = client_with_pushbuf(&gpu, A);
+        let ch_b = client_with_pushbuf(&gpu, B);
+        let sem = syncobj::create(false);
+        assert_eq!(
+            exec(&gpu, A, ch_a, &[push(PUSH_VA, 16)], &[], &[sync(sem)]),
+            Ok(0)
+        );
+        // A release fence nobody has signaled yet, imported over it.
+        let release = syncobj::create(false);
+        assert!(syncobj::import_snapshot(sem, release, 1));
+        assert_eq!(run_gpu(1).len(), 2, "A's ring passes the superseded fence");
+        assert_eq!(
+            syncobj::query(sem),
+            Some(0),
+            "the semaphore now stands for the release, which has not happened"
+        );
+        let out = syncobj::create(false);
+        // 1 ms per clock read: the CPU wait ends after 10 s virtual.
+        test_clock::set_auto_advance(1_000);
+        assert_eq!(
+            exec(
+                &gpu,
+                B,
+                ch_b,
+                &[push(PUSH_VA, 16)],
+                &[sync(sem)],
+                &[sync(out)]
+            ),
+            Err(nv::EIO),
+            "the release never came: nothing is submitted behind it"
+        );
+        test_clock::set_auto_advance(0);
+        assert!(!has_chan(2), "B's ring was never opened");
+        assert_eq!(peer_maps_made(), 0, "no fence of A's to acquire");
+        assert_eq!(syncobj::query(out), Some(0));
+        // The release arrives: the semaphore follows its source and B goes.
+        assert!(syncobj::signal(release));
+        assert_eq!(syncobj::query(sem), Some(1));
+        assert_eq!(
+            exec(
+                &gpu,
+                B,
+                ch_b,
+                &[push(PUSH_VA, 16)],
+                &[sync(sem)],
+                &[sync(out)]
+            ),
+            Ok(0)
+        );
+        assert_eq!(userd(&chan(2)), (0, 2), "push and fence, no acquire");
+        assert_eq!(run_gpu(2).len(), 2);
+        assert_eq!(syncobj::query(out), Some(1));
+        assert_eq!(FAKE_RM.lock().bad, 0);
+    }
+
     // ---- The fence-timeout upcall -----------------------------------------
     //
     // A fence the GPU never writes is `syncobj`'s to give up on: after
