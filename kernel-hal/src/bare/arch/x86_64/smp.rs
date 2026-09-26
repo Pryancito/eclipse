@@ -337,6 +337,24 @@ pub fn ap_confirm_apic_id(logical: u8) {
         return;
     }
     let actual = raw_apic_id();
+    // The id this CPU really has may already belong to another logical id --
+    // the MADT gave bring-up a provisional one, and if it named a core that
+    // exists under a different entry the two now alias. Nothing can be undone
+    // here (the hardware id is the authority, and this CPU is already running
+    // as `idx`), but a second logical id answering for one core means a
+    // shootdown addressed to both reaches one CPU and waits for two
+    // acknowledgements, so it must not pass in silence.
+    if let Some(other) = TOPOLOGY.logical_of_hw(actual) {
+        if other != idx {
+            crate::klog_warn!(
+                "[smp] logical CPUs {} and {} both report LAPIC {:#x}: one of them is not a \
+                 real CPU, and an IPI addressed to both reaches one core",
+                other,
+                idx,
+                actual
+            );
+        }
+    }
     if let Some(expected) = TOPOLOGY.confirm(idx, actual) {
         crate::klog_warn!(
             "[smp] logical CPU {}: expected LAPIC {:#x}, hardware reports {:#x} — \
@@ -545,6 +563,32 @@ pub fn start_application_processors() {
                 lapic_id
             );
             break;
+        }
+
+        // A LAPIC id this machine already has a logical id for is not an AP
+        // waiting to be launched. It is a CPU that is already running, and the
+        // first candidate is the one executing this loop: the `acpi` crate
+        // picks the boot processor out of the MADT by *order* -- the first
+        // Local APIC entry it reads -- and never compares it against the id of
+        // the CPU actually running, so on a machine whose firmware does not
+        // list the boot core first, this list contains the BSP's own LAPIC id.
+        // Firmware that lists one core twice lands here too.
+        //
+        // Starting it meant `send_init_ipi` at the boot processor's own LAPIC,
+        // in the middle of bring-up, plus a second `set_logical_cpu_id` for a
+        // CPU already running under the first -- which splits `lock`'s idea of
+        // who this CPU is from the per-CPU block it is bound to, the exact
+        // split that makes `pop_off` panic on a lock it is told it does not
+        // hold. `continue`, not `break`: one bogus entry is no reason to lose
+        // every core listed after it.
+        if let Some(known) = TOPOLOGY.logical_of_hw(lapic_id) {
+            crate::klog_warn!(
+                "[smp] the MADT lists LAPIC {} as an AP but it is already logical CPU {} \
+                 -- skipping it rather than sending INIT to a running CPU",
+                lapic_id,
+                known
+            );
+            continue;
         }
 
         // Assign this AP its dense logical id *before* it starts running, so the
