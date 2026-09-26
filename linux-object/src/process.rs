@@ -532,6 +532,15 @@ impl ProcessExt for Process {
                         if let Some(reaper_lp) = reaper.try_linux() {
                             reaper.signal_set(Signal::SIGCHLD);
                             reaper_lp.record_child_exit(child.id(), exit_code, child_cpu(&child));
+                            // The zircon bit above wakes a blocked `wait*`;
+                            // the LINUX signal is what a SIGCHLD handler, a
+                            // signalfd or a `sigwait` is waiting for
+                            // (`do_notify_parent`). Without it a shell's
+                            // `trap CHLD`, a compositor reaping its autostart
+                            // children, or a `pause()`-and-wait loop never
+                            // hear that the child is gone.
+                            let _ =
+                                send_signal_to_process(reaper.id() as usize, LinuxSignal::SIGCHLD);
                         }
                     }
                 }
@@ -3659,7 +3668,9 @@ pub fn send_signal_to_pgrp(pgid: usize, signal: LinuxSignal) -> LxResult<()> {
 }
 
 /// Pulse the parent's zircon `SIGCHLD` so a blocking `wait*` wakes for a
-/// stop/continue (exit already does the same from the terminate callback).
+/// stop/continue (exit already does the same from the terminate callback),
+/// and send it the Linux `SIGCHLD` a handler or signalfd waits for, unless
+/// its `sigaction` said `SA_NOCLDSTOP` (`do_notify_parent_cldstop`).
 fn notify_parent_child_state(child: &Arc<Process>) {
     let parent = child.try_linux().and_then(|lp| lp.parent());
     let parent = match parent {
@@ -3670,6 +3681,24 @@ fn notify_parent_child_state(child: &Arc<Process>) {
         },
     };
     parent.signal_set(Signal::SIGCHLD);
+    if parent_wants_sigchld_for_stops(&parent) {
+        let _ = send_signal_to_process(parent.id() as usize, LinuxSignal::SIGCHLD);
+    }
+}
+
+/// Whether a stop or continue of a child is reported to `parent` as a Linux
+/// `SIGCHLD`: it is unless the parent's `SIGCHLD` action carries
+/// `SA_NOCLDSTOP`, the flag whose whole meaning is "only tell me when they
+/// die".
+fn parent_wants_sigchld_for_stops(parent: &Arc<Process>) -> bool {
+    parent
+        .try_linux()
+        .map(|lp| {
+            !lp.signal_action(LinuxSignal::SIGCHLD)
+                .flags
+                .contains(crate::signal::SignalActionFlags::NOCLDSTOP)
+        })
+        .unwrap_or(false)
 }
 
 /// Park the current task until this process leaves a job-control stop (or dies).
@@ -8886,5 +8915,89 @@ mod exit_status_tests {
             "0x7f is the stop marker, not a signal"
         );
         assert_eq!(status & 0xff, 0x7f);
+    }
+}
+
+#[cfg(test)]
+mod sigchld_tests {
+    //! A child that exits, stops or resumes pulsed the zircon `SIGCHLD` bit
+    //! at its parent, which wakes a blocked `wait*`, and nothing else: no
+    //! Linux `SIGCHLD` was ever queued, so a handler, a signalfd or a
+    //! `sigwait` on it never ran. `do_notify_parent` and
+    //! `do_notify_parent_cldstop` are the two places Linux sends it.
+
+    use super::*;
+    use crate::signal::{SignalAction, SignalActionFlags};
+    use crate::thread::ThreadExt;
+    use rcore_fs_ramfs::RamFS;
+
+    fn a_parent(pid: KoID) -> (Arc<Process>, Arc<Thread>) {
+        let proc = Process::create_with_fixed_id_ext(
+            &ROOT_JOB,
+            pid,
+            "parent",
+            LinuxProcess::new(RamFS::new(), 0),
+        )
+        .unwrap();
+        let thread = Thread::create_linux(&proc).unwrap();
+        (proc, thread)
+    }
+
+    fn pending_sigchld(thread: &Arc<Thread>) -> bool {
+        thread.lock_linux().signals.contains(LinuxSignal::SIGCHLD)
+    }
+
+    fn clear_pending(thread: &Arc<Thread>) {
+        thread.lock_linux().signals = Sigset::default();
+    }
+
+    #[test]
+    fn a_child_that_exits_sends_its_parent_a_linux_sigchld() {
+        let (parent, thread) = a_parent(43_001);
+        let child = Process::fork_from(&parent).unwrap();
+        assert!(!pending_sigchld(&thread));
+        child.exit(0);
+        assert!(
+            pending_sigchld(&thread),
+            "the parent never heard the child die"
+        );
+    }
+
+    #[test]
+    fn a_child_that_stops_and_resumes_sends_sigchld_both_times() {
+        let (parent, thread) = a_parent(43_002);
+        let child = Process::fork_from(&parent).unwrap();
+        child.linux().job_stop(&child, LinuxSignal::SIGSTOP as u8);
+        assert!(pending_sigchld(&thread), "no SIGCHLD for the stop");
+        clear_pending(&thread);
+        assert!(child.linux().job_continue(&child));
+        assert!(pending_sigchld(&thread), "no SIGCHLD for the continue");
+    }
+
+    #[test]
+    fn sa_nocldstop_keeps_stops_quiet_but_not_deaths() {
+        let (parent, thread) = a_parent(43_003);
+        parent.linux().set_signal_action(
+            LinuxSignal::SIGCHLD,
+            SignalAction {
+                handler: 0x1000,
+                flags: SignalActionFlags::NOCLDSTOP,
+                restorer: 0,
+                mask: Sigset::default(),
+            },
+        );
+        let child = Process::fork_from(&parent).unwrap();
+        child.linux().job_stop(&child, LinuxSignal::SIGSTOP as u8);
+        assert!(!pending_sigchld(&thread), "SA_NOCLDSTOP was ignored");
+        child.linux().job_continue(&child);
+        assert!(
+            !pending_sigchld(&thread),
+            "SA_NOCLDSTOP was ignored on continue"
+        );
+        child.exit(0);
+        assert!(
+            pending_sigchld(&thread),
+            "a death is never covered by SA_NOCLDSTOP"
+        );
     }
 }
