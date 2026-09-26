@@ -560,8 +560,11 @@ impl Syscall<'_> {
             Sys::SHMGET => self.sys_shmget(a0, a1, a2),
             #[cfg(not(target_arch = "mips"))]
             Sys::SHMAT => self.sys_shmat(a0, a1, a2),
+            // `SYSCALL_DEFINE1(shmdt, char __user *, shmaddr)`: the address
+            // is the first and only argument. It was read from the second
+            // register, which a one-argument libc stub never sets.
             #[cfg(not(target_arch = "mips"))]
-            Sys::SHMDT => self.sys_shmdt(a0, a1, a2),
+            Sys::SHMDT => self.sys_shmdt(a0),
             #[cfg(not(target_arch = "mips"))]
             Sys::SHMCTL => self.sys_shmctl(a0, a1, a2),
 

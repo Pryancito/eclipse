@@ -608,13 +608,22 @@ impl Syscall<'_> {
     /// from the address space of the calling process.
     /// The to-be-detached segment must be currently attached with `addr`
     /// equal to the value returned by the attaching [`sys_shmat`](Self::sys_shmat) call.
-    pub fn sys_shmdt(&self, id: usize, addr: VirtAddr, shmflg: usize) -> SysResult {
+    ///
+    /// `shmdt` is `SYSCALL_DEFINE1(shmdt, char __user *, shmaddr)`: the
+    /// address is its only argument, in the first register. This handler
+    /// used to be declared `(id, addr, shmflg)` after `shmat`'s shape, and
+    /// the dispatch fed it `(a0, a1, a2)`, so the address it detached was
+    /// whatever the SECOND register held when userspace made a one-argument
+    /// call -- glibc's and musl's `shmdt(addr)` set only the first. The real
+    /// address sat in `id`, which nothing read. Every `shmdt` from a real
+    /// program was therefore `EINVAL` (or, before that errno existed here, a
+    /// silent 0), and the segment stayed mapped and counted: `XShmDetach`,
+    /// the `shmdt` in `XShmDestroyImage`'s callers, Mesa's DRI software
+    /// buffers, every SysV-shm consumer, none of them ever unmapped a byte.
+    pub fn sys_shmdt(&self, addr: VirtAddr) -> SysResult {
         // mmap_lock: shmdt unmaps the segment — a layout mutation (see shmat).
         let _aspace = self.linux_process().aspace_lock().lock();
-        info!(
-            "shmdt: id = {}, addr = {:#x}, flag = {:#x}",
-            id, addr, shmflg
-        );
+        info!("shmdt: addr = {:#x}", addr);
         let proc = self.linux_process();
         // shmdt(2): an address nothing is attached at is EINVAL. It used to
         // answer 0, which also covered the second attachment of a segment
@@ -986,6 +995,25 @@ mod ipc_tests {
         // Whatever a variadic caller left in the top 32 bits is not part of
         // the `int`, so it must neither reach the semaphore nor cause ERANGE.
         assert_eq!(setval_from_arg(0xdead_beef_0000_0005), Ok(5));
+    }
+
+    /// The handlers take exactly the arguments Linux defines, so the
+    /// dispatch cannot feed one a register the syscall does not have.
+    /// `shmdt` is `SYSCALL_DEFINE1(shmdt, shmaddr)`; declared `(id, addr,
+    /// shmflg)` after `shmat`, it read the address from the second register,
+    /// which a one-argument call never sets, and answered `EINVAL` to every
+    /// real `shmdt(addr)` while the segment stayed mapped. A handler with
+    /// the wrong arity does not compile against these pins.
+    #[test]
+    fn shmdt_takes_the_address_alone_and_shmat_takes_its_three() {
+        fn pin<'a>(
+            shmdt: fn(&Syscall<'a>, VirtAddr) -> SysResult,
+            shmat: fn(&Syscall<'a>, usize, VirtAddr, usize) -> SysResult,
+        ) -> bool {
+            shmdt as usize != 0 && shmat as usize != 0
+        }
+        // `SYSCALL_DEFINE3(shmat, int, shmid, char __user *, shmaddr, int, shmflg)`.
+        assert!(pin(Syscall::sys_shmdt, Syscall::sys_shmat));
     }
 }
 
