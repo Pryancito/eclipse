@@ -4040,18 +4040,34 @@ pub fn deliver_sigint_for_vt(vt: Option<usize>) {
 /// `armed_pgid` is per-tty state (console VT or pty pair): two terminals must
 /// not share it, or a Ctrl-C in one would escalate the other.
 pub fn interrupt_or_force_pgrp(pgid: i32, armed_pgid: &AtomicI32) -> LinuxSignal {
+    let signal = interrupt_escalation(pgid, armed_pgid);
+    if pgid > 0 {
+        let _ = send_signal_to_pgrp(pgid as usize, signal);
+    }
+    signal
+}
+
+/// Which of the two [`interrupt_or_force_pgrp`] would send, arming the tty for
+/// the next Ctrl-C, but WITHOUT sending it.
+///
+/// For the caller that is holding a lock the signalled process may itself
+/// need: a signal send walks the job tree and takes each target's own locks,
+/// and doing that from under a terminal's lock is a cycle waiting for the
+/// right pair of CPUs. The pty's Ctrl-C did exactly that while its Ctrl-\ and
+/// Ctrl-Z, three lines below, already queued the signal and sent it after the
+/// lock was dropped. Deciding here and sending there makes the three the same
+/// shape, and the label the echo needs (`^C` or `^C (killed)`) is known
+/// before anything goes out.
+pub fn interrupt_escalation(pgid: i32, armed_pgid: &AtomicI32) -> LinuxSignal {
     if pgid <= 0 {
         return LinuxSignal::SIGINT;
     }
-    let prev = armed_pgid.load(Ordering::Relaxed);
-    if prev == pgid {
+    if armed_pgid.load(Ordering::Relaxed) == pgid {
         armed_pgid.store(0, Ordering::Relaxed);
-        let _ = send_signal_to_pgrp(pgid as usize, LinuxSignal::SIGKILL);
         zcore_drivers::klog_warn!("[tty] second Ctrl-C on pgrp {} -> SIGKILL (forced)", pgid);
         LinuxSignal::SIGKILL
     } else {
         armed_pgid.store(pgid, Ordering::Relaxed);
-        let _ = send_signal_to_pgrp(pgid as usize, LinuxSignal::SIGINT);
         LinuxSignal::SIGINT
     }
 }
@@ -4100,6 +4116,28 @@ mod interrupt_escalate_tests {
             "a new job gets a fresh SIGINT, not an inherited SIGKILL"
         );
         assert_eq!(armed.load(Ordering::Relaxed), 200);
+    }
+
+    /// The split the pty needs: the arm moves and the answer is known, with
+    /// nothing sent, so the decision may be taken under a lock the send must
+    /// not be taken under.
+    #[test]
+    fn deciding_without_sending_arms_the_same_way() {
+        let armed = AtomicI32::new(0);
+        assert_eq!(interrupt_escalation(77, &armed), LinuxSignal::SIGINT);
+        assert_eq!(armed.load(Ordering::Relaxed), 77);
+        assert_eq!(interrupt_escalation(77, &armed), LinuxSignal::SIGKILL);
+        assert_eq!(armed.load(Ordering::Relaxed), 0);
+    }
+
+    /// A terminal with no foreground group has nothing to arm: the pty's
+    /// Ctrl-C reads the group out of the tty and may well find 0.
+    #[test]
+    fn with_no_foreground_group_the_arm_is_left_alone() {
+        let armed = AtomicI32::new(99);
+        assert_eq!(interrupt_escalation(0, &armed), LinuxSignal::SIGINT);
+        assert_eq!(interrupt_escalation(-1, &armed), LinuxSignal::SIGINT);
+        assert_eq!(armed.load(Ordering::Relaxed), 99, "the armed job is intact");
     }
 
     #[test]

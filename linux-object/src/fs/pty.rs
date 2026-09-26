@@ -376,8 +376,13 @@ impl Pty {
                             wake_master = true;
                         }
                         let pgid = self.fg_pgrp.load(Ordering::Relaxed);
+                        // Decided here, sent after `inner` is dropped, like
+                        // the Ctrl-\ and Ctrl-Z below: a send walks the job
+                        // tree and takes the targets' own locks, and this one
+                        // went out from under the terminal's.
                         let sent =
-                            crate::process::interrupt_or_force_pgrp(pgid, &self.ctrl_c_armed_pgid);
+                            crate::process::interrupt_escalation(pgid, &self.ctrl_c_armed_pgid);
+                        signals.push(sent);
                         if lflag & ECHO != 0 {
                             let label: &[u8] = if sent == Signal::SIGKILL {
                                 b"^C (killed)"
