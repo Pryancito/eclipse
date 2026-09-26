@@ -132,29 +132,119 @@ impl SignalFd {
     }
 }
 
+/// Which of `siginfo_t`'s unions a signal is carrying, as Linux's
+/// `siginfo_layout` decides it from the signal number and `si_code`. The
+/// answer says which fields of `struct signalfd_siginfo` may be filled, and
+/// filling the wrong ones is worse than filling none: userspace reads the
+/// field, not the layout.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum SiginfoLayout {
+    /// `_kill`: a sender and nothing else (`SI_USER`, `SI_KERNEL`).
+    Kill,
+    /// `_timer`: which timer expired, how many expiries were missed, and the
+    /// `sigev_value` it was armed with (`SI_TIMER`).
+    Timer,
+    /// `_rt`: a sender and the `sigval` they queued (`SI_QUEUE` and the rest
+    /// of the negative codes).
+    Rt,
+    /// `_sigchld`: the child, its real uid and its `wait` status.
+    Chld,
+    /// `_sigfault`: the address the fault happened at.
+    Fault,
+}
+
+/// `siginfo_layout(sig, si_code)`.
+///
+/// A code the kernel itself stamped (strictly between `SI_USER` and
+/// `SI_KERNEL`) means the union belongs to the signal: `SIGCHLD` carries a
+/// child and the faults carry an address. Everything else goes by the code
+/// alone.
+///
+/// `SIL_POLL` and `SIL_SYS` are folded into `Kill` rather than named: nothing
+/// in this kernel stamps a `SIGPOLL` or a `SIGSYS` with one of their codes, so
+/// a case for them would be a guess about bytes nobody writes.
+fn siginfo_layout(signo: i32, code: i32) -> SiginfoLayout {
+    /// `SI_KERNEL`, the top of the range the kernel stamps.
+    const SI_KERNEL: i32 = 0x80;
+    /// `SI_TIMER`, the one negative code with a union of its own.
+    const SI_TIMER: i32 = -2;
+    if code > 0 && code < SI_KERNEL {
+        return if signo == LinuxSignal::SIGCHLD as i32 {
+            SiginfoLayout::Chld
+        } else if signo == LinuxSignal::SIGSEGV as i32
+            || signo == LinuxSignal::SIGBUS as i32
+            || signo == LinuxSignal::SIGILL as i32
+            || signo == LinuxSignal::SIGFPE as i32
+            || signo == LinuxSignal::SIGTRAP as i32
+        {
+            SiginfoLayout::Fault
+        } else {
+            SiginfoLayout::Kill
+        };
+    }
+    if code == SI_TIMER {
+        SiginfoLayout::Timer
+    } else if code < 0 {
+        SiginfoLayout::Rt
+    } else {
+        SiginfoLayout::Kill
+    }
+}
+
 /// `struct signalfd_siginfo` for one consumed signal: `signalfd_copyinfo`.
 ///
 /// The layout is the uAPI's, not `siginfo_t`'s: `ssi_signo` (0), `ssi_errno`
-/// (4), `ssi_code` (8), `ssi_pid` (12), `ssi_uid` (16), ..., `ssi_status`
-/// (40). Which fields are filled depends on what the signal carries, as in
-/// the kernel's `siginfo_layout`: a signal a process sent (`SI_USER`,
-/// `SI_TKILL`, `SI_QUEUE`) has a sender; a `SIGCHLD` has the child, its uid
-/// and its status. An event loop reading a `SIGCHLD` off a signalfd is
-/// looking for exactly `ssi_pid` and `ssi_status`, and used to get zeros.
+/// (4), `ssi_code` (8), `ssi_pid` (12), `ssi_uid` (16), `ssi_tid` (24),
+/// `ssi_overrun` (32), `ssi_status` (40), `ssi_int` (44), `ssi_ptr` (48),
+/// `ssi_addr` (72). Which of them are filled is [`siginfo_layout`]'s answer,
+/// as in the kernel's own `switch (siginfo_layout(...))`.
+///
+/// This used to ask two questions instead -- "did a process send it" and "is
+/// it a `SIGCHLD` the kernel stamped" -- and write `si_pid`/`si_uid` whenever
+/// the first was true. `si_code <= 0` is true of `SI_TIMER` as well, so a
+/// POSIX timer's expiry came out with the timer id in `ssi_pid` and the
+/// overrun count in `ssi_uid`: an event loop read a signal from a process
+/// that does not exist. And the `sigval` was dropped in both the cases that
+/// carry one, so a `sigqueue(pid, sig, value)` arrived with the value zeroed
+/// and a `timer_create` expiry with no way to tell which timer it was --
+/// glibc's `SIGEV_THREAD` helper acts only on an `SI_TIMER` whose `si_ptr` is
+/// the timer it registered, so it ignored every expiry it read here. A fault
+/// read off a signalfd carried no address at all.
 fn signalfd_record(info: &SigInfo) -> [u8; SIGINFO_SIZE] {
+    // The `_sifields` union starts at byte 16 of `siginfo_t`; `_kill`,
+    // `_rt`, `_timer` and `_sigchld` all open with two 32-bit fields, and
+    // `_rt`/`_timer` carry the `sigval` in the 8 bytes behind them.
     let src = info.as_bytes();
+    let first = &src[16..20];
+    let second = &src[20..24];
+    let value = &src[24..32];
     let mut out = [0u8; SIGINFO_SIZE];
     out[..4].copy_from_slice(&(info.signo as u32).to_ne_bytes());
     out[4..8].copy_from_slice(&info.errno.to_ne_bytes());
     out[8..12].copy_from_slice(&info.code.0.to_ne_bytes());
-    let sent_by_a_process = info.code.from_a_process();
-    let about_a_child = info.signo == LinuxSignal::SIGCHLD as i32 && !sent_by_a_process;
-    if sent_by_a_process || about_a_child {
-        // `_kill` and `_sigchld` both start with `si_pid`, `si_uid`.
-        out[12..20].copy_from_slice(&src[16..24]);
-    }
-    if about_a_child {
-        out[40..44].copy_from_slice(&src[24..28]);
+    match siginfo_layout(info.signo, info.code.0) {
+        SiginfoLayout::Kill => {
+            out[12..16].copy_from_slice(first); // ssi_pid
+            out[16..20].copy_from_slice(second); // ssi_uid
+        }
+        SiginfoLayout::Rt => {
+            out[12..16].copy_from_slice(first); // ssi_pid
+            out[16..20].copy_from_slice(second); // ssi_uid
+            out[44..48].copy_from_slice(&value[..4]); // ssi_int
+            out[48..56].copy_from_slice(value); // ssi_ptr
+        }
+        SiginfoLayout::Timer => {
+            out[24..28].copy_from_slice(first); // ssi_tid = si_timerid
+            out[32..36].copy_from_slice(second); // ssi_overrun
+            out[44..48].copy_from_slice(&value[..4]); // ssi_int
+            out[48..56].copy_from_slice(value); // ssi_ptr
+        }
+        SiginfoLayout::Chld => {
+            out[12..16].copy_from_slice(first); // ssi_pid
+            out[16..20].copy_from_slice(second); // ssi_uid
+            out[40..44].copy_from_slice(&value[..4]); // ssi_status
+        }
+        SiginfoLayout::Fault => out[72..80].copy_from_slice(&src[16..24]), // ssi_addr
     }
     out
 }
@@ -423,6 +513,63 @@ mod record_tests {
         assert_eq!(word(&r, 8), SignalCode::USER.0);
         assert_eq!((word(&r, 12), word(&r, 16)), (77, 1000));
         assert_eq!(word(&r, 40), 0, "no status on a kill");
+    }
+
+    fn dword(b: &[u8], at: usize) -> u64 {
+        let mut w = [0u8; 8];
+        w.copy_from_slice(&b[at..at + 8]);
+        u64::from_ne_bytes(w)
+    }
+
+    /// `sigqueue(pid, sig, value)`: the value IS the call. It was dropped, so
+    /// a program that passes a pointer or a tag through a signal read zero.
+    #[test]
+    fn a_queued_signal_carries_the_value_that_was_queued_with_it() {
+        let info = SigInfo::queued(LinuxSignal::SIGUSR1, 77, 1000, 0xdead_beef_0bad_f00d);
+        let r = signalfd_record(&info);
+        assert_eq!(word(&r, 8), SignalCode::QUEUE.0, "ssi_code");
+        assert_eq!((word(&r, 12), word(&r, 16)), (77, 1000), "still a sender");
+        assert_eq!(dword(&r, 48), 0xdead_beef_0bad_f00d, "ssi_ptr");
+        assert_eq!(word(&r, 44), 0x0bad_f00d_u32 as i32, "ssi_int");
+    }
+
+    /// A timer expiry is not a signal from a process, and `si_code <= 0` said
+    /// it was: the timer id came out as `ssi_pid` and the overrun count as
+    /// `ssi_uid`, so an event loop read a sender that does not exist.
+    #[test]
+    fn a_timer_expiry_names_the_timer_and_not_a_sender() {
+        let info = SigInfo::timer(LinuxSignal::SIGALRM, 9, 3, 0x4000);
+        let r = signalfd_record(&info);
+        assert_eq!(word(&r, 8), SignalCode::TIMER.0, "ssi_code");
+        assert_eq!((word(&r, 12), word(&r, 16)), (0, 0), "nobody sent it");
+        assert_eq!(word(&r, 24), 9, "ssi_tid is the timer");
+        assert_eq!(word(&r, 32), 3, "ssi_overrun");
+        // glibc's SIGEV_THREAD helper acts only on an SI_TIMER whose si_ptr is
+        // the timer it registered, so a zero here is every expiry ignored.
+        assert_eq!(dword(&r, 48), 0x4000, "ssi_ptr");
+    }
+
+    /// A fault read off a signalfd had no address, which is the only field
+    /// worth reading on one.
+    #[test]
+    fn a_fault_read_off_a_signalfd_carries_the_address() {
+        let info = SigInfo::fault(LinuxSignal::SIGSEGV, SignalCode::SEGV_MAPERR, 0x1234_5000);
+        let r = signalfd_record(&info);
+        assert_eq!(word(&r, 8), SignalCode::SEGV_MAPERR.0, "ssi_code");
+        assert_eq!(dword(&r, 72), 0x1234_5000, "ssi_addr");
+        assert_eq!((word(&r, 12), word(&r, 16)), (0, 0), "not a sender");
+    }
+
+    /// The layout is the signal's only for a code the KERNEL stamped: a
+    /// `kill -SEGV` or a `kill -CHLD` is a sender like any other.
+    #[test]
+    fn a_signal_a_process_sent_is_a_sender_whatever_its_number() {
+        for signal in [LinuxSignal::SIGSEGV, LinuxSignal::SIGCHLD] {
+            let info = SigInfo::from_user(signal, 5, 1000, SignalCode::USER);
+            let r = signalfd_record(&info);
+            assert_eq!((word(&r, 12), word(&r, 16)), (5, 1000), "{signal:?}");
+            assert_eq!(dword(&r, 72), 0, "no address on a kill: {signal:?}");
+        }
     }
 
     #[test]
