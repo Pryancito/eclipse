@@ -273,3 +273,312 @@ mod pmio {
 
 #[cfg(target_arch = "x86_64")]
 pub use pmio::Uart16550Pmio;
+
+/// The 16550 register map and the three operations over it.
+///
+/// This is the serial console: every panic banner, every `[null-exec]` and
+/// `[watchpoint]` line, every crash log Moebius pastes. It had no tests, and a
+/// driver that overlays a `#[repr(C)]` struct on device memory has one failure
+/// mode above all others -- a field at the wrong offset writes to the wrong
+/// register, silently and for ever.
+///
+/// The port here is a real `Io` implementation over ordinary memory, so `init`,
+/// `send`, `try_recv` and `write_str` run unchanged.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloc::{boxed::Box, vec::Vec};
+    use core::cell::{Cell, RefCell};
+
+    /// Which of the seven registers a [`Port`] is.
+    #[derive(Copy, Clone, PartialEq, Eq, Debug)]
+    enum Reg {
+        Data,
+        IntEn,
+        FifoCtrl,
+        LineCtrl,
+        ModemCtrl,
+        LineSts,
+        ModemSts,
+    }
+
+    /// The other end of the wire: what the driver wrote, and what the port
+    /// answers when it reads.
+    struct Wire {
+        /// Every byte written to the data register, in order -- which is what a
+        /// terminal on the other end would see.
+        sent: RefCell<Vec<u8>>,
+        /// Every write to a control register, as `(register, value)`.
+        control: RefCell<Vec<(Reg, u8)>>,
+        /// What the line-status register reads.
+        line_sts: Cell<u8>,
+        /// The byte the data register reads, once.
+        pending: Cell<Option<u8>>,
+    }
+
+    impl Wire {
+        fn new(line_sts: u8) -> &'static Self {
+            Box::leak(Box::new(Self {
+                sent: RefCell::new(Vec::new()),
+                control: RefCell::new(Vec::new()),
+                line_sts: Cell::new(line_sts),
+                pending: Cell::new(None),
+            }))
+        }
+    }
+
+    struct Port {
+        wire: &'static Wire,
+        reg: Reg,
+    }
+
+    impl Io for Port {
+        type Value = u8;
+
+        fn read(&self) -> u8 {
+            match self.reg {
+                Reg::LineSts => self.wire.line_sts.get(),
+                Reg::Data => self.wire.pending.take().unwrap_or(0),
+                _ => 0,
+            }
+        }
+
+        fn write(&mut self, value: u8) {
+            match self.reg {
+                Reg::Data => self.wire.sent.borrow_mut().push(value),
+                reg => self.wire.control.borrow_mut().push((reg, value)),
+            }
+        }
+    }
+
+    fn port(wire: &'static Wire, reg: Reg) -> Port {
+        Port { wire, reg }
+    }
+
+    fn uart(wire: &'static Wire) -> Uart16550Inner<Port> {
+        Uart16550Inner {
+            data: port(wire, Reg::Data),
+            int_en: port(wire, Reg::IntEn),
+            fifo_ctrl: port(wire, Reg::FifoCtrl),
+            line_ctrl: port(wire, Reg::LineCtrl),
+            modem_ctrl: port(wire, Reg::ModemCtrl),
+            line_sts: ReadOnly::new(port(wire, Reg::LineSts)),
+            modem_sts: ReadOnly::new(port(wire, Reg::ModemSts)),
+        }
+    }
+
+    /// A line status with room in the transmit holding register.
+    const READY: u8 = 1 << 5;
+    /// ...and with a byte waiting to be read.
+    const HAS_INPUT: u8 = 1;
+
+    // --- the register map -------------------------------------------------
+
+    /// The one that matters most, and the reason this file needed tests at all:
+    /// the struct is overlaid on device memory, so each field's offset IS the
+    /// register's address. A field added in the middle, a `repr(transparent)`
+    /// dropped from `Mmio` or `ReadOnly`, or a reordering, and the driver
+    /// silently drives the wrong registers -- on a port whose only job is to
+    /// carry the evidence when everything else has already gone wrong.
+    #[test]
+    fn every_register_sits_at_its_own_offset_in_the_16550_map() {
+        // The 16550's registers are consecutive units from the base, and the
+        // unit is the bus width: one byte for an 8-bit port, four for a 32-bit
+        // one (the same struct serves both).
+        macro_rules! check {
+            ($t:ty, $stride:expr) => {{
+                type Inner = Uart16550Inner<Mmio<$t>>;
+                assert_eq!(
+                    core::mem::size_of::<Inner>(),
+                    7 * $stride,
+                    "the map must be exactly the seven registers, with no padding"
+                );
+                assert_eq!(core::mem::align_of::<Inner>(), core::mem::align_of::<$t>());
+                let map = core::mem::MaybeUninit::<Inner>::uninit();
+                let base = map.as_ptr() as usize;
+                for (i, (name, at)) in [
+                    ("data", unsafe { core::ptr::addr_of!((*map.as_ptr()).data) }
+                        as usize),
+                    (
+                        "int_en",
+                        unsafe { core::ptr::addr_of!((*map.as_ptr()).int_en) } as usize,
+                    ),
+                    ("fifo_ctrl", unsafe {
+                        core::ptr::addr_of!((*map.as_ptr()).fifo_ctrl) as usize
+                    }),
+                    ("line_ctrl", unsafe {
+                        core::ptr::addr_of!((*map.as_ptr()).line_ctrl) as usize
+                    }),
+                    ("modem_ctrl", unsafe {
+                        core::ptr::addr_of!((*map.as_ptr()).modem_ctrl) as usize
+                    }),
+                    ("line_sts", unsafe {
+                        core::ptr::addr_of!((*map.as_ptr()).line_sts) as usize
+                    }),
+                    ("modem_sts", unsafe {
+                        core::ptr::addr_of!((*map.as_ptr()).modem_sts) as usize
+                    }),
+                ]
+                .iter()
+                .enumerate()
+                {
+                    assert_eq!(
+                        at - base,
+                        i * $stride,
+                        "register {} is at the wrong offset for a {}-byte bus",
+                        name,
+                        $stride
+                    );
+                }
+            }};
+        }
+        check!(u8, 1);
+        check!(u32, 4);
+    }
+
+    // --- init -------------------------------------------------------------
+
+    /// What a port must be told before it can carry a byte, in order: quiet
+    /// first (interrupts off), then the FIFO, then the modem lines, and only
+    /// then interrupts on. Enabling the receive interrupt before the FIFO is
+    /// cleared would hand the handler the firmware's leftovers.
+    #[test]
+    fn init_quietens_the_port_before_it_arms_it() {
+        let wire = Wire::new(READY);
+        uart(&wire).init();
+        assert_eq!(
+            wire.control.borrow().as_slice(),
+            &[
+                (Reg::IntEn, 0x00),
+                (Reg::FifoCtrl, 0xC7),
+                (Reg::ModemCtrl, 0x0B),
+                (Reg::IntEn, 0x01),
+            ],
+        );
+        assert!(
+            wire.sent.borrow().is_empty(),
+            "init must not put a byte on the wire"
+        );
+    }
+
+    /// `init` never writes the line-control register, so the word format and
+    /// the baud divisor stay as the firmware left them. That is a real gap --
+    /// a real 16550 init sets DLAB, writes the divisor and then 8N1 -- and it
+    /// is recorded rather than changed, because whether a board's firmware has
+    /// already done it can only be answered on the hardware.
+    #[test]
+    fn init_inherits_the_baud_rate_and_the_word_format_from_the_firmware() {
+        let wire = Wire::new(READY);
+        uart(&wire).init();
+        assert!(
+            !wire
+                .control
+                .borrow()
+                .iter()
+                .any(|&(reg, _)| reg == Reg::LineCtrl),
+            "line control is written now: if that is on purpose, this test says so"
+        );
+    }
+
+    // --- send and write_str -----------------------------------------------
+
+    #[test]
+    fn a_byte_goes_out_when_the_holding_register_is_empty() {
+        let wire = Wire::new(READY);
+        uart(&wire).send(b'A').unwrap();
+        assert_eq!(wire.sent.borrow().as_slice(), b"A");
+    }
+
+    /// A port with no cable is the NORM on the bring-up box, so a full holding
+    /// register that never drains must cost a dropped byte and not the machine:
+    /// this runs under the uart's IRQ-masking lock, and an unbounded wait there
+    /// freezes the CPU with nothing on screen to say why.
+    #[test]
+    fn a_wedged_port_drops_the_byte_instead_of_hanging_the_cpu() {
+        let wire = Wire::new(0); // never OUTPUT_EMPTY
+        uart(&wire).send(b'A').unwrap();
+        assert!(
+            wire.sent.borrow().is_empty(),
+            "the byte cannot reach a port that never drained"
+        );
+    }
+
+    /// And the loss is silent by design, which is what the caller has to be
+    /// able to rely on: `write_str` keeps going and the machine stays up.
+    #[test]
+    fn a_wedged_port_does_not_stop_the_rest_of_the_line() {
+        let wire = Wire::new(0);
+        uart(&wire).write_str("panic!").unwrap();
+        assert!(wire.sent.borrow().is_empty());
+    }
+
+    /// A terminal needs the carriage return; a bare `\n` leaves the next line
+    /// starting where the last one ended, which is how a stairstepped panic
+    /// banner happens.
+    #[test]
+    fn a_newline_goes_out_as_carriage_return_and_newline() {
+        let wire = Wire::new(READY);
+        uart(&wire).write_str("ab\ncd\n").unwrap();
+        assert_eq!(wire.sent.borrow().as_slice(), b"ab\r\ncd\r\n");
+    }
+
+    /// A caller that writes its own `\r\n` -- and several do -- gets `\r\r\n`
+    /// on the wire, because the translation looks only at the `\n`. A terminal
+    /// ignores the repeat, so this records the behaviour rather than calling it
+    /// a bug: the fix (skip the `\r` when one precedes) risks the opposite
+    /// fault, a line that never gets its carriage return.
+    #[test]
+    fn a_caller_written_carriage_return_is_not_swallowed_and_not_merged() {
+        let wire = Wire::new(READY);
+        uart(&wire).write_str("ab\r\n").unwrap();
+        assert_eq!(wire.sent.borrow().as_slice(), b"ab\r\r\n");
+    }
+
+    /// Bytes outside ASCII are passed through unchanged: these lines carry
+    /// UTF-8, and a port that mangled the high bit would garble every em dash
+    /// in the log.
+    #[test]
+    fn a_multibyte_character_goes_out_byte_for_byte() {
+        let wire = Wire::new(READY);
+        uart(&wire).write_str("a\u{2014}b").unwrap();
+        assert_eq!(
+            wire.sent.borrow().as_slice(),
+            "a\u{2014}b".as_bytes(),
+            "the port must not touch the bytes it is given"
+        );
+    }
+
+    // --- try_recv ---------------------------------------------------------
+
+    #[test]
+    fn nothing_is_received_while_the_receive_register_is_empty() {
+        let wire = Wire::new(READY);
+        assert_eq!(uart(&wire).try_recv().unwrap(), None);
+    }
+
+    #[test]
+    fn a_waiting_byte_is_received_once() {
+        let wire = Wire::new(READY | HAS_INPUT);
+        wire.pending.set(Some(b'q'));
+        let mut uart = uart(&wire);
+        assert_eq!(uart.try_recv().unwrap(), Some(b'q'));
+        // The status bit is what says whether there is more, so the driver
+        // asks it again rather than assuming.
+        wire.line_sts.set(READY);
+        assert_eq!(uart.try_recv().unwrap(), None);
+    }
+
+    /// The driver must not touch the data register while the status says there
+    /// is nothing there: on a real 16550 that read is not free of consequence.
+    #[test]
+    fn the_receive_register_is_not_read_until_the_status_says_to() {
+        let wire = Wire::new(READY);
+        wire.pending.set(Some(b'x'));
+        assert_eq!(uart(&wire).try_recv().unwrap(), None);
+        assert_eq!(
+            wire.pending.get(),
+            Some(b'x'),
+            "the data register was read with INPUT_FULL clear"
+        );
+    }
+}
