@@ -879,22 +879,61 @@ mod spin_discipline_tests {
     static PUMPS: AtomicU32 = AtomicU32::new(0);
     static REPORTS: AtomicU32 = AtomicU32::new(0);
 
+    std::thread_local! {
+        /// Set on the thread that armed the hooks, and on no other.
+        static COUNTING: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+    }
+
+    /// The hooks are process-wide, so once armed they fire for **every**
+    /// spinner in the process, not only for the [`SpinDiscipline`] these tests
+    /// drive by hand. The shared hook lock stops another test from *arming*
+    /// them underneath us; it cannot stop one from *spinning*, and several
+    /// tests in `tests.rs` put two real threads on one lock and let them
+    /// contend — past 512 turns each of those calls this pump, and past the
+    /// threshold each calls this reporter.
+    ///
+    /// The counts below then read one too many and the test fails naming the
+    /// cadence, which is the one thing that was not wrong. So each counter
+    /// takes only the turns of the waiter it was armed for. CI runs the suite
+    /// with `--test-threads=1` and never had the overlap to notice.
+    #[inline]
+    fn mine() -> bool {
+        COUNTING.with(|c| c.get())
+    }
+
     fn count_pump() {
-        PUMPS.fetch_add(1, Ordering::SeqCst);
+        if mine() {
+            PUMPS.fetch_add(1, Ordering::SeqCst);
+        }
     }
 
     fn count_report(_file: &'static str, _line: u32) {
-        REPORTS.fetch_add(1, Ordering::SeqCst);
+        if mine() {
+            REPORTS.fetch_add(1, Ordering::SeqCst);
+        }
     }
 
-    fn armed(threshold: u64) -> std::sync::MutexGuard<'static, ()> {
+    /// Held for as long as the hooks are armed. Dropping it stops counting and
+    /// puts the threshold back, so a test that fails an assertion does not
+    /// leave the rest of the suite spinning into a threshold it never set.
+    struct Armed(#[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
+
+    impl Drop for Armed {
+        fn drop(&mut self) {
+            COUNTING.with(|c| c.set(false));
+            crate::deadlock::set_deadlock_spins(0);
+        }
+    }
+
+    fn armed(threshold: u64) -> Armed {
         let guard = hook_lock();
         PUMPS.store(0, Ordering::SeqCst);
         REPORTS.store(0, Ordering::SeqCst);
+        COUNTING.with(|c| c.set(true));
         crate::deadlock::set_spin_pump(count_pump);
         crate::deadlock::set_deadlock_hook(count_report);
         crate::deadlock::set_deadlock_spins(threshold);
-        guard
+        Armed(guard)
     }
 
     fn here() -> &'static core::panic::Location<'static> {
@@ -920,7 +959,6 @@ mod spin_discipline_tests {
             spin.spin();
         }
         assert_eq!(PUMPS.load(Ordering::SeqCst), 2);
-        crate::deadlock::set_deadlock_spins(0);
     }
 
     #[test]
@@ -942,6 +980,5 @@ mod spin_discipline_tests {
         // …and it never stops waiting: a lock that is merely very contended
         // must still be acquired once it frees up.
         assert!(PUMPS.load(Ordering::SeqCst) > 1);
-        crate::deadlock::set_deadlock_spins(0);
     }
 }
