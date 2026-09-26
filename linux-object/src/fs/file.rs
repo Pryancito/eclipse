@@ -1078,6 +1078,17 @@ impl FileLike for File {
             .unwrap_or(false)
     }
 
+    /// `FIONREAD` on a regular file: what is left between the position and
+    /// the end (`file_ioctl`, fs/ioctl.c: `i_size_read(inode) - filp->f_pos`).
+    /// It fell through to the inode's `io_control`, which knows no ioctl, so
+    /// the answer was ENOTTY: bash's `read -t 0` (`input_avail`), which asks
+    /// this first, took a redirected file for a terminal with nothing typed.
+    fn readable_bytes(&self) -> Option<usize> {
+        let inner = self.inner.read();
+        let metadata = inner.inode.metadata().ok()?;
+        regular_file_readable_bytes(metadata.type_, metadata.size, inner.offset)
+    }
+
     fn is_terminal(&self) -> bool {
         use super::devfs::UartDev;
         use super::stdio::{CurrentVtTty, Stdin, Stdout};
@@ -1216,6 +1227,73 @@ impl FileLike for File {
         );
         drop(inner);
         self.get_vmo(offset, len).map(|vmo| (vmo, 0))
+    }
+}
+
+/// The `FIONREAD` answer of a `File` over an inode of `type_`: bytes from
+/// `offset` to `size` for a regular file (a position past the end is 0,
+/// not a wrap), and `None`, which hands the request to the inode's own
+/// `ioctl`, for anything else (a directory is ENOTTY; a device answers for
+/// itself).
+fn regular_file_readable_bytes(type_: FileType, size: usize, offset: u64) -> Option<usize> {
+    match type_ {
+        FileType::File => Some((size as u64).saturating_sub(offset) as usize),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod fionread_tests {
+    //! `FIONREAD` on a regular file, which was ENOTTY.
+
+    use super::*;
+    use rcore_fs::vfs::FileSystem;
+    use rcore_fs_ramfs::RamFS;
+
+    /// A regular file answers with what is left; anything else does not
+    /// answer, so its own `ioctl` decides.
+    #[test]
+    fn a_regular_file_reports_what_is_left_after_the_position() {
+        assert_eq!(regular_file_readable_bytes(FileType::File, 10, 0), Some(10));
+        assert_eq!(regular_file_readable_bytes(FileType::File, 10, 4), Some(6));
+        assert_eq!(regular_file_readable_bytes(FileType::File, 10, 10), Some(0));
+        assert_eq!(
+            regular_file_readable_bytes(FileType::File, 10, 11),
+            Some(0),
+            "past the end"
+        );
+        assert_eq!(regular_file_readable_bytes(FileType::File, 0, 0), Some(0));
+        for other in [
+            FileType::Dir,
+            FileType::CharDevice,
+            FileType::BlockDevice,
+            FileType::SymLink,
+        ] {
+            assert_eq!(
+                regular_file_readable_bytes(other, 10, 0),
+                None,
+                "{:?}",
+                other
+            );
+        }
+    }
+
+    /// Through the `File` itself, over a ramfs: the position `lseek` set is
+    /// the one the answer counts from.
+    #[test]
+    fn the_file_counts_from_its_own_position() {
+        let fs = RamFS::new();
+        let root = fs.root_inode();
+        let inode = root.create("f", FileType::File, 0o644).unwrap();
+        inode.write_at(0, &[7u8; 10]).unwrap();
+        let file = File::new(inode, OpenFlags::RDWR, String::from("/f"));
+        assert_eq!(FileLike::readable_bytes(&*file), Some(10));
+        file.seek(SeekFrom::Start(4)).unwrap();
+        assert_eq!(FileLike::readable_bytes(&*file), Some(6));
+        file.seek(SeekFrom::Start(40)).unwrap();
+        assert_eq!(FileLike::readable_bytes(&*file), Some(0));
+        let dir = File::new(root, OpenFlags::RDONLY, String::from("/"));
+        assert_eq!(FileLike::readable_bytes(&*dir), None);
     }
 }
 
