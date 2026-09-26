@@ -40,6 +40,7 @@
 
 use core::sync::atomic::Ordering;
 
+use crate::common::guard_band::{self, BandRefusal, Take};
 use crate::fault_slots::SlotTable;
 use crate::mem::PhysFrame;
 use crate::phys_watch::{FramePool, FrameSet, FreedRing};
@@ -327,7 +328,7 @@ pub fn split_pool_stats() -> (usize, usize, usize) {
 /// the huge entries that cover it. Idempotent, and never rolled back: a split
 /// leaves the mapping describing exactly the same memory, so a band that is
 /// refused afterwards costs nothing but the frames.
-fn ensure_4k(pt: &mut PageTable, base: usize, size: usize) -> Result<(), &'static str> {
+fn ensure_4k(pt: &mut PageTable, base: usize, size: usize) -> Result<(), BandRefusal> {
     let _guard = SPLIT_LOCK.lock();
     let mut split_any = false;
     for off in (0..size).step_by(PAGE_SIZE) {
@@ -337,10 +338,10 @@ fn ensure_4k(pt: &mut PageTable, base: usize, size: usize) -> Result<(), &'stati
             // Anything bigger: split it, and the rest of the pages it covered
             // come back as 4 KiB on their own turn through this loop.
             Ok(_) => {}
-            Err(_) => return Err("band is not mapped"),
+            Err(_) => return Err(BandRefusal::NotMapped),
         }
         if pt.split_huge_page(vaddr, split_pool_take).is_err() {
-            return Err("no reserved frames left to split the band's huge mapping");
+            return Err(BandRefusal::NoSplitFrames);
         }
         split_any = true;
     }
@@ -381,23 +382,6 @@ pub fn stats() -> (usize, usize) {
     GUARDS.stats()
 }
 
-/// Write `flags` into every page of the band, reporting the first failure.
-fn set_band_flags(pt: &mut PageTable, base: usize, size: usize, flags: MMUFlags) -> Result<(), ()> {
-    for off in (0..size).step_by(PAGE_SIZE) {
-        // `update_no_shootdown` because a synchronous shootdown per page would
-        // be O(pages x ack-wait) on a path that runs on every executor
-        // creation; the caller issues one remote flush for the whole band. The
-        // *local* TLB is still invalidated per page by `update_no_shootdown`.
-        if pt
-            .update_no_shootdown(base + off, None, Some(flags))
-            .is_err()
-        {
-            return Err(());
-        }
-    }
-    Ok(())
-}
-
 /// Make `[guard_base, guard_base + guard_size)` fault on any access.
 ///
 /// Returns `false` — having left the mapping exactly as it found it — if the
@@ -405,7 +389,7 @@ fn set_band_flags(pt: &mut PageTable, base: usize, size: usize, flags: MMUFlags)
 /// registry is full, or if the result does not verify. The scheduler then keeps
 /// its soft canary.
 fn install(guard_base: usize, guard_size: usize) -> bool {
-    let refuse = |reason: &str| {
+    let refuse = |reason: BandRefusal| {
         let n = GUARDS.note_refused();
         // Logged only the first few times. This runs inside `Executor::new`,
         // which the scheduler calls with the runtime lock held and interrupts
@@ -416,17 +400,16 @@ fn install(guard_base: usize, guard_size: usize) -> bool {
         // [`stats`] keeps the running count.
         if n < 4 {
             warn!(
-                "stack_guard: refusing hard guard at {:#x}+{:#x} ({})",
-                guard_base, guard_size, reason
+                "stack_guard: refusing hard guard at {:#x}+{:#x} (band {})",
+                guard_base,
+                guard_size,
+                reason.reason(Take::Everything)
             );
         }
         false
     };
-    if guard_size == 0
-        || !guard_base.is_multiple_of(PAGE_SIZE)
-        || !guard_size.is_multiple_of(PAGE_SIZE)
-    {
-        return refuse("band is not page aligned");
+    if let Err(reason) = guard_band::check_alignment(guard_base, guard_size) {
+        return refuse(reason);
     }
 
     // The kernel half is shared by every address space (`pt_clone_kernel_space`
@@ -446,72 +429,40 @@ fn install(guard_base: usize, guard_size: usize) -> bool {
         return refuse(reason);
     }
 
-    // Survey first, touch nothing: every page must be an ordinary 4 KiB
-    // mapping, and all of them must agree on their flags so `remove` can
+    // Survey first, touch nothing: alignment, then every page an ordinary
+    // 4 KiB mapping and all of them agreeing on their flags, so `remove` can
     // restore the band from a single recorded value.
-    let expect = match pt.query(guard_base) {
-        Ok((_, flags, crate::vm::PageSize::Size4K)) => flags,
-        Ok((_, _, size)) => {
-            return refuse(match size {
-                crate::vm::PageSize::Size2M => "band is covered by a 2 MiB PTE",
-                _ => "band is covered by a 1 GiB PTE",
-            })
-        }
-        Err(_) => return refuse("band is not mapped"),
+    let expect = match guard_band::survey(&pt, guard_base, guard_size, Take::Everything) {
+        Ok(flags) => flags,
+        Err(reason) => return refuse(reason),
     };
-    if expect.is_empty() {
-        return refuse("band already has no permissions (double install?)");
-    }
-    for off in (0..guard_size).step_by(PAGE_SIZE) {
-        match pt.query(guard_base + off) {
-            // A page whose frame is physical 0 is refused, and not because it
-            // could not be guarded: clearing the flags of such an entry leaves
-            // it all-zero, which `is_unused()` reads as "no mapping here" — and
-            // `update` refuses to touch an unused entry, so `remove` could
-            // never put it back. No `.bss` page is ever backed by frame 0, so
-            // this only ever fires on something already wrong.
-            Ok((paddr, flags, crate::vm::PageSize::Size4K))
-                if flags == expect && paddr & !(PAGE_SIZE - 1) != 0 => {}
-            _ => return refuse("band is not a uniform run of mapped 4 KiB pages"),
-        }
-    }
 
     // Publish before editing: a fault inside the band from here on is a guard
     // hit and should be reported as one.
     let Some(slot) = GUARDS.claim(guard_base, guard_size, expect.bits()) else {
-        return refuse("guard registry is full");
+        return refuse(BandRefusal::RegistryFull);
     };
 
     let rollback = |pt: &mut PageTable| {
         // Best effort by construction: every entry still holds its own frame,
         // so restoring is one flag write per page and cannot fail for any
         // reason the survey above did not already rule out.
-        let _ = set_band_flags(pt, guard_base, guard_size, expect);
+        let _ = guard_band::set_band_flags(pt, guard_base, guard_size, expect);
         crate::vm::flush_tlb(None);
         crate::common::ipi::remote_flush_tlb_aspace(None, None);
     };
 
-    if set_band_flags(&mut pt, guard_base, guard_size, MMUFlags::empty()).is_err() {
+    let taken = Take::Everything.applied_to(expect);
+    if guard_band::set_band_flags(&mut pt, guard_base, guard_size, taken).is_err() {
         rollback(&mut pt);
         GUARDS.free(slot);
-        return refuse("clearing the band's permissions failed");
+        return refuse(BandRefusal::EditFailed);
     }
 
-    // Verify rather than trust. The "empty flags means no present bit" property
-    // is a per-architecture detail of `From<MMUFlags>`; reading it back is what
-    // turns that into something this module knows rather than assumes. A
-    // mismatch rolls back, so an architecture where it does not hold degrades
-    // to the soft canary instead of shipping a guard band that does not guard.
-    for off in (0..guard_size).step_by(PAGE_SIZE) {
-        let gone = match pt.query(guard_base + off) {
-            Ok((_, flags, _)) => flags.is_empty(),
-            Err(_) => true,
-        };
-        if !gone {
-            rollback(&mut pt);
-            GUARDS.free(slot);
-            return refuse("band still readable after clearing its permissions");
-        }
+    if !guard_band::took_effect(&pt, guard_base, guard_size, Take::Everything) {
+        rollback(&mut pt);
+        GUARDS.free(slot);
+        return refuse(BandRefusal::NoEffect);
     }
 
     // One flush for the whole band. Other CPUs may hold TLB entries from the
@@ -557,7 +508,7 @@ fn remove(guard_base: usize, guard_size: usize) {
     };
     let flags = MMUFlags::from_bits_truncate(bits);
     let mut pt = PageTable::from_current();
-    if set_band_flags(&mut pt, guard_base, guard_size, flags).is_err() {
+    if guard_band::set_band_flags(&mut pt, guard_base, guard_size, flags).is_err() {
         panic!(
             "stack_guard: could not restore guard band {:#x}+{:#x} — refusing to \
              return unmapped memory to the heap",
@@ -615,7 +566,7 @@ static QUARANTINE: SlotTable<MAX_QUAR> = SlotTable::new();
 /// of writable 4 KiB pages or the registry is full; the scheduler then frees the
 /// stack the ordinary way. Same all-or-nothing contract as [`install`].
 pub fn quarantine_protect(usable_base: usize, size: usize) -> bool {
-    let refuse = |reason: &str| {
+    let refuse = |reason: BandRefusal| {
         let n = QUARANTINE.note_refused();
         // Same rate limit, and for the same reason, as `install`'s: this runs
         // on every executor teardown and a permanent condition would otherwise
@@ -623,14 +574,16 @@ pub fn quarantine_protect(usable_base: usize, size: usize) -> bool {
         // "armed and never hit" from "never armed".
         if n < 4 {
             warn!(
-                "stack_guard: refusing to quarantine {:#x}+{:#x} ({})",
-                usable_base, size, reason
+                "stack_guard: refusing to quarantine {:#x}+{:#x} (region {})",
+                usable_base,
+                size,
+                reason.reason(Take::WriteOnly)
             );
         }
         false
     };
-    if size == 0 || !usable_base.is_multiple_of(PAGE_SIZE) || !size.is_multiple_of(PAGE_SIZE) {
-        return refuse("region is not page aligned");
+    if let Err(reason) = guard_band::check_alignment(usable_base, size) {
+        return refuse(reason);
     }
     let mut pt = PageTable::from_current();
     // Split the covering huge entries first, exactly as `install` does. Without
@@ -642,57 +595,30 @@ pub fn quarantine_protect(usable_base: usize, size: usize) -> bool {
     if let Err(reason) = ensure_4k(&mut pt, usable_base, size) {
         return refuse(reason);
     }
-    let expect = match pt.query(usable_base) {
-        Ok((_, flags, crate::vm::PageSize::Size4K)) => flags,
-        Ok((_, _, _)) => return refuse("region is covered by a huge PTE"),
-        Err(_) => return refuse("region is not mapped"),
+    let expect = match guard_band::survey(&pt, usable_base, size, Take::WriteOnly) {
+        Ok(flags) => flags,
+        Err(reason) => return refuse(reason),
     };
-    // An empty flag set cannot contain WRITE, so this one test is the whole
-    // check; it used to be written twice, and neither copy could then be shown
-    // to do anything.
-    if !expect.contains(MMUFlags::WRITE) {
-        return refuse("region is already not writable");
-    }
-    for off in (0..size).step_by(PAGE_SIZE) {
-        match pt.query(usable_base + off) {
-            Ok((paddr, flags, crate::vm::PageSize::Size4K))
-                if flags == expect && paddr & !(PAGE_SIZE - 1) != 0 => {}
-            _ => return refuse("region is not a uniform run of mapped 4 KiB pages"),
-        }
-    }
     let Some(slot) = QUARANTINE.claim(usable_base, size, expect.bits()) else {
-        return refuse("quarantine registry is full");
+        return refuse(BandRefusal::RegistryFull);
     };
     let rollback = |pt: &mut PageTable| {
-        let _ = set_band_flags(pt, usable_base, size, expect);
+        let _ = guard_band::set_band_flags(pt, usable_base, size, expect);
         crate::vm::flush_tlb(None);
         crate::common::ipi::remote_flush_tlb_aspace(None, None);
     };
     // Present + readable, minus WRITE: a stale read stays silent, a stale write
     // faults with the WRITE error bit set.
-    let readonly = MMUFlags::from_bits_truncate(expect.bits() & !MMUFlags::WRITE.bits());
-    if set_band_flags(&mut pt, usable_base, size, readonly).is_err() {
+    let readonly = Take::WriteOnly.applied_to(expect);
+    if guard_band::set_band_flags(&mut pt, usable_base, size, readonly).is_err() {
         rollback(&mut pt);
         QUARANTINE.free(slot);
-        return refuse("clearing the region's write permission failed");
+        return refuse(BandRefusal::EditFailed);
     }
-    // Verify rather than trust, as `install` does. "Clearing the WRITE bit
-    // leaves the page readable and not writable" is a per-architecture detail
-    // of `From<MMUFlags>`; reading it back is what turns it into something this
-    // module knows. Without it a quarantine that protected nothing still
-    // returned `true` and still counted, so the diagnostic said the stacks were
-    // watched while every stale write went through untouched — the failure this
-    // whole path exists to catch, reported as a success.
-    for off in (0..size).step_by(PAGE_SIZE) {
-        let still_writable = match pt.query(usable_base + off) {
-            Ok((_, flags, _)) => flags.contains(MMUFlags::WRITE),
-            Err(_) => true,
-        };
-        if still_writable {
-            rollback(&mut pt);
-            QUARANTINE.free(slot);
-            return refuse("region still writable after clearing its write permission");
-        }
+    if !guard_band::took_effect(&pt, usable_base, size, Take::WriteOnly) {
+        rollback(&mut pt);
+        QUARANTINE.free(slot);
+        return refuse(BandRefusal::NoEffect);
     }
     crate::vm::flush_tlb(None);
     crate::common::ipi::remote_flush_tlb_aspace(None, None);
@@ -713,7 +639,7 @@ pub fn quarantine_unprotect(usable_base: usize, size: usize) {
     };
     let flags = MMUFlags::from_bits_truncate(bits);
     let mut pt = PageTable::from_current();
-    if set_band_flags(&mut pt, usable_base, size, flags).is_err() {
+    if guard_band::set_band_flags(&mut pt, usable_base, size, flags).is_err() {
         panic!(
             "stack_guard: could not un-protect quarantined stack {:#x}+{:#x} — \
              refusing to return write-protected memory to the heap",

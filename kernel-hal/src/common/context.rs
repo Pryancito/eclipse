@@ -236,7 +236,31 @@ impl TrapReason {
         };
         match Kind::from_num((trap_num >> 16) & 0xffff) {
             Some(Kind::Synchronous) => match Syndrome::from(esr) {
-                Syndrome::Breakpoint => Self::SoftwareBreakpoint,
+                // `brk #imm` is the software breakpoint on this architecture:
+                // what a debugger plants, what `__builtin_trap()` and
+                // `abort()` compile to. It used to fall through to
+                // `GernelFault` -- SIGTRAP became SIGSEGV for user code, and
+                // a `brk` the kernel took reached `sync_handler`'s catch-all,
+                // which reports and returns *without advancing ELR*, so the
+                // same instruction re-executed for ever.
+                //
+                // What did answer `SoftwareBreakpoint` was EC 0b11000x, the
+                // hardware breakpoint armed through the debug registers.
+                // That one is x86's #DB, not its int3, and `TrapReason` has
+                // had a name for it all along: `from_x86` maps
+                // `DEBUG_VECTOR` to `HardwareBreakpoint` and
+                // `BREAKPOINT_VECTOR` to `SoftwareBreakpoint`.
+                Syndrome::Brk(_) => Self::SoftwareBreakpoint,
+                Syndrome::Breakpoint | Syndrome::Step | Syndrome::Watchpoint => {
+                    Self::HardwareBreakpoint
+                }
+                // EC 0b000000 ("unknown reason") is what an unallocated
+                // instruction raises, and 0b001110 an illegal execution
+                // state. Both are SIGILL on the other two architectures
+                // (`INVALID_OPCODE_VECTOR` on x86_64, `ILLEGAL_INSTRUCTION`
+                // on riscv64) and were a generic kernel fault here, which
+                // `cpu_fault_signal` turns into SIGSEGV.
+                Syndrome::Unknown | Syndrome::IllegalExecutionState => Self::UndefinedInstruction,
                 Syndrome::Svc(_) => Self::Syscall,
                 // It used to ask for READ | WRITE on every data abort, which
                 // no read-only mapping can satisfy: reading a page mapped
@@ -733,8 +757,22 @@ mod tests {
     const EC_INSN_ABORT_LOWER: u32 = 0b10_0000;
     /// EC 0b010101: `SVC` from AArch64.
     const EC_SVC64: u32 = 0b01_0101;
-    /// EC 0b110000: breakpoint from a lower exception level.
+    /// EC 0b110000: hardware breakpoint from a lower exception level, armed
+    /// through the debug registers. This is x86's #DB, not its int3.
     const EC_BREAKPOINT: u32 = 0b11_0000;
+    /// EC 0b110001: the same, taken at the current exception level.
+    const EC_BREAKPOINT_CURRENT: u32 = 0b11_0001;
+    /// EC 0b110010: software step from a lower exception level.
+    const EC_SOFTWARE_STEP: u32 = 0b11_0010;
+    /// EC 0b110100: watchpoint from a lower exception level.
+    const EC_WATCHPOINT: u32 = 0b11_0100;
+    /// EC 0b111100: the `brk #imm16` instruction -- aarch64's int3.
+    const EC_BRK: u32 = 0b11_1100;
+    /// EC 0b000000: "unknown reason", which is what an unallocated
+    /// instruction raises.
+    const EC_UNKNOWN: u32 = 0b00_0000;
+    /// EC 0b001110: illegal execution state.
+    const EC_ILLEGAL_STATE: u32 = 0b00_1110;
     /// EC 0b100010: PC alignment fault.
     const EC_PC_ALIGNMENT: u32 = 0b10_0010;
     /// EC 0b100110: SP alignment fault.
@@ -865,7 +903,8 @@ mod tests {
     #[test]
     fn breakpoints_and_alignment_faults_keep_their_names() {
         let cases = [
-            (EC_BREAKPOINT, TrapReason::SoftwareBreakpoint),
+            (EC_BRK, TrapReason::SoftwareBreakpoint),
+            (EC_BREAKPOINT, TrapReason::HardwareBreakpoint),
             (EC_PC_ALIGNMENT, TrapReason::UnalignedAccess),
             (EC_SP_ALIGNMENT, TrapReason::UnalignedAccess),
         ];
@@ -876,6 +915,78 @@ mod tests {
                 "EC {ec:#08b}"
             );
         }
+    }
+
+    #[test]
+    fn a_brk_instruction_is_the_software_breakpoint_and_not_a_kernel_fault() {
+        // `brk` is aarch64's int3. Reported as `GernelFault` it became
+        // SIGSEGV instead of SIGTRAP for a debugged process, `General`
+        // instead of `SoftwareBreakpoint` for a Zircon exception channel --
+        // so no debugger could claim it -- and, in the kernel, a report that
+        // does not advance ELR, i.e. the same `brk` for ever.
+        for imm in [0u32, 1, 0xf000, 0xffff] {
+            assert_eq!(
+                TrapReason::from_aarch64(
+                    from_el0(Kind::Synchronous),
+                    esr(EC_BRK, imm),
+                    FAR,
+                    no_irq
+                ),
+                TrapReason::SoftwareBreakpoint,
+                "brk #{imm:#x}"
+            );
+        }
+        // ...and the same instruction executed by the kernel itself.
+        assert_eq!(
+            TrapReason::from_aarch64(
+                vector(Source::CurrentSpElx, Kind::Synchronous),
+                esr(EC_BRK, 1),
+                FAR,
+                no_irq
+            ),
+            TrapReason::SoftwareBreakpoint
+        );
+    }
+
+    #[test]
+    fn the_debug_exceptions_are_the_hardware_breakpoint() {
+        // Everything the debug registers arm. `from_x86` has always told
+        // #DB from int3; this told neither, and answered "software
+        // breakpoint" for the one exception `brk` never raises.
+        for ec in [
+            EC_BREAKPOINT,
+            EC_BREAKPOINT_CURRENT,
+            EC_SOFTWARE_STEP,
+            EC_WATCHPOINT,
+        ] {
+            assert_eq!(
+                TrapReason::from_aarch64(from_el0(Kind::Synchronous), esr(ec, 0), FAR, no_irq),
+                TrapReason::HardwareBreakpoint,
+                "EC {ec:#08b}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unallocated_instruction_is_an_undefined_instruction() {
+        // EC 0 is what an instruction the CPU does not know raises, and it
+        // is SIGILL on the other two architectures. As a `GernelFault` it
+        // was SIGSEGV, which says the program touched memory it may not --
+        // and sends whoever reads the log looking for a pointer.
+        let faulty = esr(EC_UNKNOWN, 0);
+        assert_eq!(
+            TrapReason::from_aarch64(from_el0(Kind::Synchronous), faulty, FAR, no_irq),
+            TrapReason::UndefinedInstruction
+        );
+        assert_eq!(
+            TrapReason::from_aarch64(
+                from_el0(Kind::Synchronous),
+                esr(EC_ILLEGAL_STATE, 0),
+                FAR,
+                no_irq
+            ),
+            TrapReason::UndefinedInstruction
+        );
     }
 
     #[test]
