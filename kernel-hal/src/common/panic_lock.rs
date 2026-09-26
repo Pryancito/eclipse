@@ -181,6 +181,27 @@ mod tests {
     const ME: u32 = 3;
     const OTHER: u32 = 5;
 
+    /// A `pause` that refuses to be called more than `cap` times, for the tests
+    /// that do not care how long the wait was, only that it ended.
+    ///
+    /// **Every** test here passes one of these two helpers and never a closure
+    /// with an empty body: a `pause` that does nothing cannot tell a wait that
+    /// ends from a wait that does not, so a mutation that removes the end of the
+    /// loop turns into a spinning test binary instead of a named failure -- and
+    /// `timeout` kills cargo without killing that binary.
+    fn at_most(cap: u32) -> impl FnMut() {
+        let mut n = 0u32;
+        move || {
+            n += 1;
+            assert!(
+                n <= cap,
+                "spun {} times with a cap of {}: this wait does not end",
+                n,
+                cap
+            );
+        }
+    }
+
     /// A `pause` that counts, and that refuses to wait past `cap`.
     ///
     /// The cap is not decoration. Every interesting way of getting this rule
@@ -329,7 +350,7 @@ mod tests {
     fn a_nested_panic_write_does_not_free_the_lock_the_outer_write_holds() {
         let l = ConsoleLock::new();
         let outer = l.try_acquire(ME).unwrap();
-        let inner = l.acquire_for_panic(ME, 10, || {});
+        let inner = l.acquire_for_panic(ME, 10, at_most(0));
         l.release(inner);
         assert_eq!(l.owner(), ME, "the nested write gave away the outer ticket");
         l.release(outer);
@@ -371,19 +392,19 @@ mod tests {
     fn taking_a_lock_away_is_counted_so_it_can_be_reported() {
         let l = ConsoleLock::new();
         l.try_acquire(OTHER).unwrap();
-        l.acquire_for_panic(ME, 0, || {});
+        l.acquire_for_panic(ME, 0, at_most(0));
         l.release(Acquired::Stolen);
         l.try_acquire(OTHER).unwrap();
-        l.acquire_for_panic(ME, 0, || {});
+        l.acquire_for_panic(ME, 0, at_most(0));
         assert_eq!(l.steals(), 2);
     }
 
     #[test]
     fn an_ordinary_write_is_never_counted_as_a_steal() {
         let l = ConsoleLock::new();
-        let how = l.acquire_for_panic(ME, 10, || {});
+        let how = l.acquire_for_panic(ME, 10, at_most(0));
         l.release(how);
-        let how = l.acquire_for_panic(ME, 10, || {});
+        let how = l.acquire_for_panic(ME, 10, at_most(0));
         l.release(how);
         assert_eq!(l.steals(), 0);
     }
@@ -399,7 +420,7 @@ mod tests {
     fn a_stolen_lock_is_released_like_any_other() {
         let l = ConsoleLock::new();
         l.try_acquire(OTHER).unwrap();
-        let how = l.acquire_for_panic(ME, 0, || {});
+        let how = l.acquire_for_panic(ME, 0, at_most(0));
         l.release(how);
         assert_eq!(l.owner(), NOBODY);
     }
