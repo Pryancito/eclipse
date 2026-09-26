@@ -2091,29 +2091,28 @@ mod tests {
     }
 
     #[test]
-    fn vkill_clears_the_line_and_the_stock_terminal_echoes_a_newline() {
-        // The cooked default is ECHOK without ECHOKE, so Ctrl-U leaves the
-        // killed line on screen and starts a fresh one. This end used to rub
-        // the line out instead, which is ECHOKE's answer to a flag that is
-        // off — a shell that had not touched either flag looked like the
-        // characters were never typed.
+    fn vkill_rubs_the_line_out_on_the_stock_terminal() {
+        // `tty_std_termios` has ECHOK and ECHOKE both, and ECHOKE wins, so
+        // Ctrl-U on a terminal nobody reconfigured walks back over the line it
+        // threw away. The default here was missing ECHOKE, so this used to
+        // echo a bare newline and leave the killed line on screen.
         let p = pty();
         p.master_write(b"abcd");
         let _ = master_drain(&p);
         p.master_write(&[CTRL_U]);
-        assert_eq!(master_drain(&p), "\r\n");
+        assert_eq!(master_drain(&p), "\x08 \x08".repeat(4));
         p.master_write(b"\n");
         assert_eq!(slave_reads(&p), vec!["\n"]);
     }
 
     #[test]
-    fn vkill_rubs_the_line_out_when_the_program_asks_for_echoke() {
+    fn vkill_echoes_a_newline_when_the_program_asks_for_echok_alone() {
         let p = pty();
-        set_flags(&p, |t| t.c_lflag |= L_ECHOKE);
+        set_flags(&p, |t| t.c_lflag &= !L_ECHOKE);
         p.master_write(b"abcd");
         let _ = master_drain(&p);
         p.master_write(&[CTRL_U]);
-        assert_eq!(master_drain(&p), "\x08 \x08".repeat(4));
+        assert_eq!(master_drain(&p), "\r\n");
     }
 
     #[test]
@@ -2294,19 +2293,18 @@ mod tests {
         p.master_write(b"intacta");
         let _ = master_drain(&p);
         p.master_write(&[CTRL_R]);
-        // ECHOCTL is off in the default termios, so the "^R" marker is not
-        // drawn -- only the fresh line and the pending text.
-        assert_eq!(master_drain(&p), "\r\nintacta");
+        // ECHOCTL is in the cooked default, so the "^R" marker is drawn first.
+        assert_eq!(master_drain(&p), "^R\r\nintacta");
         p.master_write(b"\n");
         assert_eq!(slave_reads(&p), vec!["intacta\n"]);
 
-        // With ECHOCTL the marker is drawn first.
+        // Without ECHOCTL only the fresh line and the pending text.
         let p = pty();
-        set_flags(&p, |t| t.c_lflag |= ECHOCTL);
+        set_flags(&p, |t| t.c_lflag &= !ECHOCTL);
         p.master_write(b"intacta");
         let _ = master_drain(&p);
         p.master_write(&[CTRL_R]);
-        assert_eq!(master_drain(&p), "^R\r\nintacta");
+        assert_eq!(master_drain(&p), "\r\nintacta");
     }
 
     #[test]

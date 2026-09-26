@@ -134,10 +134,14 @@ impl Syscall<'_> {
         let proc = self.linux_process();
         let inode = proc.lookup_inode_at(dirfd, dir_path, true)?;
         let dir_metadata = inode.metadata()?;
-        proc.check_access(&dir_metadata, 0o3, true)?;
+        // The name is looked up BEFORE the parent's mode, as `filename_create`
+        // does it: Linux answers `EEXIST` from the lookup and only then asks
+        // `may_create` about the parent. See `sys_mkdirat`, where the reverse
+        // order cost a whole desktop its sound daemon.
         if inode.find(file_name).is_ok() {
             return Err(LxError::EEXIST);
         }
+        proc.check_access(&dir_metadata, 0o3, true)?;
         let create_mode = proc.apply_umask((mode & 0o7777) as u16);
         let rdev = if matches!(file_type, FileType::CharDevice | FileType::BlockDevice) {
             dev
@@ -237,14 +241,15 @@ impl Syscall<'_> {
         };
         let new_dir_inode = proc.lookup_inode_at(newdirfd, new_dir_path, true)?;
         let new_dir_metadata = new_dir_inode.metadata()?;
-        proc.check_access(&new_dir_metadata, 0o3, true)?;
         // `do_linkat`: the new name is looked up (`filename_create`, EEXIST)
-        // before `may_linkat` and `vfs_link` decide whether THIS file may be
-        // linked at all: a directory never, another user's file only when it
-        // is a safe source (`protected_hardlinks`). See `check_link`.
+        // before the parent's mode and before `may_linkat` and `vfs_link`
+        // decide whether THIS file may be linked at all: a directory never,
+        // another user's file only when it is a safe source
+        // (`protected_hardlinks`). See `check_link`.
         if new_dir_inode.find(new_file_name).is_ok() {
             return Err(LxError::EEXIST);
         }
+        proc.check_access(&new_dir_metadata, 0o3, true)?;
         proc.check_link(&inode.metadata()?)?;
         new_dir_inode.link(new_file_name, &inode)?;
         linux_object::fs::dcache_invalidate();
@@ -284,8 +289,14 @@ impl Syscall<'_> {
         };
         let dir_inode = proc.lookup_inode_at(dirfd, dir_path, true)?;
         let dir_metadata = dir_inode.metadata()?;
-        proc.check_access(&dir_metadata, 0o3, true)?;
+        // The name first, the parent's mode after: `do_unlinkat` resolves it
+        // with search permission alone and answers `ENOENT` from the lookup,
+        // and `may_delete`'s write check comes later. `rm -f dir/absent` in a
+        // directory the caller may not write said "Permission denied" where it
+        // has to say "No such file or directory", so every script with the
+        // usual "already gone, fine" branch on `ENOENT` took the error branch.
         let file_inode = dir_inode.find(file_name)?;
+        proc.check_access(&dir_metadata, 0o3, true)?;
         let file_metadata = file_inode.metadata()?;
         unlinkat_type_check(
             remove_dir,
@@ -348,9 +359,12 @@ impl Syscall<'_> {
         let new_dir_inode = proc.lookup_inode_at(newdirfd, new_dir_path, true)?;
         let old_dir_metadata = old_dir_inode.metadata()?;
         let new_dir_metadata = new_dir_inode.metadata()?;
+        // The source name first: `do_renameat2` resolves both sides before
+        // `may_delete`/`may_create` look at either parent, so a source that is
+        // not there is `ENOENT` and not `EACCES`.
+        let old_inode = old_dir_inode.find(old_file_name)?;
         proc.check_access(&old_dir_metadata, 0o3, true)?;
         proc.check_access(&new_dir_metadata, 0o3, true)?;
-        let old_inode = old_dir_inode.find(old_file_name)?;
         let old_metadata = old_inode.metadata()?;
         rename_slash_check(
             old_metadata.type_ == FileType::Dir,
@@ -493,10 +507,14 @@ impl Syscall<'_> {
         let proc = self.linux_process();
         let inode = proc.lookup_inode_at(newdirfd, dir_path, true)?;
         let dir_metadata = inode.metadata()?;
-        proc.check_access(&dir_metadata, 0o3, true)?;
+        // The name is looked up BEFORE the parent's mode, as `filename_create`
+        // does it: Linux answers `EEXIST` from the lookup and only then asks
+        // `may_create` about the parent. See `sys_mkdirat`, where the reverse
+        // order cost a whole desktop its sound daemon.
         if inode.find(file_name).is_ok() {
             return Err(LxError::EEXIST);
         }
+        proc.check_access(&dir_metadata, 0o3, true)?;
         let mode = proc.apply_umask(0o777);
         let symlink_inode = inode.create(file_name, FileType::SymLink, mode as u32)?;
         proc.initialize_created_metadata(&symlink_inode, Some(&dir_metadata), mode, false)?;

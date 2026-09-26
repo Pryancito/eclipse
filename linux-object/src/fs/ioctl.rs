@@ -52,10 +52,25 @@ impl Termios {
             c_iflag: 0x6500,
             // OPOST | ONLCR
             c_oflag: 0x0005,
-            // B38400 | CS8 | CREAD | HUPCL
-            c_cflag: 0x08bf,
-            // ISIG | ICANON | ECHO | ECHOE | ECHOK | IEXTEN
-            c_lflag: 0x803b,
+            // B38400 | CS8 | CREAD | HUPCL | CLOCAL.
+            //
+            // `tty_std_termios` is `B38400 | CS8 | CREAD | HUPCL`, and
+            // `uart_set_options` adds `CLOCAL` for a port that is a console.
+            // The value here used to be 0x08bf, which is that set with
+            // `CLOCAL` in place of `HUPCL` -- the comment said `HUPCL` and the
+            // number did not have it, so `stty -a` reported `-hupcl` where
+            // Linux reports `hupcl`, and nothing that keys off "hang up on the
+            // last close" ever saw it asked for.
+            c_cflag: 0x0cbf,
+            // ISIG | ICANON | ECHO | ECHOE | ECHOK | ECHOCTL | ECHOKE | IEXTEN,
+            // which is `tty_std_termios` exactly.
+            //
+            // It used to be 0x803b, that set without the last two, and both
+            // are implemented here and were simply never on: without `ECHOCTL`
+            // a control character is not echoed as `^C`, and without `ECHOKE`
+            // [`Termios::kill_echo`] answers `Newline`, so Ctrl-U left the
+            // killed line on screen instead of rubbing it out.
+            c_lflag: 0x8a3b,
             c_line: 0,
             // Matches Linux `INIT_C_CC` (include/linux/tty.h), one entry per
             // NCCS=19 control char: VINTR=^C, VQUIT=^\, VERASE=DEL, VKILL=^U,
@@ -362,9 +377,8 @@ impl Termios {
     /// `ECHO` gates all three: a program that turned echo off (a password
     /// prompt) may not have the line it is hiding painted back over the
     /// screen, even as rubouts. Past that, `ECHOKE` wins over `ECHOK` —
-    /// that is `n_tty`'s order in `eraser()`, and it matters because the
-    /// cooked default has `ECHOK` on and `ECHOKE` off, so the stock answer
-    /// is a newline and not a rubout.
+    /// that is `n_tty`'s order in `eraser()`, and both are on in the cooked
+    /// default, so the stock answer is a rubout.
     pub fn kill_echo(&self) -> KillEcho {
         if self.c_lflag & L_ECHO == 0 {
             return KillEcho::Nothing;
@@ -810,7 +824,13 @@ pub const TIOCSPTLCK: usize = 0x4004_5431;
 pub const TIOCGPTPEER: usize = 0x5441;
 
 /// Get keyboard LED state (Scroll/Num/Caps) into an `int`.
-pub const KDGETLED: usize = 0x4B11;
+///
+/// `0x4B31` (`linux/kd.h`, between `KDMKTONE` 0x4B30 and `KDSETLED` 0x4B32).
+/// It used to be `0x4B11`, which is no KD ioctl at all: `KDSETLED` worked and
+/// `KDGETLED` fell through to the catch-all, so the LED state was write-only
+/// and this constant's handler was dead code. `setleds`, `kbd` and X's VT
+/// probe all read it.
+pub const KDGETLED: usize = 0x4B31;
 /// Set keyboard LED state from an `int` (by value, not a pointer).
 pub const KDSETLED: usize = 0x4B32;
 /// Read one keymap entry into a [`KbEntry`].
@@ -1174,16 +1194,25 @@ mod termios_tests {
     }
 
     #[test]
-    fn the_stock_kill_character_echoes_a_newline_and_not_a_rubout() {
-        // ISIG | ICANON | ECHO | ECHOE | ECHOK | IEXTEN: ECHOK is on and
-        // ECHOKE is off, so Ctrl-U on a terminal nobody reconfigured leaves
-        // the killed line on screen and starts a fresh one.
-        assert_eq!(Termios::default_tty().kill_echo(), KillEcho::Newline);
+    fn the_stock_kill_character_rubs_the_line_out() {
+        // `tty_std_termios` has ECHOK *and* ECHOKE, and ECHOKE wins, so Ctrl-U
+        // on a terminal nobody reconfigured walks back over the line it threw
+        // away. The default used to be missing ECHOKE and ECHOCTL, so this
+        // answered `Newline` and the killed line stayed on screen.
+        assert_eq!(Termios::default_tty().kill_echo(), KillEcho::Rubout);
+        let t = Termios::default_tty();
+        assert!(t.c_lflag & L_ECHOKE != 0, "ECHOKE is in the cooked default");
+        assert_eq!(t.c_lflag & 0x0200, 0x0200, "and so is ECHOCTL");
+        // `HUPCL` and `CLOCAL` both, as a console port gets them.
+        assert_eq!(t.c_cflag & 0o2000, 0o2000, "HUPCL");
+        assert_eq!(t.c_cflag & 0o4000, 0o4000, "CLOCAL");
     }
 
     #[test]
     fn echoke_wins_over_echok_when_a_program_asks_for_both() {
         let mut t = Termios::default_tty();
+        t.c_lflag &= !L_ECHOKE;
+        assert_eq!(t.kill_echo(), KillEcho::Newline, "ECHOK alone is a newline");
         t.c_lflag |= L_ECHOKE;
         assert_eq!(t.kill_echo(), KillEcho::Rubout);
     }
