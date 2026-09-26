@@ -1330,15 +1330,20 @@ impl State {
 
         let surface = comp.create_surface(qh, ());
         let xdg = wm.get_xdg_surface(&surface, qh, ());
-        // Window geometry is the PANEL, shadow excluded, so the positioner
-        // places the panel and not the margin around it. Set again on every
-        // configure, because `reposition` changes the panel's size.
-        xdg.set_window_geometry(POPUP_SHADOW, POPUP_SHADOW, pw, ph);
         // Parent NULL: the layer surface adopts it on the next line, which is
         // what wlr-layer-shell requires before the popup's first commit.
         let popup = xdg.get_popup(None, &pos, qh, ());
         parent.get_popup(&popup);
         pos.destroy();
+        // Window geometry is the PANEL, shadow excluded, so the positioner
+        // places the panel and not the margin around it. Set again on every
+        // configure, because `reposition` changes the panel's size.
+        //
+        // AFTER `get_popup`, never before: `set_window_geometry` is a
+        // role-dependent request, and an xdg_surface with no role yet answers
+        // it with `xdg_surface.error.not_constructed` -- a fatal protocol
+        // error, so the panel died the first time a menu was opened.
+        xdg.set_window_geometry(POPUP_SHADOW, POPUP_SHADOW, pw, ph);
         // The grab is what makes this a menu: the compositor routes the
         // keyboard here and sends `popup_done` on a click outside, so neither
         // needs hand-rolling (and the rest of the desktop keeps its focus).
