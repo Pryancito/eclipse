@@ -802,10 +802,23 @@ impl Syscall<'_> {
             "inotify_add_watch: fd={}, path={:?}, mask={:#x}",
             fd, path, mask
         );
-        let file = self.linux_process().get_file_like(fd.into())?;
+        // `inotify_add_watch`, in its order: the mask, the fd, then the
+        // path (`inotify_find_inode`: `user_path_at` with `LOOKUP_FOLLOW`
+        // unless `IN_DONT_FOLLOW` and `LOOKUP_DIRECTORY` for `IN_ONLYDIR`,
+        // then `inode_permission(MAY_READ)`). The path was never looked up:
+        // `inotifywait /nonexistent` reported success and waited forever.
+        let lookup = linux_object::fs::inotify_watch_lookup(mask)?;
+        let proc = self.linux_process();
+        let file = proc.get_file_like(fd.into())?;
         let inotify = file
             .downcast_arc::<linux_object::fs::Inotify>()
             .map_err(|_| LxError::EINVAL)?;
+        let inode = proc.lookup_inode_at(FileDesc::CWD, path, lookup.follow)?;
+        let metadata = inode.metadata()?;
+        if lookup.only_dir && metadata.type_ != FileType::Dir {
+            return Err(LxError::ENOTDIR);
+        }
+        proc.check_access(&metadata, 0o4, true)?; // MAY_READ
         inotify.add_watch(path, mask)
     }
 

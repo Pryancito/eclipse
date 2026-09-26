@@ -163,7 +163,7 @@ pub fn drm_fd_desc(f: &alloc::sync::Arc<dyn FileLike>) -> Option<alloc::string::
 }
 pub use eventfd::EventFd;
 pub use file::{cache_truncate, fs_grow_error, File, OpenFlags, PollEvents, SeekFrom};
-pub use inotify::Inotify;
+pub use inotify::{inotify_watch_lookup, Inotify, WatchLookup};
 pub use perf::{sample_user as perf_sample_user, PerfEvent};
 pub use pidfd::{PidFd, PIDFD_THREAD};
 pub use pipe::{Pipe, PIPE_BUF, PIPE_DEFAULT_CAPACITY};
