@@ -1669,6 +1669,8 @@ impl Syscall<'_> {
         attr: UserInPtr<SchedAttr>,
         flags: usize,
     ) -> SysResult {
+        // `!uattr || pid < 0 || flags` is EINVAL, before the struct is read.
+        let pid = crate::intarg::sched_param_pid(pid, attr.is_null())?;
         if flags != 0 {
             return Err(LxError::EINVAL);
         }
@@ -1683,19 +1685,37 @@ impl Syscall<'_> {
             }
         }
         let a = attr.read()?;
-        let policy = (a.sched_policy & !(SCHED_RESET_ON_FORK as u32)) as usize;
+        let plan = sched_setattr_plan(a.sched_flags, a.sched_policy)?;
+        info!(
+            "sched_setattr: pid={} policy={:?} flags={:#x} nice={}",
+            pid, plan.policy, a.sched_flags, a.sched_nice
+        );
+        let thread = self.sched_target(pid)?;
+        // `SETPARAM_POLICY`: the thread's own policy stands in for the one
+        // in the struct. `SCHED_RESET_ON_FORK` in the policy word is
+        // accepted but not modelled, as in `sched_setscheduler`.
+        let policy = match plan.policy {
+            None => thread.sched_policy() as usize,
+            Some(p) => (p & !(SCHED_RESET_ON_FORK as u32)) as usize,
+        };
         if policy == SCHED_DEADLINE as usize || policy > u8::MAX as usize {
             return Err(LxError::EINVAL);
         }
-        info!(
-            "sched_setattr: pid={} policy={} nice={}",
-            pid, policy, a.sched_nice
-        );
-        let thread = self.sched_target(crate::intarg::sched_pid(pid)?)?;
-        let (p, rt, nice) =
-            Self::sched_validate(policy as u8, a.sched_priority as i32, a.sched_nice)?;
+        // `get_params`: with KEEP_PARAMS the thread's own priority and nice
+        // are what gets validated and permission-checked, not the caller's.
+        let (priority, nice) = if plan.keep_params {
+            (
+                thread.sched_rt_priority() as i32,
+                thread.sched_nice() as i32,
+            )
+        } else {
+            (a.sched_priority as i32, a.sched_nice)
+        };
+        let (p, rt, nice) = Self::sched_validate(policy as u8, priority, nice)?;
         self.check_sched_permission(&thread, p, nice, rt)?;
-        thread.set_sched(p, nice, rt);
+        if !plan.keep_params {
+            thread.set_sched(p, nice, rt);
+        }
         Ok(0)
     }
 
@@ -1710,11 +1730,13 @@ impl Syscall<'_> {
         size: usize,
         flags: usize,
     ) -> SysResult {
+        // `!uattr || pid < 0 || usize out of range || flags` is EINVAL.
+        let pid = crate::intarg::sched_param_pid(pid, attr.is_null())?;
         if flags != 0 {
             return Err(LxError::EINVAL);
         }
         sched_getattr_size(size)?;
-        let thread = self.sched_target(crate::intarg::sched_pid(pid)?)?;
+        let thread = self.sched_target(pid)?;
         let a = SchedAttr {
             size: SCHED_ATTR_SIZE_VER0 as u32,
             sched_policy: thread.sched_policy() as u32,
@@ -2373,6 +2395,63 @@ pub(crate) fn sched_setattr_size(size: u32) -> LxResult<usize> {
         return Err(LxError::E2BIG);
     }
     Ok(size)
+}
+
+/// `SCHED_FLAG_RESET_ON_FORK`: the fork-reset bit as `sched_attr` carries it.
+pub(crate) const SCHED_FLAG_RESET_ON_FORK: u64 = 0x01;
+/// `SCHED_FLAG_KEEP_POLICY`: keep the thread's policy, ignore `sched_policy`.
+pub(crate) const SCHED_FLAG_KEEP_POLICY: u64 = 0x08;
+/// `SCHED_FLAG_KEEP_PARAMS`: keep the thread's priority and nice, ignore
+/// `sched_priority` and `sched_nice` (and, in `__sched_setscheduler`, the
+/// policy too: the class change is skipped along with the parameters).
+pub(crate) const SCHED_FLAG_KEEP_PARAMS: u64 = 0x10;
+/// `SCHED_FLAG_ALL`: every flag `sched_setattr` knows (`RESET_ON_FORK`,
+/// `RECLAIM`, `DL_OVERRUN`, `KEEP_POLICY`, `KEEP_PARAMS`, `UTIL_CLAMP_MIN`,
+/// `UTIL_CLAMP_MAX`). A flag outside it is `EINVAL`.
+pub(crate) const SCHED_FLAG_ALL: u64 = 0x7f;
+
+/// What `sched_setattr` will do to the thread, decided from `sched_flags`
+/// and `sched_policy` the way `sys_sched_setattr` and `__sched_setscheduler`
+/// decide it.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct SchedAttrPlan {
+    /// The policy to set, or `None` to keep the thread's own
+    /// (`SCHED_FLAG_KEEP_POLICY`, `SETPARAM_POLICY`).
+    pub policy: Option<u32>,
+    /// `SCHED_FLAG_KEEP_PARAMS`: validate and check permission against the
+    /// thread's own priority and nice, and store nothing.
+    pub keep_params: bool,
+}
+
+/// `sched_setattr`'s reading of `sched_flags`: a flag outside
+/// `SCHED_FLAG_ALL` is `EINVAL`; `SCHED_FLAG_KEEP_POLICY` makes the policy
+/// `SETPARAM_POLICY`, which is "the one the thread has"; and
+/// `SCHED_FLAG_KEEP_PARAMS` copies the thread's priority and nice over the
+/// caller's (`get_params`) and then skips the store. A negative
+/// `sched_policy` (`(int)attr.sched_policy < 0`) is `EINVAL` before any of
+/// that, and before the pid is looked up.
+///
+/// The flags were never read. `KEEP_POLICY` is how a program changes the
+/// nice of a thread without knowing its policy (systemd's `Nice=` on a
+/// service that set `SCHED_FIFO` for itself, `chrt`-less renicing in
+/// PipeWire's module-rt): with `sched_policy` left at zero, as the manual
+/// says it may be, the thread was dropped from `SCHED_FIFO` to
+/// `SCHED_OTHER`. And a flag Linux does not know was accepted.
+pub(crate) fn sched_setattr_plan(sched_flags: u64, sched_policy: u32) -> LxResult<SchedAttrPlan> {
+    if (sched_policy as i32) < 0 {
+        return Err(LxError::EINVAL);
+    }
+    if sched_flags & !SCHED_FLAG_ALL != 0 {
+        return Err(LxError::EINVAL);
+    }
+    Ok(SchedAttrPlan {
+        policy: if sched_flags & SCHED_FLAG_KEEP_POLICY != 0 {
+            None
+        } else {
+            Some(sched_policy)
+        },
+        keep_params: sched_flags & SCHED_FLAG_KEEP_PARAMS != 0,
+    })
 }
 
 /// And for `sched_getattr`: `EINVAL`, and no zero quirk. See
@@ -3299,6 +3378,89 @@ mod extensible_struct_tests {
         assert!(clone3_size(PAGE_SIZE + 1).is_err());
         assert!(sched_setattr_size(PAGE_SIZE as u32 + 1).is_err());
         assert!(sched_getattr_size(PAGE_SIZE + 1).is_err());
+    }
+}
+
+#[cfg(test)]
+mod sched_attr_flag_tests {
+    //! `sched_setattr(2)`'s `sched_flags`, which were never read.
+
+    use super::*;
+
+    /// A flag Linux does not know is `EINVAL`; the known ones are not, alone
+    /// or together.
+    #[test]
+    fn an_unknown_flag_is_einval() {
+        assert_eq!(sched_setattr_plan(0x80, 0), Err(LxError::EINVAL));
+        assert_eq!(sched_setattr_plan(1 << 63, 0), Err(LxError::EINVAL));
+        assert_eq!(
+            sched_setattr_plan(SCHED_FLAG_KEEP_POLICY | 0x100, 0),
+            Err(LxError::EINVAL)
+        );
+        assert!(sched_setattr_plan(SCHED_FLAG_ALL, 0).is_ok());
+        assert!(sched_setattr_plan(SCHED_FLAG_RESET_ON_FORK, 0).is_ok());
+        // Their uapi values.
+        assert_eq!(SCHED_FLAG_RESET_ON_FORK, 0x01);
+        assert_eq!(SCHED_FLAG_KEEP_POLICY, 0x08);
+        assert_eq!(SCHED_FLAG_KEEP_PARAMS, 0x10);
+        assert_eq!(SCHED_FLAG_ALL, 0x7f);
+    }
+
+    /// `SCHED_FLAG_KEEP_POLICY` keeps the thread's policy whatever
+    /// `sched_policy` says; without it `sched_policy` is the policy.
+    #[test]
+    fn keep_policy_ignores_the_policy_in_the_struct() {
+        assert_eq!(
+            sched_setattr_plan(SCHED_FLAG_KEEP_POLICY, 0),
+            Ok(SchedAttrPlan {
+                policy: None,
+                keep_params: false
+            })
+        );
+        assert_eq!(
+            sched_setattr_plan(SCHED_FLAG_KEEP_POLICY, 1),
+            Ok(SchedAttrPlan {
+                policy: None,
+                keep_params: false
+            })
+        );
+        assert_eq!(
+            sched_setattr_plan(0, 1),
+            Ok(SchedAttrPlan {
+                policy: Some(1),
+                keep_params: false
+            })
+        );
+        assert_eq!(
+            sched_setattr_plan(SCHED_FLAG_KEEP_PARAMS, 2),
+            Ok(SchedAttrPlan {
+                policy: Some(2),
+                keep_params: true
+            })
+        );
+        assert_eq!(
+            sched_setattr_plan(SCHED_FLAG_KEEP_POLICY | SCHED_FLAG_KEEP_PARAMS, 2),
+            Ok(SchedAttrPlan {
+                policy: None,
+                keep_params: true
+            })
+        );
+    }
+
+    /// `(int)attr.sched_policy < 0` is `EINVAL`, even under `KEEP_POLICY`,
+    /// and before the flags are looked at.
+    #[test]
+    fn a_negative_policy_is_einval_before_the_flags() {
+        assert_eq!(sched_setattr_plan(0, 0x8000_0000), Err(LxError::EINVAL));
+        assert_eq!(sched_setattr_plan(0, u32::MAX), Err(LxError::EINVAL));
+        assert_eq!(
+            sched_setattr_plan(SCHED_FLAG_KEEP_POLICY, u32::MAX),
+            Err(LxError::EINVAL)
+        );
+        assert!(
+            sched_setattr_plan(0, 0x7fff_ffff).is_ok(),
+            "the sign, not the range"
+        );
     }
 }
 
