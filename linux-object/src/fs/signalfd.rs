@@ -8,7 +8,7 @@ use super::*;
 // `crate::signal::Signal` (the Linux signal enum) would shadow
 // `zircon_object::object::Signal` (the KObject signal bits used by
 // `impl_kobject!`), so alias it.
-use crate::signal::{Signal as LinuxSignal, Sigset};
+use crate::signal::{SigInfo, Signal as LinuxSignal, Sigset};
 use crate::thread::ThreadExt;
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicU64, Ordering::SeqCst};
@@ -82,16 +82,43 @@ impl SignalFd {
     }
 
     /// Consume and return the lowest-numbered accepted pending signal, removing
-    /// it from the calling thread's pending set.
-    fn consume_one(&self) -> Option<LinuxSignal> {
+    /// it from the calling thread's pending set, with the `siginfo_t` that
+    /// came with it.
+    fn consume_one(&self) -> Option<SigInfo> {
         let mask = self.mask.load(SeqCst);
         let arc = kernel_hal::thread::get_current_thread()?;
         let thread = arc.downcast::<Thread>().ok()?;
         let mut tl = thread.lock_linux();
         let sig = Sigset::new(tl.signals.val() & mask).find_first_signal()?;
-        tl.signals.remove(sig);
-        Some(sig)
+        Some(tl.take_siginfo(sig))
     }
+}
+
+/// `struct signalfd_siginfo` for one consumed signal: `signalfd_copyinfo`.
+///
+/// The layout is the uAPI's, not `siginfo_t`'s: `ssi_signo` (0), `ssi_errno`
+/// (4), `ssi_code` (8), `ssi_pid` (12), `ssi_uid` (16), ..., `ssi_status`
+/// (40). Which fields are filled depends on what the signal carries, as in
+/// the kernel's `siginfo_layout`: a signal a process sent (`SI_USER`,
+/// `SI_TKILL`, `SI_QUEUE`) has a sender; a `SIGCHLD` has the child, its uid
+/// and its status. An event loop reading a `SIGCHLD` off a signalfd is
+/// looking for exactly `ssi_pid` and `ssi_status`, and used to get zeros.
+fn signalfd_record(info: &SigInfo) -> [u8; SIGINFO_SIZE] {
+    let src = info.as_bytes();
+    let mut out = [0u8; SIGINFO_SIZE];
+    out[..4].copy_from_slice(&(info.signo as u32).to_ne_bytes());
+    out[4..8].copy_from_slice(&info.errno.to_ne_bytes());
+    out[8..12].copy_from_slice(&(info.code as i32).to_ne_bytes());
+    let sent_by_a_process = (info.code as i32) <= 0;
+    let about_a_child = info.signo == LinuxSignal::SIGCHLD as i32 && (info.code as i32) > 0;
+    if sent_by_a_process || about_a_child {
+        // `_kill` and `_sigchld` both start with `si_pid`, `si_uid`.
+        out[12..20].copy_from_slice(&src[16..24]);
+    }
+    if about_a_child {
+        out[40..44].copy_from_slice(&src[24..28]);
+    }
+    out
 }
 
 #[async_trait]
@@ -110,12 +137,8 @@ impl FileLike for SignalFd {
             return Err(LxError::EINVAL);
         }
         loop {
-            if let Some(sig) = self.consume_one() {
-                // struct signalfd_siginfo: ssi_signo is the first u32; the rest
-                // (errno/code/pid/uid/…) we leave zero, which is all an event
-                // loop reading Ctrl-C / SIGTERM looks at.
-                buf[..SIGINFO_SIZE].fill(0);
-                buf[..4].copy_from_slice(&(sig as u32).to_ne_bytes());
+            if let Some(info) = self.consume_one() {
+                buf[..SIGINFO_SIZE].copy_from_slice(&signalfd_record(&info));
                 return Ok(SIGINFO_SIZE);
             }
             if self.flags().non_block() {
@@ -328,5 +351,48 @@ mod tests {
         assert!(fd.pending_matched().is_empty());
         assert!(!fd.poll(PollEvents::IN).unwrap().read);
         assert!(fd.consume_one().is_none());
+    }
+}
+
+#[cfg(test)]
+mod record_tests {
+    //! What a `read` on a signalfd hands over besides the number. It was
+    //! `ssi_signo` and 124 zero bytes, so a compositor reaping its children
+    //! through a signalfd read `ssi_pid == 0` for every `SIGCHLD`.
+
+    use super::*;
+    use crate::process::wait_status_exited;
+    use crate::signal::SignalCode;
+
+    fn word(b: &[u8], at: usize) -> i32 {
+        i32::from_ne_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]])
+    }
+
+    #[test]
+    fn a_sigchld_read_off_a_signalfd_names_the_child_its_uid_and_its_status() {
+        let info = SigInfo::child_state_change(4242, 1000, wait_status_exited(3));
+        let r = signalfd_record(&info);
+        assert_eq!(word(&r, 0), LinuxSignal::SIGCHLD as i32, "ssi_signo");
+        assert_eq!(word(&r, 8), SignalCode::CLD_EXITED as i32, "ssi_code");
+        assert_eq!(word(&r, 12), 4242, "ssi_pid");
+        assert_eq!(word(&r, 16), 1000, "ssi_uid");
+        assert_eq!(word(&r, 40), 3, "ssi_status");
+    }
+
+    #[test]
+    fn a_kill_read_off_a_signalfd_names_its_sender() {
+        let info = SigInfo::from_user(LinuxSignal::SIGTERM, 77, 1000, SignalCode::USER);
+        let r = signalfd_record(&info);
+        assert_eq!(word(&r, 0), LinuxSignal::SIGTERM as i32);
+        assert_eq!(word(&r, 8), SignalCode::USER as i32);
+        assert_eq!((word(&r, 12), word(&r, 16)), (77, 1000));
+        assert_eq!(word(&r, 40), 0, "no status on a kill");
+    }
+
+    #[test]
+    fn a_bare_signal_is_its_number_and_nothing_else() {
+        let r = signalfd_record(&SigInfo::bare(LinuxSignal::SIGINT));
+        assert_eq!(word(&r, 0), LinuxSignal::SIGINT as i32);
+        assert!(r[4..].iter().all(|&b| b == 0), "{:?}", &r[4..48]);
     }
 }
