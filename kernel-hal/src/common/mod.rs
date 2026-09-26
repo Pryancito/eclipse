@@ -5,7 +5,9 @@ pub(super) mod thread;
 pub(super) mod vdso;
 pub(super) mod vm;
 
+pub mod acpi_tables;
 pub mod addr;
+pub mod affinity_walk;
 #[cfg(feature = "graphic")]
 pub mod boot_logo;
 pub mod cache_maint;
@@ -20,11 +22,13 @@ pub mod dma_quarantine;
 pub mod fault_diag;
 pub mod fault_slots;
 pub mod guard_band;
+pub mod hart_walk;
 pub mod ipi;
 pub mod kaddr;
 pub mod kstats;
 pub mod ksyms;
 pub mod oops_log;
+pub mod panic_lock;
 pub mod phys_watch;
 pub mod rand;
 pub mod rtc;

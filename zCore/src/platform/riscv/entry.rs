@@ -3,6 +3,7 @@ use super::{
     consts::{kernel_mem_info, MAX_HART_NUM, STACK_PAGES_PER_HART},
 };
 use dtb_walker::{Dtb, DtbObj, HeaderError::*, Property, Str, WalkOperation::*};
+use kernel_hal::hart_walk::{outcome, parse_hart_id, HartWalk, Next, Outcome, Skip};
 use kernel_hal::KernelConfig;
 
 /// 内核入口。
@@ -192,14 +193,25 @@ unsafe extern "C" fn select_stack(hartid: usize) {
 }
 
 // 启动副核
+//
+// Which harts this starts, and what a refusal from the SEE means, live in
+// `kernel_hal::hart_walk` so the host test suite can reach them: the `ecall`
+// is the only part of this that needs a riscv machine.
 fn boot_secondary_harts(boot_hartid: usize, dtb: &Dtb, start_addr: usize) {
     if sbi_rt::probe_extension(sbi_rt::Hsm).is_unavailable() {
         println!("HSM SBI extension is not supported for current SEE.");
         return;
     }
 
+    // `MAX_HART_NUM` bounds the raw hart id (the boot stack array `select_stack`
+    // indexes); `MAX_CORE_NUM - 1` bounds how many secondaries the per-CPU
+    // tables can hold on top of this one.
+    let mut walk = HartWalk::new(
+        boot_hartid,
+        MAX_HART_NUM,
+        kernel_hal::config::MAX_CORE_NUM.saturating_sub(1),
+    );
     let mut cpus = false;
-    let mut cpu: Option<usize> = None;
     dtb.walk(|path, obj| match obj {
         DtbObj::SubNode { name } => {
             if path.is_root() {
@@ -209,9 +221,8 @@ fn boot_secondary_harts(boot_hartid: usize, dtb: &Dtb, start_addr: usize) {
                     StepInto
                 } else if cpus {
                     // 已离开 cpus 节点
-                    if let Some(hartid) = cpu.take() {
-                        hart_start(boot_hartid, hartid, start_addr);
-                    }
+                    let next = walk.see_cpu_node(None);
+                    hart_start(&mut walk, next, start_addr);
                     Terminate
                 } else {
                     // 其他节点
@@ -223,14 +234,15 @@ fn boot_secondary_harts(boot_hartid: usize, dtb: &Dtb, start_addr: usize) {
                     return Terminate;
                 }
                 if name.starts_with("cpu@") {
-                    let id: usize = usize::from_str_radix(
-                        unsafe { core::str::from_utf8_unchecked(&name.as_bytes()[4..]) },
-                        16,
-                    )
-                    .unwrap();
-                    if let Some(hartid) = cpu.replace(id) {
-                        hart_start(boot_hartid, hartid, start_addr);
+                    // A node name the firmware wrote. `parse_hart_id` answers
+                    // `None` rather than panicking on one it will not vouch
+                    // for; the walk then drops that node and reads the next.
+                    let id = name.as_str().ok().and_then(parse_hart_id);
+                    if id.is_none() {
+                        println!("[smp] {name} does not name a hart — ignored");
                     }
+                    let next = walk.see_cpu_node(id);
+                    hart_start(&mut walk, next, start_addr);
                     StepInto
                 } else {
                     StepOver
@@ -240,27 +252,82 @@ fn boot_secondary_harts(boot_hartid: usize, dtb: &Dtb, start_addr: usize) {
             }
         }
         // 状态不是 "okay" 的 cpu 不能启动
-        DtbObj::Property(Property::Status(status))
-            if path.name().starts_with("cpu@") && status != Str::from("okay") =>
-        {
-            if let Some(id) = cpu.take() {
+        //
+        // Which strings count as startable is `see_status`' call and only its
+        // call -- asking the same question here too is how the two answers
+        // drift. A status whose bytes are not utf-8 is a status we cannot
+        // trust, so it arrives as the empty string and the core stays asleep.
+        DtbObj::Property(Property::Status(status)) if path.name().starts_with("cpu@") => {
+            if let Some(id) = walk.see_status(status.as_str().unwrap_or("")) {
                 println!("hart{id} has status: {status}");
             }
-            StepOut
+            StepOver
         }
         DtbObj::Property(_) => StepOver,
     });
+    // The end of the walk. `dtb_walker` never announces it, and the code this
+    // replaces flushed its pending hart only on the next root-level node after
+    // `/cpus`: a blob whose `/cpus` is the root's last child lost its last core
+    // on every boot and said nothing.
+    let next = walk.finish();
+    hart_start(&mut walk, next, start_addr);
+
+    println!(
+        "[smp] {} secondary hart(s) started, {} already up, {} absent, {} refused",
+        walk.started(),
+        walk.already_on(),
+        walk.absent(),
+        walk.failures(),
+    );
     println!();
 }
 
-fn hart_start(boot_hartid: usize, hartid: usize, start_addr: usize) {
-    if hartid != boot_hartid {
-        println!("hart{hartid} is booting...");
-        let ret = sbi_rt::hart_start(hartid, start_addr, 0);
-        if ret.is_err() {
-            panic!("start hart{hartid} failed. error: {ret:?}");
+/// Issue one `HART_START`, or say why the walk refused to.
+///
+/// A refusal is never fatal here. It used to be: `panic!("start hart{hartid}
+/// failed")` meant one core the SEE would not hand over took down a machine
+/// with every other core waiting — which is why `entry64.rs` carries a
+/// `board-fu740` `cfg` that skips hart 0 by hand. x86_64 and aarch64 both skip
+/// the CPU and boot with the ones that came up; this is the third place the
+/// kernel asks that question and it now answers it the same way.
+fn hart_start(walk: &mut HartWalk, next: Next, start_addr: usize) {
+    let hartid = match next {
+        Next::Nothing => return,
+        Next::Skip(hartid, why) => {
+            // Every arm is braced: zCore's `println!` ends in a semicolon,
+            // so it is a statement and not an expression.
+            match why {
+                Skip::BootHart => {
+                    println!("hart{hartid} is the primary hart.");
+                }
+                Skip::NoStack => {
+                    println!(
+                        "hart{hartid} is past MAX_HART_NUM ({MAX_HART_NUM}) — no boot stack, \
+                         not started"
+                    );
+                }
+                Skip::NoRoom => {
+                    println!("hart{hartid} has no per-CPU slot left — not started");
+                }
+            }
+            return;
         }
-    } else {
-        println!("hart{hartid} is the primary hart.");
+        Next::Start(hartid) => hartid,
+    };
+    println!("hart{hartid} is booting...");
+    let ret = sbi_rt::hart_start(hartid, start_addr, 0);
+    let verdict = outcome(ret.error);
+    walk.saw(verdict);
+    match verdict {
+        Outcome::Started => {}
+        Outcome::AlreadyOn => {
+            println!("hart{hartid} was already running");
+        }
+        Outcome::Absent => {
+            println!("hart{hartid} is not this SEE's to start");
+        }
+        Outcome::Failed(code) => {
+            println!("start hart{hartid} failed. error: {code}");
+        }
     }
 }

@@ -25,6 +25,30 @@ use crate::ticket::TicketMutex;
 /// `MAX_CORE_NUM` so [`UNREGISTERED_LOGICAL`] can never be one of them.
 static NEXT_LOGICAL: AtomicU32 = AtomicU32::new(0);
 
+/// Ids whose test thread has finished, waiting to be handed to the next one.
+///
+/// Without this the pool was one id per **test in the crate** rather than one
+/// per *live* test thread, so the harness had a ceiling on how many tests this
+/// crate could hold at all -- reached the day `mcslock.rs` got its own, at which
+/// point two unrelated rwlock tests started failing with "ran out of simulated
+/// CPUs". The ids are recycled rather than the ceiling raised, because the
+/// ceiling is real: `MAX_CORE_NUM` slots is what the per-CPU arrays have.
+static FREE_LOGICAL: std::sync::Mutex<std::vec::Vec<u8>> =
+    std::sync::Mutex::new(std::vec::Vec::new());
+
+fn free_logical() -> std::sync::MutexGuard<'static, std::vec::Vec<u8>> {
+    FREE_LOGICAL.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// One test thread's claim on a simulated CPU, given back when it exits.
+struct CpuSlot(u8);
+
+impl Drop for CpuSlot {
+    fn drop(&mut self) {
+        free_logical().push(self.0);
+    }
+}
+
 /// In range for every per-CPU array, and registered by nobody — which is the
 /// exact shape of the id a corrupted GS reported on a 6-vCPU guest.
 const UNREGISTERED_LOGICAL: u8 = (crate::MAX_CORE_NUM - 1) as u8;
@@ -36,34 +60,43 @@ const UNREGISTERED_LOGICAL: u8 = (crate::MAX_CORE_NUM - 1) as u8;
 /// interrupt-disable depth in one slot — which is precisely the bug this file
 /// exists to catch, so the harness must not reproduce it.
 fn this_cpu() -> u8 {
-    use core::cell::Cell;
+    use core::cell::RefCell;
     std::thread_local! {
-        static MINE: Cell<Option<u8>> = const { Cell::new(None) };
+        static MINE: RefCell<Option<CpuSlot>> = const { RefCell::new(None) };
     }
-    MINE.with(|m| {
-        if let Some(id) = m.get() {
-            return id;
+    if let Some(id) = MINE.with(|m| m.borrow().as_ref().map(|slot| slot.0)) {
+        return id;
+    }
+    // A finished thread's id first; a fresh one only when none is waiting.
+    let logical = match free_logical().pop() {
+        Some(id) => id,
+        None => {
+            let next = NEXT_LOGICAL.fetch_add(1, Ordering::Relaxed);
+            assert!(
+                next < UNREGISTERED_LOGICAL as u32,
+                "test harness ran out of simulated CPUs: {} test threads alive at once",
+                next
+            );
+            next as u8
         }
-        let logical = NEXT_LOGICAL.fetch_add(1, Ordering::Relaxed);
-        assert!(
-            logical < UNREGISTERED_LOGICAL as u32,
-            "test harness ran out of simulated CPUs"
-        );
-        let logical = logical as u8;
-        // A sparse hardware id, on purpose: a dense one would pass even if the
-        // map were indexing by hardware id.
-        let hw = 0x1000 + (logical as u32) * 7;
-        set_test_hw_id(hw);
-        set_test_published(Some(logical));
-        assert!(set_logical_cpu_id(hw, logical));
-        m.set(Some(logical));
-        logical
-    })
+    };
+    // A sparse hardware id, on purpose: a dense one would pass even if the
+    // map were indexing by hardware id. Derived from the logical id, so a
+    // recycled slot re-registers the very same pair.
+    let hw = 0x1000 + (logical as u32) * 7;
+    set_test_hw_id(hw);
+    set_test_published(Some(logical));
+    assert!(set_logical_cpu_id(hw, logical));
+    MINE.with(|m| *m.borrow_mut() = Some(CpuSlot(logical)));
+    logical
 }
 
 /// Run `body` on a CPU whose interrupts start enabled, and assert it left the
 /// slot exactly as it found it.
-fn on_a_cpu(body: impl FnOnce()) {
+///
+/// `pub(crate)` because `mcslock.rs` keeps its tests next to the lock and needs
+/// the same harness: every flavour is held to the same pairing.
+pub(crate) fn on_a_cpu(body: impl FnOnce()) {
     let me = this_cpu();
     crate::interrupt::intr_on_for_test();
     assert_eq!(lock_depth(), 0, "cpu {} entered the test holding locks", me);
@@ -434,8 +467,33 @@ fn a_whole_rwlock_sequence_comes_back_to_zero() {
 
 static PUMPS: AtomicU32 = AtomicU32::new(0);
 
+std::thread_local! {
+    /// Set on the one thread whose acquire a test is measuring.
+    static IS_THE_WAITER: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+}
+
+/// The pump is process-wide: once armed it fires for every spinner anywhere in
+/// the process, and the four tests below assert only that it fired *at all*.
+/// So a pump from some other test's contending peer read as proof that the
+/// loop under test drains its queue -- a discipline removed from that loop
+/// would have gone on passing. The shared hook lock cannot help: it keeps
+/// another test from arming the pump, not from spinning into it.
+///
+/// Counting only the waiter's own turns closes that: the acquire under test is
+/// the only thing that can move this number.
 fn count_pump() {
-    PUMPS.fetch_add(1, Ordering::SeqCst);
+    if IS_THE_WAITER.with(|c| c.get()) {
+        PUMPS.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+/// Run the acquire whose waiting is under test. Only turns taken inside here
+/// count towards [`a_pump_was_seen`].
+fn as_the_waiter<R>(f: impl FnOnce() -> R) -> R {
+    IS_THE_WAITER.with(|c| c.set(true));
+    let r = f();
+    IS_THE_WAITER.with(|c| c.set(false));
+    r
 }
 
 /// Arm the recording pump. Returns the shared hook lock, so `rwlock.rs`'s own
@@ -469,7 +527,7 @@ fn a_reader_waiting_on_a_writer_drains_its_own_shootdown_queue() {
     on_a_cpu(|| {
         let w = LOCK.write();
         let other = std::thread::spawn(|| {
-            on_a_cpu(|| assert_eq!(*LOCK.read(), 7));
+            on_a_cpu(|| as_the_waiter(|| assert_eq!(*LOCK.read(), 7)));
         });
         let pumped = a_pump_was_seen();
         drop(w);
@@ -485,7 +543,7 @@ fn a_writer_waiting_on_a_reader_drains_its_own_shootdown_queue() {
     on_a_cpu(|| {
         let r = LOCK.read();
         let other = std::thread::spawn(|| {
-            on_a_cpu(|| *LOCK.write() = 2);
+            on_a_cpu(|| as_the_waiter(|| *LOCK.write() = 2));
         });
         let pumped = a_pump_was_seen();
         drop(r);
@@ -504,7 +562,7 @@ fn an_upgradeable_reader_waiting_on_another_drains_its_own_shootdown_queue() {
         // deadlock report, so a wedge here left the console empty too.
         let up = LOCK.upgradeable_read();
         let other = std::thread::spawn(|| {
-            on_a_cpu(|| assert_eq!(*LOCK.upgradeable_read(), 3));
+            on_a_cpu(|| as_the_waiter(|| assert_eq!(*LOCK.upgradeable_read(), 3)));
         });
         let pumped = a_pump_was_seen();
         drop(up);
@@ -526,9 +584,11 @@ fn an_upgrade_waiting_on_a_reader_drains_its_own_shootdown_queue() {
         let r = LOCK.read();
         let other = std::thread::spawn(|| {
             on_a_cpu(|| {
-                let up = LOCK.upgradeable_read();
-                READY.store(true, Ordering::SeqCst);
-                *up.upgrade() = 5;
+                as_the_waiter(|| {
+                    let up = LOCK.upgradeable_read();
+                    READY.store(true, Ordering::SeqCst);
+                    *up.upgrade() = 5;
+                })
             });
         });
         while !READY.load(Ordering::SeqCst) {
@@ -1070,9 +1130,10 @@ fn a_spin_waiter_that_loses_an_acquire_counts_the_turn_it_lost() {
             contended += 1;
             assert!(
                 turns > 0,
-                "an acquire lost {lost} attempt(s) and counted no waiting at \
+                "an acquire lost {} attempt(s) and counted no waiting at \
                  all: that waiter drained no shootdown queue and would never \
-                 be reported stuck, however long it span"
+                 be reported stuck, however long it span",
+                lost
             );
         }
         stop.store(true, Ordering::Relaxed);

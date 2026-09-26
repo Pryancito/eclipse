@@ -28,7 +28,7 @@ use alloc::sync::Arc;
 use core::convert::TryFrom;
 
 use kernel_hal::user::{IoVecIn, IoVecOut, UserInOutPtr, UserInPtr, UserOutPtr};
-use linux_object::error::{LxError, SysResult};
+use linux_object::error::{LxError, LxResult, SysResult};
 use linux_object::fs::FileDesc;
 use linux_object::process::{LinuxProcess, ProcessExt, RLimit};
 use zircon_object::object::{KernelObject, KoID};
@@ -37,6 +37,7 @@ use zircon_object::vm::VirtAddr;
 
 use self::consts::SyscallType as Sys;
 use self::file::poll_timeout_msecs;
+use self::file::{XattrOp, XattrTarget};
 
 mod consts {
     // generated from syscall.h.in
@@ -134,6 +135,7 @@ mod abi;
 #[cfg(target_arch = "x86_64")]
 pub mod bsd;
 mod file;
+mod intarg;
 mod ipc;
 mod misc;
 mod net;
@@ -304,19 +306,19 @@ impl Syscall<'_> {
             }
             Sys::SENDFILE => self.sys_sendfile(a0.into(), a1.into(), a2.into(), a3).await,
             Sys::FCNTL => self.sys_fcntl(a0.into(), a1, a2).await,
-            Sys::FLOCK => self.sys_flock(a0.into(), a1),
+            Sys::FLOCK => self.sys_flock(a0.into(), a1).await,
             Sys::FSYNC => self.sys_fsync(a0.into()),
             Sys::FDATASYNC => self.sys_fdatasync(a0.into()),
             Sys::TRUNCATE => self.sys_truncate(a0.into(), a1),
             Sys::FTRUNCATE => self.sys_ftruncate(a0.into(), a1),
             Sys::FADVISE64 => self.sys_fadvise64(a0.into(), a1, a2, a3),
-            // readahead(2) is a pure prefetch hint; we have no page cache to
-            // populate, so validate the fd and return 0. Firefox's IO thread
-            // fires it constantly and the `unknown syscall: READAHEAD` flood
-            // was pure noise.
-            Sys::READAHEAD => self.linux_process().get_file_like(a0.into()).map(|_| 0),
+            // `sys_readahead` has the man page's checks (EBADF for a
+            // descriptor not open for reading, EINVAL for one with nothing
+            // to read ahead into); this arm used to look the fd up itself
+            // and answer 0, so the function it was written for never ran.
+            Sys::READAHEAD => self.sys_readahead(a0.into(), a1 as u64, a2),
             Sys::FALLOCATE => self.sys_fallocate(a0.into(), a1, a2, a3),
-            Sys::SYNC_FILE_RANGE => self.sys_sync_file_range(a0.into(), a1 as u64, a2 as u64, a3),
+            Sys::SYNC_FILE_RANGE => self.sys_sync_file_range(a0.into(), a1, a2, a3),
             Sys::GETDENTS64 => self.sys_getdents64(a0.into(), a1.into(), a2),
             Sys::GETCWD => self.sys_getcwd(a0.into(), a1),
             Sys::CHDIR => self.sys_chdir(a0.into()),
@@ -330,13 +332,16 @@ impl Syscall<'_> {
             Sys::SYMLINKAT => self.sys_symlinkat(a0.into(), a1.into(), a2.into()),
             Sys::READLINKAT => self.sys_readlinkat(a0.into(), a1.into(), a2.into(), a3),
             Sys::FCHMOD => self.sys_fchmod(a0.into(), a1),
-            Sys::FCHMODAT => self.sys_fchmodat(a0.into(), a1.into(), a2, a3),
+            // `fchmodat` has no flags argument (`fchmodat2` would); neither
+            // has `faccessat` (`faccessat2` does). See `at_flags_register`.
+            ref s @ Sys::FCHMODAT => {
+                let flags = at_flags_register(at_syscall_takes_flags(s), a3);
+                self.sys_fchmodat(a0.into(), a1.into(), a2, flags)
+            }
             Sys::FCHOWN => self.sys_fchown(a0.into(), a1, a2),
             Sys::FCHOWNAT => self.sys_fchownat(a0.into(), a1.into(), a2, a3, a4),
-            // `faccessat` has no flags argument; `faccessat2` does. See
-            // `faccessat_flags`.
             ref s @ (Sys::FACCESSAT | Sys::FACCESSAT2) => {
-                let flags = faccessat_flags(faccessat_takes_flags(s), a3);
+                let flags = at_flags_register(at_syscall_takes_flags(s), a3);
                 self.sys_faccessat(a0.into(), a1.into(), a2, flags)
             }
             Sys::DUP => self.sys_dup(a0.into()),
@@ -503,7 +508,10 @@ impl Syscall<'_> {
             Sys::EXIT => self.sys_exit(a0 as _),
             Sys::EXIT_GROUP => self.sys_exit_group(a0 as _),
             Sys::WAIT4 => self.sys_wait4(a0 as _, a1.into(), a2 as _, a3.into()).await,
-            Sys::WAITID => self.sys_waitid(a0 as i32, a1, a2.into(), a3 as u32).await,
+            Sys::WAITID => {
+                self.sys_waitid(a0 as i32, a1, a2.into(), a3 as u32, a4.into())
+                    .await
+            }
             Sys::SET_TID_ADDRESS => self.sys_set_tid_address(a0.into()),
             Sys::FUTEX => self.sys_futex(a0, a1 as _, a2 as _, a3, a4, a5 as _).await,
             Sys::GET_ROBUST_LIST => self.sys_get_robust_list(a0 as _, a1.into(), a2.into()),
@@ -517,7 +525,7 @@ impl Syscall<'_> {
             Sys::PIDFD_GETFD => self.sys_pidfd_getfd(a0.into(), a1 as i32, a2 as u32),
 
             // time
-            Sys::NANOSLEEP => self.sys_nanosleep(a0.into()).await,
+            Sys::NANOSLEEP => self.sys_nanosleep(a0.into(), a1.into()).await,
             Sys::CLOCK_NANOSLEEP => self.sys_clock_nanosleep(a0, a1, a2.into(), a3.into()).await,
             Sys::SETITIMER => self.sys_setitimer(a0, a1.into(), a2.into()),
             // `alarm` only exists in the x86_64 syscall table; the generic ABI
@@ -557,8 +565,11 @@ impl Syscall<'_> {
             Sys::SHMGET => self.sys_shmget(a0, a1, a2),
             #[cfg(not(target_arch = "mips"))]
             Sys::SHMAT => self.sys_shmat(a0, a1, a2),
+            // `SYSCALL_DEFINE1(shmdt, char __user *, shmaddr)`: the address
+            // is the first and only argument. It was read from the second
+            // register, which a one-argument libc stub never sets.
             #[cfg(not(target_arch = "mips"))]
-            Sys::SHMDT => self.sys_shmdt(a0, a1, a2),
+            Sys::SHMDT => self.sys_shmdt(a0),
             #[cfg(not(target_arch = "mips"))]
             Sys::SHMCTL => self.sys_shmctl(a0, a1, a2),
 
@@ -649,17 +660,66 @@ impl Syscall<'_> {
             Sys::GETRANDOM => self.sys_getrandom(a0.into(), a1, a2 as u32),
             Sys::STATX => self.sys_statx(a0.into(), a1.into(), a2, a3 as u32, a4.into()),
 
-            // Extended attributes: this kernel's filesystems do not implement
-            // xattrs. Answer the standard "no xattr support" way and quietly —
-            // letting these fall through to `unknown_syscall` returned ENOSYS
-            // but logged an `error!` per call, which floods the console (e.g.
-            // busybox init probing files: `unknown syscall: LISTXATTR`).
-            // `listxattr` -> 0 (empty name list); `getxattr` -> ENODATA (no such
-            // attribute); `setxattr` -> EOPNOTSUPP; `removexattr` -> ENODATA.
-            Sys::LISTXATTR | Sys::LLISTXATTR | Sys::FLISTXATTR => Ok(0),
-            Sys::GETXATTR | Sys::LGETXATTR | Sys::FGETXATTR => Err(LxError::ENODATA),
-            Sys::SETXATTR | Sys::LSETXATTR | Sys::FSETXATTR => Err(LxError::EOPNOTSUPP),
-            Sys::REMOVEXATTR | Sys::LREMOVEXATTR | Sys::FREMOVEXATTR => Err(LxError::ENODATA),
+            // Extended attributes: this kernel's filesystems do not keep
+            // them, and answering from here, by syscall name, kept busybox
+            // init's probing off the console. But `fs/xattr.c` reads the
+            // name and the flags and looks the file up BEFORE the filesystem
+            // answers, and these arms did none of it: a missing path was
+            // ENODATA, a closed fd was 0. `sys_xattr` makes those checks and
+            // then gives the same four answers.
+            Sys::GETXATTR => {
+                self.sys_xattr(XattrOp::Get, XattrTarget::Path(a0.into(), true), a1.into())
+            }
+            Sys::LGETXATTR => {
+                self.sys_xattr(XattrOp::Get, XattrTarget::Path(a0.into(), false), a1.into())
+            }
+            Sys::FGETXATTR => self.sys_xattr(XattrOp::Get, XattrTarget::Fd(a0.into()), a1.into()),
+            Sys::SETXATTR => self.sys_xattr(
+                XattrOp::Set {
+                    size: a3,
+                    flags: a4,
+                },
+                XattrTarget::Path(a0.into(), true),
+                a1.into(),
+            ),
+            Sys::LSETXATTR => self.sys_xattr(
+                XattrOp::Set {
+                    size: a3,
+                    flags: a4,
+                },
+                XattrTarget::Path(a0.into(), false),
+                a1.into(),
+            ),
+            Sys::FSETXATTR => self.sys_xattr(
+                XattrOp::Set {
+                    size: a3,
+                    flags: a4,
+                },
+                XattrTarget::Fd(a0.into()),
+                a1.into(),
+            ),
+            Sys::LISTXATTR => {
+                self.sys_xattr(XattrOp::List, XattrTarget::Path(a0.into(), true), a1.into())
+            }
+            Sys::LLISTXATTR => self.sys_xattr(
+                XattrOp::List,
+                XattrTarget::Path(a0.into(), false),
+                a1.into(),
+            ),
+            Sys::FLISTXATTR => self.sys_xattr(XattrOp::List, XattrTarget::Fd(a0.into()), a1.into()),
+            Sys::REMOVEXATTR => self.sys_xattr(
+                XattrOp::Remove,
+                XattrTarget::Path(a0.into(), true),
+                a1.into(),
+            ),
+            Sys::LREMOVEXATTR => self.sys_xattr(
+                XattrOp::Remove,
+                XattrTarget::Path(a0.into(), false),
+                a1.into(),
+            ),
+            Sys::FREMOVEXATTR => {
+                self.sys_xattr(XattrOp::Remove, XattrTarget::Fd(a0.into()), a1.into())
+            }
 
             // kernel module
             //            Sys::INIT_MODULE => self.sys_init_module(a0.into(), a1 as usize, a2.into()),
@@ -958,19 +1018,22 @@ fn unknown_syscall_number(num: u32) -> isize {
     syscall_ret(Err(LxError::ENOSYS))
 }
 
-/// The `flags` argument for the `faccessat` family.
+/// The `flags` argument for a `*at` syscall whose handler takes one, from the
+/// register it would be in.
 ///
-/// `faccessat` is `SYSCALL_DEFINE3` in Linux: it takes `(dirfd, path, mode)`
-/// and never reads a fourth register. `faccessat2` is the four-argument one
-/// that added the flags. Both were dispatched here as if they were
-/// `faccessat2`, so a plain `access()` -- which musl issues as a
-/// three-argument `faccessat`, leaving the fourth register holding whatever
-/// its syscall stub last had in it -- handed us that as `AT_` flags. Two of
+/// `faccessat` and `fchmodat` are `SYSCALL_DEFINE3` in Linux: `(dirfd, path,
+/// mode)`, and the kernel never reads a fourth register for them. The
+/// four-argument ones that added the flags are `faccessat2` and `fchmodat2`.
+/// Both threes were dispatched here as if they were the fours, so a plain
+/// `access()` or `chmod()` -- which musl and glibc issue as a three-argument
+/// `faccessat` / `fchmodat`, leaving the fourth register holding whatever
+/// their syscall stub last had in it -- handed us that as `AT_` flags. Two of
 /// the bits `AtFlags` keeps change the answer: `AT_SYMLINK_NOFOLLOW` applies
-/// the check to a symlink instead of to its target, and `AT_EACCESS` swaps the
-/// real uid/gid for the effective ones. Intermittently, differing per call
-/// site, on a syscall every shell and every dynamic loader makes constantly.
-fn faccessat_flags(takes_flags: bool, a3: usize) -> usize {
+/// the call to a symlink instead of to its target (`chmod("link", m)` setting
+/// the mode of the link and leaving the file alone), and `AT_EACCESS` swaps
+/// the real uid/gid for the effective ones. Intermittently, differing per
+/// call site, on syscalls every shell, installer and dynamic loader make.
+fn at_flags_register(takes_flags: bool, a3: usize) -> usize {
     if takes_flags {
         a3
     } else {
@@ -978,10 +1041,12 @@ fn faccessat_flags(takes_flags: bool, a3: usize) -> usize {
     }
 }
 
-/// Which of the `faccessat` family carries a fourth argument. The dispatch
-/// asks this rather than deciding per arm, so the answer is one place and a
-/// test can read it.
-fn faccessat_takes_flags(sys: &Sys) -> bool {
+/// Which of the `*at` syscalls dispatched with a flags word actually carry
+/// one. The dispatch asks this rather than deciding per arm, so the answer
+/// is one place and a test can read it. `fchmodat2` has no number in this
+/// table yet (it answers `ENOSYS`, and libc falls back), so `FCHMODAT` is the
+/// only spelling of that family here, and it is the three-argument one.
+fn at_syscall_takes_flags(sys: &Sys) -> bool {
     matches!(sys, Sys::FACCESSAT2)
 }
 
@@ -1130,23 +1195,28 @@ mod syscall_answer_tests {
     }
 
     #[test]
-    fn faccessat_is_given_no_flags_and_faccessat2_is_given_the_register() {
+    fn a_three_argument_at_syscall_is_given_no_flags_and_a_four_argument_one_the_register() {
         // AT_SYMLINK_NOFOLLOW is 0x100 and AT_EACCESS is 0x200: the two bits
-        // in a garbage register that change what access() answers.
+        // in a garbage register that change what access() and chmod() do.
         for garbage in [0x100usize, 0x200, 0x300, 0xdead_beef, usize::MAX] {
             assert_eq!(
-                faccessat_flags(false, garbage),
+                at_flags_register(false, garbage),
                 0,
-                "faccessat has three arguments; the fourth register is not its own"
+                "a SYSCALL_DEFINE3 has three arguments; the fourth register is not its own"
             );
-            assert_eq!(faccessat_flags(true, garbage), garbage);
+            assert_eq!(at_flags_register(true, garbage), garbage);
         }
-        assert_eq!(faccessat_flags(true, 0), 0);
+        assert_eq!(at_flags_register(true, 0), 0);
     }
 
     #[test]
-    fn only_faccessat2_of_the_family_has_a_fourth_argument() {
-        assert!(!faccessat_takes_flags(&Sys::FACCESSAT));
-        assert!(faccessat_takes_flags(&Sys::FACCESSAT2));
+    fn faccessat2_has_a_fourth_argument_and_faccessat_and_fchmodat_do_not() {
+        assert!(!at_syscall_takes_flags(&Sys::FACCESSAT));
+        assert!(at_syscall_takes_flags(&Sys::FACCESSAT2));
+        // `SYSCALL_DEFINE3(fchmodat, int, dfd, const char __user *, filename,
+        // umode_t, mode)`: glibc's chmod() and musl's are this call with
+        // three arguments, and whatever the stub left in the fourth register
+        // used to arrive here as AT_ flags.
+        assert!(!at_syscall_takes_flags(&Sys::FCHMODAT));
     }
 }

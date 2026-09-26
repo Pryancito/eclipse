@@ -27,11 +27,14 @@ impl Syscall<'_> {
         }
         let (end0, end1) = Fifo::create(elem_count, elem_size);
         let proc = self.thread.proc();
-        let handle0 = proc.add_handle(Handle::new(end0, Rights::DEFAULT_FIFO));
-        let handle1 = proc.add_handle(Handle::new(end1, Rights::DEFAULT_FIFO));
-        out0.write(handle0)?;
-        out1.write(handle1)?;
-        Ok(())
+        install_handle_pair(
+            proc,
+            (
+                Handle::new(end0, Rights::DEFAULT_FIFO),
+                Handle::new(end1, Rights::DEFAULT_FIFO),
+            ),
+            (&mut out0, &mut out1),
+        )
     }
 
     /// Write data to a fifo.

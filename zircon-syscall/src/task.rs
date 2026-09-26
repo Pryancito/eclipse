@@ -1,3 +1,4 @@
+use alloc::vec::Vec;
 use core::convert::TryFrom;
 use kernel_hal::context::UserContextField;
 use {super::*, zircon_object::task::*};
@@ -36,14 +37,17 @@ impl Syscall<'_> {
             (),
         )?;
         let new_vmar = new_proc.vmar();
-        let proc_handle_value = proc.add_handle(Handle::new(new_proc, Rights::DEFAULT_PROCESS));
-        let vmar_handle_value = proc.add_handle(Handle::new(
-            new_vmar,
-            Rights::DEFAULT_VMAR | Rights::READ | Rights::WRITE | Rights::EXECUTE,
-        ));
-        proc_handle.write(proc_handle_value)?;
-        vmar_handle.write(vmar_handle_value)?;
-        Ok(())
+        install_handle_pair(
+            proc,
+            (
+                Handle::new(new_proc, Rights::DEFAULT_PROCESS),
+                Handle::new(
+                    new_vmar,
+                    Rights::DEFAULT_VMAR | Rights::READ | Rights::WRITE | Rights::EXECUTE,
+                ),
+            ),
+            (&mut proc_handle, &mut vmar_handle),
+        )
     }
 
     /// Exits the currently running process.
@@ -76,9 +80,11 @@ impl Syscall<'_> {
         let proc = self.thread.proc();
         let process = proc.get_object_with_rights::<Process>(proc_handle, Rights::MANAGE_THREAD)?;
         let thread = Thread::create(&process, name)?;
-        let handle = proc.add_handle(Handle::new(thread, Rights::DEFAULT_THREAD));
-        thread_handle.write(handle)?;
-        Ok(())
+        install_handle(
+            proc,
+            Handle::new(thread, Rights::DEFAULT_THREAD),
+            &mut thread_handle,
+        )
     }
 
     /// Start execution on a process.
@@ -133,10 +139,14 @@ impl Syscall<'_> {
         );
         let proc = self.thread.proc();
         let thread = proc.get_object_with_rights::<Thread>(handle, Rights::READ)?;
-        //TODO: Remove allocation
-        let mut buf = vec![0; buffer_size];
-        thread.read_state(kind, &mut buf)?;
-        buffer.write_array(&buf[..])?;
+        // The kernel buffer is as large as a state can be, not as large as the
+        // caller says: `vec![0; buffer_size]` with a `buffer_size` from
+        // userspace was an allocation of any size, and past what the heap
+        // has, a kernel panic. Only the bytes of the state come back, as
+        // `zx_thread_read_state` promises.
+        let mut buf = vec![0; buffer_size.min(MAX_THREAD_STATE_SIZE)];
+        let len = thread.read_state(kind, &mut buf)?;
+        buffer.write_array(&buf[..len])?;
         Ok(())
     }
 
@@ -174,12 +184,12 @@ impl Syscall<'_> {
             "job.set_critical: job={:#x?}, options={:#x}, process={:#x?}",
             job_handle, options, process_handle,
         );
-        let retcode_nonzero = if options == 1 {
-            true
-        } else if options == 0 {
-            false
-        } else {
-            unimplemented!()
+        // Any other option is the caller's mistake, not a kernel panic: this
+        // used to be `unimplemented!()`.
+        let retcode_nonzero = match options {
+            0 => false,
+            1 => true,
+            _ => return Err(ZxError::INVALID_ARGS),
         };
         let proc = self.thread.proc();
         let job = proc.get_object_with_rights::<Job>(job_handle, Rights::DESTROY)?;
@@ -277,23 +287,35 @@ impl Syscall<'_> {
     ) -> ZxResult {
         info!("task.suspend_token: handle={:?}, token={:?}", handle, token);
         let proc = self.thread.proc();
-        if let Ok(thread) = proc.get_object_with_rights::<Thread>(handle, Rights::WRITE) {
-            if Arc::ptr_eq(&thread, self.thread) {
-                return Err(ZxError::NOT_SUPPORTED);
+        // A handle that is not a thread's is an error that says which: a
+        // process is `NOT_SUPPORTED`, anything else `WRONG_TYPE`, a thread
+        // without the write right `ACCESS_DENIED`. All three used to answer
+        // `OK` and write no token, so the caller read one that was never
+        // there.
+        let (object, rights) = proc.get_dyn_object_and_rights(handle)?;
+        let thread = match object.downcast_arc::<Thread>() {
+            Ok(thread) => thread,
+            Err(object) => {
+                return Err(if object.downcast_arc::<Process>().is_ok() {
+                    ZxError::NOT_SUPPORTED
+                } else {
+                    ZxError::WRONG_TYPE
+                })
             }
-            if thread.state() == ThreadState::Dying || thread.state() == ThreadState::Dead {
-                return Err(ZxError::BAD_STATE);
-            }
-            let thread: Arc<dyn Task> = thread;
-            let token_handle =
-                Handle::new(SuspendToken::create(&thread), Rights::DEFAULT_SUSPEND_TOKEN);
-            token.write(proc.add_handle(token_handle))?;
-            return Ok(());
+        };
+        if !rights.contains(Rights::WRITE) {
+            return Err(ZxError::ACCESS_DENIED);
         }
-        if let Ok(_process) = proc.get_object_with_rights::<Process>(handle, Rights::WRITE) {
+        if Arc::ptr_eq(&thread, self.thread) {
             return Err(ZxError::NOT_SUPPORTED);
         }
-        Ok(())
+        if thread.state() == ThreadState::Dying || thread.state() == ThreadState::Dead {
+            return Err(ZxError::BAD_STATE);
+        }
+        let thread: Arc<dyn Task> = thread;
+        let token_handle =
+            Handle::new(SuspendToken::create(&thread), Rights::DEFAULT_SUSPEND_TOKEN);
+        install_handle(proc, token_handle, &mut token)
     }
 
     /// Kill the provided task (job, process, or thread).
@@ -301,17 +323,30 @@ impl Syscall<'_> {
         info!("task.kill: handle={:?}", handle);
         let proc = self.thread.proc();
 
-        if let Ok(job) = proc.get_object_with_rights::<Job>(handle, Rights::DESTROY) {
-            job.kill();
-        } else if let Ok(process) = proc.get_object_with_rights::<Process>(handle, Rights::DESTROY)
-        {
-            process.kill();
-        } else if let Ok(thread) = proc.get_object_with_rights::<Thread>(handle, Rights::DESTROY) {
-            thread.kill();
-        } else {
-            return Err(ZxError::WRONG_TYPE);
+        // As `sys_task_kill` in Zircon: the handle and its DESTROY right
+        // first, whatever the object is, then the three task types. This
+        // used to try the three types in turn and answer `WRONG_TYPE` to
+        // whatever failed all three, so a bad handle was `WRONG_TYPE` instead
+        // of `BAD_HANDLE`, and a job, process or thread handle without the
+        // right was `WRONG_TYPE` instead of `ACCESS_DENIED`: the caller was
+        // told it had the wrong kind of object when it had the right one and
+        // not enough rights to it.
+        let (object, rights) = proc.get_dyn_object_and_rights(handle)?;
+        if !rights.contains(Rights::DESTROY) {
+            return Err(ZxError::ACCESS_DENIED);
         }
-        Ok(())
+        let object = match object.downcast_arc::<Job>() {
+            Ok(job) => return Ok(job.kill()),
+            Err(object) => object,
+        };
+        let object = match object.downcast_arc::<Process>() {
+            Ok(process) => return Ok(process.kill()),
+            Err(object) => object,
+        };
+        match object.downcast_arc::<Thread>() {
+            Ok(thread) => Ok(thread.kill()),
+            Err(_) => Err(ZxError::WRONG_TYPE),
+        }
     }
 
     /// Create a new child job object given a parent job.
@@ -333,8 +368,7 @@ impl Syscall<'_> {
                 .get_object_with_rights::<Job>(parent, Rights::MANAGE_JOB)
                 .or_else(|_| proc.get_object_with_rights::<Job>(parent, Rights::WRITE))?;
             let child = parent_job.create_child()?;
-            out.write(proc.add_handle(Handle::new(child, Rights::DEFAULT_JOB)))?;
-            Ok(())
+            install_handle(proc, Handle::new(child, Rights::DEFAULT_JOB), &mut out)
         }
     }
 
@@ -360,12 +394,9 @@ impl Syscall<'_> {
                     JOB_POL_ABSOLUTE => SetPolicyOptions::Absolute,
                     _ => return Err(ZxError::INVALID_ARGS),
                 };
-                job.set_policy_basic(
-                    policy_option,
-                    UserInPtr::from(policy).as_slice(count as usize)?,
-                )
+                let policies = basic_policies(topic, policy, count)?;
+                job.set_policy_basic(policy_option, &policies)
             }
-            //JOB_POL_BASE_V2 => unimplemented!(),
             JOB_POL_TIMER_SLACK => {
                 if options != JOB_POL_RELATIVE {
                     return Err(ZxError::INVALID_ARGS);
@@ -387,7 +418,7 @@ impl Syscall<'_> {
         &self,
         handle_value: HandleValue,
         vaddr: usize,
-        mut buffer: UserOutPtr<u8>,
+        buffer: UserOutPtr<u8>,
         buffer_size: usize,
         mut actual: UserOutPtr<usize>,
     ) -> ZxResult {
@@ -397,10 +428,27 @@ impl Syscall<'_> {
         let proc = self.thread.proc();
         let process =
             proc.get_object_with_rights::<Process>(handle_value, Rights::READ | Rights::WRITE)?;
-        let mut data = vec![0u8; buffer_size];
-        let len = process.vmar().read_memory(vaddr, &mut data)?;
-        buffer.write_array(&data[..len])?;
-        actual.write(len)?;
+        // Through a bounded kernel buffer, a chunk at a time. `vec![0u8;
+        // buffer_size]` was an allocation of whatever the caller asked for, up
+        // to `MAX_BLOCK`: 64 MiB of kernel heap that a machine may not have
+        // to spare, and an allocation the heap cannot serve is not an error
+        // here but a kernel panic. Zircon copies straight into the caller's
+        // pages for the same reason.
+        let vmar = process.vmar();
+        let mut chunk = vec![0u8; buffer_size.min(READ_MEMORY_CHUNK)];
+        let mut done = 0;
+        while done < buffer_size {
+            let want = (buffer_size - done).min(chunk.len());
+            let len = vmar.read_memory(vaddr + done, &mut chunk[..want])?;
+            buffer.add(done).write_array(&chunk[..len])?;
+            done += len;
+            // The mapping ends here: what `read_memory` answers, and the
+            // whole of what Zircon reads for one call.
+            if len < want {
+                break;
+            }
+        }
+        actual.write(done)?;
         Ok(())
     }
 
@@ -436,3 +484,57 @@ const JOB_POL_RELATIVE: u32 = 0;
 const JOB_POL_ABSOLUTE: u32 = 1;
 
 const MAX_BLOCK: usize = 64 * 1024 * 1024; //64M
+/// Larger than any register set `zx_thread_read_state` can answer with.
+const MAX_THREAD_STATE_SIZE: usize = 4096;
+/// The kernel buffer `zx_process_read_memory` copies through, per round.
+const READ_MEMORY_CHUNK: usize = 64 * 1024;
+
+/// `zx_policy_basic_v2_t`: `zx_policy_basic_v1_t` (condition, action) plus a
+/// `flags` word, twelve bytes to the v1's eight.
+///
+/// `ZX_JOB_POL_BASIC_V2` used to be read with the v1 layout: the first entry
+/// came out right, and from the second on the kernel was reading each
+/// entry's `flags` as the next entry's condition and each condition as an
+/// action. Two v2 entries `[NEW_VMO deny, NEW_CHANNEL allow]` were parsed as
+/// `[NEW_VMO deny, BAD_HANDLE action=5]`, which is not an action, so the call
+/// was `INVALID_ARGS`; other arrays parsed into policies nobody asked for.
+/// `ZX_JOB_POL_BASIC` has meant the v2 layout in the Zircon SDK since 2020,
+/// so this is what every policy-setting program sends.
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+struct BasicPolicyV2 {
+    condition: u32,
+    action: u32,
+    /// `ZX_POL_OVERRIDE_ALLOW` (0) or `ZX_POL_OVERRIDE_DENY` (1): whether a
+    /// child job may set this condition differently. Every policy here
+    /// behaves as `OVERRIDE_DENY`, which is what a v1 policy is; the value is
+    /// checked, not modelled.
+    flags: u32,
+}
+
+const ZX_POL_OVERRIDE_ALLOW: u32 = 0;
+const ZX_POL_OVERRIDE_DENY: u32 = 1;
+
+/// The basic policies of a `zx_job_set_policy` call, read at the size the
+/// topic says they have.
+fn basic_policies(topic: u32, policy: usize, count: u32) -> ZxResult<Vec<BasicPolicy>> {
+    let count = count as usize;
+    if topic == JOB_POL_BASE_V1 {
+        return UserInPtr::<BasicPolicy>::from(policy)
+            .read_array(count)
+            .map_err(ZxError::from);
+    }
+    UserInPtr::<BasicPolicyV2>::from(policy)
+        .read_array(count)?
+        .into_iter()
+        .map(|v2| {
+            if v2.flags != ZX_POL_OVERRIDE_ALLOW && v2.flags != ZX_POL_OVERRIDE_DENY {
+                return Err(ZxError::INVALID_ARGS);
+            }
+            Ok(BasicPolicy {
+                condition: v2.condition,
+                action: v2.action,
+            })
+        })
+        .collect()
+}

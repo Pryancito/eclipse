@@ -33,8 +33,12 @@
 //! tests at the bottom parse every bit this module can produce back through
 //! those two types and demand that it survives.
 
-use super::consts::{lin_mman, lin_oflags, mman, oflags};
+use super::consts::{
+    fcntl, lin_fcntl, lin_madv, lin_mman, lin_msync, lin_oflags, lin_wait, madv, mman, msync,
+    oflags, rlimit, sig, wait,
+};
 use linux_object::error::{LxError, LxResult};
+use linux_object::process as lin_rlimit;
 
 /// The only page size this kernel maps with, as a shift.
 const PAGE_SHIFT: i32 = 12;
@@ -259,6 +263,347 @@ pub fn mmap_flags_to_linux(bsd: i32) -> LxResult<i32> {
     }
 
     Ok(out | excl)
+}
+
+/// The status flags `F_SETFL` may change and `F_GETFL` reports, in both
+/// spellings. `kern_fcntl` masks its argument to these and ignores the rest,
+/// so an `F_SETFL` word is never refused for a bit outside them.
+const STATUS_MAP: &[(i32, i32)] = &[
+    (oflags::O_NONBLOCK, lin_oflags::O_NONBLOCK),
+    (oflags::O_APPEND, lin_oflags::O_APPEND),
+    (oflags::O_ASYNC, lin_oflags::O_ASYNC),
+    (oflags::O_FSYNC, lin_oflags::O_SYNC),
+    (oflags::O_DIRECT, lin_oflags::O_DIRECT),
+    (oflags::O_DSYNC, lin_oflags::O_DSYNC),
+];
+
+/// The `F_SETFL` argument of a FreeBSD program, in Linux's spelling.
+///
+/// It used to go through untouched, and the two systems put the flags this
+/// command exists for on different bits: FreeBSD's `O_NONBLOCK` is `0x4`,
+/// which Linux does not use, so `fcntl(fd, F_SETFL, O_NONBLOCK)` from a
+/// FreeBSD binary left the descriptor blocking and answered 0.
+pub fn setfl_flags_to_linux(bsd: i32) -> i32 {
+    STATUS_MAP
+        .iter()
+        .filter(|(from, _)| bsd & from != 0)
+        .fold(0, |out, (_, to)| out | to)
+}
+
+/// The word `F_GETFL` hands a FreeBSD program: the access mode, and the
+/// status flags in FreeBSD's spelling.
+///
+/// A Linux answer read with FreeBSD's headers was a lie bit for bit: Linux
+/// `O_APPEND` (`0x400`) is FreeBSD's `O_TRUNC`, and Linux `O_NONBLOCK`
+/// (`0x800`) is FreeBSD's `O_EXCL`, so a program asking whether its socket
+/// was non-blocking was told about flags that do not exist on an open file.
+/// A Linux bit with no peer here is dropped: FreeBSD's headers cannot name it.
+pub fn open_flags_from_linux(lin: i32) -> i32 {
+    let mut out = lin & oflags::O_ACCMODE;
+    for &(bsd, l) in STATUS_MAP {
+        // Linux `O_SYNC` is two bits, one of them `O_DSYNC`; FreeBSD reports
+        // the strong one as `O_FSYNC` alone.
+        if l == lin_oflags::O_DSYNC && lin & lin_oflags::O_SYNC == lin_oflags::O_SYNC {
+            continue;
+        }
+        if lin & l == l {
+            out |= bsd;
+        }
+    }
+    out
+}
+
+/// What a FreeBSD `fcntl(2)` becomes here.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Fcntl {
+    /// The command in Linux's numbering, with its argument in Linux's
+    /// spelling.
+    Linux {
+        /// A `lin_fcntl` command.
+        cmd: usize,
+        /// Its argument.
+        arg: usize,
+    },
+    /// `F_DUP2FD` and `F_DUP2FD_CLOEXEC`: `dup2` and `dup3` by another name.
+    Dup2 {
+        /// The descriptor to land on.
+        target: usize,
+        /// Whether the new descriptor is close-on-exec.
+        cloexec: bool,
+    },
+}
+
+/// Translate a FreeBSD `fcntl(2)` command and argument.
+///
+/// The commands used to go through with their FreeBSD numbers: the five
+/// lowest happen to agree with Linux, and past them `F_DUPFD_CLOEXEC` (17)
+/// landed on Linux's `F_SETLEASE`, `F_DUP2FD` (10) on `F_SETSIG`, and the
+/// record locks (11-13) on `F_GETSIG`/`F_SETSIG`/nothing, all of which this
+/// kernel refuses with `EINVAL`. `F_SETFL` went through with FreeBSD's flag
+/// bits (see [`setfl_flags_to_linux`]).
+///
+/// The record locks are still `EINVAL`: FreeBSD's `struct flock` lays its
+/// fields out differently from Linux's (`l_start` first, `l_type` fifth), so
+/// passing the pointer through would read a lock request that was never
+/// made.
+pub fn fcntl_to_linux(cmd: usize, arg: usize) -> LxResult<Fcntl> {
+    let linux = |cmd, arg| Ok(Fcntl::Linux { cmd, arg });
+    match cmd {
+        fcntl::F_DUPFD => linux(lin_fcntl::F_DUPFD, arg),
+        fcntl::F_GETFD => linux(lin_fcntl::F_GETFD, arg),
+        // `FD_CLOEXEC` is 1 on both.
+        fcntl::F_SETFD => linux(lin_fcntl::F_SETFD, arg),
+        fcntl::F_GETFL => linux(lin_fcntl::F_GETFL, arg),
+        fcntl::F_SETFL => linux(
+            lin_fcntl::F_SETFL,
+            setfl_flags_to_linux(arg as i32) as u32 as usize,
+        ),
+        fcntl::F_GETOWN => linux(lin_fcntl::F_GETOWN, arg),
+        fcntl::F_SETOWN => linux(lin_fcntl::F_SETOWN, arg),
+        fcntl::F_DUPFD_CLOEXEC => linux(lin_fcntl::F_DUPFD_CLOEXEC, arg),
+        // The seal bits (`F_SEAL_SEAL`, `_SHRINK`, `_GROW`, `_WRITE`) are the
+        // same four on both.
+        fcntl::F_ADD_SEALS => linux(lin_fcntl::F_ADD_SEALS, arg),
+        fcntl::F_GET_SEALS => linux(lin_fcntl::F_GET_SEALS, arg),
+        fcntl::F_DUP2FD => Ok(Fcntl::Dup2 {
+            target: arg,
+            cloexec: false,
+        }),
+        fcntl::F_DUP2FD_CLOEXEC => Ok(Fcntl::Dup2 {
+            target: arg,
+            cloexec: true,
+        }),
+        _ => Err(LxError::EINVAL),
+    }
+}
+
+/// FreeBSD `wait4(2)` option bits and their Linux peers.
+const WAIT_MAP: &[(i32, i32)] = &[
+    (wait::WNOHANG, lin_wait::WNOHANG),
+    (wait::WUNTRACED, lin_wait::WUNTRACED),
+    (wait::WCONTINUED, lin_wait::WCONTINUED),
+    (wait::WNOWAIT, lin_wait::WNOWAIT),
+    (wait::WLINUXCLONE, lin_wait::WCLONE),
+];
+
+/// `wait4` reports exits and traps whether or not it is asked to, on both
+/// systems; Linux spells that by refusing `WEXITED` on `wait4` (it belongs
+/// to `waitid`), FreeBSD by accepting it as the default it already is.
+const WAIT_IGNORED: i32 = wait::WEXITED | wait::WTRAPPED;
+
+/// Translate the options word of a FreeBSD `wait4(2)`.
+///
+/// It used to go through untouched, and past the two lowest bits the two
+/// systems disagree: FreeBSD's `WCONTINUED` (4) is Linux's `WEXITED`, which
+/// `wait4` refuses, so a FreeBSD shell asking to hear about resumed jobs
+/// got `EINVAL`; and FreeBSD's `WNOWAIT` (8) is Linux's `WCONTINUED`, so a
+/// program asking to look without reaping reaped.
+pub fn wait_options_to_linux(bsd: i32) -> LxResult<i32> {
+    sift(bsd, WAIT_MAP, WAIT_IGNORED, 0)
+}
+
+/// FreeBSD `madvise(2)` advice in Linux's numbering.
+///
+/// It used to go through untouched, and the two tables only agree up to 4.
+/// FreeBSD's `MADV_FREE` is 5, which Linux does not have, so every purge
+/// jemalloc (FreeBSD's `malloc`) made was `EINVAL`. Worse, FreeBSD's
+/// `MADV_NOCORE` is 8, which is Linux's `MADV_FREE`: a program that asked for
+/// its key material to stay out of core dumps (libsodium's `sodium_mlock`
+/// does exactly this) was telling this kernel it could throw the pages away,
+/// and it did, so the keys read back as zeros.
+///
+/// FreeBSD's `MADV_DONTNEED` is a paging hint that keeps the contents, not
+/// Linux's, which empties the pages, so it becomes `MADV_NORMAL`: a hint not
+/// taken loses nothing, a page emptied loses the program's data. `NOSYNC`,
+/// `AUTOSYNC` and `PROTECT` have no Linux peer and no effect a program can
+/// see, so they are accepted as hints too.
+pub fn madvise_to_linux(bsd: usize) -> LxResult<usize> {
+    Ok(match bsd {
+        madv::MADV_NORMAL => lin_madv::MADV_NORMAL,
+        madv::MADV_RANDOM => lin_madv::MADV_RANDOM,
+        madv::MADV_SEQUENTIAL => lin_madv::MADV_SEQUENTIAL,
+        madv::MADV_WILLNEED => lin_madv::MADV_WILLNEED,
+        madv::MADV_DONTNEED => lin_madv::MADV_NORMAL,
+        madv::MADV_FREE => lin_madv::MADV_FREE,
+        madv::MADV_NOSYNC | madv::MADV_AUTOSYNC | madv::MADV_PROTECT => lin_madv::MADV_NORMAL,
+        madv::MADV_NOCORE => lin_madv::MADV_DONTDUMP,
+        madv::MADV_CORE => lin_madv::MADV_DODUMP,
+        _ => return Err(LxError::EINVAL),
+    })
+}
+
+/// The `msync(2)` flag pairs.
+const MSYNC_MAP: &[(i32, i32)] = &[
+    (msync::MS_ASYNC, lin_msync::MS_ASYNC),
+    (msync::MS_INVALIDATE, lin_msync::MS_INVALIDATE),
+    (msync::MS_SYNC, lin_msync::MS_SYNC),
+];
+
+/// FreeBSD `msync(2)` flags in Linux's spelling.
+///
+/// `MS_SYNC` is `0x10` on FreeBSD and `4` on Linux, so passed through it was
+/// a flag Linux does not have: every `msync(addr, len, MS_SYNC)` from a
+/// FreeBSD program was `EINVAL`, and a database that fsyncs its mapped file
+/// that way believed the write never reached the disk. `MS_ASYNC` and
+/// `MS_INVALIDATE` happen to agree.
+pub fn msync_flags_to_linux(bsd: i32) -> LxResult<i32> {
+    sift(bsd, MSYNC_MAP, 0, 0)
+}
+
+/// A FreeBSD `getrlimit(2)`/`setrlimit(2)` resource in Linux's numbering.
+///
+/// It used to go through untouched, and the two tables part ways at 6:
+/// FreeBSD's `RLIMIT_NOFILE` is 8, which is Linux's `RLIMIT_MEMLOCK`, so
+/// `sysconf(_SC_OPEN_MAX)` (FreeBSD's libc asks `getrlimit` for it) came
+/// back as the locked-memory limit, and a daemon that raises its own
+/// descriptor limit at startup was raising how much memory it may pin. And
+/// FreeBSD's `RLIMIT_NPROC` is 7, Linux's `RLIMIT_NOFILE`: a program
+/// lowering how many processes it may fork was lowering how many files it
+/// may open, with itself as the first casualty.
+///
+/// The resources FreeBSD has and Linux does not (socket buffer bytes,
+/// pseudo-terminals, swap, kqueues, umtx keys) are refused rather than
+/// answered with some other limit's numbers.
+pub fn rlimit_to_linux(bsd: usize) -> LxResult<usize> {
+    Ok(match bsd {
+        rlimit::RLIMIT_CPU => lin_rlimit::RLIMIT_CPU,
+        rlimit::RLIMIT_FSIZE => lin_rlimit::RLIMIT_FSIZE,
+        rlimit::RLIMIT_DATA => lin_rlimit::RLIMIT_DATA,
+        rlimit::RLIMIT_STACK => lin_rlimit::RLIMIT_STACK,
+        rlimit::RLIMIT_CORE => lin_rlimit::RLIMIT_CORE,
+        rlimit::RLIMIT_RSS => lin_rlimit::RLIMIT_RSS,
+        rlimit::RLIMIT_MEMLOCK => lin_rlimit::RLIMIT_MEMLOCK,
+        rlimit::RLIMIT_NPROC => lin_rlimit::RLIMIT_NPROC,
+        rlimit::RLIMIT_NOFILE => lin_rlimit::RLIMIT_NOFILE,
+        rlimit::RLIMIT_VMEM => lin_rlimit::RLIMIT_AS,
+        rlimit::RLIMIT_SBSIZE
+        | rlimit::RLIMIT_NPTS
+        | rlimit::RLIMIT_SWAP
+        | rlimit::RLIMIT_KQUEUES
+        | rlimit::RLIMIT_UMTXP => return Err(LxError::EOPNOTSUPP),
+        _ => return Err(LxError::EINVAL),
+    })
+}
+
+/// A FreeBSD signal number in Linux's numbering, for `kill(2)`.
+///
+/// It used to go through untouched, and the two tables agree only on the
+/// old Unix signals. The ones that moved are the ones programs send on
+/// purpose: FreeBSD's `SIGCONT` is 19, which is Linux's `SIGSTOP`, so a
+/// FreeBSD program resuming a child was stopping it; its `SIGSTOP` is 17,
+/// Linux's `SIGCHLD`, which the child ignored; its `SIGUSR1` is 30, Linux's
+/// `SIGPWR`, whose default disposition is to terminate, so a `kill -USR1`
+/// meant to reload a configuration killed the daemon; and its `SIGCHLD` is
+/// 20, Linux's `SIGTSTP`.
+///
+/// Zero (a permission probe) passes as zero. The signals with no Linux peer
+/// (`SIGEMT`, `SIGINFO`, `SIGTHR`, `SIGLIBRT`) are refused; so is a number
+/// above FreeBSD's last, `kill(2)`'s own `EINVAL`.
+pub fn signal_to_linux(bsd: usize) -> LxResult<usize> {
+    Ok(match bsd {
+        0..=6 | 8 | 9 | 11 | 13..=15 | 21 | 22 | 24..=28 => bsd,
+        sig::SIGBUS => 7,
+        sig::SIGSYS => 31,
+        sig::SIGURG => 23,
+        sig::SIGSTOP => 19,
+        sig::SIGTSTP => 20,
+        sig::SIGCONT => 18,
+        sig::SIGCHLD => 17,
+        sig::SIGIO => 29,
+        sig::SIGUSR1 => 10,
+        sig::SIGUSR2 => 12,
+        sig::SIGEMT | sig::SIGINFO | sig::SIGTHR | sig::SIGLIBRT => return Err(LxError::EINVAL),
+        _ => return Err(LxError::EINVAL),
+    })
+}
+
+/// A Linux signal number in FreeBSD's numbering: the inverse of
+/// [`signal_to_linux`], for what the kernel reports rather than what the
+/// program sends. `None` for the two Linux signals FreeBSD lacks
+/// (`SIGSTKFLT`, `SIGPWR`).
+pub fn signal_from_linux(lin: usize) -> Option<usize> {
+    Some(match lin {
+        0..=6 | 8 | 9 | 11 | 13..=15 | 21 | 22 | 24..=28 => lin,
+        7 => sig::SIGBUS,
+        31 => sig::SIGSYS,
+        23 => sig::SIGURG,
+        19 => sig::SIGSTOP,
+        20 => sig::SIGTSTP,
+        18 => sig::SIGCONT,
+        17 => sig::SIGCHLD,
+        29 => sig::SIGIO,
+        10 => sig::SIGUSR1,
+        12 => sig::SIGUSR2,
+        _ => return None,
+    })
+}
+
+/// The `wait(2)` status word `sys_wait4` wrote, with its signal number in
+/// FreeBSD's numbering.
+///
+/// The two systems encode the word the same way (`sys/wait.h` is older than
+/// either): low seven bits zero is an exit with the code in the second byte,
+/// `0x7f` is a stop with the signal in the second byte, `0xffff` is a
+/// continue, and anything else is a death by the signal in the low seven
+/// bits, with `0x80` for a core dump. Only the signal NUMBER inside it is
+/// Linux's, so a FreeBSD parent whose child died of `SIGUSR1` read
+/// `WTERMSIG` as 10, its `SIGBUS`, and one whose child was stopped read
+/// `WSTOPSIG` 19 as `SIGCONT`. A number FreeBSD lacks is left as it is.
+pub fn wait_status_to_freebsd(status: i32) -> i32 {
+    const CONTINUED: i32 = 0xffff;
+    const STOPPED: i32 = 0x7f;
+    const CORE: i32 = 0x80;
+    if status == CONTINUED {
+        return status;
+    }
+    let low = status & 0x7f;
+    if low == 0 {
+        return status; // exited
+    }
+    if low == STOPPED {
+        let signal = ((status >> 8) & 0xff) as usize;
+        return match signal_from_linux(signal) {
+            Some(bsd) => ((bsd as i32) << 8) | STOPPED,
+            None => status,
+        };
+    }
+    match signal_from_linux(low as usize) {
+        Some(bsd) => (status & CORE) | bsd as i32,
+        None => status,
+    }
+}
+
+/// A FreeBSD `clockid_t` as the Linux `clockid_t` that `sys_clock_*` reads.
+///
+/// The two tables agree only on `CLOCK_REALTIME` (`sys/sys/_clock_id.h` vs
+/// `include/uapi/linux/time.h`): FreeBSD `CLOCK_MONOTONIC` is 4 where Linux
+/// uses 1, the CPU-time clocks are renumbered, and FreeBSD's `CLOCK_VIRTUAL`
+/// (1) and `CLOCK_PROF` (2), the process's user time and its user plus
+/// system time, are Linux's `CLOCK_MONOTONIC` and `CLOCK_PROCESS_CPUTIME_ID`
+/// by number: a FreeBSD program timing itself with `CLOCK_VIRTUAL` read
+/// the uptime. They are Linux's own CPU clocks of the calling process,
+/// `MAKE_PROCESS_CPUCLOCK(0, CPUCLOCK_VIRT | PROF)`, which are negative ids
+/// (`~0 << 3 | kind`). A number FreeBSD does not define (3, 6, 16 and up) is
+/// `EINVAL`, as its `clock_gettime` answers, rather than whatever Linux
+/// clock happens to sit at that number.
+pub fn clockid_to_linux(bsd: usize) -> LxResult<usize> {
+    /// `MAKE_PROCESS_CPUCLOCK(0, kind)`, read from the register as an `int`.
+    const fn own_process_cpuclock(kind: i32) -> usize {
+        ((!0i32 << 3) | kind) as u32 as usize
+    }
+    const CPUCLOCK_PROF: i32 = 0;
+    const CPUCLOCK_VIRT: i32 = 1;
+    Ok(match bsd {
+        // REALTIME and its _PRECISE(9)/_FAST(10)/SECOND(13) variants.
+        0 | 9 | 10 | 13 => 0,
+        // MONOTONIC(4) and the UPTIME(5,7,8) / MONOTONIC_PRECISE(11)/_FAST(12) family.
+        4 | 5 | 7 | 8 | 11 | 12 => 1,
+        1 => own_process_cpuclock(CPUCLOCK_VIRT), // CLOCK_VIRTUAL
+        2 => own_process_cpuclock(CPUCLOCK_PROF), // CLOCK_PROF
+        15 => 2,                                  // PROCESS_CPUTIME_ID
+        14 => 3,                                  // THREAD_CPUTIME_ID
+        _ => return Err(LxError::EINVAL),
+    })
 }
 
 #[cfg(test)]
@@ -570,5 +915,393 @@ mod tests {
             produced & !kept,
             produced
         );
+    }
+
+    #[test]
+    fn setfl_puts_nonblock_and_append_on_linux_bits() {
+        assert_eq!(
+            setfl_flags_to_linux(oflags::O_NONBLOCK),
+            lin_oflags::O_NONBLOCK
+        );
+        assert_eq!(setfl_flags_to_linux(oflags::O_APPEND), lin_oflags::O_APPEND);
+        assert_eq!(setfl_flags_to_linux(oflags::O_FSYNC), lin_oflags::O_SYNC);
+        // Bits `F_SETFL` does not change are dropped, not refused.
+        assert_eq!(setfl_flags_to_linux(oflags::O_CREAT | oflags::O_RDWR), 0);
+    }
+
+    #[test]
+    fn getfl_reads_back_in_freebsd_spelling() {
+        let lin = lin_oflags::O_RDWR | lin_oflags::O_NONBLOCK | lin_oflags::O_APPEND;
+        assert_eq!(
+            open_flags_from_linux(lin),
+            oflags::O_RDWR | oflags::O_NONBLOCK | oflags::O_APPEND
+        );
+        assert_eq!(open_flags_from_linux(lin_oflags::O_SYNC), oflags::O_FSYNC);
+        assert_eq!(open_flags_from_linux(lin_oflags::O_DSYNC), oflags::O_DSYNC);
+        // A Linux bit FreeBSD's headers cannot name is not handed over.
+        assert_eq!(
+            open_flags_from_linux(lin_oflags::O_CLOEXEC | lin_oflags::O_WRONLY),
+            oflags::O_WRONLY
+        );
+        // And the pair are inverses over the status flags.
+        let bsd = oflags::O_NONBLOCK | oflags::O_ASYNC | oflags::O_DIRECT;
+        assert_eq!(open_flags_from_linux(setfl_flags_to_linux(bsd)), bsd);
+    }
+
+    #[test]
+    fn fcntl_commands_land_on_their_linux_numbers() {
+        let lin = |cmd, arg| Fcntl::Linux { cmd, arg };
+        assert_eq!(fcntl_to_linux(fcntl::F_GETFD, 0), Ok(lin(1, 0)));
+        assert_eq!(
+            fcntl_to_linux(fcntl::F_DUPFD_CLOEXEC, 10),
+            Ok(lin(lin_fcntl::F_DUPFD_CLOEXEC, 10))
+        );
+        assert_eq!(
+            fcntl_to_linux(fcntl::F_GETOWN, 0),
+            Ok(lin(lin_fcntl::F_GETOWN, 0))
+        );
+        assert_eq!(
+            fcntl_to_linux(fcntl::F_SETFL, oflags::O_NONBLOCK as usize),
+            Ok(lin(lin_fcntl::F_SETFL, lin_oflags::O_NONBLOCK as usize))
+        );
+        assert_eq!(
+            fcntl_to_linux(fcntl::F_DUP2FD, 7),
+            Ok(Fcntl::Dup2 {
+                target: 7,
+                cloexec: false
+            })
+        );
+        assert_eq!(
+            fcntl_to_linux(fcntl::F_DUP2FD_CLOEXEC, 7),
+            Ok(Fcntl::Dup2 {
+                target: 7,
+                cloexec: true
+            })
+        );
+        // Record locks and anything unknown are EINVAL, as FreeBSD answers
+        // for a command it does not have.
+        assert_eq!(fcntl_to_linux(fcntl::F_SETLK, 0), Err(LxError::EINVAL));
+        assert_eq!(fcntl_to_linux(99, 0), Err(LxError::EINVAL));
+    }
+
+    #[test]
+    fn wait_options_move_to_their_linux_bits() {
+        assert_eq!(wait_options_to_linux(0), Ok(0));
+        assert_eq!(
+            wait_options_to_linux(wait::WNOHANG | wait::WUNTRACED),
+            Ok(lin_wait::WNOHANG | lin_wait::WUNTRACED)
+        );
+        assert_eq!(
+            wait_options_to_linux(wait::WCONTINUED),
+            Ok(lin_wait::WCONTINUED)
+        );
+        assert_eq!(wait_options_to_linux(wait::WNOWAIT), Ok(lin_wait::WNOWAIT));
+        // The default interests are accepted and add nothing.
+        assert_eq!(wait_options_to_linux(wait::WEXITED | wait::WTRAPPED), Ok(0));
+        assert_eq!(
+            wait_options_to_linux(wait::WLINUXCLONE),
+            Ok(lin_wait::WCLONE)
+        );
+        assert_eq!(wait_options_to_linux(0x40), Err(LxError::EINVAL));
+    }
+}
+
+/// `madvise(2)` and `msync(2)`, which used to hand their numbers through.
+#[cfg(test)]
+mod advice_tests {
+    use super::*;
+
+    #[test]
+    fn the_advice_the_two_systems_agree_on_passes_unchanged() {
+        for n in [0, 1, 2, 3] {
+            assert_eq!(madvise_to_linux(n), Ok(n));
+        }
+    }
+
+    #[test]
+    fn freebsd_madv_free_is_linux_madv_free_not_an_unknown_five() {
+        assert_eq!(madvise_to_linux(madv::MADV_FREE), Ok(lin_madv::MADV_FREE));
+        assert_eq!(lin_madv::MADV_FREE, 8);
+    }
+
+    #[test]
+    fn keeping_pages_out_of_a_core_dump_does_not_throw_them_away() {
+        // FreeBSD's 8 is Linux's MADV_FREE; passed through it discarded the
+        // very pages the program wanted kept private.
+        assert_eq!(
+            madvise_to_linux(madv::MADV_NOCORE),
+            Ok(lin_madv::MADV_DONTDUMP)
+        );
+        assert_ne!(madvise_to_linux(madv::MADV_NOCORE), Ok(lin_madv::MADV_FREE));
+        assert_eq!(madvise_to_linux(madv::MADV_CORE), Ok(lin_madv::MADV_DODUMP));
+    }
+
+    #[test]
+    fn freebsd_dontneed_keeps_the_contents_so_it_is_a_hint_here() {
+        assert_eq!(
+            madvise_to_linux(madv::MADV_DONTNEED),
+            Ok(lin_madv::MADV_NORMAL)
+        );
+        assert_ne!(
+            madvise_to_linux(madv::MADV_DONTNEED),
+            Ok(lin_madv::MADV_DONTNEED)
+        );
+    }
+
+    #[test]
+    fn the_hints_without_a_linux_peer_are_accepted_and_the_rest_refused() {
+        for n in [madv::MADV_NOSYNC, madv::MADV_AUTOSYNC, madv::MADV_PROTECT] {
+            assert_eq!(madvise_to_linux(n), Ok(lin_madv::MADV_NORMAL));
+        }
+        for n in [11, 16, 17, 100, usize::MAX] {
+            assert_eq!(madvise_to_linux(n), Err(LxError::EINVAL), "advice {}", n);
+        }
+    }
+
+    #[test]
+    fn ms_sync_moves_from_bit_four_to_bit_two() {
+        assert_eq!(msync_flags_to_linux(msync::MS_SYNC), Ok(lin_msync::MS_SYNC));
+        assert_eq!(lin_msync::MS_SYNC, 4);
+        assert_eq!(
+            msync_flags_to_linux(msync::MS_SYNC | msync::MS_INVALIDATE),
+            Ok(lin_msync::MS_SYNC | lin_msync::MS_INVALIDATE)
+        );
+        assert_eq!(
+            msync_flags_to_linux(msync::MS_ASYNC),
+            Ok(lin_msync::MS_ASYNC)
+        );
+        assert_eq!(msync_flags_to_linux(0), Ok(0));
+    }
+
+    #[test]
+    fn a_bit_that_is_no_msync_flag_anywhere_is_einval() {
+        // Linux's own MS_SYNC bit is not a FreeBSD flag.
+        assert_eq!(msync_flags_to_linux(4), Err(LxError::EINVAL));
+        assert_eq!(msync_flags_to_linux(0x100), Err(LxError::EINVAL));
+    }
+}
+
+/// `getrlimit`/`setrlimit` resources and `kill` signal numbers, which used
+/// to hand their numbers through.
+#[cfg(test)]
+mod number_tests {
+    use super::*;
+
+    #[test]
+    fn the_first_six_resources_are_the_same_on_both_systems() {
+        for n in 0..=5 {
+            assert_eq!(rlimit_to_linux(n), Ok(n));
+        }
+    }
+
+    #[test]
+    fn the_open_files_limit_is_not_the_locked_memory_limit() {
+        assert_eq!(
+            rlimit_to_linux(rlimit::RLIMIT_NOFILE),
+            Ok(lin_rlimit::RLIMIT_NOFILE)
+        );
+        assert_ne!(
+            rlimit_to_linux(rlimit::RLIMIT_NOFILE),
+            Ok(lin_rlimit::RLIMIT_MEMLOCK)
+        );
+        assert_eq!(
+            rlimit_to_linux(rlimit::RLIMIT_NPROC),
+            Ok(lin_rlimit::RLIMIT_NPROC)
+        );
+        assert_eq!(
+            rlimit_to_linux(rlimit::RLIMIT_MEMLOCK),
+            Ok(lin_rlimit::RLIMIT_MEMLOCK)
+        );
+        assert_eq!(
+            rlimit_to_linux(rlimit::RLIMIT_VMEM),
+            Ok(lin_rlimit::RLIMIT_AS)
+        );
+    }
+
+    #[test]
+    fn a_resource_linux_does_not_have_is_refused_not_answered_with_another() {
+        for n in [
+            rlimit::RLIMIT_SBSIZE,
+            rlimit::RLIMIT_NPTS,
+            rlimit::RLIMIT_SWAP,
+            rlimit::RLIMIT_KQUEUES,
+            rlimit::RLIMIT_UMTXP,
+        ] {
+            assert_eq!(
+                rlimit_to_linux(n),
+                Err(LxError::EOPNOTSUPP),
+                "resource {}",
+                n
+            );
+        }
+        assert_eq!(rlimit_to_linux(15), Err(LxError::EINVAL));
+        assert_eq!(rlimit_to_linux(usize::MAX), Err(LxError::EINVAL));
+    }
+
+    #[test]
+    fn the_old_unix_signals_keep_their_numbers() {
+        for n in [
+            0, 1, 2, 3, 4, 5, 6, 8, 9, 11, 13, 14, 15, 21, 22, 24, 25, 26, 27, 28,
+        ] {
+            assert_eq!(signal_to_linux(n), Ok(n), "signal {}", n);
+        }
+    }
+
+    #[test]
+    fn continuing_a_child_does_not_stop_it_and_stopping_it_is_not_ignored() {
+        // Linux: SIGCONT 18, SIGSTOP 19, SIGCHLD 17, SIGTSTP 20.
+        assert_eq!(signal_to_linux(sig::SIGCONT), Ok(18));
+        assert_eq!(signal_to_linux(sig::SIGSTOP), Ok(19));
+        assert_eq!(signal_to_linux(sig::SIGTSTP), Ok(20));
+        assert_eq!(signal_to_linux(sig::SIGCHLD), Ok(17));
+    }
+
+    #[test]
+    fn usr1_is_not_pwr_and_the_rest_of_the_moved_ones_land_on_their_names() {
+        // Linux: SIGUSR1 10, SIGUSR2 12, SIGBUS 7, SIGSYS 31, SIGURG 23, SIGIO 29.
+        assert_eq!(signal_to_linux(sig::SIGUSR1), Ok(10));
+        assert_eq!(signal_to_linux(sig::SIGUSR2), Ok(12));
+        assert_eq!(signal_to_linux(sig::SIGBUS), Ok(7));
+        assert_eq!(signal_to_linux(sig::SIGSYS), Ok(31));
+        assert_eq!(signal_to_linux(sig::SIGURG), Ok(23));
+        assert_eq!(signal_to_linux(sig::SIGIO), Ok(29));
+    }
+
+    #[test]
+    fn every_freebsd_signal_with_a_peer_lands_on_a_distinct_linux_one() {
+        let mut seen = alloc::collections::BTreeSet::new();
+        for n in 1..=33 {
+            if let Ok(lin) = signal_to_linux(n) {
+                assert!((1..=31).contains(&lin), "{} -> {}", n, lin);
+                assert!(seen.insert(lin), "{} lands on {} twice", n, lin);
+            }
+        }
+        // Linux's 1..=31 minus SIGSTKFLT (16) and SIGPWR (30), which FreeBSD lacks.
+        assert_eq!(seen.len(), 29);
+        assert!(!seen.contains(&16) && !seen.contains(&30));
+    }
+
+    #[test]
+    fn a_signal_linux_does_not_have_is_einval_and_so_is_one_past_the_end() {
+        for n in [
+            sig::SIGEMT,
+            sig::SIGINFO,
+            sig::SIGTHR,
+            sig::SIGLIBRT,
+            34,
+            64,
+            128,
+        ] {
+            assert_eq!(signal_to_linux(n), Err(LxError::EINVAL), "signal {}", n);
+        }
+    }
+}
+
+/// What `wait4` reports, in FreeBSD's signal numbers.
+#[cfg(test)]
+mod wait_status_tests {
+    use super::*;
+
+    #[test]
+    fn from_linux_undoes_to_linux_for_every_signal_with_a_peer() {
+        for bsd in 1..=33 {
+            if let Ok(lin) = signal_to_linux(bsd) {
+                assert_eq!(signal_from_linux(lin), Some(bsd), "{} -> {} -> ?", bsd, lin);
+            }
+        }
+        // And the two Linux signals FreeBSD lacks come back as nothing.
+        assert_eq!(signal_from_linux(16), None);
+        assert_eq!(signal_from_linux(30), None);
+        assert_eq!(signal_from_linux(32), None);
+    }
+
+    #[test]
+    fn an_exit_and_a_continue_are_left_alone() {
+        assert_eq!(wait_status_to_freebsd(0), 0);
+        assert_eq!(wait_status_to_freebsd(1 << 8), 1 << 8);
+        assert_eq!(wait_status_to_freebsd(255 << 8), 255 << 8);
+        assert_eq!(wait_status_to_freebsd(0xffff), 0xffff);
+    }
+
+    #[test]
+    fn a_child_killed_by_usr1_says_usr1_not_bus() {
+        // Linux SIGUSR1 is 10, which is FreeBSD's SIGBUS; FreeBSD SIGUSR1 is 30.
+        assert_eq!(wait_status_to_freebsd(10), 30);
+        // The core-dump bit rides along.
+        assert_eq!(wait_status_to_freebsd(10 | 0x80), 30 | 0x80);
+        // The old Unix signals are the same number on both.
+        assert_eq!(wait_status_to_freebsd(15), 15);
+        assert_eq!(wait_status_to_freebsd(9), 9);
+    }
+
+    #[test]
+    fn a_stopped_child_says_stop_not_cont() {
+        // Linux SIGSTOP 19 is FreeBSD's SIGCONT; FreeBSD SIGSTOP is 17.
+        assert_eq!(wait_status_to_freebsd((19 << 8) | 0x7f), (17 << 8) | 0x7f);
+        assert_eq!(wait_status_to_freebsd((20 << 8) | 0x7f), (18 << 8) | 0x7f);
+        // SIGTTIN is 21 on both.
+        assert_eq!(wait_status_to_freebsd((21 << 8) | 0x7f), (21 << 8) | 0x7f);
+    }
+
+    #[test]
+    fn a_signal_freebsd_lacks_keeps_its_linux_number() {
+        assert_eq!(wait_status_to_freebsd(30), 30);
+        assert_eq!(wait_status_to_freebsd((30 << 8) | 0x7f), (30 << 8) | 0x7f);
+    }
+}
+
+/// The FreeBSD clock ids, which passed through by number where they had
+/// no entry.
+#[cfg(test)]
+mod clockid_tests {
+    use super::*;
+    use linux_object::time::{clock_gettime_source, ClockSource, CpuClockKind, CpuClockOwner};
+
+    #[test]
+    fn the_wall_and_monotonic_families_map_to_realtime_and_monotonic() {
+        for bsd in [0, 9, 10, 13] {
+            assert_eq!(clockid_to_linux(bsd), Ok(0), "{}", bsd);
+        }
+        for bsd in [4, 5, 7, 8, 11, 12] {
+            assert_eq!(clockid_to_linux(bsd), Ok(1), "{}", bsd);
+        }
+        assert_eq!(clockid_to_linux(15), Ok(2)); // PROCESS_CPUTIME_ID
+        assert_eq!(clockid_to_linux(14), Ok(3)); // THREAD_CPUTIME_ID
+    }
+
+    /// `CLOCK_VIRTUAL` is the process's user time and `CLOCK_PROF` its user
+    /// plus system time. They used to reach `sys_clock_gettime` as 1 and 2:
+    /// the uptime, and (once that clock could be read) the scheduler's count.
+    #[test]
+    fn virtual_and_prof_are_the_callers_own_cpu_clocks() {
+        let virt = clockid_to_linux(1).unwrap();
+        let prof = clockid_to_linux(2).unwrap();
+        assert_eq!(
+            virt as u32 as i32, -7,
+            "MAKE_PROCESS_CPUCLOCK(0, CPUCLOCK_VIRT)"
+        );
+        assert_eq!(
+            prof as u32 as i32, -8,
+            "MAKE_PROCESS_CPUCLOCK(0, CPUCLOCK_PROF)"
+        );
+        for (id, kind) in [(virt, CpuClockKind::Virt), (prof, CpuClockKind::Prof)] {
+            match clock_gettime_source(id) {
+                Ok(ClockSource::Cpu(cpu)) => {
+                    assert_eq!(cpu.owner, CpuClockOwner::Process(0));
+                    assert_eq!(cpu.kind, kind);
+                }
+                other => panic!("{:#x} reads {:?}", id, other),
+            }
+        }
+    }
+
+    /// The holes in FreeBSD's table (3 and 6) and everything past its end
+    /// are `EINVAL`, not the Linux clock that shares the number: 3 was
+    /// `CLOCK_THREAD_CPUTIME_ID` and 6 `CLOCK_MONOTONIC_COARSE`.
+    #[test]
+    fn a_number_freebsd_does_not_define_is_einval() {
+        for bsd in [3, 6, 16, 17, 99, usize::MAX] {
+            assert_eq!(clockid_to_linux(bsd), Err(LxError::EINVAL), "{}", bsd);
+        }
     }
 }

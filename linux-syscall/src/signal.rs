@@ -12,7 +12,9 @@ use super::*;
 use crate::outparams::commit_and_report_old;
 use linux_object::error::LxResult;
 use linux_object::process::{Credentials, LinuxProcess};
-use linux_object::signal::{SigInfo, Signal, SignalAction, SignalStack, SignalStackFlags, Sigset};
+use linux_object::signal::{
+    SigInfo, Signal, SignalAction, SignalCode, SignalStack, SignalStackFlags, Sigset,
+};
 use linux_object::thread::ThreadExt;
 use linux_object::time::TimeSpec;
 use numeric_enum_macro::numeric_enum;
@@ -38,11 +40,9 @@ pub(crate) fn check_sigsetsize(sigsetsize: usize) -> Result<(), LxError> {
 }
 
 /// The arch-independent 12-byte prefix every `siginfo_t` layout starts with
-/// (`signo`, `errno`, `code`). `rt_sigqueueinfo` reads only this much: the
-/// permission rule is decided on `si_code` alone, and the union payload cannot
-/// be carried by the bitmask pending set anyway. Read as plain integers — the
-/// user-supplied code is unconstrained, so it must not be transmuted into the
-/// kernel's `SignalCode` enum.
+/// (`signo`, `errno`, `code`): what the permission rule of `rt_sigqueueinfo`
+/// and `pidfd_send_signal` is decided on. Plain integers, because the
+/// user-supplied code is unconstrained.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct SigInfoHead {
@@ -53,6 +53,17 @@ pub struct SigInfoHead {
     /// `si_code`: must be < 0 (and not SI_TKILL) when targeting another
     /// process.
     pub code: i32,
+}
+
+impl SigInfoHead {
+    /// The head of a whole `siginfo_t` the caller handed in.
+    pub fn of(info: &SigInfo) -> Self {
+        SigInfoHead {
+            signo: info.signo,
+            errno: info.errno,
+            code: info.code.0,
+        }
+    }
 }
 
 /// `pid_t` is the `int` of the uAPI, so `SYSCALL_DEFINE` casts the register to
@@ -163,7 +174,12 @@ fn deliver_direct_sigkill(
     caller: &Arc<zircon_object::task::Process>,
     process: &Arc<zircon_object::task::Process>,
 ) {
-    let retcode = (128 + Signal::SIGKILL as i32) as i64;
+    // A death by signal, not an `exit(137)`: `137` is the shell's own
+    // arithmetic over `WIFSIGNALED`, and stored as the exit code it made
+    // `kill -9` look like a program that had exited normally with 137 --
+    // `WIFSIGNALED` false, bash silent instead of "Killed", the parent's
+    // SIGCHLD saying `CLD_EXITED`.
+    let retcode = linux_object::process::exit_code_killed_by(Signal::SIGKILL as u8);
     match sigkill_outcome(caller.id(), process.id()) {
         KillOutcome::Caller => {
             // Same trace as send_signal_to_process: this path ends the target
@@ -191,8 +207,108 @@ fn deliver_direct_sigkill(
 /// `send_signal_to_process` carries the comment "that drop is why lunarbar's
 /// `kill 1` did nothing". Contention is likeliest exactly when the target is
 /// busy, which is when a signal matters.
-fn queue_signal_to_thread(thread: &Arc<Thread>, signal: Signal) {
-    thread.lock_linux().signals.insert(signal);
+fn queue_signal_to_thread(thread: &Arc<Thread>, signal: Signal, info: SigInfo) {
+    thread.lock_linux().queue_signal(signal, Some(info));
+    linux_object::process::wake_signal_sleeper(thread);
+}
+
+/// The `siginfo_t` a process queues with `rt_sigqueueinfo(2)`,
+/// `rt_tgsigqueueinfo(2)` or `pidfd_send_signal(2)`: the caller's own,
+/// verbatim, with `si_signo` forced to the signal the call named
+/// (`do_rt_sigqueueinfo`: `info->si_signo = sig`). Nothing else is
+/// rewritten, since `may_queue_siginfo` has already refused the codes that
+/// would forge a kernel or a `tkill`: `si_pid` and `si_uid` are what the
+/// sender wrote (glibc's `sigqueue(3)` fills them in itself) and `si_value`
+/// is the whole point of the call.
+///
+/// The syscalls used to read only the 12-byte head, decide the permission on
+/// it and then deliver the `siginfo_t` of a plain `kill(2)`: `SI_USER` and a
+/// zero `si_value`, whatever `sigqueue(pid, sig, value)` had sent.
+/// The wait of `rt_sigtimedwait(2)`: park `thread` until one of `waitset`
+/// is pending on it, dequeue that signal and return it with its `siginfo`.
+/// `EINTR` if an unblocked signal outside the set interrupts the wait,
+/// `EAGAIN` once `deadline` passes with nothing (`None`: no deadline).
+///
+/// Two things the old 10 ms polling loop got wrong. The wait is now
+/// announced in the thread's `sigwait` set, so a process-directed signal is
+/// queued to THIS thread although it is blocked here, as it is blocked
+/// everywhere: before, it went to the first thread of the process and the
+/// waiter never saw it (a program with a dedicated signal thread got no
+/// signal at all). And the wake is the signal itself, not a tick: a
+/// `sigwait` answers at once instead of up to 10 ms later, and an idle
+/// busybox `init` parked here no longer wakes a hundred times a second.
+///
+/// The set is cleared again on every way out, so a thread that has left
+/// the wait is not offered signals it no longer takes.
+pub(crate) async fn sigtimedwait_on(
+    thread: &Arc<Thread>,
+    waitset: Sigset,
+    deadline: Option<core::time::Duration>,
+) -> LxResult<(Signal, SigInfo)> {
+    use linux_object::process::SignalPark;
+    thread.lock_linux().sigwait = waitset;
+    let mut park = SignalPark::new(thread);
+    let outcome = loop {
+        park.prepare();
+        // A waited-for signal pending? Dequeue and return it.
+        {
+            let mut lt = thread.lock_linux();
+            let ready = Sigset::new(lt.signals.val() & waitset.val());
+            if let Some(sig) = ready.find_first_signal() {
+                let si = lt.take_siginfo(sig);
+                break Ok((sig, si));
+            }
+        }
+        // An unblocked signal *outside* `set` interrupts the wait (EINTR).
+        if let Err(e) = linux_object::process::check_signals_of(thread) {
+            break Err(e);
+        }
+        // Timed out with nothing delivered.
+        if let Some(end) = deadline {
+            if kernel_hal::timer::timer_now() >= end {
+                break Err(LxError::EAGAIN);
+            }
+        }
+        park.park(deadline).await;
+    };
+    thread.lock_linux().sigwait = Sigset::empty();
+    outcome
+}
+
+pub(crate) fn queued_from_user(signal: Signal, mut user: SigInfo) -> SigInfo {
+    user.signo = signal as i32;
+    user
+}
+
+/// The delivery a `KillContext` has already been allowed for one process:
+/// `info` is the caller's `siginfo_t` when the syscall carried one, else the
+/// `SI_USER` of a `kill(2)`, whose `si_pid`/`si_uid` are the caller's pid and
+/// REAL uid.
+fn deliver_to_process(
+    cx: &KillContext,
+    process: &Arc<zircon_object::task::Process>,
+    info: Option<SigInfo>,
+) -> LxResult<()> {
+    match cx.signal {
+        // kill(pid, 0): finding the process was the whole answer.
+        None => Ok(()),
+        Some(Signal::SIGKILL) => {
+            deliver_direct_sigkill(&cx.caller, process);
+            Ok(())
+        }
+        Some(sig) => linux_object::process::send_signal_to_process_with_info(
+            process.id() as usize,
+            sig,
+            Some(info.unwrap_or_else(|| {
+                SigInfo::from_user(
+                    sig,
+                    cx.caller.id() as i32,
+                    cx.credentials.ruid,
+                    SignalCode::USER,
+                )
+            })),
+        ),
+    }
 }
 
 /// `si_code` of a signal `tkill`/`tgkill` sent, which userland may not forge.
@@ -221,14 +337,6 @@ pub(crate) fn may_queue_siginfo(code: i32, target_is_self: bool) -> bool {
     target_is_self || (code < 0 && code != SI_TKILL)
 }
 
-/// `MINSIGSTKSZ` on the architectures this kernel runs.
-const MIN_SIGSTACK_SIZE: usize = 2048;
-
-/// The flags `sigaltstack(2)` accepts in `ss_flags`.
-const VALID_SIGSTACK_FLAGS: SignalStackFlags = SignalStackFlags::from_bits_truncate(
-    SignalStackFlags::AUTODISARM.bits() | SignalStackFlags::DISABLE.bits(),
-);
-
 /// Validate the stack `sigaltstack(2)` was handed, in the order Linux does it.
 ///
 /// `do_sigaltstack` answers `EPERM` for a thread running *on* the alternate
@@ -242,13 +350,7 @@ fn check_sigaltstack(ss: SignalStack, on_alternate_stack: bool) -> Result<(), Lx
     if on_alternate_stack {
         return Err(LxError::EPERM);
     }
-    if !VALID_SIGSTACK_FLAGS.contains(ss.flags) {
-        return Err(LxError::EINVAL);
-    }
-    if !ss.flags.contains(SignalStackFlags::DISABLE) && ss.size < MIN_SIGSTACK_SIZE {
-        return Err(LxError::ENOMEM);
-    }
-    Ok(())
+    ss.validate()
 }
 
 impl Syscall<'_> {
@@ -370,20 +472,27 @@ impl Syscall<'_> {
             if ss.is_null() {
                 return Ok(());
             }
-            let mut ss = ss.read()?;
+            let ss = ss.read()?;
             check_sigaltstack(ss, old.flags.contains(SignalStackFlags::ONSTACK))?;
             // `SS_DISABLE` forgets the stack, it does not merely park it:
             // Linux zeroes `ss_sp`/`ss_size` here, so the next
             // `sigaltstack(NULL, &old)` reports nothing installed rather
             // than an address the program may already have freed.
-            if ss.flags.contains(SignalStackFlags::DISABLE) {
-                ss.sp = 0;
-                ss.size = 0;
-            }
-            self.thread.lock_linux().signal_alternate_stack = ss;
+            self.thread.lock_linux().signal_alternate_stack = ss.as_installed();
             Ok(())
         })?;
         Ok(0)
+    }
+
+    /// The `siginfo_t` of a signal this thread's process is sending:
+    /// its pid and real uid, and how (`SI_TKILL`, `SI_QUEUE`).
+    fn sent_by_me(&self, signal: Signal, code: SignalCode) -> SigInfo {
+        SigInfo::from_user(
+            signal,
+            self.zircon_process().id() as i32,
+            self.linux_process().credentials().ruid,
+            code,
+        )
     }
 
     pub(crate) fn kill_context(&self, signal: Option<Signal>) -> KillContext {
@@ -418,22 +527,27 @@ impl Syscall<'_> {
         )
     }
 
-    /// The gate, then the delivery, for one process.
+    /// The gate, then the delivery, for one process: `kill(2)`, whose
+    /// `siginfo_t` the kernel fills in itself.
     pub(crate) fn signal_one_process(
         &self,
         cx: &KillContext,
         process: &Arc<zircon_object::task::Process>,
     ) -> LxResult<()> {
+        self.signal_one_process_with_info(cx, process, None)
+    }
+
+    /// The gate, then the delivery, for one process, with the `siginfo_t`
+    /// the caller supplied (`rt_sigqueueinfo`, `pidfd_send_signal`) or the
+    /// one `kill(2)` gets when it did not (`None`).
+    pub(crate) fn signal_one_process_with_info(
+        &self,
+        cx: &KillContext,
+        process: &Arc<zircon_object::task::Process>,
+        info: Option<SigInfo>,
+    ) -> LxResult<()> {
         self.may_signal_process(cx, process)?;
-        match cx.signal {
-            // kill(pid, 0): finding the process was the whole answer.
-            None => Ok(()),
-            Some(Signal::SIGKILL) => {
-                deliver_direct_sigkill(&cx.caller, process);
-                Ok(())
-            }
-            Some(sig) => linux_object::process::send_signal_to_process(process.id() as usize, sig),
-        }
+        deliver_to_process(cx, process, info)
     }
 
     /// `kill(pid, sig)` with a positive pid.
@@ -541,7 +655,11 @@ impl Syscall<'_> {
                 };
                 // tkill(tid, 0) probes the thread and delivers nothing.
                 if let Some(signal) = signal {
-                    queue_signal_to_thread(&thread, signal);
+                    queue_signal_to_thread(
+                        &thread,
+                        signal,
+                        self.sent_by_me(signal, SignalCode::TKILL),
+                    );
                 }
                 Ok(0)
             }
@@ -589,7 +707,7 @@ impl Syscall<'_> {
         self.may_signal_process(&self.kill_context(signal), &process)?;
         // tgkill(tgid, tid, 0) probes the thread and delivers nothing.
         if let Some(signal) = signal {
-            queue_signal_to_thread(&thread, signal);
+            queue_signal_to_thread(&thread, signal, self.sent_by_me(signal, SignalCode::TKILL));
         }
         Ok(0)
     }
@@ -660,11 +778,7 @@ impl Syscall<'_> {
         // (or the thread/process is being torn down). `check_signals` reports
         // this as `EINTR`, which is exactly the return value `sigsuspend` owes
         // its caller.
-        loop {
-            linux_object::process::check_signals()?;
-            let deadline = kernel_hal::timer::deadline_after(core::time::Duration::from_millis(10));
-            kernel_hal::thread::sleep_until(deadline).await;
-        }
+        Err(linux_object::process::wait_for_signal(self.thread).await)
     }
 
     /// Suspend the calling thread until a signal is delivered that either
@@ -673,11 +787,7 @@ impl Syscall<'_> {
     /// Always returns `-EINTR`.
     pub async fn sys_pause(&mut self) -> SysResult {
         info!("pause: thread {}", self.thread.id());
-        loop {
-            linux_object::process::check_signals()?;
-            let deadline = kernel_hal::timer::deadline_after(core::time::Duration::from_millis(10));
-            kernel_hal::thread::sleep_until(deadline).await;
-        }
+        Err(linux_object::process::wait_for_signal(self.thread).await)
     }
 
     /// Examine the set of signals that are pending for delivery to the calling
@@ -698,23 +808,24 @@ impl Syscall<'_> {
     /// Queue a signal plus caller-filled `siginfo` to a process
     /// (see rt_sigqueueinfo(2); the libc wrapper is `sigqueue(3)`).
     ///
-    /// The pending set is a bitmask (no per-signal siginfo queue), so the
-    /// accompanying value payload is not preserved — but the signal itself is
-    /// delivered with full disposition handling. The previous behaviour
-    /// returned success while dropping the signal entirely.
+    /// The caller's `siginfo_t` is what gets delivered (see
+    /// [`queued_from_user`]): a handler with `SA_SIGINFO`, a `sigwaitinfo`
+    /// or a signalfd reads the `si_value` that `sigqueue(pid, sig, value)`
+    /// sent. The previous behaviour returned success while dropping the
+    /// signal entirely, and then delivered it as a plain `kill(2)`.
     pub fn sys_rt_sigqueueinfo(
         &self,
         pid: usize,
         signum: usize,
-        info: UserInPtr<SigInfoHead>,
+        info: UserInPtr<SigInfo>,
     ) -> SysResult {
-        let head = info.read()?;
+        let user = info.read()?;
         info!(
             "rt_sigqueueinfo: pid={}, sig={}, si_code={}",
-            pid, signum, head.code
+            pid, signum, user.code.0
         );
         let pid = pid_arg(pid as isize);
-        if !may_queue_siginfo(head.code, pid as i64 == self.zircon_process().id() as i64) {
+        if !may_queue_siginfo(user.code.0, pid as i64 == self.zircon_process().id() as i64) {
             return Err(LxError::EPERM);
         }
         let process = ROOT_JOB.find_process(pid as KoID).ok_or(LxError::ESRCH)?;
@@ -725,7 +836,8 @@ impl Syscall<'_> {
         // target is found so that `ESRCH` keeps winning over `EINVAL`, as it
         // did before.
         let signal = Signal::from_syscall_arg(signum)?;
-        self.signal_one_process(&self.kill_context(signal), &process)
+        let info = signal.map(|sig| queued_from_user(sig, user));
+        self.signal_one_process_with_info(&self.kill_context(signal), &process, info)
             .map(|_| 0)
     }
 
@@ -736,19 +848,19 @@ impl Syscall<'_> {
         tgid: usize,
         tid: usize,
         signum: usize,
-        info: UserInPtr<SigInfoHead>,
+        info: UserInPtr<SigInfo>,
     ) -> SysResult {
-        let head = info.read()?;
+        let user = info.read()?;
         info!(
             "rt_tgsigqueueinfo: tgid={}, tid={}, sig={}, si_code={}",
-            tgid, tid, signum, head.code
+            tgid, tid, signum, user.code.0
         );
         let tgid = single_task_id(tgid)?;
         let tid = single_task_id(tid)?;
         // The target THREAD, not its thread group: forging an `si_code` at a
         // sibling thread is forging it at somebody else, and asking about the
         // group let that through.
-        if !may_queue_siginfo(head.code, tid == self.thread.id()) {
+        if !may_queue_siginfo(user.code.0, tid == self.thread.id()) {
             return Err(LxError::EPERM);
         }
         let process = ROOT_JOB.find_process(tgid).ok_or(LxError::ESRCH)?;
@@ -762,7 +874,7 @@ impl Syscall<'_> {
         // it is refused just the same, so it cannot report the existence of a
         // thread you may not signal.
         if let Some(signal) = signal {
-            queue_signal_to_thread(&thread, signal);
+            queue_signal_to_thread(&thread, signal, queued_from_user(signal, user));
         }
         Ok(0)
     }
@@ -807,38 +919,13 @@ impl Syscall<'_> {
             deadline,
             self.thread.id()
         );
-        loop {
-            // A waited-for signal already pending? Dequeue and return it. We do
-            // not have per-signal queued `siginfo` (pending signals are a plain
-            // bitmask), so only `si_signo` is reported — enough for callers like
-            // busybox init that follow up with `waitpid`.
-            {
-                let mut thread = self.thread.lock_linux();
-                let ready = Sigset::new(thread.signals.val() & waitset.val());
-                if let Some(sig) = ready.find_first_signal() {
-                    thread.signals.remove(sig);
-                    drop(thread);
-                    if !info.is_null() {
-                        let si = SigInfo {
-                            signo: sig as i32,
-                            ..SigInfo::default()
-                        };
-                        info.write(si)?;
-                    }
-                    return Ok(sig as usize);
-                }
-            }
-            // An unblocked signal *outside* `set` interrupts the wait (EINTR).
-            linux_object::process::check_signals()?;
-            // Timed out with nothing delivered.
-            if let Some(end) = deadline {
-                if kernel_hal::timer::timer_now() >= end {
-                    return Err(LxError::EAGAIN);
-                }
-            }
-            let next = kernel_hal::timer::deadline_after(core::time::Duration::from_millis(10));
-            kernel_hal::thread::sleep_until(next).await;
+        let (sig, si) = sigtimedwait_on(self.thread, waitset, deadline).await?;
+        // With what came with it: who sent it, which child it is about.
+        // `sigwaitinfo(3)` is how a program asks for that.
+        if !info.is_null() {
+            info.write(si)?;
         }
+        Ok(sig as usize)
     }
 
     /// Install a temporary blocked-signal mask for wait syscalls that take a
@@ -919,6 +1006,7 @@ impl Drop for TempSigmaskGuard {
 #[cfg(test)]
 mod signal_tests {
     use super::*;
+    use linux_object::signal::{MIN_SIGSTACK_SIZE, VALID_SIGSTACK_FLAGS};
 
     /// `pid_t` in a register, the way a caller leaves it there.
     fn reg(value: i32) -> usize {
@@ -1269,5 +1357,283 @@ mod signal_tests {
             ),
             Ok(())
         );
+    }
+}
+
+#[cfg(test)]
+mod queued_siginfo_tests {
+    //! `tkill`/`tgkill` queue straight onto the target thread; what they
+    //! leave for the handler goes with the signal.
+
+    use super::*;
+    use linux_object::process::LinuxProcess;
+    use linux_object::thread::ThreadExt;
+    use rcore_fs_ramfs::RamFS;
+    use zircon_object::task::ROOT_JOB;
+
+    #[test]
+    fn a_thread_signal_arrives_with_who_sent_it() {
+        let proc = Process::create_with_fixed_id_ext(
+            &ROOT_JOB,
+            43_201,
+            "t",
+            LinuxProcess::new(RamFS::new(), 0),
+        )
+        .unwrap();
+        let thread = Thread::create_linux(&proc).unwrap();
+        queue_signal_to_thread(
+            &thread,
+            Signal::SIGUSR1,
+            SigInfo::from_user(Signal::SIGUSR1, 31, 1000, SignalCode::TKILL),
+        );
+        let info = thread.lock_linux().take_siginfo(Signal::SIGUSR1);
+        let b = info.as_bytes();
+        let word = |at: usize| i32::from_ne_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]]);
+        assert_eq!(
+            (info.code, word(16), word(20)),
+            (SignalCode::TKILL, 31, 1000)
+        );
+    }
+
+    /// `(si_code, si_pid, si_uid, si_value)` where glibc reads them: the
+    /// union at byte 16, `si_value` eight bytes into it.
+    fn rt_fields(info: &SigInfo) -> (SignalCode, i32, i32, usize) {
+        let b = info.as_bytes();
+        let word = |at: usize| i32::from_ne_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]]);
+        let mut v = [0u8; core::mem::size_of::<usize>()];
+        let n = v.len();
+        v.copy_from_slice(&b[24..24 + n]);
+        (info.code, word(16), word(20), usize::from_ne_bytes(v))
+    }
+
+    fn a_process(pid: KoID) -> Arc<zircon_object::task::Process> {
+        Process::create_with_fixed_id_ext(&ROOT_JOB, pid, "p", LinuxProcess::new(RamFS::new(), 0))
+            .unwrap()
+    }
+
+    fn kill_context_of(caller: &Arc<zircon_object::task::Process>, signal: Signal) -> KillContext {
+        KillContext {
+            credentials: caller.linux().credentials(),
+            sid: linux_object::process::effective_sid(caller),
+            caller: caller.clone(),
+            signal: Some(signal),
+        }
+    }
+
+    /// `sigqueue(pid, SIGUSR1, 0xdead_beef)`: the handler used to see
+    /// `SI_USER` and a zero `si_value`, whatever was sent.
+    #[test]
+    fn the_queued_siginfo_is_the_senders_with_the_signal_number_forced() {
+        // glibc fills in si_signo itself, but the kernel trusts the
+        // argument, not the struct.
+        let user = SigInfo::queued(Signal::SIGUSR2, 77, 1000, 0xdead_beef);
+        let queued = queued_from_user(Signal::SIGUSR1, user);
+        assert_eq!(queued.signo, Signal::SIGUSR1 as i32);
+        assert_eq!(
+            rt_fields(&queued),
+            (SignalCode::QUEUE, 77, 1000, 0xdead_beef)
+        );
+    }
+
+    #[test]
+    fn a_queued_signal_reaches_the_process_with_its_value_and_a_kill_without_one() {
+        let caller = a_process(43_205);
+        let target = a_process(43_206);
+        let thread = Thread::create_linux(&target).unwrap();
+        let cx = kill_context_of(&caller, Signal::SIGUSR1);
+        let user = SigInfo::queued(Signal::SIGUSR1, caller.id() as i32, 0, 42);
+        deliver_to_process(&cx, &target, Some(queued_from_user(Signal::SIGUSR1, user))).unwrap();
+        let got = thread.lock_linux().take_siginfo(Signal::SIGUSR1);
+        assert_eq!(
+            rt_fields(&got),
+            (SignalCode::QUEUE, caller.id() as i32, 0, 42),
+            "the sender's si_value was dropped"
+        );
+        // Without a siginfo it is a kill(2): SI_USER from the caller.
+        deliver_to_process(&cx, &target, None).unwrap();
+        let got = thread.lock_linux().take_siginfo(Signal::SIGUSR1);
+        assert_eq!(
+            rt_fields(&got),
+            (SignalCode::USER, caller.id() as i32, 0, 0)
+        );
+    }
+}
+
+#[cfg(test)]
+mod direct_sigkill_tests {
+    //! The direct `SIGKILL` of `kill(2)` and `rt_sigqueueinfo(2)` ended the
+    //! target with the literal `128 + 9`: to `wait4` and to the SIGCHLD that
+    //! was an `exit(137)`, `WIFSIGNALED` false, and bash printed nothing
+    //! where it prints "Killed".
+
+    use super::*;
+    use linux_object::process::{exit_code_killed_by, wait_status_exited, LinuxProcess};
+    use rcore_fs_ramfs::RamFS;
+    use zircon_object::task::{Status, ROOT_JOB};
+
+    fn a_process(pid: KoID) -> Arc<zircon_object::task::Process> {
+        Process::create_with_fixed_id_ext(&ROOT_JOB, pid, "p", LinuxProcess::new(RamFS::new(), 0))
+            .unwrap()
+    }
+
+    fn killed_by_sigkill(proc: &Arc<zircon_object::task::Process>) {
+        let code = match proc.status() {
+            Status::Exited(code) => code,
+            other => panic!("not exited: {:?}", other),
+        };
+        assert_eq!(code, exit_code_killed_by(Signal::SIGKILL as u8));
+        let status = wait_status_exited(code);
+        assert_eq!(status & 0x7f, 9, "WTERMSIG of {:#x}", status);
+        assert_ne!(status >> 8 & 0xff, 137, "still the shell's 137");
+    }
+
+    #[test]
+    fn a_direct_sigkill_at_another_process_is_a_death_by_signal() {
+        let caller = a_process(43_202);
+        let target = a_process(43_203);
+        deliver_direct_sigkill(&caller, &target);
+        killed_by_sigkill(&target);
+        assert!(!matches!(caller.status(), Status::Exited(_)));
+    }
+
+    #[test]
+    fn a_direct_sigkill_at_oneself_is_a_death_by_signal_too() {
+        let caller = a_process(43_204);
+        deliver_direct_sigkill(&caller, &caller);
+        killed_by_sigkill(&caller);
+    }
+}
+
+#[cfg(test)]
+mod sigtimedwait_tests {
+    //! A program that blocks a signal in every thread and dedicates one to
+    //! `sigwait(3)` never got it: the signal was queued to the first thread
+    //! of the process, blocked there for good, and the waiter timed out.
+    extern crate std;
+
+    use super::*;
+    use core::time::Duration;
+    use linux_object::process::{send_signal_to_process, LinuxProcess};
+    use linux_object::signal::{SignalAction, SignalActionFlags, Sigset};
+    use rcore_fs_ramfs::RamFS;
+    use zircon_object::task::Process;
+
+    fn set_of(signal: Signal) -> Sigset {
+        Sigset::new(1 << (signal as u64 - 1))
+    }
+
+    /// A process whose two threads both block SIGUSR1; the second is the
+    /// one that will wait.
+    fn program(pid: KoID) -> (Arc<Process>, Arc<Thread>, Arc<Thread>) {
+        let proc = Process::create_with_fixed_id_ext(
+            &ROOT_JOB,
+            pid,
+            "sigwaiter",
+            LinuxProcess::new(RamFS::new(), 0),
+        )
+        .unwrap();
+        let main = Thread::create_linux(&proc).unwrap();
+        let waiter = Thread::create_linux(&proc).unwrap();
+        main.lock_linux().set_signal_mask(set_of(Signal::SIGUSR1));
+        waiter.lock_linux().set_signal_mask(set_of(Signal::SIGUSR1));
+        (proc, main, waiter)
+    }
+
+    fn later(pid: KoID, signal: Signal, after: Duration) {
+        std::thread::spawn(move || {
+            std::thread::sleep(after);
+            let _ = send_signal_to_process(pid as usize, signal);
+        });
+    }
+
+    fn wait(
+        thread: &Arc<Thread>,
+        signal: Signal,
+        timeout: Duration,
+    ) -> (LxResult<(Signal, SigInfo)>, Duration) {
+        let start = std::time::Instant::now();
+        let deadline = Some(kernel_hal::timer::timer_now() + timeout);
+        let r = async_std::task::block_on(sigtimedwait_on(thread, set_of(signal), deadline));
+        (r, start.elapsed())
+    }
+
+    #[test]
+    fn the_dedicated_signal_thread_receives_what_is_sent_to_its_process() {
+        let (proc, main, waiter) = program(43_601);
+        later(proc.id(), Signal::SIGUSR1, Duration::from_millis(50));
+        let (r, took) = wait(&waiter, Signal::SIGUSR1, Duration::from_secs(3));
+        let (sig, si) = r.expect("the waiter timed out: the signal went elsewhere");
+        assert_eq!(sig, Signal::SIGUSR1);
+        assert_eq!(si.signo, Signal::SIGUSR1 as i32);
+        assert!(took < Duration::from_secs(1), "answered after {:?}", took);
+        assert!(
+            !main.lock_linux().signals.contains(Signal::SIGUSR1),
+            "the signal was queued to the main thread too"
+        );
+        assert_eq!(waiter.lock_linux().sigwait.val(), 0, "wait set left behind");
+    }
+
+    #[test]
+    fn nothing_pending_times_out_with_eagain_and_leaves_no_wait_set_behind() {
+        let (_proc, _main, waiter) = program(43_602);
+        let (r, took) = wait(&waiter, Signal::SIGUSR1, Duration::from_millis(100));
+        assert_eq!(r.map(|(s, _)| s), Err(LxError::EAGAIN));
+        assert!(
+            took >= Duration::from_millis(100),
+            "gave up after {:?}",
+            took
+        );
+        assert_eq!(
+            waiter.lock_linux().sigwait.val(),
+            0,
+            "a thread that left the wait is still offered the signal"
+        );
+    }
+
+    #[test]
+    fn a_signal_already_pending_is_taken_without_waiting() {
+        let (proc, _main, waiter) = program(43_603);
+        waiter.lock_linux().queue_signal(
+            Signal::SIGUSR1,
+            Some(SigInfo::from_user(Signal::SIGUSR1, 7, 0, SignalCode::USER)),
+        );
+        let _ = proc;
+        let (r, took) = wait(&waiter, Signal::SIGUSR1, Duration::from_secs(3));
+        let (_, si) = r.unwrap();
+        let b = si.as_bytes();
+        assert_eq!(
+            i32::from_ne_bytes([b[16], b[17], b[18], b[19]]),
+            7,
+            "si_pid"
+        );
+        assert!(took < Duration::from_millis(500), "waited {:?}", took);
+    }
+
+    #[test]
+    fn a_caught_signal_outside_the_set_interrupts_the_wait() {
+        let (proc, main, waiter) = program(43_604);
+        // Aimed at the waiter: the main thread, which has SIGUSR2 unblocked
+        // as well, would otherwise be the thread to take it.
+        let mut both = set_of(Signal::SIGUSR1);
+        both.insert(Signal::SIGUSR2);
+        main.lock_linux().set_signal_mask(both);
+        proc.linux().set_signal_action(
+            Signal::SIGUSR2,
+            SignalAction {
+                handler: 0x1000,
+                flags: SignalActionFlags::empty(),
+                restorer: 0,
+                mask: Sigset::default(),
+            },
+        );
+        later(proc.id(), Signal::SIGUSR2, Duration::from_millis(50));
+        let (r, took) = wait(&waiter, Signal::SIGUSR1, Duration::from_secs(3));
+        assert_eq!(r.map(|(s, _)| s), Err(LxError::EINTR));
+        assert!(
+            took < Duration::from_secs(1),
+            "interrupted after {:?}",
+            took
+        );
+        assert_eq!(waiter.lock_linux().sigwait.val(), 0, "wait set left behind");
     }
 }

@@ -291,6 +291,7 @@ impl From<FsError> for LxError {
             FsError::Again => LxError::EAGAIN,
             FsError::TimedOut => LxError::ETIME,
             FsError::SymLoop => LxError::ELOOP,
+            FsError::NameTooLong => LxError::ENAMETOOLONG,
             FsError::Busy => LxError::EBUSY,
             FsError::ReadOnly => LxError::EROFS,
             FsError::Interrupted => LxError::EINTR,

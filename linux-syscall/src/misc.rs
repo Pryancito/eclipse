@@ -1,7 +1,8 @@
 use super::*;
 use core::time::Duration;
 use kernel_hal::timer::timer_now;
-use linux_object::process::{CAP_SYS_ADMIN, CAP_SYS_BOOT, CAP_SYS_RESOURCE};
+use linux_object::process::{CAP_SYS_ADMIN, CAP_SYS_BOOT, CAP_SYS_NICE, CAP_SYS_RESOURCE};
+use linux_object::thread::ThreadExt;
 use linux_object::time::*;
 use zircon_object::task::ThreadState;
 use zircon_object::{ZxError, ZxResult};
@@ -198,40 +199,56 @@ impl Syscall<'_> {
         Ok(0)
     }
 
-    /// get I/O scheduling class and priority
-    /// (see [linux man ioprio_get(2)](https://www.man7.org/linux/man-pages/man2/ioprio_set.2.html)).
+    /// `ioprio_get(2)`: the I/O priority of the task `which`/`who` names,
+    /// or the best (numerically lowest) one across a process group or a
+    /// user's tasks, as `ioprio_best` folds them.
     ///
-    /// There is no I/O scheduler to carry the value, so every task reports the
-    /// Linux default: best-effort class, priority 4 (what a task with nice 0
-    /// gets). `ionice` and `tar --ioprio` run happily against this.
+    /// A task that never set one reports what `get_task_ioprio` derives
+    /// from its nice value: best-effort, level `(nice + 20) / 5`. See
+    /// [`effective_ioprio`].
     pub fn sys_ioprio_get(&self, which: usize, who: usize) -> SysResult {
         info!("ioprio_get: which={}, who={}", which, who);
-        // IOPRIO_WHO_PROCESS / _PGRP / _USER
-        if !(1..=3).contains(&which) {
-            return Err(LxError::EINVAL);
-        }
-        const IOPRIO_CLASS_BE: usize = 2;
-        const IOPRIO_CLASS_SHIFT: usize = 13;
-        Ok((IOPRIO_CLASS_BE << IOPRIO_CLASS_SHIFT) | 4)
+        let which = ioprio_which(which)?;
+        let best = self
+            .priority_targets(which, who)?
+            .iter()
+            .map(|t| effective_ioprio(t.lock_linux().ioprio, t.sched_nice()))
+            .reduce(ioprio_best)
+            .ok_or(LxError::ESRCH)?;
+        Ok(best as usize)
     }
 
-    /// set I/O scheduling class and priority
-    /// (see [linux man ioprio_set(2)](https://www.man7.org/linux/man-pages/man2/ioprio_set.2.html)).
+    /// `ioprio_set(2)`: record the I/O priority of every task `which`/`who`
+    /// names.
     ///
-    /// Accepted and not acted upon (there is no I/O scheduler); arguments are
-    /// still validated so misuse fails loudly like on Linux.
+    /// This used to validate the class and answer 0, storing nothing and
+    /// asking nothing: `ionice -c3 -p PID` on a pid that did not exist
+    /// succeeded, on somebody else's process succeeded, `-c1` (real-time)
+    /// was granted to anyone, and `ionice -p PID` afterwards reported the
+    /// default whatever had been set. There is still no I/O scheduler to
+    /// act on the value, but a setting that reads back as set is what every
+    /// caller checks; the rest is Linux's order: `ioprio_check_cap` first
+    /// (`EINVAL`/`EPERM` before anybody is looked up), then the tasks
+    /// (`ESRCH` when there is none), then `set_task_ioprio`'s owner test on
+    /// each, stopping at the first refusal like the kernel's loop does.
+    ///
+    /// See [linux man ioprio_set(2)](https://www.man7.org/linux/man-pages/man2/ioprio_set.2.html).
     pub fn sys_ioprio_set(&self, which: usize, who: usize, ioprio: usize) -> SysResult {
         info!(
             "ioprio_set: which={}, who={}, ioprio={:#x}",
             which, who, ioprio
         );
-        if !(1..=3).contains(&which) {
-            return Err(LxError::EINVAL);
-        }
-        const IOPRIO_CLASS_SHIFT: usize = 13;
-        // Classes: 0 = none (inherit), 1 = RT, 2 = BE, 3 = IDLE.
-        if ioprio >> IOPRIO_CLASS_SHIFT > 3 {
-            return Err(LxError::EINVAL);
+        let caller = self.linux_process().credentials();
+        let capable = self.linux_process().capable(CAP_SYS_NICE)
+            || self.linux_process().capable(CAP_SYS_ADMIN);
+        let ioprio = ioprio_set_verdict(ioprio, capable)?;
+        let which = ioprio_which(which)?;
+        for thread in self.priority_targets(which, who)? {
+            let linux = thread.proc().try_linux().ok_or(LxError::ESRCH)?;
+            if !LinuxProcess::may_set_ioprio_of(&caller, &linux.credentials()) {
+                return Err(LxError::EPERM);
+            }
+            thread.lock_linux().ioprio = ioprio;
         }
         Ok(0)
     }
@@ -252,25 +269,28 @@ impl Syscall<'_> {
     ) -> SysResult {
         let hdr = header.read()?;
         info!("capget: version={:#x}, pid={}", hdr.version, hdr.pid);
-        let elems = match cap_version_elems(hdr.version) {
-            Some(n) => n,
-            None => {
-                header.write(CapUserHeader {
-                    version: LINUX_CAPABILITY_VERSION_3,
-                    pid: hdr.pid,
-                })?;
-                return Err(LxError::EINVAL);
-            }
+        if cap_version_elems(hdr.version).is_none() {
+            header.write(CapUserHeader {
+                version: LINUX_CAPABILITY_VERSION_3,
+                pid: hdr.pid,
+            })?;
+        }
+        let elems = match capget_plan(hdr.version, hdr.pid, data.is_null())? {
+            Some(elems) => elems,
+            None => return Ok(0),
         };
-        if hdr.pid < 0 {
-            return Err(LxError::EINVAL);
-        }
-        if data.is_null() {
-            return Ok(0);
-        }
-        // Built out of the same predicate every gate asks, so what this
-        // publishes and what the kernel honours cannot drift apart.
-        let caps = linux_object::process::published_capabilities(self.linux_process().euid());
+        // `cap_get_target_pid`: the caller's own sets, or those of the task
+        // `pid` names, which must exist (`ESRCH`). Built out of the same
+        // predicate every gate asks, so what this publishes and what the
+        // kernel honours cannot drift apart.
+        let euid = if capget_names_the_caller(hdr.pid, self.zircon_process().id()) {
+            self.linux_process().euid()
+        } else {
+            process_of_task(hdr.pid as KoID)
+                .and_then(|p| p.try_linux().map(|lp| lp.euid()))
+                .ok_or(LxError::ESRCH)?
+        };
+        let caps = linux_object::process::published_capabilities(euid);
         let mut out = [CapUserData::default(); 2];
         out[0].effective = caps as u32;
         out[0].permitted = caps as u32;
@@ -283,11 +303,18 @@ impl Syscall<'_> {
     /// set capabilities of a process
     /// (see [linux man capset(2)](https://www.man7.org/linux/man-pages/man2/capset.2.html)).
     ///
-    /// Version/pid validation matches [`sys_capget`](Self::sys_capget); the new
-    /// sets are then accepted without being stored — every root process already
-    /// holds the full set here and there is no privilege machinery for a
-    /// reduced set to constrain. Capability-dropping daemons proceed as if it
-    /// worked, which on this single-user kernel it effectively has.
+    /// The version negotiation is [`sys_capget`](Self::sys_capget)'s; then
+    /// Linux's own order (`SYSCALL_DEFINE2(capset)`, then `cap_capset`): the
+    /// call may only affect the caller (`EPERM` for any other pid, negative
+    /// ones included: there is no `EINVAL` for a bad pid here, unlike
+    /// `capget`), and the new sets must fit inside the old ones
+    /// ([`capset_sets_verdict`]). A set that passes is then accepted without
+    /// being stored: every root process holds the full set here and there is
+    /// no privilege machinery for a reduced set to constrain, so a daemon
+    /// dropping capabilities proceeds as if it worked, which on this
+    /// single-user kernel it effectively has. What is refused is what Linux
+    /// refuses: an unprivileged process granting itself capabilities, or
+    /// anyone making effective what is not permitted.
     pub fn sys_capset(
         &self,
         mut header: UserInOutPtr<CapUserHeader>,
@@ -305,10 +332,18 @@ impl Syscall<'_> {
                 return Err(LxError::EINVAL);
             }
         };
-        if hdr.pid < 0 {
-            return Err(LxError::EINVAL);
-        }
-        let _sets = data.read_array(elems)?;
+        capset_target(hdr.pid, self.zircon_process().id())?;
+        let new = CapSets::from_user(&data.read_array(elems)?);
+        // What this process holds now: the published set is both its
+        // permitted and its effective set, nothing is inheritable, and the
+        // bounding set is every capability (`PR_CAPBSET_READ` says so).
+        let held = linux_object::process::published_capabilities(self.linux_process().euid());
+        let old = CapSets {
+            effective: held,
+            permitted: held,
+            inheritable: 0,
+        };
+        capset_sets_verdict(&old, CAP_FULL_SET, &new)?;
         Ok(0)
     }
 
@@ -823,6 +858,9 @@ impl Syscall<'_> {
     /// or for its own pid, otherwise whichever process that is -- `ESRCH`
     /// when there is none, `EPERM` when it is not the caller's to touch.
     fn prlimit_target(&self, pid: usize) -> linux_object::error::LxResult<Arc<Process>> {
+        // A `pid_t`: the low 32 bits of the register, and a negative one is
+        // a task `find_task_by_vpid` does not find.
+        let pid = crate::intarg::task_pid(pid)?;
         let me = self.zircon_process();
         if pid == 0 || pid as u64 == me.id() {
             return Ok(me.clone());
@@ -1053,6 +1091,372 @@ fn cap_version_elems(version: u32) -> Option<usize> {
     }
 }
 
+/// Every capability there is: the bounding set of a process nothing has
+/// ever narrowed (`CAP_FULL_SET`).
+const CAP_FULL_SET: u64 = (1u64 << (linux_object::process::CAP_LAST_CAP + 1)) - 1;
+
+/// What `capget(2)` does before it looks at any process, from
+/// `SYSCALL_DEFINE2(capget)`:
+///
+/// ```c
+/// ret = cap_validate_magic(header, &tocopy);
+/// if ((dataptr == NULL) || (ret != 0))
+///         return ((dataptr == NULL) && (ret == -EINVAL)) ? 0 : ret;
+/// if (get_user(pid, &header->pid)) return -EFAULT;
+/// if (pid < 0) return -EINVAL;
+/// ```
+///
+/// `Ok(None)` is the probe: a null `data` is answered 0 whatever the header
+/// says, after the version was written back if it was unknown. That is how
+/// libcap learns the kernel's version (`capget(&hdr, NULL)` with version 0).
+/// It used to be `EINVAL` here whenever the version was unknown, null data or
+/// not, and `EINVAL` for a negative pid ahead of the null test as well.
+/// `Ok(Some(n))` is a real read of `n` elements.
+fn capget_plan(version: u32, pid: i32, data_is_null: bool) -> LxResult<Option<usize>> {
+    let elems = cap_version_elems(version);
+    if data_is_null {
+        return Ok(None);
+    }
+    let elems = elems.ok_or(LxError::EINVAL)?;
+    if pid < 0 {
+        return Err(LxError::EINVAL);
+    }
+    Ok(Some(elems))
+}
+
+/// Whether a `capget` `pid` names the caller: 0, or its own process id
+/// (`cap_get_target_pid`: `if (pid && (pid != task_pid_vnr(current)))`
+/// looks the task up, else `current`).
+fn capget_names_the_caller(pid: i32, self_pid: KoID) -> bool {
+    pid == 0 || pid as KoID == self_pid
+}
+
+/// The process the task `pid` belongs to: the process of that id, or the
+/// one owning a thread of that id, since Linux's `find_task_by_vpid` takes a
+/// TID. `None` when there is no such task.
+fn process_of_task(pid: KoID) -> Option<Arc<zircon_object::task::Process>> {
+    linux_object::process::find_process(pid).or_else(|| {
+        linux_object::process::all_live_processes()
+            .into_iter()
+            .find(|proc| proc.get_child(pid).is_ok())
+    })
+}
+
+/// `capset(2)`'s only target is the caller: `SYSCALL_DEFINE2(capset)`, `/*
+/// may only affect current now */ if (pid != 0 && pid != task_pid_vnr(current))
+/// return -EPERM;`. There is no `EINVAL` for a negative pid, unlike `capget`:
+/// -1 is just another process that is not the caller.
+///
+/// It used to answer 0 for any other pid, which told `setcap`-style tooling
+/// and anything that drops another process's capabilities that it had.
+fn capset_target(pid: i32, self_pid: KoID) -> LxResult {
+    if pid == 0 || pid as KoID == self_pid {
+        Ok(())
+    } else {
+        Err(LxError::EPERM)
+    }
+}
+
+/// The three capability sets as 64-bit masks, assembled from the one or two
+/// `CapUserData` elements the negotiated version transfers. Version 1
+/// sends one element, and the upper 32 bits are then zero (the kernel:
+/// `if (i < tocopy) ... else effective.val |= 0`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CapSets {
+    effective: u64,
+    permitted: u64,
+    inheritable: u64,
+}
+
+impl CapSets {
+    fn from_user(data: &[CapUserData]) -> Self {
+        let mut sets = CapSets {
+            effective: 0,
+            permitted: 0,
+            inheritable: 0,
+        };
+        for (i, elem) in data.iter().take(2).enumerate() {
+            let shift = 32 * i as u32;
+            sets.effective |= (elem.effective as u64) << shift;
+            sets.permitted |= (elem.permitted as u64) << shift;
+            sets.inheritable |= (elem.inheritable as u64) << shift;
+        }
+        sets
+    }
+}
+
+/// `cap_capset` (`security/commoncap.c`): may a process holding `old`, with
+/// bounding set `bset`, make `new` its sets? Four subset tests, each
+/// `EPERM`, in the kernel's order:
+///
+/// ```c
+/// if (!cap_issubset(*inheritable, cap_combine(old->cap_inheritable, old->cap_permitted)))
+///         return -EPERM;   /* incapable of using this inheritable set */
+/// if (!cap_issubset(*inheritable, cap_combine(old->cap_inheritable, old->cap_bset)))
+///         return -EPERM;   /* no new pI capabilities outside bounding set */
+/// if (!cap_issubset(*permitted, old->cap_permitted))
+///         return -EPERM;   /* verify restrictions on target's new Permitted set */
+/// if (!cap_issubset(*effective, *permitted))
+///         return -EPERM;   /* verify the _new_Effective_ is a subset of the _new_Permitted_ */
+/// ```
+///
+/// A set may only ever shrink: nothing checked this before, so a process
+/// running as any user could `capset` itself every capability and be told
+/// it had them (nothing stored them, but the answer was the lie).
+fn capset_sets_verdict(old: &CapSets, bset: u64, new: &CapSets) -> LxResult {
+    let subset = |part: u64, whole: u64| part & !whole == 0;
+    if !subset(new.inheritable, old.inheritable | old.permitted) {
+        return Err(LxError::EPERM);
+    }
+    if !subset(new.inheritable, old.inheritable | bset) {
+        return Err(LxError::EPERM);
+    }
+    if !subset(new.permitted, old.permitted) {
+        return Err(LxError::EPERM);
+    }
+    if !subset(new.effective, new.permitted) {
+        return Err(LxError::EPERM);
+    }
+    Ok(())
+}
+
+/// `IOPRIO_CLASS_SHIFT`: the class sits above a 13-bit level.
+const IOPRIO_CLASS_SHIFT: u16 = 13;
+/// `IOPRIO_CLASS_NONE`: never set; reads as the nice-derived best-effort.
+const IOPRIO_CLASS_NONE: u16 = 0;
+/// `IOPRIO_CLASS_RT`: real-time, `CAP_SYS_NICE`/`CAP_SYS_ADMIN` only.
+const IOPRIO_CLASS_RT: u16 = 1;
+/// `IOPRIO_CLASS_BE`: best-effort, the default class.
+const IOPRIO_CLASS_BE: u16 = 2;
+/// `IOPRIO_CLASS_IDLE`: served when nobody else wants the disk.
+const IOPRIO_CLASS_IDLE: u16 = 3;
+/// `IOPRIO_NR_LEVELS`: RT and BE have levels `0..8`.
+const IOPRIO_NR_LEVELS: u16 = 8;
+/// `IOPRIO_BE_NORM`: the best-effort level of a nice-0 task.
+const IOPRIO_BE_NORM: u16 = 4;
+
+/// `IOPRIO_PRIO_VALUE(class, level)`.
+const fn ioprio_value(class: u16, level: u16) -> u16 {
+    (class << IOPRIO_CLASS_SHIFT) | level
+}
+
+/// `IOPRIO_PRIO_CLASS` and `IOPRIO_PRIO_LEVEL` (`IOPRIO_PRIO_DATA`).
+fn ioprio_class_and_level(ioprio: u16) -> (u16, u16) {
+    (
+        ioprio >> IOPRIO_CLASS_SHIFT,
+        ioprio & ((1 << IOPRIO_CLASS_SHIFT) - 1),
+    )
+}
+
+/// `IOPRIO_WHO_PROCESS`/`_PGRP`/`_USER` are `1`/`2`/`3`; `setpriority`'s
+/// `PRIO_PROCESS`/`_PGRP`/`_USER` are `0`/`1`/`2` and mean the same three
+/// things (`who == 0` is "mine" in every flavour, in both calls). Anything
+/// else is `EINVAL`.
+fn ioprio_which(which: usize) -> LxResult<usize> {
+    match which {
+        1..=3 => Ok(which - 1),
+        _ => Err(LxError::EINVAL),
+    }
+}
+
+/// `ioprio_check_cap()`: what an `ioprio_set` word may say, and who may
+/// say it.
+///
+/// ```c
+/// switch (class) {
+/// case IOPRIO_CLASS_RT:
+///         if (!capable(CAP_SYS_NICE) && !capable(CAP_SYS_ADMIN))
+///                 return -EPERM;
+///         fallthrough;
+/// case IOPRIO_CLASS_BE:
+///         if (level >= IOPRIO_NR_LEVELS)
+///                 return -EINVAL;
+///         break;
+/// case IOPRIO_CLASS_IDLE:
+///         break;
+/// case IOPRIO_CLASS_NONE:
+///         if (level)
+///                 return -EINVAL;
+///         break;
+/// default:
+///         return -EINVAL;
+/// }
+/// ```
+///
+/// `capable` is the caller's `CAP_SYS_NICE || CAP_SYS_ADMIN`. The word
+/// comes back as the `u16` a thread stores.
+pub(crate) fn ioprio_set_verdict(ioprio: usize, capable: bool) -> LxResult<u16> {
+    let word = u16::try_from(ioprio).map_err(|_| LxError::EINVAL)?;
+    let (class, level) = ioprio_class_and_level(word);
+    match class {
+        IOPRIO_CLASS_RT | IOPRIO_CLASS_BE => {
+            if class == IOPRIO_CLASS_RT && !capable {
+                return Err(LxError::EPERM);
+            }
+            if level >= IOPRIO_NR_LEVELS {
+                return Err(LxError::EINVAL);
+            }
+        }
+        IOPRIO_CLASS_IDLE => {}
+        IOPRIO_CLASS_NONE => {
+            if level != 0 {
+                return Err(LxError::EINVAL);
+            }
+        }
+        _ => return Err(LxError::EINVAL),
+    }
+    Ok(word)
+}
+
+/// `task_nice_ioprio()`: the best-effort level a task that never set an I/O
+/// priority is served at, `(nice + 20) / 5`, so nice 0 is level 4 and the
+/// two ends of the nice range are levels 0 and 7.
+pub(crate) fn nice_ioprio(nice: i8) -> u16 {
+    let level = (nice as i16 + 20) / 5;
+    ioprio_value(IOPRIO_CLASS_BE, level as u16)
+}
+
+/// `get_task_ioprio()`: what a task reports -- the word it set, or, when
+/// its class is `IOPRIO_CLASS_NONE` (never set), [`nice_ioprio`].
+pub(crate) fn effective_ioprio(stored: u16, nice: i8) -> u16 {
+    if ioprio_class_and_level(stored).0 == IOPRIO_CLASS_NONE {
+        nice_ioprio(nice)
+    } else {
+        stored
+    }
+}
+
+/// `ioprio_best()`: of two effective priorities, the one served first. The
+/// word orders the right way round -- RT (1) below BE (2) below IDLE (3),
+/// and level 0 before level 7 within a class -- so it is the minimum; a
+/// class of NONE is read as the best-effort default first.
+pub(crate) fn ioprio_best(a: u16, b: u16) -> u16 {
+    let default = ioprio_value(IOPRIO_CLASS_BE, IOPRIO_BE_NORM);
+    let valid = |p: u16| {
+        if ioprio_class_and_level(p).0 == IOPRIO_CLASS_NONE {
+            default
+        } else {
+            p
+        }
+    };
+    valid(a).min(valid(b))
+}
+
+#[cfg(test)]
+mod ioprio_tests {
+    use super::*;
+
+    const RT: u16 = IOPRIO_CLASS_RT;
+    const BE: u16 = IOPRIO_CLASS_BE;
+    const IDLE: u16 = IOPRIO_CLASS_IDLE;
+
+    fn word(class: u16, level: u16) -> usize {
+        ioprio_value(class, level) as usize
+    }
+
+    #[test]
+    fn real_time_is_for_cap_sys_nice_only() {
+        assert_eq!(ioprio_set_verdict(word(RT, 4), false), Err(LxError::EPERM));
+        assert_eq!(
+            ioprio_set_verdict(word(RT, 4), true),
+            Ok(ioprio_value(RT, 4))
+        );
+        // The capability opens the class, not the level range.
+        assert_eq!(ioprio_set_verdict(word(RT, 8), true), Err(LxError::EINVAL));
+    }
+
+    #[test]
+    fn best_effort_has_eight_levels() {
+        for level in 0..IOPRIO_NR_LEVELS {
+            assert_eq!(
+                ioprio_set_verdict(word(BE, level), false),
+                Ok(ioprio_value(BE, level))
+            );
+        }
+        assert_eq!(ioprio_set_verdict(word(BE, 8), false), Err(LxError::EINVAL));
+        assert_eq!(
+            ioprio_set_verdict(word(BE, 0x1fff), true),
+            Err(LxError::EINVAL)
+        );
+    }
+
+    #[test]
+    fn idle_is_for_anyone_and_none_takes_no_level() {
+        assert_eq!(
+            ioprio_set_verdict(word(IDLE, 0), false),
+            Ok(ioprio_value(IDLE, 0))
+        );
+        assert_eq!(ioprio_set_verdict(word(IOPRIO_CLASS_NONE, 0), false), Ok(0));
+        assert_eq!(
+            ioprio_set_verdict(word(IOPRIO_CLASS_NONE, 1), false),
+            Err(LxError::EINVAL)
+        );
+    }
+
+    #[test]
+    fn an_unknown_class_or_a_word_too_wide_is_einval() {
+        assert_eq!(ioprio_set_verdict(word(4, 0), true), Err(LxError::EINVAL));
+        assert_eq!(ioprio_set_verdict(word(7, 3), true), Err(LxError::EINVAL));
+        assert_eq!(ioprio_set_verdict(1 << 16, true), Err(LxError::EINVAL));
+        assert_eq!(ioprio_set_verdict(usize::MAX, true), Err(LxError::EINVAL));
+    }
+
+    #[test]
+    fn a_task_that_never_set_one_is_best_effort_at_its_nice_level() {
+        assert_eq!(nice_ioprio(0), ioprio_value(BE, 4));
+        assert_eq!(nice_ioprio(-20), ioprio_value(BE, 0));
+        assert_eq!(nice_ioprio(19), ioprio_value(BE, 7));
+        assert_eq!(nice_ioprio(10), ioprio_value(BE, 6));
+        assert_eq!(nice_ioprio(-1), ioprio_value(BE, 3));
+        assert_eq!(effective_ioprio(0, 10), ioprio_value(BE, 6));
+    }
+
+    #[test]
+    fn what_was_set_is_what_is_read_back_whatever_the_nice() {
+        assert_eq!(
+            effective_ioprio(ioprio_value(IDLE, 0), -20),
+            ioprio_value(IDLE, 0)
+        );
+        assert_eq!(
+            effective_ioprio(ioprio_value(RT, 7), 19),
+            ioprio_value(RT, 7)
+        );
+        assert_eq!(
+            effective_ioprio(ioprio_value(BE, 0), 19),
+            ioprio_value(BE, 0)
+        );
+    }
+
+    #[test]
+    fn the_best_of_a_group_is_the_one_served_first() {
+        assert_eq!(
+            ioprio_best(ioprio_value(IDLE, 0), ioprio_value(BE, 7)),
+            ioprio_value(BE, 7)
+        );
+        assert_eq!(
+            ioprio_best(ioprio_value(BE, 7), ioprio_value(RT, 7)),
+            ioprio_value(RT, 7)
+        );
+        assert_eq!(
+            ioprio_best(ioprio_value(BE, 2), ioprio_value(BE, 5)),
+            ioprio_value(BE, 2)
+        );
+        // NONE reads as the best-effort default, so it loses to BE 2 and
+        // beats BE 5 -- it is not the numerically smallest word.
+        assert_eq!(ioprio_best(0, ioprio_value(BE, 5)), ioprio_value(BE, 4));
+        assert_eq!(ioprio_best(0, ioprio_value(BE, 2)), ioprio_value(BE, 2));
+    }
+
+    #[test]
+    fn the_who_flavours_are_offset_by_one_from_setpriority() {
+        assert_eq!(ioprio_which(1), Ok(0));
+        assert_eq!(ioprio_which(2), Ok(1));
+        assert_eq!(ioprio_which(3), Ok(2));
+        assert_eq!(ioprio_which(0), Err(LxError::EINVAL));
+        assert_eq!(ioprio_which(4), Err(LxError::EINVAL));
+    }
+}
+
 #[cfg(test)]
 mod capability_tests {
     use super::*;
@@ -1070,6 +1474,179 @@ mod capability_tests {
         for v in [0u32, 1, 0x2008_0523, u32::MAX] {
             assert_eq!(cap_version_elems(v), None, "version {:#x}", v);
         }
+    }
+
+    const V1: u32 = LINUX_CAPABILITY_VERSION_1;
+    const V3: u32 = LINUX_CAPABILITY_VERSION_3;
+
+    #[test]
+    fn a_capget_with_null_data_is_a_probe_that_always_answers_zero() {
+        // libcap: `capget(&hdr, NULL)` with version 0 to learn the kernel's
+        // version from the written-back header. The kernel answers 0 to a
+        // null `dataptr` whatever the header held, even a negative pid.
+        assert_eq!(capget_plan(0, 0, true), Ok(None));
+        assert_eq!(capget_plan(V3, 0, true), Ok(None));
+        assert_eq!(capget_plan(0, -1, true), Ok(None));
+        assert_eq!(capget_plan(V3, -1, true), Ok(None));
+    }
+
+    #[test]
+    fn a_capget_that_reads_needs_a_known_version_and_a_non_negative_pid() {
+        assert_eq!(capget_plan(V1, 0, false), Ok(Some(1)));
+        assert_eq!(capget_plan(V3, 42, false), Ok(Some(2)));
+        // The version first, then the pid: `cap_validate_magic` runs before
+        // the pid is even read.
+        assert_eq!(capget_plan(0, 0, false), Err(LxError::EINVAL));
+        assert_eq!(capget_plan(0, -1, false), Err(LxError::EINVAL));
+        assert_eq!(capget_plan(V3, -1, false), Err(LxError::EINVAL));
+        assert_eq!(capget_plan(V3, i32::MIN, false), Err(LxError::EINVAL));
+    }
+
+    #[test]
+    fn capget_looks_up_any_pid_but_zero_and_its_own() {
+        assert!(capget_names_the_caller(0, 7));
+        assert!(capget_names_the_caller(7, 7));
+        // Another process: `cap_get_target_pid` finds it (or ESRCH). It used
+        // to be answered with the caller's own sets, whether it existed or not.
+        assert!(!capget_names_the_caller(8, 7));
+        assert!(!capget_names_the_caller(1, 7));
+    }
+
+    #[test]
+    fn capset_may_only_affect_the_caller_and_says_eperm_to_everyone_else() {
+        assert_eq!(capset_target(0, 7), Ok(()));
+        assert_eq!(capset_target(7, 7), Ok(()));
+        // Another pid, existing or not, was answered 0 before.
+        assert_eq!(capset_target(8, 7), Err(LxError::EPERM));
+        assert_eq!(capset_target(1, 7), Err(LxError::EPERM));
+        // `SYSCALL_DEFINE2(capset)` has no `pid < 0` rule: -1 is EPERM like
+        // any other pid that is not the caller, not capget's EINVAL.
+        assert_eq!(capset_target(-1, 7), Err(LxError::EPERM));
+        assert_eq!(capset_target(i32::MIN, 7), Err(LxError::EPERM));
+    }
+
+    #[test]
+    fn the_sets_are_assembled_low_element_first_and_v1_leaves_the_top_half_zero() {
+        let low = CapUserData {
+            effective: 0x1,
+            permitted: 0x3,
+            inheritable: 0x7,
+        };
+        let high = CapUserData {
+            effective: 0x10,
+            permitted: 0x30,
+            inheritable: 0x70,
+        };
+        assert_eq!(
+            CapSets::from_user(&[low]),
+            CapSets {
+                effective: 0x1,
+                permitted: 0x3,
+                inheritable: 0x7
+            }
+        );
+        assert_eq!(
+            CapSets::from_user(&[low, high]),
+            CapSets {
+                effective: 0x10_0000_0001,
+                permitted: 0x30_0000_0003,
+                inheritable: 0x70_0000_0007
+            }
+        );
+        assert_eq!(
+            CapSets::from_user(&[]),
+            CapSets {
+                effective: 0,
+                permitted: 0,
+                inheritable: 0
+            }
+        );
+    }
+
+    #[test]
+    fn the_full_set_is_every_capability_up_to_cap_last_cap() {
+        use linux_object::process::CAP_LAST_CAP;
+        assert_eq!(CAP_FULL_SET.count_ones(), CAP_LAST_CAP + 1);
+        assert_ne!(CAP_FULL_SET & (1 << CAP_LAST_CAP), 0);
+        assert_eq!(CAP_FULL_SET & (1 << (CAP_LAST_CAP + 1)), 0);
+    }
+
+    fn sets(effective: u64, permitted: u64, inheritable: u64) -> CapSets {
+        CapSets {
+            effective,
+            permitted,
+            inheritable,
+        }
+    }
+
+    #[test]
+    fn a_process_may_drop_capabilities_but_never_gain_them() {
+        let root = sets(CAP_FULL_SET, CAP_FULL_SET, 0);
+        // Dropping to a subset, or to nothing, is what daemons do.
+        assert_eq!(
+            capset_sets_verdict(&root, CAP_FULL_SET, &sets(0x3, 0x3, 0)),
+            Ok(())
+        );
+        assert_eq!(
+            capset_sets_verdict(&root, CAP_FULL_SET, &sets(0, 0, 0)),
+            Ok(())
+        );
+        assert_eq!(capset_sets_verdict(&root, CAP_FULL_SET, &root), Ok(()));
+        // An unprivileged process holds nothing, so any bit is a gain: EPERM.
+        // It used to be answered 0.
+        let nobody = sets(0, 0, 0);
+        assert_eq!(capset_sets_verdict(&nobody, CAP_FULL_SET, &nobody), Ok(()));
+        assert_eq!(
+            capset_sets_verdict(&nobody, CAP_FULL_SET, &sets(0, 0x1, 0)),
+            Err(LxError::EPERM)
+        );
+        assert_eq!(
+            capset_sets_verdict(&nobody, CAP_FULL_SET, &sets(0, 0, 0x1)),
+            Err(LxError::EPERM)
+        );
+        // A permitted bit outside the old permitted set is a gain for root
+        // too: bit 41 is above CAP_LAST_CAP and root does not hold it.
+        assert_eq!(
+            capset_sets_verdict(&root, CAP_FULL_SET, &sets(0, 1 << 41, 0)),
+            Err(LxError::EPERM)
+        );
+    }
+
+    #[test]
+    fn the_effective_set_must_fit_in_the_new_permitted_set() {
+        let root = sets(CAP_FULL_SET, CAP_FULL_SET, 0);
+        // Keep bit 0 permitted and make bit 1 effective: `cap_capset`'s
+        // last test, against the NEW permitted set, not the old one.
+        assert_eq!(
+            capset_sets_verdict(&root, CAP_FULL_SET, &sets(0x2, 0x1, 0)),
+            Err(LxError::EPERM)
+        );
+        assert_eq!(
+            capset_sets_verdict(&root, CAP_FULL_SET, &sets(0x1, 0x1, 0)),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn the_inheritable_set_is_bounded_by_what_is_held_and_by_the_bounding_set() {
+        let held = sets(0x7, 0x7, 0x8);
+        // Old inheritable | old permitted = 0xf; bit 4 is in neither.
+        assert_eq!(
+            capset_sets_verdict(&held, CAP_FULL_SET, &sets(0, 0x7, 0xf)),
+            Ok(())
+        );
+        assert_eq!(
+            capset_sets_verdict(&held, CAP_FULL_SET, &sets(0, 0x7, 0x10)),
+            Err(LxError::EPERM)
+        );
+        // Bit 2 is permitted but outside a bounding set of {0, 1, 3}: no new
+        // inheritable capability outside the bounding set.
+        assert_eq!(
+            capset_sets_verdict(&held, 0xb, &sets(0, 0x7, 0x4)),
+            Err(LxError::EPERM)
+        );
+        // ...unless it was inheritable already (old inheritable | bset).
+        assert_eq!(capset_sets_verdict(&held, 0x7, &sets(0, 0x7, 0x8)), Ok(()));
     }
 }
 

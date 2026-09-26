@@ -154,35 +154,65 @@ impl dyn INode {
     }
 
     /// Lookup path from current INode, and follow symlinks at most `follow_times` times
+    ///
+    /// With `follow_times == 0` no symlink is followed: one met as the last
+    /// component is returned as it is (`lstat`, `readlink`), one met on the
+    /// way is `NotDir`. With a budget, running out of it is `SymLoop`, as
+    /// `ELOOP` on Linux, never the symlink itself: a link that points at
+    /// itself used to come back as an ordinary file whose contents were its
+    /// own name.
     pub fn lookup_follow(&self, path: &str, follow_times: usize) -> Result<Arc<dyn INode>> {
-        if self.metadata()?.type_ != FileType::Dir {
+        lookup_with_budget(self, path, follow_times, follow_times > 0)
+    }
+}
+
+/// The longest symlink target `lookup_follow` resolves: Linux's `PATH_MAX`.
+/// A longer one is `NameTooLong`. It used to be read into 256 bytes and cut
+/// there without a word, so a long target resolved to whatever its first 256
+/// bytes named.
+pub const SYMLINK_MAX: usize = 4096;
+
+/// What a symlink points at, whole.
+fn read_symlink(inode: &dyn INode) -> Result<String> {
+    let mut content = alloc::vec![0u8; SYMLINK_MAX + 1];
+    let len = inode.read_at(0, &mut content)?;
+    if len > SYMLINK_MAX {
+        return Err(FsError::NameTooLong);
+    }
+    content.truncate(len);
+    String::from_utf8(content).map_err(|_| FsError::NotDir)
+}
+
+fn lookup_with_budget(
+    start: &dyn INode,
+    path: &str,
+    follow_times: usize,
+    following: bool,
+) -> Result<Arc<dyn INode>> {
+    if start.metadata()?.type_ != FileType::Dir {
+        return Err(FsError::NotDir);
+    }
+
+    // handle absolute path
+    let (mut result, mut rest_path) = if let Some(rest) = path.strip_prefix('/') {
+        (start.fs().root_inode(), String::from(rest))
+    } else {
+        (start.find(".")?, String::from(path))
+    };
+
+    while !rest_path.is_empty() {
+        if result.metadata()?.type_ != FileType::Dir {
             return Err(FsError::NotDir);
         }
-
-        // handle absolute path
-        let (mut result, mut rest_path) = if let Some(rest) = path.strip_prefix('/') {
-            (self.fs().root_inode(), String::from(rest))
-        } else {
-            (self.find(".")?, String::from(path))
-        };
-
-        while !rest_path.is_empty() {
-            if result.metadata()?.type_ != FileType::Dir {
-                return Err(FsError::NotDir);
+        let name;
+        match rest_path.find('/') {
+            None => {
+                name = rest_path;
+                rest_path = String::new();
             }
-            let name;
-            match rest_path.find('/') {
-                None => {
-                    name = rest_path;
-                    rest_path = String::new();
-                }
-                Some(pos) => {
-                    name = String::from(&rest_path[0..pos]);
-                    rest_path = String::from(&rest_path[pos + 1..]);
-                }
-            };
-            if name.is_empty() {
-                continue;
+            Some(pos) => {
+                name = String::from(&rest_path[0..pos]);
+                rest_path = String::from(&rest_path[pos + 1..]);
             }
             let inode = result.find(&name)?;
             // Handle symlink
@@ -204,9 +234,15 @@ impl dyn INode {
             } else {
                 result = inode
             }
+            let link_path = read_symlink(&*inode)?;
+            // result remains unchanged
+            let new_path = link_path + "/" + &rest_path;
+            return lookup_with_budget(&*result, &new_path, follow_times - 1, following);
+        } else {
+            result = inode
         }
-        Ok(result)
     }
+    Ok(result)
 }
 
 pub enum IOCTLError {
@@ -345,6 +381,7 @@ pub enum FsError {
     Again,          // E_AGAIN, when no data is available, never happens in fs
     TimedOut,       // E_TIME (62), a wait reached its deadline -- e.g. DRM_IOCTL_SYNCOBJ_WAIT
     SymLoop,        // E_LOOP
+    NameTooLong,    // E_NAMETOOLONG, e.g. a symlink target past `SYMLINK_MAX`
     Busy,           // E_BUSY
     ReadOnly,       // E_ROFS
     Interrupted,    // E_INTR

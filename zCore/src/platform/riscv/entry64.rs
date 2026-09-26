@@ -3,6 +3,7 @@ global_asm!(include_str!("boot.asm"));
 use core::arch::{asm, global_asm};
 use core::str::FromStr;
 use kernel_hal::arch::sbi::{hart_start, send_ipi, SBI_SUCCESS};
+use kernel_hal::hart_walk::{outcome, Outcome};
 use kernel_hal::KernelConfig;
 
 #[no_mangle]
@@ -59,6 +60,10 @@ pub extern "C" fn primary_rust_main(hartid: usize, device_tree_paddr: usize) -> 
     for id in 0..usize::from_str(consts::SMP).expect("can't parse SMP as usize.") {
         #[cfg(feature = "board-fu740")]
         if id == 0 {
+            // The fu740's hart 0 is an S7 monitor core the SEE will not hand
+            // over. This `cfg` is the hard-coded form of what `outcome` below
+            // now works out for any board: it is kept because skipping the
+            // call is cheaper than making it and reading the refusal.
             continue;
         }
 
@@ -69,14 +74,27 @@ pub extern "C" fn primary_rust_main(hartid: usize, device_tree_paddr: usize) -> 
                 secondary_hart_start as *const () as usize - PHY_MEM_OFS, // cal physical address
                 0,
             );
-            if err_code != SBI_SUCCESS {
-                panic!("start hart{} failed. error code={}", id, err_code);
+            // A hart the SEE will not start used to `panic!` here, which took
+            // down a machine that had every other core waiting on it. The
+            // other two architectures skip the CPU and boot with the ones that
+            // came up; so does this now.
+            match outcome(err_code) {
+                Outcome::Started => {}
+                Outcome::AlreadyOn => println!("hart{id} was already running"),
+                Outcome::Absent => {
+                    println!("hart{id} is not this SEE's to start");
+                    continue;
+                }
+                Outcome::Failed(code) => {
+                    println!("start hart{id} failed. error code={code}");
+                    continue;
+                }
             }
 
             let hart_mask: usize = 1 << id;
             let err_code = send_ipi(&hart_mask as *const _ as usize);
             if err_code != SBI_SUCCESS {
-                panic!("send ipi to hart{} failed. error code={}", id, err_code);
+                println!("send ipi to hart{id} failed. error code={err_code}");
             }
         } else {
             println!("hart{id} is the primary hart");

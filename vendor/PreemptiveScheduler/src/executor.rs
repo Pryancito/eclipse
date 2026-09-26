@@ -63,13 +63,73 @@ pub struct Executor {
     /// straight back onto the faulting instruction on a corrupt stack. This
     /// flag makes the runtime take the replace path instead.
     force_replace: AtomicBool,
-    /// [null-exec guard] Resume-ownership latch: 0 = parked/idle, `cpu+1` =
-    /// the CPU currently standing on this executor's stack. The runtime CAS-es
-    /// it before every `switch` INTO the executor and releases it only after
-    /// control is back on the runtime stack (the executor's frame saved and
-    /// parked). A second resumer — the double-consume that pops a dead frame's
-    /// zeros as `ret`/`cr3` — fails the CAS and is reported instead of run.
-    resume_owner: core::sync::atomic::AtomicUsize,
+    /// [null-exec guard] Resume-ownership latch. See [`ResumeClaim`].
+    resume_claim: ResumeClaim,
+}
+
+/// [null-exec guard] The exclusive right to stand on one executor's stack.
+///
+/// The runtime claims it before every `switch` INTO the executor and releases
+/// it only once control is back on the runtime stack, with the executor's frame
+/// saved and parked. A second resumer is the double-consume that pops a dead
+/// frame's zeros as `ret`/`cr3`, so it must fail and be reported, never run.
+///
+/// `0` means parked, and a holder is stored as **`cpu + 1`**. The bias is not
+/// cosmetic: `Drop` reads this latch to decide whether a CPU is still standing
+/// on the stack, and leaks the block if one is. Storing the raw id would make
+/// **CPU 0** — the BSP, the CPU that runs almost everything — indistinguishable
+/// from parked, so dropping an executor CPU 0 was executing on would hand its
+/// block back to the buddy heap: the `[double-alloc]` that lets a later
+/// `Vec`/`Box` land on a live coroutine stack and zero its saved return slots.
+///
+/// Split out of `Executor` so the rules below can be tested without allocating
+/// a multi-MiB stack, which is the only reason they had no tests at all.
+pub(crate) struct ResumeClaim(core::sync::atomic::AtomicUsize);
+
+/// The latch value that means "nobody is standing on this stack".
+const PARKED: usize = 0;
+
+impl ResumeClaim {
+    pub(crate) const fn new() -> Self {
+        Self(core::sync::atomic::AtomicUsize::new(PARKED))
+    }
+
+    /// Claim the stack for `cpu`. `Err(holder)` names the CPU that already has
+    /// it — including `cpu` itself, because coming back round to an executor
+    /// this CPU is already standing on is not re-entrancy to allow, it is the
+    /// same double-consume seen from one CPU. The caller must NOT switch in.
+    pub(crate) fn try_claim(&self, cpu: usize) -> Result<(), usize> {
+        use core::sync::atomic::Ordering::{AcqRel, Acquire};
+        match self.0.compare_exchange(PARKED, cpu + 1, AcqRel, Acquire) {
+            Ok(_) => Ok(()),
+            Err(holder) => Err(holder - 1),
+        }
+    }
+
+    /// Release the claim `cpu` holds. `Err(holder)` means the latch did not name
+    /// `cpu`: either nobody held it, or another CPU did.
+    ///
+    /// The latch is cleared either way, on purpose. Refusing to clear would
+    /// leave the executor unresumable for the rest of the boot, which is worse
+    /// than the bookkeeping slip being reported — and this is a guard whose job
+    /// is to *name* what went wrong, not to add a second way to wedge.
+    pub(crate) fn release_by(&self, cpu: usize) -> Result<(), Option<usize>> {
+        let held = self.0.swap(PARKED, core::sync::atomic::Ordering::AcqRel);
+        match held {
+            PARKED => Err(None),
+            h if h - 1 == cpu => Ok(()),
+            h => Err(Some(h - 1)),
+        }
+    }
+
+    /// The CPU standing on this stack, if any. Read by `Drop` to decide whether
+    /// the block may be recycled.
+    pub(crate) fn holder(&self) -> Option<usize> {
+        match self.0.load(core::sync::atomic::Ordering::Acquire) {
+            PARKED => None,
+            h => Some(h - 1),
+        }
+    }
 }
 
 /// Idle-loop iterations since any task was last polled (hang detector; see the
@@ -650,6 +710,13 @@ static SPINE_BASE: [core::sync::atomic::AtomicUsize; SPINE_SLOTS] =
 static SPINE_GEN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 /// One full smash report is enough; later mismatches only bump this.
 static SPINE_SMASHES: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+/// Registrations the table had no room for, i.e. live executors whose spine
+/// slot is watched by nobody. Monotonic, like the stack registries'
+/// [`STACK_REG_OVERFLOW`] — and for the same reason: the whole hunt is built on
+/// "a hit on a registered slot is the corruptor", so a slot that never got
+/// registered is a blind spot, and a blind spot nobody counts reads exactly
+/// like a clean run.
+static SPINE_OVERFLOW: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
 fn spine_register(slot: usize, val: u64, exec_id: usize, stack_base: usize) {
     use core::sync::atomic::Ordering::{AcqRel, Relaxed, Release};
@@ -668,7 +735,26 @@ fn spine_register(slot: usize, val: u64, exec_id: usize, stack_base: usize) {
             return;
         }
     }
-    // Full: this executor's slot simply goes unwatched (diagnostic best-effort).
+    // Full: this executor's slot goes unwatched. Best-effort as a diagnostic,
+    // but not silent — 16 slots cover "CPUs + parked weaks" and the sibling
+    // pool's cap of 32 was already found too small by a GL=1 burst, so say so
+    // rather than letting the hunt look armed while the victim is unwatched.
+    let n = SPINE_OVERFLOW.fetch_add(1, Relaxed) + 1;
+    if n <= 4 {
+        error!(
+            "[spine] registry full ({} slots): executor id={} slot {:#x} goes UNWATCHED \
+             (dropped {} so far) — a smash on it will be seen by neither the debug \
+             registers nor the tick sweep",
+            SPINE_SLOTS, exec_id, slot, n,
+        );
+    }
+}
+
+/// Spine registrations dropped because the table was full: live executors whose
+/// slot no watchpoint covers and no sweep reads. Non-zero means the hunt has
+/// blind spots; zero means every live executor was watched.
+pub fn unwatched_spine_slots() -> usize {
+    SPINE_OVERFLOW.load(core::sync::atomic::Ordering::Relaxed)
 }
 
 fn spine_unregister(slot: usize) {
@@ -734,6 +820,17 @@ pub fn spine_snapshot(out: &mut [usize]) -> usize {
 /// Returns the owning executor id when registered.
 pub fn spine_owner_of(addr: usize) -> Option<usize> {
     use core::sync::atomic::Ordering::{Acquire, Relaxed};
+    // The two values the table uses for itself, which no slot address can be:
+    // `0` is an empty entry and `usize::MAX` is one being reserved. Matching on
+    // either handed back whatever executor id the entry held last — a stale one
+    // for an empty entry, an unpublished one for a reserving entry — so the
+    // caller would read "registered, and this is the victim" for an address
+    // nobody is watching, and then dereference it. Today's one caller filters
+    // both out before asking (`ours()` drops a disabled register), which is why
+    // this has never fired; the filter belongs here, where the promise is made.
+    if addr == 0 || addr == usize::MAX {
+        return None;
+    }
     for i in 0..SPINE_SLOTS {
         if SPINE_ADDR[i].load(Acquire) == addr {
             return Some(SPINE_EXEC[i].load(Relaxed));
@@ -790,6 +887,14 @@ pub fn spine_verify() -> Option<SpineSmash> {
         }
         // Seqlock-ish: if a register/unregister raced this read, skip — the
         // mismatch may pair a new slot with an old value or a poisoned stack.
+        //
+        // The one rule here no test pins, and it cannot be: what it suppresses
+        // is a false report in a race, and a false report is byte-for-byte the
+        // same as a true one. A single thread cannot move the generation under
+        // its own read, and a second thread that moves it cannot tell the
+        // suppressed report from the report the sweep is supposed to make.
+        // Removing these three lines leaves the sweep correct on a quiet table
+        // and wrong only in the window it exists for.
         if SPINE_GEN.load(Acquire) != gen0 || SPINE_ADDR[i].load(Acquire) != a {
             continue;
         }
@@ -1008,7 +1113,7 @@ impl Executor {
             current_waker: core::ptr::null(),
             abandoned: AtomicBool::new(false),
             force_replace: AtomicBool::new(false),
-            resume_owner: core::sync::atomic::AtomicUsize::new(0),
+            resume_claim: ResumeClaim::new(),
         }));
 
         pin_executor.init_stack_and_context();
@@ -1370,22 +1475,43 @@ impl Executor {
     /// now would be the double-consume that pops a dead frame (`ret` to 0 /
     /// `cr3` garbage). The caller must NOT switch in on failure.
     pub fn try_claim_resume(&self, cpu: usize) -> Result<(), usize> {
-        use core::sync::atomic::Ordering::{AcqRel, Acquire};
-        match self
-            .resume_owner
-            .compare_exchange(0, cpu + 1, AcqRel, Acquire)
-        {
-            Ok(_) => Ok(()),
-            Err(holder) => Err(holder.wrapping_sub(1)),
-        }
+        self.resume_claim.try_claim(cpu)
     }
 
-    /// Release the resume claim. Only call once control is back OFF this
-    /// executor's stack (its context frame saved and parked) — releasing while
-    /// still standing on it re-opens the double-resume window this closes.
-    pub fn release_resume(&self) {
-        self.resume_owner
-            .store(0, core::sync::atomic::Ordering::Release);
+    /// Release the resume claim `cpu` holds. Only call once control is back OFF
+    /// this executor's stack (its context frame saved and parked) — releasing
+    /// while still standing on it re-opens the double-resume window this closes.
+    ///
+    /// Takes the CPU so a release by anyone but the holder is *seen*. It used to
+    /// take nothing and clear unconditionally, which made the latch a guard
+    /// anybody could switch off: a caller releasing a claim it never made left
+    /// the stack open to a second resumer with nothing said. The clear still
+    /// happens either way (see [`ResumeClaim::release_by`]).
+    pub fn release_resume(&self, cpu: usize) {
+        if let Err(held) = self.resume_claim.release_by(cpu) {
+            use core::sync::atomic::{AtomicUsize, Ordering};
+            static SLIPS: AtomicUsize = AtomicUsize::new(0);
+            let n = SLIPS.fetch_add(1, Ordering::Relaxed);
+            if n < 16 {
+                match held {
+                    Some(holder) => error!(
+                        "[resume-claim] executor id={} released by CPU{} but claimed by CPU{} \
+                         (report {}/16)",
+                        self.id(),
+                        cpu,
+                        holder,
+                        n + 1
+                    ),
+                    None => error!(
+                        "[resume-claim] executor id={} released by CPU{} but nobody claimed it \
+                         (report {}/16)",
+                        self.id(),
+                        cpu,
+                        n + 1
+                    ),
+                }
+            }
+        }
     }
 
     /// Retire the task this executor is polling and mark the executor dead.
@@ -1512,7 +1638,7 @@ impl Drop for Executor {
         let alloc_base = self.stack_base - GUARD_SIZE;
 
         // [null-exec root guard] Never free or reuse a stack a CPU is still
-        // standing on. `resume_owner` is 0 only once control is OFF this
+        // standing on. The claim is parked only once control is OFF this
         // executor's stack (its frame parked and `release_resume` called). If
         // it is non-zero at Drop, some CPU claimed this executor and is
         // executing on (or switching into) its stack RIGHT NOW — returning that
@@ -1527,9 +1653,7 @@ impl Drop for Executor {
         // cost next to heap corruption and an unrecoverable crash loop. The log
         // names the still-standing CPU so the remaining lifetime race can be
         // traced to where an executor is dropped while claimed.
-        let owner = self
-            .resume_owner
-            .load(core::sync::atomic::Ordering::Acquire);
+        let owner = self.resume_claim.holder().map(|cpu| cpu + 1).unwrap_or(0);
         if owner != 0 {
             use core::sync::atomic::{AtomicUsize, Ordering};
             static LEAKED: AtomicUsize = AtomicUsize::new(0);
@@ -1624,6 +1748,139 @@ pub unsafe fn push_stack<T>(stack_top: usize, val: T) -> usize {
 /// needs a real coroutine stack; the decisions live in
 /// [`retire_stack_after_grace`] and [`observe_cpu_quiescent_locked`], and they
 /// are what is exercised here. They share the module's globals, so they lock.
+#[cfg(test)]
+mod resume_claim_tests {
+    use super::ResumeClaim;
+
+    /// The BSP. Written as a literal on purpose: this is the id the bias exists
+    /// for, and naming a constant would let the constant move with a mutation.
+    const BSP: usize = 0;
+
+    #[test]
+    fn a_parked_stack_names_nobody() {
+        let claim = ResumeClaim::new();
+        assert_eq!(claim.holder(), None);
+    }
+
+    #[test]
+    fn the_first_cpu_to_ask_gets_the_stack() {
+        let claim = ResumeClaim::new();
+        assert_eq!(claim.try_claim(3), Ok(()));
+        assert_eq!(claim.holder(), Some(3));
+    }
+
+    #[test]
+    fn a_second_cpu_is_refused_and_told_who_has_it() {
+        let claim = ResumeClaim::new();
+        assert_eq!(claim.try_claim(2), Ok(()));
+        assert_eq!(
+            claim.try_claim(5),
+            Err(2),
+            "a refused resumer has to name the holder: that report is the only \
+             thing that turns a double-consume into a diagnosable event"
+        );
+        assert_eq!(claim.holder(), Some(2), "and the refusal changed nothing");
+    }
+
+    #[test]
+    fn the_cpu_that_already_holds_it_is_refused_too() {
+        let claim = ResumeClaim::new();
+        assert_eq!(claim.try_claim(4), Ok(()));
+        assert_eq!(
+            claim.try_claim(4),
+            Err(4),
+            "coming back round to a stack this CPU is already standing on is \
+             not re-entrancy to allow, it is the same double-consume from one CPU"
+        );
+    }
+
+    /// The rule the whole `cpu + 1` bias exists for. `Drop` decides whether a
+    /// block may go back to the heap by asking [`ResumeClaim::holder`], so a
+    /// latch that stored the raw id would report the BSP as parked — and the
+    /// BSP is the CPU that runs almost everything.
+    #[test]
+    fn a_stack_the_first_cpu_stands_on_does_not_read_as_parked() {
+        let claim = ResumeClaim::new();
+        assert_eq!(claim.try_claim(BSP), Ok(()));
+        assert_eq!(claim.holder(), Some(BSP));
+        assert_ne!(
+            claim.holder(),
+            None,
+            "storing the raw cpu id makes CPU 0 look parked, and Drop then hands \
+             a block back to the buddy heap with a CPU still executing on it"
+        );
+        assert_eq!(claim.try_claim(1), Err(BSP), "and it still excludes others");
+    }
+
+    #[test]
+    fn a_released_stack_is_free_for_anyone() {
+        let claim = ResumeClaim::new();
+        assert_eq!(claim.try_claim(1), Ok(()));
+        assert_eq!(claim.release_by(1), Ok(()));
+        assert_eq!(claim.holder(), None);
+        assert_eq!(claim.try_claim(7), Ok(()), "including a different CPU");
+        assert_eq!(claim.holder(), Some(7));
+    }
+
+    #[test]
+    fn releasing_a_stack_another_cpu_holds_is_reported() {
+        let claim = ResumeClaim::new();
+        assert_eq!(claim.try_claim(2), Ok(()));
+        assert_eq!(
+            claim.release_by(6),
+            Err(Some(2)),
+            "a guard anybody can switch off is not a guard: the slip has to be \
+             named, and it has to name the CPU whose claim was thrown away"
+        );
+    }
+
+    #[test]
+    fn releasing_a_stack_nobody_holds_is_reported_as_nobody() {
+        let claim = ResumeClaim::new();
+        assert_eq!(claim.release_by(1), Err(None));
+    }
+
+    /// Reported, and cleared anyway. Refusing to clear would leave the executor
+    /// unresumable for the rest of the boot: a second way to wedge, added by the
+    /// guard that exists to stop one.
+    #[test]
+    fn a_release_that_was_reported_still_parks_the_stack() {
+        let claim = ResumeClaim::new();
+        assert_eq!(claim.try_claim(2), Ok(()));
+        assert!(claim.release_by(6).is_err());
+        assert_eq!(claim.holder(), None);
+        assert_eq!(claim.try_claim(9), Ok(()));
+    }
+
+    #[test]
+    fn two_cpus_asking_at_once_leave_exactly_one_standing_on_the_stack() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static WON: AtomicUsize = AtomicUsize::new(0);
+        WON.store(0, Ordering::SeqCst);
+        static CLAIM: ResumeClaim = ResumeClaim::new();
+
+        let peer = std::thread::spawn(|| {
+            if CLAIM.try_claim(1).is_ok() {
+                WON.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+        if CLAIM.try_claim(0).is_ok() {
+            WON.fetch_add(1, Ordering::SeqCst);
+        }
+        peer.join().unwrap();
+        assert_eq!(
+            WON.load(Ordering::SeqCst),
+            1,
+            "both CPUs were handed the same parked frame"
+        );
+        assert!(claimed_by_one_of(&CLAIM, 0, 1));
+    }
+
+    fn claimed_by_one_of(claim: &ResumeClaim, a: usize, b: usize) -> bool {
+        matches!(claim.holder(), Some(h) if h == a || h == b)
+    }
+}
+
 #[cfg(test)]
 mod grace_period_tests {
     use super::*;
@@ -2137,5 +2394,514 @@ mod stack_registry_tests {
         retract(overflowing);
         assert_eq!(untracked_live_stacks(), 1);
         assert_eq!(untracked_alloc_stacks(), 1);
+    }
+}
+
+/// The spine-slot registry, which had no tests at all.
+///
+/// It is the whole of the `[null-exec]` hunt's second generation: what it
+/// publishes is what the debug registers watch on every CPU and what the timer
+/// tick sweeps, so every one of its answers is load-bearing in a way a
+/// diagnostic's usually is not. A slot it forgets to publish is a corruptor
+/// nobody catches; a slot it publishes wrongly is an innocent writer reported
+/// as the corruptor, with `note_heap_smash_suspected()` called on its name; an
+/// address it hands out that is not on the victim's stack is a `#PF` inside the
+/// timer tick, on the one machine that was about to explain the bug.
+///
+/// Every test here works on real memory of its own, because `spine_verify`
+/// **reads** the addresses it is given: a fake address would not test the
+/// sweep, it would crash it.
+#[cfg(test)]
+mod spine_tests {
+    use super::*;
+    use core::sync::atomic::Ordering;
+
+    /// The table is a module global, so the tests take turns.
+    fn test_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn wipe() {
+        for s in SPINE_ADDR.iter() {
+            s.store(0, Ordering::SeqCst);
+        }
+        for s in SPINE_VAL.iter() {
+            s.store(0, Ordering::SeqCst);
+        }
+        for s in SPINE_EXEC.iter() {
+            s.store(0, Ordering::SeqCst);
+        }
+        for s in SPINE_BASE.iter() {
+            s.store(0, Ordering::SeqCst);
+        }
+        SPINE_SMASHES.store(0, Ordering::SeqCst);
+        SPINE_OVERFLOW.store(0, Ordering::SeqCst);
+    }
+
+    struct Clean(#[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
+
+    impl Drop for Clean {
+        fn drop(&mut self) {
+            // Left behind, a registered entry points at a buffer this test is
+            // about to free: the next `spine_verify` in the suite would read it.
+            wipe();
+        }
+    }
+
+    fn clean() -> Clean {
+        let g = test_lock();
+        wipe();
+        Clean(g)
+    }
+
+    /// `SPINE_GEN` is monotonic for the life of the process (it is a re-sync
+    /// counter, not state), so tests read it as a difference.
+    fn gen_now() -> u64 {
+        spine_gen()
+    }
+
+    /// A plausible write-once value: the return into `run_executor`, which is a
+    /// kernel `.text` address. Nothing in the registry validates it — `run`
+    /// does that before registering — so its only job here is to be distinct
+    /// from whatever a smash writes.
+    const RETURN_INTO_RUN_EXECUTOR: u64 = 0xffff_ff00_0020_1234;
+    /// A value no blob walk may absorb: not the corruptor's and not zero.
+    const UNTOUCHED: u64 = 0x5555_5555_5555_5555;
+
+    /// A stand-in for an executor stack: memory this test owns, since
+    /// `spine_verify` reads the slot and walks up to 4 KiB either side of it.
+    ///
+    /// The declared base may sit *inside* the buffer, which is how a test
+    /// proves the walk stops at the stack's edge: the memory below that edge
+    /// exists and matches the blob, so only the clamp keeps the sweep out of
+    /// it. A `Vec<u64>` is 8-aligned, which is all a spine slot needs.
+    struct Fake {
+        mem: alloc::vec::Vec<u64>,
+        base_off: usize,
+    }
+
+    impl Fake {
+        fn new(words: usize, base_off: usize, fill: u64) -> Self {
+            let mut mem = alloc::vec::Vec::with_capacity(words);
+            mem.resize(words, fill);
+            Self { mem, base_off }
+        }
+
+        fn start(&self) -> usize {
+            self.mem.as_ptr() as usize
+        }
+
+        /// The address the registry is told the usable stack begins at.
+        fn base(&self) -> usize {
+            self.start() + self.base_off * 8
+        }
+
+        /// Byte `off` above the declared base.
+        fn at(&self, off: usize) -> usize {
+            self.base() + off
+        }
+
+        fn set(&mut self, addr: usize, val: u64) {
+            let i = (addr - self.start()) / 8;
+            self.mem[i] = val;
+        }
+    }
+
+    /// The registered slots, in table order.
+    fn watched() -> alloc::vec::Vec<usize> {
+        let mut out = [0usize; SPINE_SLOTS];
+        let n = spine_snapshot(&mut out);
+        out[..n].to_vec()
+    }
+
+    #[test]
+    fn a_registered_slot_is_handed_to_the_watchpoints_and_names_its_owner() {
+        // The snapshot is what every CPU loads into DR0-DR3, and the owner is
+        // what the #DB handler prints as the victim. A registration that
+        // publishes neither is an executor the hunt does not cover.
+        let _c = clean();
+        let fake = Fake::new(64, 0, UNTOUCHED);
+        let slot = fake.at(8 * 8);
+        spine_register(slot, RETURN_INTO_RUN_EXECUTOR, 7, fake.base());
+        assert_eq!(watched(), alloc::vec![slot]);
+        assert_eq!(spine_owner_of(slot), Some(7));
+    }
+
+    #[test]
+    fn an_address_no_executor_registered_names_nobody() {
+        // The #DB handler uses this as its noise filter: a hit on a slot that
+        // is no longer registered is the pool re-poison, not the corruptor.
+        let _c = clean();
+        let fake = Fake::new(64, 0, UNTOUCHED);
+        let slot = fake.at(8 * 8);
+        spine_register(slot, RETURN_INTO_RUN_EXECUTOR, 7, fake.base());
+        assert_eq!(spine_owner_of(slot + 8), None);
+        assert_eq!(spine_owner_of(fake.base()), None);
+    }
+
+    #[test]
+    fn the_two_values_the_table_keeps_for_itself_never_name_an_owner() {
+        // `0` is an empty entry and `usize::MAX` an entry being reserved.
+        // Matching on either handed back the executor id the entry held last
+        // -- stale, or not yet published -- and the caller would then read the
+        // address as a live victim and dereference it.
+        let _c = clean();
+        let fake = Fake::new(64, 0, UNTOUCHED);
+        let slot = fake.at(8 * 8);
+        spine_register(slot, RETURN_INTO_RUN_EXECUTOR, 9, fake.base());
+        spine_unregister(slot);
+        // The entry is empty now, and still remembers executor 9.
+        assert_eq!(SPINE_EXEC[0].load(Ordering::SeqCst), 9);
+        assert_eq!(spine_owner_of(0), None);
+        // And the reservation window, which only `spine_register` can be
+        // inside: written by hand because a test cannot stand in it.
+        SPINE_ADDR[0].store(usize::MAX, Ordering::SeqCst);
+        assert_eq!(spine_owner_of(usize::MAX), None);
+    }
+
+    #[test]
+    fn every_registration_and_every_removal_moves_the_generation() {
+        // Each CPU reprograms its debug registers only when this number moves.
+        // A registration that does not move it is watched by whichever CPUs
+        // happen to reprogram for some other reason, and by no others.
+        let _c = clean();
+        let fake = Fake::new(64, 0, UNTOUCHED);
+        let slot = fake.at(8 * 8);
+        let before = gen_now();
+        spine_register(slot, RETURN_INTO_RUN_EXECUTOR, 1, fake.base());
+        let after_register = gen_now();
+        assert!(
+            after_register > before,
+            "registering must move the generation: {} -> {}",
+            before,
+            after_register
+        );
+        spine_unregister(slot);
+        assert!(
+            gen_now() > after_register,
+            "removing must move it too, or a CPU keeps watching a retired slot"
+        );
+    }
+
+    #[test]
+    fn a_slot_given_back_stops_being_watched() {
+        // `run` unregisters before returning, because past that return its
+        // caller's own calls legitimately re-push over the slot.
+        let _c = clean();
+        let fake = Fake::new(64, 0, UNTOUCHED);
+        let slot = fake.at(8 * 8);
+        spine_register(slot, RETURN_INTO_RUN_EXECUTOR, 3, fake.base());
+        spine_unregister(slot);
+        assert!(watched().is_empty());
+        assert_eq!(spine_owner_of(slot), None);
+    }
+
+    #[test]
+    fn an_entry_being_reserved_is_not_watched_and_not_swept() {
+        // The window between claiming a slot and publishing its address holds
+        // `usize::MAX`, which is neither an address to arm a register on nor
+        // one the sweep may read -- reading it is a non-canonical fault in the
+        // timer tick, which kills the machine that was about to name the bug.
+        // A mutation that drops the sentinel check in `spine_verify` reads
+        // `usize::MAX` as a `*const u64`: a misaligned dereference, which is a
+        // non-unwinding panic and aborts the whole test process rather than
+        // printing a FAILED line -- but it does name this test in the
+        // backtrace, and the snapshot half below falls the ordinary way.
+        let _c = clean();
+        SPINE_ADDR[0].store(usize::MAX, Ordering::SeqCst);
+        SPINE_BASE[0].store(0, Ordering::SeqCst);
+        assert!(watched().is_empty());
+        assert!(spine_verify().is_none());
+    }
+
+    #[test]
+    fn a_slot_that_still_holds_its_return_address_is_not_a_smash() {
+        // The sweep runs on every tick on every CPU; a false positive here is
+        // a console storm and a `note_heap_smash_suspected()` on an innocent.
+        let _c = clean();
+        let mut fake = Fake::new(64, 0, UNTOUCHED);
+        let slot = fake.at(8 * 8);
+        fake.set(slot, RETURN_INTO_RUN_EXECUTOR);
+        spine_register(slot, RETURN_INTO_RUN_EXECUTOR, 4, fake.base());
+        assert!(spine_verify().is_none());
+    }
+
+    #[test]
+    fn an_overwritten_slot_is_reported_with_the_facts_the_printer_needs() {
+        // The report is written straight to the serial port by a caller in IRQ
+        // context, so these fields are the entire post-mortem.
+        let _c = clean();
+        let mut fake = Fake::new(64, 0, UNTOUCHED);
+        let slot = fake.at(8 * 8);
+        fake.set(slot, RETURN_INTO_RUN_EXECUTOR);
+        spine_register(slot, RETURN_INTO_RUN_EXECUTOR, 12, fake.base());
+        fake.set(slot, 0);
+        let smash = spine_verify().expect("an overwritten spine slot is a smash");
+        assert_eq!(smash.ordinal, 0);
+        assert_eq!(smash.exec_id, 12);
+        assert_eq!(smash.slot, slot);
+        assert_eq!(smash.expected, RETURN_INTO_RUN_EXECUTOR);
+        assert_eq!(smash.found, 0);
+        assert_eq!(smash.stack_base, fake.base());
+        // The usable region is 2 MiB, and the top is where the slot is
+        // measured from: a report that names the wrong top makes every offset
+        // in it wrong.
+        assert_eq!(smash.stack_top, fake.base() + 0x20_0000);
+    }
+
+    #[test]
+    fn the_same_unrepaired_slot_is_reported_once_and_not_at_tick_rate() {
+        // Nothing repairs the slot, and the sweep runs 250 times a second on
+        // every CPU. Reporting it every time buries the first report -- the
+        // only one with the rest of the machine still intact -- under
+        // thousands of copies, on a serial console at 115200 baud.
+        let _c = clean();
+        let mut fake = Fake::new(64, 0, UNTOUCHED);
+        let slot = fake.at(8 * 8);
+        fake.set(slot, RETURN_INTO_RUN_EXECUTOR);
+        spine_register(slot, RETURN_INTO_RUN_EXECUTOR, 5, fake.base());
+        fake.set(slot, 0);
+        assert!(spine_verify().is_some());
+        assert!(spine_verify().is_none());
+        assert!(spine_verify().is_none());
+    }
+
+    #[test]
+    fn a_later_write_to_a_healed_slot_is_reported_again() {
+        // The cure for the tick storm must not be "stop watching this slot":
+        // the corruptor writes more than once, and each write is a fresh
+        // chance to catch it with a different rip.
+        let _c = clean();
+        let mut fake = Fake::new(64, 0, UNTOUCHED);
+        let slot = fake.at(8 * 8);
+        fake.set(slot, RETURN_INTO_RUN_EXECUTOR);
+        spine_register(slot, RETURN_INTO_RUN_EXECUTOR, 5, fake.base());
+        fake.set(slot, 0);
+        assert!(spine_verify().is_some());
+        assert!(spine_verify().is_none());
+        fake.set(slot, 0x0a0a_0a0a);
+        let second = spine_verify().expect("a second write to the slot is a second smash");
+        assert_eq!(second.found, 0x0a0a_0a0a);
+        assert_eq!(
+            second.expected, 0,
+            "the healed expectation is what it found last"
+        );
+        assert!(spine_owner_of(slot).is_some(), "and it is still watched");
+    }
+
+    #[test]
+    fn each_smash_is_numbered_so_a_second_victim_is_not_read_as_the_first() {
+        let _c = clean();
+        let mut one = Fake::new(64, 0, UNTOUCHED);
+        let mut two = Fake::new(64, 0, UNTOUCHED);
+        let slot_one = one.at(8 * 8);
+        let slot_two = two.at(8 * 8);
+        one.set(slot_one, RETURN_INTO_RUN_EXECUTOR);
+        two.set(slot_two, RETURN_INTO_RUN_EXECUTOR);
+        spine_register(slot_one, RETURN_INTO_RUN_EXECUTOR, 1, one.base());
+        spine_register(slot_two, RETURN_INTO_RUN_EXECUTOR, 2, two.base());
+        one.set(slot_one, 0);
+        two.set(slot_two, 0);
+        let first = spine_verify().expect("first");
+        let second = spine_verify().expect("second");
+        assert_eq!(first.ordinal, 0);
+        assert_eq!(second.ordinal, 1);
+        assert_ne!(first.slot, second.slot);
+    }
+
+    #[test]
+    fn the_report_measures_the_foreign_blob_around_the_slot() {
+        // Every capture shows the slot inside a ~0x400-byte foreign blob, and
+        // its extent is what says whether the writer was aiming at a buffer
+        // (wide) or at this one word (narrow). The end is exclusive.
+        let _c = clean();
+        let mut fake = Fake::new(64, 0, UNTOUCHED);
+        let slot = fake.at(8 * 8);
+        fake.set(slot, RETURN_INTO_RUN_EXECUTOR);
+        spine_register(slot, RETURN_INTO_RUN_EXECUTOR, 6, fake.base());
+        for w in 5..=12 {
+            fake.set(fake.at(w * 8), 0);
+        }
+        let smash = spine_verify().expect("smash");
+        assert_eq!(smash.blob_lo, fake.at(5 * 8));
+        assert_eq!(smash.blob_hi, fake.at(13 * 8));
+    }
+
+    #[test]
+    fn zeros_inside_the_blob_do_not_cut_it_short() {
+        // The blob is the corruptor's value *or* zero: the captures show both
+        // mixed, because the store that lands on a saved pointer leaves the
+        // high half zero. Stopping at the first zero measured a blob three
+        // words wide where it was thirty.
+        let _c = clean();
+        let mut fake = Fake::new(64, 0, UNTOUCHED);
+        let slot = fake.at(8 * 8);
+        fake.set(slot, RETURN_INTO_RUN_EXECUTOR);
+        spine_register(slot, RETURN_INTO_RUN_EXECUTOR, 6, fake.base());
+        let foreign = 0x0000_0000_1a1a_1a1a;
+        fake.set(fake.at(6 * 8), foreign);
+        fake.set(fake.at(7 * 8), 0);
+        fake.set(slot, foreign);
+        fake.set(fake.at(9 * 8), 0);
+        fake.set(fake.at(10 * 8), foreign);
+        let smash = spine_verify().expect("smash");
+        assert_eq!(smash.found, foreign);
+        assert_eq!(smash.blob_lo, fake.at(6 * 8));
+        assert_eq!(smash.blob_hi, fake.at(11 * 8));
+    }
+
+    #[test]
+    fn the_sweep_never_reads_more_than_four_kilobytes_either_side() {
+        // The walk runs in the timer tick with a blob that may cover the whole
+        // stack; unbounded it would read 2 MiB per tick per victim, and the
+        // report would be a number nobody can use.
+        let _c = clean();
+        // Zero-filled: every word matches the blob, so only the bound stops
+        // the walk. The words just outside it are what a missing bound would
+        // reach.
+        let mut fake = Fake::new(0x800, 0, 0);
+        let slot = fake.at(0x2000);
+        fake.set(slot, RETURN_INTO_RUN_EXECUTOR);
+        spine_register(slot, RETURN_INTO_RUN_EXECUTOR, 8, fake.base());
+        fake.set(slot, 0);
+        fake.set(slot - 0x1010, UNTOUCHED);
+        fake.set(slot + 0x1010, UNTOUCHED);
+        let smash = spine_verify().expect("smash");
+        assert_eq!(smash.blob_lo, slot - 0x1000);
+        assert_eq!(smash.blob_hi, slot + 0x1000);
+    }
+
+    #[test]
+    fn the_sweep_stops_at_the_bottom_of_the_victim_stack() {
+        // Below the usable region is the bottom guard page, which is unmapped
+        // on purpose: walking into it faults inside the timer tick.
+        let _c = clean();
+        // The declared base sits 0x2000 into the buffer, so the memory below
+        // it exists and matches -- only the clamp keeps the walk out.
+        let mut fake = Fake::new(0x800, 0x400, 0);
+        let slot = fake.at(0x100);
+        fake.set(slot, RETURN_INTO_RUN_EXECUTOR);
+        spine_register(slot, RETURN_INTO_RUN_EXECUTOR, 8, fake.base());
+        fake.set(slot, 0);
+        let smash = spine_verify().expect("smash");
+        assert_eq!(smash.blob_lo, fake.base());
+    }
+
+    #[test]
+    fn the_sweep_stops_at_the_top_of_the_victim_stack() {
+        // And above it is the top guard, likewise unmapped. The spine slot
+        // lives 0x508 bytes below the top, so this is the side the walk
+        // actually reaches on every real victim.
+        let _c = clean();
+        let mut fake = Fake::new(0x20_0000 / 8 + 0x400, 0, 0);
+        let top = fake.at(0x20_0000);
+        let slot = top - 0x508;
+        fake.set(slot, RETURN_INTO_RUN_EXECUTOR);
+        spine_register(slot, RETURN_INTO_RUN_EXECUTOR, 8, fake.base());
+        fake.set(slot, 0);
+        let smash = spine_verify().expect("smash");
+        assert_eq!(smash.blob_hi, top);
+    }
+
+    #[test]
+    fn retiring_a_stack_clears_every_slot_on_it_and_none_on_its_neighbour() {
+        // An abandoned executor's `run` never returns, so `Drop` clears its
+        // slots by stack. Leaving one behind leaves the pool's re-poison
+        // writing through a watched address; clearing one too many stops
+        // watching a live executor. Neither reads memory, so these addresses
+        // are invented.
+        let _c = clean();
+        let victim = 0x1000_0000;
+        let neighbour = victim + 0x20_0000;
+        let elsewhere = 0x4000_0000;
+        // The very first and very last words of the usable region: both belong
+        // to the victim.
+        spine_register(victim, RETURN_INTO_RUN_EXECUTOR, 1, victim);
+        spine_register(victim + 0x20_0000 - 8, RETURN_INTO_RUN_EXECUTOR, 2, victim);
+        // The neighbour's own first word, one byte past the victim's end.
+        spine_register(neighbour, RETURN_INTO_RUN_EXECUTOR, 3, neighbour);
+        spine_register(elsewhere, RETURN_INTO_RUN_EXECUTOR, 4, elsewhere);
+        let before = gen_now();
+        spine_unregister_by_stack(victim);
+        assert!(
+            gen_now() > before,
+            "and it moves the generation, or a CPU keeps DR0 on a retired stack"
+        );
+        assert_eq!(spine_owner_of(victim), None);
+        assert_eq!(spine_owner_of(victim + 0x20_0000 - 8), None);
+        assert_eq!(spine_owner_of(neighbour), Some(3));
+        assert_eq!(spine_owner_of(elsewhere), Some(4));
+    }
+
+    #[test]
+    fn a_full_registry_says_so_instead_of_dropping_the_slot_in_silence() {
+        // 16 slots cover "CPUs plus parked weaks", and the sibling stack pool
+        // was already found too small by a GL=1 spawn burst. Unwatched and
+        // uncounted, the hunt reports a clean sweep on a machine where the
+        // victim was never watched at all.
+        let _c = clean();
+        let base = 0x1000_0000;
+        for i in 0..16 {
+            spine_register(
+                base + i * 0x20_0000,
+                RETURN_INTO_RUN_EXECUTOR,
+                i,
+                base + i * 0x20_0000,
+            );
+        }
+        assert_eq!(unwatched_spine_slots(), 0);
+        let unlucky = base + 16 * 0x20_0000;
+        spine_register(unlucky, RETURN_INTO_RUN_EXECUTOR, 99, unlucky);
+        assert_eq!(unwatched_spine_slots(), 1);
+        assert_eq!(spine_owner_of(unlucky), None);
+        // And it evicted nobody: dropping the newcomer is the whole point.
+        assert_eq!(watched().len(), 16);
+        assert_eq!(spine_owner_of(base), Some(0));
+    }
+
+    #[test]
+    fn a_slot_given_back_is_handed_to_the_next_executor() {
+        // Registrations outlive no executor, so the table must not fill up
+        // permanently over a boot's worth of spawn and exit.
+        let _c = clean();
+        let base = 0x1000_0000;
+        for i in 0..16 {
+            spine_register(
+                base + i * 0x20_0000,
+                RETURN_INTO_RUN_EXECUTOR,
+                i,
+                base + i * 0x20_0000,
+            );
+        }
+        spine_unregister(base + 3 * 0x20_0000);
+        let newcomer = base + 40 * 0x20_0000;
+        spine_register(newcomer, RETURN_INTO_RUN_EXECUTOR, 77, newcomer);
+        assert_eq!(spine_owner_of(newcomer), Some(77));
+        assert_eq!(unwatched_spine_slots(), 0);
+    }
+
+    #[test]
+    fn the_snapshot_reports_no_more_slots_than_it_was_given_room_for() {
+        // The caller arms four debug registers from a four-element array and
+        // trusts the count; writing past it, or leaving a stale address in the
+        // tail, arms a register on whatever was there before.
+        let _c = clean();
+        let base = 0x1000_0000;
+        for i in 0..3 {
+            spine_register(
+                base + i * 0x20_0000,
+                RETURN_INTO_RUN_EXECUTOR,
+                i,
+                base + i * 0x20_0000,
+            );
+        }
+        let mut two = [0usize; 2];
+        assert_eq!(spine_snapshot(&mut two), 2);
+        assert_eq!(two, [base, base + 0x20_0000]);
+        let mut roomy = [0xaaaa_aaaausize; 5];
+        assert_eq!(spine_snapshot(&mut roomy), 3);
+        assert_eq!(roomy[3], 0, "the tail must be cleared, not left stale");
+        assert_eq!(roomy[4], 0);
     }
 }

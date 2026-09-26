@@ -1,11 +1,11 @@
 //! `pidfd_open`, `pidfd_send_signal`, `pidfd_getfd`
 
 use super::*;
-use crate::signal::{may_queue_siginfo, SigInfoHead};
+use crate::signal::{may_queue_siginfo, queued_from_user, SigInfoHead};
 use linux_object::error::LxResult;
 use linux_object::fs::{OpenFlags, PidFd, PIDFD_THREAD};
 use linux_object::process::LinuxProcess;
-use linux_object::signal::Signal;
+use linux_object::signal::{SigInfo, Signal};
 use zircon_object::object::{KernelObject, KoID};
 use zircon_object::task::{Status, ROOT_JOB};
 
@@ -111,7 +111,7 @@ impl Syscall<'_> {
         &self,
         pidfd: FileDesc,
         signum: usize,
-        info: UserInPtr<SigInfoHead>,
+        info: UserInPtr<SigInfo>,
         flags: u32,
     ) -> SysResult {
         if flags != 0 {
@@ -123,16 +123,25 @@ impl Syscall<'_> {
         if matches!(target.status(), Status::Exited(_)) {
             return Err(LxError::ESRCH);
         }
-        let head = if info.is_null() {
+        let user = if info.is_null() {
             None
         } else {
             Some(info.read()?)
         };
-        check_pidfd_siginfo(signum, head, target.id() == self.zircon_process().id())?;
+        check_pidfd_siginfo(
+            signum,
+            user.as_ref().map(SigInfoHead::of),
+            target.id() == self.zircon_process().id(),
+        )?;
         // Including `pidfd_send_signal(fd, 0, ...)`, which is a permission
         // probe and not just a liveness one: answering from the status alone
         // told a caller that a process it may not touch is alive.
-        self.signal_one_process(&self.kill_context(signal), &target)
+        //
+        // The caller's `siginfo_t`, when it gave one, is what gets delivered:
+        // `pidfd_send_signal` is the pidfd form of `rt_sigqueueinfo`, and a
+        // sender that filled in `si_value` expects the handler to read it.
+        let info = signal.and_then(|sig| user.map(|u| queued_from_user(sig, u)));
+        self.signal_one_process_with_info(&self.kill_context(signal), &target, info)
             .map(|_| 0)
     }
 

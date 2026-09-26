@@ -6,7 +6,7 @@ use crate::{
     ipc::*,
     loader::AuxIdentity,
     net::SOCKET_FD,
-    signal::{Signal as LinuxSignal, SignalAction, Sigset},
+    signal::{SigInfo, Signal as LinuxSignal, SignalAction, Sigset},
 };
 use alloc::{
     boxed::Box,
@@ -16,7 +16,7 @@ use alloc::{
     vec::Vec,
 };
 use core::convert::TryFrom;
-use core::sync::atomic::{AtomicI32, Ordering};
+use core::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 use hashbrown::{HashMap, HashSet};
 use kernel_hal::sync::{Mutex, MutexGuard};
 use kernel_hal::VirtAddr;
@@ -24,7 +24,7 @@ use rcore_fs::vfs::{FileSystem, FileType, INode, Metadata};
 
 use zircon_object::{
     object::{KernelObject, KoID, Signal},
-    signal::Futex,
+    signal::{Futex, FutexTable},
     task::{
         Job, Process, Status, Thread, ROOT_JOB, SCHED_BATCH, SCHED_DEADLINE, SCHED_FIFO,
         SCHED_IDLE, SCHED_NORMAL, SCHED_RR,
@@ -138,6 +138,7 @@ pub fn published_capabilities(euid: u32) -> u64 {
 }
 
 const NO_ID: u32 = u32::MAX;
+const ACCESS_READ: u16 = 0o4;
 const ACCESS_WRITE: u16 = 0o2;
 const ACCESS_EXEC: u16 = 0o1;
 const MODE_PERM_MASK: u16 = 0o7777;
@@ -205,6 +206,37 @@ impl Default for Credentials {
     }
 }
 
+lazy_static::lazy_static! {
+    /// What else dies with a process, registered by the layers above this
+    /// crate for the state they keep by pid and this crate cannot name: the
+    /// POSIX timers of `timer_create(2)` live in `linux-syscall`. Each hook
+    /// runs once per process death, with the dead process's pid, from the
+    /// `PROCESS_TERMINATED` callbacks below, after the process's own tables
+    /// have been torn down.
+    static ref PROCESS_EXIT_HOOKS: Mutex<Vec<fn(KoID)>> = Mutex::new(Vec::new());
+}
+
+/// Run `hook(pid)` whenever a process dies. Registration is not deduplicated:
+/// a layer that may register more than once keeps its own once-flag.
+pub fn register_process_exit_hook(hook: fn(KoID)) {
+    PROCESS_EXIT_HOOKS.lock().push(hook);
+}
+
+/// How many hooks are registered, for a layer to check that its own once-flag
+/// holds.
+pub fn process_exit_hook_count() -> usize {
+    PROCESS_EXIT_HOOKS.lock().len()
+}
+
+/// The death of `pid`, told to every registered hook. The list is copied out
+/// first: a hook may take locks of its own, and must not run under this one.
+fn run_process_exit_hooks(pid: KoID) {
+    let hooks: Vec<fn(KoID)> = PROCESS_EXIT_HOOKS.lock().clone();
+    for hook in hooks {
+        hook(pid);
+    }
+}
+
 impl ProcessExt for Process {
     fn create_linux(
         job: &Arc<Job>,
@@ -234,6 +266,9 @@ impl ProcessExt for Process {
                     // Record locks die with the process (same as the
                     // fork path below; see `record_lock::release_owner`).
                     crate::fs::record_lock::release_owner(proc.id());
+                    // And so does what the layers above keep by pid (the
+                    // POSIX timers); see `register_process_exit_hook`.
+                    run_process_exit_hooks(proc.id());
                     // try_linux (not linux): this callback runs from the
                     // object layer on PROCESS_TERMINATED, concurrently with
                     // SMP teardown churn. If the extension can no longer be
@@ -242,16 +277,20 @@ impl ProcessExt for Process {
                         // Take the file table out and drop it AFTER the lock is
                         // released — file teardown can re-enter this process's
                         // accessors (see close_file).
-                        let dropped_files = {
+                        // The shared-memory table goes the same way: its
+                        // drop is the detach of every attachment, which
+                        // locks each segment, and `fork` locks the segments
+                        // under this process's lock.
+                        let dropped = {
                             let mut inner = lp.inner.lock();
                             let files = core::mem::take(&mut inner.files);
                             inner.cloexec_fds.clear();
                             inner.futexes.clear();
                             inner.semaphores = Default::default();
-                            inner.shm_identifiers = Default::default();
-                            files
+                            let shm = core::mem::take(&mut inner.shm_identifiers);
+                            (files, shm)
                         };
-                        drop(dropped_files);
+                        drop(dropped);
                     }
                 }
                 return true;
@@ -464,7 +503,11 @@ impl ProcessExt for Process {
             perf: crate::perf::ProcPerf::new(),
             itimers: Default::default(),
             aspace_lock: Mutex::new(()),
-            inner: Mutex::new(linux_parent_inner.forked_child(parent_pgid, parent_sid)),
+            inner: Mutex::new(linux_parent_inner.forked_child(
+                parent_pgid,
+                parent_sid,
+                monotonic_now_ns(),
+            )),
         };
         let new_proc = Process::create_with_ext(&parent.job(), "", new_linux_proc)?;
         // Batch the fork's cross-CPU TLB shootdowns into one, but only when
@@ -509,6 +552,9 @@ impl ProcessExt for Process {
                     // lazy liveness prune in `record_lock` cannot tell a dead
                     // owner from a recycled pid (see `release_owner`).
                     crate::fs::record_lock::release_owner(child.id());
+                    // And what the layers above keep by pid (the POSIX
+                    // timers); see `register_process_exit_hook`.
+                    run_process_exit_hooks(child.id());
                     // try_linux (not linux): this callback fires from the object
                     // layer on PROCESS_TERMINATED, concurrently with SMP teardown
                     // churn. A process whose extension can no longer be resolved
@@ -517,21 +563,61 @@ impl ProcessExt for Process {
                         // Drop the file table AFTER releasing the lock — file
                         // teardown can re-enter process accessors (see
                         // close_file).
-                        let dropped_files = {
+                        // The shared-memory table goes the same way: its
+                        // drop is the detach of every attachment, which
+                        // locks each segment, and `fork` locks the segments
+                        // under this process's lock.
+                        let dropped = {
                             let mut inner = lp.inner.lock();
                             let files = core::mem::take(&mut inner.files);
                             inner.cloexec_fds.clear();
                             inner.futexes.clear();
                             inner.semaphores = Default::default();
-                            inner.shm_identifiers = Default::default();
-                            files
+                            let shm = core::mem::take(&mut inner.shm_identifiers);
+                            (files, shm)
                         };
-                        drop(dropped_files);
+                        drop(dropped);
                     }
                     if let Some(reaper) = reaper_for(&parent) {
                         if let Some(reaper_lp) = reaper.try_linux() {
+                            let policy = child_death_policy(reaper_lp);
+                            // The zircon bit wakes a blocked `wait*` either
+                            // way: with nothing left to collect it comes back
+                            // ECHILD, which is how POSIX says a `wait` ends
+                            // when SIGCHLD is ignored.
                             reaper.signal_set(Signal::SIGCHLD);
-                            reaper_lp.record_child_exit(child.id(), exit_code, child_cpu(&child));
+                            if policy.autoreap {
+                                reaper_lp.forget_child(child.id());
+                            } else {
+                                reaper_lp.record_child_exit(
+                                    child.id(),
+                                    exit_code,
+                                    child_cpu(&child),
+                                );
+                            }
+                            if !policy.notify {
+                                return true;
+                            }
+                            // The zircon bit above wakes a blocked `wait*`;
+                            // the LINUX signal is what a SIGCHLD handler, a
+                            // signalfd or a `sigwait` is waiting for
+                            // (`do_notify_parent`). Without it a shell's
+                            // `trap CHLD`, a compositor reaping its autostart
+                            // children, or a `pause()`-and-wait loop never
+                            // hear that the child is gone.
+                            let info = SigInfo::child_state_change(
+                                child.id() as i32,
+                                child
+                                    .try_linux()
+                                    .map(|lp| lp.credentials().ruid)
+                                    .unwrap_or(0),
+                                wait_status_exited(exit_code),
+                            );
+                            let _ = send_signal_to_process_with_info(
+                                reaper.id() as usize,
+                                LinuxSignal::SIGCHLD,
+                                Some(info),
+                            );
                         }
                     }
                 }
@@ -946,7 +1032,7 @@ struct LinuxProcessInner {
     /// Share Memory
     shm_identifiers: ShmProc,
     /// Futexes
-    futexes: HashMap<VirtAddr, Arc<Futex>>,
+    futexes: FutexTable,
     /// Child processes
     children: HashMap<KoID, Arc<Process>>,
     /// Exit codes and final CPU usage for children already detached (freed
@@ -957,6 +1043,13 @@ struct LinuxProcessInner {
     children_utime_ns: u64,
     /// Kernel-side counterpart of `children_utime_ns`.
     children_stime_ns: u64,
+    /// When this process was created, in nanoseconds of the monotonic clock
+    /// (`task->start_boottime`): what field 22 of `/proc/<pid>/stat` reports
+    /// in clock ticks, and what `ps -o etime,start` and `top`'s TIME+ column
+    /// derive from. A fork stamps the child with its own birth; an exec
+    /// keeps it, since Linux's `start_time` is the task's and not the
+    /// image's.
+    start_ns: u64,
     /// Process group id (job control). `0` means "unset" and resolves to the
     /// process's own pid, so a fresh session/group leader is its own group.
     /// `fork` copies the parent's *effective* pgid (children join the parent's
@@ -1316,6 +1409,17 @@ impl LinuxProcess {
         inner.reaped_children.insert(child_id, (exit_code, cpu));
     }
 
+    /// Drop a dead child without keeping anything for `wait*`: the reaper
+    /// ignores `SIGCHLD` (or set `SA_NOCLDWAIT`), so Linux releases the
+    /// task in `exit_notify` instead of leaving a zombie, and its CPU never
+    /// reaches the reaper's `RUSAGE_CHILDREN` (that only counts children
+    /// that were waited for).
+    pub fn forget_child(&self, child_id: KoID) {
+        let mut inner = self.inner.lock();
+        inner.children.remove(&child_id);
+        inner.reaped_children.remove(&child_id);
+    }
+
     /// CPU totals of already-reaped children, in nanoseconds (utime, stime).
     pub fn children_cpu_ns(&self) -> (u64, u64) {
         let inner = self.inner.lock();
@@ -1356,6 +1460,7 @@ impl LinuxProcess {
         files.insert(1.into(), stdout);
         files.insert(2.into(), stderr);
 
+        note_process_created();
         LinuxProcess {
             root_inode,
             parent: Mutex::new(Weak::default()),
@@ -1365,9 +1470,24 @@ impl LinuxProcess {
             aspace_lock: Mutex::new(()),
             inner: Mutex::new(LinuxProcessInner {
                 files,
+                start_ns: monotonic_now_ns(),
                 ..Default::default()
             }),
         }
+    }
+
+    /// When this process was created, in nanoseconds of the monotonic clock
+    /// (`task->start_boottime`). See `LinuxProcessInner::start_ns`.
+    pub fn start_time_ns(&self) -> u64 {
+        self.inner.lock().start_ns
+    }
+
+    /// Credit the CPU time of a reaped child, as `wait*` does when it reaps
+    /// one: what `RUSAGE_CHILDREN`, `times()` and fields 16/17 of
+    /// `/proc/<pid>/stat` add up.
+    #[cfg(test)]
+    pub(crate) fn credit_children_cpu(&self, cpu: ChildCpu) {
+        self.inner.lock().add_children_cpu(cpu);
     }
 
     /// The process's `mmap_lock` (see the field doc): hold it across any
@@ -1557,17 +1677,10 @@ impl LinuxProcess {
         if uaddr == 0 || !uaddr.is_multiple_of(core::mem::align_of::<AtomicI32>()) {
             return None;
         }
-        let mut inner = self.inner.lock();
-        Some(
-            inner
-                .futexes
-                .entry(uaddr)
-                .or_insert_with(|| {
-                    let value = unsafe { &*(uaddr as *const AtomicI32) };
-                    Futex::new(value)
-                })
-                .clone(),
-        )
+        Some(self.inner.lock().futexes.get_or_create(uaddr, || {
+            let value = unsafe { &*(uaddr as *const AtomicI32) };
+            Futex::new(value)
+        }))
     }
 
     /// Get lowest free fd
@@ -1630,19 +1743,33 @@ impl LinuxProcess {
         file: Arc<dyn FileLike>,
         cloexec: bool,
     ) -> LxResult<Option<Arc<dyn FileLike>>> {
-        let mut inner = self.inner.lock();
-        let old = inner.files.remove(&fd);
-        // Net table size is unchanged (replace) or +1 (plain insert); apply the
-        // same limit check as insert_file for the growth case.
-        if old.is_none() && inner.files.len() >= inner.nofile() {
-            return Err(LxError::EMFILE);
+        let forget;
+        let old = {
+            let mut inner = self.inner.lock();
+            let old = inner.files.remove(&fd);
+            // Net table size is unchanged (replace) or +1 (plain insert); apply the
+            // same limit check as insert_file for the growth case.
+            if old.is_none() && inner.files.len() >= inner.nofile() {
+                return Err(LxError::EMFILE);
+            }
+            if cloexec {
+                inner.cloexec_fds.insert(fd);
+            } else {
+                inner.cloexec_fds.remove(&fd);
+            }
+            inner.files.insert(fd, file);
+            // `dup2` onto an open descriptor closes it, and closing it tells
+            // the epolls, like `close` does. Planned after the insert so the
+            // new file at `fd` counts as a holder if it is the same
+            // description (`dup2(fd, fd)` is a no-op in Linux too).
+            forget = old
+                .as_ref()
+                .map(|f| inner.epoll_forget_plan(vec![(fd, f.clone())]));
+            old
+        };
+        if let Some(forget) = forget {
+            forget.run();
         }
-        if cloexec {
-            inner.cloexec_fds.insert(fd);
-        } else {
-            inner.cloexec_fds.remove(&fd);
-        }
-        inner.files.insert(fd, file);
         Ok(old)
     }
 
@@ -1929,6 +2056,26 @@ impl LinuxProcess {
         Self::is_same_owner(caller, target) || has_capability(caller.euid, CAP_SYS_NICE)
     }
 
+    /// `set_task_ioprio()` (`block/ioprio.c`): whether `caller` may change
+    /// the I/O priority of a task running under `target`'s credentials.
+    ///
+    /// ```c
+    /// if (!uid_eq(tcred->uid, cred->euid) &&
+    ///     !uid_eq(tcred->uid, cred->uid) && !capable(CAP_SYS_NICE)) {
+    ///         err = -EPERM;
+    /// ```
+    ///
+    /// Not the same rule as [`Self::may_set_priority_of`]: it is the target's
+    /// REAL uid that is compared, against either of the caller's, so a task
+    /// running set-uid as somebody else is still its real owner's to renice
+    /// for I/O, and a caller's real uid counts where `setpriority` only
+    /// looks at the effective one.
+    pub fn may_set_ioprio_of(caller: &Credentials, target: &Credentials) -> bool {
+        target.ruid == caller.euid
+            || target.ruid == caller.ruid
+            || has_capability(caller.euid, CAP_SYS_NICE)
+    }
+
     /// `set_one_prio()`'s two gates, in order: whether the task is yours,
     /// then how far down you are asking to push it.
     ///
@@ -2196,11 +2343,18 @@ impl LinuxProcess {
     /// same spinlock. Seen live as a hard SMP deadlock:
     ///   [DEADLOCK cpu=1 at pgid_raw, HOLDER cpu=1 at close_file].
     pub fn close_file(&self, fd: FileDesc) -> LxResult {
-        let removed = {
+        let (removed, forget) = {
             let mut inner = self.inner.lock();
             inner.cloexec_fds.remove(&fd);
-            inner.files.remove(&fd)
+            let removed = inner.files.remove(&fd);
+            let forget = removed
+                .as_ref()
+                .map(|f| inner.epoll_forget_plan(vec![(fd, f.clone())]));
+            (removed, forget)
         };
+        if let Some(forget) = forget {
+            forget.run();
+        }
         removed.map(drop).ok_or(LxError::EBADF)
     }
 
@@ -2231,7 +2385,7 @@ impl LinuxProcess {
     pub fn close_range(&self, first: FileDesc, last: FileDesc) {
         // Collect the removed files and drop them only after `inner` is
         // released — see `close_file` for the re-entrancy deadlock this avoids.
-        let removed: Vec<(FileDesc, Arc<dyn FileLike>)> = {
+        let (removed, forget): (Vec<(FileDesc, Arc<dyn FileLike>)>, _) = {
             let mut inner = self.inner.lock();
             let fds: Vec<_> = inner
                 .files
@@ -2239,13 +2393,17 @@ impl LinuxProcess {
                 .filter(|&&fd| fd >= first && fd <= last)
                 .cloned()
                 .collect();
-            fds.into_iter()
+            let removed: Vec<_> = fds
+                .into_iter()
                 .filter_map(|fd| {
                     inner.cloexec_fds.remove(&fd);
                     inner.files.remove(&fd).map(|f| (fd, f))
                 })
-                .collect()
+                .collect();
+            let forget = inner.epoll_forget_plan(removed.clone());
+            (removed, forget)
         };
+        forget.run();
         for (fd, f) in removed {
             // DRM diagnostics: see fs::drm_fd_desc.
             if let Some(desc) = crate::fs::drm_fd_desc(&f) {
@@ -2539,10 +2697,20 @@ impl LinuxProcess {
 
     /// Check if sticky-directory removal/rename is allowed.
     pub fn check_sticky(&self, dir_metadata: &Metadata, target_metadata: &Metadata) -> LxResult {
+        Self::sticky_verdict(&self.credentials(), dir_metadata, target_metadata)
+    }
+
+    /// Linux's `check_sticky()`: in a sticky directory only root, the
+    /// directory's owner and the entry's owner may remove or replace the
+    /// entry. Pure, on the metadata of both.
+    fn sticky_verdict(
+        creds: &Credentials,
+        dir_metadata: &Metadata,
+        target_metadata: &Metadata,
+    ) -> LxResult {
         if (dir_metadata.mode & MODE_STICKY) == 0 {
             return Ok(());
         }
-        let creds = self.credentials();
         // `__check_sticky()` opens with `kuid_t fsuid = current_fsuid();` and
         // compares that one id against both inodes.
         if creds.fsuid == ROOT_UID
@@ -2553,6 +2721,70 @@ impl LinuxProcess {
         } else {
             Err(LxError::EPERM)
         }
+    }
+
+    /// What `vfs_rename` and its two `may_delete` calls decide about a
+    /// rename of `old` (in `old_dir`) onto `new` (in `new_dir`, `None` when
+    /// no such entry exists), once both parents are known writable and
+    /// searchable. Pure, so the matrix is unit-testable.
+    ///
+    /// Only the first of these was ever asked before, which left the other
+    /// three to whoever called: in a sticky `/tmp`, `mv mine yours` replaced
+    /// another user's file (the very thing the sticky bit forbids `rm` from
+    /// doing, and which `unlinkat` here already refused); a file could be
+    /// renamed onto a directory and a directory onto a file, and a directory
+    /// could be moved out of one parent into another without the caller
+    /// holding write permission on it -- Linux asks for it because the move
+    /// rewrites the directory's own `..`.
+    ///
+    /// The order is Linux's: `may_delete(old_dir, old)` (the sticky bit), then
+    /// `may_delete(new_dir, new, is_dir)` on the target, whose sticky `EPERM`
+    /// comes before its type mismatch (`ENOTDIR` for a directory onto a
+    /// non-directory, `EISDIR` for the reverse), then the `MAY_WRITE` on a
+    /// directory changing parents (`EACCES`).
+    fn rename_verdict(
+        creds: &Credentials,
+        old_dir: &Metadata,
+        old: &Metadata,
+        new_dir: &Metadata,
+        new: Option<&Metadata>,
+    ) -> LxResult {
+        Self::sticky_verdict(creds, old_dir, old)?;
+        let is_dir = old.type_ == FileType::Dir;
+        if let Some(new) = new {
+            Self::sticky_verdict(creds, new_dir, new)?;
+            let new_is_dir = new.type_ == FileType::Dir;
+            if is_dir && !new_is_dir {
+                return Err(LxError::ENOTDIR);
+            }
+            if !is_dir && new_is_dir {
+                return Err(LxError::EISDIR);
+            }
+        }
+        let same_parent = old_dir.dev == new_dir.dev && old_dir.inode == new_dir.inode;
+        if is_dir && !same_parent {
+            Self::access_verdict(
+                creds,
+                old.uid as u32,
+                old.gid as u32,
+                old.mode,
+                true,
+                ACCESS_WRITE,
+                true,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// [`rename_verdict`](Self::rename_verdict) for this process.
+    pub fn check_rename(
+        &self,
+        old_dir: &Metadata,
+        old: &Metadata,
+        new_dir: &Metadata,
+        new: Option<&Metadata>,
+    ) -> LxResult {
+        Self::rename_verdict(&self.credentials(), old_dir, old, new_dir, new)
     }
 
     /// The mode a `chmod` by `creds` actually lands on a file owned by
@@ -2600,6 +2832,142 @@ impl LinuxProcess {
             mode,
         )?;
         Ok(())
+    }
+
+    /// Whether `creds` may set the times of a file owned by `owner_uid` with
+    /// mode `mode` (Linux's `utimes_common` / `setattr_prepare`).
+    ///
+    /// Explicit times (`ATTR_ATIME_SET` / `ATTR_MTIME_SET`) are the owner's
+    /// and root's alone: `EPERM` for anyone else, write access or not. A
+    /// touch (a null `times`, or both `UTIME_NOW`) is `ATTR_TOUCH`: the owner
+    /// and root, or anyone `inode_permission(MAY_WRITE)` lets write the file
+    /// (`EACCES` otherwise). Ownership is judged by the FILESYSTEM uid, as
+    /// `inode_owner_or_capable` does.
+    ///
+    /// Nothing checked this before: `utimensat`, `utimes` and `futimens` set
+    /// whatever times they were handed on whatever file they named, so any
+    /// process could backdate `/etc/passwd`, hide a modification from `make`
+    /// or a backup's mtime comparison, or forge the timestamps of another
+    /// user's files.
+    fn utimes_verdict(
+        creds: &Credentials,
+        owner_uid: u32,
+        owner_gid: u32,
+        mode: u16,
+        is_dir: bool,
+        explicit: bool,
+    ) -> LxResult {
+        // `inode_owner_or_capable()`: `vfsuid_eq_kuid(vfsuid, current_fsuid())`.
+        if creds.fsuid == ROOT_UID || creds.fsuid == owner_uid {
+            return Ok(());
+        }
+        if explicit {
+            return Err(LxError::EPERM);
+        }
+        Self::access_verdict(
+            creds,
+            owner_uid,
+            owner_gid,
+            mode,
+            is_dir,
+            ACCESS_WRITE,
+            true,
+        )
+    }
+
+    /// [`utimes_verdict`](Self::utimes_verdict) for this process on
+    /// `metadata`: `explicit` when any of the times is a value the caller
+    /// chose rather than "now".
+    pub fn check_utimes(&self, metadata: &Metadata, explicit: bool) -> LxResult {
+        Self::utimes_verdict(
+            &self.credentials(),
+            metadata.uid as u32,
+            metadata.gid as u32,
+            metadata.mode,
+            metadata.type_ == FileType::Dir,
+            explicit,
+        )
+    }
+
+    /// Whether `creds` may make a new hard link to a file owned by
+    /// `owner_uid:owner_gid` with mode `mode` and type `type_`.
+    ///
+    /// `vfs_link`: a directory is never linkable, by anyone (`EPERM`). Then
+    /// `may_linkat` with `fs.protected_hardlinks` on, the default since Linux
+    /// 3.6: the owner and root link what they like; anyone else only a "safe
+    /// source" (`safe_hardlink_source`): a regular file, not setuid, not
+    /// setgid-and-group-executable, that they could open for reading AND
+    /// writing. Everything else is `EPERM`, the way Linux answers it, not the
+    /// `EACCES` of the access check underneath.
+    ///
+    /// Nothing checked this before: any process could pin `/etc/shadow`, a
+    /// setuid binary or another user's private file under a name of its own
+    /// choosing, and keep its content across the owner's replace-and-unlink
+    /// (which is exactly the attack `protected_hardlinks` exists to stop).
+    fn link_verdict(
+        creds: &Credentials,
+        owner_uid: u32,
+        owner_gid: u32,
+        mode: u16,
+        type_: FileType,
+    ) -> LxResult {
+        if type_ == FileType::Dir {
+            return Err(LxError::EPERM);
+        }
+        // `inode_owner_or_capable()`: `vfsuid_eq_kuid(vfsuid, current_fsuid())`.
+        if creds.fsuid == ROOT_UID || creds.fsuid == owner_uid {
+            return Ok(());
+        }
+        if type_ != FileType::File {
+            return Err(LxError::EPERM);
+        }
+        if mode & MODE_SET_UID != 0 {
+            return Err(LxError::EPERM);
+        }
+        if mode & (MODE_SET_GID | MODE_EXEC_GRP) == (MODE_SET_GID | MODE_EXEC_GRP) {
+            return Err(LxError::EPERM);
+        }
+        Self::access_verdict(
+            creds,
+            owner_uid,
+            owner_gid,
+            mode,
+            false,
+            ACCESS_READ | ACCESS_WRITE,
+            true,
+        )
+        .map_err(|_| LxError::EPERM)
+    }
+
+    /// `inode_owner_or_capable`: whether `creds` own the file (by the
+    /// FILESYSTEM uid, `vfsuid_eq_kuid(vfsuid, current_fsuid())`) or are
+    /// root. The question behind chmod, chown of a group, explicit utimes
+    /// and `O_NOATIME`.
+    fn owner_or_capable(creds: &Credentials, owner_uid: u32) -> bool {
+        creds.fsuid == ROOT_UID || creds.fsuid == owner_uid
+    }
+
+    /// `may_open`: "O_NOATIME can only be set by the owner or superuser",
+    /// `EPERM` for anyone else. Nothing asked this before: any process could
+    /// read another user's file without leaving an access time behind.
+    pub fn check_owner_or_capable(&self, metadata: &Metadata) -> LxResult {
+        if Self::owner_or_capable(&self.credentials(), metadata.uid as u32) {
+            Ok(())
+        } else {
+            Err(LxError::EPERM)
+        }
+    }
+
+    /// [`link_verdict`](Self::link_verdict) for this process on the file
+    /// `metadata` describes, the one `linkat(2)` was asked to link.
+    pub fn check_link(&self, metadata: &Metadata) -> LxResult {
+        Self::link_verdict(
+            &self.credentials(),
+            metadata.uid as u32,
+            metadata.gid as u32,
+            metadata.mode,
+            metadata.type_,
+        )
     }
 
     /// Change owner/group following a conservative POSIX-compatible policy.
@@ -2706,7 +3074,10 @@ impl LinuxProcess {
     /// [`Self::reset_signal_actions_for_exec`] and, per thread,
     /// [`LinuxThread::reset_for_exec`](crate::thread::LinuxThread::reset_for_exec).
     pub fn reset_for_exec(&self, privileged: bool) {
-        self.inner.lock().reset_for_exec(privileged)
+        // The old attachments come out under the lock and are dropped after
+        // it: dropping them locks each segment (see `ShmProc`).
+        let old_attachments = self.inner.lock().reset_for_exec(privileged);
+        drop(old_attachments);
     }
 
     /// Set supplementary groups.
@@ -3094,17 +3465,19 @@ impl LinuxProcess {
         // Remove under the lock, DROP outside it — see `close_file` for the
         // re-entrancy deadlock this avoids.
         type RemovedFds = Vec<(FileDesc, Arc<dyn FileLike>)>;
-        let (removed, exec_path): (RemovedFds, String) = {
+        let (removed, forget, exec_path): (RemovedFds, _, String) = {
             let mut inner = self.inner.lock();
             // Per-fd state is authoritative — NOT the flag inside the (possibly
             // fork-shared) `File` objects, which is only a creation-time record.
             let close_fds = inner.cloexec_fds.drain().collect::<Vec<_>>();
-            let removed = close_fds
+            let removed: RemovedFds = close_fds
                 .into_iter()
                 .filter_map(|fd| inner.files.remove(&fd).map(|f| (fd, f)))
                 .collect();
-            (removed, inner.execute_path.clone())
+            let forget = inner.epoll_forget_plan(removed.clone());
+            (removed, forget, inner.execute_path.clone())
         };
+        forget.run();
         for (fd, f) in removed {
             // DRM diagnostics: removal of a DRM/dmabuf fd — see
             // fs::drm_fd_desc. debug level: this is NORMAL CLOEXEC behavior
@@ -3137,13 +3510,23 @@ impl LinuxProcess {
     }
 
     /// Insert a `SemArray` and return its ID
-    pub fn semaphores_add(&self, array: Arc<SemArray>) -> usize {
-        self.inner.lock().semaphores.add(array)
+    pub fn semaphores_add(&self, id: usize, array: Arc<SemArray>) {
+        self.inner.lock().semaphores.add(id, array)
     }
 
     /// Get an semaphore set by `id`
     pub fn semaphores_get(&self, id: usize) -> Option<Arc<SemArray>> {
-        self.inner.lock().semaphores.get(id)
+        let mut inner = self.inner.lock();
+        if let Some(array) = inner.semaphores.get(id) {
+            return Some(array);
+        }
+        // Not one this process `semget`-ed: the id may have been created by
+        // another program and passed here, which is what a system-wide id is
+        // for. Record it, so the `SEM_UNDO` records `semop` leaves have a set
+        // to replay against at exit.
+        let array = crate::ipc::sem_lookup(id)?;
+        inner.semaphores.add(id, array.clone());
+        Some(array)
     }
 
     /// Add an undo operation
@@ -3180,9 +3563,75 @@ impl LinuxProcess {
     pub fn shm_set(&self, id: usize, shm_id: ShmIdentifier) {
         self.inner.lock().shm_identifiers.set(id, shm_id)
     }
+
+    /// Record an attachment of segment `id` at `addr`: what `shmat` mapped.
+    pub fn shm_attach(&self, id: usize, shared_guard: Arc<Mutex<ShmGuard>>, addr: usize) {
+        self.inner
+            .lock()
+            .shm_identifiers
+            .attach(id, shared_guard, addr)
+    }
+
+    /// Forget the attachment at `addr`, and say what was there; `None` when
+    /// nothing was, which `shmdt` answers with `EINVAL`.
+    pub fn shm_detach(&self, addr: usize) -> Option<ShmIdentifier> {
+        self.inner.lock().shm_identifiers.detach(addr)
+    }
+}
+
+/// What a close has to tell this process's epolls, decided under the table
+/// lock and delivered after it: [`LinuxProcessInner::epoll_forget_plan`].
+pub(crate) struct EpollForgetPlan {
+    epolls: Vec<Arc<crate::fs::Epoll>>,
+    gone: Vec<(FileDesc, Arc<dyn FileLike>)>,
+}
+
+impl EpollForgetPlan {
+    /// Remove every `gone` entry from every epoll. Called with the table lock
+    /// released: an epoll takes its own lock, and the `Arc`s dropped here may
+    /// be the description's last, whose teardown re-enters the process (see
+    /// [`LinuxProcess::close_file`]).
+    pub(crate) fn run(self) {
+        for epoll in &self.epolls {
+            for (_, file) in &self.gone {
+                epoll.forget_closed(file);
+            }
+        }
+    }
 }
 
 impl LinuxProcessInner {
+    /// The closed descriptors whose open file description no descriptor of
+    /// this table holds any more, with the epolls of this table that may
+    /// watch them.
+    ///
+    /// Linux drops an epoll entry from `__fput`, when the LAST reference to
+    /// the description goes: a `dup` of a watched descriptor keeps its entry
+    /// alive through the close of the original, and epoll(7) tells the
+    /// program to `EPOLL_CTL_DEL` explicitly in that case. The references
+    /// this table can see are its own, which is where every dup made by
+    /// `dup`, `dup2` and `fcntl(F_DUPFD)` lives; a fork's copy of the same
+    /// description in another process is not counted, and its own close
+    /// tells its own epolls.
+    ///
+    /// `closed` must already be out of `files`.
+    fn epoll_forget_plan(&self, closed: Vec<(FileDesc, Arc<dyn FileLike>)>) -> EpollForgetPlan {
+        let epolls: Vec<Arc<crate::fs::Epoll>> = self
+            .files
+            .values()
+            .filter_map(|f| f.clone().downcast_arc::<crate::fs::Epoll>().ok())
+            .collect();
+        let gone = if epolls.is_empty() {
+            Vec::new()
+        } else {
+            closed
+                .into_iter()
+                .filter(|(_, file)| !self.files.values().any(|f| Arc::ptr_eq(f, file)))
+                .collect()
+        };
+        EpollForgetPlan { epolls, gone }
+    }
+
     /// Everything a `fork(2)` child starts life with, decided field by field.
     ///
     /// Written out in full, with no `..Default::default()`, on purpose: a
@@ -3350,7 +3799,11 @@ impl LinuxProcessInner {
 
     /// What `execve` must make the process forget, once the old address space
     /// is gone. `privileged` is `bprm->secureexec`.
-    fn reset_for_exec(&mut self, privileged: bool) {
+    ///
+    /// Returns the shared-memory table the old image had, for the caller to
+    /// drop once the process lock is released: its drop accounts a detach on
+    /// every segment it had attached, and that locks each segment.
+    fn reset_for_exec(&mut self, privileged: bool) -> ShmProc {
         // Every System V segment this process had attached was mapped in the
         // address space `execve` just cleared; Linux unmaps them with the
         // rest of the old mm and each `shm_close` accounts its detach. Kept,
@@ -3358,9 +3811,8 @@ impl LinuxProcessInner {
         // NEW image, and `shmdt` trusts them: it looks the address up in this
         // very map and unmaps that many bytes there (`sys_shmdt`), so a
         // detach of a segment the process no longer has punches a hole in the
-        // new program. The segment's attach count never drops either, so an
-        // `IPC_RMID` on it frees nothing.
-        self.shm_identifiers = Default::default();
+        // new program. The detach itself is the table's drop.
+        let old_attachments = core::mem::take(&mut self.shm_identifiers);
 
         // `begin_new_exec()`: `me->flags &= ~PF_FORKNOEXEC`. From here on the
         // process runs an image of its own choosing, and a `setpgid` from the
@@ -3384,10 +3836,17 @@ impl LinuxProcessInner {
         // interval timers, which setitimer(2) preserves across an exec.
         // `brk`/`mapped_brk`, `environ`, `cmdline`, `execute_path` and `abi`
         // are all overwritten by the caller from the new image.
+        old_attachments
     }
 
-    fn forked_child(&self, pgid: KoID, sid: KoID) -> Self {
+    fn forked_child(&self, pgid: KoID, sid: KoID, start_ns: u64) -> Self {
+        note_process_created();
         LinuxProcessInner {
+            // `copy_process`: `p->start_time = ktime_get_ns()`. The child is
+            // born now, whenever its parent was; carried over, every child
+            // of a long-lived shell would claim the shell's start time and
+            // `ps -o etime` would show the shell's age for all of them.
+            start_ns,
             // --- copied from the parent -------------------------------------
             execute_path: self.execute_path.clone(),
             cmdline: self.cmdline.clone(),
@@ -3433,7 +3892,7 @@ impl LinuxProcessInner {
             // shmat(2): the attachments come along with the copied address
             // space, so the child must be able to `shmdt` them. Without the
             // record it cannot, and the mapping stays for the child's life.
-            shm_identifiers: self.shm_identifiers.clone(),
+            shm_identifiers: self.shm_identifiers.inherited(),
 
             // --- deliberately fresh -----------------------------------------
             // A child has no children of its own, and no accumulated times
@@ -3666,7 +4125,9 @@ pub fn send_signal_to_pgrp(pgid: usize, signal: LinuxSignal) -> LxResult<()> {
 }
 
 /// Pulse the parent's zircon `SIGCHLD` so a blocking `wait*` wakes for a
-/// stop/continue (exit already does the same from the terminate callback).
+/// stop/continue (exit already does the same from the terminate callback),
+/// and send it the Linux `SIGCHLD` a handler or signalfd waits for, unless
+/// its `sigaction` said `SA_NOCLDSTOP` (`do_notify_parent_cldstop`).
 fn notify_parent_child_state(child: &Arc<Process>) {
     let parent = child.try_linux().and_then(|lp| lp.parent());
     let parent = match parent {
@@ -3677,6 +4138,74 @@ fn notify_parent_child_state(child: &Arc<Process>) {
         },
     };
     parent.signal_set(Signal::SIGCHLD);
+    if parent_wants_sigchld_for_stops(&parent) {
+        let info = child.try_linux().map(|lp| {
+            let (uid, status) = {
+                let inner = lp.inner.lock();
+                let status = if inner.job_stopped {
+                    wait_status_stopped(inner.job_stop_sig)
+                } else {
+                    WAIT_STATUS_CONTINUED
+                };
+                (inner.credentials.ruid, status)
+            };
+            SigInfo::child_state_change(child.id() as i32, uid, status)
+        });
+        let _ = send_signal_to_process_with_info(parent.id() as usize, LinuxSignal::SIGCHLD, info);
+    }
+}
+
+/// Whether a stop or continue of a child is reported to `parent` as a Linux
+/// `SIGCHLD`: it is unless the parent's `SIGCHLD` action carries
+/// `SA_NOCLDSTOP`, the flag whose whole meaning is "only tell me when they
+/// die".
+fn parent_wants_sigchld_for_stops(parent: &Arc<Process>) -> bool {
+    parent
+        .try_linux()
+        .map(|lp| {
+            !lp.signal_action(LinuxSignal::SIGCHLD)
+                .flags
+                .contains(crate::signal::SignalActionFlags::NOCLDSTOP)
+        })
+        .unwrap_or(false)
+}
+
+/// What a reaper's `SIGCHLD` disposition says to do with a child that just
+/// died: `do_notify_parent`'s `autoreap`, and whether the signal is sent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ChildDeathPolicy {
+    /// Release the child at once instead of leaving a zombie for `wait*`.
+    autoreap: bool,
+    /// Queue the Linux `SIGCHLD` at all.
+    notify: bool,
+}
+
+/// `SIG_IGN` on `SIGCHLD` means "I will never wait for them": the child is
+/// released without a zombie and no signal is sent. `SA_NOCLDWAIT` with a
+/// handler means the same for the zombie, but the handler still runs
+/// (sigaction(2), and the `psig->action[SIGCHLD-1]` test in
+/// `do_notify_parent`). Anything else leaves the zombie and sends the signal.
+fn child_death_policy(reaper: &LinuxProcess) -> ChildDeathPolicy {
+    let action = reaper.signal_action(LinuxSignal::SIGCHLD);
+    if action.handler == crate::signal::SIG_IGN {
+        ChildDeathPolicy {
+            autoreap: true,
+            notify: false,
+        }
+    } else if action
+        .flags
+        .contains(crate::signal::SignalActionFlags::NOCLDWAIT)
+    {
+        ChildDeathPolicy {
+            autoreap: true,
+            notify: true,
+        }
+    } else {
+        ChildDeathPolicy {
+            autoreap: false,
+            notify: true,
+        }
+    }
 }
 
 /// Park the current task until this process leaves a job-control stop (or dies).
@@ -3894,6 +4423,35 @@ pub fn all_live_processes() -> Vec<Arc<Process>> {
 /// it can ask anything else about it.
 pub fn find_process(pid: KoID) -> Option<Arc<Process>> {
     ROOT_JOB.find_process(pid)
+}
+
+/// The monotonic clock now, in nanoseconds: what a process's birth is
+/// stamped with (`ktime_get_ns()` in `copy_process`).
+fn monotonic_now_ns() -> u64 {
+    kernel_hal::timer::timer_now().as_nanos() as u64
+}
+
+/// Processes created since boot, exited or not: Linux's `total_forks`,
+/// bumped once per `copy_process`, which the `processes` line of
+/// `/proc/stat` publishes and `vmstat` differentiates into forks per second.
+static PROCESSES_CREATED: AtomicU64 = AtomicU64::new(0);
+
+fn note_process_created() {
+    PROCESSES_CREATED.fetch_add(1, Ordering::Relaxed);
+}
+
+/// How many processes have been created since boot (`total_forks`): a
+/// counter that only grows, not the number alive now.
+pub fn processes_created() -> u64 {
+    PROCESSES_CREATED.load(Ordering::Relaxed)
+}
+
+/// The real uid of the process `pid` names, exited or not; 0 when there is
+/// no such process. What `si_uid` carries in a `SIGCHLD` (`task_uid`).
+pub fn real_uid_of(pid: KoID) -> u32 {
+    find_process(pid)
+        .and_then(|p| p.try_linux().map(|lp| lp.credentials().ruid))
+        .unwrap_or(0)
 }
 
 /// Whether `pid` names a process that has not exited.
@@ -4184,6 +4742,17 @@ fn interrupts_syscall(handler: usize, sig: LinuxSignal) -> bool {
 pub fn check_signals() -> LxResult<()> {
     if let Some(arc) = kernel_hal::thread::get_current_thread() {
         if let Ok(thread) = arc.downcast::<Thread>() {
+            return check_signals_of(&thread);
+        }
+    }
+    Ok(())
+}
+
+/// [`check_signals`] for a named thread rather than the current one: what an
+/// interruptible sleep asks about the thread it is putting to sleep.
+pub fn check_signals_of(thread: &Arc<Thread>) -> LxResult<()> {
+    {
+        {
             use crate::thread::ThreadExt;
             use zircon_object::task::ThreadState;
             if thread.state() == ThreadState::Dying {
@@ -4255,6 +4824,122 @@ pub fn check_signals() -> LxResult<()> {
         }
     }
     Ok(())
+}
+
+/// The zircon bit on a Linux THREAD object that says "a signal was just
+/// queued to you": what [`interruptible_sleep_until`] parks on. Set by every
+/// path that makes a signal pending on a thread ([`wake_signal_sleeper`]).
+pub const SIGNAL_WAKE: Signal = Signal::USER_SIGNAL_0;
+
+/// The zircon bit the sleep's own deadline timer sets on the thread.
+const SLEEP_DEADLINE: Signal = Signal::USER_SIGNAL_2;
+
+/// Tell `thread` a signal was queued to it, so a sleep it is in ends now.
+pub fn wake_signal_sleeper(thread: &Arc<Thread>) {
+    thread.signal_set(SIGNAL_WAKE);
+}
+
+/// Sleep until `deadline`, or until a signal that would interrupt a syscall
+/// is pending on `thread`, whichever comes first: `TASK_INTERRUPTIBLE`, the
+/// sleep of `nanosleep(2)`, `clock_nanosleep(2)` and `pause(2)`. `Ok` at the
+/// deadline; `EINTR` with the signal still pending otherwise.
+///
+/// `nanosleep` used to be one uninterruptible `sleep_until(deadline)` with a
+/// signal check after it: a daemon in `sleep(60)` took up to a minute to see
+/// the `SIGTERM` its handler was waiting for, and `alarm(1)` did nothing to a
+/// `sleep(10)` until the ten seconds were up.
+///
+/// The bit is cleared BEFORE the pending set is looked at, so a signal that
+/// arrives after the look sets it again and the wait returns at once; the
+/// deadline is a timer that sets a second bit, and a stale one from an
+/// earlier sleep only costs a spurious pass through the loop.
+pub async fn interruptible_sleep_until(
+    thread: &Arc<Thread>,
+    deadline: core::time::Duration,
+) -> LxResult<()> {
+    let mut park = SignalPark::new(thread);
+    loop {
+        park.prepare();
+        check_signals_of(thread)?;
+        if kernel_hal::timer::timer_now() >= deadline {
+            return Ok(());
+        }
+        park.park(Some(deadline)).await;
+    }
+}
+
+/// Park until a signal that would interrupt a syscall is pending on
+/// `thread`: `pause(2)` and `rt_sigsuspend(2)`, which return only through
+/// that signal, so this returns the error to hand back (`EINTR`, or what
+/// [`check_signals_of`] says about a thread being torn down).
+///
+/// Both used to spin on a 10 ms `sleep_until`: a shell parked in `pause`
+/// woke a hundred times a second for nothing, and a hundred idle daemons
+/// were ten thousand wakeups a second on a machine doing nothing.
+pub async fn wait_for_signal(thread: &Arc<Thread>) -> LxError {
+    let mut park = SignalPark::new(thread);
+    loop {
+        park.prepare();
+        if let Err(e) = check_signals_of(thread) {
+            return e;
+        }
+        park.park(None).await;
+    }
+}
+
+/// The parking half of an interruptible wait on a Linux thread: wake when a
+/// signal is queued to `thread` -- blocked or not, which is what a
+/// `sigtimedwait` on a blocked set needs -- or when a deadline passes.
+///
+/// The protocol is two calls per pass, [`Self::prepare`] then
+/// [`Self::park`], with the caller's own look at its condition in between:
+/// `prepare` clears the wake bits BEFORE the look, so a signal queued after
+/// the look sets a bit again and the park returns at once. A stale deadline
+/// bit from an earlier pass only costs one spurious pass.
+pub struct SignalPark {
+    thread: Arc<Thread>,
+    object: Arc<dyn KernelObject>,
+    armed: bool,
+}
+
+impl SignalPark {
+    /// A park on `thread`.
+    pub fn new(thread: &Arc<Thread>) -> Self {
+        SignalPark {
+            thread: thread.clone(),
+            object: thread.clone(),
+            armed: false,
+        }
+    }
+
+    /// Clear the wake bits. Call this before looking at the condition the
+    /// park waits for, never after.
+    pub fn prepare(&self) {
+        self.object.signal_clear(SIGNAL_WAKE | SLEEP_DEADLINE);
+    }
+
+    /// Wait for a signal queued to the thread, or for `deadline` (`None`:
+    /// only a signal ends the wait). The deadline timer is armed once per
+    /// park, on the first call that passes one.
+    pub async fn park(&mut self, deadline: Option<core::time::Duration>) {
+        if let Some(deadline) = deadline {
+            if !self.armed {
+                self.armed = true;
+                // Weak: the timer must not keep a dead thread's object alive
+                // for the length of a long sleep.
+                let weak = Arc::downgrade(&self.thread);
+                kernel_hal::timer::timer_set(
+                    deadline,
+                    Box::new(move |_now| {
+                        if let Some(thread) = weak.upgrade() {
+                            thread.signal_set(SLEEP_DEADLINE);
+                        }
+                    }),
+                );
+            }
+        }
+        self.object.wait_signal(SIGNAL_WAKE | SLEEP_DEADLINE).await;
+    }
 }
 
 /// Send a signal to a process by its KoID.
@@ -4438,6 +5123,17 @@ pub fn pending_after_send(mut pending: Sigset, signal: LinuxSignal) -> Sigset {
 }
 
 pub fn send_signal_to_process(pid: usize, signal: LinuxSignal) -> LxResult<()> {
+    send_signal_to_process_with_info(pid, signal, None)
+}
+
+/// [`send_signal_to_process`], with the `siginfo_t` the handler will be
+/// handed: who sent a `kill`, which child a `SIGCHLD` is about. `None` leaves
+/// [`SigInfo::bare`].
+pub fn send_signal_to_process_with_info(
+    pid: usize,
+    signal: LinuxSignal,
+    info: Option<SigInfo>,
+) -> LxResult<()> {
     use crate::thread::ThreadExt;
     if let Some(process) = ROOT_JOB.find_process(pid as KoID) {
         if signal_trace_worthy(signal) {
@@ -4477,11 +5173,13 @@ pub fn send_signal_to_process(pid: usize, signal: LinuxSignal) -> LxResult<()> {
                 if let Ok(thread) = thread_obj.downcast_arc::<Thread>() {
                     // Peek without holding the guard across a move of `thread`.
                     let delivered = if let Some(mut lt) = thread.try_lock_linux() {
-                        if lt.signal_mask().contains(signal) {
-                            false
-                        } else {
-                            lt.signals.insert(signal);
+                        // `wants_signal()`: unblocked, or parked in
+                        // `rt_sigtimedwait` for exactly this signal.
+                        if lt.wants_signal(signal) {
+                            lt.queue_signal(signal, info);
                             true
+                        } else {
+                            false
                         }
                     } else {
                         // Lock held (e.g. PID 1 in waitpid): queue below rather
@@ -4490,6 +5188,7 @@ pub fn send_signal_to_process(pid: usize, signal: LinuxSignal) -> LxResult<()> {
                         false
                     };
                     if delivered {
+                        wake_signal_sleeper(&thread);
                         // Wake waitpid(-1): PID 1 blocks on this zircon bit.
                         process.signal_set(Signal::SIGCHLD);
                         wake_for_job_control(&process, signal);
@@ -4507,7 +5206,8 @@ pub fn send_signal_to_process(pid: usize, signal: LinuxSignal) -> LxResult<()> {
         // The old code dropped it here, which is why a Wayland compositor that
         // blocks SIGINT for its signalfd never saw Ctrl-C.
         if let Some(thread) = first {
-            thread.lock_linux().signals.insert(signal);
+            thread.lock_linux().queue_signal(signal, info);
+            wake_signal_sleeper(&thread);
         }
         // Pulse even when every thread had the Linux signal blocked: waitpid
         // still needs to return so the waiter can notice the pending set.
@@ -4602,7 +5302,31 @@ mod fork_inheritance_tests {
     }
 
     fn fork_of(parent: &LinuxProcessInner) -> LinuxProcessInner {
-        parent.forked_child(41, 42)
+        parent.forked_child(41, 42, 999)
+    }
+
+    #[test]
+    fn a_child_is_born_now_not_when_its_parent_was() {
+        // `copy_process`: `p->start_time = ktime_get_ns()`, never the
+        // parent's. `/proc/<pid>/stat` field 22 comes from this.
+        let mut parent = a_configured_parent();
+        parent.start_ns = 5;
+        assert_eq!(parent.forked_child(41, 42, 999).start_ns, 999);
+    }
+
+    #[test]
+    fn every_fork_counts_once_in_the_processes_created_since_boot() {
+        // `total_forks` in `copy_process`: a counter, never the live count.
+        // Other tests create processes too, so the count can grow by more
+        // than ours, never by less and never shrink.
+        let parent = a_configured_parent();
+        let before = processes_created();
+        let _first = parent.forked_child(41, 42, 1);
+        let _second = parent.forked_child(41, 42, 2);
+        assert!(processes_created() >= before + 2);
+        // A dropped child stays counted.
+        drop(_first);
+        assert!(processes_created() >= before + 2);
     }
 
     #[test]
@@ -4694,7 +5418,7 @@ mod fork_inheritance_tests {
         let mut parent = a_configured_parent();
         parent.pgid = 0;
         parent.sid = 0;
-        let child = parent.forked_child(1234, 5678);
+        let child = parent.forked_child(1234, 5678, 0);
         assert_eq!(child.pgid, 1234);
         assert_eq!(child.sid, 5678);
     }
@@ -4767,9 +5491,11 @@ mod fork_inheritance_tests {
         // own exit, semaphore operations that its parent performed and that
         // the parent will undo again.
         let mut parent = a_configured_parent();
-        let id = parent
-            .semaphores
-            .add(crate::ipc::SemArray::get_or_create(0, 1, 0o666, 0, 0).unwrap());
+        let id = 7;
+        parent.semaphores.add(
+            id,
+            crate::ipc::SemArray::get_or_create(0, 1, 0o666, 0, 0).unwrap(),
+        );
         parent.semaphores.add_undo(id, 0, -1);
 
         let child = fork_of(&parent);
@@ -4815,6 +5541,34 @@ mod fork_inheritance_tests {
     }
 
     #[test]
+    fn the_fork_counts_the_child_as_one_more_attachment() {
+        // `shm_open` on the copied mapping: the segment's `shm_nattch` goes
+        // up by one for the child, as `ipcs -m` shows on Linux, and comes
+        // back down when the child dies. It used to move only on an explicit
+        // `shmat`/`shmdt`, so a forked child was invisible to the count and
+        // a parent that died with the segment attached left it one too high
+        // for ever.
+        use crate::ipc::ShmGuard;
+        use zircon_object::vm::VmObject;
+        let mut parent = a_configured_parent();
+        let guard = Arc::new(kernel_hal::sync::Mutex::new(ShmGuard {
+            shared_guard: VmObject::new_paged(1),
+            shmid_ds: kernel_hal::sync::Mutex::new(Default::default()),
+        }));
+        guard.lock().attach(1);
+        parent.shm_identifiers.attach(9, guard.clone(), 0x7f00_0000);
+        let nattch = || guard.lock().shmid_ds.lock().nattch;
+        assert_eq!(nattch(), 1);
+
+        let child = fork_of(&parent);
+        assert_eq!(nattch(), 2, "the child holds the mapping too");
+        drop(child);
+        assert_eq!(nattch(), 1, "the child's death is a detach");
+        drop(parent);
+        assert_eq!(nattch(), 0, "and so is the parent's");
+    }
+
+    #[test]
     fn the_kernel_side_futex_objects_are_not_inherited() {
         // They are keyed by address in the parent's address space and hold
         // its waiters. The child's memory is a copy: same addresses,
@@ -4823,7 +5577,7 @@ mod fork_inheritance_tests {
         // threads of the parent that are waiting on their own memory.
         static WORD: AtomicI32 = AtomicI32::new(0);
         let mut parent = a_configured_parent();
-        parent.futexes.insert(0x1000, Futex::new(&WORD));
+        parent.futexes.get_or_create(0x1000, || Futex::new(&WORD));
 
         let child = fork_of(&parent);
         assert!(child.futexes.is_empty());
@@ -4883,6 +5637,26 @@ mod exec_reset_tests {
         inner.reset_for_exec(false);
         assert_eq!(inner.shm_identifiers.get_id(0x7f00_0000), None);
         assert!(inner.shm_identifiers.get(9).is_none());
+    }
+
+    #[test]
+    fn an_exec_detaches_the_segments_on_the_segment_side_too() {
+        // Linux unmaps the old mm's segments with `shm_close` on each, so
+        // `shm_nattch` drops. Here the record was cleared and the count
+        // stayed: a program that exec'd with a segment attached counted as
+        // its user for ever.
+        let mut inner = a_process_about_to_exec();
+        let guard = inner.shm_identifiers.get(9).unwrap().guard;
+        guard.lock().attach(1);
+        assert_eq!(guard.lock().shmid_ds.lock().nattch, 1);
+        let old = inner.reset_for_exec(false);
+        assert_eq!(
+            guard.lock().shmid_ds.lock().nattch,
+            1,
+            "the detach happens when the old table is dropped, outside the lock"
+        );
+        drop(old);
+        assert_eq!(guard.lock().shmid_ds.lock().nattch, 0);
     }
 
     /// `begin_new_exec`: `me->flags &= ~PF_FORKNOEXEC`. The exec is what
@@ -7681,6 +8455,535 @@ mod fsid_tests {
 }
 
 #[cfg(test)]
+mod utimes_permission_tests {
+    use super::*;
+    use rcore_fs::vfs::FileSystem;
+    use rcore_fs_ramfs::RamFS;
+
+    const OWNER: u32 = 1000;
+    const OTHER: u32 = 2000;
+
+    fn creds(uid: u32) -> Credentials {
+        Credentials {
+            ruid: uid,
+            euid: uid,
+            suid: uid,
+            rgid: uid,
+            egid: uid,
+            sgid: uid,
+            fsuid: uid,
+            fsgid: uid,
+            groups: Vec::new(),
+            umask: 0o022,
+        }
+    }
+
+    fn verdict(uid: u32, mode: u16, explicit: bool) -> LxResult {
+        LinuxProcess::utimes_verdict(&creds(uid), OWNER, OWNER, mode, false, explicit)
+    }
+
+    #[test]
+    fn the_owner_and_root_may_set_any_time_on_a_read_only_file() {
+        assert_eq!(verdict(OWNER, 0o444, true), Ok(()));
+        assert_eq!(verdict(OWNER, 0o444, false), Ok(()));
+        assert_eq!(verdict(ROOT_UID, 0o444, true), Ok(()));
+        assert_eq!(verdict(ROOT_UID, 0o000, false), Ok(()));
+    }
+
+    #[test]
+    fn explicit_times_on_someone_elses_file_are_eperm_even_with_write_access() {
+        // `touch -d yesterday /tmp/theirs` on a 0666 file: writable, yet the
+        // times are the owner's to forge, not the world's (`setattr_prepare`:
+        // `ATTR_MTIME_SET` without `inode_owner_or_capable` is EPERM).
+        assert_eq!(verdict(OTHER, 0o666, true), Err(LxError::EPERM));
+        assert_eq!(verdict(OTHER, 0o644, true), Err(LxError::EPERM));
+    }
+
+    #[test]
+    fn a_touch_needs_write_access_and_nothing_more() {
+        // `touch /tmp/theirs` (times NULL): `ATTR_TOUCH` falls back on
+        // `inode_permission(MAY_WRITE)`, so a writable file may be touched by
+        // anyone and a read-only one answers EACCES, not EPERM.
+        assert_eq!(verdict(OTHER, 0o666, false), Ok(()));
+        assert_eq!(verdict(OTHER, 0o644, false), Err(LxError::EACCES));
+    }
+
+    #[test]
+    fn ownership_is_the_filesystem_uid_not_the_effective_one() {
+        // `inode_owner_or_capable()`: `vfsuid_eq_kuid(vfsuid, current_fsuid())`.
+        let mut c = creds(OTHER);
+        c.fsuid = OWNER;
+        assert_eq!(
+            LinuxProcess::utimes_verdict(&c, OWNER, OWNER, 0o444, false, true),
+            Ok(())
+        );
+        let mut c = creds(OWNER);
+        c.fsuid = OTHER;
+        assert_eq!(
+            LinuxProcess::utimes_verdict(&c, OWNER, OWNER, 0o444, false, true),
+            Err(LxError::EPERM)
+        );
+    }
+
+    #[test]
+    fn check_utimes_reads_the_verdict_off_real_metadata() {
+        let proc = super::dup_fd_tests::a_process();
+        proc.set_resuid(OTHER, OTHER, OTHER).unwrap();
+        let inode: Arc<dyn INode> = RamFS::new()
+            .root_inode()
+            .create("f", FileType::File, 0o644)
+            .unwrap();
+        let mut meta = inode.metadata().unwrap();
+        meta.uid = OWNER as usize;
+        meta.gid = OWNER as usize;
+        inode.set_metadata(&meta).unwrap();
+        let meta = inode.metadata().unwrap();
+        assert_eq!(proc.check_utimes(&meta, true), Err(LxError::EPERM));
+        assert_eq!(proc.check_utimes(&meta, false), Err(LxError::EACCES));
+        let mut meta = meta;
+        meta.mode = 0o666;
+        assert_eq!(proc.check_utimes(&meta, false), Ok(()));
+    }
+}
+
+#[cfg(test)]
+mod link_permission_tests {
+    use super::*;
+
+    const OWNER: u32 = 1000;
+    const OTHER: u32 = 2000;
+
+    fn creds(uid: u32) -> Credentials {
+        Credentials {
+            ruid: uid,
+            euid: uid,
+            suid: uid,
+            rgid: uid,
+            egid: uid,
+            sgid: uid,
+            fsuid: uid,
+            fsgid: uid,
+            groups: Vec::new(),
+            umask: 0o022,
+        }
+    }
+
+    fn verdict(uid: u32, mode: u16, type_: FileType) -> LxResult {
+        LinuxProcess::link_verdict(&creds(uid), OWNER, OWNER, mode, type_)
+    }
+
+    #[test]
+    fn nobody_links_a_directory_not_even_root() {
+        // `vfs_link`: `if (S_ISDIR(inode->i_mode)) return -EPERM;`
+        assert_eq!(verdict(ROOT_UID, 0o777, FileType::Dir), Err(LxError::EPERM));
+        assert_eq!(verdict(OWNER, 0o777, FileType::Dir), Err(LxError::EPERM));
+    }
+
+    #[test]
+    fn the_owner_and_root_link_whatever_they_own_however_it_is_set() {
+        assert_eq!(verdict(OWNER, 0o000, FileType::File), Ok(()));
+        assert_eq!(verdict(OWNER, 0o4755, FileType::File), Ok(()));
+        assert_eq!(verdict(OWNER, 0o600, FileType::NamedPipe), Ok(()));
+        assert_eq!(verdict(ROOT_UID, 0o000, FileType::File), Ok(()));
+        assert_eq!(verdict(ROOT_UID, 0o4755, FileType::CharDevice), Ok(()));
+    }
+
+    #[test]
+    fn someone_else_needs_a_safe_source_they_can_read_and_write() {
+        // The `protected_hardlinks` case: `ln /etc/shadow ~/mine`.
+        assert_eq!(verdict(OTHER, 0o600, FileType::File), Err(LxError::EPERM));
+        assert_eq!(
+            verdict(OTHER, 0o644, FileType::File),
+            Err(LxError::EPERM),
+            "readable is not enough"
+        );
+        assert_eq!(
+            verdict(OTHER, 0o622, FileType::File),
+            Err(LxError::EPERM),
+            "writable is not enough either"
+        );
+        assert_eq!(verdict(OTHER, 0o666, FileType::File), Ok(()));
+    }
+
+    #[test]
+    fn a_setuid_or_setgid_executable_is_never_a_safe_source() {
+        assert_eq!(verdict(OTHER, 0o4666, FileType::File), Err(LxError::EPERM));
+        assert_eq!(verdict(OTHER, 0o2676, FileType::File), Err(LxError::EPERM));
+        // Setgid WITHOUT group-exec is mandatory locking, not privilege:
+        // still a safe source (`(S_ISGID | S_IXGRP)` both, or neither counts).
+        assert_eq!(verdict(OTHER, 0o2666, FileType::File), Ok(()));
+    }
+
+    #[test]
+    fn a_special_file_is_never_a_safe_source_for_someone_else() {
+        // "Special files should not get pinned to the filesystem."
+        assert_eq!(
+            verdict(OTHER, 0o666, FileType::NamedPipe),
+            Err(LxError::EPERM)
+        );
+        assert_eq!(
+            verdict(OTHER, 0o666, FileType::CharDevice),
+            Err(LxError::EPERM)
+        );
+        assert_eq!(
+            verdict(OTHER, 0o777, FileType::SymLink),
+            Err(LxError::EPERM)
+        );
+        assert_eq!(verdict(OTHER, 0o777, FileType::Socket), Err(LxError::EPERM));
+    }
+
+    #[test]
+    fn the_answer_is_eperm_not_the_eacces_of_the_access_check() {
+        // `may_linkat` returns -EPERM whatever `inode_permission` said: the
+        // caller is told the link is forbidden, not that the file is.
+        assert_eq!(verdict(OTHER, 0o000, FileType::File), Err(LxError::EPERM));
+        let mut c = creds(OTHER);
+        c.fsuid = OWNER;
+        assert_eq!(
+            LinuxProcess::link_verdict(&c, OWNER, OWNER, 0o000, FileType::File),
+            Ok(()),
+            "and ownership is the filesystem uid"
+        );
+        // The read-and-write test is on the FILESYSTEM ids too
+        // (`inode_permission` -> `current_fsuid()`/`current_fsgid()`): a
+        // process whose real ids are strangers to the file but whose fs gid
+        // is the file's group may link a group-rw file.
+        let mut c = creds(3000);
+        c.fsuid = OTHER;
+        c.fsgid = OTHER;
+        assert_eq!(
+            LinuxProcess::link_verdict(&c, OWNER, OTHER, 0o660, FileType::File),
+            Ok(())
+        );
+        c.fsgid = 3000;
+        assert_eq!(
+            LinuxProcess::link_verdict(&c, OWNER, OTHER, 0o660, FileType::File),
+            Err(LxError::EPERM)
+        );
+    }
+}
+
+/// `owner_or_capable`, the gate `O_NOATIME` goes through.
+#[cfg(test)]
+mod noatime_permission_tests {
+    use super::*;
+    use rcore_fs::vfs::FileSystem;
+    use rcore_fs_ramfs::RamFS;
+
+    fn creds(euid: u32, fsuid: u32) -> Credentials {
+        Credentials {
+            ruid: euid,
+            euid,
+            suid: euid,
+            rgid: euid,
+            egid: euid,
+            sgid: euid,
+            fsuid,
+            fsgid: fsuid,
+            groups: Vec::new(),
+            umask: 0o022,
+        }
+    }
+
+    #[test]
+    fn the_owner_and_root_and_nobody_else() {
+        assert!(LinuxProcess::owner_or_capable(&creds(1000, 1000), 1000));
+        assert!(LinuxProcess::owner_or_capable(
+            &creds(ROOT_UID, ROOT_UID),
+            1000
+        ));
+        assert!(!LinuxProcess::owner_or_capable(&creds(2000, 2000), 1000));
+    }
+
+    #[test]
+    fn ownership_is_judged_by_the_filesystem_uid() {
+        // `vfsuid_eq_kuid(vfsuid, current_fsuid())`: a server that switched
+        // only its filesystem id to the file's owner counts as the owner,
+        // and one that kept the owner's effective id but moved its fsuid
+        // away does not.
+        assert!(LinuxProcess::owner_or_capable(&creds(2000, 1000), 1000));
+        assert!(!LinuxProcess::owner_or_capable(&creds(1000, 2000), 1000));
+        // Root is root by the filesystem id too.
+        assert!(!LinuxProcess::owner_or_capable(
+            &creds(ROOT_UID, 2000),
+            1000
+        ));
+    }
+
+    #[test]
+    fn check_owner_or_capable_is_eperm_off_real_metadata() {
+        // `may_open`: `return -EPERM`, not the `EACCES` of a permission bit;
+        // the file may well be world-readable.
+        let inode: Arc<dyn INode> = RamFS::new()
+            .root_inode()
+            .create("f", FileType::File, 0o644)
+            .unwrap();
+        let mut meta = inode.metadata().unwrap();
+        meta.uid = 1000;
+        inode.set_metadata(&meta).unwrap();
+        let meta = inode.metadata().unwrap();
+        // Root, then a process that dropped to the owner, then one that
+        // dropped to somebody else (a dropped process cannot come back).
+        let root = super::dup_fd_tests::a_process();
+        assert_eq!(root.check_owner_or_capable(&meta), Ok(()));
+        let owner = super::dup_fd_tests::a_process();
+        owner.set_resuid(1000, 1000, 1000).unwrap();
+        assert_eq!(owner.check_owner_or_capable(&meta), Ok(()));
+        let other = super::dup_fd_tests::a_process();
+        other.set_resuid(2000, 2000, 2000).unwrap();
+        assert_eq!(other.check_owner_or_capable(&meta), Err(LxError::EPERM));
+    }
+}
+
+/// `may_set_ioprio_of`: which of the caller's ids and the target's ids
+/// `set_task_ioprio` compares.
+#[cfg(test)]
+mod ioprio_permission_tests {
+    use super::*;
+
+    fn creds(ruid: u32, euid: u32) -> Credentials {
+        Credentials {
+            ruid,
+            euid,
+            suid: euid,
+            rgid: ruid,
+            egid: euid,
+            sgid: euid,
+            fsuid: euid,
+            fsgid: euid,
+            groups: Vec::new(),
+            umask: 0o022,
+        }
+    }
+
+    #[test]
+    fn the_targets_real_uid_against_either_of_the_callers() {
+        let alice = creds(1000, 1000);
+        let bob = creds(2000, 2000);
+        assert!(LinuxProcess::may_set_ioprio_of(&alice, &alice));
+        assert!(!LinuxProcess::may_set_ioprio_of(&alice, &bob));
+        // A set-uid-root task Alice started is still hers.
+        let alices_setuid = creds(1000, ROOT_UID);
+        assert!(LinuxProcess::may_set_ioprio_of(&alice, &alices_setuid));
+        // A caller running set-uid as Bob reaches Bob's tasks through its
+        // effective id and its own through its real one.
+        let alice_as_bob = creds(1000, 2000);
+        assert!(LinuxProcess::may_set_ioprio_of(&alice_as_bob, &bob));
+        assert!(LinuxProcess::may_set_ioprio_of(&alice_as_bob, &alice));
+        // But the target's EFFECTIVE id is not what is compared: Bob's task
+        // running set-uid as Alice is not Alice's to touch.
+        let bobs_setuid_alice = creds(2000, 1000);
+        assert!(!LinuxProcess::may_set_ioprio_of(&alice, &bobs_setuid_alice));
+    }
+
+    #[test]
+    fn cap_sys_nice_reaches_everyone() {
+        let root = creds(ROOT_UID, ROOT_UID);
+        assert!(LinuxProcess::may_set_ioprio_of(&root, &creds(2000, 2000)));
+    }
+}
+
+/// `rename_verdict`: the three questions `vfs_rename` asks that `renameat2`
+/// never asked. Pure inputs, so every cell of the matrix runs on the host.
+#[cfg(test)]
+mod rename_permission_tests {
+    use super::*;
+    use rcore_fs::vfs::Timespec;
+
+    const ALICE: u32 = 1000;
+    const BOB: u32 = 2000;
+    const TMP: usize = 40;
+    const HOME: usize = 41;
+
+    fn creds(uid: u32) -> Credentials {
+        Credentials {
+            ruid: uid,
+            euid: uid,
+            suid: uid,
+            rgid: uid,
+            egid: uid,
+            sgid: uid,
+            fsuid: uid,
+            fsgid: uid,
+            groups: Vec::new(),
+            umask: 0o022,
+        }
+    }
+
+    fn meta(inode: usize, type_: FileType, mode: u16, uid: u32) -> Metadata {
+        Metadata {
+            dev: 1,
+            inode,
+            size: 0,
+            blk_size: 4096,
+            blocks: 0,
+            atime: Timespec { sec: 0, nsec: 0 },
+            mtime: Timespec { sec: 0, nsec: 0 },
+            ctime: Timespec { sec: 0, nsec: 0 },
+            type_,
+            mode,
+            nlinks: 1,
+            uid: uid as _,
+            gid: uid as _,
+            rdev: 0,
+        }
+    }
+
+    /// `/tmp`: root's, world-writable, sticky.
+    fn sticky_tmp() -> Metadata {
+        meta(TMP, FileType::Dir, 0o1777, ROOT_UID)
+    }
+
+    /// A plain shared directory without the sticky bit.
+    fn plain_dir(inode: usize) -> Metadata {
+        meta(inode, FileType::Dir, 0o777, ROOT_UID)
+    }
+
+    fn file(inode: usize, uid: u32) -> Metadata {
+        meta(inode, FileType::File, 0o644, uid)
+    }
+
+    fn dir(inode: usize, mode: u16, uid: u32) -> Metadata {
+        meta(inode, FileType::Dir, mode, uid)
+    }
+
+    fn verdict(
+        uid: u32,
+        old_dir: &Metadata,
+        old: &Metadata,
+        new_dir: &Metadata,
+        new: Option<&Metadata>,
+    ) -> LxResult {
+        LinuxProcess::rename_verdict(&creds(uid), old_dir, old, new_dir, new)
+    }
+
+    #[test]
+    fn in_a_sticky_directory_the_target_must_be_yours_too() {
+        // `mv mine yours` in /tmp: `may_delete(new_dir, new_dentry)` is the
+        // same sticky test `rm yours` fails.
+        let tmp = sticky_tmp();
+        let mine = file(1, ALICE);
+        let yours = file(2, BOB);
+        assert_eq!(
+            verdict(ALICE, &tmp, &mine, &tmp, Some(&yours)),
+            Err(LxError::EPERM)
+        );
+        // Over a file of one's own, over nothing, by root, or by the owner
+        // of the directory: allowed.
+        let also_mine = file(3, ALICE);
+        assert_eq!(verdict(ALICE, &tmp, &mine, &tmp, Some(&also_mine)), Ok(()));
+        assert_eq!(verdict(ALICE, &tmp, &mine, &tmp, None), Ok(()));
+        assert_eq!(verdict(ROOT_UID, &tmp, &mine, &tmp, Some(&yours)), Ok(()));
+        let bobs_sticky = meta(TMP, FileType::Dir, 0o1777, BOB);
+        let carols = file(4, 3000);
+        assert_eq!(
+            verdict(BOB, &bobs_sticky, &mine, &bobs_sticky, Some(&carols)),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn the_sticky_bit_on_the_source_directory_still_counts() {
+        let tmp = sticky_tmp();
+        let yours = file(2, BOB);
+        assert_eq!(
+            verdict(ALICE, &tmp, &yours, &plain_dir(HOME), None),
+            Err(LxError::EPERM)
+        );
+    }
+
+    #[test]
+    fn without_the_sticky_bit_anyone_may_replace_anyone() {
+        let shared = plain_dir(HOME);
+        assert_eq!(
+            verdict(
+                ALICE,
+                &shared,
+                &file(1, ALICE),
+                &shared,
+                Some(&file(2, BOB))
+            ),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn a_directory_onto_a_file_is_enotdir_and_a_file_onto_a_directory_eisdir() {
+        let home = plain_dir(HOME);
+        let d = dir(5, 0o755, ALICE);
+        let f = file(6, ALICE);
+        assert_eq!(
+            verdict(ALICE, &home, &d, &home, Some(&f)),
+            Err(LxError::ENOTDIR)
+        );
+        assert_eq!(
+            verdict(ALICE, &home, &f, &home, Some(&d)),
+            Err(LxError::EISDIR)
+        );
+        // A directory onto an (empty) directory is the filesystem's call.
+        let e = dir(7, 0o755, ALICE);
+        assert_eq!(verdict(ALICE, &home, &d, &home, Some(&e)), Ok(()));
+    }
+
+    #[test]
+    fn the_sticky_eperm_on_the_target_comes_before_its_type() {
+        // `may_delete` checks `check_sticky` before `d_is_dir(victim)`.
+        let tmp = sticky_tmp();
+        let d = dir(5, 0o755, ALICE);
+        let bobs_file = file(2, BOB);
+        assert_eq!(
+            verdict(ALICE, &tmp, &d, &tmp, Some(&bobs_file)),
+            Err(LxError::EPERM)
+        );
+    }
+
+    #[test]
+    fn moving_a_directory_to_another_parent_needs_write_permission_on_it() {
+        // `vfs_rename`: `if (is_dir && new_dir != old_dir)
+        // error = inode_permission(source, MAY_WRITE);` -- the move rewrites
+        // the directory's own `..`.
+        let home = plain_dir(HOME);
+        let elsewhere = plain_dir(42);
+        let bobs_dir = dir(5, 0o755, BOB);
+        assert_eq!(
+            verdict(ALICE, &home, &bobs_dir, &elsewhere, None),
+            Err(LxError::EACCES)
+        );
+        // Within the same parent it is only a rename: no such requirement.
+        assert_eq!(verdict(ALICE, &home, &bobs_dir, &home, None), Ok(()));
+        // A file has no `..` to rewrite.
+        assert_eq!(
+            verdict(ALICE, &home, &file(6, BOB), &elsewhere, None),
+            Ok(())
+        );
+        // A writable directory, its owner, or root: allowed.
+        assert_eq!(
+            verdict(ALICE, &home, &dir(5, 0o777, BOB), &elsewhere, None),
+            Ok(())
+        );
+        assert_eq!(verdict(BOB, &home, &bobs_dir, &elsewhere, None), Ok(()));
+        assert_eq!(
+            verdict(ROOT_UID, &home, &bobs_dir, &elsewhere, None),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn the_same_parent_is_the_same_inode_on_the_same_device() {
+        // The parents reached through two different paths (`.` and `..`, a
+        // bind mount) compare by (dev, inode), not by the path typed.
+        let home = plain_dir(HOME);
+        let mut other_device = plain_dir(HOME);
+        other_device.dev = 2;
+        let bobs_dir = dir(5, 0o755, BOB);
+        assert_eq!(
+            verdict(ALICE, &home, &bobs_dir, &other_device, None),
+            Err(LxError::EACCES)
+        );
+    }
+}
+
+#[cfg(test)]
 mod dac_tests {
     //! The discretionary-access decisions of `LinuxProcess`, on pure inputs:
     //! who gets which permission bits, what a `chmod` really lands, and which
@@ -8893,5 +10196,513 @@ mod exit_status_tests {
             "0x7f is the stop marker, not a signal"
         );
         assert_eq!(status & 0xff, 0x7f);
+    }
+}
+
+#[cfg(test)]
+mod sigchld_tests {
+    //! A child that exits, stops or resumes pulsed the zircon `SIGCHLD` bit
+    //! at its parent, which wakes a blocked `wait*`, and nothing else: no
+    //! Linux `SIGCHLD` was ever queued, so a handler, a signalfd or a
+    //! `sigwait` on it never ran. `do_notify_parent` and
+    //! `do_notify_parent_cldstop` are the two places Linux sends it.
+
+    use super::*;
+    use crate::signal::{SignalAction, SignalActionFlags, SignalCode};
+    use crate::thread::ThreadExt;
+    use rcore_fs_ramfs::RamFS;
+
+    fn a_parent(pid: KoID) -> (Arc<Process>, Arc<Thread>) {
+        let proc = Process::create_with_fixed_id_ext(
+            &ROOT_JOB,
+            pid,
+            "parent",
+            LinuxProcess::new(RamFS::new(), 0),
+        )
+        .unwrap();
+        let thread = Thread::create_linux(&proc).unwrap();
+        (proc, thread)
+    }
+
+    fn pending_sigchld(thread: &Arc<Thread>) -> bool {
+        thread.lock_linux().signals.contains(LinuxSignal::SIGCHLD)
+    }
+
+    fn clear_pending(thread: &Arc<Thread>) {
+        thread.lock_linux().signals = Sigset::default();
+    }
+
+    /// The `siginfo_t` of the pending SIGCHLD as `(si_code, si_pid, si_uid,
+    /// si_status)`, read where glibc reads them.
+    fn sigchld_info(thread: &Arc<Thread>) -> (SignalCode, i32, i32, i32) {
+        let info = thread.lock_linux().take_siginfo(LinuxSignal::SIGCHLD);
+        let b = info.as_bytes();
+        let word = |at: usize| i32::from_ne_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]]);
+        (info.code, word(16), word(20), word(24))
+    }
+
+    #[test]
+    fn the_sigchld_says_which_child_whose_and_how_it_ended() {
+        let (parent, thread) = a_parent(43_004);
+        let child = Process::fork_from(&parent).unwrap();
+        child.linux().set_resuid(1000, 1000, 1000).unwrap();
+        child.exit(7);
+        assert_eq!(
+            sigchld_info(&thread),
+            (SignalCode::CLD_EXITED, child.id() as i32, 1000, 7)
+        );
+    }
+
+    #[test]
+    fn a_child_killed_by_a_signal_is_reported_as_killed_by_that_signal() {
+        let (parent, thread) = a_parent(43_005);
+        let child = Process::fork_from(&parent).unwrap();
+        child.exit(exit_code_killed_by(LinuxSignal::SIGKILL as u8));
+        assert_eq!(
+            sigchld_info(&thread),
+            (
+                SignalCode::CLD_KILLED,
+                child.id() as i32,
+                0,
+                LinuxSignal::SIGKILL as i32
+            )
+        );
+    }
+
+    #[test]
+    fn a_stop_and_a_continue_say_so_in_the_sigchld() {
+        let (parent, thread) = a_parent(43_006);
+        let child = Process::fork_from(&parent).unwrap();
+        child.linux().job_stop(&child, LinuxSignal::SIGTSTP as u8);
+        assert_eq!(
+            sigchld_info(&thread),
+            (
+                SignalCode::CLD_STOPPED,
+                child.id() as i32,
+                0,
+                LinuxSignal::SIGTSTP as i32
+            )
+        );
+        child.linux().job_continue(&child);
+        let (code, pid, _, _) = sigchld_info(&thread);
+        assert_eq!((code, pid), (SignalCode::CLD_CONTINUED, child.id() as i32));
+    }
+
+    #[test]
+    fn a_child_that_exits_sends_its_parent_a_linux_sigchld() {
+        let (parent, thread) = a_parent(43_001);
+        let child = Process::fork_from(&parent).unwrap();
+        assert!(!pending_sigchld(&thread));
+        child.exit(0);
+        assert!(
+            pending_sigchld(&thread),
+            "the parent never heard the child die"
+        );
+    }
+
+    #[test]
+    fn a_child_that_stops_and_resumes_sends_sigchld_both_times() {
+        let (parent, thread) = a_parent(43_002);
+        let child = Process::fork_from(&parent).unwrap();
+        child.linux().job_stop(&child, LinuxSignal::SIGSTOP as u8);
+        assert!(pending_sigchld(&thread), "no SIGCHLD for the stop");
+        clear_pending(&thread);
+        assert!(child.linux().job_continue(&child));
+        assert!(pending_sigchld(&thread), "no SIGCHLD for the continue");
+    }
+
+    #[test]
+    fn sa_nocldstop_keeps_stops_quiet_but_not_deaths() {
+        let (parent, thread) = a_parent(43_003);
+        parent.linux().set_signal_action(
+            LinuxSignal::SIGCHLD,
+            SignalAction {
+                handler: 0x1000,
+                flags: SignalActionFlags::NOCLDSTOP,
+                restorer: 0,
+                mask: Sigset::default(),
+            },
+        );
+        let child = Process::fork_from(&parent).unwrap();
+        child.linux().job_stop(&child, LinuxSignal::SIGSTOP as u8);
+        assert!(!pending_sigchld(&thread), "SA_NOCLDSTOP was ignored");
+        child.linux().job_continue(&child);
+        assert!(
+            !pending_sigchld(&thread),
+            "SA_NOCLDSTOP was ignored on continue"
+        );
+        child.exit(0);
+        assert!(
+            pending_sigchld(&thread),
+            "a death is never covered by SA_NOCLDSTOP"
+        );
+    }
+
+    fn sigchld_action(parent: &Arc<Process>, handler: usize, flags: SignalActionFlags) {
+        parent.linux().set_signal_action(
+            LinuxSignal::SIGCHLD,
+            SignalAction {
+                handler,
+                flags,
+                restorer: 0,
+                mask: Sigset::default(),
+            },
+        );
+    }
+
+    /// A daemon that sets SIGCHLD to SIG_IGN and never waits (sigaction(2):
+    /// "children that terminate do not become zombies") used to leave every
+    /// child as a zombie in `reaped_children`, for good, and a later
+    /// `wait4(-1)` handed back a child the program had said it would never
+    /// collect.
+    #[test]
+    fn sig_ign_on_sigchld_releases_the_child_with_no_zombie_and_no_signal() {
+        let (parent, thread) = a_parent(43_007);
+        sigchld_action(&parent, crate::signal::SIG_IGN, SignalActionFlags::empty());
+        let child = Process::fork_from(&parent).unwrap();
+        child.exit(3);
+        assert!(
+            !parent.linux().is_zombie_child(child.id()),
+            "the child stayed a zombie although SIGCHLD is ignored"
+        );
+        assert!(!parent.linux().has_child(child.id()));
+        assert!(!pending_sigchld(&thread), "SIG_IGN still queued a SIGCHLD");
+        let r = async_std::task::block_on(wait_child_any(&parent, true, true));
+        assert_eq!(r.err(), Some(LxError::ECHILD));
+    }
+
+    #[test]
+    fn sa_nocldwait_releases_the_child_but_the_handler_still_runs() {
+        let (parent, thread) = a_parent(43_008);
+        sigchld_action(&parent, 0x1000, SignalActionFlags::NOCLDWAIT);
+        let child = Process::fork_from(&parent).unwrap();
+        child.exit(0);
+        assert!(!parent.linux().has_child(child.id()), "zombie left behind");
+        assert!(
+            pending_sigchld(&thread),
+            "SA_NOCLDWAIT is not SIG_IGN: the signal is still sent"
+        );
+    }
+
+    #[test]
+    fn a_parent_that_wants_its_zombies_keeps_them() {
+        let (parent, _thread) = a_parent(43_009);
+        sigchld_action(&parent, 0x1000, SignalActionFlags::NOCLDSTOP);
+        let child = Process::fork_from(&parent).unwrap();
+        child.exit(5);
+        assert!(parent.linux().is_zombie_child(child.id()));
+        let (pid, status, _) =
+            async_std::task::block_on(wait_child_any(&parent, true, true)).unwrap();
+        assert_eq!((pid, status), (child.id(), wait_status_exited(5)));
+    }
+}
+
+#[cfg(test)]
+mod signal_park_tests {
+    //! A process-directed signal that every thread blocks went to the first
+    //! thread, whatever the others were waiting for; and `pause`,
+    //! `sigsuspend` and `sigtimedwait` looked for it every 10 ms.
+    extern crate std;
+
+    use super::*;
+    use crate::signal::{SignalAction, SignalActionFlags};
+    use crate::thread::ThreadExt;
+    use core::time::Duration;
+    use rcore_fs_ramfs::RamFS;
+
+    fn usr1() -> Sigset {
+        Sigset::new(1 << (LinuxSignal::SIGUSR1 as u64 - 1))
+    }
+
+    /// A process with two threads, both blocking SIGUSR1.
+    fn two_blocking_threads(pid: KoID) -> (Arc<Process>, Arc<Thread>, Arc<Thread>) {
+        let proc = Process::create_with_fixed_id_ext(
+            &ROOT_JOB,
+            pid,
+            "two",
+            LinuxProcess::new(RamFS::new(), 0),
+        )
+        .unwrap();
+        let first = Thread::create_linux(&proc).unwrap();
+        let second = Thread::create_linux(&proc).unwrap();
+        first.lock_linux().set_signal_mask(usr1());
+        second.lock_linux().set_signal_mask(usr1());
+        (proc, first, second)
+    }
+
+    fn usr1_later(pid: KoID, after: Duration) {
+        std::thread::spawn(move || {
+            std::thread::sleep(after);
+            let _ = send_signal_to_process(pid as usize, LinuxSignal::SIGUSR1);
+        });
+    }
+
+    #[test]
+    fn a_process_signal_lands_on_the_thread_waiting_for_it_though_blocked() {
+        let (proc, first, second) = two_blocking_threads(43_411);
+        second.lock_linux().sigwait = usr1();
+        send_signal_to_process(proc.id() as usize, LinuxSignal::SIGUSR1).unwrap();
+        assert!(
+            second.lock_linux().signals.contains(LinuxSignal::SIGUSR1),
+            "the sigtimedwait thread never got the signal"
+        );
+        assert!(
+            !first.lock_linux().signals.contains(LinuxSignal::SIGUSR1),
+            "the signal was queued to the first thread as well"
+        );
+    }
+
+    #[test]
+    fn with_nobody_waiting_a_blocked_signal_still_goes_to_the_first_thread() {
+        let (proc, first, second) = two_blocking_threads(43_412);
+        send_signal_to_process(proc.id() as usize, LinuxSignal::SIGUSR1).unwrap();
+        assert!(first.lock_linux().signals.contains(LinuxSignal::SIGUSR1));
+        assert!(!second.lock_linux().signals.contains(LinuxSignal::SIGUSR1));
+    }
+
+    #[test]
+    fn a_blocked_signal_still_ends_the_park() {
+        // What `sigtimedwait` relies on: the caller has the set blocked, and
+        // the park must wake on the queueing, not on the deadline.
+        let (proc, first, _second) = two_blocking_threads(43_413);
+        let mut park = SignalPark::new(&first);
+        park.prepare();
+        usr1_later(proc.id(), Duration::from_millis(50));
+        let start = std::time::Instant::now();
+        let deadline = kernel_hal::timer::timer_now() + Duration::from_secs(3);
+        async_std::task::block_on(park.park(Some(deadline)));
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "parked {:?}: the blocked signal did not wake it",
+            start.elapsed()
+        );
+        assert!(first.lock_linux().signals.contains(LinuxSignal::SIGUSR1));
+    }
+
+    #[test]
+    fn pause_returns_eintr_the_moment_a_caught_signal_arrives() {
+        let proc = Process::create_with_fixed_id_ext(
+            &ROOT_JOB,
+            43_414,
+            "paused",
+            LinuxProcess::new(RamFS::new(), 0),
+        )
+        .unwrap();
+        let thread = Thread::create_linux(&proc).unwrap();
+        proc.linux().set_signal_action(
+            LinuxSignal::SIGUSR1,
+            SignalAction {
+                handler: 0x1000,
+                flags: SignalActionFlags::empty(),
+                restorer: 0,
+                mask: Sigset::default(),
+            },
+        );
+        usr1_later(proc.id(), Duration::from_millis(50));
+        let start = std::time::Instant::now();
+        let e = async_std::task::block_on(wait_for_signal(&thread));
+        assert_eq!(e, LxError::EINTR);
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "woke after {:?}",
+            start.elapsed()
+        );
+        assert!(
+            thread.lock_linux().signals.contains(LinuxSignal::SIGUSR1),
+            "the signal must still be pending for delivery"
+        );
+    }
+}
+
+#[cfg(test)]
+mod interruptible_sleep_tests {
+    //! `nanosleep` slept the whole way and looked for a signal only when it
+    //! woke: a handler installed for `SIGTERM` waited out the entire
+    //! `sleep(60)`, and `alarm(1)` never cut a `sleep(10)` short.
+    extern crate std;
+
+    use super::*;
+    use crate::signal::{SignalAction, SignalActionFlags, SIG_IGN};
+    use crate::thread::ThreadExt;
+    use core::time::Duration;
+    use rcore_fs_ramfs::RamFS;
+
+    fn a_sleeper(pid: KoID) -> (Arc<Process>, Arc<Thread>) {
+        let proc = Process::create_with_fixed_id_ext(
+            &ROOT_JOB,
+            pid,
+            "sleeper",
+            LinuxProcess::new(RamFS::new(), 0),
+        )
+        .unwrap();
+        let thread = Thread::create_linux(&proc).unwrap();
+        (proc, thread)
+    }
+
+    fn usr1_action(proc: &Arc<Process>, handler: usize) {
+        proc.linux().set_signal_action(
+            LinuxSignal::SIGUSR1,
+            SignalAction {
+                handler,
+                flags: SignalActionFlags::empty(),
+                restorer: 0,
+                mask: Sigset::default(),
+            },
+        );
+    }
+
+    /// SIGUSR1 at `pid`, from another host thread, `after` from now.
+    fn usr1_later(pid: KoID, after: Duration) {
+        std::thread::spawn(move || {
+            std::thread::sleep(after);
+            let _ = send_signal_to_process(pid as usize, LinuxSignal::SIGUSR1);
+        });
+    }
+
+    fn sleep_for(thread: &Arc<Thread>, length: Duration) -> (LxResult<()>, Duration) {
+        let start = std::time::Instant::now();
+        let deadline = kernel_hal::timer::timer_now() + length;
+        let r = async_std::task::block_on(interruptible_sleep_until(thread, deadline));
+        (r, start.elapsed())
+    }
+
+    #[test]
+    fn a_caught_signal_ends_the_sleep_at_once_with_eintr() {
+        let (proc, thread) = a_sleeper(43_401);
+        usr1_action(&proc, 0x1000);
+        usr1_later(proc.id(), Duration::from_millis(50));
+        let (r, took) = sleep_for(&thread, Duration::from_secs(3));
+        assert_eq!(r, Err(LxError::EINTR));
+        assert!(
+            took < Duration::from_secs(1),
+            "slept {:?} past the signal",
+            took
+        );
+        assert!(
+            thread.lock_linux().signals.contains(LinuxSignal::SIGUSR1),
+            "the signal that woke the sleep must still be pending for delivery"
+        );
+    }
+
+    #[test]
+    fn a_signal_already_pending_never_starts_the_sleep() {
+        let (proc, thread) = a_sleeper(43_402);
+        usr1_action(&proc, 0x1000);
+        send_signal_to_process(proc.id() as usize, LinuxSignal::SIGUSR1).unwrap();
+        let (r, took) = sleep_for(&thread, Duration::from_secs(3));
+        assert_eq!(r, Err(LxError::EINTR));
+        assert!(took < Duration::from_millis(500), "slept {:?}", took);
+    }
+
+    #[test]
+    fn with_no_signal_the_sleep_lasts_until_its_deadline() {
+        let (_proc, thread) = a_sleeper(43_403);
+        let (r, took) = sleep_for(&thread, Duration::from_millis(150));
+        assert_eq!(r, Ok(()));
+        assert!(
+            took >= Duration::from_millis(150),
+            "woke early after {:?}",
+            took
+        );
+    }
+
+    #[test]
+    fn an_ignored_or_blocked_signal_does_not_end_the_sleep() {
+        let (proc, thread) = a_sleeper(43_404);
+        usr1_action(&proc, SIG_IGN);
+        usr1_later(proc.id(), Duration::from_millis(30));
+        let (r, took) = sleep_for(&thread, Duration::from_millis(250));
+        assert_eq!(r, Ok(()), "an ignored signal interrupted the sleep");
+        assert!(
+            took >= Duration::from_millis(250),
+            "woke early after {:?}",
+            took
+        );
+
+        usr1_action(&proc, 0x1000);
+        thread
+            .lock_linux()
+            .set_signal_mask(Sigset::new(1 << (LinuxSignal::SIGUSR1 as u64 - 1)));
+        usr1_later(proc.id(), Duration::from_millis(30));
+        let (r, took) = sleep_for(&thread, Duration::from_millis(250));
+        assert_eq!(r, Ok(()), "a blocked signal interrupted the sleep");
+        assert!(
+            took >= Duration::from_millis(250),
+            "woke early after {:?}",
+            took
+        );
+    }
+}
+
+/// A semaphore id is system-wide: a process handed one it never `semget`-ed
+/// (by a parent through a file, by `ipcrm -s`) must reach the set through it.
+#[cfg(test)]
+mod sem_id_from_elsewhere_tests {
+    use super::*;
+    use crate::ipc::{sem_lookup, sem_register, sem_unregister, SemArray};
+    use rcore_fs_ramfs::RamFS;
+
+    #[test]
+    fn a_set_named_by_id_from_another_process_is_found_and_remembered() {
+        let _guard = crate::ipc::sem_test_globals::lock();
+        // The set exists system-wide; this process never called semget on it.
+        let array = SemArray::get_or_create(0, 1, 0o1000 | 0o666, 0, 0).unwrap();
+        let id = sem_register(&array).unwrap();
+        let proc = Process::create_with_fixed_id_ext(
+            &ROOT_JOB,
+            0x5e11,
+            "stranger",
+            LinuxProcess::new(RamFS::new(), 0),
+        )
+        .unwrap();
+        let lp = proc.linux();
+        let found = lp
+            .semaphores_get(id)
+            .expect("a system-wide id names the set anywhere");
+        assert!(Arc::ptr_eq(&found, &array));
+        // ...and it is now this process's set too, so a SEM_UNDO record left
+        // on it has something to replay against at exit.
+        assert!(lp.inner.lock().semaphores.get(id).is_some());
+        // Retired, the id names nothing to a process that never had it.
+        sem_unregister(id);
+        assert!(sem_lookup(id).is_none());
+        assert!(lp.semaphores_get(id).is_some(), "but a holder keeps it");
+        assert!(lp.semaphores_get(id + 1).is_none());
+    }
+}
+
+#[cfg(test)]
+mod exit_hook_tests {
+    //! The death of a process, told to the layers above this crate that keep
+    //! state by pid (`register_process_exit_hook`): the POSIX timers of
+    //! `linux-syscall` outlived their process because nothing here could
+    //! reach their table.
+    use super::*;
+    use core::sync::atomic::{AtomicU64, AtomicUsize};
+    use rcore_fs_ramfs::RamFS;
+
+    static DEATHS: AtomicUsize = AtomicUsize::new(0);
+    static LAST_DEAD: AtomicU64 = AtomicU64::new(0);
+
+    fn note_death(pid: KoID) {
+        DEATHS.fetch_add(1, Ordering::SeqCst);
+        LAST_DEAD.store(pid, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn a_hook_runs_once_per_death_with_the_dead_pid() {
+        register_process_exit_hook(note_death);
+        let pid = 0x5e12;
+        let proc = Process::create_linux(&ROOT_JOB, RamFS::new(), 0, None, pid).unwrap();
+        let before = DEATHS.load(Ordering::SeqCst);
+
+        proc.exit(3);
+
+        assert_eq!(
+            DEATHS.load(Ordering::SeqCst),
+            before + 1,
+            "the hook ran a different number of times than the process died"
+        );
+        assert_eq!(LAST_DEAD.load(Ordering::SeqCst), pid);
     }
 }

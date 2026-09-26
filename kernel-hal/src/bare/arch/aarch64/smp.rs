@@ -21,6 +21,7 @@ use cortex_a::registers::*;
 use tock_registers::interfaces::Readable;
 
 use super::vm::PageTable;
+use crate::common::affinity_walk::{self, AffinityWalk, Outcome, Step};
 use crate::{vm::GenericPageTable, MMUFlags, KCONFIG};
 
 const PAGE_SIZE: usize = 4096;
@@ -31,9 +32,6 @@ const _: () = assert!(STACK_SIZE.is_multiple_of(PAGE_SIZE));
 
 /// PSCI `CPU_ON` (SMC64) function id.
 const PSCI_CPU_ON: u64 = 0xC400_0003;
-/// PSCI return code for a non-existent target CPU.
-const PSCI_INVALID_PARAMETERS: i64 = -2;
-const PSCI_ALREADY_ON: i64 = -4;
 
 /// Number of secondary CPUs that have signalled they are running.
 pub static AP_ONLINE_COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -187,11 +185,22 @@ pub fn start_secondary_cores() {
 
     crate::klog_info!("[smp] starting secondary cores (PSCI CPU_ON)");
 
-    let mut started = 0usize;
-    // QEMU `virt` (single cluster) numbers cores by Aff0 = 0,1,2,...; the BSP is
-    // affinity 0. Probe upward until PSCI reports the target does not exist.
-    for aff in 1..=(max_aps as u64) {
-        let stack_top = match alloc_stack() {
+    // Which affinities to probe, and what PSCI's answer means, live in
+    // `crate::affinity_walk` -- and are tested there, which nothing here can
+    // be. What this loop used to be was `for aff in 1..=63`, stopping at the
+    // first `INVALID_PARAMETERS`: it could not name a core outside cluster 0
+    // (an affinity is `Aff1 << 8 | Aff0`, and `Aff1` is the cluster), and one
+    // hole in the numbering cost every core behind it.
+    let mut walk = AffinityWalk::new(super::cpu::raw_affinity(), max_aps);
+    let mut failures = 0usize;
+    // One stack, carried across probes until a core actually takes it. A
+    // probing walk spends most of its calls finding the edges of clusters, and
+    // a fresh 256 KiB allocation freed again for each of those is pure boot
+    // churn -- the old walk paid it once because it stopped at the first miss;
+    // this one tolerates holes, so it would pay it a dozen times.
+    let mut spare: Option<usize> = None;
+    while let Step::Probe(aff) = walk.next_candidate() {
+        let stack_top = match spare.take().or_else(alloc_stack) {
             Some(top) => top,
             None => {
                 crate::klog_warn!("[smp] out of memory allocating AP stack");
@@ -210,10 +219,10 @@ pub fn start_secondary_cores() {
             sp: stack_top as u64,
             entry: KCONFIG.ap_fn as usize as u64,
         });
-        // Kept as a Box until CPU_ON is known to have succeeded: the loop always
-        // ends on a probe that fails (that is how the core count is discovered),
-        // and leaking the stack + context of every failed probe threw away a
-        // 256 KiB stack on every boot.
+        // Kept as a Box until CPU_ON is known to have succeeded: most probes
+        // of a walk that discovers a machine by asking are answered "no such
+        // core", and leaking the stack + context of each of those threw away a
+        // 256 KiB stack apiece.
         let ctx_phys = virt_to_phys(ctx.as_ref() as *const _ as usize) as u64;
         // The secondary reads this with the MMU off, so the BSP's cacheable
         // stores have to be pushed out to memory first; see below.
@@ -225,29 +234,46 @@ pub fn start_secondary_cores() {
         // Fire CPU_ON and move on: the AP only proceeds past its `STARTED` gate
         // once the BSP finishes init, so waiting for it to come online here would
         // just stall boot. `ap_signal_online` tracks the real online count.
-        let ret = unsafe { psci_cpu_on(aff, tramp_phys as u64, ctx_phys) };
-        match ret {
-            0 => {
-                started += 1;
+        let ret = unsafe { psci_cpu_on(aff as u64, tramp_phys as u64, ctx_phys) };
+        let outcome = affinity_walk::outcome(ret);
+        walk.saw(outcome);
+        match outcome {
+            Outcome::Started => {
                 // The secondary reads this context with the MMU off, long after
                 // we return: it must outlive us. Same for its stack.
                 let _ = alloc::boxed::Box::leak(ctx);
-                crate::klog_info!("[smp] CPU_ON affinity {} -> ok", aff);
+                crate::klog_info!("[smp] CPU_ON affinity {:#x} -> ok", aff);
                 continue;
             }
-            PSCI_ALREADY_ON => crate::klog_warn!("[smp] affinity {} already on", aff),
-            PSCI_INVALID_PARAMETERS => {
-                free_stack(stack_top);
-                break; // no more cores
+            // Expected, once per cluster edge: this is how a probing walk
+            // finds out where a cluster ends. Saying it out loud printed a
+            // line per absent core on any machine with more than one cluster.
+            Outcome::Absent => {}
+            Outcome::AlreadyOn => crate::klog_warn!("[smp] affinity {:#x} already on", aff),
+            Outcome::Failed(code) => {
+                failures += 1;
+                crate::klog_warn!("[smp] CPU_ON affinity {:#x} failed: {}", aff, code);
             }
-            other => crate::klog_warn!("[smp] CPU_ON affinity {} failed: {}", aff, other),
         }
-        // Any non-success path: this core never started, so reclaim its stack
-        // (the context Box drops here on its own).
-        free_stack(stack_top);
+        // Any non-success path: this core never started, so its stack is free
+        // for the next candidate (the context Box drops here on its own).
+        spare = Some(stack_top);
+    }
+    if let Some(top) = spare.take() {
+        free_stack(top);
     }
 
-    crate::klog_info!("[smp] secondary bring-up done — {} CPU_ON issued", started);
+    if failures > 0 {
+        crate::klog_warn!(
+            "[smp] {} core(s) exist and would not start — this machine is running with \
+             fewer CPUs than it has",
+            failures
+        );
+    }
+    crate::klog_info!(
+        "[smp] secondary bring-up done — {} CPU_ON issued",
+        walk.started()
+    );
 }
 
 /// Called by each secondary from `secondary_init` to announce it is running.

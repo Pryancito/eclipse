@@ -85,23 +85,6 @@ impl BsdRet {
     }
 }
 
-/// Translate a FreeBSD `clockid_t` to the Linux one `sys_clock_*` expects.
-///
-/// The two disagree past `CLOCK_REALTIME` (both 0): FreeBSD `CLOCK_MONOTONIC`
-/// is 4 where Linux uses 1, and the CPU-time clocks are renumbered too
-/// (`sys/sys/_clock_id.h` vs `include/uapi/linux/time.h`).
-fn clockid_to_linux(bsd: usize) -> usize {
-    match bsd {
-        // REALTIME and its _PRECISE(9)/_FAST(10)/SECOND(13) variants.
-        0 | 9 | 10 | 13 => 0,
-        // MONOTONIC(4) and the UPTIME(5,7,8) / MONOTONIC_PRECISE(11)/_FAST(12) family.
-        4 | 5 | 7 | 8 | 11 | 12 => 1,
-        15 => 2, // PROCESS_CPUTIME_ID
-        14 => 3, // THREAD_CPUTIME_ID
-        other => other,
-    }
-}
-
 impl Syscall<'_> {
     /// Dispatch one FreeBSD/amd64 system call and return its FreeBSD-encoded
     /// result. Called by the trap handler when the faulting process's
@@ -154,8 +137,26 @@ impl Syscall<'_> {
             sys::FTRUNCATE => BsdRet::from_result(self.sys_ftruncate(a0.into(), a1)),
             sys::DUP => BsdRet::from_result(self.sys_dup(a0.into())),
             sys::DUP2 => BsdRet::from_result(self.sys_dup2(a0.into(), a1)),
-            sys::FCNTL => BsdRet::from_result(self.sys_fcntl(a0.into(), a1, a2).await),
-            sys::FLOCK => BsdRet::from_result(self.sys_flock(a0.into(), a1)),
+            // The command numbers and the `F_SETFL`/`F_GETFL` flag words
+            // differ from Linux's past the five lowest commands; see
+            // `translate::fcntl_to_linux`.
+            sys::FCNTL => match translate::fcntl_to_linux(a1, a2) {
+                Err(e) => BsdRet::from_lx(e),
+                Ok(translate::Fcntl::Dup2 { target, cloexec }) => BsdRet::from_result(if cloexec {
+                    self.sys_dup3(a0.into(), target, 0o2000000)
+                } else {
+                    self.sys_dup2(a0.into(), target)
+                }),
+                Ok(translate::Fcntl::Linux { cmd, arg }) => {
+                    let r = self.sys_fcntl(a0.into(), cmd, arg).await;
+                    BsdRet::from_result(if cmd == consts::lin_fcntl::F_GETFL {
+                        r.map(|fl| translate::open_flags_from_linux(fl as i32) as u32 as usize)
+                    } else {
+                        r
+                    })
+                }
+            },
+            sys::FLOCK => BsdRet::from_result(self.sys_flock(a0.into(), a1).await),
             sys::GETCWD => BsdRet::from_result(self.sys_getcwd(a0.into(), a1)),
             sys::FCHDIR => BsdRet::from_result(self.sys_fchdir(a0.into())),
             sys::CHDIR => BsdRet::from_result(self.sys_chdir(a0.into())),
@@ -169,7 +170,12 @@ impl Syscall<'_> {
                     BsdRet::from_result(self.sys_faccessat(a0.into(), a1.into(), a2, f as usize))
                 }
             },
-            sys::FCHMODAT => BsdRet::from_result(self.sys_fchmodat(a0.into(), a1.into(), a2, a3)),
+            sys::FCHMODAT => match translate::at_flags_to_linux(a3 as i32) {
+                Err(e) => BsdRet::from_lx(e),
+                Ok(f) => {
+                    BsdRet::from_result(self.sys_fchmodat(a0.into(), a1.into(), a2, f as usize))
+                }
+            },
             sys::FCHOWNAT => match translate::at_flags_to_linux(a4 as i32) {
                 Err(e) => BsdRet::from_lx(e),
                 Ok(f) => {
@@ -226,8 +232,14 @@ impl Syscall<'_> {
             },
             sys::MUNMAP => BsdRet::from_result(self.sys_munmap(a0, a1)),
             sys::MPROTECT => BsdRet::from_result(self.sys_mprotect(a0, a1, a2)),
-            sys::MADVISE => BsdRet::from_result(self.sys_madvise(a0, a1, a2)),
-            sys::MSYNC => BsdRet::from_result(self.sys_msync(a0, a1, a2)),
+            sys::MADVISE => match translate::madvise_to_linux(a2) {
+                Err(e) => BsdRet::from_lx(e),
+                Ok(advice) => BsdRet::from_result(self.sys_madvise(a0, a1, advice)),
+            },
+            sys::MSYNC => match translate::msync_flags_to_linux(a2 as i32) {
+                Err(e) => BsdRet::from_lx(e),
+                Ok(f) => BsdRet::from_result(self.sys_msync(a0, a1, f as usize)),
+            },
             sys::BREAK => BsdRet::from_result(self.sys_brk(a0)),
 
             // ---- process ----------------------------------------------------
@@ -257,12 +269,26 @@ impl Syscall<'_> {
             // must not make. `P_SUGID` is kept on the process; see
             // `LinuxProcess::is_sugid`.
             sys::ISSETUGID => BsdRet::ok(self.linux_process().is_sugid() as usize),
-            sys::KILL => BsdRet::from_result(self.sys_kill(a0 as isize, a1)),
+            sys::KILL => match translate::signal_to_linux(a1) {
+                Err(e) => BsdRet::from_lx(e),
+                Ok(signal) => BsdRet::from_result(self.sys_kill(a0 as isize, signal)),
+            },
             sys::FORK => BsdRet::from_result(self.sys_fork(0, 0)),
             sys::VFORK => BsdRet::from_result(self.sys_vfork(0, 0).await),
-            sys::WAIT4 => {
-                BsdRet::from_result(self.sys_wait4(a0 as _, a1.into(), a2 as _, a3.into()).await)
-            }
+            // The option bits past `WNOHANG | WUNTRACED` are on different
+            // positions from Linux's; see `translate::wait_options_to_linux`.
+            sys::WAIT4 => match translate::wait_options_to_linux(a2 as i32) {
+                Err(e) => BsdRet::from_lx(e),
+                Ok(options) => {
+                    let r = self
+                        .sys_wait4(a0 as _, a1.into(), options as u32, a3.into())
+                        .await;
+                    if matches!(r, Ok(pid) if pid > 0) {
+                        self.bsd_wait_status(a1);
+                    }
+                    BsdRet::from_result(r)
+                }
+            },
             sys::EXECVE => BsdRet::from_result(self.sys_execve(a0.into(), a1.into(), a2.into())),
             sys::EXIT => BsdRet::from_result(self.sys_exit(a0 as _)),
             sys::THR_EXIT => BsdRet::from_result(self.sys_exit(0)),
@@ -274,8 +300,14 @@ impl Syscall<'_> {
                 BsdRet::ok(0)
             }
             sys::SCHED_GETCPU => BsdRet::ok(kernel_hal::cpu::cpu_id() as usize),
-            sys::GETRLIMIT => BsdRet::from_result(self.sys_getrlimit(a0, a1.into())),
-            sys::SETRLIMIT => BsdRet::from_result(self.sys_setrlimit(a0, a1.into())),
+            sys::GETRLIMIT => match translate::rlimit_to_linux(a0) {
+                Err(e) => BsdRet::from_lx(e),
+                Ok(resource) => BsdRet::from_result(self.sys_getrlimit(resource, a1.into())),
+            },
+            sys::SETRLIMIT => match translate::rlimit_to_linux(a0) {
+                Err(e) => BsdRet::from_lx(e),
+                Ok(resource) => BsdRet::from_result(self.sys_setrlimit(resource, a1.into())),
+            },
             sys::GETRANDOM => BsdRet::from_result(self.sys_getrandom(a0.into(), a1, a2 as u32)),
 
             // ---- threads (amd64 thr ABI) ------------------------------------
@@ -288,17 +320,22 @@ impl Syscall<'_> {
             sys::THR_SET_NAME => BsdRet::ok(0),
 
             // ---- time -------------------------------------------------------
-            sys::NANOSLEEP => BsdRet::from_result(self.sys_nanosleep(a0.into()).await),
-            sys::CLOCK_NANOSLEEP => BsdRet::from_result(
-                self.sys_clock_nanosleep(clockid_to_linux(a0), a1, a2.into(), a3.into())
-                    .await,
-            ),
-            sys::CLOCK_GETTIME => {
-                BsdRet::from_result(self.sys_clock_gettime(clockid_to_linux(a0), a1.into()))
-            }
-            sys::CLOCK_GETRES => {
-                BsdRet::from_result(self.sys_clock_getres(clockid_to_linux(a0), a1.into()))
-            }
+            sys::NANOSLEEP => BsdRet::from_result(self.sys_nanosleep(a0.into(), a1.into()).await),
+            sys::CLOCK_NANOSLEEP => match translate::clockid_to_linux(a0) {
+                Err(e) => BsdRet::from_lx(e),
+                Ok(clock) => BsdRet::from_result(
+                    self.sys_clock_nanosleep(clock, a1, a2.into(), a3.into())
+                        .await,
+                ),
+            },
+            sys::CLOCK_GETTIME => match translate::clockid_to_linux(a0) {
+                Err(e) => BsdRet::from_lx(e),
+                Ok(clock) => BsdRet::from_result(self.sys_clock_gettime(clock, a1.into())),
+            },
+            sys::CLOCK_GETRES => match translate::clockid_to_linux(a0) {
+                Err(e) => BsdRet::from_lx(e),
+                Ok(clock) => BsdRet::from_result(self.sys_clock_getres(clock, a1.into())),
+            },
             sys::GETTIMEOFDAY => BsdRet::from_result(self.sys_gettimeofday(a0.into(), a1.into())),
 
             // ---- machine / sysctl -------------------------------------------
@@ -317,6 +354,23 @@ impl Syscall<'_> {
                 warn!("freebsd: unhandled syscall {} -> ENOSYS", other);
                 BsdRet::enosys()
             }
+        }
+    }
+
+    /// Rewrite the status word `sys_wait4` just wrote at `status` with its
+    /// signal number in FreeBSD's numbering (`translate::wait_status_to_freebsd`).
+    /// A null pointer is a caller that did not ask; a read or write that
+    /// fails leaves what `sys_wait4` wrote.
+    fn bsd_wait_status(&self, status: usize) {
+        if status == 0 {
+            return;
+        }
+        let read: UserInPtr<i32> = status.into();
+        let Ok(word) = read.read() else { return };
+        let fixed = translate::wait_status_to_freebsd(word);
+        if fixed != word {
+            let mut write: UserOutPtr<i32> = status.into();
+            let _ = write.write(fixed);
         }
     }
 
@@ -381,22 +435,17 @@ impl Syscall<'_> {
             Err(e) => return BsdRet::err(errno::lx_to_freebsd(e)),
         }
         let mut writer = fs::BsdDirentWriter::new(nbytes.min(256 * 1024));
-        loop {
-            let (meta, name) = match file.read_entry_with_metadata() {
-                Ok(v) => v,
-                Err(LxError::ENOENT) => break,
-                Err(e) => return BsdRet::err(errno::lx_to_freebsd(e)),
-            };
-            if !writer.try_push(meta.inode as u64, fs::dirent_type(meta.type_), &name) {
-                break;
-            }
-        }
+        let mut file = file;
+        let base = match read_dirents_with_base(&mut file, &mut writer) {
+            Ok(base) => base,
+            Err(e) => return BsdRet::err(errno::lx_to_freebsd(e)),
+        };
         if let Err(e) = buf.write_array(writer.as_slice()) {
             return BsdRet::err(errno::lx_to_freebsd(LxError::from(e)));
         }
-        // basep is the (opaque) directory offset; report the current file
-        // offset best-effort. Not all callers pass it.
-        let _ = basep.write_if_not_null(0);
+        // Not all callers pass `basep`; libc's `readdir` does, and keeps it
+        // as the position `telldir` reports for this buffer.
+        let _ = basep.write_if_not_null(base);
         BsdRet::ok(writer.len())
     }
 
@@ -533,9 +582,65 @@ impl Syscall<'_> {
     }
 }
 
+/// The body of `getdirentries(2)`: the records that fit in `writer`, and
+/// `*basep`, the directory position BEFORE the read. `kern_getdirentries`
+/// takes `loff = auio.uio_offset` ahead of `VOP_READDIR` and stores that;
+/// libc's `readdir` keeps it as `dd_seek`, the value `telldir` hands back for
+/// an entry of this buffer and `seekdir` gives to `lseek`. Reporting 0 made
+/// every `telldir` say "the start", so `seekdir(telldir())` rewound.
+///
+/// The entry that does not fit goes back to the directory position instead
+/// of being lost; see `collect_dirents`.
+fn read_dirents_with_base(
+    file: &mut Arc<linux_object::fs::File>,
+    writer: &mut fs::BsdDirentWriter,
+) -> linux_object::error::LxResult<i64> {
+    let base = file.dir_position() as i64;
+    crate::file::collect_dirents(file, |next, meta, name| {
+        writer.try_push(meta.inode as u64, next, fs::dirent_type(meta.type_), name)
+    })?;
+    Ok(base)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use linux_object::fs::vfs::{FileSystem, FileType};
+    use linux_object::fs::{File, OpenFlags};
+    use rcore_fs_ramfs::RamFS;
+
+    /// An open directory on a fresh ramfs holding `names`.
+    fn dir(names: &[&str]) -> Arc<File> {
+        let root = RamFS::new().root_inode();
+        for name in names {
+            root.create(name, FileType::File, 0o644).unwrap();
+        }
+        File::new(root, OpenFlags::RDONLY, alloc::string::String::from("/"))
+    }
+
+    /// `basep` is where the directory was BEFORE each read, the value
+    /// `telldir` reports for an entry of that buffer. Two entries fit per
+    /// call here and the ramfs lists `.` and `..` too, so the bases go
+    /// 0, 2, 4, 6 with the last call short.
+    #[test]
+    fn getdirentries_reports_the_position_before_each_read_in_basep() {
+        let mut d = dir(&["a", "b", "c", "d", "e"]);
+        let one = fs::dirsiz(1);
+        let mut bases = alloc::vec::Vec::new();
+        let mut lens = alloc::vec::Vec::new();
+        loop {
+            let mut w = fs::BsdDirentWriter::new(2 * one);
+            let base = read_dirents_with_base(&mut d, &mut w).unwrap();
+            if w.is_empty() {
+                break;
+            }
+            bases.push(base);
+            lens.push(w.len() / one);
+        }
+        assert_eq!(lens, [2, 2, 2, 1]);
+        assert_eq!(bases, [0, 2, 4, 6]);
+    }
 
     #[test]
     fn bsdret_encodes_success_and_error() {
@@ -560,15 +665,5 @@ mod tests {
         // Linux ENOSYS(38) -> FreeBSD ENOSYS(78).
         let r = BsdRet::from_result(Err(LxError::ENOSYS));
         assert_eq!((r.rax, r.error), (78, true));
-    }
-
-    #[test]
-    fn clockid_translation_matches_freebsd_numbering() {
-        assert_eq!(clockid_to_linux(0), 0); // REALTIME
-        assert_eq!(clockid_to_linux(4), 1); // MONOTONIC (FreeBSD 4 -> Linux 1)
-        assert_eq!(clockid_to_linux(11), 1); // MONOTONIC_PRECISE
-        assert_eq!(clockid_to_linux(9), 0); // REALTIME_PRECISE
-        assert_eq!(clockid_to_linux(15), 2); // PROCESS_CPUTIME
-        assert_eq!(clockid_to_linux(14), 3); // THREAD_CPUTIME
     }
 }

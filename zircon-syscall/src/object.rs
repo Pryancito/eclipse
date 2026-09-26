@@ -624,9 +624,7 @@ impl Syscall<'_> {
             return Err(ZxError::ACCESS_DENIED);
         }
         let child = task.get_child(koid)?;
-        let child_handle = proc.add_handle(Handle::new(child, rights));
-        out.write(child_handle)?;
-        Ok(())
+        install_handle(proc, Handle::new(child, rights), &mut out)
     }
 }
 

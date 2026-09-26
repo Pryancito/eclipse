@@ -42,10 +42,11 @@ impl Syscall<'_> {
         if kind == EVENT_MEMORY_PRESSURE_NORMAL {
             event.signal_set(Signal::SIGNALED);
         }
-        let event_handle =
-            proc.add_handle(Handle::new(event, Rights::DEFAULT_SYSTEM_EVENT_LOW_MEMORY));
-        out.write(event_handle)?;
-        Ok(())
+        install_handle(
+            proc,
+            Handle::new(event, Rights::DEFAULT_SYSTEM_EVENT_LOW_MEMORY),
+            &mut out,
+        )
     }
 }
 

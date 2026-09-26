@@ -15,6 +15,11 @@ pub const MAX_CORE_NUM: usize = 64;
 
 pub mod cpuid;
 
+// Not behind any `cfg`: the question it answers -- is this word still a
+// function? -- is asked by this crate, by the scheduler and by kernel-hal, on
+// every build including the host one, so it lives where all three can reach it.
+pub mod fn_slot;
+
 // ── the kernel locks, on the host, under `cargo test` ────────────────────────
 //
 // `KERNEL_LOCKS_ON_HOST`: everything below this line used to be behind

@@ -3,6 +3,7 @@
 use crate::error::SysResult;
 use crate::process::ProcessExt;
 use crate::signal::{SigInfo, Signal, SignalStack, SignalUserContext, Sigset};
+use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -32,6 +33,9 @@ pub trait ThreadExt {
     fn try_lock_linux(&self) -> Option<MutexGuard<'_, LinuxThread>>;
     /// Set pointer to thread ID.
     fn set_tid_address(&self, tidptr: UserOutPtr<i32>);
+    /// The word `set_tid_address` (or `CLONE_CHILD_CLEARTID`) registered:
+    /// what thread exit zeroes and wakes, null when nothing was registered.
+    fn tid_address(&self) -> UserOutPtr<i32>;
     /// Get robust list.
     fn get_robust_list(
         &self,
@@ -146,6 +150,10 @@ impl ThreadExt for Thread {
     /// Set pointer to thread ID.
     fn set_tid_address(&self, tidptr: UserPtr<i32, Out>) {
         self.lock_linux().clear_child_tid = tidptr;
+    }
+
+    fn tid_address(&self) -> UserPtr<i32, Out> {
+        UserPtr::from(self.lock_linux().clear_child_tid.as_addr())
     }
 
     fn get_robust_list(
@@ -492,6 +500,14 @@ pub struct LinuxThread {
     /// returns. Set by `rt_sigsuspend` so that the original mask is restored
     /// after the temporarily-unblocked signal is delivered.
     pub saved_sigmask: Option<Sigset>,
+    /// The signals this thread is parked in `rt_sigtimedwait(2)` for, empty
+    /// otherwise. They are BLOCKED (POSIX has the caller block them, and the
+    /// wait is what consumes them), yet a process-directed signal must land
+    /// on this thread and not on whichever thread comes first: Linux keeps
+    /// such a signal in the shared pending set, where any thread's
+    /// `sigwait` dequeues it, and unblocks the set for the length of the
+    /// wait so `wants_signal()` picks the waiter. See [`Self::wants_signal`].
+    pub sigwait: Sigset,
     /// signal alternate stack
     pub signal_alternate_stack: SignalStack,
     /// robust_list
@@ -507,6 +523,21 @@ pub struct LinuxThread {
     /// set → reads as the Linux default of 50 µs. Recorded and read back;
     /// timers here do not apply slack coalescing.
     pub timerslack_ns: u64,
+    /// I/O priority (`ioprio_set(2)`), as the `(class << 13) | level` word
+    /// userspace passes; `0` (`IOPRIO_CLASS_NONE`) = never set → reads as the
+    /// best-effort level derived from the nice value, as Linux's
+    /// `get_task_ioprio` does. Recorded and read back: there is no I/O
+    /// scheduler here to act on it, but `ionice` must see what it set.
+    pub ioprio: u16,
+    /// The `siginfo_t` that goes with each pending signal in `signals`, when
+    /// the sender left one: who sent a `kill`, which child a `SIGCHLD` is
+    /// about and how it ended. `signals` is a bitmap, so a signal is pending
+    /// once and, as for Linux's non-realtime signals, the FIRST sender's
+    /// information is the one kept. Read and cleared by [`Self::take_siginfo`].
+    pending_info: BTreeMap<u8, SigInfo>,
+    /// The `siginfo_t` handed to the handler now running, so `sigreturn` can
+    /// tell what the handler changed from what the kernel wrote.
+    handling_info: SigInfo,
 }
 
 /// Size of the kernel's per-task `comm` buffer, including the trailing NUL
@@ -514,15 +545,20 @@ pub struct LinuxThread {
 /// bytes.
 pub const TASK_COMM_LEN: usize = 16;
 
-fn unmodified_check(siginfo: &SigInfo, user_ctx: &SignalUserContext) -> usize {
+/// `IOPRIO_PRIO_VALUE(IOPRIO_CLASS_IDLE, 0)`: the io priority `ionice -c3`
+/// sets, for fixtures that must not sit at the never-set default.
+#[cfg(test)]
+const IDLE_IOPRIO: u16 = 3 << 13;
+
+fn unmodified_check(siginfo: &SigInfo, delivered: &SigInfo, user_ctx: &SignalUserContext) -> usize {
     let mut check = 0usize;
-    let default_info = SigInfo::default();
     let mut default_ctx = SignalUserContext::default();
     default_ctx.context.set_pc(user_ctx.context.get_pc());
-    check |= (*siginfo != default_info) as usize;
+    check |= (*siginfo != *delivered) as usize;
     check |= ((user_ctx.flags != default_ctx.flags) as usize) << 1;
     check |= ((user_ctx.link != default_ctx.link) as usize) << 2;
-    check |= ((user_ctx.stack != default_ctx.stack) as usize) << 3;
+    // `uc_stack` is not compared: the kernel fills it (`__save_altstack`)
+    // and the handler may change it, which `sigreturn` honours.
     check |= ((user_ctx._pad != default_ctx._pad) as usize) << 4;
     check |= ((user_ctx.context != default_ctx.context) as usize) << 5;
     #[cfg(target_arch = "x86_64")]
@@ -544,13 +580,18 @@ impl LinuxThread {
     ) {
         let siginfo = unsafe { &*(siginfo_ptr as *const SigInfo) };
         let user_ctx = unsafe { &*(uctx_ptr as *const SignalUserContext) };
-        let check = unmodified_check(siginfo, user_ctx);
+        let check = unmodified_check(siginfo, &self.handling_info, user_ctx);
         if check != 0 {
             error!("unsupported signal fields : {:b}", check);
             trace!("uctx = {:x?}", *user_ctx);
             // Be tolerant: userland may legally modify parts of ucontext/siginfo.
             // We restore the saved context and only honor the restored PC/mask below.
         }
+        // `restore_altstack()`: judged from the handler's own stack pointer,
+        // the one it is making the `sigreturn` call with.
+        let handler_sp = ctx.get_field(UserContextField::StackPointer);
+        self.signal_alternate_stack
+            .restore_from_frame(user_ctx.stack, handler_sp);
         *ctx = *old_ctx;
         ctx.set_field(UserContextField::InstrPointer, user_ctx.context.get_pc());
         // The ucontext is userland's to modify between the handler running
@@ -570,6 +611,19 @@ impl LinuxThread {
     /// *ignored*, not refused, so this returns nothing and fails at nothing.
     pub fn set_signal_mask(&mut self, mask: Sigset) {
         self.signal_mask = mask.blockable();
+    }
+
+    /// Whether a signal aimed at the whole process should be queued to THIS
+    /// thread: it has the signal unblocked, or it is parked in
+    /// `rt_sigtimedwait` waiting for exactly that signal (`wants_signal()`,
+    /// which sees the wait as an unblocked window). Without the second half
+    /// a program that blocks a signal in every thread and dedicates one
+    /// thread to `sigwait(3)` -- the pattern of dbus-daemon, of glib's
+    /// `g_unix_signal_source` helpers, of every Java and Python runtime --
+    /// never had its signal reach the waiter: it was queued to the first
+    /// thread, where it stayed blocked for good, and the waiter timed out.
+    pub fn wants_signal(&self, signal: Signal) -> bool {
+        !self.signal_mask.contains(signal) || self.sigwait.contains(signal)
     }
 
     /// `SIG_BLOCK`: add `set` to what is blocked.
@@ -609,12 +663,16 @@ impl LinuxThread {
             signals: Sigset::default(),
             signal_mask: Sigset::default(),
             saved_sigmask: None,
+            sigwait: Sigset::default(),
             signal_alternate_stack: SignalStack::default(),
             robust_list: 0.into(),
             robust_list_len: 0,
             handling_signal: None,
             comm: String::new(),
             timerslack_ns: 0,
+            ioprio: 0,
+            pending_info: BTreeMap::new(),
+            handling_info: SigInfo::default(),
         }
     }
 
@@ -661,6 +719,11 @@ impl LinuxThread {
             // created via fork(2)"; `copy_process` copies it to a new thread
             // along with the rest of the task struct.
             timerslack_ns: self.timerslack_ns,
+            // `copy_io()`: without CLONE_IO the new task gets an io_context
+            // of its own with `ioc->ioprio` copied from the creator's, so a
+            // child of `ionice -c3 make` is idle-class too; with CLONE_IO it
+            // shares the creator's, which reads the same.
+            ioprio: self.ioprio,
             // sigaltstack(2): "A child created via fork(2) inherits a copy of
             // its parent's alternate signal stack settings" -- but a THREAD
             // must not, or two threads take their signal frames to the same
@@ -698,6 +761,10 @@ impl LinuxThread {
             // belongs to a `sigreturn` frame, and the child has its own.
             handling_signal: None,
             saved_sigmask: None,
+            sigwait: Sigset::default(),
+            // Pending signals are fresh (above), and so is what went with them.
+            pending_info: BTreeMap::new(),
+            handling_info: SigInfo::default(),
             // A new thread reports the program's name until it sets one of
             // its own; empty is how a reader knows to fall back to the
             // executable's basename.
@@ -723,12 +790,20 @@ impl LinuxThread {
             signals: _,
             signal_mask: _,
             saved_sigmask,
+            // A thread inside `execve` is not inside `rt_sigtimedwait`.
+            sigwait: _,
             signal_alternate_stack,
             robust_list,
             robust_list_len,
             handling_signal,
             comm,
             timerslack_ns: _,
+            // The io_context is not part of the image: `ionice -c3 cmd` is
+            // an `ioprio_set` followed by an `execve`, and it must stick.
+            ioprio: _,
+            // Pending signals survive `execve`, and what went with them too.
+            pending_info: _,
+            handling_info: _,
         } = self;
 
         // `mm_release()`: the address the kernel writes a 0 into, and
@@ -772,6 +847,32 @@ impl LinuxThread {
     }
 
     /// Handle signal
+    /// Make `signal` pending, with what the sender knows about it.
+    ///
+    /// A signal already pending keeps the information it came with, as Linux
+    /// does for the non-realtime signals: the second `kill` is not queued and
+    /// the handler learns about the first.
+    pub fn queue_signal(&mut self, signal: Signal, info: Option<SigInfo>) {
+        self.signals.insert(signal);
+        if let Some(info) = info {
+            self.pending_info.entry(signal as u8).or_insert(info);
+        }
+    }
+
+    /// Take `signal` out of the pending set together with its `siginfo_t`,
+    /// which is [`SigInfo::bare`] when the sender left none. What is
+    /// returned is also what `sigreturn` will compare the handler's frame
+    /// against.
+    pub fn take_siginfo(&mut self, signal: Signal) -> SigInfo {
+        self.signals.remove(signal);
+        let info = self
+            .pending_info
+            .remove(&(signal as u8))
+            .unwrap_or_else(|| SigInfo::bare(signal));
+        self.handling_info = info;
+        info
+    }
+
     pub fn handle_signal(&mut self) -> Option<(Signal, Sigset)> {
         if self.handling_signal.is_none() {
             let signal = self
@@ -817,12 +918,16 @@ mod signal_delivery_tests {
             signals: Sigset::default(),
             signal_mask: Sigset::default(),
             saved_sigmask: None,
+            sigwait: Sigset::default(),
             signal_alternate_stack: SignalStack::default(),
             robust_list: 0.into(),
             robust_list_len: 0,
             handling_signal: None,
             comm: String::new(),
             timerslack_ns: 0,
+            ioprio: IDLE_IOPRIO,
+            pending_info: BTreeMap::new(),
+            handling_info: SigInfo::default(),
         }
     }
 
@@ -1051,6 +1156,42 @@ mod signal_delivery_tests {
         assert!(
             !t.signal_mask().contains(Signal::SIGTERM),
             "unblocking SIGTERM blocked it"
+        );
+    }
+
+    #[test]
+    fn sigreturn_reinstalls_the_alternate_stack_the_frame_carries() {
+        // The frame's `uc_stack` is what `sigreturn` installs back: for an
+        // `SS_AUTODISARM` stack, disarmed for the length of the handler,
+        // this is the only way it ever comes back. It never did.
+        use crate::signal::{SignalStack, SignalStackFlags};
+        let alt = SignalStack {
+            sp: 0x7000_0000,
+            flags: SignalStackFlags::AUTODISARM,
+            size: 0x4000,
+        };
+        let mut t = thread();
+        t.handling_signal = Some(Signal::SIGUSR1 as u32);
+        t.signal_alternate_stack = alt;
+        let uc_stack = t.signal_alternate_stack.take_for_frame();
+        assert!(!t.signal_alternate_stack.usable_from(0x7fff_0000));
+
+        let info = SigInfo::default();
+        let mut uctx = SignalUserContext::default();
+        uctx.stack = uc_stack;
+        let old_ctx = UserContext::default();
+        let mut ctx = UserContext::default();
+        // The handler returns from the alternate stack.
+        ctx.set_field(UserContextField::StackPointer, alt.sp + alt.size / 2);
+        t.restore_after_handle_signal(
+            &mut ctx,
+            &old_ctx,
+            &info as *const SigInfo as usize,
+            &uctx as *const SignalUserContext as usize,
+        );
+        assert_eq!(
+            t.signal_alternate_stack, alt,
+            "sigreturn did not put the auto-disarmed stack back"
         );
     }
 
@@ -1505,7 +1646,11 @@ mod exec_reset_tests {
             robust_list_len: core::mem::size_of::<RobustList>(),
             handling_signal: Some(Signal::SIGUSR2 as u32),
             comm: String::from("programa-viejo"),
+            sigwait: Sigset::default(),
             timerslack_ns: 1_234_567,
+            ioprio: IDLE_IOPRIO,
+            pending_info: BTreeMap::new(),
+            handling_info: SigInfo::default(),
         }
     }
 
@@ -1632,6 +1777,16 @@ mod exec_reset_tests {
         t.reset_for_exec();
         assert_eq!(t.timerslack_ns, 1_234_567);
     }
+
+    #[test]
+    fn the_io_priority_survives_the_exec() {
+        // `ionice -c3 cmd` is `ioprio_set(IOPRIO_WHO_PROCESS, 0, idle)` and
+        // then `execve(cmd)`: the io_context is the task's, not the image's,
+        // and `begin_new_exec()` never touches it.
+        let mut t = a_thread_in_full_swing();
+        t.reset_for_exec();
+        assert_eq!(t.ioprio, IDLE_IOPRIO);
+    }
 }
 
 #[cfg(test)]
@@ -1668,7 +1823,11 @@ mod clone_inheritance_tests {
             robust_list_len: core::mem::size_of::<RobustList>(),
             handling_signal: Some(Signal::SIGUSR2 as u32),
             comm: String::from("el-que-crea"),
+            sigwait: Sigset::default(),
             timerslack_ns: 1_234_567,
+            ioprio: IDLE_IOPRIO,
+            pending_info: BTreeMap::new(),
+            handling_info: SigInfo::default(),
         }
     }
 
@@ -1809,6 +1968,15 @@ mod clone_inheritance_tests {
     }
 
     #[test]
+    fn a_forked_child_and_a_new_thread_keep_the_io_priority() {
+        // `copy_io()`: the new task's io_context takes `ioc->ioprio` from
+        // the creator's (or shares it, with CLONE_IO). `ionice -c3 make`
+        // would otherwise idle only the `make` and none of the compilers.
+        assert_eq!(the_creating_thread().forked_child().ioprio, IDLE_IOPRIO);
+        assert_eq!(the_creating_thread().new_thread().ioprio, IDLE_IOPRIO);
+    }
+
+    #[test]
     fn the_first_thread_of_a_program_carries_nothing() {
         // There is no creating thread to carry anything from: this is the
         // loader's path, and it must not quietly become some other thread's
@@ -1848,5 +2016,96 @@ mod last_thread_tests {
     #[test]
     fn nobody_left_is_also_the_last_one() {
         assert!(last_thread_of(0));
+    }
+}
+
+#[cfg(test)]
+mod siginfo_tests {
+    //! What a pending signal carries besides its number. The pending set was
+    //! a bitmap and nothing else, so every handler was handed a zeroed
+    //! `siginfo_t`: `si_pid` 0 for a `kill`, `si_pid` 0 and `si_status` 0
+    //! for a `SIGCHLD`.
+
+    use super::*;
+    use crate::signal::SignalCode;
+
+    fn word(info: &SigInfo, at: usize) -> i32 {
+        let b = info.as_bytes();
+        i32::from_ne_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]])
+    }
+
+    #[test]
+    fn a_signal_comes_out_with_what_it_was_queued_with() {
+        let mut t = LinuxThread::initial();
+        t.queue_signal(
+            Signal::SIGUSR1,
+            Some(SigInfo::from_user(
+                Signal::SIGUSR1,
+                77,
+                1000,
+                SignalCode::USER,
+            )),
+        );
+        assert!(t.signals.contains(Signal::SIGUSR1));
+        let info = t.take_siginfo(Signal::SIGUSR1);
+        assert!(!t.signals.contains(Signal::SIGUSR1), "taking it clears it");
+        assert_eq!(word(&info, 0), Signal::SIGUSR1 as i32, "si_signo");
+        assert_eq!(word(&info, 16), 77, "si_pid");
+        assert_eq!(word(&info, 20), 1000, "si_uid");
+        assert_eq!(info.code, SignalCode::USER);
+    }
+
+    #[test]
+    fn the_first_sender_of_a_pending_signal_is_the_one_the_handler_learns_about() {
+        // Non-realtime semantics: a signal already pending is not queued
+        // again, so the second `kill` changes nothing about the first.
+        let mut t = LinuxThread::initial();
+        t.queue_signal(
+            Signal::SIGTERM,
+            Some(SigInfo::from_user(Signal::SIGTERM, 11, 0, SignalCode::USER)),
+        );
+        t.queue_signal(
+            Signal::SIGTERM,
+            Some(SigInfo::from_user(Signal::SIGTERM, 22, 0, SignalCode::USER)),
+        );
+        assert_eq!(word(&t.take_siginfo(Signal::SIGTERM), 16), 11);
+    }
+
+    #[test]
+    fn a_signal_queued_without_information_is_bare_but_numbered() {
+        let mut t = LinuxThread::initial();
+        t.queue_signal(Signal::SIGHUP, None);
+        let info = t.take_siginfo(Signal::SIGHUP);
+        assert_eq!(info.signo, Signal::SIGHUP as i32);
+        assert_eq!(word(&info, 16), 0, "si_pid of nobody");
+        assert_eq!(info.code, SignalCode::USER);
+    }
+
+    #[test]
+    fn taking_leaves_nothing_behind_for_the_next_time() {
+        let mut t = LinuxThread::initial();
+        t.queue_signal(
+            Signal::SIGUSR2,
+            Some(SigInfo::from_user(Signal::SIGUSR2, 5, 0, SignalCode::USER)),
+        );
+        t.take_siginfo(Signal::SIGUSR2);
+        t.queue_signal(Signal::SIGUSR2, None);
+        assert_eq!(word(&t.take_siginfo(Signal::SIGUSR2), 16), 0);
+    }
+
+    #[test]
+    fn sigreturn_compares_the_frame_against_what_was_delivered_not_against_zeros() {
+        // Before, a frame carrying real information looked "modified" to
+        // `restore_after_handle_signal` and was logged as such on every
+        // return. The check compares against what the kernel wrote.
+        let mut t = LinuxThread::initial();
+        let sent = SigInfo::from_user(Signal::SIGUSR1, 9, 9, SignalCode::USER);
+        t.queue_signal(Signal::SIGUSR1, Some(sent));
+        let delivered = t.take_siginfo(Signal::SIGUSR1);
+        let uctx = SignalUserContext::default();
+        assert_eq!(unmodified_check(&delivered, &t.handling_info, &uctx) & 1, 0);
+        let mut doctored = delivered;
+        doctored.errno = 3;
+        assert_eq!(unmodified_check(&doctored, &t.handling_info, &uctx) & 1, 1);
     }
 }

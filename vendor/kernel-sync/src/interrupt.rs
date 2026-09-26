@@ -218,6 +218,13 @@ cfg_if::cfg_if! {
                 static HW_ID: Cell<u32> = const { Cell::new(0) };
                 /// What this thread publishes about itself, if anything.
                 static PUBLISHED: Cell<Option<u8>> = const { Cell::new(None) };
+                /// Stands in for an interrupt arriving the instant this thread
+                /// re-enables them, which is the only way to observe what a
+                /// guard's `Drop` did *before* its `pop_off` -- and every guard
+                /// in this crate releases its lock first on purpose, so that an
+                /// arriving handler finds the lock takeable rather than
+                /// deadlocking against a guard that has not let go yet.
+                static ON_IRQ_ENABLE: Cell<Option<fn()>> = const { Cell::new(None) };
             }
 
             pub(super) fn raw_hw_id() -> u32 {
@@ -230,6 +237,12 @@ cfg_if::cfg_if! {
 
             pub(crate) fn intr_on() {
                 IRQ_ON.with(|c| c.set(true));
+                // Taken, not read: the stand-in interrupt fires once, like a
+                // real one, and cannot recurse through a handler that enables
+                // interrupts itself.
+                if let Some(handler) = ON_IRQ_ENABLE.with(|c| c.take()) {
+                    handler();
+                }
             }
             pub(crate) fn intr_off() {
                 IRQ_ON.with(|c| c.set(false));
@@ -247,6 +260,16 @@ cfg_if::cfg_if! {
             /// writing GS / TPIDR_EL1).
             pub(crate) fn set_test_published(id: Option<u8>) {
                 PUBLISHED.with(|c| c.set(id));
+            }
+
+            /// Arm one stand-in interrupt for the next `intr_on` on this thread.
+            pub(crate) fn arm_irq_on_enable(handler: fn()) {
+                ON_IRQ_ENABLE.with(|c| c.set(Some(handler)));
+            }
+
+            /// Disarm it, whether or not it fired.
+            pub(crate) fn disarm_irq_on_enable() {
+                ON_IRQ_ENABLE.with(|c| c.take());
             }
         }
     } else {
@@ -521,4 +544,17 @@ pub(crate) fn intr_off_for_test() {
 #[cfg(test)]
 pub(crate) fn intr_get_for_test() -> bool {
     intr_get()
+}
+
+/// Arm one stand-in interrupt to fire the next time this thread re-enables
+/// interrupts — i.e. inside the outermost `pop_off`, which is the only vantage
+/// point from which what a guard's `Drop` did before it can be seen.
+#[cfg(test)]
+pub(crate) fn arm_irq_on_enable_for_test(handler: fn()) {
+    arm_irq_on_enable(handler)
+}
+
+#[cfg(test)]
+pub(crate) fn disarm_irq_on_enable_for_test() {
+    disarm_irq_on_enable()
 }

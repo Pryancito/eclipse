@@ -15,6 +15,13 @@ mod pidfd;
 mod poll;
 mod splice;
 mod stat;
+mod xattr;
+pub(crate) use xattr::{XattrOp, XattrTarget};
 
+// Shared with the FreeBSD personality's `getdirentries`, which only exists on
+// x86_64; elsewhere the re-export would be an unused import under
+// `deny(warnings)`.
+#[cfg(target_arch = "x86_64")]
+pub(crate) use self::dir::collect_dirents;
 use self::dir::{at_flags, AtFlags, FSTATAT_FLAGS, STATX_FLAGS};
 pub(crate) use self::poll::poll_timeout_msecs;

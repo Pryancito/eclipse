@@ -359,3 +359,524 @@ fn info_versions_preserve_short_buffer_counts_and_boundaries() {
         Box::pin(async move { drop(ct) })
     });
 }
+
+/// `zx_stream_writev` answers the bytes it wrote when the VMO fills part-way
+/// through the vector: a 4096-byte VMO takes 3000 + 1096 of three iovecs and
+/// says 4096. It used to answer `OUT_OF_RANGE` for the call, once the iovec
+/// after the one that filled it was refused, so the caller was told nothing
+/// went in and sent the head of its data again. Only a write with no room at
+/// all is an error.
+#[test]
+fn stream_writev_answers_what_it_wrote_when_the_vmo_fills_mid_vector() {
+    use zircon_object::vm::{Stream, StreamOptions};
+    with_test_thread(|ct| {
+        let base = map_user_memory(&ct);
+        let vmo = VmObject::new_paged(1);
+        vmo.set_content_size(0).unwrap();
+        let stream = ct.proc().add_handle(Handle::new(
+            Stream::create(vmo.clone(), 0, StreamOptions::MODE_WRITE.bits()),
+            Rights::DEFAULT_STREAM | Rights::WRITE,
+        ));
+        let (a, b, c) = (base + 8192, base + 12288, base + 16384);
+        unsafe {
+            core::ptr::write_bytes(a as *mut u8, b'a', 3000);
+            core::ptr::write_bytes(b as *mut u8, b'b', 3000);
+            core::ptr::write_bytes(c as *mut u8, b'c', 10);
+            (base as *mut [[usize; 2]; 3]).write([[a, 3000], [b, 3000], [c, 10]]);
+        }
+        let actual = base + 256;
+        let sc = Syscall {
+            thread: &ct,
+            thread_fn: finish_thread,
+        };
+        sc.sys_stream_writev(stream, 0, base.into(), 3, actual.into())
+            .unwrap();
+        let mut content = [0u8; PAGE_SIZE];
+        vmo.read(0, &mut content).unwrap();
+        unsafe {
+            assert_eq!((actual as *const usize).read(), PAGE_SIZE);
+        }
+        assert!(content[..3000].iter().all(|&byte| byte == b'a'));
+        assert!(content[3000..].iter().all(|&byte| byte == b'b'));
+        // The seek is at the end now: a write with no room at all is refused.
+        unsafe {
+            (base as *mut [[usize; 2]; 1]).write([[c, 10]]);
+        }
+        assert_eq!(
+            sc.sys_stream_writev(stream, 0, base.into(), 1, actual.into()),
+            Err(ZxError::OUT_OF_RANGE)
+        );
+        // The same by offset: two iovecs from 2000 fill the page and say so.
+        unsafe {
+            (base as *mut [[usize; 2]; 2]).write([[c, 10], [b, 3000]]);
+        }
+        sc.sys_stream_writev_at(stream, 0, 2000, base.into(), 2, actual.into())
+            .unwrap();
+        unsafe {
+            assert_eq!((actual as *const usize).read(), PAGE_SIZE - 2000);
+        }
+        vmo.read(0, &mut content).unwrap();
+        assert!(content[2000..2010].iter().all(|&byte| byte == b'c'));
+        assert!(content[2010..].iter().all(|&byte| byte == b'b'));
+        assert_eq!(
+            sc.sys_stream_writev_at(stream, 0, PAGE_SIZE, base.into(), 2, actual.into()),
+            Err(ZxError::OUT_OF_RANGE)
+        );
+        Box::pin(async move { drop(ct) })
+    });
+}
+
+/// Four things userspace could ask for and get a kernel panic, or an `OK`
+/// with nothing behind it, instead of an error: a cache operation or a lock
+/// in `zx_vmo_op_range` (`unimplemented!()`), an option `zx_job_set_critical`
+/// did not know (`unimplemented!()`), a `zx_thread_read_state` with a
+/// buffer size the heap cannot hold (the kernel allocated it whole), and a
+/// `zx_task_suspend_token` on a job, a bad handle or a thread without the
+/// write right (`OK`, with no token written).
+#[test]
+fn syscalls_that_used_to_panic_or_answer_ok_for_nothing_answer_errors() {
+    with_test_thread(|ct| {
+        let base = map_user_memory(&ct);
+        let sc = Syscall {
+            thread: &ct,
+            thread_fn: finish_thread,
+        };
+        let vmo = ct
+            .proc()
+            .add_handle(Handle::new(VmObject::new_paged(2), Rights::DEFAULT_VMO));
+        const CACHE_SYNC: u32 = 6;
+        const CACHE_INVALIDATE: u32 = 7;
+        const LOCK: u32 = 3;
+        sc.sys_vmo_op_range(vmo, CACHE_SYNC, 0, 2 * PAGE_SIZE, 0.into(), 0)
+            .unwrap();
+        sc.sys_vmo_op_range(vmo, CACHE_INVALIDATE, PAGE_SIZE, PAGE_SIZE, 0.into(), 0)
+            .unwrap();
+        assert_eq!(
+            sc.sys_vmo_op_range(vmo, CACHE_SYNC, PAGE_SIZE, 2 * PAGE_SIZE, 0.into(), 0),
+            Err(ZxError::OUT_OF_RANGE)
+        );
+        assert_eq!(
+            sc.sys_vmo_op_range(vmo, CACHE_SYNC, usize::MAX, 2, 0.into(), 0),
+            Err(ZxError::OUT_OF_RANGE)
+        );
+        assert_eq!(
+            sc.sys_vmo_op_range(vmo, LOCK, 0, PAGE_SIZE, 0.into(), 0),
+            Err(ZxError::NOT_SUPPORTED)
+        );
+
+        let job = ct
+            .proc()
+            .add_handle(Handle::new(Job::root(), Rights::DEFAULT_JOB));
+        let process = ct
+            .proc()
+            .add_handle(Handle::new(ct.proc().clone(), Rights::DEFAULT_PROCESS));
+        assert_eq!(
+            sc.sys_job_set_critical(job, 2, process),
+            Err(ZxError::INVALID_ARGS)
+        );
+
+        let other = Thread::create(ct.proc(), "never-started").unwrap();
+        let thread = ct
+            .proc()
+            .add_handle(Handle::new(other.clone(), Rights::DEFAULT_THREAD));
+        assert_eq!(
+            sc.sys_thread_read_state(thread, 0, base.into(), usize::MAX / 2),
+            Err(ZxError::BAD_STATE),
+            "a thread that never ran has no state to read, and the size is no panic"
+        );
+
+        let token = base + 64;
+        unsafe { (token as *mut u32).write(0xdead_beef) };
+        assert_eq!(
+            sc.sys_task_suspend_token(job, token.into()),
+            Err(ZxError::WRONG_TYPE)
+        );
+        assert_eq!(
+            sc.sys_task_suspend_token(process, token.into()),
+            Err(ZxError::NOT_SUPPORTED)
+        );
+        assert_eq!(
+            sc.sys_task_suspend_token(0x7777_7777, token.into()),
+            Err(ZxError::BAD_HANDLE)
+        );
+        let read_only = ct.proc().add_handle(Handle::new(other, Rights::READ));
+        assert_eq!(
+            sc.sys_task_suspend_token(read_only, token.into()),
+            Err(ZxError::ACCESS_DENIED)
+        );
+        unsafe {
+            assert_eq!(
+                (token as *const u32).read(),
+                0xdead_beef,
+                "no token was written"
+            );
+        }
+        sc.sys_task_suspend_token(thread, token.into()).unwrap();
+        unsafe {
+            assert_ne!(
+                (token as *const u32).read(),
+                0xdead_beef,
+                "a thread gets its token"
+            );
+        }
+        Box::pin(async move { drop(ct) })
+    });
+}
+
+/// `zx_futex_wait` and `zx_futex_requeue` read the futex word to compare it
+/// with `current_value`; only null and alignment were checked, so any other
+/// address (unmapped, or the kernel's own) was read as the kernel: a fault
+/// with no fixup behind it. `zx_futex_requeue` did not check its requeue
+/// word at all, and `zx_iommu_create` with a type other than the dummy one
+/// was `unimplemented!()`, a kernel panic for whoever holds the root
+/// resource.
+#[test]
+fn futex_words_are_validated_and_iommu_create_refuses_other_types() {
+    with_test_thread(|ct| {
+        let base = map_user_memory(&ct);
+        let mut sc = Syscall {
+            thread: &ct,
+            thread_fn: finish_thread,
+        };
+        const FUTEX_WAIT: u32 = 40;
+        const INVALID_HANDLE: usize = 0;
+        let unmapped = base + 20 * PAGE_SIZE;
+        let mut wait = |word: usize, current: i32| {
+            let mut f = Box::pin(sc.syscall(
+                FUTEX_WAIT,
+                [
+                    word,
+                    current as u32 as usize,
+                    INVALID_HANDLE,
+                    i64::MAX as usize,
+                    0,
+                    0,
+                    0,
+                    0,
+                ],
+            ));
+            f.as_mut().poll(&mut Context::from_waker(Waker::noop()))
+        };
+        assert_eq!(
+            wait(unmapped, 0),
+            Poll::Ready(ZxError::INVALID_ARGS as isize),
+            "an unmapped word is an error, not a kernel fault"
+        );
+        assert_eq!(
+            wait(0, 0),
+            Poll::Ready(ZxError::INVALID_ARGS as isize),
+            "the null word"
+        );
+        assert_eq!(
+            wait(base + 2, 0),
+            Poll::Ready(ZxError::INVALID_ARGS as isize),
+            "a misaligned word"
+        );
+        unsafe { (base as *mut i32).write(7) };
+        assert_eq!(
+            wait(base, 8),
+            Poll::Ready(ZxError::BAD_STATE as isize),
+            "a mapped word is read and compared"
+        );
+
+        let requeue = |wake: usize, requeue: usize| {
+            sc.sys_futex_requeue(wake.into(), 1, 7, requeue.into(), 1, INVALID_HANDLE as u32)
+        };
+        assert_eq!(requeue(unmapped, base + 4), Err(ZxError::INVALID_ARGS));
+        assert_eq!(requeue(base, 0), Err(ZxError::INVALID_ARGS));
+        assert_eq!(requeue(base, base + 6), Err(ZxError::INVALID_ARGS));
+        assert_eq!(requeue(base, base), Err(ZxError::INVALID_ARGS));
+        requeue(base, base + 4).unwrap();
+
+        let root = ct.proc().add_handle(Handle::new(
+            Resource::create("root", ResourceKind::ROOT, 0, 0, ResourceFlags::empty()),
+            Rights::DEFAULT_RESOURCE,
+        ));
+        let out = base + 64;
+        assert_eq!(
+            sc.sys_iommu_create(root, 1, base.into(), 1, out.into()),
+            Err(ZxError::NOT_SUPPORTED)
+        );
+        sc.sys_iommu_create(root, 0, base.into(), 1, out.into())
+            .unwrap();
+
+        // The vDSO's combined `futex_wake_handle_close_thread_exit` stored
+        // `new_value` through `as_ref()` on whatever word it was given: a
+        // write to any address, as the kernel. A bad word now skips the
+        // store and the thread still exits.
+        const FUTEX_WAKE_HANDLE_CLOSE_THREAD_EXIT: u32 = 1005;
+        let mut exit_storing = |word: usize, new_value: usize| {
+            let mut f = Box::pin(sc.syscall(
+                FUTEX_WAKE_HANDLE_CLOSE_THREAD_EXIT,
+                [word, 1, new_value, INVALID_HANDLE, 0, 0, 0, 0],
+            ));
+            f.as_mut().poll(&mut Context::from_waker(Waker::noop()))
+        };
+        unsafe { (base as *mut i32).write(7) };
+        assert_eq!(
+            exit_storing(unmapped, 42),
+            Poll::Ready(0),
+            "no store, no fault"
+        );
+        assert_eq!(
+            exit_storing(base + 2, 42),
+            Poll::Ready(0),
+            "misaligned: no store"
+        );
+        assert_eq!(unsafe { (base as *const i32).read() }, 7);
+        assert_eq!(exit_storing(base, 42), Poll::Ready(0));
+        assert_eq!(
+            unsafe { (base as *const i32).read() },
+            42,
+            "a mapped word is stored"
+        );
+        Box::pin(async move { drop(ct) })
+    });
+}
+
+/// Every `*_create` syscall installed the handle before writing the out
+/// pointer, so a bad pointer answered `INVALID_ARGS` with the handle (and
+/// its object) left in the table where the caller could never reach it. The
+/// `replace` syscalls were worse: the old handle was already gone.
+#[test]
+fn a_bad_out_pointer_leaves_no_handle_behind() {
+    with_test_thread(|ct| {
+        let base = map_user_memory(&ct);
+        let sc = Syscall {
+            thread: &ct,
+            thread_fn: finish_thread,
+        };
+        let proc = ct.proc();
+        let unmapped = base + 20 * PAGE_SIZE;
+        let good = base;
+        let read_out = || unsafe { (good as *const u32).read() };
+        let installed = |value: u32| proc.get_handle_info(value).is_ok();
+
+        sc.sys_event_create(0, good.into()).unwrap();
+        let first = read_out();
+        for bad in [unmapped, 0, base + 2] {
+            assert_eq!(
+                sc.sys_event_create(0, bad.into()),
+                Err(ZxError::INVALID_ARGS)
+            );
+            assert!(
+                !installed(first + 4),
+                "the event of the failed create ({:#x}) stays out of the table",
+                bad
+            );
+        }
+        sc.sys_event_create(0, good.into()).unwrap();
+        assert_eq!(read_out(), first + 4, "no handle value was consumed");
+        let next = first + 8;
+
+        // Pairs: neither handle stays, and the good pointer is not written.
+        unsafe { (good as *mut u32).write(0xdead_beef) };
+        assert_eq!(
+            sc.sys_channel_create(0, good.into(), unmapped.into()),
+            Err(ZxError::INVALID_ARGS)
+        );
+        assert_eq!(
+            sc.sys_channel_create(0, unmapped.into(), good.into()),
+            Err(ZxError::INVALID_ARGS)
+        );
+        assert_eq!(read_out(), 0xdead_beef, "the good half is not written");
+        assert!(!installed(next) && !installed(next + 4));
+
+        // A duplicate that cannot be handed over is closed again.
+        let rights = Rights::DEFAULT_EVENT.bits();
+        assert_eq!(
+            sc.sys_handle_duplicate(first, rights, unmapped.into()),
+            Err(ZxError::INVALID_ARGS)
+        );
+        assert!(!installed(next));
+
+        // A replace that cannot be handed over keeps the old handle.
+        assert_eq!(
+            sc.sys_handle_replace(first, rights, unmapped.into()),
+            Err(ZxError::INVALID_ARGS)
+        );
+        assert!(installed(first), "the caller keeps its event");
+        assert!(!installed(next));
+
+        // vmar_allocate looks at both out pointers before allocating.
+        let vmar = proc.add_handle(Handle::new(
+            proc.vmar(),
+            Rights::DEFAULT_VMAR | Rights::READ | Rights::WRITE,
+        ));
+        // The duplicate and the replace above took a value each before being
+        // closed again, so the next value is whatever the table says now.
+        let next = vmar + 4;
+        const CAN_MAP_READ: u32 = 1 << 7;
+        const CAN_MAP_WRITE: u32 = 1 << 8;
+        let options = CAN_MAP_READ | CAN_MAP_WRITE;
+        for (out_vmar, out_addr) in [(unmapped, good + 8), (good, unmapped)] {
+            assert_eq!(
+                sc.sys_vmar_allocate(
+                    vmar,
+                    options,
+                    0,
+                    PAGE_SIZE as u64,
+                    out_vmar.into(),
+                    out_addr.into()
+                ),
+                Err(ZxError::INVALID_ARGS)
+            );
+            assert!(!installed(next), "no child vmar handle");
+        }
+        sc.sys_vmar_allocate(
+            vmar,
+            options,
+            0,
+            PAGE_SIZE as u64,
+            good.into(),
+            (good + 8).into(),
+        )
+        .unwrap();
+        assert_eq!(
+            read_out(),
+            next,
+            "the failed allocations left no child behind"
+        );
+        Box::pin(async move { drop(ct) })
+    });
+}
+
+/// `ZX_JOB_POL_BASIC_V2` entries are twelve bytes (condition, action, flags)
+/// and were read as v1's eight, so from the second entry on the kernel took
+/// each `flags` for the next condition. The SDK has sent v2 since 2020.
+#[test]
+fn job_set_policy_reads_v2_entries_at_their_own_size() {
+    use zircon_object::task::{PolicyAction, PolicyCondition};
+    with_test_thread(|ct| {
+        let base = map_user_memory(&ct);
+        let sc = Syscall {
+            thread: &ct,
+            thread_fn: finish_thread,
+        };
+        let proc = ct.proc();
+        let job = Job::root().create_child().unwrap();
+        let handle = proc.add_handle(Handle::new(job.clone(), Rights::DEFAULT_JOB));
+        const JOB_POL_BASIC_V2: u32 = 0x0100_0000;
+        const JOB_POL_RELATIVE: u32 = 0;
+        const NEW_VMO: u32 = 4;
+        const NEW_CHANNEL: u32 = 5;
+        const ALLOW: u32 = 0;
+        const DENY: u32 = 1;
+        const OVERRIDE_ALLOW: u32 = 0;
+        let write = |words: &[u32]| unsafe {
+            for (i, w) in words.iter().enumerate() {
+                ((base + 4 * i) as *mut u32).write(*w);
+            }
+        };
+        // [NEW_VMO deny, NEW_CHANNEL allow], in v2 layout.
+        write(&[
+            NEW_VMO,
+            DENY,
+            OVERRIDE_ALLOW,
+            NEW_CHANNEL,
+            ALLOW,
+            OVERRIDE_ALLOW,
+        ]);
+        sc.sys_job_set_policy(handle, JOB_POL_RELATIVE, JOB_POL_BASIC_V2, base, 2)
+            .unwrap();
+        let policy = job.policy();
+        assert_eq!(
+            policy.get_action(PolicyCondition::NewVMO),
+            Some(PolicyAction::Deny)
+        );
+        assert_eq!(
+            policy.get_action(PolicyCondition::NewChannel),
+            Some(PolicyAction::Allow)
+        );
+        assert_eq!(
+            policy.get_action(PolicyCondition::BadHandle),
+            None,
+            "a flags word is not a condition"
+        );
+        // A flags word that is neither override value is refused.
+        let other = Job::root().create_child().unwrap();
+        let other_handle = proc.add_handle(Handle::new(other.clone(), Rights::DEFAULT_JOB));
+        write(&[NEW_VMO, DENY, 2]);
+        assert_eq!(
+            sc.sys_job_set_policy(other_handle, JOB_POL_RELATIVE, JOB_POL_BASIC_V2, base, 1),
+            Err(ZxError::INVALID_ARGS)
+        );
+        assert_eq!(other.policy().get_action(PolicyCondition::NewVMO), None);
+        Box::pin(async move { drop(ct) })
+    });
+}
+
+/// `zx_task_kill` used to answer `WRONG_TYPE` to everything it could not
+/// kill: a handle that is not one, and a task handle without the right.
+#[test]
+fn task_kill_says_why_it_refused() {
+    with_test_thread(|ct| {
+        let mut sc = Syscall {
+            thread: &ct,
+            thread_fn: finish_thread,
+        };
+        let proc = ct.proc();
+        assert_eq!(sc.sys_task_kill(0xdead_beef), Err(ZxError::BAD_HANDLE));
+        // A job with every right but DESTROY is the right kind of object and
+        // not enough rights to it.
+        let job = Job::root().create_child().unwrap();
+        let read_only = proc.add_handle(Handle::new(
+            job.clone(),
+            Rights::DEFAULT_JOB & !Rights::DESTROY,
+        ));
+        assert_eq!(sc.sys_task_kill(read_only), Err(ZxError::ACCESS_DENIED));
+        // A killed job refuses children; a refused kill kills nothing.
+        assert!(job.create_child().is_ok());
+        // An event with the DESTROY right is the wrong kind of object.
+        let event = proc.add_handle(Handle::new(Event::new(), Rights::DESTROY));
+        assert_eq!(sc.sys_task_kill(event), Err(ZxError::WRONG_TYPE));
+        // And with the right, the job dies.
+        let full = proc.add_handle(Handle::new(job.clone(), Rights::DEFAULT_JOB));
+        assert_eq!(sc.sys_task_kill(full), Ok(()));
+        assert_eq!(job.create_child().err(), Some(ZxError::BAD_STATE));
+        Box::pin(async move { drop(ct) })
+    });
+}
+
+/// `zx_process_read_memory` copies through a kernel buffer of at most 64 KiB
+/// now, however much is asked for; a read longer than that has to come out
+/// whole and in order.
+#[test]
+fn process_read_memory_reads_past_one_kernel_buffer_in_order() {
+    with_test_thread(|ct| {
+        let src = map_user_memory(&ct);
+        let dst = map_user_memory(&ct);
+        let sc = Syscall {
+            thread: &ct,
+            thread_fn: finish_thread,
+        };
+        let proc = ct.proc();
+        let len = 20 * PAGE_SIZE;
+        assert!(len > 64 * 1024, "the read has to span two chunks");
+        for i in 0..len {
+            unsafe { ((src + i) as *mut u8).write((i % 251) as u8) };
+        }
+        let handle = proc.add_handle(Handle::new(proc.clone(), Rights::DEFAULT_PROCESS));
+        // `actual` lives in the destination window's last word; the read is
+        // one word shorter so the two never overlap.
+        let actual = dst + len - 8;
+        let want = len - 8;
+        sc.sys_process_read_memory(handle, src, dst.into(), want, actual.into())
+            .unwrap();
+        assert_eq!(unsafe { (actual as *const usize).read() }, want);
+        for i in (0..want).step_by(4093) {
+            assert_eq!(
+                unsafe { ((dst + i) as *const u8).read() },
+                (i % 251) as u8,
+                "byte {} of the copy",
+                i
+            );
+        }
+        // Past the end of the mapping the read is short, not an error.
+        let tail = 3 * PAGE_SIZE;
+        sc.sys_process_read_memory(handle, src + len - tail, dst.into(), want, actual.into())
+            .unwrap();
+        assert_eq!(unsafe { (actual as *const usize).read() }, tail);
+        Box::pin(async move { drop(ct) })
+    });
+}

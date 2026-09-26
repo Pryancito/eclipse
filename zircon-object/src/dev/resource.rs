@@ -111,8 +111,12 @@ impl Resource {
     pub fn get_info(&self) -> ResourceInfo {
         let name = self.base.name();
         let name = name.as_bytes();
+        // `zx_info_resource_t::name` is `ZX_MAX_NAME_LEN` bytes with a NUL,
+        // and `zx_resource_create` accepts a name of any length: copying it
+        // whole was a kernel panic for a name of 33 bytes or more.
         let mut name_vec = [0u8; 32];
-        name_vec[..name.len()].clone_from_slice(name);
+        let len = name.len().min(name_vec.len() - 1);
+        name_vec[..len].clone_from_slice(&name[..len]);
         ResourceInfo {
             kind: self.kind as _,
             flags: self.flags.bits,
@@ -137,6 +141,22 @@ pub struct ResourceInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A name longer than the info field is cut to fit it, NUL and all: it
+    /// used to be copied whole, which panicked past 32 bytes.
+    #[test]
+    fn a_name_longer_than_the_info_field_is_cut_to_fit_it() {
+        let long = "a-resource-name-of-forty-characters-long";
+        assert_eq!(long.len(), 40);
+        let info =
+            Resource::create(long, ResourceKind::MMIO, 0, 0, ResourceFlags::empty()).get_info();
+        assert_eq!(&info.name[..31], &long.as_bytes()[..31]);
+        assert_eq!(info.name[31], 0, "always NUL-terminated");
+        let short =
+            Resource::create("irq", ResourceKind::IRQ, 4, 2, ResourceFlags::empty()).get_info();
+        assert_eq!(&short.name[..4], b"irq\0");
+        assert_eq!((short.kind, short.base, short.size), (1, 4, 2));
+    }
 
     #[test]
     fn system_resources_are_scoped_to_their_subrange() {

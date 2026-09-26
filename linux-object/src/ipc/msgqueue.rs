@@ -10,7 +10,11 @@ use crate::time::TimeSpec;
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::future::Future;
+use core::pin::Pin;
 use core::sync::atomic::{AtomicUsize, Ordering};
+use core::task::{Context, Poll, Waker};
+use core::time::Duration;
 use lazy_static::lazy_static;
 use lock::{Mutex, RwLock};
 
@@ -26,6 +30,13 @@ pub const MSGMNB: usize = 16384;
 /// memory that nothing will ever free. `shared_mem.rs` bounds its own table
 /// at `SHMMNI` and its test says exactly why; this table had no bound at all.
 pub const MSGMNI: usize = 32000;
+
+/// How often a blocked `msgsnd`/`msgrcv` wakes up just to ask whether it
+/// should still be waiting. The queue wakes its waiters itself the moment a
+/// message lands, room appears or `IPC_RMID` runs; this tick is only a
+/// ceiling on how late a `kill` can be noticed, the same figure (and the
+/// same reasoning) as the semaphore and io-multiplex backstops.
+const MSG_INTERRUPT_CHECK_TICK_MS: u64 = 100;
 
 /// `struct msqid_ds` as 64-bit userland (musl/glibc `msqid64_ds`) lays it out.
 #[repr(C)]
@@ -62,16 +73,19 @@ struct MsgItem {
 pub enum MsgSendError {
     /// Queue was removed (`EIDRM` to the caller).
     Removed,
-    /// Not enough room; a blocking caller waits and retries.
-    Full,
+    /// Not enough room; a blocking caller parks on
+    /// [`MsgQueue::wait_for_change`] with the generation carried here and
+    /// retries.
+    Full(u64),
 }
 
 /// Outcome of a non-blocking receive attempt.
 pub enum MsgRecvError {
     /// Queue was removed (`EIDRM` to the caller).
     Removed,
-    /// No message of the requested type; a blocking caller waits.
-    NoMsg,
+    /// No message of the requested type; a blocking caller parks on
+    /// [`MsgQueue::wait_for_change`] with the generation carried here.
+    NoMsg(u64),
     /// First matching message is larger than the caller's buffer and
     /// `MSG_NOERROR` was not given (`E2BIG`).
     TooBig,
@@ -82,6 +96,31 @@ struct MsgQueueInner {
     messages: VecDeque<MsgItem>,
     /// Set by `IPC_RMID`: blocked senders/receivers wake into `EIDRM`.
     removed: bool,
+    /// Bumped on every change a blocked caller could care about: a message
+    /// in, a message out, the queue removed. A waiter snapshots it with the
+    /// `Full`/`NoMsg` it got and parks until it moves, so a change that lands
+    /// between the failed attempt and the park is seen, not slept through.
+    generation: u64,
+    /// The wakers of everybody parked in [`MsgQueue::wait_for_change`], by
+    /// subscription id.
+    waiters: Vec<(u64, Waker)>,
+    /// Next subscription id.
+    next_waiter: u64,
+}
+
+impl MsgQueueInner {
+    /// Something changed: move the generation on and wake every waiter.
+    ///
+    /// Every write to `messages` or to `removed` ends here. `msgsnd` and
+    /// `msgrcv` used to sleep 5 ms and look again, so a receiver saw its
+    /// message up to 5 ms late and a daemon parked in `msgrcv` woke two
+    /// hundred times a second for nothing.
+    fn touch(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
+        for (_, waker) in self.waiters.drain(..) {
+            waker.wake();
+        }
+    }
 }
 
 /// A System V message queue.
@@ -139,6 +178,9 @@ impl MsgQueue {
                 },
                 messages: VecDeque::new(),
                 removed: false,
+                generation: 0,
+                waiters: Vec::new(),
+                next_waiter: 0,
             }),
         }
     }
@@ -157,8 +199,17 @@ impl MsgQueue {
         // assume fits -- a queue at the top of the range answers "full".
         let cbytes = match inner.ds.cbytes.checked_add(data.len()) {
             Some(total) if total <= inner.ds.qbytes => total,
-            _ => return Err(MsgSendError::Full),
+            _ => return Err(MsgSendError::Full(inner.generation)),
         };
+        // ...and Linux bounds the NUMBER of messages by `msg_qbytes` too
+        // (`1 + q_qnum <= q_qbytes`, do_msgsnd in ipc/msg.c). Only the byte
+        // count was measured here, and a zero-length message adds no bytes:
+        // an unprivileged loop of `msgsnd(id, &buf, 0, 0)` grew the queue
+        // without limit, a heap allocation per message, pinned until
+        // `IPC_RMID`.
+        if inner.ds.qnum >= inner.ds.qbytes {
+            return Err(MsgSendError::Full(inner.generation));
+        }
         inner.ds.cbytes = cbytes;
         inner.ds.qnum += 1;
         inner.ds.stime = TimeSpec::now().sec;
@@ -167,6 +218,7 @@ impl MsgQueue {
             mtype,
             data: data.to_vec(),
         });
+        inner.touch();
         Ok(())
     }
 
@@ -186,7 +238,7 @@ impl MsgQueue {
             return Err(MsgRecvError::Removed);
         }
         let idx = select_message(inner.messages.iter().map(|m| m.mtype), msgtyp, except)
-            .ok_or(MsgRecvError::NoMsg)?;
+            .ok_or(MsgRecvError::NoMsg(inner.generation))?;
         if inner.messages[idx].data.len() > max_size && !noerror {
             return Err(MsgRecvError::TooBig);
         }
@@ -195,8 +247,31 @@ impl MsgQueue {
         inner.ds.qnum -= 1;
         inner.ds.rtime = TimeSpec::now().sec;
         inner.ds.lrpid = receiver;
+        inner.touch();
         msg.data.truncate(max_size);
         Ok((msg.mtype, msg.data))
+    }
+
+    /// Park until this queue may have changed since `since`, the generation a
+    /// failed [`try_send`](Self::try_send) or [`try_recv`](Self::try_recv)
+    /// carried: a message landed, one left, or the queue was removed
+    /// (`EIDRM`). A caught signal ends the wait with its error (`EINTR`),
+    /// which msgsnd(2) and msgrcv(2) both list. Resolves at once when the
+    /// generation already moved, so the change that lands between the failed
+    /// attempt and this call is a no-op rather than a missed wakeup.
+    pub fn wait_for_change(&self, since: u64) -> impl Future<Output = Result<(), LxError>> + '_ {
+        ChangeFuture {
+            queue: self,
+            since,
+            sub_id: None,
+            timer: None,
+        }
+    }
+
+    /// How many waiters are parked on this queue (tests).
+    #[cfg(test)]
+    fn waiter_count(&self) -> usize {
+        self.inner.lock().waiters.len()
     }
 
     /// `IPC_STAT`: snapshot the queue's `msqid_ds`.
@@ -245,11 +320,90 @@ impl MsgQueue {
     }
 
     fn mark_removed(&self) {
-        self.inner.lock().removed = true;
+        let mut inner = self.inner.lock();
+        inner.removed = true;
+        inner.touch();
     }
 
     fn key(&self) -> u32 {
         self.inner.lock().ds.perm.key
+    }
+}
+
+/// The future behind [`MsgQueue::wait_for_change`].
+#[must_use = "futures do nothing unless polled/`await`-ed"]
+struct ChangeFuture<'a> {
+    queue: &'a MsgQueue,
+    since: u64,
+    sub_id: Option<u64>,
+    /// Backstop: the queue wakes this for what happens to the QUEUE, and for
+    /// nothing that happens to the waiter. Without a tick nothing re-polls
+    /// it, so nothing checks for a signal, and a `msgrcv` on a queue nobody
+    /// writes could not be killed either.
+    timer: Option<kernel_hal::timer_waker::TimerWakerSlot>,
+}
+
+impl ChangeFuture<'_> {
+    fn done(&mut self, out: Result<(), LxError>) -> Poll<Result<(), LxError>> {
+        if let Some(id) = self.sub_id.take() {
+            self.queue.inner.lock().waiters.retain(|(i, _)| *i != id);
+        }
+        kernel_hal::timer_waker::kill_timer_waker(&mut self.timer);
+        Poll::Ready(out)
+    }
+}
+
+impl Drop for ChangeFuture<'_> {
+    fn drop(&mut self) {
+        if let Some(id) = self.sub_id.take() {
+            self.queue.inner.lock().waiters.retain(|(i, _)| *i != id);
+        }
+        kernel_hal::timer_waker::kill_timer_waker(&mut self.timer);
+    }
+}
+
+impl Future for ChangeFuture<'_> {
+    type Output = Result<(), LxError>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
+        let this = self.as_mut().get_mut();
+        {
+            let mut inner = this.queue.inner.lock();
+            if inner.removed {
+                drop(inner);
+                return this.done(Err(LxError::EIDRM));
+            }
+            if inner.generation != this.since {
+                drop(inner);
+                return this.done(Ok(()));
+            }
+            // Park: register (or refresh) our waker before letting go of the
+            // lock, so a `touch` that runs right after cannot miss us.
+            match this.sub_id {
+                Some(id) => {
+                    if let Some(slot) = inner.waiters.iter_mut().find(|(i, _)| *i == id) {
+                        slot.1 = cx.waker().clone();
+                    } else {
+                        inner.waiters.push((id, cx.waker().clone()));
+                    }
+                }
+                None => {
+                    let id = inner.next_waiter;
+                    inner.next_waiter += 1;
+                    inner.waiters.push((id, cx.waker().clone()));
+                    this.sub_id = Some(id);
+                }
+            }
+        }
+        // The queue reports only what the QUEUE does, so this is the only
+        // thing here that can answer a signal or a kill.
+        if let Err(err) = crate::process::check_signals() {
+            return this.done(Err(err));
+        }
+        let deadline =
+            kernel_hal::timer::deadline_after(Duration::from_millis(MSG_INTERRUPT_CHECK_TICK_MS));
+        kernel_hal::timer_waker::ensure_timer_waker(&mut this.timer, deadline, cx);
+        Poll::Pending
     }
 }
 
@@ -592,7 +746,7 @@ mod msg_control_tests {
         assert!(queue.try_send(1, &[0u8; 4], PID).is_ok());
         assert!(matches!(
             queue.try_send(1, &[0u8; 1], PID),
-            Err(MsgSendError::Full)
+            Err(MsgSendError::Full(_))
         ));
     }
 
@@ -609,7 +763,7 @@ mod msg_control_tests {
         }
         assert!(matches!(
             queue.try_send(1, &[0u8; 1], PID),
-            Err(MsgSendError::Full)
+            Err(MsgSendError::Full(_))
         ));
     }
 
@@ -772,5 +926,232 @@ mod msg_control_tests {
         assert!(q.may_access(STRANGER, OWNER, IPC_R));
         assert!(!q.may_access(STRANGER, OWNER, IPC_W));
         assert!(!q.may_access(STRANGER, STRANGER, IPC_R));
+    }
+}
+
+/// A blocked `msgsnd`/`msgrcv` used to sleep 5 ms and look again: a
+/// receiver saw its message up to 5 ms late, and a daemon parked in `msgrcv`
+/// woke two hundred times a second for nothing. Now the queue wakes its
+/// waiters itself. And `try_send` measured the queue in bytes only, so a
+/// zero-length message never filled it: an unprivileged loop of
+/// `msgsnd(id, &buf, 0, 0)` grew the queue without limit.
+///
+/// The waits are driven one poll at a time with a counting waker rather than
+/// `block_on`, ON PURPOSE: a mutation that stops the wait from resolving
+/// would make `block_on` hang, and a hang is not a detected failure.
+#[cfg(test)]
+mod blocking_wait_tests {
+    use super::*;
+    use core::pin::pin;
+    use core::sync::atomic::AtomicUsize;
+
+    extern crate std;
+    use std::sync::Arc as StdArc;
+    use std::task::Wake;
+
+    const PID: u32 = 7;
+    const OWNER: u32 = 1000;
+    const ROOT: u32 = 0;
+
+    /// A waker that counts how many times it was woken.
+    struct CountWaker(AtomicUsize);
+
+    impl Wake for CountWaker {
+        fn wake(self: StdArc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    fn counting_waker() -> (StdArc<CountWaker>, Waker) {
+        let count = StdArc::new(CountWaker(AtomicUsize::new(0)));
+        let waker = Waker::from(count.clone());
+        (count, waker)
+    }
+
+    fn wakes(count: &StdArc<CountWaker>) -> usize {
+        count.0.load(Ordering::SeqCst)
+    }
+
+    /// A queue that takes `qbytes` bytes, and `qbytes` messages.
+    fn queue_of(qbytes: usize) -> MsgQueue {
+        let queue = MsgQueue::new(0, 0o600, OWNER, OWNER);
+        let mut ds = queue.stat();
+        ds.qbytes = qbytes;
+        assert_eq!(queue.set(&ds, ROOT), Ok(()));
+        queue
+    }
+
+    /// The generation a receive on an empty queue is told to wait from.
+    fn empty_generation(queue: &MsgQueue) -> u64 {
+        match queue.try_recv(0, 64, false, false, PID) {
+            Err(MsgRecvError::NoMsg(since)) => since,
+            _ => panic!("an empty queue must answer NoMsg"),
+        }
+    }
+
+    // ------------------------------------------------------------- the bound
+
+    /// Linux: `1 + q_qnum <= q_qbytes` (do_msgsnd). Three zero-byte messages
+    /// fit a queue of three bytes; the fourth does not, whatever the byte
+    /// count says.
+    #[test]
+    fn zero_length_messages_fill_a_queue_too() {
+        let queue = queue_of(3);
+        for _ in 0..3 {
+            assert!(queue.try_send(1, &[], PID).is_ok());
+        }
+        assert!(
+            matches!(queue.try_send(1, &[], PID), Err(MsgSendError::Full(_))),
+            "the fourth zero-length message must find the queue full"
+        );
+        let ds = queue.stat();
+        assert_eq!(ds.qnum, 3);
+        assert_eq!(ds.cbytes, 0);
+        // Taking one out makes room for one.
+        assert!(queue.try_recv(0, 64, false, false, PID).is_ok());
+        assert!(queue.try_send(1, &[], PID).is_ok());
+    }
+
+    // -------------------------------------------------------------- the wait
+
+    /// A message that lands between the failed receive and the park must be
+    /// seen on the first poll, not slept through: the generation the failed
+    /// receive carried is older than the queue's.
+    #[test]
+    fn a_wait_on_a_stale_generation_resolves_at_once() {
+        let queue = queue_of(MSGMNB);
+        let since = empty_generation(&queue);
+        assert!(queue.try_send(1, b"hi", PID).is_ok());
+        let (_, waker) = counting_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut fut = pin!(queue.wait_for_change(since));
+        assert!(
+            matches!(fut.as_mut().poll(&mut cx), Poll::Ready(Ok(()))),
+            "a change that already happened must be seen on the very first poll"
+        );
+    }
+
+    /// The receiver's wait: parks while the queue is empty, is WOKEN (not
+    /// polled by luck) when a message lands, and resolves on the next poll.
+    #[test]
+    fn a_receiver_parks_until_a_message_lands_and_is_woken() {
+        let queue = queue_of(MSGMNB);
+        let since = empty_generation(&queue);
+        let (count, waker) = counting_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut fut = pin!(queue.wait_for_change(since));
+
+        assert!(
+            fut.as_mut().poll(&mut cx).is_pending(),
+            "nothing has changed yet"
+        );
+        assert_eq!(wakes(&count), 0);
+        assert_eq!(queue.waiter_count(), 1, "the wait must be registered");
+
+        assert!(queue.try_send(1, b"hi", PID).is_ok());
+        assert_eq!(wakes(&count), 1, "a send must wake the parked receiver");
+        assert!(
+            matches!(fut.as_mut().poll(&mut cx), Poll::Ready(Ok(()))),
+            "and the next poll must see the change"
+        );
+        // Whoever re-plans first finds the message still there.
+        assert_eq!(queue.stat().qnum, 1);
+    }
+
+    /// The sender's wait: a full queue parks it, and a receive that makes
+    /// room wakes it.
+    #[test]
+    fn a_sender_parks_on_a_full_queue_until_a_receive_makes_room() {
+        let queue = queue_of(4);
+        assert!(queue.try_send(1, &[0u8; 4], PID).is_ok());
+        let since = match queue.try_send(1, &[0u8; 1], PID) {
+            Err(MsgSendError::Full(since)) => since,
+            _ => panic!("the queue must be full"),
+        };
+        let (count, waker) = counting_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut fut = pin!(queue.wait_for_change(since));
+
+        assert!(fut.as_mut().poll(&mut cx).is_pending());
+        assert!(queue.try_recv(0, 64, false, false, PID).is_ok());
+        assert_eq!(wakes(&count), 1, "a receive must wake the parked sender");
+        assert!(matches!(fut.as_mut().poll(&mut cx), Poll::Ready(Ok(()))));
+        assert!(queue.try_send(1, &[0u8; 1], PID).is_ok(), "and now it fits");
+    }
+
+    /// `IPC_RMID` is the other way a blocked caller ends: woken, into
+    /// `EIDRM`.
+    #[test]
+    fn removing_the_queue_wakes_a_waiter_into_eidrm() {
+        let queue = queue_of(MSGMNB);
+        let since = empty_generation(&queue);
+        let (count, waker) = counting_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut fut = pin!(queue.wait_for_change(since));
+
+        assert!(fut.as_mut().poll(&mut cx).is_pending());
+        queue.mark_removed();
+        assert_eq!(wakes(&count), 1, "a removal must wake the waiter");
+        assert!(matches!(
+            fut.as_mut().poll(&mut cx),
+            Poll::Ready(Err(LxError::EIDRM))
+        ));
+        assert_eq!(
+            queue.waiter_count(),
+            0,
+            "a resolved wait leaves nothing behind"
+        );
+    }
+
+    /// A wait that is dropped while parked (the syscall was cancelled, the
+    /// task torn down) takes its waker with it; otherwise every abandoned
+    /// `msgrcv` leaves a dead entry the queue wakes for ever.
+    #[test]
+    fn a_dropped_wait_leaves_no_waker_behind() {
+        let queue = queue_of(MSGMNB);
+        let since = empty_generation(&queue);
+        let (count, waker) = counting_waker();
+        let mut cx = Context::from_waker(&waker);
+        {
+            let mut fut = pin!(queue.wait_for_change(since));
+            assert!(fut.as_mut().poll(&mut cx).is_pending());
+            assert_eq!(queue.waiter_count(), 1);
+        }
+        assert_eq!(
+            queue.waiter_count(),
+            0,
+            "dropping the wait must unregister it"
+        );
+        assert!(queue.try_send(1, b"hi", PID).is_ok());
+        assert_eq!(wakes(&count), 0, "nothing left to wake");
+    }
+
+    /// Two receivers parked on one queue: a send wakes both (each re-plans;
+    /// one wins the message, the other parks again on the new generation).
+    #[test]
+    fn a_send_wakes_every_parked_receiver() {
+        let queue = queue_of(MSGMNB);
+        let since = empty_generation(&queue);
+        let (count_a, waker_a) = counting_waker();
+        let (count_b, waker_b) = counting_waker();
+        let mut cx_a = Context::from_waker(&waker_a);
+        let mut cx_b = Context::from_waker(&waker_b);
+        let mut fut_a = pin!(queue.wait_for_change(since));
+        let mut fut_b = pin!(queue.wait_for_change(since));
+        assert!(fut_a.as_mut().poll(&mut cx_a).is_pending());
+        assert!(fut_b.as_mut().poll(&mut cx_b).is_pending());
+        assert_eq!(queue.waiter_count(), 2);
+
+        assert!(queue.try_send(1, b"hi", PID).is_ok());
+        assert_eq!((wakes(&count_a), wakes(&count_b)), (1, 1));
+        assert!(matches!(
+            fut_a.as_mut().poll(&mut cx_a),
+            Poll::Ready(Ok(()))
+        ));
+        assert!(matches!(
+            fut_b.as_mut().poll(&mut cx_b),
+            Poll::Ready(Ok(()))
+        ));
+        assert_eq!(queue.waiter_count(), 0);
     }
 }
