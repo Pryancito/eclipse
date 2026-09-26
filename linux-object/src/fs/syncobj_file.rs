@@ -322,7 +322,7 @@ impl FileLike for SyncobjHandle {
     async fn async_poll(&self, events: PollEvents) -> LxResult<PollStatus> {
         loop {
             let status = self.poll(events)?;
-            if !events.contains(PollEvents::IN) || status.read {
+            if !events.wants_read() || status.read {
                 return Ok(status);
             }
             let bus = self.eventbus.clone();

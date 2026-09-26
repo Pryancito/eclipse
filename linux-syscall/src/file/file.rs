@@ -356,6 +356,9 @@ impl Syscall<'_> {
             fd, base, len, offset
         );
         let offset = linux_object::fs::user_offset(offset)?;
+        // `generic_write_check_limits`: what the window ENDS at is what the
+        // file would have to grow to.
+        self.check_fsize_limit(offset.saturating_add(len as u64))?;
         self.linux_process()
             .get_file_like(fd)?
             .write_at(offset, base.as_slice(len)?)
@@ -654,6 +657,37 @@ impl Syscall<'_> {
         }
     }
 
+    /// `RLIMIT_FSIZE`, the largest file this process may make, or `EFBIG`.
+    ///
+    /// Linux asks this of every call that can grow a regular file
+    /// (`inode_newsize_ok`, and `generic_write_check_limits` on the write
+    /// paths), and nothing here asked it at all: the limit was stored, read
+    /// back by `getrlimit` and never compared against anything, so
+    /// `ftruncate(fd, 1 << 50)` from any process went straight to the
+    /// filesystem. On the RAM-backed roots this kernel runs on, a `resize`
+    /// commits every block it grows by, which is how one `ftruncate` to ~456
+    /// MiB took the desktop out of memory (the incident this file's `warn!`
+    /// below was added for). A limit a program sets on itself, or that a
+    /// launcher sets for it, now means something.
+    ///
+    /// `RLIM_INFINITY` is not a very large limit: it is compared against
+    /// nothing at all.
+    fn check_fsize_limit(&self, len: u64) -> linux_object::error::LxResult {
+        let limit =
+            self.linux_process()
+                .rlimit(linux_object::process::RLIMIT_FSIZE, None, false)?;
+        if limit.cur != linux_object::process::RLIM_INFINITY && len > limit.cur {
+            warn!(
+                "[rlimit] EFBIG: len={} > RLIMIT_FSIZE={} comm={}",
+                len,
+                limit.cur,
+                self.zircon_process().name(),
+            );
+            return Err(LxError::EFBIG);
+        }
+        Ok(())
+    }
+
     /// cause the regular file named by path to be truncated to a size of precisely length bytes.
     pub fn sys_truncate(&self, path: UserInPtr<u8>, len: usize) -> SysResult {
         let path = path.as_c_str()?;
@@ -664,6 +698,7 @@ impl Syscall<'_> {
         let metadata = inode.metadata()?;
         Self::truncate_type(metadata.type_)?;
         proc.check_access(&metadata, 0o2, true)?;
+        self.check_fsize_limit(len as u64)?;
         inode
             .resize(len)
             .map_err(|e| linux_object::fs::fs_grow_error(&inode, e))?;
@@ -680,6 +715,7 @@ impl Syscall<'_> {
         let proc = self.linux_process();
         let file = proc.get_file(fd)?;
         Self::ftruncate_type(file.metadata()?.type_)?;
+        self.check_fsize_limit(len as u64)?;
         // The desktop OOM was a single ftruncate growing one RAM-backed file
         // to ~456 MiB (117k live 4 KiB ramfs blocks in one resize). Name any
         // suspicious-sized truncate loudly: which file, how big, and who.

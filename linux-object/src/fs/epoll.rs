@@ -62,20 +62,7 @@ const EPOLLEXCLUSIVE_OK_BITS: u32 = PollEvents::IN.bits() as u32
 /// `EPOLLONESHOT` delivery can produce. `ep_item_poll` is the same `&`.
 fn ready_events(events: u32, status: &PollStatus) -> u32 {
     let interest = PollEvents::from_bits_truncate(events as u16);
-    let mut ready = PollEvents::empty();
-    if status.read {
-        ready |= PollEvents::IN;
-    }
-    if status.write {
-        ready |= PollEvents::OUT;
-    }
-    if status.error {
-        ready |= PollEvents::ERR;
-    }
-    if status.hangup {
-        ready |= PollEvents::HUP;
-    }
-    (ready & interest).bits() as u32
+    (PollEvents::ready(status) & interest).bits() as u32
 }
 
 /// The event mask `epoll_ctl` stores for one interest-list entry, or the
@@ -1127,6 +1114,24 @@ mod flag_tests {
         assert_eq!(ready_events(mask, &status(false, false, true, false)), ERR);
         assert_eq!(ready_events(mask, &status(false, true, false, false)), OUT);
         assert_eq!(ready_events(mask, &status(true, false, false, false)), IN);
+    }
+
+    /// `EPOLLRDNORM` and `EPOLLWRNORM` are `EPOLLIN` and `EPOLLOUT` under
+    /// their streams names, and Linux reports each pair together. An entry
+    /// armed with `EPOLLRDNORM` alone used to be one `epoll_wait` never
+    /// returned.
+    #[test]
+    fn rdnorm_and_wrnorm_are_in_and_out_under_another_name() {
+        const RDNORM: u32 = PollEvents::RDNORM.bits() as u32;
+        const WRNORM: u32 = PollEvents::WRNORM.bits() as u32;
+        let readable = status(true, false, false, false);
+        let writable = status(false, true, false, false);
+        assert_eq!(ready_events(RDNORM, &readable), RDNORM);
+        assert_eq!(ready_events(IN | RDNORM, &readable), IN | RDNORM);
+        assert_eq!(ready_events(RDNORM, &writable), 0);
+        assert_eq!(ready_events(WRNORM, &writable), WRNORM);
+        assert_eq!(ready_events(OUT | WRNORM, &writable), OUT | WRNORM);
+        assert_eq!(ready_events(WRNORM, &readable), 0);
     }
 
     /// The point of the flag: one delivery, then the entry is off until the

@@ -88,6 +88,8 @@ pub const CAP_SYS_NICE: u32 = 23;
 pub const CAP_SYS_RESOURCE: u32 = 24;
 /// `CAP_SYS_TIME`: set the system clock and discipline it.
 pub const CAP_SYS_TIME: u32 = 25;
+/// `CAP_MKNOD`: make a character or block device node with `mknod(2)`.
+pub const CAP_MKNOD: u32 = 27;
 /// `CAP_SYSLOG`: the `syslog(2)` actions that change the kernel log or the
 /// console (clear, read-and-clear, console on/off/level) -- and, under
 /// `dmesg_restrict`, reading it at all.
@@ -4003,7 +4005,21 @@ impl LinuxProcessInner {
 }
 /// Deliver SIGINT to the foreground terminal process group (job control).
 pub fn deliver_sigint_to_foreground() {
-    let pgid = crate::fs::stdio::get_foreground_pgrp();
+    deliver_sigint_for_vt(None)
+}
+
+/// `SIGINT` to the foreground group of `vt`, or of the VT on screen when no VT
+/// is named, falling back to the calling thread's own process.
+///
+/// A latched Ctrl-C names its VT ([`CtrlCInterrupt`](crate::fs::stdio::CtrlCInterrupt)):
+/// the keystroke may have arrived on the serial console while the desktop
+/// holds the graphics VT, and answering it with the VT on screen signalled the
+/// desktop's process group instead of the one that was typed at.
+pub fn deliver_sigint_for_vt(vt: Option<usize>) {
+    let pgid = match vt {
+        Some(vt) => crate::fs::stdio::vt_foreground_pgrp(vt),
+        None => crate::fs::stdio::get_foreground_pgrp(),
+    };
     if pgid > 0 {
         let _ = send_signal_to_pgrp(pgid as usize, LinuxSignal::SIGINT);
         return;
@@ -4420,8 +4436,13 @@ pub fn get_process_sid(pid: KoID) -> LxResult<KoID> {
 }
 
 pub fn check_and_deliver_tty_interrupt() -> LxResult<()> {
-    if crate::fs::stdio::ctrl_c_pending_take() {
-        deliver_sigint_to_foreground();
+    if let Some(intr) = crate::fs::stdio::ctrl_c_pending_take() {
+        // Only when the keystroke handler could not signal the group itself:
+        // it already did whenever the VT had one, and delivering again is how
+        // a single Ctrl-C came to raise two `SIGINT`s.
+        if intr.signal_owed {
+            deliver_sigint_for_vt(Some(intr.vt));
+        }
         return Err(LxError::EINTR);
     }
     check_signals()

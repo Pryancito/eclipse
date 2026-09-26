@@ -17,6 +17,7 @@ use rcore_fs::vfs::*;
 use zircon_object::vm::VmObject;
 
 use super::drm;
+use zcore_drivers::display::edid;
 
 /// Parks until the DRM card fd has a queued event. Flat `Future` (no nested
 /// `async` state machine) so blocking card reads / leftover `async_poll`
@@ -3394,38 +3395,161 @@ fn clock_khz_for_refresh_mhz(htotal: u32, vtotal: u32, refresh_mhz: u32) -> u32 
     clock.max(1) as u32
 }
 
-/// Build a `struct drm_mode_modeinfo` (68 bytes) for a simple 60 Hz mode at
-/// `w`x`h`. Timings are nominal — a software framebuffer never programs real CRT
-/// timings — but they must be *valid*: `hdisplay < hsync_start < hsync_end <
-/// htotal` (and the vertical analogue). The previous +10%/+5% blanking put
-/// `hsync_end > htotal` at 1366×768, which is MODE_H_ILLEGAL; compositors that
-/// recompute refresh from the porches then advertised ~55–59 Hz instead of 60.
+/// `DRM_MODE_FLAG_*` from `<drm/drm_mode.h>`. Only the three a synthetic or
+/// EDID-derived mode can carry.
+const DRM_MODE_FLAG_PHSYNC: u32 = 1 << 0;
+const DRM_MODE_FLAG_NHSYNC: u32 = 1 << 1;
+const DRM_MODE_FLAG_PVSYNC: u32 = 1 << 2;
+const DRM_MODE_FLAG_NVSYNC: u32 = 1 << 3;
+const DRM_MODE_FLAG_INTERLACE: u32 = 1 << 4;
+
+/// The numbers that go into a `drm_mode_modeinfo`, from whichever source could
+/// supply them. Split out from the byte packing so both sources can be tested
+/// without a monitor and without the boot-EDID global.
+struct Modeline {
+    clock_khz: u32,
+    hdisplay: u16,
+    hsync_start: u16,
+    hsync_end: u16,
+    htotal: u16,
+    vdisplay: u16,
+    vsync_start: u16,
+    vsync_end: u16,
+    vtotal: u16,
+    vrefresh: u32,
+    flags: u32,
+}
+
+impl Modeline {
+    /// The nominal mode: `w`x`h` at 60 Hz with fixed porches.
+    ///
+    /// A software framebuffer never programs CRT timings, so these are made up
+    /// — but they must be *valid*: `hdisplay < hsync_start < hsync_end <
+    /// htotal` (and the vertical analogue). The previous +10%/+5% blanking put
+    /// `hsync_end > htotal` at 1366×768, which is MODE_H_ILLEGAL; compositors
+    /// that recompute refresh from the porches then advertised ~55–59 Hz
+    /// instead of 60.
+    fn synthetic(w: u32, h: u32) -> Self {
+        let hdisplay = w as u16;
+        let vdisplay = h as u16;
+        // Fixed porches, always strictly increasing for any GOP-sized mode.
+        let hsync_start = hdisplay.saturating_add(48);
+        let hsync_end = hsync_start.saturating_add(32);
+        let htotal = hsync_end.saturating_add(80);
+        let vsync_start = vdisplay.saturating_add(3);
+        let vsync_end = vsync_start.saturating_add(6);
+        let vtotal = vsync_end.saturating_add(32);
+        Self {
+            clock_khz: clock_khz_for_refresh_mhz(htotal as u32, vtotal as u32, 60_000),
+            hdisplay,
+            hsync_start,
+            hsync_end,
+            htotal,
+            vdisplay,
+            vsync_start,
+            vsync_end,
+            vtotal,
+            vrefresh: 60,
+            // -hsync/-vsync. Made up like the rest, and nothing programs it:
+            // the sync generator is already running, set by firmware.
+            flags: DRM_MODE_FLAG_NHSYNC | DRM_MODE_FLAG_NVSYNC,
+        }
+    }
+
+    /// The panel's own timing, from the preferred detailed timing of its EDID.
+    ///
+    /// `None` unless every number survives the trip into a `u16` and the mode
+    /// states a refresh, because the fallback is the nominal mode above and
+    /// that is strictly better than an illegal one: wlroots handed a mode
+    /// whose sync runs past its total drops the output rather than picking
+    /// another, and the desktop lands on the text console.
+    fn from_panel(t: &edid::DetailedTiming) -> Option<Self> {
+        let vrefresh = t.refresh_hz();
+        if !t.is_valid() || vrefresh == 0 {
+            return None;
+        }
+        // The uAPI field is 16 bits; a monitor that states more is not a
+        // monitor this can describe, so fall back rather than truncate.
+        let fit = |v: u32| (v <= u16::MAX as u32).then_some(v as u16);
+        let mut flags = 0;
+        if t.separate_sync {
+            flags |= if t.hsync_positive {
+                DRM_MODE_FLAG_PHSYNC
+            } else {
+                DRM_MODE_FLAG_NHSYNC
+            };
+            flags |= if t.vsync_positive {
+                DRM_MODE_FLAG_PVSYNC
+            } else {
+                DRM_MODE_FLAG_NVSYNC
+            };
+        }
+        if t.interlaced {
+            flags |= DRM_MODE_FLAG_INTERLACE;
+        }
+        Some(Self {
+            clock_khz: t.clock_khz,
+            hdisplay: fit(t.hdisplay)?,
+            hsync_start: fit(t.hsync_start)?,
+            hsync_end: fit(t.hsync_end)?,
+            htotal: fit(t.htotal)?,
+            vdisplay: fit(t.vdisplay)?,
+            vsync_start: fit(t.vsync_start)?,
+            vsync_end: fit(t.vsync_end)?,
+            vtotal: fit(t.vtotal)?,
+            vrefresh,
+            flags,
+        })
+    }
+}
+
+/// The native timing of the monitor firmware read at boot, if it stated one.
+fn panel_timing() -> Option<edid::DetailedTiming> {
+    let (block, len) = zcore_drivers::display::boot_edid()?;
+    if len < 128 {
+        return None;
+    }
+    edid::preferred_timing(&block)
+}
+
+/// Build a `struct drm_mode_modeinfo` (68 bytes) for the mode at `w`x`h`.
+///
+/// The panel's own timing when its EDID describes exactly this mode, and the
+/// nominal 60 Hz one otherwise. The refresh is not cosmetic: it is what the
+/// compositor paces its repaints to, and what `set_vblank_period_from_modeinfo`
+/// turns into the synthetic vblank period every `WAIT_VBLANK` and every flip
+/// completion is timed against. Saying 60 to a 144 Hz panel throws away more
+/// than half of its scanouts.
 fn make_modeinfo(w: u32, h: u32) -> [u8; 68] {
+    make_modeinfo_with(w, h, panel_timing().as_ref())
+}
+
+/// [`make_modeinfo`] with the panel's timing handed in, so a test can drive
+/// both sources without touching the process-wide boot EDID.
+fn make_modeinfo_with(w: u32, h: u32, panel: Option<&edid::DetailedTiming>) -> [u8; 68] {
     let mut m = [0u8; 68];
-    let hdisplay = w as u16;
-    let vdisplay = h as u16;
-    // Fixed porches, always strictly increasing for any GOP-sized mode.
-    let hsync_start = hdisplay.saturating_add(48);
-    let hsync_end = hsync_start.saturating_add(32);
-    let htotal = hsync_end.saturating_add(80);
-    let vsync_start = vdisplay.saturating_add(3);
-    let vsync_end = vsync_start.saturating_add(6);
-    let vtotal = vsync_end.saturating_add(32);
-    let clock = clock_khz_for_refresh_mhz(htotal as u32, vtotal as u32, 60_000);
-    m[0..4].copy_from_slice(&clock.to_ne_bytes());
-    m[4..6].copy_from_slice(&hdisplay.to_ne_bytes());
-    m[6..8].copy_from_slice(&hsync_start.to_ne_bytes());
-    m[8..10].copy_from_slice(&hsync_end.to_ne_bytes());
-    m[10..12].copy_from_slice(&htotal.to_ne_bytes());
+    // The resolution has to match, and that is the whole safety argument: the
+    // preferred timing describes the panel's native mode, and firmware is free
+    // to have programmed a different one (1080p on a 4K panel is the common
+    // case). A timing for a mode that is not scanning out is a refresh rate
+    // for a different mode, which is worse than admitting we do not know.
+    let ml = panel
+        .filter(|t| t.hdisplay == w && t.vdisplay == h)
+        .and_then(Modeline::from_panel)
+        .unwrap_or_else(|| Modeline::synthetic(w, h));
+    m[0..4].copy_from_slice(&ml.clock_khz.to_ne_bytes());
+    m[4..6].copy_from_slice(&ml.hdisplay.to_ne_bytes());
+    m[6..8].copy_from_slice(&ml.hsync_start.to_ne_bytes());
+    m[8..10].copy_from_slice(&ml.hsync_end.to_ne_bytes());
+    m[10..12].copy_from_slice(&ml.htotal.to_ne_bytes());
     // hskew @12..14 = 0
-    m[14..16].copy_from_slice(&vdisplay.to_ne_bytes());
-    m[16..18].copy_from_slice(&vsync_start.to_ne_bytes());
-    m[18..20].copy_from_slice(&vsync_end.to_ne_bytes());
-    m[20..22].copy_from_slice(&vtotal.to_ne_bytes());
+    m[14..16].copy_from_slice(&ml.vdisplay.to_ne_bytes());
+    m[16..18].copy_from_slice(&ml.vsync_start.to_ne_bytes());
+    m[18..20].copy_from_slice(&ml.vsync_end.to_ne_bytes());
+    m[20..22].copy_from_slice(&ml.vtotal.to_ne_bytes());
     // vscan @22..24 = 0
-    m[24..28].copy_from_slice(&60u32.to_ne_bytes()); // vrefresh (Hz)
-                                                     // flags @28..32: NHSYNC (1<<1) | PVSYNC (1<<3), typical CVT polarity
-    m[28..32].copy_from_slice(&0x0Au32.to_ne_bytes());
+    m[24..28].copy_from_slice(&ml.vrefresh.to_ne_bytes()); // vrefresh (Hz)
+    m[28..32].copy_from_slice(&ml.flags.to_ne_bytes());
     // type @32..36: DRM_MODE_TYPE_DRIVER(0x40) | DRM_MODE_TYPE_PREFERRED(0x08)
     m[32..36].copy_from_slice(&0x48u32.to_ne_bytes());
     // name @36..68 ("WxH")
@@ -4442,6 +4566,280 @@ mod render_node_and_mode_tests {
             let (clock, _, _, _) = timings(&make_modeinfo(w, h));
             assert!(clock > 0, "{}x{} got a zero pixel clock", w, h);
         }
+    }
+
+    /// A `DetailedTiming` built straight, so these tests never touch the
+    /// process-wide boot EDID (which no test sets and every one of them reads).
+    #[allow(clippy::too_many_arguments)]
+    fn panel(
+        clock_khz: u32,
+        (hd, hss, hse, ht): (u32, u32, u32, u32),
+        (vd, vss, vse, vt): (u32, u32, u32, u32),
+        interlaced: bool,
+    ) -> edid::DetailedTiming {
+        edid::DetailedTiming {
+            clock_khz,
+            hdisplay: hd,
+            hsync_start: hss,
+            hsync_end: hse,
+            htotal: ht,
+            vdisplay: vd,
+            vsync_start: vss,
+            vsync_end: vse,
+            vtotal: vt,
+            interlaced,
+            separate_sync: true,
+            hsync_positive: false,
+            vsync_positive: true,
+        }
+    }
+
+    /// `1920x1080` at the given refresh, with the DMT geometry. The clock is
+    /// chosen so the refresh is exact, which is what makes the assertions
+    /// numbers instead of ranges.
+    fn dmt_1080p(hz: u32) -> edid::DetailedTiming {
+        panel(
+            hz * 2200 * 1125 / 1000,
+            (1920, 2008, 2052, 2200),
+            (1080, 1084, 1089, 1125),
+            false,
+        )
+    }
+
+    #[test]
+    fn with_no_edid_the_mode_is_the_nominal_one_byte_for_byte() {
+        // The regression guard for everything below: a machine whose firmware
+        // read no EDID -- every VM, and the case the whole suite runs in --
+        // must get exactly the mode it got before the panel timing existed.
+        for &(w, h) in MODES {
+            let m = make_modeinfo_with(w, h, None);
+            let (clock, hor, vert, vrefresh) = timings(&m);
+            let hd = w as u16;
+            let vd = h as u16;
+            assert_eq!(hor, [hd, hd + 48, hd + 80, hd + 160], "{}x{}", w, h);
+            assert_eq!(vert, [vd, vd + 3, vd + 9, vd + 41], "{}x{}", w, h);
+            assert_eq!(vrefresh, 60, "{}x{}", w, h);
+            assert_eq!(
+                clock,
+                clock_khz_for_refresh_mhz(hor[3] as u32, vert[3] as u32, 60_000),
+                "{}x{}",
+                w,
+                h
+            );
+            // -hsync/-vsync, and no interlace.
+            assert_eq!(u32::from_ne_bytes([m[28], m[29], m[30], m[31]]), 0x0A);
+            // And that is what `make_modeinfo` itself builds, since no test
+            // sets a boot EDID.
+            assert_eq!(make_modeinfo(w, h), m, "{}x{}", w, h);
+        }
+    }
+
+    #[test]
+    fn a_panel_faster_than_sixty_is_advertised_at_its_own_refresh() {
+        // The reason this path exists. The kernel used to answer 60 Hz for
+        // every monitor, because 60 was the only refresh it could name: the
+        // EDID's pixel clock was decoded nowhere. A compositor told 60 paces
+        // its repaints and its WAIT_VBLANK sleeps to 16.7 ms, so on this panel
+        // better than half the scanouts show a frame that is already up.
+        let m = make_modeinfo_with(1920, 1080, Some(&dmt_1080p(144)));
+        let (clock, hor, vert, vrefresh) = timings(&m);
+        assert_eq!(vrefresh, 144);
+        assert_eq!(clock, 356_400, "the panel's own pixel clock, in kHz");
+        assert_eq!(hor, [1920, 2008, 2052, 2200], "the panel's own porches");
+        assert_eq!(vert, [1080, 1084, 1089, 1125]);
+        // The number that matters is not the one in the `vrefresh` field but
+        // the one the pacing is derived from, and both have to agree: a client
+        // that leaves `vrefresh` at 0 gets the refresh recomputed from these
+        // porches, and that is the path `set_vblank_period_from_modeinfo` runs.
+        assert_eq!(drm::refresh_hz_from_modeinfo(&m), Some(144));
+        let mut no_vrefresh = m;
+        no_vrefresh[24..28].copy_from_slice(&0u32.to_ne_bytes());
+        assert_eq!(drm::refresh_hz_from_modeinfo(&no_vrefresh), Some(144));
+    }
+
+    #[test]
+    fn every_refresh_a_panel_can_state_survives_the_round_trip() {
+        // Not just 144: the mode has to carry whatever the monitor says, and
+        // the two answers (the stated field and the one recomputed from the
+        // porches) have to agree for each, or a compositor gets a different
+        // rate depending on which it trusts.
+        for hz in [50u32, 60, 75, 100, 120, 144, 165, 240] {
+            let m = make_modeinfo_with(1920, 1080, Some(&dmt_1080p(hz)));
+            let (_, _, _, vrefresh) = timings(&m);
+            assert_eq!(vrefresh, hz, "stated refresh for {} Hz", hz);
+            assert_eq!(
+                drm::refresh_hz_from_modeinfo(&m),
+                Some(hz as u64),
+                "recomputed refresh for {} Hz",
+                hz
+            );
+        }
+    }
+
+    #[test]
+    fn a_panel_whose_native_mode_is_not_the_one_on_screen_is_not_used() {
+        // Firmware picks the mode; a 4K panel driven at 1080p is the ordinary
+        // case. Its preferred timing then describes 3840x2160 at some refresh
+        // that has nothing to do with what is scanning out, so using it would
+        // pace the compositor to a mode nobody is displaying.
+        let native_4k = panel(
+            594_000,
+            (3840, 4016, 4104, 4400),
+            (2160, 2168, 2178, 2250),
+            false,
+        );
+        let m = make_modeinfo_with(1920, 1080, Some(&native_4k));
+        assert_eq!(m, make_modeinfo_with(1920, 1080, None), "must be nominal");
+        // One axis matching is not matching.
+        let same_width = panel(
+            148_500,
+            (1920, 2008, 2052, 2200),
+            (1200, 1204, 1209, 1245),
+            false,
+        );
+        assert_eq!(
+            make_modeinfo_with(1920, 1080, Some(&same_width)),
+            make_modeinfo_with(1920, 1080, None)
+        );
+        // And when it does match, it is used -- otherwise this test would pass
+        // with the panel timing wired to nothing.
+        assert_ne!(
+            make_modeinfo_with(1920, 1080, Some(&dmt_1080p(144))),
+            make_modeinfo_with(1920, 1080, None)
+        );
+    }
+
+    #[test]
+    fn an_illegal_panel_timing_falls_back_instead_of_being_advertised() {
+        // The one way this change could cost Moebius his desktop. A sync pulse
+        // ending past the total is MODE_H_ILLEGAL, and wlroots handed such a
+        // mode drops the output rather than picking another -- the desktop
+        // falls back to the text console. So a monitor whose descriptor is
+        // line noise has to land on the nominal mode, not on the screen.
+        let nominal = make_modeinfo_with(1920, 1080, None);
+        for bad in [
+            // hsync_end past htotal
+            panel(
+                148_500,
+                (1920, 2008, 2300, 2200),
+                (1080, 1084, 1089, 1125),
+                false,
+            ),
+            // hsync_start before hdisplay
+            panel(
+                148_500,
+                (1920, 1900, 2052, 2200),
+                (1080, 1084, 1089, 1125),
+                false,
+            ),
+            // vsync_end past vtotal
+            panel(
+                148_500,
+                (1920, 2008, 2052, 2200),
+                (1080, 1084, 1200, 1125),
+                false,
+            ),
+            // a zero clock: no refresh to derive
+            panel(0, (1920, 2008, 2052, 2200), (1080, 1084, 1089, 1125), false),
+            // a total that does not fit the 16-bit uAPI field
+            panel(
+                148_500,
+                (1920, 2008, 2052, 70_000),
+                (1080, 1084, 1089, 1125),
+                false,
+            ),
+            // a clock so slow the refresh rounds to zero
+            panel(1, (1920, 2008, 2052, 2200), (1080, 1084, 1089, 1125), false),
+        ] {
+            let m = make_modeinfo_with(1920, 1080, Some(&bad));
+            assert_eq!(m, nominal, "an unusable timing reached the mode: {:?}", bad);
+        }
+    }
+
+    #[test]
+    fn the_panels_sync_polarity_and_interlace_reach_the_flags() {
+        const PHSYNC: u32 = 1 << 0;
+        const NHSYNC: u32 = 1 << 1;
+        const PVSYNC: u32 = 1 << 2;
+        const NVSYNC: u32 = 1 << 3;
+        const INTERLACE: u32 = 1 << 4;
+        let flags_of = |m: &[u8; 68]| u32::from_ne_bytes([m[28], m[29], m[30], m[31]]);
+
+        let mut t = dmt_1080p(60);
+        assert_eq!(
+            flags_of(&make_modeinfo_with(1920, 1080, Some(&t))),
+            NHSYNC | PVSYNC,
+            "-hsync/+vsync, what the timing states"
+        );
+        t.hsync_positive = true;
+        t.vsync_positive = false;
+        assert_eq!(
+            flags_of(&make_modeinfo_with(1920, 1080, Some(&t))),
+            PHSYNC | NVSYNC
+        );
+        // A descriptor that does not use digital separate sync states no
+        // polarity at all, and inventing one is what Linux declines to do.
+        t.separate_sync = false;
+        assert_eq!(flags_of(&make_modeinfo_with(1920, 1080, Some(&t))), 0);
+
+        // 1080i60: the decoder has already doubled the vertical numbers, so
+        // the mode is 1920x1080 with an odd total and the interlace flag. A
+        // compositor that is not told it is interlaced renders half a frame.
+        let i = panel(
+            74_250,
+            (1920, 2008, 2052, 2200),
+            (1080, 1084, 1094, 1125),
+            true,
+        );
+        let m = make_modeinfo_with(1920, 1080, Some(&i));
+        assert_eq!(flags_of(&m) & INTERLACE, INTERLACE);
+        let (_, _, vert, vrefresh) = timings(&m);
+        assert_eq!(vert[3] % 2, 1, "an interlaced frame has an odd line count");
+        assert_eq!(vrefresh, 60, "1080i60 is 60 FIELDS a second");
+    }
+
+    #[test]
+    fn a_panel_timing_is_still_a_legal_mode_by_the_rule_the_nominal_one_keeps() {
+        // The porch invariant the nominal mode is held to, applied to the
+        // other source. Non-strict here, because a real panel is allowed a
+        // zero front porch or no back porch and Linux accepts it.
+        for hz in [50u32, 60, 144, 240] {
+            let m = make_modeinfo_with(1920, 1080, Some(&dmt_1080p(hz)));
+            let (clock, hor, vert, _) = timings(&m);
+            assert!(clock > 0);
+            assert!(
+                hor[0] <= hor[1] && hor[1] <= hor[2] && hor[2] <= hor[3],
+                "{:?}",
+                hor
+            );
+            assert!(
+                vert[0] <= vert[1] && vert[1] <= vert[2] && vert[2] <= vert[3],
+                "{:?}",
+                vert
+            );
+        }
+        // And a zero-porch reduced-blanking panel is accepted, not refused.
+        let rb = panel(
+            148_500,
+            (1920, 1920, 2000, 2000),
+            (1080, 1080, 1125, 1125),
+            false,
+        );
+        let m = make_modeinfo_with(1920, 1080, Some(&rb));
+        assert_ne!(m, make_modeinfo_with(1920, 1080, None));
+        let (_, hor, _, _) = timings(&m);
+        assert_eq!(hor, [1920, 1920, 2000, 2000]);
+    }
+
+    #[test]
+    fn the_mode_name_is_the_resolution_whichever_source_the_timings_came_from() {
+        // Userspace matches modes by name, so the two sources must not name
+        // the same mode differently.
+        let a = make_modeinfo_with(1920, 1080, None);
+        let b = make_modeinfo_with(1920, 1080, Some(&dmt_1080p(144)));
+        assert_eq!(a[36..68], b[36..68]);
+        assert_eq!(&a[36..45], b"1920x1080");
+        assert_eq!(a[45], 0);
     }
 
     #[test]

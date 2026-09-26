@@ -83,7 +83,7 @@ impl FileLike for PidFd {
     fn poll(&self, events: PollEvents) -> LxResult<PollStatus> {
         let exited = self.exited();
         Ok(PollStatus {
-            read: exited && events.contains(PollEvents::IN),
+            read: exited && events.wants_read(),
             write: false,
             error: false,
             hangup: false,

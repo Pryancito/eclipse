@@ -94,6 +94,24 @@ enum ShmatPlace {
 /// where it must take `SIGSEGV`. `EXECUTE` is kept unconditionally, as the old
 /// fixed flags had it -- narrowing it to `SHM_EXEC` is a separate change with
 /// its own W^X risk, out of scope here.
+/// An explicit attach address, or `EPERM` when it is under
+/// `vm.mmap_min_addr`.
+///
+/// `shmat` reached `Vmar::map`, which applies no floor, so this was the one
+/// mapping call in the Linux personality that could put a page at address 0
+/// -- `shmat(id, (void *) 1, SHM_RND)` rounds to 0, and an attach there maps
+/// the segment over the null page: the process loses its NULL-dereference
+/// protection for good, and every pointer into the segment is a pointer
+/// userspace and this kernel's own syscall checks read as NULL. Linux refuses
+/// it in `security_mmap_addr`, which `do_shmat` reaches through `MAP_FIXED`,
+/// with `EPERM` for a caller without `CAP_SYS_RAWIO`.
+fn rounded_attach_addr(addr: VirtAddr) -> Result<VirtAddr, LxError> {
+    if addr < crate::vm::MMAP_MIN_ADDR {
+        return Err(LxError::EPERM);
+    }
+    Ok(addr)
+}
+
 fn shmat_flags_and_place(shmflg: usize, addr: VirtAddr) -> Result<(MMUFlags, ShmatPlace), LxError> {
     let mut flags = MMUFlags::READ | MMUFlags::EXECUTE | MMUFlags::USER;
     if shmflg & SHM_RDONLY == 0 {
@@ -107,9 +125,9 @@ fn shmat_flags_and_place(shmflg: usize, addr: VirtAddr) -> Result<(MMUFlags, Shm
     } else if shmflg & SHM_RND != 0 {
         // "the attach occurs at the address rounded down to the nearest
         // multiple of SHMLBA."
-        ShmatPlace::At(addr & !(SHMLBA - 1))
+        ShmatPlace::At(rounded_attach_addr(addr & !(SHMLBA - 1))?)
     } else if addr.is_multiple_of(SHMLBA) {
-        ShmatPlace::At(addr)
+        ShmatPlace::At(rounded_attach_addr(addr)?)
     } else {
         // A non-aligned address without SHM_RND is EINVAL -- not, as before,
         // silently mapped somewhere else.
@@ -658,7 +676,26 @@ impl Syscall<'_> {
             ShmatPlace::Anywhere => None,
             ShmatPlace::At(want) => Some(want - vmar.addr()),
         };
-        let addr = vmar.map(vmar_offset, vmo.clone(), 0, vmo.len(), flags)?;
+        // Through `map_ext_min` with `MMAP_MIN_ADDR`, exactly as `sys_mmap`
+        // does: `Vmar::map` applies no floor, and the VMAR's first-fit search
+        // starts at 0, so the first `shmat(id, NULL, 0)` in a fresh process
+        // could be placed AT address 0. That is the MIT-SHM path -- every X
+        // client attaches its image with a null `shmaddr` -- and the result is
+        // what the floor was added to `mmap` for: userspace holds 0 as a valid
+        // pointer, every syscall null-check answers EFAULT, and the null page
+        // is mapped for the life of the process.
+        let addr = vmar.map_ext_min(
+            vmar_offset,
+            vmo.clone(),
+            0,
+            vmo.len(),
+            MMUFlags::RXW,
+            flags,
+            false,
+            true,
+            false,
+            crate::vm::MMAP_MIN_ADDR,
+        )?;
         // Account on the segment, then record where in the process -- one
         // record per attachment, so a segment attached twice can be
         // detached twice (the old table kept one address per id and lost
@@ -1767,8 +1804,14 @@ mod shmat_place_tests {
     //! chose, and the caller was told so only by the return value).
 
     use super::{shmat_flags_and_place, ShmatPlace, SHMLBA, SHM_RDONLY, SHM_RND};
+    use crate::vm::MMAP_MIN_ADDR;
     use crate::LxError;
     use zircon_object::vm::*;
+
+    /// An address well above `vm.mmap_min_addr`, so a test about placement is
+    /// not also a test about the floor. `8 * SHMLBA` (32 KiB) used to be the
+    /// number here, which is *under* the 64 KiB floor.
+    const OK_BASE: usize = MMAP_MIN_ADDR + 8 * SHMLBA;
 
     /// A read-only attach must come back read-only. This is the correctness --
     /// and security -- fix: a program that attaches `SHM_RDONLY` and then
@@ -1810,7 +1853,7 @@ mod shmat_place_tests {
     /// A page-aligned address without `SHM_RND` is honoured as given.
     #[test]
     fn an_aligned_address_is_placed_there() {
-        let addr = 8 * SHMLBA;
+        let addr = OK_BASE;
         assert_eq!(
             shmat_flags_and_place(0, addr).unwrap().1,
             ShmatPlace::At(addr)
@@ -1822,7 +1865,7 @@ mod shmat_place_tests {
     /// unrelated address -- the opposite of what the caller asked for.
     #[test]
     fn a_misaligned_address_without_rnd_is_einval() {
-        let addr = 8 * SHMLBA + 1;
+        let addr = OK_BASE + 1;
         assert_eq!(shmat_flags_and_place(0, addr), Err(LxError::EINVAL));
     }
 
@@ -1830,7 +1873,7 @@ mod shmat_place_tests {
     /// up: the segment must not start above where the caller pointed.
     #[test]
     fn shm_rnd_rounds_the_address_down() {
-        let below = 8 * SHMLBA;
+        let below = OK_BASE;
         // Anywhere inside the page rounds back to its base.
         for extra in [1, 17, SHMLBA - 1] {
             assert_eq!(
@@ -1853,9 +1896,39 @@ mod shmat_place_tests {
     /// rounded-down address, not one or the other.
     #[test]
     fn rdonly_and_rnd_both_take_effect_together() {
-        let (flags, place) = shmat_flags_and_place(SHM_RDONLY | SHM_RND, 4 * SHMLBA + 3).unwrap();
+        let (flags, place) = shmat_flags_and_place(SHM_RDONLY | SHM_RND, OK_BASE + 3).unwrap();
         assert!(!flags.contains(MMUFlags::WRITE));
-        assert_eq!(place, ShmatPlace::At(4 * SHMLBA));
+        assert_eq!(place, ShmatPlace::At(OK_BASE));
+    }
+
+    /// An attach under `vm.mmap_min_addr` is `EPERM`, and the one that gets
+    /// there by rounding is the dangerous one: `shmat(id, (void *) 1,
+    /// SHM_RND)` used to round to 0 and map the segment over the null page,
+    /// which costs the process its NULL-dereference protection for good.
+    #[test]
+    fn an_attach_under_the_floor_is_refused_even_after_rounding() {
+        for addr in [1, SHMLBA - 1, SHMLBA, MMAP_MIN_ADDR - SHMLBA] {
+            assert_eq!(
+                shmat_flags_and_place(SHM_RND, addr),
+                Err(LxError::EPERM),
+                "{addr:#x} rounds under the floor"
+            );
+        }
+        assert_eq!(
+            shmat_flags_and_place(0, SHMLBA),
+            Err(LxError::EPERM),
+            "an aligned address under the floor is refused too"
+        );
+        // The floor itself is fine, and a null address still means "anywhere"
+        // (the kernel picks, above the floor, in `sys_shmat`).
+        assert_eq!(
+            shmat_flags_and_place(0, MMAP_MIN_ADDR).unwrap().1,
+            ShmatPlace::At(MMAP_MIN_ADDR)
+        );
+        assert_eq!(
+            shmat_flags_and_place(SHM_RND, 0).unwrap().1,
+            ShmatPlace::Anywhere
+        );
     }
 }
 
