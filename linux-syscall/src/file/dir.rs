@@ -18,20 +18,30 @@ use linux_object::error::LxResult;
 use linux_object::fs::vfs::{FileType, INode, Metadata};
 use linux_object::fs::File;
 
+/// `getcwd(2)`, from the path down: the raw syscall returns the LENGTH of
+/// the string it wrote, NUL included (`fs/d_path.c`), and `ERANGE` when
+/// `len` cannot hold it. It used to return the buffer's address, which is
+/// what the glibc wrapper hands back to C, not what the kernel does: Go's
+/// `syscall.Getwd` checks the number against the buffer and gave `EINVAL`.
+pub(crate) fn getcwd_into(cwd: &str, mut buf: UserOutPtr<u8>, len: usize) -> SysResult {
+    let with_nul = cwd.len() + 1;
+    if with_nul > len {
+        return Err(LxError::ERANGE);
+    }
+    buf.write_cstring(cwd)?;
+    Ok(with_nul)
+}
+
 impl Syscall<'_> {
     /// return a null-terminated string containing an absolute pathname
     /// that is the current working directory of the calling process.
     /// - `buf` – pointer to buffer to receive path
     /// - `len` – size of buf
-    pub fn sys_getcwd(&self, mut buf: UserOutPtr<u8>, len: usize) -> SysResult {
+    pub fn sys_getcwd(&self, buf: UserOutPtr<u8>, len: usize) -> SysResult {
         info!("getcwd: buf={:?}, len={:#x}", buf, len);
         let proc = self.linux_process();
         let cwd = proc.current_working_directory();
-        if cwd.len() + 1 > len {
-            return Err(LxError::ERANGE);
-        }
-        buf.write_cstring(&cwd)?;
-        Ok(buf.as_addr())
+        getcwd_into(&cwd, buf, len)
     }
 
     /// Change the current directory.
@@ -563,6 +573,44 @@ pub(crate) fn collect_dirents(
         pushed += 1;
     }
     Ok(pushed)
+}
+
+#[cfg(test)]
+mod getcwd_tests {
+    //! What the raw `getcwd` hands back in `rax`: a length, not an address.
+
+    use super::*;
+
+    fn call(cwd: &str, len: usize) -> (SysResult, [u8; 16]) {
+        let mut buf = [0xaau8; 16];
+        let r = getcwd_into(cwd, UserOutPtr::from(buf.as_mut_ptr() as usize), len);
+        (r, buf)
+    }
+
+    /// The length of the string with its NUL, as `sys_getcwd` returns it.
+    /// Go's `syscall.Getwd` refuses anything else; glibc kept the number in
+    /// an `int`.
+    #[test]
+    fn returns_the_length_with_the_nul_not_the_address() {
+        let (r, buf) = call("/tmp", 16);
+        assert_eq!(r, Ok(5));
+        assert_eq!(&buf[..5], b"/tmp\0");
+        assert_eq!(buf[5], 0xaa, "nothing past the NUL");
+        let (r, buf) = call("/", 16);
+        assert_eq!(r, Ok(2));
+        assert_eq!(&buf[..2], b"/\0");
+    }
+
+    /// A buffer exactly the string's length has no room for the NUL and
+    /// is `ERANGE`, untouched; one byte more fits.
+    #[test]
+    fn a_buffer_without_room_for_the_nul_is_erange() {
+        let (r, buf) = call("/tmp", 4);
+        assert_eq!(r, Err(LxError::ERANGE));
+        assert!(buf.iter().all(|&b| b == 0xaa), "nothing was written");
+        assert_eq!(call("/tmp", 5).0, Ok(5));
+        assert_eq!(call("/tmp", 0).0, Err(LxError::ERANGE));
+    }
 }
 
 #[cfg(test)]

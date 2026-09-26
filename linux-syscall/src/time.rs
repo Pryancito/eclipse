@@ -30,6 +30,46 @@ fn clock_ticks_since_boot(monotonic: Duration) -> usize {
     (monotonic.as_micros() / USEC_PER_TICK as u128) as usize
 }
 
+/// `time(2)`: the seconds since the epoch, in the return value and, when
+/// `tloc` is not NULL, in `*tloc` as well. `time(NULL)` is the usual call
+/// and used to be `EINVAL`: glibc reaches this syscall when the vDSO is
+/// missing, and a raw `syscall(SYS_time, 0)` got -1, the last second of
+/// 1969.
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn time_into(sec: usize, mut tloc: UserOutPtr<u64>) -> SysResult {
+    tloc.write_if_not_null(sec as u64)?;
+    Ok(sec)
+}
+
+#[cfg(all(test, target_arch = "x86_64"))]
+mod time_tloc_tests {
+    //! `time(2)` with and without its out-pointer.
+
+    use super::*;
+
+    /// `time(NULL)` is the usual call: the seconds come back in `rax`
+    /// alone, and no pointer is touched.
+    #[test]
+    fn a_null_tloc_is_not_einval() {
+        assert_eq!(
+            time_into(1_700_000_000, UserOutPtr::from(0)),
+            Ok(1_700_000_000)
+        );
+    }
+
+    /// With a pointer, the same number goes in both places.
+    #[test]
+    fn a_tloc_gets_the_same_seconds_the_call_returns() {
+        let mut out = 0u64;
+        let r = time_into(
+            1_700_000_000,
+            UserOutPtr::from(&mut out as *mut u64 as usize),
+        );
+        assert_eq!(r, Ok(1_700_000_000));
+        assert_eq!(out, 1_700_000_000);
+    }
+}
+
 #[cfg(test)]
 mod times_tests {
     use super::*;
@@ -555,14 +595,9 @@ impl Syscall<'_> {
 
     /// get time in seconds
     #[cfg(target_arch = "x86_64")]
-    pub fn sys_time(&mut self, mut time: UserOutPtr<u64>) -> SysResult {
+    pub fn sys_time(&mut self, time: UserOutPtr<u64>) -> SysResult {
         trace!("time: time: {:?}", time);
-        if time.is_null() {
-            return Err(LxError::EINVAL);
-        }
-        let sec = TimeSpec::now().sec;
-        time.write(sec as u64)?;
-        Ok(sec)
+        time_into(TimeSpec::now().sec, time)
     }
 
     /// JUST FOR TEST, DO NOT USE IT
