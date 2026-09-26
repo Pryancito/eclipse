@@ -168,7 +168,7 @@ impl Syscall<'_> {
             "mmap: addr={:#x}, size={:#x}, prot={:?}, flags={:?}, fd={:?}, offset={:#x}",
             addr, len, prot, flags, fd, offset
         );
-        if len == 0 || len > MAX_MMAP_LEN {
+        if let Err(e) = mmap_len_check(len) {
             // Log oversized requests: the early-return is the one mmap failure
             // path with no other trace, and a silently-rejected giant
             // reservation (e.g. a JIT engine's executable pool) otherwise looks
@@ -186,7 +186,7 @@ impl Syscall<'_> {
                 "mmap: rejecting len={:#x} (cap={:#x}) prot={:?} flags={:?} fd={:?}",
                 len, MAX_MMAP_LEN, prot, flags, fd
             );
-            return Err(LxError::ENOMEM);
+            return Err(e);
         }
         // Linux UAPI: `len` is rounded UP to whole pages by the kernel for
         // mmap/munmap/mprotect; only `addr` must be page-aligned (and only
@@ -965,6 +965,16 @@ impl Syscall<'_> {
             "madvise: addr={:#x}, len={:#x}, advice={}",
             addr, len, advice
         );
+        if UNHONOURED_MADVISE.contains(&advice) {
+            // Loud on purpose: the caller is about to fall back to something
+            // slower (a DRBG that reseeds every call, say), and this line is
+            // the only place that says why.
+            info!(
+                "madvise: advice {} is not honoured by this kernel, refused",
+                advice
+            );
+            return Err(LxError::EINVAL);
+        }
         let Some(len) = madvise_args(addr, len, advice)? else {
             return Ok(0);
         };
@@ -1064,17 +1074,48 @@ fn validate_mmap_offset(
     Ok(offset)
 }
 
-/// `madvise(2)` advice values zCore recognises. All of zCore's target arches
+/// `do_mmap`'s two refusals of a length, in its order: `if (!len) return
+/// -EINVAL;` first, then the size cap (`ENOMEM`, what Linux answers when the
+/// page-aligned length overflows or the address space cannot hold it).
+///
+/// A zero length was `ENOMEM`. A reader that maps a file whole (grep and
+/// ripgrep, ld.so's `_dl_map_segments` probes) meets an empty file, gets
+/// "Cannot allocate memory" instead of `EINVAL`, and the code that takes the
+/// empty-file path on `EINVAL` reports an allocation failure instead.
+fn mmap_len_check(len: usize) -> LxResult<()> {
+    if len == 0 {
+        return Err(LxError::EINVAL);
+    }
+    if len > MAX_MMAP_LEN {
+        return Err(LxError::ENOMEM);
+    }
+    Ok(())
+}
+
+/// `madvise(2)` advice values this kernel accepts. All of zCore's target arches
 /// (x86_64/aarch64/riscv64) share this (asm-generic) numbering:
 ///   0 NORMAL, 1 RANDOM, 2 SEQUENTIAL, 3 WILLNEED, 4 DONTNEED, 8 FREE,
-///   9 REMOVE, 10 DONTFORK, 11 DOFORK, 12 MERGEABLE, 13 UNMERGEABLE,
-///   14 HUGEPAGE, 15 NOHUGEPAGE, 16 DONTDUMP, 17 DODUMP, 18 WIPEONFORK,
-///   19 KEEPONFORK, 20 COLD, 21 PAGEOUT, 100 HWPOISON, 101 SOFT_OFFLINE.
-const KNOWN_MADVISE: &[usize] = &[
-    0, 1, 2, 3, 4, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 100, 101,
-];
+///   12 MERGEABLE, 13 UNMERGEABLE, 14 HUGEPAGE, 15 NOHUGEPAGE, 16 DONTDUMP,
+///   17 DODUMP, 20 COLD, 21 PAGEOUT, 100 HWPOISON, 101 SOFT_OFFLINE.
+/// Each of these is either honoured (4 and 8 discard the pages) or a hint a
+/// kernel may ignore without anyone being able to tell.
+const KNOWN_MADVISE: &[usize] = &[0, 1, 2, 3, 4, 8, 12, 13, 14, 15, 16, 17, 20, 21, 100, 101];
 
-/// Whether `advice` is a `madvise(2)` value zCore recognises. Pure, so the
+/// The advice values Linux knows and this kernel cannot honour, refused with
+/// `EINVAL` exactly as a kernel from before they existed would (`MADV_REMOVE`
+/// 9, `MADV_DONTFORK` 10, `MADV_DOFORK` 11, `MADV_WIPEONFORK` 18,
+/// `MADV_KEEPONFORK` 19). They are not hints: each changes what a `fork` or
+/// the backing store does afterwards, and a caller that hears 0 relies on it.
+///
+/// They were accepted and ignored. BoringSSL and AWS-LC (`fork_detect.c`,
+/// behind rustls' default backend) ask for `MADV_WIPEONFORK` on a page and,
+/// told yes, trust that page to read as zero in a child: here the child kept
+/// it, so parent and child went on producing the same DRBG output after a
+/// fork, and repeated nonces and keys. Told `EINVAL`, as on a kernel older
+/// than 4.14, they fall back to detecting the fork another way.
+const UNHONOURED_MADVISE: &[usize] = &[9, 10, 11, 18, 19];
+
+/// Whether `advice` is a `madvise(2)` value this kernel accepts. Pure, so the
 /// classification is unit-testable independently of the syscall plumbing.
 fn madvise_advice_known(advice: usize) -> bool {
     KNOWN_MADVISE.contains(&advice)
@@ -1713,8 +1754,34 @@ mod madvise_tests {
     #[test]
     fn known_advice_is_accepted() {
         // NORMAL/RANDOM/SEQUENTIAL/WILLNEED/DONTNEED/FREE and a few higher ones.
-        for a in [0usize, 1, 2, 3, 4, 8, 19, 21, 100, 101] {
+        for a in [0usize, 1, 2, 3, 4, 8, 12, 17, 21, 100, 101] {
             assert!(madvise_advice_known(a), "advice {} should be known", a);
+        }
+    }
+
+    /// An advice this kernel cannot honour is refused, not answered 0: a
+    /// `MADV_WIPEONFORK` page that a child would keep is the difference
+    /// between a DRBG that reseeds after `fork` and one that repeats.
+    #[test]
+    fn advice_this_kernel_cannot_honour_is_refused_not_faked() {
+        const MADV_REMOVE: usize = 9;
+        const MADV_DONTFORK: usize = 10;
+        const MADV_DOFORK: usize = 11;
+        const MADV_WIPEONFORK: usize = 18;
+        const MADV_KEEPONFORK: usize = 19;
+        for a in [
+            MADV_REMOVE,
+            MADV_DONTFORK,
+            MADV_DOFORK,
+            MADV_WIPEONFORK,
+            MADV_KEEPONFORK,
+        ] {
+            assert!(!madvise_advice_known(a), "advice {} is faked", a);
+            assert!(super::UNHONOURED_MADVISE.contains(&a));
+        }
+        // And the two lists are disjoint: nothing is both honoured and not.
+        for a in super::UNHONOURED_MADVISE {
+            assert!(!super::KNOWN_MADVISE.contains(a), "{} in both lists", a);
         }
     }
 
@@ -1837,6 +1904,25 @@ mod mmap_file_access_tests {
             mmap_file_access(true, true, OpenFlags::RDWR | OpenFlags::APPEND),
             Ok(())
         );
+    }
+}
+
+#[cfg(test)]
+mod mmap_len_tests {
+    //! `do_mmap`'s answer to a length it will not map.
+
+    use super::*;
+
+    /// Zero is `EINVAL` (the empty file every whole-file reader meets), the
+    /// cap is `ENOMEM`, and everything between maps.
+    #[test]
+    fn a_zero_length_is_einval_and_only_the_cap_is_enomem() {
+        assert_eq!(mmap_len_check(0), Err(LxError::EINVAL));
+        assert_eq!(mmap_len_check(1), Ok(()));
+        assert_eq!(mmap_len_check(PAGE_SIZE), Ok(()));
+        assert_eq!(mmap_len_check(MAX_MMAP_LEN), Ok(()));
+        assert_eq!(mmap_len_check(MAX_MMAP_LEN + 1), Err(LxError::ENOMEM));
+        assert_eq!(mmap_len_check(usize::MAX), Err(LxError::ENOMEM));
     }
 }
 
