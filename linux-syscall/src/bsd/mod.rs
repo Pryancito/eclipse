@@ -154,7 +154,25 @@ impl Syscall<'_> {
             sys::FTRUNCATE => BsdRet::from_result(self.sys_ftruncate(a0.into(), a1)),
             sys::DUP => BsdRet::from_result(self.sys_dup(a0.into())),
             sys::DUP2 => BsdRet::from_result(self.sys_dup2(a0.into(), a1)),
-            sys::FCNTL => BsdRet::from_result(self.sys_fcntl(a0.into(), a1, a2).await),
+            // The command numbers and the `F_SETFL`/`F_GETFL` flag words
+            // differ from Linux's past the five lowest commands; see
+            // `translate::fcntl_to_linux`.
+            sys::FCNTL => match translate::fcntl_to_linux(a1, a2) {
+                Err(e) => BsdRet::from_lx(e),
+                Ok(translate::Fcntl::Dup2 { target, cloexec }) => BsdRet::from_result(if cloexec {
+                    self.sys_dup3(a0.into(), target, 0o2000000)
+                } else {
+                    self.sys_dup2(a0.into(), target)
+                }),
+                Ok(translate::Fcntl::Linux { cmd, arg }) => {
+                    let r = self.sys_fcntl(a0.into(), cmd, arg).await;
+                    BsdRet::from_result(if cmd == consts::lin_fcntl::F_GETFL {
+                        r.map(|fl| translate::open_flags_from_linux(fl as i32) as u32 as usize)
+                    } else {
+                        r
+                    })
+                }
+            },
             sys::FLOCK => BsdRet::from_result(self.sys_flock(a0.into(), a1)),
             sys::GETCWD => BsdRet::from_result(self.sys_getcwd(a0.into(), a1)),
             sys::FCHDIR => BsdRet::from_result(self.sys_fchdir(a0.into())),
@@ -260,9 +278,15 @@ impl Syscall<'_> {
             sys::KILL => BsdRet::from_result(self.sys_kill(a0 as isize, a1)),
             sys::FORK => BsdRet::from_result(self.sys_fork(0, 0)),
             sys::VFORK => BsdRet::from_result(self.sys_vfork(0, 0).await),
-            sys::WAIT4 => {
-                BsdRet::from_result(self.sys_wait4(a0 as _, a1.into(), a2 as _, a3.into()).await)
-            }
+            // The option bits past `WNOHANG | WUNTRACED` are on different
+            // positions from Linux's; see `translate::wait_options_to_linux`.
+            sys::WAIT4 => match translate::wait_options_to_linux(a2 as i32) {
+                Err(e) => BsdRet::from_lx(e),
+                Ok(options) => BsdRet::from_result(
+                    self.sys_wait4(a0 as _, a1.into(), options as u32, a3.into())
+                        .await,
+                ),
+            },
             sys::EXECVE => BsdRet::from_result(self.sys_execve(a0.into(), a1.into(), a2.into())),
             sys::EXIT => BsdRet::from_result(self.sys_exit(a0 as _)),
             sys::THR_EXIT => BsdRet::from_result(self.sys_exit(0)),
@@ -381,15 +405,14 @@ impl Syscall<'_> {
             Err(e) => return BsdRet::err(errno::lx_to_freebsd(e)),
         }
         let mut writer = fs::BsdDirentWriter::new(nbytes.min(256 * 1024));
-        loop {
-            let (meta, name) = match file.read_entry_with_metadata() {
-                Ok(v) => v,
-                Err(LxError::ENOENT) => break,
-                Err(e) => return BsdRet::err(errno::lx_to_freebsd(e)),
-            };
-            if !writer.try_push(meta.inode as u64, fs::dirent_type(meta.type_), &name) {
-                break;
-            }
+        // The entry that does not fit goes back to the directory position
+        // instead of being lost; see `collect_dirents`.
+        let mut file = file;
+        let collected = crate::file::collect_dirents(&mut file, |meta, name| {
+            writer.try_push(meta.inode as u64, fs::dirent_type(meta.type_), name)
+        });
+        if let Err(e) = collected {
+            return BsdRet::err(errno::lx_to_freebsd(e));
         }
         if let Err(e) = buf.write_array(writer.as_slice()) {
             return BsdRet::err(errno::lx_to_freebsd(LxError::from(e)));

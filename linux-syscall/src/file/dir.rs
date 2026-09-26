@@ -11,9 +11,12 @@
 //! - readlink(at)
 
 use super::*;
+use alloc::string::String;
 use bitflags::bitflags;
 use kernel_hal::user::UserOutPtr;
-use linux_object::fs::vfs::FileType;
+use linux_object::error::LxResult;
+use linux_object::fs::vfs::{FileType, Metadata};
+use linux_object::fs::File;
 
 impl Syscall<'_> {
     /// return a null-terminated string containing an absolute pathname
@@ -167,20 +170,10 @@ impl Syscall<'_> {
         let cap_size = buf_size.min(256 * 1024);
         let mut kbuf = vec![0; cap_size];
         let mut writer = DirentBufWriter::new(&mut kbuf);
-        loop {
-            let (metadata, name) = match file.read_entry_with_metadata() {
-                Err(LxError::ENOENT) => break,
-                r => r,
-            }?;
-            let ok = writer.try_write(
-                metadata.inode as u64,
-                DirentType::from(metadata.type_).bits(),
-                &name,
-            );
-            if !ok {
-                break;
-            }
-        }
+        let mut file = file;
+        collect_dirents(&mut file, |meta, name| {
+            writer.try_write(meta.inode as u64, DirentType::from(meta.type_).bits(), name)
+        })?;
         buf.write_array(writer.as_slice())?;
         Ok(writer.written_size)
     }
@@ -434,6 +427,177 @@ impl Syscall<'_> {
     /// create a symbolic link
     pub fn sys_symlink(&self, target: UserInPtr<u8>, linkpath: UserInPtr<u8>) -> SysResult {
         self.sys_symlinkat(target, FileDesc::CWD, linkpath)
+    }
+}
+
+/// A directory position that can be read one entry at a time and, when the
+/// entry just read turns out not to fit, told to hand it back.
+///
+/// `getdents64` and FreeBSD's `getdirentries` both read an entry *before*
+/// they know whether its record fits in what is left of the caller's buffer.
+/// Both used to drop the one that did not: consumed from the directory
+/// position, written nowhere, absent from every later call. A listing that
+/// took more than one buffer lost one name per buffer, and glibc's `readdir`
+/// asks in 32 KiB pieces, so any directory past a few hundred entries came
+/// out short in `ls`, `find`, `rm -r` and everything built on them.
+pub(crate) trait DirEntries {
+    /// The next entry, or `None` at the end of the directory.
+    fn next_entry(&mut self) -> LxResult<Option<(Metadata, String)>>;
+    /// Hand back the entry `next_entry` just returned.
+    fn unread_entry(&mut self);
+}
+
+impl DirEntries for Arc<File> {
+    fn next_entry(&mut self) -> LxResult<Option<(Metadata, String)>> {
+        match self.read_entry_with_metadata() {
+            Ok(entry) => Ok(Some(entry)),
+            Err(LxError::ENOENT) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    fn unread_entry(&mut self) {
+        File::unread_entry(self);
+    }
+}
+
+/// Feed directory entries to `push` until it refuses one or the directory
+/// ends. `push` returns whether the entry fitted; the one it refuses is
+/// handed back to `src`, so the next call starts with it.
+///
+/// Returns how many entries were pushed. Refusing the very first one is
+/// `EINVAL`, as Linux answers a buffer too small to hold a single record
+/// (`filldir64`: `if (reclen > buf->count) return -EINVAL`): the caller
+/// would otherwise take an empty answer for the end of the directory.
+pub(crate) fn collect_dirents(
+    src: &mut impl DirEntries,
+    mut push: impl FnMut(&Metadata, &str) -> bool,
+) -> LxResult<usize> {
+    let mut pushed = 0;
+    while let Some((meta, name)) = src.next_entry()? {
+        if !push(&meta, &name) {
+            src.unread_entry();
+            if pushed == 0 {
+                return Err(LxError::EINVAL);
+            }
+            break;
+        }
+        pushed += 1;
+    }
+    Ok(pushed)
+}
+
+#[cfg(test)]
+mod dirent_collection_tests {
+    use super::*;
+    use alloc::vec::Vec;
+    use linux_object::fs::vfs::Timespec;
+
+    /// A directory that hands out the names it was given, once each, and
+    /// remembers its position like a `File` does.
+    struct Names {
+        names: Vec<&'static str>,
+        pos: usize,
+    }
+
+    fn entry(ino: usize) -> Metadata {
+        Metadata {
+            dev: 0,
+            inode: ino,
+            size: 0,
+            blk_size: 0,
+            blocks: 0,
+            atime: Timespec { sec: 0, nsec: 0 },
+            mtime: Timespec { sec: 0, nsec: 0 },
+            ctime: Timespec { sec: 0, nsec: 0 },
+            type_: FileType::File,
+            mode: 0o644,
+            nlinks: 1,
+            uid: 0,
+            gid: 0,
+            rdev: 0,
+        }
+    }
+
+    impl DirEntries for Names {
+        fn next_entry(&mut self) -> LxResult<Option<(Metadata, String)>> {
+            let name = match self.names.get(self.pos) {
+                Some(n) => *n,
+                None => return Ok(None),
+            };
+            self.pos += 1;
+            Ok(Some((entry(self.pos), String::from(name))))
+        }
+
+        fn unread_entry(&mut self) {
+            self.pos -= 1;
+        }
+    }
+
+    /// Collect with room for `room` entries per call.
+    fn call(src: &mut Names, room: usize) -> LxResult<Vec<String>> {
+        let mut got = Vec::new();
+        collect_dirents(src, |_, name| {
+            if got.len() == room {
+                return false;
+            }
+            got.push(String::from(name));
+            true
+        })?;
+        Ok(got)
+    }
+
+    #[test]
+    fn an_entry_that_does_not_fit_comes_out_on_the_next_call() {
+        let mut dir = Names {
+            names: vec!["a", "b", "c", "d", "e"],
+            pos: 0,
+        };
+        // Two per call: the third entry is read, refused, and must not be lost.
+        assert_eq!(call(&mut dir, 2).unwrap(), ["a", "b"]);
+        assert_eq!(call(&mut dir, 2).unwrap(), ["c", "d"]);
+        assert_eq!(call(&mut dir, 2).unwrap(), ["e"]);
+        // The end of the directory is an empty answer, not an error.
+        assert_eq!(call(&mut dir, 2).unwrap(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn the_count_is_what_was_pushed() {
+        let mut dir = Names {
+            names: vec!["a", "b", "c"],
+            pos: 0,
+        };
+        let mut seen = 0;
+        let n = collect_dirents(&mut dir, |_, _| {
+            seen += 1;
+            seen <= 2
+        })
+        .unwrap();
+        assert_eq!(n, 2);
+        assert_eq!(dir.pos, 2, "the refused entry is back in the directory");
+    }
+
+    #[test]
+    fn a_buffer_too_small_for_one_entry_is_einval_and_keeps_the_entry() {
+        let mut dir = Names {
+            names: vec!["a", "b"],
+            pos: 0,
+        };
+        assert_eq!(call(&mut dir, 0), Err(LxError::EINVAL));
+        // Nothing was consumed: a bigger buffer starts where it should.
+        assert_eq!(call(&mut dir, 8).unwrap(), ["a", "b"]);
+    }
+
+    #[test]
+    fn an_error_from_the_directory_comes_through() {
+        struct Broken;
+        impl DirEntries for Broken {
+            fn next_entry(&mut self) -> LxResult<Option<(Metadata, String)>> {
+                Err(LxError::EIO)
+            }
+            fn unread_entry(&mut self) {}
+        }
+        assert_eq!(collect_dirents(&mut Broken, |_, _| true), Err(LxError::EIO));
     }
 }
 

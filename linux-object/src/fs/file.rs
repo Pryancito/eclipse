@@ -741,6 +741,19 @@ impl File {
         Ok(self.read_entry_with_metadata()?.1)
     }
 
+    /// Hand back the entry [`read_entry_with_metadata`](Self::read_entry_with_metadata)
+    /// just returned, so the next read yields it again.
+    ///
+    /// `getdents64` reads an entry before it knows whether the record fits
+    /// in what is left of the caller's buffer, and the one that did not fit
+    /// used to be gone for good: consumed from the directory position, never
+    /// written out, absent from every later call. A listing that took more
+    /// than one buffer lost one name per buffer.
+    pub fn unread_entry(&self) {
+        let mut inner = self.inner.write();
+        inner.offset = inner.offset.saturating_sub(1);
+    }
+
     /// get the next directory entry and its metadata
     pub fn read_entry_with_metadata(&self) -> LxResult<(Metadata, String)> {
         let mut inner = self.inner.write();
@@ -1204,6 +1217,45 @@ mod seek_tests {
             inode.write_at(0, &alloc::vec![0u8; len]).unwrap();
         }
         File::new(inode, OpenFlags::RDWR, String::from("/f"))
+    }
+
+    /// A directory with `names` in it, open for reading.
+    fn dir(names: &[&str]) -> Arc<File> {
+        let fs = RamFS::new();
+        let root = fs.root_inode();
+        for name in names {
+            root.create(name, FileType::File, 0o644).unwrap();
+        }
+        File::new(root, OpenFlags::RDONLY, String::from("/"))
+    }
+
+    #[test]
+    fn an_unread_entry_comes_out_again() {
+        let d = dir(&["a", "b", "c"]);
+        let first = d.read_entry().unwrap();
+        let second = d.read_entry().unwrap();
+        let third = d.read_entry().unwrap();
+        d.unread_entry();
+        assert_eq!(d.read_entry().unwrap(), third);
+        d.unread_entry();
+        d.unread_entry();
+        assert_eq!(d.read_entry().unwrap(), second);
+        // Reading on from there is the rest of the directory, once each.
+        let mut rest = alloc::vec![d.read_entry().unwrap()];
+        while let Ok(name) = d.read_entry() {
+            rest.push(name);
+        }
+        assert_eq!(rest.len() + 2, 5, "\".\", \"..\", a, b and c: {:?}", rest);
+        assert!(!rest.contains(&first) && !rest.contains(&second));
+    }
+
+    #[test]
+    fn unreading_at_the_start_stays_at_the_start() {
+        let d = dir(&["a"]);
+        let first = d.read_entry().unwrap();
+        d.unread_entry();
+        d.unread_entry();
+        assert_eq!(d.read_entry().unwrap(), first);
     }
 
     #[test]

@@ -33,7 +33,7 @@
 //! tests at the bottom parse every bit this module can produce back through
 //! those two types and demand that it survives.
 
-use super::consts::{lin_mman, lin_oflags, mman, oflags};
+use super::consts::{fcntl, lin_fcntl, lin_mman, lin_oflags, lin_wait, mman, oflags, wait};
 use linux_object::error::{LxError, LxResult};
 
 /// The only page size this kernel maps with, as a shift.
@@ -259,6 +259,143 @@ pub fn mmap_flags_to_linux(bsd: i32) -> LxResult<i32> {
     }
 
     Ok(out | excl)
+}
+
+/// The status flags `F_SETFL` may change and `F_GETFL` reports, in both
+/// spellings. `kern_fcntl` masks its argument to these and ignores the rest,
+/// so an `F_SETFL` word is never refused for a bit outside them.
+const STATUS_MAP: &[(i32, i32)] = &[
+    (oflags::O_NONBLOCK, lin_oflags::O_NONBLOCK),
+    (oflags::O_APPEND, lin_oflags::O_APPEND),
+    (oflags::O_ASYNC, lin_oflags::O_ASYNC),
+    (oflags::O_FSYNC, lin_oflags::O_SYNC),
+    (oflags::O_DIRECT, lin_oflags::O_DIRECT),
+    (oflags::O_DSYNC, lin_oflags::O_DSYNC),
+];
+
+/// The `F_SETFL` argument of a FreeBSD program, in Linux's spelling.
+///
+/// It used to go through untouched, and the two systems put the flags this
+/// command exists for on different bits: FreeBSD's `O_NONBLOCK` is `0x4`,
+/// which Linux does not use, so `fcntl(fd, F_SETFL, O_NONBLOCK)` from a
+/// FreeBSD binary left the descriptor blocking and answered 0.
+pub fn setfl_flags_to_linux(bsd: i32) -> i32 {
+    STATUS_MAP
+        .iter()
+        .filter(|(from, _)| bsd & from != 0)
+        .fold(0, |out, (_, to)| out | to)
+}
+
+/// The word `F_GETFL` hands a FreeBSD program: the access mode, and the
+/// status flags in FreeBSD's spelling.
+///
+/// A Linux answer read with FreeBSD's headers was a lie bit for bit: Linux
+/// `O_APPEND` (`0x400`) is FreeBSD's `O_TRUNC`, and Linux `O_NONBLOCK`
+/// (`0x800`) is FreeBSD's `O_EXCL`, so a program asking whether its socket
+/// was non-blocking was told about flags that do not exist on an open file.
+/// A Linux bit with no peer here is dropped: FreeBSD's headers cannot name it.
+pub fn open_flags_from_linux(lin: i32) -> i32 {
+    let mut out = lin & oflags::O_ACCMODE;
+    for &(bsd, l) in STATUS_MAP {
+        // Linux `O_SYNC` is two bits, one of them `O_DSYNC`; FreeBSD reports
+        // the strong one as `O_FSYNC` alone.
+        if l == lin_oflags::O_DSYNC && lin & lin_oflags::O_SYNC == lin_oflags::O_SYNC {
+            continue;
+        }
+        if lin & l == l {
+            out |= bsd;
+        }
+    }
+    out
+}
+
+/// What a FreeBSD `fcntl(2)` becomes here.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Fcntl {
+    /// The command in Linux's numbering, with its argument in Linux's
+    /// spelling.
+    Linux {
+        /// A `lin_fcntl` command.
+        cmd: usize,
+        /// Its argument.
+        arg: usize,
+    },
+    /// `F_DUP2FD` and `F_DUP2FD_CLOEXEC`: `dup2` and `dup3` by another name.
+    Dup2 {
+        /// The descriptor to land on.
+        target: usize,
+        /// Whether the new descriptor is close-on-exec.
+        cloexec: bool,
+    },
+}
+
+/// Translate a FreeBSD `fcntl(2)` command and argument.
+///
+/// The commands used to go through with their FreeBSD numbers: the five
+/// lowest happen to agree with Linux, and past them `F_DUPFD_CLOEXEC` (17)
+/// landed on Linux's `F_SETLEASE`, `F_DUP2FD` (10) on `F_SETSIG`, and the
+/// record locks (11-13) on `F_GETSIG`/`F_SETSIG`/nothing, all of which this
+/// kernel refuses with `EINVAL`. `F_SETFL` went through with FreeBSD's flag
+/// bits (see [`setfl_flags_to_linux`]).
+///
+/// The record locks are still `EINVAL`: FreeBSD's `struct flock` lays its
+/// fields out differently from Linux's (`l_start` first, `l_type` fifth), so
+/// passing the pointer through would read a lock request that was never
+/// made.
+pub fn fcntl_to_linux(cmd: usize, arg: usize) -> LxResult<Fcntl> {
+    let linux = |cmd, arg| Ok(Fcntl::Linux { cmd, arg });
+    match cmd {
+        fcntl::F_DUPFD => linux(lin_fcntl::F_DUPFD, arg),
+        fcntl::F_GETFD => linux(lin_fcntl::F_GETFD, arg),
+        // `FD_CLOEXEC` is 1 on both.
+        fcntl::F_SETFD => linux(lin_fcntl::F_SETFD, arg),
+        fcntl::F_GETFL => linux(lin_fcntl::F_GETFL, arg),
+        fcntl::F_SETFL => linux(
+            lin_fcntl::F_SETFL,
+            setfl_flags_to_linux(arg as i32) as u32 as usize,
+        ),
+        fcntl::F_GETOWN => linux(lin_fcntl::F_GETOWN, arg),
+        fcntl::F_SETOWN => linux(lin_fcntl::F_SETOWN, arg),
+        fcntl::F_DUPFD_CLOEXEC => linux(lin_fcntl::F_DUPFD_CLOEXEC, arg),
+        // The seal bits (`F_SEAL_SEAL`, `_SHRINK`, `_GROW`, `_WRITE`) are the
+        // same four on both.
+        fcntl::F_ADD_SEALS => linux(lin_fcntl::F_ADD_SEALS, arg),
+        fcntl::F_GET_SEALS => linux(lin_fcntl::F_GET_SEALS, arg),
+        fcntl::F_DUP2FD => Ok(Fcntl::Dup2 {
+            target: arg,
+            cloexec: false,
+        }),
+        fcntl::F_DUP2FD_CLOEXEC => Ok(Fcntl::Dup2 {
+            target: arg,
+            cloexec: true,
+        }),
+        _ => Err(LxError::EINVAL),
+    }
+}
+
+/// FreeBSD `wait4(2)` option bits and their Linux peers.
+const WAIT_MAP: &[(i32, i32)] = &[
+    (wait::WNOHANG, lin_wait::WNOHANG),
+    (wait::WUNTRACED, lin_wait::WUNTRACED),
+    (wait::WCONTINUED, lin_wait::WCONTINUED),
+    (wait::WNOWAIT, lin_wait::WNOWAIT),
+    (wait::WLINUXCLONE, lin_wait::WCLONE),
+];
+
+/// `wait4` reports exits and traps whether or not it is asked to, on both
+/// systems; Linux spells that by refusing `WEXITED` on `wait4` (it belongs
+/// to `waitid`), FreeBSD by accepting it as the default it already is.
+const WAIT_IGNORED: i32 = wait::WEXITED | wait::WTRAPPED;
+
+/// Translate the options word of a FreeBSD `wait4(2)`.
+///
+/// It used to go through untouched, and past the two lowest bits the two
+/// systems disagree: FreeBSD's `WCONTINUED` (4) is Linux's `WEXITED`, which
+/// `wait4` refuses, so a FreeBSD shell asking to hear about resumed jobs
+/// got `EINVAL`; and FreeBSD's `WNOWAIT` (8) is Linux's `WCONTINUED`, so a
+/// program asking to look without reaping reaped.
+pub fn wait_options_to_linux(bsd: i32) -> LxResult<i32> {
+    sift(bsd, WAIT_MAP, WAIT_IGNORED, 0)
 }
 
 #[cfg(test)]
@@ -570,5 +707,93 @@ mod tests {
             produced & !kept,
             produced
         );
+    }
+
+    #[test]
+    fn setfl_puts_nonblock_and_append_on_linux_bits() {
+        assert_eq!(
+            setfl_flags_to_linux(oflags::O_NONBLOCK),
+            lin_oflags::O_NONBLOCK
+        );
+        assert_eq!(setfl_flags_to_linux(oflags::O_APPEND), lin_oflags::O_APPEND);
+        assert_eq!(setfl_flags_to_linux(oflags::O_FSYNC), lin_oflags::O_SYNC);
+        // Bits `F_SETFL` does not change are dropped, not refused.
+        assert_eq!(setfl_flags_to_linux(oflags::O_CREAT | oflags::O_RDWR), 0);
+    }
+
+    #[test]
+    fn getfl_reads_back_in_freebsd_spelling() {
+        let lin = lin_oflags::O_RDWR | lin_oflags::O_NONBLOCK | lin_oflags::O_APPEND;
+        assert_eq!(
+            open_flags_from_linux(lin),
+            oflags::O_RDWR | oflags::O_NONBLOCK | oflags::O_APPEND
+        );
+        assert_eq!(open_flags_from_linux(lin_oflags::O_SYNC), oflags::O_FSYNC);
+        assert_eq!(open_flags_from_linux(lin_oflags::O_DSYNC), oflags::O_DSYNC);
+        // A Linux bit FreeBSD's headers cannot name is not handed over.
+        assert_eq!(
+            open_flags_from_linux(lin_oflags::O_CLOEXEC | lin_oflags::O_WRONLY),
+            oflags::O_WRONLY
+        );
+        // And the pair are inverses over the status flags.
+        let bsd = oflags::O_NONBLOCK | oflags::O_ASYNC | oflags::O_DIRECT;
+        assert_eq!(open_flags_from_linux(setfl_flags_to_linux(bsd)), bsd);
+    }
+
+    #[test]
+    fn fcntl_commands_land_on_their_linux_numbers() {
+        let lin = |cmd, arg| Fcntl::Linux { cmd, arg };
+        assert_eq!(fcntl_to_linux(fcntl::F_GETFD, 0), Ok(lin(1, 0)));
+        assert_eq!(
+            fcntl_to_linux(fcntl::F_DUPFD_CLOEXEC, 10),
+            Ok(lin(lin_fcntl::F_DUPFD_CLOEXEC, 10))
+        );
+        assert_eq!(
+            fcntl_to_linux(fcntl::F_GETOWN, 0),
+            Ok(lin(lin_fcntl::F_GETOWN, 0))
+        );
+        assert_eq!(
+            fcntl_to_linux(fcntl::F_SETFL, oflags::O_NONBLOCK as usize),
+            Ok(lin(lin_fcntl::F_SETFL, lin_oflags::O_NONBLOCK as usize))
+        );
+        assert_eq!(
+            fcntl_to_linux(fcntl::F_DUP2FD, 7),
+            Ok(Fcntl::Dup2 {
+                target: 7,
+                cloexec: false
+            })
+        );
+        assert_eq!(
+            fcntl_to_linux(fcntl::F_DUP2FD_CLOEXEC, 7),
+            Ok(Fcntl::Dup2 {
+                target: 7,
+                cloexec: true
+            })
+        );
+        // Record locks and anything unknown are EINVAL, as FreeBSD answers
+        // for a command it does not have.
+        assert_eq!(fcntl_to_linux(fcntl::F_SETLK, 0), Err(LxError::EINVAL));
+        assert_eq!(fcntl_to_linux(99, 0), Err(LxError::EINVAL));
+    }
+
+    #[test]
+    fn wait_options_move_to_their_linux_bits() {
+        assert_eq!(wait_options_to_linux(0), Ok(0));
+        assert_eq!(
+            wait_options_to_linux(wait::WNOHANG | wait::WUNTRACED),
+            Ok(lin_wait::WNOHANG | lin_wait::WUNTRACED)
+        );
+        assert_eq!(
+            wait_options_to_linux(wait::WCONTINUED),
+            Ok(lin_wait::WCONTINUED)
+        );
+        assert_eq!(wait_options_to_linux(wait::WNOWAIT), Ok(lin_wait::WNOWAIT));
+        // The default interests are accepted and add nothing.
+        assert_eq!(wait_options_to_linux(wait::WEXITED | wait::WTRAPPED), Ok(0));
+        assert_eq!(
+            wait_options_to_linux(wait::WLINUXCLONE),
+            Ok(lin_wait::WCLONE)
+        );
+        assert_eq!(wait_options_to_linux(0x40), Err(LxError::EINVAL));
     }
 }

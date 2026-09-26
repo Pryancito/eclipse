@@ -468,3 +468,70 @@ pub const OSTYPE: &str = "FreeBSD";
 
 /// `HW_MACHINE` / `HW_MACHINE_ARCH` for amd64.
 pub const MACHINE: &str = "amd64";
+
+/// FreeBSD `fcntl(2)` commands (`sys/sys/fcntl.h`). The first five agree with
+/// Linux; past them the two systems number their commands differently, and
+/// three of FreeBSD's (`F_DUP2FD*`) are `dup2`/`dup3` by another name.
+pub mod fcntl {
+    pub const F_DUPFD: usize = 0;
+    pub const F_GETFD: usize = 1;
+    pub const F_SETFD: usize = 2;
+    pub const F_GETFL: usize = 3;
+    pub const F_SETFL: usize = 4;
+    pub const F_GETOWN: usize = 5;
+    pub const F_SETOWN: usize = 6;
+    pub const F_OGETLK: usize = 7;
+    pub const F_OSETLK: usize = 8;
+    pub const F_OSETLKW: usize = 9;
+    pub const F_DUP2FD: usize = 10;
+    pub const F_GETLK: usize = 11;
+    pub const F_SETLK: usize = 12;
+    pub const F_SETLKW: usize = 13;
+    pub const F_SETLK_REMOTE: usize = 14;
+    pub const F_READAHEAD: usize = 15;
+    pub const F_RDAHEAD: usize = 16;
+    pub const F_DUPFD_CLOEXEC: usize = 17;
+    pub const F_DUP2FD_CLOEXEC: usize = 18;
+    pub const F_ADD_SEALS: usize = 19;
+    pub const F_GET_SEALS: usize = 20;
+}
+
+/// Linux `fcntl(2)` commands (`include/uapi/asm-generic/fcntl.h`), the
+/// target side of [`super::translate::fcntl_to_linux`].
+pub mod lin_fcntl {
+    pub const F_DUPFD: usize = 0;
+    pub const F_GETFD: usize = 1;
+    pub const F_SETFD: usize = 2;
+    pub const F_GETFL: usize = 3;
+    pub const F_SETFL: usize = 4;
+    pub const F_SETOWN: usize = 8;
+    pub const F_GETOWN: usize = 9;
+    pub const F_DUPFD_CLOEXEC: usize = 1030;
+    pub const F_ADD_SEALS: usize = 1033;
+    pub const F_GET_SEALS: usize = 1034;
+}
+
+/// FreeBSD `wait4(2)` options (`sys/sys/wait.h`). Only `WNOHANG` and
+/// `WUNTRACED` sit on the same bits as Linux.
+pub mod wait {
+    pub const WNOHANG: i32 = 1;
+    pub const WUNTRACED: i32 = 2;
+    pub const WCONTINUED: i32 = 4;
+    pub const WNOWAIT: i32 = 8;
+    pub const WEXITED: i32 = 16;
+    pub const WTRAPPED: i32 = 32;
+    /// `0x8000_0000`: wait for a child created with the Linux `clone`
+    /// emulation. The same bit is Linux's `__WCLONE`.
+    pub const WLINUXCLONE: i32 = i32::MIN;
+}
+
+/// Linux `wait4(2)` options (`include/uapi/linux/wait.h`).
+pub mod lin_wait {
+    pub const WNOHANG: i32 = 1;
+    pub const WUNTRACED: i32 = 2;
+    pub const WEXITED: i32 = 4;
+    pub const WCONTINUED: i32 = 8;
+    pub const WNOWAIT: i32 = 0x0100_0000;
+    /// `0x8000_0000`, the same bit as FreeBSD's `WLINUXCLONE`.
+    pub const WCLONE: i32 = i32::MIN;
+}
