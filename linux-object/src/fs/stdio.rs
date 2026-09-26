@@ -466,10 +466,19 @@ fn tty_ioctl(vt: usize, cmd: u32, data: usize) -> Result<usize> {
             sin.eventbus.lock().clear(Event::READABLE);
             Ok(0)
         }
-        // Argument is by value: TCIFLUSH=0, TCOFLUSH=1, TCIOFLUSH=2.
+        // Argument is by value: TCIFLUSH=0, TCOFLUSH=1, TCIOFLUSH=2. A fourth
+        // value is `EINVAL` (`tty_perform_flush`'s `default:`), which is worth
+        // saying out loud rather than answering 0: a caller that got the
+        // selector wrong -- and it is easy to get wrong, since `tcflush(3)`
+        // takes it as its own argument and the ioctl takes it by value --
+        // otherwise believed the queue had been thrown away.
         TCFLSH => {
             const TCIFLUSH: usize = 0;
+            const TCOFLUSH: usize = 1;
             const TCIOFLUSH: usize = 2;
+            if !matches!(data, TCIFLUSH | TCOFLUSH | TCIOFLUSH) {
+                return Err(FsError::InvalidParam);
+            }
             if data == TCIFLUSH || data == TCIOFLUSH {
                 let sin = vt_stdin(vt);
                 sin.buf.lock().clear();
