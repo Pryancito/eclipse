@@ -170,7 +170,7 @@ mod tests {
         let mut set = BankedEnables::new();
         assert_eq!(set.mask(), 0, "a core that enabled nothing writes nothing");
         assert!(set.record(TIMER_PPI));
-        assert!(set.record(UART_SPI) == false, "an SPI is not replayed");
+        assert!(!set.record(UART_SPI), "an SPI is not replayed");
         assert!(set.record(IPI_SGI));
         assert_eq!(set.mask(), (1 << TIMER_PPI) | (1 << IPI_SGI));
         assert!(set.contains(TIMER_PPI) && set.contains(IPI_SGI));

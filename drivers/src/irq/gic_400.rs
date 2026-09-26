@@ -2,7 +2,7 @@ use crate::prelude::IrqHandler;
 use crate::scheme::{IrqScheme, Scheme};
 use crate::sync::Mutex;
 use crate::utils::gic_banked::{bitmap_slot, BankedEnables};
-use crate::utils::IrqManager;
+use crate::utils::{run_irq_handler, IrqManager};
 use crate::DeviceResult;
 use core::sync::atomic::{AtomicU32, Ordering};
 
@@ -207,7 +207,26 @@ impl Scheme for IntController {
             // see `pending_irq`. For everything but an SGI the two are equal,
             // so a caller passing a bare id (every caller but the aarch64 trap
             // entry) is unaffected.
-            self.manager.lock().handle(irq_num & 0x3ff).ok();
+            let id = irq_num & 0x3ff;
+            // CRITICAL: clone the handler out under the lock, then RELEASE the
+            // lock before running it. This used to be one call through the
+            // guard, which meant the handler ran with `self.manager` -- the one
+            // lock every core needs to register or look up a handler -- held by
+            // its own stack frame. A handler that registers or unregisters an
+            // interrupt from inside itself then deadlocked the core, and every
+            // other core's next interrupt piled up behind it.
+            //
+            // The x86 path fixed exactly this and wrote down why
+            // (`x86_apic::handle_irq`: "a self-deadlock that pinned the CPU
+            // ... and froze every other core. This never reproduced under 2
+            // emulated CPUs"); this driver and the PLIC were still doing it.
+            // Holding it across the handler also serialised every core's
+            // interrupt dispatch on one lock for the whole duration of every
+            // handler.
+            let handler = self.manager.lock().get(id);
+            if run_irq_handler(id, handler).is_err() {
+                trace!("no registered handler for IRQ {}", id);
+            }
         }
         self.irq_eoi(irq_num as u32);
     }
@@ -229,14 +248,21 @@ impl IrqScheme for IntController {
     }
 
     fn register_handler(&self, irq_num: usize, handler: IrqHandler) -> DeviceResult {
+        // Two things, both about telling the caller the truth.
+        //
+        // The error was `.ok()`-ed and `Ok(())` returned whatever happened, so a
+        // driver could not tell a handler that was installed from one that was
+        // not: an id outside the distributor's range, or one another driver
+        // already owns, came back as success with nothing registered and the
+        // device's interrupts arriving at no one.
+        //
+        // And `register_fixed_handler`, because this controller's ids start at
+        // zero: SGI 0 is the TLB-shootdown interrupt, and the other entry point
+        // reads a zero as "allocate one".
         self.manager
             .lock()
-            .register_handler(irq_num, handler)
-            .map_err(|irq_num| {
-                trace!("Unknown irq_num: {:?}", irq_num);
-            })
-            .ok();
-        Ok(())
+            .register_fixed_handler(irq_num, handler)
+            .map(|_| ())
     }
 
     fn unregister(&self, _irq_num: usize) -> DeviceResult {
@@ -282,6 +308,8 @@ pub fn get_irq_num(gicc_base: usize, gicd_base: usize) -> usize {
 mod tests {
     use super::*;
     use alloc::boxed::Box;
+    use alloc::sync::Arc;
+    use core::sync::atomic::AtomicUsize;
 
     /// A distributor and a CPU interface backed by host memory. The driver
     /// reaches both through volatile `u32` accesses at an offset from a base
@@ -453,5 +481,154 @@ mod tests {
         gic.as_a_fresh_core_sees_it();
         ctrl.init_hart();
         assert_eq!(gic.isenabler0(), 1 << TIMER_PPI);
+    }
+
+    #[test]
+    fn a_handler_runs_with_the_dispatch_table_unlocked() {
+        // `self.manager` is the one lock every core needs to look up or register
+        // a handler, and the handler used to run inside it: a handler that
+        // registers or unregisters an interrupt from inside itself deadlocked
+        // its own core, and every other core's next interrupt piled up behind
+        // it. The x86 path fixed this and wrote down that it "never reproduced
+        // under 2 emulated CPUs"; this driver was still doing it, and QEMU is
+        // the only place the aarch64 port runs in CI.
+        //
+        // `try_lock`, not `lock`, so a regression fails this test in
+        // microseconds instead of hanging the run.
+        let mut gic = FakeGic::new();
+        let ctrl = Arc::new(gic.controller());
+        let got_in = Arc::new(AtomicUsize::new(0));
+        let seen = got_in.clone();
+        // `Weak`, because the closure lives inside the table it reaches back
+        // into -- which is the situation being tested.
+        let back = Arc::downgrade(&ctrl);
+        ctrl.register_handler(
+            UART_SPI as usize,
+            Arc::new(move || {
+                let ctrl = back.upgrade().unwrap();
+                // Asked *before* the call below, and asserted on the spot: the
+                // registration is what would spin here forever, so this is the
+                // line that has to fail, not hang.
+                assert!(
+                    ctrl.manager.try_lock().is_some(),
+                    "the handler is running with the dispatch table locked"
+                );
+                seen.fetch_add(1, Ordering::SeqCst);
+                // And the real thing the lock was blocking: registering another
+                // interrupt from inside a handler.
+                ctrl.register_handler(40, Arc::new(|| {})).unwrap();
+            }),
+        )
+        .unwrap();
+
+        ctrl.handle_irq(UART_SPI as usize);
+        assert_eq!(
+            got_in.load(Ordering::SeqCst),
+            1,
+            "the handler ran with the dispatch table still locked"
+        );
+        assert!(
+            ctrl.manager.lock().get(40).is_some(),
+            "the handler could not register an interrupt"
+        );
+    }
+
+    #[test]
+    fn an_id_that_could_not_be_registered_is_not_reported_as_success() {
+        // The error was thrown away and `Ok(())` returned whatever happened, so
+        // a driver could not tell a handler that was installed from one that was
+        // not: its device's interrupts then arrived at nobody, and the only
+        // trace was a `trace!` line.
+        let mut gic = FakeGic::new();
+        let ctrl = gic.controller();
+        // Past the top of what this distributor routes (1020..=1023 are
+        // reserved).
+        assert!(ctrl
+            .register_handler(GIC_IRQ_RANGE.end, Arc::new(|| {}))
+            .is_err());
+        assert!(ctrl.register_handler(4096, Arc::new(|| {})).is_err());
+        // And an id another driver already owns.
+        ctrl.register_handler(UART_SPI as usize, Arc::new(|| {}))
+            .unwrap();
+        assert!(
+            ctrl.register_handler(UART_SPI as usize, Arc::new(|| {}))
+                .is_err(),
+            "two drivers cannot share one line: the second handler replaces nothing"
+        );
+    }
+
+    #[test]
+    fn the_shootdown_sgi_is_claimed_by_name_and_only_once() {
+        // Id 0 is SGI 0, the interrupt `send_ipi` rings for a TLB shootdown --
+        // and `IrqManager::register_handler` reads a zero as "allocate one".
+        // That returns 0 for the first caller, so the aarch64 port works by
+        // luck; a second caller was handed id 1 and told `Ok`, which installs a
+        // handler on an id the distributor is delivering to something else,
+        // leaves the shootdown dispatched to nobody, and hangs the initiator in
+        // a wait that has no timeout. That is the `[tlb-shootdown] slow ack
+        // wait` this port already sees.
+        let mut gic = FakeGic::new();
+        let ctrl = gic.controller();
+        ctrl.register_handler(IPI_SGI as usize, Arc::new(|| {}))
+            .unwrap();
+        assert!(
+            ctrl.register_handler(IPI_SGI as usize, Arc::new(|| {}))
+                .is_err(),
+            "SGI 0 was handed out twice"
+        );
+        assert!(
+            ctrl.manager.lock().get(1).is_none(),
+            "a handler for SGI 0 landed on SGI 1"
+        );
+    }
+
+    #[test]
+    fn an_sgi_dispatches_on_its_id_and_completes_with_the_whole_word() {
+        // GICC_IAR carries the sending core's id in bits [12:10] for an SGI, and
+        // GICv2 requires that same word back at GICC_EOIR: an EOI that does not
+        // match the active interrupt leaves it active, so the core's running
+        // priority never drops and it takes no further interrupt of that
+        // priority or below. Ever.
+        let mut gic = FakeGic::new();
+        let ctrl = gic.controller();
+        let (handler, hits) = counting();
+        ctrl.register_handler(IPI_SGI as usize, handler).unwrap();
+
+        // SGI 0 sent by core 1.
+        let iar = 0x400 | IPI_SGI as usize;
+        ctrl.handle_irq(iar);
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "an SGI from another core was dispatched on the whole word, not its id"
+        );
+        assert_eq!(
+            gic.gicc_reg(GICC_EOIR),
+            iar as u32,
+            "the completion has to carry the CPUID field back"
+        );
+    }
+
+    #[test]
+    fn an_id_nobody_registered_is_still_completed() {
+        // Skipping the EOI would leave the interrupt active at this core's CPU
+        // interface for good. The dispatch says nothing about whether the
+        // completion is owed.
+        let mut gic = FakeGic::new();
+        let ctrl = gic.controller();
+        ctrl.handle_irq(UART_SPI as usize);
+        assert_eq!(gic.gicc_reg(GICC_EOIR), UART_SPI);
+    }
+
+    /// A handler that counts its calls.
+    fn counting() -> (IrqHandler, Arc<AtomicUsize>) {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let seen = hits.clone();
+        (
+            Arc::new(move || {
+                seen.fetch_add(1, Ordering::SeqCst);
+            }),
+            hits,
+        )
     }
 }

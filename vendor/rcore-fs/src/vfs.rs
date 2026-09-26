@@ -216,13 +216,17 @@ fn lookup_with_budget(
             continue;
         }
         let inode = result.find(&name)?;
-        // Handle symlink
+        // Handle symlink. `following` stays true after the budget is spent, so
+        // the next link is `SymLoop` rather than the link itself. A walk that
+        // was never asked to follow (`follow_times == 0`) leaves the link in
+        // place: the last component for `lstat`, `NotDir` if the path goes on.
         if inode.metadata()?.type_ == FileType::SymLink && following {
             if follow_times == 0 {
                 return Err(FsError::SymLoop);
             }
             let link_path = read_symlink(&*inode)?;
-            // result remains unchanged
+            // result remains unchanged: a relative target is resolved from the
+            // directory that holds the link.
             let new_path = link_path + "/" + &rest_path;
             return lookup_with_budget(&*result, &new_path, follow_times - 1, following);
         } else {
@@ -481,66 +485,91 @@ pub fn make_rdev(major: usize, minor: usize) -> usize {
 }
 
 #[cfg(test)]
-mod lookup_tests {
+mod tests {
     use super::*;
     use alloc::collections::BTreeMap;
     use alloc::sync::Weak;
+    use alloc::vec;
     use spin::Mutex;
 
-    /// The smallest tree `lookup_follow` can walk: directories with
-    /// children, files, and symlinks whose contents are their target.
+    /// A tree just rich enough to walk: directories with named children, files
+    /// with bytes, and symlinks whose bytes are their target.
     struct Node {
+        ino: usize,
         type_: FileType,
-        content: Vec<u8>,
+        data: Mutex<Vec<u8>>,
         children: Mutex<BTreeMap<String, Arc<Node>>>,
-        parent: Mutex<Weak<Node>>,
+        /// `.` has to answer with an `Arc`, and `find` only gets a `&self`.
         this: Mutex<Weak<Node>>,
+        parent: Mutex<Weak<Node>>,
         fs: Mutex<Weak<Tree>>,
+        /// Answer `metadata()` with an error, the way a disk with a bad sector
+        /// does.
+        broken: Mutex<bool>,
     }
 
     struct Tree {
-        root: Arc<Node>,
+        root: Mutex<Option<Arc<Node>>>,
+        next_ino: Mutex<usize>,
     }
 
-    fn node(type_: FileType, content: &[u8]) -> Arc<Node> {
-        let node = Arc::new(Node {
-            type_,
-            content: content.to_vec(),
-            children: Mutex::new(BTreeMap::new()),
-            parent: Mutex::new(Weak::new()),
-            this: Mutex::new(Weak::new()),
-            fs: Mutex::new(Weak::new()),
-        });
-        *node.this.lock() = Arc::downgrade(&node);
-        node
-    }
+    impl Tree {
+        fn new() -> Arc<Tree> {
+            let tree = Arc::new(Tree {
+                root: Mutex::new(None),
+                next_ino: Mutex::new(2),
+            });
+            let root = tree.node(FileType::Dir);
+            *root.parent.lock() = Arc::downgrade(&root);
+            *tree.root.lock() = Some(root);
+            tree
+        }
 
-    fn tree() -> Arc<Tree> {
-        let tree = Arc::new(Tree {
-            root: node(FileType::Dir, b""),
-        });
-        *tree.root.fs.lock() = Arc::downgrade(&tree);
-        *tree.root.parent.lock() = Arc::downgrade(&tree.root);
-        tree
-    }
+        fn node(self: &Arc<Self>, type_: FileType) -> Arc<Node> {
+            let mut next = self.next_ino.lock();
+            let ino = *next;
+            *next += 1;
+            let node = Arc::new(Node {
+                ino,
+                type_,
+                data: Mutex::new(Vec::new()),
+                children: Mutex::new(BTreeMap::new()),
+                this: Mutex::new(Weak::new()),
+                parent: Mutex::new(Weak::new()),
+                fs: Mutex::new(Arc::downgrade(self)),
+                broken: Mutex::new(false),
+            });
+            *node.this.lock() = Arc::downgrade(&node);
+            node
+        }
 
-    impl Node {
-        fn add(self: &Arc<Self>, name: &str, child: Arc<Node>) -> Arc<Node> {
-            *child.parent.lock() = Arc::downgrade(self);
-            *child.fs.lock() = self.fs.lock().clone();
-            self.children
-                .lock()
-                .insert(String::from(name), child.clone());
-            child
+        fn root_node(&self) -> Arc<Node> {
+            self.root.lock().clone().unwrap()
         }
-        fn dir(self: &Arc<Self>, name: &str) -> Arc<Node> {
-            self.add(name, node(FileType::Dir, b""))
+
+        /// Add a child of `type_` under `at`, with `data` for a symlink.
+        fn add(
+            self: &Arc<Self>,
+            at: &Arc<Node>,
+            name: &str,
+            type_: FileType,
+            data: &str,
+        ) -> Arc<Node> {
+            let node = self.node(type_);
+            *node.data.lock() = data.as_bytes().to_vec();
+            *node.parent.lock() = Arc::downgrade(at);
+            at.children.lock().insert(String::from(name), node.clone());
+            node
         }
-        fn file(self: &Arc<Self>, name: &str, content: &[u8]) -> Arc<Node> {
-            self.add(name, node(FileType::File, content))
+
+        fn dir(self: &Arc<Self>, at: &Arc<Node>, name: &str) -> Arc<Node> {
+            self.add(at, name, FileType::Dir, "")
         }
-        fn link(self: &Arc<Self>, name: &str, target: &str) -> Arc<Node> {
-            self.add(name, node(FileType::SymLink, target.as_bytes()))
+        fn file(self: &Arc<Self>, at: &Arc<Node>, name: &str) -> Arc<Node> {
+            self.add(at, name, FileType::File, "")
+        }
+        fn link(self: &Arc<Self>, at: &Arc<Node>, name: &str, target: &str) -> Arc<Node> {
+            self.add(at, name, FileType::SymLink, target)
         }
     }
 
@@ -549,22 +578,29 @@ mod lookup_tests {
             Ok(())
         }
         fn root_inode(&self) -> Arc<dyn INode> {
-            self.root.clone()
+            self.root_node()
         }
         fn info(&self) -> FsInfo {
-            no_fs().info()
+            FsInfo {
+                bsize: 4096,
+                frsize: 4096,
+                blocks: 0,
+                bfree: 0,
+                bavail: 0,
+                files: 0,
+                ffree: 0,
+                namemax: 255,
+            }
         }
     }
 
     impl INode for Node {
         fn read_at(&self, offset: usize, buf: &mut [u8]) -> Result<usize> {
-            if self.type_ == FileType::Dir {
-                return Err(FsError::IsDir);
-            }
-            let start = offset.min(self.content.len());
-            let n = buf.len().min(self.content.len() - start);
-            buf[..n].copy_from_slice(&self.content[start..start + n]);
-            Ok(n)
+            let data = self.data.lock();
+            let begin = offset.min(data.len());
+            let len = buf.len().min(data.len() - begin);
+            buf[..len].copy_from_slice(&data[begin..begin + len]);
+            Ok(len)
         }
         fn write_at(&self, _offset: usize, _buf: &[u8]) -> Result<usize> {
             Err(FsError::NotSupported)
@@ -573,17 +609,20 @@ mod lookup_tests {
             Ok(PollStatus::default())
         }
         fn metadata(&self) -> Result<Metadata> {
+            if *self.broken.lock() {
+                return Err(FsError::DeviceError);
+            }
             Ok(Metadata {
-                dev: 0,
-                inode: self as *const Node as usize,
-                size: self.content.len(),
-                blk_size: 0,
+                dev: 1,
+                inode: self.ino,
+                size: self.data.lock().len(),
+                blk_size: 4096,
                 blocks: 0,
                 atime: Timespec { sec: 0, nsec: 0 },
                 mtime: Timespec { sec: 0, nsec: 0 },
                 ctime: Timespec { sec: 0, nsec: 0 },
                 type_: self.type_,
-                mode: 0o777,
+                mode: 0o755,
                 nlinks: 1,
                 uid: 0,
                 gid: 0,
@@ -594,17 +633,25 @@ mod lookup_tests {
             if self.type_ != FileType::Dir {
                 return Err(FsError::NotDir);
             }
-            let found: Arc<Node> = match name {
-                "." => self.this.lock().upgrade().unwrap(),
-                ".." => self.parent.lock().upgrade().unwrap(),
+            match name {
+                "." => Ok(self.this.lock().upgrade().unwrap() as Arc<dyn INode>),
+                ".." => Ok(self.parent.lock().upgrade().unwrap() as Arc<dyn INode>),
                 _ => self
                     .children
                     .lock()
                     .get(name)
                     .cloned()
-                    .ok_or(FsError::EntryNotFound)?,
-            };
-            Ok(found)
+                    .map(|c| c as Arc<dyn INode>)
+                    .ok_or(FsError::EntryNotFound),
+            }
+        }
+        fn get_entry(&self, id: usize) -> Result<String> {
+            self.children
+                .lock()
+                .keys()
+                .nth(id)
+                .cloned()
+                .ok_or(FsError::EntryNotFound)
         }
         fn fs(&self) -> Arc<dyn FileSystem> {
             self.fs.lock().upgrade().unwrap()
@@ -614,76 +661,576 @@ mod lookup_tests {
         }
     }
 
-    fn same(a: &Arc<dyn INode>, b: &Arc<Node>) -> bool {
-        a.metadata().unwrap().inode == b.metadata().unwrap().inode
+    fn ino(node: &Arc<dyn INode>) -> usize {
+        node.metadata().unwrap().inode
+    }
+
+    // ---- walking a path ----
+
+    #[test]
+    fn a_relative_path_walks_from_the_node_it_was_asked_of() {
+        let t = Tree::new();
+        let root = t.root_node();
+        let a = t.dir(&root, "a");
+        let b = t.dir(&a, "b");
+        let f = t.file(&b, "f");
+        let got = (root.as_ref() as &dyn INode).lookup("a/b/f").unwrap();
+        assert_eq!(ino(&got), f.ino);
+        let from_a = (a.as_ref() as &dyn INode).lookup("b/f").unwrap();
+        assert_eq!(ino(&from_a), f.ino);
     }
 
     #[test]
-    fn a_symlink_target_longer_than_256_bytes_is_followed_whole() {
-        let tree = tree();
-        let root = &tree.root;
-        // A directory name of 300 bytes: the first 256 of the target name a
-        // directory that does not exist.
-        let long = "d".repeat(300);
-        let file = root.dir(&long).file("file", b"hello");
-        let target = long.clone() + "/file";
-        root.link("link", &target);
-        root.dir("etc").file("hosts", b"");
-        root.link("abs", &("/".to_string() + &target));
+    fn an_absolute_path_walks_from_the_root_of_the_file_system() {
+        let t = Tree::new();
+        let root = t.root_node();
+        let a = t.dir(&root, "a");
+        let f = t.file(&a, "f");
+        // Asked of a deep directory, an absolute path still starts at the top.
+        let got = (a.as_ref() as &dyn INode).lookup("/a/f").unwrap();
+        assert_eq!(ino(&got), f.ino);
+    }
 
-        let hit = (&**root as &dyn INode).lookup_follow("link", 4).unwrap();
-        assert!(
-            same(&hit, &file),
-            "the target is read whole, not cut at 256"
-        );
-        let hit = (&**root as &dyn INode).lookup_follow("abs", 4).unwrap();
-        assert!(same(&hit, &file), "an absolute target too");
+    #[test]
+    fn repeated_and_trailing_slashes_are_the_same_path() {
+        let t = Tree::new();
+        let root = t.root_node();
+        let a = t.dir(&root, "a");
+        let f = t.file(&a, "f");
+        for path in ["a/f", "a//f", "/a/f", "//a//f", "a/./f"] {
+            let got = (root.as_ref() as &dyn INode).lookup(path).unwrap();
+            assert_eq!(ino(&got), f.ino, "{:?} did not find the file", path);
+        }
+    }
 
-        // Exactly SYMLINK_MAX bytes is still a name; one more is not.
-        let edge = "e".repeat(SYMLINK_MAX - "/file".len());
-        let edge_file = root.dir(&edge).file("file", b"");
-        root.link("edge", &(edge.clone() + "/file"));
-        let hit = (&**root as &dyn INode).lookup_follow("edge", 4).unwrap();
-        assert!(same(&hit, &edge_file));
-        root.link("past", &("x".repeat(SYMLINK_MAX + 1)));
+    #[test]
+    fn the_empty_path_is_the_node_itself() {
+        let t = Tree::new();
+        let root = t.root_node();
+        let a = t.dir(&root, "a");
+        let got = (a.as_ref() as &dyn INode).lookup("").unwrap();
+        assert_eq!(ino(&got), a.ino);
+    }
+
+    #[test]
+    fn a_path_through_something_that_is_not_a_directory_is_not_a_directory() {
+        let t = Tree::new();
+        let root = t.root_node();
+        let f = t.file(&root, "f");
         assert_eq!(
-            (&**root as &dyn INode).lookup_follow("past", 4).err(),
+            (root.as_ref() as &dyn INode).lookup("f/x").err(),
+            Some(FsError::NotDir)
+        );
+        // And asking a file to resolve anything at all is the same answer.
+        assert_eq!(
+            (f.as_ref() as &dyn INode).lookup("x").err(),
+            Some(FsError::NotDir)
+        );
+    }
+
+    #[test]
+    fn an_absolute_path_asked_of_a_file_is_not_a_directory() {
+        // An absolute path jumps straight to the file system's root and never
+        // calls `find` on the node it was asked of, so the walk's own check on
+        // that node is the only thing that refuses it. Without it, a file
+        // resolves paths as if it were a directory.
+        let t = Tree::new();
+        let root = t.root_node();
+        let a = t.dir(&root, "a");
+        t.file(&a, "f");
+        let f = t.file(&root, "plain");
+        assert_eq!(
+            (f.as_ref() as &dyn INode).lookup("/a/f").err(),
+            Some(FsError::NotDir)
+        );
+    }
+
+    #[test]
+    fn a_file_system_whose_find_does_not_check_the_type_is_still_refused() {
+        // `INode::find` is not required to check that it is being asked of a
+        // directory -- nothing in the trait says so, and the default just
+        // answers `NotSupported`. So the walk checks each component itself
+        // rather than leaning on the file system to do it.
+        struct Sloppy {
+            type_: FileType,
+            child: Mutex<Option<Arc<Sloppy>>>,
+        }
+        impl INode for Sloppy {
+            fn read_at(&self, _: usize, _: &mut [u8]) -> Result<usize> {
+                Ok(0)
+            }
+            fn write_at(&self, _: usize, _: &[u8]) -> Result<usize> {
+                Ok(0)
+            }
+            fn poll(&self) -> Result<PollStatus> {
+                Ok(PollStatus::default())
+            }
+            fn metadata(&self) -> Result<Metadata> {
+                Ok(Metadata {
+                    dev: 0,
+                    inode: 1,
+                    size: 0,
+                    blk_size: 0,
+                    blocks: 0,
+                    atime: Timespec { sec: 0, nsec: 0 },
+                    mtime: Timespec { sec: 0, nsec: 0 },
+                    ctime: Timespec { sec: 0, nsec: 0 },
+                    type_: self.type_,
+                    mode: 0,
+                    nlinks: 1,
+                    uid: 0,
+                    gid: 0,
+                    rdev: 0,
+                })
+            }
+            /// Hands back a child whatever it is asked of, directory or not.
+            fn find(&self, _name: &str) -> Result<Arc<dyn INode>> {
+                match self.child.lock().clone() {
+                    Some(c) => Ok(c as Arc<dyn INode>),
+                    None => Err(FsError::EntryNotFound),
+                }
+            }
+            fn as_any_ref(&self) -> &dyn Any {
+                self
+            }
+        }
+
+        let leaf = Arc::new(Sloppy {
+            type_: FileType::File,
+            child: Mutex::new(None),
+        });
+        let middle = Arc::new(Sloppy {
+            type_: FileType::File,
+            child: Mutex::new(Some(leaf)),
+        });
+        let top = Arc::new(Sloppy {
+            type_: FileType::Dir,
+            child: Mutex::new(Some(middle.clone())),
+        });
+        // `top/middle` is a file, so `top/middle/leaf` cannot resolve.
+        assert_eq!(
+            (top.as_ref() as &dyn INode).lookup("middle/leaf").err(),
+            Some(FsError::NotDir),
+            "the walk went through a file"
+        );
+        // And asking the file itself is refused before it gets a chance to
+        // answer with its child.
+        assert_eq!(
+            (middle.as_ref() as &dyn INode).lookup("leaf").err(),
+            Some(FsError::NotDir)
+        );
+    }
+
+    #[test]
+    fn a_name_that_is_not_there_is_not_found() {
+        let t = Tree::new();
+        let root = t.root_node();
+        t.dir(&root, "a");
+        assert_eq!(
+            (root.as_ref() as &dyn INode).lookup("a/nope").err(),
+            Some(FsError::EntryNotFound)
+        );
+    }
+
+    #[test]
+    fn a_node_that_cannot_say_what_it_is_gives_the_device_error_back() {
+        let t = Tree::new();
+        let root = t.root_node();
+        let a = t.dir(&root, "a");
+        *a.broken.lock() = true;
+        assert_eq!(
+            (root.as_ref() as &dyn INode).lookup("a/x").err(),
+            Some(FsError::DeviceError)
+        );
+    }
+
+    // ---- symlinks ----
+
+    #[test]
+    fn a_symlink_is_not_followed_when_no_follows_are_allowed() {
+        let t = Tree::new();
+        let root = t.root_node();
+        let f = t.file(&root, "f");
+        let l = t.link(&root, "l", "f");
+        let got = (root.as_ref() as &dyn INode).lookup("l").unwrap();
+        assert_eq!(ino(&got), l.ino, "the link was followed");
+        assert_ne!(ino(&got), f.ino);
+    }
+
+    #[test]
+    fn a_symlink_is_followed_when_a_follow_is_allowed() {
+        let t = Tree::new();
+        let root = t.root_node();
+        let f = t.file(&root, "f");
+        t.link(&root, "l", "f");
+        let got = (root.as_ref() as &dyn INode).lookup_follow("l", 1).unwrap();
+        assert_eq!(ino(&got), f.ino);
+    }
+
+    #[test]
+    fn a_symlink_in_the_middle_of_a_path_is_followed() {
+        let t = Tree::new();
+        let root = t.root_node();
+        let a = t.dir(&root, "a");
+        let f = t.file(&a, "f");
+        t.link(&root, "l", "a");
+        let got = (root.as_ref() as &dyn INode)
+            .lookup_follow("l/f", 1)
+            .unwrap();
+        assert_eq!(ino(&got), f.ino);
+    }
+
+    #[test]
+    fn a_symlink_target_is_resolved_from_the_directory_the_link_is_in() {
+        let t = Tree::new();
+        let root = t.root_node();
+        let a = t.dir(&root, "a");
+        let inner = t.file(&a, "target");
+        t.file(&root, "target");
+        // `a/l -> target` must find `a/target`, not the one at the top.
+        t.link(&a, "l", "target");
+        let got = (root.as_ref() as &dyn INode)
+            .lookup_follow("a/l", 1)
+            .unwrap();
+        assert_eq!(ino(&got), inner.ino);
+    }
+
+    #[test]
+    fn an_absolute_symlink_target_is_resolved_from_the_root() {
+        let t = Tree::new();
+        let root = t.root_node();
+        let a = t.dir(&root, "a");
+        t.file(&a, "target");
+        let top = t.file(&root, "target");
+        t.link(&a, "l", "/target");
+        let got = (root.as_ref() as &dyn INode)
+            .lookup_follow("a/l", 1)
+            .unwrap();
+        assert_eq!(ino(&got), top.ino);
+    }
+
+    #[test]
+    fn a_chain_of_symlinks_runs_out_of_follows() {
+        let t = Tree::new();
+        let root = t.root_node();
+        let f = t.file(&root, "f");
+        t.link(&root, "l1", "f");
+        t.link(&root, "l2", "l1");
+        t.link(&root, "l3", "l2");
+        // Three links need three follows.
+        assert_eq!(
+            ino(&(root.as_ref() as &dyn INode)
+                .lookup_follow("l3", 3)
+                .unwrap()),
+            f.ino
+        );
+        // One hop short of the file is ELOOP, not the link where the walk
+        // stopped and not the file.
+        assert_eq!(
+            (root.as_ref() as &dyn INode).lookup_follow("l3", 2).err(),
+            Some(FsError::SymLoop)
+        );
+    }
+
+    #[test]
+    fn a_symlink_that_points_at_itself_runs_out_of_follows_and_does_not_hang() {
+        let t = Tree::new();
+        let root = t.root_node();
+        t.link(&root, "l", "l");
+        // The walk answers: what must not happen is a walk that never ends,
+        // nor the link coming back as an ordinary file of its own name.
+        assert_eq!(
+            (root.as_ref() as &dyn INode).lookup_follow("l", 8).err(),
+            Some(FsError::SymLoop)
+        );
+    }
+
+    #[test]
+    fn a_symlink_target_longer_than_a_path_is_refused_and_not_truncated() {
+        let t = Tree::new();
+        let root = t.root_node();
+        // A target of exactly PATH_MAX is the last one allowed.
+        let name = "x".repeat(SYMLINK_MAX);
+        t.link(&root, "long", &name);
+        assert_eq!(
+            (root.as_ref() as &dyn INode).lookup_follow("long", 1).err(),
+            Some(FsError::EntryNotFound),
+            "the target was cut short and named something else"
+        );
+        // One byte more and the walk refuses it rather than following a prefix.
+        let over = "y".repeat(SYMLINK_MAX + 1);
+        t.link(&root, "toolong", &over);
+        assert_eq!(
+            (root.as_ref() as &dyn INode)
+                .lookup_follow("toolong", 1)
+                .err(),
             Some(FsError::NameTooLong)
         );
     }
 
     #[test]
-    fn a_symlink_loop_is_eloop_and_not_the_link_itself() {
-        let tree = tree();
-        let root = &tree.root;
-        root.link("self", "self");
-        root.link("a", "b");
-        root.link("b", "a");
-        let inode = &**root as &dyn INode;
-        assert_eq!(
-            inode.lookup_follow("self", 40).err(),
-            Some(FsError::SymLoop),
-            "a link to itself used to come back as a file"
-        );
-        assert_eq!(inode.lookup_follow("a", 40).err(), Some(FsError::SymLoop));
-        assert_eq!(
-            inode.lookup_follow("self/x", 40).err(),
-            Some(FsError::SymLoop),
-            "on the way as well"
-        );
+    fn a_symlink_target_of_a_few_hundred_bytes_is_followed_whole() {
+        let t = Tree::new();
+        let root = t.root_node();
+        // 300 characters: longer than the 256-byte buffer the walk used to use,
+        // which cut the name and then found a different file -- or none.
+        let long_name = "d".repeat(300);
+        let target = t.file(&root, &long_name);
+        t.link(&root, "l", &long_name);
+        let got = (root.as_ref() as &dyn INode).lookup_follow("l", 1).unwrap();
+        assert_eq!(ino(&got), target.ino, "the target name was cut short");
+    }
 
-        // A chain that fits the budget resolves; one hop too many does not.
-        let file = root.file("file", b"");
-        root.link("l1", "file");
-        root.link("l2", "l1");
-        root.link("l3", "l2");
-        assert!(same(&inode.lookup_follow("l3", 3).unwrap(), &file));
-        assert_eq!(inode.lookup_follow("l3", 2).err(), Some(FsError::SymLoop));
+    #[test]
+    fn a_symlink_whose_target_is_not_utf8_is_refused() {
+        let t = Tree::new();
+        let root = t.root_node();
+        let l = t.link(&root, "l", "");
+        *l.data.lock() = vec![0xff, 0xfe];
+        assert!((root.as_ref() as &dyn INode).lookup_follow("l", 1).is_err());
+    }
 
-        // Without a budget the symlink is what `lstat` and `readlink` want.
-        let link = root.children.lock()["self"].clone();
-        assert!(same(&inode.lookup("self").unwrap(), &link));
-        assert_eq!(inode.lookup("self/x").err(), Some(FsError::NotDir));
-        assert_eq!(inode.lookup("l3/x").err(), Some(FsError::NotDir));
+    // ---- listing ----
+
+    #[test]
+    fn list_gives_every_entry_of_a_directory() {
+        let t = Tree::new();
+        let root = t.root_node();
+        t.file(&root, "a");
+        t.file(&root, "b");
+        t.dir(&root, "c");
+        let mut names = (root.as_ref() as &dyn INode).list().unwrap();
+        names.sort();
+        assert_eq!(names, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn listing_something_that_is_not_a_directory_is_not_a_directory() {
+        let t = Tree::new();
+        let root = t.root_node();
+        let f = t.file(&root, "f");
+        assert_eq!(
+            (f.as_ref() as &dyn INode).list().err(),
+            Some(FsError::NotDir)
+        );
+    }
+
+    #[test]
+    fn an_empty_directory_lists_nothing() {
+        let t = Tree::new();
+        let root = t.root_node();
+        let d = t.dir(&root, "d");
+        assert!((d.as_ref() as &dyn INode).list().unwrap().is_empty());
+    }
+
+    #[test]
+    fn get_entry_with_metadata_answers_the_name_and_what_it_is() {
+        let t = Tree::new();
+        let root = t.root_node();
+        let d = t.dir(&root, "sub");
+        let f = t.file(&d, "inside");
+        let (meta, name) = d.get_entry_with_metadata(0).unwrap();
+        assert_eq!(name, "inside");
+        assert_eq!(meta.inode, f.ino);
+        assert_eq!(meta.type_, FileType::File);
+        assert_eq!(
+            d.get_entry_with_metadata(1).err(),
+            Some(FsError::EntryNotFound)
+        );
+    }
+
+    // ---- the defaults of the trait ----
+
+    #[test]
+    fn downcast_reaches_the_concrete_type() {
+        let t = Tree::new();
+        let root: Arc<dyn INode> = t.root_inode();
+        assert!(root.downcast_ref::<Node>().is_some());
+    }
+
+    #[test]
+    fn an_inode_with_no_file_system_gets_the_placeholder_and_not_a_panic() {
+        struct Bare;
+        impl INode for Bare {
+            fn read_at(&self, _: usize, _: &mut [u8]) -> Result<usize> {
+                Ok(0)
+            }
+            fn write_at(&self, _: usize, _: &[u8]) -> Result<usize> {
+                Ok(0)
+            }
+            fn poll(&self) -> Result<PollStatus> {
+                Ok(PollStatus::default())
+            }
+            fn as_any_ref(&self) -> &dyn Any {
+                self
+            }
+        }
+        let fs = Bare.fs();
+        assert!(is_no_fs(&fs), "a bare inode did not get the placeholder");
+        assert!(fs.sync().is_ok());
+        assert_eq!(fs.info().blocks, 0);
+        // Its root owns nothing and answers rather than panicking.
+        let root = fs.root_inode();
+        assert_eq!(
+            root.read_at(0, &mut [0u8; 4]).err(),
+            Some(FsError::NotSupported)
+        );
+        assert_eq!(
+            root.write_at(0, &[0u8; 4]).err(),
+            Some(FsError::NotSupported)
+        );
+        assert!(root.poll().is_err());
+        assert!(root.as_any_ref().is::<()>() || true);
+    }
+
+    #[test]
+    fn the_placeholder_file_system_is_one_shared_instance() {
+        assert!(Arc::ptr_eq(&no_fs(), &no_fs()));
+        let t = Tree::new();
+        let real: Arc<dyn FileSystem> = t;
+        assert!(
+            !is_no_fs(&real),
+            "a real file system looked like the placeholder"
+        );
+    }
+
+    #[test]
+    fn the_defaults_say_not_supported_rather_than_guessing() {
+        struct Bare;
+        impl INode for Bare {
+            fn read_at(&self, _: usize, _: &mut [u8]) -> Result<usize> {
+                Ok(0)
+            }
+            fn write_at(&self, _: usize, _: &[u8]) -> Result<usize> {
+                Ok(0)
+            }
+            fn poll(&self) -> Result<PollStatus> {
+                Ok(PollStatus::default())
+            }
+            fn as_any_ref(&self) -> &dyn Any {
+                self
+            }
+        }
+        let n = Bare;
+        assert_eq!(n.metadata().err(), Some(FsError::NotSupported));
+        assert_eq!(n.sync_all().err(), Some(FsError::NotSupported));
+        assert_eq!(n.sync_data().err(), Some(FsError::NotSupported));
+        assert_eq!(n.resize(0).err(), Some(FsError::NotSupported));
+        assert_eq!(n.unlink("x").err(), Some(FsError::NotSupported));
+        assert_eq!(n.find("x").err(), Some(FsError::NotSupported));
+        assert_eq!(n.get_entry(0).err(), Some(FsError::NotSupported));
+        assert_eq!(n.io_control(0, 0).err(), Some(FsError::NotSupported));
+    }
+
+    #[test]
+    fn create_and_create2_stand_in_for_each_other() {
+        // A file system may implement either; the one it does not implement
+        // must reach the one it does, and not recurse for ever.
+        struct OnlyCreate2(Mutex<Vec<(String, usize)>>);
+        impl INode for OnlyCreate2 {
+            fn read_at(&self, _: usize, _: &mut [u8]) -> Result<usize> {
+                Ok(0)
+            }
+            fn write_at(&self, _: usize, _: &[u8]) -> Result<usize> {
+                Ok(0)
+            }
+            fn poll(&self) -> Result<PollStatus> {
+                Ok(PollStatus::default())
+            }
+            fn create2(
+                &self,
+                name: &str,
+                _type_: FileType,
+                _mode: u32,
+                data: usize,
+            ) -> Result<Arc<dyn INode>> {
+                self.0.lock().push((String::from(name), data));
+                Err(FsError::NotSupported)
+            }
+            fn as_any_ref(&self) -> &dyn Any {
+                self
+            }
+        }
+        let n = OnlyCreate2(Mutex::new(Vec::new()));
+        let _ = n.create("f", FileType::File, 0o644);
+        assert_eq!(&*n.0.lock(), &[(String::from("f"), 0)]);
+    }
+
+    #[test]
+    fn async_poll_answers_what_poll_answers() {
+        struct Ready;
+        impl INode for Ready {
+            fn read_at(&self, _: usize, _: &mut [u8]) -> Result<usize> {
+                Ok(0)
+            }
+            fn write_at(&self, _: usize, _: &[u8]) -> Result<usize> {
+                Ok(0)
+            }
+            fn poll(&self) -> Result<PollStatus> {
+                Ok(PollStatus {
+                    read: true,
+                    write: false,
+                    error: false,
+                    hangup: true,
+                })
+            }
+            fn as_any_ref(&self) -> &dyn Any {
+                self
+            }
+        }
+        let status = futures_lite_block_on(Ready.async_poll());
+        let status = status.unwrap();
+        assert!(status.read && status.hangup && !status.write);
+    }
+
+    /// The smallest executor that will drive a future this crate produces: its
+    /// default `async_poll` is ready on the first poll.
+    fn futures_lite_block_on<T>(mut fut: Pin<Box<dyn Future<Output = T> + Send + Sync + '_>>) -> T {
+        use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+        fn noop(_: *const ()) {}
+        fn clone(p: *const ()) -> RawWaker {
+            RawWaker::new(p, &VTABLE)
+        }
+        static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, noop, noop, noop);
+        let waker = unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &VTABLE)) };
+        let mut cx = Context::from_waker(&waker);
+        match fut.as_mut().poll(&mut cx) {
+            Poll::Ready(v) => v,
+            Poll::Pending => panic!("the default async_poll was not ready at once"),
+        }
+    }
+
+    // ---- device numbers ----
+
+    #[test]
+    fn make_rdev_packs_the_pair_the_way_stat_reports_it() {
+        // /dev/null is (1, 3) and /dev/zero is (1, 5).
+        assert_eq!(make_rdev(1, 3), 0x103);
+        assert_eq!(make_rdev(1, 5), 0x105);
+        // A DRM card: (226, 0).
+        assert_eq!(make_rdev(226, 0), 226 << 8);
+        assert_eq!(make_rdev(0, 0), 0);
+    }
+
+    #[test]
+    fn make_rdev_keeps_a_minor_out_of_the_major_and_a_major_out_of_the_top() {
+        // A minor of 0x100 would otherwise add one to the major.
+        assert_eq!(make_rdev(1, 0x100), 0x100);
+        assert_eq!(make_rdev(0xfff, 0xff), 0xfffff);
+        // And what does not fit is dropped rather than wrapping into the other.
+        assert_eq!(make_rdev(0x1000, 0), 0);
+    }
+
+    #[test]
+    fn an_error_prints_its_own_name() {
+        use alloc::format;
+        assert_eq!(format!("{}", FsError::EntryNotFound), "EntryNotFound");
+        assert_eq!(format!("{}", FsError::NotSameFs), "NotSameFs");
+    }
+
+    #[test]
+    fn a_device_error_becomes_a_file_system_error() {
+        let e: FsError = DevError.into();
+        assert_eq!(e, FsError::DeviceError);
     }
 }

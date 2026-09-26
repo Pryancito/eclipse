@@ -46,6 +46,13 @@ where
             graphic,
         }
     }
+
+    /// The frame buffer underneath, so a test can read back the pixels this
+    /// renderer drew. Not part of the public API.
+    #[cfg(test)]
+    pub(crate) fn target(&self) -> &D {
+        &self.graphic
+    }
 }
 
 impl<D> TextOnGraphic<D>
@@ -175,8 +182,23 @@ where
         (self.height / CHAR_SIZE.height) as usize
     }
 
+    /// Pixels cannot be read back as characters, so this answers with a blank.
+    ///
+    /// It used to be `unimplemented!()`, which is a kernel panic -- and the
+    /// trait's own default `new_line`, `clear` and `scroll_region_*` all read
+    /// before they write, so `Console::on_text_buffer(TextOnGraphic::new(..))`
+    /// died on its first scroll. Worse, the console is what the panic handler
+    /// prints through, so that was a panic inside the panic handler: the
+    /// report naming the original fault never reached the screen. Eclipse's own
+    /// `LinearScrollbackBuffer::read` already answers a blank for exactly this
+    /// reason; this one now agrees with it.
+    ///
+    /// A blank is not a good answer -- a scroll that goes through here loses
+    /// the text it moves -- but it is a recoverable one, and anything that
+    /// wants real scrolling puts a buffer that remembers cells in front
+    /// (`TextBufferCache`, or Eclipse's scrollback buffer).
     fn read(&self, _row: usize, _col: usize) -> Cell {
-        unimplemented!("reading char from graphic is unsupported")
+        Cell::default()
     }
 
     #[inline]

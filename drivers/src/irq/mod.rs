@@ -39,3 +39,16 @@ cfg_if::cfg_if! {
 #[path = "gic_400.rs"]
 #[allow(dead_code)]
 mod gic_400_host_tests;
+
+/// The RISC-V PLIC, pulled into the host build for its tests alone.
+///
+/// Same arrangement, and same reason, as the GIC above: it is `cfg`-ed to
+/// riscv, so no job that runs tests ever compiled a line of it. What it gets
+/// wrong is per-hart register *addresses* and a number it reads out of a device
+/// register, both of which a host buffer answers for exactly as a board does --
+/// the only thing it cannot answer is `tp`, so `cpu_id` has a host path that a
+/// test sets (see `riscv_plic.rs`).
+#[cfg(all(test, not(any(target_arch = "riscv32", target_arch = "riscv64"))))]
+#[path = "riscv_plic.rs"]
+#[allow(dead_code)]
+mod riscv_plic_host_tests;

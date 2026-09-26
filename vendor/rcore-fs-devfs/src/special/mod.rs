@@ -40,9 +40,14 @@ macro_rules! impl_inode {
         fn mmap(&self, _area: MMapArea) -> Result<()> {
             Err(FsError::NotSupported)
         }
-        fn fs(&self) -> Arc<dyn FileSystem> {
-            unimplemented!()
-        }
+        // No `fs()`. It used to be `unimplemented!()` here, which is a panic in
+        // a kernel: a pseudo-device belongs to no file system, and the caller
+        // asking which one is not doing anything wrong. `INode::fs` already
+        // answers that with `vfs::no_fs()`, a file system that owns nothing --
+        // this macro was overriding a working default with a landmine, and the
+        // one caller that had met it (`linux-object`'s page-cache key, which
+        // `write(2)` to /dev/null goes through) had to grow a special case to
+        // avoid asking. Leaving the method out is the fix.
         fn as_any_ref(&self) -> &dyn Any {
             self
         }

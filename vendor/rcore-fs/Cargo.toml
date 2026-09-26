@@ -10,6 +10,12 @@ libc = { version = "0.2", optional = true }
 
 [dev-dependencies]
 tempfile = "3.2"
+# `mod std` is gated on `any(test, feature = "std")`, so everything it needs
+# has to be there under `cfg(test)` too. `libc` is an optional dependency that
+# only the `std` feature pulls in, so a plain `cargo test -p rcore-fs` did not
+# compile at all -- which is why the three tests that were already here had
+# never run.
+libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
 filetime = "0.2"

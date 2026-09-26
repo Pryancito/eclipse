@@ -77,6 +77,19 @@ impl PciInitArgsHeader {
     }
 }
 
+#[cfg(test)]
+impl PciIrqSwizzleLut {
+    /// A table of zeros, for the tests of the bus driver: every pin of every
+    /// function mapped to global IRQ 0. The tuple field is private, and
+    /// `PCIeBusDriver::add_root` takes one of these by value, so without this
+    /// the bus driver's own module cannot build a root to add.
+    pub(super) fn zeroed() -> Self {
+        Self(
+            [[[0; PCI_MAX_LEGACY_IRQ_PINS]; PCI_MAX_FUNCTIONS_PER_DEVICE]; PCI_MAX_DEVICES_PER_BUS],
+        )
+    }
+}
+
 impl PciIrqSwizzleLut {
     pub(super) fn swizzle(&self, dev_id: usize, func_id: usize, pin: usize) -> ZxResult<usize> {
         if dev_id >= PCI_MAX_DEVICES_PER_BUS
