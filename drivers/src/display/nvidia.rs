@@ -12137,6 +12137,36 @@ impl NvidiaGpu {
                 {
                     return Err(nv::EFAULT);
                 }
+                // Every sig handle must exist BEFORE anything happens, as in
+                // Linux, where `nouveau_job_submit` looks the whole list up
+                // (`nouveau_job_fence_attach_prepare`) before the job is armed:
+                // an unknown handle is ENOENT with nothing queued, nothing
+                // waited for and nothing signaled. The three paths below
+                // used to notice it only while attaching or signaling, that
+                // is AFTER the pushes were on the ring (or in the RM), after
+                // a wait that never came had cost the full deadline, and
+                // after the handles before it had already been signaled --
+                // an error the caller reads as "nothing was submitted" and
+                // answers by submitting the batch again.
+                if req.sig_count > 0 {
+                    let sigs = unsafe {
+                        core::slice::from_raw_parts(
+                            req.sig_ptr as *const nv::DrmNouveauSync,
+                            req.sig_count as usize,
+                        )
+                    };
+                    if let Some(sig) = sigs
+                        .iter()
+                        .find(|s| !crate::scheme::syncobj::exists(s.handle))
+                    {
+                        crate::klog_warn!(
+                            "[nouveau-uapi] EXEC: sig syncobj handle={} is unknown -- nothing submitted (ENOENT) pid={}",
+                            sig.handle,
+                            owner_pid
+                        );
+                        return Err(nv::ENOENT);
+                    }
+                }
                 if req.push_count == 0 {
                     // An EXEC with no pushes is nouveau's CHANNEL HEALTH
                     // PROBE, not a degenerate submission. NVK sends exactly
@@ -12614,12 +12644,10 @@ impl NvidiaGpu {
                 // only lands once every earlier push was fetched too -- one
                 // fence still honestly covers the whole batch. Only once
                 // that's confirmed do we advance the syncobjs -- never
-                // before, so a signaled syncobj is never a lie. (Signaling
-                // itself is NOT atomic across sig_count > 1: if syncobj i
-                // has gone-bad handle, syncobjs before it are already
-                // signaled and syncobjs after it never get a chance --
-                // same as a single bad handle already behaved before this
-                // milestone, just now with more than one to potentially fail.)
+                // before, so a signaled syncobj is never a lie. (Every
+                // handle was looked up before the first push went in, so
+                // the ENOENT below is a handle destroyed under a running
+                // EXEC: the syncobjs before it are then already signaled.)
                 let (last, rest) = pushes
                     .split_last()
                     .expect("push_count > 0 already checked above");
@@ -16197,13 +16225,13 @@ mod nouveau_bookkeeping_tests {
         }
         assert_eq!(syncobj::query(bin), Some(1));
         assert_eq!(syncobj::query(tl), Some(5));
-        // A signal on a handle nobody has: the work ran, the ioctl says so.
+        // A signal on a handle nobody has: refused before the RM sees a push.
         let before = FAKE_RM.lock().calls.len();
         assert_eq!(
             exec(&gpu, A, ch, &[push(PUSH_VA, 16)], &[], &[sync(0xdead_0000)]),
             Err(nv::ENOENT)
         );
-        assert_eq!(rm_calls_since(before), ["exec_submit_signaled"]);
+        assert_eq!(rm_calls_since(before), [] as [&str; 0]);
         // Two channels of one process share the context and the ring.
         let ch2 = channel_alloc(&gpu, A).unwrap().channel as u32;
         assert_ne!(ch2, ch);
@@ -16793,27 +16821,15 @@ mod nouveau_bookkeeping_tests {
             ]
         );
         assert_eq!(syncobj::query(out), Some(1));
-        // A signal on a handle nobody has: the work is on the ring by the
-        // time the handle is looked up, and the ioctl says so.
+        // A signal on a handle nobody has: refused before the ring is
+        // touched, so the channel's fence sequence does not move either.
         assert_eq!(
             exec(&gpu, A, ch, &[push(PUSH_VA, 16)], &[], &[sync(0xdead_0000)]),
             Err(nv::ENOENT)
         );
-        assert_eq!(userd(&c), (5, 7));
-        assert_eq!(
-            run_gpu(1),
-            [
-                Fetched::Push {
-                    va: PUSH_VA,
-                    len: 16
-                },
-                Fetched::Release {
-                    sem_va: sem_va(&c),
-                    payload: 3
-                }
-            ]
-        );
-        assert_eq!(nv::EXEC_FAST_FENCED.load(Ordering::Relaxed), fenced + 3);
+        assert_eq!(userd(&c), (5, 5));
+        assert_eq!(run_gpu(1), [] as [Fetched; 0]);
+        assert_eq!(nv::EXEC_FAST_FENCED.load(Ordering::Relaxed), fenced + 2);
         for h in [bin, tl, out] {
             assert!(syncobj::destroy(h));
         }
@@ -17632,6 +17648,157 @@ mod nouveau_bookkeeping_tests {
         assert!(syncobj::destroy(out));
         assert!(syncobj::destroy(out2));
         gpu.nouveau_release_process(COMP);
+        assert_eq!(FAKE_RM.lock().bad, 0);
+    }
+
+    #[test]
+    fn exec_with_an_unknown_sig_syncobj_queues_nothing_and_signals_nothing() {
+        let _g = LOCK.lock();
+        let _live = LiveBytes::hold();
+        // The direct-submit path. The sig list used to be looked at only
+        // once the pushes were on the ring: the caller got ENOENT for a
+        // batch the GPU was already fetching, and resubmitted it.
+        let gpu = gpu_rm_fast();
+        let ch = client_with_pushbuf(&gpu, A);
+        let out = syncobj::create(false);
+        assert_eq!(
+            exec(&gpu, A, ch, &[push(PUSH_VA, 16)], &[], &[sync(out)]),
+            Ok(0)
+        );
+        let c = chan(1);
+        assert_eq!(run_gpu(1).len(), 2, "the push and its fence");
+        assert_eq!(userd(&c), (2, 2));
+        assert_eq!(syncobj::query(out), Some(1));
+        const STRANGER_HANDLE: u32 = 0xdead_0004;
+        assert_eq!(syncobj::query(STRANGER_HANDLE), None);
+        let out2 = syncobj::create(false);
+        assert_eq!(
+            exec(
+                &gpu,
+                A,
+                ch,
+                &[push(PUSH_VA + 0x100, 16)],
+                &[],
+                &[sync(out2), sync(STRANGER_HANDLE)]
+            ),
+            Err(nv::ENOENT)
+        );
+        assert_eq!(userd(&c), (2, 2), "nothing went onto the ring");
+        assert_eq!(run_gpu(1), [] as [Fetched; 0]);
+        assert_eq!(
+            syncobj::query_submitted(out2),
+            Some(0),
+            "the handle before the unknown one was not attached to any fence"
+        );
+        assert!(syncobj::pending_hw_fences(out2, 1).is_empty());
+        // The unknown handle first, as a timeline point: the same.
+        assert_eq!(
+            exec(
+                &gpu,
+                A,
+                ch,
+                &[push(PUSH_VA + 0x100, 16)],
+                &[],
+                &[sync_tl(STRANGER_HANDLE, 3), sync(out2)]
+            ),
+            Err(nv::ENOENT)
+        );
+        assert_eq!(userd(&c), (2, 2));
+        assert!(syncobj::pending_hw_fences(out2, 1).is_empty());
+        // Refused before the waits are honoured, like Linux (both lists are
+        // looked up before the job is armed): a wait that never comes does
+        // not turn the answer into a 10 s EIO.
+        let never = syncobj::create(false);
+        crate::nvme::nvme_queue::test_clock::set_auto_advance(1000);
+        let t0 = crate::nvme::nvme_queue::test_clock::now();
+        assert_eq!(
+            exec(
+                &gpu,
+                A,
+                ch,
+                &[push(PUSH_VA + 0x100, 16)],
+                &[sync(never)],
+                &[sync(STRANGER_HANDLE)]
+            ),
+            Err(nv::ENOENT)
+        );
+        let waited = crate::nvme::nvme_queue::test_clock::now() - t0;
+        crate::nvme::nvme_queue::test_clock::set_auto_advance(0);
+        assert!(
+            waited < 1_000_000,
+            "answered at once, not after the deadline: {}us",
+            waited
+        );
+        assert_eq!(userd(&c), (2, 2));
+        // The health probe (no pushes) signals its sig list on the CPU, and
+        // used to have signaled every handle before the unknown one.
+        let out3 = syncobj::create(false);
+        assert_eq!(
+            exec(&gpu, A, ch, &[], &[], &[sync(out3), sync(STRANGER_HANDLE)]),
+            Err(nv::ENOENT)
+        );
+        assert_eq!(syncobj::query(out3), Some(0), "not signaled");
+        // The ring is intact: the resubmit with a good list is one push and
+        // one fence, and the good handle is attached to that fence only.
+        assert_eq!(
+            exec(
+                &gpu,
+                A,
+                ch,
+                &[push(PUSH_VA + 0x100, 16)],
+                &[],
+                &[sync(out2)]
+            ),
+            Ok(0)
+        );
+        assert_eq!(userd(&c), (2, 4));
+        assert_eq!(syncobj::pending_hw_fences(out2, 1).len(), 1);
+        assert_eq!(run_gpu(1).len(), 2);
+        assert_eq!(syncobj::query(out2), Some(1));
+        for h in [out, out2, out3, never] {
+            assert!(syncobj::destroy(h));
+        }
+        gpu.nouveau_release_process(A);
+        assert_eq!(FAKE_RM.lock().bad, 0);
+    }
+
+    #[test]
+    fn exec_through_the_rm_with_an_unknown_sig_syncobj_submits_nothing() {
+        let _g = LOCK.lock();
+        let _live = LiveBytes::hold();
+        // The RM per-submit path: the pushes went in, the fence came back,
+        // and the handles before the unknown one were signaled -- then
+        // ENOENT, for a batch that had run.
+        let gpu = gpu_rm();
+        let ch = client_with_pushbuf(&gpu, A);
+        let out = syncobj::create(false);
+        const STRANGER_HANDLE: u32 = 0xdead_0005;
+        let n = FAKE_RM.lock().submits.len();
+        assert_eq!(
+            exec(
+                &gpu,
+                A,
+                ch,
+                &[push(PUSH_VA, 16), push(PUSH_VA + 0x100, 16)],
+                &[],
+                &[sync(out), sync(STRANGER_HANDLE)]
+            ),
+            Err(nv::ENOENT)
+        );
+        assert_eq!(FAKE_RM.lock().submits.len(), n, "no push entered the RM");
+        assert_eq!(
+            syncobj::query(out),
+            Some(0),
+            "the good handle stayed unsignaled"
+        );
+        assert_eq!(
+            exec(&gpu, A, ch, &[push(PUSH_VA, 16)], &[], &[sync(out)]),
+            Ok(0)
+        );
+        assert_eq!(FAKE_RM.lock().submits.len(), n + 1);
+        assert_eq!(syncobj::query(out), Some(1));
+        assert!(syncobj::destroy(out));
+        gpu.nouveau_release_process(A);
         assert_eq!(FAKE_RM.lock().bad, 0);
     }
 

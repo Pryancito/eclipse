@@ -1135,6 +1135,14 @@ pub fn reset(handle: u32) -> bool {
     true
 }
 
+/// Whether `handle` names a live syncobj: the lookup EXEC makes of every
+/// sig handle before it queues anything (`drm_syncobj_find` in Linux). A
+/// plain lookup, on purpose: unlike [`query`] it resolves no landed fence,
+/// so refusing a bad list changes nothing about the good handles in it.
+pub fn exists(handle: u32) -> bool {
+    TABLE.lock().objects.iter().any(|o| o.handle == handle)
+}
+
 /// Current timeline point (`SYNCOBJ_QUERY`), or `None` if `handle` is
 /// unknown. Signaled point only — not in-flight hardware fences.
 pub fn query(handle: u32) -> Option<u64> {
