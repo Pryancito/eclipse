@@ -88,7 +88,7 @@ impl Syscall<'_> {
     /// ("0.4.2-eclipse"): glibc and the Go runtime parse it at startup and
     /// refuse to run when it looks older than their build-time minimum — the
     /// crate version previously reported here ("0.1.0-…") failed exactly that.
-    pub fn sys_uname(&self, buf: UserOutPtr<u8>) -> SysResult {
+    pub fn sys_uname(&self, mut buf: UserOutPtr<u8>) -> SysResult {
         info!("uname: buf={:?}", buf);
 
         use linux_object::uname;
@@ -107,19 +107,20 @@ impl Syscall<'_> {
             "unknown"
         };
 
-        let strings = [
-            uname::OS_TYPE,      // sysname
-            hostname.as_str(),   // nodename
-            uname::OS_RELEASE,   // release
-            version.as_str(),    // version
-            arch,                // machine
-            domainname.as_str(), // domainname
-        ];
-
-        for (i, &s) in strings.iter().enumerate() {
-            const OFFSET: usize = 65;
-            buf.add(i * OFFSET).write_cstring(s)?;
-        }
+        // The whole 390-byte struct, each name cut to its 65-byte field
+        // (`sys_newuname` copies the arrays, not the strings). Writing
+        // each name with `write_cstring` at its offset let a name longer
+        // than the field run into the next one, and the last one past the
+        // caller's struct.
+        let utsname = uname::utsname_bytes([
+            uname::OS_TYPE.as_bytes(),    // sysname
+            hostname.as_bytes(),          // nodename
+            uname::OS_RELEASE.as_bytes(), // release
+            version.as_bytes(),           // version
+            arch.as_bytes(),              // machine
+            domainname.as_bytes(),        // domainname
+        ]);
+        buf.write_array(&utsname)?;
         Ok(0)
     }
 
