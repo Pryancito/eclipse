@@ -357,7 +357,18 @@ fn proc_pid_stat(proc: &Process) -> String {
         .try_linux()
         .map(|lp| (4 << 8) | (lp.vt() as i64 + 1))
         .unwrap_or(0);
-    let tpgid = crate::fs::stdio::get_foreground_pgrp() as i64;
+    // The foreground group of THIS process's terminal, not of the one on
+    // screen. `get_foreground_pgrp()` reads the ACTIVE VT, so a process on the
+    // serial console was reported with the desktop's foreground group while the
+    // `tty_nr` on the line above already came from `lp.vt()`: the two fields
+    // described two different terminals. `ps` prints `+` in its STAT column for
+    // the process whose pgrp equals its tty's tpgid, and that is what procps and
+    // every "am I in the foreground" check compare, so a shell on a VT that was
+    // not on screen looked like a background job to its own tools.
+    let tpgid = proc
+        .try_linux()
+        .map(|lp| crate::fs::stdio::vt_foreground_pgrp(lp.vt()) as i64)
+        .unwrap_or(0);
 
     // Fields 5..=52 of /proc/[pid]/stat (proc(5)); 0 where not tracked. Indexed
     // by `field - 5` to keep the field numbers obvious.
@@ -2000,11 +2011,16 @@ fn proc_uptime_content() -> String {
 /// agree with each other and with reality.
 ///
 /// `btime` is the boot time in seconds since the epoch, `intr` the interrupts
-/// handled since boot and `processes` the processes created since boot
-/// (`total_forks`). All three read 0 (`processes` read the number ALIVE): `ps
-/// -o lstart` adds the process's start ticks to `btime`, so every process
-/// started on 1 January 1970, and `vmstat` differentiated `processes` and
-/// `intr` into forks and interrupts per second, both 0 or negative.
+/// handled since boot, `processes` the processes created since boot
+/// (`total_forks`) and `ctxt` the context switches. All four read 0
+/// (`processes` read the number ALIVE): `ps -o lstart` adds the process's start
+/// ticks to `btime`, so every process started on 1 January 1970, and `vmstat`
+/// differentiated `processes`, `intr` and `ctxt` into forks, interrupts and
+/// switches per second, all 0 or negative.
+///
+/// `procs_blocked` is still 0: it is `nr_iowait()`, and nothing here tracks a
+/// process as blocked on I/O as opposed to sleeping, so there is no number to
+/// report rather than a number being withheld.
 fn proc_stat_content() -> String {
     let running = crate::loadavg::runnable_count();
     let ncpus = kernel_hal::online_cpu_count().max(1);
@@ -2014,6 +2030,14 @@ fn proc_stat_content() -> String {
     );
     let intr = kernel_hal::kstats::snapshot().irq_total;
     let forks = crate::process::processes_created();
+    // `ctxt` is `nr_context_switches()`, and `vmstat` differentiates it into
+    // its `cs` column: a hard 0 made that column read 0 switches per second
+    // for ever, which is the one number that says whether a machine is
+    // thrashing. Here the scheduler is cooperative, so the switch IS the poll:
+    // handing a CPU to a task is counted once per hand-over
+    // (`kstats::sched_stats().0`). On libos there is no scheduler of ours and
+    // it stays 0, as it was everywhere before.
+    let ctxt = kernel_hal::kstats::sched_stats().0;
 
     let (mut total_user, mut total_sys, mut total_idle) = (0u64, 0u64, 0u64);
     let mut per_cpu = String::new();
@@ -2030,7 +2054,7 @@ fn proc_stat_content() -> String {
         "cpu  {total_user} 0 {total_sys} {total_idle} 0 0 0 0 0 0\n\
          {per_cpu}\
          intr {intr}\n\
-         ctxt 0\n\
+         ctxt {ctxt}\n\
          btime {btime}\n\
          processes {forks}\n\
          procs_running {}\n\
@@ -3561,6 +3585,31 @@ mod pid_stat_tests {
             .trim()
             .parse()
             .unwrap()
+    }
+
+    /// Field 8 (`tpgid`) is the foreground group of THIS process's terminal.
+    /// It came from the VT that was on screen, while field 7 (`tty_nr`) on the
+    /// line above already came from the process's own: the two described two
+    /// different terminals, so a shell on a VT that was not on screen looked
+    /// like a background job to `ps`, which prints `+` exactly when a process's
+    /// pgrp equals its tty's tpgid.
+    #[test]
+    fn tpgid_is_the_foreground_group_of_the_processs_own_terminal() {
+        let proc = Process::create_with_fixed_id_ext(
+            &Job::root(),
+            4321,
+            "stat",
+            LinuxProcess::new(RamFS::new(), 3),
+        )
+        .unwrap();
+        crate::fs::stdio::set_vt_foreground_pgrp(3, 777);
+        // Another VT, with another foreground group, and it is the one on
+        // screen in a default boot (VT 0).
+        crate::fs::stdio::set_vt_foreground_pgrp(0, 999);
+        let line = proc_pid_stat(&proc);
+        assert_eq!(field(&line, 8), 777, "{:?}", line);
+        // And the tty it names is that same VT, so the two fields agree.
+        assert_eq!(field(&line, 7), (4 << 8) | 4, "{:?}", line);
     }
 
     #[test]
