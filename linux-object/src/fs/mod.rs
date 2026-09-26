@@ -2147,6 +2147,15 @@ impl LinuxProcess {
             path,
             follow
         );
+        // `getname_flags`: an empty path is `ENOENT` unless the syscall asked
+        // for `LOOKUP_EMPTY` (`AT_EMPTY_PATH`), and the callers that did
+        // resolve the descriptor themselves before coming here. The VFS walk
+        // below takes "" as "this directory", so `stat("")`, `open("")`,
+        // `access("")`, `chdir("")` and `execve("")` all named the current
+        // directory (or `dirfd`): `[ -e "$unset" ]` was true in every shell.
+        if path.is_empty() {
+            return Err(LxError::ENOENT);
+        }
         // hard code special path
         if path == "/proc/self/exe" {
             if follow {
@@ -2255,6 +2264,57 @@ impl LinuxProcess {
     /// see `lookup_inode_at`
     pub fn lookup_inode(&self, path: &str) -> LxResult<Arc<dyn INode>> {
         self.lookup_inode_at(FileDesc::CWD, path, true)
+    }
+}
+
+/// The empty path, which the VFS walk reads as "this directory" and
+/// `getname_flags` refuses.
+#[cfg(test)]
+mod empty_path_tests {
+    use super::*;
+    use crate::process::LinuxProcess;
+    use rcore_fs_ramfs::RamFS;
+
+    fn a_process() -> LinuxProcess {
+        let proc = LinuxProcess::new(RamFS::new(), 0);
+        proc.root_inode().create("d", FileType::Dir, 0o755).unwrap();
+        proc
+    }
+
+    #[test]
+    fn an_empty_path_is_enoent_from_the_cwd_and_from_a_directory_fd() {
+        let proc = a_process();
+        assert_eq!(
+            proc.lookup_inode_at(FileDesc::CWD, "", true).err(),
+            Some(LxError::ENOENT)
+        );
+        assert_eq!(
+            proc.lookup_inode_at(FileDesc::CWD, "", false).err(),
+            Some(LxError::ENOENT)
+        );
+        let dir = proc.lookup_inode("/d").unwrap();
+        let fd = proc
+            .add_file(File::new(dir, OpenFlags::RDONLY, String::from("/d")))
+            .unwrap();
+        assert_eq!(
+            proc.lookup_inode_at(fd, "", true).err(),
+            Some(LxError::ENOENT)
+        );
+    }
+
+    #[test]
+    fn a_dot_still_names_the_directory_itself() {
+        // The guard is on the empty string alone: "." is a real component.
+        let proc = a_process();
+        let root = proc.root_inode().metadata().unwrap().inode;
+        assert_eq!(
+            proc.lookup_inode_at(FileDesc::CWD, ".", true)
+                .unwrap()
+                .metadata()
+                .unwrap()
+                .inode,
+            root
+        );
     }
 }
 

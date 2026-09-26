@@ -2379,10 +2379,16 @@ impl Syscall<'_> {
         flags: usize,
     ) -> SysResult {
         let path = path.as_c_str()?;
-        let flags = AtFlags::from_bits_truncate(flags);
+        let flags = super::dir::at_flags(flags, super::dir::FCHOWNAT_FLAGS)?;
         let follow = !flags.contains(AtFlags::SYMLINK_NOFOLLOW);
         let proc = self.linux_process();
-        let inode = proc.lookup_inode_at(dirfd, path, follow)?;
+        // `AT_EMPTY_PATH` names the file `dirfd` is open on (`do_fchownat`
+        // takes `LOOKUP_EMPTY`); without it an empty path is `ENOENT`.
+        let inode = if flags.contains(AtFlags::EMPTY_PATH) && path.is_empty() {
+            super::dir::inode_of_dirfd(proc, dirfd)?
+        } else {
+            proc.lookup_inode_at(dirfd, path, follow)?
+        };
         let mut metadata = inode.metadata()?;
         proc.chown_metadata(&mut metadata, uid as u32, gid as u32)?;
         inode.set_metadata(&metadata)?;

@@ -360,7 +360,12 @@ impl Syscall<'_> {
             }
 
             let (inode, created) = if flags.contains(OpenFlags::CREATE) {
-                let (dir_path, file_name) = split_path(path);
+                // `open("", O_CREAT)` is `ENOENT`; `open("/", O_CREAT)`, like
+                // `.` and `..`, names a directory, `EISDIR`. Split as a plain
+                // name, either used to create a file called "" in the working
+                // directory.
+                let (dir_path, last) = super::dir::last_component(path)?;
+                let file_name = last.to_open_create()?;
                 // relative to cwd
                 let dir_inode = proc.lookup_inode_at(dir_fd, dir_path, true)?;
                 let dir_metadata = dir_inode.metadata()?;

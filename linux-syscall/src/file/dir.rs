@@ -67,7 +67,8 @@ impl Syscall<'_> {
             dirfd, path, mode
         );
 
-        let (dir_path, file_name) = split_path(path);
+        let (dir_path, last) = last_component(path)?;
+        let file_name = last.to_create()?;
         let proc = self.linux_process();
         let inode = proc.lookup_inode_at(dirfd, dir_path, true)?;
         let dir_metadata = inode.metadata()?;
@@ -118,7 +119,8 @@ impl Syscall<'_> {
             0o100000 | 0 => FileType::File,    // S_IFREG / unspecified => regular file
             _ => return Err(LxError::EINVAL),  // directories must use mkdir
         };
-        let (dir_path, file_name) = split_path(path);
+        let (dir_path, last) = last_component(path)?;
+        let file_name = last.to_create()?;
         let proc = self.linux_process();
         let inode = proc.lookup_inode_at(dirfd, dir_path, true)?;
         let dir_metadata = inode.metadata()?;
@@ -210,9 +212,19 @@ impl Syscall<'_> {
         );
 
         let proc = self.linux_process();
-        let (new_dir_path, new_file_name) = split_path(newpath);
+        let (new_dir_path, new_last) = last_component(newpath)?;
+        let new_file_name = new_last.to_create()?;
         let follow = flags.contains(AtFlags::SYMLINK_FOLLOW);
-        let inode = proc.lookup_inode_at(olddirfd, oldpath, follow)?;
+        // `AT_EMPTY_PATH`: the file `olddirfd` is open on (`LOOKUP_EMPTY`).
+        // Linux asks that the descriptor's opening credentials be the
+        // caller's, or `CAP_DAC_READ_SEARCH`; a descriptor here carries no
+        // credentials of its own, so what a process holds it may link.
+        // Without the flag an empty path is `ENOENT`, from the lookup.
+        let inode = if flags.contains(AtFlags::EMPTY_PATH) && oldpath.is_empty() {
+            inode_of_dirfd(proc, olddirfd)?
+        } else {
+            proc.lookup_inode_at(olddirfd, oldpath, follow)?
+        };
         let new_dir_inode = proc.lookup_inode_at(newdirfd, new_dir_path, true)?;
         let new_dir_metadata = new_dir_inode.metadata()?;
         proc.check_access(&new_dir_metadata, 0o3, true)?;
@@ -254,7 +266,12 @@ impl Syscall<'_> {
         );
 
         let proc = self.linux_process();
-        let (dir_path, file_name) = split_path(path);
+        let (dir_path, last) = last_component(path)?;
+        let file_name = if remove_dir {
+            last.to_rmdir()?
+        } else {
+            last.to_unlink()?
+        };
         let dir_inode = proc.lookup_inode_at(dirfd, dir_path, true)?;
         let dir_metadata = dir_inode.metadata()?;
         proc.check_access(&dir_metadata, 0o3, true)?;
@@ -307,8 +324,10 @@ impl Syscall<'_> {
         check_rename_flags(flags)?;
 
         let proc = self.linux_process();
-        let (old_dir_path, old_file_name) = split_path(oldpath);
-        let (new_dir_path, new_file_name) = split_path(newpath);
+        let (old_dir_path, old_last) = last_component(oldpath)?;
+        let (new_dir_path, new_last) = last_component(newpath)?;
+        let old_file_name = old_last.to_rename()?;
+        let new_file_name = new_last.to_rename()?;
         // The parents are intermediate components: a symlink among them is
         // followed, as everywhere else (`mv x /tmp/link-to-dir/y`).
         let old_dir_inode = proc.lookup_inode_at(olddirfd, old_dir_path, true)?;
@@ -435,7 +454,13 @@ impl Syscall<'_> {
             target, newdirfd, linkpath
         );
 
-        let (dir_path, file_name) = split_path(linkpath);
+        // `do_symlinkat`: an empty target is `ENOENT` (`getname` again),
+        // before the link's own name is looked at.
+        if target.is_empty() {
+            return Err(LxError::ENOENT);
+        }
+        let (dir_path, last) = last_component(linkpath)?;
+        let file_name = last.to_create()?;
         let proc = self.linux_process();
         let inode = proc.lookup_inode_at(newdirfd, dir_path, true)?;
         let dir_metadata = inode.metadata()?;
@@ -836,6 +861,110 @@ pub(crate) const STATX_FLAGS: usize = FSTATAT_FLAGS | AT_STATX_SYNC_TYPE;
 /// What `linkat(2)` accepts (`do_linkat`, `fs/namei.c`).
 pub(crate) const LINKAT_FLAGS: usize = AtFlags::SYMLINK_FOLLOW.bits() | AtFlags::EMPTY_PATH.bits();
 
+/// What `fchownat(2)` accepts (`do_fchownat`, `fs/open.c`).
+pub(crate) const FCHOWNAT_FLAGS: usize =
+    AtFlags::SYMLINK_NOFOLLOW.bits() | AtFlags::EMPTY_PATH.bits();
+
+/// The file `dirfd` is open on, for a syscall given `AT_EMPTY_PATH` and an
+/// empty path (`LOOKUP_EMPTY`): `AT_FDCWD` names the working directory.
+pub(crate) fn inode_of_dirfd(
+    proc: &linux_object::process::LinuxProcess,
+    dirfd: FileDesc,
+) -> LxResult<Arc<dyn INode>> {
+    if dirfd == FileDesc::CWD {
+        proc.lookup_inode_at(FileDesc::CWD, ".", true)
+    } else {
+        Ok(proc.get_file(dirfd)?.inode())
+    }
+}
+
+/// What the last component of a path names, as `fs/namei.c` classifies it
+/// (`LAST_NORM`, `LAST_ROOT`, `LAST_DOT`, `LAST_DOTDOT`).
+///
+/// `split_path` alone handed every caller `(".", "")` for the empty path
+/// and for `/` alike, and no caller looked at the name it got back:
+/// `mkdir("")`, `mkdir("/")`, `open("/", O_CREAT)`, `mknod("/")` and
+/// `symlink(t, "/")` each created an entry whose name is the empty string in
+/// the current directory -- the ramfs takes any name that is not `.` or
+/// `..` -- listed by `getdents` as "" and reachable by no path, and
+/// `unlink("/")` removed it again. Linux never gets there: an empty path is
+/// `ENOENT` before any lookup (`getname`), and a last component that is the
+/// root, `.` or `..` is refused by each syscall with its own errno.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LastComponent<'a> {
+    /// An ordinary name under its parent.
+    Name(&'a str),
+    /// The path was `/` (or only slashes).
+    Root,
+    /// The path ends in `.`.
+    Dot,
+    /// The path ends in `..`.
+    DotDot,
+}
+
+/// The parent's path and the last component of `path`, or `ENOENT` for the
+/// empty path.
+pub(crate) fn last_component(path: &str) -> LxResult<(&str, LastComponent<'_>)> {
+    if path.is_empty() {
+        return Err(LxError::ENOENT);
+    }
+    let (dir_path, name) = split_path(path);
+    let last = match name {
+        "" => LastComponent::Root,
+        "." => LastComponent::Dot,
+        ".." => LastComponent::DotDot,
+        name => LastComponent::Name(name),
+    };
+    Ok((dir_path, last))
+}
+
+impl<'a> LastComponent<'a> {
+    /// `filename_create` (`mkdir`, `mknod`, `symlink`, `link`'s new name):
+    /// the root, `.` and `..` exist already, `EEXIST`.
+    pub(crate) fn to_create(self) -> LxResult<&'a str> {
+        match self {
+            LastComponent::Name(name) => Ok(name),
+            _ => Err(LxError::EEXIST),
+        }
+    }
+
+    /// `do_open` with `O_CREAT`: the root, `.` and `..` are directories,
+    /// `EISDIR`, whatever else was asked.
+    pub(crate) fn to_open_create(self) -> LxResult<&'a str> {
+        match self {
+            LastComponent::Name(name) => Ok(name),
+            _ => Err(LxError::EISDIR),
+        }
+    }
+
+    /// `do_unlinkat`: anything but a plain name is `EISDIR`.
+    pub(crate) fn to_unlink(self) -> LxResult<&'a str> {
+        match self {
+            LastComponent::Name(name) => Ok(name),
+            _ => Err(LxError::EISDIR),
+        }
+    }
+
+    /// `do_rmdir`: the root is `EBUSY`, `.` is `EINVAL`, `..` is
+    /// `ENOTEMPTY`.
+    pub(crate) fn to_rmdir(self) -> LxResult<&'a str> {
+        match self {
+            LastComponent::Name(name) => Ok(name),
+            LastComponent::Root => Err(LxError::EBUSY),
+            LastComponent::Dot => Err(LxError::EINVAL),
+            LastComponent::DotDot => Err(LxError::ENOTEMPTY),
+        }
+    }
+
+    /// `do_renameat2`: either side that is not a plain name is `EBUSY`.
+    pub(crate) fn to_rename(self) -> LxResult<&'a str> {
+        match self {
+            LastComponent::Name(name) => Ok(name),
+            _ => Err(LxError::EBUSY),
+        }
+    }
+}
+
 /// `unlinkat(2)`'s `AT_REMOVEDIR`, which turns it into `rmdir`.
 ///
 /// It is not in `AtFlags` and must not be: Linux gives it the same value as
@@ -1201,7 +1330,7 @@ mod at_flags_tests {
 
     #[test]
     fn a_bit_no_syscall_knows_is_einval_everywhere() {
-        for allowed in [FSTATAT_FLAGS, STATX_FLAGS, LINKAT_FLAGS] {
+        for allowed in [FSTATAT_FLAGS, STATX_FLAGS, LINKAT_FLAGS, FCHOWNAT_FLAGS] {
             assert_eq!(at_flags(0, allowed), Ok(AtFlags::empty()));
             for bit in 0..usize::BITS as usize {
                 let flag = 1usize << bit;
@@ -1226,5 +1355,99 @@ mod at_flags_tests {
         assert!(parsed.contains(AtFlags::SYMLINK_NOFOLLOW));
         assert!(parsed.contains(AtFlags::EMPTY_PATH));
         assert!(!parsed.contains(AtFlags::SYMLINK_FOLLOW));
+    }
+}
+
+/// The last component of a path, the one every creating and removing
+/// syscall acts on by name.
+#[cfg(test)]
+mod last_component_tests {
+    use super::*;
+    use rcore_fs::vfs::FileSystem;
+    use rcore_fs_ramfs::RamFS;
+
+    fn last(path: &str) -> LastComponent<'_> {
+        last_component(path).unwrap().1
+    }
+
+    #[test]
+    fn the_empty_path_is_enoent_before_anything_is_split() {
+        assert_eq!(last_component("").err(), Some(LxError::ENOENT));
+    }
+
+    #[test]
+    fn the_root_and_the_dots_are_told_apart_from_a_name() {
+        for root in ["/", "//", "///"] {
+            assert_eq!(last(root), LastComponent::Root, "{root:?}");
+        }
+        for dot in [".", "./", "a/.", "/a/./"] {
+            assert_eq!(last(dot), LastComponent::Dot, "{dot:?}");
+        }
+        for dotdot in ["..", "../", "a/..", "/.."] {
+            assert_eq!(last(dotdot), LastComponent::DotDot, "{dotdot:?}");
+        }
+        // A name that merely starts with a dot is a name.
+        assert_eq!(last(".hidden"), LastComponent::Name(".hidden"));
+        assert_eq!(last("a/..."), LastComponent::Name("..."));
+    }
+
+    #[test]
+    fn a_name_keeps_its_parent() {
+        assert_eq!(last_component("a"), Ok((".", LastComponent::Name("a"))));
+        assert_eq!(last_component("a/"), Ok((".", LastComponent::Name("a"))));
+        assert_eq!(last_component("/a"), Ok(("/", LastComponent::Name("a"))));
+        assert_eq!(
+            last_component("/x/y/a"),
+            Ok(("/x/y", LastComponent::Name("a")))
+        );
+    }
+
+    #[test]
+    fn each_syscall_refuses_what_is_not_a_name_with_its_own_errno() {
+        for special in [
+            LastComponent::Root,
+            LastComponent::Dot,
+            LastComponent::DotDot,
+        ] {
+            // `filename_create`: `EEXIST`, they are all there already.
+            assert_eq!(special.to_create(), Err(LxError::EEXIST), "{special:?}");
+            // `do_open`: a directory, `EISDIR`.
+            assert_eq!(
+                special.to_open_create(),
+                Err(LxError::EISDIR),
+                "{special:?}"
+            );
+            // `do_unlinkat`: `EISDIR`.
+            assert_eq!(special.to_unlink(), Err(LxError::EISDIR), "{special:?}");
+            // `do_renameat2`: `EBUSY`.
+            assert_eq!(special.to_rename(), Err(LxError::EBUSY), "{special:?}");
+        }
+        // `do_rmdir` tells the three apart.
+        assert_eq!(LastComponent::Root.to_rmdir(), Err(LxError::EBUSY));
+        assert_eq!(LastComponent::Dot.to_rmdir(), Err(LxError::EINVAL));
+        assert_eq!(LastComponent::DotDot.to_rmdir(), Err(LxError::ENOTEMPTY));
+        // A name passes through everywhere.
+        let name = LastComponent::Name("a");
+        assert_eq!(name.to_create(), Ok("a"));
+        assert_eq!(name.to_open_create(), Ok("a"));
+        assert_eq!(name.to_unlink(), Ok("a"));
+        assert_eq!(name.to_rmdir(), Ok("a"));
+        assert_eq!(name.to_rename(), Ok("a"));
+    }
+
+    /// Why the guard has to be here: the filesystem takes the empty name.
+    /// `mkdir("/")` reached it as `create("")` in the working directory.
+    #[test]
+    fn the_filesystem_would_take_an_empty_name_so_nothing_may_hand_it_one() {
+        let root = RamFS::new().root_inode();
+        let (dir_path, name) = split_path("/");
+        assert_eq!((dir_path, name), (".", ""));
+        root.create(name, FileType::File, 0o644).unwrap();
+        assert!(root.list().unwrap().iter().any(|n| n.is_empty()));
+        // The classified path never gets that far.
+        assert_eq!(
+            last_component("/").and_then(|(_, l)| l.to_create()),
+            Err(LxError::EEXIST)
+        );
     }
 }
