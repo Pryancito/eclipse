@@ -2,6 +2,7 @@
 
 use alloc::{fmt::Write as _, string::String, sync::Arc, vec::Vec};
 use core::any::Any;
+use core::time::Duration;
 use lazy_static::lazy_static;
 
 use kernel_hal::drivers;
@@ -318,6 +319,29 @@ fn proc_pid_stat(proc: &Process) -> String {
     let utime = (utime_ns / NS_PER_TICK) as i64;
     let stime = (stime_ns / NS_PER_TICK) as i64;
 
+    // Fields 16/17 (cutime/cstime), 22 (starttime), 23 (vsize) and 24 (rss):
+    // `do_task_stat` publishes the reaped children's times, the task's
+    // `start_boottime` in clock ticks, `mm->total_vm` in BYTES and
+    // `get_mm_rss` in PAGES. All five read 0 here while `status`, `statm`,
+    // `getrusage(RUSAGE_CHILDREN)` and `times()` had the numbers, so `ps
+    // aux` showed VSZ 0 and RSS 0 for every process, `ps -o etime` the age
+    // of the machine, and `top`'s TIME+ never counted a finished child.
+    let (cutime_ns, cstime_ns) = proc
+        .try_linux()
+        .map(|lp| lp.children_cpu_ns())
+        .unwrap_or((0, 0));
+    let cutime = (cutime_ns / NS_PER_TICK) as i64;
+    let cstime = (cstime_ns / NS_PER_TICK) as i64;
+    let starttime = proc
+        .try_linux()
+        .map(|lp| (lp.start_time_ns() / NS_PER_TICK) as i64)
+        .unwrap_or(0);
+    let stats = proc.vmar().get_task_stats();
+    let (vsize, rss) = stat_memory_fields(
+        stats.mapped_bytes(),
+        stats.private_bytes() + stats.shared_bytes(),
+    );
+
     // Field 39 (processor): the CPU the leader thread last ran on.
     let processor = first_thread
         .as_ref()
@@ -344,9 +368,14 @@ fn proc_pid_stat(proc: &Process) -> String {
     rest[8 - 5] = tpgid;
     rest[14 - 5] = utime;
     rest[15 - 5] = stime;
+    rest[16 - 5] = cutime;
+    rest[17 - 5] = cstime;
     rest[18 - 5] = priority;
     rest[19 - 5] = nice;
     rest[20 - 5] = nthreads;
+    rest[22 - 5] = starttime;
+    rest[23 - 5] = vsize;
+    rest[24 - 5] = rss;
     rest[39 - 5] = processor;
     rest[40 - 5] = rt_priority;
     rest[41 - 5] = policy;
@@ -357,6 +386,17 @@ fn proc_pid_stat(proc: &Process) -> String {
     }
     out.push('\n');
     out
+}
+
+/// Fields 23 and 24 of `/proc/<pid>/stat` from the task's memory totals:
+/// `vsize` is `mm->total_vm << PAGE_SHIFT`, in BYTES, and `rss` is
+/// `get_mm_rss(mm)`, in PAGES (`do_task_stat`, `fs/proc/array.c`). The two
+/// units differ, and `ps` divides the first by 1024 and multiplies the
+/// second by the page size, so a byte count in `rss` would show every
+/// process at four thousand times its size.
+fn stat_memory_fields(mapped_bytes: u64, resident_bytes: u64) -> (i64, i64) {
+    const PAGE: u64 = 4096;
+    (mapped_bytes as i64, (resident_bytes / PAGE) as i64)
 }
 
 fn proc_pid_status(proc: &Process) -> String {
@@ -375,10 +415,39 @@ fn proc_pid_status(proc: &Process) -> String {
     let vm_size_kb = stats.mapped_bytes() / 1024;
     let vm_rss_kb = (stats.private_bytes() + stats.shared_bytes()) / 1024;
     let threads = proc.thread_ids().len().max(1);
+    // The ids are the process's own, not a constant: `polkit`, `sudo`,
+    // `ps -u` and `pkexec` read the `Uid:` line to decide who is asking.
+    let ids = proc
+        .try_linux()
+        .map(|lp| credential_lines(&lp.credentials()))
+        .unwrap_or_default();
     format!(
-        "Name:\t{}\nState:\t{}\nTgid:\t{}\nPid:\t{}\nPPid:\t{}\nUid:\t0\t0\t0\t0\nGid:\t0\t0\t0\t0\nVmSize:\t{:8} kB\nVmRSS:\t{:8} kB\nThreads:\t{}\n",
-        name, state, pid, pid, ppid, vm_size_kb, vm_rss_kb, threads
+        "Name:\t{}\nState:\t{}\nTgid:\t{}\nPid:\t{}\nPPid:\t{}\n{}VmSize:\t{:8} kB\nVmRSS:\t{:8} kB\nThreads:\t{}\n",
+        name, state, pid, pid, ppid, ids, vm_size_kb, vm_rss_kb, threads
     )
+}
+
+/// The `Uid:`, `Gid:` and `Groups:` lines of `/proc/<pid>/status`, in the
+/// order proc(5) gives them: real, effective, saved, filesystem. `Groups:`
+/// follows `task_state()` in `fs/proc/array.c`: each id followed by a space,
+/// then the newline.
+fn credential_lines(creds: &crate::process::Credentials) -> String {
+    let mut out = format!(
+        "Uid:\t{}\t{}\t{}\t{}\nGid:\t{}\t{}\t{}\t{}\nGroups:\t",
+        creds.ruid,
+        creds.euid,
+        creds.suid,
+        creds.fsuid,
+        creds.rgid,
+        creds.egid,
+        creds.sgid,
+        creds.fsgid
+    );
+    for group in &creds.groups {
+        let _ = write!(out, "{} ", group);
+    }
+    out.push('\n');
+    out
 }
 
 /// `/proc/<pid>/statm`: memory usage in PAGES — "size resident shared text
@@ -586,6 +655,29 @@ impl INode for ProcRootINode {
     }
 }
 
+/// Inode numbers of `/proc/<pid>` and everything under it.
+///
+/// Linux gives every one of those a number of its own (`proc_pid_make_inode`
+/// takes a fresh one per entry). Here the directory was `100 + pid`, every
+/// file under it `200 + pid` whatever the file, and `fd` `40 + pid`, all on
+/// device 0 with the fixed files of `/proc` living in 10..=999: `/proc/1`
+/// was the same (dev, ino) as a fixed file, `/proc/61/fd` as `/proc/1`, and
+/// `/proc/<pid>/stat`, `status`, `cmdline`, `environ`... were one inode to
+/// every tool that compares files by identity (`cmp`, `diff`, `cp`, `tar`,
+/// `[ a -ef b ]`), which then takes them for the same file without reading.
+///
+/// The numbers start above every fixed one and leave `PID_INODE_SLOTS` per
+/// process: slot 0 is the directory, the rest its entries.
+pub(crate) const PID_INODE_BASE: usize = 0x1_0000;
+pub(crate) const PID_INODE_SLOTS: usize = 16;
+/// Slot of `/proc/<pid>/fd` (`proc_self.rs`); the files use their kind's.
+pub(crate) const PID_FD_DIR_SLOT: usize = 10;
+
+pub(crate) fn pid_inode(pid: u64, slot: usize) -> usize {
+    debug_assert!(slot < PID_INODE_SLOTS);
+    PID_INODE_BASE + (pid as usize) * PID_INODE_SLOTS + slot
+}
+
 /// `/proc/<pid>/` — `stat`, `cmdline`, `status` for BusyBox `ps`.
 struct ProcPidDirINode {
     pid: u64,
@@ -640,7 +732,7 @@ impl INode for ProcPidDirINode {
     fn metadata(&self) -> Result<Metadata> {
         Ok(Metadata {
             dev: 0,
-            inode: 100 + self.pid as usize,
+            inode: pid_inode(self.pid, 0),
             size: 0,
             blk_size: 0,
             blocks: 0,
@@ -824,12 +916,14 @@ impl INode for ProcNetDirINode {
 }
 
 /// `/proc/sysvipc` — per-mechanism System V IPC tables
-/// (Documentation/filesystems/proc.rst); `msg` is what `ipcs -q` reads.
+/// (Documentation/filesystems/proc.rst): `msg`, `sem` and `shm` are what
+/// `ipcs -q`, `ipcs -s` and `ipcs -m` read. Only `msg` was here, so `ipcs`
+/// (and `ipcrm -a`) saw no semaphore set and no shared segment at all.
 struct ProcSysvipcDirINode;
 
 impl ProcSysvipcDirINode {
-    fn entries() -> [&'static str; 3] {
-        [".", "..", "msg"]
+    fn entries() -> [&'static str; 5] {
+        [".", "..", "msg", "sem", "shm"]
     }
 }
 
@@ -862,6 +956,8 @@ impl INode for ProcSysvipcDirINode {
             "." => Ok(PROC_SYSVIPC_DIR.clone()),
             ".." => Ok(PROC_ROOT.clone()),
             "msg" => Ok(PROC_SYSVIPC_MSG.clone()),
+            "sem" => Ok(PROC_SYSVIPC_SEM.clone()),
+            "shm" => Ok(PROC_SYSVIPC_SHM.clone()),
             _ => Err(FsError::EntryNotFound),
         }
     }
@@ -1385,6 +1481,16 @@ fn proc_sysvipc_msg_content() -> String {
     crate::ipc::msg_proc_table()
 }
 
+/// `/proc/sysvipc/sem`: the live System V semaphore-set table.
+fn proc_sysvipc_sem_content() -> String {
+    crate::ipc::sem_proc_table()
+}
+
+/// `/proc/sysvipc/shm`: the live System V shared-memory table.
+fn proc_sysvipc_shm_content() -> String {
+    crate::ipc::shm_proc_table()
+}
+
 /// Linux's default vm.max_map_count. Address-space-hungry runtimes (JVMs,
 /// wasm engines) read it to size their reservation strategy.
 fn proc_sys_max_map_count_content() -> String {
@@ -1604,7 +1710,8 @@ impl INode for ProcSelfSymINode {
             .unwrap_or_else(|| "1".into());
         Ok(Metadata {
             dev: 0,
-            inode: 12,
+            // Its own: 12 is `/proc/cpuinfo`'s.
+            inode: 19,
             size: target.len(),
             blk_size: 0,
             blocks: 0,
@@ -1640,6 +1747,24 @@ enum ProcPidFileKind {
     Environ,
     Statm,
     Threads,
+}
+
+impl ProcPidFileKind {
+    /// The file's slot in its process's inode numbers (see `pid_inode`):
+    /// one per kind, none of them the directory's 0 or `PID_FD_DIR_SLOT`.
+    fn slot(self) -> usize {
+        match self {
+            Self::Stat => 1,
+            Self::Cmdline => 2,
+            Self::Status => 3,
+            Self::Perf => 4,
+            Self::Maps => 5,
+            Self::Comm => 6,
+            Self::Environ => 7,
+            Self::Statm => 8,
+            Self::Threads => 9,
+        }
+    }
 }
 
 /// `/proc/<pid>/maps` in the format of Documentation/filesystems/proc.rst:
@@ -1744,7 +1869,7 @@ impl INode for ProcPidFileINode {
         let size = self.bytes()?.len();
         Ok(Metadata {
             dev: 0,
-            inode: 200 + self.pid as usize,
+            inode: pid_inode(self.pid, self.kind.slot()),
             size,
             blk_size: 4096,
             blocks: size.div_ceil(4096),
@@ -1877,10 +2002,22 @@ fn proc_uptime_content() -> String {
 /// spent blocked in a syscall — and `idle` from the same halt-time counter
 /// `/proc/perf/kernel` and `/proc/uptime` already use, so all three views
 /// agree with each other and with reality.
+///
+/// `btime` is the boot time in seconds since the epoch, `intr` the interrupts
+/// handled since boot and `processes` the processes created since boot
+/// (`total_forks`). All three read 0 (`processes` read the number ALIVE): `ps
+/// -o lstart` adds the process's start ticks to `btime`, so every process
+/// started on 1 January 1970, and `vmstat` differentiated `processes` and
+/// `intr` into forks and interrupts per second, both 0 or negative.
 fn proc_stat_content() -> String {
-    let procs = all_processes();
     let running = crate::loadavg::runnable_count();
     let ncpus = kernel_hal::online_cpu_count().max(1);
+    let btime = boot_time_secs(
+        kernel_hal::timer::timer_now_realtime(),
+        kernel_hal::timer::timer_now(),
+    );
+    let intr = kernel_hal::kstats::snapshot().irq_total;
+    let forks = crate::process::processes_created();
 
     let (mut total_user, mut total_sys, mut total_idle) = (0u64, 0u64, 0u64);
     let mut per_cpu = String::new();
@@ -1896,15 +2033,23 @@ fn proc_stat_content() -> String {
     format!(
         "cpu  {total_user} 0 {total_sys} {total_idle} 0 0 0 0 0 0\n\
          {per_cpu}\
-         intr 0\n\
+         intr {intr}\n\
          ctxt 0\n\
-         btime 0\n\
-         processes {}\n\
+         btime {btime}\n\
+         processes {forks}\n\
          procs_running {}\n\
          procs_blocked 0\n",
-        procs.len(),
         running
     )
+}
+
+/// The `btime` of `/proc/stat`: when the machine booted, in seconds since
+/// the epoch, which is the wall clock now minus how long it has been up
+/// (`getboottime64`). `ps` adds a process's start ticks to it to print
+/// `lstart`/`start_time`, so a `btime` of 0 dates every process to 1970.
+/// A wall clock behind the uptime (unset RTC) gives 0 rather than a wrap.
+fn boot_time_secs(realtime: Duration, monotonic: Duration) -> u64 {
+    realtime.saturating_sub(monotonic).as_secs()
 }
 
 /// `/proc/loadavg` — one-line load averages for `top` header.
@@ -3250,7 +3395,8 @@ lazy_static! {
         generate: proc_sys_threads_max_content,
     });
     static ref PROC_SYS_OVERFLOWUID: Arc<dyn INode> = Arc::new(ProcSeqINode {
-        inode: 107,
+        // Its own: 107 is `/proc/gpuroles`'s.
+        inode: 112,
         generate: proc_sys_overflowuid_content,
     });
     static ref PROC_SYS_OVERFLOWGID: Arc<dyn INode> = Arc::new(ProcSeqINode {
@@ -3270,6 +3416,14 @@ lazy_static! {
     static ref PROC_SYSVIPC_MSG: Arc<dyn INode> = Arc::new(ProcSeqINode {
         inode: 22,
         generate: proc_sysvipc_msg_content,
+    });
+    static ref PROC_SYSVIPC_SEM: Arc<dyn INode> = Arc::new(ProcSeqINode {
+        inode: 23,
+        generate: proc_sysvipc_sem_content,
+    });
+    static ref PROC_SYSVIPC_SHM: Arc<dyn INode> = Arc::new(ProcSeqINode {
+        inode: 24,
+        generate: proc_sysvipc_shm_content,
     });
     static ref PROC_SYS_VM_DIR: Arc<dyn INode> = Arc::new(ProcSysVmDirINode);
     static ref PROC_SYS_OVERCOMMIT: Arc<dyn INode> = Arc::new(ProcSeqINode {
@@ -3310,6 +3464,510 @@ lazy_static! {
         generate: proc_kbd_content,
         store: store_kbd,
     });
+}
+
+#[cfg(test)]
+mod pid_status_tests {
+    //! `/proc/<pid>/status` said `Uid:\t0\t0\t0\t0` and `Gid:\t0\t0\t0\t0`
+    //! for every process on the machine, whoever it belonged to. That line is
+    //! what `polkit`, `pkexec`, `sudo` and `ps -u` read to learn who is
+    //! asking, so every unprivileged process looked like root to them.
+
+    use super::*;
+    use crate::process::{Credentials, LinuxProcess};
+    use rcore_fs_ramfs::RamFS;
+
+    fn creds() -> Credentials {
+        Credentials {
+            ruid: 1000,
+            euid: 1001,
+            suid: 1002,
+            rgid: 2000,
+            egid: 2001,
+            sgid: 2002,
+            fsuid: 1003,
+            fsgid: 2003,
+            groups: alloc::vec![1000, 4, 24],
+            umask: 0o022,
+        }
+    }
+
+    #[test]
+    fn the_uid_and_gid_lines_are_the_process_s_own_ids_in_proc_5_order() {
+        // Real, effective, saved, filesystem: the order proc(5) gives, and
+        // the one `ps` and `polkit` parse by position.
+        let lines = credential_lines(&creds());
+        assert!(lines.starts_with("Uid:\t1000\t1001\t1002\t1003\nGid:\t2000\t2001\t2002\t2003\n"));
+    }
+
+    #[test]
+    fn the_groups_line_lists_every_supplementary_group() {
+        let lines = credential_lines(&creds());
+        assert!(lines.ends_with("Groups:\t1000 4 24 \n"), "{:?}", lines);
+    }
+
+    #[test]
+    fn a_process_that_dropped_to_a_user_reports_that_user() {
+        // The whole file, on a real process: root that became uid 1000 via
+        // setresuid, the way `login` and `su` end up.
+        let proc = Process::create_with_fixed_id_ext(
+            &Job::root(),
+            4242,
+            "root",
+            LinuxProcess::new(RamFS::new(), 0),
+        )
+        .unwrap();
+        let lp = proc.linux();
+        lp.set_resgid(100, 100, 100).unwrap();
+        lp.set_groups(alloc::vec![100, 27]);
+        lp.set_resuid(1000, 1000, 1000).unwrap();
+        let status = proc_pid_status(&proc);
+        assert!(
+            status.contains("PPid:\t0\nUid:\t1000\t1000\t1000\t1000\nGid:\t100\t100\t100\t100\nGroups:\t100 27 \nVmSize:"),
+            "{:?}",
+            status
+        );
+    }
+}
+
+#[cfg(test)]
+mod pid_stat_tests {
+    //! `/proc/<pid>/stat` fields 16/17 (cutime/cstime), 22 (starttime), 23
+    //! (vsize) and 24 (rss) were written as 0 for every process, while
+    //! `status`, `statm`, `getrusage` and `times()` already had the numbers:
+    //! `ps aux` showed VSZ 0 and RSS 0, `ps -o etime` the uptime of the
+    //! machine for everything, and `top`'s TIME+ never counted a reaped child.
+
+    use super::*;
+    use crate::process::{ChildCpu, LinuxProcess};
+    use rcore_fs_ramfs::RamFS;
+    use zircon_object::vm::{MMUFlags, VmObject, PAGE_SIZE};
+
+    fn a_process(pid: u64) -> Arc<Process> {
+        Process::create_with_fixed_id_ext(
+            &Job::root(),
+            pid,
+            "stat",
+            LinuxProcess::new(RamFS::new(), 0),
+        )
+        .unwrap()
+    }
+
+    /// Field `n` (1-based, as proc(5) numbers them) of the stat line. The
+    /// comm is in parentheses and may hold spaces, so the split starts
+    /// after the closing one.
+    fn field(line: &str, n: usize) -> i64 {
+        assert!(n >= 3);
+        let after_comm = &line[line.rfind(')').unwrap() + 2..];
+        after_comm
+            .split(' ')
+            .nth(n - 3)
+            .unwrap_or_else(|| panic!("field {} of {:?}", n, line))
+            .trim()
+            .parse()
+            .unwrap()
+    }
+
+    #[test]
+    fn the_children_times_are_the_reaped_children_s_cpu_in_ticks() {
+        let proc = a_process(4301);
+        let line = proc_pid_stat(&proc);
+        assert_eq!((field(&line, 16), field(&line, 17)), (0, 0));
+        // The child's CPU is what `wait4` credited: 2.5 s user and 30 ms
+        // system, in USER_HZ ticks.
+        proc.linux().credit_children_cpu(ChildCpu {
+            utime_ns: 2_500_000_000,
+            stime_ns: 30_000_000,
+        });
+        let line = proc_pid_stat(&proc);
+        assert_eq!(field(&line, 16), 250, "{:?}", line);
+        assert_eq!(field(&line, 17), 3, "{:?}", line);
+    }
+
+    #[test]
+    fn starttime_is_the_process_s_birth_on_the_monotonic_clock_in_ticks() {
+        let before = kernel_hal::timer::timer_now().as_nanos() as u64;
+        let proc = a_process(4302);
+        let after = kernel_hal::timer::timer_now().as_nanos() as u64;
+        // Born between the two readings, not at 0 (the boot) and not on the
+        // wall clock.
+        let born = proc.linux().start_time_ns();
+        assert!(
+            before <= born && born <= after,
+            "{} <= {} <= {}",
+            before,
+            born,
+            after
+        );
+        let expected = (born / 10_000_000) as i64;
+        let line = proc_pid_stat(&proc);
+        assert_eq!(field(&line, 22), expected, "{:?}", line);
+        // A process born later is born later: the value is per process, not
+        // the boot or a constant.
+        let later = a_process(4303);
+        assert!(later.linux().start_time_ns() >= proc.linux().start_time_ns());
+    }
+
+    #[test]
+    fn vsize_is_in_bytes_and_rss_in_pages_of_what_is_mapped_and_resident() {
+        let proc = a_process(4304);
+        let line = proc_pid_stat(&proc);
+        assert_eq!((field(&line, 23), field(&line, 24)), (0, 0), "{:?}", line);
+        // Three pages mapped and written, so all three are resident.
+        let vmo = VmObject::new_paged(3);
+        vmo.write(0, &[1u8; 3 * PAGE_SIZE]).unwrap();
+        let flags = MMUFlags::READ | MMUFlags::WRITE | MMUFlags::USER;
+        proc.vmar()
+            .map(None, vmo.clone(), 0, 3 * PAGE_SIZE, flags)
+            .unwrap();
+        let line = proc_pid_stat(&proc);
+        assert_eq!(field(&line, 23), (3 * PAGE_SIZE) as i64, "{:?}", line);
+        assert_eq!(field(&line, 24), 3, "{:?}", line);
+        // And they agree with `statm`, which `top` reads: size and resident
+        // there are both in pages.
+        assert_eq!(proc_pid_statm(&proc), "3 3 0 0 0 0 0\n");
+        // Mapped a second time the pages are shared, and shared pages are
+        // resident too: `get_mm_rss` is file + anon + shmem, and `ps` would
+        // otherwise show RSS 0 for a process that lives on shared memory.
+        proc.vmar().map(None, vmo, 0, 3 * PAGE_SIZE, flags).unwrap();
+        let line = proc_pid_stat(&proc);
+        assert_eq!(field(&line, 23), (6 * PAGE_SIZE) as i64, "{:?}", line);
+        assert_eq!(field(&line, 24), 6, "{:?}", line);
+        assert_eq!(proc_pid_statm(&proc), "6 6 6 0 0 0 0\n");
+    }
+
+    #[test]
+    fn the_two_memory_fields_have_different_units() {
+        // `do_task_stat`: `vsize` is `total_vm << PAGE_SHIFT` (bytes), `rss`
+        // is `get_mm_rss` (pages). `ps` divides the one by 1024 and
+        // multiplies the other by the page size.
+        assert_eq!(stat_memory_fields(3 * 4096, 2 * 4096), (3 * 4096, 2));
+        assert_eq!(stat_memory_fields(0, 0), (0, 0));
+        assert_eq!(stat_memory_fields(4096, 4095), (4096, 0));
+    }
+}
+
+#[cfg(test)]
+mod proc_inode_tests {
+    //! Every entry of `/proc` had to have an inode number of its own, and
+    //! did not: `/proc/self` was `/proc/cpuinfo`'s, `/proc/sys/kernel/
+    //! overflowuid` was `/proc/gpuroles`'s, `/proc/<pid>` sat on the fixed
+    //! files' numbers, and the nine files under a process were one inode.
+
+    use super::*;
+    use crate::process::LinuxProcess;
+    use alloc::collections::BTreeMap;
+    use rcore_fs_ramfs::RamFS;
+
+    /// Walk the fixed part of `/proc` (no process directories, no `self`),
+    /// collecting `(path, inode)`.
+    fn fixed_entries(dir: &Arc<dyn INode>, path: &str, out: &mut Vec<(String, usize)>) {
+        let mut i = 0;
+        while let Ok(name) = dir.get_entry(i) {
+            i += 1;
+            if name == "." || name == ".." || name == "self" || name.parse::<u64>().is_ok() {
+                continue;
+            }
+            let child = dir
+                .find(&name)
+                .unwrap_or_else(|e| panic!("{}/{}: {:?}", path, name, e));
+            let md = child.metadata().unwrap();
+            let child_path = alloc::format!("{}/{}", path, name);
+            out.push((child_path.clone(), md.inode));
+            if md.type_ == FileType::Dir {
+                fixed_entries(&child, &child_path, out);
+            }
+        }
+    }
+
+    fn duplicates(entries: &[(String, usize)]) -> Vec<(usize, Vec<String>)> {
+        let mut by_inode: BTreeMap<usize, Vec<String>> = BTreeMap::new();
+        for (path, inode) in entries {
+            by_inode.entry(*inode).or_default().push(path.clone());
+        }
+        by_inode
+            .into_iter()
+            .filter(|(_, paths)| paths.len() > 1)
+            .collect()
+    }
+
+    #[test]
+    fn every_fixed_file_of_proc_has_an_inode_of_its_own_below_the_pids() {
+        let root: Arc<dyn INode> = PROC_ROOT.clone();
+        let mut entries = alloc::vec![(String::from("/proc"), root.metadata().unwrap().inode)];
+        fixed_entries(&root, "/proc", &mut entries);
+        assert!(
+            entries.len() > 50,
+            "the walk saw the tree: {}",
+            entries.len()
+        );
+        assert_eq!(duplicates(&entries), Vec::new());
+        for (path, inode) in &entries {
+            assert!(
+                *inode < PID_INODE_BASE,
+                "{} at {} is in the pid range",
+                path,
+                inode
+            );
+        }
+        // The two that shared a number with another file.
+        let inode_of = |name: &str| root.find(name).unwrap().metadata().unwrap().inode;
+        assert_ne!(inode_of("self"), inode_of("cpuinfo"));
+        assert_ne!(
+            PROC_SYS_DIR
+                .find("kernel")
+                .unwrap()
+                .find("overflowuid")
+                .unwrap()
+                .metadata()
+                .unwrap()
+                .inode,
+            inode_of("gpuroles")
+        );
+    }
+
+    #[test]
+    fn a_process_s_directory_and_each_file_under_it_are_distinct_inodes() {
+        let kinds = [
+            ProcPidFileKind::Stat,
+            ProcPidFileKind::Cmdline,
+            ProcPidFileKind::Status,
+            ProcPidFileKind::Perf,
+            ProcPidFileKind::Maps,
+            ProcPidFileKind::Comm,
+            ProcPidFileKind::Environ,
+            ProcPidFileKind::Statm,
+            ProcPidFileKind::Threads,
+        ];
+        let inodes_of = |pid: u64| -> Vec<usize> {
+            let mut v = alloc::vec![ProcPidDirINode { pid }.metadata().unwrap().inode];
+            v.extend(
+                kinds
+                    .iter()
+                    .map(|&kind| ProcPidFileINode { pid, kind }.metadata().unwrap().inode),
+            );
+            v.push(pid_inode(pid, PID_FD_DIR_SLOT));
+            v
+        };
+        // The files answer `metadata` from the process, so it must exist.
+        let pids = [4601u64, 4607, 4661];
+        let _alive: Vec<Arc<Process>> = pids
+            .iter()
+            .map(|&pid| {
+                // Under `ROOT_JOB`, where `/proc` looks processes up.
+                Process::create_with_fixed_id_ext(
+                    &ROOT_JOB,
+                    pid,
+                    "ino",
+                    LinuxProcess::new(RamFS::new(), 0),
+                )
+                .unwrap()
+            })
+            .collect();
+        let mut all: Vec<(String, usize)> = Vec::new();
+        for pid in pids {
+            for (i, inode) in inodes_of(pid).into_iter().enumerate() {
+                assert!(
+                    inode >= PID_INODE_BASE,
+                    "pid {} slot {} at {}",
+                    pid,
+                    i,
+                    inode
+                );
+                all.push((alloc::format!("{}/{}", pid, i), inode));
+            }
+        }
+        assert_eq!(duplicates(&all), Vec::new());
+    }
+
+    #[test]
+    fn the_fd_directory_of_a_process_is_its_own_inode_too() {
+        // `/proc/61/fd` was `40 + 61 = 101`, the inode of `/proc/1`.
+        let proc = Process::create_with_fixed_id_ext(
+            &Job::root(),
+            4501,
+            "fd",
+            LinuxProcess::new(RamFS::new(), 0),
+        )
+        .unwrap();
+        let fd_dir = super::super::proc_self::ProcSelfFdDir {
+            process: proc.clone(),
+        };
+        let inode = fd_dir.metadata().unwrap().inode;
+        assert_eq!(inode, pid_inode(4501, PID_FD_DIR_SLOT));
+        assert_ne!(
+            inode,
+            ProcPidDirINode { pid: 4501 }.metadata().unwrap().inode
+        );
+        assert_ne!(
+            inode,
+            ProcPidDirINode { pid: 4461 }.metadata().unwrap().inode
+        );
+    }
+}
+
+#[cfg(test)]
+mod stat_file_tests {
+    //! `/proc/stat` said `btime 0`, `intr 0` and gave the number of live
+    //! processes as `processes`: `ps -o lstart` dated every process to 1970
+    //! and `vmstat` had no forks or interrupts per second to show.
+
+    use super::*;
+    use crate::process::LinuxProcess;
+    use rcore_fs_ramfs::RamFS;
+
+    fn line_value(text: &str, key: &str) -> u64 {
+        text.lines()
+            .find_map(|line| {
+                line.strip_prefix(key)
+                    .and_then(|rest| rest.strip_prefix(' '))
+            })
+            .unwrap_or_else(|| panic!("{} in {:?}", key, text))
+            .trim()
+            .parse()
+            .unwrap()
+    }
+
+    #[test]
+    fn btime_is_the_wall_clock_minus_the_uptime() {
+        assert_eq!(
+            boot_time_secs(Duration::from_secs(1_700_000_100), Duration::from_secs(100)),
+            1_700_000_000
+        );
+        // Seconds, whole: `ps` reads an integer.
+        assert_eq!(
+            boot_time_secs(Duration::from_millis(10_900), Duration::from_millis(400)),
+            10
+        );
+        // A wall clock behind the uptime is a clock nobody set, not a wrap.
+        assert_eq!(
+            boot_time_secs(Duration::from_secs(5), Duration::from_secs(50)),
+            0
+        );
+        // And the file carries it: what the two clocks say around the read.
+        let before = boot_time_secs(
+            kernel_hal::timer::timer_now_realtime(),
+            kernel_hal::timer::timer_now(),
+        );
+        let btime = line_value(&proc_stat_content(), "btime");
+        let after = boot_time_secs(
+            kernel_hal::timer::timer_now_realtime(),
+            kernel_hal::timer::timer_now(),
+        );
+        assert!(
+            before.saturating_sub(1) <= btime && btime <= after + 1,
+            "{}",
+            btime
+        );
+        assert!(btime > 0);
+    }
+
+    #[test]
+    fn processes_counts_the_forks_since_boot_not_the_processes_alive() {
+        let before = line_value(&proc_stat_content(), "processes");
+        let created = Process::create_with_fixed_id_ext(
+            &Job::root(),
+            4401,
+            "stat",
+            LinuxProcess::new(RamFS::new(), 0),
+        )
+        .unwrap();
+        let alive = all_processes().len() as u64;
+        let with_one_more = line_value(&proc_stat_content(), "processes");
+        assert!(
+            with_one_more >= before + 1,
+            "{} then {}",
+            before,
+            with_one_more
+        );
+        // It is a counter of births, so it does not track how many live.
+        drop(created);
+        assert!(line_value(&proc_stat_content(), "processes") >= with_one_more);
+        assert!(
+            with_one_more >= alive,
+            "{} forks, {} alive",
+            with_one_more,
+            alive
+        );
+    }
+
+    #[test]
+    fn intr_is_the_interrupts_handled_since_boot() {
+        let before = line_value(&proc_stat_content(), "intr");
+        for _ in 0..3 {
+            kernel_hal::kstats::note_irq(0xF2);
+        }
+        assert!(line_value(&proc_stat_content(), "intr") >= before + 3);
+    }
+}
+
+/// `ipcs` walks `/proc/sysvipc/{msg,sem,shm}`; a table that is not there is
+/// a mechanism whose objects nobody can list or clean up.
+#[cfg(test)]
+mod sysvipc_dir_tests {
+    use super::*;
+
+    fn read_all(inode: &Arc<dyn INode>) -> String {
+        let mut buf = alloc::vec![0u8; 4096];
+        let n = inode.read_at(0, &mut buf).unwrap();
+        String::from_utf8(buf[..n].to_vec()).unwrap()
+    }
+
+    #[test]
+    fn the_directory_lists_and_resolves_all_three_tables() {
+        let dir = PROC_SYSVIPC_DIR.clone();
+        let mut names = alloc::vec::Vec::new();
+        let mut i = 0;
+        while let Ok(name) = dir.get_entry(i) {
+            names.push(name);
+            i += 1;
+        }
+        for table in ["msg", "sem", "shm"] {
+            assert!(names.iter().any(|n| n == table), "{} is listed", table);
+            let inode = dir
+                .find(table)
+                .unwrap_or_else(|_| panic!("{} resolves", table));
+            let text = read_all(&inode);
+            assert!(
+                text.starts_with("       key "),
+                "{} reads as a kernel table:\n{}",
+                table,
+                text
+            );
+        }
+        assert!(dir.find("nope").is_err());
+    }
+
+    #[test]
+    fn each_table_has_its_own_inode() {
+        let sem = PROC_SYSVIPC_DIR
+            .find("sem")
+            .unwrap()
+            .metadata()
+            .unwrap()
+            .inode;
+        let shm = PROC_SYSVIPC_DIR
+            .find("shm")
+            .unwrap()
+            .metadata()
+            .unwrap()
+            .inode;
+        let msg = PROC_SYSVIPC_DIR
+            .find("msg")
+            .unwrap()
+            .metadata()
+            .unwrap()
+            .inode;
+        assert!(sem != shm && shm != msg && sem != msg);
+        assert!(
+            read_all(&PROC_SYSVIPC_DIR.find("sem").unwrap()).contains("semid"),
+            "sem is the semaphore table"
+        );
+        assert!(
+            read_all(&PROC_SYSVIPC_DIR.find("shm").unwrap()).contains("shmid"),
+            "shm is the shared-memory table"
+        );
+    }
 }
 
 #[cfg(test)]

@@ -6,21 +6,48 @@ use crate::Syscall;
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use core::convert::TryFrom;
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use core::time::Duration;
 use kernel_hal::{user::UserInOutPtr, user::UserInPtr, user::UserOutPtr};
 use lazy_static::lazy_static;
 use linux_object::error::{LxError, SysResult};
 use linux_object::process::ProcessExt;
 use linux_object::process::CAP_SYS_TIME;
-use linux_object::signal::Signal;
+use linux_object::signal::{SigInfo, Signal};
 use linux_object::thread::ThreadExt;
 use linux_object::time::*;
 use lock::Mutex;
 use zircon_object::object::{KernelObject, KoID};
-use zircon_object::task::{Thread, ROOT_JOB};
+use zircon_object::task::{Status, Thread, ROOT_JOB};
 
 const USEC_PER_TICK: usize = 10000;
+
+/// What `times(2)` returns: the monotonic clock in `USER_HZ` (100 Hz)
+/// ticks, Linux's `jiffies_64_to_clock_t(get_jiffies_64())`. A clock that
+/// nobody can set, so the difference of two calls is elapsed time whatever
+/// `settimeofday` did in between.
+fn clock_ticks_since_boot(monotonic: Duration) -> usize {
+    (monotonic.as_micros() / USEC_PER_TICK as u128) as usize
+}
+
+#[cfg(test)]
+mod times_tests {
+    use super::*;
+
+    #[test]
+    fn the_return_value_of_times_is_the_monotonic_clock_in_user_hz_ticks() {
+        // 12.345 s since boot is 1234 ticks of 10 ms, the fraction dropped.
+        assert_eq!(clock_ticks_since_boot(Duration::from_millis(12_345)), 1234);
+        assert_eq!(clock_ticks_since_boot(Duration::ZERO), 0);
+        assert_eq!(clock_ticks_since_boot(Duration::from_micros(9_999)), 0);
+        assert_eq!(clock_ticks_since_boot(Duration::from_micros(10_000)), 1);
+        // A year of uptime still fits.
+        assert_eq!(
+            clock_ticks_since_boot(Duration::from_secs(365 * 24 * 3600)),
+            3_153_600_000
+        );
+    }
+}
 
 /// Linux `struct timex` (x86_64 / LP64): `adjtimex(2)` / `clock_adjtime(2)`.
 /// Layout is 208 bytes (modes u32 + pad + longs + timeval + PPS + TAI + reserved).
@@ -318,17 +345,26 @@ fn ntp_time_state(st: &NtpState) -> usize {
 }
 
 impl Syscall<'_> {
-    /// finds the resolution (precision) of the specified clock clockid, and,
-    /// if buffer is non-NULL, stores it in the struct timespec pointed to by buffer
+    /// `clock_gettime(2)`: the time of the clock `clock` names.
+    ///
+    /// The wall and monotonic clocks, and the CPU clocks, which used to be
+    /// `EINVAL` here (a `match` on the numbers 0, 1 and 4 to 7) while the
+    /// accounting behind them was already reported by `getrusage(2)` and
+    /// `times(2)`: `clock()` in glibc and musl is
+    /// `clock_gettime(CLOCK_PROCESS_CPUTIME_ID)` and returned -1 to every
+    /// program, and so did what `clock_getcpuclockid(3)` and
+    /// `pthread_getcpuclockid(3)` hand back. See [`clock_gettime_source`].
     pub fn sys_clock_gettime(&self, clock: usize, mut buf: UserOutPtr<TimeSpec>) -> SysResult {
         trace!("clock_gettime: id={:?} buf={:?}", clock, buf);
         if buf.is_null() {
             return Err(LxError::EINVAL);
         }
-        let ts = match clock {
-            0 | 5 => TimeSpec::now(), // CLOCK_REALTIME, CLOCK_REALTIME_COARSE
-            1 | 4 | 6 | 7 => TimeSpec::now_monotonic(),
-            _ => return Err(LxError::EINVAL),
+        let ts = match clock_gettime_source(clock)? {
+            ClockSource::Wall => TimeSpec::now(),
+            ClockSource::Monotonic => TimeSpec::now_monotonic(),
+            ClockSource::Cpu(cpu) => {
+                TimeSpec::from_duration(Duration::from_nanos(self.cpu_clock_ns(cpu)?))
+            }
         };
         buf.write(ts)?;
 
@@ -343,18 +379,57 @@ impl Syscall<'_> {
     /// unwritten resolution as a fatal condition, so always fill the struct.
     pub fn sys_clock_getres(&self, clock: usize, mut buf: UserOutPtr<TimeSpec>) -> SysResult {
         trace!("clock_getres: id={:?} buf={:?}", clock, buf);
-        // Reject unknown clocks the same way clock_gettime does.
-        match clock {
-            0..=7 => {}
-            _ => return Err(LxError::EINVAL),
+        // Exactly the clocks `clock_gettime` reads, and for a CPU clock the
+        // same look-up of whose (`posix_cpu_clock_getres` validates the
+        // task first): a resolution for a clock that cannot be read was
+        // what this answered for the two CPU clocks.
+        if let ClockSource::Cpu(cpu) = clock_gettime_source(clock)? {
+            self.cpu_clock_ns(cpu)?;
         }
         if buf.is_null() {
             return Ok(0);
         }
-        // We service these clocks from a nanosecond-granularity timer source.
+        // We service these clocks from a nanosecond-granularity timer
+        // source, and the CPU clocks are `posix_cpu_clock_getres`'s 1 ns.
         let res = TimeSpec { sec: 0, nsec: 1 };
         buf.write(res)?;
         Ok(0)
+    }
+
+    /// What a CPU clock reads now, in nanoseconds: the accounting
+    /// `getrusage(2)` and `times(2)` report, user time per thread and the
+    /// process's kernel time from the syscall accounting (which is not split
+    /// per thread, so a thread clock counts user time alone, as
+    /// `RUSAGE_THREAD` does). Whose is resolved as `pid_for_clock` does:
+    /// `0` is the caller, a thread clock names a thread of the caller's own
+    /// process, a process clock names any process, and anything else is
+    /// `EINVAL`.
+    fn cpu_clock_ns(&self, clock: CpuClock) -> Result<u64, LxError> {
+        let (utime_ns, stime_ns) = match clock.owner {
+            CpuClockOwner::Thread(0) => (self.thread.get_time(), 0),
+            CpuClockOwner::Thread(tid) => {
+                let thread = self
+                    .zircon_process()
+                    .get_child(tid as KoID)
+                    .ok()
+                    .and_then(|obj| obj.downcast_arc::<Thread>().ok())
+                    .ok_or(LxError::EINVAL)?;
+                (thread.get_time(), 0)
+            }
+            CpuClockOwner::Process(pid) => {
+                let proc = if pid == 0 {
+                    self.zircon_process().clone()
+                } else {
+                    linux_object::process::find_process(pid as KoID).ok_or(LxError::EINVAL)?
+                };
+                let stime_ns = proc
+                    .try_linux()
+                    .map(|linux| linux.perf().totals().1)
+                    .unwrap_or(0);
+                (process_user_time_ns(&proc), stime_ns)
+            }
+        };
+        Ok(clock.kind.value_ns(utime_ns, stime_ns))
     }
 
     /// set the time of the clock with id clockid
@@ -367,6 +442,11 @@ impl Syscall<'_> {
         if clock != 0 {
             return Err(LxError::EINVAL);
         }
+        // `posix_clock_realtime_set` is `do_sys_settimeofday64(tp, NULL)`:
+        // the time is read and judged (`timespec64_valid_settod`, EINVAL)
+        // before anybody asks who is calling.
+        let ts = timespec.read()?;
+        let target = settod_time(ts.sec, ts.nsec)?;
         // Linux routes both clock setters through `security_settime64`, whose
         // default (`security/commoncap.c`) is the whole rule:
         //
@@ -381,25 +461,43 @@ impl Syscall<'_> {
         if !self.linux_process().capable(CAP_SYS_TIME) {
             return Err(LxError::EPERM);
         }
-        let ts = timespec.read()?;
-        let target = Duration::new(ts.sec as u64, ts.nsec as u32);
         kernel_hal::timer::wall_clock_set(target);
         Ok(0)
     }
 
-    /// legacy settimeofday (seconds + microseconds since Unix epoch)
-    pub fn sys_settimeofday(&mut self, tv: UserInPtr<TimeVal>, tz: UserInPtr<u8>) -> SysResult {
+    /// `settimeofday(2)`: the wall clock, the system timezone, or both.
+    ///
+    /// A non-null `tz` used to be `EINVAL` outright, and that is exactly what
+    /// busybox's `hwclock -s` passes (`to_sys_clock`: `settimeofday(&tv,
+    /// &tz)` with `tz_minuteswest` from the C library), so Alpine's `hwclock`
+    /// boot service died with `settimeofday: Invalid argument` and the RTC
+    /// never reached the system clock. util-linux `hwclock --systz` is the
+    /// other caller, with `tv` NULL: the one-time "warp" that turns a clock
+    /// set from a local-time RTC into UTC. See [`settimeofday_plan`].
+    pub fn sys_settimeofday(
+        &mut self,
+        tv: UserInPtr<TimeVal>,
+        tz: UserInPtr<TimeZone>,
+    ) -> SysResult {
         info!("settimeofday: tv={:?}, tz={:?}", tv, tz);
-        if !tz.is_null() {
-            return Err(LxError::EINVAL);
-        }
+        // `do_sys_settimeofday64`: the time is judged first (EINVAL), then
+        // the caller (EPERM), then the timezone (EINVAL), then both apply.
+        let tv = tv
+            .read_if_not_null()?
+            .map(|tv| settod_timeval(tv.sec, tv.usec))
+            .transpose()?;
+        let tz = tz.read_if_not_null()?;
         // The same `cap_settime` gate as `clock_settime`: one clock, one rule.
         if !self.linux_process().capable(CAP_SYS_TIME) {
             return Err(LxError::EPERM);
         }
-        let timeval = tv.read()?;
-        let target = Duration::new(timeval.sec as u64, timeval.usec as u32 * 1_000);
-        kernel_hal::timer::wall_clock_set(target);
+        let plan = settimeofday_plan(tv, tz, &TZ_FIRST_TIME, kernel_hal::timer::wall_clock_now())?;
+        if let Some(tz) = plan.tz {
+            *SYS_TZ.lock() = tz;
+        }
+        if let Some(target) = plan.clock {
+            kernel_hal::timer::wall_clock_set(target);
+        }
         Ok(0)
     }
 
@@ -433,23 +531,25 @@ impl Syscall<'_> {
         }
     }
 
-    /// get the time with second and microseconds
+    /// `gettimeofday(2)`: the wall clock into `tv` and the system timezone
+    /// into `tz`, each only when asked for (either pointer may be NULL, as
+    /// `SYSCALL_DEFINE2(gettimeofday)` allows). A non-null `tz` used to be
+    /// `EINVAL`; the `struct timezone` it names is what `settimeofday` stores.
     pub fn sys_gettimeofday(
         &mut self,
         mut tv: UserOutPtr<TimeVal>,
-        tz: UserInPtr<u8>,
+        mut tz: UserOutPtr<TimeZone>,
     ) -> SysResult {
         trace!("gettimeofday: tv: {:?}, tz: {:?}", tv, tz);
-        // don't support tz
-        if !tz.is_null() {
-            return Err(LxError::EINVAL);
+        if !tv.is_null() {
+            let timeval = TimeVal::now();
+            trace!("gettimeofday: {:?}", timeval);
+            tv.write(timeval)?;
         }
-
-        let timeval = TimeVal::now();
-        tv.write(timeval)?;
-
-        trace!("gettimeofday: {:?}", timeval);
-
+        if !tz.is_null() {
+            let sys_tz = *SYS_TZ.lock();
+            tz.write(sys_tz)?;
+        }
         Ok(0)
     }
 
@@ -494,24 +594,25 @@ impl Syscall<'_> {
     /// retained.
     pub fn sys_getrusage(&mut self, who: usize, mut rusage: UserOutPtr<RUsage>) -> SysResult {
         info!("getrusage: who: {}, rusage: {:?}", who, rusage);
-        const RUSAGE_SELF: isize = 0;
-        const RUSAGE_CHILDREN: isize = -1;
-        const RUSAGE_THREAD: isize = 1;
+        use crate::intarg::{rusage_who, RusageWho};
         if rusage.is_null() {
             return Err(LxError::EINVAL);
         }
-        let (utime_ns, stime_ns) = match who as isize {
-            RUSAGE_SELF => (
+        // `who` is an `int`: `RUSAGE_CHILDREN` is -1, and read out of all 64
+        // bits of the register it was 4294967295 (EINVAL) whenever the
+        // caller's compiler had zero-extended it, which is what a varargs
+        // `syscall(SYS_getrusage, RUSAGE_CHILDREN, &ru)` does.
+        let (utime_ns, stime_ns) = match rusage_who(who)? {
+            RusageWho::Process => (
                 process_user_time_ns(self.zircon_process()),
                 self.linux_process().perf().totals().1,
             ),
             // Per-thread kernel time is not split out of the process total;
             // report the thread's user time and zero kernel time.
-            RUSAGE_THREAD => (self.thread.get_time(), 0),
+            RusageWho::Thread => (self.thread.get_time(), 0),
             // Totals of children this process has reaped, accumulated at
             // wait4/waitid time exactly like Linux does.
-            RUSAGE_CHILDREN => self.linux_process().children_cpu_ns(),
-            _ => return Err(LxError::EINVAL),
+            RusageWho::Children => self.linux_process().children_cpu_ns(),
         };
         rusage.write(RUsage {
             utime: Duration::from_nanos(utime_ns).into(),
@@ -526,17 +627,21 @@ impl Syscall<'_> {
     ///
     /// `tms_utime`/`tms_stime` come from the same accounting as
     /// [`sys_getrusage`](Self::sys_getrusage), converted to clock ticks
-    /// (100 Hz here). Times of terminated children are not retained, so
-    /// `tms_cutime`/`tms_cstime` read zero. The return value stays the
-    /// wall-clock tick count since boot.
+    /// (100 Hz here); `tms_cutime`/`tms_cstime` are the reaped children's,
+    /// the same totals `RUSAGE_CHILDREN` reports. The return value is the
+    /// clock-tick count of the MONOTONIC clock, as Linux's
+    /// `jiffies_64_to_clock_t(get_jiffies_64())`: it used to be the wall
+    /// clock's, so every `settimeofday` -- `hwclock -s` at boot, an NTP step
+    /// -- moved it, backwards included, under every program that measures
+    /// elapsed time as the difference of two `times()` calls (the way
+    /// `time(1)` in busybox and many benchmarks do).
     pub fn sys_times(&mut self, mut buf: UserOutPtr<Tms>) -> SysResult {
         info!("times: buf: {:?}", buf);
 
         // 10_000 us per tick (100 Hz) → 10_000_000 ns per tick.
         const NSEC_PER_TICK: u64 = USEC_PER_TICK as u64 * 1_000;
 
-        let tv = TimeVal::now();
-        let tick = (tv.sec * 1_000_000 + tv.usec) / USEC_PER_TICK;
+        let tick = clock_ticks_since_boot(kernel_hal::timer::timer_now());
 
         if !buf.is_null() {
             let utime_ns = process_user_time_ns(self.zircon_process());
@@ -570,7 +675,7 @@ impl Syscall<'_> {
             "clock_nanosleep: clockid={}, flags={:#x}, req={:?}, rem={:?}",
             clockid, flags, req, rem
         );
-        use kernel_hal::{thread, timer};
+        use kernel_hal::timer;
         // Same rule as `nanosleep`: reject an out-of-range `timespec`
         // instead of sleeping for whatever it happens to convert to.
         let request: Duration = req.read()?.try_into_duration()?;
@@ -587,10 +692,16 @@ impl Syscall<'_> {
         )?;
         // `rem` only ever carries what a signal left over from a *relative*
         // sleep. Linux does not write it on success, and ignores it entirely
-        // when TIMER_ABSTIME is set.
-        let _ = rem;
+        // when TIMER_ABSTIME is set. The sleep itself is the interruptible
+        // one of `nanosleep`: this was a plain `sleep_until`, which no
+        // signal could cut short.
+        let rem = if flags & TIMER_ABSTIME != 0 {
+            UserOutPtr::from(0)
+        } else {
+            rem
+        };
         if let SleepPlan::Until(deadline) = plan {
-            thread::sleep_until(deadline).await;
+            crate::task::sleep_or_eintr(self.thread, deadline, rem).await?;
         }
         Ok(0)
     }
@@ -728,31 +839,37 @@ impl Syscall<'_> {
     /// `timerid` (an `int`, the kernel's `timer_t`).
     pub fn sys_timer_create(&self, clockid: usize, sevp: usize, timerid: usize) -> SysResult {
         let clock = posix_timer_clock_base(clockid)?;
-        let signo = if sevp == 0 {
-            Signal::SIGALRM as usize
+        let notify = if sevp == 0 {
+            TimerNotify::SIGALRM_TO_PROCESS
         } else {
-            // struct sigevent: sigev_value (8B), sigev_signo @ +8, sigev_notify @ +12.
+            // struct sigevent: sigev_value (8 bytes) @ 0, sigev_signo @ 8,
+            // sigev_notify @ 12, and sigev_notify_thread_id @ 16 (64 bytes in
+            // all, so the four reads are inside it whatever the notify).
+            let value_p: UserInPtr<usize> = sevp.into();
             let signo_p: UserInPtr<i32> = (sevp + 8).into();
             let notify_p: UserInPtr<i32> = (sevp + 12).into();
-            let signo = signo_p.read()?;
-            let notify = notify_p.read()?;
-            const SIGEV_NONE: i32 = 1;
-            if notify == SIGEV_NONE {
-                0
-            } else {
-                signo as usize
-            }
+            let tid_p: UserInPtr<i32> = (sevp + 16).into();
+            let event = SigEvent {
+                value: value_p.read()?,
+                signo: signo_p.read()?,
+                notify: notify_p.read()?,
+                thread_id: tid_p.read()?,
+            };
+            let proc = self.zircon_process();
+            timer_notify_from_sigevent(&event, |tid| proc.get_child(tid).is_ok())?
         };
+        ensure_posix_timers_die_with_their_owner();
         let id = NEXT_TIMER_ID.fetch_add(1, Ordering::Relaxed);
         POSIX_TIMERS.lock().insert(
             id,
             PosixTimer {
                 owner: self.zircon_process().id(),
-                signo,
+                notify,
                 clock,
                 interval: Duration::ZERO,
                 next: Duration::ZERO,
                 generation: 0,
+                overrun_last: 0,
             },
         );
         let mut out: UserOutPtr<i32> = timerid.into();
@@ -860,23 +977,104 @@ impl Syscall<'_> {
         }
     }
 
-    /// `timer_getoverrun`: we don't accumulate overruns, so report 0.
+    /// `timer_getoverrun`: the overrun count of the timer's last expiry,
+    /// which used to be a fixed 0 (see [`forward_periodic`]).
     pub fn sys_timer_getoverrun(&self, id: usize) -> SysResult {
         let owner = self.zircon_process().id();
         let timers = POSIX_TIMERS.lock();
         match timers.get(&id) {
-            Some(t) if t.owner == owner => Ok(0),
+            Some(t) if t.owner == owner => Ok(t.overrun_last.min(DELAYTIMER_MAX) as usize),
             _ => Err(LxError::EINVAL),
         }
     }
+}
+
+/// What `timer_create(2)` was told to do on expiry: its `struct sigevent`,
+/// decoded once by `good_sigevent`'s rules.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TimerNotify {
+    /// Signal to deliver; 0 for `SIGEV_NONE`.
+    signo: usize,
+    /// `sigev_value`, handed back to the handler as `si_value`. glibc's
+    /// `SIGEV_THREAD` helper thread keeps the timer it must run the
+    /// callback for in here, so with it dropped no `SIGEV_THREAD` timer
+    /// ever ran its function.
+    value: usize,
+    /// `SIGEV_THREAD_ID`: the one thread the signal goes to. `None` is a
+    /// process-directed signal, like `kill(2)`.
+    thread: Option<KoID>,
+}
+
+impl TimerNotify {
+    /// A null `sevp`: `SIGALRM` to the process, `si_value` = the timer id
+    /// (the kernel fills `sigev_value.sival_int` with it, timer_create(2)).
+    const SIGALRM_TO_PROCESS: Self = TimerNotify {
+        signo: Signal::SIGALRM as usize,
+        value: 0,
+        thread: None,
+    };
+}
+
+/// The fields of `struct sigevent` a timer reads.
+#[derive(Debug, Clone, Copy)]
+struct SigEvent {
+    value: usize,
+    signo: i32,
+    notify: i32,
+    thread_id: i32,
+}
+
+const SIGEV_SIGNAL: i32 = 0;
+const SIGEV_NONE: i32 = 1;
+const SIGEV_THREAD: i32 = 2;
+const SIGEV_THREAD_ID: i32 = 4;
+const SIGRTMAX: i32 = 64;
+
+/// `good_sigevent()`: which notifications a timer may be created with.
+/// `SIGEV_THREAD_ID` names a thread of the caller's own process, or it is
+/// `EINVAL`; the signal has to be a real one; `SIGEV_THREAD` reaches the
+/// kernel only from a program bypassing libc, and is a plain signal there.
+///
+/// This used to take `sigev_signo` as it came (0 and 200 both "worked":
+/// nothing was ever delivered), accept any `sigev_notify`, and read neither
+/// `sigev_value` nor the thread id, so every timer fired at the process.
+fn timer_notify_from_sigevent(
+    event: &SigEvent,
+    is_my_thread: impl Fn(KoID) -> bool,
+) -> Result<TimerNotify, LxError> {
+    let thread = match event.notify {
+        SIGEV_NONE => {
+            return Ok(TimerNotify {
+                signo: 0,
+                value: event.value,
+                thread: None,
+            })
+        }
+        SIGEV_SIGNAL | SIGEV_THREAD => None,
+        SIGEV_THREAD_ID => {
+            if event.thread_id <= 0 || !is_my_thread(event.thread_id as KoID) {
+                return Err(LxError::EINVAL);
+            }
+            Some(event.thread_id as KoID)
+        }
+        _ => return Err(LxError::EINVAL),
+    };
+    if event.signo <= 0 || event.signo > SIGRTMAX {
+        return Err(LxError::EINVAL);
+    }
+    Ok(TimerNotify {
+        signo: event.signo as usize,
+        value: event.value,
+        thread,
+    })
 }
 
 /// A per-process POSIX interval timer (`timer_create`).
 struct PosixTimer {
     /// Owning process KoID; a process may only operate on its own timers.
     owner: KoID,
-    /// Signal to deliver on expiry (0 = none, e.g. SIGEV_NONE).
-    signo: usize,
+    /// Where the expiry goes: signal, `si_value`, and which thread.
+    notify: TimerNotify,
     /// The timeline `timer_create`'s `clockid` names, which is what an
     /// absolute `timer_settime` counts against. The id used to be dropped
     /// on the floor (`_clockid`), so a `CLOCK_REALTIME` timer armed with
@@ -890,6 +1088,10 @@ struct PosixTimer {
     /// Bumped by settime/delete to invalidate an already-scheduled one-shot
     /// (`timer_set` callbacks are not cancellable, so they check this).
     generation: u64,
+    /// The overrun count of the last expiry (`it_overrun_last`): the
+    /// periods that went by without a signal of their own because the
+    /// timer was late, what `timer_getoverrun(2)` and `si_overrun` report.
+    overrun_last: u32,
 }
 
 lazy_static! {
@@ -954,40 +1156,80 @@ fn itimerval_from_slot(slot: &ItimerSlot, now: Duration) -> ITimerVal {
 fn arm_itimer(owner: KoID, which: usize, deadline: Duration, gen: u64) {
     kernel_hal::timer::timer_set(
         deadline,
-        Box::new(move |_now| {
-            let mut fire = false;
-            let mut rearm = None;
-            if let Some(proc) = ROOT_JOB.find_process(owner) {
-                if let Some(lp) = proc.try_linux() {
-                    let mut slots = lp.itimers().lock();
-                    let slot = &mut slots[which];
-                    if slot.generation == gen {
-                        if let Some(expiry) = slot.deadline {
-                            fire = true;
-                            if slot.interval.is_zero() {
-                                slot.deadline = None;
-                            } else {
-                                // Drift-free: step from the programmed expiry,
-                                // not from whenever the wheel got to us.
-                                let next = expiry + slot.interval;
-                                slot.deadline = Some(next);
-                                rearm = Some(next);
-                            }
-                        }
-                    }
-                }
-            }
-            if fire {
-                deliver_timer_signal(owner, itimer_signo(which));
-            }
-            if let Some(next) = rearm {
+        Box::new(move |now| {
+            if let Some(next) = expire_itimer(owner, which, gen, now) {
                 arm_itimer(owner, which, next, gen);
             }
         }),
     );
 }
 
-/// Deliver `signo` to every thread of process `owner` (mirrors setitimer/alarm).
+/// The largest overrun count `timer_getoverrun(2)` and `si_overrun` report
+/// (`DELAYTIMER_MAX`, `i32::MAX` on Linux).
+const DELAYTIMER_MAX: u32 = i32::MAX as u32;
+
+/// Where a periodic timer whose expiry was at `expiry` fires next, given
+/// that the wheel got to it at `now`, and how many periods went by in
+/// between without a signal of their own: `hrtimer_forward`. Drift-free
+/// (the next expiry is a whole number of periods after the programmed
+/// one), and never in the past.
+///
+/// Both timer callbacks used to step exactly one period from the
+/// programmed expiry, whatever the time was: a process stopped for ten
+/// seconds with a 1 ms timer got its next expiry 9 999 ms in the past, and
+/// the wheel fired it again at once, and again, ten thousand back-to-back
+/// expiries -- one signal per missed period, each `timer_set` with a
+/// deadline already gone -- where Linux delivers ONE, with `si_overrun` and
+/// `timer_getoverrun(2)` saying how many were skipped.
+fn forward_periodic(expiry: Duration, interval: Duration, now: Duration) -> (Duration, u32) {
+    let next = expiry + interval;
+    if next > now {
+        return (next, 0);
+    }
+    // `now - expiry` whole periods have gone by since the programmed
+    // expiry; the first one is the expiry that fires now, the rest are
+    // overruns, and the next expiry is the period after all of them.
+    let elapsed = now - expiry;
+    let periods = elapsed.as_nanos() / interval.as_nanos();
+    let overrun = periods.min(DELAYTIMER_MAX as u128) as u32;
+    // Saturating all the way: `interval` comes from userspace.
+    let advance = (periods + 1).saturating_mul(interval.as_nanos());
+    let advance = Duration::from_nanos(advance.min(u64::MAX as u128) as u64);
+    (expiry.saturating_add(advance), overrun)
+}
+
+/// One expiry of the `setitimer(2)` slot `which` of `owner`, at `now`:
+/// deliver its signal and say when it fires next, if it is periodic.
+/// Nothing if the slot was re-armed or disarmed since (`gen`).
+fn expire_itimer(owner: KoID, which: usize, gen: u64, now: Duration) -> Option<Duration> {
+    let mut fire = false;
+    let mut rearm = None;
+    if let Some(proc) = ROOT_JOB.find_process(owner) {
+        if let Some(lp) = proc.try_linux() {
+            let mut slots = lp.itimers().lock();
+            let slot = &mut slots[which];
+            if slot.generation == gen {
+                if let Some(expiry) = slot.deadline {
+                    fire = true;
+                    if slot.interval.is_zero() {
+                        slot.deadline = None;
+                    } else {
+                        let (next, _overrun) = forward_periodic(expiry, slot.interval, now);
+                        slot.deadline = Some(next);
+                        rearm = Some(next);
+                    }
+                }
+            }
+        }
+    }
+    if fire {
+        if let Some((signal, info)) = itimer_expiry_signal(which) {
+            deliver_timer_signal(owner, None, signal, info);
+        }
+    }
+    rearm
+}
+
 /// Disarm and delete every POSIX timer owned by `owner`, returning how many
 /// there were.
 ///
@@ -1012,20 +1254,93 @@ pub fn drop_posix_timers_of(owner: KoID) -> usize {
     before - timers.len()
 }
 
-fn deliver_timer_signal(owner: KoID, signo: usize) {
-    if signo == 0 {
-        return;
+/// Whether the process-exit hook that deletes a dead process's timers is in
+/// place. Registered on the first `timer_create`, once: `linux-object` runs its
+/// exit hooks from the `PROCESS_TERMINATED` callback and cannot name this
+/// crate's table itself.
+static EXIT_HOOK_REGISTERED: AtomicBool = AtomicBool::new(false);
+
+/// `exit_itimers()` in `do_exit()`: a process's POSIX timers die with it.
+///
+/// They did not. The table is keyed by the owner's pid and nothing consulted
+/// it when a process ended, so a timer outlived its creator: a periodic one
+/// went on re-arming itself from its own callback and firing a signal at the
+/// dead pid on every period, for as long as the machine stayed up, and every
+/// one-shot or disarmed entry stayed in the table. A program that runs on a
+/// `timer_create` tick and is started and killed a few hundred times leaves
+/// that many timers ticking behind it.
+fn ensure_posix_timers_die_with_their_owner() {
+    if !EXIT_HOOK_REGISTERED.swap(true, Ordering::AcqRel) {
+        linux_object::process::register_process_exit_hook(|pid| {
+            drop_posix_timers_of(pid);
+        });
     }
-    let signal = match Signal::try_from(signo as u8) {
-        Ok(s) => s,
-        Err(_) => return,
-    };
-    if let Some(proc) = ROOT_JOB.find_process(owner) {
-        for tid in proc.thread_ids() {
-            if let Ok(obj) = proc.get_child(tid) {
-                if let Ok(thread) = obj.downcast_arc::<Thread>() {
-                    thread.lock_linux().signals.insert(signal);
-                    thread.signal_set(zircon_object::object::Signal::USER_SIGNAL_0);
+}
+
+/// Whether `pid` is a live process: present and not yet exited. A zombie
+/// counts as dead, because Linux deletes the timers in `do_exit`, before the
+/// parent has reaped anything.
+fn process_is_alive(pid: KoID) -> bool {
+    ROOT_JOB
+        .find_process(pid)
+        .is_some_and(|p| !matches!(p.status(), Status::Exited(_)))
+}
+
+/// What an expiring `setitimer(2)` slot delivers: its signal, sent by the
+/// kernel with nobody behind it (`it_real_fn` -> `SEND_SIG_PRIV`: `SI_KERNEL`,
+/// pid and uid 0).
+fn itimer_expiry_signal(which: usize) -> Option<(Signal, SigInfo)> {
+    let signal = Signal::try_from(itimer_signo(which) as u8).ok()?;
+    Some((signal, SigInfo::from_kernel(signal)))
+}
+
+/// What an expiring POSIX timer delivers: `SI_TIMER` with the timer's id
+/// and the `sigev_value` it was created with (`posix_timer_event` ->
+/// `send_sigqueue`), or nothing for `SIGEV_NONE`.
+fn posix_timer_expiry_signal(
+    id: usize,
+    notify: TimerNotify,
+    overrun: u32,
+) -> Option<(Signal, SigInfo)> {
+    if notify.signo == 0 {
+        return None;
+    }
+    let signal = Signal::try_from(notify.signo as u8).ok()?;
+    let overrun = overrun.min(DELAYTIMER_MAX) as i32;
+    Some((
+        signal,
+        SigInfo::timer(signal, id as i32, overrun, notify.value),
+    ))
+}
+
+/// Deliver an expired timer's signal, once: to the process (`kill_pid_info`:
+/// one thread that has it unblocked, else pending on the process until one
+/// does) or, for `SIGEV_THREAD_ID`, to the one thread the timer named.
+///
+/// This used to set the bit on EVERY thread of the process, straight into
+/// the pending set, with no `siginfo_t` and without the disposition being
+/// looked at: a threaded program with a `SIGALRM` or `SIGPROF` handler ran
+/// it once per thread per expiry, and one `alarm(2)` came back as `EINTR`
+/// in every thread's blocking syscall at once.
+fn deliver_timer_signal(owner: KoID, target: Option<KoID>, signal: Signal, info: SigInfo) {
+    match target {
+        None => {
+            let _ = linux_object::process::send_signal_to_process_with_info(
+                owner as usize,
+                signal,
+                Some(info),
+            );
+        }
+        Some(tid) => {
+            // The thread may be gone by now: a timer is deleted with its
+            // process, not with one of its threads, and Linux drops the
+            // signal then too.
+            if let Some(proc) = ROOT_JOB.find_process(owner) {
+                if let Ok(obj) = proc.get_child(tid) {
+                    if let Ok(thread) = obj.downcast_arc::<Thread>() {
+                        thread.lock_linux().queue_signal(signal, Some(info));
+                        linux_object::process::wake_signal_sleeper(&thread);
+                    }
                 }
             }
         }
@@ -1038,31 +1353,349 @@ fn deliver_timer_signal(owner: KoID, signo: usize) {
 fn arm_posix_timer(id: usize, deadline: Duration, gen: u64) {
     kernel_hal::timer::timer_set(
         deadline,
-        Box::new(move |_now| {
-            let mut fire = None;
-            let mut rearm = None;
-            {
-                let mut timers = POSIX_TIMERS.lock();
-                if let Some(t) = timers.get_mut(&id) {
-                    if t.generation == gen {
-                        fire = Some((t.owner, t.signo));
-                        if t.interval.is_zero() {
-                            t.next = Duration::ZERO;
-                        } else {
-                            t.next += t.interval;
-                            rearm = Some(t.next);
-                        }
-                    }
-                }
-            }
-            if let Some((owner, signo)) = fire {
-                deliver_timer_signal(owner, signo);
-            }
-            if let Some(deadline) = rearm {
-                arm_posix_timer(id, deadline, gen);
+        Box::new(move |now| {
+            if let Some(next) = expire_posix_timer(id, gen, now) {
+                arm_posix_timer(id, next, gen);
             }
         }),
     );
+}
+
+/// One expiry of POSIX timer `id`, at `now`: deliver its signal, with the
+/// overrun count of this expiry in `si_overrun` and kept for
+/// `timer_getoverrun`, and say when it fires next if it is periodic.
+/// Nothing if the timer was deleted or re-armed since (`gen`).
+fn expire_posix_timer(id: usize, gen: u64, now: Duration) -> Option<Duration> {
+    // The owner first, and outside the table's lock: `find_process` takes the
+    // job's. A timer whose owner has died since it was armed (the exit hook
+    // and this callback can race) is deleted here instead of fired, and a
+    // periodic one is not re-armed: nothing is left to receive its signal.
+    let owner = POSIX_TIMERS
+        .lock()
+        .get(&id)
+        .filter(|t| t.generation == gen)
+        .map(|t| t.owner)?;
+    if !process_is_alive(owner) {
+        POSIX_TIMERS.lock().remove(&id);
+        return None;
+    }
+    let mut fire = None;
+    let mut rearm = None;
+    {
+        let mut timers = POSIX_TIMERS.lock();
+        if let Some(t) = timers.get_mut(&id) {
+            if t.generation == gen {
+                let overrun = if t.interval.is_zero() {
+                    t.next = Duration::ZERO;
+                    0
+                } else {
+                    let (next, overrun) = forward_periodic(t.next, t.interval, now);
+                    t.next = next;
+                    rearm = Some(next);
+                    overrun
+                };
+                t.overrun_last = overrun;
+                fire = Some((t.owner, t.notify, overrun));
+            }
+        }
+    }
+    if let Some((owner, notify, overrun)) = fire {
+        if let Some((signal, info)) = posix_timer_expiry_signal(id, notify, overrun) {
+            deliver_timer_signal(owner, notify.thread, signal, info);
+        }
+    }
+    rearm
+}
+
+/// `struct timezone` of gettimeofday(2)/settimeofday(2): minutes WEST of
+/// Greenwich, and the DST rule nobody uses any more.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TimeZone {
+    /// `tz_minuteswest`
+    pub minuteswest: i32,
+    /// `tz_dsttime`
+    pub dsttime: i32,
+}
+
+lazy_static! {
+    /// `sys_tz`: what the last `settimeofday` with a timezone stored, read
+    /// back by `gettimeofday`.
+    static ref SYS_TZ: Mutex<TimeZone> = Mutex::new(TimeZone::default());
+}
+
+/// `do_sys_settimeofday64`'s `static int firsttime = 1`: the first timezone
+/// ever set may warp the clock, and only the first.
+static TZ_FIRST_TIME: AtomicBool = AtomicBool::new(true);
+
+/// `KTIME_SEC_MAX`: the largest second a `ktime_t` holds.
+const KTIME_SEC_MAX: i64 = i64::MAX / 1_000_000_000;
+
+/// `timespec64_valid_settod`: a time the wall clock may be set to. The raw
+/// words come from the user as unsigned, so they are judged as the signed
+/// values they are on the wire: a negative second or nanosecond is EINVAL,
+/// not a date in the year 584 billion, and a nanosecond of a billion or more
+/// is EINVAL rather than a second silently carried.
+pub(crate) fn settod_time(sec: usize, nsec: usize) -> Result<Duration, LxError> {
+    let (sec, nsec) = (sec as i64, nsec as i64);
+    if !(0..1_000_000_000).contains(&nsec) || !(0..=KTIME_SEC_MAX).contains(&sec) {
+        return Err(LxError::EINVAL);
+    }
+    Ok(Duration::new(sec as u64, nsec as u32))
+}
+
+/// `settimeofday`'s `tv_usec * NSEC_PER_USEC` fed to [`settod_time`]: a
+/// microsecond of a million or more, or a negative one, is EINVAL.
+pub(crate) fn settod_timeval(sec: usize, usec: usize) -> Result<Duration, LxError> {
+    let usec = usec as i64;
+    if !(0..1_000_000).contains(&usec) {
+        return Err(LxError::EINVAL);
+    }
+    settod_time(sec, (usec * 1_000) as usize)
+}
+
+/// What a `settimeofday(tv, tz)` ends up doing, decided as
+/// `do_sys_settimeofday64` does once the time is valid and the caller is
+/// allowed.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct SettimeofdayPlan {
+    /// The value to set the wall clock to, if any.
+    pub clock: Option<Duration>,
+    /// The timezone to store as `sys_tz`, if any.
+    pub tz: Option<TimeZone>,
+}
+
+/// ```c
+/// if (tz) {
+///         /* Verify we're within the +-15 hrs range */
+///         if (tz->tz_minuteswest > 15*60 || tz->tz_minuteswest < -15*60)
+///                 return -EINVAL;
+///         sys_tz = *tz;
+///         update_vsyscall_tz();
+///         if (firsttime) {
+///                 firsttime = 0;
+///                 if (!tv)
+///                         timekeeping_warp_clock();
+///         }
+/// }
+/// if (tv)
+///         return do_settimeofday64(tv);
+/// ```
+///
+/// The warp (`timekeeping_warp_clock`) adds `tz_minuteswest * 60` seconds to
+/// the clock: a clock that was set from an RTC keeping local time becomes
+/// UTC. `first_time` is the `firsttime` static, consumed by the first call
+/// that carries a timezone whether or not it warps.
+pub(crate) fn settimeofday_plan(
+    tv: Option<Duration>,
+    tz: Option<TimeZone>,
+    first_time: &AtomicBool,
+    now: Duration,
+) -> Result<SettimeofdayPlan, LxError> {
+    let mut clock = tv;
+    if let Some(tz) = tz {
+        if !(-15 * 60..=15 * 60).contains(&tz.minuteswest) {
+            return Err(LxError::EINVAL);
+        }
+        if first_time.swap(false, Ordering::SeqCst) && tv.is_none() && tz.minuteswest != 0 {
+            let adjust = tz.minuteswest as i64 * 60;
+            clock = Some(if adjust >= 0 {
+                now.saturating_add(Duration::from_secs(adjust as u64))
+            } else {
+                now.saturating_sub(Duration::from_secs(adjust.unsigned_abs()))
+            });
+        }
+    }
+    Ok(SettimeofdayPlan { clock, tz })
+}
+
+#[cfg(test)]
+mod settimeofday_tests {
+    use super::*;
+
+    const HOUR: u64 = 3600;
+
+    fn tz(minuteswest: i32) -> TimeZone {
+        TimeZone {
+            minuteswest,
+            dsttime: 0,
+        }
+    }
+
+    #[test]
+    fn timezone_matches_the_c_struct() {
+        assert_eq!(core::mem::size_of::<TimeZone>(), 8);
+        assert_eq!(core::mem::offset_of!(TimeZone, dsttime), 4);
+    }
+
+    #[test]
+    fn a_time_is_judged_as_the_signed_value_on_the_wire() {
+        assert_eq!(
+            settod_time(1_700_000_000, 999_999_999),
+            Ok(Duration::new(1_700_000_000, 999_999_999))
+        );
+        assert_eq!(settod_time(0, 0), Ok(Duration::ZERO));
+        // `tv_nsec` of a billion is not "one more second".
+        assert_eq!(settod_time(5, 1_000_000_000), Err(LxError::EINVAL));
+        // Negative, as the C long the user wrote, not as a huge usize.
+        assert_eq!(settod_time(5, (-1i64) as usize), Err(LxError::EINVAL));
+        assert_eq!(settod_time((-1i64) as usize, 0), Err(LxError::EINVAL));
+        assert_eq!(
+            settod_time((KTIME_SEC_MAX + 1) as usize, 0),
+            Err(LxError::EINVAL)
+        );
+        assert_eq!(
+            settod_time(KTIME_SEC_MAX as usize, 0),
+            Ok(Duration::from_secs(KTIME_SEC_MAX as u64))
+        );
+    }
+
+    #[test]
+    fn a_timeval_is_judged_in_microseconds() {
+        assert_eq!(
+            settod_timeval(7, 999_999),
+            Ok(Duration::new(7, 999_999_000))
+        );
+        assert_eq!(settod_timeval(7, 1_000_000), Err(LxError::EINVAL));
+        assert_eq!(settod_timeval(7, (-1i64) as usize), Err(LxError::EINVAL));
+        assert_eq!(settod_timeval((-1i64) as usize, 0), Err(LxError::EINVAL));
+        // A microsecond count whose thousandfold wraps a 64-bit word back
+        // into range is still out of range.
+        assert_eq!(settod_timeval(7, 1 << 62), Err(LxError::EINVAL));
+    }
+
+    #[test]
+    fn the_timezone_must_be_within_fifteen_hours_of_greenwich() {
+        let first = AtomicBool::new(false);
+        let now = Duration::from_secs(1_000_000);
+        assert_eq!(
+            settimeofday_plan(None, Some(tz(15 * 60)), &first, now),
+            Ok(SettimeofdayPlan {
+                clock: None,
+                tz: Some(tz(15 * 60))
+            })
+        );
+        assert_eq!(
+            settimeofday_plan(None, Some(tz(-15 * 60)), &first, now),
+            Ok(SettimeofdayPlan {
+                clock: None,
+                tz: Some(tz(-15 * 60))
+            })
+        );
+        assert_eq!(
+            settimeofday_plan(None, Some(tz(15 * 60 + 1)), &first, now),
+            Err(LxError::EINVAL)
+        );
+        assert_eq!(
+            settimeofday_plan(None, Some(tz(-15 * 60 - 1)), &first, now),
+            Err(LxError::EINVAL)
+        );
+        // A bad timezone refuses the whole call, the time included.
+        assert_eq!(
+            settimeofday_plan(Some(now), Some(tz(9999)), &first, now),
+            Err(LxError::EINVAL)
+        );
+    }
+
+    #[test]
+    fn busybox_hwclock_sets_the_time_and_the_timezone_in_one_call() {
+        // `to_sys_clock`: `settimeofday(&tv, &tz)` with `tz_minuteswest =
+        // timezone / 60`. The clock is set to `tv`, not warped, and the
+        // timezone is stored; the first-time warp is spent.
+        let first = AtomicBool::new(true);
+        let now = Duration::from_secs(1_000_000);
+        let rtc = Duration::from_secs(1_700_000_000);
+        assert_eq!(
+            settimeofday_plan(Some(rtc), Some(tz(-60)), &first, now),
+            Ok(SettimeofdayPlan {
+                clock: Some(rtc),
+                tz: Some(tz(-60))
+            })
+        );
+        assert!(!first.load(Ordering::SeqCst));
+        // A later `hwclock --systz` no longer warps.
+        assert_eq!(
+            settimeofday_plan(None, Some(tz(-60)), &first, now),
+            Ok(SettimeofdayPlan {
+                clock: None,
+                tz: Some(tz(-60))
+            })
+        );
+    }
+
+    #[test]
+    fn the_first_timezone_without_a_time_warps_the_clock_once() {
+        // `hwclock --systz` on a machine whose RTC keeps local time: the
+        // clock was set from it as if it were UTC, and CET (one hour EAST,
+        // so `tz_minuteswest` is -60) means it reads an hour ahead. The warp
+        // subtracts that hour; a zone west of Greenwich adds.
+        let now = Duration::from_secs(10 * HOUR);
+        let first = AtomicBool::new(true);
+        assert_eq!(
+            settimeofday_plan(None, Some(tz(-60)), &first, now),
+            Ok(SettimeofdayPlan {
+                clock: Some(Duration::from_secs(9 * HOUR)),
+                tz: Some(tz(-60))
+            })
+        );
+        // Only once: the second call stores the zone and leaves the clock.
+        assert_eq!(
+            settimeofday_plan(None, Some(tz(-60)), &first, now),
+            Ok(SettimeofdayPlan {
+                clock: None,
+                tz: Some(tz(-60))
+            })
+        );
+        let first = AtomicBool::new(true);
+        assert_eq!(
+            settimeofday_plan(None, Some(tz(300)), &first, now),
+            Ok(SettimeofdayPlan {
+                clock: Some(Duration::from_secs(15 * HOUR)),
+                tz: Some(tz(300))
+            })
+        );
+        // Greenwich itself has nothing to warp, and a clock that cannot go
+        // below zero stops there.
+        let first = AtomicBool::new(true);
+        assert_eq!(
+            settimeofday_plan(None, Some(tz(0)), &first, now),
+            Ok(SettimeofdayPlan {
+                clock: None,
+                tz: Some(tz(0))
+            })
+        );
+        let first = AtomicBool::new(true);
+        assert_eq!(
+            settimeofday_plan(None, Some(tz(-15 * 60)), &first, Duration::from_secs(HOUR)),
+            Ok(SettimeofdayPlan {
+                clock: Some(Duration::ZERO),
+                tz: Some(tz(-15 * 60))
+            })
+        );
+    }
+
+    #[test]
+    fn a_time_alone_sets_the_clock_and_touches_no_timezone() {
+        let first = AtomicBool::new(true);
+        let t = Duration::from_secs(1_700_000_000);
+        assert_eq!(
+            settimeofday_plan(Some(t), None, &first, Duration::ZERO),
+            Ok(SettimeofdayPlan {
+                clock: Some(t),
+                tz: None
+            })
+        );
+        // Without a timezone the first-time warp is still available.
+        assert!(first.load(Ordering::SeqCst));
+        // Nothing at all is a successful nothing.
+        assert_eq!(
+            settimeofday_plan(None, None, &first, Duration::ZERO),
+            Ok(SettimeofdayPlan {
+                clock: None,
+                tz: None
+            })
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1356,11 +1989,12 @@ mod exec_timer_tests {
             id,
             PosixTimer {
                 owner,
-                signo: Signal::SIGALRM as usize,
+                notify: TimerNotify::SIGALRM_TO_PROCESS,
                 clock: ClockBase::Monotonic,
                 interval: Duration::from_secs(1),
                 next: Duration::from_secs(1),
                 generation: 0,
+                overrun_last: 0,
             },
         );
         id
@@ -1417,5 +2051,435 @@ mod exec_timer_tests {
         assert_eq!(drop_posix_timers_of(0x4711_0006), 0);
         assert!(still_there(theirs));
         POSIX_TIMERS.lock().remove(&theirs);
+    }
+}
+
+#[cfg(test)]
+mod exit_timer_tests {
+    //! `exit_itimers()`: a process's POSIX timers die with it. They did not:
+    //! nothing looked at the table when a process ended, so a periodic timer
+    //! kept re-arming itself and firing at the dead pid for ever, and every
+    //! other entry of the dead process stayed in the table.
+    //!
+    //! Each test owns its pids and asserts only on its own ids, so it holds
+    //! with the rest of the binary running in parallel.
+    use super::*;
+    use linux_object::process::LinuxProcess;
+    use rcore_fs_ramfs::RamFS;
+    use zircon_object::task::Process;
+
+    fn a_periodic_timer_of(owner: KoID) -> usize {
+        let id = NEXT_TIMER_ID.fetch_add(1, Ordering::Relaxed);
+        POSIX_TIMERS.lock().insert(
+            id,
+            PosixTimer {
+                owner,
+                notify: TimerNotify::SIGALRM_TO_PROCESS,
+                clock: ClockBase::Monotonic,
+                interval: Duration::from_secs(1),
+                next: Duration::from_secs(1),
+                generation: 0,
+                overrun_last: 0,
+            },
+        );
+        id
+    }
+
+    fn still_there(id: usize) -> bool {
+        POSIX_TIMERS.lock().contains_key(&id)
+    }
+
+    /// The death of a process built the way the kernel builds them, through
+    /// `create_linux`, which is where the exit callback is registered.
+    #[test]
+    fn a_process_that_dies_takes_its_timers_with_it_and_nobody_elses() {
+        let (mine, neighbour) = (0x4712_0001, 0x4712_0002);
+        let proc = Process::create_linux(&ROOT_JOB, RamFS::new(), 0, None, mine).unwrap();
+        ensure_posix_timers_die_with_their_owner();
+        let one = a_periodic_timer_of(mine);
+        let two = a_periodic_timer_of(mine);
+        let theirs = a_periodic_timer_of(neighbour);
+
+        proc.exit(0);
+
+        assert!(!still_there(one), "the dead process's timer is still armed");
+        assert!(!still_there(two));
+        assert!(
+            still_there(theirs),
+            "a death in one process took another process's timer"
+        );
+        POSIX_TIMERS.lock().remove(&theirs);
+    }
+
+    /// The hook is registered once however many timers are created: a second
+    /// `timer_create` must not stack a second copy that would run at every
+    /// death (the exit path of every process is not the place to grow).
+    #[test]
+    fn the_exit_hook_is_registered_once() {
+        let before = linux_object::process::process_exit_hook_count();
+        ensure_posix_timers_die_with_their_owner();
+        ensure_posix_timers_die_with_their_owner();
+        ensure_posix_timers_die_with_their_owner();
+        let after = linux_object::process::process_exit_hook_count();
+        assert!(after <= before + 1, "{} hooks stacked up", after - before);
+        assert!(EXIT_HOOK_REGISTERED.load(Ordering::Acquire));
+    }
+
+    /// The callback of a timer whose owner has already died (exited, whether
+    /// or not the parent has reaped it): the timer is deleted there and then,
+    /// no signal goes anywhere, and there is no next expiry to arm.
+    #[test]
+    fn an_expiry_after_the_owners_death_deletes_the_timer_and_does_not_rearm() {
+        let owner = 0x4712_0003;
+        // Built without the exit callback, so the death alone leaves the
+        // entry in place and it is the expiry that must clean up.
+        let proc = Process::create_with_fixed_id_ext(
+            &ROOT_JOB,
+            owner,
+            "p",
+            LinuxProcess::new(RamFS::new(), 0),
+        )
+        .unwrap();
+        // A thread that never ran keeps the process in the job after
+        // `exit`: findable, `Exited`, its threads still dying. That is the
+        // zombie the check has to call dead, not only a pid that names
+        // nothing any more.
+        let _thread = Thread::create_linux(&proc).unwrap();
+        let id = a_periodic_timer_of(owner);
+        proc.exit(0);
+        assert!(still_there(id), "the setup: nothing else deleted it");
+        assert!(
+            matches!(
+                ROOT_JOB.find_process(owner).map(|p| p.status()),
+                Some(Status::Exited(_))
+            ),
+            "the setup: the owner is a zombie the job still lists"
+        );
+
+        let next = expire_posix_timer(id, 0, Duration::from_secs(1));
+
+        assert_eq!(next, None, "a dead owner's periodic timer was re-armed");
+        assert!(!still_there(id), "and its entry was kept");
+    }
+
+    /// A pid that names no process at all, which is what the callback sees
+    /// once the dead process is gone from the job.
+    #[test]
+    fn an_expiry_for_a_pid_that_names_no_process_deletes_the_timer() {
+        let id = a_periodic_timer_of(0x4712_0004);
+        assert_eq!(expire_posix_timer(id, 0, Duration::from_secs(1)), None);
+        assert!(!still_there(id));
+    }
+
+    /// The other side of the check: a live owner's periodic timer goes on
+    /// as before, with the next expiry a period later and the entry kept.
+    #[test]
+    fn a_live_owners_periodic_timer_still_rearms() {
+        let owner = 0x4712_0005;
+        let _proc = Process::create_with_fixed_id_ext(
+            &ROOT_JOB,
+            owner,
+            "p",
+            LinuxProcess::new(RamFS::new(), 0),
+        )
+        .unwrap();
+        let id = a_periodic_timer_of(owner);
+
+        let next = expire_posix_timer(id, 0, Duration::from_secs(1));
+
+        assert_eq!(next, Some(Duration::from_secs(2)));
+        assert!(still_there(id), "a live owner's timer was deleted");
+        POSIX_TIMERS.lock().remove(&id);
+    }
+}
+
+#[cfg(test)]
+mod overrun_tests {
+    //! A periodic timer that fell behind fired once per missed period, back
+    //! to back, and `timer_getoverrun` always said 0.
+
+    use super::*;
+    use linux_object::process::LinuxProcess;
+    use linux_object::signal::SignalCode;
+    use rcore_fs_ramfs::RamFS;
+    use zircon_object::task::Process;
+
+    fn ms(n: u64) -> Duration {
+        Duration::from_millis(n)
+    }
+
+    fn a_process(pid: KoID) -> (alloc::sync::Arc<Process>, alloc::sync::Arc<Thread>) {
+        let proc = Process::create_with_fixed_id_ext(
+            &ROOT_JOB,
+            pid,
+            "t",
+            LinuxProcess::new(RamFS::new(), 0),
+        )
+        .unwrap();
+        let thread = Thread::create_linux(&proc).unwrap();
+        (proc, thread)
+    }
+
+    /// A periodic POSIX timer of `owner` whose expiry was programmed at
+    /// 1 s, every 10 ms.
+    fn a_periodic_timer(owner: KoID) -> usize {
+        let id = NEXT_TIMER_ID.fetch_add(1, Ordering::Relaxed);
+        POSIX_TIMERS.lock().insert(
+            id,
+            PosixTimer {
+                owner,
+                notify: TimerNotify::SIGALRM_TO_PROCESS,
+                clock: ClockBase::Monotonic,
+                interval: ms(10),
+                next: ms(1000),
+                generation: 0,
+                overrun_last: 0,
+            },
+        );
+        id
+    }
+
+    /// `si_overrun` where glibc reads it.
+    fn si_overrun(info: &SigInfo) -> i32 {
+        let b = info.as_bytes();
+        i32::from_ne_bytes([b[20], b[21], b[22], b[23]])
+    }
+
+    #[test]
+    fn a_timer_on_time_steps_one_period_with_no_overrun() {
+        assert_eq!(forward_periodic(ms(1000), ms(10), ms(1000)), (ms(1010), 0));
+        assert_eq!(forward_periodic(ms(1000), ms(10), ms(1009)), (ms(1010), 0));
+    }
+
+    #[test]
+    fn a_late_timer_skips_to_the_first_period_after_now_and_counts_the_rest() {
+        // 3.5 periods late: this expiry, three skipped, next at 1040.
+        assert_eq!(forward_periodic(ms(1000), ms(10), ms(1035)), (ms(1040), 3));
+        // Exactly two periods late: the next expiry has to be AFTER now.
+        assert_eq!(forward_periodic(ms(1000), ms(10), ms(1020)), (ms(1030), 2));
+        // Ten seconds late on a 1 ms timer: one expiry, not ten thousand.
+        let (next, overrun) = forward_periodic(ms(1000), ms(1), ms(11000));
+        assert!(next > ms(11000), "next expiry {:?} already gone", next);
+        assert_eq!(overrun, 10_000);
+        // Nothing to overflow on: a 1 ns period a year behind.
+        let (next, overrun) = forward_periodic(
+            Duration::from_secs(1),
+            Duration::from_nanos(1),
+            Duration::from_secs(365 * 24 * 3600),
+        );
+        assert!(next > Duration::from_secs(365 * 24 * 3600));
+        assert_eq!(overrun, DELAYTIMER_MAX);
+    }
+
+    #[test]
+    fn a_late_expiry_delivers_one_signal_with_the_overrun_and_keeps_it_for_getoverrun() {
+        let (proc, thread) = a_process(43_701);
+        let id = a_periodic_timer(proc.id());
+        // The wheel got to the 1 s expiry at 1.5 s: the expiries at 1010,
+        // 1020, ... 1500 went by, fifty of them, and only this one fires.
+        let next = expire_posix_timer(id, 0, ms(1500));
+        assert_eq!(next, Some(ms(1510)), "the next expiry must be after now");
+        let info = thread.lock_linux().take_siginfo(Signal::SIGALRM);
+        assert_eq!(
+            info.code,
+            SignalCode::TIMER,
+            "not SI_TIMER: a POSIX timer expiry"
+        );
+        assert_eq!(si_overrun(&info), 50, "si_overrun");
+        let timers = POSIX_TIMERS.lock();
+        let t = timers.get(&id).unwrap();
+        assert_eq!(t.overrun_last, 50, "timer_getoverrun would answer this");
+        assert_eq!(t.next, ms(1510));
+        assert!(
+            !thread.lock_linux().signals.contains(Signal::SIGALRM),
+            "a second signal was delivered for the same expiry"
+        );
+    }
+
+    #[test]
+    fn a_one_shot_expiry_disarms_and_a_stale_generation_fires_nothing() {
+        let (proc, thread) = a_process(43_702);
+        let id = a_periodic_timer(proc.id());
+        POSIX_TIMERS.lock().get_mut(&id).unwrap().interval = Duration::ZERO;
+        assert_eq!(expire_posix_timer(id, 0, ms(1500)), None);
+        assert!(thread.lock_linux().signals.contains(Signal::SIGALRM));
+        assert_eq!(POSIX_TIMERS.lock().get(&id).unwrap().next, Duration::ZERO);
+
+        let id = a_periodic_timer(proc.id());
+        POSIX_TIMERS.lock().get_mut(&id).unwrap().generation = 3;
+        thread.lock_linux().take_siginfo(Signal::SIGALRM);
+        assert_eq!(expire_posix_timer(id, 0, ms(1500)), None);
+        assert!(!thread.lock_linux().signals.contains(Signal::SIGALRM));
+    }
+
+    #[test]
+    fn a_late_interval_timer_fires_once_and_lands_after_now() {
+        let (proc, thread) = a_process(43_703);
+        {
+            let lp = proc.linux();
+            let mut slots = lp.itimers().lock();
+            slots[ITIMER_REAL] = ItimerSlot {
+                interval: ms(10),
+                deadline: Some(ms(1000)),
+                generation: 5,
+            };
+        }
+        let next = expire_itimer(proc.id(), ITIMER_REAL, 5, ms(1500));
+        assert_eq!(next, Some(ms(1510)), "the next expiry must be after now");
+        assert_eq!(
+            proc.linux().itimers().lock()[ITIMER_REAL].deadline,
+            Some(ms(1510))
+        );
+        assert!(thread.lock_linux().signals.contains(Signal::SIGALRM));
+        // A stale generation is a slot that was re-armed since: nothing.
+        assert_eq!(expire_itimer(proc.id(), ITIMER_REAL, 4, ms(1600)), None);
+    }
+}
+
+#[cfg(test)]
+mod timer_signal_tests {
+    //! A timer that expired set its signal's bit on EVERY thread of the
+    //! process, with no `siginfo_t`; `timer_create` read neither
+    //! `sigev_value` nor the thread of `SIGEV_THREAD_ID`, and took any
+    //! `sigev_signo` or `sigev_notify`.
+
+    use super::*;
+    use linux_object::process::LinuxProcess;
+    use linux_object::signal::SignalCode;
+    use rcore_fs_ramfs::RamFS;
+    use zircon_object::task::Process;
+
+    fn a_process_with_two_threads(
+        pid: KoID,
+    ) -> (alloc::sync::Arc<Process>, [alloc::sync::Arc<Thread>; 2]) {
+        let proc = Process::create_with_fixed_id_ext(
+            &ROOT_JOB,
+            pid,
+            "t",
+            LinuxProcess::new(RamFS::new(), 0),
+        )
+        .unwrap();
+        let a = Thread::create_linux(&proc).unwrap();
+        let b = Thread::create_linux(&proc).unwrap();
+        (proc, [a, b])
+    }
+
+    fn has_pending(thread: &Thread, signal: Signal) -> bool {
+        thread.lock_linux().signals.contains(signal)
+    }
+
+    /// `(si_code, si_timerid, si_overrun, si_value)` where glibc reads them.
+    fn timer_fields(info: &SigInfo) -> (SignalCode, i32, i32, usize) {
+        let b = info.as_bytes();
+        let word = |at: usize| i32::from_ne_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]]);
+        let mut v = [0u8; core::mem::size_of::<usize>()];
+        let n = v.len();
+        v.copy_from_slice(&b[24..24 + n]);
+        (info.code, word(16), word(20), usize::from_ne_bytes(v))
+    }
+
+    fn event(value: usize, signo: i32, notify: i32, thread_id: i32) -> SigEvent {
+        SigEvent {
+            value,
+            signo,
+            notify,
+            thread_id,
+        }
+    }
+
+    #[test]
+    fn an_expired_timer_signals_one_thread_not_every_thread() {
+        let (proc, threads) = a_process_with_two_threads(43_301);
+        let (signal, info) = itimer_expiry_signal(ITIMER_REAL).unwrap();
+        deliver_timer_signal(proc.id(), None, signal, info);
+        let hit = threads
+            .iter()
+            .filter(|t| has_pending(t, Signal::SIGALRM))
+            .count();
+        assert_eq!(hit, 1, "SIGALRM pending on {} of 2 threads", hit);
+    }
+
+    #[test]
+    fn sigev_thread_id_goes_to_that_thread_with_si_timer_and_the_value() {
+        let (proc, [other, target]) = a_process_with_two_threads(43_302);
+        let notify = TimerNotify {
+            signo: 34,
+            value: 0xfeed_f00d,
+            thread: Some(target.id()),
+        };
+        let (signal, info) = posix_timer_expiry_signal(7, notify, 0).unwrap();
+        deliver_timer_signal(proc.id(), notify.thread, signal, info);
+        assert!(
+            !has_pending(&other, signal),
+            "delivered to the wrong thread"
+        );
+        let got = target.lock_linux().take_siginfo(signal);
+        assert_eq!(
+            timer_fields(&got),
+            (SignalCode::TIMER, 7, 0, 0xfeed_f00d),
+            "not the SI_TIMER glibc's helper thread looks for"
+        );
+    }
+
+    #[test]
+    fn an_interval_timer_signal_comes_from_the_kernel_not_from_a_process() {
+        let (signal, info) = itimer_expiry_signal(ITIMER_PROF).unwrap();
+        assert_eq!(signal, Signal::SIGPROF);
+        assert_eq!(timer_fields(&info), (SignalCode::KERNEL, 0, 0, 0));
+    }
+
+    #[test]
+    fn sigev_none_arms_a_timer_that_delivers_nothing() {
+        let notify = timer_notify_from_sigevent(&event(5, 0, SIGEV_NONE, 0), |_| false).unwrap();
+        assert_eq!(notify.signo, 0);
+        assert!(posix_timer_expiry_signal(1, notify, 0).is_none());
+    }
+
+    #[test]
+    fn the_sigevent_has_to_name_a_real_signal_and_a_known_notify() {
+        // `sigev_signo` 0 used to be "no signal" and 200 was silently
+        // dropped at expiry; `good_sigevent` refuses both up front.
+        for signo in [0, -1, SIGRTMAX + 1, 200] {
+            assert_eq!(
+                timer_notify_from_sigevent(&event(0, signo, SIGEV_SIGNAL, 0), |_| true).err(),
+                Some(LxError::EINVAL),
+                "signo {}",
+                signo
+            );
+        }
+        for notify in [3, 5, 8, -1] {
+            assert_eq!(
+                timer_notify_from_sigevent(&event(0, 14, notify, 0), |_| true).err(),
+                Some(LxError::EINVAL),
+                "notify {}",
+                notify
+            );
+        }
+        let ok =
+            timer_notify_from_sigevent(&event(9, SIGRTMAX, SIGEV_SIGNAL, 0), |_| false).unwrap();
+        assert_eq!(
+            ok,
+            TimerNotify {
+                signo: 64,
+                value: 9,
+                thread: None
+            }
+        );
+    }
+
+    #[test]
+    fn sigev_thread_id_must_be_a_thread_of_the_caller() {
+        let mine = |tid: KoID| tid == 77;
+        assert_eq!(
+            timer_notify_from_sigevent(&event(0, 34, SIGEV_THREAD_ID, 78), mine).err(),
+            Some(LxError::EINVAL)
+        );
+        assert_eq!(
+            timer_notify_from_sigevent(&event(0, 34, SIGEV_THREAD_ID, 0), mine).err(),
+            Some(LxError::EINVAL)
+        );
+        let ok = timer_notify_from_sigevent(&event(1, 34, SIGEV_THREAD_ID, 77), mine).unwrap();
+        assert_eq!(ok.thread, Some(77));
+        assert_eq!((ok.signo, ok.value), (34, 1));
     }
 }

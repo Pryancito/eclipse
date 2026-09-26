@@ -9,6 +9,7 @@ mod eventfd;
 mod fat_mount;
 mod file;
 mod flagged_fs;
+pub mod flock;
 pub mod hunter_config;
 mod inotify;
 pub mod ioctl;
@@ -201,6 +202,34 @@ lazy_static! {
     /// prunes dead entries and reports how many inodes are still alive and how
     /// many bytes they pin.
     static ref MEMFD_LIVE: Mutex<Vec<MemfdEntry>> = Mutex::new(Vec::new());
+}
+
+/// Registry size at which `new_memfd` next prunes the dead entries. It starts
+/// at `MEMFD_PRUNE_MIN` and, after each prune, is twice what survived (never
+/// under the minimum), so the pruning is amortised O(1) per creation and the
+/// registry stays within about twice the number of memfds actually alive.
+///
+/// It used to be pruned only by `memfd_stats`, from the OOM report: every
+/// memfd ever created stayed in the list until then, and `memfd_seals`
+/// walks the whole list, upgrading every weak ref, from the `write_at`
+/// chokepoint of EVERY file (`memfd_write_allowed`) and from `ftruncate`.
+/// A desktop creates memfds without end (a wl_shm pool per resize, a segment
+/// per Firefox IPC message, a scratch file per cursor), so each `write(2)`
+/// on any file cost as many atomic upgrades as memfds had ever existed, and
+/// the list itself grew for as long as the machine stayed up.
+static MEMFD_PRUNE_AT: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(MEMFD_PRUNE_MIN);
+const MEMFD_PRUNE_MIN: usize = 64;
+
+/// Drop the entries whose inode is gone and re-arm the threshold. Runs under
+/// the registry lock and allocates nothing (`retain` works in place), which
+/// is the rule for that lock: see `new_memfd`.
+fn prune_dead_memfds(live: &mut Vec<MemfdEntry>) {
+    live.retain(|(_, w, _)| w.strong_count() > 0);
+    MEMFD_PRUNE_AT.store(
+        (live.len() * 2).max(MEMFD_PRUNE_MIN),
+        core::sync::atomic::Ordering::Relaxed,
+    );
 }
 
 /// One live memfd: its creation sequence, a weak ref to its inode, and its
@@ -439,6 +468,9 @@ pub fn new_memfd(name: &str, flags: usize) -> LxResult<Arc<File>> {
         loop {
             let cap = {
                 let mut live = MEMFD_LIVE.lock();
+                if live.len() >= MEMFD_PRUNE_AT.load(core::sync::atomic::Ordering::Relaxed) {
+                    prune_dead_memfds(&mut live);
+                }
                 if live.len() < live.capacity() {
                     live.push(elem.take().unwrap());
                     break;
@@ -2115,6 +2147,39 @@ impl LinuxProcess {
             path,
             follow
         );
+        // `getname_flags`: an empty path is `ENOENT` unless the syscall asked
+        // for `LOOKUP_EMPTY` (`AT_EMPTY_PATH`), and the callers that did
+        // resolve the descriptor themselves before coming here. The VFS walk
+        // below takes "" as "this directory", so `stat("")`, `open("")`,
+        // `access("")`, `chdir("")` and `execve("")` all named the current
+        // directory (or `dirfd`): `[ -e "$unset" ]` was true in every shell.
+        if path.is_empty() {
+            return Err(LxError::ENOENT);
+        }
+        // A trailing slash is `LOOKUP_DIRECTORY | LOOKUP_FOLLOW` on the last
+        // component (`path_init`: `if (*s == '/') ... nd->flags |=
+        // LOOKUP_DIRECTORY` via `link_path_walk`'s `nd->last.name[len]`):
+        // what it names must be a directory, `ENOTDIR` otherwise, and a
+        // symlink there is followed even by `lstat` and `O_NOFOLLOW`. The
+        // walk skips empty components, so `stat("f/")` on a regular file
+        // used to succeed and `lstat("l/")` returned the link itself.
+        let trailing_slash = path.ends_with('/');
+        let inode =
+            self.lookup_inode_at_walk(dirfd, path, follow || trailing_slash, proc_self_exe_budget)?;
+        if trailing_slash && inode.metadata()?.type_ != FileType::Dir {
+            return Err(LxError::ENOTDIR);
+        }
+        Ok(inode)
+    }
+
+    /// The walk itself, on a path already known to be non-empty.
+    fn lookup_inode_at_walk(
+        &self,
+        dirfd: FileDesc,
+        path: &str,
+        follow: bool,
+        proc_self_exe_budget: usize,
+    ) -> LxResult<Arc<dyn INode>> {
         // hard code special path
         if path == "/proc/self/exe" {
             if follow {
@@ -2223,6 +2288,104 @@ impl LinuxProcess {
     /// see `lookup_inode_at`
     pub fn lookup_inode(&self, path: &str) -> LxResult<Arc<dyn INode>> {
         self.lookup_inode_at(FileDesc::CWD, path, true)
+    }
+}
+
+/// The two ends of a path the VFS walk read wrongly: the empty path, which
+/// it took for "this directory" and `getname_flags` refuses, and a trailing
+/// slash, which it skipped and Linux reads as "must be a directory".
+#[cfg(test)]
+mod path_ending_tests {
+    use super::*;
+    use crate::process::LinuxProcess;
+    use rcore_fs_ramfs::RamFS;
+
+    fn a_process() -> LinuxProcess {
+        let proc = LinuxProcess::new(RamFS::new(), 0);
+        proc.root_inode()
+            .create("pe_d", FileType::Dir, 0o755)
+            .unwrap();
+        proc
+    }
+
+    #[test]
+    fn an_empty_path_is_enoent_from_the_cwd_and_from_a_directory_fd() {
+        let proc = a_process();
+        assert_eq!(
+            proc.lookup_inode_at(FileDesc::CWD, "", true).err(),
+            Some(LxError::ENOENT)
+        );
+        assert_eq!(
+            proc.lookup_inode_at(FileDesc::CWD, "", false).err(),
+            Some(LxError::ENOENT)
+        );
+        let dir = proc.lookup_inode_at(FileDesc::CWD, "pe_d", true).unwrap();
+        let fd = proc
+            .add_file(File::new(dir, OpenFlags::RDONLY, String::from("/pe_d")))
+            .unwrap();
+        assert_eq!(
+            proc.lookup_inode_at(fd, "", true).err(),
+            Some(LxError::ENOENT)
+        );
+    }
+
+    #[test]
+    fn a_trailing_slash_wants_a_directory_and_follows_a_link_to_one() {
+        // `LOOKUP_DIRECTORY | LOOKUP_FOLLOW`: `stat("pe_f/")` on a regular file
+        // is `ENOTDIR`, and `lstat("pe_l/")` on a link to a directory is the
+        // directory, not the link.
+        let proc = a_process();
+        let root = proc.root_inode();
+        root.create("pe_f", FileType::File, 0o644).unwrap();
+        let to_dir = root.create("pe_l", FileType::SymLink, 0o777).unwrap();
+        to_dir.write_at(0, b"pe_d").unwrap();
+        let to_file = root.create("pe_m", FileType::SymLink, 0o777).unwrap();
+        to_file.write_at(0, b"pe_f").unwrap();
+        let d = proc
+            .lookup_inode_at(FileDesc::CWD, "pe_d", true)
+            .unwrap()
+            .metadata()
+            .unwrap()
+            .inode;
+
+        assert_eq!(
+            proc.lookup_inode_at(FileDesc::CWD, "pe_f/", true).err(),
+            Some(LxError::ENOTDIR)
+        );
+        assert_eq!(
+            proc.lookup_inode_at(FileDesc::CWD, "pe_f/", false).err(),
+            Some(LxError::ENOTDIR)
+        );
+        let kind = |path: &str, follow: bool| {
+            proc.lookup_inode_at(FileDesc::CWD, path, follow)
+                .map(|i| i.metadata().unwrap())
+                .map(|m| (m.type_, m.inode))
+        };
+        assert_eq!(kind("pe_d/", true), Ok((FileType::Dir, d)));
+        assert_eq!(kind("pe_d/", false), Ok((FileType::Dir, d)));
+        // Without the slash `lstat` gets the link; with it, the directory.
+        assert_eq!(kind("pe_l", false).map(|(t, _)| t), Ok(FileType::SymLink));
+        assert_eq!(kind("pe_l/", false), Ok((FileType::Dir, d)));
+        // A link to a file is followed too, and what it reaches is not a
+        // directory.
+        assert_eq!(kind("pe_m/", false).err(), Some(LxError::ENOTDIR));
+        // The root is a directory that is nothing but a slash.
+        assert_eq!(kind("/", false).map(|(t, _)| t), Ok(FileType::Dir));
+    }
+
+    #[test]
+    fn a_dot_still_names_the_directory_itself() {
+        // The guard is on the empty string alone: "." is a real component.
+        let proc = a_process();
+        let root = proc.root_inode().metadata().unwrap().inode;
+        assert_eq!(
+            proc.lookup_inode_at(FileDesc::CWD, ".", true)
+                .unwrap()
+                .metadata()
+                .unwrap()
+                .inode,
+            root
+        );
     }
 }
 
@@ -3015,6 +3178,63 @@ mod user_argument_tests {
                 shift
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod memfd_registry_tests {
+    //! The registry of live memfds is walked on every `write(2)` of every
+    //! file and grew with every memfd ever created: only the OOM report
+    //! pruned it. Now `new_memfd` prunes the dead entries as it goes.
+    //!
+    //! The bounds here are loose on purpose: other tests of this binary
+    //! create memfds too, and CI runs with `--test-threads=1` while a
+    //! developer may not.
+    use super::*;
+
+    fn registry_len() -> usize {
+        MEMFD_LIVE.lock().len()
+    }
+
+    fn churn(n: usize) {
+        for _ in 0..n {
+            drop(new_memfd("churn", 0).unwrap());
+        }
+    }
+
+    #[test]
+    fn dead_memfds_leave_the_registry_as_new_ones_are_created() {
+        churn(5000);
+        let len = registry_len();
+        assert!(
+            len < 1000,
+            "{} entries in the registry after five thousand memfds came and went",
+            len
+        );
+    }
+
+    #[test]
+    fn a_live_memfd_survives_the_prune_with_its_seals() {
+        let f = new_memfd("keymap", MFD_ALLOW_SEALING).unwrap();
+        memfd_add_seals(&f.inode(), F_SEAL_SHRINK).unwrap();
+        churn(5000);
+        assert_eq!(
+            memfd_seals(&f.inode()),
+            Some(F_SEAL_SHRINK),
+            "a memfd still open was pruned, or lost its seals"
+        );
+    }
+
+    #[test]
+    fn the_registry_stays_within_a_multiple_of_what_is_alive() {
+        let held: Vec<_> = (0..100).map(|_| new_memfd("held", 0).unwrap()).collect();
+        churn(5000);
+        let len = registry_len();
+        // Two hundred is what a prune leaves room for with a hundred alive
+        // (twice the survivors), and the rest is what other tests of this
+        // binary may be holding.
+        assert!(len <= 100 * 2 + MEMFD_PRUNE_MIN + 200, "{} entries", len);
+        drop(held);
     }
 }
 

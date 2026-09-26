@@ -220,6 +220,13 @@ impl Futex {
         self.inner.lock().owner.clone()
     }
 
+    /// Whether nobody waits on this futex and nobody owns it, so its
+    /// process may forget it (see [`FutexTable`]).
+    pub fn is_idle(&self) -> bool {
+        let inner = self.inner.lock();
+        inner.waiter_queue.is_empty() && inner.owner.is_none()
+    }
+
     /// Wait on a futex.
     ///
     /// This atomically verifies that `value_ptr` still contains the value `current_value`
@@ -532,6 +539,61 @@ impl FutexInner {
     fn set_owner(&mut self, owner: Option<Arc<Thread>>) {
         // TODO: change the priority of owner thread
         self.owner = owner;
+    }
+}
+
+/// The futexes of one process, keyed by the address of their word.
+///
+/// A futex is only worth remembering while someone waits on it, owns it, or
+/// holds it: userspace names a futex by any aligned word it likes (a mutex
+/// on the stack, one in a freed block, or every word of the address space in
+/// a loop), and a table that kept every one for the life of the process was
+/// kernel heap that only exit gave back. Inserting past the threshold sweeps
+/// the entries nobody references and nobody waits on; the threshold then
+/// doubles from what survived, so a sweep costs amortized constant time.
+#[derive(Default)]
+pub struct FutexTable {
+    map: hashbrown::HashMap<usize, Arc<Futex>>,
+    sweep_at: usize,
+}
+
+/// The table sweeps no earlier than this many entries.
+const FUTEX_TABLE_MIN_SWEEP: usize = 64;
+
+impl FutexTable {
+    /// The futex of the word at `addr`, made with `create` if the table has
+    /// none.
+    pub fn get_or_create(
+        &mut self,
+        addr: usize,
+        create: impl FnOnce() -> Arc<Futex>,
+    ) -> Arc<Futex> {
+        if let Some(futex) = self.map.get(&addr) {
+            return futex.clone();
+        }
+        if self.map.len() >= self.sweep_at.max(FUTEX_TABLE_MIN_SWEEP) {
+            self.map
+                .retain(|_, futex| Arc::strong_count(futex) > 1 || !futex.is_idle());
+            self.sweep_at = (self.map.len() * 2).max(FUTEX_TABLE_MIN_SWEEP);
+        }
+        let futex = create();
+        self.map.insert(addr, futex.clone());
+        futex
+    }
+
+    /// Forget every futex.
+    pub fn clear(&mut self) {
+        self.map.clear();
+    }
+
+    /// How many futexes the table remembers right now.
+    pub fn len(&self) -> usize {
+        self.map.len()
+    }
+
+    /// Whether the table remembers no futex.
+    pub fn is_empty(&self) -> bool {
+        self.map.is_empty()
     }
 }
 
@@ -1211,5 +1273,100 @@ mod tests {
             Poll::Ready(Err(ZxError::BAD_STATE))
         );
         assert_eq!(futex.inner.lock().waiter_queue.len(), 0);
+    }
+
+    /// Every distinct word a process ever named used to stay in its table
+    /// until exit. Ten thousand idle futexes, each dropped as soon as it was
+    /// made, leave a table no bigger than one sweep's worth.
+    #[test]
+    fn a_table_forgets_the_futexes_nobody_holds_waits_on_or_owns() {
+        let mut table = FutexTable::default();
+        let words: &'static [AtomicI32] =
+            Box::leak((0..10_000).map(|_| AtomicI32::new(0)).collect());
+        for word in words {
+            drop(table.get_or_create(word as *const _ as usize, || Futex::new(word)));
+        }
+        assert!(
+            table.len() <= FUTEX_TABLE_MIN_SWEEP,
+            "{} idle futexes are still remembered",
+            table.len()
+        );
+        let first = table.get_or_create(words[0].as_ptr() as usize, || Futex::new(&words[0]));
+        let again = table.get_or_create(words[0].as_ptr() as usize, || Futex::new(&words[0]));
+        assert!(
+            Arc::ptr_eq(&first, &again),
+            "a futex someone holds is the one the next call gets"
+        );
+    }
+
+    /// A sweep keeps the futexes that still matter: one a caller holds, one
+    /// with a waiter on its queue, and one a thread owns with nobody
+    /// waiting. An idle one is replaced by a fresh object after the sweep.
+    #[test]
+    fn a_sweep_keeps_the_held_the_waited_on_and_the_owned() {
+        let proc = Process::create(&Job::root(), "futex-table").unwrap();
+        let thread = Thread::create(&proc, "owner").unwrap();
+        let mut table = FutexTable::default();
+        let word = |v| -> &'static AtomicI32 { Box::leak(Box::new(AtomicI32::new(v))) };
+        let key = |w: &'static AtomicI32| w as *const _ as usize;
+
+        let held_word = word(0);
+        let held = table.get_or_create(key(held_word), || Futex::new(held_word));
+
+        let waited_word = word(0);
+        let waited_id = {
+            let futex = table.get_or_create(key(waited_word), || Futex::new(waited_word));
+            futex.id()
+        };
+        let (_waiting, _) = queue_waiter(
+            &table.get_or_create(key(waited_word), || unreachable!()),
+            0,
+            None,
+        );
+
+        let owned_word = word(0);
+        let owned_id = {
+            let futex = table.get_or_create(key(owned_word), || Futex::new(owned_word));
+            futex.inner.lock().set_owner(Some(thread.clone()));
+            futex.id()
+        };
+
+        let idle_word = word(0);
+        let idle_id = table
+            .get_or_create(key(idle_word), || Futex::new(idle_word))
+            .id();
+
+        let filler: &'static [AtomicI32] = Box::leak(
+            (0..10 * FUTEX_TABLE_MIN_SWEEP)
+                .map(|_| AtomicI32::new(0))
+                .collect(),
+        );
+        for w in filler {
+            drop(table.get_or_create(key(w), || Futex::new(w)));
+        }
+
+        assert!(Arc::ptr_eq(
+            &held,
+            &table.get_or_create(key(held_word), || unreachable!())
+        ));
+        assert_eq!(
+            table
+                .get_or_create(key(waited_word), || unreachable!())
+                .id(),
+            waited_id,
+            "a futex with a waiter keeps its queue"
+        );
+        assert_eq!(
+            table.get_or_create(key(owned_word), || unreachable!()).id(),
+            owned_id,
+            "a futex a thread owns keeps its owner"
+        );
+        assert_ne!(
+            table
+                .get_or_create(key(idle_word), || Futex::new(idle_word))
+                .id(),
+            idle_id,
+            "the idle one was swept"
+        );
     }
 }

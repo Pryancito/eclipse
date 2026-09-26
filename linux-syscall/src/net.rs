@@ -105,6 +105,22 @@ fn read_sockaddr(addr: usize, addrlen: usize) -> Result<SockAddr, LxError> {
 /// size back. Previously `optlen` was write-only and the input size was ignored,
 /// so an option larger than the caller's buffer (e.g. the 12-byte SO_PEERCRED
 /// `ucred` written into a 4-byte buffer) overflowed adjacent user memory.
+/// `struct ucred` for `SO_PEERCRED`: `pid`, then the EFFECTIVE uid and gid of
+/// the process it names (`cred_to_ucred`, which reads `euid`/`egid`). When
+/// no such process exists any more the ids are `-1`, which is what Linux
+/// reports for a peer whose credentials it does not hold (`overflowuid`).
+fn ucred_of(pid: i32) -> [u8; 12] {
+    let (uid, gid) = linux_object::process::find_process(pid as u64)
+        .and_then(|p| p.try_linux().map(|lp| lp.credentials()))
+        .map(|c| (c.euid, c.egid))
+        .unwrap_or((u32::MAX, u32::MAX));
+    let mut bytes = [0u8; 12];
+    for (i, w) in [pid as u32, uid, gid].iter().enumerate() {
+        bytes[i * 4..i * 4 + 4].copy_from_slice(&w.to_ne_bytes());
+    }
+    bytes
+}
+
 fn write_sockopt_out(
     optval: UserOutPtr<u32>,
     mut optlen: UserInOutPtr<u32>,
@@ -416,9 +432,9 @@ impl Syscall<'_> {
                 // gid_t gid; }` — the credentials of the process on the other end
                 // of a connected (unix) socket. seatd reads this to authorize a
                 // Wayland client (labwc); without it the call returned ENOPROTOOPT
-                // ("invalid optname: 17") and seatd refused the client. Eclipse is
-                // single-user root, so report root uid/gid (which is what seatd
-                // checks) and the peer's pid when the socket tracks it.
+                // ("invalid optname: 17") and seatd refused the client. The uid
+                // and gid are the peer's own, not a constant: dbus-daemon,
+                // polkit and logind decide who a client IS from this answer.
                 const SO_PEERCRED: usize = 17;
                 if optname == SO_PEERCRED {
                     let file_like = self.linux_process().get_file_like(sockfd.into())?;
@@ -427,12 +443,7 @@ impl Syscall<'_> {
                         .ok()
                         .and_then(|s| s.peer_pid())
                         .unwrap_or(1);
-                    let ucred: [u32; 3] = [pid as u32, 0, 0];
-                    let mut bytes = [0u8; 12];
-                    for (i, w) in ucred.iter().enumerate() {
-                        bytes[i * 4..i * 4 + 4].copy_from_slice(&w.to_ne_bytes());
-                    }
-                    return write_sockopt_out(optval, optlen, &bytes);
+                    return write_sockopt_out(optval, optlen, &ucred_of(pid));
                 }
                 let optname = match SolOptname::try_from(optname) {
                     Ok(optname) => optname,
@@ -1531,5 +1542,48 @@ mod send_mode_tests {
         assert!(!mode.sigpipe);
         assert!(mode.wait, "MSG_NOSIGNAL says nothing about waiting");
         assert!(!send_mode(MSG_NOSIGNAL | MSG_DONTWAIT, false, true).wait);
+    }
+}
+
+#[cfg(test)]
+mod peercred_tests {
+    //! `SO_PEERCRED` answered `uid 0, gid 0` for every peer, whoever it was.
+    //! dbus-daemon, polkit and logind decide who a client IS from this
+    //! answer, so every unprivileged client was root to them.
+
+    use super::*;
+    use rcore_fs_ramfs::RamFS;
+    use zircon_object::task::ROOT_JOB;
+
+    fn a_process(pid: KoID) -> Arc<Process> {
+        Process::create_with_fixed_id_ext(
+            &ROOT_JOB,
+            pid,
+            "peer",
+            LinuxProcess::new(RamFS::new(), 0),
+        )
+        .unwrap()
+    }
+
+    fn words(bytes: [u8; 12]) -> [u32; 3] {
+        let w = |i: usize| u32::from_ne_bytes(bytes[i * 4..i * 4 + 4].try_into().unwrap());
+        [w(0), w(1), w(2)]
+    }
+
+    #[test]
+    fn the_ucred_carries_the_peer_s_effective_uid_and_gid() {
+        // A root daemon running with EFFECTIVE uid 1000 / gid 100 and its
+        // real and saved ids still 0: the effective pair is what
+        // `cred_to_ucred` reports, not the real one.
+        let peer = a_process(43_101);
+        peer.linux().set_resgid(0, 100, 0).unwrap();
+        peer.linux().set_resuid(0, 1000, 0).unwrap();
+        assert_eq!(words(ucred_of(43_101)), [43_101, 1000, 100]);
+    }
+
+    #[test]
+    fn a_peer_that_no_longer_exists_has_no_ids() {
+        // Linux's `overflowuid`: the answer for credentials it does not hold.
+        assert_eq!(words(ucred_of(43_102)), [43_102, u32::MAX, u32::MAX]);
     }
 }

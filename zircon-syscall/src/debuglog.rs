@@ -27,9 +27,7 @@ impl Syscall<'_> {
         } else {
             Rights::DEFAULT_DEBUGLOG | Rights::READ
         };
-        let dlog_handle = proc.add_handle(Handle::new(dlog, dlog_right));
-        target.write(dlog_handle)?;
-        Ok(())
+        install_handle(proc, Handle::new(dlog, dlog_right), &mut target)
     }
 
     /// Write log entry to debuglog.
@@ -48,14 +46,17 @@ impl Syscall<'_> {
         if options & !LOG_FLAGS_MASK != 0 {
             return Err(ZxError::INVALID_ARGS);
         }
-        let datalen = len.min(224);
-        let data = buf.as_str(datalen)?;
+        // The record takes bytes, not text: a line cut at `DLOG_MAX_DATA` in
+        // the middle of a multi-byte character, or one with a stray byte,
+        // used to be refused whole as invalid UTF-8.
+        let datalen = len.min(DLOG_MAX_DATA);
+        let data = buf.as_slice(datalen)?;
         let proc = self.thread.proc();
         let dlog = proc.get_object_with_rights::<DebugLog>(handle_value, Rights::WRITE)?;
         dlog.write(Severity::Info, options, self.thread.id(), proc.id(), data);
         // print to kernel console
-        kernel_hal::console::console_write_str(data);
-        if data.as_bytes().last() != Some(&b'\n') {
+        kernel_hal::console::console_write_str(&alloc::string::String::from_utf8_lossy(data));
+        if data.last() != Some(&b'\n') {
             kernel_hal::console::console_write_str("\n");
         }
         Ok(())

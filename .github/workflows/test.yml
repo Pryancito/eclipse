@@ -78,6 +78,10 @@ jobs:
           cargo test -p linux-syscall --lib -- --test-threads=1
           cargo test -p kernel-hal --lib -- --test-threads=1
           cargo test -p hunter --lib -- --test-threads=1
+          # The VFS trait under every file system: the path walk that follows
+          # symlinks (`INode::lookup_follow`). Reached only through `[patch]`,
+          # so its tests had never run anywhere.
+          cargo test -p rcore-fs --features std
           # The btrfs driver is a path dependency of linux-object, so
           # `default-members` hid its ~50 tests here too -- including the ones
           # that cross-validate our images against btrfs-progs (those skip

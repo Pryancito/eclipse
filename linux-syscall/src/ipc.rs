@@ -173,7 +173,10 @@ impl Syscall<'_> {
         let proc = self.linux_process();
         let sem_array =
             SemArray::get_or_create(key as u32, nsems, flags, proc.euid(), proc.egid())?;
-        let id = self.linux_process().semaphores_add(sem_array);
+        // The id is system-wide and the registry is what keeps the set alive
+        // past this process, per sysvipc(7). See `sem_register`.
+        let id = linux_object::ipc::sem_register(&sem_array)?;
+        self.linux_process().semaphores_add(id, sem_array);
         Ok(id)
     }
 
@@ -322,6 +325,7 @@ impl Syscall<'_> {
                     return Err(LxError::EPERM);
                 }
                 sem_array.remove();
+                linux_object::ipc::sem_unregister(id);
                 self.linux_process().semaphores_remove(id);
                 Ok(0)
             }
@@ -410,18 +414,22 @@ impl Syscall<'_> {
         }
         let sender = self.zircon_process().id() as u32;
         loop {
-            match queue.try_send(mtype, &data, sender) {
+            // A full queue parks the caller on the queue itself: `try_send`
+            // hands back the generation it looked at, and `wait_for_change`
+            // returns when a receive makes room, when `IPC_RMID` runs
+            // (`EIDRM`) or when a signal arrives (`EINTR`). This used to be a
+            // 5 ms sleep-and-look-again.
+            let since = match queue.try_send(mtype, &data, sender) {
                 Ok(()) => return Ok(0),
                 Err(MsgSendError::Removed) => return Err(LxError::EIDRM),
-                Err(MsgSendError::Full) => {
+                Err(MsgSendError::Full(since)) => {
                     if msgflg & IPC_NOWAIT != 0 {
                         return Err(LxError::EAGAIN);
                     }
+                    since
                 }
-            }
-            linux_object::process::check_signals()?;
-            let deadline = kernel_hal::timer::deadline_after(core::time::Duration::from_millis(5));
-            kernel_hal::thread::sleep_until(deadline).await;
+            };
+            queue.wait_for_change(since).await?;
         }
     }
 
@@ -453,7 +461,9 @@ impl Syscall<'_> {
         let noerror = msgflg & MSG_NOERROR != 0;
         let except = msgflg & MSG_EXCEPT != 0;
         loop {
-            match queue.try_recv(msgtyp, msgsz, noerror, except, receiver) {
+            // Same shape as `msgsnd`: park on the queue's own generation
+            // until a message lands, instead of a 5 ms sleep-and-look-again.
+            let since = match queue.try_recv(msgtyp, msgsz, noerror, except, receiver) {
                 Ok((mtype, data)) => {
                     UserOutPtr::<isize>::from(msgp).write(mtype)?;
                     UserOutPtr::<u8>::from(msgp + core::mem::size_of::<isize>())
@@ -462,15 +472,14 @@ impl Syscall<'_> {
                 }
                 Err(MsgRecvError::Removed) => return Err(LxError::EIDRM),
                 Err(MsgRecvError::TooBig) => return Err(LxError::E2BIG),
-                Err(MsgRecvError::NoMsg) => {
+                Err(MsgRecvError::NoMsg(since)) => {
                     if msgflg & IPC_NOWAIT != 0 {
                         return Err(LxError::ENOMSG);
                     }
+                    since
                 }
-            }
-            linux_object::process::check_signals()?;
-            let deadline = kernel_hal::timer::deadline_after(core::time::Duration::from_millis(5));
-            kernel_hal::thread::sleep_until(deadline).await;
+            };
+            queue.wait_for_change(since).await?;
         }
     }
 
@@ -563,15 +572,9 @@ impl Syscall<'_> {
                 return Err(LxError::EACCES);
             }
         }
-        let mut shm_identifier = self
-            .linux_process()
-            .shm_get(id)
-            .unwrap_or(ShmIdentifier { addr: 0, guard });
-
         let proc = self.zircon_process();
         let vmar = proc.vmar();
-        let shm_guard = shm_identifier.guard.lock();
-        let vmo = shm_guard.shared_guard.clone();
+        let vmo = guard.lock().shared_guard.clone();
         info!(
             "shmat: id: {}, place = {:?}, size = {}, flags = {:?}",
             id,
@@ -587,10 +590,14 @@ impl Syscall<'_> {
             ShmatPlace::At(want) => Some(want - vmar.addr()),
         };
         let addr = vmar.map(vmar_offset, vmo.clone(), 0, vmo.len(), flags)?;
-        shm_identifier.addr = addr;
-        self.linux_process().shm_set(id, shm_identifier.clone());
-
-        shm_guard.attach(proc.id() as u32);
+        // Account on the segment, then record where in the process -- one
+        // record per attachment, so a segment attached twice can be
+        // detached twice (the old table kept one address per id and lost
+        // the first). Neither lock is held while taking the other: the
+        // process lock is taken with segments locked under it by `fork` and
+        // by the table's drop at `exit`.
+        guard.lock().attach(proc.id() as u32);
+        self.linux_process().shm_attach(id, guard, addr);
         Ok(addr)
     }
 
@@ -601,39 +608,47 @@ impl Syscall<'_> {
     /// from the address space of the calling process.
     /// The to-be-detached segment must be currently attached with `addr`
     /// equal to the value returned by the attaching [`sys_shmat`](Self::sys_shmat) call.
-    pub fn sys_shmdt(&self, id: usize, addr: VirtAddr, shmflg: usize) -> SysResult {
+    ///
+    /// `shmdt` is `SYSCALL_DEFINE1(shmdt, char __user *, shmaddr)`: the
+    /// address is its only argument, in the first register. This handler
+    /// used to be declared `(id, addr, shmflg)` after `shmat`'s shape, and
+    /// the dispatch fed it `(a0, a1, a2)`, so the address it detached was
+    /// whatever the SECOND register held when userspace made a one-argument
+    /// call -- glibc's and musl's `shmdt(addr)` set only the first. The real
+    /// address sat in `id`, which nothing read. Every `shmdt` from a real
+    /// program was therefore `EINVAL` (or, before that errno existed here, a
+    /// silent 0), and the segment stayed mapped and counted: `XShmDetach`,
+    /// the `shmdt` in `XShmDestroyImage`'s callers, Mesa's DRI software
+    /// buffers, every SysV-shm consumer, none of them ever unmapped a byte.
+    pub fn sys_shmdt(&self, addr: VirtAddr) -> SysResult {
         // mmap_lock: shmdt unmaps the segment — a layout mutation (see shmat).
         let _aspace = self.linux_process().aspace_lock().lock();
-        info!(
-            "shmdt: id = {}, addr = {:#x}, flag = {:#x}",
-            id, addr, shmflg
-        );
+        info!("shmdt: addr = {:#x}", addr);
         let proc = self.linux_process();
-        let opt_id = proc.shm_get_id(addr);
-        if let Some(id) = opt_id {
-            let shm_identifier = proc.shm_get(id).ok_or(LxError::EINVAL)?;
-            // shmat() mapped the shared VMO into this address space; shmdt() must
-            // remove that mapping. Previously it only dropped the tracking entry
-            // and decremented nattch, leaving the segment MAPPED after detach:
-            // the region stayed writable, its shared frames stayed pinned, and a
-            // later MAP_FIXED mmap or re-attach at the same VA collided with the
-            // stale mapping in the address space's VMAR. Under GL=1, Mesa's DRI
-            // buffers churn shmat/shmdt hard and concurrently, so that stale-
-            // mapping / VMAR inconsistency is exactly the kind of state a
-            // parallel munmap/teardown then trips over. Unmap first, best-effort
-            // (the addr came from our own attach record), then drop the tracking
-            // entry and account the detach.
-            let size = shm_identifier.guard.lock().shared_guard.len();
-            let _ = self
-                .zircon_process()
-                .vmar()
-                .unmap(shm_identifier.addr, size);
-            proc.shm_pop(id);
-            shm_identifier
-                .guard
-                .lock()
-                .detach(self.zircon_process().id() as u32);
-        }
+        // shmdt(2): an address nothing is attached at is EINVAL. It used to
+        // answer 0, which also covered the second attachment of a segment
+        // the old table had forgotten.
+        let shm_identifier = proc.shm_detach(addr).ok_or(LxError::EINVAL)?;
+        // shmat() mapped the shared VMO into this address space; shmdt() must
+        // remove that mapping. Previously it only dropped the tracking entry
+        // and decremented nattch, leaving the segment MAPPED after detach:
+        // the region stayed writable, its shared frames stayed pinned, and a
+        // later MAP_FIXED mmap or re-attach at the same VA collided with the
+        // stale mapping in the address space's VMAR. Under GL=1, Mesa's DRI
+        // buffers churn shmat/shmdt hard and concurrently, so that stale-
+        // mapping / VMAR inconsistency is exactly the kind of state a
+        // parallel munmap/teardown then trips over. Unmap first, best-effort
+        // (the addr came from our own attach record), then account the
+        // detach.
+        let size = shm_identifier.guard.lock().shared_guard.len();
+        let _ = self
+            .zircon_process()
+            .vmar()
+            .unmap(shm_identifier.addr, size);
+        shm_identifier
+            .guard
+            .lock()
+            .detach(self.zircon_process().id() as u32);
         Ok(0)
     }
 
@@ -980,6 +995,25 @@ mod ipc_tests {
         // Whatever a variadic caller left in the top 32 bits is not part of
         // the `int`, so it must neither reach the semaphore nor cause ERANGE.
         assert_eq!(setval_from_arg(0xdead_beef_0000_0005), Ok(5));
+    }
+
+    /// The handlers take exactly the arguments Linux defines, so the
+    /// dispatch cannot feed one a register the syscall does not have.
+    /// `shmdt` is `SYSCALL_DEFINE1(shmdt, shmaddr)`; declared `(id, addr,
+    /// shmflg)` after `shmat`, it read the address from the second register,
+    /// which a one-argument call never sets, and answered `EINVAL` to every
+    /// real `shmdt(addr)` while the segment stayed mapped. A handler with
+    /// the wrong arity does not compile against these pins.
+    #[test]
+    fn shmdt_takes_the_address_alone_and_shmat_takes_its_three() {
+        fn pin<'a>(
+            shmdt: fn(&Syscall<'a>, VirtAddr) -> SysResult,
+            shmat: fn(&Syscall<'a>, usize, VirtAddr, usize) -> SysResult,
+        ) -> bool {
+            shmdt as usize != 0 && shmat as usize != 0
+        }
+        // `SYSCALL_DEFINE3(shmat, int, shmid, char __user *, shmaddr, int, shmflg)`.
+        assert!(pin(Syscall::sys_shmdt, Syscall::sys_shmat));
     }
 }
 

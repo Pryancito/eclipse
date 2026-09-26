@@ -5,12 +5,11 @@ impl Syscall<'_> {
         if options != 0 {
             return Err(ZxError::INVALID_ARGS);
         }
-        let handle = self
-            .thread
-            .proc()
-            .add_handle(Handle::new(Counter::new(), Rights::DEFAULT_COUNTER));
-        out.write(handle)?;
-        Ok(())
+        install_handle(
+            self.thread.proc(),
+            Handle::new(Counter::new(), Rights::DEFAULT_COUNTER),
+            &mut out,
+        )
     }
 
     pub fn sys_counter_add(&self, handle: HandleValue, amount: i64) -> ZxResult {

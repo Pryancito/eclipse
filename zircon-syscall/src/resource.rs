@@ -26,8 +26,6 @@ impl Syscall<'_> {
         parent_rsrc.validate_ranged_resource(kind, base as usize, size as usize)?;
         parent_rsrc.check_exclusive(flags)?;
         let rsrc = Resource::create(name, kind, base as usize, size as usize, flags);
-        let handle = proc.add_handle(Handle::new(rsrc, Rights::DEFAULT_RESOURCE));
-        out.write(handle)?;
-        Ok(())
+        install_handle(proc, Handle::new(rsrc, Rights::DEFAULT_RESOURCE), &mut out)
     }
 }

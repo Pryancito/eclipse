@@ -353,6 +353,115 @@ pub mod lin_mman {
     pub const MAP_FIXED_NOREPLACE: i32 = 0x10_0000;
 }
 
+/// FreeBSD `madvise(2)` advice (`sys/sys/mman.h`). Not flags: one number.
+pub mod madv {
+    pub const MADV_NORMAL: usize = 0;
+    pub const MADV_RANDOM: usize = 1;
+    pub const MADV_SEQUENTIAL: usize = 2;
+    pub const MADV_WILLNEED: usize = 3;
+    /// A priority hint on FreeBSD: the pages may be paged out sooner, and
+    /// their contents are kept. Not Linux's `MADV_DONTNEED`, which empties
+    /// them.
+    pub const MADV_DONTNEED: usize = 4;
+    /// The contents are no longer needed and may be dropped: Linux's
+    /// `MADV_FREE`, which is 8 there.
+    pub const MADV_FREE: usize = 5;
+    pub const MADV_NOSYNC: usize = 6;
+    pub const MADV_AUTOSYNC: usize = 7;
+    /// Leave these pages out of a core dump: Linux's `MADV_DONTDUMP`.
+    pub const MADV_NOCORE: usize = 8;
+    /// And back in: `MADV_DODUMP`.
+    pub const MADV_CORE: usize = 9;
+    /// Exempt the process from the OOM killer (superuser only).
+    pub const MADV_PROTECT: usize = 10;
+}
+
+/// Linux `madvise(2)` advice (`include/uapi/asm-generic/mman-common.h`).
+pub mod lin_madv {
+    pub const MADV_NORMAL: usize = 0;
+    pub const MADV_RANDOM: usize = 1;
+    pub const MADV_SEQUENTIAL: usize = 2;
+    pub const MADV_WILLNEED: usize = 3;
+    pub const MADV_DONTNEED: usize = 4;
+    pub const MADV_FREE: usize = 8;
+    pub const MADV_DONTDUMP: usize = 16;
+    pub const MADV_DODUMP: usize = 17;
+}
+
+/// FreeBSD `msync(2)` flags (`sys/sys/mman.h`).
+pub mod msync {
+    pub const MS_ASYNC: i32 = 0x0001;
+    pub const MS_INVALIDATE: i32 = 0x0002;
+    /// `0x10` here, `4` on Linux: the one bit the two systems put in
+    /// different places.
+    pub const MS_SYNC: i32 = 0x0010;
+}
+
+/// Linux `msync(2)` flags (`include/uapi/asm-generic/mman-common.h`).
+pub mod lin_msync {
+    pub const MS_ASYNC: i32 = 1;
+    pub const MS_INVALIDATE: i32 = 2;
+    pub const MS_SYNC: i32 = 4;
+}
+
+/// FreeBSD `getrlimit(2)` resources (`sys/sys/resource.h`).
+pub mod rlimit {
+    pub const RLIMIT_CPU: usize = 0;
+    pub const RLIMIT_FSIZE: usize = 1;
+    pub const RLIMIT_DATA: usize = 2;
+    pub const RLIMIT_STACK: usize = 3;
+    pub const RLIMIT_CORE: usize = 4;
+    pub const RLIMIT_RSS: usize = 5;
+    /// 6 here, 8 on Linux.
+    pub const RLIMIT_MEMLOCK: usize = 6;
+    /// 7 here, 6 on Linux.
+    pub const RLIMIT_NPROC: usize = 7;
+    /// 8 here, 7 on Linux.
+    pub const RLIMIT_NOFILE: usize = 8;
+    /// Socket buffer bytes: no Linux peer.
+    pub const RLIMIT_SBSIZE: usize = 9;
+    /// Linux's `RLIMIT_AS`, 9 there.
+    pub const RLIMIT_VMEM: usize = 10;
+    pub const RLIMIT_NPTS: usize = 11;
+    pub const RLIMIT_SWAP: usize = 12;
+    pub const RLIMIT_KQUEUES: usize = 13;
+    pub const RLIMIT_UMTXP: usize = 14;
+}
+
+/// FreeBSD signal numbers (`sys/sys/signal.h`), where they differ from Linux
+/// or have no Linux peer. The rest (1..=6, 8, 9, 11, 13..=15, 21, 22,
+/// 24..=28) are the same number on both.
+pub mod sig {
+    /// No Linux peer.
+    pub const SIGEMT: usize = 7;
+    /// 10 here, 7 on Linux.
+    pub const SIGBUS: usize = 10;
+    /// 12 here, 31 on Linux.
+    pub const SIGSYS: usize = 12;
+    /// 16 here, 23 on Linux.
+    pub const SIGURG: usize = 16;
+    /// 17 here, 19 on Linux.
+    pub const SIGSTOP: usize = 17;
+    /// 18 here, 20 on Linux.
+    pub const SIGTSTP: usize = 18;
+    /// 19 here, 18 on Linux.
+    pub const SIGCONT: usize = 19;
+    /// 20 here, 17 on Linux.
+    pub const SIGCHLD: usize = 20;
+    /// 23 here, 29 on Linux.
+    pub const SIGIO: usize = 23;
+    /// No Linux peer.
+    pub const SIGINFO: usize = 29;
+    /// 30 here, 10 on Linux.
+    pub const SIGUSR1: usize = 30;
+    /// 31 here, 12 on Linux.
+    pub const SIGUSR2: usize = 31;
+    /// libthr's own; no Linux peer.
+    pub const SIGTHR: usize = 32;
+    /// No Linux peer.
+    pub const SIGLIBRT: usize = 33;
+}
+
 /// `sysctl(2)` top-level identifiers and the `kern.*` / `hw.*` leaves this
 /// layer answers (`sys/sys/sysctl.h`).
 pub mod ctl {
@@ -468,3 +577,70 @@ pub const OSTYPE: &str = "FreeBSD";
 
 /// `HW_MACHINE` / `HW_MACHINE_ARCH` for amd64.
 pub const MACHINE: &str = "amd64";
+
+/// FreeBSD `fcntl(2)` commands (`sys/sys/fcntl.h`). The first five agree with
+/// Linux; past them the two systems number their commands differently, and
+/// three of FreeBSD's (`F_DUP2FD*`) are `dup2`/`dup3` by another name.
+pub mod fcntl {
+    pub const F_DUPFD: usize = 0;
+    pub const F_GETFD: usize = 1;
+    pub const F_SETFD: usize = 2;
+    pub const F_GETFL: usize = 3;
+    pub const F_SETFL: usize = 4;
+    pub const F_GETOWN: usize = 5;
+    pub const F_SETOWN: usize = 6;
+    pub const F_OGETLK: usize = 7;
+    pub const F_OSETLK: usize = 8;
+    pub const F_OSETLKW: usize = 9;
+    pub const F_DUP2FD: usize = 10;
+    pub const F_GETLK: usize = 11;
+    pub const F_SETLK: usize = 12;
+    pub const F_SETLKW: usize = 13;
+    pub const F_SETLK_REMOTE: usize = 14;
+    pub const F_READAHEAD: usize = 15;
+    pub const F_RDAHEAD: usize = 16;
+    pub const F_DUPFD_CLOEXEC: usize = 17;
+    pub const F_DUP2FD_CLOEXEC: usize = 18;
+    pub const F_ADD_SEALS: usize = 19;
+    pub const F_GET_SEALS: usize = 20;
+}
+
+/// Linux `fcntl(2)` commands (`include/uapi/asm-generic/fcntl.h`), the
+/// target side of [`super::translate::fcntl_to_linux`].
+pub mod lin_fcntl {
+    pub const F_DUPFD: usize = 0;
+    pub const F_GETFD: usize = 1;
+    pub const F_SETFD: usize = 2;
+    pub const F_GETFL: usize = 3;
+    pub const F_SETFL: usize = 4;
+    pub const F_SETOWN: usize = 8;
+    pub const F_GETOWN: usize = 9;
+    pub const F_DUPFD_CLOEXEC: usize = 1030;
+    pub const F_ADD_SEALS: usize = 1033;
+    pub const F_GET_SEALS: usize = 1034;
+}
+
+/// FreeBSD `wait4(2)` options (`sys/sys/wait.h`). Only `WNOHANG` and
+/// `WUNTRACED` sit on the same bits as Linux.
+pub mod wait {
+    pub const WNOHANG: i32 = 1;
+    pub const WUNTRACED: i32 = 2;
+    pub const WCONTINUED: i32 = 4;
+    pub const WNOWAIT: i32 = 8;
+    pub const WEXITED: i32 = 16;
+    pub const WTRAPPED: i32 = 32;
+    /// `0x8000_0000`: wait for a child created with the Linux `clone`
+    /// emulation. The same bit is Linux's `__WCLONE`.
+    pub const WLINUXCLONE: i32 = i32::MIN;
+}
+
+/// Linux `wait4(2)` options (`include/uapi/linux/wait.h`).
+pub mod lin_wait {
+    pub const WNOHANG: i32 = 1;
+    pub const WUNTRACED: i32 = 2;
+    pub const WEXITED: i32 = 4;
+    pub const WCONTINUED: i32 = 8;
+    pub const WNOWAIT: i32 = 0x0100_0000;
+    /// `0x8000_0000`, the same bit as FreeBSD's `WLINUXCLONE`.
+    pub const WCLONE: i32 = i32::MIN;
+}

@@ -10,7 +10,9 @@
 //! - access, faccessat
 
 use super::*;
+use linux_object::error::LxResult;
 use linux_object::{process::FsInfo, thread::ThreadExt, time::TimeSpec};
+use rcore_fs::vfs::INode;
 
 /// `lseek(2)`'s `whence`, which the syscall declares `int` and this tree read
 /// as a `u8`.
@@ -614,6 +616,44 @@ impl Syscall<'_> {
         Ok(mode as u16)
     }
 
+    /// What `truncate(2)` says about the type of what the path names, before
+    /// it asks anything about permissions (`do_sys_truncate`, `fs/open.c`):
+    ///
+    /// ```c
+    /// error = -EISDIR;
+    /// if (S_ISDIR(inode->i_mode)) goto dput_and_out;
+    /// error = -EINVAL;
+    /// if (!S_ISREG(inode->i_mode)) goto dput_and_out;
+    /// ...
+    /// error = inode_permission(idmap, inode, MAY_WRITE);
+    /// ```
+    ///
+    /// Nothing asked this here: the write check went first, so `truncate`
+    /// of a directory the caller could not write was `EACCES`, and of a
+    /// device, a fifo or a socket in a ramfs it was whatever `resize` on a
+    /// non-file answered (`EISDIR`, for a character device).
+    fn truncate_type(type_: FileType) -> linux_object::error::LxResult {
+        match type_ {
+            FileType::Dir => Err(LxError::EISDIR),
+            FileType::File => Ok(()),
+            _ => Err(LxError::EINVAL),
+        }
+    }
+
+    /// What `ftruncate(2)` says about the type of what the descriptor is open
+    /// on: `EINVAL` for anything but a regular file (`do_sys_ftruncate`:
+    /// `if (!S_ISREG(inode->i_mode) || !(f.file->f_mode & FMODE_WRITE))
+    /// goto out_putf;` with `error = -EINVAL`). A directory is not `EISDIR`
+    /// here, unlike `truncate`; the descriptor's own openness for writing is
+    /// still the file's to judge.
+    fn ftruncate_type(type_: FileType) -> linux_object::error::LxResult {
+        if type_ == FileType::File {
+            Ok(())
+        } else {
+            Err(LxError::EINVAL)
+        }
+    }
+
     /// cause the regular file named by path to be truncated to a size of precisely length bytes.
     pub fn sys_truncate(&self, path: UserInPtr<u8>, len: usize) -> SysResult {
         let path = path.as_c_str()?;
@@ -622,6 +662,7 @@ impl Syscall<'_> {
         let proc = self.linux_process();
         let inode = proc.lookup_inode(path)?;
         let metadata = inode.metadata()?;
+        Self::truncate_type(metadata.type_)?;
         proc.check_access(&metadata, 0o2, true)?;
         inode
             .resize(len)
@@ -638,6 +679,7 @@ impl Syscall<'_> {
         let len = linux_object::fs::user_len(len)?;
         let proc = self.linux_process();
         let file = proc.get_file(fd)?;
+        Self::ftruncate_type(file.metadata()?.type_)?;
         // The desktop OOM was a single ftruncate growing one RAM-backed file
         // to ~456 MiB (117k live 4 KiB ramfs blocks in one resize). Name any
         // suspicious-sized truncate loudly: which file, how big, and who.
@@ -701,6 +743,10 @@ impl Syscall<'_> {
         {
             return Err(LxError::ESPIPE);
         }
+        // `generic_fadvise`: `len < 0` is EINVAL, judged after the FIFO test
+        // and before the advice word. `len` is a `loff_t`; as a `usize` a
+        // negative one was a very long hint, taken.
+        crate::intarg::loff_len(len)?;
         if !fadvise_advice_known(advice) {
             return Err(LxError::EINVAL);
         }
@@ -1037,6 +1083,9 @@ impl Syscall<'_> {
         ) {
             return Err(LxError::EINVAL);
         }
+        // Then `vfs_fadvise(POSIX_FADV_WILLNEED)`, which reads the count as
+        // a `loff_t` and refuses a negative one.
+        crate::intarg::loff_len(count)?;
         Ok(0)
     }
 
@@ -1050,8 +1099,8 @@ impl Syscall<'_> {
     pub fn sys_sync_file_range(
         &self,
         fd: FileDesc,
-        offset: u64,
-        nbytes: u64,
+        offset: usize,
+        nbytes: usize,
         flags: usize,
     ) -> SysResult {
         const SYNC_FILE_RANGE_WAIT_BEFORE: usize = 1;
@@ -1067,6 +1116,11 @@ impl Syscall<'_> {
         {
             return Err(LxError::EINVAL);
         }
+        // `ksys_sync_file_range`: the range is judged after the flags and
+        // before the descriptor. Both are `loff_t`, so a negative offset or
+        // length, or an end past `LLONG_MAX`, is EINVAL; read as `u64` they
+        // were accepted and the whole file synced.
+        crate::intarg::loff_range(offset, nbytes)?;
         let proc = self.linux_process();
         let file = proc.get_file(fd)?;
         if flags != 0 {
@@ -2313,7 +2367,7 @@ impl Syscall<'_> {
         flags: usize,
     ) -> SysResult {
         let path = path.as_c_str()?;
-        let flags = AtFlags::from_bits_truncate(flags);
+        let flags = super::dir::at_flags(flags, super::dir::FACCESSAT_FLAGS)?;
         info!(
             "faccessat: dirfd={:?}, path={:?}, mode={:#o}, flags={:?}",
             dirfd, path, mode, flags
@@ -2347,10 +2401,16 @@ impl Syscall<'_> {
         flags: usize,
     ) -> SysResult {
         let path = path.as_c_str()?;
-        let flags = AtFlags::from_bits_truncate(flags);
+        let flags = super::dir::at_flags(flags, super::dir::FCHMODAT_FLAGS)?;
         let follow = !flags.contains(AtFlags::SYMLINK_NOFOLLOW);
         let proc = self.linux_process();
-        let inode = proc.lookup_inode_at(dirfd, path, follow)?;
+        // `AT_EMPTY_PATH` names the file `dirfd` is open on (`do_fchmodat`
+        // takes `LOOKUP_EMPTY`); without it an empty path is `ENOENT`.
+        let inode = if flags.contains(AtFlags::EMPTY_PATH) && path.is_empty() {
+            super::dir::inode_of_dirfd(proc, dirfd)?
+        } else {
+            proc.lookup_inode_at(dirfd, path, follow)?
+        };
         let mut metadata = inode.metadata()?;
         proc.chmod_metadata(&mut metadata, mode as u16)?;
         inode.set_metadata(&metadata)?;
@@ -2377,10 +2437,16 @@ impl Syscall<'_> {
         flags: usize,
     ) -> SysResult {
         let path = path.as_c_str()?;
-        let flags = AtFlags::from_bits_truncate(flags);
+        let flags = super::dir::at_flags(flags, super::dir::FCHOWNAT_FLAGS)?;
         let follow = !flags.contains(AtFlags::SYMLINK_NOFOLLOW);
         let proc = self.linux_process();
-        let inode = proc.lookup_inode_at(dirfd, path, follow)?;
+        // `AT_EMPTY_PATH` names the file `dirfd` is open on (`do_fchownat`
+        // takes `LOOKUP_EMPTY`); without it an empty path is `ENOENT`.
+        let inode = if flags.contains(AtFlags::EMPTY_PATH) && path.is_empty() {
+            super::dir::inode_of_dirfd(proc, dirfd)?
+        } else {
+            proc.lookup_inode_at(dirfd, path, follow)?
+        };
         let mut metadata = inode.metadata()?;
         proc.chown_metadata(&mut metadata, uid as u32, gid as u32)?;
         inode.set_metadata(&metadata)?;
@@ -2404,34 +2470,16 @@ impl Syscall<'_> {
         info!("utimes: pathname={:?}, times={:?}", pathname, times);
         let path = pathname.as_c_str()?;
         let inode = self.linux_process().lookup_inode(path)?;
-        let mut metadata = inode.metadata()?;
-        // A null `times` means "now", exactly as in utimensat.
-        let (atime, mtime) = if times.is_null() {
-            let now = TimeSpec::now();
-            (now, now)
+        // A null `times` means "now", exactly as in utimensat; a pair of
+        // timevals is a pair of explicit times, microseconds and all
+        // (`do_utimes` -> `utimes_common` with `ATTR_ATIME_SET`).
+        let times = if times.is_null() {
+            None
         } else {
-            let t = times.read()?;
-            (
-                TimeSpec {
-                    sec: t[0].sec,
-                    nsec: t[0].usec * 1000,
-                },
-                TimeSpec {
-                    sec: t[1].sec,
-                    nsec: t[1].usec * 1000,
-                },
-            )
+            Some(times.read()?)
         };
-        metadata.atime = rcore_fs::vfs::Timespec {
-            sec: atime.sec as i64,
-            nsec: atime.nsec as i32,
-        };
-        metadata.mtime = rcore_fs::vfs::Timespec {
-            sec: mtime.sec as i64,
-            nsec: mtime.nsec as i32,
-        };
-        inode.set_metadata(&metadata)?;
-        Ok(0)
+        let request = utimes_times(times, TimeSpec::now())?;
+        self.apply_utimes(&inode, request)
     }
 
     /// change file timestamps with nanosecond precision
@@ -2446,20 +2494,21 @@ impl Syscall<'_> {
             "utimensat(raw): dirfd: {:?}, pathname: {:?}, times: {:?}, flags: {:#x}",
             dirfd, pathname, times, flags
         );
-        const UTIME_NOW: usize = 0x3fffffff;
-        const UTIME_OMIT: usize = 0x3ffffffe;
         let proc = self.linux_process();
-        let mut times = if times.is_null() {
-            let epoch = TimeSpec::now();
-            [epoch, epoch]
+        let times = if times.is_null() {
+            None
         } else {
-            let times = times.read()?;
-            [times[0], times[1]]
+            Some(times.read()?)
         };
+        let request = utimensat_times(times, TimeSpec::now())?;
         let inode = if pathname.is_null() {
-            let fd = dirfd;
-            info!("futimens: fd: {:?}, times: {:?}", fd, times);
-            proc.get_file(fd)?.inode()
+            // `futimens(3)`, which glibc spells `utimensat(fd, NULL, times, 0)`;
+            // a flag word here is EINVAL (`do_utimes`), whatever it holds.
+            if flags != 0 {
+                return Err(LxError::EINVAL);
+            }
+            info!("futimens: fd: {:?}, times: {:?}", dirfd, times);
+            proc.get_file(dirfd)?.inode()
         } else {
             let pathname = pathname.as_c_str()?;
             info!(
@@ -2475,23 +2524,31 @@ impl Syscall<'_> {
             };
             proc.lookup_inode_at(dirfd, pathname, follow)?
         };
+        self.apply_utimes(&inode, request)
+    }
+
+    /// The tail every `utime` family call shares once it has the inode and
+    /// the [`TimesToSet`]: the permission check of `utimes_common`, then the
+    /// metadata write. Both `OMIT` is a success that touches nothing, before
+    /// any permission is looked at, as in Linux.
+    fn apply_utimes(&self, inode: &Arc<dyn INode>, request: TimesToSet) -> SysResult {
+        let (atime, mtime, explicit) = match request {
+            TimesToSet::Nothing => return Ok(0),
+            TimesToSet::Touch(now) => (Some(now), Some(now), false),
+            TimesToSet::Set { atime, mtime } => (atime, mtime, true),
+        };
         let mut metadata = inode.metadata()?;
-        if times[0].nsec != UTIME_OMIT {
-            if times[0].nsec == UTIME_NOW {
-                times[0] = TimeSpec::now();
-            }
+        self.linux_process().check_utimes(&metadata, explicit)?;
+        if let Some(t) = atime {
             metadata.atime = rcore_fs::vfs::Timespec {
-                sec: times[0].sec as i64,
-                nsec: times[0].nsec as i32,
+                sec: t.sec as i64,
+                nsec: t.nsec as i32,
             };
         }
-        if times[1].nsec != UTIME_OMIT {
-            if times[1].nsec == UTIME_NOW {
-                times[1] = TimeSpec::now();
-            }
+        if let Some(t) = mtime {
             metadata.mtime = rcore_fs::vfs::Timespec {
-                sec: times[1].sec as i64,
-                nsec: times[1].nsec as i32,
+                sec: t.sec as i64,
+                nsec: t.nsec as i32,
             };
         }
         inode.set_metadata(&metadata)?;
@@ -2911,6 +2968,56 @@ mod seek_and_access_tests {
     }
 }
 
+#[cfg(test)]
+mod truncate_type_tests {
+    use super::*;
+
+    /// Every type `rcore_fs` names that is not a regular file or a directory.
+    const OTHER_TYPES: [FileType; 5] = [
+        FileType::SymLink,
+        FileType::CharDevice,
+        FileType::BlockDevice,
+        FileType::NamedPipe,
+        FileType::Socket,
+    ];
+
+    #[test]
+    fn truncate_takes_a_regular_file_and_nothing_else() {
+        assert_eq!(Syscall::truncate_type(FileType::File), Ok(()));
+        // `do_sys_truncate`: a directory is EISDIR, ahead of the permission
+        // check. It used to be EACCES for a directory the caller could not
+        // write, and EISDIR only because the ramfs said so for the rest.
+        assert_eq!(Syscall::truncate_type(FileType::Dir), Err(LxError::EISDIR));
+        // Not a regular file: EINVAL. A character device in a ramfs used to
+        // get the ramfs's own answer for "not a file", which is EISDIR.
+        for type_ in OTHER_TYPES {
+            assert_eq!(
+                Syscall::truncate_type(type_),
+                Err(LxError::EINVAL),
+                "{:?}",
+                type_
+            );
+        }
+    }
+
+    #[test]
+    fn ftruncate_is_einval_on_anything_but_a_regular_file_a_directory_included() {
+        assert_eq!(Syscall::ftruncate_type(FileType::File), Ok(()));
+        // `do_sys_ftruncate` has one errno for every non-file, and it is
+        // not `truncate`'s EISDIR: `if (!S_ISREG(inode->i_mode) || ...)
+        // goto out_putf;` with `error = -EINVAL`.
+        assert_eq!(Syscall::ftruncate_type(FileType::Dir), Err(LxError::EINVAL));
+        for type_ in OTHER_TYPES {
+            assert_eq!(
+                Syscall::ftruncate_type(type_),
+                Err(LxError::EINVAL),
+                "{:?}",
+                type_
+            );
+        }
+    }
+}
+
 /// `SYNC_IOC_MERGE` is `_IOWR('>', 3, struct sync_merge_data)`: type `'>'`
 /// (0x3e), nr 3, 48 bytes. Matched on type and nr, like the DRM syncobj fd
 /// ioctls: the struct is UABI-frozen, and a size-pinned constant is how this
@@ -3091,6 +3198,176 @@ mod fadvise_tests {
         for advice in [6, 7, 8, 100, 101, usize::MAX] {
             assert!(!fadvise_advice_known(advice), "{}", advice);
         }
+    }
+}
+
+/// What a `utimensat(2)` / `utimes(2)` asks to be done to the file's times,
+/// decoded as `utimes_common` does before it looks at the file: the
+/// question of who may do it is [`LinuxProcess::check_utimes`]'s.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TimesToSet {
+    /// Both `UTIME_OMIT`: success, and nothing is touched or checked.
+    Nothing,
+    /// A null `times`, or both `UTIME_NOW`: both times become this instant,
+    /// and write access is enough (`ATTR_TOUCH`).
+    Touch(TimeSpec),
+    /// At least one time the caller chose (`ATTR_ATIME_SET` / `ATTR_MTIME_SET`):
+    /// only the owner may. `None` is an `UTIME_OMIT` half, left as it is.
+    Set {
+        atime: Option<TimeSpec>,
+        mtime: Option<TimeSpec>,
+    },
+}
+
+/// `include/uapi/linux/stat.h`.
+pub(crate) const UTIME_NOW: usize = (1 << 30) - 1;
+pub(crate) const UTIME_OMIT: usize = (1 << 30) - 2;
+const NSEC_PER_SEC: usize = 1_000_000_000;
+
+/// `nsec_valid()`: `UTIME_NOW`, `UTIME_OMIT`, or a real nanosecond count.
+fn nsec_valid(nsec: usize) -> bool {
+    nsec == UTIME_NOW || nsec == UTIME_OMIT || nsec < NSEC_PER_SEC
+}
+
+/// The `times` of `utimensat(2)`, read the way `utimes_common` reads them.
+///
+/// Anything with a nanosecond field out of range is `EINVAL` before any
+/// other consideration; both `UTIME_NOW` is the same as a null pointer;
+/// both `UTIME_OMIT` asks for nothing; and an `UTIME_NOW` next to an
+/// explicit value is that instant, set explicitly (the pair still needs
+/// the owner: it is not a touch).
+pub(crate) fn utimensat_times(times: Option<[TimeSpec; 2]>, now: TimeSpec) -> LxResult<TimesToSet> {
+    let Some([a, m]) = times else {
+        return Ok(TimesToSet::Touch(now));
+    };
+    if !nsec_valid(a.nsec) || !nsec_valid(m.nsec) {
+        return Err(LxError::EINVAL);
+    }
+    if a.nsec == UTIME_NOW && m.nsec == UTIME_NOW {
+        return Ok(TimesToSet::Touch(now));
+    }
+    if a.nsec == UTIME_OMIT && m.nsec == UTIME_OMIT {
+        return Ok(TimesToSet::Nothing);
+    }
+    let one = |t: TimeSpec| match t.nsec {
+        UTIME_OMIT => None,
+        UTIME_NOW => Some(now),
+        _ => Some(t),
+    };
+    Ok(TimesToSet::Set {
+        atime: one(a),
+        mtime: one(m),
+    })
+}
+
+/// The `times` of `utimes(2)`: two `struct timeval`, both explicit, with a
+/// microsecond field that must be one (`do_utimes` -> `get_timespec64`:
+/// `EINVAL` past 999999). A null pointer is a touch.
+#[cfg(any(target_arch = "x86_64", test))]
+pub(crate) fn utimes_times(
+    times: Option<[linux_object::time::TimeVal; 2]>,
+    now: TimeSpec,
+) -> LxResult<TimesToSet> {
+    let Some([a, m]) = times else {
+        return Ok(TimesToSet::Touch(now));
+    };
+    let one = |t: linux_object::time::TimeVal| -> LxResult<TimeSpec> {
+        if t.usec >= 1_000_000 {
+            return Err(LxError::EINVAL);
+        }
+        Ok(TimeSpec {
+            sec: t.sec,
+            nsec: t.usec * 1000,
+        })
+    };
+    Ok(TimesToSet::Set {
+        atime: Some(one(a)?),
+        mtime: Some(one(m)?),
+    })
+}
+
+#[cfg(test)]
+mod utimes_times_tests {
+    use super::*;
+    use linux_object::time::TimeVal;
+
+    const NOW: TimeSpec = TimeSpec { sec: 1000, nsec: 5 };
+
+    fn ts(sec: usize, nsec: usize) -> TimeSpec {
+        TimeSpec { sec, nsec }
+    }
+
+    #[test]
+    fn a_null_times_and_a_pair_of_nows_are_the_same_touch() {
+        assert_eq!(utimensat_times(None, NOW), Ok(TimesToSet::Touch(NOW)));
+        assert_eq!(
+            utimensat_times(Some([ts(7, UTIME_NOW), ts(9, UTIME_NOW)]), NOW),
+            Ok(TimesToSet::Touch(NOW)),
+            "the seconds next to UTIME_NOW mean nothing"
+        );
+    }
+
+    #[test]
+    fn a_pair_of_omits_asks_for_nothing() {
+        assert_eq!(
+            utimensat_times(Some([ts(7, UTIME_OMIT), ts(9, UTIME_OMIT)]), NOW),
+            Ok(TimesToSet::Nothing)
+        );
+    }
+
+    #[test]
+    fn an_explicit_time_is_set_and_the_other_half_follows_its_own_marker() {
+        // `touch -m -d @42`: mtime explicit, atime untouched.
+        assert_eq!(
+            utimensat_times(Some([ts(1, UTIME_OMIT), ts(42, 0)]), NOW),
+            Ok(TimesToSet::Set {
+                atime: None,
+                mtime: Some(ts(42, 0))
+            })
+        );
+        // `touch -a -d @42` with mtime "now": still an explicit set, so
+        // still the owner's to do, and the NOW half is this instant.
+        assert_eq!(
+            utimensat_times(Some([ts(42, 0), ts(1, UTIME_NOW)]), NOW),
+            Ok(TimesToSet::Set {
+                atime: Some(ts(42, 0)),
+                mtime: Some(NOW)
+            })
+        );
+    }
+
+    #[test]
+    fn a_nanosecond_field_out_of_range_is_einval_whatever_the_other_half() {
+        assert_eq!(
+            utimensat_times(Some([ts(1, 1_000_000_000), ts(1, UTIME_OMIT)]), NOW),
+            Err(LxError::EINVAL)
+        );
+        assert_eq!(
+            utimensat_times(Some([ts(1, UTIME_NOW), ts(1, usize::MAX)]), NOW),
+            Err(LxError::EINVAL),
+            "a NOW half does not excuse the other"
+        );
+        // The two markers sit just above the valid range and are not it.
+        assert_eq!(UTIME_NOW, 0x3fff_ffff);
+        assert_eq!(UTIME_OMIT, 0x3fff_fffe);
+        assert!(utimensat_times(Some([ts(1, 999_999_999), ts(1, 0)]), NOW).is_ok());
+    }
+
+    #[test]
+    fn utimes_is_always_explicit_and_checks_its_microseconds() {
+        let tv = |sec, usec| TimeVal { sec, usec };
+        assert_eq!(utimes_times(None, NOW), Ok(TimesToSet::Touch(NOW)));
+        assert_eq!(
+            utimes_times(Some([tv(1, 500), tv(2, 999_999)]), NOW),
+            Ok(TimesToSet::Set {
+                atime: Some(ts(1, 500_000)),
+                mtime: Some(ts(2, 999_999_000))
+            })
+        );
+        assert_eq!(
+            utimes_times(Some([tv(1, 1_000_000), tv(2, 0)]), NOW),
+            Err(LxError::EINVAL)
+        );
     }
 }
 

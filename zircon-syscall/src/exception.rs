@@ -44,12 +44,14 @@ impl Syscall<'_> {
         } else {
             return Err(ZxError::WRONG_TYPE);
         };
-        let user_end = proc.add_handle(Handle::new(
-            exceptionate.create_channel(rights)?,
-            Rights::TRANSFER | Rights::WAIT | Rights::READ,
-        ));
-        out.write(user_end)?;
-        Ok(())
+        install_handle(
+            proc,
+            Handle::new(
+                exceptionate.create_channel(rights)?,
+                Rights::TRANSFER | Rights::WAIT | Rights::READ,
+            ),
+            &mut out,
+        )
     }
 
     /// Create a handle for the exception's thread.
@@ -64,9 +66,7 @@ impl Syscall<'_> {
         let proc = self.thread.proc();
         let exception =
             proc.get_object_with_rights::<ExceptionObject>(exception, Rights::default())?;
-        let handle = proc.add_handle(exception.get_thread_handle());
-        out.write(handle)?;
-        Ok(())
+        install_handle(proc, exception.get_thread_handle(), &mut out)
     }
 
     /// Create a handle for the exception's process.  
@@ -83,9 +83,7 @@ impl Syscall<'_> {
         let proc = self.thread.proc();
         let exception =
             proc.get_object_with_rights::<ExceptionObject>(exception, Rights::default())?;
-        let handle = proc.add_handle(exception.get_process_handle()?);
-        out.write(handle)?;
-        Ok(())
+        install_handle(proc, exception.get_process_handle()?, &mut out)
     }
 }
 

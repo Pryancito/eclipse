@@ -38,6 +38,15 @@ pub struct Channel {
 type T = MessagePacket;
 type TxID = u32;
 
+/// How many messages one endpoint holds unread before a writer is told to
+/// wait: Zircon's `kMaxPendingMessageCount`. Without it a process that
+/// nobody reads from could put the whole kernel heap into one channel.
+pub const MAX_PENDING_MESSAGE_COUNT: usize = 3500;
+
+/// Transaction ids the kernel hands out for `call` live in the upper half;
+/// the lower half is for userspace's own ids.
+const KERNEL_TXID_BASE: TxID = 0x8000_0000;
+
 impl_kobject!(Channel
     fn peer(&self) -> ZxResult<Arc<dyn KernelObject>> {
         let peer = self.peer.upgrade().ok_or(ZxError::PEER_CLOSED)?;
@@ -59,7 +68,7 @@ impl Channel {
             peer: Weak::default(),
             recv_queue: Default::default(),
             call_reply: Default::default(),
-            next_txid: AtomicU32::new(0x8000_0000),
+            next_txid: AtomicU32::new(0),
         });
         let channel1 = Arc::new(Channel {
             base: KObjectBase::with_signal(Signal::WRITABLE),
@@ -67,7 +76,7 @@ impl Channel {
             peer: Arc::downgrade(&channel0),
             recv_queue: Default::default(),
             call_reply: Default::default(),
-            next_txid: AtomicU32::new(0x8000_0000),
+            next_txid: AtomicU32::new(0),
         });
         // no other reference of `channel0`
         unsafe { &mut *(Arc::as_ptr(&channel0) as *mut Channel) }.peer = Arc::downgrade(&channel1);
@@ -108,8 +117,7 @@ impl Channel {
                 return Ok(());
             }
         }
-        peer.push_general(msg);
-        Ok(())
+        peer.push_general(msg)
     }
 
     /// Send a message to a channel and await a reply.
@@ -119,6 +127,12 @@ impl Channel {
     /// written message, replacing that part of the message as read from userspace.
     ///
     /// `msg.data` must have at lease a length of 4 bytes.
+    ///
+    /// Dropping the returned future (a deadline that passed, a killed
+    /// thread) cancels the call: its reply slot goes away, and a reply that
+    /// arrives later is an ordinary message on this endpoint, as in Zircon.
+    /// The slot used to outlive the future, so every timed-out call left one
+    /// behind for good and swallowed its late reply.
     pub async fn call(self: &Arc<Self>, mut msg: T) -> ZxResult<T> {
         assert!(msg.data.len() >= 4);
         let peer = self.peer.upgrade().ok_or(ZxError::PEER_CLOSED)?;
@@ -126,28 +140,55 @@ impl Channel {
         msg.set_txid(txid);
         let (sender, receiver) = oneshot::channel();
         self.call_reply.lock().insert(txid, sender);
-        peer.push_general(msg);
+        let slot = ReplySlot {
+            channel: self,
+            txid,
+        };
+        peer.push_general(msg)?;
         drop(peer);
-        receiver.await.unwrap()
+        let reply = receiver.await.unwrap_or(Err(ZxError::INTERNAL));
+        drop(slot);
+        reply
     }
 
     /// Push a message to general queue, called from peer.
-    fn push_general(&self, msg: T) {
+    fn push_general(&self, msg: T) -> ZxResult {
         let mut send_queue = self.recv_queue.lock();
+        if send_queue.len() >= MAX_PENDING_MESSAGE_COUNT {
+            return Err(ZxError::SHOULD_WAIT);
+        }
         send_queue.push_back(msg);
         if send_queue.len() == 1 {
             self.base.signal_set(Signal::READABLE);
         }
+        Ok(())
     }
 
     /// Generate a new transaction ID for `call`.
+    ///
+    /// The counter wraps inside the kernel's half: a plain `fetch_add`
+    /// reached 0 after `2^31` calls, and a reply carrying txid 0 is an
+    /// ordinary message, so that call would never have returned.
     fn new_txid(&self) -> TxID {
-        self.next_txid.fetch_add(1, Ordering::SeqCst)
+        KERNEL_TXID_BASE | (self.next_txid.fetch_add(1, Ordering::SeqCst) & !KERNEL_TXID_BASE)
     }
 
     /// Is peer channel closed?
     fn peer_closed(&self) -> bool {
         self.peer.strong_count() == 0
+    }
+}
+
+/// The reply slot of one `call`, removed when the call ends however it
+/// ends, so a cancelled call does not keep it.
+struct ReplySlot<'a> {
+    channel: &'a Channel,
+    txid: TxID,
+}
+
+impl Drop for ReplySlot<'_> {
+    fn drop(&mut self) {
+        self.channel.call_reply.lock().remove(&self.txid);
     }
 }
 
@@ -195,8 +236,38 @@ impl MessagePacket {
 mod tests {
     use super::*;
     use alloc::boxed::Box;
+    use core::future::Future;
+    use core::pin::Pin;
     use core::sync::atomic::*;
+    use core::task::{Context, Poll, Waker};
     use core::time::Duration;
+
+    fn message(data: &[u8]) -> MessagePacket {
+        MessagePacket {
+            data: data.to_vec(),
+            handles: Vec::new(),
+        }
+    }
+
+    fn reply_to(txid: TxID, data: &[u8]) -> MessagePacket {
+        let mut reply = txid.to_ne_bytes().to_vec();
+        reply.extend_from_slice(data);
+        message(&reply)
+    }
+
+    /// A `call` polled once by hand, so it is on the wire and waiting.
+    fn call_in_flight<'a>(
+        channel: &'a Arc<Channel>,
+        data: &[u8],
+    ) -> Pin<Box<dyn Future<Output = ZxResult<MessagePacket>> + 'a>> {
+        let mut future: Pin<Box<dyn Future<Output = ZxResult<MessagePacket>> + 'a>> =
+            Box::pin(channel.call(message(data)));
+        assert!(future
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_pending());
+        future
+    }
 
     #[test]
     fn test_basics() {
@@ -359,5 +430,91 @@ mod tests {
                 .unwrap_err(),
             ZxError::PEER_CLOSED
         );
+    }
+
+    /// A writer whose peer never reads used to grow the kernel heap without
+    /// limit; the endpoint now holds `MAX_PENDING_MESSAGE_COUNT` unread and
+    /// tells the writer to wait, for `write` and `call` alike, and a `call`
+    /// that was refused leaves no reply slot behind.
+    #[test]
+    fn an_endpoint_holds_at_most_the_pending_limit_unread() {
+        let (channel0, channel1) = Channel::create();
+        for _ in 0..MAX_PENDING_MESSAGE_COUNT {
+            channel0.write(message(b"fill")).unwrap();
+        }
+        assert_eq!(
+            channel0.write(message(b"one too many")),
+            Err(ZxError::SHOULD_WAIT)
+        );
+        let mut call: Pin<Box<dyn Future<Output = ZxResult<MessagePacket>>>> =
+            Box::pin(channel0.call(message(b"call")));
+        assert_eq!(
+            call.as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .map(|r| r.map(|_| ())),
+            Poll::Ready(Err(ZxError::SHOULD_WAIT))
+        );
+        drop(call);
+        assert!(
+            channel0.call_reply.lock().is_empty(),
+            "a refused call keeps no reply slot"
+        );
+        assert_eq!(channel1.read().unwrap().data, b"fill");
+        channel0.write(message(b"room again")).unwrap();
+        assert_eq!(channel1.recv_queue.lock().len(), MAX_PENDING_MESSAGE_COUNT);
+    }
+
+    /// Every timed-out `zx_channel_call` used to leave its reply slot in the
+    /// endpoint for good, and the reply that came late was handed to that
+    /// dead slot and lost. A cancelled call frees its slot, and its late
+    /// reply is an ordinary message the caller can read.
+    #[test]
+    fn a_cancelled_call_frees_its_slot_and_its_late_reply_is_an_ordinary_message() {
+        let (channel0, channel1) = Channel::create();
+        let call = call_in_flight(&channel0, b"txidping");
+        assert_eq!(channel0.call_reply.lock().len(), 1);
+        drop(call);
+        assert!(
+            channel0.call_reply.lock().is_empty(),
+            "the deadline passed: the slot goes with the call"
+        );
+        let request = channel1.read().unwrap();
+        let txid = request.get_txid();
+        assert_eq!(&request.data[4..], b"ping");
+        channel1.write(reply_to(txid, b"pong")).unwrap();
+        let late = channel0.read().unwrap();
+        assert_eq!(late.get_txid(), txid);
+        assert_eq!(&late.data[4..], b"pong");
+    }
+
+    /// The txid counter wraps inside the kernel's half. It used to run off
+    /// the end of `u32` into 0, and a reply with txid 0 is an ordinary
+    /// message, so the call that drew it would have waited for ever.
+    #[test]
+    fn txids_wrap_inside_the_kernel_range() {
+        let (channel0, channel1) = Channel::create();
+        channel0.next_txid.store(u32::MAX, Ordering::SeqCst);
+        let last = call_in_flight(&channel0, b"last");
+        assert_eq!(channel1.read().unwrap().get_txid(), u32::MAX);
+        drop(last);
+        let mut wrapped = call_in_flight(&channel0, b"wrapped");
+        let request = channel1.read().unwrap();
+        assert_eq!(
+            request.get_txid(),
+            0x8000_0000,
+            "back to the first kernel txid, never 0"
+        );
+        channel1.write(reply_to(request.get_txid(), b"ok")).unwrap();
+        match wrapped
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+        {
+            Poll::Ready(Ok(reply)) => assert_eq!(&reply.data[4..], b"ok"),
+            other => panic!(
+                "the wrapped call did not get its reply: {:?}",
+                other.map(|r| r.map(|_| ()))
+            ),
+        }
+        assert!(channel0.call_reply.lock().is_empty());
     }
 }

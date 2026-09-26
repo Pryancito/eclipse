@@ -86,12 +86,11 @@ impl Syscall<'_> {
             _ => unreachable!(),
         };
         let clock = Clock::new(backstop, options & ZX_CLOCK_OPT_MAPPABLE != 0);
-        let handle = self
-            .thread
-            .proc()
-            .add_handle(Handle::new(clock, Rights::DEFAULT_CLOCK));
-        out.write(handle)?;
-        Ok(())
+        install_handle(
+            self.thread.proc(),
+            Handle::new(clock, Rights::DEFAULT_CLOCK),
+            &mut out,
+        )
     }
 
     /// Acquire the current time.

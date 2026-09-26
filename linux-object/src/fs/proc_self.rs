@@ -30,7 +30,7 @@ impl INode for ProcSelfFdDir {
     fn metadata(&self) -> Result<Metadata> {
         Ok(Metadata {
             dev: 0,
-            inode: 40 + self.process.id() as usize,
+            inode: super::procfs::pid_inode(self.process.id(), super::procfs::PID_FD_DIR_SLOT),
             size: 0,
             blk_size: 0,
             blocks: 0,

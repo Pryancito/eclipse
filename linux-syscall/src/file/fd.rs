@@ -359,8 +359,13 @@ impl Syscall<'_> {
                 return Ok(fd.into());
             }
 
-            let inode = if flags.contains(OpenFlags::CREATE) {
-                let (dir_path, file_name) = split_path(path);
+            let (inode, created) = if flags.contains(OpenFlags::CREATE) {
+                // `open("", O_CREAT)` is `ENOENT`; `open("/", O_CREAT)`, like
+                // `.` and `..`, names a directory, `EISDIR`. Split as a plain
+                // name, either used to create a file called "" in the working
+                // directory.
+                let (dir_path, last) = super::dir::last_component(path)?;
+                let file_name = last.to_open_create(super::dir::has_trailing_slash(path))?;
                 // relative to cwd
                 let dir_inode = proc.lookup_inode_at(dir_fd, dir_path, true)?;
                 let dir_metadata = dir_inode.metadata()?;
@@ -386,13 +391,16 @@ impl Syscall<'_> {
                             file_inode
                         };
                         let metadata = file_inode.metadata()?;
+                        // `do_open`: what the name turned out to be is judged
+                        // before what the caller may do with it.
+                        open_resolved_type(flags, metadata.type_)?;
                         if flags.writable() || flags.contains(OpenFlags::TRUNCATE) {
                             proc.check_access(&metadata, 0o2, true)?;
                         }
                         if flags.readable() {
                             proc.check_access(&metadata, 0o4, true)?;
                         }
-                        file_inode
+                        (file_inode, false)
                     }
                     Err(FsError::EntryNotFound) => {
                         let create_mode = proc.apply_umask(mode as u16);
@@ -405,7 +413,7 @@ impl Syscall<'_> {
                             create_mode,
                             false,
                         )?;
-                        inode
+                        (inode, true)
                     }
                     Err(e) => return Err(LxError::from(e)),
                 }
@@ -429,17 +437,25 @@ impl Syscall<'_> {
                 }
                 let inode = proc.lookup_inode_at(dir_fd, path, true)?;
                 let metadata = inode.metadata()?;
+                // `may_open`: the type's refusals (ELOOP, EISDIR) come before
+                // `inode_permission`.
+                open_resolved_type(flags, metadata.type_)?;
                 if flags.readable() {
                     proc.check_access(&metadata, 0o4, true)?;
                 }
                 if flags.writable() {
                     proc.check_access(&metadata, 0o2, true)?;
                 }
-                inode
+                (inode, false)
             };
             let metadata = inode.metadata()?;
             open_resolved_type(flags, metadata.type_)?;
-            if flags.contains(OpenFlags::TRUNCATE) && metadata.type_ == FileType::File {
+            // `may_open`: "O_NOATIME can only be set by the owner or
+            // superuser", after the permission checks.
+            if flags.contains(OpenFlags::NOATIME) {
+                proc.check_owner_or_capable(&metadata)?;
+            }
+            if truncates_on_open(flags, metadata.type_, created) {
                 proc.check_access(&metadata, 0o2, true)?;
                 inode.resize(0)?;
                 linux_object::fs::cache_truncate(&inode, 0);
@@ -686,21 +702,48 @@ impl Syscall<'_> {
     }
 
     /// apply or remove an advisory lock on an open file
+    /// (see [linux man flock(2)](https://man7.org/linux/man-pages/man2/flock.2.html)).
     ///
-    /// The lock itself is still not taken -- this validates the request and
-    /// reports success, which is what an advisory lock on a single-user system
-    /// amounts to. What it must not do is report success for a request Linux
-    /// refuses, because that is how a caller probes for support.
-    pub fn sys_flock(&mut self, fd: FileDesc, operation: usize) -> SysResult {
+    /// The lock is held by the open file description, which here is the
+    /// `Arc<File>` behind the fd: `dup`ed and inherited descriptors share it,
+    /// and the drop of the last of them releases it (`fs::flock`). A
+    /// conflicting lock makes the call wait, unless `LOCK_NB` asks for
+    /// `EWOULDBLOCK` instead; a signal ends the wait with `EINTR`.
+    ///
+    /// It used to validate the request and answer 0 without taking anything,
+    /// so two `LOCK_EX` on the same file both succeeded: `flock(1)`, dpkg's
+    /// and apt's frontend locks and every `LOCK_EX | LOCK_NB` "is another
+    /// instance running?" probe found the file free every time.
+    pub async fn sys_flock(&self, fd: FileDesc, operation: usize) -> SysResult {
+        use linux_object::fs::flock;
         let (cmd, nonblock) = flock_translate(operation)?;
         info!(
             "flock: fd: {:?}, cmd: {:?}, nonblock: {}",
             fd, cmd, nonblock
         );
-        let proc = self.linux_process();
-
-        proc.get_file(fd)?;
-        Ok(0)
+        let file = self.linux_process().get_file(fd)?;
+        let meta = file.metadata()?;
+        let key = (meta.dev, meta.inode);
+        let owner = Arc::as_ptr(&file) as usize;
+        let exclusive = match cmd {
+            FlockCmd::Unlock => {
+                flock::unlock(key, owner);
+                return Ok(0);
+            }
+            FlockCmd::Shared => false,
+            FlockCmd::Exclusive => true,
+        };
+        loop {
+            match flock::try_lock(key, owner, exclusive) {
+                Ok(()) => return Ok(0),
+                Err(since) => {
+                    if nonblock {
+                        return Err(LxError::EAGAIN);
+                    }
+                    flock::wait_for_change(since).await?;
+                }
+            }
+        }
     }
 
     /// `memfd_create(2)`: create an anonymous in-RAM file referred to by the
@@ -793,6 +836,14 @@ impl Syscall<'_> {
             "perf_event_open: attr={:#x} pid={} cpu={} group_fd={} flags={:#x}",
             attr_ptr, pid, cpu, group_fd, flags
         );
+        // The flag word first, as `SYSCALL_DEFINE5(perf_event_open)` reads
+        // it before the attr. It used to go through
+        // `OpenFlags::from_bits_truncate`, which reads `PERF_FLAG_*` bits as
+        // `O_*` bits: `PERF_FLAG_FD_CLOEXEC` (8) is no open flag, so the fd
+        // `perf record` opens with it survived the `execve` of the profiled
+        // program; `PERF_FLAG_FD_NO_GROUP` (1) read as `O_WRONLY`; and a
+        // flag this kernel had never heard of was accepted.
+        let plan = perf_open_plan(flags, pid, cpu, group_fd, kernel_hal::online_cpu_count())?;
         if attr_ptr == 0 {
             return Err(LxError::EFAULT);
         }
@@ -804,6 +855,17 @@ impl Syscall<'_> {
         if !crate::extensible_tail_is_empty(&attr_bytes[PERF_ATTR_SIZE_VER0..]) {
             return Err(LxError::E2BIG);
         }
+        // `perf_fget_light`: a `group_fd` other than -1 has to be an open
+        // perf event, or the call is EBADF. It was not looked at, so a
+        // bogus one opened an event anyway. Groups themselves are not
+        // modelled (every event samples on its own), so the leader is only
+        // checked, not joined.
+        if let Some(group_fd) = plan.group_fd {
+            self.linux_process()
+                .get_file_like(group_fd.into())?
+                .downcast_arc::<PerfEvent>()
+                .map_err(|_| LxError::EBADF)?;
+        }
         // A `pid` of 0 means "the calling process", not "the process whose id
         // is zero" — which is how `perf record ./prog` and every program that
         // profiles itself opens the event. Passing the literal 0 through made
@@ -814,10 +876,79 @@ impl Syscall<'_> {
         } else {
             pid
         };
-        let event = PerfEvent::new(&attr_bytes, pid, cpu, OpenFlags::from_bits_truncate(flags));
+        let event = PerfEvent::new(&attr_bytes, pid, cpu, plan.open_flags);
         let fd = self.linux_process().add_file(event)?;
         Ok(fd.into())
     }
+}
+
+/// `PERF_FLAG_FD_NO_GROUP`: `group_fd` is checked but the event is its own
+/// leader.
+const PERF_FLAG_FD_NO_GROUP: usize = 1;
+/// `PERF_FLAG_FD_OUTPUT` (2): the event writes into the leader's ring
+/// buffer. Accepted and not modelled: every event here has its own ring.
+/// `PERF_FLAG_PID_CGROUP`: `pid` is the fd of a cgroup directory.
+const PERF_FLAG_PID_CGROUP: usize = 4;
+/// `PERF_FLAG_FD_CLOEXEC`: the new fd is close-on-exec.
+const PERF_FLAG_FD_CLOEXEC: usize = 8;
+const PERF_FLAG_ALL: usize =
+    PERF_FLAG_FD_NO_GROUP | 2 | PERF_FLAG_PID_CGROUP | PERF_FLAG_FD_CLOEXEC;
+
+/// What `perf_event_open(2)` decided from its flag word, `pid` and `cpu`
+/// before it read anything from user memory.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct PerfOpenPlan {
+    /// The open flags of the new fd: `O_CLOEXEC` when `PERF_FLAG_FD_CLOEXEC`
+    /// asked for it, nothing otherwise. The perf flags are not open flags.
+    pub open_flags: OpenFlags,
+    /// The group leader to check: `group_fd` when it is not -1.
+    pub group_fd: Option<i32>,
+}
+
+/// The checks `perf_event_open` makes on its arguments alone, in Linux's
+/// order: a flag outside `PERF_FLAG_ALL` is `EINVAL`; with
+/// `PERF_FLAG_PID_CGROUP` neither `pid` nor `cpu` may be -1 (`EINVAL`),
+/// and then `pid` is a cgroup directory's fd, which this kernel has none
+/// of, so the `fdget` in `perf_cgroup_connect` finds no cgroup: `EBADF`.
+/// An event with no task (`pid == -1`) needs a CPU, and a CPU has to exist:
+/// `find_get_context` answers `EINVAL` for `cpu < 0 || cpu >= nr_cpu_ids`,
+/// and a task event with a `cpu` other than -1 goes through the same test.
+pub(crate) fn perf_open_plan(
+    flags: usize,
+    pid: i32,
+    cpu: i32,
+    group_fd: i32,
+    ncpus: usize,
+) -> Result<PerfOpenPlan, LxError> {
+    if flags & !PERF_FLAG_ALL != 0 {
+        return Err(LxError::EINVAL);
+    }
+    if flags & PERF_FLAG_PID_CGROUP != 0 {
+        if pid == -1 || cpu == -1 {
+            return Err(LxError::EINVAL);
+        }
+        return Err(LxError::EBADF);
+    }
+    if pid == -1 && cpu == -1 {
+        return Err(LxError::EINVAL);
+    }
+    if cpu != -1 && (cpu < 0 || cpu as usize >= ncpus) {
+        return Err(LxError::EINVAL);
+    }
+    let open_flags = if flags & PERF_FLAG_FD_CLOEXEC != 0 {
+        OpenFlags::CLOEXEC
+    } else {
+        OpenFlags::empty()
+    };
+    // `perf_fget_light` runs on any `group_fd` other than -1 before either
+    // `PERF_FLAG_FD_NO_GROUP` or `PERF_FLAG_FD_OUTPUT` is looked at, so the
+    // fd is checked whatever the flags say; `FD_NO_GROUP` only means the
+    // event is not joined to it, which is all this kernel does anyway.
+    let group_fd = (group_fd != -1).then_some(group_fd);
+    Ok(PerfOpenPlan {
+        open_flags,
+        group_fd,
+    })
 }
 
 use kernel_hal::PAGE_SIZE;
@@ -1223,6 +1354,12 @@ mod perf_attr_size_tests {
 /// apply at once: a symbolic link opened with `O_DIRECTORY` is `ENOTDIR`, not
 /// `ELOOP`, because it is not a directory whatever it points at.
 pub(crate) fn open_resolved_type(flags: OpenFlags, type_: FileType) -> Result<(), LxError> {
+    // `do_open`: `if (open_flag & O_CREAT) { ... if (d_is_dir(dentry))
+    // return -EISDIR; }`, ahead of the `O_DIRECTORY` test. An `O_CREAT`
+    // over a name that is a directory used to open the directory.
+    if flags.contains(OpenFlags::CREATE) && type_ == FileType::Dir {
+        return Err(LxError::EISDIR);
+    }
     if flags.contains(OpenFlags::DIRECTORY) && type_ != FileType::Dir {
         return Err(LxError::ENOTDIR);
     }
@@ -1231,10 +1368,28 @@ pub(crate) fn open_resolved_type(flags: OpenFlags, type_: FileType) -> Result<()
     if type_ == FileType::SymLink {
         return Err(LxError::ELOOP);
     }
-    if type_ == FileType::Dir && flags.writable() {
+    // `build_open_flags`: `if (flags & O_TRUNC) acc_mode |= MAY_WRITE;` and
+    // `may_open`: `case S_IFDIR: if (acc_mode & MAY_WRITE) return -EISDIR;`.
+    // A read-only `O_TRUNC` of a directory used to open it, truncating
+    // nothing and saying nothing.
+    if type_ == FileType::Dir && (flags.writable() || flags.contains(OpenFlags::TRUNCATE)) {
         return Err(LxError::EISDIR);
     }
     Ok(())
+}
+
+/// Whether this open truncates what it opened: `O_TRUNC` on a regular file
+/// that the open did not itself just create.
+///
+/// `do_open`: `if (file->f_mode & FMODE_CREATED) { /* Don't check for write
+/// permission, don't truncate */ open_flag &= ~O_TRUNC; acc_mode = 0; }`. A
+/// file created by this very call is empty already and belongs to whoever
+/// created it, whatever mode they gave it; asking it for write permission
+/// made `open("new", O_WRONLY|O_CREAT|O_TRUNC, 0444)` fail with `EACCES`
+/// for its own creator (a `umask 222` shell's `> file`). On the other types
+/// `may_open` drops the flag (`flag &= ~O_TRUNC`).
+pub(crate) fn truncates_on_open(flags: OpenFlags, type_: FileType, created: bool) -> bool {
+    !created && flags.contains(OpenFlags::TRUNCATE) && type_ == FileType::File
 }
 
 #[cfg(test)]
@@ -1366,5 +1521,150 @@ mod open_flag_tests {
                 "{flags:?}"
             );
         }
+    }
+
+    #[test]
+    fn o_creat_over_a_directory_is_eisdir_whatever_else_was_asked() {
+        // `do_open`: `if (open_flag & O_CREAT) { ... if (d_is_dir(...))
+        // return -EISDIR; }` -- even a read-only open, which used to succeed.
+        assert_eq!(
+            open_resolved_type(OpenFlags::CREATE, FileType::Dir),
+            Err(LxError::EISDIR)
+        );
+        assert_eq!(
+            open_resolved_type(OpenFlags::CREATE | OpenFlags::DIRECTORY, FileType::Dir),
+            Err(LxError::EISDIR)
+        );
+        // Over anything else `O_CREAT` is none of this function's business.
+        assert_eq!(
+            open_resolved_type(OpenFlags::CREATE, FileType::File),
+            Ok(())
+        );
+        assert_eq!(
+            open_resolved_type(OpenFlags::CREATE | OpenFlags::DIRECTORY, FileType::File),
+            Err(LxError::ENOTDIR)
+        );
+    }
+
+    #[test]
+    fn o_trunc_counts_as_a_write_where_a_directory_is_concerned() {
+        assert_eq!(
+            open_resolved_type(OpenFlags::RDONLY | OpenFlags::TRUNCATE, FileType::Dir),
+            Err(LxError::EISDIR)
+        );
+        // And nowhere else: on a file it is the truncation, on a device or a
+        // pipe `may_open` drops it.
+        for type_ in [FileType::File, FileType::CharDevice, FileType::NamedPipe] {
+            assert_eq!(
+                open_resolved_type(OpenFlags::RDONLY | OpenFlags::TRUNCATE, type_),
+                Ok(()),
+                "{type_:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_file_the_open_just_created_is_not_truncated_and_not_asked_for_write_permission() {
+        let flags = OpenFlags::WRONLY | OpenFlags::CREATE | OpenFlags::TRUNCATE;
+        assert!(truncates_on_open(flags, FileType::File, false));
+        assert!(!truncates_on_open(flags, FileType::File, true));
+        // Without the flag nothing is truncated; on other types the flag is
+        // dropped.
+        assert!(!truncates_on_open(
+            OpenFlags::WRONLY | OpenFlags::CREATE,
+            FileType::File,
+            false
+        ));
+        assert!(!truncates_on_open(flags, FileType::CharDevice, false));
+        assert!(!truncates_on_open(flags, FileType::NamedPipe, false));
+    }
+}
+
+/// `perf_event_open(2)`'s flag word, which was read as open flags.
+#[cfg(test)]
+mod perf_open_flag_tests {
+    use super::*;
+
+    fn plan(flags: usize) -> Result<PerfOpenPlan, LxError> {
+        perf_open_plan(flags, 0, -1, -1, 4)
+    }
+
+    /// `perf record` opens every event with `PERF_FLAG_FD_CLOEXEC` (perf
+    /// tools probe for it since Linux 3.14): the fd must not reach the
+    /// profiled program's `execve`. Read as an open flag, 8 is nothing,
+    /// so it did.
+    #[test]
+    fn fd_cloexec_is_close_on_exec_and_nothing_else_is() {
+        assert_eq!(
+            plan(PERF_FLAG_FD_CLOEXEC).unwrap().open_flags,
+            OpenFlags::CLOEXEC
+        );
+        assert_eq!(plan(0).unwrap().open_flags, OpenFlags::empty());
+        // `PERF_FLAG_FD_NO_GROUP` is 1, which is `O_WRONLY`: it is not.
+        assert_eq!(
+            plan(PERF_FLAG_FD_NO_GROUP).unwrap().open_flags,
+            OpenFlags::empty()
+        );
+        assert_eq!(plan(2).unwrap().open_flags, OpenFlags::empty());
+        assert!(plan(PERF_FLAG_FD_CLOEXEC)
+            .unwrap()
+            .open_flags
+            .close_on_exec());
+    }
+
+    /// A flag Linux does not define is EINVAL, whatever else is set.
+    #[test]
+    fn an_unknown_flag_is_einval() {
+        for flags in [16, 32, 0x100, PERF_FLAG_FD_CLOEXEC | 16, usize::MAX] {
+            assert_eq!(plan(flags), Err(LxError::EINVAL), "{:#x}", flags);
+        }
+        assert!(plan(PERF_FLAG_ALL & !PERF_FLAG_PID_CGROUP).is_ok());
+    }
+
+    /// `group_fd` is checked whenever it is not -1, `FD_NO_GROUP` or not:
+    /// Linux does `perf_fget_light` first and reads the flag after.
+    #[test]
+    fn a_group_fd_other_than_minus_one_is_checked() {
+        assert_eq!(perf_open_plan(0, 0, -1, -1, 4).unwrap().group_fd, None);
+        assert_eq!(perf_open_plan(0, 0, -1, 7, 4).unwrap().group_fd, Some(7));
+        assert_eq!(
+            perf_open_plan(PERF_FLAG_FD_NO_GROUP, 0, -1, 7, 4)
+                .unwrap()
+                .group_fd,
+            Some(7)
+        );
+        // A closed or negative fd is still handed over: the lookup says EBADF.
+        assert_eq!(perf_open_plan(0, 0, -1, -2, 4).unwrap().group_fd, Some(-2));
+    }
+
+    /// `PERF_FLAG_PID_CGROUP`: -1 for either of `pid`/`cpu` is EINVAL first;
+    /// then `pid` is a cgroup fd, and there are no cgroups here: EBADF.
+    #[test]
+    fn a_cgroup_event_is_einval_without_a_cpu_and_ebadf_with_one() {
+        assert_eq!(
+            perf_open_plan(PERF_FLAG_PID_CGROUP, -1, 0, -1, 4),
+            Err(LxError::EINVAL)
+        );
+        assert_eq!(
+            perf_open_plan(PERF_FLAG_PID_CGROUP, 3, -1, -1, 4),
+            Err(LxError::EINVAL)
+        );
+        assert_eq!(
+            perf_open_plan(PERF_FLAG_PID_CGROUP, 3, 0, -1, 4),
+            Err(LxError::EBADF)
+        );
+    }
+
+    /// No task and no CPU is nothing to count (`find_get_context`: EINVAL),
+    /// and a CPU number has to exist.
+    #[test]
+    fn an_event_needs_a_task_or_a_cpu_and_the_cpu_must_exist() {
+        assert_eq!(perf_open_plan(0, -1, -1, -1, 4), Err(LxError::EINVAL));
+        assert!(perf_open_plan(0, -1, 0, -1, 4).is_ok());
+        assert!(perf_open_plan(0, -1, 3, -1, 4).is_ok());
+        assert_eq!(perf_open_plan(0, -1, 4, -1, 4), Err(LxError::EINVAL));
+        assert_eq!(perf_open_plan(0, 0, 4, -1, 4), Err(LxError::EINVAL));
+        assert_eq!(perf_open_plan(0, 0, -2, -1, 4), Err(LxError::EINVAL));
+        assert!(perf_open_plan(0, 0, -1, -1, 4).is_ok());
     }
 }

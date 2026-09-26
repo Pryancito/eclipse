@@ -33,8 +33,6 @@ impl Syscall<'_> {
 
         let guest = Guest::new()?;
         let vmar = guest.vmar();
-        let guest_handle_value = proc.add_handle(Handle::new(guest, Rights::DEFAULT_GUEST));
-        guest_handle.write(guest_handle_value)?;
 
         let vmar_flags = vmar.get_flags();
         let mut vmar_rights = Rights::DEFAULT_VMAR;
@@ -47,9 +45,14 @@ impl Syscall<'_> {
         if vmar_flags.contains(VmarFlags::CAN_MAP_EXECUTE) {
             vmar_rights.insert(Rights::EXECUTE);
         }
-        let vmar_handle_value = proc.add_handle(Handle::new(vmar, vmar_rights));
-        vmar_handle.write(vmar_handle_value)?;
-        Ok(())
+        install_handle_pair(
+            proc,
+            (
+                Handle::new(guest, Rights::DEFAULT_GUEST),
+                Handle::new(vmar, vmar_rights),
+            ),
+            (&mut guest_handle, &mut vmar_handle),
+        )
     }
 
     /// Set a trap within a guest.  
@@ -99,9 +102,7 @@ impl Syscall<'_> {
         let proc = self.thread.proc();
         let guest = proc.get_object_with_rights::<Guest>(guest_handle, Rights::MANAGE_PROCESS)?;
         let vcpu = Vcpu::new(guest, entry, (*self.thread).clone())?;
-        let handle_value = proc.add_handle(Handle::new(vcpu, Rights::DEFAULT_VCPU));
-        out.write(handle_value)?;
-        Ok(())
+        install_handle(proc, Handle::new(vcpu, Rights::DEFAULT_VCPU), &mut out)
     }
 
     /// Resume execution of a VCPU.  

@@ -1,6 +1,10 @@
 [workspace]
 resolver = "1"
 members = [
+    # The VFS trait every file system implements: the path walk that follows
+    # symlinks (`INode::lookup_follow`) lives here, and nothing compiled it as
+    # a test target (it is reached only through the `[patch]` below).
+    "vendor/rcore-fs",
     "drivers",
     "nvidia-rm-sys",
     "kernel-hal",

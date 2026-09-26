@@ -69,11 +69,19 @@ impl Syscall<'_> {
         if size == 0 {
             return Err(ZxError::INVALID_ARGS);
         }
+        // Both out pointers are looked at before the region exists: a bad
+        // one used to leave the child allocated in the parent and its handle
+        // in the table, with nothing to tell the caller.
+        check_out(proc, &out_child_vmar)?;
+        check_out(proc, &out_child_addr)?;
         let child = parent.allocate(offset, size, vmar_flags, align)?;
         let child_addr = child.addr();
-        let child_handle = proc.add_handle(Handle::new(child, Rights::DEFAULT_VMAR | perm_rights));
         info!("vmar.allocate: at {:#x?}", child_addr);
-        out_child_vmar.write(child_handle)?;
+        install_handle(
+            proc,
+            Handle::new(child, Rights::DEFAULT_VMAR | perm_rights),
+            &mut out_child_vmar,
+        )?;
         out_child_addr.write(child_addr)?;
         Ok(())
     }

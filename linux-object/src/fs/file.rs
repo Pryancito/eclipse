@@ -156,6 +156,16 @@ pub struct File {
 
 impl_kobject!(File);
 
+impl Drop for File {
+    /// The last close of this open file description: the `flock(2)` locks
+    /// it holds go with it (see `fs::flock`), which is what lets a process
+    /// that took `LOCK_EX` and then exited, or just closed the fd, stop
+    /// holding the file.
+    fn drop(&mut self) {
+        crate::fs::flock::release_owner(self as *const File as usize);
+    }
+}
+
 /// Demand-paging source for a file-backed `mmap` (see [`get_vmo`]).
 ///
 /// Reads one page from the backing inode the first time that page is touched,
@@ -741,6 +751,33 @@ impl File {
         Ok(self.read_entry_with_metadata()?.1)
     }
 
+    /// Hand back the entry [`read_entry_with_metadata`](Self::read_entry_with_metadata)
+    /// just returned, so the next read yields it again.
+    ///
+    /// `getdents64` reads an entry before it knows whether the record fits
+    /// in what is left of the caller's buffer, and the one that did not fit
+    /// used to be gone for good: consumed from the directory position, never
+    /// written out, absent from every later call. A listing that took more
+    /// than one buffer lost one name per buffer.
+    pub fn unread_entry(&self) {
+        let mut inner = self.inner.write();
+        inner.offset = inner.offset.saturating_sub(1);
+    }
+
+    /// The directory position after the entry
+    /// [`read_entry_with_metadata`](Self::read_entry_with_metadata) just
+    /// returned: what `lseek(fd, pos, SEEK_SET)` takes to resume right after
+    /// it, and therefore what `getdents64` has to report as that entry's
+    /// `d_off`.
+    ///
+    /// It was reported as 0 for every entry. glibc's `telldir` is the `d_off`
+    /// of the last entry `readdir` handed out, and `seekdir` is an `lseek` to
+    /// it, so `seekdir(dir, telldir(dir))`, the way a program marks a place
+    /// in a listing and comes back to it, rewound to the start instead.
+    pub fn dir_position(&self) -> u64 {
+        self.inner.read().offset
+    }
+
     /// get the next directory entry and its metadata
     pub fn read_entry_with_metadata(&self) -> LxResult<(Metadata, String)> {
         let mut inner = self.inner.write();
@@ -1204,6 +1241,69 @@ mod seek_tests {
             inode.write_at(0, &alloc::vec![0u8; len]).unwrap();
         }
         File::new(inode, OpenFlags::RDWR, String::from("/f"))
+    }
+
+    /// A directory with `names` in it, open for reading.
+    fn dir(names: &[&str]) -> Arc<File> {
+        let fs = RamFS::new();
+        let root = fs.root_inode();
+        for name in names {
+            root.create(name, FileType::File, 0o644).unwrap();
+        }
+        File::new(root, OpenFlags::RDONLY, String::from("/"))
+    }
+
+    #[test]
+    fn an_unread_entry_comes_out_again() {
+        let d = dir(&["a", "b", "c"]);
+        let first = d.read_entry().unwrap();
+        let second = d.read_entry().unwrap();
+        let third = d.read_entry().unwrap();
+        d.unread_entry();
+        assert_eq!(d.read_entry().unwrap(), third);
+        d.unread_entry();
+        d.unread_entry();
+        assert_eq!(d.read_entry().unwrap(), second);
+        // Reading on from there is the rest of the directory, once each.
+        let mut rest = alloc::vec![d.read_entry().unwrap()];
+        while let Ok(name) = d.read_entry() {
+            rest.push(name);
+        }
+        assert_eq!(rest.len() + 2, 5, "\".\", \"..\", a, b and c: {:?}", rest);
+        assert!(!rest.contains(&first) && !rest.contains(&second));
+    }
+
+    #[test]
+    fn the_directory_position_is_where_a_seek_resumes() {
+        let d = dir(&["a", "b", "c"]);
+        let first = d.read_entry().unwrap();
+        let second = d.read_entry().unwrap();
+        let after_second = d.dir_position();
+        let third = d.read_entry().unwrap();
+        assert_ne!(
+            after_second, 0,
+            "the position after an entry is never the start"
+        );
+        // Seeking to the position reported after the second entry lands on
+        // the third, which is the contract `d_off` and `seekdir` rest on.
+        File::seek(&d, SeekFrom::Start(after_second)).unwrap();
+        assert_eq!(d.read_entry().unwrap(), third);
+        // And the positions climb with the entries.
+        File::seek(&d, SeekFrom::Start(0)).unwrap();
+        assert_eq!(d.read_entry().unwrap(), first);
+        let after_first = d.dir_position();
+        assert!(after_first < after_second);
+        File::seek(&d, SeekFrom::Start(after_first)).unwrap();
+        assert_eq!(d.read_entry().unwrap(), second);
+    }
+
+    #[test]
+    fn unreading_at_the_start_stays_at_the_start() {
+        let d = dir(&["a"]);
+        let first = d.read_entry().unwrap();
+        d.unread_entry();
+        d.unread_entry();
+        assert_eq!(d.read_entry().unwrap(), first);
     }
 
     #[test]

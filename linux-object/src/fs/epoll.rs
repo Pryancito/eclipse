@@ -184,10 +184,19 @@ impl Epoll {
         let mut inner = self.inner.lock();
         match op {
             EPOLL_CTL_ADD => {
-                if inner.interest_list.contains_key(&fd) {
-                    return Err(LxError::EEXIST);
-                }
                 let file = file.ok_or(LxError::EBADF)?;
+                // Linux keys the interest list by (file, fd), so `EEXIST` is
+                // for the SAME description under the same number. An entry
+                // whose description is no longer the one at `fd` is a number
+                // that was closed and handed out again: the caller cannot
+                // reach the old description through `fd` any more, and it
+                // cannot `EPOLL_CTL_DEL` a file it has no descriptor for.
+                if let Some((_, watched)) = inner.interest_list.get(&fd) {
+                    if Arc::ptr_eq(watched, &file) {
+                        return Err(LxError::EEXIST);
+                    }
+                    inner.interest_list.remove(&fd);
+                }
                 // If the target is itself an epoll, reject a self-add or any
                 // nesting that would create a cycle or exceed
                 // EPOLL_MAX_NEST_DEPTH. any_ready()'s recursion through
@@ -210,8 +219,10 @@ impl Epoll {
                         return Err(LxError::ELOOP);
                     }
                     inner = self.inner.lock();
-                    if inner.interest_list.contains_key(&fd) {
-                        return Err(LxError::EEXIST);
+                    if let Some((_, watched)) = inner.interest_list.get(&fd) {
+                        if Arc::ptr_eq(watched, &file) {
+                            return Err(LxError::EEXIST);
+                        }
                     }
                 }
                 inner.interest_list.insert(fd, (event, file));
@@ -253,6 +264,36 @@ impl Epoll {
                 }
             }
         }
+    }
+
+    /// Drop every entry that watches `file`: a descriptor of it was closed,
+    /// and it was the last one in its table holding that description.
+    ///
+    /// This is `eventpoll_release`, which `__fput` runs when the last
+    /// reference to an open file description goes away, and it is what
+    /// epoll(7) promises under "Will closing a file descriptor cause it to be
+    /// removed from all epoll interest lists?". Nothing here did it, so a
+    /// process that closed a watched descriptor without an `EPOLL_CTL_DEL`
+    /// first (most of them: the manual says close is enough) kept it in three
+    /// ways at once. The interest list held the description alive, so the
+    /// peer of a closed socket or pipe never saw EOF or `EPIPE` while the
+    /// event loop lived. `epoll_wait` kept returning the dead entry with its
+    /// old `data`, and the `read` the program then did on that number was
+    /// `EBADF`, forever, at full speed. And when the number came back from
+    /// `accept` or `open`, `EPOLL_CTL_ADD` on it was `EEXIST`.
+    ///
+    /// Matched by description, not by number: the entry is keyed by the
+    /// number it was added under, and the descriptor whose close ended the
+    /// description may be a `dup` under another one. Compared by pointer, as
+    /// `disarm_oneshot` does, because a number that was closed and reopened
+    /// may already watch its new description. Returns how many entries went.
+    pub fn forget_closed(&self, file: &Arc<dyn FileLike>) -> usize {
+        let mut inner = self.inner.lock();
+        let before = inner.interest_list.len();
+        inner
+            .interest_list
+            .retain(|_, (_, watched)| !Arc::ptr_eq(watched, file));
+        before - inner.interest_list.len()
     }
 
     /// Whether `needle` (some other epoll, compared by identity) is
@@ -1040,5 +1081,182 @@ mod flag_tests {
             "the replacement entry keeps its mask"
         );
         assert!(ep.poll(PollEvents::IN).unwrap().read);
+    }
+}
+
+/// Closing a watched descriptor is what removes it from the interest list,
+/// as epoll(7) promises; nothing here did it.
+#[cfg(test)]
+mod close_forgets_tests {
+    use super::*;
+    use crate::fs::eventfd::EventFd;
+    use crate::process::LinuxProcess;
+    use rcore_fs_ramfs::RamFS;
+
+    const ADD: i32 = 1;
+    const DEL: i32 = 2;
+
+    fn ev(data: u64) -> EpollEvent {
+        EpollEvent {
+            events: PollEvents::IN.bits() as u32,
+            data,
+        }
+    }
+
+    fn ready_eventfd() -> Arc<dyn FileLike> {
+        let fd = EventFd::new(0, OpenFlags::empty());
+        fd.write(&1u64.to_ne_bytes()).unwrap();
+        fd
+    }
+
+    /// A process with an epoll at `epfd` watching a readable eventfd at `fd`.
+    fn watching() -> (LinuxProcess, Arc<Epoll>, FileDesc, Arc<dyn FileLike>) {
+        let proc = LinuxProcess::new(RamFS::new(), 0);
+        let ep = Epoll::new(OpenFlags::empty());
+        proc.add_file(ep.clone()).unwrap();
+        let file = ready_eventfd();
+        let fd = proc.add_file(file.clone()).unwrap();
+        ep.ctl(ADD, fd, ev(7), Some(file.clone())).unwrap();
+        assert!(ep.poll(PollEvents::IN).unwrap().read);
+        (proc, ep, fd, file)
+    }
+
+    fn watches(ep: &Epoll, fd: FileDesc) -> bool {
+        ep.inner.lock().interest_list.contains_key(&fd)
+    }
+
+    #[test]
+    fn closing_the_watched_descriptor_removes_it_from_the_interest_list() {
+        let (proc, ep, fd, file) = watching();
+        // The table and the interest list hold it, besides this test.
+        assert_eq!(Arc::strong_count(&file), 3);
+        proc.close_file(fd).unwrap();
+        assert!(
+            !watches(&ep, fd),
+            "close is enough, no EPOLL_CTL_DEL needed"
+        );
+        assert!(!ep.poll(PollEvents::IN).unwrap().read);
+        assert_eq!(ep.ctl(DEL, fd, ev(0), None), Err(LxError::ENOENT));
+        // And the interest list no longer keeps the description alive: this
+        // is what lets the other end of a closed socket or pipe see EOF.
+        assert_eq!(Arc::strong_count(&file), 1);
+    }
+
+    #[test]
+    fn a_dup_keeps_the_entry_until_the_last_descriptor_of_the_description_closes() {
+        let (proc, ep, fd, file) = watching();
+        let dup = proc.add_file_cloexec(file.clone(), false).unwrap();
+        assert_ne!(dup, fd);
+        proc.close_file(fd).unwrap();
+        assert!(
+            watches(&ep, fd),
+            "the description is still open through the dup, as in Linux"
+        );
+        assert!(ep.poll(PollEvents::IN).unwrap().read);
+        proc.close_file(dup).unwrap();
+        assert!(!watches(&ep, fd));
+        assert_eq!(Arc::strong_count(&file), 1);
+    }
+
+    #[test]
+    fn the_number_can_be_watched_again_once_it_names_a_new_file() {
+        let (proc, ep, fd, _old) = watching();
+        proc.close_file(fd).unwrap();
+        let new = ready_eventfd();
+        // The lowest free number is the one just closed.
+        assert_eq!(proc.add_file(new.clone()).unwrap(), fd);
+        assert_eq!(ep.ctl(ADD, fd, ev(8), Some(new.clone())), Ok(0));
+        // The same description under the same number is still EEXIST.
+        assert_eq!(ep.ctl(ADD, fd, ev(8), Some(new)), Err(LxError::EEXIST));
+    }
+
+    /// The interest list is keyed by (file, fd) in Linux, so a stale entry
+    /// under a reused number never stops `EPOLL_CTL_ADD` of the new file,
+    /// whichever path let the entry survive.
+    #[test]
+    fn add_replaces_an_entry_whose_file_is_no_longer_the_one_at_that_number() {
+        let ep = Epoll::new(OpenFlags::empty());
+        let fd = FileDesc::from(5);
+        let old = ready_eventfd();
+        ep.ctl(ADD, fd, ev(1), Some(old.clone())).unwrap();
+        let new: Arc<dyn FileLike> = EventFd::new(0, OpenFlags::empty());
+        assert_eq!(ep.ctl(ADD, fd, ev(2), Some(new.clone())), Ok(0));
+        let (event, watched) = ep.inner.lock().interest_list[&fd].clone();
+        let data = event.data;
+        assert_eq!(data, 2);
+        assert!(Arc::ptr_eq(&watched, &new));
+        assert!(!ep.poll(PollEvents::IN).unwrap().read, "old is not watched");
+        assert_eq!(ep.ctl(ADD, fd, ev(3), Some(new)), Err(LxError::EEXIST));
+    }
+
+    /// The nested-epoll path re-checks after taking the nesting lock; it
+    /// answers the same two ways as the plain one.
+    #[test]
+    fn a_nested_epoll_is_eexist_twice_under_its_number_and_replaces_a_stale_one() {
+        let outer = Epoll::new(OpenFlags::empty());
+        let fd = FileDesc::from(6);
+        let stale = ready_eventfd();
+        outer.ctl(ADD, fd, ev(1), Some(stale)).unwrap();
+        let inner: Arc<dyn FileLike> = Epoll::new(OpenFlags::empty());
+        assert_eq!(outer.ctl(ADD, fd, ev(2), Some(inner.clone())), Ok(0));
+        assert!(!outer.poll(PollEvents::IN).unwrap().read, "stale is gone");
+        assert_eq!(outer.ctl(ADD, fd, ev(3), Some(inner)), Err(LxError::EEXIST));
+    }
+
+    #[test]
+    fn dup2_over_a_watched_descriptor_closes_it_for_the_epoll_too() {
+        let (proc, ep, fd, file) = watching();
+        let other = EventFd::new(0, OpenFlags::empty());
+        let old = proc.replace_file(fd, other, false).unwrap().unwrap();
+        assert!(Arc::ptr_eq(&old, &file));
+        drop(old);
+        assert!(!watches(&ep, fd));
+        assert_eq!(Arc::strong_count(&file), 1);
+    }
+
+    #[test]
+    fn dup2_of_a_descriptor_onto_itself_changes_nothing() {
+        let (proc, ep, fd, file) = watching();
+        proc.replace_file(fd, file.clone(), false).unwrap();
+        assert!(watches(&ep, fd));
+    }
+
+    #[test]
+    fn close_range_and_the_exec_sweep_forget_what_they_close() {
+        let (proc, ep, fd, file) = watching();
+        proc.close_range(fd, fd);
+        assert!(!watches(&ep, fd));
+        assert_eq!(Arc::strong_count(&file), 1);
+
+        let (proc, ep, fd, file) = watching();
+        proc.set_fd_cloexec(fd, true).unwrap();
+        proc.remove_cloexec_files();
+        assert!(!watches(&ep, fd));
+        assert_eq!(Arc::strong_count(&file), 1);
+    }
+
+    #[test]
+    fn every_entry_of_the_description_goes_whatever_number_it_was_added_under() {
+        let (proc, ep, fd, file) = watching();
+        let dup = proc.add_file_cloexec(file.clone(), false).unwrap();
+        ep.ctl(ADD, dup, ev(9), Some(file.clone())).unwrap();
+        proc.close_file(dup).unwrap();
+        assert!(
+            watches(&ep, fd) && watches(&ep, dup),
+            "still open through fd"
+        );
+        proc.close_file(fd).unwrap();
+        assert!(!watches(&ep, fd) && !watches(&ep, dup));
+        assert_eq!(Arc::strong_count(&file), 1);
+    }
+
+    /// An epoll that is itself closed takes its list with it; one that lives
+    /// on in a dup keeps watching.
+    #[test]
+    fn closing_the_epoll_itself_is_not_a_watched_descriptor_going_away() {
+        let (proc, ep, fd, _file) = watching();
+        let epfd = proc.add_file_cloexec(ep.clone(), false).unwrap();
+        proc.close_file(epfd).unwrap();
+        assert!(watches(&ep, fd));
     }
 }

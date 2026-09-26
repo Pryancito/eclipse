@@ -11,9 +11,12 @@
 //! - readlink(at)
 
 use super::*;
+use alloc::string::String;
 use bitflags::bitflags;
 use kernel_hal::user::UserOutPtr;
-use linux_object::fs::vfs::FileType;
+use linux_object::error::LxResult;
+use linux_object::fs::vfs::{FileType, INode, Metadata};
+use linux_object::fs::File;
 
 impl Syscall<'_> {
     /// return a null-terminated string containing an absolute pathname
@@ -64,7 +67,8 @@ impl Syscall<'_> {
             dirfd, path, mode
         );
 
-        let (dir_path, file_name) = split_path(path);
+        let (dir_path, last) = last_component(path)?;
+        let file_name = last.to_mkdir()?;
         let proc = self.linux_process();
         let inode = proc.lookup_inode_at(dirfd, dir_path, true)?;
         let dir_metadata = inode.metadata()?;
@@ -115,7 +119,8 @@ impl Syscall<'_> {
             0o100000 | 0 => FileType::File,    // S_IFREG / unspecified => regular file
             _ => return Err(LxError::EINVAL),  // directories must use mkdir
         };
-        let (dir_path, file_name) = split_path(path);
+        let (dir_path, last) = last_component(path)?;
+        let file_name = last.to_create(has_trailing_slash(path))?;
         let proc = self.linux_process();
         let inode = proc.lookup_inode_at(dirfd, dir_path, true)?;
         let dir_metadata = inode.metadata()?;
@@ -167,20 +172,15 @@ impl Syscall<'_> {
         let cap_size = buf_size.min(256 * 1024);
         let mut kbuf = vec![0; cap_size];
         let mut writer = DirentBufWriter::new(&mut kbuf);
-        loop {
-            let (metadata, name) = match file.read_entry_with_metadata() {
-                Err(LxError::ENOENT) => break,
-                r => r,
-            }?;
-            let ok = writer.try_write(
-                metadata.inode as u64,
-                DirentType::from(metadata.type_).bits(),
-                &name,
-            );
-            if !ok {
-                break;
-            }
-        }
+        let mut file = file;
+        collect_dirents(&mut file, |next, meta, name| {
+            writer.try_write(
+                meta.inode as u64,
+                next,
+                DirentType::from(meta.type_).bits(),
+                name,
+            )
+        })?;
         buf.write_array(writer.as_slice())?;
         Ok(writer.written_size)
     }
@@ -212,12 +212,30 @@ impl Syscall<'_> {
         );
 
         let proc = self.linux_process();
-        let (new_dir_path, new_file_name) = split_path(newpath);
+        let (new_dir_path, new_last) = last_component(newpath)?;
+        let new_file_name = new_last.to_create(has_trailing_slash(newpath))?;
         let follow = flags.contains(AtFlags::SYMLINK_FOLLOW);
-        let inode = proc.lookup_inode_at(olddirfd, oldpath, follow)?;
+        // `AT_EMPTY_PATH`: the file `olddirfd` is open on (`LOOKUP_EMPTY`).
+        // Linux asks that the descriptor's opening credentials be the
+        // caller's, or `CAP_DAC_READ_SEARCH`; a descriptor here carries no
+        // credentials of its own, so what a process holds it may link.
+        // Without the flag an empty path is `ENOENT`, from the lookup.
+        let inode = if flags.contains(AtFlags::EMPTY_PATH) && oldpath.is_empty() {
+            inode_of_dirfd(proc, olddirfd)?
+        } else {
+            proc.lookup_inode_at(olddirfd, oldpath, follow)?
+        };
         let new_dir_inode = proc.lookup_inode_at(newdirfd, new_dir_path, true)?;
         let new_dir_metadata = new_dir_inode.metadata()?;
         proc.check_access(&new_dir_metadata, 0o3, true)?;
+        // `do_linkat`: the new name is looked up (`filename_create`, EEXIST)
+        // before `may_linkat` and `vfs_link` decide whether THIS file may be
+        // linked at all: a directory never, another user's file only when it
+        // is a safe source (`protected_hardlinks`). See `check_link`.
+        if new_dir_inode.find(new_file_name).is_ok() {
+            return Err(LxError::EEXIST);
+        }
+        proc.check_link(&inode.metadata()?)?;
         new_dir_inode.link(new_file_name, &inode)?;
         linux_object::fs::dcache_invalidate();
         Ok(0)
@@ -248,13 +266,22 @@ impl Syscall<'_> {
         );
 
         let proc = self.linux_process();
-        let (dir_path, file_name) = split_path(path);
+        let (dir_path, last) = last_component(path)?;
+        let file_name = if remove_dir {
+            last.to_rmdir()?
+        } else {
+            last.to_unlink()?
+        };
         let dir_inode = proc.lookup_inode_at(dirfd, dir_path, true)?;
         let dir_metadata = dir_inode.metadata()?;
         proc.check_access(&dir_metadata, 0o3, true)?;
         let file_inode = dir_inode.find(file_name)?;
         let file_metadata = file_inode.metadata()?;
-        unlinkat_type_check(remove_dir, file_metadata.type_ == FileType::Dir)?;
+        unlinkat_type_check(
+            remove_dir,
+            file_metadata.type_ == FileType::Dir,
+            has_trailing_slash(path),
+        )?;
         proc.check_sticky(&dir_metadata, &file_metadata)?;
         dir_inode.unlink(file_name)?;
         linux_object::fs::dcache_invalidate();
@@ -301,20 +328,41 @@ impl Syscall<'_> {
         check_rename_flags(flags)?;
 
         let proc = self.linux_process();
-        let (old_dir_path, old_file_name) = split_path(oldpath);
-        let (new_dir_path, new_file_name) = split_path(newpath);
-        let old_dir_inode = proc.lookup_inode_at(olddirfd, old_dir_path, false)?;
-        let new_dir_inode = proc.lookup_inode_at(newdirfd, new_dir_path, false)?;
+        let (old_dir_path, old_last) = last_component(oldpath)?;
+        let (new_dir_path, new_last) = last_component(newpath)?;
+        let old_file_name = old_last.to_rename()?;
+        let new_file_name = new_last.to_rename()?;
+        // The parents are intermediate components: a symlink among them is
+        // followed, as everywhere else (`mv x /tmp/link-to-dir/y`).
+        let old_dir_inode = proc.lookup_inode_at(olddirfd, old_dir_path, true)?;
+        let new_dir_inode = proc.lookup_inode_at(newdirfd, new_dir_path, true)?;
         let old_dir_metadata = old_dir_inode.metadata()?;
         let new_dir_metadata = new_dir_inode.metadata()?;
         proc.check_access(&old_dir_metadata, 0o3, true)?;
         proc.check_access(&new_dir_metadata, 0o3, true)?;
         let old_inode = old_dir_inode.find(old_file_name)?;
         let old_metadata = old_inode.metadata()?;
-        proc.check_sticky(&old_dir_metadata, &old_metadata)?;
-        if flags & RENAME_NOREPLACE != 0 && new_dir_inode.find(new_file_name).is_ok() {
+        rename_slash_check(
+            old_metadata.type_ == FileType::Dir,
+            has_trailing_slash(oldpath),
+            has_trailing_slash(newpath),
+        )?;
+        let new_inode = new_dir_inode.find(new_file_name).ok();
+        if flags & RENAME_NOREPLACE != 0 && new_inode.is_some() {
             return Err(LxError::EEXIST);
         }
+        // `do_renameat2`: "source should not be an ancestor of target" is
+        // EINVAL before any permission is asked (`lock_rename`'s trap).
+        if old_metadata.type_ == FileType::Dir && is_same_or_below(&new_dir_inode, &old_metadata)? {
+            return Err(LxError::EINVAL);
+        }
+        let new_metadata = new_inode.map(|i| i.metadata()).transpose()?;
+        proc.check_rename(
+            &old_dir_metadata,
+            &old_metadata,
+            &new_dir_metadata,
+            new_metadata.as_ref(),
+        )?;
         old_dir_inode.move_(old_file_name, &new_dir_inode, new_file_name)?;
         linux_object::fs::dcache_invalidate();
         Ok(0)
@@ -342,6 +390,14 @@ impl Syscall<'_> {
         );
 
         let proc = self.linux_process();
+        // A trailing slash resolves the link (`LOOKUP_FOLLOW`) to what must
+        // be a directory: `ENOTDIR` or `ENOENT` from the lookup, else
+        // `EINVAL`, a directory not being a symlink. Splitting the name off
+        // used to read the link `l` for `readlink("l/")`.
+        if has_trailing_slash(path) {
+            proc.lookup_inode_at(dirfd, path, false)?;
+            return Err(LxError::EINVAL);
+        }
         // readlink(2) must follow symlinks in *intermediate* path components but
         // NOT the final one.
         //
@@ -415,7 +471,13 @@ impl Syscall<'_> {
             target, newdirfd, linkpath
         );
 
-        let (dir_path, file_name) = split_path(linkpath);
+        // `do_symlinkat`: an empty target is `ENOENT` (`getname` again),
+        // before the link's own name is looked at.
+        if target.is_empty() {
+            return Err(LxError::ENOENT);
+        }
+        let (dir_path, last) = last_component(linkpath)?;
+        let file_name = last.to_create(has_trailing_slash(linkpath))?;
         let proc = self.linux_process();
         let inode = proc.lookup_inode_at(newdirfd, dir_path, true)?;
         let dir_metadata = inode.metadata()?;
@@ -434,6 +496,229 @@ impl Syscall<'_> {
     /// create a symbolic link
     pub fn sys_symlink(&self, target: UserInPtr<u8>, linkpath: UserInPtr<u8>) -> SysResult {
         self.sys_symlinkat(target, FileDesc::CWD, linkpath)
+    }
+}
+
+/// A directory position that can be read one entry at a time and, when the
+/// entry just read turns out not to fit, told to hand it back.
+///
+/// `getdents64` and FreeBSD's `getdirentries` both read an entry *before*
+/// they know whether its record fits in what is left of the caller's buffer.
+/// Both used to drop the one that did not: consumed from the directory
+/// position, written nowhere, absent from every later call. A listing that
+/// took more than one buffer lost one name per buffer, and glibc's `readdir`
+/// asks in 32 KiB pieces, so any directory past a few hundred entries came
+/// out short in `ls`, `find`, `rm -r` and everything built on them.
+pub(crate) trait DirEntries {
+    /// The next entry, or `None` at the end of the directory.
+    fn next_entry(&mut self) -> LxResult<Option<(Metadata, String)>>;
+    /// Hand back the entry `next_entry` just returned.
+    fn unread_entry(&mut self);
+    /// The position an `lseek` takes to resume right after the entry
+    /// `next_entry` just returned: the entry's `d_off`.
+    fn position(&self) -> u64;
+}
+
+impl DirEntries for Arc<File> {
+    fn next_entry(&mut self) -> LxResult<Option<(Metadata, String)>> {
+        match self.read_entry_with_metadata() {
+            Ok(entry) => Ok(Some(entry)),
+            Err(LxError::ENOENT) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    fn unread_entry(&mut self) {
+        File::unread_entry(self);
+    }
+
+    fn position(&self) -> u64 {
+        self.dir_position()
+    }
+}
+
+/// Feed directory entries to `push` until it refuses one or the directory
+/// ends. `push` gets the position that follows the entry (its `d_off`: what
+/// `lseek` takes to resume after it, and what glibc's `telldir` reports),
+/// and returns whether the entry fitted; the one it refuses is handed back
+/// to `src`, so the next call starts with it.
+///
+/// Returns how many entries were pushed. Refusing the very first one is
+/// `EINVAL`, as Linux answers a buffer too small to hold a single record
+/// (`filldir64`: `if (reclen > buf->count) return -EINVAL`): the caller
+/// would otherwise take an empty answer for the end of the directory.
+pub(crate) fn collect_dirents(
+    src: &mut impl DirEntries,
+    mut push: impl FnMut(u64, &Metadata, &str) -> bool,
+) -> LxResult<usize> {
+    let mut pushed = 0;
+    while let Some((meta, name)) = src.next_entry()? {
+        if !push(src.position(), &meta, &name) {
+            src.unread_entry();
+            if pushed == 0 {
+                return Err(LxError::EINVAL);
+            }
+            break;
+        }
+        pushed += 1;
+    }
+    Ok(pushed)
+}
+
+#[cfg(test)]
+mod dirent_collection_tests {
+    use super::*;
+    use alloc::vec::Vec;
+    use core::convert::TryInto;
+    use linux_object::fs::vfs::Timespec;
+
+    /// A directory that hands out the names it was given, once each, and
+    /// remembers its position like a `File` does.
+    struct Names {
+        names: Vec<&'static str>,
+        pos: usize,
+    }
+
+    fn entry(ino: usize) -> Metadata {
+        Metadata {
+            dev: 0,
+            inode: ino,
+            size: 0,
+            blk_size: 0,
+            blocks: 0,
+            atime: Timespec { sec: 0, nsec: 0 },
+            mtime: Timespec { sec: 0, nsec: 0 },
+            ctime: Timespec { sec: 0, nsec: 0 },
+            type_: FileType::File,
+            mode: 0o644,
+            nlinks: 1,
+            uid: 0,
+            gid: 0,
+            rdev: 0,
+        }
+    }
+
+    impl DirEntries for Names {
+        fn next_entry(&mut self) -> LxResult<Option<(Metadata, String)>> {
+            let name = match self.names.get(self.pos) {
+                Some(n) => *n,
+                None => return Ok(None),
+            };
+            self.pos += 1;
+            Ok(Some((entry(self.pos), String::from(name))))
+        }
+
+        fn unread_entry(&mut self) {
+            self.pos -= 1;
+        }
+
+        fn position(&self) -> u64 {
+            self.pos as u64
+        }
+    }
+
+    /// Collect with room for `room` entries per call.
+    fn call(src: &mut Names, room: usize) -> LxResult<Vec<String>> {
+        let mut got = Vec::new();
+        collect_dirents(src, |_, _, name| {
+            if got.len() == room {
+                return false;
+            }
+            got.push(String::from(name));
+            true
+        })?;
+        Ok(got)
+    }
+
+    #[test]
+    fn an_entry_that_does_not_fit_comes_out_on_the_next_call() {
+        let mut dir = Names {
+            names: vec!["a", "b", "c", "d", "e"],
+            pos: 0,
+        };
+        // Two per call: the third entry is read, refused, and must not be lost.
+        assert_eq!(call(&mut dir, 2).unwrap(), ["a", "b"]);
+        assert_eq!(call(&mut dir, 2).unwrap(), ["c", "d"]);
+        assert_eq!(call(&mut dir, 2).unwrap(), ["e"]);
+        // The end of the directory is an empty answer, not an error.
+        assert_eq!(call(&mut dir, 2).unwrap(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn the_count_is_what_was_pushed() {
+        let mut dir = Names {
+            names: vec!["a", "b", "c"],
+            pos: 0,
+        };
+        let mut seen = 0;
+        let n = collect_dirents(&mut dir, |_, _, _| {
+            seen += 1;
+            seen <= 2
+        })
+        .unwrap();
+        assert_eq!(n, 2);
+        assert_eq!(dir.pos, 2, "the refused entry is back in the directory");
+    }
+
+    /// `d_off` is where `lseek` resumes after the entry, so it is the
+    /// position *after* it, and it climbs with the listing. It was 0 for
+    /// every entry, which made `seekdir(telldir())` a `rewinddir`.
+    #[test]
+    fn each_entry_carries_the_position_that_follows_it() {
+        let mut dir = Names {
+            names: vec!["a", "b", "c"],
+            pos: 0,
+        };
+        let mut offs = Vec::new();
+        collect_dirents(&mut dir, |next, _, _| {
+            offs.push(next);
+            true
+        })
+        .unwrap();
+        assert_eq!(offs, [1, 2, 3]);
+        // Read back from where the second entry said to resume: the third.
+        dir.pos = offs[1] as usize;
+        assert_eq!(call(&mut dir, 8).unwrap(), ["c"]);
+    }
+
+    #[test]
+    fn the_writer_puts_the_offset_it_was_given_in_d_off() {
+        let mut buf = [0u8; 64];
+        let mut w = DirentBufWriter::new(&mut buf);
+        assert!(w.try_write(7, 0x1234, DirentType::REG.bits(), "hi"));
+        let b = w.as_slice();
+        assert_eq!(u64::from_le_bytes(b[0..8].try_into().unwrap()), 7);
+        // `d_off` is the second field of `linux_dirent64`.
+        assert_eq!(u64::from_le_bytes(b[8..16].try_into().unwrap()), 0x1234);
+    }
+
+    #[test]
+    fn a_buffer_too_small_for_one_entry_is_einval_and_keeps_the_entry() {
+        let mut dir = Names {
+            names: vec!["a", "b"],
+            pos: 0,
+        };
+        assert_eq!(call(&mut dir, 0), Err(LxError::EINVAL));
+        // Nothing was consumed: a bigger buffer starts where it should.
+        assert_eq!(call(&mut dir, 8).unwrap(), ["a", "b"]);
+    }
+
+    #[test]
+    fn an_error_from_the_directory_comes_through() {
+        struct Broken;
+        impl DirEntries for Broken {
+            fn next_entry(&mut self) -> LxResult<Option<(Metadata, String)>> {
+                Err(LxError::EIO)
+            }
+            fn unread_entry(&mut self) {}
+            fn position(&self) -> u64 {
+                0
+            }
+        }
+        assert_eq!(
+            collect_dirents(&mut Broken, |_, _, _| true),
+            Err(LxError::EIO)
+        );
     }
 }
 
@@ -469,8 +754,9 @@ impl<'a> DirentBufWriter<'a> {
         }
     }
 
-    /// write data
-    fn try_write(&mut self, inode: u64, type_: u8, name: &str) -> bool {
+    /// write data; `offset` is the entry's `d_off`, the directory position
+    /// that follows it.
+    fn try_write(&mut self, inode: u64, offset: u64, type_: u8, name: &str) -> bool {
         let len = core::mem::size_of::<LinuxDirent64>() + name.len() + 1;
         let len = len.div_ceil(8) * 8; // align up
         if self.rest_size < len {
@@ -478,7 +764,7 @@ impl<'a> DirentBufWriter<'a> {
         }
         let dent = LinuxDirent64 {
             ino: inode,
-            offset: 0,
+            offset,
             reclen: len as u16,
             type_,
             name: [],
@@ -592,6 +878,146 @@ pub(crate) const STATX_FLAGS: usize = FSTATAT_FLAGS | AT_STATX_SYNC_TYPE;
 /// What `linkat(2)` accepts (`do_linkat`, `fs/namei.c`).
 pub(crate) const LINKAT_FLAGS: usize = AtFlags::SYMLINK_FOLLOW.bits() | AtFlags::EMPTY_PATH.bits();
 
+/// What `fchownat(2)` accepts (`do_fchownat`, `fs/open.c`).
+pub(crate) const FCHOWNAT_FLAGS: usize =
+    AtFlags::SYMLINK_NOFOLLOW.bits() | AtFlags::EMPTY_PATH.bits();
+
+/// What `faccessat2(2)` accepts (`do_faccessat`, `fs/open.c`: `if (flags &
+/// ~(AT_EACCESS | AT_SYMLINK_NOFOLLOW)) return -EINVAL;`).
+pub(crate) const FACCESSAT_FLAGS: usize =
+    AtFlags::EACCESS.bits() | AtFlags::SYMLINK_NOFOLLOW.bits();
+
+/// What `fchmodat2(2)` accepts (`do_fchmodat`, `fs/open.c`), which is what
+/// the FreeBSD `fchmodat` translation hands `sys_fchmodat`; the Linux
+/// `fchmodat` number carries no flags at all.
+pub(crate) const FCHMODAT_FLAGS: usize =
+    AtFlags::SYMLINK_NOFOLLOW.bits() | AtFlags::EMPTY_PATH.bits();
+
+/// The file `dirfd` is open on, for a syscall given `AT_EMPTY_PATH` and an
+/// empty path (`LOOKUP_EMPTY`): `AT_FDCWD` names the working directory.
+pub(crate) fn inode_of_dirfd(
+    proc: &linux_object::process::LinuxProcess,
+    dirfd: FileDesc,
+) -> LxResult<Arc<dyn INode>> {
+    if dirfd == FileDesc::CWD {
+        proc.lookup_inode_at(FileDesc::CWD, ".", true)
+    } else {
+        Ok(proc.get_file(dirfd)?.inode())
+    }
+}
+
+/// What the last component of a path names, as `fs/namei.c` classifies it
+/// (`LAST_NORM`, `LAST_ROOT`, `LAST_DOT`, `LAST_DOTDOT`).
+///
+/// `split_path` alone handed every caller `(".", "")` for the empty path
+/// and for `/` alike, and no caller looked at the name it got back:
+/// `mkdir("")`, `mkdir("/")`, `open("/", O_CREAT)`, `mknod("/")` and
+/// `symlink(t, "/")` each created an entry whose name is the empty string in
+/// the current directory -- the ramfs takes any name that is not `.` or
+/// `..` -- listed by `getdents` as "" and reachable by no path, and
+/// `unlink("/")` removed it again. Linux never gets there: an empty path is
+/// `ENOENT` before any lookup (`getname`), and a last component that is the
+/// root, `.` or `..` is refused by each syscall with its own errno.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LastComponent<'a> {
+    /// An ordinary name under its parent.
+    Name(&'a str),
+    /// The path was `/` (or only slashes).
+    Root,
+    /// The path ends in `.`.
+    Dot,
+    /// The path ends in `..`.
+    DotDot,
+}
+
+/// The parent's path and the last component of `path`, or `ENOENT` for the
+/// empty path.
+pub(crate) fn last_component(path: &str) -> LxResult<(&str, LastComponent<'_>)> {
+    if path.is_empty() {
+        return Err(LxError::ENOENT);
+    }
+    let (dir_path, name) = split_path(path);
+    let last = match name {
+        "" => LastComponent::Root,
+        "." => LastComponent::Dot,
+        ".." => LastComponent::DotDot,
+        name => LastComponent::Name(name),
+    };
+    Ok((dir_path, last))
+}
+
+/// `nd->last.name[nd->last.len]`: the path ends in a slash, which in Linux
+/// is a promise that the last component is a directory. `split_path` trims
+/// the slash and every caller forgot it was there: `unlink("f/")` deleted the
+/// file `f`, `rename("f/", "g")` moved it, `symlink(t, "l/")` and
+/// `mknod("p/")` created `l` and `p`, and `open("new/", O_CREAT)` created
+/// `new` -- every one of them an error on Linux, because a name with a slash
+/// after it can only ever be a directory.
+pub(crate) fn has_trailing_slash(path: &str) -> bool {
+    path.ends_with('/')
+}
+
+impl<'a> LastComponent<'a> {
+    /// `filename_create` for `mkdir`: the root, `.` and `..` exist already,
+    /// `EEXIST`; a trailing slash is fine, a directory is what is being made.
+    pub(crate) fn to_mkdir(self) -> LxResult<&'a str> {
+        match self {
+            LastComponent::Name(name) => Ok(name),
+            _ => Err(LxError::EEXIST),
+        }
+    }
+
+    /// `filename_create` for everything else that makes a name (`mknod`,
+    /// `symlink`, `link`'s new name): as `mkdir`, and a trailing slash is
+    /// `ENOENT` (`if (unlikely(!is_dir && last.name[last.len])) return
+    /// -ENOENT`), since what it promises cannot be made by this call.
+    pub(crate) fn to_create(self, trailing_slash: bool) -> LxResult<&'a str> {
+        let name = self.to_mkdir()?;
+        if trailing_slash {
+            return Err(LxError::ENOENT);
+        }
+        Ok(name)
+    }
+
+    /// `do_open` with `O_CREAT`: the root, `.` and `..` are directories,
+    /// `EISDIR`, whatever else was asked; so is a trailing slash
+    /// (`open_last_lookups`: `if (unlikely(nd->last.name[nd->last.len]))
+    /// return ERR_PTR(-EISDIR)`), whether or not the name exists.
+    pub(crate) fn to_open_create(self, trailing_slash: bool) -> LxResult<&'a str> {
+        match self {
+            LastComponent::Name(name) if !trailing_slash => Ok(name),
+            _ => Err(LxError::EISDIR),
+        }
+    }
+
+    /// `do_unlinkat`: anything but a plain name is `EISDIR`.
+    pub(crate) fn to_unlink(self) -> LxResult<&'a str> {
+        match self {
+            LastComponent::Name(name) => Ok(name),
+            _ => Err(LxError::EISDIR),
+        }
+    }
+
+    /// `do_rmdir`: the root is `EBUSY`, `.` is `EINVAL`, `..` is
+    /// `ENOTEMPTY`.
+    pub(crate) fn to_rmdir(self) -> LxResult<&'a str> {
+        match self {
+            LastComponent::Name(name) => Ok(name),
+            LastComponent::Root => Err(LxError::EBUSY),
+            LastComponent::Dot => Err(LxError::EINVAL),
+            LastComponent::DotDot => Err(LxError::ENOTEMPTY),
+        }
+    }
+
+    /// `do_renameat2`: either side that is not a plain name is `EBUSY`.
+    pub(crate) fn to_rename(self) -> LxResult<&'a str> {
+        match self {
+            LastComponent::Name(name) => Ok(name),
+            _ => Err(LxError::EBUSY),
+        }
+    }
+}
+
 /// `unlinkat(2)`'s `AT_REMOVEDIR`, which turns it into `rmdir`.
 ///
 /// It is not in `AtFlags` and must not be: Linux gives it the same value as
@@ -625,14 +1051,36 @@ fn unlinkat_removes_a_directory(flags: usize) -> linux_object::error::LxResult<b
 /// Split from the syscall because the lookup around it needs a live process
 /// and this does not, and because getting it backwards is silent: it deletes
 /// the wrong kind of thing, or refuses the right one.
-fn unlinkat_type_check(remove_dir: bool, is_dir: bool) -> linux_object::error::LxResult<()> {
+fn unlinkat_type_check(
+    remove_dir: bool,
+    is_dir: bool,
+    trailing_slash: bool,
+) -> linux_object::error::LxResult<()> {
     match (remove_dir, is_dir) {
         // `rmdir` on something that is not a directory.
         (true, false) => Err(LxError::ENOTDIR),
         // `unlink` on a directory.
         (false, true) => Err(LxError::EISDIR),
+        // `unlink("f/")`: `do_unlinkat`'s `slashes:` label, `ENOTDIR` for
+        // anything that is not a directory. It used to delete `f`.
+        (false, false) if trailing_slash => Err(LxError::ENOTDIR),
         _ => Ok(()),
     }
+}
+
+/// `do_renameat2`: a trailing slash on either name is a promise that the
+/// source is a directory, `ENOTDIR` when it is not (`if (!d_is_dir(old_dentry))
+/// { error = -ENOTDIR; if (old_last.name[old_last.len]) goto exit5; if
+/// (new_last.name[new_last.len]) goto exit5; }`).
+fn rename_slash_check(
+    old_is_dir: bool,
+    old_trailing_slash: bool,
+    new_trailing_slash: bool,
+) -> linux_object::error::LxResult<()> {
+    if !old_is_dir && (old_trailing_slash || new_trailing_slash) {
+        return Err(LxError::ENOTDIR);
+    }
+    Ok(())
 }
 
 /// renameat2(2) `RENAME_NOREPLACE`: don't overwrite an existing target.
@@ -641,6 +1089,91 @@ const RENAME_NOREPLACE: usize = 1 << 0;
 const RENAME_EXCHANGE: usize = 1 << 1;
 /// renameat2(2) `RENAME_WHITEOUT`: leave a whiteout behind (overlayfs).
 const RENAME_WHITEOUT: usize = 1 << 2;
+
+/// Whether `dir` is `ancestor` itself or lies anywhere below it: the walk up
+/// `..` from `dir` meets an inode with `ancestor`'s (dev, inode) before it
+/// reaches a directory that is its own parent (the root of that filesystem).
+///
+/// `rename("a", "a/b/c")` used to reach the filesystem as an ordinary move.
+/// One that links the entry before unlinking it (ramfs) would then leave `a`
+/// reachable only from inside itself: a cycle no path from `/` enters, every
+/// file under it lost, and every inode in it kept alive by its own
+/// reference. Linux refuses this in `do_renameat2` with `EINVAL`, before the
+/// filesystem is asked.
+///
+/// A mount point's `..` stays inside the mounted filesystem, so a directory
+/// below a mount is not seen as below the mount point's parent; a rename
+/// across filesystems fails with `EXDEV` anyway.
+pub(crate) fn is_same_or_below(dir: &Arc<dyn INode>, ancestor: &Metadata) -> LxResult<bool> {
+    let mut here = dir.clone();
+    // Bounded, so a filesystem whose `..` never reaches a fixed point (a
+    // broken parent pointer) cannot spin this walk forever.
+    for _ in 0..4096 {
+        let meta = here.metadata()?;
+        if meta.dev == ancestor.dev && meta.inode == ancestor.inode {
+            return Ok(true);
+        }
+        let up = here.find("..")?;
+        let up_meta = up.metadata()?;
+        if up_meta.dev == meta.dev && up_meta.inode == meta.inode {
+            return Ok(false);
+        }
+        here = up;
+    }
+    Err(LxError::ELOOP)
+}
+
+#[cfg(test)]
+mod rename_trap_tests {
+    use super::*;
+    use rcore_fs::vfs::FileSystem;
+    use rcore_fs_ramfs::RamFS;
+
+    fn a_tree() -> (
+        Arc<dyn INode>,
+        Arc<dyn INode>,
+        Arc<dyn INode>,
+        Arc<dyn INode>,
+    ) {
+        let root = RamFS::new().root_inode();
+        let a = root.create("a", FileType::Dir, 0o755).unwrap();
+        let b = a.create("b", FileType::Dir, 0o755).unwrap();
+        let other = root.create("other", FileType::Dir, 0o755).unwrap();
+        (root, a, b, other)
+    }
+
+    #[test]
+    fn a_directory_is_below_itself_and_below_its_ancestors() {
+        let (root, a, b, _) = a_tree();
+        let a_meta = a.metadata().unwrap();
+        // `mv a a/x`: the target's parent IS the source.
+        assert_eq!(is_same_or_below(&a, &a_meta), Ok(true));
+        // `mv a a/b/x`: the target's parent is two levels inside the source.
+        assert_eq!(is_same_or_below(&b, &a_meta), Ok(true));
+        // Everything is below the root.
+        assert_eq!(is_same_or_below(&b, &root.metadata().unwrap()), Ok(true));
+    }
+
+    #[test]
+    fn a_sibling_and_a_parent_are_not_below() {
+        let (root, a, b, other) = a_tree();
+        let a_meta = a.metadata().unwrap();
+        // `mv a other/x`: a sibling subtree.
+        assert_eq!(is_same_or_below(&other, &a_meta), Ok(false));
+        // `mv a /x`: the root is above `a`, not below it.
+        assert_eq!(is_same_or_below(&root, &a_meta), Ok(false));
+        // `mv a/b /x` seen from `b`: the root is not below `b` either.
+        assert_eq!(is_same_or_below(&root, &b.metadata().unwrap()), Ok(false));
+    }
+
+    #[test]
+    fn the_walk_stops_at_the_root_whose_parent_is_itself() {
+        // Reaching the root without meeting the ancestor answers `false`
+        // rather than walking `..` of the root forever.
+        let (_, _, b, other) = a_tree();
+        assert_eq!(is_same_or_below(&b, &other.metadata().unwrap()), Ok(false));
+    }
+}
 
 /// Validate a renameat2 `flags` argument (renameat2(2)). Pure, so the flag
 /// matrix is unit-testable: unknown bits and the documented mutually-exclusive
@@ -736,8 +1269,8 @@ mod unlinkat_flag_tests {
 
     #[test]
     fn rmdir_takes_directories_and_unlink_takes_everything_else() {
-        assert_eq!(unlinkat_type_check(true, true), Ok(()));
-        assert_eq!(unlinkat_type_check(false, false), Ok(()));
+        assert_eq!(unlinkat_type_check(true, true, false), Ok(()));
+        assert_eq!(unlinkat_type_check(false, false, false), Ok(()));
     }
 
     #[test]
@@ -745,8 +1278,31 @@ mod unlinkat_flag_tests {
         // `rmdir("file")` is ENOTDIR and `unlink("dir")` is EISDIR, and
         // userspace tells the two apart: `rm` retries as a directory on
         // EISDIR and gives up on ENOTDIR.
-        assert_eq!(unlinkat_type_check(true, false), Err(LxError::ENOTDIR));
-        assert_eq!(unlinkat_type_check(false, true), Err(LxError::EISDIR));
+        assert_eq!(
+            unlinkat_type_check(true, false, false),
+            Err(LxError::ENOTDIR)
+        );
+        assert_eq!(
+            unlinkat_type_check(false, true, false),
+            Err(LxError::EISDIR)
+        );
+    }
+
+    /// `unlink("f/")`: the slash promises a directory, and `f` is not one,
+    /// so `ENOTDIR` -- it used to delete `f`. `rmdir("d/")` is the normal
+    /// spelling and `unlink("d/")` is still `EISDIR`.
+    #[test]
+    fn a_trailing_slash_on_unlink_is_enotdir_for_anything_but_a_directory() {
+        assert_eq!(
+            unlinkat_type_check(false, false, true),
+            Err(LxError::ENOTDIR)
+        );
+        assert_eq!(unlinkat_type_check(false, true, true), Err(LxError::EISDIR));
+        assert_eq!(unlinkat_type_check(true, true, true), Ok(()));
+        assert_eq!(
+            unlinkat_type_check(true, false, true),
+            Err(LxError::ENOTDIR)
+        );
     }
 
     #[test]
@@ -756,16 +1312,19 @@ mod unlinkat_flag_tests {
         // This walks the flag word the way `sys_rmdir` hands it over.
         let remove_dir = unlinkat_removes_a_directory(AT_REMOVEDIR).unwrap();
         assert!(remove_dir);
-        assert_eq!(unlinkat_type_check(remove_dir, true), Ok(()));
+        assert_eq!(unlinkat_type_check(remove_dir, true, false), Ok(()));
         assert_eq!(
-            unlinkat_type_check(remove_dir, false),
+            unlinkat_type_check(remove_dir, false, false),
             Err(LxError::ENOTDIR)
         );
         // And plain `unlink(path)`, which hands over 0.
         let remove_dir = unlinkat_removes_a_directory(0).unwrap();
         assert!(!remove_dir);
-        assert_eq!(unlinkat_type_check(remove_dir, false), Ok(()));
-        assert_eq!(unlinkat_type_check(remove_dir, true), Err(LxError::EISDIR));
+        assert_eq!(unlinkat_type_check(remove_dir, false, false), Ok(()));
+        assert_eq!(
+            unlinkat_type_check(remove_dir, true, false),
+            Err(LxError::EISDIR)
+        );
     }
 
     #[test]
@@ -872,7 +1431,14 @@ mod at_flags_tests {
 
     #[test]
     fn a_bit_no_syscall_knows_is_einval_everywhere() {
-        for allowed in [FSTATAT_FLAGS, STATX_FLAGS, LINKAT_FLAGS] {
+        for allowed in [
+            FSTATAT_FLAGS,
+            STATX_FLAGS,
+            LINKAT_FLAGS,
+            FCHOWNAT_FLAGS,
+            FACCESSAT_FLAGS,
+            FCHMODAT_FLAGS,
+        ] {
             assert_eq!(at_flags(0, allowed), Ok(AtFlags::empty()));
             for bit in 0..usize::BITS as usize {
                 let flag = 1usize << bit;
@@ -897,5 +1463,149 @@ mod at_flags_tests {
         assert!(parsed.contains(AtFlags::SYMLINK_NOFOLLOW));
         assert!(parsed.contains(AtFlags::EMPTY_PATH));
         assert!(!parsed.contains(AtFlags::SYMLINK_FOLLOW));
+    }
+}
+
+/// The last component of a path, the one every creating and removing
+/// syscall acts on by name.
+#[cfg(test)]
+mod last_component_tests {
+    use super::*;
+    use rcore_fs::vfs::FileSystem;
+    use rcore_fs_ramfs::RamFS;
+
+    fn last(path: &str) -> LastComponent<'_> {
+        last_component(path).unwrap().1
+    }
+
+    #[test]
+    fn the_empty_path_is_enoent_before_anything_is_split() {
+        assert_eq!(last_component("").err(), Some(LxError::ENOENT));
+    }
+
+    #[test]
+    fn the_root_and_the_dots_are_told_apart_from_a_name() {
+        for root in ["/", "//", "///"] {
+            assert_eq!(last(root), LastComponent::Root, "{root:?}");
+        }
+        for dot in [".", "./", "a/.", "/a/./"] {
+            assert_eq!(last(dot), LastComponent::Dot, "{dot:?}");
+        }
+        for dotdot in ["..", "../", "a/..", "/.."] {
+            assert_eq!(last(dotdot), LastComponent::DotDot, "{dotdot:?}");
+        }
+        // A name that merely starts with a dot is a name.
+        assert_eq!(last(".hidden"), LastComponent::Name(".hidden"));
+        assert_eq!(last("a/..."), LastComponent::Name("..."));
+    }
+
+    #[test]
+    fn a_name_keeps_its_parent() {
+        assert_eq!(last_component("a"), Ok((".", LastComponent::Name("a"))));
+        assert_eq!(last_component("a/"), Ok((".", LastComponent::Name("a"))));
+        assert_eq!(last_component("/a"), Ok(("/", LastComponent::Name("a"))));
+        assert_eq!(
+            last_component("/x/y/a"),
+            Ok(("/x/y", LastComponent::Name("a")))
+        );
+    }
+
+    #[test]
+    fn each_syscall_refuses_what_is_not_a_name_with_its_own_errno() {
+        for special in [
+            LastComponent::Root,
+            LastComponent::Dot,
+            LastComponent::DotDot,
+        ] {
+            // `filename_create`: `EEXIST`, they are all there already.
+            assert_eq!(special.to_mkdir(), Err(LxError::EEXIST), "{special:?}");
+            assert_eq!(
+                special.to_create(false),
+                Err(LxError::EEXIST),
+                "{special:?}"
+            );
+            // `do_open`: a directory, `EISDIR`.
+            assert_eq!(
+                special.to_open_create(false),
+                Err(LxError::EISDIR),
+                "{special:?}"
+            );
+            // `do_unlinkat`: `EISDIR`.
+            assert_eq!(special.to_unlink(), Err(LxError::EISDIR), "{special:?}");
+            // `do_renameat2`: `EBUSY`.
+            assert_eq!(special.to_rename(), Err(LxError::EBUSY), "{special:?}");
+        }
+        // `do_rmdir` tells the three apart.
+        assert_eq!(LastComponent::Root.to_rmdir(), Err(LxError::EBUSY));
+        assert_eq!(LastComponent::Dot.to_rmdir(), Err(LxError::EINVAL));
+        assert_eq!(LastComponent::DotDot.to_rmdir(), Err(LxError::ENOTEMPTY));
+        // A name passes through everywhere.
+        let name = LastComponent::Name("a");
+        assert_eq!(name.to_mkdir(), Ok("a"));
+        assert_eq!(name.to_create(false), Ok("a"));
+        assert_eq!(name.to_open_create(false), Ok("a"));
+        assert_eq!(name.to_unlink(), Ok("a"));
+        assert_eq!(name.to_rmdir(), Ok("a"));
+        assert_eq!(name.to_rename(), Ok("a"));
+    }
+
+    /// Why the guard has to be here: the filesystem takes the empty name.
+    /// `mkdir("/")` reached it as `create("")` in the working directory.
+    #[test]
+    fn the_filesystem_would_take_an_empty_name_so_nothing_may_hand_it_one() {
+        let root = RamFS::new().root_inode();
+        let (dir_path, name) = split_path("/");
+        assert_eq!((dir_path, name), (".", ""));
+        root.create(name, FileType::File, 0o644).unwrap();
+        assert!(root.list().unwrap().iter().any(|n| n.is_empty()));
+        // The classified path never gets that far.
+        assert_eq!(
+            last_component("/").and_then(|(_, l)| l.to_mkdir()),
+            Err(LxError::EEXIST)
+        );
+    }
+
+    #[test]
+    fn a_trailing_slash_is_seen_on_the_whole_path_not_on_the_split_name() {
+        // `split_path` trims it, so it has to be asked of the path itself.
+        assert!(has_trailing_slash("a/"));
+        assert!(has_trailing_slash("/x/a//"));
+        assert!(!has_trailing_slash("a"));
+        assert!(!has_trailing_slash("/x/a"));
+        assert_eq!(last("a/"), LastComponent::Name("a"));
+    }
+
+    /// The slash promises a directory: `mkdir` makes one, nothing else does.
+    #[test]
+    fn only_mkdir_may_be_asked_for_a_name_with_a_slash_after_it() {
+        let name = LastComponent::Name("a");
+        assert_eq!(name.to_mkdir(), Ok("a"));
+        // `mknod("p/")`, `symlink(t, "l/")`, `link(f, "n/")`: `ENOENT`.
+        assert_eq!(name.to_create(true), Err(LxError::ENOENT));
+        // `open("new/", O_CREAT)`: `EISDIR`, whether or not `new` exists.
+        assert_eq!(name.to_open_create(true), Err(LxError::EISDIR));
+        // The specials keep their own errno ahead of the slash's.
+        assert_eq!(LastComponent::Root.to_create(true), Err(LxError::EEXIST));
+        assert_eq!(
+            LastComponent::Dot.to_open_create(true),
+            Err(LxError::EISDIR)
+        );
+    }
+
+    /// `rename("f/", "g")` and `rename("f", "g/")` moved the file `f`.
+    #[test]
+    fn a_slash_on_either_side_of_a_rename_needs_a_directory_source() {
+        assert_eq!(
+            rename_slash_check(false, true, false),
+            Err(LxError::ENOTDIR)
+        );
+        assert_eq!(
+            rename_slash_check(false, false, true),
+            Err(LxError::ENOTDIR)
+        );
+        assert_eq!(rename_slash_check(false, false, false), Ok(()));
+        // A directory may be spelled with the slash on both sides.
+        assert_eq!(rename_slash_check(true, true, true), Ok(()));
+        assert_eq!(rename_slash_check(true, false, true), Ok(()));
     }
 }

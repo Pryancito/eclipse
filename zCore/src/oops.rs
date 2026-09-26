@@ -87,10 +87,13 @@ use zircon_object::task::Thread;
 /// running.
 const MAX_CONTAINED: u32 = 16;
 
-/// Exit code for the victim: the same `128 + SIGKILL` `sys_kill` uses, so the
-/// parent's `wait4` — and the shell's `$?` — read it as what it is, a process
-/// the system put down.
-const KILLED_BY_KERNEL: i64 = 128 + 9;
+/// Exit code for the victim: killed by SIGKILL, in the form the process
+/// object carries a death by signal (`-signo`, see
+/// `linux_object::process::exit_code_killed_by`; `linux-object` is optional
+/// here, so the value is spelled out). The parent's `wait4` then reads it as
+/// `WIFSIGNALED`/`WTERMSIG == 9`, and the shell's `$?` as 137. It used to be
+/// the literal `128 + 9`, which `wait4` reported as an ordinary `exit(137)`.
+const KILLED_BY_KERNEL: i64 = -9;
 
 /// Faults contained since boot.
 static CONTAINED: AtomicU32 = AtomicU32::new(0);

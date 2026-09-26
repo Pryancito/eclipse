@@ -1813,6 +1813,7 @@ dependencies = [
  "filetime",
  "libc",
  "spin 0.9.4",
+ "tempfile",
  "winapi",
 ]
 

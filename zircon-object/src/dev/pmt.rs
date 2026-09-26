@@ -53,7 +53,16 @@ impl PinnedMemoryToken {
             vmo.commit(offset, size)?;
             vmo.pin(offset, size)?;
         }
-        let mapped_addrs = Self::map_into_iommu(&bti.iommu(), vmo.clone(), offset, size, perms)?;
+        // No token exists yet to undo the pin from `Drop`, so a mapping the
+        // IOMMU refuses (no permissions, a window it cannot commit) has to
+        // give the pages back here. It used to leave them pinned for the
+        // life of the object: no decommit or resize ever succeeded again.
+        let mapped_addrs = Self::map_into_iommu(&bti.iommu(), vmo.clone(), offset, size, perms)
+            .inspect_err(|_| {
+                if vmo.is_paged() {
+                    vmo.unpin(offset, size).ok();
+                }
+            })?;
         Ok(Arc::new(PinnedMemoryToken {
             base: KObjectBase::new(),
             bti: Arc::downgrade(bti),
@@ -212,6 +221,22 @@ mod tests {
         drop(pmt);
         vmo.decommit(PAGE_SIZE, PAGE_SIZE).unwrap();
         assert_eq!(vmo.committed_pages_in_range(0, 2), 0);
+    }
+
+    #[test]
+    /// A pin the IOMMU refuses is no pin at all: `zx_bti_pin` with no
+    /// permission bits answers `INVALID_ARGS`, and the pages it had pinned on
+    /// the way in are free again. They used to stay pinned with no token to
+    /// let them go, so the buffer could never be decommitted or resized.
+    fn a_pin_the_iommu_refuses_leaves_nothing_pinned() {
+        let (vmo, bti) = pinned_page();
+        assert_eq!(
+            bti.pin(vmo.clone(), 0, PAGE_SIZE, IommuPerms::empty())
+                .err(),
+            Some(ZxError::INVALID_ARGS)
+        );
+        vmo.decommit(0, PAGE_SIZE).unwrap();
+        vmo.set_len(PAGE_SIZE).unwrap();
     }
 
     #[test]

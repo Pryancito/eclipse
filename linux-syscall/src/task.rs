@@ -63,12 +63,85 @@ pub struct SchedAttr {
     pub sched_period: u64,
 }
 
-fn write_sigchld_info(mut infop: UserOutPtr<SigInfo>, pid: KoID, status: i32) -> SysResult {
-    if infop.is_null() {
-        return Ok(0);
+/// What a process that failed `execve` AFTER its address space was replaced
+/// finishes with: Linux kills it with SIGSEGV (`force_sigsegv` in
+/// `flush_old_exec`'s failure path), so its parent sees a death by signal,
+/// `WIFSIGNALED` with `WTERMSIG == 11`. This used to be the literal `139`,
+/// the number a SHELL prints for that, stored as if the process had called
+/// `exit(139)`.
+fn exit_code_after_failed_exec() -> i64 {
+    linux_object::process::exit_code_killed_by(linux_object::signal::Signal::SIGSEGV as u8)
+}
+
+/// What `nanosleep(2)` leaves in `rem` when a signal cuts the sleep short:
+/// the time that was still to go, so a loop that restarts the sleep on
+/// `EINTR` with `rem` picks up where it left off.
+fn nanosleep_remaining(deadline: core::time::Duration, now: core::time::Duration) -> TimeSpec {
+    TimeSpec::from_duration(deadline.saturating_sub(now))
+}
+
+/// Sleep until `deadline` or until a signal is pending (see
+/// `interruptible_sleep_until`); on `EINTR` the remaining time goes to
+/// `rem`, when the caller gave one. Shared by `nanosleep` and the relative
+/// form of `clock_nanosleep`.
+pub(crate) async fn sleep_or_eintr(
+    thread: &Arc<Thread>,
+    deadline: core::time::Duration,
+    mut rem: UserOutPtr<TimeSpec>,
+) -> LxResult<()> {
+    match linux_object::process::interruptible_sleep_until(thread, deadline).await {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            if e == LxError::EINTR {
+                rem.write_if_not_null(nanosleep_remaining(
+                    deadline,
+                    kernel_hal::timer::timer_now(),
+                ))?;
+            }
+            Err(e)
+        }
     }
-    infop.write(SigInfo::child_state_change(pid as i32, status))?;
-    Ok(0)
+}
+
+/// The child's final CPU usage as `wait4(2)` and `waitid(2)` hand it out:
+/// what `time(1)` prints. The struct is written in the FULL Linux layout,
+/// the fields this kernel does not account for as zero.
+fn child_rusage(cpu: linux_object::process::ChildCpu) -> RUsage {
+    RUsage {
+        utime: core::time::Duration::from_nanos(cpu.utime_ns).into(),
+        stime: core::time::Duration::from_nanos(cpu.stime_ns).into(),
+        ..RUsage::default()
+    }
+}
+
+/// What `waitid(2)` leaves in its two out-pointers.
+pub(crate) struct WaitidReport {
+    /// `infop`, always written: the `SIGCHLD` `siginfo_t` of the child
+    /// reported, or, when `WNOHANG` found nothing, a `siginfo_t` with
+    /// `si_signo` and `si_pid` zero, which is how the caller tells the two
+    /// apart (`waitid(2)`, and `sys_waitid` in `kernel/exit.c`, which
+    /// writes the six fields whatever `kernel_waitid` found).
+    pub info: SigInfo,
+    /// `rusage`, written only when a child was reported: `sys_waitid`
+    /// copies it out under `if (err > 0)`.
+    pub rusage: Option<RUsage>,
+}
+
+/// The `waitid(2)` report for what `do_wait` found: the child's pid, real
+/// uid, status word and CPU time, or nothing.
+pub(crate) fn waitid_report(
+    child: Option<(i32, u32, i32, linux_object::process::ChildCpu)>,
+) -> WaitidReport {
+    match child {
+        Some((pid, uid, status, cpu)) => WaitidReport {
+            info: SigInfo::child_state_change(pid, uid, status),
+            rusage: Some(child_rusage(cpu)),
+        },
+        None => WaitidReport {
+            info: SigInfo::default(),
+            rusage: None,
+        },
+    }
 }
 
 fn is_child_process(
@@ -251,81 +324,35 @@ impl Syscall<'_> {
     ///   Each file descriptor in the child refers to the same open file description (see [`Self::sys_open`])
     ///   as the corresponding file descriptor in the parent.
     ///   This means that the two file descriptors share open file status flags and file offset.
-    fn fork_impl(&self, newsp: usize, newtls: usize) -> LxResult<Arc<Process>> {
+    fn fork_impl(
+        &self,
+        newsp: usize,
+        newtls: usize,
+        ctid: ChildTidRequest,
+    ) -> LxResult<(Arc<Process>, KoID)> {
         info!("fork: newsp={:#x} newtls={:#x}", newsp, newtls);
         let new_proc = Process::fork_from(self.zircon_process())?;
         let path = new_proc.linux().execute_path();
         if !path.is_empty() {
             new_proc.set_name(comm_from_path(&path));
         }
-        // What the child thread takes from this one -- the signal mask above
-        // all, which a `fork` inherits (sigprocmask(2)). `false`: a fork does
-        // not share the address space, so the alternate signal stack comes
-        // across too.
-        let inherited = self.thread.lock_linux().forked_child();
-        let new_thread = Thread::create_linux_with(&new_proc, inherited)?;
-        let mut new_ctx = self.thread.context_cloned()?;
-        if newsp != 0 {
-            new_ctx.set_field(UserContextField::StackPointer, newsp);
-        }
-        if newtls != 0 {
-            new_ctx.set_field(UserContextField::ThreadPointer, newtls);
-        }
-        new_ctx.set_field(UserContextField::ReturnValue, 0);
-        // A FreeBSD child returns 0 in %rax, 1 in %rdx and a clear carry flag
-        // (cpu_fork, sys/amd64/amd64/vm_machdep.c). libc's fork() stub branches
-        // on carry, so a stale CF inherited from the parent's context would make
-        // the child believe fork() failed. Linux needs only %rax = 0.
-        #[cfg(target_arch = "x86_64")]
-        if self.linux_process().abi() == linux_object::process::Abi::Freebsd {
-            let g = new_ctx.general_mut();
-            g.rdx = 1;
-            g.rflags &= !1;
-        }
-        new_thread.with_context(|ctx| *ctx = new_ctx)?;
-        new_thread.start(self.thread_fn)?;
-        // hunter: inherit the parent's syscall whitelist into the child so a
-        // process cannot shed its policy merely by forking, and seed a fresh
-        // anomaly window for the new pid.
-        hunter::task_fork(self.zircon_process().id(), new_proc.id());
+        let tid = self.start_forked_thread(&new_proc, newsp, newtls, ctid)?;
         info!("fork: {} -> {}", self.zircon_process().id(), new_proc.id());
-        Ok(new_proc)
+        Ok((new_proc, tid))
     }
 
-    async fn vfork_impl(&self, newsp: usize, newtls: usize) -> LxResult<Arc<Process>> {
+    async fn vfork_impl(
+        &self,
+        newsp: usize,
+        newtls: usize,
+        ctid: ChildTidRequest,
+    ) -> LxResult<(Arc<Process>, KoID)> {
         info!("vfork: newsp={:#x} newtls={:#x}", newsp, newtls);
         // A real vfork shares the parent's address space until execve or exit. The VMAR
         // implementation cannot replace a shared address space on execve, so use a copy
         // here while retaining vfork's parent-suspension semantics.
         let new_proc = Process::fork_from(self.zircon_process())?;
-        // `false`: Linux's rule is `(clone_flags & (CLONE_VM|CLONE_VFORK)) ==
-        // CLONE_VM`, and a vfork sets BOTH bits, so the alternate signal
-        // stack comes across just as it does for a fork -- doubly right here,
-        // where the address space is copied anyway (see above).
-        let inherited = self.thread.lock_linux().forked_child();
-        let new_thread = Thread::create_linux_with(&new_proc, inherited)?;
-        let mut new_ctx = self.thread.context_cloned()?;
-        if newsp != 0 {
-            new_ctx.set_field(UserContextField::StackPointer, newsp);
-        }
-        if newtls != 0 {
-            new_ctx.set_field(UserContextField::ThreadPointer, newtls);
-        }
-        new_ctx.set_field(UserContextField::ReturnValue, 0);
-        // A FreeBSD child returns 0 in %rax, 1 in %rdx and a clear carry flag
-        // (cpu_fork, sys/amd64/amd64/vm_machdep.c). libc's fork() stub branches
-        // on carry, so a stale CF inherited from the parent's context would make
-        // the child believe fork() failed. Linux needs only %rax = 0.
-        #[cfg(target_arch = "x86_64")]
-        if self.linux_process().abi() == linux_object::process::Abi::Freebsd {
-            let g = new_ctx.general_mut();
-            g.rdx = 1;
-            g.rflags &= !1;
-        }
-        new_thread.with_context(|ctx| *ctx = new_ctx)?;
-        new_thread.start(self.thread_fn)?;
-        // hunter: same lifecycle hook as fork (see fork_impl).
-        hunter::task_fork(self.zircon_process().id(), new_proc.id());
+        let tid = self.start_forked_thread(&new_proc, newsp, newtls, ctid)?;
 
         let new_proc_obj: Arc<dyn KernelObject> = new_proc.clone();
         info!(
@@ -336,19 +363,73 @@ impl Syscall<'_> {
         new_proc_obj
             .wait_signal(Signal::USER_SIGNAL_0 | Signal::PROCESS_TERMINATED)
             .await; // wait for execve or termination
-        Ok(new_proc)
+        Ok((new_proc, tid))
+    }
+
+    /// The one thread a forked (or vforked) child starts with: this thread's
+    /// context with the stack, TLS and return value the caller asked for,
+    /// and the TID bookkeeping of `ctid` done BEFORE it runs a single user
+    /// instruction. Returns the child's thread id.
+    ///
+    /// The child's copy of the address space already exists (`fork_from`),
+    /// so `CLONE_CHILD_SETTID` cannot go through this thread's `UserOutPtr`:
+    /// that writes the parent's memory, which the child does not see. It is
+    /// written into the child's VMAR instead; see [`publish_child_tid`].
+    fn start_forked_thread(
+        &self,
+        new_proc: &Arc<Process>,
+        newsp: usize,
+        newtls: usize,
+        ctid: ChildTidRequest,
+    ) -> LxResult<KoID> {
+        // What the child thread takes from this one -- the signal mask above
+        // all, which a `fork` inherits (sigprocmask(2)). `false`: a fork does
+        // not share the address space, so the alternate signal stack comes
+        // across too. (For a vfork, Linux's rule is `(clone_flags &
+        // (CLONE_VM|CLONE_VFORK)) == CLONE_VM`, and a vfork sets BOTH bits,
+        // so the stack comes across there just the same -- doubly right here,
+        // where the address space is copied anyway.)
+        let inherited = self.thread.lock_linux().forked_child();
+        let new_thread = Thread::create_linux_with(new_proc, inherited)?;
+        let mut new_ctx = self.thread.context_cloned()?;
+        if newsp != 0 {
+            new_ctx.set_field(UserContextField::StackPointer, newsp);
+        }
+        if newtls != 0 {
+            new_ctx.set_field(UserContextField::ThreadPointer, newtls);
+        }
+        new_ctx.set_field(UserContextField::ReturnValue, 0);
+        // A FreeBSD child returns 0 in %rax, 1 in %rdx and a clear carry flag
+        // (cpu_fork, sys/amd64/amd64/vm_machdep.c). libc's fork() stub branches
+        // on carry, so a stale CF inherited from the parent's context would make
+        // the child believe fork() failed. Linux needs only %rax = 0.
+        #[cfg(target_arch = "x86_64")]
+        if self.linux_process().abi() == linux_object::process::Abi::Freebsd {
+            let g = new_ctx.general_mut();
+            g.rdx = 1;
+            g.rflags &= !1;
+        }
+        new_thread.with_context(|ctx| *ctx = new_ctx)?;
+        publish_child_tid(&new_thread, ctid);
+        new_thread.start(self.thread_fn)?;
+        // hunter: inherit the parent's syscall whitelist into the child so a
+        // process cannot shed its policy merely by forking, and seed a fresh
+        // anomaly window for the new pid.
+        hunter::task_fork(self.zircon_process().id(), new_proc.id());
+        Ok(new_thread.id())
     }
 
     /// `sys_fork` creates a child process.
     pub fn sys_fork(&self, newsp: usize, newtls: usize) -> SysResult {
-        self.fork_impl(newsp, newtls).map(|proc| proc.id() as usize)
+        self.fork_impl(newsp, newtls, ChildTidRequest::none())
+            .map(|(proc, _)| proc.id() as usize)
     }
 
     /// `sys_vfork` creates a child process and blocks the parent until the child terminates or execs.
     pub async fn sys_vfork(&self, newsp: usize, newtls: usize) -> SysResult {
-        self.vfork_impl(newsp, newtls)
+        self.vfork_impl(newsp, newtls, ChildTidRequest::none())
             .await
-            .map(|proc| proc.id() as usize)
+            .map(|(proc, _)| proc.id() as usize)
     }
 
     /// `sys_clone` create a new thread in the current process.
@@ -373,6 +454,13 @@ impl Syscall<'_> {
             flags, newsp, parent_tid, child_tid, newtls
         );
         if clone_flags.contains(CloneFlags::PIDFD) && clone_flags.contains(CloneFlags::THREAD) {
+            return Err(LxError::EINVAL);
+        }
+        // Legacy clone reports the pidfd through the parent_tid slot, so the
+        // two cannot both be asked for (`legacy_clone_args_valid`).
+        if clone_flags.contains(CloneFlags::PIDFD)
+            && clone_flags.contains(CloneFlags::PARENT_SETTID)
+        {
             return Err(LxError::EINVAL);
         }
         // This kernel has no namespaces. `from_bits_truncate` silently DROPPED
@@ -429,14 +517,36 @@ impl Syscall<'_> {
             } else {
                 0
             };
-            let process = if clone_flags.contains(CloneFlags::VFORK) {
+            // The TID bookkeeping flags are not a thread-only affair: glibc's
+            // fork() is
+            //     clone(CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID | SIGCHLD,
+            //           0, NULL, &THREAD_SELF->tid, 0)
+            // and nothing in the child ever calls gettid() to fix `tid` up --
+            // the kernel is expected to have stored it (arch_fork, _Fork.c).
+            // Ignored here, the child kept its parent's tid in its TCB, and
+            // everything that reads pthread_self()->tid named the wrong
+            // task: pthread_setname_np opened another process's
+            // /proc/self/task/<tid>/comm, pthread_setaffinity_np and
+            // pthread_setschedparam reached for a thread that is not in this
+            // process (ESRCH), pthread_getcpuclockid clocked the parent.
+            // (musl fixes its own `tid` up with gettid() after the clone,
+            // which is why nothing in the base image noticed.)
+            let ctid = ChildTidRequest::from_clone(clone_flags, child_tid);
+            let (process, tid) = if clone_flags.contains(CloneFlags::VFORK) {
                 info!("sys_clone: dispatching to sys_vfork for flags {:#x}", flags);
-                self.vfork_impl(newsp, tls).await?
+                self.vfork_impl(newsp, tls, ctid).await?
             } else {
                 info!("sys_clone: dispatching to sys_fork for flags {:#x}", flags);
-                self.fork_impl(newsp, tls)?
+                self.fork_impl(newsp, tls, ctid)?
             };
             let pid = process.id() as usize;
+            // In the parent, once the child exists (Linux writes it before the
+            // child runs, but from the same clone_process, i.e. in the same
+            // window -- a caller that races its own child on this word gets
+            // the same answer there).
+            if clone_flags.contains(CloneFlags::PARENT_SETTID) {
+                parent_tid.write_if_not_null(tid as i32)?;
+            }
 
             if clone_flags.contains(CloneFlags::PIDFD) {
                 let pidfd =
@@ -668,25 +778,23 @@ impl Syscall<'_> {
             Err(e) => return Err(e),
         };
         wstatus.write_if_not_null(code)?;
-        // The child's final CPU usage, captured at its exit — what `time(1)`
-        // prints. The argument used to be dropped entirely, leaving callers to
-        // read whatever stack garbage sat in their buffer; the struct is
-        // written in the FULL Linux layout.
-        rusage.write_if_not_null(RUsage {
-            utime: core::time::Duration::from_nanos(cpu.utime_ns).into(),
-            stime: core::time::Duration::from_nanos(cpu.stime_ns).into(),
-            ..RUsage::default()
-        })?;
+        // The argument used to be dropped entirely, leaving callers to read
+        // whatever stack garbage sat in their buffer.
+        rusage.write_if_not_null(child_rusage(cpu))?;
         Ok(pid as usize)
     }
 
     /// Wait for a child state change (`waitid(2)`). Supports `P_PID`, `P_PIDFD`, and `P_ALL`.
+    ///
+    /// The fifth argument is `struct rusage *`, the child's CPU time, as in
+    /// `wait4(2)`; the dispatcher used to stop at the fourth.
     pub async fn sys_waitid(
         &self,
         idtype: i32,
         id: usize,
-        infop: UserOutPtr<SigInfo>,
+        mut infop: UserOutPtr<SigInfo>,
         options: u32,
+        mut rusage: UserOutPtr<RUsage>,
     ) -> SysResult {
         let WaitOptions {
             nohang,
@@ -702,12 +810,11 @@ impl Syscall<'_> {
 
         let res = match idtype {
             P_PID => {
-                if id == 0 {
-                    return Err(LxError::EINVAL);
-                }
+                // `kernel_waitid`: an `id_t` read as a `pid_t`, positive.
+                let id = crate::intarg::waitid_id(id, false)?;
                 match wait_child_interest(caller, id as KoID, nohang, reap, interest).await {
-                    Ok((code, _cpu)) => Ok((id as KoID, code)),
-                    Err(LxError::EAGAIN) if nohang => Ok((0, 0)),
+                    Ok((code, cpu)) => Ok(Some((id as KoID, code, cpu))),
+                    Err(LxError::EAGAIN) if nohang => Ok(None),
                     Err(e) => Err(e),
                 }
             }
@@ -724,40 +831,53 @@ impl Syscall<'_> {
                     return Err(LxError::EAGAIN);
                 }
                 match wait_child_interest(caller, target.id(), nohang, reap, interest).await {
-                    Ok((code, _cpu)) => Ok((target.id(), code)),
-                    Err(LxError::EAGAIN) if nohang => Ok((0, 0)),
+                    Ok((code, cpu)) => Ok(Some((target.id(), code, cpu))),
+                    Err(LxError::EAGAIN) if nohang => Ok(None),
                     Err(e) => Err(e),
                 }
             }
             P_ALL => match wait_child_any_interest(caller, nohang, reap, interest, None).await {
-                Ok((pid, code, _cpu)) => Ok((pid, code)),
-                Err(LxError::EAGAIN) if nohang => Ok((0, 0)),
+                Ok((pid, code, cpu)) => Ok(Some((pid, code, cpu))),
+                Err(LxError::EAGAIN) if nohang => Ok(None),
                 Err(e) => Err(e),
             },
             P_PGID => {
+                // Zero is the caller's own group; a negative id is EINVAL.
+                let id = crate::intarg::waitid_id(id, true)?;
                 let pgid = if id == 0 {
                     linux_object::process::get_process_pgid(caller.id()).unwrap_or(caller.id())
                 } else {
                     id as KoID
                 };
                 match wait_child_any_interest(caller, nohang, reap, interest, Some(pgid)).await {
-                    Ok((pid, code, _cpu)) => Ok((pid, code)),
-                    Err(LxError::EAGAIN) if nohang => Ok((0, 0)),
+                    Ok((pid, code, cpu)) => Ok(Some((pid, code, cpu))),
+                    Err(LxError::EAGAIN) if nohang => Ok(None),
                     Err(e) => Err(e),
                 }
             }
             _ => return Err(LxError::EINVAL),
         };
 
-        let (child_pid, status) = res?;
-
-        if child_pid != 0 {
-            // The WHOLE status word: `si_code` and `si_status` are taken out
-            // of it together (`child_si_code_and_status`), because which
-            // number `si_status` carries depends on which of the three things
-            // happened. Shifting it down eight bits here threw that away and
-            // left every child reported as `CLD_EXITED`.
-            write_sigchld_info(infop, child_pid, status)?;
+        // The WHOLE status word goes into the report: `si_code` and
+        // `si_status` are taken out of it together
+        // (`child_si_code_and_status`), because which number `si_status`
+        // carries depends on which of the three things happened. Shifting it
+        // down eight bits here threw that away and left every child reported
+        // as `CLD_EXITED`.
+        let report = waitid_report(res?.map(|(pid, status, cpu)| {
+            (
+                pid as i32,
+                linux_object::process::real_uid_of(pid),
+                status,
+                cpu,
+            )
+        }));
+        // `infop` is written whether or not a child was found: a `WNOHANG`
+        // that found nothing leaves `si_pid` zero, and used to leave the
+        // caller's struct untouched, with the previous call's child in it.
+        infop.write_if_not_null(report.info)?;
+        if let Some(rusage_of_child) = report.rusage {
+            rusage.write_if_not_null(rusage_of_child)?;
         }
         Ok(0)
     }
@@ -986,8 +1106,7 @@ impl Syscall<'_> {
                     e,
                     self.zircon_process().id()
                 );
-                // 11 = SIGSEGV, in the "128 + signal" form a shell reports.
-                self.zircon_process().exit(139);
+                self.zircon_process().exit(exit_code_after_failed_exec());
                 return Err(e);
             }
         };
@@ -1130,25 +1249,26 @@ impl Syscall<'_> {
     /// in the calling thread or that terminates the process.
     ///
     /// To represent a duration, see TimeSpec.
-    pub async fn sys_nanosleep(&self, req: UserInPtr<TimeSpec>) -> SysResult {
+    pub async fn sys_nanosleep(
+        &self,
+        req: UserInPtr<TimeSpec>,
+        rem: UserOutPtr<TimeSpec>,
+    ) -> SysResult {
         info!("nanosleep: deadline={:?}", req);
         // A `timespec` out of range is EINVAL, not a sleep of some other
         // length: `tv_nsec` has to be a fraction of a second and `tv_sec`
         // must not be negative.
         let duration = req.read()?.try_into_duration()?;
         let deadline = kernel_hal::timer::deadline_after(duration);
-        // Check for pending signals before blocking.
-        linux_object::process::check_signals()?;
-        if kernel_hal::timer::timer_now() >= deadline {
-            return Ok(0);
-        }
-        // Sleep efficiently until the deadline instead of spinning with
-        // yield_now(). This eliminates per-tick rescheduling noise for all
-        // sleeping tasks, which was the primary source of scheduler lag.
-        // A signal check after wakeup preserves EINTR semantics for signals
-        // that arrive while the task is dormant.
-        kernel_hal::thread::sleep_until(deadline).await;
-        linux_object::process::check_signals()?;
+        // One timer for the whole sleep, and the thread's signal-wake bit
+        // beside it: no per-tick rescheduling, and a signal that arrives
+        // while the task is dormant ends the sleep then, not at the
+        // deadline. This used to be one uninterruptible `sleep_until` with
+        // a signal check after it, and `rem` was not even an argument: a
+        // daemon in `sleep(60)` saw its SIGTERM a minute late, and a
+        // `nanosleep` loop that restarts on EINTR with `rem` restarted from
+        // whatever was in the buffer.
+        sleep_or_eintr(self.thread, deadline, rem).await?;
         Ok(0)
     }
 
@@ -1246,6 +1366,7 @@ impl Syscall<'_> {
         if cpusetsize == 0 {
             return Err(LxError::EINVAL);
         }
+        let pid = crate::intarg::task_pid(pid)?;
         let mask = if pid == 0 || pid as u64 == self.thread.id() {
             self.thread.affinity()
         } else {
@@ -1268,6 +1389,11 @@ impl Syscall<'_> {
     /// which also accepts a process id for single-threaded programs. Missing
     /// targets yield `ESRCH`, matching Linux.
     fn sched_target(&self, pid: usize) -> Result<Arc<Thread>, LxError> {
+        // A `pid_t`: the low 32 bits of the register. The `sched_*` calls
+        // that answer EINVAL for a negative one have already said so through
+        // `intarg::sched_pid`; what reaches here negative is a task that
+        // `find_task_by_vpid` does not find.
+        let pid = crate::intarg::task_pid(pid)?;
         if pid == 0 || pid as u64 == self.thread.id() {
             Ok(self.thread.inner())
         } else {
@@ -1365,7 +1491,7 @@ impl Syscall<'_> {
             "sched_setscheduler: pid={} policy={} priority={}",
             pid, base, sched_priority
         );
-        let thread = self.sched_target(pid)?;
+        let thread = self.sched_target(crate::intarg::sched_pid(pid)?)?;
         let (p, rt, nice) =
             Self::sched_validate(base as u8, sched_priority, thread.sched_nice() as i32)?;
         self.check_sched_permission(&thread, p, nice, rt)?;
@@ -1377,7 +1503,7 @@ impl Syscall<'_> {
     ///
     /// See [linux man sched_getscheduler(2)](https://www.man7.org/linux/man-pages/man2/sched_getscheduler.2.html).
     pub fn sys_sched_getscheduler(&self, pid: usize) -> SysResult {
-        let thread = self.sched_target(pid)?;
+        let thread = self.sched_target(crate::intarg::sched_pid(pid)?)?;
         Ok(thread.sched_policy() as usize)
     }
 
@@ -1387,7 +1513,7 @@ impl Syscall<'_> {
     /// See [linux man sched_setparam(2)](https://www.man7.org/linux/man-pages/man2/sched_setparam.2.html).
     pub fn sys_sched_setparam(&self, pid: usize, param: UserInPtr<i32>) -> SysResult {
         let sched_priority = param.read()?;
-        let thread = self.sched_target(pid)?;
+        let thread = self.sched_target(crate::intarg::sched_pid(pid)?)?;
         let (p, rt, nice) = Self::sched_validate(
             thread.sched_policy(),
             sched_priority,
@@ -1403,7 +1529,7 @@ impl Syscall<'_> {
     ///
     /// See [linux man sched_getparam(2)](https://www.man7.org/linux/man-pages/man2/sched_getparam.2.html).
     pub fn sys_sched_getparam(&self, pid: usize, mut param: UserOutPtr<i32>) -> SysResult {
-        let thread = self.sched_target(pid)?;
+        let thread = self.sched_target(crate::intarg::sched_pid(pid)?)?;
         param.write(thread.sched_rt_priority() as i32)?;
         Ok(0)
     }
@@ -1429,7 +1555,7 @@ impl Syscall<'_> {
         pid: usize,
         mut interval: UserOutPtr<TimeSpec>,
     ) -> SysResult {
-        let thread = self.sched_target(pid)?;
+        let thread = self.sched_target(crate::intarg::sched_pid(pid)?)?;
         let ts = if thread.sched_policy() == SCHED_RR {
             TimeSpec {
                 sec: 0,
@@ -1475,7 +1601,7 @@ impl Syscall<'_> {
             "sched_setattr: pid={} policy={} nice={}",
             pid, policy, a.sched_nice
         );
-        let thread = self.sched_target(pid)?;
+        let thread = self.sched_target(crate::intarg::sched_pid(pid)?)?;
         let (p, rt, nice) =
             Self::sched_validate(policy as u8, a.sched_priority as i32, a.sched_nice)?;
         self.check_sched_permission(&thread, p, nice, rt)?;
@@ -1498,7 +1624,7 @@ impl Syscall<'_> {
             return Err(LxError::EINVAL);
         }
         sched_getattr_size(size)?;
-        let thread = self.sched_target(pid)?;
+        let thread = self.sched_target(crate::intarg::sched_pid(pid)?)?;
         let a = SchedAttr {
             size: SCHED_ATTR_SIZE_VER0 as u32,
             sched_policy: thread.sched_policy() as u32,
@@ -1528,7 +1654,7 @@ impl Syscall<'_> {
     /// the looking up. An empty set is `ESRCH`, which is what Linux's
     /// `error = -ESRCH` before the walk amounts to when the walk visits
     /// nobody.
-    fn priority_targets(&self, which: usize, who: usize) -> LxResult<Vec<Arc<Thread>>> {
+    pub(crate) fn priority_targets(&self, which: usize, who: usize) -> LxResult<Vec<Arc<Thread>>> {
         let target = prio_target(
             which,
             who,
@@ -2174,6 +2300,73 @@ pub(crate) struct Clone3Args {
 /// Decodes the eight `u64` of `struct clone_args` into legacy `clone`
 /// arguments, or the `errno` Linux answers for that struct.
 ///
+/// What a fork-like clone owes the caller about the child's TID, read off
+/// the `CLONE_CHILD_SETTID` and `CLONE_CHILD_CLEARTID` bits: whether the
+/// child's tid is stored at `ptr` (in the CHILD, before it runs) and whether
+/// that word is zeroed and futex-woken when the child's thread exits.
+///
+/// Both refer to `ptr` in the child's address space, which for a fork is a
+/// copy the parent's `UserOutPtr` cannot reach; see [`publish_child_tid`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ChildTidRequest {
+    /// The word's address, 0 for none.
+    ptr: usize,
+    set: bool,
+    clear: bool,
+}
+
+impl ChildTidRequest {
+    /// A plain `fork(2)` / `vfork(2)`: no flags, nothing to do.
+    pub(crate) fn none() -> Self {
+        Self {
+            ptr: 0,
+            set: false,
+            clear: false,
+        }
+    }
+
+    /// The request the clone flags make of the `child_tid` argument.
+    pub(crate) fn from_clone(flags: CloneFlags, ptr: UserOutPtr<i32>) -> Self {
+        Self {
+            ptr: ptr.as_addr(),
+            set: flags.contains(CloneFlags::CHILD_SETTID),
+            clear: flags.contains(CloneFlags::CHILD_CLEARTID),
+        }
+    }
+}
+
+/// Do a [`ChildTidRequest`] for `thread`, the (not yet started) sole thread
+/// of a forked child, in that child's own address space.
+///
+/// `CLONE_CHILD_SETTID`: the tid goes through the child's VMAR, because the
+/// parent's `UserOutPtr` writes the parent's copy of the page. Linux does
+/// this store from the child itself (`schedule_tail`) and ignores a fault
+/// on it, so an unmapped word is logged and skipped rather than failing a
+/// fork whose child already exists. `CLONE_CHILD_CLEARTID`: the word is
+/// registered exactly as `set_tid_address(2)` would, and thread exit does
+/// the zero-and-wake.
+pub(crate) fn publish_child_tid(thread: &Arc<Thread>, ctid: ChildTidRequest) {
+    if ctid.ptr == 0 {
+        return;
+    }
+    if ctid.set {
+        let word = (thread.id() as i32).to_ne_bytes();
+        let vaddr = ctid.ptr;
+        match thread.proc().vmar().write_memory(vaddr, &word) {
+            Ok(n) if n == word.len() => {}
+            other => warn!(
+                "clone: CLONE_CHILD_SETTID word {:#x} not writable in child {}: {:?}",
+                vaddr,
+                thread.proc().id(),
+                other
+            ),
+        }
+    }
+    if ctid.clear {
+        thread.set_tid_address(UserOutPtr::from(ctid.ptr));
+    }
+}
+
 /// Pulled out of [`Syscall::sys_clone3`] because it is the whole of what
 /// `clone3` does differently, and because until this batch **none of it ran**:
 /// the dispatch table carried `Sys::CLONE3 => Err(LxError::ENOSYS)` above the
@@ -2222,6 +2415,180 @@ pub(crate) fn clone3_to_clone(words: [u64; 8]) -> LxResult<Clone3Args> {
         tls: tls as usize,
         child_tid: child_tid as usize,
     })
+}
+
+#[cfg(test)]
+mod fork_child_tid_tests {
+    use super::*;
+    use kernel_hal::PAGE_SIZE;
+    use linux_object::process::LinuxProcess;
+    use rcore_fs_ramfs::RamFS;
+    use zircon_object::task::ROOT_JOB;
+    use zircon_object::vm::{MMUFlags, VmObject};
+
+    /// glibc's `arch_fork`: `CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID | SIGCHLD`.
+    const GLIBC_FORK: usize = 0x0120_0011;
+    /// The word every fork-time bit will be stored at (the parent's page is
+    /// seeded with this so the test can tell whose copy got written).
+    const SENTINEL: i32 = 0x5a5a_5a5a;
+
+    fn flags(bits: usize) -> CloneFlags {
+        CloneFlags::from_bits_truncate(bits)
+    }
+
+    /// A parent with one thread and one writable page holding a word set to
+    /// [`SENTINEL`]; returns it with that word's address.
+    fn a_parent(pid: KoID) -> (Arc<Process>, usize) {
+        let parent = Process::create_with_fixed_id_ext(
+            &ROOT_JOB,
+            pid,
+            "parent",
+            LinuxProcess::new(RamFS::new(), 0),
+        )
+        .unwrap();
+        let _main = Thread::create_linux(&parent).unwrap();
+        // At a fixed, non-zero offset: an auto-placed page can land at 0,
+        // which every caller of these functions reads as "no pointer".
+        let page = parent
+            .vmar()
+            .map(
+                Some(0x10_0000),
+                VmObject::new_paged(1),
+                0,
+                PAGE_SIZE,
+                MMUFlags::READ | MMUFlags::WRITE | MMUFlags::USER,
+            )
+            .unwrap();
+        assert_ne!(page, 0);
+        // Inside the page, not at its start: a tid word is a field of the
+        // TCB, and a page-aligned one would let a rounded address pass.
+        let word = page + 0x40;
+        assert_eq!(
+            parent
+                .vmar()
+                .write_memory(word, &SENTINEL.to_ne_bytes())
+                .unwrap(),
+            4
+        );
+        (parent, word)
+    }
+
+    fn word_at(proc: &Arc<Process>, vaddr: usize) -> i32 {
+        let mut b = [0u8; 4];
+        assert_eq!(proc.vmar().read_memory(vaddr, &mut b).unwrap(), 4);
+        i32::from_ne_bytes(b)
+    }
+
+    /// A forked child of `parent` with its one, unstarted thread.
+    fn a_forked_child(parent: &Arc<Process>) -> (Arc<Process>, Arc<Thread>) {
+        let child = Process::fork_from(parent).unwrap();
+        let thread = Thread::create_linux(&child).unwrap();
+        (child, thread)
+    }
+
+    #[test]
+    fn glibcs_fork_flags_ask_for_both_the_store_and_the_clear() {
+        let req = ChildTidRequest::from_clone(flags(GLIBC_FORK), 0x7000_0010.into());
+        assert_eq!(
+            req,
+            ChildTidRequest {
+                ptr: 0x7000_0010,
+                set: true,
+                clear: true
+            }
+        );
+        // musl's fork is a bare SIGCHLD: nothing asked, nothing done.
+        let req = ChildTidRequest::from_clone(flags(0x11), 0x7000_0010.into());
+        assert_eq!(
+            req,
+            ChildTidRequest {
+                ptr: 0x7000_0010,
+                set: false,
+                clear: false
+            }
+        );
+        assert_eq!(ChildTidRequest::none().ptr, 0);
+    }
+
+    #[test]
+    fn the_childs_tid_lands_in_the_childs_copy_of_the_page_not_the_parents() {
+        // The very bug: the store went through the parent's pointer, i.e.
+        // into the parent's copy, and the child's TCB kept the parent's tid.
+        let (parent, page) = a_parent(43_361);
+        let (child, thread) = a_forked_child(&parent);
+        publish_child_tid(
+            &thread,
+            ChildTidRequest::from_clone(flags(GLIBC_FORK), page.into()),
+        );
+        assert_eq!(word_at(&child, page), thread.id() as i32, "child's copy");
+        assert_eq!(word_at(&parent, page), SENTINEL, "parent's copy");
+        // (The first thread of a process carries the pid as its tid, as on
+        // Linux, so the word also reads as the child's getpid().)
+        assert_eq!(thread.id(), child.id());
+    }
+
+    #[test]
+    fn the_clear_on_exit_is_registered_as_set_tid_address_would() {
+        let (parent, page) = a_parent(43_362);
+        let (_child, thread) = a_forked_child(&parent);
+        assert!(thread.tid_address().is_null());
+        publish_child_tid(
+            &thread,
+            ChildTidRequest::from_clone(flags(GLIBC_FORK), page.into()),
+        );
+        assert_eq!(thread.tid_address().as_addr(), page);
+    }
+
+    #[test]
+    fn without_the_flags_the_word_is_left_alone() {
+        // A `clone(SIGCHLD, ..., ctid)` with a live ctid and neither bit
+        // (musl leaves the register holding whatever): nothing may be written
+        // and nothing registered, or exit would zero a word nobody gave it.
+        let (parent, page) = a_parent(43_363);
+        let (child, thread) = a_forked_child(&parent);
+        publish_child_tid(
+            &thread,
+            ChildTidRequest::from_clone(flags(0x11), page.into()),
+        );
+        assert_eq!(word_at(&child, page), SENTINEL);
+        assert!(thread.tid_address().is_null());
+        // CLEARTID alone registers and does not store (pthread-style callers
+        // that pass the two separately).
+        publish_child_tid(
+            &thread,
+            ChildTidRequest::from_clone(flags(0x0020_0011), page.into()),
+        );
+        assert_eq!(word_at(&child, page), SENTINEL);
+        assert_eq!(thread.tid_address().as_addr(), page);
+    }
+
+    #[test]
+    fn a_word_the_child_has_not_mapped_is_skipped_not_fatal() {
+        // Linux stores from the child (`schedule_tail`) and ignores the
+        // fault; the fork has already happened, so failing it here would
+        // leave a child the caller was told does not exist.
+        let (parent, page) = a_parent(43_364);
+        let (child, thread) = a_forked_child(&parent);
+        publish_child_tid(
+            &thread,
+            ChildTidRequest::from_clone(flags(GLIBC_FORK), (page + 0x10_0000).into()),
+        );
+        assert_eq!(word_at(&child, page), SENTINEL);
+        // The clear is still registered: exit tolerates an unmapped word.
+        assert_eq!(thread.tid_address().as_addr(), page + 0x10_0000);
+    }
+
+    #[test]
+    fn a_null_word_is_a_no_op_whatever_the_flags() {
+        let (parent, page) = a_parent(43_365);
+        let (child, thread) = a_forked_child(&parent);
+        publish_child_tid(
+            &thread,
+            ChildTidRequest::from_clone(flags(GLIBC_FORK), 0.into()),
+        );
+        assert_eq!(word_at(&child, page), SENTINEL);
+        assert!(thread.tid_address().is_null());
+    }
 }
 
 #[cfg(test)]
@@ -2532,6 +2899,69 @@ mod wait_option_tests {
 }
 
 #[cfg(test)]
+mod waitid_report_tests {
+    //! The two out-pointers of `waitid(2)`. The fifth argument, `struct
+    //! rusage *`, was never read by the dispatcher, so `waitid` could not
+    //! report a child's CPU time; and `infop` was written only when a child
+    //! was found, so a `WNOHANG` that found nothing handed the caller back
+    //! whatever the previous call had left there.
+
+    use super::*;
+    use linux_object::process::ChildCpu;
+    use linux_object::signal::Signal as LinuxSignal;
+
+    fn word(info: &SigInfo, at: usize) -> i32 {
+        let b = info.as_bytes();
+        i32::from_ne_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]])
+    }
+
+    /// `sys_waitid` in `kernel/exit.c` writes `si_signo`, `si_errno`,
+    /// `si_code`, `si_pid`, `si_uid` and `si_status` whatever
+    /// `kernel_waitid` found; when it found nothing they are all zero, and
+    /// `si_pid == 0` is how `waitid(2)` says to tell.
+    #[test]
+    fn nothing_found_zeroes_infop_and_leaves_rusage_alone() {
+        let report = waitid_report(None);
+        assert!(report.info.as_bytes().iter().all(|&b| b == 0));
+        assert_eq!(word(&report.info, 16), 0, "si_pid");
+        assert!(report.rusage.is_none());
+    }
+
+    /// A child found is a `SIGCHLD` `siginfo_t` with its pid where glibc
+    /// reads `si_pid`, and its CPU time in the `rusage`.
+    #[test]
+    fn a_reported_child_carries_its_pid_and_its_cpu_time() {
+        let cpu = ChildCpu {
+            utime_ns: 1_500_000_000,
+            stime_ns: 250_000,
+        };
+        let report = waitid_report(Some((4242, 1000, 7 << 8, cpu)));
+        assert_eq!(report.info.signo, LinuxSignal::SIGCHLD as i32);
+        assert_eq!(word(&report.info, 16), 4242, "si_pid");
+        assert_eq!(word(&report.info, 20), 1000, "si_uid");
+        assert_eq!(word(&report.info, 24), 7, "si_status");
+        let rusage = report.rusage.expect("a child was reported");
+        assert_eq!((rusage.utime.sec, rusage.utime.usec), (1, 500_000));
+        assert_eq!((rusage.stime.sec, rusage.stime.usec), (0, 250));
+        assert!(rusage.other.iter().all(|&f| f == 0), "the rest is zero");
+    }
+
+    /// The same struct `wait4` writes: `time(1)` over either call agrees.
+    #[test]
+    fn waitid_and_wait4_hand_out_the_same_rusage() {
+        let cpu = ChildCpu {
+            utime_ns: 3_000_000_000,
+            stime_ns: 2_000_000_000,
+        };
+        let via_wait4 = child_rusage(cpu);
+        let via_waitid = waitid_report(Some((1, 0, 0, cpu))).rusage.unwrap();
+        assert_eq!(via_wait4.utime.sec, via_waitid.utime.sec);
+        assert_eq!(via_wait4.stime.sec, via_waitid.stime.sec);
+        assert_eq!(via_wait4.stime.sec, 2);
+    }
+}
+
+#[cfg(test)]
 mod extensible_struct_tests {
     //! The `size` a caller puts beside an extensible struct says which
     //! version of it they built. Three syscalls here take one, and until this
@@ -2704,5 +3134,98 @@ mod setpgid_argument_tests {
     fn a_positive_pid_is_itself() {
         assert_eq!(resolve_pid_arg(ME, 1), Ok(1));
         assert_eq!(resolve_pid_arg(ME, i32::MAX), Ok(i32::MAX as u64));
+    }
+}
+
+#[cfg(test)]
+mod failed_exec_exit_tests {
+    //! A process whose `execve` failed after its address space was gone
+    //! finished with the literal `139`: `WIFEXITED` with status 139, the
+    //! shell's number, instead of the death by SIGSEGV Linux gives it.
+
+    use super::exit_code_after_failed_exec;
+    use linux_object::process::wait_status_exited;
+
+    #[test]
+    fn a_failed_exec_is_a_death_by_sigsegv_not_an_exit_139() {
+        let status = wait_status_exited(exit_code_after_failed_exec());
+        let wifsignaled = (status & 0x7f) != 0 && (status & 0x7f) != 0x7f;
+        assert!(wifsignaled, "status {:#x} says WIFEXITED", status);
+        assert_eq!(status & 0x7f, 11, "WTERMSIG");
+    }
+}
+
+#[cfg(test)]
+mod nanosleep_rem_tests {
+    //! `nanosleep(2)` took no `rem` at all, and its sleep could not be cut
+    //! short by a signal: a signal that arrived in the middle was seen at
+    //! the deadline, and a loop that restarts on `EINTR` with `rem`
+    //! restarted from whatever was in the buffer.
+    extern crate std;
+
+    use super::*;
+    use core::time::Duration;
+    use linux_object::process::send_signal_to_process;
+    use linux_object::signal::{Signal as LinuxSignal, SignalAction, SignalActionFlags, Sigset};
+    use rcore_fs_ramfs::RamFS;
+    use zircon_object::task::ROOT_JOB;
+
+    // `libos` addresses are ordinary host addresses, so a local is the
+    // caller's buffer.
+    fn user_out<T>(slot: &mut T) -> UserOutPtr<T> {
+        UserOutPtr::from(slot as *mut T as usize)
+    }
+
+    #[test]
+    fn what_is_left_is_the_deadline_minus_now_and_never_negative() {
+        let rem = nanosleep_remaining(Duration::from_millis(2_750), Duration::from_millis(1_000));
+        assert_eq!((rem.sec, rem.nsec), (1, 750_000_000));
+        let rem = nanosleep_remaining(Duration::from_secs(1), Duration::from_secs(5));
+        assert_eq!((rem.sec, rem.nsec), (0, 0));
+    }
+
+    #[test]
+    fn a_signal_ends_the_sleep_and_leaves_the_rest_in_rem() {
+        let proc = Process::create_with_fixed_id_ext(
+            &ROOT_JOB,
+            43_501,
+            "sleeper",
+            LinuxProcess::new(RamFS::new(), 0),
+        )
+        .unwrap();
+        let thread = Thread::create_linux(&proc).unwrap();
+        proc.linux().set_signal_action(
+            LinuxSignal::SIGUSR1,
+            SignalAction {
+                handler: 0x1000,
+                flags: SignalActionFlags::empty(),
+                restorer: 0,
+                mask: Sigset::default(),
+            },
+        );
+        let pid = proc.id() as usize;
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            let _ = send_signal_to_process(pid, LinuxSignal::SIGUSR1);
+        });
+        let mut slot = TimeSpec { sec: 99, nsec: 99 };
+        let deadline = kernel_hal::timer::timer_now() + Duration::from_secs(3);
+        let start = std::time::Instant::now();
+        let r = async_std::task::block_on(sleep_or_eintr(&thread, deadline, user_out(&mut slot)));
+        assert_eq!(r, Err(LxError::EINTR));
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "slept past the signal"
+        );
+        assert_eq!(
+            slot.sec, 2,
+            "rem {:?} is not what was left of the 3 s",
+            slot
+        );
+        assert!(
+            slot.nsec > 500_000_000 && slot.nsec < 1_000_000_000,
+            "rem {:?}",
+            slot
+        );
     }
 }

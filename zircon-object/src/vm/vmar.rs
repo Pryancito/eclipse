@@ -251,9 +251,19 @@ pub struct VmAddressRegion {
     size: usize,
     parent: Option<Arc<VmAddressRegion>>,
     page_table: Arc<Mutex<dyn GenericPageTable>>,
+    /// How many more levels of sub-regions may hang under this one.
+    max_height: u32,
     /// If inner is None, this region is destroyed, all operations are invalid.
     inner: Mutex<Option<VmarInner>>,
 }
+
+/// How deep sub-regions nest under a root VMAR.
+///
+/// A child may be as large as its parent, so nothing else bounds the depth,
+/// and `destroy`, `unmap` and `protect` walk the tree one stack frame per
+/// level: a tower as tall as userspace cared to build was a kernel stack
+/// overflow on its first `zx_vmar_destroy`, or at process exit.
+pub const ROOT_VMAR_MAX_HEIGHT: u32 = 32;
 
 impl_kobject!(VmAddressRegion);
 define_count_helper!(VmAddressRegion);
@@ -354,6 +364,7 @@ impl VmAddressRegion {
             addr,
             size,
             parent: None,
+            max_height: ROOT_VMAR_MAX_HEIGHT,
             page_table: Arc::new(Mutex::new(PageTable::from_current().clone_kernel())), //hal PageTable
             inner: Mutex::new(Some(VmarInner::default())),
         })
@@ -370,6 +381,7 @@ impl VmAddressRegion {
             addr: kernel_vmar_base,
             size: kernel_vmar_size,
             parent: None,
+            max_height: ROOT_VMAR_MAX_HEIGHT,
             page_table: Arc::new(Mutex::new(PageTable::from_current().clone_kernel())),
             inner: Mutex::new(Some(VmarInner::default())),
         })
@@ -387,6 +399,7 @@ impl VmAddressRegion {
             addr: guest_vmar_base,
             size: guest_vmar_size,
             parent: None,
+            max_height: ROOT_VMAR_MAX_HEIGHT,
             page_table: Arc::new(Mutex::new(crate::hypervisor::VmmPageTable::new())),
             inner: Mutex::new(Some(VmarInner::default())),
         })
@@ -411,6 +424,9 @@ impl VmAddressRegion {
         flags: VmarFlags,
         align: usize,
     ) -> ZxResult<Arc<Self>> {
+        if self.max_height == 0 {
+            return Err(ZxError::OUT_OF_RANGE);
+        }
         let mut guard = self.inner.lock();
         let inner = guard.as_mut().ok_or(ZxError::BAD_STATE)?;
         // No floor: the ELF loader's app sub-VMAR must land at offset 0 for
@@ -424,6 +440,7 @@ impl VmAddressRegion {
             size: len,
             parent: Some(self.clone()),
             page_table: self.page_table.clone(),
+            max_height: self.max_height - 1,
             inner: Mutex::new(Some(VmarInner::default())),
         });
         inner.children.push(child.clone());
@@ -3496,6 +3513,27 @@ mod tests {
         let s = Sample::new();
         let base = s.root.addr();
         s.child1.unmap(base + 0x8000, 0x1000).unwrap();
+    }
+
+    /// A child may be as large as its parent, so sub-regions nested without
+    /// limit, and `destroy` walks them one frame per level. The tower stops
+    /// `ROOT_VMAR_MAX_HEIGHT` levels under the root with `OUT_OF_RANGE`.
+    #[test]
+    fn sub_regions_stop_at_the_root_max_height() {
+        let root = VmAddressRegion::new_root();
+        let mut vmar = root.clone();
+        for level in 1..=ROOT_VMAR_MAX_HEIGHT {
+            vmar = vmar
+                .allocate_at(0, 0x1000, VmarFlags::CAN_MAP_RXW, PAGE_SIZE)
+                .unwrap_or_else(|e| panic!("level {} refused: {:?}", level, e));
+        }
+        assert_eq!(
+            vmar.allocate_at(0, 0x1000, VmarFlags::CAN_MAP_RXW, PAGE_SIZE)
+                .err(),
+            Some(ZxError::OUT_OF_RANGE)
+        );
+        root.destroy().unwrap();
+        assert!(vmar.is_dead());
     }
 
     #[test]
