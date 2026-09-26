@@ -365,7 +365,7 @@ impl Syscall<'_> {
                 // name, either used to create a file called "" in the working
                 // directory.
                 let (dir_path, last) = super::dir::last_component(path)?;
-                let file_name = last.to_open_create()?;
+                let file_name = last.to_open_create(super::dir::has_trailing_slash(path))?;
                 // relative to cwd
                 let dir_inode = proc.lookup_inode_at(dir_fd, dir_path, true)?;
                 let dir_metadata = dir_inode.metadata()?;

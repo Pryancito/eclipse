@@ -68,7 +68,7 @@ impl Syscall<'_> {
         );
 
         let (dir_path, last) = last_component(path)?;
-        let file_name = last.to_create()?;
+        let file_name = last.to_mkdir()?;
         let proc = self.linux_process();
         let inode = proc.lookup_inode_at(dirfd, dir_path, true)?;
         let dir_metadata = inode.metadata()?;
@@ -120,7 +120,7 @@ impl Syscall<'_> {
             _ => return Err(LxError::EINVAL),  // directories must use mkdir
         };
         let (dir_path, last) = last_component(path)?;
-        let file_name = last.to_create()?;
+        let file_name = last.to_create(has_trailing_slash(path))?;
         let proc = self.linux_process();
         let inode = proc.lookup_inode_at(dirfd, dir_path, true)?;
         let dir_metadata = inode.metadata()?;
@@ -213,7 +213,7 @@ impl Syscall<'_> {
 
         let proc = self.linux_process();
         let (new_dir_path, new_last) = last_component(newpath)?;
-        let new_file_name = new_last.to_create()?;
+        let new_file_name = new_last.to_create(has_trailing_slash(newpath))?;
         let follow = flags.contains(AtFlags::SYMLINK_FOLLOW);
         // `AT_EMPTY_PATH`: the file `olddirfd` is open on (`LOOKUP_EMPTY`).
         // Linux asks that the descriptor's opening credentials be the
@@ -277,7 +277,11 @@ impl Syscall<'_> {
         proc.check_access(&dir_metadata, 0o3, true)?;
         let file_inode = dir_inode.find(file_name)?;
         let file_metadata = file_inode.metadata()?;
-        unlinkat_type_check(remove_dir, file_metadata.type_ == FileType::Dir)?;
+        unlinkat_type_check(
+            remove_dir,
+            file_metadata.type_ == FileType::Dir,
+            has_trailing_slash(path),
+        )?;
         proc.check_sticky(&dir_metadata, &file_metadata)?;
         dir_inode.unlink(file_name)?;
         linux_object::fs::dcache_invalidate();
@@ -338,6 +342,11 @@ impl Syscall<'_> {
         proc.check_access(&new_dir_metadata, 0o3, true)?;
         let old_inode = old_dir_inode.find(old_file_name)?;
         let old_metadata = old_inode.metadata()?;
+        rename_slash_check(
+            old_metadata.type_ == FileType::Dir,
+            has_trailing_slash(oldpath),
+            has_trailing_slash(newpath),
+        )?;
         let new_inode = new_dir_inode.find(new_file_name).ok();
         if flags & RENAME_NOREPLACE != 0 && new_inode.is_some() {
             return Err(LxError::EEXIST);
@@ -381,6 +390,14 @@ impl Syscall<'_> {
         );
 
         let proc = self.linux_process();
+        // A trailing slash resolves the link (`LOOKUP_FOLLOW`) to what must
+        // be a directory: `ENOTDIR` or `ENOENT` from the lookup, else
+        // `EINVAL`, a directory not being a symlink. Splitting the name off
+        // used to read the link `l` for `readlink("l/")`.
+        if has_trailing_slash(path) {
+            proc.lookup_inode_at(dirfd, path, false)?;
+            return Err(LxError::EINVAL);
+        }
         // readlink(2) must follow symlinks in *intermediate* path components but
         // NOT the final one.
         //
@@ -460,7 +477,7 @@ impl Syscall<'_> {
             return Err(LxError::ENOENT);
         }
         let (dir_path, last) = last_component(linkpath)?;
-        let file_name = last.to_create()?;
+        let file_name = last.to_create(has_trailing_slash(linkpath))?;
         let proc = self.linux_process();
         let inode = proc.lookup_inode_at(newdirfd, dir_path, true)?;
         let dir_metadata = inode.metadata()?;
@@ -918,21 +935,46 @@ pub(crate) fn last_component(path: &str) -> LxResult<(&str, LastComponent<'_>)> 
     Ok((dir_path, last))
 }
 
+/// `nd->last.name[nd->last.len]`: the path ends in a slash, which in Linux
+/// is a promise that the last component is a directory. `split_path` trims
+/// the slash and every caller forgot it was there: `unlink("f/")` deleted the
+/// file `f`, `rename("f/", "g")` moved it, `symlink(t, "l/")` and
+/// `mknod("p/")` created `l` and `p`, and `open("new/", O_CREAT)` created
+/// `new` -- every one of them an error on Linux, because a name with a slash
+/// after it can only ever be a directory.
+pub(crate) fn has_trailing_slash(path: &str) -> bool {
+    path.ends_with('/')
+}
+
 impl<'a> LastComponent<'a> {
-    /// `filename_create` (`mkdir`, `mknod`, `symlink`, `link`'s new name):
-    /// the root, `.` and `..` exist already, `EEXIST`.
-    pub(crate) fn to_create(self) -> LxResult<&'a str> {
+    /// `filename_create` for `mkdir`: the root, `.` and `..` exist already,
+    /// `EEXIST`; a trailing slash is fine, a directory is what is being made.
+    pub(crate) fn to_mkdir(self) -> LxResult<&'a str> {
         match self {
             LastComponent::Name(name) => Ok(name),
             _ => Err(LxError::EEXIST),
         }
     }
 
+    /// `filename_create` for everything else that makes a name (`mknod`,
+    /// `symlink`, `link`'s new name): as `mkdir`, and a trailing slash is
+    /// `ENOENT` (`if (unlikely(!is_dir && last.name[last.len])) return
+    /// -ENOENT`), since what it promises cannot be made by this call.
+    pub(crate) fn to_create(self, trailing_slash: bool) -> LxResult<&'a str> {
+        let name = self.to_mkdir()?;
+        if trailing_slash {
+            return Err(LxError::ENOENT);
+        }
+        Ok(name)
+    }
+
     /// `do_open` with `O_CREAT`: the root, `.` and `..` are directories,
-    /// `EISDIR`, whatever else was asked.
-    pub(crate) fn to_open_create(self) -> LxResult<&'a str> {
+    /// `EISDIR`, whatever else was asked; so is a trailing slash
+    /// (`open_last_lookups`: `if (unlikely(nd->last.name[nd->last.len]))
+    /// return ERR_PTR(-EISDIR)`), whether or not the name exists.
+    pub(crate) fn to_open_create(self, trailing_slash: bool) -> LxResult<&'a str> {
         match self {
-            LastComponent::Name(name) => Ok(name),
+            LastComponent::Name(name) if !trailing_slash => Ok(name),
             _ => Err(LxError::EISDIR),
         }
     }
@@ -998,14 +1040,36 @@ fn unlinkat_removes_a_directory(flags: usize) -> linux_object::error::LxResult<b
 /// Split from the syscall because the lookup around it needs a live process
 /// and this does not, and because getting it backwards is silent: it deletes
 /// the wrong kind of thing, or refuses the right one.
-fn unlinkat_type_check(remove_dir: bool, is_dir: bool) -> linux_object::error::LxResult<()> {
+fn unlinkat_type_check(
+    remove_dir: bool,
+    is_dir: bool,
+    trailing_slash: bool,
+) -> linux_object::error::LxResult<()> {
     match (remove_dir, is_dir) {
         // `rmdir` on something that is not a directory.
         (true, false) => Err(LxError::ENOTDIR),
         // `unlink` on a directory.
         (false, true) => Err(LxError::EISDIR),
+        // `unlink("f/")`: `do_unlinkat`'s `slashes:` label, `ENOTDIR` for
+        // anything that is not a directory. It used to delete `f`.
+        (false, false) if trailing_slash => Err(LxError::ENOTDIR),
         _ => Ok(()),
     }
+}
+
+/// `do_renameat2`: a trailing slash on either name is a promise that the
+/// source is a directory, `ENOTDIR` when it is not (`if (!d_is_dir(old_dentry))
+/// { error = -ENOTDIR; if (old_last.name[old_last.len]) goto exit5; if
+/// (new_last.name[new_last.len]) goto exit5; }`).
+fn rename_slash_check(
+    old_is_dir: bool,
+    old_trailing_slash: bool,
+    new_trailing_slash: bool,
+) -> linux_object::error::LxResult<()> {
+    if !old_is_dir && (old_trailing_slash || new_trailing_slash) {
+        return Err(LxError::ENOTDIR);
+    }
+    Ok(())
 }
 
 /// renameat2(2) `RENAME_NOREPLACE`: don't overwrite an existing target.
@@ -1194,8 +1258,8 @@ mod unlinkat_flag_tests {
 
     #[test]
     fn rmdir_takes_directories_and_unlink_takes_everything_else() {
-        assert_eq!(unlinkat_type_check(true, true), Ok(()));
-        assert_eq!(unlinkat_type_check(false, false), Ok(()));
+        assert_eq!(unlinkat_type_check(true, true, false), Ok(()));
+        assert_eq!(unlinkat_type_check(false, false, false), Ok(()));
     }
 
     #[test]
@@ -1203,8 +1267,31 @@ mod unlinkat_flag_tests {
         // `rmdir("file")` is ENOTDIR and `unlink("dir")` is EISDIR, and
         // userspace tells the two apart: `rm` retries as a directory on
         // EISDIR and gives up on ENOTDIR.
-        assert_eq!(unlinkat_type_check(true, false), Err(LxError::ENOTDIR));
-        assert_eq!(unlinkat_type_check(false, true), Err(LxError::EISDIR));
+        assert_eq!(
+            unlinkat_type_check(true, false, false),
+            Err(LxError::ENOTDIR)
+        );
+        assert_eq!(
+            unlinkat_type_check(false, true, false),
+            Err(LxError::EISDIR)
+        );
+    }
+
+    /// `unlink("f/")`: the slash promises a directory, and `f` is not one,
+    /// so `ENOTDIR` -- it used to delete `f`. `rmdir("d/")` is the normal
+    /// spelling and `unlink("d/")` is still `EISDIR`.
+    #[test]
+    fn a_trailing_slash_on_unlink_is_enotdir_for_anything_but_a_directory() {
+        assert_eq!(
+            unlinkat_type_check(false, false, true),
+            Err(LxError::ENOTDIR)
+        );
+        assert_eq!(unlinkat_type_check(false, true, true), Err(LxError::EISDIR));
+        assert_eq!(unlinkat_type_check(true, true, true), Ok(()));
+        assert_eq!(
+            unlinkat_type_check(true, false, true),
+            Err(LxError::ENOTDIR)
+        );
     }
 
     #[test]
@@ -1214,16 +1301,19 @@ mod unlinkat_flag_tests {
         // This walks the flag word the way `sys_rmdir` hands it over.
         let remove_dir = unlinkat_removes_a_directory(AT_REMOVEDIR).unwrap();
         assert!(remove_dir);
-        assert_eq!(unlinkat_type_check(remove_dir, true), Ok(()));
+        assert_eq!(unlinkat_type_check(remove_dir, true, false), Ok(()));
         assert_eq!(
-            unlinkat_type_check(remove_dir, false),
+            unlinkat_type_check(remove_dir, false, false),
             Err(LxError::ENOTDIR)
         );
         // And plain `unlink(path)`, which hands over 0.
         let remove_dir = unlinkat_removes_a_directory(0).unwrap();
         assert!(!remove_dir);
-        assert_eq!(unlinkat_type_check(remove_dir, false), Ok(()));
-        assert_eq!(unlinkat_type_check(remove_dir, true), Err(LxError::EISDIR));
+        assert_eq!(unlinkat_type_check(remove_dir, false, false), Ok(()));
+        assert_eq!(
+            unlinkat_type_check(remove_dir, true, false),
+            Err(LxError::EISDIR)
+        );
     }
 
     #[test]
@@ -1410,10 +1500,15 @@ mod last_component_tests {
             LastComponent::DotDot,
         ] {
             // `filename_create`: `EEXIST`, they are all there already.
-            assert_eq!(special.to_create(), Err(LxError::EEXIST), "{special:?}");
+            assert_eq!(special.to_mkdir(), Err(LxError::EEXIST), "{special:?}");
+            assert_eq!(
+                special.to_create(false),
+                Err(LxError::EEXIST),
+                "{special:?}"
+            );
             // `do_open`: a directory, `EISDIR`.
             assert_eq!(
-                special.to_open_create(),
+                special.to_open_create(false),
                 Err(LxError::EISDIR),
                 "{special:?}"
             );
@@ -1428,8 +1523,9 @@ mod last_component_tests {
         assert_eq!(LastComponent::DotDot.to_rmdir(), Err(LxError::ENOTEMPTY));
         // A name passes through everywhere.
         let name = LastComponent::Name("a");
-        assert_eq!(name.to_create(), Ok("a"));
-        assert_eq!(name.to_open_create(), Ok("a"));
+        assert_eq!(name.to_mkdir(), Ok("a"));
+        assert_eq!(name.to_create(false), Ok("a"));
+        assert_eq!(name.to_open_create(false), Ok("a"));
         assert_eq!(name.to_unlink(), Ok("a"));
         assert_eq!(name.to_rmdir(), Ok("a"));
         assert_eq!(name.to_rename(), Ok("a"));
@@ -1446,8 +1542,52 @@ mod last_component_tests {
         assert!(root.list().unwrap().iter().any(|n| n.is_empty()));
         // The classified path never gets that far.
         assert_eq!(
-            last_component("/").and_then(|(_, l)| l.to_create()),
+            last_component("/").and_then(|(_, l)| l.to_mkdir()),
             Err(LxError::EEXIST)
         );
+    }
+
+    #[test]
+    fn a_trailing_slash_is_seen_on_the_whole_path_not_on_the_split_name() {
+        // `split_path` trims it, so it has to be asked of the path itself.
+        assert!(has_trailing_slash("a/"));
+        assert!(has_trailing_slash("/x/a//"));
+        assert!(!has_trailing_slash("a"));
+        assert!(!has_trailing_slash("/x/a"));
+        assert_eq!(last("a/"), LastComponent::Name("a"));
+    }
+
+    /// The slash promises a directory: `mkdir` makes one, nothing else does.
+    #[test]
+    fn only_mkdir_may_be_asked_for_a_name_with_a_slash_after_it() {
+        let name = LastComponent::Name("a");
+        assert_eq!(name.to_mkdir(), Ok("a"));
+        // `mknod("p/")`, `symlink(t, "l/")`, `link(f, "n/")`: `ENOENT`.
+        assert_eq!(name.to_create(true), Err(LxError::ENOENT));
+        // `open("new/", O_CREAT)`: `EISDIR`, whether or not `new` exists.
+        assert_eq!(name.to_open_create(true), Err(LxError::EISDIR));
+        // The specials keep their own errno ahead of the slash's.
+        assert_eq!(LastComponent::Root.to_create(true), Err(LxError::EEXIST));
+        assert_eq!(
+            LastComponent::Dot.to_open_create(true),
+            Err(LxError::EISDIR)
+        );
+    }
+
+    /// `rename("f/", "g")` and `rename("f", "g/")` moved the file `f`.
+    #[test]
+    fn a_slash_on_either_side_of_a_rename_needs_a_directory_source() {
+        assert_eq!(
+            rename_slash_check(false, true, false),
+            Err(LxError::ENOTDIR)
+        );
+        assert_eq!(
+            rename_slash_check(false, false, true),
+            Err(LxError::ENOTDIR)
+        );
+        assert_eq!(rename_slash_check(false, false, false), Ok(()));
+        // A directory may be spelled with the slash on both sides.
+        assert_eq!(rename_slash_check(true, true, true), Ok(()));
+        assert_eq!(rename_slash_check(true, false, true), Ok(()));
     }
 }
