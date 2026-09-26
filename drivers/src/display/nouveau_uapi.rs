@@ -1502,6 +1502,35 @@ pub(super) const fn gp_entry1(push_va: u64, len_bytes: u32) -> u32 {
     (((push_va >> 32) as u32) & 0xff) | (((len_bytes / 4) & 0x1f_ffff) << 10)
 }
 
+/// The longest push one GPFIFO entry can name: LENGTH is 21 bits of
+/// dwords, so `0x7f_ffff` bytes (Linux's `NV50_DMA_PUSH_MAX_LENGTH`), and
+/// EXEC refuses a longer one with EINVAL as `nouveau_exec_job_init` does.
+/// Encoded regardless, the length was masked and the GPU ran a push of
+/// `va_len mod 8 MiB`: the tail of a long command buffer silently never
+/// executed, and a push of exactly 8 MiB ran as nothing at all.
+pub(super) const EXEC_PUSH_MAX_LENGTH: u32 = 0x7f_ffff;
+
+/// `drm_nouveau_exec_push.flags`: the host must not prefetch this push
+/// (`DRM_NOUVEAU_EXEC_PUSH_NO_PREFETCH`). Set on a push the GPU itself
+/// writes just before it runs (device-generated commands, an indirect
+/// push): read ahead, the host fetches the methods before the copy that
+/// fills them lands and executes stale words.
+pub(super) const EXEC_PUSH_NO_PREFETCH: u32 = 0x1;
+
+/// [`gp_entry1`] for a user push: `NV906F_GP_ENTRY1_SYNC` (31) set to
+/// `SYNC_WAIT` when the push carries [`EXEC_PUSH_NO_PREFETCH`], so the host
+/// waits for the entry before it to complete before fetching this one.
+/// Linux's `nv50_dma_push` writes the same bit for the same flag.
+#[inline]
+pub(super) const fn gp_entry1_push(push_va: u64, len_bytes: u32, flags: u32) -> u32 {
+    let sync = if flags & EXEC_PUSH_NO_PREFETCH != 0 {
+        1 << 31
+    } else {
+        0
+    };
+    gp_entry1(push_va, len_bytes) | sync
+}
+
 /// `NV906F_DMA` header, INC_METHOD: SEC_OP (31:29) = 1, COUNT (28:16),
 /// SUBCHANNEL (15:13), METHOD_ADDRESS (11:0) = mthd >> 2.
 #[inline]
@@ -2088,6 +2117,32 @@ mod direct_submit_tests {
         );
         // A zero-length push encodes as zero length, not as a wrap.
         assert_eq!(gp_entry1(0, 0) >> 10, 0);
+    }
+
+    /// A user push's entry carries `SYNC_WAIT` (bit 31) exactly when the
+    /// push asks not to be prefetched, and the longest push EXEC accepts
+    /// still fits the 21-bit LENGTH without touching that bit.
+    #[test]
+    fn a_no_prefetch_push_sets_the_sync_bit_and_the_longest_push_fits_below_it() {
+        let plain = gp_entry1_push(0x0000_00ab_1234_5678, 24, 0);
+        assert_eq!(plain, gp_entry1(0x0000_00ab_1234_5678, 24));
+        assert_eq!(plain >> 31, 0, "SYNC_PROCEED for an ordinary push");
+        let held = gp_entry1_push(0x0000_00ab_1234_5678, 24, EXEC_PUSH_NO_PREFETCH);
+        assert_eq!(held >> 31, 1, "SYNC_WAIT for a push the GPU still writes");
+        assert_eq!(held & !(1 << 31), plain, "and nothing else changes");
+        assert_eq!(
+            gp_entry1_push(0, 24, 0x2) >> 31,
+            0,
+            "other flag bits are not the prefetch one"
+        );
+        let longest = gp_entry1_push(0, EXEC_PUSH_MAX_LENGTH & !3, 0);
+        assert_eq!((longest >> 10) & 0x1f_ffff, 0x1f_ffff, "21 bits of dwords");
+        assert_eq!(longest >> 31, 0);
+        assert_eq!(
+            (gp_entry1(0, EXEC_PUSH_MAX_LENGTH + 1) >> 10) & 0x1f_ffff,
+            0,
+            "one past the limit wraps to nothing: that is why EXEC refuses it"
+        );
     }
 
     /// `NV906F_DMA` INC_METHOD header: SEC_OP in 31:29, COUNT in 28:16,

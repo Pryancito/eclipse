@@ -9645,7 +9645,10 @@ impl NvidiaGpu {
                         let gp = (f.gpfifo_va + slot as usize * 8) as *mut u32;
                         unsafe {
                             core::ptr::write_volatile(gp, nv::gp_entry0(p.va));
-                            core::ptr::write_volatile(gp.add(1), nv::gp_entry1(p.va, p.va_len));
+                            core::ptr::write_volatile(
+                                gp.add(1),
+                                nv::gp_entry1_push(p.va, p.va_len, p.flags),
+                            );
                         }
                         slot = (slot + 1) % entries;
                     }
@@ -12642,6 +12645,19 @@ impl NvidiaGpu {
                         );
                         return Err(nv::EINVAL);
                     }
+                    // Longer than a GPFIFO entry's LENGTH can name: encoded
+                    // anyway, the field wrapped and the GPU ran a push of
+                    // `va_len mod 8 MiB`, the rest of the command buffer
+                    // silently skipped. Linux refuses it here too.
+                    if push.va_len > nv::EXEC_PUSH_MAX_LENGTH {
+                        crate::klog_warn!(
+                            "[nouveau-uapi] EXEC: push va={:#x} va_len={:#x} exceeds the {:#x} one GPFIFO entry can name",
+                            push.va,
+                            push.va_len,
+                            nv::EXEC_PUSH_MAX_LENGTH
+                        );
+                        return Err(nv::EINVAL);
+                    }
                 }
                 // One-shot: dump the head of the FIRST push Mesa ever submits.
                 // With the self-test proving (or disproving) the plumbing, the
@@ -12893,6 +12909,22 @@ impl NvidiaGpu {
                 let (last, rest) = pushes
                     .split_last()
                     .expect("push_count > 0 already checked above");
+                // The RM's own submit builds the GPFIFO entry in C and has
+                // no SYNC bit to give: a NO_PREFETCH push (one the GPU is
+                // still writing) goes in prefetchable here. The direct path
+                // honours it; say so once when this fallback drops it.
+                if pushes
+                    .iter()
+                    .any(|p| p.flags & nv::EXEC_PUSH_NO_PREFETCH != 0)
+                {
+                    static NO_PREFETCH_DROPPED: AtomicBool = AtomicBool::new(false);
+                    if !NO_PREFETCH_DROPPED.swap(true, Ordering::Relaxed) {
+                        crate::klog_warn!(
+                            "[nouveau-uapi] EXEC: NO_PREFETCH push submitted through the RM, which \
+                             cannot mark the entry SYNC_WAIT (direct submit does); reported once"
+                        );
+                    }
+                }
                 for push in rest {
                     self.submit_push_plain(device_instance, ctx_idx, push)?;
                 }
@@ -16241,6 +16273,15 @@ mod nouveau_bookkeeping_tests {
         }
     }
 
+    /// A push the GPU is still writing when it is submitted.
+    fn push_no_prefetch(va: u64, va_len: u32) -> nv::DrmNouveauExecPush {
+        nv::DrmNouveauExecPush {
+            va,
+            va_len,
+            flags: nv::EXEC_PUSH_NO_PREFETCH,
+        }
+    }
+
     fn ptr_of<T>(items: &[T]) -> u64 {
         if items.is_empty() {
             0
@@ -18666,6 +18707,108 @@ mod nouveau_bookkeeping_tests {
         }
         gpu.nouveau_release_process(A);
         gpu.nouveau_release_process(B);
+        assert_eq!(FAKE_RM.lock().bad, 0);
+    }
+
+    /// The GPFIFO entry's SYNC bit, `SYNC_WAIT` when the host must not
+    /// fetch the entry before the one ahead of it has completed.
+    fn gp_sync_wait(ctx: u32, index: u64) -> bool {
+        let c = chan(ctx);
+        peek(c.buf + FAST_GPFIFO_OFF as usize + index as usize * 8 + 4) >> 31 == 1
+    }
+
+    /// A GPFIFO entry names its push's length in 21 bits of dwords. A
+    /// longer push was encoded regardless, the field wrapped, and the GPU
+    /// ran a push of `va_len mod 8 MiB`: the tail of a long command
+    /// buffer never executed, without a word from anyone; Linux refuses it
+    /// with EINVAL. And a push flagged NO_PREFETCH (one the GPU itself is
+    /// still writing: device-generated commands) went into the ring like
+    /// any other, so the host could fetch its methods before the copy that
+    /// fills them had landed; the entry now carries `SYNC_WAIT`, as Linux's
+    /// `nv50_dma_push` writes it.
+    #[test]
+    fn a_push_longer_than_an_entry_can_name_is_einval_and_no_prefetch_holds_the_host() {
+        let _g = LOCK.lock();
+        let _live = LiveBytes::hold();
+        let gpu = gpu_rm_fast();
+        let ch = client_with_pushbuf(&gpu, A);
+        let out = syncobj::create(false);
+        // One byte over the limit (rounded to a dword), and exactly 8 MiB,
+        // which the wrap would have run as a push of nothing.
+        for len in [nv::EXEC_PUSH_MAX_LENGTH + 1, 0x80_0000, 0x80_0010] {
+            assert_eq!(
+                exec(
+                    &gpu,
+                    A,
+                    ch,
+                    &[push(PUSH_VA, 16), push(PUSH_VA + 0x100, len)],
+                    &[],
+                    &[sync(out)]
+                ),
+                Err(nv::EINVAL),
+                "va_len={:#x}",
+                len
+            );
+        }
+        assert!(
+            !has_chan(1),
+            "refused before the channel was even prepared: nothing reached the ring"
+        );
+        assert_eq!(syncobj::query(out), Some(0), "and nothing was signaled");
+        // The longest push that fits, and a NO_PREFETCH push behind it.
+        let longest = nv::EXEC_PUSH_MAX_LENGTH & !3;
+        assert_eq!(
+            exec(
+                &gpu,
+                A,
+                ch,
+                &[
+                    push(PUSH_VA, longest),
+                    push_no_prefetch(PUSH_VA + 0x100, 32),
+                    push(PUSH_VA + 0x200, 16)
+                ],
+                &[],
+                &[sync(out)]
+            ),
+            Ok(0)
+        );
+        let c = chan(1);
+        assert_eq!(userd(&c), (0, 4), "three pushes and the fence");
+        assert!(!gp_sync_wait(1, 0), "an ordinary push is prefetched");
+        assert!(
+            gp_sync_wait(1, 1),
+            "the host waits for the push ahead before fetching the one the GPU writes"
+        );
+        assert!(
+            !gp_sync_wait(1, 2),
+            "the flag is the push's own, not sticky"
+        );
+        assert!(!gp_sync_wait(1, 3), "nor the fence's");
+        assert_eq!(
+            run_gpu(1),
+            [
+                Fetched::Push {
+                    va: PUSH_VA,
+                    len: longest
+                },
+                Fetched::Push {
+                    va: PUSH_VA + 0x100,
+                    len: 32
+                },
+                Fetched::Push {
+                    va: PUSH_VA + 0x200,
+                    len: 16
+                },
+                Fetched::Release {
+                    sem_va: sem_va(&c),
+                    payload: 1
+                }
+            ],
+            "the longest push keeps its whole length in the entry"
+        );
+        assert_eq!(syncobj::query(out), Some(1));
+        assert!(syncobj::destroy(out));
+        gpu.nouveau_release_process(A);
         assert_eq!(FAKE_RM.lock().bad, 0);
     }
 
