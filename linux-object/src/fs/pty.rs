@@ -75,6 +75,21 @@ struct PtyInner {
     stopped: bool,
     /// Canonical VEOF on an empty line: next slave read returns EOF (0) once.
     eof_pending: bool,
+    /// How many bytes have ever been taken off the front of `input`, so a
+    /// position in it can be named independently of what is still queued: the
+    /// back of the queue is at `input_consumed + input.len()`.
+    input_consumed: usize,
+    /// Where a VEOF cut a canonical line short, as positions in the sequence
+    /// `input_consumed` counts. Linux keeps the same thing as an `EOF` bit in
+    /// the line discipline's `read_flags` bitmap, and `n_tty_read` stops there
+    /// exactly as it stops on a newline.
+    ///
+    /// Without it a line committed by VEOF -- which carries no terminator --
+    /// ran straight into the next one: `printf 'abc'; ^D; printf 'def\n'` came
+    /// back from a single `read` as `abcdef\n`, so a program reading a line at
+    /// a time (every prompt, every `read` builtin) saw the two joined. The
+    /// marks cost nothing when nobody presses Ctrl-D: the queue stays empty.
+    eof_marks: VecDeque<usize>,
     /// Bytes available to the master's `read` (program output + echoed input).
     output: VecDeque<u8>,
     /// Where the cursor sits on the master's line. One counter for program
@@ -84,6 +99,22 @@ struct PtyInner {
     out_column: usize,
     termios: Termios,
     winsize: ConsoleWinSize,
+}
+
+impl PtyInner {
+    /// Throw away everything on the way in, as `n_tty_flush_buffer` does: the
+    /// committed bytes, the line still being assembled, a VEOF waiting to be
+    /// reported, and the line marks that went with them. The four moved
+    /// together at every one of the four call sites already; keeping the
+    /// counter honest is what made it worth a name, because a flush leaves
+    /// positions behind that no byte will ever occupy.
+    fn flush_input(&mut self) {
+        self.input_consumed += self.input.len();
+        self.input.clear();
+        self.canon.clear();
+        self.eof_pending = false;
+        self.eof_marks.clear();
+    }
 }
 
 /// One pseudo-terminal pair.
@@ -337,9 +368,7 @@ impl Pty {
                     // the terminal emulator (foot, etc.).
                     if cc[VINTR] != 0 && c == cc[VINTR] {
                         if lflag & NOFLSH == 0 {
-                            inner.input.clear();
-                            inner.canon.clear();
-                            inner.eof_pending = false;
+                            inner.flush_input();
                             clear_slave_readable = true;
                         }
                         if inner.stopped {
@@ -370,9 +399,7 @@ impl Pty {
                     };
                     if let Some((signal, label)) = sig {
                         if lflag & NOFLSH == 0 {
-                            inner.input.clear();
-                            inner.canon.clear();
-                            inner.eof_pending = false;
+                            inner.flush_input();
                             clear_slave_readable = true;
                         }
                         // Resume any output frozen by Ctrl-S so the signalled
@@ -518,6 +545,10 @@ impl Pty {
                             inner.input.push_back(ch);
                         }
                         if had_data {
+                            // The line ends here although no terminator does,
+                            // so the mark is what tells the reader to stop.
+                            let end = inner.input_consumed + inner.input.len();
+                            inner.eof_marks.push_back(end);
                             wake_slave = true;
                         } else {
                             inner.eof_pending = true;
@@ -710,8 +741,19 @@ impl Pty {
         self.clear_vtime();
         let mut n = 0;
         while n < limit {
+            // A VEOF boundary ends this read as a newline would (`n_tty_read`
+            // stops on either). Reaching it with nothing read yet means the
+            // last read already stopped here, so the mark is spent and this
+            // read carries on into the line behind it.
+            if inner.eof_marks.front() == Some(&inner.input_consumed) {
+                inner.eof_marks.pop_front();
+                if n > 0 {
+                    break;
+                }
+            }
             match inner.input.pop_front() {
                 Some(b) => {
+                    inner.input_consumed += 1;
                     buf[n] = b;
                     n += 1;
                     if canon && b == b'\n' {
@@ -758,9 +800,7 @@ impl Pty {
                 {
                     let mut inner = self.inner.lock();
                     inner.termios = t;
-                    inner.input.clear();
-                    inner.canon.clear();
-                    inner.eof_pending = false;
+                    inner.flush_input();
                 }
                 // Not `input.is_empty()`, which is always true a line above:
                 // the slave is ALSO readable when the master has closed, and
@@ -876,9 +916,7 @@ impl Pty {
                         // committed (`n_tty_flush_buffer` resets both), and so
                         // does a VEOF waiting to be reported: it belongs to a
                         // line nobody will ever read now.
-                        inner.input.clear();
-                        inner.canon.clear();
-                        inner.eof_pending = false;
+                        inner.flush_input();
                     }
                     if flush_output {
                         inner.output.clear();
@@ -1088,6 +1126,8 @@ pub fn alloc_ptmx() -> Arc<dyn INode> {
             modem: TIOCM_DTR | TIOCM_RTS | TIOCM_CAR | TIOCM_CTS | TIOCM_DSR,
             stopped: false,
             eof_pending: false,
+            input_consumed: 0,
+            eof_marks: VecDeque::new(),
             output: VecDeque::new(),
             out_column: 0,
             termios: Termios::default_tty(),
@@ -1487,6 +1527,8 @@ mod tests {
                 modem: 0,
                 stopped: false,
                 eof_pending: false,
+                input_consumed: 0,
+                eof_marks: VecDeque::new(),
                 output: VecDeque::new(),
                 out_column: 0,
                 termios: Termios::default_tty(),
@@ -2522,6 +2564,57 @@ mod tests {
         assert!(p.inner.lock().eof_pending);
         assert_eq!(p.slave_read(&mut buf).unwrap(), 0);
         assert!(p.slave_read(&mut buf).is_err());
+    }
+
+    #[test]
+    fn a_line_cut_short_by_veof_does_not_run_into_the_next_one() {
+        let p = pty();
+        // What `printf 'abc'; ^D; printf 'def\n'` puts down the line. The
+        // first line has no terminator of its own, so before the EOF marks
+        // one `read` handed back `abcdef\n` and the program saw one line.
+        p.master_write(b"abc");
+        p.master_write(&[CTRL_D]);
+        p.master_write(b"def\n");
+        assert_eq!(slave_reads(&p), vec!["abc", "def\n"]);
+    }
+
+    #[test]
+    fn two_lines_cut_short_by_veof_each_come_back_on_their_own() {
+        let p = pty();
+        for line in [&b"one"[..], &b"two"[..], &b"three"[..]] {
+            p.master_write(line);
+            p.master_write(&[CTRL_D]);
+        }
+        assert_eq!(slave_reads(&p), vec!["one", "two", "three"]);
+    }
+
+    #[test]
+    fn a_read_that_fills_its_buffer_exactly_at_the_boundary_does_not_come_back_empty() {
+        let p = pty();
+        p.master_write(b"abc");
+        p.master_write(&[CTRL_D]);
+        p.master_write(b"de\n");
+        // A three-byte buffer takes the whole first line and stops at the
+        // boundary without having looked at it, so the next read must not
+        // spend its turn on the leftover mark.
+        let mut buf = [0u8; 3];
+        assert_eq!(p.slave_read(&mut buf).unwrap(), 3);
+        assert_eq!(&buf[..], b"abc");
+        assert_eq!(p.slave_read(&mut buf).unwrap(), 3);
+        assert_eq!(&buf[..], b"de\n");
+    }
+
+    #[test]
+    fn a_flush_takes_the_boundaries_with_it() {
+        let p = pty();
+        p.master_write(b"abc");
+        p.master_write(&[CTRL_D]);
+        assert_eq!(p.ioctl(TCFLSH as u32, 0, false), Ok(0));
+        assert!(p.inner.lock().eof_marks.is_empty());
+        // And the position the flush skipped past may not be mistaken for a
+        // boundary by whatever is typed next.
+        p.master_write(b"xyz\n");
+        assert_eq!(slave_reads(&p), vec!["xyz\n"]);
     }
 
     #[test]
