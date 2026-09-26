@@ -127,11 +127,23 @@ impl SignalStack {
     }
 
     /// What `sigaltstack(2)` refuses, in Linux's order: unknown flags
-    /// (`EINVAL`), then, when the call installs rather than disables a
-    /// stack, one smaller than `MINSIGSTKSZ` (`ENOMEM`). `SS_ONSTACK` is
-    /// accepted as a mode for compatibility, as `do_sigaltstack` does.
+    /// (`EINVAL`), then a mode that is not one of `0`, `SS_ONSTACK` or
+    /// `SS_DISABLE` (`EINVAL` too: `do_sigaltstack` reads `ss_flags` with
+    /// `SS_AUTODISARM` masked off as a small enum, and `SS_ONSTACK |
+    /// SS_DISABLE` is the value 3, which names nothing), then, when the call
+    /// installs rather than disables a stack, one smaller than `MINSIGSTKSZ`
+    /// (`ENOMEM`). `SS_ONSTACK` is accepted as a mode for compatibility, as
+    /// `do_sigaltstack` does.
+    ///
+    /// The mode went unchecked, so `SS_ONSTACK | SS_DISABLE` was accepted and
+    /// stored as a disabled stack, where Linux refuses the call and keeps the
+    /// stack the thread had.
     pub fn validate(&self) -> LxResult<()> {
         if !VALID_SIGSTACK_FLAGS.contains(self.flags) {
+            return Err(LxError::EINVAL);
+        }
+        let mode = self.flags - SignalStackFlags::AUTODISARM;
+        if mode == SignalStackFlags::ONSTACK | SignalStackFlags::DISABLE {
             return Err(LxError::EINVAL);
         }
         if !self.flags.contains(SignalStackFlags::DISABLE) && self.size < MIN_SIGSTACK_SIZE {
@@ -666,6 +678,32 @@ mod sigaltstack_tests {
             .validate(),
             Err(LxError::EINVAL)
         );
+    }
+
+    /// `ss_flags & ~SS_AUTODISARM` is a mode, not a bitmask: `0`,
+    /// `SS_ONSTACK` or `SS_DISABLE`. Both bits at once is the value 3, and
+    /// `do_sigaltstack` answers `EINVAL` (with or without `SS_AUTODISARM` on
+    /// top) rather than treating it as a disable.
+    #[test]
+    fn ss_onstack_and_ss_disable_together_are_not_a_mode() {
+        let both = SignalStackFlags::ONSTACK | SignalStackFlags::DISABLE;
+        let mut alt = alt();
+        alt.flags = both;
+        assert_eq!(alt.validate(), Err(LxError::EINVAL));
+        alt.flags = both | SignalStackFlags::AUTODISARM;
+        assert_eq!(alt.validate(), Err(LxError::EINVAL));
+        // Each of them alone, with and without the auto-disarm bit, stays
+        // a mode the call takes.
+        for mode in [
+            SignalStackFlags::empty(),
+            SignalStackFlags::ONSTACK,
+            SignalStackFlags::DISABLE,
+        ] {
+            alt.flags = mode;
+            assert_eq!(alt.validate(), Ok(()), "{:?}", mode);
+            alt.flags = mode | SignalStackFlags::AUTODISARM;
+            assert_eq!(alt.validate(), Ok(()), "{:?}", mode);
+        }
     }
 
     #[test]

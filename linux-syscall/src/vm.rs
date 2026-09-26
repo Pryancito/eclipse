@@ -162,6 +162,7 @@ impl Syscall<'_> {
     ) -> SysResult {
         let prot = MmapProt::from_bits_truncate(prot);
         let shared = mmap_shared(flags, flags & MMAP_ANONYMOUS != 0)?;
+        shared_validate_flags(flags)?;
         let flags = MmapFlags::from_bits_truncate(flags);
         info!(
             "mmap: addr={:#x}, size={:#x}, prot={:?}, flags={:?}, fd={:?}, offset={:#x}",
@@ -1201,6 +1202,65 @@ fn mmap_shared(flags: usize, anonymous: bool) -> LxResult<bool> {
         MAP_SHARED_VALIDATE if !anonymous => Ok(true),
         _ => Err(LxError::EINVAL),
     }
+}
+
+/// The flags `MAP_SHARED_VALIDATE` does not have to validate: Linux's
+/// `LEGACY_MAP_MASK`, the flag word as it stood before `MAP_SHARED_VALIDATE`
+/// existed. What is outside it (`MAP_SYNC`, `MAP_FIXED_NOREPLACE`, and every
+/// bit not yet given a meaning) is exactly what the kind exists to refuse.
+const LEGACY_MAP_MASK: usize = MAP_SHARED
+    | MAP_PRIVATE
+    | MAP_FIXED
+    | MMAP_ANONYMOUS
+    | MAP_DENYWRITE
+    | MAP_EXECUTABLE
+    | MAP_GROWSDOWN
+    | MAP_LOCKED
+    | MAP_NORESERVE
+    | MAP_POPULATE
+    | MAP_NONBLOCK
+    | MAP_STACK
+    | MAP_HUGETLB
+    | MAP_32BIT
+    | MAP_HUGE_2MB
+    | MAP_HUGE_1GB;
+const MAP_FIXED: usize = 0x10;
+const MAP_DENYWRITE: usize = 0x800;
+const MAP_EXECUTABLE: usize = 0x1000;
+const MAP_GROWSDOWN: usize = 0x100;
+const MAP_LOCKED: usize = 0x2000;
+const MAP_NORESERVE: usize = 0x4000;
+const MAP_POPULATE: usize = 0x8000;
+const MAP_NONBLOCK: usize = 0x10000;
+const MAP_STACK: usize = 0x20000;
+const MAP_HUGETLB: usize = 0x40000;
+/// `MAP_32BIT` exists on x86_64 only; elsewhere `<linux/mman.h>` defines it
+/// as 0 for this mask, so bit 6 is an unknown flag there.
+#[cfg(target_arch = "x86_64")]
+const MAP_32BIT: usize = 0x40;
+#[cfg(not(target_arch = "x86_64"))]
+const MAP_32BIT: usize = 0;
+const MAP_HUGE_2MB: usize = 21 << 26;
+const MAP_HUGE_1GB: usize = 30 << 26;
+
+/// `do_mmap`'s `MAP_SHARED_VALIDATE` arm: `flags & ~LEGACY_MAP_MASK` is
+/// `EOPNOTSUPP`. That answer is the whole point of the kind. A program asks
+/// for `MAP_SHARED_VALIDATE | MAP_SYNC` precisely so that a kernel which
+/// does not know `MAP_SYNC` (or the file's backing store does not support
+/// it) refuses instead of quietly handing back a mapping without the
+/// guarantee: with plain `MAP_SHARED` unknown bits are ignored, and the
+/// caller cannot tell.
+///
+/// The kind was accepted as a plain `MAP_SHARED` and the rest of the word
+/// never looked at, so PMDK, the DAX users and `MAP_SYNC` probes got a
+/// mapping without the persistence they were validating for, and a
+/// `MAP_SHARED_VALIDATE | MAP_FIXED_NOREPLACE` got the placement where
+/// Linux says the combination is unsupported.
+fn shared_validate_flags(flags: usize) -> LxResult<()> {
+    if flags & MAP_TYPE == MAP_SHARED_VALIDATE && flags & !LEGACY_MAP_MASK != 0 {
+        return Err(LxError::EOPNOTSUPP);
+    }
+    Ok(())
 }
 
 /// `do_mmap`'s check of the descriptor's open mode against the mapping
@@ -2392,6 +2452,55 @@ mod mmap_flag_tests {
     fn shared_validate_is_a_file_mapping_answer_only() {
         assert_eq!(mmap_shared(MAP_SHARED_VALIDATE, false), Ok(true));
         assert_eq!(mmap_shared(MAP_SHARED_VALIDATE, true), Err(LxError::EINVAL));
+    }
+
+    /// `MAP_SHARED_VALIDATE` validates: a flag outside `LEGACY_MAP_MASK`
+    /// (`MAP_SYNC`, `MAP_FIXED_NOREPLACE`, a bit nobody has defined) is
+    /// `EOPNOTSUPP`, which is the answer the kind exists to give and the one
+    /// a `MAP_SYNC` probe reads to learn the mapping would not be what it
+    /// asked for.
+    #[test]
+    fn shared_validate_refuses_the_flags_it_does_not_know() {
+        const MAP_SYNC: usize = 0x80000;
+        const MAP_FIXED_NOREPLACE: usize = 0x100000;
+        for unknown in [MAP_SYNC, MAP_FIXED_NOREPLACE, 1 << 25] {
+            assert_eq!(
+                shared_validate_flags(MAP_SHARED_VALIDATE | unknown),
+                Err(LxError::EOPNOTSUPP),
+                "{:#x}",
+                unknown
+            );
+            // Plain MAP_SHARED and MAP_PRIVATE ignore the same bits, as they
+            // always did: only the validating kind looks.
+            assert_eq!(shared_validate_flags(MAP_SHARED | unknown), Ok(()));
+            assert_eq!(shared_validate_flags(MAP_PRIVATE | unknown), Ok(()));
+        }
+    }
+
+    /// The legacy flag word passes under `MAP_SHARED_VALIDATE` whole: the
+    /// kind must not turn an ordinary `MAP_SHARED|MAP_FIXED|MAP_POPULATE`
+    /// into `EOPNOTSUPP`, or the programs that validate get nothing at all.
+    #[test]
+    fn shared_validate_takes_the_whole_legacy_word() {
+        assert_eq!(shared_validate_flags(MAP_SHARED_VALIDATE), Ok(()));
+        assert_eq!(
+            shared_validate_flags(MAP_SHARED_VALIDATE | LEGACY_MAP_MASK),
+            Ok(())
+        );
+        for legacy in [
+            MAP_FIXED,
+            MAP_POPULATE,
+            MAP_NORESERVE,
+            MAP_HUGETLB | MAP_HUGE_2MB,
+            MAP_LOCKED | MAP_STACK,
+        ] {
+            assert_eq!(
+                shared_validate_flags(MAP_SHARED_VALIDATE | legacy),
+                Ok(()),
+                "{:#x}",
+                legacy
+            );
+        }
     }
 
     /// A kind in the low four bits that names nothing is `EINVAL`, not
