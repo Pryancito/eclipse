@@ -50,6 +50,18 @@ impl VirtIOBlk<'_> {
         self.header.ack_interrupt()
     }
 
+    /// The size of the disk, in 512-byte sectors.
+    ///
+    /// Read once, during initialisation, from the config space -- which is the
+    /// only time it is valid to read: before `begin_init` the device has not
+    /// been acknowledged, and a caller that reads the window itself has to
+    /// dereference it as a plain `u64`, without the `Volatile` the register
+    /// deserves. `zcore-drivers` used to do exactly that, from a raw pointer,
+    /// before this driver had even initialised the device.
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
     /// Read a block.
     pub fn read_block(&mut self, block_id: usize, buf: &mut [u8]) -> Result {
         assert_eq!(buf.len(), BLK_SIZE);
@@ -205,3 +217,192 @@ bitflags! {
 
 unsafe impl AsBuf for BlkReq {}
 unsafe impl AsBuf for BlkResp {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_dev::{fake_header, set_config_u64, Disk, Ring};
+    use core::convert::TryInto;
+    use std::sync::Arc;
+
+    /// A driver talking to a disk of `sectors` sectors, with the device served
+    /// on its own thread: `read_block` spins on `can_pop`, so nothing can
+    /// answer it from the calling thread.
+    struct Attached {
+        blk: VirtIOBlk<'static>,
+        disk: Arc<Disk>,
+        device: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl Attached {
+        fn of(sectors: usize) -> Self {
+            let header = fake_header(2, 256);
+            set_config_u64(header, sectors as u64);
+            let blk = VirtIOBlk::new(header).expect("the driver refused the device");
+            let ring = Ring::of(blk.header, 0, 16);
+            let disk = Disk::of(sectors);
+            let served = disk.clone();
+            let device = std::thread::spawn(move || served.serve(ring));
+            Attached {
+                blk,
+                disk,
+                device: Some(device),
+            }
+        }
+    }
+
+    impl Drop for Attached {
+        fn drop(&mut self) {
+            self.disk.stop();
+            if let Some(device) = self.device.take() {
+                let _ = device.join();
+            }
+        }
+    }
+
+    /// Run `body` with a deadline: a driver waiting on a device that will not
+    /// answer spins for ever, and a test that hangs says nothing.
+    fn within(what: &'static str, secs: u64, body: impl FnOnce() + Send + 'static) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            body();
+            let _ = tx.send(());
+        });
+        match rx.recv_timeout(core::time::Duration::from_secs(secs)) {
+            Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                handle.join().expect("the body of the test failed");
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                panic!(
+                    "{} never returned: the driver is waiting on the device",
+                    what
+                )
+            }
+        }
+    }
+
+    #[test]
+    fn the_capacity_comes_from_the_config_space() {
+        let header = fake_header(2, 256);
+        set_config_u64(header, 2048);
+        let blk = VirtIOBlk::new(header).unwrap();
+        assert_eq!(blk.capacity(), 2048);
+    }
+
+    #[test]
+    fn a_read_brings_back_the_sector_that_was_asked_for() {
+        within("a read of sector 7", 20, || {
+            let mut attached = Attached::of(64);
+            let mut buf = [0u8; 512];
+            attached.blk.read_block(7, &mut buf).unwrap();
+            assert_eq!(&buf[..], &attached.disk.sector(7)[..]);
+            assert_eq!(u32::from_le_bytes(buf[0..4].try_into().unwrap()), 7);
+        });
+    }
+
+    #[test]
+    fn a_write_lands_on_the_sector_that_was_asked_for() {
+        within("a write of sector 3", 20, || {
+            let mut attached = Attached::of(64);
+            let mut buf = [0u8; 512];
+            buf[..5].copy_from_slice(b"hello");
+            attached.blk.write_block(3, &buf).unwrap();
+            assert_eq!(&attached.disk.sector(3)[..5], b"hello");
+            // and its neighbours are untouched
+            assert_eq!(
+                u32::from_le_bytes(attached.disk.sector(4)[0..4].try_into().unwrap()),
+                4
+            );
+        });
+    }
+
+    #[test]
+    fn a_write_then_a_read_of_the_same_sector_agree() {
+        within("a write followed by a read", 20, || {
+            let mut attached = Attached::of(8);
+            let mut written = [0u8; 512];
+            for (i, byte) in written.iter_mut().enumerate() {
+                *byte = (i % 251) as u8;
+            }
+            attached.blk.write_block(5, &written).unwrap();
+            let mut read = [0u8; 512];
+            attached.blk.read_block(5, &mut read).unwrap();
+            assert_eq!(&read[..], &written[..]);
+        });
+    }
+
+    #[test]
+    fn a_disk_that_reports_an_error_is_an_error_and_not_a_silent_short_read() {
+        within("a read of a failing disk", 20, || {
+            let mut attached = Attached::of(8);
+            attached
+                .disk
+                .fail
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            let mut buf = [0u8; 512];
+            assert_eq!(
+                attached.blk.read_block(0, &mut buf).err(),
+                Some(Error::IoError)
+            );
+        });
+    }
+
+    #[test]
+    fn the_queue_is_reusable_across_many_requests() {
+        // Each request takes three descriptors out of sixteen and hands them
+        // back, so the free list has to survive being walked over and over.
+        within("a hundred reads", 30, || {
+            let mut attached = Attached::of(16);
+            let mut buf = [0u8; 512];
+            for round in 0..100 {
+                let sector = round % 16;
+                attached.blk.read_block(sector, &mut buf).unwrap();
+                assert_eq!(
+                    u32::from_le_bytes(buf[0..4].try_into().unwrap()),
+                    sector as u32,
+                    "round {} read the wrong sector",
+                    round
+                );
+            }
+            assert_eq!(attached.disk.served(), 100);
+        });
+    }
+
+    #[test]
+    fn a_buffer_that_is_not_a_sector_is_refused_by_the_assert() {
+        // The driver asserts rather than returning an error, which is why the
+        // wrapper in `zcore-drivers` has to split a multi-sector request
+        // instead of forwarding it.
+        let header = fake_header(2, 256);
+        set_config_u64(header, 8);
+        let mut blk = VirtIOBlk::new(header).unwrap();
+        let mut buf = [0u8; 1024];
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = blk.read_block(0, &mut buf);
+        }));
+        assert!(panicked.is_err(), "a two-sector buffer was accepted");
+    }
+
+    #[test]
+    fn the_driver_finishes_telling_the_device_it_is_ready() {
+        let header = fake_header(2, 256);
+        set_config_u64(header, 8);
+        let blk = VirtIOBlk::new(header).unwrap();
+        assert_eq!(
+            blk.header.fake_status() & 4,
+            4,
+            "the device was never told the driver is ready"
+        );
+    }
+
+    #[test]
+    fn an_interrupt_is_acknowledged_once() {
+        let header = fake_header(2, 256);
+        set_config_u64(header, 8);
+        let mut blk = VirtIOBlk::new(header).unwrap();
+        assert!(!blk.ack_interrupt(), "an interrupt nobody raised");
+        blk.header.fake_raise_interrupt(1);
+        assert!(blk.ack_interrupt());
+        assert_eq!(blk.header.fake_interrupt_ack(), 1);
+    }
+}

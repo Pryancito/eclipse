@@ -24,6 +24,11 @@ members = [
     "vendor/rcore-fs-mountfs",
     "vendor/rcore-fs-ramfs",
     "vendor/rcore-fs-devfs",
+    # The virtio drivers: the disk, the GPU, the console and the input devices
+    # of every QEMU boot, this tree's copy of them. It was not a member and had
+    # no `[patch]` either, so `cargo` resolved `virtio-drivers` to the git rev
+    # in `drivers/Cargo.toml` and **nothing here ever built this directory**.
+    "vendor/virtio-drivers",
     "hunter",
 ]
 default-members = ["xtask"]
@@ -103,3 +108,11 @@ rcore-fs-sefs = { path = "vendor/rcore-fs-sefs" }
 
 [patch."https://github.com/rcore-os/rcore-console"]
 rcore-console = { path = "vendor/rcore-console" }
+
+# Without this the tree vendored the virtio drivers and then built the git rev
+# anyway: `Cargo.lock` resolved `virtio-drivers` to
+# `git+...?rev=2aaf7d6`, so `vendor/virtio-drivers` was a copy nothing
+# compiled. It had already drifted -- it carries a `VirtIOGpu::flush_region`
+# (damage-rectangle flush) that has never been built and has no caller.
+[patch."https://github.com/rcore-os/virtio-drivers"]
+virtio-drivers = { path = "vendor/virtio-drivers" }

@@ -70,7 +70,12 @@ jobs:
           # shadow framebuffer and their tests are all behind it, and without
           # it they are filtered out silently -- a green run that checked
           # nothing.
-          cargo test -p zcore-drivers --lib --features graphic -- --test-threads=1
+          # `virtio` is not optional either, and for a harder reason: it is
+          # the disk, the GPU, the console and the input devices of every QEMU
+          # boot -- every baremetal job in this file runs on them -- and with
+          # the feature off, `drivers/src/virtio/` (696 lines) was not compiled
+          # by anything, here or in `make clippy`.
+          cargo test -p zcore-drivers --lib --features graphic,virtio -- --test-threads=1
           cargo test -p linux-object --lib -- --test-threads=1
           # Three more crates whose unit tests `default-members` hid the same
           # way: the syscall entry points, the HAL (user-pointer copies, CPU
@@ -107,6 +112,15 @@ jobs:
           # is gated on `any(test, feature = "std")` but its `libc` dependency
           # only arrived with the feature, so the test target did not compile.
           cargo test -p rcore-fs --lib
+          # The virtio drivers themselves: the virtqueue every one of those
+          # devices talks through. The tree vendored them and then built the
+          # git revision anyway -- there was no `[patch]` for this one -- so
+          # `vendor/virtio-drivers` was a copy nothing compiled, let alone
+          # tested. The suite stands a device up out of ordinary memory: the
+          # header is a `#[repr(C)]` register map and the four `virtio_*`
+          # symbols are answered from a bump arena, so a read of a sector goes
+          # through the real ring and comes back.
+          cargo test -p virtio-drivers --lib -- --test-threads=1
           # The loader -- the code around user mode: the signal frame a
           # handler returns from, the CPU-exception-to-signal table. Its
           # default features pull in `zircon`, whose `include_bytes!` of the
