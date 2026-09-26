@@ -63,13 +63,73 @@ pub struct Executor {
     /// straight back onto the faulting instruction on a corrupt stack. This
     /// flag makes the runtime take the replace path instead.
     force_replace: AtomicBool,
-    /// [null-exec guard] Resume-ownership latch: 0 = parked/idle, `cpu+1` =
-    /// the CPU currently standing on this executor's stack. The runtime CAS-es
-    /// it before every `switch` INTO the executor and releases it only after
-    /// control is back on the runtime stack (the executor's frame saved and
-    /// parked). A second resumer — the double-consume that pops a dead frame's
-    /// zeros as `ret`/`cr3` — fails the CAS and is reported instead of run.
-    resume_owner: core::sync::atomic::AtomicUsize,
+    /// [null-exec guard] Resume-ownership latch. See [`ResumeClaim`].
+    resume_claim: ResumeClaim,
+}
+
+/// [null-exec guard] The exclusive right to stand on one executor's stack.
+///
+/// The runtime claims it before every `switch` INTO the executor and releases
+/// it only once control is back on the runtime stack, with the executor's frame
+/// saved and parked. A second resumer is the double-consume that pops a dead
+/// frame's zeros as `ret`/`cr3`, so it must fail and be reported, never run.
+///
+/// `0` means parked, and a holder is stored as **`cpu + 1`**. The bias is not
+/// cosmetic: `Drop` reads this latch to decide whether a CPU is still standing
+/// on the stack, and leaks the block if one is. Storing the raw id would make
+/// **CPU 0** — the BSP, the CPU that runs almost everything — indistinguishable
+/// from parked, so dropping an executor CPU 0 was executing on would hand its
+/// block back to the buddy heap: the `[double-alloc]` that lets a later
+/// `Vec`/`Box` land on a live coroutine stack and zero its saved return slots.
+///
+/// Split out of `Executor` so the rules below can be tested without allocating
+/// a multi-MiB stack, which is the only reason they had no tests at all.
+pub(crate) struct ResumeClaim(core::sync::atomic::AtomicUsize);
+
+/// The latch value that means "nobody is standing on this stack".
+const PARKED: usize = 0;
+
+impl ResumeClaim {
+    pub(crate) const fn new() -> Self {
+        Self(core::sync::atomic::AtomicUsize::new(PARKED))
+    }
+
+    /// Claim the stack for `cpu`. `Err(holder)` names the CPU that already has
+    /// it — including `cpu` itself, because coming back round to an executor
+    /// this CPU is already standing on is not re-entrancy to allow, it is the
+    /// same double-consume seen from one CPU. The caller must NOT switch in.
+    pub(crate) fn try_claim(&self, cpu: usize) -> Result<(), usize> {
+        use core::sync::atomic::Ordering::{AcqRel, Acquire};
+        match self.0.compare_exchange(PARKED, cpu + 1, AcqRel, Acquire) {
+            Ok(_) => Ok(()),
+            Err(holder) => Err(holder - 1),
+        }
+    }
+
+    /// Release the claim `cpu` holds. `Err(holder)` means the latch did not name
+    /// `cpu`: either nobody held it, or another CPU did.
+    ///
+    /// The latch is cleared either way, on purpose. Refusing to clear would
+    /// leave the executor unresumable for the rest of the boot, which is worse
+    /// than the bookkeeping slip being reported — and this is a guard whose job
+    /// is to *name* what went wrong, not to add a second way to wedge.
+    pub(crate) fn release_by(&self, cpu: usize) -> Result<(), Option<usize>> {
+        let held = self.0.swap(PARKED, core::sync::atomic::Ordering::AcqRel);
+        match held {
+            PARKED => Err(None),
+            h if h - 1 == cpu => Ok(()),
+            h => Err(Some(h - 1)),
+        }
+    }
+
+    /// The CPU standing on this stack, if any. Read by `Drop` to decide whether
+    /// the block may be recycled.
+    pub(crate) fn holder(&self) -> Option<usize> {
+        match self.0.load(core::sync::atomic::Ordering::Acquire) {
+            PARKED => None,
+            h => Some(h - 1),
+        }
+    }
 }
 
 /// Idle-loop iterations since any task was last polled (hang detector; see the
@@ -1008,7 +1068,7 @@ impl Executor {
             current_waker: core::ptr::null(),
             abandoned: AtomicBool::new(false),
             force_replace: AtomicBool::new(false),
-            resume_owner: core::sync::atomic::AtomicUsize::new(0),
+            resume_claim: ResumeClaim::new(),
         }));
 
         pin_executor.init_stack_and_context();
@@ -1370,22 +1430,43 @@ impl Executor {
     /// now would be the double-consume that pops a dead frame (`ret` to 0 /
     /// `cr3` garbage). The caller must NOT switch in on failure.
     pub fn try_claim_resume(&self, cpu: usize) -> Result<(), usize> {
-        use core::sync::atomic::Ordering::{AcqRel, Acquire};
-        match self
-            .resume_owner
-            .compare_exchange(0, cpu + 1, AcqRel, Acquire)
-        {
-            Ok(_) => Ok(()),
-            Err(holder) => Err(holder.wrapping_sub(1)),
-        }
+        self.resume_claim.try_claim(cpu)
     }
 
-    /// Release the resume claim. Only call once control is back OFF this
-    /// executor's stack (its context frame saved and parked) — releasing while
-    /// still standing on it re-opens the double-resume window this closes.
-    pub fn release_resume(&self) {
-        self.resume_owner
-            .store(0, core::sync::atomic::Ordering::Release);
+    /// Release the resume claim `cpu` holds. Only call once control is back OFF
+    /// this executor's stack (its context frame saved and parked) — releasing
+    /// while still standing on it re-opens the double-resume window this closes.
+    ///
+    /// Takes the CPU so a release by anyone but the holder is *seen*. It used to
+    /// take nothing and clear unconditionally, which made the latch a guard
+    /// anybody could switch off: a caller releasing a claim it never made left
+    /// the stack open to a second resumer with nothing said. The clear still
+    /// happens either way (see [`ResumeClaim::release_by`]).
+    pub fn release_resume(&self, cpu: usize) {
+        if let Err(held) = self.resume_claim.release_by(cpu) {
+            use core::sync::atomic::{AtomicUsize, Ordering};
+            static SLIPS: AtomicUsize = AtomicUsize::new(0);
+            let n = SLIPS.fetch_add(1, Ordering::Relaxed);
+            if n < 16 {
+                match held {
+                    Some(holder) => error!(
+                        "[resume-claim] executor id={} released by CPU{} but claimed by CPU{} \
+                         (report {}/16)",
+                        self.id(),
+                        cpu,
+                        holder,
+                        n + 1
+                    ),
+                    None => error!(
+                        "[resume-claim] executor id={} released by CPU{} but nobody claimed it \
+                         (report {}/16)",
+                        self.id(),
+                        cpu,
+                        n + 1
+                    ),
+                }
+            }
+        }
     }
 
     /// Retire the task this executor is polling and mark the executor dead.
@@ -1512,7 +1593,7 @@ impl Drop for Executor {
         let alloc_base = self.stack_base - GUARD_SIZE;
 
         // [null-exec root guard] Never free or reuse a stack a CPU is still
-        // standing on. `resume_owner` is 0 only once control is OFF this
+        // standing on. The claim is parked only once control is OFF this
         // executor's stack (its frame parked and `release_resume` called). If
         // it is non-zero at Drop, some CPU claimed this executor and is
         // executing on (or switching into) its stack RIGHT NOW — returning that
@@ -1527,9 +1608,7 @@ impl Drop for Executor {
         // cost next to heap corruption and an unrecoverable crash loop. The log
         // names the still-standing CPU so the remaining lifetime race can be
         // traced to where an executor is dropped while claimed.
-        let owner = self
-            .resume_owner
-            .load(core::sync::atomic::Ordering::Acquire);
+        let owner = self.resume_claim.holder().map(|cpu| cpu + 1).unwrap_or(0);
         if owner != 0 {
             use core::sync::atomic::{AtomicUsize, Ordering};
             static LEAKED: AtomicUsize = AtomicUsize::new(0);
@@ -1624,6 +1703,139 @@ pub unsafe fn push_stack<T>(stack_top: usize, val: T) -> usize {
 /// needs a real coroutine stack; the decisions live in
 /// [`retire_stack_after_grace`] and [`observe_cpu_quiescent_locked`], and they
 /// are what is exercised here. They share the module's globals, so they lock.
+#[cfg(test)]
+mod resume_claim_tests {
+    use super::ResumeClaim;
+
+    /// The BSP. Written as a literal on purpose: this is the id the bias exists
+    /// for, and naming a constant would let the constant move with a mutation.
+    const BSP: usize = 0;
+
+    #[test]
+    fn a_parked_stack_names_nobody() {
+        let claim = ResumeClaim::new();
+        assert_eq!(claim.holder(), None);
+    }
+
+    #[test]
+    fn the_first_cpu_to_ask_gets_the_stack() {
+        let claim = ResumeClaim::new();
+        assert_eq!(claim.try_claim(3), Ok(()));
+        assert_eq!(claim.holder(), Some(3));
+    }
+
+    #[test]
+    fn a_second_cpu_is_refused_and_told_who_has_it() {
+        let claim = ResumeClaim::new();
+        assert_eq!(claim.try_claim(2), Ok(()));
+        assert_eq!(
+            claim.try_claim(5),
+            Err(2),
+            "a refused resumer has to name the holder: that report is the only \
+             thing that turns a double-consume into a diagnosable event"
+        );
+        assert_eq!(claim.holder(), Some(2), "and the refusal changed nothing");
+    }
+
+    #[test]
+    fn the_cpu_that_already_holds_it_is_refused_too() {
+        let claim = ResumeClaim::new();
+        assert_eq!(claim.try_claim(4), Ok(()));
+        assert_eq!(
+            claim.try_claim(4),
+            Err(4),
+            "coming back round to a stack this CPU is already standing on is \
+             not re-entrancy to allow, it is the same double-consume from one CPU"
+        );
+    }
+
+    /// The rule the whole `cpu + 1` bias exists for. `Drop` decides whether a
+    /// block may go back to the heap by asking [`ResumeClaim::holder`], so a
+    /// latch that stored the raw id would report the BSP as parked — and the
+    /// BSP is the CPU that runs almost everything.
+    #[test]
+    fn a_stack_the_first_cpu_stands_on_does_not_read_as_parked() {
+        let claim = ResumeClaim::new();
+        assert_eq!(claim.try_claim(BSP), Ok(()));
+        assert_eq!(claim.holder(), Some(BSP));
+        assert_ne!(
+            claim.holder(),
+            None,
+            "storing the raw cpu id makes CPU 0 look parked, and Drop then hands \
+             a block back to the buddy heap with a CPU still executing on it"
+        );
+        assert_eq!(claim.try_claim(1), Err(BSP), "and it still excludes others");
+    }
+
+    #[test]
+    fn a_released_stack_is_free_for_anyone() {
+        let claim = ResumeClaim::new();
+        assert_eq!(claim.try_claim(1), Ok(()));
+        assert_eq!(claim.release_by(1), Ok(()));
+        assert_eq!(claim.holder(), None);
+        assert_eq!(claim.try_claim(7), Ok(()), "including a different CPU");
+        assert_eq!(claim.holder(), Some(7));
+    }
+
+    #[test]
+    fn releasing_a_stack_another_cpu_holds_is_reported() {
+        let claim = ResumeClaim::new();
+        assert_eq!(claim.try_claim(2), Ok(()));
+        assert_eq!(
+            claim.release_by(6),
+            Err(Some(2)),
+            "a guard anybody can switch off is not a guard: the slip has to be \
+             named, and it has to name the CPU whose claim was thrown away"
+        );
+    }
+
+    #[test]
+    fn releasing_a_stack_nobody_holds_is_reported_as_nobody() {
+        let claim = ResumeClaim::new();
+        assert_eq!(claim.release_by(1), Err(None));
+    }
+
+    /// Reported, and cleared anyway. Refusing to clear would leave the executor
+    /// unresumable for the rest of the boot: a second way to wedge, added by the
+    /// guard that exists to stop one.
+    #[test]
+    fn a_release_that_was_reported_still_parks_the_stack() {
+        let claim = ResumeClaim::new();
+        assert_eq!(claim.try_claim(2), Ok(()));
+        assert!(claim.release_by(6).is_err());
+        assert_eq!(claim.holder(), None);
+        assert_eq!(claim.try_claim(9), Ok(()));
+    }
+
+    #[test]
+    fn two_cpus_asking_at_once_leave_exactly_one_standing_on_the_stack() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static WON: AtomicUsize = AtomicUsize::new(0);
+        WON.store(0, Ordering::SeqCst);
+        static CLAIM: ResumeClaim = ResumeClaim::new();
+
+        let peer = std::thread::spawn(|| {
+            if CLAIM.try_claim(1).is_ok() {
+                WON.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+        if CLAIM.try_claim(0).is_ok() {
+            WON.fetch_add(1, Ordering::SeqCst);
+        }
+        peer.join().unwrap();
+        assert_eq!(
+            WON.load(Ordering::SeqCst),
+            1,
+            "both CPUs were handed the same parked frame"
+        );
+        assert!(claimed_by_one_of(&CLAIM, 0, 1));
+    }
+
+    fn claimed_by_one_of(claim: &ResumeClaim, a: usize, b: usize) -> bool {
+        matches!(claim.holder(), Some(h) if h == a || h == b)
+    }
+}
+
 #[cfg(test)]
 mod grace_period_tests {
     use super::*;

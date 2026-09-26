@@ -1001,7 +1001,7 @@ pub fn run_until_idle() -> bool {
         // frame: validate before the switch, replace the executor instead of
         // resuming garbage.
         if !executor_frame_resumable(&runtime.strong_executor) {
-            runtime.strong_executor.release_resume();
+            runtime.strong_executor.release_resume(cpu);
             runtime.strong_executor = Arc::new(Executor::new(runtime.task_collection.clone()));
             drop(runtime);
             continue;
@@ -1020,7 +1020,7 @@ pub fn run_until_idle() -> bool {
         // (the switch out of it completed before control got back here). Also
         // covers the abandon paths, which restore this same runtime frame.
         if let Some(ex) = runtime.current_executor.take() {
-            ex.release_resume();
+            ex.release_resume(cpu);
         }
         crate::executor::note_cpu_quiescent(cpu);
         report_switch_bounce_if_any();
@@ -1057,7 +1057,7 @@ pub fn run_until_idle() -> bool {
                 // is retired (abandoned -> killed() -> retained away next
                 // pass), never resumed. Bounded leak, machine keeps running.
                 if !executor_frame_resumable(executor) {
-                    executor.release_resume();
+                    executor.release_resume(cpu);
                     executor.force_replace_executor();
                     continue;
                 }
@@ -1069,7 +1069,7 @@ pub fn run_until_idle() -> bool {
                 switch(runtime_cx as _, executor_ctx as _);
                 runtime = get_current_runtime();
                 if let Some(ex) = runtime.current_executor.take() {
-                    ex.release_resume();
+                    ex.release_resume(cpu);
                 }
                 crate::executor::note_cpu_quiescent(cpu);
                 report_switch_bounce_if_any();
