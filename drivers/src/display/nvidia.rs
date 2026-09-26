@@ -3834,6 +3834,25 @@ fn user_slice_ok<T>(ptr: u64, count: u32) -> bool {
     }
 }
 
+/// A CPU wait `syncobj::wait` reported satisfied, but only because a fence
+/// behind it TIMED OUT: the release the client waited for never happened.
+/// EXEC's contract for a wait that never arrives is EIO (NVK: device lost),
+/// and syncobj's fence timeout and EXEC's own deadline are the same 10 s,
+/// so without this the answer was whichever clock ticked first -- one
+/// extra read of the clock (a QUERY between the submit and the EXEC) turned
+/// the EIO into a push behind a buffer nobody had let go of.
+fn exec_wait_reached_by_timeout(handles: &[u32], points: &[u64], owner_pid: u64) -> bool {
+    if handles.is_empty() || !crate::scheme::syncobj::reached_by_timeout(handles, Some(points)) {
+        return false;
+    }
+    crate::klog_warn!(
+        "[nouveau-uapi] EXEC: a wait syncobj was reached only by a fence that TIMED OUT -- NOT submitting (EIO -> NVK device-lost) pid={}:{} (handle:target/current)",
+        owner_pid,
+        crate::scheme::syncobj::describe(handles, Some(points))
+    );
+    true
+}
+
 impl DrmScheme for NvidiaGpu {
     fn pci_bdf(&self) -> Option<(u32, u8, u8, u8)> {
         // RM only ever drives function 0 of the GPU (see `cfg_loc`).
@@ -12253,7 +12272,11 @@ impl NvidiaGpu {
                                     true,
                                     deadline_us,
                                 ) {
-                                    crate::scheme::syncobj::WaitOutcome::Signaled { .. } => {}
+                                    crate::scheme::syncobj::WaitOutcome::Signaled { .. } => {
+                                        if exec_wait_reached_by_timeout(&cpu_h, &cpu_p, owner_pid) {
+                                            return Err(nv::EIO);
+                                        }
+                                    }
                                     crate::scheme::syncobj::WaitOutcome::Timeout => {
                                         crate::klog_warn!(
                                             "[nouveau-uapi] EXEC(empty): {} wait syncobj(s) still unsignaled after {}us -- not signaling its sig list (EIO) pid={}:{}",
@@ -12306,7 +12329,11 @@ impl NvidiaGpu {
                             true,
                             deadline_us,
                         ) {
-                            crate::scheme::syncobj::WaitOutcome::Signaled { .. } => {}
+                            crate::scheme::syncobj::WaitOutcome::Signaled { .. } => {
+                                if exec_wait_reached_by_timeout(&handles, &points, owner_pid) {
+                                    return Err(nv::EIO);
+                                }
+                            }
                             crate::scheme::syncobj::WaitOutcome::Timeout => {
                                 crate::klog_warn!(
                                     "[nouveau-uapi] EXEC(empty): {} wait syncobj(s) still unsignaled after {}us -- not signaling its sig list (EIO) pid={}:{}",
@@ -12519,6 +12546,9 @@ impl NvidiaGpu {
                     );
                     match outcome {
                         crate::scheme::syncobj::WaitOutcome::Signaled { .. } => {
+                            if exec_wait_reached_by_timeout(&wait_h, &wait_p, owner_pid) {
+                                return Err(nv::EIO);
+                            }
                             log::info!(
                                 "[nouveau-uapi] EXEC: {} wait(s) ok ({} hw-acquire, {} cpu) -- proceeding to submit",
                                 req.wait_count,
@@ -17799,6 +17829,188 @@ mod nouveau_bookkeeping_tests {
         assert_eq!(syncobj::query(out), Some(1));
         assert!(syncobj::destroy(out));
         gpu.nouveau_release_process(A);
+        assert_eq!(FAKE_RM.lock().bad, 0);
+    }
+
+    /// A fence that never lands is given up on after `FENCE_TIMEOUT_US`:
+    /// syncobj advances the point so its CPU waiters do not park forever.
+    /// EXEC's contract on a wait that never arrives is EIO (NVK: device
+    /// lost), and that deadline is the same 10 s -- so whether the client's
+    /// push was refused or SUBMITTED behind a release that never happened
+    /// depended on which of the two clocks ticked first, i.e. on one extra
+    /// read of the clock, such as a QUERY between the submit and the EXEC.
+    #[test]
+    fn an_exec_wait_reached_only_by_a_timed_out_fence_is_eio_whichever_clock_ticks_first() {
+        let _g = LOCK.lock();
+        let _live = LiveBytes::hold();
+        let gpu = gpu_rm_fast();
+        let ch_a = client_with_pushbuf(&gpu, A);
+        let ch_b = client_with_pushbuf(&gpu, B);
+        // The plain case first: A's fence timed out long ago. Userspace's
+        // QUERY reads it as reached (Linux: a signaled fence, error and all).
+        let rel = syncobj::create(false);
+        assert_eq!(
+            exec(&gpu, A, ch_a, &[push(PUSH_VA, 16)], &[], &[sync(rel)]),
+            Ok(0)
+        );
+        test_clock::advance(syncobj::FENCE_TIMEOUT_US + 1);
+        assert_eq!(syncobj::query(rel), Some(1));
+        let out = syncobj::create(false);
+        assert_eq!(
+            exec(
+                &gpu,
+                B,
+                ch_b,
+                &[push(PUSH_VA, 16)],
+                &[sync(rel)],
+                &[sync(out)]
+            ),
+            Err(nv::EIO),
+            "the release never happened: not submitting"
+        );
+        assert!(
+            !has_chan(2),
+            "nothing on B's ring: it was never even prepared"
+        );
+        assert_eq!(syncobj::query(out), Some(0));
+        // The same through a merge whose other half is genuine.
+        let ok = syncobj::create(false);
+        assert_eq!(
+            exec(&gpu, B, ch_b, &[push(PUSH_VA, 16)], &[], &[sync(ok)]),
+            Ok(0)
+        );
+        assert_eq!(run_gpu(2).len(), 2);
+        let b = chan(2);
+        assert_eq!(userd(&b), (2, 2));
+        assert_eq!(syncobj::query(ok), Some(1));
+        let merged = syncobj::merge_fences(&[(rel, 1), (ok, 1)]);
+        assert_eq!(syncobj::query(merged), Some(1));
+        assert_eq!(
+            exec(
+                &gpu,
+                B,
+                ch_b,
+                &[push(PUSH_VA, 16)],
+                &[sync(merged)],
+                &[sync(out)]
+            ),
+            Err(nv::EIO)
+        );
+        assert_eq!(userd(&b), (2, 2));
+        // And the health probe: it signals nothing on a wait that died.
+        assert_eq!(
+            exec(&gpu, B, ch_b, &[], &[sync(rel)], &[sync(out)]),
+            Err(nv::EIO)
+        );
+        assert_eq!(syncobj::query(out), Some(0));
+        // The probe with a half the GPU could ACQUIRE (B's own fence in
+        // flight): the dead half still decides, before anything is queued.
+        let ok2 = syncobj::create(false);
+        assert_eq!(
+            exec(&gpu, B, ch_b, &[push(PUSH_VA, 16)], &[], &[sync(ok2)]),
+            Ok(0)
+        );
+        assert_eq!(userd(&b), (2, 4));
+        assert_eq!(
+            exec(&gpu, B, ch_b, &[], &[sync(ok2), sync(rel)], &[sync(out)]),
+            Err(nv::EIO)
+        );
+        assert_eq!(
+            userd(&b),
+            (2, 4),
+            "no acquire and no fence went onto the ring"
+        );
+        assert_eq!(syncobj::query(out), Some(0));
+        assert_eq!(run_gpu(2).len(), 2);
+        assert_eq!(syncobj::query(ok2), Some(1));
+        // A point reached for real before the one that timed out stays good:
+        // 1 landed, 2 never did.
+        let tl = syncobj::create(false);
+        assert_eq!(
+            exec(&gpu, A, ch_a, &[push(PUSH_VA, 16)], &[], &[sync_tl(tl, 1)]),
+            Ok(0)
+        );
+        assert_eq!(run_gpu(1).len(), 4, "A's two submits land");
+        assert_eq!(syncobj::query(tl), Some(1));
+        assert_eq!(
+            exec(&gpu, A, ch_a, &[push(PUSH_VA, 16)], &[], &[sync_tl(tl, 2)]),
+            Ok(0)
+        );
+        test_clock::advance(syncobj::FENCE_TIMEOUT_US + 1);
+        assert_eq!(syncobj::query(tl), Some(2));
+        assert_eq!(
+            exec(
+                &gpu,
+                B,
+                ch_b,
+                &[push(PUSH_VA, 16)],
+                &[sync_tl(tl, 1)],
+                &[sync(out)]
+            ),
+            Ok(0),
+            "point 1 was the GPU's word"
+        );
+        assert_eq!(userd(&b), (4, 6));
+        assert_eq!(
+            exec(
+                &gpu,
+                B,
+                ch_b,
+                &[push(PUSH_VA, 16)],
+                &[sync_tl(tl, 2)],
+                &[sync(out)]
+            ),
+            Err(nv::EIO)
+        );
+        assert_eq!(userd(&b), (4, 6));
+        // Userspace signaling the point itself supersedes the dead fence.
+        assert!(syncobj::timeline_signal(tl, 2));
+        assert_eq!(
+            exec(
+                &gpu,
+                B,
+                ch_b,
+                &[push(PUSH_VA, 16)],
+                &[sync_tl(tl, 2)],
+                &[sync(out)]
+            ),
+            Ok(0)
+        );
+        assert_eq!(userd(&b), (4, 8));
+        assert_eq!(run_gpu(2).len(), 4);
+        assert_eq!(syncobj::query(out), Some(1));
+        // The race itself: B waits while the fence is still in flight, one
+        // read of the clock per millisecond. The QUERY in between is the
+        // read that used to make the fence timeout win over EXEC's own
+        // deadline, and turned the EIO into a submit.
+        let rel2 = syncobj::create(false);
+        assert_eq!(
+            exec(&gpu, A, ch_a, &[push(PUSH_VA, 16)], &[], &[sync(rel2)]),
+            Ok(0)
+        );
+        let out2 = syncobj::create(false);
+        test_clock::set_auto_advance(1_000);
+        assert_eq!(syncobj::query(rel2), Some(0));
+        assert_eq!(
+            exec(
+                &gpu,
+                B,
+                ch_b,
+                &[push(PUSH_VA, 16)],
+                &[sync(rel2)],
+                &[sync(out2)]
+            ),
+            Err(nv::EIO)
+        );
+        test_clock::set_auto_advance(0);
+        assert_eq!(userd(&b), (8, 8), "still nothing new on B's ring");
+        assert_eq!(syncobj::query(out2), Some(0));
+        assert_eq!(syncobj::query(rel2), Some(1), "given up on, as before");
+        for h in [rel, out, ok, ok2, merged, tl, rel2, out2] {
+            assert!(syncobj::destroy(h));
+        }
+        gpu.nouveau_release_process(A);
+        gpu.nouveau_release_process(B);
         assert_eq!(FAKE_RM.lock().bad, 0);
     }
 
