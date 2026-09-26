@@ -140,15 +140,25 @@ impl SignalAction {
     }
 }
 
-#[repr(C)]
+/// The `_sifields` union of `siginfo_t`.
+///
+/// `align(8)` is the layout: the union holds a pointer (`si_addr`), so in the
+/// kernel's `struct siginfo` and in glibc's `siginfo_t` it starts at byte 16
+/// on a 64-bit machine, after `si_signo`, `si_errno`, `si_code` and four
+/// bytes of padding, and the whole thing is 128 bytes. As a plain byte array
+/// it started at byte 12: every field the kernel wrote landed four bytes
+/// before where userspace reads it, so `waitid` handed back the child's uid
+/// as `si_pid` and its status as `si_uid`.
+#[repr(C, align(8))]
 #[derive(Copy, Clone, Eq, PartialEq)]
 pub struct SiginfoFields {
     pad: [u8; Self::PAD_SIZE],
-    // TODO: fill this union
 }
 
 impl SiginfoFields {
-    const PAD_SIZE: usize = 128 - 2 * core::mem::size_of::<i32>() - core::mem::size_of::<usize>();
+    /// 128 bytes in all, minus the three `int`s and the padding that brings
+    /// the union to pointer alignment.
+    const PAD_SIZE: usize = 128 - 2 * core::mem::size_of::<usize>();
 }
 
 impl Default for SiginfoFields {
@@ -160,18 +170,23 @@ impl Default for SiginfoFields {
 }
 
 impl SiginfoFields {
-    fn write_sigchld(&mut self, pid: i32, status: i32) {
+    /// `_kill`: `si_pid` and `si_uid` of the sender, which is what a
+    /// `kill(2)`, `tkill(2)` or `sigqueue(3)` leaves for the handler.
+    fn write_kill(&mut self, pid: i32, uid: u32) {
+        self.pad[..4].copy_from_slice(&pid.to_ne_bytes());
+        self.pad[4..8].copy_from_slice(&uid.to_ne_bytes());
+    }
+
+    /// `_sigchld`: `si_pid`, `si_uid` (the child's REAL uid, `task_uid`),
+    /// `si_status`.
+    fn write_sigchld(&mut self, pid: i32, uid: u32, status: i32) {
         #[repr(C)]
         struct Fields {
             pid: i32,
             uid: u32,
             status: i32,
         }
-        let fields = Fields {
-            pid,
-            uid: 0,
-            status,
-        };
+        let fields = Fields { pid, uid, status };
         let bytes = unsafe {
             core::slice::from_raw_parts(
                 &fields as *const Fields as *const u8,
@@ -211,7 +226,7 @@ impl SigInfo {
     /// "exited with `status >> 8`", so every child was `CLD_EXITED` however
     /// it had finished, and the number was the second byte of a word that,
     /// for a killed child, does not keep anything there.
-    pub fn child_state_change(pid: i32, status: i32) -> Self {
+    pub fn child_state_change(pid: i32, uid: u32, status: i32) -> Self {
         let (code, si_status) = child_si_code_and_status(status);
         let mut info = SigInfo {
             signo: Signal::SIGCHLD as i32,
@@ -219,8 +234,44 @@ impl SigInfo {
             code,
             ..Self::default()
         };
-        info.field.write_sigchld(pid, si_status);
+        info.field.write_sigchld(pid, uid, si_status);
         info
+    }
+
+    /// `siginfo_t` for a signal one process sent another: `si_pid` and
+    /// `si_uid` are the SENDER's (`kill(2)` leaves its real uid there), and
+    /// `code` says how it was sent (`SI_USER` for `kill`, `SI_TKILL` for
+    /// `tkill`/`tgkill`, `SI_QUEUE` for `sigqueue`).
+    pub fn from_user(signal: Signal, pid: i32, uid: u32, code: SignalCode) -> Self {
+        let mut info = SigInfo {
+            signo: signal as i32,
+            errno: 0,
+            code,
+            ..Self::default()
+        };
+        info.field.write_kill(pid, uid);
+        info
+    }
+
+    /// What a signal sent with no information carries: its number, and
+    /// `SI_USER` from nobody (`SEND_SIG_NOINFO`).
+    pub fn bare(signal: Signal) -> Self {
+        SigInfo {
+            signo: signal as i32,
+            ..Self::default()
+        }
+    }
+
+    /// The bytes of this `siginfo_t` as userspace will read them.
+    pub fn as_bytes(&self) -> &[u8] {
+        // SAFETY: `SigInfo` is `repr(C)`, has no padding bytes that are not
+        // zeroed by `Default`/the constructors, and is read only.
+        unsafe {
+            core::slice::from_raw_parts(
+                self as *const Self as *const u8,
+                core::mem::size_of::<Self>(),
+            )
+        }
     }
 }
 
@@ -840,8 +891,37 @@ mod child_siginfo_tests {
             stopped_by(Signal::SIGTSTP),
             CONTINUED,
         ] {
-            let info = SigInfo::child_state_change(4242, status);
+            let info = SigInfo::child_state_change(4242, 0, status);
             assert_eq!(info.signo, Signal::SIGCHLD as i32);
         }
+    }
+}
+
+#[cfg(test)]
+mod layout_tests {
+    //! `siginfo_t` is an ABI: userspace reads it by offset. The kernel's
+    //! `struct siginfo` on a 64-bit machine is 128 bytes with `_sifields` at
+    //! byte 16; this struct was 124 bytes with the fields at byte 12, so
+    //! everything `waitid` wrote was read four bytes off.
+
+    use super::*;
+
+    #[test]
+    fn siginfo_is_128_bytes_with_the_union_at_byte_16() {
+        assert_eq!(core::mem::size_of::<SigInfo>(), 128);
+        assert_eq!(core::mem::offset_of!(SigInfo, field), 16);
+    }
+
+    #[test]
+    fn a_child_state_change_puts_pid_uid_and_status_where_glibc_reads_them() {
+        // glibc: si_pid at 16, si_uid at 20, si_status at 24.
+        let info = SigInfo::child_state_change(4242, 1000, 7 << 8);
+        let b = info.as_bytes();
+        let word = |at: usize| i32::from_ne_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]]);
+        assert_eq!(word(0), Signal::SIGCHLD as i32, "si_signo");
+        assert_eq!(word(8), SignalCode::CLD_EXITED as i32, "si_code");
+        assert_eq!(word(16), 4242, "si_pid");
+        assert_eq!(word(20), 1000, "si_uid");
+        assert_eq!(word(24), 7, "si_status");
     }
 }

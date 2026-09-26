@@ -6,7 +6,7 @@ use crate::{
     ipc::*,
     loader::AuxIdentity,
     net::SOCKET_FD,
-    signal::{Signal as LinuxSignal, SignalAction, Sigset},
+    signal::{SigInfo, Signal as LinuxSignal, SignalAction, Sigset},
 };
 use alloc::{
     boxed::Box,
@@ -539,8 +539,19 @@ impl ProcessExt for Process {
                             // `trap CHLD`, a compositor reaping its autostart
                             // children, or a `pause()`-and-wait loop never
                             // hear that the child is gone.
-                            let _ =
-                                send_signal_to_process(reaper.id() as usize, LinuxSignal::SIGCHLD);
+                            let info = SigInfo::child_state_change(
+                                child.id() as i32,
+                                child
+                                    .try_linux()
+                                    .map(|lp| lp.credentials().ruid)
+                                    .unwrap_or(0),
+                                wait_status_exited(exit_code),
+                            );
+                            let _ = send_signal_to_process_with_info(
+                                reaper.id() as usize,
+                                LinuxSignal::SIGCHLD,
+                                Some(info),
+                            );
                         }
                     }
                 }
@@ -3682,7 +3693,19 @@ fn notify_parent_child_state(child: &Arc<Process>) {
     };
     parent.signal_set(Signal::SIGCHLD);
     if parent_wants_sigchld_for_stops(&parent) {
-        let _ = send_signal_to_process(parent.id() as usize, LinuxSignal::SIGCHLD);
+        let info = child.try_linux().map(|lp| {
+            let (uid, status) = {
+                let inner = lp.inner.lock();
+                let status = if inner.job_stopped {
+                    wait_status_stopped(inner.job_stop_sig)
+                } else {
+                    WAIT_STATUS_CONTINUED
+                };
+                (inner.credentials.ruid, status)
+            };
+            SigInfo::child_state_change(child.id() as i32, uid, status)
+        });
+        let _ = send_signal_to_process_with_info(parent.id() as usize, LinuxSignal::SIGCHLD, info);
     }
 }
 
@@ -3916,6 +3939,14 @@ pub fn all_live_processes() -> Vec<Arc<Process>> {
 /// it can ask anything else about it.
 pub fn find_process(pid: KoID) -> Option<Arc<Process>> {
     ROOT_JOB.find_process(pid)
+}
+
+/// The real uid of the process `pid` names, exited or not; 0 when there is
+/// no such process. What `si_uid` carries in a `SIGCHLD` (`task_uid`).
+pub fn real_uid_of(pid: KoID) -> u32 {
+    find_process(pid)
+        .and_then(|p| p.try_linux().map(|lp| lp.credentials().ruid))
+        .unwrap_or(0)
 }
 
 /// Whether `pid` names a process that has not exited.
@@ -4460,6 +4491,17 @@ pub fn pending_after_send(mut pending: Sigset, signal: LinuxSignal) -> Sigset {
 }
 
 pub fn send_signal_to_process(pid: usize, signal: LinuxSignal) -> LxResult<()> {
+    send_signal_to_process_with_info(pid, signal, None)
+}
+
+/// [`send_signal_to_process`], with the `siginfo_t` the handler will be
+/// handed: who sent a `kill`, which child a `SIGCHLD` is about. `None` leaves
+/// [`SigInfo::bare`].
+pub fn send_signal_to_process_with_info(
+    pid: usize,
+    signal: LinuxSignal,
+    info: Option<SigInfo>,
+) -> LxResult<()> {
     use crate::thread::ThreadExt;
     if let Some(process) = ROOT_JOB.find_process(pid as KoID) {
         if signal_trace_worthy(signal) {
@@ -4502,7 +4544,7 @@ pub fn send_signal_to_process(pid: usize, signal: LinuxSignal) -> LxResult<()> {
                         if lt.signal_mask().contains(signal) {
                             false
                         } else {
-                            lt.signals.insert(signal);
+                            lt.queue_signal(signal, info);
                             true
                         }
                     } else {
@@ -4529,7 +4571,7 @@ pub fn send_signal_to_process(pid: usize, signal: LinuxSignal) -> LxResult<()> {
         // The old code dropped it here, which is why a Wayland compositor that
         // blocks SIGINT for its signalfd never saw Ctrl-C.
         if let Some(thread) = first {
-            thread.lock_linux().signals.insert(signal);
+            thread.lock_linux().queue_signal(signal, info);
         }
         // Pulse even when every thread had the Linux signal blocked: waitpid
         // still needs to return so the waiter can notice the pending set.
@@ -8927,7 +8969,7 @@ mod sigchld_tests {
     //! `do_notify_parent_cldstop` are the two places Linux sends it.
 
     use super::*;
-    use crate::signal::{SignalAction, SignalActionFlags};
+    use crate::signal::{SignalAction, SignalActionFlags, SignalCode};
     use crate::thread::ThreadExt;
     use rcore_fs_ramfs::RamFS;
 
@@ -8949,6 +8991,62 @@ mod sigchld_tests {
 
     fn clear_pending(thread: &Arc<Thread>) {
         thread.lock_linux().signals = Sigset::default();
+    }
+
+    /// The `siginfo_t` of the pending SIGCHLD as `(si_code, si_pid, si_uid,
+    /// si_status)`, read where glibc reads them.
+    fn sigchld_info(thread: &Arc<Thread>) -> (SignalCode, i32, i32, i32) {
+        let info = thread.lock_linux().take_siginfo(LinuxSignal::SIGCHLD);
+        let b = info.as_bytes();
+        let word = |at: usize| i32::from_ne_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]]);
+        (info.code, word(16), word(20), word(24))
+    }
+
+    #[test]
+    fn the_sigchld_says_which_child_whose_and_how_it_ended() {
+        let (parent, thread) = a_parent(43_004);
+        let child = Process::fork_from(&parent).unwrap();
+        child.linux().set_resuid(1000, 1000, 1000).unwrap();
+        child.exit(7);
+        assert_eq!(
+            sigchld_info(&thread),
+            (SignalCode::CLD_EXITED, child.id() as i32, 1000, 7)
+        );
+    }
+
+    #[test]
+    fn a_child_killed_by_a_signal_is_reported_as_killed_by_that_signal() {
+        let (parent, thread) = a_parent(43_005);
+        let child = Process::fork_from(&parent).unwrap();
+        child.exit(exit_code_killed_by(LinuxSignal::SIGKILL as u8));
+        assert_eq!(
+            sigchld_info(&thread),
+            (
+                SignalCode::CLD_KILLED,
+                child.id() as i32,
+                0,
+                LinuxSignal::SIGKILL as i32
+            )
+        );
+    }
+
+    #[test]
+    fn a_stop_and_a_continue_say_so_in_the_sigchld() {
+        let (parent, thread) = a_parent(43_006);
+        let child = Process::fork_from(&parent).unwrap();
+        child.linux().job_stop(&child, LinuxSignal::SIGTSTP as u8);
+        assert_eq!(
+            sigchld_info(&thread),
+            (
+                SignalCode::CLD_STOPPED,
+                child.id() as i32,
+                0,
+                LinuxSignal::SIGTSTP as i32
+            )
+        );
+        child.linux().job_continue(&child);
+        let (code, pid, _, _) = sigchld_info(&thread);
+        assert_eq!((code, pid), (SignalCode::CLD_CONTINUED, child.id() as i32));
     }
 
     #[test]

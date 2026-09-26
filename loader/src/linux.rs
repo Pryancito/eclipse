@@ -840,7 +840,9 @@ fn handle_signal(
             },
         );
     }
-    let signal_info = SigInfo::default();
+    // What the sender left for the handler: `si_pid`/`si_uid` of a `kill`,
+    // the child and its status of a `SIGCHLD`. Bare (number only) otherwise.
+    let signal_info = thread.inner().lock_linux().take_siginfo(signal);
     let signal_context = SignalUserContext {
         sig_mask: sigmask,
         context: MachineContext::new(user_pc),

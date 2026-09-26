@@ -67,7 +67,8 @@ fn write_sigchld_info(mut infop: UserOutPtr<SigInfo>, pid: KoID, status: i32) ->
     if infop.is_null() {
         return Ok(0);
     }
-    infop.write(SigInfo::child_state_change(pid as i32, status))?;
+    let uid = linux_object::process::real_uid_of(pid);
+    infop.write(SigInfo::child_state_change(pid as i32, uid, status))?;
     Ok(0)
 }
 

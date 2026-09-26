@@ -3,6 +3,7 @@
 use crate::error::SysResult;
 use crate::process::ProcessExt;
 use crate::signal::{SigInfo, Signal, SignalStack, SignalUserContext, Sigset};
+use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -507,6 +508,15 @@ pub struct LinuxThread {
     /// set → reads as the Linux default of 50 µs. Recorded and read back;
     /// timers here do not apply slack coalescing.
     pub timerslack_ns: u64,
+    /// The `siginfo_t` that goes with each pending signal in `signals`, when
+    /// the sender left one: who sent a `kill`, which child a `SIGCHLD` is
+    /// about and how it ended. `signals` is a bitmap, so a signal is pending
+    /// once and, as for Linux's non-realtime signals, the FIRST sender's
+    /// information is the one kept. Read and cleared by [`Self::take_siginfo`].
+    pending_info: BTreeMap<u8, SigInfo>,
+    /// The `siginfo_t` handed to the handler now running, so `sigreturn` can
+    /// tell what the handler changed from what the kernel wrote.
+    handling_info: SigInfo,
 }
 
 /// Size of the kernel's per-task `comm` buffer, including the trailing NUL
@@ -514,12 +524,11 @@ pub struct LinuxThread {
 /// bytes.
 pub const TASK_COMM_LEN: usize = 16;
 
-fn unmodified_check(siginfo: &SigInfo, user_ctx: &SignalUserContext) -> usize {
+fn unmodified_check(siginfo: &SigInfo, delivered: &SigInfo, user_ctx: &SignalUserContext) -> usize {
     let mut check = 0usize;
-    let default_info = SigInfo::default();
     let mut default_ctx = SignalUserContext::default();
     default_ctx.context.set_pc(user_ctx.context.get_pc());
-    check |= (*siginfo != default_info) as usize;
+    check |= (*siginfo != *delivered) as usize;
     check |= ((user_ctx.flags != default_ctx.flags) as usize) << 1;
     check |= ((user_ctx.link != default_ctx.link) as usize) << 2;
     check |= ((user_ctx.stack != default_ctx.stack) as usize) << 3;
@@ -544,7 +553,7 @@ impl LinuxThread {
     ) {
         let siginfo = unsafe { &*(siginfo_ptr as *const SigInfo) };
         let user_ctx = unsafe { &*(uctx_ptr as *const SignalUserContext) };
-        let check = unmodified_check(siginfo, user_ctx);
+        let check = unmodified_check(siginfo, &self.handling_info, user_ctx);
         if check != 0 {
             error!("unsupported signal fields : {:b}", check);
             trace!("uctx = {:x?}", *user_ctx);
@@ -615,6 +624,8 @@ impl LinuxThread {
             handling_signal: None,
             comm: String::new(),
             timerslack_ns: 0,
+            pending_info: BTreeMap::new(),
+            handling_info: SigInfo::default(),
         }
     }
 
@@ -698,6 +709,9 @@ impl LinuxThread {
             // belongs to a `sigreturn` frame, and the child has its own.
             handling_signal: None,
             saved_sigmask: None,
+            // Pending signals are fresh (above), and so is what went with them.
+            pending_info: BTreeMap::new(),
+            handling_info: SigInfo::default(),
             // A new thread reports the program's name until it sets one of
             // its own; empty is how a reader knows to fall back to the
             // executable's basename.
@@ -729,6 +743,9 @@ impl LinuxThread {
             handling_signal,
             comm,
             timerslack_ns: _,
+            // Pending signals survive `execve`, and what went with them too.
+            pending_info: _,
+            handling_info: _,
         } = self;
 
         // `mm_release()`: the address the kernel writes a 0 into, and
@@ -772,6 +789,32 @@ impl LinuxThread {
     }
 
     /// Handle signal
+    /// Make `signal` pending, with what the sender knows about it.
+    ///
+    /// A signal already pending keeps the information it came with, as Linux
+    /// does for the non-realtime signals: the second `kill` is not queued and
+    /// the handler learns about the first.
+    pub fn queue_signal(&mut self, signal: Signal, info: Option<SigInfo>) {
+        self.signals.insert(signal);
+        if let Some(info) = info {
+            self.pending_info.entry(signal as u8).or_insert(info);
+        }
+    }
+
+    /// Take `signal` out of the pending set together with its `siginfo_t`,
+    /// which is [`SigInfo::bare`] when the sender left none. What is
+    /// returned is also what `sigreturn` will compare the handler's frame
+    /// against.
+    pub fn take_siginfo(&mut self, signal: Signal) -> SigInfo {
+        self.signals.remove(signal);
+        let info = self
+            .pending_info
+            .remove(&(signal as u8))
+            .unwrap_or_else(|| SigInfo::bare(signal));
+        self.handling_info = info;
+        info
+    }
+
     pub fn handle_signal(&mut self) -> Option<(Signal, Sigset)> {
         if self.handling_signal.is_none() {
             let signal = self
@@ -823,6 +866,8 @@ mod signal_delivery_tests {
             handling_signal: None,
             comm: String::new(),
             timerslack_ns: 0,
+            pending_info: BTreeMap::new(),
+            handling_info: SigInfo::default(),
         }
     }
 
@@ -1506,6 +1551,8 @@ mod exec_reset_tests {
             handling_signal: Some(Signal::SIGUSR2 as u32),
             comm: String::from("programa-viejo"),
             timerslack_ns: 1_234_567,
+            pending_info: BTreeMap::new(),
+            handling_info: SigInfo::default(),
         }
     }
 
@@ -1669,6 +1716,8 @@ mod clone_inheritance_tests {
             handling_signal: Some(Signal::SIGUSR2 as u32),
             comm: String::from("el-que-crea"),
             timerslack_ns: 1_234_567,
+            pending_info: BTreeMap::new(),
+            handling_info: SigInfo::default(),
         }
     }
 
@@ -1848,5 +1897,96 @@ mod last_thread_tests {
     #[test]
     fn nobody_left_is_also_the_last_one() {
         assert!(last_thread_of(0));
+    }
+}
+
+#[cfg(test)]
+mod siginfo_tests {
+    //! What a pending signal carries besides its number. The pending set was
+    //! a bitmap and nothing else, so every handler was handed a zeroed
+    //! `siginfo_t`: `si_pid` 0 for a `kill`, `si_pid` 0 and `si_status` 0
+    //! for a `SIGCHLD`.
+
+    use super::*;
+    use crate::signal::SignalCode;
+
+    fn word(info: &SigInfo, at: usize) -> i32 {
+        let b = info.as_bytes();
+        i32::from_ne_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]])
+    }
+
+    #[test]
+    fn a_signal_comes_out_with_what_it_was_queued_with() {
+        let mut t = LinuxThread::initial();
+        t.queue_signal(
+            Signal::SIGUSR1,
+            Some(SigInfo::from_user(
+                Signal::SIGUSR1,
+                77,
+                1000,
+                SignalCode::USER,
+            )),
+        );
+        assert!(t.signals.contains(Signal::SIGUSR1));
+        let info = t.take_siginfo(Signal::SIGUSR1);
+        assert!(!t.signals.contains(Signal::SIGUSR1), "taking it clears it");
+        assert_eq!(word(&info, 0), Signal::SIGUSR1 as i32, "si_signo");
+        assert_eq!(word(&info, 16), 77, "si_pid");
+        assert_eq!(word(&info, 20), 1000, "si_uid");
+        assert_eq!(info.code, SignalCode::USER);
+    }
+
+    #[test]
+    fn the_first_sender_of_a_pending_signal_is_the_one_the_handler_learns_about() {
+        // Non-realtime semantics: a signal already pending is not queued
+        // again, so the second `kill` changes nothing about the first.
+        let mut t = LinuxThread::initial();
+        t.queue_signal(
+            Signal::SIGTERM,
+            Some(SigInfo::from_user(Signal::SIGTERM, 11, 0, SignalCode::USER)),
+        );
+        t.queue_signal(
+            Signal::SIGTERM,
+            Some(SigInfo::from_user(Signal::SIGTERM, 22, 0, SignalCode::USER)),
+        );
+        assert_eq!(word(&t.take_siginfo(Signal::SIGTERM), 16), 11);
+    }
+
+    #[test]
+    fn a_signal_queued_without_information_is_bare_but_numbered() {
+        let mut t = LinuxThread::initial();
+        t.queue_signal(Signal::SIGHUP, None);
+        let info = t.take_siginfo(Signal::SIGHUP);
+        assert_eq!(info.signo, Signal::SIGHUP as i32);
+        assert_eq!(word(&info, 16), 0, "si_pid of nobody");
+        assert_eq!(info.code, SignalCode::USER);
+    }
+
+    #[test]
+    fn taking_leaves_nothing_behind_for_the_next_time() {
+        let mut t = LinuxThread::initial();
+        t.queue_signal(
+            Signal::SIGUSR2,
+            Some(SigInfo::from_user(Signal::SIGUSR2, 5, 0, SignalCode::USER)),
+        );
+        t.take_siginfo(Signal::SIGUSR2);
+        t.queue_signal(Signal::SIGUSR2, None);
+        assert_eq!(word(&t.take_siginfo(Signal::SIGUSR2), 16), 0);
+    }
+
+    #[test]
+    fn sigreturn_compares_the_frame_against_what_was_delivered_not_against_zeros() {
+        // Before, a frame carrying real information looked "modified" to
+        // `restore_after_handle_signal` and was logged as such on every
+        // return. The check compares against what the kernel wrote.
+        let mut t = LinuxThread::initial();
+        let sent = SigInfo::from_user(Signal::SIGUSR1, 9, 9, SignalCode::USER);
+        t.queue_signal(Signal::SIGUSR1, Some(sent));
+        let delivered = t.take_siginfo(Signal::SIGUSR1);
+        let uctx = SignalUserContext::default();
+        assert_eq!(unmodified_check(&delivered, &t.handling_info, &uctx) & 1, 0);
+        let mut doctored = delivered;
+        doctored.errno = 3;
+        assert_eq!(unmodified_check(&doctored, &t.handling_info, &uctx) & 1, 1);
     }
 }

@@ -12,7 +12,9 @@ use super::*;
 use crate::outparams::commit_and_report_old;
 use linux_object::error::LxResult;
 use linux_object::process::{Credentials, LinuxProcess};
-use linux_object::signal::{SigInfo, Signal, SignalAction, SignalStack, SignalStackFlags, Sigset};
+use linux_object::signal::{
+    SigInfo, Signal, SignalAction, SignalCode, SignalStack, SignalStackFlags, Sigset,
+};
 use linux_object::thread::ThreadExt;
 use linux_object::time::TimeSpec;
 use numeric_enum_macro::numeric_enum;
@@ -191,8 +193,8 @@ fn deliver_direct_sigkill(
 /// `send_signal_to_process` carries the comment "that drop is why lunarbar's
 /// `kill 1` did nothing". Contention is likeliest exactly when the target is
 /// busy, which is when a signal matters.
-fn queue_signal_to_thread(thread: &Arc<Thread>, signal: Signal) {
-    thread.lock_linux().signals.insert(signal);
+fn queue_signal_to_thread(thread: &Arc<Thread>, signal: Signal, info: SigInfo) {
+    thread.lock_linux().queue_signal(signal, Some(info));
 }
 
 /// `si_code` of a signal `tkill`/`tgkill` sent, which userland may not forge.
@@ -386,6 +388,17 @@ impl Syscall<'_> {
         Ok(0)
     }
 
+    /// The `siginfo_t` of a signal this thread's process is sending:
+    /// its pid and real uid, and how (`SI_TKILL`, `SI_QUEUE`).
+    fn sent_by_me(&self, signal: Signal, code: SignalCode) -> SigInfo {
+        SigInfo::from_user(
+            signal,
+            self.zircon_process().id() as i32,
+            self.linux_process().credentials().ruid,
+            code,
+        )
+    }
+
     pub(crate) fn kill_context(&self, signal: Option<Signal>) -> KillContext {
         let caller = self.zircon_process().clone();
         let sid = linux_object::process::effective_sid(&caller);
@@ -432,7 +445,18 @@ impl Syscall<'_> {
                 deliver_direct_sigkill(&cx.caller, process);
                 Ok(())
             }
-            Some(sig) => linux_object::process::send_signal_to_process(process.id() as usize, sig),
+            // `si_pid`/`si_uid` are the caller's: `kill(2)` leaves its pid
+            // and REAL uid for the handler.
+            Some(sig) => linux_object::process::send_signal_to_process_with_info(
+                process.id() as usize,
+                sig,
+                Some(SigInfo::from_user(
+                    sig,
+                    cx.caller.id() as i32,
+                    cx.credentials.ruid,
+                    SignalCode::USER,
+                )),
+            ),
         }
     }
 
@@ -541,7 +565,11 @@ impl Syscall<'_> {
                 };
                 // tkill(tid, 0) probes the thread and delivers nothing.
                 if let Some(signal) = signal {
-                    queue_signal_to_thread(&thread, signal);
+                    queue_signal_to_thread(
+                        &thread,
+                        signal,
+                        self.sent_by_me(signal, SignalCode::TKILL),
+                    );
                 }
                 Ok(0)
             }
@@ -589,7 +617,7 @@ impl Syscall<'_> {
         self.may_signal_process(&self.kill_context(signal), &process)?;
         // tgkill(tgid, tid, 0) probes the thread and delivers nothing.
         if let Some(signal) = signal {
-            queue_signal_to_thread(&thread, signal);
+            queue_signal_to_thread(&thread, signal, self.sent_by_me(signal, SignalCode::TKILL));
         }
         Ok(0)
     }
@@ -762,7 +790,7 @@ impl Syscall<'_> {
         // it is refused just the same, so it cannot report the existence of a
         // thread you may not signal.
         if let Some(signal) = signal {
-            queue_signal_to_thread(&thread, signal);
+            queue_signal_to_thread(&thread, signal, self.sent_by_me(signal, SignalCode::QUEUE));
         }
         Ok(0)
     }
@@ -816,13 +844,11 @@ impl Syscall<'_> {
                 let mut thread = self.thread.lock_linux();
                 let ready = Sigset::new(thread.signals.val() & waitset.val());
                 if let Some(sig) = ready.find_first_signal() {
-                    thread.signals.remove(sig);
+                    // With what came with it: who sent it, which child it is
+                    // about. `sigwaitinfo(3)` is how a program asks for that.
+                    let si = thread.take_siginfo(sig);
                     drop(thread);
                     if !info.is_null() {
-                        let si = SigInfo {
-                            signo: sig as i32,
-                            ..SigInfo::default()
-                        };
                         info.write(si)?;
                     }
                     return Ok(sig as usize);
@@ -1268,6 +1294,42 @@ mod signal_tests {
                 false
             ),
             Ok(())
+        );
+    }
+}
+
+#[cfg(test)]
+mod queued_siginfo_tests {
+    //! `tkill`/`tgkill` queue straight onto the target thread; what they
+    //! leave for the handler goes with the signal.
+
+    use super::*;
+    use linux_object::process::LinuxProcess;
+    use linux_object::thread::ThreadExt;
+    use rcore_fs_ramfs::RamFS;
+    use zircon_object::task::ROOT_JOB;
+
+    #[test]
+    fn a_thread_signal_arrives_with_who_sent_it() {
+        let proc = Process::create_with_fixed_id_ext(
+            &ROOT_JOB,
+            43_201,
+            "t",
+            LinuxProcess::new(RamFS::new(), 0),
+        )
+        .unwrap();
+        let thread = Thread::create_linux(&proc).unwrap();
+        queue_signal_to_thread(
+            &thread,
+            Signal::SIGUSR1,
+            SigInfo::from_user(Signal::SIGUSR1, 31, 1000, SignalCode::TKILL),
+        );
+        let info = thread.lock_linux().take_siginfo(Signal::SIGUSR1);
+        let b = info.as_bytes();
+        let word = |at: usize| i32::from_ne_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]]);
+        assert_eq!(
+            (info.code, word(16), word(20)),
+            (SignalCode::TKILL, 31, 1000)
         );
     }
 }
