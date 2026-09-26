@@ -17,6 +17,10 @@ use pci::{PCIDevice, BAR};
 #[cfg(test)]
 pub(super) static GPU_SPIN_HOOK: Mutex<Option<alloc::boxed::Box<dyn Fn() + Send>>> =
     Mutex::new(None);
+/// How many `CHANNEL_ALLOC`s are waiting on a context-0 teardown right now
+/// (`wait_for_ctx0_reset`); the harness models the respawn with it.
+#[cfg(test)]
+pub(super) static CTX0_RESET_WAITERS: AtomicUsize = AtomicUsize::new(0);
 
 /// Busy-wait heartbeat for the GPU register/fence poll loops in this driver.
 ///
@@ -74,6 +78,11 @@ enum FastSlot {
 /// microseconds of the payload landing; this is the bound for one that is
 /// behind other work.
 const CTX0_EXIT_GRACE_US: u64 = 20_000;
+/// The most a `CHANNEL_ALLOC` waits for a context-0 teardown in progress
+/// (`wait_for_ctx0_reset`): the grace above plus the RM's own reset, which is
+/// tens to hundreds of milliseconds. Past it the call goes on with the sticky
+/// as it finds it, as it always did.
+const CTX0_RESET_WAIT_US: u64 = 2_000_000;
 
 /// A context whose process is gone while some other channel still has an
 /// ACQUIRE queued on its fence semaphore, through a peer mapping. `ctx_free`
@@ -907,6 +916,15 @@ pub struct NvidiaGpu {
     /// freed a throwaway channel or crashed mid-session (VM_BIND → client VAS,
     /// EXEC → ctx 0 → MMU fault / FECS RESTORE hang).
     ctx0_owner: AtomicU64,
+    /// Set for the length of `reset_ctx0_singleton`; a `CHANNEL_ALLOC` that
+    /// lands while it is set waits for it (`wait_for_ctx0_reset`). The exit signals
+    /// PROCESS_TERMINATED -- the parent's `wait4` returns -- BEFORE the DRM
+    /// release hook runs, so a supervisor's respawn of the compositor can
+    /// reach `CHANNEL_ALLOC` while the dead one's teardown is still running
+    /// on another CPU; claiming then handed it the dead one's singleton
+    /// channel (`step17` is idempotent until the reset), which the teardown
+    /// freed under it.
+    ctx0_resetting: AtomicBool,
     /// MSI interrupt vector assigned by the PCI scan (`irq + 32`), or
     /// `usize::MAX` if this GPU has no MSI. Used only by the console-GPU GSP
     /// boot to bring the GPU's MSI delivery online across the SEC2-resume
@@ -1305,6 +1323,7 @@ impl NvidiaGpu {
             }),
             msi_vector: AtomicUsize::new(usize::MAX),
             ctx0_owner: AtomicU64::new(0),
+            ctx0_resetting: AtomicBool::new(false),
         })
     }
 
@@ -10376,6 +10395,11 @@ impl NvidiaGpu {
     /// CHANNEL_ALLOC/step17 recreates a fresh ctx0 channel instead of reusing a
     /// wedged one across labwc respawns.
     fn reset_ctx0_singleton(&self, device_instance: u32, reason: &str, owner_pid: u64) {
+        // A respawn that arrives while this runs waits on `ctx0_resetting`
+        // instead of claiming a channel this teardown is about to free --
+        // see the field's doc. The claim itself is released first, so a
+        // respawn that outwaits the bound claims rather than turning client.
+        self.ctx0_resetting.store(true, Ordering::Release);
         self.ctx0_release(owner_pid);
         // Every client with a frame in flight waits on this channel's
         // semaphore (its buffer's release) through a peer mapping the reset
@@ -10402,6 +10426,40 @@ impl NvidiaGpu {
                 "[nouveau-uapi] ctx0 reset: {reason} pid={} failed, NV_STATUS={:#x} (respawn may reuse a dead channel; #1192 pixman fallback remains the safety net)",
                 owner_pid,
                 status
+            );
+        }
+        self.ctx0_resetting.store(false, Ordering::Release);
+    }
+
+    /// Wait (bounded by `CTX0_RESET_WAIT_US`) while a context-0 teardown is
+    /// in progress, so the caller's `CHANNEL_ALLOC` sees the singleton either
+    /// whole or gone, never half torn down.
+    fn wait_for_ctx0_reset(&self) {
+        if !self.ctx0_resetting.load(Ordering::Acquire) {
+            return;
+        }
+        #[cfg(test)]
+        CTX0_RESET_WAITERS.fetch_add(1, Ordering::AcqRel);
+        let start = unsafe { crate::bus::drivers_timer_now_as_micros() };
+        let mut waited = 0;
+        while self.ctx0_resetting.load(Ordering::Acquire) {
+            waited = unsafe { crate::bus::drivers_timer_now_as_micros() }.wrapping_sub(start);
+            if waited >= CTX0_RESET_WAIT_US {
+                crate::klog_warn!(
+                    "[nouveau-uapi] CHANNEL_ALLOC: ctx0 teardown still running after {} us -- going on",
+                    waited
+                );
+                break;
+            }
+            lock::pump();
+            gpu_spin();
+        }
+        #[cfg(test)]
+        CTX0_RESET_WAITERS.fetch_sub(1, Ordering::AcqRel);
+        if waited > 0 {
+            log::info!(
+                "[nouveau-uapi] CHANNEL_ALLOC: waited {} us for the previous compositor's ctx0 teardown",
+                waited
             );
         }
     }
@@ -11581,14 +11639,20 @@ impl NvidiaGpu {
                 // that used to start console GSP-RM from the first GL client and
                 // freeze the machine the same way boot-time auto-bringup did.
                 self.ensure_console_gpu_brought_up();
-                let chan = self.nouveau_channels.lock();
-                if chan.len() >= nv::MAX_CHANNELS {
-                    log::warn!(
-                        "[nouveau-uapi] CHANNEL_ALLOC: {} channels already live",
-                        chan.len()
-                    );
-                    return Err(nv::EBUSY);
+                {
+                    let chan = self.nouveau_channels.lock();
+                    if chan.len() >= nv::MAX_CHANNELS {
+                        log::warn!(
+                            "[nouveau-uapi] CHANNEL_ALLOC: {} channels already live",
+                            chan.len()
+                        );
+                        return Err(nv::EBUSY);
+                    }
                 }
+                // A compositor's teardown in progress: wait for it, or the
+                // sticky read below is of a claim about to be released and
+                // the step17 below returns the channel about to be freed.
+                self.wait_for_ctx0_reset();
                 // The sticky ctx-0 owner decides who is the compositor, and
                 // nothing else does: it is claimed BEFORE the ctx-0 channel
                 // goes into the table and released at exit AFTER the table has
@@ -11607,7 +11671,6 @@ impl NvidiaGpu {
                 // any client, and the singleton idle.
                 let sticky = self.ctx0_owner.load(Ordering::Acquire);
                 let other_holds_ctx0 = sticky != 0 && sticky != owner_pid;
-                drop(chan);
                 if other_holds_ctx0 {
                     // The compositor holds context 0. This is a GL CLIENT: give it
                     // its OWN GPU context (own VAS + GPFIFO channel), built on its
@@ -13851,6 +13914,7 @@ impl NvidiaGpu {
             }),
             msi_vector: AtomicUsize::new(usize::MAX),
             ctx0_owner: AtomicU64::new(0),
+            ctx0_resetting: AtomicBool::new(false),
         }
     }
 }
@@ -18293,7 +18357,12 @@ mod nouveau_bookkeeping_tests {
         // channel: a new ring, a new window, not the dead compositor's. A
         // new client takes the dead one's index, and the two wait on each
         // other through mappings of the NEW channels' fence pages.
+        let t0 = test_clock::now();
         let ch_c = client_with_pushbuf(&gpu, COMP2);
+        assert!(
+            test_clock::now().wrapping_sub(t0) < CTX0_RESET_WAIT_US,
+            "the teardown is over: nothing to wait for"
+        );
         assert_eq!(ctx0_owner(&gpu), COMP2);
         assert_eq!(step17_builds(), 2, "a new channel behind index 0");
         let ch_b = client_with_pushbuf(&gpu, B);
@@ -18956,6 +19025,96 @@ mod nouveau_bookkeeping_tests {
         // And the client is none the worse.
         assert_eq!(exec(&gpu, A, ch_a, &[push(PUSH_VA, 16)], &[], &[]), Ok(0));
         assert_eq!(run_gpu(1).len(), 1);
+        gpu.nouveau_release_process(A);
+        gpu.nouveau_release_process(COMP2);
+        assert_eq!(FAKE_RM.lock().bad, 0);
+    }
+
+    /// The parent's `wait4` returns on PROCESS_TERMINATED, which the exit
+    /// signals BEFORE the DRM release hook runs: a supervisor respawns labwc
+    /// while the dead one's context-0 teardown (the grace wait, the window's
+    /// release, the RM's reset) is still running on another CPU. A respawn
+    /// whose CHANNEL_ALLOC lands inside that teardown must wait for it: the
+    /// singleton it would get otherwise is the dead compositor's channel,
+    /// which the teardown then frees under it.
+    #[test]
+    fn a_respawn_that_arrives_during_the_dead_compositors_teardown_waits_for_it_and_gets_a_fresh_channel(
+    ) {
+        use std::sync::atomic::AtomicBool as StdAtomicBool;
+        let _g = LOCK.lock();
+        let _live = LiveBytes::hold();
+        // `'static`: the respawn runs on its own thread, as it does on its own
+        // CPU.
+        let gpu: &'static NvidiaGpu =
+            alloc::boxed::Box::leak(alloc::boxed::Box::new(gpu_rm_ladder()));
+        FAKE_RM.lock().peer = true;
+        test_clock::set_auto_advance(1_000);
+        let ch_c = client_with_pushbuf(gpu, COMP);
+        let ch_a = client_with_pushbuf(gpu, A);
+        let out2 = syncobj::create(false);
+        assert_eq!(
+            exec(gpu, COMP, ch_c, &[push(PUSH_VA, 16)], &[], &[sync(out2)]),
+            Ok(0)
+        );
+        assert_eq!(
+            exec(gpu, A, ch_a, &[push(PUSH_VA, 16)], &[sync(out2)], &[]),
+            Ok(0)
+        );
+        assert!(run_gpu(1).is_empty(), "the client sits on the ACQUIRE");
+        // The compositor dies. Its exit waits for the client to pass; while
+        // it waits (the hook is the GPU's turn), the respawn arrives: its
+        // CHANNEL_ALLOC starts on another thread, and the hook returns only
+        // once that call is either waiting on the teardown or over. Then
+        // the client passes and the teardown goes on.
+        let respawn: std::sync::Arc<std::sync::Mutex<Option<std::thread::JoinHandle<u32>>>> =
+            Default::default();
+        let started = std::sync::Arc::new(StdAtomicBool::new(false));
+        let slot = respawn.clone();
+        let once = started.clone();
+        *GPU_SPIN_HOOK.lock() = Some(alloc::boxed::Box::new(move || {
+            if once.swap(true, Ordering::AcqRel) {
+                return;
+            }
+            let handle = std::thread::spawn(move || client_with_pushbuf(gpu, COMP2));
+            while CTX0_RESET_WAITERS.load(Ordering::Acquire) == 0 && !handle.is_finished() {
+                std::thread::yield_now();
+            }
+            *slot.lock().unwrap() = Some(handle);
+            let _ = run_gpu(1);
+        }));
+        gpu.nouveau_release_process(COMP);
+        *GPU_SPIN_HOOK.lock() = None;
+        assert!(
+            started.load(Ordering::Acquire),
+            "the exit waited, and the respawn came"
+        );
+        let handle = respawn
+            .lock()
+            .unwrap()
+            .take()
+            .expect("the respawn was started");
+        let ch_c2 = handle.join().expect("the respawn's CHANNEL_ALLOC returned");
+        assert_eq!(CTX0_RESET_WAITERS.load(Ordering::Acquire), 0);
+        // It is the compositor, on a channel built AFTER the dead one's was
+        // torn down -- not the dead one's, freed under it.
+        assert_eq!(ctx0_owner(gpu), COMP2);
+        assert_eq!(ctx0_resets(), 1);
+        assert_eq!(
+            step17_builds(),
+            2,
+            "a fresh singleton channel, not the dead compositor's"
+        );
+        assert_eq!(ctx_of(gpu, COMP2), None, "no client context");
+        assert!(has_chan(1), "the client's channel is intact");
+        let out3 = syncobj::create(false);
+        assert_eq!(
+            exec(gpu, COMP2, ch_c2, &[push(PUSH_VA, 16)], &[], &[sync(out3)]),
+            Ok(0),
+            "the respawn renders on its channel"
+        );
+        assert_eq!(run_gpu(0).len(), 2, "push and fence on the new ring");
+        assert!(syncobj::destroy(out2));
+        assert!(syncobj::destroy(out3));
         gpu.nouveau_release_process(A);
         gpu.nouveau_release_process(COMP2);
         assert_eq!(FAKE_RM.lock().bad, 0);
