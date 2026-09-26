@@ -101,6 +101,47 @@ fn current_process_id() -> Option<u64> {
     Some(thread.proc().id() as u64)
 }
 
+fn current_process() -> Option<Arc<Process>> {
+    let arc = kernel_hal::thread::get_current_thread()?;
+    let thread = arc.downcast::<Thread>().ok()?;
+    Some(thread.proc().clone())
+}
+
+/// Whether the process making this call may read what `target` is doing.
+///
+/// `ptrace_may_access(task, PTRACE_MODE_READ_FSCREDS)`, which in Linux guards
+/// `/proc/<pid>/environ`, `maps`, `fd/` and `exe` -- everything that says what
+/// another process is holding rather than merely that it exists. None of them
+/// asked anything here: every process could read every other process's
+/// environment (where programs are still handed passwords and tokens), its
+/// address map (which is what ASLR exists to hide) and the name of every file
+/// it has open.
+///
+/// `stat`, `status`, `statm`, `cmdline` and `comm` stay open to everybody,
+/// because `ps` reads them and Linux leaves them world-readable.
+///
+/// With no current thread there is no caller to judge: that is the kernel
+/// reading its own procfs, never userspace, so it goes through. Refusing
+/// instead would make a kernel-side read of `/proc/self/exe` fail.
+fn may_read_innards_of(target: &Arc<Process>) -> bool {
+    let Some(caller) = current_process() else {
+        return true;
+    };
+    if caller.id() == target.id() {
+        return true;
+    }
+    let (Some(caller_linux), Some(target_linux)) = (caller.try_linux(), target.try_linux()) else {
+        // One of the two is past teardown and has no credentials left to
+        // compare. `effective_pgid` tolerates the same race.
+        return true;
+    };
+    crate::process::LinuxProcess::may_read_process_innards(
+        &caller_linux.credentials(),
+        &target_linux.credentials(),
+        false,
+    )
+}
+
 fn sanitize_comm(name: &str) -> String {
     let base = name.rsplit('/').next().unwrap_or(name);
     let mut s = String::new();
@@ -555,6 +596,21 @@ impl ProcPidDirINode {
         ROOT_JOB.find_process(self.pid as _)
     }
 
+    /// `EACCES` unless the caller may read this process's innards.
+    ///
+    /// Answered at lookup, which is where Linux answers it too (`open` on the
+    /// file, `readlink` on the symlink): the name stays in the directory
+    /// listing, so this is "you may not read that", not "there is no such
+    /// file".
+    fn check_read_innards(&self) -> Result<()> {
+        let proc = self.process().ok_or(FsError::EntryNotFound)?;
+        if may_read_innards_of(&proc) {
+            Ok(())
+        } else {
+            Err(FsError::NoPermission)
+        }
+    }
+
     fn entries() -> [&'static str; 13] {
         [
             ".", "..", "stat", "cmdline", "status", "perf", "maps", "fd", "comm", "environ",
@@ -631,23 +687,32 @@ impl INode for ProcPidDirINode {
                 pid: self.pid,
                 kind: ProcPidFileKind::Perf,
             })),
-            "maps" => Ok(Arc::new(ProcPidFileINode {
-                pid: self.pid,
-                kind: ProcPidFileKind::Maps,
-            })),
+            "maps" => {
+                self.check_read_innards()?;
+                Ok(Arc::new(ProcPidFileINode {
+                    pid: self.pid,
+                    kind: ProcPidFileKind::Maps,
+                }))
+            }
             // Reuse the /proc/self/fd directory for any pid: it resolves the
             // fd table of the process it is handed at lookup time.
-            "fd" => Ok(Arc::new(super::proc_self::ProcSelfFdDir {
-                process: self.process().ok_or(FsError::EntryNotFound)?,
-            })),
+            "fd" => {
+                self.check_read_innards()?;
+                Ok(Arc::new(super::proc_self::ProcSelfFdDir {
+                    process: self.process().ok_or(FsError::EntryNotFound)?,
+                }))
+            }
             "comm" => Ok(Arc::new(ProcPidFileINode {
                 pid: self.pid,
                 kind: ProcPidFileKind::Comm,
             })),
-            "environ" => Ok(Arc::new(ProcPidFileINode {
-                pid: self.pid,
-                kind: ProcPidFileKind::Environ,
-            })),
+            "environ" => {
+                self.check_read_innards()?;
+                Ok(Arc::new(ProcPidFileINode {
+                    pid: self.pid,
+                    kind: ProcPidFileKind::Environ,
+                }))
+            }
             "statm" => Ok(Arc::new(ProcPidFileINode {
                 pid: self.pid,
                 kind: ProcPidFileKind::Statm,
@@ -657,6 +722,7 @@ impl INode for ProcPidDirINode {
                 kind: ProcPidFileKind::Threads,
             })),
             "exe" => {
+                self.check_read_innards()?;
                 let proc = self.process().ok_or(FsError::EntryNotFound)?;
                 let path = proc
                     .try_linux()
