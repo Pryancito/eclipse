@@ -134,13 +134,23 @@ impl IpcPerm {
     /// so is every other `mode`-based check in Unix.
     ///
     /// euid 0 passes, standing in for `CAP_IPC_OWNER`.
-    pub fn may_access(&self, euid: u32, egid: u32, want: u32) -> bool {
+    pub fn may_access(&self, euid: u32, egid: u32, groups: &[u32], want: u32) -> bool {
         if euid == 0 {
             return true;
         }
+        // `in_group_p`, and not `egid ==`: a caller is in a group if that
+        // group is the one it acts as **or** is on its supplementary list.
+        // Asking only about `egid` put everyone who holds the group by
+        // membership into the `other` class, and the group bits of an IPC
+        // object are normally wider than its other bits -- a `0660` segment
+        // or queue shared through a group (the ordinary way to share one) was
+        // `EACCES` for every member whose primary group was something else,
+        // which is every member on a normal system. The same question is
+        // answered this way for files by `acts_as_group` in `process.rs`.
+        let in_group = |g: u32| egid == g || groups.contains(&g);
         let granted = if euid == self.cuid || euid == self.uid {
             self.mode >> 6
-        } else if egid == self.cgid || egid == self.gid {
+        } else if in_group(self.cgid) || in_group(self.gid) {
             self.mode >> 3
         } else {
             self.mode
@@ -531,7 +541,7 @@ mod sem_proc_tests {
 
     /// A private set of `n` semaphores, all starting at zero.
     fn set(n: usize) -> Arc<SemArray> {
-        SemArray::get_or_create(0, n, CREAT | 0o666, 0, 0).unwrap()
+        SemArray::get_or_create(0, n, CREAT | 0o666, 0, 0, &[]).unwrap()
     }
 
     #[test]
@@ -751,13 +761,44 @@ mod ipc_access_tests {
     #[test]
     fn the_owner_the_group_and_everyone_else_are_three_separate_classes() {
         let p = perm(0o640);
-        assert!(p.may_access(OWNER, OWNER_GROUP, IPC_R | IPC_W));
+        assert!(p.may_access(OWNER, OWNER_GROUP, &[], IPC_R | IPC_W));
         // The group may read and not write...
-        assert!(p.may_access(STRANGER, OWNER_GROUP, IPC_R));
-        assert!(!p.may_access(STRANGER, OWNER_GROUP, IPC_W));
+        assert!(p.may_access(STRANGER, OWNER_GROUP, &[], IPC_R));
+        assert!(!p.may_access(STRANGER, OWNER_GROUP, &[], IPC_W));
         // ...and everyone else neither.
-        assert!(!p.may_access(STRANGER, STRANGER_GROUP, IPC_R));
-        assert!(!p.may_access(STRANGER, STRANGER_GROUP, IPC_W));
+        assert!(!p.may_access(STRANGER, STRANGER_GROUP, &[], IPC_R));
+        assert!(!p.may_access(STRANGER, STRANGER_GROUP, &[], IPC_W));
+    }
+
+    /// A supplementary membership is membership, which is what `in_group_p`
+    /// means and what `egid ==` did not. This is the ordinary way an IPC
+    /// object is shared: `0660` on a group, and every member of it whose
+    /// primary group is something else -- which on a normal system is every
+    /// member -- fell into the `other` class and got `EACCES`.
+    #[test]
+    fn a_group_held_by_membership_counts_like_the_one_you_act_as() {
+        let p = perm(0o660);
+        // Acting as the group: the case that always worked.
+        assert!(p.may_access(STRANGER, OWNER_GROUP, &[], IPC_R | IPC_W));
+        // Acting as something else, but a member: the case that did not.
+        assert!(p.may_access(STRANGER, STRANGER_GROUP, &[OWNER_GROUP], IPC_R | IPC_W));
+        // Members of other groups are still nobody, list or no list.
+        assert!(!p.may_access(STRANGER, STRANGER_GROUP, &[77, 78], IPC_R));
+        // And the list does not widen a mode that grants the group nothing.
+        assert!(!perm(0o600).may_access(STRANGER, STRANGER_GROUP, &[OWNER_GROUP], IPC_R));
+    }
+
+    /// The creator's group counts too, and separately from the owner's:
+    /// `ipcperms` asks `in_group_p(cgid) || in_group_p(gid)`, so an
+    /// `IPC_SET` that changed `gid` does not take the creator's group away.
+    #[test]
+    fn the_creators_group_is_asked_the_same_way() {
+        let mut p = perm(0o660);
+        p.gid = STRANGER_GROUP + 1; // an `IPC_SET` moved the owning group
+                                    // `cgid` is still OWNER_GROUP, and holding it by membership is enough.
+        assert!(p.may_access(STRANGER, STRANGER_GROUP, &[OWNER_GROUP], IPC_R | IPC_W));
+        // As is holding the new one.
+        assert!(p.may_access(STRANGER, STRANGER_GROUP, &[p.gid], IPC_R | IPC_W));
     }
 
     /// This is the hole: a `0600` object could be attached, read and written
@@ -765,9 +806,9 @@ mod ipc_access_tests {
     #[test]
     fn a_private_object_is_closed_to_everyone_but_its_owner() {
         let p = perm(0o600);
-        assert!(p.may_access(OWNER, OWNER_GROUP, IPC_R | IPC_W));
-        assert!(!p.may_access(STRANGER, OWNER_GROUP, IPC_R));
-        assert!(!p.may_access(STRANGER, STRANGER_GROUP, IPC_R));
+        assert!(p.may_access(OWNER, OWNER_GROUP, &[], IPC_R | IPC_W));
+        assert!(!p.may_access(STRANGER, OWNER_GROUP, &[], IPC_R));
+        assert!(!p.may_access(STRANGER, STRANGER_GROUP, &[], IPC_R));
     }
 
     /// The classes do not fall through: being refused as the owner does not
@@ -776,11 +817,11 @@ mod ipc_access_tests {
     #[test]
     fn a_class_that_refuses_does_not_fall_through_to_the_next() {
         let p = perm(0o066);
-        assert!(!p.may_access(OWNER, OWNER_GROUP, IPC_R));
-        assert!(!p.may_access(OWNER, OWNER_GROUP, IPC_W));
+        assert!(!p.may_access(OWNER, OWNER_GROUP, &[], IPC_R));
+        assert!(!p.may_access(OWNER, OWNER_GROUP, &[], IPC_W));
         // ...while a stranger in the group, and even one outside it, may.
-        assert!(p.may_access(STRANGER, OWNER_GROUP, IPC_R | IPC_W));
-        assert!(p.may_access(STRANGER, STRANGER_GROUP, IPC_R | IPC_W));
+        assert!(p.may_access(STRANGER, OWNER_GROUP, &[], IPC_R | IPC_W));
+        assert!(p.may_access(STRANGER, STRANGER_GROUP, &[], IPC_R | IPC_W));
     }
 
     /// `ipcperms` tries the creator's ids as well as the current owner's, so
@@ -791,20 +832,23 @@ mod ipc_access_tests {
         let mut p = perm(0o600);
         p.uid = STRANGER;
         p.gid = STRANGER_GROUP;
-        assert!(p.may_access(STRANGER, STRANGER_GROUP, IPC_R | IPC_W));
-        assert!(p.may_access(OWNER, 0, IPC_R | IPC_W), "still the creator");
+        assert!(p.may_access(STRANGER, STRANGER_GROUP, &[], IPC_R | IPC_W));
+        assert!(
+            p.may_access(OWNER, 0, &[], IPC_R | IPC_W),
+            "still the creator"
+        );
         // The same for the group class.
         let mut g = perm(0o060);
         g.gid = STRANGER_GROUP;
-        assert!(g.may_access(STRANGER, STRANGER_GROUP, IPC_R | IPC_W));
-        assert!(g.may_access(STRANGER, OWNER_GROUP, IPC_R | IPC_W));
+        assert!(g.may_access(STRANGER, STRANGER_GROUP, &[], IPC_R | IPC_W));
+        assert!(g.may_access(STRANGER, OWNER_GROUP, &[], IPC_R | IPC_W));
     }
 
     /// euid 0 stands in for `CAP_IPC_OWNER`.
     #[test]
     fn root_passes_whatever_the_mode_says() {
-        assert!(perm(0).may_access(0, 0, IPC_R | IPC_W));
-        assert!(perm(0o600).may_access(0, 999, IPC_R | IPC_W));
+        assert!(perm(0).may_access(0, 0, &[], IPC_R | IPC_W));
+        assert!(perm(0o600).may_access(0, 999, &[], IPC_R | IPC_W));
     }
 
     /// A mode word with nothing in it grants nothing -- but asking for
@@ -813,9 +857,9 @@ mod ipc_access_tests {
     #[test]
     fn asking_for_nothing_is_granted_and_a_zero_mode_grants_nothing() {
         let p = perm(0);
-        assert!(p.may_access(STRANGER, STRANGER_GROUP, 0));
-        assert!(!p.may_access(STRANGER, STRANGER_GROUP, IPC_R));
-        assert!(!p.may_access(OWNER, OWNER_GROUP, IPC_R));
+        assert!(p.may_access(STRANGER, STRANGER_GROUP, &[], 0));
+        assert!(!p.may_access(STRANGER, STRANGER_GROUP, &[], IPC_R));
+        assert!(!p.may_access(OWNER, OWNER_GROUP, &[], IPC_R));
     }
 
     /// The caller does not know which class it will land in, so the mode word
@@ -840,8 +884,8 @@ mod ipc_access_tests {
         assert_eq!(IPC_R, 0o4);
         assert_eq!(IPC_W, 0o2);
         let read_only = perm(0o400);
-        assert!(read_only.may_access(OWNER, OWNER_GROUP, IPC_R));
-        assert!(!read_only.may_access(OWNER, OWNER_GROUP, IPC_W));
-        assert!(!read_only.may_access(OWNER, OWNER_GROUP, IPC_R | IPC_W));
+        assert!(read_only.may_access(OWNER, OWNER_GROUP, &[], IPC_R));
+        assert!(!read_only.may_access(OWNER, OWNER_GROUP, &[], IPC_W));
+        assert!(!read_only.may_access(OWNER, OWNER_GROUP, &[], IPC_R | IPC_W));
     }
 }

@@ -250,8 +250,11 @@ impl SemArray {
     /// Whether `euid`/`egid` may use this set for `want`: `IPC_W` for a
     /// `semop` that alters a semaphore or a `SETVAL`/`SETALL`, `IPC_R` for a
     /// wait-for-zero, a `GET*` or an `IPC_STAT`. See [`IpcPerm::may_access`].
-    pub fn may_access(&self, euid: u32, egid: u32, want: u32) -> bool {
-        self.semid_ds.lock().perm.may_access(euid, egid, want)
+    pub fn may_access(&self, euid: u32, egid: u32, groups: &[u32], want: u32) -> bool {
+        self.semid_ds
+            .lock()
+            .perm
+            .may_access(euid, egid, groups, want)
     }
 
     /// Get the semaphore array with `key`, following semget(2).
@@ -280,6 +283,7 @@ impl SemArray {
         flags: usize,
         uid: u32,
         gid: u32,
+        groups: &[u32],
     ) -> Result<Arc<Self>, LxError> {
         let mut key2sem = KEY2SEM.write();
         Self::purge_stale_keys(&mut key2sem);
@@ -298,7 +302,7 @@ impl SemArray {
                     }
                     // Somebody else's set. Asking for a mode it will not grant
                     // is EACCES, not a working id (`ipc_check_perms`).
-                    if !array.may_access(uid, gid, IpcPerm::requested_mode(flags)) {
+                    if !array.may_access(uid, gid, groups, IpcPerm::requested_mode(flags)) {
                         return Err(LxError::EACCES);
                     }
                     return Ok(array);
@@ -388,7 +392,7 @@ mod sem_tests {
     /// `semget` as root, which is what every test here that does not care
     /// about ownership wants.
     fn get(key: u32, nsems: usize, flags: usize) -> Result<Arc<SemArray>, LxError> {
-        SemArray::get_or_create(key, nsems, flags, ROOT, ROOT)
+        SemArray::get_or_create(key, nsems, flags, ROOT, ROOT, &[])
     }
 
     /// `newary`: a set is never created with no semaphores in it. Zero is a
@@ -626,7 +630,7 @@ mod sem_tests {
     #[test]
     fn semget_records_the_caller_as_owner_and_creator() {
         let _guard = test_lock();
-        let a = SemArray::get_or_create(0, 1, CREAT | 0o666, OWNER, OWNER + 5).unwrap();
+        let a = SemArray::get_or_create(0, 1, CREAT | 0o666, OWNER, OWNER + 5, &[]).unwrap();
         let perm = a.semid_ds.lock().perm;
         assert_eq!(perm.uid, OWNER);
         assert_eq!(perm.gid, OWNER + 5);
@@ -640,7 +644,7 @@ mod sem_tests {
     #[test]
     fn ipc_set_from_a_stranger_is_eperm_and_changes_nothing() {
         let _guard = test_lock();
-        let a = SemArray::get_or_create(0, 1, CREAT | 0o600, OWNER, OWNER).unwrap();
+        let a = SemArray::get_or_create(0, 1, CREAT | 0o600, OWNER, OWNER, &[]).unwrap();
         let mut ds = *a.semid_ds.lock();
         ds.perm.uid = STRANGER;
         ds.perm.mode = 0o666;
@@ -657,7 +661,7 @@ mod sem_tests {
     #[test]
     fn only_the_owner_the_creator_and_root_may_control_a_set() {
         let _guard = test_lock();
-        let a = SemArray::get_or_create(0, 1, CREAT | 0o666, OWNER, OWNER).unwrap();
+        let a = SemArray::get_or_create(0, 1, CREAT | 0o666, OWNER, OWNER, &[]).unwrap();
         assert!(a.may_control(OWNER));
         assert!(a.may_control(ROOT));
         assert!(!a.may_control(STRANGER));
@@ -677,20 +681,20 @@ mod sem_tests {
     #[test]
     fn semget_refuses_a_key_that_belongs_to_somebody_else() {
         let _guard = test_lock();
-        let owned = SemArray::get_or_create(7701, 2, CREAT | 0o600, OWNER, OWNER).unwrap();
+        let owned = SemArray::get_or_create(7701, 2, CREAT | 0o600, OWNER, OWNER, &[]).unwrap();
         assert!(Arc::ptr_eq(
-            &SemArray::get_or_create(7701, 2, 0o600, OWNER, OWNER).unwrap(),
+            &SemArray::get_or_create(7701, 2, 0o600, OWNER, OWNER, &[]).unwrap(),
             &owned
         ));
         assert_eq!(
-            SemArray::get_or_create(7701, 2, 0o600, STRANGER, STRANGER).err(),
+            SemArray::get_or_create(7701, 2, 0o600, STRANGER, STRANGER, &[]).err(),
             Some(LxError::EACCES)
         );
         assert!(
-            SemArray::get_or_create(7701, 2, 0, STRANGER, STRANGER).is_ok(),
+            SemArray::get_or_create(7701, 2, 0, STRANGER, STRANGER, &[]).is_ok(),
             "a bare existence probe asks for nothing"
         );
-        assert!(SemArray::get_or_create(7701, 2, 0o600, ROOT, ROOT).is_ok());
+        assert!(SemArray::get_or_create(7701, 2, 0o600, ROOT, ROOT, &[]).is_ok());
         drop(owned);
     }
 
@@ -700,9 +704,9 @@ mod sem_tests {
     #[test]
     fn a_set_too_small_is_einval_before_it_is_eacces() {
         let _guard = test_lock();
-        let owned = SemArray::get_or_create(7702, 2, CREAT | 0o600, OWNER, OWNER).unwrap();
+        let owned = SemArray::get_or_create(7702, 2, CREAT | 0o600, OWNER, OWNER, &[]).unwrap();
         assert_eq!(
-            SemArray::get_or_create(7702, 9, 0o600, STRANGER, STRANGER).err(),
+            SemArray::get_or_create(7702, 9, 0o600, STRANGER, STRANGER, &[]).err(),
             Some(LxError::EINVAL)
         );
         drop(owned);
@@ -713,11 +717,11 @@ mod sem_tests {
     #[test]
     fn a_set_answers_for_itself_who_may_alter_it() {
         let _guard = test_lock();
-        let array = SemArray::get_or_create(7703, 1, CREAT | 0o640, OWNER, OWNER).unwrap();
-        assert!(array.may_access(OWNER, OWNER, IPC_R | IPC_W));
-        assert!(array.may_access(STRANGER, OWNER, IPC_R));
-        assert!(!array.may_access(STRANGER, OWNER, IPC_W));
-        assert!(!array.may_access(STRANGER, STRANGER, IPC_R));
+        let array = SemArray::get_or_create(7703, 1, CREAT | 0o640, OWNER, OWNER, &[]).unwrap();
+        assert!(array.may_access(OWNER, OWNER, &[], IPC_R | IPC_W));
+        assert!(array.may_access(STRANGER, OWNER, &[], IPC_R));
+        assert!(!array.may_access(STRANGER, OWNER, &[], IPC_W));
+        assert!(!array.may_access(STRANGER, STRANGER, &[], IPC_R));
     }
 }
 
@@ -740,7 +744,7 @@ mod sem_registry_tests {
     }
 
     fn private_set() -> Arc<SemArray> {
-        SemArray::get_or_create(0, 1, CREAT | 0o666, 0, 0).unwrap()
+        SemArray::get_or_create(0, 1, CREAT | 0o666, 0, 0, &[]).unwrap()
     }
 
     /// busybox `ipcs -s`: `maxid = semctl(0, 0, SEM_INFO, &info)`, then
@@ -752,8 +756,10 @@ mod sem_registry_tests {
         clear_ids();
         assert_eq!(sem_max_index(), None);
         assert_eq!(sem_totals(), (0, 0));
-        let a = sem_register(&SemArray::get_or_create(0, 2, CREAT | 0o600, 0, 0).unwrap()).unwrap();
-        let b = sem_register(&SemArray::get_or_create(0, 3, CREAT | 0o600, 0, 0).unwrap()).unwrap();
+        let a = sem_register(&SemArray::get_or_create(0, 2, CREAT | 0o600, 0, 0, &[]).unwrap())
+            .unwrap();
+        let b = sem_register(&SemArray::get_or_create(0, 3, CREAT | 0o600, 0, 0, &[]).unwrap())
+            .unwrap();
         assert_eq!(sem_max_index(), Some(b - 1));
         assert_eq!(sem_at_index(a - 1).unwrap().0, a);
         assert_eq!(sem_at_index(b - 1).unwrap().0, b);
@@ -787,12 +793,12 @@ mod sem_registry_tests {
         clear_ids();
         const KEY: u32 = 0x5e5e_0001;
         let id = {
-            let array = SemArray::get_or_create(KEY, 1, CREAT | 0o666, 0, 0).unwrap();
+            let array = SemArray::get_or_create(KEY, 1, CREAT | 0o666, 0, 0, &[]).unwrap();
             array.get_sem(0).unwrap().set(7);
             sem_register(&array).unwrap()
             // ...and the creator's reference is gone.
         };
-        let again = SemArray::get_or_create(KEY, 0, 0o666, 0, 0)
+        let again = SemArray::get_or_create(KEY, 0, 0o666, 0, 0, &[])
             .expect("the key must still name the set after its creator exits");
         assert_eq!(again.get_sem(0).unwrap().get(), 7, "with its value");
         assert_eq!(sem_register(&again), Ok(id), "under the same id");
@@ -802,7 +808,7 @@ mod sem_registry_tests {
         assert!(sem_unregister(id));
         drop(again);
         assert_eq!(
-            SemArray::get_or_create(KEY, 0, 0o666, 0, 0).err(),
+            SemArray::get_or_create(KEY, 0, 0o666, 0, 0, &[]).err(),
             Some(LxError::ENOENT)
         );
         clear_ids();
@@ -864,7 +870,7 @@ mod sem_registry_tests {
         );
         // A key past i32::MAX: `struct ipc_perm.key` is an `int`, so Linux
         // prints it negative and `ipcs` reads it back with `%d`.
-        let a = SemArray::get_or_create(0xffff_fff0, 3, CREAT | 0o640, 1000, 100).unwrap();
+        let a = SemArray::get_or_create(0xffff_fff0, 3, CREAT | 0o640, 1000, 100, &[]).unwrap();
         let b = private_set();
         let id_a = sem_register(&a).unwrap();
         let id_b = sem_register(&b).unwrap();
