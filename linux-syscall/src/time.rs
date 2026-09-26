@@ -367,6 +367,11 @@ impl Syscall<'_> {
         if clock != 0 {
             return Err(LxError::EINVAL);
         }
+        // `posix_clock_realtime_set` is `do_sys_settimeofday64(tp, NULL)`:
+        // the time is read and judged (`timespec64_valid_settod`, EINVAL)
+        // before anybody asks who is calling.
+        let ts = timespec.read()?;
+        let target = settod_time(ts.sec, ts.nsec)?;
         // Linux routes both clock setters through `security_settime64`, whose
         // default (`security/commoncap.c`) is the whole rule:
         //
@@ -381,25 +386,43 @@ impl Syscall<'_> {
         if !self.linux_process().capable(CAP_SYS_TIME) {
             return Err(LxError::EPERM);
         }
-        let ts = timespec.read()?;
-        let target = Duration::new(ts.sec as u64, ts.nsec as u32);
         kernel_hal::timer::wall_clock_set(target);
         Ok(0)
     }
 
-    /// legacy settimeofday (seconds + microseconds since Unix epoch)
-    pub fn sys_settimeofday(&mut self, tv: UserInPtr<TimeVal>, tz: UserInPtr<u8>) -> SysResult {
+    /// `settimeofday(2)`: the wall clock, the system timezone, or both.
+    ///
+    /// A non-null `tz` used to be `EINVAL` outright, and that is exactly what
+    /// busybox's `hwclock -s` passes (`to_sys_clock`: `settimeofday(&tv,
+    /// &tz)` with `tz_minuteswest` from the C library), so Alpine's `hwclock`
+    /// boot service died with `settimeofday: Invalid argument` and the RTC
+    /// never reached the system clock. util-linux `hwclock --systz` is the
+    /// other caller, with `tv` NULL: the one-time "warp" that turns a clock
+    /// set from a local-time RTC into UTC. See [`settimeofday_plan`].
+    pub fn sys_settimeofday(
+        &mut self,
+        tv: UserInPtr<TimeVal>,
+        tz: UserInPtr<TimeZone>,
+    ) -> SysResult {
         info!("settimeofday: tv={:?}, tz={:?}", tv, tz);
-        if !tz.is_null() {
-            return Err(LxError::EINVAL);
-        }
+        // `do_sys_settimeofday64`: the time is judged first (EINVAL), then
+        // the caller (EPERM), then the timezone (EINVAL), then both apply.
+        let tv = tv
+            .read_if_not_null()?
+            .map(|tv| settod_timeval(tv.sec, tv.usec))
+            .transpose()?;
+        let tz = tz.read_if_not_null()?;
         // The same `cap_settime` gate as `clock_settime`: one clock, one rule.
         if !self.linux_process().capable(CAP_SYS_TIME) {
             return Err(LxError::EPERM);
         }
-        let timeval = tv.read()?;
-        let target = Duration::new(timeval.sec as u64, timeval.usec as u32 * 1_000);
-        kernel_hal::timer::wall_clock_set(target);
+        let plan = settimeofday_plan(tv, tz, &TZ_FIRST_TIME, kernel_hal::timer::wall_clock_now())?;
+        if let Some(tz) = plan.tz {
+            *SYS_TZ.lock() = tz;
+        }
+        if let Some(target) = plan.clock {
+            kernel_hal::timer::wall_clock_set(target);
+        }
         Ok(0)
     }
 
@@ -433,23 +456,25 @@ impl Syscall<'_> {
         }
     }
 
-    /// get the time with second and microseconds
+    /// `gettimeofday(2)`: the wall clock into `tv` and the system timezone
+    /// into `tz`, each only when asked for (either pointer may be NULL, as
+    /// `SYSCALL_DEFINE2(gettimeofday)` allows). A non-null `tz` used to be
+    /// `EINVAL`; the `struct timezone` it names is what `settimeofday` stores.
     pub fn sys_gettimeofday(
         &mut self,
         mut tv: UserOutPtr<TimeVal>,
-        tz: UserInPtr<u8>,
+        mut tz: UserOutPtr<TimeZone>,
     ) -> SysResult {
         trace!("gettimeofday: tv: {:?}, tz: {:?}", tv, tz);
-        // don't support tz
-        if !tz.is_null() {
-            return Err(LxError::EINVAL);
+        if !tv.is_null() {
+            let timeval = TimeVal::now();
+            trace!("gettimeofday: {:?}", timeval);
+            tv.write(timeval)?;
         }
-
-        let timeval = TimeVal::now();
-        tv.write(timeval)?;
-
-        trace!("gettimeofday: {:?}", timeval);
-
+        if !tz.is_null() {
+            let sys_tz = *SYS_TZ.lock();
+            tz.write(sys_tz)?;
+        }
         Ok(0)
     }
 
@@ -1300,6 +1325,297 @@ fn expire_posix_timer(id: usize, gen: u64, now: Duration) -> Option<Duration> {
         }
     }
     rearm
+}
+
+/// `struct timezone` of gettimeofday(2)/settimeofday(2): minutes WEST of
+/// Greenwich, and the DST rule nobody uses any more.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TimeZone {
+    /// `tz_minuteswest`
+    pub minuteswest: i32,
+    /// `tz_dsttime`
+    pub dsttime: i32,
+}
+
+lazy_static! {
+    /// `sys_tz`: what the last `settimeofday` with a timezone stored, read
+    /// back by `gettimeofday`.
+    static ref SYS_TZ: Mutex<TimeZone> = Mutex::new(TimeZone::default());
+}
+
+/// `do_sys_settimeofday64`'s `static int firsttime = 1`: the first timezone
+/// ever set may warp the clock, and only the first.
+static TZ_FIRST_TIME: AtomicBool = AtomicBool::new(true);
+
+/// `KTIME_SEC_MAX`: the largest second a `ktime_t` holds.
+const KTIME_SEC_MAX: i64 = i64::MAX / 1_000_000_000;
+
+/// `timespec64_valid_settod`: a time the wall clock may be set to. The raw
+/// words come from the user as unsigned, so they are judged as the signed
+/// values they are on the wire: a negative second or nanosecond is EINVAL,
+/// not a date in the year 584 billion, and a nanosecond of a billion or more
+/// is EINVAL rather than a second silently carried.
+pub(crate) fn settod_time(sec: usize, nsec: usize) -> Result<Duration, LxError> {
+    let (sec, nsec) = (sec as i64, nsec as i64);
+    if !(0..1_000_000_000).contains(&nsec) || !(0..=KTIME_SEC_MAX).contains(&sec) {
+        return Err(LxError::EINVAL);
+    }
+    Ok(Duration::new(sec as u64, nsec as u32))
+}
+
+/// `settimeofday`'s `tv_usec * NSEC_PER_USEC` fed to [`settod_time`]: a
+/// microsecond of a million or more, or a negative one, is EINVAL.
+pub(crate) fn settod_timeval(sec: usize, usec: usize) -> Result<Duration, LxError> {
+    let usec = usec as i64;
+    if !(0..1_000_000).contains(&usec) {
+        return Err(LxError::EINVAL);
+    }
+    settod_time(sec, (usec * 1_000) as usize)
+}
+
+/// What a `settimeofday(tv, tz)` ends up doing, decided as
+/// `do_sys_settimeofday64` does once the time is valid and the caller is
+/// allowed.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct SettimeofdayPlan {
+    /// The value to set the wall clock to, if any.
+    pub clock: Option<Duration>,
+    /// The timezone to store as `sys_tz`, if any.
+    pub tz: Option<TimeZone>,
+}
+
+/// ```c
+/// if (tz) {
+///         /* Verify we're within the +-15 hrs range */
+///         if (tz->tz_minuteswest > 15*60 || tz->tz_minuteswest < -15*60)
+///                 return -EINVAL;
+///         sys_tz = *tz;
+///         update_vsyscall_tz();
+///         if (firsttime) {
+///                 firsttime = 0;
+///                 if (!tv)
+///                         timekeeping_warp_clock();
+///         }
+/// }
+/// if (tv)
+///         return do_settimeofday64(tv);
+/// ```
+///
+/// The warp (`timekeeping_warp_clock`) adds `tz_minuteswest * 60` seconds to
+/// the clock: a clock that was set from an RTC keeping local time becomes
+/// UTC. `first_time` is the `firsttime` static, consumed by the first call
+/// that carries a timezone whether or not it warps.
+pub(crate) fn settimeofday_plan(
+    tv: Option<Duration>,
+    tz: Option<TimeZone>,
+    first_time: &AtomicBool,
+    now: Duration,
+) -> Result<SettimeofdayPlan, LxError> {
+    let mut clock = tv;
+    if let Some(tz) = tz {
+        if !(-15 * 60..=15 * 60).contains(&tz.minuteswest) {
+            return Err(LxError::EINVAL);
+        }
+        if first_time.swap(false, Ordering::SeqCst) && tv.is_none() && tz.minuteswest != 0 {
+            let adjust = tz.minuteswest as i64 * 60;
+            clock = Some(if adjust >= 0 {
+                now.saturating_add(Duration::from_secs(adjust as u64))
+            } else {
+                now.saturating_sub(Duration::from_secs(adjust.unsigned_abs()))
+            });
+        }
+    }
+    Ok(SettimeofdayPlan { clock, tz })
+}
+
+#[cfg(test)]
+mod settimeofday_tests {
+    use super::*;
+
+    const HOUR: u64 = 3600;
+
+    fn tz(minuteswest: i32) -> TimeZone {
+        TimeZone {
+            minuteswest,
+            dsttime: 0,
+        }
+    }
+
+    #[test]
+    fn timezone_matches_the_c_struct() {
+        assert_eq!(core::mem::size_of::<TimeZone>(), 8);
+        assert_eq!(core::mem::offset_of!(TimeZone, dsttime), 4);
+    }
+
+    #[test]
+    fn a_time_is_judged_as_the_signed_value_on_the_wire() {
+        assert_eq!(
+            settod_time(1_700_000_000, 999_999_999),
+            Ok(Duration::new(1_700_000_000, 999_999_999))
+        );
+        assert_eq!(settod_time(0, 0), Ok(Duration::ZERO));
+        // `tv_nsec` of a billion is not "one more second".
+        assert_eq!(settod_time(5, 1_000_000_000), Err(LxError::EINVAL));
+        // Negative, as the C long the user wrote, not as a huge usize.
+        assert_eq!(settod_time(5, (-1i64) as usize), Err(LxError::EINVAL));
+        assert_eq!(settod_time((-1i64) as usize, 0), Err(LxError::EINVAL));
+        assert_eq!(
+            settod_time((KTIME_SEC_MAX + 1) as usize, 0),
+            Err(LxError::EINVAL)
+        );
+        assert_eq!(
+            settod_time(KTIME_SEC_MAX as usize, 0),
+            Ok(Duration::from_secs(KTIME_SEC_MAX as u64))
+        );
+    }
+
+    #[test]
+    fn a_timeval_is_judged_in_microseconds() {
+        assert_eq!(
+            settod_timeval(7, 999_999),
+            Ok(Duration::new(7, 999_999_000))
+        );
+        assert_eq!(settod_timeval(7, 1_000_000), Err(LxError::EINVAL));
+        assert_eq!(settod_timeval(7, (-1i64) as usize), Err(LxError::EINVAL));
+        assert_eq!(settod_timeval((-1i64) as usize, 0), Err(LxError::EINVAL));
+        // A microsecond count whose thousandfold wraps a 64-bit word back
+        // into range is still out of range.
+        assert_eq!(settod_timeval(7, 1 << 62), Err(LxError::EINVAL));
+    }
+
+    #[test]
+    fn the_timezone_must_be_within_fifteen_hours_of_greenwich() {
+        let first = AtomicBool::new(false);
+        let now = Duration::from_secs(1_000_000);
+        assert_eq!(
+            settimeofday_plan(None, Some(tz(15 * 60)), &first, now),
+            Ok(SettimeofdayPlan {
+                clock: None,
+                tz: Some(tz(15 * 60))
+            })
+        );
+        assert_eq!(
+            settimeofday_plan(None, Some(tz(-15 * 60)), &first, now),
+            Ok(SettimeofdayPlan {
+                clock: None,
+                tz: Some(tz(-15 * 60))
+            })
+        );
+        assert_eq!(
+            settimeofday_plan(None, Some(tz(15 * 60 + 1)), &first, now),
+            Err(LxError::EINVAL)
+        );
+        assert_eq!(
+            settimeofday_plan(None, Some(tz(-15 * 60 - 1)), &first, now),
+            Err(LxError::EINVAL)
+        );
+        // A bad timezone refuses the whole call, the time included.
+        assert_eq!(
+            settimeofday_plan(Some(now), Some(tz(9999)), &first, now),
+            Err(LxError::EINVAL)
+        );
+    }
+
+    #[test]
+    fn busybox_hwclock_sets_the_time_and_the_timezone_in_one_call() {
+        // `to_sys_clock`: `settimeofday(&tv, &tz)` with `tz_minuteswest =
+        // timezone / 60`. The clock is set to `tv`, not warped, and the
+        // timezone is stored; the first-time warp is spent.
+        let first = AtomicBool::new(true);
+        let now = Duration::from_secs(1_000_000);
+        let rtc = Duration::from_secs(1_700_000_000);
+        assert_eq!(
+            settimeofday_plan(Some(rtc), Some(tz(-60)), &first, now),
+            Ok(SettimeofdayPlan {
+                clock: Some(rtc),
+                tz: Some(tz(-60))
+            })
+        );
+        assert!(!first.load(Ordering::SeqCst));
+        // A later `hwclock --systz` no longer warps.
+        assert_eq!(
+            settimeofday_plan(None, Some(tz(-60)), &first, now),
+            Ok(SettimeofdayPlan {
+                clock: None,
+                tz: Some(tz(-60))
+            })
+        );
+    }
+
+    #[test]
+    fn the_first_timezone_without_a_time_warps_the_clock_once() {
+        // `hwclock --systz` on a machine whose RTC keeps local time: the
+        // clock was set from it as if it were UTC, and CET (one hour EAST,
+        // so `tz_minuteswest` is -60) means it reads an hour ahead. The warp
+        // subtracts that hour; a zone west of Greenwich adds.
+        let now = Duration::from_secs(10 * HOUR);
+        let first = AtomicBool::new(true);
+        assert_eq!(
+            settimeofday_plan(None, Some(tz(-60)), &first, now),
+            Ok(SettimeofdayPlan {
+                clock: Some(Duration::from_secs(9 * HOUR)),
+                tz: Some(tz(-60))
+            })
+        );
+        // Only once: the second call stores the zone and leaves the clock.
+        assert_eq!(
+            settimeofday_plan(None, Some(tz(-60)), &first, now),
+            Ok(SettimeofdayPlan {
+                clock: None,
+                tz: Some(tz(-60))
+            })
+        );
+        let first = AtomicBool::new(true);
+        assert_eq!(
+            settimeofday_plan(None, Some(tz(300)), &first, now),
+            Ok(SettimeofdayPlan {
+                clock: Some(Duration::from_secs(15 * HOUR)),
+                tz: Some(tz(300))
+            })
+        );
+        // Greenwich itself has nothing to warp, and a clock that cannot go
+        // below zero stops there.
+        let first = AtomicBool::new(true);
+        assert_eq!(
+            settimeofday_plan(None, Some(tz(0)), &first, now),
+            Ok(SettimeofdayPlan {
+                clock: None,
+                tz: Some(tz(0))
+            })
+        );
+        let first = AtomicBool::new(true);
+        assert_eq!(
+            settimeofday_plan(None, Some(tz(-15 * 60)), &first, Duration::from_secs(HOUR)),
+            Ok(SettimeofdayPlan {
+                clock: Some(Duration::ZERO),
+                tz: Some(tz(-15 * 60))
+            })
+        );
+    }
+
+    #[test]
+    fn a_time_alone_sets_the_clock_and_touches_no_timezone() {
+        let first = AtomicBool::new(true);
+        let t = Duration::from_secs(1_700_000_000);
+        assert_eq!(
+            settimeofday_plan(Some(t), None, &first, Duration::ZERO),
+            Ok(SettimeofdayPlan {
+                clock: Some(t),
+                tz: None
+            })
+        );
+        // Without a timezone the first-time warp is still available.
+        assert!(first.load(Ordering::SeqCst));
+        // Nothing at all is a successful nothing.
+        assert_eq!(
+            settimeofday_plan(None, None, &first, Duration::ZERO),
+            Ok(SettimeofdayPlan {
+                clock: None,
+                tz: None
+            })
+        );
+    }
 }
 
 #[cfg(test)]
