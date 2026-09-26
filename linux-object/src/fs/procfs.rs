@@ -555,22 +555,10 @@ impl INode for ProcRootINode {
     }
 
     fn metadata(&self) -> Result<Metadata> {
-        Ok(Metadata {
-            dev: 0,
-            inode: 10,
-            size: 0,
-            blk_size: 0,
-            blocks: 0,
-            atime: Timespec { sec: 0, nsec: 0 },
-            mtime: Timespec { sec: 0, nsec: 0 },
-            ctime: Timespec { sec: 0, nsec: 0 },
-            type_: FileType::Dir,
-            mode: 0o555,
-            nlinks: 0,
-            uid: 0,
-            gid: 0,
-            rdev: 0,
-        })
+        // `net`, `sysvipc`, `sys` and `perf`, plus a `/proc/<pid>` per live
+        // process -- which is why Linux's `/proc` nlink moves as processes come
+        // and go (`proc_root_getattr`: `nlink + nr_processes()`).
+        Ok(dir_metadata(10, 4 + all_processes().len()))
     }
 
     fn as_any_ref(&self) -> &dyn Any {
@@ -741,7 +729,8 @@ impl INode for ProcPidDirINode {
             ctime: Timespec { sec: 0, nsec: 0 },
             type_: FileType::Dir,
             mode: 0o555,
-            nlinks: 2,
+            // `.`, the name in `/proc`, and `fd`'s `..`.
+            nlinks: 3,
             uid: 0,
             gid: 0,
             rdev: 0,
@@ -841,8 +830,17 @@ impl INode for ProcPidDirINode {
 struct ProcNetDirINode;
 
 impl ProcNetDirINode {
-    fn entries() -> [&'static str; 7] {
-        ["dev", "route", "arp", "if_inet6", "tcp", "udp", "unix"]
+    /// `.` and `..` first, as `readdir` gives them and as every other
+    /// directory here lists them. This was the one that left them out, so
+    /// `ls -a /proc/net` showed neither and a walker that counts on finding
+    /// them -- `fts(3)` uses `..` to climb back out without re-resolving the
+    /// path -- got a directory shaped like nothing else in the tree. `find`
+    /// answered them from `find()`, which is why a lookup by name worked and
+    /// only the listing was short.
+    fn entries() -> [&'static str; 9] {
+        [
+            ".", "..", "dev", "route", "arp", "if_inet6", "tcp", "udp", "unix",
+        ]
     }
 }
 
@@ -865,22 +863,7 @@ impl INode for ProcNetDirINode {
     }
 
     fn metadata(&self) -> Result<Metadata> {
-        Ok(Metadata {
-            dev: 0,
-            inode: 20,
-            size: 0,
-            blk_size: 0,
-            blocks: 0,
-            atime: Timespec { sec: 0, nsec: 0 },
-            mtime: Timespec { sec: 0, nsec: 0 },
-            ctime: Timespec { sec: 0, nsec: 0 },
-            type_: FileType::Dir,
-            mode: 0o555,
-            nlinks: 0,
-            uid: 0,
-            gid: 0,
-            rdev: 0,
-        })
+        Ok(dir_metadata(20, 0))
     }
 
     fn as_any_ref(&self) -> &dyn Any {
@@ -943,7 +926,7 @@ impl INode for ProcSysvipcDirINode {
         })
     }
     fn metadata(&self) -> Result<Metadata> {
-        Ok(dir_metadata(21))
+        Ok(dir_metadata(21, 0))
     }
     fn as_any_ref(&self) -> &dyn Any {
         self
@@ -990,7 +973,7 @@ impl INode for ProcSysDirINode {
         })
     }
     fn metadata(&self) -> Result<Metadata> {
-        Ok(dir_metadata(40))
+        Ok(dir_metadata(40, 3))
     }
     fn as_any_ref(&self) -> &dyn Any {
         self
@@ -1041,7 +1024,7 @@ impl INode for ProcSysKernelDirINode {
         })
     }
     fn metadata(&self) -> Result<Metadata> {
-        Ok(dir_metadata(41))
+        Ok(dir_metadata(41, 1))
     }
     fn as_any_ref(&self) -> &dyn Any {
         self
@@ -1112,7 +1095,7 @@ impl INode for ProcSysKernelRandomDirINode {
         })
     }
     fn metadata(&self) -> Result<Metadata> {
-        Ok(dir_metadata(59))
+        Ok(dir_metadata(59, 0))
     }
     fn as_any_ref(&self) -> &dyn Any {
         self
@@ -1159,7 +1142,7 @@ impl INode for ProcSysVmDirINode {
         })
     }
     fn metadata(&self) -> Result<Metadata> {
-        Ok(dir_metadata(62))
+        Ok(dir_metadata(62, 0))
     }
     fn as_any_ref(&self) -> &dyn Any {
         self
@@ -1206,7 +1189,7 @@ impl INode for ProcSysFsDirINode {
         })
     }
     fn metadata(&self) -> Result<Metadata> {
-        Ok(dir_metadata(65))
+        Ok(dir_metadata(65, 0))
     }
     fn as_any_ref(&self) -> &dyn Any {
         self
@@ -1236,7 +1219,20 @@ impl INode for ProcSysFsDirINode {
     }
 }
 
-fn dir_metadata(inode: usize) -> Metadata {
+/// The metadata of a `/proc` directory that holds `subdirs` directories of its
+/// own.
+///
+/// `nlinks` was `0`, and a live directory with no links is not a thing a
+/// filesystem may report. Two tools act on the number rather than showing it:
+/// `stat` prints "Links: 0", which reads as a directory that has been removed;
+/// and everything built on `fts(3)` -- `find`, `du`, `chmod -R`, `cp -r`,
+/// `rm -r`, `rsync` -- subtracts 2 from it to learn how many subdirectories are
+/// left to visit, and stops descending when the count runs out. That is what
+/// `find -noleaf` exists to switch off, and its man page names "filesystems
+/// that do not follow the Unix link convention" as the reason. So a directory
+/// has to report `2 + subdirs`: one link for its own `.`, one for its name in
+/// the parent, and one per child directory's `..`.
+fn dir_metadata(inode: usize, subdirs: usize) -> Metadata {
     Metadata {
         dev: 0,
         inode,
@@ -1248,7 +1244,7 @@ fn dir_metadata(inode: usize) -> Metadata {
         ctime: Timespec { sec: 0, nsec: 0 },
         type_: FileType::Dir,
         mode: 0o555,
-        nlinks: 0,
+        nlinks: 2 + subdirs,
         uid: 0,
         gid: 0,
         rdev: 0,
@@ -1324,7 +1320,7 @@ impl INode for ProcPerfDirINode {
         })
     }
     fn metadata(&self) -> Result<Metadata> {
-        Ok(dir_metadata(45))
+        Ok(dir_metadata(45, 0))
     }
     fn as_any_ref(&self) -> &dyn Any {
         self
@@ -3965,6 +3961,89 @@ mod sysvipc_dir_tests {
         assert!(
             read_all(&PROC_SYSVIPC_DIR.find("shm").unwrap()).contains("shmid"),
             "shm is the shared-memory table"
+        );
+    }
+}
+
+#[cfg(test)]
+mod dir_shape_tests {
+    //! What a directory of `/proc` looks like to a walker: its entries and its
+    //! link count. Both were wrong in ways only a tool notices.
+
+    use super::*;
+
+    fn names(dir: &Arc<dyn INode>) -> alloc::vec::Vec<String> {
+        let mut out = alloc::vec::Vec::new();
+        let mut i = 0;
+        while let Ok(name) = dir.get_entry(i) {
+            out.push(name);
+            i += 1;
+        }
+        out
+    }
+
+    /// `/proc/net` was the one directory whose listing had no `.` and no `..`,
+    /// so `ls -a` showed neither although `find()` resolved both.
+    #[test]
+    fn proc_net_lists_dot_and_dotdot_like_every_other_directory() {
+        let dir = PROC_NET_DIR.clone();
+        let names = names(&dir);
+        assert_eq!(names.first().map(|s| s.as_str()), Some("."));
+        assert_eq!(names.get(1).map(|s| s.as_str()), Some(".."));
+        // And the tables are still all there, after the two.
+        for table in ["dev", "route", "arp", "if_inet6", "tcp", "udp", "unix"] {
+            assert!(names.iter().any(|n| n == table), "{} is listed", table);
+        }
+        assert_eq!(names.len(), 9);
+    }
+
+    /// Every listed name resolves, which is the property that makes a listing
+    /// walkable: `fts(3)` looks up what `readdir` handed it.
+    #[test]
+    fn every_name_proc_net_lists_resolves() {
+        let dir = PROC_NET_DIR.clone();
+        for name in names(&dir) {
+            assert!(dir.find(&name).is_ok(), "{} resolves", name);
+        }
+    }
+
+    /// A live directory reports at least two links. Zero reads as removed, and
+    /// `fts(3)` subtracts 2 from it to decide how far to descend.
+    #[test]
+    fn no_proc_directory_claims_to_have_no_links() {
+        let dirs: alloc::vec::Vec<(&str, Arc<dyn INode>)> = alloc::vec![
+            ("/proc", PROC_ROOT.clone()),
+            ("/proc/net", PROC_NET_DIR.clone()),
+            ("/proc/sysvipc", PROC_SYSVIPC_DIR.clone()),
+            ("/proc/sys", PROC_SYS_DIR.clone()),
+            ("/proc/perf", PROC_PERF_DIR.clone()),
+        ];
+        for (path, dir) in dirs {
+            let m = dir.metadata().unwrap();
+            assert_eq!(m.type_, FileType::Dir, "{} is a directory", path);
+            assert!(m.nlinks >= 2, "{} has {} links", path, m.nlinks);
+        }
+    }
+
+    /// And a directory that holds directories says so: `/proc/sys` has
+    /// `kernel`, `vm` and `fs` under it, so 2 + 3.
+    #[test]
+    fn a_directory_counts_its_subdirectories_in_its_links() {
+        assert_eq!(PROC_SYS_DIR.metadata().unwrap().nlinks, 5);
+        assert_eq!(
+            PROC_SYS_DIR
+                .find("kernel")
+                .unwrap()
+                .metadata()
+                .unwrap()
+                .nlinks,
+            3,
+            "/proc/sys/kernel holds random"
+        );
+        assert_eq!(
+            PROC_SYS_DIR.find("vm").unwrap().metadata().unwrap().nlinks,
+            2,
+            "/proc/sys/vm holds only files"
         );
     }
 }

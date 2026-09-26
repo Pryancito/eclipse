@@ -246,7 +246,6 @@ impl Syscall<'_> {
         if !sem_array.may_access(proc.euid(), proc.egid(), if alter { IPC_W } else { IPC_R }) {
             return Err(LxError::EACCES);
         }
-        sem_array.otime();
         let pid = self.zircon_process().id() as usize;
 
         loop {
@@ -274,6 +273,14 @@ impl Syscall<'_> {
                                 self.linux_process().semaphores_add_undo(id, num, op);
                             }
                         }
+                        // `sem_otime` is the time of the last SUCCESSFUL
+                        // operation (`do_smart_update`), and it used to be
+                        // stamped before the loop: a `semop` that answered
+                        // ERANGE or EAGAIN, or one that blocked for ever,
+                        // moved it. `ipcs -s`, and any watchdog that reads it
+                        // to tell "this set is in use" from "this set is
+                        // wedged", got the wrong answer.
+                        sem_array.otime();
                         return Ok(0);
                     }
                     // Nothing was applied. Remember which semaphore is in
@@ -425,8 +432,21 @@ impl Syscall<'_> {
                     SemctlCmds::GETNCNT => Ok(sem.get_ncnt()),
                     SemctlCmds::GETZCNT => Ok(0),
                     SemctlCmds::SETVAL => {
-                        sem.set(setval_from_arg(arg)?);
+                        let value = setval_from_arg(arg)?;
+                        // Under the set-wide lock, as `semctl_main` holds
+                        // `sem_lock(sma)` for `SETVAL` exactly as for `SETALL`
+                        // -- and as `GETALL` and `SETALL` do here. Without it
+                        // the write was simply lost: `sys_semop` plans against
+                        // a snapshot and then writes ABSOLUTE values under that
+                        // lock, so a `SETVAL` landing between another process's
+                        // snapshot and its apply is overwritten by a value
+                        // computed from the state before it. Userspace saw
+                        // `semctl(id, n, SETVAL, 0)` -- the usual "reset the
+                        // lock" -- take effect and then revert on its own.
+                        let _atomic = sem_array.semop_guard();
+                        sem.set(value);
                         sem.set_pid(self.zircon_process().id() as usize);
+                        drop(_atomic);
                         sem_array.ctime();
                         Ok(0)
                     }

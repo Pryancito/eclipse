@@ -755,16 +755,21 @@ impl Pty {
             TCSETSF => {
                 // Set attributes and flush the input queue (Linux TCSETSF).
                 let t = unsafe { *(data as *const Termios) };
-                let clear_readable;
                 {
                     let mut inner = self.inner.lock();
                     inner.termios = t;
                     inner.input.clear();
                     inner.canon.clear();
                     inner.eof_pending = false;
-                    clear_readable = inner.input.is_empty();
                 }
-                if clear_readable {
+                // Not `input.is_empty()`, which is always true a line above:
+                // the slave is ALSO readable when the master has closed, and
+                // that readability is an EOF nobody else will re-announce.
+                // Clearing it here left a program that had done its last
+                // `tcsetattr(TCSAFLUSH)` -- which is what every line editor
+                // does on the way out, and what `stty sane` is -- polling a
+                // hung-up terminal that never reported ready again.
+                if !self.slave_readable() {
                     self.slave_bus.lock().clear(Event::READABLE);
                 }
                 Ok(0)
@@ -835,7 +840,59 @@ impl Pty {
                 }
                 Ok(0)
             }
-            TCFLSH | TIOCSCTTY | TIOCNOTTY => Ok(0),
+            // `tcflush(3)`: throw away what is queued and not yet read or
+            // written. Answering `Ok(0)` and discarding nothing is a failure
+            // nobody attributes to the kernel: `getpass(3)`, sudo, ssh and
+            // every other password prompt call `tcflush(fd, TCIFLUSH)` first
+            // precisely so that what was typed ahead does NOT land in the
+            // password read -- and with the no-op it did, on a terminal with
+            // echo off, so the typist never saw where it went. `stty`,
+            // readline and screen flush for the same reason.
+            //
+            // The queue selector arrives BY VALUE (the ioctl takes an int, not
+            // a pointer), so `data` IS the selector, and a selector outside the
+            // three is `EINVAL` (`tty_perform_flush`'s `default:`).
+            //
+            // The queues are this end's, as `tty_perform_flush` works on the
+            // tty it was called on and as `FIONREAD` below already reads them:
+            // the master reads program output and writes keystrokes, the slave
+            // the other way round.
+            TCFLSH => {
+                const TCIFLUSH: usize = 0;
+                const TCOFLUSH: usize = 1;
+                const TCIOFLUSH: usize = 2;
+                let (read_side, write_side) = match data {
+                    TCIFLUSH => (true, false),
+                    TCOFLUSH => (false, true),
+                    TCIOFLUSH => (true, true),
+                    _ => return Err(FsError::InvalidParam),
+                };
+                let flush_input = if is_master { write_side } else { read_side };
+                let flush_output = if is_master { read_side } else { write_side };
+                {
+                    let mut inner = self.inner.lock();
+                    if flush_input {
+                        // The line being assembled goes with the bytes already
+                        // committed (`n_tty_flush_buffer` resets both), and so
+                        // does a VEOF waiting to be reported: it belongs to a
+                        // line nobody will ever read now.
+                        inner.input.clear();
+                        inner.canon.clear();
+                        inner.eof_pending = false;
+                    }
+                    if flush_output {
+                        inner.output.clear();
+                    }
+                }
+                if flush_input && !self.slave_readable() {
+                    self.slave_bus.lock().clear(Event::READABLE);
+                }
+                if flush_output && !self.master_readable() {
+                    self.master_bus.lock().clear(Event::READABLE);
+                }
+                Ok(0)
+            }
+            TIOCSCTTY | TIOCNOTTY => Ok(0),
             // Bytes readable at this end: the master reads program output, the
             // slave reads cooked input.
             FIONREAD => {
@@ -1452,6 +1509,99 @@ mod tests {
             slave_need: AtomicUsize::new(0),
         };
         p
+    }
+
+    /// `tcflush(fd, TCIFLUSH)` from the program throws away what was typed
+    /// ahead. This used to answer `Ok(0)` and keep every byte, which is how
+    /// type-ahead ends up inside a password prompt.
+    #[test]
+    fn tciflush_from_the_slave_discards_typed_ahead_input() {
+        let p = pty();
+        p.master_write(b"secret-typed-early\r");
+        assert!(!p.inner.lock().input.is_empty());
+        assert_eq!(p.ioctl(TCFLSH as u32, 0, false), Ok(0));
+        assert!(p.inner.lock().input.is_empty());
+        assert!(p.inner.lock().canon.is_empty());
+        assert_eq!(slave_reads(&p), Vec::<String>::new());
+    }
+
+    /// Half-typed line included: the line being assembled is part of the input
+    /// queue (`n_tty_flush_buffer` resets both).
+    #[test]
+    fn tciflush_discards_a_half_typed_line_too() {
+        let p = pty();
+        p.master_write(b"half-a-line");
+        assert!(!p.inner.lock().canon.is_empty());
+        assert_eq!(p.ioctl(TCFLSH as u32, 0, false), Ok(0));
+        assert!(p.inner.lock().canon.is_empty());
+        p.master_write(b"rest\r");
+        assert_eq!(slave_reads(&p), vec![String::from("rest\n")]);
+    }
+
+    /// `TCOFLUSH` from the program drops what it wrote and the terminal has
+    /// not read yet, and leaves the input queue alone.
+    #[test]
+    fn tcoflush_from_the_slave_drops_pending_output_only() {
+        let p = pty();
+        p.master_write(b"typed\r");
+        p.slave_write(b"printed");
+        assert!(!p.inner.lock().output.is_empty());
+        assert_eq!(p.ioctl(TCFLSH as u32, 1, false), Ok(0));
+        assert!(p.inner.lock().output.is_empty());
+        assert!(!p.inner.lock().input.is_empty());
+    }
+
+    /// `TCIOFLUSH` takes both, and the selector is read by value.
+    #[test]
+    fn tcioflush_takes_both_queues() {
+        let p = pty();
+        p.master_write(b"typed\r");
+        p.slave_write(b"printed");
+        assert_eq!(p.ioctl(TCFLSH as u32, 2, false), Ok(0));
+        assert!(p.inner.lock().input.is_empty());
+        assert!(p.inner.lock().output.is_empty());
+    }
+
+    /// A selector outside the three is `EINVAL` (`tty_perform_flush`'s
+    /// `default:`), not a silent success over the wrong queue.
+    #[test]
+    fn an_unknown_flush_selector_is_einval() {
+        let p = pty();
+        p.master_write(b"typed\r");
+        assert_eq!(p.ioctl(TCFLSH as u32, 3, false), Err(FsError::InvalidParam));
+        assert_eq!(
+            p.ioctl(TCFLSH as u32, usize::MAX, false),
+            Err(FsError::InvalidParam)
+        );
+        // And nothing was thrown away on the way to the error.
+        assert!(!p.inner.lock().input.is_empty());
+    }
+
+    /// From the master the two queues swap over: the master READS program
+    /// output, so its `TCIFLUSH` is the one that drops it.
+    #[test]
+    fn the_masters_queues_are_the_other_way_round() {
+        let p = pty();
+        p.master_write(b"typed\r");
+        p.slave_write(b"printed");
+        assert_eq!(p.ioctl(TCFLSH as u32, 0, true), Ok(0));
+        assert!(p.inner.lock().output.is_empty());
+        assert!(!p.inner.lock().input.is_empty());
+        assert_eq!(p.ioctl(TCFLSH as u32, 1, true), Ok(0));
+        assert!(p.inner.lock().input.is_empty());
+    }
+
+    /// Flushing the input queue must not un-announce an EOF: the slave is
+    /// readable while the master is gone, and nobody re-announces that.
+    #[test]
+    fn flushing_input_keeps_the_hangup_readable() {
+        let p = pty();
+        p.master_write(b"typed\r");
+        p.master_closed.store(true, Ordering::Relaxed);
+        p.slave_bus.lock().set(Event::READABLE);
+        assert_eq!(p.ioctl(TCFLSH as u32, 0, false), Ok(0));
+        assert!(p.slave_readable());
+        assert!(p.slave_bus.lock().events().contains(Event::READABLE));
     }
 
     fn set_flags(p: &Pty, f: impl FnOnce(&mut Termios)) {

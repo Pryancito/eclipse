@@ -218,8 +218,20 @@ fn deliver_direct_sigkill(
 /// `kill 1` did nothing". Contention is likeliest exactly when the target is
 /// busy, which is when a signal matters.
 fn queue_signal_to_thread(thread: &Arc<Thread>, signal: Signal, info: SigInfo) {
+    // The same three steps `do_send_specific` takes, and only the middle one
+    // used to be here. `prepare_signal` and the job-control half of
+    // `complete_signal` are process-wide even for a signal aimed at one
+    // thread, because the state they touch is: without them
+    // `tgkill(pid, tid, SIGCONT)` on a Ctrl-Z'd process left the signal
+    // pending on a thread parked in `wait_while_job_stopped` that nothing but
+    // `job_continue` releases, so the process never resumed; a `SIGKILL` the
+    // same way never woke it to die; and a process could end up carrying a
+    // stop and a continue at once.
+    let process = thread.proc();
+    linux_object::process::prepare_signal(process, signal);
     thread.lock_linux().queue_signal(signal, Some(info));
     linux_object::process::wake_signal_sleeper(thread);
+    linux_object::process::complete_signal_for_job_control(process, signal);
 }
 
 /// The `siginfo_t` a process queues with `rt_sigqueueinfo(2)`,

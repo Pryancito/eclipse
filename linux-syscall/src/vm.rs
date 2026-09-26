@@ -3,6 +3,7 @@ use alloc::vec::Vec;
 use bitflags::bitflags;
 use linux_object::error::LxResult;
 use linux_object::loader::heap_base;
+use linux_object::process::{RLIMIT_DATA, RLIM_INFINITY};
 use zircon_object::vm::{
     pages, round_down_pages, roundup_pages, MMUFlags, VmAddressRegion, VmObject, PAGE_SIZE,
     USER_ASPACE_BASE, USER_ASPACE_SIZE,
@@ -537,6 +538,24 @@ impl Syscall<'_> {
         // `/oscomp/brk` case does exactly that, because it prints and
         // round-trips the break through a 32-bit int and the heap base is a
         // round power of two whose low 32 bits are zero.
+        // `check_data_rlimit()`, and Linux runs it before the "same page"
+        // shortcut, so it governs every break the caller names and not only a
+        // grow that reaches for new pages. `RLIMIT_DATA` was stored, reported
+        // back by `prlimit64`, and enforced nowhere: `ulimit -d` was a number
+        // the shell could set and the kernel ignored, so the malloc-failure
+        // path of everything run under it -- a CI budget, a fuzzer, a
+        // `ulimit`-sandboxed script -- never once fired.
+        let data_rlimit = proc
+            .rlimit(RLIMIT_DATA, None, false)
+            .map(|l| l.cur)
+            .unwrap_or(RLIM_INFINITY);
+        if !brk_within_data_rlimit(new_brk, heap_base(&vmar), data_rlimit) {
+            info!(
+                "brk: {:#x} would take the data segment past RLIMIT_DATA ({}), keeping {:#x}",
+                new_brk, data_rlimit, current_brk
+            );
+            return Ok(current_brk);
+        }
         let Some(plan) = brk_plan(new_brk, current_brk, heap_base(&vmar)) else {
             info!(
                 "brk: {:#x} is not a break this address space can take, keeping {:#x}",
@@ -551,13 +570,51 @@ impl Syscall<'_> {
 
         match plan.moved {
             BrkMove::Shrink => {
-                // Shrink: just move the user-visible break. The reserved
-                // pages stay mapped until they are reused on the next grow.
-                // Linux glibc essentially never shrinks brk, and skipping the
-                // unmap avoids the VMAR churn + TLB shootdown for transient
-                // shrink/grow patterns.
+                // Shrink: unmap what the break no longer covers, as
+                // `__do_sys_brk` does (`do_vmi_align_munmap(..., newbrk,
+                // oldbrk, ...)`). Keeping the pages mapped "to reuse them on
+                // the next grow" is what this did before, and it is wrong for
+                // a reason that has nothing to do with the address space:
+                // memory a program gets from `brk` HAS to read as zero, and
+                // the only thing that makes it so is that the unmap threw the
+                // pages away.
+                //
+                // glibc's `calloc` depends on exactly that. Under
+                // `MORECORE_CLEARS` it clears only the part of the block that
+                // came from the OLD top chunk --
+                //
+                //     if (p == oldtop && csz > oldtopsize) csz = oldtopsize;
+                //
+                // -- and leaves the freshly-`sbrk`ed tail alone, because the
+                // kernel is supposed to have zeroed it. With the pages kept,
+                // that tail came back holding the program's own freed heap:
+                // `calloc` returning non-zero memory, which is a bug nobody
+                // debugs in the allocator. And glibc DOES shrink the break --
+                // `systrim()` calls `MORECORE(-extra)` from `free()` whenever
+                // the top chunk passes the 128 KiB trim threshold -- so
+                // "glibc essentially never shrinks brk" was the part that was
+                // not true.
+                //
+                // The unmap covers everything above the new break, the
+                // reserved-ahead chunk included: that is the only way the
+                // next grow reaches `map_at` and gets fresh pages. If it
+                // fails the reservation stays where it was, so `mapped_brk`
+                // only moves down when it really moved.
+                if mapped_brk > plan.mapped_end {
+                    match vmar.unmap_why(
+                        plan.mapped_end,
+                        mapped_brk - plan.mapped_end,
+                        "sys_brk shrink",
+                    ) {
+                        Ok(()) => proc.set_mapped_brk(plan.mapped_end),
+                        Err(e) => warn!(
+                            "brk: shrink to {:#x} could not unmap [{:#x}, {:#x}): {:?}",
+                            plan.brk, plan.mapped_end, mapped_brk, e
+                        ),
+                    }
+                }
                 proc.set_brk(plan.brk);
-                info!("brk: shrunk to {:#x} (mapping kept)", plan.brk);
+                info!("brk: shrunk to {:#x}", plan.brk);
                 return Ok(plan.brk);
             }
             BrkMove::WithinPage => {
@@ -892,11 +949,25 @@ impl Syscall<'_> {
     /// never been touched has no PTE and reports non-resident, exactly the
     /// distinction Linux draws. `ENOMEM` when the range includes unmapped pages,
     /// which some allocators use to probe address-space layout.
-    pub fn sys_mincore(&self, addr: usize, len: usize, mut vec: UserOutPtr<u8>) -> SysResult {
+    pub fn sys_mincore(&self, addr: usize, len: usize, vec: UserOutPtr<u8>) -> SysResult {
         info!("mincore: addr={:#x}, len={:#x}", addr, len);
         let pages_count = mincore_args(addr, len)?;
-        let residency = mincore_residency(&self.zircon_process().vmar(), addr, pages_count)?;
-        vec.write_array(&residency)?;
+        let vmar = self.zircon_process().vmar();
+        // A page of kernel buffer at a time, which is what `__get_free_page`
+        // in `mm/mincore.c` gives `do_mincore` and the reason Linux answers
+        // this syscall in chunks at all. The one-shot version reserved
+        // `pages.min(PAGE_SIZE)` and then pushed `pages` bytes into it, so the
+        // cap was on the reservation and not on the Vec: `MAX_MMAP_LEN` allows
+        // a 64 GiB anonymous mapping, and one `mincore` over it grew a 16 MiB
+        // kernel allocation inside the syscall. Several such mappings scale
+        // it linearly, out of a fixed kernel heap.
+        let mut written = 0;
+        while written < pages_count {
+            let chunk = (pages_count - written).min(MINCORE_CHUNK_PAGES);
+            let residency = mincore_residency(&vmar, addr + written * PAGE_SIZE, chunk)?;
+            vec.add(written).write_array(&residency)?;
+            written += chunk;
+        }
         Ok(0)
     }
 
@@ -1556,6 +1627,30 @@ struct BrkPlan {
     moved: BrkMove,
 }
 
+/// `check_data_rlimit()`: whether `RLIMIT_DATA` leaves room for a break at
+/// `new_brk`.
+///
+/// ```c
+/// if (rlim < RLIM_INFINITY) {
+///         if (((new - start) + (end_data - start_data)) > rlim)
+///                 return -ENOSPC;
+/// }
+/// ```
+///
+/// `RLIM_INFINITY` is `u64::MAX` and Linux spells the comparison `rlim <
+/// RLIM_INFINITY`, so the limit is off only at that exact value -- one below
+/// it is a real limit no address space can reach, which is the answer a
+/// program that set it asked for. `end_data - start_data`, the ELF data
+/// segment, is not tracked here, so the budget this measures is the heap
+/// alone: too generous by a fixed amount, never too tight.
+///
+/// The failure Linux reports is not an errno the caller sees: `__do_sys_brk`
+/// jumps to `out`, which returns the OLD break, and that is how `brk` says no
+/// to everything.
+fn brk_within_data_rlimit(new_brk: usize, heap_base: usize, rlimit_data: u64) -> bool {
+    rlimit_data == RLIM_INFINITY || new_brk.saturating_sub(heap_base) as u64 <= rlimit_data
+}
+
 fn brk_plan(new_brk: usize, current_brk: usize, heap_base: usize) -> Option<BrkPlan> {
     let mapped_end = brk_target(new_brk, heap_base)?;
     let current_end = roundup_pages(current_brk);
@@ -1588,6 +1683,11 @@ fn walk_mapped(vmar: &Arc<VmAddressRegion>, start: usize, end: usize) -> SysResu
     Ok(0)
 }
 
+/// How many pages' worth of `mincore(2)` answers this kernel holds at once:
+/// `PAGE_SIZE` of them, one byte each, which is the page `do_mincore` works
+/// out of.
+const MINCORE_CHUNK_PAGES: usize = PAGE_SIZE;
+
 /// One byte per page of `[addr, addr + pages * PAGE_SIZE)` for `mincore(2)`,
 /// bit 0 set when the page is resident, `ENOMEM` at the first page that is not
 /// mapped.
@@ -1597,14 +1697,18 @@ fn walk_mapped(vmar: &Arc<VmAddressRegion>, start: usize, end: usize) -> SysResu
 /// `mincore` draws, and the one allocators use to probe address-space layout.
 ///
 /// `addr + i * PAGE_SIZE` is safe here only because the caller bounded the
-/// range first (see [`mincore_args`]); so is the reservation, which Linux
-/// keeps to a single page of kernel buffer (`__get_free_page`, mm/mincore.c)
-/// rather than one byte per page of a range userspace chose. Sizing it from
-/// `len` made it a function of a raw machine word: `mincore(p, 1 << 63, v)`
-/// asked the fixed kernel heap for 2 PiB, and that allocation cannot fail,
-/// only abort the machine.
+/// range first (see [`mincore_args`]).
+///
+/// The reservation is a page at most, and that is a floor, not a ceiling: a
+/// `Vec` grows past `with_capacity` on `push`, so what really keeps this
+/// allocation bounded is that [`Syscall::sys_mincore`] hands the range over a
+/// page's worth of answers at a time, the way `do_mincore` does with its
+/// single `__get_free_page` (mm/mincore.c). Sized straight from `len` instead,
+/// this was a function of a raw machine word: `mincore(p, 1 << 63, v)` asked
+/// the fixed kernel heap for 2 PiB, and that allocation cannot fail, only
+/// abort the machine.
 fn mincore_residency(vmar: &Arc<VmAddressRegion>, addr: usize, pages: usize) -> LxResult<Vec<u8>> {
-    let mut residency = Vec::with_capacity(pages.min(PAGE_SIZE));
+    let mut residency = Vec::with_capacity(pages.min(MINCORE_CHUNK_PAGES));
     for i in 0..pages {
         let page = addr + i * PAGE_SIZE;
         let mapping = vmar.find_mapping(page).ok_or(LxError::ENOMEM)?;
@@ -2283,6 +2387,64 @@ mod mm_range_tests {
         assert_eq!(brk_target(heap, heap), Some(heap));
         assert_eq!(brk_target(heap + 1, heap), Some(heap + PAGE));
         assert_eq!(brk_target(USER_ASPACE_END, heap), Some(USER_ASPACE_END));
+    }
+}
+
+#[cfg(test)]
+mod brk_data_rlimit_tests {
+    //! `RLIMIT_DATA` against the break the caller names. The limit was stored
+    //! and reported and never once consulted, so these pin that it is.
+
+    use super::*;
+
+    const HEAP: usize = 0x40_0000;
+
+    #[test]
+    fn the_default_limit_allows_any_break() {
+        for brk in [HEAP, HEAP + PAGE_SIZE, HEAP + (1 << 40), usize::MAX] {
+            assert!(
+                brk_within_data_rlimit(brk, HEAP, RLIM_INFINITY),
+                "brk {:#x} under no limit",
+                brk
+            );
+        }
+    }
+
+    #[test]
+    fn a_break_inside_the_budget_is_allowed_and_one_past_it_is_not() {
+        // `ulimit -d 64`, which is 64 KiB of heap.
+        let rlim = 64 * 1024;
+        assert!(brk_within_data_rlimit(HEAP, HEAP, rlim));
+        assert!(brk_within_data_rlimit(HEAP + rlim as usize, HEAP, rlim));
+        assert!(!brk_within_data_rlimit(
+            HEAP + rlim as usize + 1,
+            HEAP,
+            rlim
+        ));
+    }
+
+    #[test]
+    fn only_rlim_infinity_itself_turns_the_limit_off() {
+        // Linux spells it `if (rlim < RLIM_INFINITY)`, so one below the
+        // sentinel is a real limit -- and one no heap can reach, which is
+        // what a program that set it wants.
+        // The heap base has to be 0 for a size that big to exist at all.
+        assert!(!brk_within_data_rlimit(usize::MAX, 0, RLIM_INFINITY - 1));
+        assert!(brk_within_data_rlimit(usize::MAX, 0, RLIM_INFINITY));
+    }
+
+    #[test]
+    fn a_break_below_where_the_heap_starts_does_not_wrap_the_subtraction() {
+        // `brk_plan` refuses it afterwards; this only has to not wrap into a
+        // huge "size" that every limit rejects (a build with overflow checks
+        // would panic here instead).
+        assert!(brk_within_data_rlimit(HEAP - PAGE_SIZE, HEAP, 0));
+    }
+
+    #[test]
+    fn a_zero_limit_allows_only_an_empty_heap() {
+        assert!(brk_within_data_rlimit(HEAP, HEAP, 0));
+        assert!(!brk_within_data_rlimit(HEAP + 1, HEAP, 0));
     }
 }
 
