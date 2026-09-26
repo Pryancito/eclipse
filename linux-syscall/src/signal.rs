@@ -40,11 +40,9 @@ pub(crate) fn check_sigsetsize(sigsetsize: usize) -> Result<(), LxError> {
 }
 
 /// The arch-independent 12-byte prefix every `siginfo_t` layout starts with
-/// (`signo`, `errno`, `code`). `rt_sigqueueinfo` reads only this much: the
-/// permission rule is decided on `si_code` alone, and the union payload cannot
-/// be carried by the bitmask pending set anyway. Read as plain integers — the
-/// user-supplied code is unconstrained, so it must not be transmuted into the
-/// kernel's `SignalCode` enum.
+/// (`signo`, `errno`, `code`): what the permission rule of `rt_sigqueueinfo`
+/// and `pidfd_send_signal` is decided on. Plain integers, because the
+/// user-supplied code is unconstrained.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct SigInfoHead {
@@ -55,6 +53,17 @@ pub struct SigInfoHead {
     /// `si_code`: must be < 0 (and not SI_TKILL) when targeting another
     /// process.
     pub code: i32,
+}
+
+impl SigInfoHead {
+    /// The head of a whole `siginfo_t` the caller handed in.
+    pub fn of(info: &SigInfo) -> Self {
+        SigInfoHead {
+            signo: info.signo,
+            errno: info.errno,
+            code: info.code.0,
+        }
+    }
 }
 
 /// `pid_t` is the `int` of the uAPI, so `SYSCALL_DEFINE` casts the register to
@@ -200,6 +209,54 @@ fn deliver_direct_sigkill(
 /// busy, which is when a signal matters.
 fn queue_signal_to_thread(thread: &Arc<Thread>, signal: Signal, info: SigInfo) {
     thread.lock_linux().queue_signal(signal, Some(info));
+}
+
+/// The `siginfo_t` a process queues with `rt_sigqueueinfo(2)`,
+/// `rt_tgsigqueueinfo(2)` or `pidfd_send_signal(2)`: the caller's own,
+/// verbatim, with `si_signo` forced to the signal the call named
+/// (`do_rt_sigqueueinfo`: `info->si_signo = sig`). Nothing else is
+/// rewritten, since `may_queue_siginfo` has already refused the codes that
+/// would forge a kernel or a `tkill`: `si_pid` and `si_uid` are what the
+/// sender wrote (glibc's `sigqueue(3)` fills them in itself) and `si_value`
+/// is the whole point of the call.
+///
+/// The syscalls used to read only the 12-byte head, decide the permission on
+/// it and then deliver the `siginfo_t` of a plain `kill(2)`: `SI_USER` and a
+/// zero `si_value`, whatever `sigqueue(pid, sig, value)` had sent.
+pub(crate) fn queued_from_user(signal: Signal, mut user: SigInfo) -> SigInfo {
+    user.signo = signal as i32;
+    user
+}
+
+/// The delivery a `KillContext` has already been allowed for one process:
+/// `info` is the caller's `siginfo_t` when the syscall carried one, else the
+/// `SI_USER` of a `kill(2)`, whose `si_pid`/`si_uid` are the caller's pid and
+/// REAL uid.
+fn deliver_to_process(
+    cx: &KillContext,
+    process: &Arc<zircon_object::task::Process>,
+    info: Option<SigInfo>,
+) -> LxResult<()> {
+    match cx.signal {
+        // kill(pid, 0): finding the process was the whole answer.
+        None => Ok(()),
+        Some(Signal::SIGKILL) => {
+            deliver_direct_sigkill(&cx.caller, process);
+            Ok(())
+        }
+        Some(sig) => linux_object::process::send_signal_to_process_with_info(
+            process.id() as usize,
+            sig,
+            Some(info.unwrap_or_else(|| {
+                SigInfo::from_user(
+                    sig,
+                    cx.caller.id() as i32,
+                    cx.credentials.ruid,
+                    SignalCode::USER,
+                )
+            })),
+        ),
+    }
 }
 
 /// `si_code` of a signal `tkill`/`tgkill` sent, which userland may not forge.
@@ -436,33 +493,27 @@ impl Syscall<'_> {
         )
     }
 
-    /// The gate, then the delivery, for one process.
+    /// The gate, then the delivery, for one process: `kill(2)`, whose
+    /// `siginfo_t` the kernel fills in itself.
     pub(crate) fn signal_one_process(
         &self,
         cx: &KillContext,
         process: &Arc<zircon_object::task::Process>,
     ) -> LxResult<()> {
+        self.signal_one_process_with_info(cx, process, None)
+    }
+
+    /// The gate, then the delivery, for one process, with the `siginfo_t`
+    /// the caller supplied (`rt_sigqueueinfo`, `pidfd_send_signal`) or the
+    /// one `kill(2)` gets when it did not (`None`).
+    pub(crate) fn signal_one_process_with_info(
+        &self,
+        cx: &KillContext,
+        process: &Arc<zircon_object::task::Process>,
+        info: Option<SigInfo>,
+    ) -> LxResult<()> {
         self.may_signal_process(cx, process)?;
-        match cx.signal {
-            // kill(pid, 0): finding the process was the whole answer.
-            None => Ok(()),
-            Some(Signal::SIGKILL) => {
-                deliver_direct_sigkill(&cx.caller, process);
-                Ok(())
-            }
-            // `si_pid`/`si_uid` are the caller's: `kill(2)` leaves its pid
-            // and REAL uid for the handler.
-            Some(sig) => linux_object::process::send_signal_to_process_with_info(
-                process.id() as usize,
-                sig,
-                Some(SigInfo::from_user(
-                    sig,
-                    cx.caller.id() as i32,
-                    cx.credentials.ruid,
-                    SignalCode::USER,
-                )),
-            ),
-        }
+        deliver_to_process(cx, process, info)
     }
 
     /// `kill(pid, sig)` with a positive pid.
@@ -731,23 +782,24 @@ impl Syscall<'_> {
     /// Queue a signal plus caller-filled `siginfo` to a process
     /// (see rt_sigqueueinfo(2); the libc wrapper is `sigqueue(3)`).
     ///
-    /// The pending set is a bitmask (no per-signal siginfo queue), so the
-    /// accompanying value payload is not preserved — but the signal itself is
-    /// delivered with full disposition handling. The previous behaviour
-    /// returned success while dropping the signal entirely.
+    /// The caller's `siginfo_t` is what gets delivered (see
+    /// [`queued_from_user`]): a handler with `SA_SIGINFO`, a `sigwaitinfo`
+    /// or a signalfd reads the `si_value` that `sigqueue(pid, sig, value)`
+    /// sent. The previous behaviour returned success while dropping the
+    /// signal entirely, and then delivered it as a plain `kill(2)`.
     pub fn sys_rt_sigqueueinfo(
         &self,
         pid: usize,
         signum: usize,
-        info: UserInPtr<SigInfoHead>,
+        info: UserInPtr<SigInfo>,
     ) -> SysResult {
-        let head = info.read()?;
+        let user = info.read()?;
         info!(
             "rt_sigqueueinfo: pid={}, sig={}, si_code={}",
-            pid, signum, head.code
+            pid, signum, user.code.0
         );
         let pid = pid_arg(pid as isize);
-        if !may_queue_siginfo(head.code, pid as i64 == self.zircon_process().id() as i64) {
+        if !may_queue_siginfo(user.code.0, pid as i64 == self.zircon_process().id() as i64) {
             return Err(LxError::EPERM);
         }
         let process = ROOT_JOB.find_process(pid as KoID).ok_or(LxError::ESRCH)?;
@@ -758,7 +810,8 @@ impl Syscall<'_> {
         // target is found so that `ESRCH` keeps winning over `EINVAL`, as it
         // did before.
         let signal = Signal::from_syscall_arg(signum)?;
-        self.signal_one_process(&self.kill_context(signal), &process)
+        let info = signal.map(|sig| queued_from_user(sig, user));
+        self.signal_one_process_with_info(&self.kill_context(signal), &process, info)
             .map(|_| 0)
     }
 
@@ -769,19 +822,19 @@ impl Syscall<'_> {
         tgid: usize,
         tid: usize,
         signum: usize,
-        info: UserInPtr<SigInfoHead>,
+        info: UserInPtr<SigInfo>,
     ) -> SysResult {
-        let head = info.read()?;
+        let user = info.read()?;
         info!(
             "rt_tgsigqueueinfo: tgid={}, tid={}, sig={}, si_code={}",
-            tgid, tid, signum, head.code
+            tgid, tid, signum, user.code.0
         );
         let tgid = single_task_id(tgid)?;
         let tid = single_task_id(tid)?;
         // The target THREAD, not its thread group: forging an `si_code` at a
         // sibling thread is forging it at somebody else, and asking about the
         // group let that through.
-        if !may_queue_siginfo(head.code, tid == self.thread.id()) {
+        if !may_queue_siginfo(user.code.0, tid == self.thread.id()) {
             return Err(LxError::EPERM);
         }
         let process = ROOT_JOB.find_process(tgid).ok_or(LxError::ESRCH)?;
@@ -795,7 +848,7 @@ impl Syscall<'_> {
         // it is refused just the same, so it cannot report the existence of a
         // thread you may not signal.
         if let Some(signal) = signal {
-            queue_signal_to_thread(&thread, signal, self.sent_by_me(signal, SignalCode::QUEUE));
+            queue_signal_to_thread(&thread, signal, queued_from_user(signal, user));
         }
         Ok(0)
     }
@@ -1335,6 +1388,69 @@ mod queued_siginfo_tests {
         assert_eq!(
             (info.code, word(16), word(20)),
             (SignalCode::TKILL, 31, 1000)
+        );
+    }
+
+    /// `(si_code, si_pid, si_uid, si_value)` where glibc reads them: the
+    /// union at byte 16, `si_value` eight bytes into it.
+    fn rt_fields(info: &SigInfo) -> (SignalCode, i32, i32, usize) {
+        let b = info.as_bytes();
+        let word = |at: usize| i32::from_ne_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]]);
+        let mut v = [0u8; core::mem::size_of::<usize>()];
+        let n = v.len();
+        v.copy_from_slice(&b[24..24 + n]);
+        (info.code, word(16), word(20), usize::from_ne_bytes(v))
+    }
+
+    fn a_process(pid: KoID) -> Arc<zircon_object::task::Process> {
+        Process::create_with_fixed_id_ext(&ROOT_JOB, pid, "p", LinuxProcess::new(RamFS::new(), 0))
+            .unwrap()
+    }
+
+    fn kill_context_of(caller: &Arc<zircon_object::task::Process>, signal: Signal) -> KillContext {
+        KillContext {
+            credentials: caller.linux().credentials(),
+            sid: linux_object::process::effective_sid(caller),
+            caller: caller.clone(),
+            signal: Some(signal),
+        }
+    }
+
+    /// `sigqueue(pid, SIGUSR1, 0xdead_beef)`: the handler used to see
+    /// `SI_USER` and a zero `si_value`, whatever was sent.
+    #[test]
+    fn the_queued_siginfo_is_the_senders_with_the_signal_number_forced() {
+        // glibc fills in si_signo itself, but the kernel trusts the
+        // argument, not the struct.
+        let user = SigInfo::queued(Signal::SIGUSR2, 77, 1000, 0xdead_beef);
+        let queued = queued_from_user(Signal::SIGUSR1, user);
+        assert_eq!(queued.signo, Signal::SIGUSR1 as i32);
+        assert_eq!(
+            rt_fields(&queued),
+            (SignalCode::QUEUE, 77, 1000, 0xdead_beef)
+        );
+    }
+
+    #[test]
+    fn a_queued_signal_reaches_the_process_with_its_value_and_a_kill_without_one() {
+        let caller = a_process(43_205);
+        let target = a_process(43_206);
+        let thread = Thread::create_linux(&target).unwrap();
+        let cx = kill_context_of(&caller, Signal::SIGUSR1);
+        let user = SigInfo::queued(Signal::SIGUSR1, caller.id() as i32, 0, 42);
+        deliver_to_process(&cx, &target, Some(queued_from_user(Signal::SIGUSR1, user))).unwrap();
+        let got = thread.lock_linux().take_siginfo(Signal::SIGUSR1);
+        assert_eq!(
+            rt_fields(&got),
+            (SignalCode::QUEUE, caller.id() as i32, 0, 42),
+            "the sender's si_value was dropped"
+        );
+        // Without a siginfo it is a kill(2): SI_USER from the caller.
+        deliver_to_process(&cx, &target, None).unwrap();
+        let got = thread.lock_linux().take_siginfo(Signal::SIGUSR1);
+        assert_eq!(
+            rt_fields(&got),
+            (SignalCode::USER, caller.id() as i32, 0, 0)
         );
     }
 }

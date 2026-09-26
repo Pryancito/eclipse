@@ -177,6 +177,13 @@ impl SiginfoFields {
         self.pad[4..8].copy_from_slice(&uid.to_ne_bytes());
     }
 
+    /// `_rt`: `si_pid`, `si_uid` and `si_value`, what `sigqueue(3)` fills
+    /// in (`si_value` follows the two `int`s, at byte 8 of the union).
+    fn write_rt(&mut self, pid: i32, uid: u32, value: usize) {
+        self.write_kill(pid, uid);
+        self.pad[8..8 + core::mem::size_of::<usize>()].copy_from_slice(&value.to_ne_bytes());
+    }
+
     /// `_sigfault`: `si_addr`, the address the fault was at.
     fn write_fault(&mut self, addr: usize) {
         self.pad[..core::mem::size_of::<usize>()].copy_from_slice(&addr.to_ne_bytes());
@@ -255,6 +262,20 @@ impl SigInfo {
             ..Self::default()
         };
         info.field.write_kill(pid, uid);
+        info
+    }
+
+    /// The `siginfo_t` glibc's `sigqueue(3)` hands to `rt_sigqueueinfo(2)`:
+    /// `SI_QUEUE`, the sender's pid and real uid, and the `sigval` that is
+    /// the whole point of the call.
+    pub fn queued(signal: Signal, pid: i32, uid: u32, value: usize) -> Self {
+        let mut info = SigInfo {
+            signo: signal as i32,
+            errno: 0,
+            code: SignalCode::QUEUE,
+            ..Self::default()
+        };
+        info.field.write_rt(pid, uid, value);
         info
     }
 
