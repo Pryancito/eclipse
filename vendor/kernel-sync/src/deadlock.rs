@@ -54,11 +54,14 @@ pub fn set_deadlock_hook(f: fn(&'static str, u32)) {
 
 #[inline(never)]
 pub(crate) fn report_deadlock(file: &'static str, line: u32) {
-    let h = DEADLOCK_HOOK.load(Ordering::Relaxed);
-    if h != 0 {
-        let f: fn(&'static str, u32) = unsafe { core::mem::transmute(h) };
-        f(file, line);
-    }
+    // Judged before the jump, like every other hook slot in the kernel: see
+    // `fn_slot`. A banner that jumps into smash residue replaces a diagnosable
+    // deadlock with an undiagnosable triple fault.
+    let Some(h) = crate::fn_slot::live_fn(DEADLOCK_HOOK.load(Ordering::Relaxed)) else {
+        return;
+    };
+    let f: fn(&'static str, u32) = unsafe { core::mem::transmute(h) };
+    f(file, line);
 }
 
 /// Public variant for OTHER crates' spinlocks (e.g. the scheduler's
@@ -89,11 +92,15 @@ pub fn set_spin_pump(f: fn()) {
 
 #[inline]
 pub(crate) fn spin_pump() {
-    let h = SPIN_PUMP.load(Ordering::Relaxed);
-    if h != 0 {
-        let f: fn() = unsafe { core::mem::transmute(h) };
-        f();
-    }
+    // Two relaxed loads more than the bare slot test it used to be, on a path
+    // that runs once every few hundred spins -- and it is the hottest indirect
+    // call in the kernel, made with interrupts off from inside every ticket
+    // lock, so it is the last one that should be taken on trust.
+    let Some(h) = crate::fn_slot::live_fn(SPIN_PUMP.load(Ordering::Relaxed)) else {
+        return;
+    };
+    let f: fn() = unsafe { core::mem::transmute(h) };
+    f();
 }
 
 /// Public variant for OTHER crates' IRQs-off spin loops to drain their OWN
@@ -114,7 +121,9 @@ pub(crate) fn spin_pump() {
 /// ticket lock pumped; a CPU parked in any other IRQs-off spinner was an ack
 /// black hole. Callers should invoke it at a coarse cadence (e.g. every 512
 /// spins); it is a single relaxed load when no pump is installed and one
-/// queue-pointer compare when the queue is empty. Same contract as the hook:
+/// queue-pointer compare when the queue is empty. Three relaxed loads when no
+/// pump is installed, since the slot is judged before it is called (`fn_slot`).
+/// Same contract as the hook:
 /// takes no locks, never allocates.
 #[inline]
 pub fn pump() {
@@ -134,11 +143,11 @@ pub fn set_deadlock_holder_hook(f: fn(usize, usize, u32, u32)) {
 
 #[inline(never)]
 pub(crate) fn report_deadlock_holder(file_ptr: usize, file_len: usize, line: u32, cpu: u32) {
-    let h = DEADLOCK_HOLDER_HOOK.load(Ordering::Relaxed);
-    if h != 0 {
-        let f: fn(usize, usize, u32, u32) = unsafe { core::mem::transmute(h) };
-        f(file_ptr, file_len, line, cpu);
-    }
+    let Some(h) = crate::fn_slot::live_fn(DEADLOCK_HOLDER_HOOK.load(Ordering::Relaxed)) else {
+        return;
+    };
+    let f: fn(usize, usize, u32, u32) = unsafe { core::mem::transmute(h) };
+    f(file_ptr, file_len, line, cpu);
 }
 
 /// The one lock every test that installs this module's process-wide hooks

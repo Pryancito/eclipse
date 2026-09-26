@@ -102,7 +102,14 @@ static KERNEL_TEXT: TextRange = TextRange::new();
 /// Install the image's real `.text` bounds, from the linker's own symbols.
 /// Returns whether they were taken.
 pub fn set_kernel_text(lo: u64, hi: u64) -> bool {
-    KERNEL_TEXT.set(lo, hi)
+    let taken = KERNEL_TEXT.set(lo, hi);
+    if taken {
+        // The same window judges the kernel's function-pointer hook slots, in
+        // `lock` and in the scheduler, which cannot see this module. Published
+        // from here so there is one window and not two to keep in step.
+        lock::fn_slot::set_text_range(lo as usize, hi as usize);
+    }
+    taken
 }
 
 /// `[start, end)` of the kernel image's `.text`.

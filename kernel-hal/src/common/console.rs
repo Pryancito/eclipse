@@ -30,20 +30,21 @@ pub fn klog_register(
 /// Copy the kernel log ring buffer into `dst`.  Returns bytes written.
 /// Returns 0 if no callback has been registered yet.
 pub fn klog_read(dst: &mut [u8]) -> usize {
-    let p = KLOG_READ_FN.load(Ordering::SeqCst);
-    if p == 0 {
+    // Judged before the jump: see `lock::fn_slot`. `dmesg` is read from
+    // userspace, so this slot is reachable on demand by an unprivileged
+    // process -- the last one to call on trust.
+    let Some(p) = lock::fn_slot::live_fn(KLOG_READ_FN.load(Ordering::SeqCst)) else {
         return 0;
-    }
+    };
     let f: fn(&mut [u8]) -> usize = unsafe { core::mem::transmute(p) };
     f(dst)
 }
 
 /// Total bytes currently stored in the kernel log ring buffer.
 pub fn klog_buf_size() -> usize {
-    let p = KLOG_SIZE_FN.load(Ordering::SeqCst);
-    if p == 0 {
+    let Some(p) = lock::fn_slot::live_fn(KLOG_SIZE_FN.load(Ordering::SeqCst)) else {
         return 0;
-    }
+    };
     let f: fn() -> usize = unsafe { core::mem::transmute(p) };
     f()
 }
@@ -56,10 +57,9 @@ pub const LOG_INFO: u8 = 6;
 /// Append a vital kernel message to the dmesg ring buffer (syslog priority 0–7).
 /// Always recorded regardless of the `log` crate max level.
 pub fn klog_emit(priority: u8, msg: &str) {
-    let p = KLOG_EMIT_FN.load(Ordering::SeqCst);
-    if p == 0 {
+    let Some(p) = lock::fn_slot::live_fn(KLOG_EMIT_FN.load(Ordering::SeqCst)) else {
         return;
-    }
+    };
     let f: fn(u8, &str) = unsafe { core::mem::transmute(p) };
     f(priority, msg);
 }

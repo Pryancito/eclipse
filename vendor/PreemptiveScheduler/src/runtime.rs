@@ -237,11 +237,14 @@ pub(crate) fn set_cpu_sleeping(cpu: usize, sleeping: bool) {
 
 #[inline]
 fn send_resched_ipi(owner: usize) {
-    let f = RESCHED_IPI_SENDER.load(Ordering::Acquire);
-    if f != 0 {
-        let f: fn(usize) = unsafe { core::mem::transmute(f) };
-        f(owner);
-    }
+    // Judged before the jump (`lock::fn_slot`): this is called from the waker
+    // path on every cross-CPU wake, and the word it jumps to is one a smash can
+    // reach exactly like the rest of the kernel's hook slots.
+    let Some(f) = lock::fn_slot::live_fn(RESCHED_IPI_SENDER.load(Ordering::Acquire)) else {
+        return;
+    };
+    let f: fn(usize) = unsafe { core::mem::transmute(f) };
+    f(owner);
 }
 
 /// Waker-side: kick `owner` with the wake IPI if it is (about to be) halted.

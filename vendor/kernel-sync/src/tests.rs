@@ -1070,9 +1070,10 @@ fn a_spin_waiter_that_loses_an_acquire_counts_the_turn_it_lost() {
             contended += 1;
             assert!(
                 turns > 0,
-                "an acquire lost {lost} attempt(s) and counted no waiting at \
+                "an acquire lost {} attempt(s) and counted no waiting at \
                  all: that waiter drained no shootdown queue and would never \
-                 be reported stuck, however long it span"
+                 be reported stuck, however long it span",
+                lost
             );
         }
         stop.store(true, Ordering::Relaxed);
