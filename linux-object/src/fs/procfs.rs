@@ -2669,7 +2669,6 @@ fn proc_gpusnd_content() -> String {
         s.push_str(&d.diagnostics());
     }
     // The display side, which no amount of codec state can reveal.
-    #[cfg(target_arch = "x86_64")]
     s.push_str(&kernel_hal::drivers::hdmi_audio_status());
     s
 }
