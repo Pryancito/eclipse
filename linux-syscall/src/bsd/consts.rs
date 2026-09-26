@@ -404,6 +404,64 @@ pub mod lin_msync {
     pub const MS_SYNC: i32 = 4;
 }
 
+/// FreeBSD `getrlimit(2)` resources (`sys/sys/resource.h`).
+pub mod rlimit {
+    pub const RLIMIT_CPU: usize = 0;
+    pub const RLIMIT_FSIZE: usize = 1;
+    pub const RLIMIT_DATA: usize = 2;
+    pub const RLIMIT_STACK: usize = 3;
+    pub const RLIMIT_CORE: usize = 4;
+    pub const RLIMIT_RSS: usize = 5;
+    /// 6 here, 8 on Linux.
+    pub const RLIMIT_MEMLOCK: usize = 6;
+    /// 7 here, 6 on Linux.
+    pub const RLIMIT_NPROC: usize = 7;
+    /// 8 here, 7 on Linux.
+    pub const RLIMIT_NOFILE: usize = 8;
+    /// Socket buffer bytes: no Linux peer.
+    pub const RLIMIT_SBSIZE: usize = 9;
+    /// Linux's `RLIMIT_AS`, 9 there.
+    pub const RLIMIT_VMEM: usize = 10;
+    pub const RLIMIT_NPTS: usize = 11;
+    pub const RLIMIT_SWAP: usize = 12;
+    pub const RLIMIT_KQUEUES: usize = 13;
+    pub const RLIMIT_UMTXP: usize = 14;
+}
+
+/// FreeBSD signal numbers (`sys/sys/signal.h`), where they differ from Linux
+/// or have no Linux peer. The rest (1..=6, 8, 9, 11, 13..=15, 21, 22,
+/// 24..=28) are the same number on both.
+pub mod sig {
+    /// No Linux peer.
+    pub const SIGEMT: usize = 7;
+    /// 10 here, 7 on Linux.
+    pub const SIGBUS: usize = 10;
+    /// 12 here, 31 on Linux.
+    pub const SIGSYS: usize = 12;
+    /// 16 here, 23 on Linux.
+    pub const SIGURG: usize = 16;
+    /// 17 here, 19 on Linux.
+    pub const SIGSTOP: usize = 17;
+    /// 18 here, 20 on Linux.
+    pub const SIGTSTP: usize = 18;
+    /// 19 here, 18 on Linux.
+    pub const SIGCONT: usize = 19;
+    /// 20 here, 17 on Linux.
+    pub const SIGCHLD: usize = 20;
+    /// 23 here, 29 on Linux.
+    pub const SIGIO: usize = 23;
+    /// No Linux peer.
+    pub const SIGINFO: usize = 29;
+    /// 30 here, 10 on Linux.
+    pub const SIGUSR1: usize = 30;
+    /// 31 here, 12 on Linux.
+    pub const SIGUSR2: usize = 31;
+    /// libthr's own; no Linux peer.
+    pub const SIGTHR: usize = 32;
+    /// No Linux peer.
+    pub const SIGLIBRT: usize = 33;
+}
+
 /// `sysctl(2)` top-level identifiers and the `kern.*` / `hw.*` leaves this
 /// layer answers (`sys/sys/sysctl.h`).
 pub mod ctl {

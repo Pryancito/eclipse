@@ -281,7 +281,10 @@ impl Syscall<'_> {
             // must not make. `P_SUGID` is kept on the process; see
             // `LinuxProcess::is_sugid`.
             sys::ISSETUGID => BsdRet::ok(self.linux_process().is_sugid() as usize),
-            sys::KILL => BsdRet::from_result(self.sys_kill(a0 as isize, a1)),
+            sys::KILL => match translate::signal_to_linux(a1) {
+                Err(e) => BsdRet::from_lx(e),
+                Ok(signal) => BsdRet::from_result(self.sys_kill(a0 as isize, signal)),
+            },
             sys::FORK => BsdRet::from_result(self.sys_fork(0, 0)),
             sys::VFORK => BsdRet::from_result(self.sys_vfork(0, 0).await),
             // The option bits past `WNOHANG | WUNTRACED` are on different
@@ -304,8 +307,14 @@ impl Syscall<'_> {
                 BsdRet::ok(0)
             }
             sys::SCHED_GETCPU => BsdRet::ok(kernel_hal::cpu::cpu_id() as usize),
-            sys::GETRLIMIT => BsdRet::from_result(self.sys_getrlimit(a0, a1.into())),
-            sys::SETRLIMIT => BsdRet::from_result(self.sys_setrlimit(a0, a1.into())),
+            sys::GETRLIMIT => match translate::rlimit_to_linux(a0) {
+                Err(e) => BsdRet::from_lx(e),
+                Ok(resource) => BsdRet::from_result(self.sys_getrlimit(resource, a1.into())),
+            },
+            sys::SETRLIMIT => match translate::rlimit_to_linux(a0) {
+                Err(e) => BsdRet::from_lx(e),
+                Ok(resource) => BsdRet::from_result(self.sys_setrlimit(resource, a1.into())),
+            },
             sys::GETRANDOM => BsdRet::from_result(self.sys_getrandom(a0.into(), a1, a2 as u32)),
 
             // ---- threads (amd64 thr ABI) ------------------------------------

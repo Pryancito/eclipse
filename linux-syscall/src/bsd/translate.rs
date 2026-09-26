@@ -35,9 +35,10 @@
 
 use super::consts::{
     fcntl, lin_fcntl, lin_madv, lin_mman, lin_msync, lin_oflags, lin_wait, madv, mman, msync,
-    oflags, wait,
+    oflags, rlimit, sig, wait,
 };
 use linux_object::error::{LxError, LxResult};
+use linux_object::process as lin_rlimit;
 
 /// The only page size this kernel maps with, as a shift.
 const PAGE_SHIFT: i32 = 12;
@@ -447,6 +448,73 @@ const MSYNC_MAP: &[(i32, i32)] = &[
 /// `MS_INVALIDATE` happen to agree.
 pub fn msync_flags_to_linux(bsd: i32) -> LxResult<i32> {
     sift(bsd, MSYNC_MAP, 0, 0)
+}
+
+/// A FreeBSD `getrlimit(2)`/`setrlimit(2)` resource in Linux's numbering.
+///
+/// It used to go through untouched, and the two tables part ways at 6:
+/// FreeBSD's `RLIMIT_NOFILE` is 8, which is Linux's `RLIMIT_MEMLOCK`, so
+/// `sysconf(_SC_OPEN_MAX)` (FreeBSD's libc asks `getrlimit` for it) came
+/// back as the locked-memory limit, and a daemon that raises its own
+/// descriptor limit at startup was raising how much memory it may pin. And
+/// FreeBSD's `RLIMIT_NPROC` is 7, Linux's `RLIMIT_NOFILE`: a program
+/// lowering how many processes it may fork was lowering how many files it
+/// may open, with itself as the first casualty.
+///
+/// The resources FreeBSD has and Linux does not (socket buffer bytes,
+/// pseudo-terminals, swap, kqueues, umtx keys) are refused rather than
+/// answered with some other limit's numbers.
+pub fn rlimit_to_linux(bsd: usize) -> LxResult<usize> {
+    Ok(match bsd {
+        rlimit::RLIMIT_CPU => lin_rlimit::RLIMIT_CPU,
+        rlimit::RLIMIT_FSIZE => lin_rlimit::RLIMIT_FSIZE,
+        rlimit::RLIMIT_DATA => lin_rlimit::RLIMIT_DATA,
+        rlimit::RLIMIT_STACK => lin_rlimit::RLIMIT_STACK,
+        rlimit::RLIMIT_CORE => lin_rlimit::RLIMIT_CORE,
+        rlimit::RLIMIT_RSS => lin_rlimit::RLIMIT_RSS,
+        rlimit::RLIMIT_MEMLOCK => lin_rlimit::RLIMIT_MEMLOCK,
+        rlimit::RLIMIT_NPROC => lin_rlimit::RLIMIT_NPROC,
+        rlimit::RLIMIT_NOFILE => lin_rlimit::RLIMIT_NOFILE,
+        rlimit::RLIMIT_VMEM => lin_rlimit::RLIMIT_AS,
+        rlimit::RLIMIT_SBSIZE
+        | rlimit::RLIMIT_NPTS
+        | rlimit::RLIMIT_SWAP
+        | rlimit::RLIMIT_KQUEUES
+        | rlimit::RLIMIT_UMTXP => return Err(LxError::EOPNOTSUPP),
+        _ => return Err(LxError::EINVAL),
+    })
+}
+
+/// A FreeBSD signal number in Linux's numbering, for `kill(2)`.
+///
+/// It used to go through untouched, and the two tables agree only on the
+/// old Unix signals. The ones that moved are the ones programs send on
+/// purpose: FreeBSD's `SIGCONT` is 19, which is Linux's `SIGSTOP`, so a
+/// FreeBSD program resuming a child was stopping it; its `SIGSTOP` is 17,
+/// Linux's `SIGCHLD`, which the child ignored; its `SIGUSR1` is 30, Linux's
+/// `SIGPWR`, whose default disposition is to terminate, so a `kill -USR1`
+/// meant to reload a configuration killed the daemon; and its `SIGCHLD` is
+/// 20, Linux's `SIGTSTP`.
+///
+/// Zero (a permission probe) passes as zero. The signals with no Linux peer
+/// (`SIGEMT`, `SIGINFO`, `SIGTHR`, `SIGLIBRT`) are refused; so is a number
+/// above FreeBSD's last, `kill(2)`'s own `EINVAL`.
+pub fn signal_to_linux(bsd: usize) -> LxResult<usize> {
+    Ok(match bsd {
+        0..=6 | 8 | 9 | 11 | 13..=15 | 21 | 22 | 24..=28 => bsd,
+        sig::SIGBUS => 7,
+        sig::SIGSYS => 31,
+        sig::SIGURG => 23,
+        sig::SIGSTOP => 19,
+        sig::SIGTSTP => 20,
+        sig::SIGCONT => 18,
+        sig::SIGCHLD => 17,
+        sig::SIGIO => 29,
+        sig::SIGUSR1 => 10,
+        sig::SIGUSR2 => 12,
+        sig::SIGEMT | sig::SIGINFO | sig::SIGTHR | sig::SIGLIBRT => return Err(LxError::EINVAL),
+        _ => return Err(LxError::EINVAL),
+    })
 }
 
 #[cfg(test)]
@@ -921,5 +989,121 @@ mod advice_tests {
         // Linux's own MS_SYNC bit is not a FreeBSD flag.
         assert_eq!(msync_flags_to_linux(4), Err(LxError::EINVAL));
         assert_eq!(msync_flags_to_linux(0x100), Err(LxError::EINVAL));
+    }
+}
+
+/// `getrlimit`/`setrlimit` resources and `kill` signal numbers, which used
+/// to hand their numbers through.
+#[cfg(test)]
+mod number_tests {
+    use super::*;
+
+    #[test]
+    fn the_first_six_resources_are_the_same_on_both_systems() {
+        for n in 0..=5 {
+            assert_eq!(rlimit_to_linux(n), Ok(n));
+        }
+    }
+
+    #[test]
+    fn the_open_files_limit_is_not_the_locked_memory_limit() {
+        assert_eq!(
+            rlimit_to_linux(rlimit::RLIMIT_NOFILE),
+            Ok(lin_rlimit::RLIMIT_NOFILE)
+        );
+        assert_ne!(
+            rlimit_to_linux(rlimit::RLIMIT_NOFILE),
+            Ok(lin_rlimit::RLIMIT_MEMLOCK)
+        );
+        assert_eq!(
+            rlimit_to_linux(rlimit::RLIMIT_NPROC),
+            Ok(lin_rlimit::RLIMIT_NPROC)
+        );
+        assert_eq!(
+            rlimit_to_linux(rlimit::RLIMIT_MEMLOCK),
+            Ok(lin_rlimit::RLIMIT_MEMLOCK)
+        );
+        assert_eq!(
+            rlimit_to_linux(rlimit::RLIMIT_VMEM),
+            Ok(lin_rlimit::RLIMIT_AS)
+        );
+    }
+
+    #[test]
+    fn a_resource_linux_does_not_have_is_refused_not_answered_with_another() {
+        for n in [
+            rlimit::RLIMIT_SBSIZE,
+            rlimit::RLIMIT_NPTS,
+            rlimit::RLIMIT_SWAP,
+            rlimit::RLIMIT_KQUEUES,
+            rlimit::RLIMIT_UMTXP,
+        ] {
+            assert_eq!(
+                rlimit_to_linux(n),
+                Err(LxError::EOPNOTSUPP),
+                "resource {}",
+                n
+            );
+        }
+        assert_eq!(rlimit_to_linux(15), Err(LxError::EINVAL));
+        assert_eq!(rlimit_to_linux(usize::MAX), Err(LxError::EINVAL));
+    }
+
+    #[test]
+    fn the_old_unix_signals_keep_their_numbers() {
+        for n in [
+            0, 1, 2, 3, 4, 5, 6, 8, 9, 11, 13, 14, 15, 21, 22, 24, 25, 26, 27, 28,
+        ] {
+            assert_eq!(signal_to_linux(n), Ok(n), "signal {}", n);
+        }
+    }
+
+    #[test]
+    fn continuing_a_child_does_not_stop_it_and_stopping_it_is_not_ignored() {
+        // Linux: SIGCONT 18, SIGSTOP 19, SIGCHLD 17, SIGTSTP 20.
+        assert_eq!(signal_to_linux(sig::SIGCONT), Ok(18));
+        assert_eq!(signal_to_linux(sig::SIGSTOP), Ok(19));
+        assert_eq!(signal_to_linux(sig::SIGTSTP), Ok(20));
+        assert_eq!(signal_to_linux(sig::SIGCHLD), Ok(17));
+    }
+
+    #[test]
+    fn usr1_is_not_pwr_and_the_rest_of_the_moved_ones_land_on_their_names() {
+        // Linux: SIGUSR1 10, SIGUSR2 12, SIGBUS 7, SIGSYS 31, SIGURG 23, SIGIO 29.
+        assert_eq!(signal_to_linux(sig::SIGUSR1), Ok(10));
+        assert_eq!(signal_to_linux(sig::SIGUSR2), Ok(12));
+        assert_eq!(signal_to_linux(sig::SIGBUS), Ok(7));
+        assert_eq!(signal_to_linux(sig::SIGSYS), Ok(31));
+        assert_eq!(signal_to_linux(sig::SIGURG), Ok(23));
+        assert_eq!(signal_to_linux(sig::SIGIO), Ok(29));
+    }
+
+    #[test]
+    fn every_freebsd_signal_with_a_peer_lands_on_a_distinct_linux_one() {
+        let mut seen = alloc::collections::BTreeSet::new();
+        for n in 1..=33 {
+            if let Ok(lin) = signal_to_linux(n) {
+                assert!((1..=31).contains(&lin), "{} -> {}", n, lin);
+                assert!(seen.insert(lin), "{} lands on {} twice", n, lin);
+            }
+        }
+        // Linux's 1..=31 minus SIGSTKFLT (16) and SIGPWR (30), which FreeBSD lacks.
+        assert_eq!(seen.len(), 29);
+        assert!(!seen.contains(&16) && !seen.contains(&30));
+    }
+
+    #[test]
+    fn a_signal_linux_does_not_have_is_einval_and_so_is_one_past_the_end() {
+        for n in [
+            sig::SIGEMT,
+            sig::SIGINFO,
+            sig::SIGTHR,
+            sig::SIGLIBRT,
+            34,
+            64,
+            128,
+        ] {
+            assert_eq!(signal_to_linux(n), Err(LxError::EINVAL), "signal {}", n);
+        }
     }
 }
