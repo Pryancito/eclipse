@@ -132,6 +132,14 @@ impl Syscall<'_> {
         let (dir_path, last) = last_component(path)?;
         let file_name = last.to_create(has_trailing_slash(path))?;
         let proc = self.linux_process();
+        // `may_mknod`: a character or block device node needs `CAP_MKNOD`, and
+        // it is asked before anything else. Nothing asked it here, so any
+        // process could make a node naming any major and minor it liked.
+        if matches!(file_type, FileType::CharDevice | FileType::BlockDevice)
+            && !proc.capable(linux_object::process::CAP_MKNOD)
+        {
+            return Err(LxError::EPERM);
+        }
         let inode = proc.lookup_inode_at(dirfd, dir_path, true)?;
         let dir_metadata = inode.metadata()?;
         // The name is looked up BEFORE the parent's mode, as `filename_create`
@@ -582,15 +590,35 @@ pub(crate) fn collect_dirents(
     mut push: impl FnMut(u64, &Metadata, &str) -> bool,
 ) -> LxResult<usize> {
     let mut pushed = 0;
-    while let Some((meta, name)) = src.next_entry()? {
-        if !push(src.position(), &meta, &name) {
-            src.unread_entry();
-            if pushed == 0 {
-                return Err(LxError::EINVAL);
+    loop {
+        match src.next_entry() {
+            Ok(Some((meta, name))) => {
+                if !push(src.position(), &meta, &name) {
+                    src.unread_entry();
+                    if pushed == 0 {
+                        return Err(LxError::EINVAL);
+                    }
+                    break;
+                }
+                pushed += 1;
             }
-            break;
+            Ok(None) => break,
+            // An error AFTER something was read is not this call's answer.
+            // `next_entry` has already moved the directory position past the
+            // entries handed over, so propagating here dropped every one of
+            // them: `ls` and `find` silently missed a run of names whenever
+            // one entry's metadata would not resolve. `getdents64` does the
+            // opposite -- `lastdirent = buf.current_dir; if (lastdirent) ...
+            // error = count - buf.count;` -- so the names go out now and the
+            // error surfaces on the next call, which starts at the entry that
+            // failed.
+            Err(e) => {
+                if pushed == 0 {
+                    return Err(e);
+                }
+                break;
+            }
         }
-        pushed += 1;
     }
     Ok(pushed)
 }
