@@ -15,7 +15,7 @@ use alloc::string::String;
 use bitflags::bitflags;
 use kernel_hal::user::UserOutPtr;
 use linux_object::error::LxResult;
-use linux_object::fs::vfs::{FileType, Metadata};
+use linux_object::fs::vfs::{FileType, INode, Metadata};
 use linux_object::fs::File;
 
 impl Syscall<'_> {
@@ -309,18 +309,32 @@ impl Syscall<'_> {
         let proc = self.linux_process();
         let (old_dir_path, old_file_name) = split_path(oldpath);
         let (new_dir_path, new_file_name) = split_path(newpath);
-        let old_dir_inode = proc.lookup_inode_at(olddirfd, old_dir_path, false)?;
-        let new_dir_inode = proc.lookup_inode_at(newdirfd, new_dir_path, false)?;
+        // The parents are intermediate components: a symlink among them is
+        // followed, as everywhere else (`mv x /tmp/link-to-dir/y`).
+        let old_dir_inode = proc.lookup_inode_at(olddirfd, old_dir_path, true)?;
+        let new_dir_inode = proc.lookup_inode_at(newdirfd, new_dir_path, true)?;
         let old_dir_metadata = old_dir_inode.metadata()?;
         let new_dir_metadata = new_dir_inode.metadata()?;
         proc.check_access(&old_dir_metadata, 0o3, true)?;
         proc.check_access(&new_dir_metadata, 0o3, true)?;
         let old_inode = old_dir_inode.find(old_file_name)?;
         let old_metadata = old_inode.metadata()?;
-        proc.check_sticky(&old_dir_metadata, &old_metadata)?;
-        if flags & RENAME_NOREPLACE != 0 && new_dir_inode.find(new_file_name).is_ok() {
+        let new_inode = new_dir_inode.find(new_file_name).ok();
+        if flags & RENAME_NOREPLACE != 0 && new_inode.is_some() {
             return Err(LxError::EEXIST);
         }
+        // `do_renameat2`: "source should not be an ancestor of target" is
+        // EINVAL before any permission is asked (`lock_rename`'s trap).
+        if old_metadata.type_ == FileType::Dir && is_same_or_below(&new_dir_inode, &old_metadata)? {
+            return Err(LxError::EINVAL);
+        }
+        let new_metadata = new_inode.map(|i| i.metadata()).transpose()?;
+        proc.check_rename(
+            &old_dir_metadata,
+            &old_metadata,
+            &new_dir_metadata,
+            new_metadata.as_ref(),
+        )?;
         old_dir_inode.move_(old_file_name, &new_dir_inode, new_file_name)?;
         linux_object::fs::dcache_invalidate();
         Ok(0)
@@ -871,6 +885,91 @@ const RENAME_NOREPLACE: usize = 1 << 0;
 const RENAME_EXCHANGE: usize = 1 << 1;
 /// renameat2(2) `RENAME_WHITEOUT`: leave a whiteout behind (overlayfs).
 const RENAME_WHITEOUT: usize = 1 << 2;
+
+/// Whether `dir` is `ancestor` itself or lies anywhere below it: the walk up
+/// `..` from `dir` meets an inode with `ancestor`'s (dev, inode) before it
+/// reaches a directory that is its own parent (the root of that filesystem).
+///
+/// `rename("a", "a/b/c")` used to reach the filesystem as an ordinary move.
+/// One that links the entry before unlinking it (ramfs) would then leave `a`
+/// reachable only from inside itself: a cycle no path from `/` enters, every
+/// file under it lost, and every inode in it kept alive by its own
+/// reference. Linux refuses this in `do_renameat2` with `EINVAL`, before the
+/// filesystem is asked.
+///
+/// A mount point's `..` stays inside the mounted filesystem, so a directory
+/// below a mount is not seen as below the mount point's parent; a rename
+/// across filesystems fails with `EXDEV` anyway.
+pub(crate) fn is_same_or_below(dir: &Arc<dyn INode>, ancestor: &Metadata) -> LxResult<bool> {
+    let mut here = dir.clone();
+    // Bounded, so a filesystem whose `..` never reaches a fixed point (a
+    // broken parent pointer) cannot spin this walk forever.
+    for _ in 0..4096 {
+        let meta = here.metadata()?;
+        if meta.dev == ancestor.dev && meta.inode == ancestor.inode {
+            return Ok(true);
+        }
+        let up = here.find("..")?;
+        let up_meta = up.metadata()?;
+        if up_meta.dev == meta.dev && up_meta.inode == meta.inode {
+            return Ok(false);
+        }
+        here = up;
+    }
+    Err(LxError::ELOOP)
+}
+
+#[cfg(test)]
+mod rename_trap_tests {
+    use super::*;
+    use rcore_fs::vfs::FileSystem;
+    use rcore_fs_ramfs::RamFS;
+
+    fn a_tree() -> (
+        Arc<dyn INode>,
+        Arc<dyn INode>,
+        Arc<dyn INode>,
+        Arc<dyn INode>,
+    ) {
+        let root = RamFS::new().root_inode();
+        let a = root.create("a", FileType::Dir, 0o755).unwrap();
+        let b = a.create("b", FileType::Dir, 0o755).unwrap();
+        let other = root.create("other", FileType::Dir, 0o755).unwrap();
+        (root, a, b, other)
+    }
+
+    #[test]
+    fn a_directory_is_below_itself_and_below_its_ancestors() {
+        let (root, a, b, _) = a_tree();
+        let a_meta = a.metadata().unwrap();
+        // `mv a a/x`: the target's parent IS the source.
+        assert_eq!(is_same_or_below(&a, &a_meta), Ok(true));
+        // `mv a a/b/x`: the target's parent is two levels inside the source.
+        assert_eq!(is_same_or_below(&b, &a_meta), Ok(true));
+        // Everything is below the root.
+        assert_eq!(is_same_or_below(&b, &root.metadata().unwrap()), Ok(true));
+    }
+
+    #[test]
+    fn a_sibling_and_a_parent_are_not_below() {
+        let (root, a, b, other) = a_tree();
+        let a_meta = a.metadata().unwrap();
+        // `mv a other/x`: a sibling subtree.
+        assert_eq!(is_same_or_below(&other, &a_meta), Ok(false));
+        // `mv a /x`: the root is above `a`, not below it.
+        assert_eq!(is_same_or_below(&root, &a_meta), Ok(false));
+        // `mv a/b /x` seen from `b`: the root is not below `b` either.
+        assert_eq!(is_same_or_below(&root, &b.metadata().unwrap()), Ok(false));
+    }
+
+    #[test]
+    fn the_walk_stops_at_the_root_whose_parent_is_itself() {
+        // Reaching the root without meeting the ancestor answers `false`
+        // rather than walking `..` of the root forever.
+        let (_, _, b, other) = a_tree();
+        assert_eq!(is_same_or_below(&b, &other.metadata().unwrap()), Ok(false));
+    }
+}
 
 /// Validate a renameat2 `flags` argument (renameat2(2)). Pure, so the flag
 /// matrix is unit-testable: unknown bits and the documented mutually-exclusive

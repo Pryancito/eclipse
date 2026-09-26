@@ -2625,10 +2625,20 @@ impl LinuxProcess {
 
     /// Check if sticky-directory removal/rename is allowed.
     pub fn check_sticky(&self, dir_metadata: &Metadata, target_metadata: &Metadata) -> LxResult {
+        Self::sticky_verdict(&self.credentials(), dir_metadata, target_metadata)
+    }
+
+    /// Linux's `check_sticky()`: in a sticky directory only root, the
+    /// directory's owner and the entry's owner may remove or replace the
+    /// entry. Pure, on the metadata of both.
+    fn sticky_verdict(
+        creds: &Credentials,
+        dir_metadata: &Metadata,
+        target_metadata: &Metadata,
+    ) -> LxResult {
         if (dir_metadata.mode & MODE_STICKY) == 0 {
             return Ok(());
         }
-        let creds = self.credentials();
         // `__check_sticky()` opens with `kuid_t fsuid = current_fsuid();` and
         // compares that one id against both inodes.
         if creds.fsuid == ROOT_UID
@@ -2639,6 +2649,70 @@ impl LinuxProcess {
         } else {
             Err(LxError::EPERM)
         }
+    }
+
+    /// What `vfs_rename` and its two `may_delete` calls decide about a
+    /// rename of `old` (in `old_dir`) onto `new` (in `new_dir`, `None` when
+    /// no such entry exists), once both parents are known writable and
+    /// searchable. Pure, so the matrix is unit-testable.
+    ///
+    /// Only the first of these was ever asked before, which left the other
+    /// three to whoever called: in a sticky `/tmp`, `mv mine yours` replaced
+    /// another user's file (the very thing the sticky bit forbids `rm` from
+    /// doing, and which `unlinkat` here already refused); a file could be
+    /// renamed onto a directory and a directory onto a file, and a directory
+    /// could be moved out of one parent into another without the caller
+    /// holding write permission on it -- Linux asks for it because the move
+    /// rewrites the directory's own `..`.
+    ///
+    /// The order is Linux's: `may_delete(old_dir, old)` (the sticky bit), then
+    /// `may_delete(new_dir, new, is_dir)` on the target, whose sticky `EPERM`
+    /// comes before its type mismatch (`ENOTDIR` for a directory onto a
+    /// non-directory, `EISDIR` for the reverse), then the `MAY_WRITE` on a
+    /// directory changing parents (`EACCES`).
+    fn rename_verdict(
+        creds: &Credentials,
+        old_dir: &Metadata,
+        old: &Metadata,
+        new_dir: &Metadata,
+        new: Option<&Metadata>,
+    ) -> LxResult {
+        Self::sticky_verdict(creds, old_dir, old)?;
+        let is_dir = old.type_ == FileType::Dir;
+        if let Some(new) = new {
+            Self::sticky_verdict(creds, new_dir, new)?;
+            let new_is_dir = new.type_ == FileType::Dir;
+            if is_dir && !new_is_dir {
+                return Err(LxError::ENOTDIR);
+            }
+            if !is_dir && new_is_dir {
+                return Err(LxError::EISDIR);
+            }
+        }
+        let same_parent = old_dir.dev == new_dir.dev && old_dir.inode == new_dir.inode;
+        if is_dir && !same_parent {
+            Self::access_verdict(
+                creds,
+                old.uid as u32,
+                old.gid as u32,
+                old.mode,
+                true,
+                ACCESS_WRITE,
+                true,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// [`rename_verdict`](Self::rename_verdict) for this process.
+    pub fn check_rename(
+        &self,
+        old_dir: &Metadata,
+        old: &Metadata,
+        new_dir: &Metadata,
+        new: Option<&Metadata>,
+    ) -> LxResult {
+        Self::rename_verdict(&self.credentials(), old_dir, old, new_dir, new)
     }
 
     /// The mode a `chmod` by `creds` actually lands on a file owned by
@@ -8389,6 +8463,206 @@ mod link_permission_tests {
         assert_eq!(
             LinuxProcess::link_verdict(&c, OWNER, OTHER, 0o660, FileType::File),
             Err(LxError::EPERM)
+        );
+    }
+}
+
+/// `rename_verdict`: the three questions `vfs_rename` asks that `renameat2`
+/// never asked. Pure inputs, so every cell of the matrix runs on the host.
+#[cfg(test)]
+mod rename_permission_tests {
+    use super::*;
+    use rcore_fs::vfs::Timespec;
+
+    const ALICE: u32 = 1000;
+    const BOB: u32 = 2000;
+    const TMP: usize = 40;
+    const HOME: usize = 41;
+
+    fn creds(uid: u32) -> Credentials {
+        Credentials {
+            ruid: uid,
+            euid: uid,
+            suid: uid,
+            rgid: uid,
+            egid: uid,
+            sgid: uid,
+            fsuid: uid,
+            fsgid: uid,
+            groups: Vec::new(),
+            umask: 0o022,
+        }
+    }
+
+    fn meta(inode: usize, type_: FileType, mode: u16, uid: u32) -> Metadata {
+        Metadata {
+            dev: 1,
+            inode,
+            size: 0,
+            blk_size: 4096,
+            blocks: 0,
+            atime: Timespec { sec: 0, nsec: 0 },
+            mtime: Timespec { sec: 0, nsec: 0 },
+            ctime: Timespec { sec: 0, nsec: 0 },
+            type_,
+            mode,
+            nlinks: 1,
+            uid: uid as _,
+            gid: uid as _,
+            rdev: 0,
+        }
+    }
+
+    /// `/tmp`: root's, world-writable, sticky.
+    fn sticky_tmp() -> Metadata {
+        meta(TMP, FileType::Dir, 0o1777, ROOT_UID)
+    }
+
+    /// A plain shared directory without the sticky bit.
+    fn plain_dir(inode: usize) -> Metadata {
+        meta(inode, FileType::Dir, 0o777, ROOT_UID)
+    }
+
+    fn file(inode: usize, uid: u32) -> Metadata {
+        meta(inode, FileType::File, 0o644, uid)
+    }
+
+    fn dir(inode: usize, mode: u16, uid: u32) -> Metadata {
+        meta(inode, FileType::Dir, mode, uid)
+    }
+
+    fn verdict(
+        uid: u32,
+        old_dir: &Metadata,
+        old: &Metadata,
+        new_dir: &Metadata,
+        new: Option<&Metadata>,
+    ) -> LxResult {
+        LinuxProcess::rename_verdict(&creds(uid), old_dir, old, new_dir, new)
+    }
+
+    #[test]
+    fn in_a_sticky_directory_the_target_must_be_yours_too() {
+        // `mv mine yours` in /tmp: `may_delete(new_dir, new_dentry)` is the
+        // same sticky test `rm yours` fails.
+        let tmp = sticky_tmp();
+        let mine = file(1, ALICE);
+        let yours = file(2, BOB);
+        assert_eq!(
+            verdict(ALICE, &tmp, &mine, &tmp, Some(&yours)),
+            Err(LxError::EPERM)
+        );
+        // Over a file of one's own, over nothing, by root, or by the owner
+        // of the directory: allowed.
+        let also_mine = file(3, ALICE);
+        assert_eq!(verdict(ALICE, &tmp, &mine, &tmp, Some(&also_mine)), Ok(()));
+        assert_eq!(verdict(ALICE, &tmp, &mine, &tmp, None), Ok(()));
+        assert_eq!(verdict(ROOT_UID, &tmp, &mine, &tmp, Some(&yours)), Ok(()));
+        let bobs_sticky = meta(TMP, FileType::Dir, 0o1777, BOB);
+        let carols = file(4, 3000);
+        assert_eq!(
+            verdict(BOB, &bobs_sticky, &mine, &bobs_sticky, Some(&carols)),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn the_sticky_bit_on_the_source_directory_still_counts() {
+        let tmp = sticky_tmp();
+        let yours = file(2, BOB);
+        assert_eq!(
+            verdict(ALICE, &tmp, &yours, &plain_dir(HOME), None),
+            Err(LxError::EPERM)
+        );
+    }
+
+    #[test]
+    fn without_the_sticky_bit_anyone_may_replace_anyone() {
+        let shared = plain_dir(HOME);
+        assert_eq!(
+            verdict(
+                ALICE,
+                &shared,
+                &file(1, ALICE),
+                &shared,
+                Some(&file(2, BOB))
+            ),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn a_directory_onto_a_file_is_enotdir_and_a_file_onto_a_directory_eisdir() {
+        let home = plain_dir(HOME);
+        let d = dir(5, 0o755, ALICE);
+        let f = file(6, ALICE);
+        assert_eq!(
+            verdict(ALICE, &home, &d, &home, Some(&f)),
+            Err(LxError::ENOTDIR)
+        );
+        assert_eq!(
+            verdict(ALICE, &home, &f, &home, Some(&d)),
+            Err(LxError::EISDIR)
+        );
+        // A directory onto an (empty) directory is the filesystem's call.
+        let e = dir(7, 0o755, ALICE);
+        assert_eq!(verdict(ALICE, &home, &d, &home, Some(&e)), Ok(()));
+    }
+
+    #[test]
+    fn the_sticky_eperm_on_the_target_comes_before_its_type() {
+        // `may_delete` checks `check_sticky` before `d_is_dir(victim)`.
+        let tmp = sticky_tmp();
+        let d = dir(5, 0o755, ALICE);
+        let bobs_file = file(2, BOB);
+        assert_eq!(
+            verdict(ALICE, &tmp, &d, &tmp, Some(&bobs_file)),
+            Err(LxError::EPERM)
+        );
+    }
+
+    #[test]
+    fn moving_a_directory_to_another_parent_needs_write_permission_on_it() {
+        // `vfs_rename`: `if (is_dir && new_dir != old_dir)
+        // error = inode_permission(source, MAY_WRITE);` -- the move rewrites
+        // the directory's own `..`.
+        let home = plain_dir(HOME);
+        let elsewhere = plain_dir(42);
+        let bobs_dir = dir(5, 0o755, BOB);
+        assert_eq!(
+            verdict(ALICE, &home, &bobs_dir, &elsewhere, None),
+            Err(LxError::EACCES)
+        );
+        // Within the same parent it is only a rename: no such requirement.
+        assert_eq!(verdict(ALICE, &home, &bobs_dir, &home, None), Ok(()));
+        // A file has no `..` to rewrite.
+        assert_eq!(
+            verdict(ALICE, &home, &file(6, BOB), &elsewhere, None),
+            Ok(())
+        );
+        // A writable directory, its owner, or root: allowed.
+        assert_eq!(
+            verdict(ALICE, &home, &dir(5, 0o777, BOB), &elsewhere, None),
+            Ok(())
+        );
+        assert_eq!(verdict(BOB, &home, &bobs_dir, &elsewhere, None), Ok(()));
+        assert_eq!(
+            verdict(ROOT_UID, &home, &bobs_dir, &elsewhere, None),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn the_same_parent_is_the_same_inode_on_the_same_device() {
+        // The parents reached through two different paths (`.` and `..`, a
+        // bind mount) compare by (dev, inode), not by the path typed.
+        let home = plain_dir(HOME);
+        let mut other_device = plain_dir(HOME);
+        other_device.dev = 2;
+        let bobs_dir = dir(5, 0o755, BOB);
+        assert_eq!(
+            verdict(ALICE, &home, &bobs_dir, &other_device, None),
+            Err(LxError::EACCES)
         );
     }
 }
