@@ -6358,6 +6358,198 @@ mod kms_scanout_tests {
         c.rmfb(fb).expect("RMFB");
         c.destroy_dumb(buf.handle).expect("DESTROY_DUMB");
     }
+
+    /// Drain whatever flip completions are outstanding, so a later read only
+    /// sees the ones the test is about.
+    fn drain_completions(c: &Client) {
+        drm::flush_pending_flip_completions();
+        let mut sink = [0u8; 256];
+        let _ = c.read_events(&mut sink);
+    }
+
+    /// The bug the pause machinery had, from the compositor's side. During the
+    /// deferred console-GPU bring-up scanout is parked: every flip is reported
+    /// complete and no pixel is written, which is deliberate -- labwc's BAR1
+    /// traffic must stay out of the SEC2 window. What was missing is the other
+    /// half. The compositor was TOLD those frames landed, so it will not draw
+    /// them again, and nothing put the last one up when the window closed: an
+    /// idle desktop sat on a pre-pause frame with scanout fully alive.
+    #[test]
+    fn the_frame_dropped_while_scanout_was_paused_reaches_the_panel_on_resume() {
+        let screen = kms_emu::attach(64, 16);
+        let c = Client::open(0);
+
+        let before = c.create_dumb(64, 16);
+        paint(&before, |x, y| tag(0x0011_0000, x, y));
+        let fb_before = c.addfb2(&before);
+        c.page_flip(drm::SYNTH_CRTC_ID, fb_before, 1)
+            .expect("the frame before the pause");
+        assert_eq!(
+            screen.pixel(7, 3),
+            tag(0x0011_0000, 7, 3),
+            "frame one is up"
+        );
+        drain_completions(&c);
+
+        // The bring-up parks scanout. labwc knows nothing about it and renders.
+        drm::set_scanout_paused_for(drm::SCANOUT_PAUSE_MAX);
+        let during = c.create_dumb(64, 16);
+        paint(&during, |x, y| tag(0x0022_0000, x, y));
+        let fb_during = c.addfb2(&during);
+        c.page_flip(drm::SYNTH_CRTC_ID, fb_during, 2)
+            .expect("a flip during the pause is still accepted");
+
+        // Nothing reached the panel: that is what the pause is for.
+        assert_eq!(
+            screen.pixel(7, 3),
+            tag(0x0011_0000, 7, 3),
+            "the pause let a frame through to the framebuffer"
+        );
+        // And the client was told it completed, which is why it will never
+        // draw that frame again and why the kernel owes it a repaint.
+        drm::flush_pending_flip_completions();
+        let mut b = [0u8; 32];
+        assert_eq!(c.read_events(&mut b).expect("completion"), 32);
+        assert_eq!(parse_events(&b)[0].user_data, 2);
+
+        drm::set_scanout_paused(false);
+
+        for y in 0..16 {
+            for x in 0..64 {
+                assert_eq!(
+                    screen.pixel(x, y),
+                    tag(0x0022_0000, x, y),
+                    "pixel ({}, {}) is still the pre-pause frame: the resume \
+                     left the desktop frozen with scanout running",
+                    x,
+                    y
+                );
+            }
+        }
+
+        c.rmfb(fb_before).expect("RMFB");
+        c.rmfb(fb_during).expect("RMFB");
+        c.destroy_dumb(before.handle).expect("DESTROY_DUMB");
+        c.destroy_dumb(during.handle).expect("DESTROY_DUMB");
+    }
+
+    /// And the visible half of the same disagreement. A pointer move does not
+    /// re-blit the frame; it restores the two ~64x64 windows it touches FROM
+    /// `crtc_fb`. With the panel a frame behind that buffer -- which is exactly
+    /// what a dropped present leaves -- those windows paste pieces of a frame
+    /// nobody has seen into the one still on screen: a ring of garbage that
+    /// follows the cursor, invisible on a flat wallpaper and obvious over a
+    /// window shadow.
+    ///
+    /// The watchdog is what gets there: it lifts the pause on a clock read
+    /// without anyone presenting, so the first thing to run afterwards can well
+    /// be a mouse move. A zero-length window is that same code path without a
+    /// test that sleeps.
+    #[test]
+    fn a_pointer_move_after_the_watchdog_does_not_paste_pieces_of_the_unseen_frame() {
+        let screen = kms_emu::attach(64, 16);
+        let c = Client::open(0);
+
+        let before = c.create_dumb(64, 16);
+        paint(&before, |x, y| tag(0x0011_0000, x, y));
+        let fb_before = c.addfb2(&before);
+        set_crtc(&c, drm::SYNTH_CRTC_ID, fb_before, 64, 16);
+        drain_completions(&c);
+
+        // A pointer the kernel composites itself, placed off to one side.
+        let ptr = c.create_dumb(8, 8);
+        paint(&ptr, |_, _| 0xFFFF_FFFF);
+        set_cursor(&c, drm::SYNTH_CRTC_ID, ptr.handle, 8, 8, 4, 4);
+        drain_completions(&c);
+
+        drm::set_scanout_paused_for(drm::SCANOUT_PAUSE_MAX);
+        let during = c.create_dumb(64, 16);
+        paint(&during, |x, y| tag(0x0022_0000, x, y));
+        let fb_during = c.addfb2(&during);
+        c.page_flip(drm::SYNTH_CRTC_ID, fb_during, 3)
+            .expect("a flip during the pause is still accepted");
+        drain_completions(&c);
+
+        // The bring-up never came back, so the watchdog is what resumes -- with
+        // no present of its own. `Duration::ZERO` is a window already closed.
+        drm::set_scanout_paused_for(core::time::Duration::ZERO);
+        assert!(
+            !drm::scanout_paused(),
+            "the watchdog did not lift the pause"
+        );
+
+        move_cursor(&c, drm::SYNTH_CRTC_ID, 40, 8);
+
+        // Every pixel the pointer does not cover belongs to ONE frame. Before
+        // the fix the answer was "frame one, except two windows of frame two".
+        let mut saw_second = false;
+        for y in 0..16 {
+            for x in 0..64 {
+                let px = screen.pixel(x, y);
+                if px == tag(0x0022_0000, x, y) {
+                    saw_second = true;
+                    continue;
+                }
+                assert_ne!(
+                    px,
+                    tag(0x0011_0000, x, y),
+                    "pixel ({}, {}) is still the frame the panel was showing \
+                     while the rest came from the one it never saw -- that is \
+                     the garbage around the cursor",
+                    x,
+                    y
+                );
+            }
+        }
+        assert!(saw_second, "the pointer move put nothing on the screen");
+
+        c.rmfb(fb_before).expect("RMFB");
+        c.rmfb(fb_during).expect("RMFB");
+        c.destroy_dumb(before.handle).expect("DESTROY_DUMB");
+        c.destroy_dumb(during.handle).expect("DESTROY_DUMB");
+        c.destroy_dumb(ptr.handle).expect("DESTROY_DUMB");
+    }
+
+    /// A damage rect is not a catch-up. `DRM_IOCTL_MODE_DIRTYFB` copies the
+    /// boxes the client names and nothing else, so after a dropped present the
+    /// panel is still a frame behind everywhere outside them -- and the cursor
+    /// repaint would go back to restoring rects from a buffer the panel does not
+    /// show. Only a whole frame may clear the mark.
+    #[test]
+    fn a_damage_rect_does_not_catch_a_panel_up_from_a_dropped_frame() {
+        let _screen = kms_emu::attach(64, 16);
+        let c = Client::open(0);
+
+        let before = c.create_dumb(64, 16);
+        paint(&before, |x, y| tag(0x0011_0000, x, y));
+        let fb_before = c.addfb2(&before);
+        set_crtc(&c, drm::SYNTH_CRTC_ID, fb_before, 64, 16);
+        drain_completions(&c);
+
+        drm::set_scanout_paused_for(drm::SCANOUT_PAUSE_MAX);
+        let during = c.create_dumb(64, 16);
+        paint(&during, |x, y| tag(0x0022_0000, x, y));
+        let fb_during = c.addfb2(&during);
+        c.page_flip(drm::SYNTH_CRTC_ID, fb_during, 4)
+            .expect("a flip during the pause is still accepted");
+        drain_completions(&c);
+        drm::set_scanout_paused_for(core::time::Duration::ZERO);
+        assert!(!drm::scanout_paused());
+
+        // A four-pixel box, the way a blinking cursor in a terminal damages.
+        dirtyfb(&c, fb_during, &[clip(0, 0, 4, 4)]);
+
+        assert!(
+            drm::scanout_is_stale_for_test(),
+            "a damage rect cleared the mark, so the next pointer move will \
+             restore its windows from a frame the panel is not showing"
+        );
+
+        c.rmfb(fb_before).expect("RMFB");
+        c.rmfb(fb_during).expect("RMFB");
+        c.destroy_dumb(before.handle).expect("DESTROY_DUMB");
+        c.destroy_dumb(during.handle).expect("DESTROY_DUMB");
+    }
 }
 
 /// The hardware-KMS path: what changes when a driver owns scanout.

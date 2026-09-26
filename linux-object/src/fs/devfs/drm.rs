@@ -101,12 +101,83 @@ static CRTC_BLANKED: core::sync::atomic::AtomicBool = core::sync::atomic::Atomic
 static SCANOUT_PAUSE_DEADLINE_NS: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0);
 
+/// Set when a present was acknowledged and thrown away because scanout was
+/// paused, i.e. when the screen stopped being what `crtc_fb` says it is.
+///
+/// The drop still records `crtc_fb`, so `GETCRTC` keeps telling the client the
+/// truth about what it bound -- but those pixels never reached the panel, and
+/// the client was told the flip completed, so it will not draw them again. Two
+/// things go wrong from there, and this latch is what both of them read:
+///
+/// - Nothing puts the newest frame up when the pause lifts, so an idle desktop
+///   stays frozen on a frame from before the pause even though scanout is back.
+/// - [`repaint_for_cursor`] restores its two ~64x64 windows *from* `crtc_fb`.
+///   With the screen a frame behind, a pointer move pastes pieces of a frame
+///   nobody has seen onto the one that is still up: garbage in a ring around
+///   the cursor, which a flat wallpaper hides and a window shadow does not.
+///
+/// Cleared by the next present that puts a WHOLE frame up -- a partial one
+/// leaves the disagreement everywhere it did not touch.
+static SCANOUT_STALE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
 /// How long a deferred console-GPU bring-up may hold scanout paused before the
 /// watchdog resumes it anyway. Generous, because a real GSP boot + state-load
 /// on cold hardware is tens of seconds and cutting one short would put
 /// labwc's BAR1 traffic right back into the SEC2 window this exists to keep
 /// quiet. Bounded, because the alternative is a permanently frozen desktop.
 pub const SCANOUT_PAUSE_MAX: core::time::Duration = core::time::Duration::from_secs(90);
+
+/// Nanoseconds since boot, saturating rather than wrapping.
+///
+/// `Duration::as_nanos` is a `u128` and `as u64` on it truncates silently; a
+/// truncated deadline is a deadline in the past. Nothing reaches 2^64 ns (584
+/// years) on a real boot, but the arithmetic below is the watchdog's, and the
+/// watchdog exists for the case where the rest of the bring-up did not hold.
+fn timer_now_ns() -> u64 {
+    kernel_hal::timer::timer_now()
+        .as_nanos()
+        .min(u64::MAX as u128) as u64
+}
+
+/// Whether a pause is in force, given the two latches and the clock.
+///
+/// Pure, so each branch is testable without the process-global statics and
+/// without a clock: whether a frozen desktop ever recovers is this one line.
+///
+/// `deadline_ns == 0` is the "no watchdog" sentinel -- a pause that holds until
+/// someone lifts it. Which is exactly why [`pause_deadline_ns`] never returns 0.
+fn pause_in_force(paused: bool, deadline_ns: u64, now_ns: u64) -> bool {
+    paused && (deadline_ns == 0 || now_ns < deadline_ns)
+}
+
+/// The deadline [`set_scanout_paused_for`] stores for `max` from `now_ns`.
+///
+/// Never 0, because 0 means "no watchdog": a deadline that landed there -- a
+/// truncated `now + max`, or a genuine zero on a clock that starts at zero --
+/// would turn the one call whose entire purpose is to make a permanent freeze
+/// impossible into the permanent freeze itself. 1 ns is in the past for every
+/// reader, so the pause would lift on its first read instead: cutting a
+/// bring-up window short is recoverable, a desktop frozen for good is not.
+fn pause_deadline_ns(now_ns: u64, max: core::time::Duration) -> u64 {
+    let max_ns = max.as_nanos().min(u64::MAX as u128) as u64;
+    now_ns.saturating_add(max_ns).max(1)
+}
+
+/// The deadline a plain [`set_scanout_paused`]`(true)` leaves behind: a watchdog
+/// still in force is kept, one that has already run out is dropped.
+///
+/// Keeping it matters because that variant latches until someone lifts it and
+/// nobody else will, so silently discarding a live watchdog is the difference
+/// between a desktop frozen for 90 seconds and one frozen for good. Dropping an
+/// expired one matters for the mirror-image reason: inheriting a deadline in the
+/// past would make the call not pause at all.
+fn deadline_kept_by_plain_pause(deadline_ns: u64, now_ns: u64) -> u64 {
+    if pause_in_force(true, deadline_ns, now_ns) {
+        deadline_ns
+    } else {
+        0
+    }
+}
 
 /// Turn the CRTC off (paint the panel black and stop repainting it) or back on.
 ///
@@ -160,15 +231,30 @@ pub fn ce_present_enabled() -> bool {
 ///
 /// Prefer [`set_scanout_paused_for`] when what follows the pause is a call into
 /// the hardware that can fail to return: this variant latches until someone
-/// calls it again with `false`, and nobody else will.
+/// calls it again with `false`, and nobody else will. For the same reason a
+/// watchdog already running is NOT cancelled here -- see
+/// [`deadline_kept_by_plain_pause`].
+///
+/// Resuming re-presents the framebuffer the CRTC is bound to, because every
+/// present taken during the pause was acknowledged and dropped: see
+/// [`SCANOUT_STALE`].
 pub fn set_scanout_paused(on: bool) {
-    SCANOUT_PAUSE_DEADLINE_NS.store(0, Ordering::SeqCst);
-    SCANOUT_PAUSED.store(on, Ordering::SeqCst);
-    if on {
-        kernel_hal::klog_info!("[drm] scanout PAUSED (console GSP bring-up window)");
-    } else {
+    if !on {
+        SCANOUT_PAUSED.store(false, Ordering::SeqCst);
+        SCANOUT_PAUSE_DEADLINE_NS.store(0, Ordering::SeqCst);
         kernel_hal::klog_info!("[drm] scanout RESUMED");
+        repaint_if_scanout_stale();
+        return;
     }
+    // Deadline first: a reader that saw `paused` alongside the previous,
+    // already-expired deadline would expire this pause on its first read.
+    let deadline = SCANOUT_PAUSE_DEADLINE_NS.load(Ordering::SeqCst);
+    SCANOUT_PAUSE_DEADLINE_NS.store(
+        deadline_kept_by_plain_pause(deadline, timer_now_ns()),
+        Ordering::SeqCst,
+    );
+    SCANOUT_PAUSED.store(true, Ordering::SeqCst);
+    kernel_hal::klog_info!("[drm] scanout PAUSED (console GSP bring-up window)");
 }
 
 /// Pause scanout with a watchdog: the pause lifts by itself after `max`, even
@@ -183,8 +269,7 @@ pub fn set_scanout_paused(on: bool) {
 /// forever. Expiring on a clock read, rather than from a second task, is what
 /// makes the recovery independent of any thread surviving.
 pub fn set_scanout_paused_for(max: core::time::Duration) {
-    let deadline = kernel_hal::timer::timer_now() + max;
-    SCANOUT_PAUSE_DEADLINE_NS.store(deadline.as_nanos() as u64, Ordering::SeqCst);
+    SCANOUT_PAUSE_DEADLINE_NS.store(pause_deadline_ns(timer_now_ns(), max), Ordering::SeqCst);
     SCANOUT_PAUSED.store(true, Ordering::SeqCst);
     kernel_hal::klog_info!(
         "[drm] scanout PAUSED (console GSP bring-up window, watchdog {}s)",
@@ -195,17 +280,34 @@ pub fn set_scanout_paused_for(max: core::time::Duration) {
 /// Whether scanout is currently paused, expiring a watchdogged pause whose
 /// deadline has passed. Every reader goes through here so the expiry happens
 /// on the frame that needs the answer.
+///
+/// The expiry does not repaint: everything that asks is itself in a draw path
+/// (a present about to run, a driver flip that just ran, or a cursor move), and
+/// [`SCANOUT_STALE`] is what makes the first of those put a whole frame up.
 pub fn scanout_paused() -> bool {
-    if !SCANOUT_PAUSED.load(Ordering::SeqCst) {
-        return false;
-    }
+    let paused = SCANOUT_PAUSED.load(Ordering::SeqCst);
     let deadline = SCANOUT_PAUSE_DEADLINE_NS.load(Ordering::SeqCst);
-    if deadline == 0 || (kernel_hal::timer::timer_now().as_nanos() as u64) < deadline {
+    if pause_in_force(paused, deadline, timer_now_ns()) {
         return true;
     }
-    // Deadline passed: resume, once. Whoever loses the race just sees a
-    // resumed scanout, which is the point.
-    SCANOUT_PAUSE_DEADLINE_NS.store(0, Ordering::SeqCst);
+    if !paused {
+        return false;
+    }
+    // Deadline passed: resume, once. Cancel only the deadline we just judged
+    // expired -- a `set_scanout_paused_for` that landed between the load above
+    // and here has opened a fresh window, and cancelling *that* one would put
+    // back the permanent freeze this whole path exists to prevent.
+    //
+    // No sequential test can tell this from a blind `store(0)`: the difference
+    // needs two CPUs, one expiring while the other arms. It is left as a
+    // compare-exchange because the cost is one instruction and the failure it
+    // rules out is the one this function exists to prevent.
+    if SCANOUT_PAUSE_DEADLINE_NS
+        .compare_exchange(deadline, 0, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return SCANOUT_PAUSED.load(Ordering::SeqCst);
+    }
     if SCANOUT_PAUSED.swap(false, Ordering::SeqCst) {
         kernel_hal::klog_warn!(
             "[drm] scanout watchdog: la ventana de bring-up de la GPU de consola expiro sin \
@@ -214,6 +316,40 @@ pub fn scanout_paused() -> bool {
         );
     }
     false
+}
+
+/// Whether a pause has left the panel behind `crtc_fb`, for the tests in
+/// `drm_scheme` that drive this through the ioctls rather than the latch.
+#[cfg(test)]
+pub(crate) fn scanout_is_stale_for_test() -> bool {
+    SCANOUT_STALE.load(Ordering::SeqCst)
+}
+
+/// Put the framebuffer the CRTC is bound to back on the panel, if a pause
+/// dropped a present and nothing has put a whole frame up since.
+///
+/// The compositor will not do it: it was told every one of those flips
+/// completed. Without this an idle desktop stays on a pre-pause frame after the
+/// bring-up window closes, and the next pointer move paints patches of the
+/// unseen frame into it.
+fn repaint_if_scanout_stale() {
+    if !SCANOUT_STALE.load(Ordering::SeqCst) {
+        return;
+    }
+    // A client that turned the CRTC off during the pause meant it: presenting
+    // here would light the panel behind its back. Leave the latch set so the
+    // present that un-blanks is the one that also fixes the frame.
+    if crtc_blanked() {
+        return;
+    }
+    let fb_id = DRM_STATE.lock().crtc_fb;
+    if fb_id == 0 {
+        // Nothing was ever bound, so there is no stale frame to replace.
+        SCANOUT_STALE.store(false, Ordering::SeqCst);
+        return;
+    }
+    // Clears the latch itself, on the whole-frame present below succeeding.
+    let _ = present_now_region(fb_id, SYNTH_CRTC_ID, None);
 }
 
 /// Master switch for the atomic-modesetting uAPI (`DRM_CLIENT_CAP_ATOMIC` +
@@ -2758,6 +2894,17 @@ pub fn repaint_for_cursor() {
     if scanout_paused() || crtc_blanked() {
         return;
     }
+    // The rect restore below reads FROM `crtc_fb`. If a pause dropped a present
+    // the panel is a frame behind it, and those two ~64x64 windows would paste
+    // pieces of a frame nobody has seen into the one still on screen. Put the
+    // whole frame up instead -- which also composites the pointer, so there is
+    // nothing left for the rect path to do.
+    if SCANOUT_STALE.load(Ordering::SeqCst) {
+        repaint_if_scanout_stale();
+        if !SCANOUT_STALE.load(Ordering::SeqCst) {
+            return;
+        }
+    }
     if !software_kms_active() {
         // Hardware KMS has taken over the scanout. `has_hardware_kms()` is
         // recomputed on every call and flips to true the first time the NVC57E
@@ -3691,6 +3838,9 @@ pub fn present_now_checked(
     // compositor alive, but do not touch the GOP framebuffer / CE path.
     if scanout_paused() {
         set_crtc_fb(crtc_id, fb_id);
+        // Acknowledged and not drawn: from here on the panel and `crtc_fb`
+        // describe different frames. See [`SCANOUT_STALE`].
+        SCANOUT_STALE.store(true, Ordering::SeqCst);
         return Ok(());
     }
     // An explicit present is a client putting pixels on this CRTC, so it is on
@@ -3784,6 +3934,14 @@ pub fn present_now_checked(
         composite_cursor_after_driver_flip(fb_id);
     } else {
         scanout_region_checked(fb_id, rect)?;
+    }
+    // The panel carries this framebuffer in full now -- the driver replaced the
+    // whole scanout, or the blit covered the whole frame -- so whatever a pause
+    // dropped earlier, the two agree again. A damage rect does NOT catch up:
+    // it leaves the disagreement everywhere it did not touch. See
+    // [`SCANOUT_STALE`].
+    if rect.is_none() || hw.unwrap_or(false) {
+        SCANOUT_STALE.store(false, Ordering::SeqCst);
     }
     set_crtc_fb(crtc_id, fb_id);
     // A DRM client owns the framebuffer now: stop text console drawing.
@@ -4727,6 +4885,15 @@ pub fn get_plane(id: u32) -> Option<DrmPlane> {
 #[cfg(test)]
 pub(crate) fn reset_output_state_for_test() {
     set_crtc_blanked(false);
+    // A pause is the one latch that makes a present SUCCEED while touching
+    // nothing: `present_now_checked` acknowledges the flip and returns Ok. One
+    // leaked by an earlier test would make every later present test pass for no
+    // reason at all, which is worse than failing. Cleared straight on the
+    // atomics rather than through `set_scanout_paused(false)`, which would
+    // present -- and this runs with no display registered, on purpose.
+    SCANOUT_PAUSED.store(false, Ordering::SeqCst);
+    SCANOUT_PAUSE_DEADLINE_NS.store(0, Ordering::SeqCst);
+    SCANOUT_STALE.store(false, Ordering::SeqCst);
     // Back to "nobody has said", which is what a fresh process looks like.
     HW_CURSOR.store(0, Ordering::Relaxed);
     // And back to the default boot, where the atomic uAPI is off.
@@ -7078,5 +7245,316 @@ mod present_lifetime_tests {
         let _serialised = super::test_globals::lock();
         assert!(snapshot_fb_for_present(0).is_none());
         assert!(snapshot_fb_for_present(0xDEAD_BEEF).is_none());
+    }
+}
+
+/// The two latches that can leave a desktop frozen: the scanout pause (and its
+/// watchdog) and the mark that says the panel is a frame behind `crtc_fb`.
+///
+/// None of this had a test. It is also the only path in the file where a
+/// present SUCCEEDS while touching no pixels, which is what makes it worth
+/// pinning twice over: a pause leaked out of one test would make every later
+/// present test pass for a reason that has nothing to do with what it checks.
+#[cfg(test)]
+mod scanout_pause_tests {
+    extern crate std;
+
+    use super::*;
+    use core::time::Duration;
+
+    /// Put the process-global latches back however the body leaves -- or panics
+    /// out of -- them, and serialise against every other test that presents.
+    struct Restored {
+        _serialised: self::std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl Drop for Restored {
+        fn drop(&mut self) {
+            reset_output_state_for_test();
+        }
+    }
+
+    fn serialised() -> Restored {
+        let g = Restored {
+            _serialised: super::test_globals::lock(),
+        };
+        reset_output_state_for_test();
+        g
+    }
+
+    // --- the decision itself, with no statics and no clock in the way ---
+
+    /// A pause with no watchdog is the permanent kind, and `0` is how the
+    /// deadline says so. It must not read as "a deadline in the distant past".
+    #[test]
+    fn a_pause_with_no_watchdog_holds_whatever_the_clock_says() {
+        for now in [0u64, 1, 1_000_000_000, u64::MAX] {
+            assert!(
+                pause_in_force(true, 0, now),
+                "a pause with no watchdog lifted itself at now={}",
+                now
+            );
+        }
+    }
+
+    /// The watchdog's whole contract, at the boundary: in force up to the
+    /// deadline, over the moment it arrives. An off-by-one the wrong way is a
+    /// pause that outlives its window.
+    #[test]
+    fn a_watchdogged_pause_holds_up_to_its_deadline_and_not_past_it() {
+        let deadline = 90_000_000_000;
+        for now in [0u64, 1, deadline - 1] {
+            assert!(
+                pause_in_force(true, deadline, now),
+                "expired early at now={}",
+                now
+            );
+        }
+        for now in [deadline, deadline + 1, u64::MAX] {
+            assert!(
+                !pause_in_force(true, deadline, now),
+                "still paused at now={}, past its deadline",
+                now
+            );
+        }
+    }
+
+    /// With the latch off nothing is paused, whatever the deadline still holds.
+    /// A resume clears both, but not in one instruction, so a reader can see
+    /// this combination.
+    #[test]
+    fn nothing_is_paused_while_the_latch_is_off() {
+        for deadline in [0u64, 1, 90_000_000_000, u64::MAX] {
+            assert!(!pause_in_force(false, deadline, 1_000));
+        }
+    }
+
+    /// The sentinel collision, which is how the watchdog turns into the freeze
+    /// it exists to prevent: store a deadline of `0` and every reader reads
+    /// "no watchdog". `now + max` can land there -- a clock that starts at zero
+    /// with a zero window, or a sum truncated by the cast -- so the one thing
+    /// this may never return is `0`.
+    #[test]
+    fn a_watchdog_deadline_is_never_the_value_that_means_no_watchdog() {
+        let cases = [
+            (0u64, Duration::ZERO),
+            (0, Duration::from_nanos(0)),
+            (0, Duration::from_secs(90)),
+            (1, Duration::ZERO),
+            (u64::MAX, Duration::from_secs(90)),
+            (u64::MAX / 2, Duration::from_secs(u64::MAX / 2)),
+        ];
+        for (now, max) in cases {
+            let deadline = pause_deadline_ns(now, max);
+            assert_ne!(
+                deadline, 0,
+                "now={} max={:?} gave the no-watchdog sentinel, i.e. a pause \
+                 that never lifts",
+                now, max
+            );
+            // And the pause it describes is one a reader can get out of: either
+            // the window is still open, or it has already closed.
+            assert!(
+                !pause_in_force(true, deadline, u64::MAX),
+                "now={} max={:?} gave a deadline no clock can pass",
+                now,
+                max
+            );
+        }
+    }
+
+    /// And the window really is as long as it was asked for. `as_nanos` is a
+    /// `u128`; the cast to the stored `u64` truncates, which turns a long window
+    /// into a short one -- the same mistake as storing the sentinel, one step
+    /// milder, and equally invisible without a number to compare against.
+    #[test]
+    fn the_watchdog_window_is_as_long_as_it_was_asked_for() {
+        assert_eq!(
+            pause_deadline_ns(1_000, Duration::from_secs(90)),
+            1_000 + 90_000_000_000
+        );
+        assert_eq!(pause_deadline_ns(0, Duration::from_nanos(1)), 1);
+        // A window longer than the deadline can hold stops at the far end
+        // rather than wrapping round to a moment that has already passed.
+        assert_eq!(
+            pause_deadline_ns(5, Duration::from_secs(u64::MAX)),
+            u64::MAX,
+            "an absurd window was truncated into a short one"
+        );
+    }
+
+    /// A window that has not run out is worth more than the plain pause that
+    /// would replace it: one frees itself after 90 seconds, the other never
+    /// does. A second `set_scanout_paused(true)` must not make that trade.
+    #[test]
+    fn a_second_plain_pause_leaves_a_running_watchdog_alone() {
+        let deadline = 90_000_000_000;
+        for now in [0u64, 1, deadline - 1] {
+            assert_eq!(
+                deadline_kept_by_plain_pause(deadline, now),
+                deadline,
+                "the watchdog was thrown away at now={}, turning a 90-second \
+                 freeze into a permanent one",
+                now
+            );
+        }
+    }
+
+    /// And the mirror image: a deadline already in the past is not a watchdog,
+    /// it is a pause that lifts on its first read. Inheriting it would make the
+    /// call not pause at all.
+    #[test]
+    fn a_plain_pause_does_not_inherit_a_watchdog_that_already_ran_out() {
+        let deadline = 90_000_000_000;
+        for now in [deadline, deadline + 1, u64::MAX] {
+            assert_eq!(
+                deadline_kept_by_plain_pause(deadline, now),
+                0,
+                "now={} kept an expired deadline, so the pause would lift \
+                 immediately",
+                now
+            );
+        }
+        // "No watchdog" is already the answer and stays it.
+        assert_eq!(deadline_kept_by_plain_pause(0, 12_345), 0);
+    }
+
+    // --- and the same decisions through the real latches ---
+
+    /// The plain pause is the one that latches. It must survive being read, and
+    /// read, and read -- the present path asks once per frame.
+    #[test]
+    fn a_plain_pause_survives_every_read_until_someone_lifts_it() {
+        let _restored = serialised();
+        set_scanout_paused(true);
+        for _ in 0..8 {
+            assert!(scanout_paused(), "a pause with no watchdog lifted itself");
+        }
+        set_scanout_paused(false);
+        assert!(!scanout_paused());
+    }
+
+    /// The watchdog, end to end: a window that has already closed is lifted by
+    /// the first reader, and stays lifted. A zero-length window is the same code
+    /// path as a 90-second one that ran out, without a test that sleeps.
+    #[test]
+    fn the_watchdog_lifts_a_pause_nobody_came_back_for() {
+        let _restored = serialised();
+        set_scanout_paused_for(Duration::ZERO);
+        assert!(
+            !scanout_paused(),
+            "a window that has already closed still counted as paused"
+        );
+        assert!(!scanout_paused(), "and it must not come back");
+        assert_eq!(
+            SCANOUT_PAUSE_DEADLINE_NS.load(Ordering::SeqCst),
+            0,
+            "the expired deadline was left behind for the next pause to inherit"
+        );
+    }
+
+    /// A window that is still open is not cut short by a reader.
+    #[test]
+    fn a_watchdog_that_has_not_run_out_keeps_the_pause() {
+        let _restored = serialised();
+        set_scanout_paused_for(SCANOUT_PAUSE_MAX);
+        assert!(scanout_paused());
+        assert!(scanout_paused());
+    }
+
+    /// The clobber, through the real latches: pausing again while the bring-up
+    /// window is open used to store the no-watchdog sentinel first, so a wedge
+    /// after it froze the desktop for good instead of for 90 seconds.
+    #[test]
+    fn pausing_again_does_not_turn_a_bounded_freeze_into_a_permanent_one() {
+        let _restored = serialised();
+        set_scanout_paused_for(SCANOUT_PAUSE_MAX);
+        let armed = SCANOUT_PAUSE_DEADLINE_NS.load(Ordering::SeqCst);
+        assert_ne!(armed, 0);
+
+        set_scanout_paused(true);
+
+        assert!(scanout_paused());
+        assert_eq!(
+            SCANOUT_PAUSE_DEADLINE_NS.load(Ordering::SeqCst),
+            armed,
+            "the second pause cancelled the watchdog"
+        );
+    }
+
+    /// A present taken during the pause is reported complete -- the compositor's
+    /// frame loop must not stop -- and records what it bound, so `GETCRTC` stays
+    /// truthful. What it must ALSO do is admit that the panel no longer shows
+    /// that framebuffer, because nothing else in the tree can tell afterwards.
+    #[test]
+    fn a_present_dropped_by_the_pause_is_acknowledged_and_marks_the_panel_stale() {
+        let _restored = serialised();
+        set_scanout_paused(true);
+
+        assert!(
+            present_now_checked(0x5151, SYNTH_CRTC_ID, None).is_ok(),
+            "a paused present must still be acknowledged, or the compositor \
+             blocks in poll() for a frame nobody will report"
+        );
+        assert_eq!(crtc_fb(), 0x5151, "GETCRTC must still report what it bound");
+        assert!(
+            SCANOUT_STALE.load(Ordering::SeqCst),
+            "the panel is a frame behind crtc_fb and nothing recorded it"
+        );
+    }
+
+    /// Resuming with nothing ever bound has no frame to put back, so it clears
+    /// the mark rather than leaving it set for the next pointer move to act on.
+    #[test]
+    fn a_resume_with_nothing_bound_clears_the_mark_instead_of_presenting() {
+        let _restored = serialised();
+        set_scanout_paused(true);
+        assert!(present_now_checked(0, SYNTH_CRTC_ID, None).is_ok());
+        assert!(SCANOUT_STALE.load(Ordering::SeqCst));
+
+        set_scanout_paused(false);
+
+        assert!(!scanout_paused());
+        assert!(
+            !SCANOUT_STALE.load(Ordering::SeqCst),
+            "nothing was ever bound, so there is no stale frame to chase"
+        );
+    }
+
+    /// A client that turned the CRTC off during the pause meant it. The resume
+    /// must not light the panel behind its back -- and must not drop the mark
+    /// either, or the present that does un-blank would restore rects from a
+    /// frame the panel never showed.
+    #[test]
+    fn a_resume_does_not_light_a_panel_the_client_turned_off() {
+        let _restored = serialised();
+        set_scanout_paused(true);
+        assert!(present_now_checked(0x6262, SYNTH_CRTC_ID, None).is_ok());
+        set_crtc_blanked(true);
+
+        set_scanout_paused(false);
+
+        assert!(crtc_blanked(), "the resume turned the screen back on");
+        assert!(
+            SCANOUT_STALE.load(Ordering::SeqCst),
+            "the mark was dropped while the panel was still a frame behind"
+        );
+    }
+
+    /// The harness itself. `reset_output_state_for_test` is what stands between
+    /// a test that leaves a pause behind and every present test that follows
+    /// passing while touching nothing at all.
+    #[test]
+    fn the_reset_between_tests_lifts_a_leaked_pause() {
+        let _restored = serialised();
+        set_scanout_paused_for(SCANOUT_PAUSE_MAX);
+        assert!(present_now_checked(0x7373, SYNTH_CRTC_ID, None).is_ok());
+        assert!(scanout_paused());
+
+        reset_output_state_for_test();
+
+        assert!(!scanout_paused(), "a pause survived the reset");
+        assert_eq!(SCANOUT_PAUSE_DEADLINE_NS.load(Ordering::SeqCst), 0);
+        assert!(!SCANOUT_STALE.load(Ordering::SeqCst));
     }
 }
