@@ -16,14 +16,62 @@ fn scanout_mirror_x() -> bool {
     SCANOUT_MIRROR_X.load(Ordering::Relaxed)
 }
 
-/// Map a logical X coordinate onto the scanout when [`set_scanout_mirror_x`]
-/// is active.
-#[inline]
-fn map_x(x: u32, width: u32) -> u32 {
-    if scanout_mirror_x() {
-        width.saturating_sub(1).saturating_sub(x)
-    } else {
-        x
+/// How logical X maps onto the scanout, for one operation.
+///
+/// Every 2D primitive below has to apply the mirror, and each one used to spell
+/// it out again: `draw_pixel` and `blit_argb_over` per pixel, `fill_rect` by
+/// flipping a half-open range, `copy_rect` by flipping two rectangle origins,
+/// `blit_from` with its own `screen_w - 1 - x`. Five hand-written copies of one
+/// decision that happened to agree, with nothing checking that they did -- and
+/// the mirror is opt-in at boot, so no test and no CI run ever exercised a
+/// single one of them.
+///
+/// Reading the flag once into this also means one operation cannot see it change
+/// half way through, which is what made a per-pixel `scanout_mirror_x()` a
+/// question asked `width * height` times per fill.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct XMap {
+    mirror: bool,
+    width: u32,
+}
+
+impl XMap {
+    /// The mapping in force right now for a screen `width` pixels wide.
+    #[inline]
+    fn of(width: u32) -> Self {
+        Self {
+            mirror: scanout_mirror_x(),
+            width,
+        }
+    }
+
+    /// One pixel's column.
+    #[inline]
+    fn px(self, x: u32) -> u32 {
+        if self.mirror {
+            self.width.saturating_sub(1).saturating_sub(x)
+        } else {
+            x
+        }
+    }
+
+    /// A half-open column range `[left, right)`, as a half-open range again.
+    ///
+    /// This is [`px`](Self::px) applied to a whole span, and it has to stay
+    /// exactly that: the mirror of `{ px(i) : i in [left, right) }` is
+    /// `[width - right, width - left)`, because reversing a half-open range
+    /// moves both ends. Callers hold `left <= right <= width`, which every one
+    /// of them gets from clamping against the visible width first.
+    #[inline]
+    fn range(self, left: u32, right: u32) -> (u32, u32) {
+        if self.mirror {
+            (
+                self.width.saturating_sub(right),
+                self.width.saturating_sub(left),
+            )
+        } else {
+            (left, right)
+        }
     }
 }
 
@@ -262,7 +310,7 @@ pub trait DisplayScheme: Scheme {
         if x >= info.width || y >= info.height {
             return;
         }
-        let x = map_x(x, info.width);
+        let x = XMap::of(info.width).px(x);
         let offset =
             (y as usize * info.pitch() as usize) + (x as usize * info.format.bytes() as usize);
         if pixel_fits(offset, info.format.bytes() as usize, info.fb_size) {
@@ -289,11 +337,7 @@ pub trait DisplayScheme: Scheme {
         }
 
         if info.format == ColorFormat::ARGB8888 {
-            let (left, right) = if scanout_mirror_x() {
-                (info.width - right, info.width - left)
-            } else {
-                (left, right)
-            };
+            let (left, right) = XMap::of(info.width).range(left, right);
             let pitch = info.pitch() as usize;
             let px = color.raw_value().to_ne_bytes();
             let mut fb = self.fb();
@@ -338,14 +382,11 @@ pub trait DisplayScheme: Scheme {
         if w == 0 || h == 0 {
             return;
         }
-        let (src_x, dst_x) = if scanout_mirror_x() {
-            (
-                info.width.saturating_sub(src_x + w as u32),
-                info.width.saturating_sub(dst_x + w as u32),
-            )
-        } else {
-            (src_x, dst_x)
-        };
+        // Both origins through the same mapping: a run is mirrored by flipping
+        // its whole span, so the new left edge is the old right edge's mirror.
+        let xm = XMap::of(info.width);
+        let (src_x, _) = xm.range(src_x, src_x + w as u32);
+        let (dst_x, _) = xm.range(dst_x, dst_x + w as u32);
         let pitch = info.pitch() as usize;
         let bpp = info.format.bytes() as usize;
         let row_bytes = w * bpp;
@@ -413,22 +454,29 @@ pub trait DisplayScheme: Scheme {
         }
 
         if scanout_mirror_x() && info.format == ColorFormat::ARGB8888 {
+            // `visible_w`, not `padded_w`, and on purpose. The padded limit
+            // exists so a ROW COPY's tail lands in the scanline's off-screen
+            // padding and completes the last write-combining buffer. Mirrored,
+            // this path writes pixel by pixel in decreasing address order, so
+            // there is no row-copy tail to complete -- and the logical right
+            // edge maps to the physical LEFT, so extending past it would walk
+            // below column 0 into the previous row instead of into the padding.
             let w = visible_w;
             if w == 0 {
                 return;
             }
             let mut fb = self.fb();
             let buf: &mut [u8] = &mut fb;
-            let screen_w = info.width as usize;
             for r in 0..h {
                 let src_off = r * src_stride;
                 if src_off + w > src.len() {
                     break;
                 }
                 let y = dst_y as usize + r;
+                let xm = XMap::of(info.width);
                 for c in 0..w {
                     let px = src[src_off + c].to_le_bytes();
-                    let dx = screen_w - 1 - (dst_x as usize + c);
+                    let dx = xm.px(dst_x + c as u32) as usize;
                     let d = y * pitch + dx * 4;
                     if d + 4 > buf.len() {
                         break;
@@ -538,6 +586,7 @@ pub trait DisplayScheme: Scheme {
         }
         let pitch = info.pitch() as usize;
         let (fw, fh) = (info.width as i32, info.height as i32);
+        let xm = XMap::of(info.width);
         let mut fb = self.fb();
         let buf: &mut [u8] = &mut fb;
         for r in 0..height as i32 {
@@ -560,7 +609,7 @@ pub trait DisplayScheme: Scheme {
                 if a == 0 {
                     continue;
                 }
-                let d_off = py as usize * pitch + map_x(px as u32, info.width) as usize * 4;
+                let d_off = py as usize * pitch + xm.px(px as u32) as usize * 4;
                 if d_off + 4 > buf.len() {
                     continue;
                 }
@@ -1606,6 +1655,105 @@ mod blit_tests {
         );
         // The pixel the composite did not touch keeps its own alpha.
         assert_eq!(d.px(1, 0) >> 24, 0xFF);
+    }
+
+    // ---- the mirror ----
+
+    /// Build a mapping without touching the process-wide flag, so the mirrored
+    /// half of the primitives can be checked at all. `SCANOUT_MIRROR_X` is a
+    /// boot-time opt-in that every test in this module reads, so a test that
+    /// flipped it would depend on the execution order; this does not.
+    fn xmap(mirror: bool, width: u32) -> XMap {
+        XMap { mirror, width }
+    }
+
+    #[test]
+    fn with_the_mirror_off_nothing_is_mapped_at_all() {
+        // The default, and Moebius's machines: every primitive has to come out
+        // byte-identical to no mapping at all.
+        let m = xmap(false, 1920);
+        for x in [0u32, 1, 959, 1919, 1920, u32::MAX] {
+            assert_eq!(m.px(x), x);
+        }
+        assert_eq!(m.range(0, 1920), (0, 1920));
+        assert_eq!(m.range(7, 9), (7, 9));
+    }
+
+    #[test]
+    fn a_mirrored_pixel_is_its_distance_from_the_right_edge() {
+        let m = xmap(true, 8);
+        assert_eq!(m.px(0), 7);
+        assert_eq!(m.px(7), 0);
+        assert_eq!(m.px(3), 4);
+        // Off the right edge saturates rather than wrapping to a huge column:
+        // `0 - 1` as a `u32` is four billion, and four billion times four bytes
+        // is where a blit would write if this were not saturating.
+        assert_eq!(m.px(8), 0);
+        assert_eq!(m.px(u32::MAX), 0);
+    }
+
+    #[test]
+    fn a_mirrored_range_is_exactly_the_mirror_of_its_own_pixels() {
+        // The invariant the five primitives silently shared and nothing
+        // checked: `fill_rect` mirrors a half-open span in one step, the others
+        // mirror pixel by pixel, and the two have to describe the same columns.
+        // Reversing a half-open range moves BOTH ends, which is the part that
+        // is easy to write as `width - left .. width - right` and get backwards.
+        for width in 1..=24u32 {
+            let m = xmap(true, width);
+            for left in 0..=width {
+                for right in left..=width {
+                    let (ml, mr) = m.range(left, right);
+                    let by_pixel: alloc::vec::Vec<u32> = (left..right).map(|x| m.px(x)).collect();
+                    let by_range: alloc::vec::Vec<u32> = (ml..mr).collect();
+                    let mut sorted = by_pixel.clone();
+                    sorted.sort_unstable();
+                    assert_eq!(
+                        sorted, by_range,
+                        "width {}, range {}..{} maps to {}..{} but its pixels are {:?}",
+                        width, left, right, ml, mr, by_pixel
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_mirrored_run_keeps_its_length_wherever_it_lands() {
+        // `copy_rect` mirrors two origins of the same width and then copies
+        // `w` pixels from each. If the mapping did not preserve the length the
+        // two would address different amounts of pixels.
+        let m = xmap(true, 16);
+        for left in 0..16u32 {
+            for w in 1..=(16 - left) {
+                let (ml, mr) = m.range(left, left + w);
+                assert_eq!(mr - ml, w, "run at {} of {} changed length", left, w);
+                assert!(mr <= 16, "run at {} of {} ran off the screen", left, w);
+            }
+        }
+    }
+
+    #[test]
+    fn mirroring_twice_is_not_mirroring() {
+        // An involution: a primitive that applied the mapping to a coordinate
+        // another primitive had already mapped would come out unmirrored, and
+        // this is what says the two never compose.
+        let m = xmap(true, 33);
+        for x in 0..33u32 {
+            assert_eq!(m.px(m.px(x)), x, "pixel {}", x);
+        }
+    }
+
+    #[test]
+    fn the_mapping_reads_the_flag_once_and_carries_it() {
+        // Two mappings built from the same flag agree; a per-pixel read would
+        // ask `width * height` times per fill and could see it change half way
+        // through a frame.
+        let a = XMap::of(64);
+        let b = XMap::of(64);
+        assert_eq!(a, b);
+        assert_eq!(a.mirror, scanout_mirror_x());
+        assert_eq!(a.width, 64);
     }
 
     // ---- draw_pixel ----
