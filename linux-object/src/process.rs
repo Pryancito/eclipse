@@ -1114,6 +1114,14 @@ struct LinuxProcessInner {
     /// `prctl(PR_SET_THP_DISABLE)`: recorded and read back; there is no
     /// transparent-hugepage machinery for it to steer.
     thp_disable: bool,
+    /// `prctl(PR_SET_KEEPCAPS)`, `SECBIT_KEEP_CAPS`: recorded, read back by
+    /// `PR_GET_KEEPCAPS`, inherited by `fork` and cleared by `execve`
+    /// (`cap_bprm_creds_from_file`). Capabilities here follow the effective
+    /// uid alone, so there is nothing for it to keep, but a daemon that
+    /// drops privilege asks for it before `setuid` and treats a refusal as
+    /// fatal: `prctl(PR_SET_KEEPCAPS, 1)` was EINVAL and ntpd, chrony and
+    /// dumpcap (and libcap's `cap_setuid`) stopped at startup.
+    keep_caps: bool,
     /// Signal actions
     signal_actions: SignalActions,
     /// Program break (top of heap).
@@ -1665,6 +1673,16 @@ impl LinuxProcess {
     /// Record `PR_SET_THP_DISABLE`.
     pub fn set_thp_disable(&self, on: bool) {
         self.inner.lock().thp_disable = on;
+    }
+
+    /// `prctl(PR_GET_KEEPCAPS)`.
+    pub fn keep_caps(&self) -> bool {
+        self.inner.lock().keep_caps
+    }
+
+    /// Record `PR_SET_KEEPCAPS`.
+    pub fn set_keep_caps(&self, on: bool) {
+        self.inner.lock().keep_caps = on;
     }
 
     /// Get futex object.
@@ -3822,6 +3840,9 @@ impl LinuxProcessInner {
         if privileged {
             self.pdeathsig = 0;
         }
+        // `cap_bprm_creds_from_file`: `SECBIT_KEEP_CAPS` does not survive an
+        // exec, privileged or not.
+        self.keep_caps = false;
 
         // Left alone on purpose, because execve(2) and friends say so: the
         // file table (minus close-on-exec, done by `remove_cloexec_files`),
@@ -3874,6 +3895,7 @@ impl LinuxProcessInner {
             personality: self.personality,
             abi: self.abi,
             thp_disable: self.thp_disable,
+            keep_caps: self.keep_caps,
             // The heap. `fork` copies the address space, so the heap is there
             // in the child -- but the bookkeeping that says where it ends was
             // starting from zero, and `sys_brk` answers every call with the
@@ -5327,6 +5349,7 @@ mod fork_inheritance_tests {
             dumpable: Some(0),
             personality: 0x0004_0000,
             thp_disable: true,
+            keep_caps: true,
             children_utime_ns: 111,
             children_stime_ns: 222,
             pdeathsig: 15,
@@ -5454,6 +5477,7 @@ mod fork_inheritance_tests {
         assert_eq!(child.dumpable, Some(0));
         assert_eq!(child.personality, 0x0004_0000);
         assert!(child.thp_disable);
+        assert!(child.keep_caps, "SECBIT_KEEP_CAPS is inherited");
     }
 
     #[test]
@@ -5666,6 +5690,19 @@ mod exec_reset_tests {
         // 0 answers that question for a user who is not in group 0.
         inner.credentials.groups = vec![1000];
         inner
+    }
+
+    /// `SECBIT_KEEP_CAPS` is cleared by every exec, the unprivileged one
+    /// included, while `pdeathsig` (checked elsewhere) goes only with the
+    /// privileged one.
+    #[test]
+    fn an_exec_clears_keep_caps_whether_or_not_it_is_privileged() {
+        for privileged in [false, true] {
+            let mut inner = a_process_about_to_exec();
+            inner.keep_caps = true;
+            inner.reset_for_exec(privileged);
+            assert!(!inner.keep_caps, "privileged = {}", privileged);
+        }
     }
 
     #[test]

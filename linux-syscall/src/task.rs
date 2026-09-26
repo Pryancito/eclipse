@@ -114,6 +114,17 @@ fn child_rusage(cpu: linux_object::process::ChildCpu) -> RUsage {
     }
 }
 
+/// The argument of `prctl(PR_SET_KEEPCAPS)`: `kernel/sys.c` takes 0 or 1
+/// and nothing else (`if (arg2 > 1) return -EINVAL`), unlike the other
+/// boolean options, which read "nonzero". Neither option existed here.
+pub(crate) fn keepcaps_arg(a2: usize) -> LxResult<bool> {
+    match a2 {
+        0 => Ok(false),
+        1 => Ok(true),
+        _ => Err(LxError::EINVAL),
+    }
+}
+
 /// The end of `wait4(2)`: the pid of the child found, with its status and
 /// CPU time in the two out-pointers, or 0 with both left alone.
 ///
@@ -1972,6 +1983,8 @@ impl Syscall<'_> {
         const PR_SET_NO_NEW_PRIVS: i32 = 38;
         const PR_GET_NO_NEW_PRIVS: i32 = 39;
         const PR_GET_TID_ADDRESS: i32 = 40;
+        const PR_GET_KEEPCAPS: i32 = 7;
+        const PR_SET_KEEPCAPS: i32 = 8;
         const PR_SET_THP_DISABLE: i32 = 41;
         const PR_GET_THP_DISABLE: i32 = 42;
         /// Default timer slack, ns (Linux: 50 µs for every fresh task).
@@ -2105,6 +2118,11 @@ impl Syscall<'_> {
                 Ok(0)
             }
             PR_GET_THP_DISABLE => Ok(proc.thp_disable() as usize),
+            PR_SET_KEEPCAPS => {
+                proc.set_keep_caps(keepcaps_arg(a2)?);
+                Ok(0)
+            }
+            PR_GET_KEEPCAPS => Ok(proc.keep_caps() as usize),
             _ => {
                 debug!("prctl: unknown option {}", option);
                 Err(LxError::EINVAL)
@@ -2914,6 +2932,22 @@ mod wait_option_tests {
                 stray
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod keepcaps_tests {
+    //! `prctl(PR_SET_KEEPCAPS)`'s argument.
+
+    use super::*;
+
+    /// 0 and 1 and nothing else, unlike the "nonzero" boolean options.
+    #[test]
+    fn keepcaps_takes_zero_or_one_and_nothing_else() {
+        assert_eq!(keepcaps_arg(0), Ok(false));
+        assert_eq!(keepcaps_arg(1), Ok(true));
+        assert_eq!(keepcaps_arg(2), Err(LxError::EINVAL));
+        assert_eq!(keepcaps_arg(usize::MAX), Err(LxError::EINVAL));
     }
 }
 
