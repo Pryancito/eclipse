@@ -68,14 +68,46 @@ pub struct InputCapability {
 }
 
 impl InputCapability {
+    /// How many codes this bitmap can hold.
+    ///
+    /// And the reason [`set`](Self::set) and [`contains`](Self::contains) have to
+    /// check it: the API takes a `u16`, i.e. 65536 possible codes, against an
+    /// array that holds 1024 of them. Every one of the other 64512 indexed
+    /// `bitmap[code / 64]` past the end of a 16-word array, which in a kernel is
+    /// a panic -- taken from whatever code a driver was handed. Linux's own codes
+    /// all fit (`KEY_MAX` is 0x2ff, `FF_MAX` 0x7f) and nothing in this tree
+    /// passes a larger one today, but "nothing does today" is not a bound, and
+    /// this bitmap is the wire format of `EVIOCGBIT`, whose other side is
+    /// userspace.
+    pub const BITS: u16 = 1024;
+
     pub fn empty() -> Self {
         Self { bitmap: [0; 16] }
     }
 
+    /// The word and bit a code lives in, or `None` when it is past [`BITS`](Self::BITS).
+    fn at(code: u16) -> Option<(usize, u32)> {
+        if code >= Self::BITS {
+            return None;
+        }
+        Some((code as usize / 64, (code % 64) as u32))
+    }
+
     pub fn from_bitmap(bitmap: &[u8]) -> Self {
         let mut cap = Self::empty();
-        let bitcount = bitmap.len() as u16 * 8;
-        for i in 0..bitcount as usize {
+        // `bitmap.len() as u16 * 8` was two silent failures in one expression:
+        // the cast truncates a slice longer than 65535, and the multiply
+        // overflows a `u16` above 8191 bytes -- which wraps in release, so an
+        // 8192-byte bitmap came back completely EMPTY instead of full. Anything
+        // over 128 bytes then indexed past the array as well. Count in `usize`,
+        // and stop at what this bitmap can actually hold.
+        //
+        // The `min` is redundant for correctness now that `set` refuses a code it
+        // cannot hold -- a mutant that drops it survives every test here, and
+        // that is honest. It is not redundant for the log: without it a 200-byte
+        // bitmap walks 576 codes past the end and `set` warns about every one.
+        let bits = (bitmap.len() * 8).min(Self::BITS as usize);
+        for i in 0..bits {
             if bitmap[i / 8] & (1u8 << (i % 8)) != 0 {
                 cap.set(i as u16);
             }
@@ -84,7 +116,17 @@ impl InputCapability {
     }
 
     pub fn set(&mut self, code: u16) {
-        self.bitmap[code as usize / 64] |= 1 << (code % 64);
+        match Self::at(code) {
+            Some((word, bit)) => self.bitmap[word] |= 1u64 << bit,
+            // Dropping the bit is the only answer that keeps the machine up: a
+            // capability this bitmap cannot express is one userspace will not
+            // see, which costs that feature rather than the kernel.
+            None => warn!(
+                "[input] capability code {} is past the {}-bit bitmap; dropped",
+                code,
+                Self::BITS
+            ),
+        }
     }
 
     pub fn set_all(&mut self, codes: &[u16]) {
@@ -94,7 +136,10 @@ impl InputCapability {
     }
 
     pub fn contains(&self, code: u16) -> bool {
-        self.bitmap[code as usize / 64] & (1 << (code % 64)) != 0
+        match Self::at(code) {
+            Some((word, bit)) => self.bitmap[word] & (1u64 << bit) != 0,
+            None => false,
+        }
     }
 
     pub fn contains_all(&self, codes: &[u16]) -> bool {
@@ -174,5 +219,167 @@ pub trait InputScheme: Scheme + EventScheme<Event = InputEvent> {
     /// pointer issues from a text VT when no kernel log is reachable.
     fn debug_report(&self) -> alloc::string::String {
         alloc::string::String::new()
+    }
+}
+
+/// `InputCapability` is the wire format of `EVIOCGBIT`/`EVIOCGPROP`: what this
+/// bitmap says is what libinput and libevdev believe the device can do, and a
+/// code missing from it means every event carrying that code is **dropped before
+/// it reaches the compositor** (the "the mouse wheel does not work" of #1401).
+/// It had no tests, and its API took a `u16` -- 65536 codes -- into an array of
+/// 1024 bits, with the other 64512 indexing off the end.
+#[cfg(test)]
+mod capability_tests {
+    use super::*;
+    use alloc::vec;
+
+    #[test]
+    fn a_code_the_bitmap_holds_round_trips_at_every_word_boundary() {
+        // 63/64 and 1023 are where `code / 64` and `code % 64` change word, and
+        // 1023 is the last bit that exists at all.
+        let mut cap = InputCapability::empty();
+        for code in [0u16, 1, 63, 64, 65, 127, 128, 512, 1022, 1023] {
+            assert!(!cap.contains(code), "{} was set before anything was", code);
+            cap.set(code);
+            assert!(cap.contains(code), "{} did not survive being set", code);
+        }
+        // And nothing else came along with them.
+        for code in [2u16, 62, 66, 126, 511, 1021] {
+            assert!(!cap.contains(code), "{} was set by a neighbour", code);
+        }
+    }
+
+    #[test]
+    fn a_code_past_the_bitmap_is_dropped_instead_of_taking_the_kernel_down() {
+        // `bitmap[code as usize / 64]` on a 16-word array: 1024 indexes word 16,
+        // and 65535 indexes word 1023. In the kernel that is a panic, reached
+        // from whatever code a driver was handed.
+        let mut cap = InputCapability::empty();
+        for code in [InputCapability::BITS, 1025, 4096, u16::MAX] {
+            cap.set(code);
+            assert!(!cap.contains(code), "{} cannot be held, so not held", code);
+        }
+        assert_eq!(
+            cap.to_le_bytes(),
+            [0u8; 128],
+            "a code that does not fit still changed the bitmap"
+        );
+    }
+
+    #[test]
+    fn the_serialised_form_is_the_little_endian_layout_the_ioctl_expects() {
+        // Userspace reads these 128 bytes straight out of `EVIOCGBIT` and tests
+        // bit n of byte n/8. Bit 0 is the low bit of byte 0; bit 64 is the low
+        // bit of byte 8, not of byte 7 or of the other end.
+        for (code, byte, bit) in [
+            (0u16, 0usize, 0u32),
+            (7, 0, 7),
+            (8, 1, 0),
+            (63, 7, 7),
+            (64, 8, 0),
+            (1023, 127, 7),
+        ] {
+            let mut cap = InputCapability::empty();
+            cap.set(code);
+            let wire = cap.to_le_bytes();
+            assert_eq!(
+                wire[byte],
+                1u8 << bit,
+                "code {} should be byte {} bit {}",
+                code,
+                byte,
+                bit
+            );
+            assert_eq!(
+                wire.iter().map(|b| b.count_ones()).sum::<u32>(),
+                1,
+                "code {} set more than one bit on the wire",
+                code
+            );
+        }
+    }
+
+    #[test]
+    fn what_goes_out_on_the_wire_comes_back_as_the_same_capability() {
+        // The two directions of the same format, and the reason they have to
+        // agree: `from_bitmap` reads bit-per-byte while `to_le_bytes` writes
+        // word-per-eight-bytes, so a disagreement about bit order would put
+        // every capability in the wrong place and nothing else would notice.
+        let codes = [0u16, 1, 30, 63, 64, 272, 273, 767, 1023];
+        let mut cap = InputCapability::empty();
+        cap.set_all(&codes);
+        let back = InputCapability::from_bitmap(&cap.to_le_bytes());
+        assert_eq!(back.to_le_bytes(), cap.to_le_bytes());
+        assert!(back.contains_all(&codes), "a code was lost on the way back");
+        for code in [2u16, 65, 271, 766, 1022] {
+            assert!(!back.contains(code), "{} appeared out of nowhere", code);
+        }
+    }
+
+    #[test]
+    fn a_bitmap_longer_than_the_capability_is_taken_up_to_its_limit_and_no_further() {
+        // 200 bytes is 1600 bits, and `cap.set(1024)` was an out-of-bounds index.
+        // The bitmap a caller hands over is not its own: `virtio/input.rs` sizes
+        // it from a byte the DEVICE writes.
+        let cap = InputCapability::from_bitmap(&vec![0xffu8; 200]);
+        assert!(cap.contains(1023), "the last bit it can hold");
+        assert!(!cap.contains(1024), "and not one past it");
+        assert_eq!(cap.to_le_bytes(), [0xffu8; 128], "every bit it can hold");
+    }
+
+    #[test]
+    fn a_bitmap_of_eight_thousand_bytes_is_not_read_as_empty() {
+        // `bitmap.len() as u16 * 8` overflows a `u16` above 8191 bytes, so 8192
+        // bytes of solid ones produced a bit count of ZERO and an empty
+        // capability -- a device that claims everything read as claiming
+        // nothing, which is a device whose every event userspace then drops.
+        let cap = InputCapability::from_bitmap(&vec![0xffu8; 8192]);
+        assert!(cap.contains(0), "the whole bitmap was read as empty");
+        assert!(cap.contains(1023));
+        assert_eq!(cap.to_le_bytes(), [0xffu8; 128]);
+    }
+
+    #[test]
+    fn an_empty_bitmap_and_an_empty_capability_are_the_same_thing() {
+        assert_eq!(
+            InputCapability::from_bitmap(&[]).to_le_bytes(),
+            InputCapability::empty().to_le_bytes()
+        );
+        assert!(!InputCapability::empty().contains(0));
+    }
+
+    #[test]
+    fn contains_all_wants_every_code_and_an_empty_list_is_no_obstacle() {
+        // It gates `mouse.rs`'s "is this a usable pointer" check, so the
+        // vacuous case matters: an empty list must not read as a refusal.
+        let mut cap = InputCapability::empty();
+        cap.set_all(&[1, 2, 3]);
+        assert!(
+            cap.contains_all(&[]),
+            "nothing asked for is nothing missing"
+        );
+        assert!(cap.contains_all(&[1, 2, 3]));
+        assert!(cap.contains_all(&[2]));
+        assert!(!cap.contains_all(&[1, 2, 4]), "one missing is all missing");
+    }
+
+    #[test]
+    fn set_all_sets_each_code_and_leaves_the_rest_alone() {
+        let mut cap = InputCapability::empty();
+        cap.set_all(&[EV_KEY, EV_REL]);
+        assert!(cap.contains(EV_KEY) && cap.contains(EV_REL));
+        assert!(!cap.contains(EV_ABS), "an axis type nobody asked for");
+    }
+
+    #[test]
+    fn an_absolute_axis_range_carries_the_two_numbers_and_nothing_else() {
+        // `EVIOCGABS` hands these straight to userspace, and a non-zero `flat`
+        // or `fuzz` makes libinput discard small movements near the centre.
+        let abs = AbsInfo::range(-32768, 32767);
+        assert_eq!((abs.minimum, abs.maximum), (-32768, 32767));
+        assert_eq!(
+            (abs.value, abs.fuzz, abs.flat, abs.resolution),
+            (0, 0, 0, 0)
+        );
     }
 }
