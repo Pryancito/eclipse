@@ -169,10 +169,11 @@ impl Syscall<'_> {
             addr, len, prot, flags, fd, offset
         );
         if let Err(e) = mmap_len_check(len) {
-            // Log oversized requests: the early-return is the one mmap failure
-            // path with no other trace, and a silently-rejected giant
-            // reservation (e.g. a JIT engine's executable pool) otherwise looks
-            // like a spontaneous userspace crash with nothing in the kernel log.
+            // Log a refused length, zero (EINVAL) or over the cap (ENOMEM):
+            // the early-return is the one mmap failure path with no other
+            // trace, and a silently-rejected giant reservation (e.g. a JIT
+            // engine's executable pool) otherwise looks like a spontaneous
+            // userspace crash with nothing in the kernel log.
             //
             // `error!`, not `warn!`, and the same for every other failure
             // reported in this file: the shipped command line is
@@ -182,10 +183,17 @@ impl Syscall<'_> {
             // for exactly that reason, with the kernel's own best diagnostic
             // written and switched off. A syscall that fails and takes a
             // process down is not a warning.
-            error!(
-                "mmap: rejecting len={:#x} (cap={:#x}) prot={:?} flags={:?} fd={:?}",
-                len, MAX_MMAP_LEN, prot, flags, fd
-            );
+            if len == 0 {
+                error!(
+                    "mmap: rejecting a zero length with {:?} prot={:?} flags={:?} fd={:?}",
+                    e, prot, flags, fd
+                );
+            } else {
+                error!(
+                    "mmap: rejecting len={:#x} over the cap {:#x} with {:?} prot={:?} flags={:?} fd={:?}",
+                    len, MAX_MMAP_LEN, e, prot, flags, fd
+                );
+            }
             return Err(e);
         }
         // Linux UAPI: `len` is rounded UP to whole pages by the kernel for
