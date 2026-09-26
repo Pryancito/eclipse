@@ -163,6 +163,30 @@ fn pause_deadline_ns(now_ns: u64, max: core::time::Duration) -> u64 {
     now_ns.saturating_add(max_ns).max(1)
 }
 
+/// Whether a present left the WHOLE scanout carrying its framebuffer, so
+/// [`SCANOUT_STALE`] may be cleared.
+///
+/// `None` is a full-frame present by the shape of the call. A damage rect is
+/// accepted only when it starts at the origin and reaches the display's last row
+/// and column -- a `DIRTYFB` clip covering the whole framebuffer does catch the
+/// panel up, and leaving the latch set there costs a redundant full repaint on
+/// the next pointer move.
+///
+/// Deliberately conservative, because the two ways of being wrong do not cost
+/// the same: clearing the latch while the panel is NOT caught up brings back the
+/// garbage it exists to prevent, and failing to clear it costs one repaint. With
+/// no display there is nothing to be caught up with, so the answer is no.
+fn present_caught_the_panel_up(
+    rect: Option<(u32, u32, u32, u32)>,
+    screen: Option<(u32, u32)>,
+) -> bool {
+    match (rect, screen) {
+        (None, _) => true,
+        (Some((x, y, w, h)), Some((sw, sh))) => x == 0 && y == 0 && w >= sw && h >= sh,
+        (Some(_), None) => false,
+    }
+}
+
 /// The deadline a plain [`set_scanout_paused`]`(true)` leaves behind: a watchdog
 /// still in force is kept, one that has already run out is dropped.
 ///
@@ -3936,12 +3960,19 @@ pub fn present_now_checked(
         scanout_region_checked(fb_id, rect)?;
     }
     // The panel carries this framebuffer in full now -- the driver replaced the
-    // whole scanout, or the blit covered the whole frame -- so whatever a pause
-    // dropped earlier, the two agree again. A damage rect does NOT catch up:
-    // it leaves the disagreement everywhere it did not touch. See
-    // [`SCANOUT_STALE`].
-    if rect.is_none() || hw.unwrap_or(false) {
-        SCANOUT_STALE.store(false, Ordering::SeqCst);
+    // whole scanout, or the blit covered every row and column -- so whatever a
+    // pause dropped earlier, the two agree again. A damage rect that covers less
+    // does NOT catch up: it leaves the disagreement everywhere it did not touch.
+    // See [`SCANOUT_STALE`] and [`present_caught_the_panel_up`]. Read the latch
+    // first so the common present pays neither the display lookup nor the store.
+    if SCANOUT_STALE.load(Ordering::SeqCst) {
+        let screen = primary_display().map(|d| {
+            let info = d.info();
+            (info.width, info.height)
+        });
+        if hw.unwrap_or(false) || present_caught_the_panel_up(rect, screen) {
+            SCANOUT_STALE.store(false, Ordering::SeqCst);
+        }
     }
     set_crtc_fb(crtc_id, fb_id);
     // A DRM client owns the framebuffer now: stop text console drawing.
@@ -7417,6 +7448,45 @@ mod scanout_pause_tests {
         }
         // "No watchdog" is already the answer and stays it.
         assert_eq!(deadline_kept_by_plain_pause(0, 12_345), 0);
+    }
+
+    /// A damage rect that covers the whole display catches the panel up just as
+    /// a full-frame present does -- a `DIRTYFB` clip over the entire framebuffer
+    /// is a legal way to say "all of it changed". Anything short of that does
+    /// not, and neither does any rect when there is no display to catch up with.
+    #[test]
+    fn only_a_present_that_covers_the_whole_screen_catches_the_panel_up() {
+        let screen = Some((1920, 1080));
+        assert!(present_caught_the_panel_up(None, screen));
+        assert!(
+            present_caught_the_panel_up(None, None),
+            "a full frame is one"
+        );
+        assert!(present_caught_the_panel_up(
+            Some((0, 0, 1920, 1080)),
+            screen
+        ));
+        assert!(
+            present_caught_the_panel_up(Some((0, 0, 3840, 2160)), screen),
+            "a rect larger than the display still covers it"
+        );
+        for short in [
+            (0, 0, 1919, 1080),
+            (0, 0, 1920, 1079),
+            (1, 0, 1920, 1080),
+            (0, 1, 1920, 1080),
+            (48, 25, 180, 160),
+        ] {
+            assert!(
+                !present_caught_the_panel_up(Some(short), screen),
+                "{:?} leaves rows or columns behind and must keep the mark",
+                short
+            );
+        }
+        assert!(
+            !present_caught_the_panel_up(Some((0, 0, 1920, 1080)), None),
+            "with no display there is nothing to be caught up with"
+        );
     }
 
     // --- and the same decisions through the real latches ---

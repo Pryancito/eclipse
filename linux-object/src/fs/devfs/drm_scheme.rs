@@ -6361,10 +6361,24 @@ mod kms_scanout_tests {
 
     /// Drain whatever flip completions are outstanding, so a later read only
     /// sees the ones the test is about.
+    ///
+    /// One read is not a drain: the queue hands out as much as fits and keeps the
+    /// rest, and an empty queue answers EAGAIN rather than zero. A test that
+    /// queued more than this buffer holds would leave completions behind for a
+    /// later assertion to trip over -- a suite that fails somewhere else, which
+    /// is the worst kind of noise to build in. Read until the queue says it has
+    /// nothing, with a bound so a queue that always answers cannot hang the
+    /// suite instead of failing it.
     fn drain_completions(c: &Client) {
         drm::flush_pending_flip_completions();
         let mut sink = [0u8; 256];
-        let _ = c.read_events(&mut sink);
+        for _ in 0..1024 {
+            match c.read_events(&mut sink) {
+                Ok(n) if n > 0 => continue,
+                _ => return,
+            }
+        }
+        panic!("the event queue never drained");
     }
 
     /// The bug the pause machinery had, from the compositor's side. During the
@@ -6508,6 +6522,45 @@ mod kms_scanout_tests {
         c.destroy_dumb(before.handle).expect("DESTROY_DUMB");
         c.destroy_dumb(during.handle).expect("DESTROY_DUMB");
         c.destroy_dumb(ptr.handle).expect("DESTROY_DUMB");
+    }
+
+    /// The other side of the damage rule: a `DIRTYFB` clip that covers the whole
+    /// framebuffer IS a catch-up, so it clears the mark. Leaving it set would
+    /// cost a redundant full repaint on the next pointer move.
+    #[test]
+    fn a_damage_rect_over_the_whole_screen_does_catch_the_panel_up() {
+        let _screen = kms_emu::attach(64, 16);
+        let c = Client::open(0);
+
+        let before = c.create_dumb(64, 16);
+        paint(&before, |x, y| tag(0x0011_0000, x, y));
+        let fb_before = c.addfb2(&before);
+        set_crtc(&c, drm::SYNTH_CRTC_ID, fb_before, 64, 16);
+        drain_completions(&c);
+
+        drm::set_scanout_paused_for(drm::SCANOUT_PAUSE_MAX);
+        let during = c.create_dumb(64, 16);
+        paint(&during, |x, y| tag(0x0022_0000, x, y));
+        let fb_during = c.addfb2(&during);
+        c.page_flip(drm::SYNTH_CRTC_ID, fb_during, 5)
+            .expect("a flip during the pause is still accepted");
+        drain_completions(&c);
+        drm::set_scanout_paused_for(core::time::Duration::ZERO);
+        assert!(!drm::scanout_paused());
+        assert!(drm::scanout_is_stale_for_test());
+
+        dirtyfb(&c, fb_during, &[clip(0, 0, 64, 16)]);
+
+        assert!(
+            !drm::scanout_is_stale_for_test(),
+            "a clip over the whole framebuffer put every row up, so the mark \
+             must go -- keeping it costs a full repaint on the next mouse move"
+        );
+
+        c.rmfb(fb_before).expect("RMFB");
+        c.rmfb(fb_during).expect("RMFB");
+        c.destroy_dumb(before.handle).expect("DESTROY_DUMB");
+        c.destroy_dumb(during.handle).expect("DESTROY_DUMB");
     }
 
     /// The popup's geometry, swept. Moebius's power menu comes up with whole
