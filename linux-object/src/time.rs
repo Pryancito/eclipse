@@ -6,7 +6,7 @@ use rcore_fs::vfs::*;
 
 /// TimeSpec struct for clock_gettime, similar to Timespec
 #[repr(C)]
-#[derive(Debug, Copy, Clone, Default)]
+#[derive(Debug, Copy, Clone, Default, PartialEq, Eq)]
 pub struct TimeSpec {
     /// seconds
     pub sec: usize,
