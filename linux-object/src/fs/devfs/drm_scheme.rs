@@ -6925,6 +6925,85 @@ mod kms_scanout_tests {
         c.destroy_dumb(before.handle).expect("DESTROY_DUMB");
         c.destroy_dumb(during.handle).expect("DESTROY_DUMB");
     }
+
+    /// The probe must be able to say "nothing wrote this window" -- on a buffer
+    /// nobody is writing.
+    ///
+    /// That is the half of the diagnostic that is easy to get wrong and fatal to
+    /// get wrong: if a settled present reports, every frame reports, and the
+    /// finding it exists to deliver is buried in noise. Here nothing but the
+    /// test touches the dumb buffer between the two reads, so the honest answer
+    /// is silence.
+    #[test]
+    fn an_armed_probe_says_nothing_about_a_buffer_nobody_is_writing() {
+        let _screen = kms_emu::attach(64, 16);
+        let c = Client::open(0);
+
+        let first = c.create_dumb(64, 16);
+        paint(&first, |x, y| tag(0x0011_0000, x, y));
+        let fb_first = c.addfb2(&first);
+        set_crtc(&c, drm::SYNTH_CRTC_ID, fb_first, 64, 16);
+        drain_completions(&c);
+
+        drm::set_present_probe_enabled(true);
+        let reports_before = drm::probe_reports_for_test();
+
+        let second = c.create_dumb(64, 16);
+        paint(&second, |x, y| tag(0x0022_0000, x, y));
+        let fb_second = c.addfb2(&second);
+        c.page_flip(drm::SYNTH_CRTC_ID, fb_second, 7).expect("flip");
+        drain_completions(&c);
+        // And the damage path too, because that is the one labwc drives.
+        dirtyfb(&c, fb_second, &[clip(8, 4, 24, 8)]);
+
+        assert_eq!(
+            drm::probe_reports_for_test(),
+            reports_before,
+            "a settled buffer was reported as changing under the blit, so every \
+             frame will report and the log will say nothing"
+        );
+
+        c.rmfb(fb_first).expect("RMFB");
+        c.rmfb(fb_second).expect("RMFB");
+        c.destroy_dumb(first.handle).expect("DESTROY_DUMB");
+        c.destroy_dumb(second.handle).expect("DESTROY_DUMB");
+    }
+
+    /// And it must not change what reaches the panel. A diagnostic that alters
+    /// the thing it measures is not one: the probe reads the window twice and
+    /// invalidates it in between, and the pixels on screen have to be exactly
+    /// the ones an unarmed boot would have put there.
+    #[test]
+    fn an_armed_probe_puts_the_same_pixels_on_the_panel() {
+        let _screen = kms_emu::attach(64, 16);
+        let c = Client::open(0);
+
+        let fb_buf = c.create_dumb(64, 16);
+        paint(&fb_buf, |x, y| tag(0x0033_0000, x, y));
+        let fb_id = c.addfb2(&fb_buf);
+        set_crtc(&c, drm::SYNTH_CRTC_ID, fb_id, 64, 16);
+        drain_completions(&c);
+
+        drm::set_present_probe_enabled(true);
+        // Repaint to a value the panel does not already hold, then present a
+        // damage box over part of it -- the shape the probe is armed for.
+        paint(&fb_buf, |x, y| tag(0x0044_0000, x, y));
+        // `clip` is a DRM clip rect: x1, y1, x2, y2, not x/y/w/h.
+        dirtyfb(&c, fb_id, &[clip(5, 3, 26, 12)]);
+
+        for y in 3..12u32 {
+            for x in 5..26u32 {
+                assert_eq!(
+                    _screen.pixel(x, y),
+                    tag(0x0044_0000, x, y),
+                    "the probe changed what the present wrote"
+                );
+            }
+        }
+
+        c.rmfb(fb_id).expect("RMFB");
+        c.destroy_dumb(fb_buf.handle).expect("DESTROY_DUMB");
+    }
 }
 
 /// The hardware-KMS path: what changes when a driver owns scanout.
