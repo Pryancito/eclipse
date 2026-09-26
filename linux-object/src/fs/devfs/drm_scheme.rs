@@ -6510,6 +6510,103 @@ mod kms_scanout_tests {
         c.destroy_dumb(ptr.handle).expect("DESTROY_DUMB");
     }
 
+    /// The popup's geometry, swept. Moebius's power menu comes up with whole
+    /// runs of it missing -- the desktop showing through where the panel should
+    /// be -- and the runs are in the same place on every frame, so whatever
+    /// drops them is arithmetic tied to the box, not a race or a stale cache.
+    ///
+    /// This asks the narrowest version of that question the kernel can answer on
+    /// its own: for a damage box, does the present write EVERY pixel inside it?
+    /// A box is not a set of independent rows here -- the blit widens columns to
+    /// write-combining lines and walks bands -- so an off-by-one in any of that
+    /// arithmetic shows up as pixels inside the box still carrying the previous
+    /// frame, which is exactly the symptom. Geometries chosen to be hostile:
+    /// the real panel (152x135) at several offsets, odd sizes, the single pixel,
+    /// a box on each edge, and the whole frame.
+    #[test]
+    fn every_pixel_inside_a_damage_box_is_written_whatever_its_geometry() {
+        const W: u32 = 200;
+        const H: u32 = 160;
+        let screen = kms_emu::attach(W, H);
+        let c = Client::open(0);
+        let buf = c.create_dumb(W, H);
+        let fb = c.addfb2(&buf);
+
+        let boxes: [(u32, u32, u32, u32); 10] = [
+            (0, 0, 152, 135),   // the panel, flush at the origin
+            (7, 3, 152, 135),   // and at an odd offset, both axes
+            (48, 25, 152, 135), // and where it does not fit: clipped right
+            (1, 1, 7, 2),       // narrower than one WC line
+            (13, 11, 31, 17),   // odd on every number
+            (W - 1, H - 1, 1, 1),
+            (0, H - 1, W, 1), // the last row, whole
+            (W - 3, 0, 3, H), // the last columns, whole
+            (0, 0, W, H),     // the whole frame through the damage path
+            (9, 9, 16, 16),   // exactly one WC line wide, aligned to none
+        ];
+
+        for (i, &(bx, by, bw, bh)) in boxes.iter().enumerate() {
+            let old = 0x0100_0000 * (2 * i as u32 + 1);
+            let new = 0x0100_0000 * (2 * i as u32 + 2);
+
+            // The frame that is already on the panel.
+            paint(&buf, |x, y| tag(old, x, y));
+            c.page_flip(drm::SYNTH_CRTC_ID, fb, 200 + i as u64)
+                .expect("the frame before the damage");
+            drain_completions(&c);
+            assert_eq!(
+                screen.pixel(0, 0),
+                tag(old, 0, 0),
+                "box {:?}: the first frame never got up",
+                (bx, by, bw, bh)
+            );
+
+            // The client repaints the same buffer and names only its box.
+            paint(&buf, |x, y| tag(new, x, y));
+            dirtyfb(
+                &c,
+                fb,
+                &[clip(
+                    bx as u16,
+                    by as u16,
+                    (bx + bw) as u16,
+                    (by + bh) as u16,
+                )],
+            );
+
+            let (cw, ch) = (bw.min(W - bx), bh.min(H - by));
+            for y in by..by + ch {
+                for x in bx..bx + cw {
+                    assert_eq!(
+                        screen.pixel(x, y),
+                        tag(new, x, y),
+                        "box {:?}: pixel ({}, {}) inside it still carries the \
+                         previous frame",
+                        (bx, by, bw, bh),
+                        x,
+                        y
+                    );
+                }
+            }
+            // Columns are widened to write-combining lines on purpose, so only
+            // the ROWS outside the box are guaranteed untouched.
+            for y in (0..by).chain(by + ch..H) {
+                for x in 0..W {
+                    assert_eq!(
+                        screen.pixel(x, y),
+                        tag(old, x, y),
+                        "box {:?}: row {} is outside it and was repainted",
+                        (bx, by, bw, bh),
+                        y
+                    );
+                }
+            }
+        }
+
+        c.rmfb(fb).expect("RMFB");
+        c.destroy_dumb(buf.handle).expect("DESTROY_DUMB");
+    }
+
     /// A damage rect is not a catch-up. `DRM_IOCTL_MODE_DIRTYFB` copies the
     /// boxes the client names and nothing else, so after a dropped present the
     /// panel is still a frame behind everywhere outside them -- and the cursor
