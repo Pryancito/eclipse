@@ -1538,7 +1538,13 @@ impl Stdin {
         if lflag & ECHOCTL != 0 {
             self.echo_post("^R");
         }
-        self.echo_post("\r\n");
+        // A bare newline, and ONLCR puts the carriage return: this is the one
+        // site here that wrote its own, and `echo_post` hands the run to the
+        // output rule, which adds another. Linux's reprint echoes the single
+        // `\n` too (`echo_char_raw('\n', ldata)` in `n_tty.c`). With OCRNL the
+        // handwritten return became a second newline, so the redraw landed two
+        // lines down instead of one.
+        self.echo_post("\n");
         let canon = self.canon_buf.lock();
         let mut buf = [0u8; 4];
         for &ch in canon.iter() {
@@ -3397,6 +3403,30 @@ mod line_discipline_tests {
             column(),
             8,
             "a tab moves to the next stop, it is not two characters"
+        );
+    }
+
+    #[test]
+    fn the_reprint_moves_to_a_fresh_line_with_one_newline_and_not_two() {
+        // The one echo in this file that wrote its own carriage return, around
+        // the rule that adds one. With ONLCR that was a redundant `\r`; with
+        // `-onlcr` the return took the cursor to column zero on the line it was
+        // already on, and with OCRNL it became a second newline, so the redraw
+        // landed two lines down. Linux echoes the single `\n`
+        // (`echo_char_raw('\n', ldata)` in `n_tty.c`), as every other label
+        // here already did.
+        let _g = SERIAL.lock();
+        let s = oflag(O_OPOST | O_ONOCR);
+        feed(&s, "ab");
+        assert_eq!(column(), 2);
+        s.push(CTRL_R);
+        // `^R` is two columns, the newline moves down without returning, and
+        // the redrawn `ab` is two more. A handwritten `\r` in the middle would
+        // have reset the count.
+        assert_eq!(
+            column(),
+            6,
+            "the carriage return was not the echo's to send"
         );
     }
 
