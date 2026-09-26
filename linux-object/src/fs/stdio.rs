@@ -1443,20 +1443,22 @@ impl Stdin {
         self.vtime_deadline_ns.store(deadline, Ordering::Release);
     }
 
-    /// Echo to this terminal's console.
-    ///
-    /// Raw: the bytes go out as they are and the cursor is not tracked. Only
-    /// for runs the discipline has already rendered and post-processed, or
-    /// that carry no `c_oflag` meaning at all.
-    fn echo(&self, s: &str) {
-        kernel_hal::console::vt_console_write_str(self.vt, s);
-    }
-
     /// Echo a run through the terminal's own output rules, moving its cursor.
     ///
     /// Echoed bytes go through the same `c_oflag` as program output and share
     /// its column: `__process_echoes` hands each byte it is about to put out
     /// to `do_output_char` whenever `OPOST` is set (`drivers/tty/n_tty.c`).
+    ///
+    /// The only way out, now. There used to be a raw one beside it that wrote
+    /// to the console directly, and ten echoes went that way: the erase
+    /// sequences of `VERASE`, `VWERASE` and `VKILL`, the `^R` reprint, and the
+    /// `^C`, `^\` and `^Z` labels. Every one of those is cursor movement --
+    /// `\x08 \x08` is "back, blank, back" -- and the column they moved was not
+    /// the one the terminal keeps, so after a single backspace the kernel's idea
+    /// of where the cursor sat was one column off, and stayed off. It is that
+    /// column that `ONOCR` and `ONLRET` are defined in terms of and that a `\t`
+    /// in the program's own output expands against, so a tab printed after the
+    /// user had edited a line landed at the wrong stop.
     fn echo_post(&self, s: &str) {
         tty_post_out(self.vt, s.as_bytes());
     }
@@ -1512,7 +1514,7 @@ impl Stdin {
         while matches!(canon.back(), Some(' ') | Some('\t')) {
             canon.pop_back();
             if echo {
-                self.echo("\x08 \x08");
+                self.echo_post("\x08 \x08");
             }
         }
         // Then erase the word itself, up to (not including) the next blank.
@@ -1522,7 +1524,7 @@ impl Stdin {
             }
             canon.pop_back();
             if echo {
-                self.echo("\x08 \x08");
+                self.echo_post("\x08 \x08");
             }
         }
     }
@@ -1534,13 +1536,13 @@ impl Stdin {
             return;
         }
         if lflag & ECHOCTL != 0 {
-            self.echo("^R");
+            self.echo_post("^R");
         }
-        self.echo("\r\n");
+        self.echo_post("\r\n");
         let canon = self.canon_buf.lock();
         let mut buf = [0u8; 4];
         for &ch in canon.iter() {
-            self.echo(ch.encode_utf8(&mut buf));
+            self.echo_post(ch.encode_utf8(&mut buf));
         }
     }
 
@@ -1694,9 +1696,9 @@ impl Stdin {
                 }
                 if lflag & ECHO != 0 {
                     if sent == crate::signal::Signal::SIGKILL {
-                        self.echo("^C (killed)\n");
+                        self.echo_post("^C (killed)\n");
                     } else {
-                        self.echo("^C\n");
+                        self.echo_post("^C\n");
                     }
                 }
                 // Wake waiters without latching READABLE on an empty queue
@@ -1721,7 +1723,7 @@ impl Stdin {
                     self.eof_pending.store(false, Ordering::Release);
                 }
                 if lflag & ECHO != 0 {
-                    self.echo("^\\\n");
+                    self.echo_post("^\\\n");
                 }
                 if let Some(mut eb) = self.eventbus.try_lock() {
                     eb.clear(Event::READABLE);
@@ -1743,7 +1745,7 @@ impl Stdin {
                     self.eof_pending.store(false, Ordering::Release);
                 }
                 if lflag & ECHO != 0 {
-                    self.echo("^Z\n");
+                    self.echo_post("^Z\n");
                 }
                 if let Some(mut eb) = self.eventbus.try_lock() {
                     eb.clear(Event::READABLE);
@@ -1767,18 +1769,18 @@ impl Stdin {
                 if lflag & ECHO != 0 && lflag & ECHOCTL != 0 {
                     // Show "^" with the cursor parked on it until the quoted
                     // char arrives (Linux echoes ^ then a backspace).
-                    self.echo("^\x08");
+                    self.echo_post("^\x08");
                 }
             } else if cc_match(&c_cc, VERASE, c as u8) {
                 let mut canon = self.canon_buf.lock();
                 if let Some(_popped) = canon.pop_back() {
                     if lflag & ECHO != 0 {
                         if lflag & ECHOE != 0 {
-                            self.echo("\x08 \x08");
+                            self.echo_post("\x08 \x08");
                         } else {
                             let mut buf = [0u8; 4];
                             let erase_char = (c_cc[VERASE] as char).encode_utf8(&mut buf);
-                            self.echo(erase_char);
+                            self.echo_post(erase_char);
                         }
                     }
                 }
@@ -1789,10 +1791,10 @@ impl Stdin {
                 match kill_echo {
                     KillEcho::Rubout => {
                         for _ in 0..len {
-                            self.echo("\x08 \x08");
+                            self.echo_post("\x08 \x08");
                         }
                     }
-                    KillEcho::Newline => self.echo("\n"),
+                    KillEcho::Newline => self.echo_post("\n"),
                     KillEcho::Nothing => {}
                 }
             } else if cc_match(&c_cc, VEOF, c as u8) {
@@ -3432,6 +3434,56 @@ mod line_discipline_tests {
         }
         tty_post_out(VT, &run);
         assert_eq!(column(), 500, "500 characters, 1000 bytes, 500 columns");
+    }
+
+    /// Erasing a character walks the cursor back. The erase sequence used to
+    /// go out raw, so the column stayed where the typed character had left it
+    /// and every later `\t` in the program's own output expanded against a
+    /// count one too high -- and it never came back into line.
+    #[test]
+    fn an_erase_echo_moves_the_cursor_back() {
+        let _g = SERIAL.lock();
+        let s = oflag(O_OPOST);
+        s.push('a');
+        s.push('b');
+        assert_eq!(column(), 2);
+        // VERASE (0x7f by default) with ECHOE: back, blank, back.
+        s.push('\x7f');
+        assert_eq!(column(), 1, "the erase took the cursor back with it");
+        s.push('\x7f');
+        assert_eq!(column(), 0);
+    }
+
+    /// `VKILL` erases the whole line, so the cursor ends where the line began.
+    #[test]
+    fn a_kill_echo_takes_the_cursor_back_to_the_start_of_the_line() {
+        let _g = SERIAL.lock();
+        let s = oflag(O_OPOST);
+        for c in "hola".chars() {
+            s.push(c);
+        }
+        assert_eq!(column(), 4);
+        // VKILL is Ctrl-U, and ECHOKE makes it rub the line out.
+        tty_termios(VT).lock().c_lflag |= crate::fs::ioctl::L_ECHOKE | ECHOE;
+        s.push('\x15');
+        assert_eq!(column(), 0);
+    }
+
+    /// The `^C` label is two columns and a newline, and the newline is what
+    /// `ONLCR` acts on.
+    #[test]
+    fn the_interrupt_label_goes_through_the_output_rules() {
+        let _g = SERIAL.lock();
+        let s = oflag(O_OPOST | O_ONLCR);
+        for c in "hola".chars() {
+            s.push(c);
+        }
+        s.push(CTRL_C);
+        assert_eq!(
+            column(),
+            0,
+            "^C and a newline leave the cursor at the start"
+        );
     }
 }
 
