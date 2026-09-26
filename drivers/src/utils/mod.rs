@@ -18,7 +18,7 @@ pub mod dma;
 pub mod dma_sync;
 
 pub(super) use id_allocator::IdAllocator;
-pub(super) use irq_manager::IrqManager;
+pub(super) use irq_manager::{run_irq_handler, IrqManager};
 
 pub use bounded_drain::{bounded_drain, DRAIN_BURST};
 pub use event_listener::{EventHandler, EventListener};
