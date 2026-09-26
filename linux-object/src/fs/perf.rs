@@ -387,8 +387,18 @@ impl PerfEvent {
         let data_tail = u64::from_ne_bytes(tail_b);
         let head = inner.data_head;
         // Available space in a non-overwrite ring.
+        // `data_tail` is a word USERSPACE writes into the control page, so it
+        // cannot be trusted to be behind the head: a tail ahead of it makes
+        // this subtraction wrap to something near `u64::MAX`, and then
+        // `used + record.len()` wrapped a second time, to a small number that
+        // passes for "there is room". Linux masks instead of trusting it
+        // (`CIRC_SPACE`, and `ring_buffer_has_space` on top), so a garbage tail
+        // costs the consumer its own records and nothing else. Here the write
+        // below is bounded by `head % data_size` either way, so nothing left
+        // the ring; what the wrap did was hand out space that was not there,
+        // and panic a build with overflow checks.
         let used = head.wrapping_sub(data_tail);
-        if used + record.len() as u64 > data_size as u64 {
+        if used > data_size as u64 || used + record.len() as u64 > data_size as u64 {
             inner.lost = inner.lost.wrapping_add(1);
             return;
         }
@@ -545,22 +555,39 @@ impl FileLike for PerfEvent {
                 ANY_ENABLED.store(true, Ordering::Relaxed);
                 Ok(0)
             }
+            // `arg` points at the new period, and what happens to it is not
+            // best-effort: `_perf_event_period` is
+            //
+            //     if (!value) return -EINVAL;
+            //     ...
+            //     if (copy_from_user(&value, (u64 __user *)arg, sizeof(value)))
+            //             return -EFAULT;
+            //
+            // Swallowing both left `perf record -F <freq>`, which is how the
+            // period is changed while an event runs, told its request had been
+            // honoured while the event kept the old one: samples at a rate
+            // nobody asked for and no way to find out. A period of 0 was worse
+            // than refused, it was quietly turned into 1 -- the fastest rate
+            // there is, out of a value that means "stop sampling by count".
             PERF_EVENT_IOC_PERIOD => {
-                // arg1 points at a u64 new period in user memory; best-effort.
-                if arg1 != 0 {
-                    let ptr = kernel_hal::user::UserInPtr::<u64>::from(arg1);
-                    if let Ok(p) = ptr.read() {
-                        self.inner.lock().period = p.max(1);
-                    }
+                let value = kernel_hal::user::UserInPtr::<u64>::from(arg1)
+                    .read()
+                    .map_err(|_| LxError::EFAULT)?;
+                if value == 0 {
+                    return Err(LxError::EINVAL);
                 }
+                self.inner.lock().period = value;
                 Ok(0)
             }
+            // Same for the id, which `copy_to_user` in `perf_event_ioctl`
+            // reports on: `perf` asks for it to tell whose sample is whose
+            // inside a group's ring, so a write that silently did not happen
+            // left it demultiplexing by whatever was in that word already.
             PERF_EVENT_IOC_ID => {
-                if arg1 != 0 {
-                    let id = self.inner.lock().id;
-                    let mut ptr = kernel_hal::user::UserOutPtr::<u64>::from(arg1);
-                    let _ = ptr.write(id);
-                }
+                let id = self.inner.lock().id;
+                kernel_hal::user::UserOutPtr::<u64>::from(arg1)
+                    .write(id)
+                    .map_err(|_| LxError::EFAULT)?;
                 Ok(0)
             }
             // Grouping / output redirection / filters are accepted as no-ops so
@@ -1099,9 +1126,19 @@ mod tests {
         // Grouping and filters are accepted so perf does not bail out.
         assert_eq!(ev.ioctl(PERF_EVENT_IOC_SET_OUTPUT, 0, 0, 0), Ok(0));
         assert_eq!(ev.ioctl(PERF_EVENT_IOC_SET_FILTER, 0, 0, 0), Ok(0));
-        // A null argument is not a user pointer to follow.
-        assert_eq!(ev.ioctl(PERF_EVENT_IOC_PERIOD, 0, 0, 0), Ok(0));
-        assert_eq!(ev.ioctl(PERF_EVENT_IOC_ID, 0, 0, 0), Ok(0));
+        // A null argument is a pointer that cannot be followed, and both of
+        // these follow one: `copy_from_user`/`copy_to_user` on it is `EFAULT`,
+        // and answering 0 told perf its period had changed, or that the id it
+        // was about to demultiplex by had been written.
+        assert_eq!(
+            ev.ioctl(PERF_EVENT_IOC_PERIOD, 0, 0, 0),
+            Err(LxError::EFAULT)
+        );
+        assert_eq!(ev.ioctl(PERF_EVENT_IOC_ID, 0, 0, 0), Err(LxError::EFAULT));
+        // The period it does read has to be one: 0 means "do not sample by
+        // count", and turning it into 1 is the fastest rate there is.
+        let period = ev.inner.lock().period;
+        assert_ne!(period, 0);
         assert_eq!(ev.ioctl(0x1234, 0, 0, 0), Err(LxError::ENOTTY));
     }
 
