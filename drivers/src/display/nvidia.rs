@@ -114,6 +114,11 @@ struct ZombieCtx {
     /// `(consumer ctx, entries it had put by then)`: passed once its ring has
     /// consumed that many.
     waiters: Vec<(u32, u64)>,
+    /// How many submissions its ring carried at the park. The park lands
+    /// its last payload from the CPU, so a fence issued before it reads
+    /// landed whether or not the ring ran: only a fence issued after the
+    /// park (a `CPU_PREP` probe) is the GPU's word that the ring is idle.
+    submits_at_park: u64,
 }
 
 /// How many GP entries a direct-submit channel has consumed: everything ever
@@ -9610,18 +9615,44 @@ impl NvidiaGpu {
         // a client whose own context is not ready yet has queued nothing, and
         // only the compositor (no per-pid entry, owner of the RM channel)
         // legitimately submits on ctx 0.
-        let ctx_idx = {
+        // `fenced_after`: a fence counts as the ring's word that it is idle
+        // only when issued after this many submissions (see below).
+        let (ctx_idx, fenced_after) = {
             let entry = self
                 .nouveau_pid_ctx
                 .lock()
                 .iter()
                 .find(|t| t.0 == owner_pid)
                 .map(|t| (t.1, t.4));
+            // A process that exited with a consumer's ACQUIRE queued on
+            // its semaphore is off the registry but its context is a
+            // zombie (`ZombieCtx`), and its ring keeps running what it had
+            // queued: a buffer its VM maps is still being written after
+            // the exit. Linux keeps such fences on the BO until the dead
+            // channel has idled. The mapping wears the zombie's pid (its
+            // tombstone once the pid was recycled), and so does the zombie;
+            // its channel record still does too, so the RM-channel test
+            // below would route it to context 0 -- the compositor's ring,
+            // idle -- and the compositor's prep on a frame a dying client
+            // was still drawing answered at once. The park landed the
+            // zombie's last payload from the CPU, so its fences from before
+            // the park say nothing about the ring: only a probe issued
+            // since does.
+            let zombie = |pid: u64| {
+                self.nouveau_zombies
+                    .lock()
+                    .iter()
+                    .find(|z| z.pid == pid)
+                    .map(|z| (z.ctx_idx, z.submits_at_park))
+            };
             match entry {
-                Some((ctx, true)) => ctx,
+                Some((ctx, true)) => (ctx, 0),
                 Some((_, false)) => return Ok(0),
-                None if self.nouveau_owns_rm_channel(owner_pid) => 0,
-                None => return Ok(0),
+                None => match zombie(owner_pid) {
+                    Some(z) => z,
+                    None if self.nouveau_owns_rm_channel(owner_pid) => (0, 0),
+                    None => return Ok(0),
+                },
             }
         };
         // A context latched wedged (a fence of its timed out: the ring is
@@ -9646,6 +9677,7 @@ impl NvidiaGpu {
                 f.submits > 0
                     && !f.last_fence.is_some_and(|(at, payload)| {
                         at == f.submits
+                            && at > fenced_after
                             && crate::scheme::syncobj::hw_fence_landed(f.fence_sem_va, payload)
                     })
             }
@@ -10169,6 +10201,10 @@ impl NvidiaGpu {
     /// whatever is left when the teardown runs. Only the teardown waits.
     fn park_zombie(&self, pid: u64, ctx_idx: u32, waiters: Vec<(u32, u64)>) {
         self.write_final_payload(ctx_idx);
+        let submits_at_park = match self.nouveau_fast.lock().get(ctx_idx as usize) {
+            Some(FastSlot::Ready(f)) => f.submits,
+            _ => 0,
+        };
         log::info!(
             "[nouveau-uapi] process exit pid={}: ctx {} kept as a zombie: channel(s) {:?} still have an ACQUIRE queued on its semaphore",
             pid,
@@ -10180,6 +10216,7 @@ impl NvidiaGpu {
             ctx_idx,
             born_us: unsafe { crate::bus::drivers_timer_now_as_micros() },
             waiters,
+            submits_at_park,
         });
     }
 
@@ -17433,6 +17470,167 @@ mod nouveau_bookkeeping_tests {
         assert_eq!(cpu_prep_nowait(&gpu, h, COMP), Ok(0));
         test_clock::set_auto_advance(0);
         gpu.nouveau_release_process(A);
+        gpu.nouveau_release_process(COMP);
+        assert_eq!(FAKE_RM.lock().bad, 0);
+    }
+
+    /// A client that exits mid-frame with the compositor's ACQUIRE queued
+    /// on its semaphore stays as a zombie context (`ZombieCtx`), and its
+    /// ring keeps running what it had queued: the frame it was writing is
+    /// still being written after the exit. Linux keeps the dead process's
+    /// fences on the BO's reservation until its channel has idled
+    /// (`nouveau_channel_idle` at close), so the compositor's `CPU_PREP` on
+    /// that frame waits for them. Here the exit took the pid off the
+    /// context registry, so the prep found no channel behind the mapping's
+    /// pid and answered at once: the compositor read the frame under the
+    /// dead client's ring. A zombie's ring is looked up through the zombie
+    /// list, by the pid its mappings wear (the tombstone once the pid was
+    /// recycled).
+    #[test]
+    fn cpu_prep_waits_for_a_zombies_ring_that_still_writes_the_buffer() {
+        let _g = LOCK.lock();
+        let _live = LiveBytes::hold();
+        let gpu = gpu_rm_ladder();
+        FAKE_RM.lock().peer = true;
+        let ch_c = client_with_pushbuf(&gpu, COMP);
+        let ch_a = client_with_pushbuf(&gpu, A);
+        const FRAME_VA: u64 = PUSH_VA + 0x10_0000;
+        let h = gem_new_rm(&gpu, 65536, nv::NOUVEAU_GEM_DOMAIN_GART, A)
+            .unwrap()
+            .handle;
+        assert_eq!(vm_bind_ops(&gpu, A, &mut [map(h, FRAME_VA, 65536)]), Ok(0));
+        assert!(crate::scheme::gem_mmap::add_ref(h, COMP).is_some());
+        assert_eq!(
+            vm_bind_ops(&gpu, COMP, &mut [map(h, FRAME_VA, 65536)]),
+            Ok(0)
+        );
+        // The client renders the frame and signals; the compositor samples
+        // it behind an ACQUIRE on the client's semaphore, with a fence of
+        // its own, so its ring reads idle once that has landed.
+        let out = syncobj::create(false);
+        let out2 = syncobj::create(false);
+        assert_eq!(
+            exec(&gpu, A, ch_a, &[push(PUSH_VA, 16)], &[], &[sync(out)]),
+            Ok(0)
+        );
+        assert_eq!(
+            exec(
+                &gpu,
+                COMP,
+                ch_c,
+                &[push(PUSH_VA, 16)],
+                &[sync(out)],
+                &[sync(out2)]
+            ),
+            Ok(0)
+        );
+        let (c0, c1) = (chan(0), chan(1));
+        assert_eq!(userd(&c1), (0, 2), "the frame and its fence, not fetched");
+        // The client exits before its ring ran: a zombie, its ring still
+        // to run. Its last payload landed at the park, so the compositor
+        // passes its ACQUIRE and drains its own ring.
+        gpu.nouveau_release_process(A);
+        assert_eq!(gpu.nouveau_zombies.lock().len(), 1, "a zombie");
+        assert!(has_chan(1));
+        assert_eq!(run_gpu(0).len(), 3, "the compositor passes its acquire");
+        assert_eq!(userd(&c0), (3, 3));
+        assert_eq!(userd(&c1), (0, 2), "the zombie's ring has not moved");
+        test_clock::set_auto_advance(1);
+        let t0 = test_clock::now();
+        // The compositor about to read the frame with the CPU: busy, the
+        // dead client's ring still has the write queued. Before this, a
+        // mapping whose pid had left the registry was taken as idle.
+        assert_eq!(
+            cpu_prep_nowait(&gpu, h, COMP),
+            Err(nv::EBUSY),
+            "the zombie's ring still has the frame queued"
+        );
+        assert!(test_clock::now() - t0 < 1_000, "answered without waiting");
+        assert_eq!(
+            userd(&c1),
+            (0, 3),
+            "the probe went behind the zombie's push"
+        );
+        assert_eq!(userd(&c0), (3, 3), "nothing on the compositor's idle ring");
+        // The pid comes back as a new process: the zombie and its mappings
+        // now wear its tombstone, and the prep still finds its ring.
+        gpu.rekey_zombie_wearing(A);
+        assert_eq!(
+            cpu_prep_nowait(&gpu, h, COMP),
+            Err(nv::EBUSY),
+            "the tombstone leads to the zombie's ring as the pid did"
+        );
+        assert_eq!(userd(&c1), (0, 4));
+        // A blocking prep returns once the zombie's ring ran past the probe
+        // it appended (GPPut at 5).
+        let now = test_clock::now();
+        let sem = sem_va(&c1);
+        std::thread::scope(|s| {
+            let t = s.spawn(move || {
+                test_clock::set(now);
+                for _ in 0..5_000 {
+                    if userd(&c1).1 >= 5 {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                assert_eq!(userd(&c1), (0, 5), "the blocking prep queued its probe");
+                let mut fetched = Vec::new();
+                for _ in 0..5_000 {
+                    fetched.extend(run_gpu(1));
+                    if fetched.contains(&Fetched::Release {
+                        sem_va: sem,
+                        payload: 4,
+                    }) {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                fetched
+            });
+            assert_eq!(cpu_prep(&gpu, h, COMP), Ok(0));
+            assert_eq!(
+                t.join().unwrap(),
+                [
+                    Fetched::Push {
+                        va: PUSH_VA,
+                        len: 16
+                    },
+                    Fetched::Release {
+                        sem_va: sem,
+                        payload: 1
+                    },
+                    Fetched::Release {
+                        sem_va: sem,
+                        payload: 2
+                    },
+                    Fetched::Release {
+                        sem_va: sem,
+                        payload: 3
+                    },
+                    Fetched::Release {
+                        sem_va: sem,
+                        payload: 4
+                    }
+                ]
+            );
+        });
+        assert_eq!(userd(&c1), (5, 5));
+        // That probe is the ring's own word: with it landed the zombie reads
+        // idle, and nothing more is appended.
+        assert_eq!(cpu_prep_nowait(&gpu, h, COMP), Ok(0));
+        assert_eq!(userd(&c1), (5, 5), "no probe behind a landed probe");
+        // Its consumer passed: the zombie is due, and once its teardown ran
+        // the mapping is gone with it. Nothing left to wait for, and no
+        // channel to probe.
+        gpu.reap_zombie_contexts();
+        assert!(gpu.nouveau_zombies.lock().is_empty());
+        assert!(!has_chan(1), "the zombie's channel is freed");
+        assert_eq!(cpu_prep_nowait(&gpu, h, COMP), Ok(0));
+        assert_eq!(userd(&c0), (3, 3), "no probe on the compositor's idle ring");
+        test_clock::set_auto_advance(0);
+        assert!(syncobj::destroy(out));
+        assert!(syncobj::destroy(out2));
         gpu.nouveau_release_process(COMP);
         assert_eq!(FAKE_RM.lock().bad, 0);
     }
