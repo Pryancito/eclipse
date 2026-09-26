@@ -827,6 +827,14 @@ pub trait FileLike: KernelObject + downcast_rs::DowncastSync {
     fn seek(&self, _pos: SeekFrom) -> LxResult<u64> {
         Err(LxError::ESPIPE)
     }
+    /// `file_can_poll`: whether this file has a poll operation at all.
+    /// `epoll_ctl` refuses one that does not with `EPERM`, for every op,
+    /// before it looks at anything else about the request; `poll(2)` and
+    /// `select(2)` do not refuse it, they report it always ready. Only a
+    /// regular file or a directory of an ordinary filesystem says no.
+    fn can_epoll(&self) -> bool {
+        true
+    }
     /// wait for some event on a file descriptor
     fn poll(&self, events: PollEvents) -> LxResult<PollStatus>;
     /// wait for some event on a file descriptor use async
@@ -2684,6 +2692,65 @@ mod mount_lookup_tests {
 mod tests {
     use super::split_path;
 
+    /// `file_can_poll`: a regular file or a directory has no poll operation
+    /// unless it is a procfs or sysfs node; anything else polls.
+    #[test]
+    fn only_plain_files_and_directories_outside_proc_and_sys_cannot_be_epolled() {
+        use super::{File, FileLike, OpenFlags};
+        use alloc::string::String;
+        use alloc::sync::Arc;
+        use rcore_fs::vfs::{FileType, FsError, INode, Metadata, PollStatus, Timespec};
+
+        struct Typed(FileType);
+        impl INode for Typed {
+            fn read_at(&self, _: usize, _: &mut [u8]) -> rcore_fs::vfs::Result<usize> {
+                Err(FsError::NotSupported)
+            }
+            fn write_at(&self, _: usize, buf: &[u8]) -> rcore_fs::vfs::Result<usize> {
+                Ok(buf.len())
+            }
+            fn poll(&self) -> rcore_fs::vfs::Result<PollStatus> {
+                Err(FsError::NotSupported)
+            }
+            fn metadata(&self) -> rcore_fs::vfs::Result<Metadata> {
+                Ok(Metadata {
+                    dev: 1,
+                    inode: 9,
+                    size: 0,
+                    blk_size: 4096,
+                    blocks: 0,
+                    atime: Timespec { sec: 0, nsec: 0 },
+                    mtime: Timespec { sec: 0, nsec: 0 },
+                    ctime: Timespec { sec: 0, nsec: 0 },
+                    type_: self.0,
+                    mode: 0o644,
+                    nlinks: 1,
+                    uid: 0,
+                    gid: 0,
+                    rdev: 0,
+                })
+            }
+            fn as_any_ref(&self) -> &dyn core::any::Any {
+                self
+            }
+        }
+        let open = |type_: FileType, path: &str| {
+            File::new(
+                Arc::new(Typed(type_)),
+                OpenFlags::RDONLY,
+                String::from(path),
+            )
+        };
+        assert!(!open(FileType::File, "/var/log/messages").can_epoll());
+        assert!(!open(FileType::Dir, "/etc").can_epoll());
+        assert!(open(FileType::NamedPipe, "/run/ctl.fifo").can_epoll());
+        assert!(open(FileType::CharDevice, "/dev/input/event0").can_epoll());
+        assert!(open(FileType::Socket, "/run/x.sock").can_epoll());
+        assert!(open(FileType::File, "/proc/self/mounts").can_epoll());
+        assert!(open(FileType::File, "/sys/class/drm/card0/status").can_epoll());
+        assert!(open(FileType::Dir, "/sys/class/drm").can_epoll());
+    }
+
     /// Only terminals are terminals: the poll/select slow tick keys on this,
     /// and a device node (ALSA pcm/timer, DRM, input) classified as one put
     /// PulseAudio's sink thread on a 100 ms re-scan.
@@ -2734,6 +2801,7 @@ mod tests {
             String::from("/dev/snd/timer"),
         );
         assert!(dev.is_char_device());
+        assert!(dev.can_epoll(), "a device node polls");
         assert!(
             !dev.is_terminal(),
             "a char device is not a terminal by itself"

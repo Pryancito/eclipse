@@ -952,18 +952,21 @@ impl Syscall<'_> {
             "epoll_ctl: epfd={:?}, op={}, fd={:?}, event={:?}",
             epfd, op, fd, event
         );
+        // `do_epoll_ctl`'s order: the event is copied in for ADD and MOD
+        // (EFAULT), then `epfd` and `fd` are both looked up, for every op
+        // (EBADF), then the target is judged, and only then is `epfd` not
+        // being an epoll EINVAL. It was EBADF, the answer for a closed fd,
+        // and DEL never looked `fd` up, so DEL of a closed fd was ENOENT.
+        let event = if op == 2 {
+            EpollEvent { events: 0, data: 0 }
+        } else {
+            event.read()?
+        };
         let proc = self.linux_process();
         let epoll_file = proc.get_file_like(epfd)?;
-        let epoll = epoll_file.downcast_ref::<Epoll>().ok_or(LxError::EBADF)?;
-        let (event, file) = if op == 2 {
-            // EPOLL_CTL_DEL: no event payload, no file handle needed.
-            (EpollEvent { events: 0, data: 0 }, None)
-        } else {
-            // ADD/MOD: resolve the target fd so the epoll can poll it directly
-            // (required for nested-epoll readiness).
-            (event.read()?, Some(proc.get_file_like(fd)?))
-        };
-        epoll.ctl(op, fd, event, file)
+        let file = proc.get_file_like(fd)?;
+        let epoll = epoll_file.downcast_ref::<Epoll>().ok_or(LxError::EINVAL)?;
+        epoll.ctl(op, fd, event, Some(file))
     }
 
     /// wait for an I/O event on an epoll file descriptor
