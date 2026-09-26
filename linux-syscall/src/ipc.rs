@@ -410,18 +410,22 @@ impl Syscall<'_> {
         }
         let sender = self.zircon_process().id() as u32;
         loop {
-            match queue.try_send(mtype, &data, sender) {
+            // A full queue parks the caller on the queue itself: `try_send`
+            // hands back the generation it looked at, and `wait_for_change`
+            // returns when a receive makes room, when `IPC_RMID` runs
+            // (`EIDRM`) or when a signal arrives (`EINTR`). This used to be a
+            // 5 ms sleep-and-look-again.
+            let since = match queue.try_send(mtype, &data, sender) {
                 Ok(()) => return Ok(0),
                 Err(MsgSendError::Removed) => return Err(LxError::EIDRM),
-                Err(MsgSendError::Full) => {
+                Err(MsgSendError::Full(since)) => {
                     if msgflg & IPC_NOWAIT != 0 {
                         return Err(LxError::EAGAIN);
                     }
+                    since
                 }
-            }
-            linux_object::process::check_signals()?;
-            let deadline = kernel_hal::timer::deadline_after(core::time::Duration::from_millis(5));
-            kernel_hal::thread::sleep_until(deadline).await;
+            };
+            queue.wait_for_change(since).await?;
         }
     }
 
@@ -453,7 +457,9 @@ impl Syscall<'_> {
         let noerror = msgflg & MSG_NOERROR != 0;
         let except = msgflg & MSG_EXCEPT != 0;
         loop {
-            match queue.try_recv(msgtyp, msgsz, noerror, except, receiver) {
+            // Same shape as `msgsnd`: park on the queue's own generation
+            // until a message lands, instead of a 5 ms sleep-and-look-again.
+            let since = match queue.try_recv(msgtyp, msgsz, noerror, except, receiver) {
                 Ok((mtype, data)) => {
                     UserOutPtr::<isize>::from(msgp).write(mtype)?;
                     UserOutPtr::<u8>::from(msgp + core::mem::size_of::<isize>())
@@ -462,15 +468,14 @@ impl Syscall<'_> {
                 }
                 Err(MsgRecvError::Removed) => return Err(LxError::EIDRM),
                 Err(MsgRecvError::TooBig) => return Err(LxError::E2BIG),
-                Err(MsgRecvError::NoMsg) => {
+                Err(MsgRecvError::NoMsg(since)) => {
                     if msgflg & IPC_NOWAIT != 0 {
                         return Err(LxError::ENOMSG);
                     }
+                    since
                 }
-            }
-            linux_object::process::check_signals()?;
-            let deadline = kernel_hal::timer::deadline_after(core::time::Duration::from_millis(5));
-            kernel_hal::thread::sleep_until(deadline).await;
+            };
+            queue.wait_for_change(since).await?;
         }
     }
 
