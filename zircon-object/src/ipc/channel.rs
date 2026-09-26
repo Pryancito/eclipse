@@ -111,11 +111,26 @@ impl Channel {
         let peer = self.peer.upgrade().ok_or(ZxError::PEER_CLOSED)?;
         // check first 4 bytes: whether it is a call reply?
         let txid = msg.get_txid();
-        if txid != 0 {
-            if let Some(sender) = peer.call_reply.lock().remove(&txid) {
-                let _ = sender.send(Ok(msg));
-                return Ok(());
-            }
+        // Out of the map before anything else is locked: `push_general` below
+        // takes the peer's queue, and nothing may hold both.
+        let waiting = if txid != 0 {
+            peer.call_reply.lock().remove(&txid)
+        } else {
+            None
+        };
+        if let Some(sender) = waiting {
+            // A reply the caller can no longer take is not lost. The send
+            // fails when the call was cancelled between the lookup above and
+            // here (`ReplySlot::drop` closes the receiving half), and Zircon
+            // leaves a late reply on the endpoint as an ordinary message, so
+            // that is where it goes. The answer used to be `let _ =`: the
+            // message vanished and the endpoint never saw it.
+            return match sender.send(Ok(msg)) {
+                Ok(()) => Ok(()),
+                // The value comes back exactly as it was sent.
+                Err(Ok(msg)) => peer.push_general(msg),
+                Err(Err(e)) => Err(e),
+            };
         }
         peer.push_general(msg)
     }
@@ -140,13 +155,20 @@ impl Channel {
         msg.set_txid(txid);
         let (sender, receiver) = oneshot::channel();
         self.call_reply.lock().insert(txid, sender);
-        let slot = ReplySlot {
+        let mut slot = ReplySlot {
             channel: self,
             txid,
+            receiver: Some(receiver),
         };
         peer.push_general(msg)?;
         drop(peer);
-        let reply = receiver.await.unwrap_or(Err(ZxError::INTERNAL));
+        let reply = {
+            let receiver = slot.receiver.as_mut().expect("just set");
+            receiver.await.unwrap_or(Err(ZxError::INTERNAL))
+        };
+        // The reply is in hand, so there is nothing left for `Drop` to put
+        // back on the endpoint.
+        slot.receiver = None;
         drop(slot);
         reply
     }
@@ -184,11 +206,30 @@ impl Channel {
 struct ReplySlot<'a> {
     channel: &'a Channel,
     txid: TxID,
+    /// The receiving half, held only so that a cancelled call can put back a
+    /// reply that had already been handed over to it. `None` once the call
+    /// has taken the reply itself.
+    receiver: Option<oneshot::Receiver<ZxResult<T>>>,
 }
 
 impl Drop for ReplySlot<'_> {
     fn drop(&mut self) {
         self.channel.call_reply.lock().remove(&self.txid);
+        let Some(mut receiver) = self.receiver.take() else {
+            return;
+        };
+        // Closing first shuts the window the other way round: a writer that
+        // took the sender out of the map but has not sent yet now fails, and
+        // `write` queues its reply as an ordinary message.
+        receiver.close();
+        // And a reply that made it in before all that is put on the endpoint,
+        // where Zircon leaves a late reply. Dropping the receiver with a
+        // message inside it was a lost reply: the peer's `write` had answered
+        // `Ok`, and the endpoint never held anything.
+        if let Ok(Some(Ok(msg))) = receiver.try_recv() {
+            // A full queue is the one case with nowhere to put it.
+            let _ = self.channel.push_general(msg);
+        }
     }
 }
 
@@ -483,6 +524,62 @@ mod tests {
         assert_eq!(&request.data[4..], b"ping");
         channel1.write(reply_to(txid, b"pong")).unwrap();
         let late = channel0.read().unwrap();
+        assert_eq!(late.get_txid(), txid);
+        assert_eq!(&late.data[4..], b"pong");
+    }
+
+    /// The other order, which is the one that lost the message: the reply
+    /// arrives FIRST, so `write` finds the slot and hands it over, and only
+    /// then does the call give up (its deadline, or a killed thread).
+    ///
+    /// The reply was then sitting inside a oneshot nobody would ever read,
+    /// and dropping the slot dropped it with the receiver: `write` had
+    /// answered `Ok`, the caller had been told nothing, and the endpoint
+    /// held nothing. The test above passes either way, because there the
+    /// slot is already gone when the reply is written.
+    #[test]
+    fn a_reply_that_beat_the_cancellation_is_still_left_on_the_endpoint() {
+        let (channel0, channel1) = Channel::create();
+        let call = call_in_flight(&channel0, b"txidping");
+        let request = channel1.read().unwrap();
+        let txid = request.get_txid();
+        // The reply goes in while the call is still waiting, so it is handed
+        // to the slot and not queued.
+        channel1.write(reply_to(txid, b"pong")).unwrap();
+        assert!(
+            channel0.recv_queue.lock().is_empty(),
+            "the reply went to the waiting call, not to the queue"
+        );
+        // And now the call gives up without ever being polled again.
+        drop(call);
+        assert!(
+            channel0.call_reply.lock().is_empty(),
+            "the slot goes with the call"
+        );
+        let late = channel0.read().expect("the reply is on the endpoint");
+        assert_eq!(late.get_txid(), txid);
+        assert_eq!(&late.data[4..], b"pong");
+    }
+
+    /// And the window in between: the writer has taken the sender out of the
+    /// map but has not sent yet when the call gives up, so the send fails.
+    /// `write` must not swallow that either -- it queues the reply as an
+    /// ordinary message.
+    ///
+    /// The state is built by hand, because reaching it for real needs two
+    /// threads: a slot in the map whose receiving half is already gone is
+    /// exactly what the writer finds if it loses that race.
+    #[test]
+    fn a_reply_whose_send_finds_nobody_is_queued_instead_of_dropped() {
+        let (channel0, channel1) = Channel::create();
+        let txid = 0x8000_0001;
+        let (sender, receiver) = oneshot::channel();
+        channel0.call_reply.lock().insert(txid, sender);
+        drop(receiver);
+        // `write` finds the slot, the send fails, and the reply has to land
+        // somewhere. It used to land nowhere and the call answered `Ok`.
+        channel1.write(reply_to(txid, b"pong")).unwrap();
+        let late = channel0.read().expect("the reply is on the endpoint");
         assert_eq!(late.get_txid(), txid);
         assert_eq!(&late.data[4..], b"pong");
     }
