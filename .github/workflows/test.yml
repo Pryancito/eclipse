@@ -170,6 +170,13 @@ jobs:
           # `rboot.conf` parsing, the kernel cmdline, EDID and graphic-mode
           # choice, and the splash and progress bar drawn into plain memory.
           cargo test --manifest-path rboot/Cargo.toml --lib --no-default-features
+          # The kernel binary crate itself. Its `[[bin]]` section carried
+          # `test = false`, so no job in this file ever compiled it as a test
+          # target -- the same hole rboot was in, in the crate that owns the
+          # dmesg ring, the physical frame allocator and the exit status this
+          # very job reads. Built for the libos personality, which is the one
+          # that links against the host.
+          cargo test -p zcore --features libos -- --test-threads=1
 
       - name: Build the bootloader for its real target
         run: |
