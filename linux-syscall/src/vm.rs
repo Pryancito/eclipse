@@ -311,6 +311,7 @@ impl Syscall<'_> {
             Ok(addr)
         } else {
             let file_like = self.linux_process().get_file_like(fd)?;
+            mmap_file_access(shared, want_write, file_like.flags())?;
             // MAP_SHARED must hand every mapper of the file the SAME VmObject
             // (stores propagate between processes — the wl_shm pixel path);
             // MAP_PRIVATE keeps the per-call demand-paged snapshot.
@@ -1202,6 +1203,31 @@ fn mmap_shared(flags: usize, anonymous: bool) -> LxResult<bool> {
     }
 }
 
+/// `do_mmap`'s check of the descriptor's open mode against the mapping
+/// asked for: a shared mapping with `PROT_WRITE` needs the file open for
+/// writing (`!(file->f_mode & FMODE_WRITE)` is `EACCES`), and any file
+/// mapping, shared or private, needs it open for reading (the `MAP_PRIVATE`
+/// arm the shared one falls through to).
+///
+/// Nothing looked. A file a process could only read (`O_RDONLY` on a
+/// root-owned configuration, say) could be mapped `MAP_SHARED|PROT_WRITE`
+/// and written through the mapping, and the shared VMO's writeback carried
+/// the stores to the file; and an `O_WRONLY` descriptor mapped where Linux
+/// says `EACCES`.
+fn mmap_file_access(
+    shared: bool,
+    want_write: bool,
+    open: linux_object::fs::OpenFlags,
+) -> LxResult<()> {
+    if shared && want_write && !open.writable() {
+        return Err(LxError::EACCES);
+    }
+    if !open.readable() {
+        return Err(LxError::EACCES);
+    }
+    Ok(())
+}
+
 /// Where `mmap` must put the mapping.
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 enum Placement {
@@ -1702,6 +1728,55 @@ impl MmapProt {
             flags |= MMUFlags::EXECUTE;
         }
         flags
+    }
+}
+
+#[cfg(test)]
+mod mmap_file_access_tests {
+    //! The open mode a file mapping needs, which was never asked.
+
+    use super::*;
+    use linux_object::fs::OpenFlags;
+
+    /// `MAP_SHARED|PROT_WRITE` needs a descriptor open for writing; a
+    /// private writable mapping (copy on write) does not.
+    #[test]
+    fn a_shared_writable_mapping_needs_the_file_open_for_writing() {
+        assert_eq!(
+            mmap_file_access(true, true, OpenFlags::RDONLY),
+            Err(LxError::EACCES)
+        );
+        assert_eq!(mmap_file_access(true, true, OpenFlags::RDWR), Ok(()));
+        assert_eq!(
+            mmap_file_access(false, true, OpenFlags::RDONLY),
+            Ok(()),
+            "private: copy on write"
+        );
+        assert_eq!(
+            mmap_file_access(true, false, OpenFlags::RDONLY),
+            Ok(()),
+            "shared read-only"
+        );
+    }
+
+    /// Every file mapping needs the descriptor open for reading, `O_WRONLY`
+    /// included, whatever the protection asked for.
+    #[test]
+    fn every_file_mapping_needs_the_file_open_for_reading() {
+        for (shared, want_write) in [(false, false), (false, true), (true, false), (true, true)] {
+            assert_eq!(
+                mmap_file_access(shared, want_write, OpenFlags::WRONLY),
+                Err(LxError::EACCES),
+                "shared={} write={}",
+                shared,
+                want_write
+            );
+        }
+        assert_eq!(mmap_file_access(false, false, OpenFlags::RDONLY), Ok(()));
+        assert_eq!(
+            mmap_file_access(true, true, OpenFlags::RDWR | OpenFlags::APPEND),
+            Ok(())
+        );
     }
 }
 
