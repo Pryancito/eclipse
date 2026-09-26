@@ -538,7 +538,7 @@ impl Syscall<'_> {
         newsp: usize,
         mut parent_tid: UserOutPtr<i32>,
         newtls: usize,
-        mut child_tid: UserOutPtr<i32>,
+        child_tid: UserOutPtr<i32>,
     ) -> SysResult {
         let clone_flags = CloneFlags::from_bits_truncate(flags);
         info!(
@@ -673,6 +673,57 @@ impl Syscall<'_> {
         // signal mask does come across (pthread_create(3)).
         let inherited = self.thread.lock_linux().new_thread();
         let new_thread = Thread::create_linux_with(self.zircon_process(), inherited)?;
+        let tid = new_thread.id();
+        // Everything from here to `start` can fail, and every one of those
+        // failures is on a pointer or a context userspace chose. A thread that
+        // was created and never started is a thread nobody ever takes out of
+        // the process's list: `Thread::kill` on it finds no coroutine and no
+        // waker, so it just goes Dying, `remove_thread` never runs, the list
+        // never empties, and `Process::exit` -- which only calls `terminate()`
+        // when `threads.is_empty()` -- never releases the address space. The
+        // process publishes its exit status, so `wait4` works and `ps` shows
+        // nothing, and its whole VMAR stays alive for as long as the machine
+        // does. `clone(CLONE_THREAD | CLONE_VM | CLONE_SIGHAND |
+        // CLONE_PARENT_SETTID)` with `parent_tid` pointing at an unmapped page
+        // is that leak in one unprivileged line, and it loops.
+        //
+        // `terminate_abandoned` is the hook for exactly this: "this thread
+        // will never run, take it out of the list". The fork path above
+        // documents its own weaker divergence (a live child survives a
+        // faulting `parent_tid`); this one is not a divergence, it is a leak.
+        match self.clone_start(
+            &new_thread,
+            tid,
+            clone_flags,
+            newsp,
+            newtls,
+            parent_tid,
+            child_tid,
+        ) {
+            Ok(tid) => Ok(tid),
+            Err(e) => {
+                new_thread.terminate_abandoned();
+                Err(e)
+            }
+        }
+    }
+
+    /// The tail of [`Self::sys_clone`]'s thread path: build the new thread's
+    /// context, honour the TID bookkeeping flags, and start it.
+    ///
+    /// Split out so that every `?` in it is a failure the caller can undo --
+    /// see there for what a created-but-never-started thread costs.
+    #[allow(clippy::too_many_arguments)]
+    fn clone_start(
+        &self,
+        new_thread: &Arc<Thread>,
+        tid: KoID,
+        clone_flags: CloneFlags,
+        newsp: usize,
+        newtls: usize,
+        mut parent_tid: UserOutPtr<i32>,
+        mut child_tid: UserOutPtr<i32>,
+    ) -> LxResult<usize> {
         let mut new_ctx = self.thread.context_cloned()?;
         new_ctx.set_field(UserContextField::StackPointer, newsp);
         if clone_flags.contains(CloneFlags::SETTLS) {
@@ -691,7 +742,6 @@ impl Syscall<'_> {
         }
         new_thread.with_context(|ctx| *ctx = new_ctx)?;
 
-        let tid = new_thread.id();
         info!("clone: {} -> {}", self.thread.id(), tid);
         // Honor the TID bookkeeping flags BEFORE the thread starts running:
         // the child and the parent's pthread library may read these
