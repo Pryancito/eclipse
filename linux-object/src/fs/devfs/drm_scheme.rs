@@ -1881,6 +1881,25 @@ impl DrmDev {
                     {
                         return Err(FsError::InvalidParam);
                     }
+                    // Linux builds a framebuffer over the handle
+                    // (`drm_mode_cursor_universal`): a handle this file does
+                    // not hold is ENOENT (`drm_gem_object_lookup`), and a
+                    // buffer too small for `width x height` 32-bit pixels is
+                    // EINVAL (`drm_gem_fb_size_check`). Both were reported as
+                    // success with the cursor quietly hidden, and the lookup
+                    // was the unchecked one: another process's buffer could
+                    // be shown as the pointer.
+                    if cur.handle != 0 {
+                        let Some((_, size)) =
+                            drm::resolve_gem_backing_for(cur.handle, drm::current_pid())
+                        else {
+                            return Err(FsError::EntryNotFound);
+                        };
+                        let bytes = (cur.width as usize) * (cur.height as usize) * 4;
+                        if size < bytes {
+                            return Err(FsError::InvalidParam);
+                        }
+                    }
                     changed |= drm::set_cursor_bo(cur.handle, cur.width, cur.height);
                 }
                 if cur.flags & DRM_MODE_CURSOR_MOVE != 0 {
@@ -12049,6 +12068,42 @@ mod hw_kms_tests {
 
         c.rmfb(fb).expect("RMFB");
         c.destroy_dumb(buf.handle).expect("DESTROY_DUMB");
+    }
+
+    /// `CURSOR` with a buffer: Linux wraps the handle in a framebuffer, so a
+    /// handle the file does not hold is ENOENT and a buffer too small for
+    /// `width x height` pixels is EINVAL. Both came back as success with the
+    /// pointer quietly hidden, so a compositor whose cursor upload went
+    /// wrong was never told. A buffer that fits keeps working.
+    #[test]
+    fn a_cursor_needs_a_handle_of_its_own_that_fits_the_image() {
+        let screen = kms_emu::attach(32, 8);
+        let _gpu = screen.attach_gpu(EmuGpu::hardware_kms("emu-gpu").with_ids(60, 61, 62));
+        let c = Client::open(0);
+        const BOGUS: u32 = 4242;
+        let cursor = |handle: u32, w: u32, h: u32| {
+            let mut cur = ModeCursor {
+                flags: 0x01, // BO
+                crtc_id: 60,
+                x: 0,
+                y: 0,
+                width: w,
+                height: h,
+                handle,
+            };
+            c.ioctl(DRM_IOCTL_MODE_CURSOR, &mut cur)
+        };
+        assert_eq!(cursor(BOGUS, 16, 16), Err(FsError::EntryNotFound));
+
+        // 16 rows of a 64-byte pitch: 1 KiB, room for 16x16 and not 64x64.
+        let small = c.create_dumb(16, 16);
+        assert_eq!(cursor(small.handle, 64, 64), Err(FsError::InvalidParam));
+        assert_eq!(cursor(small.handle, 16, 17), Err(FsError::InvalidParam));
+        assert_eq!(cursor(small.handle, 16, 16), Ok(0));
+        // Hiding the cursor names no buffer and needs none.
+        assert_eq!(cursor(0, 0, 0), Ok(0));
+
+        c.destroy_dumb(small.handle).expect("DESTROY_DUMB");
     }
 }
 
