@@ -85,15 +85,30 @@ impl Timer {
     /// If a previous call to `set` was pending, the previous timer is canceled
     /// and `Signal::SIGNALED` is de-asserted as needed.
     pub fn set(self: &Arc<Self>, deadline: Duration, slack: Duration) {
-        let mut inner = self.inner.lock();
-        if deadline <= timer_now() {
-            inner.deadline = None;
-            inner.slack = Duration::ZERO;
+        // Everything that leaves this object happens with the lock let go:
+        // `signal_change` runs the observers' callbacks with its own lock held,
+        // and `timer_set` hands the HAL a closure whose body is `touch`, which
+        // takes this same lock. Both used to run with `inner` held. These are
+        // spin locks taken with interrupts off, so a callback that asks this
+        // timer anything -- `cancel`, `get_info`, another `set` -- and a HAL
+        // that ever calls a deadline back inline are each a CPU that never
+        // comes back, and two of those have already been found in this kernel.
+        let already_passed = {
+            let mut inner = self.inner.lock();
+            if deadline <= timer_now() {
+                inner.deadline = None;
+                inner.slack = Duration::ZERO;
+                true
+            } else {
+                inner.deadline = Some(deadline);
+                inner.slack = slack;
+                false
+            }
+        };
+        if already_passed {
             self.base.signal_set(Signal::SIGNALED);
             return;
         }
-        inner.deadline = Some(deadline);
-        inner.slack = slack;
         self.base.signal_clear(Signal::SIGNALED);
         let me = Arc::downgrade(self);
         kernel_hal::timer::timer_set(
@@ -104,9 +119,12 @@ impl Timer {
 
     /// Cancel the pending timer started by `set`.
     pub fn cancel(&self) {
-        let mut inner = self.inner.lock();
-        inner.deadline = None;
-        inner.slack = Duration::ZERO;
+        {
+            let mut inner = self.inner.lock();
+            inner.deadline = None;
+            inner.slack = Duration::ZERO;
+        }
+        // Outside the lock, as in `set`.
         self.base.signal_clear(Signal::SIGNALED);
     }
 
@@ -125,13 +143,21 @@ impl Timer {
 
     /// Called by HAL timer.
     fn touch(&self, now: Duration) {
-        let mut inner = self.inner.lock();
-        if let Some(deadline) = inner.deadline {
-            if now >= deadline {
-                self.base.signal_set(Signal::SIGNALED);
-                inner.deadline = None;
-                inner.slack = Duration::ZERO;
+        let arrived = {
+            let mut inner = self.inner.lock();
+            match inner.deadline {
+                Some(deadline) if now >= deadline => {
+                    inner.deadline = None;
+                    inner.slack = Duration::ZERO;
+                    true
+                }
+                _ => false,
             }
+        };
+        // Outside the lock, as in `set`: this runs from the HAL's timer
+        // callback, and the observers it wakes are waiters on this very timer.
+        if arrived {
+            self.base.signal_set(Signal::SIGNALED);
         }
     }
 }
@@ -218,6 +244,52 @@ mod tests {
         // And `set` de-asserts the signal the arrived deadline raised.
         timer.set(timer_now() + FAR, Duration::default());
         assert_eq!(timer.signal(), Signal::empty());
+    }
+
+    /// Runs `body` on its own thread and turns a wedge into a named failure: a
+    /// re-entrant acquire of a spin lock does not panic, it spins, so without
+    /// this the test hangs and says nothing at all.
+    fn with_watchdog(what: &str, body: impl FnOnce() + Send + 'static) {
+        let (done, finished) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            body();
+            let _ = done.send(());
+        });
+        assert!(
+            finished.recv_timeout(Duration::from_secs(30)).is_ok(),
+            "{} wedged or panicked",
+            what,
+        );
+    }
+
+    #[test]
+    /// `set` used to raise `SIGNALED` with `inner` held, and `signal_change`
+    /// runs the observers' callbacks under its own lock, there and then. A
+    /// callback that asks this timer anything takes `inner` again -- on the
+    /// same CPU, on a spin lock held with interrupts off, which is a CPU that
+    /// never comes back. `get_info` is the cheapest thing to ask it.
+    fn a_waiter_woken_by_the_timer_may_ask_the_timer_about_itself() {
+        with_watchdog("a callback asking the timer for its info", || {
+            let timer = Timer::new();
+            let seen = Arc::new(Mutex::new(None));
+            let out = seen.clone();
+            let me = Arc::downgrade(&timer);
+            let watched: Arc<dyn KernelObject> = timer.clone();
+            watched.add_signal_callback(Box::new(move |s| {
+                if s.contains(Signal::SIGNALED) {
+                    if let Some(timer) = me.upgrade() {
+                        *out.lock() = Some(timer.get_info());
+                    }
+                }
+                false
+            }));
+
+            // A deadline already past signals from inside `set` itself.
+            timer.set(timer_now(), Duration::default());
+            assert_eq!(timer.signal(), Signal::SIGNALED);
+            let info = seen.lock().expect("the callback never ran");
+            assert_eq!(info.1, 0, "a timer that has fired holds no deadline");
+        });
     }
 
     #[test]
