@@ -7253,6 +7253,78 @@ mod kms_scanout_tests {
         );
     }
 
+    /// What Moebius's 27-sep 16:4x boot narrowed the search to. Its klog says the
+    /// source was clean in BOTH reads for 32 seconds and 320-odd frames, with the
+    /// "carries black" and "went black mid-copy" budgets sitting unspent -- so if
+    /// a black rectangle was on screen in that window, the kernel put it there.
+    ///
+    /// This pins the invariant that claim rests on: a present copies every visible
+    /// pixel and INVENTS nothing. Black is the interesting failure, but the
+    /// assertion is exact equality, because the two ways the kernel could show
+    /// black it was not given are writing a zero and **not writing at all** -- and
+    /// an unwritten pixel keeps whatever the panel held, which at boot is black.
+    /// `UNTOUCHED` is the emulator's sentinel for "never written", so equality
+    /// catches that case by name instead of it hiding as a plausible colour.
+    ///
+    /// Four geometries, because the two machines differ where it matters: QEMU
+    /// reports an UNPADDED pitch (7680 for 1920, exactly 4 bytes a pixel) and the
+    /// RTX's UEFI reports `PixelsPerScanLine` PADDED (2048 for a 1920-wide mode),
+    /// and `blit_from` picks a different right limit for each -- `padded_w` for row
+    /// copies, `visible_w` per pixel. Write-combining picks the store path, and on
+    /// x86_64 the WC one is the non-temporal loop for real.
+    #[test]
+    fn a_present_copies_every_visible_pixel_and_invents_no_black() {
+        for &(w, h, pitch_px, wc) in &[
+            (64u32, 32u32, 64u32, false),
+            (64, 32, 64, true),
+            // Padded, which is the real-hardware case and the one where the two
+            // right limits stop agreeing.
+            (40, 16, 64, true),
+            (40, 16, 64, false),
+        ] {
+            let screen = kms_emu::attach_with(w, h, pitch_px, wc);
+            let c = Client::open(0);
+            let buf = c.create_dumb(w, h);
+            // Every pixel opaque and distinct, and not one of them zero: `tag`
+            // is seeded from a non-zero base, so a zero on the panel can only
+            // have been invented by the copy.
+            paint(&buf, |x, y| tag(0x0044_0000, x, y));
+            let fb = c.addfb2(&buf);
+            let src = map_dumb(&buf);
+            let stride = (buf.pitch / 4) as usize;
+
+            c.page_flip(drm::SYNTH_CRTC_ID, fb, 0x9009).expect("flip");
+
+            for y in 0..h {
+                for x in 0..w {
+                    let got = screen.pixel(x, y);
+                    let want = src[y as usize * stride + x as usize];
+                    assert_eq!(
+                        got,
+                        want,
+                        "{}x{} pitch {} wc {}: panel pixel ({}, {}) is {:#010x}, source \
+                         says {:#010x}{}",
+                        w,
+                        h,
+                        pitch_px,
+                        wc,
+                        x,
+                        y,
+                        got,
+                        want,
+                        if got == 0 {
+                            " -- the copy INVENTED black"
+                        } else if got == kms_emu::UNTOUCHED {
+                            " -- never written, so the panel keeps what it held"
+                        } else {
+                            ""
+                        }
+                    );
+                }
+            }
+        }
+    }
+
     /// The hole Moebius's 27-sep QEMU boot opened. Its klog said, on every frame
     /// of a 65-second run, that not one sampled pixel was black -- AND said on
     /// nearly every one of those same frames that the client was still writing
