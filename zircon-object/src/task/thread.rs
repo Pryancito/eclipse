@@ -904,7 +904,10 @@ impl Task for Thread {
         // forbid. There is nothing to undo, and the threads that WERE suspended
         // still get their resume from the same loop.
         if inner.suspend_count == 0 {
-            warn!("thread {} resumed with no suspend behind it", self.base.id);
+            // `debug!` and not `warn!`: the comment above says this is reached
+            // in ordinary operation, and a warning on an ordinary path is
+            // noise that buries the warnings that mean something.
+            debug!("thread {} resumed with no suspend behind it", self.base.id);
             return;
         }
         inner.suspend_count -= 1;

@@ -52,12 +52,23 @@ impl DebugLog {
         })
     }
 
-    /// Read a log, return the actual read size.
+    /// Read one record into `buf`: its length, or `SHOULD_WAIT` when the log
+    /// holds nothing this reader has not seen.
     ///
     /// A reader that fell behind the records the buffer has since dropped
     /// resumes at the oldest one still kept.
-    pub fn read(&self, buf: &mut [u8]) -> usize {
-        self.read_within(buf, buf.len()).unwrap_or(0)
+    ///
+    /// This used to answer a bare `usize`, `unwrap_or(0)` over
+    /// [`Self::read_within`], so every error came back as the `0` that means
+    /// the log is empty -- and on a buffer shorter than one record it never got
+    /// that far: the copy underneath asserts the buffer is big enough, so the
+    /// error it was hiding was a **kernel panic**.
+    pub fn read(&self, buf: &mut [u8]) -> ZxResult<usize> {
+        let len = buf.len();
+        match self.read_within(buf, len)? {
+            0 => Err(ZxError::SHOULD_WAIT),
+            len => Ok(len),
+        }
     }
 
     /// Read one record into `buf`, provided the whole record fits in `limit`
@@ -71,6 +82,13 @@ impl DebugLog {
     /// good -- and a caller passing a length of zero destroyed a record per
     /// call while being told `SHOULD_WAIT`, that is, that the log was empty.
     pub fn read_within(&self, buf: &mut [u8], limit: usize) -> ZxResult<usize> {
+        // The copy underneath takes the whole record and takes the buffer's
+        // length on trust -- it asserts it, which in the kernel is a panic.
+        // A buffer too small for the largest record is the caller's mistake to
+        // hear about, not the machine's to die of.
+        if buf.len() < DLOG_MAX_LEN {
+            return Err(ZxError::BUFFER_TOO_SMALL);
+        }
         let mut offset = self.read_offset.lock();
         let (next, len) = DLOG.lock().read_at(*offset, buf);
         if len > limit {
@@ -239,7 +257,7 @@ mod tests {
     //! The log is one kernel-wide buffer, so these tests take turns on it
     //! and tag their records with a pid nobody else uses.
     use super::*;
-    use alloc::vec::Vec;
+    use alloc::{vec, vec::Vec};
 
     lazy_static! {
         static ref TURN: Mutex<()> = Mutex::new(());
@@ -250,10 +268,11 @@ mod tests {
     fn next_record(log: &DebugLog, pid: u64) -> Option<(DlogHeader, Vec<u8>)> {
         let mut buf = [0u8; DLOG_MAX_LEN];
         loop {
-            let len = log.read(&mut buf);
-            if len == 0 {
-                return None;
-            }
+            let len = match log.read(&mut buf) {
+                Ok(len) => len,
+                Err(ZxError::SHOULD_WAIT) => return None,
+                Err(err) => panic!("reading the log answered {:?}", err),
+            };
             let header = DlogHeader::from_bytes(buf[..HEADER_SIZE].try_into().unwrap());
             assert_eq!(len, header.wire_size());
             if header.pid == pid {
@@ -261,6 +280,46 @@ mod tests {
                 return Some((header, data));
             }
         }
+    }
+
+    #[test]
+    /// A buffer too small for a record is the caller's mistake, and it used to
+    /// be the machine's death: the copy underneath asserts the buffer is big
+    /// enough, and `read` hid whatever came back with `unwrap_or(0)` -- which
+    /// it never reached, because the assert panics the kernel first. Now it is
+    /// an error, and the record it could not hold stays in the log.
+    fn a_buffer_too_small_for_a_record_is_an_error_and_not_a_panic() {
+        let _turn = TURN.lock();
+        let pid = 0x6c6f_6701;
+        let log = DebugLog::create(0);
+        log.write(Severity::Info, 0, 1, pid, b"un registro entero");
+
+        for len in [0, 1, HEADER_SIZE, DLOG_MAX_LEN - 1] {
+            let mut small = vec![0u8; len];
+            assert_eq!(
+                log.read(&mut small).err(),
+                Some(ZxError::BUFFER_TOO_SMALL),
+                "a {}-byte buffer",
+                len,
+            );
+        }
+
+        // And the record is still there for a reader that brought room.
+        let (header, data) = next_record(&log, pid).expect("the record was kept");
+        assert_eq!(header.pid, pid);
+        assert_eq!(&data, b"un registro entero");
+    }
+
+    #[test]
+    /// An empty log answers `SHOULD_WAIT`, which `read` used to report as the
+    /// same `0` it reported every error with.
+    fn an_exhausted_log_says_so_rather_than_answering_zero() {
+        let _turn = TURN.lock();
+        let log = DebugLog::create(0);
+        let mut buf = [0u8; DLOG_MAX_LEN];
+        // Drain whatever other tests left behind.
+        while log.read(&mut buf).is_ok() {}
+        assert_eq!(log.read(&mut buf).err(), Some(ZxError::SHOULD_WAIT));
     }
 
     /// A one-byte record ends on a multiple of four, not eight, so reading

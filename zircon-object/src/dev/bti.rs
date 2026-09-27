@@ -46,10 +46,16 @@ impl BusTransactionInitiator {
     /// caller of `zx_object_get_info(ZX_INFO_BTI)` holding a quarantine count
     /// larger than the total it is a subset of.
     pub fn get_info(&self) -> BtiInfo {
+        // The IOMMU has nothing to do with `inner`, and asking it anything
+        // while holding a spin lock taken with interrupts off is how a lock
+        // cycle gets built by accident. Ask it first, then take the lock for
+        // the two counts that have to agree.
+        let minimum_contiguity = self.iommu.minimum_contiguity() as u64;
+        let aspace_size = self.iommu.aspace_size() as u64;
         let inner = self.inner.lock();
         BtiInfo {
-            minimum_contiguity: self.iommu.minimum_contiguity() as u64,
-            aspace_size: self.iommu.aspace_size() as u64,
+            minimum_contiguity,
+            aspace_size,
             pmo_count: inner.pmts.len() as u64,
             quarantine_count: Self::quarantined(&inner) as u64,
         }
@@ -132,8 +138,9 @@ impl BusTransactionInitiator {
 
     /// The tokens this initiator holds that nothing else names any more: the
     /// pin outlived every handle to it, which is what quarantine means here.
-    /// Takes the guard rather than the lock so a caller can read it together
-    /// with the total.
+    /// Takes a borrow of the locked state rather than the lock, so a caller
+    /// can read it under the same guard as the total: a quarantine count read
+    /// separately can come back larger than the total it is a subset of.
     fn quarantined(inner: &BtiInner) -> usize {
         inner
             .pmts
