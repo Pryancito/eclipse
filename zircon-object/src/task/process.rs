@@ -485,8 +485,19 @@ impl Process {
                 0
             }
         };
-        inner.futexes.clear();
+        // Take the table out and let it go with `inner` released, for the same
+        // reason as the handle table in `exit`: dropping the last `Arc<Futex>`
+        // drops its waiter queue and its owner, and that runs code this module
+        // does not own -- a `Waker`'s vtable, the oneshot send in
+        // `ExceptionObject::drop`, and a `Thread` whose `proc` field is a
+        // strong `Arc` back to this very process. `clear()` ran all of it under
+        // this lock. No test pins this one: the chain has no acquire of
+        // `self.inner` in it today, so the shape is a hazard rather than a
+        // reproducible wedge, and a test that only checked the table came out
+        // empty would pass with the bug in place.
+        let futexes = core::mem::take(&mut inner.futexes);
         drop(inner);
+        drop(futexes);
 
         // Keep the exited process object around for wait/status, but release
         // userspace mappings as soon as the last thread is gone.
