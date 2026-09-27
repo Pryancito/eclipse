@@ -37,12 +37,12 @@ const EVDEV_INTERRUPT_CHECK_TICK_MS: u64 = 100;
 /// and no test could otherwise reach the interrupted branch at all. Same shape
 /// as `sync::event_bus`'s `wait_interrupted`.
 #[cfg(not(test))]
-fn wait_interrupted() -> bool {
+pub(super) fn wait_interrupted() -> bool {
     crate::process::check_signals().is_err()
 }
 
 #[cfg(test)]
-fn wait_interrupted() -> bool {
+pub(super) fn wait_interrupted() -> bool {
     self::test_interrupt::pending()
 }
 
