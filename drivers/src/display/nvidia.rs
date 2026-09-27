@@ -19432,6 +19432,62 @@ mod nouveau_bookkeeping_tests {
         assert_eq!(FAKE_RM.lock().bad, 0);
     }
 
+    /// Mesa's `SYNC_FD` export (`vkGetSemaphoreFdKHR`, `eglDupNativeFenceFDANDROID`
+    /// through zink: wlroots' GLES renderer hands that fd to the
+    /// `linux-drm-syncobj-v1` release point) resets the binary semaphore in
+    /// the same call, while the ring is still on its way to the fence the
+    /// EXEC attached. The file has to reach on that fence regardless: the
+    /// consumer's EXEC waits on an import of it, acquires that very fence,
+    /// and the reset semaphore stays at 0 until its owner signals it again.
+    #[test]
+    fn a_sync_file_exported_from_a_semaphore_an_exec_signaled_survives_its_reset() {
+        let _g = LOCK.lock();
+        let _live = LiveBytes::hold();
+        let gpu = gpu_rm_fast();
+        FAKE_RM.lock().peer = true;
+        let ch_a = client_with_pushbuf(&gpu, A);
+        let ch_b = client_with_pushbuf(&gpu, B);
+        let sem = syncobj::create(false);
+        assert_eq!(
+            exec(&gpu, A, ch_a, &[push(PUSH_VA, 16)], &[], &[sync(sem)]),
+            Ok(0)
+        );
+        let fd = syncobj::export_fence(sem).expect("live");
+        assert!(syncobj::reset(sem), "Mesa's copy transference");
+        assert_eq!(syncobj::query(sem), Some(0));
+        // The consumer imports the file and submits behind it: B acquires
+        // A's fence on its ring, no CPU wait, no EIO.
+        let acquire = syncobj::create(false);
+        assert!(syncobj::import_snapshot(acquire, fd, 1));
+        let out = syncobj::create(false);
+        // (1 ms per clock read: a CPU wait, which there must not be, ends
+        // in EIO after 10 s virtual instead of parking the test.)
+        test_clock::set_auto_advance(1_000);
+        let submitted = exec(
+            &gpu,
+            B,
+            ch_b,
+            &[push(PUSH_VA, 16)],
+            &[sync(acquire)],
+            &[sync(out)],
+        );
+        test_clock::set_auto_advance(0);
+        assert_eq!(submitted, Ok(0), "no CPU wait: the fence is A's, in flight");
+        assert_eq!(userd(&chan(2)), (0, 3), "acquire, push and fence");
+        assert_eq!(peer_maps_made(), 1, "A's fence, mapped for B's ACQUIRE");
+        assert!(run_gpu(2).is_empty(), "B stalls behind A");
+        assert_eq!(run_gpu(1).len(), 2, "A lands");
+        assert_eq!(syncobj::query(fd), Some(1), "the file reaches on A's fence");
+        assert_eq!(syncobj::query(acquire), Some(1));
+        assert_eq!(syncobj::query(sem), Some(0), "the reset semaphore does not");
+        assert_eq!(run_gpu(2).len(), 3);
+        assert_eq!(syncobj::query(out), Some(1));
+        for h in [sem, fd, acquire, out] {
+            syncobj::destroy(h);
+        }
+        assert_eq!(FAKE_RM.lock().bad, 0);
+    }
+
     // ---- The fence-timeout upcall -----------------------------------------
     //
     // A fence the GPU never writes is `syncobj`'s to give up on: after
