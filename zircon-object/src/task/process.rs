@@ -650,16 +650,42 @@ impl Process {
         self.inner.lock().remove_handle(handle_value)
     }
 
-    /// Remove all handles from the process.
+    /// Remove all the named handles from the process, answering them, or one of
+    /// the errors if any of the values named nothing.
     ///
-    /// If one or more error happens, return one of them.
-    /// All handles are discarded on success or failure.
+    /// Every value is tried whatever the ones before it did, because the callers
+    /// -- `install_handle_pair` and the handles `zx_channel_read` had installed
+    /// -- are taking back handles the caller will never learn the values of: one
+    /// left in the table can never be named again, so it holds its object alive
+    /// for as long as the process lives. `collect()` into a `ZxResult<Vec<_>>`
+    /// stopped at the first error and left the rest installed, which is the
+    /// opposite of what the doc comment here promised.
+    ///
+    /// And the handles come out of the lock before they are dropped. Dropping
+    /// one runs the object's own `Drop`, which is code this module knows nothing
+    /// about: `SuspendToken` resumes its task, `EventPair` signals its peer --
+    /// and `signal_change` runs the observers' callbacks under its own lock.
+    /// Holding `inner` across that is how a re-entrant acquire of a spin lock
+    /// taken with interrupts off happens, and that is a CPU that never comes
+    /// back. `Drop` reaching back into this same table (a handle closed on the
+    /// way out) is the shortest version of it.
     pub fn remove_handles(&self, handle_values: &[HandleValue]) -> ZxResult<Vec<Handle>> {
-        let mut inner = self.inner.lock();
-        handle_values
-            .iter()
-            .map(|h| inner.remove_handle(*h))
-            .collect()
+        let mut removed = Vec::with_capacity(handle_values.len());
+        let mut error = None;
+        {
+            let mut inner = self.inner.lock();
+            for value in handle_values {
+                match inner.remove_handle(*value) {
+                    Ok(handle) => removed.push(handle),
+                    Err(err) => error = error.or(Some(err)),
+                }
+            }
+        }
+        match error {
+            // `removed` is dropped here, on the way out, with the lock let go.
+            Some(err) => Err(err),
+            None => Ok(removed),
+        }
     }
 
     /// Remove a handle referring to a kernel object of the given type from the process.
@@ -1003,6 +1029,92 @@ mod tests {
     use crate::object::KernelObject;
     use crate::signal::Event;
     use crate::task::*;
+    use alloc::sync::Weak;
+
+    /// An object whose `Drop` closes another handle of the same process, which
+    /// is what any number of real `Drop`s amount to: code that reaches back
+    /// into the table, or into a lock some other path takes with `inner` held.
+    struct DropProbe {
+        base: KObjectBase,
+        proc: Weak<Process>,
+        also_close: HandleValue,
+    }
+    impl_kobject!(DropProbe);
+
+    impl Drop for DropProbe {
+        fn drop(&mut self) {
+            if let Some(proc) = self.proc.upgrade() {
+                let _ = proc.remove_handle(self.also_close);
+            }
+        }
+    }
+
+    /// `remove_handles` is how `install_handle_pair` and `zx_channel_read` take
+    /// back handles whose values the caller never got, so a value left in the
+    /// table can never be named again. It used to `collect()` into a
+    /// `ZxResult<Vec<_>>`, which stops at the first error: everything after a
+    /// value that named nothing stayed installed.
+    #[test]
+    fn a_value_that_names_nothing_does_not_leave_the_rest_installed() {
+        let root_job = Job::root();
+        let proc = Process::create(&root_job, "proc").expect("failed to create process");
+        let first = proc.add_handle(Handle::new(Event::new(), Rights::DEFAULT_EVENT));
+        let last = proc.add_handle(Handle::new(Event::new(), Rights::DEFAULT_EVENT));
+        let missing = first.max(last) + 1;
+
+        assert_eq!(
+            proc.remove_handles(&[first, missing, last]).err(),
+            Some(ZxError::BAD_HANDLE),
+        );
+        for value in [first, last] {
+            assert_eq!(
+                proc.remove_handle(value).err(),
+                Some(ZxError::BAD_HANDLE),
+                "handle {} was still installed after the whole set was taken back",
+                value,
+            );
+        }
+    }
+
+    /// And the handles it takes out are dropped with the table unlocked. They
+    /// used to be dropped inside the lock -- on the error path, where the
+    /// collected ones are thrown away -- so an object whose `Drop` comes back to
+    /// this process asked for `inner` from inside the critical section that
+    /// already held it. These are spin locks taken with interrupts off and they
+    /// do not nest.
+    ///
+    /// The watchdog is the point: before the fix this test **hung**, and a hang
+    /// says nothing.
+    #[test]
+    fn the_handles_taken_back_are_dropped_with_the_table_unlocked() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let root_job = Job::root();
+        let proc = Process::create(&root_job, "proc").expect("failed to create process");
+        let victim = proc.add_handle(Handle::new(Event::new(), Rights::DEFAULT_EVENT));
+        let probe = Arc::new(DropProbe {
+            base: KObjectBase::default(),
+            proc: Arc::downgrade(&proc),
+            also_close: victim,
+        });
+        let probe_value = proc.add_handle(Handle::new(probe, Rights::DEFAULT_EVENT));
+        let missing = probe_value.max(victim) + 1;
+
+        let (done, finished) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            // The error path: the probe's handle is taken out and thrown away.
+            let err = proc.remove_handles(&[probe_value, missing]).err();
+            let _ = done.send((err, proc));
+        });
+        let (err, proc) = finished
+            .recv_timeout(Duration::from_secs(300))
+            .expect("closing a handle whose Drop closes another wedged the process table");
+        worker.join().unwrap();
+        assert_eq!(err, Some(ZxError::BAD_HANDLE));
+        // And the `Drop` really did run and really did reach the table.
+        assert_eq!(proc.remove_handle(victim).err(), Some(ZxError::BAD_HANDLE));
+    }
 
     #[test]
     fn create() {
