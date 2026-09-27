@@ -8538,18 +8538,16 @@ mod kms_scanout_tests {
         /// on top of it.
         fn fill(&mut self, px: u32) {
             self.scene.clear();
-            for _ in 0..self.w * self.h {
-                self.scene.push(px);
-            }
+            self.scene.resize((self.w * self.h) as usize, px);
             self.cursor = None;
         }
 
         /// The compositor put frame `n` up, whole.
         fn present(&mut self, n: u32) {
-            self.scene.clear();
+            self.scene.resize((self.w * self.h) as usize, 0);
             for y in 0..self.h {
                 for x in 0..self.w {
-                    self.scene.push(desktop_px(n, x, y));
+                    self.scene[(y * self.w + x) as usize] = desktop_px(n, x, y);
                 }
             }
         }
@@ -9003,24 +9001,34 @@ mod kms_scanout_tests {
     fn black_copied_mid_frame_does_not_survive_the_next_present() {
         for skip in [false, true] {
             const W: u32 = 120;
-            const H: u32 = 160;
-            let screen = kms_emu::attach_with(W, H, 128, true);
+            // Tall enough that the copy takes two bands, derived from the real
+            // band size: the boundary between two bands is the only place a
+            // test can get INSIDE a copy, so a height that hardcoded it would
+            // stop testing anything the day the constant moves -- and the
+            // assertion further down that the race landed is what would say so.
+            let chunk = drm::blit_chunk_rows_for_test();
+            let h = chunk + chunk / 4;
+            // The box the client blacks out: inside the rows the SECOND band
+            // copies, so the kernel reaches it after the hook has run.
+            let (by, bh) = (chunk + 4, chunk / 4 - 8);
+            let (bx, bw) = (40u32, 64u32);
+            let screen = kms_emu::attach_with(W, h, 128, true);
             // The band-skipping present is what Moebius has been booting with,
             // and it is the one mechanism that could decide a band already
             // matches and never copy it again. Both ways, same assertion.
             drm::set_present_skip_enabled(skip);
             let c = Client::open(0);
-            let buf = c.create_dumb(W, H);
+            let buf = c.create_dumb(W, h);
             paint(&buf, |x, y| desktop_px(0, x, y));
             let fb = c.addfb2(&buf);
-            set_crtc(&c, drm::SYNTH_CRTC_ID, fb, W, H);
+            set_crtc(&c, drm::SYNTH_CRTC_ID, fb, W, h);
             drain_completions(&c);
 
-            // The copy goes in chunks of `BLIT_CHUNK_ROWS` = 128 rows, asking the
-            // output for its framebuffer once per chunk. Clearing rows 128..160
-            // on the FIRST ask is a tile that goes black after the source was
-            // sampled and before the kernel reaches it: the copy carries it and
-            // neither read of the probe sees anything else.
+            // The copy goes band by band, asking the output for its framebuffer
+            // once per band. Clearing a box of the second band's rows on the
+            // FIRST ask is a tile that goes black after the source was sampled
+            // and before the kernel reaches it: the copy carries it and neither
+            // read of the probe sees anything else.
             let stride = (buf.pitch / 4) as usize;
             let px = map_dumb(&buf);
             // The hook wants `Send`, and a raw pointer is not, so the address
@@ -9035,11 +9043,11 @@ mod kms_scanout_tests {
                 // inside the present, on this thread, while nothing else writes
                 // those rows.
                 let p = unsafe {
-                    core::slice::from_raw_parts_mut(base as *mut u32, stride * H as usize)
+                    core::slice::from_raw_parts_mut(base as *mut u32, stride * h as usize)
                 };
-                for y in 132..156usize {
-                    for x in 40..104usize {
-                        p[y * stride + x] = 0x0000_0000;
+                for y in by..by + bh {
+                    for x in bx..bx + bw {
+                        p[y as usize * stride + x as usize] = 0x0000_0000;
                     }
                 }
             });
@@ -9050,7 +9058,7 @@ mod kms_scanout_tests {
 
             // The race really happened, or the rest of this test proves nothing.
             assert_eq!(
-                screen.pixel(60, 140),
+                screen.pixel(bx + bw / 2, by + bh / 2),
                 0x0000_0000,
                 "skip={}: the hook did not land inside the copy, so this test is \
                  not about anything",
@@ -9063,7 +9071,7 @@ mod kms_scanout_tests {
             c.page_flip(drm::SYNTH_CRTC_ID, fb, 0xF00D).expect("flip");
             drain_completions(&c);
 
-            for y in 0..H {
+            for y in 0..h {
                 for x in 0..W {
                     let got = screen.pixel(x, y);
                     assert_eq!(

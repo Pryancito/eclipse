@@ -2881,6 +2881,15 @@ pub fn crtc_fb() -> u32 {
 /// under a timer tick.
 const BLIT_CHUNK_ROWS: u32 = 128;
 
+/// Rows per blit band, for a test that has to put a write INSIDE a copy: the
+/// band boundary is the only place a test can get between two chunks, so a test
+/// that hardcoded 128 would quietly stop testing anything the day this constant
+/// moves.
+#[cfg(test)]
+pub(crate) fn blit_chunk_rows_for_test() -> u32 {
+    BLIT_CHUNK_ROWS
+}
+
 /// Blit `pixels` (row-major, `src_stride` u32s per row, already offset so
 /// `pixels[0]` is the rectangle's top-left) into `display` at
 /// `(dst_x, dst_y)`, `width`x`height`, in horizontal bands with interrupts
