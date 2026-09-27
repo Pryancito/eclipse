@@ -74,17 +74,22 @@ fn arena() -> &'static Mutex<Arena> {
     })
 }
 
-/// Hand out `bytes` of arena, poisoned, and return its *physical* address.
+/// Hand out `bytes` of arena, poisoned, and return its *physical* address, or
+/// zero when the arena has no room.
+///
+/// Zero, not a panic: the only caller that matters is `virtio_dma_alloc`, an
+/// `extern "C"` function, and **a panic there is a non-unwinding panic that
+/// aborts the process**. The suite then dies with SIGABRT and names no test,
+/// which is the one outcome a test harness must never produce. Zero is also
+/// what the kernel's own allocator answers when it cannot find the frames, so
+/// a driver asking for more than there is takes the same path here as there.
 fn bump(bytes: usize) -> usize {
     let bytes = (bytes + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
     let mut arena = arena().lock().unwrap();
     let offset = arena.cursor;
-    assert!(
-        offset + bytes <= arena.len,
-        "the test arena is out of room: asked for {} bytes with {} left",
-        bytes,
-        arena.len - offset
-    );
+    if bytes == 0 || offset.saturating_add(bytes) > arena.len {
+        return 0;
+    }
     arena.cursor += bytes;
     unsafe { core::ptr::write_bytes((arena.base + offset) as *mut u8, POISON, bytes) };
     FAKE_PHYS_BASE + offset
@@ -293,7 +298,12 @@ impl Ring {
 /// device's window outlives everything, and a test that owns one would have to
 /// prove otherwise to the borrow checker for no gain.
 pub(crate) fn fake_header(device_id: u32, max_queue_size: u32) -> &'static mut VirtIOHeader {
-    let at = to_virt(bump(0x200));
+    let paddr = bump(0x200);
+    assert_ne!(
+        paddr, 0,
+        "the test arena is out of room for a device header"
+    );
+    let at = to_virt(paddr);
     // Zeroed, unlike a DMA block: a device's registers read as whatever the
     // device decides, and `begin_init` is what sets the ones that matter.
     unsafe { core::ptr::write_bytes(at as *mut u8, 0, 0x200) };
