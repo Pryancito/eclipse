@@ -8721,8 +8721,11 @@ mod kms_scanout_tests {
         /// buffer it currently holds: a buffer being drawn into is not a frame
         /// anybody has asked for.
         scene: alloc::vec::Vec<u32>,
-        /// Where the pointer is drawn and how big it is.
-        cursor: Option<(u32, u32, u32, u32)>,
+        /// Where the pointer is drawn and how big it is. The position is signed
+        /// because a pointer really does hang off the left and top edges: the
+        /// kernel clips it, and a model that could not express that would never
+        /// ask what the clipping does.
+        cursor: Option<(i32, i32, u32, u32)>,
         /// The pointer image, `bmp_w` pixels per row, alpha `0xff` or `0x00`
         /// only -- a partly transparent pointer would need the blend written
         /// out twice, and what these tests are about is what shows THROUGH it.
@@ -8752,6 +8755,18 @@ mod kms_scanout_tests {
             self.cursor = None;
         }
 
+        /// A damage box of frame `n` went up and the rest of the panel kept the
+        /// frame that was already there -- the panel holding two frames at once,
+        /// on purpose, which is legitimate only while the box really is all that
+        /// changed.
+        fn present_box(&mut self, n: u32, x: u32, y: u32, w: u32, h: u32) {
+            for py in y..(y + h).min(self.h) {
+                for px in x..(x + w).min(self.w) {
+                    self.scene[(py * self.w + px) as usize] = desktop_px(n, px, py);
+                }
+            }
+        }
+
         /// The compositor put frame `n` up, whole.
         fn present(&mut self, n: u32) {
             self.scene.resize((self.w * self.h) as usize, 0);
@@ -8764,8 +8779,9 @@ mod kms_scanout_tests {
 
         fn want(&self, x: u32, y: u32) -> u32 {
             if let Some((cx, cy, cw, ch)) = self.cursor {
-                if x >= cx && x < cx + cw && y >= cy && y < cy + ch {
-                    let s = self.bmp[((y - cy) * self.bmp_w + (x - cx)) as usize];
+                let (dx, dy) = (x as i64 - cx as i64, y as i64 - cy as i64);
+                if dx >= 0 && dx < cw as i64 && dy >= 0 && dy < ch as i64 {
+                    let s = self.bmp[(dy as u32 * self.bmp_w + dx as u32) as usize];
                     if s >> 24 != 0 {
                         return s | 0xFF00_0000;
                     }
@@ -8814,6 +8830,89 @@ mod kms_scanout_tests {
             }
         }
         v
+    }
+
+    /// A damage box must not let the pointer paste the rest of the client's
+    /// buffer onto the screen.
+    ///
+    /// The pointer is composited on top of every present, over a window widened
+    /// to whole write-combining lines, so its window routinely reaches outside a
+    /// damage box. Inside the box the client's buffer and the panel hold the same
+    /// pixels. Outside it they do not: the panel holds the frame that was there
+    /// before, and the buffer holds whatever the client has in it now -- for a
+    /// compositor that redraws only its damage an older frame, and for one that
+    /// has begun the next frame transparent black. Taking the buffer's pixels
+    /// there puts a rectangle the client never declared on the screen, right
+    /// where the pointer is.
+    ///
+    /// Same fault as the one `CursorUnder` is named for, reached through the
+    /// present instead of through a pointer move, and found by the damage-box
+    /// steps of the soak below rather than by anybody thinking of it.
+    #[test]
+    fn a_damage_box_must_not_let_the_pointer_paste_the_rest_of_the_clients_buffer() {
+        const W: u32 = 120;
+        const H: u32 = 96;
+        const CUR: u32 = 16;
+        let screen = kms_emu::attach_with(W, H, 128, true);
+        let c = Client::open(0);
+        let buf = c.create_dumb(W, H);
+        paint(&buf, |x, y| desktop_px(1, x, y));
+        let fb = c.addfb2(&buf);
+        set_crtc(&c, drm::SYNTH_CRTC_ID, fb, W, H);
+        drain_completions(&c);
+
+        let bmp = pointer_bitmap(CUR, CUR);
+        let cur = c.create_dumb(CUR, CUR);
+        {
+            let px = map_dumb(&cur);
+            for (i, v) in bmp.iter().enumerate() {
+                px[i] = *v;
+            }
+        }
+        // Near the top, far above the damage box: the pointer's window lies
+        // wholly outside what the present is about to copy.
+        set_cursor(&c, drm::SYNTH_CRTC_ID, cur.handle, CUR, CUR, 38, 4);
+        let mut panel = Panel::new(W, H, 1, bmp.clone(), CUR);
+        panel.cursor = Some((38, 4, CUR, CUR));
+        panel.check(&screen, "frame 1 with the pointer on it");
+
+        // The client redraws ONE box and starts the next frame everywhere else,
+        // which is a renderer clearing to transparent black. Then it declares
+        // just the box.
+        let (bx, by, bw, bh) = (32u32, 48u32, 64u32, 32u32);
+        paint(&buf, |x, y| {
+            if (bx..bx + bw).contains(&x) && (by..by + bh).contains(&y) {
+                desktop_px(2, x, y)
+            } else {
+                0x0000_0000
+            }
+        });
+        dirtyfb(
+            &c,
+            fb,
+            &[clip(
+                bx as u16,
+                by as u16,
+                (bx + bw) as u16,
+                (by + bh) as u16,
+            )],
+        );
+        drain_completions(&c);
+
+        panel.present_box(2, bx, by, bw, bh);
+        panel.check(&screen, "the damage box went up and the pointer did not");
+        // And it is the save that did it, not a lucky agreement between two
+        // sources: every pixel of this window came from outside the box.
+        assert!(
+            drm::cursor_px_from_save_for_test() > 0,
+            "the pointer composited without reading the save, so this test \
+             passed for some other reason"
+        );
+
+        set_cursor(&c, drm::SYNTH_CRTC_ID, 0, 0, 0, 0, 0);
+        c.rmfb(fb).expect("RMFB");
+        c.destroy_dumb(cur.handle).expect("DESTROY_DUMB cursor");
+        c.destroy_dumb(buf.handle).expect("DESTROY_DUMB");
     }
 
     /// Three hundred steps of the desktop, in a deterministic order nobody chose
@@ -8879,12 +8978,19 @@ mod kms_scanout_tests {
         let mut model = Panel::new(W, H, frame, bmp.clone(), CUR);
         model.check(&screen, "the first frame");
 
-        let mut pos = (8u32, 8u32);
+        // Which framebuffer the panel is holding entirely. A damage box is only
+        // honoured while the panel already holds that framebuffer: otherwise the
+        // rest of the panel belongs to a different frame and honouring the box
+        // would leave two frames on screen at once, which is what put a menu on
+        // the screen twice once already.
+        let mut panel_fb = fbs[slot];
+        let mut pos = (8i32, 8i32);
         let mut shown = false;
         // The most bands any one present left alone. Asserted below, because a
         // soak that never took the skip would say nothing about it -- the one
         // lesson of the probe that measured in the wrong place.
         let mut most_skipped = 0usize;
+        let mut log: alloc::vec::Vec<alloc::string::String> = alloc::vec::Vec::new();
         // A 32-bit LCG: the sequence is fixed, so a failure here reproduces on
         // any machine, and the log below names the step.
         let mut seed: u32 = seed_in;
@@ -8894,7 +9000,7 @@ mod kms_scanout_tests {
         };
         for step in 0..300u32 {
             let what;
-            match rnd(12) {
+            match rnd(13) {
                 0..=3 => {
                     // The compositor renders a finished frame into the other
                     // buffer of its chain and puts it up, whole, as labwc does.
@@ -8906,6 +9012,7 @@ mod kms_scanout_tests {
                         .expect("flip");
                     drain_completions(&c);
                     model.present(frame);
+                    panel_fb = fbs[slot];
                     // A full present composites the pointer at wherever it is
                     // now, so that is what is on the panel.
                     model.cursor = if shown {
@@ -8916,8 +9023,16 @@ mod kms_scanout_tests {
                     what = alloc::format!("step {}: presented frame {}", step, frame);
                 }
                 4..=6 => {
-                    pos = (rnd(W - CUR + 1), rnd(H - CUR + 1));
-                    move_cursor(&c, drm::SYNTH_CRTC_ID, pos.0 as i32, pos.1 as i32);
+                    // Anywhere from wholly off the left or top edge to wholly
+                    // past the right or bottom one. The kernel clips both the
+                    // window it draws and the window it reads back, and those
+                    // two have to clip the same way or the pointer leaves its
+                    // widened margins on the screen for good.
+                    pos = (
+                        rnd(W + 2 * CUR) as i32 - CUR as i32,
+                        rnd(H + 2 * CUR) as i32 - CUR as i32,
+                    );
+                    move_cursor(&c, drm::SYNTH_CRTC_ID, pos.0, pos.1);
                     if shown {
                         model.cursor = Some((pos.0, pos.1, CUR, CUR));
                     }
@@ -8963,6 +9078,7 @@ mod kms_scanout_tests {
                     // blank has painted the panel one colour since, which is
                     // exactly what a re-present has to put right.
                     model.present(frame);
+                    panel_fb = fbs[slot];
                     model.cursor = if shown {
                         Some((pos.0, pos.1, CUR, CUR))
                     } else {
@@ -8971,24 +9087,75 @@ mod kms_scanout_tests {
                     most_skipped = most_skipped.max(drm::skipped_bands_for_test());
                     what = alloc::format!("step {}: presented frame {} AGAIN", step, frame);
                 }
-                9 => {
+                12 => {
                     shown = !shown;
                     if shown {
-                        set_cursor(
-                            &c,
-                            drm::SYNTH_CRTC_ID,
-                            cur.handle,
-                            CUR,
-                            CUR,
-                            pos.0 as i32,
-                            pos.1 as i32,
-                        );
+                        set_cursor(&c, drm::SYNTH_CRTC_ID, cur.handle, CUR, CUR, pos.0, pos.1);
                         model.cursor = Some((pos.0, pos.1, CUR, CUR));
                     } else {
                         set_cursor(&c, drm::SYNTH_CRTC_ID, 0, 0, 0, 0, 0);
                         model.cursor = None;
                     }
                     what = alloc::format!("step {}: pointer shown={}", step, shown);
+                }
+                9 => {
+                    // A client with damage tracking: it redraws a box and asks
+                    // for that box only. Sometimes into the buffer the panel is
+                    // already holding, where the box may be honoured, and
+                    // sometimes into the other one, where honouring it would put
+                    // two frames on the screen at once.
+                    frame += 1;
+                    if rnd(2) == 0 {
+                        slot ^= 1;
+                    }
+                    let f = frame;
+                    paint(&bufs[slot], |x, y| desktop_px(f, x, y));
+                    // x aligned to 16 so the write-combining widening of the box
+                    // is a no-op: the model then says what the SCREEN must show
+                    // without having to know how the kernel widens anything.
+                    let bx = rnd(W / 16) * 16;
+                    let bw = (rnd(W / 16 - bx / 16) + 1) * 16;
+                    let by = rnd(H - 1);
+                    let bh = rnd(H - by) + 1;
+                    dirtyfb(
+                        &c,
+                        fbs[slot],
+                        &[clip(
+                            bx as u16,
+                            by as u16,
+                            (bx + bw) as u16,
+                            (by + bh) as u16,
+                        )],
+                    );
+                    drain_completions(&c);
+                    if fbs[slot] == panel_fb {
+                        model.present_box(frame, bx, by, bw, bh);
+                        what = alloc::format!(
+                            "step {}: frame {} as a damage box {}x{}+{}+{}",
+                            step,
+                            frame,
+                            bw,
+                            bh,
+                            bx,
+                            by
+                        );
+                    } else {
+                        // The panel was holding another framebuffer, so the box
+                        // cannot stand alone and the whole frame has to go up.
+                        model.present(frame);
+                        what = alloc::format!(
+                            "step {}: frame {} as a damage box on a framebuffer the \
+                             panel was not holding, so the whole frame",
+                            step,
+                            frame
+                        );
+                    }
+                    panel_fb = fbs[slot];
+                    model.cursor = if shown {
+                        Some((pos.0, pos.1, CUR, CUR))
+                    } else {
+                        None
+                    };
                 }
                 10 => {
                     // DPMS off and on again, with the frame that follows it --
@@ -9003,6 +9170,7 @@ mod kms_scanout_tests {
                         .expect("flip");
                     drain_completions(&c);
                     model.present(frame);
+                    panel_fb = fbs[slot];
                     model.cursor = if shown {
                         Some((pos.0, pos.1, CUR, CUR))
                     } else {
@@ -9019,18 +9187,27 @@ mod kms_scanout_tests {
                     // there is a rectangle of the old desktop on a black screen.
                     drm::set_crtc_blanked(true);
                     drm::set_crtc_blanked(false);
+                    // Black pixels are not a framebuffer's pixels, so the panel
+                    // holds nothing now and the next damage box cannot be
+                    // honoured on its own.
+                    panel_fb = 0;
                     model.fill(screen.pixel(0, 0));
                     what = alloc::format!("step {}: blanked and unblanked, no frame", step);
                 }
             }
+            log.push(what.clone());
+            if log.len() > 8 {
+                log.remove(0);
+            }
             model.check(
                 &screen,
                 &alloc::format!(
-                    "{} [skip={} repair={} seed={:#x}]",
+                    "{} [skip={} repair={} seed={:#x}] HISTORY {:?}",
                     what,
                     skip,
                     repair,
-                    seed_in
+                    seed_in,
+                    log
                 ),
             );
         }

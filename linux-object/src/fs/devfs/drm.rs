@@ -4192,8 +4192,23 @@ pub fn scanout_region_checked(
         // way (see its `(fw, fh)`); this call site did not, even though the
         // cache invalidate right above it already used the clipped pair.
         blit_cursor_patch(
-            &*display, pixels, src_stride, fb_width, fb_height, cx, cy, cw, ch, cx, cy, cw, ch,
+            &*display,
+            pixels,
+            src_stride,
+            fb_width,
+            fb_height,
+            cx,
+            cy,
+            cw,
+            ch,
+            cx,
+            cy,
+            cw,
+            ch,
             &bmp,
+            // Only what this present copied is the buffer's; a damage box leaves
+            // the rest of the panel on an older frame.
+            Some((blit_x, blit_y, blit_w, blit_h)),
         );
         // The pointer is now ON the panel in those rows, which is not what the
         // frame's pixels say, so the bands it covers must be copied again next
@@ -4525,6 +4540,9 @@ fn composite_cursor_after_driver_flip(fb_id: u32) -> bool {
     }
     blit_cursor_patch(
         &*display, pixels, src_stride, fw, fh, nx, ny, nw, nh, nx, ny, nw, nh, &bmp,
+        // The driver is scanning out the client's own surface, so the buffer IS
+        // the panel everywhere and there is nothing the save could improve on.
+        None,
     );
     true
 }
@@ -4783,8 +4801,13 @@ pub fn repaint_for_cursor() {
             let (ux, uy, uw, uh) = union_i32(ox, oy, ow, oh, *nx, *ny, *nw, *nh);
             if rects_overlap(ox, oy, ow, oh, *nx, *ny, *nw, *nh) {
                 sync_rect(ux, uy, uw, uh);
+                // `None`: this is the fallback for a panel that cannot be read
+                // back, or the `drm.cursor_from_client` hatch. The client's
+                // buffer is all there is to compose over -- which is the defect
+                // [`repaint_cursor_from_panel`] exists to avoid.
                 blit_cursor_patch(
                     &*display, pixels, src_stride, fw, fh, ux, uy, uw, uh, *nx, *ny, *nw, *nh, bmp,
+                    None,
                 );
             } else {
                 sync_rect(ox, oy, ow, oh);
@@ -4792,7 +4815,7 @@ pub fn repaint_for_cursor() {
                 sync_rect(*nx, *ny, *nw, *nh);
                 blit_cursor_patch(
                     &*display, pixels, src_stride, fw, fh, *nx, *ny, *nw, *nh, *nx, *ny, *nw, *nh,
-                    bmp,
+                    bmp, None,
                 );
             }
         }
@@ -4804,6 +4827,7 @@ pub fn repaint_for_cursor() {
             sync_rect(*nx, *ny, *nw, *nh);
             blit_cursor_patch(
                 &*display, pixels, src_stride, fw, fh, *nx, *ny, *nw, *nh, *nx, *ny, *nw, *nh, bmp,
+                None,
             );
         }
         (None, None) => {}
@@ -4863,6 +4887,7 @@ fn blit_cursor_patch(
     cw: u32,
     ch: u32,
     bmp: &[u32],
+    copied: Option<(u32, u32, u32, u32)>,
 ) {
     if src_stride == 0 || pw == 0 || ph == 0 {
         return;
@@ -4914,6 +4939,23 @@ fn blit_cursor_patch(
         forget_cursor_under();
         return;
     }
+    // Outside the rectangle this present copied, the client's buffer is not the
+    // panel: put those pixels back from the save. See
+    // [`patch_outside_copy_from_save`] -- without this the pointer writes a
+    // rectangle of a frame the client never declared.
+    let from_save = match copied {
+        Some(rect) => patch_outside_copy_from_save(
+            patch,
+            (x0 as u32, y0 as u32, tw, rows),
+            (cx, cy, cw, ch),
+            rect,
+        ),
+        None => 0,
+    };
+    #[cfg(test)]
+    CURSOR_PX_FROM_SAVE.store(from_save, Ordering::Relaxed);
+    #[cfg(not(test))]
+    let _ = from_save;
     // Save what the pointer is about to cover BEFORE blending it in, so the next
     // move can put it back instead of asking the client's framebuffer what used
     // to be there. See [`CursorUnder`].
@@ -4995,6 +5037,93 @@ fn blend_cursor_into(
 
 /// Remember `px` as the panel pixels the pointer at `cursor` is covering. See
 /// [`CursorUnder`].
+/// Put back, from what the pointer was saved over, the part of `patch` that
+/// lies OUTSIDE the rectangle a present has just copied to the panel.
+///
+/// The pointer is composited on top of a present, and it composites over a
+/// window widened to whole write-combining lines -- so its window routinely
+/// reaches past a damage box. Inside the box, the client's buffer and the panel
+/// hold the same pixels and reading the buffer is free and right. OUTSIDE it
+/// they do not: the panel holds the frame that was there before, and the buffer
+/// holds whatever the client has in it now, which for a compositor that redraws
+/// only its damage is an OLDER frame and for one that has begun the next frame
+/// is transparent black. Taking the buffer's pixels there writes onto the screen
+/// a rectangle of a frame the client never declared -- the same defect
+/// [`CursorUnder`] documents on the pointer-move side, reached through the
+/// present instead.
+///
+/// The save is the right source because it is the panel's own pixels from before
+/// the pointer went on top of them, taken by the blit that drew it, and outside
+/// the box nothing has touched them since. No aperture read: both sources are
+/// sysmem.
+///
+/// Refuses unless the save describes EXACTLY this window and this cursor, and
+/// then the caller keeps the pixels it already has -- no worse than before this
+/// existed. Returns how many pixels it replaced, so a test can tell "the save
+/// was used" from "the save happened to agree".
+///
+/// Found by the damage-box steps of
+/// `three_hundred_steps_of_desktop_never_leave_anything_but_the_frame_and_the_pointer`.
+fn patch_outside_copy_from_save(
+    patch: &mut [u32],
+    window: (u32, u32, usize, usize),
+    cursor: (i32, i32, u32, u32),
+    copied: (u32, u32, u32, u32),
+) -> usize {
+    let (wx, wy, tw, rows) = window;
+    if tw == 0 || rows == 0 || patch.len() < tw * rows {
+        return 0;
+    }
+    let u = CURSOR_UNDER.lock();
+    // `u.rect` is what decides: it is the window the save was taken over, and
+    // the save's pixels are that window's background from before any pointer
+    // went on top of it, so a save whose window is this one is the right source
+    // wherever this present did not copy.
+    //
+    // The `for_cursor` half is a second line of defence, and dropping it is a
+    // mutation nothing here can kill -- said out loud so the next person does
+    // not go hunting for the test. Two pointer positions inside the same
+    // write-combining line share a window, and the background of that window is
+    // the same pixels for both, so the two checks agree on every case these
+    // tests can build. It stays because `u.rect` alone would also accept a save
+    // whose window still matches after something else repainted the panel, and
+    // the price of keeping it is one comparison.
+    if u.rect != Some((wx, wy, tw as u32, rows as u32)) || u.for_cursor != Some(cursor) {
+        return 0;
+    }
+    if u.px.len() < tw * rows {
+        return 0;
+    }
+    let (cx0, cy0, cw0, ch0) = copied;
+    let (cx1, cy1) = (cx0.saturating_add(cw0), cy0.saturating_add(ch0));
+    let mut n = 0;
+    for r in 0..rows {
+        let y = wy + r as u32;
+        let row_outside = y < cy0 || y >= cy1;
+        for i in 0..tw {
+            let x = wx + i as u32;
+            if row_outside || x < cx0 || x >= cx1 {
+                patch[r * tw + i] = u.px[r * tw + i];
+                n += 1;
+            }
+        }
+    }
+    n
+}
+
+/// Pixels the most recent cursor composite took from the save instead of from
+/// the client's framebuffer, so a test can assert the source and not just the
+/// result.
+#[cfg(test)]
+static CURSOR_PX_FROM_SAVE: AtomicUsize = AtomicUsize::new(0);
+
+/// Pixels the last cursor composite took from the save rather than the client's
+/// buffer.
+#[cfg(test)]
+pub(crate) fn cursor_px_from_save_for_test() -> usize {
+    CURSOR_PX_FROM_SAVE.load(Ordering::Relaxed)
+}
+
 fn save_cursor_under(window: (u32, u32, usize, usize), px: &[u32], cursor: (i32, i32, u32, u32)) {
     let (x, y, tw, rows) = window;
     let mut u = CURSOR_UNDER.lock();
