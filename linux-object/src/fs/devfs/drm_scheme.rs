@@ -7253,6 +7253,92 @@ mod kms_scanout_tests {
         );
     }
 
+    /// The hole Moebius's 27-sep QEMU boot opened. Its klog said, on every frame
+    /// of a 65-second run, that not one sampled pixel was black -- AND said on
+    /// nearly every one of those same frames that the client was still writing
+    /// the buffer. Both are true at once, because the source is sampled BEFORE
+    /// the copy: a clear-to-black that lands mid-copy gets blitted to the screen
+    /// and the old source check never saw it. So "not handed over black" only
+    /// ever meant "not black when we looked".
+    #[test]
+    fn black_that_arrives_while_the_kernel_is_copying_gets_its_own_line() {
+        let _screen = kms_emu::attach(192, 200);
+        drm::set_present_probe_enabled(true);
+        let c = Client::open(0);
+        let buf = c.create_dumb(192, 200);
+        // Opaque and distinct everywhere: the FIRST read finds no black at all,
+        // which is exactly what Moebius's boot reported.
+        paint(&buf, |x, y| tag(0x0055_0000, x, y));
+        let fb = c.addfb2(&buf);
+        let pixels = map_dumb(&buf);
+        let stride = (buf.pitch / 4) as usize;
+        let late = pixels.as_mut_ptr() as usize;
+
+        // The compositor clears a region to black while the copy is in flight --
+        // a popup being repainted over the desktop.
+        kms_emu::on_blit_band(move |band| {
+            if band != 1 {
+                return;
+            }
+            // SAFETY: the dumb buffer outlives this present, and nothing else
+            // writes it while the hook runs.
+            let p = unsafe { core::slice::from_raw_parts_mut(late as *mut u32, stride * 200) };
+            for y in 0..64usize {
+                for x in 64..128usize {
+                    p[y * stride + x] = 0;
+                }
+            }
+        });
+
+        c.page_flip(drm::SYNTH_CRTC_ID, fb, 0x7007).expect("flip");
+
+        assert!(
+            kms_emu::mid_blit_calls() >= 2,
+            "the hook has to have fired mid-copy for this test to mean anything"
+        );
+        assert_eq!(
+            drm::clean_source_lines_for_test(),
+            1,
+            "the first read still found no black, so the clean line is what the \
+             OLD probe would have said -- and on its own it is misleading"
+        );
+        assert_eq!(
+            drm::grew_source_lines_for_test(),
+            1,
+            "black that was not there before the copy and is there after was \
+             handed over, just later than the sample, and that needs saying"
+        );
+    }
+
+    /// And it must not double-report: a black rectangle that just sits there is
+    /// black in BOTH reads, so it is the source line's business and not this
+    /// one's. Without the `>` this would fire on every static black frame and
+    /// bury the frames where black actually arrived mid-copy.
+    #[test]
+    fn black_that_was_already_there_is_not_reported_as_having_arrived() {
+        let _screen = kms_emu::attach(192, 200);
+        drm::set_present_probe_enabled(true);
+        let c = Client::open(0);
+        let buf = c.create_dumb(192, 200);
+        // A black rectangle sitting still, and nothing touching the buffer
+        // during the copy.
+        paint(&buf, |x, y| if x < 64 { 0 } else { tag(0x0066_0000, x, y) });
+        let fb = c.addfb2(&buf);
+
+        c.page_flip(drm::SYNTH_CRTC_ID, fb, 0x8008).expect("flip");
+
+        assert_eq!(
+            drm::black_source_lines_for_test(),
+            1,
+            "the source carried black, so that line fires"
+        );
+        assert_eq!(
+            drm::grew_source_lines_for_test(),
+            0,
+            "it was black before the copy too, so nothing arrived mid-copy"
+        );
+    }
+
     /// And the point of the split: the cheap answer cannot eat the budget the
     /// deciding frames need. This is Moebius's boot in miniature -- a long
     /// black-free run first, and THEN the frame that carries black.
