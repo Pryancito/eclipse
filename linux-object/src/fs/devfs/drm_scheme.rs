@@ -1616,20 +1616,28 @@ impl DrmDev {
                 }
                 if req.mode_valid != 0 {
                     drm::set_vblank_period_from_modeinfo(&req.mode);
-                }
-                if fb_id != 0 {
                     if let Err(e) = drm::present_now_checked(fb_id, req.crtc_id, None) {
                         present_failed("SETCRTC", fb_id, req.crtc_id, e)?;
                     }
                 } else {
-                    // `drm_mode_setcrtc` with a null fb turns the pipe off
-                    // (`set_config` with `.fb = NULL`). Doing nothing here is
-                    // half of why a screen could never be blanked: wlroots
-                    // disables an output with DPMS off followed by exactly this
-                    // call, and both were no-ops, so the panel kept the last
-                    // frame lit while the compositor believed it was dark.
+                    // `drm_mode_setcrtc` without a mode turns the pipe off
+                    // (`set_config` with `.mode = NULL`), and only looks the
+                    // fb up under `mode_valid`, so one named here is ignored
+                    // rather than shown. Doing nothing here is half of why a
+                    // screen could never be blanked: wlroots disables an
+                    // output with DPMS off followed by exactly this call, and
+                    // both were no-ops, so the panel kept the last frame lit
+                    // while the compositor believed it was dark. The mode
+                    // goes with it (`__drm_atomic_helper_set_config` sets it
+                    // to NULL and detaches the connectors), which is what
+                    // GETCRTC, GETENCODER and GETCONNECTOR report from now
+                    // on; this arm kept answering `mode_valid = 1` with the
+                    // encoder still on the CRTC, so a compositor starting
+                    // after another had disabled the output took the console's
+                    // mode for a current one.
                     drm::set_crtc_blanked(true);
                     drm::set_crtc_fb(req.crtc_id, 0);
+                    drm::set_crtc_enabled(false);
                 }
                 Ok(0)
             }
@@ -2279,7 +2287,14 @@ impl DrmDev {
                     // fallback connectors keep the historical 11.
                     conn_res.connector_type = conn.connector_type;
                     conn_res.connector_type_id = 1;
-                    conn_res.encoder_id = drm::SYNTH_ENCODER_ID;
+                    // `connector->encoder`: attached while the CRTC has a
+                    // mode, 0 once `SETCRTC` disabled it (the connectors are
+                    // detached with the mode).
+                    conn_res.encoder_id = if drm::crtc_enabled() {
+                        drm::SYNTH_ENCODER_ID
+                    } else {
+                        0
+                    };
                     conn_res.subpixel = 0; // SubPixelUnknown
 
                     // Report exactly one encoder. wlroots calls this twice: once
@@ -2367,7 +2382,11 @@ impl DrmDev {
                                       // configure the CRTC itself via SETCRTC.
                                       // possible_crtcs=1 means bit 0 = index 0 of the CRTC list,
                                       // which is correct in both paths.
-                enc.crtc_id = if drm::software_kms_active() {
+                                      // And `encoder->crtc` is NULL once the
+                                      // CRTC was disabled: a compositor that
+                                      // finds an encoder on a CRTC takes that
+                                      // CRTC's mode as current.
+                enc.crtc_id = if drm::software_kms_active() && drm::crtc_enabled() {
                     drm::SYNTH_CRTC_ID
                 } else {
                     0
@@ -2379,19 +2398,24 @@ impl DrmDev {
             DRM_IOCTL_MODE_GETCRTC => {
                 let crtc_res = unsafe { &mut *(data as *mut DrmModeGetCrtc) };
                 if let Some(crtc) = drm::get_crtc(crtc_res.crtc_id) {
-                    crtc_res.fb_id = crtc.fb_id;
+                    // `drm_mode_getcrtc`: the primary plane's fb, and the
+                    // mode (the display's native timings, the only mode the
+                    // pipeline has) only while `crtc_state->enable` -- a
+                    // CRTC that `SETCRTC` disabled or whose scanout fb was
+                    // removed has neither, whatever the panel can do. DPMS
+                    // off keeps both. Compositors read this back to seed
+                    // their initial output state.
+                    let enabled = drm::crtc_enabled();
+                    crtc_res.fb_id = if enabled { crtc.fb_id } else { 0 };
                     crtc_res.x = crtc.x;
                     crtc_res.y = crtc.y;
                     crtc_res.gamma_size = CRTC_GAMMA_SIZE;
-                    // Report the current mode: the display's native timings
-                    // (the only mode the pipeline has). Linux fills this from
-                    // crtc->state; compositors read it back to seed their
-                    // initial output state.
-                    if let Some((w, h, _)) = drm::display_mode() {
-                        crtc_res.mode = make_modeinfo(w, h);
-                        crtc_res.mode_valid = 1;
-                    } else {
-                        crtc_res.mode_valid = 0;
+                    match drm::display_mode() {
+                        Some((w, h, _)) if enabled => {
+                            crtc_res.mode = make_modeinfo(w, h);
+                            crtc_res.mode_valid = 1;
+                        }
+                        _ => crtc_res.mode_valid = 0,
                     }
                     Ok(0)
                 } else {
@@ -8127,6 +8151,88 @@ mod kms_scanout_tests {
         c.destroy_dumb(buf.handle).expect("DESTROY_DUMB");
     }
 
+    /// `drm_mode_getcrtc` reports `mode_valid` from `crtc_state->enable`,
+    /// `drm_mode_getencoder` names `encoder->crtc` and `drm_mode_getconnector`
+    /// `connector->encoder`. A `SETCRTC` without a mode
+    /// (`__drm_atomic_helper_set_config` with `.mode = NULL`, which also
+    /// ignores the fb the request carries) and an `RMFB` of the scanout
+    /// framebuffer (`atomic_remove_fb`) set the mode to NULL and detach the
+    /// connectors, so all three answer 0 until the next modeset; DPMS off
+    /// only clears `active`, so they stay. Here `mode_valid` was 1 whenever
+    /// the panel had native timings and the encoder was always on the CRTC,
+    /// so a compositor starting after another had disabled the output (a VT
+    /// switch) took the console's mode for a current one; and a `SETCRTC`
+    /// without a mode showed the fb it named instead of turning the pipe off.
+    #[test]
+    fn a_disabled_crtc_reports_no_mode_and_no_encoder_until_the_next_modeset() {
+        let _screen = kms_emu::attach(32, 8);
+        let c = Client::open(0);
+        let buf = c.create_dumb(32, 8);
+        let fb = c.addfb2(&buf);
+        let other = c.create_dumb(32, 8);
+        let fb_other = c.addfb2(&other);
+        set_crtc(&c, drm::SYNTH_CRTC_ID, fb, 32, 8);
+
+        // (GETCRTC mode_valid, GETCRTC fb_id, GETENCODER crtc_id, GETCONNECTOR
+        // encoder_id): the pipe as the three lookups describe it.
+        let pipe = || {
+            let mut crtc: DrmModeGetCrtc = unsafe { core::mem::zeroed() };
+            crtc.crtc_id = drm::SYNTH_CRTC_ID;
+            c.ioctl(DRM_IOCTL_MODE_GETCRTC, &mut crtc).expect("GETCRTC");
+            let mut enc: DrmModeGetEncoder = unsafe { core::mem::zeroed() };
+            enc.encoder_id = drm::SYNTH_ENCODER_ID;
+            c.ioctl(DRM_IOCTL_MODE_GETENCODER, &mut enc)
+                .expect("GETENCODER");
+            let mut conn: DrmModeGetConnector = unsafe { core::mem::zeroed() };
+            conn.connector_id = drm::SYNTH_CONNECTOR_ID;
+            c.ioctl(DRM_IOCTL_MODE_GETCONNECTOR, &mut conn)
+                .expect("GETCONNECTOR");
+            (crtc.mode_valid, crtc.fb_id, enc.crtc_id, conn.encoder_id)
+        };
+        let on = (1, fb, drm::SYNTH_CRTC_ID, drm::SYNTH_ENCODER_ID);
+        let off = (0, 0, 0, 0);
+        assert_eq!(pipe(), on, "with a mode set");
+
+        // SETCRTC without a mode: off, and the fb it names is not shown.
+        let mut disable: DrmModeGetCrtc = unsafe { core::mem::zeroed() };
+        disable.crtc_id = drm::SYNTH_CRTC_ID;
+        disable.fb_id = fb_other;
+        assert_eq!(c.ioctl(DRM_IOCTL_MODE_SETCRTC, &mut disable), Ok(0));
+        assert_eq!(pipe(), off, "after SETCRTC without a mode");
+        assert!(drm::crtc_blanked(), "the pipe is off");
+        assert_eq!(drm::crtc_fb(), 0, "the fb of a modeless SETCRTC was shown");
+
+        // The next modeset brings everything back.
+        set_crtc(&c, drm::SYNTH_CRTC_ID, fb, 32, 8);
+        assert_eq!(pipe(), on, "after the modeset");
+
+        // DPMS off keeps the mode and the encoder: only `active` goes.
+        #[repr(C)]
+        struct ConnectorSetProperty {
+            value: u64,
+            prop_id: u32,
+            connector_id: u32,
+        }
+        let mut dpms = ConnectorSetProperty {
+            value: 3, // Off
+            prop_id: PROP_DPMS,
+            connector_id: drm::SYNTH_CONNECTOR_ID,
+        };
+        assert_eq!(c.ioctl(DRM_IOCTL_MODE_SETPROPERTY, &mut dpms), Ok(0));
+        assert!(drm::crtc_blanked());
+        assert_eq!(pipe(), on, "DPMS off is not a disable");
+        dpms.value = DRM_MODE_DPMS_ON;
+        assert_eq!(c.ioctl(DRM_IOCTL_MODE_SETPROPERTY, &mut dpms), Ok(0));
+
+        // RMFB of the scanout framebuffer disables the CRTC with it.
+        c.rmfb(fb).expect("RMFB");
+        assert_eq!(pipe(), off, "after RMFB of the scanout framebuffer");
+
+        c.rmfb(fb_other).expect("RMFB");
+        c.destroy_dumb(buf.handle).expect("DESTROY_DUMB");
+        c.destroy_dumb(other.handle).expect("DESTROY_DUMB");
+    }
+
     /// `drm_mode_cursor_common` reads the flags before it looks the CRTC up:
     /// no flag at all, or one it does not know, is EINVAL, ahead of the
     /// ENOENT of a CRTC that does not exist. And a handle is wrapped in a
@@ -13678,6 +13784,37 @@ mod hw_kms_tests {
         c.destroy_dumb(buf.handle).expect("DESTROY_DUMB");
     }
 
+    /// On the hardware-KMS path the driver's `get_crtc` carries its own
+    /// framebuffer id, in its own namespace (`EMU_DRIVER_FB_BASE` here), and
+    /// the core only overrides it while a DRM framebuffer is on the CRTC.
+    /// `drm_mode_getcrtc` reports `fb_id = 0` and `mode_valid = 0` for a CRTC
+    /// that `SETCRTC` disabled, so the driver's id must not show through
+    /// once the DRM one is gone.
+    #[test]
+    fn a_disabled_hardware_crtc_reports_no_framebuffer_and_no_mode() {
+        let screen = kms_emu::attach(32, 8);
+        let _gpu = screen.attach_gpu(EmuGpu::hardware_kms("emu-gpu").with_ids(60, 61, 62));
+        let c = Client::open(0);
+        let buf = c.create_dumb(32, 8);
+        let fb = c.addfb2(&buf);
+        let read = || {
+            let mut crtc: DrmModeGetCrtc = zeroed();
+            crtc.crtc_id = 60;
+            c.ioctl(DRM_IOCTL_MODE_GETCRTC, &mut crtc).expect("GETCRTC");
+            (crtc.mode_valid, crtc.fb_id)
+        };
+        set_crtc(&c, 60, fb, 32, 8);
+        assert_eq!(read(), (1, fb), "with the framebuffer on the CRTC");
+
+        let mut disable: DrmModeGetCrtc = zeroed();
+        disable.crtc_id = 60;
+        assert_eq!(c.ioctl(DRM_IOCTL_MODE_SETCRTC, &mut disable), Ok(0));
+        assert_eq!(read(), (0, 0), "the driver's own fb id showed through");
+
+        c.rmfb(fb).expect("RMFB");
+        c.destroy_dumb(buf.handle).expect("DESTROY_DUMB");
+    }
+
     /// `CURSOR` with a buffer: Linux wraps the handle in a framebuffer, so a
     /// handle the file does not hold is ENOENT and a buffer too small for
     /// `width x height` pixels is EINVAL. Both came back as success with the
@@ -16473,6 +16610,48 @@ mod off_crtc_event_tests {
 
     fn active(on: u64) -> Request {
         Request::new(&[drm::SYNTH_CRTC_ID], &[1], &[PROP_ACTIVE], &[on])
+    }
+
+    /// `drm_mode_getcrtc` reads `crtc_state->enable`, which `MODE_ID` sets
+    /// and unsets (`drm_atomic_set_mode_prop_for_crtc`): after a commit with
+    /// `MODE_ID = 0` the CRTC answers `mode_valid = 0` and the encoder names
+    /// no CRTC, until a commit sets a mode again; `ACTIVE = 0` on its own
+    /// keeps the mode. Here `mode_valid` stayed 1 through all of it.
+    #[test]
+    fn a_commit_that_unsets_the_mode_leaves_the_crtc_with_none() {
+        let (_screen, c) = atomic_client(32, 8);
+        let blob = mode_blob(&c);
+        let pipe = || {
+            let mut crtc: DrmModeGetCrtc = unsafe { core::mem::zeroed() };
+            crtc.crtc_id = drm::SYNTH_CRTC_ID;
+            c.ioctl(DRM_IOCTL_MODE_GETCRTC, &mut crtc).expect("GETCRTC");
+            let mut enc: DrmModeGetEncoder = unsafe { core::mem::zeroed() };
+            enc.encoder_id = drm::SYNTH_ENCODER_ID;
+            c.ioctl(DRM_IOCTL_MODE_GETENCODER, &mut enc)
+                .expect("GETENCODER");
+            (crtc.mode_valid, enc.crtc_id)
+        };
+        let modeset = |mode: u64, on: u64| {
+            Request::new(
+                &[drm::SYNTH_CRTC_ID],
+                &[2],
+                &[PROP_MODE_ID, PROP_ACTIVE],
+                &[mode, on],
+            )
+        };
+        let on = (1, drm::SYNTH_CRTC_ID);
+        let off = (0, 0);
+
+        commit(&c, &modeset(blob as u64, 1), DRM_MODE_ATOMIC_ALLOW_MODESET)
+            .expect("a modeset with the panel's mode");
+        assert_eq!(pipe(), on, "with a mode set");
+        commit(&c, &modeset(0, 0), DRM_MODE_ATOMIC_ALLOW_MODESET).expect("MODE_ID = 0");
+        assert_eq!(pipe(), off, "after MODE_ID = 0");
+        commit(&c, &modeset(blob as u64, 1), DRM_MODE_ATOMIC_ALLOW_MODESET)
+            .expect("the mode again");
+        assert_eq!(pipe(), on, "after the mode is set again");
+        commit(&c, &active(0), DRM_MODE_ATOMIC_ALLOW_MODESET).expect("ACTIVE = 0");
+        assert_eq!(pipe(), on, "ACTIVE = 0 keeps the mode");
     }
 
     /// One event read off the fd, or none.
