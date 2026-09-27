@@ -606,8 +606,81 @@ pub fn present_probe_enabled() -> bool {
 /// tiles, so the smallest thing this is looking for is tens of rows tall.
 const PROBE_ROW_STEP: usize = 4;
 
-/// Order-dependent checksum of the `(x, y, w, h)` window of `pixels`, sampling
-/// every `row_step`-th row and every pixel within it.
+/// Width in pixels of one probe band.
+///
+/// Both software rasterisers under this desktop hand over rectangular tiles 64
+/// pixels wide, so a band this wide either *is* a tile column or is a whole
+/// number of them. That is what makes the mask in the report worth printing: a
+/// comb of stale tiles lights up a scattered *subset* of bands, while a plain
+/// tear -- the compositor overwriting the frame it already handed over -- lights
+/// up a contiguous run. A scalar checksum cannot tell those two apart, and they
+/// do not have the same cause or the same fix.
+const PROBE_BAND_PX: usize = 64;
+
+/// Bands the mask tracks: 32 * 64 = 2048 px, past both 1920- and 1600-wide
+/// panels. A window wider than that folds its right-hand columns into the last
+/// band instead of dropping them -- a mask that silently stopped describing part
+/// of the window would be worse than a coarse last band, because the reader
+/// cannot see which of the two they are looking at.
+const PROBE_MAX_BANDS: usize = 32;
+
+/// FNV-1a's 64-bit basis and prime. Wrapping on purpose: this is a hash, and a
+/// debug build must not panic on the overflow that is the whole mechanism.
+const PROBE_FNV_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+const PROBE_FNV_PRIME: u64 = 0x100_0000_01b3;
+
+/// How many bands a window `w` pixels wide covers, never zero and never past
+/// [`PROBE_MAX_BANDS`].
+fn probe_band_count(w: u32) -> usize {
+    ((w as usize).saturating_add(PROBE_BAND_PX - 1) / PROBE_BAND_PX).clamp(1, PROBE_MAX_BANDS)
+}
+
+/// One probe read: a checksum per 64-pixel column band of the window.
+struct ProbeBands {
+    /// Bands past `n` are never touched, so they hold [`PROBE_FNV_BASIS`] in
+    /// every read and compare equal.
+    bands: [u64; PROBE_MAX_BANDS],
+    /// Bands the window actually covered.
+    n: usize,
+}
+
+impl ProbeBands {
+    /// One number for the whole window, which is all the changed/unchanged
+    /// decision needs.
+    ///
+    /// `n` is deliberately NOT folded in. It looks like it should be -- two reads
+    /// that disagreed about the window's width must not come out equal -- but the
+    /// band array already separates them: band `n` holds [`PROBE_FNV_BASIS`] in
+    /// the narrower read and a real hash of its pixels in the wider one, and
+    /// those differ even when every pixel is black. Folding `n` as well was a
+    /// mutation that could not be killed by anything the probe can actually do
+    /// (the two reads bracketing a blit are always the same width), so it is
+    /// gone, and the property it was standing in for is pinned on the bands
+    /// where it really lives.
+    fn fold(&self) -> u64 {
+        let mut acc = PROBE_FNV_BASIS;
+        for b in self.bands.iter() {
+            acc ^= *b;
+            acc = acc.wrapping_mul(PROBE_FNV_PRIME);
+        }
+        acc
+    }
+
+    /// Bit `i` set means band `i` -- source columns `x + 64*i ..= x + 64*i + 63`
+    /// -- reads differently in the two passes.
+    fn diff_mask(&self, other: &ProbeBands) -> u32 {
+        let mut mask = 0u32;
+        for i in 0..PROBE_MAX_BANDS {
+            if self.bands[i] != other.bands[i] {
+                mask |= 1u32 << i;
+            }
+        }
+        mask
+    }
+}
+
+/// Per-band order-dependent checksums of the `(x, y, w, h)` window of `pixels`,
+/// sampling every `row_step`-th row and every pixel within it.
 ///
 /// Order-dependent matters: two frames can hold the same pixels in different
 /// places (a scrolled list, a window dragged by a pixel) and a sum or an XOR
@@ -621,7 +694,7 @@ const PROBE_ROW_STEP: usize = 4;
 /// `stride_px` of 0, an empty window, or a window whose first sampled row is
 /// already past the end of `pixels` all give `None`: there is nothing to
 /// compare, which is not the same answer as "these two match".
-fn probe_checksum(
+fn probe_bands(
     pixels: &[u32],
     stride_px: usize,
     x: u32,
@@ -629,13 +702,12 @@ fn probe_checksum(
     w: u32,
     h: u32,
     row_step: usize,
-) -> Option<u64> {
+) -> Option<ProbeBands> {
     if stride_px == 0 || w == 0 || h == 0 || row_step == 0 {
         return None;
     }
-    // FNV-1a's 64-bit basis and prime. Wrapping on purpose: this is a hash, and
-    // a debug build must not panic on the overflow that is the whole mechanism.
-    let mut acc: u64 = 0xcbf2_9ce4_8422_2325;
+    let n = probe_band_count(w);
+    let mut bands = [PROBE_FNV_BASIS; PROBE_MAX_BANDS];
     let mut sampled = 0usize;
     let mut r = 0usize;
     while r < h as usize {
@@ -647,14 +719,17 @@ fn probe_checksum(
         if end > pixels.len() {
             break;
         }
-        for px in pixels[off..end].iter() {
-            acc ^= *px as u64;
-            acc = acc.wrapping_mul(0x100_0000_01b3);
+        for (c, px) in pixels[off..end].iter().enumerate() {
+            // `min(n - 1)`: the columns past the mask's reach fold into the last
+            // band rather than running off the array.
+            let b = (c / PROBE_BAND_PX).min(n - 1);
+            bands[b] ^= *px as u64;
+            bands[b] = bands[b].wrapping_mul(PROBE_FNV_PRIME);
         }
         sampled += 1;
         r += row_step;
     }
-    (sampled > 0).then_some(acc)
+    (sampled > 0).then_some(ProbeBands { bands, n })
 }
 
 /// Whether the two reads bracketing a blit say somebody else was writing the
@@ -2918,7 +2993,7 @@ pub fn scanout_region_checked(
         // in, so the read after the blit can say whether anybody else was
         // writing them at the same time. See [`PRESENT_PROBE`].
         let probe_before = if present_probe_enabled() {
-            probe_checksum(
+            probe_bands(
                 pixels,
                 src_stride,
                 blit_x,
@@ -2952,7 +3027,7 @@ pub fn scanout_region_checked(
                     vaddr, fb.size, src_stride, blit_x, blit_y, blit_w, blit_h,
                 );
             }
-            let after = probe_checksum(
+            let after = probe_bands(
                 pixels,
                 src_stride,
                 blit_x,
@@ -2961,19 +3036,35 @@ pub fn scanout_region_checked(
                 blit_h,
                 PROBE_ROW_STEP,
             );
-            if probe_says_changed(before, after) {
+            if probe_says_changed(before.fold(), after.as_ref().map(ProbeBands::fold)) {
+                // Which bands moved is the whole point of reporting at all: a
+                // scattered subset says a rasteriser handed over tiles it had
+                // not finished, a contiguous run says the compositor is drawing
+                // the next frame straight into the buffer it just presented.
+                // `0` with a second read that produced nothing is the third
+                // case, and the line says so rather than implying "no bands".
+                let mask = after.as_ref().map_or(0, |a| before.diff_mask(a));
                 let n = PROBE_REPORTS.fetch_add(1, Ordering::Relaxed);
                 let (report, last) = probe_report_decision(n);
                 if report {
                     kernel_hal::klog_info!(
                         "[drm] present probe: fb {} window {}x{}+{}+{} changed while it was \
                          being scanned out -- the client is still writing the buffer it \
-                         presented{}",
+                         presented; {} of {} {}px bands differ, mask 0x{:08x}{}{}",
                         fb_id,
                         blit_w,
                         blit_h,
                         blit_x,
                         blit_y,
+                        mask.count_ones(),
+                        before.n,
+                        PROBE_BAND_PX,
+                        mask,
+                        if after.is_none() {
+                            " (the second read produced no answer at all)"
+                        } else {
+                            ""
+                        },
                         if last {
                             " (further mismatches will not be reported)"
                         } else {
@@ -8300,7 +8391,11 @@ mod present_probe_tests {
     }
 
     fn sum(pixels: &[u32], stride: usize, x: u32, y: u32, w: u32, h: u32) -> Option<u64> {
-        probe_checksum(pixels, stride, x, y, w, h, PROBE_ROW_STEP)
+        bands(pixels, stride, x, y, w, h).map(|b| b.fold())
+    }
+
+    fn bands(pixels: &[u32], stride: usize, x: u32, y: u32, w: u32, h: u32) -> Option<ProbeBands> {
+        probe_bands(pixels, stride, x, y, w, h, PROBE_ROW_STEP)
     }
 
     // --- what it must notice ---
@@ -8437,10 +8532,10 @@ mod present_probe_tests {
         let real = sum(&p, 64, 0, 0, 8, 4);
         assert!(real.is_some());
         // Degenerate in each of the four ways.
-        assert_eq!(probe_checksum(&p, 0, 0, 0, 8, 4, PROBE_ROW_STEP), None);
-        assert_eq!(probe_checksum(&p, 64, 0, 0, 0, 4, PROBE_ROW_STEP), None);
-        assert_eq!(probe_checksum(&p, 64, 0, 0, 8, 0, PROBE_ROW_STEP), None);
-        assert_eq!(probe_checksum(&p, 64, 0, 0, 8, 4, 0), None);
+        assert!(probe_bands(&p, 0, 0, 0, 8, 4, PROBE_ROW_STEP).is_none());
+        assert!(probe_bands(&p, 64, 0, 0, 0, 4, PROBE_ROW_STEP).is_none());
+        assert!(probe_bands(&p, 64, 0, 0, 8, 0, PROBE_ROW_STEP).is_none());
+        assert!(probe_bands(&p, 64, 0, 0, 8, 4, 0).is_none());
         assert_ne!(real, None);
     }
 
@@ -8587,6 +8682,207 @@ mod present_probe_tests {
             assert!(!seen.contains(px));
             seen.push(*px);
         }
+    }
+
+    // --- which bands moved ---
+
+    /// A window read twice with nothing touching it sets no bit. Without this
+    /// every mask below would be indistinguishable from "the mask is always
+    /// full", and a full mask is exactly one of the two answers we are trying
+    /// to tell apart.
+    #[test]
+    fn a_settled_window_sets_no_band() {
+        let p = buf(512, 8);
+        let a = bands(&p, 512, 0, 0, 512, 8).unwrap();
+        let b = bands(&p, 512, 0, 0, 512, 8).unwrap();
+        assert_eq!(a.diff_mask(&b), 0);
+        assert_eq!(a.n, 8, "512 px is eight 64-px bands");
+    }
+
+    /// The comb: a rasteriser handed over tiles 1, 3 and 5 and left the rest of
+    /// the frame as it was. That is the shape this mask exists to name, and it
+    /// must come out as a *scattered* subset -- not as a run, and not as
+    /// everything.
+    #[test]
+    fn stale_tiles_light_up_exactly_their_own_bands() {
+        let mut p = buf(512, 8);
+        let before = bands(&p, 512, 0, 0, 512, 8).unwrap();
+        for band in [1usize, 3, 5] {
+            for row in 0..8usize {
+                p[row * 512 + band * PROBE_BAND_PX + 7] ^= 0xFF;
+            }
+        }
+        let after = bands(&p, 512, 0, 0, 512, 8).unwrap();
+        assert_eq!(
+            before.diff_mask(&after),
+            (1 << 1) | (1 << 3) | (1 << 5),
+            "only the bands whose pixels moved may be set"
+        );
+    }
+
+    /// The other shape: the compositor overwrote the frame it had already handed
+    /// over, so the change is a contiguous run. Same instrument, visibly
+    /// different answer -- which is the whole reason the mask beats a count.
+    #[test]
+    fn a_frame_overwritten_in_place_lights_up_a_contiguous_run() {
+        let mut p = buf(512, 8);
+        let before = bands(&p, 512, 0, 0, 512, 8).unwrap();
+        for row in 0..8usize {
+            for col in (2 * PROBE_BAND_PX)..(6 * PROBE_BAND_PX) {
+                p[row * 512 + col] ^= 0xFF;
+            }
+        }
+        let after = bands(&p, 512, 0, 0, 512, 8).unwrap();
+        let mask = before.diff_mask(&after);
+        assert_eq!(mask, 0b0011_1100, "bands 2..5 and nothing else");
+        assert_eq!(mask.count_ones(), 4);
+    }
+
+    /// One changed pixel in a band sets that band and no other. Run for every
+    /// band of the window, because a mask that is right for band 0 and wrong for
+    /// band 7 is worse than no mask: it would point the search at the wrong
+    /// columns of the panel.
+    #[test]
+    fn one_changed_pixel_sets_its_own_band_and_only_it() {
+        for band in 0..8usize {
+            let mut p = buf(512, 8);
+            let before = bands(&p, 512, 0, 0, 512, 8).unwrap();
+            p[band * PROBE_BAND_PX] ^= 0xFF;
+            let after = bands(&p, 512, 0, 0, 512, 8).unwrap();
+            assert_eq!(
+                before.diff_mask(&after),
+                1u32 << band,
+                "a pixel in band {} must set band {} alone",
+                band,
+                band
+            );
+        }
+    }
+
+    /// The last pixel of a band belongs to that band and the first pixel of the
+    /// next one does not. Off by one here would slide the whole reading of the
+    /// klog 64 px to the left.
+    #[test]
+    fn a_band_ends_where_the_next_one_starts() {
+        let mut p = buf(512, 8);
+        let before = bands(&p, 512, 0, 0, 512, 8).unwrap();
+        p[PROBE_BAND_PX - 1] ^= 0xFF;
+        assert_eq!(
+            before.diff_mask(&bands(&p, 512, 0, 0, 512, 8).unwrap()),
+            1 << 0
+        );
+        let mut q = buf(512, 8);
+        q[PROBE_BAND_PX] ^= 0xFF;
+        assert_eq!(
+            before.diff_mask(&bands(&q, 512, 0, 0, 512, 8).unwrap()),
+            1 << 1
+        );
+    }
+
+    /// The window's own `x` is the mask's origin: band 0 is the left edge of
+    /// what was blitted, not of the framebuffer. Anything else and the klog's
+    /// mask could not be read against the blit rectangle it is printed with.
+    #[test]
+    fn band_zero_is_the_windows_left_edge_not_the_buffers() {
+        let mut p = buf(512, 8);
+        let before = bands(&p, 512, 128, 0, 256, 8).unwrap();
+        p[128] ^= 0xFF;
+        let after = bands(&p, 512, 128, 0, 256, 8).unwrap();
+        assert_eq!(before.diff_mask(&after), 1 << 0);
+    }
+
+    /// A window narrower than one band still has one, and a change in it is
+    /// reported rather than divided away to nothing.
+    #[test]
+    fn a_window_narrower_than_a_band_still_has_one() {
+        let mut p = buf(512, 8);
+        let before = bands(&p, 512, 0, 0, 7, 8).unwrap();
+        assert_eq!(before.n, 1);
+        p[3] ^= 0xFF;
+        assert_eq!(before.diff_mask(&bands(&p, 512, 0, 0, 7, 8).unwrap()), 1);
+    }
+
+    /// A window wider than the mask can describe folds its right-hand columns
+    /// into the last band instead of dropping them. A mask that quietly stopped
+    /// covering part of the window would read as "those columns are clean".
+    #[test]
+    fn columns_past_the_masks_reach_fold_into_the_last_band() {
+        let wide = PROBE_MAX_BANDS * PROBE_BAND_PX + 300;
+        let mut p = buf(wide, 8);
+        let before = bands(&p, wide, 0, 0, wide as u32, 8).unwrap();
+        assert_eq!(before.n, PROBE_MAX_BANDS);
+        p[wide - 1] ^= 0xFF;
+        let after = bands(&p, wide, 0, 0, wide as u32, 8).unwrap();
+        assert_eq!(
+            before.diff_mask(&after),
+            1u32 << (PROBE_MAX_BANDS - 1),
+            "the far right column has to land in the last band, not nowhere"
+        );
+    }
+
+    /// The band count never reaches past the array, and never reads as zero.
+    #[test]
+    fn the_band_count_stays_inside_the_mask() {
+        assert_eq!(probe_band_count(0), 1);
+        assert_eq!(probe_band_count(1), 1);
+        assert_eq!(probe_band_count(PROBE_BAND_PX as u32), 1);
+        assert_eq!(probe_band_count(PROBE_BAND_PX as u32 + 1), 2);
+        assert_eq!(probe_band_count(1920), 30);
+        assert_eq!(probe_band_count(u32::MAX), PROBE_MAX_BANDS);
+    }
+
+    /// The scalar answer the report's decision rests on still notices a change
+    /// in any single band -- including the last one, which is where a fold that
+    /// stopped early would go quiet.
+    #[test]
+    fn the_fold_notices_a_change_in_any_band() {
+        for band in 0..8usize {
+            let mut p = buf(512, 8);
+            let before = sum(&p, 512, 0, 0, 512, 8);
+            p[band * PROBE_BAND_PX + 1] ^= 0xFF;
+            assert_ne!(
+                before,
+                sum(&p, 512, 0, 0, 512, 8),
+                "a change in band {} has to reach the fold",
+                band
+            );
+        }
+    }
+
+    /// A band of black pixels is not the same answer as a band nobody read. That
+    /// is what the hash basis buys, and it is also what lets two reads of
+    /// different widths come out different without the fold having to carry `n`:
+    /// on an all-black buffer the wider read's extra band is the only thing that
+    /// separates them.
+    #[test]
+    fn an_all_black_band_is_not_a_band_that_was_never_read() {
+        let p = vec![0u32; 512 * 8];
+        let narrow = bands(&p, 512, 0, 0, 64, 8).unwrap();
+        let wide = bands(&p, 512, 0, 0, 128, 8).unwrap();
+        assert_eq!((narrow.n, wide.n), (1, 2));
+        assert_eq!(
+            narrow.bands[1], PROBE_FNV_BASIS,
+            "band 1 was never read in the narrow window"
+        );
+        assert_ne!(
+            narrow.bands[1], wide.bands[1],
+            "64 black pixels must not hash to the untouched value"
+        );
+        assert_ne!(narrow.fold(), wide.fold());
+        assert_eq!(narrow.diff_mask(&wide), 1 << 1);
+    }
+
+    /// A pixel that moves from one band into another changes both of them, so
+    /// the mask describes a shift rather than hiding it as "nothing moved".
+    #[test]
+    fn a_pixel_that_moves_between_bands_marks_both() {
+        let mut p = vec![0u32; 512 * 8];
+        p[10] = 0xDEAD_BEEF;
+        let before = bands(&p, 512, 0, 0, 512, 8).unwrap();
+        p[10] = 0;
+        p[PROBE_BAND_PX + 10] = 0xDEAD_BEEF;
+        let after = bands(&p, 512, 0, 0, 512, 8).unwrap();
+        assert_eq!(before.diff_mask(&after), 0b11);
     }
 }
 
