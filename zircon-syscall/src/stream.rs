@@ -77,12 +77,47 @@ fn write_gather<'a>(
                 break;
             }
         };
-        written += count;
+        written = written.checked_add(count).ok_or(ZxError::OUT_OF_RANGE)?;
         if count < data.len() {
             break;
         }
     }
     Ok(written)
+}
+
+/// Feed the buffers of a scatter to `read` one by one and answer the bytes
+/// that came out. A read the stream cut short (the content ended inside the
+/// buffer) ends the scatter there: there is nothing left for the buffers
+/// after it.
+///
+/// The running total is added with `checked_add` too: every part of it is a
+/// length the caller chose, and nothing here is in a position to know that the
+/// VMAR bounds their sum.
+///
+/// `read` gets each buffer and the bytes read before it, which is the
+/// distance from the scatter's starting offset. `readv_at` used to advance
+/// its offset by each buffer's full length instead, whether the read filled
+/// it or not, and it added without checking. The drift by itself was quiet --
+/// `Stream::read_at` answers 0 past the content, so the buffers after a short
+/// read came back empty rather than wrong -- but the sum is `offset` plus a
+/// length, both the caller's, so an offset near the top of the address space
+/// wrapped: a panic where the build has overflow checks, and elsewhere a
+/// scatter whose later buffers were served from wherever the wrap landed.
+fn read_gather<'a>(
+    buffers: impl Iterator<Item = ZxResult<&'a mut [u8]>>,
+    mut read: impl FnMut(&mut [u8], usize) -> ZxResult<usize>,
+) -> ZxResult<usize> {
+    let mut done = 0;
+    for buffer in buffers {
+        let buffer = buffer?;
+        let want = buffer.len();
+        let count = read(buffer, done)?;
+        done = done.checked_add(count).ok_or(ZxError::OUT_OF_RANGE)?;
+        if count < want {
+            break;
+        }
+    }
+    Ok(done)
 }
 
 impl Syscall<'_> {
@@ -208,10 +243,12 @@ impl Syscall<'_> {
         let stream = proc.get_object_with_rights::<Stream>(handle_value, Rights::READ)?;
         let mut data = read_iovecs(proc, vector, vector_size)?;
         validate_iovec_buffers(proc, &data, MMUFlags::WRITE)?;
-        let mut actual_count = 0usize;
-        for io_vec in data.iter_mut() {
-            actual_count += stream.read(io_vec.as_mut_slice()?)?;
-        }
+        // The stream carries the offset from one buffer to the next itself.
+        let actual_count = read_gather(
+            data.iter_mut()
+                .map(|io_vec| io_vec.as_mut_slice().map_err(ZxError::from)),
+            |buffer, _| stream.read(buffer),
+        )?;
         actual_count_ptr.write_if_not_null(actual_count)?;
         Ok(())
     }
@@ -221,7 +258,7 @@ impl Syscall<'_> {
         &self,
         handle_value: HandleValue,
         options: u32,
-        mut offset: usize,
+        offset: usize,
         vector: UserInPtr<IoVecOut>,
         vector_size: usize,
         mut actual_count_ptr: UserOutPtr<usize>,
@@ -237,11 +274,17 @@ impl Syscall<'_> {
         let stream = proc.get_object_with_rights::<Stream>(handle_value, Rights::READ)?;
         let mut data = read_iovecs(proc, vector, vector_size)?;
         validate_iovec_buffers(proc, &data, MMUFlags::WRITE)?;
-        let mut actual_count = 0usize;
-        for io_vec in data.iter_mut() {
-            actual_count += stream.read_at(io_vec.as_mut_slice()?, offset)?;
-            offset += io_vec.len();
-        }
+        // Each buffer is served right after the bytes read into the ones
+        // before it, not after the bytes they asked for: they differ as soon
+        // as the content ends inside a buffer.
+        let actual_count = read_gather(
+            data.iter_mut()
+                .map(|io_vec| io_vec.as_mut_slice().map_err(ZxError::from)),
+            |buffer, done| {
+                let at = offset.checked_add(done).ok_or(ZxError::OUT_OF_RANGE)?;
+                stream.read_at(buffer, at)
+            },
+        )?;
         actual_count_ptr.write_if_not_null(actual_count)?;
         Ok(())
     }
@@ -344,6 +387,84 @@ mod write_gather_tests {
     fn an_iovec_that_cannot_be_read_is_the_caller_s_error() {
         let parts: Vec<ZxResult<&[u8]>> = alloc::vec![Ok(&[1; 4]), Err(ZxError::INVALID_ARGS)];
         let got = write_gather(parts.into_iter(), |bytes, _| Ok(bytes.len()));
+        assert_eq!(got, Err(ZxError::INVALID_ARGS));
+    }
+}
+
+#[cfg(test)]
+mod read_gather_tests {
+    //! `zx_stream_readv_at` advanced its offset by each buffer's full length,
+    //! not by what the stream read into it: after the content ended inside a
+    //! buffer, the next one was served from past the end -- and the sum was
+    //! unchecked, so an offset near the top of the address space wrapped.
+
+    use super::*;
+    use alloc::vec::Vec;
+
+    /// A stream of `content` bytes: each read fills what is left after `done`
+    /// and records where it was asked to start and how much it gave.
+    fn stream_of(
+        content: usize,
+        served: &mut Vec<(usize, usize)>,
+    ) -> impl FnMut(&mut [u8], usize) -> ZxResult<usize> + '_ {
+        move |buffer, done| {
+            let count = buffer.len().min(content.saturating_sub(done));
+            served.push((done, count));
+            Ok(count)
+        }
+    }
+
+    #[test]
+    fn every_buffer_is_served_right_after_the_bytes_the_one_before_it_took() {
+        let mut served = Vec::new();
+        let mut buffers = [[0u8; 30], [0u8; 30], [0u8; 30]];
+        let got = read_gather(
+            buffers.iter_mut().map(|b| Ok(&mut b[..])),
+            stream_of(100, &mut served),
+        );
+        assert_eq!(got, Ok(90));
+        assert_eq!(served, [(0, 30), (30, 30), (60, 30)]);
+    }
+
+    #[test]
+    fn a_read_the_stream_cut_short_ends_the_scatter_with_what_came_out() {
+        let mut served = Vec::new();
+        let mut buffers = [[0u8; 30], [0u8; 30], [0u8; 30]];
+        let got = read_gather(
+            buffers.iter_mut().map(|b| Ok(&mut b[..])),
+            stream_of(45, &mut served),
+        );
+        assert_eq!(got, Ok(45));
+        // The third buffer is never offered to the stream: it would have been
+        // served at 60, past the 45 bytes that exist.
+        assert_eq!(served, [(0, 30), (30, 15)]);
+    }
+
+    #[test]
+    fn an_offset_that_would_wrap_is_an_error_and_not_a_wrapped_read() {
+        // What `sys_stream_readv_at` puts in front of the stream: the scatter's
+        // offset plus the bytes read so far, which used to be a bare `+`.
+        let offset = usize::MAX - 4;
+        let mut asked = Vec::new();
+        let mut buffers = [[0u8; 8], [0u8; 8]];
+        let got = read_gather(
+            buffers.iter_mut().map(|b| Ok(&mut b[..])),
+            |buffer, done| {
+                let at = offset.checked_add(done).ok_or(ZxError::OUT_OF_RANGE)?;
+                asked.push(at);
+                Ok(buffer.len())
+            },
+        );
+        assert_eq!(got, Err(ZxError::OUT_OF_RANGE));
+        assert_eq!(asked, [offset]);
+    }
+
+    #[test]
+    fn a_buffer_that_cannot_be_written_is_the_caller_s_error() {
+        let mut first = [0u8; 4];
+        let parts: Vec<ZxResult<&mut [u8]>> =
+            alloc::vec![Ok(&mut first[..]), Err(ZxError::INVALID_ARGS)];
+        let got = read_gather(parts.into_iter(), |buffer, _| Ok(buffer.len()));
         assert_eq!(got, Err(ZxError::INVALID_ARGS));
     }
 }

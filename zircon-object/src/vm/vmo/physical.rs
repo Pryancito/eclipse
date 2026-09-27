@@ -4,7 +4,8 @@ use {super::*, alloc::sync::Arc, lock::Mutex};
 pub struct VMObjectPhysical {
     paddr: PhysAddr,
     pages: usize,
-    /// Lock this when access physical memory.
+    /// Held for the whole of every access to the physical memory below, so
+    /// bind its guard: `let _guard = ..`, never `let _ = ..`.
     data_lock: Mutex<()>,
     inner: Mutex<VMObjectPhysicalInner>,
 }
@@ -61,21 +62,31 @@ impl VMObjectPhysical {
 impl VMObjectTrait for VMObjectPhysical {
     fn read(&self, offset: usize, buf: &mut [u8]) -> ZxResult {
         self.check_range(offset, buf.len())?;
-        let _ = self.data_lock.lock();
+        // `let _ = ..lock()` dropped the guard there and then, at the end of
+        // that statement, so the lock whose whole purpose is to serialise the
+        // access below was taken and let go *before* it: two threads reading
+        // and writing one window went through together.
+        //
+        // No test pins this, and the one I wrote did not: holding the lock from
+        // outside blocks the buggy form too, because it still *acquires* the
+        // lock -- it just does not keep it. Telling the two apart needs a
+        // second thread to catch the lock free while an access is in flight,
+        // which is a race, not an assertion.
+        let _guard = self.data_lock.lock();
         kernel_hal::mem::pmem_read(self.paddr + offset, buf);
         Ok(())
     }
 
     fn write(&self, offset: usize, buf: &[u8]) -> ZxResult {
         self.check_range(offset, buf.len())?;
-        let _ = self.data_lock.lock();
+        let _guard = self.data_lock.lock();
         kernel_hal::mem::pmem_write(self.paddr + offset, buf);
         Ok(())
     }
 
     fn zero(&self, offset: usize, len: usize) -> ZxResult {
         self.check_range(offset, len)?;
-        let _ = self.data_lock.lock();
+        let _guard = self.data_lock.lock();
         kernel_hal::mem::pmem_zero(self.paddr + offset, len);
         Ok(())
     }

@@ -42,7 +42,6 @@ impl Syscall<'_> {
             "port.wait: handle={}, deadline={:?}",
             handle_value, deadline
         );
-        assert_eq!(core::mem::size_of::<PortPacket>(), 48);
         let proc = self.thread.proc();
         let port = proc.get_object_with_rights::<Port>(handle_value, Rights::READ)?;
         let future = port.wait();

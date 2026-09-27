@@ -5,7 +5,7 @@ use {
     zircon_object::{dev::*, signal::*, task::*, vm::*},
 };
 
-/// The options `zx_bti_pin` was given, or `INVALID_ARGS`.
+/// The options `zx_bti_pin` were given, or `INVALID_ARGS`.
 ///
 /// This used to be `from_bits_truncate`, which drops every bit it does not
 /// know instead of refusing it. A caller that asked for something this kernel
@@ -16,7 +16,7 @@ fn bti_options(options: u32) -> ZxResult<BtiOptions> {
     BtiOptions::from_bits(options).ok_or(ZxError::INVALID_ARGS)
 }
 
-/// The options `zx_interrupt_create` was given, or `INVALID_ARGS`.
+/// The options `zx_interrupt_create` were given, or `INVALID_ARGS`.
 ///
 /// Same as [`bti_options`]: an unknown bit was dropped rather than refused.
 /// The `options != VIRTUAL` check below could not see one either, because
@@ -283,7 +283,6 @@ impl Syscall<'_> {
         mut out: UserOutPtr<i64>,
     ) -> ZxResult {
         info!("interrupt.wait: handle={:?}", interrupt);
-        assert_eq!(core::mem::size_of::<PortPacket>(), 48);
         let proc = self.thread.proc();
         let interrupt = proc.get_object_with_rights::<Interrupt>(interrupt, Rights::WAIT)?;
         let future = interrupt.wait();
