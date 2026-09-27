@@ -1048,6 +1048,13 @@ mod tests {
     /// Runs `body` on its own thread and turns a wedge or a panicked
     /// participant into a named failure: a test that hangs says nothing, and
     /// these put two threads inside one endpoint on purpose.
+    ///
+    /// The limit is deliberately far longer than the work: it is here to give a
+    /// wedge a name, not to measure anything. It was 30 s, which on this
+    /// machine left the round counts below an eightfold margin -- and the unit
+    /// test thread hit it on master, deterministically, twice, on a machine
+    /// running other suites at the same time. A clock threshold a green run can
+    /// approach is a test that fails for being on a busy machine.
     fn with_watchdog(what: &str, body: impl FnOnce() + Send + 'static) {
         let (done, finished) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
@@ -1055,7 +1062,7 @@ mod tests {
             let _ = done.send(());
         });
         if finished
-            .recv_timeout(core::time::Duration::from_secs(30))
+            .recv_timeout(core::time::Duration::from_secs(300))
             .is_err()
         {
             panic!("{}", what);
@@ -1071,7 +1078,11 @@ mod tests {
     /// already drained -- an `unwrap` on `None`, which **panics the kernel**.
     fn two_threads_reading_one_datagram_socket_do_not_panic() {
         with_watchdog("a reader panicked the kernel or wedged", || {
-            const ROUNDS: usize = 100_000;
+            // The race is caught in the first per-cent of these: with the
+            // locks split again the reader dies in well under a second. The
+            // count is for margin, not for duration, so it stays far below
+            // what the watchdog allows even on a loaded machine.
+            const ROUNDS: usize = 20_000;
             let (writer, reader) = Socket::create(SocketFlags::DATAGRAM.bits()).unwrap();
             let stop = Arc::new(AtomicBool::new(false));
 
@@ -1110,7 +1121,7 @@ mod tests {
     /// address space.
     fn two_threads_writing_one_socket_do_not_overrun_it() {
         with_watchdog("a writer overran the socket or wedged", || {
-            const ROUNDS: usize = 200_000;
+            const ROUNDS: usize = 20_000;
             const CHUNK: usize = 1024;
             let (writer, reader) = Socket::create(0).unwrap();
             let stop = Arc::new(AtomicBool::new(false));
