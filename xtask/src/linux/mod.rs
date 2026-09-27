@@ -999,7 +999,9 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
               \x20\x20 export SDL_RENDER_DRIVER=software\n\
               \x20\x20 export SDL_FRAMEBUFFER_ACCELERATION=0\n\
               \x20 fi\n\
-              elif grep -q 'nvidia\\.nouveau_uapi' /proc/cmdline 2>/dev/null; then\n\
+              elif grep -q 'nvidia\\.nouveau_uapi' /proc/cmdline 2>/dev/null && \\
+\
+              \x20\x20 [ -r /sys/class/drm/card0/device/vendor ]; then\n\
               \x20 # flag but no NVIDIA (the GL=1 image under QEMU): software GL,\n\
               \x20 # the same stack as renderer=gl-sw -- labwc on GLES2/llvmpipe.\n\
               \x20 export WLR_RENDERER=gles2\n\

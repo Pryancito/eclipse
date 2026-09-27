@@ -60,10 +60,20 @@ const COMPOSITOR_DEGRADE_AFTER: u32 = 2;
 /// Whether the cmdline asked for the GPU-rendered wlroots compositor
 /// (`nvidia.wlr_gles2` or `nvidia.wlr_vulkan`).
 fn gpu_compositor_requested() -> bool {
-    let cmdline = fs::read_to_string("/proc/cmdline").unwrap_or_default();
-    cmdline
-        .split([':', ' ', '\t', '\n'])
-        .any(|t| t == "nvidia.wlr_gles2" || t == "nvidia.wlr_vulkan")
+    gpu_compositor_requested_in(&read_cmdline())
+}
+
+/// [`gpu_compositor_requested`] against a given command line.
+fn gpu_compositor_requested_in(cmdline: &str) -> bool {
+    cmdline_has_in(cmdline, "nvidia.wlr_gles2") || cmdline_has_in(cmdline, "nvidia.wlr_vulkan")
+}
+
+/// Has a shutdown signal arrived? Every bounded wait polls this so a
+/// Ctrl-Alt-Del lands promptly: the handlers are installed WITHOUT `SA_RESTART`
+/// on purpose (see [`install_handler`]), and that only buys anything if the code
+/// doing the waiting actually looks.
+fn shutdown_requested() -> bool {
+    WANT_HALT.load(Ordering::SeqCst) || WANT_REBOOT.load(Ordering::SeqCst)
 }
 
 /// Set by the SIGUSR1/SIGUSR2 handlers: bring the system down (halt/power off).
@@ -95,7 +105,7 @@ extern "C" fn on_sigusr2(_sig: libc::c_int) {
 }
 
 /// How a service is managed.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Kind {
     /// Run once to completion during boot (mounts, one-time setup).
     Oneshot,
@@ -278,7 +288,7 @@ fn main() {
     if desktop == "none" {
         log("console/installer session: compositor services skipped");
     }
-    services.retain(|_, s| s.desktop.as_deref().map_or(true, |d| d == desktop));
+    services.retain(|_, s| s.desktop.as_deref().is_none_or(|d| d == desktop));
     // `cmdline = <token>`: opt-in services (diagnostics) stay out of a normal
     // boot entirely.
     services.retain(|name, s| match s.cmdline.as_deref() {
@@ -538,27 +548,30 @@ fn install_handler(sig: libc::c_int, handler: usize) {
 ///      per-install override the user can edit;
 ///   3. `labwc` — the default Eclipse session.
 fn selected_desktop() -> String {
-    if let Some(d) = cmdline_desktop() {
+    selected_desktop_from(
+        &read_cmdline(),
+        fs::read_to_string("/etc/eclipse/desktop").ok().as_deref(),
+    )
+}
+
+/// [`selected_desktop`] against a given command line and `/etc/eclipse/desktop`.
+fn selected_desktop_from(cmdline: &str, file: Option<&str>) -> String {
+    if let Some(d) = desktop_from_cmdline(cmdline) {
         return d;
     }
-    if let Ok(text) = fs::read_to_string("/etc/eclipse/desktop") {
-        if let Some(tok) = text.split_whitespace().next() {
-            if !tok.is_empty() {
-                return tok.to_string();
-            }
+    if let Some(tok) = file.and_then(|t| t.split_whitespace().next()) {
+        if !tok.is_empty() {
+            return tok.to_string();
         }
     }
     String::from("labwc")
 }
 
-/// Extract `desktop=<name>` from `/proc/cmdline`. The Eclipse kernel joins boot
-/// arguments with `:` (e.g. `LOG=error:ROOT=/dev/vda:desktop=xorg`), but a plain
-/// space-separated cmdline works too — split on both.
-fn cmdline_desktop() -> Option<String> {
-    let cmdline = fs::read_to_string("/proc/cmdline").ok()?;
-    cmdline
-        .split(|c: char| c == ':' || c.is_whitespace())
-        .find_map(|tok| tok.strip_prefix("desktop="))
+/// Extract `desktop=<name>` from a kernel command line. The Eclipse kernel joins
+/// boot arguments with `:` (e.g. `LOG=error:ROOT=/dev/vda:desktop=xorg`), but a
+/// plain space-separated cmdline works too: [`cmdline_value`] splits on both.
+fn desktop_from_cmdline(cmdline: &str) -> Option<String> {
+    cmdline_value(cmdline, "desktop=")
         .filter(|d| !d.is_empty())
         .map(String::from)
 }
@@ -593,43 +606,59 @@ fn apply_locale() {
 
 /// `es` (default) or `en` from cmdline `lang=` then `/etc/eclipse/locale`.
 fn resolved_ui_lang() -> &'static str {
-    if let Ok(cmdline) = fs::read_to_string("/proc/cmdline") {
-        if let Some(v) = cmdline
-            .split(|c: char| c == ':' || c.is_whitespace())
-            .find_map(|tok| tok.strip_prefix("lang="))
-        {
-            match v.trim() {
-                "en" | "EN" | "en_US" => return "en",
-                "es" | "ES" | "es_ES" => return "es",
-                _ => {}
-            }
-        }
+    ui_lang_from(
+        &read_cmdline(),
+        fs::read_to_string("/etc/eclipse/locale").ok().as_deref(),
+    )
+}
+
+/// The two UI languages this image ships, by each spelling accepted for them. An
+/// unrecognised value is NOT a language: it falls through to the next source, so
+/// a stale `lang=fr` cannot pin the desktop to a locale with no translation.
+fn ui_lang_token(value: &str) -> Option<&'static str> {
+    match value.trim() {
+        "en" | "EN" | "en_US" => Some("en"),
+        "es" | "ES" | "es_ES" => Some("es"),
+        _ => None,
     }
-    if let Ok(text) = fs::read_to_string("/etc/eclipse/locale") {
-        for line in text.lines() {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('#') {
-                continue;
-            }
-            if let Some(v) = line.strip_prefix("lang=") {
-                match v.trim() {
-                    "en" | "EN" | "en_US" => return "en",
-                    "es" | "ES" | "es_ES" => return "es",
-                    _ => {}
-                }
-            }
+}
+
+/// [`resolved_ui_lang`] against a given command line and `/etc/eclipse/locale`.
+fn ui_lang_from(cmdline: &str, file: Option<&str>) -> &'static str {
+    if let Some(lang) = cmdline_value(cmdline, "lang=").and_then(ui_lang_token) {
+        return lang;
+    }
+    for line in file.unwrap_or_default().lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some(lang) = line.strip_prefix("lang=").and_then(ui_lang_token) {
+            return lang;
         }
     }
     "es"
 }
 
 fn overlay_locale(env: &mut Vec<CString>) {
+    overlay_locale_for(env, resolved_ui_lang());
+}
+
+/// [`overlay_locale`] for an already-resolved language.
+///
+/// REPLACES rather than appends, and takes `LC_ALL` with it: two `LANG=` entries
+/// in one environment are not "the last one wins" for every libc, and an
+/// `LC_ALL` left behind beats whatever `LANG` says. The POSIX name has to be a
+/// UTF-8 one because foot refuses to render under a plain `C` locale.
+fn overlay_locale_for(env: &mut Vec<CString>, lang: &str) {
     env.retain(|e| {
         let s = e.to_str().unwrap_or("");
         !s.starts_with("LANG=") && !s.starts_with("LANGUAGE=") && !s.starts_with("LC_ALL=")
     });
-    let (posix, language) = match resolved_ui_lang() {
+    let (posix, language) = match lang {
         "en" => ("en_US.UTF-8", "en"),
+        // Spanish falls back to English rather than to nothing, so a string
+        // with no Spanish translation still comes out readable.
         _ => ("es_ES.UTF-8", "es:en"),
     };
     env.push(CString::new(format!("LANG={posix}")).unwrap());
@@ -670,60 +699,62 @@ fn tz_for_country(country: &str) -> &'static str {
 
 /// `tz=` on the cmdline wins, then `country=`, then `/etc/eclipse/timezone`.
 fn resolved_tz() -> String {
-    if let Ok(cmdline) = fs::read_to_string("/proc/cmdline") {
-        if let Some(v) = cmdline
-            .split(|c: char| c == ':' || c.is_whitespace())
-            .find_map(|tok| tok.strip_prefix("tz=").map(str::trim))
-        {
-            if !v.is_empty() {
-                return v.to_string();
-            }
+    tz_from(
+        &read_cmdline(),
+        fs::read_to_string("/etc/eclipse/timezone").ok().as_deref(),
+    )
+}
+
+/// [`resolved_tz`] against a given command line and `/etc/eclipse/timezone`.
+///
+/// An EMPTY value is not a value, at either source and under either key: a
+/// truncated `tz=` line (a zero-filled tail after an unclean power cut, or a
+/// half-written file) falls through to the next source instead of handing every
+/// service a `TZ=` that libc reads as UTC.
+fn tz_from(cmdline: &str, file: Option<&str>) -> String {
+    if let Some(v) = cmdline_value(cmdline, "tz=").filter(|v| !v.is_empty()) {
+        return v.to_string();
+    }
+    if let Some(v) = cmdline_value(cmdline, "country=").filter(|v| !v.is_empty()) {
+        return tz_for_country(v).to_string();
+    }
+    let mut country = None;
+    let mut tz = None;
+    for line in file.unwrap_or_default().lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
         }
-        if let Some(v) = cmdline
-            .split(|c: char| c == ':' || c.is_whitespace())
-            .find_map(|tok| tok.strip_prefix("country=").map(str::trim))
-        {
-            if !v.is_empty() {
-                return tz_for_country(v).to_string();
-            }
+        if let Some(v) = line.strip_prefix("tz=") {
+            tz = Some(v.trim());
+        }
+        if let Some(v) = line.strip_prefix("country=") {
+            country = Some(v.trim());
         }
     }
-    if let Ok(text) = fs::read_to_string("/etc/eclipse/timezone") {
-        let mut country = None;
-        let mut tz = None;
-        for line in text.lines() {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('#') {
-                continue;
-            }
-            if let Some(v) = line.strip_prefix("tz=") {
-                tz = Some(v.trim().to_string());
-            }
-            if let Some(v) = line.strip_prefix("country=") {
-                country = Some(v.trim().to_string());
-            }
-        }
-        if let Some(z) = tz {
-            if !z.is_empty() {
-                return z;
-            }
-        }
-        if let Some(c) = country {
-            return tz_for_country(&c).to_string();
-        }
+    if let Some(z) = tz.filter(|z| !z.is_empty()) {
+        return z.to_string();
+    }
+    if let Some(c) = country.filter(|c| !c.is_empty()) {
+        return tz_for_country(c).to_string();
     }
     "Europe/Madrid".into()
 }
 
 fn overlay_tz(env: &mut Vec<CString>) {
+    overlay_tz_with(env, &resolved_tz());
+}
+
+/// [`overlay_tz`] for an already-resolved zone. The value comes from
+/// `/etc/eclipse/timezone` or the command line, so a NUL byte in it (a
+/// zero-filled tail after an unclean power cut) must not abort PID 1 on the
+/// first spawn: leave `TZ` unset instead.
+fn overlay_tz_with(env: &mut Vec<CString>, tz: &str) {
     env.retain(|e| {
         let s = e.to_str().unwrap_or("");
         !s.starts_with("TZ=")
     });
-    // `resolved_tz` comes from /etc/eclipse/timezone or the cmdline; a NUL
-    // byte in it (a zero-filled tail after an unclean power cut) must not
-    // abort PID 1 on the first spawn — just leave TZ unset.
-    if let Ok(tz) = CString::new(format!("TZ={}", resolved_tz())) {
+    if let Ok(tz) = CString::new(format!("TZ={tz}")) {
         env.push(tz);
     }
 }
@@ -809,7 +840,18 @@ fn parse_service(name: &str, text: &str) -> Option<Service> {
             "type" => {
                 kind = match value {
                     "respawn" => Kind::Respawn,
-                    _ => Kind::Oneshot,
+                    "oneshot" => Kind::Oneshot,
+                    // A value that is neither still means oneshot, because
+                    // defaulting to "supervise it forever" would be worse. But
+                    // say so: `type = respwan` turns the compositor into a
+                    // oneshot, so the desktop dies for good the first time it
+                    // exits and NOTHING restarts it. Silently, before this line.
+                    other => {
+                        log(&format!(
+                            "warning: {name}: 'type = {other}' is not respawn or oneshot;                              treating it as oneshot (it will NOT be restarted if it exits)"
+                        ));
+                        Kind::Oneshot
+                    }
                 }
             }
             "after" => after = value.split_whitespace().map(String::from).collect(),
@@ -818,7 +860,10 @@ fn parse_service(name: &str, text: &str) -> Option<Service> {
             "log" => log_path = Some(value.to_string()),
             "wait_socket" => wait_socket = Some(value.to_string()),
             "wait_path" => wait_path = Some(value.to_string()),
-            _ => {}
+            // Same reason: a misspelled key is a gate that does not exist.
+            // `wait_sockt = /run/seatd.sock` used to be accepted in silence, and
+            // then labwc raced seatd on every boot.
+            other => log(&format!("warning: {name}: unknown key '{other}', ignored")),
         }
     }
 
@@ -937,19 +982,60 @@ fn start_service(svc: &mut Service) {
 /// immediately instead of rounding the wait up to a 100 ms slot; backs off to
 /// 100 ms after the first second so a missing daemon costs no busy churn.
 fn wait_for_socket(path: &str, timeout: Duration) {
+    if wait_until(timeout, || is_unix_socket(path), shutdown_requested) == Wait::TimedOut {
+        log(&format!("warning: {path} not ready after {timeout:?}"));
+    }
+}
+
+/// How a bounded wait ended.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Wait {
+    /// `ready` returned true.
+    Ready,
+    /// `stop` returned true: a shutdown was requested, so waiting is pointless.
+    Stopped,
+    /// `timeout` elapsed.
+    TimedOut,
+}
+
+/// Poll `ready` until it holds, `stop` says to give up, or `timeout` elapses.
+///
+/// The three waits below share this so their pacing cannot drift apart, and so
+/// they all honour a shutdown the same way. `sleep_interruptible`, NOT
+/// `std::thread::sleep`: the latter RESTARTS itself on EINTR, which silently
+/// undid the deliberate absence of `SA_RESTART` (see [`install_handler`]) and
+/// left a Ctrl-Alt-Del during boot unanswered for as long as every wait took.
+fn wait_until(timeout: Duration, mut ready: impl FnMut() -> bool, stop: impl Fn() -> bool) -> Wait {
     let start = Instant::now();
     while start.elapsed() < timeout {
-        if is_unix_socket(path) {
-            return;
+        if ready() {
+            return Wait::Ready;
         }
-        let step = if start.elapsed() < Duration::from_secs(1) {
-            Duration::from_millis(10)
-        } else {
-            Duration::from_millis(100)
-        };
-        std::thread::sleep(step);
+        if stop() {
+            return Wait::Stopped;
+        }
+        sleep_interruptible(poll_step(start.elapsed()));
     }
-    log(&format!("warning: {path} not ready after {timeout:?}"));
+    // One last look: `ready` may have become true during the final sleep, and
+    // reporting a timeout for something that IS there would send a service into
+    // its backoff for nothing.
+    if ready() {
+        Wait::Ready
+    } else {
+        Wait::TimedOut
+    }
+}
+
+/// How long to sleep between polls, given how long the wait has already run:
+/// fine-grained (10 ms) for the first second so the common case releases almost
+/// immediately, then 100 ms so a daemon that never arrives costs no churn. One
+/// function, so the three waits below cannot drift apart.
+fn poll_step(elapsed: Duration) -> Duration {
+    if elapsed < Duration::from_secs(1) {
+        Duration::from_millis(10)
+    } else {
+        Duration::from_millis(100)
+    }
 }
 
 /// Poll `dir`'s listing until it has been NON-EMPTY and UNCHANGED for
@@ -976,7 +1062,13 @@ fn wait_for_dir_settled(dir: &str, timeout: Duration, settle: Duration) {
     let mut last = list(dir);
     let mut stable_since = Instant::now();
     while start.elapsed() < timeout {
-        std::thread::sleep(Duration::from_millis(100));
+        if shutdown_requested() {
+            log(&format!(
+                "shutdown requested while waiting for {dir} to settle"
+            ));
+            return;
+        }
+        sleep_interruptible(Duration::from_millis(100));
         let now = list(dir);
         if now != last {
             last = now;
@@ -1001,19 +1093,9 @@ fn wait_for_dir_settled(dir: &str, timeout: Duration, settle: Duration) {
 /// Poll until `path` exists (any file type) or `timeout` elapses. Same pacing
 /// as [`wait_for_socket`]; used for device nodes (`wait_path =`).
 fn wait_for_path(path: &str, timeout: Duration) {
-    let start = Instant::now();
-    while start.elapsed() < timeout {
-        if Path::new(path).exists() {
-            return;
-        }
-        let step = if start.elapsed() < Duration::from_secs(1) {
-            Duration::from_millis(10)
-        } else {
-            Duration::from_millis(100)
-        };
-        std::thread::sleep(step);
+    if wait_until(timeout, || Path::new(path).exists(), shutdown_requested) == Wait::TimedOut {
+        log(&format!("warning: {path} not present after {timeout:?}"));
     }
-    log(&format!("warning: {path} not present after {timeout:?}"));
 }
 
 fn is_unix_socket(path: &str) -> bool {
@@ -1072,20 +1154,20 @@ enum Renderer {
     GlSw,
 }
 
-fn renderer_mode() -> Renderer {
-    let cmdline = fs::read_to_string("/proc/cmdline").unwrap_or_default();
-    let has = |tok: &str| cmdline.split([':', ' ', '\t', '\n']).any(|t| t == tok);
+/// Pick the renderer from a given command line and `card0` PCI vendor. `vendor`
+/// is `None` when there is no `card0` at all.
+fn renderer_mode_from(cmdline: &str, vendor: Option<&str>) -> Renderer {
     // An explicit `renderer=` token always wins (checked most-specific first, so
     // `gl-sw` is not shadowed by `gl`). With no token, or `renderer=auto`, pick
     // from the GPU that is actually present.
-    if has("renderer=pixman") {
+    if cmdline_has_in(cmdline, "renderer=pixman") {
         Renderer::Pixman
-    } else if has("renderer=gl-sw") {
+    } else if cmdline_has_in(cmdline, "renderer=gl-sw") {
         Renderer::GlSw
-    } else if has("renderer=gl") {
+    } else if cmdline_has_in(cmdline, "renderer=gl") {
         Renderer::Gl
     } else {
-        detect_renderer()
+        detect_renderer_from(vendor, cmdline)
     }
 }
 
@@ -1104,9 +1186,9 @@ fn renderer_mode() -> Renderer {
 /// auto-detection — stays on software GL (llvmpipe), which is safe everywhere
 /// and never leaves a black screen. Only when no GPU is visible do we fall back
 /// to pixman. To use virgl in QEMU, pass `renderer=gl` explicitly.
-fn detect_renderer() -> Renderer {
-    match fs::read_to_string("/sys/class/drm/card0/device/vendor") {
-        Ok(v) if v.trim().eq_ignore_ascii_case("0x10de") => {
+fn detect_renderer_from(vendor: Option<&str>, cmdline: &str) -> Renderer {
+    match vendor {
+        Some(v) if vendor_is_nvidia(Some(v)) => {
             // NVIDIA: nouveau GL composites on real hardware via zink+NVK (the
             // path this uAPI implements). build_child_env's Gl arm additionally
             // pins GL clients to zink so they take the same NVK path instead of
@@ -1124,11 +1206,7 @@ fn detect_renderer() -> Renderer {
             // alongside the flag, so an explicit token wins before auto ever
             // gets asked -- but keying on the flag keeps a hand-written
             // `renderer=auto:nvidia.nouveau_uapi` cmdline honest too.
-            let cmdline = fs::read_to_string("/proc/cmdline").unwrap_or_default();
-            if cmdline
-                .split([':', ' ', '\t', '\n'])
-                .any(|t| t == "nvidia.nouveau_uapi")
-            {
+            if cmdline_has_in(cmdline, "nvidia.nouveau_uapi") {
                 log(&format!(
                     "renderer=auto: NVIDIA GPU {} + nvidia.nouveau_uapi -> gl \
                      (NVIDIA experiment mode; labwc stays software unless explicitly opted into wlroots GPU rendering)",
@@ -1145,7 +1223,7 @@ fn detect_renderer() -> Renderer {
                 Renderer::Pixman
             }
         }
-        Ok(v) if !v.trim().is_empty() => {
+        Some(v) if !v.trim().is_empty() => {
             log(&format!(
                 "renderer=auto: GPU vendor {} -> gl-sw (software GL; pass renderer=gl for virgl)",
                 v.trim()
@@ -1159,23 +1237,47 @@ fn detect_renderer() -> Renderer {
     }
 }
 
-/// Is the GPU behind `/dev/dri/card0` an NVIDIA card (PCI vendor `0x10de`)?
-/// Used to pin GL clients to zink+NVK on real hardware WITHOUT touching QEMU's
-/// virtio-gpu (`0x1af4`), whose GL runs through virgl and has no Vulkan for
-/// zink to sit on.
-fn gpu_is_nvidia() -> bool {
-    fs::read_to_string("/sys/class/drm/card0/device/vendor")
-        .map(|v| v.trim().eq_ignore_ascii_case("0x10de"))
-        .unwrap_or(false)
+/// The PCI vendor id behind `/dev/dri/card0`, as sysfs spells it (`0x10de`).
+/// `None` when there is no card0, which is not the same as a card that reports
+/// an empty vendor: [`detect_renderer_from`] treats those differently.
+fn card0_vendor() -> Option<String> {
+    fs::read_to_string("/sys/class/drm/card0/device/vendor").ok()
+}
+
+/// Is `vendor` NVIDIA (PCI vendor `0x10de`)? One place, so the compositor gate
+/// and the client-side zink pin can never disagree about what an NVIDIA card is.
+fn vendor_is_nvidia(vendor: Option<&str>) -> bool {
+    vendor.is_some_and(|v| v.trim().eq_ignore_ascii_case("0x10de"))
 }
 
 /// Does the kernel command line carry `token`? Same `:`/whitespace splitting
 /// as [`renderer_mode`]. Used for opt-in knobs like `nvidia.wlr_vulkan`.
 fn cmdline_has(token: &str) -> bool {
-    fs::read_to_string("/proc/cmdline")
-        .unwrap_or_default()
+    cmdline_has_in(&read_cmdline(), token)
+}
+
+/// The kernel command line, or an empty string when `/proc` is not mounted yet.
+/// One place to read it so every caller splits it the same way.
+fn read_cmdline() -> String {
+    fs::read_to_string("/proc/cmdline").unwrap_or_default()
+}
+
+/// Does `cmdline` carry `token` as a WHOLE token? The Eclipse kernel joins boot
+/// arguments with `:` (`LOG=warn:desktop=labwc:renderer=gl`); a plain
+/// space-separated command line works too, so both separate. Whole-token
+/// matching is what keeps `renderer=gl` from also firing on `renderer=gl-sw`.
+fn cmdline_has_in(cmdline: &str, token: &str) -> bool {
+    cmdline.split([':', ' ', '\t', '\n']).any(|t| t == token)
+}
+
+/// The value of the first `<key>=` token on `cmdline`, trimmed. `None` when the
+/// key is absent; `Some("")` when it is present but empty, which every caller
+/// treats as "not set" rather than as a value.
+fn cmdline_value<'a>(cmdline: &'a str, key: &str) -> Option<&'a str> {
+    cmdline
         .split([':', ' ', '\t', '\n'])
-        .any(|t| t == token)
+        .find_map(|tok| tok.strip_prefix(key))
+        .map(str::trim)
 }
 
 /// The environment handed to every spawned service: the static [`CHILD_ENV`]
@@ -1183,20 +1285,43 @@ fn cmdline_has(token: &str) -> bool {
 /// no working GL driver wlroots' GLES2 path leaves the desktop black — exactly
 /// what happened when pixman was dropped unconditionally.
 fn build_child_env() -> Vec<CString> {
+    let cmdline = read_cmdline();
+    let vendor = card0_vendor();
+    let mut env = child_env_for(
+        renderer_mode_from(&cmdline, vendor.as_deref()),
+        vendor.as_deref(),
+        &cmdline,
+        COMPOSITOR_DEGRADED.load(Ordering::Relaxed),
+    );
+    overlay_locale(&mut env);
+    overlay_tz(&mut env);
+    env
+}
+
+/// The renderer half of the child environment, as plain strings so a test can
+/// read it. Every arm is a decision the `/etc/profile` block and the
+/// `/usr/local/bin/labwc` wrapper (both written by `xtask`) must make the same
+/// way: those two re-assert this policy for a session that init did NOT launch,
+/// and a session that renders with a different renderer than its clients expect
+/// composites nothing. Keep the three in step.
+fn child_env_for(
+    renderer: Renderer,
+    vendor: Option<&str>,
+    cmdline: &str,
+    degraded: bool,
+) -> Vec<CString> {
     let mut env: Vec<CString> = CHILD_ENV
         .iter()
         .map(|e| CString::new(*e).unwrap())
         .collect();
-    overlay_locale(&mut env);
-    overlay_tz(&mut env);
-    match renderer_mode() {
+    match renderer {
         Renderer::Pixman => {
             env.push(CString::new("WLR_RENDERER=pixman").unwrap());
             env.push(CString::new("WLR_RENDERER_ALLOW_SOFTWARE=1").unwrap());
             push_sdl_render_env(&mut env, SdlRender::Software);
         }
         Renderer::Gl => {
-            if gpu_is_nvidia() {
+            if vendor_is_nvidia(vendor) {
                 // Current real-hardware status: labwc's default GPU-rendered path
                 // still crashes inside Mesa/NVK and floods `/tmp/labwc.log` with
                 // "zink: failed to create timeline semaphore", then the compositor
@@ -1213,11 +1338,11 @@ fn build_child_env() -> Vec<CString> {
                 // ...unless the compositor already died COMPOSITOR_DEGRADE_AFTER
                 // times this boot on the GPU renderer: then this respawn goes to
                 // pixman so the desktop recovers (see COMPOSITOR_DEGRADED).
-                let degraded = COMPOSITOR_DEGRADED.load(Ordering::Relaxed);
                 if !degraded
-                    && (cmdline_has("nvidia.wlr_vulkan") || cmdline_has("nvidia.wlr_gles2"))
+                    && (cmdline_has_in(cmdline, "nvidia.wlr_vulkan")
+                        || cmdline_has_in(cmdline, "nvidia.wlr_gles2"))
                 {
-                    let wlr = if cmdline_has("nvidia.wlr_vulkan") {
+                    let wlr = if cmdline_has_in(cmdline, "nvidia.wlr_vulkan") {
                         "vulkan"
                     } else {
                         "gles2"
@@ -1526,7 +1651,7 @@ fn supervise(services: &mut BTreeMap<String, Service>) {
         // order: "labwc" < "seatd", so a crash of both restarted labwc first,
         // which then parked ~10 s on the seatd socket gate (or launched
         // against a dead seatd and crashed again) before seatd was retried.
-        for name in ordered_names(&services) {
+        for name in ordered_names(services) {
             if let Some(svc) = services.get_mut(&name) {
                 if svc.kind == Kind::Respawn && svc.pid.is_none() {
                     start_service(svc);
@@ -1584,4 +1709,816 @@ fn shutdown(reboot: bool, _services: &mut BTreeMap<String, Service>) {
 fn errno() -> libc::c_int {
     // SAFETY: __errno_location returns a valid pointer on musl/glibc.
     unsafe { *libc::__errno_location() }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+//
+// This binary is PID 1 of the installed system: it mounts, picks the session,
+// orders and supervises every service, and builds the environment the compositor
+// runs in. It is a standalone package (its own `[workspace]`, its own musl
+// target, built best-effort by `xtask`), so no `cargo` line in the tree ever
+// compiled it, let alone tested it -- a build failure here silently leaves
+// busybox init as PID 1 and the desktop never starts.
+//
+// What is covered is the decision-making: the boot-argument parsing, the
+// session/locale/timezone precedence, the service-file parser, the dependency
+// order, and the renderer policy. What is NOT is everything that talks to the
+// kernel (mounts, VT ioctls, fork/exec, reboot) -- that needs to BE init.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -- Boot arguments ----------------------------------------------------
+    //
+    // The Eclipse kernel joins boot arguments with `:`, which is why none of
+    // this can reuse a space-splitting parser.
+
+    #[test]
+    fn a_boot_argument_is_matched_as_a_whole_token_on_either_separator() {
+        let colon = "LOG=warn:desktop=labwc:renderer=gl-sw:nvidia.nouveau_uapi";
+        assert!(cmdline_has_in(colon, "nvidia.nouveau_uapi"));
+        assert!(cmdline_has_in(colon, "renderer=gl-sw"));
+        assert!(cmdline_has_in(
+            "LOG=warn nvidia.nouveau_uapi",
+            "nvidia.nouveau_uapi"
+        ));
+        assert!(cmdline_has_in(
+            "a\tb\nnvidia.nouveau_uapi",
+            "nvidia.nouveau_uapi"
+        ));
+        // A prefix is not the token: this is what keeps `renderer=gl` from
+        // firing on `renderer=gl-sw`, and the whole renderer gate rests on it.
+        assert!(!cmdline_has_in(colon, "renderer=gl"));
+        assert!(!cmdline_has_in(
+            "nvidia.nouveau_uapi_off",
+            "nvidia.nouveau_uapi"
+        ));
+        // A token of a LONGER name must not match either.
+        assert!(!cmdline_has_in(
+            "xnvidia.nouveau_uapi",
+            "nvidia.nouveau_uapi"
+        ));
+    }
+
+    #[test]
+    fn an_empty_boot_argument_value_is_not_a_value() {
+        // `cmdline_value` reports the empty string rather than `None`, and every
+        // caller filters it out. Both halves matter, so both are asserted.
+        assert_eq!(cmdline_value("desktop=:LOG=warn", "desktop="), Some(""));
+        assert_eq!(cmdline_value("LOG=warn", "desktop="), None);
+        assert_eq!(cmdline_value("desktop=xorg", "desktop="), Some("xorg"));
+    }
+
+    // -- Which session boots -----------------------------------------------
+
+    #[test]
+    fn the_session_comes_from_the_cmdline_then_the_file_then_labwc() {
+        // 1. the cmdline wins over the file
+        assert_eq!(
+            selected_desktop_from("LOG=warn:desktop=xorg", Some("labwc\n")),
+            "xorg"
+        );
+        // 2. the file when the cmdline says nothing
+        assert_eq!(selected_desktop_from("LOG=warn", Some("xorg\n")), "xorg");
+        // 3. labwc when neither does
+        assert_eq!(selected_desktop_from("", None), "labwc");
+        assert_eq!(selected_desktop_from("", Some("   \n")), "labwc");
+        // `desktop=none` is the ISO installer: a real value, not a fallback.
+        assert_eq!(selected_desktop_from("desktop=none", None), "none");
+        // An EMPTY cmdline value falls through to the file rather than
+        // selecting a session named "", which would match no service's
+        // `desktop =` and silently boot with no compositor at all.
+        assert_eq!(selected_desktop_from("desktop=", Some("xorg\n")), "xorg");
+    }
+
+    // -- The UI language ---------------------------------------------------
+
+    #[test]
+    fn the_ui_language_comes_from_the_cmdline_then_the_file_then_spanish() {
+        assert_eq!(ui_lang_from("lang=en", Some("lang=es\n")), "en");
+        assert_eq!(ui_lang_from("", Some("lang=en\n")), "en");
+        assert_eq!(ui_lang_from("", None), "es");
+        // Every accepted spelling, since these come from a human-edited file.
+        for spelling in ["en", "EN", "en_US"] {
+            assert_eq!(ui_lang_from(&format!("lang={spelling}"), None), "en");
+        }
+        for spelling in ["es", "ES", "es_ES"] {
+            assert_eq!(ui_lang_from(&format!("lang={spelling}"), None), "es");
+        }
+    }
+
+    #[test]
+    fn an_unknown_language_falls_through_instead_of_winning() {
+        // There is no French translation, so `lang=fr` must not be honoured as
+        // a language -- and must not shadow the file either, which is the part
+        // a "first match wins" parser gets wrong.
+        assert_eq!(ui_lang_from("lang=fr", Some("lang=en\n")), "en");
+        assert_eq!(ui_lang_from("lang=fr", None), "es");
+    }
+
+    #[test]
+    fn the_locale_file_ignores_blanks_and_comments() {
+        let file = "# escrito por eclipse-locale\n\n   \n  lang=en  \n";
+        assert_eq!(ui_lang_from("", Some(file)), "en");
+        // A commented-out setting is not a setting.
+        assert_eq!(ui_lang_from("", Some("#lang=en\n")), "es");
+    }
+
+    #[test]
+    fn the_language_decides_both_the_posix_locale_and_the_language_list() {
+        // foot refuses to render under a non-UTF-8 locale, so the POSIX name
+        // matters as much as the choice.
+        let mut env = Vec::new();
+        overlay_locale_for(&mut env, "en");
+        let vars = as_strings(&env);
+        assert!(vars.contains(&"LANG=en_US.UTF-8".to_string()), "{vars:?}");
+        assert!(vars.contains(&"LANGUAGE=en".to_string()), "{vars:?}");
+
+        let mut env = Vec::new();
+        overlay_locale_for(&mut env, "es");
+        let vars = as_strings(&env);
+        assert!(vars.contains(&"LANG=es_ES.UTF-8".to_string()), "{vars:?}");
+        // Spanish falls back to English, not to nothing: a string with no
+        // Spanish translation should still come out readable.
+        assert!(vars.contains(&"LANGUAGE=es:en".to_string()), "{vars:?}");
+    }
+
+    #[test]
+    fn the_locale_overlay_replaces_rather_than_appends() {
+        // The base CHILD_ENV already carries a LANG. Two LANG entries in one
+        // environment is not "the last one wins" for every libc, so the old
+        // one has to go.
+        let mut env = vec![
+            CString::new("LANG=C").unwrap(),
+            CString::new("LANGUAGE=de").unwrap(),
+            CString::new("LC_ALL=C").unwrap(),
+            CString::new("PATH=/bin").unwrap(),
+        ];
+        overlay_locale_for(&mut env, "es");
+        let vars = as_strings(&env);
+        assert_eq!(vars.iter().filter(|v| v.starts_with("LANG=")).count(), 1);
+        assert_eq!(
+            vars.iter().filter(|v| v.starts_with("LANGUAGE=")).count(),
+            1
+        );
+        // LC_ALL overrides LANG in every libc, so leaving a stale one behind
+        // would silently beat the language just chosen.
+        assert!(!vars.iter().any(|v| v.starts_with("LC_ALL=")), "{vars:?}");
+        assert!(vars.contains(&"PATH=/bin".to_string()), "{vars:?}");
+    }
+
+    // -- The timezone ------------------------------------------------------
+
+    #[test]
+    fn the_timezone_precedence_is_tz_then_country_then_the_file() {
+        assert_eq!(
+            tz_from("tz=Asia/Tokyo", Some("tz=Europe/Berlin\n")),
+            "Asia/Tokyo"
+        );
+        assert_eq!(tz_from("country=US", None), "America/New_York");
+        // `tz=` beats `country=` on the same command line.
+        assert_eq!(tz_from("country=US:tz=Asia/Tokyo", None), "Asia/Tokyo");
+        assert_eq!(tz_from("", Some("tz=Europe/Berlin\n")), "Europe/Berlin");
+        assert_eq!(tz_from("", Some("country=US\n")), "America/New_York");
+        assert_eq!(tz_from("", None), "Europe/Madrid");
+    }
+
+    #[test]
+    fn an_empty_or_truncated_timezone_falls_through_instead_of_meaning_utc() {
+        // `TZ=` is not "unset" to a libc: it reads as UTC. A half-written file
+        // or a zero-filled tail after an unclean power cut would otherwise put
+        // the clock an hour or two off with nothing to explain it.
+        assert_eq!(tz_from("tz=", Some("tz=Europe/Berlin\n")), "Europe/Berlin");
+        assert_eq!(tz_from("tz=", None), "Europe/Madrid");
+        assert_eq!(tz_from("", Some("tz=\n")), "Europe/Madrid");
+        assert_eq!(tz_from("", Some("tz=\ncountry=US\n")), "America/New_York");
+        assert_eq!(
+            tz_from("country=", Some("tz=Europe/Berlin\n")),
+            "Europe/Berlin"
+        );
+        // And an empty `country=` in the FILE is not a country either.
+        assert_eq!(tz_from("", Some("country=\n")), "Europe/Madrid");
+    }
+
+    #[test]
+    fn the_timezone_file_ignores_blanks_and_comments_and_takes_the_last_setting() {
+        let file = "# escrito por eclipse-tz\n\n  tz=Europe/Berlin  \n";
+        assert_eq!(tz_from("", Some(file)), "Europe/Berlin");
+        assert_eq!(tz_from("", Some("#tz=Asia/Tokyo\n")), "Europe/Madrid");
+        // Rewritten in place by `eclipse-tz`, so a duplicated key is the last
+        // write, not the first.
+        assert_eq!(
+            tz_from("", Some("tz=Asia/Tokyo\ntz=Europe/Berlin\n")),
+            "Europe/Berlin"
+        );
+    }
+
+    #[test]
+    fn a_country_this_image_does_not_know_lands_on_the_default_zone() {
+        assert_eq!(tz_for_country("US"), "America/New_York");
+        assert_eq!(tz_for_country("us"), "America/New_York");
+        assert_eq!(tz_for_country("ES"), "Europe/Madrid");
+        assert_eq!(tz_for_country("FR"), "Europe/Madrid");
+    }
+
+    #[test]
+    fn a_timezone_with_a_nul_byte_does_not_abort_pid_one() {
+        // A zero-filled tail after an unclean power cut reaches `CString::new`
+        // as an interior NUL. PID 1 must not die on the first spawn.
+        let mut env = vec![CString::new("TZ=UTC").unwrap()];
+        overlay_tz_with(&mut env, "Europe/\0Madrid");
+        let vars = as_strings(&env);
+        assert!(!vars.iter().any(|v| v.starts_with("TZ=")), "{vars:?}");
+
+        let mut env = vec![CString::new("TZ=UTC").unwrap()];
+        overlay_tz_with(&mut env, "Asia/Tokyo");
+        assert_eq!(as_strings(&env), vec!["TZ=Asia/Tokyo".to_string()]);
+    }
+
+    // -- Service files -----------------------------------------------------
+
+    #[test]
+    fn a_service_file_parses_every_key_it_documents() {
+        let svc = parse_service(
+            "labwc",
+            "# el compositor\n\
+             exec = /usr/local/bin/labwc --config /etc/labwc\n\
+             type = respawn\n\
+             after = seatd gtk-caches dbus\n\
+             desktop = labwc\n\
+             log = /tmp/labwc.log\n\
+             wait_socket = /run/seatd.sock\n\
+             wait_path = /dev/input\n",
+        )
+        .expect("parsea");
+        assert_eq!(svc.name, "labwc");
+        assert_eq!(
+            svc.exec,
+            vec!["/usr/local/bin/labwc", "--config", "/etc/labwc"]
+        );
+        assert_eq!(svc.kind, Kind::Respawn);
+        assert_eq!(svc.after, vec!["seatd", "gtk-caches", "dbus"]);
+        assert_eq!(svc.desktop.as_deref(), Some("labwc"));
+        assert_eq!(svc.log.as_deref(), Some("/tmp/labwc.log"));
+        assert_eq!(svc.wait_socket.as_deref(), Some("/run/seatd.sock"));
+        assert_eq!(svc.wait_path.as_deref(), Some("/dev/input"));
+        // Not set means not set, not an empty string.
+        assert_eq!(svc.cmdline, None);
+    }
+
+    #[test]
+    fn a_service_without_exec_is_refused_rather_than_started_empty() {
+        assert!(parse_service("vacio", "type = respawn\n").is_none());
+        assert!(parse_service("vacio", "exec =   \n").is_none());
+        assert!(parse_service("vacio", "").is_none());
+        // A line with no `=` is not a setting, so this has no exec either.
+        assert!(parse_service("vacio", "exec /usr/bin/foo\n").is_none());
+    }
+
+    #[test]
+    fn a_value_may_contain_the_separator() {
+        // `split_once`, not `split`: a flag with its own `=` has to survive.
+        let svc = parse_service("x", "exec = /bin/sh -c a=b\n").expect("parsea");
+        assert_eq!(svc.exec, vec!["/bin/sh", "-c", "a=b"]);
+        let svc = parse_service("x", "exec = /b/f\nlog = /tmp/a=b.log\n").expect("parsea");
+        assert_eq!(svc.log.as_deref(), Some("/tmp/a=b.log"));
+    }
+
+    #[test]
+    fn a_type_that_is_not_respawn_is_a_oneshot() {
+        // The default, and the documented spelling of it.
+        assert_eq!(
+            parse_service("x", "exec = /b/f\n").unwrap().kind,
+            Kind::Oneshot
+        );
+        let svc = parse_service("x", "exec = /b/f\ntype = oneshot\n").unwrap();
+        assert_eq!(svc.kind, Kind::Oneshot);
+        // A typo also lands here -- deliberately, because supervising something
+        // forever on a guess is worse -- and now says so in the log.
+        let svc = parse_service("x", "exec = /b/f\ntype = respwan\n").unwrap();
+        assert_eq!(svc.kind, Kind::Oneshot);
+        // Case matters: the format is lowercase.
+        let svc = parse_service("x", "exec = /b/f\ntype = Respawn\n").unwrap();
+        assert_eq!(svc.kind, Kind::Oneshot);
+    }
+
+    #[test]
+    fn whitespace_and_comments_around_a_setting_are_not_part_of_it() {
+        let svc = parse_service(
+            "x",
+            "\n   # comentario\n\n   exec   =   /bin/foo   \n  type =  respawn  \n",
+        )
+        .expect("parsea");
+        assert_eq!(svc.exec, vec!["/bin/foo"]);
+        assert_eq!(svc.kind, Kind::Respawn);
+    }
+
+    // -- Start order -------------------------------------------------------
+
+    fn svc_named(name: &str, after: &[&str]) -> Service {
+        let mut text = String::from("exec = /bin/true\n");
+        if !after.is_empty() {
+            text.push_str(&format!("after = {}\n", after.join(" ")));
+        }
+        parse_service(name, &text).expect("parsea")
+    }
+
+    fn order_of(defs: &[(&str, &[&str])]) -> Vec<String> {
+        let mut map = BTreeMap::new();
+        for (name, after) in defs {
+            map.insert(name.to_string(), svc_named(name, after));
+        }
+        ordered_names(&map)
+    }
+
+    fn before(order: &[String], first: &str, second: &str) -> bool {
+        let pos = |n: &str| order.iter().position(|x| x == n);
+        match (pos(first), pos(second)) {
+            (Some(a), Some(b)) => a < b,
+            _ => false,
+        }
+    }
+
+    #[test]
+    fn a_dependency_starts_before_the_service_that_lists_it() {
+        // "labwc" < "seatd" alphabetically, so a map-order walk gets this
+        // backwards -- and did: labwc then parked ~10 s on the seatd socket.
+        let order = order_of(&[("labwc", &["seatd"]), ("seatd", &[])]);
+        assert!(before(&order, "seatd", "labwc"), "{order:?}");
+        assert_eq!(order.len(), 2);
+    }
+
+    #[test]
+    fn a_whole_dependency_chain_comes_out_in_order() {
+        // Named so the alphabetical order is the exact reverse of the required
+        // one: nothing but the dependency walk can produce this.
+        let order = order_of(&[("c", &["b"]), ("b", &["a"]), ("a", &[]), ("d", &["b", "c"])]);
+        assert_eq!(order, vec!["a", "b", "c", "d"]);
+    }
+
+    #[test]
+    fn the_real_service_graph_orders_seatd_and_dbus_before_the_compositor() {
+        let order = order_of(&[
+            ("labwc", &["seatd", "gtk-caches", "dbus"]),
+            ("seatd", &[]),
+            ("dbus", &[]),
+            ("gtk-caches", &["dbus"]),
+            ("lunarbg", &["labwc"]),
+            ("lunarbar", &["labwc"]),
+            ("udhcpc", &[]),
+            ("ntpd", &["udhcpc"]),
+        ]);
+        for dep in ["seatd", "gtk-caches", "dbus"] {
+            assert!(before(&order, dep, "labwc"), "{dep} tras labwc: {order:?}");
+        }
+        assert!(before(&order, "dbus", "gtk-caches"), "{order:?}");
+        assert!(before(&order, "labwc", "lunarbg"), "{order:?}");
+        assert!(before(&order, "labwc", "lunarbar"), "{order:?}");
+        assert!(before(&order, "udhcpc", "ntpd"), "{order:?}");
+        assert_eq!(order.len(), 8);
+    }
+
+    #[test]
+    fn a_dependency_cycle_still_boots_everything() {
+        // A bad `after =` must never wedge boot: PID 1 has nothing to fall back
+        // on. Every service is emitted exactly once, cycle or not.
+        let order = order_of(&[("a", &["b"]), ("b", &["a"]), ("c", &[])]);
+        assert_eq!(order.len(), 3);
+        assert!(order.contains(&"a".to_string()));
+        assert!(order.contains(&"b".to_string()));
+        // The one service outside the cycle still gets its turn.
+        assert!(order.contains(&"c".to_string()));
+    }
+
+    #[test]
+    fn a_service_that_lists_itself_is_not_a_deadlock() {
+        let order = order_of(&[("a", &["a"]), ("b", &[])]);
+        assert_eq!(order.len(), 2);
+    }
+
+    #[test]
+    fn a_dependency_that_is_not_installed_is_not_waited_for() {
+        // `desktop =` and `cmdline =` drop services BEFORE the order is
+        // computed, so a surviving service can list one that is gone. It must
+        // start in its normal turn: the dep will never arrive, so nothing is
+        // gained by holding it back. The EXACT order matters, not just that
+        // nothing was dropped -- a version that waits for the missing dep still
+        // emits everything, via the cycle fallback, only with labwc shoved to
+        // the end behind services that were supposed to follow it.
+        assert_eq!(
+            order_of(&[("labwc", &["xorg"]), ("seatd", &[])]),
+            vec!["labwc", "seatd"]
+        );
+        // And the same with a real dep alongside the missing one: the real one
+        // is still honoured.
+        assert_eq!(
+            order_of(&[("labwc", &["xorg", "seatd"]), ("seatd", &[])]),
+            vec!["seatd", "labwc"]
+        );
+    }
+
+    #[test]
+    fn the_order_is_the_same_every_boot() {
+        // Two services with no relation between them must not swap places from
+        // one boot to the next, or a boot-order bug is unreproducible.
+        let defs: &[(&str, &[&str])] = &[("b", &[]), ("a", &[]), ("c", &["a"])];
+        let once = order_of(defs);
+        for _ in 0..8 {
+            assert_eq!(order_of(defs), once);
+        }
+    }
+
+    // -- Bounded waits -----------------------------------------------------
+
+    #[test]
+    fn the_poll_pacing_is_fine_grained_only_at_the_start() {
+        // seatd binds its socket a few tens of ms after forking, so the first
+        // second is polled at 10 ms to release the dependent service almost at
+        // once; after that a daemon that never arrives must cost no churn.
+        assert_eq!(poll_step(Duration::ZERO), Duration::from_millis(10));
+        assert_eq!(
+            poll_step(Duration::from_millis(999)),
+            Duration::from_millis(10)
+        );
+        assert_eq!(
+            poll_step(Duration::from_secs(1)),
+            Duration::from_millis(100)
+        );
+        assert_eq!(
+            poll_step(Duration::from_secs(9)),
+            Duration::from_millis(100)
+        );
+    }
+
+    #[test]
+    fn a_wait_that_is_already_satisfied_returns_at_once() {
+        let start = Instant::now();
+        assert_eq!(
+            wait_until(Duration::from_secs(30), || true, || false),
+            Wait::Ready
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "{:?}",
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    fn a_shutdown_request_ends_a_wait_instead_of_serving_out_its_timeout() {
+        // This is the whole point of installing the handlers WITHOUT SA_RESTART.
+        // Boot parks up to 10 s on the seatd socket and 8 s each on /dev/input
+        // and its settle, all before the compositor starts: a Ctrl-Alt-Del in
+        // there used to go unanswered for the sum of them, because
+        // `std::thread::sleep` restarts itself on EINTR.
+        let start = Instant::now();
+        assert_eq!(
+            wait_until(Duration::from_secs(30), || false, || true),
+            Wait::Stopped
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "{:?}",
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    fn a_wait_that_is_never_satisfied_reports_a_timeout() {
+        let start = Instant::now();
+        assert_eq!(
+            wait_until(Duration::from_millis(120), || false, || false),
+            Wait::TimedOut
+        );
+        // It really waited, rather than falling straight through.
+        assert!(
+            start.elapsed() >= Duration::from_millis(100),
+            "{:?}",
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    fn something_that_arrives_during_the_last_sleep_is_not_reported_missing() {
+        // A service sent into its backoff over a socket that IS there is a
+        // 10-second stall for nothing.
+        let calls = std::cell::Cell::new(0);
+        let outcome = wait_until(
+            Duration::from_millis(40),
+            || {
+                calls.set(calls.get() + 1);
+                // false while the loop runs, true by the final look
+                calls.get() > 4
+            },
+            || false,
+        );
+        assert_eq!(outcome, Wait::Ready, "{} llamadas", calls.get());
+    }
+
+    #[test]
+    fn the_settle_wait_holds_on_for_a_device_node_that_arrives_late() {
+        // Without udevd there is NO input hotplug: libinput scans /dev/input
+        // exactly once, at compositor startup. Waiting for the FIRST node let
+        // labwc start between the keyboard (event0) and a slower-enumerating
+        // mouse, which then stayed invisible for the whole session. So the
+        // settle clock has to RESTART every time the listing changes, not run
+        // from the first look.
+        let dir = std::env::temp_dir().join(format!("eclipse-settle-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let d = dir.clone();
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(120));
+            fs::write(d.join("event0"), b"teclado").unwrap();
+            std::thread::sleep(Duration::from_millis(250));
+            fs::write(d.join("event1"), b"raton").unwrap();
+        });
+
+        let start = Instant::now();
+        wait_for_dir_settled(
+            &dir.display().to_string(),
+            Duration::from_secs(5),
+            Duration::from_millis(300),
+        );
+        let waited = start.elapsed();
+        writer.join().unwrap();
+
+        // The mouse was there when the wait returned: that is the bug, stated
+        // as an observation rather than as a duration.
+        let entries = fs::read_dir(&dir).unwrap().count();
+        assert_eq!(entries, 2, "volvio con {entries} nodos tras {waited:?}");
+        // And it returned because it settled, not because it timed out.
+        assert!(
+            waited < Duration::from_secs(5),
+            "agoto el plazo: {waited:?}"
+        );
+        // The settle really was observed after the LAST change, so the wait
+        // cannot be shorter than the last arrival plus the settle.
+        assert!(
+            waited >= Duration::from_millis(600),
+            "volvio pronto: {waited:?}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_settle_wait_gives_up_on_a_machine_with_no_input_at_all() {
+        // Bounded, so a genuinely input-less machine still boots.
+        let dir = std::env::temp_dir().join(format!("eclipse-settle-none-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let start = Instant::now();
+        wait_for_dir_settled(
+            &dir.display().to_string(),
+            Duration::from_millis(400),
+            Duration::from_millis(100),
+        );
+        let waited = start.elapsed();
+        assert!(
+            waited >= Duration::from_millis(350),
+            "no espero: {waited:?}"
+        );
+        assert!(waited < Duration::from_secs(3), "no se rindio: {waited:?}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // -- The renderer policy -----------------------------------------------
+    //
+    // Three places implement this: here, the `/etc/profile` block and the
+    // `/usr/local/bin/labwc` wrapper (the last two written by `xtask`, and
+    // checked against each other there). A session whose compositor renders
+    // with one renderer while its clients target another composites nothing.
+
+    const NVIDIA: Option<&str> = Some("0x10de\n");
+    const VIRTIO: Option<&str> = Some("0x1af4\n");
+
+    fn renderer_env(cmdline: &str, vendor: Option<&str>, degraded: bool) -> Vec<String> {
+        let r = renderer_mode_from(cmdline, vendor);
+        as_strings(&child_env_for(r, vendor, cmdline, degraded))
+    }
+
+    fn var<'a>(env: &'a [String], key: &str) -> Option<&'a str> {
+        env.iter()
+            .find_map(|e| e.strip_prefix(key))
+            .map(|v| v.trim_start_matches('='))
+    }
+
+    #[test]
+    fn an_explicit_renderer_token_beats_the_detected_gpu() {
+        // And `renderer=gl` must not swallow `renderer=gl-sw`.
+        assert!(matches!(
+            renderer_mode_from("renderer=pixman", NVIDIA),
+            Renderer::Pixman
+        ));
+        assert!(matches!(
+            renderer_mode_from("renderer=gl-sw", NVIDIA),
+            Renderer::GlSw
+        ));
+        assert!(matches!(
+            renderer_mode_from("renderer=gl", VIRTIO),
+            Renderer::Gl
+        ));
+        // Most-specific first: with both spellings present gl-sw wins, which is
+        // the safer of the two.
+        assert!(matches!(
+            renderer_mode_from("renderer=gl:renderer=gl-sw", NVIDIA),
+            Renderer::GlSw
+        ));
+    }
+
+    #[test]
+    fn an_nvidia_card_without_the_kernel_flag_is_not_a_gpu_session() {
+        // Without `nvidia.nouveau_uapi` the DRM node identifies as "zcore" and
+        // NVK enumerates nothing, so auto-detection must pick pixman. Returning
+        // Gl here only bought a doomed zink probe.
+        assert!(matches!(
+            renderer_mode_from("LOG=warn", NVIDIA),
+            Renderer::Pixman
+        ));
+        assert!(matches!(
+            renderer_mode_from("nvidia.nouveau_uapi", NVIDIA),
+            Renderer::Gl
+        ));
+    }
+
+    #[test]
+    fn autodetection_covers_the_three_machines_this_image_boots_on() {
+        // QEMU's virtio-gpu: software GL, which renders everywhere.
+        assert!(matches!(renderer_mode_from("", VIRTIO), Renderer::GlSw));
+        // No card at all: pixman, which never leaves a black screen.
+        assert!(matches!(renderer_mode_from("", None), Renderer::Pixman));
+        // A card that reports an empty vendor is not a card.
+        assert!(matches!(
+            renderer_mode_from("", Some("  \n")),
+            Renderer::Pixman
+        ));
+        // Case-insensitive, because sysfs spelling is not ours to assume -- and
+        // it has to hold through the WHOLE policy, not only the detection: the
+        // client-side zink pin asks the same question a second time, and the two
+        // answers disagreeing is a compositor and its clients on different
+        // stacks.
+        assert!(matches!(
+            renderer_mode_from("nvidia.nouveau_uapi", Some("0X10DE\n")),
+            Renderer::Gl
+        ));
+        let upper = renderer_env(
+            "nvidia.nouveau_uapi:nvidia.wlr_gles2",
+            Some("0X10DE\n"),
+            false,
+        );
+        let lower = renderer_env("nvidia.nouveau_uapi:nvidia.wlr_gles2", NVIDIA, false);
+        assert_eq!(var(&upper, "WLR_RENDERER"), Some("gles2"), "{upper:?}");
+        assert_eq!(var(&upper, "GALLIUM_DRIVER"), Some("zink"), "{upper:?}");
+        assert_eq!(upper, lower, "la caja del vendor cambia la politica");
+    }
+
+    #[test]
+    fn the_gpu_session_is_opt_in_and_pins_clients_to_the_same_stack() {
+        // zink+NVK is the only GL this uAPI implements, so the compositor and
+        // its clients have to be pinned to it together.
+        let env = renderer_env("renderer=gl:nvidia.wlr_vulkan", NVIDIA, false);
+        assert_eq!(var(&env, "WLR_RENDERER"), Some("vulkan"), "{env:?}");
+        assert_eq!(var(&env, "GALLIUM_DRIVER"), Some("zink"), "{env:?}");
+        assert_eq!(
+            var(&env, "MESA_LOADER_DRIVER_OVERRIDE"),
+            Some("zink"),
+            "{env:?}"
+        );
+
+        let env = renderer_env("renderer=gl:nvidia.wlr_gles2", NVIDIA, false);
+        assert_eq!(var(&env, "WLR_RENDERER"), Some("gles2"), "{env:?}");
+        assert_eq!(var(&env, "GALLIUM_DRIVER"), Some("zink"), "{env:?}");
+
+        // Without either flag the session stays on the proven software path,
+        // and must NOT carry the zink pin: pinning GL clients to a stack the
+        // compositor is not using is the mix that renders without compositing.
+        let env = renderer_env("renderer=gl", NVIDIA, false);
+        assert_eq!(var(&env, "WLR_RENDERER"), Some("pixman"), "{env:?}");
+        assert_eq!(var(&env, "GALLIUM_DRIVER"), None, "{env:?}");
+        assert_eq!(var(&env, "LIBGL_ALWAYS_SOFTWARE"), Some("1"), "{env:?}");
+    }
+
+    #[test]
+    fn the_gl_image_on_a_machine_with_no_nvidia_card_pins_software_gl() {
+        // This is the `GL=1` image under QEMU: `renderer=gl` on virtio. Leaving
+        // the environment unpinned made labwc default to pixman while clients
+        // probed Mesa's own defaults, and that mix rendered without ever
+        // compositing -- glxgears printed FPS with no window ever appearing.
+        // It has to land on the SAME stack as `renderer=gl-sw`.
+        let gl = renderer_env("renderer=gl", VIRTIO, false);
+        let gl_sw = renderer_env("renderer=gl-sw", VIRTIO, false);
+        assert_eq!(var(&gl, "WLR_RENDERER"), Some("gles2"), "{gl:?}");
+        assert_eq!(var(&gl, "LIBGL_ALWAYS_SOFTWARE"), Some("1"), "{gl:?}");
+        assert_eq!(var(&gl, "WLR_RENDERER_ALLOW_SOFTWARE"), Some("1"), "{gl:?}");
+        for key in [
+            "WLR_RENDERER",
+            "LIBGL_ALWAYS_SOFTWARE",
+            "WLR_RENDERER_ALLOW_SOFTWARE",
+            "SDL_RENDER_DRIVER",
+        ] {
+            assert_eq!(var(&gl, key), var(&gl_sw, key), "{key} difiere");
+        }
+    }
+
+    #[test]
+    fn the_compositor_renderer_and_the_client_gl_never_disagree() {
+        // The invariant behind all of the above, over every combination this
+        // image can boot with: pixman clients must be on software GL, and a
+        // hardware-GL compositor must not be handed software-GL clients.
+        for cmdline in [
+            "",
+            "renderer=pixman",
+            "renderer=gl",
+            "renderer=gl-sw",
+            "nvidia.nouveau_uapi",
+            "renderer=gl:nvidia.wlr_gles2",
+            "renderer=gl:nvidia.wlr_vulkan",
+        ] {
+            for vendor in [NVIDIA, VIRTIO, None] {
+                for degraded in [false, true] {
+                    let env = renderer_env(cmdline, vendor, degraded);
+                    let wlr = var(&env, "WLR_RENDERER").unwrap_or("");
+                    let soft = var(&env, "LIBGL_ALWAYS_SOFTWARE") == Some("1");
+                    let zink = var(&env, "GALLIUM_DRIVER") == Some("zink");
+                    let ctx = format!("{cmdline:?} {vendor:?} degraded={degraded}: {env:?}");
+                    assert!(!wlr.is_empty(), "sin WLR_RENDERER en {ctx}");
+                    // A hardware-GL compositor and a software-GL client pin
+                    // cannot both be right.
+                    assert!(!(zink && soft), "zink y software GL a la vez en {ctx}");
+                    // The zink pin only ever goes with a GPU renderer.
+                    if zink {
+                        assert!(wlr == "vulkan" || wlr == "gles2", "zink con {wlr} en {ctx}");
+                    }
+                    // pixman composites on the CPU, so its clients must not be
+                    // left probing for hardware GL.
+                    if wlr == "pixman" {
+                        assert!(!zink, "pixman con zink en {ctx}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_degraded_compositor_drops_to_pixman_even_though_the_flag_asked_for_gpu() {
+        // After COMPOSITOR_DEGRADE_AFTER exits on the GPU renderer the desktop
+        // has to come back on pixman, or the machine never reaches a desktop
+        // again this boot.
+        let asked = "renderer=gl:nvidia.wlr_gles2";
+        assert_eq!(
+            var(&renderer_env(asked, NVIDIA, false), "WLR_RENDERER"),
+            Some("gles2")
+        );
+        let degraded = renderer_env(asked, NVIDIA, true);
+        assert_eq!(
+            var(&degraded, "WLR_RENDERER"),
+            Some("pixman"),
+            "{degraded:?}"
+        );
+        assert_eq!(var(&degraded, "GALLIUM_DRIVER"), None, "{degraded:?}");
+        // And the counter only counts exits when the GPU was actually asked for.
+        assert!(gpu_compositor_requested_in(asked));
+        assert!(gpu_compositor_requested_in("nvidia.wlr_vulkan"));
+        assert!(!gpu_compositor_requested_in(
+            "renderer=gl:nvidia.nouveau_uapi"
+        ));
+    }
+
+    #[test]
+    fn every_service_gets_the_runtime_dir_the_wayland_socket_lives_in() {
+        // init does not source /etc/profile, so this base set is ALL a service
+        // gets. There is deliberately no WAYLAND_DISPLAY: the compositor creates
+        // the socket, and a client with none set looks for `wayland-0` inside
+        // XDG_RUNTIME_DIR. That is why this directory is not a free choice --
+        // the service files wait on /run/user/0/wayland-0 before starting the
+        // panel, so a different XDG_RUNTIME_DIR would leave init waiting on a
+        // path no client ever uses.
+        let env = renderer_env("", None, false);
+        assert_eq!(var(&env, "XDG_RUNTIME_DIR"), Some("/run/user/0"), "{env:?}");
+        for key in ["PATH", "HOME", "XDG_CONFIG_HOME"] {
+            assert!(var(&env, key).is_some(), "falta {key}: {env:?}");
+        }
+        // A relative PATH entry in PID 1's environment is every child's `.` in
+        // its search path.
+        let path = var(&env, "PATH").expect("PATH");
+        for seg in path.split(':') {
+            assert!(seg.starts_with('/'), "PATH relativo {seg:?} en {path:?}");
+        }
+        // Every entry is a NAME=VALUE pair; a bare name would be dropped by
+        // execve on some libcs and inherited on others.
+        for e in &env {
+            assert!(e.contains('='), "{e:?} no es NAME=VALUE");
+            assert!(!e.starts_with('='), "{e:?} no tiene nombre");
+        }
+    }
+
+    // -- Helpers -----------------------------------------------------------
+
+    fn as_strings(env: &[CString]) -> Vec<String> {
+        env.iter()
+            .map(|e| e.to_str().expect("utf-8").to_string())
+            .collect()
+    }
 }
