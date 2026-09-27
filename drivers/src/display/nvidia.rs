@@ -11349,6 +11349,51 @@ impl NvidiaGpu {
         s
     }
 
+    /// The channel an EXEC names must be the caller's own, and the RM-backed
+    /// one. The id NVK submits against is the one CHANNEL_ALLOC handed it,
+    /// and ids are assigned "lowest free" -- so only the FIRST channel of a
+    /// boot is 0; demanding 0 here once rejected every later one with a bare
+    /// EINVAL and no log line at all. A channel the caller does not hold is
+    /// ENOENT, as `nouveau_exec_ioctl_exec` answers when the id is not in the
+    /// caller's list (it was EINVAL here); a discovery channel of the
+    /// caller's own, with no GR channel/GPFIFO behind it, is ENODEV.
+    fn exec_channel_check(&self, channel: u32, owner_pid: u64) -> Result<(), i32> {
+        use super::nouveau_uapi as nv;
+        let chans = self.nouveau_channels.lock();
+        // `drm_nouveau_exec.channel` is __u32 while
+        // `drm_nouveau_channel_alloc.channel` is __s32 -- that asymmetry is in
+        // nouveau_drm.h itself. Ids we hand out are never negative, so compare
+        // in the unsigned domain.
+        let mine = chans
+            .iter()
+            .find(|c| c.id >= 0 && c.id as u32 == channel && c.owner_pid == owner_pid);
+        match mine {
+            Some(c) if c.rm_backed => Ok(()),
+            Some(_) => {
+                let rm_owner = chans.iter().find(|c| c.rm_backed).map(|c| c.owner_pid);
+                drop(chans);
+                crate::klog_warn!(
+                    "[nouveau-uapi] EXEC: channel={} belongs to pid={} but is a DISCOVERY channel (no GR channel/GPFIFO behind it); the RM-backed channel is held by pid={:?}",
+                    channel,
+                    owner_pid,
+                    rm_owner
+                );
+                Err(nv::ENODEV)
+            }
+            None => {
+                let known: Vec<i32> = chans.iter().map(|c| c.id).collect();
+                drop(chans);
+                crate::klog_warn!(
+                    "[nouveau-uapi] EXEC: channel={} is not owned by pid={} (live channels: {:?})",
+                    channel,
+                    owner_pid,
+                    known
+                );
+                Err(nv::ENOENT)
+            }
+        }
+    }
+
     fn ctx_idx_for_pid(&self, owner_pid: u64) -> u32 {
         // Only READY entries route: a mid-build ctx must not receive class
         // objects or submissions (callers that can legitimately race a build
@@ -12896,6 +12941,14 @@ impl NvidiaGpu {
                 {
                     return Err(nv::EFAULT);
                 }
+                // The channel first, for EVERY exec, the empty probe included:
+                // Linux's `nouveau_exec_ioctl_exec` finds the channel in the
+                // caller's own list before it looks at anything else, and
+                // answers ENOENT when it is not there. The probe path used to
+                // skip this: an empty EXEC against a freed channel, another
+                // process's, or a made-up id answered 0 and signaled its sigs
+                // as if that channel had drained.
+                self.exec_channel_check(req.channel, owner_pid)?;
                 // Every sig handle must exist BEFORE anything happens, as in
                 // Linux, where `nouveau_job_submit` looks the whole list up
                 // (`nouveau_job_fence_attach_prepare`) before the job is armed:
@@ -13174,47 +13227,6 @@ impl NvidiaGpu {
                         req.push_count, MAX_EXEC_PUSH, req.push_ptr
                     );
                     return Err(nv::EOPNOTSUPP);
-                }
-                // The channel id NVK submits against is the one CHANNEL_ALLOC
-                // handed it, and ids are assigned "lowest free" -- so only the
-                // FIRST channel of a boot is 0. Demanding 0 here rejected every
-                // later one with a bare EINVAL and no log line at all. Check
-                // what actually matters instead: the caller owns this channel
-                // AND it is the RM-backed one.
-                {
-                    let chans = self.nouveau_channels.lock();
-                    // `drm_nouveau_exec.channel` is __u32 while
-                    // `drm_nouveau_channel_alloc.channel` is __s32 -- that
-                    // asymmetry is in nouveau_drm.h itself. Ids we hand out are
-                    // never negative, so compare in the unsigned domain.
-                    let mine = chans.iter().find(|c| {
-                        c.id >= 0 && c.id as u32 == req.channel && c.owner_pid == owner_pid
-                    });
-                    match mine {
-                        Some(c) if c.rm_backed => {}
-                        Some(_) => {
-                            let rm_owner = chans.iter().find(|c| c.rm_backed).map(|c| c.owner_pid);
-                            drop(chans);
-                            crate::klog_warn!(
-                                "[nouveau-uapi] EXEC: channel={} belongs to pid={} but is a DISCOVERY channel (no GR channel/GPFIFO behind it); the RM-backed channel is held by pid={:?}",
-                                req.channel,
-                                owner_pid,
-                                rm_owner
-                            );
-                            return Err(nv::ENODEV);
-                        }
-                        None => {
-                            let known: Vec<i32> = chans.iter().map(|c| c.id).collect();
-                            drop(chans);
-                            crate::klog_warn!(
-                                "[nouveau-uapi] EXEC: channel={} is not owned by pid={} (live channels: {:?})",
-                                req.channel,
-                                owner_pid,
-                                known
-                            );
-                            return Err(nv::EINVAL);
-                        }
-                    }
                 }
                 let pushes = unsafe {
                     core::slice::from_raw_parts(
@@ -17160,10 +17172,10 @@ mod nouveau_bookkeeping_tests {
         channel_alloc(&gpu, B).unwrap();
         assert_eq!(
             exec(&gpu, B, ch, &p, &[], &[]),
-            Err(nv::EINVAL),
-            "B has one, but this channel id is A's"
+            Err(nv::ENOENT),
+            "B has one, but this channel id is A's: not in B's list (Linux ENOENT)"
         );
-        assert_eq!(exec(&gpu, A, ch + 7, &p, &[], &[]), Err(nv::EINVAL));
+        assert_eq!(exec(&gpu, A, ch + 7, &p, &[], &[]), Err(nv::ENOENT));
         // A channel opened before the RM attached is discovery-only for
         // good, even once its owner has a real one: the client must free it
         // and CHANNEL_ALLOC again (the driver's own log says so).
@@ -17463,6 +17475,50 @@ mod nouveau_bookkeeping_tests {
     /// early, and the application re-recorded command buffers the GPU was
     /// still reading. The sigs now ride a probe fence appended behind the
     /// queued work; an idle ring has nothing to wait for.
+    /// The probe names a channel like any other EXEC, and Linux looks that
+    /// channel up before anything else (`nouveau_exec_ioctl_exec`): an id the
+    /// caller does not hold is ENOENT with nothing signaled. This arm used
+    /// to answer 0 and signal the sigs for any id at all -- a freed channel,
+    /// another process's, or one that never existed.
+    #[test]
+    fn an_empty_exec_needs_the_callers_own_channel_like_a_real_one() {
+        let _g = LOCK.lock();
+        let _live = LiveBytes::hold();
+        let gpu = gpu_rm();
+        let ch = client_with_pushbuf(&gpu, A);
+        let out = syncobj::create(false);
+        assert_eq!(
+            exec(&gpu, A, ch + 7, &[], &[], &[sync(out)]),
+            Err(nv::ENOENT),
+            "a channel that never existed"
+        );
+        assert_eq!(syncobj::query(out), Some(0), "nothing signaled");
+        // B has a channel of its own; A's id is not in B's list.
+        let ch_b = channel_alloc(&gpu, B).unwrap().channel as u32;
+        assert_ne!(ch_b, ch);
+        assert_eq!(
+            exec(&gpu, B, ch, &[], &[], &[sync(out)]),
+            Err(nv::ENOENT),
+            "another process's channel"
+        );
+        assert_eq!(
+            exec(&gpu, B, ch_b, &[], &[], &[sync(out)]),
+            Ok(0),
+            "B's own"
+        );
+        assert_eq!(syncobj::query(out), Some(1));
+        // A channel the caller freed is gone for the probe too (with a
+        // second channel still open, so the "no RM channel at all" gate at
+        // the top of the arm does not answer first).
+        let ch2 = channel_alloc(&gpu, A).unwrap().channel as u32;
+        assert_eq!(channel_free(&gpu, ch as i32, A), Ok(0));
+        assert_eq!(exec(&gpu, A, ch, &[], &[], &[]), Err(nv::ENOENT), "freed");
+        assert_eq!(exec(&gpu, A, ch2, &[], &[], &[]), Ok(0), "the live one");
+        assert!(syncobj::destroy(out));
+        gpu.nouveau_release_process(B);
+        gpu.nouveau_release_process(A);
+    }
+
     #[test]
     fn an_empty_exec_signals_behind_the_work_the_ring_still_has_queued() {
         let _g = LOCK.lock();
