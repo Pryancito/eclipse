@@ -798,6 +798,12 @@ pub(super) const VM_BIND_OP_UNMAP: u32 = 0x1;
 /// zero instead of faulting. NVK asks for these only for sparse Vulkan
 /// resources (`nvk_image.c`/`nvk_buffer.c`), never during device creation.
 pub(super) const VM_BIND_SPARSE: u32 = 1 << 8;
+/// `DRM_NOUVEAU_VM_BIND_RUN_ASYNC` (`drm_nouveau_vm_bind.flags`): the ops
+/// run as a job behind the request's wait list and signal its sig list
+/// after; without it the request is synchronous and, as in
+/// `nouveau_job_init`, may carry no syncs at all (EINVAL). NVK's bind
+/// context (`vkQueueBindSparse`) always sets it.
+pub(super) const VM_BIND_RUN_ASYNC: u32 = 0x1;
 /// In a `VM_BIND` op, the low byte of `flags` is the PTE kind mesa wants the
 /// mapping programmed with (`nouveau_ws_bo_bind` passes `pte_kind` straight
 /// through as `flags`). 0 means plain linear.
