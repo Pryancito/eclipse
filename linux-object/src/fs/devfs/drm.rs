@@ -4709,9 +4709,6 @@ pub fn repaint_for_cursor() {
         st.cursor.drawn = new.as_ref().map(|(x, y, w, h, _)| (*x, *y, *w, *h));
         (fb_id, old_rect, new)
     };
-    if fb_id == 0 {
-        return;
-    }
     let display = match primary_display() {
         Some(d) => d,
         None => return,
@@ -4720,11 +4717,32 @@ pub fn repaint_for_cursor() {
     // this point is the older path, kept only for a panel whose pixels cannot be
     // read back -- see [`repaint_cursor_from_panel`], and [`CursorUnder`] for the
     // black rectangles that reading the client's buffer here put on the screen.
+    //
+    // Asked BEFORE `crtc_fb` is looked at, because this path does not read the
+    // client's framebuffer and so does not care whether one is bound. `RMFB` of
+    // the framebuffer on the CRTC sets `crtc_fb` to 0 (see `rmfb_for`), which a
+    // client does on every surface resize and wlroots does whenever a buffer
+    // leaves its pool -- and bailing out there left the pointer undrawn on a
+    // panel holding a perfectly good frame, with `cursor.drawn` already moved to
+    // the new place, so the image sitting at the OLD place was never erased
+    // either. A pointer-shaped ghost, until the next full present.
     if repaint_cursor_from_panel(
         &*display,
         old_rect,
         new.as_ref().map(|(x, y, w, h, b)| (*x, *y, *w, *h, &**b)),
     ) {
+        return;
+    }
+    if fb_id == 0 {
+        // Nothing was drawn, so put back what the next move has to erase: the
+        // snapshot above already moved `cursor.drawn` to where the pointer was
+        // GOING, and leaving that lie is how the old image becomes permanent.
+        //
+        // No test can kill this line, and it stays: getting here needs a panel
+        // that cannot be read back AND no framebuffer bound, and the only thing
+        // that binds one again is a present, which repaints the whole frame and
+        // rubs out the evidence. It is still the wrong state to leave behind.
+        DRM_STATE.lock().cursor.drawn = old_rect;
         return;
     }
     // Same lifetime guard as `scanout_region`: this blits with the lock dropped.
