@@ -122,8 +122,13 @@ impl Syscall<'_> {
         // TODO: uninit buffer
         let mut data = vec![0; data_len];
         let actual_count = fifo.read(elem_size, &mut data, count)?;
+        // Checked for the same reason as `data_len`, which this can only be at
+        // most: a read never returns more elements than it was given room for.
+        let actual_len = actual_count
+            .checked_mul(elem_size)
+            .ok_or(ZxError::INVALID_ARGS)?;
         actual_count_ptr.write_if_not_null(actual_count)?;
-        user_bytes.write_array(&data[..actual_count * elem_size])?;
+        user_bytes.write_array(&data[..actual_len])?;
         Ok(())
     }
 }
