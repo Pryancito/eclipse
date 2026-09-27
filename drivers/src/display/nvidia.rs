@@ -12635,16 +12635,19 @@ impl NvidiaGpu {
                 } else {
                     &[]
                 };
-                // Every sig handle must exist BEFORE anything is waited for,
-                // bound or signaled (Linux looks the whole list up in
-                // `nouveau_job_fence_attach_prepare` before the job runs).
-                if let Some(sig) = sigs
+                // Every sig and wait handle must be the CALLER'S and live
+                // BEFORE anything is waited for, bound or signaled (Linux
+                // looks the whole list up in the caller's file,
+                // `nouveau_job_fence_attach_prepare` / `nouveau_job_add_deps`,
+                // before the job runs; another process's handle is ENOENT).
+                if let Some(s) = sigs
                     .iter()
-                    .find(|s| !crate::scheme::syncobj::exists(s.handle))
+                    .chain(waits.iter())
+                    .find(|s| !crate::scheme::syncobj::usable_by(owner_pid, s.handle))
                 {
                     crate::klog_warn!(
-                        "[nouveau-uapi] VM_BIND: sig syncobj handle={} is unknown -- nothing bound (ENOENT) pid={}",
-                        sig.handle,
+                        "[nouveau-uapi] VM_BIND: syncobj handle={} is unknown or not this process's -- nothing bound (ENOENT) pid={}",
+                        s.handle,
                         owner_pid
                     );
                     return Err(nv::ENOENT);
@@ -12801,20 +12804,40 @@ impl NvidiaGpu {
                 // after the handles before it had already been signaled --
                 // an error the caller reads as "nothing was submitted" and
                 // answers by submitting the batch again.
-                if req.sig_count > 0 {
-                    let sigs = unsafe {
-                        core::slice::from_raw_parts(
-                            req.sig_ptr as *const nv::DrmNouveauSync,
-                            req.sig_count as usize,
-                        )
+                // ...and every one of them, wait or sig, must be the CALLER'S:
+                // Linux finds them in the caller's own file, so another
+                // process's handle is ENOENT, whether it was going to be
+                // waited for or signaled. Before this a client could signal
+                // the compositor's release timeline with its own EXEC.
+                {
+                    let sigs = if req.sig_count > 0 && req.sig_ptr != 0 {
+                        unsafe {
+                            core::slice::from_raw_parts(
+                                req.sig_ptr as *const nv::DrmNouveauSync,
+                                req.sig_count as usize,
+                            )
+                        }
+                    } else {
+                        &[]
                     };
-                    if let Some(sig) = sigs
+                    let waits = if req.wait_count > 0 && req.wait_ptr != 0 {
+                        unsafe {
+                            core::slice::from_raw_parts(
+                                req.wait_ptr as *const nv::DrmNouveauSync,
+                                req.wait_count as usize,
+                            )
+                        }
+                    } else {
+                        &[]
+                    };
+                    if let Some(s) = sigs
                         .iter()
-                        .find(|s| !crate::scheme::syncobj::exists(s.handle))
+                        .chain(waits.iter())
+                        .find(|s| !crate::scheme::syncobj::usable_by(owner_pid, s.handle))
                     {
                         crate::klog_warn!(
-                            "[nouveau-uapi] EXEC: sig syncobj handle={} is unknown -- nothing submitted (ENOENT) pid={}",
-                            sig.handle,
+                            "[nouveau-uapi] EXEC: syncobj handle={} is unknown or not this process's -- nothing submitted (ENOENT) pid={}",
+                            s.handle,
                             owner_pid
                         );
                         return Err(nv::ENOENT);
@@ -19616,6 +19639,134 @@ mod nouveau_bookkeeping_tests {
         gpu.nouveau_release_process(A);
         assert_eq!(FAKE_RM.lock().bad, 0);
     }
+    /// Linux finds every syncobj an EXEC or a VM_BIND names -- to wait on
+    /// or to signal -- in the caller's own file, so another process's
+    /// handle is ENOENT and nothing is submitted. Here the handle space is
+    /// global and only the handle's existence was checked: a client could
+    /// signal the compositor's release timeline with an EXEC of its own,
+    /// or wait on its acquire points.
+    #[test]
+    fn an_exec_or_a_vm_bind_cannot_name_another_processes_syncobj() {
+        let _g = LOCK.lock();
+        let _live = LiveBytes::hold();
+        let gpu = gpu_rm_fast();
+        let ch_a = client_with_pushbuf(&gpu, A);
+        let ha = gem_new_rm(&gpu, 65536, nv::NOUVEAU_GEM_DOMAIN_GART, A)
+            .unwrap()
+            .handle;
+        const VA: u64 = 0x7f_4000_0000;
+        let mine = syncobj::create_for(A, false);
+        let theirs = syncobj::create_for(B, false);
+        let theirs_done = syncobj::create_for(B, true);
+        let nobodys = syncobj::create(false);
+        // As a sig: ENOENT, nothing on the ring, B's timeline untouched.
+        assert_eq!(
+            exec(&gpu, A, ch_a, &[push(PUSH_VA, 16)], &[], &[sync(theirs)]),
+            Err(nv::ENOENT)
+        );
+        // Nothing was submitted: the direct-submit channel behind A's
+        // context is not even built until the first EXEC goes through.
+        let nothing_on_the_ring = || !has_chan(1) || run_gpu(1).is_empty();
+        assert!(nothing_on_the_ring(), "nothing was submitted");
+        assert_eq!(syncobj::query_submitted(theirs), Some(0));
+        // Mixed in with A's own: still nothing at all (the whole list is
+        // looked up first), A's own sig not armed either.
+        assert_eq!(
+            exec(
+                &gpu,
+                A,
+                ch_a,
+                &[push(PUSH_VA, 16)],
+                &[],
+                &[sync(mine), sync(theirs)]
+            ),
+            Err(nv::ENOENT)
+        );
+        assert!(nothing_on_the_ring());
+        assert_eq!(syncobj::query_submitted(mine), Some(0));
+        // As a wait, even one B already signaled: ENOENT, no wait, no
+        // submit.
+        assert_eq!(
+            exec(
+                &gpu,
+                A,
+                ch_a,
+                &[push(PUSH_VA, 16)],
+                &[sync(theirs_done)],
+                &[sync(mine)]
+            ),
+            Err(nv::ENOENT)
+        );
+        assert!(nothing_on_the_ring());
+        assert_eq!(syncobj::query_submitted(mine), Some(0));
+        // The empty EXEC (NVK's health probe) with syncs: the same.
+        assert_eq!(
+            exec(&gpu, A, ch_a, &[], &[sync(theirs_done)], &[sync(mine)]),
+            Err(nv::ENOENT)
+        );
+        assert_eq!(syncobj::query_submitted(mine), Some(0));
+        // VM_BIND: its sigs and its waits alike, nothing bound.
+        let before = FAKE_RM.lock().calls.len();
+        assert_eq!(
+            vm_bind_sync(
+                &gpu,
+                A,
+                &mut [map(ha, VA, 65536)],
+                nv::VM_BIND_RUN_ASYNC,
+                &[],
+                &[sync(theirs)]
+            ),
+            Err(nv::ENOENT)
+        );
+        assert_eq!(
+            vm_bind_sync(
+                &gpu,
+                A,
+                &mut [map(ha, VA, 65536)],
+                nv::VM_BIND_RUN_ASYNC,
+                &[sync(theirs_done)],
+                &[sync(mine)]
+            ),
+            Err(nv::ENOENT)
+        );
+        assert_eq!(rm_calls_since(before), [] as [&str; 0]);
+        assert_eq!(syncobj::query(theirs), Some(0));
+        assert_eq!(syncobj::query(mine), Some(0));
+        // A's own, and a handle nobody holds (the kernel's): fine.
+        assert_eq!(
+            exec(
+                &gpu,
+                A,
+                ch_a,
+                &[push(PUSH_VA, 16)],
+                &[],
+                &[sync(mine), sync(nobodys)]
+            ),
+            Ok(0)
+        );
+        assert!(!run_gpu(1).is_empty(), "submitted");
+        assert_eq!(syncobj::query_submitted(mine), Some(1));
+        // Once B's syncobj reaches A through an fd (an opaque import, a
+        // reference of A's on it), A may name it.
+        assert!(syncobj::add_ref_for(A, theirs));
+        assert_eq!(
+            vm_bind_sync(
+                &gpu,
+                A,
+                &mut [map(ha, VA, 65536)],
+                nv::VM_BIND_RUN_ASYNC,
+                &[],
+                &[sync(theirs)]
+            ),
+            Ok(0)
+        );
+        assert_eq!(syncobj::query(theirs), Some(1), "signaled by A's bind");
+        assert_eq!(vm_bind_ops(&gpu, A, &mut [unmap(VA, 65536)]), Ok(0));
+        assert!(syncobj::destroy_for(A, theirs) && syncobj::destroy_for(A, mine));
+        assert!(syncobj::destroy_for(B, theirs) && syncobj::destroy_for(B, theirs_done));
+        assert!(syncobj::destroy(nobodys));
+    }
+
     /// `nouveau_uvmm_bind_job_submit` runs `bind_validate_op` over every
     /// op of a `VM_BIND` when the job is submitted, before the job waits
     /// its in-syncs or touches the VA space, so a batch with a bad op in
