@@ -49,7 +49,17 @@ unsafe impl GlobalAlloc for LockedHeap {
         let alloc = self.0.lock().allocate_layout(layout);
         match alloc {
             Ok((ptr, size)) => {
-                USED_MEMORY.fetch_add(size, Ordering::Relaxed);
+                // The REQUESTED size, not the block the buddy rounded it up to,
+                // because `dealloc` below subtracts `layout.size()` and the two
+                // have to be the same quantity. Counting `size` here and
+                // `layout.size()` there left the difference in the counter on
+                // every allocation that was not already a multiple of the
+                // buddy's minimum block: `heap_used()` climbed for ever, and
+                // once it passed `heap_total()` every reader of it -- the stats
+                // syscall, the OOM report -- was quoting a number larger than
+                // the heap. `memory_x86_64.rs` counts the requested size on
+                // both sides, and says so.
+                USED_MEMORY.fetch_add(layout.size(), Ordering::Relaxed);
                 // [diag] The kernel heap (Box/Vec/Arc/String, and every
                 // `*_zeroed` allocation) is carved from the SAME buddy arena as
                 // the coroutine stacks. `frame_alloc` already alias-checks the
@@ -104,14 +114,53 @@ pub fn insert_regions(regions: &[Range<PhysAddr>]) {
 }
 
 pub fn frame_alloc(frame_count: usize, align_log2: usize) -> Option<PhysAddr> {
-    let (ptr, size) = HEAP
-        .0
-        .lock()
-        .allocate::<u8>(align_log2 << PAGE_BITS, unsafe {
-            NonZeroUsize::new_unchecked(frame_count << PAGE_BITS)
-        })
-        .ok()?;
-    assert_eq!(size, frame_count << PAGE_BITS);
+    // No frames is no allocation. Said here because the `NonZeroUsize` below
+    // used to be `new_unchecked`, so a count of zero was undefined behaviour
+    // rather than a `None`, and because the give-back further down would
+    // otherwise hand the whole block straight back and return a pointer into
+    // freed memory.
+    if frame_count == 0 {
+        return None;
+    }
+    let want = frame_count.checked_shl(PAGE_BITS as u32)?;
+    // `align_log2` arrives in FRAMES -- `VMObjectPaged::new_contiguous` hands
+    // on `align_log2 - PAGE_SIZE_LOG2` -- and `allocate` wants an ORDER in
+    // bytes: `allocate_layout` passes it `layout.align().trailing_zeros()`. The
+    // two differ by `PAGE_BITS`, so the conversion is an ADDITION.
+    //
+    // It used to be `align_log2 << PAGE_BITS`, which shifts a log2 as if it
+    // were a count: `align_log2 = 1` asked for an alignment order of 4096, that
+    // is 2^4096 bytes. No layer of the buddy will honour an alignment that
+    // large, so every aligned request fell through to the oligarchy -- the
+    // max-order free list -- and took a max-order block to hold a couple of
+    // pages, or answered `NO_MEMORY` with the block it wanted lying free. Only
+    // `align_log2 == 0` came out right, which is every caller that is not
+    // asking for alignment, which is why nothing noticed.
+    let align_order = align_log2.checked_add(PAGE_BITS)?;
+    let align = 1usize.checked_shl(align_order as u32)?;
+    // And ask for at least `align` bytes, because that is the only alignment
+    // this allocator can actually promise: it hands out a block at its own
+    // order, `idx << size_order`, so what comes back is aligned to
+    // `next_power_of_two(size)` and no more. Its `align_order` argument is
+    // turned into a per-layer index alignment by a shift, which comes out zero
+    // for every alignment smaller than a layer's block, so asking for a coarse
+    // alignment on a small block is answered by a block that does not have it.
+    // Sizing the request for the alignment is what makes the answer true, and
+    // it is what the caller needs: these frames back `zx_vmo_create_contiguous`
+    // and DMA buffers, where an unaligned buffer is worse than a refusal.
+    let bytes = NonZeroUsize::new(want.max(align))?;
+    let (ptr, size) = HEAP.0.lock().allocate::<u8>(align_order, bytes).ok()?;
+    assert_eq!(size, bytes.get());
+    let base = ptr.as_ptr() as usize;
+    // Hand back the pages the alignment asked for and the caller did not, or
+    // they are lost until reboot: `frame_alloc` reports only the base, and the
+    // caller frees `frame_count` pages and no more.
+    if size > want {
+        HEAP.0.lock().deallocate(
+            unsafe { NonNull::new_unchecked((base + want) as *mut u8) },
+            size - want,
+        );
+    }
     // [diag] These frames back userspace VMOs, and they come out of the SAME
     // buddy arena as the kernel's coroutine stacks (the `GlobalAlloc` impl
     // above locks this very heap). Handing out a block that is already a live
@@ -125,9 +174,11 @@ pub fn frame_alloc(frame_count: usize, align_log2: usize) -> Option<PhysAddr> {
     // at hand-out — naming the aliasing BEFORE anything is corrupted. The
     // registry is plain atomics, so the cost is a short scan of relaxed loads
     // (the heap lock above is already released by this point).
-    frame_alias_check(ptr.as_ptr() as usize, size);
-    USED_MEMORY.fetch_add(size, Ordering::Relaxed);
-    Some(ptr.as_ptr() as PhysAddr - phys_to_virt_offset())
+    frame_alias_check(base, want);
+    // What the caller keeps, which is what `frame_dealloc` will subtract again,
+    // one page at a time.
+    USED_MEMORY.fetch_add(want, Ordering::Relaxed);
+    Some(base as PhysAddr - phys_to_virt_offset())
 }
 
 /// [diag] Panic loudly if a just-allocated frame range overlaps a live kernel
