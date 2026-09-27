@@ -14092,6 +14092,21 @@ impl NvidiaGpu {
                 if req.info.size == 0 || req.info.size > u32::MAX as u64 {
                     return Err(nv::EINVAL);
                 }
+                // `nouveau_bo_alloc`: the kind byte of `tile_flags` must be
+                // one the MMU has (`nvif_mmu_kind_valid` on `tu102_mmu_kind`:
+                // 0x07 and 0x0f are its invalid entries and nothing past
+                // 0x0f is in the table), or the object is refused before it
+                // exists. This accepted any byte, kept it for GEM_INFO and
+                // only VM_BIND looked at it. A compressible kind (0x08..=0x0e)
+                // is in the table and stays accepted, as before.
+                let kind = nv::tile_flags_kind(req.info.tile_flags);
+                if !nv::mmu_kind_valid(kind) {
+                    crate::klog_warn!(
+                        "[nouveau-uapi] GEM_NEW: tile_flags kind {:#04x} is not in the Turing MMU kind table -> EINVAL",
+                        kind
+                    );
+                    return Err(nv::EINVAL);
+                }
                 // Quotas before gem_alloc: one BO, per-pid live, and global live.
                 if req.info.size > GEM_NEW_MAX_SINGLE {
                     crate::klog_warn!(
