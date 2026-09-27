@@ -158,11 +158,11 @@ pub extern "C" fn os_free_mem(p_address: *mut c_void) {
 // ---------------------------------------------------------------------
 #[no_mangle]
 pub extern "C" fn os_get_monotonic_time_ns() -> NvU64 {
-    with_hooks(0, |h| h.monotonic_time_ns())
+    crate::hooks::clock_ns()
 }
 #[no_mangle]
 pub extern "C" fn os_get_monotonic_time_ns_hr() -> NvU64 {
-    with_hooks(0, |h| h.monotonic_time_ns())
+    crate::hooks::clock_ns()
 }
 /// Twin of `os_services::osGetMonotonicTickResolutionNs`, which said 1_000
 /// where this said 1. `gpu_timeout.c` adds one of these to every GPU timeout,
