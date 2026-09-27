@@ -515,10 +515,38 @@ struct BasicPolicyV2 {
 const ZX_POL_OVERRIDE_ALLOW: u32 = 0;
 const ZX_POL_OVERRIDE_DENY: u32 = 1;
 
+/// How many basic policies one `zx_job_set_policy` call may carry,
+/// `ZX_POL_MAX`.
+///
+/// One per condition: `PolicyCondition` has this many, and `JobPolicy` is an
+/// array indexed by them, so a longer array can only be repeats of conditions
+/// already named. Zircon refuses a longer one, and refuses an empty one too.
+const MAX_BASIC_POLICIES: u32 = 15;
+
+/// The number of policies to read, or `INVALID_ARGS`.
+///
+/// `count` used to go straight into `read_array`, which is a
+/// `Vec::with_capacity` of `count * size_of::<BasicPolicy>()` and cannot fail:
+/// `zx_job_set_policy(job, ZX_JOB_POL_RELATIVE, ZX_JOB_POL_BASIC, buf,
+/// 0xffff_ffff)` asks the kernel heap for 48 GiB. `read_array` does check that
+/// the range is mapped first, so the caller has to have mapped it -- which a
+/// lazily committed VMO makes cheap -- and nothing else stood in the way. No
+/// privilege is needed: a job a process creates itself comes with `SET_POLICY`.
+///
+/// A count of zero used to read nothing and apply nothing, and answer `OK`. It
+/// is `INVALID_ARGS` in Zircon, and saying so is what tells a caller whose
+/// count went wrong apart from one that asked for nothing.
+fn basic_policy_count(count: u32) -> ZxResult<usize> {
+    if count == 0 || count > MAX_BASIC_POLICIES {
+        return Err(ZxError::INVALID_ARGS);
+    }
+    Ok(count as usize)
+}
+
 /// The basic policies of a `zx_job_set_policy` call, read at the size the
 /// topic says they have.
 fn basic_policies(topic: u32, policy: usize, count: u32) -> ZxResult<Vec<BasicPolicy>> {
-    let count = count as usize;
+    let count = basic_policy_count(count)?;
     if topic == JOB_POL_BASE_V1 {
         return UserInPtr::<BasicPolicy>::from(policy)
             .read_array(count)
@@ -537,4 +565,46 @@ fn basic_policies(topic: u32, policy: usize, count: u32) -> ZxResult<Vec<BasicPo
             })
         })
         .collect()
+}
+
+#[cfg(test)]
+mod basic_policy_count_tests {
+    use super::*;
+
+    /// The bug: `count` went straight into `read_array`, so the caller chose
+    /// the size of an infallible `Vec::with_capacity`.
+    #[test]
+    fn a_hostile_count_is_refused_and_never_read() {
+        assert_eq!(basic_policy_count(u32::MAX), Err(ZxError::INVALID_ARGS));
+        assert_eq!(
+            basic_policy_count(MAX_BASIC_POLICIES + 1),
+            Err(ZxError::INVALID_ARGS)
+        );
+    }
+
+    /// An empty array answered `OK` having applied nothing. Zircon refuses it.
+    #[test]
+    fn an_empty_array_is_refused() {
+        assert_eq!(basic_policy_count(0), Err(ZxError::INVALID_ARGS));
+    }
+
+    /// And one policy per condition still fits, which is the most a caller can
+    /// usefully send.
+    #[test]
+    fn one_policy_per_condition_fits() {
+        assert_eq!(basic_policy_count(1), Ok(1));
+        assert_eq!(
+            basic_policy_count(MAX_BASIC_POLICIES),
+            Ok(MAX_BASIC_POLICIES as usize)
+        );
+    }
+
+    /// The limit is the number of conditions, and it is that number because
+    /// `JobPolicy` is an array indexed by them. Tied to the enum here so a new
+    /// condition cannot leave the limit behind.
+    #[test]
+    fn the_limit_is_the_number_of_conditions() {
+        assert!(PolicyCondition::from_raw(MAX_BASIC_POLICIES - 1).is_ok());
+        assert!(PolicyCondition::from_raw(MAX_BASIC_POLICIES).is_err());
+    }
 }
