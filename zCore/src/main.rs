@@ -58,6 +58,16 @@ cfg_if! {
     }
 }
 
+// The generic arm of the pick above -- `memory.rs`, the kernel allocator on
+// riscv64 and aarch64 -- is reached only by `target_arch`, and the host suite
+// runs on x86_64. So no `cargo test` ever compiled a line of it, while its
+// x86_64 twin has a suite of its own: any test written for it would have been
+// run by nobody. Bring it in under its own name so the host suite can reach
+// it. `#[path]` because the else-arm above already owns the name `memory`.
+#[cfg(all(target_arch = "x86_64", test))]
+#[path = "memory.rs"]
+mod memory_generic;
+
 static STARTED: AtomicBool = AtomicBool::new(false);
 
 #[cfg(all(feature = "linux", not(feature = "libos")))]
