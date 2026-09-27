@@ -31,6 +31,13 @@ use lock::Mutex;
 use rcore_fs::vfs::*;
 
 // termios c_iflag bits
+/// How often a blocking read of a pty wakes up just to ask whether it should
+/// still be waiting. Same figure and same reasoning as every other
+/// interruptible wait in this kernel (`event_bus`, `semaphore`, `msgqueue`,
+/// `flock`): a ceiling on how late a `kill` can be, not on how fast a byte
+/// arrives.
+const PTY_INTERRUPT_CHECK_TICK_MS: u64 = 100;
+
 const IXON: u32 = 0x0400;
 const IXANY: u32 = 0x0800;
 // termios c_lflag bits
@@ -1327,17 +1334,38 @@ impl Future for PtyReadFuture<'_> {
                 true
             }));
         }
-        // A VTIME read has a deadline nothing else will announce.
-        if this.slave {
+        // The bus reports what the PTY does and nothing that happens to the
+        // READER, so without this a `read` on a pty nobody writes to could not
+        // be ended by a signal, by `kill`, or by its own process exiting: it
+        // sat there until the other end typed. Checked after the readiness test
+        // above, deliberately: data that is already there is delivered, and
+        // `EINTR` is only synthesised for a read that would really block.
+        // `FsError::Interrupted` is what the file layer turns into `EINTR`.
+        if crate::sync::wait_interrupted().is_err() {
+            if let Some(id) = this.sub_id.take() {
+                this.bus.lock().unsubscribe(id);
+            }
+            kernel_hal::timer_waker::kill_timer_waker(&mut this.timer);
+            return Poll::Ready(Err(FsError::Interrupted));
+        }
+        // Whichever comes first: the VTIME deadline of a slave read, which
+        // nothing else will announce, or the backstop that makes the check
+        // above run again. The backstop is why a wait with no VTIME is still
+        // interruptible; it is a ceiling on how late a `kill` can be, not on
+        // how fast a byte arrives.
+        let backstop =
+            kernel_hal::timer::deadline_after(Duration::from_millis(PTY_INTERRUPT_CHECK_TICK_MS));
+        let deadline = if this.slave {
             let dl = this.pty.vtime_deadline_ns.load(Ordering::Acquire);
             if dl != 0 {
-                kernel_hal::timer_waker::ensure_timer_waker(
-                    &mut this.timer,
-                    Duration::from_nanos(dl),
-                    cx,
-                );
+                backstop.min(Duration::from_nanos(dl))
+            } else {
+                backstop
             }
-        }
+        } else {
+            backstop
+        };
+        kernel_hal::timer_waker::ensure_timer_waker(&mut this.timer, deadline, cx);
         // Re-check after subscribing: data may have arrived in the window
         // between the first check and the subscription, which would otherwise
         // be a missed wakeup.
@@ -1521,6 +1549,63 @@ mod tests {
     use alloc::vec;
     use alloc::vec::Vec;
     use core::mem::ManuallyDrop;
+
+    /// `crate::sync`'s interrupt switch, in the two shapes these tests need.
+    mod interrupts {
+        use crate::sync::test_interrupt;
+
+        pub(super) fn clear() {
+            test_interrupt::clear();
+        }
+
+        /// From the very next check on, every wait must give up.
+        pub(super) fn interrupt_now() {
+            test_interrupt::interrupt_after(0, crate::error::LxError::EINTR);
+        }
+    }
+
+    /// A waker that does nothing. Polled by hand, not with `block_on`: a
+    /// mutation that leaves the wait with no way out would hang instead of
+    /// failing, and a hang is not a detected failure.
+    fn noop_waker() -> core::task::Waker {
+        use core::task::{RawWaker, RawWakerVTable, Waker};
+        unsafe fn clone(_: *const ()) -> RawWaker {
+            RawWaker::new(core::ptr::null(), &VTABLE)
+        }
+        unsafe fn noop(_: *const ()) {}
+        static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, noop, noop, noop);
+        unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &VTABLE)) }
+    }
+
+    /// A `read` on a pty hears from the PTY and from nothing that happens to
+    /// the reader. So a shell waiting for a line that never comes -- every
+    /// terminal emulator, every `ssh` session, every `tmux` pane -- sat in a
+    /// wait that no signal, no `kill` and not even its own process exiting
+    /// could reach.
+    #[test]
+    fn a_read_on_a_silent_pty_can_still_be_killed() {
+        interrupts::clear();
+        let p = pty();
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut fut = readable_future(&p, p.master_bus.clone(), Pty::master_readable, false);
+        assert!(
+            matches!(fut.as_mut().poll(&mut cx), Poll::Pending),
+            "nothing has been written, so the read has to wait"
+        );
+
+        interrupts::interrupt_now();
+        let ended = matches!(
+            fut.as_mut().poll(&mut cx),
+            Poll::Ready(Err(FsError::Interrupted))
+        );
+        interrupts::clear();
+        assert!(
+            ended,
+            "a read nothing will ever answer must give up when the thread is \
+             killed: FsError::Interrupted is what becomes EINTR"
+        );
+    }
 
     /// A fresh pair with one slave open, as `alloc_ptmx` + `open_pts` would
     /// leave it, but without registering in the global `PTYS` map.

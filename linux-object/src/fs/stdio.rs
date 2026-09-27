@@ -2241,6 +2241,24 @@ impl INode for Stdin {
                         error: false,
                         hangup: false,
                     }))
+                } else if crate::sync::wait_interrupted().is_err() {
+                    // The bus and the xHCI tick report what the TERMINAL does
+                    // and nothing that happens to the READER, so without this a
+                    // `read` on a console nobody is typing at could not be
+                    // ended by a signal, by `kill`, or by its own process
+                    // exiting. After the two readiness checks, deliberately:
+                    // what is already typed is delivered, and `EINTR` is only
+                    // synthesised for a read that would really block.
+                    // `FsError::Interrupted` is what the file layer turns into
+                    // `EINTR`.
+                    if let Some(id) = this.sub_id.take() {
+                        this.stdin.eventbus.lock().unsubscribe(id);
+                    }
+                    kernel_hal::timer_waker::kill_timer_waker(&mut this.timer);
+                    if let Some(w) = this.io_waker.take() {
+                        crate::net::clear_io_wait_wakers(&w, false, true);
+                    }
+                    Poll::Ready(Err(FsError::Interrupted))
                 } else {
                     Poll::Pending
                 }

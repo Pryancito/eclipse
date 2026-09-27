@@ -29,50 +29,16 @@ const EVENT_DEV_MINOR_BASE: usize = 0x40;
 /// how late a `kill` can be, not on how fast an event arrives.
 const EVDEV_INTERRUPT_CHECK_TICK_MS: u64 = 100;
 
-/// Whether the thread parked in a blocking evdev read must stop waiting --
-/// a signal is deliverable, the thread is dying, or its process has exited.
+/// Whether the thread parked in a blocking evdev read must stop waiting -- a
+/// signal is deliverable, the thread is dying, or its process has exited.
 ///
-/// Indirected so the host tests can drive it: there is no current thread in a
-/// host test, so [`crate::process::check_signals`] always answers `Ok` there
-/// and no test could otherwise reach the interrupted branch at all. Same shape
-/// as `sync::event_bus`'s `wait_interrupted`.
-#[cfg(not(test))]
+/// Goes through `crate::sync`'s switch rather than calling
+/// `crate::process::check_signals` directly: there is no current thread in a
+/// host test, so the real check always answers `Ok` there and no test could
+/// otherwise reach the interrupted branch at all. One switch for every
+/// interruptible wait in the crate, so they all flip together.
 pub(super) fn wait_interrupted() -> bool {
-    crate::process::check_signals().is_err()
-}
-
-#[cfg(test)]
-pub(super) fn wait_interrupted() -> bool {
-    self::test_interrupt::pending()
-}
-
-/// The test-only stand-in for [`crate::process::check_signals`].
-#[cfg(test)]
-pub(crate) mod test_interrupt {
-    extern crate std;
-
-    use core::cell::Cell;
-
-    self::std::thread_local! {
-        /// Thread-local so the suite stays correct under a parallel run: nothing
-        /// here is shared between tests, so no test lock is needed and a test
-        /// that panics cannot poison the next.
-        static PENDING: Cell<bool> = const { Cell::new(false) };
-    }
-
-    /// From now on, every wait in this thread answers "stop waiting".
-    pub(crate) fn interrupt() {
-        PENDING.with(|p| p.set(true));
-    }
-
-    /// Back to "nothing is interrupting anything".
-    pub(crate) fn clear() {
-        PENDING.with(|p| p.set(false));
-    }
-
-    pub(super) fn pending() -> bool {
-        PENDING.with(|p| p.get())
-    }
+    crate::sync::wait_interrupted().is_err()
 }
 
 /// The clock that stamps events, as `EVIOCSCLOCKID` selects it.
@@ -693,6 +659,20 @@ mod interruptible_read_tests {
     use alloc::sync::Arc;
     use core::task::{RawWaker, RawWakerVTable, Waker};
     use zcore_drivers::scheme::{EventScheme, Scheme};
+
+    /// `crate::sync`'s interrupt switch, in the two shapes these tests need.
+    mod interrupts {
+        use crate::sync::test_interrupt;
+
+        pub(super) fn clear() {
+            test_interrupt::clear();
+        }
+
+        /// From the very next check on, every wait must give up.
+        pub(super) fn interrupt_now() {
+            test_interrupt::interrupt_after(0, crate::error::LxError::EINTR);
+        }
+    }
     use zcore_drivers::utils::{EventHandler, EventListener};
 
     /// The quietest input device there is: it never sends anything. (The
@@ -749,7 +729,7 @@ mod interruptible_read_tests {
 
     #[test]
     fn a_quiet_device_parks_the_reader() {
-        test_interrupt::clear();
+        interrupts::clear();
         let d = dev();
         let waker = noop_waker();
         let mut cx = Context::from_waker(&waker);
@@ -762,7 +742,7 @@ mod interruptible_read_tests {
 
     #[test]
     fn a_reader_of_a_device_nobody_touches_can_still_be_killed() {
-        test_interrupt::clear();
+        interrupts::clear();
         let d = dev();
         let waker = noop_waker();
         let mut cx = Context::from_waker(&waker);
@@ -771,12 +751,12 @@ mod interruptible_read_tests {
 
         // The thread is now dying, or a signal is deliverable. Nothing has
         // happened to the device, and nothing ever will.
-        test_interrupt::interrupt();
+        interrupts::interrupt_now();
         let ended = matches!(
             fut.as_mut().poll(&mut cx),
             Poll::Ready(Err(FsError::Interrupted))
         );
-        test_interrupt::clear();
+        interrupts::clear();
         assert!(
             ended,
             "a read nothing will ever answer must give up when the thread is \

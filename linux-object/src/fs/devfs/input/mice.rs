@@ -702,6 +702,20 @@ mod mice_poll_tests {
 
     use super::*;
 
+    /// `crate::sync`'s interrupt switch, in the two shapes these tests need.
+    mod interrupts {
+        use crate::sync::test_interrupt;
+
+        pub(super) fn clear() {
+            test_interrupt::clear();
+        }
+
+        /// From the very next check on, every wait must give up.
+        pub(super) fn interrupt_now() {
+            test_interrupt::interrupt_after(0, crate::error::LxError::EINTR);
+        }
+    }
+
     /// A node with no mice behind it: enough for `poll`, which asks the inner
     /// buffer and nothing else when there is no device to ask.
     fn a_node() -> MiceDev {
@@ -742,7 +756,7 @@ mod mice_poll_tests {
     /// notice.
     #[test]
     fn a_reader_of_mice_nobody_touches_can_still_be_killed() {
-        super::super::event::test_interrupt::clear();
+        interrupts::clear();
         let node = a_node();
         let waker = noop_waker();
         let mut cx = Context::from_waker(&waker);
@@ -752,12 +766,12 @@ mod mice_poll_tests {
             "nothing has moved, so the read has to wait"
         );
 
-        super::super::event::test_interrupt::interrupt();
+        interrupts::interrupt_now();
         let ended = matches!(
             fut.as_mut().poll(&mut cx),
             Poll::Ready(Err(FsError::Interrupted))
         );
-        super::super::event::test_interrupt::clear();
+        interrupts::clear();
         assert!(
             ended,
             "a read nothing will ever answer must give up when the thread is \

@@ -275,16 +275,20 @@ const INTERRUPT_CHECK_TICK_MS: u64 = 100;
 /// Whether a thread parked in a blocking wait must stop waiting -- because a
 /// signal is deliverable, the thread is dying, or the process has exited.
 ///
+/// Shared by every interruptible wait in this crate that is not driven through
+/// `EventBusFuture` itself (the pty, the serial console, the input nodes), so
+/// that they all flip together in a host test.
+///
 /// Indirected so the host tests can drive it: there is no current thread in a
 /// host test, so [`crate::process::check_signals`] always answers `Ok` there
 /// and no test could otherwise reach the interrupted branch at all.
 #[cfg(not(test))]
-fn wait_interrupted() -> crate::error::LxResult<()> {
+pub(crate) fn wait_interrupted() -> crate::error::LxResult<()> {
     crate::process::check_signals()
 }
 
 #[cfg(test)]
-fn wait_interrupted() -> crate::error::LxResult<()> {
+pub(crate) fn wait_interrupted() -> crate::error::LxResult<()> {
     self::test_interrupt::check()
 }
 
