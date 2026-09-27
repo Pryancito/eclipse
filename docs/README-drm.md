@@ -143,7 +143,7 @@ Leyenda: ✅ implementado · 🟡 parcial / no-op deliberado · ❌ no implement
 | `DRM_IOCTL_MODE_OBJ_SETPROPERTY` / `SETPROPERTY` | 🟡 | **DPMS sí actúa**: cualquier valor distinto de "On" apaga el CRTC (pantalla en negro y se dejan de repintar el cursor y el daño), y la propiedad se relee con el valor puesto. El resto se acepta como no-op |
 | `DRM_IOCTL_MODE_GETPROPBLOB` | ✅ | EDID + blobs del almacén de propiedades |
 | `DRM_IOCTL_MODE_CREATEPROPBLOB` / `DESTROYPROPBLOB` | ✅ | almacén de blobs; destruir un blob del kernel da EACCES (Linux: EPERM) |
-| `DRM_IOCTL_MODE_CURSOR` / `CURSOR2` | ✅ | cursor compuesto por el kernel sobre cada frame (`set_cursor_bo`/`move_cursor`); más de 64×64 → EINVAL (el tamaño anunciado en las *caps*) |
+| `DRM_IOCTL_MODE_CURSOR` / `CURSOR2` | ✅ | cursor compuesto por el kernel sobre cada frame (`set_cursor_bo`/`move_cursor`); sin flag o con uno desconocido → EINVAL antes de buscar el CRTC (ENOENT), como `drm_mode_cursor_common`; un handle con ancho o alto 0, o más de 64×64 (el tamaño anunciado en las *caps*) → EINVAL; solo el handle 0 esconde el puntero |
 | `DRM_IOCTL_MODE_ATOMIC` | ✅ | **opt-in** con `drm.atomic` (ver sección siguiente) |
 | `DRM_IOCTL_MODE_GETGAMMA` / `SETGAMMA` | 🟡 | aceptados como no-op (`gamma_size=0`, sin `GAMMA_LUT`); devolver ENOTTY provocaba una tormenta de SETGAMMA desde Xorg |
 | `DRM_IOCTL_MODE_CREATE_LEASE` | 🟡 | aceptado, **no restringido**: devuelve un `dup` del fd, así que un cliente "arrendado" conserva el control completo del dispositivo. `LIST_LESSEES` responde cero |
