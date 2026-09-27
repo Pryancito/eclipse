@@ -1372,7 +1372,14 @@ impl VmAddressRegion {
         align: usize,
         min_offset: usize,
     ) -> ZxResult<VirtAddr> {
-        if !check_aligned(len, align) {
+        // The alignment is the BASE's, not the length's: `zx_vmar_allocate`
+        // with `ZX_VM_ALIGN_1MB` asks for a region that starts on a megabyte,
+        // and says nothing about how long it is. Requiring the length to be a
+        // multiple of it too refused every such request whose size was not,
+        // and the length is only ever page-aligned by the callers below. It is
+        // not used as an alignment anywhere in the search: `find_free_area`
+        // aligns candidate bases and measures `len` in bytes.
+        if !page_aligned(len) {
             Err(ZxError::INVALID_ARGS)
         } else if let Some(offset) = offset {
             if check_aligned(offset, align) && self.test_map(inner, offset, len, align) {
@@ -1430,7 +1437,7 @@ impl VmAddressRegion {
     /// Test if can create a new mapping at `offset` with `len`.
     fn test_map(&self, inner: &VmarInner, offset: usize, len: usize, align: usize) -> bool {
         debug_assert!(check_aligned(offset, align));
-        debug_assert!(check_aligned(len, align));
+        debug_assert!(page_aligned(len));
         let begin = self.addr + offset;
         let end = begin + len;
         if end > self.addr + self.size {
@@ -1477,7 +1484,7 @@ impl VmAddressRegion {
     ) -> Option<usize> {
         // TODO: randomize
         debug_assert!(check_aligned(min_offset, align));
-        debug_assert!(check_aligned(len, align));
+        debug_assert!(page_aligned(len));
         let base = self.addr;
         let limit = base + self.size;
         let floor = base + min_offset;
@@ -3383,6 +3390,39 @@ pub const USER_STACK_PAGES: usize = 128;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `ZX_VM_ALIGN_*` names where a sub-region STARTS, not how long it is.
+    /// `determine_offset` required the length to be a multiple of the
+    /// alignment too, so `zx_vmar_allocate(ZX_VM_ALIGN_1MB, size = one page)`
+    /// -- a legal request -- was `INVALID_ARGS`.
+    #[test]
+    fn a_sub_region_is_aligned_by_its_base_and_not_by_its_length() {
+        let root = VmAddressRegion::new_root();
+        const ALIGN: usize = 1 << 20;
+        let child = root
+            .allocate(None, PAGE_SIZE, VmarFlags::CAN_MAP_RXW, ALIGN)
+            .expect("a megabyte-aligned page is a legal region");
+        assert_eq!(child.addr() % ALIGN, 0, "the base carries the alignment");
+        assert_eq!(child.size, PAGE_SIZE, "the length is the one asked for");
+
+        // A length that is not even a whole page is still refused.
+        assert_eq!(
+            root.allocate(None, PAGE_SIZE - 1, VmarFlags::CAN_MAP_RXW, ALIGN)
+                .err(),
+            Some(ZxError::INVALID_ARGS)
+        );
+        // And an explicit offset still has to carry the alignment itself.
+        assert_eq!(
+            root.allocate(
+                Some(child.addr() - root.addr() + PAGE_SIZE),
+                PAGE_SIZE,
+                VmarFlags::CAN_MAP_RXW,
+                ALIGN
+            )
+            .err(),
+            Some(ZxError::INVALID_ARGS)
+        );
+    }
 
     /// Lets go of a thread this test parked, however the test ends.
     ///
