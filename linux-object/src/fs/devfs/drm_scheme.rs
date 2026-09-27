@@ -2218,6 +2218,10 @@ impl DrmDev {
                     return Err(FsError::OpNotSupported);
                 }
                 let req = unsafe { &mut *(data as *mut DrmSyncobjCreate) };
+                // `drm_syncobj_create_ioctl`: SIGNALED is the only flag.
+                if req.flags & !DRM_SYNCOBJ_CREATE_SIGNALED != 0 {
+                    return Err(FsError::InvalidParam);
+                }
                 // Owned by the calling process: given back when it dies
                 // (`release_process`), and a `DESTROY` from any other
                 // process is ENOENT.
@@ -2258,6 +2262,10 @@ impl DrmDev {
                     return Err(FsError::OpNotSupported);
                 }
                 let req = unsafe { &*(data as *const DrmSyncobjDestroy) };
+                // `drm_syncobj_destroy_ioctl`: "make sure padding is empty".
+                if req.pad != 0 {
+                    return Err(FsError::InvalidParam);
+                }
                 if zcore_drivers::scheme::syncobj::destroy_for(drm::current_pid(), req.handle) {
                     Ok(0)
                 } else {
@@ -2270,6 +2278,11 @@ impl DrmDev {
                     return Err(FsError::OpNotSupported);
                 }
                 let req = unsafe { &*(data as *const DrmSyncobjArray) };
+                // `drm_syncobj_reset_ioctl` / `drm_syncobj_signal_ioctl`: the
+                // padding first, then the count.
+                if req.pad != 0 {
+                    return Err(FsError::InvalidParam);
+                }
                 if req.count_handles == 0 {
                     return Err(FsError::InvalidParam);
                 }
@@ -2317,6 +2330,10 @@ impl DrmDev {
                     return Err(FsError::OpNotSupported);
                 }
                 let req = unsafe { &*(data as *const DrmSyncobjTimelineArray) };
+                // `drm_syncobj_timeline_signal_ioctl`: no flags are defined.
+                if req.flags != 0 {
+                    return Err(FsError::InvalidParam);
+                }
                 if req.count_handles == 0 {
                     return Err(FsError::InvalidParam);
                 }
@@ -2383,6 +2400,10 @@ impl DrmDev {
                     return Err(FsError::OpNotSupported);
                 }
                 let req = unsafe { &*(data as *const DrmSyncobjTimelineArray) };
+                // `drm_syncobj_query_ioctl`: LAST_SUBMITTED is the only flag.
+                if req.flags & !DRM_SYNCOBJ_QUERY_FLAGS_LAST_SUBMITTED != 0 {
+                    return Err(FsError::InvalidParam);
+                }
                 if req.count_handles == 0 {
                     return Err(FsError::InvalidParam);
                 }
@@ -3067,7 +3088,6 @@ const DRM_SYNCOBJ_CREATE_SIGNALED: u32 = 1 << 0;
 #[repr(C)]
 struct DrmSyncobjDestroy {
     handle: u32,
-    #[allow(dead_code)]
     pad: u32,
 }
 
@@ -3106,7 +3126,11 @@ struct DrmSyncobjTimelineWait {
     pad: u32,
 }
 const DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL: u32 = 1 << 0;
+const DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT: u32 = 1 << 1;
 const DRM_SYNCOBJ_WAIT_FLAGS_WAIT_AVAILABLE: u32 = 1 << 2;
+/// A scheduling hint (`dma_fence_set_deadline`) carried by the 40-byte forms
+/// of the wait structs; accepted, as Linux does, and not acted on.
+const DRM_SYNCOBJ_WAIT_FLAGS_WAIT_DEADLINE: u32 = 1 << 3;
 const DRM_SYNCOBJ_QUERY_FLAGS_LAST_SUBMITTED: u32 = 1 << 0;
 
 /// Throttled visibility for syncobj WAIT failures: they return to Mesa as
@@ -3137,7 +3161,6 @@ fn syncobj_wait_klog(timeline: bool, handles: &[u32], kind: &'static str) {
 struct DrmSyncobjArray {
     handles: u64,
     count_handles: u32,
-    #[allow(dead_code)]
     pad: u32,
 }
 
@@ -3502,6 +3525,21 @@ fn read_syncobj_wait(cmd: u32, data: usize) -> Result<Option<SyncobjWaitReq>> {
             req.flags,
         )
     };
+    // `drm_syncobj_array_wait_ioctl` / `drm_syncobj_timeline_wait_ioctl`:
+    // a flag bit outside the form's set is EINVAL before the count is
+    // looked at, and WAIT_AVAILABLE is the timeline form's alone -- on the
+    // binary wait it was read and honoured here as if it were legal.
+    let allowed = DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL
+        | DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT
+        | DRM_SYNCOBJ_WAIT_FLAGS_WAIT_DEADLINE
+        | if timeline {
+            DRM_SYNCOBJ_WAIT_FLAGS_WAIT_AVAILABLE
+        } else {
+            0
+        };
+    if flags & !allowed != 0 {
+        return Err(FsError::InvalidParam);
+    }
     if count_handles == 0 {
         return Ok(None);
     }
@@ -12588,6 +12626,124 @@ mod syncobj_array_tests {
             c.ioctl(DRM_IOCTL_SYNCOBJ_WAIT, &mut req),
             Err(FsError::InvalidParam)
         );
+    }
+
+    /// The flag and padding rules of `drm_syncobj.c`, ioctl by ioctl:
+    /// CREATE takes SIGNALED alone, DESTROY/RESET/SIGNAL want their pad
+    /// empty, TIMELINE_SIGNAL has no flags, QUERY takes LAST_SUBMITTED alone,
+    /// WAIT takes ALL, FOR_SUBMIT and DEADLINE, and TIMELINE_WAIT those plus
+    /// AVAILABLE. Every one of them was accepted here; the binary WAIT even
+    /// honoured AVAILABLE.
+    #[test]
+    fn every_syncobj_ioctl_refuses_the_flags_and_padding_linux_refuses() {
+        let _serialised = drm::test_globals::lock();
+        let _hook = crate::fs::syncobj_eventfd::hardware_fence_tests::TEST_SERIAL.lock();
+        let _on = NouveauOn::new();
+        let c = Client::open(0);
+        // CREATE.
+        for bad in [2u32, 3, 0x8000_0000] {
+            let mut req = DrmSyncobjCreate {
+                handle: 0,
+                flags: bad,
+            };
+            assert_eq!(
+                c.ioctl(DRM_IOCTL_SYNCOBJ_CREATE, &mut req),
+                Err(FsError::InvalidParam),
+                "CREATE flags {:#x}",
+                bad
+            );
+        }
+        let s = create(&c, true);
+        let t = create(&c, false);
+        // DESTROY with a dirty pad: refused, and the handle survives.
+        let mut req = DrmSyncobjDestroy { handle: s, pad: 1 };
+        assert_eq!(
+            c.ioctl(DRM_IOCTL_SYNCOBJ_DESTROY, &mut req),
+            Err(FsError::InvalidParam)
+        );
+        assert_eq!(wait(&c, &[s], 0), Ok(0), "still there, still signaled");
+        // RESET / SIGNAL with a dirty pad: refused, and nothing happens.
+        for cmd in [DRM_IOCTL_SYNCOBJ_RESET, DRM_IOCTL_SYNCOBJ_SIGNAL] {
+            let handles = [s];
+            let mut req = DrmSyncobjArray {
+                handles: handles.as_ptr() as u64,
+                count_handles: 1,
+                pad: 7,
+            };
+            assert_eq!(c.ioctl(cmd, &mut req), Err(FsError::InvalidParam));
+        }
+        assert_eq!(wait(&c, &[s], 0), Ok(0), "the refused RESET reset nothing");
+        // TIMELINE_SIGNAL / QUERY flags.
+        let handles = [t];
+        let mut points = [5u64];
+        let mut req = DrmSyncobjTimelineArray {
+            handles: handles.as_ptr() as u64,
+            points: points.as_mut_ptr() as u64,
+            count_handles: 1,
+            flags: 1,
+        };
+        assert_eq!(
+            c.ioctl(DRM_IOCTL_SYNCOBJ_TIMELINE_SIGNAL, &mut req),
+            Err(FsError::InvalidParam),
+            "TIMELINE_SIGNAL has no flags"
+        );
+        for bad in [2u32, 3, 0x100] {
+            req.flags = bad;
+            assert_eq!(
+                c.ioctl(DRM_IOCTL_SYNCOBJ_QUERY, &mut req),
+                Err(FsError::InvalidParam),
+                "QUERY flags {:#x}",
+                bad
+            );
+        }
+        req.flags = DRM_SYNCOBJ_QUERY_FLAGS_LAST_SUBMITTED;
+        assert_eq!(c.ioctl(DRM_IOCTL_SYNCOBJ_QUERY, &mut req), Ok(0));
+        assert_eq!(
+            points[0], 0,
+            "never signaled: the refused signal did not land"
+        );
+        // WAIT: AVAILABLE is the timeline form's; DEADLINE is a hint on both.
+        assert_eq!(
+            wait(&c, &[s], DRM_SYNCOBJ_WAIT_FLAGS_WAIT_AVAILABLE),
+            Err(FsError::InvalidParam)
+        );
+        for bad in [0x10u32, 0x20, 0x8000_0000] {
+            assert_eq!(
+                wait(&c, &[s], bad),
+                Err(FsError::InvalidParam),
+                "WAIT {:#x}",
+                bad
+            );
+            assert_eq!(
+                timeline_wait(&c, &[s], &[1], bad),
+                Err(FsError::InvalidParam),
+                "TIMELINE_WAIT {:#x}",
+                bad
+            );
+        }
+        assert_eq!(
+            wait(&c, &[s], DRM_SYNCOBJ_WAIT_FLAGS_WAIT_DEADLINE),
+            Ok(0),
+            "DEADLINE is accepted"
+        );
+        assert_eq!(
+            wait(&c, &[s], DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT),
+            Ok(0),
+            "FOR_SUBMIT is accepted"
+        );
+        assert_eq!(
+            timeline_wait(
+                &c,
+                &[s],
+                &[1],
+                DRM_SYNCOBJ_WAIT_FLAGS_WAIT_AVAILABLE | DRM_SYNCOBJ_WAIT_FLAGS_WAIT_DEADLINE
+            ),
+            Ok(0)
+        );
+        // An empty array still goes through the flag check first.
+        assert_eq!(wait(&c, &[], 0x10), Err(FsError::InvalidParam));
+        destroy(&c, s);
+        destroy(&c, t);
     }
 }
 
