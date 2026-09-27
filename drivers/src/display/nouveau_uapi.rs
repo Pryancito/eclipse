@@ -1119,6 +1119,10 @@ pub(super) struct NouveauVmMapping {
     /// the VM_BIND op) -- needed to translate a GPU VA inside this mapping
     /// back to a CPU-readable physical address (gem phys + bo_offset + delta).
     pub bo_offset: u64,
+    /// The PTE kind the RM programmed (`rm_pte_kind`): a split of this
+    /// mapping (a partial UNMAP or MAP over it) maps the kept parts again
+    /// with the same kind.
+    pub pte_kind: u32,
 }
 
 // ===================== NVIF (`DRM_NOUVEAU_NVIF`, nr 0x47) =====================
