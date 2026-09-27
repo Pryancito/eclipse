@@ -308,27 +308,97 @@ struct VmarInner {
 /// How many recent unmaps each VMAR remembers (see `VmarInner::recent_unmaps`).
 const UNMAP_HISTORY: usize = 16;
 
+/// The hosted per-process address-space windows, when `aspace-separate` is on.
+///
+/// Darwin reserves the low multi-gigabyte range for its shared cache and Apple
+/// Silicon rejects mappings at 64 GiB. Keep hosted guest address spaces between
+/// those regions and use a smaller per-process window than on hosts with a
+/// conventional 48-bit VA.
+#[cfg(feature = "aspace-separate")]
+mod aspace_window {
+    use {alloc::vec::Vec, lock::Mutex};
+
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    pub const BASE: usize = 0x4_0000_0000;
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    pub const SIZE: usize = 0x1_0000_0000;
+    #[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
+    pub const BASE: usize = 0x2_0000_0000;
+    #[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
+    pub const SIZE: usize = 0x100_0000_0000;
+
+    /// The first window index whose base the host would refuse.
+    ///
+    /// A 47-bit user address space tops out at 128 TiB, and the windows are a
+    /// TiB apiece on a conventional host, so there are only about 127 of them.
+    /// Handing out the 128th used to be silent: `BASE + SIZE * i` walked past
+    /// the top of userspace and every `mmap` into that window came back
+    /// `ENOMEM`, from inside a page fault, in whatever unrelated code ran next.
+    pub const WINDOWS: usize = (USER_ASPACE_TOP - BASE) / SIZE;
+
+    /// The top of the host's user address space. 47 bits on x86_64 and on a
+    /// conventional aarch64 host; the macOS window is far below it either way.
+    const USER_ASPACE_TOP: usize = 0x8000_0000_0000;
+
+    /// Windows handed out and given back. **The counter alone is a leak**: a
+    /// system that creates processes over its life must reuse the windows of
+    /// the ones that are gone, or it stops being able to create any.
+    static FREE: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+    static NEXT: Mutex<usize> = Mutex::new(0);
+
+    /// Take a window, reusing a released one if there is one.
+    pub fn take() -> usize {
+        if let Some(i) = FREE.lock().pop() {
+            return i;
+        }
+        let mut next = NEXT.lock();
+        let i = *next;
+        assert!(
+            i < WINDOWS,
+            "out of hosted address-space windows: {} taken, and only {} fit under {:#x}",
+            i,
+            WINDOWS,
+            USER_ASPACE_TOP
+        );
+        *next = i + 1;
+        i
+    }
+
+    /// Give a window back. `addr` is a root VMAR's base; anything that is not
+    /// one of our windows is ignored.
+    pub fn give_back(addr: usize, size: usize) {
+        if size != SIZE || addr < BASE || (addr - BASE) % SIZE != 0 {
+            return;
+        }
+        let i = (addr - BASE) / SIZE;
+        if i < WINDOWS {
+            FREE.lock().push(i);
+        }
+    }
+}
+
+#[cfg(feature = "aspace-separate")]
+impl Drop for VmAddressRegion {
+    fn drop(&mut self) {
+        // Only a root owns a window, and only the windows `new_root` hands out
+        // are ours to take back (`new_root_at` is also called with addresses
+        // that have nothing to do with them).
+        if self.parent.is_none() {
+            aspace_window::give_back(self.addr, self.size);
+        }
+    }
+}
+
 impl VmAddressRegion {
     /// Create a new root VMAR.
     pub fn new_root() -> Arc<Self> {
         #[cfg(feature = "aspace-separate")]
         let (addr, size) = {
-            use core::sync::atomic::*;
-            static VMAR_ID: AtomicUsize = AtomicUsize::new(0);
-            let i = VMAR_ID.fetch_add(1, Ordering::SeqCst);
-            // Darwin reserves the low multi-gigabyte range for its shared
-            // cache and Apple Silicon rejects mappings at 64 GiB. Keep hosted
-            // guest address spaces between those regions and use a smaller
-            // per-process window than on hosts with a conventional 48-bit VA.
-            #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
-            const BASE: usize = 0x4_0000_0000;
-            #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
-            const SIZE: usize = 0x1_0000_0000;
-            #[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
-            const BASE: usize = 0x2_0000_0000;
-            #[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
-            const SIZE: usize = 0x100_0000_0000;
-            (BASE + SIZE * i, SIZE)
+            let i = aspace_window::take();
+            (
+                aspace_window::BASE + aspace_window::SIZE * i,
+                aspace_window::SIZE,
+            )
         };
         #[cfg(not(feature = "aspace-separate"))]
         let (addr, size) = (USER_ASPACE_BASE as usize, USER_ASPACE_SIZE as usize);
@@ -3390,6 +3460,35 @@ pub const USER_STACK_PAGES: usize = 128;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `new_root` handed out its hosted window with a counter that only ever
+    /// went up: `BASE + SIZE * i`, a TiB apiece, never reusing the window of a
+    /// process that had gone. Only about 127 of them fit under the top of a
+    /// 47-bit user address space, so the 128th root VMAR of the system's life
+    /// got a base the host will not map -- and it failed *silently* there, with
+    /// every later `mmap` into that window coming back `ENOMEM` from inside a
+    /// page fault, in whatever unrelated code happened to run next. Caught by a
+    /// test that creates two thousand processes: the failure landed on an ELF
+    /// loader test hundreds of lines away.
+    #[test]
+    #[cfg(feature = "aspace-separate")]
+    fn the_hosted_address_space_windows_are_reused() {
+        // Each root is dropped before the next one is made, so one window would
+        // be enough for all of these. With the counter, the run dies partway.
+        for round in 0..aspace_window::WINDOWS + 8 {
+            let vmar = VmAddressRegion::new_root();
+            assert!(
+                vmar.addr() + vmar.size <= 0x8000_0000_0000,
+                "round {} got a window at {:#x}, past the top of userspace",
+                round,
+                vmar.addr()
+            );
+            let vmo = VmObject::new_paged(1);
+            let flags = MMUFlags::READ | MMUFlags::WRITE | MMUFlags::USER;
+            vmar.map_at(0, vmo, 0, 0x1000, flags)
+                .expect("a reused window has to still be mappable");
+        }
+    }
 
     /// `ZX_VM_ALIGN_*` names where a sub-region STARTS, not how long it is.
     /// `determine_offset` required the length to be a multiple of the
