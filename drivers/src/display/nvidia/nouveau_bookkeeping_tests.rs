@@ -964,8 +964,8 @@ fn nvif_refuses_a_short_payload_and_an_unknown_type_before_reading_a_body() {
     );
     assert_eq!(
         Nvif::new(0x09, 0, 0, 0, HDR + NEW).send(&gpu, A),
-        Err(nv::ENOSYS),
-        "a type this driver has no arm for"
+        Err(nv::EINVAL),
+        "a type nouveau_abi16_ioctl has no arm for"
     );
     assert_eq!(
         device_new(u64::MAX).cut(HDR + NEW - 1).send(&gpu, A),
@@ -978,9 +978,12 @@ fn nvif_refuses_a_short_payload_and_an_unknown_type_before_reading_a_body() {
         "MTHD without its 8-byte body"
     );
     assert_eq!(
-        device_info(nv::NV_DEVICE_V0_INFO)
-            .cut(HDR + MTHD + INFO - 1)
-            .send(&gpu, A),
+        {
+            assert_eq!(device_new(u64::MAX).send(&gpu, A), Ok(0));
+            device_info(nv::NV_DEVICE_V0_INFO)
+                .cut(HDR + MTHD + INFO - 1)
+                .send(&gpu, A)
+        },
         Err(nv::EINVAL),
         "INFO with no room for its 104-byte reply"
     );
@@ -1027,6 +1030,7 @@ fn nvif_new_of_the_device_object_takes_only_the_client_default() {
 fn nvif_device_info_reports_the_board_and_floors_its_vram() {
     let _g = LOCK.lock();
     let gpu = gpu();
+    assert_eq!(device_new(u64::MAX).send(&gpu, A), Ok(0));
     let mut r = device_info(nv::NV_DEVICE_V0_INFO);
     assert_eq!(r.send(&gpu, A), Ok(0));
     let info: nv::NvDeviceInfoV0 = r.get(HDR + MTHD);
@@ -1048,12 +1052,13 @@ fn nvif_device_info_reports_the_board_and_floors_its_vram() {
     assert_eq!(cstr(&info.name), "nvidia-test");
     assert_eq!(
         device_info(0x05).send(&gpu, A),
-        Err(nv::ENOSYS),
+        Err(nv::EINVAL),
         "the only method is INFO"
     );
     // A board the id table does not know: the architecture's floor,
     // never a 0 that would leave NVK with an empty VRAM heap.
     let unknown = NvidiaGpu::for_test(0x1fff, 0);
+    assert_eq!(device_new(u64::MAX).send(&unknown, A), Ok(0));
     let mut r = device_info(nv::NV_DEVICE_V0_INFO);
     assert_eq!(r.send(&unknown, A), Ok(0));
     let info: nv::NvDeviceInfoV0 = r.get(HDR + MTHD);
@@ -1171,6 +1176,152 @@ fn nvif_new_of_a_subchannel_needs_the_callers_channel_and_records_nothing_withou
 }
 
 #[test]
+fn nvif_reads_the_header_and_the_bodies_as_nouveau_abi16_ioctl_does() {
+    let _g = LOCK.lock();
+    let gpu = gpu();
+    // The header: version 0, route 0x00 or 0xff, before the type.
+    let mut r = device_new(u64::MAX);
+    r.0[0] = 1;
+    assert_eq!(r.send(&gpu, A), Err(nv::EINVAL), "header version 1");
+    for route in [0x01u8, 0x7f, 0xfe] {
+        assert_eq!(
+            Nvif::new(nv::NVIF_IOCTL_V0_NEW, route, 0, 0, HDR + NEW)
+                .put(HDR, new_body(nv::NVIF_CLASS_NV_DEVICE, 0xd0d0))
+                .send(&gpu, A),
+            Err(nv::EINVAL),
+            "route {route:#04x}"
+        );
+    }
+    // NEW: a version-0 body; on route 0 the device under the client.
+    let mut r = device_new(u64::MAX);
+    r.0[HDR] = 1;
+    assert_eq!(r.send(&gpu, A), Err(nv::EINVAL), "NEW body version 1");
+    assert_eq!(
+        Nvif::new(nv::NVIF_IOCTL_V0_NEW, 0, 0, 0x77, HDR + NEW)
+            .put(HDR, new_body(nv::NVIF_CLASS_NV_DEVICE, 0xd0d0))
+            .send(&gpu, A),
+        Err(nv::EINVAL),
+        "a device under another object"
+    );
+    assert_eq!(
+        Nvif::new(nv::NVIF_IOCTL_V0_NEW, 0, 0, 0, HDR + NEW)
+            .put(HDR, new_body(0xc597, 0xd0d0))
+            .send(&gpu, A),
+        Err(nv::EINVAL),
+        "an engine class on the client's route"
+    );
+    // On a channel's route the class is an engine object, whatever it
+    // says: NV_DEVICE there makes no device object (and no channel is
+    // EINVAL, as for any engine object).
+    assert_eq!(
+        subchan_new(0, nv::NVIF_CLASS_NV_DEVICE, 0xdead).send(&gpu, A),
+        Err(nv::EINVAL),
+        "no channel"
+    );
+    assert_eq!(channel_alloc(&gpu, A).unwrap().channel, 0);
+    assert_eq!(
+        subchan_new(0, nv::NVIF_CLASS_NV_DEVICE, 0xdead).send(&gpu, A),
+        Ok(0),
+        "an engine object of class 0x80 on a discovery channel"
+    );
+    assert_eq!(
+        Nvif::new(nv::NVIF_IOCTL_V0_MTHD, 0, 0, 0xdead, HDR + MTHD + INFO)
+            .put(
+                HDR,
+                nv::NvifIoctlMthdV0 {
+                    version: 0,
+                    method: nv::NV_DEVICE_V0_INFO,
+                    pad02: [0; 6],
+                },
+            )
+            .send(&gpu, A),
+        Err(nv::EINVAL),
+        "not a device object"
+    );
+    // A route that is neither: refused at the header, even where the
+    // channel's path would have taken it.
+    assert_eq!(
+        Nvif::new(nv::NVIF_IOCTL_V0_NEW, 0x7f, 0, 0, HDR + NEW)
+            .put(HDR, new_body(0xc597, 0x1000))
+            .send(&gpu, A),
+        Err(nv::EINVAL),
+        "route 0x7f on a channel that exists"
+    );
+    // MTHD: on a device object the caller made, route 0, INFO only,
+    // a body of exactly the reply's size, a version-0 template.
+    assert_eq!(
+        device_info(nv::NV_DEVICE_V0_INFO).send(&gpu, A),
+        Err(nv::EINVAL),
+        "no device object yet"
+    );
+    assert_eq!(device_new(u64::MAX).send(&gpu, A), Ok(0));
+    assert_eq!(device_info(nv::NV_DEVICE_V0_INFO).send(&gpu, A), Ok(0));
+    assert_eq!(
+        device_info(nv::NV_DEVICE_V0_INFO).send(&gpu, B),
+        Err(nv::EINVAL),
+        "A's device object is not B's"
+    );
+    let mut r = device_info(nv::NV_DEVICE_V0_INFO);
+    r.0[HDR + MTHD] = 1;
+    assert_eq!(r.send(&gpu, A), Err(nv::EINVAL), "reply template version 1");
+    let mut r = device_info(nv::NV_DEVICE_V0_INFO);
+    r.0.push(0);
+    assert_eq!(
+        r.send(&gpu, A),
+        Err(nv::EINVAL),
+        "a byte more than the reply"
+    );
+    assert_eq!(
+        Nvif::new(nv::NVIF_IOCTL_V0_MTHD, 0xff, 0, 0xd0d0, HDR + MTHD + INFO)
+            .put(
+                HDR,
+                nv::NvifIoctlMthdV0 {
+                    version: 0,
+                    method: nv::NV_DEVICE_V0_INFO,
+                    pad02: [0; 6],
+                },
+            )
+            .send(&gpu, A),
+        Err(nv::EINVAL),
+        "MTHD on a channel's route"
+    );
+    // DEL: route 0 and no body; then the device object is gone.
+    assert_eq!(
+        Nvif::new(nv::NVIF_IOCTL_V0_DEL, 0xff, 0, 0xd0d0, HDR).send(&gpu, A),
+        Err(nv::EINVAL),
+        "DEL on a channel's route"
+    );
+    assert_eq!(
+        Nvif::new(nv::NVIF_IOCTL_V0_DEL, 0, 0, 0xd0d0, HDR + 1).send(&gpu, A),
+        Err(nv::EINVAL),
+        "DEL with a body"
+    );
+    assert_eq!(device_info(nv::NV_DEVICE_V0_INFO).send(&gpu, A), Ok(0));
+    assert_eq!(
+        Nvif::new(nv::NVIF_IOCTL_V0_DEL, 0, 0, 0xd0d0, HDR).send(&gpu, B),
+        Ok(0),
+        "B's DEL of A's cookie is a no-op"
+    );
+    assert_eq!(device_info(nv::NV_DEVICE_V0_INFO).send(&gpu, A), Ok(0));
+    assert_eq!(
+        Nvif::new(nv::NVIF_IOCTL_V0_DEL, 0, 0, 0xd0d0, HDR).send(&gpu, A),
+        Ok(0)
+    );
+    assert_eq!(
+        device_info(nv::NV_DEVICE_V0_INFO).send(&gpu, A),
+        Err(nv::EINVAL),
+        "deleted"
+    );
+    // Process exit drops the device objects with everything else.
+    assert_eq!(device_new(u64::MAX).send(&gpu, A), Ok(0));
+    gpu.nouveau_release_process(A);
+    assert_eq!(
+        device_info(nv::NV_DEVICE_V0_INFO).send(&gpu, A),
+        Err(nv::EINVAL)
+    );
+}
+
+#[test]
 fn nvif_del_and_the_class_registry_are_scoped_to_the_owner_and_the_channel() {
     let _g = LOCK.lock();
     let gpu = gpu();
@@ -1181,12 +1332,12 @@ fn nvif_del_and_the_class_registry_are_scoped_to_the_owner_and_the_channel() {
     // A DEL names the object by the cookie mesa passed at NEW (a heap
     // pointer, so equal across processes): only the caller's goes.
     assert_eq!(
-        Nvif::new(nv::NVIF_IOCTL_V0_DEL, 0xff, 3, 0x1000, HDR).send(&gpu, STRANGER),
+        Nvif::new(nv::NVIF_IOCTL_V0_DEL, 0, 3, 0x1000, HDR).send(&gpu, STRANGER),
         Ok(0),
         "nothing of STRANGER's: a no-op, as in Linux's nvif_object_dtor"
     );
     assert_eq!(
-        Nvif::new(nv::NVIF_IOCTL_V0_DEL, 0xff, 3, 0x1000, HDR).send(&gpu, A),
+        Nvif::new(nv::NVIF_IOCTL_V0_DEL, 0, 3, 0x1000, HDR).send(&gpu, A),
         Ok(0)
     );
     assert_eq!(nv::class_object_remove(0x1000, A), None, "gone");
@@ -2012,7 +2163,7 @@ fn with_the_rm_a_subchannel_new_builds_the_class_on_the_callers_context_and_chan
     }
     // DEL frees the RM object, the caller's only.
     assert_eq!(
-        Nvif::new(nv::NVIF_IOCTL_V0_DEL, 0xff, 0, 0x1000, HDR).send(&gpu, B),
+        Nvif::new(nv::NVIF_IOCTL_V0_DEL, 0, 0, 0x1000, HDR).send(&gpu, B),
         Ok(0)
     );
     assert_eq!(FAKE_RM.lock().class_frees, 1);
