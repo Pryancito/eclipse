@@ -250,6 +250,43 @@ pub fn frame_stats() -> (usize, usize) {
     )
 }
 
+/// The next table down from page-table entry `e` at `level`, or `None` when
+/// there is none to descend into.
+///
+/// Three reasons there is none, and the third was a hole. The entry may be
+/// absent (bit 0 clear). It may be a huge leaf: bit 7 is `PS` in a PDPTE
+/// (1 GiB) or a PDE (2 MiB), so a set `PS` there means the entry maps memory
+/// rather than naming a table -- but in the PML4 bit 7 is reserved and in a PTE
+/// it is `PAT`, which is why the question is asked only below level 4 and why
+/// the walk stops before reading a PTE at all. And **the child address may be
+/// zero**: the walk guarded its *reservation* with `table_pa != 0` and then
+/// dereferenced `phys_to_virt(table_pa)` regardless, so a present entry naming
+/// frame 0 -- which nothing legitimately does, and which is exactly the shape
+/// of a half-overwritten entry -- had the walk reading 4 KiB of frame 0 as 512
+/// page-table entries and recursing into whatever they said. In the one
+/// function whose entire job is to stop a recycled page table from triple
+/// faulting the machine.
+///
+/// `level` is 4 for the PML4 down to 1 for a PT.
+fn table_child(e: u64, level: u8) -> Option<usize> {
+    const PRESENT: u64 = 1;
+    /// Bit 7: `PS` in a PDPTE or PDE, `PAT` in a PTE, reserved in a PML4E.
+    const HUGE: u64 = 1 << 7;
+    /// Bits 51:12 of an entry are the physical address of what it names.
+    const ADDR_MASK: u64 = 0x000f_ffff_ffff_f000;
+    if e & PRESENT == 0 {
+        return None;
+    }
+    if level < 4 && e & HUGE != 0 {
+        return None;
+    }
+    let child = (e & ADDR_MASK) as usize;
+    if child == 0 {
+        return None;
+    }
+    Some(child)
+}
+
 /// Reserve every frame of the CURRENTLY ACTIVE page-table tree so the frame
 /// allocator can never hand them out as ordinary RAM.
 ///
@@ -277,10 +314,8 @@ pub fn reserve_active_page_table_frames() {
     // lower table; entry bit 0 = present. Physical addresses are masked to 52
     // bits and page-aligned.
     fn walk(ba: &mut FrameAlloc, table_pa: usize, level: u8, reserved: &mut usize) {
-        const PRESENT: u64 = 1;
-        const HUGE: u64 = 1 << 7;
         let idx = table_pa >> PAGE_BITS;
-        if table_pa != 0 && table_pa < MAX_MANAGED_PADDR_EXCLUSIVE {
+        if table_pa < MAX_MANAGED_PADDR_EXCLUSIVE {
             // `remove` marks the frame used regardless of current state.
             ba.remove(idx..idx + 1);
             *reserved += 1;
@@ -288,15 +323,16 @@ pub fn reserve_active_page_table_frames() {
         if level == 1 {
             return;
         }
+        // SAFETY: `table_pa` is a live page-table frame -- the root from CR3,
+        // or a child `table_child` accepted -- and the physmap covers every
+        // page-table frame. `table_child` is what guarantees it is not zero.
         let entries = unsafe {
             core::slice::from_raw_parts(kernel_hal::mem::phys_to_virt(table_pa) as *const u64, 512)
         };
         for &e in entries {
-            if e & PRESENT == 0 || (level < 4 && e & HUGE != 0) {
-                continue;
+            if let Some(child) = table_child(e, level) {
+                walk(ba, child, level - 1, reserved);
             }
-            let child = (e & 0x000f_ffff_ffff_f000) as usize;
-            walk(ba, child, level - 1, reserved);
         }
     }
     walk(&mut ba, root, 4, &mut reserved);
@@ -1565,5 +1601,94 @@ mod frame_tests {
             "libos reports no page-table root; this test would walk a null tree"
         );
         reserve_active_page_table_frames();
+    }
+}
+
+/// Which page-table entries have a table under them.
+///
+/// The region arithmetic beside this already has its `frame_tests`; the walk
+/// that keeps the live boot tree out of the frame pool did not, and its
+/// per-entry decision is where a wrong answer is worst: descend into a huge
+/// leaf and you read 4 KiB of somebody's data as 512 page-table entries; refuse
+/// to descend and a live page table goes into the pool as ordinary RAM, which
+/// is the corruption this function exists to prevent.
+///
+/// The heap half below is `#[cfg(not(feature = "libos"))]` and **cannot** be
+/// opened the way `lang.rs` and `oops.rs` were: `buddy_system_allocator` and
+/// `bitmap-allocator` are `target_os = "none"` dependencies, and `LockedHeap`'s
+/// mutex comes from kernel-sync, which gates its impl on the same cfg -- so it
+/// has no `lock()` on a host build. Opening it means changing a vendored crate,
+/// not a cfg.
+#[cfg(test)]
+mod table_walk_tests {
+    use super::table_child;
+
+    /// Bits 51:12 are the address; the low twelve bits and bit 63 are flags.
+    fn entry(child_pa: usize, flags: u64) -> u64 {
+        child_pa as u64 | flags
+    }
+
+    #[test]
+    fn an_absent_entry_has_nothing_under_it() {
+        for level in 2..=4u8 {
+            assert_eq!(table_child(entry(0x1000, 0), level), None, "level {level}");
+            assert_eq!(
+                table_child(entry(0x1000, 1 << 1 | 1 << 2), level),
+                None,
+                "level {level}: writable and user, but not present"
+            );
+        }
+    }
+
+    #[test]
+    fn a_present_entry_names_the_table_under_it_with_its_flags_stripped() {
+        // present | writable | user | accessed | dirty | NX
+        let flags = 1 | 1 << 1 | 1 << 2 | 1 << 5 | 1 << 6 | 1 << 63;
+        for level in 2..=4u8 {
+            assert_eq!(
+                table_child(entry(0x1234_5000, flags), level),
+                Some(0x1234_5000),
+                "level {level}"
+            );
+        }
+    }
+
+    /// Bit 7 is `PS` in a PDPTE (1 GiB) and a PDE (2 MiB): the entry maps memory
+    /// instead of naming a table.
+    #[test]
+    fn a_huge_leaf_has_no_table_under_it() {
+        let huge = 1 | 1 << 7;
+        assert_eq!(table_child(entry(0x4000_0000, huge), 3), None, "1 GiB page");
+        assert_eq!(table_child(entry(0x20_0000, huge), 2), None, "2 MiB page");
+    }
+
+    /// ...but in the PML4 bit 7 is reserved, not `PS`. Reading it as `PS` there
+    /// would skip a whole 512 GiB quarter of the tree, live page tables and all,
+    /// and every one of those frames would go into the pool as ordinary RAM.
+    #[test]
+    fn bit_seven_in_the_top_table_is_not_a_huge_page() {
+        assert_eq!(
+            table_child(entry(0x1000, 1 | 1 << 7), 4),
+            Some(0x1000),
+            "the PML4 has no PS bit"
+        );
+    }
+
+    /// The hole. The walk guarded its *reservation* with `table_pa != 0` and
+    /// then dereferenced `phys_to_virt(table_pa)` anyway, so a present entry
+    /// naming frame 0 -- the shape of a half-overwritten entry, and nothing
+    /// legitimate -- sent it reading frame 0 as a page table and recursing into
+    /// whatever it found there. In the one function whose whole job is to stop a
+    /// recycled page table from triple faulting the machine.
+    #[test]
+    fn a_present_entry_naming_frame_zero_is_not_followed() {
+        for level in 2..=4u8 {
+            assert_eq!(table_child(entry(0, 1), level), None, "level {level}");
+            assert_eq!(
+                table_child(entry(0, 1 | 1 << 1 | 1 << 5), level),
+                None,
+                "level {level} with flags"
+            );
+        }
     }
 }
