@@ -514,9 +514,19 @@ impl Process {
         if let Some(hook) = hook {
             hook(self.base.id);
         }
-        let inner = self.inner.lock();
         // If we are critical to a job, we need to take action.
-        if let Some((job, retcode_nonzero)) = &inner.critical_to_job {
+        //
+        // Copied out and the lock DROPPED before the kill, for the same reason
+        // as the hook just above. `Job::kill` walks the whole job tree and
+        // tears down every process in it, each one doing its own
+        // `vmar.clear()` and teardown hook -- tens or hundreds of milliseconds
+        // apiece. Holding this lock means holding an IRQ-off spin lock for all
+        // of it, and a CPU with interrupts off cannot ack a TLB shootdown, so a
+        // peer in `vmar.clear` spins until the 8 s deadlock detector kills the
+        // machine. That is the glxgears-window-close panic the comment above
+        // describes, and the shape is the same one.
+        let critical = self.inner.lock().critical_to_job.clone();
+        if let Some((job, retcode_nonzero)) = critical {
             if !retcode_nonzero || retcode != 0 {
                 job.kill();
             }
