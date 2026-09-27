@@ -7,6 +7,8 @@ use alloc::sync::Arc;
 use core::any::Any;
 use core::future::Future;
 use core::pin::Pin;
+#[cfg(test)]
+use core::sync::atomic::AtomicUsize;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use core::task::{Context, Poll as TaskPoll};
 use core::time::Duration;
@@ -223,60 +225,17 @@ impl DrmDev {
         if !zcore_drivers::display::nouveau_uapi_enabled() {
             return;
         }
-        let timeline = is_syncobj_timeline_wait(cmd);
-        // Deadline-sized ioctls carry a trailing hint we never read; the
-        // prefix matches the classic structs.
-        let prefix = if timeline {
-            core::mem::size_of::<DrmSyncobjTimelineWait>()
-        } else {
-            core::mem::size_of::<DrmSyncobjWait>()
-        };
-        if ucheck(data, prefix).is_err() {
+        // A request the sync arm will refuse, or answer without waiting, is
+        // not slept on.
+        let Ok(Some(SyncobjWaitReq {
+            handles,
+            points,
+            timeout_nsec,
+            flags,
+            ..
+        })) = read_syncobj_wait(cmd, data)
+        else {
             return;
-        }
-        let (handles_ptr, points_ptr, timeout_nsec, count_handles, flags) = if timeline {
-            let req = unsafe { *(data as *const DrmSyncobjTimelineWait) };
-            (
-                req.handles,
-                req.points,
-                req.timeout_nsec,
-                req.count_handles,
-                req.flags,
-            )
-        } else {
-            let req = unsafe { *(data as *const DrmSyncobjWait) };
-            (
-                req.handles,
-                0u64,
-                req.timeout_nsec,
-                req.count_handles,
-                req.flags,
-            )
-        };
-        const MAX_HANDLES: u32 = 64;
-        if count_handles == 0 || count_handles > MAX_HANDLES || handles_ptr == 0 {
-            return;
-        }
-        if ucheck_n::<u32>(handles_ptr as usize, count_handles as usize).is_err() {
-            return;
-        }
-        if timeline
-            && points_ptr != 0
-            && ucheck_n::<u64>(points_ptr as usize, count_handles as usize).is_err()
-        {
-            return;
-        }
-        let handles: alloc::vec::Vec<u32> = (0..count_handles as usize)
-            .map(|i| unsafe { *(handles_ptr as *const u32).add(i) })
-            .collect();
-        let points: Option<alloc::vec::Vec<u64>> = if timeline && points_ptr != 0 {
-            Some(
-                (0..count_handles as usize)
-                    .map(|i| unsafe { *(points_ptr as *const u64).add(i) })
-                    .collect(),
-            )
-        } else {
-            None
         };
         let deadline_us = (timeout_nsec.max(0) as u64) / 1000;
         let wait_all = flags & DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL != 0;
@@ -1438,14 +1397,29 @@ impl DrmDev {
                 // Flush accumulated damage by re-scanning the framebuffer out.
                 // Clients that keep one persistent FB and signal damage with
                 // DIRTYFB (X's modesetting shadow, simple toolkits) rely on this
-                // to update the screen. When clip rects are given, blit only
-                // their bounding union — a full-frame copy of a swapchain
-                // buffer that only has those boxes painted left stale tiles
-                // (squares) on the GOP. Scanout expands the union to 64-byte
-                // WC lines so a partial store cannot smear neighbouring pixels.
+                // to update the screen. A full-frame copy of a swapchain buffer
+                // that only has those boxes painted left stale tiles (squares) on
+                // the GOP, so what goes up is the damage and not the frame.
+                //
+                // Each box is blitted ON ITS OWN while there are few enough of
+                // them to be worth the per-blit bookkeeping and their bounding
+                // union is much bigger than they are. That union used to be the
+                // one span, and for the two boxes a toolkit really sends -- a
+                // menu here, the shadow it dropped over there -- it is most of
+                // the screen: at the 42 MB/s this panel's aperture writes at
+                // (see `la-basura-del-dibujado` measurements) a 1920x1080 span is
+                // ~99 ms, so a 16x16 menu redraw cost a fifth of a second and
+                // three dropped frames. Scanout expands each span to 64-byte WC
+                // lines so a partial store cannot smear neighbouring pixels.
+                //
                 // An oversized, zero, or unreadable clip list means "the whole
                 // frame is dirty" (true DIRTYFB semantics for num_clips == 0).
+                const MAX_DIRTY_SPANS: usize = 8;
                 let cmd = unsafe { *(data as *const DrmModeFbDirtyCmd) };
+                let mut spans = [(0u32, 0u32, 0u32, 0u32); MAX_DIRTY_SPANS];
+                let mut n = 0usize;
+                let mut area = 0u64;
+                let mut too_many = false;
                 let rect = if cmd.num_clips > 0 && cmd.num_clips <= 64 && cmd.clips_ptr != 0 {
                     ucheck_n::<DrmClipRect>(cmd.clips_ptr as usize, cmd.num_clips as usize)?;
                     let mut union: Option<(u32, u32, u32, u32)> = None;
@@ -1460,6 +1434,13 @@ impl DrmDev {
                             clip.x2 as u32,
                             clip.y2 as u32,
                         );
+                        if n < MAX_DIRTY_SPANS {
+                            spans[n] = (x1, y1, x2 - x1, y2 - y1);
+                            n += 1;
+                            area += (x2 - x1) as u64 * (y2 - y1) as u64;
+                        } else {
+                            too_many = true;
+                        }
                         union = Some(match union {
                             Some((ux, uy, uw, uh)) => {
                                 let nx = ux.min(x1);
@@ -1475,7 +1456,32 @@ impl DrmDev {
                 } else {
                     None
                 };
-                if !drm::present_now_region(cmd.fb_id, 1, rect) {
+                // One box is one box either way, so the boxes only win when there
+                // are several of them and they really are far apart: half the
+                // union or less. Overlapping or adjacent boxes go up as the union,
+                // where they cost one blit instead of several that copy the same
+                // pixels twice.
+                let by_box = match rect {
+                    Some((_, _, uw, uh)) if n > 1 && !too_many => {
+                        area.saturating_mul(2) <= uw as u64 * uh as u64
+                    }
+                    _ => false,
+                };
+                #[cfg(test)]
+                DIRTY_SPANS_BLITTED.store(if by_box { n } else { 1 }, Ordering::Relaxed);
+                let presented = if by_box {
+                    // Every box, even if one of them cannot be scanned out: they
+                    // are separate pieces of damage and dropping the rest because
+                    // the first failed would leave the screen half updated.
+                    let mut ok = true;
+                    for span in spans.iter().take(n) {
+                        ok &= drm::present_now_region(cmd.fb_id, 1, Some(*span));
+                    }
+                    ok
+                } else {
+                    drm::present_now_region(cmd.fb_id, 1, rect)
+                };
+                if !presented {
                     // Best-effort: a damage flush that can't scan out (e.g. the
                     // fb id is unknown to the software path) is not fatal — the
                     // client keeps its shadow and will re-present. Returning EIO
@@ -2227,8 +2233,11 @@ impl DrmDev {
                     return Err(FsError::OpNotSupported);
                 }
                 let req = unsafe { &*(data as *const DrmSyncobjArray) };
-                const MAX_HANDLES: u32 = 64;
-                if req.count_handles == 0 || req.count_handles > MAX_HANDLES || req.handles == 0 {
+                if req.count_handles == 0 {
+                    return Err(FsError::InvalidParam);
+                }
+                syncobj_array_bound(req.count_handles)?;
+                if req.handles == 0 {
                     return Err(FsError::InvalidParam);
                 }
                 ucheck_n::<u32>(req.handles as usize, req.count_handles as usize)?;
@@ -2271,12 +2280,11 @@ impl DrmDev {
                     return Err(FsError::OpNotSupported);
                 }
                 let req = unsafe { &*(data as *const DrmSyncobjTimelineArray) };
-                const MAX_HANDLES: u32 = 64;
-                if req.count_handles == 0
-                    || req.count_handles > MAX_HANDLES
-                    || req.handles == 0
-                    || req.points == 0
-                {
+                if req.count_handles == 0 {
+                    return Err(FsError::InvalidParam);
+                }
+                syncobj_array_bound(req.count_handles)?;
+                if req.handles == 0 || req.points == 0 {
                     return Err(FsError::InvalidParam);
                 }
                 ucheck_n::<u32>(req.handles as usize, req.count_handles as usize)?;
@@ -2338,12 +2346,11 @@ impl DrmDev {
                     return Err(FsError::OpNotSupported);
                 }
                 let req = unsafe { &*(data as *const DrmSyncobjTimelineArray) };
-                const MAX_HANDLES: u32 = 64;
-                if req.count_handles == 0
-                    || req.count_handles > MAX_HANDLES
-                    || req.handles == 0
-                    || req.points == 0
-                {
+                if req.count_handles == 0 {
+                    return Err(FsError::InvalidParam);
+                }
+                syncobj_array_bound(req.count_handles)?;
+                if req.handles == 0 || req.points == 0 {
                     return Err(FsError::InvalidParam);
                 }
                 let last_submitted = req.flags & DRM_SYNCOBJ_QUERY_FLAGS_LAST_SUBMITTED != 0;
@@ -2400,57 +2407,26 @@ impl DrmDev {
                 if !zcore_drivers::display::nouveau_uapi_enabled() {
                     return Err(FsError::OpNotSupported);
                 }
-                // One rule for "is this the timeline wait", shared with the
-                // async sleeper that runs before this arm, so the two cannot
-                // read the same request as different structs.
-                let timeline = is_syncobj_timeline_wait(cmd);
-                // Both structs share this prefix layout, so a single path
-                // can read the common fields regardless of which ioctl.
-                let (handles_ptr, points_ptr, timeout_nsec, count_handles, flags) = if timeline {
-                    let req = unsafe { &*(data as *const DrmSyncobjTimelineWait) };
-                    (
-                        req.handles,
-                        req.points,
-                        req.timeout_nsec,
-                        req.count_handles,
-                        req.flags,
-                    )
-                } else {
-                    let req = unsafe { &*(data as *const DrmSyncobjWait) };
-                    (
-                        req.handles,
-                        0,
-                        req.timeout_nsec,
-                        req.count_handles,
-                        req.flags,
-                    )
+                // The request as the async sleeper read it (one reader, so
+                // the two cannot disagree on the struct or on what is
+                // refused). Nothing to wait for is answered at once, as
+                // Linux does, without reading the array.
+                let Some(SyncobjWaitReq {
+                    timeline,
+                    handles,
+                    points,
+                    timeout_nsec,
+                    flags,
+                }) = read_syncobj_wait(cmd, data)?
+                else {
+                    return Ok(0);
                 };
-                const MAX_HANDLES: u32 = 64;
-                if count_handles == 0 || count_handles > MAX_HANDLES || handles_ptr == 0 {
-                    return Err(FsError::InvalidParam);
-                }
-                ucheck_n::<u32>(handles_ptr as usize, count_handles as usize)?;
-                if timeline && points_ptr != 0 {
-                    ucheck_n::<u64>(points_ptr as usize, count_handles as usize)?;
-                }
-                let handles: alloc::vec::Vec<u32> = (0..count_handles as usize)
-                    .map(|i| unsafe { *(handles_ptr as *const u32).add(i) })
-                    .collect();
                 // The caller's own handles (`drm_syncobj_array_find`): a wait
                 // on another process's syncobj is ENOENT, not a wait.
                 if !zcore_drivers::scheme::syncobj::all_usable_by(drm::current_pid(), &handles) {
                     syncobj_wait_klog(timeline, &handles, "not the caller's handle (ENOENT)");
                     return Err(FsError::EntryNotFound);
                 }
-                let points: Option<alloc::vec::Vec<u64>> = if timeline && points_ptr != 0 {
-                    Some(
-                        (0..count_handles as usize)
-                            .map(|i| unsafe { *(points_ptr as *const u64).add(i) })
-                            .collect(),
-                    )
-                } else {
-                    None
-                };
                 // `timeout_nsec` is an ABSOLUTE CLOCK_MONOTONIC deadline (real
                 // Linux semantics, confirmed against this kernel's own
                 // `now_monotonic()` -> `kernel_hal::timer::timer_now()`), not a
@@ -3370,6 +3346,100 @@ fn ucheck_n<T>(addr: usize, count: usize) -> Result<()> {
     }
 }
 
+/// How many handles a syncobj array ioctl may name. Linux puts no bound of
+/// its own on `count_handles`: the array is `kmalloc_array`ed, and only
+/// past 4 MiB of handles does that fail, with ENOMEM. The five array arms
+/// here shared a cap of 64, EINVAL beyond it -- and `vkWaitForFences` with
+/// more fences than that is a single `TIMELINE_WAIT` over all of them
+/// (`vk_drm_syncobj_wait_many`), so a legal call came back
+/// VK_ERROR_UNKNOWN.
+const SYNCOBJ_ARRAY_MAX: u32 = 1 << 20;
+
+/// ENOMEM past [`SYNCOBJ_ARRAY_MAX`], as the kernel's allocation would be.
+fn syncobj_array_bound(count_handles: u32) -> Result<()> {
+    if count_handles > SYNCOBJ_ARRAY_MAX {
+        Err(FsError::NoDeviceSpace)
+    } else {
+        Ok(())
+    }
+}
+
+/// What a `SYNCOBJ_WAIT` / `TIMELINE_WAIT` (deadline-sized or not) asks
+/// for, read the same way by the async sleeper and the sync arm.
+struct SyncobjWaitReq {
+    timeline: bool,
+    handles: alloc::vec::Vec<u32>,
+    points: Option<alloc::vec::Vec<u64>>,
+    timeout_nsec: i64,
+    flags: u32,
+}
+
+/// Read a wait request. `Ok(None)` is a wait on no handles at all, which
+/// Linux answers 0 without reading the array (`count_handles == 0`), and
+/// the array bound is [`syncobj_array_bound`].
+fn read_syncobj_wait(cmd: u32, data: usize) -> Result<Option<SyncobjWaitReq>> {
+    // One rule for "is this the timeline wait", so the sleeper and the arm
+    // cannot read the same request as different structs.
+    let timeline = is_syncobj_timeline_wait(cmd);
+    // Deadline-sized ioctls carry a trailing hint never read here; the
+    // prefix matches the classic structs, which share this layout.
+    let prefix = if timeline {
+        core::mem::size_of::<DrmSyncobjTimelineWait>()
+    } else {
+        core::mem::size_of::<DrmSyncobjWait>()
+    };
+    ucheck(data, prefix)?;
+    let (handles_ptr, points_ptr, timeout_nsec, count_handles, flags) = if timeline {
+        let req = unsafe { *(data as *const DrmSyncobjTimelineWait) };
+        (
+            req.handles,
+            req.points,
+            req.timeout_nsec,
+            req.count_handles,
+            req.flags,
+        )
+    } else {
+        let req = unsafe { *(data as *const DrmSyncobjWait) };
+        (
+            req.handles,
+            0u64,
+            req.timeout_nsec,
+            req.count_handles,
+            req.flags,
+        )
+    };
+    if count_handles == 0 {
+        return Ok(None);
+    }
+    syncobj_array_bound(count_handles)?;
+    if handles_ptr == 0 {
+        return Err(FsError::InvalidParam);
+    }
+    ucheck_n::<u32>(handles_ptr as usize, count_handles as usize)?;
+    if timeline && points_ptr != 0 {
+        ucheck_n::<u64>(points_ptr as usize, count_handles as usize)?;
+    }
+    let handles: alloc::vec::Vec<u32> = (0..count_handles as usize)
+        .map(|i| unsafe { *(handles_ptr as *const u32).add(i) })
+        .collect();
+    let points: Option<alloc::vec::Vec<u64>> = if timeline && points_ptr != 0 {
+        Some(
+            (0..count_handles as usize)
+                .map(|i| unsafe { *(points_ptr as *const u64).add(i) })
+                .collect(),
+        )
+    } else {
+        None
+    };
+    Ok(Some(SyncobjWaitReq {
+        timeline,
+        handles,
+        points,
+        timeout_nsec,
+        flags,
+    }))
+}
+
 fn eclipse_compute_ioctl(minor: u32, data: usize) -> Result<usize> {
     let req = unsafe { &mut *(data as *mut DrmEclipseCompute) };
     // The node decides the GPU: `ecl-compute` on card2 must launch on the card
@@ -3389,6 +3459,18 @@ fn eclipse_compute_ioctl(minor: u32, data: usize) -> Result<usize> {
     req.grid_threads = result.grid_threads;
     fill_summary(&mut req.summary, &result.report);
     Ok(0)
+}
+
+/// How many spans the last DIRTYFB blitted: the boxes themselves, or 1 for their
+/// bounding union. A test cannot see the difference on the screen when the client
+/// painted its whole buffer, and that is exactly the client a test writes.
+#[cfg(test)]
+static DIRTY_SPANS_BLITTED: AtomicUsize = AtomicUsize::new(0);
+
+/// How many spans the last DIRTYFB blitted.
+#[cfg(test)]
+fn dirty_spans_blitted_for_test() -> usize {
+    DIRTY_SPANS_BLITTED.load(Ordering::Relaxed)
 }
 
 fn fill_summary(dst: &mut [u8; 512], src: &str) {
@@ -8721,8 +8803,11 @@ mod kms_scanout_tests {
         /// buffer it currently holds: a buffer being drawn into is not a frame
         /// anybody has asked for.
         scene: alloc::vec::Vec<u32>,
-        /// Where the pointer is drawn and how big it is.
-        cursor: Option<(u32, u32, u32, u32)>,
+        /// Where the pointer is drawn and how big it is. The position is signed
+        /// because a pointer really does hang off the left and top edges: the
+        /// kernel clips it, and a model that could not express that would never
+        /// ask what the clipping does.
+        cursor: Option<(i32, i32, u32, u32)>,
         /// The pointer image, `bmp_w` pixels per row, alpha `0xff` or `0x00`
         /// only -- a partly transparent pointer would need the blend written
         /// out twice, and what these tests are about is what shows THROUGH it.
@@ -8752,6 +8837,18 @@ mod kms_scanout_tests {
             self.cursor = None;
         }
 
+        /// A damage box of frame `n` went up and the rest of the panel kept the
+        /// frame that was already there -- the panel holding two frames at once,
+        /// on purpose, which is legitimate only while the box really is all that
+        /// changed.
+        fn present_box(&mut self, n: u32, x: u32, y: u32, w: u32, h: u32) {
+            for py in y..(y + h).min(self.h) {
+                for px in x..(x + w).min(self.w) {
+                    self.scene[(py * self.w + px) as usize] = desktop_px(n, px, py);
+                }
+            }
+        }
+
         /// The compositor put frame `n` up, whole.
         fn present(&mut self, n: u32) {
             self.scene.resize((self.w * self.h) as usize, 0);
@@ -8764,8 +8861,9 @@ mod kms_scanout_tests {
 
         fn want(&self, x: u32, y: u32) -> u32 {
             if let Some((cx, cy, cw, ch)) = self.cursor {
-                if x >= cx && x < cx + cw && y >= cy && y < cy + ch {
-                    let s = self.bmp[((y - cy) * self.bmp_w + (x - cx)) as usize];
+                let (dx, dy) = (x as i64 - cx as i64, y as i64 - cy as i64);
+                if dx >= 0 && dx < cw as i64 && dy >= 0 && dy < ch as i64 {
+                    let s = self.bmp[(dy as u32 * self.bmp_w + dx as u32) as usize];
                     if s >> 24 != 0 {
                         return s | 0xFF00_0000;
                     }
@@ -8816,6 +8914,251 @@ mod kms_scanout_tests {
         v
     }
 
+    /// A damage box must not let the pointer paste the rest of the client's
+    /// buffer onto the screen.
+    ///
+    /// The pointer is composited on top of every present, over a window widened
+    /// to whole write-combining lines, so its window routinely reaches outside a
+    /// damage box. Inside the box the client's buffer and the panel hold the same
+    /// pixels. Outside it they do not: the panel holds the frame that was there
+    /// before, and the buffer holds whatever the client has in it now -- for a
+    /// compositor that redraws only its damage an older frame, and for one that
+    /// has begun the next frame transparent black. Taking the buffer's pixels
+    /// there puts a rectangle the client never declared on the screen, right
+    /// where the pointer is.
+    ///
+    /// Same fault as the one `CursorUnder` is named for, reached through the
+    /// present instead of through a pointer move, and found by the damage-box
+    /// steps of the soak below rather than by anybody thinking of it.
+    #[test]
+    fn a_damage_box_must_not_let_the_pointer_paste_the_rest_of_the_clients_buffer() {
+        const W: u32 = 120;
+        const H: u32 = 96;
+        const CUR: u32 = 16;
+        let screen = kms_emu::attach_with(W, H, 128, true);
+        let c = Client::open(0);
+        let buf = c.create_dumb(W, H);
+        paint(&buf, |x, y| desktop_px(1, x, y));
+        let fb = c.addfb2(&buf);
+        set_crtc(&c, drm::SYNTH_CRTC_ID, fb, W, H);
+        drain_completions(&c);
+
+        let bmp = pointer_bitmap(CUR, CUR);
+        let cur = c.create_dumb(CUR, CUR);
+        {
+            let px = map_dumb(&cur);
+            for (i, v) in bmp.iter().enumerate() {
+                px[i] = *v;
+            }
+        }
+        // Near the top, far above the damage box: the pointer's window lies
+        // wholly outside what the present is about to copy.
+        set_cursor(&c, drm::SYNTH_CRTC_ID, cur.handle, CUR, CUR, 38, 4);
+        let mut panel = Panel::new(W, H, 1, bmp.clone(), CUR);
+        panel.cursor = Some((38, 4, CUR, CUR));
+        panel.check(&screen, "frame 1 with the pointer on it");
+
+        // The client redraws ONE box and starts the next frame everywhere else,
+        // which is a renderer clearing to transparent black. Then it declares
+        // just the box.
+        let (bx, by, bw, bh) = (32u32, 48u32, 64u32, 32u32);
+        paint(&buf, |x, y| {
+            if (bx..bx + bw).contains(&x) && (by..by + bh).contains(&y) {
+                desktop_px(2, x, y)
+            } else {
+                0x0000_0000
+            }
+        });
+        dirtyfb(
+            &c,
+            fb,
+            &[clip(
+                bx as u16,
+                by as u16,
+                (bx + bw) as u16,
+                (by + bh) as u16,
+            )],
+        );
+        drain_completions(&c);
+
+        panel.present_box(2, bx, by, bw, bh);
+        panel.check(&screen, "the damage box went up and the pointer did not");
+        // And it is the save that did it, not a lucky agreement between two
+        // sources: every pixel of this window came from outside the box.
+        assert!(
+            drm::cursor_px_from_save_for_test() > 0,
+            "the pointer composited without reading the save, so this test \
+             passed for some other reason"
+        );
+
+        set_cursor(&c, drm::SYNTH_CRTC_ID, 0, 0, 0, 0, 0);
+        c.rmfb(fb).expect("RMFB");
+        c.destroy_dumb(cur.handle).expect("DESTROY_DUMB cursor");
+        c.destroy_dumb(buf.handle).expect("DESTROY_DUMB");
+    }
+
+    /// Two small pieces of damage far apart must not drag the whole span between
+    /// them through the aperture.
+    ///
+    /// A DIRTYFB with several clip rects used to go up as their bounding union,
+    /// and for the two boxes a toolkit really sends -- a menu here, the shadow it
+    /// dropped over there -- that union is most of the screen. The panel's
+    /// aperture takes writes at about 42 MB/s, so a whole 1920x1080 span is ~99 ms
+    /// and three dropped frames for what the client said was two 16x16 boxes.
+    ///
+    /// The screen cannot tell the two apart for a client that painted its whole
+    /// buffer, which is every client a test writes, so this paints the WHOLE
+    /// buffer with the new frame and then asserts that what is between the boxes
+    /// still holds the old one. That is only true if the boxes went up as boxes.
+    /// The span count is asserted as well, for the cases where the union is the
+    /// right answer and the screen agrees either way.
+    #[test]
+    fn two_far_apart_damage_boxes_do_not_drag_the_whole_span_between_them() {
+        const W: u32 = 120;
+        const H: u32 = 96;
+        let screen = kms_emu::attach_with(W, H, 128, true);
+        let c = Client::open(0);
+        let buf = c.create_dumb(W, H);
+        paint(&buf, |x, y| desktop_px(1, x, y));
+        let fb = c.addfb2(&buf);
+        set_crtc(&c, drm::SYNTH_CRTC_ID, fb, W, H);
+        drain_completions(&c);
+        let mut panel = Panel::new(W, H, 1, alloc::vec::Vec::new(), 0);
+        panel.check(&screen, "the first frame");
+
+        // Two 16x16 boxes in opposite corners. Their union is 80x72, thirty times
+        // what they are.
+        paint(&buf, |x, y| desktop_px(2, x, y));
+        dirtyfb(&c, fb, &[clip(16, 8, 32, 24), clip(80, 64, 96, 80)]);
+        drain_completions(&c);
+        assert_eq!(
+            dirty_spans_blitted_for_test(),
+            2,
+            "two far-apart boxes went up as one span"
+        );
+        panel.present_box(2, 16, 8, 16, 16);
+        panel.present_box(2, 80, 64, 16, 16);
+        panel.check(
+            &screen,
+            "two boxes went up and the span between them did not",
+        );
+
+        // Two boxes that touch. Splitting these copies the same bytes twice for
+        // nothing, so the union is the right answer and the count says so.
+        paint(&buf, |x, y| desktop_px(3, x, y));
+        dirtyfb(&c, fb, &[clip(16, 8, 48, 24), clip(32, 8, 64, 24)]);
+        drain_completions(&c);
+        assert_eq!(
+            dirty_spans_blitted_for_test(),
+            1,
+            "two touching boxes went up separately, copying the overlap twice"
+        );
+        panel.present_box(3, 16, 8, 48, 16);
+        panel.check(&screen, "two touching boxes went up as one span");
+
+        // More boxes than the kernel will track one by one, and far enough apart
+        // that it would otherwise rather split them: the union, because keeping
+        // only the first eight would DROP the ninth box and leave that piece of
+        // the client's redraw off the screen.
+        paint(&buf, |x, y| desktop_px(4, x, y));
+        let many: alloc::vec::Vec<DrmClipRect> =
+            (0..9).map(|i| clip(0, i * 10, 16, i * 10 + 4)).collect();
+        dirtyfb(&c, fb, &many);
+        drain_completions(&c);
+        assert_eq!(
+            dirty_spans_blitted_for_test(),
+            1,
+            "nine boxes were tracked one by one, so the ninth went nowhere"
+        );
+        panel.present_box(4, 0, 0, 16, 84);
+        panel.check(&screen, "nine boxes went up as one span");
+
+        c.rmfb(fb).expect("RMFB");
+        c.destroy_dumb(buf.handle).expect("DESTROY_DUMB");
+    }
+
+    /// A pointer straddling the right edge of a framebuffer SMALLER than the mode
+    /// must still be erasable, or its outer columns stay on the panel for good.
+    ///
+    /// The two paths clip the pointer's window against different things. The
+    /// present composites into the client's buffer, so it clips to the buffer:
+    /// for a 96-wide framebuffer on a 120-wide mode, a pointer at x=92 gets a
+    /// window that stops at x=96. The move path draws straight onto the panel, so
+    /// it clips to the PANEL: the same pointer gets a window reaching x=112. Each
+    /// one saves what its own window covered, so a present after a move recorded
+    /// the narrow window over the wide one -- and the next erase put back only 16
+    /// of the 20 columns. The four it did not own were pointer pixels, on top of
+    /// the desktop, with nothing left that knew they were there.
+    ///
+    /// This is not the fault Moebius is looking at (labwc presents a framebuffer
+    /// the size of the mode), but it is the same family: a window written in one
+    /// place and restored in another.
+    #[test]
+    fn a_pointer_past_the_edge_of_a_narrow_framebuffer_must_still_come_off() {
+        const W: u32 = 120;
+        const H: u32 = 96;
+        const SMALL_W: u32 = 96;
+        const SMALL_H: u32 = 80;
+        const CUR: u32 = 16;
+        let screen = kms_emu::attach_with(W, H, 128, true);
+        let c = Client::open(0);
+
+        // Frame 1 over the whole panel, so the part the narrow framebuffer never
+        // touches holds a frame of its own and a leftover there is visible.
+        let big = c.create_dumb(W, H);
+        paint(&big, |x, y| desktop_px(1, x, y));
+        let fb_big = c.addfb2(&big);
+        set_crtc(&c, drm::SYNTH_CRTC_ID, fb_big, W, H);
+        drain_completions(&c);
+
+        let small = c.create_dumb(SMALL_W, SMALL_H);
+        let fb_small = c.addfb2(&small);
+
+        let bmp = pointer_bitmap(CUR, CUR);
+        let cur = c.create_dumb(CUR, CUR);
+        {
+            let px = map_dumb(&cur);
+            for (i, v) in bmp.iter().enumerate() {
+                px[i] = *v;
+            }
+        }
+        let mut panel = Panel::new(W, H, 1, bmp.clone(), CUR);
+
+        // Straddling x=96: four columns of the pointer land where the narrow
+        // framebuffer does not reach. A pointer move draws them; only a present
+        // that knows they are there can undo them.
+        let (px0, py0) = (92i32, 15i32);
+        set_cursor(&c, drm::SYNTH_CRTC_ID, cur.handle, CUR, CUR, px0, py0);
+        panel.cursor = Some((px0, py0, CUR, CUR));
+        panel.check(&screen, "the pointer hangs off the narrow framebuffer");
+
+        // The narrow present composites the pointer again, and this is where the
+        // window used to shrink.
+        paint(&small, |x, y| desktop_px(2, x, y));
+        c.page_flip(drm::SYNTH_CRTC_ID, fb_small, 1)
+            .expect("flip the narrow framebuffer");
+        drain_completions(&c);
+        panel.present_box(2, 0, 0, SMALL_W, SMALL_H);
+        panel.check(&screen, "frame 2 from the narrow framebuffer");
+        assert!(
+            drm::cursor_windows_widened_for_test() > 0,
+            "the composite never widened its window, so this test is not \
+             exercising the fix"
+        );
+
+        // Now take the pointer away. Everything it drew has to come off, columns
+        // past the framebuffer's edge included.
+        set_cursor(&c, drm::SYNTH_CRTC_ID, 0, 0, 0, 0, 0);
+        panel.cursor = None;
+        panel.check(&screen, "the pointer was hidden and left nothing behind");
+
+        c.rmfb(fb_small).expect("RMFB small");
+        c.rmfb(fb_big).expect("RMFB big");
+        c.destroy_dumb(cur.handle).expect("DESTROY_DUMB cursor");
+        c.destroy_dumb(small.handle).expect("DESTROY_DUMB small");
+        c.destroy_dumb(big.handle).expect("DESTROY_DUMB big");
+    }
+
     /// Three hundred steps of the desktop, in a deterministic order nobody chose
     /// by hand, with the whole panel checked against the contract after every
     /// one of them.
@@ -8844,14 +9187,25 @@ mod kms_scanout_tests {
         // and the repair is the other writer of the panel that does not go
         // through the blit. Two seeds each, so the order of operations is not
         // one order.
+        let mut widened = 0usize;
         for (skip, repair) in [(false, false), (true, false), (false, true), (true, true)] {
             for seed in [0x5EED_1234u32, 0x0BAD_C0DE] {
-                soak_the_desktop(seed, skip, repair);
+                widened += soak_the_desktop(seed, skip, repair);
             }
         }
+        // A present on a framebuffer smaller than the mode has to have caught the
+        // pointer across its edge at least once in all of this, because that is
+        // the only thing that leaves a piece of the pointer to erase later. If it
+        // never happened, those steps are not exercising what they were added for
+        // -- and a whole fix would be untested with every test still green.
+        assert!(
+            widened > 0,
+            "no composite in 2400 steps widened its window, so the \
+             smaller-than-the-mode steps never put the pointer across the edge"
+        );
     }
 
-    fn soak_the_desktop(seed_in: u32, skip: bool, repair: bool) {
+    fn soak_the_desktop(seed_in: u32, skip: bool, repair: bool) -> usize {
         const W: u32 = 120;
         const H: u32 = 96;
         const CUR: u32 = 16;
@@ -8862,6 +9216,15 @@ mod kms_scanout_tests {
 
         let bufs = [c.create_dumb(W, H), c.create_dumb(W, H)];
         let fbs = [c.addfb2(&bufs[0]), c.addfb2(&bufs[1])];
+        // A framebuffer SMALLER than the mode, which is a case the present path
+        // has its own arithmetic for (`image_pitch_px`, and the pointer clipped
+        // to what the buffer covers rather than to the row stride). Its width is
+        // a multiple of 16 so the write-combining widening of the copy is a
+        // no-op and the model does not have to know how the kernel widens.
+        const SMALL_W: u32 = 96;
+        const SMALL_H: u32 = 80;
+        let small = c.create_dumb(SMALL_W, SMALL_H);
+        let fb_small = c.addfb2(&small);
         let bmp = pointer_bitmap(CUR, CUR);
         let cur = c.create_dumb(CUR, CUR);
         {
@@ -8870,6 +9233,29 @@ mod kms_scanout_tests {
                 px[i] = *v;
             }
         }
+        // A pointer of a DIFFERENT size, because a theme change or a client
+        // setting its own cursor really does hand the kernel another bitmap while
+        // the old one is on the screen. What the old one covered has to come back
+        // even though the new window is not the old window.
+        const CUR2: u32 = 8;
+        let bmp2 = pointer_bitmap(CUR2, CUR2);
+        let cur2 = c.create_dumb(CUR2, CUR2);
+        {
+            let px = map_dumb(&cur2);
+            for (i, v) in bmp2.iter().enumerate() {
+                px[i] = *v;
+            }
+        }
+        // A framebuffer BIGGER than the mode. The copy stops at the panel's edge,
+        // so the pointer's window is computed against a buffer whose rows run past
+        // the screen -- the opposite arithmetic to the smaller one, and the case
+        // the window widening has to refuse.
+        const BIG_W: u32 = 160;
+        const BIG_H: u32 = 128;
+        let big = c.create_dumb(BIG_W, BIG_H);
+        let fb_big = c.addfb2(&big);
+        let mut cur_sz = CUR;
+        let mut cur_h = cur.handle;
 
         let mut frame: u32 = 1;
         let mut slot = 0usize;
@@ -8879,12 +9265,22 @@ mod kms_scanout_tests {
         let mut model = Panel::new(W, H, frame, bmp.clone(), CUR);
         model.check(&screen, "the first frame");
 
-        let mut pos = (8u32, 8u32);
+        // Which framebuffer the panel is holding entirely. A damage box is only
+        // honoured while the panel already holds that framebuffer: otherwise the
+        // rest of the panel belongs to a different frame and honouring the box
+        // would leave two frames on screen at once, which is what put a menu on
+        // the screen twice once already.
+        let mut panel_fb = fbs[slot];
+        let mut pos = (8i32, 8i32);
         let mut shown = false;
         // The most bands any one present left alone. Asserted below, because a
         // soak that never took the skip would say nothing about it -- the one
         // lesson of the probe that measured in the wrong place.
         let mut most_skipped = 0usize;
+        // Damage flushes that went up as their own boxes rather than as one
+        // bounding span.
+        let mut by_box = 0usize;
+        let mut log: alloc::vec::Vec<alloc::string::String> = alloc::vec::Vec::new();
         // A 32-bit LCG: the sequence is fixed, so a failure here reproduces on
         // any machine, and the log below names the step.
         let mut seed: u32 = seed_in;
@@ -8894,7 +9290,7 @@ mod kms_scanout_tests {
         };
         for step in 0..300u32 {
             let what;
-            match rnd(12) {
+            match rnd(17) {
                 0..=3 => {
                     // The compositor renders a finished frame into the other
                     // buffer of its chain and puts it up, whole, as labwc does.
@@ -8906,20 +9302,29 @@ mod kms_scanout_tests {
                         .expect("flip");
                     drain_completions(&c);
                     model.present(frame);
+                    panel_fb = fbs[slot];
                     // A full present composites the pointer at wherever it is
                     // now, so that is what is on the panel.
                     model.cursor = if shown {
-                        Some((pos.0, pos.1, CUR, CUR))
+                        Some((pos.0, pos.1, cur_sz, cur_sz))
                     } else {
                         None
                     };
                     what = alloc::format!("step {}: presented frame {}", step, frame);
                 }
                 4..=6 => {
-                    pos = (rnd(W - CUR + 1), rnd(H - CUR + 1));
-                    move_cursor(&c, drm::SYNTH_CRTC_ID, pos.0 as i32, pos.1 as i32);
+                    // Anywhere from wholly off the left or top edge to wholly
+                    // past the right or bottom one. The kernel clips both the
+                    // window it draws and the window it reads back, and those
+                    // two have to clip the same way or the pointer leaves its
+                    // widened margins on the screen for good.
+                    pos = (
+                        rnd(W + 2 * CUR) as i32 - CUR as i32,
+                        rnd(H + 2 * CUR) as i32 - CUR as i32,
+                    );
+                    move_cursor(&c, drm::SYNTH_CRTC_ID, pos.0, pos.1);
                     if shown {
-                        model.cursor = Some((pos.0, pos.1, CUR, CUR));
+                        model.cursor = Some((pos.0, pos.1, cur_sz, cur_sz));
                     }
                     what = alloc::format!("step {}: pointer moved to {:?}", step, pos);
                 }
@@ -8963,32 +9368,114 @@ mod kms_scanout_tests {
                     // blank has painted the panel one colour since, which is
                     // exactly what a re-present has to put right.
                     model.present(frame);
+                    panel_fb = fbs[slot];
                     model.cursor = if shown {
-                        Some((pos.0, pos.1, CUR, CUR))
+                        Some((pos.0, pos.1, cur_sz, cur_sz))
                     } else {
                         None
                     };
                     most_skipped = most_skipped.max(drm::skipped_bands_for_test());
                     what = alloc::format!("step {}: presented frame {} AGAIN", step, frame);
                 }
-                9 => {
+                12 => {
                     shown = !shown;
                     if shown {
-                        set_cursor(
-                            &c,
-                            drm::SYNTH_CRTC_ID,
-                            cur.handle,
-                            CUR,
-                            CUR,
-                            pos.0 as i32,
-                            pos.1 as i32,
-                        );
-                        model.cursor = Some((pos.0, pos.1, CUR, CUR));
+                        set_cursor(&c, drm::SYNTH_CRTC_ID, cur_h, cur_sz, cur_sz, pos.0, pos.1);
+                        model.cursor = Some((pos.0, pos.1, cur_sz, cur_sz));
                     } else {
                         set_cursor(&c, drm::SYNTH_CRTC_ID, 0, 0, 0, 0, 0);
                         model.cursor = None;
                     }
                     what = alloc::format!("step {}: pointer shown={}", step, shown);
+                }
+                9 => {
+                    // A client with damage tracking: it redraws a box and asks
+                    // for that box only. Sometimes into the buffer the panel is
+                    // already holding, where the box may be honoured, and
+                    // sometimes into the other one, where honouring it would put
+                    // two frames on the screen at once.
+                    frame += 1;
+                    if rnd(2) == 0 {
+                        slot ^= 1;
+                    }
+                    let f = frame;
+                    paint(&bufs[slot], |x, y| desktop_px(f, x, y));
+                    // x aligned to 16 so the write-combining widening of the box
+                    // is a no-op: the model then says what the SCREEN must show
+                    // without having to know how the kernel widens anything.
+                    let bx = rnd(W / 16) * 16;
+                    let bw = (rnd(W / 16 - bx / 16) + 1) * 16;
+                    let by = rnd(H - 1);
+                    let bh = rnd(H - by) + 1;
+                    dirtyfb(
+                        &c,
+                        fbs[slot],
+                        &[clip(
+                            bx as u16,
+                            by as u16,
+                            (bx + bw) as u16,
+                            (by + bh) as u16,
+                        )],
+                    );
+                    drain_completions(&c);
+                    if fbs[slot] == panel_fb {
+                        model.present_box(frame, bx, by, bw, bh);
+                        what = alloc::format!(
+                            "step {}: frame {} as a damage box {}x{}+{}+{}",
+                            step,
+                            frame,
+                            bw,
+                            bh,
+                            bx,
+                            by
+                        );
+                    } else {
+                        // The panel was holding another framebuffer, so the box
+                        // cannot stand alone and the whole frame has to go up.
+                        model.present(frame);
+                        what = alloc::format!(
+                            "step {}: frame {} as a damage box on a framebuffer the \
+                             panel was not holding, so the whole frame",
+                            step,
+                            frame
+                        );
+                    }
+                    panel_fb = fbs[slot];
+                    model.cursor = if shown {
+                        Some((pos.0, pos.1, cur_sz, cur_sz))
+                    } else {
+                        None
+                    };
+                }
+                13 => {
+                    // A client whose framebuffer is smaller than the mode. The
+                    // present copies what the buffer covers and the rest of the
+                    // panel keeps the frame it had, so the panel holds two frames
+                    // at once -- and the pointer is composited over a window the
+                    // copy may not reach.
+                    frame += 1;
+                    let f = frame;
+                    paint(&small, |x, y| desktop_px(f, x, y));
+                    c.page_flip(drm::SYNTH_CRTC_ID, fb_small, step as u64)
+                        .expect("flip");
+                    drain_completions(&c);
+                    model.present_box(frame, 0, 0, SMALL_W, SMALL_H);
+                    // The panel does not hold this framebuffer entirely -- only
+                    // its top-left corner -- so no damage box on it may be
+                    // honoured on its own.
+                    panel_fb = 0;
+                    model.cursor = if shown {
+                        Some((pos.0, pos.1, cur_sz, cur_sz))
+                    } else {
+                        None
+                    };
+                    what = alloc::format!(
+                        "step {}: frame {} from a {}x{} framebuffer, smaller than the mode",
+                        step,
+                        frame,
+                        SMALL_W,
+                        SMALL_H
+                    );
                 }
                 10 => {
                     // DPMS off and on again, with the frame that follows it --
@@ -9003,12 +9490,147 @@ mod kms_scanout_tests {
                         .expect("flip");
                     drain_completions(&c);
                     model.present(frame);
+                    panel_fb = fbs[slot];
                     model.cursor = if shown {
-                        Some((pos.0, pos.1, CUR, CUR))
+                        Some((pos.0, pos.1, cur_sz, cur_sz))
                     } else {
                         None
                     };
                     what = alloc::format!("step {}: blanked, unblanked, frame {}", step, frame);
+                }
+                14 => {
+                    // A client whose framebuffer is BIGGER than the mode.
+                    frame += 1;
+                    let f = frame;
+                    paint(&big, |x, y| desktop_px(f, x, y));
+                    c.page_flip(drm::SYNTH_CRTC_ID, fb_big, step as u64)
+                        .expect("flip the oversized framebuffer");
+                    drain_completions(&c);
+                    // Its top-left corner holds the same pixels a framebuffer of
+                    // the mode's size would, so the screen must show this frame
+                    // entirely.
+                    model.present(frame);
+                    // The panel holds a corner of this framebuffer, not the whole
+                    // of it, so no damage box may be honoured on its own after
+                    // this.
+                    panel_fb = 0;
+                    model.cursor = if shown {
+                        Some((pos.0, pos.1, cur_sz, cur_sz))
+                    } else {
+                        None
+                    };
+                    what = alloc::format!(
+                        "step {}: frame {} from a {}x{} framebuffer, bigger than the mode",
+                        step,
+                        frame,
+                        BIG_W,
+                        BIG_H
+                    );
+                }
+                15 => {
+                    // TWO damage boxes in one DIRTYFB, which is what a client with
+                    // real damage tracking sends: a menu and the shadow it dropped
+                    // somewhere else. The kernel may copy them in one span or in
+                    // two, and either way nothing between them may move.
+                    frame += 1;
+                    let f = frame;
+                    paint(&bufs[slot], |x, y| desktop_px(f, x, y));
+                    let bx = rnd(W / 32) * 16;
+                    let bw = (rnd(2) + 1) * 16;
+                    let by = rnd(H / 2);
+                    let bh = rnd(H / 2 - by) + 1;
+                    let cx2 = 64 + rnd(2) * 16;
+                    let cw2 = (rnd(2) + 1) * 16;
+                    let cy2 = H / 2 + rnd(H / 4);
+                    let ch2 = rnd(H - cy2) + 1;
+                    dirtyfb(
+                        &c,
+                        fbs[slot],
+                        &[
+                            clip(bx as u16, by as u16, (bx + bw) as u16, (by + bh) as u16),
+                            clip(
+                                cx2 as u16,
+                                cy2 as u16,
+                                (cx2 + cw2) as u16,
+                                (cy2 + ch2) as u16,
+                            ),
+                        ],
+                    );
+                    drain_completions(&c);
+                    if fbs[slot] == panel_fb {
+                        // The TWO boxes and nothing between them: far apart and
+                        // small, so the kernel blits each one instead of their
+                        // bounding union, and everything outside them keeps the
+                        // frame it had. Both x spans are 16-aligned so the
+                        // write-combining widening of each is a no-op.
+                        model.present_box(frame, bx, by, bw, bh);
+                        model.present_box(frame, cx2, cy2, cw2, ch2);
+                        assert_eq!(
+                            dirty_spans_blitted_for_test(),
+                            2,
+                            "step {}: two boxes {}x{}+{}+{} and {}x{}+{}+{} went up \
+                             as one span, so the screen agreeing means nothing",
+                            step,
+                            bw,
+                            bh,
+                            bx,
+                            by,
+                            cw2,
+                            ch2,
+                            cx2,
+                            cy2
+                        );
+                        by_box += 1;
+                        what = alloc::format!(
+                            "step {}: frame {} as TWO damage boxes {}x{}+{}+{} and {}x{}+{}+{}",
+                            step,
+                            frame,
+                            bw,
+                            bh,
+                            bx,
+                            by,
+                            cw2,
+                            ch2,
+                            cx2,
+                            cy2
+                        );
+                    } else {
+                        model.present(frame);
+                        what = alloc::format!(
+                            "step {}: frame {} as two damage boxes on a framebuffer the \
+                             panel was not holding, so the whole frame",
+                            step,
+                            frame
+                        );
+                    }
+                    panel_fb = fbs[slot];
+                    model.cursor = if shown {
+                        Some((pos.0, pos.1, cur_sz, cur_sz))
+                    } else {
+                        None
+                    };
+                }
+                16 => {
+                    // The pointer changes SIZE where it stands. The old window is
+                    // not the new window, so what the old pointer covered can only
+                    // come back from what the blit that drew it saved.
+                    cur_sz = if cur_sz == CUR { CUR2 } else { CUR };
+                    cur_h = if cur_sz == CUR {
+                        cur.handle
+                    } else {
+                        cur2.handle
+                    };
+                    model.bmp = if cur_sz == CUR {
+                        bmp.clone()
+                    } else {
+                        bmp2.clone()
+                    };
+                    model.bmp_w = cur_sz;
+                    shown = true;
+                    set_cursor(&c, drm::SYNTH_CRTC_ID, cur_h, cur_sz, cur_sz, pos.0, pos.1);
+                    model.cursor = Some((pos.0, pos.1, cur_sz, cur_sz));
+                    what =
+                        alloc::format!("step {}: pointer resized to {}x{}", step, cur_sz, cur_sz);
                 }
                 _ => {
                     // DPMS off and on again with NOTHING presented after it,
@@ -9019,22 +9641,41 @@ mod kms_scanout_tests {
                     // there is a rectangle of the old desktop on a black screen.
                     drm::set_crtc_blanked(true);
                     drm::set_crtc_blanked(false);
+                    // Black pixels are not a framebuffer's pixels, so the panel
+                    // holds nothing now and the next damage box cannot be
+                    // honoured on its own.
+                    panel_fb = 0;
                     model.fill(screen.pixel(0, 0));
                     what = alloc::format!("step {}: blanked and unblanked, no frame", step);
                 }
             }
+            log.push(what.clone());
+            if log.len() > 8 {
+                log.remove(0);
+            }
             model.check(
                 &screen,
                 &alloc::format!(
-                    "{} [skip={} repair={} seed={:#x}]",
+                    "{} [skip={} repair={} seed={:#x}] HISTORY {:?}",
                     what,
                     skip,
                     repair,
-                    seed_in
+                    seed_in,
+                    log
                 ),
             );
         }
         assert!(frame < 256, "the frame number has to stay in one byte");
+        // How many composites had to widen their window, for the caller to sum:
+        // that only happens when a smaller-than-the-mode present catches the
+        // pointer across the edge of the client's framebuffer, which no single
+        // run of 300 steps is guaranteed to reach.
+        assert!(
+            by_box > 0,
+            "no damage flush ever went up box by box, so the two-box steps say \
+             nothing about the span the kernel picks"
+        );
+        let widened = drm::cursor_windows_widened_for_test();
         assert_eq!(
             skip && most_skipped > 0,
             skip,
@@ -9045,13 +9686,20 @@ mod kms_scanout_tests {
         set_cursor(&c, drm::SYNTH_CRTC_ID, 0, 0, 0, 0, 0);
         drm::set_present_skip_enabled(false);
         drm::set_present_repair_enabled(false);
+        c.rmfb(fb_small).expect("RMFB small");
+        c.destroy_dumb(small.handle).expect("DESTROY_DUMB small");
         for fb in fbs {
             c.rmfb(fb).expect("RMFB");
         }
         c.destroy_dumb(cur.handle).expect("DESTROY_DUMB cursor");
+        c.destroy_dumb(cur2.handle)
+            .expect("DESTROY_DUMB small cursor");
+        c.rmfb(fb_big).expect("RMFB big");
+        c.destroy_dumb(big.handle).expect("DESTROY_DUMB big");
         for b in bufs {
             c.destroy_dumb(b.handle).expect("DESTROY_DUMB");
         }
+        widened
     }
 
     /// The bug Moebius sees: a pointer move pastes the frame labwc is STILL
@@ -12488,6 +13136,317 @@ mod card_fd_wait_tests {
             bus.lock().get_callback_len(),
             0,
             "the callback outlived the waiter"
+        );
+    }
+}
+
+#[cfg(test)]
+mod syncobj_array_tests {
+    //! The syncobj ioctls that take an array of handles, driven through the
+    //! ioctl entry point with the nouveau uAPI on: how many handles they
+    //! take, and what an empty array means.
+    use super::gl_client_sequence_tests::Client;
+    use super::*;
+
+    /// The nouveau uAPI switch, on for one test and put back after; under
+    /// `drm::test_globals::lock()`, like every process-wide DRM knob. The
+    /// tests also hold the eventfd tests' lock: signaling a syncobj fires
+    /// the process-wide signal hook those tests install, whose walk
+    /// delivers their waiter (see `syncobj_eventfd`'s `TEST_SERIAL`).
+    struct NouveauOn(bool);
+    impl NouveauOn {
+        fn new() -> Self {
+            let was = zcore_drivers::display::nouveau_uapi_enabled();
+            zcore_drivers::display::set_nouveau_uapi_enabled(true);
+            NouveauOn(was)
+        }
+    }
+    impl Drop for NouveauOn {
+        fn drop(&mut self) {
+            zcore_drivers::display::set_nouveau_uapi_enabled(self.0);
+        }
+    }
+
+    fn create(c: &Client, signaled: bool) -> u32 {
+        let mut req = DrmSyncobjCreate {
+            handle: 0,
+            flags: if signaled {
+                DRM_SYNCOBJ_CREATE_SIGNALED
+            } else {
+                0
+            },
+        };
+        c.ioctl(DRM_IOCTL_SYNCOBJ_CREATE, &mut req).expect("CREATE");
+        req.handle
+    }
+
+    fn destroy(c: &Client, handle: u32) {
+        let mut req = DrmSyncobjDestroy { handle, pad: 0 };
+        c.ioctl(DRM_IOCTL_SYNCOBJ_DESTROY, &mut req)
+            .expect("DESTROY");
+    }
+
+    /// `SYNCOBJ_WAIT` with an absolute deadline already passed: what is
+    /// signaled now decides. Gives back `first_signaled`.
+    fn wait(c: &Client, handles: &[u32], flags: u32) -> Result<u32> {
+        let mut req = DrmSyncobjWait {
+            handles: handles.as_ptr() as u64,
+            timeout_nsec: 0,
+            count_handles: handles.len() as u32,
+            flags,
+            first_signaled: 0xdead,
+            pad: 0,
+        };
+        c.ioctl(DRM_IOCTL_SYNCOBJ_WAIT, &mut req)
+            .map(|_| req.first_signaled)
+    }
+
+    fn timeline_wait(c: &Client, handles: &[u32], points: &[u64], flags: u32) -> Result<u32> {
+        let mut req = DrmSyncobjTimelineWait {
+            handles: handles.as_ptr() as u64,
+            points: points.as_ptr() as u64,
+            timeout_nsec: 0,
+            count_handles: handles.len() as u32,
+            flags,
+            first_signaled: 0xdead,
+            pad: 0,
+        };
+        c.ioctl(DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT, &mut req)
+            .map(|_| req.first_signaled)
+    }
+
+    /// `RESET` or `SIGNAL`.
+    fn array(c: &Client, cmd: u32, handles: &[u32]) -> Result<usize> {
+        let mut req = DrmSyncobjArray {
+            handles: handles.as_ptr() as u64,
+            count_handles: handles.len() as u32,
+            pad: 0,
+        };
+        c.ioctl(cmd, &mut req)
+    }
+
+    /// `TIMELINE_SIGNAL` or `QUERY`, `points` read or written per arm.
+    fn timeline_array(c: &Client, cmd: u32, handles: &[u32], points: &mut [u64]) -> Result<usize> {
+        let mut req = DrmSyncobjTimelineArray {
+            handles: handles.as_ptr() as u64,
+            points: points.as_mut_ptr() as u64,
+            count_handles: handles.len() as u32,
+            flags: 0,
+        };
+        c.ioctl(cmd, &mut req)
+    }
+
+    /// `vkWaitForFences` on more fences than 64 is one `TIMELINE_WAIT` over
+    /// all of them (`vk_drm_syncobj_wait_many`), and `vkResetFences` one
+    /// `RESET`; Linux takes any number the allocator does. Every array arm
+    /// used to stop at 64 with EINVAL, which Mesa reports as a lost device.
+    #[test]
+    fn the_array_ioctls_take_more_than_sixty_four_handles() {
+        let _serialised = drm::test_globals::lock();
+        let _hook = crate::fs::syncobj_eventfd::hardware_fence_tests::TEST_SERIAL.lock();
+        let _on = NouveauOn::new();
+        let c = Client::open(0);
+        const N: usize = 100;
+        let handles: alloc::vec::Vec<u32> = (0..N).map(|_| create(&c, true)).collect();
+        assert_eq!(wait(&c, &handles, DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL), Ok(0));
+        let ones = alloc::vec![1u64; N];
+        assert_eq!(
+            timeline_wait(&c, &handles, &ones, DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL),
+            Ok(0)
+        );
+        // RESET all: nothing is signaled any more, whichever is asked.
+        assert_eq!(array(&c, DRM_IOCTL_SYNCOBJ_RESET, &handles), Ok(0));
+        assert_eq!(wait(&c, &handles, 0), Err(FsError::TimedOut));
+        assert_eq!(
+            wait(&c, &handles[N - 1..], 0),
+            Err(FsError::TimedOut),
+            "the hundredth was reset too"
+        );
+        // SIGNAL all: the hundredth is signaled, and the first one found.
+        assert_eq!(array(&c, DRM_IOCTL_SYNCOBJ_SIGNAL, &handles), Ok(0));
+        assert_eq!(wait(&c, &handles[N - 1..], 0), Ok(0));
+        assert_eq!(wait(&c, &handles, DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL), Ok(0));
+        let mut points = alloc::vec![0u64; N];
+        assert_eq!(
+            timeline_array(&c, DRM_IOCTL_SYNCOBJ_QUERY, &handles, &mut points),
+            Ok(0)
+        );
+        assert!(points.iter().all(|&p| p == 1), "{:?}", points);
+        // TIMELINE_SIGNAL all to 5: the query and the wait see every one.
+        let mut fives = alloc::vec![5u64; N];
+        assert_eq!(
+            timeline_array(&c, DRM_IOCTL_SYNCOBJ_TIMELINE_SIGNAL, &handles, &mut fives),
+            Ok(0)
+        );
+        assert_eq!(
+            timeline_array(&c, DRM_IOCTL_SYNCOBJ_QUERY, &handles, &mut points),
+            Ok(0)
+        );
+        assert!(points.iter().all(|&p| p == 5), "{:?}", points);
+        assert_eq!(
+            timeline_wait(&c, &handles, &fives, DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL),
+            Ok(0)
+        );
+        let sixes = alloc::vec![6u64; N];
+        assert_eq!(
+            timeline_wait(&c, &handles, &sixes, DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL),
+            Err(FsError::TimedOut)
+        );
+        // Only the last one at 6: found at its index, not at one of the 64.
+        assert_eq!(
+            timeline_array(
+                &c,
+                DRM_IOCTL_SYNCOBJ_TIMELINE_SIGNAL,
+                &handles[N - 1..],
+                &mut [6u64]
+            ),
+            Ok(0)
+        );
+        assert_eq!(
+            timeline_wait(&c, &handles, &sixes, 0),
+            Ok(N as u32 - 1),
+            "first_signaled"
+        );
+        for h in handles {
+            destroy(&c, h);
+        }
+    }
+
+    /// A wait on no handles is answered 0 at once, without reading the
+    /// array (Linux `drm_syncobj_wait_ioctl`); the arms that change or read
+    /// state refuse an empty array with EINVAL, as Linux does.
+    #[test]
+    fn a_wait_with_no_handles_returns_at_once_and_the_other_arrays_refuse_it() {
+        let _serialised = drm::test_globals::lock();
+        let _hook = crate::fs::syncobj_eventfd::hardware_fence_tests::TEST_SERIAL.lock();
+        let _on = NouveauOn::new();
+        let c = Client::open(0);
+        let none: [u32; 0] = [];
+        let mut req = DrmSyncobjWait {
+            handles: 0,
+            timeout_nsec: 0,
+            count_handles: 0,
+            flags: DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL,
+            first_signaled: 0xdead,
+            pad: 0,
+        };
+        assert_eq!(c.ioctl(DRM_IOCTL_SYNCOBJ_WAIT, &mut req), Ok(0));
+        assert_eq!(req.first_signaled, 0xdead, "not written");
+        let mut req = DrmSyncobjTimelineWait {
+            handles: 0,
+            points: 0,
+            timeout_nsec: 0,
+            count_handles: 0,
+            flags: 0,
+            first_signaled: 0xdead,
+            pad: 0,
+        };
+        assert_eq!(c.ioctl(DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT, &mut req), Ok(0));
+        assert_eq!(req.first_signaled, 0xdead);
+        for cmd in [DRM_IOCTL_SYNCOBJ_RESET, DRM_IOCTL_SYNCOBJ_SIGNAL] {
+            assert_eq!(
+                array(&c, cmd, &none),
+                Err(FsError::InvalidParam),
+                "{:#x}",
+                cmd
+            );
+        }
+        // Real (if empty) arrays behind the pointers, so an arm that went
+        // on to read its first entry would fail the assertion, not crash.
+        let mut no_points = [0u64; 1];
+        for cmd in [DRM_IOCTL_SYNCOBJ_TIMELINE_SIGNAL, DRM_IOCTL_SYNCOBJ_QUERY] {
+            assert_eq!(
+                timeline_array(&c, cmd, &none, &mut no_points[..0]),
+                Err(FsError::InvalidParam),
+                "{:#x}",
+                cmd
+            );
+        }
+    }
+
+    /// Past what the kernel would allocate for the array, ENOMEM, before
+    /// the array is looked at (it is never read here: the pointer is null).
+    #[test]
+    fn an_array_past_what_the_kernel_would_allocate_is_enomem() {
+        let _serialised = drm::test_globals::lock();
+        let _hook = crate::fs::syncobj_eventfd::hardware_fence_tests::TEST_SERIAL.lock();
+        let _on = NouveauOn::new();
+        let c = Client::open(0);
+        let too_many = SYNCOBJ_ARRAY_MAX + 1;
+        let mut req = DrmSyncobjWait {
+            handles: 0,
+            timeout_nsec: 0,
+            count_handles: too_many,
+            flags: 0,
+            first_signaled: 0,
+            pad: 0,
+        };
+        assert_eq!(
+            c.ioctl(DRM_IOCTL_SYNCOBJ_WAIT, &mut req),
+            Err(FsError::NoDeviceSpace)
+        );
+        let mut req = DrmSyncobjTimelineWait {
+            handles: 0,
+            points: 0,
+            timeout_nsec: 0,
+            count_handles: too_many,
+            flags: 0,
+            first_signaled: 0,
+            pad: 0,
+        };
+        assert_eq!(
+            c.ioctl(DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT, &mut req),
+            Err(FsError::NoDeviceSpace)
+        );
+        for cmd in [DRM_IOCTL_SYNCOBJ_RESET, DRM_IOCTL_SYNCOBJ_SIGNAL] {
+            let mut req = DrmSyncobjArray {
+                handles: 0,
+                count_handles: too_many,
+                pad: 0,
+            };
+            assert_eq!(
+                c.ioctl(cmd, &mut req),
+                Err(FsError::NoDeviceSpace),
+                "{:#x}",
+                cmd
+            );
+        }
+        for cmd in [DRM_IOCTL_SYNCOBJ_TIMELINE_SIGNAL, DRM_IOCTL_SYNCOBJ_QUERY] {
+            let mut req = DrmSyncobjTimelineArray {
+                handles: 0,
+                points: 0,
+                count_handles: too_many,
+                flags: 0,
+            };
+            assert_eq!(
+                c.ioctl(cmd, &mut req),
+                Err(FsError::NoDeviceSpace),
+                "{:#x}",
+                cmd
+            );
+        }
+        // The bound itself is fine, and a null array under it is EINVAL as
+        // before (Linux: EFAULT from the copy).
+        let mut req = DrmSyncobjArray {
+            handles: 0,
+            count_handles: SYNCOBJ_ARRAY_MAX,
+            pad: 0,
+        };
+        assert_eq!(
+            c.ioctl(DRM_IOCTL_SYNCOBJ_SIGNAL, &mut req),
+            Err(FsError::InvalidParam)
+        );
+        let mut req = DrmSyncobjWait {
+            handles: 0,
+            timeout_nsec: 0,
+            count_handles: 1,
+            flags: 0,
+            first_signaled: 0,
+            pad: 0,
+        };
+        assert_eq!(
+            c.ioctl(DRM_IOCTL_SYNCOBJ_WAIT, &mut req),
+            Err(FsError::InvalidParam)
         );
     }
 }
