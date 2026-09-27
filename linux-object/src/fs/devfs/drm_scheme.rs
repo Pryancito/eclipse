@@ -136,11 +136,17 @@ impl DrmDev {
     /// `open(2)` on `/dev/dri/card*` / `renderD*`: a fresh per-fd DRM file
     /// state (ATOMIC_CLIENT + event queue), like Linux's `drm_open_helper`.
     pub fn open_client(&self) -> Arc<dyn INode> {
-        Arc::new(DrmDev {
+        Arc::new(self.open_client_dev())
+    }
+
+    /// The open itself: the state is scoped to this node, and takes the
+    /// node's master when no open holds it (`drm_master_open`).
+    fn open_client_dev(&self) -> DrmDev {
+        DrmDev {
             inode_id: self.inode_id,
             minor: self.minor,
-            file: drm::DrmFileState::new(),
-        })
+            file: drm::DrmFileState::for_minor(self.minor),
+        }
     }
 
     pub fn file_state(&self) -> &Arc<drm::DrmFileState> {
@@ -998,8 +1004,9 @@ impl DrmDev {
             // (pixman path) requires master, so always succeed — the single
             // client on the primary node is implicitly master here.
             DRM_IOCTL_GET_MAGIC => {
-                // struct drm_auth { __u32 magic; }
-                unsafe { *(data as *mut u32) = 1 };
+                // struct drm_auth { __u32 magic; }: `drm_getmagic` mints one
+                // per file, once. Every file was told 1.
+                unsafe { *(data as *mut u32) = self.file.magic() };
                 Ok(0)
             }
             DRM_IOCTL_GET_CLIENT => {
@@ -1016,8 +1023,31 @@ impl DrmDev {
                 c.iocs = 0;
                 Ok(0)
             }
-            DRM_IOCTL_AUTH_MAGIC => Ok(0),
+            DRM_IOCTL_AUTH_MAGIC => {
+                // `DRM_MASTER` ioctl: only the master authenticates
+                // (EACCES), and only a magic a file of this device holds
+                // (`drm_authmagic`: EINVAL), once. Any magic from anyone
+                // was answered "authenticated".
+                if !drm::is_master(self.minor, self.file_owner()) {
+                    return Err(FsError::NoPermission);
+                }
+                let magic = unsafe { *(data as *const u32) };
+                if drm::auth_magic(self.minor, magic) {
+                    Ok(0)
+                } else {
+                    Err(FsError::InvalidParam)
+                }
+            }
             DRM_IOCTL_SET_MASTER => {
+                // `drm_setmaster_ioctl`: the master again is a no-op, another
+                // open's master is EBUSY, a free device is taken. Nothing was
+                // recorded: every caller was told it was master, and
+                // `drm-probe --scanout` or `eclipse-bench`, which stand down
+                // on EBUSY, took the display from the running compositor.
+                if let Err(drm::MasterError::Busy) = drm::set_master(self.minor, self.file_owner())
+                {
+                    return Err(FsError::Busy);
+                }
                 // Become DRM master, but do NOT switch the console to graphics
                 // yet: defer that to the first real scanout (`drm::scanout`). If
                 // the client stalls before presenting a frame (e.g. its renderer
@@ -1037,6 +1067,12 @@ impl DrmDev {
                 Ok(0)
             }
             DRM_IOCTL_DROP_MASTER => {
+                // `drm_dropmaster_ioctl`: a file that is not the master has
+                // nothing to drop (EINVAL), and in particular does not run
+                // the console restore below on the compositor's behalf.
+                if !drm::drop_master(self.minor, self.file_owner()) {
+                    return Err(FsError::InvalidParam);
+                }
                 // In a seat-managed session (seatd owns tty7 via VT_PROCESS) the
                 // SEAT -- not DRM master -- drives the console KD mode: seatd
                 // already put tty7 into KD_GRAPHICS and will restore text via
@@ -6772,7 +6808,7 @@ mod gl_client_sequence_tests {
         /// `open("/dev/dri/card0")`.
         pub(super) fn open(minor: u32) -> Client {
             Client {
-                dev: DrmDev::new(minor),
+                dev: DrmDev::new(minor).open_client_dev(),
             }
         }
 
@@ -13901,6 +13937,116 @@ mod syncobj_wait_routing_tests {
     fn an_offset_above_the_handle_space_aliases_rather_than_failing() {
         let aliased = ((1u64 << 32) | 5) << 12;
         assert_eq!(handle_from_mmap_cookie(aliased as usize), 5);
+    }
+}
+
+#[cfg(test)]
+mod master_tests {
+    //! `drm_auth.c`: one master per node, and the magic handshake.
+
+    use super::gl_client_sequence_tests::Client;
+    use super::*;
+
+    fn set_master(c: &Client) -> Result<usize> {
+        c.ioctl(DRM_IOCTL_SET_MASTER, &mut 0u8)
+    }
+    fn drop_master(c: &Client) -> Result<usize> {
+        c.ioctl(DRM_IOCTL_DROP_MASTER, &mut 0u8)
+    }
+    fn magic(c: &Client) -> u32 {
+        let mut magic = 0u32;
+        c.ioctl(DRM_IOCTL_GET_MAGIC, &mut magic).expect("GET_MAGIC");
+        magic
+    }
+    fn auth(c: &Client, magic: u32) -> Result<usize> {
+        let mut magic = magic;
+        c.ioctl(DRM_IOCTL_AUTH_MAGIC, &mut magic)
+    }
+
+    /// `drm_master_open` / `drm_setmaster_ioctl` / `drm_dropmaster_ioctl`:
+    /// the first open of a node is its master; a second open's SET_MASTER is
+    /// EBUSY while the first holds it and its DROP_MASTER is EINVAL; the
+    /// master's own SET_MASTER is a no-op; once dropped, or once the holding
+    /// file closes, the next SET_MASTER takes it. Nothing was recorded, so
+    /// every SET_MASTER and every DROP_MASTER succeeded for everyone.
+    #[test]
+    fn one_open_holds_the_master_until_it_drops_it_or_closes() {
+        let _serialised = drm::test_globals::lock();
+        // A node of its own: minor 0's master is whichever test opened it.
+        let first = Client::open(77);
+        let second = Client::open(77);
+        assert_eq!(
+            set_master(&second),
+            Err(FsError::Busy),
+            "held by the first open"
+        );
+        assert_eq!(set_master(&first), Ok(0), "the master again: a no-op");
+        assert_eq!(
+            drop_master(&second),
+            Err(FsError::InvalidParam),
+            "not the master"
+        );
+        assert_eq!(drop_master(&first), Ok(0));
+        assert_eq!(
+            drop_master(&first),
+            Err(FsError::InvalidParam),
+            "already dropped"
+        );
+        assert_eq!(set_master(&second), Ok(0), "free, so taken");
+        assert_eq!(
+            set_master(&first),
+            Err(FsError::Busy),
+            "and now held by the second"
+        );
+        drop(second);
+        assert_eq!(
+            set_master(&first),
+            Ok(0),
+            "released with the file that held it"
+        );
+    }
+
+    /// `drm_getmagic` / `drm_authmagic`: a magic is minted per file, once;
+    /// only the master authenticates (EACCES), only a magic a file of this
+    /// node holds (EINVAL), and a magic is spent by the AUTH_MAGIC that
+    /// names it or by its file closing. Every file was told magic 1 and
+    /// every AUTH_MAGIC from anyone, of anything, was "authenticated".
+    #[test]
+    fn a_magic_is_minted_per_file_and_only_the_master_spends_it() {
+        let master = Client::open(78);
+        let client = Client::open(78);
+        let m_client = magic(&client);
+        assert_ne!(m_client, 0);
+        assert_eq!(magic(&client), m_client, "the same file, the same magic");
+        assert_ne!(magic(&master), m_client, "another file, another magic");
+
+        assert_eq!(
+            auth(&client, m_client),
+            Err(FsError::NoPermission),
+            "not the master"
+        );
+        assert_eq!(
+            auth(&master, m_client + 1000),
+            Err(FsError::InvalidParam),
+            "never minted"
+        );
+        assert_eq!(auth(&master, m_client), Ok(0));
+        assert_eq!(auth(&master, m_client), Err(FsError::InvalidParam), "spent");
+
+        let elsewhere = Client::open(79);
+        assert_eq!(
+            auth(&master, magic(&elsewhere)),
+            Err(FsError::InvalidParam),
+            "minted on another node"
+        );
+        let closing = Client::open(78);
+        let m_closing = magic(&closing);
+        drop(closing);
+        assert_eq!(
+            auth(&master, m_closing),
+            Err(FsError::InvalidParam),
+            "died with its file"
+        );
     }
 }
 

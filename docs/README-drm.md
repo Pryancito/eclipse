@@ -97,8 +97,8 @@ Leyenda: ✅ implementado · 🟡 parcial / no-op deliberado · ❌ no implement
 | `DRM_IOCTL_VERSION` | ✅ | nombre `zcore`, versión 1.0.0 |
 | `DRM_IOCTL_GET_UNIQUE` | 🟡 | `zcore-gpu` (no es un *busid* parseable `pci:…`) |
 | `DRM_IOCTL_SET_VERSION` | ✅ | interfaz 1.4, driver 1.0; valida majors como `drm_setversion` (lo usa Xorg/modesetting) |
-| `DRM_IOCTL_GET_MAGIC` / `AUTH_MAGIC` | 🟡 | cliente único = master implícito |
-| `DRM_IOCTL_SET_MASTER` / `DROP_MASTER` | ✅ | conmuta la consola de texto del kernel (KD_GRAPHICS/KD_TEXT) |
+| `DRM_IOCTL_GET_MAGIC` / `AUTH_MAGIC` | ✅ | magic por fichero, minted una vez; `AUTH_MAGIC` solo desde el master (EACCES), de un magic de ese nodo (EINVAL) y una sola vez |
+| `DRM_IOCTL_SET_MASTER` / `DROP_MASTER` | ✅ | un master por nodo: el primer `open` lo toma (`drm_master_open`), `SET_MASTER` con otro fichero como master es EBUSY, `DROP_MASTER` sin serlo es EINVAL; se suelta al cerrar el fd; conmuta la consola de texto del kernel (KD_GRAPHICS/KD_TEXT) |
 | `DRM_IOCTL_GET_CAP` | ✅ | ver tabla de *caps* |
 | `DRM_IOCTL_SET_CLIENT_CAP` | ✅ | `ATOMIC` según `drm.atomic` (ver sección atómico); `WRITEBACK` solo para clientes atómicos (EINVAL como Linux); resto aceptado |
 | `DRM_IOCTL_WAIT_VBLANK` | 🟡 | vblank sintético ~60 Hz. Modo evento: respeta `RELATIVE`/`ABSOLUTE`/`NEXTONMISS` y entrega `DRM_EVENT_VBLANK` cuando el contador alcanza la secuencia pedida (nunca antes del siguiente vblank). Modo bloqueante: espera de verdad, hasta el tope de 3 s de Linux (`sys_ioctl` duerme antes del arm síncrono; ver `README-async-ioctl-vblank.md`) |
@@ -286,12 +286,12 @@ Detalles:
   nouveau (arriba).
 - **Estado por apertura**: los eventos y `DRM_CLIENT_CAP_ATOMIC` **sí** van
   por fd abierto (`DrmFileState`, que `sys_open` crea por cada `open`). Los
-  handles GEM, los framebuffers, el cursor y el estado de master siguen en
-  tablas globales; para los handles y los framebuffers el pid del propietario
-  cubre el acceso entre procesos (ver arriba), pero no aísla dos fds del mismo
-  proceso, y **no hay estado de master en absoluto**: `SET_MASTER` no registra
-  nada, así que todos los ioctls que Linux marca `DRM_MASTER` los puede emitir
-  cualquiera.
+  handles GEM, los framebuffers y el cursor siguen en tablas globales; para
+  los handles y los framebuffers el pid del propietario cubre el acceso entre
+  procesos (ver arriba), pero no aísla dos fds del mismo proceso. El master
+  **sí** es por fd y por nodo (`drm::set_master`/`drop_master`, tomado por el
+  primer `open` como en `drm_master_open`), pero **los ioctls que Linux marca
+  `DRM_MASTER` todavía no lo exigen**: cualquiera puede emitirlos.
 - **`drm-usage-stats.rst` (fdinfo)**. No se exponen estadísticas de
   uso/memoria/engine por `fdinfo`.
 - **Render / 3D**. No hay aceleración: se usa el render por software de Mesa
@@ -313,7 +313,7 @@ esto no:
 | Sin caché de dma-buf por objeto ni de handles PRIME por fichero | Tope GEM subido a 256; sigue sin dedup PRIME por fichero |
 | `ADDFB2` no valida formato, flags ni modifiers | Un modifier con tiling se acepta y se escanea como lineal: basura |
 | El límite de clips de `DIRTYFB` es 64 donde Linux usa 256, y `ANNOTATE_COPY` no está | Cada frame con más daño cae al blit de pantalla completa por CPU |
-| Sin estado de master | Todo ioctl `DRM_MASTER` lo puede emitir cualquiera |
+| Los ioctls `DRM_MASTER` no comprueban el master (que sí existe) | Todo ioctl `DRM_MASTER` lo puede emitir cualquiera |
 | `GET_CLIENT` no existe | libva da la inicialización por fallida: sin VA-API |
 | Sin `GAMMA_LUT`/`CTM` | gammastep, luz nocturna y la gamma de RandR no hacen nada |
 | Sin `IN_FORMATS` en el plano | Inocuo mientras `DRM_CAP_ADDFB2_MODIFIERS` sea 0; obligatorio el día que se ponga a 1 |
