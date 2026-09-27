@@ -670,9 +670,7 @@ impl Process {
     /// -- `install_handle_pair` and the handles `zx_channel_read` had installed
     /// -- are taking back handles the caller will never learn the values of: one
     /// left in the table can never be named again, so it holds its object alive
-    /// for as long as the process lives. `collect()` into a `ZxResult<Vec<_>>`
-    /// stopped at the first error and left the rest installed, which is the
-    /// opposite of what the doc comment here promised.
+    /// for as long as the process lives.
     ///
     /// And the handles come out of the lock before they are dropped. Dropping
     /// one runs the object's own `Drop`, which is code this module knows nothing
@@ -683,6 +681,9 @@ impl Process {
     /// back. `Drop` reaching back into this same table (a handle closed on the
     /// way out) is the shortest version of it.
     pub fn remove_handles(&self, handle_values: &[HandleValue]) -> ZxResult<Vec<Handle>> {
+        // A `collect()` into a `ZxResult<Vec<_>>` stopped at the first error and
+        // left everything behind it installed, which is the opposite of what
+        // the contract above promises. Hence the explicit loop.
         let mut removed = Vec::with_capacity(handle_values.len());
         let mut error = None;
         {
@@ -1150,7 +1151,7 @@ mod tests {
         let proc = Process::create(&root_job, "proc").expect("failed to create process");
         let first = proc.add_handle(Handle::new(Event::new(), Rights::DEFAULT_EVENT));
         let last = proc.add_handle(Handle::new(Event::new(), Rights::DEFAULT_EVENT));
-        let missing = first.max(last) + 1;
+        let missing = first.max(last).saturating_add(1);
 
         assert_eq!(
             proc.remove_handles(&[first, missing, last]).err(),
@@ -1189,7 +1190,7 @@ mod tests {
             also_close: victim,
         });
         let probe_value = proc.add_handle(Handle::new(probe, Rights::DEFAULT_EVENT));
-        let missing = probe_value.max(victim) + 1;
+        let missing = probe_value.max(victim).saturating_add(1);
 
         let (done, finished) = mpsc::channel();
         let worker = std::thread::spawn(move || {
