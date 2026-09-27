@@ -321,6 +321,59 @@ struct AhciPort {
 /// First physical address that does not fit in 32 bits.
 const DMA_4G: u64 = 1u64 << 32;
 
+/// Whether an HBA that may only do 32-bit DMA can address every byte of
+/// `pages` starting at `paddr`.
+///
+/// Exclusive end on purpose: a block that finishes exactly at 4 GiB has its
+/// last byte at `DMA_4G - 1`, which is reachable.
+fn hba_reachable(paddr: usize, pages: usize, supports_64bit: bool) -> bool {
+    supports_64bit || (paddr as u64).saturating_add((pages * 4096) as u64) <= DMA_4G
+}
+
+/// Take `pages` of DMA this HBA can actually reach, or nothing.
+///
+/// Three places in this file asked the kernel for DMA and **one** of them
+/// checked what came back. `drivers_dma_alloc` answers the physical address
+/// `0` when it has no contiguous run of pages, and the two that did not check
+/// then handed that `0` to the controller:
+///
+/// * the port's command list, received-FIS area and command table were placed
+///   at physical 0, 1024 and 4096 and the HBA was programmed to DMA there for
+///   the life of the port -- and the 4 GiB test right below the allocation
+///   *passed*, because `0 + 9 pages` is nowhere near 4 GiB;
+/// * `identify` zeroed 512 bytes through `phys_to_virt(0)` and then put `0` in
+///   the PRDT, so the drive's IDENTIFY response was DMA'd over low memory.
+///
+/// `identify` also never applied the 4 GiB test at all, though it fills the
+/// PRDT's high half (`dbau`) like everything else here does.
+///
+/// Returns `(virtual, physical)`.
+fn hba_dma(pages: usize, supports_64bit: bool, what: &str) -> Option<(usize, usize)> {
+    let paddr = unsafe { drivers_dma_alloc(pages) };
+    if paddr == 0 {
+        crate::klog_err!("[AHCI] no DMA left for {}", what);
+        return None;
+    }
+    if paddr & 0xfff != 0 {
+        // The command list needs 1 KiB alignment, the FIS area 256 bytes and
+        // the command table 128; a page satisfies all three, which is what
+        // `CommandHeader` says it relies on. Check it rather than assume it.
+        crate::klog_err!("[AHCI] {} came back unaligned at {:#x}", what, paddr);
+        unsafe { drivers_dma_dealloc(paddr, pages) };
+        return None;
+    }
+    if !hba_reachable(paddr, pages, supports_64bit) {
+        crate::klog_err!(
+            "[AHCI] {} at {:#x} is above 4 GiB on a 32-bit-only HBA",
+            what,
+            paddr
+        );
+        unsafe { drivers_dma_dealloc(paddr, pages) };
+        return None;
+    }
+    Some((phys_to_virt(paddr), paddr))
+}
+
 impl AhciPort {
     fn read_reg(&self, offset: usize) -> u32 {
         unsafe { read_volatile((self.base + offset) as *const u32) }
@@ -752,8 +805,10 @@ impl AhciPort {
         }
 
         let slot = 0u32;
-        let paddr = unsafe { drivers_dma_alloc(1) };
-        let vaddr = phys_to_virt(paddr);
+        // The drive DMAs its IDENTIFY response into this page and the PRDT
+        // below carries its address, high half included, so it is subject to
+        // the same two questions as every other block here.
+        let (vaddr, paddr) = hba_dma(1, self.supports_64bit, "the IDENTIFY buffer")?;
 
         unsafe {
             let cmd_table = self.ct_virt as *mut CommandTable;
@@ -1141,21 +1196,14 @@ impl AhciInterface {
         for i in 0..32 {
             if pi & (1 << i) != 0 {
                 let pbase = base + 0x100 + (i * 0x80);
-                let dma_paddr = unsafe { drivers_dma_alloc(DMA_PAGES) };
-                let dma_vaddr = phys_to_virt(dma_paddr);
-
-                // The command list / FIS / command table live in this block. If
-                // it landed above 4 GiB on a controller without 64-bit support,
-                // the HBA cannot address it at all — refuse rather than wedge.
-                let dma_end = dma_paddr as u64 + (DMA_PAGES * 4096) as u64;
-                if !supports_64bit && dma_end > DMA_4G {
-                    crate::klog_err!(
-                        "[AHCI] port {} DMA structures at {:#x} are above 4 GiB on a 32-bit-only HBA; skipping",
-                        i, dma_paddr,
-                    );
-                    unsafe { drivers_dma_dealloc(dma_paddr, DMA_PAGES) };
+                // The command list, the received-FIS area and the command
+                // table all live in this block, and the HBA is programmed with
+                // its address for the life of the port.
+                let Some((dma_vaddr, dma_paddr)) =
+                    hba_dma(DMA_PAGES, supports_64bit, "the port's DMA structures")
+                else {
                     continue;
-                }
+                };
 
                 let mut port = AhciPort {
                     base: pbase,
@@ -1246,44 +1294,31 @@ impl AhciInterface {
                                 capacity_512 / 2048
                             );
                         }
-                        let bounce_phys = unsafe { drivers_dma_alloc(BOUNCE_PAGES) };
-                        if bounce_phys == 0 {
-                            unsafe {
-                                drivers_dma_dealloc(dma_paddr, DMA_PAGES);
-                            }
-                            return Err(DeviceError::NoResources);
-                        }
                         // Every data transfer DMAs through this bounce buffer
-                        // (the zero-copy path is disabled), so its physical
-                        // address must be reachable by the HBA. Log it, and on
-                        // a 32-bit-only HBA refuse a >4 GiB buffer rather than
-                        // silently corrupt every read/write.
-                        let bounce_end = bounce_phys as u64 + (BOUNCE_PAGES * 4096) as u64;
+                        // (the zero-copy path is disabled), so a buffer the HBA
+                        // cannot reach corrupts every read and write silently.
+                        // This is the one site that always asked both questions;
+                        // now all three ask them in the same place.
+                        let Some((bounce_virt, bounce_phys)) =
+                            hba_dma(BOUNCE_PAGES, supports_64bit, "the bounce buffer")
+                        else {
+                            unsafe { drivers_dma_dealloc(dma_paddr, DMA_PAGES) };
+                            continue;
+                        };
                         crate::klog_info!(
                             "[AHCI] port {} bounce buffer at {:#x}..{:#x} ({}-bit DMA)",
                             i,
                             bounce_phys,
-                            bounce_end,
+                            bounce_phys + BOUNCE_PAGES * 4096,
                             if supports_64bit { 64 } else { 32 },
                         );
-                        if !supports_64bit && bounce_end > DMA_4G {
-                            crate::klog_err!(
-                                "[AHCI] port {} bounce buffer above 4 GiB on a 32-bit-only HBA; skipping",
-                                i,
-                            );
-                            unsafe {
-                                drivers_dma_dealloc(bounce_phys, BOUNCE_PAGES);
-                                drivers_dma_dealloc(dma_paddr, DMA_PAGES);
-                            }
-                            continue;
-                        }
                         disks.push(Self {
                             name: format!("ahci-{}", i),
                             port: Mutex::new(port),
                             capacity: capacity_512,
                             sector_bytes,
                             bounce_phys,
-                            bounce_virt: phys_to_virt(bounce_phys),
+                            bounce_virt,
                             bounce_len: BOUNCE_PAGES * 4096,
                         });
                         continue;
@@ -2101,5 +2136,152 @@ mod command_tests {
         // start of the disk.
         assert!(check_request(usize::MAX, 512, u64::MAX).is_err());
         assert!(check_request(usize::MAX - 1, 4096, u64::MAX).is_err());
+    }
+}
+
+#[cfg(test)]
+mod dma_tests {
+    //! The memory the HBA is pointed at.
+    //!
+    //! Three blocks are taken here -- the port's command structures, the
+    //! IDENTIFY buffer and the bounce buffer every transfer goes through -- and
+    //! the controller is programmed with the physical address of each. Two
+    //! questions decide whether that address is usable, and until now only one
+    //! of the three sites asked both.
+
+    use super::*;
+    use crate::utils::host_hooks as shim;
+    use core::sync::atomic::Ordering;
+
+    /// The shims keep process-wide state, so a test that touches them must be
+    /// the only one doing so, whatever `--test-threads` says.
+    fn alone_with_the_allocator<R>(body: impl FnOnce() -> R) -> R {
+        static TURNSTILE: crate::sync::Mutex<()> = crate::sync::Mutex::new(());
+        let _guard = TURNSTILE.lock();
+        shim::reset();
+        let out = body();
+        shim::reset();
+        out
+    }
+
+    // ── what a 32-bit HBA can reach ─────────────────────────────────────────
+
+    #[test]
+    fn a_block_that_ends_exactly_at_four_gib_is_reachable() {
+        // Its last byte is at `DMA_4G - 1`. Refusing this one would throw away
+        // a perfectly good block on the boundary.
+        let last_page = (DMA_4G - 4096) as usize;
+        assert!(hba_reachable(last_page, 1, false));
+        assert!(!hba_reachable(last_page, 2, false), "one page too far");
+        assert!(!hba_reachable(DMA_4G as usize, 1, false));
+    }
+
+    #[test]
+    fn a_sixty_four_bit_hba_reaches_anything() {
+        assert!(hba_reachable(DMA_4G as usize, BOUNCE_PAGES, true));
+        assert!(hba_reachable(usize::MAX - 4096, 1, true));
+    }
+
+    #[test]
+    fn an_address_that_would_overflow_is_refused_rather_than_wrapping() {
+        // Wrapping would make a block near the top of memory look like one at
+        // the bottom, which is the one answer that must never come out of here.
+        assert!(!hba_reachable(usize::MAX, BOUNCE_PAGES, false));
+    }
+
+    #[test]
+    fn the_four_gib_test_cannot_tell_that_an_address_is_the_failure_value() {
+        // This is what the bug was. The port's structures had the 4 GiB test
+        // and not the zero test, and for the address the allocator returns when
+        // it has nothing, the 4 GiB test says yes: nine pages from zero are
+        // nowhere near 4 GiB. One guard cannot stand in for the other.
+        assert!(hba_reachable(0, DMA_PAGES, false));
+        assert!(hba_reachable(0, BOUNCE_PAGES, false));
+    }
+
+    // ── taking a block ──────────────────────────────────────────────────────
+
+    #[test]
+    fn a_block_comes_back_page_aligned_with_both_of_its_addresses() {
+        alone_with_the_allocator(|| {
+            let (va, pa) = hba_dma(DMA_PAGES, true, "test").expect("memory is available");
+            assert_ne!(pa, 0);
+            assert_eq!(pa & 0xfff, 0, "the command list relies on this");
+            assert_eq!(va, phys_to_virt(pa));
+            assert_eq!(shim::ALLOC_PAGES.load(Ordering::SeqCst), DMA_PAGES);
+        });
+    }
+
+    #[test]
+    fn an_allocator_with_nothing_left_yields_no_block_at_all() {
+        alone_with_the_allocator(|| {
+            // The physical address 0 is how the kernel says "no contiguous run
+            // of pages". `phys_to_virt(0)` used to make a pointer out of it,
+            // and the controller was then told to DMA there.
+            shim::FAIL_ALLOC.store(true, Ordering::SeqCst);
+            assert!(hba_dma(DMA_PAGES, true, "test").is_none());
+            assert_eq!(
+                shim::DEALLOC_CALLS.load(Ordering::SeqCst),
+                0,
+                "nothing was taken"
+            );
+        });
+    }
+
+    #[test]
+    fn a_misaligned_block_is_refused_and_given_back() {
+        alone_with_the_allocator(|| {
+            // `CommandHeader` says it depends on the 1 KiB alignment a page
+            // provides. That was an assumption, not a check.
+            shim::MISALIGN_ALLOC.store(true, Ordering::SeqCst);
+            assert!(hba_dma(DMA_PAGES, true, "test").is_none());
+            assert_eq!(
+                shim::DEALLOC_CALLS.load(Ordering::SeqCst),
+                1,
+                "refusing it is not the same as leaking it"
+            );
+            assert_eq!(shim::DEALLOC_PAGES.load(Ordering::SeqCst), DMA_PAGES);
+        });
+    }
+
+    #[test]
+    fn a_block_a_32_bit_hba_cannot_reach_is_refused_and_given_back() {
+        alone_with_the_allocator(|| {
+            // Where the host allocator lands is not ours to choose, so ask it
+            // once and then assert the RELATIONSHIP: whether a 32-bit-only HBA
+            // may have a block is exactly `hba_reachable`'s answer about it,
+            // and a refusal hands the block back rather than dropping it.
+            let (_, probe) = hba_dma(1, true, "probe").expect("memory is available");
+            let reachable = hba_reachable(probe, 1, false);
+            shim::reset();
+            match hba_dma(1, false, "test") {
+                Some((_, pa)) => assert!(
+                    reachable && hba_reachable(pa, 1, false),
+                    "accepted a block a 32-bit HBA cannot address"
+                ),
+                None => {
+                    assert!(!reachable, "refused a block that was reachable");
+                    assert_eq!(
+                        shim::DEALLOC_CALLS.load(Ordering::SeqCst),
+                        1,
+                        "refused, not leaked"
+                    );
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn every_block_this_driver_takes_asks_for_the_size_it_uses() {
+        alone_with_the_allocator(|| {
+            // 9 pages for the command list plus FIS plus command table, 32 for
+            // the bounce buffer, 1 for IDENTIFY. A block short of what the
+            // driver then indexes is a DMA past the end of the allocation.
+            for pages in [1, DMA_PAGES, BOUNCE_PAGES] {
+                shim::reset();
+                hba_dma(pages, true, "test").expect("memory is available");
+                assert_eq!(shim::ALLOC_PAGES.load(Ordering::SeqCst), pages);
+            }
+        });
     }
 }
