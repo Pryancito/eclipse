@@ -199,6 +199,19 @@ jobs:
           # which is written twice more, in `/etc/profile` and the labwc
           # wrapper, and is cross-checked against those two in `xtask`.
           cargo test --manifest-path tools/eclipse-init/Cargo.toml
+          # lunarbg, the desktop wallpaper: the same standalone-package hole as
+          # eclipse-init (its own `[workspace]`, its own musl target, built
+          # best-effort by `xtask`, which on failure only prints "swaybg
+          # fallback remains"). Nothing in this file compiled it either. It is
+          # a software renderer that paints every pixel of every output and
+          # then hands the compositor shm buffers, so what the tests cover is
+          # the arithmetic that has to be right for the wallpaper to appear at
+          # all: the two buffer ceilings and the HiDPI scale walked down to fit
+          # them, the shm pool geometry the seed and the animation must agree
+          # on, the damage rect in surface coordinates, the animated region
+          # staying inside the buffer, and the pixel helpers discarding a
+          # coordinate instead of writing it one row down.
+          cargo test --manifest-path tools/lunarbg/Cargo.toml
           # The kernel binary crate itself. Its `[[bin]]` section carried
           # `test = false`, so no job in this file ever compiled it as a test
           # target -- the same hole rboot was in, in the crate that owns the
