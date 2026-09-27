@@ -34,6 +34,20 @@ pub fn register_hooks(hooks: &'static dyn KernelHooks) {
     *HOOKS.lock() = Some(hooks);
 }
 
+/// Test-only: put `hooks` in the slot and hand back whatever was there.
+///
+/// `HOOKS` is a process-global that `drivers` fills once during GPU init and
+/// nothing ever clears, so a test that installs a fake has to put the previous
+/// value back or it leaks into every test that runs after it. This lives here
+/// rather than in the tests because `HOOKS` is private and stays private.
+#[cfg(test)]
+pub(crate) fn swap_hooks(
+    hooks: Option<&'static dyn KernelHooks>,
+) -> Option<&'static dyn KernelHooks> {
+    let mut slot = HOOKS.lock();
+    core::mem::replace(&mut *slot, hooks)
+}
+
 pub(crate) fn with_hooks<R>(default: R, f: impl FnOnce(&dyn KernelHooks) -> R) -> R {
     // Bind and drop the guard *before* calling `f` -- matching on
     // `*HOOKS.lock()` directly would keep the lock held for the entire

@@ -1524,10 +1524,32 @@ pub extern "C" fn osGetGridCspSupport() -> NvU32 {
     0
 }
 
+/// One past the highest address a user process can map.
+///
+/// Real Linux (os.c) is `return TASK_SIZE;`. Eclipse's own limit is
+/// `USER_MAX` in `kernel-hal/src/common/user.rs`, the bound every
+/// `UserPtr` check uses; this crate cannot depend back on kernel-hal, so the
+/// value is repeated here and the test pins the one number the RM actually
+/// derives from it.
+///
+/// That derivation is `osGetCpuVaAddrShift` (os_init.c):
+/// `(64 - clz64(maxUserVa - 1)) + 1`. With 0 it read
+/// `(64 - clz64(u64::MAX)) + 1 == 65` -- a user address space one bit wider
+/// than a 64-bit machine has, from which `kgmmuSignExtendFaultAddress_GV100`
+/// (the HAL Turing uses) would take `64 - 65` as an unsigned shift count.
+/// That branch is not the one an x86_64 GPU takes, so nothing has crashed on
+/// it; the number was still wrong, and the RPC path (`rpc.c`) hands it
+/// straight to a vGPU host.
 #[no_mangle]
 pub extern "C" fn osGetMaxUserVa() -> NvU64 {
-    0
+    USER_VA_END
 }
+
+/// Mirror of `USER_MAX` in `kernel-hal/src/common/user.rs`: the exclusive top
+/// of Eclipse's user half, which is also where x86_64's canonical lower half
+/// ends. Chosen to match, not invented -- if that constant moves, this is the
+/// line that has to move with it.
+const USER_VA_END: NvU64 = 0x0000_8000_0000_0000;
 
 #[no_mangle]
 pub extern "C" fn osGetMemoryPages(
@@ -1571,9 +1593,24 @@ pub extern "C" fn osGetPageRefcount(arg0: NvU64) -> NvU32 {
     0
 }
 
+/// The CPU page size as a shift, the exact sibling of [`osGetPageSize`].
+///
+/// Real Linux (os.c) is `return os_page_shift;`, and this crate has already
+/// exported `os_page_shift = 12` next door for the RM to read directly -- so
+/// the right answer was one file away while this returned 0.
+///
+/// `osGetPageSize` returning 0 is not a hypothetical: it broke sysmem
+/// allocation on real hardware (see its comment), and this is the same number
+/// asked for in the other unit. A shift of 0 makes `size >> osGetPageShift()`
+/// a byte count used as a page count and `1 << osGetPageShift()` one byte used
+/// as one page, so the RM's page arithmetic comes out **4096x** wrong instead
+/// of merely failing: `numa.c` acquires a refcount on `actualSize - 1` pages
+/// where it wanted `(actualSize >> 12) - 1`, and
+/// `phys_mem_allocator_util.c` releases `1 << PMA_PAGE_SHIFT` pages where it
+/// took `1 << (PMA_PAGE_SHIFT - 12)`.
 #[no_mangle]
 pub extern "C" fn osGetPageShift() -> NvU8 {
-    0
+    crate::os_interface::os_page_shift
 }
 
 #[no_mangle]
@@ -1622,9 +1659,41 @@ pub extern "C" fn osGetSecurityToken() -> *mut c_void {
     core::ptr::null_mut()
 }
 
+/// Every power-of-two sysmem page size this OS supports, as a bitmask.
+///
+/// Real Linux (os.c) assumes it can serve every power of two from
+/// `os_page_size` to `os_max_page_size` inclusive and returns
+/// `((os_max_page_size << 1) - 1) & ~(os_page_size - 1)`. This returned 0,
+/// i.e. "no page size at all", which is not a value the contract admits: 0
+/// says the OS cannot allocate sysmem in any unit, and
+/// `_memmgrPickDefaultSysmemPageSize` (mem_mgr.c) tests
+/// `supportedPageMask & kgmmuGetMaxBigPageSize_HAL(...)` against it, so a big
+/// page is never picked no matter what the GPU offers.
+///
+/// With `os_max_page_size == os_page_size` the honest answer is the single
+/// 4 KiB bit, which picks the same page size the zero did -- so this changes
+/// no behaviour today. It changes what happens the day `os_max_page_size`
+/// grows: then the mask follows it, instead of staying silently empty.
 #[no_mangle]
 pub extern "C" fn osGetSupportedSysmemPageSizeMask() -> NvU64 {
-    0
+    sysmem_page_size_mask(
+        crate::os_interface::os_page_size,
+        crate::os_interface::os_max_page_size,
+    )
+}
+
+/// Linux's mask formula, split out so it can be checked against the property
+/// it is supposed to have rather than against itself.
+///
+/// `page_size` and `max_page_size` are powers of two with
+/// `page_size <= max_page_size`; both are this crate's own constants, and the
+/// zero that motivated this whole cluster is exactly what must not reach the
+/// subtractions below, so it is refused rather than wrapped.
+fn sysmem_page_size_mask(page_size: NvU64, max_page_size: NvU64) -> NvU64 {
+    if page_size == 0 || max_page_size < page_size {
+        return 0;
+    }
+    ((max_page_size << 1) - 1) & !(page_size - 1)
 }
 
 #[no_mangle]
@@ -2880,4 +2949,451 @@ pub extern "C" fn osGpuLocksQueueRelease(
     let _ = pGpu;
     let _ = dpc_gpu_lock_release;
     NV_OK
+}
+
+/// What the RM asks this OS about itself, and what it gets back.
+///
+/// This crate had no tests and `test.yml` named no job that compiled it, so
+/// none of the two hundred-odd `os*` entry points the vendored RM calls had
+/// ever been executed anywhere but on Moebius's GPU. The cluster below is the
+/// one where being silently wrong is worst: a getter that answers a number the
+/// RM then does arithmetic with, where a wrong answer is not an error the RM
+/// reports but a size, a count or a shift that comes out of the wrong
+/// magnitude. `osGetPageSize` is the proof that it bites -- it returned 0, and
+/// `RM_ALIGN_UP(size, 0)` collapsed every sysmem allocation to 0 and failed
+/// with 0x1F on real hardware -- so these tests mostly compare the same
+/// question asked in two units, which is what nobody did when that one was
+/// fixed and its sibling `osGetPageShift` was left at 0.
+#[cfg(test)]
+mod boundary_tests {
+    use super::*;
+    use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+    extern crate std;
+    use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
+    use std::sync::Mutex as StdMutex;
+
+    /// `PMA_PAGE_SHIFT` from the RM's own page allocator
+    /// (`phys_mem_allocator.h`): 64 KiB frames.
+    const PMA_PAGE_SHIFT: u32 = 16;
+
+    /// A `KernelHooks` that answers from statics the test sets, so a boundary
+    /// function can be checked without a GPU, a timer or a second thread. The
+    /// waits do not wait: they record what they were asked for, which is the
+    /// only thing a caller can observe about them.
+    struct FakeKernel;
+
+    static NOW_NS: AtomicU64 = AtomicU64::new(0);
+    static DELAYED_US: AtomicU32 = AtomicU32::new(0);
+    static DELAY_CALLS: AtomicU32 = AtomicU32::new(0);
+    static FAKE: FakeKernel = FakeKernel;
+
+    impl crate::hooks::KernelHooks for FakeKernel {
+        fn pci_config_read(&self, _h: usize, _off: u32, len: u32) -> u32 {
+            // A distinguishable, width-correct answer: never the all-ones an
+            // absent device reads as, so a test can tell "the hook answered"
+            // from "nothing was installed".
+            match len {
+                1 => 0x5A,
+                2 => 0x5A5A,
+                _ => 0x5A5A_5A5A,
+            }
+        }
+        fn pci_config_write(&self, _h: usize, _off: u32, _len: u32, _v: u32) {}
+        fn map_kernel_space(&self, _phys: u64, _size: u64) -> u64 {
+            0
+        }
+        fn unmap_kernel_space(&self, _virt: u64, _size: u64) {}
+        fn io_read(&self, _port: u32, _len: u32) -> u32 {
+            0
+        }
+        fn io_write(&self, _port: u32, _len: u32, _v: u32) {}
+        fn monotonic_time_ns(&self) -> u64 {
+            NOW_NS.load(Ordering::SeqCst)
+        }
+        fn delay_us(&self, us: u32) {
+            DELAYED_US.store(us, Ordering::SeqCst);
+            DELAY_CALLS.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// The hook slot and the fake's own statics are process-wide, so the tests
+    /// take turns and each leaves them as it found them -- including when the
+    /// body panics, or the next test inherits a fake clock and fails for a
+    /// reason that is not its own.
+    fn alone_with_the_kernel<R>(now_ns: u64, body: impl FnOnce() -> R) -> R {
+        static TURNSTILE: StdMutex<()> = StdMutex::new(());
+        let _guard = TURNSTILE.lock().unwrap_or_else(|e| e.into_inner());
+        let previous = crate::hooks::swap_hooks(Some(&FAKE));
+        NOW_NS.store(now_ns, Ordering::SeqCst);
+        DELAYED_US.store(0, Ordering::SeqCst);
+        DELAY_CALLS.store(0, Ordering::SeqCst);
+        let out = catch_unwind(AssertUnwindSafe(body));
+        crate::hooks::swap_hooks(previous);
+        match out {
+            Ok(v) => v,
+            Err(p) => resume_unwind(p),
+        }
+    }
+
+    /// The same, with the slot deliberately empty: an unwired build, which is
+    /// also every moment before `drivers` registers its hooks.
+    fn alone_with_no_kernel<R>(body: impl FnOnce() -> R) -> R {
+        static TURNSTILE: StdMutex<()> = StdMutex::new(());
+        let _guard = TURNSTILE.lock().unwrap_or_else(|e| e.into_inner());
+        let previous = crate::hooks::swap_hooks(None);
+        let out = catch_unwind(AssertUnwindSafe(body));
+        crate::hooks::swap_hooks(previous);
+        match out {
+            Ok(v) => v,
+            Err(p) => resume_unwind(p),
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Page geometry: the same question in two units.
+    // -----------------------------------------------------------------
+
+    /// The test that was missing. `osGetPageSize` was fixed from 0 to 4096
+    /// because 0 broke sysmem allocation on hardware; `osGetPageShift` was
+    /// left at 0, and nothing compared them.
+    #[test]
+    fn the_page_shift_and_the_page_size_describe_the_same_page() {
+        let shift = u32::from(osGetPageShift());
+        assert_eq!(
+            1u64 << shift,
+            osGetPageSize(),
+            "the shift and the size are the same number in two units"
+        );
+    }
+
+    /// Neither of them may be zero, whatever else they are: zero is the value
+    /// that makes the RM's arithmetic collapse instead of fail.
+    #[test]
+    fn neither_the_page_size_nor_the_shift_is_zero() {
+        assert_ne!(osGetPageSize(), 0);
+        assert_ne!(osGetPageShift(), 0);
+    }
+
+    /// `numa.c`: `osAllocAcquirePage(addr + (1 << shift), (size >> shift) - 1)`
+    /// -- a base one page up and a count in pages. With a shift of 0 it asked
+    /// for one BYTE up and `size - 1` pages: 2097151 pages of a 2 MiB
+    /// allocation instead of 511.
+    #[test]
+    fn a_byte_size_shifted_by_the_page_shift_is_a_page_count() {
+        let shift = u32::from(osGetPageShift());
+        let two_mib = 2 * 1024 * 1024u64;
+        assert_eq!(two_mib >> shift, 512, "2 MiB is 512 pages");
+        assert_eq!(
+            (two_mib >> shift) - 1,
+            511,
+            "and numa.c skips the first, which it already refcounted"
+        );
+        assert_eq!(1u64 << shift, osGetPageSize(), "one page up, not one byte");
+    }
+
+    /// `phys_mem_allocator_util.c`: a PMA frame is released as
+    /// `1 << (PMA_PAGE_SHIFT - osPageShift)` OS pages. With a shift of 0 that
+    /// released 65536 pages where the acquire took 16.
+    #[test]
+    fn a_pma_frame_releases_as_many_pages_as_it_holds() {
+        let shift = u32::from(osGetPageShift());
+        assert!(
+            PMA_PAGE_SHIFT >= shift,
+            "the RM asserts this before it subtracts"
+        );
+        let pages_per_frame = 1u64 << (PMA_PAGE_SHIFT - shift);
+        assert_eq!(
+            pages_per_frame * osGetPageSize(),
+            1u64 << PMA_PAGE_SHIFT,
+            "the pages of one frame add up to exactly one frame"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // The supported-page-size mask.
+    // -----------------------------------------------------------------
+
+    /// The property the RM reads it for: the OS page size is a page size the
+    /// OS supports. A mask of 0 says it is not.
+    #[test]
+    fn the_supported_mask_holds_the_page_size_it_hands_out() {
+        assert_ne!(
+            osGetSupportedSysmemPageSizeMask() & osGetPageSize(),
+            0,
+            "the size osGetPageSize() returns must be in the mask"
+        );
+    }
+
+    #[test]
+    fn the_supported_mask_holds_nothing_smaller_than_a_page() {
+        assert_eq!(
+            osGetSupportedSysmemPageSizeMask() & (osGetPageSize() - 1),
+            0,
+            "no sub-page unit is a supported page size"
+        );
+    }
+
+    /// Linux's own description of the mask: every power of two from the page
+    /// size to the maximum page size, inclusive, and nothing else below.
+    #[test]
+    fn the_supported_mask_holds_every_power_of_two_in_the_range() {
+        let mask = sysmem_page_size_mask(4096, 2 * 1024 * 1024);
+        let mut size = 4096u64;
+        while size <= 2 * 1024 * 1024 {
+            assert_ne!(mask & size, 0, "{size} is in [4 KiB, 2 MiB]");
+            size <<= 1;
+        }
+        for smaller in [1u64, 2, 512, 2048] {
+            assert_eq!(mask & smaller, 0, "{smaller} is below a page");
+        }
+    }
+
+    /// The zero this whole cluster is about must not reach the subtractions:
+    /// `!(0 - 1)` wraps to zero and hands back exactly the empty mask that
+    /// was the bug.
+    #[test]
+    fn a_page_size_of_zero_gets_no_mask_rather_than_a_wrapped_one() {
+        assert_eq!(sysmem_page_size_mask(0, 4096), 0);
+        assert_eq!(
+            sysmem_page_size_mask(4096, 1024),
+            0,
+            "a maximum below the minimum names no range"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // The user address space.
+    // -----------------------------------------------------------------
+
+    /// `osGetCpuVaAddrShift` (os_init.c) is
+    /// `(64 - clz64(maxUserVa - 1)) + 1`, and x86_64's answer is 48. With
+    /// `osGetMaxUserVa()` at 0 it read `(64 - clz64(u64::MAX)) + 1 == 65`: a
+    /// user address space one bit wider than the machine.
+    #[test]
+    fn the_user_address_space_is_the_canonical_forty_eight_bits() {
+        let max_user_va = osGetMaxUserVa();
+        assert_ne!(max_user_va, 0, "zero makes the shift below come out 65");
+        let shift = (64 - (max_user_va - 1).leading_zeros()) + 1;
+        assert_eq!(shift, 48, "what osGetCpuVaAddrShift computes from it");
+    }
+
+    /// And it is in the lower half, which is what makes it sign-extendable at
+    /// all: the RM canonicalises a fault address by shifting it left and back.
+    #[test]
+    fn the_top_of_the_user_half_is_not_a_kernel_address() {
+        let max_user_va = osGetMaxUserVa();
+        assert_eq!(
+            max_user_va & (1u64 << 63),
+            0,
+            "the user half must not carry the sign bit"
+        );
+        let last = max_user_va - 1;
+        assert_eq!(
+            ((last as i64) << 16) >> 16,
+            last as i64,
+            "the last user address survives a 48-bit sign extension"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Time: three functions, one clock.
+    // -----------------------------------------------------------------
+
+    /// `osGetTimestamp` is in whatever unit `osGetTimestampFreq` declares.
+    /// They are two functions and nothing but this ties them together.
+    #[test]
+    fn the_timestamp_is_in_the_unit_its_own_frequency_declares() {
+        alone_with_the_kernel(3_000_000_000, || {
+            assert_eq!(osGetTimestampFreq(), 1_000_000, "microseconds");
+            assert_eq!(osGetTimestamp(), 3_000_000);
+            assert_eq!(
+                osGetTimestamp() / osGetTimestampFreq(),
+                3,
+                "three seconds, by its own units"
+            );
+        });
+    }
+
+    /// `rcdbConstruct_IMPL` divides by this. It was 0 once and the divide
+    /// killed the machine with no output.
+    #[test]
+    fn the_frequency_the_journal_divides_by_is_never_zero() {
+        assert_ne!(osGetTimestampFreq(), 0);
+    }
+
+    /// `osGetCurrentTick` is nanoseconds and `osGetTimestamp` microseconds,
+    /// off the same clock, so at an exact microsecond they agree.
+    #[test]
+    fn the_tick_is_nanoseconds_where_the_timestamp_is_microseconds() {
+        alone_with_the_kernel(7_000_000, || {
+            let mut tick = 0u64;
+            assert_eq!(osGetCurrentTick(&mut tick), NV_OK);
+            assert_eq!(tick, 7_000_000, "nanoseconds, unscaled");
+            assert_eq!(osGetTimestamp() * 1_000, tick);
+        });
+    }
+
+    /// The tick resolution is only ever added to a deadline, never divided by,
+    /// but it still must not claim a granularity finer than the clock has.
+    #[test]
+    fn the_tick_resolution_is_not_finer_than_the_clock() {
+        assert_ne!(osGetTickResolution(), 0);
+        assert!(osGetTickResolution() <= 1_000_000, "at most a millisecond");
+    }
+
+    /// Seconds and microseconds have to name one instant between them: the
+    /// microseconds are the part inside the second, not the whole clock.
+    #[test]
+    fn the_wall_clock_seconds_and_microseconds_name_one_instant() {
+        alone_with_the_kernel(1_234_567_890, || {
+            let mut secs = 0u32;
+            let mut usecs = 0u32;
+            assert_eq!(osGetCurrentTime(&mut secs, &mut usecs), NV_OK);
+            assert_eq!(secs, 1);
+            assert_eq!(usecs, 234_567);
+            assert_eq!(
+                u64::from(secs) * 1_000_000 + u64::from(usecs),
+                1_234_567,
+                "together they are the clock, in microseconds"
+            );
+        });
+    }
+
+    #[test]
+    fn the_microseconds_never_reach_a_whole_second() {
+        for ns in [
+            0u64,
+            1,
+            999,
+            1_000,
+            999_999_999,
+            1_000_000_000,
+            1_999_999_999,
+            u64::from(u32::MAX) * 1_000_000_000,
+        ] {
+            alone_with_the_kernel(ns, || {
+                let mut secs = 0u32;
+                let mut usecs = 0u32;
+                assert_eq!(osGetCurrentTime(&mut secs, &mut usecs), NV_OK);
+                assert!(usecs < 1_000_000, "ns={} gave usec={}", ns, usecs);
+            });
+        }
+    }
+
+    /// Both out-pointers are optional in the real signature, and a null one
+    /// must not be written through.
+    #[test]
+    fn a_clock_read_with_nowhere_to_put_it_does_not_write_anywhere() {
+        alone_with_the_kernel(5_000_000_000, || {
+            assert_eq!(
+                osGetCurrentTime(core::ptr::null_mut(), core::ptr::null_mut()),
+                NV_OK
+            );
+            assert_eq!(osGetCurrentTick(core::ptr::null_mut()), NV_OK);
+        });
+    }
+
+    // -----------------------------------------------------------------
+    // Waiting.
+    // -----------------------------------------------------------------
+
+    /// Linux's `os_delay_ns` rounds up to at least a microsecond: a poll that
+    /// asks for less must still wait, or it spins.
+    #[test]
+    fn a_sub_microsecond_wait_rounds_up_to_one() {
+        for (ns, want_us) in [(1u32, 1u32), (999, 1), (1_000, 1), (1_001, 2), (2_000, 2)] {
+            alone_with_the_kernel(0, || {
+                assert_eq!(osDelayNs(ns), NV_OK);
+                assert_eq!(DELAY_CALLS.load(Ordering::SeqCst), 1, "ns={ns}");
+                assert_eq!(DELAYED_US.load(Ordering::SeqCst), want_us, "ns={ns}");
+            });
+        }
+    }
+
+    /// Zero nanoseconds is a yield, not a wait: the RM uses it to let this CPU
+    /// answer a TLB shootdown between two register reads.
+    #[test]
+    fn a_zero_nanosecond_wait_is_a_yield_and_not_a_wait() {
+        alone_with_the_kernel(0, || {
+            assert_eq!(osDelayNs(0), NV_OK);
+            assert_eq!(
+                DELAY_CALLS.load(Ordering::SeqCst),
+                0,
+                "nothing was asked to wait"
+            );
+        });
+    }
+
+    #[test]
+    fn a_millisecond_wait_is_a_thousand_microseconds() {
+        alone_with_the_kernel(0, || {
+            assert_eq!(osDelay(5), NV_OK);
+            assert_eq!(DELAYED_US.load(Ordering::SeqCst), 5_000);
+        });
+    }
+
+    /// The longest wait the RM can name must not come out shorter than a long
+    /// one: `ms * 1000` saturates, so the cap has to be past any real timeout.
+    #[test]
+    fn a_long_wait_is_not_silently_shortened() {
+        alone_with_the_kernel(0, || {
+            assert_eq!(osDelay(60_000), NV_OK);
+            assert_eq!(
+                DELAYED_US.load(Ordering::SeqCst),
+                60_000_000,
+                "a minute, the longest deadline the RM sets"
+            );
+        });
+    }
+
+    // -----------------------------------------------------------------
+    // An unwired build.
+    // -----------------------------------------------------------------
+
+    /// Before `drivers` registers its hooks -- and in any build that never
+    /// does -- a config read has to read as an absent device, which on PCI is
+    /// all ones at each width. Anything else is a made-up device.
+    #[test]
+    fn a_config_read_with_no_kernel_behind_it_reads_as_an_absent_device() {
+        alone_with_no_kernel(|| {
+            let h = core::ptr::null_mut();
+            assert_eq!(osPciReadByte(h, 0), 0xFF);
+            assert_eq!(osPciReadWord(h, 0), 0xFFFF);
+            assert_eq!(osPciReadDword(h, 0), 0xFFFF_FFFF);
+        });
+    }
+
+    /// ...and once they are registered, the same calls answer from the kernel
+    /// instead, which is what makes the test above mean something.
+    #[test]
+    fn a_config_read_with_a_kernel_behind_it_answers_from_the_kernel() {
+        alone_with_the_kernel(0, || {
+            let h = core::ptr::null_mut();
+            assert_eq!(osPciReadByte(h, 0), 0x5A);
+            assert_eq!(osPciReadWord(h, 0), 0x5A5A);
+            assert_eq!(osPciReadDword(h, 0), 0x5A5A_5A5A);
+        });
+    }
+
+    /// The page geometry is not hooked and must answer with or without a GPU:
+    /// `memdescCreate` asks for it before any device is attached.
+    #[test]
+    fn the_page_geometry_answers_before_any_gpu_exists() {
+        alone_with_no_kernel(|| {
+            assert_eq!(osGetPageSize(), 4096);
+            assert_eq!(osGetPageShift(), 12);
+            assert_ne!(osGetSupportedSysmemPageSizeMask(), 0);
+            assert_ne!(osGetMaxUserVa(), 0);
+        });
+    }
+
+    /// With no timer hook the wait still returns success rather than a status
+    /// a caller might treat as fatal and skip the wait over.
+    #[test]
+    fn a_wait_with_no_timer_still_succeeds() {
+        alone_with_no_kernel(|| {
+            assert_eq!(osDelayNs(1_500), NV_OK);
+            assert_eq!(osDelay(1), NV_OK);
+        });
+    }
 }
