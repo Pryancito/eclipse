@@ -5435,6 +5435,28 @@ mod gl_client_sequence_tests {
         }
 
         /// `drmModeAddFB2`: wrap a buffer in a framebuffer object.
+        /// `ADDFB2` declaring a width narrower than the buffer's own pitch, so
+        /// the framebuffer has off-screen padding at the end of every row --
+        /// what a client with an alignment requirement, or a client whose
+        /// surface is narrower than the mode, really registers.
+        pub(super) fn addfb2_narrow(&self, buf: &DrmModeCreateDumb, width: u32) -> u32 {
+            const DRM_FORMAT_XRGB8888: u32 = 0x3443_5258;
+            let mut cmd = DrmModeFbCmd2 {
+                fb_id: 0,
+                width,
+                height: buf.height,
+                pixel_format: DRM_FORMAT_XRGB8888,
+                flags: 0,
+                handles: [buf.handle, 0, 0, 0],
+                pitches: [buf.pitch, 0, 0, 0],
+                offsets: [0; 4],
+                modifier: [0; 4],
+            };
+            self.ioctl(DRM_IOCTL_MODE_ADDFB2, &mut cmd).expect("ADDFB2");
+            assert_ne!(cmd.fb_id, 0, "ADDFB2 gave no fb id");
+            cmd.fb_id
+        }
+
         pub(super) fn addfb2(&self, buf: &DrmModeCreateDumb) -> u32 {
             // DRM_FORMAT_XRGB8888, which is what every GL swapchain on this
             // tree ends up presenting.
@@ -6924,6 +6946,50 @@ mod kms_scanout_tests {
         c.rmfb(fb_during).expect("RMFB");
         c.destroy_dumb(before.handle).expect("DESTROY_DUMB");
         c.destroy_dumb(during.handle).expect("DESTROY_DUMB");
+    }
+
+    /// Does the cursor patch read past the framebuffer's own right edge?
+    ///
+    /// The call site's comment says it clips "to what the framebuffer covers
+    /// (`fb_width`/`fb_height`), not to the screen: a client fb narrower or
+    /// shorter than the display would otherwise have the patch read past the end
+    /// of a row -- the next row's pixels -- and paint that onto the scanout as a
+    /// shifted square trailing the pointer". The height half does clip to `fh`.
+    /// The width half never mentions `fw` again: it bounds `x` at the row PITCH,
+    /// which is >= `fw` by construction. So a framebuffer narrower than its own
+    /// pitch has the columns in between read and painted.
+    #[test]
+    fn the_cursor_patch_does_not_paint_the_framebuffers_row_padding() {
+        let screen = kms_emu::attach(64, 16);
+        let c = Client::open(0);
+
+        // A 40-pixel buffer registered as a 32-pixel-wide framebuffer: eight
+        // columns of row padding, and the screen is wider than either.
+        let buf = c.create_dumb(40, 16);
+        paint(&buf, |x, y| tag(0x0055_0000, x, y));
+        let fb = c.addfb2_narrow(&buf, 32);
+        set_crtc(&c, drm::SYNTH_CRTC_ID, fb, 32, 16);
+        drain_completions(&c);
+
+        // Whatever the present put on screen for the padding columns is the
+        // baseline: the cursor must not change it.
+        let before: alloc::vec::Vec<u32> = (32..48u32).map(|x| screen.pixel(x, 4)).collect();
+
+        // An 8x8 opaque pointer at the framebuffer's right edge: its patch
+        // reaches columns 24..32, and the write-combining widening takes the
+        // read out to the row pitch.
+        set_cursor(&c, drm::SYNTH_CRTC_ID, buf.handle, 8, 8, 24, 0);
+        move_cursor(&c, drm::SYNTH_CRTC_ID, 24, 2);
+
+        let after: alloc::vec::Vec<u32> = (32..48u32).map(|x| screen.pixel(x, 4)).collect();
+        assert_eq!(
+            before, after,
+            "the pointer painted the framebuffer's off-screen row padding onto \
+             the visible screen, past the framebuffer's own right edge"
+        );
+
+        c.rmfb(fb).expect("RMFB");
+        c.destroy_dumb(buf.handle).expect("DESTROY_DUMB");
     }
 
     /// The probe must be able to say "nothing wrote this window" -- on a buffer

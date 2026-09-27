@@ -2453,6 +2453,52 @@ pub fn scanout(fb_id: u32) -> bool {
 /// to those 16-pixel boundaries; `limit` is the largest X that is safe to write
 /// (visible width, or the pitch in pixels so the right-edge tail can land in
 /// off-screen padding).
+/// How far right a blit of the CRTC framebuffer may go, in pixels: the limit
+/// every read of it is bounded by, and the one [`expand_x_for_wc`] widens up to.
+///
+/// One function because four places asked it and they did not all agree. Three
+/// spelled it `min(src_stride, display_pitch_px).max(fw)` and one added a
+/// `.min(src_stride)` with a paragraph explaining why -- and none of them asked
+/// the question that decides it, which is whether the image covers the screen.
+///
+/// When it does, widening past the visible width lands in the DISPLAY's
+/// off-screen scanline padding. That is legitimate and deliberate: it completes
+/// the last write-combining buffer instead of flushing it half-full, and nobody
+/// can see those columns. The only bound is the row itself -- past `src_stride`
+/// is the next row's leftmost pixel, and a pointer whose tail appears on the far
+/// left of the line below is the visible form of that off-by-one.
+///
+/// When it does NOT -- a client framebuffer narrower than the mode -- the
+/// columns past its right edge are on the screen and the image has nothing to
+/// put in them. Widening to the stride there read the framebuffer's own row
+/// padding, and past that the next row's pixels, and painted both onto the
+/// visible screen: a shifted square trailing the pointer, which is exactly what
+/// the cursor patch's comment says it clips to `fb_width` to prevent. It clipped
+/// `y` and never clipped `x`.
+///
+/// `image_width >= display_width` is how "the image covers the screen" is asked,
+/// and callers pass whichever width they hold: the framebuffer's own, or the
+/// `min` of it and the display's. Both answer the same question, because the min
+/// equals the display width exactly when the framebuffer is at least as wide.
+///
+/// It must be ONE value per present, too, not recomputed per caller:
+/// [`cursor_read_is_synced`] is told the window the blend will read and compares
+/// it against what the present invalidated. Two callers deriving that limit
+/// differently makes it answer about a window nobody reads -- and the way it
+/// falls is "covered", which skips the flush.
+fn image_pitch_px(
+    src_stride: usize,
+    display_pitch_px: u32,
+    display_width: u32,
+    image_width: u32,
+) -> u32 {
+    if image_width >= display_width {
+        (src_stride as u32).min(display_pitch_px)
+    } else {
+        image_width
+    }
+}
+
 fn expand_x_for_wc(x: u32, w: u32, limit: u32) -> (u32, u32) {
     const WC_PX: u32 = 16;
     if w == 0 || limit == 0 {
@@ -2791,19 +2837,14 @@ pub fn scanout_region_checked(
         snap
     };
     if let Some((cx, cy, cw, ch, bmp)) = cursor {
-        // Capped at `src_stride` on the way out, after the `.max(fb_width)`:
-        // `cursor_read_is_synced` linearises with `src_stride`, so a limit
-        // above it would put the read's last byte in the NEXT row and tip the
-        // containment test towards "covered" -- the direction that skips a
-        // flush. `create_fb` already rejects `pitch < width * 4`, so
-        // `fb_width <= src_stride` holds for every registered framebuffer and
-        // the cap never fires; it keeps the two arguments consistent by
-        // construction rather than by an invariant enforced a thousand lines
-        // away.
-        let cursor_pitch_px = (src_stride as u32)
-            .min(info.pitch() / 4)
-            .max(fb_width)
-            .min(src_stride as u32);
+        // The one limit for this present, and it has to be the SAME one
+        // `blit_cursor_patch` uses below: `cursor_read_is_synced` is told the
+        // window the blend will read and compares it against what the present
+        // invalidated, so two derivations of it make that comparison answer about
+        // a window nobody reads -- and it falls towards "covered", which skips
+        // the flush. See [`image_pitch_px`] for why the answer is the image's
+        // own width and not the row stride.
+        let cursor_pitch_px = image_pitch_px(src_stride, info.pitch() / 4, info.width, fb_width);
         // `blit_cursor_patch` below READS the framebuffer under the pointer --
         // through the WB physmap alias of a GEM the GPU writes -- to blend the
         // cursor over it. Those lines have to be invalidated first or the blend
@@ -3277,7 +3318,7 @@ pub fn repaint_for_cursor() {
     // squares of an older frame -- and it only shows where the GPU recently
     // rewrote those pixels, so a flat wallpaper hides it and a window shadow
     // (a gradient, freshly composited) does not.
-    let sync_pitch_px = (src_stride as u32).min(info.pitch() / 4).max(fw);
+    let sync_pitch_px = image_pitch_px(src_stride, info.pitch() / 4, info.width, fw);
     let sync_rect = |x: i32, y: i32, w: u32, h: u32| {
         if !gem_cpu_mapped {
             return;
@@ -3392,7 +3433,8 @@ fn blit_cursor_patch(
     if src_stride == 0 || pw == 0 || ph == 0 {
         return;
     }
-    let pitch_px = (src_stride as u32).min(display.info().pitch() / 4).max(fw);
+    let dinfo = display.info();
+    let pitch_px = image_pitch_px(src_stride, dinfo.pitch() / 4, dinfo.width, fw);
     let x0 = px.max(0) as u32;
     let y0 = py.max(0);
     let x1 = (px + pw as i32).max(0) as u32;
@@ -3487,7 +3529,8 @@ fn restore_rect(
     if src_stride == 0 {
         return;
     }
-    let pitch_px = (src_stride as u32).min(display.info().pitch() / 4).max(fw);
+    let dinfo = display.info();
+    let pitch_px = image_pitch_px(src_stride, dinfo.pitch() / 4, dinfo.width, fw);
     let y0 = y.max(0);
     let y1 = (y + h as i32).min(fh as i32);
     if y1 <= y0 {
@@ -8421,5 +8464,109 @@ mod edid_gate_tests {
         // captured, so this is the fallback path every such machine takes.
         assert_eq!(get_connector_edid(SYNTH_CONNECTOR_ID), None);
         assert_eq!(boot_edid_block(), None);
+    }
+}
+
+/// Tests for how far right a blit of the CRTC framebuffer may go.
+///
+/// One number, asked by four places, and the two regimes it has to tell apart
+/// look identical from inside any one of them: past the visible width is the
+/// display's own off-screen padding when the image covers the screen, and it is
+/// the screen itself when the image does not. Getting that backwards is either a
+/// write-combining buffer flushed half-full (a fraction of one blit) or the
+/// framebuffer's row padding painted onto the desktop (pixels a person sees).
+#[cfg(test)]
+mod image_pitch_tests {
+    use super::*;
+
+    /// The ordinary desktop: a 1920 framebuffer on a 1920 mode whose scanline is
+    /// padded to 2048 by the firmware. The blit may run to the row's end, which
+    /// is the framebuffer's own stride -- those columns are the display's padding
+    /// and nobody sees them.
+    #[test]
+    fn an_image_that_covers_the_screen_may_reach_the_displays_padding() {
+        assert_eq!(image_pitch_px(1920, 2048, 1920, 1920), 1920);
+        // And with a padded SOURCE stride, out to that stride.
+        assert_eq!(image_pitch_px(1936, 2048, 1920, 1920), 1936);
+    }
+
+    /// Never past the row, though. One pixel further is the next row's leftmost
+    /// pixel, and a pointer whose tail appears on the far left of the line below
+    /// is what that looks like.
+    #[test]
+    fn it_never_reaches_past_the_row_itself() {
+        assert_eq!(image_pitch_px(1920, 4096, 1920, 1920), 1920);
+        assert!(image_pitch_px(1920, 4096, 1920, 1920) <= 1920);
+    }
+
+    /// Nor past what the display can address, when the display is the narrower
+    /// of the two.
+    #[test]
+    fn it_never_reaches_past_what_the_display_can_address() {
+        assert_eq!(image_pitch_px(2048, 1920, 1366, 2048), 1920);
+    }
+
+    /// The defect. A client framebuffer narrower than the mode: the columns past
+    /// its right edge are ON the screen, and it has nothing to put in them, so
+    /// the blit stops at the image. Widening to the stride here read the row
+    /// padding, and past that the next row, and painted both.
+    #[test]
+    fn an_image_narrower_than_the_screen_stops_at_its_own_right_edge() {
+        // A 32-wide framebuffer in a 48-pixel stride, on a 64-wide screen.
+        assert_eq!(image_pitch_px(48, 64, 64, 32), 32);
+        // Not the stride, and not the screen.
+        assert_ne!(image_pitch_px(48, 64, 64, 32), 48);
+        assert_ne!(image_pitch_px(48, 64, 64, 32), 64);
+    }
+
+    /// The boundary between the two regimes is "as wide as the screen", not
+    /// "wider than it". One pixel either side decides whether the widened
+    /// columns are padding or desktop.
+    #[test]
+    fn the_regime_turns_over_at_exactly_as_wide_as_the_screen() {
+        assert_eq!(
+            image_pitch_px(80, 128, 64, 63),
+            63,
+            "one short: stop at the image"
+        );
+        assert_eq!(
+            image_pitch_px(80, 128, 64, 64),
+            80,
+            "exactly as wide: reach the padding"
+        );
+        assert_eq!(image_pitch_px(80, 128, 64, 65), 80, "wider: the same");
+    }
+
+    /// Callers hold different widths -- the framebuffer's own, or the `min` of it
+    /// and the display's -- and both have to give the same answer, because
+    /// `cursor_read_is_synced` compares a window one caller derived against a
+    /// flush another caller decided.
+    #[test]
+    fn the_raw_width_and_the_minned_one_agree() {
+        for (dw, fbw) in [
+            (64u32, 32u32),
+            (64, 64),
+            (64, 96),
+            (1920, 1920),
+            (1920, 1366),
+        ] {
+            let minned = dw.min(fbw);
+            assert_eq!(
+                image_pitch_px(2048, 2048, dw, fbw),
+                image_pitch_px(2048, 2048, dw, minned),
+                "display {} vs framebuffer {}",
+                dw,
+                fbw
+            );
+        }
+    }
+
+    /// A zero-width image asks for nothing, and must not come out as "the whole
+    /// row": `expand_x_for_wc` treats its limit as the right-hand bound, so a
+    /// limit of the stride on an empty image would widen a nothing into a row.
+    #[test]
+    fn an_image_of_no_width_does_not_become_a_whole_row() {
+        assert_eq!(image_pitch_px(64, 64, 64, 0), 0);
+        assert_eq!(expand_x_for_wc(0, 0, image_pitch_px(64, 64, 64, 0)), (0, 0));
     }
 }
