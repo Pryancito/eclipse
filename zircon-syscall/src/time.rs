@@ -166,7 +166,7 @@ impl Syscall<'_> {
             1 => {
                 let args = UserInPtr::<ClockUpdateArgsV1>::from(user_args.as_addr()).read()?;
                 if flags & ZX_CLOCK_UPDATE_OPTION_SYNTHETIC_VALUE_VALID != 0 {
-                    clock.update(now, args.value);
+                    clock.update(now, args.value)?;
                 }
             }
             2 => {
@@ -177,7 +177,7 @@ impl Syscall<'_> {
                     } else {
                         now
                     };
-                    clock.update(reference, args.synthetic_value);
+                    clock.update(reference, args.synthetic_value)?;
                 }
             }
             _ => return Err(ZxError::INVALID_ARGS),

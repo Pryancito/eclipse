@@ -136,7 +136,7 @@ impl Syscall<'_> {
 
     /// Prevent future reading or writing on a socket.
     pub fn sys_socket_shutdown(&self, socket: HandleValue, options: u32) -> ZxResult {
-        let options = SocketFlags::from_bits_truncate(options);
+        let options = shutdown_options(options)?;
         info!(
             "socket.shutdown: socket={:#x?}, options={:#x?}",
             socket, options
@@ -147,5 +147,52 @@ impl Syscall<'_> {
         let write = options.contains(SocketFlags::SHUTDOWN_WRITE);
         socket.shutdown(read, write)?;
         Ok(())
+    }
+}
+
+/// The `options` of `zx_socket_shutdown`, which are the two shutdown bits and
+/// nothing else.
+///
+/// `from_bits_truncate` was quietly dropping every other bit, so a caller that
+/// passed the wrong constant got a call that did something else instead of an
+/// error -- and `SocketFlags` holds the bits of `socket_create` and
+/// `socket_read` too, which are numbered over these.
+fn shutdown_options(options: u32) -> ZxResult<SocketFlags> {
+    let options = SocketFlags::from_bits(options).ok_or(ZxError::INVALID_ARGS)?;
+    if !(options - SocketFlags::SHUTDOWN_MASK).is_empty() {
+        return Err(ZxError::INVALID_ARGS);
+    }
+    Ok(options)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    /// The two shutdown bits, in any combination, and nothing else: the flags
+    /// of the other socket syscalls share this word's numbering, so accepting
+    /// them here turns a caller's mistake into a different action.
+    fn shutdown_takes_the_two_shutdown_bits_and_no_others() {
+        let read = SocketFlags::SHUTDOWN_READ;
+        let write = SocketFlags::SHUTDOWN_WRITE;
+        assert_eq!(shutdown_options(0).unwrap(), SocketFlags::empty());
+        assert_eq!(shutdown_options(read.bits()).unwrap(), read);
+        assert_eq!(shutdown_options(write.bits()).unwrap(), write);
+        assert_eq!(
+            shutdown_options((read | write).bits()).unwrap(),
+            read | write,
+        );
+
+        assert_eq!(
+            shutdown_options(SocketFlags::SOCKET_PEEK.bits()).err(),
+            Some(ZxError::INVALID_ARGS),
+            "`peek` belongs to socket_read",
+        );
+        assert_eq!(
+            shutdown_options(1 << 20).err(),
+            Some(ZxError::INVALID_ARGS),
+            "and a bit that is nothing at all",
+        );
     }
 }
