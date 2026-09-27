@@ -907,9 +907,10 @@ fn log_raw_cstr(str_: *const c_char) {
             p = p.add(1);
         }
         let slice = core::slice::from_raw_parts(str_ as *const u8, len);
-        // GPU-independent survival breadcrumb: bump the CMOS narration counter on
-        // every RM line so a wedge's surviving count says how far the RM's own
-        // narration got (see crate::survival / /proc/gpusurvive).
+        // The GPU-independent survival breadcrumb used to be bumped here, once
+        // per RM line. It is a no-op now: the CMOS write it fed is disabled, so
+        // the read that produced its value had no consumer, and it was four port
+        // accesses with NMI masked on every line (see crate::survival).
         crate::survival::narration_tick();
         // A single byte the RM got from the GPU (a monitor name out of an EDID,
         // a VBIOS string) used to drop the WHOLE line: no log, no capture, and

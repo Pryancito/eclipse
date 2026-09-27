@@ -632,8 +632,6 @@ pub fn wedge_detected() -> bool {
     WEDGE_DETECTED.load(core::sync::atomic::Ordering::Relaxed)
 }
 
-/// Clear fake-MMIO mode after a successful bus recovery (BARs restored and
-/// the device answering config cycles again).
 /// Stop rendering to the console because the GPU whose BAR1 holds the console
 /// framebuffer has stopped answering: the next rendered line would take the
 /// machine with it, and the /proc report has to survive.
@@ -653,6 +651,8 @@ pub(crate) fn wedge_console_suppress_for_test() {
     wedge_console_suppress();
 }
 
+/// Clear fake-MMIO mode after a successful bus recovery (BARs restored and
+/// the device answering config cycles again).
 pub fn wedge_fake_mmio_clear() {
     WEDGE_FAKE_MMIO.store(false, core::sync::atomic::Ordering::Relaxed);
     // The device answers config space again, so the console framebuffer in its
