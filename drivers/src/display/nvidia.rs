@@ -12413,7 +12413,12 @@ impl NvidiaGpu {
                     // host-visible heap; reporting them equal makes it treat
                     // ALL VRAM as CPU-mappable and mmap past the aperture.
                     nv::NOUVEAU_GETPARAM_VRAM_BAR_SIZE => self.info.fb_size as u64,
-                    nv::NOUVEAU_GETPARAM_AGP_SIZE => 0,
+                    // `drm->gem.gart_available`: on a PCIe board the limit
+                    // of the client's VMM, 49 bits (`nouveau_ttm_init`),
+                    // not 0 -- libdrm reads it as the board's GART size and
+                    // budgets against it (`gart_limit`). Also what
+                    // GEM_PUSHBUF writes back.
+                    nv::NOUVEAU_GETPARAM_AGP_SIZE => nv::NOUVEAU_GART_AVAILABLE,
                     // The REAL chip id, not the architecture's lower bound:
                     // gallium's nouveau GL still reads this, and a bound value
                     // decodes to the wrong SM (0x170 is GA100, not GA10x).
@@ -14503,7 +14508,7 @@ impl NvidiaGpu {
                     return Err(nv::ENOENT);
                 }
                 pb.vram_available = (self.effective_vram_mb() as u64).saturating_mul(1024 * 1024);
-                pb.gart_available = 0;
+                pb.gart_available = nv::NOUVEAU_GART_AVAILABLE;
                 if pb.nr_push == 0 {
                     pb.suffix0 = 0;
                     pb.suffix1 = 0;
