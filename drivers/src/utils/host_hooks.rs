@@ -18,36 +18,122 @@
 //! and the error paths are where the interesting behaviour lives.
 
 extern crate std;
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use core::cell::Cell;
+use core::sync::atomic::Ordering;
 use std::alloc::{alloc, alloc_zeroed, Layout};
 
+// ─── Per-thread, not process-wide ───────────────────────────────────────────
+//
+// These were `AtomicBool`/`AtomicUsize` statics, which made every switch and
+// every counter shared by the WHOLE test binary. A test asserting that it took
+// exactly four regions was asserting something about every other test that
+// happened to be running: at `--test-threads=16` this suite failed about two
+// runs in three, and the modules that use these hooks each kept a private
+// `TURNSTILE` mutex that could not possibly help, since the tests perturbing the
+// counters are in modules that never take any lock at all.
+//
+// A test's allocations happen on the thread running it, so the state belongs to
+// that thread. Each one now sees its own switches and its own counts, whatever
+// `--test-threads` says and whatever the rest of the binary is doing. The
+// wrappers keep the `.load(Ordering)` / `.store(v, Ordering)` shape of the
+// atomics they replace, so every call site reads as it did; the `Ordering` is
+// accepted and ignored, because there is nothing to order against.
+
+/// A `bool` that is private to the thread reading it, shaped like `AtomicBool`.
+pub struct ThreadFlag(&'static std::thread::LocalKey<Cell<bool>>);
+
+impl ThreadFlag {
+    pub fn store(&self, value: bool, _: Ordering) {
+        self.0.with(|c| c.set(value));
+    }
+    pub fn load(&self, _: Ordering) -> bool {
+        self.0.with(|c| c.get())
+    }
+}
+
+/// A `usize` that is private to the thread reading it, shaped like
+/// `AtomicUsize`.
+pub struct ThreadCount(&'static std::thread::LocalKey<Cell<usize>>);
+
+impl ThreadCount {
+    pub fn store(&self, value: usize, _: Ordering) {
+        self.0.with(|c| c.set(value));
+    }
+    pub fn load(&self, _: Ordering) -> usize {
+        self.0.with(|c| c.get())
+    }
+    /// Returns the value from *before* the add, like `AtomicUsize::fetch_add`.
+    pub fn fetch_add(&self, delta: usize, _: Ordering) -> usize {
+        self.0.with(|c| {
+            let before = c.get();
+            c.set(before + delta);
+            before
+        })
+    }
+}
+
+std::thread_local! {
+    static FAIL_ALLOC_CELL: Cell<bool> = const { Cell::new(false) };
+    static MISALIGN_ALLOC_CELL: Cell<bool> = const { Cell::new(false) };
+    static POISON_ALLOC_CELL: Cell<bool> = const { Cell::new(false) };
+    static FAIL_MARK_CELL: Cell<bool> = const { Cell::new(false) };
+    static FAIL_VERIFY_CELL: Cell<bool> = const { Cell::new(false) };
+    static FAIL_ALLOC_AFTER_CELL: Cell<usize> = const { Cell::new(usize::MAX) };
+    static ALLOC_CALLS_CELL: Cell<usize> = const { Cell::new(0) };
+    static ALLOC_PAGES_CELL: Cell<usize> = const { Cell::new(0) };
+    static DEALLOC_CALLS_CELL: Cell<usize> = const { Cell::new(0) };
+    static DEALLOC_PAGES_CELL: Cell<usize> = const { Cell::new(0) };
+    static MARK_CALLS_CELL: Cell<usize> = const { Cell::new(0) };
+    static VERIFY_CALLS_CELL: Cell<usize> = const { Cell::new(0) };
+}
+
 /// `drivers_dma_alloc` answers 0 (out of memory).
-pub static FAIL_ALLOC: AtomicBool = AtomicBool::new(false);
+pub static FAIL_ALLOC: ThreadFlag = ThreadFlag(&FAIL_ALLOC_CELL);
 /// `drivers_dma_alloc` answers an address that is not page-aligned.
-pub static MISALIGN_ALLOC: AtomicBool = AtomicBool::new(false);
+pub static MISALIGN_ALLOC: ThreadFlag = ThreadFlag(&MISALIGN_ALLOC_CELL);
 /// `drivers_dma_alloc` hands back dirty memory instead of zeroes, which is what
 /// recycled frames actually look like.
-pub static POISON_ALLOC: AtomicBool = AtomicBool::new(false);
+pub static POISON_ALLOC: ThreadFlag = ThreadFlag(&POISON_ALLOC_CELL);
 /// `drivers_dma_mark_uncached` fails.
-pub static FAIL_MARK: AtomicBool = AtomicBool::new(false);
+pub static FAIL_MARK: ThreadFlag = ThreadFlag(&FAIL_MARK_CELL);
 /// `drivers_dma_verify_uncached` fails -- the interesting one, because it fails
 /// AFTER the pages have already been remapped.
-pub static FAIL_VERIFY: AtomicBool = AtomicBool::new(false);
+pub static FAIL_VERIFY: ThreadFlag = ThreadFlag(&FAIL_VERIFY_CELL);
 
 /// `drivers_dma_alloc` answers 0 once this many calls have already been made,
 /// so a caller that takes several regions can be failed on the *third* one --
 /// which is the only way to reach the path that gives the first two back.
 /// `usize::MAX` (the default) never fails.
-pub static FAIL_ALLOC_AFTER: AtomicUsize = AtomicUsize::new(usize::MAX);
+pub static FAIL_ALLOC_AFTER: ThreadCount = ThreadCount(&FAIL_ALLOC_AFTER_CELL);
 
-pub static ALLOC_CALLS: AtomicUsize = AtomicUsize::new(0);
+pub static ALLOC_CALLS: ThreadCount = ThreadCount(&ALLOC_CALLS_CELL);
 /// Pages asked for, summed. `ALLOC_CALLS` counts the calls; this is what they
 /// asked for, which is where a byte length rounded the wrong way shows up.
-pub static ALLOC_PAGES: AtomicUsize = AtomicUsize::new(0);
-pub static DEALLOC_CALLS: AtomicUsize = AtomicUsize::new(0);
-pub static DEALLOC_PAGES: AtomicUsize = AtomicUsize::new(0);
-pub static MARK_CALLS: AtomicUsize = AtomicUsize::new(0);
-pub static VERIFY_CALLS: AtomicUsize = AtomicUsize::new(0);
+pub static ALLOC_PAGES: ThreadCount = ThreadCount(&ALLOC_PAGES_CELL);
+pub static DEALLOC_CALLS: ThreadCount = ThreadCount(&DEALLOC_CALLS_CELL);
+pub static DEALLOC_PAGES: ThreadCount = ThreadCount(&DEALLOC_PAGES_CELL);
+pub static MARK_CALLS: ThreadCount = ThreadCount(&MARK_CALLS_CELL);
+pub static VERIFY_CALLS: ThreadCount = ThreadCount(&VERIFY_CALLS_CELL);
+
+/// Run `body` with every switch and counter of *this thread* reset on both
+/// sides of it.
+///
+/// There is no lock, and that is the point. Each module that needed this used to
+/// keep its own `static TURNSTILE` inside its own test module, and three private
+/// mutexes over one set of process-wide counters guard nothing: the tests that
+/// perturbed the counters were in modules holding a different lock, or no lock
+/// at all. At `--test-threads=16` this suite failed about two runs in three,
+/// and CI passing `--test-threads=1` is what hid it -- while all three copies
+/// carried a comment claiming they did not rely on that.
+///
+/// The state is per-thread now, so the isolation is real and costs no
+/// serialisation. One definition, here, beside what it resets.
+pub fn alone_with_the_allocator<R>(body: impl FnOnce() -> R) -> R {
+    reset();
+    let out = body();
+    reset();
+    out
+}
 
 /// Put every switch back to its default and zero every counter.
 pub fn reset() {
