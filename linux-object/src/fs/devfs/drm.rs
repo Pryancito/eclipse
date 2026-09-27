@@ -1312,6 +1312,35 @@ const MAX_PROBE_REPORTS: u32 = 12;
 /// would let a torn boot spend it before the static case was ever described.
 static ZERO_REPORTS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
+/// Source reads split by their answer, because the two answers are worth very
+/// different amounts and one shared budget spent it all on the cheap one.
+///
+/// Measured on Moebius's boot: of the ten source lines the budget paid for,
+/// eight said "not one sampled pixel is 0x00000000" and the budget was gone
+/// 27.2 s in -- long before the menu whose black rectangle the flag exists to
+/// explain was ever opened. The tenth "no black in the source" says nothing the
+/// first did not; a frame that DOES carry black is a new fact every time,
+/// because its box is where to look on screen.
+///
+/// So: the clean answer gets [`MAX_CLEAN_SOURCE_REPORTS`] as a baseline, and the
+/// frames that carry black keep the full [`MAX_PROBE_REPORTS`]. Both still count
+/// every read, the same convention as [`PROBE_REPORTS`].
+static ZERO_FOUND_REPORTS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static ZERO_CLEAN_REPORTS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// One baseline line for "the source carried no black at all". See
+/// [`ZERO_CLEAN_REPORTS`] for why it is not twelve.
+const MAX_CLEAN_SOURCE_REPORTS: u32 = 1;
+
+/// Source lines actually WRITTEN, per kind. The occurrence counters above keep
+/// counting long after the budget stops the lines, so they cannot tell a test
+/// whether the split budget is really doing its job -- and the whole point of
+/// the split is which lines get written once the cheap answer has had its turn.
+#[cfg(test)]
+static CLEAN_SOURCE_LINES: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+#[cfg(test)]
+static BLACK_SOURCE_LINES: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
 /// How many probe mismatches this process has seen, so an end-to-end test can
 /// assert that a settled buffer produced none.
 #[cfg(test)]
@@ -1335,6 +1364,26 @@ pub(crate) fn zero_reports_for_test() -> u32 {
 
 /// How many of each kind of probe line get written before the budget cuts them
 /// off. For the range assertion above.
+/// How many source lines of each kind were actually written. These are what say
+/// whether the split budget works, because the occurrence counters keep counting
+/// after the lines stop.
+#[cfg(test)]
+pub(crate) fn clean_source_lines_for_test() -> u32 {
+    CLEAN_SOURCE_LINES.load(Ordering::Relaxed)
+}
+
+#[cfg(test)]
+pub(crate) fn black_source_lines_for_test() -> u32 {
+    BLACK_SOURCE_LINES.load(Ordering::Relaxed)
+}
+
+/// The baseline budget for "no black in the source". One; see
+/// [`ZERO_CLEAN_REPORTS`].
+#[cfg(test)]
+pub(crate) fn clean_source_report_budget_for_test() -> u32 {
+    MAX_CLEAN_SOURCE_REPORTS
+}
+
 #[cfg(test)]
 pub(crate) fn probe_report_budget_for_test() -> u32 {
     MAX_PROBE_REPORTS
@@ -1349,10 +1398,14 @@ pub(crate) fn probe_report_budget_for_test() -> u32 {
 /// plain `+ 1` panics the kernel from inside a diagnostic. A probe that brings
 /// the machine down is worse than no probe.
 fn probe_report_decision(already: u32) -> (bool, bool) {
-    (
-        already < MAX_PROBE_REPORTS,
-        already.saturating_add(1) == MAX_PROBE_REPORTS,
-    )
+    report_decision(already, MAX_PROBE_REPORTS)
+}
+
+/// [`probe_report_decision`] against any budget, so the two source answers can
+/// have their own without duplicating the saturating arithmetic that keeps a
+/// diagnostic from panicking the kernel.
+fn report_decision(already: u32, budget: u32) -> (bool, bool) {
+    (already < budget, already.saturating_add(1) == budget)
 }
 
 /// The render fences a legacy present on `fb_id` has to wait for, each as
@@ -3656,47 +3709,71 @@ pub fn scanout_region_checked(
             // neither.
             {
                 let z = before.zero;
-                let n = ZERO_REPORTS.fetch_add(1, Ordering::Relaxed);
-                let (report, last) = probe_report_decision(n);
-                if report {
-                    match z.bbox() {
-                        Some((zx, zy, zw, zh)) => kernel_hal::klog_info!(
-                            "[drm] present source: fb {} window {}x{}+{}+{} -- {} of {} sampled \
-                             pixels are already 0x00000000 in the buffer the client handed over, \
-                             inside {}x{}+{}+{} of the window{}",
-                            fb_id,
-                            blit_w,
-                            blit_h,
-                            blit_x,
-                            blit_y,
-                            z.zeros,
-                            z.sampled,
-                            zw,
-                            zh,
-                            zx,
-                            zy,
-                            if last {
-                                " (further source reports will not be made)"
-                            } else {
-                                ""
-                            }
-                        ),
-                        None => kernel_hal::klog_info!(
-                            "[drm] present source: fb {} window {}x{}+{}+{} -- not one of {} \
-                             sampled pixels is 0x00000000, so any black on screen was NOT handed \
-                             over black{}",
-                            fb_id,
-                            blit_w,
-                            blit_h,
-                            blit_x,
-                            blit_y,
-                            z.sampled,
-                            if last {
-                                " (further source reports will not be made)"
-                            } else {
-                                ""
-                            }
-                        ),
+                // Every read counts here, both answers, so this stays the
+                // "how many reads happened" number it always was.
+                ZERO_REPORTS.fetch_add(1, Ordering::Relaxed);
+                match z.bbox() {
+                    // The frame carries black: a new fact every time, because
+                    // its box says where on screen to look. Full budget.
+                    Some((zx, zy, zw, zh)) => {
+                        let n = ZERO_FOUND_REPORTS.fetch_add(1, Ordering::Relaxed);
+                        let (report, last) = report_decision(n, MAX_PROBE_REPORTS);
+                        if report {
+                            #[cfg(test)]
+                            BLACK_SOURCE_LINES.fetch_add(1, Ordering::Relaxed);
+                            kernel_hal::klog_info!(
+                                "[drm] present source: fb {} window {}x{}+{}+{} -- {} of {} \
+                                 sampled pixels are already 0x00000000 in the buffer the client \
+                                 handed over, inside {}x{}+{}+{} of the window{}",
+                                fb_id,
+                                blit_w,
+                                blit_h,
+                                blit_x,
+                                blit_y,
+                                z.zeros,
+                                z.sampled,
+                                zw,
+                                zh,
+                                zx,
+                                zy,
+                                if last {
+                                    " (further source reports will not be made)"
+                                } else {
+                                    ""
+                                }
+                            );
+                        }
+                    }
+                    // No black anywhere in the source. Worth saying once, and
+                    // then it is the same sentence about a different frame.
+                    None => {
+                        let n = ZERO_CLEAN_REPORTS.fetch_add(1, Ordering::Relaxed);
+                        let (report, last) = report_decision(n, MAX_CLEAN_SOURCE_REPORTS);
+                        if report {
+                            #[cfg(test)]
+                            CLEAN_SOURCE_LINES.fetch_add(1, Ordering::Relaxed);
+                            kernel_hal::klog_info!(
+                                "[drm] present source: fb {} window {}x{}+{}+{} -- not one of {} \
+                                 sampled pixels is 0x00000000, so any black on screen was NOT \
+                                 handed over black{}",
+                                fb_id,
+                                blit_w,
+                                blit_h,
+                                blit_x,
+                                blit_y,
+                                z.sampled,
+                                // NOT "no further source reports": the frames
+                                // that carry black keep their own budget, and a
+                                // reader who is told the reporting stopped here
+                                // stops waiting for the line that matters.
+                                if last {
+                                    " (further black-free frames will not be reported; frames \
+                                     that DO carry black still will)"
+                                } else {
+                                    ""
+                                }
+                            );
+                        }
                     }
                 }
             }
@@ -6448,6 +6525,13 @@ pub(crate) fn reset_output_state_for_test() {
     REPAIR_ROUNDS_RUN.store(0, Ordering::Relaxed);
     PROBE_REPORTS.store(0, Ordering::Relaxed);
     ZERO_REPORTS.store(0, Ordering::Relaxed);
+    // The split source budgets leak across tests exactly like the shared one
+    // did: a test that spends the one clean line would leave the next test
+    // asserting about a line the budget had already refused.
+    ZERO_FOUND_REPORTS.store(0, Ordering::Relaxed);
+    ZERO_CLEAN_REPORTS.store(0, Ordering::Relaxed);
+    CLEAN_SOURCE_LINES.store(0, Ordering::Relaxed);
+    BLACK_SOURCE_LINES.store(0, Ordering::Relaxed);
     // A leaked `PANEL_FB` makes a later test's damage box either honoured or
     // promoted for a reason that has nothing to do with what it is testing --
     // and the ids the tests pick collide freely, so it would sometimes match.

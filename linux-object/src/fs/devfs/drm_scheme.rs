@@ -7220,6 +7220,84 @@ mod kms_scanout_tests {
         );
     }
 
+    /// "Not one sampled pixel is black" is worth saying once. On Moebius's boot
+    /// it got said eight times and the budget was gone 27.2 s in, before the menu
+    /// whose black rectangle the flag exists to explain had been opened at all.
+    #[test]
+    fn a_source_with_no_black_is_described_once_and_then_stops() {
+        let _screen = kms_emu::attach(64, 64);
+        drm::set_present_probe_enabled(true);
+        let c = Client::open(0);
+        let buf = c.create_dumb(64, 64);
+        // Not one zero pixel anywhere: `tag` is seeded from a non-zero base, so
+        // every pixel is opaque and distinct.
+        paint(&buf, |x, y| tag(0x0055_0000, x, y));
+        let fb = c.addfb2(&buf);
+
+        for i in 0..4 {
+            c.page_flip(drm::SYNTH_CRTC_ID, fb, 0x4400 + i)
+                .expect("flip");
+        }
+
+        assert_eq!(
+            drm::zero_reports_for_test(),
+            4,
+            "every present still reads the source -- the budget cuts the lines, \
+             not the reads"
+        );
+        assert_eq!(
+            drm::clean_source_lines_for_test(),
+            drm::clean_source_report_budget_for_test(),
+            "four black-free frames say the same sentence, so only the baseline \
+             line gets written"
+        );
+    }
+
+    /// And the point of the split: the cheap answer cannot eat the budget the
+    /// deciding frames need. This is Moebius's boot in miniature -- a long
+    /// black-free run first, and THEN the frame that carries black.
+    #[test]
+    fn a_frame_that_carries_black_is_still_reported_after_a_long_black_free_run() {
+        let _screen = kms_emu::attach(64, 64);
+        drm::set_present_probe_enabled(true);
+        let c = Client::open(0);
+
+        let clean = c.create_dumb(64, 64);
+        paint(&clean, |x, y| tag(0x0055_0000, x, y));
+        let clean_fb = c.addfb2(&clean);
+        // More than the whole shared budget, which is what makes this test bite:
+        // with one budget between the two answers these presents spend it and the
+        // frame below gets no line.
+        let run = drm::probe_report_budget_for_test() + 2;
+        for i in 0..run {
+            c.page_flip(drm::SYNTH_CRTC_ID, clean_fb, 0x5500 + u64::from(i))
+                .expect("flip");
+        }
+        assert_eq!(
+            drm::black_source_lines_for_test(),
+            0,
+            "no frame carried black yet, so that budget is untouched"
+        );
+
+        // Now the frame that decides: a black region the compositor handed over.
+        let black = c.create_dumb(64, 64);
+        paint(
+            &black,
+            |x, y| if x < 32 { tag(0x0066_0000, x, y) } else { 0 },
+        );
+        let black_fb = c.addfb2(&black);
+        c.page_flip(drm::SYNTH_CRTC_ID, black_fb, 0x6666)
+            .expect("flip");
+
+        assert_eq!(
+            drm::black_source_lines_for_test(),
+            1,
+            "the frame that carries black has to get its line even after a long \
+             black-free run -- that run is exactly what spent the shared budget \
+             on Moebius's boot"
+        );
+    }
+
     /// The repair is one more writer that goes around the band skip, so it has to
     /// make the skip forget -- the same rule the cursor, a damage box, a blank, a
     /// VT and the copy engine all follow.
