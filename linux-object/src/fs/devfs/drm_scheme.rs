@@ -1500,11 +1500,30 @@ impl DrmDev {
                 // and `drm_framebuffer_lookup` in that order. The CRTC id was
                 // never read, so a flip aimed at a CRTC the card does not have
                 // landed on the one it has.
-                if drm::get_crtc(flip.crtc_id).is_none() {
+                let Some(crtc) = drm::get_crtc(flip.crtc_id) else {
                     return Err(FsError::EntryNotFound);
+                };
+                let Some(fb) = drm::get_fb(flip.fb_id) else {
+                    return Err(FsError::EntryNotFound);
+                };
+                // Then `drm_crtc_check_viewport(crtc, crtc->x, crtc->y,
+                // &crtc->mode, fb)`: the CRTC's mode has to fit in the new
+                // fb (ENOSPC), and "page flip is not allowed to change frame
+                // buffer format" (EINVAL). Neither was read: a flip onto an
+                // fb smaller than the mode, or of another format, went to
+                // the scanout as if it were the frame the CRTC was set up
+                // with. (Linux also refuses a flip on a CRTC with no fb,
+                // EBUSY; this tree's flip is also its present, so a client
+                // is allowed to start with one, as the GL sequence does.)
+                if let Some((w, h, _)) = drm::display_mode() {
+                    if fb.width < w || fb.height < h {
+                        return Err(FsError::NoDeviceSpace);
+                    }
                 }
-                if drm::get_fb(flip.fb_id).is_none() {
-                    return Err(FsError::EntryNotFound);
+                if let Some(old) = drm::get_fb(crtc.fb_id) {
+                    if old.pixel_format != fb.pixel_format {
+                        return Err(FsError::InvalidParam);
+                    }
                 }
                 let want_event = flip.flags & DRM_MODE_PAGE_FLIP_EVENT != 0;
                 match drm::page_flip(
@@ -10254,9 +10273,14 @@ mod kms_scanout_tests {
         // The narrow present composites the pointer again, and this is where the
         // window used to shrink.
         paint(&small, |x, y| desktop_px(2, x, y));
-        c.page_flip(drm::SYNTH_CRTC_ID, fb_small, 1)
-            .expect("flip the narrow framebuffer");
-        drain_completions(&c);
+        // A flip onto a framebuffer the mode does not fit in is ENOSPC
+        // (`drm_mode_page_flip_ioctl`, like `SETCRTC` in
+        // `a_framebuffer_smaller_than_the_mode_leaves_the_rest_of_the_screen_alone`),
+        // so the narrow scanout is reached the way the kernel's own callers
+        // reach it, and the CRTC is left holding the fb as the flip did.
+        drm::present_now_checked(fb_small, drm::SYNTH_CRTC_ID, None)
+            .expect("present the narrow framebuffer");
+        drm::set_crtc_fb(drm::SYNTH_CRTC_ID, fb_small);
         panel.present_box(2, 0, 0, SMALL_W, SMALL_H);
         panel.check(&screen, "frame 2 from the narrow framebuffer");
         assert!(
@@ -10588,9 +10612,12 @@ mod kms_scanout_tests {
                     frame += 1;
                     let f = frame;
                     paint(&small, |x, y| desktop_px(f, x, y));
-                    c.page_flip(drm::SYNTH_CRTC_ID, fb_small, step as u64)
-                        .expect("flip");
-                    drain_completions(&c);
+                    // A flip onto it is ENOSPC (the mode does not fit), so the
+                    // present is made the way the kernel's own callers make it
+                    // and the CRTC is left holding the fb as the flip did.
+                    drm::present_now_checked(fb_small, drm::SYNTH_CRTC_ID, None)
+                        .expect("present the narrow framebuffer");
+                    drm::set_crtc_fb(drm::SYNTH_CRTC_ID, fb_small);
                     model.present_box(frame, 0, 0, SMALL_W, SMALL_H);
                     // The panel does not hold this framebuffer entirely -- only
                     // its top-left corner -- so no damage box on it may be
@@ -12401,6 +12428,95 @@ mod hw_kms_tests {
 
         c.rmfb(fb).expect("RMFB");
         c.destroy_dumb(buf.handle).expect("DESTROY_DUMB");
+    }
+
+    /// `drm_mode_page_flip_ioctl`, once the CRTC and the fb are found: the
+    /// CRTC's mode has to fit in the new fb (`drm_crtc_check_viewport`,
+    /// ENOSPC), and "page flip is not allowed to change frame buffer format"
+    /// (EINVAL). Neither was read: a flip onto an fb narrower than the mode,
+    /// or of another format, was scanned out as the frame the CRTC was set
+    /// up with, and the client was told it had flipped.
+    #[test]
+    fn page_flip_wants_an_fb_that_holds_the_mode_and_keeps_the_format() {
+        let _screen = kms_emu::attach(32, 8);
+        let c = Client::open(0);
+        let (crtcs, _) = topology(&c);
+        let crtc = crtcs[0];
+        let xr24 = c.create_dumb(32, 8);
+        paint(&xr24, 0x0000_5555);
+        let fb_xr24 = c.addfb2(&xr24);
+        set_crtc(&c, crtc, fb_xr24, 32, 8);
+        assert_eq!(get_crtc_fb(&c, crtc), fb_xr24);
+
+        let addfb2 = |buf: &DrmModeCreateDumb, pixel_format: u32| {
+            let mut cmd = DrmModeFbCmd2 {
+                fb_id: 0,
+                width: buf.width,
+                height: buf.height,
+                pixel_format,
+                flags: 0,
+                handles: [buf.handle, 0, 0, 0],
+                pitches: [buf.pitch, 0, 0, 0],
+                offsets: [0; 4],
+                modifier: [0; 4],
+            };
+            c.ioctl(DRM_IOCTL_MODE_ADDFB2, &mut cmd).expect("ADDFB2");
+            cmd.fb_id
+        };
+        let narrow = c.create_dumb(16, 8);
+        let fb_narrow = addfb2(&narrow, drm::DRM_FORMAT_XRGB8888);
+        let short = c.create_dumb(32, 4);
+        let fb_short = addfb2(&short, drm::DRM_FORMAT_XRGB8888);
+        let ar24 = c.create_dumb(32, 8);
+        paint(&ar24, 0xff00_6666);
+        let fb_ar24 = addfb2(&ar24, drm::DRM_FORMAT_ARGB8888);
+        let ar24_too = c.create_dumb(32, 8);
+        let fb_ar24_too = addfb2(&ar24_too, drm::DRM_FORMAT_ARGB8888);
+
+        assert_eq!(
+            c.page_flip(crtc, fb_narrow, 1),
+            Err(FsError::NoDeviceSpace),
+            "narrower than the mode"
+        );
+        assert_eq!(
+            c.page_flip(crtc, fb_short, 2),
+            Err(FsError::NoDeviceSpace),
+            "shorter than the mode"
+        );
+        assert_eq!(
+            c.page_flip(crtc, fb_ar24, 3),
+            Err(FsError::InvalidParam),
+            "XRGB8888 on the CRTC, ARGB8888 flipped"
+        );
+        assert_eq!(
+            get_crtc_fb(&c, crtc),
+            fb_xr24,
+            "a refused flip presented anyway"
+        );
+        let mut events = [0u8; 256];
+        assert!(
+            matches!(c.read_events(&mut events), Err(_) | Ok(0)),
+            "a refused flip queued a completion"
+        );
+
+        // A modeset may change the format; a flip may then keep the new one.
+        set_crtc(&c, crtc, fb_ar24, 32, 8);
+        assert_eq!(
+            c.page_flip(crtc, fb_xr24, 4),
+            Err(FsError::InvalidParam),
+            "ARGB8888 on the CRTC, XRGB8888 flipped"
+        );
+        assert_eq!(c.page_flip(crtc, fb_ar24_too, 5), Ok(0));
+        drm::flush_pending_flip_completions();
+        assert_eq!(get_crtc_fb(&c, crtc), fb_ar24_too);
+        let _ = c.read_events(&mut events);
+
+        for fb in [fb_xr24, fb_narrow, fb_short, fb_ar24, fb_ar24_too] {
+            c.rmfb(fb).expect("RMFB");
+        }
+        for buf in [&xr24, &narrow, &short, &ar24, &ar24_too] {
+            c.destroy_dumb(buf.handle).expect("DESTROY_DUMB");
+        }
     }
 
     /// With a mode, `drm_mode_setcrtc` looks the fb up (ENOENT; -1 is the
