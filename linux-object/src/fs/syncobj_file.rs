@@ -136,11 +136,13 @@ impl SyncobjHandle {
     ///
     /// `None` for a sync_file fd (a fence, not an object; the caller reports
     /// the flag mismatch) or a syncobj that no longer exists.
-    pub fn import_opaque(&self) -> Option<u32> {
+    pub fn import_opaque(&self, pid: u64) -> Option<u32> {
         if self.sync_file_point.is_some() {
             return None;
         }
-        if !zcore_drivers::scheme::syncobj::add_ref(self.handle) {
+        // The importing process holds the new reference: given back when it
+        // dies, and its to `DESTROY` (the exporter's reference stays).
+        if !zcore_drivers::scheme::syncobj::add_ref_for(pid, self.handle) {
             return None;
         }
         Some(self.handle)
@@ -403,7 +405,7 @@ mod sync_file_poll_tests {
         assert!(zcore_drivers::scheme::syncobj::add_ref(handle));
         let fd = SyncobjHandle::new(handle);
         // FD_TO_HANDLE in the importing process, then close(fd).
-        let imported = fd.import_opaque().expect("a live syncobj imports");
+        let imported = fd.import_opaque(0).expect("a live syncobj imports");
         assert_eq!(imported, handle, "the handle space is global");
         drop(fd);
         // xcb_dri3_free_syncobj -> drmSyncobjDestroy in the importer.
@@ -426,7 +428,7 @@ mod sync_file_poll_tests {
         let handle = zcore_drivers::scheme::syncobj::create(false);
         assert!(zcore_drivers::scheme::syncobj::add_ref(handle));
         let fd = SyncobjHandle::new(handle);
-        let imported = fd.import_opaque().expect("a live syncobj imports");
+        let imported = fd.import_opaque(0).expect("a live syncobj imports");
         drop(fd);
         assert!(zcore_drivers::scheme::syncobj::destroy(imported));
         assert_eq!(
@@ -445,7 +447,7 @@ mod sync_file_poll_tests {
         let handle = zcore_drivers::scheme::syncobj::create(false);
         assert!(zcore_drivers::scheme::syncobj::add_ref(handle));
         let fd = SyncobjHandle::new_sync_file(handle, 1);
-        assert!(fd.import_opaque().is_none());
+        assert!(fd.import_opaque(0).is_none());
         drop(fd);
         assert!(zcore_drivers::scheme::syncobj::destroy(handle));
         assert_eq!(zcore_drivers::scheme::syncobj::query(handle), None);

@@ -5982,6 +5982,16 @@ pub fn release_process(pid: u64) -> usize {
     // close; DROP_MASTER deliberately no longer cancels events -- see
     // cancel_pending_events.)
     cancel_events_for_exit(pid);
+    // Its syncobjs too (Linux: `drm_syncobj_release` when the file closes):
+    // a crashed client's stayed in the table for the rest of the boot.
+    let syncobjs = zcore_drivers::scheme::syncobj::release_owner(pid);
+    if syncobjs > 0 {
+        log::info!(
+            "[drm] pid={} exit: gave back {} syncobj reference(s)",
+            pid,
+            syncobjs
+        );
+    }
     // Driver-private (nouveau `GEM_NEW`) framebuffers first, and BEFORE the
     // early return below: `nouveau_release_process`, which runs right after
     // this hook, drops everything the pid held, so a framebuffer of its own
@@ -6528,6 +6538,28 @@ mod release_tests {
 
         assert_eq!(release_process(77_002), 1);
         assert!(!live_ids().contains(&9003));
+    }
+
+    #[test]
+    fn process_exit_gives_back_the_syncobjs_it_still_held() {
+        let _serialised = super::test_globals::lock();
+        use zcore_drivers::scheme::syncobj;
+        // Linux frees a dying client's syncobj handles with its drm_file
+        // (`drm_syncobj_release`); here nothing did, so a crashed client's
+        // stayed in the table for the rest of the boot.
+        let mine = syncobj::create_for(77_004, false);
+        let shared = syncobj::create_for(77_005, false);
+        assert!(syncobj::add_ref_for(77_004, shared), "imported by 77_004");
+        let theirs = syncobj::create_for(77_005, true);
+        assert_eq!(release_process(77_004), 0, "no buffers to give back");
+        assert!(!syncobj::exists(mine), "freed with its owner");
+        assert!(syncobj::exists(shared), "77_005 still holds it");
+        assert!(!syncobj::held_by(77_004, shared));
+        assert!(syncobj::exists(theirs), "another process's survives");
+        assert_eq!(release_process(77_004), 0, "idempotent");
+        assert!(syncobj::destroy_for(77_005, shared));
+        assert!(syncobj::destroy_for(77_005, theirs));
+        assert!(!syncobj::exists(shared) && !syncobj::exists(theirs));
     }
 
     #[test]
