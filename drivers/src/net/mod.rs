@@ -122,9 +122,19 @@ pub fn pci_finish_msi_registrations() -> DeviceResult {
     Ok(())
 }
 
+// The RTL8211F PHY/GMAC pair only exists on the D1, so the glue that wires it
+// into the kernel (`rtlx`) is riscv64-only. The driver itself is opened to the
+// host test build as well: it is the largest file in the tree without a test,
+// and behind a bare `target_arch` gate no `cargo test` ever compiled a line of
+// it, so any test written for it would have been run by nobody.
+cfg_if::cfg_if! {
+    if #[cfg(any(target_arch = "riscv64", test))] {
+mod realtek;
+    }
+}
+
 cfg_if::cfg_if! {
     if #[cfg(target_arch = "riscv64")] {
-mod realtek;
 mod rtlx;
 
 pub use rtlx::*;
