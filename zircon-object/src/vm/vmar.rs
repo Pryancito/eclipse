@@ -367,7 +367,7 @@ mod aspace_window {
     /// Give a window back. `addr` is a root VMAR's base; anything that is not
     /// one of our windows is ignored.
     pub fn give_back(addr: usize, size: usize) {
-        if size != SIZE || addr < BASE || (addr - BASE) % SIZE != 0 {
+        if size != SIZE || addr < BASE || !(addr - BASE).is_multiple_of(SIZE) {
             return;
         }
         let i = (addr - BASE) / SIZE;
