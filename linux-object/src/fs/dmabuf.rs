@@ -749,7 +749,8 @@ mod sync_file_tests {
             "a sync_file, not a syncobj fd"
         );
         assert!(ready(&idle), "nothing to wait for: the stub fence");
-        assert_eq!(idle.flags(), OpenFlags::RDWR | OpenFlags::CLOEXEC);
+        // `get_unused_fd_flags(O_CLOEXEC)` on an anon inode opened with 0.
+        assert_eq!(idle.flags(), OpenFlags::RDONLY | OpenFlags::CLOEXEC);
 
         let reader = syncobj::create(false);
         let writer = syncobj::create(false);
