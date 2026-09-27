@@ -631,6 +631,18 @@ fn primary_main(config: kernel_hal::KernelConfig) {
             // sigue dibujando el buffer que acaba de presentar. Responde a una
             // sola pregunta -- si los pixeles ya venian mal -- y cuesta una
             // relectura por frame, asi que no se deja puesto.
+            // Escotilla de salida, apagada: el puntero vuelve a leer el buffer
+            // del cliente para saber lo que tapa, que es de donde salian los
+            // rectangulos negros al abrir un menu. Solo tiene sentido si el
+            // arreglo -- leer el panel -- sale caro en la apertura de verdad y el
+            // puntero se arrastra; aqui no hay apertura que medir.
+            if kernel_hal::cmdline::flag(&options.cmdline, "drm.cursor_from_client") {
+                linux_object::fs::devfs::drm::set_cursor_from_client(true);
+                klog_info!(
+                    "Eclipse: drm.cursor_from_client ON -- el puntero lee nada mas el buffer \
+                     del cliente, asi que los rectangulos negros de los menus vuelven"
+                );
+            }
             if kernel_hal::cmdline::flag(&options.cmdline, "drm.present_probe") {
                 linux_object::fs::devfs::drm::set_present_probe_enabled(true);
                 klog_info!(

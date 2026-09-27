@@ -378,6 +378,12 @@ pub fn set_crtc_blanked(on: bool) {
         // that un-blanks honours its damage box and leaves a black screen with
         // one rectangle of desktop in it. See [`PANEL_FB`].
         set_panel_fb(0);
+        // Nor is the pointer covering anything any more: this just painted over
+        // whatever it was. Un-blanking normally puts a whole frame up before the
+        // pointer moves again, but it does not have to -- a DPMS write on its own
+        // un-blanks -- and restoring the save then would put one rectangle of the
+        // old desktop on a black screen. See [`CursorUnder`].
+        forget_cursor_under();
         kernel_hal::klog_info!("[drm] CRTC off: panel blanked");
     } else {
         kernel_hal::klog_info!("[drm] CRTC on");
@@ -608,6 +614,33 @@ pub fn flip_fence_enabled() -> bool {
 /// run of frames with no mismatch means the buffer was settled and the defect
 /// is somewhere the kernel can be held responsible for.
 static PRESENT_PROBE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Whether the software pointer takes the scene it is drawn over from the
+/// CLIENT's framebuffer instead of from the panel (`drm.cursor_from_client` on
+/// the cmdline). OFF by default, and the black rectangles come back with it on.
+///
+/// This is an escape hatch for a cost that cannot be measured from here, and not
+/// a choice worth making. Reading the panel is the fix -- see [`CursorUnder`] --
+/// and it puts one read of a ~64x64 window of the display aperture on the pointer
+/// path, where there was none before. Writes to that aperture run at about
+/// 42 MB/s on Moebius's RTX 2060 Supers; reads of it have never been measured,
+/// there is no aperture in QEMU to measure them in, and an aperture read can be
+/// several times slower than a write. If that shows up as a pointer that drags,
+/// this puts the old path back so the machine is usable while a better source for
+/// the scene is found.
+static CURSOR_FROM_CLIENT: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Make the software pointer read the client's framebuffer again, black
+/// rectangles and all. See [`CURSOR_FROM_CLIENT`].
+pub fn set_cursor_from_client(on: bool) {
+    CURSOR_FROM_CLIENT.store(on, Ordering::Relaxed);
+}
+
+/// Whether the pointer is reading the client's framebuffer for this boot.
+pub fn cursor_from_client() -> bool {
+    CURSOR_FROM_CLIENT.load(Ordering::Relaxed)
+}
 
 /// Turn the present probe on (or back off) for this boot.
 pub fn set_present_probe_enabled(on: bool) {
@@ -1756,10 +1789,58 @@ struct CursorState {
     hw: bool,
 }
 
+/// What the software pointer is covering on the panel, kept so it can be put
+/// back without asking the client's framebuffer what used to be there.
+///
+/// That question is where the black rectangles came from. Our software-KMS
+/// present COPIES the client's buffer into the panel and completes the flip, so
+/// the compositor is free to start the next frame in that same buffer -- and a
+/// renderer opens a frame by clearing to transparent black. `repaint_for_cursor`
+/// then went back and read that buffer to erase and redraw its two ~64x64
+/// windows, and pasted a piece of a half-drawn frame into the frame that was on
+/// the screen: a black rectangle, right where the pointer was, appearing exactly
+/// when something new was being drawn. Which is why it showed up on menus and
+/// popups and why labwc and lunarbar were never at fault -- they were drawing
+/// into a buffer that is theirs to draw into.
+///
+/// The panel, by contrast, is the kernel's own. Whatever is on it is what the
+/// user is looking at, so reading it back can never produce a frame nobody
+/// asked for. Reproduced with no GPU by
+/// `a_pointer_move_must_not_paste_the_frame_the_compositor_is_still_drawing`.
+struct CursorUnder {
+    /// The window on the panel these pixels came from, and the one they go back
+    /// to: already clipped and widened exactly as the blit that drew the pointer
+    /// was. Restoring a narrower window would leave the pointer's widened
+    /// margins on the screen for good.
+    rect: Option<(u32, u32, u32, u32)>,
+    /// `rect`'s pixels, `rect.2` of them per row.
+    px: Vec<u32>,
+    /// The cursor rect this was saved for, as `CursorState::drawn` records it.
+    ///
+    /// The save describes the panel only while nothing else has repainted it, and
+    /// most of the things that do -- a driver flip, the display engine's plane
+    /// taking the pointer over, a full present with no pointer to draw -- reset
+    /// `drawn` as part of doing it. Comparing against it costs those places no new
+    /// bookkeeping and stops a future one from forgetting: a `drawn` that has
+    /// moved on says the save is stale, whoever moved it.
+    ///
+    /// It is a second line of defence and not the whole of it. Blanking repaints
+    /// the panel and leaves `drawn` alone, so `set_crtc_blanked` says so itself --
+    /// which is what the test named after it holds in place.
+    for_cursor: Option<(i32, i32, u32, u32)>,
+}
+
 lazy_static::lazy_static! {
     /// Reused compose buffer for software-cursor patches (avoids a heap alloc
     /// on every pointer motion).
     static ref CURSOR_PATCH: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+    /// See [`CursorUnder`]. Locked AFTER [`CURSOR_PATCH`] wherever both are
+    /// held, which is the compose path in both directions.
+    static ref CURSOR_UNDER: Mutex<CursorUnder> = Mutex::new(CursorUnder {
+        rect: None,
+        px: Vec::new(),
+        for_cursor: None,
+    });
     static ref DRM_STATE: Mutex<DrmState> = Mutex::new(DrmState {
         drivers: Vec::new(),
         next_handle_id: 1,
@@ -4439,7 +4520,88 @@ fn composite_cursor_after_driver_flip(fb_id: u32) -> bool {
     true
 }
 
-/// Make a cursor set/move take effect immediately (the legacy cursor ioctls/// Make a cursor set/move take effect immediately (the legacy cursor ioctls
+/// Move the software pointer on the panel WITHOUT reading the client's
+/// framebuffer: erase it by putting back what it was covering, and draw it over
+/// what the panel itself holds at the new position.
+///
+/// This is the fix for the black rectangles. See [`CursorUnder`] for what went
+/// wrong and why the panel is the only honest source for a pointer move: the
+/// client's buffer stopped being the frame on screen the moment the compositor
+/// started the next one in it, which our present invites it to do.
+///
+/// Returns false, having touched nothing, when the panel cannot be read back --
+/// anything but ARGB8888, see [`DisplayScheme::read_into`] -- in which case the
+/// caller's older read-from-the-client path runs. That is what such a panel has
+/// today, and it is not one any machine this kernel runs on has: a UEFI GOP,
+/// virtio-gpu and an NVIDIA BAR1 aperture are all 32-bit.
+fn repaint_cursor_from_panel(
+    display: &dyn DisplayScheme,
+    old_drawn: Option<(i32, i32, u32, u32)>,
+    new: Option<(i32, i32, u32, u32, &[u32])>,
+) -> bool {
+    if cursor_from_client() || !display.fb_readable() {
+        return false;
+    }
+    // Take the pointer off the panel first, and only from the save: the panel at
+    // the old rect holds the pointer BLENDED over the scene, and an opaque
+    // pointer pixel cannot be un-blended. Erasing before reading is also what
+    // lets the draw below read the panel at all -- when the two rects overlap,
+    // reading first would capture the old pointer and blend the new one over it,
+    // baking a trail in.
+    {
+        let mut u = CURSOR_UNDER.lock();
+        // Only while `drawn` still describes what the save was taken for. See
+        // [`CursorUnder::for_cursor`].
+        if u.for_cursor == old_drawn {
+            if let Some((x, y, w, h)) = u.rect {
+                // `px` holds exactly `w * h` pixels, `w` per row: `save_cursor_under`
+                // wrote it from the window it is describing.
+                display.blit_from(x, y, &u.px, w as usize, w, h);
+            }
+        }
+        u.rect = None;
+        u.for_cursor = None;
+    }
+    let Some((cx, cy, cw, ch, bmp)) = new else {
+        return true;
+    };
+    let info = display.info();
+    // The window the blit will write: clipped to the panel and widened to the
+    // write-combining boundary. `read_into` clamps a window exactly as
+    // `blit_from` does, so what is read back is what will be written -- which is
+    // the property the restore above depends on.
+    let y0 = cy.max(0);
+    let y1 = (cy + ch as i32).min(info.height as i32);
+    let x0 = cx.max(0) as u32;
+    let x1 = (cx + cw as i32).max(0) as u32;
+    let (wx, ww) = expand_x_for_wc(x0, x1.saturating_sub(x0), info.pitch() / 4);
+    if y1 <= y0 || ww == 0 {
+        // Wholly off screen. Nothing is drawn and nothing is covered, which the
+        // erase above has already recorded.
+        return true;
+    }
+    let rows = (y1 - y0) as usize;
+    let tw = ww as usize;
+    let need = tw.saturating_mul(rows);
+    let mut slot = CURSOR_PATCH.lock();
+    if slot.len() < need {
+        slot.resize(need, 0);
+    }
+    let patch = &mut slot[..need];
+    if !display.read_into(wx, y0 as u32, patch, tw, ww, rows as u32) {
+        // The window is there but the panel would not give it up. Leave the
+        // pointer undrawn rather than compose over whatever the scratch buffer
+        // held from the last move, which is a stale square of an older frame --
+        // the same rule the `rows` bookkeeping in `blit_cursor_patch` follows.
+        return true;
+    }
+    save_cursor_under((wx, y0 as u32, tw, rows), patch, (cx, cy, cw, ch));
+    blend_cursor_into(patch, (wx as i32, y0, tw, rows), (cx, cy, cw, ch), bmp);
+    display.blit_from(wx, y0 as u32, patch, tw, ww, rows as u32);
+    true
+}
+
+/// Make a cursor set/move take effect immediately (the legacy cursor ioctls
 /// carry no page-flip of their own) WITHOUT re-blitting the whole frame.
 ///
 /// The pointer moves far more often than the scene changes — wlroots issues a
@@ -4523,13 +4685,24 @@ pub fn repaint_for_cursor() {
     if fb_id == 0 {
         return;
     }
+    let display = match primary_display() {
+        Some(d) => d,
+        None => return,
+    };
+    // The panel is the source, not the client's framebuffer. Everything below
+    // this point is the older path, kept only for a panel whose pixels cannot be
+    // read back -- see [`repaint_cursor_from_panel`], and [`CursorUnder`] for the
+    // black rectangles that reading the client's buffer here put on the screen.
+    if repaint_cursor_from_panel(
+        &*display,
+        old_rect,
+        new.as_ref().map(|(x, y, w, h, b)| (*x, *y, *w, *h, &**b)),
+    ) {
+        return;
+    }
     // Same lifetime guard as `scanout_region`: this blits with the lock dropped.
     let (fb, _backing) = match snapshot_fb_for_present(fb_id) {
         Some(v) => v,
-        None => return,
-    };
-    let display = match primary_display() {
-        Some(d) => d,
         None => return,
     };
     if fb.phys_addr == 0 || fb.size == 0 {
@@ -4723,12 +4896,64 @@ fn blit_cursor_patch(
         }
         rows = r + 1;
         patch[dst_off..dst_off + n].copy_from_slice(&pixels[src_off..src_off + n]);
+    }
+    if rows == 0 {
+        // Nothing was drawn, so nothing is covered. Said explicitly because a
+        // save left over from the previous position would otherwise be restored
+        // onto a panel this pointer is not on -- a stale square, which is the
+        // defect the `rows` bookkeeping above exists to avoid causing.
+        forget_cursor_under();
+        return;
+    }
+    // Save what the pointer is about to cover BEFORE blending it in, so the next
+    // move can put it back instead of asking the client's framebuffer what used
+    // to be there. See [`CursorUnder`].
+    //
+    // These are the panel's own pixels whatever the client did, and not because
+    // the buffer is trustworthy: the blit below writes this whole window to the
+    // panel, so the panel is MADE to hold what was just saved. On a pointer move,
+    // where nothing writes the window first, that guarantee is gone -- which is
+    // the whole difference between this path and `repaint_cursor_from_panel`.
+    save_cursor_under(
+        (x0 as u32, y0 as u32, tw, rows),
+        &patch[..rows * tw],
+        (cx, cy, cw, ch),
+    );
+    blend_cursor_into(patch, (x0, y0, tw, rows), (cx, cy, cw, ch), bmp);
+    display.blit_from(x0 as u32, y0 as u32, patch, tw, tw as u32, rows as u32);
+}
+
+/// Blend the pointer bitmap over `patch`, a `tw` x `rows` window of the scene
+/// whose top-left corner is at `(x0, y0)` on screen.
+///
+/// wlroots renders cursors with premultiplied alpha, so the operator is
+/// `out = src + dst * (255 - a) / 255`; fully transparent pixels are skipped and
+/// fully opaque ones are written without reading what they cover. One function
+/// and not two because the pointer is composited from two different sources --
+/// the frame a present is putting up, and the panel itself on a move -- and a
+/// blend written out twice is a blend that can disagree with itself.
+fn blend_cursor_into(
+    patch: &mut [u32],
+    window: (i32, i32, usize, usize),
+    cursor: (i32, i32, u32, u32),
+    bmp: &[u32],
+) {
+    let (x0, y0, tw, rows) = window;
+    let (cx, cy, cw, ch) = cursor;
+    // The contract, checked once rather than per pixel: both callers size the
+    // patch as `tw * rows` exactly, and a smaller one would have the blend run
+    // off the end of it.
+    if patch.len() < tw.saturating_mul(rows) {
+        return;
+    }
+    for r in 0..rows {
+        let dst_off = r * tw;
         let cr = (y0 + r as i32) - cy;
         if cr < 0 || cr >= ch as i32 {
             continue;
         }
         let bmp_row = cr as usize * cw as usize;
-        for c in 0..n {
+        for c in 0..tw {
             let cc = (x0 + c as i32) - cx;
             if cc < 0 || cc >= cw as i32 {
                 continue;
@@ -4757,10 +4982,24 @@ fn blit_cursor_patch(
             };
         }
     }
-    if rows == 0 {
-        return;
-    }
-    display.blit_from(x0 as u32, y0 as u32, patch, tw, tw as u32, rows as u32);
+}
+
+/// Remember `px` as the panel pixels the pointer at `cursor` is covering. See
+/// [`CursorUnder`].
+fn save_cursor_under(window: (u32, u32, usize, usize), px: &[u32], cursor: (i32, i32, u32, u32)) {
+    let (x, y, tw, rows) = window;
+    let mut u = CURSOR_UNDER.lock();
+    u.px.clear();
+    u.px.extend_from_slice(px);
+    u.rect = Some((x, y, tw as u32, rows as u32));
+    u.for_cursor = Some(cursor);
+}
+
+/// Forget the save, because the pointer is not on the panel where it described.
+fn forget_cursor_under() {
+    let mut u = CURSOR_UNDER.lock();
+    u.rect = None;
+    u.for_cursor = None;
 }
 
 /// Restore the `(x, y, w, h)` window of the display from the CRTC framebuffer
@@ -6600,6 +6839,7 @@ pub(crate) fn reset_output_state_for_test() {
     // twice and can put a line in the klog for a frame nobody was looking at.
     // Its report budget goes back too, or the last test to run finds it spent.
     set_present_probe_enabled(false);
+    set_cursor_from_client(false);
     set_present_repair_enabled(false);
     // `set_present_skip_enabled` resets the band state itself, which is what a
     // fresh boot looks like: nothing known about what the panel holds. A leaked
@@ -6617,6 +6857,9 @@ pub(crate) fn reset_output_state_for_test() {
     ZERO_FOUND_REPORTS.store(0, Ordering::Relaxed);
     ZERO_CLEAN_REPORTS.store(0, Ordering::Relaxed);
     ZERO_GREW_REPORTS.store(0, Ordering::Relaxed);
+    // A save left behind describes a panel the next test does not have, and the
+    // erase would put those pixels onto it.
+    forget_cursor_under();
     CLEAN_SOURCE_LINES.store(0, Ordering::Relaxed);
     BLACK_SOURCE_LINES.store(0, Ordering::Relaxed);
     GREW_SOURCE_LINES.store(0, Ordering::Relaxed);
