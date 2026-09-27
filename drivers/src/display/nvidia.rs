@@ -9703,6 +9703,14 @@ impl NvidiaGpu {
                 else {
                     return Err(nv::FastSubmitError::Gone);
                 };
+                // More entries than the ring has slots never fit, however
+                // long the GPU is given: spinning the 10 s below and then
+                // latching the channel WEDGED (what this did) turned a large
+                // submission into a dead context. EXEC budgets its ACQUIREs
+                // so it does not get here; anything else is the caller's.
+                if needed >= entries {
+                    return Err(nv::FastSubmitError::TooLarge { needed, entries });
+                }
                 if room {
                     let mut slot = put;
                     // Same-ctx wait fences: GPU ACQUIRE before user pushes so
@@ -9972,13 +9980,17 @@ impl NvidiaGpu {
     /// cannot be an ACQUIRE (no fast ctx, no published VA, mapping refused)
     /// the whole handle falls back to the CPU wait, which waits for every
     /// source anyway.
+    ///
+    /// The ACQUIREs come grouped by the wait they stand for, so the caller
+    /// can still send a whole wait to the CPU when its ACQUIREs would not
+    /// fit the ring ([`fit_acquires_to_ring`]).
     fn partition_exec_waits(
         &self,
         handles: &[u32],
         points: &[u64],
         ctx_idx: u32,
     ) -> (
-        alloc::vec::Vec<(u64, u32)>,
+        alloc::vec::Vec<(u32, u64, alloc::vec::Vec<(u64, u32)>)>,
         alloc::vec::Vec<u32>,
         alloc::vec::Vec<u64>,
     ) {
@@ -10013,10 +10025,47 @@ impl NvidiaGpu {
                 cpu_h.push(h);
                 cpu_p.push(point);
             } else {
-                acquires.extend(mine);
+                acquires.push((h, point, mine));
             }
         }
         (acquires, cpu_h, cpu_p)
+    }
+
+    /// Which of the grouped ACQUIREs from [`partition_exec_waits`] go into
+    /// the ring of `ctx_idx` (prepared by now) next to the `reserved` entries
+    /// the submission itself takes (its pushes and its fence), and which
+    /// waits go to the CPU lists instead. The ring holds `entries - 1`, and a
+    /// wait whose ACQUIREs would not leave room for the rest is waited for
+    /// on the CPU (correct either way: those fences are already queued ahead
+    /// on their channel; the CPU waits for them here instead of the GPU
+    /// there). Before this budget, NVK's batches of up to 256 waits and 64
+    /// pushes asked the ring for more slots than it has, and `fast_submit`
+    /// spun 10 s for room that could never come and latched the channel
+    /// WEDGED.
+    fn fit_acquires_to_ring(
+        &self,
+        ctx_idx: u32,
+        reserved: u32,
+        grouped: alloc::vec::Vec<(u32, u64, alloc::vec::Vec<(u64, u32)>)>,
+        cpu_h: &mut alloc::vec::Vec<u32>,
+        cpu_p: &mut alloc::vec::Vec<u64>,
+    ) -> alloc::vec::Vec<(u64, u32)> {
+        let budget = match self.nouveau_fast.lock().get(ctx_idx as usize) {
+            Some(FastSlot::Ready(f)) => {
+                f.entries.saturating_sub(1).saturating_sub(reserved) as usize
+            }
+            _ => 0,
+        };
+        let mut acquires = alloc::vec::Vec::new();
+        for (h, point, mine) in grouped {
+            if acquires.len() + mine.len() > budget {
+                cpu_h.push(h);
+                cpu_p.push(point);
+            } else {
+                acquires.extend(mine);
+            }
+        }
+        acquires
     }
 
     /// Map a producer's fence semaphore GPU VA into the consumer channel's
@@ -10697,6 +10746,13 @@ impl NvidiaGpu {
                     ctx_idx, owner_pid
                 );
                 Err(nv::ENODEV)
+            }
+            Err(nv::FastSubmitError::TooLarge { needed, entries }) => {
+                crate::klog_warn!(
+                    "[nouveau-uapi] EXEC(direct): ctx{} submission of {} entries cannot fit a {}-entry ring -- EINVAL (not a hang) pid={}",
+                    ctx_idx, needed, entries, owner_pid
+                );
+                Err(nv::EINVAL)
             }
             Err(nv::FastSubmitError::RingFull { put, get, needed }) => {
                 // GPGet froze for a full second: the channel is wedged, the
@@ -12544,17 +12600,21 @@ impl NvidiaGpu {
                 }
                 let req = unsafe { &*(arg as *const nv::DrmNouveauExec) };
                 const MAX_EXEC_PUSH: u32 = 64;
-                const MAX_EXEC_SYNC: u32 = 64;
+                // NVK batches up to 256 waits and 256 signals per EXEC
+                // (`NVKMD_NOUVEAU_MAX_SYNCS`) and flushes at that count;
+                // Linux nouveau has no cap of its own. The old 64 turned a
+                // vkQueueSubmit with 65 semaphores into VK_ERROR_DEVICE_LOST.
+                const MAX_EXEC_SYNC: u32 = 256;
                 if req.wait_count > MAX_EXEC_SYNC || (req.wait_count > 0 && req.wait_ptr == 0) {
                     crate::klog_warn!(
-                        "[nouveau-uapi] EXEC: wait_count={} exceeds the {} this milestone supports (or wait_ptr is null)",
+                        "[nouveau-uapi] EXEC: wait_count={} exceeds the {} an EXEC may carry (or wait_ptr is null)",
                         req.wait_count, MAX_EXEC_SYNC
                     );
                     return Err(nv::EOPNOTSUPP);
                 }
                 if req.sig_count > MAX_EXEC_SYNC || (req.sig_count > 0 && req.sig_ptr == 0) {
                     crate::klog_warn!(
-                        "[nouveau-uapi] EXEC: sig_count={} exceeds the {} this milestone supports (or sig_ptr is null)",
+                        "[nouveau-uapi] EXEC: sig_count={} exceeds the {} an EXEC may carry (or sig_ptr is null)",
                         req.sig_count, MAX_EXEC_SYNC
                     );
                     return Err(nv::EOPNOTSUPP);
@@ -12665,7 +12725,7 @@ impl NvidiaGpu {
                         // CPU-wait the full set (10 s), including same-ctx
                         // pending fences — never premature-signal.
                         let ctx_idx = self.ctx_idx_for_pid(owner_pid);
-                        let (acquires, cpu_h, cpu_p) =
+                        let (grouped, mut cpu_h, mut cpu_p) =
                             self.partition_exec_waits(&handles, &points, ctx_idx);
                         let device_instance = *self.rm_device_instance.lock();
                         let with_fence = req.sig_count > 0 && req.sig_ptr != 0;
@@ -12673,10 +12733,21 @@ impl NvidiaGpu {
                         // empty wait-only EXEC must still CPU-block until the
                         // fences land (ioctl contract).
                         let used_hw = with_fence
-                            && !acquires.is_empty()
+                            && !grouped.is_empty()
                             && device_instance
                                 .map(|d| self.fast_ctx_ready(d, ctx_idx))
                                 .unwrap_or(false);
+                        let acquires = if used_hw {
+                            self.fit_acquires_to_ring(
+                                ctx_idx,
+                                with_fence as u32,
+                                grouped,
+                                &mut cpu_h,
+                                &mut cpu_p,
+                            )
+                        } else {
+                            alloc::vec::Vec::new()
+                        };
                         if used_hw {
                             if !cpu_h.is_empty() {
                                 match crate::scheme::syncobj::wait(
@@ -12944,14 +13015,21 @@ impl NvidiaGpu {
                     let wait_start = unsafe { crate::bus::drivers_timer_now_as_micros() };
                     let deadline_us = wait_start + WAIT_TIMEOUT_US;
                     let wait_ctx = self.ctx_idx_for_pid(owner_pid);
-                    let (acquires, cpu_h, cpu_p) =
+                    let (grouped, mut cpu_h, mut cpu_p) =
                         self.partition_exec_waits(&handles, &points, wait_ctx);
                     // Only emit ACQUIRE when the direct-submit path will run;
                     // otherwise reunite into a full CPU wait.
                     let use_hw =
-                        !acquires.is_empty() && self.fast_ctx_ready(device_instance, wait_ctx);
+                        !grouped.is_empty() && self.fast_ctx_ready(device_instance, wait_ctx);
                     if use_hw {
-                        hw_acquires = acquires;
+                        let with_fence = req.sig_count > 0 && req.sig_ptr != 0;
+                        hw_acquires = self.fit_acquires_to_ring(
+                            wait_ctx,
+                            req.push_count + with_fence as u32,
+                            grouped,
+                            &mut cpu_h,
+                            &mut cpu_p,
+                        );
                     }
                     let (wait_h, wait_p): (Vec<u32>, Vec<u64>) = if use_hw {
                         (cpu_h, cpu_p)
@@ -16608,20 +16686,20 @@ mod nouveau_bookkeeping_tests {
         r.push_ptr = p.as_ptr() as u64;
         r.wait_count = 1;
         assert_eq!(exec_raw(&gpu, A, &mut r), Err(nv::EOPNOTSUPP), "null waits");
-        // Sixty-five real, satisfied syncs: a cap that let them through
-        // would submit, not crash.
+        // One more than NVK's batch (256) of real, satisfied syncs: a cap
+        // that let them through would submit, not crash.
         let ready = syncobj::create(true);
-        let many_syncs: Vec<_> = (0..65).map(|_| sync(ready)).collect();
-        r.wait_count = 65;
+        let many_syncs: Vec<_> = (0..257).map(|_| sync(ready)).collect();
+        r.wait_count = 257;
         r.wait_ptr = many_syncs.as_ptr() as u64;
-        assert_eq!(exec_raw(&gpu, A, &mut r), Err(nv::EOPNOTSUPP), "65 waits");
+        assert_eq!(exec_raw(&gpu, A, &mut r), Err(nv::EOPNOTSUPP), "257 waits");
         r.wait_count = 0;
         r.wait_ptr = 0;
         r.sig_count = 1;
         assert_eq!(exec_raw(&gpu, A, &mut r), Err(nv::EOPNOTSUPP), "null sigs");
-        r.sig_count = 65;
+        r.sig_count = 257;
         r.sig_ptr = many_syncs.as_ptr() as u64;
-        assert_eq!(exec_raw(&gpu, A, &mut r), Err(nv::EOPNOTSUPP), "65 sigs");
+        assert_eq!(exec_raw(&gpu, A, &mut r), Err(nv::EOPNOTSUPP), "257 sigs");
         assert!(syncobj::destroy(ready));
         r.sig_count = 0;
         r.push_ptr = 0xffff_ffff_ffff_0000;
@@ -17062,6 +17140,25 @@ mod nouveau_bookkeeping_tests {
     }
 
     /// The PBDMA of context `ctx`: fetch every entry from GPGet up to GPPut.
+    /// A clock that advances on every read, restored to a standing one when
+    /// dropped, unwinding included: test threads are pooled, so an
+    /// auto-advance a failed test left behind would run the next tests on
+    /// that thread against a clock that never stands still.
+    struct AutoAdvance;
+
+    impl AutoAdvance {
+        fn of(us_per_read: u64) -> Self {
+            test_clock::set_auto_advance(us_per_read);
+            Self
+        }
+    }
+
+    impl Drop for AutoAdvance {
+        fn drop(&mut self) {
+            test_clock::set_auto_advance(0);
+        }
+    }
+
     fn run_gpu(ctx: u32) -> Vec<Fetched> {
         run_gpu_frames(ctx, u32::MAX)
     }
@@ -17586,6 +17683,139 @@ mod nouveau_bookkeeping_tests {
         assert!(syncobj::destroy(out));
         gpu.nouveau_release_process(A);
         gpu.nouveau_release_process(B);
+        assert_eq!(FAKE_RM.lock().bad, 0);
+    }
+
+    /// NVK batches up to 256 waits and 256 signals per EXEC and 64 pushes
+    /// (`GETPARAM_EXEC_PUSH_MAX`), and every same-channel wait is a GPFIFO
+    /// ACQUIRE entry here, next to the pushes and the fence. The ring has
+    /// 128 entries with one kept free, so a batch of 64 pushes with 63 or
+    /// more such waits asked for room the ring never has: `fast_submit`
+    /// spun 10 s, latched the channel WEDGED and every EXEC after it was
+    /// EIO (VK_ERROR_DEVICE_LOST) until the process died. Linux has no such
+    /// ceiling: its waits are scheduler dependencies, not ring entries.
+    #[test]
+    fn an_exec_with_more_acquires_than_the_ring_holds_waits_for_the_rest_on_the_cpu_and_is_not_a_hang(
+    ) {
+        let _g = LOCK.lock();
+        let _live = LiveBytes::hold();
+        let gpu = gpu_rm_fast();
+        let ch = client_with_pushbuf(&gpu, A);
+        // One submit signals 100 semaphores with its one fence (65 or more
+        // was EOPNOTSUPP before): 100 waits on them are 100 ACQUIREs.
+        let sems: Vec<u32> = (0..100).map(|_| syncobj::create(false)).collect();
+        let sigs: Vec<_> = sems.iter().map(|&s| sync(s)).collect();
+        assert_eq!(
+            exec(&gpu, A, ch, &[push(PUSH_VA, 16)], &[], &sigs),
+            Ok(0),
+            "100 signals in one EXEC"
+        );
+        let c = chan(1);
+        assert_eq!(userd(&c), (0, 2));
+        assert!(sems.iter().all(|&s| syncobj::query(s) == Some(0)));
+        // 100 waits + 64 pushes + the fence would be 165 entries.
+        let waits: Vec<_> = sems.iter().map(|&s| sync(s)).collect();
+        let pushes: Vec<_> = (0..64)
+            .map(|i| push(PUSH_VA + 0x100 + i * 16, 16))
+            .collect();
+        let out = syncobj::create(false);
+        let now = test_clock::now();
+        let tick = AutoAdvance::of(1);
+        let fetched = std::thread::scope(|s| {
+            // The GPU runs on its own: it lands the first fence, which
+            // satisfies the waits that did not fit as ACQUIREs, and drains
+            // the ring for the submission itself.
+            let t = s.spawn(move || {
+                test_clock::set(now);
+                let mut got = Vec::new();
+                let start = std::time::Instant::now();
+                while got.len() < 2 + 127 && start.elapsed() < Duration::from_secs(30) {
+                    std::thread::sleep(Duration::from_millis(5));
+                    got.extend(run_gpu(1));
+                }
+                got
+            });
+            assert_eq!(
+                exec(&gpu, A, ch, &pushes, &waits, &[sync(out)]),
+                Ok(0),
+                "62 ACQUIREs in the ring, 38 waits on the CPU"
+            );
+            t.join().unwrap()
+        });
+        drop(tick);
+        assert!(!nv::ctx_is_wedged(1));
+        assert_eq!(fetched.len(), 2 + 127);
+        let acquires = fetched
+            .iter()
+            .filter(|f| matches!(f, Fetched::Acquire { payload: 1, .. }))
+            .count();
+        assert_eq!(
+            acquires,
+            127 - 64 - 1,
+            "as many ACQUIREs as the ring holds next to 64 pushes and the fence"
+        );
+        assert_eq!(
+            fetched
+                .iter()
+                .filter(|f| matches!(f, Fetched::Push { .. }))
+                .count(),
+            65
+        );
+        assert_eq!(
+            fetched
+                .iter()
+                .filter(|f| matches!(f, Fetched::Release { .. }))
+                .count(),
+            2
+        );
+        assert!(
+            matches!(fetched[2], Fetched::Acquire { .. }),
+            "ACQUIREs first"
+        );
+        assert!(
+            matches!(fetched[128], Fetched::Release { .. }),
+            "the fence last"
+        );
+        assert_eq!(syncobj::query(out), Some(1));
+        assert!(sems.iter().all(|&s| syncobj::query(s) == Some(1)));
+        assert_eq!(userd(&c), (1, 1), "129 entries: wrapped once");
+        // Not wedged: the channel goes on.
+        assert_eq!(exec(&gpu, A, ch, &[push(PUSH_VA, 16)], &[], &[]), Ok(0));
+        // A submission larger than the ring on its own is refused at once,
+        // not after 10 s, and does not wedge the channel either.
+        let big: Vec<_> = (0..128).map(|i| push(PUSH_VA + i * 16, 16)).collect();
+        // (1 ms per clock read: a submit that still spun would give up
+        // after its 10 s instead of hanging the test.)
+        let tick = AutoAdvance::of(1000);
+        assert!(matches!(
+            gpu.fast_submit(1, &big, false, &[]),
+            Err(nv::FastSubmitError::TooLarge {
+                needed: 128,
+                entries: 128
+            })
+        ));
+        assert!(!nv::ctx_is_wedged(1));
+        // Through EXEC's direct path the answer is EINVAL, and still no
+        // WEDGED latch: the next submission is welcome.
+        let r = nv::DrmNouveauExec {
+            channel: ch,
+            push_count: big.len() as u32,
+            wait_count: 0,
+            sig_count: 0,
+            wait_ptr: 0,
+            sig_ptr: 0,
+            push_ptr: big.as_ptr() as u64,
+        };
+        assert_eq!(gpu.exec_fast(1, A, &r, &big, &[]), Err(nv::EINVAL));
+        drop(tick);
+        assert!(!nv::ctx_is_wedged(1));
+        assert_eq!(userd(&c), (1, 2), "nothing was written over the ring");
+        assert_eq!(run_gpu(1).len(), 1);
+        for s in sems {
+            assert!(syncobj::destroy(s));
+        }
+        assert!(syncobj::destroy(out));
+        gpu.nouveau_release_process(A);
         assert_eq!(FAKE_RM.lock().bad, 0);
     }
 

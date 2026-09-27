@@ -1446,6 +1446,10 @@ pub(super) enum FastSubmitError {
     /// frozen -- the channel is wedged (same signal the RM path reported as
     /// `NV_ERR_BUSY_RETRY`).
     RingFull { put: u32, get: u32, needed: u32 },
+    /// `needed` entries can never fit a ring of `entries` slots (one is
+    /// always kept free), however long GPGet is given: a request to split,
+    /// not a wedged channel.
+    TooLarge { needed: u32, entries: u32 },
 }
 
 /// The GPFIFO ring's accounting: how the submit path turns the raw `GPPut` and
