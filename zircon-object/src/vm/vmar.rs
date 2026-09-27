@@ -2495,6 +2495,14 @@ impl VmMapping {
                 None
             }
         };
+        // The split below is a SECOND mapping of the same VMO, and only
+        // `VmMapping::new` tells the VMO about one -- this one is built by
+        // hand, so it was never counted while its `Drop` counts it out. Told
+        // here and not in the branch that uses it, because the error paths in
+        // between drop the spare unused and have to be symmetric.
+        if let Some(spare) = &spare {
+            self.vmo.append_mapping(Arc::downgrade(spare));
+        }
         let mut inner = self.inner.lock();
         let mut page_table = self.page_table.lock();
         if inner.addr >= begin && inner.end_addr() <= end {
@@ -5156,6 +5164,30 @@ mod mapping_count_tests {
             vmo.share_count(),
             0,
             "the region let the mapping go and the VMO still counts it"
+        );
+    }
+
+    /// Unmapping a hole in the middle splits one mapping into two, and `cut`
+    /// builds the second one by hand instead of through `VmMapping::new`, so
+    /// the VMO was never told about it.
+    #[test]
+    fn a_mapping_split_in_two_is_counted_twice() {
+        let vmar = VmAddressRegion::new_root_zircon();
+        let vmo = VmObject::new_paged(3);
+        vmar.map_at(0, vmo.clone(), 0, 3 * PAGE_SIZE, MMUFlags::READ)
+            .unwrap();
+        assert_eq!(vmo.share_count(), 1);
+        vmar.unmap(vmar.addr() + PAGE_SIZE, PAGE_SIZE).unwrap();
+        assert_eq!(
+            vmo.share_count(),
+            2,
+            "the hole left two mappings and the VMO counts one"
+        );
+        vmar.clear().unwrap();
+        assert_eq!(
+            vmo.share_count(),
+            0,
+            "both halves are gone and the VMO still counts one"
         );
     }
 
