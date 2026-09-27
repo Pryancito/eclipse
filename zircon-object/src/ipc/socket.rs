@@ -160,24 +160,36 @@ impl Socket {
         }
     }
 
+    /// Measure the free room and fill it under **one** hold of the lock.
+    ///
+    /// These were two: the room was measured, the lock let go, and the push
+    /// took it again. Two writers on the same endpoint both measured the same
+    /// room and both wrote it, so `data` went past `SOCKET_SIZE` -- and from
+    /// then on every `SOCKET_SIZE - data.len()` in `write`, `read` and
+    /// `write_size` underflows, so the socket reports room for the rest of the
+    /// address space and grows until the kernel heap is gone.
     fn write_data(&self, data: &[u8]) -> ZxResult<usize> {
-        let curr_size = self.inner.lock().data.len();
-        let was_empty = curr_size == 0;
-        let rest_size = SOCKET_SIZE - curr_size;
-        if rest_size == 0 {
-            return Err(ZxError::SHOULD_WAIT);
-        }
-        let write_size = data.len().min(rest_size);
-        let actual_count = if self.flags.contains(SocketFlags::DATAGRAM) {
-            if data.len() > SOCKET_SIZE {
-                return Err(ZxError::OUT_OF_RANGE);
-            }
-            if data.len() > rest_size {
+        let (was_empty, actual_count) = {
+            let mut inner = self.inner.lock();
+            let curr_size = inner.data.len();
+            let was_empty = curr_size == 0;
+            let rest_size = SOCKET_SIZE - curr_size;
+            if rest_size == 0 {
                 return Err(ZxError::SHOULD_WAIT);
             }
-            self.write_datagram(&data[..write_size])?
-        } else {
-            self.write_stream(&data[..write_size])?
+            let write_size = data.len().min(rest_size);
+            let actual_count = if self.flags.contains(SocketFlags::DATAGRAM) {
+                if data.len() > SOCKET_SIZE {
+                    return Err(ZxError::OUT_OF_RANGE);
+                }
+                if data.len() > rest_size {
+                    return Err(ZxError::SHOULD_WAIT);
+                }
+                Self::write_datagram(&mut inner, &data[..write_size])?
+            } else {
+                Self::write_stream(&mut inner, &data[..write_size])
+            };
+            (was_empty, actual_count)
         };
         if actual_count > 0 {
             let mut set = Signal::empty();
@@ -199,22 +211,22 @@ impl Socket {
         Ok(actual_count)
     }
 
-    fn write_datagram(&self, data: &[u8]) -> ZxResult<usize> {
+    /// Takes the guard its caller already holds: the measure and the push are
+    /// one step, see [`Socket::write_data`].
+    fn write_datagram(inner: &mut SocketInner, data: &[u8]) -> ZxResult<usize> {
         if data.is_empty() {
             return Err(ZxError::INVALID_ARGS);
         }
-        let mut inner = self.inner.lock();
         let actual_count = data.len();
         inner.data.extend(data);
         inner.datagram_len.push_back(actual_count);
         Ok(actual_count)
     }
 
-    fn write_stream(&self, data: &[u8]) -> ZxResult<usize> {
-        let actual_count = data.len();
-        let mut inner = self.inner.lock();
+    /// Takes the guard its caller already holds; see [`Socket::write_data`].
+    fn write_stream(inner: &mut SocketInner, data: &[u8]) -> usize {
         inner.data.extend(data);
-        Ok(actual_count)
+        data.len()
     }
 
     /// The buffer a read of `count` bytes needs, which is never more than the
@@ -246,20 +258,36 @@ impl Socket {
     ///
     /// If `peek` is true, leave the message in the socket. Otherwise consume the message.
     pub fn read(&self, peek: bool, data: &mut [u8]) -> ZxResult<usize> {
-        let curr_size = self.inner.lock().data.len();
-        if curr_size == 0 {
-            let _peer = self.peer.upgrade().ok_or(ZxError::PEER_CLOSED)?;
-            let inner = self.inner.lock();
-            if inner.read_disabled {
-                return Err(ZxError::BAD_STATE);
+        // The look and the take are one step, under one hold of the lock.
+        // They used to be two: this decided the socket was not empty, let go,
+        // and the take below took the lock again. Two threads reading the same
+        // endpoint -- two threads of one process, or two processes sharing the
+        // handle -- both got past the check, and on a datagram socket the
+        // second one reached `datagram_len.pop_front().unwrap()` with the
+        // queue already drained, **which panics the kernel**. On a stream
+        // socket it was quieter and still wrong: the read of an empty buffer
+        // answered `Ok(0)` where the contract says `SHOULD_WAIT`, and a
+        // userspace loop reads that as the end of the stream.
+        let (was_full, actual_count) = {
+            let mut inner = self.inner.lock();
+            if inner.data.is_empty() {
+                // `PEER_CLOSED` first, as before: a peer that is gone is the
+                // reason the buffer is never going to fill.
+                if self.peer.upgrade().is_none() {
+                    return Err(ZxError::PEER_CLOSED);
+                }
+                if inner.read_disabled {
+                    return Err(ZxError::BAD_STATE);
+                }
+                return Err(ZxError::SHOULD_WAIT);
             }
-            return Err(ZxError::SHOULD_WAIT);
-        }
-        let was_full = curr_size == SOCKET_SIZE;
-        let actual_count = if self.flags.contains(SocketFlags::DATAGRAM) {
-            self.read_datagram(data, peek)?
-        } else {
-            self.read_stream(data, peek)?
+            let was_full = inner.data.len() == SOCKET_SIZE;
+            let actual_count = if self.flags.contains(SocketFlags::DATAGRAM) {
+                Self::read_datagram(&mut inner, data, peek)
+            } else {
+                Self::read_stream(&mut inner, data, peek)
+            };
+            (was_full, actual_count)
         };
         if !peek && actual_count > 0 {
             // One lock at a time: see the note in `write`.
@@ -296,15 +324,25 @@ impl Socket {
         Ok(actual_count)
     }
 
-    fn read_datagram(&self, data: &mut [u8], peek: bool) -> ZxResult<usize> {
+    /// Takes the guard its caller already holds, which is what makes the two
+    /// `datagram_len` reads below safe; see [`Socket::read`].
+    fn read_datagram(inner: &mut SocketInner, data: &mut [u8], peek: bool) -> usize {
         if data.is_empty() {
-            return Ok(0);
+            return 0;
         }
-        let mut inner = self.inner.lock();
+        // The caller has established, under this same guard, that `data` is
+        // not empty, and every byte in it belongs to a datagram whose length
+        // is in this queue.
         let datagram_len = if peek {
-            *inner.datagram_len.front().unwrap()
+            match inner.datagram_len.front() {
+                Some(len) => *len,
+                None => return 0,
+            }
         } else {
-            inner.datagram_len.pop_front().unwrap()
+            match inner.datagram_len.pop_front() {
+                Some(len) => len,
+                None => return 0,
+            }
         };
         let read_size = data.len().min(datagram_len);
         if peek {
@@ -316,11 +354,11 @@ impl Socket {
                 data[i] = x;
             }
         };
-        Ok(read_size)
+        read_size
     }
 
-    fn read_stream(&self, data: &mut [u8], peek: bool) -> ZxResult<usize> {
-        let mut inner = self.inner.lock();
+    /// Takes the guard its caller already holds; see [`Socket::read`].
+    fn read_stream(inner: &mut SocketInner, data: &mut [u8], peek: bool) -> usize {
         let read_size = data.len().min(inner.data.len());
         if peek {
             for (i, x) in inner.data.iter().take(read_size).enumerate() {
@@ -331,7 +369,7 @@ impl Socket {
                 data[i] = x;
             }
         };
-        Ok(read_size)
+        read_size
     }
 
     /// Get information of the socket.
@@ -549,6 +587,8 @@ pub struct SocketInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::vec::Vec;
+    use core::sync::atomic::{AtomicBool, Ordering};
 
     /// Both ends of a socket used at once must not wedge. A socket is
     /// bidirectional, so each side writes its own endpoint and reads it: that
@@ -955,6 +995,115 @@ mod tests {
             "there is room again, but this end may not write",
         );
         assert_eq!(end0.write(&[0; 1]).unwrap_err(), ZxError::BAD_STATE);
+    }
+
+    /// Runs `body` on its own thread and turns a wedge or a panicked
+    /// participant into a named failure: a test that hangs says nothing, and
+    /// these put two threads inside one endpoint on purpose.
+    fn with_watchdog(what: &str, body: impl FnOnce() + Send + 'static) {
+        let (done, finished) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            body();
+            let _ = done.send(());
+        });
+        if finished
+            .recv_timeout(core::time::Duration::from_secs(30))
+            .is_err()
+        {
+            panic!("{}", what);
+        }
+    }
+
+    #[test]
+    /// Two threads reading one endpoint, kept on the boundary: the writer only
+    /// sends the next datagram once the socket is empty again, so the readers
+    /// are nearly always racing over the last one. The look and the take used
+    /// to be two separate holds of the lock, so both got past "the socket is
+    /// not empty" and the loser popped a `datagram_len` queue the winner had
+    /// already drained -- an `unwrap` on `None`, which **panics the kernel**.
+    fn two_threads_reading_one_datagram_socket_do_not_panic() {
+        with_watchdog("a reader panicked the kernel or wedged", || {
+            const ROUNDS: usize = 100_000;
+            let (writer, reader) = Socket::create(SocketFlags::DATAGRAM.bits()).unwrap();
+            let stop = Arc::new(AtomicBool::new(false));
+
+            let readers: Vec<_> = (0..2)
+                .map(|_| {
+                    let reader = reader.clone();
+                    let stop = stop.clone();
+                    std::thread::spawn(move || {
+                        let mut buf = [0u8; 4];
+                        while !stop.load(Ordering::Relaxed) {
+                            let _ = reader.read(false, &mut buf);
+                        }
+                    })
+                })
+                .collect();
+
+            // No throttle: the readers drain faster than one writer fills,
+            // so the queue sits at nought or one datagram and every read is at
+            // the boundary.
+            for _ in 0..ROUNDS {
+                let _ = writer.write(&[1, 2, 3, 4]);
+            }
+            stop.store(true, Ordering::Relaxed);
+            for (i, r) in readers.into_iter().enumerate() {
+                assert!(r.join().is_ok(), "reader {} panicked the kernel", i);
+            }
+        });
+    }
+
+    #[test]
+    /// And the same two steps on the way in, on the same boundary: the socket
+    /// is held with room for about one chunk while two writers write one each.
+    /// Both used to measure the free room, let go, and write it, so the buffer
+    /// went past `SOCKET_SIZE` -- after which every `SOCKET_SIZE -
+    /// data.len()` underflows and the socket reports room for the rest of the
+    /// address space.
+    fn two_threads_writing_one_socket_do_not_overrun_it() {
+        with_watchdog("a writer overran the socket or wedged", || {
+            const ROUNDS: usize = 200_000;
+            const CHUNK: usize = 1024;
+            let (writer, reader) = Socket::create(0).unwrap();
+            let stop = Arc::new(AtomicBool::new(false));
+
+            // Filled so that only about one chunk of room is ever free.
+            assert_eq!(
+                writer.write(&vec![0u8; SOCKET_SIZE - CHUNK]).unwrap(),
+                SOCKET_SIZE - CHUNK,
+            );
+
+            let writers: Vec<_> = (0..2)
+                .map(|_| {
+                    let writer = writer.clone();
+                    let stop = stop.clone();
+                    std::thread::spawn(move || {
+                        let chunk = vec![0u8; CHUNK];
+                        while !stop.load(Ordering::Relaxed) {
+                            let _ = writer.write(&chunk);
+                        }
+                    })
+                })
+                .collect();
+
+            let mut drain = vec![0u8; CHUNK];
+            for _ in 0..ROUNDS {
+                let held = reader.get_info().rx_buf_size as usize;
+                assert!(
+                    held <= SOCKET_SIZE,
+                    "{} bytes in a socket that holds {}",
+                    held,
+                    SOCKET_SIZE,
+                );
+                if held > SOCKET_SIZE - CHUNK {
+                    let _ = reader.read(false, &mut drain);
+                }
+            }
+            stop.store(true, Ordering::Relaxed);
+            for (i, w) in writers.into_iter().enumerate() {
+                assert!(w.join().is_ok(), "writer {} overran the socket", i);
+            }
+        });
     }
 
     #[test]
