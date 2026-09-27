@@ -1675,7 +1675,7 @@ fn vm_bind_maps_into_the_callers_own_context_and_a_map_over_a_live_range_replace
         "B's binding is still live"
     );
     assert_eq!(
-        vm_bind_ops(&gpu, A, &mut [unmap(0x1000, 0x1000)]),
+        vm_bind_ops(&gpu, A, &mut [unmap(0x1_0000_1000, 0x1000)]),
         Ok(0),
         "nothing there: fine"
     );
@@ -1943,7 +1943,7 @@ fn vm_bind_programs_uncompressed_kinds_verbatim_and_hands_the_rest_to_the_rm_def
         (0xff, 0x00),
     ];
     for (i, (asked, _)) in cases.iter().enumerate() {
-        let va = 0x1000_0000 + (i as u64) * 0x1_0000;
+        let va = 0x1_1000_0000 + (i as u64) * 0x1_0000;
         assert_eq!(
             vm_bind_ops(&gpu, A, &mut [op(nv::VM_BIND_OP_MAP, *asked, h, va, 4096)]),
             Ok(0),
@@ -1961,7 +1961,7 @@ fn vm_bind_programs_uncompressed_kinds_verbatim_and_hands_the_rest_to_the_rm_def
         vm_bind_ops(
             &gpu,
             A,
-            &mut [op(nv::VM_BIND_OP_MAP, 0x0200, h, 0x2000_0000, 4096)]
+            &mut [op(nv::VM_BIND_OP_MAP, 0x0200, h, 0x1_2000_0000, 4096)]
         ),
         Ok(0)
     );
@@ -1973,7 +1973,7 @@ fn vm_bind_programs_uncompressed_kinds_verbatim_and_hands_the_rest_to_the_rm_def
         vm_bind_ops(
             &gpu,
             A,
-            &mut [op(nv::VM_BIND_OP_MAP, 0x0206, h, 0x2001_0000, 4096)]
+            &mut [op(nv::VM_BIND_OP_MAP, 0x0206, h, 0x1_2001_0000, 4096)]
         ),
         Ok(0)
     );
@@ -2029,7 +2029,7 @@ fn with_the_rm_a_subchannel_new_builds_the_class_on_the_callers_context_and_chan
         .unwrap()
         .handle;
     assert_eq!(
-        vm_bind_ops(&gpu, A, &mut [map(h, 0x5000_0000, 4096)]),
+        vm_bind_ops(&gpu, A, &mut [map(h, 0x1_5000_0000, 4096)]),
         Ok(0)
     );
     assert_eq!(channel_free(&gpu, 0, A), Ok(0));
@@ -2071,11 +2071,11 @@ fn process_exit_with_the_rm_frees_classes_then_the_context_then_memory_and_never
         .unwrap()
         .handle;
     assert_eq!(
-        vm_bind_ops(&gpu, A, &mut [map(ha, 0x1000_0000, 65536)]),
+        vm_bind_ops(&gpu, A, &mut [map(ha, 0x1_1000_0000, 65536)]),
         Ok(0)
     );
     assert_eq!(
-        vm_bind_ops(&gpu, B, &mut [map(hb, 0x1000_0000, 4096)]),
+        vm_bind_ops(&gpu, B, &mut [map(hb, 0x1_1000_0000, 4096)]),
         Ok(0)
     );
     assert_eq!(subchan_new(0, 0xc597, 0x1000).send(&gpu, A), Ok(0));
@@ -2316,6 +2316,107 @@ fn vm_bind_and_exec_answer_enosys_until_the_client_ran_vm_init() {
     channel_alloc(&gpu, B).unwrap();
     assert_eq!(bind(B), Err(nv::ENOSYS));
     assert_eq!(submit(B), Err(nv::ENOSYS));
+    gpu.nouveau_release_process(B);
+    gpu.nouveau_release_process(STRANGER);
+}
+
+#[test]
+fn vm_bind_stays_inside_the_va_space_and_off_the_range_vm_init_reserved() {
+    let _g = LOCK.lock();
+    let _live = LiveBytes::hold();
+    let gpu = gpu_rm();
+    let init = |pid: u64, addr: u64, size: u64| {
+        let mut r = nv::DrmNouveauVmInit {
+            kernel_managed_addr: addr,
+            kernel_managed_size: size,
+        };
+        call(
+            &gpu,
+            wr::<nv::DrmNouveauVmInit>(nv::NR_VM_INIT),
+            &mut r,
+            pid,
+        )
+    };
+    let bo = |pid: u64| {
+        gem_new_rm(&gpu, 65536, nv::NOUVEAU_GEM_DOMAIN_GART, pid)
+            .unwrap()
+            .handle
+    };
+    channel_alloc(&gpu, A).unwrap();
+    channel_alloc(&gpu, B).unwrap();
+    channel_alloc(&gpu, STRANGER).unwrap();
+    // A reserves 1 GiB at 1 TiB for the kernel; the helpers' own
+    // VM_INIT (the low 4 GiB) comes second and does not replace it.
+    const KSTART: u64 = 1 << 40;
+    const KSIZE: u64 = 1 << 30;
+    const KEND: u64 = KSTART + KSIZE;
+    const END: u64 = nv::NOUVEAU_VA_SPACE_END;
+    assert_eq!(init(A, KSTART, KSIZE), Ok(0));
+    let ha = bo(A);
+    // Past the VA space (without wrapping): EINVAL, MAP and UNMAP alike.
+    assert_eq!(
+        vm_bind_ops(&gpu, A, &mut [map(ha, END - 4096, 8192)]),
+        Err(nv::EINVAL),
+        "a page past the end"
+    );
+    assert_eq!(
+        vm_bind_ops(&gpu, A, &mut [map(ha, END, 4096)]),
+        Err(nv::EINVAL),
+        "starting at the end"
+    );
+    assert_eq!(
+        vm_bind_ops(&gpu, A, &mut [unmap(END, 4096)]),
+        Err(nv::EINVAL),
+        "an UNMAP past the end"
+    );
+    // Touching the reservation anywhere: EINVAL.
+    for (what, op) in [
+        ("at its start", map(ha, KSTART, 4096)),
+        ("its last page", map(ha, KEND - 4096, 4096)),
+        ("straddling its start", map(ha, KSTART - 4096, 8192)),
+        ("straddling its end", map(ha, KEND - 4096, 8192)),
+        ("an UNMAP inside it", unmap(KSTART + 4096, 4096)),
+    ] {
+        assert_eq!(vm_bind_ops(&gpu, A, &mut [op]), Err(nv::EINVAL), "{what}");
+    }
+    // A batch is checked whole: a good op ahead of a bad one binds nothing.
+    assert_eq!(
+        vm_bind_ops(&gpu, A, &mut [map(ha, KEND, 4096), unmap(KSTART, 4096)]),
+        Err(nv::EINVAL)
+    );
+    assert!(driver_maps(&gpu, A).is_empty(), "nothing reached the RM");
+    // Ending exactly at the reservation, starting exactly at its end,
+    // and the last page of the VA space: bound.
+    assert_eq!(
+        vm_bind_ops(&gpu, A, &mut [map(ha, KSTART - 4096, 4096)]),
+        Ok(0)
+    );
+    assert_eq!(vm_bind_ops(&gpu, A, &mut [map(bo(A), KEND, 4096)]), Ok(0));
+    assert_eq!(
+        vm_bind_ops(&gpu, A, &mut [map(bo(A), END - 4096, 4096)]),
+        Ok(0)
+    );
+    assert_eq!(driver_maps(&gpu, A).len(), 3);
+    // The reservation is the client's own: B, with the helpers' low
+    // 4 GiB, may bind where A may not, and not below 4 GiB.
+    let hb = bo(B);
+    assert_eq!(
+        vm_bind_ops(&gpu, B, &mut [map(hb, 0x1000_0000, 4096)]),
+        Err(nv::EINVAL)
+    );
+    assert_eq!(vm_bind_ops(&gpu, B, &mut [map(hb, KSTART, 4096)]), Ok(0));
+    // An empty reservation blocks nothing, not even the op that
+    // straddles its address.
+    assert_eq!(init(STRANGER, KSTART + 4096, 0), Ok(0));
+    assert_eq!(
+        vm_bind_ops(&gpu, STRANGER, &mut [map(bo(STRANGER), KSTART, 8192)]),
+        Ok(0)
+    );
+    // Process exit drops the reservation with the uvmm: A starts over.
+    gpu.nouveau_release_process(A);
+    assert_eq!(init(A, 0, 0), Ok(0));
+    assert_eq!(vm_bind_ops(&gpu, A, &mut [map(bo(A), KSTART, 4096)]), Ok(0));
+    gpu.nouveau_release_process(A);
     gpu.nouveau_release_process(B);
     gpu.nouveau_release_process(STRANGER);
 }

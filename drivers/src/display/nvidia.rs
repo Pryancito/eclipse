@@ -814,6 +814,15 @@ struct NvidiaKmsState {
     last_vblank_us: u64,
 }
 
+/// One `VM_INIT`: the process that ran it and the range it reserved for
+/// the kernel (`nouveau_uvmm.kernel_managed_addr/size`).
+#[derive(Clone, Copy, Debug)]
+struct NouveauUvmm {
+    pid: u64,
+    kernel_managed_addr: u64,
+    kernel_managed_size: u64,
+}
+
 pub struct NvidiaGpu {
     name: String,
     info: DisplayInfo,
@@ -926,13 +935,15 @@ pub struct NvidiaGpu {
     /// Active `VM_BIND` GPU-VA mappings, so `UNMAP` can find the RM handle
     /// to tear down.
     nouveau_vm_mappings: Mutex<Vec<super::nouveau_uapi::NouveauVmMapping>>,
-    /// Pids that ran `VM_INIT`: Linux's `cli->uvmm.ptr`, the VA space
-    /// `VM_BIND` and `EXEC` work in. Without it both answer ENOSYS
-    /// (`nouveau_uvmm_ioctl_vm_bind`, `nouveau_exec_ioctl_exec`), before
-    /// anything else is looked at. Per pid rather than per drm file because
-    /// every other nouveau-uAPI state here is keyed by pid too
+    /// Pids that ran `VM_INIT`, with the kernel-managed range each one
+    /// reserved: Linux's `cli->uvmm.ptr`, the VA space `VM_BIND` and `EXEC`
+    /// work in. Without it both answer ENOSYS (`nouveau_uvmm_ioctl_vm_bind`,
+    /// `nouveau_exec_ioctl_exec`), before anything else is looked at, and
+    /// no `VM_BIND` op may touch the reserved range
+    /// (`drm_gpuvm_in_kernel_node`). Per pid rather than per drm file
+    /// because every other nouveau-uAPI state here is keyed by pid too
     /// (`nouveau_pid_ctx`); cleared in `nouveau_release_process`.
-    nouveau_uvmm: Mutex<Vec<u64>>,
+    nouveau_uvmm: Mutex<Vec<NouveauUvmm>>,
     /// Per-process GPU context assignment: `(owner_pid, ctx_idx, h_vas,
     /// h_notifier)`. The compositor (context 0) is NOT tracked here. A GL
     /// client's context is built on its FIRST GPU touch -- `VM_BIND` or
@@ -8635,7 +8646,7 @@ impl DrmScheme for NvidiaGpu {
         }
         // Its uvmm goes with it (`nouveau_uvmm_fini` from the file's
         // postclose): a recycled pid starts over at `VM_INIT`.
-        self.nouveau_uvmm.lock().retain(|&p| p != pid);
+        self.nouveau_uvmm.lock().retain(|u| u.pid != pid);
         // A process going away is one event sure to follow every zombie
         // context (below): the ones that are due get their teardown first,
         // and one still wearing this very pid (recycled) is re-keyed, so
@@ -8993,6 +9004,40 @@ impl NvidiaGpu {
                 op.range
             );
             return Err(nv::EINVAL);
+        }
+        // `drm_gpuvm_range_valid`: the window lies in the VA space
+        // (`drm_gpuvm_in_mm_range`, [0, 1 << 47)) and off the range the
+        // client reserved for the kernel at VM_INIT
+        // (`drm_gpuvm_in_kernel_node`: an empty reservation blocks
+        // nothing). Both held for MAP and UNMAP alike, and an op past the
+        // VA space or inside the reservation used to reach the RM.
+        let end = op.addr + op.range;
+        if end > nv::NOUVEAU_VA_SPACE_END {
+            crate::klog_warn!(
+                "[nouveau-uapi] VM_BIND: op={} VA={:#x} range={:#x} ends past the {:#x} VA space \
+                 -> EINVAL",
+                op.op,
+                op.addr,
+                op.range,
+                nv::NOUVEAU_VA_SPACE_END
+            );
+            return Err(nv::EINVAL);
+        }
+        if let Some((kstart, krange)) = self.nouveau_kernel_managed(owner_pid) {
+            // VM_INIT already checked that this sum fits the VA space.
+            let kend = kstart + krange;
+            if krange != 0 && op.addr < kend && kstart < end {
+                crate::klog_warn!(
+                    "[nouveau-uapi] VM_BIND: op={} VA={:#x} range={:#x} overlaps the kernel-managed \
+                     range [{:#x}, {:#x}) of VM_INIT -> EINVAL",
+                    op.op,
+                    op.addr,
+                    op.range,
+                    kstart,
+                    kend
+                );
+                return Err(nv::EINVAL);
+            }
         }
         if op.op != nv::VM_BIND_OP_MAP || op.handle == 0 {
             return Ok(());
@@ -9564,7 +9609,17 @@ impl NvidiaGpu {
 
     /// Whether this process ran `VM_INIT` (Linux: `nouveau_cli_uvmm(cli)`).
     fn nouveau_has_uvmm(&self, pid: u64) -> bool {
-        self.nouveau_uvmm.lock().contains(&pid)
+        self.nouveau_uvmm.lock().iter().any(|u| u.pid == pid)
+    }
+
+    /// The `(addr, size)` this process reserved for the kernel at
+    /// `VM_INIT`, if it ran one: `drm_gpuvm`'s `kernel_alloc_node`.
+    fn nouveau_kernel_managed(&self, pid: u64) -> Option<(u64, u64)> {
+        self.nouveau_uvmm
+            .lock()
+            .iter()
+            .find(|u| u.pid == pid)
+            .map(|u| (u.kernel_managed_addr, u.kernel_managed_size))
     }
 
     /// Whether THIS process owns the RM-backed channel.
@@ -13021,9 +13076,17 @@ impl NvidiaGpu {
                     req.kernel_managed_addr,
                     req.kernel_managed_size
                 );
+                // The range is kept: `drm_gpuvm_init` makes it the
+                // `kernel_alloc_node` no VM_BIND op may touch (checked in
+                // `vm_bind_check_op`). The first VM_INIT's range stays on a
+                // repeat: NVK issues exactly one.
                 let mut uvmm = self.nouveau_uvmm.lock();
-                if !uvmm.contains(&owner_pid) {
-                    uvmm.push(owner_pid);
+                if !uvmm.iter().any(|u| u.pid == owner_pid) {
+                    uvmm.push(NouveauUvmm {
+                        pid: owner_pid,
+                        kernel_managed_addr: req.kernel_managed_addr,
+                        kernel_managed_size: req.kernel_managed_size,
+                    });
                 }
                 Ok(0)
             }
