@@ -653,8 +653,8 @@ pub fn present_probe_enabled() -> bool {
 }
 
 /// Whether a present that finds the source still moving under it **repairs**
-/// the bands that moved, instead of only reporting them (`drm.present_repair`
-/// on the cmdline). OFF by default.
+/// the bands that moved, instead of only reporting them. ON by default; the
+/// `drm.present_repair=off` cmdline turns it off.
 ///
 /// The defect it answers is measured, not guessed: with the compositor on
 /// wlroots' GLES2 renderer over Mesa's software rasteriser, the probe fires on
@@ -664,7 +664,8 @@ pub fn present_probe_enabled() -> bool {
 /// waiting, and there is nothing for the compositor to wait on either: this
 /// kernel answers `DRM_CAP_SYNCOBJ_TIMELINE` with 0, and a software renderer
 /// has no GPU fence to export. So the buffer the kernel is handed is a frame
-/// whose tiles are still arriving.
+/// whose tiles are still arriving. On screen that is the "basura" in freshly
+/// opened menus (noise over the surface, smears at the edges).
 ///
 /// What the kernel can do about it is narrow but real. It cannot make the frame
 /// whole -- a present that raced is a mix of two frames whatever we do, and only
@@ -674,7 +675,13 @@ pub fn present_probe_enabled() -> bool {
 /// copying those again picks up what has since arrived. Bounded by
 /// [`MAX_REPAIR_ROUNDS`], because a compositor that never stops writing must not
 /// turn one present into an unbounded loop.
-static PRESENT_REPAIR: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+///
+/// Default ON because `renderer=auto` still lands non-NVIDIA boxes (QEMU
+/// virtio-gpu, VirtualBox SVGA) on the GLES2/llvmpipe stack, and there is no
+/// fence path that can wait those workers out. Pixman sessions pay only the
+/// two settled checksums (the repair loop never runs). Opt out with
+/// `drm.present_repair=off` if the checksum cost shows up on a tight frame budget.
+static PRESENT_REPAIR: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);
 
 /// Turn the present repair pass on (or back off) for this boot.
 pub fn set_present_repair_enabled(on: bool) {
@@ -7175,7 +7182,9 @@ pub(crate) fn reset_output_state_for_test() {
     // Its report budget goes back too, or the last test to run finds it spent.
     set_present_probe_enabled(false);
     set_cursor_from_client(false);
-    set_present_repair_enabled(false);
+    // Back to the boot default (ON). A test that disarmed repair must not leave
+    // every later present skipping the settle-and-recopy pass.
+    set_present_repair_enabled(true);
     // `set_present_skip_enabled` resets the band state itself, which is what a
     // fresh boot looks like: nothing known about what the panel holds. A leaked
     // hash would make a later test's present skip a band for a reason that has
@@ -10990,17 +10999,18 @@ mod present_probe_tests {
         assert_eq!(repair_span_px(1, 0, 1920), None);
     }
 
-    /// The repair is off unless the cmdline arms it, and the reset between tests
-    /// disarms it -- a leaked flag would have every later present test doing
-    /// extra blits.
+    /// The repair is on by default (the boot that has no fence for llvmpipe),
+    /// the cmdline can disarm it, and the reset between tests restores the
+    /// default -- a leaked OFF would hide the settle-and-recopy pass from every
+    /// later present test.
     #[test]
-    fn the_repair_is_off_unless_the_cmdline_arms_it() {
+    fn the_repair_is_on_by_default_and_reset_restores_it() {
         let _g = serialised();
-        assert!(!present_repair_enabled());
-        set_present_repair_enabled(true);
         assert!(present_repair_enabled());
-        reset_output_state_for_test();
+        set_present_repair_enabled(false);
         assert!(!present_repair_enabled());
+        reset_output_state_for_test();
+        assert!(present_repair_enabled());
         assert_eq!(repair_rounds_for_test(), 0);
     }
 

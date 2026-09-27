@@ -1181,11 +1181,16 @@ fn renderer_mode_from(cmdline: &str, vendor: Option<&str>) -> Renderer {
 /// as "zcore" and NVK can never enumerate; NVIDIA without the flag goes to
 /// pixman, the proven software default there). In that experiment mode labwc now
 /// still defaults to software unless `nvidia.wlr_gles2` / `nvidia.wlr_vulkan`
-/// opt into the unstable GPU compositor. Everything else — notably QEMU's
-/// virtio-gpu (`0x1af4`), whose GL is virgl and is not wired into
-/// auto-detection — stays on software GL (llvmpipe), which is safe everywhere
-/// and never leaves a black screen. Only when no GPU is visible do we fall back
-/// to pixman. To use virgl in QEMU, pass `renderer=gl` explicitly.
+/// opt into the unstable GPU compositor.
+///
+/// Everything else — QEMU virtio-gpu (`0x1af4`), VirtualBox SVGA (`0x15ad`),
+/// or no card — lands on **pixman**. The previous auto pick was
+/// GLES2/llvmpipe (`gl-sw`), which painted menus with tile garbage: `glFlush`
+/// returns before llvmpipe's workers finish, this kernel has no timeline
+/// syncobj for them to wait on, and the present scanned out half-drawn frames.
+/// Pixman settles on the calling thread, so the buffer the kernel copies is
+/// whole. Opt into the old software-GL stack with `renderer=gl-sw`, or virgl
+/// with `renderer=gl`.
 fn detect_renderer_from(vendor: Option<&str>, cmdline: &str) -> Renderer {
     match vendor {
         Some(v) if vendor_is_nvidia(Some(v)) => {
@@ -1225,10 +1230,11 @@ fn detect_renderer_from(vendor: Option<&str>, cmdline: &str) -> Renderer {
         }
         Some(v) if !v.trim().is_empty() => {
             log(&format!(
-                "renderer=auto: GPU vendor {} -> gl-sw (software GL; pass renderer=gl for virgl)",
+                "renderer=auto: GPU vendor {} -> pixman (pass renderer=gl-sw for GLES2/llvmpipe, \
+                 renderer=gl for virgl)",
                 v.trim()
             ));
-            Renderer::GlSw
+            Renderer::Pixman
         }
         _ => {
             log("renderer=auto: no GPU visible -> pixman");
@@ -2345,8 +2351,14 @@ mod tests {
 
     #[test]
     fn autodetection_covers_the_three_machines_this_image_boots_on() {
-        // QEMU's virtio-gpu: software GL, which renders everywhere.
-        assert!(matches!(renderer_mode_from("", VIRTIO), Renderer::GlSw));
+        // QEMU virtio-gpu / VirtualBox SVGA: pixman. gl-sw (GLES2/llvmpipe)
+        // left menu garbage because the kernel presents before the workers
+        // finish; opt in with renderer=gl-sw if that stack is wanted.
+        assert!(matches!(renderer_mode_from("", VIRTIO), Renderer::Pixman));
+        assert!(matches!(
+            renderer_mode_from("renderer=auto", Some("0x15ad\n")),
+            Renderer::Pixman
+        ));
         // No card at all: pixman, which never leaves a black screen.
         assert!(matches!(renderer_mode_from("", None), Renderer::Pixman));
         // A card that reports an empty vendor is not a card.

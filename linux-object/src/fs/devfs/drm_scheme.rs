@@ -7959,6 +7959,9 @@ mod kms_scanout_tests {
     fn the_probe_alone_measures_and_does_not_repair() {
         let screen = kms_emu::attach(192, 200);
         drm::set_present_probe_enabled(true);
+        // Repair is ON by default; this test is specifically the probe WITHOUT
+        // the repair pass, so disarm it for the duration.
+        drm::set_present_repair_enabled(false);
         let c = Client::open(0);
         let buf = c.create_dumb(192, 200);
         paint(&buf, |x, y| tag(0x00AA_0000, x, y));
