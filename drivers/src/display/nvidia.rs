@@ -10249,15 +10249,24 @@ impl NvidiaGpu {
             .retain(|&(consumer, producer), _| consumer != ctx_idx && producer != ctx_idx);
     }
 
-    /// The RM side of a process exit: its context (`my_ctx`, already off
-    /// the pid registry), its mappings, its GEM objects and its channels.
-    fn release_process_finish(&self, pid: u64, my_ctx: Option<u32>) {
+    /// Retire `my_ctx`, `pid`'s context (already off the pid registry):
+    /// its class objects, its direct-submit state, the RM channel and VAS,
+    /// and the mappings that VAS carried. The GPU side of a process exit,
+    /// and of a wedged context's rebuild (`retire_wedged_ctx_of`), which
+    /// keeps the process's GEM objects. Returns whether the RM freed the
+    /// context, and how many mappings went with it.
+    fn retire_ctx(
+        &self,
+        pid: u64,
+        my_ctx: Option<u32>,
+        device_instance: Option<u32>,
+        why: &str,
+    ) -> (bool, usize) {
         // Per-process GPU teardown, OWNER-SCOPED. Stop the GPU before ripping
         // out VM_BIND / GEM: the old order unmapped and freed buffers while the
         // channel was still on the runlist, so a dying glxgears (window close
         // or ^C) left the GPU writing into memory the next shootdown was
         // tearing down — HOLDER waits TLB ack, 8s panic.
-        let device_instance = *self.rm_device_instance.lock();
         // 1. Engine-class objects are RM children of the channel. Free them
         //    while the channel is still alive (child-before-parent). ctx_free
         //    would reap them; doing it here avoids a double-free of the shared
@@ -10273,8 +10282,8 @@ impl NvidiaGpu {
                     }
                 }
                 log::info!(
-                    "[nouveau-uapi] process exit pid={}: freed {} leftover class object(s) before channel",
-                    pid,
+                    "[nouveau-uapi] {}: freed {} leftover class object(s) before channel",
+                    why,
                     leftovers.len()
                 );
             }
@@ -10292,8 +10301,8 @@ impl NvidiaGpu {
                 let status = nvidia_rm_sys::rm_init::ctx_free(device_instance, ctx_idx);
                 super::nouveau_uapi::ctx_clear_wedged(ctx_idx);
                 log::info!(
-                    "[nouveau-uapi] process exit pid={}: freed CTX {} -> status={:#x}",
-                    pid,
+                    "[nouveau-uapi] {}: freed CTX {} -> status={:#x}",
+                    why,
                     ctx_idx,
                     status
                 );
@@ -10320,8 +10329,8 @@ impl NvidiaGpu {
             let dropped = self.forget_deferred_mappings_of(pid);
             if dropped > 0 {
                 log::info!(
-                    "[nouveau-uapi] process exit pid={}: dropped {} mapping(s) of closed objects still waiting on its ring (VAS freed)",
-                    pid,
+                    "[nouveau-uapi] {}: dropped {} mapping(s) of closed objects still waiting on its ring (VAS freed)",
+                    why,
                     dropped
                 );
             }
@@ -10329,11 +10338,16 @@ impl NvidiaGpu {
         // 3. Drop local VM_BIND bookkeeping. Skip the RM unmap when ctx_free
         //    already destroyed the VAS (a second vm_bind_unmap on a stale
         //    h_virt is a use-after-free in RM).
-        let dropped_maps = self.drain_vm_mappings(
-            &alloc::format!("process exit pid={}", pid),
-            |m| m.owner_pid == pid,
-            !ctx_freed,
-        );
+        let dropped_maps = self.drain_vm_mappings(why, |m| m.owner_pid == pid, !ctx_freed);
+        (ctx_freed, dropped_maps)
+    }
+
+    /// The RM side of a process exit: its context (`my_ctx`, already off
+    /// the pid registry), its mappings, its GEM objects and its channels.
+    fn release_process_finish(&self, pid: u64, my_ctx: Option<u32>) {
+        let device_instance = *self.rm_device_instance.lock();
+        let why = alloc::format!("process exit pid={}", pid);
+        let (_, dropped_maps) = self.retire_ctx(pid, my_ctx, device_instance, &why);
         // 4. Release this process's GEM objects, RESPECTING the PRIME share
         //    count. A buffer this process created may still be imported by
         //    ANOTHER holder: the compositor self-imports a client's on-screen
@@ -11117,6 +11131,7 @@ impl NvidiaGpu {
     /// `CHANNEL_ALLOC` for a GL/Vulkan client (not the sticky ctx-0 owner).
     fn channel_alloc_client(&self, owner_pid: u64, arg: usize) -> Result<usize, i32> {
         use super::nouveau_uapi as nv;
+        self.retire_wedged_ctx_of(owner_pid);
         let (ctx_idx, h_vas_out, notif_out) = self.ensure_ctx_for_pid(owner_pid, false);
         let ok = ctx_idx != 0;
         let mut chan = self.nouveau_channels.lock();
@@ -11157,6 +11172,90 @@ impl NvidiaGpu {
             }
         );
         Ok(0)
+    }
+
+    /// A CHANNEL_ALLOC by a process whose context is latched wedged and that
+    /// holds no RM channel any more retires that context first, so the
+    /// channel it gets is born on a fresh one.
+    ///
+    /// nouveau kills the channel a fault or a hang belongs to
+    /// (`nouveau_channel_kill`), and only it: the process's next
+    /// CHANNEL_ALLOC is a new fifo channel that works. That is how a client
+    /// recovers from VK_ERROR_DEVICE_LOST -- NVK reports it, the app
+    /// destroys the device (its channel goes with it) and creates another.
+    /// Here the context is the process's and the verdict was for life: the
+    /// device the app made to recover was born dead, EIO on every submit
+    /// until the process exited. A channel still open on the context keeps
+    /// it (they share its VAS; NVK's second instance in the same process,
+    /// on the desktop): the client frees that one first, as a device
+    /// destroy does.
+    ///
+    /// The GEM objects stay the process's: only the context, its VAS and
+    /// the mappings in it go, as on exit (`retire_ctx`), and a consumer
+    /// with an ACQUIRE queued on its semaphore keeps it as a zombie the
+    /// same way -- wearing the tombstone pid from the start, since the
+    /// process is alive and everything else it owns stays its own.
+    fn retire_wedged_ctx_of(&self, pid: u64) {
+        use super::nouveau_uapi as nv;
+        if pid == 0 {
+            return;
+        }
+        let device_instance = *self.rm_device_instance.lock();
+        if device_instance.is_none() {
+            return;
+        }
+        if self
+            .nouveau_channels
+            .lock()
+            .iter()
+            .any(|c| c.owner_pid == pid && c.rm_backed)
+        {
+            return;
+        }
+        let ctx_idx = {
+            let mut map = self.nouveau_pid_ctx.lock();
+            let Some(i) = map
+                .iter()
+                .position(|t| t.0 == pid && t.4 && t.1 >= 1 && nv::ctx_is_wedged(t.1))
+            else {
+                return;
+            };
+            let idx = map.remove(i).1;
+            // Reserved until the RM has freed it, as on exit.
+            self.nouveau_ctx_teardown.lock().push(idx);
+            idx
+        };
+        crate::klog_warn!(
+            "[nouveau-uapi] CHANNEL_ALLOC pid={}: its CTX {} is latched WEDGED and it holds no channel -- retiring it for a fresh one",
+            pid,
+            ctx_idx
+        );
+        let waiters = self.channels_waiting_on(ctx_idx);
+        if waiters.is_empty() {
+            let why = alloc::format!("CHANNEL_ALLOC pid={} wedged-context rebuild", pid);
+            self.retire_ctx(pid, Some(ctx_idx), device_instance, &why);
+            return;
+        }
+        // What the zombie's teardown must take is the context's alone: the
+        // mappings in its VAS, those of closed objects still waiting on a
+        // ring included (its class objects went with its channels, at
+        // their CHANNEL_FREE). Keyed by the tombstone from here on, so the
+        // process's exit takes nothing of the zombie's and the zombie's
+        // teardown nothing of the process's.
+        let tomb = ZOMBIE_PID_BASE | u64::from(ctx_idx);
+        let mut maps = rekey_owners(&mut self.nouveau_vm_mappings.lock(), pid, tomb, |m| {
+            &mut m.owner_pid
+        });
+        for d in self.nouveau_deferred_frees.lock().iter_mut() {
+            maps += rekey_owners(&mut d.mappings, pid, tomb, |m| &mut m.owner_pid);
+        }
+        log::info!(
+            "[nouveau-uapi] CHANNEL_ALLOC pid={}: wedged CTX {} keeps its {} mapping(s) as a zombie's",
+            pid,
+            ctx_idx,
+            maps
+        );
+        self.park_zombie(tomb, ctx_idx, waiters);
     }
 
     /// Software-only discovery channel when the RM is not attached yet.
@@ -13335,7 +13434,7 @@ impl NvidiaGpu {
                         let bit = 1u32 << ctx_idx;
                         if REPORTED.fetch_or(bit, Ordering::Relaxed) & bit == 0 {
                             crate::klog_warn!(
-                                "[nouveau-uapi] EXEC: pid={} submitting on CTX {}, latched WEDGED by an earlier fence timeout -- every submit fast-fails EIO (NVK: device-lost) until this process exits. {}",
+                                "[nouveau-uapi] EXEC: pid={} submitting on CTX {}, latched WEDGED by an earlier fence timeout -- every submit fast-fails EIO (NVK: device-lost) until this process exits or frees its channels and allocates anew. {}",
                                 owner_pid,
                                 ctx_idx,
                                 self.ctx_registry_summary()
@@ -13589,7 +13688,7 @@ impl NvidiaGpu {
                             nv::ctx_set_wedged(ctx_idx);
                             crate::klog_warn!(
                                 "[nouveau-uapi] EXEC: CTX {} wedged (fence timeout) -- fast-failing \
-                                 its submits until it exits so the compositor keeps running",
+                                 its submits until it exits or reallocates so the compositor keeps running",
                                 ctx_idx
                             );
                         }
@@ -17531,6 +17630,173 @@ mod nouveau_bookkeeping_tests {
         assert!(!nv::ctx_is_wedged(1));
         let ch = client_with_pushbuf(&gpu, A);
         assert_eq!(exec(&gpu, A, ch, &[push(PUSH_VA, 16)], &[], &[]), Ok(0));
+        assert!(syncobj::destroy(out));
+        gpu.nouveau_release_process(A);
+        gpu.nouveau_release_process(B);
+        assert_eq!(FAKE_RM.lock().bad, 0);
+    }
+
+    /// nouveau kills the channel a hang belongs to and only it: the
+    /// process's next CHANNEL_ALLOC is a new fifo channel that works, which
+    /// is how a client recovers from VK_ERROR_DEVICE_LOST (destroy the
+    /// device, its channel with it; create another). Here the verdict was
+    /// the process's for life, so the device made to recover was born dead.
+    #[test]
+    fn a_new_channel_after_the_wedged_one_is_freed_gets_a_fresh_context() {
+        let _g = LOCK.lock();
+        let _live = LiveBytes::hold();
+        let gpu = gpu_rm();
+        let ch = channel_alloc(&gpu, A).unwrap().channel as u32;
+        let h = gem_new_rm(&gpu, 65536, nv::NOUVEAU_GEM_DOMAIN_GART, A)
+            .unwrap()
+            .handle;
+        assert_eq!(vm_bind_ops(&gpu, A, &mut [map(h, PUSH_VA, 65536)]), Ok(0));
+        let out = syncobj::create(false);
+        assert_eq!(
+            exec(&gpu, A, ch, &[push(PUSH_VA, 16)], &[], &[sync(out)]),
+            Ok(0)
+        );
+        FAKE_RM.lock().fence_stalls = true;
+        crate::nvme::nvme_queue::test_clock::set_auto_advance(1000);
+        assert_eq!(
+            exec(&gpu, A, ch, &[push(PUSH_VA, 16)], &[], &[sync_tl(out, 2)]),
+            Err(nv::EIO)
+        );
+        crate::nvme::nvme_queue::test_clock::set_auto_advance(0);
+        FAKE_RM.lock().fence_stalls = false;
+        assert!(nv::ctx_is_wedged(1));
+        // A second channel while the first is still open shares its VAS:
+        // the same context, wedged as it is (NVK's other instance in the
+        // same process would be rendering in that VAS).
+        let before = FAKE_RM.lock().calls.len();
+        let ch2 = channel_alloc(&gpu, A).unwrap().channel as u32;
+        assert_eq!(rm_calls_since(before), [] as [&str; 0]);
+        assert_eq!(ctx_of(&gpu, A), Some((1, true)));
+        assert!(nv::ctx_is_wedged(1));
+        assert_eq!(
+            exec(&gpu, A, ch2, &[push(PUSH_VA, 16)], &[], &[]),
+            Err(nv::EIO)
+        );
+        assert_eq!(channel_free(&gpu, ch as i32, A), Ok(0));
+        assert_eq!(channel_free(&gpu, ch2 as i32, A), Ok(0));
+        assert!(nv::ctx_is_wedged(1), "freeing channels judges nothing");
+        // No channel left: the next CHANNEL_ALLOC retires the wedged context
+        // and the channel it hands out is on a fresh one.
+        let before = FAKE_RM.lock().calls.len();
+        let bytes = NOUVEAU_GEM_BYTES.load(Ordering::Relaxed);
+        let ch3 = channel_alloc(&gpu, A).unwrap().channel as u32;
+        let calls = rm_calls_since(before);
+        let freed = calls.iter().position(|c| *c == "ctx_free");
+        let built = calls.iter().position(|c| *c == "ctx_alloc");
+        assert!(
+            matches!((freed, built), (Some(f), Some(b)) if f < b),
+            "the old context freed, then a new one built: {:?}",
+            calls
+        );
+        assert!(!nv::ctx_is_wedged(1));
+        assert_eq!(ctx_of(&gpu, A), Some((1, true)));
+        assert!(gpu.nouveau_ctx_teardown.lock().is_empty());
+        assert!(gpu.nouveau_zombies.lock().is_empty());
+        // The VAS went with the context, and the mappings in it; the
+        // process's buffers are its own still.
+        assert!(
+            !gpu.nouveau_vm_mappings
+                .lock()
+                .iter()
+                .any(|m| m.owner_pid == A),
+            "no mapping survives its VAS"
+        );
+        assert!(
+            !calls.contains(&"vm_bind_unmap"),
+            "gone with the VAS: {:?}",
+            calls
+        );
+        assert!(
+            !calls.contains(&"gem_free"),
+            "the buffer is the process's: {:?}",
+            calls
+        );
+        assert_eq!(NOUVEAU_GEM_BYTES.load(Ordering::Relaxed), bytes);
+        assert!(gem_info(&gpu, h, A).is_ok());
+        assert_eq!(
+            exec(&gpu, A, ch3, &[push(PUSH_VA, 16)], &[], &[]),
+            Err(nv::EIO),
+            "nothing is bound at the old VA"
+        );
+        assert!(!nv::ctx_is_wedged(1), "a refused submit is not a hang");
+        assert_eq!(vm_bind_ops(&gpu, A, &mut [map(h, PUSH_VA, 65536)]), Ok(0));
+        let out2 = syncobj::create(false);
+        assert_eq!(
+            exec(&gpu, A, ch3, &[push(PUSH_VA, 16)], &[], &[sync(out2)]),
+            Ok(0),
+            "renders again"
+        );
+        assert_eq!(syncobj::query(out2), Some(1));
+        // A process with a live context that is not wedged is left alone by
+        // the same path.
+        let before = FAKE_RM.lock().calls.len();
+        assert_eq!(channel_free(&gpu, ch3 as i32, A), Ok(0));
+        let ch4 = channel_alloc(&gpu, A).unwrap().channel as u32;
+        assert_eq!(rm_calls_since(before), [] as [&str; 0]);
+        assert_eq!(
+            exec(&gpu, A, ch4, &[push(PUSH_VA, 16)], &[], &[]),
+            Ok(0),
+            "still bound: the context stayed"
+        );
+        assert!(syncobj::destroy(out));
+        assert!(syncobj::destroy(out2));
+        gpu.nouveau_release_process(A);
+        assert_eq!(FAKE_RM.lock().bad, 0);
+    }
+
+    /// The index of a context being retired is the RM's until `ctx_free`
+    /// returns: a newcomer arriving inside that window gets another, as
+    /// on exit -- or the RM would free the newcomer's context.
+    #[test]
+    fn the_index_of_a_wedged_context_being_retired_is_not_handed_to_a_newcomer() {
+        let _g = LOCK.lock();
+        let _live = LiveBytes::hold();
+        let gpu: &'static NvidiaGpu = alloc::boxed::Box::leak(alloc::boxed::Box::new(gpu_rm()));
+        let ch = client_with_pushbuf(gpu, A);
+        assert_eq!(ctx_of(gpu, A), Some((1, true)));
+        let out = syncobj::create(false);
+        FAKE_RM.lock().fence_stalls = true;
+        crate::nvme::nvme_queue::test_clock::set_auto_advance(1000);
+        assert_eq!(
+            exec(gpu, A, ch, &[push(PUSH_VA, 16)], &[], &[sync(out)]),
+            Err(nv::EIO)
+        );
+        crate::nvme::nvme_queue::test_clock::set_auto_advance(0);
+        FAKE_RM.lock().fence_stalls = false;
+        assert!(nv::ctx_is_wedged(1));
+        assert_eq!(channel_free(gpu, ch as i32, A), Ok(0));
+        let newcomer: std::sync::Arc<std::sync::Mutex<Option<(u32, Option<(u32, bool)>)>>> =
+            Default::default();
+        let sink = newcomer.clone();
+        *CTX_TEARDOWN_HOOK.lock() = Some(alloc::boxed::Box::new(move || {
+            if sink.lock().unwrap().is_some() {
+                return;
+            }
+            let ch = client_with_pushbuf(gpu, B);
+            *sink.lock().unwrap() = Some((ch, ctx_of(gpu, B)));
+        }));
+        let ch_a = channel_alloc(gpu, A).unwrap().channel as u32;
+        *CTX_TEARDOWN_HOOK.lock() = None;
+        let (ch_b, ctx_b) = newcomer
+            .lock()
+            .unwrap()
+            .take()
+            .expect("the newcomer came during the retirement");
+        assert_eq!(ctx_b, Some((2, true)), "not the index being retired");
+        assert_eq!(ctx_of(gpu, A), Some((1, true)), "free once freed");
+        assert!(!nv::ctx_is_wedged(1));
+        assert!(FAKE_RM.lock().ctxs.contains(&2), "B's context is alive");
+        assert_eq!(exec(gpu, B, ch_b, &[push(PUSH_VA, 16)], &[], &[]), Ok(0));
+        let h = gem_new_rm(gpu, 65536, nv::NOUVEAU_GEM_DOMAIN_GART, A)
+            .unwrap()
+            .handle;
+        assert_eq!(vm_bind_ops(gpu, A, &mut [map(h, PUSH_VA, 65536)]), Ok(0));
+        assert_eq!(exec(gpu, A, ch_a, &[push(PUSH_VA, 16)], &[], &[]), Ok(0));
         assert!(syncobj::destroy(out));
         gpu.nouveau_release_process(A);
         gpu.nouveau_release_process(B);
@@ -22058,6 +22324,153 @@ mod nouveau_bookkeeping_tests {
         assert!(syncobj::destroy(out2));
         assert!(syncobj::destroy(out3));
         gpu.nouveau_release_process(A);
+        gpu.nouveau_release_process(COMP);
+        assert_eq!(FAKE_RM.lock().bad, 0);
+    }
+
+    /// The rebuild of a wedged context a consumer still has an ACQUIRE
+    /// queued on: the context waits as a zombie, as on exit, and the
+    /// process renders on in a new one meanwhile. The zombie's teardown
+    /// takes the old context's own (the mapping in its VAS) and nothing of
+    /// the live process's; the process's exit, later, takes nothing of the
+    /// zombie's.
+    #[test]
+    fn a_wedged_context_a_consumer_waits_on_is_a_zombie_while_its_process_renders_on() {
+        let _g = LOCK.lock();
+        let _live = LiveBytes::hold();
+        let gpu = gpu_rm_ladder();
+        FAKE_RM.lock().peer = true;
+        test_clock::set_auto_advance(1_000);
+        let ch_c = client_with_pushbuf(&gpu, COMP);
+        let ch_a = channel_alloc(&gpu, A).unwrap().channel as u32;
+        let h_a = gem_new_rm(&gpu, 65536, nv::NOUVEAU_GEM_DOMAIN_GART, A)
+            .unwrap()
+            .handle;
+        assert_eq!(vm_bind_ops(&gpu, A, &mut [map(h_a, PUSH_VA, 65536)]), Ok(0));
+        let out = syncobj::create(false);
+        assert_eq!(
+            exec(&gpu, A, ch_a, &[push(PUSH_VA, 16)], &[], &[sync(out)]),
+            Ok(0)
+        );
+        assert_eq!(
+            exec(&gpu, COMP, ch_c, &[push(PUSH_VA, 16)], &[sync(out)], &[]),
+            Ok(0)
+        );
+        // A buffer of A's that B imports and B's ring still reads when A,
+        // the last holder, closes it: its free, and the unmap of its
+        // mappings -- A's in the VAS about to go among them -- wait for
+        // B's ring.
+        let ch_b = client_with_pushbuf(&gpu, B);
+        const FRAME_VA: u64 = PUSH_VA + 0x10_0000;
+        let h2 = gem_new_rm(&gpu, 65536, nv::NOUVEAU_GEM_DOMAIN_GART, A)
+            .unwrap()
+            .handle;
+        assert_eq!(vm_bind_ops(&gpu, A, &mut [map(h2, FRAME_VA, 65536)]), Ok(0));
+        assert!(crate::scheme::gem_mmap::add_ref(h2, B).is_some());
+        assert_eq!(vm_bind_ops(&gpu, B, &mut [map(h2, FRAME_VA, 65536)]), Ok(0));
+        assert_eq!(exec(&gpu, B, ch_b, &[push(FRAME_VA, 16)], &[], &[]), Ok(0));
+        assert!(gpu.nouveau_gem_close(h2, B));
+        assert!(gpu.nouveau_gem_close(h2, A));
+        assert_eq!(gpu.nouveau_deferred_frees.lock().len(), 1);
+        // A's fence never lands: the timeout's upcall latches its context.
+        let (fence_va, _, payload, ctx) = pending_hw_fence(out, 1).unwrap();
+        assert_eq!(ctx, 1);
+        gpu.fast_fence_timeout(1, fence_va, payload, out, 1);
+        assert!(nv::ctx_is_wedged(1));
+        assert_eq!(channel_free(&gpu, ch_a as i32, A), Ok(0));
+        // The compositor's ACQUIRE is still queued: the context is kept.
+        let before = FAKE_RM.lock().calls.len();
+        let bytes = NOUVEAU_GEM_BYTES.load(Ordering::Relaxed);
+        let ch_a2 = client_with_pushbuf(&gpu, A);
+        let calls = rm_calls_since(before);
+        assert!(
+            !calls.contains(&"ctx_free"),
+            "a zombie until its consumer passes: {:?}",
+            calls
+        );
+        assert_eq!(gpu.nouveau_zombies.lock().len(), 1);
+        assert_eq!(ctx_of(&gpu, A), Some((3, true)), "a fresh context");
+        assert!(!nv::ctx_is_wedged(3));
+        assert!(nv::ctx_is_wedged(1), "the zombie keeps its verdict");
+        assert!(
+            peer_map(0, 1).is_some(),
+            "the compositor's mapping of its page stays"
+        );
+        assert_eq!(
+            NOUVEAU_GEM_BYTES.load(Ordering::Relaxed) - bytes,
+            65536,
+            "the new pushbuf, and nothing of A's freed"
+        );
+        assert!(gem_info(&gpu, h_a, A).is_ok(), "A's buffer is A's still");
+        assert_eq!(
+            gpu.nouveau_vm_mappings
+                .lock()
+                .iter()
+                .filter(|m| m.va == PUSH_VA && m.owner_pid != COMP && m.owner_pid != B)
+                .count(),
+            2,
+            "the zombie's mapping in its VAS and A's in the new one"
+        );
+        let out2 = syncobj::create(false);
+        assert_eq!(
+            exec(&gpu, A, ch_a2, &[push(PUSH_VA, 16)], &[], &[sync(out2)]),
+            Ok(0),
+            "renders on"
+        );
+        assert_eq!(run_gpu(3).len(), 2);
+        assert_eq!(syncobj::query(out2), Some(1));
+        // The compositor passes its ACQUIRE on a page that is still there,
+        // and the zombie is due.
+        assert_eq!(run_gpu(0).len(), 2);
+        let before = FAKE_RM.lock().calls.len();
+        let bytes = NOUVEAU_GEM_BYTES.load(Ordering::Relaxed);
+        gpu.reap_zombie_contexts();
+        let calls = rm_calls_since(before);
+        assert!(calls.contains(&"ctx_free"), "its context: {:?}", calls);
+        assert!(!calls.contains(&"gem_free"), "nothing of A's: {:?}", calls);
+        assert!(gpu.nouveau_zombies.lock().is_empty());
+        assert!(!nv::ctx_is_wedged(1));
+        // The closed buffer still waits for B's ring, with B's mapping
+        // only: A's went with the VAS, and unmapping it later would be a
+        // stale handle in the RM.
+        {
+            let deferred = gpu.nouveau_deferred_frees.lock();
+            assert_eq!(deferred.len(), 1);
+            assert_eq!(deferred[0].mappings.len(), 1);
+            assert_eq!(deferred[0].mappings[0].owner_pid, B);
+        }
+        assert_eq!(NOUVEAU_GEM_BYTES.load(Ordering::Relaxed), bytes);
+        assert_eq!(peer_map(0, 1), None);
+        assert!(!has_chan(1));
+        assert_eq!(
+            gpu.nouveau_vm_mappings
+                .lock()
+                .iter()
+                .filter(|m| m.owner_pid == A)
+                .count(),
+            1,
+            "A's mapping in its new VAS; the zombie's is gone"
+        );
+        assert_eq!(ctx_of(&gpu, A), Some((3, true)));
+        assert_eq!(
+            exec(&gpu, A, ch_a2, &[push(PUSH_VA, 16)], &[], &[]),
+            Ok(0),
+            "and on"
+        );
+        assert_eq!(run_gpu(3).len(), 1);
+        // B's ring passes the closed buffer; A's exit takes A's: both
+        // pushbufs, and the closed buffer, B's mapping of it unmapped and
+        // nothing of the VAS that is gone.
+        assert_eq!(run_gpu(2).len(), 2, "B's push and the probe");
+        let before = FAKE_RM.lock().calls.len();
+        gpu.nouveau_release_process(A);
+        let calls = rm_calls_since(before);
+        assert_eq!(calls.iter().filter(|c| **c == "gem_free").count(), 3);
+        assert_eq!(calls.iter().filter(|c| **c == "vm_bind_unmap").count(), 1);
+        assert!(gpu.nouveau_deferred_frees.lock().is_empty());
+        assert!(syncobj::destroy(out));
+        assert!(syncobj::destroy(out2));
+        gpu.nouveau_release_process(B);
         gpu.nouveau_release_process(COMP);
         assert_eq!(FAKE_RM.lock().bad, 0);
     }
