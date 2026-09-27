@@ -14176,8 +14176,13 @@ impl NvidiaGpu {
                 // the producer was still rendering into answer at once, and
                 // a producer write into a buffer the compositor was still
                 // sampling.
-                const NOUVEAU_GEM_CPU_PREP_NOWAIT: u32 = 0x2;
-                let nowait = req.flags & NOUVEAU_GEM_CPU_PREP_NOWAIT != 0;
+                // `NOWAIT` is bit 0 of the flags, as `nouveau_drm.h` has it
+                // and as libdrm's `nouveau_bo_wait(NOUVEAU_BO_NOBLOCK)` sends
+                // it. This read bit 1, which no header defines: a client's
+                // NOWAIT blocked for the whole of the queued work (Gallium
+                // polling a query result, a `PIPE_MAP_DONTBLOCK` map), and
+                // nothing but this file's own tests ever set bit 1.
+                let nowait = req.flags & nv::NOUVEAU_GEM_CPU_PREP_NOWAIT != 0;
                 // A pid listed twice (the caller maps it too, or maps it at
                 // two VAs) costs nothing: once its channel has been waited
                 // for it is idle and the next wait appends no probe.
@@ -15052,7 +15057,11 @@ mod nouveau_bookkeeping_tests {
     }
 
     fn cpu_prep_nowait(gpu: &NvidiaGpu, handle: u32, pid: u64) -> Result<usize, i32> {
-        let mut r = nv::DrmNouveauGemCpuPrep { handle, flags: 0x2 };
+        cpu_prep_flags(gpu, handle, nv::NOUVEAU_GEM_CPU_PREP_NOWAIT, pid)
+    }
+
+    fn cpu_prep_flags(gpu: &NvidiaGpu, handle: u32, flags: u32, pid: u64) -> Result<usize, i32> {
+        let mut r = nv::DrmNouveauGemCpuPrep { handle, flags };
         call(
             gpu,
             wr::<nv::DrmNouveauGemCpuPrep>(nv::NR_GEM_CPU_PREP),
@@ -18840,6 +18849,62 @@ mod nouveau_bookkeeping_tests {
         );
         gpu.nouveau_release_process(A);
         gpu.nouveau_release_process(STRANGER);
+        assert_eq!(FAKE_RM.lock().bad, 0);
+    }
+
+    /// The `NOWAIT` bit is the one `nouveau_drm.h` defines and libdrm sends,
+    /// bit 0; `WRITE` (bit 2) is not it, and neither is bit 1, which no
+    /// header defines. This used to read bit 1: a client's NOWAIT waited
+    /// for the whole of the queued work, and the tests above proved NOWAIT
+    /// with a bit no client sends.
+    #[test]
+    fn cpu_prep_nowait_is_bit_zero_as_libdrm_sends_it_and_write_is_not_it() {
+        let _g = LOCK.lock();
+        let _live = LiveBytes::hold();
+        let gpu = gpu_rm_fast();
+        let ch = client_with_pushbuf(&gpu, A);
+        let h = gem_new_rm(&gpu, 4096, nv::NOUVEAU_GEM_DOMAIN_GART, A)
+            .unwrap()
+            .handle;
+        assert_eq!(exec(&gpu, A, ch, &[push(PUSH_VA, 16)], &[], &[]), Ok(0));
+        let c = chan(1);
+        assert_eq!(userd(&c), (0, 1));
+        // Nothing runs the GPU. 1 ms per clock read: a wait that blocks is
+        // the 10 s timeout, in virtual time, and answers EBUSY too -- what
+        // tells a blocking prep from a NOWAIT one is the clock.
+        test_clock::set_auto_advance(1000);
+        for (flags, what) in [
+            (nv::NOUVEAU_GEM_CPU_PREP_NOWAIT, "NOWAIT"),
+            (
+                nv::NOUVEAU_GEM_CPU_PREP_NOWAIT | nv::NOUVEAU_GEM_CPU_PREP_WRITE,
+                "NOWAIT | WRITE",
+            ),
+            (nv::NOUVEAU_GEM_CPU_PREP_NOWAIT | 0x2, "NOWAIT plus bit 1"),
+        ] {
+            let t0 = test_clock::now();
+            assert_eq!(cpu_prep_flags(&gpu, h, flags, A), Err(nv::EBUSY), "{what}");
+            assert!(
+                test_clock::now() - t0 < 100_000,
+                "{what}: waited {} us instead of answering at once",
+                test_clock::now() - t0
+            );
+        }
+        for (flags, what) in [
+            (0, "no flags"),
+            (nv::NOUVEAU_GEM_CPU_PREP_WRITE, "WRITE"),
+            (0x2, "bit 1, which no header defines"),
+        ] {
+            let t0 = test_clock::now();
+            assert_eq!(cpu_prep_flags(&gpu, h, flags, A), Err(nv::EBUSY), "{what}");
+            assert!(
+                test_clock::now() - t0 >= 10_000_000,
+                "{what}: answered after {} us instead of waiting the 10 s",
+                test_clock::now() - t0
+            );
+        }
+        test_clock::set_auto_advance(0);
+        assert!(!nv::ctx_is_wedged(1), "a slow GPU is not a hung one");
+        gpu.nouveau_release_process(A);
         assert_eq!(FAKE_RM.lock().bad, 0);
     }
 

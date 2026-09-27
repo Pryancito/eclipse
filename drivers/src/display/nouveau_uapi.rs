@@ -886,6 +886,17 @@ pub(super) struct DrmNouveauGemCpuPrep {
     pub flags: u32,
 }
 
+/// `drm_nouveau_gem_cpu_prep.flags`, as `nouveau_drm.h` defines them (and
+/// as libdrm's `nouveau_bo_wait` sends them): `NOWAIT` is bit 0 and answers
+/// EBUSY instead of blocking; `WRITE` is bit 2 and says the CPU will write.
+/// Bit 1 is nothing. Linux ignores bits it does not know.
+pub(super) const NOUVEAU_GEM_CPU_PREP_NOWAIT: u32 = 0x0000_0001;
+/// Linux waits only the write fences for a read prep and every fence for a
+/// write one; here every queued submission counts as a write, so the bit
+/// changes nothing and only the tests name it.
+#[allow(dead_code)]
+pub(super) const NOUVEAU_GEM_CPU_PREP_WRITE: u32 = 0x0000_0004;
+
 #[repr(C)]
 pub(super) struct DrmNouveauGemCpuFini {
     pub handle: u32,
