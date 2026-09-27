@@ -135,7 +135,7 @@ Leyenda: ✅ implementado · 🟡 parcial / no-op deliberado · ❌ no implement
 | `DRM_IOCTL_MODE_GETENCODER` | ✅ | encoder `VIRTUAL`, `possible_crtcs=1`; `crtc_id=0` mientras el CRTC no tiene modo |
 | `DRM_IOCTL_MODE_GETCONNECTOR` | ✅ | 1 modo = resolución nativa (preferido); propiedades estándar (ver abajo); `encoder_id=0` mientras el CRTC no tiene modo |
 | `DRM_IOCTL_MODE_GETPLANERESOURCES` | ✅ | 1 plano primario |
-| `DRM_IOCTL_MODE_GETPLANE` | ✅ | formatos `XR24`/`AR24` |
+| `DRM_IOCTL_MODE_GETPLANE` | ✅ | formatos `XR24`/`AR24`; `crtc_id` y `fb_id` son el CRTC y el framebuffer que el plano primario muestra (como `plane->state->crtc`/`->fb`): 0 y 0 con el CRTC apagado por `SETCRTC` sin modo o `RMFB` del scanout, sin cambio con DPMS off, y el fb sigue a cada flip; el id de fb propio del driver nunca sale |
 | `DRM_IOCTL_MODE_SETPLANE` | ✅ | equivale a *scanout* del fb (ruta primaria SW) |
 | `DRM_IOCTL_MODE_PAGE_FLIP` | ✅ | *scanout*; `DRM_EVENT_FLIP_COMPLETE` (con `crtc_id` y la secuencia de vblank) solo con `PAGE_FLIP_EVENT`; `ASYNC`/`TARGET_*`/flags desconocidos → EINVAL, fb desconocido → ENOENT |
 | `DRM_IOCTL_MODE_OBJ_GETPROPERTIES` | ✅ | tabla de propiedades por objeto; las propiedades `DRM_MODE_PROP_ATOMIC` solo se muestran a clientes atómicos (mismo filtrado que Linux) |

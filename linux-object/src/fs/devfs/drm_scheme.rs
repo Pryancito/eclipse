@@ -8233,6 +8233,76 @@ mod kms_scanout_tests {
         c.destroy_dumb(other.handle).expect("DESTROY_DUMB");
     }
 
+    /// `drm_mode_getplane` reports `plane->state->crtc` and `plane->state->fb`:
+    /// the CRTC and framebuffer the primary plane shows, 0 and 0 once the
+    /// pipe is disabled (a `SETCRTC` without a mode, an `RMFB` of the
+    /// scanout) and unchanged under DPMS off, and the fb follows a page
+    /// flip. Here the synthetic plane answered its CRTC always and no
+    /// framebuffer ever, so a client reading the plane back saw a plane on a
+    /// CRTC with nothing on it whatever was on the screen.
+    #[test]
+    fn the_primary_plane_reports_its_crtc_and_framebuffer_only_while_it_has_them() {
+        let _screen = kms_emu::attach(32, 8);
+        let c = Client::open(0);
+        let buf = c.create_dumb(32, 8);
+        let fb = c.addfb2(&buf);
+        let next = c.create_dumb(32, 8);
+        let fb_next = c.addfb2(&next);
+        let plane = || {
+            let mut res: DrmModeGetPlane = unsafe { core::mem::zeroed() };
+            res.plane_id = drm::SYNTH_PLANE_ID;
+            c.ioctl(DRM_IOCTL_MODE_GETPLANE, &mut res)
+                .expect("GETPLANE");
+            (res.crtc_id, res.fb_id)
+        };
+
+        set_crtc(&c, drm::SYNTH_CRTC_ID, fb, 32, 8);
+        assert_eq!(plane(), (drm::SYNTH_CRTC_ID, fb), "with the fb on the CRTC");
+
+        let mut disable: DrmModeGetCrtc = unsafe { core::mem::zeroed() };
+        disable.crtc_id = drm::SYNTH_CRTC_ID;
+        assert_eq!(c.ioctl(DRM_IOCTL_MODE_SETCRTC, &mut disable), Ok(0));
+        assert_eq!(plane(), (0, 0), "after SETCRTC without a mode");
+
+        set_crtc(&c, drm::SYNTH_CRTC_ID, fb, 32, 8);
+        #[repr(C)]
+        struct ConnectorSetProperty {
+            value: u64,
+            prop_id: u32,
+            connector_id: u32,
+        }
+        let mut dpms = ConnectorSetProperty {
+            value: 3, // Off
+            prop_id: PROP_DPMS,
+            connector_id: drm::SYNTH_CONNECTOR_ID,
+        };
+        assert_eq!(c.ioctl(DRM_IOCTL_MODE_SETPROPERTY, &mut dpms), Ok(0));
+        assert_eq!(
+            plane(),
+            (drm::SYNTH_CRTC_ID, fb),
+            "DPMS off keeps the plane state"
+        );
+        dpms.value = DRM_MODE_DPMS_ON;
+        assert_eq!(c.ioctl(DRM_IOCTL_MODE_SETPROPERTY, &mut dpms), Ok(0));
+
+        assert_eq!(c.page_flip(drm::SYNTH_CRTC_ID, fb_next, 0), Ok(0));
+        assert_eq!(
+            plane(),
+            (drm::SYNTH_CRTC_ID, fb_next),
+            "the fb follows a flip"
+        );
+        drm::flush_pending_flip_completions();
+        let mut sink = [0u8; 64];
+        let _ = c.read_events(&mut sink);
+
+        c.rmfb(fb_next).expect("RMFB");
+        assert_eq!(plane(), (0, 0), "after RMFB of the scanout framebuffer");
+
+        c.rmfb(fb).expect("RMFB");
+        c.destroy_dumb(buf.handle).expect("DESTROY_DUMB");
+        c.destroy_dumb(next.handle).expect("DESTROY_DUMB");
+    }
+
     /// `drm_mode_cursor_common` reads the flags before it looks the CRTC up:
     /// no flag at all, or one it does not know, is EINVAL, ahead of the
     /// ENOENT of a CRTC that does not exist. And a handle is wrapped in a
@@ -13810,6 +13880,37 @@ mod hw_kms_tests {
         disable.crtc_id = 60;
         assert_eq!(c.ioctl(DRM_IOCTL_MODE_SETCRTC, &mut disable), Ok(0));
         assert_eq!(read(), (0, 0), "the driver's own fb id showed through");
+
+        c.rmfb(fb).expect("RMFB");
+        c.destroy_dumb(buf.handle).expect("DESTROY_DUMB");
+    }
+
+    /// The hardware driver's `get_plane` carries its own framebuffer id, in
+    /// its own namespace (`EMU_DRIVER_FB_BASE`), like its `get_crtc`. The
+    /// core reports the DRM framebuffer on the plane instead, and 0 with no
+    /// CRTC once the pipe is disabled; the driver's id must never show.
+    #[test]
+    fn the_hardware_primary_plane_never_shows_the_drivers_own_fb_id() {
+        let screen = kms_emu::attach(32, 8);
+        let _gpu = screen.attach_gpu(EmuGpu::hardware_kms("emu-gpu").with_ids(60, 61, 62));
+        let c = Client::open(0);
+        let buf = c.create_dumb(32, 8);
+        let fb = c.addfb2(&buf);
+        let plane = || {
+            let mut res: DrmModeGetPlane = zeroed();
+            res.plane_id = 62;
+            c.ioctl(DRM_IOCTL_MODE_GETPLANE, &mut res)
+                .expect("GETPLANE");
+            (res.crtc_id, res.fb_id)
+        };
+        assert_eq!(plane(), (0, 0), "nothing on the plane yet");
+        set_crtc(&c, 60, fb, 32, 8);
+        assert_eq!(plane(), (60, fb), "the DRM framebuffer, not the driver's");
+
+        let mut disable: DrmModeGetCrtc = zeroed();
+        disable.crtc_id = 60;
+        assert_eq!(c.ioctl(DRM_IOCTL_MODE_SETCRTC, &mut disable), Ok(0));
+        assert_eq!(plane(), (0, 0), "the driver's own fb id showed through");
 
         c.rmfb(fb).expect("RMFB");
         c.destroy_dumb(buf.handle).expect("DESTROY_DUMB");
