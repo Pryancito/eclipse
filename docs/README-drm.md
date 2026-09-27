@@ -107,7 +107,7 @@ Leyenda: ✅ implementado · 🟡 parcial / no-op deliberado · ❌ no implement
 
 | ioctl | Estado | Notas |
 |---|---|---|
-| `DRM_IOCTL_MODE_CREATE_DUMB` | ✅ | memoria física contigua vía VMO; *pitch* alineado a 64 B. El `mmap` comparte el VMO del buffer (cacheado, WB): el mapeo y cada framebuffer construido sobre el handle mantienen la memoria viva tras `DESTROY_DUMB`, como el refcount de `drm_gem_object` |
+| `DRM_IOCTL_MODE_CREATE_DUMB` | ✅ | memoria física contigua vía VMO; *pitch* = `ceil(bpp/8) * width` alineado a 64 B; ancho, alto o bpp a 0 son EINVAL como en `drm_mode_create_dumb`. El `mmap` comparte el VMO del buffer (cacheado, WB): el mapeo y cada framebuffer construido sobre el handle mantienen la memoria viva tras `DESTROY_DUMB`, como el refcount de `drm_gem_object` |
 | `DRM_IOCTL_MODE_MAP_DUMB` | ✅ | *offset* = `handle << 12`; `mmap` mapea el VMO físico |
 | `DRM_IOCTL_MODE_DESTROY_DUMB` | ✅ | |
 | `DRM_IOCTL_GEM_CLOSE` | ✅ | |
