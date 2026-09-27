@@ -62,10 +62,11 @@ impl Exceptionate {
     }
 
     /// Send exception to the user-owned endpoint.
-    pub(super) fn send_exception(
-        &self,
-        exception: &Arc<Exception>,
-    ) -> ZxResult<oneshot::Receiver<()>> {
+    ///
+    /// Private on purpose: everything outside this module goes through
+    /// [`Exception::send_to`], which is what keeps the exception's channel
+    /// kind true before the packet becomes readable.
+    fn send_exception(&self, exception: &Arc<Exception>) -> ZxResult<oneshot::Receiver<()>> {
         debug!(
             "Exception: {:?} ,try send to {:?}",
             exception.type_, self.type_
@@ -426,6 +427,31 @@ impl Exception {
         }
     }
 
+    /// Hand this exception to one handler, saying which kind of channel it is
+    /// going out on **before** the packet can be read.
+    ///
+    /// The order matters, and that is why the two live in one function. The
+    /// moment `send_exception` returns, the packet is sitting readable on the
+    /// handler's end of the channel, and a handler on another CPU can already
+    /// be holding the exception handle that came with it. Both
+    /// `zx_exception_get_process` and `zx_exception_set_strategy` answer from
+    /// `current_channel_type`, so publishing it *after* the send left a window
+    /// in which it still read `None`: a **thread**-level handler was handed a
+    /// process handle the API says it may never have, and a debugger asking
+    /// for its second chance got `BAD_STATE` instead.
+    ///
+    /// A handler that declines gives the exception back, so the next one in
+    /// the chain does not inherit its kind.
+    pub(super) fn send_to(
+        self: &Arc<Self>,
+        exceptionate: &Arc<Exceptionate>,
+    ) -> ZxResult<oneshot::Receiver<()>> {
+        self.inner.lock().current_channel_type = exceptionate.type_;
+        exceptionate.send_exception(self).inspect_err(|_| {
+            self.inner.lock().current_channel_type = ExceptionChannelType::None;
+        })
+    }
+
     /// Handle the exception with a customized iterator.
     ///
     /// If `first_only` is true, this will only send exception to the first one that received the exception
@@ -436,12 +462,11 @@ impl Exception {
         first_only: bool,
     ) -> ZxResult {
         for exceptionate in exceptionates.into_iter() {
-            let closed = match exceptionate.send_exception(self) {
+            let closed = match self.send_to(&exceptionate) {
                 // This channel is not available now!
                 Err(ZxError::NEXT) => continue,
                 res => res?,
             };
-            self.inner.lock().current_channel_type = exceptionate.type_;
             // If this error, the sender is dropped, and the handle should also be closed.
             closed.await.ok();
             let handled = {
@@ -568,6 +593,7 @@ impl Iterator for JobDebuggerIterator {
 mod tests {
     use super::*;
     use crate::task::*;
+    use alloc::boxed::Box;
     use core::convert::TryInto;
 
     #[test]
@@ -977,6 +1003,92 @@ mod tests {
         let without = ExceptionReport::new(ExceptionType::ThreadStarting, None);
         assert_eq!(with_context.context, without.context);
         assert_eq!(with_context.context, ExceptionContext::default());
+    }
+
+    #[test]
+    /// A handler can read the packet the instant the send returns, so which
+    /// kind of channel the exception went out on has to be true by then:
+    /// `zx_exception_get_process` and `zx_exception_set_strategy` both answer
+    /// from it, and a thread-level handler reaching the process is the one the
+    /// API forbids outright.
+    fn the_channel_kind_is_true_before_the_packet_can_be_read() {
+        let thread = a_thread();
+        let exception = page_fault(&thread);
+        let e = Exceptionate::new(ExceptionChannelType::Thread);
+        let handler = e.create_channel(Rights::DEFAULT_THREAD).unwrap();
+        // Kept, so the exception object in the packet stays alive.
+        let _closed = exception.send_to(&e).unwrap();
+        assert_eq!(
+            exception.current_channel_type(),
+            ExceptionChannelType::Thread,
+        );
+
+        let packet = handler.read().unwrap();
+        let object = packet.handles[0]
+            .object
+            .clone()
+            .downcast_arc::<ExceptionObject>()
+            .unwrap();
+        assert_eq!(
+            object.get_process_handle().err(),
+            Some(ZxError::ACCESS_DENIED),
+            "a thread handler must not reach the process",
+        );
+        assert_eq!(
+            object.set_strategy(1).err(),
+            Some(ZxError::BAD_STATE),
+            "and it is not a debugger either",
+        );
+    }
+
+    #[test]
+    /// And "by then" means exactly this: `Channel::write` raises `READABLE` on
+    /// the handler's end from inside the send, and the signal callbacks run
+    /// there and then. That is the earliest instant a handler on another CPU
+    /// could have the packet, so it is the instant the kind has to be right --
+    /// which is why the publish and the send live in one function instead of
+    /// being two statements of the caller's loop.
+    fn the_kind_is_already_right_where_a_handler_could_first_look() {
+        let thread = a_thread();
+        let exception = page_fault(&thread);
+        let e = Exceptionate::new(ExceptionChannelType::Thread);
+        let handler = e.create_channel(Rights::DEFAULT_THREAD).unwrap();
+
+        let seen = Arc::new(Mutex::new(None));
+        let watched = exception.clone();
+        let out = seen.clone();
+        let readable: Arc<dyn KernelObject> = handler.clone();
+        readable.add_signal_callback(Box::new(move |s| {
+            if s.contains(Signal::READABLE) {
+                *out.lock() = Some(watched.current_channel_type());
+            }
+            false
+        }));
+
+        let _closed = exception.send_to(&e).unwrap();
+        assert_eq!(
+            *seen.lock(),
+            Some(ExceptionChannelType::Thread),
+            "the packet was readable before the exception knew whose it was",
+        );
+    }
+
+    #[test]
+    /// The other half: a handler that declines hands the exception back, so
+    /// the next link in the chain does not inherit a kind it never had.
+    fn a_handler_that_declines_does_not_leave_its_kind_behind() {
+        let thread = a_thread();
+        let exception = page_fault(&thread);
+        let nobody_home = Exceptionate::new(ExceptionChannelType::Debugger);
+        assert_eq!(exception.send_to(&nobody_home).err(), Some(ZxError::NEXT));
+        assert_eq!(exception.current_channel_type(), ExceptionChannelType::None,);
+
+        let (object, _closed) = ExceptionObject::create(exception, Rights::DEFAULT_JOB);
+        assert_eq!(
+            object.set_strategy(1).err(),
+            Some(ZxError::BAD_STATE),
+            "nobody is holding this exception, so nobody sets its strategy",
+        );
     }
 
     #[test]

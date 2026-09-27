@@ -1070,11 +1070,7 @@ impl CurrentThread {
             exception
         };
         if type_ == ExceptionType::ThreadExiting {
-            let handled = self
-                .0
-                .proc()
-                .debug_exceptionate()
-                .send_exception(&exception);
+            let handled = exception.send_to(&self.0.proc().debug_exceptionate());
             if let Ok(future) = handled {
                 self.dying_run(future).await.ok();
             }
