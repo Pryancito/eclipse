@@ -4224,11 +4224,8 @@ impl PciDriver for E1000eDriverPci {
             return Err(DeviceError::IoError);
         };
 
-        if let Some(m) = mapper {
-            m.query_or_map(bar0_addr, 128 * 1024);
-        }
-
-        let vaddr = crate::net::phys_to_virt(bar0_addr);
+        // Through the base the mapper returns: see `bus::resolve_window`.
+        let vaddr = crate::bus::resolve_window(mapper, bar0_addr, 128 * 1024, 0);
         let name = crate::net::next_eth_ifname();
 
         unsafe {

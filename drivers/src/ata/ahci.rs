@@ -1563,9 +1563,8 @@ impl PciDriver for AhciDriverPci {
 
         let map_len = len.max(4096 * 8);
 
-        if let Some(m) = mapper {
-            m.query_or_map(addr, map_len);
-        }
+        // Through the base the mapper returns: see `bus::resolve_window`.
+        let mapped_vaddr = crate::bus::resolve_window(mapper, addr, map_len, 0);
 
         #[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
         unsafe {
@@ -1575,7 +1574,7 @@ impl PciDriver for AhciDriverPci {
             am.write16(ops, dev.loc, 0x04, pci_command | 0x0004 | 0x0002 | 0x0001);
         }
 
-        let vaddr = phys_to_virt(addr);
+        let vaddr = mapped_vaddr;
         let vector = irq.map(|idx| idx + 32).unwrap_or(33);
         let mut disks = AhciInterface::new_all(vaddr, vector)?;
         // The PCI probe framework returns a single `Device` per function, but
