@@ -1673,6 +1673,34 @@ impl DrmDev {
                 // frame is dirty" (true DIRTYFB semantics for num_clips == 0).
                 const MAX_DIRTY_SPANS: usize = 8;
                 let cmd = unsafe { *(data as *const DrmModeFbDirtyCmd) };
+                // `drm_mode_dirtyfb_ioctl`, in its order: a flag it does not
+                // define is EINVAL; the fb is looked up (ENOENT); a clip count
+                // without a pointer, or a pointer without a count, is EINVAL;
+                // ANNOTATE_COPY clips come in (src, dst) pairs, so an odd
+                // count is EINVAL; more than DRM_MODE_FB_DIRTY_MAX_CLIPS is
+                // EINVAL. None of it was read: a flush of a framebuffer that
+                // does not exist, or with a clip list the kernel could not
+                // have read, was reported as done.
+                const DRM_MODE_FB_DIRTY_ANNOTATE_COPY: u32 = 0x01;
+                const DRM_MODE_FB_DIRTY_ANNOTATE_FILL: u32 = 0x02;
+                const DRM_MODE_FB_DIRTY_MAX_CLIPS: u32 = 256;
+                if cmd.flags & !(DRM_MODE_FB_DIRTY_ANNOTATE_COPY | DRM_MODE_FB_DIRTY_ANNOTATE_FILL)
+                    != 0
+                {
+                    return Err(FsError::InvalidParam);
+                }
+                if drm::get_fb(cmd.fb_id).is_none() {
+                    return Err(FsError::EntryNotFound);
+                }
+                if (cmd.num_clips == 0) != (cmd.clips_ptr == 0) {
+                    return Err(FsError::InvalidParam);
+                }
+                if cmd.flags & DRM_MODE_FB_DIRTY_ANNOTATE_COPY != 0 && cmd.num_clips % 2 != 0 {
+                    return Err(FsError::InvalidParam);
+                }
+                if cmd.num_clips > DRM_MODE_FB_DIRTY_MAX_CLIPS {
+                    return Err(FsError::InvalidParam);
+                }
                 let mut spans = [(0u32, 0u32, 0u32, 0u32); MAX_DIRTY_SPANS];
                 let mut n = 0usize;
                 let mut area = 0u64;
@@ -7082,6 +7110,67 @@ mod kms_scanout_tests {
 
     fn clip(x1: u16, y1: u16, x2: u16, y2: u16) -> DrmClipRect {
         DrmClipRect { x1, y1, x2, y2 }
+    }
+
+    /// What `drm_mode_dirtyfb_ioctl` refuses before any driver sees the
+    /// flush: an unknown flag (EINVAL), a framebuffer that does not exist
+    /// (ENOENT), a clip count and a clip pointer that disagree about whether
+    /// there are clips (EINVAL), an odd count with ANNOTATE_COPY, whose clips
+    /// come in pairs (EINVAL), and more than 256 clips (EINVAL). None of it
+    /// was read: every one of these came back as a flush done. The shapes
+    /// Xorg's modesetting shadow sends keep going through.
+    #[test]
+    fn dirtyfb_refuses_what_linux_refuses() {
+        let _screen = kms_emu::attach(64, 16);
+        let c = Client::open(0);
+        let buf = c.create_dumb(64, 16);
+        paint(&buf, |x, y| tag(0x0066_0000, x, y));
+        let fb = c.addfb2(&buf);
+        set_crtc(&c, drm::SYNTH_CRTC_ID, fb, 64, 16);
+
+        let clips = [clip(0, 0, 16, 8), clip(16, 8, 32, 16)];
+        let ptr = clips.as_ptr() as u64;
+        let dirty = |fb_id: u32, flags: u32, num_clips: u32, clips_ptr: u64| {
+            let mut cmd = DrmModeFbDirtyCmd {
+                fb_id,
+                flags,
+                color: 0,
+                num_clips,
+                clips_ptr,
+            };
+            c.ioctl(DRM_IOCTL_MODE_DIRTYFB, &mut cmd)
+        };
+        const ANNOTATE_COPY: u32 = 0x01;
+        const ANNOTATE_FILL: u32 = 0x02;
+        let einval = Err(FsError::InvalidParam);
+
+        assert_eq!(dirty(4242, 0, 1, ptr), Err(FsError::EntryNotFound));
+        assert_eq!(
+            dirty(fb, 0x4, 1, ptr),
+            einval,
+            "a flag Linux does not define"
+        );
+        assert_eq!(dirty(fb, 0, 1, 0), einval, "clips without a pointer");
+        assert_eq!(dirty(fb, 0, 0, ptr), einval, "a pointer without clips");
+        assert_eq!(
+            dirty(fb, ANNOTATE_COPY, 1, ptr),
+            einval,
+            "copy clips come in pairs"
+        );
+        assert_eq!(
+            dirty(fb, 0, 257, ptr),
+            einval,
+            "more clips than the kernel reads"
+        );
+
+        assert_eq!(dirty(fb, 0, 256, ptr), Ok(0), "exactly the kernel's limit");
+        assert_eq!(dirty(fb, ANNOTATE_COPY, 2, ptr), Ok(0));
+        assert_eq!(dirty(fb, ANNOTATE_FILL, 1, ptr), Ok(0));
+        assert_eq!(dirty(fb, 0, 2, ptr), Ok(0));
+        assert_eq!(dirty(fb, 0, 0, 0), Ok(0), "no clips: the whole frame");
+
+        assert_eq!(c.rmfb(fb), Ok(0));
+        assert_eq!(c.destroy_dumb(buf.handle), Ok(0));
     }
 
     /// `struct drm_mode_cursor`, 28 bytes -- the layout the ioctl number
