@@ -409,8 +409,9 @@ impl DrmDev {
     /// syscall path and can really sleep.
     ///
     /// Every early return leaves the commit behaving exactly as before this
-    /// existed: a malformed request, an fd that is not a fence, or a TEST_ONLY
-    /// probe simply does not wait, and the sync arm reports on it as usual.
+    /// existed: a malformed request, an fd that is not a sync_file, or a
+    /// TEST_ONLY probe simply does not wait, and the sync arm reports on it
+    /// as usual (the first two are its EINVAL).
     pub async fn atomic_in_fence_sleep(&self, data: usize) -> LxResult<()> {
         let Some((handle, point)) = self.atomic_in_fence(data) else {
             return Ok(());
@@ -707,10 +708,6 @@ impl DrmDev {
     /// disturb it: every check here is read-only and every failure is a
     /// `None` that simply skips the wait.
     fn atomic_in_fence(&self, data: usize) -> Option<(u32, u64)> {
-        use crate::fs::{FileDesc, SyncobjHandle};
-        use crate::process::ProcessExt;
-        use zircon_object::task::Thread;
-
         if !self.file.atomic_client() {
             return None;
         }
@@ -725,24 +722,12 @@ impl DrmDev {
         }
         let mut fd: Option<i32> = None;
         walk_atomic_props(&req, |_obj_id, prop_id, value| {
-            fold_in_fence(&mut fd, prop_id, value);
-            Ok(())
+            fold_in_fence(&mut fd, prop_id, value)
         })
         .ok()?;
-        let fd = fd?;
-        let thread = kernel_hal::thread::get_current_thread()?
-            .downcast::<Thread>()
-            .ok()?;
-        let linux = thread.proc().try_linux()?;
-        let file = linux.get_file_like(FileDesc::from(fd as usize)).ok()?;
-        let sync = file.downcast_ref::<SyncobjHandle>()?;
-        // A sync_file fd names one fence ("handle reaches point"); a plain
-        // syncobj fd names whatever its object currently carries.
-        let point = match sync.sync_file_point {
-            Some(p) => p,
-            None => zcore_drivers::scheme::syncobj::export_snapshot(sync.handle)?,
-        };
-        Some((sync.handle, point))
+        // An fd that names no sync_file is the sync arm's EINVAL, not a
+        // fence to sleep on.
+        in_fence_of_fd(fd?).ok().flatten()
     }
 
     /// Returns the [`VmObject`] representing the file with given `offset` and `len`.
@@ -2780,6 +2765,19 @@ impl DrmDev {
                         );
                     })
                 })?;
+                // `drm_atomic_plane_set_property` resolves the IN_FENCE_FD as
+                // it stages it (`sync_file_get_fence`): an fd that names no
+                // sync_file refuses the commit. It used to present without
+                // waiting.
+                if let Some(fd) = upd.in_fence_fd {
+                    in_fence_of_fd(fd).inspect_err(|e| {
+                        log::error!(
+                            "[drm] ATOMIC IN_FENCE_FD={} is not a sync_file -> {:?}",
+                            fd,
+                            e
+                        );
+                    })?;
+                }
                 log::debug!(
                     "[drm] ATOMIC objs={} test_only={} allow_modeset={} event={} fb={:?} mode_blob={:?} active={:?}",
                     req.count_objs,
@@ -5704,13 +5702,58 @@ fn plane_props(plane: &drm::DrmPlane, atomic: bool) -> alloc::vec::Vec<(u32, u64
 }
 
 /// Fold one `(property, value)` of an atomic request into the IN_FENCE_FD the
-/// commit will wait on: the last real fd named. -1 is the "no fence"
-/// sentinel and leaves whatever came before it, which is what
-/// `atomic_stage_on` does with the same property.
-fn fold_in_fence(fd: &mut Option<i32>, prop_id: u32, value: u64) {
-    if prop_id == PROP_IN_FENCE_FD && (value as i32) >= 0 {
+/// commit will wait on, the way `drm_atomic_plane_set_property` takes it:
+/// -1 is the "no fence" sentinel and names nothing, and a plane whose state
+/// already holds a fence takes no second `IN_FENCE_FD`, the sentinel
+/// included (`if (state->fence) return -EINVAL` comes before the -1 check).
+/// The last real fd used to win, and -1 to keep it. `atomic_stage_on` does
+/// the same with the same property.
+fn fold_in_fence(fd: &mut Option<i32>, prop_id: u32, value: u64) -> Result<()> {
+    if prop_id != PROP_IN_FENCE_FD {
+        return Ok(());
+    }
+    if fd.is_some() {
+        return Err(FsError::InvalidParam);
+    }
+    if (value as i32) >= 0 {
         *fd = Some(value as i32);
     }
+    Ok(())
+}
+
+/// The fence an `IN_FENCE_FD` names, as `(syncobj, point)`:
+/// `sync_file_get_fence`, which knows only sync_files. A syncobj fd is the
+/// object, not a fence (it used to be read as "whatever the object carries
+/// now"), and any other file carries none.
+pub(crate) fn in_fence_of_file(file: &Arc<dyn crate::fs::FileLike>) -> Option<(u32, u64)> {
+    let sync = file.downcast_ref::<crate::fs::SyncobjHandle>()?;
+    Some((sync.handle, sync.sync_file_point?))
+}
+
+/// An `IN_FENCE_FD` resolved through the calling process's fd table:
+/// `Ok(None)` when no process is behind the call (a kernel caller, the
+/// tests), EINVAL when the fd names no file or no sync_file, which is what
+/// `drm_atomic_plane_set_property` answers and what refuses the commit. It
+/// used to be waved through as "no fence to wait for".
+fn in_fence_of_fd(fd: i32) -> Result<Option<(u32, u64)>> {
+    use crate::process::ProcessExt;
+    use zircon_object::task::Thread;
+
+    let Some(thread) = kernel_hal::thread::get_current_thread() else {
+        return Ok(None);
+    };
+    let Ok(thread) = thread.downcast::<Thread>() else {
+        return Ok(None);
+    };
+    let Some(linux) = thread.proc().try_linux() else {
+        return Ok(None);
+    };
+    let file = linux
+        .get_file_like(crate::fs::FileDesc::from(fd as usize))
+        .map_err(|_| FsError::InvalidParam)?;
+    in_fence_of_file(&file)
+        .map(Some)
+        .ok_or(FsError::InvalidParam)
 }
 
 /// Walk the `(object, property, value)` triples of a `DRM_IOCTL_MODE_ATOMIC`
@@ -5877,8 +5920,15 @@ fn atomic_stage_on(
             // so anything else is a real fd. It is waited for before the
             // commit presents -- see `DrmDev::atomic_in_fence_sleep`, which
             // runs in the async syscall path ahead of this sync arm. Staging
-            // it here is still what makes the commit accept the property.
+            // it here is still what makes the commit accept the property,
+            // and the ioctl arm resolves it (`in_fence_of_fd`) once staged.
+            // A plane state that already holds a fence takes no second one,
+            // the sentinel included (`drm_atomic_plane_set_property` checks
+            // `state->fence` before the -1).
             PROP_IN_FENCE_FD => {
+                if upd.in_fence_fd.is_some() {
+                    return Err(FsError::InvalidParam);
+                }
                 let fd = value as i32;
                 if fd >= 0 {
                     upd.in_fence_fd = Some(fd);

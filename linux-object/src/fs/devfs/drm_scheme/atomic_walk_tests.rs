@@ -228,37 +228,38 @@ fn a_refused_property_stops_the_walk_where_it_failed() {
 /// The reason the walk is shared. The fence scan runs before the commit
 /// and picks the IN_FENCE_FD to sleep on; the commit then stages it. When
 /// a request names the property twice, both have to land on the same one,
-/// or the commit sleeps on a fence it will not use.
+/// or the commit sleeps on a fence it will not use; and now that a second
+/// fence on the plane is EINVAL, both have to refuse the same requests.
 #[test]
 fn the_fence_scan_and_the_staging_pick_the_same_in_fence() {
     // Both readings of the same request: `atomic_in_fence`'s fold, and
     // what the ioctl arm ends up staging.
-    let both = |values: &[u64]| -> (Option<i32>, Option<i32>) {
+    let both = |values: &[u64]| -> (Result<Option<i32>>, Result<Option<i32>>) {
         let props = alloc::vec![PROP_IN_FENCE_FD; values.len()];
         let counts = alloc::vec![1u32; values.len()];
         let objs = alloc::vec![4u32; values.len()];
         let r = Request::new(&objs, &counts, &props, values);
 
         let mut fd: Option<i32> = None;
-        walk_atomic_props(&r.req(), |_, prop_id, value| {
-            fold_in_fence(&mut fd, prop_id, value);
-            Ok(())
+        let scanned = walk_atomic_props(&r.req(), |_, prop_id, value| {
+            fold_in_fence(&mut fd, prop_id, value)
         })
-        .unwrap();
+        .map(|()| fd);
 
         let mut upd = drm::AtomicUpdate::default();
-        walk_atomic_props(&r.req(), |_, prop_id, value| {
+        let staged = walk_atomic_props(&r.req(), |_, prop_id, value| {
             atomic_stage_on(&mut upd, AtomicObject::Plane, prop_id, value)
         })
-        .unwrap();
-        (fd, upd.in_fence_fd)
+        .map(|()| upd.in_fence_fd);
+        (scanned, staged)
     };
 
     for (values, want) in [
-        (alloc::vec![3u64, 9], Some(9)),            // last one wins
-        (alloc::vec![3u64, -1i64 as u64], Some(3)), // the sentinel keeps it
-        (alloc::vec![0u64], Some(0)),               // fd 0 is a real fd
-        (alloc::vec![-1i64 as u64], None),          // only the sentinel
+        (alloc::vec![3u64, 9], Err(FsError::InvalidParam)), // a second fence
+        (alloc::vec![3u64, -1i64 as u64], Err(FsError::InvalidParam)), // even -1
+        (alloc::vec![-1i64 as u64, 3], Ok(Some(3))),        // the sentinel held none
+        (alloc::vec![0u64], Ok(Some(0))),                   // fd 0 is a real fd
+        (alloc::vec![-1i64 as u64], Ok(None)),              // only the sentinel
     ] {
         let (scanned, staged) = both(&values);
         assert_eq!(scanned, want, "the fence scan read {:?} wrong", values);
@@ -267,6 +268,34 @@ fn the_fence_scan_and_the_staging_pick_the_same_in_fence() {
             "the commit stages a different fence than it sleeps on",
         );
     }
+}
+
+/// `sync_file_get_fence`: an IN_FENCE_FD names a fence only through a
+/// sync_file. A syncobj fd is the object (it used to be read as its
+/// current fence), and without a process behind the call there is no
+/// table to look in.
+#[test]
+fn an_in_fence_is_a_sync_file_and_nothing_else() {
+    use crate::fs::{FileLike, SyncobjHandle};
+    let a = zcore_drivers::scheme::syncobj::create(false);
+    assert!(zcore_drivers::scheme::syncobj::add_ref(a));
+    assert!(zcore_drivers::scheme::syncobj::add_ref(a));
+    let opaque: Arc<dyn FileLike> = SyncobjHandle::new(a);
+    let fence: Arc<dyn FileLike> = SyncobjHandle::new_sync_file(a, 1);
+    assert_eq!(
+        in_fence_of_file(&opaque),
+        None,
+        "a syncobj fd is not a fence"
+    );
+    assert_eq!(in_fence_of_file(&fence), Some((a, 1)));
+    assert_eq!(
+        in_fence_of_fd(7),
+        Ok(None),
+        "no process behind the call: nothing to resolve, nothing refused"
+    );
+    drop(opaque);
+    drop(fence);
+    assert!(zcore_drivers::scheme::syncobj::destroy(a));
 }
 
 /// `ucheck_n` multiplies a userspace count by a struct size. The bounds
