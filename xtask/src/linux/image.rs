@@ -16,9 +16,14 @@ fn efi_fat_size_for(initramfs_bytes: u64, zcore_bytes: u64, boot_bytes: u64) -> 
     let max_payload = EFI_PARTITION_BYTES as u64 - FAT_METADATA_SLACK;
     assert!(
         payload <= max_payload,
-        "EFI payloads ({} MiB) do not fit in the {} MiB ESP; strip zcore or raise PART1_SIZE_MIB",
+        "EFI payloads ({} MiB) exceed the {} MiB the {} MiB ESP can hold \
+         ({} MiB of it is FAT metadata slack) by {} MiB; \
+         strip zcore or raise PART1_SIZE_MIB",
         payload.div_ceil(1024 * 1024),
+        max_payload / (1024 * 1024),
         EFI_PARTITION_BYTES / (1024 * 1024),
+        FAT_METADATA_SLACK / (1024 * 1024),
+        (payload - max_payload).div_ceil(1024 * 1024),
     );
     EFI_PARTITION_BYTES
 }
@@ -29,7 +34,21 @@ const BOOT_PAYLOADS: [&str; 3] = ["efi.img.gz", "rootfs.btrfs.gz", "home.btrfs.g
 /// Recursively sum the size (in bytes) of regular files under `path`.
 fn dir_size(path: &Path) -> u64 {
     let mut total = 0;
-    if let Ok(entries) = fs::read_dir(path) {
+    // A directory this cannot read used to be worth zero, silently, and every
+    // image size below is computed from this number: the image then comes out
+    // too small and `fuse` panics with `NoDeviceSpace`, a message that names
+    // neither the directory nor the size.
+    let entries = match fs::read_dir(path) {
+        Ok(entries) => entries,
+        Err(e) => {
+            eprintln!(
+                "warning: not counting {} towards the image size: {e}",
+                path.display()
+            );
+            return 0;
+        }
+    };
+    {
         for entry in entries.flatten() {
             let p = entry.path();
             let md = match fs::symlink_metadata(&p) {
@@ -44,6 +63,56 @@ fn dir_size(path: &Path) -> u64 {
         }
     }
     total
+}
+
+/// Bytes SFS will actually spend on the tree at `path`, which is what an SFS
+/// image has to hold.
+///
+/// **Not** the sum of the file lengths -- that is what [`dir_size`] answers, and
+/// sizing an SFS image from it is the bug this replaces. SFS spends a whole
+/// block on each inode and then `ceil(len / BLKSIZE)` blocks on the contents, so
+/// a tree of 3000 one-byte files is 3 KB of content and 24 MiB of image. The
+/// percentage headroom below cannot cover the difference, because it is
+/// proportional to BYTES while the shortfall is proportional to ENTRIES.
+///
+/// Measured on a tree of one 900 KiB file plus N symlinks:
+/// `live_image_size(dir_size(..))` answered 17 MiB at N=1000 and 18 MiB at
+/// N=5000 -- it barely moves -- and `fuse` panicked with `NoDeviceSpace` from
+/// N=3000 on. Through this function the same tree sizes to 26 MiB and 61 MiB,
+/// and every N fits.
+fn sfs_payload_bytes(path: &Path) -> u64 {
+    sfs_payload_blocks(path) * rcore_fs_sfs::BLKSIZE as u64
+}
+
+/// Blocks for the tree rooted at `path`, including the block for `path`'s own
+/// inode. A symlink is charged like a file, because SFS stores its target in a
+/// data block.
+fn sfs_payload_blocks(path: &Path) -> u64 {
+    const BLOCK: u64 = rcore_fs_sfs::BLKSIZE as u64;
+    let mut blocks = 1;
+    let entries = match fs::read_dir(path) {
+        Ok(entries) => entries,
+        Err(e) => {
+            eprintln!(
+                "warning: not counting {} towards the image size: {e}",
+                path.display()
+            );
+            return blocks;
+        }
+    };
+    for entry in entries.flatten() {
+        let p = entry.path();
+        let md = match fs::symlink_metadata(&p) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        if md.file_type().is_dir() {
+            blocks += sfs_payload_blocks(&p);
+        } else {
+            blocks += 1 + md.len().div_ceil(BLOCK);
+        }
+    }
+    blocks
 }
 
 /// Round up to whole MiB, with `num/den` fractional headroom plus a `floor_mib`
@@ -231,7 +300,7 @@ impl super::LinuxRootfs {
             // "lookup(/lib/firmware/nvidia/gsp/gsp.bin) failed: EntryNotFound"
             // at boot even though the mounted btrfs root has it). Install it
             // straight into the live root, uncapped, so it ships in the RAM
-            // initramfs; sfs_size_for(dir_size(&live_root)) below then sizes
+            // initramfs; sfs_size_for(sfs_payload_bytes(&live_root)) below sizes
             // the image to fit. This is the one heavy file deliberately kept
             // in the bootstrap initramfs -- the GPU needs its firmware at
             // bring-up time, not after root pivot. Copy the blob already
@@ -280,7 +349,7 @@ impl super::LinuxRootfs {
             // no installer payloads. The installed system boots this only to
             // pivot onto btrfs. Written to a dedicated file so the later live
             // SFS can own zCore/x86_64.img (what `make qemu` copies to the ESP).
-            let bootstrap_size = sfs_size_for(dir_size(&live_root));
+            let bootstrap_size = sfs_size_for(sfs_payload_bytes(&live_root));
             println!(
                 "Building bootstrap initramfs.img ({} MiB, no desktop stack)...",
                 bootstrap_size / (1024 * 1024)
@@ -441,7 +510,7 @@ impl super::LinuxRootfs {
             // `make iso` copies this to the El Torito ESP as initramfs.img so
             // the live session is console + install-eclipse; the desktop is
             // only inside rootfs.btrfs.gz (written to disk by the installer).
-            let iso_size = live_image_size(dir_size(&live_root));
+            let iso_size = live_image_size(sfs_payload_bytes(&live_root));
             println!(
                 "Building ISO installer initramfs ({} MiB, no desktop stack)...",
                 iso_size / (1024 * 1024)
@@ -460,7 +529,7 @@ impl super::LinuxRootfs {
             // 6. QEMU live SFS: installer payloads + desktop. Not written to
             // the installed ESP or the ISO — those carry the lean images from
             // steps 3 and 5d.
-            let live_size = qemu_live_image_size(dir_size(&live_root));
+            let live_size = qemu_live_image_size(sfs_payload_bytes(&live_root));
             println!(
                 "Building QEMU live image ({} MiB)...",
                 live_size / (1024 * 1024)
@@ -497,7 +566,11 @@ impl super::LinuxRootfs {
             fs::copy(fw_dir.join("Boot.json"), boot_dir.join("Boot.json")).unwrap();
         }
         // 生成镜像
-        fuse(self.path(), &image, sfs_size_for(dir_size(&self.path())));
+        fuse(
+            self.path(),
+            &image,
+            sfs_size_for(sfs_payload_bytes(&self.path())),
+        );
         // 扩充一些额外空间，供某些测试使用
         Qemu::img()
             .arg("resize")
@@ -522,7 +595,7 @@ fn dbg_repack_initramfs() {
     let image = PROJECT_DIR.join("zCore").join("x86_64.img");
     // Size dynamically like the production images do — the old fixed 80 MiB
     // made this helper useless the moment the rootfs grew past it.
-    let size = sfs_size_for(dir_size(&rootfs));
+    let size = sfs_size_for(sfs_payload_bytes(&rootfs));
     eprintln!(
         "repack {} ({} MiB) -> {} ({} MiB image)",
         rootfs.display(),
@@ -553,4 +626,339 @@ fn fuse(dir: impl AsRef<Path>, image: impl AsRef<Path>, fs_size: usize) {
     let fs = SimpleFileSystem::create(Arc::new(Mutex::new(file)), fs_size)
         .expect("failed to create sfs");
     zip_dir(dir.as_ref(), fs.root_inode()).expect("failed to zip fs");
+}
+
+#[cfg(test)]
+mod image_size_tests {
+    use super::*;
+
+    const MIB: u64 = 1024 * 1024;
+    const BLOCK: u64 = rcore_fs_sfs::BLKSIZE as u64;
+
+    fn scratch(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "eclipse-image-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// The whole point of sizing from blocks: an SFS image must hold what SFS
+    /// actually spends, and a tree can be almost all metadata. Sized from the
+    /// sum of the file lengths, a tree of one 900 KiB file plus 3000 symlinks
+    /// came out at 18 MiB and `fuse` died with `NoDeviceSpace` -- a panic that
+    /// names neither the size nor the tree. This is the case, fused for real.
+    #[test]
+    fn an_entry_heavy_tree_gets_an_image_that_actually_fits() {
+        let dir = scratch("entry-heavy");
+        let bin = dir.join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        fs::write(bin.join("busybox"), vec![0u8; 900 * 1024]).unwrap();
+        for i in 0..3000 {
+            std::os::unix::fs::symlink("busybox", bin.join(format!("applet{i}"))).unwrap();
+        }
+
+        let content = dir_size(&dir);
+        let sized = live_image_size(sfs_payload_bytes(&dir));
+        assert!(
+            sized as u64 > content * 20,
+            "3001 entries of {content} B of content need far more image than content: got {sized}"
+        );
+        // The image goes outside the tree: fuse creates it with set_len, so an
+        // image inside the tree would be zipped into itself.
+        let img = scratch("entry-heavy-img").join("live.img");
+        fuse(&dir, &img, sized);
+        assert!(fs::metadata(&img).unwrap().len() == sized as u64);
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(img.parent().unwrap());
+    }
+
+    /// A one-byte file is one byte of content and TWO blocks of image: one for
+    /// its inode and one for the byte. That factor of 8192 is the whole gap
+    /// between the two questions, and the percentage headroom cannot close it
+    /// because it is proportional to the content.
+    #[test]
+    fn a_one_byte_file_costs_two_blocks_and_not_one_byte() {
+        let dir = scratch("one-byte");
+        fs::write(dir.join("f"), b"x").unwrap();
+
+        assert_eq!(dir_size(&dir), 1);
+        // the directory's own inode, the file's inode, the file's one block
+        assert_eq!(sfs_payload_bytes(&dir), 3 * BLOCK);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A symlink is charged like a file, because SFS keeps its target in a data
+    /// block -- and `bin/` is hundreds of applet symlinks, which is exactly the
+    /// tree that used to be under-counted into an image that would not hold it.
+    #[test]
+    fn a_symlink_is_charged_like_a_file() {
+        let dir = scratch("symlink-cost");
+        fs::write(dir.join("busybox"), b"x").unwrap();
+        std::os::unix::fs::symlink("busybox", dir.join("ls")).unwrap();
+
+        // directory inode + busybox (inode + block) + ls (inode + block)
+        assert_eq!(sfs_payload_bytes(&dir), 5 * BLOCK);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// An empty directory is not free, and a tree of empty directories is not
+    /// worth zero: every inode is a block. `build_live_rootfs` creates nine
+    /// empty mount points on purpose, so this is not a hypothetical shape.
+    #[test]
+    fn an_empty_directory_still_costs_its_own_inode() {
+        let dir = scratch("empty");
+        assert_eq!(dir_size(&dir), 0);
+        assert_eq!(sfs_payload_bytes(&dir), BLOCK);
+
+        for d in ["proc", "sys", "dev"] {
+            fs::create_dir_all(dir.join(d)).unwrap();
+        }
+        assert_eq!(dir_size(&dir), 0);
+        assert_eq!(sfs_payload_bytes(&dir), 4 * BLOCK);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Contents are charged by whole blocks, so one byte over a block boundary
+    /// costs another whole block. Rounding the other way would under-size every
+    /// image by a block per file.
+    #[test]
+    fn contents_are_charged_by_whole_blocks() {
+        let dir = scratch("blocks");
+        for (len, want_data_blocks) in [(0u64, 0u64), (1, 1), (BLOCK, 1), (BLOCK + 1, 2)] {
+            let f = dir.join("f");
+            fs::write(&f, vec![0u8; len as usize]).unwrap();
+            assert_eq!(
+                sfs_payload_bytes(&dir),
+                (2 + want_data_blocks) * BLOCK,
+                "a file of {len} bytes"
+            );
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Whatever the payload, the answer is a whole number of MiB: the image is
+    /// created with `set_len` and handed to SFS, and a partial MiB is a size no
+    /// tool downstream (`qemu-img resize`, the ESP layout, the installer's
+    /// partition arithmetic) expects.
+    #[test]
+    fn every_size_is_a_whole_number_of_mib() {
+        for payload in [0u64, 1, 1023, MIB - 1, MIB, MIB + 1, 700 * MIB + 3] {
+            for size in [
+                sfs_size_for(payload) as u64,
+                live_image_size(payload) as u64,
+                qemu_live_image_size(payload) as u64,
+            ] {
+                assert_eq!(size % MIB, 0, "{size} for a payload of {payload}");
+                assert!(size >= payload, "{size} cannot hold {payload}");
+            }
+        }
+    }
+
+    /// The rounding to whole MiB has to go UP. Rounding down would quietly eat
+    /// up to a MiB of the headroom that was just computed, and the headroom is
+    /// the only thing standing between the payload and `NoDeviceSpace`.
+    #[test]
+    fn the_rounding_goes_up_and_never_eats_the_headroom() {
+        for payload in [1u64, 1023, MIB - 1, MIB + 1, 3 * MIB + 7, 700 * MIB + 3] {
+            for (num, den, floor) in [(2u64, 5u64, 24u64), (1, 8, 16), (1, 8, 256)] {
+                let asked = payload + payload * num / den + floor * MIB;
+                let got = padded_image_size(payload, num, den, floor);
+                assert!(
+                    got >= asked,
+                    "padded_image_size({payload}, {num}, {den}, {floor}) gave {got}, \
+                     which is below the {asked} it was asked for"
+                );
+                assert!(
+                    got - asked < MIB,
+                    "it rounded up by more than a MiB: {got} vs {asked}"
+                );
+            }
+        }
+    }
+
+    /// The three floors are load-bearing and each one is there for a reason the
+    /// comments record. The 256 MiB of the QEMU image is the one that was paid
+    /// for: with the lean 16 MiB floor the image filled two minutes into
+    /// Firefox, because `HOME=/root` lives on it and the profile, the fontconfig
+    /// caches and the wrapper logs all land there.
+    #[test]
+    fn the_floors_are_the_ones_the_comments_promise() {
+        assert_eq!(
+            sfs_size_for(0) as u64,
+            24 * MIB,
+            "bootstrap initramfs floor"
+        );
+        assert_eq!(live_image_size(0) as u64, 16 * MIB, "ISO installer floor");
+        assert_eq!(
+            qemu_live_image_size(0) as u64,
+            256 * MIB,
+            "the QEMU live image is the root a browser session writes to"
+        );
+    }
+
+    /// And so are the percentages: 40% for the bootstrap initramfs, 12.5% for
+    /// the two live images, which is what their comments say they trade RAM for.
+    #[test]
+    fn the_headroom_percentages_are_the_ones_the_comments_promise() {
+        let payload = 800 * MIB;
+        assert_eq!(
+            sfs_size_for(payload) as u64,
+            payload + payload * 2 / 5 + 24 * MIB
+        );
+        assert_eq!(
+            live_image_size(payload) as u64,
+            payload + payload / 8 + 16 * MIB
+        );
+        assert_eq!(
+            qemu_live_image_size(payload) as u64,
+            payload + payload / 8 + 256 * MIB
+        );
+    }
+
+    /// The ESP is a fixed size, so the only thing this function can do when the
+    /// payloads do not fit is stop the build with a message someone can act on.
+    /// It used to report the PARTITION size where it meant the payload limit, so
+    /// it could say "1022 MiB do not fit in the 1024 MiB ESP" -- which reads
+    /// like a contradiction, in the one message that only ever appears when a
+    /// build has already failed.
+    #[test]
+    #[should_panic(expected = "exceed the 1020 MiB the 1024 MiB ESP can hold")]
+    fn the_esp_message_names_the_payload_limit_and_not_the_partition_size() {
+        efi_fat_size_for(EFI_PARTITION_BYTES as u64, 0, 0);
+    }
+
+    /// And the boundary is where the slack says it is: the last byte that fits
+    /// is accepted, the next one stops the build.
+    #[test]
+    fn the_esp_accepts_exactly_what_the_slack_leaves() {
+        let max = EFI_PARTITION_BYTES as u64 - 4 * MIB;
+        assert_eq!(efi_fat_size_for(max, 0, 0), EFI_PARTITION_BYTES);
+        assert_eq!(
+            efi_fat_size_for(max - 1, 1, 0),
+            EFI_PARTITION_BYTES,
+            "the three payloads are summed, not checked one by one"
+        );
+        assert!(std::panic::catch_unwind(|| efi_fat_size_for(max, 1, 0)).is_err());
+    }
+
+    /// `build_live_rootfs` decides what the RAM-resident installer root holds.
+    /// Anything outside `LIVE_KEEP` ships in `rootfs.btrfs.gz` instead and must
+    /// NOT be copied -- that is what keeps Mesa, the fonts and libLLVM out of an
+    /// image that is loaded whole into memory at boot.
+    #[test]
+    fn the_live_root_keeps_only_what_live_keep_names() {
+        let full = scratch("live-full");
+        let out = scratch("live-out");
+        for rel in ["bin", "usr/lib", "usr/share/fonts", "usr/bin"] {
+            fs::create_dir_all(full.join(rel)).unwrap();
+        }
+        fs::write(full.join("bin/busybox"), b"busybox").unwrap();
+        fs::write(full.join("usr/lib/libLLVM.so"), b"heavy").unwrap();
+        fs::write(full.join("usr/share/fonts/DejaVu.ttf"), b"font").unwrap();
+        fs::write(full.join("usr/bin/firefox"), b"browser").unwrap();
+
+        build_live_rootfs(&full, &out);
+
+        assert!(out.join("bin/busybox").is_file(), "busybox is an essential");
+        for gone in [
+            "usr/lib/libLLVM.so",
+            "usr/share/fonts/DejaVu.ttf",
+            "usr/bin/firefox",
+        ] {
+            assert!(
+                !out.join(gone).exists(),
+                "{gone} is not in LIVE_KEEP and would be loaded into RAM at boot"
+            );
+        }
+        // The mount points have to exist for boot-time fstab processing, and
+        // /var/log because Xorg aborts when it cannot open Xorg.0.log.
+        for d in [
+            "proc", "sys", "dev", "tmp", "run", "home", "boot", "boot/efi", "var/log",
+        ] {
+            assert!(out.join(d).is_dir(), "missing mount point {d}");
+        }
+        let _ = fs::remove_dir_all(&full);
+        let _ = fs::remove_dir_all(&out);
+    }
+
+    /// Applet links must arrive as LINKS. Copying the target instead would put
+    /// one busybox per applet into an image that is loaded whole into RAM --
+    /// hundreds of copies of the same 900 KiB binary.
+    #[test]
+    fn a_symlink_arrives_as_a_symlink_and_not_as_a_copy() {
+        let full = scratch("live-links-full");
+        let out = scratch("live-links-out");
+        fs::create_dir_all(full.join("bin")).unwrap();
+        fs::write(full.join("bin/busybox"), vec![0u8; 4096]).unwrap();
+        std::os::unix::fs::symlink("busybox", full.join("bin/ls")).unwrap();
+
+        build_live_rootfs(&full, &out);
+
+        let link = out.join("bin/ls");
+        assert!(link.is_symlink(), "the applet link was copied, not linked");
+        assert_eq!(fs::read_link(&link).unwrap(), Path::new("busybox"));
+        let _ = fs::remove_dir_all(&full);
+        let _ = fs::remove_dir_all(&out);
+    }
+
+    /// The cap is the safety net against a stray heavy file bloating the
+    /// RAM-resident image, and it applies to regular files only: a big file is
+    /// left out, a small one comes through. (The GSP firmware is the one blob
+    /// deliberately put back afterwards, uncapped, because the driver reads it
+    /// before the real root is pivoted in.)
+    #[test]
+    fn a_file_over_the_cap_is_left_out() {
+        let full = scratch("cap-full");
+        let out = scratch("cap-out");
+        fs::create_dir_all(full.join("bin")).unwrap();
+        fs::write(full.join("bin/small"), vec![0u8; 1024]).unwrap();
+        fs::write(full.join("bin/huge"), vec![0u8; LIVE_FILE_CAP as usize + 1]).unwrap();
+        fs::write(full.join("bin/exactly"), vec![0u8; LIVE_FILE_CAP as usize]).unwrap();
+
+        build_live_rootfs(&full, &out);
+
+        assert!(out.join("bin/small").is_file());
+        assert!(
+            out.join("bin/exactly").is_file(),
+            "the cap is a maximum, not an exclusive bound"
+        );
+        assert!(
+            !out.join("bin/huge").exists(),
+            "a file over the cap would be loaded into RAM at boot"
+        );
+        let _ = fs::remove_dir_all(&full);
+        let _ = fs::remove_dir_all(&out);
+    }
+
+    /// The installer looks these three payloads up by name in its own `/boot`,
+    /// so the list the build stages and the list the installer reads have to
+    /// agree, and a duplicate would mean one of them is never staged.
+    #[test]
+    fn the_boot_payloads_are_distinct_gz_names() {
+        let mut seen = std::collections::BTreeSet::new();
+        for name in BOOT_PAYLOADS {
+            assert!(seen.insert(name), "{name} is listed twice");
+            assert!(name.ends_with(".gz"), "{name} is written out compressed");
+            assert!(!name.contains('/'), "{name} is staged flat into /boot");
+        }
+    }
+
+    /// `LIVE_KEEP` entries are relative paths joined onto both roots, so a
+    /// leading slash would make the copy read and write the host's own
+    /// directories instead of the two rootfs trees.
+    #[test]
+    fn the_live_keep_paths_are_relative_and_distinct() {
+        let mut seen = std::collections::BTreeSet::new();
+        for rel in LIVE_KEEP {
+            assert!(seen.insert(rel), "{rel} is listed twice");
+            assert!(
+                Path::new(rel).is_relative(),
+                "{rel} must be relative to the rootfs"
+            );
+        }
+    }
 }
