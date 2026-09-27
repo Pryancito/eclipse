@@ -88,15 +88,10 @@ impl Syscall<'_> {
         if len > PCI_INIT_ARG_MAX_SIZE as u32 {
             return Err(ZxError::INVALID_ARGS);
         }
-        const HEADER_SIZE: usize = core::mem::size_of::<PciInitArgsHeader>();
-        const ADDR_WINDOWS_SIZE: usize = core::mem::size_of::<PciInitArgsAddrWindows>();
         let mut arg_header = UserInPtr::<PciInitArgsHeader>::from(init_buf).read()?;
-        let expected_len = HEADER_SIZE + arg_header.addr_window_count as usize * ADDR_WINDOWS_SIZE;
-        if len != expected_len as u32 {
-            return Err(ZxError::INVALID_ARGS);
-        }
+        let window_count = init_args_window_count(len, arg_header.addr_window_count)?;
         let mut addr_windows = UserInPtr::<PciInitArgsAddrWindows>::from(init_buf + HEADER_SIZE)
-            .read_array(arg_header.addr_window_count as usize)?;
+            .read_array(window_count)?;
         // `num_irqs` is a user field and indexes a fixed `[PciInitArgsIrqs; 224]`
         // inside the header, so an out-of-range count is a kernel
         // index-out-of-bounds panic rather than an error. `len` above does not
@@ -301,6 +296,82 @@ pub struct PciBar {
     bar_type: u32,
     size: usize,
     addr: u64,
+}
+
+const HEADER_SIZE: usize = core::mem::size_of::<PciInitArgsHeader>();
+const ADDR_WINDOWS_SIZE: usize = core::mem::size_of::<PciInitArgsAddrWindows>();
+
+/// How many address windows `len` bytes of init args carry, given the count the
+/// header claims, or `INVALID_ARGS` when the two do not agree.
+///
+/// The comparison has to happen in `usize`. It used to be
+/// `len != expected_len as u32`, and `expected_len` is
+/// `HEADER_SIZE + addr_window_count * ADDR_WINDOWS_SIZE` with a count userspace
+/// picks: that cast **truncates**, so a count whose byte total is a multiple of
+/// 2^32 compares equal to a `len` of just the header. A window is 24 bytes, so
+/// `addr_window_count = 1 << 29` makes the product exactly 3 * 2^32 and the
+/// check passes with `len == HEADER_SIZE`. The `read_array` right after then
+/// asks for 12 GiB in one infallible allocation and panics the kernel.
+///
+/// The `PCI_INIT_ARG_MAX_SIZE` limit above does not catch it: it bounds `len`,
+/// which in that call is small and honest. It is the count that lies.
+fn init_args_window_count(len: u32, addr_window_count: u32) -> ZxResult<usize> {
+    let count = addr_window_count as usize;
+    // `checked_*` rather than plain arithmetic so the reasoning does not depend
+    // on `usize` being 64 bits wide.
+    let expected = count
+        .checked_mul(ADDR_WINDOWS_SIZE)
+        .and_then(|windows| windows.checked_add(HEADER_SIZE))
+        .ok_or(ZxError::INVALID_ARGS)?;
+    if len as usize != expected {
+        return Err(ZxError::INVALID_ARGS);
+    }
+    Ok(count)
+}
+
+#[cfg(test)]
+mod init_args_len_tests {
+    use super::*;
+
+    /// The bug: a count whose byte total wraps a `u32` agreed with a `len` that
+    /// carried nothing but the header, and the read that followed asked for
+    /// `count * 24` bytes of kernel memory.
+    #[test]
+    fn a_count_that_wraps_a_u32_is_refused() {
+        // 24 * (1 << 29) == 3 << 32, which is 0 in a `u32`.
+        assert_eq!(ADDR_WINDOWS_SIZE, 24, "the wrapping count below assumes 24");
+        assert_eq!(
+            init_args_window_count(HEADER_SIZE as u32, 1 << 29),
+            Err(ZxError::INVALID_ARGS)
+        );
+        // And the same trick one window further along.
+        assert_eq!(
+            init_args_window_count(HEADER_SIZE as u32 + 24, (1 << 29) + 1),
+            Err(ZxError::INVALID_ARGS)
+        );
+    }
+
+    /// A count no `len` can hold is refused whatever the arithmetic does.
+    #[test]
+    fn the_largest_count_is_refused() {
+        assert_eq!(
+            init_args_window_count(u32::MAX, u32::MAX),
+            Err(ZxError::INVALID_ARGS)
+        );
+    }
+
+    /// And the calls the driver actually makes still go through.
+    #[test]
+    fn a_header_with_one_window_is_accepted() {
+        let len = (HEADER_SIZE + ADDR_WINDOWS_SIZE) as u32;
+        assert_eq!(init_args_window_count(len, 1), Ok(1));
+        assert_eq!(init_args_window_count(HEADER_SIZE as u32, 0), Ok(0));
+        // A `len` that does not match the count is still a mismatch.
+        assert_eq!(
+            init_args_window_count(HEADER_SIZE as u32, 1),
+            Err(ZxError::INVALID_ARGS)
+        );
+    }
 }
 
 /// Trim an ECAM window that runs into the architectural registers below 4 GiB.
