@@ -1332,6 +1332,21 @@ static ZERO_CLEAN_REPORTS: core::sync::atomic::AtomicU32 = core::sync::atomic::A
 /// [`ZERO_CLEAN_REPORTS`] for why it is not twelve.
 const MAX_CLEAN_SOURCE_REPORTS: u32 = 1;
 
+/// Black that was NOT there when the source was sampled and IS there when the
+/// same window is read again after the copy. Its own counter and the full
+/// [`MAX_PROBE_REPORTS`], because it is the third distinct answer and a new fact
+/// every time: its box says where on screen to look.
+///
+/// This is the hole Moebius's QEMU boot of 27-sep opened. The source line said
+/// "not one of 518400 sampled pixels is 0x00000000" on every frame of a 65-second
+/// run, and the mismatch line said, on nearly every one of those same frames,
+/// that the client was still writing the buffer. Both can be true at once,
+/// because the source is sampled BEFORE the copy: a clear-to-black that lands
+/// while the kernel is copying gets blitted to the screen and the source check
+/// never sees it. "Not handed over black" only ever meant "not black when we
+/// looked", and this is the counter that can tell the two apart.
+static ZERO_GREW_REPORTS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
 /// Source lines actually WRITTEN, per kind. The occurrence counters above keep
 /// counting long after the budget stops the lines, so they cannot tell a test
 /// whether the split budget is really doing its job -- and the whole point of
@@ -1340,6 +1355,8 @@ const MAX_CLEAN_SOURCE_REPORTS: u32 = 1;
 static CLEAN_SOURCE_LINES: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 #[cfg(test)]
 static BLACK_SOURCE_LINES: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+#[cfg(test)]
+static GREW_SOURCE_LINES: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
 /// How many probe mismatches this process has seen, so an end-to-end test can
 /// assert that a settled buffer produced none.
@@ -1373,6 +1390,13 @@ pub(crate) fn clean_source_lines_for_test() -> u32 {
 #[cfg(test)]
 pub(crate) fn black_source_lines_for_test() -> u32 {
     BLACK_SOURCE_LINES.load(Ordering::Relaxed)
+}
+
+/// Lines written for "the source went black while we were copying it". See
+/// [`ZERO_GREW_REPORTS`].
+#[cfg(test)]
+pub(crate) fn grew_source_lines_for_test() -> u32 {
+    GREW_SOURCE_LINES.load(Ordering::Relaxed)
 }
 
 /// The baseline budget for "no black in the source". One; see
@@ -3780,6 +3804,62 @@ pub fn scanout_region_checked(
                                 }
                             );
                         }
+                    }
+                }
+            }
+            // And the one the source line above cannot answer: black that was
+            // NOT in the first read and IS in the second. The copy ran between
+            // them, so this black was handed over -- just after we had already
+            // looked. See [`ZERO_GREW_REPORTS`].
+            if let Some(a) = after.as_ref() {
+                // The box is every zero pixel of the SECOND read, not only the
+                // new ones: the reads are summarised per band, so which
+                // individual pixel turned black is not recoverable. The line
+                // says so rather than let the box be read as the new black
+                // alone.
+                //
+                // Matched on rather than unwrapped with a fallback: `bbox` is
+                // `Some` exactly when `zeros > 0`, which this comparison already
+                // guarantees, so a fallback box could never print -- and if it
+                // somehow did, `0x0+0+0` reads as a real zero-sized region and
+                // would be a lie in a diagnostic. No branch, no lie.
+                if let Some((zx, zy, zw, zh)) =
+                    a.zero.bbox().filter(|_| a.zero.zeros > before.zero.zeros)
+                {
+                    let n = ZERO_GREW_REPORTS.fetch_add(1, Ordering::Relaxed);
+                    let (report, last) = report_decision(n, MAX_PROBE_REPORTS);
+                    if report {
+                        #[cfg(test)]
+                        GREW_SOURCE_LINES.fetch_add(1, Ordering::Relaxed);
+                        // Fits the 512-byte `klog_emit` line buffer with room to
+                        // spare (392 with the longest numbers and the suffix),
+                        // but that buffer DROPS the tail of a longer message, so
+                        // anything added here has to be measured, not guessed.
+                        kernel_hal::klog_info!(
+                            "[drm] present source: fb {} window {}x{}+{}+{} -- the source WENT \
+                             BLACK while it was being copied: {} of {} sampled pixels were \
+                             0x00000000 before the copy and {} after, so that black WAS handed \
+                             over, just later than the sample; {}x{}+{}+{} of the window bounds \
+                             all black in the second read{}",
+                            fb_id,
+                            blit_w,
+                            blit_h,
+                            blit_x,
+                            blit_y,
+                            before.zero.zeros,
+                            before.zero.sampled,
+                            a.zero.zeros,
+                            zw,
+                            zh,
+                            zx,
+                            zy,
+                            if last {
+                                " (further frames whose source went black mid-copy will not be \
+                                 reported)"
+                            } else {
+                                ""
+                            }
+                        );
                     }
                 }
             }
@@ -6536,8 +6616,10 @@ pub(crate) fn reset_output_state_for_test() {
     // asserting about a line the budget had already refused.
     ZERO_FOUND_REPORTS.store(0, Ordering::Relaxed);
     ZERO_CLEAN_REPORTS.store(0, Ordering::Relaxed);
+    ZERO_GREW_REPORTS.store(0, Ordering::Relaxed);
     CLEAN_SOURCE_LINES.store(0, Ordering::Relaxed);
     BLACK_SOURCE_LINES.store(0, Ordering::Relaxed);
+    GREW_SOURCE_LINES.store(0, Ordering::Relaxed);
     // A leaked `PANEL_FB` makes a later test's damage box either honoured or
     // promoted for a reason that has nothing to do with what it is testing --
     // and the ids the tests pick collide freely, so it would sometimes match.
