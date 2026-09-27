@@ -1362,8 +1362,6 @@ pub(crate) fn zero_reports_for_test() -> u32 {
     ZERO_REPORTS.load(Ordering::Relaxed)
 }
 
-/// How many of each kind of probe line get written before the budget cuts them
-/// off. For the range assertion above.
 /// How many source lines of each kind were actually written. These are what say
 /// whether the split budget works, because the occurrence counters keep counting
 /// after the lines stop.
@@ -1384,6 +1382,8 @@ pub(crate) fn clean_source_report_budget_for_test() -> u32 {
     MAX_CLEAN_SOURCE_REPORTS
 }
 
+/// How many lines a kind of probe gets before its budget cuts them off. For the
+/// range assertion above.
 #[cfg(test)]
 pub(crate) fn probe_report_budget_for_test() -> u32 {
     MAX_PROBE_REPORTS
@@ -3736,8 +3736,14 @@ pub fn scanout_region_checked(
                                 zh,
                                 zx,
                                 zy,
+                                // Same lie as the one below, on this side:
+                                // what runs out here is the budget for frames
+                                // that carry black, and the black-free baseline
+                                // may still have its line to write.
                                 if last {
-                                    " (further source reports will not be made)"
+                                    " (further frames carrying black will not be \
+                                     reported; a black-free frame still gets its \
+                                     baseline line if it has not had it yet)"
                                 } else {
                                     ""
                                 }
