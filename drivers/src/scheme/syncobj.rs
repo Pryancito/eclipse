@@ -59,15 +59,27 @@ struct Syncobj {
     /// drops a dead process's entries, and `destroy_for` refuses a process
     /// that holds none.
     holders: alloc::vec::Vec<u64>,
-    /// A pending dependency on another syncobj: `(src, target, dst_point)`.
-    /// This object reaches `dst_point` once `src` reaches `target`.
+    /// The pending dependencies on other syncobjs, in ascending `dst_point`
+    /// order: the object reaches a link's `dst_point` once that link's
+    /// sources have reached their targets -- AND every link below it has
+    /// resolved, as a node of a `dma_fence_chain` is signaled only once the
+    /// nodes before it are. Empty for the normal case.
     ///
-    /// Set by a `sync_file` import (see [`import_snapshot`], where `dst_point`
-    /// is 1, because a binary import really does replace the binary fence) and
-    /// by a [`transfer`] whose source has not landed yet. `None` for the normal
-    /// case, and cleared whenever the object is signaled or reset directly,
-    /// mirroring how a real `drm_syncobj` REPLACES its fence on those
-    /// operations rather than accumulating them.
+    /// One link is set by a `sync_file` import (see [`import_snapshot`],
+    /// where `dst_point` is 1, because a binary import really does replace
+    /// the binary fence) or by a [`transfer`] whose source has not landed
+    /// yet. A binary signal, import or transfer replaces them all, as a real
+    /// `drm_syncobj` REPLACES its single fence; a timeline point is ADDED
+    /// behind the ones already there (`drm_syncobj_add_point`), which is
+    /// what Mesa's many-to-many `vk_drm_syncobj_transfer_payloads` leans
+    /// on: it transfers each wait into a temporary timeline at points 1..N
+    /// and then transfers the temporary "as a binary" (point 0) into every
+    /// signal semaphore, relying on "waiting on a whole chain waits on
+    /// everything". With a single link, point N+1 threw away what point N
+    /// was still waiting on, and the signal semaphores followed one wait
+    /// out of N. A landed hardware fence or a reached transfer at a point
+    /// above a link still waiting queues behind it the same way, as an
+    /// empty link ([`Syncobj::push_link`]).
     ///
     /// `dst_point` used to be missing, so a software timeline-to-timeline
     /// transfer landed `dst` at 1 whatever point was asked for. Linux allocates
@@ -76,7 +88,43 @@ struct Syncobj {
     /// hang, not a rounding error: wlroots' `linux-drm-syncobj-v1` moves a
     /// client's acquire point into its own timeline at a point it chooses, then
     /// waits on it, so a point that never arrives freezes that surface.
-    linked: Option<Link>,
+    links: Vec<Link>,
+}
+
+impl Syncobj {
+    /// Add a link, keeping [`Self::links`] in chain order (ascending
+    /// `dst_point`). An empty `deps` is a point already delivered that
+    /// waits only for the links below it.
+    fn push_link(&mut self, link: Link) {
+        let point = link.dst_point.max(1);
+        let at = self
+            .links
+            .iter()
+            .position(|l| l.dst_point.max(1) > point)
+            .unwrap_or(self.links.len());
+        self.links.insert(at, link);
+    }
+
+    /// The links `target` depends on: every one up to and including the
+    /// first whose point covers it. `None` when no link promises `target`.
+    fn links_to(&self, target: u64) -> Option<&[Link]> {
+        let end = self
+            .links
+            .iter()
+            .position(|l| l.dst_point.max(1) >= target)?;
+        Some(&self.links[..=end])
+    }
+}
+
+/// Whether a node of `obj`'s chain below `point` is still waiting -- a link,
+/// or a hardware fence of its own in flight above its counter -- so that
+/// `point`, delivered now, has to queue behind it.
+fn node_below_waiting(table: &SyncobjTable, obj: &Syncobj, point: u64) -> bool {
+    obj.links.iter().any(|l| l.dst_point.max(1) < point)
+        || table
+            .pending
+            .iter()
+            .any(|g| g.handle == obj.handle && g.point > obj.point && g.point < point)
 }
 
 /// A deferred dependency: the object reaches `dst_point` once EVERY entry of
@@ -124,18 +172,35 @@ struct PendingFence {
 ///
 /// Callers must already hold the table lock (and have resolved pending
 /// hardware fences first, see [`resolve_locked`]).
-fn effective_point(objects: &[Syncobj], handle: u32, depth: u8) -> Option<u64> {
-    let obj = objects.iter().find(|o| o.handle == handle)?;
+fn effective_point(table: &SyncobjTable, handle: u32, depth: u8) -> Option<u64> {
+    let obj = table.objects.iter().find(|o| o.handle == handle)?;
     let mut point = obj.point;
-    if let (Some(link), true) = (&obj.linked, depth > 0) {
-        let all_reached = link.deps.iter().all(|&(src, target)| {
-            effective_point(objects, src, depth - 1).is_some_and(|p| p >= target)
-        });
-        if all_reached {
+    if depth > 0 {
+        // The walk of `dma_fence_chain_signaled`: a link's point counts
+        // once its own sources AND every node below it -- link or fence
+        // in flight -- are reached, so the walk stops at the first one
+        // still waiting.
+        for link in &obj.links {
+            if !link_ready(table, obj, link, depth) {
+                break;
+            }
             point = point.max(link.dst_point.max(1));
         }
     }
     Some(point)
+}
+
+/// Whether `link` (one of `obj`'s) can resolve: every source has reached
+/// its target, and no hardware fence of `obj`'s own is still in flight
+/// below the link's point. Such a fence is a node of the chain before it
+/// (two channels signaling one timeline out of order), and the link waits
+/// for it as it waits for a link below it. `depth` bounds the sources'
+/// own links, as in [`effective_point`].
+fn link_ready(table: &SyncobjTable, obj: &Syncobj, link: &Link, depth: u8) -> bool {
+    !node_below_waiting(table, obj, link.dst_point.max(1))
+        && link.deps.iter().all(|&(src, target)| {
+            effective_point(table, src, depth - 1).is_some_and(|p| p >= target)
+        })
 }
 
 /// Link-following depth for [`effective_point`]. The X11 route of a
@@ -164,7 +229,8 @@ const LINK_DEPTH: u8 = 8;
 /// only a lone source left the whole wait on the CPU, inside the ioctl,
 /// until the compositor's frame had run. A source with nothing submitted
 /// has no fence: then the list is empty, and the caller waits on the CPU
-/// as before.
+/// as before. A chain is followed link by link up to the one that
+/// delivers `target`: every one of them has to resolve first.
 ///
 /// Callers must hold the table lock, with pending fences resolved.
 fn fences_through_link(
@@ -173,33 +239,44 @@ fn fences_through_link(
     target: u64,
     depth: u8,
 ) -> alloc::vec::Vec<PendingFence> {
-    let own = table
+    let Some(obj) = table.objects.iter().find(|o| o.handle == handle) else {
+        return alloc::vec::Vec::new();
+    };
+    // What delivers `target`: the lowest own fence covering it, or the
+    // first link promising it, whichever comes lower -- and, as a node of
+    // a `dma_fence_chain` is signaled only once the nodes before it are,
+    // everything on the handle below that point too: its own fences still
+    // above the counter and its links, each followed to its sources.
+    let own_cover = table
         .pending
         .iter()
         .filter(|f| f.handle == handle && f.point >= target)
-        .min_by_key(|f| f.point)
-        .copied();
-    if let Some(own) = own {
-        return alloc::vec![own];
-    }
-    if depth == 0 {
-        return alloc::vec::Vec::new();
-    }
-    let Some(link) = table
-        .objects
-        .iter()
-        .find(|o| o.handle == handle)
-        .and_then(|o| o.linked.as_ref())
-    else {
-        return alloc::vec::Vec::new();
+        .map(|f| f.point)
+        .min();
+    let link_cover = obj
+        .links_to(target)
+        .map(|l| l[l.len() - 1].dst_point.max(1));
+    let cover = match (own_cover, link_cover) {
+        (None, None) => return alloc::vec::Vec::new(),
+        (a, b) => a.into_iter().chain(b).min().unwrap_or(target),
     };
-    if link.dst_point.max(1) < target {
-        return alloc::vec::Vec::new();
-    }
-    let mut fences = alloc::vec::Vec::new();
-    for &(src, t) in &link.deps {
-        if effective_point(&table.objects, src, LINK_DEPTH).is_some_and(|p| p >= t) {
+    let mut fences: alloc::vec::Vec<PendingFence> = table
+        .pending
+        .iter()
+        .filter(|f| f.handle == handle && f.point > obj.point && f.point <= cover)
+        .copied()
+        .collect();
+    for &(src, t) in obj
+        .links
+        .iter()
+        .filter(|l| l.dst_point.max(1) <= cover)
+        .flat_map(|l| l.deps.iter())
+    {
+        if effective_point(table, src, LINK_DEPTH).is_some_and(|p| p >= t) {
             continue;
+        }
+        if depth == 0 {
+            return alloc::vec::Vec::new();
         }
         let behind = fences_through_link(table, src, t, depth - 1);
         if behind.is_empty() {
@@ -220,7 +297,7 @@ fn fences_through_link(
 ///
 /// Callers must hold the table lock, with pending fences resolved.
 fn submitted_locked(table: &SyncobjTable, handle: u32, target: u64, depth: u8) -> bool {
-    if effective_point(&table.objects, handle, LINK_DEPTH).is_some_and(|p| p >= target) {
+    if effective_point(table, handle, LINK_DEPTH).is_some_and(|p| p >= target) {
         return true;
     }
     if table
@@ -233,19 +310,18 @@ fn submitted_locked(table: &SyncobjTable, handle: u32, target: u64, depth: u8) -
     if depth == 0 {
         return false;
     }
-    let Some(link) = table
+    let Some(links) = table
         .objects
         .iter()
         .find(|o| o.handle == handle)
-        .and_then(|o| o.linked.as_ref())
+        .and_then(|o| o.links_to(target))
     else {
         return false;
     };
-    link.dst_point.max(1) >= target
-        && link
-            .deps
-            .iter()
-            .all(|&(src, t)| submitted_locked(table, src, t, depth - 1))
+    links
+        .iter()
+        .flat_map(|l| l.deps.iter())
+        .all(|&(src, t)| submitted_locked(table, src, t, depth - 1))
 }
 
 /// The point a link on `handle` promises, if it carries one (0 otherwise).
@@ -258,16 +334,16 @@ fn promised_point(table: &SyncobjTable, handle: u32) -> u64 {
         .objects
         .iter()
         .find(|o| o.handle == handle)
-        .and_then(|o| o.linked.as_ref())
+        .and_then(|o| o.links.last())
         .map_or(0, |l| l.dst_point.max(1))
 }
 
 /// Whether some object's link still names `handle` as a source.
 fn is_link_source(objects: &[Syncobj], handle: u32) -> bool {
     objects.iter().any(|o| {
-        o.linked
-            .as_ref()
-            .is_some_and(|l| l.deps.iter().any(|&(src, _)| src == handle))
+        o.links
+            .iter()
+            .any(|l| l.deps.iter().any(|&(src, _)| src == handle))
     })
 }
 
@@ -496,18 +572,26 @@ impl Deferred {
 /// submit fails honestly). Returns the upcalls to make after unlocking.
 fn resolve_locked(table: &mut SyncobjTable) -> Deferred {
     let mut out = Deferred::default();
-    resolve_hw_locked(table, &mut out);
-    resolve_links_locked(table, &mut out);
+    // To a fixed point: a link resolving can release a landed fence held
+    // behind it, and a fence landing can satisfy a link.
+    loop {
+        let hw = resolve_hw_locked(table, &mut out);
+        let links = resolve_links_locked(table, &mut out);
+        if !(hw || links) {
+            break;
+        }
+    }
     out
 }
 
 /// The hardware half of [`resolve_locked`]: take every landed (or timed-out)
 /// fence out of the table and advance its syncobj.
-fn resolve_hw_locked(table: &mut SyncobjTable, out: &mut Deferred) {
+fn resolve_hw_locked(table: &mut SyncobjTable, out: &mut Deferred) -> bool {
     if table.pending.is_empty() {
-        return;
+        return false;
     }
     let now = now_us();
+    let mut any = false;
     let mut i = 0;
     while i < table.pending.len() {
         let f = table.pending[i];
@@ -517,6 +601,22 @@ fn resolve_hw_locked(table: &mut SyncobjTable, out: &mut Deferred) {
             i += 1;
             continue;
         }
+        // A node of the chain still waiting below this point -- a fence of
+        // the same handle in flight (two channels signaling one timeline
+        // out of order) or a link -- holds it: the fence stays in the table
+        // as landed, and advances the counter once they have resolved, as
+        // `dma_fence_chain_signaled` walks every node before it. (A
+        // timed-out fence held this way waits for them too.)
+        let held = table
+            .objects
+            .iter()
+            .find(|o| o.handle == f.handle)
+            .is_some_and(|o| f.point > o.point && node_below_waiting(table, o, f.point));
+        if held {
+            i += 1;
+            continue;
+        }
+        any = true;
         table.pending.swap_remove(i);
         if landed {
             let lat = now.wrapping_sub(f.submitted_us);
@@ -542,6 +642,7 @@ fn resolve_hw_locked(table: &mut SyncobjTable, out: &mut Deferred) {
         }
     }
     PENDING_COUNT.store(table.pending.len(), Ordering::Relaxed);
+    any
 }
 
 /// The software half of [`resolve_locked`]: a link whose sources have all
@@ -565,23 +666,20 @@ fn resolve_hw_locked(table: &mut SyncobjTable, out: &mut Deferred) {
 ///
 /// Runs to a fixed point so a chain (an import of a transfer of an import)
 /// collapses in one call, and collects the orphans it stops naming.
-fn resolve_links_locked(table: &mut SyncobjTable, out: &mut Deferred) {
+fn resolve_links_locked(table: &mut SyncobjTable, out: &mut Deferred) -> bool {
     let mut any = false;
-    let satisfied = |objects: &[Syncobj]| {
-        objects.iter().position(|o| {
-            o.linked.as_ref().is_some_and(|l| {
-                l.deps.iter().all(|&(src, target)| {
-                    effective_point(objects, src, LINK_DEPTH).is_some_and(|p| p >= target)
-                })
-            })
+    // The lowest link of an object is the only one that can resolve: a
+    // higher one waits for it however ready its own sources are.
+    let satisfied = |table: &SyncobjTable| {
+        table.objects.iter().position(|o| {
+            o.links
+                .first()
+                .is_some_and(|l| link_ready(table, o, l, LINK_DEPTH))
         })
     };
-    while let Some(pos) = satisfied(&table.objects) {
+    while let Some(pos) = satisfied(table) {
         let obj = &mut table.objects[pos];
-        let link = obj
-            .linked
-            .take()
-            .expect("position() matched a linked object");
+        let link = obj.links.remove(0);
         let before = obj.point;
         obj.point = obj.point.max(link.dst_point.max(1));
         let (handle, after) = (obj.handle, obj.point);
@@ -600,6 +698,7 @@ fn resolve_links_locked(table: &mut SyncobjTable, out: &mut Deferred) {
     if any {
         collect_orphans(table);
     }
+    any
 }
 
 /// Resolve pending hardware fences now. Returns how many are still pending.
@@ -672,9 +771,13 @@ pub fn attach_hw_fence(
             deferred.run();
             return false;
         };
-        let dropped_link = obj.linked.take().is_some();
         let cur = obj.point;
+        // A binary re-arm replaces the slot, links included; a timeline
+        // point is a new node of the chain and leaves the links below it
+        // waiting (its landing queues behind them, see `resolve_hw_locked`).
+        let dropped_link = binary && cur <= 1 && !obj.links.is_empty();
         if binary && cur <= 1 {
+            obj.links.clear();
             // Replace the slot's fence: rewind the point so waiters block
             // until THIS submit lands, and drop the fence the slot carried,
             // which this one supersedes.
@@ -770,7 +873,7 @@ pub fn create(signaled: bool) -> u32 {
         point: if signaled { 1 } else { 0 },
         refs: 1,
         holders: alloc::vec::Vec::new(),
-        linked: None,
+        links: Vec::new(),
     });
     handle
 }
@@ -834,7 +937,7 @@ fn destroy_locked(table: &mut SyncobjTable, handle: u32) -> Option<Vec<(u32, u64
     // before) signaled the acquire semaphore of a swapchain image before
     // the compositor had let go of it.
     let can_progress =
-        table.pending.iter().any(|f| f.handle == handle) || table.objects[pos].linked.is_some();
+        table.pending.iter().any(|f| f.handle == handle) || !table.objects[pos].links.is_empty();
     if can_progress && is_link_source(&table.objects, handle) {
         table.objects[pos].refs = 0;
         return Some(Vec::new());
@@ -864,25 +967,16 @@ fn destroy_locked(table: &mut SyncobjTable, handle: u32) -> Option<Vec<(u32, u64
     // to the point the transfer promised, the same call
     // [`abandon_fences`] makes for a fence that can no longer land: a
     // waiter on a dead producer moves on rather than freezing.
-    let mut notify = Vec::new();
-    for obj in table.objects.iter_mut() {
-        let Some(link) = obj.linked.as_mut() else {
-            continue;
-        };
-        if !link.deps.iter().any(|&(src, _)| src == handle) {
-            continue;
-        }
+    for link in table.objects.iter_mut().flat_map(|o| o.links.iter_mut()) {
         // A merged fence keeps waiting for its other sources.
         link.deps.retain(|&(src, _)| src != handle);
-        if link.deps.is_empty() {
-            let dst_point = link.dst_point;
-            obj.linked = None;
-            obj.point = obj.point.max(dst_point);
-            notify.push((obj.handle, obj.point));
-        }
     }
+    // A link left with no source resolves like any other: in chain order,
+    // behind the links below it.
+    let mut out = Deferred::default();
+    resolve_links_locked(table, &mut out);
     collect_orphans(table);
-    Some(notify)
+    Some(out.notify)
 }
 
 /// `SYNCOBJ_CREATE` from process `pid`: [`create`], with the reference
@@ -994,6 +1088,36 @@ pub fn held_by(pid: u64, handle: u32) -> bool {
         .any(|o| o.handle == handle && o.refs > 0 && o.holders.contains(&pid))
 }
 
+/// Whether process `pid` may name `handle` in an ioctl at all. Linux keeps
+/// syncobj handles per `drm_file`, so a handle some other file created is
+/// simply not there (`drm_syncobj_find` -> ENOENT) for a SIGNAL, a RESET,
+/// a TRANSFER, a QUERY, a WAIT or an EXEC as much as for a DESTROY. Here
+/// the handle space is global and consecutive, so the holders recorded per
+/// reference stand in for the file: a handle with holders is usable by
+/// them alone; a live handle with NO holder (created by the kernel, a
+/// sync_file carrier, a merge, a test) belongs to no file and is usable by
+/// anyone; and pid 0 (no current thread: the kernel itself) may name any
+/// live handle. Before this, `destroy` was the only ioctl that asked, and
+/// a client guessing the compositor's handle numbers could signal its
+/// release timelines early, reset its acquire fences, or wait on them.
+pub fn usable_by(pid: u64, handle: u32) -> bool {
+    all_usable_by(pid, &[handle])
+}
+
+/// [`usable_by`] for a whole handle array, in ONE take of the lock: the
+/// array lookup Linux does first (`drm_syncobj_array_find`), so an ioctl
+/// over `[good, bad]` touches neither.
+pub fn all_usable_by(pid: u64, handles: &[u32]) -> bool {
+    let table = TABLE.lock();
+    handles.iter().all(|&h| {
+        table.objects.iter().any(|o| {
+            o.handle == h
+                && o.refs > 0
+                && (pid == 0 || o.holders.is_empty() || o.holders.contains(&pid))
+        })
+    })
+}
+
 /// The unresolved HW fences that will deliver at least `point` on `handle`,
 /// each as `(fence_va_cpu, fence_gpu_va, payload, ctx_idx)`. Used by EXEC to
 /// emit a GPU ACQUIRE per fence instead of spinning on the CPU. `fence_gpu_va`
@@ -1015,24 +1139,18 @@ pub fn pending_hw_fences(handle: u32, point: u64) -> alloc::vec::Vec<(usize, u64
         // frame N+1, in front of pushes nobody asked to hold back. Linux
         // drops a dependency on a signaled fence before the job runs.
         let reached =
-            effective_point(&table.objects, handle, LINK_DEPTH).is_some_and(|p| p >= point.max(1));
+            effective_point(&table, handle, LINK_DEPTH).is_some_and(|p| p >= point.max(1));
         // Binary waits (point 0/1): the highest pending fence on this handle.
-        // Timeline: the lowest pending fence that covers `point`.
-        let own = if reached {
+        // Timeline: every fence and link up to the lowest one that covers
+        // `point`, the chain (`fences_through_link`).
+        let own = if reached || point > 1 {
             None
-        } else if point <= 1 {
+        } else {
             table
                 .pending
                 .iter()
                 .filter(|f| f.handle == handle)
                 .max_by_key(|f| f.point)
-                .copied()
-        } else {
-            table
-                .pending
-                .iter()
-                .filter(|f| f.handle == handle && f.point >= point)
-                .min_by_key(|f| f.point)
                 .copied()
         };
         let found = match own {
@@ -1071,9 +1189,14 @@ pub fn timeline_signal(handle: u32, point: u64) -> bool {
         if point > obj.point {
             obj.point = point;
         }
-        // A direct signal replaces whatever fence the object carried, imported
-        // sync_file included — same as real drm_syncobj.
-        let dropped_link = obj.linked.take().is_some();
+        // A direct signal replaces whatever fence the object carried at or
+        // below the point, imported sync_file included -- same as real
+        // drm_syncobj. A link ABOVE it is a chain node still waiting for
+        // its own sources and stays: dropping it stranded a transfer to a
+        // higher point at the counter this signal set.
+        let links_before = obj.links.len();
+        obj.links.retain(|l| l.dst_point.max(1) > point);
+        let dropped_link = obj.links.len() != links_before;
         let p = obj.point;
         // Pending hardware fences at or below the new point are moot, and so
         // is a fence that was given up on there: the CPU's word replaces it.
@@ -1123,7 +1246,7 @@ pub fn export_snapshot(handle: u32) -> Option<u64> {
     let (r, deferred) = {
         let mut table = TABLE.lock();
         let d = resolve_locked(&mut table);
-        let cur = effective_point(&table.objects, handle, LINK_DEPTH);
+        let cur = effective_point(&table, handle, LINK_DEPTH);
         let in_flight = table
             .pending
             .iter()
@@ -1176,7 +1299,7 @@ pub fn import_snapshot(dst: u32, src: u32, target: u64) -> bool {
     let (advanced, deferred) = {
         let mut table = TABLE.lock();
         let d = resolve_locked(&mut table);
-        let Some(src_point) = effective_point(&table.objects, src, LINK_DEPTH) else {
+        let Some(src_point) = effective_point(&table, src, LINK_DEPTH) else {
             drop(table);
             d.run();
             return false;
@@ -1194,11 +1317,11 @@ pub fn import_snapshot(dst: u32, src: u32, target: u64) -> bool {
             d.run();
             return false;
         };
-        let had_link = obj.linked.is_some();
+        let had_link = !obj.links.is_empty();
+        obj.links.clear();
         let adv = if reached {
             let before = obj.point;
             obj.point = obj.point.max(1);
-            obj.linked = None;
             let after = obj.point;
             if tainted {
                 mark_errored(&mut table, dst, before, after);
@@ -1212,7 +1335,7 @@ pub fn import_snapshot(dst: u32, src: u32, target: u64) -> bool {
             if obj.point <= 1 {
                 obj.point = 0;
             }
-            obj.linked = Some(Link {
+            obj.links.push(Link {
                 deps: alloc::vec![(src, target)],
                 dst_point: 1,
             });
@@ -1233,9 +1356,12 @@ pub fn import_snapshot(dst: u32, src: u32, target: u64) -> bool {
 
 /// `SYNCOBJ_TRANSFER`: copy the fence "`src` reached `src_point`" onto `dst`
 /// at `dst_point`. Both handles must exist (returns `false` otherwise). A
-/// `*_point` of 0 selects the object's binary fence (its next signal),
-/// matching [`export_snapshot`]'s floor-at-1 treatment of an unsignaled
-/// binary syncobj.
+/// `dst_point` of 0 selects the destination's binary fence; a `src_point`
+/// of 0 is the fence the source carries NOW -- its highest point reached,
+/// in flight or promised, floored at 1 for an unsignaled binary as
+/// [`export_snapshot`] floors it -- because `drm_syncobj_find_fence` at
+/// point 0 hands back the whole `dma_fence_chain`, and waiting on it waits
+/// on everything.
 ///
 /// If `src` has already reached the requested point, `dst` is advanced to
 /// `dst_point` right away (monotonic — never backwards). If `src` is still
@@ -1249,44 +1375,97 @@ pub fn transfer(dst: u32, dst_point: u64, src: u32, src_point: u64) -> bool {
     let (new_point, deferred) = {
         let mut table = TABLE.lock();
         let d = resolve_locked(&mut table);
-        let Some(src_eff) = effective_point(&table.objects, src, LINK_DEPTH) else {
+        let Some(src_eff) = effective_point(&table, src, LINK_DEPTH) else {
             drop(table);
             d.run();
             return false;
         };
-        let need = src_point.max(1);
+        let need = if src_point == 0 {
+            // Read as point 1, this handed over a point long reached while
+            // the source still had work pending: Mesa's many-to-many
+            // transfer moves its temporary timeline at point 0 into every
+            // signal semaphore, and they signaled behind one wait of N.
+            let in_flight = table
+                .pending
+                .iter()
+                .filter(|f| f.handle == src)
+                .map(|f| f.point)
+                .max()
+                .unwrap_or(0);
+            src_eff
+                .max(in_flight)
+                .max(promised_point(&table, src))
+                .max(1)
+        } else {
+            src_point
+        };
         let reached = src_eff >= need;
         let tainted = reached && errored_locked(&table, src, need);
-        // The lowest pending hardware fence on `src` that covers `need`.
+        // The lowest pending hardware fence on `src` that covers `need` --
+        // copied only when it is the WHOLE of what `need` waits for. With
+        // another fence or a link below it on the source, the dependency
+        // is the chain, and a link to `src` follows every node of it
+        // (`fences_through_link`); the lone copy followed one.
         let hw = table
             .pending
             .iter()
             .filter(|f| f.handle == src && f.point >= need)
             .min_by_key(|f| f.point)
-            .copied();
-        if dst_point <= 1 {
+            .copied()
+            .filter(|f| {
+                !table
+                    .objects
+                    .iter()
+                    .find(|o| o.handle == src)
+                    .is_some_and(|o| node_below_waiting(&table, o, f.point))
+            });
+        let binary = dst_point <= 1;
+        if binary {
             // A binary transfer replaces the destination's fence, as an
             // import does (above); a timeline point is added to the chain.
             drop_binary_fence(&mut table, dst);
         }
+        let point = dst_point.max(1);
+        // A timeline point already reached on the source still queues
+        // behind the nodes the destination waits on below it.
+        let behind_a_node = !binary
+            && table
+                .objects
+                .iter()
+                .find(|o| o.handle == dst)
+                .is_some_and(|o| node_below_waiting(&table, o, point));
         let Some(obj) = table.objects.iter_mut().find(|o| o.handle == dst) else {
             drop(table);
             d.run();
             return false;
         };
-        let had_link = obj.linked.is_some();
+        // The binary replace takes the links with it; a timeline point is a
+        // new node behind whatever the destination still waits on
+        // (`drm_syncobj_add_point`), which used to be thrown away here.
+        let had_link = binary && !obj.links.is_empty();
+        if binary {
+            obj.links.clear();
+        }
         let np = if reached {
             let before = obj.point;
-            obj.point = obj.point.max(dst_point.max(1));
-            obj.linked = None;
-            let after = obj.point;
-            if tainted {
-                mark_errored(&mut table, dst, before, after);
+            if behind_a_node {
+                obj.push_link(Link {
+                    deps: Vec::new(),
+                    dst_point: point,
+                });
+                if tainted {
+                    mark_errored(&mut table, dst, before, point);
+                }
+                None
+            } else {
+                obj.point = obj.point.max(point);
+                let after = obj.point;
+                if tainted {
+                    mark_errored(&mut table, dst, before, after);
+                }
+                Some(after)
             }
-            Some(after)
         } else if let Some(f) = hw {
-            obj.linked = None;
-            let point = dst_point.max(1);
             if point == 1 && obj.point == 1 {
                 // The binary slot is replaced: signaled no more.
                 obj.point = 0;
@@ -1305,13 +1484,13 @@ pub fn transfer(dst: u32, dst_point: u64, src: u32, src_point: u64) -> bool {
             }
             None
         } else {
-            if dst_point <= 1 && obj.point == 1 {
+            if binary && obj.point == 1 {
                 // The binary slot is replaced: signaled no more.
                 obj.point = 0;
             }
-            obj.linked = Some(Link {
+            obj.push_link(Link {
                 deps: alloc::vec![(src, need)],
-                dst_point: dst_point.max(1),
+                dst_point: point,
             });
             None
         };
@@ -1349,7 +1528,7 @@ pub fn merge_fences(fences: &[(u32, u64)]) -> u32 {
             .iter()
             .copied()
             .filter(|&(src, target)| {
-                effective_point(&table.objects, src, LINK_DEPTH).is_some_and(|p| p < target)
+                effective_point(&table, src, LINK_DEPTH).is_some_and(|p| p < target)
             })
             .collect();
         let tainted = deps.is_empty()
@@ -1361,10 +1540,10 @@ pub fn merge_fences(fences: &[(u32, u64)]) -> u32 {
             point: if deps.is_empty() { 1 } else { 0 },
             refs: 1,
             holders: alloc::vec::Vec::new(),
-            linked: if deps.is_empty() {
-                None
+            links: if deps.is_empty() {
+                Vec::new()
             } else {
-                Some(Link { deps, dst_point: 1 })
+                alloc::vec![Link { deps, dst_point: 1 }]
             },
         });
         if tainted {
@@ -1393,7 +1572,8 @@ pub fn reset(handle: u32) -> bool {
             return false;
         };
         obj.point = 0;
-        let dropped_link = obj.linked.take().is_some();
+        let dropped_link = !obj.links.is_empty();
+        obj.links.clear();
         // Every fence, not just the ones inside binary range: `SYNCOBJ_RESET` is
         // `drm_syncobj_replace_fence(syncobj, NULL)` in Linux, i.e. "this object
         // carries no fence at all". A timeline fence left in flight across the
@@ -1462,7 +1642,7 @@ fn query_inner(handle: u32, last_submitted: bool) -> Option<u64> {
     let (r, deferred) = {
         let mut table = TABLE.lock();
         let d = resolve_locked(&mut table);
-        let cur = effective_point(&table.objects, handle, LINK_DEPTH);
+        let cur = effective_point(&table, handle, LINK_DEPTH);
         let out = if last_submitted {
             cur.map(|p| {
                 let inflight = table
@@ -1590,7 +1770,7 @@ fn wait_ready_inner(
         let mut table = TABLE.lock();
         let d = resolve_locked(&mut table);
         for (i, &h) in handles.iter().enumerate() {
-            let Some(point) = effective_point(&table.objects, h, LINK_DEPTH) else {
+            let Some(point) = effective_point(&table, h, LINK_DEPTH) else {
                 drop(table);
                 d.run();
                 return Some(Err(WaitOutcome::Invalid));
@@ -1659,7 +1839,7 @@ fn wait_inner(
             let mut table = TABLE.lock();
             let d = resolve_locked(&mut table);
             for (i, &h) in handles.iter().enumerate() {
-                let Some(point) = effective_point(&table.objects, h, LINK_DEPTH) else {
+                let Some(point) = effective_point(&table, h, LINK_DEPTH) else {
                     drop(table);
                     d.run();
                     account(false);
@@ -1774,7 +1954,7 @@ pub fn describe(handles: &[u32], points: Option<&[u64]>) -> alloc::string::Strin
     let table = TABLE.lock();
     for (i, &h) in handles.iter().enumerate() {
         let target = points.map(|p| p[i]).unwrap_or(1);
-        let cur = effective_point(&table.objects, h, LINK_DEPTH).map_or(-1i64, |p| p as i64);
+        let cur = effective_point(&table, h, LINK_DEPTH).map_or(-1i64, |p| p as i64);
         let _ = core::fmt::write(&mut list, format_args!(" {:#x}:{}/{}", h, target, cur));
         for f in table.pending.iter().filter(|f| f.handle == h) {
             let _ = core::fmt::write(&mut list, format_args!("+{}(ctx{})", f.point, f.ctx_idx));
@@ -2235,11 +2415,15 @@ mod tests {
         let stray = Landing::new();
         assert!(attach_hw_fence(h, 1, stray.va(), 0, 1, 0, true));
 
-        assert_eq!(
-            pending_hw_fence(h, 7).map(|f| f.0),
-            Some(inflight.va()),
+        let vas: Vec<usize> = pending_hw_fences(h, 7).into_iter().map(|f| f.0).collect();
+        assert!(
+            vas.contains(&inflight.va()),
             "the in-flight timeline fence must survive a binary signal"
         );
+        // ...and the slot's own fence is the node below it in the chain: 7
+        // counts once both have landed.
+        assert_eq!(vas.len(), 2);
+        assert!(vas.contains(&stray.va()));
         assert_eq!(query_submitted(h), Some(7));
 
         destroy(h);
@@ -3255,7 +3439,7 @@ mod tests {
             .lock()
             .objects
             .iter()
-            .filter(|o| o.linked.is_some())
+            .filter(|o| !o.links.is_empty())
             .count()
     }
 
@@ -3442,9 +3626,10 @@ mod tests {
     }
 
     /// A transfer recorded before its source was submitted is a link; once
-    /// the source's work is in flight, the link shows that fence, and only
-    /// up to the point the transfer promised. Among several fences on the
-    /// source, the lowest one that covers the transferred point is the one.
+    /// the source's work is in flight, the link shows its fences, and only
+    /// up to the point the transfer promised: among several fences on the
+    /// source, the lowest one that covers the transferred point and every
+    /// one below it (the chain), never the ones above.
     #[test]
     fn a_pending_transfer_shows_its_source_fence_up_to_the_point_it_promises() {
         let _g = test_lock();
@@ -3461,17 +3646,21 @@ mod tests {
             WaitOutcome::Timeout
         ));
         assert_eq!(query_submitted(dst), Some(0));
-        let low = Landing::new();
+        let mut low = Landing::new();
         let mut high = Landing::new();
         let top = Landing::new();
         assert!(attach_hw_fence(src, 2, low.va(), 0, 5, 1, false));
         assert!(attach_hw_fence(src, 4, high.va(), 0, 11, 2, false));
         assert!(attach_hw_fence(src, 6, top.va(), 0, 13, 2, false));
-        let fence = Some((high.va(), 0u64, 11u32, 2u32));
-        assert_eq!(pending_hw_fence(dst, 6), fence, "the fence that reaches 4");
+        let chain = alloc::vec![(low.va(), 0u64, 5u32, 1u32), (high.va(), 0, 11, 2)];
         assert_eq!(
-            pending_hw_fence(dst, 3),
-            fence,
+            pending_hw_fences(dst, 6),
+            chain,
+            "the fence that reaches 4, and the one below it"
+        );
+        assert_eq!(
+            pending_hw_fences(dst, 3),
+            chain,
             "any point the transfer covers"
         );
         assert_eq!(pending_hw_fence(dst, 7), None, "past what it promises");
@@ -3495,10 +3684,12 @@ mod tests {
         assert_eq!(query(dst), Some(0), "available is not signaled");
         assert_eq!(export_snapshot(dst), Some(6));
         high.land(11);
+        assert_eq!(query(dst), Some(0), "4 landed out of order: it waits for 2");
+        low.land(5);
         assert_eq!(query(dst), Some(6));
         assert!(destroy(dst));
         assert!(destroy(src));
-        assert_eq!(pending_now(), 0, "src's fences at 2 and 6 went with it");
+        assert_eq!(pending_now(), 0, "src's fence at 6 went with it");
     }
 
     /// A merged fence is submitted once EVERY source is, and is one GPU
@@ -3752,6 +3943,235 @@ mod tests {
         assert_eq!(links_now(), 0);
         assert!(destroy(a));
         assert!(destroy(b));
+    }
+
+    /// `SYNCOBJ_TRANSFER` to a timeline point ADDS a node to the chain
+    /// (`drm_syncobj_add_point`): the point counts once its own source and
+    /// every node before it have -- and a transfer FROM point 0 takes the
+    /// chain the source carries now (`drm_syncobj_find_fence` at 0), not its
+    /// point 1. The pair is Mesa's many-to-many
+    /// `vk_drm_syncobj_transfer_payloads` (a `vkQueueSubmit` that only
+    /// forwards N waits into M signals: NVK's `copy_sync_payloads`): each
+    /// wait goes into a temporary timeline at points 1..N, then the
+    /// temporary goes at point 0 into every signal, "relying on waiting on
+    /// a whole chain waiting on everything". With one link per object,
+    /// point 2 threw away what point 1 waited on and point 0 read as point
+    /// 1, so every signal semaphore followed ONE wait of N, whichever
+    /// order they came in: a semaphore signaled before its producer had
+    /// finished, and a buffer reused under the GPU.
+    #[test]
+    fn a_transfer_to_a_timeline_point_waits_for_the_nodes_before_it_like_a_chain() {
+        let _g = test_lock();
+        arm_hooks();
+        let reached = |h: u32, p: u64| matches!(wait_ready(&[h], Some(&[p]), true, 0), Some(Ok(_)));
+
+        // Mesa's shape, both binary waits still pending when forwarded,
+        // signaled in either order.
+        for first in 0..2usize {
+            let w = [create(false), create(false)];
+            let tmp = create(false);
+            let (s_bin, s_tl) = (create(false), create(false));
+            assert!(transfer(tmp, 1, w[0], 0));
+            assert!(transfer(tmp, 2, w[1], 0));
+            assert!(transfer(s_bin, 0, tmp, 0));
+            assert!(transfer(s_tl, 7, tmp, 0));
+            assert!(
+                !reached(s_bin, 1) && !reached(s_tl, 7),
+                "nothing signaled yet"
+            );
+            assert!(signal(w[first]));
+            assert_eq!(
+                query(tmp),
+                Some(if first == 0 { 1 } else { 0 }),
+                "point 1 is w0's alone; point 2 needs both (w{first} signaled first)"
+            );
+            assert!(
+                !reached(s_bin, 1),
+                "one wait of two is not the chain (w{} first)",
+                first
+            );
+            assert!(!reached(s_tl, 7));
+            assert!(signal(w[1 - first]));
+            assert_eq!(query(tmp), Some(2));
+            assert!(reached(s_bin, 1) && reached(s_tl, 7));
+            assert_eq!(query(s_tl), Some(7));
+            for h in [w[0], w[1], tmp, s_bin, s_tl] {
+                assert!(destroy(h));
+            }
+        }
+
+        // A wait already done when forwarded: the temporary reaches 1 at
+        // once, and point 0 is still the whole chain, not that 1.
+        {
+            let (w0, w1, tmp, s) = (create(true), create(false), create(false), create(false));
+            assert!(transfer(tmp, 1, w0, 0));
+            assert_eq!(query(tmp), Some(1));
+            assert!(transfer(tmp, 2, w1, 0));
+            assert!(transfer(s, 0, tmp, 0));
+            assert!(
+                !reached(s, 1),
+                "point 0 of the temporary is point 2, still pending"
+            );
+            assert!(signal(w1));
+            assert!(reached(s, 1));
+            for h in [w0, w1, tmp, s] {
+                assert!(destroy(h));
+            }
+        }
+
+        // Both waits in flight on two channels: EXEC behind the signal sees
+        // both fences (one ACQUIRE each), and the signal counts only once
+        // both have landed, whichever lands first.
+        {
+            let (w0, w1, tmp, s) = (create(false), create(false), create(false), create(false));
+            let (mut l0, mut l1) = (Landing::new(), Landing::new());
+            assert!(attach_hw_fence(w0, 1, l0.va(), 0, 1, 0, true));
+            assert!(attach_hw_fence(w1, 1, l1.va(), 0, 1, 1, true));
+            assert!(transfer(tmp, 1, w0, 0));
+            assert!(transfer(tmp, 2, w1, 0));
+            assert!(transfer(s, 0, tmp, 0));
+            let vas: Vec<usize> = pending_hw_fences(s, 1).into_iter().map(|f| f.0).collect();
+            assert_eq!(vas.len(), 2, "both fences of the chain: {:?}", vas);
+            assert!(vas.contains(&l0.va()) && vas.contains(&l1.va()));
+            l1.land(1);
+            assert!(
+                !reached(s, 1),
+                "w1 landed first: w0 is still the node before it"
+            );
+            assert_eq!(query(tmp), Some(0));
+            l0.land(1);
+            assert!(reached(s, 1));
+            assert_eq!(query(tmp), Some(2));
+            for h in [w0, w1, tmp, s] {
+                assert!(destroy(h));
+            }
+        }
+
+        // The nodes below stay independent: point 1 is reached when its own
+        // source is, whatever point 2 still waits on (no over-sync).
+        {
+            let (a, b, t) = (create(false), create(false), create(false));
+            assert!(transfer(t, 1, a, 0));
+            assert!(transfer(t, 2, b, 0));
+            assert!(signal(a));
+            assert_eq!(query(t), Some(1));
+            assert!(reached(t, 1) && !reached(t, 2));
+            assert!(signal(b));
+            assert_eq!(query(t), Some(2));
+            for h in [a, b, t] {
+                assert!(destroy(h));
+            }
+        }
+
+        // A transfer already reached at a point above a node still waiting
+        // queues behind it too: behind a link (a wait done, forwarded after
+        // one that is not) and behind the object's own fence in flight (an
+        // EXEC signal at 3, then a done wait forwarded at 5).
+        {
+            let (a, b, t) = (create(false), create(true), create(false));
+            assert!(transfer(t, 1, a, 0));
+            assert!(transfer(t, 2, b, 0));
+            assert_eq!(
+                query(t),
+                Some(0),
+                "2 is done, 1 is not: the chain stops at 1"
+            );
+            assert!(!reached(t, 2));
+            assert!(signal(a));
+            assert_eq!(query(t), Some(2));
+            let u = create(false);
+            let mut land = Landing::new();
+            assert!(attach_hw_fence(u, 3, land.va(), 0, 1, 0, false));
+            assert!(transfer(u, 5, b, 0));
+            assert_eq!(query(u), Some(0), "5 is done, 3 has not landed");
+            assert!(!reached(u, 5));
+            land.land(1);
+            assert_eq!(query(u), Some(5));
+            for h in [a, b, t, u] {
+                assert!(destroy(h));
+            }
+        }
+
+        // A hardware fence landing at a point above a node still waiting
+        // queues behind it (EXEC signals 4 while a transfer at 3 is
+        // pending), and a CPU signal below a pending transfer leaves the
+        // transfer waiting instead of dropping it.
+        {
+            let (w, t) = (create(false), create(false));
+            assert!(transfer(t, 3, w, 0));
+            let mut land = Landing::new();
+            assert!(attach_hw_fence(t, 4, land.va(), 0, 1, 0, false));
+            land.land(1);
+            assert_eq!(poll_pending(), 1, "landed, and held behind the node at 3");
+            assert_eq!(
+                query(t),
+                Some(0),
+                "4 landed, 3 has not: the chain stops at 3"
+            );
+            assert!(!reached(t, 3) && !reached(t, 4));
+            assert!(signal(w));
+            assert_eq!(query(t), Some(4));
+            assert_eq!(pending_now(), 0);
+            let (a, u) = (create(false), create(false));
+            assert!(transfer(u, 5, a, 0));
+            assert!(timeline_signal(u, 3));
+            assert_eq!(query(u), Some(3));
+            assert!(signal(a));
+            assert_eq!(
+                query(u),
+                Some(5),
+                "the transfer to 5 survived the signal to 3"
+            );
+            for h in [w, t, a, u] {
+                assert!(destroy(h));
+            }
+        }
+        assert_eq!(links_now(), 0);
+    }
+
+    /// Linux finds a syncobj handle in the calling file's table and nowhere
+    /// else: another process's handle is ENOENT for every syncobj ioctl.
+    /// Here the handle space is global, and with DESTROY the only ioctl
+    /// that asked who held the handle, a client guessing the compositor's
+    /// (consecutive) handle numbers could signal its release timelines,
+    /// reset its acquire fences or wait on them. `usable_by` is the one
+    /// answer every arm now asks for, holders standing in for the file.
+    #[test]
+    fn a_syncobj_is_named_only_by_the_processes_that_hold_it() {
+        let _g = test_lock();
+        arm_hooks();
+        const A: u64 = 92_001;
+        const B: u64 = 92_002;
+        let a1 = create_for(A, false);
+        let b1 = create_for(B, true);
+        let kernel = create(false);
+        assert!(usable_by(A, a1) && usable_by(B, b1));
+        assert!(!usable_by(B, a1), "A's is not B's");
+        assert!(!usable_by(A, b1), "B's is not A's");
+        assert!(
+            usable_by(A, kernel) && usable_by(B, kernel),
+            "no file owns a handle nobody holds"
+        );
+        assert!(
+            usable_by(0, a1) && usable_by(0, b1) && usable_by(0, kernel),
+            "the kernel itself names any live handle"
+        );
+        assert!(!usable_by(A, 0xdead_0007) && !usable_by(0, 0xdead_0007));
+        // An import (an opaque FD_TO_HANDLE) makes B a holder of a1.
+        assert!(add_ref_for(B, a1));
+        assert!(usable_by(B, a1) && usable_by(A, a1));
+        // The array form is all-or-nothing, like `drm_syncobj_array_find`.
+        assert!(all_usable_by(A, &[a1, kernel]));
+        assert!(!all_usable_by(A, &[a1, b1]), "one of them is B's alone");
+        assert!(!all_usable_by(A, &[a1, 0xdead_0008]));
+        assert!(all_usable_by(A, &[]), "nothing to refuse");
+        // B gives its reference back: a1 is A's alone again.
+        assert!(destroy_for(B, a1));
+        assert!(!usable_by(B, a1) && usable_by(A, a1));
+        // A destroyed handle is nobody's, not even the kernel's.
+        assert!(destroy_for(A, a1));
+        assert!(!usable_by(A, a1) && !usable_by(0, a1));
+        assert!(destroy_for(B, b1) && destroy(kernel));
     }
 
     /// A syncobj handle is a `drm_file` thing in Linux: `SYNCOBJ_DESTROY`

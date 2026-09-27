@@ -2237,8 +2237,16 @@ impl DrmDev {
                 } else {
                     zcore_drivers::scheme::syncobj::signal
                 };
-                for i in 0..req.count_handles {
-                    let handle = unsafe { *(req.handles as *const u32).add(i as usize) };
+                // The whole array is looked up first, in the caller's own
+                // handles (`drm_syncobj_array_find`): one it does not hold
+                // is ENOENT and none of the others is touched.
+                let handles: alloc::vec::Vec<u32> = (0..req.count_handles as usize)
+                    .map(|i| unsafe { *(req.handles as *const u32).add(i) })
+                    .collect();
+                if !zcore_drivers::scheme::syncobj::all_usable_by(drm::current_pid(), &handles) {
+                    return Err(FsError::EntryNotFound);
+                }
+                for handle in handles {
                     if !apply(handle) {
                         return Err(FsError::EntryNotFound);
                     }
@@ -2273,8 +2281,15 @@ impl DrmDev {
                 }
                 ucheck_n::<u32>(req.handles as usize, req.count_handles as usize)?;
                 ucheck_n::<u64>(req.points as usize, req.count_handles as usize)?;
-                for i in 0..req.count_handles as usize {
-                    let handle = unsafe { *(req.handles as *const u32).add(i) };
+                // The caller's own handles, all of them, before any is
+                // signaled (`drm_syncobj_array_find`).
+                let handles: alloc::vec::Vec<u32> = (0..req.count_handles as usize)
+                    .map(|i| unsafe { *(req.handles as *const u32).add(i) })
+                    .collect();
+                if !zcore_drivers::scheme::syncobj::all_usable_by(drm::current_pid(), &handles) {
+                    return Err(FsError::EntryNotFound);
+                }
+                for (i, handle) in handles.into_iter().enumerate() {
                     let point = unsafe { *(req.points as *const u64).add(i) };
                     if !zcore_drivers::scheme::syncobj::timeline_signal(handle, point) {
                         return Err(FsError::EntryNotFound);
@@ -2291,6 +2306,13 @@ impl DrmDev {
                     return Err(FsError::OpNotSupported);
                 }
                 let req = unsafe { &*(data as *const DrmSyncobjTransfer) };
+                // Both ends must be the caller's (`drm_syncobj_find` on each).
+                if !zcore_drivers::scheme::syncobj::all_usable_by(
+                    drm::current_pid(),
+                    &[req.dst_handle, req.src_handle],
+                ) {
+                    return Err(FsError::EntryNotFound);
+                }
                 let ok = zcore_drivers::scheme::syncobj::transfer(
                     req.dst_handle,
                     req.dst_point,
@@ -2333,9 +2355,16 @@ impl DrmDev {
                 // terminator (`libvulkan_nouveau.so+0x9cc48`).
                 ucheck_n::<u32>(req.handles as usize, req.count_handles as usize)?;
                 ucheck_n::<u64>(req.points as usize, req.count_handles as usize)?;
+                // The caller's own handles, all of them, before any point is
+                // written back (`drm_syncobj_array_find`).
+                let handles: alloc::vec::Vec<u32> = (0..req.count_handles as usize)
+                    .map(|i| unsafe { *(req.handles as *const u32).add(i) })
+                    .collect();
+                if !zcore_drivers::scheme::syncobj::all_usable_by(drm::current_pid(), &handles) {
+                    return Err(FsError::EntryNotFound);
+                }
                 let mut first_pt = 0u64;
-                for i in 0..req.count_handles as usize {
-                    let handle = unsafe { *(req.handles as *const u32).add(i) };
+                for (i, handle) in handles.into_iter().enumerate() {
                     let looked_up = if last_submitted {
                         zcore_drivers::scheme::syncobj::query_submitted(handle)
                     } else {
@@ -2407,6 +2436,12 @@ impl DrmDev {
                 let handles: alloc::vec::Vec<u32> = (0..count_handles as usize)
                     .map(|i| unsafe { *(handles_ptr as *const u32).add(i) })
                     .collect();
+                // The caller's own handles (`drm_syncobj_array_find`): a wait
+                // on another process's syncobj is ENOENT, not a wait.
+                if !zcore_drivers::scheme::syncobj::all_usable_by(drm::current_pid(), &handles) {
+                    syncobj_wait_klog(timeline, &handles, "not the caller's handle (ENOENT)");
+                    return Err(FsError::EntryNotFound);
+                }
                 let points: Option<alloc::vec::Vec<u64>> = if timeline && points_ptr != 0 {
                     Some(
                         (0..count_handles as usize)
@@ -7428,6 +7463,164 @@ mod kms_scanout_tests {
         );
     }
 
+    /// What Moebius's 27-sep 16:4x boot narrowed the search to. Its klog says the
+    /// source was clean in BOTH reads for 32 seconds and 320-odd frames, with the
+    /// "carries black" and "went black mid-copy" budgets sitting unspent -- so if
+    /// a black rectangle was on screen in that window, the kernel put it there.
+    ///
+    /// This pins the invariant that claim rests on: a present copies every visible
+    /// pixel and INVENTS nothing. Black is the interesting failure, but the
+    /// assertion is exact equality, because the two ways the kernel could show
+    /// black it was not given are writing a zero and **not writing at all** -- and
+    /// an unwritten pixel keeps whatever the panel held, which at boot is black.
+    /// `UNTOUCHED` is the emulator's sentinel for "never written", so equality
+    /// catches that case by name instead of it hiding as a plausible colour.
+    ///
+    /// Four geometries, because the two machines differ where it matters: QEMU
+    /// reports an UNPADDED pitch (7680 for 1920, exactly 4 bytes a pixel) and the
+    /// RTX's UEFI reports `PixelsPerScanLine` PADDED (2048 for a 1920-wide mode),
+    /// and `blit_from` picks a different right limit for each -- `padded_w` for row
+    /// copies, `visible_w` per pixel. Write-combining picks the store path, and on
+    /// x86_64 the WC one is the non-temporal loop for real.
+    #[test]
+    fn a_present_copies_every_visible_pixel_and_invents_no_black() {
+        for &(w, h, pitch_px, wc) in &[
+            (64u32, 32u32, 64u32, false),
+            (64, 32, 64, true),
+            // Padded, which is the real-hardware case and the one where the two
+            // right limits stop agreeing.
+            (40, 16, 64, true),
+            (40, 16, 64, false),
+        ] {
+            let screen = kms_emu::attach_with(w, h, pitch_px, wc);
+            let c = Client::open(0);
+            let buf = c.create_dumb(w, h);
+            // Every pixel opaque and distinct, and not one of them zero: `tag`
+            // is seeded from a non-zero base, so a zero on the panel can only
+            // have been invented by the copy.
+            paint(&buf, |x, y| tag(0x0044_0000, x, y));
+            let fb = c.addfb2(&buf);
+            let src = map_dumb(&buf);
+            let stride = (buf.pitch / 4) as usize;
+
+            c.page_flip(drm::SYNTH_CRTC_ID, fb, 0x9009).expect("flip");
+
+            for y in 0..h {
+                for x in 0..w {
+                    let got = screen.pixel(x, y);
+                    let want = src[y as usize * stride + x as usize];
+                    assert_eq!(
+                        got,
+                        want,
+                        "{}x{} pitch {} wc {}: panel pixel ({}, {}) is {:#010x}, source \
+                         says {:#010x}{}",
+                        w,
+                        h,
+                        pitch_px,
+                        wc,
+                        x,
+                        y,
+                        got,
+                        want,
+                        if got == 0 {
+                            " -- the copy INVENTED black"
+                        } else if got == kms_emu::UNTOUCHED {
+                            " -- never written, so the panel keeps what it held"
+                        } else {
+                            ""
+                        }
+                    );
+                }
+            }
+        }
+    }
+
+    /// The hole Moebius's 27-sep QEMU boot opened. Its klog said, on every frame
+    /// of a 65-second run, that not one sampled pixel was black -- AND said on
+    /// nearly every one of those same frames that the client was still writing
+    /// the buffer. Both are true at once, because the source is sampled BEFORE
+    /// the copy: a clear-to-black that lands mid-copy gets blitted to the screen
+    /// and the old source check never saw it. So "not handed over black" only
+    /// ever meant "not black when we looked".
+    #[test]
+    fn black_that_arrives_while_the_kernel_is_copying_gets_its_own_line() {
+        let _screen = kms_emu::attach(192, 200);
+        drm::set_present_probe_enabled(true);
+        let c = Client::open(0);
+        let buf = c.create_dumb(192, 200);
+        // Opaque and distinct everywhere: the FIRST read finds no black at all,
+        // which is exactly what Moebius's boot reported.
+        paint(&buf, |x, y| tag(0x0055_0000, x, y));
+        let fb = c.addfb2(&buf);
+        let pixels = map_dumb(&buf);
+        let stride = (buf.pitch / 4) as usize;
+        let late = pixels.as_mut_ptr() as usize;
+
+        // The compositor clears a region to black while the copy is in flight --
+        // a popup being repainted over the desktop.
+        kms_emu::on_blit_band(move |band| {
+            if band != 1 {
+                return;
+            }
+            // SAFETY: the dumb buffer outlives this present, and nothing else
+            // writes it while the hook runs.
+            let p = unsafe { core::slice::from_raw_parts_mut(late as *mut u32, stride * 200) };
+            for y in 0..64usize {
+                for x in 64..128usize {
+                    p[y * stride + x] = 0;
+                }
+            }
+        });
+
+        c.page_flip(drm::SYNTH_CRTC_ID, fb, 0x7007).expect("flip");
+
+        assert!(
+            kms_emu::mid_blit_calls() >= 2,
+            "the hook has to have fired mid-copy for this test to mean anything"
+        );
+        assert_eq!(
+            drm::clean_source_lines_for_test(),
+            1,
+            "the first read still found no black, so the clean line is what the \
+             OLD probe would have said -- and on its own it is misleading"
+        );
+        assert_eq!(
+            drm::grew_source_lines_for_test(),
+            1,
+            "black that was not there before the copy and is there after was \
+             handed over, just later than the sample, and that needs saying"
+        );
+    }
+
+    /// And it must not double-report: a black rectangle that just sits there is
+    /// black in BOTH reads, so it is the source line's business and not this
+    /// one's. Without the `>` this would fire on every static black frame and
+    /// bury the frames where black actually arrived mid-copy.
+    #[test]
+    fn black_that_was_already_there_is_not_reported_as_having_arrived() {
+        let _screen = kms_emu::attach(192, 200);
+        drm::set_present_probe_enabled(true);
+        let c = Client::open(0);
+        let buf = c.create_dumb(192, 200);
+        // A black rectangle sitting still, and nothing touching the buffer
+        // during the copy.
+        paint(&buf, |x, y| if x < 64 { 0 } else { tag(0x0066_0000, x, y) });
+        let fb = c.addfb2(&buf);
+
+        c.page_flip(drm::SYNTH_CRTC_ID, fb, 0x8008).expect("flip");
+
+        assert_eq!(
+            drm::black_source_lines_for_test(),
+            1,
+            "the source carried black, so that line fires"
+        );
+        assert_eq!(
+            drm::grew_source_lines_for_test(),
+            0,
+            "it was black before the copy too, so nothing arrived mid-copy"
+        );
+    }
+
     /// And the point of the split: the cheap answer cannot eat the budget the
     /// deciding frames need. This is Moebius's boot in miniature -- a long
     /// black-free run first, and THEN the frame that carries black.
@@ -8495,6 +8688,440 @@ mod kms_scanout_tests {
 
         c.rmfb(fb_id).expect("RMFB");
         c.destroy_dumb(fb_buf.handle).expect("DESTROY_DUMB");
+    }
+
+    // -----------------------------------------------------------------------
+    // The desktop, simulated: labwc presenting while the pointer moves.
+    //
+    // The garbage this exists for cannot be photographed into a test. What CAN
+    // be written down is the contract the screen owes its user: it shows the
+    // frame the compositor last presented, with the pointer on top, and nothing
+    // else. Every step below checks the WHOLE panel against that, so a stray
+    // rectangle is caught wherever it lands and whatever it holds -- a piece of
+    // an older frame, a piece of one not presented yet, or black.
+    // -----------------------------------------------------------------------
+
+    /// One pixel of the desktop labwc composes for frame `n`.
+    ///
+    /// The frame number is in every pixel and the alpha byte is always `0xff`,
+    /// which buys two things. A window of another frame pasted into this one
+    /// does not resemble anything here, so it is caught by value and not merely
+    /// by position. And `0x00000000` -- the black of the rectangles -- cannot
+    /// come out of any legitimate scene, so if the panel holds it, the kernel
+    /// put it there.
+    fn desktop_px(n: u32, x: u32, y: u32) -> u32 {
+        0xFF00_0000 | ((n & 0xff) << 16) | ((y & 0xff) << 8) | (x & 0xff)
+    }
+
+    /// What the screen ought to show, kept beside the emulated panel.
+    struct Panel {
+        w: u32,
+        h: u32,
+        /// The frame the compositor last PRESENTED, pixel for pixel. Not the
+        /// buffer it currently holds: a buffer being drawn into is not a frame
+        /// anybody has asked for.
+        scene: alloc::vec::Vec<u32>,
+        /// Where the pointer is drawn and how big it is.
+        cursor: Option<(u32, u32, u32, u32)>,
+        /// The pointer image, `bmp_w` pixels per row, alpha `0xff` or `0x00`
+        /// only -- a partly transparent pointer would need the blend written
+        /// out twice, and what these tests are about is what shows THROUGH it.
+        bmp: alloc::vec::Vec<u32>,
+        bmp_w: u32,
+    }
+
+    impl Panel {
+        fn new(w: u32, h: u32, frame: u32, bmp: alloc::vec::Vec<u32>, bmp_w: u32) -> Self {
+            let mut p = Panel {
+                w,
+                h,
+                scene: alloc::vec::Vec::new(),
+                cursor: None,
+                bmp,
+                bmp_w,
+            };
+            p.present(frame);
+            p
+        }
+
+        /// The compositor put frame `n` up, whole.
+        fn present(&mut self, n: u32) {
+            self.scene.clear();
+            for y in 0..self.h {
+                for x in 0..self.w {
+                    self.scene.push(desktop_px(n, x, y));
+                }
+            }
+        }
+
+        fn want(&self, x: u32, y: u32) -> u32 {
+            if let Some((cx, cy, cw, ch)) = self.cursor {
+                if x >= cx && x < cx + cw && y >= cy && y < cy + ch {
+                    let s = self.bmp[((y - cy) * self.bmp_w + (x - cx)) as usize];
+                    if s >> 24 != 0 {
+                        return s | 0xFF00_0000;
+                    }
+                }
+            }
+            self.scene[(y * self.w + x) as usize]
+        }
+
+        /// Compare every visible pixel, and say in the failure which of the two
+        /// ways it is wrong -- the two need work in opposite places.
+        fn check(&self, screen: &kms_emu::Screen, step: &str) {
+            for y in 0..self.h {
+                for x in 0..self.w {
+                    let want = self.want(x, y);
+                    let got = screen.pixel(x, y);
+                    if got == want {
+                        continue;
+                    }
+                    let how = if got == 0 {
+                        ", and it is BLACK: no scene of this desktop holds a \
+                         zero pixel, so the kernel put it there"
+                    } else if got == UNTOUCHED {
+                        ", and nothing ever wrote it"
+                    } else {
+                        ", which is a piece of another frame"
+                    };
+                    panic!(
+                        "{}: pixel ({}, {}) reads {:#010x} and the frame on \
+                         screen says {:#010x}{}",
+                        step, x, y, got, want, how
+                    );
+                }
+            }
+        }
+    }
+
+    /// A pointer image: opaque in a cross, transparent in the corners, so the
+    /// desktop shows through it and a wrong read under the pointer is visible
+    /// rather than hidden behind an opaque square.
+    fn pointer_bitmap(w: u32, h: u32) -> alloc::vec::Vec<u32> {
+        let mut v = alloc::vec::Vec::new();
+        for y in 0..h {
+            for x in 0..w {
+                let on = x >= w / 4 && x < w - w / 4 || y >= h / 4 && y < h - h / 4;
+                v.push(if on { 0xFFFF_FFFF } else { 0x0000_0000 });
+            }
+        }
+        v
+    }
+
+    /// The bug Moebius sees: a pointer move pastes the frame labwc is STILL
+    /// DRAWING into the frame that is on the screen.
+    ///
+    /// Our software-KMS present does not hold the client's buffer the way a real
+    /// display engine does -- it copies it and completes the flip -- so the
+    /// compositor is free to start the next frame in that same buffer. Nothing
+    /// is wrong with that; it is what a released buffer is for. What is wrong is
+    /// that `repaint_for_cursor` then goes back and READS that buffer to erase
+    /// and redraw its two ~64x64 windows, and a renderer begins a frame by
+    /// clearing to transparent black. So the window under the pointer gets a
+    /// black rectangle pasted into a frame that has no black in it, and it
+    /// appears exactly when something new is being drawn -- a menu, a popup --
+    /// which is precisely when Moebius sees it and precisely why labwc and
+    /// lunarbar are not at fault.
+    ///
+    /// Nothing here needs a GPU: the race is not a race at all from the
+    /// kernel's side, because the two events are ordered by the ioctls.
+    #[test]
+    fn a_pointer_move_must_not_paste_the_frame_the_compositor_is_still_drawing() {
+        const W: u32 = 120;
+        const H: u32 = 64;
+        // A padded, write-combining scanline: the UEFI shape, and the one where
+        // the cursor patch widens its columns for real.
+        let screen = kms_emu::attach_with(W, H, 128, true);
+        let c = Client::open(0);
+        let buf = c.create_dumb(W, H);
+        paint(&buf, |x, y| desktop_px(0, x, y));
+        let fb = c.addfb2(&buf);
+        set_crtc(&c, drm::SYNTH_CRTC_ID, fb, W, H);
+        drain_completions(&c);
+
+        let bmp = pointer_bitmap(16, 16);
+        let cur = c.create_dumb(16, 16);
+        {
+            let px = map_dumb(&cur);
+            for (i, v) in bmp.iter().enumerate() {
+                px[i] = *v;
+            }
+        }
+        set_cursor(&c, drm::SYNTH_CRTC_ID, cur.handle, 16, 16, 8, 8);
+
+        let mut panel = Panel::new(W, H, 0, bmp, 16);
+        panel.cursor = Some((8, 8, 16, 16));
+        panel.check(&screen, "frame 0 up and the pointer composited on it");
+
+        // labwc starts frame 1 in the buffer it just presented: a renderer opens
+        // a frame by clearing the region it is about to draw to transparent
+        // black. It has not presented anything, so the screen still shows frame
+        // 0 -- and must keep showing it.
+        let popup = (40u32, 16u32, 104u32, 48u32);
+        {
+            let px = map_dumb(&buf);
+            let stride = (buf.pitch / 4) as usize;
+            for y in popup.1..popup.3 {
+                for x in popup.0..popup.2 {
+                    px[y as usize * stride + x as usize] = 0x0000_0000;
+                }
+            }
+        }
+        panel.check(
+            &screen,
+            "the compositor cleared a popup box in its own buffer and \
+             presented nothing",
+        );
+
+        // The pointer moves into that box, which is what a user does to open the
+        // menu they are pointing at.
+        move_cursor(&c, drm::SYNTH_CRTC_ID, 56, 24);
+        panel.cursor = Some((56, 24, 16, 16));
+        panel.check(&screen, "the pointer moved over the box being drawn");
+
+        // A few pixels further, which is what a mouse actually does: the old and
+        // new windows OVERLAP, so an erase that read the panel instead of what
+        // was saved would capture the pointer it is erasing and blend the new one
+        // over it, baking a trail in.
+        move_cursor(&c, drm::SYNTH_CRTC_ID, 59, 27);
+        panel.cursor = Some((59, 27, 16, 16));
+        panel.check(&screen, "the pointer moved three pixels inside the box");
+
+        // And out again, which is where the erase half used to read that buffer.
+        move_cursor(&c, drm::SYNTH_CRTC_ID, 8, 8);
+        panel.cursor = Some((8, 8, 16, 16));
+        panel.check(&screen, "the pointer moved back out of the box");
+
+        // The right edge, where the pointer's window runs off the visible width
+        // into the scanline's off-screen padding. Those columns are written, so
+        // they have to be read and put back too -- and the model above cannot see
+        // them, which is exactly why a pointer left behind there would never be
+        // noticed. Read them, visit, leave, and they must be as they were.
+        let padding = |s: &kms_emu::Screen| {
+            let mut v = alloc::vec::Vec::new();
+            for y in 24..40 {
+                for x in W..s.pitch_px() {
+                    v.push(s.pixel(x, y));
+                }
+            }
+            v
+        };
+        let before = padding(&screen);
+        move_cursor(&c, drm::SYNTH_CRTC_ID, 112, 24);
+        panel.cursor = Some((112, 24, 16, 16));
+        panel.check(&screen, "the pointer at the right edge");
+        move_cursor(&c, drm::SYNTH_CRTC_ID, 8, 8);
+        panel.cursor = Some((8, 8, 16, 16));
+        panel.check(&screen, "the pointer left the right edge");
+        assert_eq!(
+            padding(&screen),
+            before,
+            "the pointer stayed in the scanline padding: the columns its blit \
+             wrote are not the columns the restore put back"
+        );
+
+        // Now labwc finishes frame 1 and presents it. The screen catches up, the
+        // pointer is composited on top of it -- and what it is covering has to be
+        // re-remembered from the frame that just went up, or the next move erases
+        // with frame 0's pixels.
+        paint(&buf, |x, y| desktop_px(1, x, y));
+        c.page_flip(drm::SYNTH_CRTC_ID, fb, 0xC0DE).expect("flip");
+        drain_completions(&c);
+        panel.present(1);
+        panel.check(&screen, "frame 1 presented with the pointer on it");
+        move_cursor(&c, drm::SYNTH_CRTC_ID, 40, 40);
+        panel.cursor = Some((40, 40, 16, 16));
+        panel.check(&screen, "the pointer moved after frame 1 went up");
+
+        set_cursor(&c, drm::SYNTH_CRTC_ID, 0, 0, 0, 0, 0);
+        c.rmfb(fb).expect("RMFB");
+        c.destroy_dumb(cur.handle).expect("DESTROY_DUMB cursor");
+        c.destroy_dumb(buf.handle).expect("DESTROY_DUMB");
+    }
+
+    /// The saved pixels describe the panel, so anything that repaints the panel
+    /// behind the pointer's back has to make the kernel forget them.
+    ///
+    /// Blanking is the case with no second chance. It paints the panel black and
+    /// does NOT touch `cursor.drawn`, and un-blanking is allowed to happen on a
+    /// bare DPMS write with no frame behind it (see `set_crtc_blanked`). So the
+    /// first pointer move after that would erase the pointer by putting back what
+    /// it was covering before the screen went black -- one rectangle of the old
+    /// desktop on a black screen, which is the same class of bug as the one the
+    /// save exists to fix and would have been introduced by fixing it.
+    /// The escape hatch really takes the old path, and this is what the old path
+    /// does.
+    ///
+    /// `drm.cursor_from_client` exists for one risk the fix cannot measure from
+    /// here: reading the panel puts an aperture read on the pointer path, and
+    /// nobody has measured how slow a read of an NVIDIA BAR1 window is. If that
+    /// turns out to drag the pointer, this flag makes the machine usable again.
+    /// Its price is exactly the defect, so the test says so: the same steps as
+    /// `a_pointer_move_must_not_paste_the_frame_the_compositor_is_still_drawing`
+    /// put the black rectangle back. A flag whose only honest test is "the bug
+    /// returns" is a flag nobody should leave on, which is the point.
+    #[test]
+    fn the_escape_hatch_reads_the_clients_framebuffer_again_black_rectangles_and_all() {
+        const W: u32 = 120;
+        const H: u32 = 64;
+        let screen = kms_emu::attach_with(W, H, 128, true);
+        drm::set_cursor_from_client(true);
+        let c = Client::open(0);
+        let buf = c.create_dumb(W, H);
+        paint(&buf, |x, y| desktop_px(0, x, y));
+        let fb = c.addfb2(&buf);
+        set_crtc(&c, drm::SYNTH_CRTC_ID, fb, W, H);
+        drain_completions(&c);
+
+        let bmp = pointer_bitmap(16, 16);
+        let cur = c.create_dumb(16, 16);
+        {
+            let px = map_dumb(&cur);
+            for (i, v) in bmp.iter().enumerate() {
+                px[i] = *v;
+            }
+        }
+        set_cursor(&c, drm::SYNTH_CRTC_ID, cur.handle, 16, 16, 8, 8);
+
+        // The compositor starts the next frame in the buffer it presented.
+        {
+            let px = map_dumb(&buf);
+            let stride = (buf.pitch / 4) as usize;
+            for y in 16..48usize {
+                for x in 40..104usize {
+                    px[y * stride + x] = 0x0000_0000;
+                }
+            }
+        }
+        move_cursor(&c, drm::SYNTH_CRTC_ID, 56, 24);
+
+        // The pointer's window is columns 48..72 -- widened to the
+        // write-combining boundary -- and every pixel of it the pointer does not
+        // cover now holds the black the compositor had not finished drawing over.
+        let mut black = 0;
+        for y in 24..40u32 {
+            for x in 48..72u32 {
+                if screen.pixel(x, y) == 0 {
+                    black += 1;
+                }
+            }
+        }
+        assert!(
+            black > 0,
+            "the flag did not take the old path: nothing pasted the half-drawn \
+             frame, so there is nothing for the hatch to be an escape from"
+        );
+
+        set_cursor(&c, drm::SYNTH_CRTC_ID, 0, 0, 0, 0, 0);
+        c.rmfb(fb).expect("RMFB");
+        c.destroy_dumb(cur.handle).expect("DESTROY_DUMB cursor");
+        c.destroy_dumb(buf.handle).expect("DESTROY_DUMB");
+    }
+
+    /// A panel that will not hand its pixels back keeps the older route, and that
+    /// route still has to draw and erase a pointer.
+    ///
+    /// The fix above reads the panel, which a panel that is not ARGB8888 cannot
+    /// do, so the read-the-client's-framebuffer path is still there for it. No
+    /// machine this kernel meets has such a panel -- a UEFI GOP, virtio-gpu and an
+    /// NVIDIA BAR1 aperture are all 32-bit -- so nothing else would ever run it,
+    /// and an untested fallback is one that stops working without anyone finding
+    /// out. This is the only test that takes it, and it is the reason the
+    /// emulated panel can be told to refuse.
+    #[test]
+    fn a_panel_that_cannot_be_read_back_still_gets_its_pointer_drawn_and_erased() {
+        let screen = kms_emu::attach(64, 16);
+        screen.refuse_read_back();
+        let c = Client::open(0);
+        let buf = c.create_dumb(64, 16);
+        paint(&buf, |_, _| 0xFF00_1111);
+        let fb = c.addfb2(&buf);
+        set_crtc(&c, drm::SYNTH_CRTC_ID, fb, 64, 16);
+
+        let cur = c.create_dumb(8, 8);
+        {
+            let px = map_dumb(&cur);
+            for p in px.iter_mut().take(64) {
+                *p = 0xFF00_00FF;
+            }
+        }
+        set_cursor(&c, drm::SYNTH_CRTC_ID, cur.handle, 8, 8, 4, 2);
+        move_cursor(&c, drm::SYNTH_CRTC_ID, 40, 6);
+
+        for y in 0..16 {
+            for x in 0..64 {
+                let want = if (40..48).contains(&x) && (6..14).contains(&y) {
+                    0xFF00_00FF
+                } else {
+                    0xFF00_1111
+                };
+                assert_eq!(
+                    screen.pixel(x, y),
+                    want,
+                    "({}, {}) after a move on a panel that refuses read-back",
+                    x,
+                    y
+                );
+            }
+        }
+
+        set_cursor(&c, drm::SYNTH_CRTC_ID, 0, 0, 0, 0, 0);
+        c.rmfb(fb).expect("RMFB");
+        c.destroy_dumb(cur.handle).expect("DESTROY_DUMB cursor");
+        c.destroy_dumb(buf.handle).expect("DESTROY_DUMB");
+    }
+
+    #[test]
+    fn blanking_the_panel_makes_the_kernel_forget_what_the_pointer_was_covering() {
+        const W: u32 = 120;
+        const H: u32 = 64;
+        let screen = kms_emu::attach_with(W, H, 128, true);
+        let c = Client::open(0);
+        let buf = c.create_dumb(W, H);
+        paint(&buf, |x, y| desktop_px(3, x, y));
+        let fb = c.addfb2(&buf);
+        set_crtc(&c, drm::SYNTH_CRTC_ID, fb, W, H);
+        drain_completions(&c);
+
+        let bmp = pointer_bitmap(16, 16);
+        let cur = c.create_dumb(16, 16);
+        {
+            let px = map_dumb(&cur);
+            for (i, v) in bmp.iter().enumerate() {
+                px[i] = *v;
+            }
+        }
+        set_cursor(&c, drm::SYNTH_CRTC_ID, cur.handle, 16, 16, 8, 8);
+
+        drm::set_crtc_blanked(true);
+        // A DPMS write on its own, with nothing presented after it.
+        drm::set_crtc_blanked(false);
+        move_cursor(&c, drm::SYNTH_CRTC_ID, 60, 30);
+
+        // Whatever colour the blank left, the panel is one colour: the only thing
+        // allowed on it is the pointer. A restored save would be a rectangle of
+        // the desktop, wherever the pointer had been.
+        let blank = screen.pixel(0, 0);
+        for y in 0..H {
+            for x in 0..W {
+                if (60..76).contains(&x) && (30..46).contains(&y) {
+                    continue;
+                }
+                assert_eq!(
+                    screen.pixel(x, y),
+                    blank,
+                    "({}, {}) is not the blanked panel: the pointer put back what \
+                     it was covering before the screen went black",
+                    x,
+                    y
+                );
+            }
+        }
+
+        set_cursor(&c, drm::SYNTH_CRTC_ID, 0, 0, 0, 0, 0);
+        c.rmfb(fb).expect("RMFB");
+        c.destroy_dumb(cur.handle).expect("DESTROY_DUMB cursor");
+        c.destroy_dumb(buf.handle).expect("DESTROY_DUMB");
     }
 }
 

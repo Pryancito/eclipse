@@ -8789,10 +8789,95 @@ impl NvidiaGpu {
         }
     }
 
-    /// Applies a single `VM_BIND` op (`MAP` or `UNMAP`). Factored out so
-    /// `DRM_IOCTL_NOUVEAU_VM_BIND` can loop it over an `op_count > 1`
-    /// array -- see that arm's own comment on why this isn't atomic
-    /// across ops.
+    /// What Linux refuses before it touches anything, for ONE op
+    /// (`bind_validate_op` + `nouveau_uvmm_validate_range`): an op it does
+    /// not know, a sparse region (not implemented here), a VA or a range off
+    /// the page, an empty range, one that wraps; and for a `MAP` of a real
+    /// object, a handle the caller does not hold and a window
+    /// (`bo_offset`, `range`) that does not fit the object. The `VM_BIND`
+    /// arm runs this over the WHOLE op list before the first op is applied,
+    /// the way `nouveau_uvmm_bind_job_submit` validates every op before the
+    /// job waits or modifies the VA space: a batch with a bad op in it
+    /// binds nothing and unbinds nothing.
+    fn vm_bind_check_op(
+        &self,
+        owner_pid: u64,
+        op: &super::nouveau_uapi::DrmNouveauVmBindOp,
+    ) -> Result<(), i32> {
+        use super::nouveau_uapi as nv;
+        if op.op != nv::VM_BIND_OP_MAP && op.op != nv::VM_BIND_OP_UNMAP {
+            log::warn!("[nouveau-uapi] VM_BIND: unknown op {:#x}", op.op);
+            return Err(nv::EINVAL);
+        }
+        if op.flags & nv::VM_BIND_SPARSE != 0 {
+            crate::klog_warn!(
+                "[nouveau-uapi] VM_BIND: SPARSE regions are not implemented (op={} addr={:#x} \
+                 range={:#x}) -- sparse Vulkan resources will fail, everything else is unaffected",
+                op.op,
+                op.addr,
+                op.range
+            );
+            return Err(nv::EOPNOTSUPP);
+        }
+        const VM_PAGE: u64 = 4096;
+        if op.range == 0
+            || !op.addr.is_multiple_of(VM_PAGE)
+            || !op.range.is_multiple_of(VM_PAGE)
+            || op.addr.checked_add(op.range).is_none()
+        {
+            crate::klog_warn!(
+                "[nouveau-uapi] VM_BIND: op={} VA={:#x} range={:#x} is empty, wraps, or is off the \
+                 page -> EINVAL",
+                op.op,
+                op.addr,
+                op.range
+            );
+            return Err(nv::EINVAL);
+        }
+        if op.op != nv::VM_BIND_OP_MAP || op.handle == 0 {
+            return Ok(());
+        }
+        // Only a holder may bind the object into its VAS: binding another
+        // process's buffer is a GPU read/write of it.
+        let obj_size = {
+            let gem = self.nouveau_gem.lock();
+            let Some(obj) = gem
+                .iter()
+                .find(|o| o.handle == op.handle && gem_usable_by(o, owner_pid))
+            else {
+                return Err(nv::ENOENT);
+            };
+            obj.size
+        };
+        // The window must lie inside the object (`bind_validate_op`: the
+        // offset on a page, below the end, the range within what is left).
+        // The object's size is what was asked for; Linux rounds a BO up to
+        // whole pages, so measure against that, or a 100-byte object could
+        // never be mapped for its page. Past the end the RM either refused
+        // (EIO, after the drain had already unmapped the live range) or
+        // mapped whatever followed the allocation into the caller's VAS.
+        let obj_pages = obj_size.div_ceil(VM_PAGE).saturating_mul(VM_PAGE);
+        if !op.bo_offset.is_multiple_of(VM_PAGE)
+            || op.bo_offset >= obj_pages
+            || op.range > obj_pages - op.bo_offset
+        {
+            crate::klog_warn!(
+                "[nouveau-uapi] VM_BIND MAP handle={} bo_offset={:#x} range={:#x} does not \
+                 fit the object ({} bytes) -> EINVAL",
+                op.handle,
+                op.bo_offset,
+                op.range,
+                obj_size
+            );
+            return Err(nv::EINVAL);
+        }
+        Ok(())
+    }
+
+    /// Applies a single `VM_BIND` op (`MAP` or `UNMAP`) the `VM_BIND` arm
+    /// has already passed through [`Self::vm_bind_check_op`] -- the only
+    /// caller, which runs that over the whole list first. Factored out so
+    /// the arm can loop it over an `op_count > 1` array.
     fn vm_bind_op(
         &self,
         device_instance: u32,
@@ -8889,37 +8974,11 @@ impl NvidiaGpu {
         // default) is handed to rm_init::vm_bind_map below, which programs it
         // into the GEM memory's descriptor before the Map so it lands in the
         // PTEs -- Linux-nouveau-faithful kind handling.
-        if op.flags & nv::VM_BIND_SPARSE != 0 {
-            crate::klog_warn!(
-                "[nouveau-uapi] VM_BIND: SPARSE regions are not implemented (op={} addr={:#x} \
-                 range={:#x}) -- sparse Vulkan resources will fail, everything else is unaffected",
-                op.op,
-                op.addr,
-                op.range
-            );
-            return Err(nv::EOPNOTSUPP);
-        }
-        // What Linux refuses before it touches anything
-        // (`bind_validate_region`): a VA or a range off the page, an empty
-        // range, one that wraps. Checked here, ahead of the "last binder
-        // wins" drain below, so a malformed op never costs the caller the
-        // live mapping it overlaps: that drain unmaps in the RM first, and
-        // a map the RM then refuses cannot put the old one back.
-        const VM_PAGE: u64 = 4096;
-        if op.range == 0
-            || !op.addr.is_multiple_of(VM_PAGE)
-            || !op.range.is_multiple_of(VM_PAGE)
-            || op.addr.checked_add(op.range).is_none()
-        {
-            crate::klog_warn!(
-                "[nouveau-uapi] VM_BIND: op={} VA={:#x} range={:#x} is empty, wraps, or is off the \
-                 page -> EINVAL",
-                op.op,
-                op.addr,
-                op.range
-            );
-            return Err(nv::EINVAL);
-        }
+        // What Linux refuses before it touches anything was checked by the
+        // caller (`vm_bind_check_op`, over the whole list) ahead of the
+        // "last binder wins" drain below, so a malformed op never costs the
+        // caller the live mapping it overlaps: that drain unmaps in the RM
+        // first, and a map the RM then refuses cannot put the old one back.
         match op.op {
             nv::VM_BIND_OP_MAP => {
                 // MAP with handle=0 is how Mesa spells "unmap this range but
@@ -8939,41 +8998,19 @@ impl NvidiaGpu {
                     );
                     return Ok(());
                 }
-                let (h_memory, obj_size) = {
+                // The holder check and the window check ran in
+                // `vm_bind_check_op`; the lookup here is for `h_memory`, and
+                // an object that went away in between is ENOENT.
+                let h_memory = {
                     let gem = self.nouveau_gem.lock();
-                    // Only a holder may bind the object into its VAS: binding
-                    // another process's buffer is a GPU read/write of it.
                     let Some(obj) = gem
                         .iter()
                         .find(|o| o.handle == op.handle && gem_usable_by(o, owner_pid))
                     else {
                         return Err(nv::ENOENT);
                     };
-                    (obj.h_memory, obj.size)
+                    obj.h_memory
                 };
-                // The window must lie inside the object (`bind_validate_op`:
-                // the offset on a page, below the end, the range within what
-                // is left). The object's size is what was asked for; Linux
-                // rounds a BO up to whole pages, so measure against that,
-                // or a 100-byte object could never be mapped for its page.
-                // Past the end the RM either refused (EIO, after the drain
-                // had already unmapped the live range) or mapped whatever
-                // followed the allocation into the caller's VAS.
-                let obj_pages = obj_size.div_ceil(VM_PAGE).saturating_mul(VM_PAGE);
-                if !op.bo_offset.is_multiple_of(VM_PAGE)
-                    || op.bo_offset >= obj_pages
-                    || op.range > obj_pages - op.bo_offset
-                {
-                    crate::klog_warn!(
-                        "[nouveau-uapi] VM_BIND MAP handle={} bo_offset={:#x} range={:#x} does not \
-                         fit the object ({} bytes) -> EINVAL",
-                        op.handle,
-                        op.bo_offset,
-                        op.range,
-                        obj_size
-                    );
-                    return Err(nv::EINVAL);
-                }
                 // REPLACE semantics, like Linux's gpuvm: a MAP over an
                 // already-mapped range unmaps the old mapping first instead
                 // of failing. On real hardware the missing half of this bit:
@@ -12598,19 +12635,45 @@ impl NvidiaGpu {
                 } else {
                     &[]
                 };
-                // Every sig handle must exist BEFORE anything is waited for,
-                // bound or signaled (Linux looks the whole list up in
-                // `nouveau_job_fence_attach_prepare` before the job runs).
-                if let Some(sig) = sigs
+                // Every sig and wait handle must be the CALLER'S and live
+                // BEFORE anything is waited for, bound or signaled (Linux
+                // looks the whole list up in the caller's file,
+                // `nouveau_job_fence_attach_prepare` / `nouveau_job_add_deps`,
+                // before the job runs; another process's handle is ENOENT).
+                if let Some(s) = sigs
                     .iter()
-                    .find(|s| !crate::scheme::syncobj::exists(s.handle))
+                    .chain(waits.iter())
+                    .find(|s| !crate::scheme::syncobj::usable_by(owner_pid, s.handle))
                 {
                     crate::klog_warn!(
-                        "[nouveau-uapi] VM_BIND: sig syncobj handle={} is unknown -- nothing bound (ENOENT) pid={}",
-                        sig.handle,
+                        "[nouveau-uapi] VM_BIND: syncobj handle={} is unknown or not this process's -- nothing bound (ENOENT) pid={}",
+                        s.handle,
                         owner_pid
                     );
                     return Err(nv::ENOENT);
+                }
+                // Every op is checked BEFORE any is applied, and before the
+                // waits: `nouveau_uvmm_bind_job_submit` runs
+                // `bind_validate_op` over the whole list when the job is
+                // submitted, ahead of its dependencies and of the VA-space
+                // changes, and a job it refuses has done nothing. Checking
+                // each op as it was applied left a batch half done -- op[0]'s
+                // UNMAP already in the RM when op[1] was refused, and the
+                // caller (NVK, `vkQueueBindSparse` with up to 4096 coalesced
+                // ops per call) told that nothing happened -- and cost the
+                // caller the whole wait before it heard about a bad op.
+                if let Some((i, e)) = ops
+                    .iter()
+                    .enumerate()
+                    .find_map(|(i, op)| self.vm_bind_check_op(owner_pid, op).err().map(|e| (i, e)))
+                {
+                    if req.op_count > 1 {
+                        log::warn!(
+                            "[nouveau-uapi] VM_BIND: op[{}] of {} refused ({}): nothing bound, nothing waited for, nothing signaled",
+                            i, req.op_count, e
+                        );
+                    }
+                    return Err(e);
                 }
                 // The waits, on the CPU: the ops below are RM calls the GPU
                 // never orders behind a semaphore, so the ioctl blocks until
@@ -12652,12 +12715,15 @@ impl NvidiaGpu {
                         }
                     }
                 }
-                // Ops are applied in order, one real RM call each -- NOT
-                // atomic across the array: if op[i] fails, op[0..i] already
-                // happened and stay applied, and op[i+1..] never run. Real
-                // nouveau's own VM_BIND jobs behave the same way (each op
-                // is validated/applied as it's processed, not as a single
-                // all-or-nothing transaction).
+                // Ops are applied in order, one real RM call each. Every op
+                // passed `vm_bind_check_op` above, so what can still fail
+                // here is the RM itself (a VA it will not reserve, memory it
+                // has not got) -- and THAT is not unwound: if op[i] fails in
+                // the RM, op[0..i] stay applied and op[i+1..] never run,
+                // where Linux would roll the VA space back
+                // (`nouveau_uvmm_sm_*_prepare_unwind`). A replaced mapping
+                // cannot be put back once the RM has unmapped it, so the
+                // honest thing is to say so in the log.
                 //
                 // Sticky ctx-0 owner (F-M15): do not re-infer from live channels —
                 // a throwaway CHANNEL_FREE must not rebuild a client context for
@@ -12668,7 +12734,7 @@ impl NvidiaGpu {
                     if let Err(e) = self.vm_bind_op(device_instance, ctx_idx, owner_pid, op) {
                         if req.op_count > 1 {
                             log::warn!(
-                                "[nouveau-uapi] VM_BIND: op[{}] of {} failed, stopping ({} earlier op(s) already applied)",
+                                "[nouveau-uapi] VM_BIND: op[{}] of {} failed in the RM, stopping ({} earlier op(s) already applied, not unwound)",
                                 i, req.op_count, i
                             );
                         }
@@ -12738,20 +12804,40 @@ impl NvidiaGpu {
                 // after the handles before it had already been signaled --
                 // an error the caller reads as "nothing was submitted" and
                 // answers by submitting the batch again.
-                if req.sig_count > 0 {
-                    let sigs = unsafe {
-                        core::slice::from_raw_parts(
-                            req.sig_ptr as *const nv::DrmNouveauSync,
-                            req.sig_count as usize,
-                        )
+                // ...and every one of them, wait or sig, must be the CALLER'S:
+                // Linux finds them in the caller's own file, so another
+                // process's handle is ENOENT, whether it was going to be
+                // waited for or signaled. Before this a client could signal
+                // the compositor's release timeline with its own EXEC.
+                {
+                    let sigs = if req.sig_count > 0 && req.sig_ptr != 0 {
+                        unsafe {
+                            core::slice::from_raw_parts(
+                                req.sig_ptr as *const nv::DrmNouveauSync,
+                                req.sig_count as usize,
+                            )
+                        }
+                    } else {
+                        &[]
                     };
-                    if let Some(sig) = sigs
+                    let waits = if req.wait_count > 0 && req.wait_ptr != 0 {
+                        unsafe {
+                            core::slice::from_raw_parts(
+                                req.wait_ptr as *const nv::DrmNouveauSync,
+                                req.wait_count as usize,
+                            )
+                        }
+                    } else {
+                        &[]
+                    };
+                    if let Some(s) = sigs
                         .iter()
-                        .find(|s| !crate::scheme::syncobj::exists(s.handle))
+                        .chain(waits.iter())
+                        .find(|s| !crate::scheme::syncobj::usable_by(owner_pid, s.handle))
                     {
                         crate::klog_warn!(
-                            "[nouveau-uapi] EXEC: sig syncobj handle={} is unknown -- nothing submitted (ENOENT) pid={}",
-                            sig.handle,
+                            "[nouveau-uapi] EXEC: syncobj handle={} is unknown or not this process's -- nothing submitted (ENOENT) pid={}",
+                            s.handle,
                             owner_pid
                         );
                         return Err(nv::ENOENT);
@@ -16424,18 +16510,18 @@ mod nouveau_bookkeeping_tests {
             before,
             "none of those reached the RM"
         );
-        // Ops apply in order and stop at the first failure.
+        // A batch with a bad op in it does nothing at all: Linux checks
+        // every op before the job runs.
         let mut ops = [
             map(ha, VA, 4096),
             map(ha + 1000, VA + 0x1000, 4096),
             map(ha, VA + 0x2000, 4096),
         ];
+        let before = FAKE_RM.lock().calls.len();
         assert_eq!(vm_bind_ops(&gpu, A, &mut ops), Err(nv::ENOENT));
-        assert_eq!(
-            driver_maps(&gpu, A).len(),
-            1,
-            "op[0] applied, op[2] never ran"
-        );
+        assert_eq!(driver_maps(&gpu, A), [], "op[0] was not applied either");
+        assert_eq!(FAKE_RM.lock().calls.len(), before, "nothing reached the RM");
+        assert_eq!(vm_bind_ops(&gpu, A, &mut [map(ha, VA, 4096)]), Ok(0));
         assert_eq!(FAKE_RM.lock().maps_of_ctx(1), [(VA, 4096, 0x06)]);
         // The RM refused the map (a fixed VA it will not reserve): EIO, and
         // no binding is recorded for a mapping that does not exist.
@@ -19553,6 +19639,280 @@ mod nouveau_bookkeeping_tests {
         gpu.nouveau_release_process(A);
         assert_eq!(FAKE_RM.lock().bad, 0);
     }
+    /// Linux finds every syncobj an EXEC or a VM_BIND names -- to wait on
+    /// or to signal -- in the caller's own file, so another process's
+    /// handle is ENOENT and nothing is submitted. Here the handle space is
+    /// global and only the handle's existence was checked: a client could
+    /// signal the compositor's release timeline with an EXEC of its own,
+    /// or wait on its acquire points.
+    #[test]
+    fn an_exec_or_a_vm_bind_cannot_name_another_processes_syncobj() {
+        let _g = LOCK.lock();
+        let _live = LiveBytes::hold();
+        let gpu = gpu_rm_fast();
+        let ch_a = client_with_pushbuf(&gpu, A);
+        let ha = gem_new_rm(&gpu, 65536, nv::NOUVEAU_GEM_DOMAIN_GART, A)
+            .unwrap()
+            .handle;
+        const VA: u64 = 0x7f_4000_0000;
+        let mine = syncobj::create_for(A, false);
+        let theirs = syncobj::create_for(B, false);
+        let theirs_done = syncobj::create_for(B, true);
+        let nobodys = syncobj::create(false);
+        // As a sig: ENOENT, nothing on the ring, B's timeline untouched.
+        assert_eq!(
+            exec(&gpu, A, ch_a, &[push(PUSH_VA, 16)], &[], &[sync(theirs)]),
+            Err(nv::ENOENT)
+        );
+        // Nothing was submitted: the direct-submit channel behind A's
+        // context is not even built until the first EXEC goes through.
+        let nothing_on_the_ring = || !has_chan(1) || run_gpu(1).is_empty();
+        assert!(nothing_on_the_ring(), "nothing was submitted");
+        assert_eq!(syncobj::query_submitted(theirs), Some(0));
+        // Mixed in with A's own: still nothing at all (the whole list is
+        // looked up first), A's own sig not armed either.
+        assert_eq!(
+            exec(
+                &gpu,
+                A,
+                ch_a,
+                &[push(PUSH_VA, 16)],
+                &[],
+                &[sync(mine), sync(theirs)]
+            ),
+            Err(nv::ENOENT)
+        );
+        assert!(nothing_on_the_ring());
+        assert_eq!(syncobj::query_submitted(mine), Some(0));
+        // As a wait, even one B already signaled: ENOENT, no wait, no
+        // submit.
+        assert_eq!(
+            exec(
+                &gpu,
+                A,
+                ch_a,
+                &[push(PUSH_VA, 16)],
+                &[sync(theirs_done)],
+                &[sync(mine)]
+            ),
+            Err(nv::ENOENT)
+        );
+        assert!(nothing_on_the_ring());
+        assert_eq!(syncobj::query_submitted(mine), Some(0));
+        // The empty EXEC (NVK's health probe) with syncs: the same.
+        assert_eq!(
+            exec(&gpu, A, ch_a, &[], &[sync(theirs_done)], &[sync(mine)]),
+            Err(nv::ENOENT)
+        );
+        assert_eq!(syncobj::query_submitted(mine), Some(0));
+        // VM_BIND: its sigs and its waits alike, nothing bound.
+        let before = FAKE_RM.lock().calls.len();
+        assert_eq!(
+            vm_bind_sync(
+                &gpu,
+                A,
+                &mut [map(ha, VA, 65536)],
+                nv::VM_BIND_RUN_ASYNC,
+                &[],
+                &[sync(theirs)]
+            ),
+            Err(nv::ENOENT)
+        );
+        assert_eq!(
+            vm_bind_sync(
+                &gpu,
+                A,
+                &mut [map(ha, VA, 65536)],
+                nv::VM_BIND_RUN_ASYNC,
+                &[sync(theirs_done)],
+                &[sync(mine)]
+            ),
+            Err(nv::ENOENT)
+        );
+        assert_eq!(rm_calls_since(before), [] as [&str; 0]);
+        assert_eq!(syncobj::query(theirs), Some(0));
+        assert_eq!(syncobj::query(mine), Some(0));
+        // A's own, and a handle nobody holds (the kernel's): fine.
+        assert_eq!(
+            exec(
+                &gpu,
+                A,
+                ch_a,
+                &[push(PUSH_VA, 16)],
+                &[],
+                &[sync(mine), sync(nobodys)]
+            ),
+            Ok(0)
+        );
+        assert!(!run_gpu(1).is_empty(), "submitted");
+        assert_eq!(syncobj::query_submitted(mine), Some(1));
+        // Once B's syncobj reaches A through an fd (an opaque import, a
+        // reference of A's on it), A may name it.
+        assert!(syncobj::add_ref_for(A, theirs));
+        assert_eq!(
+            vm_bind_sync(
+                &gpu,
+                A,
+                &mut [map(ha, VA, 65536)],
+                nv::VM_BIND_RUN_ASYNC,
+                &[],
+                &[sync(theirs)]
+            ),
+            Ok(0)
+        );
+        assert_eq!(syncobj::query(theirs), Some(1), "signaled by A's bind");
+        assert_eq!(vm_bind_ops(&gpu, A, &mut [unmap(VA, 65536)]), Ok(0));
+        assert!(syncobj::destroy_for(A, theirs) && syncobj::destroy_for(A, mine));
+        assert!(syncobj::destroy_for(B, theirs) && syncobj::destroy_for(B, theirs_done));
+        assert!(syncobj::destroy(nobodys));
+    }
+
+    /// `nouveau_uvmm_bind_job_submit` runs `bind_validate_op` over every
+    /// op of a `VM_BIND` when the job is submitted, before the job waits
+    /// its in-syncs or touches the VA space, so a batch with a bad op in
+    /// it does nothing at all. Here the ops were checked as they were
+    /// applied: op[0]'s UNMAP was already in the RM when op[1] was
+    /// refused -- the caller told "nothing happened" had lost a live
+    /// mapping -- and a bad op behind an unsignaled wait was heard of only
+    /// after the wait had cost its whole deadline.
+    #[test]
+    fn a_vm_bind_batch_with_a_bad_op_binds_nothing_and_unbinds_nothing() {
+        let _g = LOCK.lock();
+        let _live = LiveBytes::hold();
+        let gpu = gpu_rm_fast();
+        let _ch_a = client_with_pushbuf(&gpu, A);
+        let ha = gem_new_rm(&gpu, 65536, nv::NOUVEAU_GEM_DOMAIN_GART, A)
+            .unwrap()
+            .handle;
+        const VA: u64 = 0x7f_3000_0000;
+        let bound = driver_maps(&gpu, A).len();
+        assert_eq!(vm_bind_ops(&gpu, A, &mut [map(ha, VA, 65536)]), Ok(0));
+        // A's mappings in this test's stretch of VA: (va, size).
+        let live = || {
+            driver_maps(&gpu, A)
+                .iter()
+                .filter(|m| (VA..VA + 0x100_0000).contains(&m.1))
+                .map(|m| (m.1, m.2))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(live(), [(VA, 65536)]);
+        let bad: [(nv::DrmNouveauVmBindOp, i32, &str); 6] = [
+            (
+                map(ha + 1000, VA + 0x10_0000, 4096),
+                nv::ENOENT,
+                "a handle A does not hold",
+            ),
+            (
+                op(
+                    nv::VM_BIND_OP_MAP,
+                    nv::VM_BIND_SPARSE,
+                    0,
+                    VA + 0x10_0000,
+                    4096,
+                ),
+                nv::EOPNOTSUPP,
+                "a sparse region",
+            ),
+            (
+                map(ha, VA + 0x10_0001, 4096),
+                nv::EINVAL,
+                "a VA off the page",
+            ),
+            (map(ha, VA + 0x10_0000, 0), nv::EINVAL, "an empty range"),
+            (
+                map_at(ha, VA + 0x10_0000, 4096, 65536),
+                nv::EINVAL,
+                "a window past the object",
+            ),
+            (
+                op(7, 0, ha, VA + 0x10_0000, 4096),
+                nv::EINVAL,
+                "an op nobody knows",
+            ),
+        ];
+        for (op_bad, errno, what) in bad {
+            // Two good ops first -- an UNMAP of the live mapping and a MAP
+            // of a fresh page -- then the bad one; and the bad one first.
+            let again = || nv::DrmNouveauVmBindOp { ..op_bad };
+            for (place, mut ops) in [
+                (
+                    "last",
+                    [unmap(VA, 65536), map(ha, VA + 0x20_0000, 4096), again()],
+                ),
+                (
+                    "first",
+                    [again(), unmap(VA, 65536), map(ha, VA + 0x20_0000, 4096)],
+                ),
+            ] {
+                let before = FAKE_RM.lock().calls.len();
+                assert_eq!(
+                    vm_bind_ops(&gpu, A, &mut ops),
+                    Err(errno),
+                    "{} ({})",
+                    what,
+                    place
+                );
+                assert_eq!(
+                    live(),
+                    [(VA, 65536)],
+                    "{} ({}): the UNMAP in the same batch did not run, nor the MAP",
+                    what,
+                    place
+                );
+                assert_eq!(
+                    rm_calls_since(before),
+                    [] as [&str; 0],
+                    "{} ({}): nothing reached the RM",
+                    what,
+                    place
+                );
+            }
+        }
+        // Behind a wait that is not signaled: the bad op is refused at once,
+        // not after the deadline the wait would have cost, and the sig
+        // stays unsignaled.
+        let never = syncobj::create(false);
+        let late = syncobj::create(false);
+        let _advance = AutoAdvance::of(1_000);
+        let t0 = test_clock::now();
+        let before = FAKE_RM.lock().calls.len();
+        assert_eq!(
+            vm_bind_sync(
+                &gpu,
+                A,
+                &mut [unmap(VA, 65536), map(ha + 1000, VA + 0x10_0000, 4096)],
+                nv::VM_BIND_RUN_ASYNC,
+                &[sync(never)],
+                &[sync(late)]
+            ),
+            Err(nv::ENOENT),
+            "the bad op, not EIO for the wait"
+        );
+        assert!(
+            test_clock::now() - t0 < 1_000_000,
+            "refused without waiting ({} us)",
+            test_clock::now() - t0
+        );
+        assert_eq!(live(), [(VA, 65536)]);
+        assert_eq!(syncobj::query(late), Some(0), "not signaled");
+        assert_eq!(rm_calls_since(before), [] as [&str; 0]);
+        // The same two good ops on their own: both apply.
+        assert_eq!(
+            vm_bind_ops(
+                &gpu,
+                A,
+                &mut [unmap(VA, 65536), map(ha, VA + 0x20_0000, 4096)]
+            ),
+            Ok(0)
+        );
+        assert_eq!(live(), [(VA + 0x20_0000, 4096)]);
+        assert_eq!(
+            vm_bind_ops(&gpu, A, &mut [unmap(VA + 0x20_0000, 4096)]),
+            Ok(0)
+        );
+        assert_eq!(driver_maps(&gpu, A).len(), bound);
+    }
+
     /// `vkQueueBindSparse` is a `VM_BIND` with `RUN_ASYNC`, the submit's
     /// wait semaphores as its wait list and its signal semaphores and fence
     /// as its sig list (NVK's bind context, `nvkmd_nouveau_bind_ctx_flush`,

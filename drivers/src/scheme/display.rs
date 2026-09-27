@@ -559,6 +559,102 @@ pub trait DisplayScheme: Scheme {
         }
     }
 
+    /// Whether [`read_into`](Self::read_into) can hand back this scanout's pixels
+    /// as ARGB8888.
+    ///
+    /// One place answers it, because the two questions "may I read this panel?"
+    /// and "what does reading it return?" have to agree: a caller that checked
+    /// the format itself and a `read_into` that refused on a different condition
+    /// would leave the caller believing it had restored pixels it never read. A
+    /// driver whose scanout can be read back some other way overrides both.
+    fn fb_readable(&self) -> bool {
+        self.info().format == ColorFormat::ARGB8888
+    }
+
+    /// Read the `width` x `height` window at `(src_x, src_y)` of the scanout back
+    /// into `dst`, row-major with `dst_stride` pixels per row.
+    ///
+    /// The inverse of [`blit_from`](Self::blit_from), and deliberately its mirror
+    /// image: it clamps the window the same way, takes the same two right limits
+    /// -- the padded pitch for the row copies, the visible width for the
+    /// pixel-at-a-time mirrored path -- and honours [`set_scanout_mirror_x`] with
+    /// the same [`XMap`]. That symmetry is the point. Its caller is the software
+    /// cursor, which reads the panel to know what the pointer is covering and
+    /// later writes those same pixels back: a read that covered different
+    /// columns than the write would leave the pointer's widened margins on the
+    /// screen for good.
+    ///
+    /// Either it fills the whole window and returns true, or it writes NOTHING
+    /// and returns false -- a partly filled buffer restored onto the panel is
+    /// garbage, so "I could not read all of it" must not be indistinguishable
+    /// from "here it is". False means the panel is not ARGB8888
+    /// ([`fb_readable`](Self::fb_readable)), the window is empty, or `dst` or the
+    /// scanout is too small for it.
+    fn read_into(
+        &self,
+        src_x: u32,
+        src_y: u32,
+        dst: &mut [u32],
+        dst_stride: usize,
+        width: u32,
+        height: u32,
+    ) -> bool {
+        if !self.fb_readable() || dst_stride == 0 {
+            return false;
+        }
+        let info = self.info();
+        let h = height.min(info.height.saturating_sub(src_y)) as usize;
+        let pitch = info.pitch() as usize;
+        let mirror = scanout_mirror_x();
+        // The same pair of limits as `blit_from`, picked the same way: the row
+        // copies may read the scanline's off-screen padding, the mirrored
+        // per-pixel path may not, because a mirrored column past the visible
+        // right edge maps below column 0 -- into the previous row.
+        let w = if mirror {
+            width.min(info.width.saturating_sub(src_x)) as usize
+        } else {
+            width.min((pitch / 4).saturating_sub(src_x as usize) as u32) as usize
+        };
+        if h == 0 || w == 0 {
+            return false;
+        }
+        // Bounds first, copy after, so a refusal never leaves half a window in
+        // `dst`. Every byte read lies in rows `src_y .. src_y + h` and within
+        // `pitch` of a row's start -- `w` is capped at the pitch on both paths --
+        // so one check per side covers every access the loops make.
+        let mut fb = self.fb();
+        let buf: &mut [u8] = &mut fb;
+        if (h - 1).saturating_mul(dst_stride).saturating_add(w) > dst.len()
+            || (src_y as usize).saturating_add(h).saturating_mul(pitch) > buf.len()
+        {
+            return false;
+        }
+        if mirror {
+            let xm = XMap::of(info.width);
+            for r in 0..h {
+                let y = src_y as usize + r;
+                for c in 0..w {
+                    let s = y * pitch + xm.px(src_x + c as u32) as usize * 4;
+                    dst[r * dst_stride + c] =
+                        u32::from_le_bytes([buf[s], buf[s + 1], buf[s + 2], buf[s + 3]]);
+                }
+            }
+            return true;
+        }
+        let row_bytes = w * 4;
+        for r in 0..h {
+            let s = (src_y as usize + r) * pitch + src_x as usize * 4;
+            let d = r * dst_stride;
+            // SAFETY: `dst[d .. d + w]` is in bounds by the check above, and
+            // `u32` has no alignment requirement a `u8` view can violate.
+            let dst_bytes = unsafe {
+                core::slice::from_raw_parts_mut(dst[d..].as_mut_ptr() as *mut u8, row_bytes)
+            };
+            dst_bytes.copy_from_slice(&buf[s..s + row_bytes]);
+        }
+        true
+    }
+
     /// Alpha-composite a premultiplied ARGB8888 source "over" the framebuffer at
     /// `(dst_x, dst_y)`, which may be negative (the source is clipped to the
     /// visible area). This is the kernel-composited hardware cursor: wlroots is
