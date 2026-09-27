@@ -228,10 +228,58 @@ pub extern "C" fn osCgroupUnregisterRegion(region: *mut c_void) {
 /// profiling/bind path) in a kernel that runs fully privileged
 /// (os_is_administrator == NV_TRUE). Linux forwards this to os_check_access,
 /// whose Eclipse implementation (os_interface.rs) grants -- match it.
+/// Whether the caller holds an access right, which is a privilege check.
+///
+/// This granted **every** right to **every** caller, including the ones Linux
+/// denies outright. Real Linux (`os.c` -> `os_check_access`) answers exactly
+/// three ways: `RS_ACCESS_PERFMON` is `capable(CAP_PERFMON)`, or
+/// `os_is_administrator()` where that capability does not exist;
+/// `RS_ACCESS_NICE` is `capable(CAP_SYS_NICE)`; and **everything else is
+/// `NV_FALSE`** -- a written-out default, not an oversight, so a right nobody
+/// has taught it about is refused rather than assumed.
+///
+/// A blanket yes also contradicted this crate's own answer one function away:
+/// `osIsAdministrator()` says `NV_FALSE`, so the same caller was not an
+/// administrator and held every right an administrator holds. Linux's PERFMON
+/// fallback is literally `os_is_administrator()`, which is what ties the two
+/// together here.
+///
+/// What it gates, in code that is compiled: `cliresAccessCallback_IMPL`
+/// (client_resource.c) hands PERFMON and NICE to any client that asks;
+/// `kern_profiler_v2.c` opens the hardware performance monitor on it; and
+/// `fecs_event_list.c` and `kern_perf_pwr.c` use it as the second half of
+/// `bAdmin || osCheckAccess(RS_ACCESS_PERFMON)`, so a blanket yes made the
+/// `bAdmin` half of those two decisions dead.
 #[no_mangle]
 pub extern "C" fn osCheckAccess(access_right: NvU16) -> NvBool {
-    let _ = access_right;
-    NV_TRUE
+    access_granted(access_right, osIsAdministrator() == NV_TRUE)
+}
+
+/// Which rights a caller holds, with the privilege answer passed in rather than
+/// asked for.
+///
+/// `is_admin` is a parameter and not a call to `osIsAdministrator()` for the
+/// same reason the line disciplines take the clock as one: with the answer
+/// hardcoded to `NV_FALSE`, "PERFMON asks the privilege question" and "PERFMON
+/// is refused outright" give the same result, so no test can tell them apart --
+/// and a mutant that collapsed the first into the second survived until this
+/// was a parameter. The rule is now checkable at both privilege levels, which
+/// is the only way to say it is a rule and not a constant.
+fn access_granted(access_right: NvU16, is_admin: bool) -> NvBool {
+    /// `RS_ACCESS_NICE` from `rs_access.h`. Linux asks for `CAP_SYS_NICE`;
+    /// Eclipse has no capability that reaches the RM, so it asks the only
+    /// privilege question this crate can answer, which is at least as strict.
+    const RS_ACCESS_NICE: NvU16 = 1;
+    /// `RS_ACCESS_PERFMON`. Linux's own fallback when `CAP_PERFMON` is not
+    /// available is `os_is_administrator()`, which is what this is.
+    const RS_ACCESS_PERFMON: NvU16 = 3;
+    match access_right {
+        RS_ACCESS_NICE | RS_ACCESS_PERFMON if is_admin => NV_TRUE,
+        // Linux's explicit default, which covers `RS_ACCESS_DUP_OBJECT`,
+        // `RS_ACCESS_DEBUG`, anything past `RS_ACCESS_COUNT`, and the two
+        // answerable rights when the caller is not privileged.
+        _ => NV_FALSE,
+    }
 }
 
 #[no_mangle]
@@ -1628,10 +1676,27 @@ pub extern "C" fn osGetPageSize() -> NvU64 {
     crate::os_interface::os_page_size
 }
 
+/// A monotonic nanosecond counter. Real Linux (`os.c`) is two lines and
+/// **cannot fail**: `*pTimeInNs = os_get_monotonic_time_ns_hr(); return NV_OK;`.
+///
+/// This refused with `NV_ERR_NOT_SUPPORTED` and wrote nothing, and the RM's
+/// callers do not check the status -- `engstateLogStateTransitionPost_IMPL`
+/// (eng_state.c) declares `NvU64 endTimeNs;`, calls this, and computes
+/// `(endTimeNs - pData->transitionStartTimeNs) / 1000` from it. So every
+/// engine's state-transition time, measured right through `gpuStateInit`, came
+/// out of whatever was on the stack at that address. A `NOT_SUPPORTED` that
+/// nobody reads is not a refusal, it is a number made up of stack residue --
+/// and the clock it wanted has been in this crate all along, behind the same
+/// hook `osGetTimestamp` and `osGetCurrentTick` already use.
 #[no_mangle]
-pub extern "C" fn osGetPerformanceCounter(arg0: *mut NvU64) -> NV_STATUS {
-    let _ = arg0;
-    NV_ERR_NOT_SUPPORTED
+pub extern "C" fn osGetPerformanceCounter(pTimeInNs: *mut NvU64) -> NV_STATUS {
+    if pTimeInNs.is_null() {
+        return NV_ERR_INVALID_ARGUMENT;
+    }
+    unsafe {
+        *pTimeInNs = with_hooks(0u64, |h| h.monotonic_time_ns());
+    }
+    NV_OK
 }
 
 #[no_mangle]
@@ -2745,11 +2810,24 @@ pub extern "C" fn osWriteToFile(
     NV_ERR_NOT_SUPPORTED
 }
 
+/// Wall-clock seconds and microseconds, the platform half of
+/// [`crate::os_services::osGetSystemTime`].
+///
+/// `os-interface.h` declares it `NV_STATUS NV_API_CALL os_get_system_time(NvU32
+/// *, NvU32 *)`. This was generated with `*mut c_void` and returned
+/// `null_mut()`, which on the return register **is** `NV_OK`: it told its
+/// caller the call had succeeded and wrote neither out-parameter, so the caller
+/// read its own uninitialised stack as the time. Of the two ways a stub can be
+/// wrong, that is the worse one -- a refusal at least says so.
+///
+/// `osGetSystemTime` in `os_services.rs` has answered this properly the whole
+/// time; the same question was implemented in one file and stubbed in the
+/// other. Nothing in the RM sources that get compiled calls this one today
+/// (only the Linux platform layer this crate replaces does), which is why the
+/// wrong return type never showed up at link time.
 #[no_mangle]
-pub extern "C" fn os_get_system_time(arg0: *mut NvU32, arg1: *mut NvU32) -> *mut c_void {
-    let _ = arg0;
-    let _ = arg1;
-    core::ptr::null_mut()
+pub extern "C" fn os_get_system_time(pSeconds: *mut NvU32, pMicroSeconds: *mut NvU32) -> NV_STATUS {
+    crate::os_services::osGetSystemTime(pSeconds, pMicroSeconds)
 }
 
 #[no_mangle]
@@ -3384,6 +3462,195 @@ mod boundary_tests {
             assert_eq!(osGetPageShift(), 12);
             assert_ne!(osGetSupportedSysmemPageSizeMask(), 0);
             assert_ne!(osGetMaxUserVa(), 0);
+        });
+    }
+
+    // -----------------------------------------------------------------
+    // Privilege: a right is granted, or it is not.
+    // -----------------------------------------------------------------
+
+    /// `rs_access.h`: the four rights that exist, and the first value past them.
+    const RS_ACCESS_DUP_OBJECT: NvU16 = 0;
+    const RS_ACCESS_NICE: NvU16 = 1;
+    const RS_ACCESS_DEBUG: NvU16 = 2;
+    const RS_ACCESS_PERFMON: NvU16 = 3;
+    const RS_ACCESS_COUNT: NvU16 = 4;
+
+    /// The invariant, and the one that does not change if Eclipse ever grows a
+    /// caller the RM should believe: a right is granted only to somebody this
+    /// crate calls an administrator. A blanket `NV_TRUE` broke it for every
+    /// right at once.
+    #[test]
+    fn a_right_is_granted_only_to_an_administrator() {
+        let admin = osIsAdministrator() == NV_TRUE;
+        for right in 0..=RS_ACCESS_COUNT {
+            if osCheckAccess(right) == NV_TRUE {
+                assert!(
+                    admin,
+                    "right {} granted to a caller that is not an administrator",
+                    right
+                );
+            }
+        }
+    }
+
+    /// Linux writes its default out: a right it has not been taught about is
+    /// refused, never assumed. `RS_ACCESS_DUP_OBJECT` and `RS_ACCESS_DEBUG` are
+    /// real rights with no os-level question behind them, and anything from
+    /// `RS_ACCESS_COUNT` up is not a right at all.
+    #[test]
+    fn a_right_with_no_question_behind_it_is_refused() {
+        for right in [
+            RS_ACCESS_DUP_OBJECT,
+            RS_ACCESS_DEBUG,
+            RS_ACCESS_COUNT,
+            RS_ACCESS_COUNT + 1,
+            u16::MAX,
+        ] {
+            assert_eq!(osCheckAccess(right), NV_FALSE, "right {right}");
+        }
+    }
+
+    /// The two rights Linux does answer turn on the privilege question, and
+    /// nothing else does. Checked at **both** privilege levels, because with
+    /// the answer pinned to "not an administrator" a rule that consults it and
+    /// a right refused outright look identical -- which is how the first
+    /// version of this test let a mutant through.
+    #[test]
+    fn only_the_two_answerable_rights_turn_on_being_an_administrator() {
+        for right in 0..=RS_ACCESS_COUNT + 1 {
+            let answerable = right == RS_ACCESS_NICE || right == RS_ACCESS_PERFMON;
+            assert_eq!(
+                access_granted(right, false),
+                NV_FALSE,
+                "right {right} granted to a caller with no privilege"
+            );
+            assert_eq!(
+                access_granted(right, true) == NV_TRUE,
+                answerable,
+                "right {right}: only NICE and PERFMON follow the privilege"
+            );
+        }
+    }
+
+    /// And the entry point the RM calls asks that question rather than
+    /// answering it itself, so the two cannot drift apart.
+    #[test]
+    fn the_entry_point_asks_the_administrator_question() {
+        for right in 0..=RS_ACCESS_COUNT + 1 {
+            assert_eq!(
+                osCheckAccess(right),
+                access_granted(right, osIsAdministrator() == NV_TRUE),
+                "right {right}"
+            );
+        }
+    }
+
+    /// `fecs_event_list.c` and `kern_perf_pwr.c` both decide with
+    /// `bAdmin || osCheckAccess(RS_ACCESS_PERFMON)`. A blanket yes made the
+    /// `bAdmin` half of that unreachable, so the whole gate was one constant.
+    #[test]
+    fn the_profiling_gate_is_not_one_constant() {
+        let gate = |b_admin: bool| b_admin || osCheckAccess(RS_ACCESS_PERFMON) == NV_TRUE;
+        assert_ne!(
+            gate(true),
+            gate(false),
+            "the bAdmin half of the RM's gate has to still matter"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // The performance counter: Linux cannot fail it.
+    // -----------------------------------------------------------------
+
+    /// Real Linux is `*pTimeInNs = os_get_monotonic_time_ns_hr(); return NV_OK;`
+    /// -- two lines with no failure in them.
+    #[test]
+    fn the_performance_counter_answers_from_the_clock() {
+        alone_with_the_kernel(4_200_000_042, || {
+            let mut t = 0u64;
+            assert_eq!(osGetPerformanceCounter(&mut t), NV_OK);
+            assert_eq!(t, 4_200_000_042, "nanoseconds, off the same clock");
+            let mut tick = 0u64;
+            assert_eq!(osGetCurrentTick(&mut tick), NV_OK);
+            assert_eq!(t, tick, "and the same clock osGetCurrentTick reads");
+        });
+    }
+
+    /// `engstateLogStateTransitionPost_IMPL` (eng_state.c) is
+    /// `NvU64 endTimeNs; osGetPerformanceCounter(&endTimeNs);
+    /// stats->transitionTimeUs = (endTimeNs - start) / 1000;` -- it does not
+    /// look at the status. So a refusal that writes nothing is not a refusal,
+    /// it is a duration computed from whatever was at that address, for every
+    /// engine, right through `gpuStateInit`. Seeded with a value the clock
+    /// cannot produce, so "did not write" is distinguishable from "wrote".
+    #[test]
+    fn an_engine_transition_time_comes_off_the_clock_and_not_the_stack() {
+        alone_with_the_kernel(0, || {
+            let mut start = 0xDEAD_BEEF_DEAD_BEEFu64;
+            assert_eq!(osGetPerformanceCounter(&mut start), NV_OK);
+            NOW_NS.store(3_500_000, Ordering::SeqCst);
+            let mut end = 0xDEAD_BEEF_DEAD_BEEFu64;
+            assert_eq!(osGetPerformanceCounter(&mut end), NV_OK);
+            assert_ne!(end, 0xDEAD_BEEF_DEAD_BEEF, "the stack value survived");
+            assert_eq!(
+                (end - start) / 1000,
+                3_500,
+                "3.5 ms of transition, in the microseconds the RM stores"
+            );
+        });
+    }
+
+    /// A caller that passes nowhere to write has to be told, not told NV_OK:
+    /// `NV_OK` with nothing written is exactly what this used to do by
+    /// returning a null pointer from a function the header declares as
+    /// returning a status.
+    #[test]
+    fn a_performance_counter_read_with_nowhere_to_put_it_is_refused() {
+        alone_with_the_kernel(1, || {
+            assert_eq!(
+                osGetPerformanceCounter(core::ptr::null_mut()),
+                NV_ERR_INVALID_ARGUMENT
+            );
+        });
+    }
+
+    // -----------------------------------------------------------------
+    // The wall clock, written three times in this crate.
+    // -----------------------------------------------------------------
+
+    /// `os_get_system_time`, `osGetSystemTime` and `osGetCurrentTime` are the
+    /// same question in three places -- two files and two spellings -- and they
+    /// have to give one answer. One of the three was a stub that returned a
+    /// null pointer, which on the return register reads as `NV_OK`.
+    #[test]
+    fn the_three_wall_clocks_of_this_crate_agree() {
+        alone_with_the_kernel(9_876_543_210, || {
+            let read = |f: extern "C" fn(*mut NvU32, *mut NvU32) -> NV_STATUS| {
+                let (mut s, mut u) = (0u32, 0u32);
+                assert_eq!(f(&mut s, &mut u), NV_OK);
+                (s, u)
+            };
+            let platform = read(os_get_system_time);
+            let service = read(crate::os_services::osGetSystemTime);
+            let boundary = read(osGetCurrentTime);
+            assert_eq!(platform, service, "os_get_system_time vs osGetSystemTime");
+            assert_eq!(platform, boundary, "os_get_system_time vs osGetCurrentTime");
+            assert_eq!(platform, (9, 876_543));
+        });
+    }
+
+    /// And it writes both halves before it says it succeeded. The old stub said
+    /// `NV_OK` and wrote neither, so the caller read its own stack as the time.
+    #[test]
+    fn the_platform_clock_writes_both_halves_before_claiming_success() {
+        alone_with_the_kernel(2_000_500_000, || {
+            let mut secs = u32::MAX;
+            let mut usecs = u32::MAX;
+            assert_eq!(os_get_system_time(&mut secs, &mut usecs), NV_OK);
+            assert_ne!(secs, u32::MAX, "seconds were left as they came in");
+            assert_ne!(usecs, u32::MAX, "microseconds were left as they came in");
+            assert_eq!((secs, usecs), (2, 500));
         });
     }
 
