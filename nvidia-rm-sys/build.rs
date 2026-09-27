@@ -10,6 +10,14 @@
 //   2. C code can call back into a Rust-exported function -- the same
 //      shape NVIDIA's RM uses to call into an os-interface.h implementation.
 // Replace this file with real vendored NVIDIA sources once both are proven.
+/// The `srcs.mk` parser and the Eclipse override table, in `src/srcs_mk.rs` so
+/// that `tests/srcs_mk.rs` can drive the same code this compiles with. A build
+/// script is not a target any `cargo test` compiles, so without that the checks
+/// below would never run anywhere. `linux-vdso/build.rs` includes `src/elf.rs`
+/// for the same reason.
+#[path = "src/srcs_mk.rs"]
+mod srcs_mk;
+
 /// True when actually building for Eclipse's no_std kernel target
 /// (CARGO_CFG_TARGET_OS reflects the JSON target spec's "os" field,
 /// "none", regardless of how cc's own TARGET-string parsing handles a
@@ -76,58 +84,6 @@ fn main() {
     build_first_real_nvidia_file();
 }
 
-/// Parses src/nvidia/srcs.mk -- NVIDIA's own real, authoritative list of
-/// every .c file their build compiles into the Resource Manager core
-/// (`SRCS += <path-relative-to-src/nvidia>`) -- rather than hand-picking
-/// files and chasing undefined symbols one at a time. Confirmed by
-/// actually compiling the full resulting set (1038 of 1054 entries) in an
-/// isolated scratch build against the pinned submodule commit: it leaves
-/// only the genuine os-interface.h/OBJOS boundary undefined, exactly the
-/// surface os_interface.rs/os_services.rs/os_boundary.rs exist to fill.
-///
-/// Deliberately excludes `arch/nvalloc/unix/src/` -- NVIDIA's own Linux
-/// platform-integration layer (the real `/dev/nvidia0` character device
-/// driver, ioctls, registry access, etc.), which Eclipse replaces with
-/// its own os_interface.rs implementation rather than vendoring.
-fn parse_srcs_mk(nvidia_dir: &std::path::Path) -> Vec<std::path::PathBuf> {
-    let srcs_mk = nvidia_dir.join("srcs.mk");
-    let text = std::fs::read_to_string(&srcs_mk)
-        .unwrap_or_else(|e| panic!("failed to read {}: {e}", srcs_mk.display()));
-    let mut files = Vec::new();
-    for line in text.lines() {
-        let Some(rel) = line.strip_prefix("SRCS += ") else {
-            continue;
-        };
-        let rel = rel.trim();
-        if rel.contains("arch/nvalloc/unix/src/") {
-            continue;
-        }
-        // Eclipse-patched RM sources. The submodule stays PRISTINE upstream
-        // (NVIDIA remote; local edits there would never reach another clone),
-        // so files Eclipse must modify are copied to vendor/eclipse_overrides/
-        // -- tracked by the main repo -- and compiled INSTEAD of the submodule
-        // copy. Currently: kernel_graphics.c + kernel_graphics_context.c carry
-        // the loud golden-image / global-ctx-buffer-map diagnostics and the
-        // propagate-map-failure fix (FECS-RESTORE hang investigation). The
-        // include search path is identical, so they compile unchanged apart
-        // from the marked ECLIPSE edits.
-        if rel.ends_with("src/kernel/gpu/gr/kernel_graphics.c") {
-            files.push(std::path::PathBuf::from(
-                "vendor/eclipse_overrides/kernel_graphics.c",
-            ));
-            continue;
-        }
-        if rel.ends_with("src/kernel/gpu/gr/kernel_graphics_context.c") {
-            files.push(std::path::PathBuf::from(
-                "vendor/eclipse_overrides/kernel_graphics_context.c",
-            ));
-            continue;
-        }
-        files.push(nvidia_dir.join(rel));
-    }
-    files
-}
-
 /// Compiles the real NVIDIA RM source, which lives in the pinned
 /// `open-gpu-kernel-modules` submodule.
 ///
@@ -175,7 +131,58 @@ fn build_first_real_nvidia_file() {
         );
         return;
     }
-    let source_files = parse_srcs_mk(&nvidia);
+    // NVIDIA's own authoritative list of every .c file their build compiles
+    // into the Resource Manager core, rather than hand-picking files and chasing
+    // undefined symbols one at a time. Confirmed once by compiling the full
+    // resulting set in an isolated scratch build against the pinned submodule:
+    // it leaves only the genuine os-interface.h/OBJOS boundary undefined, which
+    // is exactly the surface os_interface.rs/os_services.rs/os_boundary.rs exist
+    // to fill.
+    let srcs_mk_path = nvidia.join("srcs.mk");
+    let text = std::fs::read_to_string(&srcs_mk_path)
+        .unwrap_or_else(|e| panic!("failed to read {}: {e}", srcs_mk_path.display()));
+    // A line that assigns a source and that the parser does not take would
+    // otherwise become `undefined symbol` out of the linker, hundreds of lines
+    // and one subsystem away from the makefile that caused it. Retargeting the
+    // submodule is exactly when a makefile gets reformatted.
+    let unrecognised = srcs_mk::unrecognised(&text);
+    assert!(
+        unrecognised.is_empty(),
+        "nvidia-rm-sys: {} asigna fuentes con una forma que el parser no se lleva, \
+         y cada una seria un simbolo sin definir al enlazar: {:?}",
+        srcs_mk_path.display(),
+        unrecognised
+    );
+    let sources = srcs_mk::parse(&text, &nvidia);
+    // NVIDIA's own Linux platform layer -- the real `/dev/nvidia0` character
+    // device, its ioctls, registry access -- must not end up compiled into
+    // Eclipse's kernel; `os_interface.rs` is what replaces it. If the filter
+    // ever stops matching, none of that is left out and nothing else notices.
+    assert!(
+        sources.skipped_platform_layer > 0,
+        "nvidia-rm-sys: ninguna entrada de srcs.mk cayo en el filtro de \
+         arch/nvalloc/unix/src/, asi que la capa de Linux de NVIDIA entraria \
+         entera en el kernel; el filtro ya no coincide con nada"
+    );
+    // `upstream_suffix` is matched against the END of a path, so a file that
+    // moves upstream stops matching without a word: the build then compiles the
+    // submodule's pristine copy, links, boots, and quietly does not carry the
+    // Eclipse fix. Counting the replacements is what turns that into an error.
+    for (ov, hits) in srcs_mk::OVERRIDES.iter().zip(&sources.override_hits) {
+        assert_eq!(
+            *hits, 1,
+            "nvidia-rm-sys: el parche de Eclipse {} reemplazo {} entradas de srcs.mk \
+             en vez de una; si {} se ha movido en el submodulo, el build compilaria \
+             la copia de NVIDIA sin el parche y no lo diria",
+            ov.replacement, hits, ov.upstream_suffix
+        );
+        assert!(
+            std::path::Path::new(ov.replacement).is_file(),
+            "nvidia-rm-sys: el parche de Eclipse {} no esta en el arbol",
+            ov.replacement
+        );
+    }
+    let source_files = sources.files;
     // SRC_COMMON below is INFERRED as <submodule>/src/common (matches every
     // one of these paths existing under a "common" sibling of "nvidia" --
     // e.g. sdk/nvidia/inc, mbedtls/... -- but the exact `SRC_COMMON =`
@@ -276,6 +283,21 @@ fn build_first_real_nvidia_file() {
     // replacing the no-op os_boundary.rs stubs -- backed by kernel-hal's
     // contiguous DMA frame allocator + physmap. See that file's header.
     build.file("vendor/eclipse_rm_mem.c");
+    // A compiler ignores a `-I` that does not exist, without a word, so this list
+    // can drift away from the tree and nothing says so until a header turns up
+    // missing somewhere else entirely. The entries are harmless; the silence is
+    // not. (At the pinned 580.178.04 four of them are already stale, among them
+    // `uproc/os/libos-v2.0.0/include`, where the tree now carries libos-v3.1.0.)
+    let stale = srcs_mk::missing_include_dirs(&include_dirs);
+    if !stale.is_empty() {
+        println!(
+            "cargo:warning=nvidia-rm-sys: {} de los {} directorios de -I no existen en el \
+             submodulo pinchado, asi que el compilador los ignora en silencio: {}",
+            stale.len(),
+            include_dirs.len(),
+            stale.join(", ")
+        );
+    }
     for dir in &include_dirs {
         build.include(dir);
     }
@@ -356,7 +378,11 @@ fn build_first_real_nvidia_file() {
     println!("cargo:rerun-if-changed=vendor/glue.c");
     println!("cargo:rerun-if-changed=vendor/rm_boundary_stubs.c");
     println!("cargo:rerun-if-changed=vendor/eclipse_rm_init.c");
-    println!("cargo:rerun-if-changed=vendor/eclipse_overrides/kernel_graphics.c");
-    println!("cargo:rerun-if-changed=vendor/eclipse_overrides/kernel_graphics_context.c");
+    // From the table, so adding a third override cannot leave it out of here --
+    // where leaving it out means editing the patch and getting the old object.
+    for ov in srcs_mk::OVERRIDES {
+        println!("cargo:rerun-if-changed={}", ov.replacement);
+    }
+    println!("cargo:rerun-if-changed=src/srcs_mk.rs");
     println!("cargo:rerun-if-changed=vendor/eclipse_rm_mem.c");
 }

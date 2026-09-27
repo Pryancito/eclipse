@@ -382,13 +382,21 @@ fn running_as_root() -> bool {
         .unwrap_or(false)
 }
 
+/// Whether a knob's value is one of the spellings that mean off. One function
+/// rather than a copy per knob: the two lists were identical, and a spelling
+/// added to one of them and not the other is a knob that answers differently
+/// from its twin for no reason a reader could find.
+fn knob_off(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "0" | "off" | "no" | "false" | ""
+    )
+}
+
 /// Returns `true` unless `ECLIPSE_XORG` is explicitly set to a falsey value.
 fn enabled() -> bool {
     match std::env::var("ECLIPSE_XORG") {
-        Ok(v) => !matches!(
-            v.trim().to_ascii_lowercase().as_str(),
-            "0" | "off" | "no" | "false" | ""
-        ),
+        Ok(v) => !knob_off(&v),
         Err(_) => true,
     }
 }
@@ -469,11 +477,63 @@ fn mk_apk_add(
     cmd
 }
 
+/// The bare package name inside an apk dependency atom, which is what `apk
+/// info` prints and what apk itself keys `world` on.
+///
+/// apk's own grammar (`apk_dep_parse` in tools/apk/src/package.c) is
+/// `[!]name[@tag][<op>version]`, where an op is one or more of `<`, `=`, `>`,
+/// `~`: the name ends at the first of those characters, and the `@tag` is then
+/// split off what is left. So `firefox>102`, `mesa@edge` and `mesa@edge>=24`
+/// are all the name `mesa`/`firefox` to apk, and comparing the whole atom to a
+/// name never matches.
+///
+/// This exists because `ECLIPSE_XORG_PACKAGES` is documented for exactly the
+/// cases that need an atom rather than a name -- a repository whose names
+/// differ, a mirror carrying only ESR -- and every comparison below used to be
+/// on the whole atom.
+fn apk_atom_name(atom: &str) -> &str {
+    let atom = atom.trim();
+    let atom = atom.strip_prefix('!').unwrap_or(atom);
+    let name = match atom.find(['<', '=', '>', '~']) {
+        Some(i) => &atom[..i],
+        None => atom,
+    };
+    match name.find('@') {
+        Some(i) => &name[..i],
+        None => name,
+    }
+}
+
+/// The requested atoms that `apk info` does not account for, in the order they
+/// were asked for. Empty means every request resolved.
+///
+/// A free function and not a closure at the one call site, because the call
+/// site is inside a 750-line `install()` that needs a real apk binary and a
+/// network to reach: the comparison could go back to matching whole atoms
+/// against bare names and no test could tell. This is that comparison, and
+/// [`merge_apk_world`] answers the same question the same way.
+fn not_installed<'a>(requested: &'a [String], installed: &[String]) -> Vec<&'a String> {
+    requested
+        .iter()
+        .filter(|p| {
+            let name = apk_atom_name(p);
+            !installed.iter().any(|i| apk_atom_name(i) == name)
+        })
+        .collect()
+}
+
 /// Add the requested top-level packages that actually installed to `world_path`
 /// (the rootfs's `/etc/apk/world`), deduplicated and additive — existing base
 /// entries are preserved. `requested` is what we asked `apk add` for;
 /// `installed` is the audited closure (`apk info`), used so a name that failed
 /// to resolve is not written into world as if it were present.
+///
+/// Both comparisons are on the NAME inside the atom, never on the atom: `apk
+/// info` prints bare names, so a requested `firefox>102` matched nothing and
+/// was dropped on the floor -- installed, but absent from `world`, which is
+/// what `apk fix` and `apk upgrade` read to decide what to keep. And an
+/// existing `firefox>102` in the base world has to block appending a bare
+/// `firefox`, or world ends up with two entries for one name.
 fn merge_apk_world(world_path: &Path, requested: &[String], installed: &[String]) {
     let mut world: Vec<String> = std::fs::read_to_string(world_path)
         .unwrap_or_default()
@@ -483,9 +543,10 @@ fn merge_apk_world(world_path: &Path, requested: &[String], installed: &[String]
         .collect();
     let before = world.len();
     for p in requested {
-        // Only record a package that actually installed, and only once — apk
-        // rejects a world file with a duplicate constraint on some versions.
-        if installed.iter().any(|i| i == p) && !world.iter().any(|w| w == p) {
+        let name = apk_atom_name(p);
+        if installed.iter().any(|i| apk_atom_name(i) == name)
+            && !world.iter().any(|w| apk_atom_name(w) == name)
+        {
             world.push(p.clone());
         }
     }
@@ -507,10 +568,14 @@ fn merge_apk_world(world_path: &Path, requested: &[String], installed: &[String]
     }
 }
 
-/// Union the `world` at `src` into the one at `dst`, additive and deduplicated:
-/// every line present in `src` but not `dst` is appended, base entries kept.
-/// Used to carry the full rootfs's apk-world additions into the live root,
-/// whose etc/apk LIVE_TREES does not copy.
+/// Union the `world` at `src` into the one at `dst`, additive and deduplicated
+/// BY NAME: every package named in `src` but not in `dst` is appended, base
+/// entries kept. Used to carry the full rootfs's apk-world additions into the
+/// live root, whose etc/apk LIVE_TREES does not copy.
+///
+/// By name and not by line, because the two worlds can spell the same package
+/// differently -- one `firefox`, the other `firefox>102` -- and appending both
+/// leaves two entries for one name.
 fn union_apk_world(src: &Path, dst: &Path) {
     let src_lines: Vec<String> = match std::fs::read_to_string(src) {
         Ok(s) => s
@@ -528,7 +593,8 @@ fn union_apk_world(src: &Path, dst: &Path) {
         .collect();
     let before = dst_lines.len();
     for l in src_lines {
-        if !dst_lines.contains(&l) {
+        let name = apk_atom_name(&l);
+        if !dst_lines.iter().any(|d| apk_atom_name(d) == name) {
             dst_lines.push(l);
         }
     }
@@ -709,10 +775,11 @@ pub(super) fn install(rootfs: &Path, apk_bin: &Path, arch: &str) {
     if installed.is_empty() {
         eprintln!("warning: Xorg stack: `apk info` returned nothing; cannot audit what installed");
     } else {
-        let missing: Vec<&String> = packages
-            .iter()
-            .filter(|p| !installed.iter().any(|i| i == *p))
-            .collect();
+        // By name, like `merge_apk_world`: `apk info` prints bare names, so a
+        // constrained or repository-tagged request that installed perfectly
+        // well used to be reported here as NOT installed -- and this log line
+        // is the only place a package going missing ever shows up.
+        let missing = not_installed(&packages, &installed);
         if missing.is_empty() {
             println!(
                 "Xorg stack: all {} requested packages are installed ({} in the closure)",
@@ -1298,10 +1365,7 @@ const LIVE_TREES: &[&str] = &[
 
 fn live_enabled() -> bool {
     match std::env::var("ECLIPSE_XORG_LIVE") {
-        Ok(v) => !matches!(
-            v.trim().to_ascii_lowercase().as_str(),
-            "0" | "off" | "no" | "false" | ""
-        ),
+        Ok(v) => !knob_off(&v),
         Err(_) => true,
     }
 }
@@ -1426,11 +1490,20 @@ pub(super) fn copy_into_live(full: &Path, live: &Path) {
     // is in LIVE_KEEP) but finds no /usr/bin/labwc, prints "real binary not
     // found (apk add labwc)" and exits 127, and eclipse-init just respawns it
     // forever. That is a black screen with the compositor never actually there.
+    //
+    // `symlink_metadata` and not `exists()`: these paths are inside a staged
+    // rootfs, not a chroot, so a symlink there (Alpine ships `usr/bin/X` as
+    // one) points at an ABSOLUTE path that resolves against the build HOST,
+    // where it does not exist. `exists()` follows the link and answers no, and
+    // answering no here returns before copying anything -- the black screen
+    // above, reached a second way. Asking about the entry itself cannot be
+    // fooled by where the link points.
+    let staged = |p: &str| full.join(p).symlink_metadata().is_ok();
     let have_xorg = enabled()
         && ["usr/bin/Xorg", "usr/bin/X", "usr/lib/xorg"]
             .iter()
-            .any(|p| full.join(p).exists());
-    let have_labwc = full.join("usr/bin/labwc").exists();
+            .any(|p| staged(p));
+    let have_labwc = staged("usr/bin/labwc");
     if !have_xorg && !have_labwc {
         return;
     }
@@ -1605,6 +1678,402 @@ fn audit_icu_data(full: &Path, live: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// apk's own grammar, taken from `apk_dep_parse` in
+    /// tools/apk/src/package.c: the name ends at the first of `< = > ~`, a
+    /// leading `!` is a conflict marker, and `@tag` is split off what remains.
+    /// Every comparison in this module used to be on the whole atom, which
+    /// matches `apk info`'s bare names only when nobody asked for a version.
+    #[test]
+    fn a_package_atom_is_reduced_to_the_name_apk_keys_on() {
+        for (atom, name) in [
+            ("xorg-server", "xorg-server"),
+            ("firefox>102", "firefox"),
+            ("firefox<128", "firefox"),
+            ("busybox=1.36.1-r0", "busybox"),
+            ("mesa-gl>=24", "mesa-gl"),
+            ("mesa-gl<=25", "mesa-gl"),
+            ("icu-data-full~76", "icu-data-full"),
+            ("mesa@edge", "mesa"),
+            ("mesa@edge>=24", "mesa"),
+            ("!xf86-video-vesa", "xf86-video-vesa"),
+            ("  labwc  ", "labwc"),
+        ] {
+            assert_eq!(apk_atom_name(atom), name, "atom {atom:?}");
+        }
+    }
+
+    /// The name is everything BEFORE the operator, so a package whose name
+    /// merely contains a digit or a dash keeps all of it. Getting this wrong in
+    /// the other direction -- truncating at the first dash, say -- would make
+    /// two different packages look like one.
+    #[test]
+    fn a_name_is_not_cut_anywhere_but_at_the_operator() {
+        assert_eq!(apk_atom_name("sdl12-compat"), "sdl12-compat");
+        assert_eq!(apk_atom_name("mesa-vulkan-nouveau"), "mesa-vulkan-nouveau");
+        assert_eq!(apk_atom_name("font-misc-misc"), "font-misc-misc");
+        assert_eq!(apk_atom_name("libpng"), "libpng");
+        assert_ne!(apk_atom_name("mesa-gl"), apk_atom_name("mesa-egl"));
+    }
+
+    fn scratch(what: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!(
+            "eclipse-xorg-{what}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn world_of(p: &Path) -> Vec<String> {
+        fs::read_to_string(p)
+            .unwrap_or_default()
+            .lines()
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty())
+            .collect()
+    }
+
+    /// The whole point of writing `world`: `apk fix` and `apk upgrade` read it
+    /// to decide what to keep, so a package that installed and is missing from
+    /// it reads as an un-owned pile of files.
+    #[test]
+    fn a_package_that_installed_is_recorded_and_one_that_did_not_is_not() {
+        let d = scratch("record");
+        let w = d.join("etc/apk/world");
+        merge_apk_world(
+            &w,
+            &["xorg-server".into(), "xf86-video-vesa".into()],
+            &["xorg-server".into(), "libx11".into()],
+        );
+        assert_eq!(world_of(&w), vec!["xorg-server".to_string()]);
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// The build log is the only place a package going missing ever shows up,
+    /// so the audit behind it has to be right in both directions: name a
+    /// request that really did not resolve, and stay quiet about one that
+    /// installed under a constraint or a repository tag. It used to compare the
+    /// whole atom against `apk info`'s bare names, so every constrained request
+    /// was reported missing and the real ones drowned in the noise.
+    #[test]
+    fn the_audit_names_what_did_not_install_and_nothing_else() {
+        let requested: Vec<String> = ["xorg-server", "firefox>102", "mesa@edge", "xf86-video-vesa"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let installed: Vec<String> = ["xorg-server", "firefox", "mesa", "libx11"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(
+            not_installed(&requested, &installed),
+            vec![&"xf86-video-vesa".to_string()]
+        );
+        assert!(
+            not_installed(&requested, &requested).is_empty(),
+            "everything asked for is accounted for"
+        );
+        assert_eq!(
+            not_installed(&requested, &[]).len(),
+            4,
+            "an audit that returned nothing accounts for nothing"
+        );
+    }
+
+    /// The bug this batch is about. `apk info` prints bare names, so the atom
+    /// `firefox>102` -- which is what the module's own documentation tells you
+    /// to put in `ECLIPSE_XORG_PACKAGES` for a mirror carrying only one
+    /// version -- matched nothing and was silently dropped from `world`,
+    /// although apk had installed it.
+    #[test]
+    fn a_constrained_or_tagged_request_that_installed_is_still_recorded() {
+        let d = scratch("constrained");
+        let w = d.join("etc/apk/world");
+        merge_apk_world(
+            &w,
+            &["firefox>102".into(), "mesa@edge".into()],
+            &["firefox".into(), "mesa".into()],
+        );
+        assert_eq!(
+            world_of(&w),
+            vec!["firefox>102".to_string(), "mesa@edge".to_string()],
+            "the atom is what goes into world -- apk world holds atoms -- but \
+             whether it installed is asked by name"
+        );
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// And the same comparison in the other direction: a name already in the
+    /// base world under a different spelling must block the append, or world
+    /// carries two entries for one package.
+    #[test]
+    fn a_name_already_in_world_is_not_added_again_under_another_spelling() {
+        let d = scratch("dedup");
+        let w = d.join("etc/apk/world");
+        fs::create_dir_all(w.parent().unwrap()).unwrap();
+        fs::write(&w, "busybox\nfirefox>102\n").unwrap();
+        merge_apk_world(
+            &w,
+            &["firefox".into(), "labwc".into()],
+            &["firefox".into(), "labwc".into()],
+        );
+        assert_eq!(
+            world_of(&w),
+            vec![
+                "busybox".to_string(),
+                "firefox>102".to_string(),
+                "labwc".to_string()
+            ],
+            "firefox is already there with a constraint; labwc is new"
+        );
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// Additive, never destructive: the base's own entries are what keeps the
+    /// hand-staged base system owned, and this function has no business
+    /// rewriting them.
+    #[test]
+    fn the_base_entries_survive_untouched_and_in_order() {
+        let d = scratch("base");
+        let w = d.join("etc/apk/world");
+        fs::create_dir_all(w.parent().unwrap()).unwrap();
+        fs::write(&w, "alpine-base\nbusybox>=1.36\nmusl\n").unwrap();
+        merge_apk_world(&w, &["labwc".into()], &["labwc".into()]);
+        let got = world_of(&w);
+        assert_eq!(&got[..3], &["alpine-base", "busybox>=1.36", "musl"]);
+        assert_eq!(got.len(), 4);
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// Nothing to add means nothing written, so a build that installs no new
+    /// package cannot reformat a world file it did not need to touch.
+    #[test]
+    fn a_run_that_adds_nothing_leaves_the_file_exactly_as_it_was() {
+        let d = scratch("noop");
+        let w = d.join("etc/apk/world");
+        fs::create_dir_all(w.parent().unwrap()).unwrap();
+        // Deliberately ragged: blank line, trailing spaces, no final newline.
+        let raw = "alpine-base \n\nbusybox";
+        fs::write(&w, raw).unwrap();
+        merge_apk_world(&w, &["labwc".into()], &["xorg-server".into()]);
+        assert_eq!(
+            fs::read_to_string(&w).unwrap(),
+            raw,
+            "no additions means no write at all"
+        );
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// apk reads `world` line by line, so the last entry needs its newline or
+    /// the next tool to append lands on the same line and makes one nonsense
+    /// package name out of two real ones.
+    #[test]
+    fn every_entry_ends_on_its_own_line_including_the_last() {
+        let d = scratch("newline");
+        let w = d.join("etc/apk/world");
+        merge_apk_world(
+            &w,
+            &["labwc".into(), "foot".into()],
+            &["labwc".into(), "foot".into()],
+        );
+        assert_eq!(fs::read_to_string(&w).unwrap(), "labwc\nfoot\n");
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// `apk info` returning nothing is the audited-nothing case, and the caller
+    /// warns about it. What must not happen is recording the request anyway.
+    #[test]
+    fn an_empty_audit_records_nothing_rather_than_everything() {
+        let d = scratch("noaudit");
+        let w = d.join("etc/apk/world");
+        merge_apk_world(&w, &["xorg-server".into(), "labwc".into()], &[]);
+        assert!(
+            world_of(&w).is_empty(),
+            "without an audit there is no evidence anything installed"
+        );
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// The world file lives at `etc/apk/world` in a rootfs this function may be
+    /// the first to write into.
+    #[test]
+    fn the_parent_directory_is_created_when_it_is_missing() {
+        let d = scratch("mkdir");
+        let w = d.join("etc/apk/world");
+        merge_apk_world(&w, &["labwc".into()], &["labwc".into()]);
+        assert!(w.is_file());
+        assert!(
+            fs::read_to_string(&w).unwrap().ends_with('\n'),
+            "apk reads it line by line"
+        );
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// `etc/apk` is not in LIVE_TREES, so the live root can reach this point
+    /// with no `etc/apk` directory at all -- and a write into a directory that
+    /// is not there fails silently, because every write here is a `let _ =`.
+    #[test]
+    fn the_union_creates_the_live_etc_apk_it_may_be_the_first_to_need() {
+        let d = scratch("union-mkdir");
+        let src = d.join("full/etc/apk/world");
+        let dst = d.join("live/etc/apk/world");
+        fs::create_dir_all(src.parent().unwrap()).unwrap();
+        fs::write(&src, "labwc\nfoot\n").unwrap();
+        assert!(
+            !dst.parent().unwrap().exists(),
+            "the live root has no etc/apk yet"
+        );
+        union_apk_world(&src, &dst);
+        assert_eq!(
+            world_of(&dst),
+            vec!["labwc".to_string(), "foot".to_string()]
+        );
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// LIVE_TREES does not carry `etc/apk`, so the live root's world is the
+    /// base one and the full rootfs's additions have to be unioned in.
+    #[test]
+    fn the_live_world_gains_what_the_full_one_added_and_keeps_its_own() {
+        let d = scratch("union");
+        let src = d.join("full/etc/apk/world");
+        let dst = d.join("live/etc/apk/world");
+        fs::create_dir_all(src.parent().unwrap()).unwrap();
+        fs::create_dir_all(dst.parent().unwrap()).unwrap();
+        fs::write(&src, "alpine-base\nlabwc\nfoot\n").unwrap();
+        fs::write(&dst, "alpine-base\nbusybox\n").unwrap();
+        union_apk_world(&src, &dst);
+        assert_eq!(
+            world_of(&dst),
+            vec![
+                "alpine-base".to_string(),
+                "busybox".to_string(),
+                "labwc".to_string(),
+                "foot".to_string()
+            ]
+        );
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// Same defect as in `merge_apk_world`: the two worlds can spell one
+    /// package differently, and a line-by-line union then writes it twice.
+    #[test]
+    fn the_union_does_not_duplicate_a_name_spelled_two_ways() {
+        let d = scratch("union-dup");
+        let src = d.join("full/etc/apk/world");
+        let dst = d.join("live/etc/apk/world");
+        fs::create_dir_all(src.parent().unwrap()).unwrap();
+        fs::create_dir_all(dst.parent().unwrap()).unwrap();
+        fs::write(&src, "firefox>102\nmesa@edge\n").unwrap();
+        fs::write(&dst, "firefox\nmesa\n").unwrap();
+        union_apk_world(&src, &dst);
+        assert_eq!(
+            world_of(&dst),
+            vec!["firefox".to_string(), "mesa".to_string()]
+        );
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// No source world is the "Xorg never ran" case, and it is a no-op rather
+    /// than a truncation of the destination.
+    #[test]
+    fn a_missing_source_world_leaves_the_destination_alone() {
+        let d = scratch("union-nosrc");
+        let dst = d.join("live/etc/apk/world");
+        fs::create_dir_all(dst.parent().unwrap()).unwrap();
+        fs::write(&dst, "alpine-base\nbusybox\n").unwrap();
+        union_apk_world(&d.join("full/etc/apk/world"), &dst);
+        assert_eq!(
+            world_of(&dst),
+            vec!["alpine-base".to_string(), "busybox".to_string()]
+        );
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// The other half of this batch. `copy_into_live` returns without copying
+    /// anything unless it can see Xorg or the compositor, and it used to look
+    /// with `exists()`, which FOLLOWS a symlink. These paths are inside a
+    /// staged rootfs rather than a chroot, so a symlink there resolves against
+    /// the build host: `usr/bin/labwc -> /usr/bin/labwc.real` is present in the
+    /// image and absent on the host, `exists()` says no, and the whole desktop
+    /// silently never reaches the live root -- the boot then finds the wrapper,
+    /// no binary behind it, and respawns forever on a black screen.
+    #[test]
+    fn a_symlinked_compositor_still_counts_as_installed() {
+        let d = scratch("symlink-gate");
+        let full = d.join("full");
+        let live = d.join("live");
+        fs::create_dir_all(full.join("usr/bin")).unwrap();
+        fs::create_dir_all(full.join("usr/share/games/doom")).unwrap();
+        fs::create_dir_all(&live).unwrap();
+        // Absolute target, the way a package's own symlink is written: broken
+        // when read from the host, correct once this tree is the root.
+        std::os::unix::fs::symlink("/usr/bin/labwc.real", full.join("usr/bin/labwc")).unwrap();
+        assert!(
+            !full.join("usr/bin/labwc").exists(),
+            "the fixture only means anything while the link does not resolve here"
+        );
+        fs::write(full.join("usr/share/games/doom/freedoom1.wad"), b"IWAD").unwrap();
+
+        copy_into_live(&full, &live);
+
+        assert!(
+            live.join("usr/share/games/doom/freedoom1.wad").is_file(),
+            "a symlinked compositor must not make the whole copy a no-op"
+        );
+        assert_eq!(
+            fs::read_link(live.join("usr/bin/labwc")).unwrap(),
+            Path::new("/usr/bin/labwc.real"),
+            "and the link itself crosses as a link, not as its target"
+        );
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// With neither Xorg nor a compositor there is nothing to stage, and
+    /// copying the rootfs into the RAM root anyway would be the whole image
+    /// twice over.
+    #[test]
+    fn a_rootfs_with_no_desktop_at_all_is_still_skipped() {
+        let d = scratch("no-desktop");
+        let full = d.join("full");
+        let live = d.join("live");
+        fs::create_dir_all(full.join("usr/share/games/doom")).unwrap();
+        fs::create_dir_all(&live).unwrap();
+        fs::write(full.join("usr/share/games/doom/freedoom1.wad"), b"IWAD").unwrap();
+
+        copy_into_live(&full, &live);
+
+        assert!(
+            !live.join("usr/share/games/doom").exists(),
+            "no server and no compositor means nothing to copy"
+        );
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// The knob spellings, in one place because both knobs now share them. A
+    /// substring test here would be the bug this repo has already had twice:
+    /// `ECLIPSE_XORG=off-by-default` is not off.
+    #[test]
+    fn a_knob_is_off_only_for_the_spellings_it_documents() {
+        for off in ["0", "off", "no", "false", "OFF", "False", " 0 ", "", "  "] {
+            assert!(knob_off(off), "{off:?} is documented as off");
+        }
+        for on in [
+            "1",
+            "yes",
+            "true",
+            "on",
+            "off-by-default",
+            "no-really",
+            "0x0",
+            "00",
+        ] {
+            assert!(!knob_off(on), "{on:?} is not one of the off spellings");
+        }
+    }
 
     /// The game DATA has to reach the image, not just the binaries. Freedoom
     /// shipped as `/usr/bin/freedoom2` + gzdoom with no wad behind them because
