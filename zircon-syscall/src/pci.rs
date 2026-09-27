@@ -210,8 +210,12 @@ impl Syscall<'_> {
             // a device that would not enable, or an `out_bar` the caller got
             // wrong, answered an error having already handed out a live VMO
             // over the device's BAR.
-            device.enable_mmio()?;
+            // And the cheapest check first: `check_out` only looks at a
+            // pointer the caller gave, so a bad one now costs nothing, while
+            // after `enable_mmio` it answers an error with the device already
+            // turned on.
             check_out(proc, &out_bar)?;
+            device.enable_mmio()?;
             let vmo = VmObject::new_physical(info.bus_addr as usize, pages(info.size as usize));
             install_handle(proc, Handle::new(vmo, Rights::DEFAULT_VMO), &mut out_handle)?;
         } else {

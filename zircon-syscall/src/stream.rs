@@ -77,7 +77,7 @@ fn write_gather<'a>(
                 break;
             }
         };
-        written += count;
+        written = written.checked_add(count).ok_or(ZxError::OUT_OF_RANGE)?;
         if count < data.len() {
             break;
         }
@@ -89,6 +89,10 @@ fn write_gather<'a>(
 /// that came out. A read the stream cut short (the content ended inside the
 /// buffer) ends the scatter there: there is nothing left for the buffers
 /// after it.
+///
+/// The running total is added with `checked_add` too: every part of it is a
+/// length the caller chose, and nothing here is in a position to know that the
+/// VMAR bounds their sum.
 ///
 /// `read` gets each buffer and the bytes read before it, which is the
 /// distance from the scatter's starting offset. `readv_at` used to advance
@@ -108,7 +112,7 @@ fn read_gather<'a>(
         let buffer = buffer?;
         let want = buffer.len();
         let count = read(buffer, done)?;
-        done += count;
+        done = done.checked_add(count).ok_or(ZxError::OUT_OF_RANGE)?;
         if count < want {
             break;
         }

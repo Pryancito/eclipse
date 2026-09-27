@@ -629,7 +629,10 @@ mod tests {
         use std::sync::mpsc;
         use std::time::Duration;
 
-        const ROUNDS: usize = 50_000;
+        // The crossed orders wedge on the first round that takes both
+        // branches, so the count is only margin. It was 50_000 with a 30 s
+        // budget, which is the shape that reddened master on a loaded machine.
+        const ROUNDS: usize = 5_000;
         let (end0, end1) = Socket::create(0).unwrap();
         // Thresholds on both ends, so every round takes the branches that
         // used to want the other endpoint's lock.
@@ -654,7 +657,7 @@ mod tests {
 
         for _ in 0..2 {
             finished
-                .recv_timeout(Duration::from_secs(30))
+                .recv_timeout(Duration::from_secs(300))
                 .expect("the two ends of one socket deadlocked");
         }
         for end in ends {
@@ -1078,11 +1081,21 @@ mod tests {
     /// already drained -- an `unwrap` on `None`, which **panics the kernel**.
     fn two_threads_reading_one_datagram_socket_do_not_panic() {
         with_watchdog("a reader panicked the kernel or wedged", || {
-            // The race is caught in the first per-cent of these: with the
-            // locks split again the reader dies in well under a second. The
-            // count is for margin, not for duration, so it stays far below
-            // what the watchdog allows even on a loaded machine.
+            // Rounds are opportunities for the race and the clock is the cap,
+            // because the two are not the same thing here: the readers spin on
+            // this socket's lock without ever yielding, so the writer's rate
+            // depends on the machine. It gets the lock hundreds of thousands of
+            // times a second on an idle one and 40-70 times a second on a
+            // loaded one, where 20_000 rounds took over five minutes and blew
+            // even a 300 s watchdog. So keep the count -- with the locks split
+            // again the reader dies around write 200 to 5000, and 3_000 rounds
+            // were not enough here -- and stop early on time instead.
+            //
+            // Yielding in the readers is not the answer: it takes them out of
+            // `read` at the same time and the race stops happening at all.
+            use std::time::{Duration, Instant};
             const ROUNDS: usize = 20_000;
+            const CAP: Duration = Duration::from_secs(30);
             let (writer, reader) = Socket::create(SocketFlags::DATAGRAM.bits()).unwrap();
             let stop = Arc::new(AtomicBool::new(false));
 
@@ -1102,8 +1115,12 @@ mod tests {
             // No throttle: the readers drain faster than one writer fills,
             // so the queue sits at nought or one datagram and every read is at
             // the boundary.
-            for _ in 0..ROUNDS {
+            let started = Instant::now();
+            for round in 0..ROUNDS {
                 let _ = writer.write(&[1, 2, 3, 4]);
+                if round % 256 == 0 && started.elapsed() > CAP {
+                    break;
+                }
             }
             stop.store(true, Ordering::Relaxed);
             for (i, r) in readers.into_iter().enumerate() {
@@ -1121,7 +1138,12 @@ mod tests {
     /// address space.
     fn two_threads_writing_one_socket_do_not_overrun_it() {
         with_watchdog("a writer overran the socket or wedged", || {
+            // Rounds for the opportunities, the clock for the cap: see the
+            // note on the reading test above, the two writers here spin on the
+            // same lock this loop needs.
+            use std::time::{Duration, Instant};
             const ROUNDS: usize = 20_000;
+            const CAP: Duration = Duration::from_secs(30);
             const CHUNK: usize = 1024;
             let (writer, reader) = Socket::create(0).unwrap();
             let stop = Arc::new(AtomicBool::new(false));
@@ -1146,7 +1168,11 @@ mod tests {
                 .collect();
 
             let mut drain = vec![0u8; CHUNK];
-            for _ in 0..ROUNDS {
+            let started = Instant::now();
+            for round in 0..ROUNDS {
+                if round % 256 == 0 && started.elapsed() > CAP {
+                    break;
+                }
                 let held = reader.get_info().rx_buf_size as usize;
                 assert!(
                     held <= SOCKET_SIZE,
