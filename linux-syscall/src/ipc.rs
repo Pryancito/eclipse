@@ -845,14 +845,30 @@ impl Syscall<'_> {
                     .ok_or(LxError::EINVAL)?,
             ),
         };
-        let shm_guard = guard.lock();
+        // The segment's `Mutex` is taken PER COMMAND and never held across
+        // anything that can block or take another lock. It used to be taken
+        // here, once, for the whole `match`, and that one guard sat over both
+        // of the things it must not:
+        //
+        // * the two global tables (`IPC_RMID`), which `shmget` and
+        //   `/proc/sysvipc/shm` lock in the other order -- and these locks spin
+        //   with the interrupts off, so an inversion is two CPUs gone for good.
+        //   See `shared_mem::unlink_key`.
+        // * userspace memory (`IPC_SET`'s read, `IPC_STAT`'s write), which can
+        //   fault, and a fault resolved under an interrupts-off spinlock is a
+        //   page-fault handler that cannot be told to shoot down a TLB.
         match cmd {
             ShmctlCmds::IPC_RMID => {
-                if !shm_guard.may_control(self.linux_process().euid()) {
+                if !guard.lock().may_control(self.linux_process().euid()) {
                     return Err(LxError::EPERM);
                 }
-                shm_guard.remove();
-                linux_object::ipc::shm_unregister(id);
+                // shmctl(2): `EINVAL` when the id does not name a segment any
+                // more, which is what a second `IPC_RMID` is. It answered 0
+                // and freed the key of whatever segment had been filed under
+                // this one's key in the meantime.
+                if !linux_object::ipc::shm_unlink(id, &guard) {
+                    return Err(LxError::EINVAL);
+                }
                 // The attachment stays. shmget(2): the segment is destroyed
                 // only once the last process detaches, and every user of the
                 // X11 extension removes the id the moment it has attached --
@@ -863,22 +879,29 @@ impl Syscall<'_> {
             }
             ShmctlCmds::IPC_SET => {
                 let buffer: UserInPtr<ShmidDs> = buffer.into();
+                // Read userspace BEFORE locking the segment.
                 let set_ds = buffer.read()?;
+                let shm_guard = guard.lock();
                 shm_guard.set(&set_ds, self.linux_process().euid())?;
                 shm_guard.ctime();
                 Ok(0)
             }
             ShmctlCmds::IPC_STAT | ShmctlCmds::SHM_STAT | ShmctlCmds::SHM_STAT_ANY => {
-                let proc = self.linux_process();
-                // `SHM_STAT_ANY` skips the read-permission check.
-                if cmd != ShmctlCmds::SHM_STAT_ANY
-                    && !shm_guard.may_access(proc.euid(), proc.egid(), &proc.groups(), IPC_R)
-                {
-                    return Err(LxError::EACCES);
-                }
-                let shmid_ds = shm_guard.shmid_ds.lock();
+                // Snapshot under the lock, copy out with it down.
+                let shmid_ds = {
+                    let shm_guard = guard.lock();
+                    let proc = self.linux_process();
+                    // `SHM_STAT_ANY` skips the read-permission check.
+                    if cmd != ShmctlCmds::SHM_STAT_ANY
+                        && !shm_guard.may_access(proc.euid(), proc.egid(), &proc.groups(), IPC_R)
+                    {
+                        return Err(LxError::EACCES);
+                    }
+                    let ds = *shm_guard.shmid_ds.lock();
+                    ds
+                };
                 let mut buffer: UserOutPtr<ShmidDs> = buffer.into();
-                buffer.write(*shmid_ds)?;
+                buffer.write(shmid_ds)?;
                 // The `SHM_STAT`s answer the segment's id: it is how the
                 // caller learns it from the index it walked to.
                 Ok(ipc_stat_result(cmd != ShmctlCmds::IPC_STAT, id))
