@@ -6912,6 +6912,15 @@ mod kms_scanout_tests {
     /// panel is still a frame behind everywhere outside them -- and the cursor
     /// repaint would go back to restoring rects from a buffer the panel does not
     /// show. Only a whole frame may clear the mark.
+    ///
+    /// The box has to name the framebuffer the panel already carries for this to
+    /// be reachable at all: a box on any other one is promoted to a whole frame
+    /// before it gets here (see
+    /// `a_damage_box_on_a_fresh_buffer_puts_the_whole_frame_up`), and a whole
+    /// frame is a catch-up. What is left is the client re-damaging the buffer
+    /// that IS up while `crtc_fb` points at the one the pause swallowed: the
+    /// panel does carry that buffer, so the box is honoured, and the panel is
+    /// still not showing what the cursor repaint would read.
     #[test]
     fn a_damage_rect_does_not_catch_a_panel_up_from_a_dropped_frame() {
         let _screen = kms_emu::attach(64, 16);
@@ -6933,14 +6942,28 @@ mod kms_scanout_tests {
         drm::set_scanout_paused_for(core::time::Duration::ZERO);
         assert!(!drm::scanout_paused());
 
-        // A four-pixel box, the way a blinking cursor in a terminal damages.
-        dirtyfb(&c, fb_during, &[clip(0, 0, 4, 4)]);
+        // A four-pixel box, the way a blinking cursor in a terminal damages, on
+        // the buffer the panel really carries.
+        assert_eq!(drm::panel_fb_for_test(), fb_before);
+        dirtyfb(&c, fb_before, &[clip(0, 0, 4, 4)]);
 
         assert!(
             drm::scanout_is_stale_for_test(),
             "a damage rect cleared the mark, so the next pointer move will \
              restore its windows from a frame the panel is not showing"
         );
+
+        // And the other half of the same situation: the box that names the
+        // framebuffer the pause swallowed cannot be honoured -- the panel does
+        // not carry it -- so it becomes a whole frame, which heals the frame the
+        // pause dropped instead of waiting for a pointer move to expose it.
+        dirtyfb(&c, fb_during, &[clip(0, 0, 4, 4)]);
+        assert!(
+            !drm::scanout_is_stale_for_test(),
+            "a box on a framebuffer the panel does not carry has to become a \
+             whole frame, and a whole frame catches the panel up"
+        );
+        assert_eq!(drm::panel_fb_for_test(), fb_during);
 
         c.rmfb(fb_before).expect("RMFB");
         c.rmfb(fb_during).expect("RMFB");
@@ -6988,6 +7011,276 @@ mod kms_scanout_tests {
 
         c.rmfb(fb).expect("RMFB");
         c.destroy_dumb(buf.handle).expect("DESTROY_DUMB");
+    }
+
+    /// A damage box says "only these pixels changed in the frame already on the
+    /// panel". A compositor with a swapchain presents a DIFFERENT framebuffer
+    /// almost every frame, and a recycled swapchain buffer holds, outside the
+    /// region it was just drawn into, whatever frame it was last used for.
+    ///
+    /// So honouring the box against another buffer leaves the panel carrying two
+    /// frames at once. That is invisible until something reads the panel's own
+    /// content back -- and `repaint_for_cursor` does exactly that, restoring its
+    /// two ~64x64 windows from `crtc_fb`. A pointer move over a region the box
+    /// did not touch then pastes the new buffer's older content into the frame
+    /// still up: garbage in a ring around the cursor, appearing exactly when a
+    /// popup opens, because that is when a fresh buffer arrives with a box around
+    /// the popup and nothing else.
+    ///
+    /// Linux throws the clips away and declares a full update whenever
+    /// `state->fb != old_state->fb` (`drm_atomic_helper_damage_iter_init`).
+    #[test]
+    fn a_damage_box_on_a_fresh_buffer_puts_the_whole_frame_up() {
+        let screen = kms_emu::attach(64, 16);
+        let c = Client::open(0);
+
+        // The frame on the panel.
+        let a = c.create_dumb(64, 16);
+        paint(&a, |x, y| tag(0x00AA_0000, x, y));
+        let fb_a = c.addfb2(&a);
+        set_crtc(&c, drm::SYNTH_CRTC_ID, fb_a, 64, 16);
+        drain_completions(&c);
+        assert_eq!(screen.pixel(0, 0), tag(0x00AA_0000, 0, 0));
+        assert_eq!(drm::panel_fb_for_test(), fb_a);
+
+        // The next swapchain buffer. Every pixel of it differs from the frame up.
+        let b = c.create_dumb(64, 16);
+        paint(&b, |x, y| tag(0x0011_0000, x, y));
+        let fb_b = c.addfb2(&b);
+
+        dirtyfb(&c, fb_b, &[clip(8, 4, 24, 8)]);
+
+        assert_eq!(
+            screen.pixel(10, 5),
+            tag(0x0011_0000, 10, 5),
+            "the damaged region itself did not reach the panel"
+        );
+        assert_eq!(
+            screen.pixel(40, 12),
+            tag(0x0011_0000, 40, 12),
+            "outside the box the panel still carries the PREVIOUS framebuffer, so              it is holding two frames at once -- and `repaint_for_cursor` reads              that region back from `crtc_fb` on the next pointer move"
+        );
+        assert_eq!(drm::panel_fb_for_test(), fb_b);
+
+        c.rmfb(fb_a).expect("RMFB a");
+        c.rmfb(fb_b).expect("RMFB b");
+        c.destroy_dumb(a.handle).expect("DESTROY_DUMB a");
+        c.destroy_dumb(b.handle).expect("DESTROY_DUMB b");
+    }
+
+    /// And the optimisation is still there for the case it exists for: the client
+    /// re-presents the framebuffer the panel already carries, so the pixels
+    /// outside the box really are the ones on screen. Copying the whole frame
+    /// here is the 8.3 MB of CPU stores per blinking caret that the damage path
+    /// was added to avoid, so "promote everything" would not be a fix.
+    #[test]
+    fn a_damage_box_on_the_buffer_already_up_still_copies_only_the_box() {
+        let screen = kms_emu::attach(64, 16);
+        let c = Client::open(0);
+
+        let a = c.create_dumb(64, 16);
+        paint(&a, |x, y| tag(0x00AA_0000, x, y));
+        let fb = c.addfb2(&a);
+        set_crtc(&c, drm::SYNTH_CRTC_ID, fb, 64, 16);
+        drain_completions(&c);
+
+        // Repaint the WHOLE buffer but report one box, which is the client lying
+        // about its damage -- and the kernel is entitled to believe it here.
+        paint(&a, |x, y| tag(0x0011_0000, x, y));
+        dirtyfb(&c, fb, &[clip(8, 4, 24, 8)]);
+
+        assert_eq!(
+            screen.pixel(10, 5),
+            tag(0x0011_0000, 10, 5),
+            "the box was not copied at all"
+        );
+        assert_eq!(
+            screen.pixel(40, 12),
+            tag(0x00AA_0000, 40, 12),
+            "the whole frame was copied, so the damage path no longer shrinks              anything"
+        );
+
+        c.rmfb(fb).expect("RMFB");
+        c.destroy_dumb(a.handle).expect("DESTROY_DUMB");
+    }
+
+    /// Blanking paints the panel black, so black is what a damage box would be
+    /// leaving in place. Un-blanking happens on the next present, at the top of
+    /// `present_now_checked` -- and if that present is a damage box the screen
+    /// stays black with one rectangle of desktop in it.
+    #[test]
+    fn the_present_that_unblanks_does_not_leave_one_rectangle_on_black() {
+        let screen = kms_emu::attach(64, 16);
+        let c = Client::open(0);
+
+        let a = c.create_dumb(64, 16);
+        paint(&a, |x, y| tag(0x00AA_0000, x, y));
+        let fb = c.addfb2(&a);
+        set_crtc(&c, drm::SYNTH_CRTC_ID, fb, 64, 16);
+        drain_completions(&c);
+
+        drm::set_crtc_blanked(true);
+        assert_eq!(screen.pixel(40, 12), 0, "blanking left the panel lit");
+        assert_eq!(
+            drm::panel_fb_for_test(),
+            0,
+            "black pixels are not this framebuffer's pixels"
+        );
+
+        dirtyfb(&c, fb, &[clip(8, 4, 24, 8)]);
+        assert_eq!(
+            screen.pixel(40, 12),
+            tag(0x00AA_0000, 40, 12),
+            "the panel is still black everywhere the box did not touch"
+        );
+
+        c.rmfb(fb).expect("RMFB");
+        c.destroy_dumb(a.handle).expect("DESTROY_DUMB");
+    }
+
+    /// A present a pause acknowledged without drawing does not make the panel
+    /// carry that framebuffer -- it carries the one from before, which is the
+    /// whole point of `SCANOUT_STALE`. Recording it here would tell the next
+    /// damage box it may keep its region, on a panel a frame behind.
+    #[test]
+    fn a_present_a_pause_acknowledged_does_not_claim_the_panel() {
+        let screen = kms_emu::attach(64, 16);
+        let c = Client::open(0);
+
+        let a = c.create_dumb(64, 16);
+        paint(&a, |x, y| tag(0x00AA_0000, x, y));
+        let fb_a = c.addfb2(&a);
+        set_crtc(&c, drm::SYNTH_CRTC_ID, fb_a, 64, 16);
+        drain_completions(&c);
+
+        let b = c.create_dumb(64, 16);
+        paint(&b, |x, y| tag(0x0011_0000, x, y));
+        let fb_b = c.addfb2(&b);
+
+        drm::set_scanout_paused(true);
+        c.page_flip(drm::SYNTH_CRTC_ID, fb_b, 21).expect("flip");
+        drain_completions(&c);
+        assert_eq!(
+            screen.pixel(0, 0),
+            tag(0x00AA_0000, 0, 0),
+            "a paused present drew"
+        );
+        assert_eq!(
+            drm::panel_fb_for_test(),
+            fb_a,
+            "the panel was credited with a frame nobody drew"
+        );
+
+        // Resuming puts the whole frame up, which is what makes the panel carry
+        // it -- and only then is a box on it meaningful again.
+        drm::set_scanout_paused(false);
+        assert_eq!(screen.pixel(0, 0), tag(0x0011_0000, 0, 0));
+        assert_eq!(drm::panel_fb_for_test(), fb_b);
+
+        c.rmfb(fb_a).expect("RMFB a");
+        c.rmfb(fb_b).expect("RMFB b");
+        c.destroy_dumb(a.handle).expect("DESTROY_DUMB a");
+        c.destroy_dumb(b.handle).expect("DESTROY_DUMB b");
+    }
+
+    /// Retiring the framebuffer the panel carries forgets it. Ids are handed out
+    /// again, so without this a later buffer landing on the same number would
+    /// inherit "already on screen" and have its first box honoured against a
+    /// frame that is not its own.
+    #[test]
+    fn retiring_the_framebuffer_on_the_panel_forgets_it() {
+        let _screen = kms_emu::attach(64, 16);
+        let c = Client::open(0);
+
+        let a = c.create_dumb(64, 16);
+        paint(&a, |x, y| tag(0x00AA_0000, x, y));
+        let fb = c.addfb2(&a);
+        set_crtc(&c, drm::SYNTH_CRTC_ID, fb, 64, 16);
+        drain_completions(&c);
+        assert_eq!(drm::panel_fb_for_test(), fb);
+
+        c.rmfb(fb).expect("RMFB");
+        assert_eq!(
+            drm::panel_fb_for_test(),
+            0,
+            "a retired id is still recorded as the frame on the panel"
+        );
+
+        c.destroy_dumb(a.handle).expect("DESTROY_DUMB");
+    }
+
+    /// A present the console swallowed leaves the panel carrying nothing. While a
+    /// text VT is foreground the compositor's pixels are dropped -- reported as
+    /// complete so its frame loop keeps running -- and the console prints over the
+    /// last frame. So when the graphics VT comes back, the panel is not showing
+    /// any framebuffer, and the first present's damage box would paint one
+    /// rectangle of desktop into a screen full of console text.
+    #[test]
+    fn a_present_the_console_swallowed_leaves_the_panel_carrying_nothing() {
+        let screen = kms_emu::attach(64, 16);
+        let c = Client::open(0);
+
+        let a = c.create_dumb(64, 16);
+        paint(&a, |x, y| tag(0x00AA_0000, x, y));
+        let fb = c.addfb2(&a);
+        set_crtc(&c, drm::SYNTH_CRTC_ID, fb, 64, 16);
+        drain_completions(&c);
+        assert_eq!(drm::panel_fb_for_test(), fb);
+
+        // A text VT is foreground: the compositor owns VT 7, the user is on 1.
+        drm::set_graphics_vt_for_test(Some(7));
+        c.page_flip(drm::SYNTH_CRTC_ID, fb, 31)
+            .expect("a suppressed flip is still reported complete");
+        drain_completions(&c);
+        assert_eq!(
+            drm::panel_fb_for_test(),
+            0,
+            "the panel is still credited with a frame the console is printing over"
+        );
+
+        // Back to the desktop. Repaint the buffer so a box on it would be
+        // visibly different from what is up, then damage one corner of it.
+        drm::set_graphics_vt_for_test(None);
+        paint(&a, |x, y| tag(0x0033_0000, x, y));
+        dirtyfb(&c, fb, &[clip(0, 0, 4, 4)]);
+        assert_eq!(
+            screen.pixel(40, 12),
+            tag(0x0033_0000, 40, 12),
+            "the first present after the VT came back honoured its box, so the \
+             screen is console text with one rectangle of desktop in it"
+        );
+
+        c.rmfb(fb).expect("RMFB");
+        c.destroy_dumb(a.handle).expect("DESTROY_DUMB");
+    }
+
+    /// A present that could not put pixels anywhere does not get to say the panel
+    /// carries its framebuffer. Crediting it would hand the next damage box a
+    /// reference frame that was never drawn.
+    #[test]
+    fn a_present_that_failed_does_not_claim_the_panel() {
+        let _screen = kms_emu::attach(64, 16);
+        let c = Client::open(0);
+
+        let a = c.create_dumb(64, 16);
+        paint(&a, |x, y| tag(0x00AA_0000, x, y));
+        let fb = c.addfb2(&a);
+        set_crtc(&c, drm::SYNTH_CRTC_ID, fb, 64, 16);
+        drain_completions(&c);
+        assert_eq!(drm::panel_fb_for_test(), fb);
+
+        assert!(
+            drm::present_now_checked(0x0BAD_F00D, drm::SYNTH_CRTC_ID, None).is_err(),
+            "an id nobody registered must not present"
+        );
+        assert_eq!(
+            drm::panel_fb_for_test(),
+            fb,
+            "a present that put no pixels anywhere was credited with the panel"
+        );
+
+        c.rmfb(fb).expect("RMFB");
+        c.destroy_dumb(a.handle).expect("DESTROY_DUMB");
     }
 
     /// Does the cursor patch read past the framebuffer's own right edge?
