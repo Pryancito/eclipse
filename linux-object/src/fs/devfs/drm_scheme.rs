@@ -7,6 +7,8 @@ use alloc::sync::Arc;
 use core::any::Any;
 use core::future::Future;
 use core::pin::Pin;
+#[cfg(test)]
+use core::sync::atomic::AtomicUsize;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use core::task::{Context, Poll as TaskPoll};
 use core::time::Duration;
@@ -1438,14 +1440,29 @@ impl DrmDev {
                 // Flush accumulated damage by re-scanning the framebuffer out.
                 // Clients that keep one persistent FB and signal damage with
                 // DIRTYFB (X's modesetting shadow, simple toolkits) rely on this
-                // to update the screen. When clip rects are given, blit only
-                // their bounding union — a full-frame copy of a swapchain
-                // buffer that only has those boxes painted left stale tiles
-                // (squares) on the GOP. Scanout expands the union to 64-byte
-                // WC lines so a partial store cannot smear neighbouring pixels.
+                // to update the screen. A full-frame copy of a swapchain buffer
+                // that only has those boxes painted left stale tiles (squares) on
+                // the GOP, so what goes up is the damage and not the frame.
+                //
+                // Each box is blitted ON ITS OWN while there are few enough of
+                // them to be worth the per-blit bookkeeping and their bounding
+                // union is much bigger than they are. That union used to be the
+                // one span, and for the two boxes a toolkit really sends -- a
+                // menu here, the shadow it dropped over there -- it is most of
+                // the screen: at the 42 MB/s this panel's aperture writes at
+                // (see `la-basura-del-dibujado` measurements) a 1920x1080 span is
+                // ~99 ms, so a 16x16 menu redraw cost a fifth of a second and
+                // three dropped frames. Scanout expands each span to 64-byte WC
+                // lines so a partial store cannot smear neighbouring pixels.
+                //
                 // An oversized, zero, or unreadable clip list means "the whole
                 // frame is dirty" (true DIRTYFB semantics for num_clips == 0).
+                const MAX_DIRTY_SPANS: usize = 8;
                 let cmd = unsafe { *(data as *const DrmModeFbDirtyCmd) };
+                let mut spans = [(0u32, 0u32, 0u32, 0u32); MAX_DIRTY_SPANS];
+                let mut n = 0usize;
+                let mut area = 0u64;
+                let mut too_many = false;
                 let rect = if cmd.num_clips > 0 && cmd.num_clips <= 64 && cmd.clips_ptr != 0 {
                     ucheck_n::<DrmClipRect>(cmd.clips_ptr as usize, cmd.num_clips as usize)?;
                     let mut union: Option<(u32, u32, u32, u32)> = None;
@@ -1460,6 +1477,13 @@ impl DrmDev {
                             clip.x2 as u32,
                             clip.y2 as u32,
                         );
+                        if n < MAX_DIRTY_SPANS {
+                            spans[n] = (x1, y1, x2 - x1, y2 - y1);
+                            n += 1;
+                            area += (x2 - x1) as u64 * (y2 - y1) as u64;
+                        } else {
+                            too_many = true;
+                        }
                         union = Some(match union {
                             Some((ux, uy, uw, uh)) => {
                                 let nx = ux.min(x1);
@@ -1475,7 +1499,32 @@ impl DrmDev {
                 } else {
                     None
                 };
-                if !drm::present_now_region(cmd.fb_id, 1, rect) {
+                // One box is one box either way, so the boxes only win when there
+                // are several of them and they really are far apart: half the
+                // union or less. Overlapping or adjacent boxes go up as the union,
+                // where they cost one blit instead of several that copy the same
+                // pixels twice.
+                let by_box = match rect {
+                    Some((_, _, uw, uh)) if n > 1 && !too_many => {
+                        area.saturating_mul(2) <= uw as u64 * uh as u64
+                    }
+                    _ => false,
+                };
+                #[cfg(test)]
+                DIRTY_SPANS_BLITTED.store(if by_box { n } else { 1 }, Ordering::Relaxed);
+                let presented = if by_box {
+                    // Every box, even if one of them cannot be scanned out: they
+                    // are separate pieces of damage and dropping the rest because
+                    // the first failed would leave the screen half updated.
+                    let mut ok = true;
+                    for span in spans.iter().take(n) {
+                        ok &= drm::present_now_region(cmd.fb_id, 1, Some(*span));
+                    }
+                    ok
+                } else {
+                    drm::present_now_region(cmd.fb_id, 1, rect)
+                };
+                if !presented {
                     // Best-effort: a damage flush that can't scan out (e.g. the
                     // fb id is unknown to the software path) is not fatal — the
                     // client keeps its shadow and will re-present. Returning EIO
@@ -3389,6 +3438,18 @@ fn eclipse_compute_ioctl(minor: u32, data: usize) -> Result<usize> {
     req.grid_threads = result.grid_threads;
     fill_summary(&mut req.summary, &result.report);
     Ok(0)
+}
+
+/// How many spans the last DIRTYFB blitted: the boxes themselves, or 1 for their
+/// bounding union. A test cannot see the difference on the screen when the client
+/// painted its whole buffer, and that is exactly the client a test writes.
+#[cfg(test)]
+static DIRTY_SPANS_BLITTED: AtomicUsize = AtomicUsize::new(0);
+
+/// How many spans the last DIRTYFB blitted.
+#[cfg(test)]
+fn dirty_spans_blitted_for_test() -> usize {
+    DIRTY_SPANS_BLITTED.load(Ordering::Relaxed)
 }
 
 fn fill_summary(dst: &mut [u8; 512], src: &str) {
@@ -8915,6 +8976,86 @@ mod kms_scanout_tests {
         c.destroy_dumb(buf.handle).expect("DESTROY_DUMB");
     }
 
+    /// Two small pieces of damage far apart must not drag the whole span between
+    /// them through the aperture.
+    ///
+    /// A DIRTYFB with several clip rects used to go up as their bounding union,
+    /// and for the two boxes a toolkit really sends -- a menu here, the shadow it
+    /// dropped over there -- that union is most of the screen. The panel's
+    /// aperture takes writes at about 42 MB/s, so a whole 1920x1080 span is ~99 ms
+    /// and three dropped frames for what the client said was two 16x16 boxes.
+    ///
+    /// The screen cannot tell the two apart for a client that painted its whole
+    /// buffer, which is every client a test writes, so this paints the WHOLE
+    /// buffer with the new frame and then asserts that what is between the boxes
+    /// still holds the old one. That is only true if the boxes went up as boxes.
+    /// The span count is asserted as well, for the cases where the union is the
+    /// right answer and the screen agrees either way.
+    #[test]
+    fn two_far_apart_damage_boxes_do_not_drag_the_whole_span_between_them() {
+        const W: u32 = 120;
+        const H: u32 = 96;
+        let screen = kms_emu::attach_with(W, H, 128, true);
+        let c = Client::open(0);
+        let buf = c.create_dumb(W, H);
+        paint(&buf, |x, y| desktop_px(1, x, y));
+        let fb = c.addfb2(&buf);
+        set_crtc(&c, drm::SYNTH_CRTC_ID, fb, W, H);
+        drain_completions(&c);
+        let mut panel = Panel::new(W, H, 1, alloc::vec::Vec::new(), 0);
+        panel.check(&screen, "the first frame");
+
+        // Two 16x16 boxes in opposite corners. Their union is 80x72, thirty times
+        // what they are.
+        paint(&buf, |x, y| desktop_px(2, x, y));
+        dirtyfb(&c, fb, &[clip(16, 8, 32, 24), clip(80, 64, 96, 80)]);
+        drain_completions(&c);
+        assert_eq!(
+            dirty_spans_blitted_for_test(),
+            2,
+            "two far-apart boxes went up as one span"
+        );
+        panel.present_box(2, 16, 8, 16, 16);
+        panel.present_box(2, 80, 64, 16, 16);
+        panel.check(
+            &screen,
+            "two boxes went up and the span between them did not",
+        );
+
+        // Two boxes that touch. Splitting these copies the same bytes twice for
+        // nothing, so the union is the right answer and the count says so.
+        paint(&buf, |x, y| desktop_px(3, x, y));
+        dirtyfb(&c, fb, &[clip(16, 8, 48, 24), clip(32, 8, 64, 24)]);
+        drain_completions(&c);
+        assert_eq!(
+            dirty_spans_blitted_for_test(),
+            1,
+            "two touching boxes went up separately, copying the overlap twice"
+        );
+        panel.present_box(3, 16, 8, 48, 16);
+        panel.check(&screen, "two touching boxes went up as one span");
+
+        // More boxes than the kernel will track one by one, and far enough apart
+        // that it would otherwise rather split them: the union, because keeping
+        // only the first eight would DROP the ninth box and leave that piece of
+        // the client's redraw off the screen.
+        paint(&buf, |x, y| desktop_px(4, x, y));
+        let many: alloc::vec::Vec<DrmClipRect> =
+            (0..9).map(|i| clip(0, i * 10, 16, i * 10 + 4)).collect();
+        dirtyfb(&c, fb, &many);
+        drain_completions(&c);
+        assert_eq!(
+            dirty_spans_blitted_for_test(),
+            1,
+            "nine boxes were tracked one by one, so the ninth went nowhere"
+        );
+        panel.present_box(4, 0, 0, 16, 84);
+        panel.check(&screen, "nine boxes went up as one span");
+
+        c.rmfb(fb).expect("RMFB");
+        c.destroy_dumb(buf.handle).expect("DESTROY_DUMB");
+    }
+
     /// A pointer straddling the right edge of a framebuffer SMALLER than the mode
     /// must still be erasable, or its outer columns stay on the panel for good.
     ///
@@ -9025,14 +9166,25 @@ mod kms_scanout_tests {
         // and the repair is the other writer of the panel that does not go
         // through the blit. Two seeds each, so the order of operations is not
         // one order.
+        let mut widened = 0usize;
         for (skip, repair) in [(false, false), (true, false), (false, true), (true, true)] {
             for seed in [0x5EED_1234u32, 0x0BAD_C0DE] {
-                soak_the_desktop(seed, skip, repair);
+                widened += soak_the_desktop(seed, skip, repair);
             }
         }
+        // A present on a framebuffer smaller than the mode has to have caught the
+        // pointer across its edge at least once in all of this, because that is
+        // the only thing that leaves a piece of the pointer to erase later. If it
+        // never happened, those steps are not exercising what they were added for
+        // -- and a whole fix would be untested with every test still green.
+        assert!(
+            widened > 0,
+            "no composite in 2400 steps widened its window, so the \
+             smaller-than-the-mode steps never put the pointer across the edge"
+        );
     }
 
-    fn soak_the_desktop(seed_in: u32, skip: bool, repair: bool) {
+    fn soak_the_desktop(seed_in: u32, skip: bool, repair: bool) -> usize {
         const W: u32 = 120;
         const H: u32 = 96;
         const CUR: u32 = 16;
@@ -9060,6 +9212,29 @@ mod kms_scanout_tests {
                 px[i] = *v;
             }
         }
+        // A pointer of a DIFFERENT size, because a theme change or a client
+        // setting its own cursor really does hand the kernel another bitmap while
+        // the old one is on the screen. What the old one covered has to come back
+        // even though the new window is not the old window.
+        const CUR2: u32 = 8;
+        let bmp2 = pointer_bitmap(CUR2, CUR2);
+        let cur2 = c.create_dumb(CUR2, CUR2);
+        {
+            let px = map_dumb(&cur2);
+            for (i, v) in bmp2.iter().enumerate() {
+                px[i] = *v;
+            }
+        }
+        // A framebuffer BIGGER than the mode. The copy stops at the panel's edge,
+        // so the pointer's window is computed against a buffer whose rows run past
+        // the screen -- the opposite arithmetic to the smaller one, and the case
+        // the window widening has to refuse.
+        const BIG_W: u32 = 160;
+        const BIG_H: u32 = 128;
+        let big = c.create_dumb(BIG_W, BIG_H);
+        let fb_big = c.addfb2(&big);
+        let mut cur_sz = CUR;
+        let mut cur_h = cur.handle;
 
         let mut frame: u32 = 1;
         let mut slot = 0usize;
@@ -9081,6 +9256,9 @@ mod kms_scanout_tests {
         // soak that never took the skip would say nothing about it -- the one
         // lesson of the probe that measured in the wrong place.
         let mut most_skipped = 0usize;
+        // Damage flushes that went up as their own boxes rather than as one
+        // bounding span.
+        let mut by_box = 0usize;
         let mut log: alloc::vec::Vec<alloc::string::String> = alloc::vec::Vec::new();
         // A 32-bit LCG: the sequence is fixed, so a failure here reproduces on
         // any machine, and the log below names the step.
@@ -9091,7 +9269,7 @@ mod kms_scanout_tests {
         };
         for step in 0..300u32 {
             let what;
-            match rnd(14) {
+            match rnd(17) {
                 0..=3 => {
                     // The compositor renders a finished frame into the other
                     // buffer of its chain and puts it up, whole, as labwc does.
@@ -9107,7 +9285,7 @@ mod kms_scanout_tests {
                     // A full present composites the pointer at wherever it is
                     // now, so that is what is on the panel.
                     model.cursor = if shown {
-                        Some((pos.0, pos.1, CUR, CUR))
+                        Some((pos.0, pos.1, cur_sz, cur_sz))
                     } else {
                         None
                     };
@@ -9125,7 +9303,7 @@ mod kms_scanout_tests {
                     );
                     move_cursor(&c, drm::SYNTH_CRTC_ID, pos.0, pos.1);
                     if shown {
-                        model.cursor = Some((pos.0, pos.1, CUR, CUR));
+                        model.cursor = Some((pos.0, pos.1, cur_sz, cur_sz));
                     }
                     what = alloc::format!("step {}: pointer moved to {:?}", step, pos);
                 }
@@ -9171,7 +9349,7 @@ mod kms_scanout_tests {
                     model.present(frame);
                     panel_fb = fbs[slot];
                     model.cursor = if shown {
-                        Some((pos.0, pos.1, CUR, CUR))
+                        Some((pos.0, pos.1, cur_sz, cur_sz))
                     } else {
                         None
                     };
@@ -9181,8 +9359,8 @@ mod kms_scanout_tests {
                 12 => {
                     shown = !shown;
                     if shown {
-                        set_cursor(&c, drm::SYNTH_CRTC_ID, cur.handle, CUR, CUR, pos.0, pos.1);
-                        model.cursor = Some((pos.0, pos.1, CUR, CUR));
+                        set_cursor(&c, drm::SYNTH_CRTC_ID, cur_h, cur_sz, cur_sz, pos.0, pos.1);
+                        model.cursor = Some((pos.0, pos.1, cur_sz, cur_sz));
                     } else {
                         set_cursor(&c, drm::SYNTH_CRTC_ID, 0, 0, 0, 0, 0);
                         model.cursor = None;
@@ -9243,7 +9421,7 @@ mod kms_scanout_tests {
                     }
                     panel_fb = fbs[slot];
                     model.cursor = if shown {
-                        Some((pos.0, pos.1, CUR, CUR))
+                        Some((pos.0, pos.1, cur_sz, cur_sz))
                     } else {
                         None
                     };
@@ -9266,7 +9444,7 @@ mod kms_scanout_tests {
                     // honoured on its own.
                     panel_fb = 0;
                     model.cursor = if shown {
-                        Some((pos.0, pos.1, CUR, CUR))
+                        Some((pos.0, pos.1, cur_sz, cur_sz))
                     } else {
                         None
                     };
@@ -9293,11 +9471,145 @@ mod kms_scanout_tests {
                     model.present(frame);
                     panel_fb = fbs[slot];
                     model.cursor = if shown {
-                        Some((pos.0, pos.1, CUR, CUR))
+                        Some((pos.0, pos.1, cur_sz, cur_sz))
                     } else {
                         None
                     };
                     what = alloc::format!("step {}: blanked, unblanked, frame {}", step, frame);
+                }
+                14 => {
+                    // A client whose framebuffer is BIGGER than the mode.
+                    frame += 1;
+                    let f = frame;
+                    paint(&big, |x, y| desktop_px(f, x, y));
+                    c.page_flip(drm::SYNTH_CRTC_ID, fb_big, step as u64)
+                        .expect("flip the oversized framebuffer");
+                    drain_completions(&c);
+                    // Its top-left corner holds the same pixels a framebuffer of
+                    // the mode's size would, so the screen must show this frame
+                    // entirely.
+                    model.present(frame);
+                    // The panel holds a corner of this framebuffer, not the whole
+                    // of it, so no damage box may be honoured on its own after
+                    // this.
+                    panel_fb = 0;
+                    model.cursor = if shown {
+                        Some((pos.0, pos.1, cur_sz, cur_sz))
+                    } else {
+                        None
+                    };
+                    what = alloc::format!(
+                        "step {}: frame {} from a {}x{} framebuffer, bigger than the mode",
+                        step,
+                        frame,
+                        BIG_W,
+                        BIG_H
+                    );
+                }
+                15 => {
+                    // TWO damage boxes in one DIRTYFB, which is what a client with
+                    // real damage tracking sends: a menu and the shadow it dropped
+                    // somewhere else. The kernel may copy them in one span or in
+                    // two, and either way nothing between them may move.
+                    frame += 1;
+                    let f = frame;
+                    paint(&bufs[slot], |x, y| desktop_px(f, x, y));
+                    let bx = rnd(W / 32) * 16;
+                    let bw = (rnd(2) + 1) * 16;
+                    let by = rnd(H / 2);
+                    let bh = rnd(H / 2 - by) + 1;
+                    let cx2 = 64 + rnd(2) * 16;
+                    let cw2 = (rnd(2) + 1) * 16;
+                    let cy2 = H / 2 + rnd(H / 4);
+                    let ch2 = rnd(H - cy2) + 1;
+                    dirtyfb(
+                        &c,
+                        fbs[slot],
+                        &[
+                            clip(bx as u16, by as u16, (bx + bw) as u16, (by + bh) as u16),
+                            clip(
+                                cx2 as u16,
+                                cy2 as u16,
+                                (cx2 + cw2) as u16,
+                                (cy2 + ch2) as u16,
+                            ),
+                        ],
+                    );
+                    drain_completions(&c);
+                    if fbs[slot] == panel_fb {
+                        // The TWO boxes and nothing between them: far apart and
+                        // small, so the kernel blits each one instead of their
+                        // bounding union, and everything outside them keeps the
+                        // frame it had. Both x spans are 16-aligned so the
+                        // write-combining widening of each is a no-op.
+                        model.present_box(frame, bx, by, bw, bh);
+                        model.present_box(frame, cx2, cy2, cw2, ch2);
+                        assert_eq!(
+                            dirty_spans_blitted_for_test(),
+                            2,
+                            "step {}: two boxes {}x{}+{}+{} and {}x{}+{}+{} went up \
+                             as one span, so the screen agreeing means nothing",
+                            step,
+                            bw,
+                            bh,
+                            bx,
+                            by,
+                            cw2,
+                            ch2,
+                            cx2,
+                            cy2
+                        );
+                        by_box += 1;
+                        what = alloc::format!(
+                            "step {}: frame {} as TWO damage boxes {}x{}+{}+{} and {}x{}+{}+{}",
+                            step,
+                            frame,
+                            bw,
+                            bh,
+                            bx,
+                            by,
+                            cw2,
+                            ch2,
+                            cx2,
+                            cy2
+                        );
+                    } else {
+                        model.present(frame);
+                        what = alloc::format!(
+                            "step {}: frame {} as two damage boxes on a framebuffer the \
+                             panel was not holding, so the whole frame",
+                            step,
+                            frame
+                        );
+                    }
+                    panel_fb = fbs[slot];
+                    model.cursor = if shown {
+                        Some((pos.0, pos.1, cur_sz, cur_sz))
+                    } else {
+                        None
+                    };
+                }
+                16 => {
+                    // The pointer changes SIZE where it stands. The old window is
+                    // not the new window, so what the old pointer covered can only
+                    // come back from what the blit that drew it saved.
+                    cur_sz = if cur_sz == CUR { CUR2 } else { CUR };
+                    cur_h = if cur_sz == CUR {
+                        cur.handle
+                    } else {
+                        cur2.handle
+                    };
+                    model.bmp = if cur_sz == CUR {
+                        bmp.clone()
+                    } else {
+                        bmp2.clone()
+                    };
+                    model.bmp_w = cur_sz;
+                    shown = true;
+                    set_cursor(&c, drm::SYNTH_CRTC_ID, cur_h, cur_sz, cur_sz, pos.0, pos.1);
+                    model.cursor = Some((pos.0, pos.1, cur_sz, cur_sz));
+                    what =
+                        alloc::format!("step {}: pointer resized to {}x{}", step, cur_sz, cur_sz);
                 }
                 _ => {
                     // DPMS off and on again with NOTHING presented after it,
@@ -9333,15 +9645,16 @@ mod kms_scanout_tests {
             );
         }
         assert!(frame < 256, "the frame number has to stay in one byte");
-        // The smaller-than-the-mode steps put the pointer across the edge of the
-        // client's framebuffer sooner or later, and that is the only thing that
-        // leaves a leftover to erase. If none ever happened, the step is not
-        // exercising what it was added for.
+        // How many composites had to widen their window, for the caller to sum:
+        // that only happens when a smaller-than-the-mode present catches the
+        // pointer across the edge of the client's framebuffer, which no single
+        // run of 300 steps is guaranteed to reach.
         assert!(
-            drm::cursor_windows_widened_for_test() > 0,
-            "no composite ever widened its window, so the \
-             smaller-than-the-mode steps never put the pointer across the edge"
+            by_box > 0,
+            "no damage flush ever went up box by box, so the two-box steps say \
+             nothing about the span the kernel picks"
         );
+        let widened = drm::cursor_windows_widened_for_test();
         assert_eq!(
             skip && most_skipped > 0,
             skip,
@@ -9358,9 +9671,14 @@ mod kms_scanout_tests {
             c.rmfb(fb).expect("RMFB");
         }
         c.destroy_dumb(cur.handle).expect("DESTROY_DUMB cursor");
+        c.destroy_dumb(cur2.handle)
+            .expect("DESTROY_DUMB small cursor");
+        c.rmfb(fb_big).expect("RMFB big");
+        c.destroy_dumb(big.handle).expect("DESTROY_DUMB big");
         for b in bufs {
             c.destroy_dumb(b.handle).expect("DESTROY_DUMB");
         }
+        widened
     }
 
     /// The bug Moebius sees: a pointer move pastes the frame labwc is STILL
