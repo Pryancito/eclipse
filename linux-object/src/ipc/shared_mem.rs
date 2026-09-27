@@ -152,6 +152,74 @@ pub fn shm_unregister(id: ShmId) -> bool {
     SHMID2SHM.write().remove(&id).is_some()
 }
 
+/// Take `guard` out of the key table, and only when the key still names
+/// **this** segment.
+///
+/// It used to be `ShmGuard::remove(&self)`, which is the same code with two
+/// defects that the `&self` receiver is what made possible:
+///
+/// * The caller holds the segment's `Mutex` while this takes `KEY2SHM`, and
+///   `shmget` ([`ShmIdentifier::new_shared_guard`]) holds `KEY2SHM` while it
+///   locks the segment to compare sizes and permissions. The same two locks in
+///   opposite orders, and `kernel_hal::sync` locks spin with the interrupts
+///   off: the two CPUs never come back. The idiom that reaches it is the one
+///   every user of the X11 shared-memory extension runs on every image --
+///   `shmget` + `shmat` + `shmctl(IPC_RMID)` -- from as many clients as the
+///   session has.
+/// * It removed the entry under the segment's key without asking whether the
+///   entry was still the segment's. After an `IPC_RMID` the key is free, so
+///   somebody else's `shmget(key, IPC_CREAT)` files a NEW segment under it; a
+///   second `IPC_RMID` on the old id then deleted that stranger's entry, and
+///   the next `shmget(key)` either answered `ENOENT` or created a third
+///   segment -- two programs that believed they shared memory quietly on
+///   separate pages.
+///
+/// Lock order, which every path in this module follows: the tables first, then
+/// the segment, then its `shmid_ds`.
+fn unlink_key(key2shm: &mut BTreeMap<u32, Weak<Mutex<ShmGuard>>>, guard: &Arc<Mutex<ShmGuard>>) {
+    // A private segment carries key 0 and was never filed, so there is
+    // nothing of its own to take out -- and key 0 may not be touched.
+    let key = guard.lock().shmid_ds.lock().perm.key;
+    if key == 0 {
+        return;
+    }
+    let ours = key2shm
+        .get(&key)
+        .and_then(Weak::upgrade)
+        .is_some_and(|filed| Arc::ptr_eq(&filed, guard));
+    if ours {
+        key2shm.remove(&key);
+    }
+}
+
+/// `shmctl(id, IPC_RMID, ..)` whole: the id and the key both stop naming the
+/// segment, whose memory lives on for whoever is already attached.
+///
+/// `false` means `id` does not name `guard` any more -- a second `IPC_RMID` on
+/// the same id -- which shmctl(2) answers with `EINVAL`. It used to answer 0
+/// and do the damage described in [`unlink_key`] on the way.
+pub fn shm_unlink(id: ShmId, guard: &Arc<Mutex<ShmGuard>>) -> bool {
+    // Both tables before the segment: see `unlink_key`. Taken in the same
+    // order the old `shmctl` took them (`remove` then `shm_unregister`), so
+    // this adds no new pair.
+    let mut key2shm = KEY2SHM.write();
+    let mut ids = SHMID2SHM.write();
+    if !ids.get(&id).is_some_and(|filed| Arc::ptr_eq(filed, guard)) {
+        return false;
+    }
+    ids.remove(&id);
+    unlink_key(&mut key2shm, guard);
+    true
+}
+
+/// Free the key of a segment nobody is going to remove by id. Only the tests
+/// of this module need it; `shmctl` goes through [`shm_unlink`].
+#[cfg(test)]
+fn shm_unlink_key_only(guard: &Arc<Mutex<ShmGuard>>) {
+    let mut key2shm = KEY2SHM.write();
+    unlink_key(&mut key2shm, guard);
+}
+
 /// shmid data structure
 ///
 /// struct shmid_ds
@@ -378,16 +446,6 @@ impl ShmGuard {
     /// The segment's size in bytes, as `shmget` and `IPC_STAT` report it.
     pub fn segsz(&self) -> usize {
         self.shmid_ds.lock().segsz
-    }
-
-    /// remove Shared memory
-    ///
-    /// A private segment carries key 0 and was never filed under it, so for
-    /// one of those this finds nothing: the segment dies with its last `Arc`.
-    pub fn remove(&self) {
-        let mut key2shm = KEY2SHM.write();
-        let key = self.shmid_ds.lock().perm.key;
-        key2shm.remove(&key);
     }
 }
 
@@ -810,7 +868,7 @@ mod shm_tests {
     fn removing_a_segment_frees_its_key_even_while_it_is_still_referenced() {
         let _guard = test_lock();
         let a = get(0x5b_0006, 4096, CREAT | 0o666).unwrap();
-        a.lock().remove();
+        shm_unlink_key_only(&a);
         assert_eq!(get(0x5b_0006, 4096, 0o666).err(), Some(LxError::ENOENT));
         let b = get(0x5b_0006, 4096, CREAT | 0o666).unwrap();
         assert!(!Arc::ptr_eq(&a, &b));
@@ -824,7 +882,7 @@ mod shm_tests {
         // key 0, took the *next* caller's segment with it.
         let keyed = get(0x5b_0007, 4096, CREAT | 0o666).unwrap();
         let private = get(0, 4096, CREAT | 0o666).unwrap();
-        private.lock().remove();
+        shm_unlink_key_only(&private);
         let still_there = get(0x5b_0007, 4096, 0o666).unwrap();
         assert!(Arc::ptr_eq(&keyed, &still_there));
     }
@@ -1017,6 +1075,131 @@ mod shm_tests {
         assert_eq!(guard.segsz(), 4096);
         drop(guard);
         drop(seg);
+        clear_ids();
+    }
+
+    // ---- IPC_RMID: two locks, and a key that is no longer ours -----------
+
+    /// `shmctl(id, IPC_RMID)` twice on the same id. The second one must be
+    /// `EINVAL` and must change nothing -- it used to free the key of whatever
+    /// segment had been filed under this one's key in the meantime, so two
+    /// programs that believed they shared memory ended up on separate pages
+    /// (or got `ENOENT` from a `shmget(key, 0, 0)` probe).
+    #[test]
+    fn a_stale_ipc_rmid_does_not_free_the_new_owner_of_the_key() {
+        let _guard = test_lock();
+        clear_ids();
+        const KEY: u32 = 0x5b_2001;
+        let a = get(KEY, PAGE_SIZE, CREAT | 0o666).unwrap();
+        let id_a = shm_register(&a).unwrap();
+        assert!(shm_unlink(id_a, &a), "the first IPC_RMID names the segment");
+
+        // The key is free now, so the next `shmget` files a NEW segment under
+        // it -- `a` is still alive, attached, exactly as the X11 idiom leaves
+        // it.
+        let b = get(KEY, PAGE_SIZE, CREAT | 0o666).unwrap();
+        assert!(!Arc::ptr_eq(&a, &b), "a fresh segment, not the removed one");
+        let id_b = shm_register(&b).unwrap();
+
+        assert!(
+            !shm_unlink(id_a, &a),
+            "a second IPC_RMID on a retired id is EINVAL"
+        );
+        let found = get(KEY, PAGE_SIZE, 0o666).expect("B kept its key");
+        assert!(Arc::ptr_eq(&b, &found));
+        assert!(shm_lookup(id_b).is_some(), "and kept its id");
+    }
+
+    /// Freeing a key frees it only while it is still this segment's. Once the
+    /// key has been handed to somebody else, a stale caller must not take it
+    /// out from under them.
+    #[test]
+    fn freeing_a_key_only_frees_it_while_it_is_still_ours() {
+        let _guard = test_lock();
+        clear_ids();
+        const KEY: u32 = 0x5b_2004;
+        let a = get(KEY, PAGE_SIZE, CREAT | 0o666).unwrap();
+        shm_unlink_key_only(&a);
+        let b = get(KEY, PAGE_SIZE, CREAT | 0o666).unwrap();
+        assert!(!Arc::ptr_eq(&a, &b));
+        // `a` no longer owns the key, so this must be a no-op.
+        shm_unlink_key_only(&a);
+        assert!(Arc::ptr_eq(
+            &b,
+            &get(KEY, PAGE_SIZE, 0o666).expect("B still holds the key")
+        ));
+    }
+
+    /// A private segment has no key of its own, so removing it must leave key
+    /// 0 -- and everybody else -- alone.
+    #[test]
+    fn removing_a_private_segment_by_id_frees_no_key() {
+        let _guard = test_lock();
+        clear_ids();
+        const KEY: u32 = 0x5b_2002;
+        let keyed = get(KEY, PAGE_SIZE, CREAT | 0o666).unwrap();
+        let private = get(0, PAGE_SIZE, CREAT | 0o666).unwrap();
+        let id = shm_register(&private).unwrap();
+        assert!(shm_unlink(id, &private));
+        assert!(Arc::ptr_eq(
+            &keyed,
+            &get(KEY, PAGE_SIZE, 0o666).expect("the keyed segment is untouched")
+        ));
+    }
+
+    /// The same two locks in opposite orders, which is the whole bug.
+    ///
+    /// `shmget` on an existing key holds `KEY2SHM` and then locks the segment,
+    /// to compare the size asked for and the permissions. `shmctl(IPC_RMID)`
+    /// held the segment and then took `KEY2SHM` (and `SHMID2SHM` after it).
+    /// `kernel_hal::sync` locks spin with the interrupts off, so on real SMP
+    /// the two CPUs never come back -- and `shmget` + `shmat` +
+    /// `shmctl(IPC_RMID)` is what every client of the X11 shared-memory
+    /// extension runs, on every image it allocates.
+    ///
+    /// With the orders crossed this test does not fail, it HANGS, and a hung
+    /// suite names nothing: hence the watchdog.
+    #[test]
+    fn opening_a_key_while_another_thread_removes_it_does_not_wedge() {
+        use core::sync::atomic::{AtomicBool, Ordering};
+        let _guard = test_lock();
+        clear_ids();
+        const KEY: u32 = 0x5b_2003;
+        const ROUNDS: usize = 4000;
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let opener_stop = stop.clone();
+        // `shmget(KEY, ...)`: KEY2SHM, then the segment.
+        let opener = std::thread::spawn(move || {
+            while !opener_stop.load(Ordering::Relaxed) {
+                let _ = owned_get(KEY, PAGE_SIZE, CREAT | 0o666, ROOT);
+            }
+        });
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        // `shmget` + `shmctl(IPC_RMID)`: the segment, and then both tables.
+        let remover = std::thread::spawn(move || {
+            for _ in 0..ROUNDS {
+                let g = match owned_get(KEY, PAGE_SIZE, CREAT | 0o666, ROOT) {
+                    Ok(g) => g,
+                    Err(_) => continue,
+                };
+                if let Ok(id) = shm_register(&g) {
+                    shm_unlink(id, &g);
+                }
+            }
+            let _ = tx.send(());
+        });
+
+        let verdict = rx.recv_timeout(std::time::Duration::from_secs(30));
+        stop.store(true, Ordering::Relaxed);
+        assert!(
+            verdict.is_ok(),
+            "shmget and shmctl(IPC_RMID) took KEY2SHM and the segment lock in \
+             opposite orders and deadlocked"
+        );
+        remover.join().unwrap();
+        opener.join().unwrap();
         clear_ids();
     }
 }
