@@ -59,6 +59,32 @@ pub fn parse_bool(v: &str) -> Option<bool> {
     }
 }
 
+/// A whole number as a value spells it, or `None` when it spells something
+/// else.
+///
+/// Two spellings, because those are the two a boot argument is written with: a
+/// decimal count (`DEADLOCKSPINS=20000000`) and a `0x` hexadecimal (masks, and
+/// thresholds whose zeros nobody wants to count). Everything else is refused.
+///
+/// Refused is the point. The hand-rolled parsers this replaces read a number
+/// as `cmdline.split("KEY=").nth(1)` followed by
+/// `chars().take_while(is_ascii_digit)`, and `take_while` does not refuse a
+/// value that is not a number -- it TRUNCATES it, so the knob reads as a
+/// *different* number and the log reports the one it invented.
+/// `DEADLOCKSPINS=0x4000000` came out as `0`, which `set_deadlock_spins` turns
+/// back into the default it was written to lower, under a klog line saying
+/// "threshold set to 0"; `=8spins` came out as `8`. A knob that quietly means
+/// something else is worse than one that quietly means nothing.
+///
+/// Overflow is refused too, not wrapped: a count that does not fit is not a
+/// smaller count.
+pub fn parse_number(v: &str) -> Option<u64> {
+    match v.strip_prefix("0x").or_else(|| v.strip_prefix("0X")) {
+        Some(hex) => u64::from_str_radix(hex, 16).ok(),
+        None => v.parse().ok(),
+    }
+}
+
 /// Whether the boolean flag `key` is on: present, and not spelled off.
 ///
 /// A value that spells neither — `nvidia.hwcursor=banana` — is not an
@@ -330,6 +356,117 @@ mod tests {
         for other in ["", "banana", "2", "-1", "onward", "of", "ye"] {
             assert_eq!(parse_bool(other), None, "{}", other);
         }
+    }
+
+    // ── parse_number ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_number_reads_the_count_a_knob_is_written_with() {
+        assert_eq!(parse_number("0"), Some(0));
+        assert_eq!(parse_number("3"), Some(3));
+        assert_eq!(parse_number("20000000"), Some(20_000_000));
+        assert_eq!(parse_number("18446744073709551615"), Some(u64::MAX));
+    }
+
+    #[test]
+    fn parse_number_reads_the_hex_a_threshold_is_written_in() {
+        // Twenty million in the spelling somebody reaching for a round number
+        // actually types.
+        assert_eq!(parse_number("0x4000000"), Some(0x400_0000));
+        assert_eq!(parse_number("0X4000000"), Some(0x400_0000));
+        assert_eq!(parse_number("0xdeadbeef"), Some(0xdead_beef));
+        assert_eq!(parse_number("0xDEADBEEF"), Some(0xdead_beef));
+        assert_eq!(parse_number("0x0"), Some(0));
+    }
+
+    #[test]
+    fn parse_number_refuses_what_is_not_a_number_rather_than_truncating_it() {
+        // The whole reason this function exists. `take_while(is_ascii_digit)`
+        // answers each of these with the digits it happens to start with, so
+        // the knob takes a value nobody wrote -- and for the first one that
+        // value is `0`, which restores the very default the knob was written
+        // to lower.
+        for not_a_number in ["0x4000000", "8spins", "20000000:LOG=info", "5 "] {
+            let truncated: alloc::string::String = not_a_number
+                .chars()
+                .take_while(|c| c.is_ascii_digit())
+                .collect();
+            assert!(
+                truncated.parse::<u64>().is_ok(),
+                "the old parser read {:?} as {:?}",
+                not_a_number,
+                truncated
+            );
+        }
+        for spelled in [
+            "8spins",
+            "20000000:LOG=info",
+            "",
+            "banana",
+            "-1",
+            "0x",
+            "0xg",
+            " ",
+        ] {
+            assert_eq!(parse_number(spelled), None, "{:?}", spelled);
+        }
+        // The first one is missing from that list on purpose: a hexadecimal is
+        // a number, so this reads it instead of refusing it -- and reads it as
+        // the number it is rather than as the `0` the truncation made of it.
+        assert_eq!(parse_number("0x4000000"), Some(0x400_0000));
+    }
+
+    #[test]
+    fn parse_number_refuses_a_count_too_big_to_be_one() {
+        // Not wrapped: a count that does not fit is not a smaller count.
+        assert_eq!(parse_number("18446744073709551616"), None);
+        assert_eq!(parse_number("0x10000000000000000"), None);
+    }
+
+    #[test]
+    fn a_threshold_survives_the_trip_through_a_command_line() {
+        // `value` then `parse_number` is the shape the call sites use, the same
+        // way `power.rs` composes `value` with `parse_bool`. The colon is what
+        // ends the number, and `value` is what knows that.
+        let line = "LOG=error:DEADLOCKSPINS=20000000:ROOT=/dev/sda2";
+        assert_eq!(
+            value(line, "DEADLOCKSPINS").and_then(parse_number),
+            Some(20_000_000)
+        );
+        // A key nobody wrote and a key written with nonsense are both `None`
+        // here, which is why a call site that wants to report the second one
+        // asks `value` first.
+        assert_eq!(value(line, "TLBHAMMER").and_then(parse_number), None);
+        assert_eq!(value("DEADLOCKSPINS=lots", "DEADLOCKSPINS"), Some("lots"));
+        assert_eq!(
+            value("DEADLOCKSPINS=lots", "DEADLOCKSPINS").and_then(parse_number),
+            None
+        );
+    }
+
+    #[test]
+    fn the_spaces_a_person_leaves_around_a_number_are_not_part_of_it() {
+        // `value` trims, so this reads; the old parser saw a space where it
+        // wanted a digit and took the key to be absent.
+        assert_eq!(
+            value("LOG=error: DEADLOCKSPINS = 20000000 ", "DEADLOCKSPINS").and_then(parse_number),
+            Some(20_000_000)
+        );
+    }
+
+    #[test]
+    fn a_knob_name_inside_a_longer_key_is_not_that_knob() {
+        // The substring split had no notion of a key, so a knob could be read
+        // out of a longer one -- or out of somebody else's value.
+        assert!(
+            "X.DEADLOCKSPINS=9".contains("DEADLOCKSPINS="),
+            "the old way"
+        );
+        assert_eq!(value("X.DEADLOCKSPINS=9", "DEADLOCKSPINS"), None);
+        assert_eq!(
+            value("ROOT=/dev/by-id/DEADLOCKSPINS=9", "DEADLOCKSPINS"),
+            None
+        );
     }
 
     #[test]

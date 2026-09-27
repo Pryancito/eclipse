@@ -45,7 +45,13 @@ mod fs;
 mod handler;
 mod invariants;
 mod platform;
-#[cfg(all(feature = "linux", not(feature = "libos")))]
+// `test` as well as the kernel build, and for the same reason `lang` and `oops`
+// above carry one: the hammer is gated to a bare kernel, so no job that runs
+// tests compiled a line of it -- and what it reads is the kernel command line,
+// which is a string, which is the one thing a host test answers for exactly as
+// a boot does. Nothing here calls it under `cfg(test)`; the crate-wide
+// `allow(dead_code)` at the top covers that.
+#[cfg(any(all(feature = "linux", not(feature = "libos")), test))]
 mod tlb_hammer;
 mod utils;
 
@@ -75,6 +81,22 @@ static TLBHAMMER_N: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU6
 
 #[cfg(all(not(any(feature = "libos")), feature = "mock-disk"))]
 static MOCK_CORE: AtomicBool = AtomicBool::new(false);
+
+/// What `DEADLOCKSPINS=<n>` on the command line asks the deadlock detector for.
+///
+/// Three answers, and the third is the one that matters. `None` is a line that
+/// never mentioned the knob. `Some(Ok(n))` is a spin count. `Some(Err(spelled))`
+/// is somebody having written the knob and written something that is not a
+/// count -- which used to read as the digits the value happened to start with,
+/// so `DEADLOCKSPINS=0x4000000` came out as `0`, `set_deadlock_spins` turned
+/// that back into the very default the knob exists to lower, and the klog said
+/// "threshold set to 0". The detector then never fired, which is exactly the
+/// failure the knob was added for: a hang read as "not a deadlock, no banner
+/// appeared" when the threshold had simply not been reached.
+fn deadlock_spins(cmdline: &str) -> Option<Result<u64, &str>> {
+    let spelled = kernel_hal::cmdline::value(cmdline, "DEADLOCKSPINS")?;
+    Some(kernel_hal::cmdline::parse_number(spelled).ok_or(spelled))
+}
 
 fn primary_main(config: kernel_hal::KernelConfig) {
     logging::init();
@@ -157,13 +179,16 @@ fn primary_main(config: kernel_hal::KernelConfig) {
         // detector never fires within a test run — which is how a genuine hang
         // came to be misread as "not a deadlock, nothing was reported". Lower it
         // for emulated runs: `DEADLOCKSPINS=20000000`.
-        if let Some(rest) = options.cmdline.split("DEADLOCKSPINS=").nth(1) {
-            let digits: alloc::string::String =
-                rest.chars().take_while(|c| c.is_ascii_digit()).collect();
-            if let Ok(n) = digits.parse::<u64>() {
+        match deadlock_spins(&options.cmdline) {
+            None => {}
+            Some(Ok(n)) => {
                 lock::set_deadlock_spins(n);
                 klog_info!("Eclipse: deadlock spin threshold set to {}", n);
             }
+            Some(Err(spelled)) => klog_warn!(
+                "Eclipse: DEADLOCKSPINS={} is not a spin count -- threshold left at the default",
+                spelled
+            ),
         }
         // Default is ON (see `COW_FORK`): the user-memory corruption that had it
         // rolled back was a stale writable TLB entry after `protect_for_cow`, now
@@ -1121,4 +1146,105 @@ fn secondary_main() -> ! {
         }
     }
     utils::wait_for_exit(None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::deadlock_spins;
+
+    /// The line a live Eclipse boots with, which mentions no threshold.
+    const REAL: &str = "LOG=error:TERM=xterm-256color:console.shell=true:ROOT=/dev/sda2";
+
+    #[test]
+    fn the_count_written_is_the_count_asked_for() {
+        assert_eq!(
+            deadlock_spins("DEADLOCKSPINS=20000000"),
+            Some(Ok(20_000_000))
+        );
+        // The colon ends the number, and `cmdline` is what knows that.
+        assert_eq!(
+            deadlock_spins("LOG=error:DEADLOCKSPINS=20000000:ROOT=/dev/sda2"),
+            Some(Ok(20_000_000))
+        );
+    }
+
+    #[test]
+    fn a_threshold_written_in_hex_is_the_number_it_spells() {
+        // This is the one that cost something: the old parser stopped at the
+        // `x` and read `0`, `set_deadlock_spins(0)` restores the default the
+        // knob exists to lower, and the klog said "threshold set to 0". The
+        // detector then never fired on an emulated run -- which is the failure
+        // the knob was added for in the first place.
+        assert_eq!(
+            deadlock_spins("DEADLOCKSPINS=0x4000000"),
+            Some(Ok(0x400_0000))
+        );
+        assert_eq!(
+            deadlock_spins("DEADLOCKSPINS=0X4000000"),
+            Some(Ok(0x400_0000))
+        );
+    }
+
+    #[test]
+    fn a_line_that_never_mentioned_the_knob_says_so() {
+        // Distinct from a knob written with nonsense: nothing to report.
+        assert_eq!(deadlock_spins(REAL), None);
+        assert_eq!(deadlock_spins(""), None);
+    }
+
+    #[test]
+    fn a_value_that_is_not_a_count_is_reported_rather_than_invented() {
+        // `take_while(is_ascii_digit)` answered each of these with the digits
+        // it happened to start with, and set that.
+        assert_eq!(deadlock_spins("DEADLOCKSPINS=lots"), Some(Err("lots")));
+        assert_eq!(
+            deadlock_spins("DEADLOCKSPINS=20000000spins"),
+            Some(Err("20000000spins"))
+        );
+        assert_eq!(deadlock_spins("DEADLOCKSPINS=-1"), Some(Err("-1")));
+        // Naming the knob and writing no count at all is a typo too.
+        assert_eq!(deadlock_spins("LOG=error:DEADLOCKSPINS"), Some(Err("")));
+    }
+
+    #[test]
+    fn a_count_of_zero_is_a_count_and_means_the_default() {
+        // `set_deadlock_spins` documents `0` as "restore the default", so this
+        // is a real answer and not the misparse above.
+        assert_eq!(deadlock_spins("DEADLOCKSPINS=0"), Some(Ok(0)));
+    }
+
+    #[test]
+    fn the_name_inside_a_longer_key_is_not_the_knob() {
+        assert!(
+            "X.DEADLOCKSPINS=9".contains("DEADLOCKSPINS="),
+            "which is what the old parser asked"
+        );
+        assert_eq!(deadlock_spins("X.DEADLOCKSPINS=9"), None);
+        assert_eq!(deadlock_spins("NODEADLOCKSPINS=9"), None);
+    }
+
+    #[test]
+    fn the_name_inside_somebody_elses_value_is_not_the_knob() {
+        assert_eq!(
+            deadlock_spins("ROOT=/dev/disk/by-id/DEADLOCKSPINS=9-part2"),
+            None
+        );
+        assert_eq!(deadlock_spins("TERM=DEADLOCKSPINS=9"), None);
+    }
+
+    #[test]
+    fn the_key_is_case_insensitive_like_every_other_one() {
+        assert_eq!(deadlock_spins("deadlockspins=5"), Some(Ok(5)));
+        assert_eq!(deadlock_spins("DeadlockSpins=5"), Some(Ok(5)));
+    }
+
+    #[test]
+    fn the_spaces_a_person_leaves_around_the_count_are_not_part_of_it() {
+        // The old parser wanted a digit where the space was, so the knob it
+        // reported as absent was one somebody had just written.
+        assert_eq!(
+            deadlock_spins("LOG=error: DEADLOCKSPINS = 20000000 "),
+            Some(Ok(20_000_000))
+        );
+    }
 }

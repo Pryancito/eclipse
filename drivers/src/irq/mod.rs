@@ -52,3 +52,17 @@ mod gic_400_host_tests;
 #[path = "riscv_plic.rs"]
 #[allow(dead_code)]
 mod riscv_plic_host_tests;
+
+/// The RISC-V per-hart interrupt controller, pulled into the host build for its
+/// tests alone.
+///
+/// Third of the three, and the one with the least architecture in it: the only
+/// riscv-specific thing it touches is the `sie` CSR, which `riscv_intc.rs`
+/// doubles for the host. What that one import hid is a `.unwrap()` in
+/// `handle_irq` -- a kernel panic reached from the trap handler by any interrupt
+/// cause the file does not know -- and a handler called with the lock that
+/// registering one takes still held.
+#[cfg(all(test, not(any(target_arch = "riscv32", target_arch = "riscv64"))))]
+#[path = "riscv_intc.rs"]
+#[allow(dead_code)]
+mod riscv_intc_host_tests;

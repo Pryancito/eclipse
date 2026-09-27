@@ -34,7 +34,16 @@ pub static FAIL_MARK: AtomicBool = AtomicBool::new(false);
 /// AFTER the pages have already been remapped.
 pub static FAIL_VERIFY: AtomicBool = AtomicBool::new(false);
 
+/// `drivers_dma_alloc` answers 0 once this many calls have already been made,
+/// so a caller that takes several regions can be failed on the *third* one --
+/// which is the only way to reach the path that gives the first two back.
+/// `usize::MAX` (the default) never fails.
+pub static FAIL_ALLOC_AFTER: AtomicUsize = AtomicUsize::new(usize::MAX);
+
 pub static ALLOC_CALLS: AtomicUsize = AtomicUsize::new(0);
+/// Pages asked for, summed. `ALLOC_CALLS` counts the calls; this is what they
+/// asked for, which is where a byte length rounded the wrong way shows up.
+pub static ALLOC_PAGES: AtomicUsize = AtomicUsize::new(0);
 pub static DEALLOC_CALLS: AtomicUsize = AtomicUsize::new(0);
 pub static DEALLOC_PAGES: AtomicUsize = AtomicUsize::new(0);
 pub static MARK_CALLS: AtomicUsize = AtomicUsize::new(0);
@@ -53,6 +62,7 @@ pub fn reset() {
     }
     for counter in [
         &ALLOC_CALLS,
+        &ALLOC_PAGES,
         &DEALLOC_CALLS,
         &DEALLOC_PAGES,
         &MARK_CALLS,
@@ -60,12 +70,14 @@ pub fn reset() {
     ] {
         counter.store(0, Ordering::SeqCst);
     }
+    FAIL_ALLOC_AFTER.store(usize::MAX, Ordering::SeqCst);
 }
 
 #[no_mangle]
 extern "C" fn drivers_dma_alloc(pages: usize) -> usize {
-    ALLOC_CALLS.fetch_add(1, Ordering::SeqCst);
-    if FAIL_ALLOC.load(Ordering::SeqCst) {
+    let before = ALLOC_CALLS.fetch_add(1, Ordering::SeqCst);
+    ALLOC_PAGES.fetch_add(pages, Ordering::SeqCst);
+    if FAIL_ALLOC.load(Ordering::SeqCst) || before >= FAIL_ALLOC_AFTER.load(Ordering::SeqCst) {
         return 0;
     }
     // One extra page of slack, so a deliberately misaligned answer still points
