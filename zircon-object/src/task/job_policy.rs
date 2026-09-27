@@ -36,12 +36,27 @@ impl JobPolicy {
 
     /// Apply a basic policy.
     pub fn apply(&mut self, condition: PolicyCondition, action: PolicyAction) {
-        self.action[condition as usize] = Some(action);
-        if let PolicyCondition::NewAny = condition {
-            for &condition in NEW_ANY_EXPANSION {
-                self.action[condition as usize] = Some(action);
-            }
+        for condition in Self::conditions_written(condition) {
+            self.action[condition as usize] = Some(action);
         }
+    }
+
+    /// Every condition applying `condition` writes: itself, plus the ten
+    /// `NewAny` stands for.
+    ///
+    /// `ZX_JOB_POL_ABSOLUTE` promises every condition in the array or none, and
+    /// weighing `NewAny` against the parent by its own slot alone broke that
+    /// promise: a parent that had spoken for `NewVMO` had not spoken for
+    /// `NewAny`, so the call was accepted -- and then the parent's word won for
+    /// `NewVMO` anyway, because [`merge`](Self::merge) gives it the last say.
+    /// The caller was told it had set a policy that is not the one in force,
+    /// which is exactly what absolute exists to rule out.
+    pub fn conditions_written(condition: PolicyCondition) -> impl Iterator<Item = PolicyCondition> {
+        let expansion: &'static [PolicyCondition] = match condition {
+            PolicyCondition::NewAny => NEW_ANY_EXPANSION,
+            _ => &[],
+        };
+        core::iter::once(condition).chain(expansion.iter().copied())
     }
 
     /// Merge the policy with `parent`'s.

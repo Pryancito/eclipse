@@ -189,13 +189,23 @@ impl Job {
         let mut to_apply = Vec::with_capacity(policies.len());
         for policy in policies {
             let (condition, action) = policy.parse()?;
-            if self.parent_policy.get_action(condition).is_some() {
-                match options {
-                    // The parent has spoken for this condition and its policy
-                    // wins either way; absolute says so is an error.
-                    SetPolicyOptions::Absolute => return Err(ZxError::ALREADY_EXISTS),
-                    SetPolicyOptions::Relative => continue,
-                }
+            // Weighed against every condition this entry WRITES, not just the
+            // one it names: `NewAny` writes the ten `NEW_*` as well, and
+            // checking its own slot alone let an absolute call through when the
+            // parent had spoken for one of the ten. The parent's word wins
+            // either way (see `JobPolicy::merge`), so relative still applies
+            // what it can and lets the merge decide.
+            let overridden = JobPolicy::conditions_written(condition)
+                .any(|written| self.parent_policy.get_action(written).is_some());
+            // The parent has spoken for at least one condition this entry
+            // writes, and its word wins either way (see `JobPolicy::merge`).
+            // Absolute says every condition or none, so that is an error.
+            // Relative applies the entry all the same: the merge decides slot
+            // by slot, so the conditions the parent did NOT speak for still
+            // take the child's action. Skipping the whole entry lost them --
+            // for `NewAny` that is nine of the ten it stands for.
+            if overridden && matches!(options, SetPolicyOptions::Absolute) {
+                return Err(ZxError::ALREADY_EXISTS);
             }
             to_apply.push((condition, action));
         }
@@ -455,6 +465,56 @@ mod tests {
     }
 
     /// `ZX_JOB_POL_ABSOLUTE` means every condition in the array or none.
+    /// `NEW_ANY` stands for the ten `NEW_*` conditions, so a parent that has
+    /// spoken for one of them has spoken for part of it. `ZX_JOB_POL_ABSOLUTE`
+    /// promises every condition or none, and this was weighed against
+    /// `NEW_ANY`'s own slot alone: the call was accepted, and then the parent's
+    /// word won for that one condition anyway, so the caller was told it had
+    /// set a policy that was not the one in force. Relative still applies what
+    /// it can and lets the merge decide.
+    #[test]
+    fn an_absolute_new_any_collides_with_a_parent_that_spoke_for_one_kind() {
+        let root = Job::root();
+        let parent = Job::create_child(&root).unwrap();
+        parent
+            .set_policy_basic(
+                SetPolicyOptions::Relative,
+                &[BasicPolicy {
+                    condition: PolicyCondition::NewVMO as u32,
+                    action: PolicyAction::Deny as u32,
+                }],
+            )
+            .unwrap();
+
+        let any_allow = [BasicPolicy {
+            condition: PolicyCondition::NewAny as u32,
+            action: PolicyAction::Allow as u32,
+        }];
+
+        let absolute = Job::create_child(&parent).unwrap();
+        assert_eq!(
+            absolute.set_policy_basic(SetPolicyOptions::Absolute, &any_allow),
+            Err(ZxError::ALREADY_EXISTS),
+            "the parent has spoken for one of the ten NEW_ANY stands for",
+        );
+
+        let relative = Job::create_child(&parent).unwrap();
+        relative
+            .set_policy_basic(SetPolicyOptions::Relative, &any_allow)
+            .expect("relative applies what it can");
+        let policy = relative.policy();
+        assert_eq!(
+            policy.get_action(PolicyCondition::NewVMO),
+            Some(PolicyAction::Deny),
+            "the parent's word stands for the one it spoke for",
+        );
+        assert_eq!(
+            policy.get_action(PolicyCondition::NewChannel),
+            Some(PolicyAction::Allow),
+            "and the child's for the other nine",
+        );
+    }
+
     /// Parsing, weighing and applying all happened in one loop, so an array
     /// whose second entry collided with the parent came back
     /// `ALREADY_EXISTS` with the first entry already written.

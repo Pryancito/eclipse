@@ -1,5 +1,8 @@
 use {super::*, bitflags::bitflags, zircon_object::vm::*};
 
+/// Where `ZX_VM_ALIGN_*` lives in `options`: a power of two, not a flag bit.
+const ALIGN_FIELD: u32 = 0xFF00_0000;
+
 fn amount_of_alignments(options: u32) -> ZxResult<usize> {
     let mut align_pow2 = (options >> 24) as usize;
     if align_pow2 == 0 {
@@ -10,6 +13,20 @@ fn amount_of_alignments(options: u32) -> ZxResult<usize> {
     } else {
         Ok(1 << align_pow2)
     }
+}
+
+/// The flags and the alignment a `zx_vmar_allocate` asked for.
+///
+/// `ZX_VM_ALIGN_*` is `(align_pow2 << 24)`, so it sits outside the flag bits
+/// and the flags have to be read from what is left. `VmOptions::from_bits`
+/// refuses any bit it does not know, and it used to be handed the whole word:
+/// **every `ZX_VM_ALIGN_*` request answered `INVALID_ARGS`**, and
+/// `amount_of_alignments` -- which exists to read exactly those bits -- could
+/// never return anything but `PAGE_SIZE`. An unknown bit among the flags is
+/// still refused.
+fn vmar_options(options: u32) -> ZxResult<(VmOptions, usize)> {
+    let flags = VmOptions::from_bits(options & !ALIGN_FIELD).ok_or(ZxError::INVALID_ARGS)?;
+    Ok((flags, amount_of_alignments(options)?))
 }
 
 impl Syscall<'_> {
@@ -25,7 +42,7 @@ impl Syscall<'_> {
         mut out_child_vmar: UserOutPtr<HandleValue>,
         mut out_child_addr: UserOutPtr<usize>,
     ) -> ZxResult {
-        let vm_options = VmOptions::from_bits(options).ok_or(ZxError::INVALID_ARGS)?;
+        let (vm_options, align) = vmar_options(options)?;
         info!(
             "vmar.allocate: parent={:#x?}, options={:#x?}, offset={:#x?}, size={:#x?}",
             parent_vmar, options, offset, size,
@@ -48,9 +65,6 @@ impl Syscall<'_> {
         ) {
             return Err(ZxError::INVALID_ARGS);
         }
-
-        // get align
-        let align = amount_of_alignments(options)?;
 
         // get offest with options
         let offset = if vm_options.contains(VmOptions::SPECIFIC) {
@@ -372,5 +386,70 @@ impl VmOptions {
             flags.insert(VmarFlags::ALLOW_FAULTS);
         }
         flags
+    }
+}
+
+#[cfg(test)]
+mod vmar_options_tests {
+    //! `ZX_VM_ALIGN_*` rides in bits 24.. of `options`, outside the flag bits.
+    //! The whole word used to go to `VmOptions::from_bits`, which refuses any
+    //! bit it does not know, so every alignment request was `INVALID_ARGS` and
+    //! `amount_of_alignments` could only ever answer `PAGE_SIZE`.
+
+    use super::*;
+
+    /// `ZX_VM_ALIGN_<n>` as Zircon writes it.
+    fn align_option(align_pow2: u32) -> u32 {
+        align_pow2 << 24
+    }
+
+    #[test]
+    fn an_alignment_request_is_read_and_not_refused() {
+        let (flags, align) =
+            vmar_options(align_option(20) | VmOptions::CAN_MAP_READ.bits()).unwrap();
+        assert_eq!(align, 1 << 20, "ZX_VM_ALIGN_1MB");
+        assert!(
+            flags.contains(VmOptions::CAN_MAP_READ),
+            "the flags come from the bits that are not the alignment"
+        );
+        assert_eq!(
+            flags.bits() & ALIGN_FIELD,
+            0,
+            "no alignment bit is left among the flags"
+        );
+    }
+
+    #[test]
+    fn the_largest_alignment_is_accepted() {
+        assert_eq!(
+            vmar_options(align_option(32)),
+            Ok((VmOptions::empty(), 1 << 32))
+        );
+    }
+
+    #[test]
+    fn no_alignment_asked_for_is_a_page() {
+        let (flags, align) = vmar_options(VmOptions::SPECIFIC.bits()).unwrap();
+        assert_eq!(align, PAGE_SIZE);
+        assert_eq!(flags, VmOptions::SPECIFIC);
+    }
+
+    #[test]
+    fn an_alignment_smaller_than_a_page_or_larger_than_the_largest_is_refused() {
+        assert_eq!(vmar_options(align_option(10)), Err(ZxError::INVALID_ARGS));
+        assert_eq!(
+            vmar_options(align_option((PAGE_SIZE_LOG2 - 1) as u32)),
+            Err(ZxError::INVALID_ARGS)
+        );
+        assert_eq!(vmar_options(align_option(33)), Err(ZxError::INVALID_ARGS));
+    }
+
+    #[test]
+    fn an_unknown_flag_bit_is_still_refused() {
+        assert_eq!(vmar_options(1 << 13), Err(ZxError::INVALID_ARGS));
+        assert_eq!(
+            vmar_options(align_option(20) | (1 << 13)),
+            Err(ZxError::INVALID_ARGS)
+        );
     }
 }
