@@ -1008,6 +1008,14 @@ pub(super) const fn mmu_kind_valid(kind: u32) -> bool {
             && TU102_MMU_KIND[kind as usize] != TU102_MMU_KIND_INVALID)
 }
 
+/// `nvbo->comp` in `nouveau_bo_alloc`: a kind the table maps to another
+/// one is a compressible kind, the pair being its uncompressed form. Only
+/// asked of a kind [`mmu_kind_valid`] accepted.
+#[inline]
+pub(super) const fn mmu_kind_compressible(kind: u32) -> bool {
+    (kind as usize) < TU102_MMU_KIND.len() && TU102_MMU_KIND[kind as usize] as u32 != kind
+}
+
 /// The kind byte of a `tile_flags` (`(tile_flags & 0x0000ff00) >> 8`,
 /// Fermi and later).
 #[inline]
@@ -1024,14 +1032,19 @@ pub(super) const NOUVEAU_GEM_TILE_NONCONTIG: u32 = 0x0000_0008;
 /// pages (`vmm->page[i].host` is set on the 4 KiB entry alone); VRAM takes
 /// the largest page the request already fills, 2 MiB or 64 KiB, and 4 KiB
 /// under that (the walk stops "once the buffer is larger than the current
-/// page size").
+/// page size"). A `comp` object (a compressible kind, from a client
+/// without a uvmm) is kept off the 4 KiB page, which has no compression:
+/// the walk only settles on a page "compatible with the requested
+/// compression settings" once it has one, so in VRAM it stays on the
+/// 64 KiB page for any request under it. A uvmm client's walk ignores
+/// compression altogether (its mappings take their kind from `VM_BIND`).
 #[inline]
-pub(super) const fn gem_page_shift(size: u64, sysmem: bool) -> u32 {
+pub(super) const fn gem_page_shift(size: u64, sysmem: bool, comp: bool) -> u32 {
     if sysmem {
         12
     } else if size >= 1 << 21 {
         21
-    } else if size >= 1 << 16 {
+    } else if size >= 1 << 16 || comp {
         16
     } else {
         12
@@ -1048,13 +1061,16 @@ pub(super) const fn gem_alloc_size(size: u64, page_shift: u32) -> u64 {
 }
 
 /// The kind an object of `page_shift` pages is programmed and reported
-/// with: a compressible kind needs a page with compression, which only the
-/// 64 KiB and 2 MiB VRAM pages have; on 4 KiB pages `nouveau_bo_alloc`
-/// "disables compression" by mapping it through the MMU table to its
-/// uncompressed pair. The kind is one [`mmu_kind_valid`] accepted.
+/// with: a `comp` object (see [`gem_page_shift`]) needs a page with
+/// compression, which only the 64 KiB and 2 MiB VRAM pages have; on 4 KiB
+/// pages (host memory) `nouveau_bo_alloc` "disables compression" by mapping
+/// the kind through the MMU table to its uncompressed pair. Without `comp`
+/// (an uncompressed kind, or any kind from a uvmm client, whose walk never
+/// looks at compression) the kind stays as the client gave it. The kind
+/// is one [`mmu_kind_valid`] accepted.
 #[inline]
-pub(super) const fn gem_reported_kind(kind: u32, page_shift: u32) -> u32 {
-    if (kind as usize) < TU102_MMU_KIND.len() && page_shift == 12 {
+pub(super) const fn gem_reported_kind(kind: u32, page_shift: u32, comp: bool) -> u32 {
+    if comp && (kind as usize) < TU102_MMU_KIND.len() && page_shift == 12 {
         TU102_MMU_KIND[kind as usize] as u32
     } else {
         kind
@@ -2697,14 +2713,14 @@ mod gl_client_abi_tests {
     fn a_gem_object_is_as_big_as_its_gpu_page_and_reports_the_kind_it_programs() {
         // Host memory is 4 KiB pages whatever the size; VRAM fills the
         // largest page it already reaches.
-        assert_eq!(gem_page_shift(1, true), 12);
-        assert_eq!(gem_page_shift(3 << 20, true), 12);
-        assert_eq!(gem_page_shift(1, false), 12);
-        assert_eq!(gem_page_shift((1 << 16) - 1, false), 12);
-        assert_eq!(gem_page_shift(1 << 16, false), 16);
-        assert_eq!(gem_page_shift((1 << 21) - 1, false), 16);
-        assert_eq!(gem_page_shift(1 << 21, false), 21);
-        assert_eq!(gem_page_shift(u64::from(u32::MAX), false), 21);
+        assert_eq!(gem_page_shift(1, true, false), 12);
+        assert_eq!(gem_page_shift(3 << 20, true, false), 12);
+        assert_eq!(gem_page_shift(1, false, false), 12);
+        assert_eq!(gem_page_shift((1 << 16) - 1, false, false), 12);
+        assert_eq!(gem_page_shift(1 << 16, false, false), 16);
+        assert_eq!(gem_page_shift((1 << 21) - 1, false, false), 16);
+        assert_eq!(gem_page_shift(1 << 21, false, false), 21);
+        assert_eq!(gem_page_shift(u64::from(u32::MAX), false, false), 21);
 
         assert_eq!(gem_alloc_size(1, 12), 4096);
         assert_eq!(gem_alloc_size(4096, 12), 4096);
@@ -2719,12 +2735,16 @@ mod gl_client_abi_tests {
         );
 
         // A compressible kind is only kept on a page with compression.
-        assert_eq!(gem_reported_kind(0x08, 12), 0x06);
-        assert_eq!(gem_reported_kind(0x0a, 12), 0x02);
-        assert_eq!(gem_reported_kind(0x08, 16), 0x08);
-        assert_eq!(gem_reported_kind(0x08, 21), 0x08);
-        assert_eq!(gem_reported_kind(0x06, 12), 0x06, "uncompressed stays");
-        assert_eq!(gem_reported_kind(0x00, 12), 0x00);
+        assert_eq!(gem_reported_kind(0x08, 12, true), 0x06);
+        assert_eq!(gem_reported_kind(0x0a, 12, true), 0x02);
+        assert_eq!(gem_reported_kind(0x08, 16, true), 0x08);
+        assert_eq!(gem_reported_kind(0x08, 21, true), 0x08);
+        assert_eq!(
+            gem_reported_kind(0x06, 12, false),
+            0x06,
+            "uncompressed stays"
+        );
+        assert_eq!(gem_reported_kind(0x00, 12, false), 0x00);
 
         assert_eq!(gem_reported_tile_flags(0x00ff_08ff, 0x06), 0x0000_0608);
         assert_eq!(gem_reported_tile_flags(0x0000_0800, 0x08), 0x0000_0800);
@@ -2733,6 +2753,48 @@ mod gl_client_abi_tests {
             0,
             "only NONCONTIG"
         );
+    }
+
+    /// `nouveau_bo_alloc` for a compressible kind (`nvbo->comp`, the table
+    /// mapping the kind elsewhere): in VRAM the page walk settles on the
+    /// 64 KiB page, the smallest with compression, for any request under
+    /// it, and the kind stays; on host pages compression is disabled and
+    /// the kind is its uncompressed pair. A uvmm client's object is not
+    /// `comp` at all: the page is the one the request fills and the kind
+    /// comes back as given. This put every request under 64 KiB on 4 KiB
+    /// pages, downgrading the kind, uvmm or not.
+    #[test]
+    fn a_compressible_kind_needs_a_page_with_compression_unless_the_client_has_a_uvmm() {
+        for kind in 0x08u32..=0x0e {
+            assert!(mmu_kind_compressible(kind), "{:#04x}", kind);
+        }
+        for kind in 0x00u32..=0x07 {
+            assert!(!mmu_kind_compressible(kind), "{:#04x}", kind);
+        }
+        assert!(!mmu_kind_compressible(0x10), "past the table");
+
+        // VRAM: 64 KiB is the floor of a compressed object.
+        assert_eq!(gem_page_shift(1, false, true), 16);
+        assert_eq!(gem_page_shift(4096, false, true), 16);
+        assert_eq!(gem_page_shift((1 << 16) - 1, false, true), 16);
+        assert_eq!(gem_page_shift(1 << 16, false, true), 16);
+        assert_eq!(gem_page_shift((1 << 21) - 1, false, true), 16);
+        assert_eq!(gem_page_shift(1 << 21, false, true), 21, "2 MiB still wins");
+        // Host memory has 4 KiB pages only, compression or not.
+        assert_eq!(gem_page_shift(1, true, true), 12);
+        assert_eq!(gem_page_shift(1 << 16, true, true), 12);
+        // Not `comp`: the page the request fills.
+        assert_eq!(gem_page_shift(4096, false, false), 12);
+
+        // The kind is downgraded on a 4 KiB page of a `comp` object only.
+        assert_eq!(gem_reported_kind(0x0b, 12, true), 0x01);
+        assert_eq!(gem_reported_kind(0x0b, 16, true), 0x0b);
+        assert_eq!(
+            gem_reported_kind(0x0b, 12, false),
+            0x0b,
+            "a uvmm client's kind is its own"
+        );
+        assert_eq!(gem_reported_kind(0x0e, 12, false), 0x0e);
     }
 
     #[test]

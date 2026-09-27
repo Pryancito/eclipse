@@ -14112,16 +14112,23 @@ impl NvidiaGpu {
                 // host-backed, and 64 KiB or 2 MiB for VRAM once the request
                 // reaches that size -- and that is the size `GEM_NEW` and
                 // `GEM_INFO` report and the one the memory is allocated and
-                // accounted at. A compressible kind on 4 KiB pages, which
-                // carry no compression, is programmed and reported as its
-                // uncompressed pair, and the reported `tile_flags` is
-                // NONCONTIG | kind << 8, nothing else. This allocated and
-                // reported the request as it came.
-                let page_shift = nv::gem_page_shift(req.info.size, sysmem);
+                // accounted at. A compressible kind from a client without a
+                // uvmm (`nvbo->comp`) keeps off the 4 KiB page in VRAM, which
+                // has no compression, so a small request takes the 64 KiB
+                // page and keeps its kind; on host pages it is programmed and
+                // reported as its uncompressed pair. A uvmm client's walk
+                // never looks at compression: its object goes on the page
+                // the request fills and the kind comes back as given (its
+                // mappings take theirs from `VM_BIND`). The reported
+                // `tile_flags` is NONCONTIG | kind << 8, nothing else. This
+                // put every request under 64 KiB on 4 KiB pages, downgrading
+                // the kind, uvmm or not.
+                let comp = !self.nouveau_has_uvmm(owner_pid) && nv::mmu_kind_compressible(kind);
+                let page_shift = nv::gem_page_shift(req.info.size, sysmem, comp);
                 let size = nv::gem_alloc_size(req.info.size, page_shift);
                 let tile_flags = nv::gem_reported_tile_flags(
                     req.info.tile_flags,
-                    nv::gem_reported_kind(kind, page_shift),
+                    nv::gem_reported_kind(kind, page_shift, comp),
                 );
                 // Quotas before gem_alloc: one BO, per-pid live, and global live.
                 if size > GEM_NEW_MAX_SINGLE {
