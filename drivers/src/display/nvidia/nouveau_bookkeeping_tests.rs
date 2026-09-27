@@ -4547,6 +4547,113 @@ fn cpu_prep_waits_for_a_zombies_ring_that_still_writes_the_buffer() {
     assert_eq!(FAKE_RM.lock().bad, 0);
 }
 
+/// `nouveau_job_submit` resolves the waits first (`nouveau_job_add_deps`:
+/// a sync whose type is neither SYNCOBJ nor TIMELINE_SYNCOBJ is
+/// EOPNOTSUPP, then the handle must be the caller's), then prepares the
+/// sigs (`nouveau_job_fence_attach_prepare`: an unknown type is EINVAL,
+/// then the handle), all before anything is submitted or bound. This
+/// driver took any type it did not know for a binary syncobj, and looked
+/// the sigs up before the waits.
+#[test]
+fn a_sync_of_an_unknown_type_is_refused_before_anything_runs() {
+    let _g = LOCK.lock();
+    let _live = LiveBytes::hold();
+    let gpu = gpu_rm_fast();
+    let ch = client_with_pushbuf(&gpu, A);
+    let ready = syncobj::create(false);
+    assert!(syncobj::signal(ready));
+    let out = syncobj::create(false);
+    let typed = |handle: u32, flags: u32| nv::DrmNouveauSync {
+        flags,
+        handle,
+        timeline_value: 0,
+    };
+    const STRANGER_HANDLE: u32 = 0xdead_0006;
+    assert_eq!(syncobj::query(STRANGER_HANDLE), None);
+    let p = [push(PUSH_VA, 16)];
+    // A first submission brings the direct-submit channel up.
+    assert_eq!(exec(&gpu, A, ch, &p, &[], &[]), Ok(0));
+    let c = chan(1);
+    assert!(!run_gpu(1).is_empty(), "the push");
+    let before = userd(&c);
+    // A wait of type 2 is EOPNOTSUPP, signaled or not; a sig of type 2
+    // is EINVAL.
+    assert_eq!(
+        exec(&gpu, A, ch, &p, &[typed(ready, 2)], &[sync(out)]),
+        Err(nv::EOPNOTSUPP)
+    );
+    assert_eq!(
+        exec(&gpu, A, ch, &p, &[sync(ready)], &[typed(out, 2)]),
+        Err(nv::EINVAL)
+    );
+    // The type before the handle, and the waits before the sigs.
+    assert_eq!(
+        exec(&gpu, A, ch, &p, &[typed(STRANGER_HANDLE, 2)], &[]),
+        Err(nv::EOPNOTSUPP)
+    );
+    assert_eq!(
+        exec(&gpu, A, ch, &p, &[sync(STRANGER_HANDLE)], &[typed(out, 2)]),
+        Err(nv::ENOENT)
+    );
+    assert_eq!(
+        exec(
+            &gpu,
+            A,
+            ch,
+            &p,
+            &[typed(ready, 2)],
+            &[sync(STRANGER_HANDLE)]
+        ),
+        Err(nv::EOPNOTSUPP)
+    );
+    assert_eq!(userd(&c), before, "nothing went onto the ring");
+    assert_eq!(run_gpu(1), [] as [Fetched; 0]);
+    assert_eq!(syncobj::query_submitted(out), Some(0));
+    // Bits outside the type nibble are not the type: binary syncobjs.
+    assert_eq!(
+        exec(&gpu, A, ch, &p, &[typed(ready, 0x10)], &[typed(out, 0x20)]),
+        Ok(0)
+    );
+    assert_eq!(run_gpu(1).len(), 2, "the push and its fence");
+    assert_eq!(syncobj::query(out), Some(1));
+    // VM_BIND runs the same job code.
+    let ha = gem_new_rm(&gpu, 65536, nv::NOUVEAU_GEM_DOMAIN_GART, A)
+        .unwrap()
+        .handle;
+    const VA: u64 = 0x7f_3000_0000;
+    let bound = driver_maps(&gpu, A).len();
+    let tl = syncobj::create(false);
+    let async_bind = |waits: &[nv::DrmNouveauSync], sigs: &[nv::DrmNouveauSync]| {
+        vm_bind_sync(
+            &gpu,
+            A,
+            &mut [map(ha, VA, 65536)],
+            nv::VM_BIND_RUN_ASYNC,
+            waits,
+            sigs,
+        )
+    };
+    assert_eq!(
+        async_bind(&[typed(ready, 2)], &[sync_tl(tl, 1)]),
+        Err(nv::EOPNOTSUPP)
+    );
+    assert_eq!(async_bind(&[sync(ready)], &[typed(tl, 3)]), Err(nv::EINVAL));
+    assert_eq!(
+        async_bind(&[sync(STRANGER_HANDLE)], &[typed(tl, 3)]),
+        Err(nv::ENOENT)
+    );
+    assert_eq!(driver_maps(&gpu, A).len(), bound, "nothing was bound");
+    assert_eq!(syncobj::query(tl), Some(0));
+    assert_eq!(async_bind(&[typed(ready, 0x10)], &[sync_tl(tl, 1)]), Ok(0));
+    assert_eq!(driver_maps(&gpu, A).len(), bound + 1);
+    assert_eq!(syncobj::query(tl), Some(1));
+    for h in [ready, out, tl] {
+        assert!(syncobj::destroy(h));
+    }
+    gpu.nouveau_release_process(A);
+    assert_eq!(FAKE_RM.lock().bad, 0);
+}
+
 #[test]
 fn exec_with_an_unknown_sig_syncobj_queues_nothing_and_signals_nothing() {
     let _g = LOCK.lock();
