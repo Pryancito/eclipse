@@ -4192,8 +4192,23 @@ pub fn scanout_region_checked(
         // way (see its `(fw, fh)`); this call site did not, even though the
         // cache invalidate right above it already used the clipped pair.
         blit_cursor_patch(
-            &*display, pixels, src_stride, fb_width, fb_height, cx, cy, cw, ch, cx, cy, cw, ch,
+            &*display,
+            pixels,
+            src_stride,
+            fb_width,
+            fb_height,
+            cx,
+            cy,
+            cw,
+            ch,
+            cx,
+            cy,
+            cw,
+            ch,
             &bmp,
+            // Only what this present copied is the buffer's; a damage box leaves
+            // the rest of the panel on an older frame.
+            Some((blit_x, blit_y, blit_w, blit_h)),
         );
         // The pointer is now ON the panel in those rows, which is not what the
         // frame's pixels say, so the bands it covers must be copied again next
@@ -4525,6 +4540,9 @@ fn composite_cursor_after_driver_flip(fb_id: u32) -> bool {
     }
     blit_cursor_patch(
         &*display, pixels, src_stride, fw, fh, nx, ny, nw, nh, nx, ny, nw, nh, &bmp,
+        // The driver is scanning out the client's own surface, so the buffer IS
+        // the panel everywhere and there is nothing the save could improve on.
+        None,
     );
     true
 }
@@ -4783,8 +4801,13 @@ pub fn repaint_for_cursor() {
             let (ux, uy, uw, uh) = union_i32(ox, oy, ow, oh, *nx, *ny, *nw, *nh);
             if rects_overlap(ox, oy, ow, oh, *nx, *ny, *nw, *nh) {
                 sync_rect(ux, uy, uw, uh);
+                // `None`: this is the fallback for a panel that cannot be read
+                // back, or the `drm.cursor_from_client` hatch. The client's
+                // buffer is all there is to compose over -- which is the defect
+                // [`repaint_cursor_from_panel`] exists to avoid.
                 blit_cursor_patch(
                     &*display, pixels, src_stride, fw, fh, ux, uy, uw, uh, *nx, *ny, *nw, *nh, bmp,
+                    None,
                 );
             } else {
                 sync_rect(ox, oy, ow, oh);
@@ -4792,7 +4815,7 @@ pub fn repaint_for_cursor() {
                 sync_rect(*nx, *ny, *nw, *nh);
                 blit_cursor_patch(
                     &*display, pixels, src_stride, fw, fh, *nx, *ny, *nw, *nh, *nx, *ny, *nw, *nh,
-                    bmp,
+                    bmp, None,
                 );
             }
         }
@@ -4804,6 +4827,7 @@ pub fn repaint_for_cursor() {
             sync_rect(*nx, *ny, *nw, *nh);
             blit_cursor_patch(
                 &*display, pixels, src_stride, fw, fh, *nx, *ny, *nw, *nh, *nx, *ny, *nw, *nh, bmp,
+                None,
             );
         }
         (None, None) => {}
@@ -4863,6 +4887,7 @@ fn blit_cursor_patch(
     cw: u32,
     ch: u32,
     bmp: &[u32],
+    copied: Option<(u32, u32, u32, u32)>,
 ) {
     if src_stride == 0 || pw == 0 || ph == 0 {
         return;
@@ -4881,30 +4906,88 @@ fn blit_cursor_patch(
     if tw_u == 0 {
         return;
     }
+    // Everything the pointer was drawn into, which is wider than what this
+    // framebuffer covers when the client's is smaller than the mode. Asked before
+    // `CURSOR_PATCH` is taken so the two locks keep their order (PATCH then
+    // UNDER): this call holds only UNDER.
+    let (x0, y0, tw_u, wide_rows) = match widen_window_to_what_was_drawn(
+        (x0, y0.max(0) as u32, tw_u as usize, (y1 - y0) as usize),
+        (cx, cy, cw, ch),
+        copied,
+        dinfo.pitch() / 4,
+        dinfo.height,
+    ) {
+        Some((sx, sy, sw, sh)) => {
+            #[cfg(test)]
+            CURSOR_WINDOWS_WIDENED.fetch_add(1, Ordering::Relaxed);
+            (sx, sy as i32, sw as u32, Some(sh))
+        }
+        None => (x0, y0, tw_u, None),
+    };
     let x0 = x0 as i32;
     let tw = tw_u as usize;
-    let th = (y1 - y0) as usize;
+    let th = wide_rows.unwrap_or((y1 - y0) as usize);
     let need = tw.saturating_mul(th);
     let mut slot = CURSOR_PATCH.lock();
     if slot.len() < need {
         slot.resize(need, 0);
     }
     let patch = &mut slot[..need];
-    // Rows actually sourced from the framebuffer. CURSOR_PATCH is scratch
-    // REUSED across moves, so a row the source could not fill still holds the
-    // previous patch's pixels — blitting `th` rows unconditionally would paint
-    // that onto the screen as a stale square. Blit only what was filled.
+    // The background the pointer goes on top of, from two sources chosen by
+    // geometry and not by trust -- [`patch_outside_copy_from_save`] says why. The
+    // save goes first, for the whole window, so the buffer only has to fill the
+    // part this present made the panel equal to it.
+    let from_save = match copied {
+        Some(rect) => patch_outside_copy_from_save(
+            patch,
+            (x0 as u32, y0 as u32, tw, th),
+            (cx, cy, cw, ch),
+            rect,
+        ),
+        None => 0,
+    };
+    #[cfg(test)]
+    CURSOR_PX_FROM_SAVE.store(from_save, Ordering::Relaxed);
+    // Rows actually sourced. CURSOR_PATCH is scratch REUSED across moves, so a row
+    // nothing could fill still holds the previous patch's pixels -- blitting `th`
+    // rows unconditionally would paint that onto the screen as a stale square.
     let mut rows = 0usize;
-    for r in 0..th {
-        let src_y = y0 as usize + r;
-        let src_off = src_y.saturating_mul(src_stride).saturating_add(x0 as usize);
-        let dst_off = r * tw;
-        let n = tw.min(pixels.len().saturating_sub(src_off));
-        if n < tw {
-            break;
+    if from_save > 0 {
+        // The save filled every pixel outside the copied rectangle, and the
+        // rectangle itself is inside what the framebuffer covers, so the whole
+        // window has its background and only its copied part comes from the
+        // buffer.
+        rows = th;
+        let (rx, ry, rw, rh) = copied.expect("from_save > 0 needs a copied rect");
+        let bx0 = rx.max(x0 as u32);
+        let bx1 = (rx + rw).min(x0 as u32 + tw as u32);
+        let by0 = ry.max(y0 as u32);
+        let by1 = (ry + rh).min(y0 as u32 + th as u32);
+        for y in by0..by1 {
+            let src_off = (y as usize)
+                .saturating_mul(src_stride)
+                .saturating_add(bx0 as usize);
+            let n = (bx1.saturating_sub(bx0) as usize)
+                .min(src_stride.saturating_sub(bx0 as usize))
+                .min(pixels.len().saturating_sub(src_off));
+            if n == 0 {
+                continue;
+            }
+            let dst_off = (y - y0 as u32) as usize * tw + (bx0 - x0 as u32) as usize;
+            patch[dst_off..dst_off + n].copy_from_slice(&pixels[src_off..src_off + n]);
         }
-        rows = r + 1;
-        patch[dst_off..dst_off + n].copy_from_slice(&pixels[src_off..src_off + n]);
+    } else {
+        for r in 0..th {
+            let src_y = y0 as usize + r;
+            let src_off = src_y.saturating_mul(src_stride).saturating_add(x0 as usize);
+            let dst_off = r * tw;
+            let n = tw.min(pixels.len().saturating_sub(src_off));
+            if n < tw {
+                break;
+            }
+            rows = r + 1;
+            patch[dst_off..dst_off + n].copy_from_slice(&pixels[src_off..src_off + n]);
+        }
     }
     if rows == 0 {
         // Nothing was drawn, so nothing is covered. Said explicitly because a
@@ -4995,6 +5078,183 @@ fn blend_cursor_into(
 
 /// Remember `px` as the panel pixels the pointer at `cursor` is covering. See
 /// [`CursorUnder`].
+/// Widen the window a present is about to compose the pointer over, so it covers
+/// everything the pointer was actually DRAWN into.
+///
+/// A present clips the window to what the CLIENT'S FRAMEBUFFER covers (`fw`/`fh`),
+/// because reading past the end of a source row would paint the next row's pixels
+/// onto the screen. A pointer move clips to the PANEL instead, which is wider
+/// whenever the client's framebuffer is smaller than the mode. So a pointer
+/// straddling that edge was drawn wide by the move and then composed narrow by the
+/// next present: the part outside the narrow window stayed on the panel, and
+/// `save_cursor_under` then recorded only the narrow window, so the next erase put
+/// back the narrow part and **left the rest of the pointer on the screen for
+/// good**.
+///
+/// The save's own window is the answer, and refusing anything else is what makes it
+/// safe:
+/// - it has to be for **this very cursor rect**, so the part of it this present
+///   copied is exactly the part the composite is about to write again;
+/// - it has to **contain** the narrow window, or widening would drop rows the
+///   composite needs;
+/// - it has to fit inside the panel's scanline and height, so the widened window
+///   is one this display can be written and read at.
+///
+/// Whatever it adds lies outside what the present copied, so
+/// [`patch_outside_copy_from_save`] fills exactly that part from the save -- which
+/// is why the two functions insist on the same window.
+///
+/// Found by the smaller-than-the-mode steps of
+/// `three_hundred_steps_of_desktop_never_leave_anything_but_the_frame_and_the_pointer`,
+/// and the named case is
+/// `a_pointer_past_the_edge_of_a_narrow_framebuffer_must_still_come_off`.
+///
+/// Three of the four refusals survive every mutation, and stay anyway. A cursor
+/// position is only ever saved by the WIDEST window drawn at it -- the position
+/// changes only through a cursor ioctl, and that ioctl repaints against the panel
+/// -- so today a save for this cursor can be neither narrower than the window nor
+/// outside the panel, and the move path can never reach a wider save. They are the
+/// bounds check on the slice indexing that follows, so the day one of those
+/// invariants moves they are the difference between a refusal and reading past the
+/// end of a row.
+fn widen_window_to_what_was_drawn(
+    window: (u32, u32, usize, usize),
+    cursor: (i32, i32, u32, u32),
+    copied: Option<(u32, u32, u32, u32)>,
+    panel_pitch_px: u32,
+    panel_h: u32,
+) -> Option<(u32, u32, usize, usize)> {
+    let (wx, wy, tw, th) = window;
+    // Only a present can widen: what it adds lies outside the rectangle it
+    // copied, so it is the save that fills it. With no such rectangle (a pointer
+    // move, or a driver flip where the buffer IS the panel) there is nothing to
+    // fill the extra columns with, and a wider window would just read past the
+    // end of a source row.
+    copied?;
+    let u = CURSOR_UNDER.lock();
+    if u.for_cursor != Some(cursor) {
+        return None;
+    }
+    let (sx, sy, sw, sh) = u.rect?;
+    if sx > wx || sy > wy || sx + sw < wx + tw as u32 || sy + sh < wy + th as u32 {
+        return None;
+    }
+    // The panel's own scanline and height, not the image's: the widened window is
+    // written to and read from the PANEL, and the whole point is that it reaches
+    // past what the client's framebuffer covers.
+    if sx + sw > panel_pitch_px || sy + sh > panel_h {
+        return None;
+    }
+    if (sx, sy, sw as usize, sh as usize) == window {
+        // Every present on a client whose framebuffer is as big as the mode --
+        // said as "nothing to do" rather than returning the same window, so the
+        // caller's counter means "this really widened".
+        return None;
+    }
+    if u.px.len() < (sw as usize).saturating_mul(sh as usize) {
+        return None;
+    }
+    Some((sx, sy, sw as usize, sh as usize))
+}
+
+/// Composites whose window had to be widened to cover what the pointer was drawn
+/// into, so a test can tell the fix ran from the panel happening to be right.
+#[cfg(test)]
+static CURSOR_WINDOWS_WIDENED: AtomicUsize = AtomicUsize::new(0);
+
+/// How many composites have widened their window since the last reset.
+#[cfg(test)]
+pub(crate) fn cursor_windows_widened_for_test() -> usize {
+    CURSOR_WINDOWS_WIDENED.load(Ordering::Relaxed)
+}
+
+/// Put back, from what the pointer was saved over, the part of `patch` that
+/// lies OUTSIDE the rectangle a present has just copied to the panel.
+///
+/// The pointer is composited on top of a present, and it composites over a
+/// window widened to whole write-combining lines -- so its window routinely
+/// reaches past a damage box. Inside the box, the client's buffer and the panel
+/// hold the same pixels and reading the buffer is free and right. OUTSIDE it
+/// they do not: the panel holds the frame that was there before, and the buffer
+/// holds whatever the client has in it now, which for a compositor that redraws
+/// only its damage is an OLDER frame and for one that has begun the next frame
+/// is transparent black. Taking the buffer's pixels there writes onto the screen
+/// a rectangle of a frame the client never declared -- the same defect
+/// [`CursorUnder`] documents on the pointer-move side, reached through the
+/// present instead.
+///
+/// The save is the right source because it is the panel's own pixels from before
+/// the pointer went on top of them, taken by the blit that drew it, and outside
+/// the box nothing has touched them since. No aperture read: both sources are
+/// sysmem.
+///
+/// Refuses unless the save describes EXACTLY this window and this cursor, and
+/// then the caller keeps the pixels it already has -- no worse than before this
+/// existed. Returns how many pixels it replaced, so a test can tell "the save
+/// was used" from "the save happened to agree".
+///
+/// Found by the damage-box steps of
+/// `three_hundred_steps_of_desktop_never_leave_anything_but_the_frame_and_the_pointer`.
+fn patch_outside_copy_from_save(
+    patch: &mut [u32],
+    window: (u32, u32, usize, usize),
+    cursor: (i32, i32, u32, u32),
+    copied: (u32, u32, u32, u32),
+) -> usize {
+    let (wx, wy, tw, rows) = window;
+    if tw == 0 || rows == 0 || patch.len() < tw * rows {
+        return 0;
+    }
+    let u = CURSOR_UNDER.lock();
+    // `u.rect` is what decides: it is the window the save was taken over, and
+    // the save's pixels are that window's background from before any pointer
+    // went on top of it, so a save whose window is this one is the right source
+    // wherever this present did not copy.
+    //
+    // The `for_cursor` half is a second line of defence, and dropping it is a
+    // mutation nothing here can kill -- said out loud so the next person does
+    // not go hunting for the test. Two pointer positions inside the same
+    // write-combining line share a window, and the background of that window is
+    // the same pixels for both, so the two checks agree on every case these
+    // tests can build. It stays because `u.rect` alone would also accept a save
+    // whose window still matches after something else repainted the panel, and
+    // the price of keeping it is one comparison.
+    if u.rect != Some((wx, wy, tw as u32, rows as u32)) || u.for_cursor != Some(cursor) {
+        return 0;
+    }
+    if u.px.len() < tw * rows {
+        return 0;
+    }
+    let (cx0, cy0, cw0, ch0) = copied;
+    let (cx1, cy1) = (cx0.saturating_add(cw0), cy0.saturating_add(ch0));
+    let mut n = 0;
+    for r in 0..rows {
+        let y = wy + r as u32;
+        let row_outside = y < cy0 || y >= cy1;
+        for i in 0..tw {
+            let x = wx + i as u32;
+            if row_outside || x < cx0 || x >= cx1 {
+                patch[r * tw + i] = u.px[r * tw + i];
+                n += 1;
+            }
+        }
+    }
+    n
+}
+
+/// Pixels the most recent cursor composite took from the save instead of from
+/// the client's framebuffer, so a test can assert the source and not just the
+/// result.
+#[cfg(test)]
+static CURSOR_PX_FROM_SAVE: AtomicUsize = AtomicUsize::new(0);
+
+/// Pixels the last cursor composite took from the save rather than the client's
+/// buffer.
+#[cfg(test)]
+pub(crate) fn cursor_px_from_save_for_test() -> usize {
+    CURSOR_PX_FROM_SAVE.load(Ordering::Relaxed)
+}
+
 fn save_cursor_under(window: (u32, u32, usize, usize), px: &[u32], cursor: (i32, i32, u32, u32)) {
     let (x, y, tw, rows) = window;
     let mut u = CURSOR_UNDER.lock();
@@ -6855,6 +7115,7 @@ pub(crate) fn reset_output_state_for_test() {
     // hash would make a later test's present skip a band for a reason that has
     // nothing to do with what it is testing.
     set_present_skip_enabled(false);
+    CURSOR_WINDOWS_WIDENED.store(0, Ordering::Relaxed);
     SKIP_BANDS_SKIPPED.store(0, Ordering::Relaxed);
     SKIP_PRESENTS.store(0, Ordering::Relaxed);
     REPAIR_ROUNDS_RUN.store(0, Ordering::Relaxed);
