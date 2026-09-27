@@ -435,12 +435,42 @@ impl SharedLegacyIrqHandler {
             PciReg16::Command,
             cfg.read16(PciReg16::Command) | PCIE_CFG_COMMAND_INT_DISABLE,
         );
-        let mut device_handler = self.device_handler.lock();
-        device_handler.retain(|h| Arc::ptr_eq(h, &device));
-        if device_handler.is_empty() {
-            interrupt::mask_irq(self.irq_id).unwrap();
-        }
+        let left = {
+            let mut device_handler = self.device_handler.lock();
+            let left = take_out(&mut device_handler, &device);
+            if device_handler.is_empty() {
+                interrupt::mask_irq(self.irq_id).unwrap();
+            }
+            left
+        };
+        // The devices that left are dropped with the list's lock released:
+        // `handle()` takes each device's own `inner` under it, so running a
+        // device's `Drop` in there is a lock nest this module does not control.
+        drop(left);
     }
+}
+
+/// Take `victim` out of `list`, answering whatever left it.
+///
+/// Generic over the element so a test can exercise the predicate without a PCI
+/// device and its config space. `remove_device` had this as
+/// `retain(|h| Arc::ptr_eq(h, &device))`, which is `retain`'s condition the
+/// wrong way round: it **kept** the device being removed and threw out every
+/// other device on the same legacy IRQ line. So the line's handler kept calling
+/// the device that had just asked to leave, and the devices that had said
+/// nothing stopped being called at all -- and if the victim was not in the list,
+/// the list came out empty and `remove_device` masked the IRQ for everyone.
+fn take_out<T>(list: &mut Vec<Arc<T>>, victim: &Arc<T>) -> Vec<Arc<T>> {
+    let mut left = Vec::new();
+    list.retain(|item| {
+        if Arc::ptr_eq(item, victim) {
+            left.push(item.clone());
+            false
+        } else {
+            true
+        }
+    });
+    left
 }
 
 numeric_enum! {
@@ -2793,5 +2823,46 @@ mod pci_bar_and_config_tests {
         // nobody, which is what it did before for a live bridge that was not
         // an upstream.
         assert!(dev.inner.lock().upstream.upgrade().is_none());
+    }
+    /// `remove_device` was `retain(|h| Arc::ptr_eq(h, &device))`, which is
+    /// `retain`'s condition inverted: it kept the device being removed and threw
+    /// out every other device sharing that legacy IRQ line. On hardware with two
+    /// devices on one line, moving one of them to MSI stopped the other's
+    /// interrupts for good, silently; and removing a device that was not in the
+    /// list left the list empty, which makes `remove_device` mask the line for
+    /// everyone.
+    #[test]
+    fn taking_one_device_out_leaves_the_others_on_the_line() {
+        let a = Arc::new(1u32);
+        let b = Arc::new(2u32);
+        let c = Arc::new(3u32);
+        let mut list = vec![a.clone(), b.clone(), c.clone()];
+
+        let left = take_out(&mut list, &b);
+
+        assert_eq!(left.len(), 1, "only the named device leaves");
+        assert!(Arc::ptr_eq(&left[0], &b));
+        assert_eq!(list.len(), 2, "the others stay on the line");
+        assert!(Arc::ptr_eq(&list[0], &a));
+        assert!(Arc::ptr_eq(&list[1], &c));
+    }
+
+    /// And the list is matched by identity, not by value: two devices whose
+    /// contents compare equal are still two devices.
+    #[test]
+    fn a_device_that_is_not_on_the_line_takes_nobody_with_it() {
+        let a = Arc::new(7u32);
+        let same_value_other_device = Arc::new(7u32);
+        let mut list = vec![a.clone()];
+
+        let left = take_out(&mut list, &same_value_other_device);
+
+        assert!(left.is_empty());
+        assert_eq!(
+            list.len(),
+            1,
+            "a device that was never added must not empty the line, \
+             because an empty line gets its IRQ masked"
+        );
     }
 }
