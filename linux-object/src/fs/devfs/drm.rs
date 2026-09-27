@@ -1534,6 +1534,13 @@ pub fn cpu_prep_fences(gem_handle: u32, owner_pid: u64) -> Vec<(usize, u32)> {
 /// [`DrmFileState`] via [`super::drm_scheme::DrmDev::open_client`].
 pub struct DrmFileState {
     atomic_client: AtomicBool,
+    /// `drm_file.universal_planes`: set by `DRM_CLIENT_CAP_UNIVERSAL_PLANES`,
+    /// and by `DRM_CLIENT_CAP_ATOMIC` together with `atomic_client`. Until a
+    /// client sets it, `GETPLANERESOURCES` lists only overlay planes, as
+    /// `drm_mode_getplane_res` does: a legacy client was written when the
+    /// primary and the cursor were not planes, and would drive them as
+    /// overlays.
+    universal_planes: AtomicBool,
     events: Mutex<VecDeque<Vec<u8>>>,
     eventbus: Arc<Mutex<EventBus>>,
     /// The nouveau GEM handles this open imported through `PRIME_FD_TO_HANDLE`
@@ -1547,6 +1554,7 @@ impl DrmFileState {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
             atomic_client: AtomicBool::new(false),
+            universal_planes: AtomicBool::new(false),
             events: Mutex::new(VecDeque::new()),
             eventbus: EventBus::new(),
             prime_imports: Mutex::new(Vec::new()),
@@ -1587,6 +1595,14 @@ impl DrmFileState {
 
     pub fn atomic_client(&self) -> bool {
         self.atomic_client.load(Ordering::Relaxed)
+    }
+
+    pub fn set_universal_planes(&self, on: bool) {
+        self.universal_planes.store(on, Ordering::Relaxed);
+    }
+
+    pub fn universal_planes(&self) -> bool {
+        self.universal_planes.load(Ordering::Relaxed)
     }
 
     pub fn eventbus(&self) -> Arc<Mutex<EventBus>> {
