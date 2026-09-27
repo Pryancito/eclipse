@@ -1307,13 +1307,15 @@ impl DrmDev {
                 // Our software-KMS `rmfb` already only drops the fb object —
                 // scanout keeps showing the last blitted frame until the next
                 // present — which is exactly CLOSEFB's "close without
-                // disabling" contract. Reject unknown ids like Linux (EINVAL
-                // via DeviceError is close enough for wlroots' fallback).
+                // disabling" contract. An id that is not the caller's is
+                // ENOENT, as in `drm_mode_closefb_ioctl` (the lookup and the
+                // "is it in this file's list" check both answer that) and as
+                // RMFB above already did; this arm said EINVAL.
                 let fb_id = unsafe { *(data as *const u32) };
                 if drm::rmfb_for(fb_id, drm::current_pid()) {
                     Ok(0)
                 } else {
-                    Err(FsError::InvalidParam)
+                    Err(FsError::EntryNotFound)
                 }
             }
             DRM_IOCTL_MODE_MAP_DUMB => {
@@ -1494,6 +1496,13 @@ impl DrmDev {
                 // Primary-plane update: present immediately on the target CRTC.
                 // fb_id == 0 disables the plane, which we treat as a no-op.
                 let req = unsafe { *(data as *const DrmModeSetPlane) };
+                // `drm_mode_setplane` looks the plane up before anything else
+                // and answers ENOENT for one that does not exist. The id was
+                // not read at all, so a stale or invented plane id presented
+                // the fb on the CRTC as if it named the primary plane.
+                if drm::get_plane(req.plane_id).is_none() {
+                    return Err(FsError::EntryNotFound);
+                }
                 if req.fb_id != 0 {
                     if let Err(e) = drm::present_now_checked(req.fb_id, req.crtc_id, None) {
                         present_failed("SETPLANE", req.fb_id, req.crtc_id, e)?;
@@ -1666,6 +1675,13 @@ impl DrmDev {
                 Ok(0)
             }
             DRM_IOCTL_MODE_GETGAMMA | DRM_IOCTL_MODE_SETGAMMA => {
+                // `struct drm_mode_crtc_lut` starts with `crtc_id`; both
+                // `drm_mode_gamma_{get,set}_ioctl` look it up first and answer
+                // ENOENT for a CRTC that does not exist.
+                let crtc_id = unsafe { *(data as *const u32) };
+                if drm::get_crtc(crtc_id).is_none() {
+                    return Err(FsError::EntryNotFound);
+                }
                 // No programmable gamma on the software scanout: accept and
                 // ignore. (Get leaves the caller's ramp buffers untouched, which
                 // Xorg treats as the identity it will "restore" on exit — a
@@ -1685,6 +1701,14 @@ impl DrmDev {
                 // The software scanout has no programmable object state, so
                 // accept and ignore rather than failing the client's modeset.
                 let req = unsafe { *(data as *const DrmModeObjSetProperty) };
+                // `drm_mode_obj_set_property_ioctl`: an object that does not
+                // exist is ENOENT, and so is a property id that does not. This
+                // arm accepted both, so a write to an object the client never
+                // got from GETRESOURCES, or with a property id it made up, was
+                // reported as done.
+                if !mode_object_exists(req.obj_id) || prop_spec(req.prop_id).is_none() {
+                    return Err(FsError::EntryNotFound);
+                }
                 // Same DPMS handling as the connector-specific setter above:
                 // `drm_mode_obj_set_property_ioctl` funnels into the very same
                 // `drm_mode_connector_set_obj_prop`.
@@ -1714,6 +1738,12 @@ impl DrmDev {
                         *(data.wrapping_add(12) as *const u32),
                     )
                 };
+                // `drm_connector_property_set_ioctl` is the OBJ_SETPROPERTY
+                // above with the type fixed to connector: an unknown
+                // connector or property id is ENOENT.
+                if drm::get_connector(connector_id).is_none() || prop_spec(prop_id).is_none() {
+                    return Err(FsError::EntryNotFound);
+                }
                 // DPMS is the one legacy connector property with an effect
                 // here. Linux routes it through `connector->funcs->dpms`,
                 // which disables the CRTC for anything but "On"; the other
@@ -1760,6 +1790,13 @@ impl DrmDev {
                 const DRM_MODE_CURSOR_BO: u32 = 0x01;
                 const DRM_MODE_CURSOR_MOVE: u32 = 0x02;
                 let cur = unsafe { &*(data as *const DrmModeCursor) };
+                // `drm_mode_cursor_common` finds the CRTC before it reads the
+                // flags: "Unknown CRTC ID" is ENOENT. The id was not looked
+                // at, so a cursor aimed at a CRTC that does not exist moved the
+                // one that does.
+                if drm::get_crtc(cur.crtc_id).is_none() {
+                    return Err(FsError::EntryNotFound);
+                }
                 let mut changed = false;
                 if cur.flags & DRM_MODE_CURSOR_BO != 0 {
                     // Linux: a cursor larger than DRM_CAP_CURSOR_WIDTH/HEIGHT
@@ -1994,16 +2031,23 @@ impl DrmDev {
                     // trace: a retry loop on a refused id must not storm klog.
                     if wsi_trace_take() {
                         kernel_hal::klog_info!(
-                            "[drm-wsi] GETCONNECTOR id={} -> NOT FOUND (EINVAL)",
+                            "[drm-wsi] GETCONNECTOR id={} -> NOT FOUND (ENOENT)",
                             conn_res.connector_id
                         );
                     }
-                    Err(FsError::InvalidParam)
+                    // ENOENT, as `drm_mode_getconnector`'s lookup answers.
+                    Err(FsError::EntryNotFound)
                 }
             }
             DRM_IOCTL_MODE_GETENCODER => {
                 let enc = unsafe { &mut *(data as *mut DrmModeGetEncoder) };
-                enc.encoder_id = drm::SYNTH_ENCODER_ID;
+                // There is one encoder, the synthetic one GETRESOURCES and
+                // GETCONNECTOR name; `drm_mode_getencoder` answers ENOENT for
+                // any other id. This arm answered every id with that encoder,
+                // rewriting the id the client asked about.
+                if enc.encoder_id != drm::SYNTH_ENCODER_ID {
+                    return Err(FsError::EntryNotFound);
+                }
                 // DRM_MODE_ENCODER_VIRTUAL=6: correct type for a software/
                 // virtual encoder that drives a dumb-buffer scanout path.
                 // Reporting NONE(0) causes some compositors to skip property
@@ -2046,11 +2090,12 @@ impl DrmDev {
                 } else {
                     if wsi_trace_take() {
                         kernel_hal::klog_info!(
-                            "[drm-wsi] GETCRTC id={} -> NOT FOUND (EINVAL)",
+                            "[drm-wsi] GETCRTC id={} -> NOT FOUND (ENOENT)",
                             crtc_res.crtc_id
                         );
                     }
-                    Err(FsError::InvalidParam)
+                    // ENOENT, as `drm_mode_getcrtc`'s lookup answers.
+                    Err(FsError::EntryNotFound)
                 }
             }
             DRM_IOCTL_MODE_GETPLANERESOURCES => {
@@ -2093,11 +2138,12 @@ impl DrmDev {
                 } else {
                     if wsi_trace_take() {
                         kernel_hal::klog_info!(
-                            "[drm-wsi] GETPLANE id={} -> NOT FOUND (EINVAL)",
+                            "[drm-wsi] GETPLANE id={} -> NOT FOUND (ENOENT)",
                             res.plane_id
                         );
                     }
-                    Err(FsError::InvalidParam)
+                    // ENOENT, as `drm_mode_getplane`'s lookup answers.
+                    Err(FsError::EntryNotFound)
                 }
             }
             DRM_IOCTL_MODE_OBJ_GETPROPERTIES => {
@@ -2117,12 +2163,18 @@ impl DrmDev {
                     crtc_props(atomic)
                 } else if drm::get_connector(res.obj_id).is_some() {
                     connector_props(res.obj_id, atomic)
-                } else {
-                    // Encoders exist but carry no properties; anything
-                    // else is unknown. Keep the historical empty-list
-                    // answer (Linux: EINVAL/ENOENT) — some clients probe
-                    // every id returned by GETRESOURCES.
+                } else if res.obj_id == drm::SYNTH_ENCODER_ID {
+                    // The encoder exists but carries no properties. Linux
+                    // answers EINVAL for an object without a property list;
+                    // keep the historical empty list, since GETRESOURCES
+                    // names this id and some clients probe every id it
+                    // returns.
                     alloc::vec::Vec::new()
+                } else {
+                    // Anything else is no object at all: ENOENT, as
+                    // `drm_mode_obj_get_properties_ioctl`'s lookup answers.
+                    // This used to be the same empty list as the encoder's.
+                    return Err(FsError::EntryNotFound);
                 };
                 let n = props.len();
                 // Both output arrays are written below, so both pointers must be
@@ -2238,10 +2290,14 @@ impl DrmDev {
                         res.length = edid.len() as u32;
                         Ok(0)
                     } else {
-                        Err(FsError::InvalidParam)
+                        // The connector has no EDID, so no blob carries this
+                        // id: ENOENT, as `drm_property_lookup_blob` answers.
+                        Err(FsError::EntryNotFound)
                     }
                 } else {
-                    Err(FsError::InvalidParam)
+                    // No blob carries this id: ENOENT, as
+                    // `drm_property_lookup_blob` answers. Both were EINVAL.
+                    Err(FsError::EntryNotFound)
                 }
             }
             DRM_IOCTL_MODE_CREATEPROPBLOB => {
@@ -4543,6 +4599,16 @@ struct PropSpec {
 /// The property table of the synthetic pipeline. Names, types and ranges
 /// match Linux's standard properties (`drm_mode_create_standard_properties`,
 /// `drm_plane_create_*`, `drm_connector_create_standard_properties`).
+/// Whether `id` names a mode object a client can set a property on: a plane,
+/// a CRTC, a connector or the one encoder. What `drm_mode_object_get` with
+/// `DRM_MODE_OBJECT_ANY` finds.
+fn mode_object_exists(id: u32) -> bool {
+    id == drm::SYNTH_ENCODER_ID
+        || drm::get_plane(id).is_some()
+        || drm::get_crtc(id).is_some()
+        || drm::get_connector(id).is_some()
+}
+
 fn prop_spec(prop_id: u32) -> Option<PropSpec> {
     Some(match prop_id {
         PROP_TYPE => PropSpec {
@@ -11616,6 +11682,165 @@ mod hw_kms_tests {
 
         assert_eq!(drm::get_connector_edid(41), Some(completed));
         drop(gpu);
+    }
+
+    /// A zeroed ioctl argument, for the arms whose structs have no
+    /// `Default`. All of them are `repr(C)` integers, for which zero is a
+    /// value.
+    fn zeroed<T: Copy>() -> T {
+        // SAFETY: every struct this is used for is plain integers.
+        unsafe { core::mem::zeroed() }
+    }
+
+    /// Every mode-object lookup Linux answers ENOENT for an id that does not
+    /// exist (`drm_mode_object_find` and its typed wrappers), and the one
+    /// encoder is the only encoder. Here GETCRTC, GETPLANE, GETCONNECTOR,
+    /// GETPROPBLOB and CLOSEFB said EINVAL; GETENCODER answered any id with
+    /// the synthetic encoder and rewrote the id; OBJ_GETPROPERTIES gave an
+    /// unknown id the encoder's empty list; and SETPLANE, CURSOR, the gamma
+    /// pair, OBJ_SETPROPERTY and SETPROPERTY never looked the object up at
+    /// all and reported success. The ids the client really has keep
+    /// working.
+    #[test]
+    fn unknown_mode_object_ids_answer_enoent_like_linux() {
+        let screen = kms_emu::attach(32, 8);
+        let _gpu = screen.attach_gpu(EmuGpu::hardware_kms("emu-gpu").with_ids(60, 61, 62));
+        let c = Client::open(0);
+        const BOGUS: u32 = 4242;
+        let enoent = Err(FsError::EntryNotFound);
+
+        // GETCRTC / GETPLANE / GETCONNECTOR: the typed lookups.
+        let mut crtc: DrmModeGetCrtc = zeroed();
+        crtc.crtc_id = BOGUS;
+        assert_eq!(c.ioctl(DRM_IOCTL_MODE_GETCRTC, &mut crtc), enoent);
+        crtc.crtc_id = 60;
+        assert_eq!(c.ioctl(DRM_IOCTL_MODE_GETCRTC, &mut crtc), Ok(0));
+
+        let mut plane: DrmModeGetPlane = zeroed();
+        plane.plane_id = BOGUS;
+        assert_eq!(c.ioctl(DRM_IOCTL_MODE_GETPLANE, &mut plane), enoent);
+        plane.plane_id = 62;
+        assert_eq!(c.ioctl(DRM_IOCTL_MODE_GETPLANE, &mut plane), Ok(0));
+
+        let mut conn: DrmModeGetConnector = zeroed();
+        conn.connector_id = BOGUS;
+        assert_eq!(c.ioctl(DRM_IOCTL_MODE_GETCONNECTOR, &mut conn), enoent);
+        conn.connector_id = 61;
+        assert_eq!(c.ioctl(DRM_IOCTL_MODE_GETCONNECTOR, &mut conn), Ok(0));
+
+        // GETENCODER: one encoder, and an unknown id is not renamed to it.
+        let mut enc: DrmModeGetEncoder = zeroed();
+        enc.encoder_id = BOGUS;
+        assert_eq!(c.ioctl(DRM_IOCTL_MODE_GETENCODER, &mut enc), enoent);
+        assert_eq!(
+            enc.encoder_id, BOGUS,
+            "the id the client asked about was rewritten"
+        );
+        enc.encoder_id = drm::SYNTH_ENCODER_ID;
+        assert_eq!(c.ioctl(DRM_IOCTL_MODE_GETENCODER, &mut enc), Ok(0));
+        assert_eq!(enc.encoder_id, drm::SYNTH_ENCODER_ID);
+
+        // OBJ_GETPROPERTIES: an unknown id is not "an object with no
+        // properties"; the encoder still is.
+        let mut props: DrmModeObjGetProperties = zeroed();
+        props.obj_id = BOGUS;
+        assert_eq!(
+            c.ioctl(DRM_IOCTL_MODE_OBJ_GETPROPERTIES, &mut props),
+            enoent
+        );
+        props.obj_id = drm::SYNTH_ENCODER_ID;
+        assert_eq!(c.ioctl(DRM_IOCTL_MODE_OBJ_GETPROPERTIES, &mut props), Ok(0));
+        assert_eq!(props.count_props, 0, "the encoder carries no properties");
+        props.obj_id = 61;
+        assert_eq!(c.ioctl(DRM_IOCTL_MODE_OBJ_GETPROPERTIES, &mut props), Ok(0));
+        assert!(props.count_props > 0, "the connector does");
+
+        // GETPROPBLOB: neither a blob id nor an EDID id of a connector that
+        // does not exist.
+        let mut blob: DrmModeGetBlob = zeroed();
+        blob.blob_id = BOGUS;
+        assert_eq!(c.ioctl(DRM_IOCTL_MODE_GETPROPBLOB, &mut blob), enoent);
+        blob.blob_id = edid_blob_id(BOGUS);
+        assert_eq!(c.ioctl(DRM_IOCTL_MODE_GETPROPBLOB, &mut blob), enoent);
+
+        // CLOSEFB, like RMFB.
+        let mut fb_id = BOGUS;
+        assert_eq!(c.ioctl(DRM_IOCTL_MODE_CLOSEFB, &mut fb_id), enoent);
+
+        // SETPLANE looks the plane up first; disabling the real one is fine.
+        let mut set_plane: DrmModeSetPlane = zeroed();
+        set_plane.plane_id = BOGUS;
+        set_plane.crtc_id = 60;
+        assert_eq!(c.ioctl(DRM_IOCTL_MODE_SETPLANE, &mut set_plane), enoent);
+        set_plane.plane_id = 62;
+        assert_eq!(c.ioctl(DRM_IOCTL_MODE_SETPLANE, &mut set_plane), Ok(0));
+
+        // CURSOR: "Unknown CRTC ID".
+        let mut cur = ModeCursor {
+            flags: 0x02, // MOVE
+            crtc_id: BOGUS,
+            x: 1,
+            y: 1,
+            width: 0,
+            height: 0,
+            handle: 0,
+        };
+        assert_eq!(c.ioctl(DRM_IOCTL_MODE_CURSOR, &mut cur), enoent);
+        cur.crtc_id = 60;
+        assert_eq!(c.ioctl(DRM_IOCTL_MODE_CURSOR, &mut cur), Ok(0));
+
+        // GETGAMMA / SETGAMMA: `struct drm_mode_crtc_lut` starts with the
+        // CRTC id.
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct CrtcLut {
+            crtc_id: u32,
+            gamma_size: u32,
+            red: u64,
+            green: u64,
+            blue: u64,
+        }
+        let mut lut: CrtcLut = zeroed();
+        lut.crtc_id = BOGUS;
+        assert_eq!(c.ioctl(DRM_IOCTL_MODE_GETGAMMA, &mut lut), enoent);
+        assert_eq!(c.ioctl(DRM_IOCTL_MODE_SETGAMMA, &mut lut), enoent);
+        lut.crtc_id = 60;
+        assert_eq!(c.ioctl(DRM_IOCTL_MODE_GETGAMMA, &mut lut), Ok(0));
+        assert_eq!(c.ioctl(DRM_IOCTL_MODE_SETGAMMA, &mut lut), Ok(0));
+
+        // OBJ_SETPROPERTY: the object and the property must both exist.
+        let mut set = DrmModeObjSetProperty {
+            value: DRM_MODE_DPMS_ON,
+            prop_id: PROP_DPMS,
+            obj_id: BOGUS,
+            obj_type: 0,
+        };
+        assert_eq!(c.ioctl(DRM_IOCTL_MODE_OBJ_SETPROPERTY, &mut set), enoent);
+        set.obj_id = 61;
+        set.prop_id = BOGUS;
+        assert_eq!(c.ioctl(DRM_IOCTL_MODE_OBJ_SETPROPERTY, &mut set), enoent);
+        set.prop_id = PROP_DPMS;
+        assert_eq!(c.ioctl(DRM_IOCTL_MODE_OBJ_SETPROPERTY, &mut set), Ok(0));
+
+        // SETPROPERTY: `struct drm_mode_connector_set_property`.
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct ConnectorSetProperty {
+            value: u64,
+            prop_id: u32,
+            connector_id: u32,
+        }
+        let mut cset = ConnectorSetProperty {
+            value: DRM_MODE_DPMS_ON,
+            prop_id: PROP_DPMS,
+            connector_id: BOGUS,
+        };
+        assert_eq!(c.ioctl(DRM_IOCTL_MODE_SETPROPERTY, &mut cset), enoent);
+        cset.connector_id = 61;
+        cset.prop_id = BOGUS;
+        assert_eq!(c.ioctl(DRM_IOCTL_MODE_SETPROPERTY, &mut cset), enoent);
+        cset.prop_id = PROP_DPMS;
+        assert_eq!(c.ioctl(DRM_IOCTL_MODE_SETPROPERTY, &mut cset), Ok(0));
     }
 }
 
