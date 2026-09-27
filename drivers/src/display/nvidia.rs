@@ -12658,6 +12658,42 @@ impl NvidiaGpu {
             }
 
             nv::NR_CHANNEL_ALLOC => {
+                let req = unsafe { &mut *(arg as *mut nv::DrmNouveauChannelAlloc) };
+                // `nouveau_abi16_ioctl_channel_alloc`, Kepler and later: with
+                // `fb_ctxdma_handle == ~0` the client names the ENGINE in
+                // `tt_ctxdma_handle` (libdrm's nve0 channels and NVK: GR, or
+                // CE for a copy queue); a name that is none of the five is
+                // ENOSYS, and VP/PPP/BSP name runlists a Turing has not got
+                // (`nvif_fifo_runlist` finds none: EINVAL). Otherwise the two
+                // are legacy ctxdma handles, and only `tt == ~0` is refused
+                // (EINVAL). The engine words are consumed: Linux writes 0 and
+                // 0 back for them, there and then.
+                if req.fb_ctxdma_handle == u32::MAX {
+                    match req.tt_ctxdma_handle {
+                        nv::NOUVEAU_FIFO_ENGINE_GR | nv::NOUVEAU_FIFO_ENGINE_CE => {}
+                        nv::NOUVEAU_FIFO_ENGINE_VP
+                        | nv::NOUVEAU_FIFO_ENGINE_PPP
+                        | nv::NOUVEAU_FIFO_ENGINE_BSP => {
+                            log::warn!(
+                                "[nouveau-uapi] CHANNEL_ALLOC: engine {:#x} has no runlist on this GPU -> EINVAL",
+                                req.tt_ctxdma_handle
+                            );
+                            return Err(nv::EINVAL);
+                        }
+                        other => {
+                            log::warn!(
+                                "[nouveau-uapi] CHANNEL_ALLOC: {:#x} names no engine -> ENOSYS",
+                                other
+                            );
+                            return Err(nv::ENOSYS);
+                        }
+                    }
+                    req.fb_ctxdma_handle = 0;
+                    req.tt_ctxdma_handle = 0;
+                } else if req.tt_ctxdma_handle == u32::MAX {
+                    log::warn!("[nouveau-uapi] CHANNEL_ALLOC: tt_ctxdma_handle ~0 -> EINVAL");
+                    return Err(nv::EINVAL);
+                }
                 // [auto-bringup] Only THIS GPU. On dual-GPU boxes card0 is the
                 // compute card: ensure_console_gpu_brought_up is a no-op there
                 // (drives_boot_display == false). Never walk other GPUs here —
@@ -12851,7 +12887,6 @@ impl NvidiaGpu {
                     owner_pid,
                 });
                 drop(chan);
-                let req = unsafe { &mut *(arg as *mut nv::DrmNouveauChannelAlloc) };
                 req.channel = new_id;
                 req.notifier_handle = channel.h_notifier;
                 req.pushbuf_domains = nv::NOUVEAU_GEM_DOMAIN_VRAM;
