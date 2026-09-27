@@ -2626,10 +2626,36 @@ fn write_labwc_wrapper(rootfs: &Path) {
           \x20\x20 : \"${SDL_RENDER_DRIVER:=software}\"; export SDL_RENDER_DRIVER\n\
           \x20\x20 : \"${SDL_FRAMEBUFFER_ACCELERATION:=0}\"; export SDL_FRAMEBUFFER_ACCELERATION\n\
           \x20 fi\n\
+          elif grep -q 'nvidia\\.nouveau_uapi' /proc/cmdline 2>/dev/null && \\
+\
+          \x20\x20 [ -r /sys/class/drm/card0/device/vendor ]; then\n\
+          \x20 # The flag but NO NVIDIA card: the GL=1 image under QEMU, whose\n\
+          \x20 # virtio-gpu is 2D-only. Hardware GL cannot exist here, and\n\
+          \x20 # leaving the renderer at pixman while GL clients probe Mesa's\n\
+          \x20 # own defaults is WORSE than either explicit mode: that mix\n\
+          \x20 # renders but never composites -- glxgears printed its FPS to the\n\
+          \x20 # console with no window ever appearing, because frames were\n\
+          \x20 # swapped into buffers the pixman compositor does not take. Use\n\
+          \x20 # the same software-GL stack as renderer=gl-sw, which is what\n\
+          \x20 # eclipse-init's build_child_env and /etc/profile both pick for\n\
+          \x20 # this machine. Without this branch a labwc started BY HAND from\n\
+          \x20 # a non-login shell (no /etc/profile, no init) got pixman.\n\
+          \x20 : \"${WLR_RENDERER:=gles2}\"; export WLR_RENDERER\n\
+          \x20 : \"${WLR_RENDERER_ALLOW_SOFTWARE:=1}\"; export WLR_RENDERER_ALLOW_SOFTWARE\n\
+          \x20 : \"${LIBGL_ALWAYS_SOFTWARE:=1}\"; export LIBGL_ALWAYS_SOFTWARE\n\
+          \x20 : \"${SDL_RENDER_DRIVER:=opengles2}\"; export SDL_RENDER_DRIVER\n\
+          \x20 : \"${SDL_FRAMEBUFFER_ACCELERATION:=opengles2}\"; export SDL_FRAMEBUFFER_ACCELERATION\n\
           else\n\
-          \x20 : \"${WLR_RENDERER:=pixman}\"; export WLR_RENDERER\n\
+          \x20 # No flag: the kernel uAPI is off, so there is no hardware GL on\n\
+          \x20 # either machine (QEMU by default, or an RTX booted without it).\n\
+          \x20 # pixman composites on the CPU and always puts a frame up, and\n\
+          \x20 # LIBGL_ALWAYS_SOFTWARE keeps a GL client from probing for a\n\
+          \x20 # driver that is not there -- the same pair /etc/profile exports.\n\
           \x20 # `:=` again: an init-launched session already carries the GL=1\n\
           \x20 # (renderer=gl-sw) pins from build_child_env, and those win here.\n\
+          \x20 : \"${WLR_RENDERER:=pixman}\"; export WLR_RENDERER\n\
+          \x20 : \"${WLR_RENDERER_ALLOW_SOFTWARE:=1}\"; export WLR_RENDERER_ALLOW_SOFTWARE\n\
+          \x20 : \"${LIBGL_ALWAYS_SOFTWARE:=1}\"; export LIBGL_ALWAYS_SOFTWARE\n\
           \x20 : \"${SDL_RENDER_DRIVER:=software}\"; export SDL_RENDER_DRIVER\n\
           \x20 : \"${SDL_FRAMEBUFFER_ACCELERATION:=0}\"; export SDL_FRAMEBUFFER_ACCELERATION\n\
           fi\n\
@@ -3175,6 +3201,222 @@ mod tests {
     /// would render through different stacks. This pins the two halves:
     /// renderer-independent backends everywhere, and the render driver per
     /// compositor renderer in every branch of the two shell copies.
+    /// Cut the renderer gate out of a generated shell file: from the `if` that
+    /// tests `nvidia.nouveau_uapi` to the `fi` that closes it, tracking depth so
+    /// the inner `if`s do not end the block early.
+    fn renderer_gate(text: &str) -> String {
+        let mut out = Vec::new();
+        let mut depth = 0usize;
+        for line in text.lines() {
+            let t = line.trim();
+            if depth == 0 {
+                if t.starts_with("if grep -q 'nvidia\\.nouveau_uapi'") {
+                    depth = 1;
+                    out.push(line);
+                }
+                continue;
+            }
+            out.push(line);
+            // A one-line `if ...; then ...; fi` would need real parsing; the
+            // generated gate has none, so counting openers and closers is exact.
+            if t.starts_with("if ") || t == "if" {
+                depth += 1;
+            } else if t == "fi" || t.starts_with("fi ") || t == "fi;" {
+                depth -= 1;
+                if depth == 0 {
+                    break;
+                }
+            }
+        }
+        assert!(depth == 0 && !out.is_empty(), "no renderer gate found");
+        out.join("\n")
+    }
+
+    /// Run a renderer gate against a faked `/proc/cmdline` and `card0` vendor,
+    /// and report the variables it exported. This EXECUTES the branch logic
+    /// instead of matching its text, so a gate that parses but picks the wrong
+    /// arm is caught.
+    fn run_gate(gate: &str, cmdline: &str, vendor: Option<&str>) -> Vec<(String, String)> {
+        // No parentheses or spaces in this path: it is substituted into a shell
+        // script unquoted, and `ThreadId(3)` made `sh` report a syntax error
+        // that looked like a fault in the generated gate.
+        let tag: String = format!("{:?}", std::thread::current().id())
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric())
+            .collect();
+        let dir = std::env::temp_dir().join(format!("eclipse-gate-{}-{tag}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("sys")).unwrap();
+        fs::write(dir.join("cmdline"), cmdline).unwrap();
+        if let Some(v) = vendor {
+            fs::write(dir.join("sys/vendor"), v).unwrap();
+        }
+        let base = dir.display().to_string();
+        let script = format!(
+            "{}\nenv\n",
+            gate.replace("/proc/cmdline", &format!("{base}/cmdline"))
+                .replace(
+                    "/sys/class/drm/card0/device/vendor",
+                    &format!("{base}/sys/vendor")
+                )
+        );
+        // `sh` is POSIX and present on every runner this crate is built on. If
+        // it were missing this test must FAIL, not quietly pass: a gate nobody
+        // ran is the thing being fixed here.
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&script)
+            .env_clear()
+            .env("PATH", std::env::var("PATH").unwrap_or_default())
+            .output()
+            .expect("sh must be available to run the renderer gate");
+        assert!(
+            out.status.success(),
+            "gate failed for {cmdline:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let _ = fs::remove_dir_all(&dir);
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|l| l.split_once('='))
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    fn gate_var(env: &[(String, String)], key: &str) -> Option<String> {
+        env.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone())
+    }
+
+    /// The renderer policy is written THREE times: here in the labwc wrapper, in
+    /// `/etc/profile`, and in `eclipse-init`'s `build_child_env`. The wrapper and
+    /// the profile are both generated by this crate, so they can be run
+    /// side by side -- and they must pick the same renderer for the same machine.
+    ///
+    /// They did not. The wrapper had TWO top-level arms where the other two have
+    /// three: it was missing "the `nvidia.nouveau_uapi` flag but NO NVIDIA card",
+    /// which is the `GL=1` image under QEMU. There the wrapper pinned
+    /// `WLR_RENDERER=pixman` while the other two pin `gles2`, and
+    /// `build_child_env`'s own comment records what that mix does: it renders but
+    /// never composites, so glxgears prints its FPS to the console with no window
+    /// ever appearing. A labwc started by hand from a non-login shell (no
+    /// `/etc/profile`, no init) took exactly that arm.
+    #[test]
+    fn the_wrapper_and_the_profile_pick_the_same_renderer_for_the_same_machine() {
+        let dir = std::env::temp_dir().join(format!("eclipse-renderer-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        write_labwc_wrapper(&dir);
+        let etc = dir.join("etc");
+        fs::create_dir_all(&etc).unwrap();
+        super::super::LinuxRootfs::write_profile(&etc);
+        let wrapper_gate =
+            renderer_gate(&fs::read_to_string(dir.join("usr/local/bin/labwc")).unwrap());
+        let profile_gate = renderer_gate(&fs::read_to_string(etc.join("profile")).unwrap());
+
+        const NVIDIA: Option<&str> = Some("0x10de\n");
+        const VIRTIO: Option<&str> = Some("0x1af4\n");
+        // Every machine and boot this image supports, with the renderer each
+        // one must land on. The third row is the one that diverged.
+        let cases: &[(&str, Option<&str>, &str)] = &[
+            // an RTX booted with the kernel uAPI on, no explicit opt-in
+            ("nvidia.nouveau_uapi", NVIDIA, "pixman"),
+            // an RTX booted without it: the DRM node is not nouveau at all
+            ("LOG=warn", NVIDIA, "pixman"),
+            // the GL=1 image under QEMU: the flag, but no NVIDIA card
+            ("renderer=gl:nvidia.nouveau_uapi", VIRTIO, "gles2"),
+            // QEMU with no flag
+            ("LOG=warn", VIRTIO, "pixman"),
+            // no card0 at all
+            ("nvidia.nouveau_uapi", None, "pixman"),
+            ("LOG=warn", None, "pixman"),
+            // the explicit GPU opt-ins, which only apply on a real NVIDIA card
+            ("nvidia.nouveau_uapi:nvidia.wlr_gles2", NVIDIA, "gles2"),
+            ("nvidia.nouveau_uapi:nvidia.wlr_vulkan", NVIDIA, "vulkan"),
+        ];
+        for (cmdline, vendor, expect) in cases {
+            let w = run_gate(&wrapper_gate, cmdline, *vendor);
+            let p = run_gate(&profile_gate, cmdline, *vendor);
+            let ctx = format!("{cmdline:?} vendor={vendor:?}");
+            assert_eq!(
+                gate_var(&w, "WLR_RENDERER").as_deref(),
+                Some(*expect),
+                "wrapper renderer for {ctx}"
+            );
+            assert_eq!(
+                gate_var(&p, "WLR_RENDERER").as_deref(),
+                Some(*expect),
+                "/etc/profile renderer for {ctx}"
+            );
+            // The whole point: not merely that each is right on its own, but
+            // that the two agree on every variable that decides how a frame is
+            // produced. A compositor on one renderer with clients pinned to
+            // another composites nothing.
+            for key in [
+                "WLR_RENDERER",
+                "LIBGL_ALWAYS_SOFTWARE",
+                "GALLIUM_DRIVER",
+                "MESA_LOADER_DRIVER_OVERRIDE",
+                "SDL_RENDER_DRIVER",
+                "SDL_FRAMEBUFFER_ACCELERATION",
+            ] {
+                assert_eq!(
+                    gate_var(&w, key),
+                    gate_var(&p, key),
+                    "{key} differs between the wrapper and /etc/profile for {ctx}"
+                );
+            }
+            // A software renderer must never be left with clients probing for a
+            // hardware GL driver that is not there.
+            if *expect == "pixman" || *vendor != NVIDIA {
+                assert_eq!(
+                    gate_var(&w, "LIBGL_ALWAYS_SOFTWARE").as_deref(),
+                    Some("1"),
+                    "software GL not pinned for {ctx}"
+                );
+                assert_eq!(
+                    gate_var(&w, "GALLIUM_DRIVER"),
+                    None,
+                    "zink pinned for {ctx}"
+                );
+            } else {
+                // and a GPU session must pin its clients to the same stack
+                assert_eq!(
+                    gate_var(&w, "GALLIUM_DRIVER").as_deref(),
+                    Some("zink"),
+                    "{ctx}"
+                );
+                assert_eq!(gate_var(&w, "LIBGL_ALWAYS_SOFTWARE"), None, "{ctx}");
+            }
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A caller's own choice survives the gate: every assignment is `:=`, so
+    /// what `eclipse-init` already exported (or a person debugging by hand) wins
+    /// instead of being overwritten by the default for the machine.
+    #[test]
+    fn a_renderer_the_caller_already_chose_is_not_overwritten() {
+        let dir = std::env::temp_dir().join(format!("eclipse-renderer-ov-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        write_labwc_wrapper(&dir);
+        let gate = renderer_gate(&fs::read_to_string(dir.join("usr/local/bin/labwc")).unwrap());
+        // Prepend an inherited pin, as an init-launched session carries.
+        let with_pin = format!("WLR_RENDERER=gles2\nexport WLR_RENDERER\n{gate}");
+        let env = run_gate(
+            &with_pin,
+            "renderer=gl:nvidia.nouveau_uapi",
+            Some("0x1af4\n"),
+        );
+        assert_eq!(gate_var(&env, "WLR_RENDERER").as_deref(), Some("gles2"));
+        let with_pin = format!("WLR_RENDERER=pixman\nexport WLR_RENDERER\n{gate}");
+        let env = run_gate(
+            &with_pin,
+            "nvidia.nouveau_uapi:nvidia.wlr_vulkan",
+            Some("0x10de\n"),
+        );
+        assert_eq!(gate_var(&env, "WLR_RENDERER").as_deref(), Some("pixman"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn sdl_policy_is_consistent_across_wrapper_profile_and_environment() {
         let dir =

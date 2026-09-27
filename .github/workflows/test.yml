@@ -187,6 +187,18 @@ jobs:
           # `rboot.conf` parsing, the kernel cmdline, EDID and graphic-mode
           # choice, and the splash and progress bar drawn into plain memory.
           cargo test --manifest-path rboot/Cargo.toml --lib --no-default-features
+          # eclipse-init, PID 1 of the installed system. Same hole rboot was in
+          # and worse: it is a standalone package (its own `[workspace]` table,
+          # its own musl target) that `xtask` builds BEST-EFFORT, so a break
+          # here does not fail a build -- it silently leaves busybox init as
+          # PID 1 and the desktop never starts. Nothing in this file compiled
+          # it. What the tests cover is every decision it makes before it
+          # touches the kernel: the `:`-joined boot arguments, which session
+          # boots, the locale and timezone precedence, the service-file parser,
+          # the `after =` start order, and the renderer policy -- the last of
+          # which is written twice more, in `/etc/profile` and the labwc
+          # wrapper, and is cross-checked against those two in `xtask`.
+          cargo test --manifest-path tools/eclipse-init/Cargo.toml
           # The kernel binary crate itself. Its `[[bin]]` section carried
           # `test = false`, so no job in this file ever compiled it as a test
           # target -- the same hole rboot was in, in the crate that owns the
