@@ -66,4 +66,15 @@ const _: () = {
     // `build.rs` guarantees `_vdso_data` starts on a page boundary; this
     // guarantees the Rust view still fits in that page.
     assert!(core::mem::size_of::<VdsoData>() <= DATA_PAGE_SIZE);
+    // And this is the one the paragraph at the top of this file rests on.
+    // `DATA_SIZE` is `_vdso_data`'s `st_size` in the linked image, which is the
+    // size the C compiler gave `struct vdso_data` in `vdso.c`. Until this
+    // existed, "a field added on one side and forgotten on the other" was only
+    // asserted in prose: it compiled, linked, passed verification and booted,
+    // and the kernel published the new field into bytes past the end of the
+    // struct userspace reads -- a clock that is wrong rather than absent, the
+    // one outcome this design says it is arranged to avoid. Now it stops the
+    // build, on either side. Skipped when there is no image, where `DATA_SIZE`
+    // is zero and nothing maps the struct at all.
+    assert!(!AVAILABLE || core::mem::size_of::<VdsoData>() == DATA_SIZE);
 };

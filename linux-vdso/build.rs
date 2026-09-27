@@ -39,6 +39,13 @@ const PT_DYNAMIC: u32 = 2;
 const SHT_SYMTAB: u32 = 2;
 const SHT_RELA: u32 = 4;
 const SHT_REL: u32 = 9;
+// `SHT_RELR` and its two dynamic tags: the packed encoding of relative
+// relocations that a linker emits *instead of* `.rela.dyn` when it is told to,
+// and that several distributions now turn on by default. A check that looks
+// only for RELA and REL sees nothing, so an image full of relocations nobody
+// applies would pass -- which is precisely the failure this file exists to
+// prevent. Cheap to refuse, invisible if it never happens.
+const SHT_RELR: u32 = 19;
 const DT_NULL: u64 = 0;
 const DT_HASH: u64 = 4;
 const DT_STRTAB: u64 = 5;
@@ -47,6 +54,8 @@ const DT_RELA: u64 = 7;
 const DT_RELASZ: u64 = 8;
 const DT_REL: u64 = 17;
 const DT_RELSZ: u64 = 18;
+const DT_RELRSZ: u64 = 35;
+const DT_RELR: u64 = 36;
 const DT_GNU_HASH: u64 = 0x6fff_fef5;
 const DT_VERDEF: u64 = 0x6fff_fffc;
 const DT_VERSYM: u64 = 0x6fff_fff0;
@@ -69,13 +78,10 @@ fn main() {
     match build_image(&out_dir, &link_path) {
         Ok(linked) => {
             // Malformed image => hard failure. See the module comment.
-            let Verified {
-                data_offset,
-                load_len,
-            } = verify(&linked);
-            let image = strip(&linked, load_len);
+            let verified = verify(&linked);
+            let image = strip(&linked, verified.load_len);
             fs::write(&image_path, &image).unwrap();
-            fs::write(&meta_path, meta_source(true, data_offset, image.len())).unwrap();
+            fs::write(&meta_path, meta_source(Some(&verified), image.len())).unwrap();
         }
         Err(reason) => {
             println!(
@@ -84,7 +90,12 @@ fn main() {
                 reason
             );
             fs::write(&image_path, b"").unwrap();
-            fs::write(&meta_path, meta_source(false, 0, 0)).unwrap();
+            // An empty one rather than none at all, and rather than whatever
+            // half-written thing a failed link left behind: `tests/verify.rs`
+            // includes this path to get the unstripped image, and a missing file
+            // there is a compile error on a host that simply has no `cc`.
+            fs::write(&link_path, b"").unwrap();
+            fs::write(&meta_path, meta_source(None, 0)).unwrap();
         }
     }
 }
@@ -101,7 +112,7 @@ fn main() {
 /// The section-header fields in the ELF header are zeroed rather than left
 /// dangling past the new end of file, so the result stays a well-formed ELF
 /// that tools can still read.
-fn strip(linked: &[u8], load_len: usize) -> Vec<u8> {
+pub(crate) fn strip(linked: &[u8], load_len: usize) -> Vec<u8> {
     let mut image = linked[..load_len].to_vec();
     image[40..48].copy_from_slice(&0u64.to_le_bytes()); // e_shoff
     image[58..60].copy_from_slice(&0u16.to_le_bytes()); // e_shentsize
@@ -187,15 +198,28 @@ fn build_image(out_dir: &Path, image_path: &Path) -> Result<Vec<u8>, String> {
     Ok(image)
 }
 
-fn meta_source(available: bool, data_offset: usize, len: usize) -> String {
+/// The constants the kernel compiles against.
+///
+/// `None` is the only way to say there is no image. A separate `available: bool`
+/// beside the three numbers is a call site that can claim an image while handing
+/// over zeros for it -- and the arm that would get that wrong is the one no host
+/// with a working `cc` ever takes, so nothing would ever notice.
+pub(crate) fn meta_source(verified: Option<&Verified>, len: usize) -> String {
+    let (available, data_offset, data_size, len) = match verified {
+        Some(v) => (true, v.data_offset, v.data_size, len),
+        None => (false, 0, 0, 0),
+    };
     format!(
         "/// Whether a usable image was linked into this build.\n\
          pub const AVAILABLE: bool = {};\n\
          /// Byte offset of `_vdso_data` from the start of the mapped image.\n\
          pub const DATA_OFFSET: usize = {};\n\
+         /// Size of `_vdso_data` as `vdso.c` laid it out, from its symbol-table\n\
+         /// entry in the linked image. Zero when there is no image.\n\
+         pub const DATA_SIZE: usize = {};\n\
          /// Length of the image in bytes, before rounding up to whole pages.\n\
          pub const IMAGE_LEN: usize = {};\n",
-        available, data_offset, len
+        available, data_offset, data_size, len
     )
 }
 
@@ -223,16 +247,20 @@ fn cstr(b: &[u8], off: usize) -> String {
 }
 
 /// What `verify` extracts from an image it has accepted.
-struct Verified {
+pub(crate) struct Verified {
     /// Offset of `_vdso_data` from the start of the mapping.
-    data_offset: usize,
+    pub(crate) data_offset: usize,
+    /// Size of `_vdso_data` as the C compiler laid it out, straight from its
+    /// symbol-table entry. Published so the Rust view of the struct can be
+    /// checked against the C one at compile time instead of being trusted.
+    pub(crate) data_size: usize,
     /// Bytes of the single `PT_LOAD`, i.e. everything that gets mapped.
-    load_len: usize,
+    pub(crate) load_len: usize,
 }
 
 /// Checks every property the kernel and musl rely on. Panics — with an
 /// explanation — on anything that would make the image silently useless.
-fn verify(img: &[u8]) -> Verified {
+pub(crate) fn verify(img: &[u8]) -> Verified {
     assert_eq!(&img[..4], b"\x7fELF", "no es un ELF");
     assert_eq!(img[4], 2, "se esperaba ELF64");
     assert_eq!(u16le(img, 16), ET_DYN, "se esperaba ET_DYN");
@@ -270,6 +298,16 @@ fn verify(img: &[u8]) -> Verified {
     assert_eq!(
         filesz, memsz,
         "PT_LOAD.p_memsz != p_filesz: la imagen tiene .bss y nadie la pondria a cero"
+    );
+    // Everything below indexes `img` with offsets read out of `img`, and
+    // `strip` then truncates the file to exactly this many bytes. A `p_filesz`
+    // past the end of what was linked turns both into a slice panic, which says
+    // nothing at all about what is wrong with the image.
+    assert!(
+        (filesz as usize) <= img.len(),
+        "PT_LOAD.p_filesz ({}) pasa del final del fichero ({} bytes)",
+        filesz,
+        img.len()
     );
 
     let dynamic = dynamic.expect("falta PT_DYNAMIC");
@@ -313,6 +351,8 @@ fn verify(img: &[u8]) -> Verified {
         (DT_RELASZ, "DT_RELASZ"),
         (DT_REL, "DT_REL"),
         (DT_RELSZ, "DT_RELSZ"),
+        (DT_RELR, "DT_RELR"),
+        (DT_RELRSZ, "DT_RELRSZ"),
     ] {
         assert!(
             tags.get(&tag).copied().unwrap_or(0) == 0,
@@ -329,14 +369,14 @@ fn verify(img: &[u8]) -> Verified {
     let shstrndx = u16le(img, 62) as usize;
     let shstr = u64le(img, shoff + shstrndx * shentsize + 24) as usize;
 
-    let mut data_offset = None;
+    let mut data = None;
     for i in 0..shnum {
         let sh = shoff + i * shentsize;
         let name = cstr(img, shstr + u32le(img, sh) as usize);
         let sh_type = u32le(img, sh + 4);
         let sh_size = u64le(img, sh + 32);
 
-        if (sh_type == SHT_RELA || sh_type == SHT_REL) && sh_size != 0 {
+        if (sh_type == SHT_RELA || sh_type == SHT_REL || sh_type == SHT_RELR) && sh_size != 0 {
             panic!(
                 "seccion de reubicaciones {} con {} bytes: compilar con \
                  -fvisibility=hidden deberia haberlas eliminado",
@@ -349,16 +389,22 @@ fn verify(img: &[u8]) -> Verified {
             let symstr = u64le(img, shoff + strtab_idx * shentsize + 24) as usize;
             let off = u64le(img, sh + 24) as usize;
             let entsize = u64le(img, sh + 56) as usize;
+            // A symbol table that does not say how big its entries are cannot
+            // be walked. Said here, because the division below would otherwise
+            // stop the build with "attempt to divide by zero".
+            assert!(entsize != 0, "{} declara sh_entsize = 0", name);
             for s in 0..(sh_size as usize / entsize) {
                 let sym = off + s * entsize;
                 if cstr(img, symstr + u32le(img, sym) as usize) == "_vdso_data" {
-                    data_offset = Some(u64le(img, sym + 8) as usize);
+                    // st_value and st_size. The size is the C struct's own,
+                    // which is what makes the Rust view checkable against it.
+                    data = Some((u64le(img, sym + 8) as usize, u64le(img, sym + 16) as usize));
                 }
             }
         }
     }
 
-    let data_offset = data_offset.expect(
+    let (data_offset, data_size) = data.expect(
         "no se encuentra el simbolo _vdso_data en .symtab; \
          la imagen no debe pasar por strip",
     );
@@ -373,10 +419,20 @@ fn verify(img: &[u8]) -> Verified {
     // anything sharing it would be writable too. The tail of the page is
     // implicitly zero and does not appear in the file, hence the upper bound on
     // `filesz` rather than a requirement that a whole page be present.
+    // `data_size` rather than a hand-copied byte count: the number this must
+    // compare against is the size of the C struct, and the symbol table already
+    // carries it. Written out by hand it is a second copy of a layout that
+    // lives in `vdso.c`, and the whole point of the crate is that there is only
+    // one.
     assert!(
-        data_offset + core::mem::size_of::<u64>() * 3 <= filesz as usize,
-        "_vdso_data en {:#x} no cabe en la imagen ({} bytes)",
+        data_size != 0,
+        "_vdso_data declara st_size = 0; sin tamaño no se puede comprobar nada"
+    );
+    assert!(
+        data_offset + data_size <= filesz as usize,
+        "_vdso_data en {:#x} ocupa {} bytes y no cabe en la imagen ({} bytes)",
         data_offset,
+        data_size,
         filesz
     );
     assert!(
@@ -415,6 +471,7 @@ fn verify(img: &[u8]) -> Verified {
 
     Verified {
         data_offset,
+        data_size,
         load_len: filesz as usize,
     }
 }
