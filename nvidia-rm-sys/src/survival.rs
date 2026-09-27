@@ -139,15 +139,18 @@ pub fn checkpoint(m: u8) {
     }
 }
 
-/// Bump the rolling narration counter (wraps at 256). Called on every RM
-/// nv_printf line so a wedge's surviving count pinpoints how far the RM's own
-/// narration got before it died.
-pub fn narration_tick() {
-    unsafe {
-        let n = cmos_read(CMOS_NARR_OFF);
-        cmos_write(CMOS_NARR_OFF, n.wrapping_add(1));
-    }
-}
+/// DISABLED, along with the write it fed.
+///
+/// It read the counter and wrote it back one higher, on **every** RM
+/// `nv_printf` line. `cmos_write` is a deliberate no-op now (writing
+/// 0x40-0x42 broke the firmware's NVRAM checksum on the bring-up box), so the
+/// read had no consumer left -- and it was not free: four port accesses to
+/// 0x70/0x71 per line, with NMI masked for the duration, times the hundreds of
+/// lines the RM narrates per GSP boot. It also put a privileged instruction on
+/// the RM's whole narration path, which is why nothing about that path could
+/// be tested. Kept as a no-op so its callers still read as the boot they
+/// describe.
+pub fn narration_tick() {}
 
 /// Zero the narration counter at the start of a fresh attempt.
 pub fn reset_narration() {

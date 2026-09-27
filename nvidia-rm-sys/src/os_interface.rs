@@ -240,14 +240,34 @@ pub extern "C" fn os_get_cpu_frequency() -> NvU64 {
 pub extern "C" fn os_get_current_process() -> NvU32 {
     0
 }
-#[no_mangle]
-pub extern "C" fn os_get_current_process_name(buffer: *mut c_char, length: NvU32) {
+/// The name this kernel answers with when the RM asks who is running.
+pub(crate) const PROCESS_NAME: &[u8] = b"eclipse-kernel";
+
+/// Copy [`PROCESS_NAME`] into a caller's buffer, **always NUL-terminated**.
+///
+/// The terminator is the whole contract, because the RM prints the result with
+/// `%s` out of a buffer it never zeroed: `kernel_rc.c:349` hands the Xid path a
+/// fresh `portMemAllocNonPaged(NV_PROC_NAME_MAX_LENGTH)` and prints it as
+/// `name=%s`, so a copy that fills the buffer edge to edge leaves `%s` reading
+/// whatever follows the allocation. Linux truncates the same way -- `strscpy`
+/// returns `-E2BIG` and its caller deliberately ignores it -- but never leaves
+/// the buffer unterminated.
+pub(crate) fn write_process_name(buffer: *mut c_char, length: NvU32) {
     if buffer.is_null() || length == 0 {
         return;
     }
-    let name = b"eclipse-kernel\0";
-    let n = core::cmp::min(name.len(), length as usize);
-    unsafe { core::ptr::copy_nonoverlapping(name.as_ptr(), buffer as *mut u8, n) };
+    // One byte of the caller's room belongs to the terminator, always.
+    let room = length as usize - 1;
+    let n = core::cmp::min(PROCESS_NAME.len(), room);
+    unsafe {
+        core::ptr::copy_nonoverlapping(PROCESS_NAME.as_ptr(), buffer as *mut u8, n);
+        *(buffer as *mut u8).add(n) = 0;
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn os_get_current_process_name(buffer: *mut c_char, length: NvU32) {
+    write_process_name(buffer, length);
 }
 /// Provider of per-thread identity for the RM (`set_thread_id_provider`).
 /// Stored as a raw fn pointer in an atomic so this leaf crate needs no
@@ -717,28 +737,83 @@ static QUIET_SAVED_LEVEL: core::sync::atomic::AtomicUsize =
 /// single biggest divergence from Linux in the exact wedge window. Capture
 /// paths (capture_push / seq trace) are unaffected: they run before the log
 /// macros, so the narration still lands in the /proc output afterwards.
-/// Pair with `console_quiet_end`; nesting is not supported.
+/// Pair with `console_quiet_end`. A nested begin is safe: only the outermost
+/// one records a level to go back to.
 pub fn console_quiet_begin() {
     let cur = log::max_level();
-    QUIET_SAVED_LEVEL.store(cur as usize, Ordering::Relaxed);
+    // Record the level from OUTSIDE the outermost window, and only that one.
+    // A nested begin used to overwrite it with `Off` -- the level the outer
+    // begin had just set -- so the next end "restored" silence and the console
+    // never came back. That nesting is real: the wedge watch latches rendering
+    // off from inside the GSP-boot window (os_boundary's dead-fabric branch),
+    // and a RECOVERED wedge then left the machine dark for the rest of the
+    // boot, starting with the very line announcing the recovery.
+    let _ = QUIET_SAVED_LEVEL.compare_exchange(
+        usize::MAX,
+        cur as usize,
+        Ordering::Relaxed,
+        Ordering::Relaxed,
+    );
     log::set_max_level(log::LevelFilter::Off);
 }
 
-/// Leave the console-quiet window, restoring the saved log level. An
-/// unpaired call (no matching begin) is a no-op; a machine running with
-/// logging Off keeps it Off.
+/// Set while rendering must stay off no matter how the windows around it
+/// close: the console framebuffer lives in a wedged GPU's BAR1 and the next
+/// rendered line would kill the machine.
+static QUIET_LATCHED: AtomicBool = AtomicBool::new(false);
+
+/// Latch console rendering off until something says the framebuffer is safe
+/// again. Unlike [`console_quiet_begin`] this outlives a
+/// [`console_quiet_end`]; only [`console_quiet_unlatch`] lifts it, and the
+/// level to go back to is kept for whoever does.
+pub fn console_quiet_latch() {
+    QUIET_LATCHED.store(true, Ordering::Relaxed);
+    log::set_max_level(log::LevelFilter::Off);
+}
+
+/// Declare the console framebuffer safe to render into again. Called from
+/// `os_boundary::wedge_fake_mmio_clear`, which is what the recovery path runs
+/// once the device answers config space: it does not restore the level by
+/// itself, it lets the next [`console_quiet_end`] do it.
+pub fn console_quiet_unlatch() {
+    QUIET_LATCHED.store(false, Ordering::Relaxed);
+}
+
+/// Whether console rendering is latched off (for the /proc report).
+pub fn console_quiet_latched() -> bool {
+    QUIET_LATCHED.load(Ordering::Relaxed)
+}
+
+/// Leave the console-quiet window, restoring the level from before the
+/// outermost begin. An unpaired call (no matching begin) is a no-op; so is one
+/// made while rendering is latched off, which keeps the saved level for the
+/// call that follows the unlatch.
 pub fn console_quiet_end() {
+    if QUIET_LATCHED.load(Ordering::Relaxed) {
+        return;
+    }
     let saved = QUIET_SAVED_LEVEL.swap(usize::MAX, Ordering::Relaxed);
-    let level = match saved {
+    log::set_max_level(match level_from_usize(saved) {
+        Some(level) => level,
+        None => return, // usize::MAX sentinel: no window was active
+    });
+}
+
+/// The `log::LevelFilter` a `LevelFilter as usize` came from.
+///
+/// [`console_quiet_begin`] stores the discriminant and this reads it back, so
+/// the two halves have to agree about all six of them; a test walks every
+/// level through a window rather than trusting that they do.
+fn level_from_usize(saved: usize) -> Option<log::LevelFilter> {
+    Some(match saved {
         0 => log::LevelFilter::Off,
         1 => log::LevelFilter::Error,
         2 => log::LevelFilter::Warn,
         3 => log::LevelFilter::Info,
         4 => log::LevelFilter::Debug,
         5 => log::LevelFilter::Trace,
-        _ => return, // usize::MAX sentinel: no window was active
-    };
-    log::set_max_level(level);
+        _ => return None,
+    })
 }
 
 /// Probe-diagnostic line: ALWAYS lands in the capture buffer (folded into the
@@ -760,12 +835,35 @@ const LOG_CAPTURE_CAP: usize = 256 * 1024;
 /// Start (or restart) capturing RM log lines into an in-memory buffer, in
 /// addition to the normal `log::warn!` sink.
 pub fn capture_begin() {
+    CAPTURE_DROPPED.store(0, Ordering::Relaxed);
     *LOG_CAPTURE.lock() = Some(String::new());
 }
 
-/// Stop capturing and return everything captured since `capture_begin`.
+/// Narration lines the cap turned away since the last `capture_begin`.
+static CAPTURE_DROPPED: AtomicU32 = AtomicU32::new(0);
+
+/// Stop capturing and return everything captured since `capture_begin`, with a
+/// final line when the cap turned any narration away.
+///
+/// The buffer is the only place the RM's narration reaches the person reading
+/// it -- the kernel log stream does not reach the monitor on the bring-up box,
+/// only `cat /proc/gpustepN` does -- and what the cap drops is the TAIL, which
+/// is the part nearest whatever went wrong. Dropping it quietly made a
+/// truncated report look like a complete one that simply stopped.
 pub fn capture_take() -> Option<String> {
-    LOG_CAPTURE.lock().take()
+    let mut buf = LOG_CAPTURE.lock().take()?;
+    let dropped = CAPTURE_DROPPED.swap(0, Ordering::Relaxed);
+    if dropped != 0 {
+        let _ = core::fmt::Write::write_fmt(
+            &mut buf,
+            format_args!(
+                "[nvidia-rm] ...TRUNCATED: {} further narration line(s) dropped after the {} KiB capture cap; the end of this boot's narration is NOT here.\n",
+                dropped,
+                LOG_CAPTURE_CAP / 1024
+            ),
+        );
+    }
+    Some(buf)
 }
 
 fn capture_push(s: &str) {
@@ -774,6 +872,8 @@ fn capture_push(s: &str) {
         if buf.len() < LOG_CAPTURE_CAP {
             buf.push_str(s);
             buf.push('\n');
+        } else {
+            CAPTURE_DROPPED.fetch_add(1, Ordering::Relaxed);
         }
     }
 }
@@ -807,11 +907,19 @@ fn log_raw_cstr(str_: *const c_char) {
             p = p.add(1);
         }
         let slice = core::slice::from_raw_parts(str_ as *const u8, len);
-        // GPU-independent survival breadcrumb: bump the CMOS narration counter on
-        // every RM line so a wedge's surviving count says how far the RM's own
-        // narration got (see crate::survival / /proc/gpusurvive).
+        // The GPU-independent survival breadcrumb used to be bumped here, once
+        // per RM line. It is a no-op now: the CMOS write it fed is disabled, so
+        // the read that produced its value had no consumer, and it was four port
+        // accesses with NMI masked on every line (see crate::survival).
         crate::survival::narration_tick();
-        if let Ok(s) = core::str::from_utf8(slice) {
+        // A single byte the RM got from the GPU (a monitor name out of an EDID,
+        // a VBIOS string) used to drop the WHOLE line: no log, no capture, and
+        // with it the two things this routine latches on -- arming the
+        // sequencer trace and restoring PDISP. Replace the bad bytes instead;
+        // `from_utf8_lossy` borrows and allocates nothing for the normal line.
+        let lossy = alloc::string::String::from_utf8_lossy(slice);
+        {
+            let s: &str = &lossy;
             // ERROR level when live-echo is armed (opt-in step debugging);
             // DEBUG otherwise, so the routine RM narration is filtered at the
             // default LOG level.
@@ -1574,3 +1682,389 @@ pub extern "C" fn os_cgroup_get_from_fd(_fd: NvU32) -> *mut c_void {
 }
 #[no_mangle]
 pub extern "C" fn os_cgroup_put(_cgroup: *mut c_void) {}
+
+#[cfg(test)]
+mod interface_tests {
+    use super::*;
+    extern crate std;
+    use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
+    use std::sync::Mutex as StdMutex;
+
+    /// Everything this file exposes to a test lives in a process global -- the
+    /// capture buffer, `log::max_level`, the quiet latch, the last-assert hash
+    /// -- so the tests take turns and put back what they found, whether the
+    /// body passes or panics.
+    static TURNSTILE: StdMutex<()> = StdMutex::new(());
+
+    fn with_globals<F: FnOnce()>(f: F) {
+        let _guard = TURNSTILE.lock().unwrap_or_else(|e| e.into_inner());
+        let saved_level = log::max_level();
+        let saved_capture = LOG_CAPTURE.lock().take();
+        let saved_dropped = CAPTURE_DROPPED.swap(0, Ordering::Relaxed);
+        let saved_echo = LIVE_ECHO.swap(false, Ordering::Relaxed);
+        QUIET_SAVED_LEVEL.store(usize::MAX, Ordering::Relaxed);
+        QUIET_LATCHED.store(false, Ordering::Relaxed);
+        let outcome = catch_unwind(AssertUnwindSafe(f));
+        QUIET_LATCHED.store(false, Ordering::Relaxed);
+        QUIET_SAVED_LEVEL.store(usize::MAX, Ordering::Relaxed);
+        LIVE_ECHO.store(saved_echo, Ordering::Relaxed);
+        CAPTURE_DROPPED.store(saved_dropped, Ordering::Relaxed);
+        *LOG_CAPTURE.lock() = saved_capture;
+        log::set_max_level(saved_level);
+        if let Err(payload) = outcome {
+            resume_unwind(payload);
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // The name the RM prints for the process that owns a dead channel.
+    // -----------------------------------------------------------------
+
+    /// A buffer with a byte of poison on either side of the room the callee is
+    /// allowed to touch, so "wrote past the end" is a visible failure rather
+    /// than someone else's crash.
+    const POISON: u8 = 0xA5;
+
+    fn name_into(room: usize) -> (std::vec::Vec<u8>, usize) {
+        let mut buf = std::vec![POISON; room + 8];
+        write_process_name(buf.as_mut_ptr() as *mut c_char, room as NvU32);
+        let canary = room;
+        (buf, canary)
+    }
+
+    fn as_cstr(buf: &[u8]) -> &str {
+        let end = buf.iter().position(|&b| b == 0).expect("no terminator");
+        core::str::from_utf8(&buf[..end]).expect("not utf8")
+    }
+
+    #[test]
+    fn the_process_name_is_the_one_this_kernel_answers_with() {
+        let (buf, _) = name_into(64);
+        assert_eq!(as_cstr(&buf), "eclipse-kernel");
+    }
+
+    #[test]
+    fn a_process_name_that_does_not_fit_is_still_terminated() {
+        // `kernel_rc.c` prints this with `%s` out of memory it never zeroed, so
+        // a copy that fills the buffer edge to edge sends `%s` off the end.
+        for room in 1..=("eclipse-kernel".len() + 2) {
+            let (buf, _) = name_into(room);
+            assert!(
+                buf[..room].contains(&0),
+                "a {}-byte buffer came back with no terminator",
+                room
+            );
+            let text = as_cstr(&buf);
+            assert!(
+                "eclipse-kernel".starts_with(text),
+                "a {}-byte buffer came back with {:?}, which is not a prefix of the name",
+                room,
+                text
+            );
+        }
+    }
+
+    #[test]
+    fn the_process_name_never_writes_past_the_room_it_was_given() {
+        for room in 1..=20 {
+            let (buf, canary) = name_into(room);
+            assert!(
+                buf[canary..].iter().all(|&b| b == POISON),
+                "a {}-byte buffer wrote past its end: {:?}",
+                room,
+                &buf[canary..]
+            );
+        }
+    }
+
+    #[test]
+    fn a_single_byte_of_room_holds_the_terminator_and_nothing_else() {
+        let (buf, _) = name_into(1);
+        assert_eq!(
+            buf[0], 0,
+            "one byte of room must be spent on the terminator"
+        );
+    }
+
+    #[test]
+    fn no_room_and_no_buffer_are_both_left_alone() {
+        let mut buf = std::vec![POISON; 8];
+        write_process_name(buf.as_mut_ptr() as *mut c_char, 0);
+        assert!(
+            buf.iter().all(|&b| b == POISON),
+            "zero length wrote something: {:?}",
+            buf
+        );
+        write_process_name(core::ptr::null_mut(), 64);
+    }
+
+    #[test]
+    fn both_spellings_of_the_process_name_write_the_same_bytes() {
+        // The half the RM actually calls is the CamelCase one; it used to
+        // return without writing anything at all.
+        let mut theirs = std::vec![POISON; 40];
+        let mut ours = std::vec![POISON; 40];
+        crate::os_boundary::osGetCurrentProcessName(theirs.as_mut_ptr() as *mut c_char, 32);
+        os_get_current_process_name(ours.as_mut_ptr() as *mut c_char, 32);
+        assert_eq!(theirs, ours, "the two spellings disagree");
+        assert_eq!(as_cstr(&theirs), "eclipse-kernel");
+    }
+
+    // -----------------------------------------------------------------
+    // The console-quiet window around the GSP boot.
+    // -----------------------------------------------------------------
+
+    const EVERY_LEVEL: [log::LevelFilter; 6] = [
+        log::LevelFilter::Off,
+        log::LevelFilter::Error,
+        log::LevelFilter::Warn,
+        log::LevelFilter::Info,
+        log::LevelFilter::Debug,
+        log::LevelFilter::Trace,
+    ];
+
+    #[test]
+    fn every_log_level_survives_a_quiet_window() {
+        with_globals(|| {
+            // The level is stored as `LevelFilter as usize` and read back by a
+            // table written by hand; walk all six rather than trust that the
+            // two halves agree.
+            for &level in EVERY_LEVEL.iter() {
+                log::set_max_level(level);
+                console_quiet_begin();
+                assert_eq!(
+                    log::max_level(),
+                    log::LevelFilter::Off,
+                    "the window did not silence {}",
+                    level
+                );
+                console_quiet_end();
+                assert_eq!(log::max_level(), level, "{} did not come back", level);
+            }
+        });
+    }
+
+    #[test]
+    fn a_window_nested_inside_another_does_not_bury_the_level() {
+        with_globals(|| {
+            log::set_max_level(log::LevelFilter::Warn);
+            console_quiet_begin();
+            console_quiet_begin();
+            console_quiet_end();
+            assert_eq!(
+                log::max_level(),
+                log::LevelFilter::Warn,
+                "the inner begin saved the silence the outer one had just set"
+            );
+        });
+    }
+
+    #[test]
+    fn a_recovered_wedge_gives_the_console_back() {
+        with_globals(|| {
+            // The real sequence: the GSP boot opens a quiet window, the wedge
+            // watch finds the fabric dead and latches rendering off, the
+            // recovery finds the device answering config space again, and the
+            // window closes. The line that announces the recovery is the first
+            // one that has to render.
+            log::set_max_level(log::LevelFilter::Warn);
+            console_quiet_begin();
+            crate::os_boundary::wedge_console_suppress_for_test();
+            crate::os_boundary::wedge_fake_mmio_clear();
+            console_quiet_end();
+            assert_eq!(
+                log::max_level(),
+                log::LevelFilter::Warn,
+                "the console stayed dark after the wedge was recovered"
+            );
+        });
+    }
+
+    #[test]
+    fn an_unrecovered_wedge_keeps_the_console_dark() {
+        with_globals(|| {
+            // The framebuffer lives in the wedged GPU's BAR1, so the next
+            // rendered line would take the machine with it. Closing the window
+            // must not undo the latch.
+            log::set_max_level(log::LevelFilter::Warn);
+            console_quiet_begin();
+            crate::os_boundary::wedge_console_suppress_for_test();
+            console_quiet_end();
+            assert_eq!(
+                log::max_level(),
+                log::LevelFilter::Off,
+                "closing the window rendered into a dead GPU's BAR1"
+            );
+            assert!(console_quiet_latched(), "the latch did not survive the end");
+            // ...and the level is still there for the attempt that recovers.
+            console_quiet_unlatch();
+            console_quiet_end();
+            assert_eq!(
+                log::max_level(),
+                log::LevelFilter::Warn,
+                "the level was consumed by the end that had to refuse"
+            );
+        });
+    }
+
+    #[test]
+    fn an_end_with_no_window_open_changes_nothing() {
+        with_globals(|| {
+            log::set_max_level(log::LevelFilter::Info);
+            console_quiet_end();
+            assert_eq!(log::max_level(), log::LevelFilter::Info);
+        });
+    }
+
+    #[test]
+    fn a_level_that_no_filter_encodes_is_not_restored_as_one() {
+        assert!(level_from_usize(usize::MAX).is_none());
+        assert!(level_from_usize(6).is_none());
+        for (n, &level) in EVERY_LEVEL.iter().enumerate() {
+            assert_eq!(level_from_usize(n), Some(level), "level {}", n);
+            assert_eq!(level as usize, n, "discriminant of {}", level);
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // The capture buffer, which is the only place this narration is read.
+    // -----------------------------------------------------------------
+
+    fn fill_capture_to_the_cap() {
+        let big: String = core::iter::repeat('x').take(LOG_CAPTURE_CAP).collect();
+        capture_push(&big);
+    }
+
+    #[test]
+    fn a_capture_that_fit_says_nothing_about_truncation() {
+        with_globals(|| {
+            capture_begin();
+            capture_push("one");
+            capture_push("two");
+            let got = capture_take().expect("no buffer");
+            assert_eq!(got, "one\ntwo\n");
+        });
+    }
+
+    #[test]
+    fn the_capture_says_when_it_dropped_the_end_of_the_narration() {
+        with_globals(|| {
+            // What the cap turns away is the TAIL, which is the part nearest
+            // whatever went wrong; dropping it quietly made a truncated report
+            // read like a complete one.
+            capture_begin();
+            fill_capture_to_the_cap();
+            for _ in 0..7 {
+                capture_push("a line nobody will ever see");
+            }
+            let got = capture_take().expect("no buffer");
+            assert!(
+                got.contains("TRUNCATED"),
+                "the report did not say it was cut short"
+            );
+            assert!(
+                got.contains("7 further narration line(s) dropped"),
+                "the report did not say how much it lost: {:?}",
+                &got[got.len() - 200..]
+            );
+        });
+    }
+
+    #[test]
+    fn a_dropped_count_does_not_leak_into_the_next_capture() {
+        with_globals(|| {
+            // Not via `capture_take`, which clears the count on its way out: a
+            // window that is abandoned and reopened is the case that used to
+            // carry the previous boot's losses into the next report.
+            capture_begin();
+            fill_capture_to_the_cap();
+            capture_push("dropped");
+            capture_begin();
+            capture_push("this one fit");
+            let got = capture_take().expect("no buffer");
+            assert_eq!(got, "this one fit\n", "a stale drop count came along");
+        });
+    }
+
+    #[test]
+    fn narration_outside_a_capture_window_is_not_counted_as_dropped() {
+        with_globals(|| {
+            capture_push("nobody asked for this");
+            capture_begin();
+            capture_push("kept");
+            let got = capture_take().expect("no buffer");
+            assert_eq!(got, "kept\n");
+        });
+    }
+
+    // -----------------------------------------------------------------
+    // The RM narration path itself.
+    // -----------------------------------------------------------------
+
+    fn narrate(bytes: &[u8]) {
+        let mut owned = std::vec::Vec::from(bytes);
+        owned.push(0);
+        log_raw_cstr(owned.as_ptr() as *const c_char);
+    }
+
+    #[test]
+    fn a_narration_line_costs_nothing_that_needs_a_kernel() {
+        // The breadcrumb this used to bump was four port accesses to 0x70/0x71
+        // per line, with NMI masked; `out dx, al` outside the kernel is a fault,
+        // so this call is the whole proof that the path is free of it.
+        for _ in 0..1000 {
+            crate::survival::narration_tick();
+        }
+    }
+
+    #[test]
+    fn a_narration_line_reaches_the_capture() {
+        with_globals(|| {
+            capture_begin();
+            narrate(b"NVRM: ordinary narration");
+            let got = capture_take().expect("no buffer");
+            assert_eq!(got, "NVRM: ordinary narration\n");
+        });
+    }
+
+    #[test]
+    fn a_narration_line_with_a_byte_that_is_not_utf8_is_not_thrown_away() {
+        with_globals(|| {
+            // The RM prints strings it got from the GPU -- a monitor name out of
+            // an EDID, a VBIOS string -- and one stray byte used to drop the
+            // whole line: no log, no capture, nothing.
+            capture_begin();
+            narrate(b"NVRM: monitor name \xFF\xFE here");
+            let got = capture_take().expect("no buffer");
+            assert!(
+                got.contains("NVRM: monitor name "),
+                "the line was thrown away over a byte: {:?}",
+                got
+            );
+            assert!(
+                got.contains(" here"),
+                "the text after the bad byte was lost: {:?}",
+                got
+            );
+        });
+    }
+
+    #[test]
+    fn a_bad_byte_does_not_swallow_what_the_line_was_going_to_trigger() {
+        with_globals(|| {
+            // This routine latches on two lines: the sequencer RPC arms the
+            // register trace, and "RISCV started" restores PDISP. Dropping a
+            // line over one byte dropped its side effect with it.
+            crate::os_boundary::seq_trace_arm();
+            capture_begin();
+            narrate(b"NVRM: RPC \xFF RUN_CPU_SEQUENCER received");
+            let got = capture_take().expect("no buffer");
+            crate::os_boundary::seq_trace_disarm();
+            assert!(
+                got.contains("SEQ trace LIVE"),
+                "the sequencer trace never went live: {:?}",
+                got
+            );
+        });
+    }
+}

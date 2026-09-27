@@ -632,10 +632,33 @@ pub fn wedge_detected() -> bool {
     WEDGE_DETECTED.load(core::sync::atomic::Ordering::Relaxed)
 }
 
+/// Stop rendering to the console because the GPU whose BAR1 holds the console
+/// framebuffer has stopped answering: the next rendered line would take the
+/// machine with it, and the /proc report has to survive.
+///
+/// This must LATCH, not open a window: it fires from inside the GSP boot's own
+/// console-quiet window, and an ordinary nested window would be closed again by
+/// that window's end -- which is how a boot that recovered from a wedge used to
+/// go dark, and how one that did not recover used to render into a dead BAR1.
+fn wedge_console_suppress() {
+    crate::os_interface::console_quiet_latch();
+}
+
+/// The same call the dead-fabric branch makes, reachable from a test: what has
+/// to hold is that a wedge's suppression outlives the window it happened in.
+#[cfg(test)]
+pub(crate) fn wedge_console_suppress_for_test() {
+    wedge_console_suppress();
+}
+
 /// Clear fake-MMIO mode after a successful bus recovery (BARs restored and
 /// the device answering config cycles again).
 pub fn wedge_fake_mmio_clear() {
     WEDGE_FAKE_MMIO.store(false, core::sync::atomic::Ordering::Relaxed);
+    // The device answers config space again, so the console framebuffer in its
+    // BAR1 is safe to render into: lift the latch the wedge branch set, and let
+    // the `console_quiet_end` that follows actually restore the log level.
+    crate::os_interface::console_quiet_unlatch();
 }
 
 /// Is fake-MMIO mode active?
@@ -1283,7 +1306,7 @@ pub extern "C" fn osDevWriteReg032(
                         // BAR1: suppress ALL rendering or the next log line
                         // kills the machine. Capture keeps recording for the
                         // /proc report.
-                        crate::os_interface::console_quiet_begin();
+                        wedge_console_suppress();
                     }
                 }
                 startcpu_posted = true;
@@ -1579,9 +1602,15 @@ pub extern "C" fn osGetCurrentProcess() -> NvU32 {
 }
 
 #[no_mangle]
-pub extern "C" fn osGetCurrentProcessName(arg0: *mut c_char, arg1: NvU32) {
-    let _ = arg0;
-    let _ = arg1;
+pub extern "C" fn osGetCurrentProcessName(pName: *mut c_char, maxLength: NvU32) {
+    // This did nothing, and no caller zeroes the buffer first. `kernel_rc.c`
+    // hands the Xid path a fresh `portMemAllocNonPaged(NV_PROC_NAME_MAX_LENGTH)`
+    // and prints the result as `name=%s` on the Xid line -- the one line of a
+    // dead-channel boot that says what died -- so that name came out of
+    // uninitialized kernel heap, and `%s` ran on until it found a zero byte,
+    // which need not be inside the hundred bytes it was given. `client.c:118`
+    // fills every `RmClient::name` from here too.
+    crate::os_interface::write_process_name(pName, maxLength);
 }
 
 #[no_mangle]
