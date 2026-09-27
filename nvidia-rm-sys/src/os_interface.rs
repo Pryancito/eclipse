@@ -66,16 +66,37 @@ pub static os_imex_channel_is_supported: NvBool = NV_FALSE;
 // ---------------------------------------------------------------------
 const ALLOC_ALIGN: usize = 16;
 const HEADER_PAD: usize = ALLOC_ALIGN; // one aligned slot is plenty for a usize
+/// The widest `HEADER_PAD + size` `os_free_mem` will accept back from the
+/// header before calling it corruption. `os_alloc_mem` refuses anything larger
+/// up front, because an allocation this pair cannot free is a silent permanent
+/// leak reported as heap corruption -- and the x86_64 kernel heap is 512 MiB
+/// (`KERNEL_HEAP_SIZE` in zCore/src/memory_x86_64.rs), so a request above this
+/// ceiling is one the heap could otherwise have served.
+const MAX_SANE_TOTAL: usize = 256 * 1024 * 1024;
 
 #[no_mangle]
 pub extern "C" fn os_alloc_mem(p_address: *mut *mut c_void, size: NvU64) -> NV_STATUS {
     if p_address.is_null() {
         return NV_ERR_INVALID_ARGUMENT;
     }
+    // Cleared before anything can fail, which is what the real os_alloc_mem
+    // does on entry (`*address = NULL;`) and what at least one caller relies on
+    // instead of the status: `_portMemAllocNonPagedUntracked`
+    // (memory_unix_kernel_os.c:61) calls this and returns the pointer without
+    // ever looking at what came back. That caller zeroes its own local first,
+    // so it survives either way -- but the contract is the contract, and the
+    // next caller may not.
+    unsafe { *p_address = core::ptr::null_mut() };
     let total = match HEADER_PAD.checked_add(size as usize) {
         Some(t) => t,
         None => return NV_ERR_INVALID_ARGUMENT,
     };
+    if total > MAX_SANE_TOTAL {
+        // Not INVALID_ARGUMENT: the size is well-formed, we just will not be
+        // able to hand it back. NV_ERR_NO_MEMORY is what every caller already
+        // handles for "this allocator cannot serve that".
+        return NV_ERR_NO_MEMORY;
+    }
     let layout = match Layout::from_size_align(total, ALLOC_ALIGN) {
         Ok(l) => l,
         Err(_) => return NV_ERR_INVALID_ARGUMENT,
@@ -114,8 +135,7 @@ pub extern "C" fn os_free_mem(p_address: *mut c_void) {
         // Refuse the free: leak this one block (bounded, recoverable, and now
         // DIAGNOSED) rather than let a single bad free corrupt the whole heap.
         const MIN_SANE: usize = HEADER_PAD;
-        const MAX_SANE: usize = 256 * 1024 * 1024;
-        if !(MIN_SANE..=MAX_SANE).contains(&total) {
+        if !(MIN_SANE..=MAX_SANE_TOTAL).contains(&total) {
             log::error!(
                 "[nvidia-rm] os_free_mem: REFUSING free of {:p} — header size \
                  {:#x} is insane (raw {:p}); double-free or header corruption. \
@@ -144,9 +164,12 @@ pub extern "C" fn os_get_monotonic_time_ns() -> NvU64 {
 pub extern "C" fn os_get_monotonic_time_ns_hr() -> NvU64 {
     with_hooks(0, |h| h.monotonic_time_ns())
 }
+/// Twin of `os_services::osGetMonotonicTickResolutionNs`, which said 1_000
+/// where this said 1. `gpu_timeout.c` adds one of these to every GPU timeout,
+/// so the two padded every timeout differently by a factor of a thousand.
 #[no_mangle]
 pub extern "C" fn os_get_monotonic_tick_resolution_ns() -> NvU64 {
-    1
+    crate::os_services::osGetMonotonicTickResolutionNs()
 }
 #[no_mangle]
 pub extern "C" fn os_delay(milliseconds: NvU32) -> NV_STATUS {
@@ -164,9 +187,22 @@ pub extern "C" fn os_delay_us(microseconds: NvU32) -> NV_STATUS {
 /// not a divisor anywhere at construction time (checked), but a 0 MHz
 /// CPU clock would flow into later consumers (e.g. GSP boot arguments),
 /// so report the real value.
+/// Calibrated once and kept, because the calibration costs 10 ms of wall time.
+/// At module scope rather than inside the function so a test can put a known
+/// frequency in it: on the host the calibration measures a `delay_us` that does
+/// not delay, which comes out under a megahertz and therefore zero megahertz --
+/// the same answer as the bug, which would make the test that catches the bug
+/// unable to fail.
+static CACHED_HZ: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Test-only: put `hz` in the cache and hand back what was there.
+#[cfg(test)]
+pub(crate) fn swap_cached_cpu_hz(hz: NvU64) -> NvU64 {
+    CACHED_HZ.swap(hz, Ordering::SeqCst)
+}
+
 #[no_mangle]
 pub extern "C" fn os_get_cpu_frequency() -> NvU64 {
-    static CACHED_HZ: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
     let cached = CACHED_HZ.load(Ordering::Relaxed);
     if cached != 0 {
         return cached;
@@ -529,17 +565,37 @@ pub extern "C" fn os_flush_cpu_cache_all() -> NV_STATUS {
 pub extern "C" fn os_flush_user_cache() -> NV_STATUS {
     NV_OK
 }
-#[no_mangle]
-pub extern "C" fn os_flush_cpu_write_combine_buffer() {
-    // x86_64: use the SFENCE instruction to flush the write-combining buffer.
-    // Other architectures do not have a write-combining buffer requiring an
-    // explicit flush; a compiler fence suffices.
+/// Test-only tally of how many times `write_combine_fence` ran, so a test can
+/// prove that BOTH exported spellings of the flush reach it. The fence itself
+/// leaves no trace a test could see.
+#[cfg(test)]
+pub(crate) static WC_FENCES: AtomicU32 = AtomicU32::new(0);
+
+/// The one store fence behind every write-combine flush in this crate.
+///
+/// The RM writes into write-combined mappings (BAR1 pushbuffers, notifiers,
+/// semaphores) and then tells the GPU to go read them; this is the only thing
+/// between the two. It exists as a shared helper because the ABI spells the
+/// same flush twice -- `os_flush_cpu_write_combine_buffer` here and
+/// `osFlushCpuWriteCombineBuffer` in `os_boundary.rs` -- and one of the two
+/// used to be an empty body, which is a fence that silently isn't one.
+pub(crate) fn write_combine_fence() {
+    #[cfg(test)]
+    WC_FENCES.fetch_add(1, Ordering::Relaxed);
+    // x86_64: SFENCE is what orders write-combining stores; a compiler fence
+    // would not. Other architectures have no write-combining buffer needing an
+    // explicit flush, so a full fence is both sufficient and available.
     #[cfg(target_arch = "x86_64")]
     unsafe {
         core::arch::asm!("sfence")
     };
     #[cfg(not(target_arch = "x86_64"))]
-    core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+    core::sync::atomic::fence(Ordering::SeqCst);
+}
+
+#[no_mangle]
+pub extern "C" fn os_flush_cpu_write_combine_buffer() {
+    write_combine_fence();
 }
 #[no_mangle]
 pub extern "C" fn os_io_read_byte(port: NvU32) -> NvU8 {
@@ -570,13 +626,24 @@ pub extern "C" fn os_io_write_dword(port: NvU32, value: NvU32) {
 // Permissions (REAL, trivially) -- everything in this driver already runs
 // fully privileged in kernel context.
 // ---------------------------------------------------------------------
+/// Both of these are the OS half of a pair the real driver ties together:
+/// `os.c` defines `osIsAdministrator()` as `return os_is_administrator();` and
+/// `osCheckAccess()` as `return os_check_access(accessRight);`. build.rs
+/// excludes `arch/nvalloc/unix/src/`, so this crate supplies both halves, and
+/// these two used to answer the opposite of their twins -- a blanket yes here
+/// against a considered no there. Unified on the twin, which is the half the
+/// compiled RM actually calls, so the answer cannot depend on which spelling a
+/// caller happens to use. The privilege POLICY lives in one place now
+/// (`os_boundary::access_granted`); this is only the plumbing.
 #[no_mangle]
 pub extern "C" fn os_is_administrator() -> NvBool {
-    NV_TRUE
+    crate::os_boundary::osIsAdministrator()
 }
+/// `RsAccessRight` is `NvU16` (src/common/sdk/nvidia/inc/rs_access.h:73), not
+/// `u32`; the width is fixed here along with the answer.
 #[no_mangle]
-pub extern "C" fn os_check_access(_access_right: u32) -> NvBool {
-    NV_TRUE
+pub extern "C" fn os_check_access(access_right: NvU16) -> NvBool {
+    crate::os_boundary::osCheckAccess(access_right)
 }
 #[no_mangle]
 pub extern "C" fn os_get_euid(euid: *mut NvU32) -> NV_STATUS {
@@ -852,14 +919,19 @@ pub extern "C" fn os_enable_console_access() {}
 pub extern "C" fn os_registry_init() -> NV_STATUS {
     NV_OK
 }
+/// Twin of `os_boundary::osGetMaxUserVa`. This said one byte less than that
+/// one; the shift the RM derives (`osGetCpuVaAddrShift`) came out 48 either
+/// way, but two answers to "where does user space end" is one too many.
 #[no_mangle]
 pub extern "C" fn os_get_max_user_va() -> NvU64 {
-    0x0000_7FFF_FFFF_FFFF
+    crate::os_boundary::osGetMaxUserVa()
 }
+/// Twin of `os_services::osSchedule`, which drains this CPU's TLB-shootdown
+/// queue. A bare `spin_loop()` yields nothing at all, so the two disagreed
+/// about what "schedule" means; unified on the one the RM calls.
 #[no_mangle]
 pub extern "C" fn os_schedule() -> NV_STATUS {
-    core::hint::spin_loop();
-    NV_OK
+    crate::os_services::osSchedule()
 }
 
 // ---------------------------------------------------------------------

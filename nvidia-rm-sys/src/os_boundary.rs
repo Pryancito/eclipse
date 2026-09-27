@@ -73,9 +73,14 @@ pub extern "C" fn osAllocReleasePage(arg0: NvU64, arg1: NvU32) {
     let _ = arg1;
 }
 
+/// Clears the handle before refusing, like the twin. `mem_multicast_fabric.c`
+/// calls this under `NV_ASSERT_OK(...)`, which in a release build logs and
+/// carries on, so what lands in `pWq` is what the caller then uses.
 #[no_mangle]
 pub extern "C" fn osAllocWaitQueue(ppWq: *mut *mut c_void) -> NV_STATUS {
-    let _ = ppWq;
+    if !ppWq.is_null() {
+        unsafe { *ppWq = core::ptr::null_mut() };
+    }
     NV_ERR_NOT_SUPPORTED
 }
 
@@ -120,9 +125,54 @@ pub extern "C" fn osAttachToProcess(arg0: *mut *mut c_void, arg1: NvU32) -> NV_S
     NV_ERR_NOT_SUPPORTED
 }
 
+/// Transcribed from `OS_BUG_CHECK_BUGCODE_STR` in
+/// src/nvidia/generated/g_os_nvoc.h:202, indexed by bug code; the last index is
+/// `OS_BUG_CHECK_BUGCODE_LAST`.
+const BUG_CHECK_NAMES: [&str; 8] = [
+    "Unknown Error",
+    "Nv Internal Testing",
+    "Bus Error",
+    "Reserved",
+    "Reserved",
+    "Invalid Bindata Access",
+    "BSOD on Assert or Breakpoint",
+    "Display Underflow",
+];
+
+/// Does not return. The real `os.c` clamps the code and calls
+/// `os_bug_check(bugCode, ppOsBugCheckBugcodeStr[bugCode])`, which on Linux is
+/// `panic(bugCodeStr)`. This was an empty body, so the RM carried on past a
+/// condition it had just declared unrecoverable -- while the twin
+/// `os_bug_check` in `os_interface.rs` halts, as it should.
+/// `-> !` on purpose: the C header says `void osBugCheck(NvU32)`, and a
+/// never-returning function is a valid one of those. Writing it into the
+/// signature is what makes "this does not return" checkable, because a test
+/// cannot check it -- an `extern "C"` function is nounwind, so the halt aborts
+/// the process rather than unwinding into `catch_unwind`. With `!` here, the
+/// empty body this used to have does not compile.
 #[no_mangle]
-pub extern "C" fn osBugCheck(bugCode: NvU32) {
-    let _ = bugCode;
+pub extern "C" fn osBugCheck(bugCode: NvU32) -> ! {
+    bug_check_halt(bugCode, bug_check_name(bugCode));
+}
+
+/// The clamp the real `os.c` does before indexing: a code past the end of the
+/// table is the unknown one, not an out-of-bounds read.
+fn bug_check_name(code: NvU32) -> &'static str {
+    let index = if (code as usize) < BUG_CHECK_NAMES.len() {
+        code as usize
+    } else {
+        0
+    };
+    BUG_CHECK_NAMES[index]
+}
+
+/// Split out from `osBugCheck` so a test can watch it diverge. It cannot be
+/// tested through `osBugCheck` itself: an `extern "C"` function is nounwind, so
+/// a panic crossing that boundary aborts the process instead of unwinding --
+/// which is exactly what is wanted in the kernel, where the panic handler
+/// halts, and useless to a test.
+fn bug_check_halt(code: NvU32, name: &str) -> ! {
+    panic!("[nvidia-rm] osBugCheck({}): {}", code, name);
 }
 
 #[no_mangle]
@@ -1437,10 +1487,13 @@ pub extern "C" fn osEventNotificationWithInfo(
     NV_ERR_NOT_SUPPORTED
 }
 
+/// Clears the pid before refusing, like the twin.
 #[no_mangle]
 pub extern "C" fn osFindNsPid(pOsPidInfo: *mut c_void, pNsPid: *mut NvU32) -> NV_STATUS {
     let _ = pOsPidInfo;
-    let _ = pNsPid;
+    if !pNsPid.is_null() {
+        unsafe { *pNsPid = 0 };
+    }
     NV_ERR_NOT_SUPPORTED
 }
 
@@ -1449,8 +1502,20 @@ pub extern "C" fn osFlushCpuCache() -> NV_STATUS {
     NV_ERR_NOT_SUPPORTED
 }
 
+/// The RM's only fence between a CPU write into a write-combined mapping and
+/// telling the GPU to read it: 27 call sites in the compiled RM (among them
+/// `channel_utils.c`, `method_notification.c` and Turing's own BAR1/BAR2 bind
+/// in `kern_bus_tu102.c`) and 36 more in Eclipse's own `eclipse_rm_init.c`.
+///
+/// It was an empty body, while the same flush spelled
+/// `os_flush_cpu_write_combine_buffer` in `os_interface.rs` did the SFENCE --
+/// and the compiled RM calls only this spelling, because build.rs excludes the
+/// `arch/nvalloc/unix/src/os.c` that would have tied the two together. Both go
+/// through one helper now.
 #[no_mangle]
-pub extern "C" fn osFlushCpuWriteCombineBuffer() {}
+pub extern "C" fn osFlushCpuWriteCombineBuffer() {
+    crate::os_interface::write_combine_fence();
+}
 
 #[no_mangle]
 pub extern "C" fn osFlushGpuCoherentCpuCacheRange(
@@ -1484,14 +1549,28 @@ pub extern "C" fn osGetAcpiRsdpFromUefi(pRsdpAddr: *mut NvU32) -> NV_STATUS {
     NV_ERR_NOT_SUPPORTED
 }
 
+/// `cpu.c` puts this straight into `pSys->cpuInfo.numPhysicalCpus` and
+/// `numLogicalCpus`. Zero is not a possible number of CPUs, and the twin in
+/// `os_interface.rs` already answered 1.
 #[no_mangle]
 pub extern "C" fn osGetCpuCount() -> NvU32 {
-    0
+    crate::os_interface::os_get_cpu_count()
 }
 
+/// **Megahertz**, not hertz: the real `os.c` is
+/// `return (NvU32)(os_get_cpu_frequency() / 1000000ULL);`. The twin here
+/// measures the TSC in Hz and its own doc comment already said it "feeds
+/// osGetCpuFrequency (Hz -> MHz)" -- the conversion was just never written, so
+/// this reported 0 MHz into `pSys->cpuInfo.clock`, which `client_resource.c`
+/// hands to userspace.
 #[no_mangle]
 pub extern "C" fn osGetCpuFrequency() -> NvU32 {
-    0
+    hz_to_mhz(crate::os_interface::os_get_cpu_frequency())
+}
+
+/// Truncating, like the C cast it replaces: anything under a megahertz is 0.
+fn hz_to_mhz(hz: NvU64) -> NvU32 {
+    (hz / 1_000_000) as NvU32
 }
 
 #[no_mangle]
@@ -1887,9 +1966,12 @@ pub extern "C" fn osHandleGpuLost(arg0: *mut c_void, arg1: NvBool) -> NV_STATUS 
     NV_ERR_NOT_SUPPORTED
 }
 
+/// A count, so never negative: `client_resource.c` tests it with `!= 0` and
+/// `== 0`. The twin said 0, which is also what `os_imex_channel_is_supported`
+/// being `NV_FALSE` implies.
 #[no_mangle]
 pub extern "C" fn osImexChannelCount() -> NvS32 {
-    -1
+    crate::os_interface::os_imex_channel_count()
 }
 
 #[no_mangle]
@@ -1953,9 +2035,13 @@ pub extern "C" fn osIsISR() -> NvBool {
     NV_FALSE
 }
 
+/// Eclipse has no PID namespaces at all, so it is vacuously the only one --
+/// which is what the twin in `os_interface.rs` already said. Answering no sent
+/// `kern_perf_ctrl.c` down the "translate every sample's pid" path instead of
+/// its `if (osIsInitNs()) return NV_OK;` shortcut, to translate nothing.
 #[no_mangle]
 pub extern "C" fn osIsInitNs() -> NvBool {
-    NV_FALSE
+    crate::os_interface::os_is_init_ns()
 }
 
 #[no_mangle]
@@ -2252,9 +2338,15 @@ pub extern "C" fn osOfflinePageAtAddress(address: NvU64) -> NV_STATUS {
     NV_ERR_NOT_SUPPORTED
 }
 
+/// Clears the handle before refusing. `fbsr_gm107.c:497` passes a *struct
+/// field* (`pFbsr->pagedBufferInfo.sectionHandle`) rather than a fresh local,
+/// so leaving it untouched leaves whatever the last suspend/resume cycle put
+/// there; the twin in `os_interface.rs` already cleared it.
 #[no_mangle]
 pub extern "C" fn osOpenTemporaryFile(ppFile: *mut *mut c_void) -> NV_STATUS {
-    let _ = ppFile;
+    if !ppFile.is_null() {
+        unsafe { *ppFile = core::ptr::null_mut() };
+    }
     NV_ERR_NOT_SUPPORTED
 }
 
@@ -3662,5 +3754,262 @@ mod boundary_tests {
             assert_eq!(osDelayNs(1_500), NV_OK);
             assert_eq!(osDelay(1), NV_OK);
         });
+    }
+
+    // -----------------------------------------------------------------
+    // The same question asked twice. In the real driver
+    // arch/nvalloc/unix/src/os.c is what ties each `osXxx` to its `os_xxx`
+    // twin -- `osIsAdministrator()` IS `return os_is_administrator();` -- but
+    // build.rs excludes that whole directory, so this crate supplies both
+    // halves independently, and the compiled RM calls only the `osXxx` one.
+    // Every test below is an equality that used to be false.
+    // -----------------------------------------------------------------
+
+    /// The one that mattered, and the one nothing else could have caught: a
+    /// store fence leaves no trace, so an empty body reads as a working flush.
+    /// Both spellings go through one helper that counts itself under
+    /// `cfg(test)`.
+    #[test]
+    fn both_spellings_of_the_write_combine_flush_reach_the_fence() {
+        static TURNSTILE: StdMutex<()> = StdMutex::new(());
+        let _guard = TURNSTILE.lock().unwrap_or_else(|e| e.into_inner());
+        let before = crate::os_interface::WC_FENCES.load(Ordering::SeqCst);
+        osFlushCpuWriteCombineBuffer();
+        assert_eq!(
+            crate::os_interface::WC_FENCES.load(Ordering::SeqCst),
+            before + 1,
+            "osFlushCpuWriteCombineBuffer did not reach the fence",
+        );
+        crate::os_interface::os_flush_cpu_write_combine_buffer();
+        assert_eq!(
+            crate::os_interface::WC_FENCES.load(Ordering::SeqCst),
+            before + 2,
+            "os_flush_cpu_write_combine_buffer did not reach the fence",
+        );
+    }
+
+    /// `cpu.c` copies this into `numPhysicalCpus` and `numLogicalCpus`.
+    #[test]
+    fn a_cpu_count_of_zero_is_not_an_answer() {
+        assert!(osGetCpuCount() >= 1, "the RM was told it has no CPUs");
+        assert_eq!(osGetCpuCount(), crate::os_interface::os_get_cpu_count());
+    }
+
+    /// The conversion the real `os.c` does with a cast, on its own: hertz in,
+    /// megahertz out, truncating.
+    #[test]
+    fn the_cpu_clock_is_reported_in_megahertz() {
+        assert_eq!(hz_to_mhz(2_900_000_000), 2_900);
+        assert_eq!(hz_to_mhz(1_000_000), 1);
+        assert_eq!(
+            hz_to_mhz(1_999_999),
+            1,
+            "megahertz truncate, they do not round"
+        );
+        assert_eq!(hz_to_mhz(999_999), 0);
+        assert_eq!(hz_to_mhz(0), 0);
+    }
+
+    /// And that the entry point performs it rather than answering 0, with a
+    /// frequency a desktop CPU would really report. Reading the twin's own
+    /// measurement instead would not do: on the host it calibrates against a
+    /// `delay_us` that does not delay, comes out under a megahertz, and so
+    /// answers 0 MHz -- the same as the bug.
+    #[test]
+    fn the_cpu_frequency_entry_point_converts_what_the_twin_measures() {
+        static TURNSTILE: StdMutex<()> = StdMutex::new(());
+        let _guard = TURNSTILE.lock().unwrap_or_else(|e| e.into_inner());
+        let previous = crate::os_interface::swap_cached_cpu_hz(2_900_000_000);
+        let outcome = catch_unwind(|| {
+            assert_eq!(crate::os_interface::os_get_cpu_frequency(), 2_900_000_000);
+            assert_eq!(osGetCpuFrequency(), 2_900);
+        });
+        crate::os_interface::swap_cached_cpu_hz(previous);
+        if let Err(p) = outcome {
+            resume_unwind(p);
+        }
+    }
+
+    /// Whether the caller is privileged decided two different ways: a blanket
+    /// yes under one spelling, a considered no under the other.
+    #[test]
+    fn the_privilege_question_has_one_answer() {
+        assert_eq!(
+            osIsAdministrator(),
+            crate::os_interface::os_is_administrator(),
+        );
+    }
+
+    /// Including through `osCheckAccess`, whose Linux default is to refuse a
+    /// right nobody has described -- so a spelling that granted everything was
+    /// the opposite of the contract, not a laxer reading of it.
+    #[test]
+    fn a_right_is_answered_the_same_way_under_both_spellings() {
+        const RS_ACCESS_NICE: NvU16 = 1;
+        const RS_ACCESS_PERFMON: NvU16 = 3;
+        for right in [0, RS_ACCESS_NICE, 2, RS_ACCESS_PERFMON, 4, 99, NvU16::MAX] {
+            assert_eq!(
+                osCheckAccess(right),
+                crate::os_interface::os_check_access(right),
+                "the two spellings disagree about right {}",
+                right,
+            );
+        }
+        assert_eq!(
+            crate::os_interface::os_check_access(99),
+            NV_FALSE,
+            "a right nobody has described is granted",
+        );
+    }
+
+    /// Eclipse has no PID namespaces, so it is vacuously the only one.
+    /// `kern_perf_ctrl.c` returns early on a yes here.
+    #[test]
+    fn the_namespace_question_has_one_answer() {
+        assert_eq!(osIsInitNs(), crate::os_interface::os_is_init_ns());
+        assert_eq!(osIsInitNs(), NV_TRUE);
+    }
+
+    /// A count, so not -1. `client_resource.c` tests it against zero.
+    #[test]
+    fn a_channel_count_is_never_negative() {
+        assert!(osImexChannelCount() >= 0);
+        assert_eq!(
+            osImexChannelCount(),
+            crate::os_interface::os_imex_channel_count(),
+        );
+        assert_eq!(
+            osImexChannelIsSupported() == NV_TRUE,
+            osImexChannelCount() != 0,
+            "the count and the support flag describe different worlds",
+        );
+    }
+
+    /// The two answers differed by one byte, which the derived shift hid.
+    #[test]
+    fn the_top_of_user_space_has_one_answer() {
+        assert_eq!(osGetMaxUserVa(), crate::os_interface::os_get_max_user_va());
+    }
+
+    /// `gpu_timeout.c` adds one of these to every GPU timeout, and the two
+    /// spellings differed by a factor of a thousand.
+    #[test]
+    fn the_tick_resolution_has_one_answer() {
+        assert_eq!(
+            crate::os_services::osGetMonotonicTickResolutionNs(),
+            crate::os_interface::os_get_monotonic_tick_resolution_ns(),
+        );
+    }
+
+    /// A bug check that returns is not a bug check: the RM declares the
+    /// condition unrecoverable and then carries on through it. `osBugCheck` is
+    /// `extern "C"` and therefore nounwind, so what a test can watch is the
+    /// halt it delegates to.
+    #[test]
+    fn a_bug_check_does_not_return() {
+        let payload = catch_unwind(|| bug_check_halt(1, bug_check_name(1)))
+            .expect_err("the bug check returned to its caller");
+        let text = payload
+            .downcast_ref::<std::string::String>()
+            .expect("the halt carried no message");
+        assert!(
+            text.contains("Nv Internal Testing"),
+            "the halt did not name the bug code: {}",
+            text,
+        );
+    }
+
+    /// And a code past the end of the table is the unknown one, not an index
+    /// out of bounds -- the clamp the real `os.c` does before indexing.
+    #[test]
+    fn a_bug_check_code_past_the_table_is_the_unknown_one() {
+        assert_eq!(bug_check_name(0), "Unknown Error");
+        assert_eq!(bug_check_name(1), "Nv Internal Testing");
+        assert_eq!(bug_check_name(7), "Display Underflow");
+        assert_eq!(
+            bug_check_name(8),
+            "Unknown Error",
+            "one past the last code indexed past the table",
+        );
+        assert_eq!(bug_check_name(NvU32::MAX), "Unknown Error");
+    }
+
+    // -----------------------------------------------------------------
+    // And one pair inside os_interface.rs itself: the allocator and the
+    // deallocator disagreeing about which sizes are legal.
+    // -----------------------------------------------------------------
+
+    /// `os_free_mem` refuses a header size above its ceiling and calls it
+    /// corruption, so an allocation above that ceiling used to succeed and then
+    /// leak for ever, reported as a double free. The two agree now.
+    #[test]
+    fn an_allocation_this_pair_could_not_free_is_refused() {
+        let mut p: *mut c_void = core::ptr::null_mut();
+        assert_eq!(
+            crate::os_interface::os_alloc_mem(&mut p, 512 * 1024 * 1024),
+            NV_ERR_NO_MEMORY,
+        );
+        // And the ordinary case still works, header and all.
+        assert_eq!(crate::os_interface::os_alloc_mem(&mut p, 4096), NV_OK);
+        assert!(!p.is_null());
+        crate::os_interface::os_free_mem(p);
+    }
+
+    /// Every refusal leaves a null pointer behind, on all three paths, which
+    /// is what the real `os_alloc_mem` guarantees by clearing on entry -- and
+    /// `_portMemAllocNonPagedUntracked` reads the pointer and never the status.
+    #[test]
+    fn a_refused_allocation_leaves_a_null_pointer_behind() {
+        const POISON: usize = 0xDEAD_BEEF;
+        for (size, expected) in [
+            (NvU64::MAX, NV_ERR_INVALID_ARGUMENT),
+            (512 * 1024 * 1024, NV_ERR_NO_MEMORY),
+        ] {
+            let mut p = POISON as *mut c_void;
+            assert_eq!(crate::os_interface::os_alloc_mem(&mut p, size), expected);
+            assert!(p.is_null(), "a refused allocation of {} left {:p}", size, p);
+        }
+        // And a null destination is refused without being written through.
+        assert_eq!(
+            crate::os_interface::os_alloc_mem(core::ptr::null_mut(), 4096),
+            NV_ERR_INVALID_ARGUMENT,
+        );
+    }
+
+    /// Three calls that refuse: each clears the destination it was going to
+    /// fill first, because their callers pass struct fields and asserts that
+    /// carry on, not fresh locals.
+    #[test]
+    fn an_unsupported_call_clears_the_handle_it_was_going_to_fill() {
+        const POISON: usize = 0xDEAD_BEEF;
+
+        let mut file = POISON as *mut c_void;
+        assert_eq!(osOpenTemporaryFile(&mut file), NV_ERR_NOT_SUPPORTED);
+        assert!(file.is_null(), "a refused open left a stale section handle");
+
+        let mut wq = POISON as *mut c_void;
+        assert_eq!(osAllocWaitQueue(&mut wq), NV_ERR_NOT_SUPPORTED);
+        assert!(wq.is_null(), "a refused wait queue left a stale handle");
+
+        let mut pid = u32::MAX;
+        assert_eq!(
+            osFindNsPid(core::ptr::null_mut(), &mut pid),
+            NV_ERR_NOT_SUPPORTED,
+        );
+        assert_eq!(pid, 0, "a refused lookup left a stale pid");
+
+        // And none of the three touches a null destination.
+        assert_eq!(
+            osOpenTemporaryFile(core::ptr::null_mut()),
+            NV_ERR_NOT_SUPPORTED,
+        );
+        assert_eq!(
+            osAllocWaitQueue(core::ptr::null_mut()),
+            NV_ERR_NOT_SUPPORTED
+        );
+        assert_eq!(
+            osFindNsPid(core::ptr::null_mut(), core::ptr::null_mut()),
+            NV_ERR_NOT_SUPPORTED,
+        );
     }
 }
