@@ -223,60 +223,17 @@ impl DrmDev {
         if !zcore_drivers::display::nouveau_uapi_enabled() {
             return;
         }
-        let timeline = is_syncobj_timeline_wait(cmd);
-        // Deadline-sized ioctls carry a trailing hint we never read; the
-        // prefix matches the classic structs.
-        let prefix = if timeline {
-            core::mem::size_of::<DrmSyncobjTimelineWait>()
-        } else {
-            core::mem::size_of::<DrmSyncobjWait>()
-        };
-        if ucheck(data, prefix).is_err() {
+        // A request the sync arm will refuse, or answer without waiting, is
+        // not slept on.
+        let Ok(Some(SyncobjWaitReq {
+            handles,
+            points,
+            timeout_nsec,
+            flags,
+            ..
+        })) = read_syncobj_wait(cmd, data)
+        else {
             return;
-        }
-        let (handles_ptr, points_ptr, timeout_nsec, count_handles, flags) = if timeline {
-            let req = unsafe { *(data as *const DrmSyncobjTimelineWait) };
-            (
-                req.handles,
-                req.points,
-                req.timeout_nsec,
-                req.count_handles,
-                req.flags,
-            )
-        } else {
-            let req = unsafe { *(data as *const DrmSyncobjWait) };
-            (
-                req.handles,
-                0u64,
-                req.timeout_nsec,
-                req.count_handles,
-                req.flags,
-            )
-        };
-        const MAX_HANDLES: u32 = 64;
-        if count_handles == 0 || count_handles > MAX_HANDLES || handles_ptr == 0 {
-            return;
-        }
-        if ucheck_n::<u32>(handles_ptr as usize, count_handles as usize).is_err() {
-            return;
-        }
-        if timeline
-            && points_ptr != 0
-            && ucheck_n::<u64>(points_ptr as usize, count_handles as usize).is_err()
-        {
-            return;
-        }
-        let handles: alloc::vec::Vec<u32> = (0..count_handles as usize)
-            .map(|i| unsafe { *(handles_ptr as *const u32).add(i) })
-            .collect();
-        let points: Option<alloc::vec::Vec<u64>> = if timeline && points_ptr != 0 {
-            Some(
-                (0..count_handles as usize)
-                    .map(|i| unsafe { *(points_ptr as *const u64).add(i) })
-                    .collect(),
-            )
-        } else {
-            None
         };
         let deadline_us = (timeout_nsec.max(0) as u64) / 1000;
         let wait_all = flags & DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL != 0;
@@ -2227,8 +2184,11 @@ impl DrmDev {
                     return Err(FsError::OpNotSupported);
                 }
                 let req = unsafe { &*(data as *const DrmSyncobjArray) };
-                const MAX_HANDLES: u32 = 64;
-                if req.count_handles == 0 || req.count_handles > MAX_HANDLES || req.handles == 0 {
+                if req.count_handles == 0 {
+                    return Err(FsError::InvalidParam);
+                }
+                syncobj_array_bound(req.count_handles)?;
+                if req.handles == 0 {
                     return Err(FsError::InvalidParam);
                 }
                 ucheck_n::<u32>(req.handles as usize, req.count_handles as usize)?;
@@ -2271,12 +2231,11 @@ impl DrmDev {
                     return Err(FsError::OpNotSupported);
                 }
                 let req = unsafe { &*(data as *const DrmSyncobjTimelineArray) };
-                const MAX_HANDLES: u32 = 64;
-                if req.count_handles == 0
-                    || req.count_handles > MAX_HANDLES
-                    || req.handles == 0
-                    || req.points == 0
-                {
+                if req.count_handles == 0 {
+                    return Err(FsError::InvalidParam);
+                }
+                syncobj_array_bound(req.count_handles)?;
+                if req.handles == 0 || req.points == 0 {
                     return Err(FsError::InvalidParam);
                 }
                 ucheck_n::<u32>(req.handles as usize, req.count_handles as usize)?;
@@ -2338,12 +2297,11 @@ impl DrmDev {
                     return Err(FsError::OpNotSupported);
                 }
                 let req = unsafe { &*(data as *const DrmSyncobjTimelineArray) };
-                const MAX_HANDLES: u32 = 64;
-                if req.count_handles == 0
-                    || req.count_handles > MAX_HANDLES
-                    || req.handles == 0
-                    || req.points == 0
-                {
+                if req.count_handles == 0 {
+                    return Err(FsError::InvalidParam);
+                }
+                syncobj_array_bound(req.count_handles)?;
+                if req.handles == 0 || req.points == 0 {
                     return Err(FsError::InvalidParam);
                 }
                 let last_submitted = req.flags & DRM_SYNCOBJ_QUERY_FLAGS_LAST_SUBMITTED != 0;
@@ -2400,57 +2358,26 @@ impl DrmDev {
                 if !zcore_drivers::display::nouveau_uapi_enabled() {
                     return Err(FsError::OpNotSupported);
                 }
-                // One rule for "is this the timeline wait", shared with the
-                // async sleeper that runs before this arm, so the two cannot
-                // read the same request as different structs.
-                let timeline = is_syncobj_timeline_wait(cmd);
-                // Both structs share this prefix layout, so a single path
-                // can read the common fields regardless of which ioctl.
-                let (handles_ptr, points_ptr, timeout_nsec, count_handles, flags) = if timeline {
-                    let req = unsafe { &*(data as *const DrmSyncobjTimelineWait) };
-                    (
-                        req.handles,
-                        req.points,
-                        req.timeout_nsec,
-                        req.count_handles,
-                        req.flags,
-                    )
-                } else {
-                    let req = unsafe { &*(data as *const DrmSyncobjWait) };
-                    (
-                        req.handles,
-                        0,
-                        req.timeout_nsec,
-                        req.count_handles,
-                        req.flags,
-                    )
+                // The request as the async sleeper read it (one reader, so
+                // the two cannot disagree on the struct or on what is
+                // refused). Nothing to wait for is answered at once, as
+                // Linux does, without reading the array.
+                let Some(SyncobjWaitReq {
+                    timeline,
+                    handles,
+                    points,
+                    timeout_nsec,
+                    flags,
+                }) = read_syncobj_wait(cmd, data)?
+                else {
+                    return Ok(0);
                 };
-                const MAX_HANDLES: u32 = 64;
-                if count_handles == 0 || count_handles > MAX_HANDLES || handles_ptr == 0 {
-                    return Err(FsError::InvalidParam);
-                }
-                ucheck_n::<u32>(handles_ptr as usize, count_handles as usize)?;
-                if timeline && points_ptr != 0 {
-                    ucheck_n::<u64>(points_ptr as usize, count_handles as usize)?;
-                }
-                let handles: alloc::vec::Vec<u32> = (0..count_handles as usize)
-                    .map(|i| unsafe { *(handles_ptr as *const u32).add(i) })
-                    .collect();
                 // The caller's own handles (`drm_syncobj_array_find`): a wait
                 // on another process's syncobj is ENOENT, not a wait.
                 if !zcore_drivers::scheme::syncobj::all_usable_by(drm::current_pid(), &handles) {
                     syncobj_wait_klog(timeline, &handles, "not the caller's handle (ENOENT)");
                     return Err(FsError::EntryNotFound);
                 }
-                let points: Option<alloc::vec::Vec<u64>> = if timeline && points_ptr != 0 {
-                    Some(
-                        (0..count_handles as usize)
-                            .map(|i| unsafe { *(points_ptr as *const u64).add(i) })
-                            .collect(),
-                    )
-                } else {
-                    None
-                };
                 // `timeout_nsec` is an ABSOLUTE CLOCK_MONOTONIC deadline (real
                 // Linux semantics, confirmed against this kernel's own
                 // `now_monotonic()` -> `kernel_hal::timer::timer_now()`), not a
@@ -3368,6 +3295,100 @@ fn ucheck_n<T>(addr: usize, count: usize) -> Result<()> {
         Some(bytes) => ucheck(addr, bytes),
         None => Err(FsError::InvalidParam),
     }
+}
+
+/// How many handles a syncobj array ioctl may name. Linux puts no bound of
+/// its own on `count_handles`: the array is `kmalloc_array`ed, and only
+/// past 4 MiB of handles does that fail, with ENOMEM. The five array arms
+/// here shared a cap of 64, EINVAL beyond it -- and `vkWaitForFences` with
+/// more fences than that is a single `TIMELINE_WAIT` over all of them
+/// (`vk_drm_syncobj_wait_many`), so a legal call came back
+/// VK_ERROR_UNKNOWN.
+const SYNCOBJ_ARRAY_MAX: u32 = 1 << 20;
+
+/// ENOMEM past [`SYNCOBJ_ARRAY_MAX`], as the kernel's allocation would be.
+fn syncobj_array_bound(count_handles: u32) -> Result<()> {
+    if count_handles > SYNCOBJ_ARRAY_MAX {
+        Err(FsError::NoDeviceSpace)
+    } else {
+        Ok(())
+    }
+}
+
+/// What a `SYNCOBJ_WAIT` / `TIMELINE_WAIT` (deadline-sized or not) asks
+/// for, read the same way by the async sleeper and the sync arm.
+struct SyncobjWaitReq {
+    timeline: bool,
+    handles: alloc::vec::Vec<u32>,
+    points: Option<alloc::vec::Vec<u64>>,
+    timeout_nsec: i64,
+    flags: u32,
+}
+
+/// Read a wait request. `Ok(None)` is a wait on no handles at all, which
+/// Linux answers 0 without reading the array (`count_handles == 0`), and
+/// the array bound is [`syncobj_array_bound`].
+fn read_syncobj_wait(cmd: u32, data: usize) -> Result<Option<SyncobjWaitReq>> {
+    // One rule for "is this the timeline wait", so the sleeper and the arm
+    // cannot read the same request as different structs.
+    let timeline = is_syncobj_timeline_wait(cmd);
+    // Deadline-sized ioctls carry a trailing hint never read here; the
+    // prefix matches the classic structs, which share this layout.
+    let prefix = if timeline {
+        core::mem::size_of::<DrmSyncobjTimelineWait>()
+    } else {
+        core::mem::size_of::<DrmSyncobjWait>()
+    };
+    ucheck(data, prefix)?;
+    let (handles_ptr, points_ptr, timeout_nsec, count_handles, flags) = if timeline {
+        let req = unsafe { *(data as *const DrmSyncobjTimelineWait) };
+        (
+            req.handles,
+            req.points,
+            req.timeout_nsec,
+            req.count_handles,
+            req.flags,
+        )
+    } else {
+        let req = unsafe { *(data as *const DrmSyncobjWait) };
+        (
+            req.handles,
+            0u64,
+            req.timeout_nsec,
+            req.count_handles,
+            req.flags,
+        )
+    };
+    if count_handles == 0 {
+        return Ok(None);
+    }
+    syncobj_array_bound(count_handles)?;
+    if handles_ptr == 0 {
+        return Err(FsError::InvalidParam);
+    }
+    ucheck_n::<u32>(handles_ptr as usize, count_handles as usize)?;
+    if timeline && points_ptr != 0 {
+        ucheck_n::<u64>(points_ptr as usize, count_handles as usize)?;
+    }
+    let handles: alloc::vec::Vec<u32> = (0..count_handles as usize)
+        .map(|i| unsafe { *(handles_ptr as *const u32).add(i) })
+        .collect();
+    let points: Option<alloc::vec::Vec<u64>> = if timeline && points_ptr != 0 {
+        Some(
+            (0..count_handles as usize)
+                .map(|i| unsafe { *(points_ptr as *const u64).add(i) })
+                .collect(),
+        )
+    } else {
+        None
+    };
+    Ok(Some(SyncobjWaitReq {
+        timeline,
+        handles,
+        points,
+        timeout_nsec,
+        flags,
+    }))
 }
 
 fn eclipse_compute_ioctl(minor: u32, data: usize) -> Result<usize> {
@@ -12488,6 +12509,317 @@ mod card_fd_wait_tests {
             bus.lock().get_callback_len(),
             0,
             "the callback outlived the waiter"
+        );
+    }
+}
+
+#[cfg(test)]
+mod syncobj_array_tests {
+    //! The syncobj ioctls that take an array of handles, driven through the
+    //! ioctl entry point with the nouveau uAPI on: how many handles they
+    //! take, and what an empty array means.
+    use super::gl_client_sequence_tests::Client;
+    use super::*;
+
+    /// The nouveau uAPI switch, on for one test and put back after; under
+    /// `drm::test_globals::lock()`, like every process-wide DRM knob. The
+    /// tests also hold the eventfd tests' lock: signaling a syncobj fires
+    /// the process-wide signal hook those tests install, whose walk
+    /// delivers their waiter (see `syncobj_eventfd`'s `TEST_SERIAL`).
+    struct NouveauOn(bool);
+    impl NouveauOn {
+        fn new() -> Self {
+            let was = zcore_drivers::display::nouveau_uapi_enabled();
+            zcore_drivers::display::set_nouveau_uapi_enabled(true);
+            NouveauOn(was)
+        }
+    }
+    impl Drop for NouveauOn {
+        fn drop(&mut self) {
+            zcore_drivers::display::set_nouveau_uapi_enabled(self.0);
+        }
+    }
+
+    fn create(c: &Client, signaled: bool) -> u32 {
+        let mut req = DrmSyncobjCreate {
+            handle: 0,
+            flags: if signaled {
+                DRM_SYNCOBJ_CREATE_SIGNALED
+            } else {
+                0
+            },
+        };
+        c.ioctl(DRM_IOCTL_SYNCOBJ_CREATE, &mut req).expect("CREATE");
+        req.handle
+    }
+
+    fn destroy(c: &Client, handle: u32) {
+        let mut req = DrmSyncobjDestroy { handle, pad: 0 };
+        c.ioctl(DRM_IOCTL_SYNCOBJ_DESTROY, &mut req)
+            .expect("DESTROY");
+    }
+
+    /// `SYNCOBJ_WAIT` with an absolute deadline already passed: what is
+    /// signaled now decides. Gives back `first_signaled`.
+    fn wait(c: &Client, handles: &[u32], flags: u32) -> Result<u32> {
+        let mut req = DrmSyncobjWait {
+            handles: handles.as_ptr() as u64,
+            timeout_nsec: 0,
+            count_handles: handles.len() as u32,
+            flags,
+            first_signaled: 0xdead,
+            pad: 0,
+        };
+        c.ioctl(DRM_IOCTL_SYNCOBJ_WAIT, &mut req)
+            .map(|_| req.first_signaled)
+    }
+
+    fn timeline_wait(c: &Client, handles: &[u32], points: &[u64], flags: u32) -> Result<u32> {
+        let mut req = DrmSyncobjTimelineWait {
+            handles: handles.as_ptr() as u64,
+            points: points.as_ptr() as u64,
+            timeout_nsec: 0,
+            count_handles: handles.len() as u32,
+            flags,
+            first_signaled: 0xdead,
+            pad: 0,
+        };
+        c.ioctl(DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT, &mut req)
+            .map(|_| req.first_signaled)
+    }
+
+    /// `RESET` or `SIGNAL`.
+    fn array(c: &Client, cmd: u32, handles: &[u32]) -> Result<usize> {
+        let mut req = DrmSyncobjArray {
+            handles: handles.as_ptr() as u64,
+            count_handles: handles.len() as u32,
+            pad: 0,
+        };
+        c.ioctl(cmd, &mut req)
+    }
+
+    /// `TIMELINE_SIGNAL` or `QUERY`, `points` read or written per arm.
+    fn timeline_array(c: &Client, cmd: u32, handles: &[u32], points: &mut [u64]) -> Result<usize> {
+        let mut req = DrmSyncobjTimelineArray {
+            handles: handles.as_ptr() as u64,
+            points: points.as_mut_ptr() as u64,
+            count_handles: handles.len() as u32,
+            flags: 0,
+        };
+        c.ioctl(cmd, &mut req)
+    }
+
+    /// `vkWaitForFences` on more fences than 64 is one `TIMELINE_WAIT` over
+    /// all of them (`vk_drm_syncobj_wait_many`), and `vkResetFences` one
+    /// `RESET`; Linux takes any number the allocator does. Every array arm
+    /// used to stop at 64 with EINVAL, which Mesa reports as a lost device.
+    #[test]
+    fn the_array_ioctls_take_more_than_sixty_four_handles() {
+        let _serialised = drm::test_globals::lock();
+        let _hook = crate::fs::syncobj_eventfd::hardware_fence_tests::TEST_SERIAL.lock();
+        let _on = NouveauOn::new();
+        let c = Client::open(0);
+        const N: usize = 100;
+        let handles: alloc::vec::Vec<u32> = (0..N).map(|_| create(&c, true)).collect();
+        assert_eq!(wait(&c, &handles, DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL), Ok(0));
+        let ones = alloc::vec![1u64; N];
+        assert_eq!(
+            timeline_wait(&c, &handles, &ones, DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL),
+            Ok(0)
+        );
+        // RESET all: nothing is signaled any more, whichever is asked.
+        assert_eq!(array(&c, DRM_IOCTL_SYNCOBJ_RESET, &handles), Ok(0));
+        assert_eq!(wait(&c, &handles, 0), Err(FsError::TimedOut));
+        assert_eq!(
+            wait(&c, &handles[N - 1..], 0),
+            Err(FsError::TimedOut),
+            "the hundredth was reset too"
+        );
+        // SIGNAL all: the hundredth is signaled, and the first one found.
+        assert_eq!(array(&c, DRM_IOCTL_SYNCOBJ_SIGNAL, &handles), Ok(0));
+        assert_eq!(wait(&c, &handles[N - 1..], 0), Ok(0));
+        assert_eq!(wait(&c, &handles, DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL), Ok(0));
+        let mut points = alloc::vec![0u64; N];
+        assert_eq!(
+            timeline_array(&c, DRM_IOCTL_SYNCOBJ_QUERY, &handles, &mut points),
+            Ok(0)
+        );
+        assert!(points.iter().all(|&p| p == 1), "{:?}", points);
+        // TIMELINE_SIGNAL all to 5: the query and the wait see every one.
+        let mut fives = alloc::vec![5u64; N];
+        assert_eq!(
+            timeline_array(&c, DRM_IOCTL_SYNCOBJ_TIMELINE_SIGNAL, &handles, &mut fives),
+            Ok(0)
+        );
+        assert_eq!(
+            timeline_array(&c, DRM_IOCTL_SYNCOBJ_QUERY, &handles, &mut points),
+            Ok(0)
+        );
+        assert!(points.iter().all(|&p| p == 5), "{:?}", points);
+        assert_eq!(
+            timeline_wait(&c, &handles, &fives, DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL),
+            Ok(0)
+        );
+        let sixes = alloc::vec![6u64; N];
+        assert_eq!(
+            timeline_wait(&c, &handles, &sixes, DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL),
+            Err(FsError::TimedOut)
+        );
+        // Only the last one at 6: found at its index, not at one of the 64.
+        assert_eq!(
+            timeline_array(
+                &c,
+                DRM_IOCTL_SYNCOBJ_TIMELINE_SIGNAL,
+                &handles[N - 1..],
+                &mut [6u64]
+            ),
+            Ok(0)
+        );
+        assert_eq!(
+            timeline_wait(&c, &handles, &sixes, 0),
+            Ok(N as u32 - 1),
+            "first_signaled"
+        );
+        for h in handles {
+            destroy(&c, h);
+        }
+    }
+
+    /// A wait on no handles is answered 0 at once, without reading the
+    /// array (Linux `drm_syncobj_wait_ioctl`); the arms that change or read
+    /// state refuse an empty array with EINVAL, as Linux does.
+    #[test]
+    fn a_wait_with_no_handles_returns_at_once_and_the_other_arrays_refuse_it() {
+        let _serialised = drm::test_globals::lock();
+        let _hook = crate::fs::syncobj_eventfd::hardware_fence_tests::TEST_SERIAL.lock();
+        let _on = NouveauOn::new();
+        let c = Client::open(0);
+        let none: [u32; 0] = [];
+        let mut req = DrmSyncobjWait {
+            handles: 0,
+            timeout_nsec: 0,
+            count_handles: 0,
+            flags: DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL,
+            first_signaled: 0xdead,
+            pad: 0,
+        };
+        assert_eq!(c.ioctl(DRM_IOCTL_SYNCOBJ_WAIT, &mut req), Ok(0));
+        assert_eq!(req.first_signaled, 0xdead, "not written");
+        let mut req = DrmSyncobjTimelineWait {
+            handles: 0,
+            points: 0,
+            timeout_nsec: 0,
+            count_handles: 0,
+            flags: 0,
+            first_signaled: 0xdead,
+            pad: 0,
+        };
+        assert_eq!(c.ioctl(DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT, &mut req), Ok(0));
+        assert_eq!(req.first_signaled, 0xdead);
+        for cmd in [DRM_IOCTL_SYNCOBJ_RESET, DRM_IOCTL_SYNCOBJ_SIGNAL] {
+            assert_eq!(
+                array(&c, cmd, &none),
+                Err(FsError::InvalidParam),
+                "{:#x}",
+                cmd
+            );
+        }
+        // Real (if empty) arrays behind the pointers, so an arm that went
+        // on to read its first entry would fail the assertion, not crash.
+        let mut no_points = [0u64; 1];
+        for cmd in [DRM_IOCTL_SYNCOBJ_TIMELINE_SIGNAL, DRM_IOCTL_SYNCOBJ_QUERY] {
+            assert_eq!(
+                timeline_array(&c, cmd, &none, &mut no_points[..0]),
+                Err(FsError::InvalidParam),
+                "{:#x}",
+                cmd
+            );
+        }
+    }
+
+    /// Past what the kernel would allocate for the array, ENOMEM, before
+    /// the array is looked at (it is never read here: the pointer is null).
+    #[test]
+    fn an_array_past_what_the_kernel_would_allocate_is_enomem() {
+        let _serialised = drm::test_globals::lock();
+        let _hook = crate::fs::syncobj_eventfd::hardware_fence_tests::TEST_SERIAL.lock();
+        let _on = NouveauOn::new();
+        let c = Client::open(0);
+        let too_many = SYNCOBJ_ARRAY_MAX + 1;
+        let mut req = DrmSyncobjWait {
+            handles: 0,
+            timeout_nsec: 0,
+            count_handles: too_many,
+            flags: 0,
+            first_signaled: 0,
+            pad: 0,
+        };
+        assert_eq!(
+            c.ioctl(DRM_IOCTL_SYNCOBJ_WAIT, &mut req),
+            Err(FsError::NoDeviceSpace)
+        );
+        let mut req = DrmSyncobjTimelineWait {
+            handles: 0,
+            points: 0,
+            timeout_nsec: 0,
+            count_handles: too_many,
+            flags: 0,
+            first_signaled: 0,
+            pad: 0,
+        };
+        assert_eq!(
+            c.ioctl(DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT, &mut req),
+            Err(FsError::NoDeviceSpace)
+        );
+        for cmd in [DRM_IOCTL_SYNCOBJ_RESET, DRM_IOCTL_SYNCOBJ_SIGNAL] {
+            let mut req = DrmSyncobjArray {
+                handles: 0,
+                count_handles: too_many,
+                pad: 0,
+            };
+            assert_eq!(
+                c.ioctl(cmd, &mut req),
+                Err(FsError::NoDeviceSpace),
+                "{:#x}",
+                cmd
+            );
+        }
+        for cmd in [DRM_IOCTL_SYNCOBJ_TIMELINE_SIGNAL, DRM_IOCTL_SYNCOBJ_QUERY] {
+            let mut req = DrmSyncobjTimelineArray {
+                handles: 0,
+                points: 0,
+                count_handles: too_many,
+                flags: 0,
+            };
+            assert_eq!(
+                c.ioctl(cmd, &mut req),
+                Err(FsError::NoDeviceSpace),
+                "{:#x}",
+                cmd
+            );
+        }
+        // The bound itself is fine, and a null array under it is EINVAL as
+        // before (Linux: EFAULT from the copy).
+        let mut req = DrmSyncobjArray {
+            handles: 0,
+            count_handles: SYNCOBJ_ARRAY_MAX,
+            pad: 0,
+        };
+        assert_eq!(
+            c.ioctl(DRM_IOCTL_SYNCOBJ_SIGNAL, &mut req),
+            Err(FsError::InvalidParam)
+        );
+        let mut req = DrmSyncobjWait {
+            handles: 0,
+            timeout_nsec: 0,
+            count_handles: 1,
+            flags: 0,
+            first_signaled: 0,
+            pad: 0,
+        };
+        assert_eq!(
+            c.ioctl(DRM_IOCTL_SYNCOBJ_WAIT, &mut req),
+            Err(FsError::InvalidParam)
         );
     }
 }

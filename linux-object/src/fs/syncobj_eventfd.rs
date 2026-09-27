@@ -226,7 +226,7 @@ pub fn init() {
 /// That is why this path could be broken for a day without a single test or
 /// boot noticing.
 #[cfg(test)]
-mod hardware_fence_tests {
+pub(crate) mod hardware_fence_tests {
     use super::*;
     use crate::error::LxResult;
     use crate::fs::{OpenFlags, PollEvents, PollStatus};
@@ -293,7 +293,14 @@ mod hardware_fence_tests {
         ///
         /// Held for the whole body, not just around `reset`, because every step
         /// in between touches the same globals.
-        static ref TEST_SERIAL: Mutex<()> = Mutex::new(());
+        ///
+        /// `pub(crate)`: a test elsewhere in the crate that signals syncobjs
+        /// fires `on_syncobj_signaled` too, once a test here has installed it
+        /// (the hook is process-wide and never uninstalled), and that walk
+        /// delivers a waiter of these tests outside the `WAITERS` lock -- so
+        /// the assertion here could run between the other thread's
+        /// `swap_remove` and its `deliver`. Such a test takes this lock.
+        pub(crate) static ref TEST_SERIAL: Mutex<()> = Mutex::new(());
     }
 
     fn reset() {
