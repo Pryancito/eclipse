@@ -203,9 +203,17 @@ impl Syscall<'_> {
             addr: 0,
         };
         if info.is_mmio {
+            // Everything that can fail happens before the handle exists.
+            // `install_handle` was written for exactly this: a handle in the
+            // table and an error to the caller is a leak. Here the handle went
+            // in first and `enable_mmio` and the `out_bar` write came after, so
+            // a device that would not enable, or an `out_bar` the caller got
+            // wrong, answered an error having already handed out a live VMO
+            // over the device's BAR.
+            device.enable_mmio()?;
+            check_out(proc, &out_bar)?;
             let vmo = VmObject::new_physical(info.bus_addr as usize, pages(info.size as usize));
             install_handle(proc, Handle::new(vmo, Rights::DEFAULT_VMO), &mut out_handle)?;
-            device.enable_mmio()?;
         } else {
             bar_.addr = info.bus_addr;
             device.enable_pio()?;
