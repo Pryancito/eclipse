@@ -1695,14 +1695,22 @@ fn vm_bind_maps_into_the_callers_own_context_and_a_map_over_a_live_range_replace
         [hb]
     );
     assert_eq!(FAKE_RM.lock().unmaps, 6);
-    // MAP with handle 0 is Mesa's "unbind, keep the reservation", and
-    // it is scoped like UNMAP: B's mapping at the same VA is not A's.
+    // MAP with handle 0 names no object: ENOENT, and nothing of A's
+    // moves. UNMAP is scoped: B's mapping at the same VA is not A's.
     assert_eq!(
         vm_bind_ops(&gpu, B, &mut [map(hb, VA + 0x10_0000, 4096)]),
         Ok(0)
     );
     assert_eq!(
         vm_bind_ops(&gpu, A, &mut [map(0, VA + 0x10_0000, 4096)]),
+        Err(nv::ENOENT)
+    );
+    assert_eq!(
+        driver_maps(&gpu, A).iter().map(|m| m.0).collect::<Vec<_>>(),
+        [hb]
+    );
+    assert_eq!(
+        vm_bind_ops(&gpu, A, &mut [unmap(VA + 0x10_0000, 4096)]),
         Ok(0)
     );
     assert_eq!(driver_maps(&gpu, A), []);
@@ -5680,6 +5688,84 @@ fn an_exec_or_a_vm_bind_cannot_name_another_processes_syncobj() {
     assert!(syncobj::destroy_for(A, theirs) && syncobj::destroy_for(A, mine));
     assert!(syncobj::destroy_for(B, theirs) && syncobj::destroy_for(B, theirs_done));
     assert!(syncobj::destroy(nobodys));
+}
+
+/// `nouveau_uvmm_bind_job_submit` looks every MAP's handle up in the
+/// caller's file (`drm_gem_object_lookup`) before anything is validated
+/// or applied, and handle 0 names no GEM object: ENOENT, with the batch
+/// untouched. Here a MAP with handle 0 skipped the lookup and was applied
+/// as "unmap the range, keep the reservation", draining whatever the
+/// caller had mapped there -- a shape no client sends Linux (NVK unbinds
+/// with UNMAP, and its sparse regions are MAP with the SPARSE flag,
+/// refused here as EOPNOTSUPP), so a stray handle took a live mapping
+/// with it instead of an error, and in a batch did so after the ops
+/// ahead of it had been applied.
+#[test]
+fn a_vm_bind_map_with_no_object_is_enoent_and_unmaps_nothing() {
+    let _g = LOCK.lock();
+    let _live = LiveBytes::hold();
+    let gpu = gpu_rm_fast();
+    let _ch_a = client_with_pushbuf(&gpu, A);
+    let ha = gem_new_rm(&gpu, 65536, nv::NOUVEAU_GEM_DOMAIN_GART, A)
+        .unwrap()
+        .handle;
+    const VA: u64 = 0x1_9000_0000;
+    let bound = driver_maps(&gpu, A).len();
+    assert_eq!(vm_bind_ops(&gpu, A, &mut [map(ha, VA, 65536)]), Ok(0));
+    assert_eq!(driver_maps(&gpu, A).len(), bound + 1);
+    let before = FAKE_RM.lock().calls.len();
+    // Over the live mapping, beside it, and as pitch: no object, ENOENT.
+    for bad in [
+        map(0, VA, 65536),
+        map(0, VA + 0x10_0000, 4096),
+        op(nv::VM_BIND_OP_MAP, 0, 0, VA, 4096),
+    ] {
+        assert_eq!(vm_bind_ops(&gpu, A, &mut [bad]), Err(nv::ENOENT));
+    }
+    assert_eq!(driver_maps(&gpu, A).len(), bound + 1, "still mapped");
+    assert_eq!(
+        rm_calls_since(before),
+        [] as [&str; 0],
+        "nothing reached the RM"
+    );
+    // In a batch it is found before anything is applied: the good MAP
+    // ahead of it does not run, nor the UNMAP behind it.
+    let hb = gem_new_rm(&gpu, 4096, nv::NOUVEAU_GEM_DOMAIN_GART, A)
+        .unwrap()
+        .handle;
+    let before = FAKE_RM.lock().calls.len();
+    assert_eq!(
+        vm_bind_ops(
+            &gpu,
+            A,
+            &mut [
+                map(hb, VA + 0x20_0000, 4096),
+                map(0, VA + 0x30_0000, 4096),
+                unmap(VA, 65536),
+            ]
+        ),
+        Err(nv::ENOENT)
+    );
+    assert_eq!(driver_maps(&gpu, A).len(), bound + 1);
+    assert_eq!(rm_calls_since(before), [] as [&str; 0]);
+    // A sparse region is what it was, and UNMAP is the way to unmap.
+    assert_eq!(
+        vm_bind_ops(
+            &gpu,
+            A,
+            &mut [op(
+                nv::VM_BIND_OP_MAP,
+                nv::VM_BIND_SPARSE,
+                0,
+                VA + 0x30_0000,
+                4096
+            )]
+        ),
+        Err(nv::EOPNOTSUPP)
+    );
+    assert_eq!(vm_bind_ops(&gpu, A, &mut [unmap(VA, 65536)]), Ok(0));
+    assert_eq!(driver_maps(&gpu, A).len(), bound);
+    gpu.nouveau_release_process(A);
 }
 
 /// `nouveau_uvmm_bind_job_submit` runs `bind_validate_op` over every
