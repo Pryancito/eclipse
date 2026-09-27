@@ -352,10 +352,23 @@ impl Socket {
     }
 
     /// Prevent reading or writing.
+    ///
+    /// The two directions **cross** at the peer: nothing more can arrive here
+    /// once this end stops reading, so the peer stops writing, and the peer
+    /// stops reading once this end stops writing. Negating them instead --
+    /// which is what this used to do -- happens to look right whenever exactly
+    /// one direction is named, and is wrong in both the other cases:
+    ///
+    /// - `shutdown(read, write)` with both named told the peer **nothing**, so
+    ///   a peer blocked writing was never woken and never saw
+    ///   `SOCKET_WRITE_DISABLED` or `SOCKET_PEER_WRITE_DISABLED`; and
+    /// - `shutdown` with neither named -- which `zx_socket_shutdown(s, 0)`
+    ///   reaches -- shut the peer down in **both** directions, so a call that
+    ///   asks for nothing killed the other end.
     pub fn shutdown(&self, read: bool, write: bool) -> ZxResult {
         self.shutdown_self(read, write)?;
         if let Some(peer) = self.peer.upgrade() {
-            peer.shutdown_self(!read, !write)?;
+            peer.shutdown_self(write, read)?;
         }
         Ok(())
     }
@@ -831,6 +844,71 @@ mod tests {
         // the opposite direction is still okay
         assert_eq!(end1.write(&[0; 1]).unwrap(), 1);
         assert_eq!(end0.read(false, &mut [0; 10]).unwrap(), 1);
+    }
+
+    #[test]
+    /// Shutting both directions down has to reach the peer, and it used to
+    /// reach nothing: the two flags were negated instead of crossed, so
+    /// `(true, true)` became `(false, false)` at the peer. A peer parked in a
+    /// write then had nothing to wake it and no signal to tell it why.
+    fn shutting_down_both_directions_tells_the_peer_too() {
+        let (end0, end1) = Socket::create(0).unwrap();
+        end1.write(&[0; 10]).unwrap();
+
+        end0.shutdown(true, true).unwrap();
+
+        assert!(!end0.signal().contains(Signal::WRITABLE));
+        assert!(end0.signal().contains(Signal::SOCKET_WRITE_DISABLED));
+        assert!(end0.signal().contains(Signal::SOCKET_PEER_WRITE_DISABLED));
+
+        assert!(
+            !end1.signal().contains(Signal::WRITABLE),
+            "the peer must not still look writable",
+        );
+        assert!(
+            end1.signal().contains(Signal::SOCKET_WRITE_DISABLED),
+            "nothing this end writes can be read any more",
+        );
+        assert!(
+            end1.signal().contains(Signal::SOCKET_PEER_WRITE_DISABLED),
+            "and nothing more is coming from the other one",
+        );
+        assert_eq!(end1.write(&[0; 1]).unwrap_err(), ZxError::BAD_STATE);
+
+        // What was already buffered is still readable, as after a one-sided
+        // shutdown, and the end of it is `BAD_STATE` rather than a wait.
+        assert_eq!(end0.read(false, &mut [0; 20]).unwrap(), 10);
+        assert_eq!(
+            end0.read(false, &mut [0; 20]).unwrap_err(),
+            ZxError::BAD_STATE,
+        );
+    }
+
+    #[test]
+    /// And the other end of the same mistake: asking for neither direction
+    /// negated to "both" at the peer, so `zx_socket_shutdown(s, 0)` -- which
+    /// the syscall let through -- shut the other end down completely.
+    fn a_shutdown_of_neither_direction_shuts_nothing_down() {
+        let (end0, end1) = Socket::create(0).unwrap();
+        end0.shutdown(false, false).unwrap();
+
+        for (name, end) in [("end0", &end0), ("end1", &end1)] {
+            assert!(end.signal().contains(Signal::WRITABLE), "{}", name);
+            assert!(
+                !end.signal().contains(Signal::SOCKET_WRITE_DISABLED),
+                "{}",
+                name,
+            );
+            assert!(
+                !end.signal().contains(Signal::SOCKET_PEER_WRITE_DISABLED),
+                "{}",
+                name,
+            );
+        }
+        assert_eq!(end0.write(&[0; 4]).unwrap(), 4);
+        assert_eq!(end1.read(false, &mut [0; 4]).unwrap(), 4);
+        assert_eq!(end1.write(&[0; 4]).unwrap(), 4);
+        assert_eq!(end0.read(false, &mut [0; 4]).unwrap(), 4);
     }
 
     #[test]
