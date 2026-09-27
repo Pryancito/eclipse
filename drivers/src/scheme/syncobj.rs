@@ -1492,6 +1492,29 @@ pub fn pending_hw_fences(handle: u32, point: u64) -> alloc::vec::Vec<(usize, u64
     r
 }
 
+/// `drm_syncobj_array_wait_timeout` without `WAIT_FOR_SUBMIT` or
+/// `WAIT_AVAILABLE`: before anything is waited for, every handle must
+/// carry a fence for its point -- a binary syncobj any at all (there is
+/// none after `CREATE` without `SIGNALED`, or after `RESET`), a timeline
+/// one whose chain reaches the point, signaled or still in flight
+/// (`dma_fence_chain_find_seqno`). The index of the first handle without
+/// one, which the ioctl answers with EINVAL at once; a wait that simply
+/// ran to its deadline on such a handle (as this did) is ETIME, the code
+/// for "the fence exists and has not signaled".
+pub fn without_fence(handles: &[u32], points: Option<&[u64]>) -> Option<usize> {
+    let (r, deferred) = {
+        let mut table = TABLE.lock();
+        let d = resolve_locked(&mut table);
+        let r = handles.iter().enumerate().find_map(|(i, &h)| {
+            let target = points.map(|p| p[i]).unwrap_or(1).max(1);
+            (!submitted_locked(&table, h, target, LINK_DEPTH)).then_some(i)
+        });
+        (r, d)
+    };
+    deferred.run();
+    r
+}
+
 /// Binary signal (point = 1). Returns `false` if `handle` is unknown.
 pub fn signal(handle: u32) -> bool {
     timeline_signal(handle, 1)

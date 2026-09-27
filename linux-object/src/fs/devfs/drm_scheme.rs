@@ -3088,6 +3088,29 @@ impl DrmDev {
                 let deadline_us = (timeout_nsec.max(0) as u64) / 1000;
                 let wait_all = flags & DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL != 0;
                 let available_only = flags & DRM_SYNCOBJ_WAIT_FLAGS_WAIT_AVAILABLE != 0;
+                // `drm_syncobj_array_wait_timeout`: without WAIT_FOR_SUBMIT
+                // or WAIT_AVAILABLE, a handle with no fence for its point (a
+                // binary syncobj fresh or RESET, a timeline point nobody
+                // submitted) is EINVAL before anything is waited for, for
+                // every handle, WAIT_ANY included. This spun to the deadline
+                // and answered ETIME, the code for a fence that exists and
+                // has not signaled.
+                if flags
+                    & (DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT
+                        | DRM_SYNCOBJ_WAIT_FLAGS_WAIT_AVAILABLE)
+                    == 0
+                {
+                    if let Some(i) =
+                        zcore_drivers::scheme::syncobj::without_fence(&handles, points.as_deref())
+                    {
+                        syncobj_wait_klog(
+                            timeline,
+                            &handles[i..=i],
+                            "no fence for the point and no WAIT_FOR_SUBMIT (EINVAL)",
+                        );
+                        return Err(FsError::InvalidParam);
+                    }
+                }
                 trace_syncobj(
                     if timeline { "TIMELINE_WAIT" } else { "WAIT" },
                     drm::current_pid(),
