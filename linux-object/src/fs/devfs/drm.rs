@@ -3812,18 +3812,29 @@ pub fn scanout_region_checked(
             // them, so this black was handed over -- just after we had already
             // looked. See [`ZERO_GREW_REPORTS`].
             if let Some(a) = after.as_ref() {
-                if a.zero.zeros > before.zero.zeros {
+                // The box is every zero pixel of the SECOND read, not only the
+                // new ones: the reads are summarised per band, so which
+                // individual pixel turned black is not recoverable. The line
+                // says so rather than let the box be read as the new black
+                // alone.
+                //
+                // Matched on rather than unwrapped with a fallback: `bbox` is
+                // `Some` exactly when `zeros > 0`, which this comparison already
+                // guarantees, so a fallback box could never print -- and if it
+                // somehow did, `0x0+0+0` reads as a real zero-sized region and
+                // would be a lie in a diagnostic. No branch, no lie.
+                if let Some((zx, zy, zw, zh)) =
+                    a.zero.bbox().filter(|_| a.zero.zeros > before.zero.zeros)
+                {
                     let n = ZERO_GREW_REPORTS.fetch_add(1, Ordering::Relaxed);
                     let (report, last) = report_decision(n, MAX_PROBE_REPORTS);
                     if report {
                         #[cfg(test)]
                         GREW_SOURCE_LINES.fetch_add(1, Ordering::Relaxed);
-                        // The box is every zero pixel of the SECOND read, not
-                        // only the new ones: the reads are summarised per band,
-                        // so which individual pixel turned black is not
-                        // recoverable. Say so rather than let the box be read as
-                        // the new black alone.
-                        let (zx, zy, zw, zh) = a.zero.bbox().unwrap_or((0, 0, 0, 0));
+                        // Fits the 512-byte `klog_emit` line buffer with room to
+                        // spare (392 with the longest numbers and the suffix),
+                        // but that buffer DROPS the tail of a longer message, so
+                        // anything added here has to be measured, not guessed.
                         kernel_hal::klog_info!(
                             "[drm] present source: fb {} window {}x{}+{}+{} -- the source WENT \
                              BLACK while it was being copied: {} of {} sampled pixels were \
