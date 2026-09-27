@@ -946,6 +946,11 @@ pub(super) struct DrmNouveauVmInit {
     pub kernel_managed_size: u64,
 }
 
+/// One past the last GPU VA a client's uvmm may span: `NOUVEAU_VA_SPACE_END`
+/// (`1 << NOUVEAU_VA_SPACE_BITS`, 47) in `nouveau_uvmm.c`. `VM_INIT` refuses
+/// a kernel-managed range that overflows or ends past it with EINVAL.
+pub(super) const NOUVEAU_VA_SPACE_END: u64 = 1 << 47;
+
 #[repr(C)]
 #[allow(dead_code)] // fields read for validation only in this milestone (VM_BIND itself is EOPNOTSUPP)
 pub(super) struct DrmNouveauVmBindOp {
