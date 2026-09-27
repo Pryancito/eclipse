@@ -20,7 +20,6 @@
 //! duplicated here.
 #![allow(non_snake_case)]
 
-use crate::hooks::with_hooks;
 use crate::types::*;
 
 #[no_mangle]
@@ -54,7 +53,7 @@ pub extern "C" fn osDelayUs(microseconds: NvU32) -> NV_STATUS {
 
 #[no_mangle]
 pub extern "C" fn osGetMonotonicTimeNs() -> NvU64 {
-    with_hooks(0, |h| h.monotonic_time_ns())
+    crate::hooks::clock_ns()
 }
 
 /// 580.178.04 retired `osGetTickResolution` in favour of this one, and
@@ -66,7 +65,9 @@ pub extern "C" fn osGetMonotonicTimeNs() -> NvU64 {
 /// microsecond-granularity clock, NSEC_PER_USEC.
 #[no_mangle]
 pub extern "C" fn osGetMonotonicTickResolutionNs() -> NvU64 {
-    1_000
+    // The same constant the fallback clock advances by, so the granularity
+    // this crate reports is the granularity its clock actually has.
+    crate::hooks::TICK_RESOLUTION_NS
 }
 
 // GPU_TIMEOUT_FLAGS_OSTIMER = NVBIT(3) (gpu_timeout.h). This MUST be set:
@@ -117,7 +118,7 @@ pub extern "C" fn osSchedule() -> NV_STATUS {
 
 #[no_mangle]
 pub extern "C" fn osGetSystemTime(sec: *mut NvU32, usec: *mut NvU32) -> NV_STATUS {
-    let ns = with_hooks(0u64, |h| h.monotonic_time_ns());
+    let ns = crate::hooks::clock_ns();
     unsafe {
         if !sec.is_null() {
             *sec = (ns / 1_000_000_000) as NvU32;

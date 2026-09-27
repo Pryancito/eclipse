@@ -1802,7 +1802,7 @@ pub extern "C" fn osGetPerformanceCounter(pTimeInNs: *mut NvU64) -> NV_STATUS {
         return NV_ERR_INVALID_ARGUMENT;
     }
     unsafe {
-        *pTimeInNs = with_hooks(0u64, |h| h.monotonic_time_ns());
+        *pTimeInNs = crate::hooks::clock_ns();
     }
     NV_OK
 }
@@ -1892,7 +1892,7 @@ pub extern "C" fn osGetTimestamp() -> NvU64 {
     // microseconds with freq=1e6, and Eclipse mirrors that exactly. The
     // previous auto-generated stub returned 0 with a WRONG signature
     // (*mut c_void) -- same register ABI, but semantically garbage.
-    crate::hooks::with_hooks(0u64, |h| h.monotonic_time_ns()) / 1_000
+    crate::hooks::clock_ns() / 1_000
 }
 
 #[no_mangle]
@@ -1918,7 +1918,7 @@ pub extern "C" fn osGetCurrentTick(pTimeInNs: *mut NvU64) -> NV_STATUS {
     // it only surfaced at link time on this re-vendor.
     if !pTimeInNs.is_null() {
         unsafe {
-            *pTimeInNs = with_hooks(0u64, |h| h.monotonic_time_ns());
+            *pTimeInNs = crate::hooks::clock_ns();
         }
     }
     NV_OK
@@ -1930,8 +1930,9 @@ pub extern "C" fn osGetTickResolution() -> NvU64 {
     // gpu_timeout.c timeoutSet() to pad a deadline out to the next tick, never
     // as a divisor, so any small non-zero value is safe. Mirror the Linux
     // fallback where os_get_current_tick has microsecond granularity:
-    // NSEC_PER_USEC = 1000 ns.
-    1_000
+    // NSEC_PER_USEC = 1000 ns -- which is also the step `hooks::clock_ns`'s
+    // fallback takes, so the two cannot drift apart.
+    crate::hooks::TICK_RESOLUTION_NS
 }
 
 #[no_mangle]
@@ -1941,7 +1942,7 @@ pub extern "C" fn osGetCurrentTime(pSeconds: *mut NvU32, pMicroSeconds: *mut NvU
     // derive both from the same monotonic nanosecond clock used everywhere
     // else here; callers use it for log/journal timestamps and elapsed-time
     // deltas (client_resource.c, rpc.c), for which a monotonic base is fine.
-    let ns = with_hooks(0u64, |h| h.monotonic_time_ns());
+    let ns = crate::hooks::clock_ns();
     if !pSeconds.is_null() {
         unsafe {
             *pSeconds = (ns / 1_000_000_000) as NvU32;
@@ -3220,8 +3221,7 @@ mod boundary_tests {
     /// body panics, or the next test inherits a fake clock and fails for a
     /// reason that is not its own.
     fn alone_with_the_kernel<R>(now_ns: u64, body: impl FnOnce() -> R) -> R {
-        static TURNSTILE: StdMutex<()> = StdMutex::new(());
-        let _guard = TURNSTILE.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::hooks::test_turnstile();
         let previous = crate::hooks::swap_hooks(Some(&FAKE));
         NOW_NS.store(now_ns, Ordering::SeqCst);
         DELAYED_US.store(0, Ordering::SeqCst);
@@ -3237,8 +3237,7 @@ mod boundary_tests {
     /// The same, with the slot deliberately empty: an unwired build, which is
     /// also every moment before `drivers` registers its hooks.
     fn alone_with_no_kernel<R>(body: impl FnOnce() -> R) -> R {
-        static TURNSTILE: StdMutex<()> = StdMutex::new(());
-        let _guard = TURNSTILE.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::hooks::test_turnstile();
         let previous = crate::hooks::swap_hooks(None);
         let out = catch_unwind(AssertUnwindSafe(body));
         crate::hooks::swap_hooks(previous);

@@ -225,6 +225,11 @@ where
             + mac_addr[3] as u32
             + mac_addr[4] as u32
             + mac_addr[5] as u32;
+        // The broadcast arm (`v_addr == 0x5fa`, the sum of six 0xff bytes) can
+        // never be the one that fires: 0x5fa is the largest sum six bytes can
+        // reach, so it needs all six to be 0xff, and then bit 0 of byte 0 is set
+        // and the multicast arm has already caught it. Kept because it says what
+        // it is looking for.
         if (v_addr == 0) || // mac addr is all 0
            ((mac_addr[0] & 0x01) == 1) || // mac addr is multicast
            (v_addr == 0x5fa)
@@ -402,7 +407,18 @@ where
         self.mdio_write(phyaddr, MII_BMCR, mii_bmcr_value & !BMCR_PDOWN);
         info!("Read MII_BMCR: {:#x}", mii_bmcr_value);
 
-        self.mac_reset().unwrap();
+        // `rtlx::init` already says, in a comment on the very call that lands
+        // here, that a GMAC which does not come out of soft reset "must not take
+        // the whole boot down" and that is why it propagates instead of
+        // unwrapping. This `unwrap()` panicked before that error could ever
+        // reach it, so the mitigation at the call site was dead: a board whose
+        // EMAC clock or power is not up yet took the kernel with it instead of
+        // booting without networking. Every other hardware wait in `open` is
+        // bounded and carries on; this was the one that killed the machine.
+        if self.mac_reset().is_err() {
+            error!("[rtl8211f] GMAC soft reset never completed; no networking");
+            return Err("mac Soft Reset failed !");
+        }
 
         self.mac_init(1, 1);
 
@@ -516,7 +532,17 @@ where
             */
 
             /* Setup standard advertisement */
-            let adv = ADVERTISE_ALL;
+            // The mask names every bit this write owns and `adv` is what it
+            // leaves set, so a bit named only in the mask is a bit being
+            // CLEARED. `ADVERTISE_PAUSE_CAP` and `ADVERTISE_PAUSE_ASYM` were in
+            // the mask and missing from `adv`, so the driver told the link
+            // partner it could not do 802.3x pause -- and then, sixty lines
+            // down, asked the partner's reply whether pause had been agreed.
+            // `lpa &= adv` makes that question answer "no" every time, which is
+            // why `flow_ctrl` and the whole FLOW_* family below were dead code.
+            // Advertise pause, which is what putting those bits in the mask was
+            // reaching for. 100BASE4 stays cleared: this MAC cannot do it.
+            let adv = ADVERTISE_ALL | ADVERTISE_PAUSE_CAP | ADVERTISE_PAUSE_ASYM;
             let _ = self.phy_modify(
                 MII_ADVERTISE,
                 ADVERTISE_ALL | ADVERTISE_100BASE4 | ADVERTISE_PAUSE_CAP | ADVERTISE_PAUSE_ASYM,
@@ -524,8 +550,9 @@ where
             );
 
             // 1000M PHY BMSR_ESTATEN = 1
-            let bmcr = self.mdio_read(phyaddr, MII_BMSR);
-            if (bmcr & BMSR_ESTATEN) != 0 {
+            let bmsr = self.mdio_read(phyaddr, MII_BMSR);
+            let is_gigabit_capable = (bmsr & BMSR_ESTATEN) != 0;
+            if is_gigabit_capable {
                 let adv = ADVERTISE_1000FULL;
                 let _ = self.phy_modify(MII_CTRL1000, ADVERTISE_1000FULL | ADVERTISE_1000HALF, adv);
             }
@@ -536,9 +563,16 @@ where
             // read LPA todo
             // phy_resolve_aneg_linkmode() TODO 接着解析自协商的匹配速率
 
-            let is_gigabit_capable = 1;
+            // The extended-status bit read above IS the answer to "can this PHY
+            // do gigabit", and it was being read and then ignored: this block
+            // ran behind a hardcoded 1. On a PHY without gigabit, MII_STAT1000
+            // and MII_CTRL1000 are reserved registers, so whatever they happen
+            // to read back was parsed as a negotiation result -- and a reserved
+            // register that reads all ones carries LPA_1000MSFAIL, which aborts
+            // link-up with "Master/Slave resolution failed" on a perfectly good
+            // 100M link.
             // 有Gigabit连接能力时
-            if is_gigabit_capable != 0 {
+            if is_gigabit_capable {
                 let lpagb = self.mdio_read(phyaddr, MII_STAT1000);
                 info!("MII_STAT1000    : {:#x}", lpagb);
 
@@ -652,8 +686,28 @@ where
 
         // 而没网线Link时, 不进行下列设置: PHY state change UP -> NOLINK
         if link != 0 {
-            if pause != 0 {
-                self.flow_ctrl(duplex, FLOW_CTRL, PAUSE);
+            // `FLOW_CTRL` is the hardwired "Flow Off" constant, so passing it
+            // here enabled neither direction: `flow_ctrl` fell through both of
+            // its `fc` arms and only wrote a pause TIME into a register whose
+            // enable bit was still clear. What the negotiation has just worked
+            // out is `pause`/`asym_pause`, so that is what decides.
+            //
+            // Symmetric pause agreed: honour the partner's pause frames and
+            // send our own. Asymmetric only: we advertise PAUSE, so what the
+            // partner asked for is that we honour its frames, not that we send
+            // ours (IEEE 802.3 Annex 28B).
+            let fc = if pause != 0 {
+                FLOW_AUTO
+            } else if asym_pause != 0 {
+                FLOW_RX
+            } else {
+                FLOW_OFF
+            };
+            if fc != FLOW_OFF {
+                // PAUSE_TIME is the quanta count the reference driver sends;
+                // `PAUSE` is an advertisement bit that had been pressed into
+                // service as a pause time, which is why PAUSE_TIME sat unused.
+                self.flow_ctrl(duplex, fc, PAUSE_TIME);
             }
 
             self.set_link_mode(duplex, speed);
@@ -789,6 +843,16 @@ where
 
             rx_packets += 1;
             rx_bytes += frame_len as u64;
+
+            // One frame in, one frame out. The loop used to keep going and
+            // overwrite `buffer` on every pass, so with any limit above 1 it
+            // took frames out of the ring and returned only the last one:
+            // `interrupt_handle` calls this with BUDGET (64) and dropped up to
+            // 63 of them with no trace. `limit` still bounds how many
+            // descriptors are examined, which is where it earns its keep --
+            // error frames `continue` without producing anything -- but nothing
+            // is consumed that is not handed back.
+            break;
         }
 
         info!(
@@ -929,12 +993,18 @@ where
 
         // DMA store ordering: the payload MUST be visible in RAM before the NIC
         // can observe OWN=1, or it may DMA stale bytes onto the wire. Flush the
-        // buffer first, fence, then flush the descriptor carrying OWN, then
-        // fence. Previously the descriptor (OWN=1) was flushed first with no
-        // fence, so a back-to-back transmit could let the NIC follow the chain
-        // into this descriptor before the payload write-back completed.
+        // buffer, fence, flush the descriptor carrying OWN, then fence again so
+        // the doorbell `tx_poll` is about to ring cannot reach the NIC ahead of
+        // the descriptor it announces.
+        //
+        // The fourth operation used to be a second copy of the payload flush
+        // instead of that closing fence -- the comment above it already
+        // prescribed the fence -- so nothing ordered OWN=1 against the doorbell.
+        // The size guard above keeps every frame inside one descriptor, so
+        // `first` and `desc_count` are the same slot; each is named for what it
+        // means rather than for the fact that they coincide.
         flush_cache(
-            virt_to_phys(self.send_buffers[desc_count]) as u64,
+            virt_to_phys(self.send_buffers[first]) as u64,
             send_buff.len() as u64,
         );
         fence_w();
@@ -942,10 +1012,7 @@ where
             virt_to_phys(&self.send_ring[desc_count] as *const DmaDesc as usize) as u64,
             size_of::<DmaDesc>() as u64,
         );
-        flush_cache(
-            virt_to_phys(self.send_buffers[desc_count]) as u64,
-            send_buff.len() as u64,
-        );
+        fence_w();
 
         info!(
             "######### TX Descriptor DMA: {:#x}",
@@ -1658,14 +1725,799 @@ pub fn desc_init(desc: &mut DmaDesc) {
     //desc.desc2 = 0;
 }
 
+/// Where a device register lives.
+///
+/// On the D1 this is the kernel's physical-to-virtual map. In a host test build
+/// there is no such map -- `phys_to_virt` is the identity there -- so the four
+/// register blocks become ordinary memory and this is where the driver's
+/// hardcoded device addresses get pointed at them. See [`fake`].
+#[cfg(not(test))]
+fn mmio(phys: usize) -> usize {
+    phys_to_virt(phys)
+}
+
+#[cfg(test)]
+fn mmio(phys: usize) -> usize {
+    fake::translate(phys)
+}
+
 fn read_volatile<T>(src: *const T) -> T {
-    unsafe { core::ptr::read_volatile(phys_to_virt(src as usize) as *const T) }
+    unsafe { core::ptr::read_volatile(mmio(src as usize) as *const T) }
 }
 
 fn write_volatile<T>(dst: *mut T, value: T) {
     unsafe {
-        core::ptr::write_volatile(phys_to_virt(dst as usize) as *mut T, value);
+        core::ptr::write_volatile(mmio(dst as usize) as *mut T, value);
+    }
+    // A register the driver posts a command to answers back. On real hardware
+    // that happens on its own; the fake has to be told a store landed.
+    #[cfg(test)]
+    if size_of::<T>() == size_of::<u32>() {
+        fake::posted(dst as usize);
     }
 }
 
 pub fn print_hex_dump(buf: &[u8], len: usize) {}
+
+/// The GMAC and its MDIO bus, faked over ordinary memory.
+///
+/// `phys_to_virt` is the identity in a host build, so without this the first
+/// `read_volatile` in the driver would dereference the literal address
+/// `0x0450_0048`. Each of the four register blocks the driver touches gets one
+/// page of real memory, and an address outside all four panics by name instead
+/// of quietly landing in whatever was there.
+///
+/// Two of those registers are not just storage. The driver posts an MDIO
+/// transaction by setting `MII_BUSY` and then spins until the hardware clears
+/// it, and it starts a MAC soft reset by setting `SOFT_RST` and spinning until
+/// the MAC clears that; a purely passive fake would spin `MDIO_MAX_SPINS` times
+/// on every single register access. [`posted`] completes both the way the
+/// hardware does -- and the switches on [`Guard`] make each one *not* complete,
+/// which is the only way to reach the driver's give-up paths.
+#[cfg(test)]
+pub(crate) mod fake {
+    extern crate std;
+
+    use super::*;
+    use crate::net::ProviderImpl;
+
+    /// One page each, which is more than any of the four blocks really uses, so
+    /// a stray access stays inside its own window where a test can see it.
+    const WINDOW_LEN: usize = 0x1000;
+    const BASES: [u32; 4] = [GMAC_BASE, CCU_BASE, SYS_CFG_BASE, PINCTRL_GPIO_BASE];
+
+    fn windows() -> &'static [usize; 4] {
+        static WINDOWS: spin::Once<[usize; 4]> = spin::Once::new();
+        WINDOWS.call_once(|| {
+            let mut out = [0usize; 4];
+            for slot in out.iter_mut() {
+                *slot = alloc::vec![0u8; WINDOW_LEN].leak().as_mut_ptr() as usize;
+            }
+            out
+        })
+    }
+
+    /// Where a device address lives on the host.
+    pub fn translate(phys: usize) -> usize {
+        for (i, base) in BASES.iter().enumerate() {
+            let base = *base as usize;
+            if phys >= base && phys < base + WINDOW_LEN {
+                return windows()[i] + (phys - base);
+            }
+        }
+        panic!(
+            "rtl8211f touched {:#x}, which is in no register window",
+            phys
+        );
+    }
+
+    pub fn read(phys: u32) -> u32 {
+        unsafe { (translate(phys as usize) as *const u32).read_volatile() }
+    }
+
+    pub fn write(phys: u32, value: u32) {
+        unsafe { (translate(phys as usize) as *mut u32).write_volatile(value) }
+    }
+
+    /// The PHY, as the 32 MII registers the driver reads it through. The link
+    /// partner's abilities show up in `MII_LPA` and `MII_STAT1000`, which is
+    /// where autonegotiation leaves them.
+    #[derive(Clone, Copy)]
+    pub struct Phy {
+        pub regs: [u32; 32],
+    }
+
+    impl Phy {
+        /// A gigabit PHY facing a partner that offers every speed.
+        pub fn gigabit_partner() -> Self {
+            let mut regs = [0u32; 32];
+            regs[MII_BMSR as usize] =
+                BMSR_LSTATUS | BMSR_ANEGCOMPLETE | BMSR_ANEGCAPABLE | BMSR_ESTATEN;
+            regs[MII_LPA as usize] = LPA_100FULL | LPA_100HALF | LPA_10FULL | LPA_10HALF;
+            regs[MII_STAT1000 as usize] = LPA_1000FULL | LPA_1000HALF;
+            Self { regs }
+        }
+
+        /// A PHY with no gigabit at all: no extended status, and `MII_STAT1000`
+        /// reads back as the reserved register it is. All ones is what a real
+        /// one often gives, and it carries `LPA_1000MSFAIL`.
+        pub fn fast_ethernet_only() -> Self {
+            let mut regs = [0u32; 32];
+            regs[MII_BMSR as usize] = BMSR_LSTATUS | BMSR_ANEGCOMPLETE | BMSR_ANEGCAPABLE;
+            regs[MII_LPA as usize] = LPA_100FULL | LPA_100HALF;
+            regs[MII_STAT1000 as usize] = 0xffff;
+            Self { regs }
+        }
+
+        /// No cable, or a partner that never answers.
+        pub fn no_link(mut self) -> Self {
+            self.regs[MII_BMSR as usize] &= !BMSR_LSTATUS;
+            self
+        }
+
+        /// The partner offers symmetric 802.3x pause.
+        pub fn offering_pause(mut self) -> Self {
+            self.regs[MII_LPA as usize] |= LPA_PAUSE_CAP | LPA_PAUSE_ASYM;
+            self
+        }
+
+        /// The partner asks for pause in one direction only.
+        pub fn offering_asymmetric_pause_only(mut self) -> Self {
+            self.regs[MII_LPA as usize] |= LPA_PAUSE_ASYM;
+            self.regs[MII_LPA as usize] &= !LPA_PAUSE_CAP;
+            self
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // What the smoltcp layer above the driver (`net/rtlx.rs`) needs: a way to
+    // raise each of the interrupts `int_enable` arms, a way to see whether one
+    // was acked, and a way to put the transmit ring in the state a stopped DMA
+    // leaves it in. The registers and the ring cursors are private to this file,
+    // so a sibling module can only reach them through here.
+    // ---------------------------------------------------------------------
+
+    /// Leave the interrupt-status register the way the GMAC leaves it when a
+    /// frame has arrived.
+    pub fn raise_rx_interrupt() {
+        write(GMAC_BASE + GETH_INT_STA, RX_INT);
+    }
+
+    /// ... when the transmit FIFO underran, which stops the transmit DMA. One of
+    /// only two interrupts `int_enable` arms.
+    pub fn raise_tx_underflow() {
+        write(GMAC_BASE + GETH_INT_STA, TX_UNF_INT);
+    }
+
+    /// ... when the transmit DMA has stopped.
+    pub fn raise_tx_stopped() {
+        write(GMAC_BASE + GETH_INT_STA, TX_STOP_INT);
+    }
+
+    /// Whether the receive interrupt is still pending, i.e. nobody acked it.
+    pub fn rx_interrupt_pending() -> bool {
+        read(GMAC_BASE + GETH_INT_STA) & RX_INT != 0
+    }
+
+    /// Which interrupts the GMAC is currently armed to raise.
+    pub fn interrupts_armed() -> u32 {
+        read(GMAC_BASE + GETH_INT_EN)
+    }
+
+    /// Forget that the transmit poll-demand doorbell was ever rung.
+    pub fn clear_tx_doorbell() {
+        let value = read(GMAC_BASE + GETH_TX_CTL1);
+        write(GMAC_BASE + GETH_TX_CTL1, value & !0x8000_0000);
+    }
+
+    /// Whether the transmit poll-demand doorbell has been rung since
+    /// [`clear_tx_doorbell`]. This is what restarts a DMA that stopped.
+    pub fn tx_doorbell_rung() -> bool {
+        read(GMAC_BASE + GETH_TX_CTL1) & 0x8000_0000 != 0
+    }
+
+    /// Put the transmit ring in the state a stopped DMA leaves it in: every slot
+    /// handed to the hardware, none of them completed. This is what `can_send`
+    /// answers "no" to, and with the DMA stopped nothing gets it out of it.
+    pub fn fill_tx_ring(nic: &mut RTL8211F<ProviderImpl>) {
+        nic.tx_clean = 0;
+        nic.tx_dirty = DMA_DESC_TX - 1;
+        for desc in nic.send_ring.iter_mut() {
+            desc_set_own(desc);
+        }
+    }
+
+    /// Mark every slot of a filled transmit ring finished, the way the DMA does
+    /// once it is running again.
+    pub fn complete_whole_tx_ring(nic: &mut RTL8211F<ProviderImpl>) {
+        for i in 0..DMA_DESC_TX {
+            complete_tx(nic, i);
+        }
+    }
+
+    /// The transmit ring's two cursors, as (clean, dirty). `clean` is the one
+    /// only `tx_complete` moves.
+    pub fn tx_cursors(nic: &RTL8211F<ProviderImpl>) -> (usize, usize) {
+        (nic.tx_clean, nic.tx_dirty)
+    }
+
+    /// The first `len` bytes sitting in transmit buffer `slot`.
+    pub fn tx_buffer(nic: &RTL8211F<ProviderImpl>, slot: usize, len: usize) -> alloc::vec::Vec<u8> {
+        unsafe { slice::from_raw_parts(nic.send_buffers[slot] as *const u8, len) }.to_vec()
+    }
+
+    static PHY: spin::Mutex<Option<Phy>> = spin::Mutex::new(None);
+    /// The PHY's `BMCR_RESET` never clears: a PHY with no clock behind it.
+    static PHY_RESET_STICKS: core::sync::atomic::AtomicBool =
+        core::sync::atomic::AtomicBool::new(false);
+    /// The MAC's `SOFT_RST` never clears: EMAC clock or power not up yet.
+    static MAC_RESET_STICKS: core::sync::atomic::AtomicBool =
+        core::sync::atomic::AtomicBool::new(false);
+
+    /// A driver with its rings allocated out of host memory. `new` touches no
+    /// registers, only DMA, so it needs nothing from the fake device.
+    ///
+    /// Here rather than in this file's test module because `net/rtlx.rs` -- the
+    /// smoltcp layer over this driver -- needs the same three fixtures, and a
+    /// `#[cfg(test)] mod tests` is reachable from nowhere else.
+    pub fn driver() -> RTL8211F<ProviderImpl> {
+        RTL8211F::new(&[0x02, 0x11, 0x22, 0x33, 0x44, 0x55])
+    }
+
+    /// Leave a frame in RX descriptor `slot` the way the GMAC leaves one: OWN
+    /// clear, the last-descriptor bit set, no error bits, and the length the
+    /// hardware reports -- which counts the 4-byte FCS the driver strips.
+    pub fn stage_rx(nic: &mut RTL8211F<ProviderImpl>, slot: usize, on_wire: u32, bytes: &[u8]) {
+        let buf = nic.recv_buffers[slot];
+        unsafe {
+            slice::from_raw_parts_mut(buf as *mut u8, bytes.len()).copy_from_slice(bytes);
+        }
+        nic.recv_ring[slot].desc0 = (on_wire << 16) | (1 << 8);
+    }
+
+    pub fn stage_rx_frame(nic: &mut RTL8211F<ProviderImpl>, slot: usize, payload: &[u8]) {
+        stage_rx(nic, slot, payload.len() as u32 + 4, payload);
+    }
+
+    /// Leave a frame in RX descriptor `slot` the way the GMAC leaves one it does
+    /// not want: the error-summary bit set, which is what a CRC error, a runt or
+    /// an MII error looks like by the time the driver sees it.
+    pub fn stage_bad_rx(nic: &mut RTL8211F<ProviderImpl>, slot: usize, payload: &[u8]) {
+        stage_rx_frame(nic, slot, payload);
+        // ES (bit 15) is one of the bits `geth_recv` tests with `& 0x9008`.
+        nic.recv_ring[slot].desc0 |= 1 << 15;
+    }
+
+    /// Mark TX descriptor `slot` finished, the way the DMA does: OWN clear, the
+    /// last-segment bit set, no error bits.
+    pub fn complete_tx(nic: &mut RTL8211F<ProviderImpl>, slot: usize) {
+        nic.send_ring[slot].desc0 = 0;
+        // LS (bit 29 of desc1) is what `desc_get_tx_ls` reads.
+        nic.send_ring[slot].desc1 |= 0b11 << 30;
+    }
+
+    pub fn phy_reg(reg: u32) -> u32 {
+        PHY.lock().as_ref().map_or(0, |p| p.regs[reg as usize])
+    }
+
+    /// Complete whatever the driver just posted.
+    ///
+    /// Called right after a register store, so the value is read back out of the
+    /// window rather than threaded through the generic `write_volatile`.
+    pub(super) fn posted(phys: usize) {
+        use core::sync::atomic::Ordering;
+
+        if phys == (GMAC_BASE + GETH_INT_STA) as usize {
+            // The interrupt-status bits are write-1-to-clear: `interrupt_status`
+            // acks by storing back the bits it just read. Plain memory keeps them
+            // set instead, and then nothing can tell an interrupt that was acked
+            // from one that was not -- which is the whole question when a handler
+            // reads the status register for a line that is not its own.
+            //
+            // The store has already landed, so what is sitting in the window now
+            // is exactly the set being acked; and since the driver never acks a
+            // bit it did not just read, nothing is left pending. (Bits above
+            // `0x3FFF` are outside the mask the driver writes, and it never looks
+            // at them either.)
+            write(GMAC_BASE + GETH_INT_STA, 0);
+            return;
+        }
+        if phys == (GMAC_BASE + GETH_BASIC_CTL1) as usize {
+            let ctl = read(GMAC_BASE + GETH_BASIC_CTL1);
+            if ctl & SOFT_RST != 0 && !MAC_RESET_STICKS.load(Ordering::SeqCst) {
+                // The MAC clears SOFT_RST when the reset completes.
+                write(GMAC_BASE + GETH_BASIC_CTL1, ctl & !SOFT_RST);
+            }
+            return;
+        }
+        if phys != (GMAC_BASE + GETH_MDIO_ADDR) as usize {
+            return;
+        }
+        let cmd = read(GMAC_BASE + GETH_MDIO_ADDR);
+        if cmd & MII_BUSY == 0 {
+            return;
+        }
+        let reg = ((cmd & 0x0000_07F0) >> 4) as usize;
+        {
+            let mut guard = PHY.lock();
+            if let Some(phy) = guard.as_mut() {
+                if cmd & MII_WRITE != 0 {
+                    phy.regs[reg] = read(GMAC_BASE + GETH_MDIO_DATA) & 0xffff;
+                    if reg == MII_BMCR as usize && !PHY_RESET_STICKS.load(Ordering::SeqCst) {
+                        // A real PHY finishes its reset and clears the bit itself.
+                        phy.regs[reg] &= !BMCR_RESET;
+                    }
+                } else {
+                    write(GMAC_BASE + GETH_MDIO_DATA, phy.regs[reg]);
+                }
+            }
+        }
+        // Transaction done: the GMAC clears MII_BUSY.
+        write(GMAC_BASE + GETH_MDIO_ADDR, cmd & !MII_BUSY);
+    }
+
+    /// Zero every register window, install `phy`, and hand back the guard that
+    /// serialises the whole fake. The register file, the PHY and the cache log
+    /// are one process-global apiece and this crate's tests run in parallel, so
+    /// they all sit behind this one lock -- one lock, so there is no pair to take
+    /// in the wrong order.
+    pub fn with_phy(phy: Phy) -> Guard {
+        use core::sync::atomic::Ordering;
+
+        static TURNSTILE: spin::Mutex<()> = spin::Mutex::new(());
+        let turnstile = TURNSTILE.lock();
+        for w in windows().iter() {
+            unsafe { core::ptr::write_bytes(*w as *mut u8, 0, WINDOW_LEN) };
+        }
+        *PHY.lock() = Some(phy);
+        PHY_RESET_STICKS.store(false, Ordering::SeqCst);
+        MAC_RESET_STICKS.store(false, Ordering::SeqCst);
+        Guard {
+            _turnstile: turnstile,
+        }
+    }
+
+    pub struct Guard {
+        _turnstile: spin::MutexGuard<'static, ()>,
+    }
+
+    impl Guard {
+        /// The PHY's `BMCR_RESET` will never clear.
+        pub fn with_phy_stuck_in_reset(self) -> Self {
+            PHY_RESET_STICKS.store(true, core::sync::atomic::Ordering::SeqCst);
+            self
+        }
+
+        /// The MAC's `SOFT_RST` will never clear.
+        pub fn with_mac_stuck_in_reset(self) -> Self {
+            MAC_RESET_STICKS.store(true, core::sync::atomic::Ordering::SeqCst);
+            self
+        }
+
+        /// Start recording cache and fence operations, from empty.
+        pub fn record_cache(&self) {
+            super::super::utils::host::begin();
+        }
+
+        /// What the driver has asked the cache to do since [`Self::record_cache`].
+        pub fn cache_ops(&self) -> alloc::vec::Vec<super::super::utils::host::CacheOp> {
+            super::super::utils::host::ops()
+        }
+    }
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            use core::sync::atomic::Ordering;
+            *PHY.lock() = None;
+            PHY_RESET_STICKS.store(false, Ordering::SeqCst);
+            MAC_RESET_STICKS.store(false, Ordering::SeqCst);
+            super::super::utils::host::end();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    extern crate std;
+
+    use super::super::utils::host::CacheOp;
+    use super::fake::{self, driver, stage_rx, stage_rx_frame, Phy};
+    use super::*;
+    use crate::net::ProviderImpl;
+
+    // ------------------------------------------------------------------ 802.3x
+
+    #[test]
+    fn the_pause_the_driver_advertises_is_the_pause_it_later_asks_about() {
+        let _dev = fake::with_phy(Phy::gigabit_partner().offering_pause());
+        let mut nic = driver();
+        let _ = nic.adjust_link();
+
+        let advertised = fake::phy_reg(MII_ADVERTISE);
+        assert_ne!(
+            advertised & ADVERTISE_PAUSE_CAP,
+            0,
+            "the driver resolves flow control out of `MII_LPA & MII_ADVERTISE`, so \
+             clearing the pause bit it advertises makes that answer 'no pause' \
+             whatever the partner offered: advertised {:#x}",
+            advertised
+        );
+    }
+
+    #[test]
+    fn a_partner_that_offers_pause_gets_flow_control_switched_on() {
+        let _dev = fake::with_phy(Phy::gigabit_partner().offering_pause());
+        let mut nic = driver();
+        nic.adjust_link()
+            .expect("a gigabit partner offering everything must link");
+
+        assert_ne!(
+            fake::read(GMAC_BASE + GETH_RX_CTL0) & 0x1_0000,
+            0,
+            "RX flow control must be on, or the MAC ignores the pause frames the \
+             partner just said it would send"
+        );
+        assert_ne!(
+            fake::read(GMAC_BASE + GETH_TX_FLOW_CTL) & 0x1,
+            0,
+            "TX flow control must be on, or the MAC cannot ask the partner to stop \
+             and a download stalls instead of throttling"
+        );
+        assert_eq!(
+            fake::read(GMAC_BASE + GETH_TX_FLOW_CTL) >> 4 & 0xffff,
+            PAUSE_TIME,
+            "the pause quanta the GMAC sends must be PAUSE_TIME"
+        );
+    }
+
+    #[test]
+    fn a_partner_that_offers_no_pause_leaves_flow_control_off() {
+        let _dev = fake::with_phy(Phy::gigabit_partner());
+        let mut nic = driver();
+        nic.adjust_link().expect("the link must still come up");
+
+        assert_eq!(
+            fake::read(GMAC_BASE + GETH_RX_CTL0) & 0x1_0000,
+            0,
+            "a partner that never offered pause must not have it turned on"
+        );
+        assert_eq!(
+            fake::read(GMAC_BASE + GETH_TX_FLOW_CTL),
+            0,
+            "nothing at all belongs in the flow-control register with pause off"
+        );
+    }
+
+    #[test]
+    fn a_partner_that_offers_only_asymmetric_pause_gets_one_direction() {
+        let _dev = fake::with_phy(Phy::gigabit_partner().offering_asymmetric_pause_only());
+        let mut nic = driver();
+        nic.adjust_link().expect("the link must come up");
+
+        assert_ne!(
+            fake::read(GMAC_BASE + GETH_RX_CTL0) & 0x1_0000,
+            0,
+            "we advertise symmetric pause, so an asymmetric partner is asking us to \
+             honour its pause frames (IEEE 802.3 Annex 28B)"
+        );
+        assert_eq!(
+            fake::read(GMAC_BASE + GETH_TX_FLOW_CTL) & 0x1,
+            0,
+            "it did not ask us to send pause frames, so TX flow control stays off"
+        );
+    }
+
+    // -------------------------------------------------------- speed resolution
+
+    #[test]
+    fn a_phy_without_gigabit_is_not_asked_to_resolve_a_gigabit_link() {
+        let _dev = fake::with_phy(Phy::fast_ethernet_only());
+        let mut nic = driver();
+        let outcome = nic.adjust_link();
+        assert!(
+            outcome.is_ok(),
+            "MII_STAT1000 is a reserved register on a 100M PHY; reading it as a \
+             negotiation result turns a good 100M link into {:?}",
+            outcome.err()
+        );
+
+        assert_eq!(
+            fake::read(GMAC_BASE + GETH_BASIC_CTL0) & 0x0f,
+            CTL0_DM | 0x08 | 0x04,
+            "a 100M full-duplex link: duplex bit, not-gigabit, 100 rather than 10"
+        );
+    }
+
+    #[test]
+    fn a_gigabit_partner_is_programmed_as_a_gigabit_link() {
+        let _dev = fake::with_phy(Phy::gigabit_partner());
+        let mut nic = driver();
+        nic.adjust_link().expect("a gigabit partner must link");
+
+        assert_eq!(
+            fake::read(GMAC_BASE + GETH_BASIC_CTL0) & 0x0f,
+            CTL0_DM,
+            "gigabit is the speed bits CLEARED, with the duplex bit kept"
+        );
+    }
+
+    #[test]
+    fn with_no_cable_the_link_speed_is_never_programmed() {
+        let _dev = fake::with_phy(Phy::gigabit_partner().no_link());
+        let mut nic = driver();
+        let _ = nic.adjust_link();
+
+        assert_eq!(
+            fake::read(GMAC_BASE + GETH_BASIC_CTL0),
+            0,
+            "with no carrier the driver must not program a speed it guessed"
+        );
+    }
+
+    // ------------------------------------------------------------ DMA ordering
+
+    #[test]
+    fn the_descriptor_that_publishes_a_frame_is_fenced_against_the_doorbell() {
+        let dev = fake::with_phy(Phy::gigabit_partner());
+        let mut nic = driver();
+        let frame = [0xa5u8; 64];
+
+        let payload = virt_to_phys(nic.send_buffers[0]) as u64;
+        let descriptor = virt_to_phys(&nic.send_ring[0] as *const DmaDesc as usize) as u64;
+
+        dev.record_cache();
+        nic.geth_send(&frame).expect("a 64-byte frame must go out");
+        let ops = dev.cache_ops();
+
+        assert!(ops.len() >= 4, "too few cache operations: {:?}", ops);
+        assert_eq!(
+            &ops[..4],
+            &[
+                CacheOp::Flush(payload, frame.len() as u64),
+                CacheOp::Fence,
+                CacheOp::Flush(descriptor, size_of::<DmaDesc>() as u64),
+                CacheOp::Fence,
+            ][..],
+            "publishing a frame is payload, fence, descriptor, fence: without that \
+             last fence nothing orders OWN=1 against the doorbell that follows, and \
+             the NIC can DMA a descriptor whose payload is still in the store buffer"
+        );
+    }
+
+    // --------------------------------------------------------------- receiving
+
+    #[test]
+    fn a_frame_taken_out_of_the_ring_is_always_the_frame_handed_back() {
+        let _dev = fake::with_phy(Phy::gigabit_partner());
+        let mut nic = driver();
+        let first = [0x11u8; 60];
+        let second = [0x22u8; 70];
+        stage_rx_frame(&mut nic, 0, &first);
+        stage_rx_frame(&mut nic, 1, &second);
+
+        // A budget of eight, two frames waiting.
+        let (got, count) = nic.geth_recv(8);
+        assert_eq!(
+            got,
+            &first[..],
+            "the first frame is the one that comes back; the loop used to keep \
+             going and overwrite it, so a budget above 1 consumed frames out of \
+             the ring and returned only the last"
+        );
+        assert_eq!(count, 1, "one frame consumed, one frame handed over");
+
+        let (got, _) = nic.geth_recv(8);
+        assert_eq!(
+            got,
+            &second[..],
+            "the second frame must still be in the ring, not dropped"
+        );
+    }
+
+    #[test]
+    fn a_descriptor_claiming_more_than_the_buffer_holds_is_clamped_to_it() {
+        let _dev = fake::with_phy(Phy::gigabit_partner());
+        let mut nic = driver();
+        // 0x3fff is the largest the descriptor's 14-bit length field can say, and
+        // on the last descriptor of a multi-descriptor frame the hardware really
+        // does report the WHOLE frame length there -- more than one buffer holds.
+        stage_rx(&mut nic, 0, 0x3fff, &[0x5au8; 64]);
+
+        let (got, _) = nic.geth_recv(1);
+        assert_eq!(
+            got.len(),
+            (MAX_BUF_SZ - 4) as usize,
+            "the frame handed back must be clamped to the DMA buffer: taking the \
+             reported length at face value reads -- and invalidates cache over -- \
+             far past the end of a one-page RX buffer"
+        );
+    }
+
+    #[test]
+    fn a_runt_too_short_to_hold_its_own_checksum_is_dropped() {
+        let _dev = fake::with_phy(Phy::gigabit_partner());
+        let mut nic = driver();
+        // Three bytes on the wire: less than the 4-byte FCS the driver strips.
+        stage_rx(&mut nic, 0, 3, &[0xde, 0xad, 0xbe]);
+
+        let (got, _) = nic.geth_recv(1);
+        assert!(
+            got.is_empty(),
+            "a frame shorter than its FCS must be dropped, not have 4 subtracted \
+             from its length"
+        );
+    }
+
+    // ------------------------------------------------------------ transmitting
+
+    #[test]
+    fn a_frame_shorter_than_an_ethernet_header_is_refused_without_moving_the_ring() {
+        let _dev = fake::with_phy(Phy::gigabit_partner());
+        let mut nic = driver();
+        assert!(
+            nic.geth_send(&[]).is_err(),
+            "an empty frame must be refused"
+        );
+        assert!(
+            nic.geth_send(&[0u8; 13]).is_err(),
+            "13 bytes cannot carry an Ethernet header"
+        );
+        assert_eq!(
+            (nic.tx_dirty, nic.tx_clean),
+            (0, 0),
+            "a refused frame must leave the ring pointers where they were, or the \
+             slot is never reclaimed and the ring desynchronises for good"
+        );
+    }
+
+    #[test]
+    fn a_frame_too_big_for_a_dma_buffer_is_refused_without_moving_the_ring() {
+        let _dev = fake::with_phy(Phy::gigabit_partner());
+        let mut nic = driver();
+        let huge = alloc::vec![0u8; MAX_BUF_SZ as usize + 1];
+        assert!(
+            nic.geth_send(&huge).is_err(),
+            "a frame past MAX_BUF_SZ would overflow the TX buffer it is copied into"
+        );
+        assert_eq!((nic.tx_dirty, nic.tx_clean), (0, 0));
+    }
+
+    #[test]
+    fn a_tx_ring_with_no_room_says_so_and_an_empty_one_does_not() {
+        let _dev = fake::with_phy(Phy::gigabit_partner());
+        let mut nic = driver();
+
+        assert!(nic.can_send(), "an untouched ring has room");
+
+        // One slot short of the write cursor: every descriptor is outstanding.
+        nic.tx_clean = 0;
+        nic.tx_dirty = DMA_DESC_TX - 1;
+        assert!(
+            !nic.can_send(),
+            "with the write cursor one slot behind the reclaim cursor the ring is \
+             full, and claiming otherwise overwrites a descriptor the NIC owns"
+        );
+
+        nic.tx_clean = 5;
+        nic.tx_dirty = 5;
+        assert!(nic.can_send(), "both cursors together is an empty ring");
+    }
+
+    // ------------------------------------------------------------- bringing up
+
+    #[test]
+    fn bringing_the_gmac_up_enables_it_and_hands_the_ring_to_the_dma() {
+        let _dev = fake::with_phy(Phy::gigabit_partner());
+        let mut nic = driver();
+        nic.open().expect("a healthy GMAC must come up");
+
+        assert_ne!(
+            fake::read(GMAC_BASE + GETH_TX_CTL0) & (1 << 31),
+            0,
+            "TX must be enabled"
+        );
+        assert_ne!(
+            fake::read(GMAC_BASE + GETH_RX_CTL0) & (1 << 31),
+            0,
+            "RX must be enabled"
+        );
+        assert_eq!(
+            fake::read(GMAC_BASE + GETH_RX_DESC_LIST),
+            nic.recv_ring.as_ptr() as usize as u32,
+            "the RX descriptor list register must point at the ring, or the DMA \
+             walks whatever was in the register at reset"
+        );
+        assert_eq!(
+            fake::read(GMAC_BASE + GETH_TX_DESC_LIST),
+            nic.send_ring.as_ptr() as usize as u32,
+            "and the same for TX"
+        );
+        assert_eq!(
+            fake::phy_reg(MII_BMCR) & BMCR_PDOWN,
+            0,
+            "the PHY must be brought out of power-down"
+        );
+    }
+
+    #[test]
+    fn a_gmac_whose_soft_reset_never_completes_fails_the_bring_up_not_the_boot() {
+        let _dev = fake::with_phy(Phy::gigabit_partner()).with_mac_stuck_in_reset();
+        let mut nic = driver();
+
+        // `rtlx::init` propagates this error precisely so the board still boots
+        // without networking. An `unwrap()` in here panicked first and made that
+        // mitigation dead code.
+        assert!(
+            nic.open().is_err(),
+            "a MAC that never leaves soft reset must come back as an error"
+        );
+    }
+
+    #[test]
+    fn a_phy_stuck_in_reset_does_not_wedge_the_bring_up() {
+        let _dev = fake::with_phy(Phy::gigabit_partner()).with_phy_stuck_in_reset();
+        let mut nic = driver();
+
+        // Bounded busy-waits, not infinite ones: the point is that `open`
+        // returns at all.
+        nic.open()
+            .expect("a PHY that never leaves reset must not stop the MAC coming up");
+    }
+
+    // ------------------------------------------------------------- the address
+
+    #[test]
+    fn a_mac_the_board_never_programmed_falls_back_to_the_built_in_one() {
+        let built_in = RTL8211F::<ProviderImpl>::new(&[0u8; 6]).get_umac();
+        assert_ne!(built_in, [0u8; 6], "all zeros is not a usable address");
+        assert_eq!(
+            built_in[0] & 0x01,
+            0,
+            "the fallback must not be a multicast address"
+        );
+
+        assert_eq!(
+            RTL8211F::<ProviderImpl>::new(&[0xff; 6]).get_umac(),
+            built_in,
+            "broadcast is not a usable address either"
+        );
+        assert_eq!(
+            RTL8211F::<ProviderImpl>::new(&[0x01, 0, 0, 0, 0, 1]).get_umac(),
+            built_in,
+            "nor is a multicast one"
+        );
+        assert_eq!(
+            RTL8211F::<ProviderImpl>::new(&[0x02, 0x11, 0x22, 0x33, 0x44, 0x55]).get_umac(),
+            [0x02, 0x11, 0x22, 0x33, 0x44, 0x55],
+            "a usable address is kept as it is"
+        );
+    }
+
+    #[test]
+    fn the_mac_lands_in_the_two_halves_the_gmac_reads_it_from() {
+        let _dev = fake::with_phy(Phy::gigabit_partner());
+        let nic = driver();
+        nic.set_umac(&[0x02, 0x11, 0x22, 0x33, 0x44, 0x55], 0);
+
+        assert_eq!(
+            fake::read(GMAC_BASE + GETH_ADDR_HI),
+            0x5544,
+            "the high half is the last two bytes, low byte first"
+        );
+        assert_eq!(
+            fake::read(GMAC_BASE + GETH_ADDR_LO),
+            0x3322_1102,
+            "and the low half is the first four, in the same order"
+        );
+
+        // Slot 1 lives eight bytes further up, not four.
+        nic.set_umac(&[0x06, 0x01, 0x02, 0x03, 0x04, 0x05], 1);
+        assert_eq!(fake::read(GMAC_BASE + GETH_ADDR_HI + 8), 0x0504);
+        assert_eq!(fake::read(GMAC_BASE + GETH_ADDR_LO + 8), 0x0302_0106);
+        assert_eq!(
+            fake::read(GMAC_BASE + GETH_ADDR_HI),
+            0x5544,
+            "and writing slot 1 must not have landed on slot 0"
+        );
+    }
+}
