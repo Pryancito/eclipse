@@ -7190,9 +7190,15 @@ mod kms_scanout_tests {
             0,
             "nothing moved under the copy, so there is no mismatch to report"
         );
+        // The range, not just the floor: a count above the budget would be
+        // reads that wrote no line, and then this would pass without the line
+        // this test is about ever having been written.
+        let zero_reads = drm::zero_reports_for_test();
         assert!(
-            drm::zero_reports_for_test() >= 1,
-            "but the source report has to fire anyway -- that is the whole point of it"
+            (1..=drm::probe_report_budget_for_test()).contains(&zero_reads),
+            "the source report has to fire anyway -- that is the whole point of \
+             it -- and inside the budget, so it really wrote its line; got {}",
+            zero_reads
         );
     }
 

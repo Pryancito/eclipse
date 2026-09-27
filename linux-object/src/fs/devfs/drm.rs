@@ -1247,7 +1247,10 @@ fn probe_bands(
     let n = probe_band_count(w);
     let mut bands = [PROBE_FNV_BASIS; PROBE_MAX_BANDS];
     let mut zero = ZeroExtent::empty();
-    let mut sampled = 0usize;
+    // Rows, not pixels -- `zero.sampled` beside it counts pixels, and the two
+    // being one word apart with the same name is how a later reader divides by
+    // the wrong thing.
+    let mut sampled_rows = 0usize;
     let mut r = 0usize;
     while r < h as usize {
         let off = (y as usize)
@@ -1272,10 +1275,10 @@ fn probe_bands(
             }
         }
         zero.sampled = zero.sampled.saturating_add(end.saturating_sub(off));
-        sampled += 1;
+        sampled_rows += 1;
         r += row_step;
     }
-    (sampled > 0).then_some(ProbeBands { bands, n, zero })
+    (sampled_rows > 0).then_some(ProbeBands { bands, n, zero })
 }
 
 /// Whether the two reads bracketing a blit say somebody else was writing the
@@ -1290,34 +1293,51 @@ fn probe_says_changed(before: u64, after: Option<u64>) -> bool {
     after != Some(before)
 }
 
-/// How many probe mismatches have been reported, so a compositor that tears
-/// every frame does not turn the klog into the bottleneck. `klog` writes
+/// How many probe mismatches have OCCURRED, which is not the same as how many
+/// got a line: [`probe_report_decision`] stops writing after
+/// [`MAX_PROBE_REPORTS`] of them while this keeps counting. Counting
+/// occurrences is what makes the budget work -- a compositor that tears every
+/// frame must not turn the klog into the bottleneck. `klog` writes
 /// synchronously to the UART, which at 115200 baud is slower than the frame it
 /// is describing.
 static PROBE_REPORTS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 const MAX_PROBE_REPORTS: u32 = 12;
 
-/// How many "where is the source black" lines have been reported. Its own
-/// counter, and not the mismatch one, because the two answer different
+/// How many source-is-black reads have OCCURRED -- every present, not only the
+/// ones that got a line, the same convention as [`PROBE_REPORTS`] and for the
+/// same reason. Its own counter, and not the mismatch one, because the two answer different
 /// questions and the interesting case for this one is the frame where NOTHING
 /// changed: a black rectangle that just sits there is black in both reads, so it
 /// never sets a band bit and the mismatch line never fires. Sharing a budget
 /// would let a torn boot spend it before the static case was ever described.
 static ZERO_REPORTS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
-/// How many probe mismatches this process has reported, so an end-to-end test
-/// can assert that a settled buffer produced none.
+/// How many probe mismatches this process has seen, so an end-to-end test can
+/// assert that a settled buffer produced none.
 #[cfg(test)]
 pub(crate) fn probe_reports_for_test() -> u32 {
     PROBE_REPORTS.load(Ordering::Relaxed)
 }
 
-/// How many source-is-black lines this process has reported, so an end-to-end
-/// test can assert the thing that distinguishes this line from the mismatch
-/// one: that it fires on a present where nothing changed at all.
+/// How many source-is-black reads this process has done, so an end-to-end test
+/// can assert the thing that distinguishes this line from the mismatch one:
+/// that it fires on a present where nothing changed at all.
+///
+/// A count on its own does not say a line was written, because the budget cuts
+/// the lines off and not the counting. A count that is at least one and no more
+/// than [`probe_report_budget_for_test`] does: the budget cannot have been spent
+/// yet, so every one of those reads wrote its line. Assert the range, not just
+/// the floor.
 #[cfg(test)]
 pub(crate) fn zero_reports_for_test() -> u32 {
     ZERO_REPORTS.load(Ordering::Relaxed)
+}
+
+/// How many of each kind of probe line get written before the budget cuts them
+/// off. For the range assertion above.
+#[cfg(test)]
+pub(crate) fn probe_report_budget_for_test() -> u32 {
+    MAX_PROBE_REPORTS
 }
 
 /// Whether this mismatch gets a line in the klog, and whether it is the last
