@@ -2456,6 +2456,15 @@ pub fn handle_vmo(handle_id: u32) -> Option<Arc<VmObject>> {
         .map(|(_, vmo, _)| vmo.clone())
 }
 
+/// Whether the calling process holds `handle` as a GEM object it may map:
+/// its own dumb buffer, or a driver-private (nouveau) object it has a
+/// reference to. What `MAP_DUMB` asks before minting an mmap offset, as
+/// `drm_gem_dumb_map_offset` asks `drm_gem_object_lookup`.
+pub fn gem_handle_mappable(handle: u32) -> bool {
+    handle_vmo(handle).is_some()
+        || zcore_drivers::scheme::gem_mmap::lookup_for(handle, current_pid()).is_some()
+}
+
 /// Whether a process may act on a GEM object owned by `owner`: its own, an
 /// unowned (boot-time) one, or when there is no current thread. Handles are
 /// per-file in Linux; this global table cannot do better than per-pid, but

@@ -536,11 +536,11 @@ impl DrmDev {
         // syscall, so the cookie must be page-aligned; recover the handle by
         // shifting it back down.
         let handle_id = handle_from_mmap_cookie(offset);
-        let _ = len;
         if let Some(vmo) = drm::handle_vmo(handle_id) {
             // The dumb buffer's OWN (contiguous, cached) VMO: the mapping keeps
             // the frames alive past DESTROY_DUMB, and the pixels are WB for the
             // renderer -- see `drm::handle_vmo`.
+            mmap_len_check(len, vmo.len())?;
             Ok(vmo)
         } else if let Some((phys_addr, size)) =
             zcore_drivers::scheme::gem_mmap::lookup_for(handle_id, drm::current_pid())
@@ -563,7 +563,7 @@ impl DrmDev {
             // file that never got a handle to the object gets EACCES. The
             // dumb-buffer branch above is already owner-checked inside
             // `handle_vmo`; this was the remaining door.
-            let _ = len;
+            mmap_len_check(len, size as usize)?;
             Ok(drm::nouveau_cpu_vmo(handle_id, phys_addr, size as usize))
         } else {
             Err(FsError::InvalidParam)
@@ -1180,6 +1180,16 @@ impl DrmDev {
             }
             DRM_IOCTL_MODE_MAP_DUMB => {
                 let map = unsafe { &mut *(data as *mut DrmModeMapDumb) };
+                // Linux's `drm_gem_dumb_map_offset` looks the handle up first
+                // (`drm_gem_object_lookup`: ENOENT for one this file does not
+                // hold) and only then mints the offset. A cookie for a handle
+                // the caller does not own is not a way in -- `get_vmo` checks
+                // again -- but it turned a client's stale or wrong handle into
+                // an EINVAL from `mmap()` two calls later instead of the ENOENT
+                // here that names the ioctl at fault.
+                if !drm::gem_handle_mappable(map.handle) {
+                    return Err(FsError::EntryNotFound);
+                }
                 // Return a page-aligned fake offset (`handle << PAGE_SHIFT`). The
                 // subsequent mmap of the dumb buffer passes this back as the file
                 // offset; musl's `mmap()` rejects a non-page-aligned offset with
@@ -3339,6 +3349,21 @@ fn connector_of_edid_blob(blob_id: u32) -> Option<u32> {
 /// functions rather than a shift written out at each end.
 fn mmap_cookie_for(handle: u32) -> u64 {
     (handle as u64) << 12
+}
+
+/// Whether an `mmap` of `len` bytes fits a GEM object of `object` bytes.
+///
+/// Linux's `drm_gem_mmap_obj` refuses with EINVAL a mapping longer than the
+/// object (measured in whole pages, `drm_vma_node_size`), and the TTM drivers
+/// SIGBUS a touch past it. Here the syscall's own past-EOF rule applied: the
+/// object backed the head and the tail was fresh zero pages, so a client that
+/// mapped a buffer with the wrong size got readable, writable memory that was
+/// not the buffer, and nothing said so.
+fn mmap_len_check(len: usize, object: usize) -> Result<()> {
+    if len > zircon_object::vm::pages(object) * zircon_object::vm::PAGE_SIZE {
+        return Err(FsError::InvalidParam);
+    }
+    Ok(())
 }
 
 /// See [`mmap_cookie_for`]. Truncates above 32 bits, so an offset beyond the
@@ -5857,6 +5882,23 @@ mod gl_client_sequence_tests {
         /// This open's `drm_file` state.
         pub(super) fn file_state(&self) -> &Arc<drm::DrmFileState> {
             self.dev.file_state()
+        }
+
+        /// `mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_SHARED, fd, offset)`,
+        /// down to the object the mapping would be made of.
+        pub(super) fn mmap(&self, offset: u64, len: usize) -> Result<Arc<VmObject>> {
+            self.dev.get_vmo(offset as usize, len)
+        }
+
+        /// `DRM_IOCTL_MODE_MAP_DUMB`: the mmap offset for `handle`.
+        pub(super) fn map_dumb(&self, handle: u32) -> Result<u64> {
+            let mut req = DrmModeMapDumb {
+                handle,
+                pad: 0,
+                offset: 0,
+            };
+            self.ioctl(DRM_IOCTL_MODE_MAP_DUMB, &mut req)?;
+            Ok(req.offset)
         }
 
         /// `read(fd, buf, len)` --- how a compositor collects flip completions.
@@ -11662,6 +11704,105 @@ mod prime_import_close_tests {
         );
         assert!(c.file_state().holds_prime_import(by_gem_close.handle));
         c.file_state().forget_prime_import(by_gem_close.handle);
+    }
+}
+
+#[cfg(test)]
+mod mmap_bounds_tests {
+    //! `MAP_DUMB` names a handle the file holds, and the `mmap` that follows
+    //! is no longer than the object -- `drm_gem_dumb_map_offset` and
+    //! `drm_gem_mmap_obj`.
+    use super::gl_client_sequence_tests::Client;
+    use super::*;
+    use zcore_drivers::scheme::gem_mmap;
+    use zircon_object::vm::PAGE_SIZE;
+
+    /// A nouveau-range handle no GPU slice hands out in these tests.
+    const H: u32 = 0xbfff_0008;
+
+    #[test]
+    fn map_dumb_is_enoent_for_a_handle_the_file_does_not_hold() {
+        let _serialised = drm::test_globals::lock();
+        let c = Client::open(0);
+        let buf = c.create_dumb(16, 16);
+        assert_eq!(c.map_dumb(buf.handle), Ok(mmap_cookie_for(buf.handle)));
+        assert_eq!(
+            c.map_dumb(buf.handle + 0x100),
+            Err(FsError::EntryNotFound),
+            "a dumb handle nobody created"
+        );
+        assert_eq!(
+            c.map_dumb(H),
+            Err(FsError::EntryNotFound),
+            "a nouveau handle nobody registered"
+        );
+        // A nouveau GEM the process holds maps through the same ioctl, as
+        // `drm_gem_object_lookup` finds any GEM object of the file.
+        gem_mmap::register(H, 0x1000_0000, 2 * PAGE_SIZE as u64, drm::current_pid());
+        assert_eq!(c.map_dumb(H), Ok(mmap_cookie_for(H)));
+        assert!(gem_mmap::unregister(H));
+        assert_eq!(c.map_dumb(H), Err(FsError::EntryNotFound), "gone again");
+        assert_eq!(c.destroy_dumb(buf.handle), Ok(0));
+        assert_eq!(
+            c.map_dumb(buf.handle),
+            Err(FsError::EntryNotFound),
+            "a destroyed dumb handle"
+        );
+    }
+
+    #[test]
+    fn an_mmap_longer_than_the_object_is_einval_and_one_that_fits_is_the_object() {
+        let _serialised = drm::test_globals::lock();
+        let c = Client::open(0);
+        // 64 x 64 x 4 = 16 KiB: four whole pages.
+        let buf = c.create_dumb(64, 64);
+        assert_eq!(buf.size, 4 * PAGE_SIZE as u64);
+        let off = c.map_dumb(buf.handle).unwrap();
+        for len in [1usize, PAGE_SIZE, 3 * PAGE_SIZE + 1, 4 * PAGE_SIZE] {
+            let vmo = c
+                .mmap(off, len)
+                .unwrap_or_else(|e| panic!("len {}: {:?}", len, e));
+            assert_eq!(vmo.len(), 4 * PAGE_SIZE, "len {}", len);
+        }
+        for len in [4 * PAGE_SIZE + 1, 5 * PAGE_SIZE, 1 << 30] {
+            assert_eq!(
+                c.mmap(off, len).err(),
+                Some(FsError::InvalidParam),
+                "len {}",
+                len
+            );
+        }
+        // A 16 x 16 buffer is 1 KiB in a page of its own: the page is the
+        // object's, the next one is not.
+        let small = c.create_dumb(16, 16);
+        let off = c.map_dumb(small.handle).unwrap();
+        assert!(c.mmap(off, PAGE_SIZE).is_ok());
+        assert_eq!(
+            c.mmap(off, PAGE_SIZE + 1).err(),
+            Some(FsError::InvalidParam)
+        );
+        assert_eq!(c.destroy_dumb(small.handle), Ok(0));
+        assert_eq!(c.destroy_dumb(buf.handle), Ok(0));
+    }
+
+    #[test]
+    fn the_nouveau_side_measures_the_object_the_same_way() {
+        let _serialised = drm::test_globals::lock();
+        let c = Client::open(0);
+        // Two pages and a byte: three pages of object.
+        gem_mmap::register(H, 0x1000_0000, 2 * PAGE_SIZE as u64 + 1, drm::current_pid());
+        let off = c.map_dumb(H).unwrap();
+        assert_eq!(
+            c.mmap(off, 3 * PAGE_SIZE + 1).err(),
+            Some(FsError::InvalidParam),
+            "past the object"
+        );
+        assert!(
+            c.mmap(off, 3 * PAGE_SIZE).is_ok(),
+            "the object's three pages"
+        );
+        assert!(gem_mmap::unregister(H));
+        drm::nouveau_cpu_vmo_forget(H);
     }
 }
 
