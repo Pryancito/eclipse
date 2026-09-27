@@ -1469,6 +1469,7 @@ impl Syscall<'_> {
                 return Err(e.into());
             }
         };
+        syncobj_fd_args_check(h.flags, h.pad)?;
         // Whichever way round, `h.handle` is one of the CALLER'S syncobjs:
         // the one being exported, or the one an IMPORT_SYNC_FILE lands in.
         // Linux finds it in the caller's file (`drm_syncobj_find`), so
@@ -1481,17 +1482,22 @@ impl Syscall<'_> {
                 h.handle,
             )
         {
+            // `drm_syncobj_handle_to_fd` and `drm_syncobj_export_sync_file`
+            // answer a failed `drm_syncobj_find` with EINVAL;
+            // `drm_syncobj_import_sync_file_fence` with ENOENT.
+            let errno = syncobj_fd_missing_handle_errno(is_handle_to_fd);
             warn!(
-                "[drm] SYNCOBJ_{} ENOENT: handle={} is not a live syncobj of pid {}",
+                "[drm] SYNCOBJ_{} {:?}: handle={} is not a live syncobj of pid {}",
                 if is_handle_to_fd {
                     "HANDLE_TO_FD"
                 } else {
                     "FD_TO_HANDLE(IMPORT_SYNC_FILE)"
                 },
+                errno,
                 h.handle,
                 self.zircon_process().id()
             );
-            return Err(LxError::ENOENT);
+            return Err(errno);
         }
         // The `_SYNC_FILE` variants (same bit on both ioctls) move a single
         // FENCE rather than the syncobj itself: export takes the fence that is
@@ -3113,6 +3119,68 @@ mod truncate_type_tests {
 /// tree has lost ioctls before.
 pub(crate) fn is_sync_ioc_merge(cmd: u32) -> bool {
     (cmd >> 8) & 0xff == 0x3e && cmd & 0xff == 3
+}
+
+/// The one flag `SYNCOBJ_HANDLE_TO_FD` and `SYNCOBJ_FD_TO_HANDLE` know:
+/// `DRM_SYNCOBJ_HANDLE_TO_FD_FLAGS_EXPORT_SYNC_FILE` and
+/// `DRM_SYNCOBJ_FD_TO_HANDLE_FLAGS_IMPORT_SYNC_FILE`, bit 0 on both.
+const SYNCOBJ_FD_SYNC_FILE: u32 = 1 << 0;
+
+/// What both syncobj fd ioctls refuse before looking at the handle or the
+/// fd, as `drm_syncobj_handle_to_fd_ioctl` / `drm_syncobj_fd_to_handle_ioctl`
+/// do: a non-zero `pad`, and `flags` other than 0 or the one bit. Every
+/// other flag is EINVAL -- which includes the `_TIMELINE` variants newer
+/// kernels grew (bit 1, with a `point` past the 16-byte prefix): this tree
+/// has no timeline sync_file, and a client that asked for one used to get
+/// its request honoured as the plain, whole-syncobj kind, so the point it
+/// wanted to export or import was silently not the one that travelled.
+pub(crate) fn syncobj_fd_args_check(flags: u32, pad: u32) -> Result<(), LxError> {
+    if pad != 0 {
+        return Err(LxError::EINVAL);
+    }
+    if flags != 0 && flags != SYNCOBJ_FD_SYNC_FILE {
+        return Err(LxError::EINVAL);
+    }
+    Ok(())
+}
+
+/// The errno for a `handle` that is not the caller's: EINVAL on
+/// `HANDLE_TO_FD` (both variants), ENOENT on `FD_TO_HANDLE`'s
+/// IMPORT_SYNC_FILE, which is how Linux's two lookups answer.
+pub(crate) fn syncobj_fd_missing_handle_errno(handle_to_fd: bool) -> LxError {
+    if handle_to_fd {
+        LxError::EINVAL
+    } else {
+        LxError::ENOENT
+    }
+}
+
+#[cfg(test)]
+mod syncobj_fd_ioctl_tests {
+    use super::{syncobj_fd_args_check, syncobj_fd_missing_handle_errno, LxError};
+
+    /// libdrm's two shapes go through; a pad, an unknown bit, and the
+    /// timeline bit (alone or with the sync_file one) are EINVAL.
+    #[test]
+    fn only_pad_zero_and_the_sync_file_bit_are_accepted() {
+        assert_eq!(syncobj_fd_args_check(0, 0), Ok(()));
+        assert_eq!(syncobj_fd_args_check(1, 0), Ok(()));
+        assert_eq!(syncobj_fd_args_check(0, 1), Err(LxError::EINVAL));
+        assert_eq!(syncobj_fd_args_check(1, 0xdead_beef), Err(LxError::EINVAL));
+        // DRM_SYNCOBJ_HANDLE_TO_FD_FLAGS_EXPORT_SYNC_FILE_TIMELINE and the
+        // import twin: bit 1.
+        assert_eq!(syncobj_fd_args_check(1 << 1, 0), Err(LxError::EINVAL));
+        assert_eq!(syncobj_fd_args_check(0x3, 0), Err(LxError::EINVAL));
+        for bit in [2, 3, 8, 16, 31] {
+            assert_eq!(syncobj_fd_args_check(1 << bit, 0), Err(LxError::EINVAL));
+        }
+    }
+
+    #[test]
+    fn a_missing_handle_is_einval_on_export_and_enoent_on_import() {
+        assert_eq!(syncobj_fd_missing_handle_errno(true), LxError::EINVAL);
+        assert_eq!(syncobj_fd_missing_handle_errno(false), LxError::ENOENT);
+    }
 }
 
 #[cfg(test)]
