@@ -283,7 +283,6 @@ impl Syscall<'_> {
         mut out: UserOutPtr<i64>,
     ) -> ZxResult {
         info!("interrupt.wait: handle={:?}", interrupt);
-        assert_eq!(core::mem::size_of::<PortPacket>(), 48);
         let proc = self.thread.proc();
         let interrupt = proc.get_object_with_rights::<Interrupt>(interrupt, Rights::WAIT)?;
         let future = interrupt.wait();

@@ -24,6 +24,12 @@ pub struct PortPacket {
     pub data: Payload,
 }
 
+/// The packet goes to and from userspace byte for byte, so its size is part of
+/// the ABI. `sys_port_wait` and `sys_interrupt_wait` used to `assert_eq!` this
+/// at run time, on every wait: a layout that drifted would have been a kernel
+/// panic in a syscall rather than a build that does not finish.
+const _: () = assert!(core::mem::size_of::<PortPacket>() == 48);
+
 impl PortPacket {
     /// The packet's type, or `INVALID_ARGS` if the caller wrote something that
     /// is not one.
@@ -390,8 +396,8 @@ mod wire_tests {
         unsafe { core::ptr::read_unaligned(bytes.as_ptr() as *const PortPacket) }
     }
 
-    /// `sys_port_wait` asserts this at run time on every wait, and the byte
-    /// builder above depends on it too.
+    /// A `const` assertion by the definition makes a drift a build error; the
+    /// byte builder above depends on the size too.
     #[test]
     fn the_wire_packet_is_forty_eight_bytes() {
         assert_eq!(core::mem::size_of::<PortPacket>(), 48);
