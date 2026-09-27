@@ -8649,6 +8649,101 @@ impl NvidiaGpu {
         drained_count
     }
 
+    /// Takes the caller's mappings that overlap `[addr, addr + range)` out
+    /// of its VAS and maps back the parts outside the range. Linux's gpuvm
+    /// answers an UNMAP over part of a mapping, or a MAP over part of one,
+    /// with REMAP ops: the head and the tail of the old mapping stay, same
+    /// object and kind, offsets moved along. Before this, any overlap took
+    /// the WHOLE old mapping: NVK's bind context merges adjacent
+    /// `vkQueueBindSparse` binds into one mapping, so unbinding (or
+    /// rebinding) one page of a sparse-binding buffer later unmapped
+    /// everything merged around it, and the next draw faulted on it. The RM
+    /// knows a mapping only whole (one `h_virt`), so the old one is unmapped
+    /// first and the kept parts are mapped again; a part the RM refuses is
+    /// reported and lost, the op itself still succeeds (Linux cannot fail
+    /// here either). Returns how many mappings were taken.
+    fn split_vm_mappings(
+        &self,
+        device_instance: u32,
+        ctx_idx: u32,
+        owner_pid: u64,
+        addr: u64,
+        range: u64,
+        context: &str,
+    ) -> usize {
+        let end = addr.wrapping_add(range);
+        let taken = self.take_vm_mappings(|m| {
+            m.owner_pid == owner_pid && m.va < end && addr < m.va.wrapping_add(m.size)
+        });
+        let count = taken.len();
+        // (gem_handle, va, size, bo_offset, pte_kind) of every kept part.
+        let mut kept = Vec::new();
+        for m in &taken {
+            let m_end = m.va.wrapping_add(m.size);
+            if m.va < addr {
+                kept.push((m.gem_handle, m.va, addr - m.va, m.bo_offset, m.pte_kind));
+            }
+            if end < m_end {
+                kept.push((
+                    m.gem_handle,
+                    end,
+                    m_end - end,
+                    m.bo_offset + (end - m.va),
+                    m.pte_kind,
+                ));
+            }
+        }
+        self.rm_unmap_mappings(context, taken);
+        for (gem_handle, va, size, bo_offset, pte_kind) in kept {
+            let h_memory = self
+                .nouveau_gem
+                .lock()
+                .iter()
+                .find(|o| o.handle == gem_handle)
+                .map(|o| o.h_memory);
+            let mapped = h_memory
+                .and_then(|h| {
+                    nvidia_rm_sys::rm_init::vm_bind_map(
+                        device_instance,
+                        ctx_idx,
+                        h,
+                        size,
+                        va,
+                        bo_offset,
+                        pte_kind,
+                    )
+                    .ok()
+                })
+                .filter(|b| b.map_status == 0);
+            match mapped {
+                Some(b) => {
+                    self.nouveau_vm_mappings
+                        .lock()
+                        .push(super::nouveau_uapi::NouveauVmMapping {
+                            gem_handle,
+                            h_virt: b.h_virt,
+                            owner_pid,
+                            va: b.actual_va,
+                            size,
+                            bo_offset,
+                            pte_kind,
+                        });
+                    log::info!(
+                        "[nouveau-uapi] {}: kept VA={:#x}+{:#x} of the split mapping (handle={} bo_offset={:#x})",
+                        context, va, size, gem_handle, bo_offset
+                    );
+                }
+                None => {
+                    crate::klog_warn!(
+                        "[nouveau-uapi] {}: the part VA={:#x}+{:#x} outside the range (handle={} bo_offset={:#x}) could not be mapped again -- that part of the object is now UNMAPPED",
+                        context, va, size, gem_handle, bo_offset
+                    );
+                }
+            }
+        }
+        count
+    }
+
     /// Take every mapping `matches` out of the table, in order, without
     /// touching the RM: the caller unmaps them (`rm_unmap_mappings`) now or
     /// later.
@@ -8890,26 +8985,27 @@ impl NvidiaGpu {
                 // -13 in both labwc renderers). The displaced owner cannot
                 // be executing anyway: EXEC is restricted to the RM
                 // channel's owner, so the last binder is the one that runs.
-                let replaced = self.drain_vm_mappings(
+                // Scoped to THIS process's context: two clients each have
+                // their own VA space, so the SAME VA in a different context
+                // is not a conflict -- replacing it would corrupt the other
+                // client. Only the overlapped part of an old mapping goes;
+                // what lies outside the range stays mapped (gpuvm's REMAP).
+                let replaced = self.split_vm_mappings(
+                    device_instance,
+                    ctx_idx,
+                    owner_pid,
+                    op.addr,
+                    op.range,
                     &alloc::format!(
                         "VM_BIND MAP replace VA={:#x}+{:#x} (this ctx, last binder wins)",
                         op.addr,
                         op.range
                     ),
-                    // Scope to THIS process's context: two clients each have their
-                    // own VA space, so the SAME VA in a different context is not a
-                    // conflict -- replacing it would corrupt the other client.
-                    |m| {
-                        m.owner_pid == owner_pid
-                            && m.va < op.addr.wrapping_add(op.range)
-                            && op.addr < m.va.wrapping_add(m.size)
-                    },
-                    true,
                 );
                 if replaced > 0 {
                     crate::klog_warn!(
-                        "[nouveau-uapi] VM_BIND MAP VA={:#x}+{:#x}: replaced {} stale mapping(s) \
-                         from an earlier device generation (single global VAS, last binder wins)",
+                        "[nouveau-uapi] VM_BIND MAP VA={:#x}+{:#x}: replaced {} mapping(s) it overlapped \
+                         (last binder wins; the parts outside the range stay mapped)",
                         op.addr,
                         op.range,
                         replaced
@@ -8949,6 +9045,7 @@ impl NvidiaGpu {
                             va: b.actual_va,
                             size: op.range,
                             bo_offset: op.bo_offset,
+                            pte_kind: rm_pte_kind,
                         });
                         log::info!(
                             "[nouveau-uapi] VM_BIND MAP handle={} -> VA={:#x} ({} bytes)",
@@ -9003,14 +9100,15 @@ impl NvidiaGpu {
                 // range with nothing in it is a SUCCESS, not ENOENT --
                 // Mesa's va_free unconditionally unmaps even reserve-only
                 // VAs it never bound, and treats a refusal as "leak the VA".
-                self.drain_vm_mappings(
+                // Only the range asked for goes: a mapping the range cuts
+                // through keeps its head and its tail (gpuvm's REMAP).
+                self.split_vm_mappings(
+                    device_instance,
+                    ctx_idx,
+                    owner_pid,
+                    op.addr,
+                    op.range,
                     &alloc::format!("VM_BIND UNMAP VA={:#x}+{:#x}", op.addr, op.range),
-                    |m| {
-                        m.owner_pid == owner_pid
-                            && m.va < op.addr.wrapping_add(op.range)
-                            && op.addr < m.va.wrapping_add(m.size)
-                    },
-                    true,
                 );
                 Ok(())
             }
@@ -14849,6 +14947,7 @@ mod nouveau_bookkeeping_tests {
             va,
             size,
             bo_offset: 0,
+            pte_kind: 0,
         });
     }
 
@@ -16138,8 +16237,9 @@ mod nouveau_bookkeeping_tests {
             "the driver's record names the RM's h_virt"
         );
         assert_eq!(gem_info(&gpu, ha, A).unwrap().offset, VA);
-        // REPLACE: a MAP over a live range of the same context unmaps it
-        // first (Linux gpuvm semantics; the RM would refuse the fixed VA).
+        // REPLACE: a MAP over a live range of the same context unmaps the
+        // part it covers first (Linux gpuvm semantics; the RM would refuse
+        // the fixed VA); the part outside the range stays, as a REMAP.
         assert_eq!(
             vm_bind_ops(&gpu, A, &mut [map(ha, VA + 0x8000, 65536)]),
             Ok(0)
@@ -16147,10 +16247,14 @@ mod nouveau_bookkeeping_tests {
         {
             let f = FAKE_RM.lock();
             assert_eq!(f.unmaps, 1, "the old binding was unmapped in the RM");
-            assert_eq!(f.maps_of_ctx(1), [(VA + 0x8000, 65536, 0x06)]);
+            assert_eq!(
+                f.maps_of_ctx(1),
+                [(VA, 0x8000, 0x06), (VA + 0x8000, 65536, 0x06)],
+                "its head was mapped again, then the new one"
+            );
             assert_eq!(f.bad, 0);
         }
-        assert_eq!(driver_maps(&gpu, A).len(), 1);
+        assert_eq!(driver_maps(&gpu, A).len(), 2);
         // A mapping that starts exactly where the new one ends is a
         // neighbour, not an overlap: it stays. The offset into the object
         // reaches the RM and the record.
@@ -16168,7 +16272,11 @@ mod nouveau_bookkeeping_tests {
             assert_eq!(f.unmaps, 2, "only the overlapping one was replaced");
             assert_eq!(
                 f.maps_of_ctx(1),
-                [(VA + 0x18000, 4096, 0x06), (VA + 0x8000, 65536, 0x06)]
+                [
+                    (VA, 0x8000, 0x06),
+                    (VA + 0x18000, 4096, 0x06),
+                    (VA + 0x8000, 65536, 0x06)
+                ]
             );
             assert_eq!(
                 f.maps.iter().find(|m| m.3 == VA + 0x18000).map(|m| m.5),
@@ -16188,7 +16296,7 @@ mod nouveau_bookkeeping_tests {
             vm_bind_ops(&gpu, A, &mut [unmap(VA + 0x18000, 4096)]),
             Ok(0)
         );
-        assert_eq!(driver_maps(&gpu, A).len(), 1);
+        assert_eq!(driver_maps(&gpu, A).len(), 2);
         assert_eq!(FAKE_RM.lock().unmaps, 3);
         // Another process, the same VA: its own context, so no conflict.
         assert_eq!(channel_alloc(&gpu, B).unwrap().channel, 1);
@@ -16201,11 +16309,11 @@ mod nouveau_bookkeeping_tests {
         );
         {
             let f = FAKE_RM.lock();
-            assert_eq!(f.maps.len(), 2);
+            assert_eq!(f.maps.len(), 3, "A's two pieces and B's");
             assert_eq!(f.maps_of_ctx(2), [(VA + 0x8000, 4096, 0x06)]);
             assert_eq!(f.unmaps, 3, "B replaced nothing of A's");
         }
-        assert_eq!(driver_maps(&gpu, A).len(), 1);
+        assert_eq!(driver_maps(&gpu, A).len(), 2);
         // Binding another process's buffer is a GPU read/write of it: only
         // a holder may. PRIME makes A a holder.
         assert_eq!(
@@ -16217,13 +16325,30 @@ mod nouveau_bookkeeping_tests {
             vm_bind_ops(&gpu, A, &mut [map(hb, VA + 0x10_0000, 4096)]),
             Ok(0)
         );
-        assert_eq!(driver_maps(&gpu, A).len(), 2);
-        // UNMAP is by range, scoped to the caller: A's overlapping mapping
-        // goes, B's identical VA stays. An empty range is a success.
+        assert_eq!(driver_maps(&gpu, A).len(), 3);
+        // UNMAP is by range, scoped to the caller: the page of A's mapping
+        // goes (the rest of that mapping stays, offset moved along), B's
+        // identical VA stays. An empty range is a success.
         assert_eq!(vm_bind_ops(&gpu, A, &mut [unmap(VA + 0x8000, 4096)]), Ok(0));
         assert_eq!(
-            driver_maps(&gpu, A).iter().map(|m| m.0).collect::<Vec<_>>(),
-            [hb]
+            driver_maps(&gpu, A)
+                .iter()
+                .map(|m| (m.0, m.1, m.2))
+                .collect::<Vec<_>>(),
+            [
+                (ha, VA, 0x8000),
+                (hb, VA + 0x10_0000, 4096),
+                (ha, VA + 0x9000, 65536 - 4096)
+            ]
+        );
+        assert_eq!(
+            gpu.nouveau_vm_mappings
+                .lock()
+                .iter()
+                .find(|m| m.va == VA + 0x9000)
+                .map(|m| m.bo_offset),
+            Some(0x1000),
+            "the tail starts a page into the object"
         );
         assert_eq!(
             FAKE_RM.lock().maps_of_ctx(2).len(),
@@ -16236,6 +16361,13 @@ mod nouveau_bookkeeping_tests {
             "nothing there: fine"
         );
         assert_eq!(FAKE_RM.lock().unmaps, 4);
+        // Both of A's own pieces, whole, in one range.
+        assert_eq!(vm_bind_ops(&gpu, A, &mut [unmap(VA, 0x20000)]), Ok(0));
+        assert_eq!(
+            driver_maps(&gpu, A).iter().map(|m| m.0).collect::<Vec<_>>(),
+            [hb]
+        );
+        assert_eq!(FAKE_RM.lock().unmaps, 6);
         // MAP with handle 0 is Mesa's "unbind, keep the reservation", and
         // it is scoped like UNMAP: B's mapping at the same VA is not A's.
         assert_eq!(
@@ -16317,6 +16449,156 @@ mod nouveau_bookkeeping_tests {
         assert_eq!(gem_info(&gpu, ha, A).unwrap().offset, VA);
         gpu.nouveau_release_process(A);
         gpu.nouveau_release_process(B);
+        assert_eq!(FAKE_RM.lock().bad, 0);
+    }
+
+    /// Linux's gpuvm answers an UNMAP over part of a mapping, or a MAP over
+    /// part of one, with REMAP ops: the head and the tail of the old mapping
+    /// stay, same object and kind, offsets moved along
+    /// (`drm_gpuvm_sm_unmap_ops_create` / `..._map_ops_create`,
+    /// `nouveau_uvmm.c` `op_remap`). NVK's bind context merges adjacent
+    /// `vkQueueBindSparse` binds into one mapping, so unbinding or rebinding
+    /// one page of a sparse-binding buffer later cuts through a larger one.
+    /// Before, any overlap took the whole old mapping, and the next draw
+    /// that touched the rest of it faulted.
+    #[test]
+    fn a_partial_unmap_or_map_over_keeps_the_parts_outside_the_range_like_a_remap() {
+        let _g = LOCK.lock();
+        let _live = LiveBytes::hold();
+        let gpu = gpu_rm();
+        const VA: u64 = 0x3f_f000_0000;
+        assert_eq!(channel_alloc(&gpu, A).unwrap().channel, 0);
+        let h = gem_new_rm(&gpu, 65536, nv::NOUVEAU_GEM_DOMAIN_GART, A)
+            .unwrap()
+            .handle;
+        let h2 = gem_new_rm(&gpu, 65536, nv::NOUVEAU_GEM_DOMAIN_GART, A)
+            .unwrap()
+            .handle;
+        // (handle, va, size, bo_offset, kind) as the driver records it.
+        let parts = || -> Vec<(u32, u64, u64, u64, u32)> {
+            gpu.nouveau_vm_mappings
+                .lock()
+                .iter()
+                .filter(|m| m.owner_pid == A)
+                .map(|m| (m.gem_handle, m.va, m.size, m.bo_offset, m.pte_kind))
+                .collect()
+        };
+        // (va, size, bo_offset, kind) as the RM has it.
+        let rm_parts = || -> Vec<(u64, u64, u64, u32)> {
+            FAKE_RM
+                .lock()
+                .maps
+                .iter()
+                .filter(|m| m.1 == 1)
+                .map(|m| (m.3, m.4, m.5, m.6))
+                .collect()
+        };
+        // Fifteen pages of `h`, a page into the object, kind 0x06.
+        assert_eq!(
+            vm_bind_ops(&gpu, A, &mut [map_at(h, VA, 0xF000, 0x1000)]),
+            Ok(0)
+        );
+        assert_eq!(parts(), [(h, VA, 0xF000, 0x1000, 0x06)]);
+        // The middle page goes: head and tail stay, the tail's offset moved
+        // along by the pages before it.
+        assert_eq!(
+            vm_bind_ops(&gpu, A, &mut [unmap(VA + 0x4000, 0x1000)]),
+            Ok(0)
+        );
+        assert_eq!(
+            parts(),
+            [
+                (h, VA, 0x4000, 0x1000, 0x06),
+                (h, VA + 0x5000, 0xA000, 0x6000, 0x06)
+            ]
+        );
+        assert_eq!(
+            rm_parts(),
+            [
+                (VA, 0x4000, 0x1000, 0x06),
+                (VA + 0x5000, 0xA000, 0x6000, 0x06)
+            ],
+            "the RM was asked for exactly those two, the whole old one gone"
+        );
+        assert_eq!(FAKE_RM.lock().unmaps, 1);
+        // The head of the first piece: only its tail stays.
+        assert_eq!(vm_bind_ops(&gpu, A, &mut [unmap(VA, 0x2000)]), Ok(0));
+        assert_eq!(
+            parts(),
+            [
+                (h, VA + 0x5000, 0xA000, 0x6000, 0x06),
+                (h, VA + 0x2000, 0x2000, 0x3000, 0x06)
+            ]
+        );
+        // The tail of the second piece, with a range running past its end.
+        assert_eq!(
+            vm_bind_ops(&gpu, A, &mut [unmap(VA + 0xC000, 0x4000)]),
+            Ok(0)
+        );
+        assert_eq!(
+            parts(),
+            [
+                (h, VA + 0x2000, 0x2000, 0x3000, 0x06),
+                (h, VA + 0x5000, 0x7000, 0x6000, 0x06)
+            ]
+        );
+        assert_eq!(FAKE_RM.lock().unmaps, 3);
+        // A MAP of another object over the middle of a piece: head, tail,
+        // then the new mapping.
+        assert_eq!(
+            vm_bind_ops(&gpu, A, &mut [map(h2, VA + 0x7000, 0x2000)]),
+            Ok(0)
+        );
+        assert_eq!(
+            parts(),
+            [
+                (h, VA + 0x2000, 0x2000, 0x3000, 0x06),
+                (h, VA + 0x5000, 0x2000, 0x6000, 0x06),
+                (h, VA + 0x9000, 0x3000, 0xA000, 0x06),
+                (h2, VA + 0x7000, 0x2000, 0, 0x06)
+            ]
+        );
+        assert_eq!(parts().len(), rm_parts().len());
+        assert_eq!(FAKE_RM.lock().unmaps, 4);
+        // One range cutting through two pieces at once: each keeps what
+        // lies outside it.
+        assert_eq!(
+            vm_bind_ops(&gpu, A, &mut [unmap(VA + 0x3000, 0x3000)]),
+            Ok(0)
+        );
+        assert_eq!(
+            parts(),
+            [
+                (h, VA + 0x9000, 0x3000, 0xA000, 0x06),
+                (h2, VA + 0x7000, 0x2000, 0, 0x06),
+                (h, VA + 0x2000, 0x1000, 0x3000, 0x06),
+                (h, VA + 0x6000, 0x1000, 0x7000, 0x06)
+            ]
+        );
+        assert_eq!(FAKE_RM.lock().unmaps, 6);
+        assert_eq!(rm_parts().len(), 4);
+        // The RM refusing to map a kept part again: the op still succeeds
+        // (Linux cannot fail a remap either), the part is reported lost and
+        // nothing pretends it is mapped.
+        FAKE_RM.lock().refuse_map = true;
+        assert_eq!(
+            vm_bind_ops(&gpu, A, &mut [unmap(VA + 0xA000, 0x1000)]),
+            Ok(0)
+        );
+        FAKE_RM.lock().refuse_map = false;
+        assert_eq!(
+            parts(),
+            [
+                (h2, VA + 0x7000, 0x2000, 0, 0x06),
+                (h, VA + 0x2000, 0x1000, 0x3000, 0x06),
+                (h, VA + 0x6000, 0x1000, 0x7000, 0x06)
+            ]
+        );
+        assert_eq!(rm_parts().len(), 3);
+        assert_eq!(FAKE_RM.lock().unmaps, 7);
+        assert_eq!(FAKE_RM.lock().bad, 0);
+        gpu.nouveau_release_process(A);
+        assert_eq!(FAKE_RM.lock().maps_of_ctx(1), []);
         assert_eq!(FAKE_RM.lock().bad, 0);
     }
 
