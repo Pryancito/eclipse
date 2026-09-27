@@ -806,8 +806,16 @@ impl DrmDev {
             }
             DRM_IOCTL_GET_CAP => {
                 let cap = unsafe { &mut *(data as *mut DrmGetCap) };
+                // `drm_getcap` zeroes the answer first, so a refused probe
+                // never hands back whatever the client left in `value`.
+                cap.value = 0;
                 match cap.capability {
                     0x1 => cap.value = 1, // DRM_CAP_DUMB_BUFFER
+                    // DRM_CAP_VBLANK_HIGH_CRTC: WAIT_VBLANK reads the CRTC
+                    // index from the HIGH_CRTC field (see `wait_vblank_check`),
+                    // which is what this cap promises; Linux answers 1 for
+                    // every KMS driver.
+                    0x2 => cap.value = 1,
                     // DRM_CAP_DUMB_PREFERRED_DEPTH: XRGB8888 scanout = 24.
                     0x3 => cap.value = 24,
                     // DRM_CAP_DUMB_PREFER_SHADOW: the dumb buffer lives behind
@@ -883,10 +891,22 @@ impl DrmDev {
                             );
                         }
                     }
-                    // Everything else — DRM_CAP_ASYNC_PAGE_FLIP (0x7),
-                    // DRM_CAP_PAGE_FLIP_TARGET (0x11) and
-                    // DRM_CAP_ATOMIC_ASYNC_PAGE_FLIP (0x15) — is honestly 0.
-                    _ => cap.value = 0,
+                    // DRM_CAP_ASYNC_PAGE_FLIP (0x7), DRM_CAP_PAGE_FLIP_TARGET
+                    // (0x11) and DRM_CAP_ATOMIC_ASYNC_PAGE_FLIP (0x15) are
+                    // honestly 0: none of the three flip forms is implemented.
+                    0x7 | 0x11 | 0x15 => cap.value = 0,
+                    // A capability this kernel has never heard of is EINVAL
+                    // (`drm_getcap`'s default arm), not "0": a client probing a
+                    // NEW cap must be able to tell "not supported" from "the
+                    // kernel predates the cap", and the value it left in the
+                    // struct is not an answer either.
+                    _ => {
+                        log::debug!(
+                            "[drm] GET_CAP cap={:#x} -> EINVAL (unknown)",
+                            cap.capability
+                        );
+                        return Err(FsError::InvalidParam);
+                    }
                 }
                 log::debug!(
                     "[drm] GET_CAP minor={} cap={:#x} -> {}",
@@ -1035,10 +1055,31 @@ impl DrmDev {
                         }
                         Ok(0)
                     }
-                    // STEREO_3D, UNIVERSAL_PLANES, ASPECT_RATIO: accept.
-                    _ => {
+                    // STEREO_3D, UNIVERSAL_PLANES, ASPECT_RATIO: a boolean
+                    // each in Linux (`drm_setclientcap`: `value > 1` is
+                    // EINVAL); nothing here changes with them, so accept the
+                    // two legal values and refuse the rest.
+                    DRM_CLIENT_CAP_STEREO_3D
+                    | DRM_CLIENT_CAP_UNIVERSAL_PLANES
+                    | DRM_CLIENT_CAP_ASPECT_RATIO => {
+                        if value > 1 {
+                            return Err(FsError::InvalidParam);
+                        }
                         log::debug!("[drm] SET_CLIENT_CAP cap={} -> accepted", cap);
                         Ok(0)
+                    }
+                    // CURSOR_PLANE_HOTSPOT is EOPNOTSUPP unless the driver has
+                    // DRIVER_CURSOR_HOTSPOT (the virtualised ones: virtio-gpu,
+                    // vmwgfx, qxl). There is no cursor plane with HOTSPOT_X/Y
+                    // properties here, so a client told "yes" would look for
+                    // them in vain, or worse, assume a virtualised cursor.
+                    DRM_CLIENT_CAP_CURSOR_PLANE_HOTSPOT => Err(FsError::OpNotSupported),
+                    // Anything else: EINVAL, as `drm_setclientcap`'s default
+                    // arm. Accepting it told a client that a cap this kernel
+                    // has never heard of was now in force.
+                    _ => {
+                        log::debug!("[drm] SET_CLIENT_CAP cap={} -> EINVAL (unknown)", cap);
+                        Err(FsError::InvalidParam)
                     }
                 }
             }
@@ -3217,8 +3258,12 @@ const DRM_MODE_OBJECT_CRTC: u32 = 0xcccc_cccc;
 const DRM_MODE_OBJECT_FB: u32 = 0xfbfb_fbfb;
 
 // DRM client capabilities (DRM_IOCTL_SET_CLIENT_CAP).
+const DRM_CLIENT_CAP_STEREO_3D: u64 = 1;
+const DRM_CLIENT_CAP_UNIVERSAL_PLANES: u64 = 2;
 const DRM_CLIENT_CAP_ATOMIC: u64 = 3;
+const DRM_CLIENT_CAP_ASPECT_RATIO: u64 = 4;
 const DRM_CLIENT_CAP_WRITEBACK_CONNECTORS: u64 = 5;
+const DRM_CLIENT_CAP_CURSOR_PLANE_HOTSPOT: u64 = 6;
 
 // drm_mode_atomic flags (`drm_mode.h`).
 const DRM_MODE_PAGE_FLIP_EVENT: u32 = 0x01;
@@ -11704,6 +11749,99 @@ mod prime_import_close_tests {
         );
         assert!(c.file_state().holds_prime_import(by_gem_close.handle));
         c.file_state().forget_prime_import(by_gem_close.handle);
+    }
+}
+
+#[cfg(test)]
+mod client_cap_tests {
+    //! `GET_CAP` and `SET_CLIENT_CAP` against `drm_getcap` and
+    //! `drm_setclientcap`: what is known, what is boolean, and what is EINVAL.
+    use super::gl_client_sequence_tests::Client;
+    use super::*;
+
+    fn get_cap(c: &Client, capability: u64) -> Result<u64> {
+        let mut req = DrmGetCap {
+            capability,
+            value: 0xdead_beef,
+        };
+        c.ioctl(DRM_IOCTL_GET_CAP, &mut req).map(|_| req.value)
+    }
+
+    fn set_cap(c: &Client, cap: u64, value: u64) -> Result<usize> {
+        let mut req: [u64; 2] = [cap, value];
+        c.ioctl(DRM_IOCTL_SET_CLIENT_CAP, &mut req)
+    }
+
+    #[test]
+    fn get_cap_knows_high_crtc_and_refuses_a_capability_it_has_never_heard_of() {
+        let _serialised = drm::test_globals::lock();
+        let c = Client::open(0);
+        assert_eq!(get_cap(&c, 0x1), Ok(1), "DUMB_BUFFER");
+        assert_eq!(
+            get_cap(&c, 0x2),
+            Ok(1),
+            "VBLANK_HIGH_CRTC: WAIT_VBLANK reads it"
+        );
+        assert_eq!(get_cap(&c, 0x6), Ok(1), "TIMESTAMP_MONOTONIC");
+        assert_eq!(get_cap(&c, 0x12), Ok(1), "CRTC_IN_VBLANK_EVENT");
+        for known_zero in [0x7u64, 0x11, 0x15] {
+            assert_eq!(get_cap(&c, known_zero), Ok(0), "cap {:#x}", known_zero);
+        }
+        for unknown in [0x0u64, 0xa, 0xf, 0x16, 0x100, u64::MAX] {
+            let mut req = DrmGetCap {
+                capability: unknown,
+                value: 0xdead_beef,
+            };
+            assert_eq!(
+                c.ioctl(DRM_IOCTL_GET_CAP, &mut req).err(),
+                Some(FsError::InvalidParam),
+                "cap {:#x}",
+                unknown
+            );
+            assert_eq!(req.value, 0, "the value is zeroed, not left as it came");
+        }
+    }
+
+    #[test]
+    fn set_client_cap_takes_booleans_and_refuses_hotspot_and_the_unknown() {
+        let _serialised = drm::test_globals::lock();
+        let c = Client::open(0);
+        for boolean in [
+            DRM_CLIENT_CAP_STEREO_3D,
+            DRM_CLIENT_CAP_UNIVERSAL_PLANES,
+            DRM_CLIENT_CAP_ASPECT_RATIO,
+        ] {
+            assert_eq!(set_cap(&c, boolean, 0), Ok(0), "cap {} off", boolean);
+            assert_eq!(set_cap(&c, boolean, 1), Ok(0), "cap {} on", boolean);
+            for bad in [2u64, 5, u64::MAX] {
+                assert_eq!(
+                    set_cap(&c, boolean, bad),
+                    Err(FsError::InvalidParam),
+                    "cap {} value {}",
+                    boolean,
+                    bad
+                );
+            }
+        }
+        assert_eq!(
+            set_cap(&c, DRM_CLIENT_CAP_CURSOR_PLANE_HOTSPOT, 1),
+            Err(FsError::OpNotSupported),
+            "no virtualised cursor plane here"
+        );
+        assert_eq!(
+            set_cap(&c, DRM_CLIENT_CAP_WRITEBACK_CONNECTORS, 1),
+            Err(FsError::InvalidParam),
+            "writeback needs an atomic client first"
+        );
+        for unknown in [0u64, 7, 8, 0x100, u64::MAX] {
+            assert_eq!(
+                set_cap(&c, unknown, 1),
+                Err(FsError::InvalidParam),
+                "cap {}",
+                unknown
+            );
+            assert_eq!(set_cap(&c, unknown, 0), Err(FsError::InvalidParam));
+        }
     }
 }
 
