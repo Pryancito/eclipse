@@ -31,6 +31,8 @@ pub fn next_eth_ifname() -> String {
 static MSI_IRQ_HOST: Mutex<Option<Arc<dyn IrqScheme>>> = Mutex::new(None);
 static MSI_PENDING: Mutex<Vec<(usize, Arc<dyn Scheme>)>> = Mutex::new(Vec::new());
 const MAX_MSI_PENDING: usize = 256;
+/// Which of the two MSI queues this is, for the log.
+const MSI_QUEUE_OWNER: &str = "net";
 
 fn enqueue_pending_msi(
     pending: &mut Vec<(usize, Arc<dyn Scheme>)>,
@@ -44,7 +46,18 @@ fn enqueue_pending_msi(
         return;
     }
     if pending.len() >= MAX_MSI_PENDING {
-        pending.remove(0);
+        // A dropped entry is a device that will never be told about its own
+        // interrupt, so it does not go quietly. One note per device today
+        // makes this unreachable, and that is exactly why it would be
+        // unreachable to debug as well if it ever were reached.
+        let (v, d) = pending.remove(0);
+        crate::klog_warn!(
+            "[{}] MSI queue full at {}: vector {} for {} dropped, that device will get no interrupt",
+            MSI_QUEUE_OWNER,
+            MAX_MSI_PENDING,
+            v,
+            d.name()
+        );
     }
     pending.push((vector, dev.clone()));
 }
@@ -205,7 +218,31 @@ lazy_static::lazy_static! {
     pub static ref DEFERRED_PACKETS: Mutex<alloc::collections::VecDeque<Vec<u8>>> = Mutex::new(alloc::collections::VecDeque::new());
 }
 
-const DEFERRED_PACKET_MAX: usize = 64;
+/// How many frames one `poll` may hand to an AF_PACKET tap.
+///
+/// It was 64. The e1000e has **256 RX descriptors** (its own comment says so),
+/// every frame of a poll goes through [`net_defer_packet`] while smoltcp holds
+/// `SOCKETS`, and the queue is only drained afterwards by
+/// [`net_flush_deferred_packets`] -- so one poll of a full ring offered 256
+/// frames to a queue that held 64 and dropped the oldest 192 without a word.
+/// With a tap running, that is not an edge case: it is every burst that fills
+/// the ring, which is what a download does.
+///
+/// A poll's worth of the largest ring in the tree, then. The frames are only
+/// copied at all when a tap is registered, and the queue is emptied on every
+/// flush, so the cost is borne by whoever is capturing.
+const DEFERRED_PACKET_MAX: usize = 256;
+
+/// Frames dropped because the tap queue was full, since boot.
+static DEFERRED_PACKETS_DROPPED: AtomicUsize = AtomicUsize::new(0);
+
+/// How many frames an AF_PACKET tap has lost to a full queue.
+///
+/// A cap that drops is invisible without this: the tap simply shows fewer
+/// frames than went past, and nothing anywhere says so.
+pub fn dropped_deferred_packets() -> usize {
+    DEFERRED_PACKETS_DROPPED.load(Ordering::Relaxed)
+}
 
 /// Sets a callback for every received packet (raw).
 pub fn set_packet_callback(callback: fn(&[u8])) {
@@ -235,11 +272,20 @@ pub fn net_defer_packet(data: &[u8]) {
     if PACKET_CALLBACK.lock().is_none() {
         return;
     }
+    queue_for_the_tap(data.to_vec());
+}
+
+/// The one place the cap is applied, so there is one cap.
+///
+/// It used to be written out twice, once here and once in
+/// [`net_defer_packet_owned`], which is two places to fix and one to forget.
+fn queue_for_the_tap(frame: Vec<u8>) {
     let mut q = DEFERRED_PACKETS.lock();
     if q.len() >= DEFERRED_PACKET_MAX {
         q.pop_front();
+        DEFERRED_PACKETS_DROPPED.fetch_add(1, Ordering::Relaxed);
     }
-    q.push_back(data.to_vec());
+    q.push_back(frame);
 }
 
 /// Like [`net_defer_packet`], but takes ownership so the caller can avoid a
@@ -248,11 +294,7 @@ pub fn net_defer_packet_owned(data: Vec<u8>) {
     if PACKET_CALLBACK.lock().is_none() {
         return;
     }
-    let mut q = DEFERRED_PACKETS.lock();
-    if q.len() >= DEFERRED_PACKET_MAX {
-        q.pop_front();
-    }
-    q.push_back(data);
+    queue_for_the_tap(data);
 }
 
 /// Flush frames queued by [`net_defer_packet`]; call only after releasing smoltcp locks.
@@ -269,4 +311,351 @@ pub fn net_flush_deferred_packets() {
 // 注意！这个容易出现死锁
 pub fn get_sockets() -> Arc<Mutex<SocketSet<'static>>> {
     SOCKETS.clone()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::scheme::IrqScheme;
+    extern crate std;
+
+    /// Everything here lives in process-wide statics -- the tap callback, the
+    /// deferred queue, the drop counter, the MSI queue -- so the tests take
+    /// turns, and each leaves them as it found them.
+    fn alone_with_the_statics<R>(body: impl FnOnce() -> R) -> R {
+        static TURNSTILE: Mutex<()> = Mutex::new(());
+        let _guard = TURNSTILE.lock();
+        clear_the_statics();
+        let out = body();
+        clear_the_statics();
+        out
+    }
+
+    fn clear_the_statics() {
+        *PACKET_CALLBACK.lock() = None;
+        DEFERRED_PACKETS.lock().clear();
+        DEFERRED_PACKETS_DROPPED.store(0, Ordering::SeqCst);
+        MSI_PENDING.lock().clear();
+        *MSI_IRQ_HOST.lock() = None;
+        SEEN.lock().clear();
+    }
+
+    /// The frames the tap was handed, in the order it got them.
+    static SEEN: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
+
+    fn tap(data: &[u8]) {
+        SEEN.lock().push(data.to_vec());
+    }
+
+    fn seen() -> Vec<Vec<u8>> {
+        SEEN.lock().clone()
+    }
+
+    fn frame(n: u32) -> Vec<u8> {
+        // Each frame carries its own number, so a frame that arrives out of
+        // order or in place of another is a wrong number rather than one
+        // indistinguishable buffer among many.
+        n.to_le_bytes().to_vec()
+    }
+
+    #[test]
+    fn nothing_is_copied_when_nobody_is_listening() {
+        // The common case: no AF_PACKET tap, and the receive path must not pay
+        // an allocation and a copy per frame for a queue nobody drains.
+        alone_with_the_statics(|| {
+            for i in 0..10 {
+                net_defer_packet(&frame(i));
+                net_defer_packet_owned(frame(i));
+            }
+            assert!(DEFERRED_PACKETS.lock().is_empty());
+            assert_eq!(dropped_deferred_packets(), 0);
+        })
+    }
+
+    #[test]
+    fn a_frame_reaches_the_tap_only_once_the_queue_is_flushed() {
+        // The whole point of deferring: `net_defer_packet` is called with
+        // smoltcp's `SOCKETS` held, and the callback takes more locks.
+        alone_with_the_statics(|| {
+            set_packet_callback(tap);
+            net_defer_packet(&frame(7));
+            assert!(seen().is_empty(), "the tap was called with SOCKETS held");
+            net_flush_deferred_packets();
+            assert_eq!(seen(), std::vec![frame(7)]);
+        })
+    }
+
+    #[test]
+    fn the_frames_reach_the_tap_in_the_order_they_arrived() {
+        alone_with_the_statics(|| {
+            set_packet_callback(tap);
+            for i in 0..8 {
+                net_defer_packet(&frame(i));
+            }
+            net_flush_deferred_packets();
+            assert_eq!(seen(), (0..8).map(frame).collect::<Vec<_>>());
+        })
+    }
+
+    #[test]
+    fn a_whole_ring_of_frames_reaches_the_tap() {
+        // The e1000e has 256 RX descriptors, and one poll can drain all of
+        // them before anything is flushed. The cap was 64, so 192 of those 256
+        // frames were dropped -- silently, and the oldest first, which for a
+        // capture means losing the beginning of the burst.
+        alone_with_the_statics(|| {
+            set_packet_callback(tap);
+            for i in 0..256 {
+                net_defer_packet(&frame(i));
+            }
+            net_flush_deferred_packets();
+            assert_eq!(seen().len(), 256, "a poll of a full ring lost frames");
+            assert_eq!(seen(), (0..256).map(frame).collect::<Vec<_>>());
+            assert_eq!(dropped_deferred_packets(), 0);
+        })
+    }
+
+    #[test]
+    fn the_frames_that_do_not_fit_are_counted_instead_of_vanishing() {
+        // Past the cap frames still have to go, but a cap that drops without
+        // counting is a cap nobody can see: the tap just shows fewer frames
+        // than went past and nothing anywhere says so.
+        alone_with_the_statics(|| {
+            set_packet_callback(tap);
+            for i in 0..(DEFERRED_PACKET_MAX + 10) as u32 {
+                net_defer_packet(&frame(i));
+            }
+            assert_eq!(dropped_deferred_packets(), 10);
+            net_flush_deferred_packets();
+            assert_eq!(seen().len(), DEFERRED_PACKET_MAX);
+            // The oldest went, so the newest are the ones still here.
+            assert_eq!(seen()[0], frame(10));
+        })
+    }
+
+    #[test]
+    fn the_cap_is_the_same_whether_the_frame_is_borrowed_or_owned() {
+        // It was written out twice, which is two places to fix and one to
+        // forget. This is the test that would have noticed.
+        for owned in [false, true] {
+            alone_with_the_statics(|| {
+                set_packet_callback(tap);
+                for i in 0..(DEFERRED_PACKET_MAX + 3) as u32 {
+                    if owned {
+                        net_defer_packet_owned(frame(i));
+                    } else {
+                        net_defer_packet(&frame(i));
+                    }
+                }
+                assert_eq!(
+                    (DEFERRED_PACKETS.lock().len(), dropped_deferred_packets()),
+                    (DEFERRED_PACKET_MAX, 3),
+                    "owned = {}",
+                    owned
+                );
+            })
+        }
+    }
+
+    #[test]
+    fn a_flush_leaves_the_queue_empty_even_if_the_tap_goes_away() {
+        alone_with_the_statics(|| {
+            set_packet_callback(tap);
+            net_defer_packet(&frame(1));
+            *PACKET_CALLBACK.lock() = None;
+            net_flush_deferred_packets();
+            assert!(
+                DEFERRED_PACKETS.lock().is_empty(),
+                "the frames of a tap that unregistered stay queued for ever"
+            );
+            assert!(seen().is_empty());
+        })
+    }
+
+    #[test]
+    fn a_flush_with_nothing_queued_does_nothing() {
+        alone_with_the_statics(|| {
+            set_packet_callback(tap);
+            net_flush_deferred_packets();
+            assert!(seen().is_empty());
+        })
+    }
+
+    #[test]
+    fn the_interfaces_are_named_the_way_the_scripts_look_for_them() {
+        // `eth{bus}d{dev}f{fn}` made the first NIC `eth0d3f0`, and udhcpc never
+        // bound to it. The names are sequential and start where the counter is,
+        // so the test asserts the shape and the step, not an absolute number.
+        let first = next_eth_ifname();
+        let second = next_eth_ifname();
+        assert!(first.starts_with("eth"), "{}", first);
+        let n: usize = first[3..].parse().expect("the name is not ethN");
+        assert_eq!(second, alloc::format!("eth{}", n + 1));
+    }
+
+    /// An interrupt controller that refuses the vectors it was told to refuse.
+    struct PickyIntc {
+        refuse: Vec<usize>,
+        unmask_refuse: Vec<usize>,
+        registered: Mutex<Vec<usize>>,
+        unmasked: Mutex<Vec<usize>>,
+    }
+
+    impl PickyIntc {
+        fn refusing(refuse: &[usize]) -> Arc<Self> {
+            Arc::new(PickyIntc {
+                refuse: refuse.to_vec(),
+                unmask_refuse: Vec::new(),
+                registered: Mutex::new(Vec::new()),
+                unmasked: Mutex::new(Vec::new()),
+            })
+        }
+    }
+
+    impl Scheme for PickyIntc {
+        fn name(&self) -> &str {
+            "picky-intc"
+        }
+    }
+
+    impl IrqScheme for PickyIntc {
+        fn is_valid_irq(&self, _irq: usize) -> bool {
+            true
+        }
+        fn mask(&self, _irq: usize) -> DeviceResult {
+            Ok(())
+        }
+        fn unmask(&self, irq: usize) -> DeviceResult {
+            if self.unmask_refuse.contains(&irq) {
+                return Err(crate::DeviceError::InvalidParam);
+            }
+            self.unmasked.lock().push(irq);
+            Ok(())
+        }
+        fn register_handler(&self, _irq: usize, _h: crate::scheme::IrqHandler) -> DeviceResult {
+            Ok(())
+        }
+        fn register_device(&self, irq: usize, _dev: Arc<dyn Scheme>) -> DeviceResult {
+            if self.refuse.contains(&irq) {
+                return Err(crate::DeviceError::InvalidParam);
+            }
+            self.registered.lock().push(irq);
+            Ok(())
+        }
+        fn unregister(&self, _irq: usize) -> DeviceResult {
+            Ok(())
+        }
+    }
+
+    /// A NIC, as far as this queue is concerned.
+    struct Nic(&'static str);
+    impl Scheme for Nic {
+        fn name(&self) -> &str {
+            self.0
+        }
+    }
+
+    #[test]
+    fn a_noted_vector_is_registered_and_unmasked_when_the_walk_finishes() {
+        alone_with_the_statics(|| {
+            let intc = PickyIntc::refusing(&[]);
+            pci_set_irq_host(intc.clone());
+            pci_note_pending_msi(11, Arc::new(Nic("eth0")));
+            pci_finish_msi_registrations().expect("the walk failed");
+            assert_eq!(intc.registered.lock().clone(), std::vec![11]);
+            assert_eq!(intc.unmasked.lock().clone(), std::vec![11]);
+            assert!(
+                MSI_PENDING.lock().is_empty(),
+                "a registered vector is still pending"
+            );
+        })
+    }
+
+    #[test]
+    fn two_devices_sharing_a_vector_are_both_kept() {
+        // MSI vectors get shared, and the dedup is about a repeated *note* of
+        // the same device, not about the vector. Matching on the vector alone
+        // would drop the second card and leave it without interrupts, which is
+        // the same silence as every other bug in this file.
+        alone_with_the_statics(|| {
+            let intc = PickyIntc::refusing(&[]);
+            pci_set_irq_host(intc.clone());
+            pci_note_pending_msi(11, Arc::new(Nic("eth0")));
+            pci_note_pending_msi(11, Arc::new(Nic("eth1")));
+            assert_eq!(
+                MSI_PENDING.lock().len(),
+                2,
+                "a device sharing a vector was dropped"
+            );
+            pci_finish_msi_registrations().expect("the walk failed");
+            assert_eq!(intc.registered.lock().clone(), std::vec![11, 11]);
+        })
+    }
+
+    #[test]
+    fn the_same_device_and_vector_is_not_queued_twice() {
+        alone_with_the_statics(|| {
+            let dev: Arc<dyn Scheme> = Arc::new(Nic("eth0"));
+            pci_note_pending_msi(11, dev.clone());
+            pci_note_pending_msi(11, dev.clone());
+            assert_eq!(MSI_PENDING.lock().len(), 1);
+            // A different vector for the same device is a different thing.
+            pci_note_pending_msi(12, dev);
+            assert_eq!(MSI_PENDING.lock().len(), 2);
+        })
+    }
+
+    #[test]
+    fn a_vector_the_controller_refuses_does_not_cost_the_devices_behind_it() {
+        // This is the one that matters, and the twin of this function in
+        // `usb::xhci_hid` used to fail it: with `?` inside the `drain`, the
+        // first refusal returned from the function and `Drain::drop` threw away
+        // every entry behind it, so a device queued after a failing one never
+        // got its interrupt -- and the caller discards the error, so nothing
+        // was logged either.
+        alone_with_the_statics(|| {
+            let intc = PickyIntc::refusing(&[7]);
+            pci_set_irq_host(intc.clone());
+            pci_note_pending_msi(7, Arc::new(Nic("eth0")));
+            pci_note_pending_msi(9, Arc::new(Nic("eth1")));
+            pci_finish_msi_registrations().expect("the walk failed");
+            assert_eq!(
+                intc.registered.lock().clone(),
+                std::vec![9],
+                "the device behind the refused one lost its interrupt"
+            );
+            assert!(MSI_PENDING.lock().is_empty());
+        })
+    }
+
+    #[test]
+    fn a_walk_with_no_interrupt_controller_leaves_the_queue_alone() {
+        // The NICs are enumerated before the controller is handed over, so the
+        // queue has to survive a walk that comes too early -- otherwise every
+        // vector noted before then is lost.
+        alone_with_the_statics(|| {
+            pci_note_pending_msi(11, Arc::new(Nic("eth0")));
+            pci_finish_msi_registrations().expect("the walk failed");
+            assert_eq!(
+                MSI_PENDING.lock().len(),
+                1,
+                "the queue was emptied with nowhere to register"
+            );
+        })
+    }
+
+    #[test]
+    fn a_full_queue_says_which_device_it_is_dropping() {
+        // Unreachable with one note per device, and that is the reason it is
+        // pinned: if it ever is reached, the note in the log is the only thing
+        // that could explain a NIC that never interrupts.
+        alone_with_the_statics(|| {
+            for v in 0..MAX_MSI_PENDING + 5 {
+                pci_note_pending_msi(v, Arc::new(Nic("eth0")));
+            }
+            let q = MSI_PENDING.lock();
+            assert_eq!(q.len(), MAX_MSI_PENDING);
+            assert_eq!(q[0].0, 5, "the oldest entries were not the ones dropped");
+        })
+    }
 }
