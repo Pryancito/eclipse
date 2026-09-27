@@ -217,9 +217,16 @@ legacy exactamente como antes.
 
 `IN_FENCE_FD` y `OUT_FENCE_PTR` **sí existen**: la primera espera de verdad a
 la fence del cliente antes de presentar (con un tope de 100 ms, tras el cual
-presenta igual), y la segunda instala un `sync_file` **ya señalado** — honesto
-mientras el present sea síncrono, porque cuando el ioctl vuelve los píxeles ya
-están en pantalla, pero no sirve para marcar el ritmo de frames.
+presenta igual), y la segunda es una fence de verdad, como en Linux: el slot
+del cliente recibe `-1` en cuanto se escenifica la propiedad
+(`put_user(-1, fence_ptr)`), el `sync_file` se crea e instala en su tabla de
+fds **antes** del commit (`prepare_signaling`; un commit que falla lo retira y
+deja el `-1`), y su fence **se señala cuando se entrega la completion del
+flip**, en el vblank sintético, con el evento si se pidió `PAGE_FLIP_EVENT` y
+sola si no. Un commit con solo `OUT_FENCE_PTR` debe esa completion igual que
+uno con evento (y se rechaza igual sobre un CRTC apagado que sigue apagado).
+Antes era un `sync_file` **ya señalado**: quien soltaba el buffer anterior al
+verla firmada lo hacía con ese buffer todavía en pantalla.
 
 Un commit que falla no deja nada a medias: el estado KMS, el framebuffer del
 CRTC y el blob de modo del kernel se restauran, como hace
@@ -314,7 +321,7 @@ esto no:
 | ~~Los fd de `sync_file` no se pueden sondear~~ | **Corregido:** `SyncobjHandle::poll` reporta `POLLIN` cuando la fence alcanzó el punto; `subscribe_readiness` + el poller de fences HW despiertan `sys_poll` al aterrizar (sin eso `sync_wait()` de Mesa en GLX/DRI3 mataba el swapchain: `zink: swapchain killed`) |
 | ~~El fd de `sync_file` no tenía `SYNC_IOC_FILE_INFO` ni `SYNC_IOC_SET_DEADLINE`, y los dos fds (`sync_file` y syncobj) respondían `ENOSYS` a `read`/`write` y decían ser `O_RDWR`~~ | **Corregido:** los dos son inodos anónimos abiertos con flags 0, como en Linux: `O_RDONLY` (`read` EINVAL, `write` EBADF, `pread`/`pwrite`/`lseek` ESPIPE). El fd de syncobj no tiene `poll` ni `ioctl` (`poll(2)` lo da siempre listo, `epoll_ctl` EPERM, cualquier ioctl ENOTTY, `SYNC_IOC_MERGE` incluido). El de `sync_file` tiene `SYNC_IOC_FILE_INFO` (estado, nombre y la única fence, con driver `eclipse`, timeline `syncobj`, `-ENODEV` si la fence venció, y el nombre que le dio `SYNC_IOC_MERGE`) y `SYNC_IOC_SET_DEADLINE` (comprueba el `pad` y no hace nada). Es lo que `sync_file_info()` de libsync y el `sync_wait` de Mesa consultan sin sondear |
 | ~~`IN_FENCE_FD` con un fd que no es un `sync_file` (o que no existe) se presentaba sin esperar, un fd de syncobj se tomaba por su fence actual, y un segundo `IN_FENCE_FD` en el plano pisaba al primero~~ | **Corregido:** como `drm_atomic_plane_set_property`: el fd se resuelve con la semántica de `sync_file_get_fence` (solo un `sync_file`; cualquier otra cosa, EINVAL y el commit no se ejecuta) y un plano cuyo estado ya lleva fence no admite otro `IN_FENCE_FD`, ni siquiera el -1 (EINVAL) |
-| `OUT_FENCE_PTR` devuelve una fence ya señalada | Quien marque el ritmo de frames con ella suelta buffers aún en escaneo |
+| ~~`OUT_FENCE_PTR` devuelve una fence ya señalada, y el slot del cliente no se toca si el commit no llega a ejecutarse~~ | **Corregido:** la fence se señala al entregarse la completion del flip (`drm_send_event_helper`), haya evento o no y aunque el fd de DRM se haya cerrado; el slot recibe `-1` al escenificar la propiedad y el fd solo si el commit se ejecuta. Quien marque el ritmo de frames con ella, o la entregue a un cliente como release de su buffer, espera ahora a que el buffer anterior haya salido de pantalla |
 | El arm síncrono de `SYNCOBJ_WAIT` puede girar sin ceder la CPU | Una corrutina del kernel atascada; la máquina parece congelada |
 | Sin caché de dma-buf por objeto ni de handles PRIME por fichero | Tope GEM subido a 256; sigue sin dedup PRIME por fichero |
 | `ADDFB2` no valida formato, flags ni modifiers | Un modifier con tiling se acepta y se escanea como lineal: basura |

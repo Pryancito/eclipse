@@ -6373,6 +6373,17 @@ enum PendingDrmTimer {
         user_data: u64,
         /// Deliver onto this open's event queue (Weak so close can Drop).
         file: Weak<DrmFileState>,
+        /// The request carried `DRM_MODE_PAGE_FLIP_EVENT`: the completion
+        /// goes on the fd. A commit with only an `OUT_FENCE_PTR` owes the
+        /// CRTC the same completion (`prepare_signaling` creates the
+        /// `drm_pending_vblank_event` for either) but no event: its
+        /// `file_priv` stays NULL.
+        event: bool,
+        /// The syncobj behind the commit's `OUT_FENCE_PTR` sync_file, if
+        /// any: signaled when the completion is delivered, whether or not
+        /// the fd is still open (`drm_send_event_helper` signals `e->fence`
+        /// before it looks at `file_priv`).
+        out_fence: Option<u32>,
     },
     // `seq` is intentionally not stored: we recompute it from `vblank_seq_now()`
     // at delivery time so the event carries the sequence that actually just
@@ -6442,14 +6453,9 @@ fn deliver_pending_drm_timer() {
                 crtc_id,
                 user_data,
                 file,
-            } => {
-                if let Some(file) = file.upgrade() {
-                    queue_flip_event(&file, crtc_id, user_data);
-                } else {
-                    // drm_file closed before delivery — drop the event.
-                    flip_in_flight_done();
-                }
-            }
+                event,
+                out_fence,
+            } => complete_flip(crtc_id, user_data, file, event, out_fence),
             PendingDrmTimer::Vblank {
                 signal,
                 due_seq,
@@ -6508,6 +6514,20 @@ fn arm_coalesced_drm_timer(pending: PendingDrmTimer) {
 static LAST_FLIP_PID: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 fn schedule_flip_event(crtc_id: u32, user_data: u64, file: &Arc<DrmFileState>) {
+    schedule_flip_completion(crtc_id, user_data, file, true, None);
+}
+
+/// [`schedule_flip_event`] for a commit that may owe its completion to an
+/// out-fence as well as, or instead of, an event on the fd: `event` is
+/// whether the request carried `DRM_MODE_PAGE_FLIP_EVENT`, `out_fence` the
+/// syncobj its `OUT_FENCE_PTR` sync_file wraps.
+fn schedule_flip_completion(
+    crtc_id: u32,
+    user_data: u64,
+    file: &Arc<DrmFileState>,
+    event: bool,
+    out_fence: Option<u32>,
+) {
     // Set FLIP_EVENT_PENDING and push the job INSIDE the same lock acquisition
     // as arm_coalesced_drm_timer, so that flush_pending_flip_completions can
     // never observe FLIP_EVENT_PENDING = true with an empty queue on SMP. Without
@@ -6527,9 +6547,39 @@ fn schedule_flip_event(crtc_id: u32, user_data: u64, file: &Arc<DrmFileState>) {
             crtc_id,
             user_data,
             file: Arc::downgrade(file),
+            event,
+            out_fence,
         });
     }
     arm_coalesced_drm_timer_locked();
+}
+
+/// One flip's completion, `drm_send_event_helper`: the out-fence signals
+/// first, then the event goes on the fd when one was asked for and the fd is
+/// still open, and either way the flip leaves the in-flight population.
+fn complete_flip(
+    crtc_id: u32,
+    user_data: u64,
+    file: Weak<DrmFileState>,
+    event: bool,
+    out_fence: Option<u32>,
+) {
+    if let Some(handle) = out_fence {
+        // The syncobj is the sync_file's: closed already, there is nobody
+        // to tell.
+        let _ = zcore_drivers::scheme::syncobj::signal(handle);
+    }
+    match (event, file.upgrade()) {
+        (true, Some(file)) => queue_flip_event(&file, crtc_id, user_data),
+        // No event owed, or the drm_file closed before delivery: the event
+        // is dropped, and the flip leaves the in-flight population like any
+        // other. Clearing the latch alone here left the count one too high
+        // for good: from then on no delivery was ever the last one, the
+        // latch never cleared after a real flip, and the next PAGE_FLIP spun
+        // `settle_outstanding_flip` out into the EBUSY wlroots escalates
+        // into an output teardown.
+        _ => flip_in_flight_done(),
+    }
 }
 
 /// Deliver every queued page-flip completion to the card fd *now* instead of
@@ -6543,17 +6593,13 @@ fn schedule_flip_event(crtc_id: u32, user_data: u64, file: &Arc<DrmFileState>) {
 /// dropped or overwritten completion, so no stale `wl_listener` free in labwc.
 /// Pending vblank-wait jobs keep their own pacing and stay queued.
 pub(crate) fn flush_pending_flip_completions() {
-    let flips: Vec<(u32, u64, Weak<DrmFileState>)> = {
+    let flips: Vec<PendingDrmTimer> = {
         let mut q = PENDING_DRM_TIMERS.lock();
         let mut kept = VecDeque::with_capacity(q.len());
         let mut flips = Vec::new();
         while let Some(job) = q.pop_front() {
             match job {
-                PendingDrmTimer::Flip {
-                    crtc_id,
-                    user_data,
-                    file,
-                } => flips.push((crtc_id, user_data, file)),
+                flip @ PendingDrmTimer::Flip { .. } => flips.push(flip),
                 other => kept.push_back(other),
             }
         }
@@ -6562,18 +6608,16 @@ pub(crate) fn flush_pending_flip_completions() {
     };
     // queue_flip_event locks the file's event queue and clears FLIP_EVENT_PENDING;
     // the PENDING_DRM_TIMERS guard above is already dropped, so no nested lock.
-    for (crtc_id, user_data, file) in flips {
-        if let Some(file) = file.upgrade() {
-            queue_flip_event(&file, crtc_id, user_data);
-        } else {
-            // drm_file closed before delivery: the event is dropped, and the
-            // flip leaves the in-flight population like any other, as the
-            // timer's deliverer does. Clearing the latch alone here left the
-            // count one too high for good: from then on no delivery was ever
-            // the last one, the latch never cleared after a real flip, and
-            // the next PAGE_FLIP spun `settle_outstanding_flip` out into the
-            // EBUSY wlroots escalates into an output teardown.
-            flip_in_flight_done();
+    for job in flips {
+        if let PendingDrmTimer::Flip {
+            crtc_id,
+            user_data,
+            file,
+            event,
+            out_fence,
+        } = job
+        {
+            complete_flip(crtc_id, user_data, file, event, out_fence);
         }
     }
 }
@@ -6684,6 +6728,12 @@ pub fn cancel_pending_events() {
 /// Drain timer jobs that target a closing drm_file (by raw pointer identity).
 fn cancel_pending_timers_for_file(file_ptr: *const DrmFileState) {
     let mut cleared_flip = 0usize;
+    // The out-fences of the completions dropped here. Linux keeps the event
+    // (`drm_events_release` only forgets its `file_priv`) and signals its
+    // fence when the CRTC completes; this drops the completion with the
+    // file, so the fence signals now rather than never: its sync_file may
+    // be in another process's hands (a release fence handed to a client).
+    let mut orphaned_fences = Vec::new();
     {
         let mut q = PENDING_DRM_TIMERS.lock();
         q.retain(|job| {
@@ -6692,14 +6742,18 @@ fn cancel_pending_timers_for_file(file_ptr: *const DrmFileState) {
                 PendingDrmTimer::Vblank { file, .. } => file.as_ptr(),
             };
             if core::ptr::eq(job_ptr, file_ptr) {
-                if matches!(job, PendingDrmTimer::Flip { .. }) {
+                if let PendingDrmTimer::Flip { out_fence, .. } = job {
                     cleared_flip += 1;
+                    orphaned_fences.extend(*out_fence);
                 }
                 false
             } else {
                 true
             }
         });
+    }
+    for handle in orphaned_fences {
+        let _ = zcore_drivers::scheme::syncobj::signal(handle);
     }
     for _ in 0..cleared_flip {
         flip_in_flight_done();
@@ -7315,8 +7369,13 @@ pub fn atomic_commit(
     want_event: bool,
     user_data: u64,
     file: &Arc<DrmFileState>,
+    out_fence: Option<u32>,
 ) -> Result<(), AtomicError> {
     let (cur, _) = atomic_snapshot();
+    // `prepare_signaling` creates the CRTC's completion for an event and for
+    // an out-fence alike: a commit with either owes one, and the check
+    // below and the settle before the commit go by that, not by the event.
+    let completion = want_event || out_fence.is_some();
 
     // --- Check phase (no state touched) ---
     // [swapchain-diag] Every rejection below is logged at error! so it is
@@ -7382,11 +7441,13 @@ pub fn atomic_commit(
     // rate. Turning the pipe on or off in the same commit is fine (one of
     // the two states is active). A TEST_ONLY commit carries no event on
     // Linux, and the ioctl arm refuses the TEST_ONLY|EVENT pair before it
-    // gets here, so `want_event` alone is the whole condition.
+    // gets here, so `completion` alone is the whole condition -- and an
+    // `OUT_FENCE_PTR` on such a CRTC is refused the same way, since the
+    // event it hangs off is what the check sees.
     let ends_active = upd.active.unwrap_or(cur.active);
-    if want_event && !ends_active && !cur.active {
+    if completion && !ends_active && !cur.active {
         log::error!(
-            "[drm] ATOMIC reject: PAGE_FLIP_EVENT requested on a CRTC that is off and stays off"
+            "[drm] ATOMIC reject: PAGE_FLIP_EVENT or OUT_FENCE_PTR on a CRTC that is off and stays off"
         );
         return Err(AtomicError::Invalid);
     }
@@ -7457,7 +7518,7 @@ pub fn atomic_commit(
     // and [`settle_outstanding_flip`], which also waits out a completion the
     // timer is delivering on another CPU at this very moment; EBUSY is left
     // for a delivery that never finishes.
-    if want_event && !settle_outstanding_flip() {
+    if completion && !settle_outstanding_flip() {
         return Err(AtomicError::Busy);
     }
 
@@ -7576,12 +7637,14 @@ pub fn atomic_commit(
         _ => {}
     }
 
-    if want_event {
-        // One event per CRTC in the commit; the pipeline has exactly one.
-        // Paced to the synthetic vblank (not delivered now) for the same
-        // anti-spin reason as the legacy page-flip path. Busy was checked
-        // above before present.
-        schedule_flip_event(SYNTH_CRTC_ID, user_data, file);
+    if completion {
+        // One completion per CRTC in the commit; the pipeline has exactly
+        // one. Paced to the synthetic vblank (not delivered now) for the
+        // same anti-spin reason as the legacy page-flip path, and that is
+        // when the out-fence signals: the new frame is being scanned out
+        // and the previous buffer is free. Busy was checked above before
+        // present.
+        schedule_flip_completion(SYNTH_CRTC_ID, user_data, file, want_event, out_fence);
     }
     Ok(())
 }
