@@ -534,16 +534,29 @@ fn write_received_handles(
     handles: Vec<Handle>,
     is_etc: bool,
 ) -> ZxResult {
-    if is_etc {
-        let mut infos: Vec<_> = handles.iter().map(Handle::get_handle_info).collect();
-        for (info, value) in infos.iter_mut().zip(proc.add_handles(handles)) {
-            info.handle = value;
-        }
-        UserOutPtr::<HandleInfo>::from(addr).write_array(&infos)?;
-    } else {
-        UserOutPtr::<HandleValue>::from(addr).write_array(&proc.add_handles(handles))?;
-    }
-    Ok(())
+    // The `HandleInfo`s have to be read off the handles before the table takes
+    // them, so they are built first and filled in with the values after.
+    let infos: Option<Vec<HandleInfo>> =
+        is_etc.then(|| handles.iter().map(Handle::get_handle_info).collect());
+    let values = proc.add_handles(handles);
+    crate::user_memory::hand_out_handles(
+        &values,
+        |values| {
+            match infos {
+                Some(mut infos) => {
+                    for (info, &value) in infos.iter_mut().zip(values) {
+                        info.handle = value;
+                    }
+                    UserOutPtr::<HandleInfo>::from(addr).write_array(&infos)
+                }
+                None => UserOutPtr::<HandleValue>::from(addr).write_array(values),
+            }
+            .map_err(ZxError::from)
+        },
+        |values| {
+            proc.remove_handles(values).ok();
+        },
+    )
 }
 
 fn handle_check(

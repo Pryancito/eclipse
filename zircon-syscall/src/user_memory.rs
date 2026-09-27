@@ -96,3 +96,101 @@ pub(crate) fn install_handle_pair(
     }
     Ok(())
 }
+
+/// Hand a message's freshly installed handles to the caller, taking them back
+/// if the caller never gets their values.
+///
+/// `zx_channel_read` and `zx_channel_read_etc` install every handle the message
+/// carried and only then copy the values (or the `HandleInfo`s) into user
+/// memory. The message is already off the channel by that point, so a handle
+/// left in the table when that copy fails can never be read again and nothing
+/// in the process can name it to close it: the channel, VMO or process behind
+/// it stays alive as long as the reader does.
+///
+/// [`install_handle_pair`] closes the same window for the two-handle `*_create`
+/// syscalls, and [`install_handle_value`] for the one-handle ones. This is the
+/// N-handle shape, and the one the sweep that wrote those two missed.
+///
+/// `take_back` is a parameter rather than a `remove_handles` call so the rule
+/// can be checked without a process and a mapped user buffer.
+pub(crate) fn hand_out_handles<V: Copy>(
+    values: &[V],
+    report: impl FnOnce(&[V]) -> ZxResult,
+    take_back: impl FnOnce(&[V]),
+) -> ZxResult {
+    match report(values) {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            take_back(values);
+            Err(err)
+        }
+    }
+}
+
+#[cfg(test)]
+mod hand_out_tests {
+    use super::*;
+    use alloc::vec::Vec;
+    use core::cell::RefCell;
+
+    /// The bug: a failed copy left every handle of the message in the table.
+    #[test]
+    fn a_copy_that_faults_gives_every_handle_back() {
+        let taken: RefCell<Vec<u32>> = RefCell::new(Vec::new());
+        let err = hand_out_handles(
+            &[7u32, 8, 9],
+            |_| Err(ZxError::INVALID_ARGS),
+            |values| taken.borrow_mut().extend_from_slice(values),
+        );
+        assert_eq!(err, Err(ZxError::INVALID_ARGS));
+        assert_eq!(
+            *taken.borrow(),
+            [7, 8, 9],
+            "a failed copy left handles in the table"
+        );
+    }
+
+    /// And a copy that lands keeps them: the caller now owns them, and taking
+    /// them back would close objects it is about to use.
+    #[test]
+    fn a_copy_that_lands_keeps_them() {
+        let taken: RefCell<Vec<u32>> = RefCell::new(Vec::new());
+        let got: RefCell<Vec<u32>> = RefCell::new(Vec::new());
+        let ok = hand_out_handles(
+            &[7u32, 8, 9],
+            |values| {
+                got.borrow_mut().extend_from_slice(values);
+                Ok(())
+            },
+            |values| taken.borrow_mut().extend_from_slice(values),
+        );
+        assert_eq!(ok, Ok(()));
+        assert_eq!(
+            *got.borrow(),
+            [7, 8, 9],
+            "the caller was handed something else"
+        );
+        assert!(
+            taken.borrow().is_empty(),
+            "handles the caller owns were taken back"
+        );
+    }
+
+    /// A message with no handles at all is the common case, and it neither
+    /// reports nothing nor takes anything back.
+    #[test]
+    fn a_message_with_no_handles_is_still_reported() {
+        let reported = RefCell::new(false);
+        let ok = hand_out_handles(
+            &[] as &[u32],
+            |values| {
+                assert!(values.is_empty());
+                *reported.borrow_mut() = true;
+                Ok(())
+            },
+            |_| panic!("nothing was installed, so nothing can come back"),
+        );
+        assert_eq!(ok, Ok(()));
+        assert!(*reported.borrow(), "the empty copy was skipped");
+    }
+}
