@@ -8744,12 +8744,20 @@ mod kms_scanout_tests {
             p
         }
 
+        /// The panel was painted one colour, by a blank, and nothing is drawn
+        /// on top of it.
+        fn fill(&mut self, px: u32) {
+            self.scene.clear();
+            self.scene.resize((self.w * self.h) as usize, px);
+            self.cursor = None;
+        }
+
         /// The compositor put frame `n` up, whole.
         fn present(&mut self, n: u32) {
-            self.scene.clear();
+            self.scene.resize((self.w * self.h) as usize, 0);
             for y in 0..self.h {
                 for x in 0..self.w {
-                    self.scene.push(desktop_px(n, x, y));
+                    self.scene[(y * self.w + x) as usize] = desktop_px(n, x, y);
                 }
             }
         }
@@ -8806,6 +8814,244 @@ mod kms_scanout_tests {
             }
         }
         v
+    }
+
+    /// Three hundred steps of the desktop, in a deterministic order nobody chose
+    /// by hand, with the whole panel checked against the contract after every
+    /// one of them.
+    ///
+    /// The single-scenario tests above each say "this exact sequence must not do
+    /// this exact wrong thing", which only ever catches the fault whoever wrote
+    /// them had already thought of. Moebius reports rectangles that are still
+    /// there after the one cause we found, so what is needed now is the opposite
+    /// shape of test: put the panel through combinations of presents, pointer
+    /// moves, pointer hides, buffer reuse and blank round-trips, and assert the
+    /// one rule the user reads off the screen -- the panel shows the frame that
+    /// was last PRESENTED, with the pointer on top, and nothing else -- after
+    /// every single step. A failing seed prints the step that broke it and the
+    /// operation log, which is a reproduction.
+    ///
+    /// Two buffers, alternating, because that is what wlroots does, and the
+    /// scribble step blacks out a box in the buffer the kernel last copied FROM:
+    /// a released buffer the compositor has started drawing into. Every pixel of
+    /// a legitimate frame is opaque and carries its frame number, so a black
+    /// pixel or a pixel from another frame is caught by value, not by position.
+    #[test]
+    fn three_hundred_steps_of_desktop_never_leave_anything_but_the_frame_and_the_pointer() {
+        // Every combination of the two present flags, because the band skip is
+        // the one mechanism that can decide a band is already on the panel and
+        // never copy it again -- so a stale pixel it leaves stays for good --
+        // and the repair is the other writer of the panel that does not go
+        // through the blit. Two seeds each, so the order of operations is not
+        // one order.
+        for (skip, repair) in [(false, false), (true, false), (false, true), (true, true)] {
+            for seed in [0x5EED_1234u32, 0x0BAD_C0DE] {
+                soak_the_desktop(seed, skip, repair);
+            }
+        }
+    }
+
+    fn soak_the_desktop(seed_in: u32, skip: bool, repair: bool) {
+        const W: u32 = 120;
+        const H: u32 = 96;
+        const CUR: u32 = 16;
+        let screen = kms_emu::attach_with(W, H, 128, true);
+        drm::set_present_skip_enabled(skip);
+        drm::set_present_repair_enabled(repair);
+        let c = Client::open(0);
+
+        let bufs = [c.create_dumb(W, H), c.create_dumb(W, H)];
+        let fbs = [c.addfb2(&bufs[0]), c.addfb2(&bufs[1])];
+        let bmp = pointer_bitmap(CUR, CUR);
+        let cur = c.create_dumb(CUR, CUR);
+        {
+            let px = map_dumb(&cur);
+            for (i, v) in bmp.iter().enumerate() {
+                px[i] = *v;
+            }
+        }
+
+        let mut frame: u32 = 1;
+        let mut slot = 0usize;
+        paint(&bufs[slot], |x, y| desktop_px(frame, x, y));
+        set_crtc(&c, drm::SYNTH_CRTC_ID, fbs[slot], W, H);
+        drain_completions(&c);
+        let mut model = Panel::new(W, H, frame, bmp.clone(), CUR);
+        model.check(&screen, "the first frame");
+
+        let mut pos = (8u32, 8u32);
+        let mut shown = false;
+        // The most bands any one present left alone. Asserted below, because a
+        // soak that never took the skip would say nothing about it -- the one
+        // lesson of the probe that measured in the wrong place.
+        let mut most_skipped = 0usize;
+        // A 32-bit LCG: the sequence is fixed, so a failure here reproduces on
+        // any machine, and the log below names the step.
+        let mut seed: u32 = seed_in;
+        let mut rnd = |m: u32| {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (seed >> 13) % m
+        };
+        for step in 0..300u32 {
+            let what;
+            match rnd(12) {
+                0..=3 => {
+                    // The compositor renders a finished frame into the other
+                    // buffer of its chain and puts it up, whole, as labwc does.
+                    frame += 1;
+                    slot ^= 1;
+                    let f = frame;
+                    paint(&bufs[slot], |x, y| desktop_px(f, x, y));
+                    c.page_flip(drm::SYNTH_CRTC_ID, fbs[slot], step as u64)
+                        .expect("flip");
+                    drain_completions(&c);
+                    model.present(frame);
+                    // A full present composites the pointer at wherever it is
+                    // now, so that is what is on the panel.
+                    model.cursor = if shown {
+                        Some((pos.0, pos.1, CUR, CUR))
+                    } else {
+                        None
+                    };
+                    what = alloc::format!("step {}: presented frame {}", step, frame);
+                }
+                4..=6 => {
+                    pos = (rnd(W - CUR + 1), rnd(H - CUR + 1));
+                    move_cursor(&c, drm::SYNTH_CRTC_ID, pos.0 as i32, pos.1 as i32);
+                    if shown {
+                        model.cursor = Some((pos.0, pos.1, CUR, CUR));
+                    }
+                    what = alloc::format!("step {}: pointer moved to {:?}", step, pos);
+                }
+                7 => {
+                    // The released buffer is the compositor's again and it has
+                    // started the next frame in it by clearing a box to
+                    // transparent black. Nothing is presented: this changes
+                    // nothing that may reach the screen.
+                    let (bx, by) = (rnd(W - 8), rnd(H - 8));
+                    let (bw, bh) = (rnd(W - bx) + 1, rnd(H - by) + 1);
+                    let stride = (bufs[slot].pitch / 4) as usize;
+                    let px = map_dumb(&bufs[slot]);
+                    for y in by..by + bh {
+                        for x in bx..bx + bw {
+                            px[y as usize * stride + x as usize] = 0x0000_0000;
+                        }
+                    }
+                    what = alloc::format!(
+                        "step {}: the client cleared {}x{}+{}+{} in the buffer it \
+                         had presented",
+                        step,
+                        bw,
+                        bh,
+                        bx,
+                        by
+                    );
+                }
+                8 => {
+                    // The scene has not changed and the compositor puts it up
+                    // again, which is what an idle desktop does all day. This is
+                    // the ONLY operation the band skip can act on: every band
+                    // hashes to what the panel is already holding, so a band
+                    // whose pixels are not really there stays wrong for good.
+                    slot ^= 1;
+                    let f = frame;
+                    paint(&bufs[slot], |x, y| desktop_px(f, x, y));
+                    c.page_flip(drm::SYNTH_CRTC_ID, fbs[slot], step as u64)
+                        .expect("flip");
+                    drain_completions(&c);
+                    // The same pixels the model already held -- unless a bare
+                    // blank has painted the panel one colour since, which is
+                    // exactly what a re-present has to put right.
+                    model.present(frame);
+                    model.cursor = if shown {
+                        Some((pos.0, pos.1, CUR, CUR))
+                    } else {
+                        None
+                    };
+                    most_skipped = most_skipped.max(drm::skipped_bands_for_test());
+                    what = alloc::format!("step {}: presented frame {} AGAIN", step, frame);
+                }
+                9 => {
+                    shown = !shown;
+                    if shown {
+                        set_cursor(
+                            &c,
+                            drm::SYNTH_CRTC_ID,
+                            cur.handle,
+                            CUR,
+                            CUR,
+                            pos.0 as i32,
+                            pos.1 as i32,
+                        );
+                        model.cursor = Some((pos.0, pos.1, CUR, CUR));
+                    } else {
+                        set_cursor(&c, drm::SYNTH_CRTC_ID, 0, 0, 0, 0, 0);
+                        model.cursor = None;
+                    }
+                    what = alloc::format!("step {}: pointer shown={}", step, shown);
+                }
+                10 => {
+                    // DPMS off and on again, with the frame that follows it --
+                    // which is what a screen coming back actually looks like.
+                    drm::set_crtc_blanked(true);
+                    drm::set_crtc_blanked(false);
+                    frame += 1;
+                    slot ^= 1;
+                    let f = frame;
+                    paint(&bufs[slot], |x, y| desktop_px(f, x, y));
+                    c.page_flip(drm::SYNTH_CRTC_ID, fbs[slot], step as u64)
+                        .expect("flip");
+                    drain_completions(&c);
+                    model.present(frame);
+                    model.cursor = if shown {
+                        Some((pos.0, pos.1, CUR, CUR))
+                    } else {
+                        None
+                    };
+                    what = alloc::format!("step {}: blanked, unblanked, frame {}", step, frame);
+                }
+                _ => {
+                    // DPMS off and on again with NOTHING presented after it,
+                    // which a stray DPMS write really can do. The blank paints
+                    // over the pointer too, so now the panel is one colour and
+                    // nothing is drawn -- and whatever the pointer was covering
+                    // is not under it any more. Anything the next move puts back
+                    // there is a rectangle of the old desktop on a black screen.
+                    drm::set_crtc_blanked(true);
+                    drm::set_crtc_blanked(false);
+                    model.fill(screen.pixel(0, 0));
+                    what = alloc::format!("step {}: blanked and unblanked, no frame", step);
+                }
+            }
+            model.check(
+                &screen,
+                &alloc::format!(
+                    "{} [skip={} repair={} seed={:#x}]",
+                    what,
+                    skip,
+                    repair,
+                    seed_in
+                ),
+            );
+        }
+        assert!(frame < 256, "the frame number has to stay in one byte");
+        assert_eq!(
+            skip && most_skipped > 0,
+            skip,
+            "with the band skip armed some present had to skip a band, or this \
+             soak did not exercise it at all"
+        );
+
+        set_cursor(&c, drm::SYNTH_CRTC_ID, 0, 0, 0, 0, 0);
+        drm::set_present_skip_enabled(false);
+        drm::set_present_repair_enabled(false);
+        for fb in fbs {
+            c.rmfb(fb).expect("RMFB");
+        }
+        c.destroy_dumb(cur.handle).expect("DESTROY_DUMB cursor");
+        for b in bufs {
+            c.destroy_dumb(b.handle).expect("DESTROY_DUMB");
+        }
     }
 
     /// The bug Moebius sees: a pointer move pastes the frame labwc is STILL
@@ -8949,6 +9195,120 @@ mod kms_scanout_tests {
     /// it was covering before the screen went black -- one rectangle of the old
     /// desktop on a black screen, which is the same class of bug as the one the
     /// save exists to fix and would have been introduced by fixing it.
+    /// llvmpipe hands over a frame it has not finished: its tiles arrive in
+    /// worker threads while the kernel is already copying. That one frame is not
+    /// the kernel's to fix -- there is no fence to wait on (`SYNCOBJ_TIMELINE`
+    /// answers 0) and the buffer really did hold those pixels when they were
+    /// read.
+    ///
+    /// What IS the kernel's is whether the black it copied SURVIVES. labwc
+    /// presents a WHOLE FRAME every time -- measured on Moebius's boot, 1600
+    /// presents and not one `DIRTYFB` -- so the very next present carries every
+    /// pixel and nothing of the mix may be left on the panel. A rectangle that
+    /// stays while a menu sits open is a rectangle nobody is overwriting, and
+    /// that would be ours.
+    #[test]
+    fn black_copied_mid_frame_does_not_survive_the_next_present() {
+        for skip in [false, true] {
+            const W: u32 = 120;
+            // Tall enough that the copy takes two bands, derived from the real
+            // band size: the boundary between two bands is the only place a
+            // test can get INSIDE a copy, so a height that hardcoded it would
+            // stop testing anything the day the constant moves -- and the
+            // assertion further down that the race landed is what would say so.
+            let chunk = drm::blit_chunk_rows_for_test();
+            let h = chunk + chunk / 4;
+            // The box the client blacks out: inside the rows the SECOND band
+            // copies, so the kernel reaches it after the hook has run.
+            let (by, bh) = (chunk + 4, chunk / 4 - 8);
+            let (bx, bw) = (40u32, 64u32);
+            let screen = kms_emu::attach_with(W, h, 128, true);
+            // The band-skipping present is what Moebius has been booting with,
+            // and it is the one mechanism that could decide a band already
+            // matches and never copy it again. Both ways, same assertion.
+            drm::set_present_skip_enabled(skip);
+            let c = Client::open(0);
+            let buf = c.create_dumb(W, h);
+            paint(&buf, |x, y| desktop_px(0, x, y));
+            let fb = c.addfb2(&buf);
+            set_crtc(&c, drm::SYNTH_CRTC_ID, fb, W, h);
+            drain_completions(&c);
+
+            // The copy goes band by band, asking the output for its framebuffer
+            // once per band. Clearing a box of the second band's rows on the
+            // FIRST ask is a tile that goes black after the source was sampled
+            // and before the kernel reaches it: the copy carries it and neither
+            // read of the probe sees anything else.
+            let stride = (buf.pitch / 4) as usize;
+            let px = map_dumb(&buf);
+            // The hook wants `Send`, and a raw pointer is not, so the address
+            // travels as an integer; the buffer it names is this test's own and
+            // outlives the hook, which `clear_mid_blit` takes down below.
+            let base = px.as_mut_ptr() as usize;
+            kms_emu::on_blit_band(move |n| {
+                if n != 0 {
+                    return;
+                }
+                // SAFETY: the dumb buffer outlives this test and the hook runs
+                // inside the present, on this thread, while nothing else writes
+                // those rows.
+                let p = unsafe {
+                    core::slice::from_raw_parts_mut(base as *mut u32, stride * h as usize)
+                };
+                for y in by..by + bh {
+                    for x in bx..bx + bw {
+                        p[y as usize * stride + x as usize] = 0x0000_0000;
+                    }
+                }
+            });
+            paint(&buf, |x, y| desktop_px(1, x, y));
+            c.page_flip(drm::SYNTH_CRTC_ID, fb, 0xBEEF).expect("flip");
+            drain_completions(&c);
+            kms_emu::clear_mid_blit();
+
+            // The race really happened, or the rest of this test proves nothing.
+            assert_eq!(
+                screen.pixel(bx + bw / 2, by + bh / 2),
+                0x0000_0000,
+                "skip={}: the hook did not land inside the copy, so this test is \
+                 not about anything",
+                skip
+            );
+
+            // Now the compositor presents a finished frame, whole, as labwc does
+            // every time. Nothing of the mix may be left.
+            paint(&buf, |x, y| desktop_px(2, x, y));
+            c.page_flip(drm::SYNTH_CRTC_ID, fb, 0xF00D).expect("flip");
+            drain_completions(&c);
+
+            for y in 0..h {
+                for x in 0..W {
+                    let got = screen.pixel(x, y);
+                    assert_eq!(
+                        got,
+                        desktop_px(2, x, y),
+                        "skip={}: ({}, {}) reads {:#010x} after a whole finished \
+                         frame went up{}",
+                        skip,
+                        x,
+                        y,
+                        got,
+                        if got == 0 {
+                            " -- the black the kernel copied mid-frame is STILL \
+                             THERE, so nothing overwrote it"
+                        } else {
+                            ""
+                        }
+                    );
+                }
+            }
+
+            drm::set_present_skip_enabled(false);
+            c.rmfb(fb).expect("RMFB");
+            c.destroy_dumb(buf.handle).expect("DESTROY_DUMB");
+        }
+    }
+
     /// The escape hatch really takes the old path, and this is what the old path
     /// does.
     ///
