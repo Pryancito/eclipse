@@ -184,8 +184,14 @@ impl Socket {
             if was_empty {
                 set |= Signal::READABLE;
             }
-            let inner = self.inner.lock();
-            if inner.read_threshold > 0 && inner.data.len() >= inner.read_threshold {
+            // Read the two values and let go: `signal_change` runs the
+            // observers' callbacks with its own lock held, and holding one of
+            // ours across that is how a re-entrant acquire happens.
+            let (size, read_threshold) = {
+                let inner = self.inner.lock();
+                (inner.data.len(), inner.read_threshold)
+            };
+            if read_threshold > 0 && size >= read_threshold {
                 set |= Signal::SOCKET_READ_THRESHOLD;
             }
             self.base.signal_set(set);
@@ -275,7 +281,13 @@ impl Socket {
                 if peer_write_threshold > 0 && SOCKET_SIZE - self_size >= peer_write_threshold {
                     set |= Signal::SOCKET_WRITE_THRESHOLD;
                 }
-                if was_full {
+                // Draining a full socket makes room, but room is not
+                // permission: once writing on that end is shut down,
+                // `WRITABLE` never comes back. This is the only place it is
+                // ever re-asserted, and it used to re-assert it regardless, so
+                // a peer parked on `WRITABLE` was woken to a `write` that can
+                // only answer `BAD_STATE`, over and over.
+                if was_full && !peer.base.signal().contains(Signal::SOCKET_WRITE_DISABLED) {
                     set |= Signal::WRITABLE;
                 }
                 peer.base.signal_set(set);
@@ -444,15 +456,18 @@ impl Socket {
     fn shutdown_self(&self, read: bool, write: bool) -> ZxResult {
         let mut set = Signal::empty();
         let mut clear = Signal::empty();
-        let mut inner = self.inner.lock();
-        if read {
-            inner.read_disabled = true;
-            set |= Signal::SOCKET_PEER_WRITE_DISABLED;
+        {
+            let mut inner = self.inner.lock();
+            if read {
+                inner.read_disabled = true;
+                set |= Signal::SOCKET_PEER_WRITE_DISABLED;
+            }
         }
         if write {
             clear |= Signal::WRITABLE;
             set |= Signal::SOCKET_WRITE_DISABLED;
         }
+        // Outside the lock, as in `read` and `write_data`.
         self.base.signal_change(clear, set);
         Ok(())
     }
@@ -467,11 +482,13 @@ impl Socket {
         if threshold > SOCKET_SIZE {
             return Err(ZxError::INVALID_ARGS);
         }
-        let mut inner = self.inner.lock();
-        inner.read_threshold = threshold;
-        if threshold == 0 {
-            self.base.signal_clear(Signal::SOCKET_READ_THRESHOLD);
-        } else if inner.data.len() >= threshold {
+        let queued = {
+            let mut inner = self.inner.lock();
+            inner.read_threshold = threshold;
+            inner.data.len()
+        };
+        // Outside the lock, as in `read` and `write_data`.
+        if threshold > 0 && queued >= threshold {
             self.base.signal_set(Signal::SOCKET_READ_THRESHOLD);
         } else {
             self.base.signal_clear(Signal::SOCKET_READ_THRESHOLD);
@@ -909,6 +926,35 @@ mod tests {
         assert_eq!(end1.read(false, &mut [0; 4]).unwrap(), 4);
         assert_eq!(end1.write(&[0; 4]).unwrap(), 4);
         assert_eq!(end0.read(false, &mut [0; 4]).unwrap(), 4);
+    }
+
+    #[test]
+    /// Draining a full socket makes room, and room is not permission: the
+    /// only place `WRITABLE` is ever re-asserted is the read that empties a
+    /// full socket, and it did so even for an end whose writes had been shut
+    /// down. A peer parked on `WRITABLE` was then woken to a `write` that can
+    /// only answer `BAD_STATE`.
+    fn a_read_that_makes_room_does_not_make_a_shut_down_end_writable() {
+        let (end0, end1) = Socket::create(0).unwrap();
+
+        // Fill it from end0, so end1 holds a full buffer.
+        let full = vec![0u8; SOCKET_SIZE];
+        assert_eq!(end0.write(&full).unwrap(), SOCKET_SIZE);
+        assert!(!end0.signal().contains(Signal::WRITABLE), "no room left");
+
+        // Then shut writing down on end0, and drain from end1.
+        end0.shutdown(false, true).unwrap();
+        assert!(end0.signal().contains(Signal::SOCKET_WRITE_DISABLED));
+        assert_eq!(
+            end1.read(false, &mut vec![0u8; SOCKET_SIZE]).unwrap(),
+            SOCKET_SIZE
+        );
+
+        assert!(
+            !end0.signal().contains(Signal::WRITABLE),
+            "there is room again, but this end may not write",
+        );
+        assert_eq!(end0.write(&[0; 1]).unwrap_err(), ZxError::BAD_STATE);
     }
 
     #[test]
