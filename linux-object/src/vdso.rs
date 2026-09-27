@@ -91,8 +91,16 @@ fn build() -> Option<Vdso> {
 
     let len = roundup_pages(linux_vdso::IMAGE_LEN);
     let frames = PhysFrame::new_contiguous(pages(len), 0);
-    if frames.is_empty() {
-        warn!("vdso: no hay memoria fisica contigua para la imagen");
+    // Short as well as empty. `new_physical` below is told `pages(len)` and does
+    // not go looking: a VMO wider than the frames actually obtained is a window
+    // onto memory nobody owns, which the allocator is free to hand to somebody
+    // else while every process in the system has it mapped.
+    if frames.len() < pages(len) {
+        warn!(
+            "vdso: no hay memoria fisica contigua para la imagen ({} de {} paginas)",
+            frames.len(),
+            pages(len)
+        );
         return None;
     }
     let paddr: PhysAddr = frames[0].paddr();
@@ -168,31 +176,45 @@ fn publish() {
 
     // SAFETY: `data` addresses `_vdso_data` inside frames owned for the
     // lifetime of the system, whose extent the build script has checked lies
-    // wholly within the image. Volatile writes because the reader is userspace
-    // and invisible to the compiler.
-    unsafe {
-        let d = vdso.data;
-        let enabled = core::ptr::addr_of_mut!((*d).enabled);
-        let tsc_mult = core::ptr::addr_of_mut!((*d).tsc_mult);
-        let wall = core::ptr::addr_of_mut!((*d).wall_off_ns);
+    // wholly within the image.
+    unsafe { publish_into(vdso.data, mult, wall_off_ns) }
+}
 
-        match mult {
-            None => {
-                // Turning off: `enabled` goes first, so no reader can act on
-                // parameters already known to be wrong.
-                core::ptr::write_volatile(enabled, 0);
-                compiler_fence(Ordering::SeqCst);
-                core::ptr::write_volatile(tsc_mult, 0);
-                core::ptr::write_volatile(wall, wall_off_ns);
-            }
-            Some(mult) => {
-                // Turning on, or updating: the parameters land first, so a
-                // reader that sees `enabled` sees them too.
-                core::ptr::write_volatile(tsc_mult, mult);
-                core::ptr::write_volatile(wall, wall_off_ns);
-                compiler_fence(Ordering::SeqCst);
-                core::ptr::write_volatile(enabled, 1);
-            }
+/// The write sequence itself, against any `VdsoData`.
+///
+/// Separate from [`publish`] so that what lands in the struct, and in what
+/// order, can be driven from a test: the libos build of `kernel_hal` answers
+/// `vdso_tsc_mult()` with a hardcoded `None`, so through `publish` the enabling
+/// arm is unreachable on the host and the ordering below -- the only thing here
+/// that can be wrong -- would never be exercised anywhere but on Moebius's own
+/// machine.
+///
+/// # Safety
+///
+/// `d` must point at a live, aligned `VdsoData` that the caller may write.
+unsafe fn publish_into(d: *mut VdsoData, mult: Option<u64>, wall_off_ns: u64) {
+    // Volatile writes because the reader is userspace and invisible to the
+    // compiler.
+    let enabled = core::ptr::addr_of_mut!((*d).enabled);
+    let tsc_mult = core::ptr::addr_of_mut!((*d).tsc_mult);
+    let wall = core::ptr::addr_of_mut!((*d).wall_off_ns);
+
+    match mult {
+        None => {
+            // Turning off: `enabled` goes first, so no reader can act on
+            // parameters already known to be wrong.
+            core::ptr::write_volatile(enabled, 0);
+            compiler_fence(Ordering::SeqCst);
+            core::ptr::write_volatile(tsc_mult, 0);
+            core::ptr::write_volatile(wall, wall_off_ns);
+        }
+        Some(mult) => {
+            // Turning on, or updating: the parameters land first, so a reader
+            // that sees `enabled` sees them too.
+            core::ptr::write_volatile(tsc_mult, mult);
+            core::ptr::write_volatile(wall, wall_off_ns);
+            compiler_fence(Ordering::SeqCst);
+            core::ptr::write_volatile(enabled, 1);
         }
     }
 }
@@ -256,6 +278,27 @@ pub fn status() -> alloc::string::String {
     )
 }
 
+/// Where the image goes in a process: its base address, and that base as an
+/// offset into the VMAR, or `None` when it does not fit.
+///
+/// Immediately below `stack_bottom` with [`STACK_GUARD`] of gap, so a stack
+/// overflow faults instead of running quietly into executable pages. Every
+/// subtraction is checked: a small `stack_bottom` -- a thread whose stack the
+/// loader placed low, or a caller that passed a size where an address was
+/// wanted -- would otherwise wrap to an enormous address that `map_ext` might
+/// well accept, mapping executable pages nowhere near the stack they were
+/// supposed to sit under.
+///
+/// Split out from [`map_into`] because reaching it there needs a process, a
+/// VMAR and a vDSO whose clock is live, and none of the three says anything
+/// about the arithmetic.
+fn placement(stack_bottom: VirtAddr, vmar_addr: VirtAddr, len: usize) -> Option<(VirtAddr, usize)> {
+    let top = stack_bottom.checked_sub(STACK_GUARD)?;
+    let base = top.checked_sub(len)?;
+    let offset = base.checked_sub(vmar_addr)?;
+    Some((base, offset))
+}
+
 /// Map the vDSO into a process, just below `stack_bottom`, and return the
 /// address to publish as `AT_SYSINFO_EHDR`.
 ///
@@ -280,9 +323,7 @@ pub fn map_into(vmar: &Arc<VmAddressRegion>, stack_bottom: VirtAddr) -> Option<V
         return None;
     }
 
-    let top = stack_bottom.checked_sub(STACK_GUARD)?;
-    let base = top.checked_sub(vdso.len)?;
-    let offset = base.checked_sub(vmar.addr())?;
+    let (base, offset) = placement(stack_bottom, vmar.addr(), vdso.len)?;
 
     // Read and execute, never write. A process that could write the data page
     // could lie to itself about the time and to nothing else, but there is no
@@ -312,5 +353,323 @@ pub fn map_into(vmar: &Arc<VmAddressRegion>, stack_bottom: VirtAddr) -> Option<V
             warn!("vdso: no se pudo mapear en {:#x}: {:?}", base, e);
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use zircon_object::vm::PAGE_SIZE;
+
+    /// A `VdsoData` a test owns, so `publish_into` writes somewhere harmless.
+    fn scratch_data() -> VdsoData {
+        VdsoData {
+            enabled: 0xdead_beef,
+            _pad: 0xdead_beef,
+            tsc_mult: 0xdead_beef_dead_beef,
+            wall_off_ns: 0xdead_beef_dead_beef,
+        }
+    }
+
+    /// Enabling: the parameters have to be in memory before `enabled` vouches
+    /// for them, and both of them, not just the multiplier. A reader that sees
+    /// `enabled` and then loads a `wall_off_ns` still holding the previous
+    /// boot's value answers `CLOCK_REALTIME` off by that much -- silently, which
+    /// is the failure this whole module is arranged to avoid.
+    #[test]
+    fn turning_the_clock_on_publishes_both_parameters_and_then_enables() {
+        let mut d = scratch_data();
+        // SAFETY: `d` is a live, aligned `VdsoData` this test owns.
+        unsafe { publish_into(&mut d, Some(0x1234_5678_9abc_def0), 42) };
+        assert_eq!(d.enabled, 1);
+        assert_eq!(d.tsc_mult, 0x1234_5678_9abc_def0);
+        assert_eq!(d.wall_off_ns, 42);
+    }
+
+    /// Disabling: `enabled` goes to zero, and the multiplier goes with it. Left
+    /// standing, a stale multiplier is what a reader that forgets to check
+    /// `enabled` would compute a time from; zero makes that reader return zero,
+    /// which is wrong in a way somebody notices.
+    #[test]
+    fn turning_the_clock_off_clears_the_multiplier_as_well_as_the_flag() {
+        let mut d = scratch_data();
+        // SAFETY: as above.
+        unsafe { publish_into(&mut d, Some(99), 7) };
+        // SAFETY: as above.
+        unsafe { publish_into(&mut d, None, 8) };
+        assert_eq!(d.enabled, 0);
+        assert_eq!(d.tsc_mult, 0, "a stale multiplier must not survive");
+        assert_eq!(d.wall_off_ns, 8, "the wall offset is published either way");
+    }
+
+    /// The padding exists only to keep the 64-bit fields aligned, which is what
+    /// lets the reader run without a seqlock. Writing it would be writing a
+    /// field `vdso.c` does not know about.
+    #[test]
+    fn publishing_never_touches_the_padding() {
+        let mut d = scratch_data();
+        // SAFETY: as above.
+        unsafe { publish_into(&mut d, Some(1), 1) };
+        assert_eq!(d._pad, 0xdead_beef);
+        // SAFETY: as above.
+        unsafe { publish_into(&mut d, None, 1) };
+        assert_eq!(d._pad, 0xdead_beef);
+    }
+
+    /// Republishing is the ordinary case -- `settimeofday`, a recalibration --
+    /// and has to overwrite rather than accumulate.
+    #[test]
+    fn publishing_again_replaces_what_was_there() {
+        let mut d = scratch_data();
+        // SAFETY: as above.
+        unsafe { publish_into(&mut d, Some(10), 100) };
+        // SAFETY: as above.
+        unsafe { publish_into(&mut d, Some(20), 200) };
+        assert_eq!((d.enabled, d.tsc_mult, d.wall_off_ns), (1, 20, 200));
+    }
+
+    /// The guard page is the whole reason the image is not flush against the
+    /// stack: a stack overflow must fault, not run into executable pages.
+    #[test]
+    fn the_image_sits_a_guard_page_below_the_stack() {
+        let len = 2 * PAGE_SIZE;
+        let stack_bottom = 0x7fff_0000_0000;
+        let (base, offset) = placement(stack_bottom, 0, len).unwrap();
+        assert_eq!(base + len + STACK_GUARD, stack_bottom);
+        assert_eq!(offset, base, "with the VMAR at zero the two coincide");
+        assert_eq!(STACK_GUARD, PAGE_SIZE);
+    }
+
+    /// The offset is measured from the VMAR's own base, because that is what
+    /// `map_ext` takes. Passing an absolute address as an offset would map the
+    /// image at the VMAR's base plus that address.
+    #[test]
+    fn the_offset_is_measured_from_the_vmars_base() {
+        let len = 2 * PAGE_SIZE;
+        let vmar = 0x1000_0000;
+        let (base, offset) = placement(0x7fff_0000_0000, vmar, len).unwrap();
+        assert_eq!(base - vmar, offset);
+        assert!(offset < base, "an offset is not an address");
+    }
+
+    /// Every subtraction is checked, and this is why: without that, a
+    /// `stack_bottom` smaller than the guard plus the image wraps to an
+    /// enormous address, and `map_ext` has no way to know it was nonsense.
+    #[test]
+    fn a_stack_too_low_to_fit_the_image_is_refused_rather_than_wrapped() {
+        let len = 2 * PAGE_SIZE;
+        assert_eq!(placement(0, 0, len), None, "a zero stack bottom");
+        assert_eq!(
+            placement(STACK_GUARD - 1, 0, len),
+            None,
+            "less than the guard"
+        );
+        assert_eq!(
+            placement(STACK_GUARD, 0, len),
+            None,
+            "the guard and no room"
+        );
+        assert_eq!(
+            placement(STACK_GUARD + len - 1, 0, len),
+            None,
+            "one byte short"
+        );
+        assert!(
+            placement(STACK_GUARD + len, 0, len).is_some(),
+            "exactly enough"
+        );
+    }
+
+    /// A stack below the VMAR is not this VMAR's stack. Answering with a
+    /// wrapped offset would map the image outside the region that was asked
+    /// about.
+    #[test]
+    fn a_stack_below_the_vmar_is_refused() {
+        let len = 2 * PAGE_SIZE;
+        let vmar = 0x8000_0000;
+        assert_eq!(placement(vmar, vmar, len), None);
+        assert_eq!(placement(vmar + STACK_GUARD + len - 1, vmar, len), None);
+        assert_eq!(
+            placement(vmar + STACK_GUARD + len, vmar, len),
+            Some((vmar, 0)),
+            "flush against the VMAR's base is the first address that fits"
+        );
+    }
+
+    /// Placement keeps page alignment: the guard is a page and the image is
+    /// rounded up to whole pages, so a page-aligned stack gives a page-aligned
+    /// base. A misaligned base is a mapping request `map_ext` would refuse.
+    #[test]
+    fn a_page_aligned_stack_gives_a_page_aligned_base() {
+        for len in [PAGE_SIZE, 2 * PAGE_SIZE, 5 * PAGE_SIZE] {
+            let (base, offset) = placement(0x7fff_0000_0000, PAGE_SIZE, len).unwrap();
+            assert_eq!(base % PAGE_SIZE, 0, "len={}", len);
+            assert_eq!(offset % PAGE_SIZE, 0, "len={}", len);
+        }
+    }
+
+    /// The host suite really does build the image -- contiguous frames, the
+    /// copy, the physical VMO, the cache policy -- so everything below is
+    /// asking about the real thing and not about a fixture.
+    #[test]
+    fn the_image_is_actually_installed_on_this_build() {
+        assert!(
+            linux_vdso::AVAILABLE,
+            "this test is about the installed image; a build without one has nothing to check"
+        );
+        assert!(vdso().is_some(), "{}", status());
+    }
+
+    /// What every process maps has to be the image, byte for byte, and the tail
+    /// of the last page has to be zero. The frames come from the physical
+    /// allocator holding whatever was there before, and the image is shorter
+    /// than the pages it occupies: without the zero-fill, every Linux process
+    /// in the system gets a readable window onto that leftover kernel memory.
+    #[test]
+    fn what_userspace_maps_is_the_image_and_then_zeros() {
+        let Some(vdso) = vdso() else { return };
+        assert_eq!(vdso.len, roundup_pages(linux_vdso::IMAGE_LEN));
+        assert_eq!(vdso.vmo.len(), vdso.len);
+
+        let mut got = alloc::vec![0xabu8; vdso.len];
+        vdso.vmo.read(0, &mut got).expect("the image reads back");
+        assert_eq!(
+            &got[..linux_vdso::IMAGE_LEN],
+            linux_vdso::IMAGE,
+            "the mapped image differs from the one that was linked"
+        );
+        assert!(
+            got[linux_vdso::IMAGE_LEN..].iter().all(|&b| b == 0),
+            "the tail of the last page is leftover physical memory unless it is zeroed"
+        );
+    }
+
+    /// The image's own clock bytes are zero as linked, which is what makes the
+    /// zero-fill in `build` and the copy length agree: copying `IMAGE_LEN` bytes
+    /// and copying only the first page produce the same memory. Worth pinning,
+    /// because it is also why `publish` may write there without reading first.
+    #[test]
+    fn the_clock_bytes_of_the_linked_image_are_zero() {
+        assert!(
+            linux_vdso::IMAGE[linux_vdso::DATA_OFFSET..]
+                .iter()
+                .all(|&b| b == 0),
+            "the linked image already carries clock parameters"
+        );
+        assert_eq!(
+            linux_vdso::IMAGE_LEN - linux_vdso::DATA_OFFSET,
+            core::mem::size_of::<VdsoData>(),
+            "the image ends exactly at the end of the clock struct"
+        );
+    }
+
+    /// The clock lives inside those frames, and `publish` writes straight
+    /// through a raw pointer at `DATA_OFFSET`. If the struct ran off the end,
+    /// those writes would land on whatever follows the image's frames.
+    #[test]
+    fn the_clock_struct_lies_wholly_inside_the_frames_that_were_allocated() {
+        let Some(vdso) = vdso() else { return };
+        let end = linux_vdso::DATA_OFFSET + core::mem::size_of::<VdsoData>();
+        assert!(end <= vdso.len, "{end} > {}", vdso.len);
+        assert_eq!(
+            linux_vdso::DATA_OFFSET % core::mem::align_of::<VdsoData>(),
+            0,
+            "the writes are through a *mut VdsoData, so the offset has to be aligned"
+        );
+    }
+
+    /// The `data` pointer has to address the clock page of the frames this
+    /// build installed, and not some other page of them.
+    #[test]
+    fn the_data_pointer_addresses_the_clock_page_of_the_image() {
+        let Some(vdso) = vdso() else { return };
+        let mut page = alloc::vec![0xabu8; core::mem::size_of::<VdsoData>()];
+        vdso.vmo
+            .read(linux_vdso::DATA_OFFSET, &mut page)
+            .expect("the clock page reads back");
+        // SAFETY: `data` is the direct-map address of that same offset.
+        let live = unsafe { core::ptr::read_volatile(vdso.data) };
+        assert_eq!(
+            page,
+            unsafe {
+                core::slice::from_raw_parts(
+                    &live as *const VdsoData as *const u8,
+                    core::mem::size_of::<VdsoData>(),
+                )
+            },
+            "the VMO and the kernel pointer are two views of one page"
+        );
+    }
+
+    /// Being asked twice must not build twice: the frames are leaked on
+    /// purpose, so a second build would leak a second image and leave every
+    /// process that already mapped the first one reading a clock nobody
+    /// updates.
+    #[test]
+    fn the_image_is_built_once_and_handed_out_again() {
+        let first = vdso().map(|v| v.data as usize);
+        let second = vdso().map(|v| v.data as usize);
+        assert_eq!(first, second);
+        init();
+        init();
+        assert_eq!(vdso().map(|v| v.data as usize), first);
+    }
+
+    /// A vDSO whose clock is off answers -ENOSYS for every call, so offering it
+    /// costs an indirect call before every clock read and buys nothing. libos
+    /// answers `vdso_tsc_mult()` with a hardcoded `None`, which makes this the
+    /// case the host suite is always in -- and the one the check exists for.
+    #[test]
+    fn a_vdso_with_no_clock_is_not_advertised_to_the_process() {
+        let Some(vdso) = vdso() else { return };
+        // SAFETY: `data` addresses the live clock struct.
+        let enabled =
+            unsafe { core::ptr::read_volatile(core::ptr::addr_of!((*vdso.data).enabled)) };
+        if enabled != 0 {
+            return;
+        }
+        let vmar = VmAddressRegion::new_root();
+        assert_eq!(
+            map_into(&vmar, vmar.addr() + 0x10_0000),
+            None,
+            "an inactive clock must not be published as AT_SYSINFO_EHDR"
+        );
+    }
+
+    /// `status()` is the only symptom a broken vDSO has -- every other way it
+    /// can fail to engage is silent -- so it has to name the reason rather than
+    /// report success for a clock that is not running.
+    #[test]
+    fn the_status_line_says_which_of_the_ways_this_can_fail_happened() {
+        let s = status();
+        let Some(vdso) = vdso() else {
+            assert!(
+                s.contains("sin imagen") || s.contains("sin memoria fisica"),
+                "no vDSO, but the reason given was {:?}",
+                s
+            );
+            return;
+        };
+        // SAFETY: `data` addresses the live clock struct.
+        let enabled =
+            unsafe { core::ptr::read_volatile(core::ptr::addr_of!((*vdso.data).enabled)) };
+        if enabled == 0 {
+            assert!(s.contains("inactiva"), "{:?}", s);
+            assert!(
+                !s.contains("activa,"),
+                "an inactive clock reported as active: {:?}",
+                s
+            );
+        } else {
+            assert!(s.contains("activa, tsc_mult="), "{:?}", s);
+        }
+    }
+
+    /// The aux-vector tag a C library looks the vDSO up by. Get this wrong and
+    /// the library never finds the image, which looks exactly like not having
+    /// one.
+    #[test]
+    fn the_aux_vector_tag_is_the_one_linux_uses() {
+        assert_eq!(AT_SYSINFO_EHDR, 33);
     }
 }
