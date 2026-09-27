@@ -1193,6 +1193,93 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
         .unwrap();
     }
 
+    /// The applets linked unconditionally, before `busybox --list` is consulted.
+    ///
+    /// This list is the FALLBACK, and the fallback is the whole story on every
+    /// cross build: the complement below runs `busybox --list` on the *host*,
+    /// and a busybox built for aarch64 or riscv64 does not run here. So an
+    /// applet missing from this list has no link at all in those images, and
+    /// every caller in the rootfs's own scripts hides the failure -- inside
+    /// `$(...)` a missing command substitutes empty, and the rest redirect
+    /// stderr to /dev/null. `applets_cover_what_the_generated_scripts_call` is
+    /// the test that keeps this in step with those scripts.
+    const BASE_APPLETS: &[&str] = &[
+        "cat",
+        "cp",
+        "echo",
+        "false",
+        "grep",
+        "gzip",
+        "ip",
+        "kill",
+        "ln",
+        "ls",
+        "mkdir",
+        "mv",
+        "pidof",
+        "ping",
+        "ps",
+        "pwd",
+        "rm",
+        "rmdir",
+        "sh",
+        "sleep",
+        "stat",
+        "tar",
+        "touch",
+        "true",
+        "uname",
+        "usleep",
+        "watch",
+        "ifconfig",
+        "route",
+        "udhcpc",
+        "udhcpc6",
+        "sed",
+        "awk",
+        "cmp",
+        "diff",
+        "logger",
+        "hostname",
+        "cut",
+        "sort",
+        "uniq",
+        "head",
+        "tail",
+        "wc",
+        "xargs",
+        "find",
+        "test",
+        "expr",
+        "id",
+        "date",
+        "env",
+        "chmod",
+        "chown",
+        "vi",
+        "top",
+        "less",
+        "ssl_client",
+        "ssl_server",
+        "wget",
+        "traceroute",
+        "traceroute6",
+        "reboot",
+        "halt",
+        "poweroff",
+        // Called by the scripts this module and `desktop.rs` write into the
+        // rootfs. Each of these was missing, so on a cross build the line that
+        // uses it quietly did nothing:
+        "tr",       // /etc/profile: the card0 vendor check that picks the renderer
+        "printf", // /etc/profile: the cursor query of the TTY-size probe, and the \e[H that homes the console
+        "stty",   // /etc/profile: raw mode for that probe, and putting the tty back
+        "dd",     // /etc/profile: reads the terminal's reply; eclipse-xkbmap writes /proc/kbd
+        "basename", // eclipse-init: turns the socket path into WAYLAND_DISPLAY
+        "dirname", // eclipse-xkbmap, eclipse-look: the mkdir -p of the file they upsert
+        "pkill",  // eclipse-look, lunarrun: respawn the panel, refuse a second instance
+        "setsid", // eclipse-init: detaches a oneshot so it does not hold up the panel
+    ];
+
     /// Creates symlinks in `bin/` for every busybox applet.
     ///
     /// Called on both full and incremental builds so that a rootfs directory
@@ -1200,75 +1287,7 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
     /// up with all applet symlinks in the final ext2 image.  Existing entries
     /// (real binaries like `nl_dump`) are never overwritten.
     fn ensure_busybox_applets(bin: &Path) {
-        // Base list of essential applets
-        let mut applets: Vec<String> = vec![
-            "cat",
-            "cp",
-            "echo",
-            "false",
-            "grep",
-            "gzip",
-            "ip",
-            "kill",
-            "ln",
-            "ls",
-            "mkdir",
-            "mv",
-            "pidof",
-            "ping",
-            "ps",
-            "pwd",
-            "rm",
-            "rmdir",
-            "sh",
-            "sleep",
-            "stat",
-            "tar",
-            "touch",
-            "true",
-            "uname",
-            "usleep",
-            "watch",
-            "ifconfig",
-            "route",
-            "udhcpc",
-            "udhcpc6",
-            "sed",
-            "awk",
-            "cmp",
-            "diff",
-            "logger",
-            "hostname",
-            "cut",
-            "sort",
-            "uniq",
-            "head",
-            "tail",
-            "wc",
-            "xargs",
-            "find",
-            "test",
-            "expr",
-            "id",
-            "date",
-            "env",
-            "chmod",
-            "chown",
-            "vi",
-            "top",
-            "less",
-            "ssl_client",
-            "ssl_server",
-            "wget",
-            "traceroute",
-            "traceroute6",
-            "reboot",
-            "halt",
-            "poweroff",
-        ]
-        .into_iter()
-        .map(String::from)
-        .collect();
+        let mut applets: Vec<String> = Self::BASE_APPLETS.iter().map(|a| a.to_string()).collect();
 
         // Complement the list with `busybox --list` when it runs on the host.
         let busybox_bin = bin.join("busybox");
@@ -3664,9 +3683,12 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
                 let target = lib.join(name);
                 if source.is_symlink() {
                     if name != musl_libc_protected.as_str() {
-                        dir::rm(&target).unwrap();
                         // `fs::copy` 会拷贝文件内容
-                        unix::fs::symlink(source.read_link().unwrap(), target).unwrap();
+                        let Some(link_to) = rootfs_link_target(&source) else {
+                            return;
+                        };
+                        dir::rm(&target).unwrap();
+                        unix::fs::symlink(link_to, target).unwrap();
                     }
                 } else if name != musl_libc_ignored {
                     dir::rm(&target).unwrap();
@@ -3683,9 +3705,26 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<Path>,
 {
+    // `env::var` hands back `Err` for a `PATH` that is not valid UTF-8, and the
+    // whole inherited `PATH` was then dropped on the floor; `var_os` keeps the
+    // bytes. Reading the environment is all this wrapper does, so the assembling
+    // below can be asked about without a test having to touch the environment of
+    // the process it shares with every other test.
+    join_path_env_from(env::var_os("PATH"), paths)
+}
+
+fn join_path_env_from<I, S>(inherited: Option<OsString>, paths: I) -> OsString
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<Path>,
+{
     let mut path = OsString::new();
     let mut first = true;
-    if let Ok(current) = env::var("PATH") {
+    // An EMPTY `PATH` is set-but-empty, so it used to count as a first element:
+    // the result then began with a `:`, and an empty element in `PATH` means THE
+    // CURRENT DIRECTORY to every exec that inherits it. Unset and empty have to
+    // be treated the same.
+    if let Some(current) = inherited.filter(|c| !c.is_empty()) {
         path.push(current);
         first = false;
     }
@@ -3695,9 +3734,65 @@ where
         } else {
             path.push(":");
         }
-        path.push(item.as_ref().canonicalize().unwrap().as_os_str());
+        // `canonicalize` fails on a directory that does not exist yet, and the
+        // panic named neither the path nor `PATH` -- just "No such file or
+        // directory (os error 2)" from somewhere inside a build. An element of
+        // `PATH` that does not exist is simply skipped by exec, so keep going
+        // with the path as it was given and say which one it was.
+        let item = item.as_ref();
+        match item.canonicalize() {
+            Ok(absolute) => path.push(absolute.as_os_str()),
+            Err(e) => {
+                eprintln!(
+                    "warning: PATH entry {} could not be resolved: {e}",
+                    item.display()
+                );
+                path.push(item.as_os_str());
+            }
+        }
     }
     path
+}
+
+/// The symlink to install in the rootfs for the library symlink `source`, or
+/// `None` when there is nothing safe to install.
+///
+/// What goes in is the RAW link target, not the resolved path: the rootfs is
+/// assembled on the host and mounted at a different root in the guest, so an
+/// absolute target here names a host path that does not exist there. The result
+/// is a dangling `/lib` entry whose only symptom is the loader saying "not
+/// found" about a library that is visibly present.
+///
+/// A relative target already survives the move. An absolute one that names a
+/// sibling in the same lib directory says the same thing as its file name, and
+/// that sibling is installed by the same pass, so the name is the rewrite. An
+/// absolute target pointing anywhere else has nothing to be rewritten to.
+fn rootfs_link_target(source: &Path) -> Option<PathBuf> {
+    let raw = source.read_link().ok()?;
+    if raw.is_relative() {
+        return Some(raw);
+    }
+    // The sibling has to be a DIFFERENT file: when the absolute target's last
+    // component is the link's own name, rewriting to that name points the link
+    // at itself, and `exists()` says yes because it follows the link back to the
+    // host path. A self-referencing symlink is ELOOP for every reader.
+    let sibling = raw
+        .file_name()
+        .map(|base| (base, source.with_file_name(base)));
+    match sibling {
+        Some((base, sibling)) if sibling != *source && sibling.exists() => {
+            Some(PathBuf::from(base))
+        }
+        _ => {
+            eprintln!(
+                "warning: skipping {}: it is a symlink to the host path {}, \
+                 which does not exist in the guest",
+                source.display(),
+                raw.display()
+            );
+            None
+        }
+    }
 }
 
 /// 判断一个文件是动态库或动态库的符号链接。
@@ -3720,7 +3815,12 @@ fn check_so<P: AsRef<Path>>(path: P) -> bool {
         return false;
     }
     // so 之后全是纯十进制数字
-    !seg.any(|it| !it.chars().all(|ch| ch.is_ascii_digit()))
+    //
+    // Every segment after `so` is a version number, so it must be non-empty as
+    // well as all digits: `all` over an EMPTY segment is vacuously true, which
+    // made `libfoo.so.` answer yes and put a name no loader will ever look up
+    // into the rootfs's /lib.
+    seg.all(|it| !it.is_empty() && it.chars().all(|ch| ch.is_ascii_digit()))
 }
 
 #[cfg(test)]
@@ -3955,5 +4055,349 @@ mod lunar_client_tests {
                  as a window exists"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod rootfs_plumbing_tests {
+    use super::*;
+
+    fn scratch(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "eclipse-rootfs-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// The applet list is the FALLBACK for when `busybox --list` cannot run on
+    /// the host, which is every cross build -- so on aarch64 and riscv64 it is
+    /// the whole list. An applet missing from it has no link at all in those
+    /// images, and every caller in the rootfs's own scripts swallows the
+    /// failure: `$(cmd)` substitutes empty and the rest send stderr to
+    /// /dev/null. That is how eight of these went unnoticed: `tr` in the card0
+    /// vendor check (so the NVIDIA branch of /etc/profile could never be taken),
+    /// and `stty`/`printf`/`dd` in the terminal-size probe -- including the
+    /// final `printf '\e[H'` whose own comment says that without it the
+    /// installer "would look like a hung black screen".
+    #[test]
+    fn applets_cover_what_the_generated_scripts_call() {
+        for (applet, used_by) in [
+            ("tr", "/etc/profile: the card0 vendor check that picks the renderer"),
+            ("printf", "/etc/profile: the cursor query of the TTY-size probe, and the \\e[H that homes the console"),
+            ("stty", "/etc/profile: raw mode for the TTY-size probe"),
+            ("dd", "/etc/profile: reads the terminal's reply to the probe"),
+            ("basename", "eclipse-init: turns the socket path into WAYLAND_DISPLAY"),
+            ("dirname", "eclipse-xkbmap and eclipse-look: the mkdir -p of the file they upsert"),
+            ("pkill", "eclipse-look and lunarrun: respawn the panel, refuse a second instance"),
+            ("setsid", "eclipse-init: detaches a oneshot so it does not hold up the panel"),
+            // The ones the list has always had, so the test also notices a
+            // deletion. `awk` and `grep` parse /etc/eclipse/*; `sh` is every
+            // script's interpreter; `wget` is how apk reaches a mirror.
+            ("awk", "/etc/profile: reads the language and timezone out of /etc/eclipse"),
+            ("grep", "/etc/profile: reads the nvidia.* flags out of /proc/cmdline"),
+            ("sh", "the interpreter of every script written into the rootfs"),
+            ("wget", "apk's downloader, and how the IWADs and the CA bundle arrive"),
+        ] {
+            assert!(
+                LinuxRootfs::BASE_APPLETS.contains(&applet),
+                "`{applet}` has no applet link on a cross build, and it is used by {used_by}"
+            );
+        }
+    }
+
+    /// The other half of the pairing above: the test only means something while
+    /// the probe really is written with those commands. If it is rewritten, this
+    /// fails and whoever rewrote it updates both halves instead of leaving a
+    /// list that guards commands nobody calls any more.
+    #[test]
+    fn the_terminal_size_probe_still_uses_stty_printf_and_dd() {
+        let etc = scratch("profile").join("etc");
+        fs::create_dir_all(&etc).unwrap();
+        LinuxRootfs::write_profile(&etc);
+        let profile = fs::read_to_string(etc.join("profile")).unwrap();
+        for fragment in [
+            "stty raw -echo min 0 time 3",
+            "printf '\\033[999;999H\\033[6n'",
+            "dd bs=32 count=1",
+            "printf '\\033[H'",
+            "tr -d '[:space:]' < /sys/class/drm/card0/device/vendor",
+        ] {
+            assert!(
+                profile.contains(fragment),
+                "/etc/profile no longer contains {fragment:?}; \
+                 applets_cover_what_the_generated_scripts_call guards it for nothing"
+            );
+        }
+        let _ = fs::remove_dir_all(etc.parent().unwrap());
+    }
+
+    /// Every applet link has to be RELATIVE and name `busybox`: the rootfs is
+    /// built on the host and mounted at a different root in the guest, and
+    /// busybox picks its applet from `basename(argv[0])`, so the link's own name
+    /// is what selects the applet.
+    #[test]
+    fn every_applet_gets_a_relative_link_to_busybox() {
+        let dir = scratch("applets");
+        let bin = dir.join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        LinuxRootfs::ensure_busybox_applets(&bin);
+
+        for applet in LinuxRootfs::BASE_APPLETS {
+            let link = bin.join(applet);
+            assert!(link.is_symlink(), "no link for the `{applet}` applet");
+            assert_eq!(
+                fs::read_link(&link).unwrap(),
+                Path::new("busybox"),
+                "the `{applet}` link must be a relative link to busybox"
+            );
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The doc comment promises that "existing entries (real binaries like
+    /// `nl_dump`) are never overwritten", and the whole rootfs depends on it:
+    /// several applet names are also the names of programs Eclipse builds and
+    /// installs itself, and replacing one with a busybox link would silently
+    /// swap the program for a completely different command.
+    #[test]
+    fn a_real_binary_keeps_its_place_and_so_does_a_dangling_link() {
+        let dir = scratch("keep");
+        let bin = dir.join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        fs::write(bin.join("ls"), b"#!/bin/sh\necho not busybox\n").unwrap();
+        unix::fs::symlink("nowhere-at-all", bin.join("ps")).unwrap();
+
+        LinuxRootfs::ensure_busybox_applets(&bin);
+
+        assert!(
+            !bin.join("ls").is_symlink(),
+            "a real binary was replaced by an applet link"
+        );
+        assert_eq!(
+            fs::read_link(bin.join("ps")).unwrap(),
+            Path::new("nowhere-at-all"),
+            "an existing symlink was repointed at busybox"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The list is data, and duplicated data hides an edit: the complement loop
+    /// skips a name it already has, so a duplicate never shows up as a second
+    /// link and nothing else would ever say it is there.
+    #[test]
+    fn the_applet_list_has_no_duplicates() {
+        let mut seen = std::collections::BTreeSet::new();
+        for applet in LinuxRootfs::BASE_APPLETS {
+            assert!(seen.insert(*applet), "`{applet}` is listed twice");
+        }
+    }
+
+    /// What goes into the rootfs is the RAW link target, and the rootfs is
+    /// mounted at a different root in the guest. A relative target survives the
+    /// move untouched, which is the normal case and must not be rewritten.
+    #[test]
+    fn a_relative_symlink_target_is_kept_as_it_was() {
+        let dir = scratch("relative");
+        fs::write(dir.join("libc.so"), b"").unwrap();
+        let link = dir.join("ld-musl-x86_64.so.1");
+        unix::fs::symlink("libc.so", &link).unwrap();
+
+        assert_eq!(
+            rootfs_link_target(&link),
+            Some(PathBuf::from("libc.so")),
+            "a relative target is already correct in the guest"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// An absolute target that names a sibling in the same lib directory says
+    /// the same thing as its file name, and that sibling is installed by the
+    /// same pass -- so the name is the rewrite, and the link resolves in the
+    /// guest instead of pointing back at the host's toolchain.
+    #[test]
+    fn an_absolute_target_in_the_same_directory_becomes_its_name() {
+        let dir = scratch("absolute-sibling");
+        fs::write(dir.join("libstdc++.so.6.0.30"), b"").unwrap();
+        let link = dir.join("libstdc++.so.6");
+        unix::fs::symlink(dir.join("libstdc++.so.6.0.30"), &link).unwrap();
+
+        assert_eq!(
+            rootfs_link_target(&link),
+            Some(PathBuf::from("libstdc++.so.6.0.30")),
+            "an absolute sibling must be rewritten to its name, not copied verbatim"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// And an absolute target that is NOT in the lib directory has nothing to be
+    /// rewritten to, so it is refused. Installing it verbatim is the bad case
+    /// this guards: a `/lib` entry that is visibly present and that the loader
+    /// says is not found, because the path it names only exists on the machine
+    /// that built the image.
+    #[test]
+    fn an_absolute_target_outside_the_directory_is_refused() {
+        let dir = scratch("absolute-elsewhere");
+        let elsewhere = dir.join("host-only");
+        fs::create_dir_all(&elsewhere).unwrap();
+        fs::write(elsewhere.join("libbar.so.1"), b"").unwrap();
+        let link = dir.join("libfoo.so.1");
+        unix::fs::symlink(elsewhere.join("libbar.so.1"), &link).unwrap();
+
+        assert_eq!(
+            rootfs_link_target(&link),
+            None,
+            "a host path outside the lib directory must not be installed"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// And the case that caught the first version of the rewrite: when the
+    /// absolute target's last component is the LINK'S OWN name, rewriting to
+    /// that name points the link at itself. `exists()` says yes, because it
+    /// follows the link back to the host path -- so the sibling has to be
+    /// checked for being a different file, not just for existing. A
+    /// self-referencing symlink is ELOOP for every reader.
+    #[test]
+    fn an_absolute_target_that_would_point_the_link_at_itself_is_refused() {
+        let dir = scratch("absolute-self");
+        let elsewhere = dir.join("host-only");
+        fs::create_dir_all(&elsewhere).unwrap();
+        fs::write(elsewhere.join("libfoo.so.1"), b"").unwrap();
+        let link = dir.join("libfoo.so.1");
+        unix::fs::symlink(elsewhere.join("libfoo.so.1"), &link).unwrap();
+
+        assert_eq!(rootfs_link_target(&link), None);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A dangling absolute link is the same case and must not be installed
+    /// either: `exists()` follows the link, so the sibling check answers no.
+    #[test]
+    fn a_dangling_absolute_target_is_refused() {
+        let dir = scratch("absolute-dangling");
+        let link = dir.join("libgone.so.1");
+        unix::fs::symlink(dir.join("never-existed.so.1"), &link).unwrap();
+
+        assert_eq!(rootfs_link_target(&link), None);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// An empty `PATH` is set-but-empty, and counting it as a first element put
+    /// a leading `:` in the result -- which every exec reads as THE CURRENT
+    /// DIRECTORY, so a build would look for its tools in whatever directory it
+    /// happened to be started from. Unset and empty have to agree.
+    #[test]
+    fn an_empty_inherited_path_does_not_become_the_current_directory() {
+        let dir = scratch("path-empty");
+        let want = dir.canonicalize().unwrap();
+
+        let empty = join_path_env_from(Some(OsString::from("")), [&dir]);
+        let unset = join_path_env_from(None, [&dir]);
+        assert_eq!(empty, unset, "an empty PATH must behave like an unset one");
+        assert_eq!(empty, want.as_os_str());
+        assert!(
+            !empty.to_string_lossy().starts_with(':'),
+            "a leading empty PATH element means the current directory: {empty:?}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The inherited `PATH` comes first and the added directories after it, each
+    /// one absolute: they are handed to child builds that run in a different
+    /// working directory, where a relative entry means somewhere else.
+    #[test]
+    fn the_added_entries_follow_the_inherited_path_and_are_absolute() {
+        let dir = scratch("path-order");
+        let a = dir.join("a");
+        let b = dir.join("b");
+        fs::create_dir_all(&a).unwrap();
+        fs::create_dir_all(&b).unwrap();
+
+        let joined = join_path_env_from(Some(OsString::from("/inherited")), [&a, &b]);
+        let joined = joined.to_string_lossy().into_owned();
+        let mut parts = joined.split(':');
+        assert_eq!(parts.next(), Some("/inherited"));
+        for dir in [&a, &b] {
+            let part = parts.next().unwrap();
+            assert!(Path::new(part).is_absolute(), "{part} is not absolute");
+            assert_eq!(Path::new(part), dir.canonicalize().unwrap());
+        }
+        assert_eq!(parts.next(), None);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A directory that does not exist yet used to abort the whole build inside
+    /// `canonicalize().unwrap()`, naming neither the path nor `PATH` -- just "No
+    /// such file or directory (os error 2)". exec skips a `PATH` element that is
+    /// not there, so the build has no reason to stop.
+    #[test]
+    fn a_path_entry_that_does_not_exist_does_not_abort_the_build() {
+        let dir = scratch("path-missing");
+        let missing = dir.join("not-built-yet");
+
+        let joined = join_path_env_from(Some(OsString::from("/inherited")), [&missing]);
+        assert_eq!(
+            joined.to_string_lossy(),
+            format!("/inherited:{}", missing.display()),
+            "the entry must still be there, just not canonicalized"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A `PATH` that is not valid UTF-8 is legal on Linux, and reading it as a
+    /// `String` dropped the whole inherited `PATH` silently -- the child then
+    /// found none of the host's tools and failed on the first one it needed.
+    #[test]
+    fn a_path_that_is_not_utf8_is_carried_through() {
+        use std::os::unix::ffi::OsStringExt;
+        let dir = scratch("path-bytes");
+        let weird = OsString::from_vec(vec![b'/', 0xff, 0xfe, b'/', b'b', b'i', b'n']);
+
+        let joined = join_path_env_from(Some(weird.clone()), [&dir]);
+        let bytes = joined.clone().into_vec();
+        assert!(
+            bytes.starts_with(&weird.clone().into_vec()),
+            "the inherited PATH was dropped: {joined:?}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// `check_so` decides what `put_libs` copies into the rootfs's /lib. Every
+    /// segment after `so` is a version number, so it has to be non-empty as well
+    /// as all digits: `all` over an empty segment is vacuously true, which made
+    /// `libfoo.so.` answer yes.
+    #[test]
+    fn a_trailing_dot_is_not_a_shared_library() {
+        let dir = scratch("check-so");
+        for (name, want) in [
+            ("libc.so", true),
+            ("libgcc_s.so.1", true),
+            ("libstdc++.so.6.0.30", true),
+            ("libfoo.so.", false),
+            ("libfoo.so.6.", false),
+            ("libfoo.so.6a", false),
+            ("libfoo.so.6.debug", false),
+            ("libfoo", false),
+            (".so.1", false),
+        ] {
+            let path = dir.join(name);
+            fs::write(&path, b"").unwrap();
+            assert_eq!(check_so(&path), want, "check_so({name:?})");
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// And a name that is not there at all is not a library, however it is
+    /// spelled: `put_libs` reads a directory, so a racing delete between the
+    /// listing and the check must answer no rather than panic.
+    #[test]
+    fn a_name_that_does_not_exist_is_not_a_shared_library() {
+        let dir = scratch("check-so-missing");
+        assert!(!check_so(dir.join("libghost.so.1")));
+        let _ = fs::remove_dir_all(&dir);
     }
 }
