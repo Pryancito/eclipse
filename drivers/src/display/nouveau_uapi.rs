@@ -1015,6 +1015,59 @@ pub(super) const fn tile_flags_kind(tile_flags: u32) -> u32 {
     (tile_flags >> 8) & 0xff
 }
 
+/// `NOUVEAU_GEM_TILE_NONCONTIG`: the one bit of `tile_flags` besides the
+/// kind that `nouveau_gem_info` reports back.
+pub(super) const NOUVEAU_GEM_TILE_NONCONTIG: u32 = 0x0000_0008;
+
+/// `nouveau_bo_alloc`'s choice of GPU page for a new object, as a shift.
+/// Host-backed memory (GART, or a request naming no VRAM) only has 4 KiB
+/// pages (`vmm->page[i].host` is set on the 4 KiB entry alone); VRAM takes
+/// the largest page the request already fills, 2 MiB or 64 KiB, and 4 KiB
+/// under that (the walk stops "once the buffer is larger than the current
+/// page size").
+#[inline]
+pub(super) const fn gem_page_shift(size: u64, sysmem: bool) -> u32 {
+    if sysmem {
+        12
+    } else if size >= 1 << 21 {
+        21
+    } else if size >= 1 << 16 {
+        16
+    } else {
+        12
+    }
+}
+
+/// `nouveau_bo_fixup_align`: the object's size is the request rounded up
+/// to its GPU page (and to the CPU page, which the GPU page covers). It is
+/// what the memory is allocated at and what `GEM_NEW`/`GEM_INFO` report.
+#[inline]
+pub(super) const fn gem_alloc_size(size: u64, page_shift: u32) -> u64 {
+    let page = 1u64 << page_shift;
+    (size + page - 1) & !(page - 1)
+}
+
+/// The kind an object of `page_shift` pages is programmed and reported
+/// with: a compressible kind needs a page with compression, which only the
+/// 64 KiB and 2 MiB VRAM pages have; on 4 KiB pages `nouveau_bo_alloc`
+/// "disables compression" by mapping it through the MMU table to its
+/// uncompressed pair. The kind is one [`mmu_kind_valid`] accepted.
+#[inline]
+pub(super) const fn gem_reported_kind(kind: u32, page_shift: u32) -> u32 {
+    if (kind as usize) < TU102_MMU_KIND.len() && page_shift == 12 {
+        TU102_MMU_KIND[kind as usize] as u32
+    } else {
+        kind
+    }
+}
+
+/// `nouveau_gem_info`'s `tile_flags`: NONCONTIG if the request carried it,
+/// and the kind in the second byte; every other bit of the request is gone.
+#[inline]
+pub(super) const fn gem_reported_tile_flags(tile_flags: u32, kind: u32) -> u32 {
+    (tile_flags & NOUVEAU_GEM_TILE_NONCONTIG) | (kind << 8)
+}
+
 #[inline]
 pub(super) const fn pte_kind_is_supported(kind: u32) -> bool {
     // The Turing UNCOMPRESSED kind set (tu102 dev_mmu.h): PITCH (0x00), the
@@ -2635,6 +2688,51 @@ mod gl_client_abi_tests {
         assert_eq!(tile_flags_kind(0x0000_0600), 0x06);
         assert_eq!(tile_flags_kind(0x00ff_07ff), 0x07, "the second byte only");
         assert_eq!(tile_flags_kind(0), 0);
+    }
+
+    /// `nouveau_bo_alloc`: the GPU page of a new object, the size it is
+    /// rounded to, and the kind it is reported with once compression is off
+    /// on a page that has none.
+    #[test]
+    fn a_gem_object_is_as_big_as_its_gpu_page_and_reports_the_kind_it_programs() {
+        // Host memory is 4 KiB pages whatever the size; VRAM fills the
+        // largest page it already reaches.
+        assert_eq!(gem_page_shift(1, true), 12);
+        assert_eq!(gem_page_shift(3 << 20, true), 12);
+        assert_eq!(gem_page_shift(1, false), 12);
+        assert_eq!(gem_page_shift((1 << 16) - 1, false), 12);
+        assert_eq!(gem_page_shift(1 << 16, false), 16);
+        assert_eq!(gem_page_shift((1 << 21) - 1, false), 16);
+        assert_eq!(gem_page_shift(1 << 21, false), 21);
+        assert_eq!(gem_page_shift(u64::from(u32::MAX), false), 21);
+
+        assert_eq!(gem_alloc_size(1, 12), 4096);
+        assert_eq!(gem_alloc_size(4096, 12), 4096);
+        assert_eq!(gem_alloc_size(4097, 12), 8192);
+        assert_eq!(gem_alloc_size(65537, 16), 131072);
+        assert_eq!(gem_alloc_size(3 << 20, 21), 4 << 20);
+        assert_eq!(gem_alloc_size(2 << 20, 21), 2 << 20);
+        assert_eq!(
+            gem_alloc_size(u64::from(u32::MAX), 21),
+            1 << 32,
+            "rounds past 32 bits rather than wrapping"
+        );
+
+        // A compressible kind is only kept on a page with compression.
+        assert_eq!(gem_reported_kind(0x08, 12), 0x06);
+        assert_eq!(gem_reported_kind(0x0a, 12), 0x02);
+        assert_eq!(gem_reported_kind(0x08, 16), 0x08);
+        assert_eq!(gem_reported_kind(0x08, 21), 0x08);
+        assert_eq!(gem_reported_kind(0x06, 12), 0x06, "uncompressed stays");
+        assert_eq!(gem_reported_kind(0x00, 12), 0x00);
+
+        assert_eq!(gem_reported_tile_flags(0x00ff_08ff, 0x06), 0x0000_0608);
+        assert_eq!(gem_reported_tile_flags(0x0000_0800, 0x08), 0x0000_0800);
+        assert_eq!(
+            gem_reported_tile_flags(0x0000_00f7, 0x00),
+            0,
+            "only NONCONTIG"
+        );
     }
 
     #[test]
