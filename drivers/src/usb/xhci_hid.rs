@@ -990,6 +990,44 @@ const EP_TYPE_INT_IN: u32 = 7 << 3;
 const HID_PROTO_KEY: u8 = 1;
 const HID_PROTO_MOUSE: u8 = 2;
 const HID_PROTO_TABLET: u8 = 3;
+
+/// `wValue` of SET_PROTOCOL (USB HID 1.11 §7.2.6).
+const HID_PROTOCOL_BOOT: u8 = 0;
+const HID_PROTOCOL_REPORT: u8 = 1;
+
+/// True when a mouse interface is handing us reports too short for the layout
+/// we parsed, in the one case where that is unambiguous: an interface with no
+/// Report IDs, where every report on the endpoint *is* the mouse report. A
+/// device that refused SET_PROTOCOL(Report) and stayed in boot protocol looks
+/// exactly like this — three bytes where the layout wants four or more.
+///
+/// On an interface that multiplexes Report IDs a short report is simply a
+/// different, shorter report (a consumer-control page, a battery report), so we
+/// never guess there.
+fn mouse_report_is_truncated(ml: &MouseLayout, actual_len: usize, boot_layout_ok: bool) -> bool {
+    boot_layout_ok && ml.report_id.is_none() && actual_len < ml.report_bytes
+}
+
+/// Which HID protocol to put a boot-subclass interface in: the one whose report
+/// layout we are going to decode.
+///
+/// Report protocol whenever the report descriptor gave us a layout for this
+/// interface's role, because that layout describes the report-protocol report
+/// — including its wheel, which the three-byte boot mouse report does not
+/// have at all. Boot only as the fallback, where `dispatch_hid` decodes the
+/// fixed boot layout and therefore needs the device to be in boot protocol.
+fn hid_protocol_request(role: u8, parsed: &HidDescInfo) -> u8 {
+    let have_layout = match role {
+        HID_PROTO_MOUSE => parsed.mouse.is_some(),
+        HID_PROTO_KEY => parsed.key.is_some(),
+        _ => false,
+    };
+    if have_layout {
+        HID_PROTOCOL_REPORT
+    } else {
+        HID_PROTOCOL_BOOT
+    }
+}
 const TABLET_RANGE: i32 = 32767;
 /// VirtualBox USB Tablet (`--mouse usbtablet`).
 const VBOX_USB_TABLET_VID: u16 = 0x80ee;
@@ -1726,6 +1764,11 @@ struct HidDev {
     /// Parsed relative-mouse report layout, when the descriptor gave one.
     /// `None` → parse the boot `[buttons, dx, dy, …]` layout.
     mouse_layout: Option<MouseLayout>,
+    /// Latched when this interface turned out to be speaking boot protocol
+    /// after all (it refused SET_PROTOCOL(Report), or its BIOS left it there):
+    /// its reports are shorter than `mouse_layout` describes, so decode the
+    /// fixed boot layout instead of reading zeros off the end of every report.
+    boot_reports: bool,
     /// Parsed keyboard report layout. [`BOOT_KEY_LAYOUT`] for a boot-protocol
     /// keyboard (no report descriptor is read for those).
     key_layout: Option<KeyLayout>,
@@ -3169,25 +3212,42 @@ impl XhciInner {
             .max(parsed.max_report_bytes)
             .clamp(floor, MAX_HID_TD);
 
-        // Forzar protocolo de boot solo en teclado/ratón boot HID.
-        // VirtualBox's USB Tablet (and QEMU usb-tablet) use bInterfaceProtocol 0
-        // with an *absolute* report. SET_PROTOCOL(boot=0) can switch them to a
-        // 3-byte relative mouse report while we still parse 6–8 byte absolute
-        // packets — the pointer then jumps at random. Leave report protocol as-is.
-        // SET_PROTOCOL(Boot) is defined ONLY for boot-subclass interfaces
-        // (bInterfaceSubClass == 1). A report-protocol interface (subclass 0)
-        // has no boot protocol to switch to, and forcing it there silenced a
-        // real composite keyboard+mouse's mouse interface completely — the
-        // mouse endpoint delivered zero reports (/proc/usbhid reports=0) while
-        // the boot keyboard on the same device worked. Only force boot where
-        // the interface actually advertises it; a report-protocol mouse stays
-        // in its native protocol and is parsed from its report descriptor.
+        // Pick the HID protocol whose report layout we are actually going to
+        // decode. USB HID 1.11 §7.2.6: a boot-subclass interface supports two
+        // protocols and the host "should not make any assumptions about the
+        // device's state" — a BIOS that drove the keyboard or mouse leaves it
+        // in Boot — so say which one we want.
+        //
+        // We used to ask for Boot unconditionally here, and that is what killed
+        // the wheel on every real USB mouse. Almost every mouse advertises the
+        // boot subclass, and the boot mouse report is defined as exactly three
+        // bytes — buttons, X, Y. There is no wheel byte in it. Meanwhile we
+        // read the device's *report*-protocol descriptor, found its Wheel field
+        // somewhere past those three bytes, and then switched the device to a
+        // protocol that never sends them: `read_signed_bits` ran off the end of
+        // every report and returned zero, so the pointer and the buttons worked
+        // and the wheel did nothing, forever. Linux's usbhid drives everything from the
+        // report descriptor and keeps the device in report protocol; so do we.
+        //
+        // Boot is still the right request when the descriptor gave us nothing
+        // to decode with, because then `dispatch_hid` falls back to the fixed
+        // boot layout, which is only true of a device in boot protocol.
+        //
+        // Only boot-subclass interfaces get the request at all. A
+        // report-protocol interface (subclass 0) has no boot protocol to switch
+        // to, and asking anyway silenced a real composite keyboard+mouse's
+        // mouse interface completely (/proc/usbhid reports=0) while the boot
+        // keyboard on the same device kept working. VirtualBox's USB Tablet and
+        // QEMU's usb-tablet are that shape too: absolute devices on
+        // bInterfaceProtocol 0, which SET_PROTOCOL(Boot) can flip into a 3-byte
+        // relative mouse while we keep parsing 6–8 byte absolute packets.
         if (real_proto == HID_PROTO_KEY || real_proto == HID_PROTO_MOUSE)
             && subclass == HID_SUBCLASS_BOOT
         {
+            let want = hid_protocol_request(real_proto, &parsed);
             let _ = self.ep0_control_out0_optional(
                 slot,
-                trb_setup(0x21, HID_REQ_SET_PROTOCOL, 0, iface as u16, 0, 0),
+                trb_setup(0x21, HID_REQ_SET_PROTOCOL, want as u16, iface as u16, 0, 0),
                 true,
             );
         }
@@ -3331,6 +3391,7 @@ impl XhciInner {
             report_desc: report_desc.0,
             report_desc_len: report_desc.1,
             mouse_layout: parsed.mouse,
+            boot_reports: false,
             // A boot-protocol keyboard has no report descriptor to parse (we
             // never read one), and its report IS the boot layout.
             key_layout: parsed.key.or(if real_proto == HID_PROTO_KEY {
@@ -3520,7 +3581,36 @@ impl XhciInner {
                     // report-protocol interface whose descriptor we could not
                     // parse gets nothing dispatched rather than garbage
                     // (its report ID decoded as a stuck button).
-                    let parsed = match h.mouse_layout {
+                    // A device that refused SET_PROTOCOL(Report) keeps
+                    // sending boot reports while we hold its report-protocol
+                    // layout: the wheel byte is off the end (and a layout with
+                    // a Report ID would match nothing at all), so latch onto
+                    // the boot layout instead. At ERROR level because a rig
+                    // booted with `LOG=error` prints nothing else, and this is
+                    // the one line that says why the wheel is dead.
+                    let boot_layout_ok = h.subclass == HID_SUBCLASS_BOOT || h.if_proto != 0;
+                    if !h.boot_reports
+                        && h.protocol == HID_PROTO_MOUSE
+                        && h.mouse_layout.is_some_and(|ml| {
+                            mouse_report_is_truncated(&ml, report_len, boot_layout_ok)
+                        })
+                    {
+                        h.boot_reports = true;
+                        error!(
+                            "[xhci] mouse slot={} {:04x}:{:04x} iface={} is still in BOOT \
+                             protocol: {}-byte reports where its descriptor declares {}. \
+                             Falling back to the boot layout; the wheel does not exist in \
+                             boot protocol, so it will not work on this device.",
+                            h.slot_id,
+                            h.vid,
+                            h.pid,
+                            h.iface,
+                            report_len,
+                            h.mouse_layout.map(|ml| ml.report_bytes).unwrap_or(0),
+                        );
+                    }
+                    let layout = if h.boot_reports { None } else { h.mouse_layout };
+                    let parsed = match layout {
                         Some(ml) => {
                             // A shared interface can multiplex several report
                             // IDs; ignore reports whose ID isn't this mouse's.
@@ -4678,7 +4768,16 @@ impl InputScheme for XhciUsbHid {
                     ml.wheel.map(bf),
                     ml.hwheel.map(bf),
                 );
-            } else if h.protocol == HID_PROTO_MOUSE
+            }
+            if h.boot_reports {
+                let _ = writeln!(
+                    s,
+                    "[usbhid]   BOOT protocol reports (shorter than the descriptor declares): \
+                     decoded with the fixed boot layout, no wheel"
+                );
+            }
+            if h.mouse_layout.is_none()
+                && h.protocol == HID_PROTO_MOUSE
                 && h.subclass != HID_SUBCLASS_BOOT
                 && h.if_proto == 0
             {
@@ -4919,6 +5018,79 @@ mod tests {
         // The consumer report (ID byte + 16 bits) must be counted too, or the
         // interrupt TD is armed too short and the endpoint babbles.
         assert_eq!(info.max_report_bytes, 5);
+    }
+
+    #[test]
+    fn a_mouse_we_parsed_a_layout_for_is_asked_for_report_protocol() {
+        // The boot mouse report is three bytes -- buttons, X, Y -- and has no
+        // wheel byte in it at all. Putting a boot-subclass mouse into boot
+        // protocol while decoding its report-protocol layout is exactly why
+        // the wheel was dead on real hardware: its Wheel field lives at byte 4
+        // of a six-byte report the device then stops sending.
+        let parsed = parse_hid_descriptor(MOUSE_5BTN_12BIT);
+        assert_eq!(parsed.mouse.unwrap().wheel.unwrap().off / 8, 4);
+        assert_eq!(
+            hid_protocol_request(HID_PROTO_MOUSE, &parsed),
+            HID_PROTOCOL_REPORT
+        );
+        let kbd = parse_hid_descriptor(KBD_WITH_CONSUMER);
+        assert_eq!(
+            hid_protocol_request(HID_PROTO_KEY, &kbd),
+            HID_PROTOCOL_REPORT
+        );
+    }
+
+    #[test]
+    fn a_device_whose_descriptor_gave_nothing_is_asked_for_boot_protocol() {
+        // With no layout, `dispatch_hid` decodes the fixed boot layout, which
+        // is only true of a device that really is in boot protocol.
+        let empty = HidDescInfo::default();
+        assert_eq!(
+            hid_protocol_request(HID_PROTO_MOUSE, &empty),
+            HID_PROTOCOL_BOOT
+        );
+        assert_eq!(
+            hid_protocol_request(HID_PROTO_KEY, &empty),
+            HID_PROTOCOL_BOOT
+        );
+        // A parsed mouse layout says nothing about the keyboard role: a combo
+        // receiver's keyboard interface must not be dragged into report
+        // protocol by the mouse's descriptor.
+        let mouse_only = parse_hid_descriptor(MOUSE_5BTN_12BIT);
+        assert_eq!(
+            hid_protocol_request(HID_PROTO_KEY, &mouse_only),
+            HID_PROTOCOL_BOOT
+        );
+    }
+
+    #[test]
+    fn the_wheel_byte_of_a_boot_report_is_simply_not_there() {
+        // The regression in two assertions: the same layout over a full report
+        // and over a boot report.
+        let ml = parse_hid_descriptor(MOUSE_5BTN_12BIT).mouse.unwrap();
+        let wheel = ml.wheel.unwrap();
+        let mut full = [0u8; 6];
+        full[4] = 1;
+        assert_eq!(read_signed_bits(&full, wheel.off, wheel.len), 1);
+        let boot = [0x00u8, 0x00, 0x00];
+        assert_eq!(read_signed_bits(&boot, wheel.off, wheel.len), 0);
+        // ...and that short report is what tells us to stop using this layout.
+        assert!(mouse_report_is_truncated(&ml, boot.len(), true));
+        assert!(!mouse_report_is_truncated(&ml, full.len(), true));
+    }
+
+    #[test]
+    fn a_short_report_is_only_a_boot_report_when_the_interface_has_one_report() {
+        // An interface that multiplexes Report IDs sends reports of several
+        // lengths by design, so a short one there is a different report, not a
+        // device stuck in boot protocol.
+        let ids = parse_hid_descriptor(MOUSE_WITH_REPORT_IDS).mouse.unwrap();
+        assert!(!mouse_report_is_truncated(&ids, 3, true));
+        // And an interface with no boot layout to fall back to (subclass 0,
+        // bInterfaceProtocol 0) must keep decoding its descriptor, whatever
+        // length its reports come in.
+        let plain = parse_hid_descriptor(MOUSE_5BTN_12BIT).mouse.unwrap();
+        assert!(!mouse_report_is_truncated(&plain, 3, false));
     }
 
     #[test]
