@@ -253,12 +253,27 @@ fn panel_fb() -> u32 {
 /// framebuffer (blanked, or a console VT has written over it).
 fn set_panel_fb(fb_id: u32) {
     PANEL_FB.store(fb_id, Ordering::SeqCst);
+    // Every caller passing 0 is something OTHER than a present having written
+    // the panel -- a blank painting it black, a console VT printing over it --
+    // so the band skip's idea of what is up there stops being true at the same
+    // moment, and for the same reason. See [`PRESENT_SKIP`].
+    if fb_id == 0 {
+        panel_bands_reset();
+    }
 }
 
 /// [`PANEL_FB`] cleared for a framebuffer that no longer exists, so a reused id
 /// cannot inherit "the panel already carries this".
 fn forget_panel_fb(fb_id: u32) {
-    let _ = PANEL_FB.compare_exchange(fb_id, 0, Ordering::SeqCst, Ordering::SeqCst);
+    if PANEL_FB
+        .compare_exchange(fb_id, 0, Ordering::SeqCst, Ordering::SeqCst)
+        .is_ok()
+    {
+        // The framebuffer whose pixels the band hashes describe is gone, and its
+        // id can come back on a different buffer. Same rule as [`PANEL_FB`]'s
+        // own: a retired id inherits nothing.
+        panel_bands_reset();
+    }
 }
 
 /// The region a present may actually restrict itself to: the damage box when the
@@ -636,6 +651,356 @@ pub fn set_present_repair_enabled(on: bool) {
 /// Whether the present repair pass is armed for this boot.
 pub fn present_repair_enabled() -> bool {
     PRESENT_REPAIR.load(Ordering::Relaxed)
+}
+
+/// Whether a present may leave a band of rows alone because the panel already
+/// holds exactly those pixels (`drm.present_skip` on the cmdline). OFF by
+/// default.
+///
+/// The cost this answers is measured: on real NVIDIA hardware CPU stores into
+/// the console GPU's BAR1 serve at about 42 MB/s even through a verified
+/// write-combining mapping, so a 1920x1080 frame costs ~99 ms and the desktop
+/// runs at 7-11 FPS -- and labwc never sends a damage box (1600 presents, not
+/// one `DIRTYFB`), so every frame pays for the whole screen. Under QEMU the same
+/// full frame costs 2.6-15 ms.
+///
+/// What almost never changes between two of those frames is most of the screen.
+/// A compositor re-renders its whole scene into an alternating buffer, but the
+/// PIXELS are the previous frame's nearly everywhere: a blinking terminal cursor
+/// or a clock changes a few rows. So the present hashes each band of
+/// [`SKIP_BAND_ROWS`] rows, compares it with the hash of what it last put on the
+/// panel for that band, and copies only the bands that differ. The read is from
+/// cached RAM, which the same measurement puts orders of magnitude above the
+/// write it avoids.
+///
+/// Correctness rests on one invariant: a band's stored hash means "the panel
+/// holds these pixels in these rows". Everything that writes the panel WITHOUT
+/// going through this path has to forget what it wrote over --
+/// [`panel_bands_reset`] for a blank, a console VT or a present that took
+/// another route, and [`panel_bands_dirty_rows`] for the cursor, which is
+/// composited on top of the frame and would otherwise leave its previous
+/// position behind in a band nobody re-copies.
+static PRESENT_SKIP: AtomicBool = AtomicBool::new(false);
+
+/// Turn the unchanged-band skip on (or back off) for this boot.
+pub fn set_present_skip_enabled(on: bool) {
+    PRESENT_SKIP.store(on, Ordering::Relaxed);
+    // The state describes what the panel holds, and nothing was tracking it
+    // while the switch was off, so an arming boot starts from "nothing known".
+    panel_bands_reset();
+}
+
+/// Whether the unchanged-band skip is armed for this boot.
+pub fn present_skip_enabled() -> bool {
+    PRESENT_SKIP.load(Ordering::Relaxed)
+}
+
+/// Rows in one band of the skip decision.
+///
+/// 16 rows is ~128 KiB at 1920 pixels: small enough that re-reading a band after
+/// deciding to copy it is served from cache rather than from RAM, and small
+/// enough that the cursor -- which dirties every band it covers -- costs 16 rows
+/// instead of the 128 a blit band would. Not smaller, because each run of dirty
+/// bands becomes one `blit_from`, and a short run wastes the non-temporal store
+/// path's stride.
+const SKIP_BAND_ROWS: u32 = 16;
+
+/// Bands the panel state can describe: 4352 rows, which covers every mode this
+/// kernel drives. A frame taller than that simply does not take the skip.
+const MAX_SKIP_BANDS: usize = 272;
+
+/// What the panel holds, one band hash per band of [`SKIP_BAND_ROWS`] rows,
+/// encoded by [`known_hash`] so that `0` means "unknown" and nothing else does.
+///
+/// Unknown is the state after a reset, and after anything that is not this path
+/// wrote over the band. It has to be a value no real hash can take, or a band
+/// whose pixels happened to hash to the sentinel would be skipped on the very
+/// first present after a reset -- when the panel does NOT hold them.
+///
+/// Lock-free on purpose. The alternative was a `Mutex` held across the hashing
+/// of a whole frame -- milliseconds -- which any CPU invalidating a cursor band
+/// would spin on.
+static PANEL_BAND_HASH: [AtomicU64; MAX_SKIP_BANDS] = [const { AtomicU64::new(0) }; MAX_SKIP_BANDS];
+
+/// The geometry the hashes describe, packed as four `u16`s (`x`, `y`, `w`, `h`),
+/// or `0` for "none". A present whose geometry differs starts over: the bands
+/// would otherwise be compared against hashes of different pixels.
+static PANEL_BAND_GEOM: AtomicU64 = AtomicU64::new(0);
+
+/// The source stride the hashes were taken at, or `0` for none. Separate from
+/// the geometry because a stride is not bounded by the panel's 16 bits.
+static PANEL_BAND_STRIDE: AtomicU64 = AtomicU64::new(0);
+
+/// A band hash as it is stored: the top bit set, so no stored value is ever the
+/// `0` that [`PANEL_BAND_HASH`] uses for "unknown".
+///
+/// The cost is one bit of the hash -- two bands whose hashes differ only in bit
+/// 63 compare equal, which doubles a collision probability of 2^-64 -- and the
+/// gain is that "nothing is known about this band" is not a number the hash can
+/// produce. A sentinel that a real hash can hit is a stale band on screen.
+fn known_hash(h: u64) -> u64 {
+    h | 1 << 63
+}
+
+/// `(x, y, w, h)` packed into one `u64`, or `None` when any of them does not fit
+/// in 16 bits -- in which case the skip is simply not taken.
+///
+/// `w` and `h` are never 0 on a present that reaches here, so a packed value is
+/// never 0 and the `0` sentinel of [`PANEL_BAND_GEOM`] cannot collide with a
+/// real geometry.
+fn pack_panel_geom(x: u32, y: u32, w: u32, h: u32) -> Option<u64> {
+    let (x, y, w, h) = (
+        u16::try_from(x).ok()?,
+        u16::try_from(y).ok()?,
+        u16::try_from(w).ok()?,
+        u16::try_from(h).ok()?,
+    );
+    if w == 0 || h == 0 {
+        return None;
+    }
+    Some((x as u64) << 48 | (y as u64) << 32 | (w as u64) << 16 | h as u64)
+}
+
+/// Forget everything about what the panel holds.
+fn panel_bands_reset() {
+    PANEL_BAND_GEOM.store(0, Ordering::Relaxed);
+    PANEL_BAND_STRIDE.store(0, Ordering::Relaxed);
+    for h in PANEL_BAND_HASH.iter() {
+        h.store(0, Ordering::Relaxed);
+    }
+}
+
+/// The half-open range of bands covering panel rows `y .. y + h`, clamped to the
+/// bands that exist. `None` when the range covers no row, or lies past them all.
+fn bands_covering_rows(y: u32, h: u32) -> Option<(usize, usize)> {
+    if h == 0 {
+        return None;
+    }
+    let first = (y / SKIP_BAND_ROWS) as usize;
+    if first >= MAX_SKIP_BANDS {
+        return None;
+    }
+    let last_row = y.saturating_add(h - 1);
+    let last = ((last_row / SKIP_BAND_ROWS) as usize).min(MAX_SKIP_BANDS - 1);
+    Some((first, last + 1))
+}
+
+/// Forget the bands covering panel rows `y .. y + h`, so the next present copies
+/// them whatever their pixels hash to.
+///
+/// This is what the cursor calls. A cursor is composited on top of the frame
+/// after the blit, so the panel's pixels in those rows are NOT the ones the
+/// present copied, and a band left claiming otherwise keeps the pointer's last
+/// position on screen until something in those rows happens to change.
+fn panel_bands_dirty_rows(y: u32, h: u32) {
+    if let Some((first, end)) = bands_covering_rows(y, h) {
+        for band in PANEL_BAND_HASH.iter().take(end).skip(first) {
+            band.store(0, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Bands the last present left alone, so a test can assert that a settled frame
+/// costs no copy at all and a changed band costs exactly one.
+#[cfg(test)]
+static SKIP_BANDS_SKIPPED: AtomicUsize = AtomicUsize::new(0);
+
+/// Presents the band skip has driven, so a test can assert which presents take
+/// it at all -- a damage box must not, and the visible pixels alone cannot say
+/// so, because a box copied through the skip looks the same on the panel.
+#[cfg(test)]
+static SKIP_PRESENTS: AtomicUsize = AtomicUsize::new(0);
+
+/// Presents the band skip has driven since the last reset.
+#[cfg(test)]
+pub(crate) fn skip_presents_for_test() -> usize {
+    SKIP_PRESENTS.load(Ordering::Relaxed)
+}
+
+/// Bands the most recent present skipped.
+#[cfg(test)]
+pub(crate) fn skipped_bands_for_test() -> usize {
+    SKIP_BANDS_SKIPPED.load(Ordering::Relaxed)
+}
+
+/// Rows of band `b` within a window `height` rows tall: `(row, rows)`, or `None`
+/// when the band lies past the window.
+fn skip_band_span(b: usize, height: u32) -> Option<(u32, u32)> {
+    let row = u32::try_from(b).ok()?.checked_mul(SKIP_BAND_ROWS)?;
+    if row >= height {
+        return None;
+    }
+    Some((row, SKIP_BAND_ROWS.min(height - row)))
+}
+
+/// FNV-1a over every pixel of `rows` rows starting at `row`, `w` wide, taken
+/// from a buffer whose rows are `stride` pixels apart.
+///
+/// Every pixel, and every row: a sampled hash would answer "unchanged" for a
+/// band whose unsampled rows moved, and this answer is what decides whether the
+/// panel keeps the pixels it has. `None` when the band does not lie wholly
+/// inside the buffer, which reads as "copy it".
+fn skip_band_hash(pixels: &[u32], stride: usize, row: u32, rows: u32, w: u32) -> Option<u64> {
+    if stride == 0 || w == 0 || rows == 0 || (w as usize) > stride {
+        return None;
+    }
+    let mut acc = PROBE_FNV_BASIS;
+    for r in 0..rows as usize {
+        let start = (row as usize).checked_add(r)?.checked_mul(stride)?;
+        let end = start.checked_add(w as usize)?;
+        let line = pixels.get(start..end)?;
+        for px in line {
+            acc ^= *px as u64;
+            acc = acc.wrapping_mul(PROBE_FNV_PRIME);
+        }
+    }
+    Some(acc)
+}
+
+/// Blit only the bands whose pixels are not already on the panel, and return
+/// `(bands, skipped)`.
+///
+/// `pixels` starts at the window's top-left, exactly as [`blit_chunked`] takes
+/// it. Runs of adjacent dirty bands go out in ONE `blit_from`, because a run of
+/// rows is what the non-temporal store path is fast at.
+///
+/// Falls back to copying everything -- and forgetting the state -- for a window
+/// this cannot describe: too tall for [`MAX_SKIP_BANDS`], or a geometry that does
+/// not pack. "Copy everything" is always correct; skipping is the part that has
+/// to be earned.
+fn blit_chunked_skipping(
+    display: &Arc<dyn DisplayScheme>,
+    dst_x: u32,
+    dst_y: u32,
+    pixels: &[u32],
+    src_stride: usize,
+    width: u32,
+    height: u32,
+) -> (usize, usize) {
+    let bands = match skip_band_count(height) {
+        Some(n) => n,
+        None => {
+            panel_bands_reset();
+            blit_chunked(display, dst_x, dst_y, pixels, src_stride, width, height);
+            return (0, 0);
+        }
+    };
+    let geom = match pack_panel_geom(dst_x, dst_y, width, height) {
+        Some(g) => g,
+        None => {
+            panel_bands_reset();
+            blit_chunked(display, dst_x, dst_y, pixels, src_stride, width, height);
+            return (0, 0);
+        }
+    };
+    let stride = src_stride as u64;
+    // A geometry or stride that is not the one the hashes were taken at makes
+    // every comparison meaningless, so it starts over rather than reading the
+    // old numbers as if they described this window.
+    // Both swaps, every time, and NOT folded into one `||`: the short-circuit
+    // skipped the second store whenever the first answered "changed", so the
+    // stride stayed 0, the NEXT present saw it change, and the state was thrown
+    // away on every single frame -- a skip that never skipped. Its test caught it.
+    //
+    // Neither key can be killed by a test in this tree, and both stay. A window's
+    // own width and row count are already inside the hash it produces, so a
+    // window that changes shape almost always produces different hashes and is
+    // copied anyway -- which is why no test can tell these two lines from
+    // `false`. What they are for is the case the hash cannot see: a MODESET, which
+    // leaves the panel's geometry -- and its contents -- something else entirely
+    // under the same framebuffer, and which `kms_emu` cannot stage without
+    // dropping the screen (whose `Drop` resets this state for its own reasons).
+    // And a hash collision between two different windows, which is the same
+    // wager as [`known_hash`]'s: cheap here, a stale band on screen if lost.
+    let geom_changed = PANEL_BAND_GEOM.swap(geom, Ordering::Relaxed) != geom;
+    let stride_changed = PANEL_BAND_STRIDE.swap(stride, Ordering::Relaxed) != stride;
+    if geom_changed || stride_changed {
+        for h in PANEL_BAND_HASH.iter() {
+            h.store(0, Ordering::Relaxed);
+        }
+    }
+    let window = SkipWindow {
+        dst_x,
+        dst_y,
+        pixels,
+        src_stride,
+        width,
+    };
+    let mut skipped = 0usize;
+    // The open run of dirty bands, as `(first row, rows)`.
+    let mut run: Option<(u32, u32)> = None;
+    for (b, band) in PANEL_BAND_HASH.iter().enumerate().take(bands) {
+        let Some((row, rows)) = skip_band_span(b, height) else {
+            break;
+        };
+        let fresh = skip_band_hash(pixels, src_stride, row, rows, width);
+        let known = band.load(Ordering::Relaxed);
+        // A band with no hash at all (`None`) is copied. No test in this tree can
+        // reach that -- a present's window always lies inside its own framebuffer
+        // -- and the branch stays because the alternative reading of "I could not
+        // look" is "nothing changed", which puts stale pixels on the panel.
+        let same = matches!(fresh, Some(f) if known_hash(f) == known);
+        if same {
+            skipped += 1;
+            if let Some((start, len)) = run.take() {
+                blit_run(display, &window, start, len);
+            }
+            continue;
+        }
+        // Stored BEFORE the copy, because what the panel is about to hold is what
+        // was read here. A band whose hash could not be taken stays unknown.
+        band.store(fresh.map_or(0, known_hash), Ordering::Relaxed);
+        run = Some(match run {
+            Some((start, len)) => (start, len.saturating_add(rows)),
+            None => (row, rows),
+        });
+    }
+    if let Some((start, len)) = run.take() {
+        blit_run(display, &window, start, len);
+    }
+    #[cfg(test)]
+    {
+        SKIP_BANDS_SKIPPED.store(skipped, Ordering::Relaxed);
+        SKIP_PRESENTS.fetch_add(1, Ordering::Relaxed);
+    }
+    (bands, skipped)
+}
+
+/// Everything a run of rows needs except which rows: where the window sits on
+/// the panel and where its pixels come from.
+struct SkipWindow<'a> {
+    dst_x: u32,
+    dst_y: u32,
+    pixels: &'a [u32],
+    src_stride: usize,
+    width: u32,
+}
+
+/// One run of rows of the window, from `pixels` at the window's own `start` row.
+fn blit_run(display: &Arc<dyn DisplayScheme>, w: &SkipWindow<'_>, start: u32, rows: u32) {
+    let off = (start as usize).saturating_mul(w.src_stride);
+    if off >= w.pixels.len() {
+        return;
+    }
+    blit_chunked(
+        display,
+        w.dst_x,
+        w.dst_y.saturating_add(start),
+        &w.pixels[off..],
+        w.src_stride,
+        w.width,
+        rows,
+    );
+}
+
+/// Bands a window `height` rows tall needs, or `None` when it needs more than
+/// [`MAX_SKIP_BANDS`].
+fn skip_band_count(height: u32) -> Option<usize> {
+    if height == 0 {
+        return None;
+    }
+    let n = (height as usize).div_ceil(SKIP_BAND_ROWS as usize);
+    (n <= MAX_SKIP_BANDS).then_some(n)
 }
 
 /// How many times one present may re-copy the bands that moved under it.
@@ -3001,6 +3366,8 @@ pub fn scanout_region_checked(
     // look stale, restore a sync here — the present klog's `sync Xus` is the
     // tell (should be ~0 on CE-direct).
     let mut blitted_by_ce = false;
+    // `(bands, skipped)` when the unchanged-band skip drove this present's copy.
+    let mut skip_report: Option<(usize, usize)> = None;
     if CE_PRESENT_ENABLED.load(Ordering::Relaxed) {
         // Byte offsets of the damaged region in each buffer. Both are zero for
         // a full-frame present, which is exactly the old behaviour.
@@ -3083,6 +3450,14 @@ pub fn scanout_region_checked(
             );
         }
     }
+    if blitted_by_ce {
+        // A copy engine wrote the panel, not the band skip, so what the skip
+        // remembers about those rows is no longer what the panel holds. No test
+        // covers this one: taking the CE path needs a state-loaded GPU, so it is
+        // the same untestable half as the fence wait's -- and the rule it follows
+        // is the one every other writer of the panel follows.
+        panel_bands_reset();
+    }
     if !blitted_by_ce {
         // CPU reads the GEM through the WB physmap alias. Without FromDevice,
         // stale lines from the previous frame stay resident and the screen
@@ -3114,16 +3489,37 @@ pub fn scanout_region_checked(
         };
         // Banded blit with IRQs briefly re-enabled between bands — see
         // [`blit_chunked`]. Honours a DIRTYFB damage rect when present.
+        //
+        // Armed by `drm.present_skip`, and only for a whole frame: the bands the
+        // panel already holds are left alone. A damage box is already the
+        // client's own answer to the same question, and mixing the two would have
+        // the skip's state describe rows a box never touched. See
+        // [`PRESENT_SKIP`].
         if src_off < pixels.len() {
-            blit_chunked(
-                &display,
-                blit_x,
-                blit_y,
-                &pixels[src_off..],
-                src_stride,
-                blit_w,
-                blit_h,
-            );
+            if present_skip_enabled() && rect.is_none() {
+                skip_report = Some(blit_chunked_skipping(
+                    &display,
+                    blit_x,
+                    blit_y,
+                    &pixels[src_off..],
+                    src_stride,
+                    blit_w,
+                    blit_h,
+                ));
+            } else {
+                // Anything the skip did not drive wrote rows it does not know
+                // about, so what it remembers about the panel stops being true.
+                panel_bands_reset();
+                blit_chunked(
+                    &display,
+                    blit_x,
+                    blit_y,
+                    &pixels[src_off..],
+                    src_stride,
+                    blit_w,
+                    blit_h,
+                );
+            }
         }
         if let Some(before) = probe_before {
             // Invalidate before reading again, or the second read is served
@@ -3357,6 +3753,15 @@ pub fn scanout_region_checked(
             &*display, pixels, src_stride, fb_width, fb_height, cx, cy, cw, ch, cx, cy, cw, ch,
             &bmp,
         );
+        // The pointer is now ON the panel in those rows, which is not what the
+        // frame's pixels say, so the bands it covers must be copied again next
+        // time rather than recognised as already there. Without this the
+        // pointer's previous position stays on screen until something else
+        // happens to change those rows -- exactly the stale-pixel defect the
+        // skip exists to avoid causing. See [`panel_bands_dirty_rows`].
+        if skip_report.is_some() {
+            panel_bands_dirty_rows(cy.max(0) as u32, ch);
+        }
     }
     let t_cursor = kernel_hal::timer::timer_now();
     // Both kinds of present, not just the full frames. This was behind
@@ -3385,7 +3790,7 @@ pub fn scanout_region_checked(
             let read = cost_scaled(blit_read_bytes(blit_w, blit_h));
             kernel_hal::klog_info!(
                 "[drm] present {} #{}: sync {}us ({}{} flushed for {}{} read) + {} blit \
-                 {}us + cursor {}us ({}x{} at +{}+{})",
+                 {}us + cursor {}us ({}x{} at +{}+{}){}",
                 kind,
                 n,
                 sync_elapsed.as_micros(),
@@ -3402,7 +3807,20 @@ pub fn scanout_region_checked(
                 blit_w,
                 blit_h,
                 blit_x,
-                blit_y
+                blit_y,
+                // Only when the skip drove the copy, and it says what it bought:
+                // the bands it did NOT have to write are the whole point, and a
+                // boot where that number stays 0 is a boot where the desktop
+                // changes everywhere every frame.
+                match skip_report {
+                    Some((bands, skipped)) => alloc::format!(
+                        " -- skipped {} of {} {}-row bands",
+                        skipped,
+                        bands,
+                        SKIP_BAND_ROWS
+                    ),
+                    None => alloc::string::String::new(),
+                }
             );
         }
     }
@@ -5821,6 +6239,13 @@ pub(crate) fn reset_output_state_for_test() {
     // Its report budget goes back too, or the last test to run finds it spent.
     set_present_probe_enabled(false);
     set_present_repair_enabled(false);
+    // `set_present_skip_enabled` resets the band state itself, which is what a
+    // fresh boot looks like: nothing known about what the panel holds. A leaked
+    // hash would make a later test's present skip a band for a reason that has
+    // nothing to do with what it is testing.
+    set_present_skip_enabled(false);
+    SKIP_BANDS_SKIPPED.store(0, Ordering::Relaxed);
+    SKIP_PRESENTS.store(0, Ordering::Relaxed);
     REPAIR_ROUNDS_RUN.store(0, Ordering::Relaxed);
     PROBE_REPORTS.store(0, Ordering::Relaxed);
     // A leaked `PANEL_FB` makes a later test's damage box either honoured or
@@ -8541,6 +8966,303 @@ mod scanout_pause_tests {
 /// window, every frame reports and the log says nothing. Both directions are
 /// pinned here, as is the blind spot it does have -- the rows it steps over --
 /// because that one is a deliberate trade and not an accident.
+#[cfg(test)]
+mod present_skip_tests {
+    //! The band arithmetic and the hash behind `drm.present_skip`.
+    //!
+    //! Everything here decides whether a band of the panel keeps the pixels it
+    //! has. Each one of these functions can be wrong in a way that shows up as
+    //! stale pixels on screen and in nothing else, which is the defect the whole
+    //! present path has been chasing -- so they are pinned here, away from a
+    //! display, and the end-to-end behaviour is in `drm_scheme`'s
+    //! `kms_scanout_tests`.
+
+    use super::*;
+
+    // --- how many bands, and which rows are in them ---
+
+    /// A window of no rows has no bands, rather than one empty one: a band that
+    /// describes no pixels would compare two hashes of nothing and answer
+    /// "unchanged" for rows that were never looked at.
+    #[test]
+    fn a_window_of_no_rows_has_no_bands() {
+        assert_eq!(skip_band_count(0), None);
+    }
+
+    /// Anything up to a full band is one band, and one row past it is two: the
+    /// tail band is short, never dropped. A dropped tail is a strip at the
+    /// bottom of the screen that stops being repainted.
+    #[test]
+    fn the_last_rows_get_their_own_short_band() {
+        assert_eq!(skip_band_count(1), Some(1));
+        assert_eq!(skip_band_count(SKIP_BAND_ROWS), Some(1));
+        assert_eq!(skip_band_count(SKIP_BAND_ROWS + 1), Some(2));
+        assert_eq!(skip_band_count(1080), Some(68));
+    }
+
+    /// And the tail band reports its real height, so the copy that follows it
+    /// does not run past the window.
+    #[test]
+    fn the_tail_band_is_as_short_as_it_really_is() {
+        assert_eq!(skip_band_span(0, 1080), Some((0, SKIP_BAND_ROWS)));
+        assert_eq!(skip_band_span(67, 1080), Some((1072, 8)));
+        assert_eq!(skip_band_span(68, 1080), None);
+        assert_eq!(skip_band_span(0, 3), Some((0, 3)));
+    }
+
+    /// A window taller than the state can describe does not take the skip at
+    /// all. Clamping instead would leave the rows past the last band never
+    /// compared and never copied.
+    #[test]
+    fn a_window_taller_than_the_state_declines_the_skip() {
+        let tallest = SKIP_BAND_ROWS * MAX_SKIP_BANDS as u32;
+        assert_eq!(skip_band_count(tallest), Some(MAX_SKIP_BANDS));
+        assert_eq!(skip_band_count(tallest + 1), None);
+    }
+
+    // --- which bands a write on top of the frame dirties ---
+
+    /// One row dirties the band that holds it, and a row range that straddles a
+    /// boundary dirties both. The cursor is the caller, and a boundary it
+    /// straddles with half its height is the ordinary case.
+    #[test]
+    fn a_row_range_dirties_every_band_it_touches() {
+        assert_eq!(bands_covering_rows(0, 1), Some((0, 1)));
+        assert_eq!(
+            bands_covering_rows(SKIP_BAND_ROWS - 1, 2),
+            Some((0, 2)),
+            "a range crossing the boundary owns both bands"
+        );
+        assert_eq!(
+            bands_covering_rows(SKIP_BAND_ROWS, SKIP_BAND_ROWS),
+            Some((1, 2))
+        );
+        assert_eq!(bands_covering_rows(0, SKIP_BAND_ROWS + 1), Some((0, 2)));
+    }
+
+    /// A write of no rows dirties nothing, and one entirely past the bands
+    /// dirties nothing either -- but a range that merely ENDS past them clamps
+    /// instead of vanishing, because its first rows are on the panel.
+    #[test]
+    fn a_range_outside_the_bands_dirties_nothing_but_one_that_leaves_them_clamps() {
+        assert_eq!(bands_covering_rows(0, 0), None);
+        assert_eq!(
+            bands_covering_rows(SKIP_BAND_ROWS * MAX_SKIP_BANDS as u32, 4),
+            None
+        );
+        assert_eq!(
+            bands_covering_rows(0, u32::MAX),
+            Some((0, MAX_SKIP_BANDS)),
+            "a range past the end still dirties every band it does cover"
+        );
+    }
+
+    // --- the geometry key ---
+
+    /// Two different windows pack to two different keys, or a present would read
+    /// hashes taken from somewhere else on the screen as its own.
+    #[test]
+    fn every_window_packs_to_its_own_key() {
+        let a = pack_panel_geom(0, 0, 1920, 1080).expect("packs");
+        for (x, y, w, h) in [
+            (1, 0, 1920, 1080),
+            (0, 1, 1920, 1080),
+            (0, 0, 1921, 1080),
+            (0, 0, 1920, 1081),
+        ] {
+            assert_ne!(
+                a,
+                pack_panel_geom(x, y, w, h).expect("packs"),
+                "{:?}",
+                (x, y, w, h)
+            );
+        }
+    }
+
+    /// And a packed key is never the `0` that means "nothing known", so a real
+    /// geometry cannot be mistaken for the absence of one.
+    #[test]
+    fn a_real_geometry_never_packs_to_the_empty_key() {
+        for (x, y, w, h) in [(0, 0, 1, 1), (0, 0, 1920, 1080), (7, 9, 64, 64)] {
+            assert_ne!(pack_panel_geom(x, y, w, h), Some(0));
+        }
+    }
+
+    /// A window with no width or no height, and one that does not fit the key,
+    /// decline instead of aliasing onto some other window's hashes.
+    #[test]
+    fn a_window_that_does_not_fit_the_key_declines() {
+        assert_eq!(pack_panel_geom(0, 0, 0, 1080), None);
+        assert_eq!(pack_panel_geom(0, 0, 1920, 0), None);
+        assert_eq!(pack_panel_geom(0, 0, 70_000, 1080), None);
+        assert_eq!(pack_panel_geom(70_000, 0, 1920, 1080), None);
+    }
+
+    // --- the hash ---
+
+    /// The same pixels hash the same, and one pixel of one row different hashes
+    /// differently. That second half is the whole claim: a band that changed must
+    /// not be recognised as already on the panel.
+    #[test]
+    fn one_changed_pixel_changes_the_bands_hash() {
+        let stride = 8usize;
+        let mut px: Vec<u32> = (0..stride * 40).map(|n| n as u32).collect();
+        let before = skip_band_hash(&px, stride, 0, SKIP_BAND_ROWS, 8).expect("hashes");
+        assert_eq!(
+            skip_band_hash(&px, stride, 0, SKIP_BAND_ROWS, 8),
+            Some(before),
+            "the same pixels twice"
+        );
+        px[stride * 9 + 3] ^= 1;
+        assert_ne!(
+            skip_band_hash(&px, stride, 0, SKIP_BAND_ROWS, 8),
+            Some(before)
+        );
+    }
+
+    /// Two pixels swapped between rows hash differently, so the hash is of the
+    /// band's LAYOUT and not of its multiset of colours: a window dragged by one
+    /// row is not "the same pixels".
+    #[test]
+    fn moving_a_pixel_changes_the_hash() {
+        let stride = 8usize;
+        let mut px: Vec<u32> = (0..stride * 20).map(|n| 0x1000 + n as u32).collect();
+        let before = skip_band_hash(&px, stride, 0, SKIP_BAND_ROWS, 8).expect("hashes");
+        px.swap(0, stride);
+        assert_ne!(
+            skip_band_hash(&px, stride, 0, SKIP_BAND_ROWS, 8),
+            Some(before)
+        );
+    }
+
+    /// Only the window's own columns count. The bytes past `w` in a row are the
+    /// scanline's padding, and a hash that read them would call a band changed
+    /// because of pixels nobody displays.
+    #[test]
+    fn the_padding_after_the_window_is_not_part_of_the_band() {
+        let stride = 12usize;
+        let mut px: Vec<u32> = (0..stride * 20).map(|n| 0x2000 + n as u32).collect();
+        let before = skip_band_hash(&px, stride, 0, SKIP_BAND_ROWS, 8).expect("hashes");
+        for r in 0..SKIP_BAND_ROWS as usize {
+            px[r * stride + 9] ^= 0xFFFF;
+        }
+        assert_eq!(
+            skip_band_hash(&px, stride, 0, SKIP_BAND_ROWS, 8),
+            Some(before)
+        );
+    }
+
+    /// A band that does not lie wholly inside the buffer has no answer, and the
+    /// caller reads `None` as "copy it". Hashing a short last row would compare
+    /// against a hash of different rows and could answer "unchanged".
+    #[test]
+    fn a_band_that_runs_past_the_buffer_has_no_hash() {
+        let stride = 8usize;
+        let px: Vec<u32> = (0..stride * 8).map(|n| n as u32).collect();
+        assert_eq!(skip_band_hash(&px, stride, 0, SKIP_BAND_ROWS, 8), None);
+        assert!(skip_band_hash(&px, stride, 0, 8, 8).is_some());
+        assert_eq!(skip_band_hash(&px, stride, 4, 8, 8), None);
+    }
+
+    /// A window wider than its own stride is not a window, and a zero stride,
+    /// width or height describes no pixels: all of them decline rather than hash
+    /// whatever the arithmetic lands on.
+    #[test]
+    fn a_window_that_cannot_be_read_has_no_hash() {
+        let px: Vec<u32> = (0..64).collect();
+        assert_eq!(skip_band_hash(&px, 8, 0, 4, 9), None);
+        assert_eq!(skip_band_hash(&px, 0, 0, 4, 4), None);
+        assert_eq!(skip_band_hash(&px, 8, 0, 0, 4), None);
+        assert_eq!(skip_band_hash(&px, 8, 0, 4, 0), None);
+    }
+
+    // --- the stored form of a hash ---
+
+    /// A stored hash is never the `0` that means "nothing is known about this
+    /// band". If it could be, a band whose pixels happened to hash to the
+    /// sentinel would be skipped on the first present after a reset -- when the
+    /// panel does not hold them yet -- and that is a stale band on screen.
+    #[test]
+    fn a_stored_hash_is_never_the_unknown_sentinel() {
+        for h in [0u64, 1, u64::MAX, PROBE_FNV_BASIS, 1 << 63] {
+            assert_ne!(known_hash(h), 0, "hash {:#x}", h);
+        }
+    }
+
+    /// And two different hashes still store differently, so the encoding costs
+    /// one bit and not the comparison: `known_hash` must not fold hashes together
+    /// beyond that bit.
+    #[test]
+    fn the_stored_form_keeps_different_hashes_apart() {
+        assert_ne!(known_hash(1), known_hash(2));
+        assert_ne!(known_hash(PROBE_FNV_BASIS), known_hash(PROBE_FNV_PRIME));
+        // The one pair it does fold: bit 63 is the sentinel's, and the doc says so.
+        assert_eq!(known_hash(0), known_hash(1 << 63));
+    }
+
+    // --- the state ---
+
+    /// A reset forgets every band and the geometry, which is what a boot, a
+    /// blank and a console VT all leave behind.
+    #[test]
+    fn a_reset_forgets_the_geometry_and_every_band() {
+        let _g = test_globals::lock();
+        PANEL_BAND_GEOM.store(7, Ordering::Relaxed);
+        PANEL_BAND_STRIDE.store(1920, Ordering::Relaxed);
+        for (i, h) in PANEL_BAND_HASH.iter().enumerate() {
+            h.store(i as u64 + 1, Ordering::Relaxed);
+        }
+        panel_bands_reset();
+        assert_eq!(PANEL_BAND_GEOM.load(Ordering::Relaxed), 0);
+        assert_eq!(PANEL_BAND_STRIDE.load(Ordering::Relaxed), 0);
+        assert!(PANEL_BAND_HASH
+            .iter()
+            .all(|h| h.load(Ordering::Relaxed) == 0));
+    }
+
+    /// Dirtying a row range clears exactly the bands it covers and leaves the
+    /// rest, which is what makes the cursor cost 16 rows instead of the frame.
+    #[test]
+    fn dirtying_rows_leaves_the_bands_it_does_not_cover() {
+        let _g = test_globals::lock();
+        for h in PANEL_BAND_HASH.iter() {
+            h.store(0xABCD, Ordering::Relaxed);
+        }
+        panel_bands_dirty_rows(SKIP_BAND_ROWS, 1);
+        assert_eq!(PANEL_BAND_HASH[0].load(Ordering::Relaxed), 0xABCD);
+        assert_eq!(PANEL_BAND_HASH[1].load(Ordering::Relaxed), 0);
+        assert_eq!(PANEL_BAND_HASH[2].load(Ordering::Relaxed), 0xABCD);
+        panel_bands_reset();
+    }
+
+    /// The skip is off unless the cmdline arms it, like every other diagnostic
+    /// and mitigation on this path: a boot that says nothing gets exactly the
+    /// present it got before.
+    #[test]
+    fn the_skip_is_off_unless_the_cmdline_arms_it() {
+        let _g = test_globals::lock();
+        reset_output_state_for_test();
+        assert!(!present_skip_enabled());
+        set_present_skip_enabled(true);
+        assert!(present_skip_enabled());
+        reset_output_state_for_test();
+        assert!(!present_skip_enabled());
+    }
+
+    /// Arming it forgets whatever was remembered: nothing was maintaining the
+    /// hashes while it was off, so the first present after arming must copy.
+    #[test]
+    fn arming_the_skip_starts_from_nothing_known() {
+        let _g = test_globals::lock();
+        PANEL_BAND_HASH[3].store(0x1234, Ordering::Relaxed);
+        PANEL_BAND_GEOM.store(99, Ordering::Relaxed);
+        set_present_skip_enabled(true);
+        assert_eq!(PANEL_BAND_HASH[3].load(Ordering::Relaxed), 0);
+        assert_eq!(PANEL_BAND_GEOM.load(Ordering::Relaxed), 0);
+        reset_output_state_for_test();
+    }
+}
+
 #[cfg(test)]
 mod present_probe_tests {
     extern crate std;

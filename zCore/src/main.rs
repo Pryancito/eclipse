@@ -608,6 +608,20 @@ fn primary_main(config: kernel_hal::KernelConfig) {
             // en vez de dejar la baldosa rancia en el panel. No hace el frame
             // entero -- eso solo lo arregla la sincronizacion de arriba -- pero
             // quita la basura que se queda. Acotado a dos rondas.
+            // Y esto es lo otro que se puede hacer desde aqui, pero por el
+            // rendimiento y no por la basura: el compositor nunca manda caja de
+            // dano, asi que cada frame paga la pantalla entera --- 8,1 MB, y en
+            // las RTX la BAR1 sirve unos 42 MB/s, o sea ~99 ms por frame. Lo que
+            // casi nunca cambia entre dos frames es la mayor parte de la
+            // pantalla, asi que el present compara cada banda de 16 filas con lo
+            // que ya puso en el panel y solo copia las que se movieron.
+            if kernel_hal::cmdline::flag(&options.cmdline, "drm.present_skip") {
+                linux_object::fs::devfs::drm::set_present_skip_enabled(true);
+                klog_info!(
+                    "Eclipse: drm.present_skip ON -- el present no vuelve a copiar \
+                     las bandas de 16 filas que el panel ya tiene"
+                );
+            }
             if kernel_hal::cmdline::flag(&options.cmdline, "drm.present_repair") {
                 linux_object::fs::devfs::drm::set_present_repair_enabled(true);
                 klog_info!(
