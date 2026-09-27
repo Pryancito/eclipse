@@ -381,12 +381,22 @@ impl INode for EventDev {
                 // event.  By registering first, any event that arrives during
                 // or after subscribe() will call the waker and reschedule the
                 // task.
+                // `once: false`, not `true`: a one-shot handler is taken out
+                // of the listener as soon as it fires, and `sub_id` stayed
+                // `Some` naming nothing -- so a poll that woke and found
+                // `can_read()` false (the event went to another reader of the
+                // same device, or produced no readable packet) parked again
+                // with NO handler registered, and nothing here re-polls on a
+                // tick: that reader slept for good. Subscribing for the
+                // future's whole life is what `Drop` and both Ready paths
+                // already unsubscribe. See `EventBusFuture::poll` for the same
+                // bug with the event bus.
                 if this.sub_id.is_none() {
                     let waker = cx.waker().clone();
                     this.sub_id = this
                         .dev
                         .input
-                        .subscribe(Box::new(move |_| waker.wake_by_ref()), true);
+                        .subscribe(Box::new(move |_| waker.wake_by_ref()), false);
                 }
                 // Re-check after registering the waker in case an event
                 // arrived in the window between the first check and subscribe().

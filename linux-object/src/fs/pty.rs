@@ -1310,7 +1310,17 @@ impl Future for PtyReadFuture<'_> {
             kernel_hal::timer_waker::kill_timer_waker(&mut this.timer);
             return Poll::Ready(ready);
         }
-        if this.sub_id.is_none() {
+        // Not `sub_id.is_none()`: the callback is one-shot (it returns
+        // `true`), so the bus drops it the moment it fires and the id names
+        // nothing afterwards. A waiter that only asked `is_none()` parked again
+        // with NO callback on the bus, so from the second wait on, only the
+        // re-scan tick ever looked at the pty. See `EventBusFuture::poll`.
+        let live = this
+            .sub_id
+            .map(|id| this.bus.lock().is_subscribed(id))
+            .unwrap_or(false);
+        if !live {
+            this.sub_id = None;
             let waker = cx.waker().clone();
             this.sub_id = this.bus.lock().subscribe(Box::new(move |_| {
                 waker.wake_by_ref();

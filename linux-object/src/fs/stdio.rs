@@ -2191,7 +2191,19 @@ impl INode for Stdin {
                 } else {
                     crate::net::register_io_wait_wakers(cx.waker(), false, true);
                     this.io_waker = Some(cx.waker().clone());
-                    if this.sub_id.is_none() {
+                    // Not `sub_id.is_none()`: the callback is one-shot (it
+                    // returns `true`), so the bus drops it as soon as it fires
+                    // and the id names nothing afterwards. A reader that only
+                    // asked `is_none()` went back to sleep with NO callback on
+                    // the bus, and from then on only the re-scan tick looked at
+                    // the terminal again -- keystrokes up to a tick late, for
+                    // the life of the read. See `EventBusFuture::poll`.
+                    let live = this
+                        .sub_id
+                        .map(|id| this.stdin.eventbus.lock().is_subscribed(id))
+                        .unwrap_or(false);
+                    if !live {
+                        this.sub_id = None;
                         let waker = cx.waker().clone();
                         this.sub_id = this.stdin.eventbus.lock().subscribe(Box::new(move |_| {
                             waker.wake_by_ref();
