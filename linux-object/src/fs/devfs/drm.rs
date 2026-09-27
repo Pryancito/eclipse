@@ -1669,8 +1669,8 @@ impl DrmFileState {
     /// kernel: the caller saw EAGAIN, but the queue was NOT empty so
     /// `Event::READABLE` stayed set, so a blocking reader's wait resolved
     /// instantly, re-read, got EAGAIN again, and spun with no yield point.
-    /// Linux puts the event back and returns EINVAL when nothing has been read
-    /// yet, and never blocks in that case.
+    /// Linux puts the event back and returns what it has read so far (0 when
+    /// nothing), and never blocks in that case.
     pub fn read_events(&self, buf: &mut [u8]) -> EventRead {
         let mut events = self.events.lock();
         let mut total = 0usize;
@@ -1709,8 +1709,8 @@ impl DrmFileState {
 pub enum EventRead {
     /// Nothing queued: EAGAIN, or block until one arrives.
     Empty,
-    /// The buffer cannot hold even the first queued event: EINVAL, as
-    /// `drm_read()` answers when it has read nothing yet.
+    /// The buffer cannot hold even the first queued event: a read of 0
+    /// bytes, as `drm_read()` answers when it has read nothing yet.
     TooSmall,
     /// This many bytes of whole events were copied.
     Read(usize),
@@ -9061,7 +9061,7 @@ mod drm_event_read_tests {
     /// The livelock. A short read left the event queued with `READABLE` still
     /// set, and answered EAGAIN -- so a blocking reader's wait resolved
     /// immediately, it re-read, got EAGAIN again, and spun a core with no
-    /// yield point. `drm_read()` returns EINVAL there and never blocks.
+    /// yield point. `drm_read()` returns 0 there and never blocks.
     #[test]
     fn a_buffer_too_small_for_the_first_event_is_distinguishable_from_empty() {
         let file = DrmFileState::new();
