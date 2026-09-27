@@ -9077,6 +9077,74 @@ mod kms_scanout_tests {
         c.destroy_dumb(buf.handle).expect("DESTROY_DUMB");
     }
 
+    /// Destroying the framebuffer that is ON THE SCREEN must not stop the pointer
+    /// being drawn, or leave the one already drawn behind as a ghost.
+    ///
+    /// `RMFB` of the framebuffer bound to the CRTC sets `crtc_fb` to 0 (see
+    /// `rmfb_for`), and a client does that on every surface resize -- wlroots
+    /// whenever a buffer leaves its pool. `repaint_for_cursor` used to give up on
+    /// a zero `crtc_fb` because the OLD pointer path read the client's buffer, and
+    /// the panel path that replaced it does not. So the move drew nothing, while
+    /// the snapshot it had already taken moved `cursor.drawn` to where the pointer
+    /// was going: the image at the old place was never erased, and the next move
+    /// erased a window that had nothing in it. A pointer-shaped ghost on the
+    /// desktop until something presented a whole frame.
+    ///
+    /// The panel still holds a perfectly good frame through all of this -- our
+    /// present copied it -- so there is nothing to bail out for.
+    ///
+    /// Found by the soak, one step after it learned to destroy and remake the
+    /// framebuffer the panel is holding.
+    #[test]
+    fn a_pointer_still_draws_after_the_framebuffer_on_screen_is_destroyed() {
+        const W: u32 = 120;
+        const H: u32 = 96;
+        const CUR: u32 = 16;
+        let screen = kms_emu::attach_with(W, H, 128, true);
+        let c = Client::open(0);
+        let buf = c.create_dumb(W, H);
+        paint(&buf, |x, y| desktop_px(1, x, y));
+        let fb = c.addfb2(&buf);
+        set_crtc(&c, drm::SYNTH_CRTC_ID, fb, W, H);
+        drain_completions(&c);
+
+        let bmp = pointer_bitmap(CUR, CUR);
+        let cur = c.create_dumb(CUR, CUR);
+        {
+            let px = map_dumb(&cur);
+            for (i, v) in bmp.iter().enumerate() {
+                px[i] = *v;
+            }
+        }
+        set_cursor(&c, drm::SYNTH_CRTC_ID, cur.handle, CUR, CUR, 20, 20);
+        let mut panel = Panel::new(W, H, 1, bmp.clone(), CUR);
+        panel.cursor = Some((20, 20, CUR, CUR));
+        panel.check(&screen, "the pointer is on the frame");
+
+        // The client drops the framebuffer it presented. Its pixels are still on
+        // the panel, because the present copied them; what is gone is the id.
+        c.rmfb(fb).expect("RMFB the framebuffer on the CRTC");
+        assert_eq!(
+            drm::crtc_fb(),
+            0,
+            "this test is pointless unless RMFB really unbinds the CRTC's framebuffer"
+        );
+
+        // A move, with no framebuffer bound. The pointer has to arrive at the new
+        // place AND leave the old one as it was before it got there.
+        move_cursor(&c, drm::SYNTH_CRTC_ID, 60, 40);
+        panel.cursor = Some((60, 40, CUR, CUR));
+        panel.check(&screen, "the pointer moved with no framebuffer bound");
+
+        // And it still comes off entirely.
+        set_cursor(&c, drm::SYNTH_CRTC_ID, 0, 0, 0, 0, 0);
+        panel.cursor = None;
+        panel.check(&screen, "the pointer was hidden with no framebuffer bound");
+
+        c.destroy_dumb(cur.handle).expect("DESTROY_DUMB cursor");
+        c.destroy_dumb(buf.handle).expect("DESTROY_DUMB");
+    }
+
     /// A pointer straddling the right edge of a framebuffer SMALLER than the mode
     /// must still be erasable, or its outer columns stay on the panel for good.
     ///
@@ -9215,7 +9283,7 @@ mod kms_scanout_tests {
         let c = Client::open(0);
 
         let bufs = [c.create_dumb(W, H), c.create_dumb(W, H)];
-        let fbs = [c.addfb2(&bufs[0]), c.addfb2(&bufs[1])];
+        let mut fbs = [c.addfb2(&bufs[0]), c.addfb2(&bufs[1])];
         // A framebuffer SMALLER than the mode, which is a case the present path
         // has its own arithmetic for (`image_pitch_px`, and the pointer clipped
         // to what the buffer covers rather than to the row stride). Its width is
@@ -9243,6 +9311,19 @@ mod kms_scanout_tests {
         {
             let px = map_dumb(&cur2);
             for (i, v) in bmp2.iter().enumerate() {
+                px[i] = *v;
+            }
+        }
+        // And the size a real theme actually uses. On a 120x96 panel a 64x64
+        // pointer is a third of the screen, so its window is clipped on two edges
+        // at once for most positions -- and what it covers is 16 KB of save, where
+        // the 16x16 one was 1 KB.
+        const CUR3: u32 = 64;
+        let bmp3 = pointer_bitmap(CUR3, CUR3);
+        let cur3 = c.create_dumb(CUR3, CUR3);
+        {
+            let px = map_dumb(&cur3);
+            for (i, v) in bmp3.iter().enumerate() {
                 px[i] = *v;
             }
         }
@@ -9290,7 +9371,7 @@ mod kms_scanout_tests {
         };
         for step in 0..300u32 {
             let what;
-            match rnd(17) {
+            match rnd(18) {
                 0..=3 => {
                     // The compositor renders a finished frame into the other
                     // buffer of its chain and puts it up, whole, as labwc does.
@@ -9614,16 +9695,20 @@ mod kms_scanout_tests {
                     // The pointer changes SIZE where it stands. The old window is
                     // not the new window, so what the old pointer covered can only
                     // come back from what the blit that drew it saved.
-                    cur_sz = if cur_sz == CUR { CUR2 } else { CUR };
-                    cur_h = if cur_sz == CUR {
-                        cur.handle
-                    } else {
-                        cur2.handle
+                    cur_sz = match cur_sz {
+                        CUR => CUR2,
+                        CUR2 => CUR3,
+                        _ => CUR,
                     };
-                    model.bmp = if cur_sz == CUR {
-                        bmp.clone()
-                    } else {
-                        bmp2.clone()
+                    cur_h = match cur_sz {
+                        CUR => cur.handle,
+                        CUR2 => cur2.handle,
+                        _ => cur3.handle,
+                    };
+                    model.bmp = match cur_sz {
+                        CUR => bmp.clone(),
+                        CUR2 => bmp2.clone(),
+                        _ => bmp3.clone(),
                     };
                     model.bmp_w = cur_sz;
                     shown = true;
@@ -9631,6 +9716,26 @@ mod kms_scanout_tests {
                     model.cursor = Some((pos.0, pos.1, cur_sz, cur_sz));
                     what =
                         alloc::format!("step {}: pointer resized to {}x{}", step, cur_sz, cur_sz);
+                }
+                17 => {
+                    // The client DESTROYS the framebuffer the panel is scanning
+                    // out and makes another one from the same buffer, which is
+                    // what a client does when it resizes or drops a surface. The
+                    // panel keeps the pixels -- our present copied them -- so
+                    // nothing on the screen may change, and the pointer still has
+                    // to work afterwards even though the fb id it came from is
+                    // gone.
+                    c.rmfb(fbs[slot])
+                        .expect("RMFB the framebuffer on the panel");
+                    fbs[slot] = c.addfb2(&bufs[slot]);
+                    // The panel holds the pixels of a framebuffer that does not
+                    // exist any more, so no damage box may be honoured on its own
+                    // until something presents a whole frame again.
+                    panel_fb = 0;
+                    what = alloc::format!(
+                        "step {}: the framebuffer on the panel was destroyed and remade",
+                        step
+                    );
                 }
                 _ => {
                     // DPMS off and on again with NOTHING presented after it,
@@ -9691,6 +9796,8 @@ mod kms_scanout_tests {
         for fb in fbs {
             c.rmfb(fb).expect("RMFB");
         }
+        c.destroy_dumb(cur3.handle)
+            .expect("DESTROY_DUMB big cursor");
         c.destroy_dumb(cur.handle).expect("DESTROY_DUMB cursor");
         c.destroy_dumb(cur2.handle)
             .expect("DESTROY_DUMB small cursor");

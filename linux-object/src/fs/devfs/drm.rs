@@ -4709,9 +4709,6 @@ pub fn repaint_for_cursor() {
         st.cursor.drawn = new.as_ref().map(|(x, y, w, h, _)| (*x, *y, *w, *h));
         (fb_id, old_rect, new)
     };
-    if fb_id == 0 {
-        return;
-    }
     let display = match primary_display() {
         Some(d) => d,
         None => return,
@@ -4720,11 +4717,41 @@ pub fn repaint_for_cursor() {
     // this point is the older path, kept only for a panel whose pixels cannot be
     // read back -- see [`repaint_cursor_from_panel`], and [`CursorUnder`] for the
     // black rectangles that reading the client's buffer here put on the screen.
+    //
+    // Asked BEFORE `crtc_fb` is looked at, because this path does not read the
+    // client's framebuffer and so does not care whether one is bound. `RMFB` of
+    // the framebuffer on the CRTC sets `crtc_fb` to 0 (see `rmfb_for`), which a
+    // client does on every surface resize and wlroots does whenever a buffer
+    // leaves its pool -- and bailing out there left the pointer undrawn on a
+    // panel holding a perfectly good frame, with `cursor.drawn` already moved to
+    // the new place, so the image sitting at the OLD place was never erased
+    // either. A pointer-shaped ghost, until the next full present.
     if repaint_cursor_from_panel(
         &*display,
         old_rect,
         new.as_ref().map(|(x, y, w, h, b)| (*x, *y, *w, *h, &**b)),
     ) {
+        return;
+    }
+    if fb_id == 0 {
+        // Nothing has been drawn and nothing can be from here: the fallback below
+        // reads the client's framebuffer and there is none. The snapshot above
+        // already advanced `cursor.drawn` to where the pointer was GOING, so the
+        // state on the way out says the pointer was painted there when it was
+        // not, and the next move would erase that window instead of the one the
+        // old image is really in -- which is how an image becomes permanent.
+        //
+        // Undone only if it is still OUR write: `drawn` is taken and put back with
+        // the lock dropped in between, so a cursor event on another thread may
+        // have moved it again, and that newer state is the true one. Reached with
+        // a panel that cannot be read back and no framebuffer bound, which no
+        // test can set up so as to observe the difference -- the only thing that
+        // binds a framebuffer again is a present, and that repaints the whole
+        // frame.
+        let mut st = DRM_STATE.lock();
+        if st.cursor.drawn == new.as_ref().map(|(x, y, w, h, _)| (*x, *y, *w, *h)) {
+            st.cursor.drawn = old_rect;
+        }
         return;
     }
     // Same lifetime guard as `scanout_region`: this blits with the lock dropped.
