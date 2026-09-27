@@ -5,6 +5,26 @@ use {
     zircon_object::{dev::*, signal::*, task::*, vm::*},
 };
 
+/// The options `zx_bti_pin` was given, or `INVALID_ARGS`.
+///
+/// This used to be `from_bits_truncate`, which drops every bit it does not
+/// know instead of refusing it. A caller that asked for something this kernel
+/// has no notion of -- a permission bit from a newer ABI, a typo in a
+/// `#define` -- got a pin with whatever was left of its request and was told
+/// it succeeded.
+fn bti_options(options: u32) -> ZxResult<BtiOptions> {
+    BtiOptions::from_bits(options).ok_or(ZxError::INVALID_ARGS)
+}
+
+/// The options `zx_interrupt_create` was given, or `INVALID_ARGS`.
+///
+/// Same as [`bti_options`]: an unknown bit was dropped rather than refused.
+/// The `options != VIRTUAL` check below could not see one either, because
+/// truncation had already removed it.
+fn interrupt_options(options: u32) -> ZxResult<InterruptOptions> {
+    InterruptOptions::from_bits(options).ok_or(ZxError::INVALID_ARGS)
+}
+
 impl Syscall<'_> {
     /// Create a new object in the kernel representing an IOMMU device.
     pub fn sys_iommu_create(
@@ -79,7 +99,7 @@ impl Syscall<'_> {
         addrs_count: usize,
         mut out: UserOutPtr<HandleValue>,
     ) -> ZxResult {
-        let options = BtiOptions::from_bits_truncate(options);
+        let options = bti_options(options)?;
         info!(
             "bti.pin: bti={:#x}, options={:?}, vmo={:#x}, offset={:#x}, size={:#x}, addrs={:#x?}, addrs_count={:#x}",
             bti, options, vmo, offset, size, addrs, addrs_count
@@ -172,7 +192,7 @@ impl Syscall<'_> {
             resource, src_num, options
         );
         let proc = self.thread.proc();
-        let options = InterruptOptions::from_bits_truncate(options);
+        let options = interrupt_options(options)?;
         let interrupt = if options.contains(InterruptOptions::VIRTUAL) {
             if options != InterruptOptions::VIRTUAL {
                 return Err(ZxError::INVALID_ARGS);
@@ -333,5 +353,66 @@ impl BtiOptions {
             perms.insert(IommuPerms::PERM_EXECUTE);
         }
         perms
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! The options words of `zx_bti_pin` and `zx_interrupt_create`: a bit this
+    //! kernel does not know is the caller's mistake to hear about, not
+    //! something to drop on the floor and carry on as if it had been asked for
+    //! what was left.
+    use super::*;
+
+    #[test]
+    fn bti_pin_takes_the_bits_it_knows_and_no_others() {
+        assert_eq!(bti_options(0).unwrap(), BtiOptions::empty());
+        assert_eq!(
+            bti_options(0b1_1111).unwrap(),
+            BtiOptions::PERM_READ
+                | BtiOptions::PERM_WRITE
+                | BtiOptions::PERM_EXECUTE
+                | BtiOptions::COMPRESS
+                | BtiOptions::CONTIGUOUS,
+        );
+        // The first bit above the ones defined, and the top of the word.
+        assert_eq!(bti_options(0b10_0000).err(), Some(ZxError::INVALID_ARGS));
+        assert_eq!(bti_options(u32::MAX).err(), Some(ZxError::INVALID_ARGS));
+        // It used to keep the part it understood and answer `Ok`.
+        assert_eq!(
+            bti_options(BtiOptions::PERM_READ.bits() | 0b10_0000).err(),
+            Some(ZxError::INVALID_ARGS),
+        );
+    }
+
+    #[test]
+    fn interrupt_create_takes_every_mode_and_no_unknown_bit() {
+        // The mode is a field written as flags, so every value it can hold has
+        // to go through: refusing one of these would be a regression of its
+        // own.
+        for mode in [
+            InterruptOptions::MODE_DEFAULT,
+            InterruptOptions::MODE_EDGE_LOW,
+            InterruptOptions::MODE_EDGE_HIGH,
+            InterruptOptions::MODE_LEVEL_LOW,
+            InterruptOptions::MODE_LEVEL_HIGH,
+            InterruptOptions::MODE_EDGE_BOTH,
+        ] {
+            let word = mode.bits() | InterruptOptions::REMAP_IRQ.bits();
+            assert_eq!(interrupt_options(word).unwrap().bits(), word);
+        }
+        assert_eq!(
+            interrupt_options(InterruptOptions::VIRTUAL.bits()).unwrap(),
+            InterruptOptions::VIRTUAL,
+        );
+
+        assert_eq!(
+            interrupt_options(InterruptOptions::all().bits() + 1).err(),
+            Some(ZxError::INVALID_ARGS),
+        );
+        assert_eq!(
+            interrupt_options(u32::MAX).err(),
+            Some(ZxError::INVALID_ARGS)
+        );
     }
 }
