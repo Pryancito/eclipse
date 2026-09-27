@@ -1245,7 +1245,41 @@ impl DrmDev {
             }
             DRM_IOCTL_MODE_ADDFB => {
                 let cmd = unsafe { &mut *(data as *mut DrmModeFbCmd) };
-                if let Some(fb_id) = drm::create_fb(cmd.handle, cmd.width, cmd.height, cmd.pitch) {
+                // `drm_mode_addfb` is `drm_mode_addfb2` with the fourcc
+                // derived from (bpp, depth): a pair the table does not know is
+                // EINVAL, and the derived format then goes through the same
+                // checks as an ADDFB2, which refuse every format no plane
+                // scans out. This arm read neither field, so a 16-bit or a
+                // 10-bit framebuffer was wrapped as XRGB8888 and scanned out
+                // as garbage, and an ARGB8888 one (32/32) was registered as
+                // XRGB8888 and reported back with depth 24.
+                let Some(pixel_format) = legacy_fb_format(cmd.bpp, cmd.depth) else {
+                    log::debug!(
+                        "[drm] ADDFB bpp={} depth={} -> EINVAL (no such format)",
+                        cmd.bpp,
+                        cmd.depth
+                    );
+                    return Err(FsError::InvalidParam);
+                };
+                let as_fb2 = DrmModeFbCmd2 {
+                    fb_id: 0,
+                    width: cmd.width,
+                    height: cmd.height,
+                    pixel_format,
+                    flags: 0,
+                    handles: [cmd.handle, 0, 0, 0],
+                    pitches: [cmd.pitch, 0, 0, 0],
+                    offsets: [0; 4],
+                    modifier: [0; 4],
+                };
+                addfb2_check(&as_fb2)?;
+                if let Some(fb_id) = drm::create_fb_with_format(
+                    cmd.handle,
+                    cmd.width,
+                    cmd.height,
+                    cmd.pitch,
+                    pixel_format,
+                ) {
                     cmd.fb_id = fb_id;
                     Ok(0)
                 } else {
@@ -4090,6 +4124,35 @@ struct DrmModeFbCmd2 {
     pitches: [u32; 4],
     offsets: [u32; 4],
     modifier: [u64; 4],
+}
+
+/// The fourcc `drm_mode_legacy_fb_format` derives from an `ADDFB`'s
+/// (`bpp`, `depth`), or `None` for a pair it does not know
+/// (`DRM_FORMAT_INVALID`, which `drm_mode_addfb` turns into EINVAL). The
+/// formats other than the two [`drm::SCANOUT_FORMATS`] are real fourccs that
+/// [`addfb2_check`] then refuses, exactly as Linux refuses them on a device
+/// whose planes do not scan them out.
+fn legacy_fb_format(bpp: u32, depth: u32) -> Option<u32> {
+    /// `DRM_FORMAT_C8`
+    const C8: u32 = 0x2020_3843;
+    /// `DRM_FORMAT_XRGB1555`
+    const XRGB1555: u32 = 0x3531_5258;
+    /// `DRM_FORMAT_RGB565`
+    const RGB565: u32 = 0x3631_4752;
+    /// `DRM_FORMAT_RGB888`
+    const RGB888: u32 = 0x3432_4752;
+    /// `DRM_FORMAT_XRGB2101010`
+    const XRGB2101010: u32 = 0x3033_5258;
+    Some(match (bpp, depth) {
+        (8, 8) => C8,
+        (16, 15) => XRGB1555,
+        (16, 16) => RGB565,
+        (24, 24) => RGB888,
+        (32, 24) => drm::DRM_FORMAT_XRGB8888,
+        (32, 30) => XRGB2101010,
+        (32, 32) => drm::DRM_FORMAT_ARGB8888,
+        _ => return None,
+    })
 }
 
 /// `drm_mode_fb_cmd2.flags`: the two Linux knows. Anything else is EINVAL.
@@ -15396,6 +15459,119 @@ mod addfb2_validation_tests {
         narrow.width = 32;
         let fb = accepted(&client, narrow, "a narrow fb over a wide buffer");
         assert_eq!(client.rmfb(fb), Ok(0));
+
+        assert_eq!(client.destroy_dumb(buf.handle), Ok(0));
+    }
+
+    /// `ADDFB` with `bpp`/`depth`, and the framebuffer table before and
+    /// after.
+    fn addfb(
+        client: &Client,
+        buf: &DrmModeCreateDumb,
+        bpp: u32,
+        depth: u32,
+    ) -> (Result<usize>, u32, usize, usize) {
+        let mut cmd = DrmModeFbCmd {
+            fb_id: 0,
+            width: buf.width,
+            height: buf.height,
+            pitch: buf.pitch,
+            bpp,
+            depth,
+            handle: buf.handle,
+        };
+        let before = drm::table_sizes_for_test().0;
+        let r = client.ioctl(DRM_IOCTL_MODE_ADDFB, &mut cmd);
+        (r, cmd.fb_id, before, drm::table_sizes_for_test().0)
+    }
+
+    /// `drm_mode_legacy_fb_format`'s table, and nothing outside it.
+    #[test]
+    fn the_legacy_bpp_depth_table_is_linuxs() {
+        assert_eq!(legacy_fb_format(32, 24), Some(drm::DRM_FORMAT_XRGB8888));
+        assert_eq!(legacy_fb_format(32, 32), Some(drm::DRM_FORMAT_ARGB8888));
+        // Real formats no plane here scans out: fourccs, spelled as Linux
+        // spells them.
+        assert_eq!(legacy_fb_format(8, 8), Some(u32::from_le_bytes(*b"C8  ")));
+        assert_eq!(legacy_fb_format(16, 15), Some(u32::from_le_bytes(*b"XR15")));
+        assert_eq!(legacy_fb_format(16, 16), Some(u32::from_le_bytes(*b"RG16")));
+        assert_eq!(legacy_fb_format(24, 24), Some(u32::from_le_bytes(*b"RG24")));
+        assert_eq!(legacy_fb_format(32, 30), Some(u32::from_le_bytes(*b"XR30")));
+        for (bpp, depth) in [
+            (0, 0),
+            (32, 16),
+            (16, 24),
+            (24, 32),
+            (64, 64),
+            (32, 0),
+            (0, 24),
+        ] {
+            assert_eq!(legacy_fb_format(bpp, depth), None, "{bpp}/{depth}");
+        }
+    }
+
+    /// The legacy `ADDFB` is an `ADDFB2` with the fourcc derived from
+    /// (bpp, depth): 32/24 registers XRGB8888 and 32/32 ARGB8888 (`GETFB2`
+    /// gives the format back and `GETFB` the depth), every other pair is
+    /// EINVAL with no framebuffer created, whether the table knows it
+    /// (16/16 is RGB565, which nothing here scans out) or not (32/16), and
+    /// a pitch shorter than a row is refused as it is on `ADDFB2`. This
+    /// arm read neither field: a 16-bit framebuffer scanned out as
+    /// XRGB8888 garbage, and an ARGB8888 one came back as depth 24.
+    #[test]
+    fn legacy_addfb_derives_the_format_from_bpp_and_depth() {
+        let _serialised = drm::test_globals::lock();
+        let client = Client::open(0);
+        let buf = client.create_dumb(64, 64);
+
+        let (r, fb, before, after) = addfb(&client, &buf, 32, 24);
+        assert_eq!(r, Ok(0));
+        assert_eq!(after, before + 1);
+        assert_eq!(getfb2(&client, fb).pixel_format, drm::DRM_FORMAT_XRGB8888);
+        assert_eq!(getfb_depth(&client, fb), 24);
+        assert_eq!(client.rmfb(fb), Ok(0));
+
+        let (r, fb, before, after) = addfb(&client, &buf, 32, 32);
+        assert_eq!(r, Ok(0));
+        assert_eq!(after, before + 1);
+        assert_eq!(getfb2(&client, fb).pixel_format, drm::DRM_FORMAT_ARGB8888);
+        assert_eq!(getfb_depth(&client, fb), 32, "32/32 is ARGB8888, depth 32");
+        assert_eq!(client.rmfb(fb), Ok(0));
+
+        for (bpp, depth) in [
+            (16, 16),
+            (16, 15),
+            (24, 24),
+            (8, 8),
+            (32, 30),
+            (32, 16),
+            (0, 0),
+        ] {
+            let (r, fb, before, after) = addfb(&client, &buf, bpp, depth);
+            assert_eq!(r, Err(FsError::InvalidParam), "{bpp}/{depth}: not EINVAL");
+            assert_eq!(fb, 0, "{bpp}/{depth}: an fb id came back with the error");
+            assert_eq!(
+                after, before,
+                "{bpp}/{depth}: a framebuffer was created anyway"
+            );
+        }
+
+        // The ADDFB2 checks apply to the legacy form too: a pitch shorter
+        // than a row of 4-byte pixels.
+        let mut short = DrmModeFbCmd {
+            fb_id: 0,
+            width: buf.width,
+            height: buf.height,
+            pitch: buf.width * 4 - 4,
+            bpp: 32,
+            depth: 24,
+            handle: buf.handle,
+        };
+        assert_eq!(
+            client.ioctl(DRM_IOCTL_MODE_ADDFB, &mut short),
+            Err(FsError::InvalidParam)
+        );
+        assert_eq!(short.fb_id, 0);
 
         assert_eq!(client.destroy_dumb(buf.handle), Ok(0));
     }
