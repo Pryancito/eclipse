@@ -4740,11 +4740,9 @@ impl PciDriver for XhciDriverPci {
         let map_len =
             ((len.min(usize::MAX as u64) as usize + offset + 0xfff) & !0xfff).max(128 * 1024);
 
-        if let Some(m) = mapper {
-            m.query_or_map(base_addr, map_len);
-        }
-
-        let vaddr = crate::bus::phys_to_virt(addr as usize);
+        // Through the base the mapper returns, with the BAR's own low bits as
+        // the offset: see `bus::resolve_window`.
+        let vaddr = crate::bus::resolve_window(mapper, base_addr, map_len, offset);
 
         let vector = irq.map(|idx| idx + 32).unwrap_or(NO_MSI_VECTOR);
 
