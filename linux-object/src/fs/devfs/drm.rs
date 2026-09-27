@@ -80,8 +80,6 @@ pub(crate) fn present_report_counts_for_test() -> (u64, u64) {
     )
 }
 
-/// How often each kind of present gets a line. A full frame is rare enough to
-/// report often; a damage box is not.
 /// A byte count and its unit for the present's cost line: bytes below a KiB,
 /// whole KiB above it.
 ///
@@ -100,6 +98,8 @@ fn cost_scaled(bytes: usize) -> (usize, &'static str) {
     }
 }
 
+/// How often each kind of present gets a line. A full frame is rare enough to
+/// report often; a damage box is not.
 const FULL_FRAME_REPORT_EVERY: u64 = 64;
 const RECT_REPORT_EVERY: u64 = 512;
 
