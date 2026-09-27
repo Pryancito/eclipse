@@ -1688,8 +1688,6 @@ impl Syscall<'_> {
     /// Gated on the same `nvidia.nouveau_uapi` opt-in as the rest of the
     /// syncobj ioctls (`drm_scheme.rs`).
     fn sys_drm_syncobj_fd(&self, request: usize, arg1: usize) -> Result<Option<usize>, LxError> {
-        use linux_object::fs::SyncobjHandle;
-
         // Match by ioctl NR + type only, IGNORING the encoded struct size.
         // `struct drm_syncobj_handle`'s UABI is append-only: its first 16 bytes
         // (handle@0, flags@4, fd@8, pad@12) are frozen, but newer kernels grew
@@ -1703,9 +1701,6 @@ impl Syscall<'_> {
         const SYNCOBJ_HANDLE_TO_FD_NR: usize = 0xc1; // DRM_IOWR(0xc1, drm_syncobj_handle)
         const SYNCOBJ_FD_TO_HANDLE_NR: usize = 0xc2; // DRM_IOWR(0xc2, drm_syncobj_handle)
         const DRM_IOCTL_TYPE: usize = 0x64; // 'd'
-                                            // Bit 0 on BOTH ioctls: `..._HANDLE_TO_FD_FLAGS_EXPORT_SYNC_FILE` and
-                                            // `..._FD_TO_HANDLE_FLAGS_IMPORT_SYNC_FILE`.
-        const SYNC_FILE: u32 = 1 << 0;
 
         let nr = request & 0xff;
         if (request >> 8) & 0xff != DRM_IOCTL_TYPE
@@ -1718,7 +1713,6 @@ impl Syscall<'_> {
             return Ok(None);
         }
 
-        let proc = self.linux_process();
         let mut ptr = UserInOutPtr::<DrmSyncobjHandle>::from(arg1);
         let mut h = match ptr.read() {
             Ok(h) => h,
@@ -1728,212 +1722,27 @@ impl Syscall<'_> {
             }
         };
         syncobj_fd_args_check(h.flags, h.pad)?;
-        // Whichever way round, `h.handle` is one of the CALLER'S syncobjs:
-        // the one being exported, or the one an IMPORT_SYNC_FILE lands in.
-        // Linux finds it in the caller's file (`drm_syncobj_find`), so
-        // another process's handle is ENOENT. An opaque FD_TO_HANDLE
-        // creates the handle and reads none, so it is exempt.
-        let names_a_handle = is_handle_to_fd || (h.flags & SYNC_FILE != 0);
-        if names_a_handle
-            && !kernel_hal::drivers::scheme::syncobj::usable_by(
-                self.zircon_process().id(),
-                h.handle,
-            )
-        {
-            // `drm_syncobj_handle_to_fd` and `drm_syncobj_export_sync_file`
-            // answer a failed `drm_syncobj_find` with EINVAL;
-            // `drm_syncobj_import_sync_file_fence` with ENOENT.
-            let errno = syncobj_fd_missing_handle_errno(is_handle_to_fd);
+        drm_syncobj_fd_op(
+            self.linux_process(),
+            self.zircon_process().id(),
+            is_handle_to_fd,
+            &mut h,
+        )?;
+        // `DRM_IOWR`: the struct goes back whichever way round, with the new
+        // fd or the new handle in it.
+        if let Err(e) = ptr.write(h) {
             warn!(
-                "[drm] SYNCOBJ_{} {:?}: handle={} is not a live syncobj of pid {}",
+                "[drm] SYNCOBJ_{} write-back EFAULT: {:?}",
                 if is_handle_to_fd {
                     "HANDLE_TO_FD"
                 } else {
-                    "FD_TO_HANDLE(IMPORT_SYNC_FILE)"
+                    "FD_TO_HANDLE"
                 },
-                errno,
-                h.handle,
-                self.zircon_process().id()
+                e
             );
-            return Err(errno);
+            return Err(e.into());
         }
-        // The `_SYNC_FILE` variants (same bit on both ioctls) move a single
-        // FENCE rather than the syncobj itself: export takes the fence that is
-        // current on `handle` and wraps it in an fd; import gives that fence
-        // to a DIFFERENT, already-existing syncobj. That is how Mesa hands
-        // completed work across a process boundary — a GLX/DRI3 client and
-        // the X server exchanging frames — so a GL client under Xwayland
-        // exercises this pair on paths a Wayland-native client never touches.
-        //
-        // These used to answer EOPNOTSUPP ("Eclipse has no sync_file
-        // abstraction"), which was a real gap wearing a reasonable-sounding
-        // excuse: the caller has no fallback, so the fence it needed simply
-        // never arrived, and the wait it then posted timed out inside EXEC ->
-        // EIO -> VK_ERROR_DEVICE_LOST. It was also invisible: `warn!` while
-        // the machine boots at LOG=error.
-        //
-        // A fence here is "syncobj S reached point N", so a sync_file fd is
-        // exactly that pair, and `zcore_drivers::scheme::syncobj` resolves it
-        // on import (immediately when already satisfied — the normal case,
-        // since this driver's EXEC only signals its `sig` syncobjs after the
-        // GPU fence has landed — and as a recorded dependency otherwise).
-        let sync_file = h.flags & SYNC_FILE != 0;
-        // Bounded, LOG=error-visible trace of the export/import ops NVK issues
-        // during physical-device / semaphore init. This is the LAST syncobj path
-        // NOT covered by `drm_scheme.rs`'s `trace_syncobj`: HANDLE_TO_FD /
-        // FD_TO_HANDLE are intercepted HERE (they need the process fd table),
-        // before the inode `io_control` those traces live in. An export->import
-        // round-trip is exactly how Mesa auto-detects a syncobj's EXTERNAL-handle
-        // features, the one detection step we could never see. If the "failed to
-        // create timeline semaphore" crash is PRECEDED by these lines, NVK probed
-        // external sync and its decision is downstream of what we return here; if
-        // it is NOT, NVK reached the crash on GET_CAP + CREATE alone, and the
-        // fault is purely in its own userspace `sync_types` construction (the
-        // kernel side is exhaustively verified correct). `opaque` =
-        // OPAQUE_FD whole-syncobj share; `sync_file` = single-fence transfer.
-        {
-            static SYNCOBJ_FD_TRACE_BUDGET: core::sync::atomic::AtomicU32 =
-                core::sync::atomic::AtomicU32::new(0);
-            let n = SYNCOBJ_FD_TRACE_BUDGET.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-            if n < 32 {
-                kernel_hal::klog_info!(
-                    "[drm] SYNCOBJ_{} #{} pid={} handle={} fd={} flags={:#x} ({})",
-                    if is_handle_to_fd {
-                        "HANDLE_TO_FD"
-                    } else {
-                        "FD_TO_HANDLE"
-                    },
-                    n + 1,
-                    self.zircon_process().id(),
-                    h.handle,
-                    h.fd,
-                    h.flags,
-                    if sync_file { "sync_file" } else { "opaque" },
-                );
-            }
-        }
-        if is_handle_to_fd && sync_file {
-            // The file gets the FENCE the syncobj carries now, as a syncobj
-            // of its own (`export_fence`), never a live reading of the
-            // source: a RESET of the source, or its re-arm by the next
-            // submit, must not take the fence away from a sync_file already
-            // exported (Mesa resets a binary semaphore in the same call that
-            // exports its SYNC_FD). The file owns the carrier's one reference
-            // and `destroy`s it on close (Drop on SyncobjHandle).
-            let Some(carrier) = kernel_hal::drivers::scheme::syncobj::export_fence(h.handle) else {
-                warn!(
-                    "[drm] SYNCOBJ_HANDLE_TO_FD(EXPORT_SYNC_FILE) EINVAL: handle={} not a live syncobj",
-                    h.handle
-                );
-                return Err(LxError::EINVAL);
-            };
-            let new_fd = match proc.add_file(SyncobjHandle::new_sync_file(carrier, 1)) {
-                Ok(fd) => fd,
-                Err(e) => {
-                    let _ = kernel_hal::drivers::scheme::syncobj::destroy(carrier);
-                    return Err(e);
-                }
-            };
-            h.fd = i32::from(new_fd);
-            if let Err(e) = ptr.write(h) {
-                warn!("[drm] SYNCOBJ export sync_file write-back EFAULT: {:?}", e);
-                return Err(e.into());
-            }
-            return Ok(Some(0));
-        }
-        if !is_handle_to_fd && sync_file {
-            // Both operands come from userspace here: `fd` is the sync_file to
-            // import, `handle` the DESTINATION syncobj (which must already
-            // exist — Linux does not create one for this variant).
-            let target = proc.get_file_like(FileDesc::from(h.fd as usize))?;
-            let file = target
-                .downcast_ref::<SyncobjHandle>()
-                .ok_or(LxError::EINVAL)?;
-            // A plain syncobj fd passed here names its own current fence.
-            let point = match file.sync_file_point {
-                Some(p) => p,
-                None => kernel_hal::drivers::scheme::syncobj::export_snapshot(file.handle)
-                    .ok_or(LxError::EINVAL)?,
-            };
-            if !kernel_hal::drivers::scheme::syncobj::import_snapshot(h.handle, file.handle, point)
-            {
-                warn!(
-                    "[drm] SYNCOBJ_FD_TO_HANDLE(IMPORT_SYNC_FILE) EINVAL: dst handle={} or src handle={} not live",
-                    h.handle, file.handle
-                );
-                return Err(LxError::EINVAL);
-            }
-            return Ok(Some(0));
-        }
-        if is_handle_to_fd {
-            if kernel_hal::drivers::scheme::syncobj::query(h.handle).is_none() {
-                warn!(
-                    "[drm] SYNCOBJ_HANDLE_TO_FD EINVAL: handle={} not a live syncobj",
-                    h.handle
-                );
-                return Err(LxError::EINVAL);
-            }
-            // Fd holds a syncobj ref so SYNCOBJ_DESTROY cannot free it while
-            // the exported fd is still live (Drop on SyncobjHandle dec_refs).
-            if !kernel_hal::drivers::scheme::syncobj::add_ref(h.handle) {
-                return Err(LxError::EINVAL);
-            }
-            let file = SyncobjHandle::new(h.handle);
-            let new_fd = match proc.add_file(file) {
-                Ok(fd) => fd,
-                Err(e) => {
-                    warn!("[drm] SYNCOBJ_HANDLE_TO_FD add_file {:?}", e);
-                    let _ = kernel_hal::drivers::scheme::syncobj::destroy(h.handle);
-                    return Err(e);
-                }
-            };
-            h.fd = i32::from(new_fd);
-            if let Err(e) = ptr.write(h) {
-                warn!("[drm] SYNCOBJ_HANDLE_TO_FD write-back EFAULT: {:?}", e);
-                return Err(e.into());
-            }
-            Ok(Some(0))
-        } else {
-            let target = match proc.get_file_like(FileDesc::from(h.fd as usize)) {
-                Ok(t) => t,
-                Err(e) => {
-                    warn!(
-                        "[drm] SYNCOBJ_FD_TO_HANDLE EBADF: fd={} not in fd table",
-                        h.fd
-                    );
-                    return Err(e);
-                }
-            };
-            let syncobj = target
-                .downcast_ref::<SyncobjHandle>()
-                .ok_or(LxError::EINVAL)?;
-            if syncobj.sync_file_point.is_some() {
-                // A sync_file fd imported WITHOUT the flag would alias the two
-                // objects (the importer would signal the exporter's syncobj)
-                // instead of copying one fence. Linux rejects the mismatch;
-                // so do we, loudly, because silently aliasing them produces
-                // fences that appear to signal early — the worst failure to
-                // debug from a frame that merely looks wrong.
-                warn!(
-                    "[drm] SYNCOBJ_FD_TO_HANDLE EINVAL: fd={} is a sync_file, not a syncobj \
-                     (missing IMPORT_SYNC_FILE flag)",
-                    h.fd
-                );
-                return Err(LxError::EINVAL);
-            }
-            // The importer gets a reference of its own (Linux: a new handle
-            // in its table), so its later DESTROY frees only that.
-            let Some(handle) = syncobj.import_opaque(self.zircon_process().id()) else {
-                warn!(
-                    "[drm] SYNCOBJ_FD_TO_HANDLE EINVAL: fd={} names syncobj handle={} that no longer exists",
-                    h.fd, syncobj.handle
-                );
-                return Err(LxError::EINVAL);
-            };
-            h.handle = handle;
-            ptr.write(h)?;
-            Ok(Some(0))
-        }
+        Ok(Some(0))
     }
 
     /// `DMA_BUF_IOCTL_EXPORT_SYNC_FILE` (`export`) and `IMPORT_SYNC_FILE` on
@@ -3637,12 +3446,12 @@ struct DrmModeCreateLease {
 /// this order. Here rather than inside that method for the reason
 /// [`SyncMergeData`] gives.
 #[repr(C)]
-#[derive(Clone, Copy, Default)]
-struct DrmSyncobjHandle {
-    handle: u32,
-    flags: u32,
-    fd: i32,
-    pad: u32,
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub(crate) struct DrmSyncobjHandle {
+    pub handle: u32,
+    pub flags: u32,
+    pub fd: i32,
+    pub pad: u32,
 }
 
 /// `struct drm_syncobj_eventfd` (`drm.h`), the argument of
@@ -3697,15 +3506,210 @@ pub(crate) fn syncobj_fd_args_check(flags: u32, pad: u32) -> Result<(), LxError>
     Ok(())
 }
 
-/// The errno for a `handle` that is not the caller's: EINVAL on
-/// `HANDLE_TO_FD` (both variants), ENOENT on `FD_TO_HANDLE`'s
-/// IMPORT_SYNC_FILE, which is how Linux's two lookups answer.
-pub(crate) fn syncobj_fd_missing_handle_errno(handle_to_fd: bool) -> LxError {
-    if handle_to_fd {
+/// The errno for a `handle` that is not the caller's, which is how Linux's
+/// three lookups answer: EINVAL from `drm_syncobj_handle_to_fd` (the
+/// whole-syncobj export), ENOENT from `drm_syncobj_find_fence` (the
+/// sync_file export, which used to say EINVAL here too) and from
+/// `drm_syncobj_import_sync_file_fence` (the import's destination).
+pub(crate) fn syncobj_fd_missing_handle_errno(handle_to_fd: bool, sync_file: bool) -> LxError {
+    if handle_to_fd && !sync_file {
         LxError::EINVAL
     } else {
         LxError::ENOENT
     }
+}
+
+/// `SYNCOBJ_HANDLE_TO_FD` / `SYNCOBJ_FD_TO_HANDLE` after the argument check,
+/// on the caller's fd table `proc` as process `pid`; `h.fd` (an export) or
+/// `h.handle` (an import) comes back filled in.
+///
+/// The `_SYNC_FILE` variants (same bit on both ioctls) move a single FENCE
+/// rather than the syncobj itself: export takes the fence that is current on
+/// `handle` and wraps it in an fd; import gives that fence to a DIFFERENT,
+/// already-existing syncobj. That is how Mesa hands completed work across a
+/// process boundary (a GLX/DRI3 client and the X server exchanging frames),
+/// so a GL client under Xwayland exercises this pair on paths a
+/// Wayland-native client never touches. A fence here is "syncobj S reached
+/// point N", so a sync_file fd is exactly that pair, and
+/// `zcore_drivers::scheme::syncobj` resolves it on import (immediately when
+/// already satisfied, as a recorded dependency otherwise).
+///
+/// The errors are the ones `drm_syncobj.c` gives, in its order:
+/// - an export of a handle that is not the caller's is EINVAL for the
+///   whole syncobj (`drm_syncobj_handle_to_fd`) and ENOENT for its fence
+///   (`drm_syncobj_find_fence`);
+/// - an import looks at the fd FIRST: one that names no file is EINVAL
+///   (`fdget` / `sync_file_get_fence` come back empty; it used to be the
+///   fd table's EBADF), and so is a file of the wrong kind, a syncobj fd
+///   where a fence is wanted included (`sync_file_get_fence` knows only
+///   sync_files; a syncobj fd used to be taken as "whatever its object
+///   carries now"), or a sync_file where the object is wanted;
+/// - only then the destination handle of an `IMPORT_SYNC_FILE`, ENOENT
+///   when it is not the caller's (it used to be looked up first).
+pub(crate) fn drm_syncobj_fd_op(
+    proc: &LinuxProcess,
+    pid: KoID,
+    is_handle_to_fd: bool,
+    h: &mut DrmSyncobjHandle,
+) -> LxResult {
+    use kernel_hal::drivers::scheme::syncobj;
+    use linux_object::fs::SyncobjHandle;
+
+    let sync_file = h.flags & SYNCOBJ_FD_SYNC_FILE != 0;
+    // Bounded, LOG=error-visible trace of the export/import ops NVK issues
+    // during physical-device / semaphore init. This is the LAST syncobj path
+    // NOT covered by `drm_scheme.rs`'s `trace_syncobj`: HANDLE_TO_FD /
+    // FD_TO_HANDLE are intercepted HERE (they need the process fd table),
+    // before the inode `io_control` those traces live in. An export->import
+    // round-trip is exactly how Mesa auto-detects a syncobj's EXTERNAL-handle
+    // features, the one detection step we could never see. `opaque` =
+    // OPAQUE_FD whole-syncobj share; `sync_file` = single-fence transfer.
+    {
+        static SYNCOBJ_FD_TRACE_BUDGET: core::sync::atomic::AtomicU32 =
+            core::sync::atomic::AtomicU32::new(0);
+        let n = SYNCOBJ_FD_TRACE_BUDGET.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        if n < 32 {
+            kernel_hal::klog_info!(
+                "[drm] SYNCOBJ_{} #{} pid={} handle={} fd={} flags={:#x} ({})",
+                if is_handle_to_fd {
+                    "HANDLE_TO_FD"
+                } else {
+                    "FD_TO_HANDLE"
+                },
+                n + 1,
+                pid,
+                h.handle,
+                h.fd,
+                h.flags,
+                if sync_file { "sync_file" } else { "opaque" },
+            );
+        }
+    }
+    if is_handle_to_fd {
+        // `h.handle` is one of the CALLER'S syncobjs (`drm_syncobj_find`):
+        // another process's is not there.
+        if !syncobj::usable_by(pid, h.handle) {
+            let errno = syncobj_fd_missing_handle_errno(true, sync_file);
+            warn!(
+                "[drm] SYNCOBJ_HANDLE_TO_FD{} {:?}: handle={} is not a live syncobj of pid {}",
+                if sync_file { "(EXPORT_SYNC_FILE)" } else { "" },
+                errno,
+                h.handle,
+                pid
+            );
+            return Err(errno);
+        }
+        if sync_file {
+            // The file gets the FENCE the syncobj carries now, as a syncobj
+            // of its own (`export_fence`), never a live reading of the
+            // source: a RESET of the source, or its re-arm by the next
+            // submit, must not take the fence away from a sync_file already
+            // exported (Mesa resets a binary semaphore in the same call that
+            // exports its SYNC_FD). The file owns the carrier's one reference
+            // and `destroy`s it on close (Drop on SyncobjHandle).
+            let Some(carrier) = syncobj::export_fence(h.handle) else {
+                warn!(
+                    "[drm] SYNCOBJ_HANDLE_TO_FD(EXPORT_SYNC_FILE) ENOENT: handle={} went away",
+                    h.handle
+                );
+                return Err(LxError::ENOENT);
+            };
+            let new_fd = match proc.add_file(SyncobjHandle::new_sync_file(carrier, 1)) {
+                Ok(fd) => fd,
+                Err(e) => {
+                    let _ = syncobj::destroy(carrier);
+                    return Err(e);
+                }
+            };
+            h.fd = i32::from(new_fd);
+            return Ok(());
+        }
+        // Fd holds a syncobj ref so SYNCOBJ_DESTROY cannot free it while
+        // the exported fd is still live (Drop on SyncobjHandle dec_refs).
+        if !syncobj::add_ref(h.handle) {
+            return Err(LxError::EINVAL);
+        }
+        let new_fd = match proc.add_file(SyncobjHandle::new(h.handle)) {
+            Ok(fd) => fd,
+            Err(e) => {
+                warn!("[drm] SYNCOBJ_HANDLE_TO_FD add_file {:?}", e);
+                let _ = syncobj::destroy(h.handle);
+                return Err(e);
+            }
+        };
+        h.fd = i32::from(new_fd);
+        return Ok(());
+    }
+    // FD_TO_HANDLE: the fd first. `fdget` (opaque) and `sync_file_get_fence`
+    // (import) answer an fd that names nothing with EINVAL, as they do a
+    // file of another kind.
+    let target = proc
+        .get_file_like(FileDesc::from(h.fd as usize))
+        .map_err(|_| {
+            warn!(
+                "[drm] SYNCOBJ_FD_TO_HANDLE EINVAL: fd={} is not in the fd table",
+                h.fd
+            );
+            LxError::EINVAL
+        })?;
+    let file = target
+        .downcast_ref::<SyncobjHandle>()
+        .ok_or(LxError::EINVAL)?;
+    if sync_file {
+        // Only a sync_file carries a fence to import; a syncobj fd is the
+        // object, and `sync_file_get_fence` has nothing to give for it.
+        let Some(point) = file.sync_file_point else {
+            warn!(
+                "[drm] SYNCOBJ_FD_TO_HANDLE(IMPORT_SYNC_FILE) EINVAL: fd={} is a syncobj fd, not a sync_file",
+                h.fd
+            );
+            return Err(LxError::EINVAL);
+        };
+        // The DESTINATION must already exist and be the caller's (Linux does
+        // not create one for this variant): `drm_syncobj_find`, ENOENT.
+        if !syncobj::usable_by(pid, h.handle) {
+            let errno = syncobj_fd_missing_handle_errno(false, true);
+            warn!(
+                "[drm] SYNCOBJ_FD_TO_HANDLE(IMPORT_SYNC_FILE) {:?}: handle={} is not a live syncobj of pid {}",
+                errno, h.handle, pid
+            );
+            return Err(errno);
+        }
+        if !syncobj::import_snapshot(h.handle, file.handle, point) {
+            warn!(
+                "[drm] SYNCOBJ_FD_TO_HANDLE(IMPORT_SYNC_FILE) EINVAL: dst handle={} or src handle={} not live",
+                h.handle, file.handle
+            );
+            return Err(LxError::EINVAL);
+        }
+        return Ok(());
+    }
+    if file.sync_file_point.is_some() {
+        // A sync_file fd imported WITHOUT the flag would alias the two
+        // objects (the importer would signal the exporter's syncobj)
+        // instead of copying one fence. Linux rejects the mismatch
+        // (`f_op != &drm_syncobj_file_fops`); so do we, loudly, because
+        // silently aliasing them produces fences that appear to signal
+        // early, the worst failure to debug from a frame that merely
+        // looks wrong.
+        warn!(
+            "[drm] SYNCOBJ_FD_TO_HANDLE EINVAL: fd={} is a sync_file, not a syncobj \
+             (missing IMPORT_SYNC_FILE flag)",
+            h.fd
+        );
+        return Err(LxError::EINVAL);
+    }
+    // The importer gets a reference of its own (Linux: a new handle in its
+    // table), so its later DESTROY frees only that.
+    let Some(handle) = file.import_opaque(pid) else {
+        warn!(
+            "[drm] SYNCOBJ_FD_TO_HANDLE EINVAL: fd={} names syncobj handle={} that no longer exists",
+            h.fd, file.handle
+        );
+        return Err(LxError::EINVAL);
+    };
+    h.handle = handle;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -3729,10 +3733,223 @@ mod syncobj_fd_ioctl_tests {
         }
     }
 
+    /// `drm_syncobj_handle_to_fd` says EINVAL, `drm_syncobj_find_fence`
+    /// (the sync_file export) and the import's destination lookup ENOENT.
     #[test]
-    fn a_missing_handle_is_einval_on_export_and_enoent_on_import() {
-        assert_eq!(syncobj_fd_missing_handle_errno(true), LxError::EINVAL);
-        assert_eq!(syncobj_fd_missing_handle_errno(false), LxError::ENOENT);
+    fn a_missing_handle_is_einval_on_the_opaque_export_and_enoent_elsewhere() {
+        assert_eq!(
+            syncobj_fd_missing_handle_errno(true, false),
+            LxError::EINVAL
+        );
+        assert_eq!(syncobj_fd_missing_handle_errno(true, true), LxError::ENOENT);
+        assert_eq!(
+            syncobj_fd_missing_handle_errno(false, true),
+            LxError::ENOENT
+        );
+        assert_eq!(
+            syncobj_fd_missing_handle_errno(false, false),
+            LxError::ENOENT
+        );
+    }
+}
+
+#[cfg(test)]
+mod syncobj_fd_table_tests {
+    //! The two syncobj fd ioctls on a real fd table: what an fd that names
+    //! nothing, a file of the wrong kind, and a handle that is not the
+    //! caller's get, and in which order, against `drm_syncobj.c`.
+
+    use super::{drm_syncobj_fd_op, DrmSyncobjHandle, LxError};
+    use alloc::sync::Arc;
+    use kernel_hal::drivers::scheme::syncobj;
+    use linux_object::fs::{FileDesc, SyncobjHandle};
+    use linux_object::process::{LinuxProcess, ProcessExt};
+    use rcore_fs_ramfs::RamFS;
+    use zircon_object::task::{Process, ROOT_JOB};
+
+    /// Bit 0 on both ioctls: `EXPORT_SYNC_FILE` / `IMPORT_SYNC_FILE`.
+    const SYNC_FILE: u32 = 1;
+
+    fn a_process(pid: u64) -> Arc<Process> {
+        Process::create_with_fixed_id_ext(&ROOT_JOB, pid, "p", LinuxProcess::new(RamFS::new(), 0))
+            .unwrap()
+    }
+
+    fn args(handle: u32, flags: u32, fd: i32) -> DrmSyncobjHandle {
+        DrmSyncobjHandle {
+            handle,
+            flags,
+            fd,
+            pad: 0,
+        }
+    }
+
+    fn is_sync_file(proc: &LinuxProcess, fd: i32) -> bool {
+        proc.get_file_like(FileDesc::from(fd as usize))
+            .expect("the fd the export installed")
+            .downcast_ref::<SyncobjHandle>()
+            .expect("a syncobj file")
+            .sync_file_point
+            .is_some()
+    }
+
+    fn gone(handle: u32) {
+        while syncobj::exists(handle) {
+            syncobj::destroy(handle);
+        }
+    }
+
+    /// `fdget` / `sync_file_get_fence` on an fd that names no file: EINVAL,
+    /// for the whole-syncobj import and the fence import alike, and before
+    /// the destination handle is looked at (an unknown one is ENOENT, but
+    /// only once the fd is good).
+    #[test]
+    fn an_fd_that_names_no_file_is_einval_on_both_imports_before_the_handle() {
+        let pid = 0x4a10_0001;
+        let proc = a_process(pid);
+        let linux = proc.linux();
+        let dst = syncobj::create(false);
+        let mut h = args(dst, 0, 999);
+        assert_eq!(
+            drm_syncobj_fd_op(linux, pid, false, &mut h),
+            Err(LxError::EINVAL)
+        );
+        let mut h = args(dst, SYNC_FILE, 999);
+        assert_eq!(
+            drm_syncobj_fd_op(linux, pid, false, &mut h),
+            Err(LxError::EINVAL)
+        );
+        let mut h = args(0xdead_0001, SYNC_FILE, 999);
+        assert_eq!(
+            drm_syncobj_fd_op(linux, pid, false, &mut h),
+            Err(LxError::EINVAL),
+            "the fd decides before the handle"
+        );
+        assert_eq!(syncobj::query(dst), Some(0), "nothing landed");
+        gone(dst);
+    }
+
+    /// The fence import wants a sync_file: a syncobj fd is EINVAL and puts
+    /// nothing on the destination; a sync_file fd lands the source's fence
+    /// there, an unknown destination is ENOENT (after the fd), and the
+    /// whole-syncobj import hands the handle back for a syncobj fd and
+    /// refuses a sync_file.
+    #[test]
+    fn a_syncobj_fd_is_not_a_fence_to_import_and_a_sync_file_is() {
+        let pid = 0x4a10_0002;
+        let proc = a_process(pid);
+        let linux = proc.linux();
+        let src = syncobj::create(false);
+        let dst = syncobj::create(false);
+
+        let mut h = args(src, 0, -1);
+        assert_eq!(drm_syncobj_fd_op(linux, pid, true, &mut h), Ok(()));
+        let opaque_fd = h.fd;
+        assert!(opaque_fd >= 0 && !is_sync_file(linux, opaque_fd));
+
+        let mut h = args(dst, SYNC_FILE, opaque_fd);
+        assert_eq!(
+            drm_syncobj_fd_op(linux, pid, false, &mut h),
+            Err(LxError::EINVAL),
+            "a syncobj fd carries no fence"
+        );
+        assert!(syncobj::signal(src));
+        assert_eq!(
+            syncobj::query(dst),
+            Some(0),
+            "and the destination did not take the source's fence"
+        );
+        assert!(syncobj::reset(src));
+
+        let mut h = args(src, SYNC_FILE, -1);
+        assert_eq!(drm_syncobj_fd_op(linux, pid, true, &mut h), Ok(()));
+        let fence_fd = h.fd;
+        assert!(fence_fd >= 0 && is_sync_file(linux, fence_fd));
+
+        let mut h = args(0xdead_0002, SYNC_FILE, fence_fd);
+        assert_eq!(
+            drm_syncobj_fd_op(linux, pid, false, &mut h),
+            Err(LxError::ENOENT),
+            "an unknown destination, once the fd is a sync_file"
+        );
+        let mut h = args(dst, SYNC_FILE, fence_fd);
+        assert_eq!(drm_syncobj_fd_op(linux, pid, false, &mut h), Ok(()));
+        assert_eq!(syncobj::query(dst), Some(0), "the fence is still in flight");
+        assert!(syncobj::signal(src));
+        assert_eq!(
+            syncobj::query(dst),
+            Some(1),
+            "the imported fence is the source's"
+        );
+
+        let mut h = args(0, 0, opaque_fd);
+        assert_eq!(drm_syncobj_fd_op(linux, pid, false, &mut h), Ok(()));
+        assert_eq!(h.handle, src, "the whole-syncobj import names the object");
+        let mut h = args(0, 0, fence_fd);
+        assert_eq!(
+            drm_syncobj_fd_op(linux, pid, false, &mut h),
+            Err(LxError::EINVAL),
+            "a sync_file is not a syncobj to import"
+        );
+        // A negative fd is no fd (`fdget` finds nothing), not the positive
+        // one with its sign dropped.
+        let mut h = args(dst, SYNC_FILE, -fence_fd);
+        assert_eq!(
+            drm_syncobj_fd_op(linux, pid, false, &mut h),
+            Err(LxError::EINVAL)
+        );
+        let mut h = args(0, 0, -opaque_fd);
+        assert_eq!(
+            drm_syncobj_fd_op(linux, pid, false, &mut h),
+            Err(LxError::EINVAL)
+        );
+        assert_eq!(h.handle, 0, "and no handle came back");
+        drop(proc);
+        gone(src);
+        gone(dst);
+    }
+
+    /// A handle that is another process's: EINVAL on the whole-syncobj
+    /// export (`drm_syncobj_handle_to_fd`), ENOENT on the fence export
+    /// (`drm_syncobj_find_fence`) and as an import's destination; no fd is
+    /// installed for a refused export.
+    #[test]
+    fn another_processs_handle_is_einval_opaque_and_enoent_as_a_fence() {
+        let pid = 0x4a10_0003;
+        let proc = a_process(pid);
+        let linux = proc.linux();
+        let theirs = syncobj::create_for(0x4a10_0004, true);
+        let mine = syncobj::create(true);
+
+        let mut h = args(theirs, 0, -1);
+        assert_eq!(
+            drm_syncobj_fd_op(linux, pid, true, &mut h),
+            Err(LxError::EINVAL)
+        );
+        assert_eq!(h.fd, -1, "no fd installed");
+        let mut h = args(theirs, SYNC_FILE, -1);
+        assert_eq!(
+            drm_syncobj_fd_op(linux, pid, true, &mut h),
+            Err(LxError::ENOENT)
+        );
+        assert_eq!(h.fd, -1);
+
+        let mut h = args(mine, SYNC_FILE, -1);
+        assert_eq!(drm_syncobj_fd_op(linux, pid, true, &mut h), Ok(()));
+        let fence_fd = h.fd;
+        assert_eq!(
+            fence_fd, 3,
+            "the first fd after the standard streams: the refusals installed none"
+        );
+        let mut h = args(theirs, SYNC_FILE, fence_fd);
+        assert_eq!(
+            drm_syncobj_fd_op(linux, pid, false, &mut h),
+            Err(LxError::ENOENT),
+            "another process's syncobj is not a destination"
+        );
+        drop(proc);
+        gone(theirs);
+        gone(mine);
     }
 }
 
