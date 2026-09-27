@@ -265,11 +265,12 @@ pub struct FbVarScreeninfo {
 
 impl From<DisplayInfo> for FbVarScreeninfo {
     fn from(info: DisplayInfo) -> Self {
-        let (width_mm, height_mm) = size_mm(
-            info,
-            zcore_drivers::display::boot_edid()
-                .and_then(|(block, len)| (len >= 128).then_some(block)),
-        );
+        // The same answer the connector property serves and the mode is derived
+        // from: a whole, self-consistent block or nothing. This used to check
+        // the length alone, which was harmless (every decoder in
+        // `display::edid` gates on `block_valid` itself) but was a fourth
+        // spelling of one question. See `drm::boot_edid_block`.
+        let (width_mm, height_mm) = size_mm(info, crate::fs::devfs::drm::boot_edid_block());
         let (rl, gl, bl, al, ro, go, bo, ao) = match info.format {
             ColorFormat::RGB332 => (3, 3, 2, 0, 5, 3, 0, 0),
             ColorFormat::RGB565 => (5, 6, 5, 0, 11, 5, 0, 0),

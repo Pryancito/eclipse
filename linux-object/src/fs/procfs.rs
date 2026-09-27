@@ -2779,7 +2779,17 @@ fn format_uefi_edid() -> String {
         s.push_str("[gpuedid] === UEFI active-panel EDID: none captured by firmware ===\n");
         return s;
     };
-    let valid = len >= 128 && e[0] == 0x00 && e[7] == 0x00 && e[1..=6].iter().all(|&b| b == 0xFF);
+    // Deliberately NOT `drm::boot_edid_block()`, and deliberately its own header
+    // check. This is the diagnostic somebody reads when the EDID is the thing
+    // under suspicion, so it must be able to describe a block the rest of the
+    // kernel would refuse, and dump the raw head below so a bad pointer
+    // (garbage) is distinguishable from an empty buffer (zeros). Today
+    // `set_boot_edid` already drops an invalid block, so this branch only fires
+    // if that rule ever loosens -- which is exactly when it earns its keep.
+    let valid = len as usize >= zcore_drivers::display::edid::BLOCK_LEN
+        && e[0] == 0x00
+        && e[7] == 0x00
+        && e[1..=6].iter().all(|&b| b == 0xFF);
     if !valid {
         let _ = writeln!(
             s,

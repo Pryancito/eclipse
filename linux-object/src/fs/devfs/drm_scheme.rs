@@ -5435,6 +5435,28 @@ mod gl_client_sequence_tests {
         }
 
         /// `drmModeAddFB2`: wrap a buffer in a framebuffer object.
+        /// `ADDFB2` declaring a width narrower than the buffer's own pitch, so
+        /// the framebuffer has off-screen padding at the end of every row --
+        /// what a client with an alignment requirement, or a client whose
+        /// surface is narrower than the mode, really registers.
+        pub(super) fn addfb2_narrow(&self, buf: &DrmModeCreateDumb, width: u32) -> u32 {
+            const DRM_FORMAT_XRGB8888: u32 = 0x3443_5258;
+            let mut cmd = DrmModeFbCmd2 {
+                fb_id: 0,
+                width,
+                height: buf.height,
+                pixel_format: DRM_FORMAT_XRGB8888,
+                flags: 0,
+                handles: [buf.handle, 0, 0, 0],
+                pitches: [buf.pitch, 0, 0, 0],
+                offsets: [0; 4],
+                modifier: [0; 4],
+            };
+            self.ioctl(DRM_IOCTL_MODE_ADDFB2, &mut cmd).expect("ADDFB2");
+            assert_ne!(cmd.fb_id, 0, "ADDFB2 gave no fb id");
+            cmd.fb_id
+        }
+
         pub(super) fn addfb2(&self, buf: &DrmModeCreateDumb) -> u32 {
             // DRM_FORMAT_XRGB8888, which is what every GL swapchain on this
             // tree ends up presenting.
@@ -6926,6 +6948,50 @@ mod kms_scanout_tests {
         c.destroy_dumb(during.handle).expect("DESTROY_DUMB");
     }
 
+    /// Does the cursor patch read past the framebuffer's own right edge?
+    ///
+    /// The call site's comment says it clips "to what the framebuffer covers
+    /// (`fb_width`/`fb_height`), not to the screen: a client fb narrower or
+    /// shorter than the display would otherwise have the patch read past the end
+    /// of a row -- the next row's pixels -- and paint that onto the scanout as a
+    /// shifted square trailing the pointer". The height half does clip to `fh`.
+    /// The width half never mentions `fw` again: it bounds `x` at the row PITCH,
+    /// which is >= `fw` by construction. So a framebuffer narrower than its own
+    /// pitch has the columns in between read and painted.
+    #[test]
+    fn the_cursor_patch_does_not_paint_the_framebuffers_row_padding() {
+        let screen = kms_emu::attach(64, 16);
+        let c = Client::open(0);
+
+        // A 40-pixel buffer registered as a 32-pixel-wide framebuffer: eight
+        // columns of row padding, and the screen is wider than either.
+        let buf = c.create_dumb(40, 16);
+        paint(&buf, |x, y| tag(0x0055_0000, x, y));
+        let fb = c.addfb2_narrow(&buf, 32);
+        set_crtc(&c, drm::SYNTH_CRTC_ID, fb, 32, 16);
+        drain_completions(&c);
+
+        // Whatever the present put on screen for the padding columns is the
+        // baseline: the cursor must not change it.
+        let before: alloc::vec::Vec<u32> = (32..48u32).map(|x| screen.pixel(x, 4)).collect();
+
+        // An 8x8 opaque pointer at the framebuffer's right edge: its patch
+        // reaches columns 24..32, and the write-combining widening takes the
+        // read out to the row pitch.
+        set_cursor(&c, drm::SYNTH_CRTC_ID, buf.handle, 8, 8, 24, 0);
+        move_cursor(&c, drm::SYNTH_CRTC_ID, 24, 2);
+
+        let after: alloc::vec::Vec<u32> = (32..48u32).map(|x| screen.pixel(x, 4)).collect();
+        assert_eq!(
+            before, after,
+            "the pointer painted the framebuffer's off-screen row padding onto \
+             the visible screen, past the framebuffer's own right edge"
+        );
+
+        c.rmfb(fb).expect("RMFB");
+        c.destroy_dumb(buf.handle).expect("DESTROY_DUMB");
+    }
+
     /// The probe must be able to say "nothing wrote this window" -- on a buffer
     /// nobody is writing.
     ///
@@ -7719,6 +7785,74 @@ mod hw_kms_tests {
         c.rmfb(fb).expect("RMFB");
         c.destroy_dumb(cur.handle).expect("DESTROY_DUMB cursor");
         c.destroy_dumb(buf.handle).expect("DESTROY_DUMB");
+    }
+    // ---- the EDID a driver reports, and whether the core serves it ----
+
+    /// A whole block with a correct header and checksum, as a monitor sends one.
+    fn real_edid() -> [u8; 128] {
+        let mut b = [0u8; 128];
+        b[..8].copy_from_slice(&[0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00]);
+        b[18] = 1;
+        b[19] = 4;
+        b[21] = 60;
+        b[22] = 34;
+        let sum = b[..127].iter().fold(0u8, |s, x| s.wrapping_add(*x));
+        b[127] = sum.wrapping_neg();
+        b
+    }
+
+    /// The defect this pair of tests exists for. `NvidiaGpu::get_connector_edid`
+    /// used to build a block out of the 32 bytes the RM gives it by padding the
+    /// rest with zeros, and the DRM core served whatever a driver reported after
+    /// a length check alone. Those bytes cannot pass a checksum, so wlroots --
+    /// through libdisplay-info, which checks -- threw the whole block away and
+    /// the output lost the make, the model and the size that WERE in the 32 real
+    /// bytes. Worse, the kernel refused the same block for its own mode (every
+    /// decoder gates on `block_valid`), so the EDID it handed out and the mode it
+    /// advertised could disagree about the same monitor.
+    #[test]
+    fn a_driver_that_reports_something_that_is_not_an_edid_has_it_refused() {
+        let screen = kms_emu::attach(64, 16);
+        let mut padded = real_edid();
+        // Keep the header, drop the checksum: exactly the shape zero-padding
+        // produces, and exactly the shape a length check lets through.
+        padded[127] = padded[127].wrapping_add(1);
+        let gpu = screen.attach_gpu(EmuGpu::new("emu-edid").with_edid(padded));
+
+        assert_eq!(
+            drm::get_connector_edid(41),
+            None,
+            "a block that fails its own checksum was served as a monitor's identity"
+        );
+        drop(gpu);
+    }
+
+    /// And the other direction, so the refusal is not simply "always none":
+    /// a driver reporting a real block still has it served, byte for byte.
+    #[test]
+    fn a_driver_that_reports_a_real_edid_has_it_served_unchanged() {
+        let screen = kms_emu::attach(64, 16);
+        let good = real_edid();
+        let gpu = screen.attach_gpu(EmuGpu::new("emu-edid").with_edid(good));
+
+        assert_eq!(drm::get_connector_edid(41), Some(good));
+        drop(gpu);
+    }
+
+    /// The 32 bytes the RM actually gives, completed the way the driver now
+    /// completes them, go through. The two halves of the fix have to agree: a
+    /// core that refuses without a driver that repairs would just lose the
+    /// monitor's identity instead of keeping it.
+    #[test]
+    fn the_thirty_two_byte_head_the_rm_gives_is_served_once_completed() {
+        let screen = kms_emu::attach(64, 16);
+        let head = &real_edid()[..32];
+        let completed = zcore_drivers::display::edid::finish_partial_block(head)
+            .expect("a real head completes");
+        let gpu = screen.attach_gpu(EmuGpu::new("emu-edid").with_edid(completed));
+
+        assert_eq!(drm::get_connector_edid(41), Some(completed));
+        drop(gpu);
     }
 }
 

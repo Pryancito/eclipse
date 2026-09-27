@@ -318,6 +318,12 @@ pub(crate) struct EmuGpu {
     /// the software pointer back in charge.
     hw_cursor_plane: AtomicBool,
     next_fb: AtomicU32,
+    /// What this GPU reports when asked for its connector's EDID. A driver
+    /// reports what it read off the DDC line, and that is not always an EDID:
+    /// the NVIDIA driver only gets 32 bytes from the RM and had to make a block
+    /// out of them. Whether such a block is fit to be served is the DRM core's
+    /// decision, so the core needs a driver that can hand it a bad one.
+    edid: Option<[u8; 128]>,
     calls: Mutex<GpuCalls>,
 }
 
@@ -334,8 +340,16 @@ impl EmuGpu {
             accepts_flips: AtomicBool::new(true),
             hw_cursor_plane: AtomicBool::new(false),
             next_fb: AtomicU32::new(EMU_DRIVER_FB_BASE),
+            edid: None,
             calls: Mutex::new(GpuCalls::default()),
         }
+    }
+
+    /// The block this GPU reports for its connector, whatever it is. Passing one
+    /// that is not a valid EDID is the point: the core has to refuse it.
+    pub(crate) fn with_edid(mut self, block: [u8; 128]) -> EmuGpu {
+        self.edid = Some(block);
+        self
     }
 
     /// A GPU that declares `has_hardware_kms()`, like the NVIDIA driver with
@@ -385,6 +399,10 @@ impl DrmScheme for EmuGpu {
 
     fn has_hardware_kms(&self) -> bool {
         self.hardware_kms
+    }
+
+    fn get_connector_edid(&self, id: u32) -> Option<[u8; 128]> {
+        self.connectors.contains(&id).then_some(self.edid).flatten()
     }
 
     fn create_fb(&self, handle_id: u32, width: u32, height: u32, pitch: u32) -> Option<u32> {
