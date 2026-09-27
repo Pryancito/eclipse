@@ -3,6 +3,7 @@
 use core::alloc::Layout;
 use core::panic::PanicInfo;
 
+#[cfg(not(test))]
 #[alloc_error_handler]
 fn alloc_error(layout: Layout) -> ! {
     // The heap is exhausted here, so we must NOT allocate: klog_*! use
@@ -86,19 +87,106 @@ fn alloc_error(layout: Layout) -> ! {
     panic!("memory allocation of {} bytes failed", layout.size());
 }
 
+/// How many bytes a banner may occupy. A stack buffer, because the panic
+/// handler must not allocate (the panic may BE an OOM) and must not depend on
+/// any lock.
+///
+/// It was 1024 for a banner that was a header and a line per stuck site. Since
+/// then the deadlock report grew a `non-acker` line per CPU that owes a TLB
+/// shootdown ack, a `HOLDER cpuN is now at` line per holder, and the `DIAG:`
+/// verdict -- and the buffer did not. A full slot table (~560 B), four
+/// non-acker lines (~140 B each) and the verdict (~190 B) is a little over
+/// 1300, so the report has been overflowing a 1024-byte buffer and losing
+/// whatever came last, which was the conclusion. The comment on the HOLDER
+/// lines shows the shape of it: they are capped at two because "anything added
+/// here is spent out of the verdict's budget" -- rationing the buffer instead
+/// of sizing it.
+///
+/// 2 KiB of a 2 MiB coroutine stack, once, on a machine that is already wedged.
+/// [`tests::the_non_acker_cap_is_small_enough_to_leave_the_rest_of_the_banner_room`]
+/// is what keeps this number ahead of what the banner prints.
+const BANNER_BYTES: usize = 2048;
+
+/// Bytes [`StackBuf::with_reserve`] holds back for the deadlock banner's final
+/// verdict plus the `[+N B cut]` marker: the longest `DIAG:` line is ~190
+/// bytes and the marker ~20.
+const VERDICT_RESERVE: usize = 256;
+
 /// Fixed-size, no-alloc formatter for the panic banner. The panic handler must
 /// not allocate (the panic may BE an OOM) and must not depend on any lock.
+///
+/// `write_str` drops what does not fit, because a banner that panics while
+/// reporting a panic reports nothing. Two things make that safe rather than
+/// merely quiet:
+///
+/// * `reserve` holds bytes back at the end of the buffer, so the line written
+///   after [`release_reserve`] lands whatever came before it. The deadlock
+///   banner needs this: its `DIAG:` verdict is the one line that makes an
+///   on-screen capture self-diagnosing, it is written last, and the block
+///   before it -- one `non-acker cpuN ...` line per CPU that owes a TLB
+///   shootdown ack -- is bounded only by the core count. Eight non-ackers at
+///   ~120 bytes each is the whole buffer, and the conclusion was what fell off
+///   the end. There is no scrolling back on a photograph of a wedged machine.
+/// * `dropped` counts what was lost, so [`truncated`] can say so out loud
+///   instead of leaving a reader to wonder whether the banner ended or was cut.
 struct StackBuf {
-    buf: [u8; 1024],
+    buf: [u8; BANNER_BYTES],
     len: usize,
+    /// Bytes at the end of `buf` that `write_str` will not fill.
+    reserve: usize,
+    /// Bytes `write_str` dropped for want of room.
+    dropped: usize,
+}
+
+impl StackBuf {
+    /// A buffer whose whole length is writable.
+    fn new() -> Self {
+        Self {
+            buf: [0u8; BANNER_BYTES],
+            len: 0,
+            reserve: 0,
+            dropped: 0,
+        }
+    }
+
+    /// A buffer that keeps `reserve` bytes back until [`release_reserve`].
+    fn with_reserve(reserve: usize) -> Self {
+        Self {
+            reserve: reserve.min(BANNER_BYTES),
+            ..Self::new()
+        }
+    }
+
+    /// Open the reserved tail for writing. Call once, immediately before the
+    /// line the reserve exists to protect.
+    fn release_reserve(&mut self) {
+        self.reserve = 0;
+    }
+
+    /// Bytes dropped for want of room, `0` when the banner is complete.
+    fn dropped(&self) -> usize {
+        self.dropped
+    }
+
+    /// The banner as a string. Truncation can split a multi-byte character, so
+    /// what is returned is the valid prefix -- this used to be spelled out at
+    /// each call site.
+    fn valid_str(&self) -> &str {
+        match core::str::from_utf8(&self.buf[..self.len]) {
+            Ok(s) => s,
+            Err(e) => core::str::from_utf8(&self.buf[..e.valid_up_to()]).unwrap_or(""),
+        }
+    }
 }
 
 impl core::fmt::Write for StackBuf {
     fn write_str(&mut self, s: &str) -> core::fmt::Result {
-        let room = self.buf.len() - self.len;
+        let cap = self.buf.len() - self.reserve;
+        let room = cap.saturating_sub(self.len);
         let n = s.len().min(room);
         self.buf[self.len..self.len + n].copy_from_slice(&s.as_bytes()[..n]);
         self.len += n;
+        self.dropped += s.len() - n;
         Ok(())
     }
 }
@@ -124,13 +212,41 @@ static DL_LINE_CPU: [core::sync::atomic::AtomicUsize; DL_SLOTS] =
 static DL_HOLDER: [core::sync::atomic::AtomicUsize; DL_SLOTS] =
     [const { core::sync::atomic::AtomicUsize::new(0) }; DL_SLOTS];
 
+/// `(line, cpu)` in one word: the line in the low half, the cpu in the high
+/// half. One function so the pack and the two unpacks below cannot drift --
+/// reading the pair back with a plain `as u32` is what dropped a whole CPU from
+/// the banner (see [`dl_record`]).
+const fn dl_pack(line: u32, cpu: u32) -> usize {
+    ((cpu as usize) << 32) | line as usize
+}
+
+/// The line half of a packed word.
+const fn dl_line(packed: usize) -> u32 {
+    (packed & 0xffff_ffff) as u32
+}
+
+/// The cpu half of a packed word.
+const fn dl_cpu(packed: usize) -> usize {
+    packed >> 32
+}
+
 /// Record one `(site, cpu, role)` into the slots (deduplicated) — lock-free.
+///
+/// All three parts of that tuple are the key. The comparison used to mask the
+/// packed word down to its line (`as u32`), so `cpu` was not in it: a second
+/// CPU stuck at the SAME source line was dropped as a duplicate. That is not a
+/// corner — it is the case this whole banner exists for. A shootdown convoy is
+/// several CPUs wedged in one place, and the capture that prompted the HOLDER
+/// lines had holder and waiter at the very same line (the kernel heap's
+/// `dealloc`). The photograph then showed one CPU where several were stuck, and
+/// "every stuck call site at once" quietly meant "one of them".
 fn dl_record(ptr: usize, len: usize, line: u32, cpu: u32, holder: bool) {
     use core::sync::atomic::Ordering;
+    let key = dl_pack(line, cpu);
     for i in 0..DL_SLOTS {
         let cur = DL_FILE_PTR[i].load(Ordering::SeqCst);
         if cur == ptr
-            && (DL_LINE_CPU[i].load(Ordering::SeqCst) as u32) == line
+            && DL_LINE_CPU[i].load(Ordering::SeqCst) == key
             && (DL_HOLDER[i].load(Ordering::SeqCst) != 0) == holder
         {
             return;
@@ -141,21 +257,51 @@ fn dl_record(ptr: usize, len: usize, line: u32, cpu: u32, holder: bool) {
                 .is_ok()
         {
             DL_FILE_LEN[i].store(len, Ordering::SeqCst);
-            DL_LINE_CPU[i].store(((cpu as usize) << 32) | line as usize, Ordering::SeqCst);
+            DL_LINE_CPU[i].store(key, Ordering::SeqCst);
             DL_HOLDER[i].store(holder as usize, Ordering::SeqCst);
             return;
         }
     }
 }
 
+/// The most `non-acker` lines the banner prints, and how many CPUs that leaves
+/// out.
+///
+/// The cap exists for the same reason the HOLDER lines are capped at two: this
+/// is the one block whose length is set by the core count rather than by the
+/// slot table, at ~120 bytes a line, and it is written before the verdict.
+/// Sixty-four of them is sixty times the buffer. The lines are repetitive -- a
+/// convoy's non-ackers are usually wedged in the same place -- so the first few
+/// carry the finding.
+const MAX_NONACKER_LINES: usize = 4;
+
+/// `(lines to print, CPUs left out)` for `total` non-acking CPUs.
+const fn nonacker_lines(total: usize) -> (usize, usize) {
+    if total <= MAX_NONACKER_LINES {
+        (total, 0)
+    } else {
+        (MAX_NONACKER_LINES, total - MAX_NONACKER_LINES)
+    }
+}
+
+/// How many slots hold a recorded site. Monotone (slots are claimed and never
+/// released) and bounded by [`DL_SLOTS`], which is what makes it a safe key for
+/// the serial re-emit guard.
+fn dl_recorded_sites() -> usize {
+    use core::sync::atomic::Ordering;
+    (0..DL_SLOTS)
+        .filter(|&i| DL_FILE_PTR[i].load(Ordering::SeqCst) != 0)
+        .count()
+}
+
 /// Rebuild and paint the banner from all recorded slots.
 fn dl_paint() {
     use core::fmt::Write;
     use core::sync::atomic::Ordering;
-    let mut b = StackBuf {
-        buf: [0u8; 1024],
-        len: 0,
-    };
+    // Reserved: the `DIAG:` verdict below is written last and is the line that
+    // makes a photograph of a wedged machine self-diagnosing. Everything
+    // between here and `release_reserve` may be cut; that line may not.
+    let mut b = StackBuf::with_reserve(VERDICT_RESERVE);
     // The build id pins WHICH binary paniced: a stale build booted after a
     // fix landed reads exactly like the fix not working.
     let _ = write!(
@@ -187,7 +333,7 @@ fn dl_paint() {
         }
         let l = DL_FILE_LEN[i].load(Ordering::SeqCst);
         let lc = DL_LINE_CPU[i].load(Ordering::SeqCst);
-        let cpu = lc >> 32;
+        let cpu = dl_cpu(lc);
         let is_holder = DL_HOLDER[i].load(Ordering::SeqCst) != 0;
         let role = if is_holder { "HOLDER " } else { "" };
         if is_holder && holder_n < DL_SLOTS {
@@ -200,7 +346,7 @@ fn dl_paint() {
         let f = unsafe {
             core::str::from_utf8_unchecked(core::slice::from_raw_parts(p as *const u8, l))
         };
-        let _ = write!(b, "\n{}cpu={} at {}:{}", role, cpu, f, lc & 0xffff_ffff);
+        let _ = write!(b, "\n{}cpu={} at {}:{}", role, cpu, f, dl_line(lc));
         // If this CPU is spin-waiting for a TLB-shootdown ack, name the CPUs it
         // is blocked on. A HOLDER shown here is the convoy head — the machine is
         // wedged not by a lock cycle but because those CPUs never acked.
@@ -263,9 +409,24 @@ fn dl_paint() {
     kernel_hal::kstats::capture_cpu_rips();
     if nonack_union != 0 {
         let mut m = nonack_union;
+        // Capped, and the count of what was left out printed, for the same
+        // reason the HOLDER lines are capped at two: this is the one block in
+        // the banner whose length is set by the core count rather than by the
+        // slot table, at ~120 bytes a line, and it is written BEFORE the
+        // verdict. Sixty-four of them is sixty times the buffer. The lines are
+        // repetitive -- a convoy's non-ackers are usually wedged in the same
+        // place -- so the first few carry the finding and the rest only cost
+        // the reader the conclusion.
+        let (cap, omitted) = nonacker_lines(nonack_union.count_ones() as usize);
+        let mut shown = 0usize;
         while m != 0 {
             let c = m.trailing_zeros() as usize;
             m &= m - 1;
+            if shown == cap {
+                let _ = write!(b, "\n… and {} more non-acking cpu(s) not shown", omitted);
+                break;
+            }
+            shown += 1;
             let nmi = kernel_hal::kstats::nmi_rip(c);
             let tick = kernel_hal::kstats::cpu_tick_rip(c);
             let post_seq = kernel_hal::shootdown_seq_of(c);
@@ -322,6 +483,9 @@ fn dl_paint() {
             );
         }
     }
+    // Everything above was allowed to be cut; what follows is not. The verdict
+    // is the line a reader acts on, so it gets the bytes held back for it.
+    b.release_reserve();
     // One-line verdict so the on-screen (no-serial) capture is self-diagnosing.
     if shootdown_head {
         let _ = write!(
@@ -347,10 +511,13 @@ fn dl_paint() {
              \"is now at\" line above says which."
         );
     }
-    let valid = match core::str::from_utf8(&b.buf[..b.len]) {
-        Ok(s) => s,
-        Err(e) => core::str::from_utf8(&b.buf[..e.valid_up_to()]).unwrap_or(""),
-    };
+    // Say so when the banner did not all fit, rather than ending mid-line and
+    // letting a reader take the cut for the end of the report.
+    let cut = b.dropped();
+    if cut > 0 {
+        let _ = write!(b, "\n[{} B of this report did not fit]", cut);
+    }
+    let valid = b.valid_str();
     kernel_hal::console::panic_banner(valid);
     // …and to the serial console, which is the only one anybody watching a
     // headless run can see.
@@ -378,11 +545,22 @@ fn dl_paint() {
     // unknowable: the framebuffer repaint had it, and nobody could see it.
     // Slot count bounds the reprints (each unique site is recorded once), so
     // this cannot storm: at most DL_SLOTS emissions ever.
-    static DL_SERIAL_LEN: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
-    let prev = DL_SERIAL_LEN.load(Ordering::SeqCst);
-    if b.len > prev
-        && DL_SERIAL_LEN
-            .compare_exchange(prev, b.len, Ordering::SeqCst, Ordering::SeqCst)
+    // Keyed on how many SITES have been recorded, which is what bounds the
+    // reprints. It used to be keyed on the banner's byte length, and that is
+    // not the same number: the block of `non-acker`/`is now at` lines is
+    // rebuilt from live RIPs on every call, so its length moves without a new
+    // site being recorded (extra emissions) and a genuinely new site can leave
+    // the length unchanged (a suppressed one). Worse once the banner is long
+    // enough to be cut: the length then stops growing at the buffer size, so
+    // the HOLDER line -- the one a once-guard was changed to stop losing --
+    // would never be mailed out at all.
+    static DL_SERIAL_SITES: core::sync::atomic::AtomicUsize =
+        core::sync::atomic::AtomicUsize::new(0);
+    let sites = dl_recorded_sites();
+    let prev = DL_SERIAL_SITES.load(Ordering::SeqCst);
+    if sites > prev
+        && DL_SERIAL_SITES
+            .compare_exchange(prev, sites, Ordering::SeqCst, Ordering::SeqCst)
             .is_ok()
     {
         kernel_hal::console::serial_write_fmt_spin(format_args!("\n[{}]\n", valid));
@@ -404,6 +582,7 @@ pub fn deadlock_holder_report(file_ptr: usize, file_len: usize, line: u32, cpu: 
     dl_paint();
 }
 
+#[cfg(not(test))]
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
     // Disable interrupts immediately. With panic-strategy=abort, local variables
@@ -427,10 +606,7 @@ fn panic(info: &PanicInfo) -> ! {
     // visible only on serial). This banner cannot.
     {
         use core::fmt::Write;
-        let mut b = StackBuf {
-            buf: [0u8; 1024],
-            len: 0,
-        };
+        let mut b = StackBuf::new();
         if let Some(loc) = info.location() {
             let _ = write!(
                 b,
@@ -448,12 +624,7 @@ fn panic(info: &PanicInfo) -> ! {
                 info.message()
             );
         }
-        let valid = match core::str::from_utf8(&b.buf[..b.len]) {
-            Ok(s) => s,
-            // Truncation can split a multi-byte char; keep the valid prefix.
-            Err(e) => core::str::from_utf8(&b.buf[..e.valid_up_to()]).unwrap_or(""),
-        };
-        kernel_hal::console::panic_banner(valid);
+        kernel_hal::console::panic_banner(b.valid_str());
     }
 
     // Make the panic VISIBLE after a compositor took the screen. Once labwc
@@ -607,5 +778,352 @@ fn panic(info: &PanicInfo) -> ! {
         loop {
             core::hint::spin_loop();
         }
+    }
+}
+
+/// The banner builder and the deadlock slots, on the host.
+///
+/// Neither had ever been compiled by a test binary: this module is
+/// `#[cfg(not(feature = "libos"))]` in the kernel build and `cargo test -p
+/// zcore` runs with `--features libos`, so the panic path and the deadlock
+/// report were written, twice rewritten, and never once executed by a job.
+/// Only `#[panic_handler]` and `#[alloc_error_handler]` genuinely cannot be
+/// here (std supplies both); everything below is the code the machine runs.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use core::fmt::Write;
+    use core::sync::atomic::Ordering;
+
+    /// One test at a time through the deadlock slots, which are process-wide
+    /// statics that every test would otherwise believe are its own -- and which
+    /// are deliberately never cleared in the kernel, so they cannot be reset by
+    /// the code under test. Saved and restored, so a test leaves the slots as it
+    /// found them even on a panic.
+    fn alone_with_the_slots(body: impl FnOnce()) {
+        extern crate std;
+        use std::sync::Mutex;
+        static TURNSTILE: Mutex<()> = Mutex::new(());
+        let _guard = TURNSTILE.lock().unwrap_or_else(|e| e.into_inner());
+        let saved: [(usize, usize, usize, usize); DL_SLOTS] = core::array::from_fn(|i| {
+            (
+                DL_FILE_PTR[i].load(Ordering::SeqCst),
+                DL_FILE_LEN[i].load(Ordering::SeqCst),
+                DL_LINE_CPU[i].load(Ordering::SeqCst),
+                DL_HOLDER[i].load(Ordering::SeqCst),
+            )
+        });
+        for i in 0..DL_SLOTS {
+            DL_FILE_PTR[i].store(0, Ordering::SeqCst);
+            DL_FILE_LEN[i].store(0, Ordering::SeqCst);
+            DL_LINE_CPU[i].store(0, Ordering::SeqCst);
+            DL_HOLDER[i].store(0, Ordering::SeqCst);
+        }
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(body));
+        for (i, (p, l, lc, h)) in saved.iter().enumerate() {
+            DL_FILE_PTR[i].store(*p, Ordering::SeqCst);
+            DL_FILE_LEN[i].store(*l, Ordering::SeqCst);
+            DL_LINE_CPU[i].store(*lc, Ordering::SeqCst);
+            DL_HOLDER[i].store(*h, Ordering::SeqCst);
+        }
+        if let Err(e) = r {
+            std::panic::resume_unwind(e);
+        }
+    }
+
+    /// The `(file, line, cpu, role)` of one slot, as the banner would print it.
+    fn slot(i: usize) -> Option<(&'static str, u32, usize, bool)> {
+        let p = DL_FILE_PTR[i].load(Ordering::SeqCst);
+        if p == 0 {
+            return None;
+        }
+        let l = DL_FILE_LEN[i].load(Ordering::SeqCst);
+        let lc = DL_LINE_CPU[i].load(Ordering::SeqCst);
+        // SAFETY: the test stored these from a `&'static str` literal.
+        let f = unsafe {
+            core::str::from_utf8_unchecked(core::slice::from_raw_parts(p as *const u8, l))
+        };
+        Some((
+            f,
+            dl_line(lc),
+            dl_cpu(lc),
+            DL_HOLDER[i].load(Ordering::SeqCst) != 0,
+        ))
+    }
+
+    fn record(file: &'static str, line: u32, cpu: u32, holder: bool) {
+        dl_record(file.as_ptr() as usize, file.len(), line, cpu, holder);
+    }
+
+    // ── The banner buffer ───────────────────────────────────────────────────
+
+    #[test]
+    fn a_banner_that_fits_comes_back_whole_and_drops_nothing() {
+        let mut b = StackBuf::new();
+        let _ = write!(b, "DEADLOCK: cpu={} at {}:{}", 3, "src/lib.rs", 42);
+        assert_eq!(b.valid_str(), "DEADLOCK: cpu=3 at src/lib.rs:42");
+        assert_eq!(b.dropped(), 0);
+    }
+
+    #[test]
+    fn a_banner_past_the_buffer_keeps_its_head_and_counts_what_it_lost() {
+        let mut b = StackBuf::new();
+        // Written in chunks, as `format_args!` feeds the writer, and past the
+        // end of the buffer whatever its size is.
+        let chunk = "x".repeat(100);
+        let chunks = BANNER_BYTES / 100 + 3;
+        for _ in 0..chunks {
+            let _ = write!(b, "{}", chunk);
+        }
+        assert_eq!(b.valid_str().len(), BANNER_BYTES);
+        assert_eq!(b.dropped(), chunks * 100 - BANNER_BYTES);
+        assert!(b.valid_str().starts_with("xxx"));
+    }
+
+    /// The reserve is not spendable by the lines that come before it: that is
+    /// the whole mechanism, and the number it protects is the buffer size minus
+    /// the reserve, not the buffer size.
+    #[test]
+    fn the_lines_before_the_verdict_cannot_spend_the_bytes_held_back_for_it() {
+        let mut b = StackBuf::with_reserve(VERDICT_RESERVE);
+        let _ = write!(b, "{}", "y".repeat(BANNER_BYTES * 2));
+        assert_eq!(b.valid_str().len(), BANNER_BYTES - VERDICT_RESERVE);
+        assert!(b.dropped() > 0);
+    }
+
+    /// The bug, in the shape the machine produces it: a header, then a block of
+    /// repetitive `non-acker` lines long enough to fill the banner, and then the
+    /// one line a reader acts on. Without the reserve the verdict is what falls
+    /// off the end -- on a photograph of a wedged machine, with nothing to
+    /// scroll back to.
+    #[test]
+    fn the_verdict_lands_even_when_the_block_before_it_filled_the_banner() {
+        const VERDICT: &str = "\nDIAG: no HOLDER is in a shootdown wait. Either a \
+                               lock-ordering cycle (AB-BA) or a HOLDER stuck inside \
+                               its own critical section -- the \"is now at\" line \
+                               above says which.";
+        let mut b = StackBuf::with_reserve(VERDICT_RESERVE);
+        let _ = write!(b, "DEADLOCK: spinlock(s) stuck >8s [build deadbeef]");
+        for c in 0..64 {
+            let _ = write!(
+                b,
+                "\nnon-acker cpu{} nmi_rip={:#x} (last_tick={:#x}) seq={}->{} \
+                 goal={} q={}/{}/{} fl={}{}",
+                c, 0xffff_ff00_0007_3bf2u64, 0xffff_ff00_0007_3bf2u64, 7, 7, 9, 1, 2, 3, 1, 0
+            );
+        }
+        assert!(
+            b.dropped() > 0,
+            "the block should have overflowed the banner"
+        );
+        b.release_reserve();
+        let _ = write!(b, "{}", VERDICT);
+        assert!(
+            b.valid_str().ends_with("above says which."),
+            "the verdict was cut: banner ends {:?}",
+            &b.valid_str()[b.valid_str().len() - 40..]
+        );
+        assert!(b.valid_str().starts_with("DEADLOCK: spinlock(s) stuck >8s"));
+    }
+
+    #[test]
+    fn a_banner_says_so_when_it_did_not_all_fit() {
+        let mut b = StackBuf::with_reserve(VERDICT_RESERVE);
+        let _ = write!(b, "{}", "z".repeat(BANNER_BYTES * 2));
+        b.release_reserve();
+        let cut = b.dropped();
+        let _ = write!(b, "\n[{} B of this report did not fit]", cut);
+        assert!(b.valid_str().ends_with("B of this report did not fit]"));
+        assert!(cut > 0);
+    }
+
+    /// A cut can land in the middle of a multi-byte character, and the banner is
+    /// handed on as a `&str`.
+    #[test]
+    fn a_character_the_cut_split_in_half_is_not_in_the_banner() {
+        let mut b = StackBuf::new();
+        let _ = write!(b, "{}", "a".repeat(BANNER_BYTES - 1));
+        // 'é' is two bytes and only one byte of room is left.
+        let _ = write!(b, "é");
+        assert_eq!(b.dropped(), 1, "one byte of the pair should have been kept");
+        let s = b.valid_str();
+        assert_eq!(s.len(), BANNER_BYTES - 1, "the half character is not in it");
+        assert!(s.chars().all(|c| c == 'a'));
+    }
+
+    #[test]
+    fn a_reserve_bigger_than_the_buffer_leaves_no_room_instead_of_panicking() {
+        let mut b = StackBuf::with_reserve(BANNER_BYTES * 4);
+        let _ = write!(b, "anything at all");
+        assert_eq!(b.valid_str(), "");
+        assert_eq!(b.dropped(), "anything at all".len());
+        b.release_reserve();
+        let _ = write!(b, "the verdict");
+        assert_eq!(b.valid_str(), "the verdict");
+    }
+
+    // ── The packed (line, cpu) word ─────────────────────────────────────────
+
+    #[test]
+    fn the_line_and_the_cpu_come_back_out_of_the_packed_word() {
+        for (line, cpu) in [(1u32, 0u32), (42, 3), (u32::MAX, 63), (0, 63)] {
+            let p = dl_pack(line, cpu);
+            assert_eq!(dl_line(p), line, "line of ({line}, {cpu})");
+            assert_eq!(dl_cpu(p), cpu as usize, "cpu of ({line}, {cpu})");
+        }
+    }
+
+    /// The comparison that dropped a CPU: masked to `as u32` these two are the
+    /// same word.
+    #[test]
+    fn the_same_line_on_two_cpus_is_two_different_keys() {
+        assert_ne!(dl_pack(1200, 0), dl_pack(1200, 1));
+        assert_eq!(dl_line(dl_pack(1200, 0)), dl_line(dl_pack(1200, 1)));
+    }
+
+    // ── The slots ───────────────────────────────────────────────────────────
+
+    /// The bug. A shootdown convoy is several CPUs wedged in one place, and the
+    /// capture that prompted the HOLDER lines had holder and waiter at the very
+    /// same line, so this is the ordinary case and not a corner. The banner
+    /// showed one of them.
+    #[test]
+    fn two_cpus_stuck_at_the_same_line_are_both_recorded() {
+        alone_with_the_slots(|| {
+            record("linux-object/src/fs/pty.rs", 1200, 0, false);
+            record("linux-object/src/fs/pty.rs", 1200, 3, false);
+            assert_eq!(dl_recorded_sites(), 2, "the second cpu was dropped");
+            assert_eq!(slot(0).map(|s| s.2), Some(0));
+            assert_eq!(slot(1).map(|s| s.2), Some(3));
+        });
+    }
+
+    #[test]
+    fn the_same_cpu_reporting_the_same_line_again_is_recorded_once() {
+        alone_with_the_slots(|| {
+            for _ in 0..10 {
+                record("kernel-hal/src/mem.rs", 88, 2, false);
+            }
+            assert_eq!(dl_recorded_sites(), 1);
+        });
+    }
+
+    /// The role is part of the key too: one CPU can be a waiter at a line while
+    /// another CPU holds the lock acquired at that same line, and the HOLDER
+    /// line is the one that names the wedged path.
+    #[test]
+    fn a_waiter_and_a_holder_at_one_line_are_two_records() {
+        alone_with_the_slots(|| {
+            record("zCore/src/memory.rs", 77, 1, false);
+            record("zCore/src/memory.rs", 77, 1, true);
+            assert_eq!(dl_recorded_sites(), 2);
+            assert_eq!(slot(0).map(|s| s.3), Some(false));
+            assert_eq!(slot(1).map(|s| s.3), Some(true));
+        });
+    }
+
+    #[test]
+    fn the_slots_fill_up_and_then_keep_what_they_have() {
+        alone_with_the_slots(|| {
+            for cpu in 0..(DL_SLOTS as u32 + 4) {
+                record("a/b.rs", 5, cpu, false);
+            }
+            assert_eq!(dl_recorded_sites(), DL_SLOTS);
+            // The first reporters are the ones kept, not the last.
+            assert_eq!(slot(0).map(|s| s.2), Some(0));
+            assert_eq!(slot(DL_SLOTS - 1).map(|s| s.2), Some(DL_SLOTS - 1));
+        });
+    }
+
+    /// The cap on the one block whose length the core count sets. Under the cap
+    /// nothing is hidden and nothing is claimed to be; over it the reader is
+    /// told exactly how many CPUs are missing, because "and 2 more" and "and 59
+    /// more" are different findings.
+    #[test]
+    fn the_non_acker_block_says_how_many_cpus_it_left_out() {
+        assert_eq!(nonacker_lines(0), (0, 0));
+        assert_eq!(nonacker_lines(1), (1, 0));
+        assert_eq!(nonacker_lines(MAX_NONACKER_LINES), (MAX_NONACKER_LINES, 0));
+        assert_eq!(
+            nonacker_lines(MAX_NONACKER_LINES + 1),
+            (MAX_NONACKER_LINES, 1)
+        );
+        assert_eq!(
+            nonacker_lines(64),
+            (MAX_NONACKER_LINES, 64 - MAX_NONACKER_LINES)
+        );
+        // Whatever the count, every CPU is either printed or counted.
+        for total in 0..=64 {
+            let (shown, omitted) = nonacker_lines(total);
+            assert_eq!(shown + omitted, total, "{total} non-ackers");
+            assert!(shown <= MAX_NONACKER_LINES);
+        }
+    }
+
+    /// How big the cap may be, said WITHOUT naming the cap -- otherwise the
+    /// test above moves with it and a cap of 64 passes, which is how a first
+    /// pass at this let the mutant live.
+    ///
+    /// Two independent bounds. The block is supplementary to the slot table, so
+    /// printing more non-ackers than there are slots for actual stuck sites
+    /// inverts the banner's priorities; and one line, measured here rather than
+    /// guessed, times the cap must still leave the slot table and the verdict
+    /// their room in the buffer.
+    #[test]
+    fn the_non_acker_cap_is_small_enough_to_leave_the_rest_of_the_banner_room() {
+        assert!(
+            MAX_NONACKER_LINES * 2 <= DL_SLOTS,
+            "more non-acker lines ({}) than half the slot table ({})",
+            MAX_NONACKER_LINES,
+            DL_SLOTS
+        );
+        // One line at the magnitudes the kernel prints: a kernel-half RIP, a
+        // shootdown sequence and goal, three queue indices and two flags.
+        let mut one = StackBuf::new();
+        let _ = write!(
+            one,
+            "\nnon-acker cpu{} nmi_rip={:#x} (last_tick={:#x}) seq={}->{} \
+             goal={} q={}/{}/{} fl={}{}",
+            63usize,
+            0xffff_ff00_0007_3bf2u64,
+            0xffff_ff00_0007_3bf2u64,
+            u32::MAX,
+            u32::MAX,
+            u32::MAX,
+            4095,
+            4095,
+            4095,
+            1,
+            1
+        );
+        let line = one.valid_str().len();
+        assert_eq!(one.dropped(), 0, "the measurement itself was cut");
+        // The slot table is what the banner is chiefly for: DL_SLOTS lines of a
+        // path and a number, ~70 bytes each.
+        let slot_table = DL_SLOTS * 70;
+        assert!(
+            MAX_NONACKER_LINES * line + slot_table + VERDICT_RESERVE <= BANNER_BYTES,
+            "{} non-acker lines of {line} B plus the slot table ({slot_table} B) \
+             and the verdict ({VERDICT_RESERVE} B) do not fit in {BANNER_BYTES} B",
+            MAX_NONACKER_LINES
+        );
+    }
+
+    /// What the serial re-emit guard is keyed on, now that it is not keyed on
+    /// the banner's byte length: monotone, and bounded by the slot count.
+    #[test]
+    fn the_recorded_site_count_rises_once_per_new_site_and_stops_at_the_slots() {
+        alone_with_the_slots(|| {
+            assert_eq!(dl_recorded_sites(), 0);
+            for cpu in 0..(DL_SLOTS as u32) {
+                record("a/b.rs", 5, cpu, false);
+                assert_eq!(dl_recorded_sites(), cpu as usize + 1);
+                // Reporting again does not move it.
+                record("a/b.rs", 5, cpu, false);
+                assert_eq!(dl_recorded_sites(), cpu as usize + 1);
+            }
+            record("c/d.rs", 9, 40, false);
+            assert_eq!(dl_recorded_sites(), DL_SLOTS);
+        });
     }
 }
