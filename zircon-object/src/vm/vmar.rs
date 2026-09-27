@@ -367,7 +367,7 @@ mod aspace_window {
     /// Give a window back. `addr` is a root VMAR's base; anything that is not
     /// one of our windows is ignored.
     pub fn give_back(addr: usize, size: usize) {
-        if size != SIZE || addr < BASE || (addr - BASE) % SIZE != 0 {
+        if size != SIZE || addr < BASE || !(addr - BASE).is_multiple_of(SIZE) {
             return;
         }
         let i = (addr - BASE) / SIZE;
@@ -2495,6 +2495,14 @@ impl VmMapping {
                 None
             }
         };
+        // The split below is a SECOND mapping of the same VMO, and only
+        // `VmMapping::new` tells the VMO about one -- this one is built by
+        // hand, so it was never counted while its `Drop` counts it out. Told
+        // here and not in the branch that uses it, because the error paths in
+        // between drop the spare unused and have to be symmetric.
+        if let Some(spare) = &spare {
+            self.vmo.append_mapping(Arc::downgrade(spare));
+        }
         let mut inner = self.inner.lock();
         let mut page_table = self.page_table.lock();
         if inner.addr >= begin && inner.end_addr() <= end {
@@ -3375,6 +3383,11 @@ impl VmMappingInner {
 
 impl Drop for VmMapping {
     fn drop(&mut self) {
+        // Before the `size == 0` return below: the VMO counts mappings, not
+        // mapped bytes, and `unmap`/`clear` zero the size before letting the
+        // mapping go, so after that return the count never comes down at all.
+        // See `VmObject::forget_mapping`.
+        self.vmo.forget_mapping();
         let (addr, size) = {
             let inner = self.inner.lock();
             (inner.addr, inner.size)
@@ -5071,5 +5084,129 @@ mod range_is_free_tests {
         assert!(vmar.range_is_free(addr, PAGE_SIZE));
         vmar.destroy().unwrap();
         assert!(!vmar.range_is_free(addr, PAGE_SIZE));
+    }
+}
+
+#[cfg(test)]
+mod mapping_count_tests {
+    //! A VMO counts how many mappings it has, and until now the count only ever
+    //! went up: nothing called `VmObject::remove_mapping`, so an object that had
+    //! been mapped and unmapped reported sharers it no longer had.
+    use super::*;
+
+    fn one_page_vmo() -> Arc<VmObject> {
+        VmObject::new_paged(1)
+    }
+
+    #[test]
+    fn unmapping_brings_the_share_count_back_down() {
+        let vmar = VmAddressRegion::new_root_zircon();
+        let vmo = one_page_vmo();
+        assert_eq!(vmo.share_count(), 0, "a fresh VMO has no mappings");
+        vmar.map_at(0, vmo.clone(), 0, PAGE_SIZE, MMUFlags::READ)
+            .unwrap();
+        assert_eq!(vmo.share_count(), 1);
+        vmar.unmap(vmar.addr(), PAGE_SIZE).unwrap();
+        assert_eq!(
+            vmo.share_count(),
+            0,
+            "the mapping is gone and the VMO still counts it"
+        );
+    }
+
+    #[test]
+    fn mapping_and_unmapping_over_and_over_does_not_run_the_count_up() {
+        let vmar = VmAddressRegion::new_root_zircon();
+        let vmo = one_page_vmo();
+        for round in 0..8 {
+            vmar.map_at(0, vmo.clone(), 0, PAGE_SIZE, MMUFlags::READ)
+                .unwrap();
+            vmar.unmap(vmar.addr(), PAGE_SIZE).unwrap();
+            assert_eq!(
+                vmo.share_count(),
+                0,
+                "round {}: the count kept what the last round mapped",
+                round
+            );
+        }
+    }
+
+    /// The count is what `set_cache_policy` refuses on, so a monotonic count
+    /// refused for the rest of the object's life.
+    #[test]
+    fn a_vmo_that_was_mapped_and_unmapped_accepts_a_cache_policy() {
+        let vmar = VmAddressRegion::new_root_zircon();
+        let vmo = one_page_vmo();
+        vmar.map_at(0, vmo.clone(), 0, PAGE_SIZE, MMUFlags::READ)
+            .unwrap();
+        assert_eq!(
+            vmo.set_cache_policy(CachePolicy::Uncached),
+            Err(ZxError::BAD_STATE),
+            "a mapped VMO must still refuse a cache policy"
+        );
+        vmar.unmap(vmar.addr(), PAGE_SIZE).unwrap();
+        vmo.set_cache_policy(CachePolicy::Uncached)
+            .expect("nothing is mapped any more, so this must be allowed");
+    }
+
+    /// `clear`/`destroy_internal` unmap the range and zero the mapping's size
+    /// first, so `Drop for VmMapping` returns early -- which is why the count
+    /// has to come down before that return and not after it.
+    #[test]
+    fn destroying_the_region_brings_the_count_down_too() {
+        let vmar = VmAddressRegion::new_root_zircon();
+        let vmo = one_page_vmo();
+        vmar.map_at(0, vmo.clone(), 0, PAGE_SIZE, MMUFlags::READ)
+            .unwrap();
+        assert_eq!(vmo.share_count(), 1);
+        vmar.clear().unwrap();
+        assert_eq!(
+            vmo.share_count(),
+            0,
+            "the region let the mapping go and the VMO still counts it"
+        );
+    }
+
+    /// Unmapping a hole in the middle splits one mapping into two, and `cut`
+    /// builds the second one by hand instead of through `VmMapping::new`, so
+    /// the VMO was never told about it.
+    #[test]
+    fn a_mapping_split_in_two_is_counted_twice() {
+        let vmar = VmAddressRegion::new_root_zircon();
+        let vmo = VmObject::new_paged(3);
+        vmar.map_at(0, vmo.clone(), 0, 3 * PAGE_SIZE, MMUFlags::READ)
+            .unwrap();
+        assert_eq!(vmo.share_count(), 1);
+        vmar.unmap(vmar.addr() + PAGE_SIZE, PAGE_SIZE).unwrap();
+        assert_eq!(
+            vmo.share_count(),
+            2,
+            "the hole left two mappings and the VMO counts one"
+        );
+        vmar.clear().unwrap();
+        assert_eq!(
+            vmo.share_count(),
+            0,
+            "both halves are gone and the VMO still counts one"
+        );
+    }
+
+    /// Two live mappings of one object is what the `share_count() > 1` guards
+    /// are for, and dropping one of them has to leave the other counted.
+    #[test]
+    fn dropping_one_of_two_mappings_leaves_the_other_counted() {
+        let vmar = VmAddressRegion::new_root_zircon();
+        let vmo = one_page_vmo();
+        vmar.map_at(0, vmo.clone(), 0, PAGE_SIZE, MMUFlags::READ)
+            .unwrap();
+        vmar.map_at(2 * PAGE_SIZE, vmo.clone(), 0, PAGE_SIZE, MMUFlags::READ)
+            .unwrap();
+        assert_eq!(vmo.share_count(), 2);
+        vmar.unmap(vmar.addr(), PAGE_SIZE).unwrap();
+        assert_eq!(
+            vmo.share_count(),
+            1,
+            "one mapping left, and the VMO says otherwise"
+        );
     }
 }

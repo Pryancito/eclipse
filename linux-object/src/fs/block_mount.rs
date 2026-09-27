@@ -357,6 +357,18 @@ impl BlockCache {
         self.lru.insert(new_tick, sector);
     }
 
+    /// Forget a sector whose on-disk contents are no longer known, so the next
+    /// read fetches it from the device instead of trusting a copy that may not
+    /// match the disk. Both indexes are cleared together: an `lru` key left
+    /// behind names a sector that is no longer resident, so it costs the
+    /// eviction loop a wasted round for as long as it sits there, and the two
+    /// maps stop agreeing on how much is cached.
+    fn invalidate(&mut self, sector: u64) {
+        if let Some(line) = self.lines.remove(&sector) {
+            self.lru.remove(&line.tick);
+        }
+    }
+
     /// Patch `src` into a *resident* sector at byte offset `off`. No-op if the
     /// sector is not cached: write-through already put the bytes on disk, so the
     /// next read will fetch them fresh.
@@ -654,9 +666,33 @@ impl Device for CachedDevice {
         if buf.is_empty() {
             return Ok(0);
         }
+        // The sectors this request spans; used below to drop cached copies whose
+        // on-disk contents the write left unknown.
+        let req_first = (offset / SECTOR) as u64;
+        let req_last = ((offset + buf.len() - 1) / SECTOR) as u64;
+
         // Write-through first: the disk is authoritative and acknowledged bytes
         // survive a crash regardless of cache state.
-        let n = self.inner.write_at(offset, buf)?;
+        let n = match self.inner.write_at(offset, buf) {
+            Ok(n) => n,
+            Err(e) => {
+                // A failed write is NOT a write that did not happen. The layer
+                // below writes sector by sector (and read-modify-writes the
+                // partial head and tail), so an error on any one of them leaves
+                // the earlier ones on disk. Keeping the old copies cached would
+                // break the one invariant this cache rests on — a resident
+                // sector holds exactly what is on disk — and every later read
+                // would be served the pre-write bytes from RAM, silently, with
+                // the filesystem above having already been told the write
+                // failed. Forget the whole span instead: the next read pays one
+                // device command and sees the truth.
+                let mut cache = self.cache.lock();
+                for sector in req_first..=req_last {
+                    cache.invalidate(sector);
+                }
+                return Err(e);
+            }
+        };
         if n == 0 {
             return Ok(0);
         }
@@ -681,6 +717,16 @@ impl Device for CachedDevice {
                     cov_start - s_start,
                     &buf[cov_start - offset..cov_end - offset],
                 );
+            }
+        }
+        // A short write is the same story on a smaller scale: the bytes past `n`
+        // were not acknowledged, yet the sectors holding them may have been
+        // touched (the tail sector is read-modify-written before the error
+        // surfaces). Anything the reconciliation above did not account for is
+        // therefore of unknown content and must not stay cached.
+        if n < buf.len() {
+            for sector in (end / SECTOR) as u64..=req_last {
+                cache.invalidate(sector);
             }
         }
         Ok(n)
@@ -1232,6 +1278,142 @@ mod block_byte_tests {
         // Still room for exactly one more before eviction.
         c.insert(6, &[0x33; SECTOR]);
         assert!(c.contains(5) && c.contains(6));
+    }
+
+    /// A backing device that stops part-way: everything below `fail_from` lands
+    /// on disk, and a write reaching past it writes the part that fits and then
+    /// reports the failure — which is how the layer below actually behaves, one
+    /// sector (or one read-modify-write) at a time.
+    struct PartialWriteDevice {
+        data: Mutex<Vec<u8>>,
+        fail_from: usize,
+    }
+    impl Device for PartialWriteDevice {
+        fn read_at(&self, offset: usize, buf: &mut [u8]) -> DevResult<usize> {
+            let d = self.data.lock();
+            let take = min(buf.len(), d.len().saturating_sub(offset));
+            buf[..take].copy_from_slice(&d[offset..offset + take]);
+            Ok(take)
+        }
+        fn write_at(&self, offset: usize, buf: &[u8]) -> DevResult<usize> {
+            let mut d = self.data.lock();
+            let take = min(buf.len(), self.fail_from.saturating_sub(offset));
+            d[offset..offset + take].copy_from_slice(&buf[..take]);
+            if take < buf.len() {
+                Err(DevError)
+            } else {
+                Ok(take)
+            }
+        }
+        fn sync(&self) -> DevResult<()> {
+            Ok(())
+        }
+    }
+
+    /// A backing device that writes everything but only *acknowledges* a prefix,
+    /// the short-write shape a file-backed mount produces at end-of-file.
+    struct ShortWriteDevice {
+        data: Mutex<Vec<u8>>,
+        ack: usize,
+    }
+    impl Device for ShortWriteDevice {
+        fn read_at(&self, offset: usize, buf: &mut [u8]) -> DevResult<usize> {
+            let d = self.data.lock();
+            let take = min(buf.len(), d.len().saturating_sub(offset));
+            buf[..take].copy_from_slice(&d[offset..offset + take]);
+            Ok(take)
+        }
+        fn write_at(&self, offset: usize, buf: &[u8]) -> DevResult<usize> {
+            let mut d = self.data.lock();
+            d[offset..offset + buf.len()].copy_from_slice(buf);
+            Ok(min(buf.len(), self.ack))
+        }
+        fn sync(&self) -> DevResult<()> {
+            Ok(())
+        }
+    }
+
+    /// A write that FAILS is not a write that did not happen: the sectors before
+    /// the failure are already on disk. If the cache keeps its old copies, every
+    /// later read of those sectors is served the pre-write bytes out of RAM,
+    /// silently disagreeing with the disk for as long as the mount lives — and
+    /// the filesystem above was told the write failed, so it will never rewrite
+    /// them. The span must be forgotten instead.
+    #[test]
+    fn a_failed_write_does_not_leave_the_cache_lying_about_the_disk() {
+        let dev = Arc::new(PartialWriteDevice {
+            data: Mutex::new(vec![0xAA; 4 * SECTOR]),
+            fail_from: SECTOR, // sector 0 lands, sector 1 fails
+        });
+        let cd = CachedDevice::with_capacity(dev.clone(), 4 * SECTOR, 64);
+
+        // Warm sector 0 into the cache.
+        let mut buf = vec![0u8; SECTOR];
+        assert_eq!(cd.read_at(0, &mut buf).unwrap(), SECTOR);
+        assert_eq!(buf[0], 0xAA);
+
+        // Two sectors: the first lands on disk, the second fails.
+        let payload = vec![0xBBu8; 2 * SECTOR];
+        assert!(
+            cd.write_at(0, &payload).is_err(),
+            "the write must report the failure"
+        );
+        assert_eq!(
+            dev.data.lock()[0],
+            0xBB,
+            "sector 0 really is on disk despite the error"
+        );
+
+        // The cache must not answer with the bytes the disk no longer holds.
+        let mut back = vec![0u8; SECTOR];
+        cd.read_at(0, &mut back).unwrap();
+        assert_eq!(
+            back[0], 0xBB,
+            "a cached sector survived a failed write and now disagrees with the disk"
+        );
+    }
+
+    /// Same hole, one size down: the bytes past a short write were never
+    /// acknowledged, but the sectors holding them may already have been touched,
+    /// so the reconciliation cannot describe them and they must not stay cached.
+    #[test]
+    fn the_tail_of_a_short_write_is_not_left_cached() {
+        let dev = Arc::new(ShortWriteDevice {
+            data: Mutex::new(vec![0xAA; 4 * SECTOR]),
+            ack: SECTOR, // only the first sector is acknowledged
+        });
+        let cd = CachedDevice::with_capacity(dev.clone(), 4 * SECTOR, 64);
+
+        // Warm sectors 0 and 1.
+        let mut buf = vec![0u8; 2 * SECTOR];
+        assert_eq!(cd.read_at(0, &mut buf).unwrap(), 2 * SECTOR);
+
+        let payload = vec![0xBBu8; 2 * SECTOR];
+        assert_eq!(cd.write_at(0, &payload).unwrap(), SECTOR, "short write");
+
+        let mut back = vec![0u8; SECTOR];
+        cd.read_at(SECTOR, &mut back).unwrap();
+        assert_eq!(
+            back[0], 0xBB,
+            "the unacknowledged tail sector stayed cached with its old bytes"
+        );
+    }
+
+    #[test]
+    fn cache_invalidate_clears_both_indexes() {
+        let mut c = BlockCache::new(4);
+        c.insert(0, &[0xAA; SECTOR]);
+        c.insert(1, &[0xBB; SECTOR]);
+        c.invalidate(0);
+        assert!(!c.contains(0));
+        assert!(c.contains(1), "the other sector is untouched");
+        // The LRU index must shrink with the line table: a key naming a sector
+        // that is no longer resident costs the eviction loop a wasted round.
+        assert_eq!(
+            c.lru.len(),
+            c.lines.len(),
+            "invalidate left a stale LRU key behind"
+        );
     }
 
     #[test]

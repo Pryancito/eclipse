@@ -120,16 +120,44 @@ impl BusTransactionInitiator {
     }
 
     /// Releases all quarantined PMTs.
+    ///
+    /// The tokens leave the list under the lock and are destroyed with it let
+    /// go. `PinnedMemoryToken::drop` unpins its VMO -- so it takes the VMO's
+    /// own lock, and logs loudly if that answers an error -- and a `retain`
+    /// that drops them in place ran all of that under this IRQ-off spin lock.
+    /// No test pins this: nothing in that chain comes back for `self.inner`
+    /// today, so it is the shape that is wrong rather than a reproducible
+    /// wedge, and a test that only counted the survivors would pass either way.
     pub fn release_quarantine(&self) {
         let mut inner = self.inner.lock();
-        // remove no handle, the only Arc is from self.pmts
-        inner.pmts.retain(|pmt| Arc::strong_count(pmt) > 1);
+        // Nothing else names these: the only `Arc` left is the list's own.
+        let mut quarantined = Vec::new();
+        inner.pmts.retain(|pmt| {
+            if Arc::strong_count(pmt) > 1 {
+                true
+            } else {
+                quarantined.push(pmt.clone());
+                false
+            }
+        });
+        drop(inner);
+        drop(quarantined);
     }
 
     /// Release a PMT by KoID.
     pub(super) fn release_pmt(&self, id: KoID) {
         let mut inner = self.inner.lock();
-        inner.pmts.retain(|pmt| pmt.id() != id);
+        let mut released = Vec::new();
+        inner.pmts.retain(|pmt| {
+            if pmt.id() == id {
+                released.push(pmt.clone());
+                false
+            } else {
+                true
+            }
+        });
+        drop(inner);
+        drop(released);
     }
 
     pub(super) fn iommu(&self) -> Arc<Iommu> {

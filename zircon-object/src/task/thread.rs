@@ -627,28 +627,36 @@ impl Thread {
     /// The thread do not terminate immediately when stopped. It is just made dying.
     /// It will terminate after some cleanups (when `terminate` are called **explicitly** by upper layer).
     fn stop(&self, killed: bool) {
-        let mut inner = self.inner.lock();
-        if inner.state == ThreadState::Dead {
-            return;
-        }
-        if killed {
-            inner.killed = true;
-        }
-        if inner.state == ThreadState::Dying {
-            if killed {
-                if let Some(killer) = inner.killer.take() {
-                    // It's ok to ignore the error since the other end could be closed
-                    killer.send(()).ok();
-                }
+        // The wake and the oneshot `send` both run code this module does not
+        // own -- the executor's waker vtable, and whatever the woken task does
+        // next -- so they happen with `inner` released. `Waiter::wake` in
+        // `signal/futex.rs` already keeps that discipline ("The waker is
+        // invoked after releasing the waiter lock"); this path, which is the
+        // one `Process::exit` drives for every thread it kills, did not: it
+        // woke the task with this thread's own spin lock still held, taken with
+        // interrupts off. A woken task that reaches back for `inner` -- reading
+        // its state, or terminating -- is a CPU that does not come back.
+        let (waker, killer) = {
+            let mut inner = self.inner.lock();
+            if inner.state == ThreadState::Dead {
+                return;
             }
-            return;
-        }
-        inner.change_state(ThreadState::Dying, &self.base);
-        if let Some(waker) = inner.waker.take() {
+            if killed {
+                inner.killed = true;
+            }
+            if inner.state == ThreadState::Dying {
+                // Already dying: only the killer, and only for a kill.
+                (None, if killed { inner.killer.take() } else { None })
+            } else {
+                inner.change_state(ThreadState::Dying, &self.base);
+                // For a blocking thread, the killer is what gets it out.
+                (inner.waker.take(), inner.killer.take())
+            }
+        };
+        if let Some(waker) = waker {
             waker.wake_by_ref();
         }
-        // For blocking thread, use the killer
-        if let Some(killer) = inner.killer.take() {
+        if let Some(killer) = killer {
             // It's ok to ignore the error since the other end could be closed
             killer.send(()).ok();
         }
@@ -889,6 +897,16 @@ impl Thread {
     pub fn terminate_abandoned(&self) {
         self.terminate();
     }
+
+    /// Install `waker` as this thread's wake-up, the way a suspended thread's
+    /// own future does from its `poll`.
+    ///
+    /// Only for tests: they cannot poll that future by hand, and without a door
+    /// like this there is no way to ask whether `stop` wakes with `inner` held.
+    #[cfg(test)]
+    pub fn set_waker_for_test(&self, waker: core::task::Waker) {
+        self.inner.lock().waker = Some(waker);
+    }
 }
 
 impl Task for Thread {
@@ -921,12 +939,17 @@ impl Task for Thread {
             return;
         }
         inner.suspend_count -= 1;
-        if inner.suspend_count == 0 {
+        let waker = if inner.suspend_count == 0 {
             let state = inner.state;
             inner.change_state(state, &self.base);
-            if let Some(waker) = inner.waker.take() {
-                waker.wake_by_ref();
-            }
+            inner.waker.take()
+        } else {
+            None
+        };
+        // Out of the lock before the wake, for the reason in `stop`.
+        drop(inner);
+        if let Some(waker) = waker {
+            waker.wake_by_ref();
         }
     }
 
@@ -1382,6 +1405,120 @@ mod tests {
     use crate::object::*;
     use crate::task::*;
     use kernel_hal::timer::timer_now;
+
+    /// A waker that answers one question: was the thread's own lock free when
+    /// it was woken?
+    ///
+    /// `Thread::stop` woke the task with `inner` still held -- a spin lock taken
+    /// with interrupts off -- so a woken task that reached back for `inner`
+    /// (reading its state, or terminating) was a CPU that did not come back.
+    /// `Waiter::wake` in `signal/futex.rs` already invokes its waker after
+    /// letting the lock go; this path did not.
+    mod lock_probe {
+        use super::*;
+        use alloc::sync::Arc as ProbeArc;
+        use core::sync::atomic::{AtomicBool, Ordering};
+        use core::task::{RawWaker, RawWakerVTable, Waker};
+
+        pub struct Probe {
+            pub woken: AtomicBool,
+            pub lock_was_free: AtomicBool,
+            pub thread: Mutex<Option<ProbeArc<Thread>>>,
+        }
+
+        impl Probe {
+            pub fn new(thread: &ProbeArc<Thread>) -> ProbeArc<Self> {
+                ProbeArc::new(Probe {
+                    woken: AtomicBool::new(false),
+                    lock_was_free: AtomicBool::new(false),
+                    thread: Mutex::new(Some(thread.clone())),
+                })
+            }
+        }
+
+        unsafe fn clone_raw(data: *const ()) -> RawWaker {
+            ProbeArc::increment_strong_count(data as *const Probe);
+            RawWaker::new(data, &VTABLE)
+        }
+
+        unsafe fn wake_raw(data: *const ()) {
+            wake_by_ref_raw(data);
+            drop_raw(data);
+        }
+
+        unsafe fn wake_by_ref_raw(data: *const ()) {
+            let probe = &*(data as *const Probe);
+            probe.woken.store(true, Ordering::SeqCst);
+            // The thread is reached through a second handle, exactly as a woken
+            // task would reach it, and `try_lock` answers without wedging the
+            // test when the answer is "held".
+            let thread = probe.thread.lock().clone();
+            if let Some(thread) = thread {
+                let free = thread.inner.try_lock().is_some();
+                probe.lock_was_free.store(free, Ordering::SeqCst);
+            }
+        }
+
+        unsafe fn drop_raw(data: *const ()) {
+            ProbeArc::decrement_strong_count(data as *const Probe);
+        }
+
+        static VTABLE: RawWakerVTable =
+            RawWakerVTable::new(clone_raw, wake_raw, wake_by_ref_raw, drop_raw);
+
+        pub fn waker_of(probe: &ProbeArc<Probe>) -> Waker {
+            let data = ProbeArc::into_raw(probe.clone()) as *const ();
+            unsafe { Waker::from_raw(RawWaker::new(data, &VTABLE)) }
+        }
+    }
+
+    #[test]
+    fn killing_a_thread_wakes_it_with_its_own_lock_let_go() {
+        use core::sync::atomic::Ordering;
+
+        let root_job = Job::root();
+        let proc = Process::create(&root_job, "proc").expect("failed to create process");
+        let thread = Thread::create(&proc, "thread").expect("failed to create thread");
+
+        let probe = lock_probe::Probe::new(&thread);
+        thread.set_waker_for_test(lock_probe::waker_of(&probe));
+
+        thread.kill();
+
+        assert!(
+            probe.woken.load(Ordering::SeqCst),
+            "killing a thread has to wake whatever it was parked in"
+        );
+        assert!(
+            probe.lock_was_free.load(Ordering::SeqCst),
+            "the wake ran with the thread's own lock still held: a woken task \
+             that reaches back for it is a CPU that never comes back"
+        );
+    }
+
+    #[test]
+    fn resuming_a_thread_wakes_it_with_its_own_lock_let_go() {
+        use core::sync::atomic::Ordering;
+
+        let root_job = Job::root();
+        let proc = Process::create(&root_job, "proc").expect("failed to create process");
+        let thread = Thread::create(&proc, "thread").expect("failed to create thread");
+
+        thread.suspend();
+        let probe = lock_probe::Probe::new(&thread);
+        thread.set_waker_for_test(lock_probe::waker_of(&probe));
+
+        thread.resume();
+
+        assert!(
+            probe.woken.load(Ordering::SeqCst),
+            "resuming a suspended thread has to wake it"
+        );
+        assert!(
+            probe.lock_was_free.load(Ordering::SeqCst),
+            "the resume's wake ran with the thread's own lock still held"
+        );
+    }
 
     #[test]
     fn create() {

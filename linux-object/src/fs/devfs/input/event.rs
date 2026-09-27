@@ -16,6 +16,31 @@ const BUF_CAPACITY: usize = 64;
 
 const EVENT_DEV_MINOR_BASE: usize = 0x40;
 
+/// How often a blocking read of an `/dev/input/event*` node wakes up just to
+/// ask whether it should still be waiting.
+///
+/// The listener fires for what the DEVICE does and for nothing that happens to
+/// the reader, and this wait had no backstop at all: a `read` on a quiet evdev
+/// node could not be ended by a signal, by `kill`, or by its own process
+/// exiting -- libinput keeps one such read parked on every input node, so a
+/// compositor being killed while nothing is being typed had threads that never
+/// came back. Same figure and same reasoning as every other interruptible wait
+/// in this kernel (`event_bus`, `semaphore`, `msgqueue`, `flock`): a ceiling on
+/// how late a `kill` can be, not on how fast an event arrives.
+const EVDEV_INTERRUPT_CHECK_TICK_MS: u64 = 100;
+
+/// Whether the thread parked in a blocking evdev read must stop waiting -- a
+/// signal is deliverable, the thread is dying, or its process has exited.
+///
+/// Goes through `crate::sync`'s switch rather than calling
+/// `crate::process::check_signals` directly: there is no current thread in a
+/// host test, so the real check always answers `Ok` there and no test could
+/// otherwise reach the interrupted branch at all. One switch for every
+/// interruptible wait in the crate, so they all flip together.
+pub(super) fn wait_interrupted() -> bool {
+    crate::sync::wait_interrupted().is_err()
+}
+
 /// The clock that stamps events, as `EVIOCSCLOCKID` selects it.
 ///
 /// Linux keeps this per open file description; here it belongs to the node,
@@ -352,13 +377,25 @@ impl INode for EventDev {
         struct EventFuture<'a> {
             dev: &'a EventDev,
             sub_id: Option<u64>,
+            /// Backstop slot; see [`EVDEV_INTERRUPT_CHECK_TICK_MS`].
+            timer: Option<kernel_hal::timer_waker::TimerWakerSlot>,
+        }
+
+        impl EventFuture<'_> {
+            /// Let go of everything this future parked: the listener handler and
+            /// the backstop tick. Every path that leaves `Pending` runs it, so a
+            /// late tick cannot wake a finished task.
+            fn unpark(&mut self) {
+                if let Some(id) = self.sub_id.take() {
+                    self.dev.input.unsubscribe(id);
+                }
+                kernel_hal::timer_waker::kill_timer_waker(&mut self.timer);
+            }
         }
 
         impl Drop for EventFuture<'_> {
             fn drop(&mut self) {
-                if let Some(id) = self.sub_id.take() {
-                    self.dev.input.unsubscribe(id);
-                }
+                self.unpark();
             }
         }
 
@@ -369,9 +406,7 @@ impl INode for EventDev {
                 let this = self.as_mut().get_mut();
                 // Fast path: data already available.
                 if this.dev.can_read() {
-                    if let Some(id) = this.sub_id.take() {
-                        this.dev.input.unsubscribe(id);
-                    }
+                    this.unpark();
                     return Poll::Ready(this.dev.poll());
                 }
                 // Register the waker BEFORE the second can_read() check to
@@ -381,21 +416,44 @@ impl INode for EventDev {
                 // event.  By registering first, any event that arrives during
                 // or after subscribe() will call the waker and reschedule the
                 // task.
+                // `once: false`, not `true`: a one-shot handler is taken out
+                // of the listener as soon as it fires, and `sub_id` stayed
+                // `Some` naming nothing -- so a poll that woke and found
+                // `can_read()` false (the event went to another reader of the
+                // same device, or produced no readable packet) parked again
+                // with NO handler registered, and nothing here re-polls on a
+                // tick: that reader slept for good. Subscribing for the
+                // future's whole life is what `Drop` and both Ready paths
+                // already unsubscribe. See `EventBusFuture::poll` for the same
+                // bug with the event bus.
                 if this.sub_id.is_none() {
                     let waker = cx.waker().clone();
                     this.sub_id = this
                         .dev
                         .input
-                        .subscribe(Box::new(move |_| waker.wake_by_ref()), true);
+                        .subscribe(Box::new(move |_| waker.wake_by_ref()), false);
                 }
                 // Re-check after registering the waker in case an event
                 // arrived in the window between the first check and subscribe().
                 if this.dev.can_read() {
-                    if let Some(id) = this.sub_id.take() {
-                        this.dev.input.unsubscribe(id);
-                    }
+                    this.unpark();
                     return Poll::Ready(this.dev.poll());
                 }
+                // Nothing to read. Before parking, ask whether this thread is
+                // still supposed to be here: the listener only ever reports
+                // what the device does, so this and the tick below are the only
+                // things in the whole wait that can answer a signal or a kill.
+                // Checked AFTER readiness, deliberately: data that is already
+                // there is delivered, and `EINTR` is synthesised only for a
+                // read that would otherwise block.
+                if wait_interrupted() {
+                    this.unpark();
+                    return Poll::Ready(Err(FsError::Interrupted));
+                }
+                let deadline = kernel_hal::timer::deadline_after(
+                    core::time::Duration::from_millis(EVDEV_INTERRUPT_CHECK_TICK_MS),
+                );
+                kernel_hal::timer_waker::ensure_timer_waker(&mut this.timer, deadline, cx);
                 Poll::Pending
             }
         }
@@ -403,6 +461,7 @@ impl INode for EventDev {
         Box::pin(EventFuture {
             dev: self,
             sub_id: None,
+            timer: None,
         })
     }
 
@@ -580,6 +639,129 @@ impl INode for EventDev {
 
     fn as_any_ref(&self) -> &dyn Any {
         self
+    }
+}
+
+#[cfg(test)]
+mod interruptible_read_tests {
+    //! A blocking read of an `/dev/input/event*` node that only ever hears from
+    //! the DEVICE is a read that nothing which happens to the READER can end.
+    //!
+    //! libinput keeps one parked on every input node for as long as the session
+    //! lasts, and the listener fires only when the device sends something. So a
+    //! compositor being killed while nobody is typing had a thread in a wait
+    //! that neither a signal, nor `kill`, nor its own process exiting could
+    //! reach -- it sat there until somebody touched the mouse. Unlike every
+    //! other wait in this kernel, this one had no backstop tick either, so
+    //! nothing even re-polled it to notice.
+
+    use super::*;
+    use alloc::sync::Arc;
+    use core::task::{RawWaker, RawWakerVTable, Waker};
+    use zcore_drivers::scheme::{EventScheme, Scheme};
+
+    /// `crate::sync`'s interrupt switch, in the two shapes these tests need.
+    mod interrupts {
+        use crate::sync::test_interrupt;
+
+        pub(super) fn clear() {
+            test_interrupt::clear();
+        }
+
+        /// From the very next check on, every wait must give up.
+        pub(super) fn interrupt_now() {
+            test_interrupt::interrupt_after(0, crate::error::LxError::EINTR);
+        }
+    }
+    use zcore_drivers::utils::{EventHandler, EventListener};
+
+    /// The quietest input device there is: it never sends anything. (The
+    /// `mock` module of `zcore-drivers` has one, but it is behind a feature
+    /// this build does not turn on.)
+    #[derive(Default)]
+    struct SilentDevice {
+        listener: EventListener<InputEvent>,
+    }
+
+    impl EventScheme for SilentDevice {
+        type Event = InputEvent;
+
+        fn trigger(&self, event: Self::Event) {
+            self.listener.trigger(event);
+        }
+
+        fn subscribe(&self, handler: EventHandler<Self::Event>, once: bool) -> Option<u64> {
+            self.listener.subscribe(handler, once)
+        }
+
+        fn unsubscribe(&self, id: u64) {
+            self.listener.unsubscribe(id);
+        }
+    }
+
+    impl Scheme for SilentDevice {
+        fn name(&self) -> &str {
+            "silent-input"
+        }
+    }
+
+    impl InputScheme for SilentDevice {
+        fn capability(&self, _cap_type: CapabilityType) -> InputCapability {
+            InputCapability::empty()
+        }
+    }
+
+    fn dev() -> EventDev {
+        EventDev::new(Arc::new(SilentDevice::default()), 0)
+    }
+
+    /// A waker that does nothing. These tests poll by hand rather than
+    /// `block_on`, on purpose: a mutation that stops the wait from ever ending
+    /// would make `block_on` hang, and a hang is not a detected failure.
+    fn noop_waker() -> Waker {
+        unsafe fn clone(_: *const ()) -> RawWaker {
+            RawWaker::new(core::ptr::null(), &VTABLE)
+        }
+        unsafe fn noop(_: *const ()) {}
+        static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, noop, noop, noop);
+        unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &VTABLE)) }
+    }
+
+    #[test]
+    fn a_quiet_device_parks_the_reader() {
+        interrupts::clear();
+        let d = dev();
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut fut = d.async_poll();
+        assert!(
+            matches!(fut.as_mut().poll(&mut cx), Poll::Pending),
+            "nothing has been typed, so the read has to wait"
+        );
+    }
+
+    #[test]
+    fn a_reader_of_a_device_nobody_touches_can_still_be_killed() {
+        interrupts::clear();
+        let d = dev();
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut fut = d.async_poll();
+        assert!(matches!(fut.as_mut().poll(&mut cx), Poll::Pending));
+
+        // The thread is now dying, or a signal is deliverable. Nothing has
+        // happened to the device, and nothing ever will.
+        interrupts::interrupt_now();
+        let ended = matches!(
+            fut.as_mut().poll(&mut cx),
+            Poll::Ready(Err(FsError::Interrupted))
+        );
+        interrupts::clear();
+        assert!(
+            ended,
+            "a read nothing will ever answer must give up when the thread is \
+             killed: FsError::Interrupted is what becomes EINTR"
+        );
     }
 }
 

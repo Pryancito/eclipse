@@ -144,7 +144,22 @@ impl Semaphore {
                         }
                         return Poll::Ready(Ok(()));
                     }
-                    if this.sub_id.is_none() {
+                    // Not `sub_id.is_none()`: the callback below is one-shot
+                    // (it returns `true`), so the bus drops it the moment it
+                    // fires, and a full table evicts the oldest outright. The
+                    // id then names nothing, and a waiter that only asked
+                    // `is_none()` never parked itself again -- so after the
+                    // first release it had NO callback on the bus and the only
+                    // thing that re-polled it was the 100 ms backstop. That is
+                    // the common case under contention, where several waiters
+                    // are woken and all but one find the count already taken.
+                    // See `EventBusFuture::poll`, which had the same bug.
+                    if !this
+                        .sub_id
+                        .map(|id| inner.eventbus.is_subscribed(id))
+                        .unwrap_or(false)
+                    {
+                        this.sub_id = None;
                         let waker = cx.waker().clone();
                         this.sub_id = inner.eventbus.subscribe(Box::new(move |_| {
                             waker.wake_by_ref();
@@ -315,7 +330,14 @@ impl Semaphore {
                         drop(inner);
                         return this.done(Ok(()));
                     }
-                    if this.sub_id.is_none() {
+                    // One-shot, as in `acquire`: ask whether the id is still
+                    // on the bus, not just whether we ever had one.
+                    if !this
+                        .sub_id
+                        .map(|id| inner.eventbus.is_subscribed(id))
+                        .unwrap_or(false)
+                    {
+                        this.sub_id = None;
                         let waker = cx.waker().clone();
                         this.sub_id = inner.eventbus.subscribe(Box::new(move |_| {
                             waker.wake_by_ref();
@@ -509,6 +531,42 @@ mod semop_primitive_tests {
         unsafe fn noop(_: *const ()) {}
         static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, noop, noop, noop);
         unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &VTABLE)) }
+    }
+
+    /// How many callbacks are parked on this semaphore's bus.
+    fn parked(sem: &Semaphore) -> usize {
+        sem.lock.lock().eventbus.get_callback_len()
+    }
+
+    /// The contention case a semaphore exists for: two waiters, one release,
+    /// and the loser has to park itself again. Its callback was spent by the
+    /// wakeup -- the bus drops a one-shot as soon as it fires -- so a waiter
+    /// that did not notice went back to sleep with nothing registered, and
+    /// from then on only the 100 ms backstop ever looked at the count.
+    #[test]
+    fn an_acquire_that_loses_the_race_parks_itself_again() {
+        let sem = Semaphore::new(0);
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut loser = pin!(sem.acquire());
+
+        assert!(matches!(loser.as_mut().poll(&mut cx), Poll::Pending));
+        assert_eq!(parked(&sem), 1, "the waiter parked once");
+
+        // One unit is released -- which spends the waiter's callback -- and
+        // somebody else takes it before this one runs again.
+        sem.release();
+        assert_eq!(parked(&sem), 0, "a one-shot callback is gone once it fires");
+        assert!(async_std::task::block_on(sem.acquire()).is_ok());
+        assert_eq!(sem.get(), 0);
+
+        assert!(matches!(loser.as_mut().poll(&mut cx), Poll::Pending));
+        assert_eq!(
+            parked(&sem),
+            1,
+            "a waiter that goes back to sleep must leave a callback behind, or \
+             only the 100 ms backstop will ever wake it"
+        );
     }
 
     /// Setting a semaphore back to a non-positive value must CLEAR the "can
