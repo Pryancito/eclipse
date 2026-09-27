@@ -7167,6 +7167,110 @@ mod kms_scanout_tests {
         }
     }
 
+    /// The source report has to fire on a present where NOTHING changed, because
+    /// that is the case it exists for: a black rectangle that just sits there is
+    /// black in both reads, so it differs in no band and the mismatch line never
+    /// fires. If this line shared the mismatch line's trigger, the static case --
+    /// the one Moebius is looking at -- would never be described at all.
+    #[test]
+    fn the_source_report_fires_even_when_nothing_changed() {
+        let _screen = kms_emu::attach(192, 200);
+        drm::set_present_probe_enabled(true);
+        let c = Client::open(0);
+        let buf = c.create_dumb(192, 200);
+        // Half opaque, half fully transparent black: a settled buffer that holds
+        // a black region, which is exactly the shape being diagnosed.
+        paint(&buf, |x, y| if x < 96 { tag(0x0044_0000, x, y) } else { 0 });
+        let fb = c.addfb2(&buf);
+
+        c.page_flip(drm::SYNTH_CRTC_ID, fb, 0x3333).expect("flip");
+
+        assert_eq!(
+            drm::probe_reports_for_test(),
+            0,
+            "nothing moved under the copy, so there is no mismatch to report"
+        );
+        assert!(
+            drm::zero_reports_for_test() >= 1,
+            "but the source report has to fire anyway -- that is the whole point of it"
+        );
+    }
+
+    /// The repair is one more writer that goes around the band skip, so it has to
+    /// make the skip forget -- the same rule the cursor, a damage box, a blank, a
+    /// VT and the copy engine all follow.
+    ///
+    /// The skip's stored hash means "the panel holds these pixels in these rows".
+    /// A repair writes the panel with a plain `blit_chunked`, so after it the
+    /// panel holds what the REPAIR copied while the hash still describes what the
+    /// first copy put there. Leave that stale and a later frame whose pixels
+    /// happen to match the old hash gets skipped over a panel that does not hold
+    /// them -- stale pixels left on screen by the very path that exists to stop
+    /// leaving stale pixels on screen.
+    ///
+    /// The control for this one is
+    /// `a_band_the_panel_already_holds_is_not_copied_again`: there a second
+    /// present of the same pixels skips every band. Here the first present
+    /// repairs, so the second must skip none.
+    #[test]
+    fn a_present_that_repaired_makes_the_next_one_copy_again() {
+        let screen = kms_emu::attach(192, 200);
+        drm::set_present_repair_enabled(true);
+        drm::set_present_skip_enabled(true);
+        let c = Client::open(0);
+        let buf = c.create_dumb(192, 200);
+        paint(&buf, |x, y| tag(0x0055_0000, x, y));
+        let fb = c.addfb2(&buf);
+        let pixels = map_dumb(&buf);
+        let stride = (buf.pitch / 4) as usize;
+        let late = pixels.as_mut_ptr() as usize;
+
+        // Present 1: the source moves under the copy, so the repair runs.
+        kms_emu::on_blit_band(move |band| {
+            if band != 1 {
+                return;
+            }
+            // SAFETY: the dumb buffer outlives this present, and nothing else
+            // writes it while the hook runs.
+            let p = unsafe { core::slice::from_raw_parts_mut(late as *mut u32, stride * 200) };
+            for y in 0..128usize {
+                for x in 64..128usize {
+                    p[y * stride + x] = tag(0x0099_0000, x as u32, y as u32);
+                }
+            }
+        });
+        c.page_flip(drm::SYNTH_CRTC_ID, fb, 0x1111)
+            .expect("first flip");
+        assert!(
+            drm::repair_rounds_for_test() >= 1,
+            "the staging did not make the source move, so this test proves nothing"
+        );
+
+        // Present 2: nothing touches the source, and it is exactly what the panel
+        // was last left holding. Without the invalidation the skip would believe
+        // its own stale hash and skip.
+        kms_emu::clear_mid_blit();
+        c.page_flip(drm::SYNTH_CRTC_ID, fb, 0x2222)
+            .expect("second flip");
+        assert_eq!(
+            drm::skipped_bands_for_test(),
+            0,
+            "a repair wrote the panel outside the skip, so the skip must have forgotten those rows"
+        );
+        // And the panel still agrees with the source everywhere, which is the
+        // outcome the invalidation is protecting.
+        for y in (0..200).step_by(17) {
+            for x in (0..192).step_by(23) {
+                let want = if y < 128 && (64..128).contains(&x) {
+                    tag(0x0099_0000, x, y)
+                } else {
+                    tag(0x0055_0000, x, y)
+                };
+                assert_eq!(screen.pixel(x, y), want, "pixel ({}, {})", x, y);
+            }
+        }
+    }
+
     /// A repair round copies the span that moved and NOT the whole window. The
     /// claim that a round costs what actually moved rests on this, and reading the
     /// destination afterwards cannot show it when the source agrees everywhere:
