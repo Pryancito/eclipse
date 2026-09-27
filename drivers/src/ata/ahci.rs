@@ -2153,16 +2153,11 @@ mod dma_tests {
     use crate::utils::host_hooks as shim;
     use core::sync::atomic::Ordering;
 
-    /// The shims keep process-wide state, so a test that touches them must be
-    /// the only one doing so, whatever `--test-threads` says.
-    fn alone_with_the_allocator<R>(body: impl FnOnce() -> R) -> R {
-        static TURNSTILE: crate::sync::Mutex<()> = crate::sync::Mutex::new(());
-        let _guard = TURNSTILE.lock();
-        shim::reset();
-        let out = body();
-        shim::reset();
-        out
-    }
+    /// One turnstile for every module in the crate, next to the counters it
+    /// guards: see `host_hooks::alone_with_the_allocator`. A copy per module --
+    /// which is what this was -- is three different locks over one set of
+    /// process-wide counters, so none of them guards anything.
+    use shim::alone_with_the_allocator;
 
     // ── what a 32-bit HBA can reach ─────────────────────────────────────────
 
