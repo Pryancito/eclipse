@@ -1511,6 +1511,10 @@ pub fn software_kms_active() -> bool {
 #[allow(dead_code)]
 pub struct DrmFramebuffer {
     pub id: u32,
+    /// The DRM fourcc `ADDFB2` named (one of [`SCANOUT_FORMATS`]); `ADDFB`
+    /// and the kernel's own framebuffers are [`DRM_FORMAT_XRGB8888`]. What
+    /// `GETFB2` reports back, and `GETFB` derives its depth from.
+    pub pixel_format: u32,
     /// Optional driver-private framebuffer id returned by `DrmScheme::create_fb`.
     pub driver_fb_id: Option<u32>,
     /// GEM handle that backs this framebuffer
@@ -2469,7 +2473,34 @@ pub fn resolve_gem_backing_for(handle_id: u32, pid: u64) -> Option<(u64, usize)>
 }
 
 /// Create a framebuffer from a GEM handle
+/// `DRM_FORMAT_XRGB8888` ("XR24"): the format every GL and Vulkan swapchain
+/// on this tree presents, and the one the software scanout consumes.
+pub const DRM_FORMAT_XRGB8888: u32 = 0x3432_5258;
+/// `DRM_FORMAT_ARGB8888` ("AR24"): the same 4 bytes per pixel, alpha ignored
+/// by the scanout.
+pub const DRM_FORMAT_ARGB8888: u32 = 0x3432_5241;
+/// The formats the primary plane advertises (`GETPLANE`) and `ADDFB2`
+/// accepts, both 32 bits per pixel: the CPU present path and the copy
+/// engine take every framebuffer as 4-byte pixels, so a format with another
+/// layout would scan out as garbage, and Linux answers such an `ADDFB2`
+/// EINVAL (`drm_any_plane_has_format`).
+pub const SCANOUT_FORMATS: [u32; 2] = [DRM_FORMAT_XRGB8888, DRM_FORMAT_ARGB8888];
+
+/// [`create_fb_with_format`] for an XR24 framebuffer: `ADDFB` and every
+/// framebuffer the kernel makes for itself.
 pub fn create_fb(handle_id: u32, width: u32, height: u32, pitch: u32) -> Option<u32> {
+    create_fb_with_format(handle_id, width, height, pitch, DRM_FORMAT_XRGB8888)
+}
+
+/// Wrap `handle_id` in a framebuffer of `pixel_format` (one of
+/// [`SCANOUT_FORMATS`], which the `ADDFB2` arm has checked).
+pub fn create_fb_with_format(
+    handle_id: u32,
+    width: u32,
+    height: u32,
+    pitch: u32,
+    pixel_format: u32,
+) -> Option<u32> {
     // Resolve the backing buffer from EITHER source:
     //  - a DRM dumb buffer in our own handle table (CREATE_DUMB / pixman), or
     //  - a nouveau-uAPI GEM object (GEM_NEW), whose high-range handle lives in
@@ -2542,6 +2573,7 @@ pub fn create_fb(handle_id: u32, width: u32, height: u32, pitch: u32) -> Option<
 
     let fb = DrmFramebuffer {
         id: fb_id,
+        pixel_format,
         driver_fb_id,
         gem_handle_id: handle_id,
         width,
@@ -6587,6 +6619,7 @@ mod release_tests {
         {
             let mut state = DRM_STATE.lock();
             state.framebuffers.push(DrmFramebuffer {
+                pixel_format: DRM_FORMAT_XRGB8888,
                 id: 9299,
                 driver_fb_id: None,
                 gem_handle_id: 9201,
@@ -6619,6 +6652,7 @@ mod release_tests {
         {
             let mut state = DRM_STATE.lock();
             state.framebuffers.push(DrmFramebuffer {
+                pixel_format: DRM_FORMAT_XRGB8888,
                 id: 9399,
                 driver_fb_id: None,
                 gem_handle_id: 9301,
@@ -7301,6 +7335,7 @@ mod nouveau_fb_lifetime_tests {
         gem_mmap::register(handle, 0x1_0000, 4096, pid);
         let mut state = DRM_STATE.lock();
         state.framebuffers.push(DrmFramebuffer {
+            pixel_format: DRM_FORMAT_XRGB8888,
             id: fb_id,
             driver_fb_id: None,
             gem_handle_id: handle,
@@ -7401,6 +7436,7 @@ mod nouveau_fb_lifetime_tests {
         let _serialised = super::test_globals::lock();
         let mut state = DRM_STATE.lock();
         state.framebuffers.push(DrmFramebuffer {
+            pixel_format: DRM_FORMAT_XRGB8888,
             id: 9502,
             driver_fb_id: None,
             gem_handle_id: 42, // low range: a CREATE_DUMB handle
@@ -7473,6 +7509,7 @@ mod nouveau_fb_lifetime_tests {
         {
             let mut state = DRM_STATE.lock();
             state.framebuffers.push(DrmFramebuffer {
+                pixel_format: DRM_FORMAT_XRGB8888,
                 id: 9505,
                 driver_fb_id: None,
                 gem_handle_id: shared,
@@ -7530,6 +7567,7 @@ mod present_error_tests {
         let mut state = DRM_STATE.lock();
         state.framebuffers.retain(|fb| fb.id != fb_id);
         state.framebuffers.push(DrmFramebuffer {
+            pixel_format: DRM_FORMAT_XRGB8888,
             id: fb_id,
             driver_fb_id: None,
             gem_handle_id: 0,
@@ -7616,6 +7654,7 @@ mod present_error_tests {
         {
             let mut state = DRM_STATE.lock();
             state.framebuffers.push(DrmFramebuffer {
+                pixel_format: DRM_FORMAT_XRGB8888,
                 id: 9604,
                 driver_fb_id: None,
                 gem_handle_id: handle,
@@ -7902,6 +7941,7 @@ mod gem_ownership_tests {
 
     fn plant_fb(fb_id: u32, owner: u64) {
         DRM_STATE.lock().framebuffers.push(DrmFramebuffer {
+            pixel_format: DRM_FORMAT_XRGB8888,
             id: fb_id,
             driver_fb_id: None,
             gem_handle_id: 0,
@@ -8800,6 +8840,7 @@ mod present_lifetime_tests {
         {
             let mut state = DRM_STATE.lock();
             state.framebuffers.push(DrmFramebuffer {
+                pixel_format: DRM_FORMAT_XRGB8888,
                 id: 9601,
                 driver_fb_id: None,
                 gem_handle_id: 7,
@@ -8850,6 +8891,7 @@ mod present_lifetime_tests {
         {
             let mut state = DRM_STATE.lock();
             state.framebuffers.push(DrmFramebuffer {
+                pixel_format: DRM_FORMAT_XRGB8888,
                 id: 9602,
                 driver_fb_id: None,
                 gem_handle_id: handle,
