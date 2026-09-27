@@ -26,6 +26,12 @@ AUDIO ?= on
 # `make qemu DESKTOP=xorg` to work on the X session.
 DESKTOP ?= labwc
 
+# Extra kernel cmdline options passed straight through to the guest, e.g.
+# `make qemu KOPTS=drm.present_probe` or several at once separated by colons:
+# `make qemu KOPTS=drm.present_probe:drm.flip_fence=off`. See zCore/Makefile
+# for why setting CMDLINE by hand is not a substitute.
+KOPTS ?=
+
 STRIP := $(ARCH)-linux-musl-strip
 export PATH=$(shell printenv PATH):$(CURDIR)/ignored/target/$(ARCH)/$(ARCH)-linux-musl-cross/bin/
 
@@ -104,10 +110,10 @@ clean-everything: clean
 # 	cd rootfs/x86_64/rt-tests && make
 # 	echo x86 gcc build rt-test,now need manual modificy.
 qemu: image
-	$(MAKE) -C zCore run MODE=release LINUX=1 LOG=$(LOG) GRAPHIC=$(GRAPHIC) ACCEL=$(ACCEL) DESKTOP=$(DESKTOP) AUDIO=$(AUDIO)
+	$(MAKE) -C zCore run MODE=release LINUX=1 LOG=$(LOG) GRAPHIC=$(GRAPHIC) ACCEL=$(ACCEL) DESKTOP=$(DESKTOP) AUDIO=$(AUDIO) KOPTS=$(KOPTS)
 
 vbox: image
-	$(MAKE) -C zCore vbox MODE=release LINUX=1 LOG=$(LOG) GRAPHIC=$(GRAPHIC) ACCEL=$(ACCEL) DESKTOP=$(DESKTOP) IFACE=$(IFACE)
+	$(MAKE) -C zCore vbox MODE=release LINUX=1 LOG=$(LOG) GRAPHIC=$(GRAPHIC) ACCEL=$(ACCEL) DESKTOP=$(DESKTOP) IFACE=$(IFACE) KOPTS=$(KOPTS)
 
 # Macvtap networking: VM gets its own MAC/IP on the physical LAN.
 # Useful for testing the I219-V driver on bare metal.

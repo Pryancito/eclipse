@@ -69,6 +69,33 @@ static CE_STAGING_ALLOC_FAILED_LOGGED: core::sync::atomic::AtomicBool =
 static CE_STAGING: Mutex<Option<(usize, u64, usize, Arc<VmObject>)>> = Mutex::new(None);
 /// Full-frame presents completed, for the rate-limited phase-timing klog.
 static PRESENT_FRAME_COUNT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// The two present counters, so a test can assert that a damage-clipped present
+/// is counted at all -- which is the whole of this change, and which no test can
+/// see from the klog.
+#[cfg(test)]
+pub(crate) fn present_report_counts_for_test() -> (u64, u64) {
+    (
+        PRESENT_FRAME_COUNT.load(Ordering::Relaxed),
+        PRESENT_RECT_COUNT.load(Ordering::Relaxed),
+    )
+}
+
+/// How often each kind of present gets a line. A full frame is rare enough to
+/// report often; a damage box is not.
+const FULL_FRAME_REPORT_EVERY: u64 = 64;
+const RECT_REPORT_EVERY: u64 = 512;
+
+/// Damage-clipped presents completed, counted separately from the full frames
+/// and reported far less often.
+///
+/// Two counters because the two rates are nothing alike. A compositor with
+/// damage tracking issues several of these per frame and full frames almost
+/// never, so one counter with one divisor either drowns the log or hides the
+/// clipped path entirely -- and hiding it is what the old `if rect.is_none()`
+/// did. `klog` writes synchronously to the UART, where a line of this length is
+/// milliseconds, so the clipped divisor is large enough that the log costs less
+/// than the frame it describes.
+static PRESENT_RECT_COUNT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 /// CE staging repacks completed, for the rate-limited repack-timing klog.
 static CE_REPACK_COUNT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
@@ -2213,6 +2240,28 @@ fn sync_run_px(stride_px: usize, x: u32, y: u32, w: u32, h: u32) -> Option<(usiz
     (end > start).then_some((start, end))
 }
 
+/// Bytes [`dma_sync_scanout_src_from_device`] invalidates for `(x, y, w, h)` --
+/// the whole contiguous run, pitch padding and all -- so the klog can say what
+/// the flush cost next to what the blit needed.
+fn sync_span_bytes(stride_px: usize, x: u32, y: u32, w: u32, h: u32) -> usize {
+    sync_run_px(stride_px, x, y, w, h).map_or(0, |(s, e)| e.saturating_sub(s).saturating_mul(4))
+}
+
+/// Bytes the blit actually READS out of that run: the rectangle, and nothing
+/// between its rows.
+///
+/// The two numbers are equal for a full frame and diverge sharply for a damage
+/// box, because the run spans every byte from the first row's left edge to the
+/// last row's right edge. A 200x180 popup in a 1920-pitch framebuffer reads
+/// 144 KiB and flushes 1.38 MiB -- and until now nothing said so, because the
+/// present's own timing line was behind `if rect.is_none()` and a
+/// damage-clipped present never printed at all. Whether that ratio is worth
+/// paying for is a question about a real machine, so the numbers go in the log
+/// rather than into a rewrite nothing here can measure.
+fn blit_read_bytes(w: u32, h: u32) -> usize {
+    (w as usize).saturating_mul(h as usize).saturating_mul(4)
+}
+
 /// `(x, y, w, h)` clipped the way [`dma_sync_gem_rect_from_device`] clips
 /// before it touches a line, so "what would be invalidated" and "what is
 /// already invalidated" are compared in the same coordinates. `None` means the
@@ -2906,13 +2955,36 @@ pub fn scanout_region_checked(
         );
     }
     let t_cursor = kernel_hal::timer::timer_now();
-    if rect.is_none() {
-        let n = PRESENT_FRAME_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
-        if n <= 2 || n.is_multiple_of(64) {
+    // Both kinds of present, not just the full frames. This was behind
+    // `if rect.is_none()`, so the path a compositor with damage tracking
+    // actually drives -- every frame labwc puts up -- printed nothing at all,
+    // and the one number that would say whether the source flush is oversized
+    // was the one number never reported. `flush` vs `read` is that number: they
+    // are equal for a full frame and diverge by the pitch padding between a
+    // damage box's rows (see [`blit_read_bytes`]).
+    {
+        let (n, every, kind) = if rect.is_none() {
+            (
+                PRESENT_FRAME_COUNT.fetch_add(1, Ordering::Relaxed) + 1,
+                FULL_FRAME_REPORT_EVERY,
+                "frame",
+            )
+        } else {
+            (
+                PRESENT_RECT_COUNT.fetch_add(1, Ordering::Relaxed) + 1,
+                RECT_REPORT_EVERY,
+                "rect",
+            )
+        };
+        if n <= 2 || n.is_multiple_of(every) {
             kernel_hal::klog_info!(
-                "[drm] present #{}: sync {}us + {} blit {}us + cursor {}us ({}x{})",
+                "[drm] present {} #{}: sync {}us ({}KiB flushed for {}KiB read) + {} blit \
+                 {}us + cursor {}us ({}x{} at +{}+{})",
+                kind,
                 n,
                 sync_elapsed.as_micros(),
+                sync_span_bytes(src_stride, blit_x, blit_y, blit_w, blit_h) / 1024,
+                blit_read_bytes(blit_w, blit_h) / 1024,
                 if blitted_by_ce { "CE" } else { "cpu" },
                 t_blit
                     .saturating_sub(t0)
@@ -2920,7 +2992,9 @@ pub fn scanout_region_checked(
                     .as_micros(),
                 t_cursor.saturating_sub(t_blit).as_micros(),
                 blit_w,
-                blit_h
+                blit_h,
+                blit_x,
+                blit_y
             );
         }
     }
@@ -8568,5 +8642,101 @@ mod image_pitch_tests {
     fn an_image_of_no_width_does_not_become_a_whole_row() {
         assert_eq!(image_pitch_px(64, 64, 64, 0), 0);
         assert_eq!(expand_x_for_wc(0, 0, image_pitch_px(64, 64, 64, 0)), (0, 0));
+    }
+}
+
+/// Tests for the two numbers the present's timing line reports: what the source
+/// flush costs, and what the blit needed out of it.
+///
+/// They exist because the line they go in was behind `if rect.is_none()`, so a
+/// damage-clipped present -- every frame a compositor with damage tracking puts
+/// up, which is every frame labwc puts up -- printed nothing at all. The one
+/// number that says whether the flush is oversized was the one number never
+/// reported.
+#[cfg(test)]
+mod present_cost_tests {
+    use super::*;
+
+    /// A full frame reads everything it flushes, bar the last row's padding:
+    /// the run IS the frame.
+    #[test]
+    fn a_full_frame_flushes_about_what_it_reads() {
+        // 1920x1080 at a 1920-pixel pitch.
+        let flushed = sync_span_bytes(1920, 0, 0, 1920, 1080);
+        let read = blit_read_bytes(1920, 1080);
+        assert_eq!(read, 1920 * 1080 * 4);
+        assert_eq!(flushed, read, "no padding between rows at this pitch");
+    }
+
+    /// And with a padded pitch it flushes the padding of every row but the last,
+    /// which is the honest cost of one contiguous run.
+    #[test]
+    fn a_full_frame_on_a_padded_pitch_flushes_the_padding_too() {
+        let flushed = sync_span_bytes(2048, 0, 0, 1920, 1080);
+        let read = blit_read_bytes(1920, 1080);
+        assert!(flushed > read);
+        // 1079 rows of 128 padding pixels.
+        assert_eq!(flushed - read, 1079 * 128 * 4);
+    }
+
+    /// The number this exists to surface. Moebius's power menu is about 200x180
+    /// in a 1920-wide framebuffer: the blit reads 144 KiB and the flush sweeps
+    /// 1.38 MiB, because one contiguous run spans every byte from the first
+    /// row's left edge to the last row's right edge.
+    #[test]
+    fn a_popups_damage_box_flushes_about_ten_times_what_it_reads() {
+        let flushed = sync_span_bytes(1920, 860, 400, 200, 180);
+        let read = blit_read_bytes(200, 180);
+        assert_eq!(read, 200 * 180 * 4);
+        assert!(
+            flushed > read * 9 && flushed < read * 11,
+            "flushed {} for read {}",
+            flushed,
+            read
+        );
+    }
+
+    /// A one-row damage box is the case where they agree however wide the pitch
+    /// is, because there is no next row for the run to reach into. A blinking
+    /// terminal cursor is this shape.
+    #[test]
+    fn a_single_row_box_flushes_exactly_what_it_reads() {
+        assert_eq!(sync_span_bytes(1920, 100, 500, 8, 1), blit_read_bytes(8, 1));
+    }
+
+    /// Nothing to flush is zero, not a panic and not the whole row -- the line
+    /// prints these unconditionally now, including for a present that was
+    /// refused or had a degenerate box.
+    #[test]
+    fn a_degenerate_box_costs_nothing() {
+        assert_eq!(sync_span_bytes(1920, 0, 0, 0, 100), 0);
+        assert_eq!(sync_span_bytes(1920, 0, 0, 100, 0), 0);
+        assert_eq!(sync_span_bytes(0, 0, 0, 100, 100), 0);
+        assert_eq!(blit_read_bytes(0, 100), 0);
+        assert_eq!(blit_read_bytes(100, 0), 0);
+    }
+
+    /// The two report rates. A compositor with damage tracking issues several
+    /// clipped presents per frame and full frames almost never, so one divisor
+    /// for both either drowns the log -- and `klog` writes synchronously to the
+    /// UART, where a line this long is milliseconds -- or hides the clipped path,
+    /// which is what the old `if rect.is_none()` did.
+    #[test]
+    fn a_damage_box_is_reported_far_less_often_than_a_full_frame() {
+        assert!(
+            RECT_REPORT_EVERY >= FULL_FRAME_REPORT_EVERY * 4,
+            "the clipped path is the frequent one; reporting it as often as a \
+             full frame puts the log on the critical path"
+        );
+        // And both still report, which is the whole change.
+        assert!(FULL_FRAME_REPORT_EVERY > 0 && RECT_REPORT_EVERY > 0);
+    }
+
+    /// Neither number overflows on values no framebuffer has, because the line
+    /// that prints them must never be the thing that panics the kernel.
+    #[test]
+    fn neither_number_overflows_on_absurd_geometry() {
+        assert_eq!(blit_read_bytes(u32::MAX, u32::MAX), usize::MAX);
+        let _ = sync_span_bytes(usize::MAX, u32::MAX, u32::MAX, u32::MAX, u32::MAX);
     }
 }

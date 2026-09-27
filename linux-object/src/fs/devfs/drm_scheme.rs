@@ -6948,6 +6948,48 @@ mod kms_scanout_tests {
         c.destroy_dumb(during.handle).expect("DESTROY_DUMB");
     }
 
+    /// A damage-clipped present is counted, and counted as its own kind.
+    ///
+    /// The present's phase-timing line used to sit behind `if rect.is_none()`, so
+    /// the path a compositor with damage tracking actually drives -- every frame
+    /// labwc puts up -- printed nothing at all, and the number that says whether
+    /// the source flush is oversized was the one number never reported. Nothing
+    /// can see a klog line from here, so the counters are what this asserts: the
+    /// two kinds are tallied separately, because they happen at rates nothing
+    /// alike and one divisor for both either drowns the log or hides the clipped
+    /// path again.
+    #[test]
+    fn a_damage_clipped_present_is_counted_as_its_own_kind() {
+        let _screen = kms_emu::attach(64, 16);
+        let c = Client::open(0);
+
+        let buf = c.create_dumb(64, 16);
+        paint(&buf, |x, y| tag(0x0066_0000, x, y));
+        let fb = c.addfb2(&buf);
+        set_crtc(&c, drm::SYNTH_CRTC_ID, fb, 64, 16);
+        drain_completions(&c);
+
+        let (frames0, rects0) = drm::present_report_counts_for_test();
+
+        c.page_flip(drm::SYNTH_CRTC_ID, fb, 9).expect("flip");
+        drain_completions(&c);
+        let (frames1, rects1) = drm::present_report_counts_for_test();
+        assert!(frames1 > frames0, "a full-frame present was not counted");
+        assert_eq!(rects1, rects0, "a full frame was counted as a damage box");
+
+        dirtyfb(&c, fb, &[clip(8, 4, 24, 8)]);
+        let (frames2, rects2) = drm::present_report_counts_for_test();
+        assert!(
+            rects2 > rects1,
+            "a damage-clipped present was not counted, so it will never be \
+             reported either -- which is the defect this change is about"
+        );
+        assert_eq!(frames2, frames1, "a damage box was counted as a full frame");
+
+        c.rmfb(fb).expect("RMFB");
+        c.destroy_dumb(buf.handle).expect("DESTROY_DUMB");
+    }
+
     /// Does the cursor patch read past the framebuffer's own right edge?
     ///
     /// The call site's comment says it clips "to what the framebuffer covers
