@@ -52,6 +52,13 @@ struct Syncobj {
     /// real DRM (and fixing the stale-handle window the old no-refcount
     /// table left for Mesa fence export).
     refs: u32,
+    /// The processes holding those references, one entry per reference a
+    /// `SYNCOBJ_CREATE` or an opaque `SYNCOBJ_FD_TO_HANDLE` gave out (Linux:
+    /// the handle lives in that `drm_file`'s table). Kernel-owned references
+    /// (a sync_file's, a merge's, a test's) have no entry. `release_owner`
+    /// drops a dead process's entries, and `destroy_for` refuses a process
+    /// that holds none.
+    holders: alloc::vec::Vec<u64>,
     /// A pending dependency on another syncobj: `(src, target, dst_point)`.
     /// This object reaches `dst_point` once `src` reaches `target`.
     ///
@@ -762,6 +769,7 @@ pub fn create(signaled: bool) -> u32 {
         handle,
         point: if signaled { 1 } else { 0 },
         refs: 1,
+        holders: alloc::vec::Vec::new(),
         linked: None,
     });
     handle
@@ -788,86 +796,202 @@ pub fn add_ref(handle: u32) -> bool {
 pub fn destroy(handle: u32) -> bool {
     let notify = {
         let mut table = TABLE.lock();
-        let Some(pos) = table
-            .objects
-            .iter()
-            .position(|o| o.handle == handle && o.refs > 0)
-        else {
-            return false;
-        };
-        if table.objects[pos].refs > 1 {
-            table.objects[pos].refs -= 1;
-            return true;
+        match destroy_locked(&mut table, handle) {
+            Some(notify) => notify,
+            None => return false,
         }
-        // A fence outlives the syncobj it was taken from. In Linux a
-        // dependent holds the `dma_fence` itself, so destroying the source
-        // changes nothing for it; here a link names its source BY HANDLE, so
-        // an object that other links still depend on, and that can still make
-        // progress (a hardware fence in flight, or a link of its own), stays
-        // in the table as an ORPHAN: no reference, invisible to `add_ref` and
-        // to a second `destroy`, but resolved like any other object until
-        // nothing names it ([`collect_orphans`]). Mesa creates exactly this
-        // every frame under X11: a surrogate syncobj receives a transfer of a
-        // point still in flight, is exported as a sync_file, and is destroyed
-        // at once -- releasing its dependents instead (what this function did
-        // before) signaled the acquire semaphore of a swapchain image before
-        // the compositor had let go of it.
-        let can_progress =
-            table.pending.iter().any(|f| f.handle == handle) || table.objects[pos].linked.is_some();
-        if can_progress && is_link_source(&table.objects, handle) {
-            table.objects[pos].refs = 0;
-            return true;
-        }
-        table.objects.swap_remove(pos);
-        // EVERY fence still in flight on it, timeline points included. The
-        // old filter kept anything above binary range, and those entries
-        // outlived the object they belonged to: nothing could advance (the
-        // resolver looks the handle up and finds nothing), nothing could wait
-        // on them, and [`FENCE_TIMEOUT_US`] later they reached the timeout
-        // hook, which latches their GPU context WEDGED -- so the client's
-        // next submit failed with EIO/device-lost. Closing a syncobj with a
-        // submit in flight is not an error, it is what
-        // `drm_syncobj_release`/process teardown does to every handle a
-        // client owns, so a client that simply exited mid-frame took the
-        // context down with it. Linux has nothing to leak here: the syncobj
-        // drops its `dma_fence` reference and the fence is just a refcounted
-        // object with no back-pointer to it.
-        table.pending.retain(|f| f.handle != handle);
-        table.errored.retain(|e| e.handle != handle);
-        PENDING_COUNT.store(table.pending.len(), Ordering::Relaxed);
-        // A still-deferred import/transfer names its source BY HANDLE (a
-        // real one holds the `dma_fence` itself, which outlives the syncobj
-        // it came from). With the source gone the link can never resolve, so
-        // the destination parks at its old point forever -- and NVK's waits
-        // carry an INT64_MAX deadline, so forever is literal. Release them
-        // to the point the transfer promised, the same call
-        // [`abandon_fences`] makes for a fence that can no longer land: a
-        // waiter on a dead producer moves on rather than freezing.
-        let mut notify = Vec::new();
-        for obj in table.objects.iter_mut() {
-            let Some(link) = obj.linked.as_mut() else {
-                continue;
-            };
-            if !link.deps.iter().any(|&(src, _)| src == handle) {
-                continue;
-            }
-            // A merged fence keeps waiting for its other sources.
-            link.deps.retain(|&(src, _)| src != handle);
-            if link.deps.is_empty() {
-                let dst_point = link.dst_point;
-                obj.linked = None;
-                obj.point = obj.point.max(dst_point);
-                notify.push((obj.handle, obj.point));
-            }
-        }
-        collect_orphans(&mut table);
-        notify
     };
     // Lock released: the hook re-enters this module to re-check waiters.
     for (h, p) in notify {
         notify_signal(h, p);
     }
     true
+}
+
+/// [`destroy`] with the table already held: `None` for an unknown handle,
+/// otherwise the `(handle, point)` signals to deliver once the lock is
+/// released.
+fn destroy_locked(table: &mut SyncobjTable, handle: u32) -> Option<Vec<(u32, u64)>> {
+    let pos = table
+        .objects
+        .iter()
+        .position(|o| o.handle == handle && o.refs > 0)?;
+    if table.objects[pos].refs > 1 {
+        table.objects[pos].refs -= 1;
+        return Some(Vec::new());
+    }
+    // A fence outlives the syncobj it was taken from. In Linux a
+    // dependent holds the `dma_fence` itself, so destroying the source
+    // changes nothing for it; here a link names its source BY HANDLE, so
+    // an object that other links still depend on, and that can still make
+    // progress (a hardware fence in flight, or a link of its own), stays
+    // in the table as an ORPHAN: no reference, invisible to `add_ref` and
+    // to a second `destroy`, but resolved like any other object until
+    // nothing names it ([`collect_orphans`]). Mesa creates exactly this
+    // every frame under X11: a surrogate syncobj receives a transfer of a
+    // point still in flight, is exported as a sync_file, and is destroyed
+    // at once -- releasing its dependents instead (what this function did
+    // before) signaled the acquire semaphore of a swapchain image before
+    // the compositor had let go of it.
+    let can_progress =
+        table.pending.iter().any(|f| f.handle == handle) || table.objects[pos].linked.is_some();
+    if can_progress && is_link_source(&table.objects, handle) {
+        table.objects[pos].refs = 0;
+        return Some(Vec::new());
+    }
+    table.objects.swap_remove(pos);
+    // EVERY fence still in flight on it, timeline points included. The
+    // old filter kept anything above binary range, and those entries
+    // outlived the object they belonged to: nothing could advance (the
+    // resolver looks the handle up and finds nothing), nothing could wait
+    // on them, and [`FENCE_TIMEOUT_US`] later they reached the timeout
+    // hook, which latches their GPU context WEDGED -- so the client's
+    // next submit failed with EIO/device-lost. Closing a syncobj with a
+    // submit in flight is not an error, it is what
+    // `drm_syncobj_release`/process teardown does to every handle a
+    // client owns, so a client that simply exited mid-frame took the
+    // context down with it. Linux has nothing to leak here: the syncobj
+    // drops its `dma_fence` reference and the fence is just a refcounted
+    // object with no back-pointer to it.
+    table.pending.retain(|f| f.handle != handle);
+    table.errored.retain(|e| e.handle != handle);
+    PENDING_COUNT.store(table.pending.len(), Ordering::Relaxed);
+    // A still-deferred import/transfer names its source BY HANDLE (a
+    // real one holds the `dma_fence` itself, which outlives the syncobj
+    // it came from). With the source gone the link can never resolve, so
+    // the destination parks at its old point forever -- and NVK's waits
+    // carry an INT64_MAX deadline, so forever is literal. Release them
+    // to the point the transfer promised, the same call
+    // [`abandon_fences`] makes for a fence that can no longer land: a
+    // waiter on a dead producer moves on rather than freezing.
+    let mut notify = Vec::new();
+    for obj in table.objects.iter_mut() {
+        let Some(link) = obj.linked.as_mut() else {
+            continue;
+        };
+        if !link.deps.iter().any(|&(src, _)| src == handle) {
+            continue;
+        }
+        // A merged fence keeps waiting for its other sources.
+        link.deps.retain(|&(src, _)| src != handle);
+        if link.deps.is_empty() {
+            let dst_point = link.dst_point;
+            obj.linked = None;
+            obj.point = obj.point.max(dst_point);
+            notify.push((obj.handle, obj.point));
+        }
+    }
+    collect_orphans(table);
+    Some(notify)
+}
+
+/// `SYNCOBJ_CREATE` from process `pid`: [`create`], with the reference
+/// recorded as `pid`'s so that [`release_owner`] can drop it when the
+/// process dies. A `pid` of 0 (no process: the kernel, or a test) records
+/// nothing, as [`create`] does.
+pub fn create_for(pid: u64, signaled: bool) -> u32 {
+    let handle = create(signaled);
+    if pid != 0 {
+        let mut table = TABLE.lock();
+        if let Some(obj) = table.objects.iter_mut().find(|o| o.handle == handle) {
+            obj.holders.push(pid);
+        }
+    }
+    handle
+}
+
+/// An opaque `SYNCOBJ_FD_TO_HANDLE` by process `pid`: [`add_ref`], with the
+/// new reference recorded as `pid`'s. A `pid` of 0 records nothing.
+pub fn add_ref_for(pid: u64, handle: u32) -> bool {
+    let mut table = TABLE.lock();
+    let Some(obj) = table
+        .objects
+        .iter_mut()
+        .find(|o| o.handle == handle && o.refs > 0)
+    else {
+        return false;
+    };
+    obj.refs = obj.refs.saturating_add(1);
+    if pid != 0 {
+        obj.holders.push(pid);
+    }
+    true
+}
+
+/// `SYNCOBJ_DESTROY` by process `pid`: gives back one of the references
+/// `pid` holds on `handle`. `false` (ENOENT) when it holds none, even if the
+/// object exists: a handle is another process's to destroy only in that
+/// process's table (Linux), and a client that guesses the compositor's
+/// handle numbers must not be able to free its timelines. A `pid` of 0
+/// destroys as the kernel would ([`destroy`]).
+pub fn destroy_for(pid: u64, handle: u32) -> bool {
+    if pid == 0 {
+        return destroy(handle);
+    }
+    let notify = {
+        let mut table = TABLE.lock();
+        let Some(obj) = table
+            .objects
+            .iter_mut()
+            .find(|o| o.handle == handle && o.refs > 0)
+        else {
+            return false;
+        };
+        let Some(i) = obj.holders.iter().position(|&p| p == pid) else {
+            return false;
+        };
+        obj.holders.swap_remove(i);
+        // One take of the lock: the reference goes with its holder entry.
+        destroy_locked(&mut table, handle).unwrap_or_default()
+    };
+    for (h, p) in notify {
+        notify_signal(h, p);
+    }
+    true
+}
+
+/// Process `pid` is gone: give back every reference it still held
+/// (`drm_syncobj_release` on the file's close in Linux). An object another
+/// process also holds, or a sync_file carries, stays; one nobody else holds
+/// goes the way of [`destroy`] (orphaned while a link still needs it, freed
+/// otherwise). Returns how many references were given back. Without this a
+/// crashed or killed client's syncobjs stayed in the table for the rest of
+/// the boot, and every lookup walks that table.
+pub fn release_owner(pid: u64) -> usize {
+    if pid == 0 {
+        return 0;
+    }
+    let (given_back, notify) = {
+        let mut table = TABLE.lock();
+        let mut handles = alloc::vec::Vec::new();
+        for obj in table.objects.iter_mut() {
+            let before = obj.holders.len();
+            obj.holders.retain(|&p| p != pid);
+            for _ in obj.holders.len()..before {
+                handles.push(obj.handle);
+            }
+        }
+        // One take of the lock for the whole sweep: no DESTROY from another
+        // process slips in between the holder entry going and the reference.
+        let mut notify = Vec::new();
+        for &h in &handles {
+            notify.extend(destroy_locked(&mut table, h).unwrap_or_default());
+        }
+        (handles.len(), notify)
+    };
+    for (h, p) in notify {
+        notify_signal(h, p);
+    }
+    given_back
+}
+
+/// Whether process `pid` holds a reference on `handle`.
+pub fn held_by(pid: u64, handle: u32) -> bool {
+    TABLE
+        .lock()
+        .objects
+        .iter()
+        .any(|o| o.handle == handle && o.refs > 0 && o.holders.contains(&pid))
 }
 
 /// The unresolved HW fences that will deliver at least `point` on `handle`,
@@ -1012,6 +1136,32 @@ pub fn export_snapshot(handle: u32) -> Option<u64> {
     };
     deferred.run();
     r
+}
+
+/// `SYNCOBJ_HANDLE_TO_FD_FLAGS_EXPORT_SYNC_FILE`: the fence `handle` carries
+/// right now, as a syncobj of its own for the `sync_file` to hold. A Linux
+/// `sync_file` keeps its own reference to the `dma_fence` that was attached
+/// at export time: a RESET of the syncobj (Mesa resets a binary semaphore in
+/// the same call that exports its `SYNC_FD`, copy transference) or the
+/// re-arm of the next submit replaces the syncobj's fence and leaves the
+/// file's alone. A file that read `(handle, point)` live against the source
+/// lost the fence with the reset -- `reset` drops the pending fence and
+/// zeroes the point -- and waited for the source's NEXT signal, or for ever.
+///
+/// The carrier starts with one reference, the file's; `destroy` it when the
+/// file closes. Its point 1 is the fence: reached already (a timed-out one
+/// keeps its mark), the same hardware fence when one is in flight, or the
+/// source's next signal when it has none (Linux refuses that export;
+/// [`export_snapshot`] explains why it is accepted here). `None` for an
+/// unknown handle.
+pub fn export_fence(handle: u32) -> Option<u32> {
+    let point = export_snapshot(handle)?;
+    let carrier = create(false);
+    if !transfer(carrier, 1, handle, point) {
+        destroy(carrier);
+        return None;
+    }
+    Some(carrier)
 }
 
 /// `SYNCOBJ_FD_TO_HANDLE_FLAGS_IMPORT_SYNC_FILE`: make `dst` carry the fence
@@ -1210,6 +1360,7 @@ pub fn merge_fences(fences: &[(u32, u64)]) -> u32 {
             handle,
             point: if deps.is_empty() { 1 } else { 0 },
             refs: 1,
+            holders: alloc::vec::Vec::new(),
             linked: if deps.is_empty() {
                 None
             } else {
@@ -2861,6 +3012,105 @@ mod tests {
         destroy(src);
     }
 
+    /// `EXPORT_SYNC_FILE` hands out the fence the syncobj carries NOW, and a
+    /// `sync_file` holds its own reference to it: resetting or re-arming the
+    /// syncobj afterwards does not touch the file. Mesa exports a `SYNC_FD`
+    /// and resets the binary semaphore in the same call
+    /// (`vk_common_GetSemaphoreFdKHR`, copy transference) while the GPU is
+    /// still on its way to the fence. Here the file was `(handle, point)`
+    /// read live against the source: the reset dropped the pending fence and
+    /// zeroed the point, and the file, its merges and its imports waited for
+    /// the source's next signal, or for ever.
+    #[test]
+    fn an_exported_sync_file_keeps_its_fence_through_a_reset_or_a_re_arm_of_the_source() {
+        let _g = test_lock();
+        arm_hooks();
+        // In flight at export, reset before it lands.
+        let src = create(false);
+        let mut zone = Landing::new();
+        assert!(attach_hw_fence(src, 1, zone.va(), 0x100, 7, 3, true));
+        let fd = export_fence(src).expect("a live source");
+        assert_ne!(fd, src, "a syncobj of its own");
+        assert_eq!(
+            pending_hw_fences(fd, 1),
+            alloc::vec![(zone.va(), 0x100u64, 7u32, 3u32)],
+            "the file carries the same hardware fence"
+        );
+        assert!(reset(src));
+        assert_eq!(query(src), Some(0));
+        assert!(
+            pending_hw_fences(src, 1).is_empty(),
+            "the reset dropped the source's fence"
+        );
+        assert_eq!(query(fd), Some(0), "not landed yet");
+        let dst = create(false);
+        assert!(import_snapshot(dst, fd, 1));
+        assert!(matches!(
+            wait_ready(&[dst], None, true, 0),
+            Some(Err(WaitOutcome::Timeout))
+        ));
+        zone.land(7);
+        assert_eq!(query(fd), Some(1), "the fence landed: the file signals");
+        assert_eq!(query(dst), Some(1), "and so does its import");
+        assert_eq!(query(src), Some(0), "the reset source does not");
+        destroy(dst);
+        destroy(fd);
+        // Re-armed by the next submit before the exported fence lands.
+        let mut first = Landing::new();
+        assert!(attach_hw_fence(src, 1, first.va(), 0, 8, 3, true));
+        let fd = export_fence(src).unwrap();
+        let mut second = Landing::new();
+        assert!(attach_hw_fence(src, 1, second.va(), 0, 9, 3, true));
+        assert_eq!(query(src), Some(0));
+        first.land(8);
+        assert_eq!(query(fd), Some(1), "the first submission's fence");
+        assert_eq!(query(src), Some(0), "the source waits for the second");
+        second.land(9);
+        assert_eq!(query(src), Some(1));
+        destroy(fd);
+        // Landed before the export: reached at once, and a reset changes
+        // nothing about it.
+        let fd = export_fence(src).unwrap();
+        assert_eq!(query(fd), Some(1));
+        assert!(reset(src));
+        assert_eq!(query(fd), Some(1));
+        assert!(!reached_by_timeout(&[fd], Some(&[1])));
+        destroy(fd);
+        // Given up on before the export: the file carries the timeout mark.
+        let dead = Landing::new();
+        assert!(attach_hw_fence(src, 1, dead.va(), 0, 10, 3, true));
+        test_clock::advance(FENCE_TIMEOUT_US + 1);
+        assert_eq!(query(src), Some(1), "reached, by the timeout");
+        let fd = export_fence(src).unwrap();
+        assert_eq!(query(fd), Some(1));
+        assert!(reached_by_timeout(&[fd], Some(&[1])), "and marked as such");
+        destroy(fd);
+        assert!(reset(src));
+        // No fence at all: the file is the source's next signal.
+        let fd = export_fence(src).unwrap();
+        assert_eq!(query(fd), Some(0));
+        assert!(signal(src));
+        assert_eq!(query(fd), Some(1));
+        destroy(fd);
+        destroy(src);
+        // A timeline: the file is the point in flight, not the counter.
+        let tl = create(false);
+        assert!(timeline_signal(tl, 3));
+        let mut z = Landing::new();
+        assert!(attach_hw_fence(tl, 5, z.va(), 0, 11, 3, false));
+        let fd = export_fence(tl).unwrap();
+        assert_eq!(query(fd), Some(0), "point 5 is still in flight");
+        assert!(reset(tl));
+        z.land(11);
+        assert_eq!(query(fd), Some(1));
+        destroy(fd);
+        destroy(tl);
+        // An unknown handle exports nothing, and leaves nothing behind.
+        let before = TABLE.lock().objects.len();
+        assert_eq!(export_fence(0xdead_0000), None);
+        assert_eq!(TABLE.lock().objects.len(), before);
+    }
+
     /// `IMPORT_SYNC_FILE` and a binary `TRANSFER` REPLACE the destination's
     /// fence (`drm_syncobj_replace_fence` in Linux: the old `dma_fence` may
     /// still signal, but the syncobj no longer carries it). The destination
@@ -3502,5 +3752,97 @@ mod tests {
         assert_eq!(links_now(), 0);
         assert!(destroy(a));
         assert!(destroy(b));
+    }
+
+    /// A syncobj handle is a `drm_file` thing in Linux: `SYNCOBJ_DESTROY`
+    /// frees the caller's reference and nobody else's, and the file's close
+    /// (`drm_syncobj_release`) gives back every handle the process still
+    /// had. Here the handle space is global and, before this, `destroy` took
+    /// whichever reference was there, so a client guessing the compositor's
+    /// handle numbers could free its timelines, and a client that crashed
+    /// mid-frame left its syncobjs (and any fence in flight on them) in the
+    /// table for the rest of the boot.
+    #[test]
+    fn a_process_that_dies_gives_back_its_syncobjs_and_only_its_own() {
+        let _g = test_lock();
+        arm_hooks();
+        const A: u64 = 91_001;
+        const B: u64 = 91_002;
+        let live = || TABLE.lock().objects.iter().filter(|o| o.refs > 0).count();
+        let before = live();
+        let a1 = create_for(A, false);
+        let a2 = create_for(A, true);
+        let b1 = create_for(B, false);
+        let kernel = create(false);
+        assert!(held_by(A, a1) && held_by(A, a2) && held_by(B, b1));
+        assert!(!held_by(A, b1) && !held_by(B, a1) && !held_by(A, kernel));
+        // B imports a1 (an opaque FD_TO_HANDLE): a reference of its own.
+        assert!(add_ref_for(B, a1));
+        assert!(held_by(B, a1) && held_by(A, a1));
+        assert!(!add_ref_for(B, 0xdead_0001), "unknown handle");
+        // A imports its own export of a2: two references of A's on it, and
+        // its death gives back both.
+        assert!(add_ref_for(A, a2));
+        // DESTROY from the wrong process is ENOENT and changes nothing.
+        assert!(!destroy_for(B, a2), "a2 is A's alone");
+        assert!(!destroy_for(A, b1), "b1 is B's alone");
+        assert!(!destroy_for(A, kernel), "no process holds the kernel's");
+        assert!(exists(a2) && exists(b1) && exists(kernel));
+        assert_eq!(query(a2), Some(1));
+        // A's fence in flight on a1: B's EXEC acquires it, so it must
+        // survive A's death (B holds the object) and still land.
+        let mut landing = Landing::new();
+        assert!(attach_hw_fence(a1, 1, landing.va(), 0, 7, 0, true));
+        assert_eq!(pending_now(), 1);
+        // A dies: a1 (its reference; B keeps the object) and a2 (both
+        // references, so freed).
+        assert_eq!(release_owner(A), 3);
+        assert!(exists(a1), "B still holds a1");
+        assert!(!held_by(A, a1) && held_by(B, a1));
+        assert!(!exists(a2), "nobody held a2 but A");
+        assert!(exists(b1) && exists(kernel));
+        assert_eq!(pending_now(), 1, "the fence B waits for is still armed");
+        assert_eq!(release_owner(A), 0, "a second teardown finds nothing");
+        // (The arm itself already announced the fence to EXEC waiters.)
+        let announced = signals().iter().filter(|&&s| s == (a1, 1)).count();
+        landing.land(7);
+        assert_eq!(query(a1), Some(1), "and it lands for B");
+        assert_eq!(
+            signals().iter().filter(|&&s| s == (a1, 1)).count(),
+            announced + 1,
+            "the landing is delivered"
+        );
+        // B's own DESTROY of the imported reference is the last one: gone.
+        assert!(destroy_for(B, a1));
+        assert!(!exists(a1));
+        assert!(!destroy_for(B, a1), "already gone");
+        // A fence in flight on a syncobj nobody else holds goes with its
+        // process (no waiter, no WEDGE from the timeout hook later).
+        let mut orphan = Landing::new();
+        assert!(attach_hw_fence(b1, 1, orphan.va(), 0, 3, 0, true));
+        assert_eq!(pending_now(), 1);
+        assert_eq!(release_owner(B), 1);
+        assert!(!exists(b1));
+        assert_eq!(pending_now(), 0);
+        let announced = signals().iter().filter(|&&s| s == (b1, 1)).count();
+        orphan.land(3);
+        assert_eq!(poll_pending(), 0);
+        assert_eq!(
+            signals().iter().filter(|&&s| s == (b1, 1)).count(),
+            announced,
+            "nothing is delivered for a dead process's fence"
+        );
+        // pid 0 is the kernel: nothing recorded, nothing released, and
+        // `destroy_for(0, ..)` is plain `destroy`.
+        let k2 = create_for(0, false);
+        assert!(!held_by(0, k2));
+        assert!(add_ref_for(0, k2));
+        assert_eq!(release_owner(0), 0);
+        assert!(exists(k2) && exists(kernel));
+        assert!(destroy_for(0, k2), "the extra reference");
+        assert!(destroy_for(0, k2), "the last one");
+        assert!(!exists(k2));
+        assert!(destroy(kernel));
+        assert_eq!(live(), before, "nothing of this test is left in the table");
     }
 }

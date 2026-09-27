@@ -116,7 +116,7 @@ bitflags! {
         /// BASIC | IO | PROPERTY | MAP | SIGNAL
         const DEFAULT_VMO = Self::BASIC.bits | Self::IO.bits | Self::PROPERTY.bits | Self::MAP.bits | Self::SIGNAL.bits;
 
-        /// BASIC | WAIT
+        /// (BASIC & !WAIT) | OP_CHILDREN
         const DEFAULT_VMAR = Self::BASIC.bits & !Self::WAIT.bits | Self::OP_CHILDREN.bits;
 
         /// BASIC | IO | PROPERTY | POLICY | ENUMERATE | DESTROY | SIGNAL | MANAGE_JOB | MANAGE_PROCESS | MANAGE_THREAD
@@ -138,7 +138,7 @@ bitflags! {
         /// BASIC | WRITE | SIGNAL
         const DEFAULT_TIMER = Self::BASIC.bits | Self::WRITE.bits | Self::SIGNAL.bits;
 
-        /// BASIC | IO | SIGNAL | PROPERTY
+        /// BASIC | IO | SIGNAL | PROPERTY | MAP
         const DEFAULT_CLOCK = Self::BASIC.bits | Self::IO.bits | Self::SIGNAL.bits | Self::PROPERTY.bits | Self::MAP.bits;
 
         /// BASIC | IO | SIGNAL
@@ -156,13 +156,13 @@ bitflags! {
         /// BASIC | IO | SIGNAL | SIGNAL_PEER
         const DEFAULT_FIFO = Self::BASIC.bits | Self::IO.bits | Self::SIGNAL.bits | Self::SIGNAL_PEER.bits;
 
-        /// BASIC | IO | PROPERTY | SIGNAL | SIGNAL_PEER
+        /// BASIC | IO | PROPERTY | SIGNAL | SIGNAL_PEER | MANAGE_SOCKET
         const DEFAULT_SOCKET = Self::BASIC.bits | Self::IO.bits | Self::PROPERTY.bits | Self::SIGNAL.bits | Self::SIGNAL_PEER.bits | Self::MANAGE_SOCKET.bits;
 
         /// BASIC | PROPERTY | SIGNAL
         const DEFAULT_STREAM = Self::BASIC.bits | Self::PROPERTY.bits | Self::SIGNAL.bits;
 
-        /// (BASIC & !WAIT) | IO | MAP
+        /// (BASIC & !WAIT) | IO | PROPERTY | MAP
         const DEFAULT_BTI = (Self::BASIC.bits & !Self::WAIT.bits) | Self::IO.bits | Self::PROPERTY.bits | Self::MAP.bits;
 
         /// BASIC | IO | SIGNAL
@@ -178,7 +178,15 @@ bitflags! {
         const DEFAULT_EXCEPTION = Self::TRANSFER.bits | Self::PROPERTY.bits | Self::INSPECT.bits;
 
         /// TRANSFER | DUPLICATE | WRITE | INSPECT | MANAGE_PROCESS
-        const DEFAULT_GUEST = Self::TRANSFER.bits | Self::DUPLICATE.bits | Self::WRITE.bits | Self::INSPECT.bits | Self::MANAGE_THREAD.bits;
+        ///
+        /// `MANAGE_PROCESS`, not `MANAGE_THREAD`: `sys_vcpu_create` is the one
+        /// caller that asks a `Guest` handle for either, and it asks for
+        /// `MANAGE_PROCESS`. With `MANAGE_THREAD` here, every
+        /// `zx_vcpu_create` on a handle from `zx_guest_create` answered
+        /// `ACCESS_DENIED` -- no VCPU could be made, so the hypervisor was
+        /// unusable from userspace -- and nothing in the tree ever asked a
+        /// `Guest` for `MANAGE_THREAD`.
+        const DEFAULT_GUEST = Self::TRANSFER.bits | Self::DUPLICATE.bits | Self::WRITE.bits | Self::INSPECT.bits | Self::MANAGE_PROCESS.bits;
 
         /// BASIC | IO | EXECUTE | SIGNAL
         const DEFAULT_VCPU = Self::BASIC.bits | Self::IO.bits | Self::EXECUTE.bits | Self::SIGNAL.bits;
@@ -201,5 +209,74 @@ mod tests {
     fn test_try_from() {
         assert_eq!(Err(ZxError::INVALID_ARGS), Rights::try_from(0xffff_ffff));
         assert_eq!(Ok(Rights::SAME_RIGHTS), Rights::try_from(1 << 31));
+    }
+
+    /// A default right set is only useful if it covers what the syscalls ask of
+    /// that kind of handle. `DEFAULT_GUEST` did not: `sys_vcpu_create` asks a
+    /// `Guest` for `MANAGE_PROCESS` and the set granted `MANAGE_THREAD`, so
+    /// `zx_vcpu_create` on a handle straight out of `zx_guest_create` could
+    /// only ever answer `ACCESS_DENIED`.
+    ///
+    /// Spelled out rather than compared against the syscall crate, which this
+    /// one cannot see.
+    #[test]
+    fn a_guest_handle_can_make_a_vcpu() {
+        assert!(
+            Rights::DEFAULT_GUEST.contains(Rights::MANAGE_PROCESS),
+            "sys_vcpu_create asks a Guest for MANAGE_PROCESS"
+        );
+        assert!(
+            !Rights::DEFAULT_GUEST.contains(Rights::MANAGE_THREAD),
+            "nothing asks a Guest for MANAGE_THREAD"
+        );
+    }
+
+    /// Every `DEFAULT_*` set names rights that exist, and none of them carries
+    /// `SAME_RIGHTS`, which is the marker `zx_handle_duplicate` reads and not a
+    /// right an object can hold.
+    #[test]
+    fn no_default_set_carries_the_same_rights_marker() {
+        for (name, rights) in [
+            ("CHANNEL", Rights::DEFAULT_CHANNEL),
+            ("PROCESS", Rights::DEFAULT_PROCESS),
+            ("THREAD", Rights::DEFAULT_THREAD),
+            ("VMO", Rights::DEFAULT_VMO),
+            ("VMAR", Rights::DEFAULT_VMAR),
+            ("JOB", Rights::DEFAULT_JOB),
+            ("RESOURCE", Rights::DEFAULT_RESOURCE),
+            ("DEBUGLOG", Rights::DEFAULT_DEBUGLOG),
+            ("SUSPEND_TOKEN", Rights::DEFAULT_SUSPEND_TOKEN),
+            ("PORT", Rights::DEFAULT_PORT),
+            ("TIMER", Rights::DEFAULT_TIMER),
+            ("CLOCK", Rights::DEFAULT_CLOCK),
+            ("COUNTER", Rights::DEFAULT_COUNTER),
+            ("EVENT", Rights::DEFAULT_EVENT),
+            ("EVENTPAIR", Rights::DEFAULT_EVENTPAIR),
+            ("FIFO", Rights::DEFAULT_FIFO),
+            ("SOCKET", Rights::DEFAULT_SOCKET),
+            ("STREAM", Rights::DEFAULT_STREAM),
+            ("BTI", Rights::DEFAULT_BTI),
+            ("INTERRUPT", Rights::DEFAULT_INTERRUPT),
+            ("DEVICE", Rights::DEFAULT_DEVICE),
+            ("PCI_INTERRUPT", Rights::DEFAULT_PCI_INTERRUPT),
+            ("EXCEPTION", Rights::DEFAULT_EXCEPTION),
+            ("GUEST", Rights::DEFAULT_GUEST),
+            ("VCPU", Rights::DEFAULT_VCPU),
+        ] {
+            assert!(
+                !rights.contains(Rights::SAME_RIGHTS),
+                "DEFAULT_{} carries SAME_RIGHTS",
+                name
+            );
+            assert!(!rights.is_empty(), "DEFAULT_{} is empty", name);
+        }
+    }
+
+    /// A channel handle is not duplicatable, which is what makes a channel a
+    /// point-to-point link rather than a broadcast.
+    #[test]
+    fn a_channel_handle_cannot_be_duplicated() {
+        assert!(!Rights::DEFAULT_CHANNEL.contains(Rights::DUPLICATE));
+        assert!(Rights::DEFAULT_CHANNEL.contains(Rights::TRANSFER));
     }
 }

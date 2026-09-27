@@ -678,6 +678,17 @@ impl<'a> Future for PtyReadFuture<'a> {
                 hangup: false,
             }));
         }
+        // The wakers below report what the PEER does and nothing that happens
+        // to the READER, so without this a `read` on a pty nobody writes to
+        // could not be ended by a signal, by `kill`, or by its own process
+        // exiting. After the readiness check, deliberately: what is already
+        // there is delivered, and `EINTR` is only synthesised for a read that
+        // would really block. `FsError::Interrupted` is what the file layer
+        // turns into `EINTR`, and the io-wait tick is what makes this check run
+        // again while the read is parked.
+        if crate::sync::wait_interrupted().is_err() {
+            return Poll::Ready(Err(FsError::Interrupted));
+        }
         if this.armed {
             crate::net::retain_io_wait_wakers(cx.waker(), false, true);
         } else {

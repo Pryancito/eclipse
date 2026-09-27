@@ -64,7 +64,21 @@ impl Future for DrmEventWait<'_> {
                     return false;
                 }
                 waker.wake_by_ref();
-                true
+                // `false`, not `true`: returning true makes the callback
+                // ONE-SHOT, and the bus drops it the moment it fires while
+                // `sub_id` stays `Some` naming nothing. So a waiter that woke
+                // on READABLE and then found nothing to read -- another reader
+                // of the same `drm_file` (a `dup`ed card fd, or a second
+                // compositor thread) drained the queue first, or the flag was
+                // set without a completion landing -- fell through to the
+                // `is_none()` above, did NOT re-subscribe, and parked with no
+                // callback on the bus at all. Nothing here re-polls on a tick,
+                // so that reader slept for good: a compositor blocked in
+                // `read()` on the card fd, which is the frame loop stopping
+                // dead. Staying subscribed for the future's whole life costs a
+                // spurious wake at most, and every exit path already
+                // unsubscribes -- both `Ready` arms of both matches, and `Drop`.
+                false
             }));
         }
         match this.dev.poll() {
@@ -2160,7 +2174,11 @@ impl DrmDev {
                     return Err(FsError::OpNotSupported);
                 }
                 let req = unsafe { &mut *(data as *mut DrmSyncobjCreate) };
-                let handle = zcore_drivers::scheme::syncobj::create(
+                // Owned by the calling process: given back when it dies
+                // (`release_process`), and a `DESTROY` from any other
+                // process is ENOENT.
+                let handle = zcore_drivers::scheme::syncobj::create_for(
+                    drm::current_pid(),
                     req.flags & DRM_SYNCOBJ_CREATE_SIGNALED != 0,
                 );
                 req.handle = handle;
@@ -2196,7 +2214,7 @@ impl DrmDev {
                     return Err(FsError::OpNotSupported);
                 }
                 let req = unsafe { &*(data as *const DrmSyncobjDestroy) };
-                if zcore_drivers::scheme::syncobj::destroy(req.handle) {
+                if zcore_drivers::scheme::syncobj::destroy_for(drm::current_pid(), req.handle) {
                     Ok(0)
                 } else {
                     Err(FsError::EntryNotFound)
@@ -7167,6 +7185,116 @@ mod kms_scanout_tests {
         }
     }
 
+    /// The source report has to fire on a present where NOTHING changed, because
+    /// that is the case it exists for: a black rectangle that just sits there is
+    /// black in both reads, so it differs in no band and the mismatch line never
+    /// fires. If this line shared the mismatch line's trigger, the static case --
+    /// the one Moebius is looking at -- would never be described at all.
+    #[test]
+    fn the_source_report_fires_even_when_nothing_changed() {
+        let _screen = kms_emu::attach(192, 200);
+        drm::set_present_probe_enabled(true);
+        let c = Client::open(0);
+        let buf = c.create_dumb(192, 200);
+        // Half opaque, half fully transparent black: a settled buffer that holds
+        // a black region, which is exactly the shape being diagnosed.
+        paint(&buf, |x, y| if x < 96 { tag(0x0044_0000, x, y) } else { 0 });
+        let fb = c.addfb2(&buf);
+
+        c.page_flip(drm::SYNTH_CRTC_ID, fb, 0x3333).expect("flip");
+
+        assert_eq!(
+            drm::probe_reports_for_test(),
+            0,
+            "nothing moved under the copy, so there is no mismatch to report"
+        );
+        // The range, not just the floor: a count above the budget would be
+        // reads that wrote no line, and then this would pass without the line
+        // this test is about ever having been written.
+        let zero_reads = drm::zero_reports_for_test();
+        assert!(
+            (1..=drm::probe_report_budget_for_test()).contains(&zero_reads),
+            "the source report has to fire anyway -- that is the whole point of \
+             it -- and inside the budget, so it really wrote its line; got {}",
+            zero_reads
+        );
+    }
+
+    /// The repair is one more writer that goes around the band skip, so it has to
+    /// make the skip forget -- the same rule the cursor, a damage box, a blank, a
+    /// VT and the copy engine all follow.
+    ///
+    /// The skip's stored hash means "the panel holds these pixels in these rows".
+    /// A repair writes the panel with a plain `blit_chunked`, so after it the
+    /// panel holds what the REPAIR copied while the hash still describes what the
+    /// first copy put there. Leave that stale and a later frame whose pixels
+    /// happen to match the old hash gets skipped over a panel that does not hold
+    /// them -- stale pixels left on screen by the very path that exists to stop
+    /// leaving stale pixels on screen.
+    ///
+    /// The control for this one is
+    /// `a_band_the_panel_already_holds_is_not_copied_again`: there a second
+    /// present of the same pixels skips every band. Here the first present
+    /// repairs, so the second must skip none.
+    #[test]
+    fn a_present_that_repaired_makes_the_next_one_copy_again() {
+        let screen = kms_emu::attach(192, 200);
+        drm::set_present_repair_enabled(true);
+        drm::set_present_skip_enabled(true);
+        let c = Client::open(0);
+        let buf = c.create_dumb(192, 200);
+        paint(&buf, |x, y| tag(0x0055_0000, x, y));
+        let fb = c.addfb2(&buf);
+        let pixels = map_dumb(&buf);
+        let stride = (buf.pitch / 4) as usize;
+        let late = pixels.as_mut_ptr() as usize;
+
+        // Present 1: the source moves under the copy, so the repair runs.
+        kms_emu::on_blit_band(move |band| {
+            if band != 1 {
+                return;
+            }
+            // SAFETY: the dumb buffer outlives this present, and nothing else
+            // writes it while the hook runs.
+            let p = unsafe { core::slice::from_raw_parts_mut(late as *mut u32, stride * 200) };
+            for y in 0..128usize {
+                for x in 64..128usize {
+                    p[y * stride + x] = tag(0x0099_0000, x as u32, y as u32);
+                }
+            }
+        });
+        c.page_flip(drm::SYNTH_CRTC_ID, fb, 0x1111)
+            .expect("first flip");
+        assert!(
+            drm::repair_rounds_for_test() >= 1,
+            "the staging did not make the source move, so this test proves nothing"
+        );
+
+        // Present 2: nothing touches the source, and it is exactly what the panel
+        // was last left holding. Without the invalidation the skip would believe
+        // its own stale hash and skip.
+        kms_emu::clear_mid_blit();
+        c.page_flip(drm::SYNTH_CRTC_ID, fb, 0x2222)
+            .expect("second flip");
+        assert_eq!(
+            drm::skipped_bands_for_test(),
+            0,
+            "a repair wrote the panel outside the skip, so the skip must have forgotten those rows"
+        );
+        // And the panel still agrees with the source everywhere, which is the
+        // outcome the invalidation is protecting.
+        for y in (0..200).step_by(17) {
+            for x in (0..192).step_by(23) {
+                let want = if y < 128 && (64..128).contains(&x) {
+                    tag(0x0099_0000, x, y)
+                } else {
+                    tag(0x0055_0000, x, y)
+                };
+                assert_eq!(screen.pixel(x, y), want, "pixel ({}, {})", x, y);
+            }
+        }
+    }
+
     /// A repair round copies the span that moved and NOT the whole window. The
     /// claim that a round costs what actually moved rests on this, and reading the
     /// destination afterwards cannot show it when the source agrees everywhere:
@@ -10998,5 +11126,128 @@ mod present_fence_tests {
     #[test]
     fn a_zero_tick_ends_the_wait_rather_than_spinning() {
         assert_eq!(next_poll_wake(ms(10), ms(110), Duration::ZERO), None);
+    }
+}
+
+#[cfg(test)]
+mod card_fd_wait_tests {
+    //! The waiter behind a blocking `read()` on the card fd.
+    //!
+    //! A compositor's frame loop lives here: it page-flips, then blocks reading
+    //! the card fd until the completion arrives. The wait is an event-bus
+    //! subscription, and the bus drops a callback that returns `true` as soon
+    //! as it fires. So a waiter that woke, found nothing to read, and parked
+    //! again had to make sure it still HAD a callback -- nothing in this file
+    //! re-polls the fd on a tick, so a park with no callback is a frame loop
+    //! that stops for good.
+    //!
+    //! Waking with nothing to read is ordinary, not exotic: another reader of
+    //! the same `drm_file` (a `dup`ed fd, a second compositor thread) can drain
+    //! the queue in between, and the bus flag is latched independently of the
+    //! queue.
+
+    use super::*;
+    use crate::sync::Event;
+    use core::sync::atomic::{AtomicUsize, Ordering};
+    use core::task::{Context, RawWaker, RawWakerVTable, Waker};
+
+    /// A waker that counts how many times the bus reached it.
+    fn counting_waker(hits: &AtomicUsize) -> Waker {
+        fn raw(ptr: *const ()) -> RawWaker {
+            unsafe fn clone(ptr: *const ()) -> RawWaker {
+                raw(ptr)
+            }
+            unsafe fn wake(ptr: *const ()) {
+                wake_by_ref(ptr)
+            }
+            unsafe fn wake_by_ref(ptr: *const ()) {
+                // SAFETY: `ptr` is the `&AtomicUsize` this waker was built
+                // from, which outlives the waker (it is a local of the test).
+                unsafe { &*(ptr as *const AtomicUsize) }.fetch_add(1, Ordering::Relaxed);
+            }
+            unsafe fn drop(_: *const ()) {}
+            RawWaker::new(ptr, &RawWakerVTable::new(clone, wake, wake_by_ref, drop))
+        }
+        // SAFETY: the vtable above only ever reads `ptr` as the `&AtomicUsize`.
+        unsafe { Waker::from_raw(raw(hits as *const AtomicUsize as *const ())) }
+    }
+
+    /// The bug this pins down: one wake that produced nothing to read used to
+    /// leave the reader parked with no callback on the bus.
+    #[test]
+    fn a_wake_that_finds_nothing_to_read_leaves_the_reader_still_subscribed() {
+        let hits = AtomicUsize::new(0);
+        let waker = counting_waker(&hits);
+        let mut cx = Context::from_waker(&waker);
+
+        let dev = DrmDev::new(0);
+        let bus = dev.file.eventbus();
+        let mut fut = core::pin::pin!(DrmEventWait {
+            dev: &dev,
+            bus: bus.clone(),
+            sub_id: None,
+        });
+
+        // Nothing queued, so the first poll parks with a callback on the bus.
+        assert!(matches!(fut.as_mut().poll(&mut cx), TaskPoll::Pending));
+        assert_eq!(
+            bus.lock().get_callback_len(),
+            1,
+            "parked without a callback"
+        );
+
+        // A readable edge that leaves the queue empty: somebody else read it.
+        bus.lock().change(Event::empty(), Event::READABLE);
+        assert_eq!(hits.load(Ordering::Relaxed), 1, "the edge has to wake it");
+
+        // Woken, still nothing to read, parks again -- and MUST still be
+        // subscribed. This is the assertion the one-shot callback failed.
+        assert!(matches!(fut.as_mut().poll(&mut cx), TaskPoll::Pending));
+        assert_eq!(
+            bus.lock().get_callback_len(),
+            1,
+            "parked with no callback on the bus: nothing will ever wake this \
+             reader again, and a compositor blocked in read() on the card fd is \
+             a frame loop that has stopped"
+        );
+
+        // And the proof it is a live callback and not merely a present one: the
+        // next edge reaches the same waiter.
+        bus.lock().change(Event::READABLE, Event::empty());
+        bus.lock().change(Event::empty(), Event::READABLE);
+        assert_eq!(
+            hits.load(Ordering::Relaxed),
+            2,
+            "the second edge never reached the reader"
+        );
+    }
+
+    /// The other half, so the fix cannot be "never unsubscribe": dropping the
+    /// future still takes the callback off the bus. A card fd is opened and
+    /// closed on every compositor restart, and the bus evicts its oldest entry
+    /// when the table fills, so a leak here would silently cost somebody else
+    /// their wakeup.
+    #[test]
+    fn dropping_the_waiter_takes_its_callback_off_the_bus() {
+        let hits = AtomicUsize::new(0);
+        let waker = counting_waker(&hits);
+        let mut cx = Context::from_waker(&waker);
+
+        let dev = DrmDev::new(0);
+        let bus = dev.file.eventbus();
+        {
+            let mut fut = core::pin::pin!(DrmEventWait {
+                dev: &dev,
+                bus: bus.clone(),
+                sub_id: None,
+            });
+            assert!(matches!(fut.as_mut().poll(&mut cx), TaskPoll::Pending));
+            assert_eq!(bus.lock().get_callback_len(), 1);
+        }
+        assert_eq!(
+            bus.lock().get_callback_len(),
+            0,
+            "the callback outlived the waiter"
+        );
     }
 }

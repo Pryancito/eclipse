@@ -435,12 +435,42 @@ impl SharedLegacyIrqHandler {
             PciReg16::Command,
             cfg.read16(PciReg16::Command) | PCIE_CFG_COMMAND_INT_DISABLE,
         );
-        let mut device_handler = self.device_handler.lock();
-        device_handler.retain(|h| Arc::ptr_eq(h, &device));
-        if device_handler.is_empty() {
-            interrupt::mask_irq(self.irq_id).unwrap();
-        }
+        let left = {
+            let mut device_handler = self.device_handler.lock();
+            let left = take_out(&mut device_handler, &device);
+            if device_handler.is_empty() {
+                interrupt::mask_irq(self.irq_id).unwrap();
+            }
+            left
+        };
+        // The devices that left are dropped with the list's lock released:
+        // `handle()` takes each device's own `inner` under it, so running a
+        // device's `Drop` in there is a lock nest this module does not control.
+        drop(left);
     }
+}
+
+/// Take `victim` out of `list`, answering whatever left it.
+///
+/// Generic over the element so a test can exercise the predicate without a PCI
+/// device and its config space. `remove_device` had this as
+/// `retain(|h| Arc::ptr_eq(h, &device))`, which is `retain`'s condition the
+/// wrong way round: it **kept** the device being removed and threw out every
+/// other device on the same legacy IRQ line. So the line's handler kept calling
+/// the device that had just asked to leave, and the devices that had said
+/// nothing stopped being called at all -- and if the victim was not in the list,
+/// the list came out empty and `remove_device` masked the IRQ for everyone.
+fn take_out<T>(list: &mut Vec<Arc<T>>, victim: &Arc<T>) -> Vec<Arc<T>> {
+    let mut left = Vec::new();
+    list.retain(|item| {
+        if Arc::ptr_eq(item, victim) {
+            left.push(item.clone());
+            false
+        } else {
+            true
+        }
+    });
+    left
 }
 
 numeric_enum! {
@@ -880,6 +910,27 @@ impl PcieDevice {
         let oldval = cfg.read16(PciReg16::Command);
         cfg.write16(PciReg16::Command, oldval & !clr | set)
     }
+    /// Put `bit` of the command register into the state `set` asks for, and
+    /// answer whether the register had to change at all.
+    ///
+    /// The read and the write are both under `command_lock`, so the answer is
+    /// the transition this call made and not a guess from a stale read.
+    fn modify_cmd_bit(&self, bit: u16, set: bool) -> ZxResult<bool> {
+        if !self.inner.lock().plugged_in {
+            return Err(ZxError::UNAVAILABLE);
+        }
+        // Same order as `modify_cmd_adv`: `dev_lock` outside `command_lock`.
+        let _guard = self.dev_lock.lock();
+        let _cmd_lock = self.command_lock.lock();
+        let cfg = self.cfg.as_ref().unwrap();
+        let oldval = cfg.read16(PciReg16::Command);
+        if !cmd_bit_needs_change(oldval, bit, set) {
+            return Ok(false);
+        }
+        let newval = if set { oldval | bit } else { oldval & !bit };
+        cfg.write16(PciReg16::Command, newval);
+        Ok(true)
+    }
     fn modify_cmd_adv(&self, clr: u16, set: u16) -> ZxResult {
         if !self.inner.lock().plugged_in {
             return Err(ZxError::UNAVAILABLE);
@@ -932,11 +983,18 @@ impl PcieDevice {
     }
 
     /// Enable bus mastering.
+    ///
+    /// The upstream node is told only when this device's own bit actually
+    /// changes. It has to be: a bridge upstream counts how many of the devices
+    /// below it want bus mastering, and `zx_pci_enable_bus_master` is a syscall
+    /// userspace can call as often as it likes. Without this guard, a loop of
+    /// `zx_pci_enable_bus_master(handle, true)` runs that count up without
+    /// bound, and one `false` in a row that is already `false` runs it down
+    /// into `BAD_STATE` for a device that never asked for anything.
     pub fn enable_master(&self, enable: bool) -> ZxResult {
-        self.modify_cmd_adv(
-            if enable { 0 } else { PCI_COMMAND_BUS_MASTER_EN },
-            if enable { PCI_COMMAND_BUS_MASTER_EN } else { 0 },
-        )?;
+        if !self.modify_cmd_bit(PCI_COMMAND_BUS_MASTER_EN, enable)? {
+            return Ok(());
+        }
         if let Some(up) = self.upstream().upgrade() {
             up.enable_bus_master(enable)
         } else {
@@ -1729,24 +1787,42 @@ impl IPciNode for PciBridge {
         Ok(())
     }
     fn enable_bus_master(&self, enable: bool) -> ZxResult {
-        let count = {
+        let change = {
             let mut count = self.downstream_bus_mastering_cnt.lock();
-            if enable {
-                *count += 1;
-            } else if *count == 0 {
-                return Err(ZxError::BAD_STATE);
-            } else {
-                *count -= 1;
-            }
-            *count
+            bus_master_transition(&mut count, enable)?
         };
-        if count > 0 {
-            self.base_device.enable_master(false)?;
-        }
-        if count == 1 && enable {
-            self.base_device.enable_master(true)?;
+        // Outside the lock on purpose: this writes config space and walks on up
+        // to this bridge's own upstream node.
+        if let Some(enable) = change {
+            self.base_device.enable_master(enable)?;
         }
         Ok(())
+    }
+}
+
+/// Whether putting `bit` of the command register `cmd` into the state `set`
+/// asks for changes anything.
+fn cmd_bit_needs_change(cmd: u16, bit: u16, set: bool) -> bool {
+    (cmd & bit != 0) != set
+}
+
+/// Move a bridge's count of downstream devices that want bus mastering, and
+/// answer with the change the bridge's own command register needs, if any.
+///
+/// A bridge is a master only while something below it is: the bit goes on when
+/// the count leaves zero and off when it comes back to zero, and nothing else
+/// touches config space. The count going 1 -> 2 or 2 -> 1 is not a transition,
+/// and used to disable mastering for the whole subtree while a device below was
+/// still using it; the count reaching zero used to leave it enabled forever.
+fn bus_master_transition(count: &mut usize, enable: bool) -> ZxResult<Option<bool>> {
+    if enable {
+        *count += 1;
+        Ok(if *count == 1 { Some(true) } else { None })
+    } else if *count == 0 {
+        Err(ZxError::BAD_STATE)
+    } else {
+        *count -= 1;
+        Ok(if *count == 0 { Some(false) } else { None })
     }
 }
 
@@ -2793,5 +2869,133 @@ mod pci_bar_and_config_tests {
         // nobody, which is what it did before for a live bridge that was not
         // an upstream.
         assert!(dev.inner.lock().upstream.upgrade().is_none());
+    }
+    /// `remove_device` was `retain(|h| Arc::ptr_eq(h, &device))`, which is
+    /// `retain`'s condition inverted: it kept the device being removed and threw
+    /// out every other device sharing that legacy IRQ line. On hardware with two
+    /// devices on one line, moving one of them to MSI stopped the other's
+    /// interrupts for good, silently; and removing a device that was not in the
+    /// list left the list empty, which makes `remove_device` mask the line for
+    /// everyone.
+    #[test]
+    fn taking_one_device_out_leaves_the_others_on_the_line() {
+        let a = Arc::new(1u32);
+        let b = Arc::new(2u32);
+        let c = Arc::new(3u32);
+        let mut list = vec![a.clone(), b.clone(), c.clone()];
+
+        let left = take_out(&mut list, &b);
+
+        assert_eq!(left.len(), 1, "only the named device leaves");
+        assert!(Arc::ptr_eq(&left[0], &b));
+        assert_eq!(list.len(), 2, "the others stay on the line");
+        assert!(Arc::ptr_eq(&list[0], &a));
+        assert!(Arc::ptr_eq(&list[1], &c));
+    }
+
+    /// And the list is matched by identity, not by value: two devices whose
+    /// contents compare equal are still two devices.
+    #[test]
+    fn a_device_that_is_not_on_the_line_takes_nobody_with_it() {
+        let a = Arc::new(7u32);
+        let same_value_other_device = Arc::new(7u32);
+        let mut list = vec![a.clone()];
+
+        let left = take_out(&mut list, &same_value_other_device);
+
+        assert!(left.is_empty());
+        assert_eq!(
+            list.len(),
+            1,
+            "a device that was never added must not empty the line, \
+             because an empty line gets its IRQ masked"
+        );
+    }
+}
+
+#[cfg(test)]
+mod bus_master_tests {
+    use super::*;
+
+    /// Ask for the transition and apply it to a register, the way
+    /// `PciBridge::enable_bus_master` and `PcieDevice::enable_master` do
+    /// together, so the test sees what the bridge's command bit ends up as.
+    fn step(count: &mut usize, cmd: &mut u16, enable: bool) -> ZxResult {
+        if let Some(enable) = bus_master_transition(count, enable)? {
+            assert!(
+                cmd_bit_needs_change(*cmd, PCI_COMMAND_BUS_MASTER_EN, enable),
+                "a transition asked for a write that changes nothing"
+            );
+            *cmd = if enable {
+                *cmd | PCI_COMMAND_BUS_MASTER_EN
+            } else {
+                *cmd & !PCI_COMMAND_BUS_MASTER_EN
+            };
+        }
+        Ok(())
+    }
+
+    fn master(cmd: u16) -> bool {
+        cmd & PCI_COMMAND_BUS_MASTER_EN != 0
+    }
+
+    #[test]
+    fn a_second_device_asking_for_mastering_does_not_turn_the_bridge_off() {
+        let (mut count, mut cmd) = (0, 0u16);
+        step(&mut count, &mut cmd, true).unwrap();
+        assert!(master(cmd), "the first device did not turn mastering on");
+        step(&mut count, &mut cmd, true).unwrap();
+        assert!(
+            master(cmd),
+            "the second device turned mastering off with the first still using it"
+        );
+        assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn mastering_goes_off_only_when_the_last_device_lets_go() {
+        let (mut count, mut cmd) = (0, 0u16);
+        for _ in 0..3 {
+            step(&mut count, &mut cmd, true).unwrap();
+        }
+        for left in [2, 1] {
+            step(&mut count, &mut cmd, false).unwrap();
+            assert_eq!(count, left);
+            assert!(
+                master(cmd),
+                "mastering went off with {} device(s) still using it",
+                left
+            );
+        }
+        step(&mut count, &mut cmd, false).unwrap();
+        assert_eq!(count, 0);
+        assert!(
+            !master(cmd),
+            "the last device let go and mastering stayed on"
+        );
+    }
+
+    #[test]
+    fn letting_go_of_a_bridge_nobody_is_mastering_is_bad_state() {
+        let mut count = 0;
+        assert_eq!(
+            bus_master_transition(&mut count, false),
+            Err(ZxError::BAD_STATE)
+        );
+        assert_eq!(count, 0, "the refused call moved the count");
+    }
+
+    /// The guard in `PcieDevice::enable_master`: a repeated request is not a
+    /// transition, so it never reaches the bridge's count.
+    #[test]
+    fn a_repeated_request_is_not_a_change_to_the_command_register() {
+        let bit = PCI_COMMAND_BUS_MASTER_EN;
+        assert!(cmd_bit_needs_change(0, bit, true));
+        assert!(!cmd_bit_needs_change(bit, bit, true));
+        assert!(cmd_bit_needs_change(bit, bit, false));
+        assert!(!cmd_bit_needs_change(0, bit, false));
+        // Other bits of the register are none of its business.
+        assert!(!cmd_bit_needs_change(0xffff & !bit, bit, false));
+        assert!(cmd_bit_needs_change(0xffff & !bit, bit, true));
     }
 }

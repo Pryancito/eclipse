@@ -684,13 +684,17 @@ fn surfaceflip_drain() -> Option<u64> {
 /// One `/proc/gpudbg` line with the surface-flip counters.
 fn surfaceflip_stats_line() -> String {
     alloc::format!(
-        "[gpudbg]  surfaceflip: state={} flips={} drain-waits={} drain-total={}us drain-max={}us submit-max={}us stuck-dropped={} busy-refused={}",
+        "[gpudbg]  surfaceflip: state={} flips={} iso-ctxdma-builds={} drain-waits={} drain-total={}us drain-max={}us submit-max={}us stuck-dropped={} busy-refused={}",
         match SURFACEFLIP_STATE.load(Ordering::Relaxed) {
             0 => "untried",
             1 => "ready",
             _ => "failed",
         },
         SURFACEFLIP_FLIPS.load(Ordering::Relaxed),
+        // One per distinct framebuffer the compositor flips is healthy; a
+        // number that tracks `flips` means every frame is paying an RM object
+        // free plus an RM object alloc inside the RM API lock.
+        nvidia_rm_sys::rm_init::hwflip_iso_builds(),
         SURFACEFLIP_DRAIN_WAITS.load(Ordering::Relaxed),
         SURFACEFLIP_DRAIN_US.load(Ordering::Relaxed),
         SURFACEFLIP_DRAIN_MAX_US.load(Ordering::Relaxed),
@@ -19432,6 +19436,62 @@ mod nouveau_bookkeeping_tests {
         assert_eq!(FAKE_RM.lock().bad, 0);
     }
 
+    /// Mesa's `SYNC_FD` export (`vkGetSemaphoreFdKHR`, `eglDupNativeFenceFDANDROID`
+    /// through zink: wlroots' GLES renderer hands that fd to the
+    /// `linux-drm-syncobj-v1` release point) resets the binary semaphore in
+    /// the same call, while the ring is still on its way to the fence the
+    /// EXEC attached. The file has to reach on that fence regardless: the
+    /// consumer's EXEC waits on an import of it, acquires that very fence,
+    /// and the reset semaphore stays at 0 until its owner signals it again.
+    #[test]
+    fn a_sync_file_exported_from_a_semaphore_an_exec_signaled_survives_its_reset() {
+        let _g = LOCK.lock();
+        let _live = LiveBytes::hold();
+        let gpu = gpu_rm_fast();
+        FAKE_RM.lock().peer = true;
+        let ch_a = client_with_pushbuf(&gpu, A);
+        let ch_b = client_with_pushbuf(&gpu, B);
+        let sem = syncobj::create(false);
+        assert_eq!(
+            exec(&gpu, A, ch_a, &[push(PUSH_VA, 16)], &[], &[sync(sem)]),
+            Ok(0)
+        );
+        let fd = syncobj::export_fence(sem).expect("live");
+        assert!(syncobj::reset(sem), "Mesa's copy transference");
+        assert_eq!(syncobj::query(sem), Some(0));
+        // The consumer imports the file and submits behind it: B acquires
+        // A's fence on its ring, no CPU wait, no EIO.
+        let acquire = syncobj::create(false);
+        assert!(syncobj::import_snapshot(acquire, fd, 1));
+        let out = syncobj::create(false);
+        // (1 ms per clock read: a CPU wait, which there must not be, ends
+        // in EIO after 10 s virtual instead of parking the test.)
+        test_clock::set_auto_advance(1_000);
+        let submitted = exec(
+            &gpu,
+            B,
+            ch_b,
+            &[push(PUSH_VA, 16)],
+            &[sync(acquire)],
+            &[sync(out)],
+        );
+        test_clock::set_auto_advance(0);
+        assert_eq!(submitted, Ok(0), "no CPU wait: the fence is A's, in flight");
+        assert_eq!(userd(&chan(2)), (0, 3), "acquire, push and fence");
+        assert_eq!(peer_maps_made(), 1, "A's fence, mapped for B's ACQUIRE");
+        assert!(run_gpu(2).is_empty(), "B stalls behind A");
+        assert_eq!(run_gpu(1).len(), 2, "A lands");
+        assert_eq!(syncobj::query(fd), Some(1), "the file reaches on A's fence");
+        assert_eq!(syncobj::query(acquire), Some(1));
+        assert_eq!(syncobj::query(sem), Some(0), "the reset semaphore does not");
+        assert_eq!(run_gpu(2).len(), 3);
+        assert_eq!(syncobj::query(out), Some(1));
+        for h in [sem, fd, acquire, out] {
+            syncobj::destroy(h);
+        }
+        assert_eq!(FAKE_RM.lock().bad, 0);
+    }
+
     // ---- The fence-timeout upcall -----------------------------------------
     //
     // A fence the GPU never writes is `syncobj`'s to give up on: after
@@ -22330,6 +22390,53 @@ mod surfaceflip_tests {
         assert_eq!((kms.crtc_fb, kms.plane_fb), (FB, FB));
     }
 
+    /// A compositor rotates a swapchain, so the buffer handed to consecutive
+    /// flips alternates. Each distinct buffer needs an ISO context DMA, and
+    /// that object is what a flip must NOT be paying for: the display front
+    /// end may still be scanning out the buffer whose ctxdma a rebuild would
+    /// free, and an RM object free plus alloc sits inside the RM API lock and
+    /// the GPU locks, on the compositor's critical path.
+    ///
+    /// The count the flip path reports is therefore the number of distinct
+    /// buffers, not the number of flips. This pins the number down to what
+    /// `/proc/gpudbg` says, which is the only place either of us can read it
+    /// on a machine with a display; the table itself lives in
+    /// `eclipse_rm_hwflip_surface`, which the fake stands in for here.
+    #[test]
+    fn rotating_a_swapchain_builds_one_ctxdma_per_buffer_not_one_per_flip() {
+        let _g = SERIAL.lock();
+        let gpu = console_gpu();
+        const FB_B: u32 = FB + 1;
+        const H_MEMORY_B: u32 = H_MEMORY + 1;
+        gpu.kms_framebuffers.lock().push(NvidiaKmsFramebuffer {
+            id: FB_B,
+            handle_id: 2,
+            width: 1920,
+            height: 1080,
+            pitch: 1920 * 4,
+            phys_addr: 0,
+            size: 0,
+            h_memory: H_MEMORY_B,
+            vram_offset: Some(0),
+        });
+        for fb in [FB, FB_B, FB, FB_B, FB, FB_B] {
+            assert!(gpu.page_flip(fb));
+        }
+        assert_eq!(surfaces(), 6, "six frames went out");
+        assert_eq!(
+            FAKE_HWFLIP.lock().iso_mems,
+            [H_MEMORY, H_MEMORY_B],
+            "two buffers, whatever the frame count"
+        );
+        let line = surfaceflip_stats_line();
+        assert!(
+            line.contains("iso-ctxdma-builds=2"),
+            "the count has to be readable on a real machine: {}",
+            line
+        );
+        assert!(line.contains("flips=6"), "{}", line);
+    }
+
     /// The next flip is the one that waits, and only until the front end has
     /// fetched the previous one -- then it writes.
     #[test]
@@ -22455,7 +22562,11 @@ mod surfaceflip_tests {
         assert!(gpu.page_flip(FB));
         let line = surfaceflip_stats_line();
         assert!(line.contains("state=ready"), "{}", line);
-        assert!(line.contains("flips=2 drain-waits=1"), "{}", line);
+        assert!(
+            line.contains("flips=2 iso-ctxdma-builds=1 drain-waits=1"),
+            "{}",
+            line
+        );
         assert!(line.contains("stuck-dropped=0 busy-refused=0"), "{}", line);
     }
 }
@@ -22767,6 +22878,11 @@ mod rm_host_shims {
         /// cursor image change kicking the core between the drain and the
         /// flip looks like.
         pub refuse_busy_once: bool,
+        /// Distinct `h_memory` values ever flipped. The C side builds one ISO
+        /// context DMA per distinct framebuffer and keeps it across flips, so
+        /// this is what `eclipse_rm_hwflip_iso_builds` answers: the healthy
+        /// count is the swapchain's depth and then flat, not one per flip.
+        pub iso_mems: Vec<u32>,
     }
 
     const EMPTY_HWFLIP: FakeHwflip = FakeHwflip {
@@ -22783,6 +22899,7 @@ mod rm_host_shims {
         surfaces: Vec::new(),
         refused_busy: 0,
         refuse_busy_once: false,
+        iso_mems: Vec::new(),
     };
 
     pub(super) static FAKE_HWFLIP: lock::Mutex<FakeHwflip> = lock::Mutex::new(EMPTY_HWFLIP);
@@ -22860,6 +22977,9 @@ mod rm_host_shims {
         }
         f.surfaces
             .push((h_memory, plane_offset, width, height, pitch));
+        if !f.iso_mems.contains(&h_memory) {
+            f.iso_mems.push(h_memory);
+        }
         f.pending_polls = f.fetch_polls;
         f.pending_until_us = if f.fetch_delay_us > 0 {
             crate::nvme::nvme_queue::test_clock::now() + f.fetch_delay_us
@@ -22867,6 +22987,10 @@ mod rm_host_shims {
             0
         };
         0
+    }
+    #[no_mangle]
+    extern "C" fn eclipse_rm_hwflip_iso_builds() -> u64 {
+        FAKE_HWFLIP.lock().iso_mems.len() as u64
     }
     #[no_mangle]
     extern "C" fn eclipse_rm_init_core() -> u32 {

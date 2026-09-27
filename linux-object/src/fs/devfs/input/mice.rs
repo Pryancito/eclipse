@@ -14,6 +14,11 @@ const BUF_CAPACITY: usize = 32;
 
 const MOUSE_DEV_MINOR_BASE: usize = 0x20;
 
+/// How often a blocking read of `/dev/input/mice` wakes up just to ask whether
+/// it should still be waiting. Same figure, same reasoning and the same hole as
+/// `EventDev`: see `event::EVDEV_INTERRUPT_CHECK_TICK_MS`.
+const MICE_INTERRUPT_CHECK_TICK_MS: u64 = 100;
+
 /// The sample-rate sequence a client writes to ask for the IntelliMouse
 /// protocol, and the one for IntelliMouse Explorer (`mousedev.c`).
 const IMPS_SEQ: [u8; 6] = [0xf3, 200, 0xf3, 100, 0xf3, 80];
@@ -286,15 +291,27 @@ impl INode for MiceDev {
             dev: &'a MiceDev,
             /// `(mouse index, subscription id)` pairs registered while Pending.
             subs: Vec<(usize, u64)>,
+            /// Backstop slot; see [`MICE_INTERRUPT_CHECK_TICK_MS`].
+            timer: Option<kernel_hal::timer_waker::TimerWakerSlot>,
         }
 
-        impl Drop for MiceFuture<'_> {
-            fn drop(&mut self) {
+        impl MiceFuture<'_> {
+            /// Let go of everything this future parked: the listeners and the
+            /// backstop tick. Every path that leaves `Pending` runs it, so a
+            /// late tick cannot wake a finished task.
+            fn unpark(&mut self) {
                 for (idx, id) in self.subs.drain(..) {
                     if let Some(m) = self.dev.mice.get(idx) {
                         m.unsubscribe(id);
                     }
                 }
+                kernel_hal::timer_waker::kill_timer_waker(&mut self.timer);
+            }
+        }
+
+        impl Drop for MiceFuture<'_> {
+            fn drop(&mut self) {
+                self.unpark();
             }
         }
 
@@ -303,34 +320,46 @@ impl INode for MiceDev {
 
             fn poll(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
                 let this = self.as_mut().get_mut();
-                let clear_subs = |fut: &mut MiceFuture<'_>| {
-                    for (idx, id) in fut.subs.drain(..) {
-                        if let Some(m) = fut.dev.mice.get(idx) {
-                            m.unsubscribe(id);
-                        }
-                    }
-                };
                 if this.dev.can_read() {
-                    clear_subs(this);
+                    this.unpark();
                     return Poll::Ready(this.dev.poll());
                 }
                 // Register the waker BEFORE the second can_read() check to close
                 // the TOCTOU race: a packet that lands between the first check
                 // and subscribe() would otherwise fire no waker, and the task
                 // would sleep until the next packet. (Matches EventDev.)
+                // `once: false`, not `true`: a one-shot handler leaves the
+                // listener as soon as it fires, while `subs` keeps holding its
+                // id -- so `subs.is_empty()` stayed false and a poll that woke
+                // and found nothing to read parked again with NO handler
+                // registered anywhere. Subscribing for the future's whole life
+                // is what `unpark` already undoes. Same bug as `EventDev`.
                 if this.subs.is_empty() {
                     for (idx, m) in this.dev.mice.iter().enumerate() {
                         let waker = cx.waker().clone();
-                        if let Some(id) = m.subscribe(Box::new(move |_| waker.wake_by_ref()), true)
+                        if let Some(id) = m.subscribe(Box::new(move |_| waker.wake_by_ref()), false)
                         {
                             this.subs.push((idx, id));
                         }
                     }
                 }
                 if this.dev.can_read() {
-                    clear_subs(this);
+                    this.unpark();
                     return Poll::Ready(this.dev.poll());
                 }
+                // Nothing to read. Before parking, ask whether this thread is
+                // still supposed to be here: the listeners report only what the
+                // mice do, so this and the tick below are the only things in the
+                // whole wait that can answer a signal or a kill. After the
+                // readiness check, deliberately -- see `EventDev`.
+                if super::event::wait_interrupted() {
+                    this.unpark();
+                    return Poll::Ready(Err(FsError::Interrupted));
+                }
+                let deadline = kernel_hal::timer::deadline_after(
+                    core::time::Duration::from_millis(MICE_INTERRUPT_CHECK_TICK_MS),
+                );
+                kernel_hal::timer_waker::ensure_timer_waker(&mut this.timer, deadline, cx);
                 Poll::Pending
             }
         }
@@ -338,6 +367,7 @@ impl INode for MiceDev {
         Box::pin(MiceFuture {
             dev: self,
             subs: Vec::new(),
+            timer: None,
         })
     }
 
@@ -672,6 +702,20 @@ mod mice_poll_tests {
 
     use super::*;
 
+    /// `crate::sync`'s interrupt switch, in the two shapes these tests need.
+    mod interrupts {
+        use crate::sync::test_interrupt;
+
+        pub(super) fn clear() {
+            test_interrupt::clear();
+        }
+
+        /// From the very next check on, every wait must give up.
+        pub(super) fn interrupt_now() {
+            test_interrupt::interrupt_after(0, crate::error::LxError::EINTR);
+        }
+    }
+
     /// A node with no mice behind it: enough for `poll`, which asks the inner
     /// buffer and nothing else when there is no device to ask.
     fn a_node() -> MiceDev {
@@ -690,6 +734,49 @@ mod mice_poll_tests {
                 buf: VecDeque::new(),
             })),
         }
+    }
+
+    /// A waker that does nothing. Polled by hand, not with `block_on`: a
+    /// mutation that leaves the wait with no way out would hang instead of
+    /// failing, and a hang is not a detected failure.
+    fn noop_waker() -> core::task::Waker {
+        use core::task::{RawWaker, RawWakerVTable, Waker};
+        unsafe fn clone(_: *const ()) -> RawWaker {
+            RawWaker::new(core::ptr::null(), &VTABLE)
+        }
+        unsafe fn noop(_: *const ()) {}
+        static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, noop, noop, noop);
+        unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &VTABLE)) }
+    }
+
+    /// The same hole `EventDev` had: `/dev/input/mice` is what a PS/2-era
+    /// client reads, and a read parked on it heard only from the mice. Nothing
+    /// that happens to the READER -- a signal, `kill`, its own process exiting
+    /// -- reached it, and with no backstop tick nothing even re-polled it to
+    /// notice.
+    #[test]
+    fn a_reader_of_mice_nobody_touches_can_still_be_killed() {
+        interrupts::clear();
+        let node = a_node();
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut fut = node.async_poll();
+        assert!(
+            matches!(fut.as_mut().poll(&mut cx), Poll::Pending),
+            "nothing has moved, so the read has to wait"
+        );
+
+        interrupts::interrupt_now();
+        let ended = matches!(
+            fut.as_mut().poll(&mut cx),
+            Poll::Ready(Err(FsError::Interrupted))
+        );
+        interrupts::clear();
+        assert!(
+            ended,
+            "a read nothing will ever answer must give up when the thread is \
+             killed: FsError::Interrupted is what becomes EINTR"
+        );
     }
 
     #[test]

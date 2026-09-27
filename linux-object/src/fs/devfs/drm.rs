@@ -1107,6 +1107,70 @@ fn probe_band_count(w: u32) -> usize {
     ((w as usize).saturating_add(PROBE_BAND_PX - 1) / PROBE_BAND_PX).clamp(1, PROBE_MAX_BANDS)
 }
 
+/// Where the source buffer is fully transparent black, gathered in the same
+/// pass as the band checksums.
+///
+/// This exists for the one question a photograph of the screen cannot answer.
+/// Black rectangles on the desktop have two completely different causes, and
+/// they call for work in opposite places: either the kernel is failing to copy
+/// pixels that the compositor did draw, or the compositor handed over a buffer
+/// it never finished drawing and the kernel copied the zeros faithfully. The
+/// band mask does not separate them -- a region that is black in BOTH reads
+/// never differs, so it does not set a bit -- and neither does the cost line.
+/// The count and the box do: if the black on screen sits where the source was
+/// already zero, the kernel is exonerated and the search moves upstream.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct ZeroExtent {
+    /// Sampled pixels that were exactly `0x0000_0000`.
+    zeros: usize,
+    /// Sampled pixels in total, so `zeros` can be read as a fraction.
+    sampled: usize,
+    /// Window-relative bounding box of the zero pixels. Meaningless while
+    /// `zeros` is 0, which is why [`ZeroExtent::bbox`] is the only reader.
+    min_x: u32,
+    max_x: u32,
+    min_y: u32,
+    max_y: u32,
+}
+
+impl ZeroExtent {
+    /// Nothing seen yet. The box starts inverted so the first `note` sets both
+    /// ends of both axes without a special case.
+    fn empty() -> Self {
+        Self {
+            zeros: 0,
+            sampled: 0,
+            min_x: u32::MAX,
+            max_x: 0,
+            min_y: u32::MAX,
+            max_y: 0,
+        }
+    }
+
+    /// Record one zero pixel at window-relative `(x, y)`.
+    fn note(&mut self, x: u32, y: u32) {
+        self.zeros = self.zeros.saturating_add(1);
+        self.min_x = self.min_x.min(x);
+        self.max_x = self.max_x.max(x);
+        self.min_y = self.min_y.min(y);
+        self.max_y = self.max_y.max(y);
+    }
+
+    /// `(x, y, w, h)` of the zero pixels, window-relative, or `None` when there
+    /// were none. The box is inclusive of both ends, hence the `+ 1`: a single
+    /// zero pixel is a 1x1 box, not a 0x0 one.
+    fn bbox(&self) -> Option<(u32, u32, u32, u32)> {
+        (self.zeros > 0).then(|| {
+            (
+                self.min_x,
+                self.min_y,
+                self.max_x.saturating_sub(self.min_x).saturating_add(1),
+                self.max_y.saturating_sub(self.min_y).saturating_add(1),
+            )
+        })
+    }
+}
+
 /// One probe read: a checksum per 64-pixel column band of the window.
 struct ProbeBands {
     /// Bands past `n` are never touched, so they hold [`PROBE_FNV_BASIS`] in
@@ -1114,6 +1178,8 @@ struct ProbeBands {
     bands: [u64; PROBE_MAX_BANDS],
     /// Bands the window actually covered.
     n: usize,
+    /// Where this read found the source already black. See [`ZeroExtent`].
+    zero: ZeroExtent,
 }
 
 impl ProbeBands {
@@ -1180,7 +1246,11 @@ fn probe_bands(
     }
     let n = probe_band_count(w);
     let mut bands = [PROBE_FNV_BASIS; PROBE_MAX_BANDS];
-    let mut sampled = 0usize;
+    let mut zero = ZeroExtent::empty();
+    // Rows, not pixels -- `zero.sampled` beside it counts pixels, and the two
+    // being one word apart with the same name is how a later reader divides by
+    // the wrong thing.
+    let mut sampled_rows = 0usize;
     let mut r = 0usize;
     while r < h as usize {
         let off = (y as usize)
@@ -1197,11 +1267,18 @@ fn probe_bands(
             let b = (c / PROBE_BAND_PX).min(n - 1);
             bands[b] ^= *px as u64;
             bands[b] = bands[b].wrapping_mul(PROBE_FNV_PRIME);
+            if *px == 0 {
+                // Window-relative, and `r` not `y + r`, because the window's own
+                // origin is already in the reported line: a box relative to the
+                // window is what lines up with what the eye sees on screen.
+                zero.note(c as u32, r as u32);
+            }
         }
-        sampled += 1;
+        zero.sampled = zero.sampled.saturating_add(end.saturating_sub(off));
+        sampled_rows += 1;
         r += row_step;
     }
-    (sampled > 0).then_some(ProbeBands { bands, n })
+    (sampled_rows > 0).then_some(ProbeBands { bands, n, zero })
 }
 
 /// Whether the two reads bracketing a blit say somebody else was writing the
@@ -1216,18 +1293,51 @@ fn probe_says_changed(before: u64, after: Option<u64>) -> bool {
     after != Some(before)
 }
 
-/// How many probe mismatches have been reported, so a compositor that tears
-/// every frame does not turn the klog into the bottleneck. `klog` writes
+/// How many probe mismatches have OCCURRED, which is not the same as how many
+/// got a line: [`probe_report_decision`] stops writing after
+/// [`MAX_PROBE_REPORTS`] of them while this keeps counting. Counting
+/// occurrences is what makes the budget work -- a compositor that tears every
+/// frame must not turn the klog into the bottleneck. `klog` writes
 /// synchronously to the UART, which at 115200 baud is slower than the frame it
 /// is describing.
 static PROBE_REPORTS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 const MAX_PROBE_REPORTS: u32 = 12;
 
-/// How many probe mismatches this process has reported, so an end-to-end test
-/// can assert that a settled buffer produced none.
+/// How many source-is-black reads have OCCURRED -- every present, not only the
+/// ones that got a line, the same convention as [`PROBE_REPORTS`] and for the
+/// same reason. Its own counter, and not the mismatch one, because the two answer different
+/// questions and the interesting case for this one is the frame where NOTHING
+/// changed: a black rectangle that just sits there is black in both reads, so it
+/// never sets a band bit and the mismatch line never fires. Sharing a budget
+/// would let a torn boot spend it before the static case was ever described.
+static ZERO_REPORTS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// How many probe mismatches this process has seen, so an end-to-end test can
+/// assert that a settled buffer produced none.
 #[cfg(test)]
 pub(crate) fn probe_reports_for_test() -> u32 {
     PROBE_REPORTS.load(Ordering::Relaxed)
+}
+
+/// How many source-is-black reads this process has done, so an end-to-end test
+/// can assert the thing that distinguishes this line from the mismatch one:
+/// that it fires on a present where nothing changed at all.
+///
+/// A count on its own does not say a line was written, because the budget cuts
+/// the lines off and not the counting. A count that is at least one and no more
+/// than [`probe_report_budget_for_test`] does: the budget cannot have been spent
+/// yet, so every one of those reads wrote its line. Assert the range, not just
+/// the floor.
+#[cfg(test)]
+pub(crate) fn zero_reports_for_test() -> u32 {
+    ZERO_REPORTS.load(Ordering::Relaxed)
+}
+
+/// How many of each kind of probe line get written before the budget cuts them
+/// off. For the range assertion above.
+#[cfg(test)]
+pub(crate) fn probe_report_budget_for_test() -> u32 {
+    MAX_PROBE_REPORTS
 }
 
 /// Whether this mismatch gets a line in the klog, and whether it is the last
@@ -3539,6 +3649,57 @@ pub fn scanout_region_checked(
                 blit_h,
                 PROBE_ROW_STEP,
             );
+            // Where the SOURCE was already black, reported whether or not
+            // anything changed. See [`ZeroExtent`]: this is the line that says
+            // which side of the handover a black rectangle came from, and the
+            // band mask cannot say it because black in both reads differs in
+            // neither.
+            {
+                let z = before.zero;
+                let n = ZERO_REPORTS.fetch_add(1, Ordering::Relaxed);
+                let (report, last) = probe_report_decision(n);
+                if report {
+                    match z.bbox() {
+                        Some((zx, zy, zw, zh)) => kernel_hal::klog_info!(
+                            "[drm] present source: fb {} window {}x{}+{}+{} -- {} of {} sampled \
+                             pixels are already 0x00000000 in the buffer the client handed over, \
+                             inside {}x{}+{}+{} of the window{}",
+                            fb_id,
+                            blit_w,
+                            blit_h,
+                            blit_x,
+                            blit_y,
+                            z.zeros,
+                            z.sampled,
+                            zw,
+                            zh,
+                            zx,
+                            zy,
+                            if last {
+                                " (further source reports will not be made)"
+                            } else {
+                                ""
+                            }
+                        ),
+                        None => kernel_hal::klog_info!(
+                            "[drm] present source: fb {} window {}x{}+{}+{} -- not one of {} \
+                             sampled pixels is 0x00000000, so any black on screen was NOT handed \
+                             over black{}",
+                            fb_id,
+                            blit_w,
+                            blit_h,
+                            blit_x,
+                            blit_y,
+                            z.sampled,
+                            if last {
+                                " (further source reports will not be made)"
+                            } else {
+                                ""
+                            }
+                        ),
+                    }
+                }
+            }
             if probe_says_changed(before.fold(), after.as_ref().map(ProbeBands::fold)) {
                 // Which bands moved is the whole point of reporting at all: a
                 // scattered subset says a rasteriser handed over tiles it had
@@ -3650,6 +3811,34 @@ pub fn scanout_region_checked(
                         );
                         mask = now.as_ref().map_or(0, |n| redo.diff_mask(n));
                     }
+                    // The repair wrote the panel with a plain `blit_chunked`,
+                    // so it is one more writer that went around the band skip --
+                    // the same rule the cursor, a damage box, a blank, a VT and
+                    // the copy engine all follow. Without this the skip's
+                    // remembered hash still describes what the FIRST copy put
+                    // there, while the panel now holds what the repair copied,
+                    // and a later frame whose pixels match that stale hash would
+                    // be skipped over a panel that does not hold them. The rows
+                    // are the whole window's -- the repair narrows its span in x
+                    // only -- so this is deliberately the coarse answer: with
+                    // both flags on, a present that repairs gives up the next
+                    // present's skip. Correctness first; the two flags are
+                    // independent knobs and nothing needs them together.
+                    //
+                    // Unconditional, with no `round > 0` in front of it: getting
+                    // here at all means the loop ran, and the loop increments
+                    // before its only `break`, so `round` is always at least 1.
+                    // A guard on it was a mutant nothing could kill, because it
+                    // cannot change the answer for any input.
+                    //
+                    // `panel_bands_reset()` would be equivalent TODAY and that
+                    // mutation survives on purpose: the skip only ever drives a
+                    // whole frame, so these rows are always the whole window and
+                    // dirtying them clears every band. `dirty_rows` is written
+                    // anyway because it states the rule that is actually true --
+                    // forget the rows you wrote -- and stays right if the skip
+                    // ever learns to take a damage box, where the two diverge.
+                    panel_bands_dirty_rows(blit_y, blit_h);
                     #[cfg(test)]
                     REPAIR_ROUNDS_RUN.store(round, Ordering::Relaxed);
                 }
@@ -5793,6 +5982,16 @@ pub fn release_process(pid: u64) -> usize {
     // close; DROP_MASTER deliberately no longer cancels events -- see
     // cancel_pending_events.)
     cancel_events_for_exit(pid);
+    // Its syncobjs too (Linux: `drm_syncobj_release` when the file closes):
+    // a crashed client's stayed in the table for the rest of the boot.
+    let syncobjs = zcore_drivers::scheme::syncobj::release_owner(pid);
+    if syncobjs > 0 {
+        log::info!(
+            "[drm] pid={} exit: gave back {} syncobj reference(s)",
+            pid,
+            syncobjs
+        );
+    }
     // Driver-private (nouveau `GEM_NEW`) framebuffers first, and BEFORE the
     // early return below: `nouveau_release_process`, which runs right after
     // this hook, drops everything the pid held, so a framebuffer of its own
@@ -6248,6 +6447,7 @@ pub(crate) fn reset_output_state_for_test() {
     SKIP_PRESENTS.store(0, Ordering::Relaxed);
     REPAIR_ROUNDS_RUN.store(0, Ordering::Relaxed);
     PROBE_REPORTS.store(0, Ordering::Relaxed);
+    ZERO_REPORTS.store(0, Ordering::Relaxed);
     // A leaked `PANEL_FB` makes a later test's damage box either honoured or
     // promoted for a reason that has nothing to do with what it is testing --
     // and the ids the tests pick collide freely, so it would sometimes match.
@@ -6338,6 +6538,28 @@ mod release_tests {
 
         assert_eq!(release_process(77_002), 1);
         assert!(!live_ids().contains(&9003));
+    }
+
+    #[test]
+    fn process_exit_gives_back_the_syncobjs_it_still_held() {
+        let _serialised = super::test_globals::lock();
+        use zcore_drivers::scheme::syncobj;
+        // Linux frees a dying client's syncobj handles with its drm_file
+        // (`drm_syncobj_release`); here nothing did, so a crashed client's
+        // stayed in the table for the rest of the boot.
+        let mine = syncobj::create_for(77_004, false);
+        let shared = syncobj::create_for(77_005, false);
+        assert!(syncobj::add_ref_for(77_004, shared), "imported by 77_004");
+        let theirs = syncobj::create_for(77_005, true);
+        assert_eq!(release_process(77_004), 0, "no buffers to give back");
+        assert!(!syncobj::exists(mine), "freed with its owner");
+        assert!(syncobj::exists(shared), "77_005 still holds it");
+        assert!(!syncobj::held_by(77_004, shared));
+        assert!(syncobj::exists(theirs), "another process's survives");
+        assert_eq!(release_process(77_004), 0, "idempotent");
+        assert!(syncobj::destroy_for(77_005, shared));
+        assert!(syncobj::destroy_for(77_005, theirs));
+        assert!(!syncobj::exists(shared) && !syncobj::exists(theirs));
     }
 
     #[test]
@@ -9305,6 +9527,111 @@ mod present_probe_tests {
 
     fn bands(pixels: &[u32], stride: usize, x: u32, y: u32, w: u32, h: u32) -> Option<ProbeBands> {
         probe_bands(pixels, stride, x, y, w, h, PROBE_ROW_STEP)
+    }
+
+    // --- where the source is already black (ZeroExtent) ---
+
+    /// `buf` paints every pixel opaque, so the answer must be "none". This is
+    /// the reading that exonerates the compositor: black on screen with no zero
+    /// pixels in the source means the kernel lost them.
+    #[test]
+    fn a_source_with_no_black_reports_no_zero_pixels() {
+        let p = buf(64, 32);
+        let b = probe_bands(&p, 64, 0, 0, 64, 32, 1).expect("a window to read");
+        assert_eq!(b.zero.zeros, 0);
+        assert_eq!(b.zero.bbox(), None);
+    }
+
+    /// The reading that convicts it: a black rectangle in the buffer the client
+    /// handed over comes back as its own box, in window coordinates.
+    #[test]
+    fn a_black_rectangle_in_the_source_is_located_by_its_box() {
+        let mut p = buf(64, 32);
+        // A 10x6 hole at +20+8 of the buffer, zeroed the way an unrasterised
+        // tile is: fully transparent black.
+        for y in 8..14 {
+            for x in 20..30 {
+                p[y * 64 + x] = 0;
+            }
+        }
+        let b = probe_bands(&p, 64, 0, 0, 64, 32, 1).expect("a window to read");
+        assert_eq!(b.zero.zeros, 10 * 6);
+        assert_eq!(b.zero.bbox(), Some((20, 8, 10, 6)));
+    }
+
+    /// The box is window-relative, not buffer-relative, because that is what
+    /// lines up with what the eye sees: the window's own origin is already
+    /// printed beside it.
+    #[test]
+    fn the_box_is_relative_to_the_window_not_the_buffer() {
+        let mut p = buf(64, 32);
+        p[10 * 64 + 30] = 0;
+        // Window starts at +25+8, so the pixel is at +5+2 inside it.
+        let b = probe_bands(&p, 64, 25, 8, 20, 10, 1).expect("a window to read");
+        assert_eq!(b.zero.bbox(), Some((5, 2, 1, 1)));
+    }
+
+    /// A single zero pixel is a 1x1 box. Reported inclusively on both ends, so
+    /// without the `+ 1` it would come out 0x0 and read as "no black at all" --
+    /// the wrong answer in the direction that sends the search to the wrong side.
+    #[test]
+    fn one_black_pixel_is_a_one_by_one_box() {
+        let mut p = buf(64, 32);
+        p[3 * 64 + 7] = 0;
+        let b = probe_bands(&p, 64, 0, 0, 64, 32, 1).expect("a window to read");
+        assert_eq!(b.zero.zeros, 1);
+        assert_eq!(b.zero.bbox(), Some((7, 3, 1, 1)));
+    }
+
+    /// Black outside the window is none of this window's business: a present
+    /// that scans out part of a buffer must not be blamed for the rest of it.
+    #[test]
+    fn black_outside_the_window_is_not_counted() {
+        let mut p = buf(64, 32);
+        p[0] = 0; // +0+0 of the buffer, outside the window below
+        let b = probe_bands(&p, 64, 10, 10, 20, 10, 1).expect("a window to read");
+        assert_eq!(b.zero.zeros, 0);
+        assert_eq!(b.zero.bbox(), None);
+    }
+
+    /// `sampled` counts PIXELS, not rows, or the fraction in the klog line would
+    /// be off by the window's width and the number would mean nothing.
+    #[test]
+    fn the_sampled_count_is_pixels_not_rows() {
+        let p = buf(64, 32);
+        // 20 rows at a step of 4 samples rows 0,4,8,12,16 -- five of them.
+        let b = probe_bands(&p, 64, 0, 0, 40, 20, 4).expect("a window to read");
+        assert_eq!(b.zero.sampled, 40 * 5);
+    }
+
+    /// A row the sampling step skips over cannot contribute, which is the honest
+    /// limit of the number: it describes the rows the probe actually read.
+    #[test]
+    fn a_black_row_the_step_skips_is_not_seen() {
+        let mut p = buf(64, 32);
+        for x in 0..64 {
+            p[1 * 64 + x] = 0; // row 1, which a step of 4 never reads
+        }
+        let b = probe_bands(&p, 64, 0, 0, 64, 32, 4).expect("a window to read");
+        assert_eq!(b.zero.zeros, 0);
+    }
+
+    /// Black in both reads differs in neither, so the band mask says nothing
+    /// about it. This is exactly why the zero report is a separate line with its
+    /// own budget rather than a field on the mismatch one.
+    #[test]
+    fn a_static_black_region_sets_no_band_bit_but_is_still_reported() {
+        let mut p = buf(64, 32);
+        for y in 0..32 {
+            for x in 8..16 {
+                p[y * 64 + x] = 0;
+            }
+        }
+        let a = probe_bands(&p, 64, 0, 0, 64, 32, 1).expect("first read");
+        let b = probe_bands(&p, 64, 0, 0, 64, 32, 1).expect("second read");
+        assert_eq!(a.diff_mask(&b), 0, "nothing moved, so no band differs");
+        assert!(!probe_says_changed(a.fold(), Some(b.fold())));
+        assert_eq!(a.zero.bbox(), Some((8, 0, 8, 32)), "but the black is found");
     }
 
     // --- what it must notice ---

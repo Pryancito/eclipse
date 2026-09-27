@@ -89,12 +89,19 @@ impl Syscall<'_> {
         let end = (offset as usize)
             .checked_add(buf_size)
             .ok_or(ZxError::OUT_OF_RANGE)?;
+        // The caller's buffer is checked BEFORE the object is grown. An
+        // unbounded or resizable VMO grows to fit a write, and this used to
+        // grow it first: a `zx_vmo_write` naming a buffer the caller does not
+        // have answered the error with the object already bigger, which
+        // `zx_vmo_get_size` reports and a `zx_vmo_read` can then read as
+        // zeroes. No test: there is no harness in this crate that can call a
+        // syscall with a live process, and the order is the whole of it.
+        proc.vmar()
+            .check_user_range(buf.as_addr(), buf_size, MMUFlags::READ)?;
         vmo.grow_for_write(end)?;
         if offset as usize > vmo.len() || buf_size > vmo.len() - (offset as usize) {
             return Err(ZxError::OUT_OF_RANGE);
         }
-        proc.vmar()
-            .check_user_range(buf.as_addr(), buf_size, MMUFlags::READ)?;
         vmo.write(offset as usize, buf.as_slice(buf_size)?)
     }
 
