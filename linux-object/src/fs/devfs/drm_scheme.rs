@@ -8915,6 +8915,88 @@ mod kms_scanout_tests {
         c.destroy_dumb(buf.handle).expect("DESTROY_DUMB");
     }
 
+    /// A pointer straddling the right edge of a framebuffer SMALLER than the mode
+    /// must still be erasable, or its outer columns stay on the panel for good.
+    ///
+    /// The two paths clip the pointer's window against different things. The
+    /// present composites into the client's buffer, so it clips to the buffer:
+    /// for a 96-wide framebuffer on a 120-wide mode, a pointer at x=92 gets a
+    /// window that stops at x=96. The move path draws straight onto the panel, so
+    /// it clips to the PANEL: the same pointer gets a window reaching x=112. Each
+    /// one saves what its own window covered, so a present after a move recorded
+    /// the narrow window over the wide one -- and the next erase put back only 16
+    /// of the 20 columns. The four it did not own were pointer pixels, on top of
+    /// the desktop, with nothing left that knew they were there.
+    ///
+    /// This is not the fault Moebius is looking at (labwc presents a framebuffer
+    /// the size of the mode), but it is the same family: a window written in one
+    /// place and restored in another.
+    #[test]
+    fn a_pointer_past_the_edge_of_a_narrow_framebuffer_must_still_come_off() {
+        const W: u32 = 120;
+        const H: u32 = 96;
+        const SMALL_W: u32 = 96;
+        const SMALL_H: u32 = 80;
+        const CUR: u32 = 16;
+        let screen = kms_emu::attach_with(W, H, 128, true);
+        let c = Client::open(0);
+
+        // Frame 1 over the whole panel, so the part the narrow framebuffer never
+        // touches holds a frame of its own and a leftover there is visible.
+        let big = c.create_dumb(W, H);
+        paint(&big, |x, y| desktop_px(1, x, y));
+        let fb_big = c.addfb2(&big);
+        set_crtc(&c, drm::SYNTH_CRTC_ID, fb_big, W, H);
+        drain_completions(&c);
+
+        let small = c.create_dumb(SMALL_W, SMALL_H);
+        let fb_small = c.addfb2(&small);
+
+        let bmp = pointer_bitmap(CUR, CUR);
+        let cur = c.create_dumb(CUR, CUR);
+        {
+            let px = map_dumb(&cur);
+            for (i, v) in bmp.iter().enumerate() {
+                px[i] = *v;
+            }
+        }
+        let mut panel = Panel::new(W, H, 1, bmp.clone(), CUR);
+
+        // Straddling x=96: four columns of the pointer land where the narrow
+        // framebuffer does not reach. A pointer move draws them; only a present
+        // that knows they are there can undo them.
+        let (px0, py0) = (92i32, 15i32);
+        set_cursor(&c, drm::SYNTH_CRTC_ID, cur.handle, CUR, CUR, px0, py0);
+        panel.cursor = Some((px0, py0, CUR, CUR));
+        panel.check(&screen, "the pointer hangs off the narrow framebuffer");
+
+        // The narrow present composites the pointer again, and this is where the
+        // window used to shrink.
+        paint(&small, |x, y| desktop_px(2, x, y));
+        c.page_flip(drm::SYNTH_CRTC_ID, fb_small, 1)
+            .expect("flip the narrow framebuffer");
+        drain_completions(&c);
+        panel.present_box(2, 0, 0, SMALL_W, SMALL_H);
+        panel.check(&screen, "frame 2 from the narrow framebuffer");
+        assert!(
+            drm::cursor_windows_widened_for_test() > 0,
+            "the composite never widened its window, so this test is not \
+             exercising the fix"
+        );
+
+        // Now take the pointer away. Everything it drew has to come off, columns
+        // past the framebuffer's edge included.
+        set_cursor(&c, drm::SYNTH_CRTC_ID, 0, 0, 0, 0, 0);
+        panel.cursor = None;
+        panel.check(&screen, "the pointer was hidden and left nothing behind");
+
+        c.rmfb(fb_small).expect("RMFB small");
+        c.rmfb(fb_big).expect("RMFB big");
+        c.destroy_dumb(cur.handle).expect("DESTROY_DUMB cursor");
+        c.destroy_dumb(small.handle).expect("DESTROY_DUMB small");
+        c.destroy_dumb(big.handle).expect("DESTROY_DUMB big");
+    }
+
     /// Three hundred steps of the desktop, in a deterministic order nobody chose
     /// by hand, with the whole panel checked against the contract after every
     /// one of them.
@@ -8961,6 +9043,15 @@ mod kms_scanout_tests {
 
         let bufs = [c.create_dumb(W, H), c.create_dumb(W, H)];
         let fbs = [c.addfb2(&bufs[0]), c.addfb2(&bufs[1])];
+        // A framebuffer SMALLER than the mode, which is a case the present path
+        // has its own arithmetic for (`image_pitch_px`, and the pointer clipped
+        // to what the buffer covers rather than to the row stride). Its width is
+        // a multiple of 16 so the write-combining widening of the copy is a
+        // no-op and the model does not have to know how the kernel widens.
+        const SMALL_W: u32 = 96;
+        const SMALL_H: u32 = 80;
+        let small = c.create_dumb(SMALL_W, SMALL_H);
+        let fb_small = c.addfb2(&small);
         let bmp = pointer_bitmap(CUR, CUR);
         let cur = c.create_dumb(CUR, CUR);
         {
@@ -9000,7 +9091,7 @@ mod kms_scanout_tests {
         };
         for step in 0..300u32 {
             let what;
-            match rnd(13) {
+            match rnd(14) {
                 0..=3 => {
                     // The compositor renders a finished frame into the other
                     // buffer of its chain and puts it up, whole, as labwc does.
@@ -9157,6 +9248,36 @@ mod kms_scanout_tests {
                         None
                     };
                 }
+                13 => {
+                    // A client whose framebuffer is smaller than the mode. The
+                    // present copies what the buffer covers and the rest of the
+                    // panel keeps the frame it had, so the panel holds two frames
+                    // at once -- and the pointer is composited over a window the
+                    // copy may not reach.
+                    frame += 1;
+                    let f = frame;
+                    paint(&small, |x, y| desktop_px(f, x, y));
+                    c.page_flip(drm::SYNTH_CRTC_ID, fb_small, step as u64)
+                        .expect("flip");
+                    drain_completions(&c);
+                    model.present_box(frame, 0, 0, SMALL_W, SMALL_H);
+                    // The panel does not hold this framebuffer entirely -- only
+                    // its top-left corner -- so no damage box on it may be
+                    // honoured on its own.
+                    panel_fb = 0;
+                    model.cursor = if shown {
+                        Some((pos.0, pos.1, CUR, CUR))
+                    } else {
+                        None
+                    };
+                    what = alloc::format!(
+                        "step {}: frame {} from a {}x{} framebuffer, smaller than the mode",
+                        step,
+                        frame,
+                        SMALL_W,
+                        SMALL_H
+                    );
+                }
                 10 => {
                     // DPMS off and on again, with the frame that follows it --
                     // which is what a screen coming back actually looks like.
@@ -9212,6 +9333,15 @@ mod kms_scanout_tests {
             );
         }
         assert!(frame < 256, "the frame number has to stay in one byte");
+        // The smaller-than-the-mode steps put the pointer across the edge of the
+        // client's framebuffer sooner or later, and that is the only thing that
+        // leaves a leftover to erase. If none ever happened, the step is not
+        // exercising what it was added for.
+        assert!(
+            drm::cursor_windows_widened_for_test() > 0,
+            "no composite ever widened its window, so the \
+             smaller-than-the-mode steps never put the pointer across the edge"
+        );
         assert_eq!(
             skip && most_skipped > 0,
             skip,
@@ -9222,6 +9352,8 @@ mod kms_scanout_tests {
         set_cursor(&c, drm::SYNTH_CRTC_ID, 0, 0, 0, 0, 0);
         drm::set_present_skip_enabled(false);
         drm::set_present_repair_enabled(false);
+        c.rmfb(fb_small).expect("RMFB small");
+        c.destroy_dumb(small.handle).expect("DESTROY_DUMB small");
         for fb in fbs {
             c.rmfb(fb).expect("RMFB");
         }
