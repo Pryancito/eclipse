@@ -1,6 +1,7 @@
 use crate::{object::*, task::Thread};
 use alloc::collections::VecDeque;
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 use core::future::Future;
 use core::pin::Pin;
 use core::sync::atomic::*;
@@ -563,21 +564,55 @@ const FUTEX_TABLE_MIN_SWEEP: usize = 64;
 impl FutexTable {
     /// The futex of the word at `addr`, made with `create` if the table has
     /// none.
+    ///
+    /// The swept entries go into `swept` instead of being dropped here, and the
+    /// caller must let that vector go **with the table's lock released**. This
+    /// table lives inside a process's `inner`, so a `retain` that dropped them
+    /// in place ran their `Drop` under that spin lock -- and dropping the last
+    /// `Arc<Futex>` drops its waiter queue and its owner: a `Waker`'s vtable,
+    /// the oneshot send in `ExceptionObject::drop`, and a `Thread` whose `proc`
+    /// field is a strong `Arc` back to that very process. This is the hot path
+    /// (every futex wait and wake goes through it) and the sweep fires every
+    /// time the table passes its threshold, so it is the likeliest of the
+    /// family to actually be reached.
     pub fn get_or_create(
         &mut self,
         addr: usize,
         create: impl FnOnce() -> Arc<Futex>,
+        swept: &mut Vec<Arc<Futex>>,
     ) -> Arc<Futex> {
         if let Some(futex) = self.map.get(&addr) {
             return futex.clone();
         }
         if self.map.len() >= self.sweep_at.max(FUTEX_TABLE_MIN_SWEEP) {
-            self.map
-                .retain(|_, futex| Arc::strong_count(futex) > 1 || !futex.is_idle());
+            self.map.retain(|_, futex| {
+                if Arc::strong_count(futex) > 1 || !futex.is_idle() {
+                    true
+                } else {
+                    swept.push(futex.clone());
+                    false
+                }
+            });
             self.sweep_at = (self.map.len() * 2).max(FUTEX_TABLE_MIN_SWEEP);
         }
         let futex = create();
         self.map.insert(addr, futex.clone());
+        futex
+    }
+
+    /// `get_or_create` with the swept futexes let go right here.
+    ///
+    /// Only for callers that hold no lock -- the tests below. In a process the
+    /// table lives inside `inner`, so the sweep has to hand them out; see
+    /// `get_or_create`.
+    pub fn get_or_create_dropping_swept(
+        &mut self,
+        addr: usize,
+        create: impl FnOnce() -> Arc<Futex>,
+    ) -> Arc<Futex> {
+        let mut swept = Vec::new();
+        let futex = self.get_or_create(addr, create, &mut swept);
+        drop(swept);
         futex
     }
 
@@ -1284,15 +1319,19 @@ mod tests {
         let words: &'static [AtomicI32] =
             Box::leak((0..10_000).map(|_| AtomicI32::new(0)).collect());
         for word in words {
-            drop(table.get_or_create(word as *const _ as usize, || Futex::new(word)));
+            drop(
+                table.get_or_create_dropping_swept(word as *const _ as usize, || Futex::new(word)),
+            );
         }
         assert!(
             table.len() <= FUTEX_TABLE_MIN_SWEEP,
             "{} idle futexes are still remembered",
             table.len()
         );
-        let first = table.get_or_create(words[0].as_ptr() as usize, || Futex::new(&words[0]));
-        let again = table.get_or_create(words[0].as_ptr() as usize, || Futex::new(&words[0]));
+        let first = table
+            .get_or_create_dropping_swept(words[0].as_ptr() as usize, || Futex::new(&words[0]));
+        let again = table
+            .get_or_create_dropping_swept(words[0].as_ptr() as usize, || Futex::new(&words[0]));
         assert!(
             Arc::ptr_eq(&first, &again),
             "a futex someone holds is the one the next call gets"
@@ -1311,29 +1350,31 @@ mod tests {
         let key = |w: &'static AtomicI32| w as *const _ as usize;
 
         let held_word = word(0);
-        let held = table.get_or_create(key(held_word), || Futex::new(held_word));
+        let held = table.get_or_create_dropping_swept(key(held_word), || Futex::new(held_word));
 
         let waited_word = word(0);
         let waited_id = {
-            let futex = table.get_or_create(key(waited_word), || Futex::new(waited_word));
+            let futex =
+                table.get_or_create_dropping_swept(key(waited_word), || Futex::new(waited_word));
             futex.id()
         };
         let (_waiting, _) = queue_waiter(
-            &table.get_or_create(key(waited_word), || unreachable!()),
+            &table.get_or_create_dropping_swept(key(waited_word), || unreachable!()),
             0,
             None,
         );
 
         let owned_word = word(0);
         let owned_id = {
-            let futex = table.get_or_create(key(owned_word), || Futex::new(owned_word));
+            let futex =
+                table.get_or_create_dropping_swept(key(owned_word), || Futex::new(owned_word));
             futex.inner.lock().set_owner(Some(thread.clone()));
             futex.id()
         };
 
         let idle_word = word(0);
         let idle_id = table
-            .get_or_create(key(idle_word), || Futex::new(idle_word))
+            .get_or_create_dropping_swept(key(idle_word), || Futex::new(idle_word))
             .id();
 
         let filler: &'static [AtomicI32] = Box::leak(
@@ -1342,28 +1383,30 @@ mod tests {
                 .collect(),
         );
         for w in filler {
-            drop(table.get_or_create(key(w), || Futex::new(w)));
+            drop(table.get_or_create_dropping_swept(key(w), || Futex::new(w)));
         }
 
         assert!(Arc::ptr_eq(
             &held,
-            &table.get_or_create(key(held_word), || unreachable!())
+            &table.get_or_create_dropping_swept(key(held_word), || unreachable!())
         ));
         assert_eq!(
             table
-                .get_or_create(key(waited_word), || unreachable!())
+                .get_or_create_dropping_swept(key(waited_word), || unreachable!())
                 .id(),
             waited_id,
             "a futex with a waiter keeps its queue"
         );
         assert_eq!(
-            table.get_or_create(key(owned_word), || unreachable!()).id(),
+            table
+                .get_or_create_dropping_swept(key(owned_word), || unreachable!())
+                .id(),
             owned_id,
             "a futex a thread owns keeps its owner"
         );
         assert_ne!(
             table
-                .get_or_create(key(idle_word), || Futex::new(idle_word))
+                .get_or_create_dropping_swept(key(idle_word), || Futex::new(idle_word))
                 .id(),
             idle_id,
             "the idle one was swept"

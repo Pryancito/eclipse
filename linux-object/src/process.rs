@@ -1704,10 +1704,20 @@ impl LinuxProcess {
         if uaddr == 0 || !uaddr.is_multiple_of(core::mem::align_of::<AtomicI32>()) {
             return None;
         }
-        Some(self.inner.lock().futexes.get_or_create(uaddr, || {
-            let value = unsafe { &*(uaddr as *const AtomicI32) };
-            Futex::new(value)
-        }))
+        // The table's sweep hands its victims out rather than dropping them in
+        // place, so they go with `inner` released: see
+        // `FutexTable::get_or_create`.
+        let mut swept = Vec::new();
+        let futex = self.inner.lock().futexes.get_or_create(
+            uaddr,
+            || {
+                let value = unsafe { &*(uaddr as *const AtomicI32) };
+                Futex::new(value)
+            },
+            &mut swept,
+        );
+        drop(swept);
+        Some(futex)
     }
 
     /// Get lowest free fd
@@ -5748,7 +5758,9 @@ mod fork_inheritance_tests {
         // threads of the parent that are waiting on their own memory.
         static WORD: AtomicI32 = AtomicI32::new(0);
         let mut parent = a_configured_parent();
-        parent.futexes.get_or_create(0x1000, || Futex::new(&WORD));
+        parent
+            .futexes
+            .get_or_create_dropping_swept(0x1000, || Futex::new(&WORD));
 
         let child = fork_of(&parent);
         assert!(child.futexes.is_empty());

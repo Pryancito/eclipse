@@ -730,10 +730,16 @@ impl Process {
 
     /// Get a futex from the process
     pub fn get_futex(&self, addr: &'static AtomicI32) -> Arc<Futex> {
-        self.inner
-            .lock()
-            .futexes
-            .get_or_create(addr as *const AtomicI32 as usize, || Futex::new(addr))
+        // The table's sweep hands its victims out rather than dropping them, so
+        // they go with `inner` released: see `FutexTable::get_or_create`.
+        let mut swept = Vec::new();
+        let futex = self.inner.lock().futexes.get_or_create(
+            addr as *const AtomicI32 as usize,
+            || Futex::new(addr),
+            &mut swept,
+        );
+        drop(swept);
+        futex
     }
 
     /// Duplicate a handle with new `rights`, return the new handle value.
