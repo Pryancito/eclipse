@@ -254,7 +254,9 @@ fn runnable(cmd: &str) -> bool {
     if word.contains('/') {
         return is_exec(std::path::Path::new(word));
     }
-    let path = std::env::var("PATH").unwrap_or_else(|_| "/usr/local/bin:/bin:/usr/bin:/sbin:/usr/sbin".into());
+    // The same list `apps.rs` uses for TryExec: a command the menu accepts and
+    // the runner rejects (or the other way round) is a bug nobody can explain.
+    let path = std::env::var("PATH").unwrap_or_else(|_| lunarbar::apps::DEFAULT_PATH.into());
     path.split(':')
         .filter(|d| !d.is_empty())
         .any(|d| is_exec(&std::path::Path::new(d).join(word)))
