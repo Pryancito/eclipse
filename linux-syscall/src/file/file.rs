@@ -1517,23 +1517,24 @@ impl Syscall<'_> {
             }
         }
         if is_handle_to_fd && sync_file {
-            let Some(point) = kernel_hal::drivers::scheme::syncobj::export_snapshot(h.handle)
-            else {
+            // The file gets the FENCE the syncobj carries now, as a syncobj
+            // of its own (`export_fence`), never a live reading of the
+            // source: a RESET of the source, or its re-arm by the next
+            // submit, must not take the fence away from a sync_file already
+            // exported (Mesa resets a binary semaphore in the same call that
+            // exports its SYNC_FD). The file owns the carrier's one reference
+            // and `destroy`s it on close (Drop on SyncobjHandle).
+            let Some(carrier) = kernel_hal::drivers::scheme::syncobj::export_fence(h.handle) else {
                 warn!(
                     "[drm] SYNCOBJ_HANDLE_TO_FD(EXPORT_SYNC_FILE) EINVAL: handle={} not a live syncobj",
                     h.handle
                 );
                 return Err(LxError::EINVAL);
             };
-            // Fd holds a syncobj ref so SYNCOBJ_DESTROY cannot free it while
-            // the sync_file is still live (Drop on SyncobjHandle dec_refs).
-            if !kernel_hal::drivers::scheme::syncobj::add_ref(h.handle) {
-                return Err(LxError::EINVAL);
-            }
-            let new_fd = match proc.add_file(SyncobjHandle::new_sync_file(h.handle, point)) {
+            let new_fd = match proc.add_file(SyncobjHandle::new_sync_file(carrier, 1)) {
                 Ok(fd) => fd,
                 Err(e) => {
-                    let _ = kernel_hal::drivers::scheme::syncobj::destroy(h.handle);
+                    let _ = kernel_hal::drivers::scheme::syncobj::destroy(carrier);
                     return Err(e);
                 }
             };

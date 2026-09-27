@@ -1014,6 +1014,32 @@ pub fn export_snapshot(handle: u32) -> Option<u64> {
     r
 }
 
+/// `SYNCOBJ_HANDLE_TO_FD_FLAGS_EXPORT_SYNC_FILE`: the fence `handle` carries
+/// right now, as a syncobj of its own for the `sync_file` to hold. A Linux
+/// `sync_file` keeps its own reference to the `dma_fence` that was attached
+/// at export time: a RESET of the syncobj (Mesa resets a binary semaphore in
+/// the same call that exports its `SYNC_FD`, copy transference) or the
+/// re-arm of the next submit replaces the syncobj's fence and leaves the
+/// file's alone. A file that read `(handle, point)` live against the source
+/// lost the fence with the reset -- `reset` drops the pending fence and
+/// zeroes the point -- and waited for the source's NEXT signal, or for ever.
+///
+/// The carrier starts with one reference, the file's; `destroy` it when the
+/// file closes. Its point 1 is the fence: reached already (a timed-out one
+/// keeps its mark), the same hardware fence when one is in flight, or the
+/// source's next signal when it has none (Linux refuses that export;
+/// [`export_snapshot`] explains why it is accepted here). `None` for an
+/// unknown handle.
+pub fn export_fence(handle: u32) -> Option<u32> {
+    let point = export_snapshot(handle)?;
+    let carrier = create(false);
+    if !transfer(carrier, 1, handle, point) {
+        destroy(carrier);
+        return None;
+    }
+    Some(carrier)
+}
+
 /// `SYNCOBJ_FD_TO_HANDLE_FLAGS_IMPORT_SYNC_FILE`: make `dst` carry the fence
 /// captured in a snapshot (`src` reaching `target`). Returns `false` if
 /// either handle is unknown.
@@ -2859,6 +2885,105 @@ mod tests {
         second.land(2);
         destroy(dst);
         destroy(src);
+    }
+
+    /// `EXPORT_SYNC_FILE` hands out the fence the syncobj carries NOW, and a
+    /// `sync_file` holds its own reference to it: resetting or re-arming the
+    /// syncobj afterwards does not touch the file. Mesa exports a `SYNC_FD`
+    /// and resets the binary semaphore in the same call
+    /// (`vk_common_GetSemaphoreFdKHR`, copy transference) while the GPU is
+    /// still on its way to the fence. Here the file was `(handle, point)`
+    /// read live against the source: the reset dropped the pending fence and
+    /// zeroed the point, and the file, its merges and its imports waited for
+    /// the source's next signal, or for ever.
+    #[test]
+    fn an_exported_sync_file_keeps_its_fence_through_a_reset_or_a_re_arm_of_the_source() {
+        let _g = test_lock();
+        arm_hooks();
+        // In flight at export, reset before it lands.
+        let src = create(false);
+        let mut zone = Landing::new();
+        assert!(attach_hw_fence(src, 1, zone.va(), 0x100, 7, 3, true));
+        let fd = export_fence(src).expect("a live source");
+        assert_ne!(fd, src, "a syncobj of its own");
+        assert_eq!(
+            pending_hw_fences(fd, 1),
+            alloc::vec![(zone.va(), 0x100u64, 7u32, 3u32)],
+            "the file carries the same hardware fence"
+        );
+        assert!(reset(src));
+        assert_eq!(query(src), Some(0));
+        assert!(
+            pending_hw_fences(src, 1).is_empty(),
+            "the reset dropped the source's fence"
+        );
+        assert_eq!(query(fd), Some(0), "not landed yet");
+        let dst = create(false);
+        assert!(import_snapshot(dst, fd, 1));
+        assert!(matches!(
+            wait_ready(&[dst], None, true, 0),
+            Some(Err(WaitOutcome::Timeout))
+        ));
+        zone.land(7);
+        assert_eq!(query(fd), Some(1), "the fence landed: the file signals");
+        assert_eq!(query(dst), Some(1), "and so does its import");
+        assert_eq!(query(src), Some(0), "the reset source does not");
+        destroy(dst);
+        destroy(fd);
+        // Re-armed by the next submit before the exported fence lands.
+        let mut first = Landing::new();
+        assert!(attach_hw_fence(src, 1, first.va(), 0, 8, 3, true));
+        let fd = export_fence(src).unwrap();
+        let mut second = Landing::new();
+        assert!(attach_hw_fence(src, 1, second.va(), 0, 9, 3, true));
+        assert_eq!(query(src), Some(0));
+        first.land(8);
+        assert_eq!(query(fd), Some(1), "the first submission's fence");
+        assert_eq!(query(src), Some(0), "the source waits for the second");
+        second.land(9);
+        assert_eq!(query(src), Some(1));
+        destroy(fd);
+        // Landed before the export: reached at once, and a reset changes
+        // nothing about it.
+        let fd = export_fence(src).unwrap();
+        assert_eq!(query(fd), Some(1));
+        assert!(reset(src));
+        assert_eq!(query(fd), Some(1));
+        assert!(!reached_by_timeout(&[fd], Some(&[1])));
+        destroy(fd);
+        // Given up on before the export: the file carries the timeout mark.
+        let dead = Landing::new();
+        assert!(attach_hw_fence(src, 1, dead.va(), 0, 10, 3, true));
+        test_clock::advance(FENCE_TIMEOUT_US + 1);
+        assert_eq!(query(src), Some(1), "reached, by the timeout");
+        let fd = export_fence(src).unwrap();
+        assert_eq!(query(fd), Some(1));
+        assert!(reached_by_timeout(&[fd], Some(&[1])), "and marked as such");
+        destroy(fd);
+        assert!(reset(src));
+        // No fence at all: the file is the source's next signal.
+        let fd = export_fence(src).unwrap();
+        assert_eq!(query(fd), Some(0));
+        assert!(signal(src));
+        assert_eq!(query(fd), Some(1));
+        destroy(fd);
+        destroy(src);
+        // A timeline: the file is the point in flight, not the counter.
+        let tl = create(false);
+        assert!(timeline_signal(tl, 3));
+        let mut z = Landing::new();
+        assert!(attach_hw_fence(tl, 5, z.va(), 0, 11, 3, false));
+        let fd = export_fence(tl).unwrap();
+        assert_eq!(query(fd), Some(0), "point 5 is still in flight");
+        assert!(reset(tl));
+        z.land(11);
+        assert_eq!(query(fd), Some(1));
+        destroy(fd);
+        destroy(tl);
+        // An unknown handle exports nothing, and leaves nothing behind.
+        let before = TABLE.lock().objects.len();
+        assert_eq!(export_fence(0xdead_0000), None);
+        assert_eq!(TABLE.lock().objects.len(), before);
     }
 
     /// `IMPORT_SYNC_FILE` and a binary `TRANSFER` REPLACE the destination's
