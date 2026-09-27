@@ -7390,6 +7390,319 @@ mod kms_scanout_tests {
         }
     }
 
+    // --- the unchanged-band skip (`drm.present_skip`) ---
+    //
+    // Every one of these turns on a sentinel: a value poked straight onto the
+    // emulated panel between two presents. A band the present copies overwrites
+    // it; a band the present skips leaves it there. That is the only way to see
+    // the difference from outside, because the source says the same thing either
+    // way -- and it is also the shape of the defect, since a skip that is wrong
+    // shows up as exactly such a leftover pixel.
+
+    /// Presenting the same buffer twice copies nothing the second time. This is
+    /// the whole point: on real hardware CPU stores into the console GPU's BAR1
+    /// serve at ~42 MB/s, so a frame nobody changed costs ~99 ms of pure waste.
+    #[test]
+    fn a_band_the_panel_already_holds_is_not_copied_again() {
+        const SENTINEL: u32 = 0x0BAD_F00D;
+        let screen = kms_emu::attach(64, 48);
+        let pitch_px = screen.pitch_px();
+        drm::set_present_skip_enabled(true);
+        let c = Client::open(0);
+        let buf = c.create_dumb(64, 48);
+        paint(&buf, |x, y| tag(0x0011_0000, x, y));
+        let fb = c.addfb2(&buf);
+
+        c.page_flip(drm::SYNTH_CRTC_ID, fb, 0xF00D).expect("flip");
+        assert_eq!(
+            drm::skipped_bands_for_test(),
+            0,
+            "the first present of a boot knows nothing and must copy everything"
+        );
+        // One pixel of each band, marked on the panel and not in the buffer.
+        for b in 0..3u32 {
+            kms_emu::poke(pitch_px, 0, b * 16, SENTINEL);
+        }
+
+        c.page_flip(drm::SYNTH_CRTC_ID, fb, 0xF00E).expect("flip");
+
+        assert_eq!(
+            drm::skipped_bands_for_test(),
+            3,
+            "the same buffer again: every band is already up there"
+        );
+        for b in 0..3u32 {
+            assert_eq!(
+                screen.pixel(0, b * 16),
+                SENTINEL,
+                "band {} was copied again although nothing changed",
+                b
+            );
+        }
+    }
+
+    /// And without the flag the same two presents copy the frame twice, which is
+    /// what fixes the behaviour to the flag rather than to the state: the
+    /// sentinel goes away.
+    #[test]
+    fn without_the_skip_every_band_is_copied_again() {
+        const SENTINEL: u32 = 0x0BAD_BEEF;
+        let screen = kms_emu::attach(64, 48);
+        let pitch_px = screen.pitch_px();
+        let c = Client::open(0);
+        let buf = c.create_dumb(64, 48);
+        paint(&buf, |x, y| tag(0x0022_0000, x, y));
+        let fb = c.addfb2(&buf);
+        c.page_flip(drm::SYNTH_CRTC_ID, fb, 0xF00D).expect("flip");
+        kms_emu::poke(pitch_px, 0, 16, SENTINEL);
+
+        c.page_flip(drm::SYNTH_CRTC_ID, fb, 0xF00E).expect("flip");
+
+        assert_eq!(drm::skipped_bands_for_test(), 0);
+        assert_eq!(
+            screen.pixel(0, 16),
+            tag(0x0022_0000, 0, 16),
+            "with no skip armed the present must copy every band"
+        );
+    }
+
+    /// A band whose pixels moved is copied; the bands around it are not. The
+    /// saving and the correctness are the same claim, and this is where they meet:
+    /// a desktop changes a few rows per frame and must still show them.
+    #[test]
+    fn only_the_band_that_changed_is_copied() {
+        const SENTINEL: u32 = 0x0FEE_1DEA;
+        let screen = kms_emu::attach(64, 48);
+        let pitch_px = screen.pitch_px();
+        drm::set_present_skip_enabled(true);
+        let c = Client::open(0);
+        let buf = c.create_dumb(64, 48);
+        paint(&buf, |x, y| tag(0x0033_0000, x, y));
+        let fb = c.addfb2(&buf);
+        c.page_flip(drm::SYNTH_CRTC_ID, fb, 0xF00D).expect("flip");
+
+        // Mark all three bands on the panel, then change one pixel of the middle
+        // one in the BUFFER.
+        for b in 0..3u32 {
+            kms_emu::poke(pitch_px, 0, b * 16, SENTINEL);
+        }
+        let stride = (buf.pitch / 4) as usize;
+        map_dumb(&buf)[20 * stride + 5] = 0x00C0_FFEE;
+
+        c.page_flip(drm::SYNTH_CRTC_ID, fb, 0xF00E).expect("flip");
+
+        assert_eq!(
+            drm::skipped_bands_for_test(),
+            2,
+            "one band moved, so two were already on the panel"
+        );
+        assert_eq!(
+            screen.pixel(5, 20),
+            0x00C0_FFEE,
+            "the pixel that changed has to reach the panel"
+        );
+        assert_eq!(
+            screen.pixel(0, 16),
+            tag(0x0033_0000, 0, 16),
+            "the band that changed is copied whole, sentinel and all"
+        );
+        assert_eq!(screen.pixel(0, 0), SENTINEL, "band 0 did not change");
+        assert_eq!(screen.pixel(0, 32), SENTINEL, "band 2 did not change");
+    }
+
+    /// The cursor is composited ON TOP of the frame, so the rows it covers are
+    /// not the frame's pixels and the next present must copy them again. Without
+    /// that the pointer's previous position stays on screen until something else
+    /// happens to change those rows -- the very defect this path exists to stop
+    /// causing.
+    #[test]
+    fn the_rows_under_the_cursor_are_copied_again() {
+        const SENTINEL: u32 = 0x0C0F_FEE0;
+        let screen = kms_emu::attach(64, 48);
+        let pitch_px = screen.pitch_px();
+        drm::set_present_skip_enabled(true);
+        let c = Client::open(0);
+        let buf = c.create_dumb(64, 48);
+        paint(&buf, |x, y| tag(0x0044_0000, x, y));
+        let fb = c.addfb2(&buf);
+        // An opaque 8x8 pointer parked inside band 0.
+        let cur = c.create_dumb(8, 8);
+        paint(&cur, |_, _| 0xFF00_FF00);
+        set_cursor(&c, drm::SYNTH_CRTC_ID, cur.handle, 8, 8, 0, 0);
+        c.page_flip(drm::SYNTH_CRTC_ID, fb, 0xF00D).expect("flip");
+
+        // Row 12 is in the pointer's band (rows 0..16) but BELOW the 8-row
+        // pointer itself: a sentinel under the pointer would be overwritten by
+        // the pointer's own pixels and say nothing about the band.
+        kms_emu::poke(pitch_px, 0, 12, SENTINEL);
+        kms_emu::poke(pitch_px, 0, 32, SENTINEL);
+
+        c.page_flip(drm::SYNTH_CRTC_ID, fb, 0xF00E).expect("flip");
+
+        assert_eq!(
+            screen.pixel(0, 12),
+            tag(0x0044_0000, 0, 12),
+            "the band under the pointer must be copied again"
+        );
+        assert_eq!(
+            screen.pixel(0, 32),
+            SENTINEL,
+            "and a band nowhere near the pointer must not"
+        );
+    }
+
+    /// Two bands change with a skipped band between them, and BOTH have to reach
+    /// the panel. This is the one that says the dirty run is closed when a skipped
+    /// band interrupts it: a run left open across the gap blits the right number
+    /// of rows from the wrong place and the second changed band never arrives.
+    #[test]
+    fn two_bands_with_a_gap_between_them_both_arrive() {
+        const SENTINEL: u32 = 0x0A11_0A11;
+        let screen = kms_emu::attach(64, 48);
+        let pitch_px = screen.pitch_px();
+        drm::set_present_skip_enabled(true);
+        let c = Client::open(0);
+        let buf = c.create_dumb(64, 48);
+        paint(&buf, |x, y| tag(0x0077_0000, x, y));
+        let fb = c.addfb2(&buf);
+        c.page_flip(drm::SYNTH_CRTC_ID, fb, 0xF00D).expect("flip");
+
+        kms_emu::poke(pitch_px, 0, 20, SENTINEL);
+        let stride = (buf.pitch / 4) as usize;
+        {
+            let m = map_dumb(&buf);
+            m[4 * stride + 1] = 0x0011_1111;
+            m[36 * stride + 2] = 0x0022_2222;
+        }
+
+        c.page_flip(drm::SYNTH_CRTC_ID, fb, 0xF00E).expect("flip");
+
+        assert_eq!(
+            drm::skipped_bands_for_test(),
+            1,
+            "the band between the two that moved is the only one still up there"
+        );
+        assert_eq!(
+            screen.pixel(1, 4),
+            0x0011_1111,
+            "the first band that moved has to arrive"
+        );
+        assert_eq!(
+            screen.pixel(2, 36),
+            0x0022_2222,
+            "and so does the one past the gap"
+        );
+        assert_eq!(
+            screen.pixel(0, 20),
+            SENTINEL,
+            "the band between them was not copied"
+        );
+    }
+
+    /// A damage box does not take the skip at all. The box is already the
+    /// client's own answer to "what changed", and the skip's state is indexed
+    /// from its window's top row -- so a box would have it describing rows by a
+    /// different origin than the cursor invalidation uses. The pixels look the
+    /// same either way, which is why this asserts on which path ran.
+    #[test]
+    fn a_damage_box_does_not_take_the_skip() {
+        let screen = kms_emu::attach(64, 48);
+        drm::set_present_skip_enabled(true);
+        let c = Client::open(0);
+        let buf = c.create_dumb(64, 48);
+        paint(&buf, |x, y| tag(0x0088_0000, x, y));
+        let fb = c.addfb2(&buf);
+        c.page_flip(drm::SYNTH_CRTC_ID, fb, 0xF00D).expect("flip");
+        let after_frame = drm::skip_presents_for_test();
+        assert_eq!(after_frame, 1, "a whole frame takes the skip");
+
+        paint(&buf, |x, y| tag(0x0099_0000, x, y));
+        dirtyfb(&c, fb, &[clip(0, 16, 64, 32)]);
+
+        assert_eq!(
+            drm::skip_presents_for_test(),
+            after_frame,
+            "a damage box must not go through the skip"
+        );
+        assert_eq!(
+            screen.pixel(0, 20),
+            tag(0x0099_0000, 0, 20),
+            "and the box is still copied"
+        );
+        assert_eq!(
+            screen.pixel(0, 4),
+            tag(0x0088_0000, 0, 4),
+            "while the rows outside it keep what they had"
+        );
+    }
+
+    /// A damage box copies part of the frame without the skip's knowledge, so
+    /// everything it remembers stops being true. Keeping the hashes would leave
+    /// the rows the box did NOT cover claiming to hold pixels that a later
+    /// present then refuses to copy.
+    #[test]
+    fn a_damage_box_forgets_what_the_panel_held() {
+        const SENTINEL: u32 = 0x0D06_0D06;
+        let screen = kms_emu::attach(64, 48);
+        let pitch_px = screen.pitch_px();
+        drm::set_present_skip_enabled(true);
+        let c = Client::open(0);
+        let buf = c.create_dumb(64, 48);
+        paint(&buf, |x, y| tag(0x0055_0000, x, y));
+        let fb = c.addfb2(&buf);
+        c.page_flip(drm::SYNTH_CRTC_ID, fb, 0xF00D).expect("flip");
+
+        dirtyfb(&c, fb, &[clip(0, 0, 64, 16)]);
+        kms_emu::poke(pitch_px, 0, 32, SENTINEL);
+
+        c.page_flip(drm::SYNTH_CRTC_ID, fb, 0xF00E).expect("flip");
+
+        assert_eq!(
+            drm::skipped_bands_for_test(),
+            0,
+            "after a damage box the skip knows nothing again"
+        );
+        assert_eq!(
+            screen.pixel(0, 32),
+            tag(0x0055_0000, 0, 32),
+            "a band the skip still claimed was left stale on the panel"
+        );
+    }
+
+    /// Blanking paints the panel black, which is not the frame's pixels. A skip
+    /// that kept its hashes across a blank would leave the screen black: every
+    /// band would match, so the present that comes back would copy nothing.
+    #[test]
+    fn a_blank_forgets_what_the_panel_held() {
+        let screen = kms_emu::attach(64, 48);
+        drm::set_present_skip_enabled(true);
+        let c = Client::open(0);
+        let buf = c.create_dumb(64, 48);
+        paint(&buf, |x, y| tag(0x0066_0000, x, y));
+        let fb = c.addfb2(&buf);
+        c.page_flip(drm::SYNTH_CRTC_ID, fb, 0xF00D).expect("flip");
+
+        drm::set_crtc_blanked(true);
+        assert_eq!(screen.pixel(0, 32), 0, "blanking paints the panel black");
+        drm::set_crtc_blanked(false);
+
+        c.page_flip(drm::SYNTH_CRTC_ID, fb, 0xF00E).expect("flip");
+
+        assert_eq!(
+            drm::skipped_bands_for_test(),
+            0,
+            "nothing is known about a panel that was blanked"
+        );
+        for y in [0u32, 16, 32, 47] {
+            assert_eq!(
+                screen.pixel(0, y),
+                tag(0x0066_0000, 0, y),
+                "row {} stayed black after the blank",
+                y
+            );
+        }
+    }
+
     /// And the repair pass changes nothing about a damage box on the buffer the
     /// panel already carries: the box is still the only thing copied. Arming a
     /// repair must not quietly turn every present into a whole frame.
