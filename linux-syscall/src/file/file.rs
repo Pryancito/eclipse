@@ -1176,20 +1176,14 @@ impl Syscall<'_> {
         arg1: usize,
     ) -> Result<Option<usize>, LxError> {
         use linux_object::fs::devfs::drm;
+        use linux_object::fs::devfs::drm_scheme::{
+            nr, prime_request, DrmPrimeHandle, PrimeRequest,
+        };
         use linux_object::fs::DmaBuf;
 
-        const PRIME_HANDLE_TO_FD: u32 = 0x2E; // DRM_IOWR(0x2e, drm_prime_handle)
-        const PRIME_FD_TO_HANDLE: u32 = 0x2D; // DRM_IOWR(0x2d, drm_prime_handle)
+        const PRIME_HANDLE_TO_FD: u32 = nr::PRIME_HANDLE_TO_FD.0; // DRM_IOWR(0x2d, drm_prime_handle)
+        const PRIME_FD_TO_HANDLE: u32 = nr::PRIME_FD_TO_HANDLE.0; // DRM_IOWR(0x2e, drm_prime_handle)
         const MODE_CREATE_LEASE: u32 = 0xC6; // DRM_IOWR(0xc6, drm_mode_create_lease)
-
-        // struct drm_prime_handle { __u32 handle; __u32 flags; __s32 fd; }
-        #[repr(C)]
-        #[derive(Clone, Copy, Default)]
-        struct DrmPrimeHandle {
-            handle: u32,
-            flags: u32,
-            fd: i32,
-        }
 
         // struct drm_mode_create_lease {
         //   __u64 object_ids; __u32 object_count; __u32 flags;
@@ -1228,15 +1222,15 @@ impl Syscall<'_> {
         // Match on the DRM ioctl NR only. The struct size the client encoded is
         // deliberately NOT part of the comparison -- see `is_drm_ioctl_nr`.
         match request as u32 & 0xff {
-            // EXPORT (HANDLE_TO_FD) and IMPORT (FD_TO_HANDLE) share one arm and
-            // are told apart by STRUCT CONTENT, not the ioctl number. On real
-            // hardware the number-based dispatch mis-routed 0xc00c642d (export)
-            // into the import path — verified impossible in the source yet
-            // reproducible on the target — so the number is no longer trusted to
-            // pick the operation. libdrm's drmPrimeHandleToFD presets the output
-            // `fd` field to -1 and passes a real GEM `handle`; drmPrimeFDToHandle
-            // passes a real `fd` (>=0) and a zero output `handle`. Thus `fd < 0`
-            // is an unambiguous, dispatch-independent marker of an export.
+            // EXPORT (HANDLE_TO_FD, 0x2d) and IMPORT (FD_TO_HANDLE, 0x2e)
+            // share one arm; `prime_request` tells them apart by the ioctl
+            // NUMBER, as `drm_ioctl` does. This arm used to read the
+            // operation off the struct instead (`fd < 0` = export, because
+            // libdrm presets that output field to -1): the two numbers were
+            // filed the wrong way round in `nr`, which is what "0xc00c642d
+            // mis-routed into the import path on real hardware" was, and the
+            // struct heuristic papered over it -- while breaking any exporter
+            // that zeroes the struct (fd = 0 read as "import stdin").
             PRIME_HANDLE_TO_FD | PRIME_FD_TO_HANDLE => {
                 let mut ptr = UserInOutPtr::<DrmPrimeHandle>::from(arg1);
                 let mut h = match ptr.read() {
@@ -1246,139 +1240,153 @@ impl Syscall<'_> {
                         return Err(e.into());
                     }
                 };
-                let is_export = h.fd < 0;
-                if is_export {
-                    // handle -> new dma-buf fd
-                    let (phys, size, vmo) = match drm::export_handle(h.handle) {
-                        Some(v) => v,
-                        None => {
-                            warn!(
-                                "[drm] PRIME export EINVAL: handle={} not in GEM table",
-                                h.handle
-                            );
-                            return Err(LxError::EINVAL);
-                        }
-                    };
-                    let dmabuf = DmaBuf::from_prime(h.handle, phys, size, vmo);
-                    let new_fd = match proc.add_file(dmabuf) {
-                        Ok(fd) => fd,
-                        Err(e) => {
-                            warn!("[drm] PRIME export add_file {:?}", e);
-                            return Err(e);
-                        }
-                    };
-                    h.fd = i32::from(new_fd);
-                    // debug-only: export is a HOT path. wlroots re-exports both
-                    // swapchain buffers on every recreate/present cycle, so at
-                    // error! this floods the graphical console (~8/s) and buries
-                    // the real failure in labwc.log -- exactly the console-flood
-                    // pattern to avoid. The diagnostic job (compare exported phys
-                    // vs the import-side reverse lookup) is done; keep it at debug.
-                    log::debug!(
-                        "[drm] PRIME export handle={:#x} -> phys={:#x} size={} fd={}",
-                        h.handle,
-                        phys,
-                        size,
-                        h.fd
-                    );
-                    if let Err(e) = ptr.write(h) {
-                        warn!("[drm] PRIME export write-back EFAULT: {:?}", e);
-                        return Err(e.into());
+                let op = match prime_request(request as u32, h) {
+                    Ok(op) => op,
+                    Err(e) => {
+                        warn!(
+                            "[drm] PRIME request={:#x} handle={} flags={:#x} fd={} refused: {:?}",
+                            request, h.handle, h.flags, h.fd, e
+                        );
+                        return Err(e);
                     }
-                    Ok(Some(0))
-                } else {
-                    // fd -> new GEM handle
-                    let target = match proc.get_file_like(FileDesc::from(h.fd as usize)) {
-                        Ok(t) => t,
-                        Err(e) => {
-                            warn!("[drm] PRIME import EBADF: fd={} not in fd table", h.fd);
-                            return Err(e);
+                };
+                match op {
+                    PrimeRequest::Export { handle, flags: _ } => {
+                        // handle -> new dma-buf fd. `h.fd` is an OUTPUT here:
+                        // whatever the caller left in it is not read.
+                        let (phys, size, vmo) = match drm::export_handle(handle) {
+                            Some(v) => v,
+                            None => {
+                                warn!(
+                                    "[drm] PRIME export EINVAL: handle={} not in GEM table",
+                                    handle
+                                );
+                                return Err(LxError::EINVAL);
+                            }
+                        };
+                        let dmabuf = DmaBuf::from_prime(handle, phys, size, vmo);
+                        let new_fd = match proc.add_file(dmabuf) {
+                            Ok(fd) => fd,
+                            Err(e) => {
+                                warn!("[drm] PRIME export add_file {:?}", e);
+                                return Err(e);
+                            }
+                        };
+                        h.fd = i32::from(new_fd);
+                        // debug-only: export is a HOT path. wlroots re-exports both
+                        // swapchain buffers on every recreate/present cycle, so at
+                        // error! this floods the graphical console (~8/s) and buries
+                        // the real failure in labwc.log -- exactly the console-flood
+                        // pattern to avoid. The diagnostic job (compare exported phys
+                        // vs the import-side reverse lookup) is done; keep it at debug.
+                        log::debug!(
+                            "[drm] PRIME export handle={:#x} -> phys={:#x} size={} fd={}",
+                            h.handle,
+                            phys,
+                            size,
+                            h.fd
+                        );
+                        if let Err(e) = ptr.write(h) {
+                            warn!("[drm] PRIME export write-back EFAULT: {:?}", e);
+                            return Err(e.into());
                         }
-                    };
-                    let dmabuf = target.downcast_ref::<DmaBuf>().ok_or(LxError::EINVAL)?;
-                    // Self-import first: if this dma-buf was exported from a
-                    // nouveau-uAPI GEM object, hand back the ORIGINAL nouveau
-                    // handle -- real Linux PRIME semantics (importing your own
-                    // export resolves to the existing GEM object). This is
-                    // what the compositor does for every swapchain buffer:
-                    // gbm/NVK allocates (GEM_NEW), exports the fd, and EGL
-                    // imports it again on the same device. A fresh GENERIC
-                    // handle over the same memory (the old behaviour) passes
-                    // the generic ioctls and then fails every driver-private
-                    // one -- nouveau GEM_INFO gave ENOENT, NVK's dma-buf
-                    // import died, and the desktop fell over at
-                    // "createImageFromDmaBufs failed" / zink "couldn't
-                    // allocate memory".
-                    let (handle_id, kind) = match drm::nouveau_handle_for_phys(dmabuf.phys_addr) {
-                        Some(nouveau_handle) => {
-                            // Take a PRIME reference: the importer will GEM_CLOSE
-                            // this handle when done, but the exporter (wlroots)
-                            // still owns the same nouveau handle. Without this
-                            // bump the importer's close frees the buffer out from
-                            // under the exporter, the next self-import misses, and
-                            // NVK falls back to a generic handle that GEM_INFO
-                            // ENOENTs -> zink "couldn't allocate memory heap=0".
-                            let n = drm::nouveau_gem_add_ref(nouveau_handle);
-                            // debug-only: this is the SUCCESS path and it is hot
-                            // (every swapchain buffer import). Stay quiet so a
-                            // working stack does not flood the console; the failure
-                            // path below is the one that logs loudly.
-                            log::debug!(
-                                "[drm] PRIME self-import ref++ handle={:#x} -> refcount={:?}",
-                                nouveau_handle,
-                                n
-                            );
-                            // ...except the first few per boot, at error! (the
-                            // rig runs LOG=error): whether the COMPOSITOR ever
-                            // imports a CLIENT's dma-buf is the missing half of
-                            // the vkcube/eglgears present-hang picture. The pid
-                            // tells the two apart -- labwc importing a phys that
-                            // a client pid exported means the Wayland dmabuf
-                            // dance reached the compositor at all.
-                            {
-                                use core::sync::atomic::{AtomicU32, Ordering};
-                                static FIRST_IMPORTS: AtomicU32 = AtomicU32::new(0);
-                                let k = FIRST_IMPORTS.fetch_add(1, Ordering::Relaxed);
-                                if k < 8 {
-                                    log::error!(
+                        Ok(Some(0))
+                    }
+                    PrimeRequest::Import { fd } => {
+                        // fd -> new GEM handle. `h.handle` is the OUTPUT here.
+                        let target = match proc.get_file_like(FileDesc::from(fd as usize)) {
+                            Ok(t) => t,
+                            Err(e) => {
+                                warn!("[drm] PRIME import EBADF: fd={} not in fd table", fd);
+                                return Err(e);
+                            }
+                        };
+                        let dmabuf = target.downcast_ref::<DmaBuf>().ok_or(LxError::EINVAL)?;
+                        // Self-import first: if this dma-buf was exported from a
+                        // nouveau-uAPI GEM object, hand back the ORIGINAL nouveau
+                        // handle -- real Linux PRIME semantics (importing your own
+                        // export resolves to the existing GEM object). This is
+                        // what the compositor does for every swapchain buffer:
+                        // gbm/NVK allocates (GEM_NEW), exports the fd, and EGL
+                        // imports it again on the same device. A fresh GENERIC
+                        // handle over the same memory (the old behaviour) passes
+                        // the generic ioctls and then fails every driver-private
+                        // one -- nouveau GEM_INFO gave ENOENT, NVK's dma-buf
+                        // import died, and the desktop fell over at
+                        // "createImageFromDmaBufs failed" / zink "couldn't
+                        // allocate memory".
+                        let (handle_id, kind) = match drm::nouveau_handle_for_phys(dmabuf.phys_addr)
+                        {
+                            Some(nouveau_handle) => {
+                                // Take a PRIME reference: the importer will GEM_CLOSE
+                                // this handle when done, but the exporter (wlroots)
+                                // still owns the same nouveau handle. Without this
+                                // bump the importer's close frees the buffer out from
+                                // under the exporter, the next self-import misses, and
+                                // NVK falls back to a generic handle that GEM_INFO
+                                // ENOENTs -> zink "couldn't allocate memory heap=0".
+                                let n = drm::nouveau_gem_add_ref(nouveau_handle);
+                                // debug-only: this is the SUCCESS path and it is hot
+                                // (every swapchain buffer import). Stay quiet so a
+                                // working stack does not flood the console; the failure
+                                // path below is the one that logs loudly.
+                                log::debug!(
+                                    "[drm] PRIME self-import ref++ handle={:#x} -> refcount={:?}",
+                                    nouveau_handle,
+                                    n
+                                );
+                                // ...except the first few per boot, at error! (the
+                                // rig runs LOG=error): whether the COMPOSITOR ever
+                                // imports a CLIENT's dma-buf is the missing half of
+                                // the vkcube/eglgears present-hang picture. The pid
+                                // tells the two apart -- labwc importing a phys that
+                                // a client pid exported means the Wayland dmabuf
+                                // dance reached the compositor at all.
+                                {
+                                    use core::sync::atomic::{AtomicU32, Ordering};
+                                    static FIRST_IMPORTS: AtomicU32 = AtomicU32::new(0);
+                                    let k = FIRST_IMPORTS.fetch_add(1, Ordering::Relaxed);
+                                    if k < 8 {
+                                        log::error!(
                                         "[drm] PRIME import pid={} fd={} phys={:#x} size={} -> nouveau handle={:#x} (import {}/8 this boot; informational, not an error)",
                                         self.zircon_process().id(), h.fd,
                                         dmabuf.phys_addr, dmabuf.size, nouveau_handle, k + 1
                                     );
+                                    }
                                 }
+                                (nouveau_handle, "self-import(nouveau)")
                             }
-                            (nouveau_handle, "self-import(nouveau)")
-                        }
-                        None => (
-                            drm::import_dmabuf(dmabuf.phys_addr, dmabuf.size, dmabuf.vmo()),
-                            "generic",
-                        ),
-                    };
-                    // Loud ONLY on the failure path: "generic" means the
-                    // self-import reverse lookup MISSED (the dma-buf's phys is not
-                    // registered as a nouveau GEM object), so NVK's driver-private
-                    // GEM_INFO will ENOENT the fresh handle -> zink "couldn't
-                    // allocate memory heap=0" / createImageFromDmaBufs failed. The
-                    // success path ("self-import(nouveau)") is hot and stays at
-                    // debug so a working swapchain loop doesn't flood the console.
-                    if kind == "generic" {
-                        log::info!(
+                            None => (
+                                drm::import_dmabuf(dmabuf.phys_addr, dmabuf.size, dmabuf.vmo()),
+                                "generic",
+                            ),
+                        };
+                        // Loud ONLY on the failure path: "generic" means the
+                        // self-import reverse lookup MISSED (the dma-buf's phys is not
+                        // registered as a nouveau GEM object), so NVK's driver-private
+                        // GEM_INFO will ENOENT the fresh handle -> zink "couldn't
+                        // allocate memory heap=0" / createImageFromDmaBufs failed. The
+                        // success path ("self-import(nouveau)") is hot and stays at
+                        // debug so a working swapchain loop doesn't flood the console.
+                        if kind == "generic" {
+                            log::info!(
                             "[drm] PRIME import fd={} phys={:#x} size={} -> generic handle={:#x} (SELF-IMPORT MISS -> GEM_INFO will ENOENT)",
                             h.fd, dmabuf.phys_addr, dmabuf.size, handle_id
                         );
-                    } else {
-                        log::debug!(
-                            "[drm] PRIME import fd={} phys={:#x} size={} -> {} handle={:#x}",
-                            h.fd,
-                            dmabuf.phys_addr,
-                            dmabuf.size,
-                            kind,
-                            handle_id
-                        );
+                        } else {
+                            log::debug!(
+                                "[drm] PRIME import fd={} phys={:#x} size={} -> {} handle={:#x}",
+                                h.fd,
+                                dmabuf.phys_addr,
+                                dmabuf.size,
+                                kind,
+                                handle_id
+                            );
+                        }
+                        h.handle = handle_id;
+                        ptr.write(h)?;
+                        Ok(Some(0))
                     }
-                    h.handle = handle_id;
-                    ptr.write(h)?;
-                    Ok(Some(0))
                 }
             }
             MODE_CREATE_LEASE => {

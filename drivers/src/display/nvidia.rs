@@ -8649,6 +8649,101 @@ impl NvidiaGpu {
         drained_count
     }
 
+    /// Takes the caller's mappings that overlap `[addr, addr + range)` out
+    /// of its VAS and maps back the parts outside the range. Linux's gpuvm
+    /// answers an UNMAP over part of a mapping, or a MAP over part of one,
+    /// with REMAP ops: the head and the tail of the old mapping stay, same
+    /// object and kind, offsets moved along. Before this, any overlap took
+    /// the WHOLE old mapping: NVK's bind context merges adjacent
+    /// `vkQueueBindSparse` binds into one mapping, so unbinding (or
+    /// rebinding) one page of a sparse-binding buffer later unmapped
+    /// everything merged around it, and the next draw faulted on it. The RM
+    /// knows a mapping only whole (one `h_virt`), so the old one is unmapped
+    /// first and the kept parts are mapped again; a part the RM refuses is
+    /// reported and lost, the op itself still succeeds (Linux cannot fail
+    /// here either). Returns how many mappings were taken.
+    fn split_vm_mappings(
+        &self,
+        device_instance: u32,
+        ctx_idx: u32,
+        owner_pid: u64,
+        addr: u64,
+        range: u64,
+        context: &str,
+    ) -> usize {
+        let end = addr.wrapping_add(range);
+        let taken = self.take_vm_mappings(|m| {
+            m.owner_pid == owner_pid && m.va < end && addr < m.va.wrapping_add(m.size)
+        });
+        let count = taken.len();
+        // (gem_handle, va, size, bo_offset, pte_kind) of every kept part.
+        let mut kept = Vec::new();
+        for m in &taken {
+            let m_end = m.va.wrapping_add(m.size);
+            if m.va < addr {
+                kept.push((m.gem_handle, m.va, addr - m.va, m.bo_offset, m.pte_kind));
+            }
+            if end < m_end {
+                kept.push((
+                    m.gem_handle,
+                    end,
+                    m_end - end,
+                    m.bo_offset + (end - m.va),
+                    m.pte_kind,
+                ));
+            }
+        }
+        self.rm_unmap_mappings(context, taken);
+        for (gem_handle, va, size, bo_offset, pte_kind) in kept {
+            let h_memory = self
+                .nouveau_gem
+                .lock()
+                .iter()
+                .find(|o| o.handle == gem_handle)
+                .map(|o| o.h_memory);
+            let mapped = h_memory
+                .and_then(|h| {
+                    nvidia_rm_sys::rm_init::vm_bind_map(
+                        device_instance,
+                        ctx_idx,
+                        h,
+                        size,
+                        va,
+                        bo_offset,
+                        pte_kind,
+                    )
+                    .ok()
+                })
+                .filter(|b| b.map_status == 0);
+            match mapped {
+                Some(b) => {
+                    self.nouveau_vm_mappings
+                        .lock()
+                        .push(super::nouveau_uapi::NouveauVmMapping {
+                            gem_handle,
+                            h_virt: b.h_virt,
+                            owner_pid,
+                            va: b.actual_va,
+                            size,
+                            bo_offset,
+                            pte_kind,
+                        });
+                    log::info!(
+                        "[nouveau-uapi] {}: kept VA={:#x}+{:#x} of the split mapping (handle={} bo_offset={:#x})",
+                        context, va, size, gem_handle, bo_offset
+                    );
+                }
+                None => {
+                    crate::klog_warn!(
+                        "[nouveau-uapi] {}: the part VA={:#x}+{:#x} outside the range (handle={} bo_offset={:#x}) could not be mapped again -- that part of the object is now UNMAPPED",
+                        context, va, size, gem_handle, bo_offset
+                    );
+                }
+            }
+        }
+        count
+    }
+
     /// Take every mapping `matches` out of the table, in order, without
     /// touching the RM: the caller unmaps them (`rm_unmap_mappings`) now or
     /// later.
@@ -8890,26 +8985,27 @@ impl NvidiaGpu {
                 // -13 in both labwc renderers). The displaced owner cannot
                 // be executing anyway: EXEC is restricted to the RM
                 // channel's owner, so the last binder is the one that runs.
-                let replaced = self.drain_vm_mappings(
+                // Scoped to THIS process's context: two clients each have
+                // their own VA space, so the SAME VA in a different context
+                // is not a conflict -- replacing it would corrupt the other
+                // client. Only the overlapped part of an old mapping goes;
+                // what lies outside the range stays mapped (gpuvm's REMAP).
+                let replaced = self.split_vm_mappings(
+                    device_instance,
+                    ctx_idx,
+                    owner_pid,
+                    op.addr,
+                    op.range,
                     &alloc::format!(
                         "VM_BIND MAP replace VA={:#x}+{:#x} (this ctx, last binder wins)",
                         op.addr,
                         op.range
                     ),
-                    // Scope to THIS process's context: two clients each have their
-                    // own VA space, so the SAME VA in a different context is not a
-                    // conflict -- replacing it would corrupt the other client.
-                    |m| {
-                        m.owner_pid == owner_pid
-                            && m.va < op.addr.wrapping_add(op.range)
-                            && op.addr < m.va.wrapping_add(m.size)
-                    },
-                    true,
                 );
                 if replaced > 0 {
                     crate::klog_warn!(
-                        "[nouveau-uapi] VM_BIND MAP VA={:#x}+{:#x}: replaced {} stale mapping(s) \
-                         from an earlier device generation (single global VAS, last binder wins)",
+                        "[nouveau-uapi] VM_BIND MAP VA={:#x}+{:#x}: replaced {} mapping(s) it overlapped \
+                         (last binder wins; the parts outside the range stay mapped)",
                         op.addr,
                         op.range,
                         replaced
@@ -8949,6 +9045,7 @@ impl NvidiaGpu {
                             va: b.actual_va,
                             size: op.range,
                             bo_offset: op.bo_offset,
+                            pte_kind: rm_pte_kind,
                         });
                         log::info!(
                             "[nouveau-uapi] VM_BIND MAP handle={} -> VA={:#x} ({} bytes)",
@@ -9003,14 +9100,15 @@ impl NvidiaGpu {
                 // range with nothing in it is a SUCCESS, not ENOENT --
                 // Mesa's va_free unconditionally unmaps even reserve-only
                 // VAs it never bound, and treats a refusal as "leak the VA".
-                self.drain_vm_mappings(
+                // Only the range asked for goes: a mapping the range cuts
+                // through keeps its head and its tail (gpuvm's REMAP).
+                self.split_vm_mappings(
+                    device_instance,
+                    ctx_idx,
+                    owner_pid,
+                    op.addr,
+                    op.range,
                     &alloc::format!("VM_BIND UNMAP VA={:#x}+{:#x}", op.addr, op.range),
-                    |m| {
-                        m.owner_pid == owner_pid
-                            && m.va < op.addr.wrapping_add(op.range)
-                            && op.addr < m.va.wrapping_add(m.size)
-                    },
-                    true,
                 );
                 Ok(())
             }
@@ -9703,6 +9801,14 @@ impl NvidiaGpu {
                 else {
                     return Err(nv::FastSubmitError::Gone);
                 };
+                // More entries than the ring has slots never fit, however
+                // long the GPU is given: spinning the 10 s below and then
+                // latching the channel WEDGED (what this did) turned a large
+                // submission into a dead context. EXEC budgets its ACQUIREs
+                // so it does not get here; anything else is the caller's.
+                if needed >= entries {
+                    return Err(nv::FastSubmitError::TooLarge { needed, entries });
+                }
                 if room {
                     let mut slot = put;
                     // Same-ctx wait fences: GPU ACQUIRE before user pushes so
@@ -9972,13 +10078,17 @@ impl NvidiaGpu {
     /// cannot be an ACQUIRE (no fast ctx, no published VA, mapping refused)
     /// the whole handle falls back to the CPU wait, which waits for every
     /// source anyway.
+    ///
+    /// The ACQUIREs come grouped by the wait they stand for, so the caller
+    /// can still send a whole wait to the CPU when its ACQUIREs would not
+    /// fit the ring ([`fit_acquires_to_ring`]).
     fn partition_exec_waits(
         &self,
         handles: &[u32],
         points: &[u64],
         ctx_idx: u32,
     ) -> (
-        alloc::vec::Vec<(u64, u32)>,
+        alloc::vec::Vec<(u32, u64, alloc::vec::Vec<(u64, u32)>)>,
         alloc::vec::Vec<u32>,
         alloc::vec::Vec<u64>,
     ) {
@@ -10013,10 +10123,47 @@ impl NvidiaGpu {
                 cpu_h.push(h);
                 cpu_p.push(point);
             } else {
-                acquires.extend(mine);
+                acquires.push((h, point, mine));
             }
         }
         (acquires, cpu_h, cpu_p)
+    }
+
+    /// Which of the grouped ACQUIREs from [`partition_exec_waits`] go into
+    /// the ring of `ctx_idx` (prepared by now) next to the `reserved` entries
+    /// the submission itself takes (its pushes and its fence), and which
+    /// waits go to the CPU lists instead. The ring holds `entries - 1`, and a
+    /// wait whose ACQUIREs would not leave room for the rest is waited for
+    /// on the CPU (correct either way: those fences are already queued ahead
+    /// on their channel; the CPU waits for them here instead of the GPU
+    /// there). Before this budget, NVK's batches of up to 256 waits and 64
+    /// pushes asked the ring for more slots than it has, and `fast_submit`
+    /// spun 10 s for room that could never come and latched the channel
+    /// WEDGED.
+    fn fit_acquires_to_ring(
+        &self,
+        ctx_idx: u32,
+        reserved: u32,
+        grouped: alloc::vec::Vec<(u32, u64, alloc::vec::Vec<(u64, u32)>)>,
+        cpu_h: &mut alloc::vec::Vec<u32>,
+        cpu_p: &mut alloc::vec::Vec<u64>,
+    ) -> alloc::vec::Vec<(u64, u32)> {
+        let budget = match self.nouveau_fast.lock().get(ctx_idx as usize) {
+            Some(FastSlot::Ready(f)) => {
+                f.entries.saturating_sub(1).saturating_sub(reserved) as usize
+            }
+            _ => 0,
+        };
+        let mut acquires = alloc::vec::Vec::new();
+        for (h, point, mine) in grouped {
+            if acquires.len() + mine.len() > budget {
+                cpu_h.push(h);
+                cpu_p.push(point);
+            } else {
+                acquires.extend(mine);
+            }
+        }
+        acquires
     }
 
     /// Map a producer's fence semaphore GPU VA into the consumer channel's
@@ -10697,6 +10844,13 @@ impl NvidiaGpu {
                     ctx_idx, owner_pid
                 );
                 Err(nv::ENODEV)
+            }
+            Err(nv::FastSubmitError::TooLarge { needed, entries }) => {
+                crate::klog_warn!(
+                    "[nouveau-uapi] EXEC(direct): ctx{} submission of {} entries cannot fit a {}-entry ring -- EINVAL (not a hang) pid={}",
+                    ctx_idx, needed, entries, owner_pid
+                );
+                Err(nv::EINVAL)
             }
             Err(nv::FastSubmitError::RingFull { put, get, needed }) => {
                 // GPGet froze for a full second: the channel is wedged, the
@@ -12544,17 +12698,21 @@ impl NvidiaGpu {
                 }
                 let req = unsafe { &*(arg as *const nv::DrmNouveauExec) };
                 const MAX_EXEC_PUSH: u32 = 64;
-                const MAX_EXEC_SYNC: u32 = 64;
+                // NVK batches up to 256 waits and 256 signals per EXEC
+                // (`NVKMD_NOUVEAU_MAX_SYNCS`) and flushes at that count;
+                // Linux nouveau has no cap of its own. The old 64 turned a
+                // vkQueueSubmit with 65 semaphores into VK_ERROR_DEVICE_LOST.
+                const MAX_EXEC_SYNC: u32 = 256;
                 if req.wait_count > MAX_EXEC_SYNC || (req.wait_count > 0 && req.wait_ptr == 0) {
                     crate::klog_warn!(
-                        "[nouveau-uapi] EXEC: wait_count={} exceeds the {} this milestone supports (or wait_ptr is null)",
+                        "[nouveau-uapi] EXEC: wait_count={} exceeds the {} an EXEC may carry (or wait_ptr is null)",
                         req.wait_count, MAX_EXEC_SYNC
                     );
                     return Err(nv::EOPNOTSUPP);
                 }
                 if req.sig_count > MAX_EXEC_SYNC || (req.sig_count > 0 && req.sig_ptr == 0) {
                     crate::klog_warn!(
-                        "[nouveau-uapi] EXEC: sig_count={} exceeds the {} this milestone supports (or sig_ptr is null)",
+                        "[nouveau-uapi] EXEC: sig_count={} exceeds the {} an EXEC may carry (or sig_ptr is null)",
                         req.sig_count, MAX_EXEC_SYNC
                     );
                     return Err(nv::EOPNOTSUPP);
@@ -12665,7 +12823,7 @@ impl NvidiaGpu {
                         // CPU-wait the full set (10 s), including same-ctx
                         // pending fences — never premature-signal.
                         let ctx_idx = self.ctx_idx_for_pid(owner_pid);
-                        let (acquires, cpu_h, cpu_p) =
+                        let (grouped, mut cpu_h, mut cpu_p) =
                             self.partition_exec_waits(&handles, &points, ctx_idx);
                         let device_instance = *self.rm_device_instance.lock();
                         let with_fence = req.sig_count > 0 && req.sig_ptr != 0;
@@ -12673,10 +12831,21 @@ impl NvidiaGpu {
                         // empty wait-only EXEC must still CPU-block until the
                         // fences land (ioctl contract).
                         let used_hw = with_fence
-                            && !acquires.is_empty()
+                            && !grouped.is_empty()
                             && device_instance
                                 .map(|d| self.fast_ctx_ready(d, ctx_idx))
                                 .unwrap_or(false);
+                        let acquires = if used_hw {
+                            self.fit_acquires_to_ring(
+                                ctx_idx,
+                                with_fence as u32,
+                                grouped,
+                                &mut cpu_h,
+                                &mut cpu_p,
+                            )
+                        } else {
+                            alloc::vec::Vec::new()
+                        };
                         if used_hw {
                             if !cpu_h.is_empty() {
                                 match crate::scheme::syncobj::wait(
@@ -12944,14 +13113,21 @@ impl NvidiaGpu {
                     let wait_start = unsafe { crate::bus::drivers_timer_now_as_micros() };
                     let deadline_us = wait_start + WAIT_TIMEOUT_US;
                     let wait_ctx = self.ctx_idx_for_pid(owner_pid);
-                    let (acquires, cpu_h, cpu_p) =
+                    let (grouped, mut cpu_h, mut cpu_p) =
                         self.partition_exec_waits(&handles, &points, wait_ctx);
                     // Only emit ACQUIRE when the direct-submit path will run;
                     // otherwise reunite into a full CPU wait.
                     let use_hw =
-                        !acquires.is_empty() && self.fast_ctx_ready(device_instance, wait_ctx);
+                        !grouped.is_empty() && self.fast_ctx_ready(device_instance, wait_ctx);
                     if use_hw {
-                        hw_acquires = acquires;
+                        let with_fence = req.sig_count > 0 && req.sig_ptr != 0;
+                        hw_acquires = self.fit_acquires_to_ring(
+                            wait_ctx,
+                            req.push_count + with_fence as u32,
+                            grouped,
+                            &mut cpu_h,
+                            &mut cpu_p,
+                        );
                     }
                     let (wait_h, wait_p): (Vec<u32>, Vec<u64>) = if use_hw {
                         (cpu_h, cpu_p)
@@ -14771,6 +14947,7 @@ mod nouveau_bookkeeping_tests {
             va,
             size,
             bo_offset: 0,
+            pte_kind: 0,
         });
     }
 
@@ -16060,8 +16237,9 @@ mod nouveau_bookkeeping_tests {
             "the driver's record names the RM's h_virt"
         );
         assert_eq!(gem_info(&gpu, ha, A).unwrap().offset, VA);
-        // REPLACE: a MAP over a live range of the same context unmaps it
-        // first (Linux gpuvm semantics; the RM would refuse the fixed VA).
+        // REPLACE: a MAP over a live range of the same context unmaps the
+        // part it covers first (Linux gpuvm semantics; the RM would refuse
+        // the fixed VA); the part outside the range stays, as a REMAP.
         assert_eq!(
             vm_bind_ops(&gpu, A, &mut [map(ha, VA + 0x8000, 65536)]),
             Ok(0)
@@ -16069,10 +16247,14 @@ mod nouveau_bookkeeping_tests {
         {
             let f = FAKE_RM.lock();
             assert_eq!(f.unmaps, 1, "the old binding was unmapped in the RM");
-            assert_eq!(f.maps_of_ctx(1), [(VA + 0x8000, 65536, 0x06)]);
+            assert_eq!(
+                f.maps_of_ctx(1),
+                [(VA, 0x8000, 0x06), (VA + 0x8000, 65536, 0x06)],
+                "its head was mapped again, then the new one"
+            );
             assert_eq!(f.bad, 0);
         }
-        assert_eq!(driver_maps(&gpu, A).len(), 1);
+        assert_eq!(driver_maps(&gpu, A).len(), 2);
         // A mapping that starts exactly where the new one ends is a
         // neighbour, not an overlap: it stays. The offset into the object
         // reaches the RM and the record.
@@ -16090,7 +16272,11 @@ mod nouveau_bookkeeping_tests {
             assert_eq!(f.unmaps, 2, "only the overlapping one was replaced");
             assert_eq!(
                 f.maps_of_ctx(1),
-                [(VA + 0x18000, 4096, 0x06), (VA + 0x8000, 65536, 0x06)]
+                [
+                    (VA, 0x8000, 0x06),
+                    (VA + 0x18000, 4096, 0x06),
+                    (VA + 0x8000, 65536, 0x06)
+                ]
             );
             assert_eq!(
                 f.maps.iter().find(|m| m.3 == VA + 0x18000).map(|m| m.5),
@@ -16110,7 +16296,7 @@ mod nouveau_bookkeeping_tests {
             vm_bind_ops(&gpu, A, &mut [unmap(VA + 0x18000, 4096)]),
             Ok(0)
         );
-        assert_eq!(driver_maps(&gpu, A).len(), 1);
+        assert_eq!(driver_maps(&gpu, A).len(), 2);
         assert_eq!(FAKE_RM.lock().unmaps, 3);
         // Another process, the same VA: its own context, so no conflict.
         assert_eq!(channel_alloc(&gpu, B).unwrap().channel, 1);
@@ -16123,11 +16309,11 @@ mod nouveau_bookkeeping_tests {
         );
         {
             let f = FAKE_RM.lock();
-            assert_eq!(f.maps.len(), 2);
+            assert_eq!(f.maps.len(), 3, "A's two pieces and B's");
             assert_eq!(f.maps_of_ctx(2), [(VA + 0x8000, 4096, 0x06)]);
             assert_eq!(f.unmaps, 3, "B replaced nothing of A's");
         }
-        assert_eq!(driver_maps(&gpu, A).len(), 1);
+        assert_eq!(driver_maps(&gpu, A).len(), 2);
         // Binding another process's buffer is a GPU read/write of it: only
         // a holder may. PRIME makes A a holder.
         assert_eq!(
@@ -16139,13 +16325,30 @@ mod nouveau_bookkeeping_tests {
             vm_bind_ops(&gpu, A, &mut [map(hb, VA + 0x10_0000, 4096)]),
             Ok(0)
         );
-        assert_eq!(driver_maps(&gpu, A).len(), 2);
-        // UNMAP is by range, scoped to the caller: A's overlapping mapping
-        // goes, B's identical VA stays. An empty range is a success.
+        assert_eq!(driver_maps(&gpu, A).len(), 3);
+        // UNMAP is by range, scoped to the caller: the page of A's mapping
+        // goes (the rest of that mapping stays, offset moved along), B's
+        // identical VA stays. An empty range is a success.
         assert_eq!(vm_bind_ops(&gpu, A, &mut [unmap(VA + 0x8000, 4096)]), Ok(0));
         assert_eq!(
-            driver_maps(&gpu, A).iter().map(|m| m.0).collect::<Vec<_>>(),
-            [hb]
+            driver_maps(&gpu, A)
+                .iter()
+                .map(|m| (m.0, m.1, m.2))
+                .collect::<Vec<_>>(),
+            [
+                (ha, VA, 0x8000),
+                (hb, VA + 0x10_0000, 4096),
+                (ha, VA + 0x9000, 65536 - 4096)
+            ]
+        );
+        assert_eq!(
+            gpu.nouveau_vm_mappings
+                .lock()
+                .iter()
+                .find(|m| m.va == VA + 0x9000)
+                .map(|m| m.bo_offset),
+            Some(0x1000),
+            "the tail starts a page into the object"
         );
         assert_eq!(
             FAKE_RM.lock().maps_of_ctx(2).len(),
@@ -16158,6 +16361,13 @@ mod nouveau_bookkeeping_tests {
             "nothing there: fine"
         );
         assert_eq!(FAKE_RM.lock().unmaps, 4);
+        // Both of A's own pieces, whole, in one range.
+        assert_eq!(vm_bind_ops(&gpu, A, &mut [unmap(VA, 0x20000)]), Ok(0));
+        assert_eq!(
+            driver_maps(&gpu, A).iter().map(|m| m.0).collect::<Vec<_>>(),
+            [hb]
+        );
+        assert_eq!(FAKE_RM.lock().unmaps, 6);
         // MAP with handle 0 is Mesa's "unbind, keep the reservation", and
         // it is scoped like UNMAP: B's mapping at the same VA is not A's.
         assert_eq!(
@@ -16239,6 +16449,156 @@ mod nouveau_bookkeeping_tests {
         assert_eq!(gem_info(&gpu, ha, A).unwrap().offset, VA);
         gpu.nouveau_release_process(A);
         gpu.nouveau_release_process(B);
+        assert_eq!(FAKE_RM.lock().bad, 0);
+    }
+
+    /// Linux's gpuvm answers an UNMAP over part of a mapping, or a MAP over
+    /// part of one, with REMAP ops: the head and the tail of the old mapping
+    /// stay, same object and kind, offsets moved along
+    /// (`drm_gpuvm_sm_unmap_ops_create` / `..._map_ops_create`,
+    /// `nouveau_uvmm.c` `op_remap`). NVK's bind context merges adjacent
+    /// `vkQueueBindSparse` binds into one mapping, so unbinding or rebinding
+    /// one page of a sparse-binding buffer later cuts through a larger one.
+    /// Before, any overlap took the whole old mapping, and the next draw
+    /// that touched the rest of it faulted.
+    #[test]
+    fn a_partial_unmap_or_map_over_keeps_the_parts_outside_the_range_like_a_remap() {
+        let _g = LOCK.lock();
+        let _live = LiveBytes::hold();
+        let gpu = gpu_rm();
+        const VA: u64 = 0x3f_f000_0000;
+        assert_eq!(channel_alloc(&gpu, A).unwrap().channel, 0);
+        let h = gem_new_rm(&gpu, 65536, nv::NOUVEAU_GEM_DOMAIN_GART, A)
+            .unwrap()
+            .handle;
+        let h2 = gem_new_rm(&gpu, 65536, nv::NOUVEAU_GEM_DOMAIN_GART, A)
+            .unwrap()
+            .handle;
+        // (handle, va, size, bo_offset, kind) as the driver records it.
+        let parts = || -> Vec<(u32, u64, u64, u64, u32)> {
+            gpu.nouveau_vm_mappings
+                .lock()
+                .iter()
+                .filter(|m| m.owner_pid == A)
+                .map(|m| (m.gem_handle, m.va, m.size, m.bo_offset, m.pte_kind))
+                .collect()
+        };
+        // (va, size, bo_offset, kind) as the RM has it.
+        let rm_parts = || -> Vec<(u64, u64, u64, u32)> {
+            FAKE_RM
+                .lock()
+                .maps
+                .iter()
+                .filter(|m| m.1 == 1)
+                .map(|m| (m.3, m.4, m.5, m.6))
+                .collect()
+        };
+        // Fifteen pages of `h`, a page into the object, kind 0x06.
+        assert_eq!(
+            vm_bind_ops(&gpu, A, &mut [map_at(h, VA, 0xF000, 0x1000)]),
+            Ok(0)
+        );
+        assert_eq!(parts(), [(h, VA, 0xF000, 0x1000, 0x06)]);
+        // The middle page goes: head and tail stay, the tail's offset moved
+        // along by the pages before it.
+        assert_eq!(
+            vm_bind_ops(&gpu, A, &mut [unmap(VA + 0x4000, 0x1000)]),
+            Ok(0)
+        );
+        assert_eq!(
+            parts(),
+            [
+                (h, VA, 0x4000, 0x1000, 0x06),
+                (h, VA + 0x5000, 0xA000, 0x6000, 0x06)
+            ]
+        );
+        assert_eq!(
+            rm_parts(),
+            [
+                (VA, 0x4000, 0x1000, 0x06),
+                (VA + 0x5000, 0xA000, 0x6000, 0x06)
+            ],
+            "the RM was asked for exactly those two, the whole old one gone"
+        );
+        assert_eq!(FAKE_RM.lock().unmaps, 1);
+        // The head of the first piece: only its tail stays.
+        assert_eq!(vm_bind_ops(&gpu, A, &mut [unmap(VA, 0x2000)]), Ok(0));
+        assert_eq!(
+            parts(),
+            [
+                (h, VA + 0x5000, 0xA000, 0x6000, 0x06),
+                (h, VA + 0x2000, 0x2000, 0x3000, 0x06)
+            ]
+        );
+        // The tail of the second piece, with a range running past its end.
+        assert_eq!(
+            vm_bind_ops(&gpu, A, &mut [unmap(VA + 0xC000, 0x4000)]),
+            Ok(0)
+        );
+        assert_eq!(
+            parts(),
+            [
+                (h, VA + 0x2000, 0x2000, 0x3000, 0x06),
+                (h, VA + 0x5000, 0x7000, 0x6000, 0x06)
+            ]
+        );
+        assert_eq!(FAKE_RM.lock().unmaps, 3);
+        // A MAP of another object over the middle of a piece: head, tail,
+        // then the new mapping.
+        assert_eq!(
+            vm_bind_ops(&gpu, A, &mut [map(h2, VA + 0x7000, 0x2000)]),
+            Ok(0)
+        );
+        assert_eq!(
+            parts(),
+            [
+                (h, VA + 0x2000, 0x2000, 0x3000, 0x06),
+                (h, VA + 0x5000, 0x2000, 0x6000, 0x06),
+                (h, VA + 0x9000, 0x3000, 0xA000, 0x06),
+                (h2, VA + 0x7000, 0x2000, 0, 0x06)
+            ]
+        );
+        assert_eq!(parts().len(), rm_parts().len());
+        assert_eq!(FAKE_RM.lock().unmaps, 4);
+        // One range cutting through two pieces at once: each keeps what
+        // lies outside it.
+        assert_eq!(
+            vm_bind_ops(&gpu, A, &mut [unmap(VA + 0x3000, 0x3000)]),
+            Ok(0)
+        );
+        assert_eq!(
+            parts(),
+            [
+                (h, VA + 0x9000, 0x3000, 0xA000, 0x06),
+                (h2, VA + 0x7000, 0x2000, 0, 0x06),
+                (h, VA + 0x2000, 0x1000, 0x3000, 0x06),
+                (h, VA + 0x6000, 0x1000, 0x7000, 0x06)
+            ]
+        );
+        assert_eq!(FAKE_RM.lock().unmaps, 6);
+        assert_eq!(rm_parts().len(), 4);
+        // The RM refusing to map a kept part again: the op still succeeds
+        // (Linux cannot fail a remap either), the part is reported lost and
+        // nothing pretends it is mapped.
+        FAKE_RM.lock().refuse_map = true;
+        assert_eq!(
+            vm_bind_ops(&gpu, A, &mut [unmap(VA + 0xA000, 0x1000)]),
+            Ok(0)
+        );
+        FAKE_RM.lock().refuse_map = false;
+        assert_eq!(
+            parts(),
+            [
+                (h2, VA + 0x7000, 0x2000, 0, 0x06),
+                (h, VA + 0x2000, 0x1000, 0x3000, 0x06),
+                (h, VA + 0x6000, 0x1000, 0x7000, 0x06)
+            ]
+        );
+        assert_eq!(rm_parts().len(), 3);
+        assert_eq!(FAKE_RM.lock().unmaps, 7);
+        assert_eq!(FAKE_RM.lock().bad, 0);
+        gpu.nouveau_release_process(A);
+        assert_eq!(FAKE_RM.lock().maps_of_ctx(1), []);
         assert_eq!(FAKE_RM.lock().bad, 0);
     }
 
@@ -16608,20 +16968,20 @@ mod nouveau_bookkeeping_tests {
         r.push_ptr = p.as_ptr() as u64;
         r.wait_count = 1;
         assert_eq!(exec_raw(&gpu, A, &mut r), Err(nv::EOPNOTSUPP), "null waits");
-        // Sixty-five real, satisfied syncs: a cap that let them through
-        // would submit, not crash.
+        // One more than NVK's batch (256) of real, satisfied syncs: a cap
+        // that let them through would submit, not crash.
         let ready = syncobj::create(true);
-        let many_syncs: Vec<_> = (0..65).map(|_| sync(ready)).collect();
-        r.wait_count = 65;
+        let many_syncs: Vec<_> = (0..257).map(|_| sync(ready)).collect();
+        r.wait_count = 257;
         r.wait_ptr = many_syncs.as_ptr() as u64;
-        assert_eq!(exec_raw(&gpu, A, &mut r), Err(nv::EOPNOTSUPP), "65 waits");
+        assert_eq!(exec_raw(&gpu, A, &mut r), Err(nv::EOPNOTSUPP), "257 waits");
         r.wait_count = 0;
         r.wait_ptr = 0;
         r.sig_count = 1;
         assert_eq!(exec_raw(&gpu, A, &mut r), Err(nv::EOPNOTSUPP), "null sigs");
-        r.sig_count = 65;
+        r.sig_count = 257;
         r.sig_ptr = many_syncs.as_ptr() as u64;
-        assert_eq!(exec_raw(&gpu, A, &mut r), Err(nv::EOPNOTSUPP), "65 sigs");
+        assert_eq!(exec_raw(&gpu, A, &mut r), Err(nv::EOPNOTSUPP), "257 sigs");
         assert!(syncobj::destroy(ready));
         r.sig_count = 0;
         r.push_ptr = 0xffff_ffff_ffff_0000;
@@ -17062,6 +17422,25 @@ mod nouveau_bookkeeping_tests {
     }
 
     /// The PBDMA of context `ctx`: fetch every entry from GPGet up to GPPut.
+    /// A clock that advances on every read, restored to a standing one when
+    /// dropped, unwinding included: test threads are pooled, so an
+    /// auto-advance a failed test left behind would run the next tests on
+    /// that thread against a clock that never stands still.
+    struct AutoAdvance;
+
+    impl AutoAdvance {
+        fn of(us_per_read: u64) -> Self {
+            test_clock::set_auto_advance(us_per_read);
+            Self
+        }
+    }
+
+    impl Drop for AutoAdvance {
+        fn drop(&mut self) {
+            test_clock::set_auto_advance(0);
+        }
+    }
+
     fn run_gpu(ctx: u32) -> Vec<Fetched> {
         run_gpu_frames(ctx, u32::MAX)
     }
@@ -17586,6 +17965,139 @@ mod nouveau_bookkeeping_tests {
         assert!(syncobj::destroy(out));
         gpu.nouveau_release_process(A);
         gpu.nouveau_release_process(B);
+        assert_eq!(FAKE_RM.lock().bad, 0);
+    }
+
+    /// NVK batches up to 256 waits and 256 signals per EXEC and 64 pushes
+    /// (`GETPARAM_EXEC_PUSH_MAX`), and every same-channel wait is a GPFIFO
+    /// ACQUIRE entry here, next to the pushes and the fence. The ring has
+    /// 128 entries with one kept free, so a batch of 64 pushes with 63 or
+    /// more such waits asked for room the ring never has: `fast_submit`
+    /// spun 10 s, latched the channel WEDGED and every EXEC after it was
+    /// EIO (VK_ERROR_DEVICE_LOST) until the process died. Linux has no such
+    /// ceiling: its waits are scheduler dependencies, not ring entries.
+    #[test]
+    fn an_exec_with_more_acquires_than_the_ring_holds_waits_for_the_rest_on_the_cpu_and_is_not_a_hang(
+    ) {
+        let _g = LOCK.lock();
+        let _live = LiveBytes::hold();
+        let gpu = gpu_rm_fast();
+        let ch = client_with_pushbuf(&gpu, A);
+        // One submit signals 100 semaphores with its one fence (65 or more
+        // was EOPNOTSUPP before): 100 waits on them are 100 ACQUIREs.
+        let sems: Vec<u32> = (0..100).map(|_| syncobj::create(false)).collect();
+        let sigs: Vec<_> = sems.iter().map(|&s| sync(s)).collect();
+        assert_eq!(
+            exec(&gpu, A, ch, &[push(PUSH_VA, 16)], &[], &sigs),
+            Ok(0),
+            "100 signals in one EXEC"
+        );
+        let c = chan(1);
+        assert_eq!(userd(&c), (0, 2));
+        assert!(sems.iter().all(|&s| syncobj::query(s) == Some(0)));
+        // 100 waits + 64 pushes + the fence would be 165 entries.
+        let waits: Vec<_> = sems.iter().map(|&s| sync(s)).collect();
+        let pushes: Vec<_> = (0..64)
+            .map(|i| push(PUSH_VA + 0x100 + i * 16, 16))
+            .collect();
+        let out = syncobj::create(false);
+        let now = test_clock::now();
+        let tick = AutoAdvance::of(1);
+        let fetched = std::thread::scope(|s| {
+            // The GPU runs on its own: it lands the first fence, which
+            // satisfies the waits that did not fit as ACQUIREs, and drains
+            // the ring for the submission itself.
+            let t = s.spawn(move || {
+                test_clock::set(now);
+                let mut got = Vec::new();
+                let start = std::time::Instant::now();
+                while got.len() < 2 + 127 && start.elapsed() < Duration::from_secs(30) {
+                    std::thread::sleep(Duration::from_millis(5));
+                    got.extend(run_gpu(1));
+                }
+                got
+            });
+            assert_eq!(
+                exec(&gpu, A, ch, &pushes, &waits, &[sync(out)]),
+                Ok(0),
+                "62 ACQUIREs in the ring, 38 waits on the CPU"
+            );
+            t.join().unwrap()
+        });
+        drop(tick);
+        assert!(!nv::ctx_is_wedged(1));
+        assert_eq!(fetched.len(), 2 + 127);
+        let acquires = fetched
+            .iter()
+            .filter(|f| matches!(f, Fetched::Acquire { payload: 1, .. }))
+            .count();
+        assert_eq!(
+            acquires,
+            127 - 64 - 1,
+            "as many ACQUIREs as the ring holds next to 64 pushes and the fence"
+        );
+        assert_eq!(
+            fetched
+                .iter()
+                .filter(|f| matches!(f, Fetched::Push { .. }))
+                .count(),
+            65
+        );
+        assert_eq!(
+            fetched
+                .iter()
+                .filter(|f| matches!(f, Fetched::Release { .. }))
+                .count(),
+            2
+        );
+        assert!(
+            matches!(fetched[2], Fetched::Acquire { .. }),
+            "ACQUIREs first"
+        );
+        assert!(
+            matches!(fetched[128], Fetched::Release { .. }),
+            "the fence last"
+        );
+        assert_eq!(syncobj::query(out), Some(1));
+        assert!(sems.iter().all(|&s| syncobj::query(s) == Some(1)));
+        assert_eq!(userd(&c), (1, 1), "129 entries: wrapped once");
+        // Not wedged: the channel goes on.
+        assert_eq!(exec(&gpu, A, ch, &[push(PUSH_VA, 16)], &[], &[]), Ok(0));
+        // A submission larger than the ring on its own is refused at once,
+        // not after 10 s, and does not wedge the channel either.
+        let big: Vec<_> = (0..128).map(|i| push(PUSH_VA + i * 16, 16)).collect();
+        // (1 ms per clock read: a submit that still spun would give up
+        // after its 10 s instead of hanging the test.)
+        let tick = AutoAdvance::of(1000);
+        assert!(matches!(
+            gpu.fast_submit(1, &big, false, &[]),
+            Err(nv::FastSubmitError::TooLarge {
+                needed: 128,
+                entries: 128
+            })
+        ));
+        assert!(!nv::ctx_is_wedged(1));
+        // Through EXEC's direct path the answer is EINVAL, and still no
+        // WEDGED latch: the next submission is welcome.
+        let r = nv::DrmNouveauExec {
+            channel: ch,
+            push_count: big.len() as u32,
+            wait_count: 0,
+            sig_count: 0,
+            wait_ptr: 0,
+            sig_ptr: 0,
+            push_ptr: big.as_ptr() as u64,
+        };
+        assert_eq!(gpu.exec_fast(1, A, &r, &big, &[]), Err(nv::EINVAL));
+        drop(tick);
+        assert!(!nv::ctx_is_wedged(1));
+        assert_eq!(userd(&c), (1, 2), "nothing was written over the ring");
+        assert_eq!(run_gpu(1).len(), 1);
+        for s in sems {
+            assert!(syncobj::destroy(s));
+        }
+        assert!(syncobj::destroy(out));
+        gpu.nouveau_release_process(A);
         assert_eq!(FAKE_RM.lock().bad, 0);
     }
 

@@ -17,6 +17,7 @@ use rcore_fs::vfs::*;
 use zircon_object::vm::VmObject;
 
 use super::drm;
+use crate::error::LxError;
 use zcore_drivers::display::edid;
 
 /// Parks until the DRM card fd has a queued event. Flat `Future` (no nested
@@ -2567,10 +2568,16 @@ pub mod nr {
     pub const WAIT_VBLANK: (u32, usize) = (0x3A, 24);
     /// `struct drm_mode_atomic` (56 B, frozen).
     pub const MODE_ATOMIC: (u32, usize) = (0xBC, 56);
-    /// `struct drm_prime_handle` (12 B, frozen).
-    pub const PRIME_FD_TO_HANDLE: (u32, usize) = (0x2D, 12);
-    /// `struct drm_prime_handle` (12 B, frozen).
-    pub const PRIME_HANDLE_TO_FD: (u32, usize) = (0x2E, 12);
+    /// `DRM_IOCTL_PRIME_HANDLE_TO_FD` (export), `struct drm_prime_handle`
+    /// (12 B, frozen). `drm.h`: `DRM_IOWR(0x2d, struct drm_prime_handle)`.
+    /// These two were filed the other way round for a long time, which is
+    /// why the export/import arm in `linux-syscall` stopped trusting the
+    /// number and read the operation off the struct instead -- see
+    /// [`super::prime_request`].
+    pub const PRIME_HANDLE_TO_FD: (u32, usize) = (0x2D, 12);
+    /// `DRM_IOCTL_PRIME_FD_TO_HANDLE` (import), `struct drm_prime_handle`
+    /// (12 B, frozen). `drm.h`: `DRM_IOWR(0x2e, struct drm_prime_handle)`.
+    pub const PRIME_FD_TO_HANDLE: (u32, usize) = (0x2E, 12);
     /// `struct drm_mode_create_lease` (24 B).
     pub const MODE_CREATE_LEASE: (u32, usize) = (0xC6, 24);
     /// `struct drm_syncobj_eventfd` (24 B).
@@ -2579,6 +2586,76 @@ pub mod nr {
     pub const MODE_SETCRTC: (u32, usize) = (0xA2, 104);
     /// `struct drm_mode_crtc_page_flip` (24 B, frozen).
     pub const MODE_PAGE_FLIP: (u32, usize) = (0xB0, 24);
+}
+
+/// `struct drm_prime_handle`, the argument of both PRIME ioctls:
+/// `{ __u32 handle; __u32 flags; __s32 fd; }`. On an export `handle` and
+/// `flags` are read and `fd` is written; on an import `fd` is read and
+/// `handle` is written. The field the ioctl does not read is whatever the
+/// caller left there.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DrmPrimeHandle {
+    pub handle: u32,
+    pub flags: u32,
+    pub fd: i32,
+}
+
+/// `DRM_CLOEXEC`, the one flag an export may carry besides [`DRM_RDWR`].
+pub const DRM_CLOEXEC: u32 = 0o2000000;
+/// `DRM_RDWR`: the dma-buf fd is to be opened read-write.
+pub const DRM_RDWR: u32 = 0o2;
+
+/// What a PRIME ioctl asks for, decided the way `drm_ioctl` decides it: by
+/// the ioctl NUMBER. `PRIME_HANDLE_TO_FD` is an export of `handle`, whatever
+/// the caller left in `fd`; `PRIME_FD_TO_HANDLE` is an import of `fd`,
+/// whatever it left in `handle`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PrimeRequest {
+    /// `PRIME_HANDLE_TO_FD`: wrap GEM `handle` in a new dma-buf fd.
+    Export { handle: u32, flags: u32 },
+    /// `PRIME_FD_TO_HANDLE`: the dma-buf behind `fd`, as a GEM handle.
+    Import { fd: i32 },
+}
+
+/// Reads a PRIME request the way Linux does. `cmd` picks the operation (the
+/// caller has already matched it against [`nr::PRIME_HANDLE_TO_FD`] and
+/// [`nr::PRIME_FD_TO_HANDLE`], so anything else is `ENOTTY`), then each
+/// operation checks only the fields it reads: an export refuses a flag
+/// other than `DRM_CLOEXEC | DRM_RDWR` with `EINVAL`
+/// (`drm_prime_handle_to_fd_ioctl`), an import of a negative fd is `EBADF`
+/// (`dma_buf_get`).
+///
+/// The operation used to be read off the STRUCT instead: `fd < 0` meant an
+/// export, because libdrm's `drmPrimeHandleToFD` presets the output field to
+/// -1. That was a workaround for the two NRs being filed the wrong way
+/// round in [`nr`], and it broke every exporter that does not preset the
+/// field -- a `drm_prime_handle` zeroed by the caller (`fd = 0`) was taken
+/// for an import of fd 0, so the export answered `EINVAL` (stdin is not a
+/// dma-buf), or imported whatever dma-buf the client happened to hold at
+/// fd 0. Linux never looks at `fd` on an export: it is an output.
+pub fn prime_request(
+    cmd: u32,
+    args: DrmPrimeHandle,
+) -> core::result::Result<PrimeRequest, LxError> {
+    let (export, export_min) = nr::PRIME_HANDLE_TO_FD;
+    let (import, import_min) = nr::PRIME_FD_TO_HANDLE;
+    if is_drm_ioctl_nr(cmd, export, export_min) {
+        if args.flags & !(DRM_CLOEXEC | DRM_RDWR) != 0 {
+            return Err(LxError::EINVAL);
+        }
+        Ok(PrimeRequest::Export {
+            handle: args.handle,
+            flags: args.flags,
+        })
+    } else if is_drm_ioctl_nr(cmd, import, import_min) {
+        if args.fd < 0 {
+            return Err(LxError::EBADF);
+        }
+        Ok(PrimeRequest::Import { fd: args.fd })
+    } else {
+        Err(LxError::ENOTTY)
+    }
 }
 
 /// How long a pre-present fence wait may hold the frame.
@@ -5437,11 +5514,109 @@ mod ioctl_size_reconciliation_tests {
     #[test]
     fn nr_matching_keeps_a_size_floor() {
         let (n, min) = nr::PRIME_HANDLE_TO_FD;
-        assert!(is_drm_ioctl_nr(0xC00C_642E, n, min), "the frozen encoding");
-        assert!(is_drm_ioctl_nr(0xC018_642E, n, min), "a grown one");
-        assert!(!is_drm_ioctl_nr(0xC008_642E, n, min), "a short one");
-        assert!(!is_drm_ioctl_nr(0xC00C_652E, n, min), "not a DRM type byte");
-        assert!(!is_drm_ioctl_nr(0xC00C_642D, n, min), "a different NR");
+        assert!(is_drm_ioctl_nr(0xC00C_642D, n, min), "the frozen encoding");
+        assert!(is_drm_ioctl_nr(0xC018_642D, n, min), "a grown one");
+        assert!(!is_drm_ioctl_nr(0xC008_642D, n, min), "a short one");
+        assert!(!is_drm_ioctl_nr(0xC00C_652D, n, min), "not a DRM type byte");
+        assert!(!is_drm_ioctl_nr(0xC00C_642E, n, min), "a different NR");
+    }
+
+    /// The two PRIME numbers as `drm.h` files them: 0x2d exports, 0x2e
+    /// imports. They spent a long time the other way round here, and the
+    /// export/import arm compensated by reading the operation off the
+    /// struct (`fd < 0`); with the numbers right, the number decides.
+    #[test]
+    fn prime_handle_to_fd_is_0x2d_and_fd_to_handle_is_0x2e() {
+        assert_eq!(
+            nr::PRIME_HANDLE_TO_FD,
+            (0x2D, 12),
+            "DRM_IOWR(0x2d, drm_prime_handle)"
+        );
+        assert_eq!(
+            nr::PRIME_FD_TO_HANDLE,
+            (0x2E, 12),
+            "DRM_IOWR(0x2e, drm_prime_handle)"
+        );
+    }
+
+    /// An export is an export because of the ioctl number, whatever the
+    /// caller left in the OUTPUT field `fd`: libdrm presets it to -1, a
+    /// caller that zeroes the struct leaves 0, and both are exporting. Read
+    /// off the struct, the zeroed one became "import stdin".
+    #[test]
+    fn a_prime_export_is_told_by_its_number_not_by_what_the_fd_field_holds() {
+        const HANDLE_TO_FD: u32 = 0xC00C_642D;
+        const FD_TO_HANDLE: u32 = 0xC00C_642E;
+        let libdrm = DrmPrimeHandle {
+            handle: 7,
+            flags: DRM_CLOEXEC | DRM_RDWR,
+            fd: -1,
+        };
+        let zeroed = DrmPrimeHandle {
+            handle: 7,
+            flags: DRM_CLOEXEC,
+            fd: 0,
+        };
+        for args in [libdrm, zeroed] {
+            assert_eq!(
+                prime_request(HANDLE_TO_FD, args),
+                Ok(PrimeRequest::Export {
+                    handle: 7,
+                    flags: args.flags
+                }),
+                "fd={} is not read on an export",
+                args.fd
+            );
+        }
+        // A grown struct (a newer drm.h) keeps the number.
+        assert_eq!(
+            prime_request(0xC018_642D, zeroed),
+            Ok(PrimeRequest::Export {
+                handle: 7,
+                flags: DRM_CLOEXEC
+            })
+        );
+        // The import reads `fd` and nothing else: the `handle` field is its
+        // output, whatever it holds.
+        let import = DrmPrimeHandle {
+            handle: 0xDEAD,
+            flags: 0,
+            fd: 5,
+        };
+        assert_eq!(
+            prime_request(FD_TO_HANDLE, import),
+            Ok(PrimeRequest::Import { fd: 5 })
+        );
+        // Linux's own checks on the fields each one reads.
+        assert_eq!(
+            prime_request(
+                HANDLE_TO_FD,
+                DrmPrimeHandle {
+                    handle: 7,
+                    flags: 0x4,
+                    fd: -1
+                }
+            ),
+            Err(LxError::EINVAL),
+            "a flag other than DRM_CLOEXEC | DRM_RDWR"
+        );
+        assert_eq!(
+            prime_request(
+                FD_TO_HANDLE,
+                DrmPrimeHandle {
+                    handle: 0,
+                    flags: 0,
+                    fd: -1
+                }
+            ),
+            Err(LxError::EBADF),
+            "dma_buf_get(-1)"
+        );
+        assert_eq!(
+            prime_request(0xC00C_642F, import),
+            Err(LxError::ENOTTY),
+            "not a PRIME number"
+        );
     }
 }
 
@@ -7217,6 +7392,84 @@ mod kms_scanout_tests {
             "the source report has to fire anyway -- that is the whole point of \
              it -- and inside the budget, so it really wrote its line; got {}",
             zero_reads
+        );
+    }
+
+    /// "Not one sampled pixel is black" is worth saying once. On Moebius's boot
+    /// it got said eight times and the budget was gone 27.2 s in, before the menu
+    /// whose black rectangle the flag exists to explain had been opened at all.
+    #[test]
+    fn a_source_with_no_black_is_described_once_and_then_stops() {
+        let _screen = kms_emu::attach(64, 64);
+        drm::set_present_probe_enabled(true);
+        let c = Client::open(0);
+        let buf = c.create_dumb(64, 64);
+        // Not one zero pixel anywhere: `tag` is seeded from a non-zero base, so
+        // every pixel is opaque and distinct.
+        paint(&buf, |x, y| tag(0x0055_0000, x, y));
+        let fb = c.addfb2(&buf);
+
+        for i in 0..4 {
+            c.page_flip(drm::SYNTH_CRTC_ID, fb, 0x4400 + i)
+                .expect("flip");
+        }
+
+        assert_eq!(
+            drm::zero_reports_for_test(),
+            4,
+            "every present still reads the source -- the budget cuts the lines, \
+             not the reads"
+        );
+        assert_eq!(
+            drm::clean_source_lines_for_test(),
+            drm::clean_source_report_budget_for_test(),
+            "four black-free frames say the same sentence, so only the baseline \
+             line gets written"
+        );
+    }
+
+    /// And the point of the split: the cheap answer cannot eat the budget the
+    /// deciding frames need. This is Moebius's boot in miniature -- a long
+    /// black-free run first, and THEN the frame that carries black.
+    #[test]
+    fn a_frame_that_carries_black_is_still_reported_after_a_long_black_free_run() {
+        let _screen = kms_emu::attach(64, 64);
+        drm::set_present_probe_enabled(true);
+        let c = Client::open(0);
+
+        let clean = c.create_dumb(64, 64);
+        paint(&clean, |x, y| tag(0x0055_0000, x, y));
+        let clean_fb = c.addfb2(&clean);
+        // More than the whole shared budget, which is what makes this test bite:
+        // with one budget between the two answers these presents spend it and the
+        // frame below gets no line.
+        let run = drm::probe_report_budget_for_test() + 2;
+        for i in 0..run {
+            c.page_flip(drm::SYNTH_CRTC_ID, clean_fb, 0x5500 + u64::from(i))
+                .expect("flip");
+        }
+        assert_eq!(
+            drm::black_source_lines_for_test(),
+            0,
+            "no frame carried black yet, so that budget is untouched"
+        );
+
+        // Now the frame that decides: a black region the compositor handed over.
+        let black = c.create_dumb(64, 64);
+        paint(
+            &black,
+            |x, y| if x < 32 { tag(0x0066_0000, x, y) } else { 0 },
+        );
+        let black_fb = c.addfb2(&black);
+        c.page_flip(drm::SYNTH_CRTC_ID, black_fb, 0x6666)
+            .expect("flip");
+
+        assert_eq!(
+            drm::black_source_lines_for_test(),
+            1,
+            "the frame that carries black has to get its line even after a long \
+             black-free run -- that run is exactly what spent the shared budget \
+             on Moebius's boot"
         );
     }
 

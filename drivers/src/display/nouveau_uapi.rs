@@ -1119,6 +1119,10 @@ pub(super) struct NouveauVmMapping {
     /// the VM_BIND op) -- needed to translate a GPU VA inside this mapping
     /// back to a CPU-readable physical address (gem phys + bo_offset + delta).
     pub bo_offset: u64,
+    /// The PTE kind the RM programmed (`rm_pte_kind`): a split of this
+    /// mapping (a partial UNMAP or MAP over it) maps the kept parts again
+    /// with the same kind.
+    pub pte_kind: u32,
 }
 
 // ===================== NVIF (`DRM_NOUVEAU_NVIF`, nr 0x47) =====================
@@ -1446,6 +1450,10 @@ pub(super) enum FastSubmitError {
     /// frozen -- the channel is wedged (same signal the RM path reported as
     /// `NV_ERR_BUSY_RETRY`).
     RingFull { put: u32, get: u32, needed: u32 },
+    /// `needed` entries can never fit a ring of `entries` slots (one is
+    /// always kept free), however long GPGet is given: a request to split,
+    /// not a wedged channel.
+    TooLarge { needed: u32, entries: u32 },
 }
 
 /// The GPFIFO ring's accounting: how the submit path turns the raw `GPPut` and
