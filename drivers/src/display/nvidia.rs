@@ -130,6 +130,9 @@ struct ZombieCtx {
 struct RingProbe {
     ctx_idx: u32,
     fence_va: usize,
+    /// The same semaphore in the ring's own GPU VA space (0 = unknown), so
+    /// a syncobj attached to the probe can be a GPU ACQUIRE for a consumer.
+    fence_gpu_va: u64,
     payload: u32,
     entries_put: u64,
 }
@@ -10066,7 +10069,7 @@ impl NvidiaGpu {
         if !queued {
             return None;
         }
-        let (fence_va, _fence_gpu_va, payload) = match self.fast_submit(ctx_idx, &[], true, &[]) {
+        let (fence_va, fence_gpu_va, payload) = match self.fast_submit(ctx_idx, &[], true, &[]) {
             Ok(Some(fence)) => fence,
             Ok(None) => return None,
             Err(_) => {
@@ -10090,6 +10093,7 @@ impl NvidiaGpu {
         Some(RingProbe {
             ctx_idx,
             fence_va,
+            fence_gpu_va,
             payload,
             entries_put,
         })
@@ -13024,11 +13028,41 @@ impl NvidiaGpu {
                                 req.sig_count as usize,
                             )
                         };
+                        // The sigs of an empty EXEC mean "everything this
+                        // channel had queued has run": Linux puts the empty
+                        // job on the channel's scheduler queue behind the
+                        // earlier ones and still emits a fence for it
+                        // (`nouveau_exec_job_run` with `push.count == 0`),
+                        // and the sigs take that fence. Signaling them from
+                        // the CPU here signaled them at once, ahead of the
+                        // pushes the ring was still fetching -- and this
+                        // EXEC is vkQueueWaitIdle / vkDeviceWaitIdle (NVK's
+                        // `nvkmd_nouveau_exec_ctx_sync`: no push, one sig,
+                        // then a WAIT on it) and every vkQueueSubmit with no
+                        // command buffer and a fence, so the application
+                        // re-recorded command buffers the GPU was still
+                        // reading. A probe fence appended behind the queued
+                        // work carries the sigs (`ring_idle_probe`, what
+                        // CPU_PREP waits on); an idle ring, or none, has
+                        // nothing to wait for and the CPU's word stands.
+                        let ring = self.ring_idle_probe(owner_pid);
                         for sig in sigs {
                             let timeline =
                                 sig.flags & nv::SYNC_TYPE_MASK == nv::SYNC_TIMELINE_SYNCOBJ;
                             let target = if timeline { sig.timeline_value } else { 1 };
-                            if !crate::scheme::syncobj::timeline_signal(sig.handle, target) {
+                            let ok = match &ring {
+                                Some(p) => crate::scheme::syncobj::attach_hw_fence(
+                                    sig.handle,
+                                    target,
+                                    p.fence_va,
+                                    p.fence_gpu_va,
+                                    p.payload,
+                                    p.ctx_idx,
+                                    !timeline,
+                                ),
+                                None => crate::scheme::syncobj::timeline_signal(sig.handle, target),
+                            };
+                            if !ok {
                                 return Err(nv::ENOENT);
                             }
                         }
@@ -17305,6 +17339,93 @@ mod nouveau_bookkeeping_tests {
         assert_eq!(exec(&gpu, A, ch, &[], &[], &[sync_tl(out, 2)]), Ok(0));
         assert_eq!(syncobj::query(out), Some(2));
         for h in [a, b, out] {
+            assert!(syncobj::destroy(h));
+        }
+        gpu.nouveau_release_process(A);
+    }
+
+    /// `vkQueueWaitIdle` / `vkDeviceWaitIdle` is an EXEC with no push and
+    /// one sig, then a WAIT on it (NVK's `nvkmd_nouveau_exec_ctx_sync`), and
+    /// a `vkQueueSubmit` with no command buffer and a fence is the same
+    /// shape. Linux queues the empty job behind the channel's earlier jobs
+    /// and gives its sigs the job's fence (`nouveau_exec_job_run` emits one
+    /// even for `push.count == 0`), so they signal once everything queued
+    /// before has run. Signaled from the CPU, they went off while the ring
+    /// was still fetching the pushes of the submit before: WaitIdle returned
+    /// early, and the application re-recorded command buffers the GPU was
+    /// still reading. The sigs now ride a probe fence appended behind the
+    /// queued work; an idle ring has nothing to wait for.
+    #[test]
+    fn an_empty_exec_signals_behind_the_work_the_ring_still_has_queued() {
+        let _g = LOCK.lock();
+        let _live = LiveBytes::hold();
+        let gpu = gpu_rm_fast();
+        let ch = client_with_pushbuf(&gpu, A);
+        let out = syncobj::create(false);
+        let tl = syncobj::create(false);
+        // Work queued, not run, and with no fence of its own.
+        assert_eq!(exec(&gpu, A, ch, &[push(PUSH_VA, 16)], &[], &[]), Ok(0));
+        assert_eq!(
+            exec(&gpu, A, ch, &[], &[], &[sync(out), sync_tl(tl, 4)]),
+            Ok(0)
+        );
+        assert_eq!(
+            syncobj::query(out),
+            Some(0),
+            "the ring has not run the push yet: WaitIdle must not return"
+        );
+        assert_eq!(syncobj::query(tl), Some(0));
+        assert_eq!(
+            syncobj::query_submitted(tl),
+            Some(4),
+            "submitted, on a fence of its own"
+        );
+        let fences = syncobj::pending_hw_fences(out, 1);
+        assert_eq!(fences.len(), 1, "one fence, the probe's");
+        assert_ne!(
+            fences[0].1, 0,
+            "a GPU ACQUIRE for a consumer, not a CPU wait"
+        );
+        assert!(!run_gpu(1).is_empty(), "the push and the probe fence ran");
+        syncobj::poll_pending();
+        assert_eq!(syncobj::query(out), Some(1));
+        assert_eq!(syncobj::query(tl), Some(4));
+        // An idle ring has nothing to wait for: the CPU's word stands.
+        let idle = syncobj::create(false);
+        assert_eq!(exec(&gpu, A, ch, &[], &[], &[sync(idle)]), Ok(0));
+        assert_eq!(
+            syncobj::query(idle),
+            Some(1),
+            "nothing queued: signaled at once"
+        );
+        // Behind a wait settled on the CPU it is still the ring's word.
+        let done = syncobj::create(true);
+        let after = syncobj::create(false);
+        assert_eq!(exec(&gpu, A, ch, &[push(PUSH_VA, 16)], &[], &[]), Ok(0));
+        assert_eq!(exec(&gpu, A, ch, &[], &[sync(done)], &[sync(after)]), Ok(0));
+        assert_eq!(
+            syncobj::query(after),
+            Some(0),
+            "the wait was done; the ring is not"
+        );
+        assert!(!run_gpu(1).is_empty());
+        syncobj::poll_pending();
+        assert_eq!(syncobj::query(after), Some(1));
+        // NVK never resets the syncobj it syncs on: the second WaitIdle
+        // signals a binary syncobj that is already signaled, and a binary
+        // sig REPLACES its fence (`drm_syncobj_replace_fence`), so it goes
+        // back to waiting for this ring, not "signaled already".
+        assert_eq!(exec(&gpu, A, ch, &[push(PUSH_VA, 16)], &[], &[]), Ok(0));
+        assert_eq!(exec(&gpu, A, ch, &[], &[], &[sync(out)]), Ok(0));
+        assert_eq!(
+            syncobj::query(out),
+            Some(0),
+            "re-armed on the ring's new fence, as NVK's second WaitIdle needs"
+        );
+        assert!(!run_gpu(1).is_empty());
+        syncobj::poll_pending();
+        assert_eq!(syncobj::query(out), Some(1));
+        for h in [out, tl, idle, done, after] {
             assert!(syncobj::destroy(h));
         }
         gpu.nouveau_release_process(A);
