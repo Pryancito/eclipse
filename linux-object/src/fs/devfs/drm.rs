@@ -4995,7 +4995,14 @@ pub(crate) fn flush_pending_flip_completions() {
         if let Some(file) = file.upgrade() {
             queue_flip_event(&file, crtc_id, user_data);
         } else {
-            FLIP_EVENT_PENDING.store(false, Ordering::Release);
+            // drm_file closed before delivery: the event is dropped, and the
+            // flip leaves the in-flight population like any other, as the
+            // timer's deliverer does. Clearing the latch alone here left the
+            // count one too high for good: from then on no delivery was ever
+            // the last one, the latch never cleared after a real flip, and
+            // the next PAGE_FLIP spun `settle_outstanding_flip` out into the
+            // EBUSY wlroots escalates into an output teardown.
+            flip_in_flight_done();
         }
     }
 }
@@ -8517,6 +8524,49 @@ mod flip_latch_tests {
         FLIP_EVENT_PENDING.store(true, Ordering::Release);
         clear_stale_flip_pending();
         assert!(!FLIP_EVENT_PENDING.load(Ordering::Acquire));
+        reset();
+    }
+
+    /// The flush is the other deliverer, and it kept the other half of the
+    /// accounting: a flip whose drm_file was gone by the time the flush
+    /// reached it cleared the latch but not the count. From then on every
+    /// delivery found one flip more in flight than there was, none was ever
+    /// the last, the latch stayed set after every real flip, and the next
+    /// PAGE_FLIP spun `settle_outstanding_flip` out into EBUSY -- which
+    /// wlroots escalates into an output teardown.
+    #[test]
+    fn a_flushed_flip_whose_file_is_gone_leaves_the_population_too() {
+        let _serialised = super::test_globals::lock();
+        reset();
+        {
+            let mut q = PENDING_DRM_TIMERS.lock();
+            FLIPS_IN_FLIGHT.fetch_add(1, Ordering::AcqRel);
+            FLIP_EVENT_PENDING.store(true, Ordering::Release);
+            q.push_back(PendingDrmTimer::Flip {
+                crtc_id: SYNTH_CRTC_ID,
+                user_data: 0xF11D,
+                file: Weak::new(),
+            });
+        }
+        flush_pending_flip_completions();
+        assert!(!FLIP_EVENT_PENDING.load(Ordering::Acquire));
+        assert_eq!(
+            FLIPS_IN_FLIGHT.load(Ordering::Acquire),
+            0,
+            "the flip went with its file"
+        );
+        // The next real flip is delivered and is the last one in flight, so
+        // the latch clears and the flip after it is accepted.
+        let file = DrmFileState::new();
+        queue_one(&file);
+        flush_pending_flip_completions();
+        assert!(file.has_events(), "the completion reached the card fd");
+        assert!(
+            !FLIP_EVENT_PENDING.load(Ordering::Acquire),
+            "nothing outstanding"
+        );
+        assert_eq!(FLIPS_IN_FLIGHT.load(Ordering::Acquire), 0);
+        assert!(settle_outstanding_flip());
         reset();
     }
 
