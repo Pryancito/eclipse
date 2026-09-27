@@ -1410,8 +1410,41 @@ impl DrmDev {
                 if drm::get_crtc(req.crtc_id).is_none() {
                     return Err(FsError::EntryNotFound);
                 }
+                // With a mode, `drm_mode_setcrtc` then looks the fb up
+                // (ENOENT; -1 names the fb already on the CRTC, EINVAL when
+                // there is none), runs the mode through
+                // `drm_mode_convert_umode` (EINVAL for a zero clock, a zero
+                // active area, sync timings out of order or an aspect-ratio
+                // code it does not define) and wants the active area at
+                // (x, y) inside the fb (`drm_crtc_check_viewport`, ENOSPC).
+                // None of it was read: a mode wider or taller than its fb
+                // was scanned out as if the fb fit it, a mode with no clock
+                // set the vblank pacing to a fallback and answered done, and
+                // -1 was looked up as an fb id.
+                let mut fb_id = req.fb_id;
+                if req.mode_valid != 0 {
+                    if fb_id == u32::MAX {
+                        fb_id = drm::get_crtc(req.crtc_id).map_or(0, |c| c.fb_id);
+                        if fb_id == 0 {
+                            return Err(FsError::InvalidParam);
+                        }
+                    }
+                    let Some(fb) = drm::get_fb(fb_id) else {
+                        return Err(FsError::EntryNotFound);
+                    };
+                    let Some((w, h)) = modeinfo_active_area(&req.mode) else {
+                        return Err(FsError::InvalidParam);
+                    };
+                    if w > fb.width
+                        || req.x > fb.width - w
+                        || h > fb.height
+                        || req.y > fb.height - h
+                    {
+                        return Err(FsError::NoDeviceSpace);
+                    }
+                }
                 if req.count_connectors > 0 {
-                    if req.mode_valid == 0 || req.fb_id == 0 {
+                    if req.mode_valid == 0 || fb_id == 0 {
                         return Err(FsError::InvalidParam);
                     }
                     let connectors = drm::get_resources().2;
@@ -1430,9 +1463,9 @@ impl DrmDev {
                 if req.mode_valid != 0 {
                     drm::set_vblank_period_from_modeinfo(&req.mode);
                 }
-                if req.fb_id != 0 {
-                    if let Err(e) = drm::present_now_checked(req.fb_id, req.crtc_id, None) {
-                        present_failed("SETCRTC", req.fb_id, req.crtc_id, e)?;
+                if fb_id != 0 {
+                    if let Err(e) = drm::present_now_checked(fb_id, req.crtc_id, None) {
+                        present_failed("SETCRTC", fb_id, req.crtc_id, e)?;
                     }
                 } else {
                     // `drm_mode_setcrtc` with a null fb turns the pipe off
@@ -4717,6 +4750,38 @@ fn panel_timing_in(block: &[u8], len: u32) -> Option<edid::DetailedTiming> {
 /// turns into the synthetic vblank period every `WAIT_VBLANK` and every flip
 /// completion is timed against. Saying 60 to a 144 Hz panel throws away more
 /// than half of its scanouts.
+/// `DRM_MODE_FLAG_PIC_AR_MASK` is bits 19..=23 of `drm_mode_modeinfo.flags`;
+/// `drm_mode_convert_umode` knows the codes 0 (none) to 4 (256:135) and
+/// refuses the rest.
+const DRM_MODE_FLAG_PIC_AR_SHIFT: u32 = 19;
+const DRM_MODE_FLAG_PIC_AR_MAX: u32 = 4;
+
+/// `drm_mode_validate_basic`, on a `struct drm_mode_modeinfo` as the ioctl
+/// carries it, plus the aspect-ratio code check of `drm_mode_convert_umode`:
+/// the modes the kernel refuses with EINVAL before any driver sees them. For a
+/// mode that passes, its active area `(hdisplay, vdisplay)`.
+fn modeinfo_active_area(m: &[u8; 68]) -> Option<(u32, u32)> {
+    let u16_at = |i: usize| u16::from_ne_bytes([m[i], m[i + 1]]);
+    let clock = u32::from_ne_bytes([m[0], m[1], m[2], m[3]]);
+    let (hdisplay, hsync_start, hsync_end, htotal) = (u16_at(4), u16_at(6), u16_at(8), u16_at(10));
+    let (vdisplay, vsync_start, vsync_end, vtotal) =
+        (u16_at(14), u16_at(16), u16_at(18), u16_at(20));
+    let flags = u32::from_ne_bytes([m[28], m[29], m[30], m[31]]);
+    if (flags >> DRM_MODE_FLAG_PIC_AR_SHIFT) & 0x1f > DRM_MODE_FLAG_PIC_AR_MAX {
+        return None;
+    }
+    if clock == 0 {
+        return None;
+    }
+    if hdisplay == 0 || hsync_start < hdisplay || hsync_end < hsync_start || htotal < hsync_end {
+        return None;
+    }
+    if vdisplay == 0 || vsync_start < vdisplay || vsync_end < vsync_start || vtotal < vsync_end {
+        return None;
+    }
+    Some((hdisplay as u32, vdisplay as u32))
+}
+
 fn make_modeinfo(w: u32, h: u32) -> [u8; 68] {
     make_modeinfo_with(w, h, panel_timing().as_ref())
 }
@@ -7381,7 +7446,9 @@ mod kms_scanout_tests {
     /// A framebuffer smaller than the mode leaves the rest of the screen alone.
     /// Writing past it would be an out-of-bounds store into the scanout aperture
     /// on real hardware, and the pixels it would land on belong to whatever was
-    /// there before -- the text console, usually.
+    /// there before -- the text console, usually. `SETCRTC` refuses such a
+    /// modeset outright (ENOSPC, `drm_crtc_check_viewport`), so the scanout
+    /// is reached the way the kernel's own callers reach it.
     #[test]
     fn a_framebuffer_smaller_than_the_mode_leaves_the_rest_of_the_screen_alone() {
         let screen = kms_emu::attach(64, 16);
@@ -7390,7 +7457,23 @@ mod kms_scanout_tests {
         paint(&buf, |x, y| tag(0x0033_0000, x, y));
         let fb = c.addfb2(&buf);
 
-        set_crtc(&c, drm::SYNTH_CRTC_ID, fb, 64, 16);
+        let mut req = DrmModeGetCrtc {
+            set_connectors_ptr: 0,
+            count_connectors: 0,
+            crtc_id: drm::SYNTH_CRTC_ID,
+            fb_id: fb,
+            x: 0,
+            y: 0,
+            gamma_size: 0,
+            mode_valid: 1,
+            mode: make_modeinfo(64, 16),
+        };
+        assert_eq!(
+            c.ioctl(DRM_IOCTL_MODE_SETCRTC, &mut req),
+            Err(FsError::NoDeviceSpace),
+            "a mode the fb cannot hold"
+        );
+        drm::present_now_checked(fb, drm::SYNTH_CRTC_ID, None).expect("present");
 
         for y in 0..16 {
             for x in 0..64 {
@@ -12277,8 +12360,8 @@ mod hw_kms_tests {
         );
         assert_eq!(
             setcrtc(60, &[61], 1, 0),
-            Err(FsError::InvalidParam),
-            "connectors but no fb"
+            enoent,
+            "a mode with fb 0: the fb lookup comes before the connector rules"
         );
         assert_eq!(
             get_crtc_fb(&c, 60),
@@ -12313,6 +12396,154 @@ mod hw_kms_tests {
         assert_eq!(c.ioctl(DRM_IOCTL_MODE_SETPLANE, &mut set_plane), enoent);
         set_plane.crtc_id = 60;
         assert_eq!(c.ioctl(DRM_IOCTL_MODE_SETPLANE, &mut set_plane), Ok(0));
+
+        c.rmfb(fb).expect("RMFB");
+        c.destroy_dumb(buf.handle).expect("DESTROY_DUMB");
+    }
+
+    /// With a mode, `drm_mode_setcrtc` looks the fb up (ENOENT; -1 is the
+    /// fb already on the CRTC, EINVAL when there is none), refuses a mode
+    /// `drm_mode_validate_basic` would not have (a zero clock, a zero active
+    /// area, sync timings out of order) or an aspect-ratio code it does not
+    /// define (EINVAL), and wants the active area at (x, y) inside the fb
+    /// (ENOSPC). None of it was read: a 64-wide mode on a 32-wide fb was
+    /// scanned out, and a clockless mode was paced from a fallback.
+    #[test]
+    fn setcrtc_wants_a_mode_that_is_one_and_an_fb_that_holds_it() {
+        // The synthetic pipe: its CRTC reports exactly the fb the core has on
+        // it, so "nothing on the CRTC" is a state this test can reach.
+        let _screen = kms_emu::attach(32, 8);
+        let c = Client::open(0);
+        let (crtcs, conns) = topology(&c);
+        let (crtc, conn) = (crtcs[0], conns[0]);
+        let buf = c.create_dumb(32, 8);
+        paint(&buf, 0x0000_4444);
+        let fb = c.addfb2(&buf);
+        let einval = Err(FsError::InvalidParam);
+        let enospc = Err(FsError::NoDeviceSpace);
+
+        let setcrtc = |fb_id: u32, x: u32, y: u32, mode: [u8; 68]| {
+            let connectors = [conn];
+            let mut req = DrmModeGetCrtc {
+                set_connectors_ptr: connectors.as_ptr() as u64,
+                count_connectors: 1,
+                crtc_id: crtc,
+                fb_id,
+                x,
+                y,
+                gamma_size: 0,
+                mode_valid: 1,
+                mode,
+            };
+            c.ioctl(DRM_IOCTL_MODE_SETCRTC, &mut req)
+        };
+        let good = make_modeinfo(32, 8);
+        let put_u16 =
+            |m: &mut [u8; 68], at: usize, v: u16| m[at..at + 2].copy_from_slice(&v.to_ne_bytes());
+
+        // The fb: -1 with nothing on the CRTC, and an id that is not one.
+        let mut off = DrmModeGetCrtc {
+            set_connectors_ptr: 0,
+            count_connectors: 0,
+            crtc_id: crtc,
+            fb_id: 0,
+            x: 0,
+            y: 0,
+            gamma_size: 0,
+            mode_valid: 0,
+            mode: [0; 68],
+        };
+        c.ioctl(DRM_IOCTL_MODE_SETCRTC, &mut off)
+            .expect("SETCRTC off");
+        assert_eq!(get_crtc_fb(&c, crtc), 0);
+        assert_eq!(
+            setcrtc(u32::MAX, 0, 0, good),
+            einval,
+            "-1 with no fb on the CRTC"
+        );
+        assert_eq!(
+            setcrtc(4242, 0, 0, good),
+            Err(FsError::EntryNotFound),
+            "an fb that does not exist"
+        );
+
+        // The viewport: the active area at (x, y) has to lie inside the fb.
+        assert_eq!(
+            setcrtc(fb, 0, 0, make_modeinfo(64, 8)),
+            enospc,
+            "wider than the fb"
+        );
+        assert_eq!(
+            setcrtc(fb, 0, 0, make_modeinfo(32, 16)),
+            enospc,
+            "taller than the fb"
+        );
+        assert_eq!(
+            setcrtc(fb, 1, 0, good),
+            enospc,
+            "x pushes it past the right edge"
+        );
+        assert_eq!(
+            setcrtc(fb, 0, 1, good),
+            enospc,
+            "y pushes it past the bottom"
+        );
+        assert_eq!(
+            setcrtc(fb, 0x1_0000, 0, good),
+            enospc,
+            "an x with high bits set is outside any fb"
+        );
+
+        // The mode: what `drm_mode_validate_basic` refuses.
+        let mut m = good;
+        m[0..4].copy_from_slice(&0u32.to_ne_bytes());
+        assert_eq!(setcrtc(fb, 0, 0, m), einval, "clock 0");
+        let mut m = good;
+        put_u16(&mut m, 4, 0);
+        assert_eq!(setcrtc(fb, 0, 0, m), einval, "hdisplay 0");
+        let mut m = good;
+        put_u16(&mut m, 6, 31);
+        assert_eq!(setcrtc(fb, 0, 0, m), einval, "hsync_start before hdisplay");
+        let mut m = good;
+        put_u16(&mut m, 8, u16::from_ne_bytes([good[6], good[7]]) - 1);
+        assert_eq!(setcrtc(fb, 0, 0, m), einval, "hsync_end before hsync_start");
+        let mut m = good;
+        put_u16(&mut m, 10, u16::from_ne_bytes([good[8], good[9]]) - 1);
+        assert_eq!(setcrtc(fb, 0, 0, m), einval, "htotal before hsync_end");
+        let mut m = good;
+        put_u16(&mut m, 14, 0);
+        assert_eq!(setcrtc(fb, 0, 0, m), einval, "vdisplay 0");
+        let mut m = good;
+        put_u16(&mut m, 16, 7);
+        assert_eq!(setcrtc(fb, 0, 0, m), einval, "vsync_start before vdisplay");
+        let mut m = good;
+        put_u16(&mut m, 18, u16::from_ne_bytes([good[16], good[17]]) - 1);
+        assert_eq!(setcrtc(fb, 0, 0, m), einval, "vsync_end before vsync_start");
+        let mut m = good;
+        put_u16(&mut m, 20, u16::from_ne_bytes([good[18], good[19]]) - 1);
+        assert_eq!(setcrtc(fb, 0, 0, m), einval, "vtotal before vsync_end");
+        let mut m = good;
+        let flags = u32::from_ne_bytes([good[28], good[29], good[30], good[31]]);
+        m[28..32].copy_from_slice(&(flags | (5 << 19)).to_ne_bytes());
+        assert_eq!(setcrtc(fb, 0, 0, m), einval, "aspect-ratio code 5");
+        assert_eq!(
+            get_crtc_fb(&c, crtc),
+            0,
+            "a refused modeset presented anyway"
+        );
+
+        // What passes: the fb that fits, with the last aspect-ratio code the
+        // kernel defines, and then -1 for the same fb again.
+        let mut m = good;
+        m[28..32].copy_from_slice(&(flags | (4 << 19)).to_ne_bytes());
+        assert_eq!(setcrtc(fb, 0, 0, m), Ok(0));
+        assert_eq!(get_crtc_fb(&c, crtc), fb);
+        assert_eq!(
+            setcrtc(u32::MAX, 0, 0, good),
+            Ok(0),
+            "-1 is the fb on the CRTC"
+        );
+        assert_eq!(get_crtc_fb(&c, crtc), fb);
 
         c.rmfb(fb).expect("RMFB");
         c.destroy_dumb(buf.handle).expect("DESTROY_DUMB");
