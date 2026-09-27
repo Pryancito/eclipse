@@ -853,16 +853,26 @@ impl Thread {
     }
 
     /// Terminate the current running thread.
+    ///
+    /// Nothing here touches the process with this thread's lock held. It used
+    /// to: `remove_thread` takes the process's `inner`, so this path ran
+    /// thread -> process while `Process::exit` runs process -> thread (it held
+    /// its own `inner` across `thread.kill()`). Two orders of the same pair of
+    /// spin locks taken with interrupts off, and a process exiting on one CPU
+    /// while one of its threads terminates on another is two CPUs that never
+    /// come back. The process side let go too, so neither order exists now.
     fn terminate(&self) {
-        let mut inner = self.inner.lock();
         self.exceptionate.shutdown();
-        inner.change_state(ThreadState::Dead, &self.base);
+        self.inner
+            .lock()
+            .change_state(ThreadState::Dead, &self.base);
         // Credit this thread's CPU time to the process before the thread
         // disappears from its list, so process-level accounting
         // (getrusage/times, the parent's wait4 rusage) keeps it.
-        self.proc().dead_threads_time_add(self.get_time());
-        self.proc().dead_threads_sys_time_add(self.get_sys_time());
-        self.proc().remove_thread(self.base.id);
+        let proc = self.proc();
+        proc.dead_threads_time_add(self.get_time());
+        proc.dead_threads_sys_time_add(self.get_sys_time());
+        proc.remove_thread(self.base.id);
     }
 
     /// Terminate a thread whose coroutine was abandoned and can never run again.

@@ -603,6 +603,18 @@ fn primary_main(config: kernel_hal::KernelConfig) {
                      sigue escribiendo el buffer que presento"
                 );
             }
+            // Y esto es el arreglo que sale de esa medida: cuando el origen se
+            // mueve bajo la copia, volver a copiar las bandas que se movieron
+            // en vez de dejar la baldosa rancia en el panel. No hace el frame
+            // entero -- eso solo lo arregla la sincronizacion de arriba -- pero
+            // quita la basura que se queda. Acotado a dos rondas.
+            if kernel_hal::cmdline::flag(&options.cmdline, "drm.present_repair") {
+                linux_object::fs::devfs::drm::set_present_repair_enabled(true);
+                klog_info!(
+                    "Eclipse: drm.present_repair ON -- un present que pilla el origen \
+                     moviendose vuelve a copiar las bandas que se movieron"
+                );
+            }
             // Nouveau-compatible driver-specific ioctl surface on the NVIDIA
             // DRM node (GETPARAM, CHANNEL_ALLOC, GEM_NEW/INFO, VM_INIT --
             // see drivers/src/display/nouveau_uapi.rs and

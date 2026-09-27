@@ -100,7 +100,13 @@ fn cost_scaled(bytes: usize) -> (usize, &'static str) {
 
 /// How often each kind of present gets a line. A full frame is rare enough to
 /// report often; a damage box is not.
-const FULL_FRAME_REPORT_EVERY: u64 = 64;
+///
+/// The full-frame rhythm is `pub(crate)` because the fence report next door
+/// shares it on purpose (`drm_scheme`'s `FENCE_REPORT_EVERY`): the two lines
+/// describe the same present, so on the same rhythm they land next to each other
+/// in the klog and a reader can pair "waited 0us for 0 fences" with "cpu blit
+/// 12000us" without counting frames.
+pub(crate) const FULL_FRAME_REPORT_EVERY: u64 = 64;
 const RECT_REPORT_EVERY: u64 = 512;
 
 /// Damage-clipped presents completed, counted separately from the full frames
@@ -596,6 +602,107 @@ pub fn set_present_probe_enabled(on: bool) {
 /// Whether the present probe is armed for this boot.
 pub fn present_probe_enabled() -> bool {
     PRESENT_PROBE.load(Ordering::Relaxed)
+}
+
+/// Whether a present that finds the source still moving under it **repairs**
+/// the bands that moved, instead of only reporting them (`drm.present_repair`
+/// on the cmdline). OFF by default.
+///
+/// The defect it answers is measured, not guessed: with the compositor on
+/// wlroots' GLES2 renderer over Mesa's software rasteriser, the probe fires on
+/// essentially every frame, and with the pixman renderer -- same kernel, same
+/// present, same flip -- it never fires once and the screen is clean.
+/// `glFlush` hands llvmpipe's scene to its worker threads and returns without
+/// waiting, and there is nothing for the compositor to wait on either: this
+/// kernel answers `DRM_CAP_SYNCOBJ_TIMELINE` with 0, and a software renderer
+/// has no GPU fence to export. So the buffer the kernel is handed is a frame
+/// whose tiles are still arriving.
+///
+/// What the kernel can do about it is narrow but real. It cannot make the frame
+/// whole -- a present that raced is a mix of two frames whatever we do, and only
+/// explicit synchronisation upstream fixes that. What it can do is not *leave*
+/// the stale tiles on the panel: the bands that moved under the copy are exactly
+/// the bands whose pixels on screen are older than the buffer they came from, and
+/// copying those again picks up what has since arrived. Bounded by
+/// [`MAX_REPAIR_ROUNDS`], because a compositor that never stops writing must not
+/// turn one present into an unbounded loop.
+static PRESENT_REPAIR: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Turn the present repair pass on (or back off) for this boot.
+pub fn set_present_repair_enabled(on: bool) {
+    PRESENT_REPAIR.store(on, Ordering::Relaxed);
+}
+
+/// Whether the present repair pass is armed for this boot.
+pub fn present_repair_enabled() -> bool {
+    PRESENT_REPAIR.load(Ordering::Relaxed)
+}
+
+/// How many times one present may re-copy the bands that moved under it.
+///
+/// Two, and the number is a budget rather than a convergence criterion: the
+/// source may still be moving when the last round ends, and that is accepted.
+/// Each round costs the bands that actually moved, not the frame, so a round
+/// that repairs three bands of a 1920-wide panel copies 10% of what the present
+/// already copied. An unbounded loop against a compositor that never stops
+/// writing would hold the flip ioctl for as long as the desktop is busy, which
+/// is a worse failure than a stale tile.
+const MAX_REPAIR_ROUNDS: u32 = 2;
+
+/// The horizontal span of the window covered by the set bands of `mask`, as
+/// `(x_offset, width)` in pixels **relative to the window's own left edge**.
+///
+/// `None` when there is nothing to repair: no band set, an empty window, or a
+/// mask whose only bits sit past the bands the window actually covered (which
+/// describes no pixels, and must not be turned into a copy of the whole row).
+///
+/// One span from the first set band to the last, not a copy per band: a repair
+/// round is a blit, and two blits of adjacent bands cost more than one blit of
+/// both. The span is clamped to the window because the last band is the folded
+/// one -- for a window wider than the mask's reach it stands for every column
+/// from its own left edge to the right edge of the window.
+fn repair_span_px(mask: u32, n: usize, window_w: u32) -> Option<(u32, u32)> {
+    if n == 0 || window_w == 0 {
+        return None;
+    }
+    // `first >= n` is the only emptiness test needed, and it covers two cases
+    // that look separate. An empty mask gives `trailing_zeros() == 32`, which is
+    // never below `n` (clamped to `PROBE_MAX_BANDS`), so "no band set" needs no
+    // test of its own -- and neither does `x >= window_w`, because a `first`
+    // inside the window's bands puts `x` inside the window by construction.
+    // Both of those guards were mutants that could not be killed, and the honest
+    // resolution was to take them out rather than pin a second spelling of this
+    // line.
+    let first = mask.trailing_zeros() as usize;
+    if first >= n {
+        return None;
+    }
+    let last = (u32::BITS - 1 - mask.leading_zeros()) as usize;
+    let last = last.min(n - 1);
+    let x = u32::try_from(first.saturating_mul(PROBE_BAND_PX)).unwrap_or(u32::MAX);
+    // The LAST band owns everything to the window's right edge, not just its own
+    // 64 columns: for a window wider than the mask's reach it is the folded band,
+    // and `(last + 1) * 64` would stop short and leave those columns unrepaired
+    // for good. For a window the mask covers exactly, the two agree.
+    let end = if last.saturating_add(1) >= n {
+        window_w
+    } else {
+        u32::try_from(last.saturating_add(1).saturating_mul(PROBE_BAND_PX))
+            .unwrap_or(u32::MAX)
+            .min(window_w)
+    };
+    (end > x).then(|| (x, end - x))
+}
+
+/// How many repair rounds the last present ran, so a test can assert that a
+/// settled buffer runs none and a moving one runs a bounded number.
+#[cfg(test)]
+static REPAIR_ROUNDS_RUN: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// Repair rounds run by the most recent present.
+#[cfg(test)]
+pub(crate) fn repair_rounds_for_test() -> u32 {
+    REPAIR_ROUNDS_RUN.load(Ordering::Relaxed)
 }
 
 /// Rows the probe samples: every 4th one, every pixel within it.
@@ -2992,7 +3099,7 @@ pub fn scanout_region_checked(
         // Armed by `drm.present_probe` only: what the pixels looked like going
         // in, so the read after the blit can say whether anybody else was
         // writing them at the same time. See [`PRESENT_PROBE`].
-        let probe_before = if present_probe_enabled() {
+        let probe_before = if present_probe_enabled() || present_repair_enabled() {
             probe_bands(
                 pixels,
                 src_stride,
@@ -3071,6 +3178,84 @@ pub fn scanout_region_checked(
                             ""
                         }
                     );
+                }
+                // The bands that moved under the copy are the bands whose pixels
+                // on the panel are older than the buffer they came from. Copy
+                // them again and the panel picks up what has arrived since. See
+                // [`PRESENT_REPAIR`] for why this is all the kernel can do, and
+                // [`MAX_REPAIR_ROUNDS`] for why it is bounded.
+                if present_repair_enabled() {
+                    let mut mask = mask;
+                    let mut round = 0u32;
+                    while round < MAX_REPAIR_ROUNDS {
+                        let Some((dx, dw)) = repair_span_px(mask, before.n, blit_w) else {
+                            break;
+                        };
+                        let span_off = src_off.saturating_add(dx as usize);
+                        if span_off >= pixels.len() {
+                            break;
+                        }
+                        // Re-read before re-copying: the span is being written
+                        // by another CPU, so the lines this CPU pulled in for
+                        // the checksum are the ones we must NOT copy from.
+                        if gem_cpu_mapped {
+                            dma_sync_scanout_src_from_device(
+                                vaddr,
+                                fb.size,
+                                src_stride,
+                                blit_x.saturating_add(dx),
+                                blit_y,
+                                dw,
+                                blit_h,
+                            );
+                        }
+                        let redo = probe_bands(
+                            pixels,
+                            src_stride,
+                            blit_x,
+                            blit_y,
+                            blit_w,
+                            blit_h,
+                            PROBE_ROW_STEP,
+                        );
+                        blit_chunked(
+                            &display,
+                            blit_x.saturating_add(dx),
+                            blit_y,
+                            &pixels[span_off..],
+                            src_stride,
+                            dw,
+                            blit_h,
+                        );
+                        round = round.saturating_add(1);
+                        // What still moved DURING this round is what the next
+                        // one owes. A round that copied a settled span leaves
+                        // nothing set and the loop ends on its own.
+                        let Some(redo) = redo else { break };
+                        if gem_cpu_mapped {
+                            dma_sync_scanout_src_from_device(
+                                vaddr,
+                                fb.size,
+                                src_stride,
+                                blit_x.saturating_add(dx),
+                                blit_y,
+                                dw,
+                                blit_h,
+                            );
+                        }
+                        let now = probe_bands(
+                            pixels,
+                            src_stride,
+                            blit_x,
+                            blit_y,
+                            blit_w,
+                            blit_h,
+                            PROBE_ROW_STEP,
+                        );
+                        mask = now.as_ref().map_or(0, |n| redo.diff_mask(n));
+                    }
+                    #[cfg(test)]
+                    REPAIR_ROUNDS_RUN.store(round, Ordering::Relaxed);
                 }
             }
         }
@@ -5635,6 +5820,8 @@ pub(crate) fn reset_output_state_for_test() {
     // twice and can put a line in the klog for a frame nobody was looking at.
     // Its report budget goes back too, or the last test to run finds it spent.
     set_present_probe_enabled(false);
+    set_present_repair_enabled(false);
+    REPAIR_ROUNDS_RUN.store(0, Ordering::Relaxed);
     PROBE_REPORTS.store(0, Ordering::Relaxed);
     // A leaked `PANEL_FB` makes a later test's damage box either honoured or
     // promoted for a reason that has nothing to do with what it is testing --
@@ -8870,6 +9057,105 @@ mod present_probe_tests {
         );
         assert_ne!(narrow.fold(), wide.fold());
         assert_eq!(narrow.diff_mask(&wide), 1 << 1);
+    }
+
+    // --- what a repair round would copy ---
+
+    /// Nothing moved, nothing to repair. Without this every span below could be
+    /// explained by "it always returns a span".
+    #[test]
+    fn a_mask_with_no_band_set_repairs_nothing() {
+        assert_eq!(repair_span_px(0, 30, 1920), None);
+    }
+
+    /// One band is its own 64 columns and not one more. A span that overshot
+    /// would copy settled pixels on every repair round, which is the cost this
+    /// whole mechanism is trying to keep proportional.
+    #[test]
+    fn one_band_is_its_own_sixty_four_columns() {
+        assert_eq!(repair_span_px(1 << 0, 30, 1920), Some((0, 64)));
+        assert_eq!(repair_span_px(1 << 1, 30, 1920), Some((64, 64)));
+        assert_eq!(repair_span_px(1 << 29, 30, 1920), Some((1856, 64)));
+    }
+
+    /// Scattered bands become ONE span from the first to the last, settled bands
+    /// in between included: two blits of nearby bands cost more than one blit of
+    /// both, and a repair round is a blit.
+    #[test]
+    fn scattered_bands_become_one_span_from_first_to_last() {
+        let mask = (1 << 2) | (1 << 5) | (1 << 9);
+        assert_eq!(repair_span_px(mask, 30, 1920), Some((128, (10 - 2) * 64)));
+    }
+
+    /// A mask whose bits all sit past the bands the window covered describes no
+    /// pixels. Turning that into a copy would be a copy of the wrong columns.
+    #[test]
+    fn bands_past_the_window_repair_nothing() {
+        assert_eq!(repair_span_px(1 << 20, 4, 256), None);
+        assert_eq!(repair_span_px(1 << 31, 30, 1920), None);
+    }
+
+    /// The last band is the folded one: for a window wider than the mask's reach
+    /// it stands for every column up to the window's right edge, and the span has
+    /// to reach that far or those columns never get repaired.
+    #[test]
+    fn the_last_band_reaches_the_windows_right_edge() {
+        let wide = (PROBE_MAX_BANDS * PROBE_BAND_PX + 300) as u32;
+        let (x, w) = repair_span_px(1 << (PROBE_MAX_BANDS - 1), PROBE_MAX_BANDS, wide).unwrap();
+        assert_eq!(x, ((PROBE_MAX_BANDS - 1) * PROBE_BAND_PX) as u32);
+        assert_eq!(
+            x + w,
+            wide,
+            "the folded band owns everything to the right edge"
+        );
+    }
+
+    /// A span never reaches past the window, whatever the mask says. A blit that
+    /// started inside the window and ran past its right edge would walk into the
+    /// next row.
+    #[test]
+    fn a_span_never_reaches_past_the_window() {
+        for bit in 0..PROBE_MAX_BANDS {
+            if let Some((x, w)) = repair_span_px(1 << bit, PROBE_MAX_BANDS, 100) {
+                assert!(
+                    x + w <= 100,
+                    "band {} gave {}..{} on a 100-px window",
+                    bit,
+                    x,
+                    x + w
+                );
+            }
+        }
+        assert_eq!(repair_span_px(u32::MAX, 30, 1920), Some((0, 1920)));
+    }
+
+    /// A window with no width and a mask that covers no bands are both "nothing
+    /// to do", not a zero-width blit at the origin.
+    #[test]
+    fn a_window_of_no_width_repairs_nothing() {
+        assert_eq!(repair_span_px(1, 30, 0), None);
+        assert_eq!(repair_span_px(1, 0, 1920), None);
+    }
+
+    /// The repair is off unless the cmdline arms it, and the reset between tests
+    /// disarms it -- a leaked flag would have every later present test doing
+    /// extra blits.
+    #[test]
+    fn the_repair_is_off_unless_the_cmdline_arms_it() {
+        let _g = serialised();
+        assert!(!present_repair_enabled());
+        set_present_repair_enabled(true);
+        assert!(present_repair_enabled());
+        reset_output_state_for_test();
+        assert!(!present_repair_enabled());
+        assert_eq!(repair_rounds_for_test(), 0);
+    }
+
+    /// Two rounds, and it is a budget: the loop must not be able to run longer
+    /// than this against a source that never settles.
+    #[test]
+    fn the_repair_budget_is_two_rounds() {
+        assert_eq!(MAX_REPAIR_ROUNDS, 2);
     }
 
     /// A pixel that moves from one band into another changes both of them, so

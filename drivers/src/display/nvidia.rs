@@ -16931,8 +16931,16 @@ mod nouveau_bookkeeping_tests {
 
     /// The PBDMA of context `ctx`: fetch every entry from GPGet up to GPPut.
     fn run_gpu(ctx: u32) -> Vec<Fetched> {
+        run_gpu_frames(ctx, u32::MAX)
+    }
+
+    /// [`run_gpu`], stopping after `max_releases` semaphore releases: one
+    /// frame's worth of work at a time, for a GPU modelled as slower than
+    /// the CPU feeding it.
+    fn run_gpu_frames(ctx: u32, max_releases: u32) -> Vec<Fetched> {
         let c = chan(ctx);
         let mut out = Vec::new();
+        let mut releases = 0;
         loop {
             let (get, put) = userd(&c);
             if get == put {
@@ -17001,8 +17009,15 @@ mod nouveau_bookkeeping_tests {
             } else {
                 Fetched::Push { va, len }
             };
+            let is_release = matches!(item, Fetched::Release { .. });
             out.push(item);
             poke(c.userd + 0x88, (get + 1) % FAST_ENTRIES);
+            if is_release {
+                releases += 1;
+                if releases >= max_releases {
+                    break;
+                }
+            }
         }
         out
     }
@@ -21256,6 +21271,584 @@ mod nouveau_bookkeeping_tests {
         gpu.nouveau_release_process(COMP);
         assert_eq!(FAKE_RM.lock().bad, 0);
     }
+    /// `glxgears` under `vblank_mode=0`, as this kernel sees it: the fixed
+    /// per-frame ioctl sequence of a zink/NVK client on X11 (DRI3 with
+    /// explicit sync) against a labwc that composites at the refresh and
+    /// flips through the NVC57E ladder. No pixels and no GPU: the fake RM's
+    /// direct-submit channels, the PBDMA of `run_gpu`, the syncobj table
+    /// and the fake display front end, all on the test clock.
+    ///
+    /// One thread, virtual time:
+    /// - The client draws into a swapchain of `IMAGES` buffers. A frame is
+    ///   EXEC(wait = the image's acquire semaphore, sig = the swapchain
+    ///   timeline at the frame's point); the GPU is a serial engine that
+    ///   lands each frame `render_us` after the one before. The acquire
+    ///   semaphore is built the way Mesa's `wsi_create_sync_for_image_syncobj`
+    ///   builds it: the image's previous present AND the compositor's release
+    ///   of it, merged and imported into the semaphore.
+    /// - Every present is a commit for the compositor. It serves a commit
+    ///   once the frame's point has landed (its `SYNCOBJ_EVENTFD`) and, when
+    ///   the commit replaces the buffer it held, lets the old one go: through
+    ///   the fence of the pass still reading it, or at once (wlroots
+    ///   `wlr_buffer_unlock`).
+    /// - At every vblank it renders the buffer it holds (EXEC on the
+    ///   compositor's channel, waiting on that frame's point) and flips.
+    /// - The compositor is one thread: while it is inside an ioctl it serves
+    ///   nothing, so an ioctl that waits is time the client's buffers stay
+    ///   held. That is the coupling `vblank_mode=0` at 60 fps was made of.
+    mod glxgears_vblank_mode {
+        use super::super::rm_host_shims::{reset_fake_hwflip, FAKE_HWFLIP};
+        use super::super::surfaceflip_tests::SERIAL;
+        use super::*;
+        use crate::nvme::nvme_queue::test_clock;
+        use crate::scheme::syncobj;
+        use std::collections::VecDeque;
+
+        /// zink on X11 acquires up to `minImageCount + 1` images: three.
+        const IMAGES: usize = 3;
+        /// The client's GPU work per frame: 500 frames a second unthrottled.
+        const RENDER_US: u64 = 2_000;
+        /// The compositor's pass over the scene.
+        const COMPOSITE_US: u64 = 1_000;
+        /// A 60 Hz panel.
+        const VBLANK_US: u64 = 16_667;
+        /// How long the display front end takes to fetch a flip: most of a
+        /// frame, what the NVC57E flip used to wait out inside the ioctl.
+        const FETCH_US: u64 = 15_000;
+        const FRAMES: u64 = 240;
+        const FB: u32 = 7;
+        const H_MEMORY: u32 = 0x1234;
+        /// A client waiting longer than this for a buffer is a kernel that
+        /// lost the release, not a slow panel.
+        const STUCK_US: u64 = 1_000_000;
+
+        #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+        enum Swap {
+            /// `vblank_mode=0`: present as soon as the frame is drawn.
+            Immediate,
+            /// `vblank_mode=1`: the next frame starts once the compositor has
+            /// taken this one to the panel.
+            Vsync,
+        }
+
+        /// The compositor's pass over the scene, on the GPU.
+        struct Pass {
+            fence: u32,
+            image: usize,
+            lands_at: u64,
+        }
+
+        struct Desktop<'a> {
+            gpu: &'a NvidiaGpu,
+            ch_client: u32,
+            ch_comp: u32,
+            render_us: u64,
+            composite_us: u64,
+            swap: Swap,
+            /// The swapchain timeline: frame `f` signals point `f + 1`.
+            present_tl: u32,
+            /// Per image, the compositor's release timeline: use `u` of the
+            /// image is released at point `u`.
+            release_tl: [u32; IMAGES],
+            /// Per image, the acquire semaphore Mesa imports the merge into.
+            sem: [u32; IMAGES],
+            uses: [u64; IMAGES],
+            last_point: [Option<u64>; IMAGES],
+            /// Frames on the client's GPU: `(point, lands_at)`.
+            client_queue: VecDeque<(u64, u64)>,
+            client_landed: u64,
+            client_gpu_free_at: u64,
+            /// Commits the compositor has not served yet: `(image, point)`.
+            inbox: VecDeque<(usize, u64)>,
+            /// The buffer the compositor holds for its next pass.
+            held: Option<(usize, u64)>,
+            pass: Option<Pass>,
+            comp_busy_until: u64,
+            /// The highest point the compositor has taken to the panel.
+            comp_consumed: u64,
+            next_vblank: u64,
+            commits_served: u64,
+            frames_composited: u64,
+            flips: u64,
+            flip_cost_max_us: u64,
+            client_stalls: u64,
+            releases_through_a_fence: u64,
+        }
+
+        /// The desktop's GPU: the fake RM's direct submit, the panel on this
+        /// GPU, `nvidia.surfaceflip` opted in and the compositor's output
+        /// buffer registered as a VRAM framebuffer.
+        fn desktop_gpu() -> NvidiaGpu {
+            let gpu = gpu_rm_ladder();
+            reset_fake_hwflip();
+            FAKE_HWFLIP.lock().fetch_delay_us = FETCH_US;
+            SURFACEFLIP_STATE.store(0, Ordering::Release);
+            for c in [
+                &SURFACEFLIP_FLIPS,
+                &SURFACEFLIP_DRAIN_WAITS,
+                &SURFACEFLIP_DRAIN_US,
+                &SURFACEFLIP_DRAIN_MAX_US,
+                &SURFACEFLIP_SUBMIT_MAX_US,
+                &SURFACEFLIP_STUCK,
+                &SURFACEFLIP_BUSY_REFUSED,
+            ] {
+                c.store(0, Ordering::Relaxed);
+            }
+            test_clock::set(1_000_000);
+            // Every read of the clock is a microsecond: an ioctl that polls
+            // costs what it polls, and one that waits costs what it waits.
+            test_clock::set_auto_advance(1);
+            nv::set_surfaceflip_enabled(true);
+            set_boot_fb_info(0x1000, 1920, 1080, 1920 * 4);
+            assert!(gpu.drives_boot_display());
+            gpu.kms_framebuffers.lock().push(NvidiaKmsFramebuffer {
+                id: FB,
+                handle_id: 1,
+                width: 1920,
+                height: 1080,
+                pitch: 1920 * 4,
+                phys_addr: 0,
+                size: 0,
+                h_memory: H_MEMORY,
+                vram_offset: Some(0),
+            });
+            gpu
+        }
+
+        impl<'a> Desktop<'a> {
+            fn new(gpu: &'a NvidiaGpu, swap: Swap) -> Self {
+                let ch_comp = client_with_pushbuf(gpu, COMP);
+                let ch_client = client_with_pushbuf(gpu, A);
+                let now = test_clock::now();
+                Desktop {
+                    gpu,
+                    ch_client,
+                    ch_comp,
+                    render_us: RENDER_US,
+                    composite_us: COMPOSITE_US,
+                    swap,
+                    present_tl: syncobj::create(false),
+                    release_tl: core::array::from_fn(|_| syncobj::create(false)),
+                    sem: core::array::from_fn(|_| syncobj::create(false)),
+                    uses: [0; IMAGES],
+                    last_point: [None; IMAGES],
+                    client_queue: VecDeque::new(),
+                    client_landed: 0,
+                    client_gpu_free_at: now,
+                    inbox: VecDeque::new(),
+                    held: None,
+                    pass: None,
+                    comp_busy_until: now,
+                    comp_consumed: 0,
+                    next_vblank: now + VBLANK_US,
+                    commits_served: 0,
+                    frames_composited: 0,
+                    flips: 0,
+                    flip_cost_max_us: 0,
+                    client_stalls: 0,
+                    releases_through_a_fence: 0,
+                }
+            }
+
+            fn now() -> u64 {
+                test_clock::now()
+            }
+
+            /// The next moment anything happens: a landing, a vblank, or the
+            /// compositor back from an ioctl with commits waiting.
+            fn next_event(&self) -> u64 {
+                let mut t = self.next_vblank;
+                if let Some(&(_, at)) = self.client_queue.front() {
+                    t = t.min(at);
+                }
+                if let Some(p) = &self.pass {
+                    t = t.min(p.lands_at);
+                }
+                if !self.inbox.is_empty() && self.comp_busy_until > Self::now() {
+                    t = t.min(self.comp_busy_until);
+                }
+                t
+            }
+
+            /// Move the clock to `target`, handling every event on the way,
+            /// in order. The clock never moves backwards.
+            fn advance_to(&mut self, target: u64) {
+                loop {
+                    let next = self.next_event();
+                    if next > target {
+                        break;
+                    }
+                    if next > Self::now() {
+                        test_clock::set(next);
+                    }
+                    self.events_due();
+                }
+                if target > Self::now() {
+                    test_clock::set(target);
+                }
+                self.serve_commits();
+            }
+
+            fn events_due(&mut self) {
+                let now = Self::now();
+                while let Some(&(point, at)) = self.client_queue.front() {
+                    if at > now {
+                        break;
+                    }
+                    self.client_queue.pop_front();
+                    let fetched = run_gpu_frames(1, 1);
+                    assert!(
+                        fetched.iter().any(|f| matches!(f, Fetched::Release { .. })),
+                        "frame {}: no fence behind it on the client's ring ({:?})",
+                        point,
+                        fetched
+                    );
+                    syncobj::poll_pending();
+                    self.client_landed = point;
+                }
+                if self.pass.as_ref().is_some_and(|p| p.lands_at <= now) {
+                    let fetched = run_gpu_frames(0, 1);
+                    assert!(
+                        fetched.iter().any(|f| matches!(f, Fetched::Release { .. })),
+                        "the compositor's pass left no fence on its ring ({:?})",
+                        fetched
+                    );
+                    syncobj::poll_pending();
+                    let p = self.pass.take().unwrap();
+                    assert!(syncobj::destroy(p.fence));
+                }
+                if self.next_vblank <= now {
+                    self.vblank();
+                }
+                self.serve_commits();
+            }
+
+            /// The output's frame event: render what is held, flip.
+            fn vblank(&mut self) {
+                self.next_vblank += VBLANK_US;
+                let Some((image, point)) = self.held else {
+                    return;
+                };
+                if self.pass.is_some() {
+                    // The previous pass is still on the GPU: this frame is
+                    // skipped, as wlroots skips it.
+                    return;
+                }
+                let fence = syncobj::create(false);
+                assert_eq!(
+                    exec(
+                        self.gpu,
+                        COMP,
+                        self.ch_comp,
+                        &[push(PUSH_VA, 16)],
+                        &[sync_tl(self.present_tl, point)],
+                        &[sync(fence)]
+                    ),
+                    Ok(0),
+                    "the compositor's pass over frame {}",
+                    point
+                );
+                self.pass = Some(Pass {
+                    fence,
+                    image,
+                    lands_at: Self::now() + self.composite_us,
+                });
+                let before = Self::now();
+                assert!(self.gpu.page_flip(FB), "flip {} refused", self.flips);
+                let cost = Self::now().wrapping_sub(before);
+                self.flip_cost_max_us = self.flip_cost_max_us.max(cost);
+                self.flips += 1;
+                self.frames_composited += 1;
+                self.comp_consumed = self.comp_consumed.max(point);
+                self.comp_busy_until = Self::now();
+            }
+
+            /// The compositor's event loop: every commit whose frame has
+            /// landed, in order.
+            fn serve_commits(&mut self) {
+                if Self::now() < self.comp_busy_until {
+                    return;
+                }
+                while let Some(&(image, point)) = self.inbox.front() {
+                    match syncobj::wait_ready(
+                        &[self.present_tl],
+                        Some(&[point]),
+                        true,
+                        Self::now() + 1_000,
+                    ) {
+                        Some(Ok(_)) => {}
+                        None | Some(Err(syncobj::WaitOutcome::Timeout)) => break,
+                        Some(Err(_)) => panic!("frame {}: the swapchain timeline vanished", point),
+                    }
+                    assert!(
+                        self.client_landed >= point,
+                        "frame {}: the compositor's eventfd fired while the GPU was still \
+                         drawing it (landed up to {})",
+                        point,
+                        self.client_landed
+                    );
+                    self.inbox.pop_front();
+                    if let Some((old, _)) = self.held.replace((image, point)) {
+                        self.release(old);
+                    }
+                    self.commits_served += 1;
+                }
+            }
+
+            /// wlroots lets go of the buffer a commit replaced: through the
+            /// fence of the pass still reading it, or at once.
+            fn release(&mut self, image: usize) {
+                let point = self.uses[image];
+                let reading = self
+                    .pass
+                    .as_ref()
+                    .filter(|p| p.image == image && p.lands_at > Self::now())
+                    .map(|p| p.fence);
+                let ok = match reading {
+                    Some(fence) => {
+                        self.releases_through_a_fence += 1;
+                        syncobj::transfer(self.release_tl[image], point, fence, 1)
+                    }
+                    None => syncobj::timeline_signal(self.release_tl[image], point),
+                };
+                assert!(ok, "release of image {} at point {}", image, point);
+            }
+
+            /// One glxgears frame: acquire, draw, present.
+            fn frame(&mut self, f: u64) {
+                let image = (f as usize) % IMAGES;
+                let point = f + 1;
+                let mut waits = Vec::new();
+                if let Some(prev) = self.last_point[image] {
+                    // Mesa: the image's previous present AND its release,
+                    // merged, imported into the acquire semaphore, and the
+                    // surrogate closed on the spot.
+                    let merged = syncobj::merge_fences(&[
+                        (self.present_tl, prev),
+                        (self.release_tl[image], self.uses[image]),
+                    ]);
+                    assert!(syncobj::import_snapshot(self.sem[image], merged, 1));
+                    assert!(syncobj::destroy(merged));
+                    let t0 = Self::now();
+                    let mut stalled = false;
+                    loop {
+                        match syncobj::wait_ready(
+                            &[self.sem[image]],
+                            None,
+                            true,
+                            Self::now() + 1_000,
+                        ) {
+                            Some(Ok(_)) => break,
+                            None | Some(Err(syncobj::WaitOutcome::Timeout)) => {}
+                            Some(Err(_)) => {
+                                panic!(
+                                    "frame {}: the acquire semaphore of image {} vanished",
+                                    f, image
+                                )
+                            }
+                        }
+                        stalled = true;
+                        assert!(
+                            Self::now().wrapping_sub(t0) < STUCK_US,
+                            "frame {}: image {} (use {}) was never released to the client",
+                            f,
+                            image,
+                            self.uses[image]
+                        );
+                        let next = self.next_event();
+                        self.advance_to(next);
+                    }
+                    if stalled {
+                        self.client_stalls += 1;
+                    }
+                    waits.push(sync(self.sem[image]));
+                }
+                // Drawing into a buffer the compositor holds, or is still
+                // reading, is a torn desktop.
+                assert_ne!(
+                    self.held.map(|h| h.0),
+                    Some(image),
+                    "frame {}: draws into image {} while the compositor holds it",
+                    f,
+                    image
+                );
+                if let Some(p) = &self.pass {
+                    assert!(
+                        !(p.image == image && p.lands_at > Self::now()),
+                        "frame {}: draws into image {} while the compositor's pass is still reading it",
+                        f,
+                        image
+                    );
+                }
+                assert_eq!(
+                    exec(
+                        self.gpu,
+                        A,
+                        self.ch_client,
+                        &[push(PUSH_VA, 16)],
+                        &waits,
+                        &[sync_tl(self.present_tl, point)]
+                    ),
+                    Ok(0),
+                    "frame {}",
+                    f
+                );
+                let start = self.client_gpu_free_at.max(Self::now());
+                let lands_at = start + self.render_us;
+                self.client_gpu_free_at = lands_at;
+                self.client_queue.push_back((point, lands_at));
+                self.uses[image] += 1;
+                self.last_point[image] = Some(point);
+                self.inbox.push_back((image, point));
+                self.serve_commits();
+                if self.swap == Swap::Vsync {
+                    let t0 = Self::now();
+                    while self.comp_consumed < point {
+                        assert!(
+                            Self::now().wrapping_sub(t0) < STUCK_US,
+                            "frame {} never reached the panel",
+                            f
+                        );
+                        let next = self.next_event();
+                        self.advance_to(next);
+                    }
+                }
+            }
+
+            /// `frames` frames of glxgears; the frame rate they made.
+            fn run(&mut self, frames: u64) -> f64 {
+                let t0 = Self::now();
+                for f in 0..frames {
+                    self.frame(f);
+                }
+                while let Some(&(_, at)) = self.client_queue.front() {
+                    self.advance_to(at);
+                }
+                let elapsed = Self::now().wrapping_sub(t0);
+                frames as f64 * 1_000_000.0 / elapsed as f64
+            }
+
+            fn finish(mut self) {
+                if let Some(at) = self.pass.as_ref().map(|p| p.lands_at) {
+                    self.advance_to(at);
+                }
+                assert!(self.pass.is_none());
+                assert!(syncobj::destroy(self.present_tl));
+                for h in self.release_tl.iter().chain(self.sem.iter()) {
+                    assert!(syncobj::destroy(*h));
+                }
+                self.gpu.nouveau_release_process(A);
+                self.gpu.nouveau_release_process(COMP);
+                test_clock::set_auto_advance(0);
+                nv::set_surfaceflip_enabled(false);
+                assert_eq!(FAKE_RM.lock().bad, 0);
+            }
+        }
+
+        /// The frame rate is the GPU's, not the panel's: a 2 ms frame gives
+        /// ~500 fps against a 60 Hz compositor whose flips take the front end
+        /// 15 ms to fetch. Nothing the client or the compositor asks of the
+        /// kernel waits for a vblank.
+        #[test]
+        fn glxgears_with_vblank_mode_0_runs_at_the_speed_of_the_gpu_not_of_the_panel() {
+            let _g = LOCK.lock();
+            let _s = SERIAL.lock();
+            let _live = LiveBytes::hold();
+            let gpu = desktop_gpu();
+            let mut d = Desktop::new(&gpu, Swap::Immediate);
+            let fps = d.run(FRAMES);
+            assert!(
+                fps > 400.0,
+                "{:.0} fps: the client is paced by something other than its own frames",
+                fps
+            );
+            assert_eq!(
+                d.commits_served, FRAMES,
+                "every present reached the compositor"
+            );
+            // ~29 vblanks in 480 ms: one flip each, none of them waiting
+            // for the panel, and no drain before the next one either (the
+            // front end had a whole frame to fetch).
+            assert!(
+                (25..=32).contains(&d.flips),
+                "{} flips in {} frames",
+                d.flips,
+                FRAMES
+            );
+            assert!(
+                d.flip_cost_max_us < 200,
+                "a flip cost {} us of the compositor's time",
+                d.flip_cost_max_us
+            );
+            assert_eq!(SURFACEFLIP_FLIPS.load(Ordering::Relaxed), d.flips);
+            assert_eq!(SURFACEFLIP_DRAIN_WAITS.load(Ordering::Relaxed), 0);
+            assert_eq!(SURFACEFLIP_STUCK.load(Ordering::Relaxed), 0);
+            assert_eq!(SURFACEFLIP_BUSY_REFUSED.load(Ordering::Relaxed), 0);
+            d.finish();
+        }
+
+        /// The same client with `vblank_mode=1`: one frame per vblank,
+        /// exactly the refresh, and every frame reaches the panel.
+        #[test]
+        fn glxgears_with_vblank_mode_1_runs_at_exactly_the_refresh() {
+            let _g = LOCK.lock();
+            let _s = SERIAL.lock();
+            let _live = LiveBytes::hold();
+            let gpu = desktop_gpu();
+            let mut d = Desktop::new(&gpu, Swap::Vsync);
+            let fps = d.run(FRAMES);
+            assert!((fps - 60.0).abs() < 0.5, "{:.2} fps with vsync", fps);
+            assert_eq!(d.commits_served, FRAMES);
+            assert_eq!(d.flips, FRAMES, "one flip per frame");
+            assert_eq!(d.client_stalls, 0, "with vsync the images are always free");
+            d.finish();
+        }
+
+        /// A compositor pass that reads a buffer for most of a frame: the
+        /// release rides the pass's fence, and the client, three images
+        /// deep, waits for exactly that image and no other -- never drawing
+        /// into one the GPU is still sampling.
+        #[test]
+        fn the_client_never_draws_into_a_buffer_the_compositor_is_still_reading() {
+            let _g = LOCK.lock();
+            let _s = SERIAL.lock();
+            let _live = LiveBytes::hold();
+            let gpu = desktop_gpu();
+            let mut d = Desktop::new(&gpu, Swap::Immediate);
+            d.composite_us = 12_000;
+            let fps = d.run(FRAMES);
+            assert!(
+                d.releases_through_a_fence > 0,
+                "no release ever waited for a pass"
+            );
+            assert!(
+                d.client_stalls > 0,
+                "the client never had to wait for a release"
+            );
+            assert!(fps > 200.0, "{:.0} fps", fps);
+            assert_eq!(d.commits_served, FRAMES);
+            d.finish();
+        }
+
+        /// A scene heavier than a frame (30 ms on the GPU): the compositor
+        /// takes a frame only once it has landed, the panel repeats the last
+        /// one meanwhile, and the rate is the GPU's 33 fps -- below the
+        /// refresh, but not snapped to a divisor of it.
+        #[test]
+        fn a_frame_reaches_the_compositor_only_once_the_gpu_has_drawn_it() {
+            let _g = LOCK.lock();
+            let _s = SERIAL.lock();
+            let _live = LiveBytes::hold();
+            let gpu = desktop_gpu();
+            let mut d = Desktop::new(&gpu, Swap::Immediate);
+            d.render_us = 30_000;
+            let fps = d.run(60);
+            assert!((fps - 33.3).abs() < 1.0, "{:.2} fps", fps);
+            assert_eq!(d.commits_served, 60);
+            assert!(d.flips > 60, "the panel kept refreshing between frames");
+            d.finish();
+        }
+    }
 }
 
 /// The NVC57E surface flip on the host: `page_flip` against the fake ladder
@@ -21274,7 +21867,7 @@ mod surfaceflip_tests {
     /// The fixture below writes process-wide state (the boot framebuffer,
     /// the opt-in flag, the ladder latch and its counters), so the tests
     /// take turns.
-    static SERIAL: lock::Mutex<()> = lock::Mutex::new(());
+    pub(super) static SERIAL: lock::Mutex<()> = lock::Mutex::new(());
 
     const FB: u32 = 7;
     const H_MEMORY: u32 = 0x1234;
@@ -21780,6 +22373,11 @@ mod rm_host_shims {
         pub overpolled: bool,
         /// Polls each accepted flip leaves pending.
         pub fetch_polls: u64,
+        /// Microseconds of the test clock each accepted flip stays pending
+        /// (0: none): a front end that fetches in time, not in polls.
+        pub fetch_delay_us: u64,
+        /// The clock reading at which the current flip is fetched.
+        pub pending_until_us: u64,
         /// Every `hwflip_pending` call.
         pub polls: u64,
         /// Accepted flips: `(h_memory, plane offset, width, height, pitch)`.
@@ -21801,6 +22399,8 @@ mod rm_host_shims {
         pending_forever: false,
         overpolled: false,
         fetch_polls: 0,
+        fetch_delay_us: 0,
+        pending_until_us: 0,
         polls: 0,
         surfaces: Vec::new(),
         refused_busy: 0,
@@ -21848,10 +22448,15 @@ mod rm_host_shims {
         }
         if f.pending_polls > 0 {
             f.pending_polls -= 1;
-            1
-        } else {
-            0
+            return 1;
         }
+        if f.pending_until_us != 0 {
+            if crate::nvme::nvme_queue::test_clock::now() < f.pending_until_us {
+                return 1;
+            }
+            f.pending_until_us = 0;
+        }
+        0
     }
     #[no_mangle]
     extern "C" fn eclipse_rm_hwflip_surface(
@@ -21868,7 +22473,9 @@ mod rm_host_shims {
         }
         // The C side's safety net: nothing is written while the front end
         // still owes a fetch.
-        if f.pending_forever || f.pending_polls > 0 || f.refuse_busy_once {
+        let fetching = f.pending_until_us != 0
+            && crate::nvme::nvme_queue::test_clock::now() < f.pending_until_us;
+        if f.pending_forever || f.pending_polls > 0 || fetching || f.refuse_busy_once {
             f.refuse_busy_once = false;
             f.refused_busy += 1;
             return NV_ERR_BUSY_RETRY;
@@ -21876,6 +22483,11 @@ mod rm_host_shims {
         f.surfaces
             .push((h_memory, plane_offset, width, height, pitch));
         f.pending_polls = f.fetch_polls;
+        f.pending_until_us = if f.fetch_delay_us > 0 {
+            crate::nvme::nvme_queue::test_clock::now() + f.fetch_delay_us
+        } else {
+            0
+        };
         0
     }
     #[no_mangle]

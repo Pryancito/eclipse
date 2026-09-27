@@ -105,6 +105,7 @@ impl DisplayScheme for EmuDisplay {
     }
 
     fn fb(&self) -> FrameBuffer<'_> {
+        run_mid_blit_hook();
         // SAFETY: `fb_ptr()` owns `MAX_BYTES`, and `attach` refuses a geometry
         // that needs more than that, so `fb_bytes()` is always within it.
         unsafe { FrameBuffer::from_raw_parts_mut(fb_ptr(), fb_bytes()) }
@@ -112,6 +113,51 @@ impl DisplayScheme for EmuDisplay {
 
     fn fb_write_combining(&self) -> bool {
         CONFIG.lock().wc
+    }
+}
+
+/// A closure the emulated output runs every time a blit asks it for the
+/// framebuffer, with the number of times it has been asked so far (0 for the
+/// first band of a present).
+///
+/// This is the only way a test can make the SOURCE of a present change while the
+/// copy is already running. No arrangement of buffers beforehand produces it: the
+/// condition is that the compositor's rasteriser is still writing the buffer it
+/// already handed over, which is a race, and a race with nothing to hook is a
+/// race no test can stage. `blit_from` asks for the framebuffer once per band of
+/// `BLIT_CHUNK_ROWS` rows, so a hook that writes the client's buffer on band 1
+/// changes rows the present has already copied -- exactly the shape the present's
+/// repair pass exists for.
+type MidBlitHook = alloc::boxed::Box<dyn FnMut(usize) + Send>;
+static MID_BLIT: Mutex<Option<MidBlitHook>> = Mutex::new(None);
+static MID_BLIT_CALLS: AtomicU32 = AtomicU32::new(0);
+
+/// Run `f` each time the blit asks for the framebuffer, until [`clear_mid_blit`]
+/// or the [`Screen`] guard drops.
+pub(crate) fn on_blit_band(f: impl FnMut(usize) + Send + 'static) {
+    MID_BLIT_CALLS.store(0, Ordering::SeqCst);
+    *MID_BLIT.lock() = Some(alloc::boxed::Box::new(f));
+}
+
+/// Forget the hook. Called from [`Screen`]'s Drop, so a hook can never outlive
+/// the test that installed it and fire inside a neighbour's present.
+pub(crate) fn clear_mid_blit() {
+    *MID_BLIT.lock() = None;
+    MID_BLIT_CALLS.store(0, Ordering::SeqCst);
+}
+
+/// How many bands the blit has asked for since the hook was installed.
+pub(crate) fn mid_blit_calls() -> u32 {
+    MID_BLIT_CALLS.load(Ordering::SeqCst)
+}
+
+fn run_mid_blit_hook() {
+    let n = MID_BLIT_CALLS.fetch_add(1, Ordering::SeqCst) as usize;
+    // The lock is released before returning the framebuffer, and a hook that
+    // asked for the framebuffer again would deadlock -- which is why the hook
+    // takes a band number and writes the CLIENT's buffer, never this one.
+    if let Some(f) = MID_BLIT.lock().as_mut() {
+        f(n);
     }
 }
 
@@ -134,6 +180,7 @@ impl Drop for Screen {
     fn drop(&mut self) {
         // Detach first, THEN reset: unblanking with a display still registered
         // would clear it, and the reset has to happen with nothing to clear.
+        clear_mid_blit();
         if let Some(dev) = self.dev.take() {
             kernel_hal::drivers::remove_device_hosted(&dev);
         }
@@ -238,6 +285,26 @@ impl Screen {
         // validated against `MAX_BYTES`.
         unsafe { core::ptr::read((fb_ptr() as *const u32).add(off)) }
     }
+}
+
+/// Write one pixel of the emulated output directly, bypassing every present.
+///
+/// For putting a sentinel on the panel BETWEEN two blits of the same present --
+/// from a [`on_blit_band`] hook -- so a test can tell a copy that touched only
+/// the span it was asked for from one that repainted the whole window. Reading
+/// the destination afterwards cannot distinguish those two when the source
+/// agrees; a sentinel the wider copy would erase can.
+///
+/// Free of the [`Screen`] guard on purpose: the hook that calls it already runs
+/// inside a present, where the guard is borrowed.
+pub(crate) fn poke(pitch_px: u32, x: u32, y: u32, v: u32) {
+    let off = (y as usize) * (pitch_px as usize) + x as usize;
+    assert!(
+        off.saturating_mul(4) < MAX_BYTES,
+        "poke off the emulated scanout"
+    );
+    // SAFETY: bounds checked above against the allocation `fb_ptr()` owns.
+    unsafe { core::ptr::write((fb_ptr() as *mut u32).add(off), v) }
 }
 
 /// ---------------------------------------------------------------------------
