@@ -104,11 +104,11 @@ impl NvmeInterface {
 
         let stride = window.stride;
         let ready_timeout_us = window.ready_timeout_us;
-        let admin_queue = Arc::new(Mutex::new(NvmeQueue::new(0, window.admin_q_size)));
+        let admin_queue = Arc::new(Mutex::new(NvmeQueue::new(0, window.admin_q_size)?));
         let io_queues = vec![Arc::new(Mutex::new(NvmeQueue::<ProviderImpl>::new(
             1,
             window.io_q_size,
-        )))];
+        )?))];
 
         let mut interface = NvmeInterface {
             name: String::from("nvme"),
