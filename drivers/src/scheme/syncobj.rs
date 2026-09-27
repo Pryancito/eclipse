@@ -994,6 +994,36 @@ pub fn held_by(pid: u64, handle: u32) -> bool {
         .any(|o| o.handle == handle && o.refs > 0 && o.holders.contains(&pid))
 }
 
+/// Whether process `pid` may name `handle` in an ioctl at all. Linux keeps
+/// syncobj handles per `drm_file`, so a handle some other file created is
+/// simply not there (`drm_syncobj_find` -> ENOENT) for a SIGNAL, a RESET,
+/// a TRANSFER, a QUERY, a WAIT or an EXEC as much as for a DESTROY. Here
+/// the handle space is global and consecutive, so the holders recorded per
+/// reference stand in for the file: a handle with holders is usable by
+/// them alone; a live handle with NO holder (created by the kernel, a
+/// sync_file carrier, a merge, a test) belongs to no file and is usable by
+/// anyone; and pid 0 (no current thread: the kernel itself) may name any
+/// live handle. Before this, `destroy` was the only ioctl that asked, and
+/// a client guessing the compositor's handle numbers could signal its
+/// release timelines early, reset its acquire fences, or wait on them.
+pub fn usable_by(pid: u64, handle: u32) -> bool {
+    all_usable_by(pid, &[handle])
+}
+
+/// [`usable_by`] for a whole handle array, in ONE take of the lock: the
+/// array lookup Linux does first (`drm_syncobj_array_find`), so an ioctl
+/// over `[good, bad]` touches neither.
+pub fn all_usable_by(pid: u64, handles: &[u32]) -> bool {
+    let table = TABLE.lock();
+    handles.iter().all(|&h| {
+        table.objects.iter().any(|o| {
+            o.handle == h
+                && o.refs > 0
+                && (pid == 0 || o.holders.is_empty() || o.holders.contains(&pid))
+        })
+    })
+}
+
 /// The unresolved HW fences that will deliver at least `point` on `handle`,
 /// each as `(fence_va_cpu, fence_gpu_va, payload, ctx_idx)`. Used by EXEC to
 /// emit a GPU ACQUIRE per fence instead of spinning on the CPU. `fence_gpu_va`
@@ -3752,6 +3782,51 @@ mod tests {
         assert_eq!(links_now(), 0);
         assert!(destroy(a));
         assert!(destroy(b));
+    }
+
+    /// Linux finds a syncobj handle in the calling file's table and nowhere
+    /// else: another process's handle is ENOENT for every syncobj ioctl.
+    /// Here the handle space is global, and with DESTROY the only ioctl
+    /// that asked who held the handle, a client guessing the compositor's
+    /// (consecutive) handle numbers could signal its release timelines,
+    /// reset its acquire fences or wait on them. `usable_by` is the one
+    /// answer every arm now asks for, holders standing in for the file.
+    #[test]
+    fn a_syncobj_is_named_only_by_the_processes_that_hold_it() {
+        let _g = test_lock();
+        arm_hooks();
+        const A: u64 = 92_001;
+        const B: u64 = 92_002;
+        let a1 = create_for(A, false);
+        let b1 = create_for(B, true);
+        let kernel = create(false);
+        assert!(usable_by(A, a1) && usable_by(B, b1));
+        assert!(!usable_by(B, a1), "A's is not B's");
+        assert!(!usable_by(A, b1), "B's is not A's");
+        assert!(
+            usable_by(A, kernel) && usable_by(B, kernel),
+            "no file owns a handle nobody holds"
+        );
+        assert!(
+            usable_by(0, a1) && usable_by(0, b1) && usable_by(0, kernel),
+            "the kernel itself names any live handle"
+        );
+        assert!(!usable_by(A, 0xdead_0007) && !usable_by(0, 0xdead_0007));
+        // An import (an opaque FD_TO_HANDLE) makes B a holder of a1.
+        assert!(add_ref_for(B, a1));
+        assert!(usable_by(B, a1) && usable_by(A, a1));
+        // The array form is all-or-nothing, like `drm_syncobj_array_find`.
+        assert!(all_usable_by(A, &[a1, kernel]));
+        assert!(!all_usable_by(A, &[a1, b1]), "one of them is B's alone");
+        assert!(!all_usable_by(A, &[a1, 0xdead_0008]));
+        assert!(all_usable_by(A, &[]), "nothing to refuse");
+        // B gives its reference back: a1 is A's alone again.
+        assert!(destroy_for(B, a1));
+        assert!(!usable_by(B, a1) && usable_by(A, a1));
+        // A destroyed handle is nobody's, not even the kernel's.
+        assert!(destroy_for(A, a1));
+        assert!(!usable_by(A, a1) && !usable_by(0, a1));
+        assert!(destroy_for(B, b1) && destroy(kernel));
     }
 
     /// A syncobj handle is a `drm_file` thing in Linux: `SYNCOBJ_DESTROY`

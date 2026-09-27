@@ -1469,6 +1469,30 @@ impl Syscall<'_> {
                 return Err(e.into());
             }
         };
+        // Whichever way round, `h.handle` is one of the CALLER'S syncobjs:
+        // the one being exported, or the one an IMPORT_SYNC_FILE lands in.
+        // Linux finds it in the caller's file (`drm_syncobj_find`), so
+        // another process's handle is ENOENT. An opaque FD_TO_HANDLE
+        // creates the handle and reads none, so it is exempt.
+        let names_a_handle = is_handle_to_fd || (h.flags & SYNC_FILE != 0);
+        if names_a_handle
+            && !kernel_hal::drivers::scheme::syncobj::usable_by(
+                self.zircon_process().id(),
+                h.handle,
+            )
+        {
+            warn!(
+                "[drm] SYNCOBJ_{} ENOENT: handle={} is not a live syncobj of pid {}",
+                if is_handle_to_fd {
+                    "HANDLE_TO_FD"
+                } else {
+                    "FD_TO_HANDLE(IMPORT_SYNC_FILE)"
+                },
+                h.handle,
+                self.zircon_process().id()
+            );
+            return Err(LxError::ENOENT);
+        }
         // The `_SYNC_FILE` variants (same bit on both ioctls) move a single
         // FENCE rather than the syncobj itself: export takes the fence that is
         // current on `handle` and wraps it in an fd; import gives that fence
@@ -1771,7 +1795,10 @@ impl Syscall<'_> {
         }
         // Resolve both preconditions up front so the trace below can report the
         // EXACT reason, then apply them in order.
-        let live = kernel_hal::drivers::scheme::syncobj::query(req.handle).is_some();
+        // ...and it must be the caller's own (`drm_syncobj_find` in the
+        // caller's file): another process's handle is ENOENT.
+        let live =
+            kernel_hal::drivers::scheme::syncobj::usable_by(self.zircon_process().id(), req.handle);
         // The target must be an eventfd: delivery is a `write` of 1, which for
         // any other FileLike would mean something else entirely.
         let proc = self.linux_process();

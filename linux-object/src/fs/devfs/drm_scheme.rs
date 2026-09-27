@@ -2237,8 +2237,16 @@ impl DrmDev {
                 } else {
                     zcore_drivers::scheme::syncobj::signal
                 };
-                for i in 0..req.count_handles {
-                    let handle = unsafe { *(req.handles as *const u32).add(i as usize) };
+                // The whole array is looked up first, in the caller's own
+                // handles (`drm_syncobj_array_find`): one it does not hold
+                // is ENOENT and none of the others is touched.
+                let handles: alloc::vec::Vec<u32> = (0..req.count_handles as usize)
+                    .map(|i| unsafe { *(req.handles as *const u32).add(i) })
+                    .collect();
+                if !zcore_drivers::scheme::syncobj::all_usable_by(drm::current_pid(), &handles) {
+                    return Err(FsError::EntryNotFound);
+                }
+                for handle in handles {
                     if !apply(handle) {
                         return Err(FsError::EntryNotFound);
                     }
@@ -2273,8 +2281,15 @@ impl DrmDev {
                 }
                 ucheck_n::<u32>(req.handles as usize, req.count_handles as usize)?;
                 ucheck_n::<u64>(req.points as usize, req.count_handles as usize)?;
-                for i in 0..req.count_handles as usize {
-                    let handle = unsafe { *(req.handles as *const u32).add(i) };
+                // The caller's own handles, all of them, before any is
+                // signaled (`drm_syncobj_array_find`).
+                let handles: alloc::vec::Vec<u32> = (0..req.count_handles as usize)
+                    .map(|i| unsafe { *(req.handles as *const u32).add(i) })
+                    .collect();
+                if !zcore_drivers::scheme::syncobj::all_usable_by(drm::current_pid(), &handles) {
+                    return Err(FsError::EntryNotFound);
+                }
+                for (i, handle) in handles.into_iter().enumerate() {
                     let point = unsafe { *(req.points as *const u64).add(i) };
                     if !zcore_drivers::scheme::syncobj::timeline_signal(handle, point) {
                         return Err(FsError::EntryNotFound);
@@ -2291,6 +2306,13 @@ impl DrmDev {
                     return Err(FsError::OpNotSupported);
                 }
                 let req = unsafe { &*(data as *const DrmSyncobjTransfer) };
+                // Both ends must be the caller's (`drm_syncobj_find` on each).
+                if !zcore_drivers::scheme::syncobj::all_usable_by(
+                    drm::current_pid(),
+                    &[req.dst_handle, req.src_handle],
+                ) {
+                    return Err(FsError::EntryNotFound);
+                }
                 let ok = zcore_drivers::scheme::syncobj::transfer(
                     req.dst_handle,
                     req.dst_point,
@@ -2333,9 +2355,16 @@ impl DrmDev {
                 // terminator (`libvulkan_nouveau.so+0x9cc48`).
                 ucheck_n::<u32>(req.handles as usize, req.count_handles as usize)?;
                 ucheck_n::<u64>(req.points as usize, req.count_handles as usize)?;
+                // The caller's own handles, all of them, before any point is
+                // written back (`drm_syncobj_array_find`).
+                let handles: alloc::vec::Vec<u32> = (0..req.count_handles as usize)
+                    .map(|i| unsafe { *(req.handles as *const u32).add(i) })
+                    .collect();
+                if !zcore_drivers::scheme::syncobj::all_usable_by(drm::current_pid(), &handles) {
+                    return Err(FsError::EntryNotFound);
+                }
                 let mut first_pt = 0u64;
-                for i in 0..req.count_handles as usize {
-                    let handle = unsafe { *(req.handles as *const u32).add(i) };
+                for (i, handle) in handles.into_iter().enumerate() {
                     let looked_up = if last_submitted {
                         zcore_drivers::scheme::syncobj::query_submitted(handle)
                     } else {
@@ -2407,6 +2436,12 @@ impl DrmDev {
                 let handles: alloc::vec::Vec<u32> = (0..count_handles as usize)
                     .map(|i| unsafe { *(handles_ptr as *const u32).add(i) })
                     .collect();
+                // The caller's own handles (`drm_syncobj_array_find`): a wait
+                // on another process's syncobj is ENOENT, not a wait.
+                if !zcore_drivers::scheme::syncobj::all_usable_by(drm::current_pid(), &handles) {
+                    syncobj_wait_klog(timeline, &handles, "not the caller's handle (ENOENT)");
+                    return Err(FsError::EntryNotFound);
+                }
                 let points: Option<alloc::vec::Vec<u64>> = if timeline && points_ptr != 0 {
                     Some(
                         (0..count_handles as usize)
