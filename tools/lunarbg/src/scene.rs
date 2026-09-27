@@ -233,24 +233,7 @@ pub fn render_base(w: usize, h: usize, monitor_aspect: Option<f32>, scale: u32) 
 
     // Blueprint grid, 48 logical px; each line is `scale` px wide so its
     // physical weight matches the scale-1 look.
-    let spacing = 48 * scu;
-    for y in (0..h).step_by(spacing) {
-        for yy in y..(y + scu).min(h) {
-            for x in 0..w {
-                blend_px_f(&mut buf, w, x, yy, GRID_BLUE, 0.38);
-            }
-        }
-    }
-    for x in (0..w).step_by(spacing) {
-        for xx in x..(x + scu).min(w) {
-            for y in 0..h {
-                // Skip the rows the horizontal lines already painted.
-                if y % spacing >= scu {
-                    blend_px_f(&mut buf, w, xx, y, GRID_BLUE, 0.38);
-                }
-            }
-        }
-    }
+    grid_pass(&mut buf, w, h, 48 * scu, scu);
 
     // Quantise to XRGB8888 with light dithering noise. Also a full-surface
     // pass: split `out` by band, read the float buffer by absolute pixel index.
@@ -520,17 +503,13 @@ impl PixBuf<'_> {
 
     fn clip_span_x(&self, c: f32, r: f32) -> (usize, usize) {
         let lo = (c - r).floor().max(self.clip.0 as f32) as usize;
-        let hi = ((c + r).ceil() as usize)
-            .saturating_add(1)
-            .min(self.clip.2);
+        let hi = ((c + r).ceil() as usize).saturating_add(1).min(self.clip.2);
         (lo, hi)
     }
 
     fn clip_span_y(&self, c: f32, r: f32) -> (usize, usize) {
         let lo = (c - r).floor().max(self.clip.1 as f32) as usize;
-        let hi = ((c + r).ceil() as usize)
-            .saturating_add(1)
-            .min(self.clip.3);
+        let hi = ((c + r).ceil() as usize).saturating_add(1).min(self.clip.3);
         (lo, hi)
     }
 
@@ -844,10 +823,53 @@ fn add_px_f(buf: &mut [f32], w: usize, h: usize, x: i32, y: i32, c: Rgb) {
     buf[i + 2] += c.2;
 }
 
-fn blend_px_f(buf: &mut [f32], w: usize, x: usize, y: usize, c: Rgb, a: f32) {
-    // Bounds-check like `add_px_f`: today's callers keep x<w and y<h, but an
-    // unclamped coordinate would index past the safe slice and panic (abort).
-    // Guard it so a future caller can't turn a coordinate bug into a crash.
+/// Paint the blueprint grid: full rows every `spacing` pixels and full columns
+/// every `spacing` pixels, each line `line` pixels thick.
+///
+/// **Every pixel is blended AT MOST ONCE.** The blend is not idempotent
+/// (`v*(1-a) + c*a` applied twice lands twice as far towards the grid colour),
+/// so a pixel caught by both passes would come out darker than the lines
+/// crossing it: a visibly wrong dot at every intersection of the grid. The
+/// column pass therefore skips the rows the row pass already painted, which is
+/// exactly `y % spacing < line`. Extracted from `render_base` so that
+/// invariant has somewhere to be tested.
+fn grid_pass(buf: &mut [f32], w: usize, h: usize, spacing: usize, line: usize) {
+    // `.min(h)` / `.min(w)` on the line bands below are an optimisation, not a
+    // guard: `blend_px_f` discards a coordinate past the buffer, so dropping
+    // them changes no pixel. Kept so the loops do not walk rows that cannot
+    // exist.
+    let (spacing, line) = (spacing.max(1), line.max(1));
+    for y in (0..h).step_by(spacing) {
+        for yy in y..(y + line).min(h) {
+            for x in 0..w {
+                blend_px_f(buf, w, h, x, yy, GRID_BLUE, 0.38);
+            }
+        }
+    }
+    for x in (0..w).step_by(spacing) {
+        for xx in x..(x + line).min(w) {
+            for y in 0..h {
+                // Skip the rows the row pass already painted.
+                if y % spacing >= line {
+                    blend_px_f(buf, w, h, xx, y, GRID_BLUE, 0.38);
+                }
+            }
+        }
+    }
+}
+
+fn blend_px_f(buf: &mut [f32], w: usize, h: usize, x: usize, y: usize, c: Rgb, a: f32) {
+    // Bounds-check like `add_px_f`, which means the X check too: this used to
+    // rely on `get_mut` alone, and a row-major index hides an x overflow
+    // instead of catching it. With x == w the slice offset lands on pixel 0 of
+    // the NEXT row, inside the buffer, so `get_mut` succeeds and the write
+    // silently lands on the wrong pixel -- a stray dot one row down, in the
+    // one helper written to make a coordinate bug harmless. Only x == w on the
+    // last row is caught by the slice, so the discard the comment promised was
+    // there for a single pixel of the whole buffer.
+    if x >= w || y >= h {
+        return;
+    }
     let i = (y * w + x) * 3;
     let Some(px) = buf.get_mut(i..i + 3) else {
         return;
@@ -864,4 +886,492 @@ fn hash2(a: u32, b: u32) -> u32 {
     x ^= x >> 15;
     x = x.wrapping_mul(0x846c_a68b);
     x ^ (x >> 16)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The alpha byte of every pixel: the wallpaper is committed as XRGB8888
+    /// and declared fully opaque, so a 0 here is a transparent hole in a
+    /// surface the compositor was told it may cull everything beneath.
+    fn every_alpha_is_opaque(buf: &[u8]) -> bool {
+        buf.as_chunks::<4>().0.iter().all(|px| px[3] == 0xff)
+    }
+
+    #[test]
+    fn an_aspect_is_read_as_a_ratio_or_a_number_and_nonsense_is_refused() {
+        assert_eq!(parse_aspect("16:9"), Some(16.0 / 9.0));
+        assert_eq!(parse_aspect(" 16 : 9 "), Some(16.0 / 9.0));
+        assert_eq!(parse_aspect("1.7777778"), Some(1.7777778));
+        assert_eq!(parse_aspect("4:3"), Some(4.0 / 3.0));
+        // Refused, each for its own reason.
+        assert_eq!(parse_aspect(""), None);
+        assert_eq!(parse_aspect("abc"), None);
+        assert_eq!(parse_aspect("16:"), None);
+        assert_eq!(parse_aspect(":9"), None);
+        assert_eq!(parse_aspect("-2"), None); // negative
+        assert_eq!(parse_aspect("0"), None); // zero
+        assert_eq!(parse_aspect("0.05"), None); // past the 0.1 floor
+        assert_eq!(parse_aspect("16:0"), None); // divide by zero -> inf
+        assert_eq!(parse_aspect("nan"), None);
+        assert_eq!(parse_aspect("inf"), None);
+    }
+
+    #[test]
+    fn the_animated_region_always_sits_inside_the_buffer() {
+        // `render_frame` restores this rect from the base and clips every
+        // stroke to it; a region past the buffer is an early return, so the
+        // whole logo silently stops being drawn.
+        for scale in 1..=4u32 {
+            for (w, h) in [
+                (1usize, 1usize),
+                (2, 3),
+                (16, 16),
+                (320, 240),
+                (640, 480),
+                (1280, 720),
+                (1920, 1080),
+                (3840, 2160),
+                (1080, 1920), // portrait
+                (3840, 600),  // ultrawide
+            ] {
+                let lay = layout(w, h, None, scale);
+                let (rx, ry, rw, rh) = lay.region;
+                assert!(
+                    rx + rw <= w && ry + rh <= h,
+                    "{w}x{h} scale {scale}: region {:?} leaves the buffer",
+                    lay.region
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_stretching_panel_squeezes_the_logo_and_a_bogus_aspect_does_not() {
+        // 1920x1080 buffer shown on a 16:10 panel: circles must be drawn as
+        // ellipses so they read round, i.e. sx != 1.
+        let stretched = layout(1920, 1080, Some(16.0 / 10.0), 1);
+        assert!(stretched.sx > 1.0, "sx = {}", stretched.sx);
+        // Same aspect as the buffer: nothing to correct.
+        let square = layout(1920, 1080, Some(16.0 / 9.0), 1);
+        assert!((square.sx - 1.0).abs() < 1e-5, "sx = {}", square.sx);
+        // No aspect, or one that cannot be believed: no squeeze at all,
+        // never a NaN that would poison every coordinate downstream.
+        for a in [
+            None,
+            Some(f32::NAN),
+            Some(0.0),
+            Some(-3.0),
+            Some(f32::INFINITY),
+        ] {
+            let l = layout(1920, 1080, a, 1);
+            assert_eq!(l.sx, 1.0, "aspect {a:?} should not squeeze");
+        }
+        // And the squeeze is clamped, so an absurd panel aspect cannot fling
+        // the logo off the surface.
+        for a in [0.2f32, 0.5, 100.0] {
+            let l = layout(1920, 1080, Some(a), 1);
+            assert!((0.5..=1.5).contains(&l.sx), "aspect {a}: sx = {}", l.sx);
+        }
+    }
+
+    #[test]
+    fn the_hidpi_scale_multiplies_the_design_not_the_layout() {
+        // The design is sized in logical pixels and multiplied back up, so a
+        // 2x buffer of the same logical size must place the logo at twice the
+        // coordinates with twice the stroke weight.
+        let one = layout(1920, 1080, None, 1);
+        let two = layout(3840, 2160, None, 2);
+        assert!((two.cx - one.cx * 2.0).abs() < 1e-3);
+        assert!((two.cy - one.cy * 2.0).abs() < 1e-3);
+        assert!((two.s - one.s * 2.0).abs() < 1e-3);
+        assert_eq!(two.px, 2.0);
+        assert_eq!(one.px, 1.0);
+        // A 0 scale must not divide by zero: it is treated as 1.
+        let zero = layout(1920, 1080, None, 0);
+        assert_eq!(zero.px, 1.0);
+        assert!(zero.s.is_finite() && zero.s > 0.0);
+    }
+
+    #[test]
+    fn the_base_scene_is_opaque_the_right_size_and_reproducible() {
+        let (w, h) = (97usize, 61usize); // deliberately not multiples of 48
+        let a = render_base(w, h, None, 1).expect("base");
+        assert_eq!(a.len(), w * h * 4);
+        assert!(every_alpha_is_opaque(&a));
+        // Two builds of the same rootfs must give the same wallpaper: the
+        // dither noise is a hash of the pixel offset, not a random number.
+        let b = render_base(w, h, None, 1).expect("base");
+        assert_eq!(a, b, "the base scene is not reproducible");
+    }
+
+    #[test]
+    fn a_size_that_would_overflow_the_allocation_returns_none() {
+        // Instead of aborting inside a giant `vec!` under panic=abort.
+        assert!(render_base(usize::MAX, 2, None, 1).is_none());
+        assert!(render_base(usize::MAX / 3, 4, None, 1).is_none());
+    }
+
+    #[test]
+    fn a_frame_repaints_only_the_region_it_declared() {
+        // The commit damages the whole buffer, but the RENDER only restores
+        // and repaints `region`. A stroke escaping it would leave a trail
+        // that no later frame ever cleans up, because nothing outside the
+        // region is ever restored from the base again.
+        let (w, h) = (400usize, 300usize);
+        let base = render_base(w, h, None, 1).expect("base");
+        let lay = layout(w, h, None, 1);
+        let (rx, ry, rw, rh) = lay.region;
+        let mut frame = base.clone();
+        render_frame(&mut frame, w, &base, &lay, 1234);
+        assert_ne!(frame, base, "the frame painted nothing at all");
+        for y in 0..h {
+            for x in 0..w {
+                let inside = x >= rx && x < rx + rw && y >= ry && y < ry + rh;
+                if inside {
+                    continue;
+                }
+                let i = (y * w + x) * 4;
+                assert_eq!(
+                    frame[i..i + 4],
+                    base[i..i + 4],
+                    "pixel ({x},{y}) outside region {:?} was touched",
+                    lay.region
+                );
+            }
+        }
+        assert!(every_alpha_is_opaque(&frame));
+    }
+
+    #[test]
+    fn a_frame_starts_from_the_base_so_the_previous_one_cannot_accumulate() {
+        // Buffers alternate, so the one being drawn carries the logo from two
+        // frames ago; `render_frame` restores the region from the base first.
+        // Without that restore the anti-aliased strokes pile up into a smear.
+        let (w, h) = (300usize, 220usize);
+        let base = render_base(w, h, None, 1).expect("base");
+        let lay = layout(w, h, None, 1);
+        let mut once = base.clone();
+        render_frame(&mut once, w, &base, &lay, 900);
+        // Same clock, but on top of a frame that already holds another one.
+        let mut twice = base.clone();
+        render_frame(&mut twice, w, &base, &lay, 4321);
+        render_frame(&mut twice, w, &base, &lay, 900);
+        assert_eq!(once, twice, "an earlier frame survived into this one");
+    }
+
+    #[test]
+    fn a_frame_refuses_a_buffer_that_does_not_match_instead_of_panicking() {
+        let (w, h) = (64usize, 48usize);
+        let base = render_base(w, h, None, 1).expect("base");
+        let lay = layout(w, h, None, 1);
+        // Zero width, a shorter frame than one row, and a base of a different
+        // size are all early returns: under panic=abort a slice panic here
+        // would kill the wallpaper outright.
+        let mut f = base.clone();
+        render_frame(&mut f, 0, &base, &lay, 10);
+        assert_eq!(f, base);
+        let mut short = vec![0u8; 4];
+        render_frame(&mut short, w, &base, &lay, 10);
+        assert_eq!(short, vec![0u8; 4]);
+        let mut f = base.clone();
+        let other = render_base(32, 24, None, 1).expect("base");
+        render_frame(&mut f, w, &other, &lay, 10);
+        assert_eq!(f, base, "a mismatched base must be refused, not blitted");
+        // And a region bigger than the buffer (a layout from another size).
+        // Checked on a buffer that does NOT already hold the base, because a
+        // partial restore of base onto base is invisible: the rows are copied
+        // and the run only stops at the first row that would leave the slice,
+        // after which the strokes are clipped to a window wider than the
+        // buffer, so `blend` indexes row y+1 for every x past the edge.
+        let big = layout(1920, 1080, None, 1);
+        let mut blank = vec![0u8; base.len()];
+        render_frame(&mut blank, w, &base, &big, 10);
+        assert!(
+            blank.iter().all(|b| *b == 0),
+            "a region from another size painted into the buffer anyway"
+        );
+        let mut f = base.clone();
+        render_frame(&mut f, w, &base, &big, 10);
+        assert_eq!(f, base);
+
+        // The case the per-row length check alone does NOT catch: a region
+        // that fits inside the buffer as a flat slice but runs off the end of
+        // its ROW. `off..end` for every row stays in bounds, so the restore
+        // happily copies across the row boundary, and the clip then admits
+        // x >= w so every stroke past the edge lands one row down. This is why
+        // the region is validated against w and h and not just against len.
+        let escaping = Layout {
+            region: (w - 4, 0, 10, 4),
+            ..layout(w, h, None, 1)
+        };
+        assert!(escaping.region.0 + escaping.region.2 > w);
+        let mut blank = vec![0u8; base.len()];
+        render_frame(&mut blank, w, &base, &escaping, 10);
+        assert!(
+            blank.iter().all(|b| *b == 0),
+            "a region running off the end of its row was drawn anyway"
+        );
+        // Same for one that runs off the bottom.
+        let tall = Layout {
+            region: (0, h - 2, 4, 9),
+            ..layout(w, h, None, 1)
+        };
+        let mut blank = vec![0u8; base.len()];
+        render_frame(&mut blank, w, &base, &tall, 10);
+        assert!(
+            blank.iter().all(|b| *b == 0),
+            "a region running off the bottom was drawn anyway"
+        );
+    }
+
+    #[test]
+    fn an_x_past_the_row_is_discarded_and_not_written_to_the_next_row() {
+        // `blend_px_f` bounds-checked with `get_mut` alone, which cannot see an
+        // x overflow: a row-major index with x == w lands on pixel 0 of the
+        // NEXT row, still inside the buffer, so the write landed on the wrong
+        // pixel instead of being dropped.
+        let (w, h) = (4usize, 3usize);
+        let mut buf = vec![0f32; w * h * 3];
+        blend_px_f(&mut buf, w, h, w, 0, (1.0, 1.0, 1.0), 1.0);
+        assert!(
+            buf.iter().all(|v| *v == 0.0),
+            "x == w wrote somewhere: {buf:?}"
+        );
+        blend_px_f(&mut buf, w, h, w + 7, 1, (1.0, 1.0, 1.0), 1.0);
+        assert!(buf.iter().all(|v| *v == 0.0), "x past w wrote somewhere");
+        blend_px_f(&mut buf, w, h, 0, h, (1.0, 1.0, 1.0), 1.0);
+        assert!(buf.iter().all(|v| *v == 0.0), "y == h wrote somewhere");
+        // A y big enough to WRAP `y * w` is why the explicit check has to be
+        // there and not just the slice bound: the wrapped product can land
+        // back inside the buffer (and in a debug build it panics outright,
+        // which under panic=abort is the wallpaper gone).
+        blend_px_f(&mut buf, w, h, 0, usize::MAX, (1.0, 1.0, 1.0), 1.0);
+        blend_px_f(&mut buf, w, h, 0, usize::MAX / w + 1, (1.0, 1.0, 1.0), 1.0);
+        assert!(buf.iter().all(|v| *v == 0.0), "a wrapped y wrote somewhere");
+        // A coordinate inside still paints, at the pixel asked for.
+        blend_px_f(&mut buf, w, h, 3, 1, (1.0, 0.5, 0.25), 1.0);
+        let i = (w + 3) * 3;
+        assert_eq!((buf[i], buf[i + 1], buf[i + 2]), (1.0, 0.5, 0.25));
+    }
+
+    #[test]
+    fn the_two_pixel_helpers_agree_on_what_is_out_of_bounds() {
+        let (w, h) = (5usize, 4usize);
+        for y in 0..h + 2 {
+            for x in 0..w + 2 {
+                let mut add = vec![0f32; w * h * 3];
+                let mut blend = vec![0f32; w * h * 3];
+                add_px_f(&mut add, w, h, x as i32, y as i32, (1.0, 1.0, 1.0));
+                blend_px_f(&mut blend, w, h, x, y, (1.0, 1.0, 1.0), 1.0);
+                assert_eq!(
+                    add.iter().any(|v| *v != 0.0),
+                    blend.iter().any(|v| *v != 0.0),
+                    "({x},{y}) in a {w}x{h} buffer: the two helpers disagree"
+                );
+            }
+        }
+        // Negative coordinates only `add_px_f` can be handed (it takes i32).
+        let mut add = vec![0f32; w * h * 3];
+        add_px_f(&mut add, w, h, -1, 0, (1.0, 1.0, 1.0));
+        add_px_f(&mut add, w, h, 0, -1, (1.0, 1.0, 1.0));
+        assert!(add.iter().all(|v| *v == 0.0));
+    }
+
+    #[test]
+    fn a_star_block_off_the_edge_is_clipped_not_wrapped() {
+        let (w, h) = (6usize, 5usize);
+        let mut buf = vec![0f32; w * h * 3];
+        // A 3x3 block anchored one pixel inside the right edge: two of its
+        // three columns fall off and must not appear on the next row.
+        star_block(&mut buf, w, h, w as i32 - 1, 0, 3, (1.0, 1.0, 1.0));
+        for y in 0..h {
+            for x in 0..w {
+                let lit = buf[(y * w + x) * 3] != 0.0;
+                let want = x == w - 1 && y < 3;
+                assert_eq!(lit, want, "({x},{y}) lit={lit} want={want}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_grid_blends_every_pixel_at_most_once() {
+        // The blend is not idempotent, so a pixel caught by both passes comes
+        // out darker than the lines crossing it: a wrong dot at every
+        // intersection. Painting a 1.0 white over a 0.0 buffer at a=0.38
+        // leaves exactly 0.38; twice leaves 0.6156.
+        for (w, h, spacing, line) in [
+            (200usize, 150usize, 48usize, 1usize),
+            (200, 150, 48, 2),
+            (200, 150, 96, 2),
+            (49, 49, 48, 1),
+            (200, 150, 7, 3),
+            (10, 10, 1, 1),
+        ] {
+            let mut buf = vec![0f32; w * h * 3];
+            grid_pass(&mut buf, w, h, spacing, line);
+            let once = 0.38f32;
+            for (i, v) in buf.iter().enumerate() {
+                let (px, ch) = (i / 3, i % 3);
+                let (x, y) = (px % w, px / w);
+                let expect = if y % spacing < line || x % spacing < line {
+                    grid_blue_ch(ch) * once
+                } else {
+                    0.0
+                };
+                assert!(
+                    (v - expect).abs() < 1e-5,
+                    "{w}x{h} spacing {spacing} line {line}: ({x},{y}) ch {ch} \
+                     is {v}, expected {expect} (blended twice?)"
+                );
+            }
+        }
+    }
+
+    fn grid_blue_ch(ch: usize) -> f32 {
+        match ch {
+            0 => GRID_BLUE.0,
+            1 => GRID_BLUE.1,
+            _ => GRID_BLUE.2,
+        }
+    }
+
+    #[test]
+    fn a_zero_spacing_or_line_does_not_divide_by_zero_or_hang() {
+        // `step_by(0)` panics, and under panic=abort that is a dead wallpaper.
+        let (w, h) = (8usize, 6usize);
+        let mut buf = vec![0f32; w * h * 3];
+        grid_pass(&mut buf, w, h, 0, 0);
+        // Treated as 1/1: every pixel painted once.
+        assert!(buf.iter().all(|v| *v > 0.0));
+    }
+
+    #[test]
+    fn every_character_the_scene_draws_has_a_glyph() {
+        // An unknown character falls back to a blank 5x7 cell, so a typo in
+        // the ring text or the wordmark deletes a letter from the wallpaper
+        // without any complaint. The space is the one deliberate blank.
+        for ch in TEXT_RING.chars().chain("ECLIPSE OS".chars()) {
+            let bits = glyph5x7(ch);
+            if ch == ' ' {
+                assert_eq!(bits, [0; 7], "the space should stay blank");
+                continue;
+            }
+            assert_ne!(bits, [0; 7], "'{ch}' draws a blank cell");
+        }
+    }
+
+    #[test]
+    fn a_glyph_never_sets_a_bit_outside_its_five_columns() {
+        // The renderer walks columns 0..5 with the mask 0b10000 >> col, so a
+        // row with bit 5 or above set silently loses that pixel.
+        for ch in TEXT_RING.chars().chain("ECLIPSE OS".chars()) {
+            for (row, bits) in glyph5x7(ch).iter().enumerate() {
+                assert_eq!(
+                    bits & !0b11111,
+                    0,
+                    "'{ch}' row {row} = {bits:#07b} sets a bit past column 5"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_span_never_leaves_the_buffer_and_never_runs_backwards() {
+        for limit in [0usize, 1, 7, 1920] {
+            for c in [-1000.0f32, -1.0, 0.0, 0.5, 100.0, 1e9] {
+                for r in [0.0f32, 0.4, 3.0, 5000.0] {
+                    let (lo, hi) = span(c, r, limit);
+                    assert!(hi <= limit, "span({c},{r},{limit}) = {lo}..{hi}");
+                    // An empty range is fine; a reversed one would panic in a
+                    // `for` loop over `lo..hi`... it does not, but a reversed
+                    // range silently draws nothing, which is worse to debug.
+                    if lo > hi {
+                        assert!(
+                            lo >= limit,
+                            "span({c},{r},{limit}) = {lo}..{hi} runs backwards \
+                             inside the buffer"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_distance_helpers_behave_at_their_edges() {
+        assert_eq!(dist(3.0, 4.0, 0.0, 0.0), 5.0);
+        assert_eq!(dist(1.0, 1.0, 1.0, 1.0), 0.0);
+        // A capsule with both ends at the same point degenerates to a circle
+        // instead of dividing by zero.
+        assert_eq!(capsule_dist(3.0, 4.0, 0.0, 0.0, 0.0, 0.0), 5.0);
+        // On the segment, off the ends, and past the ends (clamped to them).
+        assert_eq!(capsule_dist(5.0, 0.0, 0.0, 0.0, 10.0, 0.0), 0.0);
+        assert_eq!(capsule_dist(5.0, 2.0, 0.0, 0.0, 10.0, 0.0), 2.0);
+        assert_eq!(capsule_dist(-3.0, 0.0, 0.0, 0.0, 10.0, 0.0), 3.0);
+        assert_eq!(capsule_dist(14.0, 0.0, 0.0, 0.0, 10.0, 0.0), 4.0);
+    }
+
+    #[test]
+    fn a_colour_mix_stays_between_its_two_ends() {
+        assert_eq!(lerp3(COSMIC_DEEP, COSMIC_MID, 0.0), COSMIC_DEEP);
+        assert_eq!(lerp3(COSMIC_DEEP, COSMIC_MID, 1.0), COSMIC_MID);
+        // Out-of-range t is clamped, not extrapolated into a negative colour.
+        assert_eq!(lerp3(COSMIC_DEEP, COSMIC_MID, -5.0), COSMIC_DEEP);
+        assert_eq!(lerp3(COSMIC_DEEP, COSMIC_MID, 5.0), COSMIC_MID);
+        let mid = lerp3((0.0, 0.0, 0.0), (1.0, 1.0, 1.0), 0.5);
+        assert_eq!(mid, (0.5, 0.5, 0.5));
+    }
+
+    #[test]
+    fn the_star_hash_spreads_and_is_stable() {
+        // It places the stars and the dither noise: identical output for the
+        // same input is what makes two builds give the same wallpaper.
+        assert_eq!(hash2(7, 9), hash2(7, 9));
+        assert_ne!(hash2(7, 9), hash2(9, 7), "the hash is symmetric in a,b");
+        // No input collapses it to zero, and the low bits move (the star
+        // positions are `hash2(i, 1) % lw`, so a hash with dead low bits
+        // would stack every star in the same column).
+        let mut lows = std::collections::HashSet::new();
+        for i in 0..256u32 {
+            let hv = hash2(i, 1);
+            assert_ne!(hv, 0, "hash2({i},1) == 0");
+            lows.insert(hv % 64);
+        }
+        assert!(lows.len() > 50, "only {} distinct low values", lows.len());
+    }
+
+    #[test]
+    fn a_one_pixel_surface_renders_without_panicking() {
+        // The smallest thing a compositor can configure. Every span, region
+        // and chunk math has to survive it: this is the size a broken
+        // wl_output mode produces, and an abort here is a black desktop.
+        for (w, h) in [(1usize, 1usize), (1, 100), (100, 1), (2, 2), (3, 7)] {
+            let base = render_base(w, h, None, 1).unwrap_or_else(|| panic!("{w}x{h}"));
+            assert_eq!(base.len(), w * h * 4);
+            assert!(every_alpha_is_opaque(&base));
+            let lay = layout(w, h, None, 1);
+            let mut frame = base.clone();
+            render_frame(&mut frame, w, &base, &lay, 7777);
+            assert_eq!(frame.len(), base.len());
+            assert!(every_alpha_is_opaque(&frame));
+        }
+    }
+
+    #[test]
+    fn the_scene_survives_a_long_uptime_clock() {
+        // The phase is accumulated in f64 and folded per element; an f32
+        // phase loses sub-frame resolution after days and the animation turns
+        // steppy. Two clocks a frame apart must still differ after 40 days.
+        let (w, h) = (200usize, 150usize);
+        let base = render_base(w, h, None, 1).expect("base");
+        let lay = layout(w, h, None, 1);
+        let far = 40 * 24 * 3600 * 1000u64;
+        let mut a = base.clone();
+        let mut b = base.clone();
+        render_frame(&mut a, w, &base, &lay, far);
+        render_frame(&mut b, w, &base, &lay, far + 42);
+        assert_ne!(a, b, "the animation has stopped moving after 40 days");
+    }
 }

@@ -168,6 +168,23 @@ struct Background {
     frames: Option<Frames>,
 }
 
+/// One XRGB8888 frame's size in bytes and the whole pool's, for a `w` x `h`
+/// buffer holding [`BUFFERS`] frames back to back.
+///
+/// wl_shm sizes travel as `i32`, so a pool past that (a 16K output, or 8K at 2x
+/// scale) must be refused, and the size math itself is checked so a hostile
+/// configure cannot wrap it past the guard in release builds.
+///
+/// Both the allocation path and the per-frame path go through this: the seed
+/// writes buffer 1 at exactly `frame_size`, and the offsets handed to
+/// `wl_shm_pool.create_buffer` are multiples of it, so a second formula
+/// anywhere would put the frames and the buffers at different places.
+fn pool_geometry(w: usize, h: usize) -> Option<(usize, usize)> {
+    let frame = w.checked_mul(4)?.checked_mul(h)?;
+    let total = frame.checked_mul(BUFFERS)?;
+    (total <= i32::MAX as usize).then_some((frame, total))
+}
+
 /// Post surface damage for a rect given in BUFFER pixels.
 ///
 /// `wl_surface.damage_buffer` is a version-4 request, but the surface's
@@ -183,12 +200,24 @@ fn damage(surface: &wl_surface::WlSurface, scale: u32, x: i32, y: i32, w: i32, h
         surface.damage_buffer(x, y, w, h);
         return;
     }
+    let (x0, y0, dw, dh) = damage_rect(scale, x, y, w, h);
+    surface.damage(x0, y0, dw, dh);
+}
+
+/// The v1 `wl_surface.damage` rect, in SURFACE coordinates, for a rect given
+/// in BUFFER pixels at `scale`.
+///
+/// Rounded OUTWARDS on both edges: the origin down, the far edge up. Damage
+/// that under-covers the repainted pixels leaves the compositor showing stale
+/// content, which on a wallpaper is a band of the previous frame that never
+/// goes away, so the rounding has to err wide.
+fn damage_rect(scale: u32, x: i32, y: i32, w: i32, h: i32) -> (i32, i32, i32, i32) {
     let s = scale.max(1) as i32;
     // All four are non-negative here (buffer-space rects), so the usual
     // round-up idiom is safe; i32::div_ceil is still unstable.
     let (x0, y0) = (x / s, y / s);
     let (x1, y1) = ((x + w + s - 1) / s, (y + h + s - 1) / s);
-    surface.damage(x0, y0, x1 - x0, y1 - y0);
+    (x0, y0, x1 - x0, y1 - y0)
 }
 
 /// Everything we track per `wl_output` global.
@@ -428,12 +457,12 @@ impl State {
             return;
         }
         // Pass 0,0 so configure re-reads Mode::Current when size_from_mode.
-        let (w, h) = if self.backgrounds[idx].size_from_mode || self.backgrounds[idx].logical == (0, 0)
-        {
-            (0, 0)
-        } else {
-            self.backgrounds[idx].logical
-        };
+        let (w, h) =
+            if self.backgrounds[idx].size_from_mode || self.backgrounds[idx].logical == (0, 0) {
+                (0, 0)
+            } else {
+                self.backgrounds[idx].logical
+            };
         self.configure(qh, layer_id, w, h);
     }
 
@@ -494,25 +523,19 @@ impl State {
         // Integer HiDPI: render at scale x the logical size and announce it
         // with set_buffer_scale (a wl_surface v3+ request), so text and rings
         // stay crisp instead of being upscaled by the compositor.
-        let info_scale = self
-            .output_info(&out_id)
-            .map(|o| o.scale)
-            .unwrap_or(1);
+        let info_scale = self.output_info(&out_id).map(|o| o.scale).unwrap_or(1);
         let info_aspect = self.output_info(&out_id).and_then(|o| o.aspect);
         // Clamp the advertised scale defensively: a buggy compositor claiming
-        // an absurd factor must not blow the buffer-size math up. Also drop
-        // scale until the buffer fits MAX_BUFFER_DIM instead of skipping.
-        let mut scale = if surface_ver >= 3 {
+        // an absurd factor must not blow the buffer-size math up. Then drop
+        // the scale until the buffer clears BOTH ceilings instead of skipping
+        // the output -- see `fill_guard::fit_scale` for the monitor this used
+        // to leave black.
+        let asked = if surface_ver >= 3 {
             info_scale.clamp(1, 8) as u32
         } else {
             1
         };
-        while scale > 1
-            && (lw.saturating_mul(scale) > fill_guard::MAX_BUFFER_DIM
-                || lh.saturating_mul(scale) > fill_guard::MAX_BUFFER_DIM)
-        {
-            scale -= 1;
-        }
+        let scale = fill_guard::fit_scale(lw, lh, asked);
         // CLI / LUNARBG_ASPECT override geometry: fabricated DRM mm must not
         // lock out the packaging knob for Eclipse panels.
         let aspect = self.aspect_cli.or(info_aspect);
@@ -530,37 +553,31 @@ impl State {
             return false;
         };
 
-        // wl_shm sizes travel as i32: a pool past that (a 16K output, or 8K
-        // at 2x scale) must be refused, and the size math itself is checked so
-        // a hostile configure cannot wrap it past the guard in release builds.
-        let Some(total) = w
-            .checked_mul(4)
-            .and_then(|stride| stride.checked_mul(h))
-            .and_then(|frame| frame.checked_mul(BUFFERS))
-            .filter(|t| *t <= i32::MAX as usize)
-        else {
+        let Some((frame_size, total)) = pool_geometry(w, h) else {
             eprintln!(
                 "lunarbg: {w}x{h} needs a bigger pool than wl_shm can address; skipping output"
             );
             return false;
         };
-        if w > fill_guard::MAX_BUFFER_DIM as usize || h > fill_guard::MAX_BUFFER_DIM as usize {
-            eprintln!(
-                "lunarbg: {w}x{h} past MAX_BUFFER_DIM={}; skipping output",
-                fill_guard::MAX_BUFFER_DIM
-            );
-            return false;
-        }
-        if w.saturating_mul(h) > fill_guard::MAX_BUFFER_PIXELS {
-            eprintln!(
-                "lunarbg: {w}x{h} is {} Mpx, past the {} Mpx render limit; skipping output",
-                w.saturating_mul(h) >> 20,
-                fill_guard::MAX_BUFFER_PIXELS >> 20
-            );
-            return false;
+        match fill_guard::check_buffer(w, h) {
+            Ok(()) => {}
+            Err(fill_guard::TooBig::Dim) => {
+                eprintln!(
+                    "lunarbg: {w}x{h} past MAX_BUFFER_DIM={}; skipping output",
+                    fill_guard::MAX_BUFFER_DIM
+                );
+                return false;
+            }
+            Err(fill_guard::TooBig::Pixels) => {
+                eprintln!(
+                    "lunarbg: {w}x{h} is {} Mpx, past the {} Mpx render limit; skipping output",
+                    w.saturating_mul(h) >> 20,
+                    fill_guard::MAX_BUFFER_PIXELS >> 20
+                );
+                return false;
+            }
         }
         let stride = w * 4;
-        let frame_size = stride * h;
         ckpt!("configure {w}x{h} (scale {scale}): allocating shm pool total={total}");
 
         let raw = unsafe {
@@ -709,11 +726,11 @@ impl State {
         bg.dirty = false;
         frames.next = 1 - i;
 
-        let Some(frame_size) = frames
-            .width
-            .checked_mul(frames.height)
-            .and_then(|n| n.checked_mul(4))
-        else {
+        // Same arithmetic the pool was built with: the seed in `build_frames`
+        // writes buffer 1 at `frame_size`, so a second formula here that
+        // disagreed by a byte would have every animated frame land straddling
+        // the two buffers.
+        let Some((frame_size, _)) = pool_geometry(frames.width, frames.height) else {
             return;
         };
         let Some(offset) = i.checked_mul(frame_size) else {
@@ -1377,32 +1394,53 @@ fn parse_args() -> Cli {
 }
 
 /// `--dump`: render one animation frame offscreen to a raw XRGB8888 file.
-fn run_dump(spec: &str, t_ms: u64, aspect: Option<f32>) {
-    let (path, w, h) = match spec.rsplit_once(':') {
-        Some((p, dims)) if dims.contains('x') => {
-            let (w, h) = dims.split_once('x').unwrap();
-            // Clamp to 1: a 0-wide render has no rows to chunk and would
-            // panic inside the banded base passes.
-            (
-                p.to_string(),
-                w.parse().unwrap_or(1920).max(1),
-                h.parse().unwrap_or(1080).max(1),
-            )
-        }
-        _ => (spec.to_string(), 1920, 1080),
+/// Split a `--dump` / `LUNARBG_DUMP` spec into `(path, w, h)`.
+///
+/// The trailing `:WxH` is taken only when it is exactly digits, an `x` and
+/// digits. It used to be taken whenever the last colon-separated piece merely
+/// CONTAINED an `x`, and then each side was `parse().unwrap_or(default)`: with
+/// `--dump /tmp/frame:extra.raw` the `x` inside "extra" matched, both sides
+/// failed to parse, and the dump silently went to `/tmp/frame` at the default
+/// 1920x1080 -- a file written under a name the caller never asked for. A
+/// piece that is not a size now stays part of the path, where it belongs.
+///
+/// Sides are clamped to 1: a 0-wide render has no rows to chunk and would
+/// panic inside the banded base passes.
+fn parse_dump_spec(spec: &str) -> (String, usize, usize) {
+    const DEFAULT: (usize, usize) = (1920, 1080);
+    let Some((path, dims)) = spec.rsplit_once(':') else {
+        return (spec.to_string(), DEFAULT.0, DEFAULT.1);
     };
-    if w > fill_guard::MAX_BUFFER_DIM as usize || h > fill_guard::MAX_BUFFER_DIM as usize {
-        eprintln!(
-            "lunarbg: dump {w}x{h} past MAX_BUFFER_DIM={}",
-            fill_guard::MAX_BUFFER_DIM
-        );
-        std::process::exit(1);
+    let Some((w, h)) = dims.split_once('x') else {
+        return (spec.to_string(), DEFAULT.0, DEFAULT.1);
+    };
+    // `!v.is_empty()` is redundant next to `parse` (which rejects ""), and
+    // kept only so the shape of an accepted piece reads off the condition.
+    let size = |v: &str| -> Option<usize> {
+        (!v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()))
+            .then(|| v.parse().ok())
+            .flatten()
+    };
+    match (size(w), size(h)) {
+        (Some(w), Some(h)) => (path.to_string(), w.max(1), h.max(1)),
+        // Not a size after all: the whole spec is the path.
+        _ => (spec.to_string(), DEFAULT.0, DEFAULT.1),
     }
-    if w.saturating_mul(h) > fill_guard::MAX_BUFFER_PIXELS {
-        eprintln!(
-            "lunarbg: dump {w}x{h} past MAX_BUFFER_PIXELS ({} Mpx)",
-            fill_guard::MAX_BUFFER_PIXELS >> 20
-        );
+}
+
+fn run_dump(spec: &str, t_ms: u64, aspect: Option<f32>) {
+    let (path, w, h) = parse_dump_spec(spec);
+    if let Err(why) = fill_guard::check_buffer(w, h) {
+        match why {
+            fill_guard::TooBig::Dim => eprintln!(
+                "lunarbg: dump {w}x{h} past MAX_BUFFER_DIM={}",
+                fill_guard::MAX_BUFFER_DIM
+            ),
+            fill_guard::TooBig::Pixels => eprintln!(
+                "lunarbg: dump {w}x{h} past MAX_BUFFER_PIXELS ({} Mpx)",
+                fill_guard::MAX_BUFFER_PIXELS >> 20
+            ),
+        }
         std::process::exit(1);
     }
     // Offscreen: honour only the CLI/env aspect override (no geometry).
@@ -1489,6 +1527,37 @@ fn kill_stale_instances() {
     }
 }
 
+/// Whether the logo animates: `--static` wins, then `LUNARBG_STATIC`.
+///
+/// A value the packaging did not mean as "on" (`0`, `off`, empty, anything
+/// unrecognised) leaves the animation running, so a typo in an image's env
+/// file cannot freeze the wallpaper silently.
+fn animate_from(static_flag: bool, env: Option<&str>) -> bool {
+    if static_flag {
+        return false;
+    }
+    match env {
+        Some(v) => {
+            let v = v.trim().to_ascii_lowercase();
+            !(v == "1" || v == "true" || v == "yes" || v == "on")
+        }
+        None => true,
+    }
+}
+
+/// Animation rate: `--fps` (already range-checked by [`parse_args`]), then
+/// `LUNARBG_FPS`, then [`DEFAULT_FPS`].
+///
+/// The range check is applied to whatever was picked, because the env var goes
+/// through no argument parser: the loop interval is `1_000_000 / fps` micros,
+/// so a 0 from the environment would divide by zero and an absurd value would
+/// spin this software renderer at a rate the compositor cannot composite.
+fn fps_from(cli: Option<u32>, env: Option<&str>) -> u32 {
+    cli.or_else(|| env.and_then(|v| v.trim().parse().ok()))
+        .filter(|f| (1..=60).contains(f))
+        .unwrap_or(DEFAULT_FPS)
+}
+
 fn main() {
     install_crash_handler();
     let cli = parse_args();
@@ -1537,11 +1606,7 @@ fn main() {
     let display = conn.display();
     display.get_registry(&qh, ());
 
-    let animate = !cli.static_
-        && std::env::var("LUNARBG_STATIC").map_or(true, |v| {
-            let v = v.trim().to_ascii_lowercase();
-            !(v == "1" || v == "true" || v == "yes" || v == "on")
-        });
+    let animate = animate_from(cli.static_, std::env::var("LUNARBG_STATIC").ok().as_deref());
     let mut state = State {
         animate,
         aspect_cli: cli.aspect.or_else(scene::aspect_from_env),
@@ -1578,15 +1643,7 @@ fn main() {
 
     // Timer-paced animation loop; see `tick` for how frame callbacks keep the
     // real rate at or below what the compositor can composite.
-    let fps: u32 = cli
-        .fps
-        .or_else(|| {
-            std::env::var("LUNARBG_FPS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-        })
-        .filter(|f| (1..=60).contains(f))
-        .unwrap_or(DEFAULT_FPS);
+    let fps = fps_from(cli.fps, std::env::var("LUNARBG_FPS").ok().as_deref());
     let interval = Duration::from_micros(1_000_000 / fps as u64);
     let mut next_tick = Instant::now() + interval;
 
@@ -1712,4 +1769,267 @@ fn main() {
         drop(bg.frames.take());
     }
     let _ = queue.flush();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_dump_path_keeps_every_part_of_its_name() {
+        // The regression: the trailing piece was taken as a size whenever it
+        // merely CONTAINED an 'x', and each side then fell back to a default
+        // on a parse failure. "extra.raw" has an 'x', so this wrote to
+        // "/tmp/frame" at 1920x1080 and said nothing about either.
+        assert_eq!(
+            parse_dump_spec("/tmp/frame:extra.raw"),
+            ("/tmp/frame:extra.raw".to_string(), 1920, 1080)
+        );
+        assert_eq!(
+            parse_dump_spec("/tmp/xray:box.raw"),
+            ("/tmp/xray:box.raw".to_string(), 1920, 1080)
+        );
+        // A half-written size is not a size either.
+        for spec in [
+            "/tmp/a.raw:1920x",
+            "/tmp/a.raw:x1080",
+            "/tmp/a.raw:1920x1080x2",
+            "/tmp/a.raw:19 20x1080",
+            "/tmp/a.raw:-1x-1",
+            "/tmp/a.raw:1920X1080",
+            // `usize::from_str` accepts a leading '+', so `parse` alone would
+            // take this as a size and drop ":+800x600" from the filename.
+            "/tmp/a.raw:+800x600",
+            "/tmp/a.raw:800x+600",
+        ] {
+            assert_eq!(
+                parse_dump_spec(spec),
+                (spec.to_string(), 1920, 1080),
+                "{spec} should have stayed a path"
+            );
+        }
+    }
+
+    #[test]
+    fn a_real_size_after_the_colon_is_taken() {
+        assert_eq!(
+            parse_dump_spec("/tmp/a.raw:800x600"),
+            ("/tmp/a.raw".to_string(), 800, 600)
+        );
+        assert_eq!(parse_dump_spec("out:1x1"), ("out".to_string(), 1, 1));
+        // Clamped to 1: a 0-wide render has no rows to chunk.
+        assert_eq!(parse_dump_spec("out:0x0"), ("out".to_string(), 1, 1));
+        // No colon at all, and a colon with no 'x'.
+        assert_eq!(
+            parse_dump_spec("/tmp/a.raw"),
+            ("/tmp/a.raw".to_string(), 1920, 1080)
+        );
+        assert_eq!(
+            parse_dump_spec("/tmp/a:b"),
+            ("/tmp/a:b".to_string(), 1920, 1080)
+        );
+        // The LAST colon wins, so a path that already has one still works.
+        assert_eq!(
+            parse_dump_spec("/tmp/12x9:64x48"),
+            ("/tmp/12x9".to_string(), 64, 48)
+        );
+        assert_eq!(
+            parse_dump_spec("/tmp/a:b:64x48"),
+            ("/tmp/a:b".to_string(), 64, 48)
+        );
+    }
+
+    #[test]
+    fn a_dump_size_a_render_cannot_hold_is_refused_by_the_shared_ceiling() {
+        // `--dump` and the compositor path must agree, which is why both go
+        // through `fill_guard::check_buffer` now.
+        let (_, w, h) = parse_dump_spec("out:20000x20000");
+        assert!(fill_guard::check_buffer(w, h).is_err());
+        let (_, w, h) = parse_dump_spec("out:16000x16000");
+        assert_eq!(
+            fill_guard::check_buffer(w, h),
+            Err(fill_guard::TooBig::Pixels)
+        );
+        let (_, w, h) = parse_dump_spec("out:1920x1080");
+        assert!(fill_guard::check_buffer(w, h).is_ok());
+    }
+
+    #[test]
+    fn damage_never_under_covers_the_pixels_that_were_repainted() {
+        // Rounded outwards in surface coordinates: damage that under-covers
+        // leaves the compositor showing a band of the previous frame that no
+        // later commit ever repairs.
+        for scale in 1..=8u32 {
+            for (x, y, w, h) in [
+                (0i32, 0i32, 1i32, 1i32),
+                (0, 0, 1920, 1080),
+                (1, 1, 1, 1),
+                (3, 7, 5, 11),
+                (17, 17, 1, 1),
+                (0, 0, 3841, 2161),
+            ] {
+                let (dx, dy, dw, dh) = damage_rect(scale, x, y, w, h);
+                let s = scale as i32;
+                assert!(dw >= 0 && dh >= 0, "scale {scale}: negative damage");
+                // Every buffer pixel of the rect falls inside the damaged
+                // surface rect once scaled back up.
+                assert!(dx * s <= x, "scale {scale}: left edge {dx} misses {x}");
+                assert!(dy * s <= y, "scale {scale}: top edge {dy} misses {y}");
+                assert!(
+                    (dx + dw) * s >= x + w,
+                    "scale {scale}: right edge {} misses {}",
+                    (dx + dw) * s,
+                    x + w
+                );
+                assert!(
+                    (dy + dh) * s >= y + h,
+                    "scale {scale}: bottom edge {} misses {}",
+                    (dy + dh) * s,
+                    y + h
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn damage_at_scale_one_is_the_rect_itself_and_a_zero_scale_is_treated_as_one() {
+        assert_eq!(damage_rect(1, 3, 7, 5, 11), (3, 7, 5, 11));
+        assert_eq!(damage_rect(0, 3, 7, 5, 11), (3, 7, 5, 11));
+        // A 2x buffer: a full 3840x2160 buffer is a 1920x1080 surface.
+        assert_eq!(damage_rect(2, 0, 0, 3840, 2160), (0, 0, 1920, 1080));
+        // An odd rect grows rather than shrinks.
+        assert_eq!(damage_rect(2, 1, 1, 1, 1), (0, 0, 1, 1));
+    }
+
+    #[test]
+    fn the_pool_holds_both_frames_and_refuses_a_size_it_cannot_address() {
+        let (frame, total) = pool_geometry(1920, 1080).expect("1080p");
+        assert_eq!(frame, 1920 * 1080 * 4);
+        assert_eq!(total, frame * BUFFERS);
+        assert!(total <= i32::MAX as usize);
+        // The offsets the two paths use must agree: buffer i starts at
+        // i * frame, and the last byte of the last buffer is the pool's end.
+        for i in 0..BUFFERS {
+            assert!(i * frame + frame <= total);
+        }
+        // A pool past what wl_shm can address is refused, not wrapped.
+        assert_eq!(pool_geometry(usize::MAX, 2), None);
+        assert_eq!(pool_geometry(16384, 16384), None); // 2 GiB of frames
+        assert!(pool_geometry(8192, 8192).is_none() || total > 0);
+    }
+
+    #[test]
+    fn the_pool_geometry_matches_the_size_the_buffers_are_created_with() {
+        // `create_buffer` is handed `stride = w * 4` and `h`, so one frame is
+        // stride * h; the pool math must be the same product, whatever order
+        // the multiplications are written in.
+        for (w, h) in [(1usize, 1usize), (7, 13), (1920, 1080), (3840, 2160)] {
+            let (frame, _) = pool_geometry(w, h).expect("fits");
+            assert_eq!(frame, (w * 4) * h, "{w}x{h}");
+        }
+    }
+
+    #[test]
+    fn the_animation_only_stops_when_something_asked_it_to() {
+        assert!(animate_from(false, None));
+        assert!(!animate_from(true, None), "--static must win");
+        assert!(
+            !animate_from(true, Some("0")),
+            "--static must win over the env"
+        );
+        for on in ["1", "true", "yes", "on", " ON ", "True", "YES"] {
+            assert!(!animate_from(false, Some(on)), "LUNARBG_STATIC={on:?}");
+        }
+        // Anything else leaves the wallpaper animating, so a typo in an
+        // image's env file cannot freeze it without a word.
+        for off in ["0", "off", "false", "no", "", "  ", "onn", "yep"] {
+            assert!(animate_from(false, Some(off)), "LUNARBG_STATIC={off:?}");
+        }
+    }
+
+    #[test]
+    fn the_frame_rate_stays_in_a_range_the_loop_can_divide_by() {
+        assert_eq!(fps_from(None, None), DEFAULT_FPS);
+        assert_eq!(fps_from(Some(30), None), 30);
+        assert_eq!(fps_from(None, Some("30")), 30);
+        assert_eq!(fps_from(None, Some(" 45 ")), 45);
+        assert_eq!(fps_from(Some(30), Some("60")), 30, "the flag wins");
+        // The env var goes through no argument parser: a 0 would divide by
+        // zero in `1_000_000 / fps`, and an absurd value would spin this
+        // software renderer faster than the compositor can composite.
+        for bad in ["0", "61", "1000", "-5", "abc", "", "1.5"] {
+            assert_eq!(
+                fps_from(None, Some(bad)),
+                DEFAULT_FPS,
+                "LUNARBG_FPS={bad:?} should have fallen back"
+            );
+        }
+        // The edges of the accepted range are accepted.
+        assert_eq!(fps_from(None, Some("1")), 1);
+        assert_eq!(fps_from(None, Some("60")), 60);
+        // And whatever comes out can be divided into an interval.
+        for env in ["0", "1", "24", "60", "9999"] {
+            let fps = fps_from(None, Some(env));
+            assert!((1..=60).contains(&fps));
+            assert!(1_000_000u64 / fps as u64 > 0);
+        }
+    }
+
+    /// The offline modes must not kill the running wallpaper.
+    ///
+    /// `kill_stale_instances` SIGKILLs every other process named `lunarbg`, so
+    /// it has to stay BELOW the `--bench` and `--dump` early returns in
+    /// `main`: those are pure renders with no compositor client, run by hand
+    /// while a wallpaper is up. Its own comment says so; nothing enforced it,
+    /// and the order is invisible at the call site. Checked against the source
+    /// because `main` cannot be called from a test.
+    #[test]
+    fn the_offline_modes_come_before_anything_kills_a_running_wallpaper() {
+        let src = include_str!("main.rs");
+        let main_at = src.find("\nfn main() {").expect("main is not where it was");
+        let body = &src[main_at..];
+        let kill = body
+            .find("kill_stale_instances();")
+            .expect("main no longer kills stale instances");
+        for early in ["run_bench(n);", "run_dump(&spec, t_ms, cli.aspect);"] {
+            let at = body
+                .find(early)
+                .unwrap_or_else(|| panic!("main no longer calls {early}"));
+            assert!(
+                at < kill,
+                "{early} now runs AFTER kill_stale_instances: `lunarbg --dump` \
+                 would SIGKILL the running wallpaper"
+            );
+        }
+        // And each of those two arms returns, rather than falling through.
+        let bench = body.find("run_bench(n);").unwrap();
+        assert!(
+            body[bench..bench + 80].contains("return;"),
+            "the --bench arm no longer returns before the kill"
+        );
+        let dump = body.find("run_dump(&spec, t_ms, cli.aspect);").unwrap();
+        assert!(
+            body[dump..dump + 80].contains("return;"),
+            "the --dump arm no longer returns before the kill"
+        );
+    }
+
+    #[test]
+    fn the_guard_ceilings_are_the_only_ones_the_buffer_paths_check() {
+        // One policy, one place: after this batch neither path spells the
+        // ceilings out for itself, so they cannot drift the way the walk-down
+        // drifted from the doc that described it.
+        let src = include_str!("main.rs");
+        let body = src
+            .split("#[cfg(test)]")
+            .next()
+            .expect("the non-test source");
+        for spelled in ["MAX_BUFFER_DIM as usize", "MAX_BUFFER_PIXELS {"] {
+            assert!(
+                !body.contains(spelled),
+                "a buffer ceiling is compared by hand again ({spelled}); \
+                 use fill_guard::check_buffer"
+            );
+        }
+    }
 }
