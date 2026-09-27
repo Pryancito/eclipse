@@ -114,7 +114,21 @@ impl DisplayScheme for EmuDisplay {
     fn fb_write_combining(&self) -> bool {
         CONFIG.lock().wc
     }
+
+    fn fb_readable(&self) -> bool {
+        FB_READABLE.load(Ordering::SeqCst)
+    }
 }
+
+/// Whether the emulated panel hands its pixels back, i.e. whether
+/// `DisplayScheme::read_into` works on it.
+///
+/// A real panel refuses when it is not ARGB8888, and the DRM cursor path keeps an
+/// older route for that case -- the one that reads the CLIENT's framebuffer to
+/// erase and redraw the pointer. Every panel this kernel actually meets is
+/// 32-bit, so without a way to turn read-back off here that route would have no
+/// test on any machine, which is how a fallback rots into one that does not work.
+static FB_READABLE: AtomicBool = AtomicBool::new(true);
 
 /// A closure the emulated output runs every time a blit asks it for the
 /// framebuffer, with the number of times it has been asked so far (0 for the
@@ -181,6 +195,7 @@ impl Drop for Screen {
         // Detach first, THEN reset: unblanking with a display still registered
         // would clear it, and the reset has to happen with nothing to clear.
         clear_mid_blit();
+        FB_READABLE.store(true, Ordering::SeqCst);
         if let Some(dev) = self.dev.take() {
             kernel_hal::drivers::remove_device_hosted(&dev);
         }
@@ -269,6 +284,12 @@ impl Screen {
     /// padding.
     pub(crate) fn pitch_px(&self) -> u32 {
         self.pitch_px
+    }
+
+    /// Make the panel refuse to hand its pixels back, the way one that is not
+    /// ARGB8888 does. See [`FB_READABLE`]. Put back on the guard's drop.
+    pub(crate) fn refuse_read_back(&self) {
+        FB_READABLE.store(false, Ordering::SeqCst);
     }
 
     /// Put every pixel, padding included, back to `value`.
