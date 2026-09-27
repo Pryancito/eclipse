@@ -10496,13 +10496,27 @@ typedef struct EclipseHwFlipInit
 
 #define ECLIPSE_HWFLIP_PB_SIZE 4096
 
+/* Slots in the ISO ctxdma table. Four covers any swapchain a compositor
+ * actually rotates (wlroots keeps two or three buffers), so in steady state a
+ * flip allocates nothing and frees nothing. */
+#define ECLIPSE_HWFLIP_ISO_SLOTS 4
+
 static struct
 {
     NvU32  hWinPbMem;
     NvU32  hWinPbDma;
     NvU32  hWin;
-    NvU32  hIsoDma;
-    NvU32  hIsoMem;          /* hMemory the current hIsoDma covers; 0 = none */
+    /* One ISO ctxdma per client framebuffer, kept across flips; see
+     * hwflip_iso_ctxdma for why this is a table and not a single entry. */
+    struct
+    {
+        NvU32 hMem;                  /* client memory handle; 0 = empty slot */
+        NvU32 hDma;                  /* the ISO ctxdma built over it */
+        MEMORY_DESCRIPTOR *pMemDesc; /* what hMem named when hDma was built */
+        NvU64 useSeq;                /* isoSeq at this slot's last use */
+    } iso[ECLIPSE_HWFLIP_ISO_SLOTS];
+    NvU64  isoSeq;
+    NvU64  isoBuilds;        /* ctxdmas allocated since boot (cache misses) */
     volatile EclipseDispDmaControl *pWinCtl;
     NvU8  *pWinPbCpu;
     NvU32  winPbPut;
@@ -10570,6 +10584,121 @@ NvBool eclipse_rm_hwflip_pending(void)
     if (g_hwcur.pCoreCtl != NULL && g_hwcur.pCoreCtl->Get != g_hwcur.pbPut)
         return NV_TRUE;
     return NV_FALSE;
+}
+
+/* Resolve -- building it only on a miss -- the ISO ctxdma covering `hMemory`.
+ * Called with the RM API lock and the GPU locks held.
+ *
+ * This used to be a one-entry cache keyed on the handle alone, and a Wayland
+ * compositor rotates a swapchain, so `hMemory` differed from the previous
+ * flip on essentially EVERY frame: the cache missed every time, and the miss
+ * path freed the old ctxdma and allocated a new one -- an RM object free plus
+ * an RM object alloc per frame, inside the RM API lock and the GPU locks, on
+ * the compositor's critical path. That is the cost the hardware flip exists
+ * to remove.
+ *
+ * And the ctxdma it freed was the one describing the surface the display front
+ * end was still displaying. The drain before a flip only proves the FE fetched
+ * the previous flip's METHODS; with _BEGIN_MODE _NON_TEARING the surface those
+ * methods named stays latched until the next vblank, which may not have
+ * happened yet. So eviction here never takes the slot the previous flip used.
+ *
+ * Keyed on the memory descriptor as well as the handle: a client that frees a
+ * buffer can have its handle number recycled for a different one, and then the
+ * handle alone would match a ctxdma covering memory that is no longer there.
+ */
+static NV_STATUS hwflip_iso_ctxdma(RM_API *pRmApi, RsClient *pRsClient,
+                                   NvU32 hMemory, NvU32 *phDma)
+{
+    NV_CONTEXT_DMA_ALLOCATION_PARAMS dp;
+    Memory *pMemory = NULL;
+    MEMORY_DESCRIPTOR *pMemDesc;
+    NvU64 memSize;
+    NvU64 newest = 0;
+    NV_STATUS status;
+    NvU32 hDma = 0;
+    NvU32 i, victim;
+
+    status = memGetByHandle(pRsClient, hMemory, &pMemory);
+    if (status != NV_OK)
+        return status;
+    pMemDesc = pMemory->pMemDesc;
+    if (pMemDesc == NULL)
+        return NV_ERR_INVALID_STATE;
+
+    for (i = 0; i < ECLIPSE_HWFLIP_ISO_SLOTS; i++)
+    {
+        if (g_hwflip.iso[i].useSeq > newest)
+            newest = g_hwflip.iso[i].useSeq;
+    }
+
+    for (i = 0; i < ECLIPSE_HWFLIP_ISO_SLOTS; i++)
+    {
+        if (g_hwflip.iso[i].hDma != 0 &&
+            g_hwflip.iso[i].hMem == hMemory &&
+            g_hwflip.iso[i].pMemDesc == pMemDesc)
+        {
+            g_hwflip.iso[i].useSeq = ++g_hwflip.isoSeq;
+            *phDma = g_hwflip.iso[i].hDma;
+            return NV_OK;
+        }
+    }
+
+    victim = ECLIPSE_HWFLIP_ISO_SLOTS;
+    for (i = 0; i < ECLIPSE_HWFLIP_ISO_SLOTS; i++)
+    {
+        if (g_hwflip.iso[i].hDma == 0)
+        {
+            victim = i;
+            break;
+        }
+    }
+    if (victim == ECLIPSE_HWFLIP_ISO_SLOTS)
+    {
+        for (i = 0; i < ECLIPSE_HWFLIP_ISO_SLOTS; i++)
+        {
+            /* The previous flip's surface: the front end may still be
+             * scanning it out, so its ctxdma is not ours to free. */
+            if (g_hwflip.iso[i].useSeq == newest)
+                continue;
+            if (victim == ECLIPSE_HWFLIP_ISO_SLOTS ||
+                g_hwflip.iso[i].useSeq < g_hwflip.iso[victim].useSeq)
+                victim = i;
+        }
+        /* Unreachable while the table has more than one slot: at most one slot
+         * can hold `newest`, so at least one is always evictable. */
+        if (victim == ECLIPSE_HWFLIP_ISO_SLOTS)
+            return NV_ERR_INVALID_STATE;
+        pRmApi->Free(pRmApi, g_grAllocCache.hClient, g_hwflip.iso[victim].hDma);
+        g_hwflip.iso[victim].hDma = 0;
+        g_hwflip.iso[victim].hMem = 0;
+        g_hwflip.iso[victim].pMemDesc = NULL;
+        g_hwflip.iso[victim].useSeq = 0;
+    }
+
+    memSize = memdescGetSize(pMemDesc);
+    if (memSize == 0)
+        return NV_ERR_INVALID_STATE;
+    portMemSet(&dp, 0, sizeof(dp));
+    dp.hMemory = hMemory;
+    dp.offset = 0;
+    dp.limit = memSize - 1;
+    status = clientGenResourceHandle(pRsClient, &hDma);
+    if (status != NV_OK)
+        return status;
+    status = pRmApi->AllocWithHandle(pRmApi, g_grAllocCache.hClient,
+                                     g_grAllocCache.hDevice, hDma,
+                                     NV01_CONTEXT_DMA, &dp, sizeof(dp));
+    if (status != NV_OK)
+        return status;
+
+    g_hwflip.iso[victim].hDma = hDma;
+    g_hwflip.iso[victim].hMem = hMemory;
+    g_hwflip.iso[victim].pMemDesc = pMemDesc;
+    g_hwflip.iso[victim].useSeq = ++g_hwflip.isoSeq;
+    g_hwflip.isoBuilds++;
+    *phDma = hDma;
+    return NV_OK;
 }
 
 NV_STATUS eclipse_rm_hwflip_init(NvU32 gpuInstance, NvU32 head, EclipseHwFlipInit *pOut)
@@ -10772,10 +10901,9 @@ NV_STATUS eclipse_rm_hwflip_surface(
     NV_STATUS status;
     THREAD_STATE_NODE threadState;
     RsClient *pRsClient = NULL;
-    Memory *pMemory = NULL;
-    NvU64 memSize = 0;
     NvU32 args[2];
     NvU32 pitchUnits;
+    NvU32 hIsoDma = 0;
 
     if (!g_hwflip.ready || hMemory == 0 || width == 0 || height == 0 || pitchBytes == 0)
         return NV_ERR_INVALID_STATE;
@@ -10830,41 +10958,11 @@ NV_STATUS eclipse_rm_hwflip_surface(
     if (status != NV_OK)
         goto unlock;
 
-    /* (Re)build ISO ctxdma when the GEM changes. */
-    if (g_hwflip.hIsoMem != hMemory)
-    {
-        NV_CONTEXT_DMA_ALLOCATION_PARAMS dp;
-        if (g_hwflip.hIsoDma != 0)
-        {
-            pRmApi->Free(pRmApi, g_grAllocCache.hClient, g_hwflip.hIsoDma);
-            g_hwflip.hIsoDma = 0;
-            g_hwflip.hIsoMem = 0;
-        }
-        status = memGetByHandle(pRsClient, hMemory, &pMemory);
-        if (status != NV_OK || pMemory->pMemDesc == NULL)
-            goto unlock;
-        memSize = memdescGetSize(pMemory->pMemDesc);
-        if (memSize == 0)
-        {
-            status = NV_ERR_INVALID_STATE;
-            goto unlock;
-        }
-        portMemSet(&dp, 0, sizeof(dp));
-        dp.hMemory = hMemory;
-        dp.offset = 0;
-        dp.limit = memSize - 1;
-        status = clientGenResourceHandle(pRsClient, &g_hwflip.hIsoDma);
-        if (status != NV_OK) goto unlock;
-        status = pRmApi->AllocWithHandle(pRmApi, g_grAllocCache.hClient,
-                                         g_grAllocCache.hDevice, g_hwflip.hIsoDma,
-                                         NV01_CONTEXT_DMA, &dp, sizeof(dp));
-        if (status != NV_OK)
-        {
-            g_hwflip.hIsoDma = 0;
-            goto unlock;
-        }
-        g_hwflip.hIsoMem = hMemory;
-    }
+    /* The ISO ctxdma covering this framebuffer, built once per buffer and
+     * then reused as the compositor rotates its swapchain. */
+    status = hwflip_iso_ctxdma(pRmApi, pRsClient, hMemory, &hIsoDma);
+    if (status != NV_OK)
+        goto unlock;
 
     /* Window surface program (pitch-linear XRGB8888) — match nouveau wndwc57e. */
     args[0] = DRF_NUM(C57E, _SET_SIZE, _WIDTH, width) |
@@ -10880,7 +10978,7 @@ NV_STATUS eclipse_rm_hwflip_surface(
     args[0] = DRF_NUM(C57E, _SET_PLANAR_STORAGE, _PITCH, pitchUnits);
     hwflip_win_method(NVC57E_SET_PLANAR_STORAGE(0), args, 1);
 
-    args[0] = g_hwflip.hIsoDma;
+    args[0] = hIsoDma;
     hwflip_win_method(NVC57E_SET_CONTEXT_DMA_ISO(0), args, 1);
 
     /* Origin in 256-byte units, relative to the ISO ctxdma (BO start = 0). */
@@ -10927,4 +11025,12 @@ unlock:
 NvBool eclipse_rm_hwflip_ready(void)
 {
     return g_hwflip.ready;
+}
+
+/* ISO ctxdmas allocated since boot. One per distinct framebuffer the
+ * compositor ever flips is the healthy number; one per flip means the table
+ * above is thrashing and every frame is paying an RM alloc. */
+NvU64 eclipse_rm_hwflip_iso_builds(void)
+{
+    return g_hwflip.isoBuilds;
 }

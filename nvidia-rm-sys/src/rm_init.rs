@@ -655,6 +655,7 @@ extern "C" {
     ) -> NV_STATUS;
     fn eclipse_rm_hwflip_ready() -> NvBool;
     fn eclipse_rm_hwflip_pending() -> NvBool;
+    fn eclipse_rm_hwflip_iso_builds() -> NvU64;
 }
 
 /// Bring up NVC57E window ISO flip (reuses/creates NVC570+NVC57D via hwcursor).
@@ -706,6 +707,17 @@ pub fn hwflip_surface(
 /// Whether the NVC57E surface-flip ladder is ready.
 pub fn hwflip_ready() -> bool {
     unsafe { eclipse_rm_hwflip_ready() != 0 }
+}
+
+/// How many ISO context DMAs the flip path has allocated since boot.
+///
+/// The healthy number is one per distinct framebuffer the compositor ever
+/// flips -- two or three for a wlroots swapchain, and then flat forever. A
+/// count that tracks the flip count means the ctxdma table is thrashing and
+/// every frame is paying an RM object free plus an RM object alloc inside the
+/// RM API lock. Reads one C global: no RM call, no lock, no `RmGate`.
+pub fn hwflip_iso_builds() -> u64 {
+    unsafe { eclipse_rm_hwflip_iso_builds() }
 }
 
 /// Whether the display front end is still fetching the last flip's methods
