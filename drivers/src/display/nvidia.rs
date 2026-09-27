@@ -14466,7 +14466,81 @@ impl NvidiaGpu {
                 // whole request, then honestly returns EOPNOTSUPP. The dump is
                 // the anatomy needed to build real submission: how many buffers
                 // (and their domains), relocs, and pushes Mesa hands us per call.
-                let pb = unsafe { &*(arg as *const nv::DrmNouveauGemPushbuf) };
+                let pb = unsafe { &mut *(arg as *mut nv::DrmNouveauGemPushbuf) };
+                // What `nouveau_gem_ioctl_pushbuf` checks before it submits
+                // anything, in its order: a client with a uvmm (`VM_INIT`)
+                // is on the other uAPI (ENOSYS, before the channel is even
+                // looked up); the channel has to be one of this client's
+                // (ENOENT, `abi16->channels`); the VRAM and GART budgets go
+                // back to the caller (`drm->gem.vram_available` and
+                // `gart_available`, the numbers GETPARAM FB_SIZE and
+                // AGP_SIZE give); a request with no pushes is done, with
+                // `suffix0`/`suffix1` zeroed as on every channel with an
+                // indirect buffer (all of Kepler and later); the counts are
+                // capped (EINVAL) before the arrays are copied (EFAULT for
+                // a null array with a count, `u_memcpya`); and every push
+                // has to name a buffer of the list (EINVAL, after the
+                // suffixes are written like any error past the copy). This
+                // looked at none of it: EOPNOTSUPP for everyone, a request
+                // with nothing to submit included, and a uvmm client's or
+                // another client's channel as good as the caller's own.
+                if self.nouveau_has_uvmm(owner_pid) {
+                    log::warn!(
+                        "[nouveau-uapi] GEM_PUSHBUF from a client with a uvmm (pid={}) -> ENOSYS",
+                        owner_pid
+                    );
+                    return Err(nv::ENOSYS);
+                }
+                let channel_of_caller = self.nouveau_channels.lock().iter().any(|c| {
+                    c.id == pb.channel as i32 && (owner_pid == 0 || c.owner_pid == owner_pid)
+                });
+                if !channel_of_caller {
+                    log::warn!(
+                        "[nouveau-uapi] GEM_PUSHBUF: no such channel {} (for pid={}) -> ENOENT",
+                        pb.channel,
+                        owner_pid
+                    );
+                    return Err(nv::ENOENT);
+                }
+                pb.vram_available = (self.effective_vram_mb() as u64).saturating_mul(1024 * 1024);
+                pb.gart_available = 0;
+                if pb.nr_push == 0 {
+                    pb.suffix0 = 0;
+                    pb.suffix1 = 0;
+                    return Ok(0);
+                }
+                if !nv::pushbuf_counts_ok(pb.nr_push, pb.nr_buffers, pb.nr_relocs) {
+                    log::warn!(
+                        "[nouveau-uapi] GEM_PUSHBUF: nr_push={} nr_buffers={} nr_relocs={} past the caps ({}/{}/{}) -> EINVAL",
+                        pb.nr_push,
+                        pb.nr_buffers,
+                        pb.nr_relocs,
+                        nv::NOUVEAU_GEM_MAX_PUSH,
+                        nv::NOUVEAU_GEM_MAX_BUFFERS,
+                        nv::NOUVEAU_GEM_MAX_RELOCS
+                    );
+                    return Err(nv::EINVAL);
+                }
+                if pb.push == 0 || (pb.nr_buffers > 0 && pb.buffers == 0) {
+                    return Err(nv::EFAULT);
+                }
+                let all_pushes = unsafe {
+                    core::slice::from_raw_parts(
+                        pb.push as *const nv::DrmNouveauGemPushbufPush,
+                        pb.nr_push as usize,
+                    )
+                };
+                if let Some(i) = all_pushes.iter().position(|p| p.bo_index >= pb.nr_buffers) {
+                    log::warn!(
+                        "[nouveau-uapi] GEM_PUSHBUF: push {} buffer not in list (bo_index={} nr_buffers={}) -> EINVAL",
+                        i,
+                        all_pushes[i].bo_index,
+                        pb.nr_buffers
+                    );
+                    pb.suffix0 = 0;
+                    pb.suffix1 = 0;
+                    return Err(nv::EINVAL);
+                }
                 log::warn!(
                     "[nouveau-uapi] GEM_PUSHBUF: channel={} nr_buffers={} nr_relocs={} \
                      nr_push={} suffix0={:#x} suffix1={:#x} vram_avail={:#x} gart_avail={:#x}",
@@ -14531,6 +14605,8 @@ impl NvidiaGpu {
                     "[nouveau-uapi] GEM_PUSHBUF: not submitted (real submission needs \
                      GART GEM + 3D class + relocs -- follow-up); returning EOPNOTSUPP"
                 );
+                pb.suffix0 = 0;
+                pb.suffix1 = 0;
                 Err(nv::EOPNOTSUPP)
             }
 
