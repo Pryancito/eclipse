@@ -7029,6 +7029,337 @@ mod kms_scanout_tests {
     ///
     /// Linux throws the clips away and declares a full update whenever
     /// `state->fb != old_state->fb` (`drm_atomic_helper_damage_iter_init`).
+    /// The whole point, staged: the client keeps writing the buffer AFTER the
+    /// present has already copied those rows, and the repair pass picks up what
+    /// arrived. Without it the panel keeps the pixels the copy happened to catch,
+    /// which is the stain Moebius sees on a freshly redrawn title bar or menu.
+    ///
+    /// The screen is 200 rows so the blit takes two bands of `BLIT_CHUNK_ROWS`,
+    /// and the hook writes on the SECOND band -- rows the first band already
+    /// carried to the panel. That ordering is the whole test: a write before the
+    /// first band would simply be copied, and would prove nothing.
+    #[test]
+    fn the_repair_pass_picks_up_what_arrived_after_the_copy_passed() {
+        let screen = kms_emu::attach(192, 200);
+        drm::set_present_repair_enabled(true);
+        let c = Client::open(0);
+        let buf = c.create_dumb(192, 200);
+        paint(&buf, |x, y| tag(0x0066_0000, x, y));
+        let fb = c.addfb2(&buf);
+        let pixels = map_dumb(&buf);
+        let stride = (buf.pitch / 4) as usize;
+        let late = pixels.as_mut_ptr() as usize;
+
+        kms_emu::on_blit_band(move |band| {
+            // Second band only: by now rows 0..128 are already on the panel.
+            if band != 1 {
+                return;
+            }
+            // SAFETY: the dumb buffer outlives this present, and nothing else
+            // writes it while the hook runs.
+            let p = unsafe { core::slice::from_raw_parts_mut(late as *mut u32, stride * 200) };
+            for y in 0..128usize {
+                for x in 64..128usize {
+                    p[y * stride + x] = tag(0x0077_0000, x as u32, y as u32);
+                }
+            }
+        });
+
+        c.page_flip(drm::SYNTH_CRTC_ID, fb, 0xF00D).expect("flip");
+
+        assert!(
+            kms_emu::mid_blit_calls() >= 2,
+            "the blit has to take at least two bands for this to stage anything, took {}",
+            kms_emu::mid_blit_calls()
+        );
+        assert!(
+            drm::repair_rounds_for_test() >= 1,
+            "a source that moved under the copy has to cost at least one repair round"
+        );
+        for y in 0..128 {
+            for x in 64..128 {
+                assert_eq!(
+                    screen.pixel(x, y),
+                    tag(0x0077_0000, x, y),
+                    "pixel ({}, {}) was written after the copy passed and never repaired",
+                    x,
+                    y
+                );
+            }
+        }
+        // And the repair touched only the band that moved.
+        for y in 0..128 {
+            for x in (0..64).chain(128..192) {
+                assert_eq!(
+                    screen.pixel(x, y),
+                    tag(0x0066_0000, x, y),
+                    "pixel ({}, {}) outside the band that moved",
+                    x,
+                    y
+                );
+            }
+        }
+    }
+
+    /// A repair round copies the span that moved and NOT the whole window. The
+    /// claim that a round costs what actually moved rests on this, and reading the
+    /// destination afterwards cannot show it when the source agrees everywhere:
+    /// so the hook drops a sentinel on the panel outside the span, between the
+    /// present's own blit and the repair's, and a repair that repainted the whole
+    /// window would erase it.
+    #[test]
+    fn a_repair_round_copies_only_the_span_that_moved() {
+        const SENTINEL: u32 = 0xDEAD_BEEF;
+        let screen = kms_emu::attach(192, 200);
+        let pitch_px = screen.pitch_px();
+        drm::set_present_repair_enabled(true);
+        let c = Client::open(0);
+        let buf = c.create_dumb(192, 200);
+        paint(&buf, |x, y| tag(0x0088_0000, x, y));
+        let fb = c.addfb2(&buf);
+        let stride = (buf.pitch / 4) as usize;
+        let late = map_dumb(&buf).as_mut_ptr() as usize;
+
+        kms_emu::on_blit_band(move |band| match band {
+            // Second band of the present's own blit: move one band of the source
+            // after the rows carrying it have already gone to the panel.
+            1 => {
+                // SAFETY: the dumb buffer outlives this present.
+                let p = unsafe { core::slice::from_raw_parts_mut(late as *mut u32, stride * 200) };
+                for y in 0..128usize {
+                    for x in 64..128usize {
+                        p[y * stride + x] = tag(0x0099_0000, x as u32, y as u32);
+                    }
+                }
+            }
+            // First band of the repair's blit: mark the panel outside the span.
+            2 => {
+                for y in 0..128u32 {
+                    kms_emu::poke(pitch_px, 0, y, SENTINEL);
+                    kms_emu::poke(pitch_px, 191, y, SENTINEL);
+                }
+            }
+            _ => {}
+        });
+
+        c.page_flip(drm::SYNTH_CRTC_ID, fb, 0xF00D).expect("flip");
+
+        assert!(
+            drm::repair_rounds_for_test() >= 1,
+            "a source that moved under the copy has to cost at least one repair \
+             round; the blit took {} bands",
+            kms_emu::mid_blit_calls()
+        );
+        for y in 0..128 {
+            assert_eq!(
+                (screen.pixel(0, y), screen.pixel(191, y)),
+                (SENTINEL, SENTINEL),
+                "row {}: the repair repainted columns outside the span that moved",
+                y
+            );
+        }
+        // And the span itself still got repaired.
+        assert_eq!(screen.pixel(64, 0), tag(0x0099_0000, 64, 0));
+    }
+
+    /// With the probe armed and the repair NOT armed the bracket IS taken -- the
+    /// probe needs it -- so this is the one arrangement where the repair's own
+    /// check is the only thing standing between a measurement and a copy nobody
+    /// asked for. It must stay a measurement.
+    #[test]
+    fn the_probe_alone_measures_and_does_not_repair() {
+        let screen = kms_emu::attach(192, 200);
+        drm::set_present_probe_enabled(true);
+        let c = Client::open(0);
+        let buf = c.create_dumb(192, 200);
+        paint(&buf, |x, y| tag(0x00AA_0000, x, y));
+        let fb = c.addfb2(&buf);
+        let stride = (buf.pitch / 4) as usize;
+        let late = map_dumb(&buf).as_mut_ptr() as usize;
+
+        kms_emu::on_blit_band(move |band| {
+            if band != 1 {
+                return;
+            }
+            // SAFETY: the dumb buffer outlives this present.
+            let p = unsafe { core::slice::from_raw_parts_mut(late as *mut u32, stride * 200) };
+            for y in 0..128usize {
+                for x in 64..128usize {
+                    p[y * stride + x] = tag(0x00BB_0000, x as u32, y as u32);
+                }
+            }
+        });
+
+        c.page_flip(drm::SYNTH_CRTC_ID, fb, 0xF00D).expect("flip");
+
+        assert_eq!(
+            drm::repair_rounds_for_test(),
+            0,
+            "the probe must not repair -- it reports"
+        );
+        assert_eq!(
+            screen.pixel(64, 0),
+            tag(0x00AA_0000, 64, 0),
+            "the panel keeps what the copy caught"
+        );
+    }
+
+    /// A source that is still moving during the repair costs a SECOND round, and
+    /// the second round is the one that puts the latest pixels up. Without this
+    /// the budget could be one and nothing would notice.
+    #[test]
+    fn a_source_still_moving_during_the_repair_costs_a_second_round() {
+        let screen = kms_emu::attach(192, 200);
+        drm::set_present_repair_enabled(true);
+        let c = Client::open(0);
+        let buf = c.create_dumb(192, 200);
+        paint(&buf, |x, y| tag(0x00CC_0000, x, y));
+        let fb = c.addfb2(&buf);
+        let stride = (buf.pitch / 4) as usize;
+        let late = map_dumb(&buf).as_mut_ptr() as usize;
+
+        // Band 1 moves the span during the present's own blit; band 2 moves it
+        // AGAIN during the first repair round, so only a second round can catch up.
+        kms_emu::on_blit_band(move |band| {
+            let base = match band {
+                1 => 0x00DD_0000u32,
+                2 => 0x00EE_0000u32,
+                _ => return,
+            };
+            // SAFETY: the dumb buffer outlives this present.
+            let p = unsafe { core::slice::from_raw_parts_mut(late as *mut u32, stride * 200) };
+            for y in 0..128usize {
+                for x in 64..128usize {
+                    p[y * stride + x] = tag(base, x as u32, y as u32);
+                }
+            }
+        });
+
+        c.page_flip(drm::SYNTH_CRTC_ID, fb, 0xF00D).expect("flip");
+
+        assert_eq!(
+            drm::repair_rounds_for_test(),
+            2,
+            "a source that moved again under the repair owes a second round"
+        );
+        assert_eq!(
+            screen.pixel(64, 0),
+            tag(0x00EE_0000, 64, 0),
+            "the second round has to put the latest pixels up"
+        );
+    }
+
+    /// The same race with the repair NOT armed: the panel keeps the stale pixels.
+    /// This is the defect itself, pinned, so the test above cannot pass for some
+    /// reason other than the repair -- and so that turning the flag off is known
+    /// to still mean what it says.
+    #[test]
+    fn without_the_repair_the_stale_pixels_stay_on_the_panel() {
+        let screen = kms_emu::attach(192, 200);
+        let c = Client::open(0);
+        let buf = c.create_dumb(192, 200);
+        paint(&buf, |x, y| tag(0x0066_0000, x, y));
+        let fb = c.addfb2(&buf);
+        let pixels = map_dumb(&buf);
+        let stride = (buf.pitch / 4) as usize;
+        let late = pixels.as_mut_ptr() as usize;
+
+        kms_emu::on_blit_band(move |band| {
+            if band != 1 {
+                return;
+            }
+            // SAFETY: as above.
+            let p = unsafe { core::slice::from_raw_parts_mut(late as *mut u32, stride * 200) };
+            for y in 0..128usize {
+                for x in 64..128usize {
+                    p[y * stride + x] = tag(0x0077_0000, x as u32, y as u32);
+                }
+            }
+        });
+
+        c.page_flip(drm::SYNTH_CRTC_ID, fb, 0xF00D).expect("flip");
+
+        assert_eq!(
+            drm::repair_rounds_for_test(),
+            0,
+            "the repair must not run when the cmdline did not arm it"
+        );
+        assert_eq!(
+            screen.pixel(64, 0),
+            tag(0x0066_0000, 64, 0),
+            "with no repair the panel keeps what the copy caught"
+        );
+    }
+
+    /// The repair pass must be free on a buffer nobody is writing: zero extra
+    /// rounds, and the frame on screen is exactly the frame in the buffer. Every
+    /// claim about what the repair costs rests on this -- a pass that ran rounds
+    /// on a settled present would be paying on every frame of a healthy desktop.
+    #[test]
+    fn the_repair_pass_runs_no_rounds_on_a_settled_buffer() {
+        let screen = kms_emu::attach(192, 8);
+        drm::set_present_repair_enabled(true);
+        let c = Client::open(0);
+        let buf = c.create_dumb(192, 8);
+        paint(&buf, |x, y| tag(0x0033_0000, x, y));
+        let fb = c.addfb2(&buf);
+
+        c.page_flip(drm::SYNTH_CRTC_ID, fb, 0xF00D).expect("flip");
+
+        assert_eq!(
+            drm::repair_rounds_for_test(),
+            0,
+            "a buffer nobody is writing must cost no repair rounds"
+        );
+        for y in 0..8 {
+            for x in 0..192 {
+                assert_eq!(
+                    screen.pixel(x, y),
+                    tag(0x0033_0000, x, y),
+                    "pixel ({}, {}) with the repair armed",
+                    x,
+                    y
+                );
+            }
+        }
+    }
+
+    /// And the repair pass changes nothing about a damage box on the buffer the
+    /// panel already carries: the box is still the only thing copied. Arming a
+    /// repair must not quietly turn every present into a whole frame.
+    #[test]
+    fn the_repair_pass_does_not_widen_a_damage_box() {
+        let screen = kms_emu::attach(192, 8);
+        drm::set_present_repair_enabled(true);
+        let c = Client::open(0);
+        let buf = c.create_dumb(192, 8);
+        paint(&buf, |x, y| tag(0x0044_0000, x, y));
+        let fb = c.addfb2(&buf);
+        c.page_flip(drm::SYNTH_CRTC_ID, fb, 0xF00D).expect("flip");
+
+        // Repaint the whole buffer, then damage only one band of it.
+        paint(&buf, |x, y| tag(0x0055_0000, x, y));
+        dirtyfb(&c, fb, &[clip(64, 0, 128, 8)]);
+
+        assert_eq!(drm::repair_rounds_for_test(), 0);
+        for y in 0..8 {
+            for x in 0..192 {
+                let want = if (64..128).contains(&x) {
+                    tag(0x0055_0000, x, y)
+                } else {
+                    tag(0x0044_0000, x, y)
+                };
+                assert_eq!(
+                    screen.pixel(x, y),
+                    want,
+                    "pixel ({}, {}) -- the repair widened the box",
+                    x,
+                    y
+                );
+            }
+        }
+    }
+
     #[test]
     fn a_damage_box_on_a_fresh_buffer_puts_the_whole_frame_up() {
         let screen = kms_emu::attach(64, 16);
