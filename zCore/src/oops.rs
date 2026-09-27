@@ -116,6 +116,34 @@ pub fn contained_count() -> u32 {
     CONTAINED.load(Ordering::Relaxed)
 }
 
+/// Take one slot out of the fault budget, or `None` when it is spent.
+///
+/// The count used to be a bare `fetch_add` read back against
+/// [`MAX_CONTAINED`], which meant the increment happened whether or not the
+/// fault was then contained. Two things followed. The budget check saw its own
+/// increment, so the refusal came one fault after the limit rather than at it;
+/// and every later fault kept incrementing a counter nobody would decrement, so
+/// `contained_count` -- which is read back out of the kernel as *contained*
+/// faults -- grew without bound past a limit it was supposed to be capped by.
+/// A number that says 40 faults were contained out of a budget of 16 is not a
+/// diagnostic.
+///
+/// A `compare_exchange` loop instead: the slot is claimed only when one is
+/// there, so the counter never passes [`MAX_CONTAINED`] and counts exactly the
+/// faults this kernel survived.
+fn claim_fault_budget() -> Option<u32> {
+    let mut cur = CONTAINED.load(Ordering::SeqCst);
+    loop {
+        if cur >= MAX_CONTAINED {
+            return None;
+        }
+        match CONTAINED.compare_exchange(cur, cur + 1, Ordering::SeqCst, Ordering::SeqCst) {
+            Ok(_) => return Some(cur + 1),
+            Err(seen) => cur = seen,
+        }
+    }
+}
+
 /// Try to contain the fault `what` by killing only whoever caused it.
 ///
 /// **Does not return** if it succeeds: the CPU goes back to the scheduler and
@@ -286,13 +314,12 @@ pub fn try_contain(what: &str, restore_kd: Option<u32>) {
         ));
     }
 
-    let n = CONTAINED.fetch_add(1, Ordering::SeqCst) + 1;
-    if n > MAX_CONTAINED {
+    let Some(n) = claim_fault_budget() else {
         return decline(format_args!(
             "budget exhausted ({} faults already contained)",
             MAX_CONTAINED
         ));
-    }
+    };
 
     match &victim {
         Some(thread) => {
@@ -376,4 +403,116 @@ fn kill(thread: &alloc::sync::Arc<Thread>) {
     // what lets the process actually terminate and release its address space
     // when this was its last thread.
     thread.terminate_abandoned();
+}
+
+/// The fault-containment policy, on the host.
+///
+/// This module is `#[cfg(not(feature = "libos"))]` in the kernel build and
+/// `cargo test -p zcore` runs with `--features libos`, so the code that decides
+/// whether a kernel fault kills one process or the whole machine had never been
+/// compiled by a test binary. `try_contain` itself cannot run here -- it reads
+/// the local APIC's cpu id, the lock depth and the executor's stacks, and does
+/// not return when it succeeds -- but the budget it spends and the exit code it
+/// hands the victim are plain values, and both had a defect.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// One test at a time through `CONTAINED`, a process-wide static that every
+    /// test would otherwise believe is its own, saved and restored around the
+    /// body so the count is left as it was found.
+    fn alone_with_the_budget(body: impl FnOnce()) {
+        extern crate std;
+        use std::sync::Mutex;
+        static TURNSTILE: Mutex<()> = Mutex::new(());
+        let _guard = TURNSTILE.lock().unwrap_or_else(|e| e.into_inner());
+        let saved = CONTAINED.load(Ordering::SeqCst);
+        CONTAINED.store(0, Ordering::SeqCst);
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(body));
+        CONTAINED.store(saved, Ordering::SeqCst);
+        if let Err(e) = r {
+            std::panic::resume_unwind(e);
+        }
+    }
+
+    #[test]
+    fn the_budget_hands_out_exactly_the_faults_it_promises() {
+        alone_with_the_budget(|| {
+            for n in 1..=MAX_CONTAINED {
+                assert_eq!(claim_fault_budget(), Some(n), "fault {n}");
+            }
+            assert_eq!(claim_fault_budget(), None, "the {}th", MAX_CONTAINED + 1);
+        });
+    }
+
+    /// The defect: the count is read back out of the kernel as *contained*
+    /// faults, and a `fetch_add` before the check kept moving it on every fault
+    /// after the budget was spent. It reported more faults contained than the
+    /// budget allows -- and it never stopped climbing.
+    #[test]
+    fn a_refused_fault_does_not_count_itself_as_contained() {
+        alone_with_the_budget(|| {
+            while claim_fault_budget().is_some() {}
+            assert_eq!(contained_count(), MAX_CONTAINED);
+            for _ in 0..50 {
+                assert_eq!(claim_fault_budget(), None);
+            }
+            assert_eq!(
+                contained_count(),
+                MAX_CONTAINED,
+                "declined faults were counted as contained"
+            );
+        });
+    }
+
+    /// The count is what `contained_count` publishes, so the two must be the
+    /// same number and not merely agree at zero.
+    #[test]
+    fn the_published_count_is_the_number_of_faults_survived() {
+        alone_with_the_budget(|| {
+            assert_eq!(contained_count(), 0);
+            claim_fault_budget().unwrap();
+            claim_fault_budget().unwrap();
+            assert_eq!(contained_count(), 2);
+        });
+    }
+
+    /// The exit code the victim's process carries. It used to be the literal
+    /// `128 + 9`, which `wait4` reports as an ordinary `exit(137)` rather than a
+    /// death by signal, so a parent testing `WIFSIGNALED` was told its child
+    /// exited normally. The value is spelled out here because `linux-object` is
+    /// an optional dependency of this crate; where it IS linked, this test is
+    /// what stops the two spellings from drifting.
+    #[test]
+    #[cfg(feature = "linux")]
+    fn the_victim_dies_the_way_a_kill_9_does() {
+        assert_eq!(
+            KILLED_BY_KERNEL,
+            linux_object::process::exit_code_killed_by(9)
+        );
+    }
+
+    /// Without `linux-object` the constant can still be pinned to what `wait4`
+    /// needs: negative, and the signal number rather than `128 + signo`.
+    #[test]
+    fn the_victims_exit_code_is_a_signal_death_and_not_an_exit_status() {
+        assert_eq!(KILLED_BY_KERNEL, -9);
+        assert_ne!(KILLED_BY_KERNEL, 128 + 9);
+    }
+
+    /// `CONTAINING` is a bit per CPU in a `u64`, and `try_contain` refuses a cpu
+    /// id it cannot represent rather than shifting out of range. 64 is the
+    /// system's maximum, so the guard is at the edge of what fits, not inside
+    /// it.
+    #[test]
+    fn every_cpu_the_guard_admits_has_a_bit_of_its_own() {
+        let mut seen = 0u64;
+        for cpu in 0..64usize {
+            let bit = 1u64 << cpu;
+            assert_eq!(seen & bit, 0, "cpu {cpu} shares a bit");
+            seen |= bit;
+        }
+        assert_eq!(seen, u64::MAX);
+        assert_eq!(lock::MAX_CORE_NUM, 64, "the mask is sized to this");
+    }
 }
