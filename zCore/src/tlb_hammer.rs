@@ -38,17 +38,32 @@ fn hammer_log(msg: core::fmt::Arguments) {
 /// unrelated IRQ-off work).
 static HOLD: Mutex<()> = Mutex::new(());
 
-/// Parse `eclipse.tlbhammer=N` from the cmdline. `None` = disabled.
+/// The CPU budget `eclipse.tlbhammer=N` asks for. `None` = disabled.
+///
+/// Read through `kernel_hal::cmdline`, which is the kernel's one parser for
+/// this string, rather than by splitting on `"eclipse.tlbhammer="` -- that had
+/// no notion of a key, so `xeclipse.tlbhammer=6` armed the hammer and so did
+/// the text appearing inside somebody else's value, and it read a value that
+/// is not a number as however many digits it happened to start with.
+///
+/// `=0` DISABLES it. It used to clamp up to three, i.e. the one spelling
+/// anybody reaches for to turn a thing off armed three threads hammering the
+/// TLB instead -- the same kill-switch inversion `cmdline` was written to end.
 pub fn parse_tlbhammer(cmdline: &str) -> Option<usize> {
-    let rest = cmdline.split("eclipse.tlbhammer=").nth(1)?;
-    let digits: alloc::string::String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
-    let n: usize = digits.parse().ok()?;
-    if n >= 3 {
-        Some(n)
-    } else {
-        // Need at least 1 mapper + holder + churn.
-        Some(3)
+    let spelled = kernel_hal::cmdline::value(cmdline, "eclipse.tlbhammer")?;
+    let Some(n) = kernel_hal::cmdline::parse_number(spelled).and_then(|n| usize::try_from(n).ok())
+    else {
+        warn!(
+            "eclipse.tlbhammer={} is not a CPU budget; the hammer stays off",
+            spelled
+        );
+        return None;
+    };
+    if n == 0 {
+        return None;
     }
+    // Need at least 1 mapper + holder + churn.
+    Some(n.max(3))
 }
 
 /// Spawn the hammer. Call once after SMP is up and the executor is running
@@ -198,5 +213,110 @@ async fn progress_loop() {
             "tlbhammer: alive {}0s (no shootdown starvation panic)",
             n
         ));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The line a live Eclipse boots with, which mentions no hammer.
+    const REAL: &str = "LOG=error:TERM=xterm-256color:console.shell=true:ROOT=/dev/sda2";
+
+    #[test]
+    fn the_budget_written_is_the_budget_returned() {
+        assert_eq!(parse_tlbhammer("eclipse.tlbhammer=6"), Some(6));
+        assert_eq!(parse_tlbhammer("LOG=error:eclipse.tlbhammer=6"), Some(6));
+        // The colon ends the number, and that is `cmdline`'s job to know.
+        assert_eq!(
+            parse_tlbhammer("eclipse.tlbhammer=6:LOG=error:ROOT=/dev/sda2"),
+            Some(6)
+        );
+    }
+
+    #[test]
+    fn a_budget_too_small_to_run_the_hammer_is_raised_to_three() {
+        // One mapper, the irq-off holder and the process churn: below three
+        // there is no hammer to run, and asking for two is a mistake worth
+        // correcting rather than refusing.
+        assert_eq!(parse_tlbhammer("eclipse.tlbhammer=1"), Some(3));
+        assert_eq!(parse_tlbhammer("eclipse.tlbhammer=2"), Some(3));
+        assert_eq!(parse_tlbhammer("eclipse.tlbhammer=3"), Some(3));
+    }
+
+    #[test]
+    fn zero_turns_the_hammer_off_rather_than_arming_three_threads() {
+        // It used to be clamped up with the rest, so the one spelling anybody
+        // reaches for to turn a thing off armed a TLB hammer instead.
+        assert_eq!(parse_tlbhammer("eclipse.tlbhammer=0"), None);
+        assert_eq!(parse_tlbhammer("LOG=error:eclipse.tlbhammer=0"), None);
+    }
+
+    #[test]
+    fn a_line_that_never_mentioned_the_hammer_does_not_arm_it() {
+        assert_eq!(parse_tlbhammer(REAL), None);
+        assert_eq!(parse_tlbhammer(""), None);
+    }
+
+    #[test]
+    fn the_name_inside_a_longer_key_is_not_the_hammer() {
+        // `split("eclipse.tlbhammer=")` had no notion of a key.
+        assert!(
+            "xeclipse.tlbhammer=6".contains("eclipse.tlbhammer="),
+            "which is what the old parser asked"
+        );
+        assert_eq!(parse_tlbhammer("xeclipse.tlbhammer=6"), None);
+        assert_eq!(parse_tlbhammer("no.eclipse.tlbhammer=6"), None);
+    }
+
+    #[test]
+    fn the_name_inside_somebody_elses_value_is_not_the_hammer() {
+        // A root device is a path the installer substitutes, not a place to
+        // look for a debugging knob -- and this one armed the hammer.
+        assert_eq!(
+            parse_tlbhammer("ROOT=/dev/disk/by-id/eclipse.tlbhammer=6-part2"),
+            None
+        );
+        assert_eq!(parse_tlbhammer("TERM=eclipse.tlbhammer=6"), None);
+    }
+
+    #[test]
+    fn a_value_that_is_not_a_budget_leaves_the_hammer_off() {
+        // `take_while(is_ascii_digit)` read `6spins` as six.
+        assert_eq!(parse_tlbhammer("eclipse.tlbhammer=6spins"), None);
+        assert_eq!(parse_tlbhammer("eclipse.tlbhammer=six"), None);
+        assert_eq!(parse_tlbhammer("eclipse.tlbhammer=-6"), None);
+    }
+
+    #[test]
+    fn a_bare_key_with_no_budget_does_not_arm_it() {
+        // There is no sensible default CPU budget, so naming the knob without
+        // a number is a typo, not a request.
+        assert_eq!(parse_tlbhammer("LOG=error:eclipse.tlbhammer"), None);
+        assert_eq!(parse_tlbhammer("eclipse.tlbhammer="), None);
+    }
+
+    #[test]
+    fn a_budget_written_in_hex_is_the_number_it_spells() {
+        // The old parser stopped at the `x`, read `0`, clamped it up and armed
+        // three threads -- a different hammer than the one asked for.
+        assert_eq!(parse_tlbhammer("eclipse.tlbhammer=0x8"), Some(8));
+        assert_eq!(parse_tlbhammer("eclipse.tlbhammer=0x0"), None);
+    }
+
+    #[test]
+    fn the_key_is_case_insensitive_like_every_other_one() {
+        assert_eq!(parse_tlbhammer("ECLIPSE.TLBHAMMER=6"), Some(6));
+        assert_eq!(parse_tlbhammer("Eclipse.TlbHammer=6"), Some(6));
+    }
+
+    #[test]
+    fn the_spaces_a_person_leaves_around_the_budget_are_not_part_of_it() {
+        // The old parser wanted a digit where the space was and took the knob
+        // to be absent.
+        assert_eq!(
+            parse_tlbhammer("LOG=error: eclipse.tlbhammer = 6 "),
+            Some(6)
+        );
     }
 }
