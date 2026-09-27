@@ -139,7 +139,9 @@ use procfs::ProcFS;
 use pseudo::Pseudo;
 use sysfs::SysFS;
 
-pub use dmabuf::DmaBuf;
+pub use dmabuf::{
+    sync_file_usage, DmaBuf, DMA_BUF_IOCTL_EXPORT_SYNC_FILE, DMA_BUF_IOCTL_IMPORT_SYNC_FILE,
+};
 pub use eclipsefs_ioctl::{
     eclipsefs_copy_reflink, eclipsefs_fallocate, eclipsefs_ioctl, eclipsefs_seek, eclipsefs_xattr,
     FsIoctlContext, XattrReply, XattrRequest, EFS_IOC_RECEIVE,

@@ -1936,6 +1936,61 @@ impl Syscall<'_> {
         }
     }
 
+    /// `DMA_BUF_IOCTL_EXPORT_SYNC_FILE` (`export`) and `IMPORT_SYNC_FILE` on
+    /// a dma-buf fd (`<linux/dma-buf.h>`): the fences on the buffer as a new
+    /// sync_file fd, close-on-exec, or a sync_file's fence put on the buffer.
+    /// The flags are read first (`sync_file_usage`), then the fd; a target
+    /// that is not a dma-buf gets `ENOTTY` (the ioctl is unknown to that
+    /// file), an fd that is not a sync_file, or not an fd at all, `EINVAL`
+    /// (`sync_file_get_fence` finds no fence), both as in
+    /// `dma_buf_export_sync_file` / `dma_buf_import_sync_file`. Neither
+    /// existed: a dma-buf answered `ENOTTY` to both, so a client that fenced
+    /// its buffer for an implicit-sync consumer (Xwayland's window copies,
+    /// Mesa's WSI without `linux-drm-syncobj-v1`) was refused and the
+    /// consumer read the buffer whenever it liked.
+    fn sys_dma_buf_sync_file(
+        &self,
+        file: &Arc<dyn FileLike>,
+        export: bool,
+        arg1: usize,
+    ) -> SysResult {
+        use linux_object::fs::{sync_file_usage, DmaBuf, SyncobjHandle};
+
+        // struct dma_buf_export_sync_file / dma_buf_import_sync_file
+        // { __u32 flags; __s32 fd; }
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct DmaBufSyncFile {
+            flags: u32,
+            fd: i32,
+        }
+
+        let Some(dmabuf) = file.downcast_ref::<DmaBuf>() else {
+            return Err(LxError::ENOTTY);
+        };
+        let mut ptr = UserInOutPtr::<DmaBufSyncFile>::from(arg1);
+        let mut data = ptr.read()?;
+        let write = sync_file_usage(data.flags)?;
+        let proc = self.linux_process();
+        if export {
+            // `SyncobjHandle` opens `O_CLOEXEC`, which is what
+            // `get_unused_fd_flags(O_CLOEXEC)` gives the new fd.
+            let sync_file = dmabuf.export_sync_file(write);
+            let fd = proc.add_file(sync_file)?;
+            data.fd = i32::from(fd);
+            ptr.write(data)?;
+            return Ok(0);
+        }
+        let target = proc
+            .get_file_like(FileDesc::from(data.fd as usize))
+            .map_err(|_| LxError::EINVAL)?;
+        let fence = target
+            .downcast_ref::<SyncobjHandle>()
+            .ok_or(LxError::EINVAL)?;
+        dmabuf.import_sync_file(write, fence)?;
+        Ok(0)
+    }
+
     /// `SYNC_IOC_MERGE` (`<linux/sync_file.h>`): a new sync_file fd that is
     /// ready once both the target fd and `fd2` are. Both must be sync_files:
     /// a target that is not one gets `ENOTTY` (the ioctl is unknown to that
@@ -2382,6 +2437,11 @@ impl Syscall<'_> {
         // a new fd out), so it is dispatched here like the DRM fd ioctls.
         if is_sync_ioc_merge(request as u32) {
             return self.sys_sync_file_merge(&file_like, arg1);
+        }
+        // DMA_BUF_IOCTL_EXPORT_SYNC_FILE / IMPORT_SYNC_FILE on a dma-buf fd:
+        // a sync_file fd out, or one in -- the fd table again.
+        if let Some(export) = dma_buf_sync_file_ioctl(request as u32) {
+            return self.sys_dma_buf_sync_file(&file_like, export, arg1);
         }
         // SYNCOBJ_HANDLE_TO_FD / SYNCOBJ_FD_TO_HANDLE — same fd-table-access
         // reasoning and sign-extension caveat as PRIME above. Match by ioctl NR
@@ -3601,6 +3661,19 @@ struct DrmSyncobjEventfd {
     pad: u32,
 }
 
+/// Whether `cmd` is `DMA_BUF_IOCTL_EXPORT_SYNC_FILE` (`Some(true)`) or
+/// `DMA_BUF_IOCTL_IMPORT_SYNC_FILE` (`Some(false)`), the two dma-buf ioctls
+/// that need the fd table. Exact numbers: both structs are two `u32`s and
+/// frozen, so the encoded size cannot move as `drm_syncobj_handle`'s did.
+pub(crate) fn dma_buf_sync_file_ioctl(cmd: u32) -> Option<bool> {
+    use linux_object::fs::{DMA_BUF_IOCTL_EXPORT_SYNC_FILE, DMA_BUF_IOCTL_IMPORT_SYNC_FILE};
+    match cmd {
+        DMA_BUF_IOCTL_EXPORT_SYNC_FILE => Some(true),
+        DMA_BUF_IOCTL_IMPORT_SYNC_FILE => Some(false),
+        _ => None,
+    }
+}
+
 /// The one flag `SYNCOBJ_HANDLE_TO_FD` and `SYNCOBJ_FD_TO_HANDLE` know:
 /// `DRM_SYNCOBJ_HANDLE_TO_FD_FLAGS_EXPORT_SYNC_FILE` and
 /// `DRM_SYNCOBJ_FD_TO_HANDLE_FLAGS_IMPORT_SYNC_FILE`, bit 0 on both.
@@ -3665,7 +3738,7 @@ mod syncobj_fd_ioctl_tests {
 
 #[cfg(test)]
 mod sync_file_ioctl_tests {
-    use super::is_sync_ioc_merge;
+    use super::{dma_buf_sync_file_ioctl, is_sync_ioc_merge};
 
     /// The number libsync's `sync_merge()` sends.
     const SYNC_IOC_MERGE: u32 = 0xc030_3e03;
@@ -3679,6 +3752,24 @@ mod sync_file_ioctl_tests {
         // are another family.
         assert!(!is_sync_ioc_merge(0xc018_64c1));
         assert!(!is_sync_ioc_merge(0xc018_64c2));
+    }
+
+    /// The two dma-buf sync_file ioctls, by the numbers `<linux/dma-buf.h>`
+    /// encodes (`_IOWR('b', 2, ...)` and `_IOW('b', 3, ...)`, 8-byte
+    /// structs), and nothing else of the family: `SYNC` and `SET_NAME` go
+    /// to the dma-buf's own `ioctl`.
+    #[test]
+    fn the_dma_buf_sync_file_ioctls_are_recognised() {
+        assert_eq!(dma_buf_sync_file_ioctl(0xc008_6202), Some(true), "EXPORT");
+        assert_eq!(dma_buf_sync_file_ioctl(0x4008_6203), Some(false), "IMPORT");
+        assert_eq!(dma_buf_sync_file_ioctl(0x4008_6200), None, "SYNC");
+        assert_eq!(dma_buf_sync_file_ioctl(0x4008_6201), None, "SET_NAME");
+        assert_eq!(
+            dma_buf_sync_file_ioctl(0x4008_6202),
+            None,
+            "wrong direction"
+        );
+        assert_eq!(dma_buf_sync_file_ioctl(SYNC_IOC_MERGE), None);
     }
 }
 

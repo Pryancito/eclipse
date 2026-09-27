@@ -53,6 +53,46 @@ fn addfb_rejects_a_pitch_that_is_not_whole_pixels() {
     unplant(9401);
 }
 
+/// A legacy present waits for the writes a client imported onto the
+/// framebuffer's buffer (`DMA_BUF_IOCTL_IMPORT_SYNC_FILE`), found by the
+/// buffer's physical address: the writes, not the reads
+/// (`drm_gem_plane_helper_prepare_fb` takes `DMA_RESV_USAGE_WRITE`), and
+/// nothing once they have landed or for a framebuffer that does not
+/// exist. There was nowhere to import such a fence before.
+#[test]
+fn a_scanout_waits_for_the_writes_imported_onto_its_buffer() {
+    use zcore_drivers::scheme::{resv, syncobj};
+    let _serialised = super::test_globals::lock();
+    let phys = 0x9_0000_0000u64;
+    plant(9402, 64 * 1024, 78_002);
+    DRM_STATE
+        .lock()
+        .handles
+        .iter_mut()
+        .find(|(h, _, _)| h.id == 9402)
+        .unwrap()
+        .0
+        .phys_addr = phys;
+    let fb = create_fb(9402, 64, 4, 256).unwrap();
+    assert_eq!(scanout_resv_fences(fb), [], "nothing imported");
+    let read = syncobj::create(false);
+    let write = syncobj::create(false);
+    assert!(resv::add_fence(phys, read, 1, false));
+    assert_eq!(scanout_resv_fences(fb), [], "a read is not waited for");
+    assert!(resv::add_fence(phys, write, 1, true));
+    let deps = scanout_resv_fences(fb);
+    assert_eq!(deps.len(), 1, "the write is");
+    assert_eq!(deps[0].1, 1);
+    assert_eq!(syncobj::query(deps[0].0), Some(0), "still in flight");
+    assert_eq!(scanout_resv_fences(fb + 1000), [], "not a framebuffer");
+    assert!(syncobj::signal(write));
+    assert_eq!(scanout_resv_fences(fb), [], "landed");
+    resv::forget(phys);
+    syncobj::destroy(read);
+    syncobj::destroy(write);
+    unplant(9402);
+}
+
 /// The pre-existing guards, asserted so the new pitch check cannot be
 /// mistaken for the whole of the validation: a framebuffer must fit inside
 /// its backing buffer, and must be at least as wide as it claims.

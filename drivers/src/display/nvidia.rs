@@ -148,6 +148,9 @@ struct DeferredGemFree {
     handle: u32,
     h_memory: u32,
     size: u64,
+    /// Where the dma-buf reservation of the buffer is keyed, if it was ever
+    /// exportable ([`crate::scheme::resv`]).
+    phys: Option<u64>,
     mappings: Vec<super::nouveau_uapi::NouveauVmMapping>,
     probes: Vec<RingProbe>,
     born_us: u64,
@@ -7795,6 +7798,30 @@ impl DrmScheme for NvidiaGpu {
             .collect()
     }
 
+    fn queued_fences(&self, gem_handle: u32) -> Vec<crate::scheme::syncobj::HwFence> {
+        // Only a buffer this driver knows: another GPU's handle, or a dumb
+        // buffer, has no ring here. The owner is the pid that allocated it,
+        // as for the scanout fence above.
+        let owner = self
+            .nouveau_gem
+            .lock()
+            .iter()
+            .find(|o| o.handle == gem_handle)
+            .map(|o| o.owner_pid);
+        let Some(owner) = owner else {
+            return Vec::new();
+        };
+        self.buffer_ring_probes(gem_handle, owner)
+            .into_iter()
+            .map(|p| crate::scheme::syncobj::HwFence {
+                fence_va: p.fence_va,
+                fence_gpu_va: p.fence_gpu_va,
+                payload: p.payload,
+                ctx_idx: p.ctx_idx,
+            })
+            .collect()
+    }
+
     fn nouveau_gem_close(&self, handle: u32, owner_pid: u64) -> bool {
         // A close is where an earlier close's ring may have passed.
         self.reap_deferred_frees();
@@ -7880,20 +7907,7 @@ impl DrmScheme for NvidiaGpu {
         // probe fence (`ring_idle_probe`, as `CPU_PREP` waits); the memory
         // and the mappings go once those have passed
         // (`reap_deferred_frees`), the handle went above.
-        let mut pids: Vec<u64> = alloc::vec![owner_pid];
-        pids.extend(
-            self.nouveau_vm_mappings
-                .lock()
-                .iter()
-                .filter(|m| m.gem_handle == handle)
-                .map(|m| m.owner_pid),
-        );
-        pids.sort_unstable();
-        pids.dedup();
-        let probes: Vec<RingProbe> = pids
-            .iter()
-            .filter_map(|&pid| self.ring_idle_probe(pid))
-            .collect();
+        let probes = self.buffer_ring_probes(handle, owner_pid);
         if !probes.is_empty() {
             let mappings = self.take_vm_mappings(|m| m.gem_handle == handle);
             log::info!(
@@ -7908,6 +7922,7 @@ impl DrmScheme for NvidiaGpu {
                 handle,
                 h_memory: obj.h_memory,
                 size: obj.size,
+                phys: obj.phys_addr,
                 mappings,
                 probes,
                 born_us: unsafe { crate::bus::drivers_timer_now_as_micros() },
@@ -7923,6 +7938,11 @@ impl DrmScheme for NvidiaGpu {
             |m| m.gem_handle == handle,
             true,
         );
+        // The buffer's reservation goes with its memory: a fence imported
+        // onto its dma-buf names memory that is about to be someone else's.
+        if let Some(phys) = obj.phys_addr {
+            crate::scheme::resv::forget(phys);
+        }
         NOUVEAU_GEM_BYTES.fetch_sub(obj.size, Ordering::Relaxed);
         let status = (*self.rm_device_instance.lock())
             .map(|device_instance| nvidia_rm_sys::rm_init::gem_free(device_instance, obj.h_memory));
@@ -10156,6 +10176,70 @@ impl NvidiaGpu {
         }
     }
 
+    /// The second half of `CPU_PREP`: the fences userspace imported onto
+    /// the buffer's dma-buf ([`crate::scheme::resv`]), waited for on the
+    /// CPU with the same deadline and answers as [`Self::cpu_prep_wait`]:
+    /// `nowait` is EBUSY while any is in flight, and one that never lands
+    /// is EBUSY after the timeout (Linux: a timed-out reservation wait).
+    /// Nothing to wait for when the buffer was never exportable (no
+    /// physical registration: it has no dma-buf) or carries no fence.
+    fn resv_wait(&self, handle: u32, write: bool, nowait: bool) -> Result<usize, i32> {
+        use super::nouveau_uapi as nv;
+        const CPU_PREP_TIMEOUT_US: u64 = 10_000_000;
+        let Some((phys, _)) = crate::scheme::gem_mmap::lookup(handle) else {
+            return Ok(0);
+        };
+        let deps = crate::scheme::resv::fences(phys, write);
+        if deps.is_empty() {
+            return Ok(0);
+        }
+        let handles: Vec<u32> = deps.iter().map(|d| d.0).collect();
+        let points: Vec<u64> = deps.iter().map(|d| d.1).collect();
+        let start = unsafe { crate::bus::drivers_timer_now_as_micros() };
+        let deadline = start.wrapping_add(if nowait { 0 } else { CPU_PREP_TIMEOUT_US });
+        loop {
+            let _ = crate::scheme::syncobj::poll_pending();
+            match crate::scheme::syncobj::wait_ready(&handles, Some(&points), true, deadline) {
+                Some(Ok(_)) => return Ok(0),
+                Some(Err(_)) => {
+                    if !nowait {
+                        crate::klog_warn!(
+                            "[nouveau-uapi] CPU_PREP: handle={} {} imported fence(s) did not land in {}s -> EBUSY",
+                            handle,
+                            deps.len(),
+                            CPU_PREP_TIMEOUT_US / 1_000_000
+                        );
+                    }
+                    return Err(nv::EBUSY);
+                }
+                None => gpu_spin(),
+            }
+        }
+    }
+
+    /// The idle probe of every ring that may still have `handle` queued:
+    /// `owner_pid`'s own and that of every process whose VM_BIND maps the
+    /// object (a PRIME-shared buffer is on every mapper's channel). What a
+    /// `GEM_CLOSE` defers the free behind, and what an `EXPORT_SYNC_FILE`
+    /// of the buffer's dma-buf hands out as its fences. Rings that are idle,
+    /// wedged or gone contribute nothing. A pid listed twice costs nothing:
+    /// once probed it is either idle or already carries the probe.
+    fn buffer_ring_probes(&self, handle: u32, owner_pid: u64) -> Vec<RingProbe> {
+        let mut pids: Vec<u64> = alloc::vec![owner_pid];
+        pids.extend(
+            self.nouveau_vm_mappings
+                .lock()
+                .iter()
+                .filter(|m| m.gem_handle == handle)
+                .map(|m| m.owner_pid),
+        );
+        pids.sort_unstable();
+        pids.dedup();
+        pids.iter()
+            .filter_map(|&pid| self.ring_idle_probe(pid))
+            .collect()
+    }
+
     /// The fence that will say the ring `owner_pid` submits on has passed
     /// everything it had queued: a probe appended now, or, when the ring is
     /// full, the last fence it issued (which covers all but an unfenced
@@ -10577,13 +10661,14 @@ impl NvidiaGpu {
             // Phase 3: apply under the nouveau_gem lock. Collect h_memory ONLY
             // for entries actually removed here -- a racing GEM_CLOSE that
             // already reaped one leaves it absent, so it is never double-freed.
-            let mut to_free_mem: Vec<(u32, u32, u64)> = Vec::new(); // (handle, h_memory, size)
+            // (handle, h_memory, size, phys)
+            let mut to_free_mem: Vec<(u32, u32, u64, Option<u64>)> = Vec::new();
             {
                 let mut gem = self.nouveau_gem.lock();
                 for handle in &to_free {
                     if let Some(pos) = gem.iter().position(|o| o.handle == *handle) {
                         let obj = gem.remove(pos);
-                        to_free_mem.push((obj.handle, obj.h_memory, obj.size));
+                        to_free_mem.push((obj.handle, obj.h_memory, obj.size, obj.phys_addr));
                     }
                 }
                 for handle in &to_orphan {
@@ -10604,7 +10689,7 @@ impl NvidiaGpu {
             // `gem_free` has already returned to the allocator. This path is
             // the likelier way to hit that -- a client killed or crashed
             // mid-session never issues the GEM_CLOSE that would have cleaned up.
-            for (handle, _, _) in &to_free_mem {
+            for (handle, _, _, _) in &to_free_mem {
                 let dropped = self.drop_kms_fbs_for_handle(*handle);
                 if !dropped.is_empty() {
                     log::info!(
@@ -10617,8 +10702,11 @@ impl NvidiaGpu {
                 }
             }
             let mut bytes = 0u64;
-            for (handle, h_memory, size) in &to_free_mem {
+            for (handle, h_memory, size, phys) in &to_free_mem {
                 lock::pump();
+                if let Some(phys) = phys {
+                    crate::scheme::resv::forget(*phys);
+                }
                 if let Some(device_instance) = device_instance {
                     let status = nvidia_rm_sys::rm_init::gem_free(device_instance, *h_memory);
                     if status != 0 {
@@ -10948,10 +11036,14 @@ impl NvidiaGpu {
                 handle,
                 h_memory,
                 size,
+                phys,
                 mappings,
                 ..
             } = d;
             let context = alloc::format!("deferred GEM_CLOSE handle={}", handle);
+            if let Some(phys) = phys {
+                crate::scheme::resv::forget(phys);
+            }
             self.rm_unmap_mappings(&context, mappings);
             NOUVEAU_GEM_BYTES.fetch_sub(size, Ordering::Relaxed);
             let status = (*self.rm_device_instance.lock())
@@ -14590,6 +14682,15 @@ impl NvidiaGpu {
                 for pid in self.cpu_prep_pids(req.handle, owner_pid) {
                     self.cpu_prep_wait(pid, nowait)?;
                 }
+                // Then what userspace put on the buffer's dma-buf with
+                // `DMA_BUF_IOCTL_IMPORT_SYNC_FILE`: the fences Linux finds on
+                // the BO's reservation, of the usage `dma_resv_usage_rw`
+                // gives this access (a read waits for the writes, a write
+                // for every fence). They used to be refused at the import,
+                // so a prep on a buffer another client had fenced went
+                // straight through.
+                let write = req.flags & nv::NOUVEAU_GEM_CPU_PREP_WRITE != 0;
+                self.resv_wait(req.handle, write, nowait)?;
                 Ok(0)
             }
 
