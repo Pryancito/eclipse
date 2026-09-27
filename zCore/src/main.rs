@@ -21,9 +21,14 @@ extern crate cfg_if;
 #[macro_use]
 mod logging;
 
-#[cfg(not(feature = "libos"))]
+// `test` as well as the kernel build: these two modules are the panic and
+// fault path, and `cargo test -p zcore` runs with `--features libos`, so
+// until now NO job compiled either of them. The `#[panic_handler]` and
+// `#[alloc_error_handler]` inside `lang` are the only items a host build
+// cannot have (std supplies both); they carry their own `not(test)`.
+#[cfg(any(not(feature = "libos"), test))]
 mod lang;
-#[cfg(not(feature = "libos"))]
+#[cfg(any(not(feature = "libos"), test))]
 mod oops;
 
 /// The AHCI command-wait loop pumps the polled network stack through this

@@ -182,7 +182,11 @@ jobs:
           # dmesg ring, the physical frame allocator and the exit status this
           # very job reads. Built for the libos personality, which is the one
           # that links against the host.
-          cargo test -p zcore --features libos -- --test-threads=1
+          # `linux` as well as `libos`: the Linux personality is what this
+          # kernel actually boots, and with it the victim exit code in `oops`
+          # can be checked against `linux-object`'s own spelling of it instead
+          # of only against a literal.
+          cargo test -p zcore --features libos,linux -- --test-threads=1
 
       - name: Build the bootloader for its real target
         run: |
