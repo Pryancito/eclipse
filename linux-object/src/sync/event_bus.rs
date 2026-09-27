@@ -165,6 +165,16 @@ impl EventBus {
         Some(id)
     }
 
+    /// Whether `id` still names a callback on this bus.
+    ///
+    /// A subscription is one-shot in both directions: [`EventBus::change`]
+    /// drops a callback the moment it returns true, and a full table evicts the
+    /// oldest entry outright. So a holder of an id cannot tell from the id
+    /// alone whether it is still parked here, and has to ask.
+    pub fn is_subscribed(&self, id: u64) -> bool {
+        self.callbacks.iter().any(|(item_id, _)| *item_id == id)
+    }
+
     /// Unsubscribe a previously registered callback by its ID.
     pub fn unsubscribe(&mut self, id: u64) {
         self.callbacks.retain(|(item_id, _)| *item_id != id);
@@ -379,7 +389,24 @@ impl Future for EventBusFuture {
                 kernel_hal::timer_waker::kill_timer_waker(&mut this.timer);
                 return Poll::Ready(Ok(event));
             }
-            if this.sub_id.is_none() {
+            // Not `sub_id.is_none()`: the callback registered below is
+            // one-shot -- `change` drops it as soon as it fires, and a full
+            // table evicts the oldest entry outright -- so after the first
+            // wakeup the id this future holds names nothing on the bus. Asking
+            // only whether the id is `None` therefore left the future with NO
+            // callback parked for the rest of its life on any poll that did
+            // not find the events set: the common one, where the waiter is
+            // woken and another thread drains the data before it runs. From
+            // then on the only thing that ever re-polled it was the 100 ms
+            // backstop tick, so a blocking `read` on a pipe or a socket
+            // degenerated into a poll loop -- every byte up to 100 ms late,
+            // ten wakeups a second per waiter, and nothing to show why.
+            if !this
+                .sub_id
+                .map(|id| lock.is_subscribed(id))
+                .unwrap_or(false)
+            {
+                this.sub_id = None;
                 let waker = cx.waker().clone();
                 let mask = this.mask;
                 let sub_id = lock.subscribe(Box::new(move |s| {
@@ -503,6 +530,86 @@ mod tests {
             Poll::Ready(Ok(Event::READABLE))
         ));
         assert_eq!(bus.lock().get_callback_len(), 0);
+    }
+
+    /// The race this is about: the waiter is woken, and by the time it runs
+    /// another thread has already drained the data. It has to park itself on
+    /// the bus again -- its own callback was spent by the wakeup -- or nothing
+    /// but the 100 ms backstop will ever look at it again.
+    #[test]
+    fn a_woken_waiter_that_finds_nothing_parks_itself_again() {
+        static WOKE: AtomicBool = AtomicBool::new(false);
+        let bus: Arc<Mutex<EventBus>> = EventBus::new();
+        let waker = flag_waker(&WOKE);
+        let mut cx = Context::from_waker(&waker);
+        let mut fut = wait_for_event(bus.clone(), Event::READABLE);
+
+        assert!(matches!(Pin::new(&mut fut).poll(&mut cx), Poll::Pending));
+        assert_eq!(bus.lock().get_callback_len(), 1, "parked once");
+
+        // The event arrives -- which spends the callback -- and is consumed by
+        // somebody else before this future is polled.
+        bus.lock().set(Event::READABLE);
+        assert!(WOKE.load(Ordering::SeqCst), "the wakeup must have happened");
+        assert_eq!(bus.lock().get_callback_len(), 0, "one-shot, so it is gone");
+        bus.lock().clear(Event::READABLE);
+
+        assert!(matches!(Pin::new(&mut fut).poll(&mut cx), Poll::Pending));
+        assert_eq!(
+            bus.lock().get_callback_len(),
+            1,
+            "a waiter that goes back to sleep must leave a callback behind, or \
+             only the 100 ms tick will ever wake it"
+        );
+        drop(fut);
+        assert_eq!(bus.lock().get_callback_len(), 0);
+    }
+
+    /// And the other side of it: a re-poll of a waiter whose callback is still
+    /// parked must not park a second one.
+    #[test]
+    fn re_polling_a_live_waiter_does_not_park_a_second_callback() {
+        static WOKE: AtomicBool = AtomicBool::new(false);
+        let bus: Arc<Mutex<EventBus>> = EventBus::new();
+        let waker = flag_waker(&WOKE);
+        let mut cx = Context::from_waker(&waker);
+        let mut fut = wait_for_event(bus.clone(), Event::READABLE);
+        for _ in 0..8 {
+            assert!(matches!(Pin::new(&mut fut).poll(&mut cx), Poll::Pending));
+            assert_eq!(bus.lock().get_callback_len(), 1);
+        }
+        drop(fut);
+        assert_eq!(bus.lock().get_callback_len(), 0);
+    }
+
+    #[test]
+    fn an_evicted_waiter_parks_itself_again_too() {
+        static WOKE: AtomicBool = AtomicBool::new(false);
+        let bus: Arc<Mutex<EventBus>> = EventBus::new();
+        let waker = flag_waker(&WOKE);
+        let mut cx = Context::from_waker(&waker);
+        let mut fut = wait_for_event(bus.clone(), Event::READABLE);
+        assert!(matches!(Pin::new(&mut fut).poll(&mut cx), Poll::Pending));
+
+        // Fill the table: this future's callback is the oldest, so it is the
+        // one the cap evicts.
+        for _ in 0..TEST_MAX_EVENT_CALLBACKS {
+            let _ = bus.lock().subscribe(Box::new(|_| false));
+        }
+        assert!(
+            !bus.lock().is_subscribed(0),
+            "the oldest entry is the one that gets evicted"
+        );
+
+        // `TEST_MAX_EVENT_CALLBACKS + 1` ids have been handed out (this
+        // future's 0, then the loop's), so a waiter that parks itself again
+        // gets the next one.
+        assert!(matches!(Pin::new(&mut fut).poll(&mut cx), Poll::Pending));
+        assert!(
+            bus.lock()
+                .is_subscribed(TEST_MAX_EVENT_CALLBACKS as u64 + 1),
+            "an evicted waiter has to park itself again as well"
+        );
     }
 }
 
