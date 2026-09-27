@@ -830,8 +830,34 @@ impl VmObject {
 
     /// Remove a mapping from the VMO's mapping list.
     pub fn remove_mapping(&self, mapping: Weak<VmMapping>) {
-        self.inner.lock().mapping_count -= 1;
+        self.forget_mapping();
         self.trait_.remove_mapping(mapping);
+    }
+
+    /// Stop counting one mapping of this VMO, without pruning the per-kind
+    /// mapping list.
+    ///
+    /// `Drop for VmMapping` calls this, and it is the whole reason the count is
+    /// a count of live mappings: nothing called [`remove_mapping`], so
+    /// `mapping_count` only ever went up. A VMO that had been mapped and
+    /// unmapped ten times reported ten sharers with nothing mapped at all, and
+    /// the two places that read it both wanted the live number --
+    /// `set_cache_policy` refuses while anything is mapped (so it refused
+    /// forever, for any object ever mapped), and [`share_count`] feeds
+    /// `ZX_INFO_VMO`, the shared-bytes column of a task's memory stats, and the
+    /// `> 1` guards a fork uses to decide what it may share.
+    ///
+    /// The list of `Weak<VmMapping>` is left exactly as it was, dead entries
+    /// included: pruning it is a separate question, measured by the
+    /// `MAP_LIST_*` counters in `paged.rs`, and not one this has to answer.
+    ///
+    /// [`remove_mapping`]: VmObject::remove_mapping
+    /// [`share_count`]: VmObject::share_count
+    pub fn forget_mapping(&self) {
+        let mut inner = self.inner.lock();
+        // Saturating, not wrapping: the count going below zero would be a bug
+        // in the pairing, and `0 - 1` on a `usize` is a kernel panic.
+        inner.mapping_count = inner.mapping_count.saturating_sub(1);
     }
 
     /// Returns an estimate of the number of unique VmAspaces that this object
