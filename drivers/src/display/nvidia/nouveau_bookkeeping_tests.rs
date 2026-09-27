@@ -2567,11 +2567,14 @@ fn exec_waits_on_the_cpu_before_submitting_and_never_submits_after_a_wait_fails(
         Err(nv::ENOENT)
     );
     assert_eq!(rm_calls_since(before), [] as [&str; 0]);
-    // A wait that never comes: the 10 s deadline (the clock advances
-    // 1 ms per read here) ends in EIO, the pushes are NOT submitted and
-    // the sig list is NOT signaled -- NVK sees device-lost, not a
-    // frame that was never drawn.
+    // A wait on a point nobody submitted (the timeline is at 3, and
+    // `never` has no fence at all): EINVAL when the job is built,
+    // before any deadline is spent -- the pushes are NOT submitted and
+    // the sig list is NOT signaled. (A wait that never LANDS, a fence
+    // in flight the GPU never finishes, is the 10 s and the EIO of
+    // `a_wait_on_the_same_channel_is_a_gpu_acquire_and_one_on_another_channel_a_cpu_wait`.)
     crate::nvme::nvme_queue::test_clock::set_auto_advance(1000);
+    let waited = nv::EXEC_WAIT_US.load(Ordering::Relaxed);
     assert_eq!(
         exec(
             &gpu,
@@ -2581,32 +2584,219 @@ fn exec_waits_on_the_cpu_before_submitting_and_never_submits_after_a_wait_fails(
             &[sync_tl(tl, 4)],
             &[sync_tl(out, 7)]
         ),
-        Err(nv::EIO),
-        "the timeline is at 3: point 4 is a wait, not a pass"
+        Err(nv::EINVAL),
+        "the timeline is at 3: point 4 has no fence"
     );
     assert_eq!(rm_calls_since(before), [] as [&str; 0]);
     let never = syncobj::create(false);
-    let waited = nv::EXEC_WAIT_US.load(Ordering::Relaxed);
     assert_eq!(
         exec(
             &gpu,
             A,
             ch,
             &[push(PUSH_VA, 16)],
-            &[sync_tl(tl, 4), sync(never)],
+            &[sync_tl(tl, 3), sync(never)],
             &[sync_tl(out, 7)]
         ),
-        Err(nv::EIO)
+        Err(nv::EINVAL)
     );
     crate::nvme::nvme_queue::test_clock::set_auto_advance(0);
     assert_eq!(rm_calls_since(before), [] as [&str; 0]);
     assert_eq!(syncobj::query(out), Some(1), "not signaled");
-    assert!(
-        nv::EXEC_WAIT_US.load(Ordering::Relaxed) - waited >= 10_000_000,
-        "the wait is accounted"
+    assert_eq!(
+        nv::EXEC_WAIT_US.load(Ordering::Relaxed),
+        waited,
+        "no deadline spent"
     );
     for h in [done, tl, out, never] {
         assert!(syncobj::destroy(h));
+    }
+    gpu.nouveau_release_process(A);
+}
+
+/// `nouveau_job_add_deps` looks every wait up with
+/// `drm_syncobj_find_fence(.., flags 0)` when the job is built, before
+/// its sigs are prepared (`nouveau_job_fence_attach_prepare`), before
+/// `ops->submit` and before anything is waited for: a wait on a point
+/// nobody submitted -- a binary syncobj with no fence (fresh, or RESET),
+/// a timeline point past its chain -- is EINVAL at once, whatever else
+/// the job carries. Here such a wait spun to its 10 s deadline and
+/// answered EIO, the code for a fence that exists and never landed: a
+/// wait-before-signal that Mesa's submit thread is meant to hold back
+/// until the signal is submitted looked like a GPU hang if it slipped
+/// through, and cost the core ten seconds for it.
+#[test]
+fn an_exec_or_vm_bind_wait_on_a_point_nobody_submitted_is_einval_before_anything() {
+    let _g = LOCK.lock();
+    let _live = LiveBytes::hold();
+    let gpu = gpu_rm();
+    let ch = client_with_pushbuf(&gpu, A);
+    let never = syncobj::create(false);
+    let done = syncobj::create(true);
+    let tl = syncobj::create(false);
+    assert!(syncobj::timeline_signal(tl, 3));
+    let out = syncobj::create(false);
+    let out_tl = syncobj::create(false);
+    let waited = nv::EXEC_WAIT_US.load(Ordering::Relaxed);
+    let before = FAKE_RM.lock().calls.len();
+    // 1 ms per clock read: a wait that spun would reach its deadline
+    // in 10 000 reads, and be accounted.
+    crate::nvme::nvme_queue::test_clock::set_auto_advance(1000);
+    for (waits, why) in [
+        (alloc::vec![sync(never)], "a binary syncobj with no fence"),
+        (
+            alloc::vec![sync_tl(tl, 4)],
+            "a timeline point past the chain",
+        ),
+        (
+            alloc::vec![sync_tl(never, 1)],
+            "a timeline point on an empty chain",
+        ),
+        (
+            alloc::vec![sync(done), sync_tl(tl, 3), sync(never)],
+            "the third of three, behind two that pass",
+        ),
+    ] {
+        assert_eq!(
+            exec(
+                &gpu,
+                A,
+                ch,
+                &[push(PUSH_VA, 16)],
+                &waits,
+                &[sync(out), sync_tl(out_tl, 5)]
+            ),
+            Err(nv::EINVAL),
+            "{why}"
+        );
+        assert_eq!(
+            exec(&gpu, A, ch, &[], &waits, &[sync(out)]),
+            Err(nv::EINVAL),
+            "the health probe builds the same job: {why}"
+        );
+        assert_eq!(rm_calls_since(before), [] as [&str; 0], "{why}");
+        assert_eq!(syncobj::query(out), Some(0), "not signaled: {why}");
+        assert_eq!(syncobj::query(out_tl), Some(0), "{why}");
+    }
+    crate::nvme::nvme_queue::test_clock::set_auto_advance(0);
+    assert_eq!(
+        nv::EXEC_WAIT_US.load(Ordering::Relaxed),
+        waited,
+        "no deadline spent"
+    );
+    // A binary syncobj RESET has no fence any more; point 0 asks for
+    // the chain's head, which the timeline has.
+    assert!(syncobj::reset(done));
+    assert_eq!(
+        exec(&gpu, A, ch, &[], &[sync(done)], &[sync(out)]),
+        Err(nv::EINVAL)
+    );
+    assert_eq!(
+        exec(&gpu, A, ch, &[], &[sync_tl(tl, 0)], &[sync(out)]),
+        Ok(0),
+        "point 0 is the last fence"
+    );
+    assert_eq!(syncobj::query(out), Some(1));
+    // The waits are read in order, and all of them before the sigs
+    // (`nouveau_job_add_deps` runs before
+    // `nouveau_job_fence_attach_prepare`): an unknown type ahead is
+    // EOPNOTSUPP, an unknown handle ahead ENOENT, and an unsubmitted
+    // wait beats an unknown sig.
+    let odd = || nv::DrmNouveauSync {
+        flags: 0x7,
+        handle: never,
+        timeline_value: 0,
+    };
+    assert_eq!(
+        exec(&gpu, A, ch, &[], &[odd(), sync(never)], &[sync(out)]),
+        Err(nv::EOPNOTSUPP)
+    );
+    assert_eq!(
+        exec(&gpu, A, ch, &[], &[sync(never), odd()], &[sync(out)]),
+        Err(nv::EINVAL)
+    );
+    assert_eq!(
+        exec(
+            &gpu,
+            A,
+            ch,
+            &[],
+            &[sync(0xdead_0007), sync(never)],
+            &[sync(out)]
+        ),
+        Err(nv::ENOENT)
+    );
+    assert_eq!(
+        exec(
+            &gpu,
+            A,
+            ch,
+            &[],
+            &[sync(never), sync(0xdead_0007)],
+            &[sync(out)]
+        ),
+        Err(nv::EINVAL)
+    );
+    assert_eq!(
+        exec(&gpu, A, ch, &[], &[sync(never)], &[sync(0xdead_0007)]),
+        Err(nv::EINVAL),
+        "the waits before the sigs"
+    );
+    // VM_BIND builds its job the same way: EINVAL before the ops,
+    // nothing bound, nothing signaled, no deadline spent.
+    let h = gem_new_rm(&gpu, 65536, nv::NOUVEAU_GEM_DOMAIN_GART, A)
+        .unwrap()
+        .handle;
+    const VA: u64 = 0x1_8000_0000;
+    let maps = driver_maps(&gpu, A).len();
+    let before = FAKE_RM.lock().calls.len();
+    crate::nvme::nvme_queue::test_clock::set_auto_advance(1000);
+    assert_eq!(
+        vm_bind_sync(
+            &gpu,
+            A,
+            &mut [map(h, VA, 65536)],
+            nv::VM_BIND_RUN_ASYNC,
+            &[sync(never)],
+            &[sync_tl(out_tl, 5)]
+        ),
+        Err(nv::EINVAL)
+    );
+    assert_eq!(
+        vm_bind_sync(
+            &gpu,
+            A,
+            &mut [map(h, VA, 65536)],
+            nv::VM_BIND_RUN_ASYNC,
+            &[sync_tl(tl, 3), sync_tl(tl, 4)],
+            &[sync_tl(out_tl, 5)]
+        ),
+        Err(nv::EINVAL)
+    );
+    crate::nvme::nvme_queue::test_clock::set_auto_advance(0);
+    assert_eq!(rm_calls_since(before), [] as [&str; 0]);
+    assert_eq!(driver_maps(&gpu, A).len(), maps, "nothing bound");
+    assert_eq!(syncobj::query(out_tl), Some(0), "nothing signaled");
+    assert_eq!(nv::EXEC_WAIT_US.load(Ordering::Relaxed), waited);
+    // Once the point is submitted -- signaled outright here -- the same
+    // waits pass.
+    assert!(syncobj::signal(never));
+    assert_eq!(
+        vm_bind_sync(
+            &gpu,
+            A,
+            &mut [map(h, VA, 65536)],
+            nv::VM_BIND_RUN_ASYNC,
+            &[sync(never), sync_tl(tl, 3)],
+            &[sync_tl(out_tl, 5)]
+        ),
+        Ok(0)
+    );
+    assert_eq!(syncobj::query(out_tl), Some(5));
+    assert_eq!(driver_maps(&gpu, A).len(), maps + 1);
+    assert_eq!(vm_bind_ops(&gpu, A, &mut [unmap(VA, 65536)]), Ok(0));
+    for s in [never, done, tl, out, out_tl] {
+        assert!(syncobj::destroy(s));
     }
     gpu.nouveau_release_process(A);
 }
@@ -4716,9 +4906,11 @@ fn exec_with_an_unknown_sig_syncobj_queues_nothing_and_signals_nothing() {
     );
     assert_eq!(userd(&c), (2, 2));
     assert!(syncobj::pending_hw_fences(out2, 1).is_empty());
-    // Refused before the waits are honoured, like Linux (both lists are
-    // looked up before the job is armed): a wait that never comes does
-    // not turn the answer into a 10 s EIO.
+    // Both lists are looked up before the job is armed, the waits
+    // first (`nouveau_job_add_deps`, then
+    // `nouveau_job_fence_attach_prepare`): a wait nobody submitted is
+    // its own EINVAL ahead of the unknown sig, and neither costs the
+    // 10 s deadline.
     let never = syncobj::create(false);
     crate::nvme::nvme_queue::test_clock::set_auto_advance(1000);
     let t0 = crate::nvme::nvme_queue::test_clock::now();
@@ -4731,7 +4923,7 @@ fn exec_with_an_unknown_sig_syncobj_queues_nothing_and_signals_nothing() {
             &[sync(never)],
             &[sync(STRANGER_HANDLE)]
         ),
-        Err(nv::ENOENT)
+        Err(nv::EINVAL)
     );
     let waited = crate::nvme::nvme_queue::test_clock::now() - t0;
     crate::nvme::nvme_queue::test_clock::set_auto_advance(0);
@@ -5767,9 +5959,10 @@ fn a_vm_bind_batch_with_a_bad_op_binds_nothing_and_unbinds_nothing() {
             );
         }
     }
-    // Behind a wait that is not signaled: the bad op is refused at once,
-    // not after the deadline the wait would have cost, and the sig
-    // stays unsignaled.
+    // Behind a wait nobody submitted: refused at once, not after the
+    // deadline the wait would have cost, and the sig stays unsignaled.
+    // The wait is looked up first (`nouveau_job_add_deps` runs before
+    // `ops->submit` validates the ops), so it is its EINVAL.
     let never = syncobj::create(false);
     let late = syncobj::create(false);
     let _advance = AutoAdvance::of(1_000);
@@ -5784,8 +5977,8 @@ fn a_vm_bind_batch_with_a_bad_op_binds_nothing_and_unbinds_nothing() {
             &[sync(never)],
             &[sync(late)]
         ),
-        Err(nv::ENOENT),
-        "the bad op, not EIO for the wait"
+        Err(nv::EINVAL),
+        "the unsubmitted wait, not EIO for it"
     );
     assert!(
         test_clock::now() - t0 < 1_000_000,
@@ -5903,7 +6096,8 @@ fn a_sparse_bind_waits_its_semaphores_and_signals_its_fence_like_vkqueuebindspar
         "no ops, one signal"
     );
     assert_eq!(syncobj::query(only), Some(4));
-    // A wait that never comes: EIO, the unmap never runs, the sig stays.
+    // A wait nobody submitted (no fence at all): EINVAL at once, no
+    // deadline spent, the unmap never runs, the sig stays.
     let never = syncobj::create(false);
     let late = syncobj::create(false);
     let before = FAKE_RM.lock().calls.len();
@@ -5917,13 +6111,14 @@ fn a_sparse_bind_waits_its_semaphores_and_signals_its_fence_like_vkqueuebindspar
             &[sync(ready), sync(never)],
             &[sync(late)]
         ),
-        Err(nv::EIO)
+        Err(nv::EINVAL)
     );
     test_clock::set_auto_advance(0);
     assert_eq!(driver_maps(&gpu, A).len(), bound + 1, "still bound");
     assert_eq!(syncobj::query(late), Some(0), "not signaled");
     assert_eq!(rm_calls_since(before), [] as [&str; 0]);
-    // A timeline point not yet reached is a wait too: EIO, not "3 >= 1".
+    // A timeline point past the chain is unsubmitted too: EINVAL, not
+    // "3 >= 1" and not a wait.
     test_clock::set_auto_advance(1_000);
     assert_eq!(
         vm_bind_sync(
@@ -5934,8 +6129,8 @@ fn a_sparse_bind_waits_its_semaphores_and_signals_its_fence_like_vkqueuebindspar
             &[sync_tl(tl, 5)],
             &[sync(late)]
         ),
-        Err(nv::EIO),
-        "the timeline is at 3, the bind waits for 5"
+        Err(nv::EINVAL),
+        "the timeline is at 3, nobody submitted 5"
     );
     test_clock::set_auto_advance(0);
     assert_eq!(driver_maps(&gpu, A).len(), bound + 1);
