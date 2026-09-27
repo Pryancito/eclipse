@@ -100,7 +100,13 @@ fn cost_scaled(bytes: usize) -> (usize, &'static str) {
 
 /// How often each kind of present gets a line. A full frame is rare enough to
 /// report often; a damage box is not.
-const FULL_FRAME_REPORT_EVERY: u64 = 64;
+///
+/// The full-frame rhythm is `pub(crate)` because the fence report next door
+/// shares it on purpose (`drm_scheme`'s `FENCE_REPORT_EVERY`): the two lines
+/// describe the same present, so on the same rhythm they land next to each other
+/// in the klog and a reader can pair "waited 0us for 0 fences" with "cpu blit
+/// 12000us" without counting frames.
+pub(crate) const FULL_FRAME_REPORT_EVERY: u64 = 64;
 const RECT_REPORT_EVERY: u64 = 512;
 
 /// Damage-clipped presents completed, counted separately from the full frames

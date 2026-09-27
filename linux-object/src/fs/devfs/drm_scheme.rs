@@ -7,7 +7,7 @@ use alloc::sync::Arc;
 use core::any::Any;
 use core::future::Future;
 use core::pin::Pin;
-use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use core::task::{Context, Poll as TaskPoll};
 use core::time::Duration;
 
@@ -426,16 +426,56 @@ impl DrmDev {
             return;
         }
         let fences = drm::scanout_render_fence(fb_id);
+        let n = FENCE_PRESENTS
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1);
+        // `flip_fence_enabled` is the same gate `scanout_render_fence` applies
+        // internally, and it is folded into the REPORT rather than into a return
+        // of its own: with the hatch off the caller asked for the old behaviour,
+        // an empty answer then says nothing about the driver, and a second early
+        // return on the present path is a way to break presenting that no test
+        // here can reach (this half needs a live device -- see the module docs of
+        // `present_fence_tests`).
+        let report = fence_report_decision(n, FENCE_REPORT_EVERY) && drm::flip_fence_enabled();
+        // An empty answer is the interesting one, and nothing said it out loud
+        // until now. The wait is on by default and the atomic path has had its
+        // in-fence for as long as it has existed, so the natural reading of a
+        // torn frame on real hardware is "the wait did not help". It may never
+        // have run: no fence means this present goes straight to the blit, and a
+        // GPU still writing the buffer is not waited for at all. Whether that is
+        // what happens on a real desktop is a question about a real machine, so
+        // the number goes in the log.
         if fences.is_empty() {
+            if report {
+                log::info!(
+                    "[drm] present fence: fb {} (#{}) has NO render fence to wait on -- \
+                     the buffer's owner has no ring in flight, or its ring is unknown; \
+                     presenting immediately, so a GPU still writing this buffer is not \
+                     waited for",
+                    fb_id,
+                    n
+                );
+            }
             return;
         }
-        let deadline = kernel_hal::timer::timer_now()
-            + core::time::Duration::from_micros(PRESENT_FENCE_TIMEOUT_US);
+        let waited_from = kernel_hal::timer::timer_now();
+        let deadline = waited_from + core::time::Duration::from_micros(PRESENT_FENCE_TIMEOUT_US);
         loop {
             if fences
                 .iter()
                 .all(|&(va, payload)| zcore_drivers::scheme::syncobj::hw_fence_landed(va, payload))
             {
+                if report {
+                    log::info!(
+                        "[drm] present fence: fb {} (#{}) waited {}us for {} fence(s) to land",
+                        fb_id,
+                        n,
+                        kernel_hal::timer::timer_now()
+                            .saturating_sub(waited_from)
+                            .as_micros(),
+                        fences.len()
+                    );
+                }
                 return;
             }
             let Some(wake) =
@@ -2536,6 +2576,32 @@ const PRESENT_FENCE_TIMEOUT_US: u64 = 100_000;
 
 /// How long a fence poll sleeps between probes.
 const FENCE_POLL_TICK: Duration = Duration::from_millis(1);
+
+/// How often a legacy present says what it waited for: the first two of the
+/// boot, then on the present cost report's own rhythm.
+///
+/// The first two answer the question that has no other answer -- whether the
+/// implicit-sync wait finds anything to wait on at all. After that it borrows
+/// [`drm::FULL_FRAME_REPORT_EVERY`] rather than picking its own number, so the
+/// two lines about the same present land together in the klog and the wait can
+/// be read against the blit it precedes. The klog writes synchronously to the
+/// UART, so a line per frame would be a stutter of its own.
+const FENCE_REPORT_EVERY: u64 = drm::FULL_FRAME_REPORT_EVERY;
+
+/// Legacy presents that reached the fence wait with the nouveau uAPI on.
+static FENCE_PRESENTS: AtomicU64 = AtomicU64::new(0);
+
+/// Whether the `n`-th present's fence outcome gets a line in the klog.
+///
+/// No guard against `every == 0`, and not because a zero rhythm cannot arrive:
+/// `is_multiple_of(0)` is `false` for every non-zero `n` and `true` only for
+/// `0`, so a zero rhythm already reports the opening two presents and then goes
+/// quiet, and `n == 0` is already covered by the first arm. A `every != 0 &&`
+/// in front of it was a mutant that could not be killed, because it cannot
+/// change the answer for any input at all.
+fn fence_report_decision(n: u64, every: u64) -> bool {
+    n <= 2 || n.is_multiple_of(every)
+}
 
 /// When a bounded fence poll should wake for its next probe, or `None` when
 /// the deadline leaves no time to sleep and the caller must give up.
@@ -10423,9 +10489,86 @@ mod present_fence_tests {
     //! compositor on it.
     //!
     //! What is not covered here, because it needs a live device and a driver:
-    //! the fb lookup, the driver's fence answer, and the timeout warning.
+    //! the fb lookup, the driver's fence answer, the timeout warning, the text of
+    //! the two report lines, and the `+ 1` that makes the count one-based (a
+    //! zero-based count would print `#0` for the first present and open with
+    //! three lines instead of two -- visible only in a klog no test reads). The
+    //! report rhythm IS covered, because it is the only thing that will ever say
+    //! whether the wait found a fence at all, and a rhythm that reports nothing
+    //! is a diagnostic that lies by omission.
 
     use super::*;
+
+    /// The first two presents of a boot always report. Those two are the whole
+    /// point: they answer "does this find a fence at all" before anything else
+    /// has had a chance to go wrong, and a rhythm that started at 64 would
+    /// answer it a second into the session at the earliest.
+    #[test]
+    fn the_first_two_presents_of_a_boot_always_say_what_they_found() {
+        assert!(fence_report_decision(1, FENCE_REPORT_EVERY));
+        assert!(fence_report_decision(2, FENCE_REPORT_EVERY));
+    }
+
+    /// And the third does not, or the klog is a line per frame -- which it
+    /// writes synchronously to the UART, so it would be a stutter of its own.
+    #[test]
+    fn the_third_present_is_quiet() {
+        assert!(!fence_report_decision(3, FENCE_REPORT_EVERY));
+        for n in [4u64, 5, 63, 65, 127] {
+            assert!(!fence_report_decision(n, FENCE_REPORT_EVERY), "n = {}", n);
+        }
+    }
+
+    /// After that, one line every `FENCE_REPORT_EVERY` presents, counted from
+    /// the first: `#64`, `#128`, and so on.
+    #[test]
+    fn then_one_line_every_sixty_four_presents() {
+        for k in 1..=8u64 {
+            let n = k * FENCE_REPORT_EVERY;
+            assert!(fence_report_decision(n, FENCE_REPORT_EVERY), "n = {}", n);
+        }
+    }
+
+    /// `n = 0` cannot happen -- the counter is read after its increment -- but
+    /// the multiple-of test would call every rhythm true for it, so the answer
+    /// is pinned rather than left to `0 % 64 == 0`.
+    #[test]
+    fn the_count_is_one_based_and_zero_is_not_a_present() {
+        assert!(fence_report_decision(0, FENCE_REPORT_EVERY));
+    }
+
+    /// A rhythm of zero reports the first two and then goes quiet. Nothing
+    /// divides by zero on the way there: `is_multiple_of(0)` answers `false` for
+    /// a non-zero count, which is exactly "not on the rhythm". The constant is
+    /// not configurable today, so this is about the function staying safe if it
+    /// ever becomes so.
+    #[test]
+    fn a_rhythm_of_zero_reports_the_opening_and_nothing_else() {
+        assert!(fence_report_decision(1, 0));
+        assert!(fence_report_decision(2, 0));
+        for n in [3u64, 64, 128, u64::MAX] {
+            assert!(!fence_report_decision(n, 0), "n = {}", n);
+        }
+    }
+
+    /// The fence line and the present cost line describe the SAME present, so
+    /// they share one rhythm and land together in the klog: `waited 0us for 0
+    /// fence(s)` next to `cpu blit 12000us` is the pair that says whether the
+    /// wait is what costs the frame. Two independent numbers would drift apart
+    /// and leave a reader counting frames between them.
+    #[test]
+    fn the_fence_line_keeps_the_cost_lines_rhythm() {
+        assert_eq!(FENCE_REPORT_EVERY, drm::FULL_FRAME_REPORT_EVERY);
+    }
+
+    /// The last present a 64-bit counter can reach still reports on its rhythm
+    /// rather than panicking or wrapping: the counter itself saturates.
+    #[test]
+    fn the_rhythm_holds_at_the_top_of_the_counter() {
+        let top = u64::MAX - (u64::MAX % FENCE_REPORT_EVERY);
+        assert!(fence_report_decision(top, FENCE_REPORT_EVERY));
+        assert!(!fence_report_decision(u64::MAX, FENCE_REPORT_EVERY));
+    }
 
     /// `SETCRTC` and `PAGE_FLIP` both present, and both must wait.
     #[test]
