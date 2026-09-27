@@ -190,6 +190,89 @@ fn pause_deadline_ns(now_ns: u64, max: core::time::Duration) -> u64 {
     now_ns.saturating_add(max_ns).max(1)
 }
 
+/// The framebuffer whose pixels the panel carries **in full**, or 0 for none.
+///
+/// Not `crtc_fb`, which is bookkeeping for `GETCRTC` and is bound by every
+/// present that returns `Ok` -- including one that only copied a damage box, and
+/// one a pause acknowledged without drawing anything at all. This is the
+/// narrower fact, and it is the only fact a damage box is meaningful against.
+///
+/// A damage box says "only these pixels changed **in the frame that is already
+/// on the panel**". A compositor with a swapchain presents a *different*
+/// framebuffer almost every frame, so the pixels outside the box come from the
+/// buffer presented before -- and a recycled swapchain buffer holds whatever
+/// frame it was last drawn into, which is not this one. Honouring the box then
+/// leaves the panel a collage of two frames, and the collage is invisible until
+/// something reads the panel back: [`repaint_for_cursor`] restores its two
+/// ~64x64 windows *from* `crtc_fb`, so a pointer move over a region the box did
+/// not touch pastes the new buffer's older content into the frame still up.
+/// That is garbage in a ring around the cursor, appearing exactly when a popup
+/// opens -- which is when a fresh buffer is presented with a box around the
+/// popup and nothing else.
+///
+/// This is the same rule Linux applies in `drm_atomic_helper_damage_iter_init`,
+/// which throws the clips away and declares a full update when
+/// `state->fb != old_state->fb`.
+///
+/// Cleared, not just rebound, wherever something OTHER than a present writes the
+/// panel: blanking paints it black, and a text VT in the foreground puts console
+/// output on it. An id can be reused after `RMFB`, so a retired framebuffer
+/// clears it too rather than letting a new one inherit "already on screen".
+static PANEL_FB: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// The framebuffer the panel carries in full, or 0.
+fn panel_fb() -> u32 {
+    PANEL_FB.load(Ordering::SeqCst)
+}
+
+/// Record that the panel now carries `fb_id` in full; 0 means it carries no
+/// framebuffer (blanked, or a console VT has written over it).
+fn set_panel_fb(fb_id: u32) {
+    PANEL_FB.store(fb_id, Ordering::SeqCst);
+}
+
+/// [`PANEL_FB`] cleared for a framebuffer that no longer exists, so a reused id
+/// cannot inherit "the panel already carries this".
+fn forget_panel_fb(fb_id: u32) {
+    let _ = PANEL_FB.compare_exchange(fb_id, 0, Ordering::SeqCst, Ordering::SeqCst);
+}
+
+/// The region a present may actually restrict itself to: the damage box when the
+/// panel already carries this framebuffer, and the whole frame otherwise.
+///
+/// Pure, because which of the two it is decides whether the panel ends up
+/// holding one frame or two -- see [`PANEL_FB`] for what the second one looks
+/// like on screen.
+///
+/// `fb_id == 0` is never "the framebuffer the panel carries", even when
+/// [`PANEL_FB`] also reads 0: 0 is the absence of one on both sides, and letting
+/// the two absences match would honour a damage box against a panel nobody has
+/// presented to.
+fn rect_for_present(
+    rect: Option<(u32, u32, u32, u32)>,
+    panel_fb: u32,
+    fb_id: u32,
+) -> Option<(u32, u32, u32, u32)> {
+    match rect {
+        None => None,
+        Some(_) if fb_id != 0 && panel_fb == fb_id => rect,
+        Some(_) => None,
+    }
+}
+
+/// How many times the promotion above is reported before it goes quiet. Small:
+/// a compositor that presents a fresh buffer every frame promotes every frame,
+/// and the line is worth having once to say which way round the swapchain is,
+/// not sixty times a second.
+const MAX_DAMAGE_PROMOTIONS_LOGGED: u32 = 4;
+static DAMAGE_PROMOTIONS_LOGGED: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
+
+#[cfg(test)]
+pub(crate) fn panel_fb_for_test() -> u32 {
+    panel_fb()
+}
+
 /// Whether a present left the WHOLE scanout carrying its framebuffer, so
 /// [`SCANOUT_STALE`] may be cleared.
 ///
@@ -252,6 +335,10 @@ pub fn set_crtc_blanked(on: bool) {
             display.clear(zcore_drivers::prelude::RgbColor::new(0, 0, 0));
             let _ = display.flush();
         }
+        // Black pixels are not a framebuffer's pixels. Without this the present
+        // that un-blanks honours its damage box and leaves a black screen with
+        // one rectangle of desktop in it. See [`PANEL_FB`].
+        set_panel_fb(0);
         kernel_hal::klog_info!("[drm] CRTC off: panel blanked");
     } else {
         kernel_hal::klog_info!("[drm] CRTC on");
@@ -371,6 +458,18 @@ pub fn scanout_paused() -> bool {
 
 /// Whether a pause has left the panel behind `crtc_fb`, for the tests in
 /// `drm_scheme` that drive this through the ioctls rather than the latch.
+/// Pretend the compositor claimed a VT other than the foreground one, so the
+/// VT-gated present drop is reachable from a host test.
+///
+/// It is not reachable otherwise: `kernel_hal`'s `graphic` feature is off in the
+/// host build, so `active_vt()` is the constant 0 and `switch_vt` does nothing --
+/// the one branch that decides whether a desktop can be suppressed would have no
+/// test at all.
+#[cfg(test)]
+pub(crate) fn set_graphics_vt_for_test(vt: Option<usize>) {
+    DRM_STATE.lock().graphics_vt = vt;
+}
+
 #[cfg(test)]
 pub(crate) fn scanout_is_stale_for_test() -> bool {
     SCANOUT_STALE.load(Ordering::SeqCst)
@@ -2433,6 +2532,12 @@ fn note_fb_retired(state: &mut DrmState, fb_id: u32, why: FbRetired) {
         state.fb_retirements.pop_front();
     }
     state.fb_retirements.push_back((fb_id, why));
+    // Every one of the three ways a framebuffer goes away comes through here --
+    // `RMFB`, a GEM handle closing under a live fb, and a process exiting -- so
+    // this is where "the panel carries this id" stops being true. Ids are handed
+    // out again, and a new buffer landing on a retired number must not inherit
+    // it. See [`PANEL_FB`].
+    forget_panel_fb(fb_id);
 }
 
 /// What took `fb_id` away, if it is one of the last `FB_RETIRE_HISTORY` to
@@ -2566,8 +2671,13 @@ fn expand_x_for_wc(x: u32, w: u32, limit: u32) -> (u32, u32) {
 /// `DRM_IOCTL_MODE_DIRTYFB` uses this so the GOP keeps pixels the client did
 /// not repaint — a software-KMS swapchain often has only the damage boxes
 /// drawn, and copying the rest smears stale tiles onto the screen. `None`
-/// (page-flip / modeset) always repaints everything, as does an out-of-range
-/// or degenerate `rect`. Horizontal edges are expanded to 64-byte WC lines.
+/// (page-flip / modeset) always repaints everything. A `rect` that lies wholly
+/// outside the framebuffer draws NOTHING and reports success -- the same answer
+/// `drm_atomic_helper_damage_iter_next` gives for a clip whose intersection with
+/// the plane's source is empty; it is not a request to repaint the frame. The
+/// promotion of a box onto a framebuffer the panel does not carry happens before
+/// this, in [`present_now_checked`] -- see [`PANEL_FB`]. Horizontal edges are
+/// expanded to 64-byte WC lines.
 pub fn scanout_region(fb_id: u32, rect: Option<(u32, u32, u32, u32)>) -> bool {
     scanout_region_checked(fb_id, rect).is_ok()
 }
@@ -4221,6 +4331,7 @@ pub fn present_now_checked(
     crtc_id: u32,
     rect: Option<(u32, u32, u32, u32)>,
 ) -> Result<(), PresentError> {
+    let asked_for_a_rect = rect.is_some();
     // Deferred console GSP bring-up: acknowledge the flip to keep the
     // compositor alive, but do not touch the GOP framebuffer / CE path.
     if scanout_paused() {
@@ -4297,9 +4408,37 @@ pub fn present_now_checked(
                         owner, active
                     );
                 }
+                // The console has the panel: whatever it printed is over the
+                // last frame, so the panel no longer carries a framebuffer.
+                // Without this the first present after switching back honours
+                // its damage box and paints one rectangle of desktop into a
+                // screen full of console text.
+                set_panel_fb(0);
                 return Ok(());
             }
             _ => {}
+        }
+    }
+    // A damage box is only meaningful against the framebuffer the panel already
+    // carries; against any other one the pixels it leaves alone belong to a
+    // different frame. See [`PANEL_FB`], and `drm_atomic_helper_damage_iter_init`
+    // upstream, which does exactly this.
+    let panel_before = panel_fb();
+    let rect = rect_for_present(rect, panel_before, fb_id);
+    if rect.is_none() && asked_for_a_rect {
+        let n = DAMAGE_PROMOTIONS_LOGGED.fetch_add(1, Ordering::Relaxed);
+        if n < MAX_DAMAGE_PROMOTIONS_LOGGED {
+            kernel_hal::klog_info!(
+                "[drm] present: damage box on fb {} promoted to a whole frame -- the panel \
+                 carries fb {} (a swapchain buffer's untouched pixels are another frame's){}",
+                fb_id,
+                panel_before,
+                if n + 1 == MAX_DAMAGE_PROMOTIONS_LOGGED {
+                    " [last report]"
+                } else {
+                    ""
+                }
+            );
         }
     }
     // Prefer a driver page_flip (NVC57E surfaceflip / CE hwflip) when the
@@ -4337,6 +4476,13 @@ pub fn present_now_checked(
             SCANOUT_STALE.store(false, Ordering::SeqCst);
         }
     }
+    // The panel carries this framebuffer now. Unconditional, and provably so: a
+    // damage box that survived the promotion above is one the panel ALREADY
+    // carried, so the store is idempotent there, and every other present covered
+    // the whole frame -- the CPU blit over every row, or a driver flip that
+    // replaced the scanout outright. Guarding it on `rect.is_none()` was the same
+    // function written twice; the promotion is where the distinction lives.
+    set_panel_fb(fb_id);
     set_crtc_fb(crtc_id, fb_id);
     // A DRM client owns the framebuffer now: stop text console drawing.
     claim_graphics_vt();
@@ -5377,6 +5523,15 @@ pub(crate) fn reset_output_state_for_test() {
     // Its report budget goes back too, or the last test to run finds it spent.
     set_present_probe_enabled(false);
     PROBE_REPORTS.store(0, Ordering::Relaxed);
+    // A leaked `PANEL_FB` makes a later test's damage box either honoured or
+    // promoted for a reason that has nothing to do with what it is testing --
+    // and the ids the tests pick collide freely, so it would sometimes match.
+    set_panel_fb(0);
+    DAMAGE_PROMOTIONS_LOGGED.store(0, Ordering::Relaxed);
+    // And "nobody has claimed a VT", which is what lets the next test's first
+    // present claim the foreground one instead of being suppressed by a
+    // neighbour's leftover owner.
+    DRM_STATE.lock().graphics_vt = None;
     let mut st = DRM_STATE.lock();
     st.cursor = CursorState::default();
     st.crtc_fb = 0;
@@ -8738,5 +8893,100 @@ mod present_cost_tests {
     fn neither_number_overflows_on_absurd_geometry() {
         assert_eq!(blit_read_bytes(u32::MAX, u32::MAX), usize::MAX);
         let _ = sync_span_bytes(usize::MAX, u32::MAX, u32::MAX, u32::MAX, u32::MAX);
+    }
+}
+
+#[cfg(test)]
+mod damage_against_the_panel_tests {
+    use super::*;
+
+    const BOX: Option<(u32, u32, u32, u32)> = Some((100, 100, 200, 180));
+
+    /// The case the optimisation exists for: the client re-presents the very
+    /// framebuffer the panel already carries, so the pixels outside the box
+    /// really are the ones on screen and copying them again is waste.
+    #[test]
+    fn a_box_on_the_framebuffer_the_panel_carries_is_honoured() {
+        assert_eq!(rect_for_present(BOX, 7, 7), BOX);
+    }
+
+    /// The case that put a collage on the panel. Framebuffer 8 is a swapchain
+    /// buffer the compositor drew the popup into; everywhere else it holds the
+    /// frame it was last used for, which is not the frame on screen. Copy only
+    /// the box and the panel carries two frames at once.
+    #[test]
+    fn a_box_on_a_different_framebuffer_becomes_the_whole_frame() {
+        assert_eq!(rect_for_present(BOX, 7, 8), None);
+    }
+
+    /// Nothing on the panel to be a box's reference: the first present of a
+    /// session, or the one right after blanking painted it black, or the one
+    /// after a text console wrote over it.
+    #[test]
+    fn a_box_on_a_panel_that_carries_nothing_becomes_the_whole_frame() {
+        assert_eq!(rect_for_present(BOX, 0, 8), None);
+    }
+
+    /// Two absences are not a match. `0` means "no framebuffer" on both sides,
+    /// and letting them compare equal would honour a box against a panel nobody
+    /// has ever presented to -- the one case where the whole frame is most
+    /// certainly needed.
+    #[test]
+    fn framebuffer_zero_never_matches_a_panel_that_carries_nothing() {
+        assert_eq!(rect_for_present(BOX, 0, 0), None);
+    }
+
+    /// A page flip or a modeset asks for the whole frame by the shape of the
+    /// call, and stays that way whatever the panel carries.
+    #[test]
+    fn a_whole_frame_present_is_left_alone() {
+        assert_eq!(rect_for_present(None, 0, 0), None);
+        assert_eq!(rect_for_present(None, 7, 7), None);
+        assert_eq!(rect_for_present(None, 7, 8), None);
+    }
+
+    /// When the box is honoured it is passed through untouched: the rule decides
+    /// between this box and the whole frame, and never between two boxes.
+    #[test]
+    fn an_honoured_box_is_the_callers_own_box() {
+        for r in [
+            (0, 0, 1, 1),
+            (100, 100, 200, 180),
+            (0, 0, u32::MAX, u32::MAX),
+        ] {
+            assert_eq!(rect_for_present(Some(r), 3, 3), Some(r));
+        }
+    }
+
+    /// Retiring a framebuffer forgets it, and forgets only it. Ids are handed
+    /// out again, so a new buffer landing on a retired number must not inherit
+    /// "the panel already carries this".
+    #[test]
+    fn retiring_a_framebuffer_forgets_only_that_one() {
+        let _g = test_globals::lock();
+        reset_output_state_for_test();
+        set_panel_fb(7);
+        forget_panel_fb(9);
+        assert_eq!(panel_fb(), 7, "an unrelated retirement must not clear it");
+        forget_panel_fb(7);
+        assert_eq!(panel_fb(), 0);
+        // And forgetting nothing is not the same as forgetting everything: a
+        // retirement while the panel carries nothing leaves it carrying nothing.
+        forget_panel_fb(0);
+        assert_eq!(panel_fb(), 0);
+        reset_output_state_for_test();
+    }
+
+    /// The report budget stops, and says so on the way out. A compositor that
+    /// presents a fresh buffer every frame promotes every frame, so an unbudgeted
+    /// line here is sixty klog writes a second on the path whose cost this whole
+    /// area is about.
+    #[test]
+    fn the_promotion_report_is_budgeted() {
+        let _g = test_globals::lock();
+        reset_output_state_for_test();
+        assert_eq!(DAMAGE_PROMOTIONS_LOGGED.load(Ordering::Relaxed), 0);
+        assert!(MAX_DAMAGE_PROMOTIONS_LOGGED > 0 && MAX_DAMAGE_PROMOTIONS_LOGGED <= 8);
+        reset_output_state_for_test();
     }
 }
