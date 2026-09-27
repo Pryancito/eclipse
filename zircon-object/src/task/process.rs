@@ -430,22 +430,35 @@ impl Process {
     /// The process do not terminate immediately when exited.
     /// It will terminate after all its child threads are terminated.
     pub fn exit(&self, retcode: i64) {
-        let mut inner = self.inner.lock();
-        if let Status::Exited(_) = inner.status {
-            return;
-        }
-        inner.status = Status::Exited(retcode);
-        if inner.threads.is_empty() {
-            inner.handles.clear();
-            drop(inner);
+        // The two things this does to the world -- killing the threads and
+        // closing the handles -- both happen with `inner` let go.
+        //
+        // `thread.kill()` takes that thread's `inner`, and a thread that
+        // terminates takes its own `inner` and then this process's, through
+        // `remove_thread`. Holding `inner` across the kill made this path
+        // process -> thread against that path's thread -> process: the same
+        // pair of spin locks in two orders, taken with interrupts off, which is
+        // two CPUs that never come back. And closing a handle runs the object's
+        // own `Drop` -- `SuspendToken` resumes its task, `EventPair` signals
+        // its peer, and a `Drop` that comes back to this table asks for the
+        // very lock it is being run under.
+        let (threads, handles) = {
+            let mut inner = self.inner.lock();
+            if let Status::Exited(_) = inner.status {
+                return;
+            }
+            inner.status = Status::Exited(retcode);
+            (inner.threads.clone(), core::mem::take(&mut inner.handles))
+        };
+        if threads.is_empty() {
+            drop(handles);
             self.terminate();
             return;
         }
-        for thread in inner.threads.iter() {
+        for thread in threads.iter() {
             thread.kill();
         }
-        inner.handles.clear();
-        drop(inner);
+        drop(handles);
         // Linux wait semantics: a process becomes waitable the moment its
         // exit status is published (a zombie), NOT when its last thread has
         // finished dying. Signal termination NOW: `Thread::kill` is a no-op
@@ -1047,6 +1060,83 @@ mod tests {
                 let _ = proc.remove_handle(self.also_close);
             }
         }
+    }
+
+    /// Exiting closes every handle the process held, and that runs each
+    /// object's own `Drop`. It used to do it with `inner` held
+    /// (`inner.handles.clear()` before the `drop(inner)`), so an object whose
+    /// `Drop` comes back to this process asked for the lock it was already
+    /// being run under: a spin lock taken with interrupts off, so a CPU that
+    /// never comes back.
+    ///
+    /// The watchdog is the point: before the fix this test **hung**.
+    #[test]
+    fn exiting_closes_the_handles_with_the_table_unlocked() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let root_job = Job::root();
+        let proc = Process::create(&root_job, "proc").expect("failed to create process");
+        let victim = proc.add_handle(Handle::new(Event::new(), Rights::DEFAULT_EVENT));
+        let probe = Arc::new(DropProbe {
+            base: KObjectBase::default(),
+            proc: Arc::downgrade(&proc),
+            also_close: victim,
+        });
+        proc.add_handle(Handle::new(probe, Rights::DEFAULT_EVENT));
+
+        let (done, finished) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            proc.exit(0);
+            let _ = done.send(proc);
+        });
+        let proc = finished
+            .recv_timeout(Duration::from_secs(300))
+            .expect("exiting a process holding a handle whose Drop closes another wedged it");
+        worker.join().unwrap();
+        // The `Drop` ran, and the whole table is gone either way.
+        assert_eq!(proc.remove_handle(victim).err(), Some(ZxError::BAD_HANDLE));
+    }
+
+    /// A process exiting on one CPU while one of its threads terminates on
+    /// another. `Process::exit` held its own `inner` across `thread.kill()`,
+    /// which takes the thread's, and `Thread::terminate` holds the thread's
+    /// across `remove_thread`, which takes the process's: the same pair of
+    /// locks in two orders. They are spin locks taken with interrupts off and
+    /// they do not time out, so the two CPUs stay there.
+    #[test]
+    fn a_process_exiting_while_its_thread_terminates_does_not_wedge() {
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+
+        // One round is enough to lose the race sometimes; the cap is what keeps
+        // a loaded machine from spending minutes on it (see the socket tests).
+        const ROUNDS: usize = 2_000;
+        const CAP: Duration = Duration::from_secs(45);
+
+        let (done, finished) = mpsc::channel();
+        let rounds = std::thread::spawn(move || {
+            let root_job = Job::root();
+            let started = Instant::now();
+            for round in 0..ROUNDS {
+                if round % 64 == 0 && started.elapsed() > CAP {
+                    break;
+                }
+                let proc = Process::create(&root_job, "proc").expect("failed to create process");
+                let thread = Thread::create(&proc, "thread").expect("failed to create thread");
+                let exiting = {
+                    let proc = proc.clone();
+                    std::thread::spawn(move || proc.exit(0))
+                };
+                thread.terminate_abandoned();
+                exiting.join().unwrap();
+            }
+            let _ = done.send(());
+        });
+        finished
+            .recv_timeout(Duration::from_secs(300))
+            .expect("a process exiting and a thread terminating wedged each other");
+        rounds.join().unwrap();
     }
 
     /// `remove_handles` is how `install_handle_pair` and `zx_channel_read` take
