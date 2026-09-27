@@ -435,7 +435,24 @@ impl KObjectBase {
     ///
     /// All signal callbacks will be called.
     pub fn signal_change(&self, clear: Signal, set: Signal) {
+        self.signal_change_unless(clear, set, Signal::empty())
+    }
+
+    /// Change signal status, unless any bit of `unless` is asserted right now.
+    ///
+    /// The look and the change are one step, under one hold of the lock. A
+    /// caller that reads [`Self::signal`], decides, and then calls
+    /// [`Self::signal_change`] has taken the lock twice, and another thread
+    /// can change the very bit the decision rested on in between -- which is
+    /// how `Socket::read` came to re-assert `WRITABLE` on an endpoint whose
+    /// write had just been shut down.
+    ///
+    /// All signal callbacks will be called, unless nothing changed.
+    pub fn signal_change_unless(&self, clear: Signal, set: Signal, unless: Signal) {
         let mut inner = self.inner.lock();
+        if inner.signal.intersects(unless) {
+            return;
+        }
         let old_signal = inner.signal;
         inner.signal.remove(clear);
         inner.signal.insert(set);
@@ -804,6 +821,41 @@ mod tests {
 
     fn two_dummies() -> (Arc<DummyObject>, Arc<DummyObject>) {
         (DummyObject::new(), DummyObject::new())
+    }
+
+    #[test]
+    /// A caller that reads the signal word, decides, and then changes it has
+    /// taken the lock twice, and the bit it decided on can move in between.
+    /// `signal_change_unless` folds the two into one hold.
+    fn a_conditional_signal_change_looks_and_changes_under_one_lock() {
+        let object = DummyObject::new();
+        let seen = Arc::new(AtomicUsize::new(0));
+        let counted = seen.clone();
+        let watched: Arc<dyn KernelObject> = object.clone();
+        watched.add_signal_callback(Box::new(move |_| {
+            counted.fetch_add(1, Ordering::SeqCst);
+            false
+        }));
+        // `add_signal_callback` calls the callback once on the way in.
+        let baseline = seen.load(Ordering::SeqCst);
+
+        // The forbidding bit is absent, so this is an ordinary change.
+        object
+            .base
+            .signal_change_unless(Signal::empty(), Signal::READABLE, Signal::WRITABLE);
+        assert!(object.base.signal().contains(Signal::READABLE));
+        assert_eq!(seen.load(Ordering::SeqCst), baseline + 1);
+
+        // Assert the bit that forbids it, and the same call does nothing at
+        // all -- not the change, and not the callbacks either.
+        object.base.signal_set(Signal::WRITABLE);
+        object.base.signal_clear(Signal::READABLE);
+        let before = seen.load(Ordering::SeqCst);
+        object
+            .base
+            .signal_change_unless(Signal::empty(), Signal::READABLE, Signal::WRITABLE);
+        assert!(!object.base.signal().contains(Signal::READABLE));
+        assert_eq!(seen.load(Ordering::SeqCst), before, "no callback ran");
     }
 
     fn targets(a: &Arc<DummyObject>, b: &Arc<DummyObject>) -> [(Arc<dyn KernelObject>, Signal); 2] {

@@ -171,6 +171,17 @@ impl Socket {
     fn write_data(&self, data: &[u8]) -> ZxResult<usize> {
         let (was_empty, actual_count) = {
             let mut inner = self.inner.lock();
+            // Writes into this buffer are disabled exactly when this end will
+            // read no more -- either it shut down its own read, or its peer
+            // shut down its write -- and that is the flag kept beside the
+            // buffer. `write` tests the writer's `SOCKET_WRITE_DISABLED`
+            // signal, which lives under a different lock, so a `shutdown`
+            // landing after that test still let the bytes through: they
+            // arrived after `zx_socket_shutdown` had returned, into a socket
+            // whose reader may already have seen the end of the stream.
+            if inner.read_disabled {
+                return Err(ZxError::BAD_STATE);
+            }
             let curr_size = inner.data.len();
             let was_empty = curr_size == 0;
             let rest_size = SOCKET_SIZE - curr_size;
@@ -309,16 +320,25 @@ impl Socket {
                 if peer_write_threshold > 0 && SOCKET_SIZE - self_size >= peer_write_threshold {
                     set |= Signal::SOCKET_WRITE_THRESHOLD;
                 }
+                peer.base.signal_set(set);
                 // Draining a full socket makes room, but room is not
                 // permission: once writing on that end is shut down,
                 // `WRITABLE` never comes back. This is the only place it is
                 // ever re-asserted, and it used to re-assert it regardless, so
                 // a peer parked on `WRITABLE` was woken to a `write` that can
                 // only answer `BAD_STATE`, over and over.
-                if was_full && !peer.base.signal().contains(Signal::SOCKET_WRITE_DISABLED) {
-                    set |= Signal::WRITABLE;
+                //
+                // The test belongs to the same hold of the signal lock as the
+                // change: reading the word, deciding, and then setting the bit
+                // is two holds, and a `shutdown` landing in between put
+                // `WRITABLE` back on an endpoint that had just lost it.
+                if was_full {
+                    peer.base.signal_change_unless(
+                        Signal::empty(),
+                        Signal::WRITABLE,
+                        Signal::SOCKET_WRITE_DISABLED,
+                    );
                 }
-                peer.base.signal_set(set);
             }
         }
         Ok(actual_count)
@@ -995,6 +1015,34 @@ mod tests {
             "there is room again, but this end may not write",
         );
         assert_eq!(end0.write(&[0; 1]).unwrap_err(), ZxError::BAD_STATE);
+    }
+
+    #[test]
+    /// `write` reads the writer's `SOCKET_WRITE_DISABLED` signal and only then
+    /// pushes into the peer's buffer, and those are two different locks. A
+    /// `shutdown` landing in between used to let that write through, so bytes
+    /// entered the socket after `zx_socket_shutdown` had already returned.
+    ///
+    /// This is the state such a writer arrives in: the shutdown is complete,
+    /// and the push itself has to be the one to refuse.
+    fn a_write_that_outlived_a_shutdown_is_refused_by_the_buffer_itself() {
+        let (end0, end1) = Socket::create(0).unwrap();
+        end0.shutdown(false, true).unwrap();
+
+        // What `end0.write` reaches once the shutdown is done, whatever it saw
+        // of the signal word on its way here.
+        assert_eq!(end1.write_data(b"x").unwrap_err(), ZxError::BAD_STATE);
+        assert_eq!(
+            end1.read(false, &mut [0u8; 8]).unwrap_err(),
+            ZxError::BAD_STATE,
+            "nothing arrived, and this end reads no more",
+        );
+
+        // And the reader's own shutdown closes the same door.
+        let (end0, end1) = Socket::create(0).unwrap();
+        end1.shutdown(true, false).unwrap();
+        assert_eq!(end1.write_data(b"x").unwrap_err(), ZxError::BAD_STATE);
+        drop(end0);
     }
 
     /// Runs `body` on its own thread and turns a wedge or a panicked
