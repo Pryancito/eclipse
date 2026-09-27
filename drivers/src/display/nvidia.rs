@@ -12912,15 +12912,20 @@ impl NvidiaGpu {
                     // Only the channel's own process may free it: freeing the
                     // compositor's channel 0 from a client made its next EXEC
                     // fail EINVAL.
+                    // `nouveau_abi16_ioctl_channel_free` looks the id up
+                    // in the FILE's channel list (`nouveau_abi16_chan`):
+                    // a freed, never-allocated or another client's channel
+                    // is ENOENT, like EXEC's, not EINVAL (which libdrm's
+                    // `nouveau_object_del` reads as "bad arguments").
                     let Some(pos) = chans.iter().position(|c| {
                         c.id == req.channel && (owner_pid == 0 || c.owner_pid == owner_pid)
                     }) else {
                         log::warn!(
-                            "[nouveau-uapi] CHANNEL_FREE: no such channel {} (for pid={})",
+                            "[nouveau-uapi] CHANNEL_FREE: no such channel {} (for pid={}) -> ENOENT",
                             req.channel,
                             owner_pid
                         );
-                        return Err(nv::EINVAL);
+                        return Err(nv::ENOENT);
                     };
                     let c = chans.remove(pos);
                     (c.rm_backed, c.id)
