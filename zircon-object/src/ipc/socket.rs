@@ -1081,6 +1081,14 @@ mod tests {
     /// already drained -- an `unwrap` on `None`, which **panics the kernel**.
     fn two_threads_reading_one_datagram_socket_do_not_panic() {
         with_watchdog("a reader panicked the kernel or wedged", || {
+            // Measured on a loaded machine with these numbers: 2049 of the
+            // 20_000 writes in 34,8 s, which is 1,9 times the worst detection
+            // seen there (1060) -- so the cap is what sets the margin now, and
+            // 45 s rather than 30 is the difference between two times and three
+            // on a machine busier still. The check is every 64 rounds because
+            // at 59 rounds a second every 256 was four seconds of slack over
+            // the cap.
+            //
             // Rounds are opportunities for the race and the clock is the cap,
             // because the two are not the same thing here: the readers spin on
             // this socket's lock without ever yielding, so the writer's rate
@@ -1095,7 +1103,7 @@ mod tests {
             // `read` at the same time and the race stops happening at all.
             use std::time::{Duration, Instant};
             const ROUNDS: usize = 20_000;
-            const CAP: Duration = Duration::from_secs(30);
+            const CAP: Duration = Duration::from_secs(45);
             let (writer, reader) = Socket::create(SocketFlags::DATAGRAM.bits()).unwrap();
             let stop = Arc::new(AtomicBool::new(false));
 
@@ -1118,7 +1126,7 @@ mod tests {
             let started = Instant::now();
             for round in 0..ROUNDS {
                 let _ = writer.write(&[1, 2, 3, 4]);
-                if round % 256 == 0 && started.elapsed() > CAP {
+                if round % 64 == 0 && started.elapsed() > CAP {
                     break;
                 }
             }
@@ -1143,7 +1151,7 @@ mod tests {
             // same lock this loop needs.
             use std::time::{Duration, Instant};
             const ROUNDS: usize = 20_000;
-            const CAP: Duration = Duration::from_secs(30);
+            const CAP: Duration = Duration::from_secs(45);
             const CHUNK: usize = 1024;
             let (writer, reader) = Socket::create(0).unwrap();
             let stop = Arc::new(AtomicBool::new(false));
@@ -1170,7 +1178,7 @@ mod tests {
             let mut drain = vec![0u8; CHUNK];
             let started = Instant::now();
             for round in 0..ROUNDS {
-                if round % 256 == 0 && started.elapsed() > CAP {
+                if round % 64 == 0 && started.elapsed() > CAP {
                     break;
                 }
                 let held = reader.get_info().rx_buf_size as usize;
