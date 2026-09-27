@@ -7,7 +7,7 @@ use alloc::sync::Arc;
 use core::any::Any;
 use core::future::Future;
 use core::pin::Pin;
-use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use core::task::{Context, Poll as TaskPoll};
 use core::time::Duration;
 
@@ -426,16 +426,56 @@ impl DrmDev {
             return;
         }
         let fences = drm::scanout_render_fence(fb_id);
+        let n = FENCE_PRESENTS
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1);
+        // `flip_fence_enabled` is the same gate `scanout_render_fence` applies
+        // internally, and it is folded into the REPORT rather than into a return
+        // of its own: with the hatch off the caller asked for the old behaviour,
+        // an empty answer then says nothing about the driver, and a second early
+        // return on the present path is a way to break presenting that no test
+        // here can reach (this half needs a live device -- see the module docs of
+        // `present_fence_tests`).
+        let report = fence_report_decision(n, FENCE_REPORT_EVERY) && drm::flip_fence_enabled();
+        // An empty answer is the interesting one, and nothing said it out loud
+        // until now. The wait is on by default and the atomic path has had its
+        // in-fence for as long as it has existed, so the natural reading of a
+        // torn frame on real hardware is "the wait did not help". It may never
+        // have run: no fence means this present goes straight to the blit, and a
+        // GPU still writing the buffer is not waited for at all. Whether that is
+        // what happens on a real desktop is a question about a real machine, so
+        // the number goes in the log.
         if fences.is_empty() {
+            if report {
+                log::info!(
+                    "[drm] present fence: fb {} (#{}) has NO render fence to wait on -- \
+                     the buffer's owner has no ring in flight, or its ring is unknown; \
+                     presenting immediately, so a GPU still writing this buffer is not \
+                     waited for",
+                    fb_id,
+                    n
+                );
+            }
             return;
         }
-        let deadline = kernel_hal::timer::timer_now()
-            + core::time::Duration::from_micros(PRESENT_FENCE_TIMEOUT_US);
+        let waited_from = kernel_hal::timer::timer_now();
+        let deadline = waited_from + core::time::Duration::from_micros(PRESENT_FENCE_TIMEOUT_US);
         loop {
             if fences
                 .iter()
                 .all(|&(va, payload)| zcore_drivers::scheme::syncobj::hw_fence_landed(va, payload))
             {
+                if report {
+                    log::info!(
+                        "[drm] present fence: fb {} (#{}) waited {}us for {} fence(s) to land",
+                        fb_id,
+                        n,
+                        kernel_hal::timer::timer_now()
+                            .saturating_sub(waited_from)
+                            .as_micros(),
+                        fences.len()
+                    );
+                }
                 return;
             }
             let Some(wake) =
@@ -2536,6 +2576,32 @@ const PRESENT_FENCE_TIMEOUT_US: u64 = 100_000;
 
 /// How long a fence poll sleeps between probes.
 const FENCE_POLL_TICK: Duration = Duration::from_millis(1);
+
+/// How often a legacy present says what it waited for: the first two of the
+/// boot, then on the present cost report's own rhythm.
+///
+/// The first two answer the question that has no other answer -- whether the
+/// implicit-sync wait finds anything to wait on at all. After that it borrows
+/// [`drm::FULL_FRAME_REPORT_EVERY`] rather than picking its own number, so the
+/// two lines about the same present land together in the klog and the wait can
+/// be read against the blit it precedes. The klog writes synchronously to the
+/// UART, so a line per frame would be a stutter of its own.
+const FENCE_REPORT_EVERY: u64 = drm::FULL_FRAME_REPORT_EVERY;
+
+/// Legacy presents that reached the fence wait with the nouveau uAPI on.
+static FENCE_PRESENTS: AtomicU64 = AtomicU64::new(0);
+
+/// Whether the `n`-th present's fence outcome gets a line in the klog.
+///
+/// No guard against `every == 0`, and not because a zero rhythm cannot arrive:
+/// `is_multiple_of(0)` is `false` for every non-zero `n` and `true` only for
+/// `0`, so a zero rhythm already reports the opening two presents and then goes
+/// quiet, and `n == 0` is already covered by the first arm. A `every != 0 &&`
+/// in front of it was a mutant that could not be killed, because it cannot
+/// change the answer for any input at all.
+fn fence_report_decision(n: u64, every: u64) -> bool {
+    n <= 2 || n.is_multiple_of(every)
+}
 
 /// When a bounded fence poll should wake for its next probe, or `None` when
 /// the deadline leaves no time to sleep and the caller must give up.
@@ -7029,6 +7095,337 @@ mod kms_scanout_tests {
     ///
     /// Linux throws the clips away and declares a full update whenever
     /// `state->fb != old_state->fb` (`drm_atomic_helper_damage_iter_init`).
+    /// The whole point, staged: the client keeps writing the buffer AFTER the
+    /// present has already copied those rows, and the repair pass picks up what
+    /// arrived. Without it the panel keeps the pixels the copy happened to catch,
+    /// which is the stain Moebius sees on a freshly redrawn title bar or menu.
+    ///
+    /// The screen is 200 rows so the blit takes two bands of `BLIT_CHUNK_ROWS`,
+    /// and the hook writes on the SECOND band -- rows the first band already
+    /// carried to the panel. That ordering is the whole test: a write before the
+    /// first band would simply be copied, and would prove nothing.
+    #[test]
+    fn the_repair_pass_picks_up_what_arrived_after_the_copy_passed() {
+        let screen = kms_emu::attach(192, 200);
+        drm::set_present_repair_enabled(true);
+        let c = Client::open(0);
+        let buf = c.create_dumb(192, 200);
+        paint(&buf, |x, y| tag(0x0066_0000, x, y));
+        let fb = c.addfb2(&buf);
+        let pixels = map_dumb(&buf);
+        let stride = (buf.pitch / 4) as usize;
+        let late = pixels.as_mut_ptr() as usize;
+
+        kms_emu::on_blit_band(move |band| {
+            // Second band only: by now rows 0..128 are already on the panel.
+            if band != 1 {
+                return;
+            }
+            // SAFETY: the dumb buffer outlives this present, and nothing else
+            // writes it while the hook runs.
+            let p = unsafe { core::slice::from_raw_parts_mut(late as *mut u32, stride * 200) };
+            for y in 0..128usize {
+                for x in 64..128usize {
+                    p[y * stride + x] = tag(0x0077_0000, x as u32, y as u32);
+                }
+            }
+        });
+
+        c.page_flip(drm::SYNTH_CRTC_ID, fb, 0xF00D).expect("flip");
+
+        assert!(
+            kms_emu::mid_blit_calls() >= 2,
+            "the blit has to take at least two bands for this to stage anything, took {}",
+            kms_emu::mid_blit_calls()
+        );
+        assert!(
+            drm::repair_rounds_for_test() >= 1,
+            "a source that moved under the copy has to cost at least one repair round"
+        );
+        for y in 0..128 {
+            for x in 64..128 {
+                assert_eq!(
+                    screen.pixel(x, y),
+                    tag(0x0077_0000, x, y),
+                    "pixel ({}, {}) was written after the copy passed and never repaired",
+                    x,
+                    y
+                );
+            }
+        }
+        // And the repair touched only the band that moved.
+        for y in 0..128 {
+            for x in (0..64).chain(128..192) {
+                assert_eq!(
+                    screen.pixel(x, y),
+                    tag(0x0066_0000, x, y),
+                    "pixel ({}, {}) outside the band that moved",
+                    x,
+                    y
+                );
+            }
+        }
+    }
+
+    /// A repair round copies the span that moved and NOT the whole window. The
+    /// claim that a round costs what actually moved rests on this, and reading the
+    /// destination afterwards cannot show it when the source agrees everywhere:
+    /// so the hook drops a sentinel on the panel outside the span, between the
+    /// present's own blit and the repair's, and a repair that repainted the whole
+    /// window would erase it.
+    #[test]
+    fn a_repair_round_copies_only_the_span_that_moved() {
+        const SENTINEL: u32 = 0xDEAD_BEEF;
+        let screen = kms_emu::attach(192, 200);
+        let pitch_px = screen.pitch_px();
+        drm::set_present_repair_enabled(true);
+        let c = Client::open(0);
+        let buf = c.create_dumb(192, 200);
+        paint(&buf, |x, y| tag(0x0088_0000, x, y));
+        let fb = c.addfb2(&buf);
+        let stride = (buf.pitch / 4) as usize;
+        let late = map_dumb(&buf).as_mut_ptr() as usize;
+
+        kms_emu::on_blit_band(move |band| match band {
+            // Second band of the present's own blit: move one band of the source
+            // after the rows carrying it have already gone to the panel.
+            1 => {
+                // SAFETY: the dumb buffer outlives this present.
+                let p = unsafe { core::slice::from_raw_parts_mut(late as *mut u32, stride * 200) };
+                for y in 0..128usize {
+                    for x in 64..128usize {
+                        p[y * stride + x] = tag(0x0099_0000, x as u32, y as u32);
+                    }
+                }
+            }
+            // First band of the repair's blit: mark the panel outside the span.
+            2 => {
+                for y in 0..128u32 {
+                    kms_emu::poke(pitch_px, 0, y, SENTINEL);
+                    kms_emu::poke(pitch_px, 191, y, SENTINEL);
+                }
+            }
+            _ => {}
+        });
+
+        c.page_flip(drm::SYNTH_CRTC_ID, fb, 0xF00D).expect("flip");
+
+        assert!(
+            drm::repair_rounds_for_test() >= 1,
+            "a source that moved under the copy has to cost at least one repair \
+             round; the blit took {} bands",
+            kms_emu::mid_blit_calls()
+        );
+        for y in 0..128 {
+            assert_eq!(
+                (screen.pixel(0, y), screen.pixel(191, y)),
+                (SENTINEL, SENTINEL),
+                "row {}: the repair repainted columns outside the span that moved",
+                y
+            );
+        }
+        // And the span itself still got repaired.
+        assert_eq!(screen.pixel(64, 0), tag(0x0099_0000, 64, 0));
+    }
+
+    /// With the probe armed and the repair NOT armed the bracket IS taken -- the
+    /// probe needs it -- so this is the one arrangement where the repair's own
+    /// check is the only thing standing between a measurement and a copy nobody
+    /// asked for. It must stay a measurement.
+    #[test]
+    fn the_probe_alone_measures_and_does_not_repair() {
+        let screen = kms_emu::attach(192, 200);
+        drm::set_present_probe_enabled(true);
+        let c = Client::open(0);
+        let buf = c.create_dumb(192, 200);
+        paint(&buf, |x, y| tag(0x00AA_0000, x, y));
+        let fb = c.addfb2(&buf);
+        let stride = (buf.pitch / 4) as usize;
+        let late = map_dumb(&buf).as_mut_ptr() as usize;
+
+        kms_emu::on_blit_band(move |band| {
+            if band != 1 {
+                return;
+            }
+            // SAFETY: the dumb buffer outlives this present.
+            let p = unsafe { core::slice::from_raw_parts_mut(late as *mut u32, stride * 200) };
+            for y in 0..128usize {
+                for x in 64..128usize {
+                    p[y * stride + x] = tag(0x00BB_0000, x as u32, y as u32);
+                }
+            }
+        });
+
+        c.page_flip(drm::SYNTH_CRTC_ID, fb, 0xF00D).expect("flip");
+
+        assert_eq!(
+            drm::repair_rounds_for_test(),
+            0,
+            "the probe must not repair -- it reports"
+        );
+        assert_eq!(
+            screen.pixel(64, 0),
+            tag(0x00AA_0000, 64, 0),
+            "the panel keeps what the copy caught"
+        );
+    }
+
+    /// A source that is still moving during the repair costs a SECOND round, and
+    /// the second round is the one that puts the latest pixels up. Without this
+    /// the budget could be one and nothing would notice.
+    #[test]
+    fn a_source_still_moving_during_the_repair_costs_a_second_round() {
+        let screen = kms_emu::attach(192, 200);
+        drm::set_present_repair_enabled(true);
+        let c = Client::open(0);
+        let buf = c.create_dumb(192, 200);
+        paint(&buf, |x, y| tag(0x00CC_0000, x, y));
+        let fb = c.addfb2(&buf);
+        let stride = (buf.pitch / 4) as usize;
+        let late = map_dumb(&buf).as_mut_ptr() as usize;
+
+        // Band 1 moves the span during the present's own blit; band 2 moves it
+        // AGAIN during the first repair round, so only a second round can catch up.
+        kms_emu::on_blit_band(move |band| {
+            let base = match band {
+                1 => 0x00DD_0000u32,
+                2 => 0x00EE_0000u32,
+                _ => return,
+            };
+            // SAFETY: the dumb buffer outlives this present.
+            let p = unsafe { core::slice::from_raw_parts_mut(late as *mut u32, stride * 200) };
+            for y in 0..128usize {
+                for x in 64..128usize {
+                    p[y * stride + x] = tag(base, x as u32, y as u32);
+                }
+            }
+        });
+
+        c.page_flip(drm::SYNTH_CRTC_ID, fb, 0xF00D).expect("flip");
+
+        assert_eq!(
+            drm::repair_rounds_for_test(),
+            2,
+            "a source that moved again under the repair owes a second round"
+        );
+        assert_eq!(
+            screen.pixel(64, 0),
+            tag(0x00EE_0000, 64, 0),
+            "the second round has to put the latest pixels up"
+        );
+    }
+
+    /// The same race with the repair NOT armed: the panel keeps the stale pixels.
+    /// This is the defect itself, pinned, so the test above cannot pass for some
+    /// reason other than the repair -- and so that turning the flag off is known
+    /// to still mean what it says.
+    #[test]
+    fn without_the_repair_the_stale_pixels_stay_on_the_panel() {
+        let screen = kms_emu::attach(192, 200);
+        let c = Client::open(0);
+        let buf = c.create_dumb(192, 200);
+        paint(&buf, |x, y| tag(0x0066_0000, x, y));
+        let fb = c.addfb2(&buf);
+        let pixels = map_dumb(&buf);
+        let stride = (buf.pitch / 4) as usize;
+        let late = pixels.as_mut_ptr() as usize;
+
+        kms_emu::on_blit_band(move |band| {
+            if band != 1 {
+                return;
+            }
+            // SAFETY: as above.
+            let p = unsafe { core::slice::from_raw_parts_mut(late as *mut u32, stride * 200) };
+            for y in 0..128usize {
+                for x in 64..128usize {
+                    p[y * stride + x] = tag(0x0077_0000, x as u32, y as u32);
+                }
+            }
+        });
+
+        c.page_flip(drm::SYNTH_CRTC_ID, fb, 0xF00D).expect("flip");
+
+        assert_eq!(
+            drm::repair_rounds_for_test(),
+            0,
+            "the repair must not run when the cmdline did not arm it"
+        );
+        assert_eq!(
+            screen.pixel(64, 0),
+            tag(0x0066_0000, 64, 0),
+            "with no repair the panel keeps what the copy caught"
+        );
+    }
+
+    /// The repair pass must be free on a buffer nobody is writing: zero extra
+    /// rounds, and the frame on screen is exactly the frame in the buffer. Every
+    /// claim about what the repair costs rests on this -- a pass that ran rounds
+    /// on a settled present would be paying on every frame of a healthy desktop.
+    #[test]
+    fn the_repair_pass_runs_no_rounds_on_a_settled_buffer() {
+        let screen = kms_emu::attach(192, 8);
+        drm::set_present_repair_enabled(true);
+        let c = Client::open(0);
+        let buf = c.create_dumb(192, 8);
+        paint(&buf, |x, y| tag(0x0033_0000, x, y));
+        let fb = c.addfb2(&buf);
+
+        c.page_flip(drm::SYNTH_CRTC_ID, fb, 0xF00D).expect("flip");
+
+        assert_eq!(
+            drm::repair_rounds_for_test(),
+            0,
+            "a buffer nobody is writing must cost no repair rounds"
+        );
+        for y in 0..8 {
+            for x in 0..192 {
+                assert_eq!(
+                    screen.pixel(x, y),
+                    tag(0x0033_0000, x, y),
+                    "pixel ({}, {}) with the repair armed",
+                    x,
+                    y
+                );
+            }
+        }
+    }
+
+    /// And the repair pass changes nothing about a damage box on the buffer the
+    /// panel already carries: the box is still the only thing copied. Arming a
+    /// repair must not quietly turn every present into a whole frame.
+    #[test]
+    fn the_repair_pass_does_not_widen_a_damage_box() {
+        let screen = kms_emu::attach(192, 8);
+        drm::set_present_repair_enabled(true);
+        let c = Client::open(0);
+        let buf = c.create_dumb(192, 8);
+        paint(&buf, |x, y| tag(0x0044_0000, x, y));
+        let fb = c.addfb2(&buf);
+        c.page_flip(drm::SYNTH_CRTC_ID, fb, 0xF00D).expect("flip");
+
+        // Repaint the whole buffer, then damage only one band of it.
+        paint(&buf, |x, y| tag(0x0055_0000, x, y));
+        dirtyfb(&c, fb, &[clip(64, 0, 128, 8)]);
+
+        assert_eq!(drm::repair_rounds_for_test(), 0);
+        for y in 0..8 {
+            for x in 0..192 {
+                let want = if (64..128).contains(&x) {
+                    tag(0x0055_0000, x, y)
+                } else {
+                    tag(0x0044_0000, x, y)
+                };
+                assert_eq!(
+                    screen.pixel(x, y),
+                    want,
+                    "pixel ({}, {}) -- the repair widened the box",
+                    x,
+                    y
+                );
+            }
+        }
+    }
+
     #[test]
     fn a_damage_box_on_a_fresh_buffer_puts_the_whole_frame_up() {
         let screen = kms_emu::attach(64, 16);
@@ -10092,9 +10489,86 @@ mod present_fence_tests {
     //! compositor on it.
     //!
     //! What is not covered here, because it needs a live device and a driver:
-    //! the fb lookup, the driver's fence answer, and the timeout warning.
+    //! the fb lookup, the driver's fence answer, the timeout warning, the text of
+    //! the two report lines, and the `+ 1` that makes the count one-based (a
+    //! zero-based count would print `#0` for the first present and open with
+    //! three lines instead of two -- visible only in a klog no test reads). The
+    //! report rhythm IS covered, because it is the only thing that will ever say
+    //! whether the wait found a fence at all, and a rhythm that reports nothing
+    //! is a diagnostic that lies by omission.
 
     use super::*;
+
+    /// The first two presents of a boot always report. Those two are the whole
+    /// point: they answer "does this find a fence at all" before anything else
+    /// has had a chance to go wrong, and a rhythm that started at 64 would
+    /// answer it a second into the session at the earliest.
+    #[test]
+    fn the_first_two_presents_of_a_boot_always_say_what_they_found() {
+        assert!(fence_report_decision(1, FENCE_REPORT_EVERY));
+        assert!(fence_report_decision(2, FENCE_REPORT_EVERY));
+    }
+
+    /// And the third does not, or the klog is a line per frame -- which it
+    /// writes synchronously to the UART, so it would be a stutter of its own.
+    #[test]
+    fn the_third_present_is_quiet() {
+        assert!(!fence_report_decision(3, FENCE_REPORT_EVERY));
+        for n in [4u64, 5, 63, 65, 127] {
+            assert!(!fence_report_decision(n, FENCE_REPORT_EVERY), "n = {}", n);
+        }
+    }
+
+    /// After that, one line every `FENCE_REPORT_EVERY` presents, counted from
+    /// the first: `#64`, `#128`, and so on.
+    #[test]
+    fn then_one_line_every_sixty_four_presents() {
+        for k in 1..=8u64 {
+            let n = k * FENCE_REPORT_EVERY;
+            assert!(fence_report_decision(n, FENCE_REPORT_EVERY), "n = {}", n);
+        }
+    }
+
+    /// `n = 0` cannot happen -- the counter is read after its increment -- but
+    /// the multiple-of test would call every rhythm true for it, so the answer
+    /// is pinned rather than left to `0 % 64 == 0`.
+    #[test]
+    fn the_count_is_one_based_and_zero_is_not_a_present() {
+        assert!(fence_report_decision(0, FENCE_REPORT_EVERY));
+    }
+
+    /// A rhythm of zero reports the first two and then goes quiet. Nothing
+    /// divides by zero on the way there: `is_multiple_of(0)` answers `false` for
+    /// a non-zero count, which is exactly "not on the rhythm". The constant is
+    /// not configurable today, so this is about the function staying safe if it
+    /// ever becomes so.
+    #[test]
+    fn a_rhythm_of_zero_reports_the_opening_and_nothing_else() {
+        assert!(fence_report_decision(1, 0));
+        assert!(fence_report_decision(2, 0));
+        for n in [3u64, 64, 128, u64::MAX] {
+            assert!(!fence_report_decision(n, 0), "n = {}", n);
+        }
+    }
+
+    /// The fence line and the present cost line describe the SAME present, so
+    /// they share one rhythm and land together in the klog: `waited 0us for 0
+    /// fence(s)` next to `cpu blit 12000us` is the pair that says whether the
+    /// wait is what costs the frame. Two independent numbers would drift apart
+    /// and leave a reader counting frames between them.
+    #[test]
+    fn the_fence_line_keeps_the_cost_lines_rhythm() {
+        assert_eq!(FENCE_REPORT_EVERY, drm::FULL_FRAME_REPORT_EVERY);
+    }
+
+    /// The last present a 64-bit counter can reach still reports on its rhythm
+    /// rather than panicking or wrapping: the counter itself saturates.
+    #[test]
+    fn the_rhythm_holds_at_the_top_of_the_counter() {
+        let top = u64::MAX - (u64::MAX % FENCE_REPORT_EVERY);
+        assert!(fence_report_decision(top, FENCE_REPORT_EVERY));
+        assert!(!fence_report_decision(u64::MAX, FENCE_REPORT_EVERY));
+    }
 
     /// `SETCRTC` and `PAGE_FLIP` both present, and both must wait.
     #[test]
