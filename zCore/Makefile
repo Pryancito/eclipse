@@ -101,17 +101,34 @@ boottrace_arg := $(if $(BOOTTRACE),:BOOTTRACE=$(BOOTTRACE))
 # flag -> pixman (the kernel uAPI is off, so hardware GL cannot exist — same
 # two-condition rule as everywhere else); any other GPU -> gl-sw; no GPU ->
 # pixman. Force `GL=1` to try nouveau, or edit the ESP's rboot.conf by hand.
+# Extra kernel cmdline options, appended verbatim to CMDLINE. This is the knob
+# for every boot-time flag that has no Makefile variable of its own, and there
+# are a dozen of those (`drm.present_probe`, `drm.atomic`, `drm.flip_fence=off`,
+# `smp=off`, `nvidia.wlr_gles2`, ...). Without it the only way to try one was to
+# set CMDLINE by hand -- which drops LOG, TERM, console.shell, ROOT, ROOTPROC,
+# desktop= and renderer= all at once, so the guest boots to nothing -- or to
+# edit the ESP's rboot.conf after every build. Several options are separated by
+# colons, the same way CMDLINE separates its own:
+#
+#   make qemu KOPTS=drm.present_probe
+#   make qemu KOPTS=drm.present_probe:drm.flip_fence=off
+#
+# Changing it does NOT rebuild the image: `justrun` seds the new cmdline into
+# the ESP's rboot.conf and mcopies that one file in.
+KOPTS ?=
+kopts_arg := $(if $(KOPTS),:$(KOPTS))
+
 GL ?= auto
 gl_arg := $(if $(filter 0,$(GL)),:renderer=pixman,$(if $(filter sw,$(GL)),:renderer=gl-sw,$(if $(filter 1,$(GL)),:renderer=gl:nvidia.nouveau_uapi:nvidia.cepresent,:renderer=auto)))
 
 ifeq ($(LINUX), 1)
   ifeq ($(ARCH), x86_64)
-    CMDLINE ?= LOG=$(LOG):TERM=xterm-256color:console.shell=true:virtcon.disable=true:ROOT=/dev/vda:ROOTPROC=/bin/busybox?sh$(desktop_arg)$(boottrace_arg)$(gl_arg)
+    CMDLINE ?= LOG=$(LOG):TERM=xterm-256color:console.shell=true:virtcon.disable=true:ROOT=/dev/vda:ROOTPROC=/bin/busybox?sh$(desktop_arg)$(boottrace_arg)$(gl_arg)$(kopts_arg)
   else
-    CMDLINE ?= LOG=$(LOG)$(desktop_arg)$(boottrace_arg)$(gl_arg)
+    CMDLINE ?= LOG=$(LOG)$(desktop_arg)$(boottrace_arg)$(gl_arg)$(kopts_arg)
   endif
 else
-  CMDLINE ?= LOG=$(LOG):TERM=xterm-256color:console.shell=true:virtcon.disable=true$(desktop_arg)$(boottrace_arg)$(gl_arg)
+  CMDLINE ?= LOG=$(LOG):TERM=xterm-256color:console.shell=true:virtcon.disable=true$(desktop_arg)$(boottrace_arg)$(gl_arg)$(kopts_arg)
 endif
 
 # `prebuilt/zircon/` names its directories the Fuchsia way (x64, arm64,

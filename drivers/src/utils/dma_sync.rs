@@ -428,11 +428,23 @@ pub unsafe fn nt_blit_rows(
             && (src as usize).is_multiple_of(16)
             && rows_stay_aligned
         {
-            // The row copies clobber xmm0, which belongs to the interrupted
-            // USER context: this soft-float kernel never saves vector state on
-            // syscall entry, so without a save/restore the caller returns to
-            // userspace with a corrupted xmm0 (Mesa's SSE code then fails in
-            // ways that look nothing like the real cause).
+            // The row copies clobber xmm0, and it is saved and put back around
+            // them. Not because the user's copy would otherwise be lost -- the
+            // claim this comment used to make, and it is wrong:
+            // `UserContext::run` xsaves the user's FP state the moment a trap
+            // returns and xrstors it again before entering user mode, so nothing
+            // a syscall does to xmm can reach userspace.
+            //
+            // It stays because this and `nt_copy_row_aligned` are the ONLY two
+            // places in the kernel that touch a vector register, and the reason
+            // that is safe is a property of the build, not of the code: the
+            // target is `-sse,+soft-float`, so LLVM never allocates XMM and
+            // there is no compiler-held value to lose. That also means
+            // `out(xmm_reg)` is rejected and the clobber cannot be declared, so
+            // there is no way to make the compiler enforce it. The save is what
+            // is left: it costs two stores per call, not per row, and it is the
+            // only thing standing between a future kernel that does hold a
+            // vector value across this and a bug nobody would find.
             let mut xmm0_save = [0u8; 16];
             unsafe {
                 core::arch::asm!(
