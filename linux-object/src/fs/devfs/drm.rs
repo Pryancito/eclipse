@@ -4734,15 +4734,24 @@ pub fn repaint_for_cursor() {
         return;
     }
     if fb_id == 0 {
-        // Nothing was drawn, so put back what the next move has to erase: the
-        // snapshot above already moved `cursor.drawn` to where the pointer was
-        // GOING, and leaving that lie is how the old image becomes permanent.
+        // Nothing has been drawn and nothing can be from here: the fallback below
+        // reads the client's framebuffer and there is none. The snapshot above
+        // already advanced `cursor.drawn` to where the pointer was GOING, so the
+        // state on the way out says the pointer was painted there when it was
+        // not, and the next move would erase that window instead of the one the
+        // old image is really in -- which is how an image becomes permanent.
         //
-        // No test can kill this line, and it stays: getting here needs a panel
-        // that cannot be read back AND no framebuffer bound, and the only thing
-        // that binds one again is a present, which repaints the whole frame and
-        // rubs out the evidence. It is still the wrong state to leave behind.
-        DRM_STATE.lock().cursor.drawn = old_rect;
+        // Undone only if it is still OUR write: `drawn` is taken and put back with
+        // the lock dropped in between, so a cursor event on another thread may
+        // have moved it again, and that newer state is the true one. Reached with
+        // a panel that cannot be read back and no framebuffer bound, which no
+        // test can set up so as to observe the difference -- the only thing that
+        // binds a framebuffer again is a present, and that repaints the whole
+        // frame.
+        let mut st = DRM_STATE.lock();
+        if st.cursor.drawn == new.as_ref().map(|(x, y, w, h, _)| (*x, *y, *w, *h)) {
+            st.cursor.drawn = old_rect;
+        }
         return;
     }
     // Same lifetime guard as `scanout_region`: this blits with the lock dropped.
