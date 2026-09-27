@@ -569,7 +569,9 @@ impl dyn KernelObject {
     /// It's used to implement `sys_object_wait_async`.
     #[allow(unsafe_code)]
     pub fn send_signal_to_port_async(self: &Arc<Self>, signal: Signal, port: &Arc<Port>, key: u64) {
-        port.wait_async(self, (0, 0), key, signal, WaitAsyncOptions::empty(), None);
+        // The only refusal is a port watching itself, and this is never called
+        // with the port as its own object.
+        let _ = port.wait_async(self, (0, 0), key, signal, WaitAsyncOptions::empty(), None);
     }
 }
 

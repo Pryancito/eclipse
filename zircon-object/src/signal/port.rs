@@ -134,6 +134,23 @@ impl Port {
     }
 
     /// Register a one-shot signal wait, identified by its source handle and key.
+    ///
+    /// A port may not watch **itself**: `NOT_SUPPORTED`. Every path that queues
+    /// to a port holds `inner` across the `signal_set` that tells the observers,
+    /// and `signal_change` runs those callbacks with its own lock held, so a
+    /// port observing its own `READABLE` reaches `signal_observer` -- which
+    /// wants `inner` -- from inside the critical section that already holds it.
+    /// These are spin locks with interrupts off and they do not nest, so the
+    /// first packet queued to such a port wedges that CPU for good, and
+    /// `zx_object_wait_async(port, port, ..)` plus `zx_port_queue(port, ..)` is
+    /// all it takes. The packet it would have queued says only that the port
+    /// itself became readable, so there is nothing to lose by refusing.
+    ///
+    /// A **cycle** of ports each watching the next is the same hang and is NOT
+    /// covered here: an observer records the handle it came from, not the object
+    /// it watches, so the graph cannot be walked from what is stored. Breaking
+    /// that one means not holding `inner` across the signal at all, and the
+    /// clears in `wait` and `cancel` need it to stay atomic with the pop.
     pub fn wait_async(
         self: &Arc<Self>,
         object: &Arc<dyn KernelObject>,
@@ -142,7 +159,10 @@ impl Port {
         signals: Signal,
         options: WaitAsyncOptions,
         cancel: Option<Receiver<()>>,
-    ) {
+    ) -> ZxResult {
+        if object.id() == self.base.id {
+            return Err(ZxError::NOT_SUPPORTED);
+        }
         let id = {
             let mut inner = self.inner.lock();
             inner.next_observer += 1;
@@ -167,6 +187,7 @@ impl Port {
             };
             port.signal_observer(id, observed)
         }));
+        Ok(())
     }
 
     fn signal_observer(&self, id: u64, observed: Signal) -> bool {
@@ -344,6 +365,52 @@ bitflags! {
 
 #[cfg(test)]
 mod tests {
+    /// A port asked to watch itself used to be accepted, and then the first
+    /// packet queued to it wedged the CPU for good: every path that queues
+    /// holds `inner` across the `signal_set` that tells the observers, and
+    /// `signal_change` runs those callbacks under its own lock, so
+    /// `signal_observer` asked for `inner` from inside the critical section
+    /// already holding it. Spin locks with interrupts off do not nest.
+    ///
+    /// The watchdog is the point: before the refusal this test **hung**, and a
+    /// hang says nothing.
+    #[test]
+    fn a_port_cannot_watch_itself() {
+        use super::*;
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let port = Port::new(0).unwrap();
+        let itself = port.clone() as Arc<dyn KernelObject>;
+        assert_eq!(
+            port.wait_async(
+                &itself,
+                (0, 0),
+                42,
+                Signal::READABLE,
+                WaitAsyncOptions::empty(),
+                None,
+            ),
+            Err(ZxError::NOT_SUPPORTED),
+        );
+
+        // And queueing to it still works, which is what used to wedge.
+        let (done, finished) = mpsc::channel();
+        let queued = std::thread::spawn(move || {
+            let sent = port.push_user(PortPacketRepr {
+                key: 1,
+                status: 0,
+                data: PayloadRepr::User([0; 32]),
+            });
+            let _ = done.send(sent);
+        });
+        finished
+            .recv_timeout(Duration::from_secs(30))
+            .expect("queueing a packet to a port that was asked to watch itself wedged")
+            .unwrap();
+        queued.join().unwrap();
+    }
+
     use super::*;
     use std::time::Duration;
 
@@ -363,7 +430,8 @@ mod tests {
             Signal::READABLE,
             WaitAsyncOptions::EDGE,
             None,
-        );
+        )
+        .unwrap();
         assert!(port.wait().now_or_never().is_none());
         // A change to a signal this wait does not even watch is not an edge
         // on the one it does.
@@ -389,7 +457,8 @@ mod tests {
             Signal::READABLE,
             WaitAsyncOptions::EDGE,
             None,
-        );
+        )
+        .unwrap();
         assert!(port.wait().now_or_never().is_none());
         object.signal_set(Signal::READABLE);
         assert_eq!(port.wait().now_or_never().unwrap().key, 7);
@@ -408,7 +477,8 @@ mod tests {
             Signal::READABLE,
             WaitAsyncOptions::empty(),
             None,
-        );
+        )
+        .unwrap();
         assert_eq!(port.wait().now_or_never().unwrap().key, 7);
     }
 
@@ -426,7 +496,8 @@ mod tests {
             let before = kernel_hal::timer::timer_now().as_nanos() as u64;
             let port = Port::new(0).unwrap();
             let object = DummyObject::new() as Arc<dyn KernelObject>;
-            port.wait_async(&object, (1, 4), 7, Signal::READABLE, options, None);
+            port.wait_async(&object, (1, 4), 7, Signal::READABLE, options, None)
+                .unwrap();
             object.signal_set(Signal::READABLE);
             let packet = port.wait().now_or_never().unwrap().decode().unwrap();
             let PayloadRepr::Signal(signal) = packet.data else {
@@ -457,7 +528,8 @@ mod tests {
             Signal::READABLE,
             WaitAsyncOptions::empty(),
             Some(receiver),
-        );
+        )
+        .unwrap();
         drop(sender);
         object.signal_set(Signal::READABLE);
         assert_eq!(port.cancel(None, 7), Err(ZxError::NOT_FOUND));
@@ -480,7 +552,8 @@ mod tests {
             Signal::READABLE,
             WaitAsyncOptions::empty(),
             Some(receiver),
-        );
+        )
+        .unwrap();
         object.signal_set(Signal::READABLE);
         drop(sender);
         assert!(port.wait().now_or_never().is_none());
@@ -499,7 +572,8 @@ mod tests {
                 Signal::READABLE,
                 WaitAsyncOptions::empty(),
                 None,
-            );
+            )
+            .unwrap();
         }
         port.cancel(Some((1, 4)), 7).unwrap();
         object.signal_set(Signal::READABLE);
@@ -513,7 +587,8 @@ mod tests {
             Signal::READABLE,
             WaitAsyncOptions::empty(),
             None,
-        );
+        )
+        .unwrap();
         port.cancel(None, 9).unwrap();
         assert!(port.wait().now_or_never().is_none());
     }
@@ -530,7 +605,8 @@ mod tests {
             Signal::READABLE,
             WaitAsyncOptions::empty(),
             None,
-        );
+        )
+        .unwrap();
         drop(port);
         assert!(weak.upgrade().is_none());
         object.signal_set(Signal::READABLE);

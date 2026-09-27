@@ -541,8 +541,7 @@ impl Syscall<'_> {
             signals,
             options,
             Some(cancel),
-        );
-        Ok(())
+        )
     }
 
     /// Signal an object.
