@@ -1397,6 +1397,11 @@ pub struct DrmFileState {
     atomic_client: AtomicBool,
     events: Mutex<VecDeque<Vec<u8>>>,
     eventbus: Arc<Mutex<EventBus>>,
+    /// The nouveau GEM handles this open imported through `PRIME_FD_TO_HANDLE`
+    /// and has not `GEM_CLOSE`d: Linux's `drm_prime_file_private.lookup`, the
+    /// table that makes a second import of the same dma-buf by the same file
+    /// answer the handle it already has instead of taking another reference.
+    prime_imports: Mutex<Vec<u32>>,
 }
 
 impl DrmFileState {
@@ -1405,7 +1410,36 @@ impl DrmFileState {
             atomic_client: AtomicBool::new(false),
             events: Mutex::new(VecDeque::new()),
             eventbus: EventBus::new(),
+            prime_imports: Mutex::new(Vec::new()),
         })
+    }
+
+    /// Record that this open imported `handle`. `true` when it is new to this
+    /// file (a reference is owed), `false` when the file already holds it.
+    pub fn note_prime_import(&self, handle: u32) -> bool {
+        let mut imports = self.prime_imports.lock();
+        if imports.contains(&handle) {
+            return false;
+        }
+        imports.push(handle);
+        true
+    }
+
+    /// This open let go of `handle` (`GEM_CLOSE`): a later import counts
+    /// again. `true` when it was recorded.
+    pub fn forget_prime_import(&self, handle: u32) -> bool {
+        let mut imports = self.prime_imports.lock();
+        match imports.iter().position(|h| *h == handle) {
+            Some(i) => {
+                imports.swap_remove(i);
+                true
+            }
+            None => false,
+        }
+    }
+
+    pub fn holds_prime_import(&self, handle: u32) -> bool {
+        self.prime_imports.lock().contains(&handle)
     }
 
     pub fn set_atomic_client(&self, on: bool) {
@@ -2236,6 +2270,32 @@ pub fn nouveau_handle_for_phys(phys_addr: u64) -> Option<u32> {
 /// Returns the new share count, or `None` if the handle is not tracked.
 pub fn nouveau_gem_add_ref(handle: u32) -> Option<u32> {
     zcore_drivers::scheme::gem_mmap::add_ref(handle, current_pid())
+}
+
+/// The importer's reference on a nouveau GEM object at `PRIME_FD_TO_HANDLE`
+/// time: one per drm_file that imports it, not one per import. Linux keeps a
+/// per-file table of imported dma-bufs (`drm_prime_lookup_buf_handle`) and a
+/// second import of the same buffer by the same file gets the handle it
+/// already has, with no new reference; Mesa's `nouveau_ws_bo_from_dma_buf`
+/// relies on that -- it de-duplicates by handle and issues ONE `GEM_CLOSE`
+/// for however many imports it made. This took a reference per import
+/// (`nouveau_gem_add_ref`), so every re-import of a live buffer by one
+/// device was a reference nothing released: the buffer stayed in the RM
+/// until the process exited. Another file of the same process (wlroots'
+/// render node next to its KMS node) is another holder, as before. Returns
+/// the reference count, or `None` for a handle not tracked as a nouveau
+/// object.
+pub fn nouveau_gem_import_ref(handle: u32, file: &DrmFileState) -> Option<u32> {
+    if !file.note_prime_import(handle) {
+        return zcore_drivers::scheme::gem_mmap::ref_count(handle);
+    }
+    let n = zcore_drivers::scheme::gem_mmap::add_ref(handle, current_pid());
+    if n.is_none() {
+        // Not a tracked object: no reference was taken, so nothing to
+        // remember either.
+        file.forget_prime_import(handle);
+    }
+    n
 }
 
 /// Holder id a live dma-buf fd records against a nouveau GEM object. Re-export
@@ -6723,6 +6783,53 @@ mod release_tests {
         assert!(!state.framebuffers.iter().any(|fb| fb.id == 9399));
         assert!(!state.fb_backing.iter().any(|(id, _)| *id == 9399));
         assert_eq!(state.crtc_fb, 0, "RMFB of the CRTC fb unbinds it");
+    }
+}
+
+#[cfg(test)]
+mod prime_import_ref_tests {
+    //! One PRIME reference per importing file, as `drm_prime_lookup_buf_handle`
+    //! gives one handle per (file, dma-buf) and no reference for a repeat.
+    use super::*;
+    use zcore_drivers::scheme::gem_mmap::{self, DecRef};
+
+    /// A nouveau-range handle no GPU slice hands out in these tests.
+    const H: u32 = 0xbfff_0007;
+
+    #[test]
+    fn a_repeat_import_by_the_same_file_adds_no_reference_and_another_file_does() {
+        let _serialised = test_globals::lock();
+        let pid = current_pid();
+        gem_mmap::register(H, 0x1000_0000, 4096, pid);
+        assert_eq!(gem_mmap::ref_count(H), Some(1), "the creator's own");
+        let (f1, f2) = (DrmFileState::new(), DrmFileState::new());
+
+        assert_eq!(nouveau_gem_import_ref(H, &f1), Some(2));
+        assert_eq!(
+            nouveau_gem_import_ref(H, &f1),
+            Some(2),
+            "a second import by the same file is the same handle, no new reference"
+        );
+        assert_eq!(nouveau_gem_import_ref(H, &f1), Some(2));
+        assert_eq!(
+            nouveau_gem_import_ref(H, &f2),
+            Some(3),
+            "another file of the process is another holder"
+        );
+        assert!(f1.holds_prime_import(H) && f2.holds_prime_import(H));
+
+        // f1's one GEM_CLOSE: its one reference goes, and it forgets the
+        // handle, so an import after that counts again.
+        assert!(f1.forget_prime_import(H));
+        assert!(!f1.forget_prime_import(H), "forgotten once");
+        assert_eq!(gem_mmap::dec_ref(H, pid), DecRef::StillReferenced(2));
+        assert_eq!(nouveau_gem_import_ref(H, &f1), Some(3));
+
+        // An untracked handle: no reference to take, and the file does not
+        // keep a record of it either way.
+        assert_eq!(nouveau_gem_import_ref(H + 1, &f1), None);
+        assert!(!f1.holds_prime_import(H + 1));
+        assert!(gem_mmap::unregister(H));
     }
 }
 

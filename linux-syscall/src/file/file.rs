@@ -1206,18 +1206,15 @@ impl Syscall<'_> {
         // now also checks who owns the handle (see `drm::export_handle`), but
         // both gates belong here: this is the one that keeps the ioctl on the
         // device it is defined for. Same downcast `WAIT_VBLANK` already uses.
-        let is_drm_fd = file_like
-            .downcast_ref::<File>()
-            .map(|f| {
-                f.inode()
-                    .as_any_ref()
-                    .downcast_ref::<linux_object::fs::devfs::DrmDev>()
-                    .is_some()
-            })
-            .unwrap_or(false);
-        if !is_drm_fd {
+        let drm_file = file_like.downcast_ref::<File>().and_then(|f| {
+            f.inode()
+                .as_any_ref()
+                .downcast_ref::<linux_object::fs::devfs::DrmDev>()
+                .map(|dev| dev.file_state().clone())
+        });
+        let Some(drm_file) = drm_file else {
             return Ok(None);
-        }
+        };
         let proc = self.linux_process();
         // Match on the DRM ioctl NR only. The struct size the client encoded is
         // deliberately NOT part of the comparison -- see `is_drm_ioctl_nr`.
@@ -1325,7 +1322,9 @@ impl Syscall<'_> {
                                 // under the exporter, the next self-import misses, and
                                 // NVK falls back to a generic handle that GEM_INFO
                                 // ENOENTs -> zink "couldn't allocate memory heap=0".
-                                let n = drm::nouveau_gem_add_ref(nouveau_handle);
+                                // One reference per importing FILE, not per import:
+                                // see `nouveau_gem_import_ref`.
+                                let n = drm::nouveau_gem_import_ref(nouveau_handle, &drm_file);
                                 // debug-only: this is the SUCCESS path and it is hot
                                 // (every swapchain buffer import). Stay quiet so a
                                 // working stack does not flood the console; the failure
