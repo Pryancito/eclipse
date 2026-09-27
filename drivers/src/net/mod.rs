@@ -122,21 +122,30 @@ pub fn pci_finish_msi_registrations() -> DeviceResult {
     Ok(())
 }
 
-// The RTL8211F PHY/GMAC pair only exists on the D1, so the glue that wires it
-// into the kernel (`rtlx`) is riscv64-only. The driver itself is opened to the
-// host test build as well: it is the largest file in the tree without a test,
-// and behind a bare `target_arch` gate no `cargo test` ever compiled a line of
-// it, so any test written for it would have been run by nobody.
+// The RTL8211F PHY/GMAC pair only exists on the D1, so neither the driver nor
+// the `rtlx` glue above it is built into any other kernel. Both are opened to
+// the host test build all the same: behind a bare `target_arch` gate no
+// `cargo test` ever compiled a line of either, so any test written for them
+// would have been run by nobody.
 cfg_if::cfg_if! {
     if #[cfg(any(target_arch = "riscv64", test))] {
 mod realtek;
     }
 }
 
+// The glue itself comes with the host test build too, for the same reason the
+// driver below it does: behind a bare `target_arch` no `cargo test` compiles a
+// line of it, so nobody could write a test for it and nobody would have run one.
+// Only the module, not the re-export: the public surface on every other target
+// stays exactly what it was.
+cfg_if::cfg_if! {
+    if #[cfg(any(target_arch = "riscv64", test))] {
+mod rtlx;
+    }
+}
+
 cfg_if::cfg_if! {
     if #[cfg(target_arch = "riscv64")] {
-mod rtlx;
-
 pub use rtlx::*;
     }
 }

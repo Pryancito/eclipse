@@ -1779,6 +1779,7 @@ pub(crate) mod fake {
     extern crate std;
 
     use super::*;
+    use crate::net::ProviderImpl;
 
     /// One page each, which is more than any of the four blocks really uses, so
     /// a stray access stays inside its own window where a test can see it.
@@ -1868,6 +1869,83 @@ pub(crate) mod fake {
         }
     }
 
+    // ---------------------------------------------------------------------
+    // What the smoltcp layer above the driver (`net/rtlx.rs`) needs: a way to
+    // raise each of the interrupts `int_enable` arms, a way to see whether one
+    // was acked, and a way to put the transmit ring in the state a stopped DMA
+    // leaves it in. The registers and the ring cursors are private to this file,
+    // so a sibling module can only reach them through here.
+    // ---------------------------------------------------------------------
+
+    /// Leave the interrupt-status register the way the GMAC leaves it when a
+    /// frame has arrived.
+    pub fn raise_rx_interrupt() {
+        write(GMAC_BASE + GETH_INT_STA, RX_INT);
+    }
+
+    /// ... when the transmit FIFO underran, which stops the transmit DMA. One of
+    /// only two interrupts `int_enable` arms.
+    pub fn raise_tx_underflow() {
+        write(GMAC_BASE + GETH_INT_STA, TX_UNF_INT);
+    }
+
+    /// ... when the transmit DMA has stopped.
+    pub fn raise_tx_stopped() {
+        write(GMAC_BASE + GETH_INT_STA, TX_STOP_INT);
+    }
+
+    /// Whether the receive interrupt is still pending, i.e. nobody acked it.
+    pub fn rx_interrupt_pending() -> bool {
+        read(GMAC_BASE + GETH_INT_STA) & RX_INT != 0
+    }
+
+    /// Which interrupts the GMAC is currently armed to raise.
+    pub fn interrupts_armed() -> u32 {
+        read(GMAC_BASE + GETH_INT_EN)
+    }
+
+    /// Forget that the transmit poll-demand doorbell was ever rung.
+    pub fn clear_tx_doorbell() {
+        let value = read(GMAC_BASE + GETH_TX_CTL1);
+        write(GMAC_BASE + GETH_TX_CTL1, value & !0x8000_0000);
+    }
+
+    /// Whether the transmit poll-demand doorbell has been rung since
+    /// [`clear_tx_doorbell`]. This is what restarts a DMA that stopped.
+    pub fn tx_doorbell_rung() -> bool {
+        read(GMAC_BASE + GETH_TX_CTL1) & 0x8000_0000 != 0
+    }
+
+    /// Put the transmit ring in the state a stopped DMA leaves it in: every slot
+    /// handed to the hardware, none of them completed. This is what `can_send`
+    /// answers "no" to, and with the DMA stopped nothing gets it out of it.
+    pub fn fill_tx_ring(nic: &mut RTL8211F<ProviderImpl>) {
+        nic.tx_clean = 0;
+        nic.tx_dirty = DMA_DESC_TX - 1;
+        for desc in nic.send_ring.iter_mut() {
+            desc_set_own(desc);
+        }
+    }
+
+    /// Mark every slot of a filled transmit ring finished, the way the DMA does
+    /// once it is running again.
+    pub fn complete_whole_tx_ring(nic: &mut RTL8211F<ProviderImpl>) {
+        for i in 0..DMA_DESC_TX {
+            complete_tx(nic, i);
+        }
+    }
+
+    /// The transmit ring's two cursors, as (clean, dirty). `clean` is the one
+    /// only `tx_complete` moves.
+    pub fn tx_cursors(nic: &RTL8211F<ProviderImpl>) -> (usize, usize) {
+        (nic.tx_clean, nic.tx_dirty)
+    }
+
+    /// The first `len` bytes sitting in transmit buffer `slot`.
+    pub fn tx_buffer(nic: &RTL8211F<ProviderImpl>, slot: usize, len: usize) -> alloc::vec::Vec<u8> {
+        unsafe { slice::from_raw_parts(nic.send_buffers[slot] as *const u8, len) }.to_vec()
+    }
+
     static PHY: spin::Mutex<Option<Phy>> = spin::Mutex::new(None);
     /// The PHY's `BMCR_RESET` never clears: a PHY with no clock behind it.
     static PHY_RESET_STICKS: core::sync::atomic::AtomicBool =
@@ -1875,6 +1953,48 @@ pub(crate) mod fake {
     /// The MAC's `SOFT_RST` never clears: EMAC clock or power not up yet.
     static MAC_RESET_STICKS: core::sync::atomic::AtomicBool =
         core::sync::atomic::AtomicBool::new(false);
+
+    /// A driver with its rings allocated out of host memory. `new` touches no
+    /// registers, only DMA, so it needs nothing from the fake device.
+    ///
+    /// Here rather than in this file's test module because `net/rtlx.rs` -- the
+    /// smoltcp layer over this driver -- needs the same three fixtures, and a
+    /// `#[cfg(test)] mod tests` is reachable from nowhere else.
+    pub fn driver() -> RTL8211F<ProviderImpl> {
+        RTL8211F::new(&[0x02, 0x11, 0x22, 0x33, 0x44, 0x55])
+    }
+
+    /// Leave a frame in RX descriptor `slot` the way the GMAC leaves one: OWN
+    /// clear, the last-descriptor bit set, no error bits, and the length the
+    /// hardware reports -- which counts the 4-byte FCS the driver strips.
+    pub fn stage_rx(nic: &mut RTL8211F<ProviderImpl>, slot: usize, on_wire: u32, bytes: &[u8]) {
+        let buf = nic.recv_buffers[slot];
+        unsafe {
+            slice::from_raw_parts_mut(buf as *mut u8, bytes.len()).copy_from_slice(bytes);
+        }
+        nic.recv_ring[slot].desc0 = (on_wire << 16) | (1 << 8);
+    }
+
+    pub fn stage_rx_frame(nic: &mut RTL8211F<ProviderImpl>, slot: usize, payload: &[u8]) {
+        stage_rx(nic, slot, payload.len() as u32 + 4, payload);
+    }
+
+    /// Leave a frame in RX descriptor `slot` the way the GMAC leaves one it does
+    /// not want: the error-summary bit set, which is what a CRC error, a runt or
+    /// an MII error looks like by the time the driver sees it.
+    pub fn stage_bad_rx(nic: &mut RTL8211F<ProviderImpl>, slot: usize, payload: &[u8]) {
+        stage_rx_frame(nic, slot, payload);
+        // ES (bit 15) is one of the bits `geth_recv` tests with `& 0x9008`.
+        nic.recv_ring[slot].desc0 |= 1 << 15;
+    }
+
+    /// Mark TX descriptor `slot` finished, the way the DMA does: OWN clear, the
+    /// last-segment bit set, no error bits.
+    pub fn complete_tx(nic: &mut RTL8211F<ProviderImpl>, slot: usize) {
+        nic.send_ring[slot].desc0 = 0;
+        // LS (bit 29 of desc1) is what `desc_get_tx_ls` reads.
+        nic.send_ring[slot].desc1 |= 0b11 << 30;
+    }
 
     pub fn phy_reg(reg: u32) -> u32 {
         PHY.lock().as_ref().map_or(0, |p| p.regs[reg as usize])
@@ -1887,6 +2007,21 @@ pub(crate) mod fake {
     pub(super) fn posted(phys: usize) {
         use core::sync::atomic::Ordering;
 
+        if phys == (GMAC_BASE + GETH_INT_STA) as usize {
+            // The interrupt-status bits are write-1-to-clear: `interrupt_status`
+            // acks by storing back the bits it just read. Plain memory keeps them
+            // set instead, and then nothing can tell an interrupt that was acked
+            // from one that was not -- which is the whole question when a handler
+            // reads the status register for a line that is not its own.
+            //
+            // The store has already landed, so what is sitting in the window now
+            // is exactly the set being acked; and since the driver never acks a
+            // bit it did not just read, nothing is left pending. (Bits above
+            // `0x3FFF` are outside the mask the driver writes, and it never looks
+            // at them either.)
+            write(GMAC_BASE + GETH_INT_STA, 0);
+            return;
+        }
         if phys == (GMAC_BASE + GETH_BASIC_CTL1) as usize {
             let ctl = read(GMAC_BASE + GETH_BASIC_CTL1);
             if ctl & SOFT_RST != 0 && !MAC_RESET_STICKS.load(Ordering::SeqCst) {
@@ -1986,30 +2121,9 @@ mod tests {
     extern crate std;
 
     use super::super::utils::host::CacheOp;
-    use super::fake::{self, Phy};
+    use super::fake::{self, driver, stage_rx, stage_rx_frame, Phy};
     use super::*;
     use crate::net::ProviderImpl;
-
-    /// A driver with its rings allocated out of host memory. `new` touches no
-    /// registers, only DMA, so it needs nothing from the fake device.
-    fn driver() -> RTL8211F<ProviderImpl> {
-        RTL8211F::new(&[0x02, 0x11, 0x22, 0x33, 0x44, 0x55])
-    }
-
-    /// Leave a frame in RX descriptor `slot` the way the GMAC leaves one: OWN
-    /// clear, the last-descriptor bit set, no error bits, and the length the
-    /// hardware reports -- which counts the 4-byte FCS the driver strips.
-    fn stage_rx(nic: &mut RTL8211F<ProviderImpl>, slot: usize, on_wire: u32, bytes: &[u8]) {
-        let buf = nic.recv_buffers[slot];
-        unsafe {
-            slice::from_raw_parts_mut(buf as *mut u8, bytes.len()).copy_from_slice(bytes);
-        }
-        nic.recv_ring[slot].desc0 = (on_wire << 16) | (1 << 8);
-    }
-
-    fn stage_rx_frame(nic: &mut RTL8211F<ProviderImpl>, slot: usize, payload: &[u8]) {
-        stage_rx(nic, slot, payload.len() as u32 + 4, payload);
-    }
 
     // ------------------------------------------------------------------ 802.3x
 
