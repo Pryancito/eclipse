@@ -91,25 +91,23 @@ impl NvmeInterface {
     /// Settle time between I/O retries.
     const IO_RETRY_SETTLE_US: u64 = 50_000;
 
-    pub fn new(bar: usize, irq: usize) -> DeviceResult<NvmeInterface> {
+    /// Bring up the controller whose registers start at `bar`, a window
+    /// `bar_len` bytes long.
+    pub fn new(bar: usize, bar_len: usize, irq: usize) -> DeviceResult<NvmeInterface> {
         // Controller Capabilities: doorbell stride, max queue entries, ready timeout
         let cap = unsafe { read_volatile(bar as *const u64) };
-        let dstrd = ((cap >> 32) & 0xf) as u32;
-        let stride = (4usize) << dstrd;
-        let mqes = (cap & 0xffff) as usize + 1;
-        // CAP.TO is in 500 ms units; keep at least 1 s as a floor.
-        let ready_timeout_us = (((cap >> 24) & 0xff) as u64 * 500_000).max(1_000_000);
+        let window = controller_window(cap, bar_len, IO_QUEUES)?;
         warn!(
-            "[nvme] CAP: {:#x}, DSTRD: {} (stride {}B), MQES: {}, TO: {}us",
-            cap, dstrd, stride, mqes, ready_timeout_us
+            "[nvme] CAP: {:#x}, stride {}B, admin/io queue entries: {}/{}, TO: {}us",
+            cap, window.stride, window.admin_q_size, window.io_q_size, window.ready_timeout_us
         );
 
-        let admin_q_size = mqes.min(32);
-        let io_q_size = mqes.min(128);
-
-        let admin_queue = Arc::new(Mutex::new(NvmeQueue::new(0, admin_q_size)));
+        let stride = window.stride;
+        let ready_timeout_us = window.ready_timeout_us;
+        let admin_queue = Arc::new(Mutex::new(NvmeQueue::new(0, window.admin_q_size)));
         let io_queues = vec![Arc::new(Mutex::new(NvmeQueue::<ProviderImpl>::new(
-            1, io_q_size,
+            1,
+            window.io_q_size,
         )))];
 
         let mut interface = NvmeInterface {
@@ -1198,6 +1196,78 @@ pub const NVME_REG_PMRSWTP: usize = 0x0e10; /* Persistent Memory Region Sustaine
                                              */
 pub const NVME_REG_DBS: usize = 0x1000; /* SQ 0 Tail Doorbell */
 
+/// How many I/O queues this driver creates, besides the admin queue.
+pub const IO_QUEUES: usize = 1;
+
+/// What CAP and the size of BAR 0 decide between them about a controller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ControllerWindow {
+    /// Doorbell stride in bytes, `4 << CAP.DSTRD`.
+    pub stride: usize,
+    /// Entries in the admin queue.
+    pub admin_q_size: usize,
+    /// Entries in each I/O queue.
+    pub io_q_size: usize,
+    /// How long CSTS.RDY is given, in microseconds.
+    pub ready_timeout_us: u64,
+}
+
+/// Read CAP for a controller whose BAR 0 is `bar_len` bytes long.
+///
+/// Every number in here comes out of the controller, and two of them address
+/// something: `MQES` sizes the queues and `DSTRD` places the doorbells. Neither
+/// was checked.
+pub fn controller_window(
+    cap: u64,
+    bar_len: usize,
+    io_queues: usize,
+) -> DeviceResult<ControllerWindow> {
+    let stride = 4usize << ((cap >> 32) & 0xf);
+
+    // MQES is the maximum queue entries *minus one*, so the smallest value a
+    // controller may report is 1, meaning two entries. Zero used to give a
+    // one-entry queue, and a queue with one entry is full as soon as anything
+    // is in it (head == tail is empty, so `size - 1` commands fit): not one
+    // command would ever be submitted, and the driver would sit waiting for a
+    // completion for a command the controller never saw.
+    let mqes = (cap & 0xffff) as usize + 1;
+    if mqes < 2 {
+        warn!(
+            "[nvme] CAP.MQES says {} queue entry; a queue needs at least two",
+            mqes
+        );
+        return Err(DeviceError::NotSupported);
+    }
+
+    // The doorbells start at 0x1000, two per queue, `stride` apart. DSTRD is
+    // four bits, so a controller can ask for a stride of 128 KiB, and the last
+    // doorbell has to be inside BAR 0: the driver writes it on every single
+    // command. Nothing checked, and BAR 0's length was not even passed in ---
+    // a fixed 32 KiB was mapped instead --- so a controller reporting a large
+    // stride had its doorbells written outside its own window.
+    let doorbells = NVME_REG_DBS
+        .checked_add(2 * (io_queues + 1) * stride)
+        .ok_or(DeviceError::InvalidParam)?;
+    if doorbells > bar_len {
+        warn!(
+            "[nvme] {} queues at a doorbell stride of {:#x} need {:#x} bytes and BAR 0 has {:#x}",
+            io_queues + 1,
+            stride,
+            doorbells,
+            bar_len
+        );
+        return Err(DeviceError::NotSupported);
+    }
+
+    Ok(ControllerWindow {
+        stride,
+        admin_q_size: mqes.min(32),
+        io_q_size: mqes.min(128),
+        // CAP.TO is in 500 ms units; keep at least 1 s as a floor.
+        ready_timeout_us: (((cap >> 24) & 0xff) * 500_000).max(1_000_000),
+    })
+}
+
 // NVME CONST
 pub const NVME_CC_ENABLE: u32 = 1 << 0;
 pub const NVME_CC_CSS_NVM: u32 = 0 << 4;
@@ -1257,13 +1327,14 @@ impl PciDriver for NvmeDriverPci {
         mapper: &Option<Arc<dyn IoMapper>>,
         irq: Option<usize>,
     ) -> DeviceResult<Device> {
-        if let Some(BAR::Memory(addr, _len, _, _)) = dev.bars[0] {
-            if let Some(m) = mapper {
-                m.query_or_map(addr as usize, 4096 * 8);
-            }
-            let vaddr = crate::bus::phys_to_virt(addr as usize);
+        if let Some(BAR::Memory(addr, len, _, _)) = dev.bars[0] {
+            // The whole BAR, through the base the mapper returns, and its
+            // length goes to the controller bring-up: see
+            // `bus::resolve_window` and `controller_window`.
+            let len = len as usize;
+            let vaddr = crate::bus::resolve_window(mapper, addr as usize, len, 0);
             let vector = irq.map(|idx| idx + 32).unwrap_or(33);
-            let blk = Arc::new(NvmeInterface::new(vaddr, vector)?);
+            let blk = Arc::new(NvmeInterface::new(vaddr, len, vector)?);
             Ok(Device::Block(blk))
         } else {
             Err(crate::DeviceError::NotSupported)
@@ -1568,5 +1639,141 @@ mod command_tests {
         // check, aiming the transfer at the start of the namespace.
         assert!(check_request(usize::MAX, 512, usize::MAX).is_err());
         assert!(check_request(usize::MAX - 1, 4096, usize::MAX).is_err());
+    }
+}
+
+#[cfg(test)]
+mod cap_tests {
+    //! What the controller says about itself, and what the driver does with it.
+    //!
+    //! CAP is one 64-bit register read out of the device's own BAR, and two of
+    //! its fields address memory: MQES sizes the queues and DSTRD places the
+    //! doorbells the driver writes on every command. Neither was checked, and
+    //! the length of BAR 0 was not even passed in.
+
+    use super::*;
+
+    /// CAP as a controller reports it: `mqes` is the raw field (entries minus
+    /// one), `dstrd` the raw stride exponent, `to` the raw 500 ms units.
+    fn cap(mqes: u64, dstrd: u64, to: u64) -> u64 {
+        (dstrd << 32) | (to << 24) | mqes
+    }
+
+    /// Room for the doorbells of every queue at `stride`, which is what
+    /// [`controller_window`] demands of BAR 0.
+    fn room_for(stride: usize) -> usize {
+        NVME_REG_DBS + 2 * (IO_QUEUES + 1) * stride
+    }
+
+    #[test]
+    fn what_a_normal_controller_reports() {
+        // 2048 entries, the usual 4-byte stride, 15 s to become ready.
+        let w = controller_window(cap(0x7ff, 0, 30), 0x4000, IO_QUEUES).expect("a normal NVMe");
+        assert_eq!(
+            w,
+            ControllerWindow {
+                stride: 4,
+                admin_q_size: 32,
+                io_q_size: 128,
+                ready_timeout_us: 15_000_000,
+            }
+        );
+    }
+
+    #[test]
+    fn a_controller_that_says_one_queue_entry_is_refused() {
+        // A queue of one entry is full the moment anything is in it, so not one
+        // command would ever be submitted and the driver would wait for a
+        // completion the controller never got asked for.
+        assert_eq!(
+            controller_window(cap(0, 0, 30), 0x4000, IO_QUEUES).err(),
+            Some(DeviceError::NotSupported)
+        );
+    }
+
+    #[test]
+    fn two_entries_is_the_smallest_it_accepts() {
+        let w = controller_window(cap(1, 0, 30), 0x4000, IO_QUEUES).expect("two entries");
+        assert_eq!((w.admin_q_size, w.io_q_size), (2, 2));
+    }
+
+    #[test]
+    fn the_queue_sizes_are_clamped_to_what_the_driver_uses() {
+        let w = controller_window(cap(0xffff, 0, 30), 0x4000, IO_QUEUES).expect("65536 entries");
+        assert_eq!((w.admin_q_size, w.io_q_size), (32, 128));
+    }
+
+    #[test]
+    fn a_stride_that_puts_the_doorbells_outside_the_bar_is_refused() {
+        // DSTRD is four bits, so a controller can ask for 4 << 15 = 128 KiB
+        // between doorbells. The driver writes the I/O queue's doorbell at
+        // 0x1000 + 2 * 128 KiB, well past a 16 KiB BAR.
+        assert_eq!(
+            controller_window(cap(0x7ff, 0xf, 30), 0x4000, IO_QUEUES).err(),
+            Some(DeviceError::NotSupported)
+        );
+        // The same controller behind a BAR that does hold them is fine: it is
+        // the window that decides, not the stride on its own.
+        let w = controller_window(cap(0x7ff, 0xf, 30), room_for(4 << 0xf), IO_QUEUES)
+            .expect("a BAR big enough");
+        assert_eq!(w.stride, 4 << 0xf);
+    }
+
+    #[test]
+    fn the_guard_covers_the_doorbell_the_driver_actually_writes() {
+        // `nvme_write_doorbell` puts the submission doorbell at
+        // `0x1000 + 2 * qid * stride` and the completion one a stride further.
+        // For the highest queue id, that last dword has to be inside the room
+        // the guard asks for, and one byte less has to be refused: this is what
+        // keeps the guard and the formula from drifting apart.
+        for dstrd in 0..=3u64 {
+            let stride = 4usize << dstrd;
+            let room = room_for(stride);
+            let w = controller_window(cap(0x7ff, dstrd, 30), room, IO_QUEUES)
+                .expect("exactly enough room");
+            assert_eq!(w.stride, stride);
+            let last_doorbell = NVME_REG_DBS + 2 * IO_QUEUES * w.stride + w.stride;
+            assert!(
+                last_doorbell + 4 <= room,
+                "the last doorbell at {:#x} does not fit in {:#x}",
+                last_doorbell,
+                room
+            );
+            assert!(
+                controller_window(cap(0x7ff, dstrd, 30), room - 1, IO_QUEUES).is_err(),
+                "one byte short of the doorbells was accepted at stride {:#x}",
+                stride
+            );
+        }
+    }
+
+    #[test]
+    fn more_io_queues_need_more_room() {
+        let stride = 4;
+        assert!(controller_window(cap(0x7ff, 0, 30), room_for(stride), 1).is_ok());
+        assert!(controller_window(cap(0x7ff, 0, 30), room_for(stride), 8).is_err());
+    }
+
+    #[test]
+    fn the_ready_timeout_is_five_hundred_milliseconds_a_unit_with_a_floor() {
+        let w = controller_window(cap(0x7ff, 0, 4), 0x4000, IO_QUEUES).unwrap();
+        assert_eq!(w.ready_timeout_us, 2_000_000);
+        // A controller that reports no timeout at all still gets a second:
+        // CSTS.RDY takes as long as it takes.
+        let w = controller_window(cap(0x7ff, 0, 0), 0x4000, IO_QUEUES).unwrap();
+        assert_eq!(w.ready_timeout_us, 1_000_000);
+        // ...and one unit is below the floor too.
+        let w = controller_window(cap(0x7ff, 0, 1), 0x4000, IO_QUEUES).unwrap();
+        assert_eq!(w.ready_timeout_us, 1_000_000);
+    }
+
+    #[test]
+    fn nothing_above_the_four_bits_of_dstrd_reaches_the_stride() {
+        // The bits above DSTRD in CAP are other fields (CSS, MPSMIN, ...): a
+        // stride read too wide would be enormous and the doorbells would land
+        // outside any BAR.
+        let with_rubbish_above = cap(0x7ff, 0, 30) | (0xffff_ffffu64 << 36);
+        let w = controller_window(with_rubbish_above, 0x4000, IO_QUEUES).expect("stride of 4");
+        assert_eq!(w.stride, 4);
     }
 }

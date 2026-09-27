@@ -1,6 +1,6 @@
 use crate::builder::IoMapper;
 use crate::bus::pci_drivers::PciDriver;
-use crate::bus::phys_to_virt;
+use crate::bus::resolve_window;
 use crate::{Device, DeviceError, DeviceResult};
 use alloc::sync::Arc;
 use pci::{PCIDevice, BAR};
@@ -180,33 +180,6 @@ pub fn cap_window(
         return None;
     }
     Some((addr, bar_len, cap.offset as usize))
-}
-
-/// Turn a device-physical window into the virtual address the driver will use.
-///
-/// Goes through the base the mapper *returns*, not through [`phys_to_virt`]: on
-/// riscv a high BAR is mapped at a non-linear sv39 vaddr, so the linear map
-/// would point at unmapped memory and every MMIO access would fault.
-/// `query_or_map` queries an existing mapping first, so calling it once per
-/// capability is safe even when several windows share one BAR. On x86 it hands
-/// back the linear map and this is `phys_to_virt(pa + off)` either way.
-///
-/// Both the modern and the legacy path come through here. The legacy one used
-/// to call `query_or_map`, throw the base away and use `phys_to_virt` anyway,
-/// which is the one thing the paragraph above says does not work.
-pub fn resolve_window(
-    mapper: &Option<Arc<dyn IoMapper>>,
-    pa: usize,
-    len: usize,
-    off: usize,
-) -> usize {
-    match mapper {
-        Some(m) => m
-            .query_or_map(pa, len)
-            .map(|base| base + off)
-            .unwrap_or_else(|| phys_to_virt(pa + off)),
-        None => phys_to_virt(pa + off),
-    }
 }
 
 pub struct VirtIoPciDriver;
@@ -677,57 +650,6 @@ mod tests {
         assert_eq!(
             cap_window(&memory_bars(), cap, COMMON_CFG_LEN),
             Some((0xfe00_0000, 0x4000, 0))
-        );
-    }
-
-    /// A mapper that hands out a base of its own, the way the riscv one does
-    /// for a high BAR, and refuses anything it was not given.
-    struct Sv39Like {
-        pa: usize,
-        base: usize,
-    }
-
-    impl IoMapper for Sv39Like {
-        fn query_or_map(&self, paddr: usize, _size: usize) -> Option<usize> {
-            if paddr == self.pa {
-                Some(self.base)
-            } else {
-                None
-            }
-        }
-    }
-
-    #[test]
-    fn the_address_a_window_resolves_to_is_the_one_the_mapper_gives() {
-        let mapper: Option<Arc<dyn IoMapper>> = Some(Arc::new(Sv39Like {
-            pa: 0xfe00_0000,
-            base: 0xffff_ffc0_0000_0000,
-        }));
-        assert_eq!(
-            resolve_window(&mapper, 0xfe00_0000, 0x4000, 0x1000),
-            0xffff_ffc0_0000_1000,
-            "the offset goes on the mapped base, not on the physical address"
-        );
-    }
-
-    #[test]
-    fn a_window_the_mapper_cannot_map_falls_back_to_the_linear_map() {
-        let mapper: Option<Arc<dyn IoMapper>> = Some(Arc::new(Sv39Like {
-            pa: 0xfe00_0000,
-            base: 0xffff_ffc0_0000_0000,
-        }));
-        // `phys_to_virt` is the identity in the host build.
-        assert_eq!(
-            resolve_window(&mapper, 0xfd00_0000, 0x1000, 0x40),
-            phys_to_virt(0xfd00_0040)
-        );
-    }
-
-    #[test]
-    fn without_a_mapper_a_window_is_the_linear_map() {
-        assert_eq!(
-            resolve_window(&None, 0xfd00_0000, 0x1000, 0x40),
-            phys_to_virt(0xfd00_0040)
         );
     }
 }

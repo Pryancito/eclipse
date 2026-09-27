@@ -1034,10 +1034,8 @@ impl PciDriver for E1000DriverPci {
         irq: Option<usize>,
     ) -> DeviceResult<Device> {
         if let Some(BAR::Memory(addr, len, _, _)) = dev.bars[0] {
-            if let Some(m) = mapper {
-                m.query_or_map(addr as usize, 4096 * 8);
-            }
-            let vaddr = crate::bus::phys_to_virt(addr as usize);
+            // Through the base the mapper returns: see `bus::resolve_window`.
+            let vaddr = crate::bus::resolve_window(mapper, addr as usize, 4096 * 8, 0);
             let name = crate::net::next_eth_ifname();
             let vector = irq.map(|idx| idx + 32).unwrap_or(0);
             let iface = init(name, vector, vaddr, len as usize, 0)?;
