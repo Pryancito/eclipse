@@ -89,6 +89,12 @@ jobs:
           cargo test -p linux-syscall --lib -- --test-threads=1
           cargo test -p kernel-hal --lib -- --test-threads=1
           cargo test -p hunter --lib -- --test-threads=1
+          # The OS side of the vendored NVIDIA RM: 6500 lines of the interface
+          # the RM calls into, in the workspace but named by no job here, so
+          # nothing it answers had ever been executed anywhere but on a real
+          # GPU. Builds on the host without the submodule (build.rs skips the
+          # NVIDIA C and says so).
+          cargo test -p nvidia-rm-sys --lib -- --test-threads=1
           # The VFS trait under every file system: the path walk that follows
           # symlinks (`INode::lookup_follow`). Reached only through `[patch]`,
           # so its tests had never run anywhere.
