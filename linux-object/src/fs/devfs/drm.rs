@@ -82,6 +82,24 @@ pub(crate) fn present_report_counts_for_test() -> (u64, u64) {
 
 /// How often each kind of present gets a line. A full frame is rare enough to
 /// report often; a damage box is not.
+/// A byte count and its unit for the present's cost line: bytes below a KiB,
+/// whole KiB above it.
+///
+/// Truncating dividing by 1024 unconditionally was worse than imprecise, it was
+/// blind exactly where the line is needed: a caret box or a cursor patch reads a
+/// few hundred bytes, so the report read `0KiB flushed for 0KiB read` -- two
+/// zeros, for the small high-frequency updates the damage path exists to serve.
+/// The ratio between the two numbers IS the finding, and a ratio of zeros has
+/// none. Rounding up instead would have kept both numbers at `1KiB` and lost the
+/// ratio the other way.
+fn cost_scaled(bytes: usize) -> (usize, &'static str) {
+    if bytes < 1024 {
+        (bytes, "B")
+    } else {
+        (bytes / 1024, "KiB")
+    }
+}
+
 const FULL_FRAME_REPORT_EVERY: u64 = 64;
 const RECT_REPORT_EVERY: u64 = 512;
 
@@ -3087,14 +3105,18 @@ pub fn scanout_region_checked(
             )
         };
         if n <= 2 || n.is_multiple_of(every) {
+            let flushed = cost_scaled(sync_span_bytes(src_stride, blit_x, blit_y, blit_w, blit_h));
+            let read = cost_scaled(blit_read_bytes(blit_w, blit_h));
             kernel_hal::klog_info!(
-                "[drm] present {} #{}: sync {}us ({}KiB flushed for {}KiB read) + {} blit \
+                "[drm] present {} #{}: sync {}us ({}{} flushed for {}{} read) + {} blit \
                  {}us + cursor {}us ({}x{} at +{}+{})",
                 kind,
                 n,
                 sync_elapsed.as_micros(),
-                sync_span_bytes(src_stride, blit_x, blit_y, blit_w, blit_h) / 1024,
-                blit_read_bytes(blit_w, blit_h) / 1024,
+                flushed.0,
+                flushed.1,
+                read.0,
+                read.1,
                 if blitted_by_ce { "CE" } else { "cpu" },
                 t_blit
                     .saturating_sub(t0)
@@ -8885,6 +8907,31 @@ mod present_cost_tests {
         );
         // And both still report, which is the whole change.
         assert!(FULL_FRAME_REPORT_EVERY > 0 && RECT_REPORT_EVERY > 0);
+    }
+
+    /// The report used to divide by 1024 unconditionally, so a caret box or a
+    /// cursor patch -- a few hundred bytes read -- printed `0KiB flushed for 0KiB
+    /// read`. Two zeros, on exactly the small high-frequency updates the damage
+    /// path exists for, and the ratio between the two numbers is the finding.
+    #[test]
+    fn a_few_hundred_bytes_is_not_reported_as_zero() {
+        assert_eq!(cost_scaled(blit_read_bytes(4, 4)), (64, "B"));
+        assert_eq!(cost_scaled(1), (1, "B"));
+        assert_eq!(cost_scaled(1023), (1023, "B"));
+    }
+
+    /// And a whole frame still reads as a whole frame, so the change did not buy
+    /// the small case by making the big one unreadable.
+    #[test]
+    fn a_frames_worth_is_still_reported_in_kibibytes() {
+        assert_eq!(cost_scaled(1024), (1, "KiB"));
+        assert_eq!(cost_scaled(blit_read_bytes(1920, 1080)), (8100, "KiB"));
+    }
+
+    /// Nothing is nothing, not "less than a KiB of something".
+    #[test]
+    fn no_bytes_at_all_reports_zero_bytes() {
+        assert_eq!(cost_scaled(0), (0, "B"));
     }
 
     /// Neither number overflows on values no framebuffer has, because the line
