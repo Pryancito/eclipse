@@ -2174,7 +2174,11 @@ impl DrmDev {
                     return Err(FsError::OpNotSupported);
                 }
                 let req = unsafe { &mut *(data as *mut DrmSyncobjCreate) };
-                let handle = zcore_drivers::scheme::syncobj::create(
+                // Owned by the calling process: given back when it dies
+                // (`release_process`), and a `DESTROY` from any other
+                // process is ENOENT.
+                let handle = zcore_drivers::scheme::syncobj::create_for(
+                    drm::current_pid(),
                     req.flags & DRM_SYNCOBJ_CREATE_SIGNALED != 0,
                 );
                 req.handle = handle;
@@ -2210,7 +2214,7 @@ impl DrmDev {
                     return Err(FsError::OpNotSupported);
                 }
                 let req = unsafe { &*(data as *const DrmSyncobjDestroy) };
-                if zcore_drivers::scheme::syncobj::destroy(req.handle) {
+                if zcore_drivers::scheme::syncobj::destroy_for(drm::current_pid(), req.handle) {
                     Ok(0)
                 } else {
                     Err(FsError::EntryNotFound)
