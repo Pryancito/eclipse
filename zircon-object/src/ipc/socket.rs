@@ -113,14 +113,20 @@ impl Socket {
         let peer = self.peer.upgrade().ok_or(ZxError::PEER_CLOSED)?;
         let actual_count = peer.write_data(data)?;
         if actual_count > 0 {
+            // One lock at a time, and the same goes for `read` and `get_info`.
+            // This used to hold the PEER's `inner` and then take its own, while
+            // `read` took its own and then the peer's: an endpoint being
+            // written by one thread and read by another (or the two ends used
+            // at the same time) left each thread holding the lock the other was
+            // waiting for. These are spin locks taken with interrupts off, so
+            // that is not a slow path, it is a CPU that never comes back.
+            let peer_rest_size = SOCKET_SIZE - peer.inner.lock().data.len();
+            let write_threshold = self.inner.lock().write_threshold;
             let mut clear = Signal::empty();
-            let peer_inner = peer.inner.lock();
-            let inner = self.inner.lock();
-            let peer_rest_size = SOCKET_SIZE - peer_inner.data.len();
             if peer_rest_size == 0 {
                 clear |= Signal::WRITABLE;
             }
-            if inner.write_threshold > 0 && peer_rest_size < inner.write_threshold {
+            if write_threshold > 0 && peer_rest_size < write_threshold {
                 clear |= Signal::SOCKET_WRITE_THRESHOLD;
             }
             self.base.signal_clear(clear);
@@ -250,21 +256,23 @@ impl Socket {
             self.read_stream(data, peek)?
         };
         if !peek && actual_count > 0 {
-            let inner = self.inner.lock();
+            // One lock at a time: see the note in `write`.
+            let (self_size, read_threshold) = {
+                let inner = self.inner.lock();
+                (inner.data.len(), inner.read_threshold)
+            };
             let mut clear = Signal::empty();
-            if inner.read_threshold > 0 && inner.data.len() < inner.read_threshold {
+            if read_threshold > 0 && self_size < read_threshold {
                 clear |= Signal::SOCKET_READ_THRESHOLD;
             }
-            if inner.data.is_empty() {
+            if self_size == 0 {
                 clear |= Signal::READABLE;
             }
             self.base.signal_clear(clear);
-            if let Ok(peer) = self.peer.upgrade().ok_or(ZxError::PEER_CLOSED) {
+            if let Some(peer) = self.peer.upgrade() {
+                let peer_write_threshold = peer.inner.lock().write_threshold;
                 let mut set = Signal::empty();
-                let peer_inner = peer.inner.lock();
-                if peer_inner.write_threshold > 0
-                    && SOCKET_SIZE - inner.data.len() >= peer_inner.write_threshold
-                {
+                if peer_write_threshold > 0 && SOCKET_SIZE - self_size >= peer_write_threshold {
                     set |= Signal::SOCKET_WRITE_THRESHOLD;
                 }
                 if was_full {
@@ -316,12 +324,16 @@ impl Socket {
 
     /// Get information of the socket.
     pub fn get_info(&self) -> SocketInfo {
-        let inner = self.inner.lock();
-        let self_size = inner.data.len();
-        let rx_buf_available = if self.flags.contains(SocketFlags::DATAGRAM) {
-            *inner.datagram_len.front().unwrap_or(&0)
-        } else {
-            self_size
+        // One lock at a time: see the note in `write`.
+        let (self_size, rx_buf_available) = {
+            let inner = self.inner.lock();
+            let self_size = inner.data.len();
+            let available = if self.flags.contains(SocketFlags::DATAGRAM) {
+                *inner.datagram_len.front().unwrap_or(&0)
+            } else {
+                self_size
+            };
+            (self_size, available)
         };
         let mut info = SocketInfo {
             options: self.flags.bits() as _,
@@ -507,6 +519,58 @@ pub struct SocketInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Both ends of a socket used at once must not wedge. A socket is
+    /// bidirectional, so each side writes its own endpoint and reads it: that
+    /// is the ordinary duplex pattern, one thread per end.
+    ///
+    /// `write` held the PEER's `inner` and then took its own, while `read` and
+    /// `get_info` took their own and then the peer's. So `end0.write` wanted
+    /// (end1, end0) and `end1.write` wanted (end0, end1) -- the same two spin
+    /// locks in opposite orders, and neither thread ever let go. They are
+    /// taken with interrupts off, so it is not a slow path, it is two CPUs
+    /// that never come back.
+    ///
+    /// The watchdog is the point: with the orders crossed this test **hangs**,
+    /// and a hang says nothing. The timeout turns it into a failure with a
+    /// name on it.
+    #[test]
+    fn both_ends_of_a_socket_used_at_once_do_not_wedge() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        const ROUNDS: usize = 50_000;
+        let (end0, end1) = Socket::create(0).unwrap();
+        // Thresholds on both ends, so every round takes the branches that
+        // used to want the other endpoint's lock.
+        for end in [&end0, &end1] {
+            end.set_read_threshold(1).unwrap();
+            end.set_write_threshold(1).unwrap();
+        }
+
+        let (done, finished) = mpsc::channel();
+        let ends = [end0, end1].map(|end| {
+            let done = done.clone();
+            std::thread::spawn(move || {
+                let mut buf = [0u8; 8];
+                for _ in 0..ROUNDS {
+                    let _ = end.write(b"xyz");
+                    let _ = end.read(false, &mut buf);
+                    let _ = end.get_info();
+                }
+                let _ = done.send(());
+            })
+        });
+
+        for _ in 0..2 {
+            finished
+                .recv_timeout(Duration::from_secs(30))
+                .expect("the two ends of one socket deadlocked");
+        }
+        for end in ends {
+            end.join().unwrap();
+        }
+    }
 
     /// The buffer the syscall layer allocates for a read is bounded by the
     /// socket and not by what the caller asked for. The bug: `sys_socket_read`
