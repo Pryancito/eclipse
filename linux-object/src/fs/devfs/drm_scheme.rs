@@ -2876,12 +2876,43 @@ impl DrmDev {
                     return Err(FsError::OpNotSupported);
                 }
                 let req = unsafe { &*(data as *const DrmSyncobjTransfer) };
+                // `drm_syncobj_transfer_ioctl`: the padding first, then
+                // `drm_syncobj_find_fence`, for which WAIT_FOR_SUBMIT is the
+                // only flag. Neither field was read.
+                if req.pad != 0 {
+                    return Err(FsError::InvalidParam);
+                }
+                if req.flags & !DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT != 0 {
+                    return Err(FsError::InvalidParam);
+                }
                 // Both ends must be the caller's (`drm_syncobj_find` on each).
                 if !zcore_drivers::scheme::syncobj::all_usable_by(
                     drm::current_pid(),
                     &[req.dst_handle, req.src_handle],
                 ) {
                     return Err(FsError::EntryNotFound);
+                }
+                // Without WAIT_FOR_SUBMIT the source has to carry a fence at
+                // `src_point` already: `dma_fence_chain_find_seqno` is EINVAL
+                // for a point nothing has submitted, and a syncobj with no
+                // fence at all is EINVAL too (point 0 names the fence there
+                // is). With the flag Linux waits for the submission, which is
+                // what a transfer deferred on its source does here. Every
+                // transfer was deferred, so a client that Linux refuses got a
+                // destination that would signal whenever the source did.
+                if req.flags & DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT == 0 {
+                    let submitted = zcore_drivers::scheme::syncobj::query_submitted(req.src_handle)
+                        .unwrap_or(0);
+                    if submitted < req.src_point.max(1) {
+                        trace_syncobj(
+                            "TRANSFER",
+                            drm::current_pid(),
+                            req.src_handle,
+                            req.src_point,
+                            "source not submitted (EINVAL)",
+                        );
+                        return Err(FsError::InvalidParam);
+                    }
                 }
                 let ok = zcore_drivers::scheme::syncobj::transfer(
                     req.dst_handle,
@@ -3828,9 +3859,7 @@ struct DrmSyncobjTransfer {
     dst_handle: u32,
     src_point: u64,
     dst_point: u64,
-    #[allow(dead_code)]
     flags: u32,
-    #[allow(dead_code)]
     pad: u32,
 }
 
@@ -16750,6 +16779,100 @@ mod syncobj_array_tests {
             c.ioctl(DRM_IOCTL_SYNCOBJ_WAIT, &mut req),
             Err(FsError::InvalidParam)
         );
+    }
+
+    /// `drm_syncobj_transfer_ioctl`: the padding is EINVAL, and so is any
+    /// flag but WAIT_FOR_SUBMIT (`drm_syncobj_find_fence`); without that
+    /// flag the source has to carry a fence at `src_point` already, so a
+    /// source with none, or a timeline point nothing has submitted, is
+    /// EINVAL and the destination is untouched; with it the transfer waits
+    /// for the submission. Neither field was read and every transfer was
+    /// deferred.
+    #[test]
+    fn transfer_reads_its_padding_and_flags_and_wants_a_submitted_source() {
+        let _serialised = drm::test_globals::lock();
+        let _hook = crate::fs::syncobj_eventfd::hardware_fence_tests::TEST_SERIAL.lock();
+        let _on = NouveauOn::new();
+        let c = Client::open(0);
+        let signaled = create(&c, true);
+        let fresh = create(&c, false);
+        let timeline = create(&c, false);
+        let dst = create(&c, false);
+        let transfer = |dst_handle: u32, src_handle: u32, src_point: u64, flags: u32, pad: u32| {
+            let mut req = DrmSyncobjTransfer {
+                src_handle,
+                dst_handle,
+                src_point,
+                dst_point: 0,
+                flags,
+                pad,
+            };
+            c.ioctl(DRM_IOCTL_SYNCOBJ_TRANSFER, &mut req)
+        };
+        let point = |handle: u32| {
+            let mut points = [0xdeadu64];
+            timeline_array(&c, DRM_IOCTL_SYNCOBJ_QUERY, &[handle], &mut points).expect("QUERY");
+            points[0]
+        };
+        let einval = Err(FsError::InvalidParam);
+
+        assert_eq!(transfer(dst, signaled, 0, 0, 1), einval, "padding");
+        for bad in [1u32, 4, 0x8000_0000] {
+            assert_eq!(
+                transfer(dst, signaled, 0, bad, 0),
+                einval,
+                "flags {:#x}",
+                bad
+            );
+        }
+        assert_eq!(
+            transfer(dst, fresh, 0, 0, 0),
+            einval,
+            "a source with no fence"
+        );
+        timeline_array(
+            &c,
+            DRM_IOCTL_SYNCOBJ_TIMELINE_SIGNAL,
+            &[timeline],
+            &mut [3u64],
+        )
+        .expect("TIMELINE_SIGNAL 3");
+        assert_eq!(
+            transfer(dst, timeline, 5, 0, 0),
+            einval,
+            "a point nothing has submitted"
+        );
+        assert_eq!(point(dst), 0, "none of the refused transfers touched dst");
+
+        assert_eq!(transfer(dst, timeline, 3, 0, 0), Ok(0), "a submitted point");
+        assert_eq!(point(dst), 1);
+        let dst2 = create(&c, false);
+        assert_eq!(
+            transfer(dst2, signaled, 0, 0, 0),
+            Ok(0),
+            "a binary with a fence"
+        );
+        assert_eq!(point(dst2), 1);
+
+        // WAIT_FOR_SUBMIT: the transfer waits for point 5 to be submitted.
+        let dst3 = create(&c, false);
+        assert_eq!(
+            transfer(dst3, timeline, 5, DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT, 0),
+            Ok(0)
+        );
+        assert_eq!(point(dst3), 0, "not yet");
+        timeline_array(
+            &c,
+            DRM_IOCTL_SYNCOBJ_TIMELINE_SIGNAL,
+            &[timeline],
+            &mut [5u64],
+        )
+        .expect("TIMELINE_SIGNAL 5");
+        assert_eq!(point(dst3), 1, "and then it lands");
+
+        for h in [signaled, fresh, timeline, dst, dst2, dst3] {
+            destroy(&c, h);
+        }
     }
 
     /// The flag and padding rules of `drm_syncobj.c`, ioctl by ioctl:
