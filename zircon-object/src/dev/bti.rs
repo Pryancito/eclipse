@@ -40,12 +40,18 @@ impl BusTransactionInitiator {
     }
 
     /// Get information of BTI.
+    ///
+    /// Both counts come out of ONE lock. They used to be two calls that each
+    /// took it, so another thread pinning or unpinning in between could leave a
+    /// caller of `zx_object_get_info(ZX_INFO_BTI)` holding a quarantine count
+    /// larger than the total it is a subset of.
     pub fn get_info(&self) -> BtiInfo {
+        let inner = self.inner.lock();
         BtiInfo {
             minimum_contiguity: self.iommu.minimum_contiguity() as u64,
             aspace_size: self.iommu.aspace_size() as u64,
-            pmo_count: self.pmo_count() as u64,
-            quarantine_count: self.quarantine_count() as u64,
+            pmo_count: inner.pmts.len() as u64,
+            quarantine_count: Self::quarantined(&inner) as u64,
         }
     }
 
@@ -124,13 +130,12 @@ impl BusTransactionInitiator {
         self.iommu.clone()
     }
 
-    fn pmo_count(&self) -> usize {
-        self.inner.lock().pmts.len()
-    }
-
-    fn quarantine_count(&self) -> usize {
-        self.inner
-            .lock()
+    /// The tokens this initiator holds that nothing else names any more: the
+    /// pin outlived every handle to it, which is what quarantine means here.
+    /// Takes the guard rather than the lock so a caller can read it together
+    /// with the total.
+    fn quarantined(inner: &BtiInner) -> usize {
+        inner
             .pmts
             .iter()
             .filter(|pmt| Arc::strong_count(pmt) == 1)
@@ -146,4 +151,48 @@ pub struct BtiInfo {
     aspace_size: u64,
     pmo_count: u64,
     quarantine_count: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dev::Iommu;
+    use crate::vm::PAGE_SIZE;
+
+    /// The two counts of `ZX_INFO_BTI` are a total and a subset of it, so they
+    /// have to come out of one snapshot. They used to be two separate locks.
+    #[test]
+    fn the_quarantine_count_is_a_subset_of_the_pin_count() {
+        let vmo = VmObject::new_paged_with_resizable(true, 2);
+        vmo.commit(0, 2 * PAGE_SIZE).unwrap();
+        let bti = BusTransactionInitiator::create(Iommu::create(), 0);
+
+        let info = bti.get_info();
+        assert_eq!((info.pmo_count, info.quarantine_count), (0, 0));
+
+        let pmt = bti
+            .pin(vmo.clone(), 0, PAGE_SIZE, IommuPerms::PERM_READ)
+            .unwrap();
+        let info = bti.get_info();
+        assert_eq!(
+            (info.pmo_count, info.quarantine_count),
+            (1, 0),
+            "a token somebody still holds is pinned, not quarantined",
+        );
+
+        // Dropping the caller's `Arc` without unpinning is what quarantine is:
+        // the initiator's own reference is the last one left.
+        drop(pmt);
+        let info = bti.get_info();
+        assert_eq!(
+            (info.pmo_count, info.quarantine_count),
+            (1, 1),
+            "a token nothing else names is quarantined, and still pinned",
+        );
+        assert!(info.quarantine_count <= info.pmo_count);
+
+        bti.release_quarantine();
+        let info = bti.get_info();
+        assert_eq!((info.pmo_count, info.quarantine_count), (0, 0));
+    }
 }

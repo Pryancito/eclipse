@@ -57,10 +57,27 @@ impl DebugLog {
     /// A reader that fell behind the records the buffer has since dropped
     /// resumes at the oldest one still kept.
     pub fn read(&self, buf: &mut [u8]) -> usize {
+        self.read_within(buf, buf.len()).unwrap_or(0)
+    }
+
+    /// Read one record into `buf`, provided the whole record fits in `limit`
+    /// bytes, and answer `BUFFER_TOO_SMALL` leaving the reader where it was
+    /// when it does not.
+    ///
+    /// A record is the unit of the log: there is no way to ask for the rest of
+    /// one. `zx_debuglog_read` used to read the record and then truncate what
+    /// it copied out to the caller's length, so a caller with a buffer shorter
+    /// than the record got its head and the tail was consumed and gone for
+    /// good -- and a caller passing a length of zero destroyed a record per
+    /// call while being told `SHOULD_WAIT`, that is, that the log was empty.
+    pub fn read_within(&self, buf: &mut [u8], limit: usize) -> ZxResult<usize> {
         let mut offset = self.read_offset.lock();
         let (next, len) = DLOG.lock().read_at(*offset, buf);
+        if len > limit {
+            return Err(ZxError::BUFFER_TOO_SMALL);
+        }
         *offset = next;
-        len
+        Ok(len)
     }
 
     /// Write a log. Data past `DLOG_MAX_DATA` bytes is dropped, as Zircon
@@ -348,6 +365,53 @@ mod tests {
         let (h, _) = next_record(&log, 0x0dd3).unwrap();
         assert!(h.tid > 1, "the first records are gone");
         assert!(*log.read_offset.lock() > base);
+    }
+
+    /// A read that cannot hold the whole record takes nothing: the record is
+    /// the unit of the log, so a truncating read would consume a tail that no
+    /// later read can ask for. `zx_debuglog_read` used to read first and
+    /// truncate after, which lost the tail -- and with a length of zero lost a
+    /// whole record per call while answering that the log was empty.
+    #[test]
+    fn a_short_read_leaves_the_record_where_it_was() {
+        let _turn = TURN.lock();
+        let log = DebugLog::create(0);
+        log.write(Severity::Info, 0, 0, 0x0dd5, b"a whole record or nothing");
+        let mut buf = [0u8; DLOG_MAX_LEN];
+
+        // Drain whatever other tests left in the log before measuring.
+        loop {
+            let len = log.read_within(&mut buf, DLOG_MAX_LEN).unwrap();
+            assert_ne!(len, 0, "the record written above is still in the log");
+            let header = DlogHeader::from_bytes(buf[..HEADER_SIZE].try_into().unwrap());
+            if header.pid == 0x0dd5 {
+                break;
+            }
+        }
+        let offset = *log.read_offset.lock();
+        let record = HEADER_SIZE + align_up_4(b"a whole record or nothing".len());
+
+        for limit in [0, HEADER_SIZE, record - 1] {
+            // Rewind to just before the record and ask with too little room.
+            *log.read_offset.lock() = offset - record;
+            assert_eq!(
+                log.read_within(&mut buf, limit),
+                Err(ZxError::BUFFER_TOO_SMALL),
+                "a limit of {} cannot hold a {}-byte record",
+                limit,
+                record,
+            );
+            assert_eq!(
+                *log.read_offset.lock(),
+                offset - record,
+                "a refused read does not move the reader",
+            );
+        }
+
+        *log.read_offset.lock() = offset - record;
+        let (h, data) = next_record(&log, 0x0dd5).unwrap();
+        assert_eq!(data, b"a whole record or nothing");
+        assert_eq!(h.wire_size(), record);
     }
 
     /// Data past `DLOG_MAX_DATA` is dropped: the record must fit a

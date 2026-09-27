@@ -200,7 +200,13 @@ pub fn frame_alloc(frame_count: usize, align_log2: usize) -> Option<PhysAddr> {
     let ret = start_idx.map(frame_idx_to_phys_addr);
     trace!(
         "frame_alloc_contiguous(): {ret:x?} ~ {end_ret:x?}, align_log2={align_log2}",
-        end_ret = ret.map(|x| x + frame_count),
+        // The end of the RANGE, so the count has to become bytes first. It used
+        // to be `x + frame_count`, a frame count added to a physical address:
+        // for the single-frame requests that are most of this line's traffic
+        // the end read one byte past the start, and for a 512-frame run it read
+        // 512 bytes past it instead of 2 MiB. This line is what one reads to
+        // see which runs the allocator is handing out.
+        end_ret = ret.map(|x| x + (frame_count << PAGE_BITS)),
     );
     ret
 }

@@ -87,7 +87,10 @@ impl Syscall<'_> {
         let proc = self.thread.proc();
         let mut buffer = [0; DLOG_MAX_LEN];
         let dlog = proc.get_object_with_rights::<DebugLog>(handle_value, Rights::READ)?;
-        let actual_len = dlog.read(&mut buffer).min(len);
+        // The whole record or none of it: `min(len)` used to hand back the
+        // head of a record and swallow the rest, which no later read can ask
+        // for again.
+        let actual_len = dlog.read_within(&mut buffer, len)?;
         if actual_len == 0 {
             return Err(ZxError::SHOULD_WAIT);
         }

@@ -895,7 +895,18 @@ impl Task for Thread {
 
     fn resume(&self) {
         let mut inner = self.inner.lock();
-        assert_ne!(inner.suspend_count, 0);
+        // A resume with no suspend behind it used to be an `assert_ne!`, which
+        // is a kernel panic. It is reachable: `Process::suspend` counts on
+        // every thread the process holds at that moment and `Process::resume`
+        // on every thread it holds now, so a thread created in between is
+        // resumed having never been suspended -- and `SuspendToken::create`
+        // takes any `Arc<dyn Task>`, so that pairing is not this crate's to
+        // forbid. There is nothing to undo, and the threads that WERE suspended
+        // still get their resume from the same loop.
+        if inner.suspend_count == 0 {
+            warn!("thread {} resumed with no suspend behind it", self.base.id);
+            return;
+        }
         inner.suspend_count -= 1;
         if inner.suspend_count == 0 {
             let state = inner.state;
@@ -1594,5 +1605,31 @@ mod tests {
         assert_eq!(thread.get_time(), 0);
         thread.time_add(10);
         assert_eq!(thread.get_time(), 10);
+    }
+    /// `Process::suspend` counts on the threads the process holds at that
+    /// moment and `Process::resume` on the threads it holds now, so a thread
+    /// created in between is resumed having never been suspended. That used to
+    /// be an `assert_ne!` in `Thread::resume`, that is a kernel panic, and
+    /// `SuspendToken::create` takes any `Arc<dyn Task>`, process handles
+    /// included.
+    #[test]
+    fn a_thread_born_while_the_process_was_suspended_does_not_panic_on_resume() {
+        let root_job = Job::root();
+        let proc = Process::create(&root_job, "proc").expect("failed to create process");
+        let first = Thread::create(&proc, "first").expect("failed to create thread");
+
+        let task: Arc<dyn Task> = proc.clone();
+        let token = crate::task::SuspendToken::create(&task);
+        let late = Thread::create(&proc, "late").expect("failed to create thread");
+
+        // Dropping the token resumes every thread the process has NOW, and one
+        // of them was never suspended.
+        drop(token);
+
+        // The one that was suspended came back, so a matched pair still
+        // balances, and a bare resume on the other is still nothing to do.
+        first.suspend();
+        first.resume();
+        late.resume();
     }
 }
