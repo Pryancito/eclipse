@@ -221,10 +221,11 @@ impl DrmDev {
     ///
     /// Same split as [`wait_vblank_sleep`]: `io_control` is sync and used to
     /// spin-poll the whole timeout, pegging a core. Here we are in the async
-    /// syscall path, so we poll pending fences, probe with
-    /// [`zcore_drivers::scheme::syncobj::wait_ready`], and sleep ~1 ms (or
-    /// until the deadline) between probes. The sync arm then finishes the
-    /// ioctl (usually on the first iteration).
+    /// syscall path, so we probe with
+    /// [`zcore_drivers::scheme::syncobj::wait_ready`] -- which resolves the
+    /// pending hardware fences itself, under the table lock it takes anyway
+    /// -- and back off between probes ([`fence_poll_wait`]). The sync arm
+    /// then finishes the ioctl (usually on the first iteration).
     pub async fn syncobj_wait_sleep(&self, cmd: u32, data: usize) {
         if !zcore_drivers::display::nouveau_uapi_enabled() {
             return;
@@ -256,7 +257,15 @@ impl DrmDev {
         let deadline = core::time::Duration::from_micros(deadline_us);
         let mut probes = 0u32;
         loop {
-            let _ = zcore_drivers::scheme::syncobj::poll_pending();
+            // No `poll_pending()` in front of this. It takes the syncobj
+            // table lock and runs `resolve_locked` -- and so does
+            // `wait_ready` itself, on the very next line, under the same
+            // lock. Every look of this loop therefore walked the pending
+            // list TWICE, and a walk reads the landing zone of every fence
+            // still in flight out of uncached pinned sysmem. A parked
+            // client takes several looks a frame, so that was several
+            // wasted trips off the CPU per frame, plus a second round on
+            // the one lock the signalling side needs to end the wait.
             match ready_fn(&handles, points.as_deref(), wait_all, deadline_us) {
                 Some(_) => return,
                 None => {
@@ -299,7 +308,10 @@ impl DrmDev {
         let deadline = core::time::Duration::from_micros(deadline_us);
         let mut probes = 0u32;
         loop {
-            let _ = zcore_drivers::scheme::syncobj::poll_pending();
+            // Same as in [`Self::syncobj_wait_sleep`]: `wait_ready` resolves
+            // the pending fences itself, so a `poll_pending()` in front of it
+            // is a second walk of the same list under a second acquisition of
+            // the same lock.
             match zcore_drivers::scheme::syncobj::wait_ready(
                 &handles,
                 Some(&points),
@@ -14817,5 +14829,70 @@ mod trail_tests {
     fn a_null_argument_is_not_read() {
         assert!(!arg_word_readable(0xC010_6440, 0));
         assert_eq!(first_arg_word(0xC010_6440, 0), 0);
+    }
+}
+
+/// The async pre-waits resolve the syncobj table exactly once per look.
+///
+/// `poll_pending()` takes the table lock and runs the module's `resolve_locked`;
+/// so does the `wait_ready()` it used to sit in front of, under the same lock.
+/// Every look of a parked wait therefore walked the pending-fence list twice,
+/// and a walk reads the landing zone of every fence still in flight out of
+/// uncached pinned sysmem -- a trip off the CPU per fence, several looks per
+/// frame, on a desktop where the other CPU is the compositor trying to take
+/// that same lock to end the wait.
+///
+/// There is no unit test that can catch the second call coming back: the pre-
+/// waits need a live `DrmDev`, a process and a GPU, and what they cost is a
+/// count, not an answer. The measurement lives in the glxgears bench in
+/// `drivers` (`a_parked_wait_walks_the_pending_fences_once_a_look_and_not_twice`),
+/// which drives the real `syncobj` module through both shapes; this guards the
+/// shape on the kernel side, where the bench cannot reach.
+///
+/// `syncobj_file.rs` keeps its `poll_pending()` on purpose and is not covered
+/// here: it is followed by `query()`, which reads the table WITHOUT resolving
+/// it, so there the call is the only thing that advances a landed fence.
+#[cfg(test)]
+mod pre_wait_resolve_tests {
+    /// The bodies of the pre-waits that probe with `wait_ready`, from their
+    /// signature to the start of the next item at the same indentation.
+    /// `#[cfg(test)]` cannot delimit them: the first one in this file is on
+    /// line 10, so splitting there would leave nothing to look at and the
+    /// test would pass on anything.
+    fn body<'a>(src: &'a str, signature: &str) -> &'a str {
+        let after = src
+            .split_once(signature)
+            .unwrap_or_else(|| panic!("{} is no longer in this file", signature))
+            .1;
+        let end = after.find("\n    /// ").unwrap_or(after.len());
+        &after[..end]
+    }
+
+    #[test]
+    fn a_pre_wait_does_not_resolve_the_table_twice_per_look() {
+        let src = include_str!("drm_scheme.rs");
+        for name in [
+            "pub async fn syncobj_wait_sleep(",
+            "pub async fn atomic_in_fence_sleep(",
+        ] {
+            let body = body(src, name);
+            assert!(
+                body.contains("wait_ready(") || body.contains("ready_fn("),
+                "{} no longer probes with wait_ready: this test is measuring nothing",
+                name
+            );
+            let hits = body
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .filter(|l| l.contains("poll_pending("))
+                .count();
+            assert_eq!(
+                hits, 0,
+                "a poll_pending() is back in {}: wait_ready already resolves \
+                 the table, so this is a second walk of the pending list and a \
+                 second take of the lock the signalling side needs",
+                name
+            );
+        }
     }
 }

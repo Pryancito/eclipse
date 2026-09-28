@@ -492,9 +492,21 @@ pub fn hw_fence_landed(fence_va: usize, payload: u32) -> bool {
     fence_landed(fence_va, payload)
 }
 
+/// How many times a fence landing zone has been read ([`fence_landed`]).
+///
+/// The unit this counts is not free: the landing zone is pinned sysmem the
+/// GPU writes, mapped uncached, so every read is a round trip off the CPU's
+/// caches -- which is why "how often does a frame walk the pending list"
+/// is worth measuring at all. Test-only: an atomic on this path would make
+/// the measurement change the thing measured.
+#[cfg(test)]
+pub static FENCE_READS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
 /// Whether the GPU has written `payload` (or a later one) into `fence_va`.
 #[inline]
 fn fence_landed(fence_va: usize, payload: u32) -> bool {
+    #[cfg(test)]
+    FENCE_READS.fetch_add(1, Ordering::Relaxed);
     // SAFETY: `fence_va` is a kernel mapping of pinned sysmem published by
     // the driver for exactly this read (`attach_hw_fence`'s contract).
     let v = unsafe { core::ptr::read_volatile(fence_va as *const u32) };
@@ -689,10 +701,25 @@ impl Deferred {
 /// submit fails honestly). Returns the upcalls to make after unlocking.
 fn resolve_locked(table: &mut SyncobjTable) -> Deferred {
     let mut out = Deferred::default();
+    // What each landing zone said the FIRST time this call looked at it, so
+    // the passes below do not ask the same question of the same address
+    // again.
+    //
+    // The fixed point costs a full walk of the pending list per pass, and a
+    // walk reads every fence's landing zone -- pinned sysmem the GPU writes,
+    // mapped uncached, so each read leaves the CPU. What the later passes are
+    // actually re-deciding is not whether a fence LANDED (only the GPU
+    // changes that, and it is free to do so a microsecond after this call
+    // returns, which is why the next probe exists) but whether a fence that
+    // had landed is still HELD behind a node below it. Reading the zone again
+    // to answer the second question is the waste: a client parked on its
+    // acquire semaphore takes several looks a frame, and each look pays for
+    // every pass.
+    let mut seen: Vec<(usize, u32, bool)> = Vec::new();
     // To a fixed point: a link resolving can release a landed fence held
     // behind it, and a fence landing can satisfy a link.
     loop {
-        let hw = resolve_hw_locked(table, &mut out);
+        let hw = resolve_hw_locked(table, &mut out, &mut seen);
         let links = resolve_links_locked(table, &mut out);
         if !(hw || links) {
             break;
@@ -701,9 +728,30 @@ fn resolve_locked(table: &mut SyncobjTable) -> Deferred {
     out
 }
 
+/// [`fence_landed`], answered from `seen` when this `resolve_locked` call has
+/// already read that landing zone.
+///
+/// Keyed by the pair the read is made of, because the pending list is walked
+/// with `swap_remove` and an index does not name the same fence twice.
+fn fence_landed_cached(seen: &mut Vec<(usize, u32, bool)>, fence_va: usize, payload: u32) -> bool {
+    if let Some(&(_, _, landed)) = seen
+        .iter()
+        .find(|&&(va, p, _)| va == fence_va && p == payload)
+    {
+        return landed;
+    }
+    let landed = fence_landed(fence_va, payload);
+    seen.push((fence_va, payload, landed));
+    landed
+}
+
 /// The hardware half of [`resolve_locked`]: take every landed (or timed-out)
 /// fence out of the table and advance its syncobj.
-fn resolve_hw_locked(table: &mut SyncobjTable, out: &mut Deferred) -> bool {
+fn resolve_hw_locked(
+    table: &mut SyncobjTable,
+    out: &mut Deferred,
+    seen: &mut Vec<(usize, u32, bool)>,
+) -> bool {
     if table.pending.is_empty() {
         return false;
     }
@@ -712,7 +760,7 @@ fn resolve_hw_locked(table: &mut SyncobjTable, out: &mut Deferred) -> bool {
     let mut i = 0;
     while i < table.pending.len() {
         let f = table.pending[i];
-        let landed = fence_landed(f.fence_va, f.payload);
+        let landed = fence_landed_cached(seen, f.fence_va, f.payload);
         let timed_out = !landed && now.wrapping_sub(f.submitted_us) >= FENCE_TIMEOUT_US;
         if !(landed || timed_out) {
             i += 1;
@@ -979,6 +1027,21 @@ pub fn abandon_fences(fence_va: usize) -> usize {
         notify_signal(h, p);
     }
     n
+}
+
+/// How many objects the table holds, live and orphaned alike.
+///
+/// Mesa creates and destroys a surrogate syncobj on EVERY frame (the merge of
+/// the previous present and the release, imported into the acquire
+/// semaphore), and a destroyed surrogate that other links still name stays in
+/// the table as an orphan until nothing names it. The table is a `Vec` walked
+/// linearly by handle, so an orphan that is never collected is not a leak
+/// that shows up as memory -- it is a frame-by-frame slowdown of every
+/// syncobj call in the system. Test-only, so a test can pin that it does not
+/// happen.
+#[cfg(test)]
+pub fn table_len() -> usize {
+    TABLE.lock().objects.len()
 }
 
 /// Creates a syncobj, initially at point 0 (or 1 if `signaled`). Returns the
@@ -2402,6 +2465,43 @@ mod tests {
         fn land(&mut self, payload: u32) {
             *self.0 = payload;
         }
+    }
+
+    /// Two fences of the same channel share one landing zone and are told
+    /// apart only by their payload, so the cache [`resolve_locked`] keeps of
+    /// what it has already read must be keyed by BOTH.
+    ///
+    /// This is how a channel really works: the semaphore word is per channel,
+    /// and each RELEASE writes a higher payload into it. Keyed by the address
+    /// alone, the first fence's "landed" would answer for every later one on
+    /// the same channel -- every syncobj of that channel would jump to its
+    /// last point the moment the first frame landed, and a client would go on
+    /// drawing into a buffer the GPU is still reading.
+    #[test]
+    fn one_landing_zone_carries_two_payloads_and_they_resolve_apart() {
+        let _g = test_lock();
+        let early = create(false);
+        let late = create(false);
+        let mut zone = Landing::new();
+        assert!(attach_hw_fence(early, 1, zone.va(), 0, 1, 0, true));
+        assert!(attach_hw_fence(late, 1, zone.va(), 0, 5, 0, true));
+        assert_eq!(pending_now(), 2);
+
+        // The GPU has written 1: the first fence has landed, the second has
+        // not, and one resolve must say exactly that.
+        zone.land(1);
+        poll_pending();
+        assert_eq!(query(early), Some(1), "payload 1 has landed");
+        assert_eq!(
+            query(late),
+            Some(0),
+            "payload 5 answered with payload 1's landing"
+        );
+
+        zone.land(5);
+        poll_pending();
+        assert_eq!(query(late), Some(1));
+        assert!(destroy(early) && destroy(late));
     }
 
     /// A fence given up on after [`FENCE_TIMEOUT_US`] still advances the
