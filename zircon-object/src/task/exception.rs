@@ -1121,4 +1121,180 @@ mod tests {
             assert!(type_.is_synth(), "{:?}", type_);
         }
     }
+    /// A handler that spawns, reads one exception, optionally marks it
+    /// handled, and records that it was reached at all.
+    ///
+    /// The flag is read only after the task has been joined, so what these
+    /// tests assert does not depend on when the executor gets round to it.
+    /// The test this idiom replaces asserted straight after `handle()`
+    /// returned, and a handler that was wrongly reached had usually not run
+    /// yet -- which is why sending the exception on after it was handled
+    /// passed green.
+    fn a_handler(
+        exceptionate: &Arc<Exceptionate>,
+        handle_it: bool,
+        reached: Arc<Mutex<bool>>,
+    ) -> async_std::task::JoinHandle<()> {
+        let channel = exceptionate
+            .create_channel(Rights::DEFAULT_THREAD | Rights::DEFAULT_PROCESS)
+            .unwrap();
+        async_std::task::spawn(async move {
+            let channel_object: Arc<dyn KernelObject> = channel.clone();
+            channel_object
+                .wait_signal(Signal::READABLE | Signal::PEER_CLOSED)
+                .await;
+            let data = match channel.read() {
+                Ok(data) => data,
+                // The exceptionate was shut down without ever sending: this
+                // handler was never reached, which is what the flag says.
+                Err(_) => return,
+            };
+            *reached.lock() = true;
+            let exception = data.handles[0]
+                .object
+                .clone()
+                .downcast_arc::<ExceptionObject>()
+                .unwrap();
+            if handle_it {
+                exception.set_state(1).unwrap();
+            }
+        })
+    }
+
+    /// Once a handler says it handled the exception, the chain is over. The
+    /// next link getting it anyway is a second debugger resuming a thread the
+    /// first one already dealt with, and on the last link it is the process
+    /// being killed for an exception somebody handled.
+    ///
+    /// `handled | first_only` is what ends the chain, and `handled` is the
+    /// half that carries it for every ordinary fault, where `first_only` is
+    /// false: with `&` in its place the chain ran to the end and every test
+    /// stayed green.
+    #[async_std::test]
+    async fn a_handler_that_handles_the_exception_ends_the_chain() {
+        let job = Job::root().create_child().unwrap();
+        let proc = Process::create(&job, "proc").unwrap();
+        let thread = Thread::create(&proc, "thread").unwrap();
+        let exception = Exception::new(&thread, ExceptionType::Synth, None);
+
+        // The chain is: process debugger, thread, process, job, ... The
+        // debugger is left unbound, so the thread is the first link with
+        // anyone listening, and it handles it.
+        let thread_reached = Arc::new(Mutex::new(false));
+        let after_reached = Arc::new(Mutex::new(false));
+        let first = a_handler(&thread.exceptionate(), true, thread_reached.clone());
+        let second = a_handler(&proc.exceptionate(), false, after_reached.clone());
+
+        exception.handle().await;
+
+        thread.exceptionate().shutdown();
+        proc.exceptionate().shutdown();
+        first.await;
+        second.await;
+
+        assert!(*thread_reached.lock(), "the thread handler never got it");
+        assert!(
+            !*after_reached.lock(),
+            "the process handler got an exception the thread handler had already handled"
+        );
+    }
+
+    /// An exception nobody handled kills the process -- but only if it came
+    /// from the hardware. The synthetic ones are the kernel telling a
+    /// debugger something happened (a thread started, a thread exited), and
+    /// nobody is obliged to listen.
+    ///
+    /// Both halves matter and the guard reads them from one `!`: with it
+    /// dropped, a thread starting under no debugger kills the process it is
+    /// starting in, and a page fault nobody handles resumes and faults again.
+    #[async_std::test]
+    async fn only_an_unhandled_hardware_fault_kills_the_process() {
+        let quiet = a_thread();
+        let quiet_proc = quiet.proc().clone();
+        Exception::new(&quiet, ExceptionType::ThreadStarting, None)
+            .handle()
+            .await;
+        assert_ne!(
+            quiet_proc.status(),
+            Status::Exited(TASK_RETCODE_SYSCALL_KILL),
+            "a thread starting with no debugger listening killed its process"
+        );
+
+        let faulted = a_thread();
+        let faulted_proc = faulted.proc().clone();
+        page_fault(&faulted).handle().await;
+        assert_eq!(
+            faulted_proc.status(),
+            Status::Exited(TASK_RETCODE_SYSCALL_KILL),
+            "a page fault nobody handled left the process running"
+        );
+    }
+
+    /// The kind of channel the exception is on is only true while it is out
+    /// with a handler. `zx_exception_get_process` and
+    /// `zx_exception_set_strategy` both answer from it, so a stale kind left
+    /// behind after the handler let go says a thread-level handler is still
+    /// holding an exception that has already moved on.
+    ///
+    /// There is a test for the kind not being left behind when a handler
+    /// *declines*; the path where one actually takes it had none.
+    #[async_std::test]
+    async fn the_channel_kind_goes_back_to_none_once_the_handler_lets_go() {
+        let job = Job::root().create_child().unwrap();
+        let proc = Process::create(&job, "proc").unwrap();
+        let thread = Thread::create(&proc, "thread").unwrap();
+        let exception = Exception::new(&thread, ExceptionType::Synth, None);
+        assert_eq!(exception.current_channel_type(), ExceptionChannelType::None);
+
+        let reached = Arc::new(Mutex::new(false));
+        let handler = a_handler(&thread.exceptionate(), true, reached.clone());
+        exception.handle().await;
+        thread.exceptionate().shutdown();
+        handler.await;
+
+        assert!(*reached.lock(), "the handler never got it");
+        assert_eq!(
+            exception.current_channel_type(),
+            ExceptionChannelType::None,
+            "the exception still names the channel the handler has let go of"
+        );
+    }
+
+    /// A process starting goes to one job debugger, the nearest one, and
+    /// stops there whether or not it was handled. That is what `first_only`
+    /// is for, and `ZX_EXCP_PROCESS_STARTING` is the only caller that passes
+    /// it: every job above the first would otherwise be told about a process
+    /// starting somewhere it does not debug.
+    ///
+    /// Nothing caught it because `first_only` only shows up when the first
+    /// handler *declines*, and every other test here has the first handler
+    /// take the exception.
+    #[async_std::test]
+    async fn only_the_nearest_job_debugger_hears_a_process_starting() {
+        let parent_job = Job::root().create_child().unwrap();
+        let job = parent_job.create_child().unwrap();
+        let proc = Process::create(&job, "proc").unwrap();
+        let thread = Thread::create(&proc, "thread").unwrap();
+        let exception = Exception::new(&thread, ExceptionType::ProcessStarting, None);
+
+        let near = Arc::new(Mutex::new(false));
+        let far = Arc::new(Mutex::new(false));
+        // The nearest debugger takes it and does NOT handle it, which is the
+        // only way the difference shows.
+        let first = a_handler(&job.debug_exceptionate(), false, near.clone());
+        let second = a_handler(&parent_job.debug_exceptionate(), false, far.clone());
+
+        exception.handle().await;
+
+        job.debug_exceptionate().shutdown();
+        parent_job.debug_exceptionate().shutdown();
+        first.await;
+        second.await;
+
+        assert!(*near.lock(), "the nearest job debugger never got it");
+        assert!(
+            !*far.lock(),
+            "a job above the first was told about a process starting under it"
+        );
+    }
 }
