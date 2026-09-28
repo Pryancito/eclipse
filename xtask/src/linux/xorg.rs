@@ -29,9 +29,10 @@
 //!     (e.g. to match a non-Alpine repository whose names differ).
 //!   * `ECLIPSE_KDE=0|off|no|false` — leave out Qt 6 / KF6 / the KDE
 //!     applications (~1.2 GiB of the image).
-//!   * `ECLIPSE_PLASMA=1` — additionally install Plasma's own shell
-//!     (plasmashell, System Settings, kwin). Off by default: see
-//!     [`PLASMA_PACKAGES`] for why it is not a labwc thing.
+//!   * `ECLIPSE_PLASMA=0|off|no|false` — leave out Plasma's own shell
+//!     (plasmashell, System Settings; ~1 GiB more). On by default, because
+//!     `look=plasma` runs `plasmashell` as the panel: see
+//!     [`PLASMA_PACKAGES`].
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -449,24 +450,37 @@ const KDE_PACKAGES: &[&str] = &[
     "spectacle",
 ];
 
-/// Plasma's own shell: the panel (`plasmashell`), the workspace session and
-/// System Settings. OFF by default (`ECLIPSE_PLASMA=1` to add it) for two
-/// reasons, not one:
-///   - it is another ~1 GiB, and it drags in kwin, accountsservice, fprintd
-///     and a pipewire session manager as hard dependencies of
-///     plasma-workspace, none of which can run here (no system bus, no
-///     logind, and the audio stack is PulseAudio);
-///   - the panel's Task Manager speaks `org_kde_plasma_window_management`
-///     and NOTHING ELSE (plasma-workspace/libtaskmanager/waylandtasksmodel.cpp
-///     on current master). labwc implements wlr-layer-shell and
-///     wlr-output-power-management on top of what wlroots ships
-///     (labwc/protocols/meson.build) -- the KDE protocol is not in either --
-///     so under labwc a Plasma panel comes up with a permanently EMPTY window
-///     list. The panel's launcher, clock and system tray do work, because
-///     those are layer-shell + D-Bus.
+/// Plasma's own shell: the panel and desktop (`plasmashell`), the shell
+/// package that gives it a layout, and System Settings. ON by default
+/// (`ECLIPSE_PLASMA=0` drops it) because `look=plasma` execs `plasmashell`
+/// in place of `lunarbar` — without this set that look has nothing to run.
 ///
-/// In other words this set is for running the real Plasma session under
-/// `kwin_wayland`, not for bolting the Plasma panel onto labwc.
+/// Both names are load-bearing and neither is a subset of the other:
+/// `plasma-workspace` is the binary, and `plasma-desktop` is where the
+/// `org.kde.plasma.desktop` Plasma/Shell package lives (its `metadata.json`
+/// carries `"KPackageStructure": "Plasma/Shell"`), so `plasmashell` without
+/// it has no shell to load.
+///
+/// What it costs, stated plainly rather than discovered at boot:
+///   - another ~1 GiB, and `plasma-workspace`'s runtime `depends` pull in
+///     kwin, accountsservice, fprintd, kactivitymanagerd and a
+///     pipewire-session-manager. accountsservice, fprintd and logind want the
+///     **system** bus, which Eclipse does not have, so the user name, the
+///     avatar and the fingerprint page stay empty; kwin is installed and
+///     never run, since labwc is the compositor.
+///   - the panel's Task Manager speaks `org_kde_plasma_window_management` and
+///     NOTHING ELSE — verified against the tag Alpine builds,
+///     `libtaskmanager/waylandtasksmodel.cpp` of plasma-workspace v6.6.5,
+///     whose only protocol include is `qwayland-plasma-window-management.h`.
+///     labwc adds wlr-layer-shell and wlr-output-power-management to what
+///     wlroots ships (labwc/protocols/meson.build) and neither carries the
+///     KDE protocol, so the window list is **permanently empty** under
+///     labwc. The launcher, the clock, the system tray and the desktop do
+///     work: those are layer-shell + D-Bus.
+///
+/// So this is the Plasma panel on labwc, minus the task list. A full Plasma
+/// session (task list included) needs `kwin_wayland` as the compositor, which
+/// is a different decision and not this one.
 const PLASMA_PACKAGES: &[&str] = &["plasma-workspace", "plasma-desktop", "systemsettings"];
 
 /// Whether the build is running as root (euid 0), via `id -u` — no extra crate
@@ -507,13 +521,18 @@ pub(crate) fn kde_enabled() -> bool {
     }
 }
 
-/// Whether Plasma's shell is installed. OFF unless `ECLIPSE_PLASMA` is set to
-/// something that is not a falsey spelling -- the reverse default of every
-/// other knob here, because of what [`PLASMA_PACKAGES`] says.
+/// Whether Plasma's shell is installed. On unless `ECLIPSE_PLASMA` says
+/// otherwise, and gated on [`kde_enabled`] as well: plasmashell against a
+/// rootfs with no Qt 6, no KF6 and no Breeze would start and find nothing, so
+/// `ECLIPSE_KDE=0` takes the shell out with the rest rather than leaving a
+/// `look=plasma` that cannot work.
 fn plasma_enabled() -> bool {
+    if !kde_enabled() {
+        return false;
+    }
     match std::env::var("ECLIPSE_PLASMA") {
         Ok(v) => !knob_off(&v),
-        Err(_) => false,
+        Err(_) => true,
     }
 }
 
@@ -2297,13 +2316,23 @@ mod tests {
         ] {
             assert!(KDE_PACKAGES.contains(&pkg), "KDE_PACKAGES must carry {pkg}");
         }
-        // Plasma's shell is its own set and OFF by default: plasma-workspace
-        // drags in kwin, accountsservice and fprintd, and its panel cannot
-        // list windows under labwc (no org_kde_plasma_window_management).
+        // `look=plasma` execs plasmashell, and plasmashell needs a Plasma/Shell
+        // package to load, which is the second name here. A set that lost
+        // either one would leave that look falling back to lunarbar for a
+        // reason nobody could see from the look file.
+        for pkg in ["plasma-workspace", "plasma-desktop"] {
+            assert!(
+                PLASMA_PACKAGES.contains(&pkg),
+                "PLASMA_PACKAGES must carry {pkg} for look=plasma"
+            );
+        }
+        // Plasma's shell stays its OWN list even though both are on by
+        // default, because `ECLIPSE_PLASMA=0` has to be able to drop ~1 GiB
+        // (kwin, accountsservice, fprintd) and keep the KDE applications.
         for pkg in PLASMA_PACKAGES {
             assert!(
                 !DEFAULT_PACKAGES.contains(pkg) && !KDE_PACKAGES.contains(pkg),
-                "{pkg} would ship by default from another list"
+                "{pkg} would ship from another list, so ECLIPSE_PLASMA=0 could not drop it"
             );
         }
         // One name, one list: a package in two sets is installed twice on

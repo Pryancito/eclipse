@@ -443,7 +443,7 @@ mod tests {
             .map(|e| (e.name, e.ino))
             .collect();
         assert_eq!(entradas.len(), 6);
-        entradas.sort_by(|a, b| a.1.cmp(&b.1));
+        entradas.sort_by_key(|a| a.1);
         let por_inodo: Vec<&str> = entradas.iter().map(|(n, _)| n.as_str()).collect();
         assert_eq!(
             por_inodo,
