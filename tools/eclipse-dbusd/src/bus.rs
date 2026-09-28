@@ -159,7 +159,7 @@ impl Bus {
         if msg.serial == 0 {
             msg.serial = self.next_serial();
         }
-        self.monitor_copy(None, &msg);
+        self.monitor_copy(None, Some(to), &msg);
         self.send(to, msg);
     }
 
@@ -182,7 +182,16 @@ impl Bus {
     /// Give every monitor a copy of `msg`, which has already been stamped with
     /// its real sender. Called once per logical message, not once per
     /// recipient, so a broadcast shows up in `dbus-monitor` exactly once.
-    fn monitor_copy(&mut self, from: Option<u64>, msg: &Message) {
+    ///
+    /// "Exactly once" needs BOTH exclusions and used to have only one. `from`
+    /// keeps a monitor from seeing its own traffic echoed; `to` keeps it from
+    /// seeing a message twice when it is itself the recipient -- once as the
+    /// monitor copy and once as the addressee. The bus answers `BecomeMonitor`
+    /// through `send_from_bus`, which copies to every monitor and then sends to
+    /// the caller, so the very call that turns a connection into a monitor got
+    /// its own METHOD_RETURN twice, and so did every later reply and error the
+    /// bus sent it.
+    fn monitor_copy(&mut self, from: Option<u64>, to: Option<u64>, msg: &Message) {
         let sender_unique = msg.sender.clone().unwrap_or_default();
         let sender_names = from
             .and_then(|id| self.conns.get(&id))
@@ -193,7 +202,12 @@ impl Bus {
             .iter()
             .filter(|(cid, c)| {
                 c.monitor
+                    // Redundant while `dispatch` refuses a monitor's messages
+                    // outright -- `from` is never a monitor today -- and kept
+                    // because it is the exclusion that stops the echo if that
+                    // guard is ever relaxed. It costs one comparison.
                     && Some(**cid) != from
+                    && Some(**cid) != to
                     && (c.monitor_rules.is_empty()
                         || c.monitor_rules
                             .iter()
@@ -234,10 +248,27 @@ impl Bus {
 
     /// Handle one message from connection `id`.
     pub fn dispatch(&mut self, id: u64, mut msg: Message) {
-        let (unique, hello_done) = match self.conns.get(&id) {
-            Some(c) => (c.unique.clone(), c.hello),
+        let (unique, hello_done, is_monitor) = match self.conns.get(&id) {
+            Some(c) => (c.unique.clone(), c.hello, c.monitor),
             None => return,
         };
+
+        // A monitor receives everything and sends nothing. `Conn::monitor` has
+        // said so since it was written and nothing enforced it, so a monitor's
+        // traffic was routed like anybody else's -- and a monitor sees its own
+        // messages come back through `monitor_copy`, which is a feedback loop no
+        // ordinary client can create. dbus-daemon disconnects a monitor that
+        // sends; `Bus` owns no socket, so the nearest thing it can do is refuse
+        // the message and say why.
+        if is_monitor {
+            let e = Message::error(
+                &msg,
+                ERR_ACCESS_DENIED,
+                "A monitor connection may not send messages",
+            );
+            self.send_from_bus(id, e);
+            return;
+        }
 
         // Before Hello the connection has no identity, so nothing can be
         // routed from it and nothing can be routed to it.
@@ -258,7 +289,11 @@ impl Bus {
 
         // The bus stamps the sender on everything: a client cannot forge it.
         msg.sender = Some(unique.clone());
-        self.monitor_copy(Some(id), &msg);
+        // The recipient is not known yet (it depends on the destination), so a
+        // monitor addressed by its own unique name would get two copies. It
+        // cannot be addressed: a monitor is refused above before it can tell
+        // anyone its name, and `BecomeMonitor` gives up the names it had.
+        self.monitor_copy(Some(id), None, &msg);
 
         match msg.destination.as_deref() {
             Some(DBUS_NAME) => self.handle_bus_call(id, &msg),
@@ -328,7 +363,7 @@ impl Bus {
             Arg::Str(new.to_string()),
         ]);
         sig.serial = self.next_serial();
-        self.monitor_copy(None, &sig);
+        self.monitor_copy(None, None, &sig);
         let targets: Vec<u64> = self
             .conns
             .iter()
@@ -693,7 +728,7 @@ impl Bus {
                         let before = c.rules.len();
                         // Remove one instance, like dbus-daemon does: rules are
                         // reference-counted per AddMatch call.
-                        if let Some(pos) = c.rules.iter().position(|r| r.text == rule) {
+                        if let Some(pos) = find_rule(&c.rules, &rule) {
                             c.rules.remove(pos);
                         }
                         c.rules.len() != before
@@ -767,10 +802,59 @@ impl Bus {
     }
 }
 
-/// An empty `a{sv}`: the four-byte length word, zero.
+/// Which of `rules` is the one `text` names, for `RemoveMatch`.
+///
+/// An exact text match wins, because rules are reference-counted per `AddMatch`
+/// call and a client that adds the same string twice must remove it twice.
+/// Failing that, a rule that PARSES the same counts: the comparison used to be
+/// `r.text == rule` alone, so `"type='signal', member='X'"` could not remove
+/// `"type='signal',member='X'"` -- one space -- and the rule stayed for the life
+/// of the connection. Nothing ever reports it: the client believes it
+/// unsubscribed and keeps receiving the traffic, and every message the bus
+/// routes is tested against the rule again for as long as the client lives.
+fn find_rule(rules: &[MatchRule], text: &str) -> Option<usize> {
+    // The fast path picks a different INDEX from the fallback when two
+    // equivalent rules are spelt differently, and never a different rule: both
+    // select the same traffic, so removing either is the same removal. It is
+    // here to keep the common case off the parser, not for the answer.
+    if let Some(pos) = rules.iter().position(|r| r.text == text) {
+        return Some(pos);
+    }
+    let want = MatchRule::parse(text);
+    rules.iter().position(|r| same_rule(r, &want))
+}
+
+/// Do two rules select the same traffic? Everything but the original text.
+fn same_rule(a: &MatchRule, b: &MatchRule) -> bool {
+    a.kind == b.kind
+        && a.sender == b.sender
+        && a.interface == b.interface
+        && a.member == b.member
+        && a.path == b.path
+        && a.path_namespace == b.path_namespace
+        && a.destination == b.destination
+        && a.arg0 == b.arg0
+        && a.arg0namespace == b.arg0namespace
+        && a.unsupported == b.unsupported
+}
+
+/// An empty `a{sv}`: the four-byte length word, zero, and then the padding to
+/// the element's own alignment.
+///
+/// The padding is NOT optional and used to be missing. The specification reads
+/// "a UINT32 giving the length of the array data in bytes, followed by alignment
+/// padding to the alignment boundary of the array element type, followed by each
+/// array element" -- unconditionally, so an empty `a{sv}` is eight bytes and not
+/// four, because `DICT_ENTRY` aligns to 8. The crate's own `Arg::DictSS` writer
+/// has always emitted it (`w.align(8)` before the first entry); this
+/// hand-rolled twin did not, so the two disagreed about the same array and the
+/// bodies of `GetConnectionCredentials` and `GetAll` were four bytes short of
+/// where a reader that follows the spec stops. Tolerated by the readers we could
+/// try, which is exactly why it survived.
 fn empty_dict_body(endian: u8) -> Vec<u8> {
     let mut w = crate::message::Writer::new(endian);
     w.put_u32(0);
+    w.align(8); // DICT_ENTRY
     w.into_bytes()
 }
 
@@ -1204,6 +1288,288 @@ mod tests {
         b.dispatch(1, m);
         let out = take(&mut b);
         assert_eq!(out[0].1.kind, MSG_ERROR);
+    }
+    /// Call one of the bus's own methods with a single string argument.
+    fn bus_call(b: &mut Bus, id: u64, serial: u32, member: &str, arg: &str) {
+        let mut m = Message::method_call(DBUS_NAME, DBUS_PATH, DBUS_NAME, member);
+        m.serial = serial;
+        m.set_body(&[Arg::Str(arg.to_string())]);
+        b.dispatch(id, m);
+    }
+
+    /// A signal from `id` that `type='signal',interface='org.example'` matches.
+    fn example_signal(b: &mut Bus, id: u64, serial: u32) {
+        let mut sig = Message::signal("/org/a", "org.example", "Ping");
+        sig.serial = serial;
+        b.dispatch(id, sig);
+    }
+
+    #[test]
+    fn a_monitor_may_not_send() {
+        // `Conn::monitor` has said "may no longer send" since it was written and
+        // nothing enforced it, so a monitor's own traffic was routed like
+        // anybody else's -- and a monitor gets a copy of every message, its own
+        // included, which is a loop no ordinary client can make. dbus-daemon
+        // disconnects a monitor that sends.
+        let mut b = bus();
+        let one = hello(&mut b, 1);
+        hello(&mut b, 2);
+        let mut m = Message::method_call(DBUS_NAME, DBUS_PATH, DBUS_NAME, "BecomeMonitor");
+        m.serial = 2;
+        b.dispatch(2, m);
+        take(&mut b);
+
+        // A method call from the monitor to a real connection is refused, and
+        // connection 1 hears nothing.
+        let mut call = Message::method_call(&one, "/org/a", "org.example", "M");
+        call.serial = 3;
+        b.dispatch(2, call);
+        let out = take(&mut b);
+        assert!(
+            out.iter().all(|(to, _)| *to == 2),
+            "algo del monitor llego a otro: {out:?}"
+        );
+        assert_eq!(out.len(), 1, "una sola respuesta, el error: {out:?}");
+        assert_eq!(out[0].1.kind, MSG_ERROR);
+        assert_eq!(
+            out[0].1.error_name.as_deref(),
+            Some("org.freedesktop.DBus.Error.AccessDenied")
+        );
+        assert_eq!(out[0].1.reply_serial, Some(3));
+
+        // Not even a signal, which has no destination and would otherwise reach
+        // every subscriber.
+        example_signal(&mut b, 2, 4);
+        let out = take(&mut b);
+        assert!(
+            out.iter().all(|(to, _)| *to == 2),
+            "una senal del monitor se difundio: {out:?}"
+        );
+
+        // And an ordinary connection still works, so the guard is on the monitor
+        // and not on everybody.
+        example_signal(&mut b, 1, 5);
+        let out = take(&mut b);
+        assert!(
+            out.iter().any(|(to, _)| *to == 2),
+            "el monitor dejo de recibir: {out:?}"
+        );
+    }
+
+    #[test]
+    fn a_monitor_sees_every_message_exactly_once() {
+        // The promise on `monitor_copy` is "exactly once", and it used to hold
+        // only for messages the monitor was not itself the recipient of: the
+        // copy went out to every monitor and THEN the message went to its
+        // addressee, so a monitor got two of everything the bus sent it -- the
+        // reply to its own `BecomeMonitor` first of all. In dbus-monitor that
+        // reads as the session saying everything twice.
+        let mut b = bus();
+        hello(&mut b, 1);
+        hello(&mut b, 2);
+        let mut m = Message::method_call(DBUS_NAME, DBUS_PATH, DBUS_NAME, "BecomeMonitor");
+        m.serial = 2;
+        b.dispatch(2, m);
+        let out = take(&mut b);
+        let mine: Vec<_> = out.iter().filter(|(to, _)| *to == 2).collect();
+        assert_eq!(
+            mine.len(),
+            1,
+            "la respuesta a BecomeMonitor, duplicada: {mine:?}"
+        );
+        assert_eq!(mine[0].1.kind, MSG_METHOD_RETURN);
+
+        // A broadcast from somebody else: one copy, and only the monitor copy.
+        example_signal(&mut b, 1, 3);
+        let out = take(&mut b);
+        let mine: Vec<_> = out.iter().filter(|(to, _)| *to == 2).collect();
+        assert_eq!(mine.len(), 1, "la senal, duplicada: {mine:?}");
+
+        // And an error the bus sends the monitor: one copy.
+        bus_call(&mut b, 1, 4, "GetNameOwner", "org.no.Such.Name");
+        take(&mut b);
+        let mut bad = Message::method_call(DBUS_NAME, DBUS_PATH, DBUS_NAME, "NoSuchMethod");
+        bad.serial = 5;
+        b.dispatch(2, bad);
+        let out = take(&mut b);
+        let mine: Vec<_> = out.iter().filter(|(to, _)| *to == 2).collect();
+        assert_eq!(mine.len(), 1, "el error, duplicado: {mine:?}");
+    }
+
+    #[test]
+    fn a_rule_removed_with_different_spacing_is_actually_removed() {
+        // `RemoveMatch` compared the rule TEXT, so one space of difference left
+        // the rule in place for the life of the connection: the client believes
+        // it unsubscribed, keeps receiving the traffic, and every message the bus
+        // routes is tested against the rule again. libdbus compares the parse.
+        let mut b = bus();
+        hello(&mut b, 1);
+        hello(&mut b, 2);
+        bus_call(
+            &mut b,
+            2,
+            2,
+            "AddMatch",
+            "type='signal', interface='org.example'",
+        );
+        take(&mut b);
+        // It is subscribed.
+        example_signal(&mut b, 1, 3);
+        assert!(
+            take(&mut b).iter().any(|(to, _)| *to == 2),
+            "la regla no estaba puesta"
+        );
+
+        bus_call(
+            &mut b,
+            2,
+            4,
+            "RemoveMatch",
+            "type='signal',interface='org.example'",
+        );
+        let out = take(&mut b);
+        assert_eq!(
+            out[0].1.kind, MSG_METHOD_RETURN,
+            "RemoveMatch fallo: {:?}",
+            out[0].1.error_name
+        );
+        assert_eq!(
+            b.conn(2).unwrap().rules.len(),
+            0,
+            "la regla se quedo puesta"
+        );
+        // And the traffic really stops.
+        example_signal(&mut b, 1, 5);
+        assert!(
+            take(&mut b).iter().all(|(to, _)| *to != 2),
+            "sigue recibiendo despues de quitar la regla"
+        );
+    }
+
+    #[test]
+    fn the_same_rule_added_twice_has_to_be_removed_twice() {
+        // Rules are reference-counted per AddMatch call, which is what two
+        // libraries inside one process depend on: GIO and libdbus both subscribe
+        // to NameOwnerChanged, and the first one to unsubscribe must not take
+        // the other's subscription with it.
+        let mut b = bus();
+        hello(&mut b, 1);
+        hello(&mut b, 2);
+        let rule = "type='signal',interface='org.example'";
+        bus_call(&mut b, 2, 2, "AddMatch", rule);
+        bus_call(&mut b, 2, 3, "AddMatch", rule);
+        take(&mut b);
+        assert_eq!(b.conn(2).unwrap().rules.len(), 2);
+
+        bus_call(&mut b, 2, 4, "RemoveMatch", rule);
+        take(&mut b);
+        assert_eq!(b.conn(2).unwrap().rules.len(), 1, "se quitaron las dos");
+        example_signal(&mut b, 1, 5);
+        assert!(
+            take(&mut b).iter().any(|(to, _)| *to == 2),
+            "una sola llamada a RemoveMatch cancelo las dos suscripciones"
+        );
+
+        bus_call(&mut b, 2, 6, "RemoveMatch", rule);
+        take(&mut b);
+        assert_eq!(b.conn(2).unwrap().rules.len(), 0);
+        // A third try is an error, not a silent success.
+        bus_call(&mut b, 2, 7, "RemoveMatch", rule);
+        let out = take(&mut b);
+        assert_eq!(out[0].1.kind, MSG_ERROR);
+        assert_eq!(
+            out[0].1.error_name.as_deref(),
+            Some("org.freedesktop.DBus.Error.MatchRuleNotFound")
+        );
+    }
+
+    #[test]
+    fn a_rule_that_is_not_the_same_rule_is_not_removed() {
+        // The fallback compares what the rule SELECTS, so it must not collapse
+        // two rules that select different traffic -- otherwise RemoveMatch
+        // silently cancels somebody else's subscription.
+        let mut b = bus();
+        hello(&mut b, 1);
+        bus_call(&mut b, 1, 2, "AddMatch", "type='signal',member='A'");
+        take(&mut b);
+        bus_call(&mut b, 1, 3, "RemoveMatch", "type='signal',member='B'");
+        let out = take(&mut b);
+        assert_eq!(out[0].1.kind, MSG_ERROR, "quito una regla distinta");
+        assert_eq!(b.conn(1).unwrap().rules.len(), 1);
+        // Reordered keys ARE the same rule, which is the case the text
+        // comparison could not see either.
+        bus_call(&mut b, 1, 4, "RemoveMatch", "member='A',type='signal'");
+        let out = take(&mut b);
+        assert_eq!(out[0].1.kind, MSG_METHOD_RETURN, "el orden de las claves");
+        assert_eq!(b.conn(1).unwrap().rules.len(), 0);
+
+        // Every field has to count, one at a time: a comparison that dropped
+        // one would let a RemoveMatch cancel a subscription the client never
+        // asked to cancel, and nothing reports that either.
+        let base = "type='signal',sender=':1.9',interface='org.e',member='M',                    path='/p',path_namespace='/n',destination=':1.8',arg0='a',                    arg0namespace='n'";
+        for other in [
+            "type='method_call',sender=':1.9',interface='org.e',member='M',path='/p',path_namespace='/n',destination=':1.8',arg0='a',arg0namespace='n'",
+            "type='signal',sender=':1.7',interface='org.e',member='M',path='/p',path_namespace='/n',destination=':1.8',arg0='a',arg0namespace='n'",
+            "type='signal',sender=':1.9',interface='org.OTRA',member='M',path='/p',path_namespace='/n',destination=':1.8',arg0='a',arg0namespace='n'",
+            "type='signal',sender=':1.9',interface='org.e',member='OTRO',path='/p',path_namespace='/n',destination=':1.8',arg0='a',arg0namespace='n'",
+            "type='signal',sender=':1.9',interface='org.e',member='M',path='/otro',path_namespace='/n',destination=':1.8',arg0='a',arg0namespace='n'",
+            "type='signal',sender=':1.9',interface='org.e',member='M',path='/p',path_namespace='/otro',destination=':1.8',arg0='a',arg0namespace='n'",
+            "type='signal',sender=':1.9',interface='org.e',member='M',path='/p',path_namespace='/n',destination=':1.7',arg0='a',arg0namespace='n'",
+            "type='signal',sender=':1.9',interface='org.e',member='M',path='/p',path_namespace='/n',destination=':1.8',arg0='otro',arg0namespace='n'",
+            "type='signal',sender=':1.9',interface='org.e',member='M',path='/p',path_namespace='/n',destination=':1.8',arg0='a',arg0namespace='otra'",
+            // Unsupported is a field too: a rule the daemon cannot express
+            // selects NOTHING, so it is not the same rule as one that works.
+            "type='signal',sender=':1.9',interface='org.e',member='M',path='/p',path_namespace='/n',destination=':1.8',arg0='a',arg0namespace='n',desconocida='x'",
+        ] {
+            let mut b = bus();
+            hello(&mut b, 1);
+            bus_call(&mut b, 1, 2, "AddMatch", base);
+            take(&mut b);
+            bus_call(&mut b, 1, 3, "RemoveMatch", other);
+            let out = take(&mut b);
+            assert_eq!(
+                out[0].1.kind,
+                MSG_ERROR,
+                "quito la regla con una distinta: {other}"
+            );
+            assert_eq!(b.conn(1).unwrap().rules.len(), 1, "{other}");
+            // And the rule itself still comes off with its own text.
+            bus_call(&mut b, 1, 4, "RemoveMatch", base);
+            let out = take(&mut b);
+            assert_eq!(out[0].1.kind, MSG_METHOD_RETURN, "{other}");
+        }
+    }
+
+    #[test]
+    fn an_empty_dictionary_reply_is_eight_bytes_not_four() {
+        // `GetConnectionCredentials` and `GetAll` answer `a{sv}`, whose body is
+        // the length word AND the padding to the element's alignment: a
+        // DICT_ENTRY is 8-aligned, so an empty one is eight bytes. The daemon
+        // wrote four, four short of where a reader following the spec stops,
+        // while the crate's own `Arg::DictSS` writer has always emitted the
+        // padding -- the same array, two answers.
+        let mut b = bus();
+        hello(&mut b, 1);
+        for (iface, member) in [
+            (DBUS_NAME, "GetConnectionCredentials"),
+            ("org.freedesktop.DBus.Properties", "GetAll"),
+        ] {
+            let mut m = Message::method_call(DBUS_NAME, DBUS_PATH, iface, member);
+            m.serial = 2;
+            m.set_body(&[Arg::Str(":1.1".to_string())]);
+            b.dispatch(1, m);
+            let out = take(&mut b);
+            let r = &out[0].1;
+            assert_eq!(r.kind, MSG_METHOD_RETURN, "{member}: {:?}", r.error_name);
+            assert_eq!(r.signature.as_deref(), Some("a{sv}"), "{member}");
+            assert_eq!(r.body.len(), 8, "{member}: {:?}", r.body);
+            assert_eq!(r.body, vec![0u8; 8], "{member}");
+            // And it is byte-for-byte what the crate's own writer produces for
+            // the same shape, which is the disagreement that let this through.
+            let mut twin = Message::signal("/", "i", "M");
+            twin.set_body(&[Arg::DictSS(Vec::new())]);
+            assert_eq!(r.body, twin.body, "{member}: writer y mano a mano difieren");
+        }
     }
 
     #[test]
