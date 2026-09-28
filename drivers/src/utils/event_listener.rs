@@ -1,5 +1,7 @@
 use alloc::{boxed::Box, vec::Vec};
 
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
 use crate::sync::Mutex;
 
 /// A type alias for the closure to handle device event.
@@ -21,6 +23,24 @@ const MAX_ONCE_HANDLERS: usize = 64;
 pub struct EventListener<T = ()> {
     events: Mutex<Vec<(u64, EventHandler<T>, bool)>>,
     next_id: Mutex<u64>,
+    /// Ids that [`Self::unsubscribe`] could not find because a
+    /// [`Self::trigger`] had the list drained. Empty outside that window.
+    ///
+    /// Locked *after* `events` wherever both are held, and alone in the
+    /// invoke loop, which is what lets a handler unsubscribe from inside a
+    /// handler without deadlocking.
+    cancelled: Mutex<Vec<u64>>,
+    /// How many [`Self::trigger`] calls are between their drain and their
+    /// write-back. Read and written **only under the `events` lock**: that is
+    /// the whole reason the hand-off is race-free, because the same lock is
+    /// what `trigger` takes to drain and `unsubscribe` to retain, so one of
+    /// the two orders always holds and there is no third.
+    firing: AtomicUsize,
+    /// Whether `cancelled` has anything in it. Set and cleared only while its
+    /// lock is held; read on its own so the ordinary event --- nobody
+    /// unsubscribing, which is every event on a healthy device --- does not
+    /// take a second lock per handler from IRQ context.
+    any_cancelled: AtomicBool,
 }
 
 impl<T> EventListener<T> {
@@ -29,6 +49,9 @@ impl<T> EventListener<T> {
         Self {
             events: Mutex::new(Vec::new()),
             next_id: Mutex::new(0),
+            cancelled: Mutex::new(Vec::new()),
+            firing: AtomicUsize::new(0),
+            any_cancelled: AtomicBool::new(false),
         }
     }
 
@@ -61,8 +84,42 @@ impl<T> EventListener<T> {
     }
 
     /// Remove a previously registered handler by id (no-op if already fired).
+    ///
+    /// The `retain` alone is not enough, because [`Self::trigger`] takes the
+    /// whole list out before it calls anybody: an `unsubscribe` landing in
+    /// that window --- a reader's `Drop` on one CPU while a device IRQ fires
+    /// on another --- found an empty list, removed nothing, and the write-back
+    /// then put the handler back. A persistent waker resurrected that way is
+    /// called on **every later event**, which is the delayed page fault the
+    /// docs on [`Self::subscribe`] describe: not a window of microseconds, but
+    /// a handler that outlives its task for good. So the id is noted, and the
+    /// write-back drops it.
+    ///
+    /// What this cannot promise is a call already under way: a handler whose
+    /// turn came before this `retain` may still be running. Waiting for it
+    /// would mean blocking a `Drop` on an IRQ, so the note covers what it can
+    /// --- everything from the next event on.
     pub fn unsubscribe(&self, id: u64) {
-        self.events.lock().retain(|(item_id, _, _)| *item_id != id);
+        // `events` is held across the note on purpose: the write-back below
+        // takes the same two locks in the same order, so it cannot tear the
+        // note down in between and lose this id.
+        let mut events = self.events.lock();
+        events.retain(|(item_id, _, _)| *item_id != id);
+        if self.firing.load(Ordering::Relaxed) > 0 {
+            let mut cancelled = self.cancelled.lock();
+            if !cancelled.contains(&id) {
+                cancelled.push(id);
+                self.any_cancelled.store(true, Ordering::Release);
+            }
+        }
+    }
+
+    /// Whether `id` was taken away while this pass was walking its own list.
+    fn is_cancelled(&self, id: u64) -> bool {
+        if !self.any_cancelled.load(Ordering::Acquire) {
+            return false;
+        }
+        self.cancelled.lock().contains(&id)
     }
 
     /// Send an event to the `EventListener`.
@@ -82,6 +139,9 @@ impl<T> EventListener<T> {
         // the drain; the Vec is allocated once under lock then released).
         let drained: Vec<(u64, EventHandler<T>, bool)> = {
             let mut guard = self.events.lock();
+            // Under the drain's own lock, so an `unsubscribe` that misses the
+            // list is guaranteed to see this instead.
+            self.firing.fetch_add(1, Ordering::Relaxed);
             guard.drain(..).collect()
         };
         let mut kept = Vec::with_capacity(drained.len());
@@ -90,15 +150,33 @@ impl<T> EventListener<T> {
                 core::mem::forget(f);
                 continue;
             }
+            if self.is_cancelled(id) {
+                // Its owner asked for it to go while we were holding it, so it
+                // is no longer ours to call. Dropping it here is what
+                // `unsubscribe`'s own `retain` would have done had it found it.
+                continue;
+            }
             f(&event);
             if !once {
                 kept.push((id, f, once));
             }
         }
+        let mut guard = self.events.lock();
+        // The outermost pass is the one that closes the window, so a handler
+        // that re-triggers from inside a handler does not throw away the note
+        // the pass around it is still going to read.
+        let outermost = self.firing.fetch_sub(1, Ordering::Relaxed) == 1;
+        if self.any_cancelled.load(Ordering::Acquire) {
+            let mut cancelled = self.cancelled.lock();
+            kept.retain(|(id, _, _)| !cancelled.contains(id));
+            if outermost {
+                cancelled.clear();
+                self.any_cancelled.store(false, Ordering::Release);
+            }
+        }
         if kept.is_empty() {
             return;
         }
-        let mut guard = self.events.lock();
         // Preserve any handlers subscribed while we were firing.
         kept.append(&mut *guard);
         *guard = kept;
@@ -111,7 +189,7 @@ impl<T> Default for EventListener<T> {
     }
 }
 
-#[cfg(all(test, feature = "mock"))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use alloc::sync::Arc;
@@ -185,5 +263,203 @@ mod tests {
         );
         listener.trigger(());
         assert_eq!(hits.load(Ordering::SeqCst), 3);
+    }
+
+    /// A reader's future parks a **persistent** waker in the listener and
+    /// unsubscribes when it is dropped, which is what `input/event.rs` does for
+    /// every `evdev` fd. `trigger` empties the list before it calls anybody, so
+    /// an `unsubscribe` that lands in that window finds nothing to remove ---
+    /// and the write-back then puts the handler straight back. From then on the
+    /// listener calls a waker whose task is gone, on every event, for good.
+    #[test]
+    fn a_handler_unsubscribed_while_the_listener_is_firing_does_not_come_back() {
+        let listener = Arc::new(EventListener::<()>::new());
+        let hits = Arc::new(AtomicUsize::new(0));
+
+        let h = hits.clone();
+        let victim = listener
+            .subscribe(
+                Box::new(move |_| {
+                    h.fetch_add(1, Ordering::SeqCst);
+                }),
+                false,
+            )
+            .unwrap();
+
+        // Runs while the listener holds the drained list, exactly as another
+        // CPU's `Drop` would.
+        let weak = Arc::downgrade(&listener);
+        let _ = listener.subscribe(
+            Box::new(move |_| {
+                if let Some(l) = weak.upgrade() {
+                    l.unsubscribe(victim);
+                }
+            }),
+            false,
+        );
+
+        listener.trigger(());
+        listener.trigger(());
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "un handler dado de baja no puede volver a la lista"
+        );
+    }
+
+    /// The same window, seen from the other side: the handler has not had its
+    /// turn yet when its owner takes it away. Calling it at that point is the
+    /// use-after-free the file's own docs describe, so it does not get called.
+    #[test]
+    fn a_handler_unsubscribed_before_its_turn_is_not_called_in_that_pass() {
+        let listener = Arc::new(EventListener::<()>::new());
+        let hits = Arc::new(AtomicUsize::new(0));
+
+        let id_slot = Arc::new(Mutex::new(0u64));
+        let weak = Arc::downgrade(&listener);
+        let slot = id_slot.clone();
+        let _ = listener.subscribe(
+            Box::new(move |_| {
+                if let Some(l) = weak.upgrade() {
+                    l.unsubscribe(*slot.lock());
+                }
+            }),
+            false,
+        );
+
+        let h = hits.clone();
+        let victim = listener
+            .subscribe(
+                Box::new(move |_| {
+                    h.fetch_add(1, Ordering::SeqCst);
+                }),
+                false,
+            )
+            .unwrap();
+        *id_slot.lock() = victim;
+
+        listener.trigger(());
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            0,
+            "el handler ya no era del listener cuando le tocaba"
+        );
+    }
+
+    /// A `once` waker taken away mid-pass is not written back either way, so
+    /// what matters is that it is not *called*.
+    #[test]
+    fn a_once_handler_unsubscribed_mid_pass_is_not_called() {
+        let listener = Arc::new(EventListener::<()>::new());
+        let hits = Arc::new(AtomicUsize::new(0));
+
+        let id_slot = Arc::new(Mutex::new(0u64));
+        let weak = Arc::downgrade(&listener);
+        let slot = id_slot.clone();
+        let _ = listener.subscribe(
+            Box::new(move |_| {
+                if let Some(l) = weak.upgrade() {
+                    l.unsubscribe(*slot.lock());
+                }
+            }),
+            false,
+        );
+
+        let h = hits.clone();
+        let victim = listener
+            .subscribe(
+                Box::new(move |_| {
+                    h.fetch_add(1, Ordering::SeqCst);
+                }),
+                true,
+            )
+            .unwrap();
+        *id_slot.lock() = victim;
+
+        listener.trigger(());
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+    }
+
+    /// The bookkeeping the fix needs must not become the growth the cap and
+    /// `unsubscribe` exist to prevent: outside a `trigger` there is no window,
+    /// so an unsubscribe has nothing to remember.
+    #[test]
+    fn unsubscribing_outside_a_trigger_remembers_nothing() {
+        let listener = EventListener::<()>::new();
+        for _ in 0..10_000 {
+            let id = listener.subscribe(Box::new(|_| {}), true).unwrap();
+            listener.unsubscribe(id);
+        }
+        assert_eq!(listener.events.lock().len(), 0);
+        assert_eq!(
+            listener.cancelled.lock().len(),
+            0,
+            "sin trigger en curso no hay nada que anotar"
+        );
+    }
+
+    /// And inside a `trigger` it is remembered only until that `trigger` ends:
+    /// a device that fires once a second must not carry one id per reader that
+    /// ever closed.
+    #[test]
+    fn the_cancel_note_is_torn_down_with_the_trigger_that_needed_it() {
+        let listener = Arc::new(EventListener::<()>::new());
+        let victim = listener.subscribe(Box::new(|_| {}), false).unwrap();
+        let weak = Arc::downgrade(&listener);
+        let _ = listener.subscribe(
+            Box::new(move |_| {
+                if let Some(l) = weak.upgrade() {
+                    l.unsubscribe(victim);
+                }
+            }),
+            false,
+        );
+
+        listener.trigger(());
+        assert_eq!(
+            listener.cancelled.lock().len(),
+            0,
+            "la nota muere con el trigger que la necesitaba"
+        );
+    }
+
+    /// A handler that triggers the listener again must not tear that note down
+    /// from under the pass that is still walking its own drained list.
+    #[test]
+    fn a_nested_trigger_does_not_throw_away_the_outer_passs_note() {
+        let listener = Arc::new(EventListener::<()>::new());
+        let hits = Arc::new(AtomicUsize::new(0));
+
+        let h = hits.clone();
+        let victim = listener
+            .subscribe(
+                Box::new(move |_| {
+                    h.fetch_add(1, Ordering::SeqCst);
+                }),
+                false,
+            )
+            .unwrap();
+
+        let weak = Arc::downgrade(&listener);
+        let _ = listener.subscribe(
+            Box::new(move |_| {
+                if let Some(l) = weak.upgrade() {
+                    l.unsubscribe(victim);
+                    // Re-entrant: this inner pass finishes first, and its
+                    // write-back must leave the outer one's note alone.
+                    l.trigger(());
+                }
+            }),
+            false,
+        );
+
+        listener.trigger(());
+        let after_first = hits.load(Ordering::SeqCst);
+        listener.trigger(());
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            after_first,
+            "el victim no puede sobrevivir al trigger anidado"
+        );
     }
 }
