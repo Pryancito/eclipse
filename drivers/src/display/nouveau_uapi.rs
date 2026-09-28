@@ -700,7 +700,7 @@ pub(super) fn decode_ioc(request: u32) -> (u32, u32, u32) {
 /// implement -- so a trace names what Mesa wanted instead of a bare number.
 /// NR is `DRM_COMMAND_BASE + DRM_NOUVEAU_*`; returns `"unknown"` for anything
 /// outside nouveau's private range.
-pub(super) fn nouveau_ioctl_name(nr: u32) -> &'static str {
+pub fn nouveau_ioctl_name(nr: u32) -> &'static str {
     match nr.wrapping_sub(DRM_COMMAND_BASE) {
         DRM_NOUVEAU_GETPARAM => "GETPARAM",
         0x01 => "SETPARAM(deprecated)",

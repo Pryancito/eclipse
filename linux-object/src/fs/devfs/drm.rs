@@ -6700,6 +6700,19 @@ pub(super) fn current_pid() -> u64 {
         .unwrap_or(0)
 }
 
+/// The thread id of the caller, or 0 when there is no current thread.
+///
+/// Only the crash-time ioctl trail wants this: a compositor drives the GPU
+/// from more than one thread, and which one issued the last call before a
+/// fault is half of telling a render thread's crash from the main loop's.
+pub(super) fn current_tid() -> u64 {
+    use zircon_object::object::KernelObject;
+    kernel_hal::thread::get_current_thread()
+        .and_then(|t| t.downcast::<zircon_object::task::Thread>().ok())
+        .map(|t| t.id())
+        .unwrap_or(0)
+}
+
 /// Release every GEM object owned by `pid`, plus any framebuffer that was built
 /// on one. Called once per process teardown.
 ///
