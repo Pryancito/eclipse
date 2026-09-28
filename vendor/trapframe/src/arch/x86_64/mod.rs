@@ -155,6 +155,20 @@ pub unsafe fn init_ap() {
     syscall::init();
 }
 
+/// The `RFLAGS` bits the CPU clears on every `syscall` (written to `SFMASK`).
+///
+/// `TF|IF|DF|IOPL|NT|AC`, the set Linux uses. Two of them are not comfort:
+/// **`IF`** means the kernel entry stub runs with interrupts off until it has
+/// swapped to the kernel stack -- an interrupt taken on the user stack with
+/// the kernel `GS` half-swapped is not recoverable -- and **`DF`** means the
+/// kernel's `rep movs`/`stos` (every `memcpy` in it) count upwards, whatever
+/// direction the user program left the flag in. A `syscall` from a program
+/// that set `DF` would otherwise run the kernel's string ops backwards.
+///
+/// Defined here rather than inside [`syscall::init`] so a test can read it:
+/// nothing else in the build would notice a bit falling out of it.
+pub const SYSCALL_RFLAGS_MASK: u64 = 0x4_7700;
+
 /// User space context
 #[derive(Debug, Default, Clone, Copy, Eq, PartialEq)]
 #[repr(C)]
@@ -276,5 +290,201 @@ impl UserContext {
     /// Set tls pointer
     pub fn set_tls(&mut self, tls: usize) {
         self.general.fsbase = tls;
+    }
+}
+
+#[cfg(test)]
+mod layout_tests {
+    //! The contract between these structs and the assembly that fills them.
+    //!
+    //! `syscall.S` and `trap.S` build a [`UserContext`] on the stack by pushing
+    //! registers in a fixed order and then addressing the result by hardcoded
+    //! slot numbers -- `[rsp + 18*8]` for `fsbase`, `add rsp, 22*8` to step
+    //! over the whole frame, `gs:4` and `gs:12` for the kernel and scratch
+    //! stack pointers in the TSS. Nothing in the build checks any of it: add a
+    //! field to `GeneralRegs`, reorder two, or take a dependency bump that
+    //! moves a field in the `x86_64` crate's TSS, and the assembly keeps
+    //! compiling and starts writing the wrong register on every syscall.
+    //!
+    //! These tests are that check. They are cheap and they are the only thing
+    //! standing between the two halves.
+
+    use super::*;
+    use core::mem::{align_of, offset_of, size_of};
+
+    /// Every `GeneralRegs` field, in the order the entry stubs push them, with
+    /// the slot number the assembly uses to reach it.
+    const SLOTS: [(&str, usize, usize); 20] = [
+        ("rax", offset_of!(GeneralRegs, rax), 0),
+        ("rbx", offset_of!(GeneralRegs, rbx), 1),
+        ("rcx", offset_of!(GeneralRegs, rcx), 2),
+        ("rdx", offset_of!(GeneralRegs, rdx), 3),
+        ("rsi", offset_of!(GeneralRegs, rsi), 4),
+        ("rdi", offset_of!(GeneralRegs, rdi), 5),
+        ("rbp", offset_of!(GeneralRegs, rbp), 6),
+        ("rsp", offset_of!(GeneralRegs, rsp), 7),
+        ("r8", offset_of!(GeneralRegs, r8), 8),
+        ("r9", offset_of!(GeneralRegs, r9), 9),
+        ("r10", offset_of!(GeneralRegs, r10), 10),
+        ("r11", offset_of!(GeneralRegs, r11), 11),
+        ("r12", offset_of!(GeneralRegs, r12), 12),
+        ("r13", offset_of!(GeneralRegs, r13), 13),
+        ("r14", offset_of!(GeneralRegs, r14), 14),
+        ("r15", offset_of!(GeneralRegs, r15), 15),
+        ("rip", offset_of!(GeneralRegs, rip), 16),
+        ("rflags", offset_of!(GeneralRegs, rflags), 17),
+        ("fsbase", offset_of!(GeneralRegs, fsbase), 18),
+        ("gsbase", offset_of!(GeneralRegs, gsbase), 19),
+    ];
+
+    #[test]
+    fn every_general_register_sits_in_the_slot_the_assembly_reaches_for() {
+        for (name, offset, slot) in SLOTS {
+            assert_eq!(
+                offset,
+                slot * 8,
+                "{} esta en el byte {} y el ensamblador lo lee en el {}",
+                name,
+                offset,
+                slot * 8
+            );
+        }
+        // The two the stubs name outright: `mov [rsp + 18*8], eax` writes the
+        // low half of `FSBASE` and `[rsp + 19*8]` the low half of `KERNEL_GS`.
+        assert_eq!(offset_of!(GeneralRegs, fsbase), 18 * 8);
+        assert_eq!(offset_of!(GeneralRegs, gsbase), 19 * 8);
+        assert_eq!(
+            size_of::<GeneralRegs>(),
+            SLOTS.len() * 8,
+            "hay un hueco o un campo de mas: el marco ya no son {} slots",
+            SLOTS.len()
+        );
+    }
+
+    #[test]
+    fn the_trap_frame_is_the_twenty_two_slots_the_stubs_step_over() {
+        // Both stubs do `add rsp, 22*8` to get from the bottom of the frame to
+        // its top, and push `error_code` then `trap_num` on top of the general
+        // registers. A frame of any other size leaves `rsp` inside it.
+        assert_eq!(offset_of!(UserContext, general), 0);
+        assert_eq!(offset_of!(UserContext, trap_num), 20 * 8);
+        assert_eq!(offset_of!(UserContext, error_code), 21 * 8);
+        assert_eq!(
+            offset_of!(UserContext, error_code) + 8,
+            22 * 8,
+            "el `add rsp, 22*8` de syscall.S y trap.S ya no salta el marco entero"
+        );
+    }
+
+    #[test]
+    fn the_stack_pointers_are_where_gs_4_and_gs_12_point() {
+        // `swapgs` puts this CPU's TSS at `gs`, and the entry stub does
+        // `mov gs:12, rsp` (stash the user stack in the unused ring-1 slot)
+        // and `mov rsp, gs:4` (load the ring-0 stack). Both are offsets into
+        // the `x86_64` crate's TSS, which is a dependency we do not own.
+        use x86_64::structures::tss::TaskStateSegment;
+        assert_eq!(
+            offset_of!(TaskStateSegment, privilege_stack_table),
+            4,
+            "gs:4 ya no es el puntero de pila de anillo 0"
+        );
+        // `privilege_stack_table[1]`, the ring-1 slot the stub borrows.
+        assert_eq!(
+            offset_of!(TaskStateSegment, privilege_stack_table) + 8,
+            12,
+            "gs:12 ya no es el hueco donde se guarda la pila de usuario"
+        );
+        assert_eq!(
+            size_of::<TaskStateSegment>(),
+            104,
+            "un TSS de 64 bits son 104 bytes, y `iomap_base` se calcula con eso"
+        );
+    }
+
+    #[test]
+    fn the_extended_state_area_is_where_xsave_may_write_it() {
+        // `UserContext::run` issues `xsave`/`xrstor` straight at `self.fpstate`.
+        // Both fault with #GP on an address that is not 64-byte aligned, so
+        // this is not a preference: it is the instruction's precondition, and
+        // the alignment has to survive `UserContext` being moved or boxed.
+        assert_eq!(align_of::<FpState>(), 64);
+        assert_eq!(align_of::<UserContext>(), 64);
+        assert_eq!(
+            offset_of!(UserContext, fpstate) % 64,
+            0,
+            "xsave sobre este contexto lanza #GP"
+        );
+        // Legacy x87/SSE region (512) + XSAVE header (64) + YMM_Hi (256).
+        assert!(
+            size_of::<FpState>() >= 512 + 64 + 256,
+            "el area no cubre los YMM altos y XSAVE escribe fuera"
+        );
+    }
+
+    #[test]
+    fn a_fresh_context_starts_with_the_control_words_the_cpu_demands() {
+        let fresh = UserContext::default();
+        let area = &fresh.fpstate.0;
+        // FXRSTOR and XRSTOR load these straight into the CPU. A zeroed FCW
+        // unmasks every x87 exception and a zeroed MXCSR unmasks every SSE
+        // one, so the first user floating-point instruction traps.
+        assert_eq!(
+            u16::from_le_bytes([area[0], area[1]]),
+            0x037F,
+            "el FCW de un hilo nuevo no es el que deja `fninit`"
+        );
+        assert_eq!(
+            u16::from_le_bytes([area[24], area[25]]),
+            0x1F80,
+            "el MXCSR de un hilo nuevo desenmascara excepciones de SSE"
+        );
+        // The XSAVE header: XSTATE_BV = 0 (every component in its init state)
+        // and XCOMP_BV = 0 (standard layout). Bit 63 of XCOMP_BV would ask for
+        // the compacted format, which is not what `run` writes.
+        assert!(
+            area[512..576].iter().all(|&b| b == 0),
+            "la cabecera XSAVE de un hilo nuevo no esta en blanco"
+        );
+    }
+
+    #[test]
+    fn the_syscall_mask_clears_the_two_flags_the_kernel_cannot_run_with() {
+        const TF: u64 = 1 << 8;
+        const IF: u64 = 1 << 9;
+        const DF: u64 = 1 << 10;
+        const IOPL: u64 = 3 << 12;
+        const NT: u64 = 1 << 14;
+        const AC: u64 = 1 << 18;
+        assert_eq!(
+            SYSCALL_RFLAGS_MASK & IF,
+            IF,
+            "el stub de entrada corre con interrupciones puestas"
+        );
+        assert_eq!(
+            SYSCALL_RFLAGS_MASK & DF,
+            DF,
+            "un programa que deje DF puesto hace que el kernel copie hacia atras"
+        );
+        assert_eq!(SYSCALL_RFLAGS_MASK, TF | IF | DF | IOPL | NT | AC);
+    }
+
+    #[test]
+    fn a_syscalls_arguments_come_out_of_the_registers_the_abi_names() {
+        // The fourth one is `r10`, not `rcx`: `syscall` puts the return
+        // address in `rcx` before the kernel ever sees the frame.
+        let mut cx = UserContext::default();
+        cx.general.rdi = 1;
+        cx.general.rsi = 2;
+        cx.general.rdx = 3;
+        cx.general.r10 = 4;
+        cx.general.r8 = 5;
+        cx.general.r9 = 6;
+        cx.general.rcx = 0xdead_beef;
+        assert_eq!(cx.get_syscall_args(), [1, 2, 3, 4, 5, 6]);
+        cx.general.rax = 42;
+        assert_eq!(cx.get_syscall_num(), 42);
+        cx.set_syscall_ret(7);
+        assert_eq!(cx.get_syscall_ret(), 7);
+        assert_eq!(cx.general.rax, 7, "el valor de retorno no vuelve en rax");
     }
 }

@@ -1379,6 +1379,24 @@ fn write_firefox_wrapper(rootfs: &Path) {
 /// the vendored `alloc_block` was wired in that was a kernel panic rather
 /// than ENOSPC. Keep the memory cache; turn the disk cache off.
 ///
+/// Video is the other thing tuned here. Everything in this image runs on the
+/// CPU: there is no hardware video decoder, WebRender is the software one, and
+/// the kernel's own overhead lands on the same cores. YouTube asks the browser
+/// which codecs Media Source Extensions can play and picks the most efficient
+/// for bandwidth -- AV1, then VP9 -- which are also the most expensive to
+/// decode in software. With the CPU pinned at 97% YouTube Music never got past
+/// the buffering spinner. With AV1 off and VP9 off for MSE, YouTube falls back
+/// to H.264, which Firefox decodes through the system `libavcodec`
+/// (`ffmpeg7-libavcodec`, a runtime dependency of Alpine's `firefox-esr`, so it
+/// is always there). A `<video>` pointing at a plain VP9 or AV1 file still
+/// plays: only what MSE advertises changes.
+///
+/// HTTP/3 is off for the same machine. QUIC runs over UDP, and a UDP socket
+/// here holds a fixed 64 KiB while TCP's holds 512 KiB; when the CPU is
+/// saturated, the thread that drains the socket runs late and QUIC's packets
+/// are dropped at the socket, which QUIC reads as congestion and slows down.
+/// HTTP/2 over TCP carries the same streams without that cliff.
+///
 /// Both package names are covered because `firefox` and `firefox-esr` are
 /// separate Alpine packages with separate install dirs (see the wrapper).
 /// Nothing is written when neither is installed in the rootfs -- which is
@@ -1401,7 +1419,15 @@ pub fn write_firefox_default_prefs(rootfs: &Path) {
               // headroom: no on-disk cache (the memory cache stays on).\n\
               pref(\"browser.cache.disk.enable\", false);\n\
               pref(\"browser.cache.disk.smart_size.enabled\", false);\n\
-              pref(\"browser.cache.disk.capacity\", 0);\n",
+              pref(\"browser.cache.disk.capacity\", 0);\n\
+              // No hardware video decoder and a CPU-only compositor: make\n\
+              // YouTube and other MSE players pick H.264 (system libavcodec)\n\
+              // over AV1 and VP9, the costliest codecs to decode in software.\n\
+              pref(\"media.av1.enabled\", false);\n\
+              pref(\"media.mediasource.vp9.enabled\", false);\n\
+              // QUIC over a 64 KiB UDP socket drops packets when the CPU is\n\
+              // busy; HTTP/2 over TCP carries the same streams.\n\
+              pref(\"network.http.http3.enable\", false);\n",
         )
         .unwrap();
     }
@@ -2852,6 +2878,38 @@ fn write_labwc_wrapper(rootfs: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The prefs every profile reads (`defaults/pref/eclipse-os.js`), for
+    /// both install dirs. The media and HTTP/3 lines are what make YouTube
+    /// play on a CPU-only machine; see `write_firefox_default_prefs`.
+    #[test]
+    fn firefox_prefers_h264_and_http2_on_a_cpu_only_machine() {
+        let dir =
+            std::env::temp_dir().join(format!("eclipse-ff-prefs-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        for (_, app) in FIREFOX_PACKAGES {
+            fs::create_dir_all(dir.join(app)).unwrap();
+        }
+        write_firefox_default_prefs(&dir);
+        for (pkg, app) in FIREFOX_PACKAGES {
+            let prefs =
+                fs::read_to_string(dir.join(app).join("defaults/pref/eclipse-os.js")).unwrap();
+            for line in [
+                "pref(\"browser.cache.disk.enable\", false);\n",
+                "pref(\"media.av1.enabled\", false);\n",
+                "pref(\"media.mediasource.vp9.enabled\", false);\n",
+                "pref(\"network.http.http3.enable\", false);\n",
+            ] {
+                assert!(prefs.contains(line), "{pkg}: missing {line:?} in\n{prefs}");
+            }
+            // H.264 is what is left: nothing here may turn system ffmpeg off.
+            assert!(
+                !prefs.contains("media.ffmpeg.enabled"),
+                "{pkg}: H.264 comes from system libavcodec, keep it on"
+            );
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
 
     /// The two session wrappers must be valid POSIX shell (`sh -n`), and the
     /// GTK-caches oneshot must compile schemas and write the private pixbuf

@@ -60,6 +60,19 @@ jobs:
           # build compiled nothing but no-op shims. A `cargo test` build now
           # compiles the real thing against a host interrupt backend.
           cargo test -p lock --lib -- --test-threads=1
+          # `vendor/trapframe` is the other `[patch]`ed vendor crate, and the
+          # one the kernel cannot take a single trap without: the GDT, the TSS,
+          # the IDT, the syscall MSRs and the entry stubs that build a
+          # `UserContext` on the stack. It is in the workspace `exclude`, so
+          # the bare `cargo test` above does not reach it, and the only line in
+          # this file that did name it -- "Verify native AArch64 fncall ABI",
+          # far below -- is gated on `matrix.arch == 'aarch64'`. On x86_64 that
+          # step is skipped, and x86_64 is the architecture this kernel boots
+          # on: its whole arch module, and the `UserContext` layout the entry
+          # assembly addresses by hardcoded slot number, were tested by
+          # nothing. Only `fncall.rs` and the structs compile for a host
+          # target; pinning that layout is what `layout_tests` does.
+          cargo test --manifest-path vendor/trapframe/Cargo.toml
           # `default-members = ["xtask"]` in the workspace manifest means the
           # bare `cargo test` above builds ONLY xtask, so these two crates'
           # unit tests -- the DRM/KMS present path, the NVIDIA decode helpers,

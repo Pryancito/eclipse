@@ -27,13 +27,10 @@ pub fn init() {
             efer.insert(EferFlags::SYSTEM_CALL_EXTENSIONS);
         });
 
-        // flags to clear on syscall
-        // copy from Linux 5.0
-        // TF|DF|IF|IOPL|AC|NT
-        const RFLAGS_MASK: u64 = 0x47700;
-
+        // Flags the CPU clears on every `syscall`; see `SYSCALL_RFLAGS_MASK`,
+        // which is where the set and the reasons for it live.
         LStar::write(VirtAddr::new(syscall_entry as *const () as usize as u64));
-        SFMask::write(RFlags::from_bits(RFLAGS_MASK).unwrap());
+        SFMask::write(RFlags::from_bits(super::SYSCALL_RFLAGS_MASK).unwrap());
     }
 }
 
