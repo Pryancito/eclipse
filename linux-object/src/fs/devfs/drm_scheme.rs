@@ -227,7 +227,11 @@ impl DrmDev {
             return;
         }
         // A request the sync arm will refuse, or answer without waiting, is
-        // not slept on.
+        // not slept on. `data` is the caller's own pointer here, so the struct
+        // is checked before it is read (`read_syncobj_wait` does not).
+        if ucheck(data, syncobj_wait_prefix(cmd)).is_err() {
+            return;
+        }
         let Ok(Some(SyncobjWaitReq {
             handles,
             points,
@@ -3390,21 +3394,41 @@ struct SyncobjWaitReq {
     flags: u32,
 }
 
+/// Bytes of a wait request's struct that [`read_syncobj_wait`] reads.
+///
+/// Deadline-sized ioctls carry a trailing hint never read here; the prefix
+/// matches the classic structs, which share this layout.
+fn syncobj_wait_prefix(cmd: u32) -> usize {
+    if is_syncobj_timeline_wait(cmd) {
+        core::mem::size_of::<DrmSyncobjTimelineWait>()
+    } else {
+        core::mem::size_of::<DrmSyncobjWait>()
+    }
+}
+
 /// Read a wait request. `Ok(None)` is a wait on no handles at all, which
 /// Linux answers 0 without reading the array (`count_handles == 0`), and
 /// the array bound is [`syncobj_array_bound`].
+///
+/// `data` must already be known readable for [`syncobj_wait_prefix`] bytes;
+/// this does NOT `ucheck` the struct itself. From the sync arm it may be the
+/// kernel bounce buffer [`drm_ioctl_reconciled`] made for a client whose
+/// struct size differs from ours -- and that is exactly Alpine's libdrm, whose
+/// `drm_syncobj_wait` carries `deadline_nsec` (40 bytes, not 32). A `ucheck`
+/// here refused that kernel address with EFAULT on bare metal (never under
+/// `libos`, where the user-half bound is off, so no host test could see it).
+/// NVK's `vk_drm_syncobj_get_type` probe -- a WAIT on a signaled syncobj --
+/// then failed, its syncobj type lost `VK_SYNC_FEATURE_CPU_WAIT`, and the
+/// first submit that needed a binary CPU-wait sync type walked
+/// `supported_sync_types` off its NULL end: `libvulkan_nouveau.so+0xe9c48`,
+/// `fault @ 0x8`, in labwc right after its first EXEC. The dispatcher has
+/// already done `access_ok()` over the client's range; the async sleeper,
+/// which gets the raw user pointer, checks it itself. The nested `handles`
+/// and `points` arrays are always user memory and are checked below.
 fn read_syncobj_wait(cmd: u32, data: usize) -> Result<Option<SyncobjWaitReq>> {
     // One rule for "is this the timeline wait", so the sleeper and the arm
     // cannot read the same request as different structs.
     let timeline = is_syncobj_timeline_wait(cmd);
-    // Deadline-sized ioctls carry a trailing hint never read here; the
-    // prefix matches the classic structs, which share this layout.
-    let prefix = if timeline {
-        core::mem::size_of::<DrmSyncobjTimelineWait>()
-    } else {
-        core::mem::size_of::<DrmSyncobjWait>()
-    };
-    ucheck(data, prefix)?;
     let (handles_ptr, points_ptr, timeout_nsec, count_handles, flags) = if timeline {
         let req = unsafe { *(data as *const DrmSyncobjTimelineWait) };
         (
@@ -13663,6 +13687,78 @@ mod syncobj_array_tests {
             flags: 0,
         };
         c.ioctl(cmd, &mut req)
+    }
+
+    /// NVK's `vk_drm_syncobj_get_type` probe exactly as Alpine's libdrm
+    /// 2.4.134 sends it: a WAIT on a SIGNALED syncobj, timeout 0, in the
+    /// deadline-sized struct (40 bytes; 48 for the timeline form). Anything
+    /// but 0 strips `VK_SYNC_FEATURE_CPU_WAIT` from NVK's syncobj type, and
+    /// the first submit that needs a binary CPU-wait type derefs the NULL at
+    /// the end of `supported_sync_types` (`libvulkan_nouveau.so+0xe9c48`).
+    ///
+    /// These sizes go through `drm_ioctl_reconciled`'s kernel bounce buffer,
+    /// and the arm used to `ucheck` that kernel address: EFAULT on bare metal.
+    /// Under `libos` the user-half bound is off, so this test cannot see that
+    /// half by itself -- it pins the path (bounce buffer, reply copied back)
+    /// that the fix in `read_syncobj_wait` is about.
+    #[test]
+    fn the_deadline_sized_waits_nvk_probes_with_succeed_on_a_signaled_syncobj() {
+        #[repr(C)]
+        struct WaitDeadline {
+            wait: DrmSyncobjWait,
+            deadline_nsec: u64,
+        }
+        #[repr(C)]
+        struct TimelineWaitDeadline {
+            wait: DrmSyncobjTimelineWait,
+            deadline_nsec: u64,
+        }
+        assert_eq!(core::mem::size_of::<WaitDeadline>(), 40);
+        assert_eq!(core::mem::size_of::<TimelineWaitDeadline>(), 48);
+
+        let _serialised = drm::test_globals::lock();
+        let _hook = crate::fs::syncobj_eventfd::hardware_fence_tests::TEST_SERIAL.lock();
+        let _on = NouveauOn::new();
+        let c = Client::open(0);
+        let h = [create(&c, true)];
+
+        let mut req = WaitDeadline {
+            wait: DrmSyncobjWait {
+                handles: h.as_ptr() as u64,
+                timeout_nsec: 0,
+                count_handles: 1,
+                flags: DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL,
+                first_signaled: 0xdead,
+                pad: 0,
+            },
+            deadline_nsec: 0,
+        };
+        assert_eq!(c.ioctl(DRM_IOCTL_SYNCOBJ_WAIT_DEADLINE, &mut req), Ok(0));
+        assert_eq!(
+            req.wait.first_signaled, 0,
+            "reply copied back to the client"
+        );
+
+        let points = [1u64];
+        let mut req = TimelineWaitDeadline {
+            wait: DrmSyncobjTimelineWait {
+                handles: h.as_ptr() as u64,
+                points: points.as_ptr() as u64,
+                timeout_nsec: 0,
+                count_handles: 1,
+                flags: DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL,
+                first_signaled: 0xdead,
+                pad: 0,
+            },
+            deadline_nsec: 0,
+        };
+        assert_eq!(
+            c.ioctl(DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT_DEADLINE, &mut req),
+            Ok(0)
+        );
+        assert_eq!(req.wait.first_signaled, 0);
+
+        destroy(&c, h[0]);
     }
 
     /// `vkWaitForFences` on more fences than 64 is one `TIMELINE_WAIT` over
