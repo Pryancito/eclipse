@@ -26,6 +26,62 @@ fn trail_drm(cmd: u32, arg1: usize, ret: i64) {
     linux_object::fs::devfs::drm_scheme::trail_record(cmd, arg1, ret);
 }
 
+/// Largest staging chunk that is served from the stack; anything bigger goes
+/// through the heap. Same ceiling the read path uses.
+const STAGING_STACK_BUF: usize = 512;
+
+/// A kernel-side staging buffer of exactly `chunk` bytes, on the stack while it
+/// is small and on the heap otherwise.
+///
+/// EVERY byte a write syscall hands to a file passes through one of these. The
+/// bytes MUST be copied out of user memory before they reach `write`/
+/// `write_at`, because a filesystem takes its own lock around that call and
+/// then *reads the buffer under it*. If the buffer still points into user
+/// memory, that read can touch a page that is not resident yet, and the page
+/// fault is served by `FileFrameFiller`, which calls `INode::metadata()` and
+/// `INode::read_at()` — back into the same filesystem, for a lock THIS cpu is
+/// already holding. A ticket mutex is not re-entrant, so the cpu spins on
+/// itself for ever and every other cpu queues behind it.
+///
+/// That is the btrfs `KERNEL STOP` seen on real hardware: `HOLDER cpu=3 at
+/// btrfs_mount.rs:504` (the `inner` lock taken by `write_at`) with the same
+/// `cpu=3` spinning at `btrfs_mount.rs:576` (`metadata()`, reached from the
+/// fault) and six more cpus piled up behind it. Not an AB-BA cycle: one lock,
+/// one cpu, taken twice.
+///
+/// `writev`/`pwritev` always staged their bytes this way; `write`/`pwrite` were
+/// the two that handed the raw user slice straight through.
+struct Staging {
+    stack: [u8; STAGING_STACK_BUF],
+    heap: alloc::vec::Vec<u8>,
+    len: usize,
+}
+
+impl Staging {
+    /// A buffer for chunks of `chunk` bytes. `ENOMEM` rather than a kernel
+    /// abort when the heap cannot hold it (`try_zeroed_buf`).
+    fn new(chunk: usize) -> LxResult<Self> {
+        Ok(Staging {
+            stack: [0u8; STAGING_STACK_BUF],
+            heap: if chunk > STAGING_STACK_BUF {
+                crate::try_zeroed_buf(chunk)?
+            } else {
+                alloc::vec::Vec::new()
+            },
+            len: chunk,
+        })
+    }
+
+    /// The whole buffer, `chunk` bytes long.
+    fn buf(&mut self) -> &mut [u8] {
+        if self.len > STAGING_STACK_BUF {
+            &mut self.heap[..]
+        } else {
+            &mut self.stack[..self.len]
+        }
+    }
+}
+
 /// `lseek(2)`'s `whence`, which the syscall declares `int` and this tree read
 /// as a `u8`.
 ///
@@ -205,27 +261,33 @@ impl Syscall<'_> {
         })?;
         let chunk_size = len.min(super::SYSCALL_IO_MAX);
         let waits = self.waits_for_room(&file_like);
+        // The bytes are copied into kernel memory before the file sees them;
+        // see `Staging` for the deadlock that a raw user slice caused here.
+        let mut staging = Staging::new(chunk_size)?;
         let mut written = 0usize;
         while written < len {
             let n = (len - written).min(chunk_size);
-            let res = file_like
-                .write(base.add(written).as_slice(n)?)
-                .inspect_err(|&e| {
-                    if e == LxError::EBADF {
-                        let path = file_like
-                            .downcast_ref::<linux_object::fs::File>()
-                            .map(|f| f.path().clone())
-                            .unwrap_or_default();
-                        kernel_hal::klog_info!(
-                            "[ebadf-write] fd={:?} PRESENT but write refused: path={:?} \
+            let chunk: &[u8] = {
+                let dst = &mut staging.buf()[..n];
+                dst.copy_from_slice(base.add(written).as_slice(n)?);
+                dst
+            };
+            let res = file_like.write(chunk).inspect_err(|&e| {
+                if e == LxError::EBADF {
+                    let path = file_like
+                        .downcast_ref::<linux_object::fs::File>()
+                        .map(|f| f.path().clone())
+                        .unwrap_or_default();
+                    kernel_hal::klog_info!(
+                        "[ebadf-write] fd={:?} PRESENT but write refused: path={:?} \
                              flags={:?} (proc={:?})",
-                            fd,
-                            path,
-                            file_like.flags(),
-                            proc.execute_path()
-                        );
-                    }
-                });
+                        fd,
+                        path,
+                        file_like.flags(),
+                        proc.execute_path()
+                    );
+                }
+            });
             let w = match res {
                 Ok(w) => w,
                 Err(e) => match after_write_error(e, waits, written) {
@@ -371,9 +433,39 @@ impl Syscall<'_> {
         // `generic_write_check_limits`: what the window ENDS at is what the
         // file would have to grow to.
         self.check_fsize_limit(offset.saturating_add(len as u64))?;
-        self.linux_process()
-            .get_file_like(fd)?
-            .write_at(offset, base.as_slice(len)?)
+        let file_like = self.linux_process().get_file_like(fd)?;
+        // Zero bytes still has to reach the file: that is where a descriptor
+        // not open for writing answers EBADF.
+        if len == 0 {
+            return file_like.write_at(offset, &[]);
+        }
+        // Staged through kernel memory, chunked like `pwritev`: a raw user
+        // slice here is the btrfs KERNEL STOP described on `Staging`.
+        let chunk_size = len.min(super::SYSCALL_IO_MAX);
+        let mut staging = Staging::new(chunk_size)?;
+        let mut written = 0usize;
+        while written < len {
+            let n = (len - written).min(chunk_size);
+            let chunk: &[u8] = {
+                let dst = &mut staging.buf()[..n];
+                dst.copy_from_slice(base.add(written).as_slice(n)?);
+                dst
+            };
+            match file_like.write_at(offset + written as u64, chunk) {
+                // A write of nothing would spin the loop for ever.
+                Ok(0) => break,
+                Ok(w) => {
+                    written += w;
+                    if w < n {
+                        break;
+                    }
+                }
+                // POSIX partial write: bytes already taken are the answer.
+                Err(_) if written > 0 => break,
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(written)
     }
 
     /// works just like read except that multiple buffers are filled.
@@ -2943,6 +3035,72 @@ pub(crate) fn after_write_error(e: LxError, waits: bool, written: usize) -> Afte
 /// signal comes with it).
 pub(crate) fn sigpipe_due(e: LxError, stream: bool) -> bool {
     e == LxError::EPIPE && stream
+}
+
+#[cfg(test)]
+mod staging_tests {
+    //! The staging buffer every write syscall copies its bytes through. Its
+    //! whole job is that the slice the filesystem sees is KERNEL memory: a
+    //! filesystem reads that slice with its own lock held, and a fault on a
+    //! user page there re-enters the filesystem on the cpu that holds the
+    //! lock (see `Staging`). So the two things that can silently break it are
+    //! a buffer of the wrong length -- which would truncate or panic the
+    //! per-chunk `copy_from_slice` -- and a huge request aborting the kernel
+    //! instead of answering ENOMEM.
+    use super::*;
+
+    #[test]
+    fn a_small_chunk_is_served_without_touching_the_heap() {
+        let mut s = Staging::new(64).unwrap();
+        assert_eq!(s.buf().len(), 64);
+        assert!(s.heap.is_empty(), "a 64-byte chunk must not allocate");
+    }
+
+    #[test]
+    fn a_chunk_of_exactly_the_stack_ceiling_still_fits_on_the_stack() {
+        // The boundary, because `>` and `>=` here disagree only at this one
+        // value and both look right: at `>=` the heap buffer is never made
+        // yet `buf()` would index it.
+        let mut s = Staging::new(STAGING_STACK_BUF).unwrap();
+        assert_eq!(s.buf().len(), STAGING_STACK_BUF);
+        assert!(s.heap.is_empty());
+    }
+
+    #[test]
+    fn a_chunk_past_the_ceiling_moves_to_the_heap_at_its_full_length() {
+        let mut s = Staging::new(STAGING_STACK_BUF + 1).unwrap();
+        assert_eq!(s.buf().len(), STAGING_STACK_BUF + 1);
+        let n = s.buf().len();
+        assert_eq!(s.heap.len(), n);
+    }
+
+    #[test]
+    fn a_chunk_the_heap_cannot_hold_is_enomem_and_not_a_kernel_abort() {
+        assert_eq!(Staging::new(usize::MAX).err(), Some(LxError::ENOMEM));
+    }
+
+    #[test]
+    fn the_staged_slice_carries_the_bytes_and_is_not_the_source() {
+        // The property the deadlock fix rests on: what the file is handed is a
+        // copy, at a different address from the caller's buffer.
+        let src = alloc::vec![7u8; 300];
+        let mut s = Staging::new(300).unwrap();
+        let dst = &mut s.buf()[..300];
+        dst.copy_from_slice(&src);
+        assert_eq!(dst, &src[..]);
+        assert_ne!(dst.as_ptr(), src.as_ptr());
+    }
+
+    #[test]
+    fn a_chunk_shorter_than_the_buffer_stages_only_its_own_bytes() {
+        // The loop stages `n <= chunk_size` bytes into the front of the
+        // buffer; the tail is left alone and must not reach the file.
+        let mut s = Staging::new(STAGING_STACK_BUF + 8).unwrap();
+        s.buf().fill(0xAA);
+        let dst = &mut s.buf()[..3];
+        dst.copy_from_slice(&[1, 2, 3]);
+        assert_eq!(&s.buf()[..5], &[1, 2, 3, 0xAA, 0xAA]);
+    }
 }
 
 #[cfg(test)]
