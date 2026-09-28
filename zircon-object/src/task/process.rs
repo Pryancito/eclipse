@@ -713,14 +713,35 @@ impl Process {
         }
     }
 
-    /// Remove a handle referring to a kernel object of the given type from the process.
+    /// Remove a handle referring to a kernel object of the given type from the
+    /// process.
+    ///
+    /// The type is settled while the handle is still in the table. It used to
+    /// be removed first and downcast after, so a value naming an object of
+    /// another kind answered `WRONG_TYPE` **and closed it**: `zx_pmt_unpin`,
+    /// the one caller, took away a handle it had just refused to act on, and
+    /// if that was the last handle to the object the object went with it. A
+    /// syscall that refuses must leave the caller's capabilities as it found
+    /// them.
+    ///
+    /// The peek clones the `Arc` only to ask its type; the clone is dropped
+    /// with the table's own reference still there, so no object's `Drop` runs
+    /// under the lock -- see [`Process::remove_handles`] for why that matters.
     pub fn remove_object<T: KernelObject>(&self, handle_value: HandleValue) -> ZxResult<Arc<T>> {
-        let handle = self.remove_handle(handle_value)?;
-        let object = handle
+        let mut inner = self.inner.lock();
+        let (handle, _) = inner
+            .handles
+            .get(&handle_value)
+            .ok_or(ZxError::BAD_HANDLE)?;
+        if handle.object.clone().downcast_arc::<T>().is_err() {
+            return Err(ZxError::WRONG_TYPE);
+        }
+        let handle = inner.remove_handle(handle_value)?;
+        drop(inner);
+        handle
             .object
             .downcast_arc::<T>()
-            .map_err(|_| ZxError::WRONG_TYPE)?;
-        Ok(object)
+            .map_err(|_| ZxError::WRONG_TYPE)
     }
 
     /// Get a handle from the process
@@ -1493,5 +1514,139 @@ mod tests {
                 .err(),
             Some(ZxError::BAD_STATE)
         );
+    }
+
+    /// A handle opens an object only when it carries **every** right the caller
+    /// asked for. Settling for one of them is the whole handle-rights model
+    /// gone: a read-only handle would answer a request for write.
+    #[test]
+    fn a_handle_one_right_short_opens_nothing() {
+        let root_job = Job::root();
+        let proc = Process::create(&root_job, "proc").expect("failed to create process");
+        let handle = proc.add_handle(Handle::new(Event::new(), Rights::READ | Rights::INSPECT));
+
+        assert!(proc
+            .get_dyn_object_with_rights(handle, Rights::READ | Rights::INSPECT)
+            .is_ok());
+        assert_eq!(
+            proc.get_dyn_object_with_rights(handle, Rights::READ | Rights::WRITE)
+                .err(),
+            Some(ZxError::ACCESS_DENIED),
+            "tener uno de los dos derechos no es tener los dos"
+        );
+        assert_eq!(
+            proc.get_object_with_rights::<Event>(handle, Rights::READ | Rights::WRITE)
+                .err(),
+            Some(ZxError::ACCESS_DENIED)
+        );
+    }
+
+    /// `zx_handle_duplicate` is how a process hands a capability on with LESS
+    /// of it, and the reduction is the only thing keeping the copy from being
+    /// as good as the original. A duplicate that kept the rights it came from
+    /// would hand a child the parent's full authority.
+    #[test]
+    fn a_duplicate_carries_the_rights_it_was_given_and_not_the_ones_it_came_from() {
+        let root_job = Job::root();
+        let proc = Process::create(&root_job, "proc").expect("failed to create process");
+        let original = proc.add_handle(Handle::new(Event::new(), Rights::DEFAULT_EVENT));
+
+        let reduced = proc
+            .dup_handle_operating_rights(original, |_| Ok(Rights::TRANSFER | Rights::INSPECT))
+            .unwrap();
+        assert_ne!(reduced, original, "es otro valor de handle");
+
+        assert!(proc
+            .get_dyn_object_with_rights(reduced, Rights::TRANSFER | Rights::INSPECT)
+            .is_ok());
+        assert_eq!(
+            proc.get_dyn_object_with_rights(reduced, Rights::SIGNAL)
+                .err(),
+            Some(ZxError::ACCESS_DENIED),
+            "el derecho que no se le dio, no lo tiene"
+        );
+        // And the original keeps everything it had.
+        assert!(proc
+            .get_dyn_object_with_rights(original, Rights::DEFAULT_EVENT)
+            .is_ok());
+
+        // An operation that refuses installs nothing at all.
+        assert_eq!(
+            proc.dup_handle_operating_rights(original, |_| Err(ZxError::INVALID_ARGS))
+                .err(),
+            Some(ZxError::INVALID_ARGS)
+        );
+    }
+
+    /// The three errors a handle lookup can give are three different answers,
+    /// and userspace acts on the difference: `BAD_HANDLE` says the value names
+    /// nothing, `WRONG_TYPE` says it names something else, `ACCESS_DENIED`
+    /// says it names the right thing without the right to use it. Collapsing
+    /// `WRONG_TYPE` into `BAD_HANDLE` tells a program its own live handle is
+    /// closed.
+    #[test]
+    fn naming_the_wrong_kind_of_object_is_not_naming_nothing() {
+        let root_job = Job::root();
+        let proc = Process::create(&root_job, "proc").expect("failed to create process");
+        let event = proc.add_handle(Handle::new(Event::new(), Rights::DEFAULT_EVENT));
+
+        assert_eq!(
+            proc.get_object::<Process>(event).err(),
+            Some(ZxError::WRONG_TYPE)
+        );
+        assert_eq!(
+            proc.get_object::<Event>(0xdead_beef).err(),
+            Some(ZxError::BAD_HANDLE)
+        );
+
+        // And the type is settled BEFORE the rights, so a handle that is both
+        // the wrong kind and short of rights says which of the two it is.
+        assert_eq!(
+            proc.get_object_with_rights::<Process>(event, Rights::MANAGE_PROCESS)
+                .err(),
+            Some(ZxError::WRONG_TYPE),
+            "el tipo primero: ACCESS_DENIED mandaria a pedir derechos que no \
+             le valdrian de nada"
+        );
+
+        // `remove_object` answers the same way, and a refusal must not eat the
+        // handle on the way out.
+        assert_eq!(
+            proc.remove_object::<Process>(event).err(),
+            Some(ZxError::WRONG_TYPE)
+        );
+        assert!(
+            proc.get_object::<Event>(event).is_ok(),
+            "y la negativa no se lleva por delante el handle que rechazo"
+        );
+    }
+
+    /// The values come back in the order the handles went in: the caller reads
+    /// them positionally -- `zx_channel_read` hands userspace an array of
+    /// handle values that lines up with the message it just read -- so a
+    /// reversed answer gives every handle to the wrong slot.
+    #[test]
+    fn the_values_come_back_in_the_order_the_handles_went_in() {
+        let root_job = Job::root();
+        let proc = Process::create(&root_job, "proc").expect("failed to create process");
+
+        let objects: Vec<Arc<Event>> = (0..3).map(|_| Event::new()).collect();
+        let values = proc.add_handles(
+            objects
+                .iter()
+                .map(|o| Handle::new(o.clone(), Rights::DEFAULT_EVENT))
+                .collect(),
+        );
+
+        assert_eq!(values.len(), 3);
+        for (value, object) in values.iter().zip(objects.iter()) {
+            let got = proc.get_object::<Event>(*value).unwrap();
+            assert_eq!(
+                got.id(),
+                object.id(),
+                "el handle {} no es el objeto que se instalo en su sitio",
+                value
+            );
+        }
     }
 }

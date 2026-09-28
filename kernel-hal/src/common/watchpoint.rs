@@ -706,4 +706,20 @@ mod tests {
         assert_eq!(armed(), None);
         assert_ne!(WP_GEN.load(Relaxed), gen1, "no CPU would notice the disarm");
     }
+
+    /// The hit count is this tool's whole output: what it exists to answer is
+    /// "did anything write here", and the answer it is usually asked for is
+    /// no. A count that starts at one reports a store that never happened, on
+    /// a hunt where one unexplained store is the entire finding -- and it
+    /// reports it in the trap log, next to a rip that belongs to nobody.
+    #[test]
+    fn a_watchpoint_nothing_has_written_to_reports_no_hits() {
+        // Only `handle_debug_trap` bumps this, and only on bare x86_64, so it
+        // is still at its boot value here whatever else the suite has run.
+        assert_eq!(
+            hits(),
+            0,
+            "nadie ha escrito, y nadie deberia salir en el log"
+        );
+    }
 }

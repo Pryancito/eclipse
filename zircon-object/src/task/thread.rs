@@ -891,8 +891,11 @@ impl Thread {
     /// Add the parameter to the kernel-mode time this thread has run on cpu.
     ///
     /// Called from `ThreadSwitchFuture::poll`, the one place that can measure
-    /// it unambiguously — see [`Thread::sys_time_ns`].
-    pub(crate) fn sys_time_add(&self, time: u64) {
+    /// it unambiguously — see [`Thread::sys_time_ns`]. Public like its
+    /// user-mode twin [`Thread::time_add`]: the pair is what `terminate`
+    /// credits to the process, and `/proc/<pid>/stat`'s field 15 is the only
+    /// reader of the kernel-mode half, in another crate.
+    pub fn sys_time_add(&self, time: u64) {
         self.sys_time_ns.fetch_add(time, Ordering::Relaxed);
     }
 

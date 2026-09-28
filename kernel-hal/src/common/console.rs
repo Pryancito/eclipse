@@ -12,6 +12,39 @@ use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 // pointers here so that `linux-syscall` can call `klog_read` / `klog_buf_size`
 // without a direct crate dependency on `zcore`.
 
+/// The word to jump to for one klog slot, or `None` when the slot must not be
+/// called: [`lock::fn_slot::live_fn`], through one name.
+///
+/// Seamed for the same reason `kaddr::publish_fn_slot_window` is: **no build
+/// this suite compiles publishes a `.text` window**, and that is deliberate --
+/// a window that holds no host function turns every live hook into a refused
+/// one, which is what `drivers`' dmesg tests rely on not happening. With the
+/// window read inside, every host call comes back `Unchecked`, so a slot
+/// judged against nothing looks exactly like a slot that was never judged: the
+/// three refusals below are unreachable and dropping the judgement altogether
+/// -- jumping to whatever word is in the slot, which is the smash this guard
+/// exists for -- passes the whole suite. The hook is thread-local, so a test
+/// that arms it cannot reach another test's.
+#[cfg(not(test))]
+#[inline(always)]
+fn klog_slot(slot: usize) -> Option<usize> {
+    lock::fn_slot::live_fn(slot)
+}
+
+#[cfg(test)]
+fn klog_slot(slot: usize) -> Option<usize> {
+    match KLOG_SLOT_HOOK.with(|c| c.get()) {
+        Some(f) => f(slot),
+        None => lock::fn_slot::live_fn(slot),
+    }
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static KLOG_SLOT_HOOK: core::cell::Cell<Option<fn(usize) -> Option<usize>>> =
+        const { core::cell::Cell::new(None) };
+}
+
 static KLOG_READ_FN: AtomicUsize = AtomicUsize::new(0);
 static KLOG_SIZE_FN: AtomicUsize = AtomicUsize::new(0);
 static KLOG_EMIT_FN: AtomicUsize = AtomicUsize::new(0);
@@ -33,7 +66,7 @@ pub fn klog_read(dst: &mut [u8]) -> usize {
     // Judged before the jump: see `lock::fn_slot`. `dmesg` is read from
     // userspace, so this slot is reachable on demand by an unprivileged
     // process -- the last one to call on trust.
-    let Some(p) = lock::fn_slot::live_fn(KLOG_READ_FN.load(Ordering::SeqCst)) else {
+    let Some(p) = klog_slot(KLOG_READ_FN.load(Ordering::SeqCst)) else {
         return 0;
     };
     let f: fn(&mut [u8]) -> usize = unsafe { core::mem::transmute(p) };
@@ -42,7 +75,7 @@ pub fn klog_read(dst: &mut [u8]) -> usize {
 
 /// Total bytes currently stored in the kernel log ring buffer.
 pub fn klog_buf_size() -> usize {
-    let Some(p) = lock::fn_slot::live_fn(KLOG_SIZE_FN.load(Ordering::SeqCst)) else {
+    let Some(p) = klog_slot(KLOG_SIZE_FN.load(Ordering::SeqCst)) else {
         return 0;
     };
     let f: fn() -> usize = unsafe { core::mem::transmute(p) };
@@ -57,7 +90,7 @@ pub const LOG_INFO: u8 = 6;
 /// Append a vital kernel message to the dmesg ring buffer (syslog priority 0–7).
 /// Always recorded regardless of the `log` crate max level.
 pub fn klog_emit(priority: u8, msg: &str) {
-    let Some(p) = lock::fn_slot::live_fn(KLOG_EMIT_FN.load(Ordering::SeqCst)) else {
+    let Some(p) = klog_slot(KLOG_EMIT_FN.load(Ordering::SeqCst)) else {
         return;
     };
     let f: fn(u8, &str) = unsafe { core::mem::transmute(p) };
@@ -577,22 +610,30 @@ pub fn vt_write_fmt(vt: usize, fmt: Arguments) {
 /// stays a usable text console while the desktop runs on screen. In pure text
 /// mode this is just `active_vt()`, so serial still follows VT switches there.
 pub fn serial_vt() -> usize {
-    #[cfg(feature = "graphic")]
-    {
-        let a = active_vt();
-        // The reserved graphics VT (tty7) is the ONLY VT with no login shell
-        // (see zCore/src/main.rs). Whenever it is foreground -- the desktop is on
-        // screen -- bind serial to tty1's shell instead, independent of KD-mode
-        // timing during compositor start/teardown. Any other (text) VT is the
-        // active terminal itself, so serial still follows VT switches there.
-        if a == GRAPHICS_VT {
-            return 0;
-        }
-        a
-    }
-    #[cfg(not(feature = "graphic"))]
-    {
+    serial_vt_for(active_vt())
+}
+
+/// [`serial_vt`]'s rule, with the active VT as an argument rather than read
+/// inside.
+///
+/// The reserved graphics VT (tty7) is the ONLY VT with no login shell (see
+/// `zCore/src/main.rs`). Whenever it is foreground -- the desktop is on screen
+/// -- serial binds to tty1's shell instead, independent of KD-mode timing
+/// during compositor start/teardown. Any other (text) VT is the active
+/// terminal itself, so serial still follows VT switches there.
+///
+/// It is a free function because the rule used to live inside a
+/// `cfg(feature = "graphic")` block, and **no configuration this suite
+/// compiles has that feature**: without it `active_vt()` is the constant 0, so
+/// the whole rule folded away and deleting it passed every test. Here it is
+/// compiled and reachable in every build; without `graphic` the argument is
+/// still the constant 0, which is not `GRAPHICS_VT`, so it folds to the same 0
+/// the old arm returned.
+fn serial_vt_for(active: usize) -> usize {
+    if active == GRAPHICS_VT {
         0
+    } else {
+        active
     }
 }
 
@@ -629,7 +670,7 @@ pub fn cursor_blink_tick() {
         }
         static LAST_PHASE: AtomicUsize = AtomicUsize::new(usize::MAX);
         let ms = crate::hal_fn::timer::timer_now().as_millis() as usize;
-        let phase = (ms / 500) & 1;
+        let phase = blink_phase(ms);
         if LAST_PHASE.swap(phase, Ordering::SeqCst) == phase {
             return;
         }
@@ -643,6 +684,25 @@ pub fn cursor_blink_tick() {
 #[cfg(not(feature = "graphic"))]
 pub fn request_clear_graphic_on_next_write() {
     crate::hal_fn::console::console_progress_early(100);
+}
+
+/// Half of the cursor's blink period, in milliseconds: the cursor is shown for
+/// this long, then hidden for this long, so the blink itself is ~1 Hz.
+const BLINK_HALF_PERIOD_MS: usize = 500;
+
+/// Which half of the blink cycle the monotonic clock is in at `ms`: 0 while the
+/// cursor is shown, 1 while it is hidden. [`cursor_blink_tick`] runs at ~250 Hz
+/// and only does work when this flips, so it is also what keeps the common tick
+/// down to one atomic load.
+///
+/// A free function for the same reason as [`serial_vt_for`]: it lived inside a
+/// `cfg(feature = "graphic")` block that no build this suite compiles, so the
+/// rate was whatever the literal said and nothing could disagree. A cursor
+/// blinking at the wrong rate is not a failure anyone reports; it is just a
+/// console that looks slightly wrong.
+#[allow(dead_code)]
+fn blink_phase(ms: usize) -> usize {
+    (ms / BLINK_HALF_PERIOD_MS) & 1
 }
 
 /// This CPU, as the console locks name it.
@@ -743,13 +803,38 @@ struct EmergencyGraphicWriter {
     len: usize,
 }
 
+/// Where a flushed panic line goes.
+///
+/// Seamed because the whole job of this writer is getting bytes OUT, and on
+/// every target the host suite can build the real sink is an empty function
+/// (`hal_fn`'s libos stub): dropping the buffer instead of flushing it leaves
+/// the same empty buffer behind and was invisible. A panic report is written
+/// once, by a machine that is already dying, so a lost line is a lost
+/// diagnosis. Thread-local, so a test that reads it cannot see another's.
+#[cfg(not(test))]
+#[inline(always)]
+fn panic_write_str(s: &str) {
+    crate::hal_fn::console::console_panic_write_str(s);
+}
+
+#[cfg(test)]
+fn panic_write_str(s: &str) {
+    PANIC_WRITES.with(|c| c.borrow_mut().push_str(s));
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static PANIC_WRITES: core::cell::RefCell<alloc::string::String> =
+        const { core::cell::RefCell::new(alloc::string::String::new()) };
+}
+
 impl EmergencyGraphicWriter {
     fn flush(&mut self) {
         if self.len == 0 {
             return;
         }
         if let Ok(s) = core::str::from_utf8(&self.buf[..self.len]) {
-            crate::hal_fn::console::console_panic_write_str(s);
+            panic_write_str(s);
         }
         self.len = 0;
     }
@@ -1065,5 +1150,426 @@ mod kd_mode_tests {
         assert_eq!(GRAPHICS_VT, NUM_VTS - 1);
         assert_eq!(GRAPHICS_VT + 1, 7, "the launcher targets tty7");
         assert!(KD_MODES.len() >= NUM_VTS, "one mode slot per VT");
+    }
+}
+
+/// The kernel log (`dmesg`) hooks: three function-pointer slots another crate
+/// fills in, and the judgement each one gets before it is jumped to.
+#[cfg(test)]
+mod klog_tests {
+    extern crate std;
+
+    use super::*;
+    use alloc::string::{String, ToString};
+    use alloc::vec::Vec;
+    use std::sync::{Mutex, MutexGuard};
+
+    /// The three slots are process-wide, and `drivers`' dmesg tests install
+    /// their own recording sink in them. Every test here takes this lock and
+    /// puts back what it found. (`--test-threads=1`, which CI uses, hides
+    /// that; the default parallel run does not.)
+    fn test_lock() -> MutexGuard<'static, ()> {
+        static LOCK: Mutex<()> = Mutex::new(());
+        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// What the three slots held on the way in. Restored on the way out so a
+    /// sink another module installed survives this test.
+    struct SavedSlots(usize, usize, usize);
+
+    impl SavedSlots {
+        fn take() -> Self {
+            Self(
+                KLOG_READ_FN.load(Ordering::SeqCst),
+                KLOG_SIZE_FN.load(Ordering::SeqCst),
+                KLOG_EMIT_FN.load(Ordering::SeqCst),
+            )
+        }
+    }
+
+    impl Drop for SavedSlots {
+        fn drop(&mut self) {
+            KLOG_READ_FN.store(self.0, Ordering::SeqCst);
+            KLOG_SIZE_FN.store(self.1, Ordering::SeqCst);
+            KLOG_EMIT_FN.store(self.2, Ordering::SeqCst);
+            KLOG_SLOT_HOOK.with(|c| c.set(None));
+            EMITTED.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        }
+    }
+
+    /// What the stub ring buffer holds. Its length is the answer `klog_read`
+    /// and `klog_buf_size` must give, and the two are told apart by content.
+    const STORED: &[u8] = b"lo que el kernel dijo";
+
+    static EMITTED: Mutex<Vec<(u8, String)>> = Mutex::new(Vec::new());
+
+    fn stub_read(dst: &mut [u8]) -> usize {
+        let n = dst.len().min(STORED.len());
+        dst[..n].copy_from_slice(&STORED[..n]);
+        n
+    }
+
+    fn stub_size() -> usize {
+        STORED.len()
+    }
+
+    fn stub_emit(priority: u8, msg: &str) {
+        EMITTED
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((priority, msg.to_string()));
+    }
+
+    fn emitted() -> Vec<(u8, String)> {
+        EMITTED.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// A judgement that refuses everything, whatever is in the slot.
+    fn refuse_everything(_slot: usize) -> Option<usize> {
+        None
+    }
+
+    /// `dmesg` is the one of these three a process drives, so the buffer it
+    /// hands in is the one that has to come back filled -- and the count it
+    /// gets back is how many bytes it then reads out of it.
+    #[test]
+    fn what_dmesg_reads_is_what_the_registered_ring_buffer_holds() {
+        let _g = test_lock();
+        let _saved = SavedSlots::take();
+
+        klog_register(stub_read, stub_size, stub_emit);
+
+        let mut buf = [0xabu8; 64];
+        assert_eq!(
+            klog_read(&mut buf),
+            STORED.len(),
+            "el contador es el de bytes copiados"
+        );
+        assert_eq!(
+            &buf[..STORED.len()],
+            STORED,
+            "y los bytes son los del buffer de verdad, no los de otro hueco"
+        );
+        assert!(
+            buf[STORED.len()..].iter().all(|&b| b == 0xab),
+            "nada mas alla de lo copiado se toca"
+        );
+        assert_eq!(
+            klog_buf_size(),
+            STORED.len(),
+            "el tamano sale de SU hueco, no del de la lectura"
+        );
+    }
+
+    /// The normal state of all three slots on every boot until `zcore`
+    /// installs them, and the state they are back in if the judgement below
+    /// ever refuses one. Nothing is called, and -- the part that matters --
+    /// the caller is told nothing was.
+    ///
+    /// A `dmesg` that answered "I filled your 64 bytes" without filling them
+    /// hands userspace whatever was on its stack, and a size that answered
+    /// `usize::MAX` is a read loop that never ends.
+    #[test]
+    fn a_log_hook_nobody_installed_is_not_called_and_says_so() {
+        let _g = test_lock();
+        let _saved = SavedSlots::take();
+
+        KLOG_READ_FN.store(0, Ordering::SeqCst);
+        KLOG_SIZE_FN.store(0, Ordering::SeqCst);
+        KLOG_EMIT_FN.store(0, Ordering::SeqCst);
+
+        let mut buf = [0xabu8; 64];
+        assert_eq!(klog_read(&mut buf), 0, "no se ha copiado nada");
+        assert!(buf.iter().all(|&b| b == 0xab), "y no se ha tocado nada");
+        assert_eq!(klog_buf_size(), 0);
+
+        klog_emit(LOG_ERR, "esto no llega a ninguna parte");
+        assert!(emitted().is_empty());
+    }
+
+    /// The guard this module exists for. A word is not a function just because
+    /// a function was stored there: the soft smash these slots are watched for
+    /// leaves a stack pointer or a half-zeroed `.text` address behind, and
+    /// jumping to it is the end of the machine.
+    ///
+    /// The judgement is [`lock::fn_slot::live_fn`], and what it answers depends
+    /// on a `.text` window that **no build this suite compiles publishes** --
+    /// by design, since a window holding no host function would refuse every
+    /// live hook. So with the window read inside, the only answer reachable
+    /// from here is "allowed", and dropping the judgement altogether is
+    /// invisible. [`klog_slot`] is the seam that makes the other answer
+    /// reachable.
+    #[test]
+    fn a_word_the_judge_refuses_is_not_jumped_to_either() {
+        let _g = test_lock();
+        let _saved = SavedSlots::take();
+
+        klog_register(stub_read, stub_size, stub_emit);
+        KLOG_SLOT_HOOK.with(|c| c.set(Some(refuse_everything)));
+
+        let mut buf = [0xabu8; 64];
+        assert_eq!(klog_read(&mut buf), 0, "un hueco refusado no se llama");
+        assert!(buf.iter().all(|&b| b == 0xab));
+        assert_eq!(klog_buf_size(), 0);
+        klog_emit(LOG_ERR, "un hueco refusado no emite");
+        assert!(emitted().is_empty());
+
+        // And the registration is still there: what changed is the verdict,
+        // not who is installed. Otherwise the three assertions above would
+        // pass just as well with no judgement at all.
+        KLOG_SLOT_HOOK.with(|c| c.set(None));
+        assert_eq!(klog_read(&mut buf), STORED.len());
+        assert_eq!(klog_buf_size(), STORED.len());
+    }
+
+    /// The number a message carries is the syslog priority, which is what
+    /// userspace filters on: `dmesg -l err`, journald's levels, and the
+    /// `<N>` prefix of `/dev/kmsg`. Emitting an error as a warning does not
+    /// lose the line, it loses it from the filter that would have shown it.
+    #[test]
+    fn a_message_keeps_the_syslog_priority_userspace_filters_on() {
+        let _g = test_lock();
+        let _saved = SavedSlots::take();
+
+        klog_register(stub_read, stub_size, stub_emit);
+
+        // Straight out of Linux's `syslog.h`: KERN_ERR is 3, KERN_WARNING 4
+        // and KERN_INFO 6. They are an ABI, not this kernel's own numbering.
+        assert_eq!((LOG_ERR, LOG_WARNING, LOG_INFO), (3, 4, 6));
+
+        klog_emit(LOG_ERR, "un error");
+        klog_emit(LOG_WARNING, "un aviso");
+        klog_emit(LOG_INFO, "una nota");
+
+        assert_eq!(
+            emitted(),
+            alloc::vec![
+                (3u8, "un error".to_string()),
+                (4u8, "un aviso".to_string()),
+                (6u8, "una nota".to_string()),
+            ],
+            "cada linea llega con la prioridad con la que se emitio"
+        );
+    }
+}
+
+/// The console window size: what `TIOCSWINSZ` stores and what `TIOCGWINSZ`
+/// answers when nobody has stored anything.
+#[cfg(test)]
+mod win_size_tests {
+    extern crate std;
+
+    use super::*;
+    use std::sync::{Mutex, MutexGuard};
+
+    /// The override is one process-wide cell.
+    fn test_lock() -> MutexGuard<'static, ()> {
+        static LOCK: Mutex<()> = Mutex::new(());
+        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn ws(row: u16, col: u16) -> ConsoleWinSize {
+        ConsoleWinSize {
+            ws_row: row,
+            ws_col: col,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        }
+    }
+
+    fn clear() {
+        set_console_win_size(ws(0, 0));
+    }
+
+    /// The whole point of `TIOCSWINSZ` here: the framebuffer console is huge
+    /// (227x113 at 2048x2048), which is right on screen and wrong for a serial
+    /// viewer whose window is 80x24. A size that is stored and then not
+    /// answered leaves `less`, `nano` and `top` laying out for a screen that
+    /// is not there.
+    #[test]
+    fn the_size_a_serial_login_reports_is_the_size_it_gets_back() {
+        let _g = test_lock();
+        clear();
+
+        set_console_win_size(ws(30, 100));
+        let got = console_win_size();
+        assert_eq!((got.ws_row, got.ws_col), (30, 100));
+
+        clear();
+    }
+
+    /// `stty rows 0` and `stty cols 0` are how a terminal says it does not
+    /// know one of its dimensions, and Linux stores them. Only a `0x0` --
+    /// both unknown -- means "forget what I told you". Treating either zero as
+    /// the clear throws away a size the user just set, and the console jumps
+    /// back to the framebuffer's.
+    #[test]
+    fn only_a_size_unknown_in_both_directions_clears_the_override() {
+        let _g = test_lock();
+        clear();
+
+        set_console_win_size(ws(0, 100));
+        let got = console_win_size();
+        assert_eq!(
+            (got.ws_row, got.ws_col),
+            (0, 100),
+            "media dimension sigue siendo lo que dijo el usuario"
+        );
+
+        set_console_win_size(ws(30, 0));
+        let got = console_win_size();
+        assert_eq!((got.ws_row, got.ws_col), (30, 0));
+
+        set_console_win_size(ws(0, 0));
+        let got = console_win_size();
+        assert_eq!(
+            (got.ws_row, got.ws_col),
+            (24, 80),
+            "las dos a cero si borran, y se vuelve al defecto"
+        );
+
+        clear();
+    }
+
+    /// With no framebuffer and no `TIOCSWINSZ` the answer is the size every
+    /// serial terminal has had since the VT100. Rows and columns the wrong way
+    /// round is a console 80 lines tall and 24 wide: every full-screen app
+    /// draws off the edge, and nothing reports an error.
+    #[test]
+    fn with_nothing_to_go_on_the_console_is_eighty_columns_by_twentyfour_rows() {
+        let _g = test_lock();
+        clear();
+
+        let got = console_win_size();
+        assert_eq!(got.ws_row, 24, "veinticuatro FILAS");
+        assert_eq!(got.ws_col, 80, "ochenta COLUMNAS");
+        assert_ne!(
+            (got.ws_row, got.ws_col),
+            (0, 0),
+            "un tamano explicito, para que `stty size` y las apps coincidan"
+        );
+    }
+}
+
+/// The last-resort writer of the panic path, and the two rules the rest of
+/// this module keeps that no test could reach while they lived inside a
+/// `cfg(feature = "graphic")` block.
+#[cfg(test)]
+mod panic_path_tests {
+    extern crate std;
+
+    use super::*;
+    use alloc::string::String;
+
+    fn taken() -> String {
+        PANIC_WRITES.with(|c| core::mem::take(&mut *c.borrow_mut()))
+    }
+
+    fn writer() -> EmergencyGraphicWriter {
+        let _ = taken();
+        EmergencyGraphicWriter {
+            buf: [0; 512],
+            len: 0,
+        }
+    }
+
+    /// The buffer is 512 bytes and the report is longer than that, so it has
+    /// to go out in pieces -- and every byte has to be in one of them. A
+    /// writer that drops its buffer instead of flushing it loses the piece
+    /// that was in flight, which on the panic path is the part naming the
+    /// fault.
+    #[test]
+    fn a_report_longer_than_the_buffer_goes_out_whole_and_in_order() {
+        let mut w = writer();
+        let report: String = (0..700u32)
+            .map(|i| char::from(b'a' + (i % 26) as u8))
+            .collect();
+
+        w.write_str(&report).unwrap();
+        w.flush();
+
+        assert_eq!(taken(), report, "ni un byte perdido, ni uno desordenado");
+        assert_eq!(w.len, 0, "y el buffer queda vacio detras");
+    }
+
+    /// The flush happens because the next character does not fit, not one
+    /// character early and not one late: the buffer is exactly full at 512.
+    #[test]
+    fn the_buffer_flushes_when_the_next_character_does_not_fit() {
+        let mut w = writer();
+
+        let full: String = core::iter::repeat_n('x', 512).collect();
+        w.write_str(&full).unwrap();
+        assert_eq!(w.len, 512, "512 caracteres de uno caben justos");
+        assert_eq!(taken(), "", "y nada ha salido todavia");
+
+        w.write_str("y").unwrap();
+        assert_eq!(taken(), full, "el 513 saca los 512 de golpe");
+        assert_eq!(w.len, 1, "y se queda el que no cabia");
+    }
+
+    /// A character is flushed whole or not at all. Measuring the room in
+    /// characters rather than in bytes splits a multi-byte one across two
+    /// flushes, and `from_utf8` then refuses BOTH halves -- so a report with
+    /// an accent in it loses the 512 bytes around it, silently, because the
+    /// flush drops what it cannot decode.
+    #[test]
+    fn a_multibyte_character_is_never_split_across_two_flushes() {
+        let mut w = writer();
+
+        // 510 bytes used, and a 3-byte character asking for room.
+        let head: String = core::iter::repeat_n('x', 510).collect();
+        w.write_str(&head).unwrap();
+        assert_eq!(w.len, 510);
+
+        w.write_str("€").unwrap();
+        assert_eq!(taken(), head, "los 510 salen enteros");
+        assert_eq!(w.len, 3, "y el euro entra entero detras, sus tres bytes");
+
+        w.flush();
+        assert_eq!(taken(), "€");
+    }
+
+    /// The serial console follows VT switches, with one exception: the
+    /// reserved graphics VT (tty7) is the only one with no login shell, so
+    /// binding serial to it while the desktop is on screen silences the line
+    /// -- the only text a monitor-less box has.
+    #[test]
+    fn the_serial_line_never_follows_the_desktop_onto_the_graphics_vt() {
+        for vt in 0..GRAPHICS_VT {
+            assert_eq!(
+                serial_vt_for(vt),
+                vt,
+                "en modo texto la serie sigue al VT activo"
+            );
+        }
+        assert_eq!(
+            serial_vt_for(GRAPHICS_VT),
+            0,
+            "con el escritorio delante, la serie se queda en tty1"
+        );
+    }
+
+    /// ~1 Hz: half a second showing, half a second hidden, starting shown.
+    /// The tick that calls this runs at ~250 Hz and does nothing until the
+    /// phase flips, so the divisor is both the blink rate and the reason the
+    /// common tick is one atomic load.
+    #[test]
+    fn the_cursor_shows_for_half_a_second_and_hides_for_half_a_second() {
+        assert_eq!(blink_phase(0), 0, "arranca visible");
+        assert_eq!(
+            blink_phase(499),
+            0,
+            "y sigue visible hasta el medio segundo"
+        );
+        assert_eq!(blink_phase(500), 1, "ahi se apaga");
+        assert_eq!(blink_phase(999), 1);
+        assert_eq!(blink_phase(1000), 0, "y un segundo despues vuelve");
+
+        // Two states and no third: the tick compares this against the last one
+        // it saw, so anything but 0/1 would make every tick look like a flip.
+        for ms in (0..4000).step_by(37) {
+            assert!(blink_phase(ms) <= 1, "{} da una fase que no existe", ms);
+        }
     }
 }

@@ -56,6 +56,29 @@ std::thread_local! {
         const { core::cell::Cell::new(None) };
 }
 
+/// The seam a test uses to stand in the middle of [`FaultDiagLatch::take`].
+///
+/// Between the flag and the id, the latch is held by nobody it can name. What
+/// keeps that window safe is what the last [`FaultDiagLatch::release`] wrote
+/// over its holder, and neither fact is visible from outside: the window
+/// closes before `take` returns.
+#[cfg(not(test))]
+#[inline(always)]
+fn take_midpoint(_latch: &FaultDiagLatch) {}
+
+#[cfg(test)]
+fn take_midpoint(latch: &FaultDiagLatch) {
+    if let Some(f) = TAKE_MIDPOINT.with(|c| c.get()) {
+        f(latch);
+    }
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static TAKE_MIDPOINT: core::cell::Cell<Option<fn(&FaultDiagLatch)>> =
+        const { core::cell::Cell::new(None) };
+}
+
 /// What a CPU asking to diagnose is told.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum DiagTurn {
@@ -116,6 +139,7 @@ impl FaultDiagLatch {
     /// Ask for the latch on behalf of CPU `me`.
     pub fn take(&self, me: usize) -> DiagTurn {
         if !self.held.swap(true, Ordering::SeqCst) {
+            take_midpoint(self);
             self.cpu.store(me, Ordering::SeqCst);
             return DiagTurn::Mine;
         }
@@ -407,5 +431,109 @@ mod tests {
         // One pump per turn of the loop: the deadline is read once up front
         // and once per turn.
         assert_eq!(pumps.get(), reads.get() - 2);
+    }
+
+    // ── the window inside `take` ─────────────────────────────────────────
+
+    std::thread_local! {
+        /// `(busy, holder, whether a peer had to wait)` read from inside the
+        /// window `take` opens between the flag and the id.
+        static MIDPOINT_STATE: Cell<Option<(bool, Option<usize>, bool)>> =
+            const { Cell::new(None) };
+    }
+
+    #[test]
+    fn the_cpu_that_let_go_is_not_mistaken_for_itself_by_the_next_one() {
+        // `take` sets the flag and then publishes the id, and in between the
+        // latch is held by whoever the last `release` left written there. A
+        // CPU that released it a moment ago and faults again inside that
+        // window reads its own id back, is told it is re-entering its own
+        // diagnosis, and stops -- with its state intact and its report worth
+        // as much as anyone's. That is the freeze in the module docs, reached
+        // by the one CPU that had done nothing wrong.
+        //
+        // Nothing outside can see the window, and the only thing standing
+        // between it and that freeze is the `NOBODY` `release` writes over
+        // the old holder.
+        let l = FaultDiagLatch::new();
+        assert_eq!(l.take(CPU0), DiagTurn::Mine);
+        l.release();
+        MIDPOINT_TURN.with(|c| c.set(None));
+        TAKE_MIDPOINT.with(|c| {
+            c.set(Some(|l: &FaultDiagLatch| {
+                // The peer's own `take` runs this same seam, so stand down
+                // before re-entering.
+                TAKE_MIDPOINT.with(|c| c.set(None));
+                MIDPOINT_TURN.with(|t| t.set(Some(l.take(CPU0))));
+            }))
+        });
+        assert_eq!(l.take(CPU1), DiagTurn::Mine);
+        TAKE_MIDPOINT.with(|c| c.set(None));
+        assert_eq!(
+            MIDPOINT_TURN.with(|c| c.get()),
+            Some(DiagTurn::PeerBusy),
+            "el que solto el pestillo se creyo dentro de su propio diagnostico"
+        );
+    }
+
+    #[test]
+    fn the_latch_is_held_from_the_flag_on_and_not_from_the_id_on() {
+        // `busy` answers the flag. Answered instead with "does it name
+        // anybody", the window inside `take` reads as free: a peer faulting
+        // there is told there is nothing to wait for and formats its dump
+        // into the same console as the first CPU, and a console nobody can
+        // read is the same as no console at all -- which is the state this
+        // whole module exists to avoid.
+        let l = FaultDiagLatch::new();
+        MIDPOINT_STATE.with(|c| c.set(None));
+        TAKE_MIDPOINT.with(|c| {
+            c.set(Some(|l: &FaultDiagLatch| {
+                TAKE_MIDPOINT.with(|c| c.set(None));
+                let waited = !l.wait_for_peer(Duration::from_millis(3), ticking_clock(), || {});
+                MIDPOINT_STATE.with(|t| t.set(Some((l.busy(), l.holder(), waited))));
+            }))
+        });
+        assert_eq!(l.take(CPU0), DiagTurn::Mine);
+        TAKE_MIDPOINT.with(|c| c.set(None));
+        assert_eq!(
+            MIDPOINT_STATE.with(|c| c.get()),
+            // Held, naming nobody yet, and a peer that had to wait its turn.
+            Some((true, None, true)),
+            "el pestillo parecia libre entre la bandera y el id"
+        );
+        // ...and the window closed: by the time `take` returned it names the
+        // CPU that took it.
+        assert_eq!(l.holder(), Some(CPU0));
+    }
+
+    #[test]
+    fn the_budget_is_spent_the_moment_the_clock_reaches_it() {
+        // A deadline is a deadline, not a number to get past. One turn more
+        // is one more turn with interrupts off and deaf to the TLB-shootdown
+        // IPI a peer is spinning for, and that peer's own budget is what runs
+        // out next. Every clock below lands exactly on the deadline, which is
+        // the one reading `>=` and `>` disagree about -- and a wait that ends
+        // late still ends, so nothing else here can tell them apart.
+        let l = FaultDiagLatch::new();
+        assert_eq!(l.take(CPU0), DiagTurn::Mine);
+        for budget in [1u64, 2, 3, 8] {
+            let reads = Cell::new(0u64);
+            let finished = l.wait_for_peer(
+                Duration::from_millis(budget),
+                || {
+                    reads.set(reads.get() + 1);
+                    // 0 ms on the first reading, so the n-th lands on n-1.
+                    Duration::from_millis(reads.get() - 1)
+                },
+                || {},
+            );
+            assert!(!finished, "el peer no ha soltado nada");
+            assert_eq!(
+                reads.get(),
+                budget + 1,
+                "el plazo de {} ms no se agoto al llegar a el",
+                budget
+            );
+        }
     }
 }

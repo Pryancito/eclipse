@@ -139,7 +139,18 @@ fn in_user_half(addr: usize, bytes: usize) -> bool {
     // every configuration -- including the only one that builds on a
     // developer's host and in the unit-test job, which is `libos`. The
     // constant makes it fold away there.
-    cfg!(feature = "libos") || range_within(addr, bytes, USER_MAX)
+    in_user_half_with(cfg!(feature = "libos"), addr, bytes)
+}
+
+/// [`in_user_half`] with the exemption as an argument rather than a `cfg!`.
+///
+/// The exemption is the whole decision, and the only build this suite can
+/// compile is the one that takes it: with the flag folded in, every host test
+/// sees a constant `true` and nothing can tell an exemption from a bound that
+/// simply never fires. Passed in, both answers are reachable from a test.
+#[inline]
+fn in_user_half_with(libos: bool, addr: usize, bytes: usize) -> bool {
+    libos || range_within(addr, bytes, USER_MAX)
 }
 
 /// `access_ok()` for a raw `(addr, bytes)` pair that a device ioctl is about
@@ -900,5 +911,117 @@ mod tests {
         assert_eq!(vecs.write_from_buf(b"ABCDEFGHIJ").unwrap(), 8);
         assert_eq!(&a, b"ABCD");
         assert_eq!(&b, b"EFGH");
+    }
+
+    #[test]
+    fn the_user_half_bound_is_what_libos_turns_off_and_nothing_else() {
+        // On bare metal the kernel is mapped into EVERY address space, so a
+        // pointer that arrived from userspace naming a kernel address is not
+        // a fault waiting to happen: it resolves, and the copy lands in
+        // kernel memory. `libos` runs in a host process where "user"
+        // addresses are ordinary host addresses, so the bound does not apply
+        // there -- and that exemption is the only build this suite compiles,
+        // which is why nothing here could ever see the bound refuse anything.
+        const KERNEL: usize = 0xffff_8000_0000_0000;
+        assert!(
+            !in_user_half_with(false, KERNEL, 8),
+            "una direccion de kernel paso el limite"
+        );
+        assert!(in_user_half_with(false, 0x1000, 8));
+        assert!(
+            !in_user_half_with(false, USER_MAX - 4, 8),
+            "un rango a caballo del limite paso entero"
+        );
+        // Under the exemption every address clears it, kernel ones included.
+        assert!(in_user_half_with(true, KERNEL, 8));
+        assert!(in_user_half_with(true, usize::MAX, usize::MAX));
+        // ...and the build this suite runs in is the exempt one, which is
+        // what lets the tests below use host addresses as user pointers.
+        assert!(in_user_half(KERNEL, 8));
+    }
+
+    #[test]
+    fn a_range_the_address_space_does_not_map_is_refused_before_it_is_read() {
+        // Being in the user half says nothing about anything being mapped
+        // there, and the pointer is about to be dereferenced with no fault
+        // fixup behind it: an unmapped range is a kernel page fault the
+        // machine does not survive, reachable from any syscall by any
+        // process. `check_user_range` is the question that turns it into
+        // EFAULT, and every handler answers it `true` by default -- so until
+        // one could say `false`, nothing told whether it was asked.
+        init_handler();
+        let buf = [0u8; 32];
+        let addr = buf.as_ptr() as usize;
+        let ptr = UserInPtr::<u8>::from(addr);
+        assert!(ptr.check_len(32).is_ok());
+        crate::utils::test_frames::refuse_user_range(addr, 32);
+        assert_eq!(
+            ptr.check_len(32).err(),
+            Some(Error::InvalidPointer),
+            "el rango sin mapear paso la comprobacion"
+        );
+        crate::utils::test_frames::allow_user_range(addr, 32);
+        assert!(ptr.check_len(32).is_ok());
+    }
+
+    #[test]
+    fn a_zero_length_read_is_legal_even_from_a_null_pointer() {
+        // `read(fd, NULL, 0)` is a legal call and a zero-length iovec is a
+        // legal entry, and neither touches the pointer. Checked like a
+        // one-element read they become EFAULT, and the caller did nothing
+        // wrong.
+        init_handler();
+        assert!(UserInPtr::<u8>::from(0).read_array(0).unwrap().is_empty());
+        assert!(UserInPtr::<u8>::from(0).as_slice(0).unwrap().is_empty());
+        // Not even the alignment matters with no elements to align.
+        assert!(UserInPtr::<u64>::from(1).read_array(0).is_ok());
+    }
+
+    #[test]
+    fn a_null_pointer_is_refused_before_anything_walks_it() {
+        // Both of these walk memory with raw reads and no fault fixup behind
+        // them, so the check is not a formality: without it a NULL path or a
+        // NULL `argv` is a kernel page fault, from any process, on purpose.
+        init_handler();
+        assert_eq!(
+            UserInPtr::<u8>::from(0).as_c_str().err(),
+            Some(Error::InvalidPointer)
+        );
+        assert_eq!(
+            UserInPtr::<UserInPtr<u8>>::from(0)
+                .read_cstring_array()
+                .err(),
+            Some(Error::InvalidPointer)
+        );
+    }
+
+    #[test]
+    fn the_gather_list_stops_exactly_at_iov_max() {
+        // 1024 is `IOV_MAX`, and the count is what sizes the kernel's own
+        // allocation before a single byte is copied. The test above asks for
+        // 1025 entries out of an array of one, so the lengths it reads are
+        // whatever follows in memory and their sum overflows: the SAME error
+        // the bound gives, from the other mechanism, whatever the bound says.
+        // Here the array really has 1025 entries, so only the bound can
+        // refuse it.
+        init_handler();
+        let one = [0u8; 1];
+        let raw: Vec<IoVecIn> = (0..1025)
+            .map(|_| IoVecIn {
+                ptr: UserPtr::from(one.as_ptr() as usize),
+                len: 1,
+            })
+            .collect();
+        let p = UserInPtr::<IoVecIn>::from(raw.as_ptr() as usize);
+        assert_eq!(
+            p.read_iovecs(1024).unwrap().total_len(),
+            1024,
+            "IOV_MAX entero tiene que pasar"
+        );
+        assert_eq!(
+            p.read_iovecs(1025).err(),
+            Some(Error::InvalidLength),
+            "una entrada mas que IOV_MAX"
+        );
     }
 }

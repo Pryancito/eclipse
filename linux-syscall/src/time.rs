@@ -311,7 +311,7 @@ fn adjtimex_apply(tx: &mut Timex) -> Result<usize, LxError> {
     if modes == ADJ_OFFSET_SS_READ {
         let st = NTP_STATE.lock();
         tx.offset = st.offset_remain;
-        fill_timex_readonly(tx, &st);
+        fill_timex_readonly(tx, &st, TimeSpec::now());
         return Ok(ntp_time_state(&st));
     }
 
@@ -368,7 +368,7 @@ fn adjtimex_apply(tx: &mut Timex) -> Result<usize, LxError> {
         st.status &= !STA_NANO;
     }
 
-    fill_timex_readonly(tx, &st);
+    fill_timex_readonly(tx, &st, TimeSpec::now());
     Ok(ntp_time_state(&st))
 }
 
@@ -410,7 +410,12 @@ fn setoffset_ns(tv: &TimeValI64, nano: bool) -> Result<i64, LxError> {
     Ok(sec_ns.saturating_add(frac_ns))
 }
 
-fn fill_timex_readonly(tx: &mut Timex, st: &NtpState) {
+/// The fields `adjtimex(2)` hands back whatever the caller asked to change.
+///
+/// `now` is a parameter so a test can say what the clock reads: the unit of
+/// `tx.time.usec` is the stored `STA_NANO`, and a clock nobody chooses only
+/// tells the two apart by luck, once in a thousand reads.
+fn fill_timex_readonly(tx: &mut Timex, st: &NtpState, now: TimeSpec) {
     tx.freq = st.freq;
     tx.maxerror = st.maxerror;
     tx.esterror = st.esterror;
@@ -420,7 +425,6 @@ fn fill_timex_readonly(tx: &mut Timex, st: &NtpState) {
     tx.tolerance = MAXFREQ_SCALED;
     tx.tick = st.tick;
     tx.tai = st.tai;
-    let now = TimeSpec::now();
     tx.time.sec = now.sec as i64;
     tx.time.usec = if st.nano {
         now.nsec as i64
@@ -889,11 +893,7 @@ impl Syscall<'_> {
         let (remaining_secs, arm) = {
             let mut slots = self.linux_process().itimers().lock();
             let slot = &mut slots[ITIMER_REAL];
-            let remaining = slot
-                .deadline
-                .map(|d| d.saturating_sub(now))
-                .unwrap_or_default();
-            let remaining_secs = alarm_remaining_secs(remaining);
+            let remaining_secs = alarm_remaining_secs(slot_remaining(slot, now));
             slot.generation += 1;
             slot.interval = Duration::ZERO;
             if seconds == 0 {
@@ -1271,12 +1271,21 @@ fn itimer_signo(which: usize) -> usize {
 fn itimerval_from_slot(slot: &ItimerSlot, now: Duration) -> ITimerVal {
     ITimerVal {
         interval: slot.interval.into(),
-        value: slot
-            .deadline
-            .map(|d| d.saturating_sub(now))
-            .unwrap_or_default()
-            .into(),
+        value: slot_remaining(slot, now).into(),
     }
+}
+
+/// How much of `slot` is left at `now`; zero while it is disarmed.
+///
+/// One place, because the subtraction was written out twice -- here and in
+/// [`Syscall::sys_alarm`], which is where `alarm(2)` gets the seconds it
+/// returns. Round the wrong way and a caller is told how long the timer has
+/// been *running* instead of how long it has left, a number that grows as the
+/// deadline gets nearer, and the second copy had nothing asking it anything.
+fn slot_remaining(slot: &ItimerSlot, now: Duration) -> Duration {
+    slot.deadline
+        .map(|d| d.saturating_sub(now))
+        .unwrap_or_default()
 }
 
 /// Schedule the one-shot that fires itimer `which` of process `owner` at
@@ -1917,6 +1926,67 @@ mod adjtimex_tests {
         assert!(tx.time.sec >= 0);
     }
 
+    /// The ends of the ranges `timekeeping_validate_timex` allows, which is
+    /// where an off-by-one lives and where nothing looked: the only tick any
+    /// test named was 10000, in the middle. A tick of exactly 9000 or exactly
+    /// 11000 is Linux's own limit and has to pass; one step outside has to
+    /// fail. And `ADJ_TAI` refuses a *negative* offset, so zero -- which is
+    /// what a machine that has never been told about leap seconds reports --
+    /// has to pass.
+    #[test]
+    fn the_ends_of_the_ranges_adjtimex_allows_are_inside_them() {
+        let tick = |t: i64| Timex {
+            modes: ADJ_TICK,
+            tick: t,
+            ..Default::default()
+        };
+        assert_eq!(adjtimex_validate(&tick(9_000)), Ok(()), "el suelo entra");
+        assert_eq!(adjtimex_validate(&tick(11_000)), Ok(()), "y el techo");
+        assert_eq!(adjtimex_validate(&tick(8_999)), Err(LxError::EINVAL));
+        assert_eq!(adjtimex_validate(&tick(11_001)), Err(LxError::EINVAL));
+
+        let tai = |t: i32| Timex {
+            modes: ADJ_TAI,
+            tai: t,
+            ..Default::default()
+        };
+        assert_eq!(adjtimex_validate(&tai(0)), Ok(()), "cero no es negativo");
+        assert_eq!(adjtimex_validate(&tai(37)), Ok(()));
+        assert_eq!(adjtimex_validate(&tai(-1)), Err(LxError::EINVAL));
+    }
+
+    /// What comes back in a `timex` the caller did not ask to change. The
+    /// unit of `time.usec` is the stored `STA_NANO`, and with a clock nobody
+    /// chooses the two only tell themselves apart once in a thousand reads,
+    /// so this names the clock instead.
+    #[test]
+    fn a_timex_read_back_reports_its_fraction_in_the_unit_sta_nano_names() {
+        let now = TimeSpec {
+            sec: 1_800_000_000,
+            nsec: 123_456_789,
+        };
+        let st = NtpState::default();
+        assert!(!st.nano, "por defecto, microsegundos");
+
+        let mut micro = Timex::default();
+        fill_timex_readonly(&mut micro, &st, now);
+        assert_eq!(micro.time.sec, 1_800_000_000);
+        assert_eq!(micro.time.usec, 123_456, "microsegundos, truncados");
+        assert_eq!(micro.precision, 1, "1 us, la precision que Linux reporta");
+        assert_eq!(micro.tolerance, MAXFREQ_SCALED);
+
+        let mut nano = Timex::default();
+        fill_timex_readonly(
+            &mut nano,
+            &NtpState {
+                nano: true,
+                ..NtpState::default()
+            },
+            now,
+        );
+        assert_eq!(nano.time.usec, 123_456_789, "con STA_NANO, nanosegundos");
+    }
+
     #[test]
     fn clearing_unsync_returns_time_ok() {
         let _serialised = serialised();
@@ -2351,6 +2421,21 @@ mod tai_tests {
         // The offset only shifts the seconds: the nanoseconds are shared.
         assert_eq!(tai_time(wall, 37).nsec, wall.nsec);
     }
+
+    /// A TAI offset is only ever positive -- `ADJ_TAI` refuses a negative one
+    /// -- so a negative here can only come from a field nobody set, and it
+    /// has to move the clock nowhere rather than by its absolute value, which
+    /// would put `CLOCK_TAI` the wrong side of the wall clock.
+    #[test]
+    fn a_negative_tai_offset_moves_the_clock_nowhere() {
+        let wall = TimeSpec {
+            sec: 1_800_000_000,
+            nsec: 5,
+        };
+        assert_eq!(tai_time(wall, -1), wall);
+        assert_eq!(tai_time(wall, -37), wall);
+        assert_eq!(tai_time(wall, i32::MIN), wall, "ni el mas negativo");
+    }
 }
 
 #[cfg(test)]
@@ -2643,6 +2728,74 @@ mod overrun_tests {
 
     fn ms(n: u64) -> Duration {
         Duration::from_millis(n)
+    }
+
+    /// The boundary of "has the next expiry already gone by": one that lands
+    /// exactly on `now` is due now, so the answer has to step past it. Every
+    /// other case here sits comfortably on one side or the other, and
+    /// returning `now` itself is a timer that fires again at the same instant,
+    /// for ever.
+    #[test]
+    fn the_next_expiry_is_always_strictly_after_now() {
+        // 1000 + 100 lands exactly on 1100: that expiry fires now, so the one
+        // after it is 1200, and the period in between is the overrun.
+        let (next, overrun) = forward_periodic(ms(1000), ms(100), ms(1100));
+        assert_eq!((next, overrun), (ms(1200), 1));
+        assert!(next > ms(1100), "un vencimiento en el mismo instante");
+
+        // One nanosecond earlier and nothing has been missed at all.
+        let just_before = ms(1100) - Duration::from_nanos(1);
+        assert_eq!(
+            forward_periodic(ms(1000), ms(100), just_before),
+            (ms(1100), 0)
+        );
+    }
+
+    /// The conversion `timer_settime(2)` puts both of its `timespec` fields
+    /// through. Nothing named it: they reach it only from inside
+    /// `sys_timer_settime`, where a wrong unit still produces "some duration"
+    /// and the timer just fires at the wrong time.
+    #[test]
+    fn a_timespec_becomes_its_own_seconds_and_its_own_nanoseconds() {
+        assert_eq!(
+            timespec_to_duration(TimeSpec {
+                sec: 2,
+                nsec: 500_000_000
+            }),
+            ms(2_500)
+        );
+        assert_eq!(
+            timespec_to_duration(TimeSpec { sec: 1, nsec: 0 }),
+            Duration::from_secs(1),
+            "los segundos son segundos"
+        );
+        assert_eq!(
+            timespec_to_duration(TimeSpec { sec: 0, nsec: 1 }),
+            Duration::from_nanos(1),
+            "y los nanosegundos, nanosegundos"
+        );
+    }
+
+    /// What `getitimer(2)` and `alarm(2)` both report, in the one place it is
+    /// worked out now: the time still to run, not the time already run.
+    #[test]
+    fn a_slot_reports_the_time_it_has_left_and_not_the_time_it_has_run() {
+        let armed = ItimerSlot {
+            interval: ms(0),
+            deadline: Some(ms(1_000)),
+            generation: 0,
+        };
+        assert_eq!(slot_remaining(&armed, ms(400)), ms(600));
+        assert_eq!(slot_remaining(&armed, ms(999)), ms(1));
+        // A deadline already gone by is zero, not a wrapped duration.
+        assert_eq!(slot_remaining(&armed, ms(1_400)), Duration::ZERO);
+
+        let disarmed = ItimerSlot {
+            interval: ms(50),
+            deadline: None,
+            generation: 0,
+        };
+        assert_eq!(slot_remaining(&disarmed, ms(400)), Duration::ZERO);
     }
 
     fn a_process(pid: KoID) -> (alloc::sync::Arc<Process>, alloc::sync::Arc<Thread>) {

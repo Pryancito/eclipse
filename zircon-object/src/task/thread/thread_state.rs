@@ -181,7 +181,9 @@ fn user_status_register(saved: usize, requested: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::user_status_register;
+    use super::{user_status_register, ContextAccessState, ThreadStateKind};
+    use crate::ZxError;
+    use kernel_hal::context::UserContext;
 
     #[test]
     fn user_cpsr_cannot_change_privilege_or_interrupt_masks() {
@@ -190,5 +192,60 @@ mod tests {
         assert_eq!(result, saved | 0xf000_0c00);
         assert_eq!(result & 0x3df, 0); // EL0t, AArch64, interrupts unmasked.
         assert_eq!(user_status_register(result, 0), saved);
+    }
+
+    /// `zx_thread_read_state` answers how many bytes of state it wrote, and
+    /// the caller reads exactly that many out of a buffer it usually sized
+    /// generously. Answering the buffer's own size hands it the uninitialised
+    /// tail as if it were register values.
+    #[test]
+    fn the_count_is_the_state_that_was_written_and_not_the_room_it_went_in() {
+        let ctx = UserContext::default();
+        let width = core::mem::size_of::<kernel_hal::context::GeneralRegs>();
+
+        let mut roomy = alloc::vec![0u8; width * 4];
+        let n = ctx
+            .read_state(ThreadStateKind::General, &mut roomy)
+            .expect("el estado general siempre se puede leer");
+        assert_eq!(n, width, "lo escrito, no lo que cabia");
+        assert!(n < roomy.len(), "y el buffer era mas grande a proposito");
+
+        // One byte short is short, and the state does not go out in pieces.
+        let mut tight = alloc::vec![0u8; width - 1];
+        assert_eq!(
+            ctx.read_state(ThreadStateKind::General, &mut tight),
+            Err(ZxError::BUFFER_TOO_SMALL)
+        );
+    }
+
+    /// A debugger asks for the state it wants and is told when this kernel
+    /// does not keep it. Answering "zero bytes, fine" to a read leaves it
+    /// parsing whatever it had in the buffer as registers, and answering "done"
+    /// to a write tells it the breakpoint it just set is armed when nothing
+    /// was written at all.
+    #[test]
+    fn a_state_this_kernel_does_not_keep_is_refused_rather_than_faked() {
+        let mut ctx = UserContext::default();
+        let mut buf = [0u8; 512];
+
+        for kind in [
+            ThreadStateKind::FloatPoint,
+            ThreadStateKind::Vector,
+            ThreadStateKind::Debug,
+            ThreadStateKind::SingleStep,
+        ] {
+            assert_eq!(
+                ctx.read_state(kind, &mut buf),
+                Err(ZxError::NOT_SUPPORTED),
+                "leer {:?} no se contesta con ceros",
+                kind
+            );
+            assert_eq!(
+                ctx.write_state(kind, &buf),
+                Err(ZxError::NOT_SUPPORTED),
+                "y escribir {:?} no se traga en silencio",
+                kind
+            );
+        }
     }
 }

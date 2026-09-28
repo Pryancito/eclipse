@@ -230,4 +230,59 @@ mod tests {
         let info = bti.get_info();
         assert_eq!((info.pmo_count, info.quarantine_count), (0, 0));
     }
+
+    /// `zx_bti_pin` of nothing is not a pin of nothing: a zero-length range
+    /// has no pages, so the token would name none and unpinning it would
+    /// unpin none, while the initiator still carried it in its list for ever.
+    #[test]
+    fn a_pin_of_no_bytes_is_refused_and_leaves_the_initiator_empty() {
+        let vmo = VmObject::new_paged_with_resizable(true, 2);
+        vmo.commit(0, 2 * PAGE_SIZE).unwrap();
+        let bti = BusTransactionInitiator::create(Iommu::create(), 0);
+
+        assert_eq!(
+            bti.pin(vmo, 0, 0, IommuPerms::PERM_READ).err(),
+            Some(ZxError::INVALID_ARGS)
+        );
+        let info = bti.get_info();
+        assert_eq!((info.pmo_count, info.quarantine_count), (0, 0));
+    }
+
+    /// Quarantine is the pins whose handles are gone. Releasing it must leave
+    /// the ones still held alone: those name pages a device was told it may
+    /// read and write, and unpinning one lets the VMO move or decommit them
+    /// while the device is still using them.
+    #[test]
+    fn releasing_the_quarantine_leaves_the_pins_somebody_still_holds() {
+        let vmo = VmObject::new_paged_with_resizable(true, 2);
+        vmo.commit(0, 2 * PAGE_SIZE).unwrap();
+        let bti = BusTransactionInitiator::create(Iommu::create(), 0);
+
+        let kept = bti
+            .pin(vmo.clone(), 0, PAGE_SIZE, IommuPerms::PERM_READ)
+            .unwrap();
+        let dropped = bti
+            .pin(vmo, PAGE_SIZE, PAGE_SIZE, IommuPerms::PERM_READ)
+            .unwrap();
+        let kept_id = kept.id();
+        drop(dropped);
+
+        let info = bti.get_info();
+        assert_eq!((info.pmo_count, info.quarantine_count), (2, 1));
+
+        bti.release_quarantine();
+        let info = bti.get_info();
+        assert_eq!(
+            (info.pmo_count, info.quarantine_count),
+            (1, 0),
+            "se va el abandonado y se queda el que alguien sigue teniendo"
+        );
+        assert_eq!(kept.id(), kept_id, "y sigue siendo el mismo token");
+
+        // And when its holder lets go, the next release takes it too.
+        drop(kept);
+        bti.release_quarantine();
+        let info = bti.get_info();
+        assert_eq!((info.pmo_count, info.quarantine_count), (0, 0));
+    }
 }

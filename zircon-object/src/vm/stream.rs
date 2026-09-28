@@ -190,6 +190,7 @@ pub struct StreamInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::vm::PAGE_SIZE;
 
     #[async_std::test]
     async fn separate_streams_append_without_overwriting() {
@@ -213,5 +214,226 @@ mod tests {
         for id in 0..4u8 {
             assert_eq!(data.iter().filter(|byte| **byte == id).count(), 256);
         }
+    }
+
+    /// A one-page VMO holding `content` bytes of content, and a stream over it
+    /// positioned at `seek`.
+    fn stream_with(content: usize, seek: usize, options: u32) -> (Arc<VmObject>, Arc<Stream>) {
+        let vmo = VmObject::new_paged(1);
+        vmo.write(0, &[0xcd; PAGE_SIZE]).unwrap();
+        vmo.set_content_size(content).unwrap();
+        let stream = Stream::create(vmo.clone(), seek, options);
+        (vmo, stream)
+    }
+
+    /// The VMO is a whole page; the content size says how much of it is data.
+    /// A read that runs off the end of the content must stop there, because
+    /// what is past it is whatever the page held before -- another process's
+    /// bytes, if the page was recycled -- and the stream is how userspace
+    /// reads a VMO.
+    #[test]
+    fn a_read_stops_at_the_content_size_and_not_at_the_end_of_the_vmo() {
+        let (_vmo, stream) = stream_with(10, 0, 0);
+
+        let mut buf = [0xabu8; 64];
+        assert_eq!(
+            stream.read(&mut buf).unwrap(),
+            10,
+            "diez bytes de contenido son diez bytes de lectura"
+        );
+        assert!(
+            buf[10..].iter().all(|&b| b == 0xab),
+            "y nada mas alla del contenido llega al buffer del que lee"
+        );
+
+        // And at the end there is nothing left, however much is asked for.
+        assert_eq!(stream.read(&mut buf).unwrap(), 0);
+        assert_eq!(stream.read_at(&mut buf, 10).unwrap(), 0);
+        assert_eq!(stream.read_at(&mut buf, usize::MAX).unwrap(), 0);
+    }
+
+    /// The cursor moves by what came back, not by what was asked for. Moving
+    /// it by the request leaves it past the content after the first short read
+    /// at the end of the file, and every read after that answers zero on a
+    /// stream that still has data behind the cursor.
+    #[test]
+    fn the_cursor_moves_by_what_was_read_and_not_by_what_was_asked_for() {
+        let (_vmo, stream) = stream_with(10, 0, 0);
+
+        let mut buf = [0u8; 4];
+        assert_eq!(stream.read(&mut buf).unwrap(), 4);
+        let info = stream.get_info();
+        assert_eq!((info.seek, info.content_size), (4, 10), "cursor y tamano");
+
+        assert_eq!(stream.read(&mut buf).unwrap(), 4);
+        assert_eq!(stream.get_info().seek, 8);
+
+        // The short read at the end moves it by two, not by four.
+        assert_eq!(stream.read(&mut buf).unwrap(), 2);
+        assert_eq!(stream.get_info().seek, 10);
+        assert_eq!(stream.read(&mut buf).unwrap(), 0);
+        assert_eq!(stream.get_info().seek, 10, "y ahi se queda");
+    }
+
+    /// `zx_stream_create` takes the offset to start at, and `fdopen` on an
+    /// already-open file is where it comes from: a stream that always started
+    /// at zero would re-read the file from the top.
+    #[test]
+    fn a_stream_starts_where_it_was_told_to_and_not_at_the_top() {
+        let (_vmo, stream) = stream_with(10, 6, 0);
+
+        assert_eq!(stream.get_info().seek, 6);
+        let mut buf = [0u8; 64];
+        assert_eq!(
+            stream.read(&mut buf).unwrap(),
+            4,
+            "quedan cuatro bytes desde el seis"
+        );
+    }
+
+    /// The three origins of `zx_stream_seek` measure from three different
+    /// places, and `End` measures from the content size rather than from the
+    /// VMO: `lseek(fd, 0, SEEK_END)` is how every program asks how big a file
+    /// is, and answering the page size instead says a ten-byte file is 4096.
+    #[test]
+    fn the_three_seek_origins_measure_from_three_different_places() {
+        let (_vmo, stream) = stream_with(100, 0, 0);
+
+        assert_eq!(stream.seek(SeekOrigin::Start, 10).unwrap(), 10);
+        assert_eq!(
+            stream.seek(SeekOrigin::Current, 5).unwrap(),
+            15,
+            "Current parte de donde esta el cursor"
+        );
+        assert_eq!(
+            stream.seek(SeekOrigin::End, 0).unwrap(),
+            100,
+            "End parte del tamano del contenido, no del de la VMO"
+        );
+        assert_eq!(
+            stream.seek(SeekOrigin::End, -20).unwrap(),
+            80,
+            "y un desplazamiento negativo resta"
+        );
+        assert_eq!(stream.seek(SeekOrigin::Current, -80).unwrap(), 0);
+    }
+
+    /// A seek that would leave the number line is an error, and an error that
+    /// has already moved the cursor is worse than the seek: the next read
+    /// comes from somewhere nobody asked for. `usize` wraps, so without the
+    /// check the answer is a huge offset rather than a refusal.
+    #[test]
+    fn a_seek_that_leaves_the_number_line_is_refused() {
+        let (_vmo, stream) = stream_with(100, 0, 0);
+
+        assert_eq!(stream.seek(SeekOrigin::Start, 0).unwrap(), 0);
+        assert_eq!(
+            stream.seek(SeekOrigin::Current, -1),
+            Err(ZxError::INVALID_ARGS),
+            "antes del principio no hay nada"
+        );
+        assert_eq!(stream.get_info().seek, 0, "y el cursor no se ha movido");
+
+        assert_eq!(
+            stream.seek(SeekOrigin::Start, isize::MAX).unwrap(),
+            isize::MAX as usize
+        );
+        let far = stream.seek(SeekOrigin::Current, isize::MAX).unwrap();
+        assert_eq!(
+            far,
+            usize::MAX - 1,
+            "dos veces el maximo con signo, menos uno"
+        );
+        assert_eq!(
+            stream.seek(SeekOrigin::Current, 2),
+            Err(ZxError::INVALID_ARGS),
+            "y mas alla del ultimo numero tampoco"
+        );
+        assert_eq!(stream.get_info().seek, far as u64, "sigue donde estaba");
+    }
+
+    /// The two ways a write can be too big have two different names in the
+    /// Zircon ABI, and the check runs BEFORE any user buffer is touched. An
+    /// append is measured from the end of the content, so a stream with
+    /// content in it overflows where an empty one would not.
+    #[test]
+    fn a_write_that_would_not_fit_is_refused_by_the_name_the_abi_gives_it() {
+        let (_vmo, stream) = stream_with(1, 0, 0);
+
+        assert_eq!(stream.check_write_size(1, false, Some(0)), Ok(()));
+        assert_eq!(
+            stream.check_write_size(usize::MAX, true, None),
+            Err(ZxError::OUT_OF_RANGE),
+            "un append que se sale es OUT_OF_RANGE, y se mide desde el final \
+             del contenido"
+        );
+        assert_eq!(
+            stream.check_write_size(usize::MAX, false, Some(1)),
+            Err(ZxError::FILE_BIG),
+            "y uno posicionado es FILE_BIG"
+        );
+        assert_eq!(
+            stream.check_write_size(usize::MAX - 1, false, Some(1)),
+            Ok(()),
+            "justo lo que cabe en el numero, cabe"
+        );
+    }
+
+    /// `zx_stream_set_options` changes one bit. The read and write modes are
+    /// in the same word, and a stream that loses them is a stream nothing can
+    /// use again.
+    #[test]
+    fn turning_append_on_and_off_leaves_the_other_options_alone() {
+        let both = StreamOptions::MODE_READ.bits() | StreamOptions::MODE_WRITE.bits();
+        let (_vmo, stream) = stream_with(10, 0, both);
+
+        assert!(!stream.append_mode(), "el append no estaba pedido");
+
+        stream.set_append_mode(true);
+        assert!(stream.append_mode());
+        assert_eq!(
+            stream.get_info().options & both,
+            both,
+            "lectura y escritura siguen ahi"
+        );
+
+        stream.set_append_mode(false);
+        assert!(!stream.append_mode());
+        assert_eq!(stream.get_info().options & both, both);
+    }
+
+    /// After a write the cursor is where the write ENDED, not how long it
+    /// was. Leaving it at the length points it back at the start of what was
+    /// just written whenever the write did not begin at zero, so the next
+    /// write overwrites the last one and a program appending records writes
+    /// the same slot for ever.
+    #[test]
+    fn the_cursor_after_a_write_is_where_the_write_ended() {
+        let (_vmo, stream) = stream_with(10, 3, 0);
+
+        assert_eq!(stream.write(&[1, 2, 3, 4], false).unwrap(), 4);
+        assert_eq!(
+            stream.get_info().seek,
+            7,
+            "tres de donde empezo mas cuatro escritos"
+        );
+
+        // An append ignores the cursor and lands at the end of the content,
+        // and the cursor follows it there.
+        assert_eq!(stream.write(&[9], true).unwrap(), 1);
+        let info = stream.get_info();
+        assert_eq!((info.seek, info.content_size), (11, 11));
+    }
+
+    /// `write(fd, buf, 0)` is a legal call that does nothing, and on an append
+    /// stream "nothing" includes not moving the cursor to the end of the file.
+    #[test]
+    fn a_write_of_no_bytes_leaves_the_cursor_where_it_was() {
+        let (_vmo, stream) = stream_with(10, 3, StreamOptions::MODE_APPEND.bits());
+
+        assert_eq!(stream.write(&[], false).unwrap(), 0);
+        assert_eq!(stream.get_info().seek, 3);
+        assert_eq!(stream.write(&[], true).unwrap(), 0);
+        assert_eq!(stream.get_info().seek, 3);
     }
 }
