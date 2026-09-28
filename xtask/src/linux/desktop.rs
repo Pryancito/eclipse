@@ -1295,7 +1295,9 @@ fn write_terminal_wrapper(rootfs: &Path) {
 /// Crucially this does NOT set `MOZ_WEBRENDER=0`: modern Firefox has no
 /// non-WebRender compositor, so that would disable rendering outright (a black
 /// window). Software path uses `MOZ_WEBRENDER_SOFTWARE=1`; GPU path leaves
-/// WebRender on the hardware backend.
+/// WebRender on the hardware backend. Explicit-sync EVENTFD waits for fences
+/// to *land* (not merely submit) so labwc does not sample a half-written
+/// dmabuf — see `syncobj_eventfd::deliver_ready_waiters`.
 fn write_firefox_wrapper(rootfs: &Path) {
     let localbin = rootfs.join("usr/local/bin");
     let _ = fs::create_dir_all(&localbin);
@@ -1417,6 +1419,14 @@ pub fn write_firefox_default_prefs(rootfs: &Path) {
               // eclipse-firefox wrapper forces software when there is no GPU.\n\
               pref(\"gfx.webrender.all\", true);\n\
               pref(\"layers.acceleration.force-enabled\", true);\n\
+              // Keep WR in-process: a separate GPU process often stalls on\n\
+              // Wayland/zink teardown here and trips nsTerminator's shutdown\n\
+              // hang crash (intentional null write of reason 0xf2).\n\
+              pref(\"layers.gpu-process.enabled\", false);\n\
+              // zink+NVK / profile IO on a RAM rootfs can make a quit phase\n\
+              // exceed the stock 60s nsTerminator budget; raise it so closing\n\
+              // Firefox does not MOZ_CRASH mid-teardown.\n\
+              pref(\"toolkit.asyncshutdown.crash_timeout\", 300000);\n\
               // No hardware video decoder on many Eclipse builds: make\n\
               // YouTube and other MSE players pick H.264 (system libavcodec)\n\
               // over AV1 and VP9, the costliest codecs to decode in software.\n\
@@ -2519,7 +2529,8 @@ fn write_labwc_environment(rootfs: &Path) {
           MOZ_ENABLE_WAYLAND=1\n\
           # Pin the D-Bus session address so libdbus never `autolaunch:`es\n\
           # (dbus-launch + X11 + dbus-daemon + babysitter behind pipes -- the\n\
-          # chain SDL_Init walks first and where gzdoom hung). With no daemon\n\
+          # chain SDL_Init walks first -- not what hung gzdoom, see\n\
+          # README-desktop.md, but still a detour worth skipping). With no daemon\n\
           # the connect is refused at once and apps carry on bus-less; a\n\
           # dbus-daemon bound to this path later is picked up automatically.\n\
           DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/0/bus\n\
@@ -2788,8 +2799,10 @@ fn write_labwc_wrapper(rootfs: &Path) {
           # for an UNSET address is `autolaunch:`, which forks dbus-launch,\n\
           # which opens $DISPLAY and spawns a dbus-daemon plus a babysitter\n\
           # behind pipes -- a fork/exec/pipe chain that SDL_Init() (any flags,\n\
-          # via SDL_DBus_Init) walks before it does anything else. gzdoom hung\n\
-          # right there on real hardware. Pin the address to the conventional\n\
+          # via SDL_DBus_Init) walks before it does anything else. This was\n\
+          # NOT what hung gzdoom on real hardware (two kernel bugs were: see\n\
+          # docs/README-desktop.md), but it is still a fork/exec/pipe detour on\n\
+          # every SDL startup. Pin the address to the conventional\n\
           # user-bus path instead: with no daemon the connect fails at once\n\
           # (ECONNREFUSED) and apps carry on without a bus, and a\n\
           # `dbus-daemon --session --address=unix:path=$XDG_RUNTIME_DIR/bus`\n\
@@ -2908,6 +2921,8 @@ mod tests {
                 "pref(\"browser.cache.disk.enable\", false);\n",
                 "pref(\"browser.cache.memory.capacity\", 98304);\n",
                 "pref(\"gfx.webrender.all\", true);\n",
+                "pref(\"layers.gpu-process.enabled\", false);\n",
+                "pref(\"toolkit.asyncshutdown.crash_timeout\", 300000);\n",
                 "pref(\"media.av1.enabled\", false);\n",
                 "pref(\"media.mediasource.vp9.enabled\", false);\n",
                 "pref(\"network.http.http3.enable\", false);\n",
@@ -3199,7 +3214,8 @@ mod tests {
         );
         // The engine must not inherit the live session bus: SDL_Init calls
         // SDL_DBus_Init before anything else and libdbus has no timeout on the
-        // handshake, which is where gzdoom stopped dead after its banner.
+        // handshake. This is hygiene, not the fix for the banner hang -- that
+        // was two kernel bugs, see docs/README-desktop.md.
         assert!(
             src.contains("DBUS_SESSION_BUS_ADDRESS=unix:path=/run/eclipse-freedoom-no-bus"),
             "the engine must be pointed away from the session bus"

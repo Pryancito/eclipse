@@ -1044,8 +1044,11 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
               export GSETTINGS_BACKEND=memory\n\
               # No session bus here: pin the address so libdbus never\n\
               # `autolaunch:`es (dbus-launch + X11 + dbus-daemon behind pipes,\n\
-              # the chain SDL_Init walks first; gzdoom hung there). With no\n\
-              # daemon the connect is refused at once and apps carry on.\n\
+              # the chain SDL_Init walks first). That chain was NOT what hung\n\
+              # gzdoom -- two kernel bugs were, see README-desktop.md -- but\n\
+              # pinning it keeps a fork/exec/pipe detour out of every\n\
+              # SDL_Init: with no daemon the connect is refused at once and\n\
+              # apps carry on.\n\
               export DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/0/bus\n\
               # wlroots' libinput backend aborts the whole compositor if it\n\
               # enumerates zero input devices ('libinput initialization failed,\n\

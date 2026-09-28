@@ -12,6 +12,10 @@ mock-disk = []
 
 [dependencies]
 async-trait = "0.1.92"
+futures = { version = "0.3", default-features = false, features = [
+    "alloc",
+    "async-await",
+] }
 log = "0.4"
 xmas-elf = "0.7"
 bitflags = "1.3"

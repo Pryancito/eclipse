@@ -980,6 +980,20 @@ fn alsa_ioctl_name(cmd: u32) -> Option<&'static str> {
         (b'A', 0x60) => "PCM_LINK",
         (b'A', 0x61) => "PCM_UNLINK",
         (b'A', _) => "PCM_?",
+        (b'U', 0x00) => "CTL_PVERSION",
+        (b'U', 0x01) => "CTL_CARD_INFO",
+        (b'U', 0x10) => "CTL_ELEM_LIST",
+        (b'U', 0x11) => "CTL_ELEM_INFO",
+        (b'U', 0x12) => "CTL_ELEM_READ",
+        (b'U', 0x13) => "CTL_ELEM_WRITE",
+        (b'U', 0x16) => "CTL_SUBSCRIBE",
+        (b'U', 0x1a) => "CTL_TLV_READ",
+        (b'U', 0x30) => "CTL_PCM_NEXT_DEVICE",
+        (b'U', 0x31) => "CTL_PCM_INFO",
+        (b'U', 0x32) => "CTL_PCM_PREFER_SUBDEVICE",
+        (b'U', 0x40) => "CTL_RAWMIDI_NEXT_DEVICE",
+        (b'U', 0xd0) => "CTL_POWER",
+        (b'U', 0xd1) => "CTL_POWER_STATE",
         (b'U', _) => "CTL_?",
         (b'T', _) => "TIMER_?",
         _ => return None,
@@ -1011,6 +1025,13 @@ fn alsa_hunt(pid: KoID, num: u32, args: &[usize; 6], err: LxError) {
     }
     // ENOTTY is "this fd is not that kind of device" -- a probe, not a fault.
     if matches!(err, LxError::ENOTTY) {
+        return;
+    }
+    // CTL_PCM_INFO → ENOENT is alsa-lib / Pulse enumerating capture (or a
+    // device number we do not have). We only ship playback (`pcmC*D0p`); Linux
+    // answers the same ENOENT for a missing stream, and the caller just skips
+    // it. Logging it as ERROR made a healthy probe look like a broken card.
+    if name == "CTL_PCM_INFO" && matches!(err, LxError::ENOENT) {
         return;
     }
     // EAGAIN is "no room right now, poll and retry": the normal answer to a

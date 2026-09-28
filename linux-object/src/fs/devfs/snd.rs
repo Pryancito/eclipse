@@ -4096,7 +4096,10 @@ impl INode for CtlDev {
                 Ok(0)
             }
             0x31 => {
-                // PCM_INFO
+                // PCM_INFO (`SNDRV_CTL_IOCTL_PCM_INFO`). Only playback device 0
+                // exists (`pcmC{n}D0p`). Capture (stream=1) and any other
+                // device number correctly answer ENOENT — that is how alsa-lib
+                // and Pulse discover "no capture on this card", not a fault.
                 ucheck::<SndPcmInfo>(data)?;
                 let info = unsafe { &mut *(data as *mut SndPcmInfo) };
                 if info.device != 0 || info.stream != 0 {
