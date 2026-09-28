@@ -287,11 +287,7 @@ pub trait VmarExt {
     fn load_from_elf(&self, elf: &ElfFile) -> ZxResult<Arc<VmObject>>;
     /// Map LOAD segments by borrowing pages from a shared image VMO (no per-exec
     /// byte copy). Falls back to a private copy when a segment cannot borrow.
-    fn load_from_elf_image(
-        &self,
-        elf: &ElfFile,
-        image: &Arc<VmObject>,
-    ) -> ZxResult<Arc<VmObject>>;
+    fn load_from_elf_image(&self, elf: &ElfFile, image: &Arc<VmObject>) -> ZxResult<Arc<VmObject>>;
     /// Same as `load_from_elf`, but the `vmo` is an existing one instead of a lot of new ones.
     fn map_from_elf(&self, elf: &ElfFile, vmo: Arc<VmObject>) -> ZxResult;
 }
@@ -329,11 +325,7 @@ impl VmarExt for VmAddressRegion {
         }
     }
 
-    fn load_from_elf_image(
-        &self,
-        elf: &ElfFile,
-        image: &Arc<VmObject>,
-    ) -> ZxResult<Arc<VmObject>> {
+    fn load_from_elf_image(&self, elf: &ElfFile, image: &Arc<VmObject>) -> ZxResult<Arc<VmObject>> {
         #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
         {
             let _ = image;
@@ -527,7 +519,7 @@ fn make_vmo_from_image(
     // `padzero`); the borrower otherwise exposes whatever follows in the
     // image. One partial page at most.
     if visible > 0 && !visible.is_multiple_of(PAGE_SIZE) {
-        let page_end = ((visible + PAGE_SIZE - 1) / PAGE_SIZE) * PAGE_SIZE;
+        let page_end = visible.div_ceil(PAGE_SIZE) * PAGE_SIZE;
         let page_end = page_end.min(pages * PAGE_SIZE);
         if page_end > visible {
             vmo.zero(visible, page_end - visible)?;
