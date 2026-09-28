@@ -366,17 +366,29 @@ fn thread_fn(thread: CurrentThread) -> Pin<Box<dyn Future<Output = ()> + Send + 
 /// anyway.
 struct MarkBlocked<'a, F> {
     fut: F,
-    thread: &'a CurrentThread,
+    /// Taken as `&Thread`, not `&CurrentThread`: everything used here is a
+    /// `Thread` method, `&CurrentThread` coerces at the call site, and this way
+    /// a test can drive the future with a thread it built itself.
+    thread: &'a Thread,
     /// Whether we have marked the thread blocked and owe it an unmark.
     marked: bool,
+    /// Whether the last poll answered `Pending`, so the executor parked this
+    /// thread and the next poll is a resumption.
+    ///
+    /// Not the same question as `marked`, which is only true when the GENERIC
+    /// blocked marker took: a futex or channel wait sets its own state, so
+    /// `set_blocked` defers and `marked` stays false while the thread is very
+    /// much parked. The timeslice has to see those too.
+    parked: bool,
 }
 
 impl<'a, F> MarkBlocked<'a, F> {
-    fn new(thread: &'a CurrentThread, fut: F) -> Self {
+    fn new(thread: &'a Thread, fut: F) -> Self {
         Self {
             fut,
             thread,
             marked: false,
+            parked: false,
         }
     }
 }
@@ -389,6 +401,20 @@ impl<F: Future> Future for MarkBlocked<'_, F> {
         // never moved out or replaced, and neither `thread` (a shared
         // reference) nor `marked` (a bool) requires pinning.
         let this = unsafe { self.get_unchecked_mut() };
+        if this.parked {
+            // Resumed. Give the thread a fresh timeslice: the deadline it still
+            // carries is the one from before it went to sleep, and without this
+            // its first timer tick back would read as "ran out of time" and take
+            // the CPU straight back off it.
+            //
+            // The local bool is not redundant with the thread's own flag even
+            // though `sched_note_resumed` checks that one too: it is what keeps
+            // the fast path -- a syscall that answers on its first poll, which
+            // is nearly all of them -- from doing an atomic read-modify-write
+            // for nothing.
+            this.parked = false;
+            this.thread.sched_note_resumed();
+        }
         if this.marked {
             // Woken: running again before the inner future observes anything.
             // A no-op if something more specific (a futex wait, say) owns the
@@ -402,6 +428,10 @@ impl<F: Future> Future for MarkBlocked<'_, F> {
         if out.is_pending() {
             // Only own the state if nothing more specific already does.
             this.marked = this.thread.set_blocked(true);
+            // The slice, on the other hand, cares about every park, whoever
+            // owns the state.
+            this.parked = true;
+            this.thread.sched_note_parked();
         }
         out
     }
@@ -416,6 +446,14 @@ impl<F> Drop for MarkBlocked<'_, F> {
         }
         // `set_blocked` is a no-op unless we still own the generic state, so
         // a thread torn down mid-wait is never dragged back to `Running`.
+        if self.parked {
+            // Same reasoning for the slice flag, which lives on the thread and
+            // outlives this future: a wait cancelled here would otherwise leave
+            // it set, and the next syscall to park would find it already true
+            // and never be paired with a resume.
+            self.parked = false;
+            self.thread.sched_note_resumed();
+        }
     }
 }
 
@@ -1691,5 +1729,157 @@ mod loader_tests {
         assert_eq!(comm_from_path("/usr/bin/"), "");
         assert_eq!(comm_from_path("/"), "");
         assert_eq!(comm_from_path(""), "");
+    }
+}
+
+#[cfg(test)]
+mod park_tests {
+    //! The one place in the kernel that knows a thread has stopped running:
+    //! the poll of the syscall future answering `Pending`. `MarkBlocked` wraps
+    //! it, so both the reported thread state and the timeslice hang off these
+    //! two transitions, and nothing drove the future itself.
+
+    use super::*;
+    use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+    use zircon_object::task::Job;
+
+    fn noop_waker() -> Waker {
+        unsafe fn clone(_: *const ()) -> RawWaker {
+            RawWaker::new(core::ptr::null(), &VTABLE)
+        }
+        unsafe fn noop(_: *const ()) {}
+        static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, noop, noop, noop);
+        unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &VTABLE)) }
+    }
+
+    /// A thread that has not been `start`ed, so it is `New` and the generic
+    /// blocked marker will not take on it.
+    ///
+    /// That is not a corner the tests have to dodge, it is the case that
+    /// matters: `set_blocked` defers to whatever owns the state, so it also
+    /// answers false for a thread parked in a futex, a channel or a port wait
+    /// -- the commonest parks there are. The slice accounting has to see those
+    /// too, which is why it rides its own flag instead of `marked`.
+    fn a_thread() -> Arc<Thread> {
+        let root = Job::root();
+        let proc = Process::create(&root, "proc").expect("un proceso");
+        Thread::create(&proc, "thread").expect("un hilo")
+    }
+
+    /// A syscall that parks `pending` times before it answers.
+    struct ParksThenAnswers {
+        pending: usize,
+    }
+
+    impl Future for ParksThenAnswers {
+        type Output = usize;
+        fn poll(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<usize> {
+            if self.pending == 0 {
+                return Poll::Ready(42);
+            }
+            self.pending -= 1;
+            Poll::Pending
+        }
+    }
+
+    fn poll_once<F: Future>(fut: Pin<&mut F>) -> Poll<F::Output> {
+        let waker = noop_waker();
+        fut.poll(&mut Context::from_waker(&waker))
+    }
+
+    #[test]
+    fn a_syscall_that_answers_at_once_never_looks_like_a_park() {
+        let t = a_thread();
+        // The common case by a wide margin: `getpid`, a `read` off a warm page
+        // cache, a `write` to a pipe with room. It must cost nothing, and above
+        // all it must not earn the thread a fresh slice -- a loop of them would
+        // then never be preempted.
+        let mut fut = MarkBlocked::new(&t, ParksThenAnswers { pending: 0 });
+        let fut = unsafe { Pin::new_unchecked(&mut fut) };
+        assert_eq!(poll_once(fut), Poll::Ready(42));
+        assert!(
+            !t.sched_is_parked(),
+            "un syscall que contesta a la primera queda marcado como aparcado"
+        );
+    }
+
+    #[test]
+    fn a_syscall_that_parks_says_so_even_when_the_blocked_marker_does_not_take() {
+        let t = a_thread();
+        let mut fut = MarkBlocked::new(&t, ParksThenAnswers { pending: 1 });
+        let mut fut = unsafe { Pin::new_unchecked(&mut fut) };
+
+        assert_eq!(poll_once(fut.as_mut()), Poll::Pending);
+        assert_ne!(
+            t.state(),
+            ThreadState::Blocked,
+            "este hilo tenia que ser de los que el marcador generico no coge"
+        );
+        assert!(
+            t.sched_is_parked(),
+            "el hilo se duerme sin que la contabilidad del slice se entere"
+        );
+
+        assert_eq!(poll_once(fut.as_mut()), Poll::Ready(42));
+        assert!(
+            !t.sched_is_parked(),
+            "el hilo despierta y sigue contando como aparcado, asi que el \
+             siguiente poll se regalaria otro slice"
+        );
+    }
+
+    #[test]
+    fn the_thread_gets_a_fresh_slice_the_moment_it_is_polled_again() {
+        let t = a_thread();
+        // Deja el slice corriendo, como el hilo que estaba en la CPU.
+        t.tick_should_preempt();
+        let mut fut = MarkBlocked::new(&t, ParksThenAnswers { pending: 1 });
+        let mut fut = unsafe { Pin::new_unchecked(&mut fut) };
+
+        assert_eq!(poll_once(fut.as_mut()), Poll::Pending);
+        // Aqui el hilo duerme lo que sea: un `read` de disco, un futex, un
+        // `nanosleep`. Vuelve con la fecha limite de antes de dormirse, y lo
+        // que la suelta es este segundo poll.
+        assert_eq!(poll_once(fut.as_mut()), Poll::Ready(42));
+        assert!(
+            !t.tick_should_preempt(),
+            "el primer tick tras despertar le quita la CPU"
+        );
+    }
+
+    #[test]
+    fn a_wait_cancelled_while_parked_does_not_leave_the_flag_behind() {
+        let t = a_thread();
+        {
+            let mut fut = MarkBlocked::new(&t, ParksThenAnswers { pending: 1 });
+            let mut fut = unsafe { Pin::new_unchecked(&mut fut) };
+            assert_eq!(poll_once(fut.as_mut()), Poll::Pending);
+            assert!(t.sched_is_parked());
+        }
+        // El hilo muere en mitad de la espera, o la llamada se cancela. El flag
+        // vive en el hilo y sobrevive al future: si se queda puesto, el proximo
+        // syscall que aparque se lo encuentra ya a true y nadie lo empareja.
+        assert!(
+            !t.sched_is_parked(),
+            "una espera cancelada deja el hilo marcado como aparcado para siempre"
+        );
+    }
+
+    #[test]
+    fn parking_twice_is_forgiven_twice() {
+        let t = a_thread();
+        let mut fut = MarkBlocked::new(&t, ParksThenAnswers { pending: 2 });
+        let mut fut = unsafe { Pin::new_unchecked(&mut fut) };
+
+        for _ in 0..2 {
+            assert_eq!(poll_once(fut.as_mut()), Poll::Pending);
+            assert!(t.sched_is_parked());
+        }
+        assert_eq!(poll_once(fut.as_mut()), Poll::Ready(42));
+        assert!(
+            !t.sched_is_parked(),
+            "dos aparcadas seguidas dejan la marca puesta"
+        );
+        assert!(!t.tick_should_preempt());
     }
 }

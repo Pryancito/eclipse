@@ -3,7 +3,9 @@ mod thread_state;
 pub use self::thread_state::ThreadStateKind;
 
 use alloc::{boxed::Box, sync::Arc};
-use core::sync::atomic::{AtomicI8, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use core::sync::atomic::{
+    AtomicBool, AtomicI8, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering,
+};
 use core::task::{Context, Poll, Waker};
 use core::time::Duration;
 use core::{any::Any, future::Future, pin::Pin};
@@ -157,16 +159,16 @@ fn slice_verdict(now: u64, end: u64, slice: u64) -> (bool, u64) {
     // on a CPU for that span: this runs from the timer interrupt of the thread
     // that is executing, and the scheduler tick is milliseconds, so an expiry
     // is seen at the first tick after it and never a whole slice late. So the
-    // deadline is the stale one from before the thread blocked, and what we are
-    // looking at is a thread that has just woken up.
+    // deadline is the stale one from before the thread blocked.
     //
-    // Preempting it here was measured: a thread that slept one second came back
-    // with `tick_should_preempt()` answering true on its very first tick, after
-    // running for microseconds. Every blocking `read`, every `nanosleep` longer
-    // than the slice, every futex wait, cost the woken thread the CPU at once --
-    // the exact opposite of the wake-up preemption in the run loop, which exists
-    // to HAND it the CPU. The slice is meant to be time spent running, and wall
-    // clock is only the same thing while the thread is on a core.
+    // This is the BACKSTOP, not the mechanism. What a woken thread gets its
+    // fresh slice from is [`Thread::sched_note_resumed`], which knows it woke
+    // instead of inferring it -- and has to, because the clock cannot see a
+    // short wait at all: a thread that runs 15 ms, waits 8 ms on a futex and
+    // wakes has a deadline only 3 ms in the past, which is exactly what a late
+    // tick looks like, and a media thread whose audio callback fires every
+    // 10 ms is that shape every time. This arm covers whatever parks a thread
+    // without passing through that call.
     if now - end > slice {
         return (false, now.saturating_add(slice));
     }
@@ -219,6 +221,15 @@ struct SchedAttr {
     /// timer traffic the machine happens to have. A 20 ms slice has to stay
     /// 20 ms whether that is 5 interrupts or 500.
     slice_end_ns: AtomicU64,
+    /// Set while this thread's future is parked: the last poll returned
+    /// `Pending`, so the executor gave the CPU to somebody else.
+    ///
+    /// This is what tells a resumption from a plain poll, and it is the only
+    /// exact answer available. The clock cannot give it: a thread that runs
+    /// 15 ms, waits 8 ms on a futex and wakes has a deadline only 3 ms in the
+    /// past, which is indistinguishable from a late tick -- and a media thread
+    /// whose audio callback fires every 10 ms is exactly that shape.
+    parked: AtomicBool,
 }
 
 impl Default for SchedAttr {
@@ -228,6 +239,7 @@ impl Default for SchedAttr {
             nice: AtomicI8::new(0),
             rt_priority: AtomicU8::new(0),
             slice_end_ns: AtomicU64::new(0),
+            parked: AtomicBool::new(false),
         }
     }
 }
@@ -595,6 +607,42 @@ impl Thread {
         // Drop the remainder of the old slice; the next tick starts a fresh one
         // from the new policy/nice (see `tick_should_preempt`).
         self.sched.slice_end_ns.store(0, Ordering::Relaxed);
+    }
+
+    /// Note that the executor has parked this thread: its future answered
+    /// `Pending` and somebody else has the CPU now.
+    ///
+    /// Paired with [`Thread::sched_note_resumed`], which is what makes the
+    /// timeslice measure time spent running instead of time on the wall clock.
+    pub fn sched_note_parked(&self) {
+        self.sched.parked.store(true, Ordering::Relaxed);
+    }
+
+    /// Note that the executor is polling this thread again, and give it a fresh
+    /// slice if the previous poll had parked it.
+    ///
+    /// A thread that blocked keeps the deadline it had before it went to sleep,
+    /// so coming back looked exactly like running out of time: on its FIRST
+    /// timer tick after waking, [`Thread::tick_should_preempt`] answered true
+    /// and the thread lost the CPU after running for microseconds. Every
+    /// blocking `read`, every `nanosleep`, every futex wait paid for it -- the
+    /// opposite of the wake-up preemption in the run loop, which exists to HAND
+    /// the CPU to a thread that just woke.
+    ///
+    /// The park flag is the exact answer where the clock can only guess: it is
+    /// set only by a poll that really answered `Pending`, so a future that was
+    /// ready straight away never looks like a wake and cannot help itself to a
+    /// free slice.
+    pub fn sched_note_resumed(&self) {
+        if self.sched.parked.swap(false, Ordering::Relaxed) {
+            self.sched.slice_end_ns.store(0, Ordering::Relaxed);
+        }
+    }
+
+    /// Whether the executor has this thread parked: its last poll answered
+    /// `Pending`, so the next one is a resumption and owes it a fresh slice.
+    pub fn sched_is_parked(&self) -> bool {
+        self.sched.parked.load(Ordering::Relaxed)
     }
 
     /// Length of this thread's timeslice in nanoseconds.
@@ -2095,6 +2143,77 @@ mod sched_tests {
             slice_verdict(u64::MAX, 0, SLICE),
             (false, u64::MAX),
             "el primer slice al final del reloj da la vuelta"
+        );
+    }
+
+    /// The fix the clock cannot do on its own: a wait SHORTER than a slice.
+    ///
+    /// A media thread runs 15 ms, waits 8 ms for its audio callback and wakes.
+    /// Its deadline is 3 ms in the past, which is exactly what a late tick looks
+    /// like, so `slice_verdict` preempts it -- correctly, on the evidence it
+    /// has. The park flag is the evidence it does not have.
+    #[test]
+    fn a_wait_shorter_than_a_slice_still_gets_a_fresh_slice_when_the_thread_says_it_parked() {
+        let t = a_thread();
+        let slice = t.timeslice_ns();
+        let now = kernel_hal::timer::timer_now().as_nanos() as u64;
+        // Corrio 15 ms, esperó 8 ms: la fecha limite quedo 3 ms atras.
+        let end = now.saturating_sub(3_000_000);
+        t.sched.slice_end_ns.store(end, Ordering::Relaxed);
+        // Sin el flag, el reloj no puede saberlo y lo desaloja.
+        assert!(
+            slice_verdict(now, end, slice).0,
+            "el reloj deberia ver esto como un slice agotado; es lo unico que puede ver"
+        );
+        // Con el flag, el hilo lo dice.
+        t.sched_note_parked();
+        t.sched_note_resumed();
+        assert_eq!(
+            t.sched.slice_end_ns.load(Ordering::Relaxed),
+            0,
+            "despertar de una espera corta no da slice nuevo"
+        );
+        assert!(
+            !t.tick_should_preempt(),
+            "y el primer tick tras despertar sigue quitandole la CPU"
+        );
+    }
+
+    #[test]
+    fn a_poll_that_never_parked_does_not_help_itself_to_a_fresh_slice() {
+        let t = a_thread();
+        let now = kernel_hal::timer::timer_now().as_nanos() as u64;
+        let end = now.saturating_sub(4_000_000);
+        t.sched.slice_end_ns.store(end, Ordering::Relaxed);
+        // Un future que estaba listo a la primera no aparca, asi que resumed()
+        // no tiene nada que perdonar.
+        t.sched_note_resumed();
+        assert_eq!(
+            t.sched.slice_end_ns.load(Ordering::Relaxed),
+            end,
+            "un poll que no aparco se regala un slice"
+        );
+        assert!(
+            t.tick_should_preempt(),
+            "y ademas se queda la CPU con el slice agotado"
+        );
+    }
+
+    #[test]
+    fn a_park_is_forgiven_once_and_not_twice() {
+        let t = a_thread();
+        t.sched_note_parked();
+        t.sched_note_resumed();
+        let now = kernel_hal::timer::timer_now().as_nanos() as u64;
+        let end = now.saturating_sub(4_000_000);
+        t.sched.slice_end_ns.store(end, Ordering::Relaxed);
+        // El segundo resumed() sin un parked() por delante no hace nada: si lo
+        // hiciera, un hilo que nunca se bloquea no se desalojaria jamas.
+        t.sched_note_resumed();
+        assert_eq!(
+            t.sched.slice_end_ns.load(Ordering::Relaxed),
+            end,
+            "un solo aparcado perdona dos despertares"
         );
     }
 
