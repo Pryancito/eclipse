@@ -54,8 +54,22 @@ fn xhci_spin_delay_us(delay_us: u64) {
 }
 
 // PORTSC bits RW1C (port change). Hay que mantenerlos a 0 salvo cuando queramos limpiarlos.
+//
+// Los siete que define xHCI 1.2 (tabla 5-27), todos RW1CS:
+//   CSC (17) Connect Status Change      PEC (18) Port Enabled/Disabled Change
+//   WRC (19) Warm Port Reset Change     OCC (20) Over-current Change
+//   PRC (21) Port Reset Change          PLC (22) Port Link State Change
+//   CEC (23) Port Config Error Change
+//
+// CEC faltaba, y faltar aqui es peor que no mirarlo: como tampoco entraba en
+// `PORTSC_RW1C_AND_RO_MASK`, cada reescritura de una muestra de PORTSC --
+// encender el puerto, lanzar un reset, reconocer un CSC -- le escribia un 1 y
+// lo borraba sin que nadie lo hubiera leido. Un puerto USB3 que no consigue
+// configurar su enlace levanta CEC y solo CEC: el error se perdia ahi, ningun
+// camino lo contaba como cambio, y el puerto se quedaba mudo sin una linea en
+// el log. QEMU no levanta CEC nunca; el hardware de verdad si.
 const PORTSC_CHANGE_BITS: u32 =
-    (1 << 17) | (1 << 18) | (1 << 19) | (1 << 20) | (1 << 21) | (1 << 22);
+    (1 << 17) | (1 << 18) | (1 << 19) | (1 << 20) | (1 << 21) | (1 << 22) | (1 << 23);
 
 // PORTSC bits que son RW1C pero NO son "change" flags — escribir 1 los borra.
 // PED (bit 1) es RW1C: escribir 1 deshabilita el puerto. Siempre hay que enmascararlo
@@ -67,6 +81,25 @@ const PORTSC_CHANGE_BITS: u32 =
 // Reescribir un `sc` muestreado segundos antes podia, por tanto, relanzar un
 // reset de puerto en mitad de la vida del dispositivo.
 const PORTSC_RW1C_AND_RO_MASK: u32 = PORTSC_CHANGE_BITS | (1 << 1) | (1 << 4) | (1u32 << 31); // PED, PR, WPR
+
+/// The value to write into PORTSC, built from a sample `sc` of it.
+///
+/// `set` is what we actually want this write to do -- acknowledge a change bit,
+/// power the port (PP), assert a reset (PR). Everything else is carried over
+/// from the sample with [`PORTSC_RW1C_AND_RO_MASK`] stripped, because carrying
+/// one of those bits over *does something*: PED disables the port, PR and WPR
+/// relaunch a port reset in the middle of a device's life, and a change bit is
+/// acknowledged without anyone having acted on it.
+///
+/// This expression was written out eight times, and a bit missing from the mask
+/// is therefore a bug in all eight at once -- which is exactly how CEC came to
+/// be cleared behind our back. One function, one place to get it right, and one
+/// place for a test to reach.
+#[inline]
+fn portsc_writeback(sc: u32, set: u32) -> u32 {
+    (sc & !PORTSC_RW1C_AND_RO_MASK) | set
+}
+
 /// Reintentos consecutivos de enumeracion por puerto antes de rendirse hasta
 /// el siguiente CSC.
 const PORT_ENUM_MAX_RETRIES: u8 = 3;
@@ -348,7 +381,13 @@ impl XhciMmio {
         let caplength = (unsafe { read_volatile(cap as *const u32) } & 0xFF) as u64;
         let rtsoff = (unsafe { read_volatile((cap + 0x18) as *const u32) } & 0xFFFF_FFFC) as u64;
         let dboff = (unsafe { read_volatile((cap + 0x14) as *const u32) } & 0xFFFF_FFFC) as u64;
-        if caplength as usize > bar_size || rtsoff as usize > bar_size || dboff as usize > bar_size
+        // Cada uno de estos es la base de una ventana de registros, asi que lo
+        // que tiene que caber es la base MAS un registro de 32 bits. Con
+        // `> bar_size` una base podia quedarse justo en el final de la BAR --o
+        // a cuatro bytes de el-- y cada acceso a traves de ella caia fuera.
+        if caplength as usize + 4 > bar_size
+            || rtsoff as usize + 4 > bar_size
+            || dboff as usize + 4 > bar_size
         {
             return Err(DeviceError::InvalidParam);
         }
@@ -384,7 +423,9 @@ impl XhciMmio {
         }
         let mut cap_ptr = xecp << 2;
         let mut cap_steps = 0usize;
-        while cap_ptr != 0 && cap_ptr < self.bar_size {
+        // `cap_ptr + 4`, no `cap_ptr`: el encabezado de capacidad que se lee
+        // debajo son cuatro bytes, y una BAR podria no estar alineada a dword.
+        while cap_ptr != 0 && cap_ptr + 4 <= self.bar_size {
             if cap_steps >= XHCI_MAX_XECP_TRAVERSAL {
                 warn!("[xhci] xECP chain demasiado larga/cíclica, abortando handoff");
                 break;
@@ -423,8 +464,22 @@ impl XhciMmio {
 
                 // Desactivar SMIs y limpiar estados pendientes (USBLEGCTLSTS = offset 4)
                 // Escribir 0xFFFF0000 para limpiar bits RW1C y desactivar enable bits.
-                if cap_ptr + 4 <= self.bar_size {
+                //
+                // El registro son CUATRO bytes en `cap_ptr + 4`, asi que lo que
+                // tiene que caber es `cap_ptr + 8`. Con `cap_ptr + 4 <= bar_size`
+                // una capacidad legacy en el ultimo dword de la BAR pasaba la
+                // comprobacion y el `write_volatile` se iba entero fuera de la
+                // ventana: un dword de 0xffff0000 en lo que hubiera detras,
+                // que en PCI es un abort o la MMIO del vecino. Medido con una
+                // BAR falsa, el dword siguiente al final salia escrito.
+                if cap_ptr + 8 <= self.bar_size {
                     self.write_cap(cap_ptr + 4, 0xffff_0000);
+                } else {
+                    warn!(
+                        "[xhci] capacidad legacy en 0x{:x} sin sitio para USBLEGCTLSTS \
+                         dentro de la BAR ({} bytes), SMIs sin desactivar",
+                        cap_ptr, self.bar_size
+                    );
                 }
                 return;
             }
@@ -874,11 +929,21 @@ impl XferRing {
         Some(self.buf.read_u64((phys - base) as usize))
     }
 
-    /// The TRB physically before `phys` in this ring, wrapping at the start.
+    /// The TRANSFER TRB physically before `phys` in this ring, wrapping past the
+    /// Link TRB that closes the segment.
+    ///
+    /// The slot before the first one is the last DATA slot, `cap - 1`, and not
+    /// the Link TRB that lives at `cap`. A Link TRB is not a transfer TRB and
+    /// never completes: its pointer field holds this ring's own base address, so
+    /// [`Self::trb_buffer_at`] answered that base as if it were a report buffer.
+    /// The one caller compares that answer against the report buffer it is
+    /// expecting, which means at every lap of the ring the comparison could not
+    /// match and the dispatch head was resynced from the wrong TRB -- on a mouse
+    /// reporting 125 times a second, a 64-TRB ring laps twice a second.
     fn prev_trb_phys(&self, phys: u64) -> u64 {
         let base = self.buf.phys as u64;
         if phys <= base {
-            base + (self.cap as u64) * 16
+            base + (self.cap.saturating_sub(1) as u64) * 16
         } else {
             phys - 16
         }
@@ -2558,14 +2623,14 @@ impl XhciInner {
         info!("[xhci] controlador en marcha");
 
         // Energía de puertos (Port Power, PP = bit 9).
-        // Se usa PORTSC_RW1C_AND_RO_MASK para nunca escribir 1 en PED (bit 1, RW1C) ni en
+        // Se pasa por `portsc_writeback` para nunca escribir 1 en PED (bit 1, RW1C) ni en
         // los bits de cambio, lo que borraría accidentalmente la habilitación del puerto.
         for p in 1..=self.max_ports {
             let off = 0x400 + (p as usize - 1) * 0x10;
             let sc = m.read_op(off);
             if (sc & (1 << 9)) == 0 {
                 info!("[xhci] encendiendo puerto {} (PP=0 → 1)", p);
-                m.write_op(off, (sc & !PORTSC_RW1C_AND_RO_MASK) | (1 << 9));
+                m.write_op(off, portsc_writeback(sc, 1 << 9));
             }
         }
         // Pequeña espera tras dar energía (USB spec exige ≥100ms de VBUS estable antes de
@@ -2636,8 +2701,7 @@ impl XhciInner {
         // Ensure port power if the controller reports it as off.
         if (portsc & (1 << 9)) == 0 {
             info!("[xhci] puerto {}: PP=0, encendiendo", port);
-            self.mmio
-                .write_op(off, (portsc & !PORTSC_RW1C_AND_RO_MASK) | (1 << 9));
+            self.mmio.write_op(off, portsc_writeback(portsc, 1 << 9));
             xhci_spin_delay_us(100_000);
             portsc = self.mmio.read_op(off);
         }
@@ -2650,8 +2714,7 @@ impl XhciInner {
         // Reset del puerto (PR=1)
         if needs_reset {
             info!("[xhci] puerto {}: emitiendo reset", port);
-            self.mmio
-                .write_op(off, (portsc & !PORTSC_RW1C_AND_RO_MASK) | (1 << 4));
+            self.mmio.write_op(off, portsc_writeback(portsc, 1 << 4));
 
             // Espera robusta de reset (100ms)
             let mut success = false;
@@ -2680,8 +2743,7 @@ impl XhciInner {
 
         // Limpiar bits de cambio (CSC, PRC, etc) escribiendo 1; conservar PP, PED, etc.
         let clr = PORTSC_CHANGE_BITS;
-        self.mmio
-            .write_op(off, (portsc & !PORTSC_RW1C_AND_RO_MASK) | clr);
+        self.mmio.write_op(off, portsc_writeback(portsc, clr));
 
         // Pequeño delay tras reset para estabilización del link
         xhci_spin_delay_us(10_000);
@@ -2701,16 +2763,14 @@ impl XhciInner {
                 if (s & 1) == 0 {
                     return Ok(());
                 }
-                self.mmio
-                    .write_op(off, (s & !PORTSC_RW1C_AND_RO_MASK) | (1 << 4));
+                self.mmio.write_op(off, portsc_writeback(s, 1 << 4));
                 xhci_spin_delay_us(100_000);
                 let spd_retry = self.wait_port_ready(off, true).unwrap_or_else(|| {
                     s = self.mmio.read_op(off);
                     ((s >> 10) & 0x0f) as u8
                 });
                 s = self.mmio.read_op(off);
-                self.mmio
-                    .write_op(off, (s & !PORTSC_RW1C_AND_RO_MASK) | clr);
+                self.mmio.write_op(off, portsc_writeback(s, clr));
                 xhci_spin_delay_us(50_000);
                 if spd_retry == 0 || (self.mmio.read_op(off) & 1) == 0 {
                     return Ok(());
@@ -3971,8 +4031,17 @@ impl XhciInner {
         // the port was dead until reboot.
         let acked = sc & PORTSC_CHANGE_BITS;
         if acked != 0 {
-            self.mmio
-                .write_op(off, (sc & !PORTSC_RW1C_AND_RO_MASK) | acked);
+            self.mmio.write_op(off, portsc_writeback(sc, acked));
+        }
+        // CEC: el puerto no pudo configurar su enlace. No hay nada que hacer
+        // desde aqui --el reconocimiento de arriba lo limpia y el propio
+        // controlador reintenta-- pero sin esta linea un USB3 que no llega a
+        // enlazar es un puerto mudo sin una sola pista en el log.
+        if (sc & (1 << 23)) != 0 {
+            warn!(
+                "[xhci] puerto {}: CEC, el puerto no pudo configurarse (PORTSC=0x{:08x})",
+                port_id, sc
+            );
         }
         if (sc & (1 << 17)) != 0 {
             let ccs = (sc & 1) != 0;
@@ -5631,5 +5700,464 @@ mod msi_tests {
             assert_eq!(q.len(), MAX_MSI_PENDING);
             assert_eq!(q[0].0, 5, "the oldest entries were not the ones dropped");
         })
+    }
+}
+
+#[cfg(test)]
+mod portsc_tests {
+    use super::*;
+
+    /// Every bit xHCI marks RW1C or RW1S in PORTSC, with the name it goes by.
+    /// `portsc_writeback` must strip all of them from the sample, because
+    /// carrying any one of them over from a read *acts*.
+    const WRITE_ONE_DOES_SOMETHING: &[(u32, &str)] = &[
+        (1, "PED (deshabilita el puerto)"),
+        (4, "PR (relanza un reset)"),
+        (17, "CSC (reconoce una conexion)"),
+        (18, "PEC (reconoce un cambio de habilitacion)"),
+        (19, "WRC (reconoce un warm reset)"),
+        (20, "OCC (reconoce una sobrecorriente)"),
+        (21, "PRC (reconoce un reset)"),
+        (22, "PLC (reconoce un cambio de enlace)"),
+        (23, "CEC (reconoce un error de configuracion)"),
+        (31, "WPR (relanza un warm reset)"),
+    ];
+
+    #[test]
+    fn a_write_back_carries_over_no_bit_that_writing_one_to_would_act_on() {
+        // The worst sample there is: every bit set.
+        let out = portsc_writeback(u32::MAX, 0);
+        for (bit, name) in WRITE_ONE_DOES_SOMETHING {
+            assert_eq!(
+                out & (1 << bit),
+                0,
+                "el bit {} {} viaja de la muestra a la escritura",
+                bit,
+                name
+            );
+        }
+    }
+
+    #[test]
+    fn a_write_back_sets_exactly_what_it_was_asked_to_and_keeps_the_rest() {
+        // PP (9), PLS (5..8) and the speed field (10..13) are RWS or RO: they
+        // have to survive, or powering a port would also reset its link state.
+        let sc = (1 << 9) | (0x5 << 5) | (0x3 << 10) | 1 /* CCS */;
+        let out = portsc_writeback(sc, 1 << 4);
+        assert_eq!(out & (1 << 9), 1 << 9, "PP no sobrevive a la reescritura");
+        assert_eq!(out & (0xf << 5), 0x5 << 5, "PLS no sobrevive");
+        assert_eq!(out & (0xf << 10), 0x3 << 10, "la velocidad no sobrevive");
+        assert_eq!(out & (1 << 4), 1 << 4, "PR no se pone");
+        assert_eq!(
+            out & !((1 << 9) | (0xf << 5) | (0xf << 10) | (1 << 4) | 1),
+            0,
+            "la reescritura pone bits que nadie pidio"
+        );
+    }
+
+    /// The bug: a Port Config Error was cleared by every unrelated write.
+    #[test]
+    fn a_port_config_error_is_a_change_like_the_other_six() {
+        assert_ne!(
+            PORTSC_CHANGE_BITS & (1 << 23),
+            0,
+            "CEC no cuenta como cambio de puerto, asi que nada reexamina el puerto"
+        );
+        // A sample where CEC is the only thing set, written back to power the
+        // port: CEC must still be there afterwards.
+        let out = portsc_writeback(1 << 23, 1 << 9);
+        assert_eq!(
+            out & (1 << 23),
+            0,
+            "encender el puerto le escribe un 1 a CEC y borra el error"
+        );
+        // And acknowledged on purpose, it is.
+        let acked = 1u32 << 23 & PORTSC_CHANGE_BITS;
+        assert_eq!(
+            portsc_writeback(1 << 23, acked) & (1 << 23),
+            1 << 23,
+            "un CEC reconocido a proposito no se escribe"
+        );
+    }
+
+    #[test]
+    fn the_change_mask_is_the_seven_change_bits_and_nothing_else() {
+        assert_eq!(
+            PORTSC_CHANGE_BITS, 0x00fe_0000,
+            "la mascara de cambios no son exactamente los bits 17..=23"
+        );
+    }
+}
+
+#[cfg(test)]
+mod ring_tests {
+    use super::*;
+
+    /// A transfer ring of `n` TRBs: `n - 1` usable slots and a Link TRB in the
+    /// last one. `XferRing::new(8)` is the smallest size worth testing and
+    /// `XferRing::new(64)` is what an interrupt endpoint actually gets.
+    fn a_ring(n: usize) -> XferRing {
+        XferRing::new(n).expect("un anillo de transferencia")
+    }
+
+    /// Fill `count` slots with TRBs whose buffer pointers say which slot they
+    /// are, advancing the dequeue head so the ring never refuses one.
+    fn fill(r: &mut XferRing, count: usize) {
+        for i in 0..count {
+            if r.is_full() {
+                r.advance_dequeue(1);
+            }
+            r.push(trb_normal(buf_of(i), 8, true)).expect("un push");
+        }
+    }
+
+    fn buf_of(i: usize) -> u64 {
+        0xdead_0000 + (i as u64) * 0x1000
+    }
+
+    /// The bug. `prev_trb_phys` exists so a Transfer Event that points at the
+    /// TRB *after* the completed one (VirtualBox does this) can still be traced
+    /// back to the buffer that was filled. At the first slot it answered the
+    /// Link TRB, whose pointer field is the ring's own base address.
+    #[test]
+    fn the_trb_before_the_first_one_is_the_last_transfer_trb_and_not_the_link() {
+        let mut r = a_ring(8);
+        let base = r.buf.phys as u64;
+        let last_data = r.cap - 1;
+        let cap = r.cap;
+        fill(&mut r, cap);
+        let prev = r.prev_trb_phys(base);
+        assert_eq!(
+            (prev - base) / 16,
+            last_data as u64,
+            "el TRB anterior al primero es el indice {}, no el ultimo de datos ({})",
+            (prev - base) / 16,
+            last_data
+        );
+        assert_eq!(
+            r.trb_buffer_at(prev),
+            Some(buf_of(last_data)),
+            "el TRB anterior al primero no lleva el buffer del ultimo de datos"
+        );
+    }
+
+    #[test]
+    fn the_link_trb_is_never_answered_as_if_it_carried_a_report_buffer() {
+        let mut r = a_ring(8);
+        let base = r.buf.phys as u64;
+        let cap = r.cap;
+        fill(&mut r, cap);
+        for slot in 0..=r.cap {
+            let phys = base + (slot as u64) * 16;
+            let prev = r.prev_trb_phys(phys);
+            assert!(
+                (prev - base) / 16 < r.cap as u64,
+                "prev_trb_phys del indice {} contesta el indice {}, que es el TRB LINK",
+                slot,
+                (prev - base) / 16
+            );
+            assert_ne!(
+                r.trb_buffer_at(prev),
+                Some(base),
+                "prev_trb_phys del indice {} contesta la base del anillo como buffer",
+                slot
+            );
+        }
+    }
+
+    /// xHCI 1.2 section 4.9.2.2: the Link TRB's Cycle bit belongs to the pass
+    /// that just ended, and its Toggle Cycle bit has to stay set or the
+    /// controller never flips its own cycle state.
+    #[test]
+    fn a_ring_that_laps_publishes_the_link_cycle_of_the_pass_that_just_ended() {
+        let mut r = a_ring(8);
+        let link_ctrl = r.cap * 16 + 12;
+        assert!(
+            r.cycle,
+            "el anillo no empieza con el ciclo del productor a 1"
+        );
+        let cap = r.cap;
+        fill(&mut r, cap);
+        assert_eq!(r.enq, 0, "el anillo no ha dado la vuelta");
+        assert_eq!(
+            r.buf.read_u32(link_ctrl) & 1,
+            1,
+            "el TRB LINK no lleva el ciclo de la vuelta que acaba de terminar"
+        );
+        assert_eq!(
+            r.buf.read_u32(link_ctrl) & (1 << 1),
+            1 << 1,
+            "el TRB LINK ha perdido su Toggle Cycle"
+        );
+        assert!(
+            !r.cycle,
+            "el ciclo del productor no ha cambiado en la vuelta"
+        );
+        let cap = r.cap;
+        fill(&mut r, cap);
+        assert_eq!(
+            r.buf.read_u32(link_ctrl) & 1,
+            0,
+            "el TRB LINK no lleva el ciclo de la segunda vuelta"
+        );
+        assert!(r.cycle, "el ciclo del productor no ha vuelto a cambiar");
+    }
+
+    #[test]
+    fn a_full_ring_refuses_a_trb_instead_of_overwriting_one_not_yet_consumed() {
+        let mut r = a_ring(8);
+        let mut pushed = 0usize;
+        while r.push(trb_normal(buf_of(pushed), 8, true)).is_ok() {
+            pushed += 1;
+            assert!(pushed <= r.cap, "el anillo acepta mas TRB que huecos");
+        }
+        assert_eq!(
+            pushed,
+            r.cap - 1,
+            "un anillo de {} huecos acepta {} TRB sin que nadie consuma",
+            r.cap,
+            pushed
+        );
+        let enq = r.enq;
+        assert!(r.push(trb_normal(0x1000, 8, true)).is_err());
+        assert_eq!(
+            r.enq, enq,
+            "un push rechazado ha movido la cabeza de encolado"
+        );
+    }
+
+    /// The DCS field of Set TR Dequeue Pointer has to be the cycle the
+    /// controller will find on the TRB at the dequeue head, which after a lap
+    /// is the previous pass's, not the producer's current one.
+    #[test]
+    fn the_dequeue_head_carries_the_cycle_stamped_on_its_own_trb() {
+        let mut r = a_ring(8);
+        let base = r.buf.phys as u64;
+        let cap = r.cap;
+        fill(&mut r, cap);
+        // The dequeue head was dragged along by `fill`; put it back on a TRB of
+        // the first pass and check the cycle comes from the TRB, not from `r`.
+        r.xfer_deq = 1;
+        assert!(!r.cycle, "el productor deberia ir por la segunda vuelta");
+        assert!(
+            r.deq_cycle(),
+            "el ciclo de la cabeza de desencolado sale del productor y no de su TRB"
+        );
+        assert_eq!(r.deq_phys(), base + 16, "deq_phys no apunta a su hueco");
+        // Empty ring: there is no TRB to read, so the producer's cycle is the
+        // only answer there is.
+        r.xfer_deq = r.enq;
+        assert_eq!(
+            r.deq_cycle(),
+            r.cycle,
+            "un anillo vacio no contesta el ciclo del productor"
+        );
+    }
+
+    #[test]
+    fn an_address_off_the_ring_or_off_a_trb_boundary_is_not_one_of_its_trbs() {
+        let mut r = a_ring(8);
+        let base = r.buf.phys as u64;
+        fill(&mut r, 1);
+        assert_eq!(r.trb_buffer_at(base), Some(buf_of(0)));
+        assert_eq!(
+            r.trb_buffer_at(base - 16),
+            None,
+            "una direccion antes del anillo"
+        );
+        assert_eq!(
+            r.trb_buffer_at(base + ((r.cap as u64) + 1) * 16),
+            None,
+            "una direccion despues del anillo"
+        );
+        assert_eq!(
+            r.trb_buffer_at(base + 8),
+            None,
+            "media TRB dentro del anillo"
+        );
+    }
+
+    /// The event ring has no Link TRB: the consumer flips its own cycle state
+    /// when the dequeue pointer wraps, and a TRB whose Cycle bit no longer
+    /// matches is one the controller has not written yet.
+    #[test]
+    fn an_event_ring_flips_its_consumer_cycle_once_a_lap() {
+        let n = 16;
+        let mut ev = EventRing::new(n).expect("un anillo de eventos");
+        // The controller stamps its producer cycle on each event it posts.
+        for i in 0..n {
+            ev.seg.write_u64(i * 16, 0x4000 + i as u64);
+            ev.seg.write_u32(i * 16 + 12, TRB_EVT_TRANSFER | 1);
+        }
+        for i in 0..n {
+            let t = ev.pop().expect("un evento");
+            assert_eq!(t.p, 0x4000 + i as u64, "los eventos no salen en orden");
+        }
+        assert_eq!(ev.deq, 0, "la cabeza de desencolado no ha dado la vuelta");
+        assert!(
+            !ev.cycle,
+            "el ciclo del consumidor no ha cambiado en la vuelta"
+        );
+        assert!(
+            ev.pop().is_none(),
+            "el consumidor vuelve a leer los eventos de la vuelta anterior"
+        );
+        assert_eq!(
+            ev.erdp_phys(),
+            ev.seg.phys as u64,
+            "ERDP no apunta a la cabeza"
+        );
+    }
+}
+
+#[cfg(test)]
+mod mmio_tests {
+    use super::*;
+
+    /// A BAR in host memory, with slack behind it so a write past the end lands
+    /// somewhere a test can look at instead of somewhere it must not touch.
+    struct FakeBar {
+        _mem: alloc::vec::Vec<u32>,
+        base: usize,
+        size: usize,
+    }
+
+    impl FakeBar {
+        /// `size` bytes of BAR plus `size` bytes of slack behind it.
+        fn new(size: usize) -> Self {
+            let mut mem = alloc::vec![0u32; size / 2];
+            let base = mem.as_mut_ptr() as usize;
+            let mut bar = Self {
+                _mem: mem,
+                base,
+                size,
+            };
+            bar.set(0, 0x20); // CAPLENGTH
+            bar
+        }
+
+        fn set(&mut self, off: usize, v: u32) {
+            unsafe { write_volatile((self.base + off) as *mut u32, v) }
+        }
+
+        fn get(&self, off: usize) -> u32 {
+            unsafe { read_volatile((self.base + off) as *const u32) }
+        }
+
+        fn mmio(&self) -> DeviceResult<XhciMmio> {
+            XhciMmio::from_virt(self.base, self.size)
+        }
+    }
+
+    /// The bug. USBLEGCTLSTS is four bytes at `cap_ptr + 4`, so a legacy
+    /// capability header in the last dword of the BAR has no room for it -- and
+    /// the write went out of the window anyway.
+    #[test]
+    fn a_legacy_capability_in_the_last_dword_of_the_bar_is_not_written_past_it() {
+        let size = 0x40;
+        let mut bar = FakeBar::new(size);
+        bar.set(0x10, 0x000f_0000); // HCCPARAMS1: xECP en el dword 0x0f -> byte 0x3c
+        bar.set(0x3c, 0x0000_0001); // capacidad 1 (USB Legacy Support), sin siguiente
+        bar.set(size, 0xa5a5_a5a5); // centinela justo detras de la BAR
+        bar.set(size + 4, 0x5a5a_5a5a);
+        bar.mmio().expect("una BAR valida").perform_bios_handoff();
+        assert_eq!(
+            bar.get(size),
+            0xa5a5_a5a5,
+            "el handoff ha escrito USBLEGCTLSTS cuatro bytes fuera de la BAR"
+        );
+        assert_eq!(bar.get(size + 4), 0x5a5a_5a5a, "y ocho bytes fuera");
+    }
+
+    #[test]
+    fn a_legacy_capability_with_room_for_its_register_does_get_written() {
+        let size = 0x40;
+        let mut bar = FakeBar::new(size);
+        bar.set(0x10, 0x000e_0000); // xECP en el dword 0x0e -> byte 0x38
+        bar.set(0x38, 0x0000_0001);
+        bar.set(size, 0xa5a5_a5a5);
+        bar.mmio().expect("una BAR valida").perform_bios_handoff();
+        assert_eq!(
+            bar.get(0x3c),
+            0xffff_0000,
+            "USBLEGCTLSTS no se ha escrito estando dentro de la BAR"
+        );
+        assert_eq!(bar.get(size), 0xa5a5_a5a5, "y aun asi se ha salido");
+    }
+
+    #[test]
+    fn a_register_window_with_no_room_for_one_register_is_refused() {
+        let size = 0x40;
+        for (name, off, value) in [
+            ("CAPLENGTH", 0x00, size as u32),
+            ("DBOFF", 0x14, size as u32),
+            ("RTSOFF", 0x18, size as u32),
+        ] {
+            let mut bar = FakeBar::new(size);
+            bar.set(off, value);
+            assert!(
+                bar.mmio().is_err(),
+                "una BAR de {} bytes con {} justo en el final se acepta",
+                size,
+                name
+            );
+            let mut bar = FakeBar::new(size);
+            bar.set(off, value - 4);
+            assert!(
+                bar.mmio().is_ok(),
+                "una BAR de {} bytes con {} a un registro del final se rechaza",
+                size,
+                name
+            );
+        }
+        assert!(
+            XhciMmio::from_virt(0, size).is_err(),
+            "una BAR en la direccion cero se acepta"
+        );
+    }
+
+    /// A capability chain longer than [`XHCI_MAX_XECP_TRAVERSAL`]: the guard has
+    /// to stop the walk, so a legacy capability sitting past the 256th link is
+    /// never reached. `cap_ptr` only ever grows, so this -- and not a cycle --
+    /// is what a chain that runs away actually looks like.
+    #[test]
+    fn a_chain_longer_than_the_traversal_guard_stops_at_the_guard() {
+        let size = 0x500;
+        let mut bar = FakeBar::new(size);
+        // La cadena arranca en el dword 8 (byte 0x20) y cada eslabon apunta al
+        // siguiente dword: capacidad 2 (no es la legacy), next = 1.
+        bar.set(0x10, 0x0008_0000);
+        for dw in 8..320 {
+            bar.set(dw * 4, 0x0000_0102);
+        }
+        // La legacy, mas alla del eslabon 256 (dword 8 + 256 = 264).
+        let legacy_dw = 270;
+        bar.set(legacy_dw * 4, 0x0000_0001);
+        bar.set((legacy_dw + 1) * 4, 0xa5a5_a5a5);
+        bar.mmio().expect("una BAR valida").perform_bios_handoff();
+        assert_eq!(
+            bar.get((legacy_dw + 1) * 4),
+            0xa5a5_a5a5,
+            "la guarda de {} eslabones no ha cortado el recorrido de la cadena xECP",
+            XHCI_MAX_XECP_TRAVERSAL
+        );
+    }
+
+    /// A chain that simply ends: `next == 0` is the terminator.
+    #[test]
+    fn a_chain_with_no_legacy_capability_writes_nothing() {
+        let size = 0x100;
+        let mut bar = FakeBar::new(size);
+        bar.set(0x10, 0x0010_0000); // xECP en el dword 0x10 -> byte 0x40
+                                    // Capacidad 2 (no es la legacy), con `next` = 0 dwords: se apunta a si
+                                    // misma, porque `cap_ptr += next << 2` no avanza.
+        bar.set(0x40, 0x0000_0002);
+        bar.set(0x44, 0xa5a5_a5a5);
+        bar.mmio().expect("una BAR valida").perform_bios_handoff();
+        assert_eq!(
+            bar.get(0x44),
+            0xa5a5_a5a5,
+            "una cadena sin capacidad legacy ha escrito USBLEGCTLSTS"
+        );
     }
 }
