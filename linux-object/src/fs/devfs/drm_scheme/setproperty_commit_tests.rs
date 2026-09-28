@@ -37,10 +37,16 @@ fn a_property_write_is_a_one_property_atomic_commit_or_einval_on_a_legacy_driver
     commit(
         &atomic,
         &Request::new(
-            &[crtc, plane],
-            &[2, 2],
-            &[PROP_MODE_ID, PROP_ACTIVE, PROP_FB_ID, PROP_CRTC_ID],
-            &[mode.blob_id as u64, 1, fb1 as u64, crtc as u64],
+            &[crtc, plane, conn],
+            &[2, 2, 1],
+            &[
+                PROP_MODE_ID,
+                PROP_ACTIVE,
+                PROP_FB_ID,
+                PROP_CRTC_ID,
+                PROP_CRTC_ID,
+            ],
+            &[mode.blob_id as u64, 1, fb1 as u64, crtc as u64, crtc as u64],
         ),
         DRM_MODE_ATOMIC_ALLOW_MODESET,
     )

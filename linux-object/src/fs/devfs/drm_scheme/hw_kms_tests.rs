@@ -1315,10 +1315,22 @@ fn a_property_write_is_checked_against_the_object_and_the_property() {
     super::out_fence_tests::commit(
         &c,
         &super::out_fence_tests::Request::new(
-            &[crtc, plane],
-            &[2, 2],
-            &[PROP_MODE_ID, PROP_ACTIVE, PROP_FB_ID, PROP_CRTC_ID],
-            &[panel_mode.blob_id as u64, 1, fb as u64, crtc as u64],
+            &[crtc, plane, conn],
+            &[2, 2, 1],
+            &[
+                PROP_MODE_ID,
+                PROP_ACTIVE,
+                PROP_FB_ID,
+                PROP_CRTC_ID,
+                PROP_CRTC_ID,
+            ],
+            &[
+                panel_mode.blob_id as u64,
+                1,
+                fb as u64,
+                crtc as u64,
+                crtc as u64,
+            ],
         ),
         DRM_MODE_ATOMIC_ALLOW_MODESET,
     )

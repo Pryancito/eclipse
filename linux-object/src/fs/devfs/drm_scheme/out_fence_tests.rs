@@ -464,10 +464,10 @@ fn a_modeset_that_carries_a_mode_still_needs_the_allow_modeset_flag() {
     assert_ne!(blob.blob_id, 0, "the mode blob was not created");
 
     let req = Request::new(
-        &[drm::SYNTH_CRTC_ID],
-        &[2],
-        &[PROP_MODE_ID, PROP_ACTIVE],
-        &[u64::from(blob.blob_id), 1],
+        &[drm::SYNTH_CRTC_ID, drm::SYNTH_CONNECTOR_ID],
+        &[2, 1],
+        &[PROP_MODE_ID, PROP_ACTIVE, PROP_CRTC_ID],
+        &[u64::from(blob.blob_id), 1, drm::SYNTH_CRTC_ID as u64],
     );
 
     assert_eq!(
@@ -517,10 +517,10 @@ fn a_mode_blob_must_be_one_modeinfo_and_name_the_panels_own_mode() {
         (unknown, "a blob that does not exist"),
     ] {
         let req = Request::new(
-            &[drm::SYNTH_CRTC_ID],
-            &[2],
-            &[PROP_MODE_ID, PROP_ACTIVE],
-            &[u64::from(blob_id), 1],
+            &[drm::SYNTH_CRTC_ID, drm::SYNTH_CONNECTOR_ID],
+            &[2, 1],
+            &[PROP_MODE_ID, PROP_ACTIVE, PROP_CRTC_ID],
+            &[u64::from(blob_id), 1, drm::SYNTH_CRTC_ID as u64],
         );
         assert!(
             commit(&c, &req, DRM_MODE_ATOMIC_ALLOW_MODESET).is_err(),

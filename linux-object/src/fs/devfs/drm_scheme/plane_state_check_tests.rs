@@ -24,10 +24,16 @@ fn bring_up(c: &Client, fb: u32) {
     commit(
         c,
         &Request::new(
-            &[CRTC, PLANE],
-            &[2, 2],
-            &[PROP_MODE_ID, PROP_ACTIVE, PROP_FB_ID, PROP_CRTC_ID],
-            &[mode.blob_id as u64, 1, fb as u64, CRTC as u64],
+            &[CRTC, PLANE, drm::SYNTH_CONNECTOR_ID],
+            &[2, 2, 1],
+            &[
+                PROP_MODE_ID,
+                PROP_ACTIVE,
+                PROP_FB_ID,
+                PROP_CRTC_ID,
+                PROP_CRTC_ID,
+            ],
+            &[mode.blob_id as u64, 1, fb as u64, CRTC as u64, CRTC as u64],
         ),
         DRM_MODE_ATOMIC_ALLOW_MODESET,
     )

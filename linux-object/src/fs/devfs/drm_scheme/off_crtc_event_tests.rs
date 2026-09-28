@@ -42,11 +42,13 @@ fn a_commit_that_unsets_the_mode_leaves_the_crtc_with_none() {
         (crtc.mode_valid, enc.crtc_id)
     };
     let modeset = |mode: u64, on: u64| {
+        // The connector goes with the mode: routed while there is one.
+        let conn_crtc = if mode != 0 { drm::SYNTH_CRTC_ID } else { 0 };
         Request::new(
-            &[drm::SYNTH_CRTC_ID],
-            &[2],
-            &[PROP_MODE_ID, PROP_ACTIVE],
-            &[mode, on],
+            &[drm::SYNTH_CRTC_ID, drm::SYNTH_CONNECTOR_ID],
+            &[2, 1],
+            &[PROP_MODE_ID, PROP_ACTIVE, PROP_CRTC_ID],
+            &[mode, on, conn_crtc as u64],
         )
     };
     let on = (1, drm::SYNTH_CRTC_ID);
@@ -105,10 +107,10 @@ fn an_event_on_a_crtc_that_is_off_and_stays_off_is_refused() {
     // Turning it on with an event: allowed, and the event comes.
     let blob = mode_blob(&c);
     let on = Request::new(
-        &[drm::SYNTH_CRTC_ID],
-        &[2],
-        &[PROP_MODE_ID, PROP_ACTIVE],
-        &[u64::from(blob), 1],
+        &[drm::SYNTH_CRTC_ID, drm::SYNTH_CONNECTOR_ID],
+        &[2, 1],
+        &[PROP_MODE_ID, PROP_ACTIVE, PROP_CRTC_ID],
+        &[u64::from(blob), 1, drm::SYNTH_CRTC_ID as u64],
     );
     assert_eq!(commit(&c, &on, EVENT | MODESET), Ok(0));
     assert_eq!(events(&c), 1);
