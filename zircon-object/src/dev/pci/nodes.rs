@@ -359,26 +359,25 @@ pub struct SharedLegacyIrqHandler {
     device_handler: Mutex<Vec<Arc<PcieDevice>>>,
 }
 
-/// Lo que hay que hacerle a un dispositivo despues de que su linea compartida
-/// se dispare.
+/// What to do to one device after the line it shares has been asserted.
 #[derive(Debug, PartialEq, Eq)]
 struct LegacyIrqVerdict {
-    /// Volver a enmascarar su vector.
+    /// Put its vector back under the mask.
     remask: bool,
-    /// Escribir INT_DISABLE en su registro de comando, o sea callarlo.
+    /// Write INT_DISABLE into its command register, i.e. quiet it down.
     silence: bool,
 }
 
-/// `code` es lo que contesto el manejador del dispositivo, o `None` si no se
-/// le llamo.
+/// `code` is what the device's handler answered, or `None` if it was not
+/// called.
 ///
-/// Un dispositivo por el que nadie contesta se calla: la linea heredada es de
-/// nivel y compartida, asi que una que nadie atiende se vuelve a levantar sin
-/// parar y se lleva la CPU. Uno que si contesta se calla solo si lo pide.
+/// A device nobody answers for is silenced: the legacy line is shared and
+/// level-triggered, so one nobody services just asserts again forever and eats
+/// the CPU. One that does answer is silenced only if it asks to be.
 ///
-/// La regla vive aqui y no dentro del recorrido porque el recorrido llama al
-/// HAL (`interrupt::mask_irq`), que el anfitrion no implementa: con la regla
-/// dentro, tres mutaciones de esta rama pasaban en verde.
+/// The rule lives here rather than inside the walk because the walk calls the
+/// HAL (`interrupt::mask_irq`), which the host does not implement: with the
+/// rule inside it, three mutations of this branch passed green.
 fn legacy_irq_verdict(code: Option<u32>) -> LegacyIrqVerdict {
     match code {
         Some(code) => {
@@ -395,18 +394,18 @@ fn legacy_irq_verdict(code: Option<u32>) -> LegacyIrqVerdict {
     }
 }
 
-/// Se llama al manejador de este dispositivo cuando salta la linea?
+/// Is this device's handler called when the line is asserted?
 ///
-/// **`masked` se lee al reves, y se queda asi a proposito.** Enmascarar un
-/// vector es lo que hace `mask_legacy_irq`, que ademas escribe INT_DISABLE: o
-/// sea que `masked` significa «a este no se le atiende», y esto atiende justo
-/// a los enmascarados. Lo compensa que a un vector heredado **no lo
-/// desenmascara nadie**: `allocate_irq_handler` lo crea enmascarado,
-/// `enable_irq` solo toca `enabled` --un campo que no lee nadie-- y el unico
-/// `mask_legacy_irq` del arbol pasa siempre `true`. Con las dos mitades mal la
-/// ruta funciona, y arreglar una sola la deja muerta: son un cambio solo, y
-/// hay que verlo en hardware con una tarjeta de INTx, que aqui no hay.
-/// Escrito aparte para que se vea y se pueda probar tal cual esta.
+/// **`masked` reads backwards, and is left that way on purpose.** Masking a
+/// vector is what `mask_legacy_irq` does, and it writes INT_DISABLE too: so
+/// `masked` means "do not service this one", and this services exactly the
+/// masked ones. What compensates is that **nothing ever unmasks a legacy
+/// vector**: `allocate_irq_handler` creates it masked, `enable_irq` only
+/// touches `enabled` -- a field nothing reads -- and the one `mask_legacy_irq`
+/// call in the tree always passes `true`. With both halves wrong the path
+/// works, and fixing either one alone leaves it dead: they are a single
+/// change, and it needs a card with INTx to try, which there is none of here.
+/// Written out separately so that it can be seen, and tested as it stands.
 fn services_its_own_interrupt(masked: bool, has_handler: bool) -> bool {
     has_handler && masked
 }
@@ -440,14 +439,17 @@ impl SharedLegacyIrqHandler {
             //     continue;
             // }
             let inner = dev.inner.lock();
-            // `first()` y no `handlers[0]`: la tabla de vectores puede estar
-            // vacia con el dispositivo todavia en la linea compartida --
-            // `set_irq_mode` lo saca de la linea y luego limpia la tabla, y
-            // esto corre desde una interrupcion, que no espera a nadie. La
-            // rama de lista vacia ya estaba escrita debajo, pero el indice
-            // se evaluaba **antes** que ella, asi que no se podia llegar a
-            // ella sin panicar primero.
-            let code = match inner.irq.handlers.first() {
+            // `first()` and not `handlers[0]`: the vector table can be empty
+            // with the device still on the shared line -- `set_irq_mode` takes
+            // it off the line and only then clears the table, and this runs
+            // from an interrupt, which waits for nobody. The empty-list branch
+            // was already written below, but the index was evaluated *above*
+            // it, so there was no reaching it without panicking first.
+            //
+            // Looked up once and kept: the remask below acts on the same
+            // vector, under the same hold of `inner`.
+            let vector = inner.irq.handlers.first();
+            let code = match vector {
                 Some(state) => {
                     let handler = state.handler.lock();
                     if services_its_own_interrupt(state.get_masked(), handler.is_some()) {
@@ -460,7 +462,7 @@ impl SharedLegacyIrqHandler {
             };
             let verdict = legacy_irq_verdict(code);
             if verdict.remask {
-                if let Some(state) = inner.irq.handlers.first() {
+                if let Some(state) = vector {
                     state.set_masked(true);
                 }
             }
@@ -3178,7 +3180,7 @@ mod legacy_irq_tests {
                 remask: false,
                 silence: false,
             },
-            "only the bottom bit means «mask me»"
+            "only the bottom bit means 'mask me'"
         );
     }
 
