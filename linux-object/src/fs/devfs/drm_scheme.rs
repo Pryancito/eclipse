@@ -347,6 +347,67 @@ impl DrmDev {
         }
     }
 
+    /// Wait for the GPU before the synchronous arm serves a blocking
+    /// `GEM_CPU_PREP`.
+    ///
+    /// That ioctl is the one Mesa calls whenever it recycles a buffer or
+    /// reads one back, and it blocks by contract. `INode::io_control` is
+    /// synchronous, so the driver's arm could only busy-wait: `cpu_prep_wait`
+    /// spins on `gpu_spin()` for however long the GPU takes, pegging a core
+    /// and starving every other coroutine on it -- on a two-CPU desktop that
+    /// is the compositor itself being held off by its own client's buffer
+    /// recycle. Same split, and the same reason, as
+    /// [`Self::syncobj_wait_sleep`] and [`Self::atomic_in_fence_sleep`]: here
+    /// we are in the async syscall path and can really sleep, and the sync arm
+    /// then finds the work already done and returns without spinning.
+    ///
+    /// Every early return leaves the ioctl behaving exactly as before this
+    /// existed -- the sync arm still does the whole wait, spin and all. A
+    /// `NOWAIT` prep is never slept on: it answers EBUSY instead of blocking,
+    /// so a sleep ahead of it would turn the one flag that promises not to
+    /// block into a ten-second stall.
+    pub async fn cpu_prep_sleep(&self, cmd: u32, data: usize) {
+        if !zcore_drivers::display::nouveau_uapi_enabled() {
+            return;
+        }
+        if !zcore_drivers::display::is_cpu_prep_ioctl(cmd) {
+            return;
+        }
+        // `data` is the caller's own pointer, checked before it is read: the
+        // driver's arm reads it unchecked, but that runs after `io_control`
+        // has vetted the fd, and this runs on anything userspace hands us.
+        if ucheck(data, zcore_drivers::display::CPU_PREP_REQUEST_BYTES).is_err() {
+            return;
+        }
+        // SAFETY: `is_cpu_prep_ioctl` accepted the size, and `ucheck` just
+        // said those bytes are readable by this process.
+        let (handle, flags) = unsafe { zcore_drivers::display::cpu_prep_request(data) };
+        if zcore_drivers::display::cpu_prep_is_nowait(flags) {
+            return;
+        }
+        let fences = drm::cpu_prep_fences(handle, drm::current_pid());
+        if fences.is_empty() {
+            return;
+        }
+        // The driver's own bound, so a sleep here can never outlast the wait
+        // it stands in for: the sync arm answers EBUSY past it either way.
+        let deadline =
+            kernel_hal::timer::timer_now() + core::time::Duration::from_micros(CPU_PREP_TIMEOUT_US);
+        let mut probes = 0u32;
+        loop {
+            if fences
+                .iter()
+                .all(|&(va, payload)| zcore_drivers::scheme::syncobj::hw_fence_landed(va, payload))
+            {
+                return;
+            }
+            if !fence_poll_wait(probes, deadline).await {
+                return;
+            }
+            probes = probes.saturating_add(1);
+        }
+    }
+
     /// Wait for the GPU to finish writing the buffer a **legacy** present is
     /// about to scan out.
     ///
@@ -2698,6 +2759,17 @@ pub fn prime_request(
 /// broken rather than slow -- and the cost of being wrong is a stutter.
 const PRESENT_FENCE_TIMEOUT_US: u64 = 100_000;
 
+/// How long the async pre-wait for `GEM_CPU_PREP` may sleep.
+///
+/// The driver's own `CPU_PREP_TIMEOUT_US`, so this sleep can never outlast
+/// the wait it stands in for: past it the sync arm answers EBUSY, and a
+/// pre-wait still parked there would hold the caller for nothing. Unlike the
+/// present fence's bound this is not a tearing/hang trade-off -- it is a
+/// mirror, and it belongs next to the driver's number if that one ever moves
+/// (a longer one here would stall, a shorter one just hands the tail back to
+/// the spin this replaces).
+const CPU_PREP_TIMEOUT_US: u64 = 10_000_000;
+
 /// How often a legacy present says what it waited for: the first two of the
 /// boot, then on the present cost report's own rhythm.
 ///
@@ -2914,6 +2986,17 @@ fn present_failed(
 pub fn is_syncobj_wait_ioctl(cmd: u32) -> bool {
     is_drm_ioctl_nr(cmd, NR_SYNCOBJ_WAIT, core::mem::size_of::<DrmSyncobjWait>())
         || is_syncobj_timeline_wait(cmd)
+}
+
+/// True for nouveau's `GEM_CPU_PREP`. Used by `sys_ioctl` to run
+/// [`DrmDev::cpu_prep_sleep`] before `io_control`.
+///
+/// The number itself is the driver's, so the recogniser is too
+/// ([`zcore_drivers::display::is_cpu_prep_ioctl`]) -- a copy of a
+/// driver-private NR here is a copy that drifts. This exists only because
+/// `linux-syscall` does not link `zcore-drivers`.
+pub fn is_cpu_prep_ioctl(cmd: u32) -> bool {
+    zcore_drivers::display::is_cpu_prep_ioctl(cmd)
 }
 
 /// ioctl NUMBERs of the two syncobj waits. Both structs grew a trailing

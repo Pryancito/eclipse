@@ -27,6 +27,13 @@ pub use nouveau_uapi::{
     console_gsp_enabled, exec_fast_enabled, hwflip_enabled, set_console_gsp_enabled,
     set_exec_fast_enabled, set_hwflip_enabled, set_surfaceflip_enabled, surfaceflip_enabled,
 };
+/// `GEM_CPU_PREP`'s recogniser and request reader, for the async pre-wait in
+/// `linux-object`: that ioctl blocks, and `INode::io_control` is synchronous,
+/// so without a sleep ahead of it the sync arm can only spin a core.
+#[cfg(target_arch = "x86_64")]
+pub use nouveau_uapi::{
+    cpu_prep_is_nowait, cpu_prep_request, is_cpu_prep_ioctl, CPU_PREP_REQUEST_BYTES,
+};
 #[cfg(target_arch = "x86_64")]
 pub use nouveau_uapi::{enabled as nouveau_uapi_enabled, set_enabled as set_nouveau_uapi_enabled};
 #[cfg(target_arch = "x86_64")]
@@ -83,6 +90,31 @@ pub fn boot_edid() -> Option<([u8; 128], u32)> {
 #[cfg(not(target_arch = "x86_64"))]
 pub fn nouveau_uapi_enabled() -> bool {
     false
+}
+
+/// No nouveau uAPI off x86_64, so no `GEM_CPU_PREP` to wait ahead of.
+#[cfg(not(target_arch = "x86_64"))]
+pub fn is_cpu_prep_ioctl(_request: u32) -> bool {
+    false
+}
+
+/// Unreachable off x86_64, where nothing recognises the ioctl.
+#[cfg(not(target_arch = "x86_64"))]
+pub const CPU_PREP_REQUEST_BYTES: usize = 8;
+
+/// Unreachable off x86_64: [`is_cpu_prep_ioctl`] never says yes there.
+///
+/// # Safety
+/// Never called; the signature matches the x86_64 one.
+#[cfg(not(target_arch = "x86_64"))]
+pub unsafe fn cpu_prep_request(_arg: usize) -> (u32, u32) {
+    (0, 0)
+}
+
+/// Unreachable off x86_64, and "does not block" is the safe answer anyway.
+#[cfg(not(target_arch = "x86_64"))]
+pub fn cpu_prep_is_nowait(_flags: u32) -> bool {
+    true
 }
 
 /// The CE page-flip (`nvidia.hwflip`) and NVC57E surface-flip

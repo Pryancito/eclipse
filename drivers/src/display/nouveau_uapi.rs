@@ -695,6 +695,44 @@ pub(super) fn decode_ioc(request: u32) -> (u32, u32, u32) {
     (dir, nr, size)
 }
 
+/// Whether `request` is `GEM_CPU_PREP`, and carries enough bytes to read.
+///
+/// By NR alone, like the dispatch itself and like every other pre-dispatch
+/// helper in this tree: the direction and size bits are advisory, and pinning
+/// one full 32-bit command is how a wait gets lost to a struct that grew a
+/// field. The size floor is what the caller parses (`handle` and `flags`), so
+/// a command encoding fewer bytes is left alone.
+///
+/// Exists for the async pre-wait in `linux-object`: `GEM_CPU_PREP` blocks,
+/// and `INode::io_control` is synchronous, so the sync arm can only spin.
+pub fn is_cpu_prep_ioctl(request: u32) -> bool {
+    let (_dir, nr, size) = decode_ioc(request);
+    (request >> 8) & 0xff == 0x64
+        && nr == NR_GEM_CPU_PREP
+        && size as usize >= CPU_PREP_REQUEST_BYTES
+}
+
+/// How many bytes of a `GEM_CPU_PREP` request the pre-wait reads, so its
+/// caller can check that many are readable without naming the struct.
+pub const CPU_PREP_REQUEST_BYTES: usize = core::mem::size_of::<DrmNouveauGemCpuPrep>();
+
+/// `GEM_CPU_PREP`'s `(handle, flags)`, read from a request the caller has
+/// already checked is readable and long enough ([`is_cpu_prep_ioctl`]).
+///
+/// # Safety
+/// `arg` must point at [`size_of::<DrmNouveauGemCpuPrep>()`] readable bytes.
+pub unsafe fn cpu_prep_request(arg: usize) -> (u32, u32) {
+    let req = &*(arg as *const DrmNouveauGemCpuPrep);
+    (req.handle, req.flags)
+}
+
+/// Whether `flags` asks `GEM_CPU_PREP` not to block (`NOUVEAU_GEM_CPU_PREP_
+/// NOWAIT`, bit 0). A nowait prep answers EBUSY at once, so nothing may
+/// sleep ahead of it.
+pub fn cpu_prep_is_nowait(flags: u32) -> bool {
+    flags & NOUVEAU_GEM_CPU_PREP_NOWAIT != 0
+}
+
 /// Human-readable name for a driver-private ioctl NR, covering the whole
 /// `nouveau_drm.h` vocabulary -- including ioctls this driver does not
 /// implement -- so a trace names what Mesa wanted instead of a bare number.
@@ -1879,6 +1917,64 @@ mod gl_client_abi_tests {
             // Every one has to fit the 8-bit NR field of an ioctl number.
             assert!(ours <= 0xff, "{} does not fit the NR field", what);
         }
+    }
+
+    /// What the async pre-wait matches on, and what it refuses.
+    ///
+    /// The pre-wait sleeps, and a sleep on the wrong ioctl is a stall, so
+    /// this recognises `GEM_CPU_PREP` the way the dispatch does -- by NR,
+    /// inside the DRM type, with a size floor -- and nothing else. Pinning
+    /// the whole 32-bit command instead would lose the wait the first time
+    /// the struct grew a field, which has happened to three waits in this
+    /// tree already.
+    #[test]
+    fn only_a_cpu_prep_long_enough_to_read_takes_the_pre_wait() {
+        let ioc = |dir: u32, ty: u32, nr: u32, size: usize| -> u32 {
+            (dir << 30) | ((size as u32) << 16) | (ty << 8) | nr
+        };
+        const DRM: u32 = 0x64;
+        const RW: u32 = 0x3;
+        let full = size_of::<DrmNouveauGemCpuPrep>();
+        assert!(is_cpu_prep_ioctl(ioc(RW, DRM, NR_GEM_CPU_PREP, full)));
+        // A struct that grew a field is still this ioctl.
+        assert!(is_cpu_prep_ioctl(ioc(RW, DRM, NR_GEM_CPU_PREP, full + 8)));
+        // Direction is advisory, as the dispatch treats it.
+        assert!(is_cpu_prep_ioctl(ioc(0, DRM, NR_GEM_CPU_PREP, full)));
+        // One byte short of what the reader parses: left to the sync arm
+        // rather than read past the end of the caller's struct.
+        assert!(!is_cpu_prep_ioctl(ioc(RW, DRM, NR_GEM_CPU_PREP, full - 1)));
+        // Its neighbours, and another subsystem's ioctl of the same NR.
+        assert!(!is_cpu_prep_ioctl(ioc(RW, DRM, NR_GEM_CPU_FINI, full)));
+        assert!(!is_cpu_prep_ioctl(ioc(RW, DRM, NR_GEM_PUSHBUF, full)));
+        assert!(!is_cpu_prep_ioctl(ioc(RW, 0x65, NR_GEM_CPU_PREP, full)));
+    }
+
+    /// NOWAIT promises not to block, so nothing may sleep ahead of it: the
+    /// pre-wait reads the same bit the blocking arm does, bit 0, and treats
+    /// no other bit as a promise.
+    #[test]
+    fn the_pre_wait_stands_aside_for_a_nowait_prep_and_for_nothing_else() {
+        assert!(cpu_prep_is_nowait(NOUVEAU_GEM_CPU_PREP_NOWAIT));
+        assert!(cpu_prep_is_nowait(
+            NOUVEAU_GEM_CPU_PREP_NOWAIT | NOUVEAU_GEM_CPU_PREP_WRITE
+        ));
+        assert!(!cpu_prep_is_nowait(0));
+        assert!(!cpu_prep_is_nowait(NOUVEAU_GEM_CPU_PREP_WRITE));
+        // Bit 1 is nothing in `nouveau_drm.h`, and reading it as NOWAIT is
+        // the bug this file already fixed once in the blocking arm.
+        assert!(!cpu_prep_is_nowait(0x2));
+    }
+
+    /// The request reader picks the two fields out in the order the ABI has
+    /// them: a swap here hands the pre-wait a handle of flags.
+    #[test]
+    fn the_pre_wait_reads_handle_then_flags() {
+        let req = DrmNouveauGemCpuPrep {
+            handle: 0x1234_5678,
+            flags: NOUVEAU_GEM_CPU_PREP_WRITE,
+        };
+        let got = unsafe { cpu_prep_request(&req as *const _ as usize) };
+        assert_eq!(got, (0x1234_5678, NOUVEAU_GEM_CPU_PREP_WRITE));
     }
 
     /// The payload floor every arm leans on before it casts. Present for each
