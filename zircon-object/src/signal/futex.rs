@@ -915,6 +915,34 @@ mod tests {
     }
     /// `zx_futex_wake` clears the owner "regardless of the wake count", zero
     /// included -- and a zero wake must not disturb the queue.
+    /// A signal ending a `FUTEX_WAIT` races a `FUTEX_WAKE` that may already
+    /// have won: `Waiter::wake` takes the wake count and marks the waiter
+    /// before the future is polled again. `sys_futex` polls its future ONE
+    /// more time before answering EINTR, and this is the invariant that poll
+    /// rests on -- a waiter woken while nobody was looking reports the wake
+    /// on the next poll, whoever schedules it. Dropping the future instead
+    /// tombstones the waiter, and the `pthread_cond_signal` that had already
+    /// been counted against it would be lost for good.
+    #[test]
+    fn a_wake_taken_before_the_poll_is_still_reported_by_it() {
+        let futex = futex_with(1);
+        let (mut future, counter) = queue_waiter(&futex, 1, None);
+
+        assert_eq!(futex.wake(1), 1, "the wake found a live waiter");
+        assert_eq!(counter.count(), 1);
+        assert!(futex.inner.lock().waiter_queue.is_empty());
+
+        // Poll from a DIFFERENT waker, the way the interrupted wait does:
+        // the signal's task is what drives the future the last time.
+        let other = Arc::new(Counter(AtomicUsize::new(0)));
+        let waker = waker(other);
+        assert_eq!(
+            future.as_mut().poll(&mut Context::from_waker(&waker)),
+            Poll::Ready(Ok(())),
+            "the wake is still there for the next poll, not lost with it"
+        );
+    }
+
     #[test]
     fn a_wake_of_zero_clears_the_owner_and_touches_nobody() {
         let (thread, _) = two_threads();

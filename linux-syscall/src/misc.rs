@@ -1,8 +1,12 @@
 use super::*;
+use core::task::Poll;
 use core::time::Duration;
+use futures::future::{select, Either};
+use futures::{pin_mut, poll};
 use kernel_hal::timer::timer_now;
 use linux_object::process::{
-    CAP_SYSLOG, CAP_SYS_ADMIN, CAP_SYS_BOOT, CAP_SYS_NICE, CAP_SYS_RESOURCE,
+    check_signals_of, SignalPark, CAP_SYSLOG, CAP_SYS_ADMIN, CAP_SYS_BOOT, CAP_SYS_NICE,
+    CAP_SYS_RESOURCE,
 };
 use linux_object::thread::ThreadExt;
 use linux_object::time::*;
@@ -709,10 +713,68 @@ impl Syscall<'_> {
                 // `futex_deadline`. A null `timespec` is the ordinary case --
                 // every contended `pthread_mutex_lock` -- and awaiting the raw
                 // future there made the wait uninterruptible by anything.
+                //
+                // AND A SIGNAL HAS TO END IT TOO. `blocking_run` races the
+                // future against the killer and the deadline, and nothing
+                // else; `run_user` looks at the pending set when a syscall
+                // RETURNS. So a thread parked in an untimed FUTEX_WAIT --
+                // which is every `pthread_cond_wait` and every contended
+                // `pthread_mutex_lock` in the system -- took no signal at
+                // all, however long it sat there.
+                //
+                // What that costs is not a late `kill`: it is `setuid`,
+                // `seteuid`, `setgid` and friends. musl implements all of
+                // them with `__synccall`, which blocks every application
+                // signal, stops each OTHER thread with SIGRT34 and waits for
+                // it to check in. One thread in a condvar and the process is
+                // parked FOR GOOD, deaf to ^C because the signals are
+                // blocked. That is gzdoom printing its version banner and
+                // never coming back, and it would be any threaded musl
+                // program that drops privilege.
+                //
+                // Linux ends the wait with EINTR and runs the handler
+                // (`futex_wait` sleeps in TASK_INTERRUPTIBLE); so does this,
+                // through `ZxError::CANCELED`, which maps to EINTR. musl's
+                // `__timedwait` expects it and re-waits.
+                let thread = self.thread.inner();
+                let futex_wait = future;
+                pin_mut!(futex_wait);
+                let interrupted = async {
+                    let mut park = SignalPark::new(&thread);
+                    loop {
+                        // Clear the wake bits BEFORE looking, so a signal
+                        // queued after the look wakes the park at once.
+                        park.prepare();
+                        if check_signals_of(&thread).is_err() {
+                            return;
+                        }
+                        park.park(None).await;
+                    }
+                };
+                pin_mut!(interrupted);
+                let raced = async {
+                    match select(futex_wait, interrupted).await {
+                        Either::Left((res, _)) => res,
+                        Either::Right(((), mut futex_wait)) => {
+                            // The signal won a race a FUTEX_WAKE may already
+                            // have half-won: `Waiter::wake` marks the waiter
+                            // woken and consumes a wake count before this
+                            // future is polled again. Poll it once more and
+                            // report the wake, rather than dropping the
+                            // future (which tombstones the waiter) and
+                            // losing a `pthread_cond_signal` for good.
+                            match poll!(&mut futex_wait) {
+                                Poll::Ready(res) => res,
+                                Poll::Pending => Err(ZxError::CANCELED),
+                            }
+                        }
+                    }
+                };
+                pin_mut!(raced);
                 let res: ZxResult = self
                     .thread
                     .blocking_run(
-                        future,
+                        raced,
                         ThreadState::BlockedFutex,
                         futex_deadline(timer_now(), timeout, on_clock),
                         None,
