@@ -3002,9 +3002,16 @@ fn pre_wait_parked_us(elapsed_us: u64, probes: u32) -> u64 {
 
 impl Drop for PreWaitAccount {
     fn drop(&mut self) {
-        let elapsed_us = kernel_hal::timer::timer_now()
-            .saturating_sub(self.start)
-            .as_micros() as u64;
+        // `as_micros` is a u128 and a plain `as u64` wraps. It takes a
+        // clock 584 000 years old to overflow honestly, but a timer that
+        // jumps does it in one read, and the counter is a sum: one wrapped
+        // value poisons the column for the rest of the boot.
+        let elapsed_us = core::convert::TryFrom::try_from(
+            kernel_hal::timer::timer_now()
+                .saturating_sub(self.start)
+                .as_micros(),
+        )
+        .unwrap_or(u64::MAX);
         zcore_drivers::scheme::prewait::record(
             self.kind,
             pre_wait_parked_us(elapsed_us, self.probes),

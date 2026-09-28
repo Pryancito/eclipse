@@ -14,7 +14,6 @@
 //! arch-specific name table.
 
 use crate::process::LinuxProcess;
-use alloc::collections::BTreeMap;
 use alloc::{boxed::Box, string::String, vec::Vec};
 use core::fmt::Write;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering::Relaxed};
@@ -926,41 +925,118 @@ pub fn kernel_report() -> String {
 /// Cluster sampled instruction pointers into 64-byte buckets so a hot function
 /// aggregates instead of scattering across every instruction.
 const PC_BUCKET: u64 = 64;
-/// Cap on distinct buckets tracked, to bound memory and lock time. Once full,
-/// new addresses are counted as "dropped" rather than inserted.
+/// Cap on distinct buckets tracked. Once full, new addresses are counted as
+/// "dropped" rather than inserted.
 const TOP_MAX: usize = 4096;
+/// Open-addressed slots. Twice `TOP_MAX` so the table stops at a load factor
+/// of one half: a miss ends at the first empty slot instead of scanning a
+/// packed array, and the critical section stays a handful of loads.
+const TOP_SLOTS: usize = TOP_MAX * 2;
+
+const _: () = assert!(TOP_SLOTS.is_power_of_two() && TOP_SLOTS > TOP_MAX);
+
+/// One histogram bucket. `count == 0` means empty. The key cannot be the empty
+/// mark: a PC in `1..PC_BUCKET` lands in bucket 0, which is a real address.
+#[derive(Clone, Copy)]
+struct Slot {
+    key: u64,
+    count: u64,
+}
 
 struct SampleState {
     total: u64,
     dropped: u64,
-    map: BTreeMap<u64, u64>,
+    len: usize,
+    slots: [Slot; TOP_SLOTS],
 }
 
 impl SampleState {
+    const fn new() -> Self {
+        Self {
+            total: 0,
+            dropped: 0,
+            len: 0,
+            slots: [Slot { key: 0, count: 0 }; TOP_SLOTS],
+        }
+    }
+
     /// Add one instruction-pointer sample. A `pc` of zero is not an address,
     /// it is "the context had no saved PC", and counting it would put a
     /// phantom bucket at the top of the profile.
+    ///
+    /// This used to be a `BTreeMap`. `tick` calls it on the timer return path
+    /// while `SAMPLES` is held, and that mutex is a spinlock that keeps
+    /// interrupts off. A full internal node splits by allocating and then
+    /// storing the new node into each child's parent field; a null child edge
+    /// is a kernel write to address 0 (`KV::split+0x15c`) taken with the lock
+    /// still held. The fault is not contained, that CPU halts, and every other
+    /// CPU's next tick spins forever on the same lock. The table below does
+    /// not allocate and does not follow a pointer.
     fn add(&mut self, pc: u64) {
         if pc == 0 {
             return;
         }
         let key = pc & !(PC_BUCKET - 1);
         self.total += 1;
-        if let Some(c) = self.map.get_mut(&key) {
-            *c += 1;
-        } else if self.map.len() < TOP_MAX {
-            self.map.insert(key, 1);
-        } else {
-            self.dropped += 1;
+        match self.locate(key) {
+            Place::Hit(i) => self.slots[i].count += 1,
+            Place::Empty(i) if self.len < TOP_MAX => {
+                self.slots[i].key = key;
+                self.slots[i].count = 1;
+                self.len += 1;
+            }
+            Place::Empty(_) | Place::Full => self.dropped += 1,
         }
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    #[cfg(test)]
+    fn get(&self, key: u64) -> Option<u64> {
+        match self.locate(key) {
+            Place::Hit(i) => Some(self.slots[i].count),
+            Place::Empty(_) | Place::Full => None,
+        }
+    }
+
+    /// `Hit` is an occupied slot with this key. `Empty` is the first free slot
+    /// in the probe, which is also where a missing key would be inserted.
+    /// `Full` means every slot was occupied and none matched — unreachable
+    /// while `len` stays at or below `TOP_MAX`, kept so a probe cannot spin.
+    fn locate(&self, key: u64) -> Place {
+        let mut i = bucket_index(key);
+        for _ in 0..TOP_SLOTS {
+            let slot = &self.slots[i];
+            if slot.count == 0 {
+                return Place::Empty(i);
+            }
+            if slot.key == key {
+                return Place::Hit(i);
+            }
+            i = (i + 1) & (TOP_SLOTS - 1);
+        }
+        Place::Full
     }
 }
 
-static SAMPLES: Mutex<SampleState> = Mutex::new(SampleState {
-    total: 0,
-    dropped: 0,
-    map: BTreeMap::new(),
-});
+enum Place {
+    Hit(usize),
+    Empty(usize),
+    Full,
+}
+
+/// Mix the bucket so neighbouring code does not land in neighbouring slots.
+/// The low bits of `key` are always zero (`PC_BUCKET`), so the high half of
+/// the product is the part that actually varies.
+fn bucket_index(key: u64) -> usize {
+    let h = key.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    ((h >> 32) as usize) & (TOP_SLOTS - 1)
+}
+
+static SAMPLES: Mutex<SampleState> = Mutex::new(SampleState::new());
 
 /// Per-timer-tick hook: record one user-space sample and forward it to any
 /// active Linux-`perf` ring buffer. Cheap; called from the timer-interrupt
@@ -971,16 +1047,30 @@ pub fn tick(pid: i32, tid: i32, cpu: u32, pc: u64) {
 }
 
 /// Add one instruction-pointer sample to the global histogram.
+///
+/// `try_lock`, not `lock`. This runs on the timer return path. Waiting is an
+/// interrupts-off spin on every CPU that took a tick, which is how one holder
+/// stuck in this section froze the rest of the machine. A missed sample is a
+/// gap in the profile.
 fn sample_pc(pc: u64) {
-    SAMPLES.lock().add(pc);
+    if let Some(mut samples) = SAMPLES.try_lock() {
+        samples.add(pc);
+    }
 }
 
 /// Render `/proc/perf/top`: hottest sampled instruction-pointer buckets.
 pub fn top_report() -> String {
-    let (total, dropped, rows) = {
+    // Reserve before taking the lock. The push loop then cannot allocate,
+    // and a page fault in the allocator cannot run while `SAMPLES` is held.
+    let mut rows = Vec::with_capacity(TOP_MAX);
+    let (total, dropped) = {
         let s = SAMPLES.lock();
-        let rows: Vec<(u64, u64)> = s.map.iter().map(|(&k, &v)| (k, v)).collect();
-        (s.total, s.dropped, rows)
+        for slot in s.slots.iter() {
+            if slot.count != 0 {
+                rows.push((slot.key, slot.count));
+            }
+        }
+        (s.total, s.dropped)
     };
     render_top(total, dropped, rows)
 }
@@ -1608,11 +1698,7 @@ mod tests {
     // ── The sampling profiler ──────────────────────────────────────────────
 
     fn empty_samples() -> SampleState {
-        SampleState {
-            total: 0,
-            dropped: 0,
-            map: BTreeMap::new(),
-        }
+        SampleState::new()
     }
 
     #[test]
@@ -1623,8 +1709,8 @@ mod tests {
         s.add(0x103f);
         s.add(0x1040); // the next bucket along
         assert_eq!(s.total, 4);
-        assert_eq!(s.map.get(&0x1000), Some(&3));
-        assert_eq!(s.map.get(&0x1040), Some(&1));
+        assert_eq!(s.get(0x1000), Some(3));
+        assert_eq!(s.get(0x1040), Some(1));
     }
 
     #[test]
@@ -1632,7 +1718,20 @@ mod tests {
         let mut s = empty_samples();
         s.add(0);
         assert_eq!(s.total, 0);
-        assert!(s.map.is_empty());
+        assert_eq!(s.len(), 0);
+    }
+
+    #[test]
+    fn a_low_address_is_a_real_bucket_not_an_empty_slot() {
+        // `count == 0` is the empty mark, so bucket 0 (PCs in `1..PC_BUCKET`)
+        // has to be stored as a key of zero with a non-zero count. Treating
+        // key 0 as empty would drop every sample in the first bucket.
+        let mut s = empty_samples();
+        s.add(32);
+        assert_eq!(s.len(), 1);
+        assert_eq!(s.get(0), Some(1));
+        s.add(33);
+        assert_eq!(s.get(0), Some(2));
     }
 
     #[test]
@@ -1640,18 +1739,20 @@ mod tests {
         let mut s = empty_samples();
         // From one, not zero: a zero pc is not an address and `add` drops it,
         // so starting there would leave the table one bucket short.
+        // Past eleven distinct keys the old `BTreeMap` split an internal node
+        // on the timer path; this many also fills the table to its cap.
         for i in 1..=TOP_MAX as u64 {
             s.add(i * PC_BUCKET);
         }
-        assert_eq!(s.map.len(), TOP_MAX);
+        assert_eq!(s.len(), TOP_MAX);
         assert_eq!(s.dropped, 0);
         s.add(0x9999_0000);
         assert_eq!(s.dropped, 1);
-        assert_eq!(s.map.len(), TOP_MAX);
+        assert_eq!(s.len(), TOP_MAX);
         // An address already in the table is still counted, full or not.
         s.add(0);
         s.add(PC_BUCKET);
-        assert_eq!(s.map.get(&PC_BUCKET), Some(&2));
+        assert_eq!(s.get(PC_BUCKET), Some(2));
         assert_eq!(s.total, TOP_MAX as u64 + 2);
     }
 
