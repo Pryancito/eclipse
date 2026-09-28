@@ -1044,6 +1044,14 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
               # covers a `firefox-esr` typed in a terminal. The labwc environment\n\
               # file and eclipse-init's CHILD_ENV carry the same pin.\n\
               export MOZ_ENABLE_WAYLAND=1\n\
+              # GTK from a terminal: the gdk-pixbuf loader registry the\n\
+              # gtk-caches oneshot writes at boot (apk --no-scripts never wrote\n\
+              # the system loaders.cache, so without this GTK decodes no image,\n\
+              # 'Could not load a pixbuf from icon theme'), and no dconf. The\n\
+              # labwc environment file and eclipse-init's CHILD_ENV carry the\n\
+              # same two; the eclipse-firefox wrapper re-asserts them.\n\
+              export GDK_PIXBUF_MODULE_FILE=/root/.cache/pixbuf-loaders.cache\n\
+              export GSETTINGS_BACKEND=memory\n\
               # No session bus here: pin the address so libdbus never\n\
               # `autolaunch:`es (dbus-launch + X11 + dbus-daemon behind pipes,\n\
               # the chain SDL_Init walks first; gzdoom hung there). With no\n\

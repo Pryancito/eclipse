@@ -1236,6 +1236,30 @@ impl VMObjectTrait for VMObjectPaged {
         self.get_inner().source.is_some()
     }
 
+    fn prefill(&self, page_idx: usize, pages: usize) {
+        // A borrower has no source of its own: the pages live in the cache it
+        // borrows from, so the run is made resident THERE, at the borrowed
+        // offset. The cache's Arc is cloned out and this object's family lock
+        // released before the cache's is taken (the cross-family acquisition
+        // is allowed in that direction, but there is no reason to hold ours).
+        let forward = {
+            let inner = self.get_inner();
+            inner.cache.as_ref().and_then(|(cache, base, cache_len)| {
+                let start = base + page_idx * PAGE_SIZE;
+                if start >= *cache_len {
+                    return None;
+                }
+                let n = pages.min((cache_len - start) / PAGE_SIZE);
+                (n > 0).then(|| (cache.clone(), start / PAGE_SIZE, n))
+            })
+        };
+        if let Some((cache, idx, n)) = forward {
+            cache.prefill(idx, n);
+            return;
+        }
+        self.get_inner_mut().prefill(page_idx, pages);
+    }
+
     fn is_shared(&self) -> bool {
         self.shared.load(core::sync::atomic::Ordering::Relaxed)
     }
@@ -1537,6 +1561,53 @@ impl VMObjectPagedInner {
             f(paddr + block.begin, buf_range);
         }
         Ok(())
+    }
+
+    /// Make the missing pages of `[page_idx, page_idx + pages)` resident from
+    /// the backing source with one `fill_range` over the span they cover, on
+    /// a root node (no parent, not hidden: after a fork the source has moved
+    /// to the hidden parent and the leaf resolves through it page by page as
+    /// before). The frames inserted are exactly what `commit_page_internal`
+    /// inserts for a page filled from the source, so a later commit of any
+    /// of them is a plain hit.
+    ///
+    /// Runs under the family lock, like the single-page fill: the source read
+    /// takes the filesystem lock inside it, in the same order as today.
+    fn prefill(&mut self, page_idx: usize, pages: usize) {
+        if self.parent.is_some() || self.type_.is_hidden() {
+            return;
+        }
+        let Some(source) = self.source.clone() else {
+            return;
+        };
+        let end = (page_idx + pages)
+            .min(self.size / PAGE_SIZE)
+            .min(source.source_len().div_ceil(PAGE_SIZE));
+        if page_idx >= end {
+            return;
+        }
+        let missing: Vec<usize> = (page_idx..end)
+            .filter(|i| !self.frames.contains_key(i))
+            .collect();
+        // One missing page gains nothing over the commit that follows.
+        if missing.len() < 2 {
+            return;
+        }
+        let first = missing[0];
+        let span = missing[missing.len() - 1] + 1 - first;
+        let mut buf = alloc::vec![0u8; span * PAGE_SIZE];
+        source.fill_range(first * PAGE_SIZE, &mut buf);
+        for &i in &missing {
+            let Some(frame) = PhysFrame::new() else {
+                break;
+            };
+            let src = &buf[(i - first) * PAGE_SIZE..(i - first + 1) * PAGE_SIZE];
+            let dst = phys_to_virt(frame.paddr()) as *mut u8;
+            // SAFETY: a fresh frame is one page of memory this object now
+            // owns, and `src` is exactly one page.
+            unsafe { core::ptr::copy_nonoverlapping(src.as_ptr(), dst, PAGE_SIZE) };
+            self.frames.insert(i, PageState::new(frame));
+        }
     }
 
     fn commit_page(
@@ -2477,6 +2548,204 @@ mod tests {
         child_vmo.test_write(0, 2);
         assert_eq!(vmo.test_read(0), 1);
         assert_eq!(child_vmo.test_read(0), 2);
+    }
+
+    /// A backing source that counts how it is read: page by page
+    /// (`fill_page`) or by range (`fill_range`), and what each range asked
+    /// for. Page `i` of the source reads as byte `i`.
+    struct CountingSource {
+        pages: usize,
+        page_reads: AtomicUsize,
+        range_reads: AtomicUsize,
+        ranges: Mutex<Vec<(usize, usize)>>,
+        /// Only `fill_page`: the default `fill_range` loop then applies.
+        pages_only: bool,
+    }
+
+    impl CountingSource {
+        fn new(pages: usize, pages_only: bool) -> Arc<Self> {
+            Arc::new(Self {
+                pages,
+                page_reads: AtomicUsize::new(0),
+                range_reads: AtomicUsize::new(0),
+                ranges: Mutex::new(Vec::new()),
+                pages_only,
+            })
+        }
+        fn page_reads(&self) -> usize {
+            self.page_reads.load(Ordering::Relaxed)
+        }
+        fn range_reads(&self) -> usize {
+            self.range_reads.load(Ordering::Relaxed)
+        }
+        fn ranges(&self) -> Vec<(usize, usize)> {
+            self.ranges.lock().clone()
+        }
+    }
+
+    impl FrameFiller for CountingSource {
+        fn source_len(&self) -> usize {
+            self.pages * PAGE_SIZE
+        }
+        fn fill_page(&self, offset: usize, buf: &mut [u8]) {
+            self.page_reads.fetch_add(1, Ordering::Relaxed);
+            if offset < self.source_len() {
+                buf.fill((offset / PAGE_SIZE) as u8);
+            }
+        }
+        fn fill_range(&self, offset: usize, buf: &mut [u8]) {
+            if self.pages_only {
+                // What a source that only knows `fill_page` gets.
+                for (i, chunk) in buf.chunks_mut(PAGE_SIZE).enumerate() {
+                    self.fill_page(offset + i * PAGE_SIZE, chunk);
+                }
+                return;
+            }
+            self.range_reads.fetch_add(1, Ordering::Relaxed);
+            self.ranges.lock().push((offset, buf.len()));
+            for (i, chunk) in buf.chunks_mut(PAGE_SIZE).enumerate() {
+                let off = offset + i * PAGE_SIZE;
+                if off < self.source_len() {
+                    chunk.fill((off / PAGE_SIZE) as u8);
+                }
+            }
+        }
+    }
+
+    fn page_byte(vmo: &VmObject, page: usize) -> u8 {
+        let mut b = [0u8; 1];
+        vmo.read(page * PAGE_SIZE, &mut b).unwrap();
+        b[0]
+    }
+
+    /// The point of `prefill`: a fault's 16-page window costs the source ONE
+    /// read, and every commit inside the window afterwards is a hit.
+    #[test]
+    fn prefill_reads_the_whole_window_with_one_source_read() {
+        let src = CountingSource::new(32, false);
+        let vmo = VmObject::new_paged_cache(32, src.clone());
+        vmo.prefill(0, 16);
+        assert_eq!(src.range_reads(), 1);
+        assert_eq!(src.ranges(), vec![(0, 16 * PAGE_SIZE)]);
+        assert_eq!(src.page_reads(), 0, "no page-by-page reads");
+        assert_eq!(vmo.committed_pages_in_range(0, 32), 16);
+        for page in 0..16 {
+            vmo.commit_page(page, MMUFlags::READ).unwrap();
+            assert_eq!(page_byte(&vmo, page), page as u8, "page {page}");
+        }
+        assert_eq!(
+            (src.range_reads(), src.page_reads()),
+            (1, 0),
+            "the commits inside a prefilled window must not touch the source"
+        );
+        // Outside the window the source is still read on demand.
+        vmo.commit_page(20, MMUFlags::READ).unwrap();
+        assert_eq!(page_byte(&vmo, 20), 20);
+        assert_eq!(src.page_reads(), 1);
+    }
+
+    /// Pages already resident are neither re-read nor replaced: the read
+    /// spans the missing pages only, and a page that was written keeps what
+    /// was written.
+    #[test]
+    fn prefill_reads_only_the_span_of_missing_pages_and_keeps_the_resident_ones() {
+        let src = CountingSource::new(32, false);
+        let vmo = VmObject::new_paged_cache(32, src.clone());
+        vmo.commit_page(0, MMUFlags::WRITE).unwrap();
+        vmo.write(0, &[0xee]).unwrap();
+        vmo.commit_page(15, MMUFlags::READ).unwrap();
+        assert_eq!(src.page_reads(), 2);
+        vmo.prefill(0, 16);
+        assert_eq!(src.ranges(), vec![(PAGE_SIZE, 14 * PAGE_SIZE)]);
+        assert_eq!(vmo.committed_pages_in_range(0, 16), 16);
+        assert_eq!(page_byte(&vmo, 0), 0xee, "a resident page was replaced");
+        assert_eq!(page_byte(&vmo, 1), 1);
+        assert_eq!(page_byte(&vmo, 14), 14);
+        // One missing page is left to the commit that follows: there is no
+        // batch to gain, and a range read would cost an allocation.
+        vmo.commit_page(16, MMUFlags::READ).unwrap();
+        vmo.commit_page(18, MMUFlags::READ).unwrap();
+        let before = src.range_reads();
+        vmo.prefill(16, 3);
+        assert_eq!(src.range_reads(), before);
+        assert_eq!(vmo.committed_pages_in_range(17, 18), 0);
+    }
+
+    /// The window is clipped to the object and to the source: nothing is
+    /// read past either, and the pages past the source stay uncommitted
+    /// (they are the zero tail a commit hands out on its own).
+    #[test]
+    fn prefill_stops_at_the_end_of_the_source_and_of_the_object() {
+        let src = CountingSource::new(5, false);
+        let vmo = VmObject::new_paged_cache(8, src.clone());
+        vmo.prefill(2, 16);
+        assert_eq!(src.ranges(), vec![(2 * PAGE_SIZE, 3 * PAGE_SIZE)]);
+        assert_eq!(vmo.committed_pages_in_range(0, 8), 3);
+        assert_eq!(vmo.committed_pages_in_range(2, 5), 3);
+        // Entirely past the source, or past the object: nothing at all.
+        vmo.prefill(5, 16);
+        vmo.prefill(8, 16);
+        vmo.prefill(usize::MAX / PAGE_SIZE, 16);
+        assert_eq!(src.range_reads(), 1);
+        assert_eq!(vmo.committed_pages_in_range(0, 8), 3);
+    }
+
+    /// A `MAP_PRIVATE` file mapping is a borrower with no source of its own;
+    /// its prefill lands in the page cache it borrows from, at the borrowed
+    /// offset, and the borrower's commits then resolve to those frames.
+    #[test]
+    fn a_borrower_prefills_the_page_cache_it_borrows_from() {
+        let src = CountingSource::new(32, false);
+        let cache = VmObject::new_paged_cache(32, src.clone());
+        let borrower = VmObject::new_paged_borrowing(8, cache.clone(), 4 * PAGE_SIZE);
+        borrower.prefill(0, 16);
+        assert_eq!(src.ranges(), vec![(4 * PAGE_SIZE, 16 * PAGE_SIZE)]);
+        assert_eq!(cache.committed_pages_in_range(4, 20), 16);
+        assert_eq!(
+            borrower.committed_pages_in_range(0, 8),
+            0,
+            "a borrower owns no clean pages"
+        );
+        let paddr = borrower.commit_page(0, MMUFlags::READ).unwrap();
+        assert_eq!(Some(paddr), cache.committed_paddr(4));
+        assert_eq!(page_byte(&borrower, 0), 4);
+        assert_eq!((src.range_reads(), src.page_reads()), (1, 0));
+        // Past the cache: nothing.
+        let long = VmObject::new_paged_borrowing(8, cache.clone(), 30 * PAGE_SIZE);
+        long.prefill(2, 16);
+        assert_eq!(src.range_reads(), 1);
+    }
+
+    /// After a fork the source lives in the hidden parent and the leaf
+    /// resolves through it page by page as before: prefill does nothing there
+    /// rather than reaching into a node it does not own.
+    #[test]
+    fn prefill_is_a_no_op_below_a_hidden_parent() {
+        let src = CountingSource::new(32, false);
+        let vmo = VmObject::new_paged_with_source(32, src.clone());
+        let child = vmo.create_child(false, 0, 32 * PAGE_SIZE).unwrap();
+        child.prefill(0, 16);
+        vmo.prefill(0, 16);
+        assert_eq!(src.range_reads(), 0);
+        child.commit_page(3, MMUFlags::READ).unwrap();
+        assert_eq!(page_byte(&child, 3), 3);
+        assert_eq!(src.page_reads(), 1);
+    }
+
+    /// A source that only implements `fill_page` is still batched by the
+    /// trait's default loop: same pages resident, same contents.
+    #[test]
+    fn a_source_without_a_range_read_is_prefilled_page_by_page() {
+        let src = CountingSource::new(32, true);
+        let vmo = VmObject::new_paged_cache(32, src.clone());
+        vmo.prefill(0, 16);
+        assert_eq!(src.page_reads(), 16);
+        assert_eq!(vmo.committed_pages_in_range(0, 16), 16);
+        assert_eq!(page_byte(&vmo, 9), 9);
+        // And an object with no source at all has nothing to prefill.
+        let anon = VmObject::new_paged(32);
+        anon.prefill(0, 16);
+        assert_eq!(anon.committed_pages_in_range(0, 32), 0);
     }
 
     #[test]

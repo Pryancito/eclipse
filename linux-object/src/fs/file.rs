@@ -634,6 +634,14 @@ impl zircon_object::vm::FrameFiller for FileFrameFiller {
     }
 
     fn fill_page(&self, offset: usize, buf: &mut [u8]) {
+        self.fill_range(offset, buf);
+    }
+
+    /// One `read_at` for the whole range (the inode reads as much as it can
+    /// per call; the loop only covers a short read). This is the read a page
+    /// fault's 16-page window costs now: one filesystem walk and one block
+    /// cache lookup, instead of one per page.
+    fn fill_range(&self, offset: usize, buf: &mut [u8]) {
         let source_len = self.source_len();
         if offset >= source_len {
             return;
@@ -1763,6 +1771,383 @@ mod async_poll_tests {
         assert!(
             poll_once(&f, PollEvents::IN).is_pending(),
             "a reader with nothing to read waits"
+        );
+    }
+}
+
+#[cfg(test)]
+mod prefill_tests {
+    //! What a page fault on a library costs the file system and the disk.
+    //!
+    //! A fault on a file mapping used to read its page and then the fifteen
+    //! after it (`fault_around`) one `read_at` each: sixteen filesystem walks
+    //! and, on the polled AHCI/NVMe drivers, one synchronous command per page
+    //! before the block cache's read-ahead even started. `libxul.so` is
+    //! ~150 MiB of that. Now the fault makes the whole window resident with
+    //! ONE read (`VmObject::prefill` -> `FrameFiller::fill_range`), and these
+    //! tests pin the count at every layer: the filler, the page cache behind
+    //! `mmap`, and a real btrfs on a fake disk that counts its commands.
+    use super::*;
+    use alloc::vec;
+    use alloc::vec::Vec;
+    use core::sync::atomic::{AtomicUsize, Ordering};
+    use lock::Mutex;
+    use zircon_object::vm::FrameFiller;
+
+    /// A regular file whose byte at `i` is the low byte of its page number,
+    /// that counts its reads and serves at most `per_call` bytes per read.
+    struct CountingInode {
+        size: usize,
+        per_call: usize,
+        reads: AtomicUsize,
+        /// `(offset, len asked)` of every read, in order.
+        log: Mutex<Vec<(usize, usize)>>,
+    }
+
+    impl CountingInode {
+        fn new(size: usize, per_call: usize) -> Arc<Self> {
+            Arc::new(Self {
+                size,
+                per_call,
+                reads: AtomicUsize::new(0),
+                log: Mutex::new(Vec::new()),
+            })
+        }
+        fn reads(&self) -> usize {
+            self.reads.load(Ordering::Relaxed)
+        }
+        fn log(&self) -> Vec<(usize, usize)> {
+            self.log.lock().clone()
+        }
+    }
+
+    fn page_byte(offset: usize) -> u8 {
+        (offset / PAGE_SIZE) as u8
+    }
+
+    impl INode for CountingInode {
+        fn read_at(&self, offset: usize, buf: &mut [u8]) -> rcore_fs::vfs::Result<usize> {
+            self.reads.fetch_add(1, Ordering::Relaxed);
+            self.log.lock().push((offset, buf.len()));
+            if offset >= self.size {
+                return Ok(0);
+            }
+            let n = buf.len().min(self.size - offset).min(self.per_call);
+            for (i, b) in buf[..n].iter_mut().enumerate() {
+                *b = page_byte(offset + i);
+            }
+            Ok(n)
+        }
+        fn write_at(&self, _offset: usize, _buf: &[u8]) -> rcore_fs::vfs::Result<usize> {
+            Err(FsError::NotSupported)
+        }
+        fn poll(&self) -> rcore_fs::vfs::Result<PollStatus> {
+            Ok(PollStatus {
+                read: true,
+                write: false,
+                error: false,
+                hangup: false,
+            })
+        }
+        fn metadata(&self) -> rcore_fs::vfs::Result<Metadata> {
+            Ok(Metadata {
+                dev: 1,
+                inode: 7,
+                size: self.size,
+                blk_size: 4096,
+                blocks: self.size.div_ceil(512),
+                atime: Timespec { sec: 0, nsec: 0 },
+                mtime: Timespec { sec: 0, nsec: 0 },
+                ctime: Timespec { sec: 0, nsec: 0 },
+                type_: FileType::File,
+                mode: 0o644,
+                nlinks: 1,
+                uid: 0,
+                gid: 0,
+                rdev: 0,
+            })
+        }
+        fn as_any_ref(&self) -> &dyn core::any::Any {
+            self
+        }
+    }
+
+    fn filler(inode: Arc<CountingInode>, file_offset: usize, max_len: usize) -> FileFrameFiller {
+        FileFrameFiller {
+            inode,
+            file_offset,
+            max_len,
+        }
+    }
+
+    /// The whole window in one read, and the bytes are the file's.
+    #[test]
+    fn fill_range_reads_a_window_with_one_read() {
+        let inode = CountingInode::new(64 * PAGE_SIZE, usize::MAX);
+        let f = filler(inode.clone(), 0, usize::MAX);
+        let mut buf = vec![0u8; 16 * PAGE_SIZE];
+        f.fill_range(3 * PAGE_SIZE, &mut buf);
+        assert_eq!(inode.log(), vec![(3 * PAGE_SIZE, 16 * PAGE_SIZE)]);
+        for page in 0..16 {
+            assert_eq!(buf[page * PAGE_SIZE], (3 + page) as u8, "page {page}");
+            assert_eq!(buf[page * PAGE_SIZE + PAGE_SIZE - 1], (3 + page) as u8);
+        }
+        // A single page is a single read of a page, as before.
+        let mut one = vec![0u8; PAGE_SIZE];
+        f.fill_page(9 * PAGE_SIZE, &mut one);
+        assert_eq!(inode.log()[1], (9 * PAGE_SIZE, PAGE_SIZE));
+        assert_eq!(one[0], 9);
+    }
+
+    /// An inode that serves short reads is read until the window is full,
+    /// each read picking up where the last stopped: bytes land where they
+    /// belong, never shifted.
+    #[test]
+    fn a_short_read_is_continued_not_taken_for_the_end() {
+        let inode = CountingInode::new(64 * PAGE_SIZE, PAGE_SIZE + 100);
+        let f = filler(inode.clone(), 0, usize::MAX);
+        let mut buf = vec![0u8; 4 * PAGE_SIZE];
+        f.fill_range(PAGE_SIZE, &mut buf);
+        let log = inode.log();
+        assert_eq!(log[0], (PAGE_SIZE, 4 * PAGE_SIZE));
+        assert_eq!(log[1], (2 * PAGE_SIZE + 100, 3 * PAGE_SIZE - 100));
+        assert_eq!(log.len(), 4);
+        for (i, b) in buf.iter().enumerate() {
+            assert_eq!(*b, page_byte(PAGE_SIZE + i), "byte {i}");
+        }
+    }
+
+    /// The read stops at the end of the file, and at the mapping's own
+    /// bound (`max_len`) counted from where the mapping starts in the file
+    /// (`file_offset`): a 16-page window at the tail of a library must not
+    /// ask the file system for bytes past EOF.
+    #[test]
+    fn fill_range_is_clipped_to_the_file_and_the_mapping() {
+        let inode = CountingInode::new(5 * PAGE_SIZE, usize::MAX);
+        let f = filler(inode.clone(), 0, usize::MAX);
+        let mut buf = vec![0xffu8; 16 * PAGE_SIZE];
+        f.fill_range(2 * PAGE_SIZE, &mut buf);
+        assert_eq!(inode.log(), vec![(2 * PAGE_SIZE, 3 * PAGE_SIZE)]);
+        assert_eq!(buf[3 * PAGE_SIZE - 1], 4, "last byte of the file");
+        assert_eq!(buf[3 * PAGE_SIZE], 0xff, "past EOF is the caller's");
+        // Entirely past the end: no read at all.
+        f.fill_range(5 * PAGE_SIZE, &mut buf);
+        assert_eq!(inode.reads(), 1);
+
+        let inode = CountingInode::new(64 * PAGE_SIZE, usize::MAX);
+        let f = filler(inode.clone(), 2 * PAGE_SIZE, 4 * PAGE_SIZE);
+        let mut buf = vec![0u8; 16 * PAGE_SIZE];
+        f.fill_range(0, &mut buf);
+        assert_eq!(inode.log(), vec![(2 * PAGE_SIZE, 4 * PAGE_SIZE)]);
+        assert_eq!(buf[0], 2, "VMO offset 0 is file page 2");
+    }
+
+    /// Through `mmap`'s own objects: `get_vmo` hands out a borrower over the
+    /// per-inode page cache, and prefilling a window through the borrower
+    /// costs the inode ONE read; the page fault's commits after it are hits.
+    #[test]
+    fn a_private_mapping_prefills_its_page_cache_with_one_read() {
+        let inode = CountingInode::new(64 * PAGE_SIZE, usize::MAX);
+        let file = File::new(inode.clone(), OpenFlags::RDONLY, String::from("/libxul.so"));
+        let vmo = FileLike::get_vmo(&*file, 0, 32 * PAGE_SIZE).unwrap();
+        assert!(vmo.is_borrower());
+        vmo.prefill(4, 16);
+        assert_eq!(inode.log(), vec![(4 * PAGE_SIZE, 16 * PAGE_SIZE)]);
+        for page in 4..20 {
+            vmo.commit_page(page, zircon_object::vm::MMUFlags::READ)
+                .unwrap();
+        }
+        assert_eq!(inode.reads(), 1, "the window's faults are hits");
+        let mut b = [0u8; 1];
+        vmo.read(19 * PAGE_SIZE, &mut b).unwrap();
+        assert_eq!(b[0], 19);
+        // The next page is outside the window: it is read, on its own.
+        vmo.commit_page(20, zircon_object::vm::MMUFlags::READ)
+            .unwrap();
+        assert_eq!(inode.log()[1], (20 * PAGE_SIZE, PAGE_SIZE));
+    }
+
+    /// In-memory 512-byte-sector disk that counts the read commands it is
+    /// given. On the polled AHCI/NVMe drivers each one is a synchronous
+    /// round trip with one command in flight, so this, not the byte count,
+    /// is what demand paging pays for.
+    struct MockBlock {
+        sectors: Mutex<Vec<u8>>,
+        commands: AtomicUsize,
+        /// `(sector, sectors)` of every read command, in order.
+        log: Mutex<Vec<(usize, usize)>>,
+    }
+
+    impl MockBlock {
+        fn new(bytes: usize) -> Arc<Self> {
+            Arc::new(Self {
+                sectors: Mutex::new(vec![0u8; bytes]),
+                commands: AtomicUsize::new(0),
+                log: Mutex::new(Vec::new()),
+            })
+        }
+        fn commands(&self) -> usize {
+            self.commands.load(Ordering::Relaxed)
+        }
+        fn reset(&self) {
+            self.commands.store(0, Ordering::Relaxed);
+            self.log.lock().clear();
+        }
+    }
+
+    impl zcore_drivers::scheme::Scheme for MockBlock {
+        fn name(&self) -> &str {
+            "mockblock"
+        }
+    }
+
+    impl zcore_drivers::scheme::BlockScheme for MockBlock {
+        fn read_block(&self, block_id: usize, buf: &mut [u8]) -> zcore_drivers::DeviceResult {
+            let start = block_id * 512;
+            let d = self.sectors.lock();
+            if buf.is_empty() || buf.len() % 512 != 0 || start + buf.len() > d.len() {
+                return Err(zcore_drivers::DeviceError::InvalidParam);
+            }
+            buf.copy_from_slice(&d[start..start + buf.len()]);
+            self.commands.fetch_add(1, Ordering::Relaxed);
+            self.log.lock().push((block_id, buf.len() / 512));
+            Ok(())
+        }
+        fn write_block(&self, block_id: usize, buf: &[u8]) -> zcore_drivers::DeviceResult {
+            let start = block_id * 512;
+            let mut d = self.sectors.lock();
+            if buf.is_empty() || buf.len() % 512 != 0 || start + buf.len() > d.len() {
+                return Err(zcore_drivers::DeviceError::InvalidParam);
+            }
+            d[start..start + buf.len()].copy_from_slice(buf);
+            Ok(())
+        }
+        fn flush(&self) -> zcore_drivers::DeviceResult {
+            Ok(())
+        }
+        fn block_count(&self) -> usize {
+            self.sectors.lock().len() / 512
+        }
+    }
+
+    /// `mkfs` writes straight into the disk's bytes, outside the count.
+    struct Formatter(Arc<MockBlock>);
+
+    impl btrfs::BlockDevice for Formatter {
+        fn read_at(&self, offset: u64, buf: &mut [u8]) -> btrfs::Result<()> {
+            let d = self.0.sectors.lock();
+            let o = offset as usize;
+            buf.copy_from_slice(&d[o..o + buf.len()]);
+            Ok(())
+        }
+        fn write_at(&self, offset: u64, buf: &[u8]) -> btrfs::Result<()> {
+            let mut d = self.0.sectors.lock();
+            let o = offset as usize;
+            d[o..o + buf.len()].copy_from_slice(buf);
+            Ok(())
+        }
+        fn sync(&self) -> btrfs::Result<()> {
+            Ok(())
+        }
+        fn size(&self) -> u64 {
+            self.0.sectors.lock().len() as u64
+        }
+    }
+
+    fn mkfs_opts() -> btrfs::mkfs::MkfsOptions {
+        let mut seed = 0x1234_5678_9abc_def0u64;
+        let mut uuid = || {
+            let mut u = [0u8; 16];
+            for b in u.iter_mut() {
+                seed = seed
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                *b = (seed >> 33) as u8;
+            }
+            u[6] = (u[6] & 0x0f) | 0x40;
+            u[8] = (u[8] & 0x3f) | 0x80;
+            u
+        };
+        btrfs::mkfs::MkfsOptions {
+            label: String::from("libxul"),
+            fsid: uuid(),
+            chunk_uuid: uuid(),
+            dev_uuid: uuid(),
+            subvol_uuid: uuid(),
+            now: (1_700_000_000, 0),
+        }
+    }
+
+    /// The real chain, end to end: a btrfs on a disk that counts its
+    /// commands, a `File` over it, the page cache `mmap` uses, and a window
+    /// made resident through it. A cold 16-page window is one command, not
+    /// sixteen page reads (which the block cache turns into two 4 KiB
+    /// commands and then a megabyte of read-ahead).
+    #[test]
+    fn a_cold_window_of_a_library_on_btrfs_is_one_disk_command() {
+        use super::super::block_mount::MountBackend;
+        use super::super::btrfs_mount::BtrfsMountFs;
+        use rcore_fs::vfs::FileSystem;
+        use zircon_object::vm::MMUFlags;
+
+        const LIB_PAGES: usize = 2048; // 8 MiB
+        let disk = MockBlock::new(32 * 1024 * 1024);
+        btrfs::mkfs::format(&Formatter(disk.clone()), &mkfs_opts()).unwrap();
+        let backend = MountBackend::Block(disk.clone());
+        {
+            let fs = BtrfsMountFs::open(&backend, false).unwrap();
+            let lib = fs
+                .root_inode()
+                .create("libxul.so", FileType::File, 0o755)
+                .unwrap();
+            let mut chunk = vec![0u8; 64 * PAGE_SIZE];
+            for at in (0..LIB_PAGES * PAGE_SIZE).step_by(chunk.len()) {
+                for (i, b) in chunk.iter_mut().enumerate() {
+                    *b = page_byte(at + i) ^ 0x5a;
+                }
+                assert_eq!(lib.write_at(at, &chunk).unwrap(), chunk.len());
+            }
+            lib.sync_all().unwrap();
+            fs.sync().unwrap();
+        }
+
+        // A fresh mount: nothing of the file in any cache.
+        let fs = BtrfsMountFs::open(&backend, true).unwrap();
+        let lib = fs.root_inode().find("libxul.so").unwrap();
+        assert_eq!(lib.metadata().unwrap().size, LIB_PAGES * PAGE_SIZE);
+        let file = File::new(lib, OpenFlags::RDONLY, String::from("/usr/lib/libxul.so"));
+        let vmo = FileLike::get_vmo(&*file, 0, LIB_PAGES * PAGE_SIZE).unwrap();
+        // The first touch of a file pays for its extent walk too; the fault
+        // in the middle of the library is the steady state.
+        vmo.prefill(0, 16);
+        disk.reset();
+
+        vmo.prefill(1024, 16);
+        assert_eq!(
+            disk.commands(),
+            1,
+            "one 64 KiB command for the window: {:?}",
+            disk.log.lock()
+        );
+        assert_eq!(disk.log.lock()[0].1, 16 * PAGE_SIZE / 512);
+        // The commits the fault then makes are hits, and carry the file.
+        for page in 1024..1040 {
+            vmo.commit_page(page, MMUFlags::READ).unwrap();
+        }
+        assert_eq!(disk.commands(), 1);
+        let mut b = [0u8; 2];
+        vmo.read(1039 * PAGE_SIZE + PAGE_SIZE - 2, &mut b).unwrap();
+        assert_eq!(b, [page_byte(1039 * PAGE_SIZE) ^ 0x5a; 2]);
+
+        // The old way, for the record: the same window page by page.
+        disk.reset();
+        for page in 1536..1552 {
+            vmo.commit_page(page, MMUFlags::READ).unwrap();
+        }
+        assert!(
+            disk.commands() > 1,
+            "page by page was {} commands",
+            disk.commands()
         );
     }
 }

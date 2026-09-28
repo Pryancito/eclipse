@@ -11384,6 +11384,51 @@ impl NvidiaGpu {
         s
     }
 
+    /// The channel an EXEC names must be the caller's own, and the RM-backed
+    /// one. The id NVK submits against is the one CHANNEL_ALLOC handed it,
+    /// and ids are assigned "lowest free" -- so only the FIRST channel of a
+    /// boot is 0; demanding 0 here once rejected every later one with a bare
+    /// EINVAL and no log line at all. A channel the caller does not hold is
+    /// ENOENT, as `nouveau_exec_ioctl_exec` answers when the id is not in the
+    /// caller's list (it was EINVAL here); a discovery channel of the
+    /// caller's own, with no GR channel/GPFIFO behind it, is ENODEV.
+    fn exec_channel_check(&self, channel: u32, owner_pid: u64) -> Result<(), i32> {
+        use super::nouveau_uapi as nv;
+        let chans = self.nouveau_channels.lock();
+        // `drm_nouveau_exec.channel` is __u32 while
+        // `drm_nouveau_channel_alloc.channel` is __s32 -- that asymmetry is in
+        // nouveau_drm.h itself. Ids we hand out are never negative, so compare
+        // in the unsigned domain.
+        let mine = chans
+            .iter()
+            .find(|c| c.id >= 0 && c.id as u32 == channel && c.owner_pid == owner_pid);
+        match mine {
+            Some(c) if c.rm_backed => Ok(()),
+            Some(_) => {
+                let rm_owner = chans.iter().find(|c| c.rm_backed).map(|c| c.owner_pid);
+                drop(chans);
+                crate::klog_warn!(
+                    "[nouveau-uapi] EXEC: channel={} belongs to pid={} but is a DISCOVERY channel (no GR channel/GPFIFO behind it); the RM-backed channel is held by pid={:?}",
+                    channel,
+                    owner_pid,
+                    rm_owner
+                );
+                Err(nv::ENODEV)
+            }
+            None => {
+                let known: Vec<i32> = chans.iter().map(|c| c.id).collect();
+                drop(chans);
+                crate::klog_warn!(
+                    "[nouveau-uapi] EXEC: channel={} is not owned by pid={} (live channels: {:?})",
+                    channel,
+                    owner_pid,
+                    known
+                );
+                Err(nv::ENOENT)
+            }
+        }
+    }
+
     fn ctx_idx_for_pid(&self, owner_pid: u64) -> u32 {
         // Only READY entries route: a mid-build ctx must not receive class
         // objects or submissions (callers that can legitimately race a build
@@ -12931,6 +12976,14 @@ impl NvidiaGpu {
                 {
                     return Err(nv::EFAULT);
                 }
+                // The channel first, for EVERY exec, the empty probe included:
+                // Linux's `nouveau_exec_ioctl_exec` finds the channel in the
+                // caller's own list before it looks at anything else, and
+                // answers ENOENT when it is not there. The probe path used to
+                // skip this: an empty EXEC against a freed channel, another
+                // process's, or a made-up id answered 0 and signaled its sigs
+                // as if that channel had drained.
+                self.exec_channel_check(req.channel, owner_pid)?;
                 // Every sig handle must exist BEFORE anything happens, as in
                 // Linux, where `nouveau_job_submit` looks the whole list up
                 // (`nouveau_job_fence_attach_prepare`) before the job is armed:
@@ -13209,47 +13262,6 @@ impl NvidiaGpu {
                         req.push_count, MAX_EXEC_PUSH, req.push_ptr
                     );
                     return Err(nv::EOPNOTSUPP);
-                }
-                // The channel id NVK submits against is the one CHANNEL_ALLOC
-                // handed it, and ids are assigned "lowest free" -- so only the
-                // FIRST channel of a boot is 0. Demanding 0 here rejected every
-                // later one with a bare EINVAL and no log line at all. Check
-                // what actually matters instead: the caller owns this channel
-                // AND it is the RM-backed one.
-                {
-                    let chans = self.nouveau_channels.lock();
-                    // `drm_nouveau_exec.channel` is __u32 while
-                    // `drm_nouveau_channel_alloc.channel` is __s32 -- that
-                    // asymmetry is in nouveau_drm.h itself. Ids we hand out are
-                    // never negative, so compare in the unsigned domain.
-                    let mine = chans.iter().find(|c| {
-                        c.id >= 0 && c.id as u32 == req.channel && c.owner_pid == owner_pid
-                    });
-                    match mine {
-                        Some(c) if c.rm_backed => {}
-                        Some(_) => {
-                            let rm_owner = chans.iter().find(|c| c.rm_backed).map(|c| c.owner_pid);
-                            drop(chans);
-                            crate::klog_warn!(
-                                "[nouveau-uapi] EXEC: channel={} belongs to pid={} but is a DISCOVERY channel (no GR channel/GPFIFO behind it); the RM-backed channel is held by pid={:?}",
-                                req.channel,
-                                owner_pid,
-                                rm_owner
-                            );
-                            return Err(nv::ENODEV);
-                        }
-                        None => {
-                            let known: Vec<i32> = chans.iter().map(|c| c.id).collect();
-                            drop(chans);
-                            crate::klog_warn!(
-                                "[nouveau-uapi] EXEC: channel={} is not owned by pid={} (live channels: {:?})",
-                                req.channel,
-                                owner_pid,
-                                known
-                            );
-                            return Err(nv::EINVAL);
-                        }
-                    }
                 }
                 let pushes = unsafe {
                     core::slice::from_raw_parts(
@@ -17184,10 +17196,10 @@ mod nouveau_bookkeeping_tests {
         channel_alloc(&gpu, B).unwrap();
         assert_eq!(
             exec(&gpu, B, ch, &p, &[], &[]),
-            Err(nv::EINVAL),
-            "B has one, but this channel id is A's"
+            Err(nv::ENOENT),
+            "B has one, but this channel id is A's: not in B's list (Linux ENOENT)"
         );
-        assert_eq!(exec(&gpu, A, ch + 7, &p, &[], &[]), Err(nv::EINVAL));
+        assert_eq!(exec(&gpu, A, ch + 7, &p, &[], &[]), Err(nv::ENOENT));
         // A channel opened before the RM attached is discovery-only for
         // good, even once its owner has a real one: the client must free it
         // and CHANNEL_ALLOC again (the driver's own log says so).
@@ -17487,6 +17499,50 @@ mod nouveau_bookkeeping_tests {
     /// early, and the application re-recorded command buffers the GPU was
     /// still reading. The sigs now ride a probe fence appended behind the
     /// queued work; an idle ring has nothing to wait for.
+    /// The probe names a channel like any other EXEC, and Linux looks that
+    /// channel up before anything else (`nouveau_exec_ioctl_exec`): an id the
+    /// caller does not hold is ENOENT with nothing signaled. This arm used
+    /// to answer 0 and signal the sigs for any id at all -- a freed channel,
+    /// another process's, or one that never existed.
+    #[test]
+    fn an_empty_exec_needs_the_callers_own_channel_like_a_real_one() {
+        let _g = LOCK.lock();
+        let _live = LiveBytes::hold();
+        let gpu = gpu_rm();
+        let ch = client_with_pushbuf(&gpu, A);
+        let out = syncobj::create(false);
+        assert_eq!(
+            exec(&gpu, A, ch + 7, &[], &[], &[sync(out)]),
+            Err(nv::ENOENT),
+            "a channel that never existed"
+        );
+        assert_eq!(syncobj::query(out), Some(0), "nothing signaled");
+        // B has a channel of its own; A's id is not in B's list.
+        let ch_b = channel_alloc(&gpu, B).unwrap().channel as u32;
+        assert_ne!(ch_b, ch);
+        assert_eq!(
+            exec(&gpu, B, ch, &[], &[], &[sync(out)]),
+            Err(nv::ENOENT),
+            "another process's channel"
+        );
+        assert_eq!(
+            exec(&gpu, B, ch_b, &[], &[], &[sync(out)]),
+            Ok(0),
+            "B's own"
+        );
+        assert_eq!(syncobj::query(out), Some(1));
+        // A channel the caller freed is gone for the probe too (with a
+        // second channel still open, so the "no RM channel at all" gate at
+        // the top of the arm does not answer first).
+        let ch2 = channel_alloc(&gpu, A).unwrap().channel as u32;
+        assert_eq!(channel_free(&gpu, ch as i32, A), Ok(0));
+        assert_eq!(exec(&gpu, A, ch, &[], &[], &[]), Err(nv::ENOENT), "freed");
+        assert_eq!(exec(&gpu, A, ch2, &[], &[], &[]), Ok(0), "the live one");
+        assert!(syncobj::destroy(out));
+        gpu.nouveau_release_process(B);
+        gpu.nouveau_release_process(A);
+    }
+
     #[test]
     fn an_empty_exec_signals_behind_the_work_the_ring_still_has_queued() {
         let _g = LOCK.lock();
@@ -23378,6 +23434,25 @@ mod nouveau_bookkeeping_tests {
             FixedTick(u64),
         }
 
+        /// How many times one probe of a parked wait walks the pending-fence
+        /// list.
+        ///
+        /// `SYNCOBJ_WAIT` and the atomic commit's fence both have an async
+        /// pre-wait in `drm_scheme.rs` that loops "look, sleep, look". Every
+        /// look used to be TWO walks of the table: a `poll_pending()` and
+        /// then the `wait_ready()` right behind it, which takes the same lock
+        /// and runs the same `resolve_locked`. A walk is not bookkeeping --
+        /// it reads the landing zone of every fence still in flight, and a
+        /// landing zone is uncached pinned sysmem, so each read leaves the
+        /// CPU. This is the knob that shows what the second walk cost.
+        #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+        enum Resolve {
+            /// One walk per look: what the pre-waits do now.
+            Once,
+            /// The `poll_pending()` + `wait_ready()` pair they used to do.
+            Duplicated,
+        }
+
         #[derive(Clone, Copy, PartialEq, Eq, Debug)]
         enum Swap {
             /// `vblank_mode=0`: present as soon as the frame is drawn.
@@ -23402,6 +23477,7 @@ mod nouveau_bookkeeping_tests {
             composite_us: u64,
             swap: Swap,
             poll: Poll,
+            resolve: Resolve,
             /// The swapchain timeline: frame `f` signals point `f + 1`.
             present_tl: u32,
             /// Per image, the compositor's release timeline: use `u` of the
@@ -23485,6 +23561,7 @@ mod nouveau_bookkeeping_tests {
                     composite_us: COMPOSITE_US,
                     swap,
                     poll: Poll::Backoff,
+                    resolve: Resolve::Once,
                     present_tl: syncobj::create(false),
                     release_tl: core::array::from_fn(|_| syncobj::create(false)),
                     sem: core::array::from_fn(|_| syncobj::create(false)),
@@ -23553,6 +23630,20 @@ mod nouveau_bookkeeping_tests {
             /// A yield costs no wall clock, so the waiter sees the next
             /// event as it happens; a sleep means the waiter is blind until
             /// it wakes, however early the thing it waits for arrived.
+            /// One look of a parked wait, the way the async pre-wait in
+            /// `drm_scheme.rs` takes it: the `wait_ready` that answers, and
+            /// under [`Resolve::Duplicated`] the redundant `poll_pending`
+            /// that used to run in front of it.
+            fn look(&self, handle: u32) -> bool {
+                if self.resolve == Resolve::Duplicated {
+                    syncobj::poll_pending();
+                }
+                matches!(
+                    syncobj::wait_ready(&[handle], None, true, Self::now() + 1_000),
+                    Some(Ok(_))
+                )
+            }
+
             fn poll_wait(&mut self, probes: &mut u32) {
                 let delay = match self.poll {
                     Poll::Backoff => match syncobj::fence_poll_step(*probes) {
@@ -23715,21 +23806,15 @@ mod nouveau_bookkeeping_tests {
                     let mut stalled = false;
                     let mut probes = 0u32;
                     loop {
-                        match syncobj::wait_ready(
-                            &[self.sem[image]],
-                            None,
-                            true,
-                            Self::now() + 1_000,
-                        ) {
-                            Some(Ok(_)) => break,
-                            None | Some(Err(syncobj::WaitOutcome::Timeout)) => {}
-                            Some(Err(_)) => {
-                                panic!(
-                                    "frame {}: the acquire semaphore of image {} vanished",
-                                    f, image
-                                )
-                            }
+                        if self.look(self.sem[image]) {
+                            break;
                         }
+                        assert!(
+                            syncobj::query(self.sem[image]).is_some(),
+                            "frame {}: the acquire semaphore of image {} vanished",
+                            f,
+                            image
+                        );
                         stalled = true;
                         assert!(
                             Self::now().wrapping_sub(t0) < STUCK_US,
@@ -23825,6 +23910,112 @@ mod nouveau_bookkeeping_tests {
                 nv::set_surfaceflip_enabled(false);
                 assert_eq!(FAKE_RM.lock().bad, 0);
             }
+        }
+
+        /// What the second walk of the pending-fence list cost a frame.
+        ///
+        /// A client parked on its acquire semaphore takes several looks per
+        /// frame, and every look used to run `poll_pending()` and then
+        /// `wait_ready()`: the same lock twice, the same `resolve_locked`
+        /// twice, and -- the part that leaves the CPU -- the landing zone of
+        /// every fence still in flight read twice. Removing the first of the
+        /// two changes no answer the wait can give, because the second one
+        /// resolves the table itself before it reads it. This pins that: the
+        /// same desktop, the same frames, the same frame rate, and fewer
+        /// trips to the fence (about three a frame here, and one lock
+        /// acquisition a look, which this bench cannot price).
+        #[test]
+        fn a_parked_wait_walks_the_pending_fences_once_a_look_and_not_twice() {
+            let _g = LOCK.lock();
+            let _s = SERIAL.lock();
+            let _live = LiveBytes::hold();
+
+            let run = |resolve: Resolve| {
+                let gpu = desktop_gpu();
+                let mut d = Desktop::new(&gpu, Swap::Immediate);
+                d.resolve = resolve;
+                // The same Turing-sized frame the poll-tick measurement uses:
+                // short enough that the client really does park on its
+                // acquire semaphore every frame.
+                d.render_us = 100;
+                syncobj::FENCE_READS.store(0, Ordering::Relaxed);
+                let settled = syncobj::table_len();
+                let fps = d.run(FRAMES);
+                // Mesa builds and closes a surrogate syncobj every frame. If
+                // the closed ones piled up, every linear walk of the table
+                // would get longer with every frame the desktop runs -- the
+                // kind of slowdown that only shows after an hour of uptime,
+                // which is exactly when nobody is looking. The desktop's own
+                // handles (a present timeline, and a release timeline and an
+                // acquire semaphore per image) are what `settled` counts.
+                assert!(
+                    syncobj::table_len() <= settled + IMAGES,
+                    "{:?}: the table went from {} to {} objects over {} frames",
+                    resolve,
+                    settled,
+                    syncobj::table_len(),
+                    FRAMES
+                );
+                let reads = syncobj::FENCE_READS.load(Ordering::Relaxed);
+                let stalls = d.client_stalls;
+                assert_eq!(
+                    d.commits_served, FRAMES,
+                    "{:?}: a present was lost",
+                    resolve
+                );
+                d.finish();
+                (fps, reads, stalls)
+            };
+
+            let (old_fps, old_reads, old_stalls) = run(Resolve::Duplicated);
+            let (new_fps, new_reads, new_stalls) = run(Resolve::Once);
+
+            // Without a stall there is no parked wait and this measures
+            // nothing at all.
+            assert!(old_stalls > 0 && new_stalls > 0, "the client never waited");
+
+            // The answer does not change: same frames on the panel, same
+            // rate. Only the work behind each look does.
+            assert!(
+                (old_fps - new_fps).abs() / old_fps < 0.02,
+                "{:.0} -> {:.0} fps: dropping the second walk changed what the wait answers",
+                old_fps,
+                new_fps
+            );
+            // Measured: 6957 -> 6238 over 240 frames, about three reads a
+            // frame. Not half, and the reason is worth keeping written down:
+            // `poll_pending()` bails out on a lock-free counter when no
+            // hardware fence is in flight, and most looks of this desktop
+            // fall in that window. What it always paid, in flight or not, was
+            // the second acquisition of the table lock -- and that one is not
+            // counted here, because a uniprocessor bench cannot measure a
+            // lock the other CPU wants. Two saved reads a frame is the floor
+            // that a reinstated `poll_pending()` cannot clear.
+            assert!(
+                old_reads >= new_reads + FRAMES * 2,
+                "{} -> {} reads of a fence landing zone over {} frames \
+                 ({:.1} -> {:.1} a frame): the second walk is still there",
+                old_reads,
+                new_reads,
+                FRAMES,
+                old_reads as f64 / FRAMES as f64,
+                new_reads as f64 / FRAMES as f64
+            );
+
+            // And the ceiling, which is what holds the other half of this
+            // change: `resolve_locked` runs its passes to a fixed point, and
+            // it used to re-read every landing zone on every pass although
+            // what the later passes re-decide is whether a landed fence is
+            // still HELD, not whether it landed. Measured over these 240
+            // frames: 26.0 reads a frame without the cache of what this call
+            // has already read, 24.0 with it. The ceiling sits between them,
+            // so a cache that stops caching fails here.
+            assert!(
+                new_reads <= FRAMES * 25,
+                "{:.1} reads of a fence landing zone a frame: a resolve is \
+                 reading the same zone twice again",
+                new_reads as f64 / FRAMES as f64
+            );
         }
 
         /// The measurement this whole knob exists for: the same desktop,

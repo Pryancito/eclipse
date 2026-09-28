@@ -213,6 +213,15 @@ const CHILD_ENV: &[&str] = &[
     // the environment a menu-launched browser sees). /etc/profile and the
     // labwc environment file carry the same pin.
     "MOZ_ENABLE_WAYLAND=1",
+    // GTK from init-started children (a foot from the dock, and everything
+    // typed into it): the gdk-pixbuf loader registry the gtk-caches oneshot
+    // writes at boot, and no dconf. Only labwc's environment file carried
+    // these, so a `firefox-esr` typed into a dock terminal decoded no image
+    // ("Could not load a pixbuf from icon theme": `apk --no-scripts` never
+    // wrote the system loaders.cache). /etc/profile and the wrapper carry
+    // the same two.
+    "GDK_PIXBUF_MODULE_FILE=/root/.cache/pixbuf-loaders.cache",
+    "GSETTINGS_BACKEND=memory",
     // SDL (sdl12-compat / SDL2 / SDL3) backends, the renderer-independent half
     // of the session's SDL policy (the labwc wrapper and /etc/profile assert
     // the same). Video: native Wayland first, X11 as fallback -- Xwayland in
@@ -2545,6 +2554,27 @@ mod tests {
     /// environment file and /etc/profile carry the same pin, checked in
     /// xtask). Static, so it must be in CHILD_ENV itself and survive
     /// `build_child_env` on every renderer.
+    /// GTK from a dock terminal: the pixbuf loader registry and the
+    /// GSettings backend that labwc's environment file already names, in the
+    /// static base too, so a `firefox-esr` typed into foot decodes images.
+    #[test]
+    fn gtk_finds_its_pixbuf_loaders_from_init_started_children() {
+        for var in [
+            "GDK_PIXBUF_MODULE_FILE=/root/.cache/pixbuf-loaders.cache",
+            "GSETTINGS_BACKEND=memory",
+        ] {
+            assert!(CHILD_ENV.contains(&var), "{var} must be in CHILD_ENV");
+            for cmdline in ["LOG=warn", "renderer=gl", "renderer=gl-sw"] {
+                let env = renderer_env(cmdline, None, false);
+                assert_eq!(
+                    env.iter().filter(|v| v.as_str() == var).count(),
+                    1,
+                    "{cmdline}: {env:?}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn firefox_is_pinned_to_native_wayland_for_init_started_children() {
         assert!(
