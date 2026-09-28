@@ -206,7 +206,7 @@ impl LinuxElfLoader {
         )?;
         let data = unsafe { core::slice::from_raw_parts(virt_addr as *const u8, vmo.len()) };
 
-        let res = self.load_impl(vmar, data, args, envs, path, 0);
+        let res = self.load_impl(vmar, data, args, envs, path, 0, Some(vmo));
 
         zircon_object::vm::KERNEL_ASPACE.unmap(virt_addr, size)?;
         res
@@ -273,6 +273,7 @@ impl LinuxElfLoader {
         envs: Vec<String>,
         path: String,
         recursion: u8,
+        image: Option<&Arc<VmObject>>,
     ) -> LxResult<(VirtAddr, VirtAddr, usize, String, Abi)> {
         debug!(
             "elf: load_impl recursion={} len={:#x} path={:?}",
@@ -361,6 +362,7 @@ impl LinuxElfLoader {
                 envs,
                 interp_path,
                 recursion + 1,
+                Some(&interp_vmo),
             );
 
             zircon_object::vm::KERNEL_ASPACE.unmap(interp_virt, interp_size)?;
@@ -421,7 +423,11 @@ impl LinuxElfLoader {
                     );
                 })?;
             let app_base = app_vmar.addr();
-            let _app_vmo = app_vmar.load_from_elf(&elf).inspect_err(|&e| {
+            let _app_vmo = match image {
+                Some(img) => app_vmar.load_from_elf_image(&elf, img),
+                None => app_vmar.load_from_elf(&elf),
+            }
+            .inspect_err(|&e| {
                 error!("elf: load app from elf failed: {:?}", e);
             })?;
             let app_entry = entry_address(app_base, elf.header.pt2.entry_point())?;
@@ -487,9 +493,11 @@ impl LinuxElfLoader {
                     );
                 })?;
             let interp_base = interp_vmar.addr();
-            let _interp_vmo = interp_vmar.load_from_elf(&interp_elf).inspect_err(|&e| {
-                error!("elf: load interp {:?} from elf failed: {:?}", interp, e);
-            })?;
+            let _interp_vmo = interp_vmar
+                .load_from_elf_image(&interp_elf, &interp_vmo)
+                .inspect_err(|&e| {
+                    error!("elf: load interp {:?} from elf failed: {:?}", interp, e);
+                })?;
             let interp_entry = entry_address(interp_base, interp_elf.header.pt2.entry_point())?;
 
             match interp_elf.relocate(interp_vmar.clone(), vmar) {
@@ -646,7 +654,11 @@ impl LinuxElfLoader {
                 error!("elf: allocate vmar for size {:#x} failed: {:?}", size, e);
             })?;
         let base = image_vmar.addr();
-        let _vmo = image_vmar.load_from_elf(&elf).inspect_err(|&e| {
+        let _vmo = match image {
+            Some(img) => image_vmar.load_from_elf_image(&elf, img),
+            None => image_vmar.load_from_elf(&elf),
+        }
+        .inspect_err(|&e| {
             error!("elf: load_from_elf failed: {:?}", e);
         })?;
         let entry = entry_address(base, elf.header.pt2.entry_point())?;

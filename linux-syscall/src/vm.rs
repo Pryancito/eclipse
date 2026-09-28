@@ -1,4 +1,5 @@
 use super::*;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use bitflags::bitflags;
 use linux_object::error::LxResult;
@@ -943,11 +944,9 @@ impl Syscall<'_> {
     ///
     /// Argument checking follows the man page exactly (`EINVAL` for a misaligned
     /// address, unknown flags or `MS_SYNC|MS_ASYNC` together; `ENOMEM` when the
-    /// range touches unmapped pages). No writeback happens beyond that: shared
-    /// file mappings hand every mapper the same `VmObject` as the file cache, so
-    /// stores are already visible to readers the way `msync` is meant to
-    /// guarantee — succeeding here is honest, and it un-breaks software that
-    /// treats an `msync` failure as fatal (sqlite, mandb).
+    /// range touches unmapped pages). Shared file mappings then flush committed
+    /// pages back to their inode ([`linux_object::fs::sync_shared_file_vmo`]) so
+    /// SQLite / Firefox profile writes survive past eviction — Stage A writeback.
     pub fn sys_msync(&self, addr: usize, len: usize, flags: usize) -> SysResult {
         info!(
             "msync: addr={:#x}, len={:#x}, flags={:#x}",
@@ -962,7 +961,8 @@ impl Syscall<'_> {
         // zero times, so `msync(p, -1, MS_SYNC)` reported success over a range
         // it never looked at; for a `len` just below that the sum itself
         // wrapped, to an `end` under `addr`, with the same result.
-        walk_mapped(&self.zircon_process().vmar(), addr, addr + len)
+        let vmar = self.zircon_process().vmar();
+        walk_mapped_msync(&vmar, addr, addr + len)
     }
 
     /// Determine whether pages are resident in memory
@@ -1720,6 +1720,26 @@ fn walk_mapped(vmar: &Arc<VmAddressRegion>, start: usize, end: usize) -> SysResu
     while page < end {
         if vmar.find_mapping(page).is_none() {
             return Err(LxError::ENOMEM);
+        }
+        page += PAGE_SIZE;
+    }
+    Ok(0)
+}
+
+/// Like [`walk_mapped`], but also writebacks each distinct MAP_SHARED
+/// file-backed VMO touched by the range (Firefox / SQLite `msync(MS_SYNC)`).
+fn walk_mapped_msync(vmar: &Arc<VmAddressRegion>, start: usize, end: usize) -> SysResult {
+    use alloc::collections::BTreeSet;
+    let mut page = start;
+    let mut seen: BTreeSet<usize> = BTreeSet::new();
+    while page < end {
+        let Some(mapping) = vmar.find_mapping(page) else {
+            return Err(LxError::ENOMEM);
+        };
+        let vmo = mapping.vmo();
+        let key = Arc::as_ptr(vmo) as usize;
+        if seen.insert(key) {
+            linux_object::fs::sync_shared_file_vmo(vmo);
         }
         page += PAGE_SIZE;
     }

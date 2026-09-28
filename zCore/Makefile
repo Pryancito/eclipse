@@ -65,20 +65,19 @@ boottrace_arg := $(if $(BOOTTRACE),:BOOTTRACE=$(BOOTTRACE))
 #   GL=sw             -> renderer=gl-sw  (wlroots GLES2 over Mesa llvmpipe;
 #                                         software GL, RENDERS in QEMU, slow)
 #   GL=1              -> renderer=gl + nvidia.nouveau_uapi (turns on the NVIDIA
-#                                         nouveau experiment knobs; labwc now
-#                                         defaults to the SAFE software path on
-#                                         real hardware unless the cmdline also
-#                                         opts into `nvidia.wlr_gles2` or
+#                                         nouveau uAPI; on real NVIDIA hardware
+#                                         the session defaults to GLES2/zink with
+#                                         CE/surfaceflip/hwflip. Kill-switch:
+#                                         `nvidia.wlr_pixman`. Native Vulkan:
 #                                         `nvidia.wlr_vulkan`. On a machine with
 #                                         no NVIDIA GPU -- QEMU -- userspace
 #                                         still degrades itself to the gl-sw
 #                                         stack, so the same image renders.)
 #
 # GL=1 also stamps `nvidia.nouveau_uapi` (the nouveau-compatible DRM ioctl
-# surface, off by default because it is untested on real hardware — see
-# docs/README-nouveau-uapi.md): Mesa's nouveau_dri.so needs it or every
-# GETPARAM/GEM/CHANNEL ioctl returns ENOSYS. It is a no-op without a real NVIDIA
-# GPU (nothing to answer), so it is harmless in QEMU.
+# surface — see docs/README-nouveau-uapi.md): Mesa's nouveau_dri.so / NVK need
+# it or every GETPARAM/GEM/CHANNEL ioctl returns ENOSYS. It is a no-op without
+# a real NVIDIA GPU (nothing to answer), so it is harmless in QEMU.
 #
 # Why GL=1 can't render HARDWARE GL in QEMU: the virtio-gpu we expose is
 # 2D-ONLY — its DRM ioctl surface is a single GETPARAM stub, no virgl/3D
@@ -90,17 +89,16 @@ boottrace_arg := $(if $(BOOTTRACE),:BOOTTRACE=$(BOOTTRACE))
 # software-GL stack as GL=sw (labwc on GLES2/llvmpipe, clients on llvmpipe).
 # Leaving the env unpinned instead put labwc on pixman with hardware-probing
 # clients: glxgears rendered (FPS on the console) into buffers the pixman
-# compositor never composited — no window. On real NVIDIA hardware, GL=1 now
-# still keeps labwc on pixman by DEFAULT to avoid the current zink/NVK crash
-# loop; add `nvidia.wlr_gles2` or `nvidia.wlr_vulkan` to the cmdline to try the
-# unstable GPU compositor paths explicitly.
+# compositor never composited — no window. On real NVIDIA hardware, GL=1
+# defaults to GLES2/zink; if labwc dies twice the init degrades to pixman for
+# the rest of that boot (`nvidia.wlr_pixman` forces software from the start).
 #
 # NOTE for real hardware: the ESP's rboot.conf cmdline is written from CMDLINE,
 # so a default build stamps `renderer=auto` there. auto resolves per GPU at
 # boot (eclipse-init detect_renderer): NVIDIA WITHOUT the nvidia.nouveau_uapi
 # flag -> pixman (the kernel uAPI is off, so hardware GL cannot exist — same
 # two-condition rule as everywhere else); any other GPU -> gl-sw; no GPU ->
-# pixman. Force `GL=1` to try nouveau, or edit the ESP's rboot.conf by hand.
+# pixman. Force `GL=1` for GPU accel on NVIDIA, or edit the ESP's rboot.conf.
 # Extra kernel cmdline options, appended verbatim to CMDLINE. This is the knob
 # for every boot-time flag that has no Makefile variable of its own, and there
 # are a dozen of those (`drm.present_probe`, `drm.atomic`, `drm.flip_fence=off`,

@@ -285,6 +285,13 @@ pub trait VmarExt {
     /// Create `VMObject` from all LOAD segments of `elf` and map them to this VMAR.
     /// Return the first `VMObject`.
     fn load_from_elf(&self, elf: &ElfFile) -> ZxResult<Arc<VmObject>>;
+    /// Map LOAD segments by borrowing pages from a shared image VMO (no per-exec
+    /// byte copy). Falls back to a private copy when a segment cannot borrow.
+    fn load_from_elf_image(
+        &self,
+        elf: &ElfFile,
+        image: &Arc<VmObject>,
+    ) -> ZxResult<Arc<VmObject>>;
     /// Same as `load_from_elf`, but the `vmo` is an existing one instead of a lot of new ones.
     fn map_from_elf(&self, elf: &ElfFile, vmo: Arc<VmObject>) -> ZxResult;
 }
@@ -321,6 +328,41 @@ impl VmarExt for VmAddressRegion {
             first_vmo.ok_or(ZxError::INVALID_ARGS)
         }
     }
+
+    fn load_from_elf_image(
+        &self,
+        elf: &ElfFile,
+        image: &Arc<VmObject>,
+    ) -> ZxResult<Arc<VmObject>> {
+        #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+        {
+            let _ = image;
+            return self.load_from_elf_with_host_pages(elf);
+        }
+
+        #[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
+        {
+            let mut first_vmo = None;
+            for ph in elf.program_iter() {
+                if ph.get_type() != Ok(Type::Load) {
+                    continue;
+                }
+                let vmo = make_vmo_from_image(elf, image, ph)?;
+                let offset = ph.virtual_addr() as usize / PAGE_SIZE * PAGE_SIZE;
+                let flags = ph.flags().to_mmu_flags();
+                trace!(
+                    "ph:{:#x?} borrow-map offset:{:#x?} flags:{:#x?}",
+                    ph,
+                    offset,
+                    flags
+                );
+                self.map_at(offset, vmo.clone(), 0, vmo.len(), flags)?;
+                first_vmo.get_or_insert(vmo);
+            }
+            first_vmo.ok_or(ZxError::INVALID_ARGS)
+        }
+    }
+
     fn map_from_elf(&self, elf: &ElfFile, vmo: Arc<VmObject>) -> ZxResult {
         for ph in elf.program_iter() {
             if ph.get_type() != Ok(Type::Load) {
@@ -443,6 +485,54 @@ fn make_vmo(elf: &ElfFile, ph: ProgramHeader) -> ZxResult<Arc<VmObject>> {
     };
     //调用 VMObjectTrait.write, 分配物理内存，后写入程序数据
     vmo.write(page_offset, data)?;
+    Ok(vmo)
+}
+
+#[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
+/// Map one LOAD segment by borrowing from the exec image VMO.
+///
+/// This is the hot path for `fork+exec` of large binaries (Firefox content
+/// processes): the image is already in `ELF_VMO_CACHE`, and each LOAD becomes
+/// a `MAP_PRIVATE`-shaped borrower instead of a full byte copy. BSS
+/// (`p_memsz > p_filesz`) stays demand-zero past the visible file window.
+/// Falls back to [`make_vmo`] when the image cannot cover the file bytes
+/// (truncated cache entry, hostile headers).
+fn make_vmo_from_image(
+    elf: &ElfFile,
+    image: &Arc<VmObject>,
+    ph: ProgramHeader,
+) -> ZxResult<Arc<VmObject>> {
+    let page_offset = ph.virtual_addr() as usize % PAGE_SIZE;
+    let pages = segment_pages(ph.mem_size(), page_offset)?;
+    let file_off = ph.offset() as usize;
+    // ELF: p_offset ≡ p_vaddr (mod PAGE_SIZE). Without that the file page
+    // and the VA page do not line up and borrowing would map the wrong bytes.
+    if file_off % PAGE_SIZE != page_offset {
+        return make_vmo(elf, ph);
+    }
+    let base_offset = file_off - page_offset;
+    let file_size = ph.file_size() as usize;
+    // Pure BSS: nothing to borrow from the image.
+    let visible = if file_size == 0 {
+        0
+    } else {
+        page_offset.saturating_add(file_size)
+    };
+    let need = base_offset.saturating_add(visible);
+    if visible > 0 && need > image.len() {
+        return make_vmo(elf, ph);
+    }
+    let vmo = VmObject::new_paged_borrowing_capped(pages, image.clone(), base_offset, visible);
+    // Bytes past `p_filesz` in the last file page must be zero (Linux
+    // `padzero`); the borrower otherwise exposes whatever follows in the
+    // image. One partial page at most.
+    if visible > 0 && !visible.is_multiple_of(PAGE_SIZE) {
+        let page_end = ((visible + PAGE_SIZE - 1) / PAGE_SIZE) * PAGE_SIZE;
+        let page_end = page_end.min(pages * PAGE_SIZE);
+        if page_end > visible {
+            vmo.zero(visible, page_end - visible)?;
+        }
+    }
     Ok(vmo)
 }
 
@@ -1992,6 +2082,32 @@ mod tests {
         assert_eq!(&buf, b"0123456789abcdef");
         // `p_vaddr` is an offset into the address space, which does not start
         // at zero when every process gets its own window out of the host's.
+        assert!(vmar.find_mapping(vmar.addr() + 0x20_0000).is_some());
+    }
+
+    #[test]
+    fn load_from_elf_image_borrows_segment_bytes_without_a_second_copy() {
+        // ELF requires p_offset ≡ p_vaddr (mod PAGE_SIZE); the helper
+        // `one_load_segment` deliberately does not, so build an aligned image.
+        // Keep payload past the program header (at 64, 56 bytes) so `put`
+        // does not overwrite the PH itself.
+        let mut img = Image::elf64();
+        img.phoff(64);
+        img.phnum(1);
+        img.program_header(64, PT_LOAD, 0x80, 0x20_0080, (16, 16));
+        img.put(0x80, b"0123456789abcdef");
+        img.shown(0x90);
+        let bytes = img.bytes();
+        let image = VmObject::new_paged(pages(bytes.len().max(PAGE_SIZE)));
+        image.write(0, bytes).unwrap();
+        let elf = parse_checked_elf(bytes).unwrap();
+        let vmar = VmAddressRegion::new_root();
+        let vmo = vmar.load_from_elf_image(&elf, &image).unwrap();
+        assert_eq!(vmo.len(), PAGE_SIZE);
+        let mut buf = [0u8; 16];
+        vmo.read(0x80, &mut buf).unwrap();
+        assert_eq!(&buf, b"0123456789abcdef");
+        assert!(vmo.is_borrower());
         assert!(vmar.find_mapping(vmar.addr() + 0x20_0000).is_some());
     }
 

@@ -504,6 +504,29 @@ impl VmObject {
         })
     }
 
+    /// Like [`new_paged_borrowing`], but only `visible` bytes resolve into
+    /// `cache`; the rest is demand-zero (ELF BSS / `p_memsz > p_filesz`).
+    pub fn new_paged_borrowing_capped(
+        pages: usize,
+        cache: Arc<VmObject>,
+        base_offset: usize,
+        visible: usize,
+    ) -> Arc<Self> {
+        let base = KObjectBase::with_signal(Signal::VMO_ZERO_CHILDREN);
+        Arc::new(VmObject {
+            resizable: false,
+            _counter: CountHelper::new(),
+            kind: account_new(VmoKind::PagedSource, pages * PAGE_SIZE),
+            accounted_bytes: pages * PAGE_SIZE,
+            share_on_fork: core::sync::atomic::AtomicBool::new(false),
+            file_offset: core::sync::atomic::AtomicUsize::new(0),
+            unbounded: false,
+            trait_: VMObjectPaged::new_borrowing_capped(pages, cache, base_offset, visible),
+            inner: Mutex::new(VmObjectInner::default()),
+            base,
+        })
+    }
+
     /// Create a new VMO representing a piece of contiguous physical memory.
     pub fn new_physical(paddr: PhysAddr, pages: usize) -> Arc<Self> {
         Self::warn_if_phys_aliases_stack(paddr, pages);
@@ -1319,6 +1342,24 @@ mod tests {
         b.read(PAGE_SIZE, &mut buf).unwrap();
         assert_eq!(buf, [0x55; 4]);
         assert_eq!(cache.committed_pages_in_range(0, 1), 1);
+    }
+
+    /// A capped borrower stops resolving into the cache past `visible`, so an
+    /// ELF BSS window cannot leak the next bytes of the image file.
+    #[test]
+    fn borrower_capped_visible_hides_the_rest_of_the_cache() {
+        let cache = VmObject::new_paged(2);
+        cache.write(0, &[0xAA; 4]).unwrap();
+        cache.write(PAGE_SIZE, &[0xBB; 4]).unwrap();
+        let b = VmObject::new_paged_borrowing_capped(2, cache.clone(), 0, 8);
+        let mut buf = [0u8; 4];
+        b.read(0, &mut buf).unwrap();
+        assert_eq!(buf, [0xAA; 4]);
+        // Past the 8-byte window the second cache page must not appear.
+        assert_eq!(
+            b.commit_page(1, MMUFlags::READ).unwrap(),
+            kernel_hal::mem::ZERO_FRAME.paddr(),
+        );
     }
 
     /// fork keeps the borrow: the child's untouched pages still read the

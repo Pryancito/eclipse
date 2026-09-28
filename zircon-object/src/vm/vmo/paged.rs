@@ -435,12 +435,25 @@ impl VMObjectPaged {
     /// page cache), starting at byte `base` inside it. See the `cache` field
     /// for the semantics; `pages` is this VMO's own size.
     pub fn new_borrowing(pages: usize, cache: Arc<VmObject>, base: usize) -> Arc<Self> {
+        Self::new_borrowing_capped(pages, cache, base, usize::MAX)
+    }
+
+    /// Like [`new_borrowing`], but only the first `visible` bytes of this VMO
+    /// resolve into `cache`. Bytes past that are demand-zero — the BSS tail of
+    /// an ELF LOAD segment, where `p_memsz > p_filesz` and the rest of the
+    /// file must not leak into the mapping.
+    pub fn new_borrowing_capped(
+        pages: usize,
+        cache: Arc<VmObject>,
+        base: usize,
+        visible: usize,
+    ) -> Arc<Self> {
         assert!(page_aligned(base));
-        // Capture the cache length now, outside any family lock: a file page
-        // cache is not resizable, so this stays valid for the borrower's life
-        // and spares the per-commit bounds check a re-lock of the cache (see
-        // the `cache` field doc).
-        let cache_len = cache.len();
+        // Capture the visible cache window now, outside any family lock: a
+        // file page cache is not resizable, so this stays valid for the
+        // borrower's life and spares the per-commit bounds check a re-lock of
+        // the cache (see the `cache` field doc).
+        let cache_len = base.saturating_add(visible).min(cache.len());
         VMObjectPaged::wrap(
             VMObjectPagedInner {
                 owner: new_owner_id(),

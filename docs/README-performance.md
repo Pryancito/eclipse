@@ -939,13 +939,13 @@ cambia (lo que además tomaba el cerrojo de `KObjectBase`).
 3. **`fork + exec` de un binario grande: 46 ms contra 10,8 ms (4,3x).** Con
    binarios pequeños la diferencia es 1,7x, así que el grueso del coste es por
    byte, no por proceso. La
-   causa está localizada: `make_vmo` en `zircon-object/src/util/elf_loader.rs`
-   **asigna y copia el segmento entero** en un VMO nuevo en cada `exec` (1,8 MiB
-   para busybox), y `LinuxElfLoader::load` mapea y desmapea la imagen completa en
-   `KERNEL_ASPACE` alrededor de cada carga (~450 páginas más el shootdown de TLB
-   al desmapear). Linux mapea las páginas de la caché de páginas y pagina bajo
-   demanda: cero copia. La caché `ELF_VMO_CACHE` ya evita releer el fichero, pero
-   no evita ni la copia ni el mapeo.
+   causa estaba localizada: `make_vmo` en `zircon-object/src/util/elf_loader.rs`
+   **asignaba y copiaba el segmento entero** en un VMO nuevo en cada `exec`.
+   **Mitigado**: `load_from_elf_image` pide prestadas las páginas del VMO de
+   imagen (`ELF_VMO_CACHE`, ahora hasta 64 MiB/archivo y 128 MiB totales) vía
+   `new_paged_borrowing_capped`, con BSS demand-zero — cero copia por byte en el
+   camino caliente de content processes de Firefox. Queda el map/unmap en
+   `KERNEL_ASPACE` para parsear el ELF.
 
 4. **Eficiencia SMP: 87,6 % contra 98 %**, y **pipe bajo carga 2,6 ms contra
    1,4 ms (1,9x)**. Ambas apuntan al mismo sitio: la colocación de tareas y el
@@ -955,6 +955,9 @@ cambia (lo que además tomaba el cerrojo de `KObjectBase`).
 
 5. **`mprotect`: 183 us contra 101 us (1,8x).** Apunta al shootdown de TLB
    síncrono (`remote_flush_tlb` espera acks con un presupuesto de 32 768 giros).
+   **Mitigado en parte**: `apply_range_change_locked` ya no hace un segundo
+   `remote_flush_all` cuando `MADV_DONTNEED`/`unmap_released` no cambió ningún
+   PTE (mozjemalloc purge).
 
 6. **Rodaja de 20 ms.** Con la preempción por despertar ya no castiga la
    interactividad, pero sigue siendo larga frente a la granularidad efectiva de
