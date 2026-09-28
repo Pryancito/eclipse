@@ -19174,11 +19174,8 @@ mod nouveau_bookkeeping_tests {
             .handle;
         assert!(crate::scheme::gem_mmap::add_ref(h_idle, COMP).is_some());
 
-        let landed = |fences: &[(usize, u32)]| {
-            fences
-                .iter()
-                .all(|&(va, p)| crate::scheme::syncobj::hw_fence_landed(va, p))
-        };
+        // The same call the pre-wait in `drm_scheme.rs` makes.
+        let landed = |fences: &[(usize, u32)]| crate::scheme::syncobj::hw_fences_landed(fences);
 
         // Nothing queued: no fence to sleep on, and the blocking arm does
         // not block either.
@@ -23990,9 +23987,14 @@ mod nouveau_bookkeeping_tests {
             // the second acquisition of the table lock -- and that one is not
             // counted here, because a uniprocessor bench cannot measure a
             // lock the other CPU wants. Two saved reads a frame is the floor
-            // that a reinstated `poll_pending()` cannot clear.
+            // that a reinstated `poll_pending()` cannot clear -- and the floor
+            // checked below is one, because the zone cache absorbed part of
+            // what the second walk used to cost: it reads a zone once per
+            // resolve whichever resolve asked, so the duplicate's second walk
+            // now finds the word already in hand more often than not. Measured
+            // over these 240 frames after that change: 19.0 -> 17.0.
             assert!(
-                old_reads >= new_reads + FRAMES * 2,
+                old_reads >= new_reads + FRAMES,
                 "{} -> {} reads of a fence landing zone over {} frames \
                  ({:.1} -> {:.1} a frame): the second walk is still there",
                 old_reads,
@@ -24006,14 +24008,18 @@ mod nouveau_bookkeeping_tests {
             // change: `resolve_locked` runs its passes to a fixed point, and
             // it used to re-read every landing zone on every pass although
             // what the later passes re-decide is whether a landed fence is
-            // still HELD, not whether it landed. Measured over these 240
-            // frames: 26.0 reads a frame without the cache of what this call
-            // has already read, 24.0 with it. The ceiling sits between them,
-            // so a cache that stops caching fails here.
+            // still HELD, not whether it landed. And what the cache holds is
+            // the WORD, not a verdict, so two fences of one channel -- one
+            // semaphore word, two payloads -- cost one read and not two.
+            // Measured over these 240 frames: 26.0 reads a frame with no
+            // cache at all, 24.0 with a verdict cached per (address,
+            // payload), 17.0 with the word cached per address. The ceiling
+            // sits between the last two, so a cache that goes back to keying
+            // on the payload fails here.
             assert!(
-                new_reads <= FRAMES * 25,
+                new_reads <= FRAMES * 18,
                 "{:.1} reads of a fence landing zone a frame: a resolve is \
-                 reading the same zone twice again",
+                 reading the same zone more than once again",
                 new_reads as f64 / FRAMES as f64
             );
         }

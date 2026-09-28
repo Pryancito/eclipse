@@ -492,6 +492,43 @@ pub fn hw_fence_landed(fence_va: usize, payload: u32) -> bool {
     fence_landed(fence_va, payload)
 }
 
+/// Whether EVERY fence in `fences` has landed, reading each distinct landing
+/// zone at most ONCE however many of the fences sit in it.
+///
+/// For drivers and pre-waits that hold a LIST of fences to wait on -- the
+/// render fences of the buffer a present is about to scan out, the fences on
+/// a `GEM_CPU_PREP`'d object -- and take that list again on every look of a
+/// poll loop. Those lists routinely name one zone twice: a channel has ONE
+/// semaphore word and every submit on it lands a later payload in that same
+/// word, so a buffer two submits of one ring wrote carries two fences at one
+/// address. `fences.iter().all(hw_fence_landed)` read the word once per
+/// fence, and the word is pinned sysmem mapped uncached, so those were two
+/// trips off the CPU to learn one thing.
+///
+/// One read answers every payload in its zone, because the word only ever
+/// grows: `all(word(va) >= p)` over a zone is `word(va) >= max(p)`. Short
+/// circuits on the first fence still in flight, exactly as `all` did.
+pub fn hw_fences_landed(fences: &[(usize, u32)]) -> bool {
+    // What each zone said this call. Linear: these lists are a handful of
+    // entries long (one per ring that wrote the buffer), and a Vec of pairs
+    // beats a map at that size.
+    let mut words: Vec<(usize, u32)> = Vec::new();
+    for &(fence_va, payload) in fences {
+        let word = match words.iter().find(|&&(va, _)| va == fence_va) {
+            Some(&(_, w)) => w,
+            None => {
+                let w = read_fence_word(fence_va);
+                words.push((fence_va, w));
+                w
+            }
+        };
+        if !payload_reached(word, payload) {
+            return false;
+        }
+    }
+    true
+}
+
 /// How many times a fence landing zone has been read ([`fence_landed`]).
 ///
 /// The unit this counts is not free: the landing zone is pinned sysmem the
@@ -502,15 +539,34 @@ pub fn hw_fence_landed(fence_va: usize, payload: u32) -> bool {
 #[cfg(test)]
 pub static FENCE_READS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
-/// Whether the GPU has written `payload` (or a later one) into `fence_va`.
+/// The GPU's current value of the semaphore word at `fence_va`.
+///
+/// The one place a landing zone is read. Split out from [`fence_landed`]
+/// because the word is what is expensive and the compare is free: a caller
+/// holding several fences in one zone reads the word once and compares every
+/// payload against it ([`hw_fences_landed`], [`fence_landed_cached`]).
 #[inline]
-fn fence_landed(fence_va: usize, payload: u32) -> bool {
+fn read_fence_word(fence_va: usize) -> u32 {
     #[cfg(test)]
     FENCE_READS.fetch_add(1, Ordering::Relaxed);
     // SAFETY: `fence_va` is a kernel mapping of pinned sysmem published by
     // the driver for exactly this read (`attach_hw_fence`'s contract).
-    let v = unsafe { core::ptr::read_volatile(fence_va as *const u32) };
-    (v.wrapping_sub(payload) as i32) >= 0
+    unsafe { core::ptr::read_volatile(fence_va as *const u32) }
+}
+
+/// Whether a semaphore word of `word` has reached `payload`.
+///
+/// Wrapping: the word is a u32 counter that runs past its top and keeps
+/// going, so the compare is a signed difference, not `>=`.
+#[inline]
+fn payload_reached(word: u32, payload: u32) -> bool {
+    (word.wrapping_sub(payload) as i32) >= 0
+}
+
+/// Whether the GPU has written `payload` (or a later one) into `fence_va`.
+#[inline]
+fn fence_landed(fence_va: usize, payload: u32) -> bool {
+    payload_reached(read_fence_word(fence_va), payload)
 }
 
 /// How many `spin_loop()` turns [`wait`] burns before its next look at the
@@ -701,9 +757,9 @@ impl Deferred {
 /// submit fails honestly). Returns the upcalls to make after unlocking.
 fn resolve_locked(table: &mut SyncobjTable) -> Deferred {
     let mut out = Deferred::default();
-    // What each landing zone said the FIRST time this call looked at it, so
-    // the passes below do not ask the same question of the same address
-    // again.
+    // What each landing zone READ the first time this call looked at it, so
+    // neither the passes below nor two fences sharing a zone ask the same
+    // address again.
     //
     // The fixed point costs a full walk of the pending list per pass, and a
     // walk reads every fence's landing zone -- pinned sysmem the GPU writes,
@@ -715,7 +771,14 @@ fn resolve_locked(table: &mut SyncobjTable) -> Deferred {
     // to answer the second question is the waste: a client parked on its
     // acquire semaphore takes several looks a frame, and each look pays for
     // every pass.
-    let mut seen: Vec<(usize, u32, bool)> = Vec::new();
+    //
+    // What is remembered is the WORD, not a landed/not-landed verdict, and
+    // that is the difference between one read per fence and one read per
+    // zone: a channel has one semaphore word and every submit on it lands a
+    // later payload in that same word, so the pending list routinely holds
+    // several fences at one address. The word answers all of them, because it
+    // only ever grows.
+    let mut seen: Vec<(usize, u32)> = Vec::new();
     // To a fixed point: a link resolving can release a landed fence held
     // behind it, and a fence landing can satisfy a link.
     loop {
@@ -731,18 +794,22 @@ fn resolve_locked(table: &mut SyncobjTable) -> Deferred {
 /// [`fence_landed`], answered from `seen` when this `resolve_locked` call has
 /// already read that landing zone.
 ///
-/// Keyed by the pair the read is made of, because the pending list is walked
-/// with `swap_remove` and an index does not name the same fence twice.
-fn fence_landed_cached(seen: &mut Vec<(usize, u32, bool)>, fence_va: usize, payload: u32) -> bool {
-    if let Some(&(_, _, landed)) = seen
-        .iter()
-        .find(|&&(va, p, _)| va == fence_va && p == payload)
-    {
-        return landed;
-    }
-    let landed = fence_landed(fence_va, payload);
-    seen.push((fence_va, payload, landed));
-    landed
+/// Keyed by the ADDRESS, and holding the word rather than a verdict, so a
+/// second fence in the same zone is answered without a second read. Keying
+/// the verdict by the (address, payload) pair instead -- which is what this
+/// did first -- made the pending list's two fences on one channel two trips
+/// off the CPU for one word. The payload still decides, it just decides
+/// against a word already in hand.
+fn fence_landed_cached(seen: &mut Vec<(usize, u32)>, fence_va: usize, payload: u32) -> bool {
+    let word = match seen.iter().find(|&&(va, _)| va == fence_va) {
+        Some(&(_, w)) => w,
+        None => {
+            let w = read_fence_word(fence_va);
+            seen.push((fence_va, w));
+            w
+        }
+    };
+    payload_reached(word, payload)
 }
 
 /// The hardware half of [`resolve_locked`]: take every landed (or timed-out)
@@ -750,7 +817,7 @@ fn fence_landed_cached(seen: &mut Vec<(usize, u32, bool)>, fence_va: usize, payl
 fn resolve_hw_locked(
     table: &mut SyncobjTable,
     out: &mut Deferred,
-    seen: &mut Vec<(usize, u32, bool)>,
+    seen: &mut Vec<(usize, u32)>,
 ) -> bool {
     if table.pending.is_empty() {
         return false;
@@ -2468,15 +2535,17 @@ mod tests {
     }
 
     /// Two fences of the same channel share one landing zone and are told
-    /// apart only by their payload, so the cache [`resolve_locked`] keeps of
-    /// what it has already read must be keyed by BOTH.
+    /// apart only by their payload, so what [`resolve_locked`] remembers of a
+    /// zone it has already read has to be the WORD -- the payload decides
+    /// against it, every time.
     ///
     /// This is how a channel really works: the semaphore word is per channel,
-    /// and each RELEASE writes a higher payload into it. Keyed by the address
-    /// alone, the first fence's "landed" would answer for every later one on
-    /// the same channel -- every syncobj of that channel would jump to its
-    /// last point the moment the first frame landed, and a client would go on
-    /// drawing into a buffer the GPU is still reading.
+    /// and each RELEASE writes a higher payload into it. Remember a
+    /// landed/not-landed verdict per address instead and the first fence's
+    /// "landed" answers for every later one on the same channel -- every
+    /// syncobj of that channel jumps to its last point the moment the first
+    /// frame lands, and a client goes on drawing into a buffer the GPU is
+    /// still reading.
     #[test]
     fn one_landing_zone_carries_two_payloads_and_they_resolve_apart() {
         let _g = test_lock();
@@ -2502,6 +2571,127 @@ mod tests {
         poll_pending();
         assert_eq!(query(late), Some(1));
         assert!(destroy(early) && destroy(late));
+    }
+
+    /// ...and it tells them apart having read the word ONCE, not once per
+    /// fence.
+    ///
+    /// The zone is pinned sysmem the GPU writes and the CPU maps uncached, so
+    /// every read of it leaves the CPU, while the compare against a payload is
+    /// free. A channel with four frames in flight put four fences in the
+    /// pending list at one address; a resolve read that one word four times.
+    #[test]
+    fn a_resolve_reads_one_landing_zone_once_however_many_fences_sit_in_it() {
+        let _g = test_lock();
+        let mut zone = Landing::new();
+        let objs: Vec<u32> = (0..4).map(|_| create(false)).collect();
+        for (i, &h) in objs.iter().enumerate() {
+            assert!(attach_hw_fence(h, 1, zone.va(), 0, 10 + i as u32, 0, true));
+        }
+        assert_eq!(pending_now(), 4, "four fences, one zone");
+
+        // Nothing has landed: the resolve has to look, and one look answers
+        // all four payloads.
+        FENCE_READS.store(0, Ordering::Relaxed);
+        poll_pending();
+        let reads = FENCE_READS.load(Ordering::Relaxed);
+        assert_eq!(
+            reads,
+            1,
+            "one resolve read the one landing zone {} times for {} fences",
+            reads,
+            objs.len()
+        );
+        for &h in &objs {
+            assert_eq!(query(h), Some(0), "nothing has landed yet");
+        }
+
+        // And the word still decides per payload: 11 releases the first two
+        // and holds the last two.
+        zone.land(11);
+        poll_pending();
+        let reached: Vec<Option<u64>> = objs.iter().map(|&h| query(h)).collect();
+        assert_eq!(
+            reached,
+            alloc::vec![Some(1), Some(1), Some(0), Some(0)],
+            "one word, four payloads, and the word only answers the two below it"
+        );
+
+        zone.land(13);
+        poll_pending();
+        for &h in &objs {
+            assert_eq!(query(h), Some(1));
+        }
+        for &h in &objs {
+            assert!(destroy(h));
+        }
+    }
+
+    /// [`hw_fences_landed`] is `fences.iter().all(hw_fence_landed)` with the
+    /// reads collapsed: same answer, one read per ADDRESS.
+    ///
+    /// This is the list the present pre-wait and `GEM_CPU_PREP` hold, and
+    /// they take it again on every probe of a poll loop. A buffer two submits
+    /// of one ring wrote names that ring's one semaphore word twice.
+    #[test]
+    fn a_list_of_fences_reads_each_landing_zone_once_and_answers_like_all() {
+        let _g = test_lock();
+        let mut ring_a = Landing::new();
+        let mut ring_b = Landing::new();
+        // Three submits of ring A and two of ring B wrote this buffer.
+        let fences = [
+            (ring_a.va(), 7u32),
+            (ring_b.va(), 3u32),
+            (ring_a.va(), 8u32),
+            (ring_b.va(), 4u32),
+            (ring_a.va(), 9u32),
+        ];
+        let by_hand =
+            |fences: &[(usize, u32)]| fences.iter().all(|&(va, p)| hw_fence_landed(va, p));
+
+        // Nothing landed: the answer is no, and it cost two reads (it stops
+        // at the first fence in flight, which here is the first one).
+        FENCE_READS.store(0, Ordering::Relaxed);
+        assert!(!hw_fences_landed(&fences));
+        assert!(FENCE_READS.load(Ordering::Relaxed) <= 2);
+
+        // Ring A all the way, ring B one short: still no, and now the whole
+        // list is walked -- five fences, two addresses, two reads.
+        ring_a.land(9);
+        ring_b.land(3);
+        assert!(!by_hand(&fences), "ring B is one submit short");
+        FENCE_READS.store(0, Ordering::Relaxed);
+        assert!(!hw_fences_landed(&fences));
+        assert_eq!(
+            FENCE_READS.load(Ordering::Relaxed),
+            2,
+            "five fences in two zones cost more than two reads"
+        );
+
+        ring_b.land(4);
+        assert!(by_hand(&fences));
+        FENCE_READS.store(0, Ordering::Relaxed);
+        assert!(hw_fences_landed(&fences));
+        assert_eq!(FENCE_READS.load(Ordering::Relaxed), 2);
+    }
+
+    /// The word runs past the top of a u32 and keeps counting, so the compare
+    /// is a signed difference and not `>=`. Collapsing the reads must not
+    /// quietly turn it into one.
+    #[test]
+    fn a_landing_zone_that_has_wrapped_still_answers_the_payloads_behind_it() {
+        let _g = test_lock();
+        let mut zone = Landing::new();
+        zone.land(3);
+        // 3 is four ticks past 0xffff_ffff.
+        assert!(hw_fences_landed(&[(zone.va(), 0xffff_ffff)]));
+        assert!(hw_fences_landed(&[
+            (zone.va(), 0xffff_ffff),
+            (zone.va(), 3)
+        ]));
+        assert!(!hw_fences_landed(&[(zone.va(), 4)]));
+        // Half the range away is "not yet", not "long past".
+        assert!(!hw_fences_landed(&[(zone.va(), 0x8000_0003)]));
     }
 
     /// A fence given up on after [`FENCE_TIMEOUT_US`] still advances the

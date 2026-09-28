@@ -407,10 +407,12 @@ impl DrmDev {
             kernel_hal::timer::timer_now() + core::time::Duration::from_micros(CPU_PREP_TIMEOUT_US);
         let mut probes = 0u32;
         loop {
-            if fences
-                .iter()
-                .all(|&(va, payload)| zcore_drivers::scheme::syncobj::hw_fence_landed(va, payload))
-            {
+            // `hw_fences_landed`, not `fences.iter().all(hw_fence_landed)`:
+            // one read per landing zone, not one per fence. A buffer two
+            // submits of one ring wrote carries two fences at the SAME
+            // semaphore word, and this loop takes the list again on every
+            // probe.
+            if zcore_drivers::scheme::syncobj::hw_fences_landed(&fences) {
                 return;
             }
             if !fence_poll_wait(probes, deadline).await {
@@ -512,10 +514,12 @@ impl DrmDev {
         let deadline = waited_from + core::time::Duration::from_micros(PRESENT_FENCE_TIMEOUT_US);
         let mut probes = 0u32;
         loop {
-            if fences
-                .iter()
-                .all(|&(va, payload)| zcore_drivers::scheme::syncobj::hw_fence_landed(va, payload))
-            {
+            // `hw_fences_landed`, not `fences.iter().all(hw_fence_landed)`:
+            // one read per landing zone, not one per fence. A buffer two
+            // submits of one ring wrote carries two fences at the SAME
+            // semaphore word, and this loop takes the list again on every
+            // probe.
+            if zcore_drivers::scheme::syncobj::hw_fences_landed(&fences) {
                 if report {
                     log::info!(
                         "[drm] present fence: fb {} (#{}) waited {}us for {} fence(s) to land",
@@ -14891,6 +14895,43 @@ mod pre_wait_resolve_tests {
                 "a poll_pending() is back in {}: wait_ready already resolves \
                  the table, so this is a second walk of the pending list and a \
                  second take of the lock the signalling side needs",
+                name
+            );
+        }
+    }
+
+    /// A pre-wait that holds a LIST of fences reads each landing zone once
+    /// per look, not once per fence.
+    ///
+    /// `fences.iter().all(hw_fence_landed)` reads the zone once per entry, and
+    /// these lists name one zone twice whenever two submits of one ring wrote
+    /// the buffer -- a channel has a single semaphore word. `hw_fences_landed`
+    /// gives the same answer off one read per address. The bench cannot reach
+    /// here (these need a live `DrmDev`, a process and a GPU) and what they
+    /// cost is a count, not an answer, so the shape is what is guarded; the
+    /// count itself is measured next to the function, in
+    /// `a_list_of_fences_reads_each_landing_zone_once_and_answers_like_all`.
+    #[test]
+    fn a_pre_wait_on_a_list_of_fences_reads_each_landing_zone_once() {
+        let src = include_str!("drm_scheme.rs");
+        for name in [
+            "pub async fn cpu_prep_sleep(",
+            "pub async fn present_fence_sleep(",
+        ] {
+            let body = body(src, name);
+            let code = || {
+                body.lines()
+                    .filter(|l| !l.trim_start().starts_with("//"))
+                    .collect::<alloc::string::String>()
+            };
+            assert!(
+                code().contains("hw_fences_landed("),
+                "{} no longer waits with hw_fences_landed",
+                name
+            );
+            assert!(
+                !code().contains("all(") || !code().contains("hw_fence_landed("),
+                "{} is back to reading its landing zones one fence at a time",
                 name
             );
         }
