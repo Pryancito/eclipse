@@ -143,20 +143,88 @@ fn may_read_innards_of(target: &Arc<Process>) -> bool {
     )
 }
 
+/// The name of a process or thread as `/proc` carries it: the basename,
+/// without the parentheses that frame field 2 of `/proc/<pid>/stat`, cut to
+/// what Linux stores.
+///
+/// The cut is `TASK_COMM_LEN - 1` **BYTES**, on a character boundary; it used
+/// to be fifteen CHARACTERS. `set_task_comm` copies fifteen bytes and every
+/// reader sizes its column for that many -- `ps -o comm`, `top`'s COMMAND, and
+/// the sixteen-wide NAME column of `/proc/perf/tasks` right here. Fifteen
+/// characters of a name that is not ASCII are up to sixty bytes (a name of
+/// fifteen `ñ` measured thirty), so a Spanish basename came out twice as wide
+/// as the column it was aligned against. `comm_from_user_bytes` already cuts
+/// what `prctl(PR_SET_NAME)` passes to fifteen bytes; this is the same cut for
+/// the names that come from a path instead. Stopping at the character before
+/// the limit rather than at the byte keeps the string valid UTF-8, which is
+/// the one thing Linux does not have to care about.
 fn sanitize_comm(name: &str) -> String {
+    const MAX_BYTES: usize = crate::thread::TASK_COMM_LEN - 1;
     let base = name.rsplit('/').next().unwrap_or(name);
     let mut s = String::new();
-    for c in base.chars().take(15) {
+    for c in base.chars() {
         let ch = match c {
             '(' | ')' | '\0' => '_',
             _ => c,
         };
+        if s.len() + ch.len_utf8() > MAX_BYTES {
+            break;
+        }
         s.push(ch);
     }
     if s.is_empty() {
         s.push_str("process");
     }
     s
+}
+
+/// A name as the ONE-LINE files have to carry it: `\n` escaped so the line
+/// stays one line, and `\` escaped so that escape can be undone.
+///
+/// [`sanitize_comm`] takes the parentheses out, which is what field 2 of
+/// `/proc/<pid>/stat` needs. It left the newline in, and
+/// `prctl(PR_SET_NAME, "mal\nnombre")` is one call from any program:
+/// `comm_from_user_bytes` stores those bytes as they came, so the stat line
+/// ended mid-name and a second line followed it. `ps`, `top` and `htop` read
+/// that file whole and split it after the last `)`, so the tail of one
+/// process's name became another process's fields -- and `ps` walks every pid,
+/// so one process with such a name was enough to spoil the whole listing.
+/// `/proc/<pid>/status` came apart the same way: `Name:` stopped at the
+/// newline and what followed was a line no key matched.
+///
+/// Linux escapes these same two characters in these same files
+/// (`proc_task_name` in `fs/proc/array.c` calls `seq_escape_str` with
+/// `ESCAPE_SPACE | ESCAPE_SPECIAL` limited to `"\n\\"`), and it escapes
+/// nothing in `/proc/<pid>/comm`, which is a whole file for one name and has
+/// no line to break. Neither does this.
+fn escaped_comm(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    for c in name.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// The letter `ps` expects for a thread's scheduling state.
+///
+/// Written out twice before -- once here for `/proc/<pid>/stat` and once
+/// inside `proc_pid_threads` -- for two files that describe the same threads
+/// and so must not disagree about them. Every blocked flavour ends in
+/// [`ThreadState::Blocked`] (`BlockedFutex` is `0x303`), which is what the
+/// mask reads, and none of them is Linux's uninterruptible `D`: nothing in
+/// this kernel waits that way.
+fn thread_state_char(state: ThreadState) -> char {
+    match state {
+        // Suspended by `zx_task_suspend` -- Linux's "stopped by a signal".
+        ThreadState::Suspended => 'T',
+        ThreadState::Dying | ThreadState::Dead => 'Z',
+        s if (s as u32) & 0xff == ThreadState::Blocked as u32 => 'S',
+        _ => 'R',
+    }
 }
 
 /// The state letter for `/proc/<pid>/stat` and `/proc/<pid>/status`.
@@ -171,16 +239,9 @@ fn proc_state_char(proc: &Process) -> char {
         return 'Z';
     }
     match proc_first_thread(proc).map(|t| t.state()) {
-        // Suspended by `zx_task_suspend` — Linux's "stopped by a signal".
-        Some(ThreadState::Suspended) => 'T',
-        Some(ThreadState::Dying) | Some(ThreadState::Dead) => 'Z',
-        // Every blocked flavour (syscall, sleep, futex, port, channel,
-        // exception) is an interruptible sleep here; nothing in this kernel
-        // waits uninterruptibly, so none of them is Linux's `D`.
-        Some(s) if (s as u32) & 0xff == ThreadState::Blocked as u32 => 'S',
-        Some(ThreadState::New) | Some(ThreadState::Running) => 'R',
+        Some(state) => thread_state_char(state),
         // No leader thread yet: created, not started.
-        _ => 'S',
+        None => 'S',
     }
 }
 
@@ -199,7 +260,7 @@ fn proc_state_char(proc: &Process) -> char {
 fn proc_pid_threads(proc: &Process) -> String {
     use crate::thread::ThreadExt;
     use core::fmt::Write;
-    let mut out = String::from("# tid state name syscall\n");
+    let mut out = String::from("# tid state (name) syscall\n");
     for tid in proc.thread_ids() {
         let Ok(obj) = proc.get_child(tid) else {
             continue;
@@ -207,12 +268,7 @@ fn proc_pid_threads(proc: &Process) -> String {
         let Ok(thread) = obj.downcast_arc::<Thread>() else {
             continue;
         };
-        let state = match thread.state() {
-            ThreadState::Suspended => 'T',
-            ThreadState::Dying | ThreadState::Dead => 'Z',
-            s if (s as u32) & 0xff == ThreadState::Blocked as u32 => 'S',
-            _ => 'R',
-        };
+        let state = thread_state_char(thread.state());
         // try_lock: a thread tearing down may hold its own lock, and a /proc
         // read must never block on it.
         let name = thread
@@ -221,12 +277,21 @@ fn proc_pid_threads(proc: &Process) -> String {
             .filter(|c| !c.is_empty())
             .map(|c| sanitize_comm(&c))
             .unwrap_or_else(|| String::from("-"));
+        // The name goes in parentheses, like field 2 of `/proc/<pid>/stat`,
+        // because this line is positional and a name may hold spaces: Firefox
+        // calls its threads "Web Content" and "IPC I/O Child", and an
+        // unquoted name shifted the syscall one column per space -- on the one
+        // file whose whole job is to say which syscall a thread is stuck in.
+        // `sanitize_comm` has already turned any parenthesis in the name into
+        // `_`, so the closing one is unambiguous and the same "split after the
+        // last `)`" a reader already does for `stat` works here.
+        let name = escaped_comm(&name);
         match thread.current_syscall() {
             Some(num) => {
-                let _ = writeln!(out, "{} {} {} {}", tid, state, name, num);
+                let _ = writeln!(out, "{} {} ({}) {}", tid, state, name, num);
             }
             None => {
-                let _ = writeln!(out, "{} {} {} -", tid, state, name);
+                let _ = writeln!(out, "{} {} ({}) -", tid, state, name);
             }
         }
     }
@@ -391,7 +456,7 @@ fn proc_pid_stat(proc: &Process) -> String {
     rest[40 - 5] = rt_priority;
     rest[41 - 5] = policy;
 
-    let mut out = format!("{} ({}) {} {}", pid, comm, state, ppid);
+    let mut out = format!("{} ({}) {} {}", pid, escaped_comm(&comm), state, ppid);
     for v in rest.iter() {
         let _ = write!(out, " {}", v);
     }
@@ -412,7 +477,7 @@ fn stat_memory_fields(mapped_bytes: u64, resident_bytes: u64) -> (i64, i64) {
 
 fn proc_pid_status(proc: &Process) -> String {
     let pid = proc.id();
-    let name = proc_comm(proc);
+    let name = escaped_comm(&proc_comm(proc));
     let ppid = proc_ppid(proc);
     let state = match proc_state_char(proc) {
         'R' => "R (running)",
@@ -1299,7 +1364,7 @@ fn proc_perf_tasks_content() -> String {
     procs.sort_by_key(|p| p.id());
     for proc in procs {
         let pid = proc.id();
-        let comm = proc_comm(&proc);
+        let comm = escaped_comm(&proc_comm(&proc));
         let state = proc_state_char(&proc);
         let nthr = proc.thread_ids().len().max(1);
         let (calls, ns) = proc
@@ -4189,5 +4254,299 @@ mod sysctl_tests {
         assert_eq!(crate::fs::kbd_layout::current_name(), "us");
         assert!(inode.write_at(0, b"es\n").is_ok());
         assert_eq!(crate::fs::kbd_layout::current_name(), "es");
+    }
+}
+
+#[cfg(test)]
+mod comm_field_tests {
+    //! `prctl(PR_SET_NAME, "mal\nnombre")` is one call from any program, and
+    //! it split `/proc/<pid>/stat` into two lines and stopped `Name:` in
+    //! `/proc/<pid>/status` halfway through the name. `ps`, `top` and `htop`
+    //! read those files whole and split the stat line after the last `)`, so
+    //! the tail of that name became another process's fields -- and `ps` walks
+    //! every pid, so ONE process named that way spoiled the listing of all the
+    //! others.
+    //!
+    //! `/proc/<pid>/threads`, whose whole job is to say which syscall a thread
+    //! is stuck in, had the name unquoted in the middle of a positional line:
+    //! every space in it shifted the syscall one column, and Firefox names its
+    //! threads "Web Content" and "IPC I/O Child".
+
+    use super::*;
+    use crate::process::LinuxProcess;
+    use crate::thread::{ThreadExt, TASK_COMM_LEN};
+    use rcore_fs_ramfs::RamFS;
+
+    fn a_process(pid: u64, name: &str) -> Arc<Process> {
+        Process::create_with_fixed_id_ext(
+            &Job::root(),
+            pid,
+            name,
+            LinuxProcess::new(RamFS::new(), 0),
+        )
+        .unwrap()
+    }
+
+    /// What `ps` reads as the comm of a stat line: what sits between the first
+    /// `(` and the LAST `)`. The name may hold spaces, so the tail is found
+    /// from the right.
+    fn comm_of(line: &str) -> &str {
+        let open = line.find('(').expect("la linea no tiene parentesis");
+        let close = line.rfind(')').expect("la linea no cierra el parentesis");
+        &line[open + 1..close]
+    }
+
+    /// Everything after the comm, which is where every numbered field from 3
+    /// on lives.
+    fn tail_of(line: &str) -> &str {
+        &line[line.rfind(')').unwrap() + 2..]
+    }
+
+    #[test]
+    fn a_newline_in_a_name_cannot_split_the_stat_line_in_two() {
+        let proc = a_process(9201, "mal\nnombre");
+        let line = proc_pid_stat(&proc);
+        assert_eq!(
+            line.lines().count(),
+            1,
+            "/proc/<pid>/stat es UNA linea: {:?}",
+            line
+        );
+        assert!(
+            line.ends_with('\n') && line.matches('\n').count() == 1,
+            "el unico salto de linea es el del final: {:?}",
+            line
+        );
+        // The name survives, escaped the way Linux escapes it.
+        assert_eq!(comm_of(&line), "mal\\nnombre", "{:?}", line);
+        // And the fields after it still parse: field 3 is the state letter and
+        // field 4 the ppid.
+        let mut tail = tail_of(&line).split(' ');
+        assert_eq!(tail.next(), Some("S"), "{:?}", line);
+        assert_eq!(tail.next(), Some("0"), "{:?}", line);
+    }
+
+    #[test]
+    fn a_newline_in_a_name_cannot_split_the_status_file_either() {
+        let proc = a_process(9202, "mal\nnombre");
+        let status = proc_pid_status(&proc);
+        for l in status.lines() {
+            assert!(
+                l.contains(':'),
+                "cada linea de status es «Clave:\tvalor», y esta no: {:?} de {:?}",
+                l,
+                status
+            );
+        }
+        assert!(
+            status.starts_with("Name:\tmal\\nnombre\n"),
+            "el nombre entero va en la linea Name: {:?}",
+            status
+        );
+    }
+
+    #[test]
+    fn a_backslash_is_doubled_so_the_escape_can_be_undone() {
+        // Two different names must not come out as the same text: without the
+        // backslash escaped, a process literally called `mal\nnombre` and one
+        // called "mal<newline>nombre" read identically.
+        assert_eq!(escaped_comm("mal\\nnombre"), "mal\\\\nnombre");
+        assert_eq!(escaped_comm("mal\nnombre"), "mal\\nnombre");
+        assert_ne!(escaped_comm("mal\\nnombre"), escaped_comm("mal\nnombre"));
+    }
+
+    #[test]
+    fn the_name_of_proc_pid_comm_is_not_escaped() {
+        // `/proc/<pid>/comm` is a whole file for one name: it has no line to
+        // break, so Linux escapes nothing in it and neither does this. Read
+        // through the inode, which is the path userspace takes.
+        let proc = Process::create_with_fixed_id_ext(
+            &ROOT_JOB,
+            9203,
+            "mal\nnombre",
+            LinuxProcess::new(RamFS::new(), 0),
+        )
+        .unwrap();
+        assert_eq!(proc_comm(&proc), "mal\nnombre");
+        let inode = ProcPidFileINode {
+            pid: proc.id(),
+            kind: ProcPidFileKind::Comm,
+        };
+        let mut buf = [0u8; 64];
+        let read = inode.read_at(0, &mut buf).unwrap();
+        assert_eq!(&buf[..read], b"mal\nnombre\n");
+    }
+
+    #[test]
+    fn the_stat_line_has_the_fifty_two_fields_proc_5_numbers() {
+        // `ps` reads fields by position all the way out to 52, so an added or
+        // dropped one moves every field after it.
+        let proc = a_process(9204, "normal");
+        let line = proc_pid_stat(&proc);
+        let fields = 2 + tail_of(&line).trim_end().split(' ').count();
+        assert_eq!(fields, 52, "{:?}", line);
+    }
+
+    #[test]
+    fn a_name_is_never_wider_than_the_fifteen_bytes_linux_stores() {
+        // `TASK_COMM_LEN - 1` BYTES, which is what `set_task_comm` copies and
+        // what every reader's column is sized for.
+        let ñ = sanitize_comm(&"ñ".repeat(20));
+        assert!(ñ.len() <= TASK_COMM_LEN - 1, "{} bytes en {:?}", ñ.len(), ñ);
+        // Cut on a character boundary, so what is left is still the name.
+        assert_eq!(ñ, "ñññññññ");
+        // ASCII still gets its fifteen.
+        assert_eq!(sanitize_comm(&"a".repeat(20)), "a".repeat(15));
+        // And the cut counts the basename, not the path that led to it.
+        assert_eq!(sanitize_comm("/usr/local/bin/servidor"), "servidor");
+    }
+
+    #[test]
+    fn a_path_with_no_basename_still_answers_with_a_name() {
+        assert_eq!(sanitize_comm(""), "process");
+        assert_eq!(sanitize_comm("/usr/bin/"), "process");
+        // The parentheses that frame field 2 never appear inside it.
+        assert_eq!(sanitize_comm("ba(sh)"), "ba_sh_");
+    }
+
+    #[test]
+    fn the_threads_file_puts_the_name_in_parentheses_so_a_space_cannot_move_the_syscall() {
+        let proc = a_process(9205, "firefox");
+        let thread = Thread::create_linux(&proc).unwrap();
+        thread.lock_linux().comm = String::from("Web Content");
+        // 202 is `futex` on x86_64, which is where a hung thread usually is.
+        thread.set_current_syscall(Some(202));
+        let out = proc_pid_threads(&proc);
+        let line = out.lines().nth(1).expect("ninguna linea de hilo");
+        assert_eq!(comm_of(line), "Web Content", "{:?}", out);
+        assert_eq!(
+            line[line.rfind(')').unwrap() + 1..].trim(),
+            "202",
+            "el syscall es la ultima columna, la lleve espacios el nombre o no: {:?}",
+            out
+        );
+    }
+
+    #[test]
+    fn a_newline_in_a_thread_name_does_not_add_a_line_to_the_threads_file() {
+        let proc = a_process(9206, "firefox");
+        let thread = Thread::create_linux(&proc).unwrap();
+        thread.lock_linux().comm = String::from("mal\nnombre");
+        let out = proc_pid_threads(&proc);
+        assert_eq!(
+            out.lines().count(),
+            2,
+            "la cabecera y un hilo, nada mas: {:?}",
+            out
+        );
+        let line = out.lines().nth(1).unwrap();
+        assert_eq!(comm_of(line), "mal\\nnombre", "{:?}", out);
+        // In user code, not in a syscall.
+        assert_eq!(
+            line[line.rfind(')').unwrap() + 1..].trim(),
+            "-",
+            "{:?}",
+            out
+        );
+        assert!(out.starts_with("# tid state (name) syscall\n"), "{:?}", out);
+    }
+
+    #[test]
+    fn every_thread_state_gets_the_letter_ps_expects() {
+        // The mapping `/proc/<pid>/stat` and `/proc/<pid>/threads` both use:
+        // two files about the same threads that must not disagree.
+        for (state, letter) in [
+            (ThreadState::New, 'R'),
+            (ThreadState::Running, 'R'),
+            (ThreadState::Suspended, 'T'),
+            (ThreadState::Dying, 'Z'),
+            (ThreadState::Dead, 'Z'),
+            (ThreadState::Blocked, 'S'),
+            (ThreadState::BlockedException, 'S'),
+            (ThreadState::BlockedSleeping, 'S'),
+            (ThreadState::BlockedFutex, 'S'),
+            (ThreadState::BlockedPort, 'S'),
+            (ThreadState::BlockedChannel, 'S'),
+            (ThreadState::BlockedWaitOne, 'S'),
+            (ThreadState::BlockedWaitMany, 'S'),
+            (ThreadState::BlockedInterrupt, 'S'),
+            (ThreadState::BlockedPager, 'S'),
+        ] {
+            assert_eq!(
+                thread_state_char(state),
+                letter,
+                "el estado {:?} no es «{}»",
+                state,
+                letter
+            );
+        }
+    }
+
+    #[test]
+    fn a_process_with_a_thread_reports_that_threads_state_in_both_files() {
+        let proc = a_process(9207, "shell");
+        let thread = Thread::create_linux(&proc).unwrap();
+        let letter = proc_pid_stat(&proc)
+            .split(") ")
+            .nth(1)
+            .and_then(|t| t.chars().next())
+            .unwrap();
+        assert_eq!(letter, thread_state_char(thread.state()));
+        let threads = proc_pid_threads(&proc);
+        let line = threads.lines().nth(1).unwrap();
+        let per_thread = line.split(' ').nth(1).unwrap();
+        assert_eq!(per_thread, alloc::format!("{}", letter), "{:?}", threads);
+    }
+
+    #[test]
+    fn every_name_the_pid_directory_lists_can_be_opened() {
+        // The listing and the lookup are two lists of the same names written
+        // in two places, and what the listing names must be what the lookup
+        // opens: a name `readdir` gives that `find` refuses is a `/proc` entry
+        // `ls` shows and `cat` says does not exist. That is what happened to
+        // `/proc/net`, which left `.` and `..` out of its listing while
+        // answering both from `find`.
+        // Under `ROOT_JOB`, where `/proc` looks processes up: `find` answers
+        // `EntryNotFound` for a pid the root job tree does not hold, whatever
+        // the name asked for.
+        let proc = Process::create_with_fixed_id_ext(
+            &ROOT_JOB,
+            9208,
+            "listado",
+            LinuxProcess::new(RamFS::new(), 0),
+        )
+        .unwrap();
+        let dir = ProcPidDirINode { pid: proc.id() };
+        for (id, name) in ProcPidDirINode::entries().iter().enumerate() {
+            assert_eq!(&dir.get_entry(id).unwrap(), name);
+            assert!(
+                dir.find(name).is_ok(),
+                "`ls /proc/<pid>` nombra «{}» y `find` no lo encuentra",
+                name
+            );
+        }
+        assert!(dir.get_entry(ProcPidDirINode::entries().len()).is_err());
+        // And no name twice, which would hide one entry behind another.
+        let mut seen = alloc::vec::Vec::from(ProcPidDirINode::entries());
+        seen.sort_unstable();
+        let listed = seen.len();
+        seen.dedup();
+        assert_eq!(seen.len(), listed, "un nombre repetido en el listado");
+    }
+
+    #[test]
+    fn every_name_the_proc_root_lists_can_be_opened() {
+        let root = ProcRootINode;
+        for (i, name) in PROC_ROOT_STATIC.iter().enumerate() {
+            // `.` and `..` come first, so the static names start at 2.
+            assert_eq!(&ProcRootINode::entry_name(i + 2).unwrap(), name);
+            assert!(
+                root.find(name).is_ok(),
+                "`ls /proc` nombra «{}» y `find` no lo encuentra",
+                name
+            );
+        }
+        assert_eq!(ProcRootINode::entry_name(0).unwrap(), ".");
+        assert_eq!(ProcRootINode::entry_name(1).unwrap(), "..");
     }
 }
