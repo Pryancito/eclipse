@@ -372,6 +372,15 @@ const DEFAULT_PACKAGES: &[&str] = &[
     // `provides` this one, so a mirror carrying only rapid release needs
     // ECLIPSE_XORG_PACKAGES.
     "firefox-esr",
+    // What Firefox's GPU probe (`glxtest`, run before the first window) uses
+    // to read the graphics card's PCI vendor and device id: it sees
+    // `/sys/bus/pci/` and then `dlopen`s `libpci.so.3`, and without the
+    // library it logged `[GFX1-]: glxtest: libpci missing` at every start
+    // and went on with no PCI ids at all. Alpine ships the library on its
+    // own, apart from the `lspci` tool, and the sysfs files libpci reads for
+    // an id-and-class scan (`devices/`, `vendor`, `device`, `class`) are the
+    // ones the kernel's `/sys/bus/pci` already publishes for libdrm.
+    "pciutils-libs",
 ];
 
 /// Whether the build is running as root (euid 0), via `id -u` — no extra crate
@@ -2143,6 +2152,23 @@ mod tests {
     /// binary, install dir, `.desktop` id and icon names, and neither
     /// `provides` the other, so this is the name everything else in the image
     /// (the wrapper's search order, the `.desktop` override) is keyed on.
+    /// `glxtest`, Firefox's GPU probe, `dlopen`s `libpci.so.3` as soon as it
+    /// sees `/sys/bus/pci/` (which the kernel publishes for libdrm) and logs
+    /// `[GFX1-]: glxtest: libpci missing` when the library is not there. The
+    /// library comes in its own Alpine package, separate from `pciutils`
+    /// (the `lspci` tool, which nothing in the image needs).
+    #[test]
+    fn firefox_gpu_probe_finds_libpci() {
+        assert!(
+            DEFAULT_PACKAGES.contains(&"pciutils-libs"),
+            "pciutils-libs (libpci.so.3, what glxtest dlopens) must be in the default package set"
+        );
+        assert!(
+            !DEFAULT_PACKAGES.contains(&"pciutils"),
+            "the lspci tool is not what Firefox needs; only the library package"
+        );
+    }
+
     #[test]
     fn the_shipped_browser_is_firefox_esr_not_rapid_release() {
         assert!(
