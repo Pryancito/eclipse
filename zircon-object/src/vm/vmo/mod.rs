@@ -1267,6 +1267,50 @@ mod tests {
         assert_eq!(&buf, &[0, 1, 2, 3]);
     }
 
+    /// The ELF loader's `padzero`: a partial `zero` of a page nobody has
+    /// committed yet. On an anonymous VMO that page already reads as zeros,
+    /// so `zero` skips it -- but a BORROWER's uncommitted page reads the
+    /// CACHE, so the skip left the file's bytes exactly where zeros were
+    /// asked for. That is a static binary's `.bss` head, and every process on
+    /// the machine died in musl's `__init_tls` before reaching `main`.
+    ///
+    /// And it must copy up, not zero the cache: the cache is the shared exec
+    /// image, so writing through it would corrupt every other borrower and
+    /// every later exec of the same file.
+    #[test]
+    fn zeroing_part_of_a_borrowed_page_zeroes_the_borrower_not_the_cache() {
+        let cache = VmObject::new_paged(2);
+        cache.write(0, &[0xAA; PAGE_SIZE]).unwrap();
+        let b = VmObject::new_paged_borrowing(2, cache.clone(), 0);
+
+        // Nothing committed: the page reads the cache, as it should.
+        assert_eq!(b.committed_pages_in_range(0, 2), 0);
+        let mut buf = [0u8; 8];
+        b.read(8, &mut buf).unwrap();
+        assert_eq!(buf, [0xAA; 8], "a clean borrowed page reads the cache");
+
+        // `padzero` over the tail of that same uncommitted page.
+        b.zero(8, PAGE_SIZE - 8).unwrap();
+
+        b.read(8, &mut buf).unwrap();
+        assert_eq!(buf, [0; 8], "the zeroed tail still read the cache's bytes");
+        b.read(0, &mut buf).unwrap();
+        assert_eq!(
+            buf, [0xAA; 8],
+            "the bytes below the zeroed range must be untouched"
+        );
+        assert_eq!(
+            b.committed_pages_in_range(0, 2),
+            1,
+            "the zero has to copy the page up, not write the cache"
+        );
+
+        // The cache -- the shared exec image -- is exactly as it was.
+        let mut from_cache = [0u8; 8];
+        cache.read(8, &mut from_cache).unwrap();
+        assert_eq!(from_cache, [0xAA; 8], "the shared image was written to");
+    }
+
     /// A borrower's clean page IS the cache's frame; only a written page is
     /// private. This is the mechanism that de-duplicates library mappings.
     #[test]
