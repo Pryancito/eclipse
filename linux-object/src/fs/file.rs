@@ -585,13 +585,7 @@ fn prune_shared_vmos(registry: &mut SharedVmoMap) {
 
 /// Flush a shared VMO's committed pages to its inode before the VMO is dropped.
 ///
-/// There is no MAP_SHARED->inode writeback path in this kernel (msync is a
-/// no-op), so while the VMO lives it *is* the file's storage. Evicting it
-/// without this would turn "write through a shared mapping, close everything,
-/// reopen" into stale zeros. Doing it here also makes those writes visible to a
-/// plain `read()`, which they never were.
-///
-/// Bounded by the inode's CURRENT size: a shared VMO is rounded up to whole
+/// Bound by the inode's CURRENT size: a shared VMO is rounded up to whole
 /// pages and may be longer than the file (`vmo_len = file_size.max(offset+len)`),
 /// and writing those pages back would silently EXTEND the file.
 fn writeback_shared_vmo(vmo: &Arc<VmObject>, inode: &Arc<dyn INode>) {
@@ -625,6 +619,34 @@ fn writeback_shared_vmo(vmo: &Arc<VmObject>, inode: &Arc<dyn INode>) {
         // accepts writes, must not turn eviction into a failure.
         let _ = inode.write_at(offset, &buf[..n]);
     }
+}
+
+/// Write back a MAP_SHARED file VMO to its inode (Stage A `msync`).
+///
+/// Looks the VMO up in the shared-file registry and flushes committed pages.
+/// No-op when the VMO is anonymous, private, or not registered — callers can
+/// invoke this on every mapping in an `msync` range without filtering first.
+pub fn sync_shared_file_vmo(vmo: &Arc<VmObject>) {
+    if !vmo.is_shared_object() && !vmo.is_file_backed() {
+        return;
+    }
+    let (vmo, inode) = {
+        let registry = SHARED_FILE_VMOS.lock();
+        let mut found = None;
+        for (cached, inode_weak, _) in registry.values() {
+            if Arc::ptr_eq(cached, vmo) {
+                if let Some(inode) = inode_weak.upgrade() {
+                    found = Some((cached.clone(), inode));
+                }
+                break;
+            }
+        }
+        match found {
+            Some(pair) => pair,
+            None => return,
+        }
+    };
+    writeback_shared_vmo(&vmo, &inode);
 }
 
 impl zircon_object::vm::FrameFiller for FileFrameFiller {

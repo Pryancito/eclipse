@@ -162,7 +162,9 @@ pub fn drm_fd_desc(f: &alloc::sync::Arc<dyn FileLike>) -> Option<alloc::string::
     None
 }
 pub use eventfd::EventFd;
-pub use file::{cache_truncate, fs_grow_error, File, OpenFlags, PollEvents, SeekFrom};
+pub use file::{
+    cache_truncate, fs_grow_error, sync_shared_file_vmo, File, OpenFlags, PollEvents, SeekFrom,
+};
 pub use inotify::{inotify_watch_lookup, Inotify, WatchLookup};
 pub use perf::{sample_user as perf_sample_user, PerfEvent};
 pub use pidfd::{PidFd, PIDFD_THREAD};
@@ -2020,12 +2022,15 @@ pub fn dns_vfs_root() -> Option<Arc<dyn INode>> {
 /// mtime, so rewriting the file changes the key and the next exec re-reads it.
 type ElfVmoKey = (usize, usize, usize, i64, i32); // (dev, inode, size, mtime.sec, mtime.nsec)
 
-/// Skip caching files larger than this (don't pin a giant binary like
-/// `libLLVM.so` in the cache for one load).
-const ELF_VMO_CACHE_FILE_MAX: usize = 8 * 1024 * 1024;
+/// Skip caching files larger than this. Sized for Firefox content-process
+/// execs: the ESR stub plus `ld-musl` fit easily, and a warm cache avoids
+/// re-reading hundreds of MiB across E10S spawns. Above this, fall through to
+/// a fresh uncached read so one giant one-shot binary cannot pin the heap.
+const ELF_VMO_CACHE_FILE_MAX: usize = 64 * 1024 * 1024;
 /// Total committed bytes the cache may hold; the oldest entries are evicted
-/// (FIFO) once a new insert would exceed it.
-const ELF_VMO_CACHE_MAX_BYTES: usize = 32 * 1024 * 1024;
+/// (FIFO) once a new insert would exceed it. Holds a few warm executables
+/// (firefox + ld.so + shell helpers) under concurrent E10S launches.
+const ELF_VMO_CACHE_MAX_BYTES: usize = 128 * 1024 * 1024;
 
 struct ElfVmoCache {
     map: BTreeMap<ElfVmoKey, Arc<VmObject>>,

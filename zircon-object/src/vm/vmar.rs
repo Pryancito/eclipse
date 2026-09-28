@@ -2144,6 +2144,14 @@ pub struct VmMapping {
     inner: Mutex<VmMappingInner>,
 }
 
+impl VmMapping {
+    /// The VMO this mapping covers. Used by `msync` to write back shared
+    /// file-backed objects without walking internal VMAR state again.
+    pub fn vmo(&self) -> &Arc<VmObject> {
+        &self.vmo
+    }
+}
+
 #[derive(Debug, Clone)]
 struct VmMappingInner {
     /// The actual flags used in the mapping of each page, run-length encoded
@@ -2167,25 +2175,36 @@ fn apply_range_change_locked(
     let end = (vmo_page + inner.size / PAGE_SIZE).min(offset + len);
     if !(start..end).is_empty() {
         let mut pg_table = map.page_table.lock();
+        // Gate the shootdown on an actual PTE change. `MADV_DONTNEED` already
+        // unmapped+flushed in `dontneed` before `decommit` reaches here via
+        // `unmap_released`; a second unconditional `remote_flush_all` was a
+        // free synchronous IPI on every mozjemalloc purge.
+        let mut any = false;
         for i in (start - vmo_page)..(end - vmo_page) {
             match op {
                 RangeChangeOp::RemoveWrite => {
                     let mut new_flag = inner.flags[i];
                     new_flag.remove(MMUFlags::WRITE);
-                    pg_table
+                    if pg_table
                         .update_no_shootdown(inner.addr + i * PAGE_SIZE, None, Some(new_flag))
-                        .ignore()
-                        .unwrap();
+                        .is_ok()
+                    {
+                        any = true;
+                    }
                 }
                 RangeChangeOp::Unmap => {
-                    pg_table
+                    if pg_table
                         .unmap_no_shootdown(inner.addr + i * PAGE_SIZE)
-                        .ignore()
-                        .unwrap();
+                        .is_ok()
+                    {
+                        any = true;
+                    }
                 }
             };
         }
-        pg_table.remote_flush_all();
+        if any {
+            pg_table.remote_flush_all();
+        }
     }
 }
 

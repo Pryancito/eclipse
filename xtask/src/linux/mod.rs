@@ -963,46 +963,36 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
               #\n\
               # TWO conditions, like the kernel's own gate: the cmdline flag is a\n\
               # REQUEST and the NVIDIA GPU is the CAPABILITY. Only when BOTH hold\n\
-              # is the kernel's nouveau uAPI actually on. Current status on real\n\
-              # NVIDIA hardware: the default zink/NVK compositor path still floods\n\
-              # labwc.log with 'failed to create timeline semaphore' and dies, so\n\
-              # the DEFAULT session stays on the proven software path. The kernel\n\
-              # nouveau uAPI remains on for bring-up/debugging, but wlroots GPU\n\
-              # rendering is now EXPLICIT opt-in only:\n\
-              #   * nvidia.wlr_gles2   -> GLES2 on zink+NVK\n\
-              #   * nvidia.wlr_vulkan -> native Vulkan/NVK\n\
-              # Otherwise: pixman compositor + software GL clients. login(1)\n\
-              # STRIPS arbitrary vars, so re-assert the whole policy here to match\n\
-              # build_child_env and the wrapper.\n\
+              # is the kernel's nouveau uAPI actually on. Default session: GLES2\n\
+              # on zink+NVK. Kill-switch: nvidia.wlr_pixman. Native Vulkan:\n\
+              # nvidia.wlr_vulkan. nvidia.wlr_gles2 is accepted (= default).\n\
+              # login(1) STRIPS arbitrary vars, so re-assert the whole policy here\n\
+              # to match build_child_env and the wrapper.\n\
               if grep -q 'nvidia\\.nouveau_uapi' /proc/cmdline 2>/dev/null && \\\n\
               \x20\x20 [ \"$(tr -d '[:space:]' < /sys/class/drm/card0/device/vendor 2>/dev/null)\" = \"0x10de\" ]; then\n\
-              \x20 # NVIDIA + flag -> kernel nouveau uAPI ON, but software session by default.\n\
-              \x20 if grep -q 'nvidia\\.wlr_vulkan' /proc/cmdline 2>/dev/null; then\n\
+              \x20 if grep -q 'nvidia\\.wlr_pixman' /proc/cmdline 2>/dev/null; then\n\
+              \x20\x20 export WLR_RENDERER=pixman\n\
+              \x20\x20 export WLR_RENDERER_ALLOW_SOFTWARE=1\n\
+              \x20\x20 export LIBGL_ALWAYS_SOFTWARE=1\n\
+              \x20\x20 export SDL_RENDER_DRIVER=software\n\
+              \x20\x20 export SDL_FRAMEBUFFER_ACCELERATION=0\n\
+              \x20 elif grep -q 'nvidia\\.wlr_vulkan' /proc/cmdline 2>/dev/null; then\n\
               \x20\x20 export WLR_RENDERER=vulkan\n\
-              \x20\x20 export WLR_DRM_NO_MODIFIERS=1\n\
-              \x20\x20 export GALLIUM_DRIVER=zink\n\
-              \x20\x20 export MESA_LOADER_DRIVER_OVERRIDE=zink\n\
-              \x20\x20 # SDL: GLES2 renderer on the GPU sessions (SDL2 has no Vulkan\n\
-              \x20\x20 # renderer; GLES2 lands on zink+NVK like the compositor).\n\
-              \x20\x20 export SDL_RENDER_DRIVER=opengles2\n\
-              \x20\x20 export SDL_FRAMEBUFFER_ACCELERATION=opengles2\n\
-              \x20 elif grep -q 'nvidia\\.wlr_gles2' /proc/cmdline 2>/dev/null; then\n\
-              \x20\x20 export WLR_RENDERER=gles2\n\
               \x20\x20 export WLR_DRM_NO_MODIFIERS=1\n\
               \x20\x20 export GALLIUM_DRIVER=zink\n\
               \x20\x20 export MESA_LOADER_DRIVER_OVERRIDE=zink\n\
               \x20\x20 export SDL_RENDER_DRIVER=opengles2\n\
               \x20\x20 export SDL_FRAMEBUFFER_ACCELERATION=opengles2\n\
               \x20 else\n\
-              \x20\x20 export WLR_RENDERER=pixman\n\
-              \x20\x20 export WLR_RENDERER_ALLOW_SOFTWARE=1\n\
-              \x20\x20 export LIBGL_ALWAYS_SOFTWARE=1\n\
-              \x20\x20 # SDL on pixman: software renderer, no GL behind window surfaces.\n\
-              \x20\x20 export SDL_RENDER_DRIVER=software\n\
-              \x20\x20 export SDL_FRAMEBUFFER_ACCELERATION=0\n\
+              \x20\x20 # Default GPU path (and nvidia.wlr_gles2): GLES2 on zink+NVK.\n\
+              \x20\x20 export WLR_RENDERER=gles2\n\
+              \x20\x20 export WLR_DRM_NO_MODIFIERS=1\n\
+              \x20\x20 export GALLIUM_DRIVER=zink\n\
+              \x20\x20 export MESA_LOADER_DRIVER_OVERRIDE=zink\n\
+              \x20\x20 export SDL_RENDER_DRIVER=opengles2\n\
+              \x20\x20 export SDL_FRAMEBUFFER_ACCELERATION=opengles2\n\
               \x20 fi\n\
-              elif grep -q 'nvidia\\.nouveau_uapi' /proc/cmdline 2>/dev/null && \\
-\
+              elif grep -q 'nvidia\\.nouveau_uapi' /proc/cmdline 2>/dev/null && \\\n\
               \x20\x20 [ -r /sys/class/drm/card0/device/vendor ]; then\n\
               \x20 # flag but no NVIDIA (the GL=1 image under QEMU): software GL,\n\
               \x20 # the same stack as renderer=gl-sw -- labwc on GLES2/llvmpipe.\n\

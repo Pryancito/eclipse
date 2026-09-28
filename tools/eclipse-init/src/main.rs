@@ -40,32 +40,38 @@ const HEALTHY_UPTIME: Duration = Duration::from_secs(2);
 const MIN_BACKOFF: Duration = Duration::from_millis(250);
 const MAX_BACKOFF: Duration = Duration::from_secs(8);
 
-/// Compositor GPU-renderer fallback. `nvidia.wlr_gles2` / `nvidia.wlr_vulkan`
-/// put labwc on the GPU-rendered wlroots path (zink+NVK over the nouveau
-/// uAPI). On real hardware that path can die when a client's EXEC wedges the
-/// GPU channel: the compositor is context 0, a per-boot singleton the kernel
-/// never rebuilds, so every respawn of labwc lands on the SAME wedged channel
-/// and dies again -- the desktop goes black and comes back unstable, in a
-/// loop. Once labwc has exited [`COMPOSITOR_DEGRADE_AFTER`] times this boot
-/// while the GPU renderer was requested, `build_child_env` hands later
-/// respawns `WLR_RENDERER=pixman` (the proven software path) instead, so the
-/// desktop recovers. The first exit still retries the GPU renderer in case it
-/// was transient. Per boot: the next boot tries GPU rendering again.
+/// Compositor GPU-renderer fallback. With `nvidia.nouveau_uapi` on an NVIDIA
+/// GPU the session defaults to GLES2/zink (real GPU). That path can die when a
+/// client's EXEC wedges the GPU channel: the compositor is context 0, a
+/// per-boot singleton the kernel rebuilds on owner exit (`ctx0_reset`), but a
+/// wedged ring still kills labwc in a loop. Once labwc has exited
+/// [`COMPOSITOR_DEGRADE_AFTER`] times this boot while the GPU renderer was
+/// active, `build_child_env` hands later respawns `WLR_RENDERER=pixman` (the
+/// proven software path) instead, so the desktop recovers. Force software for
+/// the whole boot with `nvidia.wlr_pixman`; force native Vulkan with
+/// `nvidia.wlr_vulkan`.
 static COMPOSITOR_DEGRADED: AtomicBool = AtomicBool::new(false);
 /// How many times labwc has exited this boot with the GPU renderer requested.
 static COMPOSITOR_EXITS: AtomicU32 = AtomicU32::new(0);
 /// Exits of the GPU-rendered compositor tolerated before degrading to pixman.
 const COMPOSITOR_DEGRADE_AFTER: u32 = 2;
 
-/// Whether the cmdline asked for the GPU-rendered wlroots compositor
-/// (`nvidia.wlr_gles2` or `nvidia.wlr_vulkan`).
+/// Whether this boot wants the GPU-rendered wlroots compositor (GLES2/zink or
+/// Vulkan). True for `nvidia.nouveau_uapi` on NVIDIA unless
+/// `nvidia.wlr_pixman` kills the path; `nvidia.wlr_vulkan` / `nvidia.wlr_gles2`
+/// still force GPU when present.
 fn gpu_compositor_requested() -> bool {
     gpu_compositor_requested_in(&read_cmdline())
 }
 
 /// [`gpu_compositor_requested`] against a given command line.
 fn gpu_compositor_requested_in(cmdline: &str) -> bool {
-    cmdline_has_in(cmdline, "nvidia.wlr_gles2") || cmdline_has_in(cmdline, "nvidia.wlr_vulkan")
+    if cmdline_has_in(cmdline, "nvidia.wlr_pixman") {
+        return false;
+    }
+    cmdline_has_in(cmdline, "nvidia.wlr_vulkan")
+        || cmdline_has_in(cmdline, "nvidia.wlr_gles2")
+        || cmdline_has_in(cmdline, "nvidia.nouveau_uapi")
 }
 
 /// Has a shutdown signal arrived? Every bounded wait polls this so a
@@ -1155,11 +1161,10 @@ enum Renderer {
     /// CPU 2D software (default, and the fallback for any unknown value): the
     /// wlroots pixman renderer. Always composites a frame.
     Pixman,
-    /// Enable the NVIDIA nouveau experiment knobs. On current real hardware the
-    /// default SESSION under this mode is still the safe software path; explicit
-    /// `nvidia.wlr_gles2` / `nvidia.wlr_vulkan` cmdline flags opt into the
-    /// unstable GPU-rendered compositor paths. In QEMU our virtio-gpu is 2D-only
-    /// (no virgl), so this mode degrades to software GL there too.
+    /// Enable the NVIDIA nouveau uAPI. On real NVIDIA hardware the session
+    /// defaults to GLES2/zink; `nvidia.wlr_pixman` forces software and
+    /// `nvidia.wlr_vulkan` selects native Vulkan. In QEMU our virtio-gpu is
+    /// 2D-only (no virgl), so this mode degrades to software GL there too.
     Gl,
     /// wlroots GLES2 over Mesa's software rasterizer (llvmpipe). Exercises the
     /// real GL/EGL/GLES2 path with no GPU 3D: it renders in QEMU (on the CPU, so
@@ -1189,13 +1194,12 @@ fn renderer_mode_from(cmdline: &str, vendor: Option<&str>) -> Renderer {
 /// does the right thing in QEMU and on real hardware without a build flag
 /// (`renderer=auto`, and the default when the cmdline names no renderer).
 ///
-/// Per-GPU choice: NVIDIA (`0x10de`) enters the NVIDIA experiment mode — but
-/// ONLY when `nvidia.nouveau_uapi` is also on the cmdline, because that flag is
-/// what turns the kernel's nouveau uAPI on (without it the DRM node identifies
-/// as "zcore" and NVK can never enumerate; NVIDIA without the flag goes to
-/// pixman, the proven software default there). In that experiment mode labwc now
-/// still defaults to software unless `nvidia.wlr_gles2` / `nvidia.wlr_vulkan`
-/// opt into the unstable GPU compositor.
+/// Per-GPU choice: NVIDIA (`0x10de`) enters the NVIDIA GPU path — but ONLY when
+/// `nvidia.nouveau_uapi` is also on the cmdline, because that flag is what
+/// turns the kernel's nouveau uAPI on (without it the DRM node identifies as
+/// "zcore" and NVK can never enumerate; NVIDIA without the flag goes to
+/// pixman). With the flag, labwc defaults to GLES2/zink (kill-switch
+/// `nvidia.wlr_pixman`; `nvidia.wlr_vulkan` for native Vulkan).
 ///
 /// Everything else — QEMU virtio-gpu (`0x1af4`), VirtualBox SVGA (`0x15ad`),
 /// or no card — lands on **pixman**. The previous auto pick was
@@ -1228,7 +1232,7 @@ fn detect_renderer_from(vendor: Option<&str>, cmdline: &str) -> Renderer {
             if cmdline_has_in(cmdline, "nvidia.nouveau_uapi") {
                 log(&format!(
                     "renderer=auto: NVIDIA GPU {} + nvidia.nouveau_uapi -> gl \
-                     (NVIDIA experiment mode; labwc stays software unless explicitly opted into wlroots GPU rendering)",
+                     (GLES2/zink by default; nvidia.wlr_pixman for software)",
                     v.trim()
                 ));
                 Renderer::Gl
@@ -1342,48 +1346,38 @@ fn child_env_for(
         }
         Renderer::Gl => {
             if vendor_is_nvidia(vendor) {
-                // Current real-hardware status: labwc's default GPU-rendered path
-                // still crashes inside Mesa/NVK and floods `/tmp/labwc.log` with
-                // "zink: failed to create timeline semaphore", then the compositor
-                // dies during teardown. Keep the kernel nouveau uAPI enabled (for
-                // continued bring-up/debugging) but default the SESSION to the
-                // proven software path so labwc actually reaches the desktop.
-                //
-                // Opt back into the unstable compositor GPU paths explicitly:
-                //   * `nvidia.wlr_gles2`   -> wlroots GLES2 on zink+NVK
-                //   * `nvidia.wlr_vulkan` -> wlroots native Vulkan/NVK
-                //
-                // Absent those flags, use pixman for the compositor and software
-                // GL for clients. That avoids zink/NVK entirely on boot.
-                // ...unless the compositor already died COMPOSITOR_DEGRADE_AFTER
-                // times this boot on the GPU renderer: then this respawn goes to
+                // Real GPU path: `nvidia.nouveau_uapi` on an NVIDIA card defaults
+                // to GLES2/zink (NVK). Kill-switch: `nvidia.wlr_pixman`. Native
+                // Vulkan compositor: `nvidia.wlr_vulkan`. After
+                // COMPOSITOR_DEGRADE_AFTER deaths this boot, respawns go to
                 // pixman so the desktop recovers (see COMPOSITOR_DEGRADED).
-                if !degraded
-                    && (cmdline_has_in(cmdline, "nvidia.wlr_vulkan")
-                        || cmdline_has_in(cmdline, "nvidia.wlr_gles2"))
+                let force_pixman = degraded || cmdline_has_in(cmdline, "nvidia.wlr_pixman");
+                let want_vulkan = cmdline_has_in(cmdline, "nvidia.wlr_vulkan");
+                if !force_pixman
+                    && (want_vulkan
+                        || cmdline_has_in(cmdline, "nvidia.wlr_gles2")
+                        || cmdline_has_in(cmdline, "nvidia.nouveau_uapi"))
                 {
-                    let wlr = if cmdline_has_in(cmdline, "nvidia.wlr_vulkan") {
-                        "vulkan"
-                    } else {
-                        "gles2"
-                    };
+                    let wlr = if want_vulkan { "vulkan" } else { "gles2" };
                     env.push(CString::new(format!("WLR_RENDERER={wlr}")).unwrap());
+                    env.push(CString::new("WLR_DRM_NO_MODIFIERS=1").unwrap());
                     log(&format!(
-                        "renderer=gl: NVIDIA GPU -> experimental WLR_RENDERER={wlr} \
-                         (via nvidia.wlr_{})",
-                        if wlr == "vulkan" { "vulkan" } else { "gles2" }
+                        "renderer=gl: NVIDIA GPU -> WLR_RENDERER={wlr} (zink+NVK{}; degrade with nvidia.wlr_pixman)",
+                        if want_vulkan {
+                            ", nvidia.wlr_vulkan"
+                        } else if cmdline_has_in(cmdline, "nvidia.wlr_gles2") {
+                            ", nvidia.wlr_gles2"
+                        } else {
+                            ", default with nouveau_uapi"
+                        }
                     ));
-                    // On real NVIDIA hardware, pin the OpenGL Gallium driver to
-                    // zink (GL-on-Vulkan over NVK) only on the explicit
-                    // experimental path. Our nouveau uAPI implements the zink/NVK
-                    // submission path (VM_BIND/EXEC) but NOT classic nvc0
-                    // GEM_PUSHBUF, so hardware GL clients need the pin whenever we
-                    // intentionally exercise the GPU path.
+                    // Pin OpenGL clients to zink: our nouveau uAPI implements
+                    // VM_BIND/EXEC (NVK) but not classic nvc0 GEM_PUSHBUF.
                     env.push(CString::new("GALLIUM_DRIVER=zink").unwrap());
                     env.push(CString::new("MESA_LOADER_DRIVER_OVERRIDE=zink").unwrap());
                     push_sdl_render_env(&mut env, SdlRender::Gles2);
                     log(
-                        "renderer=gl: NVIDIA GPU -> pinning GL clients to zink+NVK on explicit experimental path",
+                        "renderer=gl: NVIDIA GPU -> pinning GL clients to zink+NVK",
                     );
                 } else {
                     env.push(CString::new("WLR_RENDERER=pixman").unwrap());
@@ -1396,7 +1390,7 @@ fn child_env_for(
                         );
                     } else {
                         log(
-                            "renderer=gl: NVIDIA GPU -> defaulting labwc to pixman and clients to software GL; opt into GPU rendering with nvidia.wlr_gles2 or nvidia.wlr_vulkan",
+                            "renderer=gl: NVIDIA GPU -> pixman (nvidia.wlr_pixman); remove that flag for GLES2/zink",
                         );
                     }
                 }
@@ -2401,9 +2395,11 @@ mod tests {
     }
 
     #[test]
-    fn the_gpu_session_is_opt_in_and_pins_clients_to_the_same_stack() {
+    fn the_gpu_session_defaults_to_gles2_and_pins_clients_to_the_same_stack() {
         // zink+NVK is the only GL this uAPI implements, so the compositor and
-        // its clients have to be pinned to it together.
+        // its clients have to be pinned to it together. With nouveau_uapi on
+        // NVIDIA, GLES2 is the default; vulkan stays explicit; pixman is the
+        // kill-switch.
         let env = renderer_env("renderer=gl:nvidia.wlr_vulkan", NVIDIA, false);
         assert_eq!(var(&env, "WLR_RENDERER"), Some("vulkan"), "{env:?}");
         assert_eq!(var(&env, "GALLIUM_DRIVER"), Some("zink"), "{env:?}");
@@ -2413,13 +2409,26 @@ mod tests {
             "{env:?}"
         );
 
+        let env = renderer_env("renderer=gl:nvidia.nouveau_uapi", NVIDIA, false);
+        assert_eq!(var(&env, "WLR_RENDERER"), Some("gles2"), "{env:?}");
+        assert_eq!(var(&env, "GALLIUM_DRIVER"), Some("zink"), "{env:?}");
+        assert_eq!(var(&env, "LIBGL_ALWAYS_SOFTWARE"), None, "{env:?}");
+
         let env = renderer_env("renderer=gl:nvidia.wlr_gles2", NVIDIA, false);
         assert_eq!(var(&env, "WLR_RENDERER"), Some("gles2"), "{env:?}");
         assert_eq!(var(&env, "GALLIUM_DRIVER"), Some("zink"), "{env:?}");
 
-        // Without either flag the session stays on the proven software path,
-        // and must NOT carry the zink pin: pinning GL clients to a stack the
-        // compositor is not using is the mix that renders without compositing.
+        // Kill-switch: force the proven software path for the whole boot.
+        let env = renderer_env(
+            "renderer=gl:nvidia.nouveau_uapi:nvidia.wlr_pixman",
+            NVIDIA,
+            false,
+        );
+        assert_eq!(var(&env, "WLR_RENDERER"), Some("pixman"), "{env:?}");
+        assert_eq!(var(&env, "GALLIUM_DRIVER"), None, "{env:?}");
+        assert_eq!(var(&env, "LIBGL_ALWAYS_SOFTWARE"), Some("1"), "{env:?}");
+
+        // Without nouveau_uapi the DRM node is not nouveau: stay on software.
         let env = renderer_env("renderer=gl", NVIDIA, false);
         assert_eq!(var(&env, "WLR_RENDERER"), Some("pixman"), "{env:?}");
         assert_eq!(var(&env, "GALLIUM_DRIVER"), None, "{env:?}");
@@ -2507,8 +2516,11 @@ mod tests {
         // And the counter only counts exits when the GPU was actually asked for.
         assert!(gpu_compositor_requested_in(asked));
         assert!(gpu_compositor_requested_in("nvidia.wlr_vulkan"));
-        assert!(!gpu_compositor_requested_in(
+        assert!(gpu_compositor_requested_in(
             "renderer=gl:nvidia.nouveau_uapi"
+        ));
+        assert!(!gpu_compositor_requested_in(
+            "renderer=gl:nvidia.nouveau_uapi:nvidia.wlr_pixman"
         ));
     }
 

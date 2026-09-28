@@ -1272,9 +1272,11 @@ fn write_terminal_wrapper(rootfs: &Path) {
     }
 }
 
-/// `/usr/local/bin/eclipse-firefox`: launch Firefox in the only configuration
-/// that renders on this GPU-less stack — Wayland and pure software WebRender
-/// (SWGL).
+/// `/usr/local/bin/eclipse-firefox`: launch Firefox with WebRender.
+///
+/// On an NVIDIA + `nvidia.nouveau_uapi` session (GLES2/zink), use hardware
+/// WebRender via zink+NVK. Otherwise force software WebRender (QEMU / no GPU /
+/// `nvidia.wlr_pixman`).
 ///
 /// It also asks for a single process, but do not count on getting one. In
 /// `BrowserTabsRemoteAutostart` (`toolkit/xre/nsAppRunner.cpp`) Firefox honours
@@ -1292,8 +1294,8 @@ fn write_terminal_wrapper(rootfs: &Path) {
 ///
 /// Crucially this does NOT set `MOZ_WEBRENDER=0`: modern Firefox has no
 /// non-WebRender compositor, so that would disable rendering outright (a black
-/// window) and, worse, override any `gfx.webrender.software=true` profile pref.
-/// `MOZ_WEBRENDER_SOFTWARE=1` keeps WebRender on but forces its software backend.
+/// window). Software path uses `MOZ_WEBRENDER_SOFTWARE=1`; GPU path leaves
+/// WebRender on the hardware backend.
 fn write_firefox_wrapper(rootfs: &Path) {
     let localbin = rootfs.join("usr/local/bin");
     let _ = fs::create_dir_all(&localbin);
@@ -1301,53 +1303,41 @@ fn write_firefox_wrapper(rootfs: &Path) {
     fs::write(
         &wrapper,
         b"#!/bin/sh\n\
-          # Eclipse OS: launch Firefox in a GPU-less, single-process, software\n\
-          # WebRender configuration. See write_firefox_wrapper in\n\
-          # xtask/src/linux/desktop.rs for the rationale.\n\
+          # Eclipse OS: Firefox with GPU WebRender when the session is on\n\
+          # zink+NVK, else software WebRender. See write_firefox_wrapper.\n\
           export HOME=\"${HOME:-/root}\"\n\
           export LANG=\"${LANG:-es_ES.UTF-8}\"\n\
           case \"$LANG\" in *UTF-8|*utf8|*UTF8) ;; *) LANG=es_ES.UTF-8 ;; esac\n\
-          # DISPLAY: inherited (the strip is gone, same as eclipse-terminal --\n\
-          # Xwayland is healthy now). MOZ_ENABLE_WAYLAND below still pins\n\
-          # Firefox itself to the Wayland backend; DISPLAY only matters to\n\
-          # anything it spawns.\n\
           export MOZ_ENABLE_WAYLAND=1\n\
-          # gdk-pixbuf loader registry (written at boot by eclipse-gtk-caches)\n\
-          # and no dconf: what labwc's environment file sets, for a launch\n\
-          # from a shell or a dock terminal that did not read it.\n\
           export GDK_PIXBUF_MODULE_FILE=\"${GDK_PIXBUF_MODULE_FILE:-/root/.cache/pixbuf-loaders.cache}\"\n\
           export GSETTINGS_BACKEND=\"${GSETTINGS_BACKEND:-memory}\"\n\
-          # Ask for a single process. A distribution build (MOZILLA_OFFICIAL)\n\
-          # ignores this unless non-local connections are disabled, so expect\n\
-          # content children anyway -- see write_firefox_wrapper.\n\
           export MOZ_FORCE_DISABLE_E10S=1\n\
           export MOZ_DISABLE_CONTENT_SANDBOX=1\n\
           export MOZ_DISABLE_GMP_SANDBOX=1\n\
           export MOZ_DISABLE_RDD_SANDBOX=1\n\
           export MOZ_DISABLE_GPU_SANDBOX=1\n\
           export MOZ_DISABLE_SOCKET_PROCESS_SANDBOX=1\n\
-          # Software rendering. NOT MOZ_WEBRENDER=0 (that disables rendering).\n\
-          export LIBGL_ALWAYS_SOFTWARE=1\n\
-          export MOZ_WEBRENDER_SOFTWARE=1\n\
-          export MOZ_ACCELERATED=0\n\
+          # GPU WebRender when NVIDIA + nouveau_uapi and not forced to pixman;\n\
+          # otherwise software (QEMU / no GPU / nvidia.wlr_pixman).\n\
+          if grep -q 'nvidia\\.nouveau_uapi' /proc/cmdline 2>/dev/null && \\\n\
+          \x20\x20 [ \"$(tr -d '[:space:]' < /sys/class/drm/card0/device/vendor 2>/dev/null)\" = \"0x10de\" ] && \\\n\
+          \x20\x20 ! grep -q 'nvidia\\.wlr_pixman' /proc/cmdline 2>/dev/null; then\n\
+          \x20 export GALLIUM_DRIVER=\"${GALLIUM_DRIVER:-zink}\"\n\
+          \x20 export MESA_LOADER_DRIVER_OVERRIDE=\"${MESA_LOADER_DRIVER_OVERRIDE:-zink}\"\n\
+          \x20 unset LIBGL_ALWAYS_SOFTWARE MOZ_WEBRENDER_SOFTWARE 2>/dev/null\n\
+          \x20 export MOZ_ACCELERATED=1\n\
+          else\n\
+          \x20 # Software rendering. NOT MOZ_WEBRENDER=0 (that disables rendering).\n\
+          \x20 export LIBGL_ALWAYS_SOFTWARE=1\n\
+          \x20 export MOZ_WEBRENDER_SOFTWARE=1\n\
+          \x20 export MOZ_ACCELERATED=0\n\
+          fi\n\
           export MOZ_CRASHREPORTER_DISABLE=1\n\
-          # No accessibility bus on Eclipse OS: stop GTK/at-spi from probing\n\
-          # for one (two 'Failed to create DBus proxy for org.a11y.Bus' lines\n\
-          # per start, plus a refused connect on every launch).\n\
           export NO_AT_BRIDGE=1\n\
           export GTK_A11Y=none\n\
-          # Caches go to /tmp (a ramfs that grows on demand), not to the\n\
-          # root SFS image, which is RAM too but fixed-size and nearly full\n\
-          # at boot on the QEMU live image. Firefox puts startupCache and\n\
-          # (were it enabled) the disk cache under $XDG_CACHE_HOME.\n\
           export XDG_CACHE_HOME=\"${XDG_CACHE_HOME:-/tmp/xdg-cache}\"\n\
           mkdir -p \"$XDG_CACHE_HOME\"\n\
           FLOG=\"${HOME:-/root}/.eclipse-firefox.log\"\n\
-          # `firefox-esr` is what DEFAULT_PACKAGES installs (the ESR line: same\n\
-          # engine, fewer features churning, lighter on RAM than rapid\n\
-          # release); `firefox` is a separate Alpine package with its own\n\
-          # binary name, so accept it as the fallback rather than sending an\n\
-          # image that carries only rapid release to the not-found branch.\n\
           FFBIN=\n\
           for c in firefox-esr firefox; do\n\
           \x20 if command -v \"$c\" >/dev/null 2>&1; then FFBIN=$c; break; fi\n\
@@ -1357,7 +1347,7 @@ fn write_firefox_wrapper(rootfs: &Path) {
           \x20 echo 'eclipse-firefox: firefox not found' >>\"$FLOG\"\n\
           \x20 exit 127\n\
           fi\n\
-          echo \"[$(date '+%H:%M:%S')] $FFBIN $* (WAYLAND_DISPLAY=${WAYLAND_DISPLAY:-UNSET} XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-UNSET})\" >>\"$FLOG\"\n\
+          echo \"[$(date '+%H:%M:%S')] $FFBIN $* (WAYLAND_DISPLAY=${WAYLAND_DISPLAY:-UNSET} GL=${GALLIUM_DRIVER:-sw} ACCEL=${MOZ_ACCELERATED:-?})\" >>\"$FLOG\"\n\
           exec \"$FFBIN\" \"$@\" 2>>\"$FLOG\"\n",
     )
     .unwrap();
@@ -1420,14 +1410,25 @@ pub fn write_firefox_default_prefs(rootfs: &Path) {
               pref(\"browser.cache.disk.enable\", false);\n\
               pref(\"browser.cache.disk.smart_size.enabled\", false);\n\
               pref(\"browser.cache.disk.capacity\", 0);\n\
-              // No hardware video decoder and a CPU-only compositor: make\n\
+              // Cap the memory cache so a long session cannot eat the live\n\
+              // image; 96 MiB is enough for a few tabs under software WR.\n\
+              pref(\"browser.cache.memory.capacity\", 98304);\n\
+              // Prefer GPU WebRender when the session exposes zink+NVK; the\n\
+              // eclipse-firefox wrapper forces software when there is no GPU.\n\
+              pref(\"gfx.webrender.all\", true);\n\
+              pref(\"layers.acceleration.force-enabled\", true);\n\
+              // No hardware video decoder on many Eclipse builds: make\n\
               // YouTube and other MSE players pick H.264 (system libavcodec)\n\
               // over AV1 and VP9, the costliest codecs to decode in software.\n\
+              pref(\"media.hardware-video-decoding.enabled\", false);\n\
               pref(\"media.av1.enabled\", false);\n\
               pref(\"media.mediasource.vp9.enabled\", false);\n\
               // QUIC over a 64 KiB UDP socket drops packets when the CPU is\n\
               // busy; HTTP/2 over TCP carries the same streams.\n\
-              pref(\"network.http.http3.enable\", false);\n",
+              pref(\"network.http.http3.enable\", false);\n\
+              // Session store less often: each write is msync + profile IO on\n\
+              // a RAM rootfs that still pays the syscall path.\n\
+              pref(\"browser.sessionstore.interval\", 60000);\n",
         )
         .unwrap();
     }
@@ -2688,48 +2689,38 @@ fn write_labwc_wrapper(rootfs: &Path) {
           # over a missing cursor ioctl and burned a core idle; leave the var\n\
           # unset unless a caller overrides it for debugging.\n\
           # Renderer, by the SAME two-condition gate as the kernel,\n\
-          # /etc/profile and eclipse-init's build_child_env: hardware GL only\n\
-          # when an NVIDIA GPU AND the nvidia.nouveau_uapi flag are both present\n\
-          # (that flag is what turns the kernel's nouveau uAPI on). Current\n\
-          # real-hardware status: the default zink/NVK compositor path still dies\n\
-          # with repeated 'failed to create timeline semaphore', so the DEFAULT\n\
-          # session stays on the proven software path. Opt into wlroots' GPU\n\
-          # renderer explicitly with:\n\
-          #   * nvidia.wlr_gles2   -> GLES2 on zink+NVK\n\
-          #   * nvidia.wlr_vulkan -> native Vulkan/NVK\n\
-          # Otherwise use pixman for labwc and software GL for clients. Every var\n\
+          # /etc/profile and eclipse-init's build_child_env: hardware GL when an\n\
+          # NVIDIA GPU AND nvidia.nouveau_uapi are both present (that flag turns\n\
+          # the kernel's nouveau uAPI on). Default session: GLES2 on zink+NVK.\n\
+          # Kill-switch: nvidia.wlr_pixman. Native Vulkan: nvidia.wlr_vulkan.\n\
+          # nvidia.wlr_gles2 remains accepted (same as the default). Every var\n\
           # uses `:=` so a caller override -- or what /etc/profile already\n\
           # exported on a login chain -- wins.\n\
           if grep -q 'nvidia\\.nouveau_uapi' /proc/cmdline 2>/dev/null && \\\n\
           \x20\x20 [ \"$(tr -d '[:space:]' < /sys/class/drm/card0/device/vendor 2>/dev/null)\" = \"0x10de\" ]; then\n\
-          \x20 if grep -q 'nvidia\\.wlr_vulkan' /proc/cmdline 2>/dev/null; then\n\
+          \x20 if grep -q 'nvidia\\.wlr_pixman' /proc/cmdline 2>/dev/null; then\n\
+          \x20\x20 : \"${WLR_RENDERER:=pixman}\"; export WLR_RENDERER\n\
+          \x20\x20 : \"${WLR_RENDERER_ALLOW_SOFTWARE:=1}\"; export WLR_RENDERER_ALLOW_SOFTWARE\n\
+          \x20\x20 : \"${LIBGL_ALWAYS_SOFTWARE:=1}\"; export LIBGL_ALWAYS_SOFTWARE\n\
+          \x20\x20 : \"${SDL_RENDER_DRIVER:=software}\"; export SDL_RENDER_DRIVER\n\
+          \x20\x20 : \"${SDL_FRAMEBUFFER_ACCELERATION:=0}\"; export SDL_FRAMEBUFFER_ACCELERATION\n\
+          \x20 elif grep -q 'nvidia\\.wlr_vulkan' /proc/cmdline 2>/dev/null; then\n\
           \x20\x20 : \"${WLR_RENDERER:=vulkan}\"; export WLR_RENDERER\n\
-          \x20\x20 : \"${WLR_DRM_NO_MODIFIERS:=1}\"; export WLR_DRM_NO_MODIFIERS\n\
-          \x20\x20 : \"${GALLIUM_DRIVER:=zink}\"; export GALLIUM_DRIVER\n\
-          \x20\x20 : \"${MESA_LOADER_DRIVER_OVERRIDE:=zink}\"; export MESA_LOADER_DRIVER_OVERRIDE\n\
-          \x20\x20 # SDL on the GPU sessions: GLES2 renderer (SDL2 has no Vulkan\n\
-          \x20\x20 # renderer; GLES2 lands on zink+NVK, the same stack as labwc).\n\
-          \x20\x20 : \"${SDL_RENDER_DRIVER:=opengles2}\"; export SDL_RENDER_DRIVER\n\
-          \x20\x20 : \"${SDL_FRAMEBUFFER_ACCELERATION:=opengles2}\"; export SDL_FRAMEBUFFER_ACCELERATION\n\
-          \x20 elif grep -q 'nvidia\\.wlr_gles2' /proc/cmdline 2>/dev/null; then\n\
-          \x20\x20 : \"${WLR_RENDERER:=gles2}\"; export WLR_RENDERER\n\
           \x20\x20 : \"${WLR_DRM_NO_MODIFIERS:=1}\"; export WLR_DRM_NO_MODIFIERS\n\
           \x20\x20 : \"${GALLIUM_DRIVER:=zink}\"; export GALLIUM_DRIVER\n\
           \x20\x20 : \"${MESA_LOADER_DRIVER_OVERRIDE:=zink}\"; export MESA_LOADER_DRIVER_OVERRIDE\n\
           \x20\x20 : \"${SDL_RENDER_DRIVER:=opengles2}\"; export SDL_RENDER_DRIVER\n\
           \x20\x20 : \"${SDL_FRAMEBUFFER_ACCELERATION:=opengles2}\"; export SDL_FRAMEBUFFER_ACCELERATION\n\
           \x20 else\n\
-          \x20\x20 : \"${WLR_RENDERER:=pixman}\"; export WLR_RENDERER\n\
-          \x20\x20 : \"${WLR_RENDERER_ALLOW_SOFTWARE:=1}\"; export WLR_RENDERER_ALLOW_SOFTWARE\n\
-          \x20\x20 : \"${LIBGL_ALWAYS_SOFTWARE:=1}\"; export LIBGL_ALWAYS_SOFTWARE\n\
-          \x20\x20 # SDL on the pixman session: software renderer, and no GL\n\
-          \x20\x20 # behind SDL_GetWindowSurface (SDL3 then blits over wl_shm like\n\
-          \x20\x20 # foot; SDL2 still presents through EGL, which is llvmpipe here).\n\
-          \x20\x20 : \"${SDL_RENDER_DRIVER:=software}\"; export SDL_RENDER_DRIVER\n\
-          \x20\x20 : \"${SDL_FRAMEBUFFER_ACCELERATION:=0}\"; export SDL_FRAMEBUFFER_ACCELERATION\n\
+          \x20\x20 # Default GPU path (and nvidia.wlr_gles2): GLES2 on zink+NVK.\n\
+          \x20\x20 : \"${WLR_RENDERER:=gles2}\"; export WLR_RENDERER\n\
+          \x20\x20 : \"${WLR_DRM_NO_MODIFIERS:=1}\"; export WLR_DRM_NO_MODIFIERS\n\
+          \x20\x20 : \"${GALLIUM_DRIVER:=zink}\"; export GALLIUM_DRIVER\n\
+          \x20\x20 : \"${MESA_LOADER_DRIVER_OVERRIDE:=zink}\"; export MESA_LOADER_DRIVER_OVERRIDE\n\
+          \x20\x20 : \"${SDL_RENDER_DRIVER:=opengles2}\"; export SDL_RENDER_DRIVER\n\
+          \x20\x20 : \"${SDL_FRAMEBUFFER_ACCELERATION:=opengles2}\"; export SDL_FRAMEBUFFER_ACCELERATION\n\
           \x20 fi\n\
-          elif grep -q 'nvidia\\.nouveau_uapi' /proc/cmdline 2>/dev/null && \\
-\
+          elif grep -q 'nvidia\\.nouveau_uapi' /proc/cmdline 2>/dev/null && \\\n\
           \x20\x20 [ -r /sys/class/drm/card0/device/vendor ]; then\n\
           \x20 # The flag but NO NVIDIA card: the GL=1 image under QEMU, whose\n\
           \x20 # virtio-gpu is 2D-only. Hardware GL cannot exist here, and\n\
@@ -2919,9 +2910,12 @@ mod tests {
                 fs::read_to_string(dir.join(app).join("defaults/pref/eclipse-os.js")).unwrap();
             for line in [
                 "pref(\"browser.cache.disk.enable\", false);\n",
+                "pref(\"browser.cache.memory.capacity\", 98304);\n",
+                "pref(\"gfx.webrender.all\", true);\n",
                 "pref(\"media.av1.enabled\", false);\n",
                 "pref(\"media.mediasource.vp9.enabled\", false);\n",
                 "pref(\"network.http.http3.enable\", false);\n",
+                "pref(\"browser.sessionstore.interval\", 60000);\n",
             ] {
                 assert!(prefs.contains(line), "{pkg}: missing {line:?} in\n{prefs}");
             }
@@ -2970,6 +2964,14 @@ mod tests {
         );
         assert!(ff.contains("(apk add firefox-esr)"));
         assert!(ff.contains("export MOZ_ENABLE_WAYLAND=1\n"));
+        assert!(
+            ff.contains("MOZ_ACCELERATED=1"),
+            "GPU path must enable MOZ_ACCELERATED"
+        );
+        assert!(
+            ff.contains("nvidia.wlr_pixman"),
+            "software kill-switch must be mentioned"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -3613,8 +3615,10 @@ mod tests {
         // Every machine and boot this image supports, with the renderer each
         // one must land on. The third row is the one that diverged.
         let cases: &[(&str, Option<&str>, &str)] = &[
-            // an RTX booted with the kernel uAPI on, no explicit opt-in
-            ("nvidia.nouveau_uapi", NVIDIA, "pixman"),
+            // an RTX with nouveau_uapi: GLES2/zink is the default GPU path
+            ("nvidia.nouveau_uapi", NVIDIA, "gles2"),
+            // kill-switch back to pixman
+            ("nvidia.nouveau_uapi:nvidia.wlr_pixman", NVIDIA, "pixman"),
             // an RTX booted without it: the DRM node is not nouveau at all
             ("LOG=warn", NVIDIA, "pixman"),
             // the GL=1 image under QEMU: the flag, but no NVIDIA card
@@ -3624,7 +3628,7 @@ mod tests {
             // no card0 at all
             ("nvidia.nouveau_uapi", None, "pixman"),
             ("LOG=warn", None, "pixman"),
-            // the explicit GPU opt-ins, which only apply on a real NVIDIA card
+            // explicit Vulkan; gles2 flag is redundant with the default
             ("nvidia.nouveau_uapi:nvidia.wlr_gles2", NVIDIA, "gles2"),
             ("nvidia.nouveau_uapi:nvidia.wlr_vulkan", NVIDIA, "vulkan"),
         ];

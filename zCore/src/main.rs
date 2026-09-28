@@ -556,8 +556,10 @@ fn primary_main(config: kernel_hal::KernelConfig) {
                 Some("nvidia.cepresent")
             } else if cmdline_has("nvidia.wlr_vulkan") {
                 Some("nvidia.wlr_vulkan")
-            } else if cmdline_has("nvidia.wlr_gles2") {
-                Some("nvidia.wlr_gles2")
+            } else if cmdline_has("nvidia.wlr_gles2") || cmdline_has("nvidia.nouveau_uapi") {
+                // GLES2/zink is the default session with nouveau_uapi; CE
+                // present avoids the CPU blit under that path.
+                Some("nvidia.nouveau_uapi (GPU compositor)")
             } else if ce_ready {
                 Some("auto: compute GPU ready")
             } else {
@@ -587,16 +589,22 @@ fn primary_main(config: kernel_hal::KernelConfig) {
                      tras escritorio; si sube, el present pasa a su propio copy engine"
                 );
             }
-            // Opt-in CE present on DRM page_flip (GOP via copy-engine). Default
-            // off; does not claim hardware KMS. Pair with CE present / dual-GPU
-            // bring-up for best results.
-            if kernel_hal::cmdline::flag(&options.cmdline, "nvidia.hwflip") {
+            // Opt-in CE present on DRM page_flip (GOP via copy-engine). Also
+            // auto-on with nouveau_uapi (GPU compositor default) unless
+            // `nvidia.nohwflip`. Pair with CE present / dual-GPU bring-up.
+            if cmdline_has("nvidia.hwflip")
+                || (cmdline_has("nvidia.nouveau_uapi") && !cmdline_has("nvidia.nohwflip"))
+            {
                 kernel_hal::drivers::set_hwflip_enabled(true);
                 klog_info!(
                     "Eclipse: nvidia.hwflip ON — page_flip intentará CE present al GOP"
                 );
             }
-            if kernel_hal::cmdline::flag(&options.cmdline, "nvidia.surfaceflip") {
+            // NVC57E ISO surfaceflip: auto with nouveau_uapi (scanout from
+            // VRAM without CPU blit) unless `nvidia.nosurfaceflip`.
+            if cmdline_has("nvidia.surfaceflip")
+                || (cmdline_has("nvidia.nouveau_uapi") && !cmdline_has("nvidia.nosurfaceflip"))
+            {
                 kernel_hal::drivers::set_surfaceflip_enabled(true);
                 klog_info!(
                     "Eclipse: nvidia.surfaceflip ON — page_flip intentará NVC57E ISO (VRAM)"
