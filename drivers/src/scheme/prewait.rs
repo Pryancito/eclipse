@@ -124,6 +124,24 @@ pub fn record(kind: Kind, us: u64, probes: u32, timed_out: bool) {
     }
 }
 
+/// Zero every counter.
+///
+/// Test-only: the table is cumulative since boot on purpose -- two reads of
+/// `/proc/gpudbg` subtracted are how a run is measured -- so nothing in the
+/// kernel clears it. A test wants to assert what it recorded and not what ran
+/// before it.
+#[cfg(test)]
+pub fn reset() {
+    for s in STATS.iter() {
+        s.calls.store(0, Ordering::Relaxed);
+        s.parked.store(0, Ordering::Relaxed);
+        s.parked_us.store(0, Ordering::Relaxed);
+        s.max_us.store(0, Ordering::Relaxed);
+        s.probes.store(0, Ordering::Relaxed);
+        s.timeouts.store(0, Ordering::Relaxed);
+    }
+}
+
 /// The pre-wait table for the `/proc/gpudbg` profile, one line per kind that
 /// has been called, plus a header. Empty when nothing has blocked at all.
 pub fn profile_lines() -> alloc::string::String {
@@ -171,28 +189,27 @@ mod tests {
 
     use super::*;
 
-    /// The counters are global, so two of these tests running at once would
-    /// read each other's increments between their own before and after.
+    /// The counters are global, so a test zeroes them and reads them back
+    /// under one lock: `reset` on its own would still race another test's
+    /// `record`.
     fn test_lock() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+        let g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        reset();
+        g
     }
 
-    /// The counters are global and cumulative, so a test reads a kind's line
-    /// before and after rather than assuming it starts at zero.
-    fn line_of(kind: Kind) -> alloc::string::String {
+    /// The six numbers of a kind's line, in the order they are printed.
+    fn row(kind: Kind) -> alloc::vec::Vec<u64> {
         profile_lines()
             .lines()
             .find(|l| l.contains(kind.name()))
-            .map(alloc::string::String::from)
+            .map(|l| {
+                l.split_whitespace()
+                    .filter_map(|w| w.parse::<u64>().ok())
+                    .collect()
+            })
             .unwrap_or_default()
-    }
-
-    fn nth_number(line: &str, n: usize) -> u64 {
-        line.split_whitespace()
-            .filter_map(|w| w.parse::<u64>().ok())
-            .nth(n)
-            .unwrap_or(0)
     }
 
     /// A wait that never parked is still a call, and it adds nothing to the
@@ -202,41 +219,18 @@ mod tests {
     #[test]
     fn a_wait_that_did_not_park_counts_as_a_call_and_no_time() {
         let _g = test_lock();
-        let before = line_of(Kind::AtomicInFence);
-        let (calls, parked, us) = (
-            nth_number(&before, 0),
-            nth_number(&before, 1),
-            nth_number(&before, 2),
-        );
         record(Kind::AtomicInFence, 0, 0, false);
-        let after = line_of(Kind::AtomicInFence);
-        assert_eq!(nth_number(&after, 0), calls + 1, "the call was not counted");
-        assert_eq!(nth_number(&after, 1), parked, "it was counted as parked");
-        assert_eq!(nth_number(&after, 2), us, "it added parked microseconds");
+        assert_eq!(row(Kind::AtomicInFence), alloc::vec![1, 0, 0, 0, 0, 0]);
     }
 
     /// A park is counted once, its microseconds summed and its longest kept.
     #[test]
     fn a_park_adds_its_time_its_probes_and_raises_the_maximum() {
         let _g = test_lock();
-        let before = line_of(Kind::CpuPrep);
-        let (calls, parked, us, probes) = (
-            nth_number(&before, 0),
-            nth_number(&before, 1),
-            nth_number(&before, 2),
-            nth_number(&before, 4),
-        );
         record(Kind::CpuPrep, 700, 3, false);
         record(Kind::CpuPrep, 4_000, 9, false);
-        let after = line_of(Kind::CpuPrep);
-        assert_eq!(nth_number(&after, 0), calls + 2);
-        assert_eq!(nth_number(&after, 1), parked + 2);
-        assert_eq!(nth_number(&after, 2), us + 4_700);
-        assert!(
-            nth_number(&after, 3) >= 4_000,
-            "the longest park was not kept"
-        );
-        assert_eq!(nth_number(&after, 4), probes + 12);
+        // calls, parked, parked_us, max_us, probes, timeouts
+        assert_eq!(row(Kind::CpuPrep), alloc::vec![2, 2, 4_700, 4_000, 12, 0]);
     }
 
     /// A wait that woke, looked and went back to sleep without the clock
@@ -246,12 +240,8 @@ mod tests {
     #[test]
     fn a_park_the_clock_did_not_see_is_still_a_park() {
         let _g = test_lock();
-        let before = line_of(Kind::PresentFence);
-        let parked = nth_number(&before, 1);
         record(Kind::PresentFence, 0, 5, false);
-        let after = line_of(Kind::PresentFence);
-        assert_eq!(nth_number(&after, 1), parked + 1);
-        assert_eq!(nth_number(&after, 4), nth_number(&before, 4) + 5);
+        assert_eq!(row(Kind::PresentFence), alloc::vec![1, 1, 0, 0, 5, 0]);
     }
 
     /// A park that ran out its deadline is counted apart: it is the shape of
@@ -259,31 +249,50 @@ mod tests {
     #[test]
     fn a_park_that_timed_out_is_counted_apart() {
         let _g = test_lock();
-        let before = line_of(Kind::WaitVblank);
-        let timeouts = nth_number(&before, 5);
         record(Kind::WaitVblank, 100_000, 120, true);
-        let after = line_of(Kind::WaitVblank);
-        assert_eq!(nth_number(&after, 5), timeouts + 1);
+        assert_eq!(
+            row(Kind::WaitVblank),
+            alloc::vec![1, 1, 100_000, 100_000, 120, 1]
+        );
     }
 
-    /// Every kind is printed under its own name, and every kind is in `ALL`.
-    /// A kind left out of `ALL` would be recorded and never shown.
+    /// Nothing has blocked, so there is no table at all -- an empty one would
+    /// be six columns of zeros between the reader and the numbers that matter.
+    #[test]
+    fn a_kernel_where_nothing_blocked_prints_no_table() {
+        let _g = test_lock();
+        assert!(profile_lines().is_empty());
+        record(Kind::SyncobjWait, 1, 1, false);
+        assert!(!profile_lines().is_empty());
+    }
+
+    /// Every kind is printed under its own name, and every kind is in `ALL`
+    /// at its own index. A kind left out would be recorded and never shown;
+    /// one at the wrong index would be recorded into another kind's counters.
     #[test]
     fn every_kind_is_listed_and_named_once() {
         let _g = test_lock();
         assert_eq!(Kind::ALL.len(), 5);
         for (i, &k) in Kind::ALL.iter().enumerate() {
             assert_eq!(k as usize, i, "{:?} is not at its own index", k);
-            record(k, 1, 1, false);
+            // A distinct probe count per kind, so a line reading another
+            // kind's counters is visible rather than merely equal.
+            record(k, 0, i as u32 + 1, false);
         }
         let out = profile_lines();
-        for &k in Kind::ALL.iter() {
+        for (i, &k) in Kind::ALL.iter().enumerate() {
             assert_eq!(
                 out.matches(k.name()).count(),
                 1,
                 "{} is not printed exactly once:\n{}",
                 k.name(),
                 out
+            );
+            assert_eq!(
+                row(k),
+                alloc::vec![1, 1, 0, 0, i as u64 + 1, 0],
+                "{} is reporting another kind's counters",
+                k.name()
             );
         }
     }
