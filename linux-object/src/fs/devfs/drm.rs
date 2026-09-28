@@ -3544,6 +3544,12 @@ pub fn rmfb_disabling_for(fb_id: u32, pid: u64) -> bool {
             if on_crtc {
                 set_crtc_blanked(true);
                 set_crtc_enabled(false);
+                // `atomic_remove_fb` on the primary plane's fb: the CRTC's
+                // mode is set to NULL and `active` to false, which is what
+                // `MODE_ID`, `ACTIVE` and the connector's `CRTC_ID` read back
+                // from now on. Only the legacy flags went off here, so the
+                // atomic readback still described a lit pipe.
+                legacy_pipe_off();
             }
             true
         }
@@ -6910,6 +6916,73 @@ pub fn atomic_snapshot() -> (AtomicKmsState, u32) {
     (state.atomic, state.crtc_fb)
 }
 
+/// Make `data` the CRTC's current mode, in the kernel-owned blob `MODE_ID`
+/// reads back (`drm_atomic_set_mode_for_crtc` creates one of its own from the
+/// mode it is handed). Reuses the blob already there so the id is stable
+/// across modesets; creates it the first time.
+fn set_mode_blob_locked(state: &mut DrmState, data: Vec<u8>) {
+    let cur_id = state.atomic.mode_blob_id;
+    if let Some(existing) = state.blobs.iter_mut().find(|b| b.id == cur_id) {
+        existing.data = data;
+    } else {
+        let id = state.next_blob_id;
+        state.next_blob_id += 1;
+        state.blobs.push(DrmBlob {
+            id,
+            user_created: false,
+            owner: 0,
+            data,
+        });
+        state.atomic.mode_blob_id = id;
+    }
+}
+
+/// A legacy `SETCRTC` with a mode, as `__drm_atomic_helper_set_config` commits
+/// it: on an atomic driver there is one state, and the legacy ioctls write
+/// the same `crtc_state`/`plane_state` the atomic uAPI reads back. The CRTC
+/// ends enabled (this mode) and active, and the primary plane covers it from
+/// `(x, y)` of the fb: `crtc_x/y = 0`, `crtc_w/h = hdisplay/vdisplay`,
+/// `src_x/y = x << 16 / y << 16`, `src_w/h = hdisplay << 16 / vdisplay << 16`
+/// (no rotation on this pipeline). None of it was written: a legacy
+/// compositor's pipe read back as `ACTIVE = 0`, `MODE_ID = 0`, no connector
+/// routed and a plane at (0, 0) of size 0, and `GETCRTC` answered `x = y = 0`
+/// whatever `SETCRTC` had scrolled to -- Xorg's modesetting seeds each CRTC's
+/// position from exactly that readback.
+pub fn legacy_set_config(mode: &[u8; 68], (w, h): (u32, u32), (x, y): (u32, u32)) {
+    let mut state = DRM_STATE.lock();
+    set_mode_blob_locked(&mut state, mode.to_vec());
+    let a = &mut state.atomic;
+    a.active = true;
+    a.crtc_x = 0;
+    a.crtc_y = 0;
+    a.crtc_w = w;
+    a.crtc_h = h;
+    a.src_x = x << 16;
+    a.src_y = y << 16;
+    a.src_w = w << 16;
+    a.src_h = h << 16;
+}
+
+/// The CRTC half of a legacy `SETCRTC` without a mode, and of removing the
+/// framebuffer a primary plane shows (`atomic_remove_fb`): the mode goes
+/// (`drm_atomic_set_mode_for_crtc(NULL)`) and `active` with it. The plane's
+/// rectangles stay as they were, as Linux leaves `plane_state` when only its
+/// crtc and fb are cleared.
+pub fn legacy_pipe_off() {
+    let mut state = DRM_STATE.lock();
+    state.atomic.mode_blob_id = 0;
+    state.atomic.active = false;
+}
+
+/// A legacy `SETPLANE` with an fb, as `drm_atomic_helper_update_plane` commits
+/// it: all eight rectangles from the request, `src_*` in 16.16 as given.
+pub fn legacy_update_plane(crtc: (i32, i32, u32, u32), src: (u32, u32, u32, u32)) {
+    let mut state = DRM_STATE.lock();
+    let a = &mut state.atomic;
+    (a.crtc_x, a.crtc_y, a.crtc_w, a.crtc_h) = crtc;
+    (a.src_x, a.src_y, a.src_w, a.src_h) = src;
+}
+
 /// Staged property updates parsed from one `DRM_IOCTL_MODE_ATOMIC` request
 /// against the synthetic (software-KMS) pipeline. `None` = property not in
 /// the request; object state not touched persists across commits, as the
@@ -7351,20 +7424,7 @@ pub fn atomic_commit(
                 // may DESTROYPROPBLOB its own right after the commit (wlroots
                 // does), and MODE_ID readback must survive that.
                 set_vblank_period_from_modeinfo(&data);
-                let cur_id = state.atomic.mode_blob_id;
-                if let Some(existing) = state.blobs.iter_mut().find(|b| b.id == cur_id) {
-                    existing.data = data;
-                } else {
-                    let id = state.next_blob_id;
-                    state.next_blob_id += 1;
-                    state.blobs.push(DrmBlob {
-                        id,
-                        user_created: false,
-                        owner: 0,
-                        data,
-                    });
-                    state.atomic.mode_blob_id = id;
-                }
+                set_mode_blob_locked(&mut state, data);
             }
         }
         if let Some(a) = upd.active {
@@ -7896,12 +7956,16 @@ pub fn get_crtc(id: u32) -> Option<DrmCrtc> {
         return None;
     }
     display_mode()?;
-    let fb_id = DRM_STATE.lock().crtc_fb;
+    // `drm_mode_getcrtc` on an atomic driver: `x`/`y` are the primary plane's
+    // `src_x >> 16`/`src_y >> 16`, which is where the last SETCRTC (or
+    // SETPLANE, or atomic commit) put the plane in its fb. These were 0
+    // whatever had been set.
+    let state = DRM_STATE.lock();
     Some(DrmCrtc {
         id: SYNTH_CRTC_ID,
-        fb_id,
-        x: 0,
-        y: 0,
+        fb_id: state.crtc_fb,
+        x: state.atomic.src_x >> 16,
+        y: state.atomic.src_y >> 16,
     })
 }
 
