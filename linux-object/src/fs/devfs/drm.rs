@@ -1513,7 +1513,11 @@ impl DrmFileState {
             magic: AtomicU32::new(0),
         });
         if minor != NO_MINOR {
-            master_open(minor, Arc::as_ptr(&file) as usize);
+            let owner = Arc::as_ptr(&file) as usize;
+            master_open(minor, owner);
+            if current_is_root() {
+                authenticate(minor, owner);
+            }
         }
         file
     }
@@ -1700,7 +1704,59 @@ pub fn master_open(minor: u32, file: usize) {
     let mut state = DRM_STATE.lock();
     if !state.masters.iter().any(|(m, _)| *m == minor) {
         state.masters.push((minor, file));
+        authenticate_locked(&mut state, minor, file);
     }
+}
+
+/// `drm_file.authenticated`: whether `file` may issue the `DRM_AUTH`
+/// ioctls, and what `GET_CLIENT` answers in `auth`. See
+/// [`DrmState::authenticated`] for who gets it.
+pub fn is_authenticated(minor: u32, file: usize) -> bool {
+    DRM_STATE
+        .lock()
+        .authenticated
+        .iter()
+        .any(|&(m, f)| m == minor && f == file)
+}
+
+fn authenticate(minor: u32, file: usize) {
+    authenticate_locked(&mut DRM_STATE.lock(), minor, file);
+}
+
+fn authenticate_locked(state: &mut DrmState, minor: u32, file: usize) {
+    if !state
+        .authenticated
+        .iter()
+        .any(|&(m, f)| m == minor && f == file)
+    {
+        state.authenticated.push((minor, file));
+    }
+}
+
+/// `capable(CAP_SYS_ADMIN)` of the thread opening the node: `false` when
+/// there is no Linux process behind it (a kernel-internal open has no
+/// credentials to be root with).
+pub(super) fn current_is_root() -> bool {
+    #[cfg(test)]
+    if TEST_ROOT.load(Ordering::Relaxed) {
+        return true;
+    }
+    use crate::process::ProcessExt;
+    kernel_hal::thread::get_current_thread()
+        .and_then(|t| t.downcast::<zircon_object::task::Thread>().ok())
+        .and_then(|t| t.proc().try_linux().map(|p| p.euid() == 0))
+        .unwrap_or(false)
+}
+
+/// Tests have no current thread, so they are never root: this makes the
+/// next opens root's (`drm_file_alloc` authenticates them) and the
+/// `DRM_ROOT_ONLY` ioctls answer. Take [`test_globals::lock`] around it.
+#[cfg(test)]
+static TEST_ROOT: AtomicBool = AtomicBool::new(false);
+
+#[cfg(test)]
+pub(super) fn set_test_root(root: bool) {
+    TEST_ROOT.store(root, Ordering::Relaxed);
 }
 
 /// Whether `file` is the current master of `minor`
@@ -1722,6 +1778,7 @@ pub fn set_master(minor: u32, file: usize) -> Result<(), MasterError> {
         Some(_) => Err(MasterError::Busy),
         None => {
             state.masters.push((minor, file));
+            authenticate_locked(&mut state, minor, file);
             Ok(())
         }
     }
@@ -1754,11 +1811,20 @@ fn magic_device(minor: u32) -> u32 {
 pub fn auth_magic(minor: u32, magic: u32) -> bool {
     let mut state = DRM_STATE.lock();
     let device = magic_device(minor);
-    let before = state.magics.len();
+    let Some(&(_, _, owner)) = state
+        .magics
+        .iter()
+        .find(|&&(d, g, _)| d == device && g == magic)
+    else {
+        return false;
+    };
+    // `file->authenticated = 1` on the magic's owner, then the magic is
+    // spent (`idr_replace(.., NULL, ..)`).
+    authenticate_locked(&mut state, minor, owner);
     state
         .magics
         .retain(|&(d, g, _)| !(d == device && g == magic));
-    state.magics.len() != before
+    true
 }
 
 /// One `drm_master` a `CREATE_LEASE` made: its `lessee_id` in the lessor's
@@ -1847,6 +1913,9 @@ fn master_release(minor: u32, file: usize) {
     let mut state = DRM_STATE.lock();
     state.masters.retain(|&(m, f)| !(m == minor && f == file));
     state.magics.retain(|&(_, _, f)| f != file);
+    state
+        .authenticated
+        .retain(|&(m, f)| !(m == minor && f == file));
 }
 
 /// Return the primary framebuffer display, if any.
@@ -1998,6 +2067,13 @@ struct DrmState {
     magics: Vec<(u32, u32, usize)>,
     /// `drm_getmagic`'s idr: magics start at 1.
     next_magic: u32,
+    /// `drm_file.authenticated` of every open, as `(minor, file)`: set for
+    /// the open that takes the master (`drm_new_set_master`), for the
+    /// owner of a magic the master `AUTH_MAGIC`s (`drm_authmagic`) and for
+    /// an open made by root (`drm_file_alloc`: "for compatibility root is
+    /// always authenticated"); gone with the file. What `GET_CLIENT`
+    /// reports and the `DRM_AUTH` ioctls require.
+    authenticated: Vec<(u32, usize)>,
     /// `drm_master.lessee_idr` of every node's master: the leases
     /// `CREATE_LEASE` made, each with the object ids it holds. See
     /// [`lease_create`].
@@ -2163,6 +2239,7 @@ lazy_static::lazy_static! {
         masters: Vec::new(),
         magics: Vec::new(),
         next_magic: 1,
+        authenticated: Vec::new(),
         leases: Vec::new(),
         atomic: AtomicKmsState::default(),
     });

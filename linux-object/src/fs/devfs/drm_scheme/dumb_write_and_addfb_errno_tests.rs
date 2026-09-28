@@ -17,7 +17,10 @@ fn destroypropblob_of_a_kernel_blob_is_eperm_to_userspace() {
 }
 
 #[test]
-fn get_client_zero_is_self_and_one_is_enoent() {
+fn get_client_zero_is_self_and_one_is_einval() {
+    // Under the lock this open takes the master, and the master is
+    // authenticated (`drm_new_set_master`).
+    let _serialised = drm::test_globals::lock();
     let c = Client::open(0);
     let mut client = DrmClient {
         idx: 0,
@@ -30,10 +33,11 @@ fn get_client_zero_is_self_and_one_is_enoent() {
     assert_eq!(c.ioctl(DRM_IOCTL_GET_CLIENT, &mut client), Ok(0));
     assert_eq!(client.auth, 1);
     assert_eq!(client.magic, 0);
+    // `drm_getclient`: any idx but 0 is EINVAL, what stops an enumerator.
     client.idx = 1;
     assert_eq!(
         c.ioctl(DRM_IOCTL_GET_CLIENT, &mut client),
-        Err(FsError::EntryNotFound)
+        Err(FsError::InvalidParam)
     );
 }
 

@@ -160,6 +160,22 @@ impl DrmDev {
         Arc::as_ptr(&self.file) as usize
     }
 
+    /// `drm_ioctl_permit` for the hollowed legacy ioctls, in its order:
+    /// `DRM_ROOT_ONLY` wants `capable(CAP_SYS_ADMIN)` (EACCES), `DRM_AUTH`
+    /// wants an authenticated open or a render client (EACCES). `DRM_MASTER`
+    /// is not enforced on any ioctl here, and a render client's own
+    /// refusal (`!DRM_RENDER_ALLOW`) is observed, not enforced, at the top
+    /// of the dispatch.
+    fn legacy_permit(&self, root_only: bool) -> Result<()> {
+        if root_only && !drm::current_is_root() {
+            return Err(FsError::NoPermission);
+        }
+        if self.minor < 128 && !drm::is_authenticated(self.minor, self.file_owner()) {
+            return Err(FsError::NoPermission);
+        }
+        Ok(())
+    }
+
     /// `drm_mode_obj_set_property_ioctl`, which `SETPROPERTY` also goes
     /// through: the object, of the type the caller named (ENOENT); a
     /// property that object carries (EINVAL, and an encoder carries none);
@@ -1124,24 +1140,6 @@ impl DrmDev {
                 unsafe { *(data as *mut u32) = self.file.magic() };
                 Ok(0)
             }
-            DRM_IOCTL_GET_CLIENT => {
-                // `struct drm_client`: libva enumerates clients at init.
-                // Single-client stub: idx 0 is this open; anything else ENOENT.
-                // Linux's `drm_getclient` always reports `magic = 0` ("do not
-                // return authenticating magic index"). Returning 1 made a
-                // client AUTH_MAGIC a number nobody had minted — or, worse,
-                // spend the first real GET_MAGIC on this boot.
-                let c = unsafe { &mut *(data as *mut DrmClient) };
-                if c.idx != 0 {
-                    return Err(FsError::EntryNotFound);
-                }
-                c.auth = 1;
-                c.pid = drm::current_pid() as usize;
-                c.uid = 0;
-                c.magic = 0;
-                c.iocs = 0;
-                Ok(0)
-            }
             DRM_IOCTL_AUTH_MAGIC => {
                 // `DRM_MASTER` ioctl: only the master authenticates
                 // (EACCES), and only a magic a file of this device holds
@@ -1164,6 +1162,56 @@ impl DrmDev {
                     }
                     Err(FsError::InvalidParam)
                 }
+            }
+            DRM_IOCTL_GET_CLIENT => {
+                // `drm_getclient`, hollowed out: only `idx == 0` answers,
+                // and what it answers is this open's `authenticated` (which
+                // is what libva's `va_drm_is_authenticated` walks the list
+                // for), the caller's pid, `overflowuid`, and a zero magic
+                // and iocs. Any other idx is EINVAL, which is what stops
+                // an enumerator. This and the rest of the hollowed core
+                // ioctls were unknown numbers (ENOSYS).
+                let c = unsafe { &mut *(data as *mut DrmClient) };
+                if c.idx != 0 {
+                    return Err(FsError::InvalidParam);
+                }
+                c.auth = drm::is_authenticated(self.minor, self.file_owner()) as i32;
+                c.pid = drm::current_pid();
+                c.uid = OVERFLOW_UID;
+                c.magic = 0;
+                c.iocs = 0;
+                Ok(0)
+            }
+            DRM_IOCTL_GET_STATS => {
+                // `drm_getstats`: zeroes the struct "to prevent userspace
+                // from eating its stack garbage", nothing else.
+                unsafe { core::ptr::write_bytes(data as *mut u8, 0, DRM_STATS_SIZE) };
+                Ok(0)
+            }
+            DRM_IOCTL_FINISH => {
+                // `drm_noop` under `DRM_AUTH`.
+                self.legacy_permit(false)?;
+                Ok(0)
+            }
+            DRM_IOCTL_SET_UNIQUE => {
+                // `drm_invalid_op` under `DRM_AUTH | DRM_MASTER |
+                // DRM_ROOT_ONLY`: EACCES first, EINVAL for whoever passes.
+                self.legacy_permit(true)?;
+                Err(FsError::InvalidParam)
+            }
+            DRM_IOCTL_BLOCK
+            | DRM_IOCTL_UNBLOCK
+            | DRM_IOCTL_ADD_DRAW
+            | DRM_IOCTL_RM_DRAW
+            | DRM_IOCTL_UPDATE_DRAW => {
+                // `drm_noop` under `DRM_AUTH | DRM_MASTER | DRM_ROOT_ONLY`.
+                self.legacy_permit(true)?;
+                Ok(0)
+            }
+            DRM_IOCTL_MODE_ATTACHMODE | DRM_IOCTL_MODE_DETACHMODE => {
+                // `drm_noop` under `DRM_MASTER`, which the modeset ioctls
+                // do not enforce here (README-drm, "Leases").
+                Ok(0)
             }
             DRM_IOCTL_SET_MASTER => {
                 // `drm_setmaster_ioctl`: the master again is a no-op, another
@@ -3888,18 +3936,35 @@ fn is_syncobj_timeline_wait(cmd: u32) -> bool {
 // DRM IOCTL numbers (Linux x86_64)
 const DRM_IOCTL_VERSION: u32 = 0xC0406400;
 const DRM_IOCTL_GET_UNIQUE: u32 = 0xC0106401;
-const DRM_IOCTL_GET_MAGIC: u32 = 0xC0046402;
+const DRM_IOCTL_GET_MAGIC: u32 = 0x80046402;
 const DRM_IOCTL_AUTH_MAGIC: u32 = 0x40046411;
+// The core ioctls Linux keeps hollowed out for old tools (`drm_ioctl.c`):
+// `GET_CLIENT` and `GET_STATS` answer a fixed shape, `SET_UNIQUE` is
+// `drm_invalid_op`, the rest are `drm_noop` behind their permit flags.
+const DRM_IOCTL_GET_CLIENT: u32 = 0xC0286405;
+const DRM_IOCTL_GET_STATS: u32 = 0x80F86406;
+const DRM_IOCTL_SET_UNIQUE: u32 = 0x40106410;
+const DRM_IOCTL_BLOCK: u32 = 0xC0046412;
+const DRM_IOCTL_UNBLOCK: u32 = 0xC0046413;
+const DRM_IOCTL_ADD_DRAW: u32 = 0xC0046427;
+const DRM_IOCTL_RM_DRAW: u32 = 0xC0046428;
+const DRM_IOCTL_FINISH: u32 = 0x4008642C;
+const DRM_IOCTL_UPDATE_DRAW: u32 = 0x4018643F;
+/// `sizeof(struct drm_stats)` on a 64-bit kernel: what `GET_STATS` zeroes.
+const DRM_STATS_SIZE: usize = 248;
+/// `overflowuid`: the uid `drm_getclient` reports for every client.
+const OVERFLOW_UID: u64 = 65534;
 const DRM_IOCTL_GET_CAP: u32 = 0xC010640C;
 const DRM_IOCTL_SET_CLIENT_CAP: u32 = 0x4010640D;
 const DRM_IOCTL_GEM_CLOSE: u32 = 0x40086409;
-/// `struct drm_client` is 40 bytes on LP64 (`_IOWR('d', 0x0A, …)`).
-const DRM_IOCTL_GET_CLIENT: u32 = 0xC028640A;
 const DRM_IOCTL_SET_MASTER: u32 = 0x0000641E;
 const DRM_IOCTL_DROP_MASTER: u32 = 0x0000641F;
 
 const DRM_IOCTL_MODE_GETRESOURCES: u32 = 0xC04064A0;
 const DRM_IOCTL_MODE_GETCRTC: u32 = 0xC06864A1;
+/// `drm_noop` under `DRM_MASTER` (`struct drm_mode_mode_cmd`, 72 bytes).
+const DRM_IOCTL_MODE_ATTACHMODE: u32 = 0xC04864A8;
+const DRM_IOCTL_MODE_DETACHMODE: u32 = 0xC04864A9;
 const DRM_IOCTL_MODE_SETCRTC: u32 = 0xC06864A2;
 const DRM_IOCTL_MODE_GETENCODER: u32 = 0xC01464A6;
 const DRM_IOCTL_MODE_GETCONNECTOR: u32 = 0xC05064A7;
@@ -4636,6 +4701,19 @@ struct DrmUnique {
     unique: *mut u8,
 }
 
+/// `struct drm_client` (`DRM_IOCTL_GET_CLIENT`): `int idx; int auth;` and
+/// four `unsigned long`s.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+struct DrmClient {
+    idx: i32,
+    auth: i32,
+    pid: u64,
+    uid: u64,
+    magic: u64,
+    iocs: u64,
+}
+
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 struct DrmGetCap {
@@ -5219,18 +5297,6 @@ struct DrmModeCreateBlob {
     blob_id: u32,
 }
 
-/// `struct drm_client` (40 bytes on LP64).
-#[repr(C)]
-#[derive(Debug, Clone, Copy)]
-struct DrmClient {
-    idx: i32,
-    auth: i32,
-    pid: usize,
-    uid: usize,
-    magic: usize,
-    iocs: usize,
-}
-
 // Compile-time guards: each DRM ioctl number encodes `sizeof(struct)` in its
 // _IOC size field, so a wrong struct layout silently mismatches the ioctl and
 // the handler never fires. Assert the sizes that the constants above depend on.
@@ -5252,9 +5318,9 @@ const _: () = {
     assert!(size_of::<DrmModeFbDirtyCmd>() == 24); // DRM_IOCTL_MODE_DIRTYFB 0x..18..
     assert!(size_of::<DrmClipRect>() == 8); // drm_clip_rect, via DIRTYFB's clips_ptr
     assert!(size_of::<DrmSetVersion>() == 16); // DRM_IOCTL_SET_VERSION   0x..10..
+    assert!(size_of::<DrmClient>() == 40); // DRM_IOCTL_GET_CLIENT    0x..28..
     assert!(size_of::<DrmModeAtomic>() == 56); // DRM_IOCTL_MODE_ATOMIC   0x..38..
     assert!(size_of::<DrmModeCreateBlob>() == 16); // CREATEPROPBLOB      0x..10..
-    assert!(size_of::<DrmClient>() == 40); // DRM_IOCTL_GET_CLIENT     0x..28..
     assert!(size_of::<DrmSyncobjCreate>() == 8); // DRM_IOCTL_SYNCOBJ_CREATE   0x..08..
     assert!(size_of::<DrmSyncobjDestroy>() == 8); // DRM_IOCTL_SYNCOBJ_DESTROY  0x..08..
     assert!(size_of::<DrmSyncobjWait>() == 32); // DRM_IOCTL_SYNCOBJ_WAIT     0x..20..
@@ -6673,6 +6739,153 @@ mod addfb2_validation_tests;
 
 #[cfg(test)]
 mod lease_tests;
+
+#[cfg(test)]
+mod legacy_core_tests {
+    //! The hollowed-out core ioctls of `drm_ioctl.c` and the
+    //! `drm_file.authenticated` they answer for or require.
+
+    use super::gl_client_sequence_tests::Client;
+    use super::*;
+
+    fn get_client(c: &Client, idx: i32) -> Result<DrmClient> {
+        let mut req = DrmClient {
+            idx,
+            auth: -1,
+            pid: u64::MAX,
+            uid: u64::MAX,
+            magic: u64::MAX,
+            iocs: u64::MAX,
+        };
+        c.ioctl(DRM_IOCTL_GET_CLIENT, &mut req)?;
+        Ok(req)
+    }
+    fn auth(c: &Client) -> i32 {
+        get_client(c, 0).expect("idx 0 answers").auth
+    }
+    fn noop<const N: usize>(c: &Client, cmd: u32) -> Result<usize> {
+        let mut arg = [0u8; N];
+        c.ioctl(cmd, &mut arg)
+    }
+    /// The five `drm_noop`s and the `drm_invalid_op` behind
+    /// `DRM_AUTH | DRM_MASTER | DRM_ROOT_ONLY`, with what each answers
+    /// once the permit passes.
+    fn root_only(c: &Client) -> [Result<usize>; 6] {
+        [
+            noop::<16>(c, DRM_IOCTL_SET_UNIQUE),
+            noop::<4>(c, DRM_IOCTL_BLOCK),
+            noop::<4>(c, DRM_IOCTL_UNBLOCK),
+            noop::<4>(c, DRM_IOCTL_ADD_DRAW),
+            noop::<4>(c, DRM_IOCTL_RM_DRAW),
+            noop::<24>(c, DRM_IOCTL_UPDATE_DRAW),
+        ]
+    }
+
+    /// `drm_getclient` answers `idx == 0` only, with the open's
+    /// `authenticated`, the caller's pid, `overflowuid` and zeros; the
+    /// open that takes the master is authenticated (`drm_new_set_master`,
+    /// at open or by `SET_MASTER`), so is the owner of a magic the master
+    /// `AUTH_MAGIC`s (`drm_authmagic`) and so is any open made by root
+    /// (`drm_file_alloc`). `FINISH` is `DRM_AUTH` (EACCES until then);
+    /// `SET_UNIQUE`, `BLOCK`, `UNBLOCK`, `ADD_DRAW`, `RM_DRAW` and
+    /// `UPDATE_DRAW` are `DRM_ROOT_ONLY` too (EACCES for anyone else,
+    /// EINVAL and 0 for root); `GET_STATS` zeroes its struct; `ATTACHMODE`
+    /// and `DETACHMODE` are no-ops. All of them were unknown numbers
+    /// (ENOSYS), and nothing recorded who was authenticated.
+    #[test]
+    fn get_client_reports_who_is_authenticated_and_the_hollowed_ioctls_answer_as_linux() {
+        let _serialised = drm::test_globals::lock();
+        drm::set_test_root(false);
+        let eacces = Err(FsError::NoPermission);
+        // A node of its own: the first open takes its master.
+        let master = Client::open(80);
+        let client = Client::open(80);
+
+        assert_eq!(
+            get_client(&master, 1).map(|c| c.idx),
+            Err(FsError::InvalidParam),
+            "only idx 0 exists"
+        );
+        let me = get_client(&master, 0).unwrap();
+        assert_eq!(
+            (me.auth, me.pid, me.uid, me.magic, me.iocs),
+            (1, 0, 65534, 0, 0),
+            "the master is authenticated; pid 0 is the test's, uid overflowuid"
+        );
+        assert_eq!(auth(&client), 0, "a second open is not");
+        assert_eq!(noop::<8>(&client, DRM_IOCTL_FINISH), eacces, "DRM_AUTH");
+        assert_eq!(noop::<8>(&master, DRM_IOCTL_FINISH), Ok(0));
+
+        // `drm_authmagic` authenticates the magic's owner.
+        let mut magic = 0u32;
+        client.ioctl(DRM_IOCTL_GET_MAGIC, &mut magic).unwrap();
+        master.ioctl(DRM_IOCTL_AUTH_MAGIC, &mut magic).unwrap();
+        assert_eq!(auth(&client), 1, "authenticated by the master");
+        assert_eq!(noop::<8>(&client, DRM_IOCTL_FINISH), Ok(0));
+        assert_eq!(auth(&master), 1, "and the master still is");
+
+        // Taking the master by `SET_MASTER` authenticates too.
+        let third = Client::open(80);
+        assert_eq!(auth(&third), 0);
+        master.ioctl(DRM_IOCTL_DROP_MASTER, &mut 0u8).unwrap();
+        third.ioctl(DRM_IOCTL_SET_MASTER, &mut 0u8).unwrap();
+        assert_eq!(auth(&third), 1, "drm_new_set_master");
+        assert_eq!(auth(&master), 1, "dropping the master keeps it");
+
+        // `GET_STATS` is zeros, whatever was there.
+        let mut stats = [0xFFu8; DRM_STATS_SIZE];
+        assert_eq!(client.ioctl(DRM_IOCTL_GET_STATS, &mut stats), Ok(0));
+        assert!(stats.iter().all(|&b| b == 0));
+
+        // `DRM_ROOT_ONLY`: EACCES for a non-root, authenticated or not.
+        for r in root_only(&client).iter().chain(root_only(&third).iter()) {
+            assert_eq!(*r, eacces, "not CAP_SYS_ADMIN");
+        }
+        assert_eq!(noop::<72>(&client, DRM_IOCTL_MODE_ATTACHMODE), Ok(0));
+        assert_eq!(noop::<72>(&client, DRM_IOCTL_MODE_DETACHMODE), Ok(0));
+
+        // Root: authenticated from the open, and the root-only ones answer.
+        drm::set_test_root(true);
+        let root = Client::open(80);
+        assert_eq!(auth(&root), 1, "root is always authenticated");
+        assert_eq!(noop::<8>(&root, DRM_IOCTL_FINISH), Ok(0));
+        assert_eq!(
+            root_only(&root),
+            [
+                Err(FsError::InvalidParam),
+                Ok(0),
+                Ok(0),
+                Ok(0),
+                Ok(0),
+                Ok(0)
+            ],
+            "SET_UNIQUE is drm_invalid_op, the rest drm_noop"
+        );
+        drm::set_test_root(false);
+        // Being root is the caller's, per call: the same open loses them.
+        for r in root_only(&root).iter() {
+            assert_eq!(*r, eacces);
+        }
+        assert_eq!(auth(&root), 1, "but the authentication stays");
+        // The authentication goes with the file (`drm_master_release`), and
+        // a magic of a closed open cannot authenticate anyone.
+        let mut stale = 0u32;
+        let gone_owner = {
+            drm::set_test_root(true);
+            let gone = Client::open(80);
+            drm::set_test_root(false);
+            let owner = Arc::as_ptr(gone.file_state()) as usize;
+            assert!(drm::is_authenticated(80, owner));
+            gone.ioctl(DRM_IOCTL_GET_MAGIC, &mut stale).unwrap();
+            owner
+        };
+        assert!(!drm::is_authenticated(80, gone_owner), "gone with the file");
+        assert_eq!(
+            third.ioctl(DRM_IOCTL_AUTH_MAGIC, &mut stale),
+            Err(FsError::InvalidParam)
+        );
+    }
+}
 
 #[cfg(test)]
 mod trail_tests;
