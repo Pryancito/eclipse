@@ -125,6 +125,55 @@ const SCHED_PRIO_TO_WEIGHT: [u32; 40] = [
     36, 29, 23, 18, 15, //                nice  15..=19
 ];
 
+/// The verdict of one scheduler tick: whether to preempt the running thread,
+/// and the slice deadline to carry forward.
+///
+/// Pulled out of [`Thread::tick_should_preempt`], which reads the clock, so that
+/// the four cases can be tested at all: a test cannot move
+/// `kernel_hal::timer::timer_now`, and a policy with four cases and no test is
+/// a policy nobody can change safely.
+///
+/// `now` and `end` are monotonic nanoseconds; `slice` is the length
+/// [`Thread::timeslice_ns`] gave this thread, never [`u64::MAX`] (a
+/// `SCHED_FIFO` thread does not reach here).
+fn slice_verdict(now: u64, end: u64, slice: u64) -> (bool, u64) {
+    // No slice running: start one. `set_sched` parks a zero here so a new
+    // policy or nice takes effect on the next tick.
+    if end == 0 {
+        return (false, now.saturating_add(slice));
+    }
+    // A deadline further out than a whole slice cannot be one we set from this
+    // clock: the clock moved backwards across a migration between cores with
+    // unsynchronised counters. Start again from the clock we can see.
+    if end > now.saturating_add(slice) {
+        return (false, now.saturating_add(slice));
+    }
+    // Inside the slice, which is the common case: nothing to do, and the
+    // deadline stands.
+    if now < end {
+        return (false, end);
+    }
+    // Past the deadline by MORE than a whole slice. The thread cannot have been
+    // on a CPU for that span: this runs from the timer interrupt of the thread
+    // that is executing, and the scheduler tick is milliseconds, so an expiry
+    // is seen at the first tick after it and never a whole slice late. So the
+    // deadline is the stale one from before the thread blocked, and what we are
+    // looking at is a thread that has just woken up.
+    //
+    // Preempting it here was measured: a thread that slept one second came back
+    // with `tick_should_preempt()` answering true on its very first tick, after
+    // running for microseconds. Every blocking `read`, every `nanosleep` longer
+    // than the slice, every futex wait, cost the woken thread the CPU at once --
+    // the exact opposite of the wake-up preemption in the run loop, which exists
+    // to HAND it the CPU. The slice is meant to be time spent running, and wall
+    // clock is only the same thing while the thread is on a core.
+    if now - end > slice {
+        return (false, now.saturating_add(slice));
+    }
+    // The slice really did run out.
+    (true, now.saturating_add(slice))
+}
+
 /// Map a nice value to its CFS load weight.
 fn nice_to_weight(nice: i8) -> u32 {
     let clamped = nice.clamp(MIN_NICE, MAX_NICE);
@@ -591,22 +640,9 @@ impl Thread {
         }
         let now = kernel_hal::timer::timer_now().as_nanos() as u64;
         let end = self.sched.slice_end_ns.load(Ordering::Relaxed);
-        // Start a slice when there is none, and also when a `set_sched` (or a
-        // clock that moved backwards across a migration) left a deadline
-        // further out than a whole slice from now.
-        if end == 0 || end > now.saturating_add(slice) {
-            self.sched
-                .slice_end_ns
-                .store(now.saturating_add(slice), Ordering::Relaxed);
-            return false;
-        }
-        if now < end {
-            return false;
-        }
-        self.sched
-            .slice_end_ns
-            .store(now.saturating_add(slice), Ordering::Relaxed);
-        true
+        let (preempt, next) = slice_verdict(now, end, slice);
+        self.sched.slice_end_ns.store(next, Ordering::Relaxed);
+        preempt
     }
 
     /// Setup the instruction and stack pointer, then tart execution on the thread
@@ -1777,5 +1813,316 @@ mod tests {
         first.suspend();
         first.resume();
         late.resume();
+    }
+}
+
+#[cfg(test)]
+mod sched_tests {
+    use super::*;
+    use crate::task::*;
+
+    fn a_thread() -> Arc<Thread> {
+        let root = Job::root();
+        let proc = Process::create(&root, "proc").expect("un proceso");
+        Thread::create(&proc, "thread").expect("un hilo")
+    }
+
+    /// `sched_prio_to_weight[]` as Linux ships it (`kernel/sched/core.c`).
+    /// Copied out on purpose rather than computed: a typo in a table is exactly
+    /// what a table test is for, and a wrong entry is a thread that quietly
+    /// gets the CPU share of a different nice level.
+    const LINUX_WEIGHTS: [u32; 40] = [
+        88761, 71755, 56483, 46273, 36291, 29154, 23254, 18705, 14949, 11916, 9548, 7620, 6100,
+        4904, 3906, 3121, 2501, 1991, 1586, 1277, 1024, 820, 655, 526, 423, 335, 272, 215, 172,
+        137, 110, 87, 70, 56, 45, 36, 29, 23, 18, 15,
+    ];
+
+    #[test]
+    fn the_weight_table_is_the_one_linux_ships() {
+        assert_eq!(
+            SCHED_PRIO_TO_WEIGHT, LINUX_WEIGHTS,
+            "la tabla de pesos no es la de Linux"
+        );
+        for (i, w) in LINUX_WEIGHTS.iter().enumerate() {
+            let nice = i as i32 - 20;
+            assert_eq!(
+                nice_to_weight(nice as i8),
+                *w,
+                "el peso de nice {} no es el de Linux",
+                nice
+            );
+        }
+        assert_eq!(nice_to_weight(0), WEIGHT_NICE0, "nice 0 no pesa 1024");
+        // Fuera del rango se recorta, no se sale de la tabla.
+        assert_eq!(
+            nice_to_weight(-100),
+            nice_to_weight(MIN_NICE),
+            "nice muy bajo no se recorta"
+        );
+        assert_eq!(
+            nice_to_weight(100),
+            nice_to_weight(MAX_NICE),
+            "nice muy alto no se recorta"
+        );
+    }
+
+    #[test]
+    fn a_nice_zero_fair_thread_gets_the_base_slice() {
+        let t = a_thread();
+        assert_eq!(
+            t.sched_policy(),
+            SCHED_NORMAL,
+            "un hilo nuevo no nace SCHED_NORMAL"
+        );
+        assert_eq!(t.sched_nice(), 0, "un hilo nuevo no nace con nice 0");
+        assert_eq!(
+            t.sched_rt_priority(),
+            0,
+            "un hilo nuevo nace con prioridad de tiempo real"
+        );
+        assert!(!t.sched_is_realtime());
+        assert_eq!(
+            t.timeslice_ns(),
+            BASE_TIMESLICE_NS,
+            "nice 0 no da el slice base"
+        );
+    }
+
+    /// One nice step is ~25% of load weight, i.e. ~10% of CPU: that is the whole
+    /// point of `nice`, and a slice that does not move with it makes `nice` a
+    /// number that is reported and ignored.
+    #[test]
+    fn one_nice_step_moves_the_slice_by_about_a_quarter() {
+        let t = a_thread();
+        for nice in -4..=4i8 {
+            t.set_sched(SCHED_NORMAL, nice, 0);
+            let lo = t.timeslice_ns();
+            t.set_sched(SCHED_NORMAL, nice - 1, 0);
+            let hi = t.timeslice_ns();
+            assert!(
+                hi > lo,
+                "nice {} da un slice de {} ns y nice {} otro de {} ns: no baja al subir nice",
+                nice - 1,
+                hi,
+                nice,
+                lo
+            );
+            // 88/64 = 1.375 y 72/64 = 1.125 acotan el 25% de la tabla con holgura.
+            assert!(
+                hi * 64 > lo * 72 && hi * 64 < lo * 88,
+                "de nice {} a nice {} el slice pasa de {} a {} ns, que no es el ~25% de la tabla",
+                nice,
+                nice - 1,
+                lo,
+                hi
+            );
+        }
+    }
+
+    #[test]
+    fn the_slice_is_clamped_at_both_ends() {
+        let t = a_thread();
+        t.set_sched(SCHED_NORMAL, MIN_NICE, 0);
+        assert_eq!(
+            t.timeslice_ns(),
+            MAX_TIMESLICE_NS,
+            "nice -20 no se recorta por arriba"
+        );
+        t.set_sched(SCHED_NORMAL, MAX_NICE, 0);
+        assert_eq!(
+            t.timeslice_ns(),
+            MIN_TIMESLICE_NS,
+            "nice 19 no se recorta por abajo"
+        );
+        assert!(MIN_TIMESLICE_NS < BASE_TIMESLICE_NS && BASE_TIMESLICE_NS < MAX_TIMESLICE_NS);
+    }
+
+    #[test]
+    fn every_policy_gets_the_slice_it_is_promised() {
+        let t = a_thread();
+        t.set_sched(SCHED_FIFO, 0, 50);
+        assert_eq!(t.timeslice_ns(), u64::MAX, "un FIFO se reparte el tiempo");
+        assert!(t.sched_is_realtime());
+        assert!(
+            !t.tick_should_preempt(),
+            "un FIFO se desaloja por fin de slice"
+        );
+
+        t.set_sched(SCHED_RR, 0, 50);
+        assert_eq!(
+            t.timeslice_ns(),
+            RR_TIMESLICE_NS,
+            "un RR no da el cuanto de 100 ms"
+        );
+        assert!(t.sched_is_realtime());
+
+        t.set_sched(SCHED_IDLE, 0, 0);
+        assert_eq!(
+            t.timeslice_ns(),
+            MIN_TIMESLICE_NS,
+            "un IDLE no da el slice mas corto"
+        );
+        assert!(!t.sched_is_realtime());
+
+        // BATCH y DEADLINE se planifican como NORMAL: el nice cuenta.
+        for policy in [SCHED_BATCH, SCHED_DEADLINE] {
+            t.set_sched(policy, 0, 0);
+            assert_eq!(
+                t.timeslice_ns(),
+                BASE_TIMESLICE_NS,
+                "la politica {} no se planifica como NORMAL",
+                policy
+            );
+            assert!(
+                !t.sched_is_realtime(),
+                "la politica {} sale como tiempo real",
+                policy
+            );
+        }
+    }
+
+    #[test]
+    fn changing_the_policy_drops_the_slice_that_was_running() {
+        let t = a_thread();
+        t.sched.slice_end_ns.store(1_234_567, Ordering::Relaxed);
+        t.set_sched(SCHED_NORMAL, 5, 0);
+        assert_eq!(
+            t.sched.slice_end_ns.load(Ordering::Relaxed),
+            0,
+            "cambiar la politica deja corriendo el slice de la anterior"
+        );
+        assert_eq!(t.sched_nice(), 5);
+    }
+
+    const SLICE: u64 = 20_000_000;
+
+    #[test]
+    fn the_first_tick_of_a_thread_starts_its_slice_instead_of_ending_it() {
+        let now = 1_000_000_000;
+        assert_eq!(
+            slice_verdict(now, 0, SLICE),
+            (false, now + SLICE),
+            "el primer tick de un hilo lo desaloja"
+        );
+    }
+
+    #[test]
+    fn a_tick_inside_the_slice_leaves_the_deadline_where_it_was() {
+        let now = 1_000_000_000;
+        let end = now + 5_000_000;
+        assert_eq!(
+            slice_verdict(now, end, SLICE),
+            (false, end),
+            "un tick a mitad de slice mueve la fecha limite o desaloja"
+        );
+    }
+
+    #[test]
+    fn a_tick_past_the_deadline_preempts_and_starts_the_next_slice() {
+        let now = 1_000_000_000;
+        // Un tick de planificador (4 ms) despues de vencer: es como se ve de verdad.
+        let end = now - 4_000_000;
+        assert_eq!(
+            slice_verdict(now, end, SLICE),
+            (true, now + SLICE),
+            "un slice vencido no desaloja"
+        );
+        // Y justo en la fecha limite, tambien.
+        assert_eq!(slice_verdict(now, now, SLICE), (true, now + SLICE));
+    }
+
+    /// Where the line is. A tick that arrives a whole slice late is still a
+    /// thread that was running -- a CPU busy with interrupts delays the
+    /// scheduler tick -- so it is preempted. One nanosecond further back is a
+    /// span no running thread can have gone unticked, so it slept.
+    #[test]
+    fn a_tick_a_whole_slice_late_is_still_the_slice_running_out() {
+        let now = 1_000_000_000;
+        assert_eq!(
+            slice_verdict(now, now - SLICE, SLICE),
+            (true, now + SLICE),
+            "un tick que llega un slice tarde se toma por un hilo que despierta"
+        );
+        assert_eq!(
+            slice_verdict(now, now - SLICE - 1, SLICE),
+            (false, now + SLICE),
+            "un nanosegundo mas atras todavia se toma por un slice agotado"
+        );
+    }
+
+    /// The bug. A thread that blocked keeps the deadline it had before it went
+    /// to sleep, so waking up looked exactly like running out of time.
+    #[test]
+    fn a_thread_that_slept_longer_than_its_slice_is_not_preempted_the_moment_it_wakes() {
+        let now = 2_000_000_000;
+        for slept in [SLICE + 1, 100_000_000, 1_000_000_000, now] {
+            let end = now - slept;
+            assert_eq!(
+                slice_verdict(now, end, SLICE),
+                (false, now + SLICE),
+                "un hilo que durmio {} ns con un slice de {} ns se desaloja al despertar",
+                slept,
+                SLICE
+            );
+        }
+    }
+
+    #[test]
+    fn a_deadline_further_out_than_a_whole_slice_is_not_believed() {
+        let now = 1_000_000_000;
+        let end = now + SLICE + 1;
+        assert_eq!(
+            slice_verdict(now, end, SLICE),
+            (false, now + SLICE),
+            "una fecha limite de un reloj que fue hacia atras se cree"
+        );
+        // Justo un slice por delante si es creible: es lo que acabamos de poner.
+        let end = now + SLICE;
+        assert_eq!(slice_verdict(now, end, SLICE), (false, end));
+    }
+
+    #[test]
+    fn a_deadline_at_the_end_of_the_clock_does_not_wrap_around() {
+        let now = u64::MAX - 1;
+        let (preempt, next) = slice_verdict(now, now - 1, SLICE);
+        assert!(preempt, "un slice vencido al final del reloj no desaloja");
+        assert_eq!(
+            next,
+            u64::MAX,
+            "la fecha limite da la vuelta en vez de saturar"
+        );
+        assert_eq!(
+            slice_verdict(u64::MAX, 0, SLICE),
+            (false, u64::MAX),
+            "el primer slice al final del reloj da la vuelta"
+        );
+    }
+
+    /// The whole thing through the thread, with the clock it really uses.
+    #[test]
+    fn a_thread_that_just_woke_keeps_the_cpu_and_one_that_ran_out_does_not() {
+        let t = a_thread();
+        let now = kernel_hal::timer::timer_now().as_nanos() as u64;
+        // Lo que deja un hilo que se bloqueo un segundo.
+        t.sched
+            .slice_end_ns
+            .store(now.saturating_sub(1_000_000_000), Ordering::Relaxed);
+        assert!(
+            !t.tick_should_preempt(),
+            "un hilo que acaba de despertar pierde la CPU en su primer tick"
+        );
+        assert!(
+            t.sched.slice_end_ns.load(Ordering::Relaxed) > now,
+            "y no se le ha dado un slice nuevo"
+        );
+        // Lo que deja un hilo que si agoto su slice: vencio hace un tick.
+        let now = kernel_hal::timer::timer_now().as_nanos() as u64;
+        t.sched
+            .slice_end_ns
+            .store(now.saturating_sub(4_000_000), Ordering::Relaxed);
+        assert!(
+            t.tick_should_preempt(),
+            "un hilo que agoto su slice no lo suelta"
+        );
     }
 }
