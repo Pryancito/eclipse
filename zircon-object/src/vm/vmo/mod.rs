@@ -45,6 +45,23 @@ pub trait FrameFiller: Send + Sync {
     /// `offset` within the VMO. The buffer is pre-zeroed; any bytes past
     /// `source_len()` must be left as zero.
     fn fill_page(&self, offset: usize, buf: &mut [u8]);
+
+    /// Fill `buf` (a whole number of pages, page-aligned `offset`) with the
+    /// source bytes starting at byte `offset`, in as few source reads as the
+    /// source can manage. Same contract as [`fill_page`](Self::fill_page) for
+    /// the bytes past `source_len()`.
+    ///
+    /// This is what a fault-around cluster calls: sixteen `fill_page`s over a
+    /// file mapping are sixteen reads that each walk the filesystem and the
+    /// block cache on their own, and on the polled disk drivers the first ones
+    /// are one synchronous device command each. A source that can read a
+    /// range at once overrides this; the default is the page-by-page loop.
+    fn fill_range(&self, offset: usize, buf: &mut [u8]) {
+        let page = crate::vm::PAGE_SIZE;
+        for (i, chunk) in buf.chunks_mut(page).enumerate() {
+            self.fill_page(offset + i * page, chunk);
+        }
+    }
 }
 
 /// Virtual Memory Object Trait
@@ -79,6 +96,15 @@ pub trait VMObjectTrait: Sync + Send {
 
     /// Commit allocating physical memory.
     fn commit(&self, offset: usize, len: usize) -> ZxResult;
+
+    /// Best effort: make the pages `[page_idx, page_idx + pages)` of a
+    /// demand-paged object resident from its backing source with ONE source
+    /// read for the whole run of missing pages, so that the `commit_page`s
+    /// that follow (a page fault and its fault-around) hit. A borrower forwards
+    /// to the page cache it borrows from. Never fails and never maps anything:
+    /// a page it did not fill is simply left for `commit_page`, which reads it
+    /// on its own as before. A no-op on objects with no backing source.
+    fn prefill(&self, _page_idx: usize, _pages: usize) {}
 
     /// Decommit allocated physical memory.
     fn decommit(&self, offset: usize, len: usize) -> ZxResult;

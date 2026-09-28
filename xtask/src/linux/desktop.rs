@@ -1312,6 +1312,11 @@ fn write_firefox_wrapper(rootfs: &Path) {
           # Firefox itself to the Wayland backend; DISPLAY only matters to\n\
           # anything it spawns.\n\
           export MOZ_ENABLE_WAYLAND=1\n\
+          # gdk-pixbuf loader registry (written at boot by eclipse-gtk-caches)\n\
+          # and no dconf: what labwc's environment file sets, for a launch\n\
+          # from a shell or a dock terminal that did not read it.\n\
+          export GDK_PIXBUF_MODULE_FILE=\"${GDK_PIXBUF_MODULE_FILE:-/root/.cache/pixbuf-loaders.cache}\"\n\
+          export GSETTINGS_BACKEND=\"${GSETTINGS_BACKEND:-memory}\"\n\
           # Ask for a single process. A distribution build (MOZILLA_OFFICIAL)\n\
           # ignores this unless non-local connections are disabled, so expect\n\
           # content children anyway -- see write_firefox_wrapper.\n\
@@ -2917,6 +2922,56 @@ mod tests {
             wrapper.contains("\nexport MOZ_ENABLE_WAYLAND=1\n"),
             "the wrapper must export MOZ_ENABLE_WAYLAND=1"
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// GTK must find its pixbuf loaders from EVERY launch path too. The
+    /// registry lives at a private path the gtk-caches oneshot writes at
+    /// boot, and only labwc's environment file named it: a `firefox-esr`
+    /// typed into a dock terminal (eclipse-init's CHILD_ENV) or a login
+    /// shell (/etc/profile) decoded no image, "Could not load a pixbuf from
+    /// icon theme". Same three copies as the Wayland pin, plus the wrapper,
+    /// and the path must be the one the oneshot writes.
+    #[test]
+    fn gtk_finds_its_pixbuf_loaders_from_every_launch_path() {
+        let dir = std::env::temp_dir().join(format!("eclipse-pixbuf-env-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        write_labwc_environment(&dir);
+        write_firefox_wrapper(&dir);
+        write_gtk_caches_wrapper(&dir);
+        let etc = dir.join("etc");
+        fs::create_dir_all(&etc).unwrap();
+        super::super::LinuxRootfs::write_profile(&etc);
+
+        const REGISTRY: &str = "/root/.cache/pixbuf-loaders.cache";
+        let profile = fs::read_to_string(etc.join("profile")).unwrap();
+        let environment = fs::read_to_string(dir.join("root/.config/labwc/environment")).unwrap();
+        let wrapper = fs::read_to_string(dir.join("usr/local/bin/eclipse-firefox")).unwrap();
+        let caches = fs::read_to_string(dir.join("usr/local/bin/eclipse-gtk-caches")).unwrap();
+        assert!(
+            caches.contains(&format!("pc=${{GDK_PIXBUF_MODULE_FILE:-{REGISTRY}}}\n")),
+            "the oneshot must write the registry at the path the others name"
+        );
+        assert!(
+            profile.contains(&format!("\nexport GDK_PIXBUF_MODULE_FILE={REGISTRY}\n")),
+            "/etc/profile must export GDK_PIXBUF_MODULE_FILE"
+        );
+        assert!(
+            profile.contains("\nexport GSETTINGS_BACKEND=memory\n"),
+            "/etc/profile must export GSETTINGS_BACKEND=memory"
+        );
+        assert!(
+            environment.contains(&format!("\nGDK_PIXBUF_MODULE_FILE={REGISTRY}\n")),
+            "labwc's environment file must set GDK_PIXBUF_MODULE_FILE"
+        );
+        assert!(environment.contains("\nGSETTINGS_BACKEND=memory\n"));
+        assert!(
+            wrapper.contains(&format!(
+                "\nexport GDK_PIXBUF_MODULE_FILE=\"${{GDK_PIXBUF_MODULE_FILE:-{REGISTRY}}}\"\n"
+            )),
+            "the wrapper must default GDK_PIXBUF_MODULE_FILE to the registry"
+        );
+        assert!(wrapper.contains("\nexport GSETTINGS_BACKEND=\"${GSETTINGS_BACKEND:-memory}\"\n"));
         let _ = fs::remove_dir_all(&dir);
     }
 
