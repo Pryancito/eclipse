@@ -1839,7 +1839,7 @@ fn vm_bind_maps_into_the_callers_own_context_and_a_map_over_a_live_range_replace
         Err(nv::EOPNOTSUPP),
         "sparse regions"
     );
-    assert_eq!(vm_bind_ops(&gpu, A, &mut []), Err(nv::EINVAL), "no ops");
+    assert_eq!(vm_bind_ops(&gpu, A, &mut []), Ok(0), "no ops: an empty job");
     let mut many: Vec<_> = (0..4097).map(|_| map(ha, VA, 4096)).collect();
     assert_eq!(
         vm_bind_ops(&gpu, A, &mut many),
@@ -2368,8 +2368,8 @@ fn vm_bind_and_exec_answer_enosys_until_the_client_ran_vm_init() {
             pid,
         )
     };
-    // An empty synchronous request: EINVAL once past the gates, so a
-    // gate that lets it through shows as EINVAL rather than as a bind.
+    // An empty synchronous request: 0 once past the gates (an empty
+    // job), so a gate that lets it through shows as 0, never as a bind.
     let bind = |pid: u64| {
         let mut r = nv::DrmNouveauVmBind {
             op_count: 0,
@@ -2549,6 +2549,50 @@ fn exec_needs_the_callers_own_rm_channel_and_a_well_formed_request() {
     gpu.nouveau_release_process(A);
     gpu.nouveau_release_process(B);
     gpu.nouveau_release_process(STRANGER);
+}
+
+#[test]
+fn an_empty_vm_bind_is_a_job_that_does_nothing_and_a_list_with_no_array_is_a_fault() {
+    let _g = LOCK.lock();
+    let _live = LiveBytes::hold();
+    let gpu = gpu_rm();
+    assert_eq!(channel_alloc(&gpu, A).unwrap().channel, 0);
+    // B has a uvmm and no context yet. `nouveau_uvmm_bind_job_init`
+    // takes an empty op list and `nouveau_job_submit` runs a job that
+    // does nothing: 0, no RM call, and no context built for it.
+    let before = FAKE_RM.lock().calls.len();
+    assert_eq!(vm_bind_ops(&gpu, B, &mut []), Ok(0), "no ops, no syncs");
+    assert_eq!(
+        vm_bind_sync(&gpu, B, &mut [], nv::VM_BIND_RUN_ASYNC, &[], &[]),
+        Ok(0),
+        "asynchronous and empty"
+    );
+    assert_eq!(rm_calls_since(before), [] as [&str; 0]);
+    assert_eq!(ctx_of(&gpu, B), None, "nothing to bind builds no context");
+    assert_eq!(driver_maps(&gpu, B), []);
+    // `nouveau_uvmm_vm_bind_ucopy` copies each list before anything is
+    // looked at (`u_memcpya`): a count with no array is EFAULT, for
+    // the ops as for the waits and the sigs.
+    let raw = |op_count: u32, wait_count: u32, sig_count: u32| {
+        let mut r = nv::DrmNouveauVmBind {
+            op_count,
+            flags: nv::VM_BIND_RUN_ASYNC,
+            wait_count,
+            sig_count,
+            wait_ptr: 0,
+            sig_ptr: 0,
+            op_ptr: 0,
+        };
+        call(&gpu, wr::<nv::DrmNouveauVmBind>(nv::NR_VM_BIND), &mut r, B)
+    };
+    assert_eq!(raw(1, 0, 0), Err(nv::EFAULT), "ops with no array");
+    assert_eq!(raw(0, 1, 0), Err(nv::EFAULT), "waits with no array");
+    assert_eq!(raw(0, 0, 1), Err(nv::EFAULT), "sigs with no array");
+    assert_eq!(rm_calls_since(before), [] as [&str; 0]);
+    assert_eq!(ctx_of(&gpu, B), None);
+    gpu.nouveau_release_process(A);
+    gpu.nouveau_release_process(B);
+    assert_eq!(FAKE_RM.lock().bad, 0);
 }
 
 #[test]
@@ -5841,7 +5885,7 @@ fn a_sparse_bind_waits_its_semaphores_and_signals_its_fence_like_vkqueuebindspar
     assert_eq!(driver_maps(&gpu, A).len(), bound);
     assert_eq!(syncobj::query(done), Some(0));
     assert_eq!(rm_calls_since(before), [] as [&str; 0]);
-    // An op list with no pointer is EINVAL, not a fault.
+    // An op list with no pointer is a fault (`u_memcpya`).
     let mut r = nv::DrmNouveauVmBind {
         op_count: 1,
         flags: nv::VM_BIND_RUN_ASYNC,
@@ -5853,7 +5897,7 @@ fn a_sparse_bind_waits_its_semaphores_and_signals_its_fence_like_vkqueuebindspar
     };
     assert_eq!(
         call(&gpu, wr::<nv::DrmNouveauVmBind>(nv::NR_VM_BIND), &mut r, A),
-        Err(nv::EINVAL),
+        Err(nv::EFAULT),
         "ops with no pointer"
     );
     // The sparse submit: two waits already satisfied, the bind, and a
