@@ -321,4 +321,103 @@ mod tests {
         assert_eq!(toggle(), Layout::Es);
         assert_eq!(current_name(), "es");
     }
+
+    /// Caps Lock and Shift **cancel**: that is what a shift state is, and the
+    /// two are the same lever on a letter. Or-ed instead, Shift with Caps on
+    /// gives a capital, so there is no way to type a small letter at all while
+    /// Caps Lock is on -- and no way to notice from a table of keys.
+    #[test]
+    fn caps_and_shift_together_give_the_small_letter() {
+        let caps = KeyMods {
+            shift: false,
+            altgr: false,
+            caps: true,
+            ctrl: false,
+        };
+        let caps_shift = KeyMods {
+            shift: true,
+            ..caps
+        };
+        assert_eq!(caps.letter('a'), 'A');
+        assert_eq!(caps_shift.letter('a'), 'a');
+        assert_eq!(to_char_for(Layout::Es, KEY_A, caps_shift), Some('a'));
+        assert_eq!(to_char_for(Layout::Es, KEY_A, caps), Some('A'));
+    }
+
+    /// The name arrives from `/proc/kbd`, and a write to `/proc/kbd` is
+    /// `echo us > /proc/kbd`: the shell puts a newline on the end. Without the
+    /// trim that write is rejected, which is every write anybody actually
+    /// makes. The uppercase spellings come from `eclipse-kbd` and from XKB
+    /// names quoted as they are in a config file.
+    #[test]
+    fn the_layout_name_is_taken_as_a_shell_writes_it() {
+        assert_eq!(Layout::from_name("us\n"), Some(Layout::Us));
+        assert_eq!(Layout::from_name(" es "), Some(Layout::Es));
+        assert_eq!(Layout::from_name("ES"), Some(Layout::Es));
+        assert_eq!(Layout::from_name("US"), Some(Layout::Us));
+        assert_eq!(Layout::from_name("es us"), None);
+    }
+
+    /// `/proc/kbd` is a one-line file, and a line ends in a newline: `cat`
+    /// leaves the prompt on the next line, and `read` in a shell script
+    /// returns instead of waiting for an end of file.
+    #[test]
+    fn proc_kbd_is_a_line_and_ends_like_one() {
+        // El valor lo mueven otros tests, asi que se mira la forma: dos
+        // letras y el salto de linea.
+        let text = proc_content();
+        assert!(text.ends_with('\n'), "{:?}", text);
+        assert_eq!(text.len(), 3, "{:?}", text);
+        assert!(
+            matches!(text.trim_end(), "es" | "us"),
+            "{:?} no es un nombre de distribucion",
+            text
+        );
+    }
+
+    /// The three keys a Spanish keyboard puts where a US one puts something
+    /// else, and they are the ones a shell types all day: `/` is Shift+7 and
+    /// the key to the right of `.` is `-`. Swapped, `ls /home` cannot be
+    /// typed at all.
+    #[test]
+    fn the_spanish_layout_types_a_slash_on_shift_seven_and_a_dash_next_to_the_dot() {
+        let plain = KeyMods {
+            shift: false,
+            altgr: false,
+            caps: false,
+            ctrl: false,
+        };
+        let shift = KeyMods {
+            shift: true,
+            ..plain
+        };
+        assert_eq!(to_char_for(Layout::Es, KEY_SLASH, plain), Some('-'));
+        assert_eq!(to_char_for(Layout::Es, KEY_SLASH, shift), Some('_'));
+        assert_eq!(to_char_for(Layout::Es, KEY_7, shift), Some('/'));
+        assert_eq!(to_char_for(Layout::Es, KEY_7, plain), Some('7'));
+        // And the same keys on the US table, where they are the other way.
+        assert_eq!(to_char_for(Layout::Us, KEY_SLASH, plain), Some('/'));
+        assert_eq!(to_char_for(Layout::Us, KEY_7, shift), Some('&'));
+    }
+
+    /// Enter sends a carriage return, not a line feed: that is what a
+    /// terminal line discipline is handed, and `ICRNL` is what turns it into
+    /// the newline a program reads. Sent as `\n` with `ICRNL` on it stays a
+    /// `\n`, which is fine, and with `ICRNL` off -- which is what every
+    /// line editor and `read -r` ask for -- the key stops ending the line.
+    /// Backspace sends DEL (0x7f), which is what `stty erase` defaults to;
+    /// as 0x08 it is a cursor-left that erases nothing.
+    #[test]
+    fn enter_sends_a_carriage_return_and_backspace_sends_del() {
+        let plain = KeyMods {
+            shift: false,
+            altgr: false,
+            caps: false,
+            ctrl: false,
+        };
+        assert_eq!(to_char_for(Layout::Es, KEY_ENTER, plain), Some('\r'));
+        assert_eq!(to_char_for(Layout::Us, KEY_KPENTER, plain), Some('\r'));
+        assert_eq!(to_char_for(Layout::Es, KEY_BACKSPACE, plain), Some('\x7f'));
+        assert_eq!(to_char_for(Layout::Us, KEY_TAB, plain), Some('\t'));
+    }
 }
