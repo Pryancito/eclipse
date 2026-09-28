@@ -1258,6 +1258,10 @@ impl DrmDev {
                 // `drm_gem_handle_delete`. Swallowing it made every wrong free
                 // look like a good one.
                 if drm::gem_close(handle) {
+                    // Same as GEM_CLOSE: Linux routes both through
+                    // `drm_gem_handle_delete`, which drops the file's PRIME
+                    // record of the handle with it.
+                    self.file.forget_prime_import(handle);
                     Ok(0)
                 } else {
                     Err(FsError::InvalidParam)
@@ -1716,6 +1720,9 @@ impl DrmDev {
                     // Drop the shared CPU-map cache entry; any live mmap Arc
                     // keeps its pin until munmap/Drop.
                     drm::nouveau_cpu_vmo_forget(handle);
+                    // This open let go of the handle: a later PRIME import of
+                    // the same buffer is a new reference again.
+                    self.file.forget_prime_import(handle);
                     Ok(0)
                 } else {
                     Err(FsError::InvalidParam)
@@ -6114,6 +6121,11 @@ mod gl_client_sequence_tests {
         /// `drmIoctl(fd, request, &arg)`.
         pub(super) fn ioctl<T>(&self, request: u32, arg: &mut T) -> Result<usize> {
             drm_ioctl(&self.dev, request, arg as *mut T as usize)
+        }
+
+        /// This open's `drm_file` state.
+        pub(super) fn file_state(&self) -> &Arc<drm::DrmFileState> {
+            self.dev.file_state()
         }
 
         /// `read(fd, buf, len)` --- how a compositor collects flip completions.
@@ -13579,6 +13591,56 @@ mod wait_vblank_validation_tests {
         ] {
             assert_eq!(wait(&c, typ, 0), Err(FsError::InvalidParam), "{typ:#x}");
         }
+    }
+}
+
+#[cfg(test)]
+mod prime_import_close_tests {
+    //! `GEM_CLOSE` and `DESTROY_DUMB` are where a file lets go of a handle:
+    //! what it imports after that is a new reference, as in Linux, where
+    //! `drm_gem_handle_delete` drops the `drm_prime_file_private` entry with
+    //! the handle on both paths.
+    use super::gl_client_sequence_tests::Client;
+    use super::*;
+
+    #[test]
+    fn closing_the_handle_forgets_the_import_so_the_next_one_counts_again() {
+        let _serialised = drm::test_globals::lock();
+        let c = Client::open(0);
+        let by_gem_close = c.create_dumb(16, 16);
+        let by_destroy_dumb = c.create_dumb(16, 16);
+        for h in [by_gem_close.handle, by_destroy_dumb.handle] {
+            assert!(c.file_state().note_prime_import(h));
+            assert!(c.file_state().holds_prime_import(h));
+        }
+        let mut h = by_gem_close.handle;
+        assert_eq!(c.ioctl(DRM_IOCTL_GEM_CLOSE, &mut h), Ok(0));
+        assert!(
+            !c.file_state().holds_prime_import(by_gem_close.handle),
+            "GEM_CLOSE left the import on record"
+        );
+        assert!(
+            c.file_state().holds_prime_import(by_destroy_dumb.handle),
+            "closing one handle forgot the other"
+        );
+        assert_eq!(c.destroy_dumb(by_destroy_dumb.handle), Ok(0));
+        assert!(
+            !c.file_state().holds_prime_import(by_destroy_dumb.handle),
+            "DESTROY_DUMB left the import on record"
+        );
+        for h in [by_gem_close.handle, by_destroy_dumb.handle] {
+            assert!(c.file_state().note_prime_import(h), "counts again");
+            c.file_state().forget_prime_import(h);
+        }
+        // A close that fails (handle already gone) forgets nothing, and says so.
+        assert!(c.file_state().note_prime_import(by_gem_close.handle));
+        let mut h = by_gem_close.handle;
+        assert_eq!(
+            c.ioctl(DRM_IOCTL_GEM_CLOSE, &mut h),
+            Err(FsError::InvalidParam)
+        );
+        assert!(c.file_state().holds_prime_import(by_gem_close.handle));
+        c.file_state().forget_prime_import(by_gem_close.handle);
     }
 }
 

@@ -217,6 +217,15 @@ pub fn add_ref(handle: u32, pid: u64) -> Option<u32> {
     })
 }
 
+/// How many references `handle` has, or `None` if it is not tracked here.
+pub fn ref_count(handle: u32) -> Option<u32> {
+    MAPPINGS
+        .lock()
+        .iter()
+        .find(|e| e.handle == handle)
+        .map(|e| e.holders.len() as u32)
+}
+
 /// Whether `pid` holds a reference to `handle`. Pid 0 (a call with no current
 /// thread -- kernel-internal) answers `true`. An untracked **nouveau-range**
 /// handle (`>= 0x8000_0000`) answers `false` so a guess cannot map/bind/close

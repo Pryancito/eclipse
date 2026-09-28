@@ -501,6 +501,46 @@ fn fence_landed(fence_va: usize, payload: u32) -> bool {
     (v.wrapping_sub(payload) as i32) >= 0
 }
 
+/// How many `spin_loop()` turns [`wait`] burns before its next look at the
+/// table, given how many looks it has already taken.
+///
+/// [`wait`] is the CPU-side wait the GPU driver's `EXEC` falls back to for
+/// every fence it cannot hand the hardware as an ACQUIRE -- a cross-process
+/// one, which on a desktop means the compositor's release of the client's
+/// buffer. It used to re-take [`TABLE`] on EVERY turn of its spin, for up to
+/// the whole ten-second bound, with nothing between the turns but one
+/// `spin_loop()`.
+///
+/// That is not merely wasted work: [`TABLE`] is the lock the SIGNALLING side
+/// needs too. A waiter that holds it essentially all the time is a waiter
+/// starving the very thread that would end its wait, and on a two-CPU
+/// desktop that thread is the compositor. The fix is to look less often, not
+/// to wait longer: a few hundred spin turns between looks is tens of
+/// nanoseconds of extra notice latency and hands the lock back for all of it.
+///
+/// The first looks have no backoff at all, because the overwhelmingly common
+/// case is a fence that is already signalled when the wait begins; the growth
+/// after that is what a contended wait pays.
+pub fn wait_spin_backoff(probes: u32) -> u32 {
+    if probes < WAIT_EAGER_PROBES {
+        return 0;
+    }
+    let doublings = probes - WAIT_EAGER_PROBES;
+    (WAIT_SPIN_FLOOR << doublings.min(16)).min(WAIT_SPIN_CAP)
+}
+
+/// Looks at the table [`wait`] takes back to back before it starts backing
+/// off. A fence already signalled is seen on the first one.
+pub const WAIT_EAGER_PROBES: u32 = 2;
+
+/// The first backoff, in `spin_loop()` turns.
+pub const WAIT_SPIN_FLOOR: u32 = 64;
+
+/// The longest gap between two looks at the table, in `spin_loop()` turns.
+/// Bounded so a wait still notices its fence promptly: this is a pause
+/// measured in nanoseconds, not a sleep.
+pub const WAIT_SPIN_CAP: u32 = 4_096;
+
 /// What a fence poll should do before its next probe.
 ///
 /// The async fence waits in `linux-object` (`SYNCOBJ_WAIT`, the atomic
@@ -571,6 +611,17 @@ static WAIT_CALLS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64
 static WAIT_SPIN_US: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 static WAIT_MAX_US: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 static WAIT_TIMEOUTS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Times [`wait`] has taken [`TABLE`] to look at its handles. Against
+/// `WAIT_CALLS` it says how hard the CPU-side waits are leaning on the lock
+/// the signalling side needs; that ratio is what [`wait_spin_backoff`] is
+/// there to keep down.
+static WAIT_TABLE_PROBES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// `spin_loop()` turns [`wait`] has burned between those looks -- the time
+/// it is NOT holding [`TABLE`]. Only the tests read it: a spin turn costs no
+/// time on the test clock, so this is the only way to see from a test that
+/// the loop really is backing off.
+#[cfg(test)]
+static WAIT_SPIN_TURNS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 static FENCES_LANDED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 static FENCES_TIMED_OUT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 static FENCE_LATENCY_US: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
@@ -582,8 +633,9 @@ pub fn stats_line() -> alloc::string::String {
     let calls = WAIT_CALLS.load(Ordering::Relaxed);
     let landed = FENCES_LANDED.load(Ordering::Relaxed);
     alloc::format!(
-        "syncobj waits={} cpu-spin={}us (avg {}us, max {}us, timeouts={}) | hw fences landed={} (submit->land avg {}us, max {}us) timed-out={} pending-now={}",
+        "syncobj waits={} (table looks={}) cpu-spin={}us (avg {}us, max {}us, timeouts={}) | hw fences landed={} (submit->land avg {}us, max {}us) timed-out={} pending-now={}",
         calls,
+        WAIT_TABLE_PROBES.load(Ordering::Relaxed),
         WAIT_SPIN_US.load(Ordering::Relaxed),
         WAIT_SPIN_US.load(Ordering::Relaxed) / calls.max(1),
         WAIT_MAX_US.load(Ordering::Relaxed),
@@ -1897,7 +1949,9 @@ fn wait_inner(
             WAIT_TIMEOUTS.fetch_add(1, Ordering::Relaxed);
         }
     };
+    let mut probes = 0u32;
     loop {
+        WAIT_TABLE_PROBES.fetch_add(1, Ordering::Relaxed);
         let mut signaled_count = 0usize;
         let mut first_signaled: Option<u32> = None;
         let deferred = {
@@ -1980,7 +2034,26 @@ fn wait_inner(
                 deadline_us.saturating_sub(now_us),
             );
         }
-        core::hint::spin_loop();
+        // Back off before looking again, and hand [`TABLE`] back while we do
+        // -- see [`wait_spin_backoff`]. The pump is the same one every other
+        // long poll in this tree runs (`gpu_spin`, the RM's `osSpinLoop`):
+        // this spin can sit here for ten seconds, and a CPU spinning that
+        // long without draining its TLB-shootdown queue starves a peer CPU's
+        // shootdown ack and wedges the machine. This was the one long poll
+        // that never pumped.
+        let turns = wait_spin_backoff(probes);
+        probes = probes.saturating_add(1);
+        #[cfg(test)]
+        WAIT_SPIN_TURNS.fetch_add(turns as u64, Ordering::Relaxed);
+        for n in 0..turns {
+            if n & 511 == 0 {
+                lock::pump();
+            }
+            core::hint::spin_loop();
+        }
+        if turns == 0 {
+            core::hint::spin_loop();
+        }
     }
 }
 
@@ -2056,6 +2129,127 @@ mod tests {
     fn test_lock() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
         LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The CPU-side wait hands the table back between its looks.
+    ///
+    /// `wait` is what `EXEC` falls back to for a fence it cannot hand the
+    /// hardware -- on a desktop, the compositor's release of the client's
+    /// buffer -- and it used to re-take `TABLE` on every turn of its spin,
+    /// for up to ten seconds, with one `spin_loop()` between turns. `TABLE`
+    /// is also the lock the SIGNALLING side takes, so that waiter was
+    /// starving the thread that would end its own wait.
+    ///
+    /// What a test here can and cannot see: a `spin_loop()` turn costs
+    /// nothing on the test clock, so the number of looks over a fixed span
+    /// of virtual microseconds cannot go down here however hard the loop
+    /// backs off -- the saving is real time on real hardware, and this
+    /// binary has none. What it CAN pin is that the loop really applies the
+    /// backoff, per look and in order, and that it stops applying it the
+    /// moment there is an answer. Those are the two ways the wiring breaks.
+    #[test]
+    fn a_cpu_wait_hands_the_table_back_between_its_looks() {
+        let _g = test_lock();
+        let h = create(false);
+        test_clock::set(1_000_000);
+        test_clock::set_auto_advance(1);
+        const SPAN_US: u64 = 20_000;
+
+        let looks_before = WAIT_TABLE_PROBES.load(Ordering::Relaxed);
+        let turns_before = WAIT_SPIN_TURNS.load(Ordering::Relaxed);
+        let t0 = now_us();
+        assert!(matches!(
+            wait(&[h], None, true, t0 + SPAN_US),
+            WaitOutcome::Timeout
+        ));
+        let looks = WAIT_TABLE_PROBES.load(Ordering::Relaxed) - looks_before;
+        let turns = WAIT_SPIN_TURNS.load(Ordering::Relaxed) - turns_before;
+
+        assert!(
+            looks > 2,
+            "the wait did not actually loop ({} looks)",
+            looks
+        );
+        // Every look past the eager ones paused, and long enough to have
+        // reached the cap: that pause is the lock handed back.
+        assert!(
+            turns >= (looks - WAIT_EAGER_PROBES as u64) * WAIT_SPIN_CAP as u64 / 2,
+            "{} looks burned only {} spin turns between them",
+            looks,
+            turns
+        );
+        // And the wait still ends where it was told to, not later: the
+        // backoff is a pause between looks, never an extension of the bound.
+        assert!(
+            now_us() >= t0 + SPAN_US && now_us() < t0 + SPAN_US * 2,
+            "the wait ran to {} for a deadline of {}",
+            now_us(),
+            t0 + SPAN_US
+        );
+
+        // A syncobj already signalled is still seen on the first look and
+        // pauses for nothing: the backoff must not cost the common case.
+        assert!(signal(h));
+        let looks_before = WAIT_TABLE_PROBES.load(Ordering::Relaxed);
+        let turns_before = WAIT_SPIN_TURNS.load(Ordering::Relaxed);
+        assert!(matches!(
+            wait(&[h], None, true, now_us() + SPAN_US),
+            WaitOutcome::Signaled { .. }
+        ));
+        assert_eq!(
+            WAIT_TABLE_PROBES.load(Ordering::Relaxed) - looks_before,
+            1,
+            "a signalled syncobj cost more than one look"
+        );
+        assert_eq!(
+            WAIT_SPIN_TURNS.load(Ordering::Relaxed) - turns_before,
+            0,
+            "a signalled syncobj paused before answering"
+        );
+
+        test_clock::set_auto_advance(0);
+        assert!(destroy(h));
+    }
+
+    /// The backoff itself: no pause at all for the first looks, then growth,
+    /// then a cap. The cap matters as much as the floor -- this is a pause
+    /// measured in `spin_loop()` turns, and one that grew without bound
+    /// would turn "look less often" into "notice the fence late".
+    #[test]
+    fn the_cpu_waits_backoff_starts_at_zero_grows_and_settles() {
+        assert!(WAIT_EAGER_PROBES > 0, "the first look already pauses");
+        for probes in 0..WAIT_EAGER_PROBES {
+            assert_eq!(
+                wait_spin_backoff(probes),
+                0,
+                "look {} paused before it looked",
+                probes
+            );
+        }
+        assert_eq!(wait_spin_backoff(WAIT_EAGER_PROBES), WAIT_SPIN_FLOOR);
+        let mut prev = 0;
+        let mut seen_cap = false;
+        for probes in WAIT_EAGER_PROBES..WAIT_EAGER_PROBES + 200 {
+            let turns = wait_spin_backoff(probes);
+            assert!(
+                (WAIT_SPIN_FLOOR..=WAIT_SPIN_CAP).contains(&turns),
+                "look {} pauses {} turns",
+                probes,
+                turns
+            );
+            assert!(
+                turns >= prev,
+                "look {} pauses less than the one before",
+                probes
+            );
+            prev = turns;
+            seen_cap |= turns == WAIT_SPIN_CAP;
+        }
+        assert!(seen_cap, "the backoff never reaches its cap");
+        // A wait parked long enough to run the shift off the top of the `u32`
+        // stays at the cap. Unclamped it comes back ZERO, which is the whole
+        // spin back again and the lock hammered exactly as before.
+        assert_eq!(wait_spin_backoff(u32::MAX), WAIT_SPIN_CAP);
     }
 
     /// The first probes cost no timer: a fence that lands in tens of
