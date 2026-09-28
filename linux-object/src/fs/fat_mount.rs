@@ -49,6 +49,21 @@ fn fits_in_fat(offset: u64, len: u64) -> bool {
     offset.saturating_add(len) <= FAT_MAX_FILE_SIZE
 }
 
+/// Qué contesta una escritura que acabó sin mover un solo byte.
+///
+/// Los dos casos se veían iguales desde dentro del bucle y salían los dos como
+/// `ENOSPC`: **escribir cero bytes es legal** y contesta cero, mientras que
+/// pedir bytes y no colocar ninguno sí es que el volumen está lleno. Con los
+/// dos confundidos, un `write(fd, buf, 0)` --que `truncate`, `tee` y cualquier
+/// copia con un trozo vacío hacen a diario-- fallaba con «no queda espacio» en
+/// un disco medio vacío.
+fn wrote(done: usize, asked: usize) -> rcore_fs::vfs::Result<usize> {
+    if done == 0 && asked > 0 {
+        return Err(FsError::NoDeviceSpace);
+    }
+    Ok(done)
+}
+
 /// Trozo de ceros usado para extender un fichero al escribir más allá del
 /// final. Un búfer en la pila evita reservar memoria en el camino de escritura.
 const ZERO_CHUNK: usize = 4096;
@@ -624,10 +639,7 @@ impl INode for FatMountINode {
         drop(file);
         drop(guard);
         self.fs.invalidate_dir(self.parent_dir());
-        if done == 0 {
-            return Err(FsError::NoDeviceSpace);
-        }
-        Ok(done)
+        wrote(done, buf.len())
     }
 
     fn poll(&self) -> rcore_fs::vfs::Result<PollStatus> {
@@ -1620,6 +1632,42 @@ mod fat_tests {
             file.write_at(at, &chunk).unwrap_err(),
             FsError::NoDeviceSpace
         );
+    }
+
+    /// Writing nothing is not the same as failing to write something.
+    ///
+    /// The loop that places the bytes ends with `done == 0` in two very
+    /// different situations: nobody asked for any bytes, and the volume would
+    /// not take the ones that were asked for. Only the second is `ENOSPC`.
+    /// `write(fd, buf, 0)` is a legal call that returns 0, and `truncate`,
+    /// `tee` and every copy that hits an empty chunk make it routinely.
+    #[test]
+    fn writing_nothing_succeeds_and_writing_into_nothing_does_not() {
+        assert_eq!(wrote(0, 0), Ok(0), "an empty write is a no-op, not ENOSPC");
+        assert_eq!(
+            wrote(0, 4096),
+            Err(FsError::NoDeviceSpace),
+            "asking for bytes and placing none is a full volume"
+        );
+        assert_eq!(wrote(7, 4096), Ok(7), "a short write is still a write");
+        assert_eq!(wrote(4096, 4096), Ok(4096));
+    }
+
+    /// And the same through the real mount: a zero-length `write_at` on a
+    /// volume with plenty of room answers `Ok(0)` and leaves the file alone.
+    #[test]
+    fn a_zero_length_write_answers_zero_and_changes_nothing() {
+        let (_blk, fs) = mount_default();
+        let root = fs.root_inode();
+        let file = create_file(&root, "empty.bin");
+
+        file.write_at(0, b"abcd").unwrap();
+        assert_eq!(file.write_at(4, &[]), Ok(0));
+        assert_eq!(file.metadata().unwrap().size, 4, "nothing was appended");
+
+        let mut back = [0u8; 4];
+        file.read_at(0, &mut back).unwrap();
+        assert_eq!(&back, b"abcd");
     }
 
     /// `st_blocks` counts 512-byte blocks and rounds **up**: every file that
