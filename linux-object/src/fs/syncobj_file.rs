@@ -627,8 +627,12 @@ mod reentrancy_tests {
         // The hook is process-wide; serialise with the tests that install the
         // real one.
         let _serial = super::super::syncobj_eventfd::hardware_fence_tests::TEST_SERIAL.lock();
-        WAITERS.lock().clear();
-        WAITER_COUNT.store(0, Ordering::SeqCst);
+        // `WAITERS` is process-wide and the other tests in this module keep
+        // their own sync_files in it, so this one asks after ITS OWN waiter
+        // rather than counting the registry: the count was 2 whenever another
+        // test had a fence in flight, and the `clear()` that tried to make it
+        // 1 dropped that test's waiter along the way. Red in 4 of 6 parallel
+        // runs of the suite, green in 5 of 5 with `--test-threads=1`.
         UPCALLS.store(0, Ordering::SeqCst);
         ALWAYS_FREE.store(true, Ordering::SeqCst);
         syncobj::set_signal_hook(probe_hook);
@@ -638,7 +642,15 @@ mod reentrancy_tests {
         // A sync_file on a point still in flight: this is what puts a waiter in
         // the registry, which is what makes `wake_ready_waiters` call `query`.
         let fd = SyncobjHandle::new_sync_file(handle, 1);
-        assert_eq!(pending_waiter_count(), 1, "the fence has not landed yet");
+        assert!(
+            !fd.poll(PollEvents::IN).expect("poll").read,
+            "the fence has not landed yet"
+        );
+        assert!(
+            WAITERS.lock().iter().any(|w| w.handle == handle),
+            "the sync_file has to be in the registry, which is what makes \
+             `wake_ready_waiters` call `query`"
+        );
 
         // The client submits: a hardware fence whose landing zone still reads
         // zero, so nothing is resolved at attach time.
@@ -671,10 +683,14 @@ mod reentrancy_tests {
             "the point-advance upcall ran while this cpu held WAITERS: the real \
              hook re-takes that lock and a ticket mutex is not re-entrant"
         );
-        assert_eq!(
-            pending_waiter_count(),
-            0,
-            "the waiter is retired once its point is reached"
+        assert!(
+            fd.poll(PollEvents::IN).expect("poll").read,
+            "the landed fence has to make the sync_file pollable"
+        );
+        assert!(
+            !WAITERS.lock().iter().any(|w| w.handle == handle),
+            "the waiter is retired once its point is reached: one left behind \
+             keeps the hardware fence poller running for ever"
         );
         drop(fd);
         let _ = syncobj::destroy(handle);
