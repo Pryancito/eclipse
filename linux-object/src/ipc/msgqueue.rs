@@ -70,6 +70,7 @@ struct MsgItem {
 }
 
 /// Outcome of a non-blocking send attempt.
+#[derive(Debug)]
 pub enum MsgSendError {
     /// Queue was removed (`EIDRM` to the caller).
     Removed,
@@ -80,6 +81,7 @@ pub enum MsgSendError {
 }
 
 /// Outcome of a non-blocking receive attempt.
+#[derive(Debug)]
 pub enum MsgRecvError {
     /// Queue was removed (`EIDRM` to the caller).
     Removed,
@@ -599,6 +601,25 @@ mod tests {
         assert_eq!(select_message(types(), -1, false), Some(3));
         assert_eq!(select_message([5isize].iter().copied(), -4, false), None);
     }
+
+    /// Every case above names a queue where the lowest type appears once, so
+    /// none of them says which of two equals wins. A queue is a queue:
+    /// `find_msg` (ipc/msg.c) only replaces its candidate on a *strictly*
+    /// lower type, so two writers of one type keep their order and a
+    /// `msgrcv(id, .., -5, 0)` loop drains them oldest first.
+    #[test]
+    fn among_messages_of_the_lowest_type_the_oldest_comes_out_first() {
+        let types = || [5isize, 1, 3, 1].iter().copied();
+        assert_eq!(
+            select_message(types(), -5, false),
+            Some(1),
+            "el primero de los dos unos, no el segundo"
+        );
+        assert_eq!(
+            select_message([1isize, 1].iter().copied(), -1, false),
+            Some(0)
+        );
+    }
 }
 
 /// Who may change a System V object, and what bounds the values `IPC_SET`
@@ -618,6 +639,8 @@ mod msg_control_tests {
 
     /// `IPC_CREAT`, as userspace spells it.
     const CREAT: usize = 0o1000;
+    /// `IPC_EXCL`, likewise.
+    const EXCL: usize = 0o2000;
     /// A pid; the field is only bookkeeping here.
     const PID: u32 = 7;
     /// The owner in these tests.
@@ -977,6 +1000,86 @@ mod msg_control_tests {
         clear_queues();
     }
 
+    // ------------------------------------------------------ msgrcv's msgsz
+
+    /// `msgrcv(2)` answers `E2BIG` for a message *longer* than `msgsz`, so a
+    /// buffer sized exactly to the message is the right size and not one byte
+    /// short. Nothing here measured either edge: a reader that sizes its
+    /// buffer to the message it expects -- which is what the `struct msgbuf`
+    /// idiom does -- would have got nothing back at all.
+    #[test]
+    fn a_message_that_exactly_fills_the_buffer_is_not_too_big() {
+        let queue = owned_by(OWNER);
+        assert!(queue.try_send(1, b"1234", PID).is_ok());
+        assert_eq!(
+            queue.try_recv(0, 4, false, false, PID).unwrap(),
+            (1, b"1234".to_vec()),
+            "cuatro bytes caben en cuatro bytes"
+        );
+
+        assert!(queue.try_send(1, b"12345", PID).is_ok());
+        assert!(
+            matches!(
+                queue.try_recv(0, 4, false, false, PID),
+                Err(MsgRecvError::TooBig)
+            ),
+            "y el que sobra por uno si es E2BIG"
+        );
+        assert_eq!(queue.stat().qnum, 1, "que sigue en la cola");
+    }
+
+    /// `MSG_NOERROR` says "give me what fits" instead of `E2BIG`, and what
+    /// fits is `msgsz` bytes. The payload is copied straight into the
+    /// caller's buffer, so a byte over is a write past the end of it -- and
+    /// no test reached this line, in either direction.
+    #[test]
+    fn msg_noerror_cuts_the_payload_to_the_buffer_and_not_a_byte_further() {
+        let queue = owned_by(OWNER);
+        assert!(queue.try_send(7, b"abcdefgh", PID).is_ok());
+        let (mtype, data) = queue.try_recv(0, 3, true, false, PID).unwrap();
+        assert_eq!(mtype, 7);
+        assert_eq!(data, b"abc".to_vec(), "tres bytes pedidos, tres bytes");
+        // And the whole message left the queue, not the part that fitted.
+        assert_eq!((queue.stat().qnum, queue.stat().cbytes), (0, 0));
+    }
+
+    /// `euid == 0` is the whole of "privileged" here, and the uid next to it
+    /// is an ordinary user (`bin` on most systems). Every case above weighs
+    /// uid 0 against uid 1000, where an off-by-one in that comparison lands
+    /// the same way -- and getting it wrong hands an unprivileged process
+    /// unbounded pinned kernel memory.
+    #[test]
+    fn the_uid_next_to_root_is_not_root_for_raising_qbytes() {
+        const ALMOST_ROOT: u32 = 1;
+        let queue = owned_by(ALMOST_ROOT);
+        let mut up = queue.stat();
+        up.qbytes = MSGMNB * 4;
+        assert_eq!(queue.set(&up, ALMOST_ROOT), Ok(()));
+        assert_eq!(
+            queue.stat().qbytes,
+            MSGMNB,
+            "el uid 1 no es root: el tope sigue siendo MSGMNB"
+        );
+    }
+
+    /// `IPC_EXCL` means something only alongside `IPC_CREAT`: on its own it
+    /// is not a request to create, so an existing key resolves to its id
+    /// (`ipcget_public` checks the pair). A program that carries a bare
+    /// `IPC_EXCL` in its flags would otherwise get `EEXIST` for ever.
+    #[test]
+    fn ipc_excl_on_its_own_still_resolves_an_existing_key() {
+        let _guard = test_lock();
+        clear_queues();
+        let id = msg_get(9903, CREAT | 0o600, OWNER, OWNER, &[]).unwrap();
+        assert_eq!(msg_get(9903, EXCL | 0o600, OWNER, OWNER, &[]), Ok(id));
+        assert_eq!(
+            msg_get(9903, CREAT | EXCL | 0o600, OWNER, OWNER, &[]),
+            Err(LxError::EEXIST),
+            "con IPC_CREAT al lado si"
+        );
+        clear_queues();
+    }
+
     /// The same question, asked of a queue this time rather than of a bare
     /// `IpcPerm`: `msgsnd` needs write, `msgrcv` and `IPC_STAT` need read.
     #[test]
@@ -1184,6 +1287,61 @@ mod blocking_wait_tests {
         );
         assert!(queue.try_send(1, b"hi", PID).is_ok());
         assert_eq!(wakes(&count), 0, "nothing left to wake");
+    }
+
+    /// A future may be polled from a different task than the one before, and
+    /// the contract is that the waker of the LATEST poll is the one woken.
+    /// Re-polling a wait that is already registered has to replace the stored
+    /// waker rather than keep the first: every other test here polls one wait
+    /// from one context throughout, where keeping either answers the same.
+    #[test]
+    fn a_re_poll_parks_the_waker_the_re_poll_brought() {
+        let queue = queue_of(MSGMNB);
+        let since = empty_generation(&queue);
+        let (first, waker_first) = counting_waker();
+        let (second, waker_second) = counting_waker();
+        let mut cx_first = Context::from_waker(&waker_first);
+        let mut cx_second = Context::from_waker(&waker_second);
+        let mut fut = pin!(queue.wait_for_change(since));
+
+        assert!(fut.as_mut().poll(&mut cx_first).is_pending());
+        assert!(fut.as_mut().poll(&mut cx_second).is_pending());
+        assert_eq!(queue.waiter_count(), 1, "sigue siendo una sola espera");
+
+        assert!(queue.try_send(1, b"hi", PID).is_ok());
+        assert_eq!(wakes(&second), 1, "despierta el waker de la ultima vuelta");
+        assert_eq!(wakes(&first), 0, "y no el de la primera");
+    }
+
+    /// Each wait takes an id of its own, and the id is what `done` and `drop`
+    /// unregister by. Two waits sharing one id would make either of them
+    /// leaving take the other's waker with it: a receiver parked for ever on
+    /// a queue that has a message for it. Two waits registering is what the
+    /// test below counts, and two waits *leaving separately* is what this one
+    /// does.
+    #[test]
+    fn two_waits_take_ids_of_their_own() {
+        let queue = queue_of(MSGMNB);
+        let since = empty_generation(&queue);
+        let (count_a, waker_a) = counting_waker();
+        let (count_b, waker_b) = counting_waker();
+        let mut cx_a = Context::from_waker(&waker_a);
+        let mut cx_b = Context::from_waker(&waker_b);
+        let mut fut_b = pin!(queue.wait_for_change(since));
+        {
+            let mut fut_a = pin!(queue.wait_for_change(since));
+            assert!(fut_a.as_mut().poll(&mut cx_a).is_pending());
+            assert!(fut_b.as_mut().poll(&mut cx_b).is_pending());
+            assert_eq!(queue.waiter_count(), 2);
+        }
+        assert_eq!(
+            queue.waiter_count(),
+            1,
+            "la que se va se lleva la suya, no las dos"
+        );
+
+        assert!(queue.try_send(1, b"hi", PID).is_ok());
+        assert_eq!((wakes(&count_a), wakes(&count_b)), (0, 1));
     }
 
     /// Two receivers parked on one queue: a send wakes both (each re-plans;
