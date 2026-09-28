@@ -208,6 +208,11 @@ const CHILD_ENV: &[&str] = &[
     // renderer's dma-buf feedback), which the `DRM_CAP_ADDFB2_MODIFIERS=0` KMS
     // cap alone may not cover. Belt and braces with that cap.
     "WLR_DRM_NO_MODIFIERS=1",
+    // Firefox: the native Wayland backend for init-started children and
+    // their descendants (lunarbar launches apps as ITS children, so this is
+    // the environment a menu-launched browser sees). /etc/profile and the
+    // labwc environment file carry the same pin.
+    "MOZ_ENABLE_WAYLAND=1",
     // SDL (sdl12-compat / SDL2 / SDL3) backends, the renderer-independent half
     // of the session's SDL policy (the labwc wrapper and /etc/profile assert
     // the same). Video: native Wayland first, X11 as fallback -- Xwayland in
@@ -2532,5 +2537,26 @@ mod tests {
         env.iter()
             .map(|e| e.to_str().expect("utf-8").to_string())
             .collect()
+    }
+
+    /// Firefox on its native Wayland backend for init-started children and
+    /// their descendants: lunarbar launches apps as ITS children, so this
+    /// static base is the environment a menu-launched browser sees (labwc's
+    /// environment file and /etc/profile carry the same pin, checked in
+    /// xtask). Static, so it must be in CHILD_ENV itself and survive
+    /// `build_child_env` on every renderer.
+    #[test]
+    fn firefox_is_pinned_to_native_wayland_for_init_started_children() {
+        assert!(
+            CHILD_ENV.contains(&"MOZ_ENABLE_WAYLAND=1"),
+            "MOZ_ENABLE_WAYLAND=1 must be in the static child environment"
+        );
+        for cmdline in ["LOG=warn", "renderer=gl", "renderer=gl-sw"] {
+            let env = renderer_env(cmdline, None, false);
+            assert!(
+                env.iter().any(|v| v == "MOZ_ENABLE_WAYLAND=1"),
+                "{cmdline}: {env:?}"
+            );
+        }
     }
 }

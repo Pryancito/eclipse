@@ -119,6 +119,7 @@ impl LinuxRootfs {
             xorg::install(&dir, &bin.join("apk"), self.0.name());
             // Needs the firefox package on disk, i.e. after xorg::install.
             desktop::write_firefox_default_prefs(&dir);
+            desktop::write_firefox_desktop_override(&dir);
             // Needs the GTK/gsettings packages on disk, same reason.
             desktop::compile_gsettings_schemas(&dir);
             // After apk too: it only downloads the IWADs when the `freedoom`
@@ -214,6 +215,7 @@ impl LinuxRootfs {
         xorg::install(&dir, &bin.join("apk"), self.0.name());
         // Needs the firefox package on disk, i.e. after xorg::install.
         desktop::write_firefox_default_prefs(&dir);
+        desktop::write_firefox_desktop_override(&dir);
         // Needs the GTK/gsettings packages on disk, same reason.
         desktop::compile_gsettings_schemas(&dir);
         // After apk too: it only downloads the IWADs when the `freedoom`
@@ -1037,6 +1039,11 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
               # so pa_mutex_new() no longer aborts.\n\
               export ALSOFT_DRIVERS=pulse,alsa\n\
               export PULSE_SERVER=unix:/run/pulse/native\n\
+              # Firefox: the native Wayland backend on every launch path. The\n\
+              # eclipse-firefox wrapper (menu, .desktop) pins it too; this line\n\
+              # covers a `firefox-esr` typed in a terminal. The labwc environment\n\
+              # file and eclipse-init's CHILD_ENV carry the same pin.\n\
+              export MOZ_ENABLE_WAYLAND=1\n\
               # No session bus here: pin the address so libdbus never\n\
               # `autolaunch:`es (dbus-launch + X11 + dbus-daemon behind pipes,\n\
               # the chain SDL_Init walks first; gzdoom hung there). With no\n\
