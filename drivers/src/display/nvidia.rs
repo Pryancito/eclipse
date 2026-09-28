@@ -12157,6 +12157,24 @@ impl NvidiaGpu {
                     );
                     return Err(nv::EINVAL);
                 }
+                // `nouveau_abi16_ioctl_sclass`: the body is exactly the
+                // `count` slots the caller says it has, else EINVAL. The
+                // first `min(count, total)` are filled and `count` comes
+                // back as the TOTAL whatever the room: that is the loop
+                // `nvif_object_sclass_get` (the kernel's own client) and
+                // libdrm's `nouveau_object_sclass_get` run, a first call
+                // with `count` 0 to learn how many, then one with that
+                // much room, ending when `count` comes back at or below
+                // what they offered. Answering with what was written (0
+                // on the probe) ended that loop with an empty class list.
+                if body_len - SB != sclass.count as usize * EB {
+                    log::warn!(
+                        "[nouveau-uapi] NVIF SCLASS: {} bytes of slots for count={} -> EINVAL",
+                        body_len - SB,
+                        sclass.count
+                    );
+                    return Err(nv::EINVAL);
+                }
                 // The caller's own channel, as in Linux (`nouveau_abi16_chan`
                 // walks the calling file's channels): another process's
                 // token is EINVAL, not its engine list.
@@ -12179,11 +12197,7 @@ impl NvidiaGpu {
                 let Some(classes) = self.nouveau_engine_classes() else {
                     return Err(nv::EINVAL);
                 };
-                // Honour the caller's advertised slot count, the real payload
-                // length, AND the protocol's own ceiling.
-                let room = (sclass.count as usize)
-                    .min((body_len - SB) / EB)
-                    .min(nv::NVIF_SCLASS_MAX);
+                let room = sclass.count as usize;
                 let n = classes.len().min(room);
                 let arr = (body + SB) as *mut nv::NvifSclassOclassV0;
                 for i in 0..n {
@@ -12213,7 +12227,7 @@ impl NvidiaGpu {
                         );
                     }
                 }
-                sclass.count = n as u8;
+                sclass.count = classes.len() as u8;
                 unsafe { core::ptr::write_unaligned(body as *mut nv::NvifIoctlSclassV0, sclass) };
                 log::warn!(
                     "[nouveau-uapi] NVIF SCLASS on {} channel token={} (hVas={:#010x} \

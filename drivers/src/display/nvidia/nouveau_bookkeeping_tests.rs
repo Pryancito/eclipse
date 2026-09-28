@@ -1169,32 +1169,22 @@ fn nvif_sclass_lists_the_callers_channels_engines_within_the_room_offered() {
     );
     let mut r = sclass(0, 0xff, 16, 16);
     assert_eq!(r.send(&gpu, 0), Ok(0), "the kernel reads anyone's");
-    // Less room than engines, said by count: the first ones, and
-    // nothing written past what the caller offered.
-    let mut r = sclass(0, 0xff, 3, 16);
+    // Less room than engines: the first ones, and `count` still says
+    // how many there are (`nouveau_abi16_ioctl_sclass`).
+    let mut r = sclass(0, 0xff, 3, 3);
     assert_eq!(r.send(&gpu, A), Ok(0));
-    let (count, list) = classes_in(&r);
-    assert_eq!(count, 3);
-    assert_eq!(&list[..3], &turing[..3]);
-    assert!(
-        list[3..].iter().all(|&c| c == 0x7777),
-        "beyond count is the caller's: {:?}",
-        list
-    );
-    // Less room than count, said by the payload itself.
-    let mut r = sclass(0, 0xff, 16, 2);
-    assert_eq!(r.send(&gpu, A), Ok(0));
-    assert_eq!(classes_in(&r), (2, alloc::vec![0x902d, 0xa140]));
-    // More slots than the protocol's ceiling: capped at 16.
+    assert_eq!(classes_in(&r), (5, turing[..3].to_vec()));
+    // The body must hold exactly `count` slots, more or fewer is EINVAL.
+    assert_eq!(sclass(0, 0xff, 3, 16).send(&gpu, A), Err(nv::EINVAL));
+    assert_eq!(sclass(0, 0xff, 16, 2).send(&gpu, A), Err(nv::EINVAL));
+    assert_eq!(sclass(0, 0xff, 0, 3).send(&gpu, A), Err(nv::EINVAL));
+    // More slots than engines: the tail within the room is cleared.
     let mut r = sclass(0, 0xff, 40, 40);
     assert_eq!(r.send(&gpu, A), Ok(0));
     let (count, list) = classes_in(&r);
     assert_eq!(count, 5);
-    assert!(list[5..16].iter().all(|&c| c == 0));
-    assert!(
-        list[16..].iter().all(|&c| c == 0x7777),
-        "past 16 is never touched"
-    );
+    assert_eq!(&list[..5], &turing);
+    assert!(list[5..].iter().all(|&c| c == 0), "stale slot: {:?}", list);
     // A second GPU of another architecture answers with its own triple.
     let ampere = NvidiaGpu::for_test(0x2204, 24576);
     assert_eq!(channel_alloc(&ampere, A).unwrap().channel, 0);
@@ -1204,6 +1194,37 @@ fn nvif_sclass_lists_the_callers_channels_engines_within_the_room_offered() {
         &classes_in(&r).1[..5],
         &[0x902d, 0xa140, 0xc797, 0xc7c0, 0xc7b5]
     );
+}
+
+#[test]
+fn nvif_sclass_answers_the_total_so_a_probe_with_no_room_learns_how_many_to_offer() {
+    let _g = LOCK.lock();
+    let gpu = gpu();
+    assert_eq!(channel_alloc(&gpu, A).unwrap().channel, 0);
+    // `nvif_object_sclass_get` and libdrm's `nouveau_object_sclass_get`:
+    // count 0 and no slots first, then as many as the answer said,
+    // until the answer fits. Two calls, five classes.
+    let turing = [0x902d, 0xa140, 0xc597, 0xc5c0, 0xc5b5];
+    let mut cnt = 0u8;
+    let mut calls = 0;
+    let list = loop {
+        let mut r = sclass(0, 0xff, cnt, cnt as usize);
+        assert_eq!(r.send(&gpu, A), Ok(0));
+        calls += 1;
+        let (count, list) = classes_in(&r);
+        if count <= cnt {
+            break list;
+        }
+        assert!(calls < 4, "the loop must converge");
+        cnt = count;
+    };
+    assert_eq!((calls, cnt), (2, 5));
+    assert_eq!(list, turing.to_vec());
+    // The probe writes nothing: 32 bytes in, 32 bytes back.
+    let mut r = sclass(0, 0xff, 0, 0);
+    assert_eq!(r.send(&gpu, A), Ok(0));
+    assert_eq!(r.0.len(), HDR + SCLASS);
+    assert_eq!(classes_in(&r), (5, alloc::vec![]));
 }
 
 #[test]
