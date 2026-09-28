@@ -322,6 +322,24 @@ mod tests {
     }
 
     #[test]
+    fn a_stale_century_register_only_looks_harmless_while_the_window_agrees() {
+        // Every case above names a year under 70, where believing the
+        // register and ignoring it land on the same answer -- so none of them
+        // says what the register does. These are the two digits where the two
+        // mechanisms disagree, and they are the ones that matter: a clock
+        // whose battery died comes up reading 99, and a byte of ordinary CMOS
+        // RAM behind that address must not turn it into 2099.
+        for stale in [0u8, 19, 21, 22, 165, 0xFF] {
+            assert_eq!(full_year(99, stale), 1999, "siglo rancio {}", stale);
+            assert_eq!(full_year(70, stale), 1970, "siglo rancio {}", stale);
+        }
+        // And with the one value it does believe, the same two digits are the
+        // century after.
+        assert_eq!(full_year(99, 20), 2099);
+        assert_eq!(full_year(70, 20), 2070);
+    }
+
+    #[test]
     fn the_window_cannot_name_a_year_before_the_epoch() {
         // The guards in `decode` against a year before 1970 and a negative day
         // count are backstops: no byte reaches them. A mutation that removes
@@ -575,6 +593,38 @@ mod tests {
         let mut regs = regs_bcd(99, 12, 31, 23, 59, 59);
         regs.century = 0;
         assert_eq!(decode(regs, BCD_24H), Some(946_684_799));
+    }
+
+    #[test]
+    fn a_year_the_window_reads_backwards_is_what_the_century_register_is_for() {
+        // 70 is the first pair of digits the window sends to the last
+        // century, so a date in the seventies of a century is the only kind
+        // where `decode` has to read the century register at all. Every other
+        // test here names a year the window resolves the same way with the
+        // register or without it, which is why dropping the register
+        // entirely, or leaving it in packed decimal, changed no answer.
+        let mut regs = regs_bcd(70, 1, 1, 0, 0, 0);
+        assert_eq!(regs.century, bcd(20), "la placa dice el siglo veinte");
+        assert_eq!(decode(regs, BCD_24H), Some(3_155_760_000));
+
+        // The same instant on a board that counts in plain binary, where the
+        // register is not packed decimal and must not be converted.
+        let binary = RtcRegs {
+            sec: 0,
+            min: 0,
+            hour: 0,
+            day: 1,
+            month: 1,
+            year: 70,
+            century: 20,
+        };
+        assert_eq!(decode(binary, BINARY_24H), Some(3_155_760_000));
+
+        // And a board with no century register behind that address holds
+        // ordinary CMOS RAM there, which the window has to overrule: the same
+        // registers then name the epoch itself, a hundred years earlier.
+        regs.century = 0xFF;
+        assert_eq!(decode(regs, BCD_24H), Some(0));
     }
 
     #[test]
