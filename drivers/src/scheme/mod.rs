@@ -13,6 +13,7 @@ pub mod gem_mmap;
 pub(super) mod input;
 pub(super) mod irq;
 pub(super) mod net;
+pub mod prewait;
 pub mod syncobj;
 pub(super) mod uart;
 

@@ -204,12 +204,16 @@ impl DrmDev {
         // period. That alternation is not a slow kernel -- it is measured as
         // jitter, and it is exactly what a client pacing on this ioctl would
         // see as stutter. The loop is bounded by the same 3 s cap.
+        let mut acct = PreWaitAccount::new(zcore_drivers::scheme::prewait::Kind::WaitVblank);
         while (target.wrapping_sub(drm::vblank_seq_now()) as i32) > 0 {
             let Some(deadline) = drm::vblank_deadline_for_seq(target) else {
                 break;
             };
+            acct.probe();
             if deadline >= cap {
                 kernel_hal::thread::sleep_until(cap).await;
+                // Stopped by the 3 s cap, not by the vblank asked for.
+                acct.timed_out();
                 break;
             }
             kernel_hal::thread::sleep_until(deadline).await;
@@ -255,7 +259,7 @@ impl DrmDev {
             zcore_drivers::scheme::syncobj::wait_ready
         };
         let deadline = core::time::Duration::from_micros(deadline_us);
-        let mut probes = 0u32;
+        let mut acct = PreWaitAccount::new(zcore_drivers::scheme::prewait::Kind::SyncobjWait);
         loop {
             // No `poll_pending()` in front of this. It takes the syncobj
             // table lock and runs `resolve_locked` -- and so does
@@ -267,15 +271,27 @@ impl DrmDev {
             // wasted trips off the CPU per frame, plus a second round on
             // the one lock the signalling side needs to end the wait.
             match ready_fn(&handles, points.as_deref(), wait_all, deadline_us) {
-                Some(_) => return,
+                Some(answer) => {
+                    // `wait_ready` answers Timeout only past `deadline_us`,
+                    // so this is the same "gave up on the clock" the poll
+                    // helper reports below, reached one look earlier.
+                    if matches!(
+                        answer,
+                        Err(zcore_drivers::scheme::syncobj::WaitOutcome::Timeout)
+                    ) {
+                        acct.timed_out();
+                    }
+                    return;
+                }
                 None => {
                     // If the absolute deadline is already behind `timer_now`,
                     // wait_ready should have returned Timeout; the helper still
                     // refuses to sleep past it if the clocks disagree slightly.
-                    if !fence_poll_wait(probes, deadline).await {
+                    if !fence_poll_wait(acct.probes, deadline).await {
+                        acct.timed_out();
                         return;
                     }
-                    probes = probes.saturating_add(1);
+                    acct.probe();
                 }
             }
         }
@@ -306,7 +322,7 @@ impl DrmDev {
         let handles = [handle];
         let points = [point];
         let deadline = core::time::Duration::from_micros(deadline_us);
-        let mut probes = 0u32;
+        let mut acct = PreWaitAccount::new(zcore_drivers::scheme::prewait::Kind::AtomicInFence);
         loop {
             // Same as in [`Self::syncobj_wait_sleep`]: `wait_ready` resolves
             // the pending fences itself, so a `poll_pending()` in front of it
@@ -350,10 +366,11 @@ impl DrmDev {
                     return;
                 }
                 None => {
-                    if !fence_poll_wait(probes, deadline).await {
+                    if !fence_poll_wait(acct.probes, deadline).await {
+                        acct.timed_out();
                         return;
                     }
-                    probes = probes.saturating_add(1);
+                    acct.probe();
                 }
             }
         }
@@ -405,7 +422,7 @@ impl DrmDev {
         // it stands in for: the sync arm answers EBUSY past it either way.
         let deadline =
             kernel_hal::timer::timer_now() + core::time::Duration::from_micros(CPU_PREP_TIMEOUT_US);
-        let mut probes = 0u32;
+        let mut acct = PreWaitAccount::new(zcore_drivers::scheme::prewait::Kind::CpuPrep);
         loop {
             // `hw_fences_landed`, not `fences.iter().all(hw_fence_landed)`:
             // one read per landing zone, not one per fence. A buffer two
@@ -415,10 +432,11 @@ impl DrmDev {
             if zcore_drivers::scheme::syncobj::hw_fences_landed(&fences) {
                 return;
             }
-            if !fence_poll_wait(probes, deadline).await {
+            if !fence_poll_wait(acct.probes, deadline).await {
+                acct.timed_out();
                 return;
             }
-            probes = probes.saturating_add(1);
+            acct.probe();
         }
     }
 
@@ -512,7 +530,7 @@ impl DrmDev {
         }
         let waited_from = kernel_hal::timer::timer_now();
         let deadline = waited_from + core::time::Duration::from_micros(PRESENT_FENCE_TIMEOUT_US);
-        let mut probes = 0u32;
+        let mut acct = PreWaitAccount::new(zcore_drivers::scheme::prewait::Kind::PresentFence);
         loop {
             // `hw_fences_landed`, not `fences.iter().all(hw_fence_landed)`:
             // one read per landing zone, not one per fence. A buffer two
@@ -533,7 +551,8 @@ impl DrmDev {
                 }
                 return;
             }
-            if !fence_poll_wait(probes, deadline).await {
+            if !fence_poll_wait(acct.probes, deadline).await {
+                acct.timed_out();
                 // Budgeted for the same reason as the atomic wait: a ring that
                 // stopped landing fences misses this bound on EVERY frame, and
                 // klog writes synchronously to the UART.
@@ -556,7 +575,7 @@ impl DrmDev {
                 }
                 return;
             }
-            probes = probes.saturating_add(1);
+            acct.probe();
         }
     }
 
@@ -2895,6 +2914,82 @@ fn next_poll_wake(now: Duration, deadline: Duration, tick: Duration) -> Option<D
         None
     } else {
         Some(wake)
+    }
+}
+
+/// Accounts one pre-wait to [`zcore_drivers::scheme::prewait`], however the
+/// wait ends.
+///
+/// The five pre-waits park a thread BEFORE the driver is ever called, so none
+/// of that time appears in the driver's per-ioctl profile -- which starts
+/// timing at the dispatch, when the parking is already over. A frame that
+/// spends most of itself parked therefore reads, in `/proc/gpudbg`, as a
+/// table of small numbers and no account of where the frame went. This is
+/// what closes that gap on the machine that has the GPU.
+///
+/// It accounts on DROP because these functions return from several places --
+/// the request does not read, the condition is already met, the deadline
+/// passed -- and a `record` at each of them is a record missed the next time
+/// a return is added.
+struct PreWaitAccount {
+    kind: zcore_drivers::scheme::prewait::Kind,
+    start: Duration,
+    /// Times the loop woke, looked, and went back to sleep. Also what tells a
+    /// wait that parked from one that was satisfied on its first look, since
+    /// a coarse clock can read zero microseconds for a real park.
+    probes: u32,
+    timed_out: bool,
+}
+
+impl PreWaitAccount {
+    fn new(kind: zcore_drivers::scheme::prewait::Kind) -> Self {
+        Self {
+            kind,
+            start: kernel_hal::timer::timer_now(),
+            probes: 0,
+            timed_out: false,
+        }
+    }
+
+    /// One more turn of the poll loop.
+    fn probe(&mut self) {
+        self.probes = self.probes.saturating_add(1);
+    }
+
+    /// This wait is ending on its deadline, not on the thing it waited for.
+    fn timed_out(&mut self) {
+        self.timed_out = true;
+    }
+}
+
+/// The parked microseconds a pre-wait reports, from how long it was alive and
+/// how many times it looked.
+///
+/// A wait satisfied on its first look was never parked, and the microseconds
+/// it was alive for are the ones spent reading its argument struct -- charging
+/// those to parking would put a floor under every line of the table and hide
+/// the waits that really do park. The probe count, not the clock, is what
+/// makes a park: a wait that woke, looked and slept again on a coarse clock
+/// can honestly measure zero microseconds, and it still parked.
+fn pre_wait_parked_us(elapsed_us: u64, probes: u32) -> u64 {
+    if probes == 0 {
+        0
+    } else {
+        elapsed_us
+    }
+}
+
+impl Drop for PreWaitAccount {
+    fn drop(&mut self) {
+        let elapsed_us = kernel_hal::timer::timer_now()
+            .saturating_sub(self.start)
+            .as_micros() as u64;
+        zcore_drivers::scheme::prewait::record(
+            self.kind,
+            pre_wait_parked_us(elapsed_us, self.probes),
+            self.probes,
+            self.timed_out,
+        );
     }
 }
 
@@ -15076,6 +15171,82 @@ mod pre_wait_resolve_tests {
                 !code().contains("hw_fence_landed("),
                 "{} is back to reading its landing zones one fence at a time",
                 name
+            );
+        }
+    }
+
+    /// A wait satisfied on its first look reports no parking, however long
+    /// its argument took to read; one that looked twice reports the lot.
+    #[test]
+    fn only_a_wait_that_looked_twice_reports_parked_time() {
+        use super::pre_wait_parked_us;
+        assert_eq!(
+            pre_wait_parked_us(37, 0),
+            0,
+            "argument parsing was charged as parking"
+        );
+        assert_eq!(pre_wait_parked_us(37, 1), 37);
+        assert_eq!(
+            pre_wait_parked_us(0, 9),
+            0,
+            "a coarse clock is not a reason to drop the park"
+        );
+    }
+
+    /// Every pre-wait accounts itself, so `/proc/gpudbg` can say how much of
+    /// a frame went into parking.
+    ///
+    /// A pre-wait parks the thread BEFORE the driver is called, so none of it
+    /// lands in the driver's per-ioctl profile. One of these five left
+    /// unaccounted is time that simply does not appear anywhere, and the
+    /// symptom is a profile that adds up to far less than the frame -- which
+    /// is exactly the question the table was added to answer. Nothing can run
+    /// these functions in a test (they need a live `DrmDev`, a process and a
+    /// GPU), so the guard is on the shape.
+    #[test]
+    fn every_pre_wait_accounts_its_parking() {
+        let src = include_str!("drm_scheme.rs");
+        for (name, kind) in [
+            ("pub async fn wait_vblank_sleep(", "Kind::WaitVblank"),
+            ("pub async fn syncobj_wait_sleep(", "Kind::SyncobjWait"),
+            ("pub async fn atomic_in_fence_sleep(", "Kind::AtomicInFence"),
+            ("pub async fn cpu_prep_sleep(", "Kind::CpuPrep"),
+            ("pub async fn present_fence_sleep(", "Kind::PresentFence"),
+        ] {
+            let body = body(src, name);
+            assert!(
+                body.contains(kind),
+                "{} does not open a PreWaitAccount for {}",
+                name,
+                kind
+            );
+            // An accountant that is never told about a probe reports every
+            // park as a wait that was satisfied at once -- the counters would
+            // be there and would say nothing.
+            assert!(
+                body.contains("acct.probe()"),
+                "{} never counts a probe",
+                name
+            );
+        }
+        // And each kind is used by exactly one of them: two waits sharing a
+        // kind would sum into one line and neither could be read.
+        for kind in [
+            "Kind::WaitVblank",
+            "Kind::SyncobjWait",
+            "Kind::AtomicInFence",
+            "Kind::CpuPrep",
+            "Kind::PresentFence",
+        ] {
+            assert_eq!(
+                src.matches(&alloc::format!(
+                    "PreWaitAccount::new(zcore_drivers::scheme::prewait::{})",
+                    kind
+                ))
+                .count(),
+                1,
+                "{} is opened by more or fewer than one pre-wait",
+                kind
             );
         }
     }
