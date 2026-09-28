@@ -2898,9 +2898,9 @@ impl DrmDev {
                     return Err(FsError::InvalidParam);
                 }
                 syncobj_array_bound(req.count_handles)?;
-                if req.handles == 0 {
-                    return Err(FsError::InvalidParam);
-                }
+                // `drm_syncobj_array_find` copies the array with
+                // `copy_from_user`: a null (or unmapped) array is EFAULT,
+                // not EINVAL.
                 ucheck_n::<u32>(req.handles as usize, req.count_handles as usize)?;
                 let apply = if cmd == DRM_IOCTL_SYNCOBJ_RESET {
                     zcore_drivers::scheme::syncobj::reset
@@ -2949,11 +2949,9 @@ impl DrmDev {
                     return Err(FsError::InvalidParam);
                 }
                 syncobj_array_bound(req.count_handles)?;
-                if req.handles == 0 || req.points == 0 {
-                    return Err(FsError::InvalidParam);
-                }
+                // `drm_syncobj_array_find` copies the handles with
+                // `copy_from_user`: a null array is EFAULT, not EINVAL.
                 ucheck_n::<u32>(req.handles as usize, req.count_handles as usize)?;
-                ucheck_n::<u64>(req.points as usize, req.count_handles as usize)?;
                 // The caller's own handles, all of them, before any is
                 // signaled (`drm_syncobj_array_find`).
                 let handles: alloc::vec::Vec<u32> = (0..req.count_handles as usize)
@@ -2962,15 +2960,28 @@ impl DrmDev {
                 if !zcore_drivers::scheme::syncobj::all_usable_by(drm::current_pid(), &handles) {
                     return Err(FsError::EntryNotFound);
                 }
+                // The points come after the lookup, and a null array is
+                // every point 0 (Linux `memset`s it), which signals nothing
+                // a counter has not reached: `drm_syncobj_add_point` at 0
+                // is the unordered point it warns about. Both used to be
+                // EINVAL before the handles were looked at.
+                if req.points != 0 {
+                    ucheck_n::<u64>(req.points as usize, req.count_handles as usize)?;
+                }
+                let point_at = |i: usize| -> u64 {
+                    if req.points == 0 {
+                        0
+                    } else {
+                        unsafe { *(req.points as *const u64).add(i) }
+                    }
+                };
                 for (i, handle) in handles.into_iter().enumerate() {
-                    let point = unsafe { *(req.points as *const u64).add(i) };
-                    if !zcore_drivers::scheme::syncobj::timeline_signal(handle, point) {
+                    if !zcore_drivers::scheme::syncobj::timeline_signal(handle, point_at(i)) {
                         return Err(FsError::EntryNotFound);
                     }
                 }
-                let (h0, p0) =
-                    unsafe { (*(req.handles as *const u32), *(req.points as *const u64)) };
-                trace_syncobj("TIMELINE_SIGNAL", drm::current_pid(), h0, p0, "ok");
+                let h0 = unsafe { *(req.handles as *const u32) };
+                trace_syncobj("TIMELINE_SIGNAL", drm::current_pid(), h0, point_at(0), "ok");
                 Ok(0)
             }
 
@@ -3050,9 +3061,6 @@ impl DrmDev {
                     return Err(FsError::InvalidParam);
                 }
                 syncobj_array_bound(req.count_handles)?;
-                if req.handles == 0 || req.points == 0 {
-                    return Err(FsError::InvalidParam);
-                }
                 let last_submitted = req.flags & DRM_SYNCOBJ_QUERY_FLAGS_LAST_SUBMITTED != 0;
                 // LAST_SUBMITTED must include in-flight EXEC fences: the fast
                 // path returns before the GPU writes the landing zone, and NVK
@@ -3060,8 +3068,9 @@ impl DrmDev {
                 // it as a no-op left the timeline at the previous signaled
                 // point — Mesa then walked `supported_sync_types` off the NULL
                 // terminator (`libvulkan_nouveau.so+0x9cc48`).
+                // `drm_syncobj_array_find` copies the handles with
+                // `copy_from_user`: a null array is EFAULT, not EINVAL.
                 ucheck_n::<u32>(req.handles as usize, req.count_handles as usize)?;
-                ucheck_n::<u64>(req.points as usize, req.count_handles as usize)?;
                 // The caller's own handles, all of them, before any point is
                 // written back (`drm_syncobj_array_find`).
                 let handles: alloc::vec::Vec<u32> = (0..req.count_handles as usize)
@@ -3070,6 +3079,9 @@ impl DrmDev {
                 if !zcore_drivers::scheme::syncobj::all_usable_by(drm::current_pid(), &handles) {
                     return Err(FsError::EntryNotFound);
                 }
+                // The points are written with `copy_to_user` after the
+                // lookup: a null array is EFAULT there, behind ENOENT.
+                ucheck_n::<u64>(req.points as usize, req.count_handles as usize)?;
                 let mut first_pt = 0u64;
                 for (i, handle) in handles.into_iter().enumerate() {
                     let looked_up = if last_submitted {
@@ -4450,9 +4462,9 @@ fn read_syncobj_wait(cmd: u32, data: usize) -> Result<Option<SyncobjWaitReq>> {
         return Ok(None);
     }
     syncobj_array_bound(count_handles)?;
-    if handles_ptr == 0 {
-        return Err(FsError::InvalidParam);
-    }
+    // `drm_syncobj_array_find` copies the handles with `copy_from_user`: a
+    // null array is EFAULT, not EINVAL. A null points array is every point
+    // 0 (`drm_syncobj_array_wait_timeout` `memset`s it).
     ucheck_n::<u32>(handles_ptr as usize, count_handles as usize)?;
     if timeline && points_ptr != 0 {
         ucheck_n::<u64>(points_ptr as usize, count_handles as usize)?;

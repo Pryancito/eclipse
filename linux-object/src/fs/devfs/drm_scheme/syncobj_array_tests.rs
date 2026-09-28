@@ -472,8 +472,8 @@ fn an_array_past_what_the_kernel_would_allocate_is_enomem() {
         };
         assert_eq!(c.ioctl(cmd, &mut req), Err(FsError::NoMemory), "{:#x}", cmd);
     }
-    // The bound itself is fine, and a null array under it is EINVAL as
-    // before (Linux: EFAULT from the copy).
+    // The bound itself is fine, and a null array under it is EFAULT
+    // from the copy, as in Linux.
     let mut req = DrmSyncobjArray {
         handles: 0,
         count_handles: SYNCOBJ_ARRAY_MAX,
@@ -481,7 +481,7 @@ fn an_array_past_what_the_kernel_would_allocate_is_enomem() {
     };
     assert_eq!(
         c.ioctl(DRM_IOCTL_SYNCOBJ_SIGNAL, &mut req),
-        Err(FsError::InvalidParam)
+        Err(FsError::BadAddress)
     );
     let mut req = DrmSyncobjWait {
         handles: 0,
@@ -493,8 +493,134 @@ fn an_array_past_what_the_kernel_would_allocate_is_enomem() {
     };
     assert_eq!(
         c.ioctl(DRM_IOCTL_SYNCOBJ_WAIT, &mut req),
-        Err(FsError::InvalidParam)
+        Err(FsError::BadAddress)
     );
+}
+
+/// `drm_syncobj_array_find` copies the handles with `copy_from_user`,
+/// so a null array with a count is EFAULT in all six arms (it was
+/// EINVAL). The points arrays come after the lookup: `TIMELINE_SIGNAL`
+/// takes a null one as every point 0 (`memset`), which moves no
+/// counter, `TIMELINE_WAIT` likewise, and `QUERY` writes into it, so
+/// null is EFAULT there, behind a handle that is not the caller's.
+#[test]
+fn a_null_handles_array_is_efault_and_null_points_are_zeros_to_signal_and_efault_to_query() {
+    let _serialised = drm::test_globals::lock();
+    let _hook = crate::fs::syncobj_eventfd::hardware_fence_tests::TEST_SERIAL.lock();
+    let _on = NouveauOn::new();
+    let c = Client::open(0);
+    let mut req = DrmSyncobjWait {
+        handles: 0,
+        timeout_nsec: 0,
+        count_handles: 1,
+        flags: 0,
+        first_signaled: 0xdead,
+        pad: 0,
+    };
+    assert_eq!(
+        c.ioctl(DRM_IOCTL_SYNCOBJ_WAIT, &mut req),
+        Err(FsError::BadAddress)
+    );
+    assert_eq!(req.first_signaled, 0xdead, "not written");
+    let mut req = DrmSyncobjTimelineWait {
+        handles: 0,
+        points: 0,
+        timeout_nsec: 0,
+        count_handles: 1,
+        flags: 0,
+        first_signaled: 0xdead,
+        pad: 0,
+    };
+    assert_eq!(
+        c.ioctl(DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT, &mut req),
+        Err(FsError::BadAddress)
+    );
+    for cmd in [DRM_IOCTL_SYNCOBJ_RESET, DRM_IOCTL_SYNCOBJ_SIGNAL] {
+        let mut req = DrmSyncobjArray {
+            handles: 0,
+            count_handles: 1,
+            pad: 0,
+        };
+        assert_eq!(
+            c.ioctl(cmd, &mut req),
+            Err(FsError::BadAddress),
+            "{:#x}",
+            cmd
+        );
+    }
+    let mut one = [0u64; 1];
+    for cmd in [DRM_IOCTL_SYNCOBJ_TIMELINE_SIGNAL, DRM_IOCTL_SYNCOBJ_QUERY] {
+        let mut req = DrmSyncobjTimelineArray {
+            handles: 0,
+            points: one.as_mut_ptr() as u64,
+            count_handles: 1,
+            flags: 0,
+        };
+        assert_eq!(
+            c.ioctl(cmd, &mut req),
+            Err(FsError::BadAddress),
+            "{:#x} with real points",
+            cmd
+        );
+    }
+
+    // Null points: the handles are looked up first.
+    let h = create(&c, false);
+    let ok_null = |cmd: u32, handle: u32| {
+        let mut req = DrmSyncobjTimelineArray {
+            handles: &handle as *const u32 as u64,
+            points: 0,
+            count_handles: 1,
+            flags: 0,
+        };
+        c.ioctl(cmd, &mut req)
+    };
+    let stranger = h + 1000;
+    assert_eq!(
+        ok_null(DRM_IOCTL_SYNCOBJ_TIMELINE_SIGNAL, stranger),
+        Err(FsError::EntryNotFound)
+    );
+    assert_eq!(
+        ok_null(DRM_IOCTL_SYNCOBJ_QUERY, stranger),
+        Err(FsError::EntryNotFound)
+    );
+    assert_eq!(
+        ok_null(DRM_IOCTL_SYNCOBJ_QUERY, h),
+        Err(FsError::BadAddress),
+        "QUERY writes the points"
+    );
+    // Every point 0 signals nothing a counter has not reached.
+    assert_eq!(ok_null(DRM_IOCTL_SYNCOBJ_TIMELINE_SIGNAL, h), Ok(0));
+    let mut point = [0xdead_u64; 1];
+    assert_eq!(
+        timeline_array(&c, DRM_IOCTL_SYNCOBJ_QUERY, &[h], &mut point),
+        Ok(0)
+    );
+    assert_eq!(point, [0], "a fresh syncobj stays at 0");
+    assert_eq!(
+        timeline_array(&c, DRM_IOCTL_SYNCOBJ_TIMELINE_SIGNAL, &[h], &mut [3]),
+        Ok(0)
+    );
+    assert_eq!(ok_null(DRM_IOCTL_SYNCOBJ_TIMELINE_SIGNAL, h), Ok(0));
+    assert_eq!(
+        timeline_array(&c, DRM_IOCTL_SYNCOBJ_QUERY, &[h], &mut point),
+        Ok(0)
+    );
+    assert_eq!(point, [3], "and a counter at 3 stays at 3");
+    // A null points array on the wait is every point 0 too: the
+    // signaled syncobj satisfies it at once.
+    let mut req = DrmSyncobjTimelineWait {
+        handles: &h as *const u32 as u64,
+        points: 0,
+        timeout_nsec: 0,
+        count_handles: 1,
+        flags: 0,
+        first_signaled: 0xdead,
+        pad: 0,
+    };
+    assert_eq!(c.ioctl(DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT, &mut req), Ok(0));
+    assert_eq!(req.first_signaled, 0);
+    destroy(&c, h);
 }
 
 /// `drm_syncobj_transfer_ioctl`: the padding is EINVAL, and so is any
