@@ -95,7 +95,9 @@ fn create_dumb_refuses_bpp_zero_and_honours_bpp_sixteen() {
         .expect("CREATE_DUMB bpp=16");
     // pitch = round_up(width * bpp/8, 64) = round_up(32, 64) = 64
     assert_eq!(bpp16.pitch, 64, "bpp=16 must not be inflated to 32");
-    assert_eq!(bpp16.size, 64 * 16);
+    // `nouveau_display_dumb_create` (and every `dumb_create`): `size =
+    // roundup(pitch * height, PAGE_SIZE)`, a GEM object is whole pages.
+    assert_eq!(bpp16.size, 4096, "PAGE_ALIGN(64 * 16)");
     assert_eq!(c.destroy_dumb(bpp16.handle), Ok(0));
 }
 
