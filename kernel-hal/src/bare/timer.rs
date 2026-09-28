@@ -271,6 +271,23 @@ pub fn vdso_tsc_mult() -> Option<u64> {
     }
 }
 
+/// The raw counter reading this boot calls time zero, which userspace must
+/// subtract before scaling by [`vdso_tsc_mult`] to get the same monotonic
+/// nanoseconds the kernel reports.
+///
+/// Meaningless when `vdso_tsc_mult` answers `None`, which is every
+/// architecture but x86_64.
+pub fn vdso_tsc_base() -> u64 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        super::arch::timer::vdso_tsc_base()
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        0
+    }
+}
+
 /// Treat the TSC as usable by userspace regardless of what CPUID reports.
 ///
 /// Set from the kernel command line (`VDSOFORCE=1`); a no-op off x86_64. See

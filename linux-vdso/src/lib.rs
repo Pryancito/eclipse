@@ -50,13 +50,23 @@ pub struct VdsoData {
     /// 64-bit loads cannot tear on x86_64, which is what lets the reader run
     /// without a seqlock.
     pub _pad: u32,
-    /// Fixed-point multiplier: monotonic ns = `(rdtsc() * tsc_mult) >> 32`.
+    /// Fixed-point multiplier: monotonic ns =
+    /// `((rdtsc() - tsc_base) * tsc_mult) >> 32`.
     ///
     /// The same constant the kernel's own `timer_now` uses, so the two clocks
     /// cannot drift apart by construction.
     pub tsc_mult: u64,
     /// Nanoseconds to add to the monotonic clock to obtain `CLOCK_REALTIME`.
     pub wall_off_ns: u64,
+    /// The raw `rdtsc()` reading this boot calls time zero, subtracted before
+    /// scaling: monotonic ns = `((rdtsc() - tsc_base) * tsc_mult) >> 32`.
+    ///
+    /// The TSC is not zero when the kernel takes over — firmware ran first, and
+    /// a warm reboot never resets it — so scaling the absolute reading reported
+    /// the time since the machine was last powered on as uptime. The kernel
+    /// subtracts this same base in `timer_now`; publishing it is what keeps the
+    /// two clocks the one clock they are documented to be.
+    pub tsc_base: u64,
 }
 
 /// Size of the data page reserved inside the image.
