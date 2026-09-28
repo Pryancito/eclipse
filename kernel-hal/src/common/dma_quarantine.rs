@@ -103,11 +103,19 @@ impl Quarantine {
         evicted: &mut alloc::vec::Vec<(usize, usize)>,
         poison: impl FnOnce(),
     ) -> Verdict {
-        if pages > MAX_BLOCK_PAGES {
-            return Verdict::TooBig;
-        }
+        // A block already in the quarantine is a double free whatever its
+        // size, and that has to be settled before the size is. `TooBig` sends
+        // the whole range back to the frame pool, so a range too big to hold
+        // that overlaps one still held returns those shared frames now -- and
+        // the quarantine returns them again when it evicts its own copy. One
+        // frame with two owners is the corruption this module exists to
+        // catch, and it would be reached through the one path that skips the
+        // check for it.
         if self.holds(base, pages) {
             return Verdict::DoubleFree;
+        }
+        if pages > MAX_BLOCK_PAGES {
+            return Verdict::TooBig;
         }
         while self.len >= MAX_BLOCKS || (self.held_pages + pages > BUDGET_PAGES && self.len > 0) {
             let h = self.head;
@@ -320,5 +328,98 @@ mod tests {
         assert!(!q.holds(at(1), 0));
         assert!(!q.holds(at(9), 4));
         assert!(q.holds(at(1) + 3 * PG, 1));
+    }
+
+    #[test]
+    fn blocks_that_touch_without_overlapping_are_not_the_same_block() {
+        // Two ranges that share an endpoint share no page. Either half of the
+        // overlap test read as "or equal" turns the neighbour of a
+        // quarantined block into a double free -- a corruption reported that
+        // did not happen, and frames dropped instead of freed, for the rest
+        // of the session. Nothing else here ever asks about an address that
+        // lands exactly on a boundary.
+        let mut q = Quarantine::new();
+        let base = at(1);
+        assert_eq!(push(&mut q, base, 4).0, Verdict::Held);
+        // The block that ends exactly where this one starts...
+        assert!(!q.holds(base - 4 * PG, 4), "el vecino de abajo se solapaba");
+        assert_eq!(push(&mut q, base - 4 * PG, 4).0, Verdict::Held);
+        // ...and the one that starts exactly where it ends.
+        assert!(
+            !q.holds(base + 4 * PG, 4),
+            "el vecino de arriba se solapaba"
+        );
+        // One page further in, either way, and they really do overlap.
+        assert!(q.holds(base - 3 * PG, 4));
+        assert!(q.holds(base + 3 * PG, 4));
+    }
+
+    #[test]
+    fn a_free_of_no_pages_inside_a_held_block_is_still_not_a_double_free() {
+        // A block of no pages covers no address, and `pages != 0` is what
+        // says so. At the held block's own base the other half of the overlap
+        // test covers for it -- the empty range ends where the block begins,
+        // so they do not overlap either way -- and that is the only address
+        // anything asks about. One page in, a free of nothing reads as a
+        // double free of everything.
+        let mut q = Quarantine::new();
+        assert_eq!(push(&mut q, at(1), 4).0, Verdict::Held);
+        for off in 0..4 {
+            assert!(
+                !q.holds(at(1) + off * PG, 0),
+                "cero paginas en +{} cubrian algo",
+                off
+            );
+        }
+    }
+
+    #[test]
+    fn a_block_too_big_to_hold_is_still_a_double_free_when_it_overlaps_one() {
+        // `TooBig` sends the range straight back to the frame pool. Answered
+        // first, the pages it shares with a block still quarantined go back
+        // now and go back again when the quarantine evicts its own copy: one
+        // frame, two owners.
+        let mut q = Quarantine::new();
+        assert_eq!(push(&mut q, at(1), 4).0, Verdict::Held);
+        let (v, ev, poisoned) = push_p(&mut q, at(1), MAX_BLOCK_PAGES + 1);
+        assert_eq!(
+            v,
+            Verdict::DoubleFree,
+            "el bloque enorme se llevo las paginas que ya estaban retenidas"
+        );
+        assert!(ev.is_empty(), "y ademas desalojo algo");
+        assert!(!poisoned, "y envenono un bloque que no retiene");
+        // Too big and overlapping nothing is still `TooBig`.
+        assert_eq!(push(&mut q, at(5), MAX_BLOCK_PAGES + 1).0, Verdict::TooBig);
+        assert_eq!(q.depth(), (1, 4));
+    }
+
+    #[test]
+    fn the_slot_an_evicted_block_leaves_stops_naming_it() {
+        // Two separate things keep a block that has left the quarantine from
+        // reading as still held: `holds` walks only the live entries, and the
+        // eviction wipes the slot behind it. Either one answers every
+        // question the other would, so neither has had a test of its own --
+        // and a slot that goes on naming its block is a free refused for
+        // ever, which is frames that never go back to the pool.
+        let mut q = Quarantine::new();
+        assert_eq!(push(&mut q, at(1), MAX_BLOCK_PAGES).0, Verdict::Held);
+        assert_eq!(push(&mut q, at(2), MAX_BLOCK_PAGES).0, Verdict::Held);
+        let (_, ev) = push(&mut q, at(3), 1);
+        assert_eq!(ev, alloc::vec![(at(1), MAX_BLOCK_PAGES)]);
+        assert_eq!(
+            q.ring[0],
+            (0, 0),
+            "la entrada desalojada seguia nombrando su bloque"
+        );
+        // Not merely outside the walk: a scan of the whole ring finds nothing
+        // of it either.
+        assert!(
+            !q.ring.iter().any(|&(b, n)| b == at(1) && n != 0),
+            "el bloque desalojado seguia en el anillo"
+        );
+        // ...and freeing it again is the ordinary free it is, not a double
+        // free.
+        assert_eq!(push(&mut q, at(1), MAX_BLOCK_PAGES).0, Verdict::Held);
     }
 }
