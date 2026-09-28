@@ -385,10 +385,11 @@ fn a_property_an_object_advertises_is_never_answered_enoent() {
 }
 
 /// The immutable connector properties, whose EINVAL the test above only
-/// sees when a display is attached to advertise them.
+/// sees when a display is attached to advertise them. link-status is not
+/// one of them: its write is taken (and never downgrades the link).
 #[test]
 fn the_immutable_connector_properties_are_refused_not_disowned() {
-    for prop_id in [PROP_EDID, PROP_LINK_STATUS, PROP_NON_DESKTOP, PROP_DPMS] {
+    for prop_id in [PROP_EDID, PROP_NON_DESKTOP, PROP_DPMS] {
         let mut upd = drm::AtomicUpdate::default();
         assert_eq!(
             atomic_stage_on(&mut upd, AtomicObject::Connector, prop_id, 0),
@@ -397,6 +398,12 @@ fn the_immutable_connector_properties_are_refused_not_disowned() {
             prop_id,
         );
     }
+    let mut upd = drm::AtomicUpdate::default();
+    assert_eq!(
+        atomic_stage_on(&mut upd, AtomicObject::Connector, PROP_LINK_STATUS, 1),
+        Ok(()),
+        "link-status is taken, never downgraded",
+    );
 }
 
 /// Every property the spec marks ATOMIC has to reach a staging arm on the
@@ -419,7 +426,9 @@ fn an_atomic_property_stages_on_its_own_object_and_nowhere_else() {
         PROP_FB_DAMAGE_CLIPS,
     ];
     let crtc = [PROP_ACTIVE, PROP_MODE_ID, PROP_OUT_FENCE_PTR];
-    let connector = [PROP_CRTC_ID];
+    // link-status is the one non-ATOMIC property a commit takes: every
+    // client sees it, and its write is accepted without moving it.
+    let connector = [PROP_CRTC_ID, PROP_LINK_STATUS];
 
     for (obj, own) in [
         (AtomicObject::Plane, &plane[..]),
@@ -428,9 +437,9 @@ fn an_atomic_property_stages_on_its_own_object_and_nowhere_else() {
     ] {
         for prop_id in own {
             let s = spec(*prop_id);
-            assert_ne!(
-                s.flags & DRM_MODE_PROP_ATOMIC,
-                0,
+            assert_eq!(
+                s.flags & DRM_MODE_PROP_ATOMIC != 0,
+                *prop_id != PROP_LINK_STATUS,
                 "{} is staged in an atomic commit but not advertised as ATOMIC",
                 s.name,
             );

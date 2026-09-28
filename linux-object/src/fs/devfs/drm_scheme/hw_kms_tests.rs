@@ -1285,10 +1285,15 @@ fn page_flip_wants_an_fb_that_holds_the_mode_and_keeps_the_format() {
 /// object of the type named (ENOENT), a property the object carries
 /// (EINVAL; an encoder carries none), then `drm_property_change_valid_get`:
 /// not immutable, and a value the property's type admits (EINVAL). Any
-/// value for any known property on any existing object was "set".
+/// value for any known property on any existing object was "set". What
+/// a write that passes the checks does is `setproperty_commit_tests`'s;
+/// here it runs on the atomic driver with the pipe up, where every value
+/// below that Linux accepts is a one-property commit that changes
+/// nothing the check phase minds.
 #[test]
 fn a_property_write_is_checked_against_the_object_and_the_property() {
     let _screen = kms_emu::attach(32, 8);
+    drm::set_atomic_enabled(true);
     let c = Client::open(0);
     let (crtcs, conns) = topology(&c);
     let (crtc, conn) = (crtcs[0], conns[0]);
@@ -1296,6 +1301,28 @@ fn a_property_write_is_checked_against_the_object_and_the_property() {
     let plane = planes(&c)[0];
     let buf = c.create_dumb(32, 8);
     let fb = c.addfb2(&buf);
+    let mut cap: [u64; 2] = [DRM_CLIENT_CAP_ATOMIC, 1];
+    c.ioctl(DRM_IOCTL_SET_CLIENT_CAP, &mut cap)
+        .expect("SET_CLIENT_CAP ATOMIC");
+    let panel = make_modeinfo(32, 8);
+    let mut panel_mode = DrmModeCreateBlob {
+        data: panel.as_ptr() as u64,
+        length: panel.len() as u32,
+        blob_id: 0,
+    };
+    c.ioctl(DRM_IOCTL_MODE_CREATEPROPBLOB, &mut panel_mode)
+        .expect("CREATEPROPBLOB");
+    super::out_fence_tests::commit(
+        &c,
+        &super::out_fence_tests::Request::new(
+            &[crtc, plane],
+            &[2, 2],
+            &[PROP_MODE_ID, PROP_ACTIVE, PROP_FB_ID, PROP_CRTC_ID],
+            &[panel_mode.blob_id as u64, 1, fb as u64, crtc as u64],
+        ),
+        DRM_MODE_ATOMIC_ALLOW_MODESET,
+    )
+    .expect("the pipe comes up");
     let einval = Err(FsError::InvalidParam);
     let enoent = Err(FsError::EntryNotFound);
     let set = |obj_id: u32, obj_type: u32, prop_id: u32, value: u64| {
@@ -1377,9 +1404,19 @@ fn a_property_write_is_checked_against_the_object_and_the_property() {
         ),
         einval
     );
+    assert_eq!(set(plane, DRM_MODE_OBJECT_PLANE, PROP_CRTC_X, 0), Ok(0));
     assert_eq!(
-        set(plane, DRM_MODE_OBJECT_PLANE, PROP_SRC_W, u32::MAX as u64),
+        set(plane, DRM_MODE_OBJECT_PLANE, PROP_SRC_W, 32 << 16),
         Ok(0)
+    );
+    assert_eq!(
+        set(
+            plane,
+            DRM_MODE_OBJECT_PLANE,
+            PROP_SRC_W,
+            u32::MAX as u64 + 1
+        ),
+        einval
     );
     // An object property: 0, or an object of the property's type.
     assert_eq!(set(plane, DRM_MODE_OBJECT_PLANE, PROP_FB_ID, 0), Ok(0));
@@ -1412,22 +1449,20 @@ fn a_property_write_is_checked_against_the_object_and_the_property() {
         einval,
         "not a 32-bit id, whatever its low word names"
     );
-    // A blob property: 0, or an existing blob.
-    let bytes = [7u8; 68];
-    let mut blob = DrmModeCreateBlob {
-        data: bytes.as_ptr() as u64,
-        length: bytes.len() as u32,
-        blob_id: 0,
-    };
-    c.ioctl(DRM_IOCTL_MODE_CREATEPROPBLOB, &mut blob)
-        .expect("CREATEPROPBLOB");
-    assert_eq!(set(crtc, DRM_MODE_OBJECT_CRTC, PROP_MODE_ID, 0), Ok(0));
+    // A blob property: 0, or an existing blob. Unsetting the mode is a
+    // modeset, which a one-property commit cannot ask for (EINVAL from
+    // the check, not from the value); the mode already set is a no-op.
+    assert_eq!(
+        set(crtc, DRM_MODE_OBJECT_CRTC, PROP_MODE_ID, 0),
+        einval,
+        "a modeset without ALLOW_MODESET"
+    );
     assert_eq!(
         set(
             crtc,
             DRM_MODE_OBJECT_CRTC,
             PROP_MODE_ID,
-            blob.blob_id as u64
+            panel_mode.blob_id as u64
         ),
         Ok(0)
     );
@@ -1435,9 +1470,6 @@ fn a_property_write_is_checked_against_the_object_and_the_property() {
         set(crtc, DRM_MODE_OBJECT_CRTC, PROP_MODE_ID, 0xdead_beef),
         einval
     );
-    let mut blob_id = blob.blob_id;
-    c.ioctl(DRM_IOCTL_MODE_DESTROYPROPBLOB, &mut blob_id)
-        .expect("DESTROYPROPBLOB");
 
     // SETPROPERTY is the same call with the connector type.
     #[repr(C)]
