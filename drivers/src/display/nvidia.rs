@@ -13107,17 +13107,23 @@ impl NvidiaGpu {
                 // Linux nouveau has no cap of its own. The old 64 turned a
                 // vkQueueSubmit with 65 semaphores into VK_ERROR_DEVICE_LOST.
                 const MAX_EXEC_SYNC: u32 = 256;
-                if req.wait_count > MAX_EXEC_SYNC || (req.wait_count > 0 && req.wait_ptr == 0) {
+                // The caps are this driver's (NVK batches 256 syncs). A
+                // count with no array is not a cap: `nouveau_exec_ucopy`
+                // copies each list with `u_memcpya` and faults, so it goes
+                // through the user range check below with the pushes.
+                if req.wait_count > MAX_EXEC_SYNC {
                     crate::klog_warn!(
-                        "[nouveau-uapi] EXEC: wait_count={} exceeds the {} an EXEC may carry (or wait_ptr is null)",
-                        req.wait_count, MAX_EXEC_SYNC
+                        "[nouveau-uapi] EXEC: wait_count={} exceeds the {} an EXEC may carry",
+                        req.wait_count,
+                        MAX_EXEC_SYNC
                     );
                     return Err(nv::EOPNOTSUPP);
                 }
-                if req.sig_count > MAX_EXEC_SYNC || (req.sig_count > 0 && req.sig_ptr == 0) {
+                if req.sig_count > MAX_EXEC_SYNC {
                     crate::klog_warn!(
-                        "[nouveau-uapi] EXEC: sig_count={} exceeds the {} an EXEC may carry (or sig_ptr is null)",
-                        req.sig_count, MAX_EXEC_SYNC
+                        "[nouveau-uapi] EXEC: sig_count={} exceeds the {} an EXEC may carry",
+                        req.sig_count,
+                        MAX_EXEC_SYNC
                     );
                     return Err(nv::EOPNOTSUPP);
                 }
@@ -13400,12 +13406,17 @@ impl NvidiaGpu {
                     }
                     return Ok(0);
                 }
-                if req.push_count > MAX_EXEC_PUSH || req.push_ptr == 0 {
+                // More pushes than the limit this driver advertises
+                // (`GETPARAM EXEC_PUSH_MAX`): `nouveau_exec_ioctl_exec`
+                // answers EINVAL to a count over its own maximum. The
+                // pointer was range-checked above.
+                if req.push_count > MAX_EXEC_PUSH {
                     crate::klog_warn!(
-                        "[nouveau-uapi] EXEC: push_count={} must be between 1 and {} (got push_ptr={:#x})",
-                        req.push_count, MAX_EXEC_PUSH, req.push_ptr
+                        "[nouveau-uapi] EXEC: push_count={} exceeds the {} an EXEC may carry",
+                        req.push_count,
+                        MAX_EXEC_PUSH
                     );
-                    return Err(nv::EOPNOTSUPP);
+                    return Err(nv::EINVAL);
                 }
                 let pushes = unsafe {
                     core::slice::from_raw_parts(
