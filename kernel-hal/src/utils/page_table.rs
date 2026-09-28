@@ -1254,6 +1254,93 @@ mod walker_tests {
         assert_eq!(seen(&three), vec![(1, 5 * G), (2, 7 * G + 4 * M)]);
     }
 
+    /// The walk stops at the last level, and a 4 KiB entry is the last level.
+    ///
+    /// A 4 KiB entry maps a frame, and on x86_64 it carries no page-size bit
+    /// to say so -- `is_leaf()` is false for it, because that bit means
+    /// something else at this level. One level too many and the dump walks
+    /// INTO the process's own data, reads 512 words of it as page-table
+    /// entries, and names addresses that exist nowhere. The frame below holds
+    /// what that looks like: words that read as present entries.
+    #[test]
+    fn the_walk_stops_at_the_last_level() {
+        use core::cell::RefCell;
+
+        let mut pt = a_table::<PageTableLevel4>();
+        let frames = PhysFrame::new_contiguous(1, 12);
+        assert!(!frames.is_empty(), "no frame");
+        let data = frames[0].paddr();
+        // SAFETY: the frame is this test's own, reserved just above.
+        let words = unsafe {
+            slice::from_raw_parts_mut(crate::mem::phys_to_virt(data) as *mut u64, PAGE_SIZE / 8)
+        };
+        for w in words.iter_mut() {
+            *w = PRESENT | 0x1000;
+        }
+
+        let vaddr = 0x3600_0000_0000;
+        pt.map(Page::new_aligned(vaddr, PageSize::Size4K), data, rw())
+            .unwrap();
+
+        let deepest = RefCell::new(0usize);
+        pt.walk(
+            table_of(pt.table_phys()),
+            Pt4::root_walk_level(),
+            0,
+            usize::MAX,
+            &|level: usize, _i: usize, _v: usize, _e: &TestPTE| {
+                let mut d = deepest.borrow_mut();
+                *d = (*d).max(level);
+            },
+        );
+        assert_eq!(
+            deepest.into_inner(),
+            3,
+            "el recorrido ha bajado por debajo del ultimo nivel"
+        );
+    }
+
+    /// `dump`'s limit is a limit: the entry that reaches it is the last one
+    /// named, not the first one over it.
+    ///
+    /// It is what keeps a panic-time dump of a full address space from
+    /// filling the console with the one thing that was worth reading pushed
+    /// off the top.
+    #[test]
+    fn the_walk_names_as_many_entries_as_it_was_allowed_and_no_more() {
+        use core::cell::RefCell;
+
+        let mut pt = a_table::<PageTableLevel4>();
+        let vaddr = 0x3700_0000_0000;
+        for i in 0..3 {
+            pt.map(
+                Page::new_aligned(vaddr + i * K, PageSize::Size4K),
+                0x1000 * (i + 1),
+                rw(),
+            )
+            .unwrap();
+        }
+
+        let count = |limit: usize| {
+            let n = RefCell::new(0usize);
+            pt.walk(
+                table_of(pt.table_phys()),
+                Pt4::root_walk_level(),
+                0,
+                limit,
+                &|_l: usize, _i: usize, _v: usize, _e: &TestPTE| {
+                    *n.borrow_mut() += 1;
+                },
+            );
+            n.into_inner()
+        };
+
+        // One entry at each of the three upper levels, then the leaves.
+        assert_eq!(count(usize::MAX), 3 + 3);
+        assert_eq!(count(2), 3 + 2);
+        assert_eq!(count(1), 3 + 1);
+    }
+
     // ── the gather window ──────────────────────────────────────────────────
 
     /// `fork` write-protects every mapping one at a time and pays for one
