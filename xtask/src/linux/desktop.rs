@@ -1578,19 +1578,15 @@ fn write_freedoom_wrapper(rootfs: &Path) {
           echo \"eclipse-freedoom: iwad=$IWAD wlr_renderer=${WLR_RENDERER:-unset}\"\n\
           # The session bus, and why the engine does not get one.\n\
           #\n\
-          # SDL2 calls SDL_DBus_Init() from SDL_InitSubSystem before it looks\n\
-          # at a single subsystem, and GZDoom's first SDL call is SDL_Init(0)\n\
-          # -- no subsystems at all -- immediately after the version banner it\n\
-          # prints. That banner followed by nothing is exactly what Freedoom\n\
-          # does here, for as long as you let it sit. libdbus waits out the\n\
-          # SASL handshake with NO timeout (the 25s one only covers the Hello\n\
-          # reply), so a bus that never finishes the handshake parks the game\n\
-          # for good. A game wants the bus for nothing: SDL uses it only for\n\
-          # screensaver inhibit and ibus. So point the engine at an address\n\
-          # with nothing behind it -- connect() fails at once, libdbus gives\n\
-          # up, SDL carries on. It is the same muzzle DBUS_SESSION_BUS_ADDRESS\n\
-          # carried session-wide before there was a daemon to point it at.\n\
-          # ECLIPSE_FREEDOOM_BUS=1 keeps the real bus, to retest it.\n\
+          # NOT a fix, and not the cause of anything: the banner-then-silence\n\
+          # hang was the seteuid() in GZDoom's own prologue, which musl turns\n\
+          # into __synccall and the kernel could not deliver to a thread whose\n\
+          # stack is mmap(PROT_NONE) + mprotect(RW). Running the game against a\n\
+          # dead address hung just the same, which is what ruled the bus out.\n\
+          # The muzzle stays because a game wants the bus for nothing -- SDL\n\
+          # uses it only for screensaver inhibit and ibus -- and one fewer\n\
+          # thing to talk to at startup is one fewer thing to wait on.\n\
+          # ECLIPSE_FREEDOOM_BUS=1 keeps the real bus.\n\
           case \"${ECLIPSE_FREEDOOM_BUS:-0}\" in\n\
           \x20 1|on|yes|true)\n\
           \x20 \x20 say \"eclipse-freedoom: session bus kept: ${DBUS_SESSION_BUS_ADDRESS:-unset}\" ;;\n\
