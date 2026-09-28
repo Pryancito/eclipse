@@ -173,6 +173,9 @@ impl DrmDev {
             return; // io_control will reject it with EFAULT in a moment
         }
         let req = unsafe { *(data as *const DrmWaitVblank) };
+        if wait_vblank_check(req.typ).is_err() {
+            return; // the sync arm refuses it at once; nothing to sleep for
+        }
         if req.typ & _DRM_VBLANK_EVENT != 0 {
             return; // event form: delivered by the timer queue, never blocks
         }
@@ -1273,6 +1276,7 @@ impl DrmDev {
                 // deliver a DRM_EVENT_VBLANK on the card fd; otherwise fill the
                 // reply and return immediately instead of blocking.
                 let req = unsafe { &mut *(data as *mut DrmWaitVblank) };
+                wait_vblank_check(req.typ)?;
                 let typ = req.typ;
                 let signal = req.val1;
                 // Only ask the driver for a real vblank when it has hardware
@@ -3148,6 +3152,44 @@ struct DrmSyncobjTransfer {
 
 // WAIT_VBLANK request type flags (`<drm/drm.h>`).
 const _DRM_VBLANK_EVENT: u32 = 0x0400_0000;
+/// The rest of `drm_vblank_seq_type`, as `drm_wait_vblank_ioctl` reads it.
+const _DRM_VBLANK_TYPES_MASK: u32 = 0x1; // ABSOLUTE = 0, RELATIVE = 1
+const _DRM_VBLANK_NEXTONMISS_FLAG: u32 = 0x1000_0000;
+const _DRM_VBLANK_SECONDARY: u32 = 0x2000_0000;
+const _DRM_VBLANK_SIGNAL: u32 = 0x4000_0000;
+const _DRM_VBLANK_FLAGS_MASK: u32 =
+    _DRM_VBLANK_EVENT | _DRM_VBLANK_SIGNAL | _DRM_VBLANK_SECONDARY | _DRM_VBLANK_NEXTONMISS_FLAG;
+const _DRM_VBLANK_HIGH_CRTC_SHIFT: u32 = 1;
+const _DRM_VBLANK_HIGH_CRTC_MASK: u32 = 0x1f << _DRM_VBLANK_HIGH_CRTC_SHIFT;
+
+/// What `drm_wait_vblank_ioctl` refuses before it looks at the sequence:
+/// `_DRM_VBLANK_SIGNAL` (signals have not been supported for years), any
+/// bit outside the type, flag and high-CRTC masks, and a pipe index (the
+/// high-CRTC field, or `_DRM_VBLANK_SECONDARY` for pipe 1) the card does
+/// not have. Every one is EINVAL. This arm used to read only RELATIVE,
+/// NEXTONMISS and EVENT and answer the rest with pipe 0's counter, so a
+/// client waiting on the second head of a one-head card, or asking for a
+/// signal, got a vblank instead of the error Linux gives.
+fn wait_vblank_check(typ: u32) -> Result<()> {
+    if typ & _DRM_VBLANK_SIGNAL != 0 {
+        return Err(FsError::InvalidParam);
+    }
+    if typ & !(_DRM_VBLANK_TYPES_MASK | _DRM_VBLANK_FLAGS_MASK | _DRM_VBLANK_HIGH_CRTC_MASK) != 0 {
+        return Err(FsError::InvalidParam);
+    }
+    let high_pipe = typ & _DRM_VBLANK_HIGH_CRTC_MASK;
+    let pipe_index = if high_pipe != 0 {
+        (high_pipe >> _DRM_VBLANK_HIGH_CRTC_SHIFT) as usize
+    } else if typ & _DRM_VBLANK_SECONDARY != 0 {
+        1
+    } else {
+        0
+    };
+    if pipe_index != 0 && pipe_index >= drm::crtc_count() {
+        return Err(FsError::InvalidParam);
+    }
+    Ok(())
+}
 
 // Synthetic KMS property ids (software KMS). Linux allocates property object
 // ids from the same idr as every other mode object; here they are fixed small
@@ -13254,6 +13296,115 @@ mod off_crtc_event_tests {
         assert_eq!(commit(&c, &active(0), EVENT), Err(FsError::InvalidParam));
         assert_eq!(commit(&c, &plane_only, EVENT), Err(FsError::InvalidParam));
         assert_eq!(events(&c), 0);
+    }
+}
+
+#[cfg(test)]
+mod wait_vblank_validation_tests {
+    //! What `WAIT_VBLANK` refuses, driven through the ioctl entry point the
+    //! way `drmWaitVBlank` drives it: `_DRM_VBLANK_SIGNAL`, a bit outside
+    //! the masks, and a pipe the card does not have, each EINVAL in
+    //! `drm_wait_vblank_ioctl` before the sequence is even looked at. This
+    //! arm answered all of them with pipe 0's counter.
+    use super::gl_client_sequence_tests::Client;
+    use super::*;
+    use crate::fs::devfs::kms_emu::{self, EmuGpu};
+
+    const RELATIVE: u32 = 0x1;
+
+    fn wait(c: &Client, typ: u32, sequence: u32) -> Result<u32> {
+        let mut req = DrmWaitVblank {
+            typ,
+            sequence,
+            val1: 0,
+            val2: 0,
+        };
+        c.ioctl(DRM_IOCTL_WAIT_VBLANK, &mut req)
+            .map(|_| req.sequence)
+    }
+
+    fn high_crtc(index: u32) -> u32 {
+        index << _DRM_VBLANK_HIGH_CRTC_SHIFT
+    }
+
+    #[test]
+    fn a_signal_an_unknown_bit_or_a_missing_pipe_is_refused_before_the_wait() {
+        let _screen = kms_emu::attach(32, 8);
+        let c = Client::open(0);
+
+        // The shapes libdrm sends on a one-head card all go through: a
+        // relative query, the same with the high-CRTC field naming pipe 0,
+        // NEXTONMISS, and the event form.
+        let now = wait(&c, RELATIVE, 0).expect("a relative query");
+        assert_eq!(wait(&c, RELATIVE | high_crtc(0), 0), Ok(now));
+        assert_eq!(
+            wait(&c, RELATIVE | _DRM_VBLANK_NEXTONMISS_FLAG, 0).map(|s| s >= now),
+            Ok(true)
+        );
+        assert_eq!(wait(&c, RELATIVE | _DRM_VBLANK_EVENT, 1).is_ok(), true);
+
+        // Signals: EINVAL, whatever else is set.
+        for typ in [
+            _DRM_VBLANK_SIGNAL,
+            _DRM_VBLANK_SIGNAL | RELATIVE,
+            _DRM_VBLANK_SIGNAL | _DRM_VBLANK_EVENT | RELATIVE,
+        ] {
+            assert_eq!(wait(&c, typ, 0), Err(FsError::InvalidParam), "{typ:#x}");
+        }
+        // A bit outside the type, flag and high-CRTC masks.
+        for bit in [1 << 6, 1 << 12, 1 << 25, 1 << 27, 1 << 31] {
+            assert_eq!(
+                wait(&c, RELATIVE | bit, 0),
+                Err(FsError::InvalidParam),
+                "bit {bit:#x}"
+            );
+        }
+        // A pipe this card does not have: the high-CRTC field past 0, or
+        // SECONDARY (pipe 1).
+        for typ in [
+            RELATIVE | high_crtc(1),
+            RELATIVE | high_crtc(31),
+            RELATIVE | _DRM_VBLANK_SECONDARY,
+            RELATIVE | _DRM_VBLANK_EVENT | _DRM_VBLANK_SECONDARY,
+            RELATIVE | _DRM_VBLANK_EVENT | high_crtc(1),
+        ] {
+            assert_eq!(wait(&c, typ, 0), Err(FsError::InvalidParam), "{typ:#x}");
+        }
+        // Refused before anything is scheduled: the fd carries nothing (the
+        // one accepted event above is owed at the next vblank, which no
+        // timer delivers here).
+        let mut buf = [0u8; 128];
+        assert_eq!(c.read_events(&mut buf), Err(FsError::Again));
+    }
+
+    /// With two heads (two drivers that own scanout, each with a CRTC of
+    /// its own), pipe 1 exists -- by the high-CRTC field or as SECONDARY --
+    /// and pipe 2 does not. What separates reading the field from merely
+    /// refusing anything in it.
+    #[test]
+    fn a_second_head_makes_pipe_one_a_real_pipe_and_pipe_two_still_not() {
+        let screen = kms_emu::attach(64, 16);
+        let _a = screen.attach_gpu(EmuGpu::hardware_kms("emu-a").with_ids(40, 41, 42));
+        let _b = screen.attach_gpu(EmuGpu::hardware_kms("emu-b").with_ids(60, 61, 62));
+        let c = Client::open(0);
+        assert_eq!(drm::crtc_count(), 2);
+
+        assert!(wait(&c, RELATIVE, 0).is_ok());
+        assert!(
+            wait(&c, RELATIVE | high_crtc(1), 0).is_ok(),
+            "pipe 1 by the field"
+        );
+        assert!(
+            wait(&c, RELATIVE | _DRM_VBLANK_SECONDARY, 0).is_ok(),
+            "pipe 1 as SECONDARY"
+        );
+        for typ in [
+            RELATIVE | high_crtc(2),
+            RELATIVE | high_crtc(31),
+            RELATIVE | _DRM_VBLANK_SECONDARY | high_crtc(2),
+        ] {
+            assert_eq!(wait(&c, typ, 0), Err(FsError::InvalidParam), "{typ:#x}");
+        }
     }
 }
 

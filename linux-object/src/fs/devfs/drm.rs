@@ -7139,6 +7139,18 @@ pub fn get_crtc(id: u32) -> Option<DrmCrtc> {
     })
 }
 
+/// How many CRTCs the card has, for the pipe index a `WAIT_VBLANK` names
+/// (`_DRM_VBLANK_HIGH_CRTC_MASK` or `_DRM_VBLANK_SECONDARY`). One on the
+/// software path; the drivers' own count otherwise. Only consulted for a
+/// pipe index above 0, which nothing on a one-output desktop sends, so the
+/// driver probe behind `get_resources` is not on the per-frame path.
+pub fn crtc_count() -> usize {
+    if software_kms_active() {
+        return 1;
+    }
+    get_resources().1.len()
+}
+
 pub fn get_planes() -> Vec<u32> {
     if software_kms_active() {
         // One synthetic primary plane bound to the synthetic CRTC.
