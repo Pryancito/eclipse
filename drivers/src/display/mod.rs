@@ -17,6 +17,11 @@ mod nvidia;
 mod nvidia_hooks;
 mod uefi;
 
+/// The driver's own name for a private-range DRM ioctl NR, so the kernel's
+/// crash-time ioctl trail (`linux_object::fs::devfs::drm_trail`) can print
+/// `EXEC` where it would otherwise print `0x52`.
+#[cfg(target_arch = "x86_64")]
+pub use nouveau_uapi::nouveau_ioctl_name;
 #[cfg(target_arch = "x86_64")]
 pub use nouveau_uapi::{
     console_gsp_enabled, exec_fast_enabled, hwflip_enabled, set_console_gsp_enabled,

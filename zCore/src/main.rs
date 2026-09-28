@@ -669,11 +669,17 @@ fn primary_main(config: kernel_hal::KernelConfig) {
                      las bandas de 16 filas que el panel ya tiene"
                 );
             }
-            if kernel_hal::cmdline::flag(&options.cmdline, "drm.present_repair") {
-                linux_object::fs::devfs::drm::set_present_repair_enabled(true);
+            // Present repair is ON by default: GLES2/llvmpipe sessions (what
+            // `renderer=auto` still picks on QEMU/VirtualBox) hand the kernel a
+            // buffer whose tiles are still arriving, and there is no fence to
+            // wait on. Re-copying the bands that moved under the blit is what
+            // clears the menu garbage. `drm.present_repair=off` restores the
+            // old "copy once and hope" behaviour.
+            if kernel_hal::cmdline::is_off(&options.cmdline, "drm.present_repair") {
+                linux_object::fs::devfs::drm::set_present_repair_enabled(false);
                 klog_info!(
-                    "Eclipse: drm.present_repair ON -- un present que pilla el origen \
-                     moviendose vuelve a copiar las bandas que se movieron"
+                    "Eclipse: drm.present_repair=off -- un present que pilla el origen \
+                     moviendose deja las baldosas rancias en el panel"
                 );
             }
             // Nouveau-compatible driver-specific ioctl surface on the NVIDIA

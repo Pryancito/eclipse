@@ -19,6 +19,7 @@ use rcore_fs::vfs::*;
 use zircon_object::vm::VmObject;
 
 use super::drm;
+use super::drm_trail;
 use crate::error::LxError;
 use zcore_drivers::display::edid;
 
@@ -1125,9 +1126,14 @@ impl DrmDev {
             }
             DRM_IOCTL_MODE_ADDFB2 => {
                 let cmd = unsafe { &mut *(data as *mut DrmModeFbCmd2) };
-                if let Some(fb_id) =
-                    drm::create_fb(cmd.handles[0], cmd.width, cmd.height, cmd.pitches[0])
-                {
+                addfb2_check(cmd)?;
+                if let Some(fb_id) = drm::create_fb_with_format(
+                    cmd.handles[0],
+                    cmd.width,
+                    cmd.height,
+                    cmd.pitches[0],
+                    cmd.pixel_format,
+                ) {
                     cmd.fb_id = fb_id;
                     Ok(0)
                 } else {
@@ -1340,7 +1346,13 @@ impl DrmDev {
                     cmd.height = fb.height;
                     cmd.pitch = fb.pitch;
                     cmd.bpp = 32;
-                    cmd.depth = 24;
+                    // `drm_mode_getfb` reports the format's depth: 32 with an
+                    // alpha channel, 24 without.
+                    cmd.depth = if fb.pixel_format == drm::DRM_FORMAT_ARGB8888 {
+                        32
+                    } else {
+                        24
+                    };
                     // The backing GEM handle goes only to the client that
                     // created this framebuffer. Linux gates it on DRM master
                     // or CAP_SYS_ADMIN and zeroes the field otherwise, with
@@ -1374,7 +1386,7 @@ impl DrmDev {
                 if let Some(fb) = drm::get_fb(cmd.fb_id) {
                     cmd.width = fb.width;
                     cmd.height = fb.height;
-                    cmd.pixel_format = 0x3432_5258; // DRM_FORMAT_XRGB8888 ("XR24")
+                    cmd.pixel_format = fb.pixel_format;
                     cmd.flags = 0;
                     // Same gate as GETFB above; `drm_mode_getfb2_ioctl`
                     // carries the identical check.
@@ -1900,10 +1912,7 @@ impl DrmDev {
                     res.possible_crtcs = plane.possible_crtcs;
                     // Advertise the formats the software scanout consumes, via
                     // the two-call pattern (count first, then fill).
-                    const FORMATS: [u32; 2] = [
-                        0x3432_5258, // DRM_FORMAT_XRGB8888 ("XR24")
-                        0x3432_5241, // DRM_FORMAT_ARGB8888 ("AR24")
-                    ];
+                    const FORMATS: [u32; 2] = drm::SCANOUT_FORMATS;
                     if res.format_type_ptr != 0 && res.count_format_types >= FORMATS.len() as u32 {
                         ucheck_n::<u32>(res.format_type_ptr as usize, FORMATS.len())?;
                         unsafe {
@@ -2122,7 +2131,14 @@ impl DrmDev {
                     return Err(FsError::InvalidParam);
                 }
                 if req.count_objs == 0 {
-                    // Empty commit: no objects, no events (Linux allows it).
+                    // Empty commit: Linux allows it, but not with an event.
+                    // `prepare_signaling` refuses a `PAGE_FLIP_EVENT` with
+                    // no CRTC in the state ("user mode pends on event which
+                    // will never reach"); this answered 0 and queued nothing,
+                    // and the client's `drmHandleEvent` then waited forever.
+                    if want_event {
+                        return Err(FsError::InvalidParam);
+                    }
                     return Ok(0);
                 }
                 let mut upd = drm::AtomicUpdate::default();
@@ -3602,6 +3618,66 @@ struct DrmModeFbCmd2 {
     modifier: [u64; 4],
 }
 
+/// `drm_mode_fb_cmd2.flags`: the two Linux knows. Anything else is EINVAL.
+const DRM_MODE_FB_INTERLACED: u32 = 1 << 0;
+const DRM_MODE_FB_MODIFIERS: u32 = 1 << 1;
+
+/// What `drm_internal_framebuffer_create` and `framebuffer_check` refuse
+/// before a driver ever sees an `ADDFB2`, for the one plane layout here: a
+/// single 32-bit plane, no modifiers (`DRM_CAP_ADDFB2_MODIFIERS` is 0).
+///
+/// None of it was checked: `pixel_format`, `flags`, `modifier`, `offsets`
+/// and the extra planes were read for the log line and nothing else, so an
+/// NV12 (`mpv --vo=drm`), a 10-bit or a modifier-tiled buffer was wrapped
+/// as if it were XR24 and scanned out as garbage, where Linux answers
+/// EINVAL and the client falls back or says why.
+///
+/// `offsets[0]` is the one place this is stricter than Linux, which allows
+/// a plane to start inside its buffer: the framebuffer here is its buffer's
+/// base (`phys_addr`, and the driver's own fb takes the handle alone), so
+/// a non-zero offset would silently scan out from the wrong place. No
+/// client of this tree sends one (GBM and dumb buffers start at 0).
+fn addfb2_check(cmd: &DrmModeFbCmd2) -> Result<()> {
+    if cmd.flags & !(DRM_MODE_FB_INTERLACED | DRM_MODE_FB_MODIFIERS) != 0 {
+        return Err(FsError::InvalidParam);
+    }
+    if cmd.flags & DRM_MODE_FB_MODIFIERS != 0 {
+        // "driver does not support fb modifiers"
+        return Err(FsError::InvalidParam);
+    }
+    if !drm::SCANOUT_FORMATS.contains(&cmd.pixel_format) {
+        // "bad framebuffer format" / no plane supports it
+        return Err(FsError::InvalidParam);
+    }
+    if cmd.width == 0 || cmd.height == 0 {
+        return Err(FsError::InvalidParam);
+    }
+    if cmd.handles[0] == 0 {
+        // "no buffer object handle for plane 0"
+        return Err(FsError::InvalidParam);
+    }
+    // "bad pitch": less than a row of 4-byte pixels. (`create_fb` checks
+    // it against the buffer as well.)
+    if u64::from(cmd.pitches[0]) < u64::from(cmd.width) * 4 {
+        return Err(FsError::InvalidParam);
+    }
+    if cmd.offsets[0] != 0 {
+        return Err(FsError::InvalidParam);
+    }
+    // "bad fb modifier" without DRM_MODE_FB_MODIFIERS, and nothing on the
+    // planes the format does not have.
+    if cmd.modifier[0] != 0 {
+        return Err(FsError::InvalidParam);
+    }
+    for i in 1..4 {
+        if cmd.handles[i] != 0 || cmd.pitches[i] != 0 || cmd.offsets[i] != 0 || cmd.modifier[i] != 0
+        {
+            return Err(FsError::InvalidParam);
+        }
+    }
+    Ok(())
+}
+
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 struct DrmModeGetCrtc {
@@ -4638,9 +4714,82 @@ fn reconcile_sizes(cmd: u32, canon: u32) -> IoctlSizes {
 /// and only when the sizes actually differ — the overwhelmingly common case is
 /// an exact match, which dispatches straight through with no copy at all.
 fn drm_ioctl(dev: &DrmDev, cmd: u32, data: usize) -> Result<usize> {
-    drm_ioctl_reconciled(cmd, data, |canon, kdata| {
+    // Read the first field BEFORE dispatching: for an `_IOWR` it is an input
+    // the handler is free to overwrite with its reply, and the trail wants to
+    // say what was ASKED (`GETPARAM` param 13, `GEM_INFO` handle 7), not what
+    // came back -- the answer is already in `ret`.
+    let arg0 = first_arg_word(cmd, data);
+    let ret = drm_ioctl_reconciled(cmd, data, |canon, kdata| {
         dev.drm_ioctl_dispatch(canon, kdata)
-    })
+    });
+    drm_trail::record(
+        drm::current_pid() as u32,
+        drm::current_tid() as u32,
+        cmd,
+        arg0,
+        trail_ret(&ret),
+    );
+    ret
+}
+
+/// Record a DRM ioctl the SYSCALL layer answered by itself.
+///
+/// Three families never reach [`drm_ioctl`] because they have to touch the
+/// process fd table: PRIME dma-buf export/import, syncobj export/import, and
+/// `SYNCOBJ_EVENTFD`. They are also the three a Vulkan driver leans on
+/// hardest, so a trail without them would skip exactly the calls that hand
+/// NVK an object it then dereferences.
+///
+/// `data` is read here, *after* the call rather than before it as
+/// [`drm_ioctl`] does: all three keep their subject (`handle`) in the first
+/// word and write their reply into a later field, so the distinction the
+/// other path needs does not arise.
+pub fn trail_record(cmd: u32, data: usize, ret: i64) {
+    drm_trail::record(
+        drm::current_pid() as u32,
+        drm::current_tid() as u32,
+        cmd,
+        first_arg_word(cmd, data),
+        ret,
+    );
+}
+
+/// The first 64-bit word of an ioctl's argument struct, or 0 when there is
+/// none or it cannot be read.
+///
+/// Every DRM argument struct starts on an 8-byte boundary and its first field
+/// is the one that names the subject: `param`, `handle`, `channel`,
+/// `crtc_id`, `capability`. Structs shorter than 8 bytes (`MODE_RMFB` and
+/// friends carry a bare `__u32`) read as 0 rather than over their end.
+///
+/// This must not be able to fault: it runs on the ordinary ioctl path for
+/// every call, including ones whose argument the dispatcher is about to
+/// reject. `UserInPtr::read` is the checked read the rest of this file uses,
+/// and its error is simply "no value".
+fn first_arg_word(cmd: u32, data: usize) -> u64 {
+    if !arg_word_readable(cmd, data) {
+        return 0;
+    }
+    kernel_hal::user::UserInPtr::<u64>::from(data)
+        .read()
+        .unwrap_or(0)
+}
+
+/// Whether [`first_arg_word`] may read eight bytes at `data`.
+///
+/// Split out from the read itself so it can be tested: the read is the one
+/// part of this that cannot run on the host, and the decision NOT to read is
+/// the part that keeps a trail entry from turning into a fault.
+fn arg_word_readable(cmd: u32, data: usize) -> bool {
+    ioc_size(cmd) >= 8 && ucheck(data, 8).is_ok()
+}
+
+/// An ioctl result as the trail records it: a count, or a negative errno.
+fn trail_ret(ret: &Result<usize>) -> i64 {
+    match ret {
+        Ok(n) => *n as i64,
+        Err(e) => -(crate::error::LxError::from(e) as i64),
+    }
 }
 
 /// [`drm_ioctl`] with the dispatch injected, so the copy-in / zero-fill /
@@ -5816,12 +5965,11 @@ mod gl_client_sequence_tests {
         /// what a client with an alignment requirement, or a client whose
         /// surface is narrower than the mode, really registers.
         pub(super) fn addfb2_narrow(&self, buf: &DrmModeCreateDumb, width: u32) -> u32 {
-            const DRM_FORMAT_XRGB8888: u32 = 0x3443_5258;
             let mut cmd = DrmModeFbCmd2 {
                 fb_id: 0,
                 width,
                 height: buf.height,
-                pixel_format: DRM_FORMAT_XRGB8888,
+                pixel_format: drm::DRM_FORMAT_XRGB8888,
                 flags: 0,
                 handles: [buf.handle, 0, 0, 0],
                 pitches: [buf.pitch, 0, 0, 0],
@@ -5835,13 +5983,13 @@ mod gl_client_sequence_tests {
 
         pub(super) fn addfb2(&self, buf: &DrmModeCreateDumb) -> u32 {
             // DRM_FORMAT_XRGB8888, which is what every GL swapchain on this
-            // tree ends up presenting.
-            const DRM_FORMAT_XRGB8888: u32 = 0x3443_5258;
+            // tree ends up presenting. (This used to spell the fourcc
+            // "XRC4", and nothing noticed, because nothing looked.)
             let mut cmd = DrmModeFbCmd2 {
                 fb_id: 0,
                 width: buf.width,
                 height: buf.height,
-                pixel_format: DRM_FORMAT_XRGB8888,
+                pixel_format: drm::DRM_FORMAT_XRGB8888,
                 flags: 0,
                 handles: [buf.handle, 0, 0, 0],
                 pitches: [buf.pitch, 0, 0, 0],
@@ -7892,6 +8040,9 @@ mod kms_scanout_tests {
     fn the_probe_alone_measures_and_does_not_repair() {
         let screen = kms_emu::attach(192, 200);
         drm::set_present_probe_enabled(true);
+        // Repair is ON by default; this test is specifically the probe WITHOUT
+        // the repair pass, so disarm it for the duration.
+        drm::set_present_repair_enabled(false);
         let c = Client::open(0);
         let buf = c.create_dumb(192, 200);
         paint(&buf, |x, y| tag(0x00AA_0000, x, y));
@@ -7978,6 +8129,10 @@ mod kms_scanout_tests {
     #[test]
     fn without_the_repair_the_stale_pixels_stay_on_the_panel() {
         let screen = kms_emu::attach(192, 200);
+        // The repair is ON by default since `drm.present_repair` was flipped
+        // (it is `=off` that disarms it now), and this test IS the unrepaired
+        // race, so it has to disarm the flag itself -- as its neighbours do.
+        drm::set_present_repair_enabled(false);
         let c = Client::open(0);
         let buf = c.create_dumb(192, 200);
         paint(&buf, |x, y| tag(0x0066_0000, x, y));
@@ -8004,7 +8159,7 @@ mod kms_scanout_tests {
         assert_eq!(
             drm::repair_rounds_for_test(),
             0,
-            "the repair must not run when the cmdline did not arm it"
+            "the repair must not run once the cmdline has disarmed it"
         );
         assert_eq!(
             screen.pixel(64, 0),
@@ -12573,7 +12728,7 @@ mod out_fence_tests {
 
     /// The property arrays of one atomic request, kept alive for as long as the
     /// request points at them.
-    struct Request {
+    pub(super) struct Request {
         objs: Vec<u32>,
         counts: Vec<u32>,
         props: Vec<u32>,
@@ -12581,7 +12736,7 @@ mod out_fence_tests {
     }
 
     impl Request {
-        fn new(objs: &[u32], counts: &[u32], props: &[u32], values: &[u64]) -> Request {
+        pub(super) fn new(objs: &[u32], counts: &[u32], props: &[u32], values: &[u64]) -> Request {
             Request {
                 objs: objs.to_vec(),
                 counts: counts.to_vec(),
@@ -12607,7 +12762,7 @@ mod out_fence_tests {
     /// An atomic client on an output, with the cmdline flag on. Returns the
     /// screen (which holds the test lock and puts the flag back on Drop) and the
     /// client.
-    fn atomic_client(width: u32, height: u32) -> (kms_emu::Screen, Client) {
+    pub(super) fn atomic_client(width: u32, height: u32) -> (kms_emu::Screen, Client) {
         let screen = kms_emu::attach(width, height);
         drm::set_atomic_enabled(true);
         let c = Client::open(0);
@@ -12624,7 +12779,7 @@ mod out_fence_tests {
         Request::new(&[drm::SYNTH_CRTC_ID], &[1], &[PROP_ACTIVE], &[0])
     }
 
-    fn commit(c: &Client, req: &Request, flags: u32) -> Result<usize> {
+    pub(super) fn commit(c: &Client, req: &Request, flags: u32) -> Result<usize> {
         let mut ioctl = req.ioctl(flags);
         c.ioctl(DRM_IOCTL_MODE_ATOMIC, &mut ioctl)
     }
@@ -12908,6 +13063,84 @@ mod out_fence_tests {
                 what
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod empty_commit_tests {
+    //! `ATOMIC` with `count_objs == 0`. Linux accepts an empty commit (there
+    //! is nothing to check and nothing to apply) but refuses one that asks
+    //! for a page-flip event: with no CRTC in the state there is nothing to
+    //! signal it from, and `prepare_signaling` says so with EINVAL rather
+    //! than let the client pend on an event that never comes. This arm
+    //! answered 0 to both.
+    use super::out_fence_tests::{atomic_client, commit, Request};
+    use super::*;
+
+    fn empty() -> Request {
+        Request::new(&[], &[], &[], &[])
+    }
+
+    #[test]
+    fn an_empty_commit_is_fine_unless_it_asks_for_an_event() {
+        let (_screen, c) = atomic_client(32, 8);
+        let req = empty();
+        for flags in [
+            0,
+            DRM_MODE_ATOMIC_TEST_ONLY,
+            DRM_MODE_ATOMIC_NONBLOCK,
+            DRM_MODE_ATOMIC_ALLOW_MODESET,
+            DRM_MODE_ATOMIC_NONBLOCK | DRM_MODE_ATOMIC_ALLOW_MODESET,
+        ] {
+            assert_eq!(commit(&c, &req, flags), Ok(0), "flags {flags:#x}");
+        }
+        for flags in [
+            DRM_MODE_PAGE_FLIP_EVENT,
+            DRM_MODE_PAGE_FLIP_EVENT | DRM_MODE_ATOMIC_NONBLOCK,
+            DRM_MODE_PAGE_FLIP_EVENT | DRM_MODE_ATOMIC_ALLOW_MODESET,
+        ] {
+            assert_eq!(
+                commit(&c, &req, flags),
+                Err(FsError::InvalidParam),
+                "flags {flags:#x}: an event with nothing to signal it from"
+            );
+        }
+        // Nothing was queued for the refused ones: the client reads no
+        // event, now or after the vblank that would have carried one.
+        drm::flush_pending_flip_completions();
+        let mut buf = [0u8; 64];
+        assert_eq!(
+            c.read_events(&mut buf),
+            Err(FsError::Again),
+            "a refused commit still queued an event"
+        );
+        // The refusal is about the missing CRTC, not the flag: the same
+        // event on a commit that names the CRTC (here, the one that turns it
+        // on) is owed and delivered.
+        let mode = make_modeinfo(32, 8);
+        let mut blob = DrmModeCreateBlob {
+            data: mode.as_ptr() as u64,
+            length: mode.len() as u32,
+            blob_id: 0,
+        };
+        c.ioctl(DRM_IOCTL_MODE_CREATEPROPBLOB, &mut blob)
+            .expect("CREATEPROPBLOB");
+        let on_crtc = Request::new(
+            &[drm::SYNTH_CRTC_ID],
+            &[2],
+            &[PROP_MODE_ID, PROP_ACTIVE],
+            &[u64::from(blob.blob_id), 1],
+        );
+        assert_eq!(
+            commit(
+                &c,
+                &on_crtc,
+                DRM_MODE_PAGE_FLIP_EVENT | DRM_MODE_ATOMIC_ALLOW_MODESET
+            ),
+            Ok(0)
+        );
+        drm::flush_pending_flip_completions();
+        assert_eq!(c.read_events(&mut buf).map(|n| n / 32), Ok(1));
     }
 }
 
@@ -13555,5 +13788,321 @@ mod syncobj_array_tests {
             c.ioctl(DRM_IOCTL_SYNCOBJ_WAIT, &mut req),
             Err(FsError::InvalidParam)
         );
+    }
+}
+
+#[cfg(test)]
+mod addfb2_validation_tests {
+    //! What `ADDFB2` refuses, driven through the ioctl entry point the way
+    //! `drmModeAddFB2WithModifiers` drives it. Linux's
+    //! `drm_internal_framebuffer_create` / `framebuffer_check` reject an
+    //! unknown flag, a modifier without `DRM_MODE_FB_MODIFIERS`, a format no
+    //! plane scans out, a zero dimension, a missing handle, a pitch shorter
+    //! than a row, and anything on the planes the format does not have,
+    //! every one of them EINVAL and none of them creating a framebuffer.
+    //! This arm used to look only at the handle and the pitch: a client
+    //! probing formats got a framebuffer of `NV12` that scanned out as
+    //! `XRGB8888`, and the test helper above registered `XRC4`, a fourcc
+    //! that does not exist, for a hundred tests without anyone noticing.
+    use super::gl_client_sequence_tests::Client;
+    use super::*;
+
+    /// `DRM_FORMAT_NV12`: a real fourcc, two planes, and nothing here scans
+    /// it out.
+    const DRM_FORMAT_NV12: u32 = 0x3231_564e;
+    /// The fourcc the test helper used to send, which is no format at all.
+    const NOT_A_FOURCC: u32 = 0x3443_5258;
+
+    fn cmd(buf: &DrmModeCreateDumb) -> DrmModeFbCmd2 {
+        DrmModeFbCmd2 {
+            fb_id: 0,
+            width: buf.width,
+            height: buf.height,
+            pixel_format: drm::DRM_FORMAT_XRGB8888,
+            flags: 0,
+            handles: [buf.handle, 0, 0, 0],
+            pitches: [buf.pitch, 0, 0, 0],
+            offsets: [0; 4],
+            modifier: [0; 4],
+        }
+    }
+
+    /// `ADDFB2` with `cmd`, and the framebuffer table before and after.
+    fn addfb2(client: &Client, cmd: &mut DrmModeFbCmd2) -> (Result<usize>, usize, usize) {
+        let before = drm::table_sizes_for_test().0;
+        let r = client.ioctl(DRM_IOCTL_MODE_ADDFB2, cmd);
+        (r, before, drm::table_sizes_for_test().0)
+    }
+
+    /// Every refusal is the same three things: EINVAL, no fb id written,
+    /// and the framebuffer table untouched.
+    #[track_caller]
+    fn refused(client: &Client, mut cmd: DrmModeFbCmd2, what: &str) {
+        let (r, before, after) = addfb2(client, &mut cmd);
+        assert_eq!(r, Err(FsError::InvalidParam), "{what}: not EINVAL");
+        assert_eq!(cmd.fb_id, 0, "{what}: an fb id came back with the error");
+        assert_eq!(after, before, "{what}: a framebuffer was created anyway");
+    }
+
+    #[track_caller]
+    fn accepted(client: &Client, mut cmd: DrmModeFbCmd2, what: &str) -> u32 {
+        let (r, before, after) = addfb2(client, &mut cmd);
+        assert_eq!(r, Ok(0), "{what}: refused");
+        assert_ne!(cmd.fb_id, 0, "{what}: no fb id");
+        assert_eq!(after, before + 1, "{what}: no framebuffer in the table");
+        cmd.fb_id
+    }
+
+    fn getfb2(client: &Client, fb_id: u32) -> DrmModeFbCmd2 {
+        let mut q = DrmModeFbCmd2 {
+            fb_id,
+            width: 0,
+            height: 0,
+            pixel_format: 0,
+            flags: 0,
+            handles: [0; 4],
+            pitches: [0; 4],
+            offsets: [0; 4],
+            modifier: [0; 4],
+        };
+        client.ioctl(DRM_IOCTL_MODE_GETFB2, &mut q).expect("GETFB2");
+        q
+    }
+
+    fn getfb_depth(client: &Client, fb_id: u32) -> u32 {
+        let mut q = DrmModeFbCmd {
+            fb_id,
+            width: 0,
+            height: 0,
+            pitch: 0,
+            bpp: 0,
+            depth: 0,
+            handle: 0,
+        };
+        client.ioctl(DRM_IOCTL_MODE_GETFB, &mut q).expect("GETFB");
+        q.depth
+    }
+
+    /// A format no plane scans out is EINVAL, and so is a fourcc that is
+    /// not a format. The two this tree knows go through, and `GETFB2` gives
+    /// each one back as registered, with `GETFB` reporting the depth Linux
+    /// derives from it (24 without alpha, 32 with).
+    #[test]
+    fn only_the_scanout_formats_are_accepted_and_come_back_as_registered() {
+        let _serialised = drm::test_globals::lock();
+        let client = Client::open(0);
+        let buf = client.create_dumb(64, 64);
+
+        let mut nv12 = cmd(&buf);
+        nv12.pixel_format = DRM_FORMAT_NV12;
+        refused(&client, nv12, "NV12");
+        let mut xrc4 = cmd(&buf);
+        xrc4.pixel_format = NOT_A_FOURCC;
+        refused(&client, xrc4, "XRC4");
+        let mut zero = cmd(&buf);
+        zero.pixel_format = 0;
+        refused(&client, zero, "format 0");
+
+        let xr24 = accepted(&client, cmd(&buf), "XR24");
+        let mut ar = cmd(&buf);
+        ar.pixel_format = drm::DRM_FORMAT_ARGB8888;
+        let ar24 = accepted(&client, ar, "AR24");
+
+        assert_eq!(getfb2(&client, xr24).pixel_format, drm::DRM_FORMAT_XRGB8888);
+        assert_eq!(getfb2(&client, ar24).pixel_format, drm::DRM_FORMAT_ARGB8888);
+        assert_eq!(
+            getfb_depth(&client, xr24),
+            24,
+            "XR24 has no alpha: depth 24"
+        );
+        assert_eq!(getfb_depth(&client, ar24), 32, "AR24 has alpha: depth 32");
+
+        assert_eq!(client.rmfb(xr24), Ok(0));
+        assert_eq!(client.rmfb(ar24), Ok(0));
+        assert_eq!(client.destroy_dumb(buf.handle), Ok(0));
+    }
+
+    /// `DRM_MODE_FB_INTERLACED` is a flag this tree accepts (and ignores, as
+    /// most drivers do). `DRM_MODE_FB_MODIFIERS` is refused because no
+    /// modifier is supported, and so is any bit Linux does not define.
+    #[test]
+    fn interlaced_is_the_only_flag_a_client_may_set() {
+        let _serialised = drm::test_globals::lock();
+        let client = Client::open(0);
+        let buf = client.create_dumb(64, 64);
+
+        let mut interlaced = cmd(&buf);
+        interlaced.flags = DRM_MODE_FB_INTERLACED;
+        let fb = accepted(&client, interlaced, "INTERLACED");
+        assert_eq!(client.rmfb(fb), Ok(0));
+
+        let mut modifiers = cmd(&buf);
+        modifiers.flags = DRM_MODE_FB_MODIFIERS;
+        refused(&client, modifiers, "MODIFIERS with a linear modifier");
+
+        let mut unknown = cmd(&buf);
+        unknown.flags = 1 << 2;
+        refused(&client, unknown, "flag bit 2");
+        let mut high = cmd(&buf);
+        high.flags = 1 << 31;
+        refused(&client, high, "flag bit 31");
+        let mut both = cmd(&buf);
+        both.flags = DRM_MODE_FB_INTERLACED | (1 << 5);
+        refused(&client, both, "INTERLACED plus an unknown bit");
+
+        assert_eq!(client.destroy_dumb(buf.handle), Ok(0));
+    }
+
+    /// A modifier without the flag, and anything at all on planes 1 to 3 of
+    /// a one-plane format, are `framebuffer_check`'s "bad fb modifier" and
+    /// "buffer object handle for plane N" refusals.
+    #[test]
+    fn a_modifier_or_a_second_plane_on_a_linear_one_plane_format_is_refused() {
+        let _serialised = drm::test_globals::lock();
+        let client = Client::open(0);
+        let buf = client.create_dumb(64, 64);
+
+        // DRM_FORMAT_MOD_NVIDIA_BLOCK_LINEAR_2D(0,0,0,0,0): a real modifier.
+        let mut tiled = cmd(&buf);
+        tiled.modifier[0] = 0x0300_0000_0000_0010;
+        refused(&client, tiled, "a tiled modifier without the flag");
+        let mut inv = cmd(&buf);
+        inv.modifier[0] = u64::MAX;
+        refused(&client, inv, "DRM_FORMAT_MOD_INVALID");
+
+        for plane in 1..4 {
+            let mut h = cmd(&buf);
+            h.handles[plane] = buf.handle;
+            refused(&client, h, "a handle on an extra plane");
+            let mut p = cmd(&buf);
+            p.pitches[plane] = buf.pitch;
+            refused(&client, p, "a pitch on an extra plane");
+            let mut o = cmd(&buf);
+            o.offsets[plane] = 64;
+            refused(&client, o, "an offset on an extra plane");
+            let mut m = cmd(&buf);
+            m.modifier[plane] = 1;
+            refused(&client, m, "a modifier on an extra plane");
+        }
+
+        // What a real NV12 client sends: two planes, second handle and
+        // pitch set. Refused for the format before the planes are looked
+        // at, and still refused.
+        let mut nv12 = cmd(&buf);
+        nv12.pixel_format = DRM_FORMAT_NV12;
+        nv12.handles[1] = buf.handle;
+        nv12.pitches[1] = buf.pitch;
+        nv12.offsets[1] = buf.pitch * 64;
+        refused(&client, nv12, "a two-plane NV12");
+
+        assert_eq!(client.destroy_dumb(buf.handle), Ok(0));
+    }
+
+    /// Plane 0 itself: a zero dimension, no handle, a pitch shorter than a
+    /// row of pixels, or an offset into the buffer (which this tree does not
+    /// scan out from) are all EINVAL, where the short pitch used to be
+    /// EFAULT-flavoured `DeviceError` and the rest were accepted.
+    #[test]
+    fn plane_zero_needs_a_size_a_handle_a_full_pitch_and_no_offset() {
+        let _serialised = drm::test_globals::lock();
+        let client = Client::open(0);
+        let buf = client.create_dumb(64, 64);
+
+        let mut w0 = cmd(&buf);
+        w0.width = 0;
+        refused(&client, w0, "width 0");
+        let mut h0 = cmd(&buf);
+        h0.height = 0;
+        refused(&client, h0, "height 0");
+        let mut nh = cmd(&buf);
+        nh.handles[0] = 0;
+        refused(&client, nh, "handle 0");
+        let mut short = cmd(&buf);
+        short.pitches[0] = buf.width * 4 - 4;
+        refused(&client, short, "a pitch one pixel short");
+        let mut zero_pitch = cmd(&buf);
+        zero_pitch.pitches[0] = 0;
+        refused(&client, zero_pitch, "pitch 0");
+        let mut wide = cmd(&buf);
+        wide.width = u32::MAX;
+        refused(&client, wide, "a width whose row overflows u32");
+        // A width whose row, multiplied in u32, wraps to 64 bytes: the pitch
+        // comparison has to be done wider than the fields are.
+        let mut wrap = cmd(&buf);
+        wrap.width = 0x4000_0010;
+        refused(&client, wrap, "a width whose row wraps to a short one");
+        let mut off = cmd(&buf);
+        off.offsets[0] = 64;
+        refused(&client, off, "an offset on plane 0");
+
+        // The exact pitch is fine, and so is one wider than the row: a
+        // narrow framebuffer over a wide buffer is what `addfb2_narrow`
+        // registers for the alignment tests.
+        let mut exact = cmd(&buf);
+        exact.pitches[0] = buf.width * 4;
+        let fb = accepted(&client, exact, "an exact pitch");
+        assert_eq!(client.rmfb(fb), Ok(0));
+        let mut narrow = cmd(&buf);
+        narrow.width = 32;
+        let fb = accepted(&client, narrow, "a narrow fb over a wide buffer");
+        assert_eq!(client.rmfb(fb), Ok(0));
+
+        assert_eq!(client.destroy_dumb(buf.handle), Ok(0));
+    }
+}
+
+#[cfg(test)]
+mod trail_tests {
+    //! What the crash-time trail records about an ioctl's outcome.
+    //!
+    //! The recording itself needs a process and a user address space, so what
+    //! is checked here is the part that does not: the translation from an
+    //! ioctl `Result` to the number userspace saw, and the refusal to read an
+    //! argument struct that has no first word.
+
+    use super::*;
+
+    /// The negative errno, not a bare -1: the whole point of the trail is that
+    /// a reader can tell `EINVAL` (userspace asked for something we do not
+    /// have) from `ENOENT` (it named an object that is gone).
+    #[test]
+    fn a_failed_ioctl_is_recorded_as_its_own_errno() {
+        assert_eq!(trail_ret(&Err(FsError::InvalidParam)), -22);
+        assert_eq!(trail_ret(&Err(FsError::EntryNotFound)), -2);
+        assert_eq!(trail_ret(&Err(FsError::NotSupported)), -38);
+        assert_eq!(trail_ret(&Err(FsError::BadAddress)), -14);
+    }
+
+    #[test]
+    fn a_successful_ioctl_is_recorded_as_its_return_value() {
+        assert_eq!(trail_ret(&Ok(0)), 0);
+        assert_eq!(trail_ret(&Ok(7)), 7);
+    }
+
+    /// `MODE_RMFB` and friends carry a bare `__u32`. Reading eight bytes off
+    /// one would run past the struct the client allocated, so an argument that
+    /// short has no first word at all.
+    #[test]
+    fn an_argument_struct_shorter_than_a_word_has_no_first_word() {
+        // `_IOC_SIZE` 4 (`MODE_RMFB`) and 0 (`SET_MASTER`), at a plausible
+        // user address: the size is what refuses them, not the address.
+        assert!(!arg_word_readable(0xC004_64AF, 0x1000));
+        assert!(!arg_word_readable(0x0000_641E, 0x1000));
+        // 16 bytes (`GETPARAM`) at the same address is the case that does get
+        // read, so the test above is about the size and nothing else.
+        assert!(arg_word_readable(0xC010_6440, 0x1000));
+    }
+
+    /// A null pointer is never read: `ucheck` is the same gate the dispatch
+    /// arms use, and a trail entry is not worth a fault.
+    ///
+    /// Only the null case is asserted. The upper bound of the user range is
+    /// the host's under `libos`, where `user_range_ok` accepts every address,
+    /// so a "kernel address is refused" assertion here would be testing this
+    /// build rather than the rule.
+    #[test]
+    fn a_null_argument_is_not_read() {
+        assert!(!arg_word_readable(0xC010_6440, 0));
+        assert_eq!(first_arg_word(0xC010_6440, 0), 0);
     }
 }

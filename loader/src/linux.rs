@@ -1010,6 +1010,17 @@ fn dump_user_fault_context(
     for line in user_stack_backtrace(vmar, sp) {
         error!("  {}", line);
     }
+    // And, for a process that was driving the GPU, what the kernel last told
+    // it. A Vulkan ICD is stripped and exports a dozen symbols, so
+    // `libvulkan_nouveau.so+0xe9c48` above resolves to nothing on the user
+    // side and the backtrace names a library rather than a function. The
+    // driver's own answers do not have that problem: the last DRM ioctls this
+    // process issued say which phase it was in and whether the call before the
+    // fault returned an error it then ignored. Empty -- and silent -- for
+    // every process that never opened `/dev/dri/*`.
+    for line in linux_object::fs::devfs::drm_trail::dump_for(thread.proc().id() as u32) {
+        error!("  {}", line);
+    }
 }
 
 /// Deliver a *synchronous* fault signal (SIGSEGV / SIGBUS / SIGILL / SIGFPE).

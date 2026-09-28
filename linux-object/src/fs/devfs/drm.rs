@@ -653,8 +653,8 @@ pub fn present_probe_enabled() -> bool {
 }
 
 /// Whether a present that finds the source still moving under it **repairs**
-/// the bands that moved, instead of only reporting them (`drm.present_repair`
-/// on the cmdline). OFF by default.
+/// the bands that moved, instead of only reporting them. ON by default; the
+/// `drm.present_repair=off` cmdline turns it off.
 ///
 /// The defect it answers is measured, not guessed: with the compositor on
 /// wlroots' GLES2 renderer over Mesa's software rasteriser, the probe fires on
@@ -664,7 +664,8 @@ pub fn present_probe_enabled() -> bool {
 /// waiting, and there is nothing for the compositor to wait on either: this
 /// kernel answers `DRM_CAP_SYNCOBJ_TIMELINE` with 0, and a software renderer
 /// has no GPU fence to export. So the buffer the kernel is handed is a frame
-/// whose tiles are still arriving.
+/// whose tiles are still arriving. On screen that is the "basura" in freshly
+/// opened menus (noise over the surface, smears at the edges).
 ///
 /// What the kernel can do about it is narrow but real. It cannot make the frame
 /// whole -- a present that raced is a mix of two frames whatever we do, and only
@@ -674,7 +675,13 @@ pub fn present_probe_enabled() -> bool {
 /// copying those again picks up what has since arrived. Bounded by
 /// [`MAX_REPAIR_ROUNDS`], because a compositor that never stops writing must not
 /// turn one present into an unbounded loop.
-static PRESENT_REPAIR: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+///
+/// Default ON because `renderer=auto` still lands non-NVIDIA boxes (QEMU
+/// virtio-gpu, VirtualBox SVGA) on the GLES2/llvmpipe stack, and there is no
+/// fence path that can wait those workers out. Pixman sessions pay only the
+/// two settled checksums (the repair loop never runs). Opt out with
+/// `drm.present_repair=off` if the checksum cost shows up on a tight frame budget.
+static PRESENT_REPAIR: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);
 
 /// Turn the present repair pass on (or back off) for this boot.
 pub fn set_present_repair_enabled(on: bool) {
@@ -1621,6 +1628,10 @@ pub fn software_kms_active() -> bool {
 #[allow(dead_code)]
 pub struct DrmFramebuffer {
     pub id: u32,
+    /// The DRM fourcc `ADDFB2` named (one of [`SCANOUT_FORMATS`]); `ADDFB`
+    /// and the kernel's own framebuffers are [`DRM_FORMAT_XRGB8888`]. What
+    /// `GETFB2` reports back, and `GETFB` derives its depth from.
+    pub pixel_format: u32,
     /// Optional driver-private framebuffer id returned by `DrmScheme::create_fb`.
     pub driver_fb_id: Option<u32>,
     /// GEM handle that backs this framebuffer
@@ -2627,7 +2638,34 @@ pub fn resolve_gem_backing_for(handle_id: u32, pid: u64) -> Option<(u64, usize)>
 }
 
 /// Create a framebuffer from a GEM handle
+/// `DRM_FORMAT_XRGB8888` ("XR24"): the format every GL and Vulkan swapchain
+/// on this tree presents, and the one the software scanout consumes.
+pub const DRM_FORMAT_XRGB8888: u32 = 0x3432_5258;
+/// `DRM_FORMAT_ARGB8888` ("AR24"): the same 4 bytes per pixel, alpha ignored
+/// by the scanout.
+pub const DRM_FORMAT_ARGB8888: u32 = 0x3432_5241;
+/// The formats the primary plane advertises (`GETPLANE`) and `ADDFB2`
+/// accepts, both 32 bits per pixel: the CPU present path and the copy
+/// engine take every framebuffer as 4-byte pixels, so a format with another
+/// layout would scan out as garbage, and Linux answers such an `ADDFB2`
+/// EINVAL (`drm_any_plane_has_format`).
+pub const SCANOUT_FORMATS: [u32; 2] = [DRM_FORMAT_XRGB8888, DRM_FORMAT_ARGB8888];
+
+/// [`create_fb_with_format`] for an XR24 framebuffer: `ADDFB` and every
+/// framebuffer the kernel makes for itself.
 pub fn create_fb(handle_id: u32, width: u32, height: u32, pitch: u32) -> Option<u32> {
+    create_fb_with_format(handle_id, width, height, pitch, DRM_FORMAT_XRGB8888)
+}
+
+/// Wrap `handle_id` in a framebuffer of `pixel_format` (one of
+/// [`SCANOUT_FORMATS`], which the `ADDFB2` arm has checked).
+pub fn create_fb_with_format(
+    handle_id: u32,
+    width: u32,
+    height: u32,
+    pitch: u32,
+    pixel_format: u32,
+) -> Option<u32> {
     // Resolve the backing buffer from EITHER source:
     //  - a DRM dumb buffer in our own handle table (CREATE_DUMB / pixman), or
     //  - a nouveau-uAPI GEM object (GEM_NEW), whose high-range handle lives in
@@ -2700,6 +2738,7 @@ pub fn create_fb(handle_id: u32, width: u32, height: u32, pitch: u32) -> Option<
 
     let fb = DrmFramebuffer {
         id: fb_id,
+        pixel_format,
         driver_fb_id,
         gem_handle_id: handle_id,
         width,
@@ -6661,6 +6700,19 @@ pub(super) fn current_pid() -> u64 {
         .unwrap_or(0)
 }
 
+/// The thread id of the caller, or 0 when there is no current thread.
+///
+/// Only the crash-time ioctl trail wants this: a compositor drives the GPU
+/// from more than one thread, and which one issued the last call before a
+/// fault is half of telling a render thread's crash from the main loop's.
+pub(super) fn current_tid() -> u64 {
+    use zircon_object::object::KernelObject;
+    kernel_hal::thread::get_current_thread()
+        .and_then(|t| t.downcast::<zircon_object::task::Thread>().ok())
+        .map(|t| t.id())
+        .unwrap_or(0)
+}
+
 /// Release every GEM object owned by `pid`, plus any framebuffer that was built
 /// on one. Called once per process teardown.
 ///
@@ -7143,7 +7195,9 @@ pub(crate) fn reset_output_state_for_test() {
     // Its report budget goes back too, or the last test to run finds it spent.
     set_present_probe_enabled(false);
     set_cursor_from_client(false);
-    set_present_repair_enabled(false);
+    // Back to the boot default (ON). A test that disarmed repair must not leave
+    // every later present skipping the settle-and-recopy pass.
+    set_present_repair_enabled(true);
     // `set_present_skip_enabled` resets the band state itself, which is what a
     // fresh boot looks like: nothing known about what the panel holds. A leaked
     // hash would make a later test's present skip a band for a reason that has
@@ -7299,6 +7353,7 @@ mod release_tests {
         {
             let mut state = DRM_STATE.lock();
             state.framebuffers.push(DrmFramebuffer {
+                pixel_format: DRM_FORMAT_XRGB8888,
                 id: 9299,
                 driver_fb_id: None,
                 gem_handle_id: 9201,
@@ -7331,6 +7386,7 @@ mod release_tests {
         {
             let mut state = DRM_STATE.lock();
             state.framebuffers.push(DrmFramebuffer {
+                pixel_format: DRM_FORMAT_XRGB8888,
                 id: 9399,
                 driver_fb_id: None,
                 gem_handle_id: 9301,
@@ -8013,6 +8069,7 @@ mod nouveau_fb_lifetime_tests {
         gem_mmap::register(handle, 0x1_0000, 4096, pid);
         let mut state = DRM_STATE.lock();
         state.framebuffers.push(DrmFramebuffer {
+            pixel_format: DRM_FORMAT_XRGB8888,
             id: fb_id,
             driver_fb_id: None,
             gem_handle_id: handle,
@@ -8113,6 +8170,7 @@ mod nouveau_fb_lifetime_tests {
         let _serialised = super::test_globals::lock();
         let mut state = DRM_STATE.lock();
         state.framebuffers.push(DrmFramebuffer {
+            pixel_format: DRM_FORMAT_XRGB8888,
             id: 9502,
             driver_fb_id: None,
             gem_handle_id: 42, // low range: a CREATE_DUMB handle
@@ -8185,6 +8243,7 @@ mod nouveau_fb_lifetime_tests {
         {
             let mut state = DRM_STATE.lock();
             state.framebuffers.push(DrmFramebuffer {
+                pixel_format: DRM_FORMAT_XRGB8888,
                 id: 9505,
                 driver_fb_id: None,
                 gem_handle_id: shared,
@@ -8242,6 +8301,7 @@ mod present_error_tests {
         let mut state = DRM_STATE.lock();
         state.framebuffers.retain(|fb| fb.id != fb_id);
         state.framebuffers.push(DrmFramebuffer {
+            pixel_format: DRM_FORMAT_XRGB8888,
             id: fb_id,
             driver_fb_id: None,
             gem_handle_id: 0,
@@ -8328,6 +8388,7 @@ mod present_error_tests {
         {
             let mut state = DRM_STATE.lock();
             state.framebuffers.push(DrmFramebuffer {
+                pixel_format: DRM_FORMAT_XRGB8888,
                 id: 9604,
                 driver_fb_id: None,
                 gem_handle_id: handle,
@@ -8614,6 +8675,7 @@ mod gem_ownership_tests {
 
     fn plant_fb(fb_id: u32, owner: u64) {
         DRM_STATE.lock().framebuffers.push(DrmFramebuffer {
+            pixel_format: DRM_FORMAT_XRGB8888,
             id: fb_id,
             driver_fb_id: None,
             gem_handle_id: 0,
@@ -9512,6 +9574,7 @@ mod present_lifetime_tests {
         {
             let mut state = DRM_STATE.lock();
             state.framebuffers.push(DrmFramebuffer {
+                pixel_format: DRM_FORMAT_XRGB8888,
                 id: 9601,
                 driver_fb_id: None,
                 gem_handle_id: 7,
@@ -9562,6 +9625,7 @@ mod present_lifetime_tests {
         {
             let mut state = DRM_STATE.lock();
             state.framebuffers.push(DrmFramebuffer {
+                pixel_format: DRM_FORMAT_XRGB8888,
                 id: 9602,
                 driver_fb_id: None,
                 gem_handle_id: handle,
@@ -10948,17 +11012,18 @@ mod present_probe_tests {
         assert_eq!(repair_span_px(1, 0, 1920), None);
     }
 
-    /// The repair is off unless the cmdline arms it, and the reset between tests
-    /// disarms it -- a leaked flag would have every later present test doing
-    /// extra blits.
+    /// The repair is on by default (the boot that has no fence for llvmpipe),
+    /// the cmdline can disarm it, and the reset between tests restores the
+    /// default -- a leaked OFF would hide the settle-and-recopy pass from every
+    /// later present test.
     #[test]
-    fn the_repair_is_off_unless_the_cmdline_arms_it() {
+    fn the_repair_is_on_by_default_and_reset_restores_it() {
         let _g = serialised();
-        assert!(!present_repair_enabled());
-        set_present_repair_enabled(true);
         assert!(present_repair_enabled());
-        reset_output_state_for_test();
+        set_present_repair_enabled(false);
         assert!(!present_repair_enabled());
+        reset_output_state_for_test();
+        assert!(present_repair_enabled());
         assert_eq!(repair_rounds_for_test(), 0);
     }
 

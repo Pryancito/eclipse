@@ -700,7 +700,7 @@ pub(super) fn decode_ioc(request: u32) -> (u32, u32, u32) {
 /// implement -- so a trace names what Mesa wanted instead of a bare number.
 /// NR is `DRM_COMMAND_BASE + DRM_NOUVEAU_*`; returns `"unknown"` for anything
 /// outside nouveau's private range.
-pub(super) fn nouveau_ioctl_name(nr: u32) -> &'static str {
+pub fn nouveau_ioctl_name(nr: u32) -> &'static str {
     match nr.wrapping_sub(DRM_COMMAND_BASE) {
         DRM_NOUVEAU_GETPARAM => "GETPARAM",
         0x01 => "SETPARAM(deprecated)",
@@ -885,6 +885,17 @@ pub(super) struct DrmNouveauGemCpuPrep {
     pub handle: u32,
     pub flags: u32,
 }
+
+/// `drm_nouveau_gem_cpu_prep.flags`, as `nouveau_drm.h` defines them (and
+/// as libdrm's `nouveau_bo_wait` sends them): `NOWAIT` is bit 0 and answers
+/// EBUSY instead of blocking; `WRITE` is bit 2 and says the CPU will write.
+/// Bit 1 is nothing. Linux ignores bits it does not know.
+pub(super) const NOUVEAU_GEM_CPU_PREP_NOWAIT: u32 = 0x0000_0001;
+/// Linux waits only the write fences for a read prep and every fence for a
+/// write one; here every queued submission counts as a write, so the bit
+/// changes nothing and only the tests name it.
+#[allow(dead_code)]
+pub(super) const NOUVEAU_GEM_CPU_PREP_WRITE: u32 = 0x0000_0004;
 
 #[repr(C)]
 pub(super) struct DrmNouveauGemCpuFini {
