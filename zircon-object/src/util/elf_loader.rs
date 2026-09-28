@@ -2114,6 +2114,47 @@ mod tests {
         assert!(vmar.find_mapping(vmar.addr() + 0x20_0000).is_some());
     }
 
+    /// `padzero`: the bytes past `p_filesz` in a segment's last file page are
+    /// where `.bss` begins, and they must read as ZERO -- not as whatever the
+    /// file happens to hold next. A borrowing load resolves an uncommitted
+    /// page straight out of the shared exec image, so the zeroing has to copy
+    /// the page up. It did not, and every process on the machine read file
+    /// garbage where its zero-initialised globals belong: busybox died in
+    /// musl's `__init_tls` before `main`, which took the whole boot down.
+    #[test]
+    fn a_borrowed_segment_reads_zero_past_the_end_of_its_file_bytes() {
+        // One LOAD: 16 file bytes at vaddr 0x200080, 0x400 bytes in memory, so
+        // the bytes from 0x90 to the end of the page are BSS. The image holds
+        // 0xEE right after them -- what the old code leaked through.
+        let mut img = Image::elf64();
+        img.phoff(64);
+        img.phnum(1);
+        img.program_header(64, PT_LOAD, 0x80, 0x20_0080, (16, 0x400));
+        img.put(0x80, b"0123456789abcdef");
+        img.put(0x90, &[0xEE; 64]);
+        img.shown(0xd0);
+        let bytes = img.bytes();
+        let image = VmObject::new_paged(pages(bytes.len().max(PAGE_SIZE)));
+        image.write(0, bytes).unwrap();
+        let elf = parse_checked_elf(bytes).unwrap();
+        let vmar = VmAddressRegion::new_root();
+        let vmo = vmar.load_from_elf_image(&elf, &image).unwrap();
+
+        let mut file_bytes = [0u8; 16];
+        vmo.read(0x80, &mut file_bytes).unwrap();
+        assert_eq!(&file_bytes, b"0123456789abcdef", "the file bytes moved");
+
+        let mut bss = [0u8; 64];
+        vmo.read(0x90, &mut bss).unwrap();
+        assert_eq!(bss, [0u8; 64], "the image's bytes leaked into the BSS");
+
+        // The shared image itself must not have been zeroed: it is the exec
+        // cache, and every later load of the same file reads it.
+        let mut from_image = [0u8; 64];
+        image.read(0x90, &mut from_image).unwrap();
+        assert_eq!(from_image, [0xEE; 64], "the shared exec image was written");
+    }
+
     #[test]
     fn load_from_elf_image_copies_writable_segments_instead_of_borrowing() {
         // PF_RW data segment: must be a private copy, not a borrower of the
