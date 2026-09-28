@@ -1311,6 +1311,15 @@ impl DrmDev {
                     // turns a vblank-paced client loop into a busy spin (see
                     // `schedule_flip_event`).
                     drm::schedule_vblank_event(signal, target, &self.file);
+                    // The reply names the vblank the event was queued for
+                    // (`drm_queue_vblank_event`: `reply.sequence = req_seq`,
+                    // or the current count when the target had already
+                    // passed). Xorg's modesetting driver reads it as the MSC
+                    // it queued (`ms_queue_vblank`) and was getting 0.
+                    // (After the NEXTONMISS move, as `drm_queue_vblank_event`
+                    // looks at the moved target.)
+                    let still_passed = (target.wrapping_sub(now_seq) as i32) <= 0;
+                    req.sequence = if still_passed { now_seq } else { target };
                 } else {
                     // Blocking form. The wait itself already happened in
                     // `sys_ioctl` (see `DrmDev::wait_vblank_sleep`): this arm
@@ -13402,6 +13411,61 @@ mod wait_vblank_validation_tests {
         // timer delivers here).
         let mut buf = [0u8; 128];
         assert_eq!(c.read_events(&mut buf), Err(FsError::Again));
+    }
+
+    /// The event form answers with the vblank the event was queued for:
+    /// the resolved target, or the current count when the target had
+    /// already passed (`drm_queue_vblank_event`). Xorg's modesetting
+    /// driver keeps that as the MSC it queued; this arm left the request's
+    /// own sequence in place, so a relative "+2" read back as 2.
+    #[test]
+    fn the_event_form_replies_with_the_vblank_it_queued() {
+        let _screen = kms_emu::attach(32, 8);
+        let c = Client::open(0);
+        const EVENT: u32 = _DRM_VBLANK_EVENT;
+        // The counter runs on the clock, so bracket each reply between two
+        // readings rather than pinning it to one.
+        let bracket = |typ: u32, seq: u32| {
+            let before = wait(&c, RELATIVE, 0).expect("now");
+            let got = wait(&c, typ, seq).expect("the event form");
+            let after = wait(&c, RELATIVE, 0).expect("now");
+            (before, got, after)
+        };
+        let within = |lo: u32, got: u32, hi: u32| {
+            (got.wrapping_sub(lo) as i32) >= 0 && (hi.wrapping_sub(got) as i32) >= 0
+        };
+
+        // Relative +2: two past the count at the time.
+        let (b, got, a) = bracket(RELATIVE | EVENT, 2);
+        assert!(
+            within(b + 2, got, a + 2),
+            "relative +2 replied {} at {}..{}",
+            got,
+            b,
+            a
+        );
+        // Absolute, ahead: exactly that.
+        let now = wait(&c, RELATIVE, 0).expect("now");
+        assert_eq!(wait(&c, EVENT, now + 50), Ok(now + 50));
+        // Absolute, already passed: the current count, like Linux, which
+        // sends the event at once in that case.
+        let (b, got, a) = bracket(EVENT, now.wrapping_sub(3));
+        assert!(
+            within(b, got, a),
+            "a passed target replied {} at {}..{}",
+            got,
+            b,
+            a
+        );
+        // Passed with NEXTONMISS: the target moved to the next vblank.
+        let (b, got, a) = bracket(EVENT | _DRM_VBLANK_NEXTONMISS_FLAG, now.wrapping_sub(3));
+        assert!(
+            within(b + 1, got, a + 1),
+            "NEXTONMISS replied {} at {}..{}",
+            got,
+            b,
+            a
+        );
     }
 
     /// With two heads (two drivers that own scanout, each with a CRTC of
