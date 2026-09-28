@@ -99,15 +99,57 @@ impl TextRange {
 
 static KERNEL_TEXT: TextRange = TextRange::new();
 
+/// Hand the window to `lock::fn_slot`, which judges every function-pointer
+/// hook slot in the kernel -- klog's emit, the spin pump, the deadlock hooks
+/// -- and cannot see this module. Published from here so there is one window
+/// and not two to keep in step.
+///
+/// Indirected so a host test can watch it happen. The real one cannot be
+/// driven from a test: the window there is process-wide and **one-way**
+/// (`lock::fn_slot` refuses an implausible pair, so `(0, 0)` will not put it
+/// back), and a published window turns every host function pointer into a
+/// refused slot -- which is precisely what this crate's dmesg tests rely on
+/// not happening (`drivers`' recording sink is reached only because nothing
+/// publishes a window in a hosted build).
+#[cfg(not(test))]
+#[inline]
+fn publish_fn_slot_window(lo: usize, hi: usize) {
+    lock::fn_slot::set_text_range(lo, hi);
+}
+
+#[cfg(test)]
+fn publish_fn_slot_window(lo: usize, hi: usize) {
+    PUBLISHED.with(|c| c.set(Some((lo, hi))));
+}
+
+#[cfg(test)]
+std::thread_local! {
+    /// The pair [`publish_fn_slot_window`] was last handed **on this thread**.
+    /// Per thread, like the rest of this crate's host seams, so a test reads
+    /// only its own call and nothing else the test binary is running can move
+    /// it.
+    static PUBLISHED: core::cell::Cell<Option<(usize, usize)>> =
+        const { core::cell::Cell::new(None) };
+}
+
+/// What this thread last published, or `None` since [`forget_published_window`].
+#[cfg(test)]
+fn published_window() -> Option<(usize, usize)> {
+    PUBLISHED.with(|c| c.get())
+}
+
+/// Back to "this thread has published nothing".
+#[cfg(test)]
+fn forget_published_window() {
+    PUBLISHED.with(|c| c.set(None));
+}
+
 /// Install the image's real `.text` bounds, from the linker's own symbols.
 /// Returns whether they were taken.
 pub fn set_kernel_text(lo: u64, hi: u64) -> bool {
     let taken = KERNEL_TEXT.set(lo, hi);
     if taken {
-        // The same window judges the kernel's function-pointer hook slots, in
-        // `lock` and in the scheduler, which cannot see this module. Published
-        // from here so there is one window and not two to keep in step.
-        lock::fn_slot::set_text_range(lo as usize, hi as usize);
+        publish_fn_slot_window(lo as usize, hi as usize);
     }
     taken
 }
@@ -315,6 +357,59 @@ mod tests {
         assert!(!is_kernel_text(hi));
     }
 
+    // ── the window the hook slots are judged against ────────────────────────
+
+    #[test]
+    fn a_measured_window_reaches_the_hook_slots() {
+        // `lock::fn_slot::live_fn` judges every function-pointer hook in this
+        // kernel -- klog's emit, the spin pump, the deadlock hooks -- against
+        // a window it keeps itself, and it cannot see the one this module
+        // keeps. Handing it over here is the only thing that makes them one
+        // window; nothing else in the tree calls `set_text_range`.
+        forget_published_window();
+        assert!(set_kernel_text(KERNEL_LO, KERNEL_LO + 0x20_0000));
+        assert_eq!(
+            published_window(),
+            Some((KERNEL_LO as usize, (KERNEL_LO + 0x20_0000) as usize)),
+            "la ventana llega a los huecos tal cual se midio"
+        );
+    }
+
+    #[test]
+    fn a_refused_window_is_not_published_to_the_hook_slots() {
+        // A pair this module refuses must not reach them either. Taking a
+        // bogus one there is worse than having none: with no window every
+        // slot is `Unchecked` and still called, while a window that holds no
+        // real function makes every live hook `Foreign` -- and a refused hook
+        // is a call that silently stops happening, which is how a dead klog
+        // or a deaf spin pump looks from the outside.
+        forget_published_window();
+        assert!(!set_kernel_text(0, 0));
+        assert_eq!(published_window(), None, "no hay nada que publicar");
+    }
+
+    #[test]
+    fn every_window_this_module_takes_is_one_the_hook_slots_also_take() {
+        // Two filters, written in two crates, and neither can read the other.
+        // Were this module's ever the looser of the pair, the hand-over would
+        // fail with nobody looking at its answer and the kernel would run on
+        // two different windows -- the state the hand-over exists to prevent.
+        for (lo, hi) in [
+            (KERNEL_LO, KERNEL_LO + 1),
+            (KERNEL_LO, KERNEL_HI),
+            (KERNEL_HI - 1, KERNEL_HI),
+            FALLBACK_TEXT,
+        ] {
+            assert!(plausible_text_range(lo, hi));
+            assert!(
+                lock::fn_slot::plausible_range(lo as usize, hi as usize),
+                "{:#x}..{:#x} lo toma este modulo y no los huecos",
+                lo,
+                hi
+            );
+        }
+    }
+
     // ── the range predicates ────────────────────────────────────────────────
 
     #[test]
@@ -387,6 +482,29 @@ mod tests {
     }
 
     #[test]
+    fn the_reserved_bit_is_bit_one_and_nothing_else() {
+        // Bit 1 is the one a live `RFLAGS` always has set. Bit 0 is CF, which
+        // is set about half the time and says nothing about what the word is.
+        // Asking for "either" instead of "bit 1" exempts every odd `.text`
+        // offset below 4 MiB from the residue test -- and the first four
+        // megabytes are where a `ret` into the middle of an instruction most
+        // often lands, so the exemption would swallow the reports this is for.
+        assert!(!looks_like_rflags(0x1));
+        assert!(!looks_like_rflags(0x1_0001));
+        assert!(!looks_like_rflags(0x3f_fffd));
+        assert!(looks_like_rflags(0x3));
+    }
+
+    #[test]
+    fn an_odd_text_offset_is_residue_and_not_rflags() {
+        // The same distinction where it is spent: a `.text` offset with bit 0
+        // set and bit 1 clear is residue, and calling it `RFLAGS` is a
+        // corruption report that never gets made.
+        assert!(!looks_like_rflags(0x7_3bf1));
+        assert!(truncated_text(TEXT, 0x7_3bf1));
+    }
+
+    #[test]
     fn a_text_low_half_on_its_own_is_truncated_residue() {
         assert!(truncated_text(TEXT, 0x7_3bf0));
         assert!(!truncated_text(TEXT, KERNEL_LO + 0x7_3bf0));
@@ -414,6 +532,24 @@ mod tests {
         let early = 0x40;
         assert!(!truncated_text(FALLBACK_TEXT, early));
         assert!(truncated_text(TEXT, early));
+    }
+
+    #[test]
+    fn residue_reaches_the_top_of_the_widest_window() {
+        // The test for "lost its top half" is that the top half is *gone*,
+        // not that the low half is small. A window may be as wide as the
+        // kernel half, so a `.text` offset may carry any of the low 32 bits,
+        // and a bound drawn anywhere below that quietly stops recognising
+        // residue from the far end of the image -- the end a `.text` that has
+        // grown adds, and the one no literal window here was ever measured
+        // against.
+        const WIDEST: (u64, u64) = (KERNEL_LO, KERNEL_HI);
+        assert!(plausible_text_range(WIDEST.0, WIDEST.1));
+        assert!(truncated_text(WIDEST, 0xffff_ffff));
+        assert!(truncated_text(WIDEST, 0x00ff_ffff));
+        // ...and one bit above the low half is a word that kept part of its
+        // top half, which is not this shape at all.
+        assert!(!truncated_text(WIDEST, 0x1_0000_0000));
     }
 
     // ── the windows the copies used ─────────────────────────────────────────
@@ -647,5 +783,23 @@ mod tests {
     fn a_tail_too_short_to_hold_a_call_is_not_one() {
         assert!(!ends_with_call(&[]));
         assert!(!ends_with_call(&[0xff]));
+    }
+
+    #[test]
+    fn a_two_byte_tail_naming_a_sib_is_not_a_call_and_is_not_read_past() {
+        // `tail` is "up to eight bytes", so two of them is inside the
+        // contract -- a return address in the first page of `.text` leaves no
+        // more to read behind it. FF /2 with rm=100 names a SIB byte in every
+        // mode but register-direct, and that SIB is the byte *after* the two
+        // there are: measuring it reads past the slice, inside the #GP
+        // handler, with the fault half-diagnosed and the panic path the one
+        // thing that must not be taken from there.
+        //
+        // No CALL in this family is two bytes long once a SIB is named, so
+        // the answer is "not a call" either way. The bound is only about how
+        // the answer is reached.
+        for modrm in [0x14u8, 0x54, 0x94] {
+            assert!(!ends_with_call(&[0xff, modrm]), "modrm {:#04x}", modrm);
+        }
     }
 }
