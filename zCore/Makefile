@@ -292,7 +292,25 @@ endif
 
 ################ QEMU options ################
 
-qemu_opts := -smp $(SMP) -device qemu-xhci,id=xhci -device usb-kbd,bus=xhci.0 -device usb-tablet,bus=xhci.0
+# USB pointer attached to the emulated xHCI: `tablet` (default) or `mouse`.
+#
+# `usb-tablet` reports ABSOLUTE coordinates and is decoded by the tablet arm of
+# the HID driver. `usb-mouse` is a boot-subclass relative mouse
+# (bInterfaceSubClass 1, bInterfaceProtocol 2) whose report descriptor declares
+# buttons, X, Y and a Wheel -- the shape of every mouse on a real desk.
+#
+# Only the tablet has ever run here, so everything the relative path does that
+# the absolute one does not -- parsing the report descriptor, SET_PROTOCOL,
+# decoding the wheel out of a report-protocol report -- has never been
+# exercised by anything, in CI or by hand. That is why "works in QEMU" has kept
+# saying nothing about the mouse on real hardware. `USB_POINTER=mouse` runs it.
+#
+# The two are mutually exclusive on purpose: an absolute pointer takes the
+# pointer role away from every relative one (USB_ABS_POINTER), so attaching
+# both would leave the mouse's reports decoded by nothing.
+USB_POINTER ?= tablet
+
+qemu_opts := -smp $(SMP) -device qemu-xhci,id=xhci -device usb-kbd,bus=xhci.0 -device usb-$(USB_POINTER),bus=xhci.0
 
 ifeq ($(ARCH), x86_64)
   qemu_opts += \

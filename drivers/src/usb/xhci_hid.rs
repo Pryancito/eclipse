@@ -1822,6 +1822,13 @@ struct HidDev {
     last_report_len: usize,
     /// Count of reports seen on this endpoint (0 = never delivered a report).
     report_count: u64,
+    /// Count of reports that carried a non-zero wheel or pan delta, and the
+    /// last such pair. Together with `report_count` this splits the one
+    /// question a dead wheel always poses -- does the driver never decode a
+    /// detent, or does it decode them and something above drops them? -- into
+    /// an answer anyone can read off `/proc/usbhid` after scrolling.
+    wheel_count: u64,
+    last_wheel: (i32, i32),
     /// First bytes of the HID report descriptor (proto-0 interfaces), for
     /// /proc/usbhid. Empty for boot-protocol devices (no descriptor read).
     report_desc: [u8; 64],
@@ -3452,6 +3459,8 @@ impl XhciInner {
             report_desc_len: report_desc.1,
             mouse_layout: parsed.mouse,
             boot_reports: false,
+            wheel_count: 0,
+            last_wheel: (0, 0),
             // A boot-protocol keyboard has no report descriptor to parse (we
             // never read one), and its report IS the boot layout.
             key_layout: parsed.key.or(if real_proto == HID_PROTO_KEY {
@@ -3477,10 +3486,15 @@ impl XhciInner {
                 slot, vid, pid, iface
             );
         } else if real_proto == HID_PROTO_MOUSE && parsed.mouse.is_some_and(|m| m.wheel.is_none()) {
-            info!(
-                "[xhci] mouse slot={} vid={:04x} pid={:04x} has no wheel field in its report \
-                 descriptor",
-                slot, vid, pid
+            // ERROR, not info: a mouse whose descriptor declares no Wheel is
+            // a mouse whose wheel cannot ever work, and a rig booted with
+            // `LOG=error` prints nothing else. This is the line that answers
+            // "the wheel does nothing" without needing /proc/usbhid.
+            error!(
+                "[xhci] mouse slot={} vid={:04x} pid={:04x} iface={} declares NO wheel field in \
+                 its report descriptor: scrolling cannot work on this device. \
+                 Paste `cat /proc/usbhid` to get its report_desc.",
+                slot, vid, pid, iface
             );
         }
         if real_proto == HID_PROTO_TABLET {
@@ -3758,6 +3772,10 @@ impl XhciInner {
                                 value: dy,
                             });
                         }
+                        if wheel != 0 || hwheel != 0 {
+                            h.wheel_count = h.wheel_count.saturating_add(1);
+                            h.last_wheel = (wheel, hwheel);
+                        }
                         emit_scroll(lis, wheel, hwheel);
                         lis.trigger(InputEvent {
                             event_type: InputEventType::Syn,
@@ -3817,6 +3835,10 @@ impl XhciInner {
                     code: ABS_Y,
                     value: ay,
                 });
+                if wheel != 0 || hwheel != 0 {
+                    h.wheel_count = h.wheel_count.saturating_add(1);
+                    h.last_wheel = (wheel, hwheel);
+                }
                 emit_scroll(lis, wheel, hwheel);
                 lis.trigger(InputEvent {
                     event_type: InputEventType::Syn,
@@ -4809,7 +4831,7 @@ impl InputScheme for XhciUsbHid {
             let _ = write!(
                 s,
                 "[usbhid] slot={} iface={} bInterfaceProtocol={} subclass={} {:04x}:{:04x} \
-                 role={} report_len={} reports={} last=[",
+                 role={} report_len={} reports={} wheel_events={} last_wheel={:?} last=[",
                 h.slot_id,
                 h.iface,
                 h.if_proto,
@@ -4819,6 +4841,8 @@ impl InputScheme for XhciUsbHid {
                 role,
                 h.report_len,
                 h.report_count,
+                h.wheel_count,
+                h.last_wheel,
             );
             for (i, b) in h.last_report[..n].iter().enumerate() {
                 let _ = write!(s, "{}{:02x}", if i == 0 { "" } else { " " }, b);
@@ -5160,6 +5184,160 @@ mod tests {
         // length its reports come in.
         let plain = parse_hid_descriptor(MOUSE_5BTN_12BIT).mouse.unwrap();
         assert!(!mouse_report_is_truncated(&plain, 3, false));
+    }
+
+    /// Seven report descriptors in the shapes real mice actually ship, to pin
+    /// down where each one puts its wheel. Written when the wheel worked in
+    /// QEMU and not on real hardware: QEMU only ever attaches `usb-tablet`
+    /// (see `USB_POINTER` in `zCore/Makefile`), so the relative path had never
+    /// run anywhere and the parser was the first suspect. It is not: every one
+    /// of these yields a wheel. That is worth keeping as a test rather than
+    /// re-deriving the next time scrolling breaks.
+    #[test]
+    fn the_wheel_is_found_in_every_shape_a_real_mouse_ships() {
+        /// Boot-compatible: 3 buttons, 5 bits of padding, 8-bit X/Y/Wheel in
+        /// one Input item. QEMU's own `usb-mouse` and most cheap office mice.
+        const BOOT_SHAPED: &[u8] = &[
+            0x05, 0x01, 0x09, 0x02, 0xA1, 0x01, 0x09, 0x01, 0xA1, 0x00, //
+            0x05, 0x09, 0x19, 0x01, 0x29, 0x03, 0x15, 0x00, 0x25, 0x01, //
+            0x95, 0x03, 0x75, 0x01, 0x81, 0x02, //   3 buttons
+            0x95, 0x01, 0x75, 0x05, 0x81, 0x01, //   padding
+            0x05, 0x01, 0x09, 0x30, 0x09, 0x31, 0x09, 0x38, //   X, Y, Wheel
+            0x15, 0x81, 0x25, 0x7F, 0x75, 0x08, 0x95, 0x03, 0x81, 0x06, //
+            0xC0, 0xC0,
+        ];
+        /// Report ID, 5 buttons, 16-bit axes, wheel and AC Pan.
+        const WIDE_AXES_AND_PAN: &[u8] = &[
+            0x05, 0x01, 0x09, 0x02, 0xA1, 0x01, 0x85, 0x01, 0x09, 0x01, 0xA1, 0x00, //
+            0x05, 0x09, 0x19, 0x01, 0x29, 0x05, 0x15, 0x00, 0x25, 0x01, //
+            0x95, 0x05, 0x75, 0x01, 0x81, 0x02, //
+            0x95, 0x01, 0x75, 0x03, 0x81, 0x01, //
+            0x05, 0x01, 0x09, 0x30, 0x09, 0x31, //
+            0x16, 0x00, 0x80, 0x26, 0xFF, 0x7F, 0x75, 0x10, 0x95, 0x02, 0x81, 0x06, //
+            0x09, 0x38, 0x15, 0x81, 0x25, 0x7F, 0x75, 0x08, 0x95, 0x01, 0x81, 0x06, //
+            0x05, 0x0C, 0x0A, 0x38, 0x02, 0x95, 0x01, 0x81, 0x06, //
+            0xC0, 0xC0,
+        ];
+        /// The high-resolution wheel pattern: the Wheel sits inside a Logical
+        /// Collection next to a Resolution Multiplier declared as a *Feature*.
+        /// A parser that let Feature items consume input bits would put the
+        /// wheel two bits late and decode garbage.
+        const HI_RES_WHEEL: &[u8] = &[
+            0x05, 0x01, 0x09, 0x02, 0xA1, 0x01, 0x85, 0x02, 0x09, 0x01, 0xA1, 0x00, //
+            0x05, 0x09, 0x19, 0x01, 0x29, 0x05, 0x15, 0x00, 0x25, 0x01, //
+            0x95, 0x05, 0x75, 0x01, 0x81, 0x02, //
+            0x95, 0x01, 0x75, 0x03, 0x81, 0x01, //
+            0x05, 0x01, 0x09, 0x30, 0x09, 0x31, //
+            0x16, 0x01, 0xF8, 0x26, 0xFF, 0x07, 0x75, 0x0C, 0x95, 0x02, 0x81, 0x06, //
+            0xA1, 0x02, //   Collection (Logical)
+            0x15, 0x00, 0x25, 0x01, 0x35, 0x01, 0x45, 0x0C, //
+            0x75, 0x02, 0x95, 0x01, 0x09, 0x48, 0xB1,
+            0x02, //     Resolution Multiplier, Feature
+            0x15, 0x81, 0x25, 0x7F, 0x35, 0x00, 0x45, 0x00, //
+            0x75, 0x08, 0x95, 0x01, 0x09, 0x38, 0x81, 0x06, //     Wheel, Input
+            0xC0, //   End Collection
+            0x95, 0x01, 0x75, 0x04, 0xB1, 0x01, //   Feature padding
+            0xC0, 0xC0,
+        ];
+        /// Sixteen buttons declared as one bitmap, then 16-bit axes.
+        const SIXTEEN_BUTTONS: &[u8] = &[
+            0x05, 0x01, 0x09, 0x02, 0xA1, 0x01, 0x09, 0x01, 0xA1, 0x00, //
+            0x05, 0x09, 0x19, 0x01, 0x29, 0x10, 0x15, 0x00, 0x25, 0x01, //
+            0x95, 0x10, 0x75, 0x01, 0x81, 0x02, //
+            0x05, 0x01, 0x09, 0x30, 0x09, 0x31, //
+            0x16, 0x00, 0x80, 0x26, 0xFF, 0x7F, 0x75, 0x10, 0x95, 0x02, 0x81, 0x06, //
+            0x09, 0x38, 0x15, 0x81, 0x25, 0x7F, 0x75, 0x08, 0x95, 0x01, 0x81, 0x06, //
+            0xC0, 0xC0,
+        ];
+        /// The wheel declared BEFORE X and Y. Nothing forbids it.
+        const WHEEL_FIRST: &[u8] = &[
+            0x05, 0x01, 0x09, 0x02, 0xA1, 0x01, 0x09, 0x01, 0xA1, 0x00, //
+            0x05, 0x09, 0x19, 0x01, 0x29, 0x03, 0x15, 0x00, 0x25, 0x01, //
+            0x95, 0x03, 0x75, 0x01, 0x81, 0x02, //
+            0x95, 0x01, 0x75, 0x05, 0x81, 0x01, //
+            0x05, 0x01, 0x09, 0x38, 0x15, 0x81, 0x25, 0x7F, //
+            0x75, 0x08, 0x95, 0x01, 0x81, 0x06, //
+            0x09, 0x30, 0x09, 0x31, 0x75, 0x08, 0x95, 0x02, 0x81, 0x06, //
+            0xC0, 0xC0,
+        ];
+        /// Push/Pop with a Report Size change inside the pushed scope, and the
+        /// wheel declared *after* the Pop so its width comes from the restored
+        /// globals. A Pop that pops the stack without putting the saved values
+        /// back leaves the wheel 16 bits wide at the wrong size.
+        const PUSH_POP: &[u8] = &[
+            0x05, 0x01, 0x09, 0x02, 0xA1, 0x01, 0x09, 0x01, 0xA1, 0x00, //
+            0x05, 0x09, 0x19, 0x01, 0x29, 0x03, 0x15, 0x00, 0x25, 0x01, //
+            0x95, 0x03, 0x75, 0x01, 0x81, 0x02, //   3 buttons
+            0x95, 0x01, 0x75, 0x05, 0x81, 0x01, //   padding
+            0x05, 0x01, 0x09, 0x30, 0x09, 0x31, 0x15, 0x81, 0x25, 0x7F, //
+            0x75, 0x08, 0x95, 0x02, 0x81, 0x06, //   X, Y at 8 bits
+            0xA4, //   Push               (saves Report Size 8)
+            0x75, 0x10, 0x95, 0x01, 0x81, 0x01, //     16 bits of vendor padding
+            0xB4, //   Pop                (restores Report Size 8)
+            0x95, 0x01, 0x09, 0x38, 0x81, 0x06, //   Wheel, at the restored size
+            0xC0, 0xC0,
+        ];
+        /// A wireless combo receiver: keyboard under report ID 1, mouse under
+        /// report ID 2, one interface and one interrupt endpoint.
+        const COMBO_RECEIVER: &[u8] = &[
+            0x05, 0x01, 0x09, 0x06, 0xA1, 0x01, 0x85, 0x01, //
+            0x05, 0x07, 0x19, 0xE0, 0x29, 0xE7, 0x15, 0x00, 0x25, 0x01, //
+            0x75, 0x01, 0x95, 0x08, 0x81, 0x02, //
+            0x95, 0x01, 0x75, 0x08, 0x81, 0x01, //
+            0x95, 0x06, 0x75, 0x08, 0x15, 0x00, 0x26, 0xFF, 0x00, //
+            0x19, 0x00, 0x29, 0xFF, 0x81, 0x00, //
+            0xC0, //
+            0x05, 0x01, 0x09, 0x02, 0xA1, 0x01, 0x85, 0x02, 0x09, 0x01, 0xA1, 0x00, //
+            0x05, 0x09, 0x19, 0x01, 0x29, 0x05, 0x15, 0x00, 0x25, 0x01, //
+            0x95, 0x05, 0x75, 0x01, 0x81, 0x02, //
+            0x95, 0x01, 0x75, 0x03, 0x81, 0x01, //
+            0x05, 0x01, 0x09, 0x30, 0x09, 0x31, 0x09, 0x38, //
+            0x15, 0x81, 0x25, 0x7F, 0x75, 0x08, 0x95, 0x03, 0x81, 0x06, //
+            0xC0, 0xC0,
+        ];
+
+        // (descriptor, report id, wheel bit offset, report bytes).
+        let cases: [(&str, &[u8], Option<u8>, usize, usize); 7] = [
+            ("boot-shaped", BOOT_SHAPED, None, 24, 4),
+            ("wide axes + pan", WIDE_AXES_AND_PAN, Some(1), 48, 8),
+            ("hi-res wheel", HI_RES_WHEEL, Some(2), 40, 6),
+            ("sixteen buttons", SIXTEEN_BUTTONS, None, 48, 7),
+            ("wheel first", WHEEL_FIRST, None, 8, 4),
+            ("push/pop", PUSH_POP, None, 40, 6),
+            ("combo receiver", COMBO_RECEIVER, Some(2), 32, 5),
+        ];
+        for (name, desc, id, wheel_off, bytes) in cases {
+            let info = parse_hid_descriptor(desc);
+            let ml = info
+                .mouse
+                .unwrap_or_else(|| panic!("{}: no mouse layout at all", name));
+            assert_eq!(ml.report_id, id, "{}: report id", name);
+            assert_eq!(
+                ml.wheel.map(|f| (f.off, f.len)),
+                Some((wheel_off, 8)),
+                "{}: wheel field",
+                name
+            );
+            assert_eq!(ml.report_bytes, bytes, "{}: report size", name);
+            assert_eq!(classify_hid_report(desc), HidClass::Mouse, "{}", name);
+        }
+        // The combo receiver must keep BOTH roles: pinning such an interface to
+        // one of them is how a keyboard-and-mouse dongle loses half itself.
+        let combo = parse_hid_descriptor(COMBO_RECEIVER);
+        assert_eq!(combo.key.map(|k| k.report_id), Some(Some(1)));
+        // ...and the endpoint must be armed for the LONGER of the two reports.
+        assert_eq!(combo.max_report_bytes, 9);
+        // The pan axis only exists where the descriptor declares AC Pan.
+        assert!(parse_hid_descriptor(WIDE_AXES_AND_PAN)
+            .mouse
+            .unwrap()
+            .hwheel
+            .is_some());
+        assert!(parse_hid_descriptor(BOOT_SHAPED)
+            .mouse
+            .unwrap()
+            .hwheel
+            .is_none());
     }
 
     #[test]
