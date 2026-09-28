@@ -79,6 +79,36 @@ mod tests {
         event0.peer().unwrap();
     }
 
+    /// There are **two** `peer()`s: the inherent one, which hands back an
+    /// `EventPair`, and the [`KernelObject`] one behind the trait object,
+    /// which is what `zx_object_get_related` reaches through. Only the
+    /// inherent one was tested, so the trait one could answer any error it
+    /// liked -- and `PEER_CLOSED` is the one a process tells apart from a
+    /// handle that was never good.
+    #[test]
+    fn the_peer_reached_through_the_trait_is_the_same_one_and_fails_the_same_way() {
+        let (event0, event1) = EventPair::create();
+        let as_object: Arc<dyn KernelObject> = event0.clone();
+
+        let through_trait = KernelObject::peer(&*as_object).unwrap();
+        assert_eq!(
+            through_trait.id(),
+            event1.id(),
+            "the trait handed back something other than the peer"
+        );
+
+        // What comes back is a *strong* reference -- the trait upgrades the
+        // `Weak` -- so the peer is not gone until this one goes too. Holding
+        // it across the drop below is what makes this read as "still open".
+        drop(through_trait);
+        drop(event1);
+        assert_eq!(
+            KernelObject::peer(&*as_object).err(),
+            Some(ZxError::PEER_CLOSED),
+            "a closed peer has to read as PEER_CLOSED and not as some other error"
+        );
+    }
+
     #[test]
     fn peer_closed() {
         let (event0, event1) = EventPair::create();
