@@ -46,25 +46,70 @@ hay detrás de la superficie y labwc no sabe desenfocar, así que no hay
 efecto esmerilado. No se distribuye ninguna fuente, icono ni fondo de
 Microsoft: todo está dibujado con colores propios.
 
-## Lo que NO se puede traer de KDE
+## KDE: lo que hay, lo que falta y por qué
 
-Plasma no puede correr aquí, y conviene saber por qué antes de intentarlo:
-`plasmashell`, `kded`, `krunner` y el agente de polkit-kde son servicios de
-**D-Bus** de arriba abajo. Eso ya no es el impedimento — ahora hay un bus de
-sesión de verdad escuchando en `DBUS_SESSION_BUS_ADDRESS`, ver
-[README-dbus.md](README-dbus.md) — pero sigue sin haber Qt ni KF6 en la
-imagen, ni polkit, ni logind (se usa seatd). Lo que sí se recrea es la
-experiencia: tema, atajos, panel y lanzador, con las piezas nativas de
-Eclipse.
+Desde que hay bus de sesión de verdad (ver [README-dbus.md](README-dbus.md)),
+la imagen trae **Qt 6, KDE Frameworks 6 y las aplicaciones de KDE**: Alpine
+3.24 empaqueta Plasma 6.6 y KF6 6.26. La lista está en `KDE_PACKAGES`
+(`xtask/src/linux/xorg.rs`) e incluye `kded` (el demonio `kded6`),
+`plasma-integration`, `qt6-qtwayland`, `breeze`, `breeze-icons`, `kio-extras`,
+`kwallet`, `kde-cli-tools`, `xdg-desktop-portal-kde` y las aplicaciones
+(dolphin, konsole, kate, ark, okular, gwenview, kcalc, spectacle). Son del
+orden de **1,2 GiB instalados**; `ECLIPSE_KDE=0` los deja fuera.
 
-Las variables de Qt (`QT_QPA_PLATFORM=wayland;xcb`,
-`QT_AUTO_SCREEN_SCALE_FACTOR`, y `QT_QUICK_BACKEND=software` en la sesión
-pixman) sí están puestas, para el día que se instale una app Qt.
-Deliberadamente **no** se fijan `QT_QPA_PLATFORMTHEME=kde` ni
-`XDG_CURRENT_DESKTOP=KDE`, que es lo que recomienda cualquier receta de «KDE
-sobre labwc»: el primero necesita el plugin de plasma-integration y el
-segundo hace que los portales y GTK busquen una sesión KDE que no existe.
-`XDG_CURRENT_DESKTOP` dice lo que esta sesión es de verdad, `labwc:wlroots`.
+Lo que hace que además **funcionen**, y no solo se instalen:
+
+- **Activación de servicios en el bus.** KDE abre kiod, kwalletd o un módulo
+  de kded pidiéndole al bus que lo arranque. Eso lo hace el `dbus-daemon` de
+  Alpine, que ya está en la imagen; `eclipse-dbusd`, el demonio propio de
+  respaldo, contesta `ServiceUnknown` a `StartServiceByName` a propósito, así
+  que con él las apps conectan y luego se quedan esperando. Para KDE hace
+  falta el `dbus-daemon` de verdad.
+- **`kded6` como servicio de init**, no por autoarranque de labwc
+  (`/etc/eclipse/services/kded.service` → `/usr/local/bin/eclipse-kded`). El
+  servicio espera a las dos cosas que kded6 necesita antes de arrancarlo:
+  `wait_socket` al socket de Wayland (construye una `QGuiApplication`) y
+  `wait_path` al socket del bus. Sin bus, kded6 sale al instante y
+  `type = respawn` lo repetiría en bucle toda la sesión.
+- **`QT_QPA_PLATFORMTHEME=kde` solo si el plugin está**. Lo exporta el wrapper
+  de labwc después de comprobar que existe
+  `…/qt6/plugins/platformthemes/KDEPlasmaPlatformTheme*.so`, porque `apk` aquí
+  es *best-effort* y un tema que se nombra sin tenerlo instalado hace que cada
+  aplicación Qt avise al arrancar y luego use el de siempre.
+- **`XDG_CURRENT_DESKTOP=KDE:labwc:wlroots`** cuando la imagen se construyó con
+  KDE (si no, `labwc:wlroots` a secas). El primer nombre es el backend de
+  portal que pide la sesión, y sigue siendo una sesión wlroots para todo lo
+  demás.
+- **Colores**: `~/.config/kdeglobals` fija estilo Breeze, iconos breeze-dark y
+  doble clic; las paletas `[Colors:*]` las copia del `BreezeDark.colors` del
+  propio paquete `eclipse-kde-colors` en el primer arranque, para no llevar
+  una copia a mano que se desvíe de la de verdad.
+
+Lo que **sigue sin poder funcionar**, y no se arregla instalando nada:
+
+- **No hay bus de sistema**, así que polkit (acciones de root en
+  systemsettings), accountsservice (nombre y avatar del usuario) y logind
+  (asiento, suspensión, cierre de sesión) no tienen con quién hablar. Aquí el
+  asiento lo da seatd. Esas piezas se degradan a «no disponible», no rompen la
+  aplicación.
+- **El panel de Plasma no puede listar ventanas sobre labwc.** El gestor de
+  tareas de Plasma habla `org_kde_plasma_window_management` y nada más
+  (`plasma-workspace/libtaskmanager/waylandtasksmodel.cpp`), y labwc solo añade
+  `wlr-layer-shell` y `wlr-output-power-management` a lo que trae wlroots
+  (`labwc/protocols/meson.build`): el protocolo de KDE no está en ninguno de
+  los dos. Un `plasmashell` sobre labwc arranca —lanzador, reloj y bandeja van,
+  porque son layer-shell y D-Bus— con la barra de tareas **vacía para
+  siempre**.
+- Por eso el shell de Plasma (`plasma-workspace`, `plasma-desktop`,
+  `systemsettings`) es un conjunto aparte y **apagado por defecto**:
+  `ECLIPSE_PLASMA=1` lo añade, y arrastra kwin, accountsservice, fprintd y un
+  gestor de sesión de pipewire como dependencias duras. Tiene sentido para
+  intentar la sesión Plasma completa bajo `kwin_wayland` (que sí implementa su
+  propio protocolo y sabe usar libseat), no para pegarle el panel de Plasma a
+  labwc.
+
+El panel y el lanzador de la sesión siguen siendo `lunarbar` y `lunarrun`,
+que sí listan ventanas por `wlr-foreign-toplevel-management`.
 
 Toda la configuración la genera `xtask` al construir el rootfs
 (`xtask/src/linux/desktop.rs`), así que está presente desde el primer
@@ -82,6 +127,8 @@ arranque sin pasos manuales.
 | Entorno de sesión | `/root/.config/labwc/environment` | Cursor Adwaita y `GTK_THEME=Adwaita:dark`. |
 | **lunarrun** | `/bin/lunarrun` | Lanzador tipo KRunner (`tools/lunarbar`, comparte biblioteca con el panel). Overlay centrado sobre wlr-layer-shell: se escribe para filtrar las aplicaciones instaladas (sin distinguir acentos), ↑/↓ o Tab para elegir, Intro para lanzar, Esc o clic fuera para cerrar. Una palabra que resuelva en `$PATH` sale como «ejecutar orden», así que `Alt+Espacio top` funciona como en KRunner. `lunarrun --toggle-desktop` es el Super+D de KDE: minimiza todas las ventanas por wlr-foreign-toplevel-management, o las restaura si ya lo estaban. `--dump RUTA:AnchoxAlto` lo dibuja a un fichero ARGB8888 sin compositor. Lo lanzan `eclipse-run` y `eclipse-showdesktop`. |
 | **lunarbar** | `/bin/lunarbar` | Panel propio de Eclipse OS (`tools/lunarbar`, Rust estático, wlr-layer-shell + wl_shm, sin GTK ni GL): una barra inferior por salida en `win11`/`kde` (dos en `eclipse`) con lanzador, barra de tareas, reloj, volumen, teclado y apagado, más popups (menú de aplicaciones) y tooltips. Traducido (`i18n.rs`). |
+| **kded6** | `/usr/local/bin/eclipse-kded` + `/etc/eclipse/services/kded.service` | Demonio de servicios de KDE (el `kded6` de KF6), donde se cargan los módulos de fondo de KDE. El servicio espera al socket de Wayland y al del bus antes de arrancarlo (esperas nativas de init, sin bucles de shell) y, si `kded6` no está instalado, el wrapper lo dice en `/tmp/kded.log` y en la consola en vez de dejar que init lo reintente en bucle. |
+| Ajustes de KDE | `/root/.config/kdeglobals` | Estilo Breeze, iconos breeze-dark y doble clic para todas las aplicaciones KF6 y, vía plasma-integration, para cualquier app Qt. Las paletas `[Colors:*]` las añade `eclipse-kde-colors` (servicio `oneshot`) copiando el `BreezeDark.colors` que trae el paquete `breeze`, y solo si no están ya. |
 | Autoarranque | *(ausente a propósito)* | labwc lanza `sh ~/.config/labwc/autostart` con doble `fork`, y esa `ash` cae con SIGSEGV en este kernel (musl mallocng). En su lugar `eclipse-init` arranca el fondo y el panel como **servicios** (`/etc/eclipse/services/{lunarbg,lunarbar}.service`, con `after = labwc` y `wait_socket` sobre `wayland-0`) a través de los wrappers `/usr/local/bin/eclipse-lunarbg` y `eclipse-lunarbar`, que a su vez esperan al socket `wayland-*`. `~/.config/labwc/autostart.README` lo explica en el sistema instalado. |
 | GTK 3/4 | `/root/.config/gtk-{3.0,4.0}/settings.ini` | Modo oscuro por defecto para aplicaciones GTK. |
 | Terminal | `/root/.config/foot/foot.ini` (+ `foot.win11.ini`, `foot.kde.ini`, `foot.eclipse.ini`) | Paleta a juego con la apariencia activa; `eclipse-look` copia la que toque sobre `foot.ini`. |
@@ -114,6 +161,11 @@ aporta `libseat.so` y el demonio `seatd`, y `foot` es el terminal.
 - `font-dejavu` — tipografía usada por tema, panel y menús.
 - `adwaita-icon-theme` — tema de cursor e iconos (sin él no se ve el puntero
   con cursor software).
+- KDE (`KDE_PACKAGES`, ~1,2 GiB): `kded`, `plasma-integration`,
+  `qt6-qtwayland`, `breeze`, `breeze-icons`, `kio-extras`, `kwallet`,
+  `kde-cli-tools`, `xdg-desktop-portal-kde` y las aplicaciones. `ECLIPSE_KDE=0`
+  las deja fuera; `ECLIPSE_PLASMA=1` añade además el shell de Plasma. Ver
+  «KDE: lo que hay, lo que falta y por qué».
 
 ## Xwayland (aplicaciones X11)
 
