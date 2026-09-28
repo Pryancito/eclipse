@@ -30,9 +30,17 @@ fn drm_mode_get_resources(c: &Client) -> Option<(Vec<u32>, Vec<u32>, u32)> {
         let mut res = blank_card_res();
         c.ioctl(DRM_IOCTL_MODE_GETRESOURCES, &mut res).ok()?;
         let counts = res;
+        // libdrm makes room for the fbs too (`drmModeGetResources` allocates
+        // all four lists): a count with no room is EFAULT, as the kernel's
+        // `put_user` makes it, and the tables here are process-wide, so a
+        // framebuffer another test left behind is one this file holds.
+        let mut fbs = alloc::vec![0u32; res.count_fbs as usize];
         let mut crtcs = alloc::vec![0u32; res.count_crtcs as usize];
         let mut conns = alloc::vec![0u32; res.count_connectors as usize];
         let mut encs = alloc::vec![0u32; res.count_encoders as usize];
+        if res.count_fbs != 0 {
+            res.fb_id_ptr = fbs.as_mut_ptr() as u64;
+        }
         if res.count_crtcs != 0 {
             res.crtc_id_ptr = crtcs.as_mut_ptr() as u64;
         }
