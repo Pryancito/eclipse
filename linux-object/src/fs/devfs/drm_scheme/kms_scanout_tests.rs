@@ -66,12 +66,14 @@ fn clip(x1: u16, y1: u16, x2: u16, y2: u16) -> DrmClipRect {
 }
 
 /// What `drm_mode_dirtyfb_ioctl` refuses before any driver sees the
-/// flush: an unknown flag (EINVAL), a framebuffer that does not exist
-/// (ENOENT), a clip count and a clip pointer that disagree about whether
-/// there are clips (EINVAL), an odd count with ANNOTATE_COPY, whose clips
-/// come in pairs (EINVAL), and more than 256 clips (EINVAL). None of it
-/// was read: every one of these came back as a flush done. The shapes
-/// Xorg's modesetting shadow sends keep going through.
+/// flush: a framebuffer that does not exist (ENOENT), a clip count and a
+/// clip pointer that disagree about whether there are clips (EINVAL), an
+/// odd count with ANNOTATE_COPY, whose clips come in pairs (EINVAL), and
+/// more than 256 clips (EINVAL). None of it was read: every one of these
+/// came back as a flush done. And what it does NOT refuse: a flag it
+/// does not define is masked off (`DRM_MODE_FB_DIRTY_FLAGS & r->flags`),
+/// with the defined bits beside it still in force; this answered EINVAL.
+/// The shapes Xorg's modesetting shadow sends keep going through.
 #[test]
 fn dirtyfb_refuses_what_linux_refuses() {
     let _screen = kms_emu::attach(64, 16);
@@ -100,9 +102,15 @@ fn dirtyfb_refuses_what_linux_refuses() {
     assert_eq!(dirty(4242, 0, 1, ptr), Err(FsError::EntryNotFound));
     assert_eq!(
         dirty(fb, 0x4, 1, ptr),
-        einval,
-        "a flag Linux does not define"
+        Ok(0),
+        "a flag Linux does not define is masked off, not refused"
     );
+    assert_eq!(
+        dirty(fb, 0x4 | ANNOTATE_COPY, 1, ptr),
+        einval,
+        "the mask keeps the bits Linux defines: COPY still wants pairs"
+    );
+    assert_eq!(dirty(fb, !0, 2, ptr), Ok(0), "every unknown bit at once");
     assert_eq!(dirty(fb, 0, 1, 0), einval, "clips without a pointer");
     assert_eq!(dirty(fb, 0, 0, ptr), einval, "a pointer without clips");
     assert_eq!(

@@ -127,6 +127,81 @@ fn only_the_creator_may_destroy_a_blob() {
         drm::BlobDestroy::NotFound
     ));
 }
+
+/// `drm_mode_createblob_ioctl` / `drm_mode_getblob_ioctl` at their edges:
+/// a zero length is EINVAL (`drm_property_create_blob`) before the data
+/// pointer is looked at, and a null pointer with a length is EFAULT from
+/// `copy_from_user`, not EINVAL; the bytes come out only into a buffer
+/// of exactly the blob's length -- a bigger one gets the length and
+/// nothing else, as libdrm's two-call pattern expects. A null pointer
+/// with a length was EINVAL, and any buffer at least as big was filled.
+#[test]
+fn a_blob_is_created_from_a_readable_length_and_read_back_at_its_exact_length() {
+    let _serialised = drm::test_globals::lock();
+    let c = Client::open(0);
+    let bytes: [u8; 68] = core::array::from_fn(|i| i as u8);
+    let create = |data: u64, length: u32| {
+        let mut blob = DrmModeCreateBlob {
+            data,
+            length,
+            blob_id: 0,
+        };
+        c.ioctl(DRM_IOCTL_MODE_CREATEPROPBLOB, &mut blob)
+            .map(|_| blob.blob_id)
+    };
+    assert_eq!(
+        create(bytes.as_ptr() as u64, 0),
+        Err(FsError::InvalidParam),
+        "a zero length"
+    );
+    assert_eq!(
+        create(0, 0),
+        Err(FsError::InvalidParam),
+        "the length is judged before the pointer"
+    );
+    assert_eq!(
+        create(0, 68),
+        Err(FsError::BadAddress),
+        "copy_from_user of a null pointer"
+    );
+    let id = create(bytes.as_ptr() as u64, 68).expect("a readable blob");
+
+    let get = |length: u32, buf: &mut [u8]| {
+        let mut req = DrmModeGetBlob {
+            blob_id: id,
+            length,
+            data: buf.as_mut_ptr() as u64,
+        };
+        c.ioctl(DRM_IOCTL_MODE_GETPROPBLOB, &mut req)
+            .map(|_| req.length)
+    };
+    let mut buf = [0xAAu8; 100];
+    assert_eq!(
+        get(100, &mut buf),
+        Ok(68),
+        "a bigger buffer: the length, no bytes"
+    );
+    assert!(buf.iter().all(|&b| b == 0xAA));
+    assert_eq!(get(67, &mut buf), Ok(68), "a smaller one: the same");
+    assert!(buf.iter().all(|&b| b == 0xAA));
+    assert_eq!(get(68, &mut buf), Ok(68), "the exact length: the bytes");
+    assert_eq!(&buf[..68], &bytes[..]);
+    assert!(buf[68..].iter().all(|&b| b == 0xAA), "and only them");
+    // The exact length with nowhere to put the bytes: `copy_to_user`
+    // faults.
+    let mut req = DrmModeGetBlob {
+        blob_id: id,
+        length: 68,
+        data: 0,
+    };
+    assert_eq!(
+        c.ioctl(DRM_IOCTL_MODE_GETPROPBLOB, &mut req),
+        Err(FsError::BadAddress)
+    );
+    let mut id = id;
+    assert_eq!(c.ioctl(DRM_IOCTL_MODE_DESTROYPROPBLOB, &mut id), Ok(0));
+}
+
 /// `drm_mode_destroyblob_ioctl` frees a blob only for the file that
 /// created it ("ensure the property was actually created by this user",
 /// EPERM otherwise), and `drm_release` frees what a file leaves behind.
