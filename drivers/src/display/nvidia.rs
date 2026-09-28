@@ -7767,6 +7767,17 @@ impl DrmScheme for NvidiaGpu {
         Some((probe.fence_va, probe.payload))
     }
 
+    fn cpu_prep_fences(&self, gem_handle: u32, owner_pid: u64) -> Vec<(usize, u32)> {
+        // The same pid set the blocking arm walks, and `ring_idle_probe` is
+        // the same probe it waits on -- appended here instead of there, and
+        // idempotent once the ring has drained, exactly as
+        // `render_fence_for_scanout` already does for the present path.
+        self.cpu_prep_pids(gem_handle, owner_pid)
+            .into_iter()
+            .filter_map(|pid| self.ring_idle_probe(pid).map(|p| (p.fence_va, p.payload)))
+            .collect()
+    }
+
     fn nouveau_gem_close(&self, handle: u32, owner_pid: u64) -> bool {
         // A close is where an earlier close's ring may have passed.
         self.reap_deferred_frees();
@@ -9956,6 +9967,30 @@ impl NvidiaGpu {
     /// answers EBUSY instead of blocking; a fence that never lands within the
     /// usual 10 s also answers EBUSY (Linux: a timed-out reservation wait is
     /// EBUSY too).
+    /// Every process whose channel a `GEM_CPU_PREP` on `gem_handle` has to
+    /// wait for: the caller, plus everyone whose VM_BIND maps the buffer.
+    ///
+    /// One function, because the blocking arm and the async pre-wait
+    /// ([`crate::scheme::DrmScheme::cpu_prep_fences`]) must name the SAME
+    /// set. A pre-wait that names fewer ends early and hands the spin back to
+    /// the sync arm, which is the whole thing it exists to avoid; one that
+    /// names more sleeps past what the ioctl promised.
+    ///
+    /// A pid listed twice (the caller maps it too, or maps it at two VAs)
+    /// costs nothing: once its channel has been waited for it is idle and the
+    /// next wait appends no probe.
+    fn cpu_prep_pids(&self, gem_handle: u32, owner_pid: u64) -> Vec<u64> {
+        let mut pids: Vec<u64> = alloc::vec![owner_pid];
+        pids.extend(
+            self.nouveau_vm_mappings
+                .lock()
+                .iter()
+                .filter(|m| m.gem_handle == gem_handle)
+                .map(|m| m.owner_pid),
+        );
+        pids
+    }
+
     fn cpu_prep_wait(&self, owner_pid: u64, nowait: bool) -> Result<usize, i32> {
         use super::nouveau_uapi as nv;
         const CPU_PREP_TIMEOUT_US: u64 = 10_000_000;
@@ -14183,18 +14218,7 @@ impl NvidiaGpu {
                 // polling a query result, a `PIPE_MAP_DONTBLOCK` map), and
                 // nothing but this file's own tests ever set bit 1.
                 let nowait = req.flags & nv::NOUVEAU_GEM_CPU_PREP_NOWAIT != 0;
-                // A pid listed twice (the caller maps it too, or maps it at
-                // two VAs) costs nothing: once its channel has been waited
-                // for it is idle and the next wait appends no probe.
-                let mut pids: Vec<u64> = alloc::vec![owner_pid];
-                pids.extend(
-                    self.nouveau_vm_mappings
-                        .lock()
-                        .iter()
-                        .filter(|m| m.gem_handle == req.handle)
-                        .map(|m| m.owner_pid),
-                );
-                for pid in pids {
+                for pid in self.cpu_prep_pids(req.handle, owner_pid) {
                     self.cpu_prep_wait(pid, nowait)?;
                 }
                 Ok(0)
@@ -19054,6 +19078,109 @@ mod nouveau_bookkeeping_tests {
         assert_eq!(FAKE_RM.lock().bad, 0);
     }
 
+    /// The async pre-wait's fences and the blocking arm agree, frame by
+    /// frame.
+    ///
+    /// `GEM_CPU_PREP` blocks by contract, and `io_control` is synchronous, so
+    /// the arm that serves it can only busy-wait -- a core pegged for however
+    /// long the GPU takes, on the ioctl Mesa calls every time it recycles a
+    /// buffer. `cpu_prep_fences` exists so `sys_ioctl` can sleep on the same
+    /// fences first and leave that arm nothing to spin for.
+    ///
+    /// "The same fences" is the whole contract, and it is what this pins:
+    /// while the list is unlanded the blocking arm answers EBUSY, and the
+    /// moment the last of it lands the blocking arm answers Ok. A list
+    /// missing the producer's ring -- the caller's pid alone, which is what
+    /// the blocking arm itself used to look at -- wakes the sleeper early and
+    /// hands the spin straight back.
+    #[test]
+    fn the_pre_waits_fences_land_exactly_when_the_blocking_cpu_prep_returns() {
+        let _g = LOCK.lock();
+        let _live = LiveBytes::hold();
+        let gpu = gpu_rm_ladder();
+        let _ch_c = client_with_pushbuf(&gpu, COMP);
+        let ch_a = client_with_pushbuf(&gpu, A);
+        const FRAME_VA: u64 = PUSH_VA + 0x10_0000;
+        // The client's frame, bound in its own VAS and imported and bound by
+        // the compositor: the producer is A, the caller below is COMP.
+        let h = gem_new_rm(&gpu, 65536, nv::NOUVEAU_GEM_DOMAIN_GART, A)
+            .unwrap()
+            .handle;
+        assert_eq!(vm_bind_ops(&gpu, A, &mut [map(h, FRAME_VA, 65536)]), Ok(0));
+        assert!(crate::scheme::gem_mmap::add_ref(h, COMP).is_some());
+        assert_eq!(
+            vm_bind_ops(&gpu, COMP, &mut [map(h, FRAME_VA, 65536)]),
+            Ok(0)
+        );
+        // Shared the same way but bound in no VM: nothing can be writing it.
+        let h_idle = gem_new_rm(&gpu, 4096, nv::NOUVEAU_GEM_DOMAIN_GART, A)
+            .unwrap()
+            .handle;
+        assert!(crate::scheme::gem_mmap::add_ref(h_idle, COMP).is_some());
+
+        let landed = |fences: &[(usize, u32)]| {
+            fences
+                .iter()
+                .all(|&(va, p)| crate::scheme::syncobj::hw_fence_landed(va, p))
+        };
+
+        // Nothing queued: no fence to sleep on, and the blocking arm does
+        // not block either.
+        assert!(
+            DrmScheme::cpu_prep_fences(&gpu, h, COMP).is_empty(),
+            "a ring with nothing on it gave the sleeper a fence"
+        );
+        assert_eq!(cpu_prep_nowait(&gpu, h, COMP), Ok(0));
+
+        // The client renders the frame: queued on its ring, not fetched.
+        assert_eq!(exec(&gpu, A, ch_a, &[push(PUSH_VA, 16)], &[], &[]), Ok(0));
+        let c1 = chan(1);
+        let fences = DrmScheme::cpu_prep_fences(&gpu, h, COMP);
+        assert!(
+            !fences.is_empty(),
+            "the producer's queued frame left the sleeper nothing to wait on, \
+             so it would return at once and the sync arm would spin the wait"
+        );
+        assert!(
+            !landed(&fences),
+            "the sleeper's fences read as landed while the frame is still queued"
+        );
+        // A buffer no VM maps still has nothing to wait for, whoever asks.
+        assert!(DrmScheme::cpu_prep_fences(&gpu, h_idle, COMP).is_empty());
+
+        // The GPU runs the frame and the probe behind it. Now every fence
+        // the sleeper was given has landed -- and that is exactly the moment
+        // the blocking arm stops saying EBUSY.
+        test_clock::set_auto_advance(1);
+        assert_eq!(
+            cpu_prep_nowait(&gpu, h, COMP),
+            Err(nv::EBUSY),
+            "the producer's channel still has the frame queued"
+        );
+        assert!(!landed(&fences), "landed before the GPU ran");
+        let fetched = run_gpu(1);
+        assert!(
+            fetched.iter().any(|f| matches!(f, Fetched::Release { .. })),
+            "the probe left no fence on the producer's ring ({:?})",
+            fetched
+        );
+        assert!(
+            landed(&fences),
+            "the sleeper is still parked on a ring that has drained"
+        );
+        assert_eq!(
+            cpu_prep_nowait(&gpu, h, COMP),
+            Ok(0),
+            "the blocking arm still waits after the sleeper's fences landed"
+        );
+        assert_eq!(userd(&c1).0, userd(&c1).1, "the ring drained");
+
+        test_clock::set_auto_advance(0);
+        gpu.nouveau_release_process(A);
+        gpu.nouveau_release_process(COMP);
+        assert_eq!(FAKE_RM.lock().bad, 0);
+    }
+
     /// A client that exits mid-frame with the compositor's ACQUIRE queued
     /// on its semaphore stays as a zombie context (`ZombieCtx`), and its
     /// ring keeps running what it had queued: the frame it was writing is
@@ -23231,6 +23358,26 @@ mod nouveau_bookkeeping_tests {
         /// lost the release, not a slow panel.
         const STUCK_US: u64 = 1_000_000;
 
+        /// How the kernel's fence waits look for the point they are parked
+        /// on.
+        ///
+        /// A client blocked in `SYNCOBJ_WAIT` does NOT see its buffer come
+        /// free the instant the compositor releases it: there is no interrupt
+        /// behind a syncobj on this hardware, so the wait is a poll, and what
+        /// the client actually sees is its next probe. Every wait on this
+        /// path used to probe on a flat 1 ms tick, which is more than a
+        /// glxgears frame costs the GPU -- so the poll, not the card, was
+        /// setting the frame rate. This is the knob that shows it.
+        #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+        enum Poll {
+            /// What the kernel does now: a few yields, then a sleep that
+            /// starts at the timer's arming floor and backs off
+            /// ([`syncobj::fence_poll_step`]).
+            Backoff,
+            /// The flat tick it replaced, in microseconds.
+            FixedTick(u64),
+        }
+
         #[derive(Clone, Copy, PartialEq, Eq, Debug)]
         enum Swap {
             /// `vblank_mode=0`: present as soon as the frame is drawn.
@@ -23254,6 +23401,7 @@ mod nouveau_bookkeeping_tests {
             render_us: u64,
             composite_us: u64,
             swap: Swap,
+            poll: Poll,
             /// The swapchain timeline: frame `f` signals point `f + 1`.
             present_tl: u32,
             /// Per image, the compositor's release timeline: use `u` of the
@@ -23336,6 +23484,7 @@ mod nouveau_bookkeeping_tests {
                     render_us: RENDER_US,
                     composite_us: COMPOSITE_US,
                     swap,
+                    poll: Poll::Backoff,
                     present_tl: syncobj::create(false),
                     release_tl: core::array::from_fn(|_| syncobj::create(false)),
                     sem: core::array::from_fn(|_| syncobj::create(false)),
@@ -23396,6 +23545,30 @@ mod nouveau_bookkeeping_tests {
                     test_clock::set(target);
                 }
                 self.serve_commits();
+            }
+
+            /// One turn of a parked fence wait: let time pass to this
+            /// wait's next probe, handling every event on the way.
+            ///
+            /// A yield costs no wall clock, so the waiter sees the next
+            /// event as it happens; a sleep means the waiter is blind until
+            /// it wakes, however early the thing it waits for arrived.
+            fn poll_wait(&mut self, probes: &mut u32) {
+                let delay = match self.poll {
+                    Poll::Backoff => match syncobj::fence_poll_step(*probes) {
+                        syncobj::PollStep::Yield => 0,
+                        syncobj::PollStep::Sleep { us } => us,
+                    },
+                    Poll::FixedTick(us) => us,
+                };
+                *probes = probes.saturating_add(1);
+                if delay == 0 {
+                    let next = self.next_event();
+                    self.advance_to(next);
+                } else {
+                    let wake = Self::now() + delay;
+                    self.advance_to(wake);
+                }
             }
 
             fn events_due(&mut self) {
@@ -23540,6 +23713,7 @@ mod nouveau_bookkeeping_tests {
                     assert!(syncobj::destroy(merged));
                     let t0 = Self::now();
                     let mut stalled = false;
+                    let mut probes = 0u32;
                     loop {
                         match syncobj::wait_ready(
                             &[self.sem[image]],
@@ -23564,8 +23738,7 @@ mod nouveau_bookkeeping_tests {
                             image,
                             self.uses[image]
                         );
-                        let next = self.next_event();
-                        self.advance_to(next);
+                        self.poll_wait(&mut probes);
                     }
                     if stalled {
                         self.client_stalls += 1;
@@ -23612,14 +23785,14 @@ mod nouveau_bookkeeping_tests {
                 self.serve_commits();
                 if self.swap == Swap::Vsync {
                     let t0 = Self::now();
+                    let mut probes = 0u32;
                     while self.comp_consumed < point {
                         assert!(
                             Self::now().wrapping_sub(t0) < STUCK_US,
                             "frame {} never reached the panel",
                             f
                         );
-                        let next = self.next_event();
-                        self.advance_to(next);
+                        self.poll_wait(&mut probes);
                     }
                 }
             }
@@ -23652,6 +23825,75 @@ mod nouveau_bookkeeping_tests {
                 nv::set_surfaceflip_enabled(false);
                 assert_eq!(FAKE_RM.lock().bad, 0);
             }
+        }
+
+        /// The measurement this whole knob exists for: the same desktop,
+        /// the same GPU, the same compositor, and the only difference is how
+        /// soon a client parked in `SYNCOBJ_WAIT` looks at its fence again.
+        ///
+        /// With the flat 1 ms tick every one of the client's acquire stalls
+        /// was rounded up to a millisecond, so a 2 ms frame became ~3 ms and
+        /// the frame rate landed near 300 -- the number Moebius measures on
+        /// his own card, from a kernel whose GPU work is far faster than 2 ms
+        /// and whose frame rate was therefore set almost entirely by this
+        /// tick. With the backoff the first probes cost no timer at all, so
+        /// the client sees the release when it happens and the rate goes back
+        /// to the GPU's own.
+        #[test]
+        fn the_fence_poll_tick_and_not_the_gpu_was_setting_the_frame_rate() {
+            let _g = LOCK.lock();
+            let _s = SERIAL.lock();
+            let _live = LiveBytes::hold();
+
+            let rate = |poll: Poll| {
+                let gpu = desktop_gpu();
+                let mut d = Desktop::new(&gpu, Swap::Immediate);
+                d.poll = poll;
+                // A glxgears frame on a Turing card, not the 2 ms the other
+                // tests use: 100 us is well under the old poll tick, which is
+                // the whole point -- a client slower than the tick hides it,
+                // a client faster than it is paced by it.
+                d.render_us = 100;
+                let fps = d.run(FRAMES);
+                let stalls = d.client_stalls;
+                assert_eq!(d.commits_served, FRAMES, "{:?}: a present was lost", poll);
+                d.finish();
+                (fps, stalls)
+            };
+
+            let (old_fps, old_stalls) = rate(Poll::FixedTick(1_000));
+            let (new_fps, new_stalls) = rate(Poll::Backoff);
+
+            // The client really does park on its fence in both runs: without
+            // stalls this measures nothing at all.
+            // The client really does park on its fence in both runs: without
+            // stalls this measures nothing at all.
+            assert!(old_stalls > 0 && new_stalls > 0, "the client never waited");
+
+            // What each run spends per frame, against the 100 us the GPU
+            // needs. Everything above that is the client sitting on a fence
+            // that had already landed, waiting to be allowed to look.
+            let old_us = 1_000_000.0 / old_fps;
+            let new_us = 1_000_000.0 / new_fps;
+            assert!(
+                old_us > 400.0,
+                "{:.0} us a frame on a flat 1 ms tick: the tick is no longer what it was",
+                old_us
+            );
+            assert!(
+                new_us < 120.0,
+                "{:.0} us a frame with the backoff, for 100 us of GPU work: \
+                 the client is still being paced by its poll",
+                new_us
+            );
+            assert!(
+                new_fps > old_fps * 3.0,
+                "{:.0} -> {:.0} fps ({:.0} -> {:.0} us a frame), which is not worth the code",
+                old_fps,
+                new_fps,
+                old_us,
+                new_us
+            );
         }
 
         /// The frame rate is the GPU's, not the panel's: a 2 ms frame gives

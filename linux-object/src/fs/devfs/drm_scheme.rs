@@ -173,6 +173,9 @@ impl DrmDev {
             return; // io_control will reject it with EFAULT in a moment
         }
         let req = unsafe { *(data as *const DrmWaitVblank) };
+        if wait_vblank_check(req.typ).is_err() {
+            return; // the sync arm refuses it at once; nothing to sleep for
+        }
         if req.typ & _DRM_VBLANK_EVENT != 0 {
             return; // event form: delivered by the timer queue, never blocks
         }
@@ -227,7 +230,11 @@ impl DrmDev {
             return;
         }
         // A request the sync arm will refuse, or answer without waiting, is
-        // not slept on.
+        // not slept on. `data` is the caller's own pointer here, so the struct
+        // is checked before it is read (`read_syncobj_wait` does not).
+        if ucheck(data, syncobj_wait_prefix(cmd)).is_err() {
+            return;
+        }
         let Ok(Some(SyncobjWaitReq {
             handles,
             points,
@@ -246,23 +253,20 @@ impl DrmDev {
         } else {
             zcore_drivers::scheme::syncobj::wait_ready
         };
+        let deadline = core::time::Duration::from_micros(deadline_us);
+        let mut probes = 0u32;
         loop {
             let _ = zcore_drivers::scheme::syncobj::poll_pending();
             match ready_fn(&handles, points.as_deref(), wait_all, deadline_us) {
                 Some(_) => return,
                 None => {
-                    let now = kernel_hal::timer::timer_now();
                     // If the absolute deadline is already behind `timer_now`,
                     // wait_ready should have returned Timeout; the helper still
                     // refuses to sleep past it if the clocks disagree slightly.
-                    let Some(wake) = next_poll_wake(
-                        now,
-                        core::time::Duration::from_micros(deadline_us),
-                        FENCE_POLL_TICK,
-                    ) else {
+                    if !fence_poll_wait(probes, deadline).await {
                         return;
-                    };
-                    kernel_hal::thread::sleep_until(wake).await;
+                    }
+                    probes = probes.saturating_add(1);
                 }
             }
         }
@@ -292,6 +296,8 @@ impl DrmDev {
         let deadline_us = now.as_micros() as u64 + PRESENT_FENCE_TIMEOUT_US;
         let handles = [handle];
         let points = [point];
+        let deadline = core::time::Duration::from_micros(deadline_us);
+        let mut probes = 0u32;
         loop {
             let _ = zcore_drivers::scheme::syncobj::poll_pending();
             match zcore_drivers::scheme::syncobj::wait_ready(
@@ -332,16 +338,73 @@ impl DrmDev {
                     return;
                 }
                 None => {
-                    let Some(wake) = next_poll_wake(
-                        kernel_hal::timer::timer_now(),
-                        core::time::Duration::from_micros(deadline_us),
-                        FENCE_POLL_TICK,
-                    ) else {
+                    if !fence_poll_wait(probes, deadline).await {
                         return;
-                    };
-                    kernel_hal::thread::sleep_until(wake).await;
+                    }
+                    probes = probes.saturating_add(1);
                 }
             }
+        }
+    }
+
+    /// Wait for the GPU before the synchronous arm serves a blocking
+    /// `GEM_CPU_PREP`.
+    ///
+    /// That ioctl is the one Mesa calls whenever it recycles a buffer or
+    /// reads one back, and it blocks by contract. `INode::io_control` is
+    /// synchronous, so the driver's arm could only busy-wait: `cpu_prep_wait`
+    /// spins on `gpu_spin()` for however long the GPU takes, pegging a core
+    /// and starving every other coroutine on it -- on a two-CPU desktop that
+    /// is the compositor itself being held off by its own client's buffer
+    /// recycle. Same split, and the same reason, as
+    /// [`Self::syncobj_wait_sleep`] and [`Self::atomic_in_fence_sleep`]: here
+    /// we are in the async syscall path and can really sleep, and the sync arm
+    /// then finds the work already done and returns without spinning.
+    ///
+    /// Every early return leaves the ioctl behaving exactly as before this
+    /// existed -- the sync arm still does the whole wait, spin and all. A
+    /// `NOWAIT` prep is never slept on: it answers EBUSY instead of blocking,
+    /// so a sleep ahead of it would turn the one flag that promises not to
+    /// block into a ten-second stall.
+    pub async fn cpu_prep_sleep(&self, cmd: u32, data: usize) {
+        if !zcore_drivers::display::nouveau_uapi_enabled() {
+            return;
+        }
+        if !zcore_drivers::display::is_cpu_prep_ioctl(cmd) {
+            return;
+        }
+        // `data` is the caller's own pointer, checked before it is read: the
+        // driver's arm reads it unchecked, but that runs after `io_control`
+        // has vetted the fd, and this runs on anything userspace hands us.
+        if ucheck(data, zcore_drivers::display::CPU_PREP_REQUEST_BYTES).is_err() {
+            return;
+        }
+        // SAFETY: `is_cpu_prep_ioctl` accepted the size, and `ucheck` just
+        // said those bytes are readable by this process.
+        let (handle, flags) = unsafe { zcore_drivers::display::cpu_prep_request(data) };
+        if zcore_drivers::display::cpu_prep_is_nowait(flags) {
+            return;
+        }
+        let fences = drm::cpu_prep_fences(handle, drm::current_pid());
+        if fences.is_empty() {
+            return;
+        }
+        // The driver's own bound, so a sleep here can never outlast the wait
+        // it stands in for: the sync arm answers EBUSY past it either way.
+        let deadline =
+            kernel_hal::timer::timer_now() + core::time::Duration::from_micros(CPU_PREP_TIMEOUT_US);
+        let mut probes = 0u32;
+        loop {
+            if fences
+                .iter()
+                .all(|&(va, payload)| zcore_drivers::scheme::syncobj::hw_fence_landed(va, payload))
+            {
+                return;
+            }
+            if !fence_poll_wait(probes, deadline).await {
+                return;
+            }
+            probes = probes.saturating_add(1);
         }
     }
 
@@ -435,6 +498,7 @@ impl DrmDev {
         }
         let waited_from = kernel_hal::timer::timer_now();
         let deadline = waited_from + core::time::Duration::from_micros(PRESENT_FENCE_TIMEOUT_US);
+        let mut probes = 0u32;
         loop {
             if fences
                 .iter()
@@ -453,9 +517,7 @@ impl DrmDev {
                 }
                 return;
             }
-            let Some(wake) =
-                next_poll_wake(kernel_hal::timer::timer_now(), deadline, FENCE_POLL_TICK)
-            else {
+            if !fence_poll_wait(probes, deadline).await {
                 // Budgeted for the same reason as the atomic wait: a ring that
                 // stopped landing fences misses this bound on EVERY frame, and
                 // klog writes synchronously to the UART.
@@ -477,8 +539,8 @@ impl DrmDev {
                     );
                 }
                 return;
-            };
-            kernel_hal::thread::sleep_until(wake).await;
+            }
+            probes = probes.saturating_add(1);
         }
     }
 
@@ -1269,6 +1331,7 @@ impl DrmDev {
                 // deliver a DRM_EVENT_VBLANK on the card fd; otherwise fill the
                 // reply and return immediately instead of blocking.
                 let req = unsafe { &mut *(data as *mut DrmWaitVblank) };
+                wait_vblank_check(req.typ)?;
                 let typ = req.typ;
                 let signal = req.val1;
                 // Only ask the driver for a real vblank when it has hardware
@@ -1309,6 +1372,15 @@ impl DrmDev {
                     // turns a vblank-paced client loop into a busy spin (see
                     // `schedule_flip_event`).
                     drm::schedule_vblank_event(signal, target, &self.file);
+                    // The reply names the vblank the event was queued for
+                    // (`drm_queue_vblank_event`: `reply.sequence = req_seq`,
+                    // or the current count when the target had already
+                    // passed). Xorg's modesetting driver reads it as the MSC
+                    // it queued (`ms_queue_vblank`) and was getting 0.
+                    // (After the NEXTONMISS move, as `drm_queue_vblank_event`
+                    // looks at the moved target.)
+                    let still_passed = (target.wrapping_sub(now_seq) as i32) <= 0;
+                    req.sequence = if still_passed { now_seq } else { target };
                 } else {
                     // Blocking form. The wait itself already happened in
                     // `sys_ioctl` (see `DrmDev::wait_vblank_sleep`): this arm
@@ -2696,8 +2768,16 @@ pub fn prime_request(
 /// broken rather than slow -- and the cost of being wrong is a stutter.
 const PRESENT_FENCE_TIMEOUT_US: u64 = 100_000;
 
-/// How long a fence poll sleeps between probes.
-const FENCE_POLL_TICK: Duration = Duration::from_millis(1);
+/// How long the async pre-wait for `GEM_CPU_PREP` may sleep.
+///
+/// The driver's own `CPU_PREP_TIMEOUT_US`, so this sleep can never outlast
+/// the wait it stands in for: past it the sync arm answers EBUSY, and a
+/// pre-wait still parked there would hold the caller for nothing. Unlike the
+/// present fence's bound this is not a tearing/hang trade-off -- it is a
+/// mirror, and it belongs next to the driver's number if that one ever moves
+/// (a longer one here would stall, a shorter one just hands the tail back to
+/// the spin this replaces).
+const CPU_PREP_TIMEOUT_US: u64 = 10_000_000;
 
 /// How often a legacy present says what it waited for: the first two of the
 /// boot, then on the present cost report's own rhythm.
@@ -2741,6 +2821,42 @@ fn next_poll_wake(now: Duration, deadline: Duration, tick: Duration) -> Option<D
         None
     } else {
         Some(wake)
+    }
+}
+
+/// Wait out one interval of a fence poll, on the schedule
+/// [`zcore_drivers::scheme::syncobj::fence_poll_step`] sets: `probes` is how
+/// many probes this wait has already made.
+///
+/// `false` means the deadline has arrived (or a clock stepped backwards) and
+/// the caller must stop polling -- the same answer [`next_poll_wake`]'s `None`
+/// carried when every one of these loops slept a flat millisecond.
+///
+/// The early probes yield instead of arming a timer. A GPU fence on this
+/// hardware lands in far less than the old 1 ms tick, so the tick, not the
+/// GPU, was setting the frame rate: see `fence_poll_step` for the whole
+/// reasoning and for why the backoff ends up at that same tick.
+async fn fence_poll_wait(probes: u32, deadline: Duration) -> bool {
+    use zcore_drivers::scheme::syncobj::{fence_poll_step, PollStep};
+    match fence_poll_step(probes) {
+        PollStep::Yield => {
+            if kernel_hal::timer::timer_now() >= deadline {
+                return false;
+            }
+            kernel_hal::thread::yield_now().await;
+            true
+        }
+        PollStep::Sleep { us } => {
+            let Some(wake) = next_poll_wake(
+                kernel_hal::timer::timer_now(),
+                deadline,
+                Duration::from_micros(us),
+            ) else {
+                return false;
+            };
+            kernel_hal::thread::sleep_until(wake).await;
+            true
+        }
     }
 }
 
@@ -2879,6 +2995,17 @@ fn present_failed(
 pub fn is_syncobj_wait_ioctl(cmd: u32) -> bool {
     is_drm_ioctl_nr(cmd, NR_SYNCOBJ_WAIT, core::mem::size_of::<DrmSyncobjWait>())
         || is_syncobj_timeline_wait(cmd)
+}
+
+/// True for nouveau's `GEM_CPU_PREP`. Used by `sys_ioctl` to run
+/// [`DrmDev::cpu_prep_sleep`] before `io_control`.
+///
+/// The number itself is the driver's, so the recogniser is too
+/// ([`zcore_drivers::display::is_cpu_prep_ioctl`]) -- a copy of a
+/// driver-private NR here is a copy that drifts. This exists only because
+/// `linux-syscall` does not link `zcore-drivers`.
+pub fn is_cpu_prep_ioctl(cmd: u32) -> bool {
+    zcore_drivers::display::is_cpu_prep_ioctl(cmd)
 }
 
 /// ioctl NUMBERs of the two syncobj waits. Both structs grew a trailing
@@ -3144,6 +3271,44 @@ struct DrmSyncobjTransfer {
 
 // WAIT_VBLANK request type flags (`<drm/drm.h>`).
 const _DRM_VBLANK_EVENT: u32 = 0x0400_0000;
+/// The rest of `drm_vblank_seq_type`, as `drm_wait_vblank_ioctl` reads it.
+const _DRM_VBLANK_TYPES_MASK: u32 = 0x1; // ABSOLUTE = 0, RELATIVE = 1
+const _DRM_VBLANK_NEXTONMISS_FLAG: u32 = 0x1000_0000;
+const _DRM_VBLANK_SECONDARY: u32 = 0x2000_0000;
+const _DRM_VBLANK_SIGNAL: u32 = 0x4000_0000;
+const _DRM_VBLANK_FLAGS_MASK: u32 =
+    _DRM_VBLANK_EVENT | _DRM_VBLANK_SIGNAL | _DRM_VBLANK_SECONDARY | _DRM_VBLANK_NEXTONMISS_FLAG;
+const _DRM_VBLANK_HIGH_CRTC_SHIFT: u32 = 1;
+const _DRM_VBLANK_HIGH_CRTC_MASK: u32 = 0x1f << _DRM_VBLANK_HIGH_CRTC_SHIFT;
+
+/// What `drm_wait_vblank_ioctl` refuses before it looks at the sequence:
+/// `_DRM_VBLANK_SIGNAL` (signals have not been supported for years), any
+/// bit outside the type, flag and high-CRTC masks, and a pipe index (the
+/// high-CRTC field, or `_DRM_VBLANK_SECONDARY` for pipe 1) the card does
+/// not have. Every one is EINVAL. This arm used to read only RELATIVE,
+/// NEXTONMISS and EVENT and answer the rest with pipe 0's counter, so a
+/// client waiting on the second head of a one-head card, or asking for a
+/// signal, got a vblank instead of the error Linux gives.
+fn wait_vblank_check(typ: u32) -> Result<()> {
+    if typ & _DRM_VBLANK_SIGNAL != 0 {
+        return Err(FsError::InvalidParam);
+    }
+    if typ & !(_DRM_VBLANK_TYPES_MASK | _DRM_VBLANK_FLAGS_MASK | _DRM_VBLANK_HIGH_CRTC_MASK) != 0 {
+        return Err(FsError::InvalidParam);
+    }
+    let high_pipe = typ & _DRM_VBLANK_HIGH_CRTC_MASK;
+    let pipe_index = if high_pipe != 0 {
+        (high_pipe >> _DRM_VBLANK_HIGH_CRTC_SHIFT) as usize
+    } else if typ & _DRM_VBLANK_SECONDARY != 0 {
+        1
+    } else {
+        0
+    };
+    if pipe_index != 0 && pipe_index >= drm::crtc_count() {
+        return Err(FsError::InvalidParam);
+    }
+    Ok(())
+}
 
 // Synthetic KMS property ids (software KMS). Linux allocates property object
 // ids from the same idr as every other mode object; here they are fixed small
@@ -3390,21 +3555,41 @@ struct SyncobjWaitReq {
     flags: u32,
 }
 
+/// Bytes of a wait request's struct that [`read_syncobj_wait`] reads.
+///
+/// Deadline-sized ioctls carry a trailing hint never read here; the prefix
+/// matches the classic structs, which share this layout.
+fn syncobj_wait_prefix(cmd: u32) -> usize {
+    if is_syncobj_timeline_wait(cmd) {
+        core::mem::size_of::<DrmSyncobjTimelineWait>()
+    } else {
+        core::mem::size_of::<DrmSyncobjWait>()
+    }
+}
+
 /// Read a wait request. `Ok(None)` is a wait on no handles at all, which
 /// Linux answers 0 without reading the array (`count_handles == 0`), and
 /// the array bound is [`syncobj_array_bound`].
+///
+/// `data` must already be known readable for [`syncobj_wait_prefix`] bytes;
+/// this does NOT `ucheck` the struct itself. From the sync arm it may be the
+/// kernel bounce buffer [`drm_ioctl_reconciled`] made for a client whose
+/// struct size differs from ours -- and that is exactly Alpine's libdrm, whose
+/// `drm_syncobj_wait` carries `deadline_nsec` (40 bytes, not 32). A `ucheck`
+/// here refused that kernel address with EFAULT on bare metal (never under
+/// `libos`, where the user-half bound is off, so no host test could see it).
+/// NVK's `vk_drm_syncobj_get_type` probe -- a WAIT on a signaled syncobj --
+/// then failed, its syncobj type lost `VK_SYNC_FEATURE_CPU_WAIT`, and the
+/// first submit that needed a binary CPU-wait sync type walked
+/// `supported_sync_types` off its NULL end: `libvulkan_nouveau.so+0xe9c48`,
+/// `fault @ 0x8`, in labwc right after its first EXEC. The dispatcher has
+/// already done `access_ok()` over the client's range; the async sleeper,
+/// which gets the raw user pointer, checks it itself. The nested `handles`
+/// and `points` arrays are always user memory and are checked below.
 fn read_syncobj_wait(cmd: u32, data: usize) -> Result<Option<SyncobjWaitReq>> {
     // One rule for "is this the timeline wait", so the sleeper and the arm
     // cannot read the same request as different structs.
     let timeline = is_syncobj_timeline_wait(cmd);
-    // Deadline-sized ioctls carry a trailing hint never read here; the
-    // prefix matches the classic structs, which share this layout.
-    let prefix = if timeline {
-        core::mem::size_of::<DrmSyncobjTimelineWait>()
-    } else {
-        core::mem::size_of::<DrmSyncobjWait>()
-    };
-    ucheck(data, prefix)?;
     let (handles_ptr, points_ptr, timeout_nsec, count_handles, flags) = if timeline {
         let req = unsafe { *(data as *const DrmSyncobjTimelineWait) };
         (
@@ -13145,6 +13330,259 @@ mod empty_commit_tests {
 }
 
 #[cfg(test)]
+mod off_crtc_event_tests {
+    //! `ATOMIC` with `PAGE_FLIP_EVENT` on a CRTC that is off and stays off.
+    //! `drm_atomic_crtc_check` refuses it with EINVAL on purpose: a client
+    //! asking to be woken for a frame on a suspended pipe is taken to have a
+    //! bug in its frame loop, the same answer WAIT_VBLANK and the legacy page
+    //! flip give on a disabled pipe. This scheduled the event anyway.
+    use super::out_fence_tests::{atomic_client, commit, Request};
+    use super::*;
+
+    fn mode_blob(c: &super::gl_client_sequence_tests::Client) -> u32 {
+        let mode = make_modeinfo(32, 8);
+        let mut blob = DrmModeCreateBlob {
+            data: mode.as_ptr() as u64,
+            length: mode.len() as u32,
+            blob_id: 0,
+        };
+        c.ioctl(DRM_IOCTL_MODE_CREATEPROPBLOB, &mut blob)
+            .expect("CREATEPROPBLOB");
+        blob.blob_id
+    }
+
+    fn active(on: u64) -> Request {
+        Request::new(&[drm::SYNTH_CRTC_ID], &[1], &[PROP_ACTIVE], &[on])
+    }
+
+    /// One event read off the fd, or none.
+    fn events(c: &super::gl_client_sequence_tests::Client) -> usize {
+        drm::flush_pending_flip_completions();
+        let mut buf = [0u8; 64];
+        match c.read_events(&mut buf) {
+            Ok(n) => n / 32,
+            Err(FsError::Again) => 0,
+            Err(e) => panic!("read: {:?}", e),
+        }
+    }
+
+    #[test]
+    fn an_event_on_a_crtc_that_is_off_and_stays_off_is_refused() {
+        let (_screen, c) = atomic_client(32, 8);
+        const EVENT: u32 = DRM_MODE_PAGE_FLIP_EVENT;
+        const MODESET: u32 = DRM_MODE_ATOMIC_ALLOW_MODESET;
+
+        // A fresh CRTC is off. Leaving it off is fine; asking for an event
+        // while doing so is not, whether the commit names the CRTC or only
+        // its plane (whose state drags the CRTC's in, on Linux).
+        assert_eq!(commit(&c, &active(0), 0), Ok(0));
+        assert_eq!(commit(&c, &active(0), MODESET), Ok(0));
+        assert_eq!(commit(&c, &active(0), EVENT), Err(FsError::InvalidParam));
+        assert_eq!(
+            commit(&c, &active(0), EVENT | MODESET),
+            Err(FsError::InvalidParam)
+        );
+        let plane_only = Request::new(&[drm::SYNTH_PLANE_ID], &[1], &[PROP_CRTC_X], &[0]);
+        assert_eq!(commit(&c, &plane_only, 0), Ok(0));
+        assert_eq!(
+            commit(&c, &plane_only, EVENT),
+            Err(FsError::InvalidParam),
+            "a plane update with an event on an off CRTC"
+        );
+        assert_eq!(events(&c), 0, "a refused commit queued its event");
+        // TEST_ONLY carries no event, so it is not refused for this reason
+        // (the TEST_ONLY|EVENT combination is refused earlier, on its own).
+        assert_eq!(commit(&c, &active(0), DRM_MODE_ATOMIC_TEST_ONLY), Ok(0));
+
+        // Turning it on with an event: allowed, and the event comes.
+        let blob = mode_blob(&c);
+        let on = Request::new(
+            &[drm::SYNTH_CRTC_ID],
+            &[2],
+            &[PROP_MODE_ID, PROP_ACTIVE],
+            &[u64::from(blob), 1],
+        );
+        assert_eq!(commit(&c, &on, EVENT | MODESET), Ok(0));
+        assert_eq!(events(&c), 1);
+        // On and staying on: the ordinary frame.
+        assert_eq!(commit(&c, &active(1), EVENT), Ok(0));
+        assert_eq!(events(&c), 1);
+        // Turning it off with an event: allowed too (it was on), and the
+        // event comes.
+        assert_eq!(commit(&c, &active(0), EVENT | MODESET), Ok(0));
+        assert_eq!(events(&c), 1);
+        // Off and staying off again: refused again, nothing queued.
+        assert_eq!(commit(&c, &active(0), EVENT), Err(FsError::InvalidParam));
+        assert_eq!(commit(&c, &plane_only, EVENT), Err(FsError::InvalidParam));
+        assert_eq!(events(&c), 0);
+    }
+}
+
+#[cfg(test)]
+mod wait_vblank_validation_tests {
+    //! What `WAIT_VBLANK` refuses, driven through the ioctl entry point the
+    //! way `drmWaitVBlank` drives it: `_DRM_VBLANK_SIGNAL`, a bit outside
+    //! the masks, and a pipe the card does not have, each EINVAL in
+    //! `drm_wait_vblank_ioctl` before the sequence is even looked at. This
+    //! arm answered all of them with pipe 0's counter.
+    use super::gl_client_sequence_tests::Client;
+    use super::*;
+    use crate::fs::devfs::kms_emu::{self, EmuGpu};
+
+    const RELATIVE: u32 = 0x1;
+
+    fn wait(c: &Client, typ: u32, sequence: u32) -> Result<u32> {
+        let mut req = DrmWaitVblank {
+            typ,
+            sequence,
+            val1: 0,
+            val2: 0,
+        };
+        c.ioctl(DRM_IOCTL_WAIT_VBLANK, &mut req)
+            .map(|_| req.sequence)
+    }
+
+    fn high_crtc(index: u32) -> u32 {
+        index << _DRM_VBLANK_HIGH_CRTC_SHIFT
+    }
+
+    #[test]
+    fn a_signal_an_unknown_bit_or_a_missing_pipe_is_refused_before_the_wait() {
+        let _screen = kms_emu::attach(32, 8);
+        let c = Client::open(0);
+
+        // The shapes libdrm sends on a one-head card all go through: a
+        // relative query, the same with the high-CRTC field naming pipe 0,
+        // NEXTONMISS, and the event form.
+        let now = wait(&c, RELATIVE, 0).expect("a relative query");
+        assert_eq!(wait(&c, RELATIVE | high_crtc(0), 0), Ok(now));
+        assert_eq!(
+            wait(&c, RELATIVE | _DRM_VBLANK_NEXTONMISS_FLAG, 0).map(|s| s >= now),
+            Ok(true)
+        );
+        assert_eq!(wait(&c, RELATIVE | _DRM_VBLANK_EVENT, 1).is_ok(), true);
+
+        // Signals: EINVAL, whatever else is set.
+        for typ in [
+            _DRM_VBLANK_SIGNAL,
+            _DRM_VBLANK_SIGNAL | RELATIVE,
+            _DRM_VBLANK_SIGNAL | _DRM_VBLANK_EVENT | RELATIVE,
+        ] {
+            assert_eq!(wait(&c, typ, 0), Err(FsError::InvalidParam), "{typ:#x}");
+        }
+        // A bit outside the type, flag and high-CRTC masks.
+        for bit in [1 << 6, 1 << 12, 1 << 25, 1 << 27, 1 << 31] {
+            assert_eq!(
+                wait(&c, RELATIVE | bit, 0),
+                Err(FsError::InvalidParam),
+                "bit {bit:#x}"
+            );
+        }
+        // A pipe this card does not have: the high-CRTC field past 0, or
+        // SECONDARY (pipe 1).
+        for typ in [
+            RELATIVE | high_crtc(1),
+            RELATIVE | high_crtc(31),
+            RELATIVE | _DRM_VBLANK_SECONDARY,
+            RELATIVE | _DRM_VBLANK_EVENT | _DRM_VBLANK_SECONDARY,
+            RELATIVE | _DRM_VBLANK_EVENT | high_crtc(1),
+        ] {
+            assert_eq!(wait(&c, typ, 0), Err(FsError::InvalidParam), "{typ:#x}");
+        }
+        // Refused before anything is scheduled: the fd carries nothing (the
+        // one accepted event above is owed at the next vblank, which no
+        // timer delivers here).
+        let mut buf = [0u8; 128];
+        assert_eq!(c.read_events(&mut buf), Err(FsError::Again));
+    }
+
+    /// The event form answers with the vblank the event was queued for:
+    /// the resolved target, or the current count when the target had
+    /// already passed (`drm_queue_vblank_event`). Xorg's modesetting
+    /// driver keeps that as the MSC it queued; this arm left the request's
+    /// own sequence in place, so a relative "+2" read back as 2.
+    #[test]
+    fn the_event_form_replies_with_the_vblank_it_queued() {
+        let _screen = kms_emu::attach(32, 8);
+        let c = Client::open(0);
+        const EVENT: u32 = _DRM_VBLANK_EVENT;
+        // The counter runs on the clock, so bracket each reply between two
+        // readings rather than pinning it to one.
+        let bracket = |typ: u32, seq: u32| {
+            let before = wait(&c, RELATIVE, 0).expect("now");
+            let got = wait(&c, typ, seq).expect("the event form");
+            let after = wait(&c, RELATIVE, 0).expect("now");
+            (before, got, after)
+        };
+        let within = |lo: u32, got: u32, hi: u32| {
+            (got.wrapping_sub(lo) as i32) >= 0 && (hi.wrapping_sub(got) as i32) >= 0
+        };
+
+        // Relative +2: two past the count at the time.
+        let (b, got, a) = bracket(RELATIVE | EVENT, 2);
+        assert!(
+            within(b + 2, got, a + 2),
+            "relative +2 replied {} at {}..{}",
+            got,
+            b,
+            a
+        );
+        // Absolute, ahead: exactly that.
+        let now = wait(&c, RELATIVE, 0).expect("now");
+        assert_eq!(wait(&c, EVENT, now + 50), Ok(now + 50));
+        // Absolute, already passed: the current count, like Linux, which
+        // sends the event at once in that case.
+        let (b, got, a) = bracket(EVENT, now.wrapping_sub(3));
+        assert!(
+            within(b, got, a),
+            "a passed target replied {} at {}..{}",
+            got,
+            b,
+            a
+        );
+        // Passed with NEXTONMISS: the target moved to the next vblank.
+        let (b, got, a) = bracket(EVENT | _DRM_VBLANK_NEXTONMISS_FLAG, now.wrapping_sub(3));
+        assert!(
+            within(b + 1, got, a + 1),
+            "NEXTONMISS replied {} at {}..{}",
+            got,
+            b,
+            a
+        );
+    }
+
+    /// With two heads (two drivers that own scanout, each with a CRTC of
+    /// its own), pipe 1 exists -- by the high-CRTC field or as SECONDARY --
+    /// and pipe 2 does not. What separates reading the field from merely
+    /// refusing anything in it.
+    #[test]
+    fn a_second_head_makes_pipe_one_a_real_pipe_and_pipe_two_still_not() {
+        let screen = kms_emu::attach(64, 16);
+        let _a = screen.attach_gpu(EmuGpu::hardware_kms("emu-a").with_ids(40, 41, 42));
+        let _b = screen.attach_gpu(EmuGpu::hardware_kms("emu-b").with_ids(60, 61, 62));
+        let c = Client::open(0);
+        assert_eq!(drm::crtc_count(), 2);
+
+        assert!(wait(&c, RELATIVE, 0).is_ok());
+        assert!(
+            wait(&c, RELATIVE | high_crtc(1), 0).is_ok(),
+            "pipe 1 by the field"
+        );
+        assert!(
+            wait(&c, RELATIVE | _DRM_VBLANK_SECONDARY, 0).is_ok(),
+            "pipe 1 as SECONDARY"
+        );
+        for typ in [
+            RELATIVE | high_crtc(2),
+            RELATIVE | high_crtc(31),
+            RELATIVE | _DRM_VBLANK_SECONDARY | high_crtc(2),
+        ] {
+            assert_eq!(wait(&c, typ, 0), Err(FsError::InvalidParam), "{typ:#x}");
+        }
+    }
+}
+
+#[cfg(test)]
 mod present_fence_tests {
     //! The pre-present fence wait: which ioctls take it, and its clock.
     //!
@@ -13574,6 +14012,78 @@ mod syncobj_array_tests {
             flags: 0,
         };
         c.ioctl(cmd, &mut req)
+    }
+
+    /// NVK's `vk_drm_syncobj_get_type` probe exactly as Alpine's libdrm
+    /// 2.4.134 sends it: a WAIT on a SIGNALED syncobj, timeout 0, in the
+    /// deadline-sized struct (40 bytes; 48 for the timeline form). Anything
+    /// but 0 strips `VK_SYNC_FEATURE_CPU_WAIT` from NVK's syncobj type, and
+    /// the first submit that needs a binary CPU-wait type derefs the NULL at
+    /// the end of `supported_sync_types` (`libvulkan_nouveau.so+0xe9c48`).
+    ///
+    /// These sizes go through `drm_ioctl_reconciled`'s kernel bounce buffer,
+    /// and the arm used to `ucheck` that kernel address: EFAULT on bare metal.
+    /// Under `libos` the user-half bound is off, so this test cannot see that
+    /// half by itself -- it pins the path (bounce buffer, reply copied back)
+    /// that the fix in `read_syncobj_wait` is about.
+    #[test]
+    fn the_deadline_sized_waits_nvk_probes_with_succeed_on_a_signaled_syncobj() {
+        #[repr(C)]
+        struct WaitDeadline {
+            wait: DrmSyncobjWait,
+            deadline_nsec: u64,
+        }
+        #[repr(C)]
+        struct TimelineWaitDeadline {
+            wait: DrmSyncobjTimelineWait,
+            deadline_nsec: u64,
+        }
+        assert_eq!(core::mem::size_of::<WaitDeadline>(), 40);
+        assert_eq!(core::mem::size_of::<TimelineWaitDeadline>(), 48);
+
+        let _serialised = drm::test_globals::lock();
+        let _hook = crate::fs::syncobj_eventfd::hardware_fence_tests::TEST_SERIAL.lock();
+        let _on = NouveauOn::new();
+        let c = Client::open(0);
+        let h = [create(&c, true)];
+
+        let mut req = WaitDeadline {
+            wait: DrmSyncobjWait {
+                handles: h.as_ptr() as u64,
+                timeout_nsec: 0,
+                count_handles: 1,
+                flags: DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL,
+                first_signaled: 0xdead,
+                pad: 0,
+            },
+            deadline_nsec: 0,
+        };
+        assert_eq!(c.ioctl(DRM_IOCTL_SYNCOBJ_WAIT_DEADLINE, &mut req), Ok(0));
+        assert_eq!(
+            req.wait.first_signaled, 0,
+            "reply copied back to the client"
+        );
+
+        let points = [1u64];
+        let mut req = TimelineWaitDeadline {
+            wait: DrmSyncobjTimelineWait {
+                handles: h.as_ptr() as u64,
+                points: points.as_ptr() as u64,
+                timeout_nsec: 0,
+                count_handles: 1,
+                flags: DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL,
+                first_signaled: 0xdead,
+                pad: 0,
+            },
+            deadline_nsec: 0,
+        };
+        assert_eq!(
+            c.ioctl(DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT_DEADLINE, &mut req),
+            Ok(0)
+        );
+        assert_eq!(req.wait.first_signaled, 0);
+
+        destroy(&c, h[0]);
     }
 
     /// `vkWaitForFences` on more fences than 64 is one `TIMELINE_WAIT` over

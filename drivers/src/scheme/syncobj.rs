@@ -501,6 +501,71 @@ fn fence_landed(fence_va: usize, payload: u32) -> bool {
     (v.wrapping_sub(payload) as i32) >= 0
 }
 
+/// What a fence poll should do before its next probe.
+///
+/// The async fence waits in `linux-object` (`SYNCOBJ_WAIT`, the atomic
+/// in-fence, the legacy pre-present fence) cannot be woken by an interrupt:
+/// there is no `dma_fence` here, so "the fence landed" is only ever observed
+/// by reading it (see this module's docs). What they *can* choose is how soon
+/// after submitting they look again, and that choice is the whole latency of
+/// a frame that is already done.
+///
+/// They all used one fixed 1 ms tick. A glxgears frame on a Turing card is
+/// well under 200 us of GPU work, so nearly every wait on this path used to
+/// sleep out a whole millisecond past the moment its fence had landed, and
+/// several such waits stack up in one frame (the client's acquire, the
+/// compositor's, the pre-present one). That is a frame rate set by the poll
+/// tick rather than by the GPU.
+///
+/// So: a few yields first, then a sleep that starts at the timer's own floor
+/// and backs off to the old tick.
+///
+/// * The yields cost no timer at all and re-probe as soon as the runtime
+///   comes back round, which is the right answer for the fence that lands in
+///   tens of microseconds -- the common case, and the one the fixed tick was
+///   worst at.
+/// * [`FENCE_POLL_FLOOR_US`] is `MIN_ARM_NS` in `kernel-hal`'s timer
+///   (200 us): asking to sleep less than that does not wake any sooner, it
+///   just reprograms the CPU timer for nothing.
+/// * The backoff caps at [`FENCE_POLL_CAP_US`], the tick this replaces, so a
+///   fence that is genuinely late (a hung ring waiting out its 100 ms or 10 s
+///   bound) costs no more wakeups than it did before -- roughly a hundred for
+///   a 100 ms timeout either way.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PollStep {
+    /// Re-probe as soon as the runtime comes back: no timer is armed.
+    Yield,
+    /// Sleep this many microseconds (capped by the caller's deadline) and
+    /// probe again.
+    Sleep { us: u64 },
+}
+
+/// Probes made by yielding before the first sleep.
+pub const FENCE_POLL_YIELDS: u32 = 4;
+
+/// The shortest sleep worth asking for: `kernel-hal`'s `MIN_ARM_NS`, below
+/// which a CPU timer cannot be armed anyway.
+pub const FENCE_POLL_FLOOR_US: u64 = 200;
+
+/// The longest gap between probes: the fixed tick this backoff replaces.
+pub const FENCE_POLL_CAP_US: u64 = 1_000;
+
+/// What the `probes`-th probe of a fence poll should do before the next one
+/// (`probes` counts the probes already made, so the first call passes 0).
+pub fn fence_poll_step(probes: u32) -> PollStep {
+    if probes < FENCE_POLL_YIELDS {
+        return PollStep::Yield;
+    }
+    let doublings = probes - FENCE_POLL_YIELDS;
+    // 200, 400, 800, then the 1000 us cap. The shift count is clamped first:
+    // a wait parked for its whole timeout reaches large `probes`, and a
+    // shift that runs off the top of the `u64` silently produces ZERO --
+    // which would ask for a sleep of no time at all and spin the poll into
+    // an unbounded timer storm, the opposite of what this exists for.
+    let us = (FENCE_POLL_FLOOR_US << doublings.min(16)).min(FENCE_POLL_CAP_US);
+    PollStep::Sleep { us }
+}
+
 // --- Counters for /proc/gpudbg -----------------------------------------------
 static WAIT_CALLS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 static WAIT_SPIN_US: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
@@ -1991,6 +2056,104 @@ mod tests {
     fn test_lock() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
         LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The first probes cost no timer: a fence that lands in tens of
+    /// microseconds -- an ordinary glxgears frame -- is seen on a yield,
+    /// never a millisecond later.
+    #[test]
+    fn a_fence_poll_yields_before_it_ever_arms_a_timer() {
+        // Spelled out, because a zero here makes the loop below vacuous and
+        // the whole test green on a schedule that never yields at all.
+        assert!(
+            FENCE_POLL_YIELDS > 0,
+            "the poll arms a timer on its first probe"
+        );
+        for probes in 0..FENCE_POLL_YIELDS {
+            assert_eq!(
+                fence_poll_step(probes),
+                PollStep::Yield,
+                "probe {} armed a timer",
+                probes
+            );
+        }
+        assert_eq!(
+            fence_poll_step(FENCE_POLL_YIELDS),
+            PollStep::Sleep {
+                us: FENCE_POLL_FLOOR_US
+            }
+        );
+    }
+
+    /// No sleep is ever asked for below the timer's arming floor (it would
+    /// not wake any sooner) nor above the fixed tick this replaces.
+    #[test]
+    fn a_fence_poll_sleeps_between_the_timer_floor_and_the_old_tick() {
+        let mut seen_cap = false;
+        for probes in FENCE_POLL_YIELDS..FENCE_POLL_YIELDS + 200 {
+            let PollStep::Sleep { us } = fence_poll_step(probes) else {
+                panic!("probe {} still yielding", probes);
+            };
+            assert!(
+                (FENCE_POLL_FLOOR_US..=FENCE_POLL_CAP_US).contains(&us),
+                "probe {} sleeps {} us",
+                probes,
+                us
+            );
+            seen_cap |= us == FENCE_POLL_CAP_US;
+        }
+        assert!(seen_cap, "the backoff never reaches its cap");
+        // And a wait parked long enough to overflow the shift stays at the
+        // cap instead of panicking in a debug build.
+        assert_eq!(
+            fence_poll_step(u32::MAX),
+            PollStep::Sleep {
+                us: FENCE_POLL_CAP_US
+            }
+        );
+    }
+
+    /// The backoff only ever moves outward, and it reaches the cap in about
+    /// a millisecond and a half, so a genuinely late fence costs no more
+    /// wakeups than the fixed tick did.
+    #[test]
+    fn a_fence_poll_backs_off_monotonically_and_settles_at_the_cap() {
+        let mut prev = 0;
+        let mut elapsed = 0;
+        let mut probes = FENCE_POLL_YIELDS;
+        while let PollStep::Sleep { us } = fence_poll_step(probes) {
+            assert!(
+                us >= prev,
+                "probe {} sleeps less than the one before",
+                probes
+            );
+            if us == FENCE_POLL_CAP_US {
+                break;
+            }
+            prev = us;
+            elapsed += us;
+            probes += 1;
+        }
+        assert!(
+            elapsed <= 2_000,
+            "{} us of short probes before the cap",
+            elapsed
+        );
+        // A 100 ms bound (the pre-present fence's) costs about as many
+        // wakeups as the old flat 1 ms tick did: 100, give or take the
+        // handful of short ones at the front.
+        let mut wakes = 0;
+        let mut t = 0;
+        let mut probes = FENCE_POLL_YIELDS;
+        while t < 100_000 {
+            let PollStep::Sleep { us } = fence_poll_step(probes) else {
+                unreachable!()
+            };
+            t += us;
+            wakes += 1;
+            probes += 1;
+        }
+        assert!(wakes <= 110, "{} wakeups to wait out 100 ms", wakes);
     }
 
     std::thread_local! {

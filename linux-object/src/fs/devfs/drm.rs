@@ -1504,6 +1504,28 @@ pub fn scanout_render_fence(fb_id: u32) -> Vec<(usize, u32)> {
         .collect()
 }
 
+/// The GPU fences a blocking `GEM_CPU_PREP` on `gem_handle` would park on,
+/// each as `(fence landing-zone kernel VA, payload)`, for the async pre-wait
+/// in [`super::drm_scheme::DrmDev::cpu_prep_sleep`].
+///
+/// EVERY registered driver is asked, for the same reason
+/// [`scanout_render_fence`] asks them all: on a two-GPU box the buffer's work
+/// need not be on the primary. A driver that does not know the handle answers
+/// with nothing.
+///
+/// Not gated on `flip_fence_enabled`: that hatch turns off a wait this kernel
+/// added to the present path, whereas `GEM_CPU_PREP` has always blocked --
+/// this only moves where it blocks.
+pub fn cpu_prep_fences(gem_handle: u32, owner_pid: u64) -> Vec<(usize, u32)> {
+    // The guard is dropped before any driver call: `cpu_prep_fences` takes the
+    // driver's own locks and may append a probe to a GPU ring.
+    let drivers = DRM_STATE.lock().drivers.clone();
+    drivers
+        .iter()
+        .flat_map(|d| d.cpu_prep_fences(gem_handle, owner_pid))
+        .collect()
+}
+
 /// Per-open DRM file state (Linux `struct drm_file`).
 ///
 /// `ATOMIC_CLIENT` and the readable event queue belong to the fd that
@@ -6483,6 +6505,25 @@ pub fn atomic_commit(
         }
     }
     let active_change = upd.active.map(|a| a != cur.active).unwrap_or(false);
+    // "requesting event but off" (`drm_atomic_crtc_check`): an event on a
+    // CRTC that is off and stays off is refused, on purpose -- Linux's
+    // comment says userspace "has a track record of happily burning through
+    // 100% cpu (or worse, crash) when the display pipe is suspended", so a
+    // request for an event there is taken as a bug in the compositor's
+    // frame loop and answered EINVAL, like WAIT_VBLANK and the legacy page
+    // flip on a disabled pipe. This scheduled the flip event anyway, so the
+    // loop of a client that kept flipping a dark output ran on at vblank
+    // rate. Turning the pipe on or off in the same commit is fine (one of
+    // the two states is active). A TEST_ONLY commit carries no event on
+    // Linux, and the ioctl arm refuses the TEST_ONLY|EVENT pair before it
+    // gets here, so `want_event` alone is the whole condition.
+    let ends_active = upd.active.unwrap_or(cur.active);
+    if want_event && !ends_active && !cur.active {
+        log::error!(
+            "[drm] ATOMIC reject: PAGE_FLIP_EVENT requested on a CRTC that is off and stays off"
+        );
+        return Err(AtomicError::Invalid);
+    }
     if (mode_change || active_change) && !allow_modeset {
         // Linux: "[CRTC] requires full modeset" -> EINVAL without the flag.
         log::error!(
@@ -7118,6 +7159,18 @@ pub fn get_crtc(id: u32) -> Option<DrmCrtc> {
         x: 0,
         y: 0,
     })
+}
+
+/// How many CRTCs the card has, for the pipe index a `WAIT_VBLANK` names
+/// (`_DRM_VBLANK_HIGH_CRTC_MASK` or `_DRM_VBLANK_SECONDARY`). One on the
+/// software path; the drivers' own count otherwise. Only consulted for a
+/// pipe index above 0, which nothing on a one-output desktop sends, so the
+/// driver probe behind `get_resources` is not on the per-frame path.
+pub fn crtc_count() -> usize {
+    if software_kms_active() {
+        return 1;
+    }
+    get_resources().1.len()
 }
 
 pub fn get_planes() -> Vec<u32> {
@@ -9461,13 +9514,18 @@ mod flip_latch_tests {
         let file = DrmFileState::new();
         leave_one_mid_delivery(&file);
 
+        // An event is only owed on a CRTC that is (or becomes) active: the
+        // check phase refuses one on a pipe that is off and stays off, as
+        // `drm_atomic_crtc_check` does. This is a frame on a running output.
+        let was_active = core::mem::replace(&mut DRM_STATE.lock().atomic.active, true);
         let (answer, first_completion_was_on_the_fd) = race_against_delivery(&file, |file| {
             atomic_commit(&AtomicUpdate::default(), false, false, true, 0xA70, file)
         });
+        DRM_STATE.lock().atomic.active = was_active;
         assert_eq!(
             answer,
             Ok(()),
-            "an empty commit that asks for an event is accepted"
+            "a commit on an active CRTC that asks for an event is accepted"
         );
         assert!(
             first_completion_was_on_the_fd,
