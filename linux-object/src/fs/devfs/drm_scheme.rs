@@ -14929,8 +14929,13 @@ mod pre_wait_resolve_tests {
                 "{} no longer waits with hw_fences_landed",
                 name
             );
+            // Named exactly: `hw_fence_landed(` is the per-fence call, and
+            // `hw_fences_landed(` -- with the s -- is not a superstring of
+            // it, so this catches the reversion and nothing else. Looking for
+            // a bare `all(` as well would fail on any unrelated `all` a later
+            // refactor puts in these bodies.
             assert!(
-                !code().contains("all(") || !code().contains("hw_fence_landed("),
+                !code().contains("hw_fence_landed("),
                 "{} is back to reading its landing zones one fence at a time",
                 name
             );

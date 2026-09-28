@@ -512,7 +512,7 @@ pub fn hw_fences_landed(fences: &[(usize, u32)]) -> bool {
     // What each zone said this call. Linear: these lists are a handful of
     // entries long (one per ring that wrote the buffer), and a Vec of pairs
     // beats a map at that size.
-    let mut words: Vec<(usize, u32)> = Vec::new();
+    let mut words: Vec<(usize, u32)> = Vec::with_capacity(fences.len());
     for &(fence_va, payload) in fences {
         let word = match words.iter().find(|&&(va, _)| va == fence_va) {
             Some(&(_, w)) => w,
