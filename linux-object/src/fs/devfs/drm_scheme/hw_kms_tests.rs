@@ -1418,8 +1418,14 @@ fn a_property_write_is_checked_against_the_object_and_the_property() {
         ),
         einval
     );
-    // An object property: 0, or an object of the property's type.
-    assert_eq!(set(plane, DRM_MODE_OBJECT_PLANE, PROP_FB_ID, 0), Ok(0));
+    // An object property: 0, or an object of the property's type. (0 is
+    // a legal value; the commit then refuses a plane with a CRTC and no
+    // FB, `drm_atomic_plane_check`.)
+    assert_eq!(
+        set(plane, DRM_MODE_OBJECT_PLANE, PROP_FB_ID, 0),
+        einval,
+        "CRTC set but no FB"
+    );
     assert_eq!(
         set(plane, DRM_MODE_OBJECT_PLANE, PROP_FB_ID, fb as u64),
         Ok(0)

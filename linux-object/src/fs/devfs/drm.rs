@@ -6960,7 +6960,7 @@ pub struct AtomicUpdate {
 
 /// One `struct drm_mode_rect` (`drm_mode.h`): an inclusive-exclusive damage
 /// rectangle in framebuffer pixels. Signed, because the uAPI is.
-const DRM_MODE_RECT_SIZE: usize = 16;
+pub const DRM_MODE_RECT_SIZE: usize = 16;
 
 /// Resolve an `FB_DAMAGE_CLIPS` blob into one bounding rectangle clamped to
 /// the framebuffer, or `None` for "present the whole frame".
@@ -6975,6 +6975,29 @@ fn damage_rect_from_blob(blob_id: u32, fb_w: u32, fb_h: u32) -> Option<(u32, u32
         return None;
     }
     damage_rect_from_clips(&get_blob(blob_id)?, fb_w, fb_h)
+}
+
+/// `drm_atomic_plane_check`'s walk over the clips of a `FB_DAMAGE_CLIPS`
+/// blob: every one must have `x1 < x2`, `y1 < y2`, `x1, y1 >= 0` and
+/// `x2, y2` no further than the fb's width and height **shifted by 16** --
+/// Linux compares the pixel coordinates of a clip to `fb_width`, which it
+/// had already put in 16.16 for the source rectangle, so a clip past the
+/// fb's edge is not refused unless it is past `width << 16`; the present
+/// trims it ([`damage_rect_from_clips`]). A blob whose length is not a
+/// whole number of rectangles never gets here: the staging refuses it.
+pub fn damage_clips_valid(data: &[u8], fb_w: u32, fb_h: u32) -> bool {
+    let fb_w = (fb_w as i64) << 16;
+    let fb_h = (fb_h as i64) << 16;
+    data.as_chunks::<DRM_MODE_RECT_SIZE>()
+        .0
+        .iter()
+        .all(|chunk| {
+            let rd = |o: usize| {
+                i32::from_ne_bytes([chunk[o], chunk[o + 1], chunk[o + 2], chunk[o + 3]]) as i64
+            };
+            let (x1, y1, x2, y2) = (rd(0), rd(4), rd(8), rd(12));
+            x1 < x2 && y1 < y2 && x1 >= 0 && y1 >= 0 && x2 <= fb_w && y2 <= fb_h
+        })
 }
 
 /// The parsing half of [`damage_rect_from_blob`], split out so it can be
@@ -7031,6 +7054,9 @@ pub enum AtomicError {
     Device,
     /// A previous flip-complete event is still outstanding.
     Busy,
+    /// The plane's source rectangle does not fit its framebuffer
+    /// (`drm_atomic_plane_check`: ENOSPC, not EINVAL).
+    NoSpace,
 }
 
 /// Validate and (unless `test_only`) apply an atomic update, queueing one
@@ -7129,6 +7155,79 @@ pub fn atomic_commit(
             mode_change = cur.mode_blob_id != 0;
         }
     }
+    // `drm_atomic_plane_check` judges the plane's *resulting* state, not the
+    // properties the commit names. The current state is the scanout fb, on
+    // the one CRTC when there is one (the pair `get_plane` reports). This
+    // only looked at what was staged: a FB_ID alone on a plane with no CRTC
+    // presented, FB_ID = 0 alone stopped the scanout, CRTC_ID = 0 alone
+    // "succeeded" with the plane still on, and a SRC_W alone was never held
+    // against the fb the plane keeps.
+    let cur_fb = crtc_fb();
+    let new_fb = upd.plane_fb_id.unwrap_or(cur_fb);
+    let new_crtc = upd
+        .plane_crtc_id
+        .unwrap_or(if cur_fb != 0 { SYNTH_CRTC_ID } else { 0 });
+    // "either *both* CRTC and FB must be set, or neither".
+    if new_crtc != 0 && new_fb == 0 {
+        log::error!(
+            "[drm] ATOMIC reject (test_only={}): plane CRTC set but no FB",
+            test_only
+        );
+        return Err(AtomicError::Invalid);
+    }
+    if new_fb != 0 && new_crtc == 0 {
+        log::error!(
+            "[drm] ATOMIC reject (test_only={}): plane FB {:#x} set but no CRTC",
+            test_only,
+            new_fb
+        );
+        return Err(AtomicError::Invalid);
+    }
+    // "if disabled, we don't care about the rest of the state".
+    if new_crtc != 0 {
+        let Some(fb) = get_fb(new_fb) else {
+            log::error!(
+                "[drm] ATOMIC reject (test_only={}): plane FB {:#x} not found (ADDFB2 never registered it?)",
+                test_only, new_fb
+            );
+            return Err(AtomicError::NotFound);
+        };
+        // The source rectangle, in 16.16, inside the fb: `src_w > fb_width
+        // || src_x > fb_width - src_w`, so a fractional edge counts (31.5
+        // wide from x = 0.75 is past 32), and the answer is ENOSPC. This
+        // truncated both to whole pixels and said EINVAL.
+        let fb_w = (fb.width as u64) << 16;
+        let fb_h = (fb.height as u64) << 16;
+        let src_x = upd.src_x.unwrap_or(cur.src_x) as u64;
+        let src_y = upd.src_y.unwrap_or(cur.src_y) as u64;
+        let src_w = upd.src_w.unwrap_or(cur.src_w) as u64;
+        let src_h = upd.src_h.unwrap_or(cur.src_h) as u64;
+        if src_w > fb_w || src_x > fb_w - src_w || src_h > fb_h || src_y > fb_h - src_h {
+            log::error!(
+                "[drm] ATOMIC reject (test_only={}): source rect {}.{:04x}x{}.{:04x}+{}.{:04x}+{}.{:04x} outside FB {:#x} ({}x{})",
+                test_only,
+                src_w >> 16, src_w & 0xffff, src_h >> 16, src_h & 0xffff,
+                src_x >> 16, src_x & 0xffff, src_y >> 16, src_y & 0xffff,
+                new_fb, fb.width, fb.height
+            );
+            return Err(AtomicError::NoSpace);
+        }
+        // Damage clips: each one a real rectangle at or past the origin
+        // (`drm_atomic_plane_check`: "invalid damage clip", EINVAL). Being
+        // silently skipped at present time hid a compositor's bug.
+        if let Some(blob_id) = upd.damage_clips {
+            if blob_id != 0
+                && !get_blob(blob_id).is_some_and(|d| damage_clips_valid(&d, fb.width, fb.height))
+            {
+                log::error!(
+                    "[drm] ATOMIC reject (test_only={}): FB_DAMAGE_CLIPS blob {:#x} holds an invalid clip",
+                    test_only, blob_id
+                );
+                return Err(AtomicError::Invalid);
+            }
+        }
+    }
+
     let active_change = upd.active.map(|a| a != cur.active).unwrap_or(false);
     // "requesting event but off" (`drm_atomic_crtc_check`): an event on a
     // CRTC that is off and stays off is refused, on purpose -- Linux's
@@ -7173,38 +7272,6 @@ pub fn atomic_commit(
             test_only, upd.mode_blob, cur.mode_blob_id
         );
         return Err(AtomicError::Invalid);
-    }
-
-    // Plane: an attached framebuffer must exist and contain the source rect.
-    if let Some(fb_id) = upd.plane_fb_id {
-        if fb_id != 0 {
-            let Some(fb) = get_fb(fb_id) else {
-                log::error!(
-                    "[drm] ATOMIC reject (test_only={}): plane FB {:#x} not found (ADDFB2 never registered it?)",
-                    test_only, fb_id
-                );
-                return Err(AtomicError::NotFound);
-            };
-            if upd.plane_crtc_id == Some(0) {
-                // FB without a CRTC is invalid atomic plane state.
-                log::error!(
-                    "[drm] ATOMIC reject (test_only={}): plane has FB {:#x} but CRTC_ID=0 (no CRTC)",
-                    test_only, fb_id
-                );
-                return Err(AtomicError::Invalid);
-            }
-            let end_x = (upd.src_x.unwrap_or(cur.src_x) >> 16)
-                .saturating_add(upd.src_w.unwrap_or(cur.src_w) >> 16);
-            let end_y = (upd.src_y.unwrap_or(cur.src_y) >> 16)
-                .saturating_add(upd.src_h.unwrap_or(cur.src_h) >> 16);
-            if end_x > fb.width || end_y > fb.height {
-                log::error!(
-                    "[drm] ATOMIC reject (test_only={}): source rect end ({},{}) exceeds FB {:#x} size {}x{}",
-                    test_only, end_x, end_y, fb_id, fb.width, fb.height
-                );
-                return Err(AtomicError::Invalid);
-            }
-        }
     }
 
     if test_only {
