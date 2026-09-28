@@ -99,15 +99,11 @@ impl Syscall<'_> {
         let hostname = uname::hostname();
         let domainname = uname::domainname();
 
-        let arch = if cfg!(target_arch = "x86_64") {
-            "x86_64"
-        } else if cfg!(target_arch = "aarch64") {
-            "aarch64"
-        } else if cfg!(target_arch = "riscv64") {
-            "riscv64"
-        } else {
-            "unknown"
-        };
+        let arch = uname_machine(
+            cfg!(target_arch = "x86_64"),
+            cfg!(target_arch = "aarch64"),
+            cfg!(target_arch = "riscv64"),
+        );
 
         // The whole 390-byte struct, each name cut to its 65-byte field
         // (`sys_newuname` copies the arrays, not the strings). Writing
@@ -2007,6 +2003,82 @@ mod futex_op_tests {
         assert_eq!(
             futex_op_check(FUTEX_WAKE | FUTEX_PRIVATE_FLAG, 0),
             Ok(FUTEX_WAKE)
+        );
+    }
+}
+
+/// The `machine` field of `uname(2)` for the target this kernel was built for.
+///
+/// Takes the three `cfg!` answers instead of asking for them, because a chain
+/// of `cfg!` written inline only ever *evaluates* the arm of the machine
+/// running the tests: the aarch64 and riscv64 strings were unreachable from
+/// any test in the tree, and a typo in one of them is not a cosmetic bug.
+/// `uname -m` is what glibc, the Go runtime and every `configure` script read
+/// to pick their code paths, so a wrong answer is a userland that will not
+/// start, on a board that cannot be tested from here.
+const fn uname_machine(x86_64: bool, aarch64: bool, riscv64: bool) -> &'static str {
+    if x86_64 {
+        "x86_64"
+    } else if aarch64 {
+        "aarch64"
+    } else if riscv64 {
+        "riscv64"
+    } else {
+        "unknown"
+    }
+}
+
+#[cfg(test)]
+mod uname_machine_tests {
+    use super::uname_machine;
+
+    /// The three answers, including the two no test in the tree could reach
+    /// while the chain was written inline: a host build only ever evaluates
+    /// its own arm.
+    #[test]
+    fn every_architecture_this_kernel_builds_for_gets_the_name_linux_uses() {
+        assert_eq!(uname_machine(true, false, false), "x86_64");
+        assert_eq!(uname_machine(false, true, false), "aarch64");
+        assert_eq!(uname_machine(false, false, true), "riscv64");
+    }
+
+    /// A fourth target added to the tree without a line here must say so,
+    /// rather than inherit whichever name happened to be last.
+    #[test]
+    fn an_architecture_with_no_name_here_says_unknown() {
+        assert_eq!(uname_machine(false, false, false), "unknown");
+    }
+
+    /// The order is a fallback chain, so it has to be read in order. Exactly
+    /// one flag is true in a real build; this pins what the chain does if that
+    /// ever stops holding, instead of leaving it to whoever edits it next.
+    #[test]
+    fn the_first_flag_that_is_set_is_the_one_that_answers() {
+        assert_eq!(uname_machine(true, true, true), "x86_64");
+        assert_eq!(uname_machine(false, true, true), "aarch64");
+    }
+
+    /// And that this build is one the chain has a name for. `sys_uname` calls
+    /// it with exactly these three flags, so a fourth target added to the tree
+    /// without a line above makes this fail here rather than making glibc fail
+    /// on the board.
+    #[test]
+    fn the_target_this_kernel_is_being_built_for_has_a_name_in_the_chain() {
+        let flags = [
+            cfg!(target_arch = "x86_64"),
+            cfg!(target_arch = "aarch64"),
+            cfg!(target_arch = "riscv64"),
+        ];
+        assert_eq!(
+            flags.iter().filter(|f| **f).count(),
+            1,
+            "un build es de exactamente una arquitectura"
+        );
+        assert_ne!(
+            uname_machine(flags[0], flags[1], flags[2]),
+            "unknown",
+            "esta arquitectura no tiene linea en la cadena: uname -m diria \
+             «unknown» y glibc y Go no arrancarian"
         );
     }
 }
