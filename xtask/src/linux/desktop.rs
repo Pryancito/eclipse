@@ -47,7 +47,9 @@ pub fn install(rootfs: &Path) {
     write_memwatch(rootfs);
     write_terminal_wrapper(rootfs);
     write_firefox_wrapper(rootfs);
-    write_firefox_desktop_override(rootfs);
+    // The firefox .desktop override is written after apk has run (mod.rs),
+    // next to the default prefs: which id to shadow depends on which
+    // package landed.
     write_freedoom_wrapper(rootfs);
     write_freedoom_desktop_entries(rootfs);
     write_xorg_config(rootfs);
@@ -1336,16 +1338,17 @@ fn write_firefox_wrapper(rootfs: &Path) {
           export XDG_CACHE_HOME=\"${XDG_CACHE_HOME:-/tmp/xdg-cache}\"\n\
           mkdir -p \"$XDG_CACHE_HOME\"\n\
           FLOG=\"${HOME:-/root}/.eclipse-firefox.log\"\n\
-          # `firefox` is what DEFAULT_PACKAGES installs; `firefox-esr` is a\n\
-          # separate Alpine package with its own binary name, so accept either\n\
-          # rather than sending a mirror that carries only ESR back to the\n\
-          # not-found branch.\n\
+          # `firefox-esr` is what DEFAULT_PACKAGES installs (the ESR line: same\n\
+          # engine, fewer features churning, lighter on RAM than rapid\n\
+          # release); `firefox` is a separate Alpine package with its own\n\
+          # binary name, so accept it as the fallback rather than sending an\n\
+          # image that carries only rapid release to the not-found branch.\n\
           FFBIN=\n\
-          for c in firefox firefox-esr; do\n\
+          for c in firefox-esr firefox; do\n\
           \x20 if command -v \"$c\" >/dev/null 2>&1; then FFBIN=$c; break; fi\n\
           done\n\
           if [ -z \"$FFBIN\" ]; then\n\
-          \x20 echo 'eclipse-firefox: firefox not found (apk add firefox)' >&2\n\
+          \x20 echo 'eclipse-firefox: firefox not found (apk add firefox-esr)' >&2\n\
           \x20 echo 'eclipse-firefox: firefox not found' >>\"$FLOG\"\n\
           \x20 exit 127\n\
           fi\n\
@@ -1378,7 +1381,7 @@ fn write_firefox_wrapper(rootfs: &Path) {
 /// before `xorg::install` has fetched the package. The rootfs build calls
 /// this after the package step, on both the fresh and the incremental path.
 pub fn write_firefox_default_prefs(rootfs: &Path) {
-    for dir in ["usr/lib/firefox", "usr/lib/firefox-esr"] {
+    for (_, dir) in FIREFOX_PACKAGES {
         let app = rootfs.join(dir);
         if !app.is_dir() {
             continue;
@@ -1399,32 +1402,73 @@ pub fn write_firefox_default_prefs(rootfs: &Path) {
     }
 }
 
-/// User-level `firefox.desktop` override so lunarbar's launcher menu (and any
-/// XDG activation) runs Firefox through `eclipse-firefox` instead of the stock
-/// package's `Exec=firefox`, which tries hardware GL/WebRender and paints black
-/// on this GPU-less stack. lunarbar scans `$XDG_DATA_HOME/applications` before
+/// The two Alpine packages that can put a Firefox in the image, as
+/// (package = `.desktop` id = icon name, install dir under the rootfs). Both
+/// names come from the package: `firefox-esr` installs
+/// `/usr/share/applications/firefox-esr.desktop`, icons named
+/// `firefox-esr.png` and `/usr/lib/firefox-esr/`; `firefox` the same with its
+/// own name. The first one is the default package; see DEFAULT_PACKAGES.
+const FIREFOX_PACKAGES: &[(&str, &str)] = &[
+    ("firefox-esr", "usr/lib/firefox-esr"),
+    ("firefox", "usr/lib/firefox"),
+];
+
+/// User-level `.desktop` override so lunarbar's launcher menu (and any XDG
+/// activation) runs Firefox through `eclipse-firefox` instead of the stock
+/// package's `Exec=`, which tries hardware GL/WebRender and paints black on
+/// this GPU-less stack. lunarbar scans `$XDG_DATA_HOME/applications` before
 /// `/usr/share/applications` and keeps the first entry per desktop-file id, so
-/// this shadows the packaged `firefox.desktop` without touching it.
-fn write_firefox_desktop_override(rootfs: &Path) {
+/// this shadows the packaged file without touching it.
+///
+/// The id has to be the installed package's: `firefox-esr` ships
+/// `firefox-esr.desktop` and icons named `firefox-esr`, so an override called
+/// `firefox.desktop` would not shadow anything -- the menu would show the
+/// packaged entry (stock `Exec`, no wrapper) AND ours, the second with an icon
+/// that does not exist. One override per package that is actually in the
+/// rootfs, and the one for a package that is not there is removed, so an
+/// incremental build that switched packages does not keep a stale entry. With
+/// no Firefox installed at all (an offline build) the default package's entry
+/// is written, so a later `apk add` is shadowed from the start. Runs after
+/// apk, next to [`write_firefox_default_prefs`], for that reason.
+pub fn write_firefox_desktop_override(rootfs: &Path) {
     let dir = rootfs.join("root/.local/share/applications");
     let _ = fs::create_dir_all(&dir);
-    fs::write(
-        dir.join("firefox.desktop"),
-        b"[Desktop Entry]\n\
-          Version=1.0\n\
-          Type=Application\n\
-          Name=Firefox\n\
-          GenericName=Web Browser\n\
-          Comment=Browse the Web (Eclipse OS software-rendering wrapper)\n\
-          Exec=/usr/local/bin/eclipse-firefox %u\n\
-          TryExec=/usr/local/bin/eclipse-firefox\n\
-          Terminal=false\n\
-          Icon=firefox\n\
-          Categories=Network;WebBrowser;\n\
-          MimeType=text/html;x-scheme-handler/http;x-scheme-handler/https;\n\
-          StartupNotify=false\n",
-    )
-    .unwrap();
+    let installed: Vec<&str> = FIREFOX_PACKAGES
+        .iter()
+        .filter(|(_, app)| rootfs.join(app).is_dir())
+        .map(|(id, _)| *id)
+        .collect();
+    let wanted: Vec<&str> = if installed.is_empty() {
+        vec![FIREFOX_PACKAGES[0].0]
+    } else {
+        installed
+    };
+    for (id, _) in FIREFOX_PACKAGES {
+        let entry = dir.join(format!("{id}.desktop"));
+        if !wanted.contains(id) {
+            let _ = fs::remove_file(&entry);
+            continue;
+        }
+        fs::write(
+            &entry,
+            format!(
+                "[Desktop Entry]\n\
+                 Version=1.0\n\
+                 Type=Application\n\
+                 Name=Firefox\n\
+                 GenericName=Web Browser\n\
+                 Comment=Browse the Web (Eclipse OS software-rendering wrapper)\n\
+                 Exec=/usr/local/bin/eclipse-firefox %u\n\
+                 TryExec=/usr/local/bin/eclipse-firefox\n\
+                 Terminal=false\n\
+                 Icon={id}\n\
+                 Categories=Network;WebBrowser;\n\
+                 MimeType=text/html;x-scheme-handler/http;x-scheme-handler/https;\n\
+                 StartupNotify=false\n"
+            ),
+        )
+        .unwrap();
+    }
 }
 
 /// `/usr/local/bin/eclipse-freedoom`: launch Freedoom on whichever Doom engine
@@ -2418,6 +2462,10 @@ fn write_labwc_environment(rootfs: &Path) {
           # in docs/README-desktop.md.\n\
           ALSOFT_DRIVERS=pulse,alsa\n\
           PULSE_SERVER=unix:/run/pulse/native\n\
+          # Firefox on native Wayland for anything labwc launches (menu,\n\
+          # keybinds, autostart). /etc/profile and eclipse-init's CHILD_ENV\n\
+          # carry the same pin; the eclipse-firefox wrapper re-asserts it.\n\
+          MOZ_ENABLE_WAYLAND=1\n\
           # Pin the D-Bus session address so libdbus never `autolaunch:`es\n\
           # (dbus-launch + X11 + dbus-daemon + babysitter behind pipes -- the\n\
           # chain SDL_Init walks first and where gzdoom hung). With no daemon\n\
@@ -2828,6 +2876,105 @@ mod tests {
         assert!(caches.contains("/root/.cache/pixbuf-loaders.cache"));
         let ff = fs::read_to_string(dir.join("usr/local/bin/eclipse-firefox")).unwrap();
         assert!(ff.contains("export NO_AT_BRIDGE=1\n"));
+        // The ESR package is the shipped one, so it is the binary the wrapper
+        // looks for first; rapid release stays as the fallback.
+        assert!(
+            ff.contains("for c in firefox-esr firefox; do\n"),
+            "the wrapper must try firefox-esr before firefox"
+        );
+        assert!(ff.contains("(apk add firefox-esr)"));
+        assert!(ff.contains("export MOZ_ENABLE_WAYLAND=1\n"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Firefox must land on its native Wayland backend from EVERY launch
+    /// path, not only through the wrapper: a `firefox-esr` typed in a
+    /// terminal reads `/etc/profile`; anything labwc launches (menu, keybind,
+    /// autostart) reads labwc's environment file; init-started children get
+    /// eclipse-init's CHILD_ENV (checked in that crate). One pin per copy.
+    #[test]
+    fn firefox_runs_on_native_wayland_from_every_launch_path() {
+        let dir = std::env::temp_dir().join(format!("eclipse-moz-wayland-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        write_labwc_environment(&dir);
+        write_firefox_wrapper(&dir);
+        let etc = dir.join("etc");
+        fs::create_dir_all(&etc).unwrap();
+        super::super::LinuxRootfs::write_profile(&etc);
+
+        let profile = fs::read_to_string(etc.join("profile")).unwrap();
+        let environment = fs::read_to_string(dir.join("root/.config/labwc/environment")).unwrap();
+        let wrapper = fs::read_to_string(dir.join("usr/local/bin/eclipse-firefox")).unwrap();
+        assert!(
+            profile.contains("\nexport MOZ_ENABLE_WAYLAND=1\n"),
+            "/etc/profile must export MOZ_ENABLE_WAYLAND=1"
+        );
+        assert!(
+            environment.contains("\nMOZ_ENABLE_WAYLAND=1\n"),
+            "labwc's environment file must set MOZ_ENABLE_WAYLAND=1"
+        );
+        assert!(
+            wrapper.contains("\nexport MOZ_ENABLE_WAYLAND=1\n"),
+            "the wrapper must export MOZ_ENABLE_WAYLAND=1"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The `.desktop` override only shadows the packaged entry when it has
+    /// the SAME id, and `firefox-esr` ships `firefox-esr.desktop` with icons
+    /// named `firefox-esr`. An override called `firefox.desktop` on an
+    /// ESR-only image shadows nothing: the menu shows the stock entry (no
+    /// wrapper) plus ours, with an icon that does not exist. So the override
+    /// follows the installed package, and switching packages on an
+    /// incremental build removes the stale one.
+    #[test]
+    fn firefox_desktop_override_follows_the_installed_package() {
+        let dir = std::env::temp_dir().join(format!("eclipse-ff-desktop-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let apps = dir.join("root/.local/share/applications");
+        let entry = |id: &str| apps.join(format!("{id}.desktop"));
+
+        // Nothing installed (an offline build): the default package's entry,
+        // so a later `apk add firefox-esr` is shadowed from the start.
+        fs::create_dir_all(&dir).unwrap();
+        write_firefox_desktop_override(&dir);
+        assert!(entry("firefox-esr").is_file(), "default entry");
+        assert!(
+            !entry("firefox").exists(),
+            "no entry for a package that is not there"
+        );
+
+        // Rapid release only.
+        fs::create_dir_all(dir.join("usr/lib/firefox")).unwrap();
+        write_firefox_desktop_override(&dir);
+        assert!(entry("firefox").is_file());
+        assert!(!entry("firefox-esr").exists(), "stale ESR entry must go");
+        let ff = fs::read_to_string(entry("firefox")).unwrap();
+        assert!(ff.contains("\nIcon=firefox\n"), "{ff}");
+
+        // Both.
+        fs::create_dir_all(dir.join("usr/lib/firefox-esr")).unwrap();
+        write_firefox_desktop_override(&dir);
+        assert!(entry("firefox").is_file() && entry("firefox-esr").is_file());
+
+        // ESR only, the shipped configuration.
+        fs::remove_dir_all(dir.join("usr/lib/firefox")).unwrap();
+        write_firefox_desktop_override(&dir);
+        assert!(
+            !entry("firefox").exists(),
+            "stale rapid-release entry must go"
+        );
+        let esr = fs::read_to_string(entry("firefox-esr")).unwrap();
+        assert!(esr.contains("\nIcon=firefox-esr\n"), "{esr}");
+        assert!(
+            esr.contains("\nExec=/usr/local/bin/eclipse-firefox %u\n"),
+            "{esr}"
+        );
+        assert!(
+            esr.contains("\nTryExec=/usr/local/bin/eclipse-firefox\n"),
+            "{esr}"
+        );
+        assert!(esr.starts_with("[Desktop Entry]\n"));
         let _ = fs::remove_dir_all(&dir);
     }
 

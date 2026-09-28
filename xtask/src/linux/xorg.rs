@@ -349,22 +349,29 @@ const DEFAULT_PACKAGES: &[&str] = &[
     "libdecor",
     // ── Firefox ─────────────────────────────────────────────────────────────
     // The browser itself. Everything around it was already here -- the
-    // `eclipse-firefox` wrapper and its `firefox.desktop` override
-    // (desktop.rs), the software-GL stack above, and `/bin/firefox-probe`,
-    // which checks the kernel interfaces it depends on -- but the package was
-    // never installed, so the wrapper's own "firefox not found" branch was the
-    // only thing that ever ran.
+    // `eclipse-firefox` wrapper and its `.desktop` override (desktop.rs), the
+    // software-GL stack above, and `/bin/firefox-probe`, which checks the
+    // kernel interfaces it depends on -- but for a while no package was
+    // installed, so the wrapper's own "firefox not found" branch was the only
+    // thing that ever ran.
     //
-    // Alpine's `firefox` installs to /usr/lib/firefox/ (libxul.so alone is
-    // ~150 MiB). That reaches the QEMU live image intact: `usr/lib` is one of
-    // LIVE_TREES, which `copy_into_live` copies UNCAPPED, so the 16 MiB
-    // LIVE_FILE_CAP that governs the rest of the live root does not apply.
-    // The live initramfs is a RAM disk, so it does grow by roughly that much.
+    // The ESR line, not rapid release: same engine, a feature set that stands
+    // still for a year, and lighter on RAM -- Firefox is the hungriest thing
+    // in the image, and on real hardware it was slow enough to drag labwc
+    // down. Alpine's `firefox-esr` installs to /usr/lib/firefox-esr/ with the
+    // binary `/usr/bin/firefox-esr`, `firefox-esr.desktop` and icons named
+    // `firefox-esr` (the wrapper and the .desktop override in desktop.rs
+    // follow those names). libxul.so alone is ~150 MiB; it reaches the QEMU
+    // live image intact because `usr/lib` is one of LIVE_TREES, which
+    // `copy_into_live` copies UNCAPPED, so the 16 MiB LIVE_FILE_CAP that
+    // governs the rest of the live root does not apply. The live initramfs is
+    // a RAM disk, so it does grow by roughly that much.
     //
-    // `firefox-esr` is the fallback the wrapper also accepts; it is a separate
-    // package with a separate binary name and does NOT `provides` this one,
-    // so a mirror carrying only ESR needs ECLIPSE_XORG_PACKAGES.
-    "firefox",
+    // `firefox` (rapid release) is the fallback the wrapper also accepts; it
+    // is a separate package with a separate binary name and does NOT
+    // `provides` this one, so a mirror carrying only rapid release needs
+    // ECLIPSE_XORG_PACKAGES.
+    "firefox-esr",
 ];
 
 /// Whether the build is running as root (euid 0), via `id -u` — no extra crate
@@ -489,7 +496,7 @@ fn mk_apk_add(
 ///
 /// This exists because `ECLIPSE_XORG_PACKAGES` is documented for exactly the
 /// cases that need an atom rather than a name -- a repository whose names
-/// differ, a mirror carrying only ESR -- and every comparison below used to be
+/// differ, a mirror carrying only rapid-release `firefox` -- and every comparison below used to be
 /// on the whole atom.
 fn apk_atom_name(atom: &str) -> &str {
     let atom = atom.trim();
@@ -2127,5 +2134,25 @@ mod tests {
         );
         assert!(live.join("usr/bin/freedoom2").is_file());
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The shipped browser is the ESR line: lighter on RAM than rapid release
+    /// (Firefox is the hungriest thing in the image, and on real hardware it
+    /// was slow enough to drag labwc down) and a feature set that stands
+    /// still for a year. The two are separate Alpine packages with separate
+    /// binary, install dir, `.desktop` id and icon names, and neither
+    /// `provides` the other, so this is the name everything else in the image
+    /// (the wrapper's search order, the `.desktop` override) is keyed on.
+    #[test]
+    fn the_shipped_browser_is_firefox_esr_not_rapid_release() {
+        assert!(
+            DEFAULT_PACKAGES.contains(&"firefox-esr"),
+            "firefox-esr must be in the default package set"
+        );
+        assert!(
+            !DEFAULT_PACKAGES.contains(&"firefox"),
+            "rapid-release firefox must not be installed next to ESR: two 150 MiB \
+             libxul.so in a RAM-backed image, and two menu entries"
+        );
     }
 }
