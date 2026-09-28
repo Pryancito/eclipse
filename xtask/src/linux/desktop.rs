@@ -1575,6 +1575,29 @@ fn write_freedoom_wrapper(rootfs: &Path) {
           \x20 exit 2\n\
           fi\n\
           echo \"eclipse-freedoom: iwad=$IWAD wlr_renderer=${WLR_RENDERER:-unset}\"\n\
+          # The session bus, and why the engine does not get one.\n\
+          #\n\
+          # SDL2 calls SDL_DBus_Init() from SDL_InitSubSystem before it looks\n\
+          # at a single subsystem, and GZDoom's first SDL call is SDL_Init(0)\n\
+          # -- no subsystems at all -- immediately after the version banner it\n\
+          # prints. That banner followed by nothing is exactly what Freedoom\n\
+          # does here, for as long as you let it sit. libdbus waits out the\n\
+          # SASL handshake with NO timeout (the 25s one only covers the Hello\n\
+          # reply), so a bus that never finishes the handshake parks the game\n\
+          # for good. A game wants the bus for nothing: SDL uses it only for\n\
+          # screensaver inhibit and ibus. So point the engine at an address\n\
+          # with nothing behind it -- connect() fails at once, libdbus gives\n\
+          # up, SDL carries on. It is the same muzzle DBUS_SESSION_BUS_ADDRESS\n\
+          # carried session-wide before there was a daemon to point it at.\n\
+          # ECLIPSE_FREEDOOM_BUS=1 keeps the real bus, to retest it.\n\
+          case \"${ECLIPSE_FREEDOOM_BUS:-0}\" in\n\
+          \x20 1|on|yes|true)\n\
+          \x20 \x20 say \"eclipse-freedoom: session bus kept: ${DBUS_SESSION_BUS_ADDRESS:-unset}\" ;;\n\
+          \x20 *)\n\
+          \x20 \x20 DBUS_SESSION_BUS_ADDRESS=unix:path=/run/eclipse-freedoom-no-bus\n\
+          \x20 \x20 export DBUS_SESSION_BUS_ADDRESS\n\
+          \x20 \x20 say \"eclipse-freedoom: session bus muzzled for the engine (ECLIPSE_FREEDOOM_BUS=1 keeps it)\" ;;\n\
+          esac\n\
           # Software-rendering engines first: on a stack whose best GL is\n\
           # llvmpipe they are the ones that run at full speed.\n\
           for e in chocolate-doom crispy-doom prboom-plus prboom; do\n\
@@ -3155,8 +3178,10 @@ mod tests {
                 "engine launched without an IWAD: {line}"
             );
         }
+        // Compare where the engines are RUN, not where their names first
+        // appear: a comment mentioning one of them must not decide this.
         assert!(
-            src.find("chocolate-doom").unwrap() < src.find("gzdoom").unwrap(),
+            src.find("for e in chocolate-doom").unwrap() < src.find("command -v gzdoom").unwrap(),
             "the software engines must be tried before gzdoom"
         );
         assert!(
@@ -3173,6 +3198,17 @@ mod tests {
         assert!(
             src.contains("Directories searched:"),
             "the no-IWAD path must name the directories it walked"
+        );
+        // The engine must not inherit the live session bus: SDL_Init calls
+        // SDL_DBus_Init before anything else and libdbus has no timeout on the
+        // handshake, which is where gzdoom stopped dead after its banner.
+        assert!(
+            src.contains("DBUS_SESSION_BUS_ADDRESS=unix:path=/run/eclipse-freedoom-no-bus"),
+            "the engine must be pointed away from the session bus"
+        );
+        assert!(
+            src.contains("ECLIPSE_FREEDOOM_BUS"),
+            "keeping the real bus must stay one env var away"
         );
         assert!(
             !src.contains("apk add freedoom"),

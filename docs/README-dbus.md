@@ -131,3 +131,26 @@ monitor), no solo contra `dbus-daemon`.
 Lo que **sigue sin poder correr** es Plasma: `plasmashell`, `kded`, `krunner` y
 el agente de polkit son servicios de D-Bus, sí, pero además necesitan Qt, KF6,
 polkit y logind, que no están. Ver [README-desktop.md](README-desktop.md).
+
+## Abierto: libdbus se queda en el saludo (gzdoom)
+
+Con el demonio real en marcha, gzdoom vuelve a colgarse — el mismo cuelgue que
+el socket sin demonio evitaba. Lo que se sabe, al 28-sep-2026:
+
+* Lo último que imprime gzdoom es su banner de versión, y justo después llama a
+  `SDL_Init(0)`. Cero subsistemas: ni vídeo, ni audio, ni joystick.
+* Lo primero que hace `SDL_InitSubSystem` en SDL2, antes de mirar ningún
+  subsistema, es `SDL_DBus_Init()` (`src/SDL.c`). Así que el cuelgue está en la
+  conexión al bus, no en nada del juego.
+* No puede ser la espera del `Hello`: esa tiene un límite de 25 segundos. El
+  saludo SASL previo no tiene ninguno, así que ahí es donde se queda.
+
+Mientras no esté arreglado, `eclipse-freedoom` apunta al motor a una dirección
+sin nada detrás (`/run/eclipse-freedoom-no-bus`), de modo que `connect()` falla
+al instante y SDL sigue adelante. A un juego el bus no le hace falta: SDL solo
+lo usa para inhibir el salvapantallas y para ibus. `ECLIPSE_FREEDOOM_BUS=1`
+conserva el bus real, que es como se vuelve a probar esto sin reconstruir.
+
+Ojo: el bozal es por proceso. Cualquier otro cliente de **libdbus** (no de
+GDBus, que trae su propia implementación y es la que usan Firefox y GTK) puede
+tropezar con lo mismo.
