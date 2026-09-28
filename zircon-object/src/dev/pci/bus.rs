@@ -1010,6 +1010,61 @@ mod pci_bus_driver_tests {
 
     // ---------- The window userspace describes the ECAM with ----------
 
+    /// The size check is an equality, not a floor: a window has to measure
+    /// **exactly** the buses it claims.
+    ///
+    /// Too small is the obvious half, and it had a test. Too large did not,
+    /// and that is the half the next check leans on: it computes
+    /// `ecam.size - 1`, with a comment saying size "is never zero here
+    /// because it is a whole number of buses by the check above". Let a
+    /// floor in and a window of size zero walks straight past -- zero is
+    /// less than a bus -- and that subtraction underflows, which is a panic
+    /// in a build with overflow checks and `u64::MAX` in the kernel's own,
+    /// which is built without them.
+    #[test]
+    fn an_ecam_window_must_measure_exactly_the_buses_it_claims() {
+        let one_bus = ecam_at(0xE000_0000, 1);
+        assert_eq!(one_bus.size, PCIE_ECAM_BYTES_PER_BUS);
+        assert_eq!(check_ecam_region(&one_bus, core::iter::empty()), Ok(()));
+
+        for (size, what) in [
+            (0, "no size at all"),
+            (PCIE_ECAM_BYTES_PER_BUS - 1, "one byte short of a bus"),
+            (PCIE_ECAM_BYTES_PER_BUS + 1, "one byte over a bus"),
+            (PCIE_ECAM_BYTES_PER_BUS * 2, "two buses for one"),
+        ] {
+            let window = PciEcamRegion {
+                size,
+                ..ecam_at(0xE000_0000, 1)
+            };
+            assert_eq!(
+                check_ecam_region(&window, core::iter::empty()),
+                Err(ZxError::INVALID_ARGS),
+                "a window with {} was taken",
+                what
+            );
+        }
+
+        // Three buses, and the same two ways of getting the size wrong.
+        let three = ecam_at(0xE000_0000, 3);
+        assert_eq!(three.size, PCIE_ECAM_BYTES_PER_BUS * 3);
+        assert_eq!(check_ecam_region(&three, core::iter::empty()), Ok(()));
+        for size in [PCIE_ECAM_BYTES_PER_BUS * 2, PCIE_ECAM_BYTES_PER_BUS * 4] {
+            assert_eq!(
+                check_ecam_region(
+                    &PciEcamRegion {
+                        size,
+                        ..ecam_at(0xE000_0000, 3)
+                    },
+                    core::iter::empty()
+                ),
+                Err(ZxError::INVALID_ARGS),
+                "three buses accepted a window of {} bytes",
+                size
+            );
+        }
+    }
+
     #[test]
     fn an_ecam_window_that_does_not_start_on_a_page_is_refused() {
         // `zx_pci_init` checks this window's size against the buses it claims
