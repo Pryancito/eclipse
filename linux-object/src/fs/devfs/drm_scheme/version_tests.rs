@@ -74,6 +74,16 @@ fn version_and_unique_count_and_copy_their_strings_like_linux() {
 
     // GET_UNIQUE: nothing for a buffer the bus id does not fit in, the
     // whole of it and no NUL when it does, `strlen` back both times.
+    // (`c` is a fresh master on a node with no PCI device behind it:
+    // the id is the device's own name once SET_VERSION has set it; see
+    // `get_unique_is_empty_until_set_version_ties_the_node_to_its_bus`.)
+    let mut sv = DrmSetVersion {
+        drm_di_major: 1,
+        drm_di_minor: 4,
+        drm_dd_major: -1,
+        drm_dd_minor: -1,
+    };
+    assert_eq!(c.ioctl(DRM_IOCTL_SET_VERSION, &mut sv), Ok(0));
     let mut u: DrmUnique = zeroed();
     assert_eq!(c.ioctl(DRM_IOCTL_GET_UNIQUE, &mut u), Ok(0));
     assert_eq!(u.unique_len, "zcore-gpu".len());
@@ -89,6 +99,102 @@ fn version_and_unique_count_and_copy_their_strings_like_linux() {
     assert_eq!(&buf[..9], b"zcore-gpu");
     assert_eq!(buf[9], SENTINEL);
     assert_eq!(u.unique_len, 9);
+}
+
+/// `drm_getunique` reads `master->unique`, which nothing but
+/// `drm_set_busid` fills, from `drm_setversion` when the request asks
+/// for interface 1.1 or later: until then the answer is length 0 and no
+/// copy; from then on `pci:DDDD:BB:SS.F` of the node's PCI device
+/// (`drm_pci_set_busid`), the same device its sysfs `device` link
+/// names. libdrm's `drmOpenByBusid` and Xorg's platform probe both do
+/// SET_VERSION 1.4 and then `drmGetBusid`, and Xorg parses the `pci:`
+/// string to find the node's PCI device and so the primary GPU. This
+/// answered a fixed `zcore-gpu` from the first call.
+#[test]
+fn get_unique_is_empty_until_set_version_ties_the_node_to_its_bus() {
+    let _serialised = drm::test_globals::lock();
+    let _hook = crate::fs::syncobj_eventfd::hardware_fence_tests::TEST_SERIAL.lock();
+    let _bus = crate::fs::sysfs::test_bus::real_machine();
+    let _nouveau = NouveauOn::new(false);
+    const SENTINEL: u8 = 0xEE;
+    // card0 on that machine is the first RTX: the display-class NVIDIA
+    // device its sysfs identity resolves to.
+    const BUSID: &[u8] = b"pci:0000:02:00.0";
+    let unique = |c: &Client, buf: &mut [u8; 20], room: usize| {
+        let mut u: DrmUnique = zeroed();
+        u.unique = buf.as_mut_ptr();
+        u.unique_len = room;
+        (c.ioctl(DRM_IOCTL_GET_UNIQUE, &mut u), u.unique_len)
+    };
+    let set_version = |c: &Client, di: (i32, i32)| {
+        let mut sv = DrmSetVersion {
+            drm_di_major: di.0,
+            drm_di_minor: di.1,
+            drm_dd_major: -1,
+            drm_dd_minor: -1,
+        };
+        c.ioctl(DRM_IOCTL_SET_VERSION, &mut sv)
+    };
+    let master = Client::open(0);
+    let mut buf = [SENTINEL; 20];
+    // A fresh master has no bus id, whatever the room.
+    assert_eq!(unique(&master, &mut buf, 20), (Ok(0), 0));
+    assert_eq!(buf, [SENTINEL; 20]);
+    // Interface 1.0 does not tie the device to its bus, -1 asks for
+    // nothing, and a refused request sets nothing.
+    assert_eq!(set_version(&master, (1, 0)), Ok(0));
+    assert_eq!(set_version(&master, (-1, 4)), Ok(0));
+    assert_eq!(set_version(&master, (1, 5)), Err(FsError::InvalidParam));
+    assert_eq!(unique(&master, &mut buf, 20), (Ok(0), 0));
+    // 1.4, what libdrm and Xorg ask for: the size probe with no room,
+    // nothing for a buffer one short, the whole of it and no NUL.
+    assert_eq!(set_version(&master, (1, 4)), Ok(0));
+    assert_eq!(unique(&master, &mut buf, 0), (Ok(0), BUSID.len()));
+    assert_eq!(
+        unique(&master, &mut buf, BUSID.len() - 1),
+        (Ok(0), BUSID.len())
+    );
+    assert_eq!(buf, [SENTINEL; 20], "a prefix of the bus id was copied");
+    assert_eq!(unique(&master, &mut buf, BUSID.len()), (Ok(0), BUSID.len()));
+    assert_eq!(&buf[..BUSID.len()], BUSID, "an exact fit is a fit");
+    assert_eq!(buf[BUSID.len()], SENTINEL, "a NUL was copied");
+    buf = [SENTINEL; 20];
+    assert_eq!(unique(&master, &mut buf, 20), (Ok(0), BUSID.len()));
+    assert_eq!(&buf[..BUSID.len()], BUSID);
+    assert_eq!(buf[BUSID.len()], SENTINEL, "a NUL was copied");
+    // Room and no buffer: `copy_to_user`'s EFAULT, not a skipped copy.
+    let mut u: DrmUnique = zeroed();
+    u.unique_len = 20;
+    assert_eq!(
+        master.ioctl(DRM_IOCTL_GET_UNIQUE, &mut u),
+        Err(FsError::BadAddress)
+    );
+    // The id is the master's: another open of the node reads the same
+    // one, and it goes when the master does (DROP_MASTER), so the next
+    // master starts empty.
+    let other = Client::open(0);
+    assert_eq!(unique(&other, &mut buf, 20), (Ok(0), BUSID.len()));
+    assert_eq!(master.ioctl(DRM_IOCTL_DROP_MASTER, &mut 0u8), Ok(0));
+    assert_eq!(unique(&other, &mut buf, 20), (Ok(0), 0));
+    assert_eq!(other.ioctl(DRM_IOCTL_SET_MASTER, &mut 0u8), Ok(0));
+    assert_eq!(unique(&other, &mut buf, 20), (Ok(0), 0));
+    // The close of an open that is not the master takes nothing away.
+    assert_eq!(set_version(&other, (1, 4)), Ok(0));
+    drop(Client::open(0));
+    assert_eq!(unique(&other, &mut buf, 20), (Ok(0), BUSID.len()));
+    // Each node has its own: 1.1 is enough (it is the version that tied
+    // devices to buses), and a node with no PCI device behind it
+    // answers its own name, as `dev->unique` does for a non-PCI parent.
+    // Closing the master's file releases the id too.
+    let bare = Client::open(82);
+    assert_eq!(unique(&bare, &mut buf, 20), (Ok(0), 0));
+    assert_eq!(set_version(&bare, (1, 1)), Ok(0));
+    assert_eq!(unique(&bare, &mut buf, 20), (Ok(0), 9));
+    assert_eq!(&buf[..9], b"zcore-gpu");
+    drop(bare);
+    let again = Client::open(82);
+    assert_eq!(unique(&again, &mut buf, 20), (Ok(0), 0));
+    assert_eq!(unique(&other, &mut buf, 20), (Ok(0), BUSID.len()));
 }
 
 #[test]

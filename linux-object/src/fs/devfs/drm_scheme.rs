@@ -160,6 +160,19 @@ impl DrmDev {
         Arc::as_ptr(&self.file) as usize
     }
 
+    /// `drm_master.unique` of this node: empty until `SET_VERSION` asks for
+    /// interface 1.1 or later, then `pci:DDDD:BB:SS.F` of the PCI device its
+    /// sysfs identity names (`drm_pci_set_busid`; `sysfs::drm_node_busid`),
+    /// and the node's own name for one with no PCI device behind it
+    /// (`drm_dev_init` seeds `dev->unique` with `dev_name(parent)`).
+    fn bus_id(&self) -> alloc::string::String {
+        if !drm::busid_set(self.minor) {
+            return alloc::string::String::new();
+        }
+        crate::fs::sysfs::drm_node_busid(self.minor)
+            .unwrap_or_else(|| alloc::string::String::from("zcore-gpu"))
+    }
+
     /// `drm_ioctl_permit` for the hollowed legacy ioctls, in its order:
     /// `DRM_ROOT_ONLY` wants `capable(CAP_SYS_ADMIN)` (EACCES), `DRM_AUTH`
     /// wants an authenticated open or a render client (EACCES). `DRM_MASTER`
@@ -1002,12 +1015,17 @@ impl DrmDev {
             }
             DRM_IOCTL_GET_UNIQUE => {
                 let u = unsafe { &mut *(data as *mut DrmUnique) };
-                // `drm_getunique`: the bus id is copied only when the whole
-                // of it fits (`unique_len >= master->unique_len`), and the
-                // length written back is `strlen`, no terminator. This
-                // copied a prefix into a short buffer and counted the NUL.
-                let unique = b"zcore-gpu";
-                if u.unique_len >= unique.len() && !u.unique.is_null() {
+                // `drm_getunique`: the master's bus id, copied only when the
+                // whole of it fits (`unique_len >= master->unique_len`), the
+                // length written back is `strlen`, no terminator, and there
+                // is none (length 0) until `SET_VERSION` sets it. This
+                // answered a fixed `zcore-gpu` from the first call, so Xorg's
+                // platform probe (`get_drm_info`: SET_VERSION 1.4, then
+                // `drmGetBusid`) had no `pci:` string to find the node's PCI
+                // device by, and with two GPUs it could not tell which node
+                // was the primary: it fell back to the first one.
+                let unique = self.bus_id();
+                if u.unique_len >= unique.len() && !unique.is_empty() {
                     ucheck(u.unique as usize, unique.len())?;
                     unsafe {
                         core::ptr::copy_nonoverlapping(unique.as_ptr(), u.unique, unique.len());
@@ -1322,6 +1340,13 @@ impl DrmDev {
                 sv.drm_dd_minor = dd_minor;
                 if req_if.0 != -1 && (req_if.0 != 1 || req_if.1 < 0 || req_if.1 > 4) {
                     return Err(FsError::InvalidParam);
+                }
+                // Interface 1.1 tied the device to its bus: an accepted
+                // request for it or later sets the master's bus id
+                // (`drm_set_busid`), which is what GET_UNIQUE reports from
+                // then on. Before the driver pair is checked, as in Linux.
+                if req_if.0 != -1 && req_if.1 >= 1 {
+                    drm::set_busid(self.minor);
                 }
                 if req_dd.0 != -1 && (req_dd.0 != dd_major || req_dd.1 < 0 || req_dd.1 > dd_minor) {
                     return Err(FsError::InvalidParam);
