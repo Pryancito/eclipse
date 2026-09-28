@@ -221,6 +221,19 @@ jobs:
           # thermal and battery files, the byte-rate formatter, and the
           # calendar the clock pill opens.
           cargo test --manifest-path tools/lunarbar/Cargo.toml
+          # eclipse-dbusd, the session message bus: the LAST standalone package
+          # in `tools/` that no cargo line named, and the one where it cost the
+          # most -- it already had 34 tests and not one of them had ever run in
+          # CI. `xtask` builds it best-effort too ("only dbus-daemon can serve
+          # the bus" on failure), and on an image with no package mirror within
+          # reach there is no dbus-daemon, so a break here is a session bus that
+          # is simply absent and every GTK, Qt and SDL client that needs one
+          # exits before drawing. What the tests cover is the wire format and
+          # the routing: the header and field-array marshalling in both byte
+          # orders, the match-rule parser and what each rule selects, name
+          # ownership with its replacement queue, and the client handshake
+          # against a daemon started on a real socket in the same process.
+          cargo test --manifest-path tools/eclipse-dbusd/Cargo.toml
           # The kernel binary crate itself. Its `[[bin]]` section carried
           # `test = false`, so no job in this file ever compiled it as a test
           # target -- the same hole rboot was in, in the crate that owns the
