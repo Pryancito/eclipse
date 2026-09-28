@@ -1849,7 +1849,26 @@ impl DrmDev {
                 // with. (Linux also refuses a flip on a CRTC with no fb,
                 // EBUSY; this tree's flip is also its present, so a client
                 // is allowed to start with one, as the GL sequence does.)
-                if let Some((w, h, _)) = drm::display_mode() {
+                // On an atomic driver the yardstick is the primary plane's
+                // source rectangle, not the mode:
+                // `drm_framebuffer_check_src_coords(plane->state->src_*, fb)`
+                // (ENOSPC), so a viewport SETCRTC, SETPLANE or an atomic
+                // commit scrolled into the fb has to fit the new fb too.
+                // This measured the mode at (0, 0): a flip onto an fb the
+                // size of the mode, with the plane 16 pixels in, passed and
+                // scanned out past the fb's end. The mode stays the
+                // yardstick for a plane never positioned (this tree lets a
+                // client start with a flip, where Linux answers EBUSY).
+                let (st, _) = drm::atomic_snapshot();
+                if st.src_w != 0 || st.src_h != 0 {
+                    if !drm::src_coords_fit(
+                        fb.width,
+                        fb.height,
+                        (st.src_x, st.src_y, st.src_w, st.src_h),
+                    ) {
+                        return Err(FsError::NoDeviceSpace);
+                    }
+                } else if let Some((w, h, _)) = drm::display_mode() {
                     if fb.width < w || fb.height < h {
                         return Err(FsError::NoDeviceSpace);
                     }
@@ -1995,11 +2014,11 @@ impl DrmDev {
                     if index >= 32 || plane.possible_crtcs & (1 << index) == 0 {
                         return Err(FsError::InvalidParam);
                     }
-                    let (fb_w, fb_h) = ((fb.width as u64) << 16, (fb.height as u64) << 16);
-                    let (src_x, src_y) = (req.src_x as u64, req.src_y as u64);
-                    let (src_w, src_h) = (req.src_w as u64, req.src_h as u64);
-                    if src_w > fb_w || src_x > fb_w - src_w || src_h > fb_h || src_y > fb_h - src_h
-                    {
+                    if !drm::src_coords_fit(
+                        fb.width,
+                        fb.height,
+                        (req.src_x, req.src_y, req.src_w, req.src_h),
+                    ) {
                         return Err(FsError::NoDeviceSpace);
                     }
                     if let Err(e) = drm::present_now_checked(req.fb_id, req.crtc_id, None) {

@@ -6974,6 +6974,16 @@ pub fn legacy_pipe_off() {
     state.atomic.active = false;
 }
 
+/// `drm_framebuffer_check_src_coords`: whether the 16.16 source rectangle
+/// `(x, y, w, h)` lies inside an fb of `fb_width` x `fb_height` pixels, the
+/// way SETPLANE, PAGE_FLIP and the atomic plane check measure it (a
+/// fractional edge counts, and the arithmetic cannot wrap in u64).
+pub fn src_coords_fit(fb_width: u32, fb_height: u32, (x, y, w, h): (u32, u32, u32, u32)) -> bool {
+    let (fb_w, fb_h) = ((fb_width as u64) << 16, (fb_height as u64) << 16);
+    let (x, y, w, h) = (x as u64, y as u64, w as u64, h as u64);
+    w <= fb_w && x <= fb_w - w && h <= fb_h && y <= fb_h - h
+}
+
 /// A legacy `SETPLANE` with an fb, as `drm_atomic_helper_update_plane` commits
 /// it: all eight rectangles from the request, `src_*` in 16.16 as given.
 pub fn legacy_update_plane(crtc: (i32, i32, u32, u32), src: (u32, u32, u32, u32)) {
