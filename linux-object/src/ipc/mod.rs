@@ -770,6 +770,24 @@ mod ipc_access_tests {
         assert!(!p.may_access(STRANGER, STRANGER_GROUP, &[], IPC_W));
     }
 
+    /// `want` is three bits, and the mask that says so is the one thing in
+    /// `ipcperms` nothing in tree exercises: every caller hands over `IPC_R`,
+    /// `IPC_W` or a `requested_mode` that is already masked. A wider word
+    /// asks for the same three permissions and no more, rather than being
+    /// refused over bits that name nothing -- which is what a `mode`-shaped
+    /// word (`0o644`, say) reaching here would be.
+    #[test]
+    fn only_the_bottom_three_bits_of_a_request_are_read() {
+        let p = perm(0o604);
+        assert!(p.may_access(STRANGER, STRANGER_GROUP, &[], IPC_R));
+        assert!(
+            p.may_access(STRANGER, STRANGER_GROUP, &[], IPC_R | 0o770),
+            "los bits de las otras clases no piden nada aqui"
+        );
+        // And the three that do name something still decide.
+        assert!(!p.may_access(STRANGER, STRANGER_GROUP, &[], IPC_W | 0o770));
+    }
+
     /// A supplementary membership is membership, which is what `in_group_p`
     /// means and what `egid ==` did not. This is the ordinary way an IPC
     /// object is shared: `0660` on a group, and every member of it whose
