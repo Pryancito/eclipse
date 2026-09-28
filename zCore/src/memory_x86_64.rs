@@ -467,47 +467,56 @@ cfg_if! {
             kernel_hal::console::graphic_console_write_fmt_spin(args);
         }
 
+        /// `[heap-grow]` / `[heap-reentrant]` banners. The elastic growth and
+        /// the re-entrancy refuse still run; only the console chatter is off.
+        const HEAP_GROW_LOG: bool = false;
+        const HEAP_REENTRANT_LOG: bool = false;
+
         #[cold]
         #[inline(never)]
         fn report_heap_reentrancy(what: &str, sz: usize) {
             use core::sync::atomic::{AtomicU32, Ordering};
-            static REPORTED: AtomicU32 = AtomicU32::new(0);
             HEAP_REENTRANCY_EVENTS.fetch_add(1, Ordering::Relaxed);
-            if REPORTED.fetch_add(1, Ordering::Relaxed) >= 4 {
-                return;
-            }
-            emit(format_args!(
-                "\n[heap-reentrant] {} size={:#x} while THIS cpu already holds the \
-                 heap lock — a fault was taken inside the allocator and the fault \
-                 path allocated. Refusing instead of wedging the machine. The \
-                 re-entrant call chain below is the code that must not allocate:\n",
-                what, sz,
-            ));
-            let mut rbp: usize;
-            unsafe { core::arch::asm!("mov {}, rbp", out(reg) rbp) };
-            for _ in 0..24 {
-                if !kernel_hal::kaddr::is_kernel_stack_qword(rbp as u64) {
-                    break;
+            if HEAP_REENTRANT_LOG {
+                static REPORTED: AtomicU32 = AtomicU32::new(0);
+                if REPORTED.fetch_add(1, Ordering::Relaxed) < 4 {
+                    emit(format_args!(
+                        "\n[heap-reentrant] {} size={:#x} while THIS cpu already holds the \
+                         heap lock — a fault was taken inside the allocator and the fault \
+                         path allocated. Refusing instead of wedging the machine. The \
+                         re-entrant call chain below is the code that must not allocate:\n",
+                        what, sz,
+                    ));
+                    let mut rbp: usize;
+                    unsafe { core::arch::asm!("mov {}, rbp", out(reg) rbp) };
+                    for _ in 0..24 {
+                        if !kernel_hal::kaddr::is_kernel_stack_qword(rbp as u64) {
+                            break;
+                        }
+                        let ret =
+                            unsafe { core::ptr::read_volatile((rbp + 8) as *const usize) };
+                        let next = unsafe { core::ptr::read_volatile(rbp as *const usize) };
+                        if ret == 0 {
+                            break;
+                        }
+                        emit(format_args!(
+                            "[heap-reentrant]   ret={}\n",
+                            kernel_hal::ksyms::Addr(ret as u64)
+                        ));
+                        if next <= rbp {
+                            break;
+                        }
+                        rbp = next;
+                    }
+                    if !kernel_hal::ksyms::available() {
+                        emit(format_args!(
+                            "[heap-reentrant] no in-kernel symbol table — symbolize with \
+                             `make sym ADDRS=\"...\"` where this kernel was built\n"
+                        ));
+                    }
                 }
-                let ret = unsafe { core::ptr::read_volatile((rbp + 8) as *const usize) };
-                let next = unsafe { core::ptr::read_volatile(rbp as *const usize) };
-                if ret == 0 {
-                    break;
-                }
-                emit(format_args!(
-                    "[heap-reentrant]   ret={}\n",
-                    kernel_hal::ksyms::Addr(ret as u64)
-                ));
-                if next <= rbp {
-                    break;
-                }
-                rbp = next;
-            }
-            if !kernel_hal::ksyms::available() {
-                emit(format_args!(
-                    "[heap-reentrant] no in-kernel symbol table — symbolize with \
-                     `make sym ADDRS=\"...\"` where this kernel was built\n"
-                ));
+            } else {
+                let _ = (what, sz);
             }
         }
 
@@ -814,8 +823,11 @@ cfg_if! {
         #[cold]
         #[inline(never)]
         fn grow_heap_once(used: usize, total: usize) -> bool {
+            if !HEAP_GROW_LOG {
+                let _ = used;
+            }
             if total >= HEAP_MAX_TOTAL {
-                if HEAP_GROW_REFUSED.fetch_add(1, Ordering::Relaxed) == 0 {
+                if HEAP_GROW_REFUSED.fetch_add(1, Ordering::Relaxed) == 0 && HEAP_GROW_LOG {
                     emit(format_args!(
                         "\n[heap-grow] REFUSED: already at the {} MiB ceiling ({} MiB in use)\n",
                         total >> 20,
@@ -836,7 +848,7 @@ cfg_if! {
             let reserve = ram / 100 * HEAP_LEAVE_FREE_PCT;
             if ram == 0 || ram_used + HEAP_GROW_CHUNKS[HEAP_GROW_CHUNKS.len() - 1] + reserve > ram
             {
-                if HEAP_GROW_REFUSED.fetch_add(1, Ordering::Relaxed) == 0 {
+                if HEAP_GROW_REFUSED.fetch_add(1, Ordering::Relaxed) == 0 && HEAP_GROW_LOG {
                     emit(format_args!(
                         "\n[heap-grow] REFUSED: {} MiB of {} MiB RAM already committed; \
                          the heap stays at {} MiB\n",
@@ -865,7 +877,7 @@ cfg_if! {
                 }
             }
             let Some((pa, chunk)) = got else {
-                if HEAP_GROW_REFUSED.fetch_add(1, Ordering::Relaxed) == 0 {
+                if HEAP_GROW_REFUSED.fetch_add(1, Ordering::Relaxed) == 0 && HEAP_GROW_LOG {
                     emit(format_args!(
                         "\n[heap-grow] REFUSED: no contiguous run of frames left, down to {} MiB\n",
                         HEAP_GROW_CHUNKS[HEAP_GROW_CHUNKS.len() - 1] >> 20,
@@ -879,7 +891,7 @@ cfg_if! {
             unsafe {
                 HEAP_ALLOCATOR.0.lock().add_to_heap(va, va + chunk);
             }
-            let new_total = HEAP_TOTAL.fetch_add(chunk, Ordering::Relaxed) + chunk;
+            HEAP_TOTAL.fetch_add(chunk, Ordering::Relaxed);
             // The vtable-liveness ceiling (`set_vtable_max`) is deliberately
             // LEFT ALONE here. It rests on "the image links .rodata below
             // .bss, so no real vtable is at or above the static heap base" —
@@ -891,14 +903,16 @@ cfg_if! {
             // not cover blocks in grown regions; refusing to dispatch anything
             // is not a trade. (Caught on the first forced-growth boot: the
             // region landed at 0xffff_8002_0000_0000.)
-            emit(format_args!(
-                "\n[heap-grow] +{} MiB from physical RAM at {:#x} (heap {} -> {} MiB, {} MiB in use)\n",
-                chunk >> 20,
-                va,
-                total >> 20,
-                new_total >> 20,
-                used >> 20,
-            ));
+            if HEAP_GROW_LOG {
+                emit(format_args!(
+                    "\n[heap-grow] +{} MiB from physical RAM at {:#x} (heap {} -> {} MiB, {} MiB in use)\n",
+                    chunk >> 20,
+                    va,
+                    total >> 20,
+                    (total + chunk) >> 20,
+                    used >> 20,
+                ));
+            }
             true
         }
 
