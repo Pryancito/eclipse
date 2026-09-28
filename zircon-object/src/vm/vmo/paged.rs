@@ -1019,7 +1019,9 @@ impl VMObjectTrait for VMObjectPaged {
                         None => (block.block, 1),
                         Some((first, _)) => (first, block.block + 1 - first),
                     });
-                } else if inner.committed_pages_in_range(block.block, block.block + 1) != 0 {
+                } else if inner.committed_pages_in_range(block.block, block.block + 1) != 0
+                    || inner.uncommitted_page_reads_nonzero(block.block)
+                {
                     // check whether this page is initialized, otherwise nothing should be done
                     let paddr =
                         inner.commit_page(block.block, MMUFlags::WRITE, &mut range_changes)?;
@@ -1924,6 +1926,37 @@ impl VMObjectPagedInner {
     }
 
     /// Count committed pages of the VMO.
+    /// Whether an UNCOMMITTED page of this node reads as something other
+    /// than zeros, so a partial `zero` of it has to commit (copy up) first.
+    ///
+    /// An anonymous VMO's uncommitted page is the shared zero frame, and
+    /// zeroing part of it changes nothing -- which is why the partial-page
+    /// path in `zero` skips a page nothing has committed. A page-cache
+    /// BORROWER and a file-backed node are the opposite: their uncommitted
+    /// pages resolve to the file's bytes, so that skip left the file's bytes
+    /// exactly where the caller had asked for zeros.
+    ///
+    /// The ELF loader is the caller that matters. Its `padzero` zeroes the
+    /// bytes past `p_filesz` in a segment's last file page -- where a static
+    /// binary's `.bss` begins -- and once LOAD segments started BORROWING
+    /// from the shared exec image instead of copying, that zero became a
+    /// no-op: every process on the machine read file garbage in place of its
+    /// zero-initialised globals, and musl's `__init_tls` walked a
+    /// `libc.tls_head` of 2 straight into a SIGSEGV before `main`.
+    ///
+    /// CoW parents need no entry here: `committed_pages_in_range` already
+    /// walks the parent chain.
+    fn uncommitted_page_reads_nonzero(&self, page_idx: usize) -> bool {
+        if let Some((_cache, base, cache_len)) = &self.cache {
+            if base + page_idx * PAGE_SIZE < *cache_len {
+                return true;
+            }
+        }
+        self.source
+            .as_ref()
+            .is_some_and(|s| page_idx * PAGE_SIZE < s.source_len())
+    }
+
     fn committed_pages_in_range(&self, start_idx: usize, end_idx: usize) -> usize {
         // Clamp to this object rather than assert. A question about pages past
         // the end has an answer -- nothing is committed there -- and the two
