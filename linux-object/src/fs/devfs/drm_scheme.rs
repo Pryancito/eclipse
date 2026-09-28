@@ -233,7 +233,10 @@ impl DrmDev {
                 value,
                 if off { "off" } else { "on" }
             );
-            drm::set_crtc_blanked(off);
+            // `drm_atomic_connector_commit_dpms`: the CRTC's ACTIVE follows
+            // when the connector is routed, and DPMS on shows the plane's fb
+            // again. This only blanked and un-blanked.
+            drm::connector_commit_dpms(!off);
             return Ok(0);
         }
         // `drm_mode_obj_set_property_ioctl`: on an atomic driver every other
@@ -6618,6 +6621,9 @@ mod crtc_routing_check_tests;
 
 #[cfg(test)]
 mod legacy_state_readback_tests;
+
+#[cfg(test)]
+mod dpms_commit_tests;
 
 #[cfg(test)]
 mod trail_tests;

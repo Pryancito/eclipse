@@ -6,7 +6,7 @@ use kernel_hal::mem::phys_to_virt;
 
 /// Paint a dumb buffer through its physical backing (see
 /// `kms_scanout_tests::paint`, which this deliberately mirrors).
-fn paint(buf: &DrmModeCreateDumb, value: u32) {
+pub(super) fn paint(buf: &DrmModeCreateDumb, value: u32) {
     let (pa, size) = drm::resolve_gem_backing(buf.handle).expect("a dumb buffer must have backing");
     let va = phys_to_virt(pa as usize);
     // SAFETY: `size` bytes of contiguous physical memory owned by this
