@@ -174,6 +174,37 @@ pub fn verdict(provisional: u64, measured: u64) -> Verdict {
     }
 }
 
+/// Fixed-point multiplier for a TSC of `hz` Hz: `ns = (cycles * mult) >> 32`,
+/// i.e. `(1_000_000_000 << 32) / hz`.
+///
+/// Built from Hz and not from truncated MHz, so a 3.312 GHz TSC is not paced
+/// as if it were 3.000 GHz, and returned as one number both the kernel clock
+/// and the vDSO scale by — two spellings of this division is two clocks.
+pub fn ns_mult(hz: u64) -> u64 {
+    ((1_000_000_000u128 << 32) / hz.max(1) as u128) as u64
+}
+
+/// Monotonic nanoseconds since `base` for a raw counter reading of `cycle`.
+///
+/// `base` is the reading the first clock read of the boot latched, and
+/// subtracting it is the whole of this function's reason to exist. The TSC is
+/// **not** zero when the kernel takes over: firmware runs before it, and on a
+/// warm reboot the counter is never reset at all, so it carries however long
+/// the machine has been powered. Scaling the raw reading therefore reported an
+/// uptime of whatever the firmware and the previous boot had spent -- 711231 s,
+/// 8.2 days, on Moebius's machine, from the very first line of `dmesg` -- with
+/// time advancing correctly on top of it. `/proc/uptime`, `uptime(1)`, the
+/// `dmesg` timestamps and `/proc/stat`'s `btime` all read that offset.
+///
+/// Saturating, so a reading below the base (a counter that a sibling CPU is
+/// slightly behind on) is zero rather than an enormous wrapped span. In
+/// `u128`, because the product of a multi-day cycle count and the multiplier
+/// overflows a `u64` -- the wrap this shape was chosen to avoid.
+pub fn mono_ns(cycle: u64, base: u64, mult: u64) -> u64 {
+    let ticks = cycle.saturating_sub(base) as u128;
+    ((ticks * mult as u128) >> 32) as u64
+}
+
 /// How long `ticks` of a `ref_hz` counter takes -- the window a calibrator is
 /// asking the machine to sit through, so it can be stated in the boot log and
 /// bounded in a test rather than guessed at from a constant.
@@ -186,6 +217,98 @@ mod tests {
     use super::*;
 
     const MASK24: u32 = 0x00ff_ffff;
+
+    /// The multiplier is one division in one place, and both clocks that use it
+    /// -- `timer_now` and the vDSO -- scale by it, so the number it produces is
+    /// what a second is worth on this machine.
+    #[test]
+    fn the_multiplier_turns_a_seconds_worth_of_cycles_into_a_second() {
+        for hz in [
+            1_000_000_000u64,
+            2_000_000_000,
+            3_312_000_000,
+            3_700_000_000,
+        ] {
+            let ns = mono_ns(hz, 0, ns_mult(hz));
+            // Fixed point: within a microsecond over a whole second.
+            assert!(
+                ns.abs_diff(1_000_000_000) < 1_000,
+                "{} Hz: un segundo de ciclos dio {} ns",
+                hz,
+                ns
+            );
+        }
+        // A 1 GHz TSC is exactly 1 ns per cycle, which is the calibration every
+        // hand-checked expectation elsewhere is written against.
+        assert_eq!(ns_mult(1_000_000_000), 1u64 << 32);
+        // And zero is not a frequency to divide by.
+        assert_eq!(ns_mult(0), ns_mult(1));
+    }
+
+    /// The bug this base exists for, in the arithmetic that had it.
+    ///
+    /// Moebius's machine reported 711231 s of uptime from the first line of
+    /// `dmesg` -- 8.2 days, the time since it was last powered on, because the
+    /// TSC is not reset when a kernel takes over and a warm reboot does not
+    /// reset it at all. Scaling the absolute reading is what produced that;
+    /// subtracting the first reading of the boot is what fixes it.
+    #[test]
+    fn the_base_is_what_makes_the_answer_an_uptime() {
+        const HZ: u64 = 3_700_000_000;
+        let mult = ns_mult(HZ);
+        // The machine from the report: 8.2 days of counter before Eclipse ran.
+        let base = 711_231 * HZ;
+
+        // What the absolute reading said, and what the bug looked like. Within
+        // a second: the multiplier truncates, so a span of days loses a tick's
+        // worth of rounding per second of it -- about 9 ms over these 8.2 days.
+        assert!(
+            (mono_ns(base, 0, mult) / 1_000_000_000).abs_diff(711_231) <= 1,
+            "el bug daba {} s",
+            mono_ns(base, 0, mult) / 1_000_000_000
+        );
+
+        // Time zero, and then one second of it.
+        assert_eq!(mono_ns(base, base, mult), 0);
+        assert!(mono_ns(base + HZ, base, mult).abs_diff(1_000_000_000) < 1_000);
+    }
+
+    /// A reading below the base saturates. The base is latched by the first
+    /// clock read of the boot, so a lower reading means a sibling CPU a few
+    /// cycles behind; wrapping there would answer ~2^64 ticks -- five centuries
+    /// -- instead of a clock a hair early, and every deadline taken from it
+    /// would be measured against that.
+    #[test]
+    fn a_reading_below_the_base_saturates_instead_of_wrapping() {
+        let mult = ns_mult(1_000_000_000);
+        assert_eq!(mono_ns(0, 1, mult), 0);
+        assert_eq!(mono_ns(1_000, 1_000_000, mult), 0);
+        assert_eq!(mono_ns(0, u64::MAX, mult), 0);
+    }
+
+    /// The `u128` product, which is the other half of why this function exists:
+    /// a 3.7 GHz counter multiplied by its own multiplier passes 2^64 within
+    /// seconds, and a `u64` multiply there wraps the clock silently.
+    #[test]
+    fn the_product_is_taken_wide_enough_not_to_wrap() {
+        const HZ: u64 = 3_700_000_000;
+        let mult = ns_mult(HZ);
+        // A hundred days of counter: far past where a 64-bit product wraps.
+        let cycles = 100 * 86_400 * HZ;
+        assert!(cycles as u128 * mult as u128 > u64::MAX as u128);
+        assert_ne!(
+            cycles.wrapping_mul(mult) >> 32,
+            mono_ns(cycles, 0, mult),
+            "la aritmetica de 64 bits daria lo mismo: caso mal elegido"
+        );
+        // Within a second of a hundred days, which is the fixed-point
+        // multiplier's own truncation and not this function's business.
+        assert!(
+            (mono_ns(cycles, 0, mult) / 1_000_000_000).abs_diff(100 * 86_400) <= 1,
+            "cien dias de contador dieron {} s",
+            mono_ns(cycles, 0, mult) / 1_000_000_000
+        );
+    }
 
     #[test]
     fn every_calibrator_believes_the_same_frequencies() {

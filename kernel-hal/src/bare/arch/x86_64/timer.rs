@@ -4,6 +4,7 @@ use spin::Once;
 use x86_64::instructions::port::Port;
 
 use crate::common::rtc::{self, RtcRegs};
+use crate::common::tsc_cal;
 
 /// Global monotonic floor in nanoseconds. Unsynchronized per-CPU TSCs can read
 /// backwards across cores; smoltcp's TCP timers (and every sleep/timeout in the
@@ -32,6 +33,25 @@ static TSC_INVARIANT: AtomicBool = AtomicBool::new(false);
 /// initialized.
 static TSC_NS_MULT: AtomicU64 = AtomicU64::new(0);
 
+/// The raw TSC reading the first clock read of this boot observed: time zero.
+/// 0 = not latched yet.
+///
+/// Without it the monotonic clock was the scaled *absolute* counter, and the
+/// TSC does not start at zero when the kernel takes over — firmware has been
+/// running, and a warm reboot never resets it at all. Moebius's machine
+/// reported 711231 s of uptime (8.2 days, the time since it was last powered
+/// on) from the first line of `dmesg` onwards, with time then advancing
+/// correctly on top of that offset: exactly the "uptime says days, the clock
+/// itself is fine" the bug was reported as.
+///
+/// Latched lazily by the first reader rather than from a boot hook, and that is
+/// deliberate: the first reader *is* the earliest moment this kernel has a
+/// notion of time, so there is no window in which a timestamp or a deadline can
+/// be taken against the un-based clock and then be jolted when the base
+/// arrives. It also cannot be got wrong by a boot-order change, on any of the
+/// entry paths.
+static TSC_BASE: AtomicU64 = AtomicU64::new(0);
+
 /// Skew tolerance for the invariant-TSC watchdog. Same-package TSCs agree to
 /// within nanoseconds; the floor a CPU compares against can be up to one tick
 /// (4 ms) stale, so anything beyond a generous 1 ms means genuinely unsynced
@@ -42,7 +62,7 @@ const TSC_SKEW_TOLERANCE_NS: u64 = 1_000_000;
 fn tsc_ns_mult_init() -> u64 {
     // `tsc_hz()` is Once-cached and never zero (falls back to 2 GHz).
     let hz = super::cpu::tsc_hz().max(1);
-    let mult = ((1_000_000_000u128 << 32) / hz as u128) as u64;
+    let mult = tsc_cal::ns_mult(hz);
     TSC_NS_MULT.store(mult, Ordering::Relaxed);
     // Invariant TSC: CPUID leaf 0x8000_0007, EDX bit 8. On such parts the TSC
     // runs at a constant rate and, on a single package, is reset-synchronized
@@ -58,21 +78,47 @@ fn tsc_ns_mult_init() -> u64 {
 /// The TSC frequency was corrected (see `cpu::recalibrate_tsc_hz`): rebuild
 /// the multiplier and let the monotonic floor follow the clock down.
 ///
-/// `timer_now` stays `tsc * mult >> 32` with no base, so a smaller multiplier
-/// makes the reading drop once, right here. This runs on the BSP at boot,
-/// before the APs and the tick exist and before anything outside the kernel
-/// can read time; deadlines armed before it simply fire a little later. The
+/// `timer_now` is `(tsc - base) * mult >> 32`, and the base does not move, so a
+/// smaller multiplier makes the reading drop once, right here. This runs on the
+/// BSP at boot, before the APs and the tick exist and before anything outside
+/// the kernel can read time; deadlines armed before it simply fire a little
+/// later. The
 /// floor is lowered to the new reading so the clamped path does not freeze
 /// until the old reading is overtaken, and the invariant-path watchdog does
 /// not mistake the drop for cross-CPU skew.
 pub(super) fn tsc_hz_changed(hz: u64) {
-    let mult = ((1_000_000_000u128 << 32) / hz.max(1) as u128) as u64;
+    let mult = tsc_cal::ns_mult(hz);
     TSC_NS_MULT.store(mult, Ordering::Relaxed);
     let cycle = unsafe { core::arch::x86_64::_rdtsc() };
     MONO_NS.store(
-        ((cycle as u128 * mult as u128) >> 32) as u64,
+        tsc_cal::mono_ns(cycle, tsc_base(cycle), mult),
         Ordering::Relaxed,
     );
+}
+
+/// This boot's time zero, latching `cycle` as it if nothing has latched one yet.
+///
+/// One atomic and one compare-exchange, and the base never changes once set, so
+/// the clock cannot go backwards through this. A `cycle` of exactly 0 -- only
+/// reachable if the very first clock read of the boot lands on TSC 0 -- is
+/// stored as 1, because 0 is the "not latched" sentinel; it costs one cycle of
+/// uptime and keeps this to a single word.
+#[inline]
+fn tsc_base(cycle: u64) -> u64 {
+    match TSC_BASE.load(Ordering::Relaxed) {
+        0 => latch_tsc_base(cycle),
+        base => base,
+    }
+}
+
+#[cold]
+fn latch_tsc_base(cycle: u64) -> u64 {
+    let base = cycle.max(1);
+    match TSC_BASE.compare_exchange(0, base, Ordering::Relaxed, Ordering::Relaxed) {
+        Ok(_) => base,
+        // Another CPU latched first; its base is the one everyone uses.
+        Err(winner) => winner,
+    }
 }
 
 #[inline]
@@ -81,7 +127,7 @@ fn tsc_to_ns(cycle: u64) -> u64 {
     if mult == 0 {
         mult = tsc_ns_mult_init();
     }
-    ((cycle as u128 * mult as u128) >> 32) as u64
+    tsc_cal::mono_ns(cycle, tsc_base(cycle), mult)
 }
 
 pub fn timer_now() -> Duration {
@@ -135,14 +181,32 @@ pub fn mono_floor_tick(now_ns: u64) {
 /// see the clock go backwards. When it is, `timer_now` returns exactly
 /// `tsc_to_ns(rdtsc())` with no floor applied — the same arithmetic on the same
 /// inputs the vDSO performs, so the two clocks cannot disagree.
+///
+/// A third condition joined them: the boot's [`TSC_BASE`] must be latched.
+/// Userspace subtracts the same base -- it is published beside the multiplier --
+/// so a vDSO handed a base of 0 while the kernel had latched a real one would
+/// answer a monotonic clock days ahead of the kernel's, which is the very bug
+/// the base exists to fix, reintroduced in userspace alone. In practice the
+/// kernel has read its clock thousands of times before the image is built; this
+/// makes that ordering guaranteed rather than merely true.
 pub fn vdso_tsc_mult() -> Option<u64> {
     if !TSC_INVARIANT.load(Ordering::Relaxed) && !FORCE_TSC_INVARIANT.load(Ordering::Relaxed) {
+        return None;
+    }
+    if TSC_BASE.load(Ordering::Relaxed) == 0 {
         return None;
     }
     match TSC_NS_MULT.load(Ordering::Relaxed) {
         0 => None,
         mult => Some(mult),
     }
+}
+
+/// This boot's TSC time zero, for the vDSO to subtract exactly as `tsc_to_ns`
+/// does. 0 until the first clock read latches it, which is also when
+/// [`vdso_tsc_mult`] starts answering, so the two are never published half-set.
+pub fn vdso_tsc_base() -> u64 {
+    TSC_BASE.load(Ordering::Relaxed)
 }
 
 /// Set by `VDSOFORCE=1` on the kernel command line: treat the TSC as usable by
