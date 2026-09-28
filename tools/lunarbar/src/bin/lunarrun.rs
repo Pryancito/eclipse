@@ -37,7 +37,7 @@ use lunarbar::keys::{
     KEY_PGDN_WL, KEY_PGUP_WL, KEY_TAB_WL, KEY_UP_WL, WHEEL_NOTCH,
 };
 use lunarbar::look::Look;
-use lunarbar::proc::{map_shm_pool, spawn_detached};
+use lunarbar::proc::{self, map_shm_pool, spawn_detached};
 use wayland_client::{
     protocol::{
         wl_buffer, wl_compositor, wl_keyboard, wl_output, wl_pointer, wl_registry, wl_seat, wl_shm,
@@ -399,7 +399,8 @@ fn move_selection(sel: usize, top: usize, n: usize, delta: i32, step: Step) -> (
 
 // ── state ────────────────────────────────────────────────────────────────────
 
-const BUFFERS: usize = 2;
+/// The crate's one double-buffer count; see `proc::BUFFERS`.
+use lunarbar::proc::BUFFERS;
 
 struct State {
     compositor: Option<wl_compositor::WlCompositor>,
@@ -541,16 +542,14 @@ impl State {
             self.render();
             return;
         }
-        let Some(total) = (w as usize)
-            .checked_mul(4)
-            .and_then(|s| s.checked_mul(h as usize))
-            .and_then(|f| f.checked_mul(BUFFERS))
-            .filter(|t| *t <= i32::MAX as usize)
-        else {
+        // One place for the i32 the protocol actually uses, shared with the
+        // panel's three bars: `create_pool` and `create_buffer` both take i32,
+        // and a pool past it arrives negative and kills the client.
+        let Some(geom) = proc::pool_geometry(w, h) else {
+            eprintln!("lunarrun: {w}x{h} does not fit a wl_shm pool; skipping");
             return;
         };
-        let stride = w as usize * 4;
-        let frame_size = stride * h as usize;
+        let (total, stride, frame_size) = (geom.total, geom.stride, geom.frame_size);
         let Some((map, fd)) = map_shm_pool(total, "lunarrun") else {
             return;
         };
@@ -1330,6 +1329,11 @@ fn new_state(toggle_desktop: bool) -> State {
     } else {
         build_items(&terminal)
     };
+    // ONE read of the look, not two. `Look::current()` reads /etc/eclipse/look,
+    // and `eclipse-look` rewrites that file when the user switches: two calls
+    // could return two different looks and leave the palette from one beside the
+    // geometry of the other.
+    let look = Look::current();
     let mut st = State {
         compositor: None,
         shm: None,
@@ -1350,8 +1354,8 @@ fn new_state(toggle_desktop: bool) -> State {
         next: 0,
         generation: 0,
         configured: false,
-        pal: palette(Look::current()),
-        look: Look::current(),
+        pal: palette(look),
+        look,
         lang: Lang::current(),
         items,
         hits: Vec::new(),
@@ -2315,6 +2319,51 @@ mod tests {
         );
         // And it must still end in a `return`, not fall through into it.
         assert!(body[dump..connect].contains("        return;"));
+    }
+
+    #[test]
+    fn the_look_is_read_once_and_only_once() {
+        // `Look::current()` reads /etc/eclipse/look, and `eclipse-look` rewrites
+        // that file when the user switches looks. Two calls could return two
+        // different looks and leave the palette from one beside the geometry of
+        // the other -- KDE's colours with Windows 11's placement. `new_state`
+        // builds a `State` full of Wayland handles, so the source is what can be
+        // checked.
+        let src = include_str!("lunarrun.rs");
+        let code = src.split("\n// \u{2500}\u{2500} tests").next().unwrap();
+        // Comment lines dropped, so explaining the rule does not break it.
+        let calls = code
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .filter(|l| l.contains("Look::current()"))
+            .count();
+        assert_eq!(calls, 1, "the look must be read exactly once per process");
+    }
+
+    #[test]
+    fn the_pool_is_sized_by_the_one_function_that_knows_the_protocols_limits() {
+        // `create_pool` and `create_buffer` take their sizes as i32, so an
+        // open-coded `w * 4 * h * BUFFERS` that forgets the ceiling hands the
+        // compositor a negative number and the client is killed. The panel's
+        // three bars and this overlay all went through their own copy of that
+        // arithmetic; now there is one. `configure` needs a live wl_shm, so the
+        // source is what can be checked.
+        let src = include_str!("lunarrun.rs");
+        let code = src.split("\n// \u{2500}\u{2500} tests").next().unwrap();
+        assert_eq!(
+            code.matches("pool_geometry(").count(),
+            1,
+            "the pool must be sized in exactly one place"
+        );
+        let hand_rolled: Vec<&str> = code
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .filter(|l| l.contains("* 4 *") || l.contains("as usize * 4"))
+            .collect();
+        assert!(
+            hand_rolled.is_empty(),
+            "the pool size is being computed by hand again: {hand_rolled:?}"
+        );
     }
 
     #[test]

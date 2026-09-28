@@ -236,7 +236,7 @@ fn clear_bar(cv: &mut Canvas, w: usize, h: usize) {
     }
 }
 
-const BUFFERS: usize = 2;
+use lunarbar::proc::BUFFERS;
 
 /// Udata marker: distinguishes the popup's layer surface and buffers from the
 /// bars' in wayland-client's per-(interface,udata) dispatch.
@@ -856,17 +856,14 @@ impl State {
             eprintln!("lunarbar: {bw}x{bh} bar past MAX_BUFFER_PIXELS; skipping");
             return;
         }
-        let Some(total) = (bw as usize)
-            .checked_mul(4)
-            .and_then(|s| s.checked_mul(bh as usize))
-            .and_then(|f| f.checked_mul(BUFFERS))
-            .filter(|t| *t <= i32::MAX as usize)
-        else {
+        // One place for the i32 the protocol actually uses, shared with the
+        // other two bars and with lunarrun: `create_pool` and `create_buffer`
+        // both take i32, and a pool past it arrives negative and kills us.
+        let Some(geom) = lunarbar::proc::pool_geometry(bw, bh) else {
             eprintln!("lunarbar: {bw}x{bh} bar too large for wl_shm; skipping");
             return;
         };
-        let stride = bw as usize * 4;
-        let frame_size = stride * bh as usize;
+        let (total, stride, frame_size) = (geom.total, geom.stride, geom.frame_size);
 
         // Allocate the NEW pool first. If this fails we keep the previous
         // mapping/buffers so the bar stays mapped and exclusive.
@@ -1424,16 +1421,12 @@ impl State {
             eprintln!("lunarbar: popup {bw}x{bh} past MAX_BUFFER_PIXELS; skipping");
             return;
         }
-        let Some(total) = (bw as usize)
-            .checked_mul(4)
-            .and_then(|s| s.checked_mul(bh as usize))
-            .and_then(|f| f.checked_mul(BUFFERS))
-            .filter(|t| *t <= i32::MAX as usize)
-        else {
+        // The same sizing as the bar above and as lunarrun; see pool_geometry.
+        let Some(geom) = lunarbar::proc::pool_geometry(bw, bh) else {
+            eprintln!("lunarbar: {bw}x{bh} does not fit a wl_shm pool; skipping");
             return;
         };
-        let stride = bw as usize * 4;
-        let frame_size = stride * bh as usize;
+        let (total, stride, frame_size) = (geom.total, geom.stride, geom.frame_size);
         let Some((map, fd)) = Self::map_shm_pool(total) else {
             return;
         };
@@ -2077,16 +2070,12 @@ impl State {
             eprintln!("lunarbar: tooltip {bw}x{bh} past MAX_BUFFER_PIXELS; skipping");
             return;
         }
-        let Some(total) = (bw as usize)
-            .checked_mul(4)
-            .and_then(|s| s.checked_mul(bh as usize))
-            .and_then(|f| f.checked_mul(BUFFERS))
-            .filter(|t| *t <= i32::MAX as usize)
-        else {
+        // The same sizing as the bar above and as lunarrun; see pool_geometry.
+        let Some(geom) = lunarbar::proc::pool_geometry(bw, bh) else {
+            eprintln!("lunarbar: {bw}x{bh} does not fit a wl_shm pool; skipping");
             return;
         };
-        let stride = bw as usize * 4;
-        let frame_size = stride * bh as usize;
+        let (total, stride, frame_size) = (geom.total, geom.stride, geom.frame_size);
         let Some((map, fd)) = Self::map_shm_pool(total) else {
             return;
         };
