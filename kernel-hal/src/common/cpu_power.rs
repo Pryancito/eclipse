@@ -462,6 +462,16 @@ mod tests {
     fn a_part_with_nowhere_to_go_is_left_alone() {
         assert_eq!(next_ceiling(90_000, BAND, 8, 8, 8), None);
         assert_eq!(next_ceiling(90_000, BAND, 8, 9, 8), None);
+        // ...and with the ceiling somewhere else entirely, which is the only
+        // shape that tells "no room" from "a range of one step": a part whose
+        // two bounds meet gets no request MSR written at all, whatever it is
+        // currently set to.
+        assert_eq!(
+            next_ceiling(90_000, BAND, 30, 8, 8),
+            None,
+            "sin margen no se escribe el MSR"
+        );
+        assert_eq!(next_ceiling(70_000, BAND, 4, 8, 8), None);
     }
 
     #[test]

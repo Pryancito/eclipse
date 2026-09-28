@@ -548,6 +548,28 @@ mod sem_tests {
         assert_eq!(get(0x5e_0007, 1, 0o666).err(), Some(LxError::ENOENT));
     }
 
+    /// `KEY2SEM` holds a `Weak`, so a set that goes away leaves an entry
+    /// behind that answers nothing. Nobody asking about the key can tell --
+    /// the probe says `ENOENT` either way -- so the only thing that tells is
+    /// whether the entry is still in the table. It has to go: `SEMMNI` bounds
+    /// the id table and nothing bounds this one, so a program that creates a
+    /// set under a fresh key and lets it drop would grow this map for the life
+    /// of the boot.
+    #[test]
+    fn a_key_whose_set_is_gone_leaves_the_table_instead_of_piling_up() {
+        let _guard = test_lock();
+        const GONE: u32 = 0x5e_000a;
+        let a = get(GONE, 1, CREAT | 0o666).unwrap();
+        assert!(KEY2SEM.read().contains_key(&GONE));
+        drop(a);
+        // Any `semget` sweeps, whatever key it is asking about.
+        let _other = get(0x5e_000b, 1, CREAT | 0o666).unwrap();
+        assert!(
+            !KEY2SEM.read().contains_key(&GONE),
+            "una clave muerta por cada conjunto que se va, y sin tope"
+        );
+    }
+
     #[test]
     fn removing_a_set_frees_its_key_even_while_it_is_still_referenced() {
         let _guard = test_lock();
@@ -570,6 +592,35 @@ mod sem_tests {
         private.remove();
         let still_there = get(0x5e_0009, 1, 0o666).unwrap();
         assert!(Arc::ptr_eq(&keyed, &still_there));
+    }
+
+    /// `semctl(IPC_RMID)` releasing the key is only half of it: the other
+    /// half is marking every semaphore in the set removed, which is what
+    /// turns a blocked `semop` into `EIDRM` instead of a wait on a set that
+    /// no longer exists. Every test above reads the key table, so nothing
+    /// looked at this half.
+    #[test]
+    fn removing_a_set_marks_every_semaphore_in_it_removed() {
+        let _guard = test_lock();
+        let a = get(0x5e_000c, 3, CREAT | 0o666).unwrap();
+        for i in 0..a.len() {
+            assert!(!a.get_sem(i).unwrap().is_removed(), "sem {} antes", i);
+        }
+        a.remove();
+        for i in 0..a.len() {
+            assert!(
+                a.get_sem(i).unwrap().is_removed(),
+                "sem {}: un semop bloqueado se quedaria esperando a un conjunto que ya no existe",
+                i
+            );
+        }
+
+        // A private set has no key to give back, so the semaphores are the
+        // whole of what `IPC_RMID` does to one.
+        let p = get(0, 2, CREAT | 0o666).unwrap();
+        p.remove();
+        assert!(p.get_sem(0).unwrap().is_removed(), "privado, sem 0");
+        assert!(p.get_sem(1).unwrap().is_removed(), "privado, sem 1");
     }
 
     #[test]
