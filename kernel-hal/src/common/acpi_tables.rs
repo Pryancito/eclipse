@@ -357,6 +357,32 @@ mod tests {
         assert_eq!(rsdp_sdt(&r), None);
     }
 
+    /// The `RSDP` is *found* by scanning physical memory, so the signature is
+    /// the whole of what says these twenty bytes are an `RSDP` at all. A blob
+    /// that happens to sum to zero -- one byte in 256 of whatever the scan
+    /// lands on -- is not one, and `bare/arch/x86_64/cpu.rs` took exactly this
+    /// on faith before walking whatever it named.
+    #[test]
+    fn a_blob_that_adds_up_is_still_not_an_rsdp_without_the_signature() {
+        let mut r = rsdp_v1(0x1234_5000);
+        r[3] = b'X';
+        // ...and seal it again, so the *only* thing left refusing it is the
+        // signature.
+        seal(&mut r, 8);
+        assert!(checksum_ok(&r), "el blob suma cero");
+        assert_eq!(rsdp_revision(&r), None, "«XSD PTR » no es una firma");
+        assert_eq!(rsdp_sdt(&r), None, "y no nombra ningun RSDT");
+
+        // Twenty bytes of anything, sealed, naming a table: memory that adds
+        // up by accident and has an address where the `RsdtAddress` goes.
+        let mut junk = vec![0u8; RSDP_V1_LEN];
+        junk[rsdp::RSDT_ADDRESS..rsdp::RSDT_ADDRESS + 4]
+            .copy_from_slice(&0x000f_0000u32.to_le_bytes());
+        seal(&mut junk, 8);
+        assert!(checksum_ok(&junk), "la basura tambien suma cero");
+        assert_eq!(rsdp_sdt(&junk), None, "basura que suma cero no es un RSDP");
+    }
+
     #[test]
     fn an_rsdp_that_names_nothing_is_refused() {
         assert_eq!(rsdp_sdt(&rsdp_v1(0)), None);
@@ -373,6 +399,57 @@ mod tests {
                 phys: 0x1234_5000,
                 wide: false
             })
+        );
+    }
+
+    /// The extended checksum covers `length` bytes and says nothing about the
+    /// ones past it, so a `length` that stops short of the `XsdtAddress` is
+    /// not a check over the `XsdtAddress`.
+    ///
+    /// The sharp case is `length` = the ACPI 1.0 length: the extended checksum
+    /// is then *exactly* the 1.0 checksum, which holds, and still covers none
+    /// of the eight bytes it would be taken as vouching for.
+    #[test]
+    fn an_extended_length_that_stops_before_the_xsdt_vouches_for_nothing() {
+        let mut r = rsdp_v2(0x1234_5000, 0x1_0000_9000);
+        r[rsdp::LENGTH..rsdp::LENGTH + 4].copy_from_slice(&(RSDP_V1_LEN as u32).to_le_bytes());
+        assert!(
+            checksum_ok(&r[..RSDP_V1_LEN]),
+            "la suma extendida de veinte bytes es la de ACPI 1.0, y vale"
+        );
+        assert_eq!(
+            rsdp_sdt(&r),
+            Some(SdtPointer {
+                phys: 0x1234_5000,
+                wide: false
+            }),
+            "una suma que no llega al XsdtAddress no lo respalda"
+        );
+    }
+
+    /// ...and a `length` of exactly the bytes the `XsdtAddress` ends at is
+    /// enough: the checksum covers it, which is all the minimum asks for.
+    #[test]
+    fn an_extended_length_that_just_reaches_the_xsdt_is_enough() {
+        // The eight bytes of this address sum to 224 and the four of the
+        // length to 32, so the first thirty-two bytes still add up: both
+        // checksums hold, and the length is the only thing under test.
+        let xsdt = 0x1000_d000u64;
+        let mut r = rsdp_v2(0x1234_5000, xsdt);
+        let len = rsdp::XSDT_ADDRESS + 8;
+        r[rsdp::LENGTH..rsdp::LENGTH + 4].copy_from_slice(&(len as u32).to_le_bytes());
+        assert!(
+            checksum_ok(&r[..len]),
+            "la suma extendida de {} bytes vale",
+            len
+        );
+        assert_eq!(
+            rsdp_sdt(&r),
+            Some(SdtPointer {
+                phys: xsdt,
+                wide: true
+            }),
+            "{len} bytes cubren el XsdtAddress entero"
         );
     }
 
@@ -461,6 +538,46 @@ mod tests {
         bad[20] = bad[20].wrapping_add(1);
         assert!(!table_is(&bad, b"XSDT"));
         assert!(!table_is(&t[..SDT_HEADER_LEN - 1], b"XSDT"));
+    }
+
+    /// A table's own `length` has to be the number of bytes there are. The
+    /// caller maps `table_length` bytes and walks them, so a header that
+    /// declares one number while the slice holds another is a table whose
+    /// checksum was taken over something other than what gets read.
+    #[test]
+    fn a_header_that_disagrees_with_how_many_bytes_there_are_is_no_table() {
+        let full = table(b"XSDT", &[0u8; 16]);
+        assert_eq!(full.len(), SDT_HEADER_LEN + 16);
+        assert!(table_is(&full, b"XSDT"), "la tabla entera si vale");
+
+        // Fewer bytes than were handed over...
+        let mut short = full.clone();
+        short[4..8].copy_from_slice(&(SDT_HEADER_LEN as u32).to_le_bytes());
+        seal(&mut short, 9);
+        assert!(checksum_ok(&short), "la suma sigue valiendo");
+        assert!(!table_is(&short, b"XSDT"), "declara 36 y hay 52");
+
+        // ...and more, which is the direction that decides how much memory
+        // gets read.
+        let mut long = full.clone();
+        long[4..8].copy_from_slice(&0x1000u32.to_le_bytes());
+        seal(&mut long, 9);
+        assert!(checksum_ok(&long), "la suma sigue valiendo");
+        assert!(!table_is(&long, b"XSDT"), "declara 4096 y hay 52");
+    }
+
+    /// The shortest legal table is a header and nothing else -- an `RSDT` or
+    /// `XSDT` listing no tables at all -- and it is a table.
+    #[test]
+    fn a_table_of_exactly_a_header_and_nothing_else_is_a_table() {
+        let empty = table(b"XSDT", &[]);
+        assert_eq!(empty.len(), SDT_HEADER_LEN);
+        assert_eq!(
+            table_length(&empty),
+            Some(SDT_HEADER_LEN),
+            "36 es el minimo, no el primer rechazado"
+        );
+        assert!(table_is(&empty, b"XSDT"), "una cabecera sola es una tabla");
     }
 
     #[test]

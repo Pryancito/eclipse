@@ -402,6 +402,14 @@ mod tick_rate_tests {
         );
         assert_eq!(ticks_per_period(100, 250), 1, "a rate slower than the tick");
         assert_eq!(ticks_per_period(QEMU_ARM, 0), QEMU_ARM);
+        // Both at once: a board that reports no rate, asked for no tick. The
+        // answer still cannot be zero counts, and this branch has a floor of
+        // its own -- the one above it does not run here.
+        assert_eq!(
+            ticks_per_period(0, 0),
+            1,
+            "sin tasa y sin tic, sigue sin ser cero"
+        );
     }
 
     #[test]
@@ -624,6 +632,58 @@ mod tests {
         assert_eq!(arm_span(NOW, NOW, 0, 0, tiny, FLOOR), Some(FLOOR));
     }
 
+    /// The one-way invariant the whole module exists for: an arm only ever
+    /// makes a timer fire *sooner* than the scheduler tick would have, never
+    /// later. Programming the CPU's one-shot timer for a deadline past a tick
+    /// that is already nearer pushes the tick itself out by the difference,
+    /// and the previous attempt at letting timers run long left halted CPUs
+    /// with timers that never expired -- no keyboard, no mouse.
+    ///
+    /// Partway through a period the recorded tick due time is nearer than a
+    /// whole tick, so the upper bound of the clamp -- a whole tick -- is too
+    /// loose to hold it, and the `min` against the tick due time is the only
+    /// thing left doing it.
+    #[test]
+    fn an_arm_never_pushes_out_a_tick_that_is_already_nearer() {
+        // A millisecond left of the period, and a deadline three past it.
+        assert_eq!(
+            arm_span(NOW, NOW + 3 * MS, NOW + MS, 0, TICK, FLOOR),
+            Some(MS),
+            "manda el tic, que es lo mas cercano"
+        );
+        // ...and the deadline when it is the nearer of the two, which is the
+        // whole point of arming at all.
+        assert_eq!(
+            arm_span(NOW, NOW + MS / 2, NOW + MS, 0, TICK, FLOOR),
+            Some(MS / 2),
+            "manda el plazo, que es lo mas cercano"
+        );
+    }
+
+    /// The upper bound is the scheduler tick, and it has to do the cutting
+    /// itself when the recorded tick due time is further out than one period
+    /// -- which is what a due time recorded under a longer period looks like
+    /// after the tick rate is measured and shortened.
+    ///
+    /// Everywhere else the `min` against the tick due time gets there first,
+    /// so the arm lands on the bound rather than being cut back to it, and a
+    /// missing bound reads the same.
+    #[test]
+    fn a_stale_tick_due_time_does_not_buy_an_arm_longer_than_a_tick() {
+        assert_eq!(
+            arm_span(NOW, NOW + 100 * MS, NOW + 10 * TICK, 0, TICK, FLOOR),
+            Some(TICK),
+            "preemption has to keep running whatever the timer heap wants"
+        );
+        // And the deadline itself, when it is the nearer of the two and still
+        // further out than a tick.
+        assert_eq!(
+            arm_span(NOW, NOW + 5 * TICK, NOW + 10 * TICK, 0, TICK, FLOOR),
+            Some(TICK),
+            "el techo es el tic, venga de donde venga el objetivo"
+        );
+    }
+
     #[test]
     fn a_deadline_at_the_far_end_of_the_counter_still_arms_within_the_tick() {
         assert_eq!(
@@ -648,6 +708,10 @@ mod tests {
     #[test]
     fn nothing_pending_leaves_the_restored_period_alone() {
         assert_eq!(rearm_span(NOW, NO_DEADLINE, NOW + TICK, TICK, FLOOR), None);
+        // ...including on a CPU with no recorded tick due time, where the
+        // hysteresis is switched off and the sentinel is the only thing left
+        // saying there is nothing to bring the timer forward for.
+        assert_eq!(rearm_span(NOW, NO_DEADLINE, 0, TICK, FLOOR), None);
     }
 
     #[test]
@@ -700,6 +764,16 @@ mod tests {
         assert_eq!(counts_for(u64::MAX, u64::MAX), u32::MAX);
         assert_eq!(counts_per_tick(u64::MAX, 1), u32::MAX);
         assert_eq!(counts_per_tick(1_000_000_000, 0), u32::MAX);
+        // `u64::MAX` cannot tell a bound from a cast: truncating it to 32 bits
+        // gives `u32::MAX` too, which is the answer either way. A count that
+        // is merely *past* the register says which one happened -- truncating
+        // five thousand million leaves seven hundred million, a tick seven
+        // times shorter than the one asked for.
+        assert_eq!(
+            counts_per_tick(5_000_000_000, 1),
+            u32::MAX,
+            "acotado, no truncado"
+        );
     }
 
     #[test]
