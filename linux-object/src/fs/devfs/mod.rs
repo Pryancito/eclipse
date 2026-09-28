@@ -1,6 +1,7 @@
 pub mod blockdev;
 pub mod drm;
 pub mod drm_scheme;
+pub mod drm_trail;
 mod dsp;
 mod fbdev;
 mod input;

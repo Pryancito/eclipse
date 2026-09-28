@@ -19,6 +19,7 @@ use rcore_fs::vfs::*;
 use zircon_object::vm::VmObject;
 
 use super::drm;
+use super::drm_trail;
 use crate::error::LxError;
 use zcore_drivers::display::edid;
 
@@ -4706,9 +4707,82 @@ fn reconcile_sizes(cmd: u32, canon: u32) -> IoctlSizes {
 /// and only when the sizes actually differ — the overwhelmingly common case is
 /// an exact match, which dispatches straight through with no copy at all.
 fn drm_ioctl(dev: &DrmDev, cmd: u32, data: usize) -> Result<usize> {
-    drm_ioctl_reconciled(cmd, data, |canon, kdata| {
+    // Read the first field BEFORE dispatching: for an `_IOWR` it is an input
+    // the handler is free to overwrite with its reply, and the trail wants to
+    // say what was ASKED (`GETPARAM` param 13, `GEM_INFO` handle 7), not what
+    // came back -- the answer is already in `ret`.
+    let arg0 = first_arg_word(cmd, data);
+    let ret = drm_ioctl_reconciled(cmd, data, |canon, kdata| {
         dev.drm_ioctl_dispatch(canon, kdata)
-    })
+    });
+    drm_trail::record(
+        drm::current_pid() as u32,
+        drm::current_tid() as u32,
+        cmd,
+        arg0,
+        trail_ret(&ret),
+    );
+    ret
+}
+
+/// Record a DRM ioctl the SYSCALL layer answered by itself.
+///
+/// Three families never reach [`drm_ioctl`] because they have to touch the
+/// process fd table: PRIME dma-buf export/import, syncobj export/import, and
+/// `SYNCOBJ_EVENTFD`. They are also the three a Vulkan driver leans on
+/// hardest, so a trail without them would skip exactly the calls that hand
+/// NVK an object it then dereferences.
+///
+/// `data` is read here, *after* the call rather than before it as
+/// [`drm_ioctl`] does: all three keep their subject (`handle`) in the first
+/// word and write their reply into a later field, so the distinction the
+/// other path needs does not arise.
+pub fn trail_record(cmd: u32, data: usize, ret: i64) {
+    drm_trail::record(
+        drm::current_pid() as u32,
+        drm::current_tid() as u32,
+        cmd,
+        first_arg_word(cmd, data),
+        ret,
+    );
+}
+
+/// The first 64-bit word of an ioctl's argument struct, or 0 when there is
+/// none or it cannot be read.
+///
+/// Every DRM argument struct starts on an 8-byte boundary and its first field
+/// is the one that names the subject: `param`, `handle`, `channel`,
+/// `crtc_id`, `capability`. Structs shorter than 8 bytes (`MODE_RMFB` and
+/// friends carry a bare `__u32`) read as 0 rather than over their end.
+///
+/// This must not be able to fault: it runs on the ordinary ioctl path for
+/// every call, including ones whose argument the dispatcher is about to
+/// reject. `UserInPtr::read` is the checked read the rest of this file uses,
+/// and its error is simply "no value".
+fn first_arg_word(cmd: u32, data: usize) -> u64 {
+    if !arg_word_readable(cmd, data) {
+        return 0;
+    }
+    kernel_hal::user::UserInPtr::<u64>::from(data)
+        .read()
+        .unwrap_or(0)
+}
+
+/// Whether [`first_arg_word`] may read eight bytes at `data`.
+///
+/// Split out from the read itself so it can be tested: the read is the one
+/// part of this that cannot run on the host, and the decision NOT to read is
+/// the part that keeps a trail entry from turning into a fault.
+fn arg_word_readable(cmd: u32, data: usize) -> bool {
+    ioc_size(cmd) >= 8 && ucheck(data, 8).is_ok()
+}
+
+/// An ioctl result as the trail records it: a count, or a negative errno.
+fn trail_ret(ret: &Result<usize>) -> i64 {
+    match ret {
+        Ok(n) => *n as i64,
+        Err(e) => -(crate::error::LxError::from(e) as i64),
+    }
 }
 
 /// [`drm_ioctl`] with the dispatch injected, so the copy-in / zero-fill /
@@ -8048,6 +8122,10 @@ mod kms_scanout_tests {
     #[test]
     fn without_the_repair_the_stale_pixels_stay_on_the_panel() {
         let screen = kms_emu::attach(192, 200);
+        // The repair is ON by default since `drm.present_repair` was flipped
+        // (it is `=off` that disarms it now), and this test IS the unrepaired
+        // race, so it has to disarm the flag itself -- as its neighbours do.
+        drm::set_present_repair_enabled(false);
         let c = Client::open(0);
         let buf = c.create_dumb(192, 200);
         paint(&buf, |x, y| tag(0x0066_0000, x, y));
@@ -8074,7 +8152,7 @@ mod kms_scanout_tests {
         assert_eq!(
             drm::repair_rounds_for_test(),
             0,
-            "the repair must not run when the cmdline did not arm it"
+            "the repair must not run once the cmdline has disarmed it"
         );
         assert_eq!(
             screen.pixel(64, 0),
@@ -13885,5 +13963,61 @@ mod addfb2_validation_tests {
         assert_eq!(client.rmfb(fb), Ok(0));
 
         assert_eq!(client.destroy_dumb(buf.handle), Ok(0));
+    }
+}
+
+#[cfg(test)]
+mod trail_tests {
+    //! What the crash-time trail records about an ioctl's outcome.
+    //!
+    //! The recording itself needs a process and a user address space, so what
+    //! is checked here is the part that does not: the translation from an
+    //! ioctl `Result` to the number userspace saw, and the refusal to read an
+    //! argument struct that has no first word.
+
+    use super::*;
+
+    /// The negative errno, not a bare -1: the whole point of the trail is that
+    /// a reader can tell `EINVAL` (userspace asked for something we do not
+    /// have) from `ENOENT` (it named an object that is gone).
+    #[test]
+    fn a_failed_ioctl_is_recorded_as_its_own_errno() {
+        assert_eq!(trail_ret(&Err(FsError::InvalidParam)), -22);
+        assert_eq!(trail_ret(&Err(FsError::EntryNotFound)), -2);
+        assert_eq!(trail_ret(&Err(FsError::NotSupported)), -38);
+        assert_eq!(trail_ret(&Err(FsError::BadAddress)), -14);
+    }
+
+    #[test]
+    fn a_successful_ioctl_is_recorded_as_its_return_value() {
+        assert_eq!(trail_ret(&Ok(0)), 0);
+        assert_eq!(trail_ret(&Ok(7)), 7);
+    }
+
+    /// `MODE_RMFB` and friends carry a bare `__u32`. Reading eight bytes off
+    /// one would run past the struct the client allocated, so an argument that
+    /// short has no first word at all.
+    #[test]
+    fn an_argument_struct_shorter_than_a_word_has_no_first_word() {
+        // `_IOC_SIZE` 4 (`MODE_RMFB`) and 0 (`SET_MASTER`), at a plausible
+        // user address: the size is what refuses them, not the address.
+        assert!(!arg_word_readable(0xC004_64AF, 0x1000));
+        assert!(!arg_word_readable(0x0000_641E, 0x1000));
+        // 16 bytes (`GETPARAM`) at the same address is the case that does get
+        // read, so the test above is about the size and nothing else.
+        assert!(arg_word_readable(0xC010_6440, 0x1000));
+    }
+
+    /// A null pointer is never read: `ucheck` is the same gate the dispatch
+    /// arms use, and a trail entry is not worth a fault.
+    ///
+    /// Only the null case is asserted. The upper bound of the user range is
+    /// the host's under `libos`, where `user_range_ok` accepts every address,
+    /// so a "kernel address is refused" assertion here would be testing this
+    /// build rather than the rule.
+    #[test]
+    fn a_null_argument_is_not_read() {
+        assert!(!arg_word_readable(0xC010_6440, 0));
+        assert_eq!(first_arg_word(0xC010_6440, 0), 0);
     }
 }

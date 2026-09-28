@@ -14,6 +14,18 @@ use linux_object::error::LxResult;
 use linux_object::{process::FsInfo, thread::ThreadExt, time::TimeSpec};
 use rcore_fs::vfs::INode;
 
+/// Land one entry in the calling process's DRM ioctl trail for a call this
+/// layer answered itself.
+///
+/// The three fd-table families (PRIME, syncobj export/import, eventfd) return
+/// straight from `sys_ioctl` and never reach `drm_ioctl`, which is where every
+/// other DRM call is recorded. Without this they would be a hole in the trail
+/// precisely where a Vulkan driver gets the objects it later dereferences --
+/// see `linux_object::fs::devfs::drm_trail`.
+fn trail_drm(cmd: u32, arg1: usize, ret: i64) {
+    linux_object::fs::devfs::drm_scheme::trail_record(cmd, arg1, ret);
+}
+
 /// `lseek(2)`'s `whence`, which the syscall declares `int` and this tree read
 /// as a `u8`.
 ///
@@ -2074,9 +2086,15 @@ impl Syscall<'_> {
             // silent on the hot path. Ok(None) means "not a PRIME request after
             // all"; fall through to the inode `io_control`.
             match self.sys_drm_prime(&file_like, cmd, arg1) {
-                Ok(Some(ret)) => return Ok(ret),
+                Ok(Some(ret)) => {
+                    trail_drm(cmd as u32, arg1, ret as i64);
+                    return Ok(ret);
+                }
                 Ok(None) => {}
-                Err(e) => return Err(e),
+                Err(e) => {
+                    trail_drm(cmd as u32, arg1, -(e as i64));
+                    return Err(e);
+                }
             }
         }
         // SYNC_IOC_MERGE on a sync_file fd: needs the fd table (a second fd in,
@@ -2095,9 +2113,15 @@ impl Syscall<'_> {
         // re-validates NR + type before touching the (frozen) 16-byte prefix.
         if ((cmd >> 8) & 0xff) == 0x64 && matches!(cmd & 0xff, 0xc1 | 0xc2) {
             match self.sys_drm_syncobj_fd(cmd, arg1) {
-                Ok(Some(ret)) => return Ok(ret),
+                Ok(Some(ret)) => {
+                    trail_drm(cmd as u32, arg1, ret as i64);
+                    return Ok(ret);
+                }
                 Ok(None) => {}
-                Err(e) => return Err(e),
+                Err(e) => {
+                    trail_drm(cmd as u32, arg1, -(e as i64));
+                    return Err(e);
+                }
             }
         }
         // SYNCOBJ_EVENTFD — same fd-table-access reasoning as the syncobj FD
@@ -2109,9 +2133,15 @@ impl Syscall<'_> {
         };
         if is_syncobj_eventfd {
             match self.sys_drm_syncobj_eventfd(cmd, arg1) {
-                Ok(Some(ret)) => return Ok(ret),
+                Ok(Some(ret)) => {
+                    trail_drm(cmd as u32, arg1, ret as i64);
+                    return Ok(ret);
+                }
                 Ok(None) => {}
-                Err(e) => return Err(e),
+                Err(e) => {
+                    trail_drm(cmd as u32, arg1, -(e as i64));
+                    return Err(e);
+                }
             }
         }
         // `TIOCSCTTY` on a pts: adopt the pty as the controlling terminal.

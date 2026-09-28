@@ -262,6 +262,19 @@ impl From<ZxError> for LxError {
 
 impl From<FsError> for LxError {
     fn from(error: FsError) -> Self {
+        Self::from(&error)
+    }
+}
+
+/// The same table, reached from a BORROW.
+///
+/// `FsError` is neither `Copy` nor `Clone`, so code holding a `&Result<_,
+/// FsError>` -- an ioctl result that must be both inspected and returned --
+/// could not name its errno at all. Every variant is fieldless, so matching
+/// through a reference is the identical table; the owned impl above delegates
+/// here rather than keeping a second copy that could drift.
+impl From<&FsError> for LxError {
+    fn from(error: &FsError) -> Self {
         match error {
             FsError::NotSupported => LxError::ENOSYS,
             FsError::NotFile => LxError::EISDIR,
@@ -417,6 +430,11 @@ mod errno_tests {
             (FsError::NoSuchDeviceOrAddress, LxError::ENXIO),
         ] {
             let name = alloc::format!("{:?}", fs);
+            // Both impls, on the same value: the borrowing one is what an
+            // ioctl result held by reference goes through, and a table that
+            // disagreed with the owned one would report a different errno
+            // depending on who asked.
+            assert_eq!(LxError::from(&fs), lx, "&{}", name);
             assert_eq!(LxError::from(fs), lx, "{}", name);
         }
     }
