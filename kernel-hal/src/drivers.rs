@@ -983,8 +983,13 @@ mod registry_tests {
     /// `set_kernel_text` is only called from `bare/arch/x86_64` -- so the slot
     /// comes back `Unchecked`, which is allowed, and the sink really is reached.
     fn sink_reset() {
-        static INSTALLED: spin::Once<()> = spin::Once::new();
-        INSTALLED.call_once(|| crate::console::klog_register(sink_read, sink_size, sink_emit));
+        // Re-registered on every reset, not once per process: the slots are
+        // three process-wide words and `console`'s own tests write them to
+        // reach the refusals in `klog_read`/`klog_buf_size`/`klog_emit`. They
+        // put back what they found, so a `call_once` would still hold here --
+        // but a fixture that reinstalls itself does not depend on that, and
+        // the call is three stores.
+        crate::console::klog_register(sink_read, sink_size, sink_emit);
         SINK.lock().clear();
     }
 
