@@ -271,18 +271,20 @@ resueltas:
   está cae a ALSA (que `/etc/asound.conf` también enruta por Pulse).
   Ver [README-audio.md](README-audio.md).
 - **gzdoom** se quedaba colgado justo tras imprimir `GZDoom 4.14.2 - - SDL
-  version / Compiled on ...`: lo siguiente que hace `main()` es `SDL_Init(0)`,
-  y SDL2 (con cualquier máscara de subsistemas) ejecuta antes que nada
-  `SDL_DBus_Init()`, que pide el bus de sesión a libdbus. Sin
-  `DBUS_SESSION_BUS_ADDRESS`, libdbus usa `autolaunch:`: hace fork de
-  `dbus-launch`, que abre `$DISPLAY` (Xwayland) y lanza un `dbus-daemon` más
-  un proceso «niñera» detrás de tuberías, esperando EOF. La sesión exporta
-  `DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/0/bus` en los mismos
-  cuatro sitios que la política de SDL (wrapper, `/etc/profile`,
-  `~/.config/labwc/environment`, `eclipse-init`), y **ahora hay un demonio
-  escuchando en esa ruta**: `dbus.service` lo arranca en el arranque, así que
-  SDL ya no solo deja de colgarse — tiene bus. Ver
-  [README-dbus.md](README-dbus.md).
+  version / Compiled on ...`, sordo incluso a `^C`. **No era el bus de sesión**:
+  con `DBUS_SESSION_BUS_ADDRESS=unix:path=/sin-bus` se colgaba igual. Eran dos
+  fallos del kernel en el camino de `__synccall` de musl, que es lo que corre
+  `seteuid()`: el hilo que llama bloquea todas las señales, manda
+  `SIGSYNCCALL` a cada uno de los demás hilos y espera a que todos fichen.
+  (1) El volcado de mapeos daba los permisos de la **primera** página del
+  mapeo a todo él, y musl pone la página de guarda de cada pila de hilo
+  **abajo**, así que toda pila de hilo parecía no escribible y el kernel no
+  podía dejar ahí el marco de la señal (`nowhere to put the SIGRT34 frame`).
+  (2) Un `FUTEX_WAIT` sin plazo no era interrumpible por nada, así que un hilo
+  dentro de `pthread_cond_wait` no fichaba nunca. Los dos están arreglados
+  ([PR #1601](https://github.com/Pryancito/eclipse/pull/1601)) y gzdoom
+  arranca. El bozal de D-Bus del wrapper se queda por higiene, pero no
+  arreglaba nada; ver [README-dbus.md](README-dbus.md).
 
 ## Atajos de teclado
 

@@ -257,8 +257,9 @@ const CHILD_ENV: &[&str] = &[
     // UNSET address makes libdbus `autolaunch:` -- fork dbus-launch, which
     // opens $DISPLAY and spawns a dbus-daemon plus a babysitter behind pipes
     // -- and SDL_Init() walks that chain (SDL_DBus_Init) before it does
-    // anything else; gzdoom hung there. Pinned, the connect is refused at
-    // once and the app carries on bus-less instead of hanging.
+    // anything else. That chain was not what hung gzdoom (two kernel bugs
+    // were: see docs/README-desktop.md), but pinned, the connect is refused
+    // at once and the app skips the fork/exec/pipe detour entirely.
     "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/0/bus",
 ];
 
