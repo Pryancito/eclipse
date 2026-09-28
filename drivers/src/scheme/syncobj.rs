@@ -1341,7 +1341,8 @@ pub fn add_ref_for(pid: u64, handle: u32) -> bool {
 }
 
 /// `SYNCOBJ_DESTROY` by process `pid`: gives back one of the references
-/// `pid` holds on `handle`. `false` (ENOENT) when it holds none, even if the
+/// `pid` holds on `handle`. `false` (EINVAL, `drm_syncobj_destroy`'s
+/// `idr_remove` finding nothing) when it holds none, even if the
 /// object exists: a handle is another process's to destroy only in that
 /// process's table (Linux), and a client that guesses the compositor's
 /// handle numbers must not be able to free its timelines. A `pid` of 0
@@ -5075,7 +5076,7 @@ mod tests {
         // A imports its own export of a2: two references of A's on it, and
         // its death gives back both.
         assert!(add_ref_for(A, a2));
-        // DESTROY from the wrong process is ENOENT and changes nothing.
+        // DESTROY from the wrong process is EINVAL and changes nothing.
         assert!(!destroy_for(B, a2), "a2 is A's alone");
         assert!(!destroy_for(A, b1), "b1 is B's alone");
         assert!(!destroy_for(A, kernel), "no process holds the kernel's");

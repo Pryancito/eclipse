@@ -421,6 +421,31 @@ fn a_wait_with_no_handles_returns_at_once_and_the_other_arrays_refuse_it() {
     }
 }
 
+/// `drm_syncobj_destroy` is an `idr_remove` on the caller's table: a
+/// handle that is not there is EINVAL (it said ENOENT), whether it was
+/// never created or was destroyed already. (Another process's handle
+/// is the same case, but a test has no second process: `current_pid`
+/// is 0 here, which `destroy_for` treats as the kernel.)
+#[test]
+fn destroying_a_handle_that_is_not_in_the_callers_table_is_einval() {
+    let _serialised = drm::test_globals::lock();
+    let _hook = crate::fs::syncobj_eventfd::hardware_fence_tests::TEST_SERIAL.lock();
+    let _on = NouveauOn::new();
+    let c = Client::open(0);
+    let h = create(&c, false);
+    let try_destroy = |handle: u32| {
+        let mut req = DrmSyncobjDestroy { handle, pad: 0 };
+        c.ioctl(DRM_IOCTL_SYNCOBJ_DESTROY, &mut req)
+    };
+    assert_eq!(
+        try_destroy(h + 1000),
+        Err(FsError::InvalidParam),
+        "never created"
+    );
+    assert_eq!(try_destroy(h), Ok(0));
+    assert_eq!(try_destroy(h), Err(FsError::InvalidParam), "twice");
+}
+
 /// Past what the kernel would allocate for the array, ENOMEM, before
 /// the array is looked at (it is never read here: the pointer is null).
 #[test]
