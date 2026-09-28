@@ -232,6 +232,42 @@ struct PendingWrite {
 /// Flush the accumulated buffer once it reaches this size.
 const WRITE_BUF_FLUSH: usize = 1024 * 1024;
 
+impl PendingWrite {
+    /// The offset just past the last buffered byte: where a write has to start
+    /// to be a contiguous append, and the end `stat` reports for the file while
+    /// the tail is still in memory. Both callers spelled the sum out for
+    /// themselves and neither had a test.
+    fn end(&self) -> u64 {
+        self.start + self.data.len() as u64
+    }
+}
+
+/// Is a write of `ino` at `off` a contiguous append onto the buffered tail?
+/// That is the only case the fast path of `write_at` may take, because it skips
+/// the `stat` that would tell it anything else about the file.
+fn appends_to(pw: &PendingWrite, ino: u64, off: u64) -> bool {
+    pw.ino == ino && pw.end() == off
+}
+
+/// A write shorter than the flush size is worth accumulating; one at least that
+/// long goes straight to the filesystem. Both the "keep buffering" and the
+/// "straight through" decisions ask this one question.
+fn worth_buffering(len: usize) -> bool {
+    len < WRITE_BUF_FLUSH
+}
+
+/// Serve `buf` from a fixed run of bytes starting at `offset`, the way
+/// `read(2)` pages through one: nothing at or past the end, never more than
+/// what is left. Returns how many bytes were copied.
+fn read_from(bytes: &[u8], offset: usize, buf: &mut [u8]) -> usize {
+    if offset >= bytes.len() {
+        return 0;
+    }
+    let take = buf.len().min(bytes.len() - offset);
+    buf[..take].copy_from_slice(&bytes[offset..offset + take]);
+    take
+}
+
 #[derive(Clone)]
 struct CachedDirEntry {
     name: String,
@@ -356,7 +392,7 @@ impl BtrfsMountFs {
     fn buffered_end(&self, ino: u64) -> Option<u64> {
         let wb = self.write_buf.lock();
         match &*wb {
-            Some(pw) if pw.ino == ino => Some(pw.start + pw.data.len() as u64),
+            Some(pw) if pw.ino == ino => Some(pw.end()),
             _ => None,
         }
     }
@@ -474,12 +510,7 @@ impl INode for BtrfsMountINode {
             FileKind::Dir => Err(FsError::IsDir),
             FileKind::Symlink => {
                 let target = fs.read_link(self.ino).map_err(map_err)?;
-                if offset >= target.len() {
-                    return Ok(0);
-                }
-                let take = buf.len().min(target.len() - offset);
-                buf[..take].copy_from_slice(&target[offset..offset + take]);
-                Ok(take)
+                Ok(read_from(&target, offset, buf))
             }
             _ => fs.read(self.ino, offset as u64, buf).map_err(|e| {
                 // Surface the exact failing operation in dmesg (klog bypasses the
@@ -509,14 +540,11 @@ impl INode for BtrfsMountINode {
         // flush first), so we skip even the `stat` and just grow the buffer.
         {
             let mut wb = self.fs.write_buf.lock();
-            let hit = matches!(
-                &*wb,
-                Some(pw) if pw.ino == self.ino && pw.start + pw.data.len() as u64 == off
-            );
+            let hit = matches!(&*wb, Some(pw) if appends_to(pw, self.ino, off));
             if hit {
                 let pw = wb.as_mut().unwrap();
                 pw.data.extend_from_slice(buf);
-                if pw.data.len() < WRITE_BUF_FLUSH {
+                if worth_buffering(pw.data.len()) {
                     return Ok(buf.len());
                 }
                 let full = wb.take().unwrap();
@@ -539,7 +567,7 @@ impl INode for BtrfsMountINode {
         }
         self.fs.flush_any(&mut fs)?;
         // Small write: start a fresh buffer. Large write: straight through.
-        if buf.len() < WRITE_BUF_FLUSH {
+        if worth_buffering(buf.len()) {
             *self.fs.write_buf.lock() = Some(PendingWrite {
                 ino: self.ino,
                 start: off,
@@ -1147,5 +1175,404 @@ mod dev_adapter_tests {
         let (_disk, adapter) = disk_and_adapter();
         assert_eq!(adapter.size(), 1024 * 1024);
         adapter.sync().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod mount_glue_tests {
+    //! Host tests for everything this mount decides *without* a filesystem
+    //! under it: the two translation tables, the `stat` conversion and the
+    //! pre-mount probe. `dev_adapter_tests` above covers the transfer layer;
+    //! between them they are the whole of this file a host can reach, and
+    //! until now every one of these decisions could be changed without a
+    //! single test noticing.
+    use super::*;
+    use alloc::vec;
+    use zcore_drivers::scheme::Scheme;
+    use zcore_drivers::{DeviceError, DeviceResult};
+
+    /// btrfs' own magic, `_BHRfS_M` read little-endian, as it sits at +0x40 of
+    /// the superblock.
+    const BTRFS_MAGIC: u64 = 0x4D5F53665248425F;
+    /// Byte offset of the primary superblock.
+    const SB_AT: usize = 0x10000;
+    /// Sectors of the disks these tests build: 128 KiB, enough to hold the
+    /// primary superblock and a little beyond it.
+    const SECTORS: usize = 256;
+
+    /// A block device whose bytes the test writes by hand, so a superblock can
+    /// be built one field at a time.
+    struct Platter {
+        bytes: Mutex<Vec<u8>>,
+        readable: bool,
+    }
+
+    impl Platter {
+        fn of(sectors: usize) -> Arc<Self> {
+            Arc::new(Self {
+                bytes: Mutex::new(vec![0u8; sectors * 512]),
+                readable: true,
+            })
+        }
+
+        fn unreadable() -> Arc<Self> {
+            Arc::new(Self {
+                bytes: Mutex::new(vec![0u8; 512]),
+                readable: false,
+            })
+        }
+
+        /// Write a little-endian `u64` at an absolute byte offset.
+        fn put(&self, at: usize, v: u64) {
+            self.bytes.lock()[at..at + 8].copy_from_slice(&v.to_le_bytes());
+        }
+    }
+
+    impl Scheme for Platter {
+        fn name(&self) -> &str {
+            "platter"
+        }
+    }
+
+    impl BlockScheme for Platter {
+        fn read_block(&self, block_id: usize, buf: &mut [u8]) -> DeviceResult {
+            if !self.readable {
+                return Err(DeviceError::IoError);
+            }
+            let start = block_id * 512;
+            let d = self.bytes.lock();
+            if start + buf.len() > d.len() {
+                return Err(DeviceError::InvalidParam);
+            }
+            buf.copy_from_slice(&d[start..start + buf.len()]);
+            Ok(())
+        }
+        fn write_block(&self, _block_id: usize, _buf: &[u8]) -> DeviceResult {
+            Err(DeviceError::NotSupported)
+        }
+        fn flush(&self) -> DeviceResult {
+            Ok(())
+        }
+        fn block_count(&self) -> usize {
+            self.bytes.lock().len() / 512
+        }
+    }
+
+    /// A disk carrying a superblock that passes every test of the probe, so
+    /// each test can spoil exactly one field of it.
+    fn a_btrfs_disk() -> Arc<Platter> {
+        let p = Platter::of(SECTORS);
+        p.put(SB_AT + 0x40, BTRFS_MAGIC);
+        p.put(SB_AT + 0x70, (SECTORS as u64) * 512);
+        p.put(SB_AT + 0x88, 1);
+        p
+    }
+
+    fn probe(p: &Arc<Platter>) -> bool {
+        let dev: Arc<dyn BlockScheme> = p.clone();
+        probe_btrfs_superblock(&dev)
+    }
+
+    #[test]
+    fn an_untouched_superblock_is_recognised() {
+        assert!(probe(&a_btrfs_disk()), "a superblock with nothing wrong");
+    }
+
+    /// The primary superblock lives at byte 0x10000, which on a 512-byte
+    /// device is sector 128. Looking for it anywhere else finds zeros and
+    /// refuses to mount a perfectly good volume.
+    #[test]
+    fn the_superblock_is_read_from_byte_64_kib() {
+        let elsewhere = Platter::of(SECTORS);
+        elsewhere.put(0x2000 + 0x40, BTRFS_MAGIC);
+        elsewhere.put(0x2000 + 0x70, (SECTORS as u64) * 512);
+        elsewhere.put(0x2000 + 0x88, 1);
+        assert!(
+            !probe(&elsewhere),
+            "a superblock at the wrong offset is not a superblock"
+        );
+        assert!(probe(&a_btrfs_disk()), "and the right offset still is");
+    }
+
+    /// The magic is at +0x40 and nowhere else, and it is a veto: a volume of
+    /// some other filesystem whose remaining numbers happen to look plausible
+    /// is still not btrfs.
+    #[test]
+    fn without_the_magic_at_its_own_offset_nothing_else_matters() {
+        let blank = a_btrfs_disk();
+        blank.put(SB_AT + 0x40, 0);
+        assert!(!probe(&blank), "plausible numbers but no magic");
+
+        let shifted = a_btrfs_disk();
+        shifted.put(SB_AT + 0x40, 0);
+        shifted.put(SB_AT + 0x48, BTRFS_MAGIC);
+        assert!(
+            !probe(&shifted),
+            "the magic one field further on is somebody else's field"
+        );
+    }
+
+    /// A volume spread over several disks is one this mount cannot read: half
+    /// its chunks live on a device nobody handed us.
+    #[test]
+    fn a_volume_spread_over_several_disks_is_refused() {
+        let p = a_btrfs_disk();
+        p.put(SB_AT + 0x88, 2);
+        assert!(!probe(&p));
+    }
+
+    /// A superblock claiming no bytes at all is a zeroed or half-written one.
+    #[test]
+    fn a_superblock_that_claims_no_bytes_is_refused() {
+        let p = a_btrfs_disk();
+        p.put(SB_AT + 0x70, 0);
+        assert!(!probe(&p));
+    }
+
+    /// The volume may be at most twice the disk it was found on -- slack for a
+    /// device whose size we count differently than btrfs did. Beyond that the
+    /// superblock describes some other, bigger disk.
+    #[test]
+    fn a_volume_far_bigger_than_its_disk_is_refused() {
+        let disk = SECTORS as u64 * 512;
+        let edge = a_btrfs_disk();
+        edge.put(SB_AT + 0x70, disk * 2);
+        assert!(probe(&edge), "exactly twice the disk is still allowed");
+
+        let over = a_btrfs_disk();
+        over.put(SB_AT + 0x70, disk * 2 + 1);
+        assert!(!probe(&over), "one byte past the allowance is not");
+    }
+
+    /// A device that cannot even be read is not btrfs. Saying yes here sends
+    /// the mount on to open a filesystem it has no way of reading.
+    #[test]
+    fn a_disk_that_cannot_be_read_is_not_btrfs() {
+        let dev: Arc<dyn BlockScheme> = Platter::unreadable();
+        assert!(!probe_btrfs_superblock(&dev));
+    }
+
+    /// Every btrfs error reaches userspace as a specific errno, and the ones
+    /// easiest to confuse are the ones that matter: `NoSpace` is ENOSPC and
+    /// not EINVAL (a package manager retries one and gives up on the other),
+    /// `BadSuperblock` is "wrong filesystem" so `mount` goes on to try the
+    /// next type instead of reporting a broken disk, and `NotEmpty` is
+    /// ENOTEMPTY, which is what `rmdir` tells apart from ENOTDIR.
+    #[test]
+    fn each_btrfs_error_keeps_its_own_errno() {
+        let pairs = [
+            (BtrfsError::Io, FsError::DeviceError),
+            (BtrfsError::BadSuperblock, FsError::WrongFs),
+            (BtrfsError::Corrupt("t"), FsError::DeviceError),
+            (BtrfsError::Unsupported("t"), FsError::NotSupported),
+            (BtrfsError::NotFound, FsError::EntryNotFound),
+            (BtrfsError::Exists, FsError::EntryExist),
+            (BtrfsError::NotDir, FsError::NotDir),
+            (BtrfsError::IsDir, FsError::IsDir),
+            (BtrfsError::NotEmpty, FsError::DirNotEmpty),
+            (BtrfsError::NoSpace, FsError::NoDeviceSpace),
+            (BtrfsError::Invalid, FsError::InvalidParam),
+        ];
+        for (from, want) in pairs {
+            assert_eq!(map_err(from), want, "{:?}", from);
+        }
+    }
+
+    /// What `stat` answers for a file's type. Getting one wrong is not
+    /// cosmetic: a FIFO reported as a socket sends `open` into the wrong
+    /// layer, and a symlink reported as a regular file makes every path that
+    /// crosses it resolve to the link itself.
+    #[test]
+    fn each_btrfs_kind_has_its_own_vfs_type() {
+        let pairs = [
+            (FileKind::Regular, FileType::File),
+            (FileKind::Dir, FileType::Dir),
+            (FileKind::Symlink, FileType::SymLink),
+            (FileKind::CharDevice, FileType::CharDevice),
+            (FileKind::BlockDevice, FileType::BlockDevice),
+            (FileKind::Fifo, FileType::NamedPipe),
+            (FileKind::Socket, FileType::Socket),
+        ];
+        for (kind, want) in pairs {
+            assert_eq!(vfs_type(kind), want, "{:?}", kind);
+        }
+    }
+
+    /// And the way back, which is what `mknod` writes into the inode: a node
+    /// created as the wrong kind is wrong on disk, not just in one answer.
+    #[test]
+    fn each_vfs_type_has_its_own_btrfs_kind() {
+        let pairs = [
+            (FileType::File, FileKind::Regular),
+            (FileType::Dir, FileKind::Dir),
+            (FileType::SymLink, FileKind::Symlink),
+            (FileType::CharDevice, FileKind::CharDevice),
+            (FileType::BlockDevice, FileKind::BlockDevice),
+            (FileType::NamedPipe, FileKind::Fifo),
+            (FileType::Socket, FileKind::Socket),
+        ];
+        for (type_, want) in pairs {
+            assert_eq!(btrfs_kind(type_).unwrap(), want, "{:?}", type_);
+        }
+    }
+
+    fn a_stat() -> btrfs::InodeStat {
+        btrfs::InodeStat {
+            ino: 257,
+            kind: FileKind::Regular,
+            mode: 0o100_644,
+            nlink: 3,
+            uid: 1000,
+            gid: 100,
+            size: 5000,
+            nbytes: 8192,
+            rdev: 0,
+            atime: (11, 111),
+            mtime: (22, 222),
+            ctime: (33, 333),
+        }
+    }
+
+    /// `st_blocks` is counted in 512-byte units and rounds *up*: a one-byte
+    /// file still occupies a block, and `du` adds these up.
+    #[test]
+    fn the_block_count_rounds_up_in_512_byte_units() {
+        let mut st = a_stat();
+        st.nbytes = 8192;
+        let m = stat_to_metadata(&st);
+        assert_eq!(m.blk_size, 512, "the unit blocks are counted in");
+        assert_eq!(m.blocks, 16);
+
+        st.nbytes = 1;
+        assert_eq!(stat_to_metadata(&st).blocks, 1, "one byte is one block");
+
+        st.nbytes = 513;
+        assert_eq!(stat_to_metadata(&st).blocks, 2, "a part block is a block");
+    }
+
+    /// `st_size` is how long the file is; `nbytes` is what it costs on disk.
+    /// A sparse or compressed file makes the two differ, and answering the
+    /// second cuts short every read that trusts `stat`.
+    #[test]
+    fn the_size_is_the_length_and_not_what_it_occupies() {
+        let mut st = a_stat();
+        st.size = 5000;
+        st.nbytes = 8192;
+        assert_eq!(stat_to_metadata(&st).size, 5000);
+    }
+
+    /// The top bits of `st_mode` are the file type, which `Metadata` carries
+    /// separately in `type_`. Letting them through reports a directory as mode
+    /// 40755, and every tool that prints or compares permissions says so.
+    #[test]
+    fn the_file_type_bits_never_leak_into_the_mode() {
+        let mut st = a_stat();
+        st.kind = FileKind::Dir;
+        st.mode = 0o40_755;
+        let m = stat_to_metadata(&st);
+        assert_eq!(m.mode, 0o755, "permissions only");
+        assert_eq!(m.type_, FileType::Dir, "the type is carried apart");
+    }
+
+    /// Each of the three timestamps keeps its own seconds *and* its own
+    /// nanoseconds. Copying a field from its neighbour is invisible on a whole
+    /// second and shows up as a file that `make` thinks is older than itself.
+    #[test]
+    fn every_timestamp_keeps_its_own_seconds_and_nanoseconds() {
+        let m = stat_to_metadata(&a_stat());
+        assert_eq!((m.atime.sec, m.atime.nsec), (11, 111));
+        assert_eq!((m.mtime.sec, m.mtime.nsec), (22, 222));
+        assert_eq!((m.ctime.sec, m.ctime.nsec), (33, 333));
+        assert_eq!(m.inode, 257);
+        assert_eq!((m.nlinks, m.uid, m.gid), (3, 1000, 100));
+    }
+
+    fn a_tail(ino: u64, start: u64, len: usize) -> PendingWrite {
+        PendingWrite {
+            ino,
+            start,
+            data: vec![0xEE; len],
+        }
+    }
+
+    /// Where the buffered tail ends is one number with two readers: `stat`
+    /// reports it as the file's size while the tail is still in memory, and
+    /// `write_at` compares it against the incoming offset to decide whether a
+    /// write continues it. Dropping the start of the buffer makes the first
+    /// answer a file that shrank and the second accept a write that belongs
+    /// somewhere else.
+    #[test]
+    fn the_buffered_tail_ends_where_it_started_plus_what_it_holds() {
+        assert_eq!(a_tail(257, 4096, 300).end(), 4396);
+        assert_eq!(
+            a_tail(257, 0, 300).end(),
+            300,
+            "a tail that starts at the start of the file"
+        );
+    }
+
+    /// The fast path skips the `stat` that would say anything at all about the
+    /// file, so it may only be taken for a write that continues the buffered
+    /// tail of the *same* inode, exactly where it left off. Accepting any
+    /// offset for that inode splices the bytes into the buffer at the wrong
+    /// place; accepting another inode's write puts one file's bytes into
+    /// another file.
+    #[test]
+    fn only_a_contiguous_append_of_the_same_inode_takes_the_fast_path() {
+        let pw = a_tail(257, 4096, 300);
+        assert!(appends_to(&pw, 257, 4396), "right where it left off");
+        assert!(!appends_to(&pw, 257, 4096), "back at the start of the tail");
+        assert!(!appends_to(&pw, 257, 4395), "one byte back is an overwrite");
+        assert!(!appends_to(&pw, 257, 4397), "one byte on leaves a hole");
+        assert!(!appends_to(&pw, 258, 4396), "another file entirely");
+    }
+
+    /// The buffer exists to turn the ~32000 tiny writes of a big package
+    /// extraction into a few hundred large ones, so the threshold is a
+    /// megabyte, and the boundary belongs to the filesystem: a write *of* the
+    /// flush size is already large enough to go straight through.
+    #[test]
+    fn the_flush_size_is_the_first_length_not_worth_buffering() {
+        assert!(worth_buffering(0));
+        assert!(worth_buffering(WRITE_BUF_FLUSH - 1));
+        assert!(!worth_buffering(WRITE_BUF_FLUSH));
+        assert!(!worth_buffering(WRITE_BUF_FLUSH + 1));
+        assert!(
+            WRITE_BUF_FLUSH >= 1024 * 1024,
+            "a buffer under a megabyte gives the coalescing back"
+        );
+    }
+
+    /// Reading a symlink pages like any other read: `read(2)` is what advances
+    /// the file position, so a second call asks for the rest. Ignoring what is
+    /// left fills whatever the caller's buffer can hold and reports having
+    /// read it, which for an 18-byte target and a 4 KiB buffer is 4 KiB of
+    /// somebody else's memory handed back as the link.
+    #[test]
+    fn reading_a_run_of_bytes_never_goes_past_its_end() {
+        let target = b"/usr/lib/libc.so.6";
+        let mut buf = [0u8; 64];
+        assert_eq!(read_from(target, 0, &mut buf), target.len());
+        assert_eq!(&buf[..target.len()], target);
+        assert!(
+            buf[target.len()..].iter().all(|&b| b == 0),
+            "and writes nothing past what it read"
+        );
+
+        let mut small = [0u8; 4];
+        assert_eq!(read_from(target, 0, &mut small), 4);
+        assert_eq!(&small, b"/usr");
+        assert_eq!(read_from(target, 4, &mut small), 4, "and on from there");
+        assert_eq!(&small, b"/lib");
+
+        let mut tail = [0u8; 64];
+        assert_eq!(read_from(target, 15, &mut tail), 3, "only what is left");
+        assert_eq!(&tail[..3], b"o.6");
+        assert_eq!(read_from(target, target.len(), &mut tail), 0, "at the end");
+        assert_eq!(
+            read_from(target, target.len() + 99, &mut tail),
+            0,
+            "past it"
+        );
     }
 }

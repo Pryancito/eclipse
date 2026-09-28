@@ -36,6 +36,34 @@ use super::block_mount::{backend_size, device_from_backend, MountBackend};
 /// Tamaño máximo que FAT puede representar en una entrada de directorio.
 const FAT_MAX_FILE_SIZE: u64 = u32::MAX as u64;
 
+/// ¿Cabe en FAT el rango `[offset, offset + len)`? El límite es el último byte
+/// que **cabe**, no el primero que sobra: un fichero de exactamente
+/// `FAT_MAX_FILE_SIZE` bytes es legal. La suma satura porque un desplazamiento
+/// enorme más un largo cualquiera envolvía a un offset pequeño, que pasaba la
+/// comprobación y aterrizaba dentro del fichero.
+///
+/// La misma regla la preguntan `write_at` y `resize`; estaba escrita en los
+/// dos, y el lado permitido de la frontera no lo podía mirar ningún test,
+/// porque llegar a él es extender un fichero hasta 4 GiB.
+fn fits_in_fat(offset: u64, len: u64) -> bool {
+    offset.saturating_add(len) <= FAT_MAX_FILE_SIZE
+}
+
+/// Qué contesta una escritura que acabó sin mover un solo byte.
+///
+/// Los dos casos se veían iguales desde dentro del bucle y salían los dos como
+/// `ENOSPC`: **escribir cero bytes es legal** y contesta cero, mientras que
+/// pedir bytes y no colocar ninguno sí es que el volumen está lleno. Con los
+/// dos confundidos, un `write(fd, buf, 0)` --que `truncate`, `tee` y cualquier
+/// copia con un trozo vacío hacen a diario-- fallaba con «no queda espacio» en
+/// un disco medio vacío.
+fn wrote(done: usize, asked: usize) -> rcore_fs::vfs::Result<usize> {
+    if done == 0 && asked > 0 {
+        return Err(FsError::NoDeviceSpace);
+    }
+    Ok(done)
+}
+
 /// Trozo de ceros usado para extender un fichero al escribir más allá del
 /// final. Un búfer en la pila evita reservar memoria en el camino de escritura.
 const ZERO_CHUNK: usize = 4096;
@@ -575,7 +603,7 @@ impl INode for FatMountINode {
             return Ok(0);
         }
         let offset = offset as u64;
-        if offset.saturating_add(buf.len() as u64) > FAT_MAX_FILE_SIZE {
+        if !fits_in_fat(offset, buf.len() as u64) {
             return Err(FsError::InvalidParam);
         }
         let guard = self.fs.inner.lock();
@@ -611,10 +639,7 @@ impl INode for FatMountINode {
         drop(file);
         drop(guard);
         self.fs.invalidate_dir(self.parent_dir());
-        if done == 0 {
-            return Err(FsError::NoDeviceSpace);
-        }
-        Ok(done)
+        wrote(done, buf.len())
     }
 
     fn poll(&self) -> rcore_fs::vfs::Result<PollStatus> {
@@ -873,7 +898,7 @@ impl INode for FatMountINode {
             return Err(FsError::IsDir);
         }
         let len = len as u64;
-        if len > FAT_MAX_FILE_SIZE {
+        if !fits_in_fat(0, len) {
             return Err(FsError::InvalidParam);
         }
         let guard = self.fs.inner.lock();
@@ -1309,6 +1334,471 @@ mod fat_tests {
         // Positioned exactly at the end of the device.
         assert!(disk.write(&[1u8; 16]).is_err());
         assert_eq!(disk.read(&mut [0u8; 16]).unwrap(), 0);
+    }
+
+    /// The inode number is a plain FNV-1a of the path, pinned here against the
+    /// algorithm's own published vectors. It has to be a *hash* and not just
+    /// any mixing: with the multiply dropped, `a/b` and `b/a` fold to the same
+    /// number, and two different files then share an `(st_dev, st_ino)`, which
+    /// is exactly the pair `cp` uses to decide two names are one file and
+    /// refuse the copy.
+    #[test]
+    fn the_inode_number_is_the_published_fnv_1a_of_the_path() {
+        assert_eq!(fnv1a_path(""), 0xcbf2_9ce4_8422_2325, "the offset basis");
+        assert_eq!(fnv1a_path("a"), 0xaf63_dc4c_8601_ec8c);
+        assert_eq!(fnv1a_path("foobar"), 0x8594_4171_f739_67e8);
+        assert_ne!(
+            fnv1a_path("a/b"),
+            fnv1a_path("b/a"),
+            "the same bytes in another order are another path"
+        );
+    }
+
+    /// February is the month the civil-date pair disagrees about: both halves
+    /// count the year as ending in February, so a March-to-January date round
+    /// trips even when that rule is broken in one of them. Two of these are
+    /// leap days and one is 2100, which is *not* a leap year -- the century
+    /// rule the conversion has to get right.
+    #[test]
+    fn a_date_in_february_survives_the_round_trip_too() {
+        for &secs in &[
+            318_211_200i64, // 1980-02-01, the floor of the DOS calendar
+            951_782_400,    // 2000-02-29, a leap day of a leap century
+            1_709_210_060,  // 2024-02-29 12:34:20
+            4_107_499_220,  // 2100-02-28, a year the century rule makes short
+        ] {
+            assert_eq!(unix_from_dos(dos_from_unix(secs)), secs, "{}", secs);
+        }
+        let d = dos_from_unix(1_709_210_060).date;
+        assert_eq!((d.year, d.month, d.day), (2024, 2, 29));
+        let d = dos_from_unix(4_107_499_220).date;
+        assert_eq!((d.year, d.month, d.day), (2100, 2, 28));
+    }
+
+    /// The three test dates the round trip already had all fall in the first
+    /// half of their minute, so the seconds could be counted modulo anything
+    /// from 30 up and nothing said so. A file saved at :45 would come back
+    /// stamped at :15, and `make` compares mtimes.
+    #[test]
+    fn the_clock_splits_the_day_into_hours_minutes_and_seconds() {
+        // 1995-06-15 23:59:59: the last second of the last minute of the day.
+        let secs = 803_260_799i64;
+        let t = dos_from_unix(secs).time;
+        assert_eq!((t.hour, t.min, t.sec), (23, 59, 59));
+        assert_eq!(unix_from_dos(dos_from_unix(secs)), secs);
+        // And a second past the half minute, which is where a modulo 30 shows.
+        let secs = 803_260_845i64; // 1995-06-16 00:00:45
+        let t = dos_from_unix(secs).time;
+        assert_eq!(t.sec, 45, "seconds are counted to 60 and not to 30");
+        assert_eq!(unix_from_dos(dos_from_unix(secs)), secs);
+    }
+
+    /// The clamp pins a whole date, not just its year. Only the year was ever
+    /// asserted, so the month, day and time it lands on were whatever the
+    /// literals said: an uninitialised clock could stamp every file it creates
+    /// 1980-06-01, and the ceiling could land on the 1st of December.
+    #[test]
+    fn a_clamped_date_is_a_whole_date_and_not_just_a_year() {
+        let floor = dos_from_unix(0);
+        assert_eq!(
+            (floor.date.year, floor.date.month, floor.date.day),
+            (1980, 1, 1),
+            "the floor is the first day of the calendar"
+        );
+        assert_eq!((floor.time.hour, floor.time.min, floor.time.sec), (0, 0, 0));
+
+        let ceiling = dos_from_unix(i64::MAX / 2);
+        assert_eq!(
+            (ceiling.date.year, ceiling.date.month, ceiling.date.day),
+            (2107, 12, 31),
+            "and the ceiling is the last one"
+        );
+        assert_eq!(
+            (ceiling.time.hour, ceiling.time.min, ceiling.time.sec),
+            (23, 59, 59)
+        );
+    }
+
+    /// 1980 is the first year the DOS calendar *can* hold, so a date inside it
+    /// is not out of range and keeps its own month, day and time. Throwing it
+    /// to the floor as well would flatten the timestamps of everything written
+    /// in the first year the format allows.
+    #[test]
+    fn the_first_year_the_calendar_holds_is_not_clamped() {
+        let secs = 329_912_430i64; // 1980-06-15 10:20:30
+        let d = dos_from_unix(secs);
+        assert_eq!(
+            (d.date.year, d.date.month, d.date.day),
+            (1980, 6, 15),
+            "a date inside the calendar is left alone"
+        );
+        assert_eq!((d.time.hour, d.time.min, d.time.sec), (10, 20, 30));
+        assert_eq!(unix_from_dos(d), secs);
+    }
+
+    /// A device the test drives byte for byte, so the stream view of the disk
+    /// can be asked the three questions a formatted volume never reaches: a
+    /// read that runs off the end of the volume, a write the device declines
+    /// without moving anything, and a short transfer.
+    struct Shelf {
+        bytes: Mutex<Vec<u8>>,
+        /// Move at most this many bytes per transfer.
+        moves_at_most: usize,
+        /// Accept a write and report having moved nothing.
+        moves_nothing: bool,
+    }
+
+    impl Shelf {
+        fn of(len: usize) -> Arc<Self> {
+            Self::with(len, usize::MAX, false)
+        }
+        fn moving_at_most(len: usize, n: usize) -> Arc<Self> {
+            Self::with(len, n, false)
+        }
+        fn moving_nothing(len: usize) -> Arc<Self> {
+            Self::with(len, usize::MAX, true)
+        }
+        fn with(len: usize, moves_at_most: usize, moves_nothing: bool) -> Arc<Self> {
+            let mut bytes = vec![0u8; len];
+            // A recognisable pattern, so bytes read from beyond the volume are
+            // not a coincidence of zeros.
+            for (i, b) in bytes.iter_mut().enumerate() {
+                *b = (i % 251) as u8 | 1;
+            }
+            Arc::new(Self {
+                bytes: Mutex::new(bytes),
+                moves_at_most,
+                moves_nothing,
+            })
+        }
+    }
+
+    impl Device for Shelf {
+        fn read_at(&self, offset: usize, buf: &mut [u8]) -> rcore_fs::dev::Result<usize> {
+            let d = self.bytes.lock();
+            if offset >= d.len() {
+                return Err(rcore_fs::dev::DevError);
+            }
+            let n = buf.len().min(d.len() - offset).min(self.moves_at_most);
+            buf[..n].copy_from_slice(&d[offset..offset + n]);
+            Ok(n)
+        }
+        fn write_at(&self, offset: usize, buf: &[u8]) -> rcore_fs::dev::Result<usize> {
+            if self.moves_nothing {
+                return Ok(0);
+            }
+            let mut d = self.bytes.lock();
+            if offset >= d.len() {
+                return Err(rcore_fs::dev::DevError);
+            }
+            let n = buf.len().min(d.len() - offset).min(self.moves_at_most);
+            d[offset..offset + n].copy_from_slice(&buf[..n]);
+            Ok(n)
+        }
+        fn sync(&self) -> rcore_fs::dev::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn a_disk_view(dev: Arc<Shelf>, len: u64) -> FatDisk {
+        FatDisk { dev, len, pos: 0 }
+    }
+
+    /// The device is bigger than the volume on it -- a partition, or a disk
+    /// with a tail of slack -- so a read that starts inside the volume has to
+    /// stop at the volume's end and not walk into whatever follows it. Every
+    /// `fatfs` read goes through here, so this clamp is the only thing between
+    /// a corrupt cluster chain and the bytes of the next partition.
+    #[test]
+    fn a_read_stops_at_the_end_of_the_volume_not_of_the_device() {
+        let disk = a_disk_view(Shelf::of(4096), 1024);
+        let mut buf = [0u8; 64];
+        let n = disk.read_bytes(1000, &mut buf).unwrap();
+        assert_eq!(n, 24, "only the 24 bytes the volume has left");
+        assert!(
+            buf[24..].iter().all(|&b| b == 0),
+            "and not one byte from past its end"
+        );
+        assert_eq!(
+            disk.read_bytes(1024, &mut buf).unwrap(),
+            0,
+            "a read that starts at the end reads nothing"
+        );
+    }
+
+    /// A write the device accepted without moving a byte is not a short write,
+    /// it is a failure. Answering `Ok(0)` tells the loop above "nothing went
+    /// wrong, carry on", and it spins on the same offset for ever while the
+    /// data is quietly lost.
+    #[test]
+    fn a_write_that_moved_nothing_is_an_error_and_not_a_short_write() {
+        let disk = a_disk_view(Shelf::moving_nothing(4096), 4096);
+        assert!(disk.write_bytes(0, b"hola").is_err());
+    }
+
+    /// The stream advances by what the device actually moved. Advancing by
+    /// what was *asked* leaves the position past bytes that were never read,
+    /// and `fatfs` walks the cluster chain from that position: every read
+    /// after a short one lands in the wrong cluster.
+    #[test]
+    fn the_stream_advances_by_what_was_read_and_not_by_what_was_asked() {
+        let mut disk = a_disk_view(Shelf::moving_at_most(4096, 16), 4096);
+        let mut buf = [0u8; 64];
+        assert_eq!(disk.read(&mut buf).unwrap(), 16, "the device moved 16");
+        assert_eq!(disk.pos, 16, "so the stream moved 16, not 64");
+        assert_eq!(
+            disk.seek(SeekFrom::Current(0)).unwrap(),
+            16,
+            "and that is where the next read starts"
+        );
+    }
+
+    /// `create` hands back an inode carrying the name **as it was typed**,
+    /// while the directory holds the name as FAT stored it -- `BOOTX64.EFI` on
+    /// a volume written by another system. `stat` on that inode still has to
+    /// find its own entry; comparing exactly answers EntryNotFound instead,
+    /// and the file "disappears" between opening it and looking at it. The
+    /// same rule is written twice in this file, and only `find`'s copy had a
+    /// test.
+    #[test]
+    fn stat_finds_its_entry_whatever_case_the_path_reached_us_in() {
+        let (_blk, fs) = mount_default();
+        let root = fs.root_inode();
+        let file = create_file(&root, "BOOTX64.EFI");
+        file.write_at(0, b"MZ").unwrap();
+
+        let as_typed = FatMountINode {
+            fs: fs.clone(),
+            path: String::from("bootx64.efi"),
+            is_dir: false,
+        };
+        let m = as_typed
+            .metadata()
+            .expect("stat of the same file spelled in another case");
+        assert_eq!(m.size, 2);
+    }
+
+    /// The largest file FAT can represent is `FAT_MAX_FILE_SIZE` bytes long,
+    /// so a write whose last byte lands exactly there still fits: the limit is
+    /// the last byte that *fits*, not the first that spills. Neither of the
+    /// two places this rule is written could be asked about its allowed side
+    /// before, because reaching it means growing a file to 4 GiB; `fits_in_fat`
+    /// is the one rule, and both callers ask it.
+    #[test]
+    fn the_size_limit_is_the_last_byte_that_fits() {
+        assert!(
+            fits_in_fat(0, FAT_MAX_FILE_SIZE),
+            "a file of exactly the max"
+        );
+        assert!(
+            fits_in_fat(FAT_MAX_FILE_SIZE - 1, 1),
+            "a one-byte write onto the last byte"
+        );
+        assert!(!fits_in_fat(FAT_MAX_FILE_SIZE, 1), "one byte past it");
+        assert!(!fits_in_fat(0, FAT_MAX_FILE_SIZE + 1));
+        assert!(
+            !fits_in_fat(u64::MAX, 1),
+            "and the sum saturates instead of wrapping to a small offset"
+        );
+    }
+
+    /// A write that could not place a single byte is ENOSPC, not a silent
+    /// zero: `write(2)` returning 0 for a non-empty buffer tells the caller
+    /// "nothing to do here", so `cp` onto a full volume finishes happily and
+    /// leaves a truncated file behind.
+    #[test]
+    fn a_write_onto_a_full_volume_is_enospc_and_not_a_silent_zero() {
+        // A small volume, so filling it is a handful of writes.
+        let (_blk, fs) = mount(2048); // 1 MiB
+        let root = fs.root_inode();
+        let file = create_file(&root, "fill.bin");
+        let chunk = vec![0xABu8; 64 * 1024];
+
+        let mut at = 0usize;
+        let mut full = None;
+        for _ in 0..64 {
+            match file.write_at(at, &chunk) {
+                Ok(n) => at += n,
+                Err(e) => {
+                    full = Some(e);
+                    break;
+                }
+            }
+        }
+        let e = full.expect("the volume should have run out within 4 MiB");
+        assert_eq!(e, FsError::NoDeviceSpace, "a full volume answers ENOSPC");
+        // And it keeps answering it, rather than settling into `Ok(0)`.
+        assert_eq!(
+            file.write_at(at, &chunk).unwrap_err(),
+            FsError::NoDeviceSpace
+        );
+    }
+
+    /// Writing nothing is not the same as failing to write something.
+    ///
+    /// The loop that places the bytes ends with `done == 0` in two very
+    /// different situations: nobody asked for any bytes, and the volume would
+    /// not take the ones that were asked for. Only the second is `ENOSPC`.
+    /// `write(fd, buf, 0)` is a legal call that returns 0, and `truncate`,
+    /// `tee` and every copy that hits an empty chunk make it routinely.
+    #[test]
+    fn writing_nothing_succeeds_and_writing_into_nothing_does_not() {
+        assert_eq!(wrote(0, 0), Ok(0), "an empty write is a no-op, not ENOSPC");
+        assert_eq!(
+            wrote(0, 4096),
+            Err(FsError::NoDeviceSpace),
+            "asking for bytes and placing none is a full volume"
+        );
+        assert_eq!(wrote(7, 4096), Ok(7), "a short write is still a write");
+        assert_eq!(wrote(4096, 4096), Ok(4096));
+    }
+
+    /// And the same through the real mount: a zero-length `write_at` on a
+    /// volume with plenty of room answers `Ok(0)` and leaves the file alone.
+    #[test]
+    fn a_zero_length_write_answers_zero_and_changes_nothing() {
+        let (_blk, fs) = mount_default();
+        let root = fs.root_inode();
+        let file = create_file(&root, "empty.bin");
+
+        file.write_at(0, b"abcd").unwrap();
+        assert_eq!(file.write_at(4, &[]), Ok(0));
+        assert_eq!(file.metadata().unwrap().size, 4, "nothing was appended");
+
+        let mut back = [0u8; 4];
+        file.read_at(0, &mut back).unwrap();
+        assert_eq!(&back, b"abcd");
+    }
+
+    /// `st_blocks` counts 512-byte blocks and rounds **up**: every file that
+    /// has any content at all occupies at least one. Rounding down reports a
+    /// 100-byte file as taking no space, and `du`, `tar --sparse` and every
+    /// quota check add these up.
+    #[test]
+    fn the_block_count_of_a_file_rounds_up() {
+        let (_blk, fs) = mount_default();
+        let root = fs.root_inode();
+        let file = create_file(&root, "small.bin");
+
+        file.write_at(0, &[7u8; 100]).unwrap();
+        let m = file.metadata().unwrap();
+        assert_eq!(m.size, 100);
+        assert_eq!(m.blocks, 1, "100 bytes still occupy a block");
+
+        file.resize(512).unwrap();
+        assert_eq!(file.metadata().unwrap().blocks, 1, "exactly one block");
+
+        file.resize(513).unwrap();
+        assert_eq!(
+            file.metadata().unwrap().blocks,
+            2,
+            "and one byte over is two"
+        );
+    }
+
+    /// A directory has at least two links, `.` and its entry in its parent.
+    /// Reporting one is what makes `find`'s leaf optimisation stop descending:
+    /// a tree with `st_nlink == 1` on every directory looks like it has no
+    /// subdirectories at all, so `find` and `du` walk right past them.
+    #[test]
+    fn a_directory_has_two_links_and_a_file_has_one() {
+        let (_blk, fs) = mount_default();
+        let root = fs.root_inode();
+        let dir = root.create("sub", FileType::Dir, 0o755).unwrap();
+        let file = create_file(&root, "plain.txt");
+
+        assert_eq!(root.metadata().unwrap().nlinks, 2, "the root");
+        assert_eq!(dir.metadata().unwrap().nlinks, 2, "a subdirectory");
+        assert_eq!(file.metadata().unwrap().nlinks, 1, "a file");
+        assert_eq!(root.metadata().unwrap().mode, 0o755, "and a dir is 0755");
+        assert_eq!(file.metadata().unwrap().mode, 0o644, "a file 0644");
+    }
+
+    /// The size field of a **directory** entry is meaningless on disk -- the
+    /// FAT spec says so and `fatfs` hands it back raw -- so `stat` answers 0
+    /// whatever it holds. A volume formatted by another system (or a corrupt
+    /// one) can carry any number there, and passing it through makes `ls -l`
+    /// print a size for a directory and a `read` of it ask for that many
+    /// bytes.
+    #[test]
+    fn a_directory_has_no_size_whatever_its_entry_says() {
+        let block = MockBlock::new(128 * 1024);
+        let backend = MountBackend::Block(block.clone());
+        {
+            let mut disk = FatDisk {
+                dev: device_from_backend(&backend).unwrap(),
+                len: 128 * 1024 * 512,
+                pos: 0,
+            };
+            fatfs::format_volume(&mut disk, fatfs::FormatVolumeOptions::new()).unwrap();
+        }
+        let fs = FatMountFs::open(&backend).unwrap();
+        fs.root_inode()
+            .create("SUBDIR", FileType::Dir, 0o755)
+            .unwrap();
+        fs.sync().unwrap();
+        drop(fs);
+
+        // Write a size into the directory's own entry, the way a volume from
+        // another system can arrive. The 8.3 name is unique on the volume, and
+        // the size field is the last four bytes of its 32-byte entry.
+        {
+            let mut sectors = block.sectors.lock();
+            let at = sectors
+                .windows(11)
+                .position(|w| w == b"SUBDIR     ")
+                .expect("the short name of the directory");
+            sectors[at + 28..at + 32].copy_from_slice(&4096u32.to_le_bytes());
+        }
+
+        let fs = FatMountFs::open(&backend).unwrap();
+        let dir = fs.root_inode().find("SUBDIR").unwrap();
+        let m = dir.metadata().unwrap();
+        assert_eq!(m.type_, FileType::Dir, "it is still a directory");
+        assert_eq!(m.size, 0, "and a directory has no size");
+        assert_eq!(m.blocks, 0);
+    }
+
+    /// `poll` is what `select`/`epoll` answer with, and a directory is never
+    /// writable: saying it is tells a poller that a `write` on a directory fd
+    /// will succeed, so it keeps waking up to try one that can only ever come
+    /// back EISDIR.
+    #[test]
+    fn a_directory_is_never_reported_as_writable() {
+        let (_blk, fs) = mount_default();
+        let root = fs.root_inode();
+        let file = create_file(&root, "w.txt");
+
+        let d = root.poll().unwrap();
+        assert!(d.read, "a directory can be read");
+        assert!(!d.write, "but never written");
+
+        let f = file.poll().unwrap();
+        assert!(f.read && f.write, "a file is both");
+    }
+
+    /// `statfs` reports how many blocks the volume has and how many are free,
+    /// in that order. Swapping them is `df` showing a volume with more free
+    /// space than it has space, which is where an installer decides it has
+    /// room and a package manager decides it has none.
+    #[test]
+    fn statfs_reports_the_total_and_then_what_is_free() {
+        let (_blk, fs) = mount_default();
+        let root = fs.root_inode();
+        let file = create_file(&root, "ocupa.bin");
+        file.write_at(0, &[1u8; 200_000]).unwrap();
+
+        let info = fs.info();
+        assert!(info.blocks > 0, "the volume has blocks");
+        assert!(
+            info.bfree < info.blocks,
+            "and fewer free ({}) than it has ({})",
+            info.bfree,
+            info.blocks
+        );
+        assert_eq!(info.bavail, info.bfree, "nothing is reserved on FAT");
+        assert_eq!(info.bsize, info.frsize, "one cluster, one unit");
+        assert_eq!(info.namemax, 255);
     }
 
     mod interop {
