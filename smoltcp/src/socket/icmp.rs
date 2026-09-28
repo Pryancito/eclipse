@@ -524,7 +524,6 @@ impl<'a> From<IcmpSocket<'a>> for Socket<'a> {
 #[cfg(test)]
 mod tests_common {
     pub use super::*;
-    pub use crate::phy::DeviceCapabilities;
     pub use crate::wire::IpAddress;
 
     pub fn buffer(packets: usize) -> IcmpSocketBuffer<'static> {
