@@ -115,6 +115,15 @@ pub fn proc_content() -> String {
     alloc::format!("{}\n", current_name())
 }
 
+/// Serializes the tests that move the global layout.
+///
+/// [`LAYOUT`] is one word for the whole kernel and `cargo test` runs the tests
+/// in parallel threads, so a `set("us")` followed by `current_name() == "us"`
+/// only holds if nothing wrote in between. Every test that writes the layout
+/// takes this first -- here and in `fs::procfs`, where `/proc/sys/kbd` does.
+#[cfg(test)]
+pub(crate) static LAYOUT_TEST_LOCK: spin::Mutex<()> = spin::Mutex::new(());
+
 pub fn set(name: &str) -> rcore_fs::vfs::Result<()> {
     let layout = Layout::from_name(name).ok_or(rcore_fs::vfs::FsError::InvalidParam)?;
     LAYOUT.store(layout as u8, Ordering::Relaxed);
@@ -313,6 +322,7 @@ mod tests {
 
     #[test]
     fn set_rejects_unknown() {
+        let _guard = LAYOUT_TEST_LOCK.lock();
         assert!(set("de").is_err());
         set("es").unwrap();
         assert_eq!(current_name(), "es");
