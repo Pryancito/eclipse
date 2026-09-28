@@ -593,6 +593,161 @@ mod tests {
         assert!(port.wait().now_or_never().is_none());
     }
 
+    /// `handle_closed` decides whether a wait still has anybody behind it,
+    /// and **both of its answers matter**. The tests that already watch it go
+    /// through `cancel`, which reaches the same `NOT_FOUND` by another road
+    /// when the observer is still in place, so inverting the whole predicate
+    /// passed green. Asking the queue directly is what tells the two apart.
+    #[test]
+    fn a_wait_queues_a_packet_only_while_its_handle_is_still_open() {
+        // Still open: the signal queues, which is the half that an inverted
+        // `handle_closed` throws away.
+        let port = Port::new(0).unwrap();
+        let object = DummyObject::new() as Arc<dyn KernelObject>;
+        let (alive, receiver) = futures::channel::oneshot::channel();
+        port.wait_async(
+            &object,
+            (1, 4),
+            7,
+            Signal::READABLE,
+            WaitAsyncOptions::empty(),
+            Some(receiver),
+        )
+        .unwrap();
+        assert_eq!(port.len(), 0);
+        object.signal_set(Signal::READABLE);
+        assert_eq!(
+            port.len(),
+            1,
+            "a wait whose handle is still open queued nothing"
+        );
+        drop(alive);
+
+        // Closed before the signal: nothing queues at all.
+        let port = Port::new(0).unwrap();
+        let object = DummyObject::new() as Arc<dyn KernelObject>;
+        let (sender, receiver) = futures::channel::oneshot::channel();
+        port.wait_async(
+            &object,
+            (1, 4),
+            7,
+            Signal::READABLE,
+            WaitAsyncOptions::empty(),
+            Some(receiver),
+        )
+        .unwrap();
+        drop(sender);
+        object.signal_set(Signal::READABLE);
+        assert_eq!(
+            port.len(),
+            0,
+            "a wait whose handle is gone queued a packet for nobody"
+        );
+    }
+
+    /// One port holds `MAX_ALLOCATED_PACKET_COUNT / 8` user packets, and the
+    /// limit is **inclusive**: the one that reaches it is the last one in.
+    /// Without a test, both the eighth of the budget and the off-by-one at
+    /// the edge passed green -- and this is the cap that stops one process
+    /// from putting the kernel heap into a port nobody drains.
+    #[test]
+    fn a_port_holds_an_eighth_of_the_packet_budget_and_not_one_more() {
+        assert_eq!(
+            MAX_ALLOCATED_PACKET_COUNT_PER_PORT,
+            MAX_ALLOCATED_PACKET_COUNT / 8,
+            "the per-port share is not an eighth any more"
+        );
+
+        let port = Port::new(0).unwrap();
+        let packet = || PortPacketRepr {
+            key: 1,
+            status: 0,
+            data: PayloadRepr::User([0; 32]),
+        };
+        for i in 0..MAX_ALLOCATED_PACKET_COUNT_PER_PORT {
+            port.push_user(packet())
+                .unwrap_or_else(|e| panic!("packet {} of the budget was refused: {:?}", i, e));
+        }
+        assert_eq!(port.len(), MAX_ALLOCATED_PACKET_COUNT_PER_PORT);
+        assert_eq!(
+            port.push_user(packet()).err(),
+            Some(ZxError::SHOULD_WAIT),
+            "the port took one past its own limit"
+        );
+        assert_eq!(port.len(), MAX_ALLOCATED_PACKET_COUNT_PER_PORT);
+    }
+
+    /// Cancelling a *handle*'s waits must not sweep up the user packets
+    /// somebody else queued under the same key. Only `cancel(None, key)`
+    /// reaches those, and with the source dropped from the test the two cases
+    /// were indistinguishable.
+    #[test]
+    fn cancelling_one_handle_leaves_the_user_packets_alone() {
+        let port = Port::new(0).unwrap();
+        let object = DummyObject::new() as Arc<dyn KernelObject>;
+        port.wait_async(
+            &object,
+            (1, 4),
+            7,
+            Signal::READABLE,
+            WaitAsyncOptions::empty(),
+            None,
+        )
+        .unwrap();
+        port.push_user(PortPacketRepr {
+            key: 7,
+            status: 0,
+            data: PayloadRepr::User([0; 32]),
+        })
+        .unwrap();
+        assert_eq!(port.len(), 1);
+
+        // Cancelling the handle's wait takes the wait and nothing else.
+        port.cancel(Some((1, 4)), 7).unwrap();
+        assert_eq!(
+            port.len(),
+            1,
+            "cancelling a handle threw away a user packet that was not its own"
+        );
+
+        // Cancelling without a source is what reaches the user packet.
+        port.cancel(None, 7).unwrap();
+        assert_eq!(port.len(), 0);
+    }
+
+    /// A port created with `BIND_TO_INTERUPT` that is only carrying ordinary
+    /// packets still has to drop `READABLE` when the last one leaves.
+    ///
+    /// The condition in `wait` reads "the queue is empty **and** either there
+    /// are no interrupts waiting **or** this port would not deliver them
+    /// anyway". Turning that `or` into an `and` leaves a bound port that has
+    /// no interrupts pending asserting `READABLE` over an empty queue, and
+    /// the next `wait` on it spins: `wait_signal(READABLE)` returns at once,
+    /// finds nothing to pop, and goes round again. Every test here used an
+    /// unbound port, where the second half of the `or` is true and hides it.
+    #[test]
+    fn a_port_bound_to_interrupts_goes_quiet_when_its_last_packet_leaves() {
+        use futures::FutureExt;
+        let port = Port::new(PortOptions::BIND_TO_INTERUPT.bits()).unwrap();
+        assert!(port.can_bind_to_interrupt());
+
+        port.push_user(PortPacketRepr {
+            key: 3,
+            status: 0,
+            data: PayloadRepr::User([0; 32]),
+        })
+        .unwrap();
+        assert_eq!(port.signal(), Signal::READABLE);
+
+        assert_eq!(port.wait().now_or_never().unwrap().key, 3);
+        assert_eq!(port.len(), 0);
+        assert_eq!(
+            port.signal(),
+            Signal::empty(),
+            "an empty port is still telling waiters it has something"
+        );
+    }
+
     #[test]
     fn observers_do_not_keep_ports_alive() {
         let object = DummyObject::new() as Arc<dyn KernelObject>;
