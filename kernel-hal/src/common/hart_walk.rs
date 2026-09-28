@@ -502,6 +502,21 @@ mod tests {
     }
 
     #[test]
+    fn a_hart_with_neither_a_stack_nor_room_is_reported_for_the_stack() {
+        // Both reasons are true of hart 9 at once, and the boot log prints
+        // one of them. "No stack" is a property of the hart itself -- its id
+        // is past the array, and it would be skipped on an otherwise empty
+        // machine too -- while "no room" is a property of how far the walk
+        // has got. Printing the second sends whoever reads the log to
+        // `MAX_CORE_NUM`, which is not what is wrong with this board.
+        let see = See::new(&[1, 9]);
+        let nodes = [node("cpu@0"), node("cpu@1"), node("cpu@9")];
+        let (handed, skipped, _) = walk(0, 8, 1, &nodes, &see);
+        assert_eq!(handed, [1]);
+        assert_eq!(skipped, [(0, Skip::BootHart), (9, Skip::NoStack)]);
+    }
+
+    #[test]
     fn the_highest_hart_the_boot_stack_holds_is_a_usable_one() {
         // The bound is a count of slots, so the last usable id is one below
         // it. An off-by-one here silently costs the top core of every board
@@ -586,6 +601,20 @@ mod tests {
         // `from_str_radix` takes a sign; a device-tree unit address does not.
         assert_eq!(parse_hart_id("cpu@+1"), None);
         assert_eq!(parse_hart_id("cpu@-1"), None);
+    }
+
+    #[test]
+    fn only_the_first_cell_of_a_unit_address_names_the_hart() {
+        // `cpu@1,0` cannot tell "the first cell" from "everything but the
+        // last": with two cells they are the same string, and two cells is
+        // all the tests above use. Three separate them, and reading all but
+        // the last gives `"1,0"`, which is not hex -- so the hart is not
+        // parsed at all and the board comes up with the cores the walk could
+        // name and one line about the one it could not.
+        assert_eq!(parse_hart_id("cpu@1,0,0"), Some(1));
+        assert_eq!(parse_hart_id("cpu@ff,0,0"), Some(0xff));
+        // ...and the cells after the first are not read, whatever they hold.
+        assert_eq!(parse_hart_id("cpu@2,zz"), Some(2));
     }
 
     #[test]
