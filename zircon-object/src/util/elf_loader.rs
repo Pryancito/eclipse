@@ -484,16 +484,27 @@ fn make_vmo(elf: &ElfFile, ph: ProgramHeader) -> ZxResult<Arc<VmObject>> {
 /// Map one LOAD segment by borrowing from the exec image VMO.
 ///
 /// This is the hot path for `fork+exec` of large binaries (Firefox content
-/// processes): the image is already in `ELF_VMO_CACHE`, and each LOAD becomes
-/// a `MAP_PRIVATE`-shaped borrower instead of a full byte copy. BSS
-/// (`p_memsz > p_filesz`) stays demand-zero past the visible file window.
-/// Falls back to [`make_vmo`] when the image cannot cover the file bytes
-/// (truncated cache entry, hostile headers).
+/// processes): the image is already in `ELF_VMO_CACHE`, and each **read-only**
+/// LOAD becomes a `MAP_PRIVATE`-shaped borrower instead of a full byte copy.
+/// Writable segments (`.data` / BSS) always take a private copy: borrowing
+/// them left busybox (and other static musl binaries) with corrupt globals —
+/// near-null faults like `READ @ 0x2a` with `rbx=2` — because the first write
+/// path / BSS pad on a capped borrower did not match the eager `make_vmo`
+/// semantics those programs rely on at startup.
+///
+/// Falls back to [`make_vmo`] for writable segments, misaligned headers, or
+/// when the image cannot cover the file bytes.
 fn make_vmo_from_image(
     elf: &ElfFile,
     image: &Arc<VmObject>,
     ph: ProgramHeader,
 ) -> ZxResult<Arc<VmObject>> {
+    // Writable LOADs must be private copies. Sharing the ELF cache through a
+    // borrower for `.data` corrupted process state on the first exec after the
+    // borrow path landed (busybox SIGSEGV @ 0x2a during eclipse-init bring-up).
+    if ph.flags().is_write() {
+        return make_vmo(elf, ph);
+    }
     let page_offset = ph.virtual_addr() as usize % PAGE_SIZE;
     let pages = segment_pages(ph.mem_size(), page_offset)?;
     let file_off = ph.offset() as usize;
@@ -2101,6 +2112,36 @@ mod tests {
         assert_eq!(&buf, b"0123456789abcdef");
         assert!(vmo.is_borrower());
         assert!(vmar.find_mapping(vmar.addr() + 0x20_0000).is_some());
+    }
+
+    #[test]
+    fn load_from_elf_image_copies_writable_segments_instead_of_borrowing() {
+        // PF_RW data segment: must be a private copy, not a borrower of the
+        // shared image (that path corrupted busybox globals → SIGSEGV @ 0x2a).
+        const PF_RW: u32 = 4 | 2; // PF_R | PF_W
+        let mut img = Image::elf64();
+        img.phoff(64);
+        img.phnum(1);
+        img.put32(64, PT_LOAD);
+        img.put32(64 + 4, PF_RW);
+        img.put64(64 + 8, 0x80); // p_offset
+        img.put64(64 + 16, 0x20_0080); // p_vaddr
+        img.put64(64 + 24, 0x20_0080);
+        img.put64(64 + 32, 16); // filesz
+        img.put64(64 + 40, 16); // memsz
+        img.put64(64 + 48, 0x1000);
+        img.put(0x80, b"0123456789abcdef");
+        img.shown(0x90);
+        let bytes = img.bytes();
+        let image = VmObject::new_paged(pages(bytes.len().max(PAGE_SIZE)));
+        image.write(0, bytes).unwrap();
+        let elf = parse_checked_elf(bytes).unwrap();
+        let vmar = VmAddressRegion::new_root();
+        let vmo = vmar.load_from_elf_image(&elf, &image).unwrap();
+        assert!(!vmo.is_borrower(), "writable LOAD must not borrow the image");
+        let mut buf = [0u8; 16];
+        vmo.read(0x80, &mut buf).unwrap();
+        assert_eq!(&buf, b"0123456789abcdef");
     }
 
     #[test]
