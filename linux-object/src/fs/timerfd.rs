@@ -69,6 +69,23 @@ impl TimerInner {
         }
     }
 
+    /// Start a new expiration epoch: retire whatever callback is still in
+    /// flight, and only then clear the count.
+    ///
+    /// The order is the whole of it. A callback that fires between the reset
+    /// and the retirement adds an expiration belonging to the old epoch,
+    /// which the reset has already gone past -- leaving a non-zero count
+    /// under a cleared readiness bit, which is a poller that never wakes on
+    /// a timer nobody armed. Retiring first closes that window, and it is
+    /// not a narrow one: what runs between the two is the bus lock below and
+    /// then all of [`TimerInner::arm`], which reads two clocks and programs
+    /// a kernel timer before it takes a generation of its own.
+    fn start_new_epoch(&self) {
+        self.generation.fetch_add(1, SeqCst);
+        self.count.store(0, SeqCst);
+        self.publish_readiness();
+    }
+
     fn schedule(self: &Arc<Self>, deadline_ns: u64, generation: u64) {
         self.next_deadline_ns.store(deadline_ns, SeqCst);
         let weak = Arc::downgrade(self);
@@ -177,14 +194,9 @@ impl TimerFd {
 
     /// Arm/disarm (`timerfd_settime`). `abs` = `TFD_TIMER_ABSTIME`.
     pub fn set_time(&self, value_ns: u64, interval_ns: u64, abs: bool) {
-        // A fresh arm starts a new expiration epoch. Retire any callback still
-        // in flight FIRST: one firing between the reset and the arm would add
-        // an expiration belonging to the old epoch, and the reset would then
-        // hide it — leaving a non-zero count under a cleared readiness bit,
-        // which is a poller that never wakes.
-        self.inner.generation.fetch_add(1, SeqCst);
-        self.inner.count.store(0, SeqCst);
-        self.inner.publish_readiness();
+        // A fresh arm starts a new expiration epoch, and the order inside
+        // that reset is load-bearing: see [`TimerInner::start_new_epoch`].
+        self.inner.start_new_epoch();
         self.inner.arm(self.clock, value_ns, interval_ns, abs);
     }
 
@@ -549,6 +561,42 @@ mod tests {
         assert_eq!(fd.inner.count.load(SeqCst), 0);
         assert_eq!(fd.get_time().0, 0, "the old interval survived the re-arm");
         fd.set_time(0, 0, false);
+    }
+
+    /// The epoch reset retires the old callback BEFORE it clears the count,
+    /// and nothing above reaches that order: every other test here arms,
+    /// waits and reads, by which time both halves have run.
+    ///
+    /// This calls the reset on its own -- without the arm that follows it in
+    /// `set_time` -- which is exactly where a callback of the old generation
+    /// would land. The other order leaves an expiration sitting in a count
+    /// the reset has already passed, under a readiness bit it has already
+    /// cleared: a poller that never wakes, on a timer nobody armed.
+    #[test]
+    fn a_new_epoch_retires_the_old_callback_before_it_clears_the_count() {
+        let fd = tfd(nonblock());
+        // An arm and a disarm, so the generation is where a live timerfd's
+        // would be without leaving a kernel timer behind.
+        fd.set_time(10 * MS, 0, false);
+        fd.set_time(0, 0, false);
+        let old = fd.inner.generation.load(SeqCst);
+
+        fd.inner.start_new_epoch();
+
+        assert_eq!(
+            fd.inner.expire(0, old, 0),
+            None,
+            "un callback de la epoca vieja no reprograma nada"
+        );
+        assert_eq!(
+            fd.inner.count.load(SeqCst),
+            0,
+            "ni deja una expiracion detras del reseteo"
+        );
+        assert!(
+            !bit_says_readable(&fd),
+            "ni una cuenta sin bit, que es un poller que no despierta"
+        );
     }
 
     #[test]
