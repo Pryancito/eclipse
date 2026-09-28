@@ -3371,6 +3371,55 @@ mod legacy_irq_tests {
         assert_eq!(dev.enable_irq(9, false), Err(ZxError::INVALID_ARGS));
     }
 
+    /// Entering legacy mode leaves the card's one vector MASKED.
+    ///
+    /// Nothing unmasks a legacy vector afterwards, so the state it is created
+    /// in is the state it keeps, and `handle` reads it on every assertion of
+    /// the shared line. A vector that came out unmasked would be skipped for
+    /// the rest of the card's life and its device silenced on the first
+    /// interrupt.
+    #[test]
+    fn entering_legacy_mode_starts_the_cards_vector_masked_and_on_the_line() {
+        let mut space = ConfigSpace::new();
+        let dev = a_card(&mut space);
+        let node: Arc<dyn IPciNode> = Arc::new(PciDeviceNode {
+            base_device: dev.clone(),
+        });
+        dev.inner.lock().weak_super = Arc::downgrade(&node);
+        // Somebody else is already on this line, so joining it does not have
+        // to reach the HAL to unmask it.
+        let mut other_space = ConfigSpace::new();
+        let neighbour = a_card(&mut other_space);
+        dev.inner
+            .lock()
+            .irq
+            .legacy
+            .shared_handler
+            .device_handler
+            .lock()
+            .push(neighbour);
+
+        assert_eq!(dev.set_irq_mode(PcieIrqMode::Legacy, 1), Ok(()));
+
+        let inner = dev.inner.lock();
+        assert_eq!(inner.irq.mode, PcieIrqMode::Legacy);
+        assert_eq!(inner.irq.handlers.len(), 1);
+        assert!(
+            inner.irq.handlers[0].get_masked(),
+            "the card's vector came out of set_irq_mode unmasked"
+        );
+        assert_eq!(
+            inner.irq.legacy.shared_handler.device_handler.lock().len(),
+            2,
+            "the card never joined the line it just armed a vector for"
+        );
+        drop(inner);
+        assert!(
+            silenced(&dev),
+            "a card just armed is quiet until it is enabled"
+        );
+    }
+
     /// The table a mode allocates has exactly the vectors that were asked for,
     /// numbered from zero, and every one of them starts in the state the
     /// caller named. Legacy mode asks for them masked, so no card can assert
