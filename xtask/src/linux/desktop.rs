@@ -790,7 +790,11 @@ fn write_eclipse_look(rootfs: &Path) {
           \x20   { sub(/\\r$/, \"\") }\n\
           \x20   /^[[:space:]]*#/ { next }\n\
           \x20   /^[[:space:]]*look[[:space:]]*=/ {\n\
-          \x20     sub(/^[^=]*=/, \"\"); gsub(/[[:space:]]/, \"\"); print; exit\n\
+          # Trailing comment first, then whitespace: without the first step\n\
+          # `look=plasma # nota` squeezes down to `plasma#nota` and matches\n\
+          # nothing, which reads as a look that was set and did not take.\n\
+          \x20     sub(/^[^=]*=/, \"\"); sub(/#.*$/, \"\")\n\
+          \x20     gsub(/[[:space:]]/, \"\"); print; exit\n\
           \x20   }\n\
           \x20 ' \"$CONF\"\n\
           }\n\
@@ -846,12 +850,17 @@ fn write_eclipse_look(rootfs: &Path) {
           \x20   pkill -x lunarbar 2>/dev/null || true\n\
           \x20   pkill -x plasmashell 2>/dev/null || true\n\
           # `-x lunarbg` catches it while it paints (the wrapper exec's it,\n\
-          # so by then the name is lunarbg); `-f eclipse-lunarbg` catches the\n\
-          # wrapper parked under look=plasma, which never exec'd anything.\n\
-          # Neither pattern matches this script: its own cmdline is\n\
-          # eclipse-look.\n\
+          # so by then the name is lunarbg); the second catches the wrapper\n\
+          # parked under look=plasma, which never exec'd anything and so is\n\
+          # still `sh /usr/local/bin/eclipse-lunarbg`. The pattern is the\n\
+          # FULL path, not the basename: busybox pkill -f matches a substring\n\
+          # of the whole command line as a regex, so a bare `eclipse-lunarbg`\n\
+          # would also hit anything that merely mentions it -- an editor, a\n\
+          # `tail` on its log, a shell reading the script. Neither pattern\n\
+          # matches this script (its own cmdline is eclipse-look) nor the\n\
+          # panel's (eclipse-lunarbar does not contain eclipse-lunarbg).\n\
           \x20   pkill -x lunarbg 2>/dev/null || true\n\
-          \x20   pkill -f eclipse-lunarbg 2>/dev/null || true\n\
+          \x20   pkill -f /usr/local/bin/eclipse-lunarbg 2>/dev/null || true\n\
           \x20 fi\n\
           \x20 echo \"[$(date '+%H:%M:%S')] look=$look theme=$theme boot=$boot\" >>\"$LOG\"\n\
           }\n\
@@ -3656,6 +3665,32 @@ mod tests {
             let got = fs::read_to_string(dir.join("root/.config/foot/foot.ini")).unwrap();
             assert_eq!(want, got, "`eclipse-look {name}` did not copy its palette");
         }
+        // `eclipse-look` with no argument reports what the FILE says, and its
+        // awk has to agree with the wrappers' sed about a trailing comment:
+        // two readers that disagree are a look that reads as applied in one
+        // place and not in the other, which is the whole reason they were
+        // written to match.
+        for (written, want) in [
+            ("look=win11\n", "win11"),
+            ("look = win11 \n", "win11"),
+            ("look=win11 # la barra de Windows\n", "win11"),
+            ("#look=win11\n", "eclipse"),
+            ("", "eclipse"),
+        ] {
+            fs::write(sandbox.join("look"), written).unwrap();
+            let out = std::process::Command::new("sh")
+                .arg(&runnable)
+                .env("HOME", dir.join("root"))
+                .env("PATH", format!("{}/bin:/usr/bin:/bin", sandbox.display()))
+                .output()
+                .unwrap();
+            assert_eq!(
+                String::from_utf8_lossy(&out.stdout).trim(),
+                want,
+                "eclipse-look read {written:?} as something other than {want}"
+            );
+        }
+
         // And a look nobody defined is still refused, so the `case` cannot be
         // "fixed" by making it accept everything.
         let out = std::process::Command::new("sh")

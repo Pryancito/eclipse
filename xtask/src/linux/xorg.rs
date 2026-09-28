@@ -29,10 +29,11 @@
 //!     (e.g. to match a non-Alpine repository whose names differ).
 //!   * `ECLIPSE_KDE=0|off|no|false` — leave out Qt 6 / KF6 / the KDE
 //!     applications (~1.2 GiB of the image).
-//!   * `ECLIPSE_PLASMA=0|off|no|false` — leave out Plasma's own shell
-//!     (plasmashell, System Settings; ~1 GiB more). On by default, because
-//!     `look=plasma` runs `plasmashell` as the panel: see
-//!     [`PLASMA_PACKAGES`].
+//!   * `ECLIPSE_PLASMA=0|off|no|false` — leave out Plasma's own shell: the
+//!     whole of [`PLASMA_PACKAGES`], which is `plasma-workspace`
+//!     (plasmashell), `plasma-desktop` (the Plasma/Shell package plasmashell
+//!     loads — it is not optional) and `systemsettings`, ~1 GiB more. On by
+//!     default, because `look=plasma` runs `plasmashell` as the panel.
 
 use std::fs;
 use std::path::{Path, PathBuf};

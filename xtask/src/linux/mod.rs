@@ -3839,11 +3839,14 @@ fn check_so<P: AsRef<Path>>(path: P) -> bool {
 /// applied and is not.
 ///
 /// Whitespace comes out of the VALUE too, not just from around the key,
-/// because `eclipse-look`'s awk does `gsub(/[[:space:]]/, "")`. A `#` line
-/// never matches, so a commented-out look stays commented out.
+/// because `eclipse-look`'s awk does `gsub(/[[:space:]]/, "")`, and a
+/// trailing `# comment` comes off BEFORE that: squeezing it instead turns
+/// `look=plasma # nota` into `plasma#nota`, which is a look that was set and
+/// did not take. A `#` LINE never matches the key pattern at all, so a
+/// commented-out look stays commented out.
 const READ_LOOK: &str =
     "look=$(sed -n 's/^[[:space:]]*look[[:space:]]*=//p' /etc/eclipse/look \\\n\
-     \x20 \x20 2>/dev/null | head -n 1 | tr -d '[:space:]')\n";
+     \x20 \x20 2>/dev/null | head -n 1 | sed 's/#.*$//' | tr -d '[:space:]')\n";
 
 /// The wallpaper service's wrapper. Under `look=plasma` it paints NOTHING and
 /// parks, because plasmashell's own DesktopView is a `wlr-layer-shell` surface
@@ -4263,7 +4266,12 @@ mod wallpaper_wrapper_tests {
 
         // Every spelling eclipse-look would accept as plasma, including the
         // one with whitespace around the value.
-        for look in ["look=plasma\n", "look = plasma \n", "look=plasma"] {
+        for look in [
+            "look=plasma\n",
+            "look = plasma \n",
+            "look=plasma",
+            "look=plasma # el shell de KDE\n",
+        ] {
             let (code, log) = run(&dir, look, true);
             assert!(
                 !log.contains("RAN lunarbg"),
@@ -4274,7 +4282,16 @@ mod wallpaper_wrapper_tests {
         }
 
         // A commented-out look is not a look, and neither is a missing file.
-        for look in ["#look=plasma\n", "look=kde\n", "look=eclipse\n", ""] {
+        // `look=kde # ...` is the case that made the reader strip a trailing
+        // comment before squeezing whitespace: without that step the value
+        // reads `kde#nota` and every look silently becomes the default.
+        for look in [
+            "#look=plasma\n",
+            "look=kde\n",
+            "look=kde # el escritorio de KDE\n",
+            "look=eclipse\n",
+            "",
+        ] {
             let (_, log) = run(&dir, look, true);
             assert!(
                 log.contains("RAN lunarbg --fps"),
