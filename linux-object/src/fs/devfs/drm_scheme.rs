@@ -253,23 +253,20 @@ impl DrmDev {
         } else {
             zcore_drivers::scheme::syncobj::wait_ready
         };
+        let deadline = core::time::Duration::from_micros(deadline_us);
+        let mut probes = 0u32;
         loop {
             let _ = zcore_drivers::scheme::syncobj::poll_pending();
             match ready_fn(&handles, points.as_deref(), wait_all, deadline_us) {
                 Some(_) => return,
                 None => {
-                    let now = kernel_hal::timer::timer_now();
                     // If the absolute deadline is already behind `timer_now`,
                     // wait_ready should have returned Timeout; the helper still
                     // refuses to sleep past it if the clocks disagree slightly.
-                    let Some(wake) = next_poll_wake(
-                        now,
-                        core::time::Duration::from_micros(deadline_us),
-                        FENCE_POLL_TICK,
-                    ) else {
+                    if !fence_poll_wait(probes, deadline).await {
                         return;
-                    };
-                    kernel_hal::thread::sleep_until(wake).await;
+                    }
+                    probes = probes.saturating_add(1);
                 }
             }
         }
@@ -299,6 +296,8 @@ impl DrmDev {
         let deadline_us = now.as_micros() as u64 + PRESENT_FENCE_TIMEOUT_US;
         let handles = [handle];
         let points = [point];
+        let deadline = core::time::Duration::from_micros(deadline_us);
+        let mut probes = 0u32;
         loop {
             let _ = zcore_drivers::scheme::syncobj::poll_pending();
             match zcore_drivers::scheme::syncobj::wait_ready(
@@ -339,14 +338,10 @@ impl DrmDev {
                     return;
                 }
                 None => {
-                    let Some(wake) = next_poll_wake(
-                        kernel_hal::timer::timer_now(),
-                        core::time::Duration::from_micros(deadline_us),
-                        FENCE_POLL_TICK,
-                    ) else {
+                    if !fence_poll_wait(probes, deadline).await {
                         return;
-                    };
-                    kernel_hal::thread::sleep_until(wake).await;
+                    }
+                    probes = probes.saturating_add(1);
                 }
             }
         }
@@ -442,6 +437,7 @@ impl DrmDev {
         }
         let waited_from = kernel_hal::timer::timer_now();
         let deadline = waited_from + core::time::Duration::from_micros(PRESENT_FENCE_TIMEOUT_US);
+        let mut probes = 0u32;
         loop {
             if fences
                 .iter()
@@ -460,9 +456,7 @@ impl DrmDev {
                 }
                 return;
             }
-            let Some(wake) =
-                next_poll_wake(kernel_hal::timer::timer_now(), deadline, FENCE_POLL_TICK)
-            else {
+            if !fence_poll_wait(probes, deadline).await {
                 // Budgeted for the same reason as the atomic wait: a ring that
                 // stopped landing fences misses this bound on EVERY frame, and
                 // klog writes synchronously to the UART.
@@ -484,8 +478,8 @@ impl DrmDev {
                     );
                 }
                 return;
-            };
-            kernel_hal::thread::sleep_until(wake).await;
+            }
+            probes = probes.saturating_add(1);
         }
     }
 
@@ -2704,9 +2698,6 @@ pub fn prime_request(
 /// broken rather than slow -- and the cost of being wrong is a stutter.
 const PRESENT_FENCE_TIMEOUT_US: u64 = 100_000;
 
-/// How long a fence poll sleeps between probes.
-const FENCE_POLL_TICK: Duration = Duration::from_millis(1);
-
 /// How often a legacy present says what it waited for: the first two of the
 /// boot, then on the present cost report's own rhythm.
 ///
@@ -2749,6 +2740,42 @@ fn next_poll_wake(now: Duration, deadline: Duration, tick: Duration) -> Option<D
         None
     } else {
         Some(wake)
+    }
+}
+
+/// Wait out one interval of a fence poll, on the schedule
+/// [`zcore_drivers::scheme::syncobj::fence_poll_step`] sets: `probes` is how
+/// many probes this wait has already made.
+///
+/// `false` means the deadline has arrived (or a clock stepped backwards) and
+/// the caller must stop polling -- the same answer [`next_poll_wake`]'s `None`
+/// carried when every one of these loops slept a flat millisecond.
+///
+/// The early probes yield instead of arming a timer. A GPU fence on this
+/// hardware lands in far less than the old 1 ms tick, so the tick, not the
+/// GPU, was setting the frame rate: see `fence_poll_step` for the whole
+/// reasoning and for why the backoff ends up at that same tick.
+async fn fence_poll_wait(probes: u32, deadline: Duration) -> bool {
+    use zcore_drivers::scheme::syncobj::{fence_poll_step, PollStep};
+    match fence_poll_step(probes) {
+        PollStep::Yield => {
+            if kernel_hal::timer::timer_now() >= deadline {
+                return false;
+            }
+            kernel_hal::thread::yield_now().await;
+            true
+        }
+        PollStep::Sleep { us } => {
+            let Some(wake) = next_poll_wake(
+                kernel_hal::timer::timer_now(),
+                deadline,
+                Duration::from_micros(us),
+            ) else {
+                return false;
+            };
+            kernel_hal::thread::sleep_until(wake).await;
+            true
+        }
     }
 }
 

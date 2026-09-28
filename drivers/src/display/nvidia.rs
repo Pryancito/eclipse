@@ -23231,6 +23231,26 @@ mod nouveau_bookkeeping_tests {
         /// lost the release, not a slow panel.
         const STUCK_US: u64 = 1_000_000;
 
+        /// How the kernel's fence waits look for the point they are parked
+        /// on.
+        ///
+        /// A client blocked in `SYNCOBJ_WAIT` does NOT see its buffer come
+        /// free the instant the compositor releases it: there is no interrupt
+        /// behind a syncobj on this hardware, so the wait is a poll, and what
+        /// the client actually sees is its next probe. Every wait on this
+        /// path used to probe on a flat 1 ms tick, which is more than a
+        /// glxgears frame costs the GPU -- so the poll, not the card, was
+        /// setting the frame rate. This is the knob that shows it.
+        #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+        enum Poll {
+            /// What the kernel does now: a few yields, then a sleep that
+            /// starts at the timer's arming floor and backs off
+            /// ([`syncobj::fence_poll_step`]).
+            Backoff,
+            /// The flat tick it replaced, in microseconds.
+            FixedTick(u64),
+        }
+
         #[derive(Clone, Copy, PartialEq, Eq, Debug)]
         enum Swap {
             /// `vblank_mode=0`: present as soon as the frame is drawn.
@@ -23254,6 +23274,7 @@ mod nouveau_bookkeeping_tests {
             render_us: u64,
             composite_us: u64,
             swap: Swap,
+            poll: Poll,
             /// The swapchain timeline: frame `f` signals point `f + 1`.
             present_tl: u32,
             /// Per image, the compositor's release timeline: use `u` of the
@@ -23336,6 +23357,7 @@ mod nouveau_bookkeeping_tests {
                     render_us: RENDER_US,
                     composite_us: COMPOSITE_US,
                     swap,
+                    poll: Poll::Backoff,
                     present_tl: syncobj::create(false),
                     release_tl: core::array::from_fn(|_| syncobj::create(false)),
                     sem: core::array::from_fn(|_| syncobj::create(false)),
@@ -23396,6 +23418,30 @@ mod nouveau_bookkeeping_tests {
                     test_clock::set(target);
                 }
                 self.serve_commits();
+            }
+
+            /// One turn of a parked fence wait: let time pass to this
+            /// wait's next probe, handling every event on the way.
+            ///
+            /// A yield costs no wall clock, so the waiter sees the next
+            /// event as it happens; a sleep means the waiter is blind until
+            /// it wakes, however early the thing it waits for arrived.
+            fn poll_wait(&mut self, probes: &mut u32) {
+                let delay = match self.poll {
+                    Poll::Backoff => match syncobj::fence_poll_step(*probes) {
+                        syncobj::PollStep::Yield => 0,
+                        syncobj::PollStep::Sleep { us } => us,
+                    },
+                    Poll::FixedTick(us) => us,
+                };
+                *probes = probes.saturating_add(1);
+                if delay == 0 {
+                    let next = self.next_event();
+                    self.advance_to(next);
+                } else {
+                    let wake = Self::now() + delay;
+                    self.advance_to(wake);
+                }
             }
 
             fn events_due(&mut self) {
@@ -23540,6 +23586,7 @@ mod nouveau_bookkeeping_tests {
                     assert!(syncobj::destroy(merged));
                     let t0 = Self::now();
                     let mut stalled = false;
+                    let mut probes = 0u32;
                     loop {
                         match syncobj::wait_ready(
                             &[self.sem[image]],
@@ -23564,8 +23611,7 @@ mod nouveau_bookkeeping_tests {
                             image,
                             self.uses[image]
                         );
-                        let next = self.next_event();
-                        self.advance_to(next);
+                        self.poll_wait(&mut probes);
                     }
                     if stalled {
                         self.client_stalls += 1;
@@ -23612,14 +23658,14 @@ mod nouveau_bookkeeping_tests {
                 self.serve_commits();
                 if self.swap == Swap::Vsync {
                     let t0 = Self::now();
+                    let mut probes = 0u32;
                     while self.comp_consumed < point {
                         assert!(
                             Self::now().wrapping_sub(t0) < STUCK_US,
                             "frame {} never reached the panel",
                             f
                         );
-                        let next = self.next_event();
-                        self.advance_to(next);
+                        self.poll_wait(&mut probes);
                     }
                 }
             }
@@ -23652,6 +23698,75 @@ mod nouveau_bookkeeping_tests {
                 nv::set_surfaceflip_enabled(false);
                 assert_eq!(FAKE_RM.lock().bad, 0);
             }
+        }
+
+        /// The measurement this whole knob exists for: the same desktop,
+        /// the same GPU, the same compositor, and the only difference is how
+        /// soon a client parked in `SYNCOBJ_WAIT` looks at its fence again.
+        ///
+        /// With the flat 1 ms tick every one of the client's acquire stalls
+        /// was rounded up to a millisecond, so a 2 ms frame became ~3 ms and
+        /// the frame rate landed near 300 -- the number Moebius measures on
+        /// his own card, from a kernel whose GPU work is far faster than 2 ms
+        /// and whose frame rate was therefore set almost entirely by this
+        /// tick. With the backoff the first probes cost no timer at all, so
+        /// the client sees the release when it happens and the rate goes back
+        /// to the GPU's own.
+        #[test]
+        fn the_fence_poll_tick_and_not_the_gpu_was_setting_the_frame_rate() {
+            let _g = LOCK.lock();
+            let _s = SERIAL.lock();
+            let _live = LiveBytes::hold();
+
+            let rate = |poll: Poll| {
+                let gpu = desktop_gpu();
+                let mut d = Desktop::new(&gpu, Swap::Immediate);
+                d.poll = poll;
+                // A glxgears frame on a Turing card, not the 2 ms the other
+                // tests use: 100 us is well under the old poll tick, which is
+                // the whole point -- a client slower than the tick hides it,
+                // a client faster than it is paced by it.
+                d.render_us = 100;
+                let fps = d.run(FRAMES);
+                let stalls = d.client_stalls;
+                assert_eq!(d.commits_served, FRAMES, "{:?}: a present was lost", poll);
+                d.finish();
+                (fps, stalls)
+            };
+
+            let (old_fps, old_stalls) = rate(Poll::FixedTick(1_000));
+            let (new_fps, new_stalls) = rate(Poll::Backoff);
+
+            // The client really does park on its fence in both runs: without
+            // stalls this measures nothing at all.
+            // The client really does park on its fence in both runs: without
+            // stalls this measures nothing at all.
+            assert!(old_stalls > 0 && new_stalls > 0, "the client never waited");
+
+            // What each run spends per frame, against the 100 us the GPU
+            // needs. Everything above that is the client sitting on a fence
+            // that had already landed, waiting to be allowed to look.
+            let old_us = 1_000_000.0 / old_fps;
+            let new_us = 1_000_000.0 / new_fps;
+            assert!(
+                old_us > 400.0,
+                "{:.0} us a frame on a flat 1 ms tick: the tick is no longer what it was",
+                old_us
+            );
+            assert!(
+                new_us < 120.0,
+                "{:.0} us a frame with the backoff, for 100 us of GPU work: \
+                 the client is still being paced by its poll",
+                new_us
+            );
+            assert!(
+                new_fps > old_fps * 3.0,
+                "{:.0} -> {:.0} fps ({:.0} -> {:.0} us a frame), which is not worth the code",
+                old_fps,
+                new_fps,
+                old_us,
+                new_us
+            );
         }
 
         /// The frame rate is the GPU's, not the panel's: a 2 ms frame gives
