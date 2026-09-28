@@ -241,22 +241,55 @@ pub(super) fn wake_ready_waiters() {
     if WAITER_COUNT.load(Ordering::Relaxed) == 0 {
         return;
     }
+    // `query` is asked with `WAITERS` RELEASED, and that is the whole point of
+    // the three passes below.
+    //
+    // `query` resolves the syncobj table, and a point that advances while it
+    // does runs the point-advance upcall -- which is
+    // `syncobj_eventfd::on_syncobj_signaled`, and its first line calls this
+    // very function. Asking under the lock therefore re-entered
+    // `WAITERS.lock()` on a cpu that already held it, and a ticket mutex is
+    // not re-entrant: the `KERNEL STOP` on real hardware had HOLDER and
+    // waiter both at this function's `WAITERS.lock()`, on cpu 8, with two
+    // more cpus queued behind it.
+    //
+    // Nothing is delivered twice: a nested call that retires a waiter first
+    // leaves it gone from the pass below, and only a waiter this pass itself
+    // removed is fired.
+    let probe: Vec<(u32, u64)> = {
+        let waiters = WAITERS.lock();
+        waiters.iter().map(|w| (w.handle, w.point)).collect()
+    };
+    // `(handle, point, reached)`. `false` is a syncobj that is gone: the fd
+    // can never become ready, so the waiter is dropped without firing (Mesa
+    // times out the same way Linux does).
+    let mut done: Vec<(u32, u64, bool)> = Vec::new();
+    for (handle, point) in probe {
+        match zcore_drivers::scheme::syncobj::query(handle) {
+            Some(cur) if cur >= point => done.push((handle, point, true)),
+            None => done.push((handle, point, false)),
+            _ => {}
+        }
+    }
+    if done.is_empty() {
+        return;
+    }
     let mut fire: Vec<(Arc<AtomicBool>, Arc<Mutex<EventBus>>)> = Vec::new();
     {
         let mut waiters = WAITERS.lock();
         let mut i = 0;
         while i < waiters.len() {
-            match zcore_drivers::scheme::syncobj::query(waiters[i].handle) {
-                Some(cur) if cur >= waiters[i].point => {
+            match done
+                .iter()
+                .find(|&&(h, p, _)| h == waiters[i].handle && p == waiters[i].point)
+            {
+                Some(&(_, _, reached)) => {
                     let w = waiters.swap_remove(i);
-                    fire.push((w.signaled, w.eventbus));
+                    if reached {
+                        fire.push((w.signaled, w.eventbus));
+                    }
                 }
-                None => {
-                    // Syncobj gone: the fd can never become ready. Drop the
-                    // waiter (Mesa will time out the same way Linux does).
-                    waiters.swap_remove(i);
-                }
-                _ => i += 1,
+                None => i += 1,
             }
         }
         WAITER_COUNT.store(waiters.len(), Ordering::SeqCst);
@@ -549,5 +582,103 @@ mod sync_file_poll_tests {
             "sys_poll must be able to park on a sync_file"
         );
         drop(fd);
+    }
+}
+
+/// The `KERNEL STOP` this module earned on real hardware: one lock, one cpu,
+/// taken twice.
+///
+/// `wake_ready_waiters` asked `syncobj::query` about each waiter with
+/// `WAITERS` held. `query` resolves the syncobj table, and a point that
+/// advances there fires the point-advance upcall —
+/// `syncobj_eventfd::on_syncobj_signaled`, whose first line calls
+/// `wake_ready_waiters`. A ticket mutex is not re-entrant, so the second
+/// `WAITERS.lock()` spun on this cpu's own hold with interrupts off, for ever.
+///
+/// The test asserts the property rather than reproducing the hang: a hanging
+/// test is a test nobody can read the failure of. A probe hook, standing in
+/// for the real one, reports whether `WAITERS` was free when the upcall ran.
+#[cfg(test)]
+mod reentrancy_tests {
+    use super::*;
+    use core::sync::atomic::AtomicU32;
+    use zcore_drivers::scheme::syncobj;
+
+    /// How many times the probe hook ran, and whether `WAITERS` was free on
+    /// every one of them (it starts true and only ever goes false, so one bad
+    /// upcall is enough to fail).
+    static UPCALLS: AtomicU32 = AtomicU32::new(0);
+    static ALWAYS_FREE: AtomicBool = AtomicBool::new(true);
+
+    /// Stands in for `syncobj_eventfd::on_syncobj_signaled`, which is what the
+    /// kernel really installs, and asks the one question that matters: is the
+    /// registry lock free right now? The real hook would take it.
+    fn probe_hook(_handle: u32, _point: u64) {
+        UPCALLS.fetch_add(1, Ordering::SeqCst);
+        match WAITERS.try_lock() {
+            Some(g) => drop(g),
+            None => ALWAYS_FREE.store(false, Ordering::SeqCst),
+        }
+    }
+
+    #[test]
+    #[allow(unsafe_code)]
+    fn the_point_advance_upcall_never_runs_with_the_waiter_registry_held() {
+        // The hook is process-wide; serialise with the tests that install the
+        // real one.
+        let _serial = super::super::syncobj_eventfd::hardware_fence_tests::TEST_SERIAL.lock();
+        WAITERS.lock().clear();
+        WAITER_COUNT.store(0, Ordering::SeqCst);
+        UPCALLS.store(0, Ordering::SeqCst);
+        ALWAYS_FREE.store(true, Ordering::SeqCst);
+        syncobj::set_signal_hook(probe_hook);
+
+        let handle = syncobj::create(false);
+        assert!(syncobj::add_ref(handle), "keep a ref for the test itself");
+        // A sync_file on a point still in flight: this is what puts a waiter in
+        // the registry, which is what makes `wake_ready_waiters` call `query`.
+        let fd = SyncobjHandle::new_sync_file(handle, 1);
+        assert_eq!(pending_waiter_count(), 1, "the fence has not landed yet");
+
+        // The client submits: a hardware fence whose landing zone still reads
+        // zero, so nothing is resolved at attach time.
+        let mut landing_zone: u32 = 0;
+        let zone = &mut landing_zone as *mut u32;
+        assert!(syncobj::attach_hw_fence(
+            handle,
+            1,
+            zone as usize,
+            0,
+            1,
+            0,
+            false
+        ));
+        // The GPU writes the payload. Nobody is told; the fence is resolved
+        // lazily, inside the very `query` that `wake_ready_waiters` makes.
+        // SAFETY: the zone is this frame's own local, and the syncobj layer
+        // reads it through the same address it was handed.
+        unsafe { zone.write_volatile(1) };
+
+        wake_ready_waiters();
+
+        assert!(
+            UPCALLS.load(Ordering::SeqCst) > 0,
+            "the landed fence must have advanced the point and fired the upcall, \
+             or this test is asserting nothing"
+        );
+        assert!(
+            ALWAYS_FREE.load(Ordering::SeqCst),
+            "the point-advance upcall ran while this cpu held WAITERS: the real \
+             hook re-takes that lock and a ticket mutex is not re-entrant"
+        );
+        assert_eq!(
+            pending_waiter_count(),
+            0,
+            "the waiter is retired once its point is reached"
+        );
+        drop(fd);
+        let _ = syncobj::destroy(handle);
+        // Put the kernel's own hook back for whatever runs next.
+        super::super::syncobj_eventfd::init();
     }
 }

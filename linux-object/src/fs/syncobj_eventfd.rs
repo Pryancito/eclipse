@@ -60,46 +60,35 @@ fn deliver(ev: &Arc<dyn FileLike>) {
 /// `wait_available` uses the last-submitted point (in-flight EXEC fences).
 pub fn register(handle: u32, point: u64, ev: Arc<dyn FileLike>, wait_available: bool) {
     let target = point.max(1);
-    // The check and the insertion happen under ONE hold of `WAITERS`, which is
-    // what makes them atomic against `on_syncobj_signaled`. Reading the point
-    // first and taking the lock afterwards left a window: a signal landing in
-    // it ran the hook against a registry that did not yet hold this waiter, and
-    // the waiter was then inserted with a target already reached. Nothing
-    // re-checks it -- `arm_poller` only fires while a hardware fence is
-    // pending, and an explicit SIGNAL leaves none -- so the eventfd was never
-    // written and the compositor's frame never completed. Linux closes the same
-    // window by adding the callback and fetching the fence under `syncobj->lock`
-    // (`drm_syncobj_add_callback_locked`).
+    // Insert FIRST, then check -- never `query` with `WAITERS` held.
     //
-    // Lock order is WAITERS then the syncobj TABLE (via `query`), the same way
-    // round as the hook; the delivery is done with the lock released, because
-    // writing an eventfd takes the eventbus lock and holding two across a wake
-    // is how this codebase has deadlocked before.
-    let already_reached = {
+    // The window this closes: reading the point first and taking the lock
+    // afterwards let a signal land in between and run the hook against a
+    // registry that did not yet hold this waiter, which was then inserted with
+    // a target already reached. Nothing re-checks it -- `arm_poller` only fires
+    // while a hardware fence is pending, and an explicit SIGNAL leaves none --
+    // so the eventfd was never written and the compositor's frame never
+    // completed. Linux closes it by adding the callback and fetching the fence
+    // under `syncobj->lock` (`drm_syncobj_add_callback_locked`).
+    //
+    // Registering before asking closes it the other way round, and without the
+    // lock held across `query`: a signal landing between the insert and the
+    // pass below finds this waiter already in the registry and delivers it,
+    // and the pass then finds it gone. Holding `WAITERS` across `query` is
+    // what wedged the machine -- `query` resolves the table and the
+    // point-advance upcall lands back in `on_syncobj_signaled`, which takes
+    // this same non-re-entrant lock (see `deliver_ready_waiters`).
+    {
         let mut waiters = WAITERS.lock();
-        let cur = if wait_available {
-            zcore_drivers::scheme::syncobj::query_submitted(handle)
-        } else {
-            zcore_drivers::scheme::syncobj::query(handle)
-        };
-        match cur {
-            Some(cur) if cur >= target => true,
-            _ => {
-                waiters.push(Waiter {
-                    handle,
-                    point: target,
-                    wait_available,
-                    ev: ev.clone(),
-                });
-                WAITER_COUNT.store(waiters.len(), Ordering::SeqCst);
-                false
-            }
-        }
-    };
-    if already_reached {
-        deliver(&ev);
-        return;
+        waiters.push(Waiter {
+            handle,
+            point: target,
+            wait_available,
+            ev,
+        });
+        WAITER_COUNT.store(waiters.len(), Ordering::SeqCst);
     }
+    deliver_ready_waiters();
     arm_poller();
 }
 
@@ -156,14 +145,46 @@ pub(super) fn ensure_hw_fence_poller() {
 /// registry is empty. Deliveries happen with the lock released — an eventfd
 /// `write` takes the eventbus lock, and holding two locks across a wake is how
 /// this codebase has deadlocked before.
-fn on_syncobj_signaled(_handle: u32, _point: u64) {
-    // Always wake sync_file waiters first: they are independent of the
-    // eventfd registry, and returning early when WAITER_COUNT==0 used to
-    // leave GLX `sync_wait` parked forever after a hardware fence landed.
-    super::syncobj_file::wake_ready_waiters();
-
+/// Deliver every registered waiter whose target point is now reached, and drop
+/// any whose syncobj has been destroyed.
+///
+/// `query` is asked with `WAITERS` RELEASED. It resolves the syncobj table,
+/// and a point that advances while it does runs the point-advance upcall,
+/// which is [`on_syncobj_signaled`] -- this function again. Asking under the
+/// lock re-entered it on a cpu that already held it, and a ticket mutex is not
+/// re-entrant; the same shape wedged the machine on `syncobj_file`'s own
+/// registry. So: snapshot, ask unlocked, take the lock again to retire what is
+/// ready. A nested call that delivered a waiter first leaves it gone from the
+/// second pass, so nothing is delivered twice.
+fn deliver_ready_waiters() {
     if WAITER_COUNT.load(Ordering::Relaxed) == 0 {
-        arm_poller();
+        return;
+    }
+    let probe: Vec<(u32, u64, bool)> = {
+        let waiters = WAITERS.lock();
+        waiters
+            .iter()
+            .map(|w| (w.handle, w.point, w.wait_available))
+            .collect()
+    };
+    // `(handle, point, wait_available, reached)`. `reached == false` is a
+    // syncobj destroyed out from under the waiter: it can never be reached
+    // now, so drop it (the eventfd is simply never signaled, same as a real
+    // syncobj fd whose object went away).
+    let mut done: Vec<(u32, u64, bool, bool)> = Vec::new();
+    for (handle, point, wait_available) in probe {
+        let cur = if wait_available {
+            zcore_drivers::scheme::syncobj::query_submitted(handle)
+        } else {
+            zcore_drivers::scheme::syncobj::query(handle)
+        };
+        match cur {
+            Some(cur) if cur >= point => done.push((handle, point, wait_available, true)),
+            None => done.push((handle, point, wait_available, false)),
+            _ => {}
+        }
+    }
+    if done.is_empty() {
         return;
     }
     let mut fire: Vec<Arc<dyn FileLike>> = Vec::new();
@@ -171,21 +192,16 @@ fn on_syncobj_signaled(_handle: u32, _point: u64) {
         let mut waiters = WAITERS.lock();
         let mut i = 0;
         while i < waiters.len() {
-            match if waiters[i].wait_available {
-                zcore_drivers::scheme::syncobj::query_submitted(waiters[i].handle)
-            } else {
-                zcore_drivers::scheme::syncobj::query(waiters[i].handle)
-            } {
-                Some(cur) if cur >= waiters[i].point => {
-                    fire.push(waiters.swap_remove(i).ev);
+            match done.iter().find(|&&(h, p, wa, _)| {
+                h == waiters[i].handle && p == waiters[i].point && wa == waiters[i].wait_available
+            }) {
+                Some(&(_, _, _, reached)) => {
+                    let w = waiters.swap_remove(i);
+                    if reached {
+                        fire.push(w.ev);
+                    }
                 }
-                // Syncobj destroyed out from under the waiter: it can never be
-                // reached now, so drop it (the eventfd is simply never signaled,
-                // same as a real syncobj fd whose object went away).
-                None => {
-                    waiters.swap_remove(i);
-                }
-                _ => i += 1,
+                None => i += 1,
             }
         }
         WAITER_COUNT.store(waiters.len(), Ordering::SeqCst);
@@ -193,6 +209,15 @@ fn on_syncobj_signaled(_handle: u32, _point: u64) {
     for ev in fire {
         deliver(&ev);
     }
+}
+
+fn on_syncobj_signaled(_handle: u32, _point: u64) {
+    // Always wake sync_file waiters first: they are independent of the
+    // eventfd registry, and returning early when WAITER_COUNT==0 used to
+    // leave GLX `sync_wait` parked forever after a hardware fence landed.
+    super::syncobj_file::wake_ready_waiters();
+
+    deliver_ready_waiters();
     // Re-arm for the waiters that are still here. `register` is the only other
     // place that arms the poller, and it gives up when nothing is pending --
     // which is the normal case, because a compositor registers the acquire
