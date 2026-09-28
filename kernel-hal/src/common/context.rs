@@ -844,6 +844,55 @@ mod tests {
         );
     }
 
+    /// The source is the WHOLE low half of the vector-table entry, and only
+    /// four numbers name a source.
+    ///
+    /// Reading a narrower field would make `0x0202` -- whose bottom byte says
+    /// "lower AArch64" while the byte above it says the entry is not one this
+    /// kernel wrote -- a user fault. USER is what the permission check ends
+    /// in, so an entry that means nothing would be trusted to say who was
+    /// running, and an unknown source is never a claim that user code was.
+    #[test]
+    fn a_source_that_names_none_of_the_four_is_not_user_code() {
+        let entry = ((Kind::Synchronous as usize) << 16) | 0x0202;
+        assert_eq!(
+            TrapReason::from_aarch64(
+                entry,
+                esr(EC_DATA_ABORT_LOWER, FSC_TRANSLATION_L3),
+                FAR,
+                no_irq,
+            ),
+            TrapReason::PageFault(FAR, MMUFlags::READ)
+        );
+        // And the four that do name one still name it, both ways.
+        for source in [Source::CurrentSpEl0, Source::CurrentSpElx] {
+            assert_eq!(
+                TrapReason::from_aarch64(
+                    vector(source, Kind::Synchronous),
+                    esr(EC_DATA_ABORT_CURRENT, FSC_TRANSLATION_L3),
+                    FAR,
+                    no_irq,
+                ),
+                TrapReason::PageFault(FAR, MMUFlags::READ),
+                "{:?} es el nucleo",
+                source
+            );
+        }
+        for source in [Source::LowerAArch64, Source::LowerAArch32] {
+            assert_eq!(
+                TrapReason::from_aarch64(
+                    vector(source, Kind::Synchronous),
+                    esr(EC_DATA_ABORT_LOWER, FSC_TRANSLATION_L3),
+                    FAR,
+                    no_irq,
+                ),
+                TrapReason::PageFault(FAR, MMUFlags::READ | MMUFlags::USER),
+                "{:?} es codigo de usuario",
+                source
+            );
+        }
+    }
+
     #[test]
     fn a_fault_the_kernel_took_itself_is_not_a_user_access() {
         // USER used to be set on every abort. A kernel-only mapping does not

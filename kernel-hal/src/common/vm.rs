@@ -503,6 +503,57 @@ mod page_size_tests {
         assert!(t.mapped.is_empty());
     }
 
+    /// The 4 KiB path advances the frame along with the address.
+    ///
+    /// The huge path is checked page by page further down; this one had only
+    /// its sizes looked at, so a physical side that drifted -- every page
+    /// mapped one frame along from the one asked for -- went unnoticed. That
+    /// is not a fault anybody sees: the mapping works, and reads the wrong
+    /// memory.
+    #[test]
+    fn without_the_huge_flag_the_frames_still_follow_the_addresses() {
+        let mut t = RecordingTable::default();
+        let start = 8 * M;
+        let phys = 3 * G + 7 * K;
+        t.map_cont(start, 5 * K, phys, MMUFlags::READ).unwrap();
+        let got: Vec<(VirtAddr, PhysAddr, usize)> = t
+            .mapped
+            .iter()
+            .map(|(v, p, s)| (*v, *p, *s as usize))
+            .collect();
+        let expect: Vec<(VirtAddr, PhysAddr, usize)> =
+            (0..5).map(|i| (start + i * K, phys + i * K, K)).collect();
+        assert_eq!(got, expect);
+    }
+
+    /// Same rule as [`the_physical_side_has_a_vote_too`], one size up: the
+    /// 2 MiB case was covered and the 1 GiB one was not, and one PTE cannot
+    /// describe a gigabyte-aligned virtual page whose frame starts 2 MiB in.
+    #[test]
+    fn the_physical_side_has_a_vote_on_the_gigabyte_page_too() {
+        let mut t = RecordingTable::default();
+        t.map_cont(G, G, G + M, MMUFlags::HUGE_PAGE).unwrap();
+        // It does not drop all the way to 4 KiB either: it takes the largest
+        // size both sides agree on, which here is 2 MiB.
+        assert_eq!(t.mapped.len(), G / M);
+        assert!(sizes(&t).iter().all(|&s| s == M), "{:?}", sizes(&t));
+    }
+
+    /// The default [`GenericPageTable::set_gather`]: a table with no gather
+    /// window of its own owes nothing, opening one or closing it.
+    ///
+    /// The caller issues a cross-CPU shootdown whenever closing a window says
+    /// a flush was owed, so answering `true` here buys every `fork` on such a
+    /// table one extra IPI round to every other CPU -- with its ack spin-wait
+    /// -- for a flush that has already happened. That round trip is the cost
+    /// the gather window exists to avoid.
+    #[test]
+    fn a_table_that_cannot_gather_never_owes_a_flush() {
+        let mut t = RecordingTable::default();
+        assert!(!t.set_gather(true), "abrir una ventana no debe nada");
+        assert!(!t.set_gather(false), "y cerrarla tampoco");
+    }
+
     // ── unmapping a range ──────────────────────────────────────────────────
 
     #[test]
