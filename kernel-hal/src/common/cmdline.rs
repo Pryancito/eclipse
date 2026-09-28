@@ -180,6 +180,29 @@ mod tests {
     }
 
     #[test]
+    fn a_bootargs_property_is_cut_at_the_first_nul_and_not_the_last() {
+        // A property can carry more than one NUL. A blob author who wrote the
+        // bootargs as a device-tree string *list* gets one per string, and a
+        // fixed-size buffer filled in by an earlier stage gets the rest as
+        // padding. Cutting at the last NUL instead of the first puts one back
+        // *inside* the line, and the flag it lands on is the last one written
+        // -- the same swallowed flag this function exists to prevent, one step
+        // further out. With one NUL the two rules give the same answer, which
+        // is why nothing above tells them apart.
+        let list = b"LOG=error:smp=off\0console.shell=true\0";
+        assert_eq!(from_c_bytes(list), Some("LOG=error:smp=off"));
+        assert!(is_off(from_c_bytes(list).unwrap(), "smp"), "la lista");
+
+        let padded = b"LOG=error:smp=off\0\0\0\0";
+        assert_eq!(from_c_bytes(padded), Some("LOG=error:smp=off"));
+        assert!(is_off(from_c_bytes(padded).unwrap(), "smp"), "el relleno");
+
+        // And what is past the first NUL is not looked at at all, so padding
+        // that is not UTF-8 does not make the whole line unreadable.
+        assert_eq!(from_c_bytes(b"smp=off\0\xff\xfe"), Some("smp=off"));
+    }
+
+    #[test]
     fn a_flag_name_inside_a_longer_key_is_not_that_flag() {
         // `contains("smp=off")` is yes for `nosmp=off`, and
         // `contains("noturbo")` is yes for `turbo=noturbo`.
