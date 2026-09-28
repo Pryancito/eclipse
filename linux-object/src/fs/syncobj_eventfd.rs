@@ -31,9 +31,9 @@ struct Waiter {
     /// Target timeline point (floored at 1: point 0 means the binary "signaled"
     /// state, i.e. the next signal, never "already true on an unsignaled obj").
     point: u64,
-    /// `DRM_SYNCOBJ_WAIT_FLAGS_WAIT_AVAILABLE`: fire when a fence covering
-    /// `point` has been *submitted* (EXEC attached a hardware fence), not
-    /// necessarily signaled.
+    /// `DRM_SYNCOBJ_WAIT_FLAGS_WAIT_AVAILABLE` as passed by the ioctl.
+    /// Stored for matching / ABI, but EVENTFD delivery always waits for the
+    /// point to be *signaled* (fence landed): see [`deliver_ready_waiters`].
     wait_available: bool,
     ev: Arc<dyn FileLike>,
 }
@@ -53,11 +53,16 @@ fn deliver(ev: &Arc<dyn FileLike>) {
     let _ = ev.write(&1u64.to_ne_bytes());
 }
 
-/// `SYNCOBJ_EVENTFD`: signal `ev` when syncobj `handle` reaches `point`.
+/// `SYNCOBJ_EVENTFD`: signal `ev` when syncobj `handle` reaches `point`
+/// (fence *landed*, engines idle after `RELEASE_WFI_EN`).
+///
 /// Delivered immediately if the point is already reached; otherwise recorded
-/// and delivered on its own as the syncobj advances. Point 0 means the binary
-/// signaled state (floored to 1), matching the rest of the syncobj layer.
-/// `wait_available` uses the last-submitted point (in-flight EXEC fences).
+/// and delivered as the syncobj advances. Point 0 means the binary signaled
+/// state (floored to 1). The ioctl's `WAIT_AVAILABLE` flag is accepted (NVK
+/// / wlroots set it) but does **not** change delivery: firing on submit let
+/// labwc sample a client's dmabuf while GR was still writing (mild static
+/// across the whole Firefox/GPU-client window). Over-waiting until signaled
+/// is correct for compositor acquire.
 pub fn register(handle: u32, point: u64, ev: Arc<dyn FileLike>, wait_available: bool) {
     let target = point.max(1);
     // Insert FIRST, then check -- never `query` with `WAITERS` held.
@@ -171,13 +176,16 @@ fn deliver_ready_waiters() {
     // syncobj destroyed out from under the waiter: it can never be reached
     // now, so drop it (the eventfd is simply never signaled, same as a real
     // syncobj fd whose object went away).
+    //
+    // Always `query` (signaled), never `query_submitted`. wlroots arms
+    // SYNCOBJ_EVENTFD with WAIT_AVAILABLE on the client's acquire point;
+    // delivering on submit made the compositor texture-sample Firefox's
+    // dmabuf mid-render (snow across the window). SYNCOBJ_WAIT still honours
+    // WAIT_AVAILABLE for NVK's WAIT_PENDING path; only the eventfd half of
+    // compositor acquire is forced to "landed".
     let mut done: Vec<(u32, u64, bool, bool)> = Vec::new();
     for (handle, point, wait_available) in probe {
-        let cur = if wait_available {
-            zcore_drivers::scheme::syncobj::query_submitted(handle)
-        } else {
-            zcore_drivers::scheme::syncobj::query(handle)
-        };
+        let cur = zcore_drivers::scheme::syncobj::query(handle);
         match cur {
             Some(cur) if cur >= point => done.push((handle, point, wait_available, true)),
             None => done.push((handle, point, wait_available, false)),
@@ -402,6 +410,45 @@ pub(crate) mod hardware_fence_tests {
             POLLER_ARMED.load(Ordering::Acquire),
             "a waiter with an in-flight fence must leave the poller armed, or \
              nothing will ever notice the GPU landing it"
+        );
+
+        reset();
+    }
+
+    /// Compositor acquire (wlroots) passes WAIT_AVAILABLE on SYNCOBJ_EVENTFD.
+    /// Delivering on submit used to let labwc sample a dmabuf while GR was
+    /// still writing — snow across the whole GPU-client window. EVENTFD must
+    /// wait for the fence to land even when that flag is set.
+    #[test]
+    fn wait_available_eventfd_does_not_fire_on_submit_alone() {
+        let _serial = TEST_SERIAL.lock();
+        reset();
+        syncobj::set_signal_hook(on_syncobj_signaled);
+        let handle = syncobj::create(false);
+        let ev = CountingEventfd::new();
+
+        register(handle, 1, ev.clone(), true /* WAIT_AVAILABLE */);
+        assert_eq!(ev.delivered(), 0);
+
+        let landing_zone: u32 = 0;
+        syncobj::attach_hw_fence(
+            handle,
+            1,
+            &landing_zone as *const u32 as usize,
+            0,
+            1,
+            0,
+            false,
+        );
+
+        assert_eq!(
+            ev.delivered(),
+            0,
+            "WAIT_AVAILABLE must not release the compositor's eventfd on submit"
+        );
+        assert!(
+            POLLER_ARMED.load(Ordering::Acquire),
+            "poller must stay armed until the fence lands"
         );
 
         reset();

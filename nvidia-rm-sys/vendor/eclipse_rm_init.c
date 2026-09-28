@@ -7721,9 +7721,14 @@ NV_STATUS eclipse_rm_gem_alloc(NvU32 gpuInstance, NvU64 size, NvU32 bSysmem,
         params.owner = HEAP_OWNER_RM_CLIENT_GENERIC;
         params.type = NVOS32_TYPE_IMAGE;
         params.size = size;
+        /* Sysmem/GART: ask for COHERENCY_CACHED so GPU DMA snoops the host
+         * caches (same attr as the hwcursor path below). Without it, No-Snoop
+         * TLPs left mild static on client dmabufs (Firefox GPU WebRender)
+         * that a CPU-written software path never showed. VRAM stays VIDMEM. */
         params.attr = bSysmem
             ? (DRF_DEF(OS32, _ATTR, _LOCATION, _PCI) |
-               DRF_DEF(OS32, _ATTR, _PHYSICALITY, _CONTIGUOUS))
+               DRF_DEF(OS32, _ATTR, _PHYSICALITY, _CONTIGUOUS) |
+               DRF_DEF(OS32, _ATTR, _COHERENCY, _CACHED))
             : DRF_DEF(OS32, _ATTR, _LOCATION, _VIDMEM);
         params.attr2 = NVOS32_ATTR2_NONE;
         status = clientGenResourceHandle(pRsClient, &pOut->hMemory);

@@ -1295,7 +1295,9 @@ fn write_terminal_wrapper(rootfs: &Path) {
 /// Crucially this does NOT set `MOZ_WEBRENDER=0`: modern Firefox has no
 /// non-WebRender compositor, so that would disable rendering outright (a black
 /// window). Software path uses `MOZ_WEBRENDER_SOFTWARE=1`; GPU path leaves
-/// WebRender on the hardware backend.
+/// WebRender on the hardware backend. Explicit-sync EVENTFD waits for fences
+/// to *land* (not merely submit) so labwc does not sample a half-written
+/// dmabuf — see `syncobj_eventfd::deliver_ready_waiters`.
 fn write_firefox_wrapper(rootfs: &Path) {
     let localbin = rootfs.join("usr/local/bin");
     let _ = fs::create_dir_all(&localbin);
@@ -1417,6 +1419,14 @@ pub fn write_firefox_default_prefs(rootfs: &Path) {
               // eclipse-firefox wrapper forces software when there is no GPU.\n\
               pref(\"gfx.webrender.all\", true);\n\
               pref(\"layers.acceleration.force-enabled\", true);\n\
+              // Keep WR in-process: a separate GPU process often stalls on\n\
+              // Wayland/zink teardown here and trips nsTerminator's shutdown\n\
+              // hang crash (intentional null write of reason 0xf2).\n\
+              pref(\"layers.gpu-process.enabled\", false);\n\
+              // zink+NVK / profile IO on a RAM rootfs can make a quit phase\n\
+              // exceed the stock 60s nsTerminator budget; raise it so closing\n\
+              // Firefox does not MOZ_CRASH mid-teardown.\n\
+              pref(\"toolkit.asyncshutdown.crash_timeout\", 300000);\n\
               // No hardware video decoder on many Eclipse builds: make\n\
               // YouTube and other MSE players pick H.264 (system libavcodec)\n\
               // over AV1 and VP9, the costliest codecs to decode in software.\n\
@@ -2911,6 +2921,8 @@ mod tests {
                 "pref(\"browser.cache.disk.enable\", false);\n",
                 "pref(\"browser.cache.memory.capacity\", 98304);\n",
                 "pref(\"gfx.webrender.all\", true);\n",
+                "pref(\"layers.gpu-process.enabled\", false);\n",
+                "pref(\"toolkit.asyncshutdown.crash_timeout\", 300000);\n",
                 "pref(\"media.av1.enabled\", false);\n",
                 "pref(\"media.mediasource.vp9.enabled\", false);\n",
                 "pref(\"network.http.http3.enable\", false);\n",
