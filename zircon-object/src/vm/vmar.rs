@@ -1118,23 +1118,37 @@ impl VmAddressRegion {
                 if m.size == 0 {
                     continue;
                 }
-                // Linux VMAs have uniform protection; after a partial mprotect
-                // split this kernel keeps per-page flags in one mapping, so the
-                // leading page stands for the row.
-                let flags = match m.flags.first() {
-                    Some(f) => *f,
-                    None => continue,
-                };
-                out.push(MappingDump {
-                    start: m.addr,
-                    end: m.end_addr(),
-                    flags,
-                    vmo_offset: m.vmo_offset,
-                    file_offset: m.vmo_offset + map.vmo.file_offset(),
-                    shared: map.vmo.share_count() > 1,
-                    vmo_id: map.vmo.id(),
-                    name: map.vmo.name(),
-                });
+                // ONE ROW PER RUN OF UNIFORM PROTECTION -- a Linux VMA. This
+                // kernel keeps per-page flags inside a single mapping, and the
+                // dump used to report the whole mapping with the flags of its
+                // FIRST page. That is wrong for every mapping a partial
+                // `mprotect` has touched, and musl builds each thread stack
+                // exactly that way: one `mmap(PROT_NONE)`, then `mprotect` to
+                // read-write of everything above the guard page at the bottom.
+                // So a thread stack read as NOT WRITABLE, and the signal-frame
+                // check in the loader refused to deliver a signal to any
+                // thread but the first -- `seteuid` in a threaded musl program
+                // (musl stops every other thread with SIGRT34 to do it) killed
+                // the process with a forced SIGSEGV. `/proc/<pid>/maps` was
+                // reporting the same wrong permissions.
+                let file_base = m.vmo_offset + map.vmo.file_offset();
+                let shared = map.vmo.share_count() > 1;
+                let vmo_id = map.vmo.id();
+                let name = map.vmo.name();
+                for (page, pages, flags) in m.flags.runs() {
+                    let offset = page * PAGE_SIZE;
+                    let start = m.addr + offset;
+                    out.push(MappingDump {
+                        start,
+                        end: start + pages * PAGE_SIZE,
+                        flags,
+                        vmo_offset: m.vmo_offset + offset,
+                        file_offset: file_base + offset,
+                        shared,
+                        vmo_id,
+                        name: name.clone(),
+                    });
+                }
             }
             inner.children.to_vec()
         };
@@ -2116,7 +2130,9 @@ pub struct MappingDump {
     pub start: VirtAddr,
     /// One past the last mapped address.
     pub end: VirtAddr,
-    /// MMU flags of the mapping's first page.
+    /// MMU flags of this row. Every row has uniform protection, like a Linux
+    /// VMA: a mapping whose pages differ (a partial `mprotect`, or a musl
+    /// thread stack with its guard page) is reported as several rows.
     pub flags: MMUFlags,
     /// Byte offset into the backing VMO.
     pub vmo_offset: usize,
@@ -4478,6 +4494,49 @@ mod tests {
         unsafe {
             assert_eq!((target as *const u8).read(), 7);
         }
+    }
+
+    /// A musl thread stack: ONE `mmap(PROT_NONE)`, then `mprotect` to
+    /// read-write of everything above the guard page at the bottom. The dump
+    /// used to hand the whole mapping the flags of its first page -- the
+    /// guard -- so a thread stack read as not writable. The loader's
+    /// signal-frame check believed it and refused to deliver a signal to any
+    /// thread but the first, which is `seteuid` in a threaded musl program
+    /// (musl stops every other thread with SIGRT34) dying on a forced
+    /// SIGSEGV, and gzdoom never getting past its version banner.
+    #[test]
+    fn a_thread_stacks_guard_page_does_not_make_the_stack_unwritable() {
+        let vmar = VmAddressRegion::new_root();
+        let base = vmar.addr();
+        let pages = 4;
+        let rw = MMUFlags::READ | MMUFlags::WRITE;
+        vmar.map_at(
+            0,
+            VmObject::new_paged(pages),
+            0,
+            pages * PAGE_SIZE,
+            MMUFlags::empty(),
+        )
+        .unwrap();
+        vmar.protect(base + PAGE_SIZE, (pages - 1) * PAGE_SIZE, rw)
+            .unwrap();
+
+        let rows = vmar.mappings_dump();
+        assert_eq!(rows.len(), 2, "guard and stack are separate VMAs: {rows:?}");
+        assert_eq!((rows[0].start, rows[0].end), (base, base + PAGE_SIZE));
+        assert!(
+            !rows[0].flags.contains(MMUFlags::WRITE),
+            "the guard page stays unwritable"
+        );
+        assert_eq!(
+            (rows[1].start, rows[1].end),
+            (base + PAGE_SIZE, base + pages * PAGE_SIZE)
+        );
+        assert!(
+            rows[1].flags.contains(MMUFlags::WRITE),
+            "the stack itself is writable, whatever the guard below it says"
+        );
+        assert_eq!(rows[1].vmo_offset, PAGE_SIZE, "the row carries its offset");
     }
 
     #[test]
