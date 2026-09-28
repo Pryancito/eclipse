@@ -176,24 +176,50 @@ fn vtable_in_heap(vtable: usize) -> bool {
     max != 0 && vtable >= max
 }
 
-/// Whether `addr` can be the address of a vtable in the kernel image.
+/// Whether `addr` lies in the kernel half of the address space.
 ///
 /// Every bare-metal target links the kernel into the upper half (x86_64
 /// `0xffff_8000_…`, riscv64 `0xffff_ffc0_…`, aarch64 TTBR1 `0xffff_…`), so a
 /// sign-extended-negative value is the portable test, and a small or user-half
 /// value in a vtable slot is corruption by construction.
 ///
+/// It is a function of its argument, and not folded into the `cfg!` arm of
+/// [`plausible_vtable`] below, because that arm is the one a host build never
+/// takes: with the comparison written inside it, **no test in the tree ever
+/// evaluated it**, and inverting it was a change no test could see. On bare
+/// metal an inverted test refuses every genuine vtable, so the first dispatch
+/// latches [`heap_smash_suspected`] and the IRQ and timer paths stop calling
+/// every closure at once -- keyboard, serial, xHCI and all timers -- which is
+/// the frozen machine with no fault to point at that this module exists to
+/// prevent.
+#[inline]
+const fn in_kernel_half(addr: usize) -> bool {
+    (addr as isize) < 0
+}
+
+/// Whether `addr` can be the address of a vtable, given whether this build
+/// has a kernel/user split at all.
+///
 /// On a hosted build (libos) the whole "kernel" is an ordinary userspace
-/// process, so its vtables live at *low* addresses and this test would reject
-/// every handler in the system. There is no kernel/user split to check there —
-/// the test degrades to "not null", which is all that is knowable.
+/// process, so its vtables live at *low* addresses and [`in_kernel_half`] would
+/// reject every handler in the system. There is no split to check there — the
+/// test degrades to "not null", which is all that is knowable.
+///
+/// `bare_metal` is a parameter rather than a `cfg!` read inside, for the same
+/// reason [`in_kernel_half`] is its own function: a host test can then see
+/// **both** answers. With the `cfg!` inline, the whole composition lived in an
+/// arm no test build takes, so dropping the call to [`in_kernel_half`]
+/// altogether was still a change nothing could catch.
+#[inline]
+const fn plausible_vtable_when(bare_metal: bool, addr: usize) -> bool {
+    !bare_metal || in_kernel_half(addr)
+}
+
+/// Whether `addr` can be the address of a vtable in this kernel's image.
+/// The `cfg!` decides *whether* the split applies, never what it says.
 #[inline]
 fn plausible_vtable(addr: usize) -> bool {
-    if cfg!(target_os = "none") {
-        (addr as isize) < 0
-    } else {
-        true
-    }
+    plausible_vtable_when(cfg!(target_os = "none"), addr)
 }
 
 /// Whether the `dyn` fat pointer stored in `p` still looks callable.
@@ -502,5 +528,93 @@ mod fat_ptr_tests {
                 "one past the last slot has to be unplaceable, not silent"
             );
         }
+    }
+
+    /// The three bases this kernel is actually linked at, and the addresses a
+    /// smashed vtable slot holds instead. Reached directly because
+    /// `plausible_vtable` folds this answer away on a hosted build, which is
+    /// every build that runs a test.
+    #[test]
+    fn the_kernel_half_test_knows_every_base_the_kernel_is_linked_at() {
+        assert_eq!(
+            usize::BITS,
+            64,
+            "los tres objetivos del arbol son de 64 bits"
+        );
+        for (name, base) in [
+            ("x86_64", 0xffff_8000_0000_0000usize),
+            ("riscv64 Sv39/Sv48", 0xffff_ffc0_0000_0000usize),
+            ("aarch64 TTBR1", 0xffff_0000_0000_0000usize),
+            ("el tope del espacio", usize::MAX),
+        ] {
+            assert!(
+                in_kernel_half(base),
+                "{} ({:#x}) es la mitad del kernel: si esto dice que no, el \
+                 kernel rechaza todas sus propias vtables",
+                name,
+                base
+            );
+        }
+    }
+
+    /// And the shapes a use-after-free leaves there. A vtable word holding any
+    /// of these is corruption by construction, because the linker cannot put
+    /// `.rodata` in the lower half of a bare-metal build.
+    #[test]
+    fn the_kernel_half_test_turns_down_user_addresses_and_small_garbage() {
+        for (what, addr) in [
+            ("cero", 0usize),
+            ("un puntero colgante de algo sin tamaño", 1usize),
+            ("una alineacion suelta", 8usize),
+            ("una pila de usuario tipica", 0x0000_7fff_ffff_f000usize),
+            ("un mapeo de usuario con ASLR", 0x0000_5555_5555_5000usize),
+        ] {
+            assert!(
+                !in_kernel_half(addr),
+                "{} ({:#x}) no puede ser una vtable del kernel",
+                what,
+                addr
+            );
+        }
+    }
+
+    /// The split is exactly the top half, not one bit more or less: it is the
+    /// sign bit of a `usize`, which is what makes one comparison work for the
+    /// three different bases above.
+    #[test]
+    fn the_half_the_kernel_lives_in_is_exactly_the_top_one() {
+        let first_kernel_addr = 1usize << (usize::BITS - 1);
+        assert!(in_kernel_half(first_kernel_addr));
+        assert!(!in_kernel_half(first_kernel_addr - 1));
+    }
+
+    /// On this build --- a hosted one, like every build that runs a test ---
+    /// the kernel-half test must NOT be applied, or the libos kernel would
+    /// refuse every handler it has. This is the arm that hid the one above.
+    #[test]
+    fn a_hosted_build_does_not_apply_the_kernel_half_test() {
+        assert!(!cfg!(target_os = "none"), "los tests corren alojados");
+        let a_low_address = 0x1000usize;
+        assert!(!in_kernel_half(a_low_address));
+        assert!(
+            plausible_vtable(a_low_address),
+            "alojado no hay reparto kernel/usuario que comprobar"
+        );
+    }
+
+    /// And what the bare-metal build does with the same addresses, which is
+    /// the arm the host never runs: there, and only there, a vtable outside
+    /// the kernel half is refused.
+    #[test]
+    fn on_bare_metal_a_vtable_outside_the_kernel_half_is_refused() {
+        let user = 0x0000_5555_5555_5000usize;
+        let kernel = 0xffff_8000_0000_0000usize;
+
+        assert!(!plausible_vtable_when(true, user));
+        assert!(plausible_vtable_when(true, kernel));
+
+        // Hosted: no split, so the same user address is fine.
+        assert!(plausible_vtable_when(false, user));
+        assert!(plausible_vtable_when(false, kernel));
     }
 }
