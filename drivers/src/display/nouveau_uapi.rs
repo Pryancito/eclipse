@@ -1744,6 +1744,10 @@ pub(super) fn format_exec_profile() -> alloc::string::String {
         EXEC_LEGACY_FENCE_US.load(Ordering::Relaxed),
     );
     let _ = writeln!(s, "[gpudbg]  {}", crate::scheme::syncobj::stats_line());
+    // Before the ioctl table, because it is the line that explains a table
+    // full of small numbers: the driver's profile starts timing when the
+    // dispatch starts, which is after the pre-wait has already let go.
+    s.push_str(&crate::scheme::prewait::profile_lines());
     let _ = writeln!(
         s,
         "[gpudbg]  ioctl            count      total_us      avg_us      max_us"
