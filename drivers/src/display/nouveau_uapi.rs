@@ -931,6 +931,9 @@ pub(super) const NOUVEAU_GETPARAM_AGP_SIZE: u64 = 9;
 /// mean.
 pub(super) const NOUVEAU_GETPARAM_PTIMER_TIME: u64 = 14;
 pub(super) const NOUVEAU_GETPARAM_CHIPSET_ID: u64 = 11;
+/// Deprecated upstream: `nouveau_abi16_ioctl_getparam` answers 0, not
+/// EINVAL, so an old libdrm asking for it still gets its answer.
+pub(super) const NOUVEAU_GETPARAM_VM_VRAM_BASE: u64 = 12;
 /// GPC/TPC topology, chip-specific. **Enumeration-fatal**: mesa's
 /// `nouveau_ws_device_new` does `if (nouveau_ws_param(fd,
 /// NOUVEAU_GETPARAM_GRAPH_UNITS, &value)) goto out_err;` and then unpacks
@@ -947,6 +950,13 @@ pub(super) const NOUVEAU_GETPARAM_HAS_PAGEFLIP: u64 = 16;
 pub(super) const NOUVEAU_GETPARAM_VRAM_BAR_SIZE: u64 = 18;
 pub(super) const NOUVEAU_GETPARAM_VRAM_USED: u64 = 19;
 pub(super) const NOUVEAU_GETPARAM_HAS_VMA_TILEMODE: u64 = 20;
+
+/// `drm_nouveau_channel_alloc.pushbuf_domains` on Tesla and later
+/// (`nouveau_abi16_ioctl_channel_alloc`): a push buffer may live in either
+/// domain, so libdrm is told both. Before Tesla it was the one domain the
+/// kernel's own push buffer sat in.
+pub(super) const NOUVEAU_CHANNEL_PUSHBUF_DOMAINS: u32 =
+    NOUVEAU_GEM_DOMAIN_VRAM | NOUVEAU_GEM_DOMAIN_GART;
 
 // --- NOUVEAU_GEM_DOMAIN_* flags (`nouveau_drm.h`) ---
 pub(super) const NOUVEAU_GEM_DOMAIN_VRAM: u32 = 1 << 1;

@@ -454,7 +454,11 @@ fn getparam_enumerates_the_gpu_without_the_rm() {
         "BAR0 reads as zero, so the architecture's flagship chip stands in"
     );
     assert_eq!(getparam(&gpu, nv::NOUVEAU_GETPARAM_HAS_VMA_TILEMODE), Ok(1));
-    assert_eq!(getparam(&gpu, nv::NOUVEAU_GETPARAM_HAS_PAGEFLIP), Ok(0));
+    // What upstream has answered since these were added: 1 and 1, and
+    // 0 for the deprecated VM_VRAM_BASE rather than EINVAL.
+    assert_eq!(getparam(&gpu, nv::NOUVEAU_GETPARAM_HAS_PAGEFLIP), Ok(1));
+    assert_eq!(getparam(&gpu, nv::NOUVEAU_GETPARAM_HAS_BO_USAGE), Ok(1));
+    assert_eq!(getparam(&gpu, nv::NOUVEAU_GETPARAM_VM_VRAM_BASE), Ok(0));
     assert_eq!(getparam(&gpu, nv::NOUVEAU_GETPARAM_EXEC_PUSH_MAX), Ok(64));
     assert_eq!(
         getparam(&gpu, nv::NOUVEAU_GETPARAM_GRAPH_UNITS),
@@ -650,7 +654,11 @@ fn channels_without_the_rm_are_discovery_only_and_free_is_owner_scoped() {
     let c = channel_alloc(&gpu, A).unwrap();
     assert_eq!(c.channel, 0);
     assert_eq!(c.notifier_handle, 0, "no RM notifier");
-    assert_eq!(c.pushbuf_domains, nv::NOUVEAU_GEM_DOMAIN_VRAM);
+    assert_eq!(
+        c.pushbuf_domains,
+        nv::NOUVEAU_GEM_DOMAIN_VRAM | nv::NOUVEAU_GEM_DOMAIN_GART,
+        "Tesla and later: a push buffer may sit in either domain"
+    );
     assert_eq!(c.nr_subchan, 0);
     assert_eq!(channel_alloc(&gpu, A).unwrap().channel, 1);
     assert_eq!(channel_alloc(&gpu, B).unwrap().channel, 2);
@@ -1435,6 +1443,11 @@ fn with_the_rm_a_clients_channel_builds_its_own_context_once_and_falls_back_when
     let c = channel_alloc(&gpu, A).unwrap();
     assert_eq!(c.channel, 0);
     assert_eq!(c.notifier_handle, 0x6001, "the notifier of CTX 1");
+    assert_eq!(
+        c.pushbuf_domains,
+        nv::NOUVEAU_GEM_DOMAIN_VRAM | nv::NOUVEAU_GEM_DOMAIN_GART,
+        "pushbufs may live in VRAM or GART on Tesla+"
+    );
     assert_eq!(
         ctx_of(&gpu, A),
         Some((1, true)),
@@ -7213,6 +7226,11 @@ fn the_compositor_claims_ctx0_through_the_ladder_once_and_keeps_it_across_its_th
     assert_eq!(
         c.notifier_handle, 0x6000,
         "the singleton channel's notifier"
+    );
+    assert_eq!(
+        c.pushbuf_domains,
+        nv::NOUVEAU_GEM_DOMAIN_VRAM | nv::NOUVEAU_GEM_DOMAIN_GART,
+        "the ladder channel reports the same domains"
     );
     assert_eq!(ctx0_owner(&gpu), COMP);
     assert_eq!(

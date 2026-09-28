@@ -11148,7 +11148,7 @@ impl NvidiaGpu {
         let req = unsafe { &mut *(arg as *mut nv::DrmNouveauChannelAlloc) };
         req.channel = new_id;
         req.notifier_handle = notif_out;
-        req.pushbuf_domains = nv::NOUVEAU_GEM_DOMAIN_VRAM;
+        req.pushbuf_domains = nv::NOUVEAU_CHANNEL_PUSHBUF_DOMAINS;
         req.nr_subchan = 0;
         crate::klog_warn!(
             "[nouveau-uapi] CHANNEL_ALLOC owner_pid={} -> channel={} {}",
@@ -11275,7 +11275,7 @@ impl NvidiaGpu {
         let req = unsafe { &mut *(arg as *mut nv::DrmNouveauChannelAlloc) };
         req.channel = new_id;
         req.notifier_handle = 0;
-        req.pushbuf_domains = nv::NOUVEAU_GEM_DOMAIN_VRAM;
+        req.pushbuf_domains = nv::NOUVEAU_CHANNEL_PUSHBUF_DOMAINS;
         req.nr_subchan = 0;
         crate::klog_warn!(
             "[nouveau-uapi] CHANNEL_ALLOC owner_pid={} -> channel={} DISCOVERY ONLY \
@@ -12423,8 +12423,16 @@ impl NvidiaGpu {
                     // gallium's nouveau GL still reads this, and a bound value
                     // decodes to the wrong SM (0x170 is GA100, not GA10x).
                     nv::NOUVEAU_GETPARAM_CHIPSET_ID => self.nouveau_chipset_id() as u64,
-                    nv::NOUVEAU_GETPARAM_HAS_BO_USAGE => 0,
-                    nv::NOUVEAU_GETPARAM_HAS_PAGEFLIP => 0,
+                    // Both have answered 1 upstream since they were added
+                    // (`nouveau_abi16_ioctl_getparam`): libdrm reads
+                    // HAS_BO_USAGE to fill the read/write/valid domains of
+                    // a PUSHBUF's buffer list, and the X driver reads
+                    // HAS_PAGEFLIP to flip instead of copy. A 0 here made a
+                    // client behave as on a pre-2011 kernel.
+                    nv::NOUVEAU_GETPARAM_HAS_BO_USAGE => 1,
+                    nv::NOUVEAU_GETPARAM_HAS_PAGEFLIP => 1,
+                    // Deprecated upstream, answered with 0, never EINVAL.
+                    nv::NOUVEAU_GETPARAM_VM_VRAM_BASE => 0,
                     // 1: this driver accepts the tile_mode/tile_flags fields
                     // on GEM_NEW and the PTE kind on VM_BIND. It gates
                     // NVK's VK_EXT_image_drm_format_modifier, which wlroots
@@ -12708,7 +12716,7 @@ impl NvidiaGpu {
                 drop(chan);
                 req.channel = new_id;
                 req.notifier_handle = channel.h_notifier;
-                req.pushbuf_domains = nv::NOUVEAU_GEM_DOMAIN_VRAM;
+                req.pushbuf_domains = nv::NOUVEAU_CHANNEL_PUSHBUF_DOMAINS;
                 req.nr_subchan = 0;
                 log::info!(
                     "[nouveau-uapi] CHANNEL_ALLOC owner_pid={} -> channel={} ctx0 sticky (hVas={:#010x} hNotifier={:#010x})",
