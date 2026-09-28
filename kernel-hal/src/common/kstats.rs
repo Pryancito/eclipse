@@ -922,4 +922,331 @@ mod tests {
             .iter()
             .any(|(_, _, _, rip)| *rip == 0xc0ff_ee00));
     }
+
+    // ── the gap between two ticks ────────────────────────────────────────
+
+    /// The tick period this kernel programs, in ns.
+    const NOMINAL: u64 = 1_000_000;
+
+    /// What one `note_tick_gap` recorded.
+    #[derive(Debug, PartialEq, Eq, Default)]
+    struct Recorded {
+        late: u64,
+        late_idle: u64,
+        max_ns: u64,
+        last_late_ns: u64,
+        last_late_at: u64,
+    }
+
+    /// Put every slot in the same state, so which one `cpu_id()` names --
+    /// and whether the thread moves between two calls -- cannot change the
+    /// answer. Callers hold `SERIAL`.
+    fn prime(last: u64, idle: bool) {
+        for (l, c) in TICK_LAST_NS_PERCPU.iter().zip(CPU_IN_IDLE.iter()) {
+            l.store(last, Relaxed);
+            c.store(idle, Relaxed);
+        }
+        TICK_GAP_MAX_NS.store(0, Relaxed);
+        TICK_GAP_LAST_LATE_NS.store(0, Relaxed);
+        TICK_GAP_LAST_LATE_AT_NS.store(0, Relaxed);
+    }
+
+    /// Drive `note_tick_gap` once from a known state and report what it wrote.
+    fn tick_gap(last: u64, now_ns: u64, nominal_ns: u64, idle: bool) -> Recorded {
+        prime(last, idle);
+        let b = snapshot();
+        note_tick_gap(now_ns, nominal_ns);
+        let a = snapshot();
+        for c in CPU_IN_IDLE.iter() {
+            c.store(false, Relaxed);
+        }
+        Recorded {
+            late: a.tick_gaps_late - b.tick_gaps_late,
+            late_idle: a.tick_gaps_late_idle - b.tick_gaps_late_idle,
+            max_ns: a.tick_gap_max_ns,
+            last_late_ns: a.tick_gap_last_late_ns,
+            last_late_at: a.tick_gap_last_late_at_ns,
+        }
+    }
+
+    #[test]
+    fn the_first_tick_on_a_cpu_has_no_gap_to_report() {
+        let _g = SERIAL.lock();
+        // A zero stamp means this CPU has not ticked yet. Subtracted from all
+        // the same, it reports the whole monotonic clock as one gap: every
+        // core would look stalled since boot on its very first tick, and the
+        // longest-gap figure would never recover.
+        assert_eq!(
+            tick_gap(0, 900 * NOMINAL, NOMINAL, false),
+            Recorded::default(),
+            "el primer tic de una cpu se conto como un hueco"
+        );
+    }
+
+    #[test]
+    fn a_clock_that_did_not_move_forward_reports_no_gap() {
+        let _g = SERIAL.lock();
+        // Two ticks stamped with the same nanosecond, and a reading that came
+        // back behind the last one -- which is what a TSC that boot never
+        // synchronised hands this path. `now - last` would wrap and report
+        // some eighteen quintillion nanoseconds, the largest number the
+        // diagnostic can hold and not a stall.
+        assert_eq!(tick_gap(5_000, 5_000, NOMINAL, false), Recorded::default());
+        assert_eq!(tick_gap(5_000, 4_999, NOMINAL, false), Recorded::default());
+    }
+
+    #[test]
+    fn a_tick_leaves_its_own_stamp_for_the_next_one_to_measure_from() {
+        let _g = SERIAL.lock();
+        // Each gap is measured against the previous tick, so every tick has
+        // to leave its own time behind. Measured against a stamp that never
+        // moves, the gaps grow without anything stalling and the diagnostic
+        // reports a machine that is getting worse by the minute.
+        prime(1_000, false);
+        note_tick_gap(2_000, NOMINAL);
+        TICK_GAP_MAX_NS.store(0, Relaxed);
+        note_tick_gap(3_000, NOMINAL);
+        assert_eq!(
+            TICK_GAP_MAX_NS.load(Relaxed),
+            1_000,
+            "el hueco se midio desde una marca que ya no valia"
+        );
+    }
+
+    #[test]
+    fn three_nominal_periods_is_not_late_yet_and_one_nanosecond_more_is() {
+        let _g = SERIAL.lock();
+        let base = 1_000_000_000u64;
+        // Three periods is the threshold the module names, and a threshold is
+        // a threshold.
+        let r = tick_gap(base, base + 3 * NOMINAL, NOMINAL, false);
+        assert_eq!(r.late, 0, "tres periodos justos se contaron como tarde");
+        assert_eq!(r.max_ns, 3 * NOMINAL, "y el hueco no llego al maximo");
+        // One nanosecond past it.
+        assert_eq!(
+            tick_gap(base, base + 3 * NOMINAL + 1, NOMINAL, false).late,
+            1
+        );
+        // Two periods, where a stricter threshold would fire: every ordinary
+        // scheduling hiccup lands there, and a counter that counts those
+        // stops pointing at anything.
+        assert_eq!(tick_gap(base, base + 2 * NOMINAL, NOMINAL, false).late, 0);
+    }
+
+    #[test]
+    fn a_nominal_period_near_the_top_of_the_range_does_not_wrap_into_lateness() {
+        let _g = SERIAL.lock();
+        // Three times a period that is already a third of the range does not
+        // fit in one. Wrapped instead of saturated the threshold comes out at
+        // two nanoseconds, so every tick is late from the first one on and
+        // the stall counter is pinned for the rest of the boot.
+        let huge = u64::MAX / 3 + 1;
+        assert_eq!(
+            tick_gap(1, 1 + 4 * NOMINAL, huge, false).late,
+            0,
+            "un periodo enorme hizo tarde a todos los tics"
+        );
+    }
+
+    #[test]
+    fn a_late_tick_that_interrupted_the_halt_is_counted_apart() {
+        let _g = SERIAL.lock();
+        // A halted vCPU the host wakes late harms nobody: nothing was waiting
+        // on it, and on a lightly loaded machine that is most late ticks.
+        // Counted together with the stalls that did hurt, they bury them.
+        let base = 1_000_000_000u64;
+        let r = tick_gap(base, base + 100 * NOMINAL, NOMINAL, true);
+        assert_eq!(
+            r.late_idle, 1,
+            "el tic tarde sobre el halt no se conto aparte"
+        );
+        assert_eq!(r.late, 0, "y ademas se conto como un atasco de verdad");
+        assert_eq!(r.max_ns, 0, "el hueco del halt subio el peor hueco");
+        // The same gap on a busy CPU is the real thing.
+        let r = tick_gap(base, base + 100 * NOMINAL, NOMINAL, false);
+        assert_eq!((r.late, r.late_idle), (1, 0));
+        assert_eq!(r.max_ns, 100 * NOMINAL);
+    }
+
+    #[test]
+    fn the_longest_gap_is_the_longest_one_and_not_the_last_one() {
+        let _g = SERIAL.lock();
+        // It is the headline of the stall diagnostic: the worst this machine
+        // went without a tick. Overwritten rather than kept, it reports
+        // whatever the most recent tick happened to be, and a machine that
+        // stalled once and then behaved reports nothing at all.
+        let base = 1_000_000_000u64;
+        prime(base, false);
+        note_tick_gap(base + 50 * NOMINAL, NOMINAL);
+        note_tick_gap(base + 50 * NOMINAL + 1, NOMINAL);
+        assert_eq!(
+            TICK_GAP_MAX_NS.load(Relaxed),
+            50 * NOMINAL,
+            "el peor hueco lo piso el tic siguiente"
+        );
+    }
+
+    #[test]
+    fn the_last_late_gap_records_its_size_and_its_time_the_right_way_round() {
+        let _g = SERIAL.lock();
+        // The pair reads as "a gap of N ns, at time T". The other way round
+        // it says the machine stalled for as long as it has been up, a few
+        // microseconds after boot.
+        let base = 1_000_000_000u64;
+        let now = base + 100 * NOMINAL;
+        let r = tick_gap(base, now, NOMINAL, false);
+        assert_eq!(r.last_late_ns, 100 * NOMINAL, "el tamano del ultimo atasco");
+        assert_eq!(r.last_late_at, now, "y el momento en que paso");
+    }
+
+    // ── who is halted, and where each core was ───────────────────────────
+
+    #[test]
+    fn the_idle_mask_puts_each_cpu_in_its_own_bit() {
+        let _g = SERIAL.lock();
+        // The TLB-shootdown initiator reads this to decide which cores it may
+        // skip waiting on. A bit in the wrong place lets it skip a core that
+        // is *running*, whose shootdown then becomes fire-and-forget while it
+        // keeps executing against a stale TLB entry.
+        for c in CPU_IN_IDLE.iter() {
+            c.store(false, Relaxed);
+        }
+        assert_eq!(cpu_idle_mask(), 0);
+        for cpu in [0usize, 1, 7, MAX_CORE_NUM - 1] {
+            for c in CPU_IN_IDLE.iter() {
+                c.store(false, Relaxed);
+            }
+            CPU_IN_IDLE[cpu].store(true, Relaxed);
+            assert_eq!(cpu_idle_mask(), 1u64 << cpu, "la cpu {} no es su bit", cpu);
+            assert_eq!(cpus_idle_now(), 1);
+        }
+        for c in CPU_IN_IDLE.iter() {
+            c.store(false, Relaxed);
+        }
+    }
+
+    #[test]
+    fn the_nmi_rips_name_the_cpus_that_answered_and_leave_out_the_rest() {
+        let _g = SERIAL.lock();
+        // The deadlock banner reads these to say where each wedged core
+        // actually is, and the index is the only thing tying a line to a
+        // core. A CPU that never took the NMI has a zero slot and no line;
+        // listed anyway it reads as "cpu 5 is at address 0".
+        for s in NMI_RIP_PERCPU.iter() {
+            s.store(0, Relaxed);
+        }
+        assert!(nmi_rips().is_empty());
+        NMI_RIP_PERCPU[3].store(0xffff_8000_0001_0000, Relaxed);
+        NMI_RIP_PERCPU[11].store(0x40_4142, Relaxed);
+        assert_eq!(
+            nmi_rips(),
+            [(3u16, 0xffff_8000_0001_0000u64), (11, 0x40_4142)],
+            "la lista no nombra a las cpus que contestaron"
+        );
+        // The non-allocating single-CPU read, which the panic painter uses
+        // because the allocator may be one of the wedged locks, agrees.
+        assert_eq!(nmi_rip(3), 0xffff_8000_0001_0000);
+        assert_eq!(nmi_rip(4), 0);
+        for s in NMI_RIP_PERCPU.iter() {
+            s.store(0, Relaxed);
+        }
+    }
+
+    #[test]
+    fn a_tick_that_interrupted_the_kernel_is_not_a_user_tick() {
+        let _g = SERIAL.lock();
+        // `user/total` is what localises a pegged core to ring 3 or ring 0.
+        // With one tick of each kind there is exactly one user tick whichever
+        // way round the question is asked, so this takes two of one kind.
+        let Some(slot) = current_slot() else {
+            return;
+        };
+        let before = ticks_all(&snapshot());
+        note_tick_context(true, 0x1111);
+        note_tick_context(true, 0x2222);
+        note_tick_context(false, 0x3333);
+        let after = ticks_all(&snapshot());
+        assert_eq!(after.0 - before.0, 3, "los tres tics");
+        assert_eq!(after.1 - before.1, 2, "de los que dos son de usuario");
+        // The last one owns the slot, by its number and for this CPU alike.
+        assert_eq!(cpu_tick_rip(slot), 0x3333);
+        assert_eq!(current_cpu_tick_rip(), 0x3333);
+    }
+
+    #[test]
+    fn the_cpu_one_past_the_last_is_out_of_range_like_any_other() {
+        // `MAX_CORE_NUM` is the number of slots, so the last one is
+        // `MAX_CORE_NUM - 1` and every bound here is written `<`. The id
+        // exactly at the bound is the one a `<=` would let through, and the
+        // tests that were here only tried `MAX_CORE_NUM + 1`, which `<=`
+        // turns away too. Reading another core's slot from the deadlock
+        // banner is the mix-up the per-CPU split exists to end; indexing off
+        // the end of it is a panic inside the panic.
+        note_user_time(MAX_CORE_NUM, 1);
+        note_sys_time(MAX_CORE_NUM, 1);
+        assert_eq!(cpu_times_jiffies(MAX_CORE_NUM), (0, 0, 0));
+        assert_eq!(cpu_tick_rip(MAX_CORE_NUM), 0);
+        assert_eq!(nmi_rip(MAX_CORE_NUM), 0);
+        assert_eq!(nmi_rip(usize::MAX), 0);
+    }
+
+    // ── the counters read as rates ───────────────────────────────────────
+
+    #[test]
+    fn an_allocation_is_counted_even_when_nobody_is_timing_it() {
+        let _g = SERIAL.lock();
+        // The count is what attributes allocations to a region of code:
+        // sample it either side and the difference is that region's own, with
+        // no per-caller plumbing. Kept only while `HEAPPROF=1`, every
+        // ordinary boot reports zero allocations.
+        let (a0, ac0, d0, dc0) = heap_prof_stats();
+        note_heap_alloc(0);
+        note_heap_alloc(0);
+        note_heap_dealloc(0);
+        let (a1, ac1, d1, dc1) = heap_prof_stats();
+        assert_eq!(a1 - a0, 2, "las reservas sin cronometrar no se contaron");
+        assert_eq!(d1 - d0, 1, "ni las liberaciones");
+        assert_eq!((ac1, dc1), (ac0, dc0), "y una medida de cero sumo ciclos");
+        // With the profile on, the cycles land where they are named.
+        note_heap_alloc(700);
+        note_heap_dealloc(11);
+        let (_, ac2, _, dc2) = heap_prof_stats();
+        assert_eq!(ac2 - ac1, 700, "los ciclos de reservar");
+        assert_eq!(dc2 - dc1, 11, "los ciclos de liberar");
+    }
+
+    #[test]
+    fn idle_callbacks_that_found_no_work_do_not_count_as_busy() {
+        // `busy/total` is the rate that says deferred work is what keeps the
+        // CPUs awake. Counted the other way round it is the exact inverse,
+        // and both tests that were here are `>=` lower bounds that pass
+        // either way.
+        let before = snapshot();
+        for _ in 0..16 {
+            note_idle_callback(false);
+        }
+        let after = snapshot();
+        assert!(after.idle_cb_total >= before.idle_cb_total + 16);
+        assert!(
+            after.idle_cb_busy - before.idle_cb_busy < 16,
+            "dieciseis llamadas sin trabajo contaron como ocupadas"
+        );
+    }
+
+    #[test]
+    fn a_nap_lands_in_its_own_cpus_idle_time_and_not_only_in_its_count() {
+        // The idle column of `/proc/stat` for one core comes from here. With
+        // the nap counted and its nanoseconds dropped, a core that sleeps all
+        // day reports a thousand naps and no idle time at all, which reads as
+        // a core that is pegged.
+        let ns_all = |s: &KStats| -> u64 { s.idle_percpu.iter().map(|(_, _, ns)| *ns).sum() };
+        let before = snapshot();
+        note_idle(7_000_000);
+        let after = snapshot();
+        assert!(
+            ns_all(&after) >= ns_all(&before) + 7_000_000,
+            "la siesta no sumo al tiempo de su cpu"
+        );
+        assert!(ns_all(&after) <= after.idle_ns);
+    }
 }
