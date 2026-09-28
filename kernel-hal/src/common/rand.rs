@@ -152,14 +152,28 @@ fn boot_seed() -> u64 {
     )
 }
 
+/// Fill `buf` from the software generator and then mix the hardware source
+/// over it, in that order.
+///
+/// The order is the whole of it, which is why it has a name of its own. The
+/// hardware word is XORed *over* bytes that are already random, so a hardware
+/// failure is a downgrade rather than a buffer of zeros -- and filling after
+/// mixing throws the hardware contribution away just as completely, leaving
+/// the software bytes alone on a machine that has a source and it works.
+/// Neither mistake is visible from outside: the caller cannot predict either
+/// half, so it cannot tell which one it got.
+fn fill_then_mix(buf: &mut [u8], soft: impl FnOnce(&mut [u8]), hardware: impl FnOnce(&mut [u8])) {
+    soft(buf);
+    hardware(buf);
+}
+
 /// Fill `buf` with random bytes.
 ///
 /// The software generator always runs; the hardware source is XORed over the
 /// result when the machine has one. Mixing rather than choosing is what makes
 /// a hardware failure a downgrade instead of a buffer of zeros.
 pub fn fill_random(buf: &mut [u8]) {
-    SOFT.fill(buf, boot_seed);
-    hardware_xor(buf);
+    fill_then_mix(buf, |b| SOFT.fill(b, boot_seed), hardware_xor);
 }
 
 /// XOR a hardware random word over each eight bytes of `buf`, where the
@@ -173,12 +187,27 @@ fn hardware_xor(buf: &mut [u8]) {
         if !x86::has_rdrand() {
             return;
         }
-        for chunk in buf.chunks_mut(8) {
-            if let Some(r) = x86::rdrand64() {
-                let word = r.to_ne_bytes();
-                for (b, w) in chunk.iter_mut().zip(word.iter()) {
-                    *b ^= *w;
-                }
+        mix_hardware_over(buf, x86::rdrand64);
+    }
+}
+
+/// XOR one hardware word over every eight bytes of `buf`, taking each word
+/// from `next`.
+///
+/// Two things here are easy to get subtly wrong and impossible to see from
+/// outside, because the real source answers differently every time: it is
+/// *every* eight bytes and not just the first, and each word is XORed over
+/// what is already there rather than written on top of it. Assignment would
+/// make the answer only as good as the instruction, and the instruction is
+/// allowed to decline -- `next` answering `None` leaves that eight bytes
+/// exactly as the caller filled them.
+#[cfg(target_arch = "x86_64")]
+fn mix_hardware_over(buf: &mut [u8], mut next: impl FnMut() -> Option<u64>) {
+    for chunk in buf.chunks_mut(8) {
+        if let Some(r) = next() {
+            let word = r.to_ne_bytes();
+            for (b, w) in chunk.iter_mut().zip(word.iter()) {
+                *b ^= *w;
             }
         }
     }
@@ -231,14 +260,30 @@ mod x86 {
     /// recommendation; past that the part is broken, and the answer is `None`
     /// rather than a zero the caller cannot tell from a number.
     pub fn rdrand64() -> Option<u64> {
-        for _ in 0..10 {
+        retrying(|| {
             let mut r: u64 = 0;
             let ok = unsafe { core::arch::x86_64::_rdrand64_step(&mut r) };
             if ok == 1 {
-                return Some(r);
+                Some(r)
+            } else {
+                None
             }
-        }
-        None
+        })
+    }
+
+    /// How many times [`rdrand64`] asks before giving up.
+    pub const TRIES: u32 = 10;
+
+    /// Ask `attempt` for a word up to [`TRIES`] times.
+    ///
+    /// Split out because the number is the whole point of the function and
+    /// nothing can make the real instruction decline on demand: a part that
+    /// asks once hands back `None` -- and so contributes nothing at all to
+    /// that eight bytes -- every time the on-chip pool happens to be empty,
+    /// which is the condition the SDM says to retry through rather than an
+    /// error.
+    pub fn retrying(mut attempt: impl FnMut() -> Option<u64>) -> Option<u64> {
+        (0..TRIES).find_map(|_| attempt())
     }
 }
 
@@ -568,6 +613,174 @@ mod tests {
             hardware_xor(&mut buf);
             x86::restore(was);
             assert_eq!(buf, [0xa5u8; 24], "it read from a source it has not got");
+        }
+    }
+
+    /// Two CPUs arriving at an unseeded generator together: the exchange is
+    /// what makes the loser keep the winner's seed instead of walking a state
+    /// of its own, which is two processes drawing from two generators that
+    /// were seeded from the same clock reading. The seed closure runs inside
+    /// exactly that window -- after the check and before the exchange -- so a
+    /// closure that seeds the generator itself stands in for the other CPU,
+    /// with no thread and no timing.
+    #[test]
+    fn the_cpu_that_loses_the_race_keeps_the_seed_the_winner_took() {
+        let g = SoftRandom::new();
+        let winner = mix64(0x1111_1111_1111_1111) | 1;
+        g.seed_once(|| {
+            g.seed_once(|| 0x1111_1111_1111_1111);
+            0x2222_2222_2222_2222
+        });
+        assert_eq!(
+            g.peek(),
+            winner,
+            "el que llego primero es el que deja la semilla"
+        );
+    }
+
+    /// `mix64` is pinned against the reference, but not the walk that feeds
+    /// it. splitmix64's `next()` advances the counter and *then* mixes, so
+    /// the first word after seeding is `mix64(seed + GOLDEN)` and not
+    /// `mix64(seed)`. Mixing before advancing is a different generator, and
+    /// handing the counter out unmixed is not a generator at all.
+    #[test]
+    fn the_walk_is_the_published_splitmix64_and_not_only_its_mixer() {
+        let g = SoftRandom::new();
+        g.seed_once(|| 0x1234_5678_9abc_def0);
+        let mut state = g.peek();
+        for i in 0..4 {
+            state = state.wrapping_add(GOLDEN);
+            assert_eq!(g.draw(), mix64(state), "la palabra numero {}", i);
+        }
+    }
+
+    /// The counter walks by a constant, so handing it out as the answer --
+    /// which is what dropping the mixer does -- gives consecutive words a
+    /// constant difference: one sample and you have every word after it.
+    /// Nothing said so, because "two words differ" is true of a counter too.
+    #[test]
+    fn consecutive_words_are_not_a_fixed_distance_apart() {
+        let g = SoftRandom::new();
+        g.seed_once(|| 7);
+        let words: alloc::vec::Vec<u64> = (0..8).map(|_| g.draw()).collect();
+        let steps: alloc::collections::BTreeSet<u64> = words
+            .windows(2)
+            .map(|pair| pair[1].wrapping_sub(pair[0]))
+            .collect();
+        assert!(
+            steps.len() > 1,
+            "siete saltos y todos iguales: eso es un contador, no un generador"
+        );
+    }
+
+    /// Each of the four things the seed is made of has to be able to change
+    /// any bit of the result in both directions, which is what XOR gives and
+    /// `|` does not: once a bit is set an `or` can never clear it again, so
+    /// the seed saturates toward all-ones as terms are folded in. "Each one
+    /// reaches the result" does not say that, and every case above only said
+    /// that.
+    #[test]
+    fn folding_a_term_into_the_seed_flips_exactly_its_own_bits() {
+        // A background the other three terms hold still, and not zero:
+        // `mix64(0)` is 0, so a background of zeros lets an `or` look like an
+        // xor.
+        const BG: u64 = 0x0f0f_0f0f_0f0f_0f0f;
+        // The nanoseconds go in raw, so they flip their own bits one for one.
+        assert_eq!(seed_from(0, BG, BG, BG) ^ seed_from(!0, BG, BG, BG), !0);
+        // The other three go in mixed, so what they flip is the mixer's
+        // output -- exactly, with nothing else moving.
+        let flip = mix64(3) ^ mix64(9);
+        assert_eq!(seed_from(BG, 3, BG, BG) ^ seed_from(BG, 9, BG, BG), flip);
+        assert_eq!(seed_from(BG, BG, 3, BG) ^ seed_from(BG, BG, 9, BG), flip);
+        assert_eq!(seed_from(BG, BG, BG, 3) ^ seed_from(BG, BG, BG, 9), flip);
+    }
+
+    /// The order inside [`fill_random`]: the software bytes go down first and
+    /// the hardware word is XORed over them.
+    #[test]
+    fn the_hardware_is_mixed_over_the_software_bytes_and_not_under_them() {
+        let mut buf = [0u8; 4];
+        fill_then_mix(
+            &mut buf,
+            |b| b.fill(0xaa),
+            |b| b.iter_mut().for_each(|x| *x ^= 0x0f),
+        );
+        assert_eq!(buf, [0xa5u8; 4], "0xaa con 0x0f mezclado encima");
+    }
+
+    /// The two halves of the mixing that no test could reach, because the
+    /// real source answers differently every time.
+    #[test]
+    fn every_eight_bytes_gets_a_hardware_word_xored_over_it() {
+        #[cfg(target_arch = "x86_64")]
+        {
+            let mut buf = [0xffu8; 20];
+            let mut asked = 0u64;
+            mix_hardware_over(&mut buf, || {
+                asked += 1;
+                Some(asked)
+            });
+            assert_eq!(asked, 3, "veinte bytes son tres palabras, no una");
+            assert_ne!(buf[16], 0xff, "el ultimo trozo se quedo sin mezclar");
+
+            // XOR and not assignment: mixing the same words over it again
+            // gives back exactly what was there.
+            let mut again = 0u64;
+            mix_hardware_over(&mut buf, || {
+                again += 1;
+                Some(again)
+            });
+            assert_eq!(buf, [0xffu8; 20], "mezclar dos veces lo mismo deshace");
+        }
+    }
+
+    /// `has_rdrand` answers and remembers in the same breath, and the two
+    /// have to say the same thing: remembering the opposite of what it
+    /// returned gives the first caller one answer and everybody after it the
+    /// other. This does not need to know whether the machine has the
+    /// instruction, only that the two agree.
+    #[test]
+    fn what_the_cpuid_answer_remembers_is_what_it_answered() {
+        #[cfg(target_arch = "x86_64")]
+        {
+            let was = x86::force(true);
+            x86::restore(0); // unasked, so the next call really asks
+            let first = x86::has_rdrand();
+            assert_eq!(
+                x86::cached(),
+                if first { 2 } else { 1 },
+                "recordo lo contrario de lo que acababa de contestar"
+            );
+            assert_eq!(x86::has_rdrand(), first, "y la segunda vez cambio");
+            x86::restore(was);
+        }
+    }
+
+    /// Ten attempts is Intel's own recommendation, and nothing can make the
+    /// real instruction decline on demand.
+    #[test]
+    fn a_declined_draw_is_retried_the_number_of_times_the_sdm_says() {
+        #[cfg(target_arch = "x86_64")]
+        {
+            let mut asked = 0u32;
+            let got = x86::retrying(|| {
+                asked += 1;
+                if asked == x86::TRIES {
+                    Some(42)
+                } else {
+                    None
+                }
+            });
+            assert_eq!(got, Some(42), "se rindio antes del ultimo intento");
+            assert_eq!(asked, x86::TRIES);
+
+            let mut all = 0u32;
+            let none = x86::retrying(|| {
+                all += 1;
+                None
+            });
+            assert_eq!(none, None);
+            assert_eq!(all, x86::TRIES, "ni un intento mas, ni uno menos");
         }
     }
 
