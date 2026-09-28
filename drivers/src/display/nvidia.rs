@@ -11777,6 +11777,123 @@ impl NvidiaGpu {
         (gpc & 0xff) | ((tpc & 0xffff) << 8)
     }
 
+    /// One of the caller's channels, by the id CHANNEL_ALLOC handed back
+    /// (`nouveau_abi16_chan`: the abi16's own list, matched on `chid`).
+    fn nouveau_channel_is_callers(&self, channel: i32, owner_pid: u64) -> bool {
+        channel >= 0
+            && self.nouveau_channels.lock().iter().any(|c| {
+                c.id >= 0 && c.id == channel && (owner_pid == 0 || c.owner_pid == owner_pid)
+            })
+    }
+
+    /// An engine object on one of the caller's channels: what an NVIF NEW on
+    /// a channel's route and the abi16 `GROBJ_ALLOC` both make
+    /// (`nouveau_abi16_ioctl_new` and `nouveau_abi16_ioctl_grobj_alloc` both
+    /// end in `nvif_object_ctor` on `chan->chan->user`). The channel must
+    /// exist and be the caller's (EINVAL, as NVIF's abi16 lookup answers;
+    /// GROBJ_ALLOC has answered its own ENOENT before calling). On an
+    /// RM-backed channel this MUST create a real RM object (see the NVIF NEW
+    /// arm for what an unbuilt engine context costs); a discovery channel
+    /// gets bookkeeping only. `abi16` files the object where `GPUOBJ_FREE`
+    /// looks, always, even without an RM behind it (see `CLASS_OBJECTS`).
+    fn nouveau_engine_object_new(
+        &self,
+        owner_pid: u64,
+        channel_token: u64,
+        oclass: u32,
+        object_token: u64,
+        abi16: bool,
+    ) -> Result<(), i32> {
+        use super::nouveau_uapi as nv;
+        let rm_backed = {
+            let chans = self.nouveau_channels.lock();
+            let Some(c) = chans.iter().find(|c| {
+                c.id >= 0
+                    && c.id as u64 == channel_token
+                    && (owner_pid == 0 || c.owner_pid == owner_pid)
+            }) else {
+                log::warn!(
+                    "[nouveau-uapi] engine object NEW oclass={:#06x}: no channel with token={} \
+                     for pid={} -- CHANNEL_ALLOC must come first",
+                    oclass,
+                    channel_token,
+                    owner_pid
+                );
+                return Err(nv::EINVAL);
+            };
+            c.rm_backed
+        };
+        if rm_backed {
+            let Some(device_instance) = *self.rm_device_instance.lock() else {
+                crate::klog_warn!(
+                    "[nouveau-uapi] engine object NEW oclass={:#06x}: channel claims RM \
+                     backing but no device instance -- refusing",
+                    oclass
+                );
+                return Err(nv::ENODEV);
+            };
+            // Build the class on the CALLER'S channel: the compositor
+            // is ctx 0 (unregistered pids also map to 0), each GL
+            // client its own ctx >= 1. A client's 3D class on ctx 0's
+            // channel leaves the client channel's GR context unbuilt
+            // and hangs its first 3D method.
+            let ctx_idx = self.ctx_idx_for_pid(owner_pid);
+            match nvidia_rm_sys::rm_init::class_alloc(device_instance, ctx_idx, oclass) {
+                Ok((h_object, 0)) => {
+                    if abi16 {
+                        nv::abi16_object_insert(
+                            channel_token,
+                            object_token as u32,
+                            h_object,
+                            owner_pid,
+                        );
+                    } else {
+                        nv::class_object_insert(channel_token, object_token, h_object, owner_pid);
+                    }
+                    crate::klog_info!(
+                        "[nouveau-uapi] engine object NEW oclass={:#06x} pid={} -> RM object \
+                         {:#010x} on CTX {} channel token={} (engine context will be built)",
+                        oclass,
+                        owner_pid,
+                        h_object,
+                        ctx_idx,
+                        channel_token
+                    );
+                }
+                Ok((_, alloc_status)) => {
+                    crate::klog_warn!(
+                        "[nouveau-uapi] engine object NEW oclass={:#06x}: RM refused the class \
+                         object, status={:#x} -- failing the NEW (submitting methods \
+                         of this class would MMU-fault the channel)",
+                        oclass,
+                        alloc_status
+                    );
+                    return Err(nv::EINVAL);
+                }
+                Err(status) => {
+                    crate::klog_warn!(
+                        "[nouveau-uapi] engine object NEW oclass={:#06x}: class_alloc failed, \
+                         NV_STATUS={:#x}",
+                        oclass,
+                        status
+                    );
+                    return Err(nv::ENODEV);
+                }
+            }
+        } else {
+            log::warn!(
+                "[nouveau-uapi] engine object NEW oclass={:#06x} on channel token={} \
+                 -- accepted (discovery channel, bookkeeping only)",
+                oclass,
+                channel_token
+            );
+            if abi16 {
+                nv::abi16_object_insert(channel_token, object_token as u32, 0, owner_pid);
+            }
+        }
+        Ok(())
+    }
+
     /// The engine classes advertised through `NVIF SCLASS`.
     ///
     /// Mesa picks, per engine type, the HIGHEST class whose LOW BYTE matches:
@@ -11972,84 +12089,13 @@ impl NvidiaGpu {
                     // allocated, or on another process's, used to answer
                     // "bookkeeping only" -- which on an RM-backed channel is
                     // exactly the unbuilt engine context described above.
-                    let rm_backed = {
-                        let chans = self.nouveau_channels.lock();
-                        let Some(c) = chans.iter().find(|c| {
-                            c.id >= 0
-                                && c.id as u64 == hdr.token
-                                && (owner_pid == 0 || c.owner_pid == owner_pid)
-                        }) else {
-                            log::warn!(
-                                "[nouveau-uapi] NVIF NEW oclass={:#06x}: no channel with token={} \
-                                 for pid={} -- CHANNEL_ALLOC must come first",
-                                new.oclass,
-                                hdr.token,
-                                owner_pid
-                            );
-                            return Err(nv::EINVAL);
-                        };
-                        c.rm_backed
-                    };
-                    if rm_backed {
-                        let Some(device_instance) = *self.rm_device_instance.lock() else {
-                            crate::klog_warn!(
-                                "[nouveau-uapi] NVIF NEW oclass={:#06x}: channel claims RM \
-                                 backing but no device instance -- refusing",
-                                new.oclass
-                            );
-                            return Err(nv::ENODEV);
-                        };
-                        // Build the class on the CALLER'S channel: the compositor
-                        // is ctx 0 (unregistered pids also map to 0), each GL
-                        // client its own ctx >= 1. A client's 3D class on ctx 0's
-                        // channel leaves the client channel's GR context unbuilt
-                        // and hangs its first 3D method.
-                        let ctx_idx = self.ctx_idx_for_pid(owner_pid);
-                        match nvidia_rm_sys::rm_init::class_alloc(
-                            device_instance,
-                            ctx_idx,
-                            new.oclass as u32,
-                        ) {
-                            Ok((h_object, 0)) => {
-                                nv::class_object_insert(hdr.token, new.object, h_object, owner_pid);
-                                crate::klog_info!(
-                                    "[nouveau-uapi] NVIF NEW oclass={:#06x} pid={} -> RM object \
-                                     {:#010x} on CTX {} channel token={} (engine context will be built)",
-                                    new.oclass,
-                                    owner_pid,
-                                    h_object,
-                                    ctx_idx,
-                                    hdr.token
-                                );
-                            }
-                            Ok((_, alloc_status)) => {
-                                crate::klog_warn!(
-                                    "[nouveau-uapi] NVIF NEW oclass={:#06x}: RM refused the class \
-                                     object, status={:#x} -- failing the NEW (submitting methods \
-                                     of this class would MMU-fault the channel)",
-                                    new.oclass,
-                                    alloc_status
-                                );
-                                return Err(nv::EINVAL);
-                            }
-                            Err(status) => {
-                                crate::klog_warn!(
-                                    "[nouveau-uapi] NVIF NEW oclass={:#06x}: class_alloc failed, \
-                                     NV_STATUS={:#x}",
-                                    new.oclass,
-                                    status
-                                );
-                                return Err(nv::ENODEV);
-                            }
-                        }
-                    } else {
-                        log::warn!(
-                            "[nouveau-uapi] NVIF NEW subchannel oclass={:#06x} on channel token={} \
-                             -- accepted (discovery channel, bookkeeping only)",
-                            new.oclass,
-                            hdr.token
-                        );
-                    }
+                    self.nouveau_engine_object_new(
+                        owner_pid,
+                        hdr.token,
+                        new.oclass as u32,
+                        new.object,
+                        false,
+                    )?;
                 }
                 Ok(0)
             }
@@ -12837,10 +12883,11 @@ impl NvidiaGpu {
                 // throwaway-enumeration leak -- without touching another
                 // live channel's classes. Do NOT ctx_free / reset ctx0 here:
                 // VAS is shared across channels of the same pid.
+                // (Drained whatever backs the channel: an abi16 object on a
+                // discovery channel is bookkeeping that must go with it.)
+                let leftovers = nv::class_objects_drain_channel(channel_id as u64, owner_pid);
                 if was_rm_backed {
                     if let Some(device_instance) = *self.rm_device_instance.lock() {
-                        let leftovers =
-                            nv::class_objects_drain_channel(channel_id as u64, owner_pid);
                         for (_token, h_object) in leftovers.iter() {
                             let status =
                                 nvidia_rm_sys::rm_init::class_free(device_instance, *h_object);
@@ -14736,6 +14783,84 @@ impl NvidiaGpu {
             }
 
             nv::NR_NVIF => self.nouveau_nvif(arg, size as usize, owner_pid),
+
+            // The abi16 object ioctls of a libdrm without NVIF
+            // (`nouveau_object_new` / `_del` when `drm->nvif` is false),
+            // deprecated in the uapi header and still in nouveau's table.
+            // They answered ENOSYS as "unhandled".
+            nv::NR_GROBJ_ALLOC => {
+                // `nouveau_abi16_ioctl_grobj_alloc`: a handle of ~0 is
+                // EINVAL before anything; the channel has to be the caller's
+                // (`nouveau_abi16_chan`, ENOENT -- not NVIF NEW's EINVAL);
+                // the old software (0x*6e) and video (0x*b1/b2/b3)
+                // identifiers map to the channel's own class of that low
+                // byte, or to nothing; a class of 0 is EINVAL; then the same
+                // `nvif_object_ctor` an NVIF NEW ends in.
+                let req = unsafe { &*(arg as *const nv::DrmNouveauGrobjAlloc) };
+                if req.handle == u32::MAX {
+                    return Err(nv::EINVAL);
+                }
+                if !self.nouveau_channel_is_callers(req.channel, owner_pid) {
+                    return Err(nv::ENOENT);
+                }
+                let low = req.class & 0xff;
+                let oclass = match low {
+                    0x6e | 0xb1 | 0xb2 | 0xb3 => self
+                        .nouveau_engine_classes()
+                        .and_then(|cs| cs.iter().copied().find(|c| (c & 0xff) == low))
+                        .unwrap_or(0),
+                    _ => req.class,
+                };
+                if oclass == 0 {
+                    return Err(nv::EINVAL);
+                }
+                self.nouveau_engine_object_new(
+                    owner_pid,
+                    req.channel as u64,
+                    oclass as u32,
+                    req.handle as u64,
+                    true,
+                )?;
+                Ok(0)
+            }
+            nv::NR_NOTIFIEROBJ_ALLOC => {
+                // `nouveau_abi16_ioctl_notifierobj_alloc`: "completely
+                // unnecessary for these chipsets" -- EINVAL on Fermi and
+                // later, before the channel is even looked up. Every GPU
+                // this driver drives is Turing or later.
+                Err(nv::EINVAL)
+            }
+            nv::NR_GPUOBJ_FREE => {
+                // `nouveau_abi16_ioctl_gpuobj_free`: a channel that is not
+                // the caller's is EINVAL (this one, unlike GROBJ_ALLOC), a
+                // handle that is not an abi16 object of it is ENOENT -- an
+                // object of NVIF NEW is on another list and is not found
+                // here. Linux idles the channel first; nothing a client
+                // without NVIF could have queued exists here, GEM_PUSHBUF
+                // being unimplemented.
+                let req = unsafe { &*(arg as *const nv::DrmNouveauGpuobjFree) };
+                if !self.nouveau_channel_is_callers(req.channel, owner_pid) {
+                    return Err(nv::EINVAL);
+                }
+                let Some(h_object) =
+                    nv::abi16_object_remove(req.channel as u64, req.handle, owner_pid)
+                else {
+                    return Err(nv::ENOENT);
+                };
+                if h_object != 0 {
+                    if let Some(device_instance) = *self.rm_device_instance.lock() {
+                        let status = nvidia_rm_sys::rm_init::class_free(device_instance, h_object);
+                        if status != 0 {
+                            crate::klog_warn!(
+                                "[nouveau-uapi] GPUOBJ_FREE: class_free({:#010x}) -> NV_STATUS={:#x}",
+                                h_object,
+                                status
+                            );
+                        }
+                    }
+                }
+                Ok(0)
+            }
 
             // GET_ZCULL_INFO: mesa 26.x probes it and TOLERATES failure
             // (`has_zcull_info` just stays false), so ENOSYS is a correct,
