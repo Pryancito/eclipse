@@ -2138,7 +2138,10 @@ mod tests {
         let elf = parse_checked_elf(bytes).unwrap();
         let vmar = VmAddressRegion::new_root();
         let vmo = vmar.load_from_elf_image(&elf, &image).unwrap();
-        assert!(!vmo.is_borrower(), "writable LOAD must not borrow the image");
+        assert!(
+            !vmo.is_borrower(),
+            "writable LOAD must not borrow the image"
+        );
         let mut buf = [0u8; 16];
         vmo.read(0x80, &mut buf).unwrap();
         assert_eq!(&buf, b"0123456789abcdef");
