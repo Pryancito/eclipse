@@ -48,9 +48,37 @@ static ARENA: Mutex<Arena> = Mutex::new(Arena {
     live: BTreeMap::new(),
 });
 
+/// Ranges this handler answers `check_user_range` with `false` for.
+///
+/// That question is what turns an unmapped user pointer into `EFAULT` instead
+/// of a kernel page fault with no fixup behind it -- a kernel DoS any process
+/// can reach from any syscall. Every handler answers it `true` by default, so
+/// without something able to say `false` nothing can tell whether the question
+/// is being asked at all. Entries are whole ranges rather than one slot, so
+/// two tests running at once do not clobber each other's.
+static REFUSED: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
+
+/// Make this handler answer `false` for `[addr, addr + len)` until
+/// [`allow_user_range`] takes it back.
+pub(crate) fn refuse_user_range(addr: usize, len: usize) {
+    REFUSED.lock().push((addr, len));
+}
+
+/// Undo one [`refuse_user_range`].
+pub(crate) fn allow_user_range(addr: usize, len: usize) {
+    REFUSED.lock().retain(|&r| r != (addr, len));
+}
+
 pub(crate) struct TestKernelHandler;
 
 impl KernelHandler for TestKernelHandler {
+    fn check_user_range(&self, vaddr: crate::VirtAddr, len: usize) -> bool {
+        !REFUSED
+            .lock()
+            .iter()
+            .any(|&(base, n)| vaddr < base.saturating_add(n) && base < vaddr.saturating_add(len))
+    }
+
     fn frame_alloc(&self) -> Option<PhysAddr> {
         let mut arena = ARENA.lock();
         let paddr = match arena.free.pop() {
