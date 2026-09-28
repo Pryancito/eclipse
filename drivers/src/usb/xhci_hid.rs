@@ -1412,6 +1412,129 @@ fn emit_scroll(lis: &EventListener<InputEvent>, wheel: i32, hwheel: i32) {
     }
 }
 
+/// One relative-mouse report, decoded into what evdev wants.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct MouseDelta {
+    /// Button bitmap, bit 0 = left, as the report carries it.
+    buttons: u8,
+    dx: i32,
+    dy: i32,
+    wheel: i32,
+    hwheel: i32,
+}
+
+/// Pull one relative-mouse report apart.
+///
+/// `layout` is the report-descriptor layout when we parsed one and the device
+/// is actually speaking that protocol; `None` falls back to the fixed boot
+/// layout `[buttons, dx, dy, wheel, pan]`, which is only meaningful on an
+/// interface bound as a mouse that really speaks boot protocol -- that is what
+/// `boot_layout_ok` carries. A report-protocol interface whose descriptor we
+/// could not parse decodes to `None` rather than to garbage: its report ID
+/// would come out as a stuck button.
+///
+/// Returns `None` when this report is not this mouse's: a shared interface
+/// multiplexes report IDs, and the keyboard side of a combo receiver must not
+/// have its keycodes decoded as buttons and deltas.
+fn decode_mouse_report(
+    layout: Option<MouseLayout>,
+    buf: &[u8],
+    report_len: usize,
+    boot_layout_ok: bool,
+) -> Option<MouseDelta> {
+    if report_len < 3 || buf.len() < 3 {
+        return None;
+    }
+    match layout {
+        Some(ml) => {
+            let id_ok = match ml.report_id {
+                Some(id) => buf.first().copied() == Some(id),
+                None => true,
+            };
+            if !id_ok {
+                return None;
+            }
+            Some(MouseDelta {
+                buttons: read_bits(buf, ml.buttons.off, ml.buttons.len) as u8,
+                dx: read_signed_bits(buf, ml.x.off, ml.x.len),
+                dy: read_signed_bits(buf, ml.y.off, ml.y.len),
+                wheel: ml
+                    .wheel
+                    .map(|f| read_signed_bits(buf, f.off, f.len))
+                    .unwrap_or(0),
+                hwheel: ml
+                    .hwheel
+                    .map(|f| read_signed_bits(buf, f.off, f.len))
+                    .unwrap_or(0),
+            })
+        }
+        None if boot_layout_ok => Some(MouseDelta {
+            buttons: buf[0],
+            dx: buf[1] as i8 as i32,
+            dy: buf[2] as i8 as i32,
+            wheel: if report_len >= 4 {
+                buf[3] as i8 as i32
+            } else {
+                0
+            },
+            hwheel: if report_len >= 5 {
+                buf[4] as i8 as i32
+            } else {
+                0
+            },
+        }),
+        None => None,
+    }
+}
+
+/// Turn one decoded report into the evdev frame for it, and return the button
+/// bitmap to remember. Buttons are edges, axes are deltas, and the frame is
+/// closed by exactly one `SYN_REPORT` however little moved.
+fn emit_mouse(lis: &EventListener<InputEvent>, d: MouseDelta, last_buttons: u8) -> u8 {
+    for (mask, code) in [
+        (1u8, BTN_LEFT),
+        (2u8, BTN_RIGHT),
+        (4u8, BTN_MIDDLE),
+        (8u8, BTN_SIDE),
+        (16u8, BTN_EXTRA),
+    ] {
+        let down = (d.buttons & mask) != 0;
+        let was = (last_buttons & mask) != 0;
+        if down != was {
+            lis.trigger(InputEvent {
+                event_type: InputEventType::Key,
+                code,
+                value: if down { 1 } else { 0 },
+            });
+        }
+    }
+    if d.dx != 0 {
+        lis.trigger(InputEvent {
+            event_type: InputEventType::RelAxis,
+            code: REL_X,
+            value: d.dx,
+        });
+    }
+    if d.dy != 0 {
+        lis.trigger(InputEvent {
+            event_type: InputEventType::RelAxis,
+            code: REL_Y,
+            // USB HID reports Y as down-positive, exactly the evdev REL_Y
+            // convention libinput expects -- emit as-is. (The earlier `-dy`
+            // was copied from the PS/2 driver, where +Y means up; under
+            // libinput it inverted the axis.)
+            value: d.dy,
+        });
+    }
+    emit_scroll(lis, d.wheel, d.hwheel);
+    lis.trigger(InputEvent {
+        event_type: InputEventType::Syn,
+        code: SYN_REPORT,
+        value: 0,
+    });
+    d.buttons
+}
+
 /// Linux's own ceilings on a HID report descriptor (`hid_parser_global` in
 /// `hid-core.c`): a single field is at most 256 bits wide and one report
 /// carries at most 12288 usages.
@@ -3684,104 +3807,18 @@ impl XhciInner {
                         );
                     }
                     let layout = if h.boot_reports { None } else { h.mouse_layout };
-                    let parsed = match layout {
-                        Some(ml) => {
-                            // A shared interface can multiplex several report
-                            // IDs; ignore reports whose ID isn't this mouse's.
-                            let id_ok = match ml.report_id {
-                                Some(id) => tmp.first().copied() == Some(id),
-                                None => true,
-                            };
-                            if id_ok {
-                                Some((
-                                    read_bits(&tmp, ml.buttons.off, ml.buttons.len) as u8,
-                                    read_signed_bits(&tmp, ml.x.off, ml.x.len),
-                                    read_signed_bits(&tmp, ml.y.off, ml.y.len),
-                                    ml.wheel
-                                        .map(|f| read_signed_bits(&tmp, f.off, f.len))
-                                        .unwrap_or(0),
-                                    ml.hwheel
-                                        .map(|f| read_signed_bits(&tmp, f.off, f.len))
-                                        .unwrap_or(0),
-                                ))
-                            } else {
-                                None
-                            }
-                        }
-                        // The fixed boot layout is only meaningful on an
-                        // interface bound as a mouse. Reaching it from the
-                        // keyboard side of a combo receiver (whose report ID
-                        // matched nothing) would decode keycodes as buttons
-                        // and deltas.
-                        None if h.protocol == HID_PROTO_MOUSE
-                            && (h.subclass == HID_SUBCLASS_BOOT || h.if_proto != 0) =>
-                        {
-                            Some((
-                                tmp[0],
-                                tmp[1] as i8 as i32,
-                                tmp[2] as i8 as i32,
-                                if report_len >= 4 {
-                                    tmp[3] as i8 as i32
-                                } else {
-                                    0
-                                },
-                                if report_len >= 5 {
-                                    tmp[4] as i8 as i32
-                                } else {
-                                    0
-                                },
-                            ))
-                        }
-                        None => None,
-                    };
-                    if let Some((btn, dx, dy, wheel, hwheel)) = parsed {
-                        for (mask, code) in [
-                            (1u8, BTN_LEFT),
-                            (2u8, BTN_RIGHT),
-                            (4u8, BTN_MIDDLE),
-                            (8u8, BTN_SIDE),
-                            (16u8, BTN_EXTRA),
-                        ] {
-                            let down = (btn & mask) != 0;
-                            let was = (h.last_buttons & mask) != 0;
-                            if down != was {
-                                lis.trigger(InputEvent {
-                                    event_type: InputEventType::Key,
-                                    code,
-                                    value: if down { 1 } else { 0 },
-                                });
-                            }
-                        }
-                        h.last_buttons = btn;
-                        if dx != 0 {
-                            lis.trigger(InputEvent {
-                                event_type: InputEventType::RelAxis,
-                                code: REL_X,
-                                value: dx,
-                            });
-                        }
-                        if dy != 0 {
-                            lis.trigger(InputEvent {
-                                event_type: InputEventType::RelAxis,
-                                code: REL_Y,
-                                // USB HID reports Y as down-positive, exactly the
-                                // evdev REL_Y convention libinput expects — emit
-                                // as-is. (The earlier `-dy` was copied from the
-                                // PS/2 driver, where +Y means up; under libinput
-                                // it inverted the axis.)
-                                value: dy,
-                            });
-                        }
-                        if wheel != 0 || hwheel != 0 {
+                    let decoded = decode_mouse_report(
+                        layout,
+                        &tmp,
+                        report_len,
+                        h.protocol == HID_PROTO_MOUSE && boot_layout_ok,
+                    );
+                    if let Some(d) = decoded {
+                        if d.wheel != 0 || d.hwheel != 0 {
                             h.wheel_count = h.wheel_count.saturating_add(1);
-                            h.last_wheel = (wheel, hwheel);
+                            h.last_wheel = (d.wheel, d.hwheel);
                         }
-                        emit_scroll(lis, wheel, hwheel);
-                        lis.trigger(InputEvent {
-                            event_type: InputEventType::Syn,
-                            code: SYN_REPORT,
-                            value: 0,
-                        });
+                        h.last_buttons = emit_mouse(lis, d, h.last_buttons);
                     }
                 }
             }
@@ -5033,6 +5070,106 @@ mod tests {
         0xC0,
     ];
 
+    /// Boot-compatible: 3 buttons, 5 bits of padding, 8-bit X/Y/Wheel in
+    /// one Input item. QEMU's own `usb-mouse` and most cheap office mice.
+    const BOOT_SHAPED: &[u8] = &[
+        0x05, 0x01, 0x09, 0x02, 0xA1, 0x01, 0x09, 0x01, 0xA1, 0x00, //
+        0x05, 0x09, 0x19, 0x01, 0x29, 0x03, 0x15, 0x00, 0x25, 0x01, //
+        0x95, 0x03, 0x75, 0x01, 0x81, 0x02, //   3 buttons
+        0x95, 0x01, 0x75, 0x05, 0x81, 0x01, //   padding
+        0x05, 0x01, 0x09, 0x30, 0x09, 0x31, 0x09, 0x38, //   X, Y, Wheel
+        0x15, 0x81, 0x25, 0x7F, 0x75, 0x08, 0x95, 0x03, 0x81, 0x06, //
+        0xC0, 0xC0,
+    ];
+    /// Report ID, 5 buttons, 16-bit axes, wheel and AC Pan.
+    const WIDE_AXES_AND_PAN: &[u8] = &[
+        0x05, 0x01, 0x09, 0x02, 0xA1, 0x01, 0x85, 0x01, 0x09, 0x01, 0xA1, 0x00, //
+        0x05, 0x09, 0x19, 0x01, 0x29, 0x05, 0x15, 0x00, 0x25, 0x01, //
+        0x95, 0x05, 0x75, 0x01, 0x81, 0x02, //
+        0x95, 0x01, 0x75, 0x03, 0x81, 0x01, //
+        0x05, 0x01, 0x09, 0x30, 0x09, 0x31, //
+        0x16, 0x00, 0x80, 0x26, 0xFF, 0x7F, 0x75, 0x10, 0x95, 0x02, 0x81, 0x06, //
+        0x09, 0x38, 0x15, 0x81, 0x25, 0x7F, 0x75, 0x08, 0x95, 0x01, 0x81, 0x06, //
+        0x05, 0x0C, 0x0A, 0x38, 0x02, 0x95, 0x01, 0x81, 0x06, //
+        0xC0, 0xC0,
+    ];
+    /// The high-resolution wheel pattern: the Wheel sits inside a Logical
+    /// Collection next to a Resolution Multiplier declared as a *Feature*.
+    /// A parser that let Feature items consume input bits would put the
+    /// wheel two bits late and decode garbage.
+    const HI_RES_WHEEL: &[u8] = &[
+        0x05, 0x01, 0x09, 0x02, 0xA1, 0x01, 0x85, 0x02, 0x09, 0x01, 0xA1, 0x00, //
+        0x05, 0x09, 0x19, 0x01, 0x29, 0x05, 0x15, 0x00, 0x25, 0x01, //
+        0x95, 0x05, 0x75, 0x01, 0x81, 0x02, //
+        0x95, 0x01, 0x75, 0x03, 0x81, 0x01, //
+        0x05, 0x01, 0x09, 0x30, 0x09, 0x31, //
+        0x16, 0x01, 0xF8, 0x26, 0xFF, 0x07, 0x75, 0x0C, 0x95, 0x02, 0x81, 0x06, //
+        0xA1, 0x02, //   Collection (Logical)
+        0x15, 0x00, 0x25, 0x01, 0x35, 0x01, 0x45, 0x0C, //
+        0x75, 0x02, 0x95, 0x01, 0x09, 0x48, 0xB1, 0x02, //     Resolution Multiplier, Feature
+        0x15, 0x81, 0x25, 0x7F, 0x35, 0x00, 0x45, 0x00, //
+        0x75, 0x08, 0x95, 0x01, 0x09, 0x38, 0x81, 0x06, //     Wheel, Input
+        0xC0, //   End Collection
+        0x95, 0x01, 0x75, 0x04, 0xB1, 0x01, //   Feature padding
+        0xC0, 0xC0,
+    ];
+    /// Sixteen buttons declared as one bitmap, then 16-bit axes.
+    const SIXTEEN_BUTTONS: &[u8] = &[
+        0x05, 0x01, 0x09, 0x02, 0xA1, 0x01, 0x09, 0x01, 0xA1, 0x00, //
+        0x05, 0x09, 0x19, 0x01, 0x29, 0x10, 0x15, 0x00, 0x25, 0x01, //
+        0x95, 0x10, 0x75, 0x01, 0x81, 0x02, //
+        0x05, 0x01, 0x09, 0x30, 0x09, 0x31, //
+        0x16, 0x00, 0x80, 0x26, 0xFF, 0x7F, 0x75, 0x10, 0x95, 0x02, 0x81, 0x06, //
+        0x09, 0x38, 0x15, 0x81, 0x25, 0x7F, 0x75, 0x08, 0x95, 0x01, 0x81, 0x06, //
+        0xC0, 0xC0,
+    ];
+    /// The wheel declared BEFORE X and Y. Nothing forbids it.
+    const WHEEL_FIRST: &[u8] = &[
+        0x05, 0x01, 0x09, 0x02, 0xA1, 0x01, 0x09, 0x01, 0xA1, 0x00, //
+        0x05, 0x09, 0x19, 0x01, 0x29, 0x03, 0x15, 0x00, 0x25, 0x01, //
+        0x95, 0x03, 0x75, 0x01, 0x81, 0x02, //
+        0x95, 0x01, 0x75, 0x05, 0x81, 0x01, //
+        0x05, 0x01, 0x09, 0x38, 0x15, 0x81, 0x25, 0x7F, //
+        0x75, 0x08, 0x95, 0x01, 0x81, 0x06, //
+        0x09, 0x30, 0x09, 0x31, 0x75, 0x08, 0x95, 0x02, 0x81, 0x06, //
+        0xC0, 0xC0,
+    ];
+    /// Push/Pop with a Report Size change inside the pushed scope, and the
+    /// wheel declared *after* the Pop so its width comes from the restored
+    /// globals. A Pop that pops the stack without putting the saved values
+    /// back leaves the wheel 16 bits wide at the wrong size.
+    const PUSH_POP: &[u8] = &[
+        0x05, 0x01, 0x09, 0x02, 0xA1, 0x01, 0x09, 0x01, 0xA1, 0x00, //
+        0x05, 0x09, 0x19, 0x01, 0x29, 0x03, 0x15, 0x00, 0x25, 0x01, //
+        0x95, 0x03, 0x75, 0x01, 0x81, 0x02, //   3 buttons
+        0x95, 0x01, 0x75, 0x05, 0x81, 0x01, //   padding
+        0x05, 0x01, 0x09, 0x30, 0x09, 0x31, 0x15, 0x81, 0x25, 0x7F, //
+        0x75, 0x08, 0x95, 0x02, 0x81, 0x06, //   X, Y at 8 bits
+        0xA4, //   Push               (saves Report Size 8)
+        0x75, 0x10, 0x95, 0x01, 0x81, 0x01, //     16 bits of vendor padding
+        0xB4, //   Pop                (restores Report Size 8)
+        0x95, 0x01, 0x09, 0x38, 0x81, 0x06, //   Wheel, at the restored size
+        0xC0, 0xC0,
+    ];
+    /// A wireless combo receiver: keyboard under report ID 1, mouse under
+    /// report ID 2, one interface and one interrupt endpoint.
+    const COMBO_RECEIVER: &[u8] = &[
+        0x05, 0x01, 0x09, 0x06, 0xA1, 0x01, 0x85, 0x01, //
+        0x05, 0x07, 0x19, 0xE0, 0x29, 0xE7, 0x15, 0x00, 0x25, 0x01, //
+        0x75, 0x01, 0x95, 0x08, 0x81, 0x02, //
+        0x95, 0x01, 0x75, 0x08, 0x81, 0x01, //
+        0x95, 0x06, 0x75, 0x08, 0x15, 0x00, 0x26, 0xFF, 0x00, //
+        0x19, 0x00, 0x29, 0xFF, 0x81, 0x00, //
+        0xC0, //
+        0x05, 0x01, 0x09, 0x02, 0xA1, 0x01, 0x85, 0x02, 0x09, 0x01, 0xA1, 0x00, //
+        0x05, 0x09, 0x19, 0x01, 0x29, 0x05, 0x15, 0x00, 0x25, 0x01, //
+        0x95, 0x05, 0x75, 0x01, 0x81, 0x02, //
+        0x95, 0x01, 0x75, 0x03, 0x81, 0x01, //
+        0x05, 0x01, 0x09, 0x30, 0x09, 0x31, 0x09, 0x38, //
+        0x15, 0x81, 0x25, 0x7F, 0x75, 0x08, 0x95, 0x03, 0x81, 0x06, //
+        0xC0, 0xC0,
+    ];
+
     /// A boot-shaped keyboard that also declares a Consumer Control
     /// collection for its media keys, under its own report ID. This is the
     /// commonest keyboard descriptor there is, and the one that used to
@@ -5195,107 +5332,6 @@ mod tests {
     /// re-deriving the next time scrolling breaks.
     #[test]
     fn the_wheel_is_found_in_every_shape_a_real_mouse_ships() {
-        /// Boot-compatible: 3 buttons, 5 bits of padding, 8-bit X/Y/Wheel in
-        /// one Input item. QEMU's own `usb-mouse` and most cheap office mice.
-        const BOOT_SHAPED: &[u8] = &[
-            0x05, 0x01, 0x09, 0x02, 0xA1, 0x01, 0x09, 0x01, 0xA1, 0x00, //
-            0x05, 0x09, 0x19, 0x01, 0x29, 0x03, 0x15, 0x00, 0x25, 0x01, //
-            0x95, 0x03, 0x75, 0x01, 0x81, 0x02, //   3 buttons
-            0x95, 0x01, 0x75, 0x05, 0x81, 0x01, //   padding
-            0x05, 0x01, 0x09, 0x30, 0x09, 0x31, 0x09, 0x38, //   X, Y, Wheel
-            0x15, 0x81, 0x25, 0x7F, 0x75, 0x08, 0x95, 0x03, 0x81, 0x06, //
-            0xC0, 0xC0,
-        ];
-        /// Report ID, 5 buttons, 16-bit axes, wheel and AC Pan.
-        const WIDE_AXES_AND_PAN: &[u8] = &[
-            0x05, 0x01, 0x09, 0x02, 0xA1, 0x01, 0x85, 0x01, 0x09, 0x01, 0xA1, 0x00, //
-            0x05, 0x09, 0x19, 0x01, 0x29, 0x05, 0x15, 0x00, 0x25, 0x01, //
-            0x95, 0x05, 0x75, 0x01, 0x81, 0x02, //
-            0x95, 0x01, 0x75, 0x03, 0x81, 0x01, //
-            0x05, 0x01, 0x09, 0x30, 0x09, 0x31, //
-            0x16, 0x00, 0x80, 0x26, 0xFF, 0x7F, 0x75, 0x10, 0x95, 0x02, 0x81, 0x06, //
-            0x09, 0x38, 0x15, 0x81, 0x25, 0x7F, 0x75, 0x08, 0x95, 0x01, 0x81, 0x06, //
-            0x05, 0x0C, 0x0A, 0x38, 0x02, 0x95, 0x01, 0x81, 0x06, //
-            0xC0, 0xC0,
-        ];
-        /// The high-resolution wheel pattern: the Wheel sits inside a Logical
-        /// Collection next to a Resolution Multiplier declared as a *Feature*.
-        /// A parser that let Feature items consume input bits would put the
-        /// wheel two bits late and decode garbage.
-        const HI_RES_WHEEL: &[u8] = &[
-            0x05, 0x01, 0x09, 0x02, 0xA1, 0x01, 0x85, 0x02, 0x09, 0x01, 0xA1, 0x00, //
-            0x05, 0x09, 0x19, 0x01, 0x29, 0x05, 0x15, 0x00, 0x25, 0x01, //
-            0x95, 0x05, 0x75, 0x01, 0x81, 0x02, //
-            0x95, 0x01, 0x75, 0x03, 0x81, 0x01, //
-            0x05, 0x01, 0x09, 0x30, 0x09, 0x31, //
-            0x16, 0x01, 0xF8, 0x26, 0xFF, 0x07, 0x75, 0x0C, 0x95, 0x02, 0x81, 0x06, //
-            0xA1, 0x02, //   Collection (Logical)
-            0x15, 0x00, 0x25, 0x01, 0x35, 0x01, 0x45, 0x0C, //
-            0x75, 0x02, 0x95, 0x01, 0x09, 0x48, 0xB1,
-            0x02, //     Resolution Multiplier, Feature
-            0x15, 0x81, 0x25, 0x7F, 0x35, 0x00, 0x45, 0x00, //
-            0x75, 0x08, 0x95, 0x01, 0x09, 0x38, 0x81, 0x06, //     Wheel, Input
-            0xC0, //   End Collection
-            0x95, 0x01, 0x75, 0x04, 0xB1, 0x01, //   Feature padding
-            0xC0, 0xC0,
-        ];
-        /// Sixteen buttons declared as one bitmap, then 16-bit axes.
-        const SIXTEEN_BUTTONS: &[u8] = &[
-            0x05, 0x01, 0x09, 0x02, 0xA1, 0x01, 0x09, 0x01, 0xA1, 0x00, //
-            0x05, 0x09, 0x19, 0x01, 0x29, 0x10, 0x15, 0x00, 0x25, 0x01, //
-            0x95, 0x10, 0x75, 0x01, 0x81, 0x02, //
-            0x05, 0x01, 0x09, 0x30, 0x09, 0x31, //
-            0x16, 0x00, 0x80, 0x26, 0xFF, 0x7F, 0x75, 0x10, 0x95, 0x02, 0x81, 0x06, //
-            0x09, 0x38, 0x15, 0x81, 0x25, 0x7F, 0x75, 0x08, 0x95, 0x01, 0x81, 0x06, //
-            0xC0, 0xC0,
-        ];
-        /// The wheel declared BEFORE X and Y. Nothing forbids it.
-        const WHEEL_FIRST: &[u8] = &[
-            0x05, 0x01, 0x09, 0x02, 0xA1, 0x01, 0x09, 0x01, 0xA1, 0x00, //
-            0x05, 0x09, 0x19, 0x01, 0x29, 0x03, 0x15, 0x00, 0x25, 0x01, //
-            0x95, 0x03, 0x75, 0x01, 0x81, 0x02, //
-            0x95, 0x01, 0x75, 0x05, 0x81, 0x01, //
-            0x05, 0x01, 0x09, 0x38, 0x15, 0x81, 0x25, 0x7F, //
-            0x75, 0x08, 0x95, 0x01, 0x81, 0x06, //
-            0x09, 0x30, 0x09, 0x31, 0x75, 0x08, 0x95, 0x02, 0x81, 0x06, //
-            0xC0, 0xC0,
-        ];
-        /// Push/Pop with a Report Size change inside the pushed scope, and the
-        /// wheel declared *after* the Pop so its width comes from the restored
-        /// globals. A Pop that pops the stack without putting the saved values
-        /// back leaves the wheel 16 bits wide at the wrong size.
-        const PUSH_POP: &[u8] = &[
-            0x05, 0x01, 0x09, 0x02, 0xA1, 0x01, 0x09, 0x01, 0xA1, 0x00, //
-            0x05, 0x09, 0x19, 0x01, 0x29, 0x03, 0x15, 0x00, 0x25, 0x01, //
-            0x95, 0x03, 0x75, 0x01, 0x81, 0x02, //   3 buttons
-            0x95, 0x01, 0x75, 0x05, 0x81, 0x01, //   padding
-            0x05, 0x01, 0x09, 0x30, 0x09, 0x31, 0x15, 0x81, 0x25, 0x7F, //
-            0x75, 0x08, 0x95, 0x02, 0x81, 0x06, //   X, Y at 8 bits
-            0xA4, //   Push               (saves Report Size 8)
-            0x75, 0x10, 0x95, 0x01, 0x81, 0x01, //     16 bits of vendor padding
-            0xB4, //   Pop                (restores Report Size 8)
-            0x95, 0x01, 0x09, 0x38, 0x81, 0x06, //   Wheel, at the restored size
-            0xC0, 0xC0,
-        ];
-        /// A wireless combo receiver: keyboard under report ID 1, mouse under
-        /// report ID 2, one interface and one interrupt endpoint.
-        const COMBO_RECEIVER: &[u8] = &[
-            0x05, 0x01, 0x09, 0x06, 0xA1, 0x01, 0x85, 0x01, //
-            0x05, 0x07, 0x19, 0xE0, 0x29, 0xE7, 0x15, 0x00, 0x25, 0x01, //
-            0x75, 0x01, 0x95, 0x08, 0x81, 0x02, //
-            0x95, 0x01, 0x75, 0x08, 0x81, 0x01, //
-            0x95, 0x06, 0x75, 0x08, 0x15, 0x00, 0x26, 0xFF, 0x00, //
-            0x19, 0x00, 0x29, 0xFF, 0x81, 0x00, //
-            0xC0, //
-            0x05, 0x01, 0x09, 0x02, 0xA1, 0x01, 0x85, 0x02, 0x09, 0x01, 0xA1, 0x00, //
-            0x05, 0x09, 0x19, 0x01, 0x29, 0x05, 0x15, 0x00, 0x25, 0x01, //
-            0x95, 0x05, 0x75, 0x01, 0x81, 0x02, //
-            0x95, 0x01, 0x75, 0x03, 0x81, 0x01, //
-            0x05, 0x01, 0x09, 0x30, 0x09, 0x31, 0x09, 0x38, //
-            0x15, 0x81, 0x25, 0x7F, 0x75, 0x08, 0x95, 0x03, 0x81, 0x06, //
-            0xC0, 0xC0,
-        ];
-
         // (descriptor, report id, wheel bit offset, report bytes).
         let cases: [(&str, &[u8], Option<u8>, usize, usize); 7] = [
             ("boot-shaped", BOOT_SHAPED, None, 24, 4),
@@ -5338,6 +5374,275 @@ mod tests {
             .unwrap()
             .hwheel
             .is_none());
+    }
+
+    /// A descriptor and the raw bytes of one report in, the evdev frame a
+    /// client would read out. This is the whole relative-mouse path -- the one
+    /// QEMU has never run, because it only ever attaches `usb-tablet`.
+    fn mouse_frame(desc: &[u8], report: &[u8]) -> Vec<(u16, u16, i32)> {
+        let ml = parse_hid_descriptor(desc).mouse;
+        let d = decode_mouse_report(ml, report, report.len(), false)
+            .expect("this report should belong to this mouse");
+        capture(|lis| {
+            emit_mouse(lis, d, 0);
+        })
+    }
+
+    /// The same, for a device decoded with the fixed boot layout.
+    fn boot_frame(report: &[u8]) -> Vec<(u16, u16, i32)> {
+        let d = decode_mouse_report(None, report, report.len(), true)
+            .expect("a boot mouse report always decodes");
+        capture(|lis| {
+            emit_mouse(lis, d, 0);
+        })
+    }
+
+    #[test]
+    fn one_detent_of_a_report_protocol_mouse_reaches_evdev() {
+        // [buttons, dx, dy, wheel] with only the wheel moved: the frame must
+        // carry the wheel and NOT a pair of zero-valued axes, which libinput
+        // would read as motion.
+        assert_eq!(
+            mouse_frame(BOOT_SHAPED, &[0x00, 0x00, 0x00, 0x01]),
+            alloc::vec![
+                (EV_REL, REL_WHEEL, 1),
+                (EV_REL, REL_WHEEL_HI_RES, 120),
+                (EV_SYN, SYN_REPORT, 0),
+            ]
+        );
+    }
+
+    #[test]
+    fn scrolling_down_is_negative_the_whole_way_through() {
+        // HID Wheel is positive away from the user and so is REL_WHEEL, so a
+        // pull towards the user stays negative on both axes. Negating it here
+        // is what made the desktop scroll backwards, which gets reported as a
+        // wheel that does not work.
+        assert_eq!(
+            mouse_frame(BOOT_SHAPED, &[0x00, 0x00, 0x00, 0xFF]),
+            alloc::vec![
+                (EV_REL, REL_WHEEL, -1),
+                (EV_REL, REL_WHEEL_HI_RES, -120),
+                (EV_SYN, SYN_REPORT, 0),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_fast_flick_reports_every_detent_it_carries() {
+        // A mouse coalesces detents when the host is slow to poll, so a single
+        // report can say 3. Clamping it to one loses scrolling speed.
+        for n in [2i32, 3, 7, 127] {
+            let frame = mouse_frame(BOOT_SHAPED, &[0x00, 0x00, 0x00, n as u8]);
+            assert_eq!(
+                frame,
+                alloc::vec![
+                    (EV_REL, REL_WHEEL, n),
+                    (EV_REL, REL_WHEEL_HI_RES, n * 120),
+                    (EV_SYN, SYN_REPORT, 0),
+                ],
+                "{} detents",
+                n
+            );
+        }
+    }
+
+    #[test]
+    fn the_pan_axis_comes_out_of_ac_pan_and_not_the_wheel() {
+        // Report ID 1, 5 buttons + 3 pad, X16, Y16, wheel, pan.
+        // Tilt right by one, nothing else.
+        let report = [0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01];
+        assert_eq!(
+            mouse_frame(WIDE_AXES_AND_PAN, &report),
+            alloc::vec![
+                (EV_REL, REL_HWHEEL, 1),
+                (EV_REL, REL_HWHEEL_HI_RES, 120),
+                (EV_SYN, SYN_REPORT, 0),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_wheel_and_a_pan_in_one_report_are_one_frame() {
+        // Both axes moved in the same report: four events and exactly one
+        // SYN_REPORT. Two frames here would make a diagonal scroll stutter.
+        let report = [0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFF, 0x01];
+        assert_eq!(
+            mouse_frame(WIDE_AXES_AND_PAN, &report),
+            alloc::vec![
+                (EV_REL, REL_WHEEL, -1),
+                (EV_REL, REL_WHEEL_HI_RES, -120),
+                (EV_REL, REL_HWHEEL, 1),
+                (EV_REL, REL_HWHEEL_HI_RES, 120),
+                (EV_SYN, SYN_REPORT, 0),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_wheel_of_a_twelve_bit_mouse_is_not_shifted_by_its_axes() {
+        // MOUSE_5BTN_12BIT packs X and Y as 12 bits each, so the wheel starts
+        // at byte 4 rather than byte 3. Reading it at the boot offset gives
+        // the high nibble of Y: motion that looks like scrolling.
+        // buttons=left, X=-1, Y=+1, wheel=+1, pan=0.
+        let report = [0x01, 0xFF, 0x1F, 0x00, 0x01, 0x00];
+        assert_eq!(
+            mouse_frame(MOUSE_5BTN_12BIT, &report),
+            alloc::vec![
+                (EV_KEY, BTN_LEFT, 1),
+                (EV_REL, REL_X, -1),
+                (EV_REL, REL_Y, 1),
+                (EV_REL, REL_WHEEL, 1),
+                (EV_REL, REL_WHEEL_HI_RES, 120),
+                (EV_SYN, SYN_REPORT, 0),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_report_belonging_to_another_report_id_moves_nothing() {
+        // The keyboard half of a combo receiver shares the endpoint. Decoding
+        // its keycodes as buttons and deltas is how a keystroke used to move
+        // the pointer.
+        let ml = parse_hid_descriptor(COMBO_RECEIVER).mouse;
+        assert_eq!(ml.map(|m| m.report_id), Some(Some(2)));
+        let keyboard_report = [0x01, 0x02, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00];
+        assert_eq!(
+            decode_mouse_report(ml, &keyboard_report, keyboard_report.len(), false),
+            None
+        );
+        // ...and its own report still decodes.
+        let mouse_report = [0x02, 0x00, 0x00, 0x00, 0x01];
+        assert_eq!(
+            decode_mouse_report(ml, &mouse_report, mouse_report.len(), false)
+                .map(|d| (d.wheel, d.hwheel)),
+            Some((1, 0))
+        );
+    }
+
+    #[test]
+    fn a_three_byte_boot_report_has_no_wheel_to_find() {
+        // The boot mouse report is buttons, X, Y and nothing else. This is the
+        // shape a device stuck in boot protocol sends, and the reason the
+        // wheel could not work there however well the descriptor parsed.
+        assert_eq!(
+            boot_frame(&[0x00, 0x00, 0x00]),
+            alloc::vec![(EV_SYN, SYN_REPORT, 0)]
+        );
+        // A device that does send a fourth byte gets its wheel decoded.
+        assert_eq!(
+            boot_frame(&[0x00, 0x00, 0x00, 0xFF]),
+            alloc::vec![
+                (EV_REL, REL_WHEEL, -1),
+                (EV_REL, REL_WHEEL_HI_RES, -120),
+                (EV_SYN, SYN_REPORT, 0),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_interface_with_no_layout_and_no_boot_layout_dispatches_nothing() {
+        // A report-protocol interface whose descriptor we could not parse: its
+        // report ID would decode as a stuck button and its payload as motion.
+        assert_eq!(
+            decode_mouse_report(None, &[0x01, 0x7F, 0x7F, 0x01], 4, false),
+            None
+        );
+        // And a report too short to be one at all.
+        assert_eq!(decode_mouse_report(None, &[0x00, 0x00], 2, true), None);
+    }
+
+    #[test]
+    fn buttons_are_edges_while_the_wheel_is_not() {
+        // Holding the left button down across two scrolled reports must send
+        // one press, not one per report -- but every detent must still come
+        // through.
+        let ml = parse_hid_descriptor(BOOT_SHAPED).mouse;
+        let first = [0x01u8, 0x00, 0x00, 0x01];
+        let second = [0x01u8, 0x00, 0x00, 0x01];
+        let d1 = decode_mouse_report(ml, &first, first.len(), false).unwrap();
+        let d2 = decode_mouse_report(ml, &second, second.len(), false).unwrap();
+        let mut held = 0u8;
+        let frame1 = capture(|lis| held = emit_mouse(lis, d1, 0));
+        assert_eq!(held, 1);
+        assert!(frame1.contains(&(EV_KEY, BTN_LEFT, 1)));
+        let frame2 = capture(|lis| {
+            emit_mouse(lis, d2, held);
+        });
+        assert!(
+            !frame2.iter().any(|&(t, _, _)| t == EV_KEY),
+            "the button was already down: {:?}",
+            frame2
+        );
+        assert_eq!(
+            frame2,
+            alloc::vec![
+                (EV_REL, REL_WHEEL, 1),
+                (EV_REL, REL_WHEEL_HI_RES, 120),
+                (EV_SYN, SYN_REPORT, 0),
+            ]
+        );
+        // Releasing it sends the up edge.
+        let up = [0x00u8, 0x00, 0x00, 0x00];
+        let d3 = decode_mouse_report(ml, &up, up.len(), false).unwrap();
+        let frame3 = capture(|lis| {
+            emit_mouse(lis, d3, held);
+        });
+        assert_eq!(
+            frame3,
+            alloc::vec![(EV_KEY, BTN_LEFT, 0), (EV_SYN, SYN_REPORT, 0)]
+        );
+    }
+
+    #[test]
+    fn every_shape_a_real_mouse_ships_can_actually_scroll() {
+        // The parser finding a wheel field is not the same as a detent coming
+        // out the other end. Put one detent through each descriptor and demand
+        // the frame.
+        let want = alloc::vec![
+            (EV_REL, REL_WHEEL, 1),
+            (EV_REL, REL_WHEEL_HI_RES, 120),
+            (EV_SYN, SYN_REPORT, 0),
+        ];
+        for (name, desc, report) in [
+            (
+                "boot-shaped",
+                BOOT_SHAPED,
+                alloc::vec![0x00, 0x00, 0x00, 0x01],
+            ),
+            (
+                "wide axes + pan",
+                WIDE_AXES_AND_PAN,
+                alloc::vec![0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00],
+            ),
+            (
+                "hi-res wheel",
+                HI_RES_WHEEL,
+                alloc::vec![0x02, 0x00, 0x00, 0x00, 0x00, 0x01],
+            ),
+            (
+                "sixteen buttons",
+                SIXTEEN_BUTTONS,
+                alloc::vec![0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01],
+            ),
+            (
+                "wheel first",
+                WHEEL_FIRST,
+                alloc::vec![0x00, 0x01, 0x00, 0x00],
+            ),
+            (
+                "push/pop",
+                PUSH_POP,
+                alloc::vec![0x00, 0x00, 0x00, 0x00, 0x00, 0x01],
+            ),
+            (
+                "combo receiver",
+                COMBO_RECEIVER,
+                alloc::vec![0x02, 0x00, 0x00, 0x00, 0x01],
+            ),
+        ] {
+            assert_eq!(mouse_frame(desc, &report), want, "{}", name);
+        }
     }
 
     #[test]
