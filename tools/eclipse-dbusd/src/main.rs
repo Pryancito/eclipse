@@ -446,6 +446,48 @@ thread_local! {
     static PENDING_FDS: RefCell<BTreeMap<usize, Vec<RawFd>>> = RefCell::new(BTreeMap::new());
 }
 
+/// The most descriptors one message may carry. The specification's default,
+/// and what `read_into`'s control buffer is sized for.
+const MAX_MESSAGE_FDS: usize = 16;
+
+/// The most descriptors the daemon will hold for one peer before dropping it.
+///
+/// A peer may legitimately have pipelined several messages before `consume`
+/// runs, so this is a generous multiple of the per-message ceiling -- and
+/// still far below a default `RLIMIT_NOFILE`, which is the number that
+/// matters: past it the daemon cannot `accept`, and a session bus that
+/// cannot accept is a dead desktop.
+const MAX_QUEUED_FDS: usize = MAX_MESSAGE_FDS * 16;
+
+/// Has this peer queued more descriptors than the daemon will hold for it?
+///
+/// Nothing consumed them before: `read_into` collects whatever rides on a
+/// `recvmsg` -- before the handshake is even finished -- and `consume` only
+/// pops them once a whole message has decoded. So a client that attaches
+/// descriptors to bytes that never complete a message has the daemon hold
+/// them for as long as it stays connected. Measured with a client that never
+/// got past the opening NUL: 960 sent, 962 more descriptors open in the
+/// daemon, none of them ever asked for.
+fn fd_queue_overflowed(queued: usize) -> bool {
+    queued > MAX_QUEUED_FDS
+}
+
+/// How many descriptors to hand a message that declares `declared` of them,
+/// given `queued` are actually waiting.
+///
+/// `declared` is a `u32` copied straight out of the `UNIX_FDS` header field,
+/// so it is whatever the client wrote there. Reserving room for it was an
+/// abort: `u32::MAX` asks for 16 GiB, the allocator says no and Rust calls
+/// `handle_alloc_error`, which kills the daemon -- from one method call of a
+/// hundred bytes, sent by any client allowed on the bus.
+///
+/// The answer cannot be more than is really queued, which is the bound: the
+/// loop that follows already stopped at the end of the queue, so this changes
+/// no behaviour at all, only how much room is set aside for it.
+fn fds_to_take(declared: u32, queued: usize) -> usize {
+    (declared as usize).min(queued)
+}
+
 /// Read whatever is available. `Ok(false)` means the peer closed its end.
 fn read_into(peer: &mut Peer) -> io::Result<bool> {
     loop {
@@ -503,6 +545,14 @@ fn read_into(peer: &mut Peer) -> io::Result<bool> {
                 }
                 c = libc::CMSG_NXTHDR(&hdr, c);
             }
+        }
+        if fd_queue_overflowed(peer.recv_fds.len()) {
+            // Dropping the peer is what closes them: `Peer::drop` drains the
+            // queue. Answering `Err` here is how that happens.
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "peer queued more file descriptors than the bus will hold",
+            ));
         }
         if (n as usize) < chunk.len() {
             return Ok(true);
@@ -627,8 +677,9 @@ fn consume(id: u64, peer: &mut Peer, b: &mut Bus, guid: &str) -> Result<(), Stri
                     None => return Ok(()),
                 };
                 peer.inbuf.drain(..used);
-                // Take the descriptors this message says it carries.
-                let want = msg.unix_fds as usize;
+                // Take the descriptors this message says it carries -- as
+                // many as it really has, which is not the same number.
+                let want = fds_to_take(msg.unix_fds, peer.recv_fds.len());
                 let mut fds = Vec::with_capacity(want);
                 for _ in 0..want {
                     match peer.recv_fds.pop_front() {
@@ -1021,5 +1072,183 @@ mod tests {
         let result = selftest::run(&path);
         let _ = fs::remove_file(&path);
         result.expect("selftest");
+    }
+
+    // ---- descriptors the client says it sent, and the ones it really did ---
+
+    #[test]
+    fn a_message_only_gets_room_for_the_descriptors_that_are_really_there() {
+        // The count comes out of the `UNIX_FDS` header field, so it is
+        // whatever the client wrote. Reserving for it aborted the daemon.
+        assert_eq!(fds_to_take(u32::MAX, 3), 3);
+        assert_eq!(fds_to_take(u32::MAX, 0), 0);
+        assert_eq!(fds_to_take(1_000_000, 2), 2);
+    }
+
+    #[test]
+    fn a_message_takes_no_more_than_it_declares_even_when_more_are_waiting() {
+        // The other half of the bound, and the half that must not change:
+        // descriptors are queued per peer and handed out per message, so
+        // taking a queued one that this message did not declare would give it
+        // to the wrong recipient.
+        assert_eq!(fds_to_take(2, 5), 2);
+        assert_eq!(fds_to_take(0, 5), 0);
+        assert_eq!(fds_to_take(5, 5), 5);
+    }
+
+    #[test]
+    fn the_queue_holds_more_than_a_message_needs_and_much_less_than_a_process_may_open() {
+        // Several messages' worth still fit: a peer may legitimately have
+        // pipelined a few before `consume` runs.
+        assert!(
+            !fd_queue_overflowed(MAX_MESSAGE_FDS * 4),
+            "cuatro mensajes legitimos ya desbordan la cola"
+        );
+        // A default soft `RLIMIT_NOFILE` is 1024. Past it the daemon cannot
+        // `accept`, and a session bus that cannot accept is a dead desktop.
+        assert!(
+            fd_queue_overflowed(1024),
+            "un solo cliente puede agotar los descriptores del demonio"
+        );
+        assert!(!fd_queue_overflowed(MAX_QUEUED_FDS));
+        assert!(fd_queue_overflowed(MAX_QUEUED_FDS + 1));
+        assert!(!fd_queue_overflowed(0));
+    }
+
+    /// Start a daemon on its own socket and wait for it to bind.
+    fn a_bus(tag: &str) -> String {
+        let path = format!(
+            "/tmp/eclipse-dbusd-test-{}-{}-{}.sock",
+            std::process::id(),
+            tag,
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let p = path.clone();
+        std::thread::spawn(move || {
+            let _ = serve(&p, false);
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !Path::new(&path).exists() {
+            assert!(std::time::Instant::now() < deadline, "daemon never bound");
+            std::thread::yield_now();
+        }
+        path
+    }
+
+    /// A method call the bus itself answers, so a live bus is a reply.
+    fn get_id(c: &mut client::Client) -> Result<Message, String> {
+        c.call(
+            "org.freedesktop.DBus",
+            "/org/freedesktop/DBus",
+            "org.freedesktop.DBus",
+            "GetId",
+            &[],
+        )
+    }
+
+    /// The failure here is not an assertion: it is `SIGABRT`, from the
+    /// allocator refusing 16 GiB inside `consume`. Measured on master.
+    #[test]
+    fn a_message_declaring_four_billion_descriptors_does_not_kill_the_bus() {
+        let path = a_bus("fdcount");
+        let mut c = client::Client::connect(&path).expect("connect");
+        let mut m = Message::method_call(
+            "org.freedesktop.DBus",
+            "/org/freedesktop/DBus",
+            "org.freedesktop.DBus",
+            "GetId",
+        );
+        m.unix_fds = u32::MAX;
+        c.send(m).expect("send");
+        // The bus is still there, and still answering -- including this very
+        // client, whose message carried no descriptors at all.
+        let mut other = client::Client::connect(&path).expect("el bus murio");
+        get_id(&mut other).expect("el bus ya no contesta");
+        let _ = fs::remove_file(&path);
+    }
+
+    /// Descriptors arrive before the handshake even finishes and are only
+    /// consumed by a decoded message, so a client that never completes one
+    /// had the daemon hold them until it ran out.
+    #[test]
+    fn a_client_that_hoards_descriptors_is_dropped_before_the_bus_runs_out() {
+        fn open_fds() -> usize {
+            fs::read_dir("/proc/self/fd")
+                .map(|d| d.count())
+                .unwrap_or(0)
+        }
+        const PER: usize = 8;
+        let path = a_bus("fdflood");
+        let base = open_fds();
+        let sock = std::os::unix::net::UnixStream::connect(&path).expect("connect");
+        let fd = std::os::unix::io::AsRawFd::as_raw_fd(&sock);
+        // The opening NUL, with nothing attached.
+        assert_eq!(unsafe { libc::write(fd, [0u8].as_ptr() as *const _, 1) }, 1);
+        let dev_null = fs::File::open("/dev/null").expect("/dev/null");
+        let src = std::os::unix::io::AsRawFd::as_raw_fd(&dev_null);
+
+        // One byte of an auth line that never ends, with descriptors hanging
+        // off every send. The loop ends when the daemon drops us, which is
+        // the whole assertion: a failed send means the peer is gone.
+        //
+        // What the client managed to send is not the measure -- the kernel
+        // holds descriptors in flight until the daemon reads them, and the
+        // client runs ahead. What the daemon has actually installed is, and
+        // that is what `/proc/self/fd` counts: the daemon runs in a thread of
+        // this very process.
+        let slack = 64;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        let mut sent = 0;
+        while send_with_fds(fd, b"A", src, PER) {
+            sent += PER;
+            let held = open_fds().saturating_sub(base);
+            assert!(
+                held <= MAX_QUEUED_FDS + slack,
+                "el demonio retiene {held} descriptores de un cliente que no ha \
+                 mandado ni un mensaje"
+            );
+            assert!(
+                std::time::Instant::now() < deadline,
+                "el demonio no ha soltado al cliente tras {sent} descriptores"
+            );
+            // Give it the chance to read them.
+            std::thread::sleep(std::time::Duration::from_micros(200));
+        }
+        assert!(sent > MAX_QUEUED_FDS, "no llegamos ni al tope: {sent}");
+
+        // And the bus itself is unharmed: it dropped the peer, not its socket.
+        let mut c = client::Client::connect(&path).expect("el bus ya no acepta");
+        get_id(&mut c).expect("el bus ya no contesta");
+        let _ = fs::remove_file(&path);
+    }
+
+    /// `sendmsg` of `bytes` with `count` copies of `src` attached. `false`
+    /// means the write failed, which is what a dropped peer looks like.
+    fn send_with_fds(fd: RawFd, bytes: &[u8], src: RawFd, count: usize) -> bool {
+        let mut iov = libc::iovec {
+            iov_base: bytes.as_ptr() as *mut libc::c_void,
+            iov_len: bytes.len(),
+        };
+        let space = unsafe { libc::CMSG_SPACE((count * 4) as u32) } as usize;
+        let mut cmsg = vec![0u8; space];
+        let mut hdr: libc::msghdr = unsafe { std::mem::zeroed() };
+        hdr.msg_iov = &mut iov;
+        hdr.msg_iovlen = 1;
+        hdr.msg_control = cmsg.as_mut_ptr() as *mut libc::c_void;
+        hdr.msg_controllen = space as _;
+        unsafe {
+            let c = libc::CMSG_FIRSTHDR(&hdr);
+            (*c).cmsg_level = libc::SOL_SOCKET;
+            (*c).cmsg_type = libc::SCM_RIGHTS;
+            (*c).cmsg_len = libc::CMSG_LEN((count * 4) as u32) as _;
+            let data = libc::CMSG_DATA(c) as *mut RawFd;
+            for k in 0..count {
+                *data.add(k) = src;
+            }
+            libc::sendmsg(fd, &hdr, libc::MSG_NOSIGNAL) > 0
+        }
     }
 }
