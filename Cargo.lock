@@ -1323,6 +1323,7 @@ dependencies = [
  "delegate",
  "downcast-rs",
  "fatfs",
+ "futures",
  "hashbrown",
  "hunter",
  "kernel-hal",

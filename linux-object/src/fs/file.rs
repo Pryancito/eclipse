@@ -997,7 +997,11 @@ impl FileLike for File {
                             let bus = drmdev.file_state().eventbus();
                             crate::sync::wait_for_event(bus, crate::sync::Event::READABLE).await?;
                         } else {
-                            inode.async_poll().await?;
+                            // Interruptible: the pipe's own future waits on a
+                            // bus only a writer or a close ever fires, so a
+                            // blocking `read` took no signal at all. See
+                            // `process::interruptible`.
+                            crate::process::interruptible(inode.async_poll()).await??;
                         }
                     }
                     Err(err) => return Err(err.into()),
@@ -1058,7 +1062,11 @@ impl FileLike for File {
                             let bus = drmdev.file_state().eventbus();
                             crate::sync::wait_for_event(bus, crate::sync::Event::READABLE).await?;
                         } else {
-                            inode.async_poll().await?;
+                            // Interruptible: the pipe's own future waits on a
+                            // bus only a writer or a close ever fires, so a
+                            // blocking `read` took no signal at all. See
+                            // `process::interruptible`.
+                            crate::process::interruptible(inode.async_poll()).await??;
                         }
                     }
                     Err(err) => return Err(err.into()),
