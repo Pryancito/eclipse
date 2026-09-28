@@ -132,25 +132,29 @@ Lo que **sigue sin poder correr** es Plasma: `plasmashell`, `kded`, `krunner` y
 el agente de polkit son servicios de D-Bus, sí, pero además necesitan Qt, KF6,
 polkit y logind, que no están. Ver [README-desktop.md](README-desktop.md).
 
-## Abierto: libdbus se queda en el saludo (gzdoom)
+## Descartado: el bus NO era el cuelgue de gzdoom (28-sep-2026)
 
-Con el demonio real en marcha, gzdoom vuelve a colgarse — el mismo cuelgue que
-el socket sin demonio evitaba. Lo que se sabe, al 28-sep-2026:
+Durante unas horas se creyó que gzdoom se colgaba dentro de `SDL_DBus_Init()`,
+porque lo último que imprime es su banner y justo después llama a `SDL_Init(0)`,
+y lo primero que hace `SDL_InitSubSystem` en SDL2 (`src/SDL.c`) es conectar al
+bus. Encaja, pero es falso: arrancando el juego con
 
-* Lo último que imprime gzdoom es su banner de versión, y justo después llama a
-  `SDL_Init(0)`. Cero subsistemas: ni vídeo, ni audio, ni joystick.
-* Lo primero que hace `SDL_InitSubSystem` en SDL2, antes de mirar ningún
-  subsistema, es `SDL_DBus_Init()` (`src/SDL.c`). Así que el cuelgue está en la
-  conexión al bus, no en nada del juego.
-* No puede ser la espera del `Hello`: esa tiene un límite de 25 segundos. El
-  saludo SASL previo no tiene ninguno, así que ahí es donde se queda.
+```sh
+DBUS_SESSION_BUS_ADDRESS=unix:path=/sin-bus freedoom2
+```
 
-Mientras no esté arreglado, `eclipse-freedoom` apunta al motor a una dirección
-sin nada detrás (`/run/eclipse-freedoom-no-bus`), de modo que `connect()` falla
-al instante y SDL sigue adelante. A un juego el bus no le hace falta: SDL solo
-lo usa para inhibir el salvapantallas y para ibus. `ECLIPSE_FREEDOOM_BUS=1`
-conserva el bus real, que es como se vuelve a probar esto sin reconstruir.
+—una dirección sin nada detrás, donde `connect()` falla al instante— gzdoom se
+cuelga exactamente igual, y además sordo a `^C`.
 
-Ojo: el bozal es por proceso. Cualquier otro cliente de **libdbus** (no de
-GDBus, que trae su propia implementación y es la que usan Firefox y GTK) puede
-tropezar con lo mismo.
+La causa real está antes de SDL, en el propio prólogo de gzdoom: `seteuid()`.
+En musl eso es `__synccall`, que bloquea todas las señales de la aplicación y
+para uno a uno a los demás hilos con `tkill`. El kernel no era capaz de
+entregarle una señal a un hilo cuya pila viene de `mmap(PROT_NONE)` +
+`mprotect(RW)`, que es como musl crea todas sus pilas de hilo; el detalle está
+en el PR que lo arregla y en el comentario de `PageFlags::first`.
+
+`eclipse-freedoom` conserva el bozal del bus (`ECLIPSE_FREEDOOM_BUS=1` lo
+desactiva) porque a un juego el bus no le hace falta —SDL solo lo usa para
+inhibir el salvapantallas y para ibus— y una dependencia menos al arrancar es
+una fuente menos de cuelgues. Pero no es el arreglo de nada, y quitarlo no
+debería cambiar el comportamiento.

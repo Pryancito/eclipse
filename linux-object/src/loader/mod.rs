@@ -265,6 +265,10 @@ impl LinuxElfLoader {
     }
 
     /// Internal recursive loader that tracks interpreter depth.
+    // Eight arguments, one over clippy's limit: every one of them is part of
+    // what `execve` has to carry down through an interpreter chain, and
+    // bundling them into a struct would only move the same list one line up.
+    #[allow(clippy::too_many_arguments)]
     fn load_impl(
         &self,
         vmar: &Arc<VmAddressRegion>,

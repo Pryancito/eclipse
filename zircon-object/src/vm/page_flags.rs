@@ -93,6 +93,11 @@ impl PageFlags {
         (page < self.len).then(|| &self.runs[self.run_of(page)])
     }
 
+    /// The FIRST PAGE's flags -- not the mapping's, which may differ page by
+    /// page. Anything reporting a mapping's protection wants
+    /// [`runs`](Self::runs) instead; reading this one and calling it the whole
+    /// mapping is what made every musl thread stack look unwritable.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn first(&self) -> Option<&MMUFlags> {
         self.runs.first()
     }
@@ -271,6 +276,26 @@ impl PageFlags {
     pub fn iter(&self) -> impl Iterator<Item = MMUFlags> + '_ {
         (0..self.len).map(move |i| self[i])
     }
+
+    /// Each run as `(first page, page count, flags)`, in address order.
+    ///
+    /// A run is the unit with uniform protection, which is what a Linux VMA
+    /// is: anyone reporting a mapping's permissions has to walk these, not
+    /// read the first page and call it the whole mapping. A musl thread
+    /// stack is one `mmap(PROT_NONE)` whose pages are then `mprotect`ed
+    /// read-write except the guard at the bottom, so its first page says
+    /// PROT_NONE for a stack that is almost entirely writable.
+    pub fn runs(&self) -> impl Iterator<Item = (usize, usize, MMUFlags)> + '_ {
+        let len = self.len;
+        self.starts
+            .iter()
+            .copied()
+            .enumerate()
+            .map(move |(i, start)| {
+                let end = self.starts.get(i + 1).copied().unwrap_or(len);
+                (start, end - start, self.runs[i])
+            })
+    }
 }
 
 impl Index<usize> for PageFlags {
@@ -297,6 +322,25 @@ mod tests {
     const RX: MMUFlags =
         MMUFlags::from_bits_truncate(MMUFlags::READ.bits() | MMUFlags::EXECUTE.bits());
     const NONE: MMUFlags = MMUFlags::empty();
+
+    /// `runs()` is what anyone reporting protection must walk: one entry per
+    /// stretch of uniform flags, the way a Linux VMA is uniform.
+    #[test]
+    fn runs_yields_one_entry_per_uniform_stretch() {
+        // A musl thread stack: a guard page, then the writable rest.
+        let mut f = PageFlags::uniform(NONE, 8);
+        f.update_range(1..8, |_| RW);
+        let runs: vec::Vec<_> = f.runs().collect();
+        assert_eq!(runs, vec![(0, 1, NONE), (1, 7, RW)]);
+        assert_eq!(f.runs().map(|(_, n, _)| n).sum::<usize>(), f.len());
+
+        // Uniform flags are a single run, and an empty set has none.
+        assert_eq!(
+            PageFlags::uniform(R, 3).runs().collect::<vec::Vec<_>>(),
+            vec![(0, 3, R)]
+        );
+        assert_eq!(PageFlags::default().runs().count(), 0);
+    }
 
     fn check(pf: &PageFlags, model: &[MMUFlags]) {
         assert_eq!(pf.len(), model.len());
