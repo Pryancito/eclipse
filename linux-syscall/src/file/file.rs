@@ -1464,6 +1464,9 @@ impl Syscall<'_> {
         const PRIME_FD_TO_HANDLE: u32 = nr::PRIME_FD_TO_HANDLE.0; // DRM_IOWR(0x2e, drm_prime_handle)
         const MODE_CREATE_LEASE: u32 = nr::MODE_CREATE_LEASE.0; // DRM_IOWR(0xc6, drm_mode_create_lease)
 
+        // `get_unused_fd_flags(cl->flags & (O_CLOEXEC | O_NONBLOCK))`.
+        const O_CLOEXEC: u32 = 0o2000000;
+
         // The fd really has to be a DRM node. Dispatching on the request number
         // alone meant `PRIME_HANDLE_TO_FD` on ANY fd reached the export path,
         // so a process that had never opened `/dev/dri/*` could still ask for a
@@ -1472,13 +1475,15 @@ impl Syscall<'_> {
         // now also checks who owns the handle (see `drm::export_handle`), but
         // both gates belong here: this is the one that keeps the ioctl on the
         // device it is defined for. Same downcast `WAIT_VBLANK` already uses.
-        let drm_file = file_like.downcast_ref::<File>().and_then(|f| {
-            f.inode()
+        let drm = file_like.downcast_ref::<File>().and_then(|f| {
+            let inode = f.inode();
+            let state = inode
                 .as_any_ref()
                 .downcast_ref::<linux_object::fs::devfs::DrmDev>()
-                .map(|dev| dev.file_state().clone())
+                .map(|dev| dev.file_state().clone())?;
+            Some((inode, state))
         });
-        let Some(drm_file) = drm_file else {
+        let Some((drm_inode, drm_file)) = drm else {
             return Ok(None);
         };
         let proc = self.linux_process();
@@ -1658,17 +1663,30 @@ impl Syscall<'_> {
                 }
             }
             MODE_CREATE_LEASE => {
-                // An empty lease is just a fresh fd to the same DRM device: our
-                // GEM table is global, so per-fd handle ref-counting (the reason
-                // wlroots' dumb allocator leases) is unnecessary. Hand back a
-                // second descriptor for this same open file description, the way
-                // `dup` does -- so closing the lease does not run the DRM file's
-                // teardown on state the lessor is still using.
+                // `drm_mode_create_lease_ioctl` in two halves. The DRM file
+                // does everything up to the fd (`DRM_IOCTL_MODE_CREATE_LEASE`
+                // in `drm_scheme.rs`: the master check, the flags, the object
+                // list and the lessee id); what only this layer can do is
+                // install the fd. Linux clones the lessor's file into a new
+                // one that holds the lease; here the lease fd is a second
+                // descriptor of this same open file description, the way
+                // `dup` makes one -- so closing the lease does not run the
+                // DRM file's teardown on state the lessor is still using, and
+                // so the lessee keeps the whole device (see README-drm). Our
+                // GEM table is global, so the per-fd handle ref-counting that
+                // makes wlroots' dumb allocator lease is not needed either.
+                drm_inode.io_control(request as u32, arg1)?;
                 let mut ptr = UserInOutPtr::<DrmModeCreateLease>::from(arg1);
                 let mut l = ptr.read()?;
                 let lease = file_like.clone();
-                let new_fd = proc.add_file(lease)?;
-                l.lessee_id = 1;
+                let new_fd = match proc.add_file_cloexec(lease, l.flags & O_CLOEXEC != 0) {
+                    Ok(fd) => fd,
+                    Err(e) => {
+                        // `get_unused_fd_flags` failing: no lease is made.
+                        drm::lease_drop(drm_file.minor(), l.lessee_id);
+                        return Err(e);
+                    }
+                };
                 l.fd = i32::from(new_fd);
                 ptr.write(l)?;
                 Ok(Some(0))

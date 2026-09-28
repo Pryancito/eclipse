@@ -2132,13 +2132,78 @@ impl DrmDev {
                 }
                 Ok(0)
             }
-            DRM_IOCTL_MODE_LIST_LESSEES => {
-                // No leases exist; report an empty list. The struct's first u32
-                // is `count_lessees` — zero it so the client copies out none.
+            DRM_IOCTL_MODE_CREATE_LEASE => {
+                // `drm_mode_create_lease_ioctl` up to the fd, which the
+                // syscall layer installs: a `DRM_MASTER` ioctl (EACCES), a
+                // flag other than the fd's own is EINVAL, the object list is
+                // read (EFAULT) and validated (`lease_objects`), and the
+                // lessee gets its id. Every caller got an unrestricted dup
+                // of the fd as lessee 1, whatever it asked for.
+                if !drm::is_master(self.minor, self.file_owner()) {
+                    return Err(FsError::NoPermission);
+                }
+                let req = unsafe { *(data as *const DrmModeCreateLease) };
+                if req.flags & !(O_CLOEXEC | O_NONBLOCK) != 0 {
+                    return Err(FsError::InvalidParam);
+                }
+                let objects = if req.object_count == 0 {
+                    alloc::vec::Vec::new()
+                } else {
+                    let count = req.object_count as usize;
+                    ucheck_n::<u32>(req.object_ids as usize, count)?;
+                    let ids =
+                        unsafe { core::slice::from_raw_parts(req.object_ids as *const u32, count) };
+                    lease_objects(ids, self.file.universal_planes())?
+                };
+                let lessee_id = drm::lease_create(self.minor, objects);
                 unsafe {
-                    *(data as *mut u32) = 0;
+                    (*(data as *mut DrmModeCreateLease)).lessee_id = lessee_id;
                 }
                 Ok(0)
+            }
+            DRM_IOCTL_MODE_LIST_LESSEES => {
+                // `drm_mode_list_lessees_ioctl`: `DRM_MASTER` (EACCES), `pad`
+                // EINVAL, then the lessees still holding objects, as many as
+                // the caller made room for, and the total in `count_lessees`.
+                // The answer was a constant zero.
+                if !drm::is_master(self.minor, self.file_owner()) {
+                    return Err(FsError::NoPermission);
+                }
+                let req = unsafe { *(data as *const DrmModeListLessees) };
+                if req.pad != 0 {
+                    return Err(FsError::InvalidParam);
+                }
+                let ids = drm::lessees(self.minor);
+                let fill = ids.len().min(req.count_lessees as usize);
+                if fill > 0 {
+                    ucheck_n::<u32>(req.lessees_ptr as usize, fill)?;
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(
+                            ids.as_ptr(),
+                            req.lessees_ptr as *mut u32,
+                            fill,
+                        );
+                    }
+                }
+                unsafe {
+                    (*(data as *mut DrmModeListLessees)).count_lessees = ids.len() as u32;
+                }
+                Ok(0)
+            }
+            DRM_IOCTL_MODE_REVOKE_LEASE => {
+                // `drm_mode_revoke_lease_ioctl`: `DRM_MASTER` (EACCES), a
+                // lessee this node's master does not have is ENOENT, and a
+                // revoked lease is emptied, not removed. Was an unknown core
+                // number (EINVAL).
+                if !drm::is_master(self.minor, self.file_owner()) {
+                    return Err(FsError::NoPermission);
+                }
+                let lessee_id = unsafe { *(data as *const u32) };
+                if drm::lease_revoke(self.minor, lessee_id) {
+                    Ok(0)
+                } else {
+                    Err(FsError::EntryNotFound)
+                }
             }
             DRM_IOCTL_MODE_OBJ_SETPROPERTY => {
                 let req = unsafe { *(data as *const DrmModeObjSetProperty) };
@@ -3885,9 +3950,16 @@ const DRM_IOCTL_MODE_DIRTYFB: u32 = 0xC01864B1;
 // has no gamma hardware, so accept both as no-ops.
 const DRM_IOCTL_MODE_GETGAMMA: u32 = 0xC02064A4;
 const DRM_IOCTL_MODE_SETGAMMA: u32 = 0xC02064A5;
-// Lease enumeration (`struct drm_mode_list_lessees`, 16 bytes). Xorg probes it
-// while taking DRM master; there are never any leases here, so report zero.
+// Leases (`drm_lease.c`), all `DRM_MASTER` ioctls. `CREATE_LEASE` (`struct
+// drm_mode_create_lease`, 24 bytes) is validated and given its lessee id
+// here and its fd by `sys_drm_prime`; `LIST_LESSEES` (`struct
+// drm_mode_list_lessees`, 16 bytes) is what Xorg probes while taking the
+// master; `REVOKE_LEASE` (`struct drm_mode_revoke_lease`, 4 bytes) empties
+// one. `GET_LEASE` is not implemented: it answers for the lessee's own file,
+// which here is a second descriptor of the lessor's.
+const DRM_IOCTL_MODE_CREATE_LEASE: u32 = 0xC01864C6;
 const DRM_IOCTL_MODE_LIST_LESSEES: u32 = 0xC01064C7;
+const DRM_IOCTL_MODE_REVOKE_LEASE: u32 = 0x400464C9;
 // Interface-version handshake (`drmSetInterfaceVersion`). The Xorg
 // modesetting driver issues it right after open; ENOTTY fails its probe.
 const DRM_IOCTL_SET_VERSION: u32 = 0xC0106407;
@@ -5071,6 +5143,32 @@ struct DrmModeFbDirtyCmd {
     clips_ptr: u64,
 }
 
+/// `struct drm_mode_create_lease` (24 bytes). `lessee_id` is written here,
+/// `fd` by the syscall layer, which installs it.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+struct DrmModeCreateLease {
+    object_ids: u64,
+    object_count: u32,
+    flags: u32,
+    lessee_id: u32,
+    fd: i32,
+}
+
+/// `struct drm_mode_list_lessees` (16 bytes).
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+struct DrmModeListLessees {
+    count_lessees: u32,
+    pad: u32,
+    lessees_ptr: u64,
+}
+
+/// The `flags` `drm_mode_create_lease_ioctl` accepts: the ones
+/// `get_unused_fd_flags` takes for the lessee's fd.
+const O_NONBLOCK: u32 = 0o4000;
+const O_CLOEXEC: u32 = 0o2000000;
+
 /// `struct drm_clip_rect` (8 bytes) — one element of the array `clips_ptr`
 /// points to. `x2`/`y2` are exclusive, i.e. the rect covers `[x1, x2) x [y1, y2)`.
 #[repr(C)]
@@ -5451,6 +5549,85 @@ fn find_mode_object(
         return None;
     }
     Some((kind, props))
+}
+
+/// `drm_mode_object_find(dev, file, id, DRM_MODE_OBJECT_ANY)`, the type
+/// alone: what [`find_mode_object`] answers without building the property
+/// lists, for a caller that only wants to know what `obj_id` is.
+fn mode_object_kind(obj_id: u32) -> Option<u32> {
+    if drm::get_plane(obj_id).is_some() {
+        Some(DRM_MODE_OBJECT_PLANE)
+    } else if drm::get_crtc(obj_id).is_some() {
+        Some(DRM_MODE_OBJECT_CRTC)
+    } else if drm::get_connector(obj_id).is_some() {
+        Some(DRM_MODE_OBJECT_CONNECTOR)
+    } else if obj_id == drm::SYNTH_ENCODER_ID {
+        Some(DRM_MODE_OBJECT_ENCODER)
+    } else {
+        None
+    }
+}
+
+/// `fill_object_idr` + `validate_lease`: the object ids a lease over `ids`
+/// holds, or why it cannot. Every id has to name an object (ENOENT) of a
+/// type a lease can hold (`drm_mode_object_lease_required`: CRTC, connector
+/// or plane; EINVAL for an encoder), the set has to hold at least one CRTC
+/// and one connector, and a plane too when the lessor asked for universal
+/// planes (EINVAL). Without universal planes each CRTC brings its primary
+/// and cursor planes along (`crtc->primary`, `crtc->cursor`: here the
+/// primary and cursor planes whose `possible_crtcs` has the CRTC's bit), and
+/// an id that lands in the set twice is the `idr_alloc` collision, ENOSPC.
+fn lease_objects(ids: &[u32], universal_planes: bool) -> Result<alloc::vec::Vec<u32>> {
+    let mut kinds = alloc::vec::Vec::with_capacity(ids.len());
+    for &id in ids {
+        let kind = mode_object_kind(id).ok_or(FsError::EntryNotFound)?;
+        if !matches!(
+            kind,
+            DRM_MODE_OBJECT_CRTC | DRM_MODE_OBJECT_CONNECTOR | DRM_MODE_OBJECT_PLANE
+        ) {
+            return Err(FsError::InvalidParam);
+        }
+        kinds.push(kind);
+    }
+    if !kinds.contains(&DRM_MODE_OBJECT_CRTC) || !kinds.contains(&DRM_MODE_OBJECT_CONNECTOR) {
+        return Err(FsError::InvalidParam);
+    }
+    if universal_planes && !kinds.contains(&DRM_MODE_OBJECT_PLANE) {
+        return Err(FsError::InvalidParam);
+    }
+    let (crtcs, planes) = if universal_planes {
+        (alloc::vec::Vec::new(), alloc::vec::Vec::new())
+    } else {
+        let planes: alloc::vec::Vec<_> = drm::get_planes()
+            .into_iter()
+            .filter_map(drm::get_plane)
+            .collect();
+        (drm::get_resources().1, planes)
+    };
+    let mut leased = alloc::vec::Vec::with_capacity(ids.len());
+    let mut add = |id: u32| -> Result<()> {
+        if leased.contains(&id) {
+            return Err(FsError::NoDeviceSpace);
+        }
+        leased.push(id);
+        Ok(())
+    };
+    for (&id, &kind) in ids.iter().zip(&kinds) {
+        add(id)?;
+        if kind != DRM_MODE_OBJECT_CRTC {
+            continue;
+        }
+        let Some(index) = crtcs.iter().position(|&c| c == id) else {
+            continue;
+        };
+        for plane in planes
+            .iter()
+            .filter(|p| p.possible_crtcs & (1 << index) != 0 && matches!(p.plane_type, 1 | 2))
+        {
+            add(plane.id)?;
+        }
+    }
+    Ok(leased)
 }
 
 /// An id list the way `drm_mode_getresources` and `drm_mode_getplane_res`
@@ -6628,6 +6805,197 @@ mod syncobj_array_tests;
 
 #[cfg(test)]
 mod addfb2_validation_tests;
+
+#[cfg(test)]
+mod lease_tests {
+    //! `drm_lease.c`: who may lease, what a lease may hold, and the lessee
+    //! list the lessor sees.
+
+    use super::gl_client_sequence_tests::Client;
+    use super::*;
+    use crate::fs::devfs::kms_emu;
+
+    fn create(c: &Client, ids: &[u32], flags: u32) -> Result<u32> {
+        let mut req = DrmModeCreateLease {
+            object_ids: if ids.is_empty() {
+                0
+            } else {
+                ids.as_ptr() as u64
+            },
+            object_count: ids.len() as u32,
+            flags,
+            lessee_id: 0,
+            fd: -1,
+        };
+        c.ioctl(DRM_IOCTL_MODE_CREATE_LEASE, &mut req)?;
+        assert_eq!(req.fd, -1, "the fd is the syscall layer's to install");
+        Ok(req.lessee_id)
+    }
+    fn list(c: &Client, room: u32, pad: u32) -> Result<(u32, alloc::vec::Vec<u32>)> {
+        let mut out = [u32::MAX; 4];
+        let mut req = DrmModeListLessees {
+            count_lessees: room,
+            pad,
+            lessees_ptr: out.as_mut_ptr() as u64,
+        };
+        c.ioctl(DRM_IOCTL_MODE_LIST_LESSEES, &mut req)?;
+        let written = out
+            .iter()
+            .take_while(|&&id| id != u32::MAX)
+            .copied()
+            .collect();
+        Ok((req.count_lessees, written))
+    }
+    fn revoke(c: &Client, lessee_id: u32) -> Result<usize> {
+        let mut id = lessee_id;
+        c.ioctl(DRM_IOCTL_MODE_REVOKE_LEASE, &mut id)
+    }
+
+    /// `drm_mode_create_lease_ioctl` / `drm_mode_list_lessees_ioctl` /
+    /// `drm_mode_revoke_lease_ioctl` over the synthetic CRTC, connector and
+    /// primary plane. All three are `DRM_MASTER` (EACCES). A lease is
+    /// refused for a flag that is not the fd's (EINVAL), an object list
+    /// that cannot be read (EFAULT), an id that names nothing (ENOENT) or
+    /// an encoder (EINVAL), a set without a CRTC and a connector, or
+    /// without a plane once the lessor has universal planes (EINVAL), and
+    /// an id that lands in the set twice, which is what naming the primary
+    /// plane beside its CRTC does without universal planes (ENOSPC). Lessee
+    /// ids are the lowest free from 1; `LIST_LESSEES` refuses `pad`, lists
+    /// only the lessees still holding objects, as many as fit, and answers
+    /// the total; `REVOKE_LEASE` empties a lessee (ENOENT for none) and
+    /// keeps it. Every caller, master or not, got an unrestricted fd as
+    /// lessee 1 for any request at all; `LIST_LESSEES` was a constant zero
+    /// and `REVOKE_LEASE` an unknown number.
+    #[test]
+    fn a_lease_holds_what_drm_lease_lets_it_and_the_lessor_lists_and_revokes_it() {
+        let _screen = kms_emu::attach(64, 16);
+        // A node of its own, so the lessee ids start at 1 here.
+        let master = Client::open(79);
+        let client = Client::open(79);
+        let (crtc, conn, plane) = (
+            drm::SYNTH_CRTC_ID,
+            drm::SYNTH_CONNECTOR_ID,
+            drm::SYNTH_PLANE_ID,
+        );
+        let einval = Err(FsError::InvalidParam);
+        let eacces = Err(FsError::NoPermission);
+        let enospc = Err(FsError::NoDeviceSpace);
+
+        assert_eq!(create(&client, &[crtc, conn], 0), eacces, "not the master");
+        assert_eq!(list(&client, 4, 0), Err(FsError::NoPermission));
+        assert_eq!(revoke(&client, 1), Err(FsError::NoPermission));
+
+        assert_eq!(create(&master, &[crtc, conn], 1), einval, "not an fd flag");
+        assert_eq!(
+            create(&master, &[crtc, conn], O_CLOEXEC | O_NONBLOCK | 0x10000),
+            einval
+        );
+        let mut unreadable = DrmModeCreateLease {
+            object_ids: 0,
+            object_count: 1,
+            flags: 0,
+            lessee_id: 0,
+            fd: -1,
+        };
+        assert_eq!(
+            master.ioctl(DRM_IOCTL_MODE_CREATE_LEASE, &mut unreadable),
+            Err(FsError::BadAddress),
+            "a count without a list: memdup_array_user faults"
+        );
+        assert_eq!(
+            create(&master, &[crtc, 4242], 0),
+            Err(FsError::EntryNotFound),
+            "no such object"
+        );
+        assert_eq!(
+            create(&master, &[crtc, conn, drm::SYNTH_ENCODER_ID], 0),
+            einval,
+            "an encoder cannot be leased"
+        );
+        assert_eq!(create(&master, &[crtc], 0), einval, "no connector");
+        assert_eq!(create(&master, &[conn, plane], 0), einval, "no CRTC");
+        assert_eq!(
+            create(&master, &[crtc, conn, crtc], 0),
+            enospc,
+            "an id twice"
+        );
+        assert_eq!(
+            create(&master, &[crtc, conn, plane], 0),
+            enospc,
+            "the CRTC brings its primary plane, so naming it too collides"
+        );
+        assert_eq!(
+            list(&master, 4, 0),
+            Ok((0, alloc::vec![])),
+            "none of those made a lease"
+        );
+
+        assert_eq!(
+            create(&master, &[], O_CLOEXEC | O_NONBLOCK),
+            Ok(1),
+            "an empty lease, with the fd's own flags"
+        );
+        assert_eq!(create(&master, &[crtc, conn], 0), Ok(2));
+        assert_eq!(list(&master, 4, 1), Err(FsError::InvalidParam), "pad");
+        assert_eq!(
+            list(&master, 4, 0),
+            Ok((1, alloc::vec![2])),
+            "the empty lease holds nothing and is not listed"
+        );
+        assert_eq!(
+            list(&master, 0, 0),
+            Ok((1, alloc::vec![])),
+            "the total, with no room to list it in"
+        );
+        let mut nowhere = DrmModeListLessees {
+            count_lessees: 4,
+            pad: 0,
+            lessees_ptr: 0,
+        };
+        assert_eq!(
+            master.ioctl(DRM_IOCTL_MODE_LIST_LESSEES, &mut nowhere),
+            Err(FsError::BadAddress),
+            "room but no list: put_user faults"
+        );
+        assert_eq!(nowhere.count_lessees, 4, "and the count is not written");
+
+        let mut cap: [u64; 2] = [DRM_CLIENT_CAP_UNIVERSAL_PLANES, 1];
+        master
+            .ioctl(DRM_IOCTL_SET_CLIENT_CAP, &mut cap)
+            .expect("UNIVERSAL_PLANES");
+        assert_eq!(
+            create(&master, &[crtc, conn], 0),
+            einval,
+            "with universal planes the lease needs a plane"
+        );
+        assert_eq!(
+            create(&master, &[crtc, conn, plane], 0),
+            Ok(3),
+            "named, not brought along"
+        );
+        assert_eq!(list(&master, 4, 0), Ok((2, alloc::vec![2, 3])));
+        assert_eq!(list(&master, 1, 0), Ok((2, alloc::vec![2])), "room for one");
+
+        assert_eq!(
+            revoke(&master, 42),
+            Err(FsError::EntryNotFound),
+            "no such lessee"
+        );
+        assert_eq!(revoke(&master, 2), Ok(0));
+        assert_eq!(
+            list(&master, 4, 0),
+            Ok((1, alloc::vec![3])),
+            "revoked: empty, so not listed"
+        );
+        assert_eq!(revoke(&master, 2), Ok(0), "the lessee is still there");
+        assert_eq!(revoke(&master, 1), Ok(0), "so is the empty one");
+        assert_eq!(
+            create(&master, &[crtc, conn, plane], 0),
+            Ok(4),
+            "ids are not reused while the lessees live"
+        );
+    }
+}
 
 #[cfg(test)]
 mod trail_tests;

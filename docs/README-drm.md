@@ -146,7 +146,7 @@ Leyenda: ✅ implementado · 🟡 parcial / no-op deliberado · ❌ no implement
 | `DRM_IOCTL_MODE_CURSOR` / `CURSOR2` | ✅ | cursor compuesto por el kernel sobre cada frame (`set_cursor_bo`/`move_cursor`); sin flag o con uno desconocido → EINVAL antes de buscar el CRTC (ENOENT), como `drm_mode_cursor_common`; un handle con ancho o alto 0, o más de 64×64 (el tamaño anunciado en las *caps*) → EINVAL; solo el handle 0 esconde el puntero |
 | `DRM_IOCTL_MODE_ATOMIC` | ✅ | **opt-in** con `drm.atomic` (ver sección siguiente) |
 | `DRM_IOCTL_MODE_GETGAMMA` / `SETGAMMA` | 🟡 | aceptados como no-op (`gamma_size=0`, sin `GAMMA_LUT`); devolver ENOTTY provocaba una tormenta de SETGAMMA desde Xorg |
-| `DRM_IOCTL_MODE_CREATE_LEASE` | 🟡 | aceptado, **no restringido**: devuelve un `dup` del fd, así que un cliente "arrendado" conserva el control completo del dispositivo. `LIST_LESSEES` responde cero |
+| `DRM_IOCTL_MODE_CREATE_LEASE` / `LIST_LESSEES` / `REVOKE_LEASE` | 🟡 | los tres son `DRM_MASTER` (EACCES a quien no lo es). `CREATE_LEASE` valida como `drm_mode_create_lease_ioctl`: `flags` fuera de `O_CLOEXEC \| O_NONBLOCK` → EINVAL; con `object_count` la lista se lee (EFAULT) y cada id debe ser un CRTC, conector o plano (ENOENT si no existe, EINVAL si es un encoder), el conjunto lleva al menos un CRTC y un conector, y un plano si el cliente pidió `UNIVERSAL_PLANES` (EINVAL); sin planos universales cada CRTC arrastra su plano primario y de cursor, y un id repetido en el conjunto es ENOSPC (`idr_alloc`). El `lessee_id` sale del menor libre desde 1 por nodo. **El fd no restringe nada**: es un `dup` del fd del arrendador, así que un cliente "arrendado" conserva el control completo del dispositivo. `LIST_LESSEES` (`pad` → EINVAL) lista los arrendamientos con objetos, tantos como quepan y el total en `count_lessees`; `REVOKE_LEASE` vacía uno (ENOENT si no existe; repetirlo es un no-op). `GET_LEASE` no existe |
 | `DRM_IOCTL_SYNCOBJ_*` | 🟡 | implementados (`CREATE`/`DESTROY`/`WAIT`/`RESET`/`SIGNAL`/`TIMELINE_*`/`QUERY`/`TRANSFER`, `drivers/src/scheme/syncobj.rs`) pero solo activos con `nvidia.nouveau_uapi`; sin él EOPNOTSUPP y `DRM_CAP_SYNCOBJ=0` |
 
 ### Propiedades KMS estándar (`drm-kms.rst` → *KMS Properties*)
@@ -292,9 +292,10 @@ Detalles:
 - **Gamma/CTM/HDR**: sin LUTs (`gamma_size=0`, sin `GAMMA_LUT`/`CTM`); el
   *scanout* software no las aplica. Consecuencia visible: gammastep, la luz
   nocturna y la gamma de RandR no hacen nada.
-- **Leases**: `CREATE_LEASE` devuelve un `dup` del fd sin restringir nada, y
-  `GET_LEASE`/`REVOKE_LEASE` no existen. **Syncobj**: solo con la UAPI de
-  nouveau (arriba).
+- **Leases**: `CREATE_LEASE` valida la petición como Linux pero devuelve un
+  `dup` del fd sin restringir nada, `GET_LEASE` no existe, y los
+  arrendamientos son por nodo y duran hasta el apagado (un `DROP_MASTER` no
+  los limpia). **Syncobj**: solo con la UAPI de nouveau (arriba).
 - **Estado por apertura**: los eventos y `DRM_CLIENT_CAP_ATOMIC` **sí** van
   por fd abierto (`DrmFileState`, que `sys_open` crea por cada `open`). Los
   handles GEM, los framebuffers y el cursor siguen en tablas globales; para
