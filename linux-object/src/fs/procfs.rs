@@ -1620,15 +1620,29 @@ struct ProcSeqINode {
     generate: fn() -> String,
 }
 
-fn seq_read_at(generate: fn() -> String, offset: usize, buf: &mut [u8]) -> Result<usize> {
-    let content = generate();
-    let bytes = content.as_bytes();
+/// One `read(2)` of `bytes` starting at `offset`: the paging rule every file
+/// in `/proc` follows.
+///
+/// It was written out three times -- here, in [`ProcSelfSymINode::read_at`]
+/// and in [`ProcPidFileINode::read_at`] -- and nothing looked at any of the
+/// three. A copy that ignored `offset` and always answered from the start
+/// passed the whole suite, and that is not a missing corner: `read(2)` is what
+/// advances the file position, so the second call asks for the rest and a
+/// `cat /proc/meminfo` would repeat its first chunk for ever. Reading a
+/// `/proc` file in one call is what a test does; `cat` uses a 128 KiB buffer
+/// and the shell's `read` line by line.
+fn slice_read_at(bytes: &[u8], offset: usize, buf: &mut [u8]) -> Result<usize> {
     if offset >= bytes.len() {
         return Ok(0);
     }
     let len = (bytes.len() - offset).min(buf.len());
     buf[..len].copy_from_slice(&bytes[offset..offset + len]);
     Ok(len)
+}
+
+fn seq_read_at(generate: fn() -> String, offset: usize, buf: &mut [u8]) -> Result<usize> {
+    let content = generate();
+    slice_read_at(content.as_bytes(), offset, buf)
 }
 
 impl INode for ProcSeqINode {
@@ -1746,8 +1760,19 @@ impl INode for ProcSysWritableINode {
     }
 }
 
+/// `sethostname(2)`'s length rule, shared by `/proc/sys/kernel/hostname` and
+/// `/proc/sys/kernel/domainname`.
+///
+/// `HOST_NAME_MAX` is the longest name that FITS, not the first one that is
+/// too long, so the comparison is `>` and not `>=`. One off here is a name of
+/// exactly 64 characters that `sethostname` takes and `/proc` refuses, which
+/// shows up as one machine in a fleet quietly keeping its old name.
+fn name_fits(value: &str) -> bool {
+    value.len() <= crate::uname::HOST_NAME_MAX
+}
+
 fn store_hostname(value: &str) -> Result<()> {
-    if value.len() > crate::uname::HOST_NAME_MAX {
+    if !name_fits(value) {
         return Err(FsError::InvalidParam);
     }
     crate::uname::set_hostname(value);
@@ -1755,7 +1780,7 @@ fn store_hostname(value: &str) -> Result<()> {
 }
 
 fn store_domainname(value: &str) -> Result<()> {
-    if value.len() > crate::uname::HOST_NAME_MAX {
+    if !name_fits(value) {
         return Err(FsError::InvalidParam);
     }
     crate::uname::set_domainname(value);
@@ -1786,13 +1811,7 @@ impl INode for ProcSelfSymINode {
         let target = current_process_id()
             .map(|id| alloc::format!("{}", id))
             .unwrap_or_else(|| "1".into());
-        let bytes = target.as_bytes();
-        if offset >= bytes.len() {
-            return Ok(0);
-        }
-        let len = (bytes.len() - offset).min(buf.len());
-        buf[..len].copy_from_slice(&bytes[offset..offset + len]);
-        Ok(len)
+        slice_read_at(target.as_bytes(), offset, buf)
     }
 
     fn write_at(&self, _offset: usize, _buf: &[u8]) -> Result<usize> {
@@ -1947,13 +1966,7 @@ impl ProcPidFileINode {
 
 impl INode for ProcPidFileINode {
     fn read_at(&self, offset: usize, buf: &mut [u8]) -> Result<usize> {
-        let bytes = self.bytes()?;
-        if offset >= bytes.len() {
-            return Ok(0);
-        }
-        let len = (bytes.len() - offset).min(buf.len());
-        buf[..len].copy_from_slice(&bytes[offset..offset + len]);
-        Ok(len)
+        slice_read_at(&self.bytes()?, offset, buf)
     }
 
     fn write_at(&self, _offset: usize, _buf: &[u8]) -> Result<usize> {
@@ -2048,9 +2061,31 @@ fn proc_net_dev_content() -> String {
     s
 }
 
-fn proc_net_route_content() -> String {
-    use crate::net::ipv4_netmask;
+/// One row of `/proc/net/route`, the table `route -n` and `netstat -r` print
+/// and every "what is my default gateway" check parses.
+///
+/// Three things in it are load-bearing. The addresses are the kernel's own
+/// byte order, printed as EIGHT hex digits: `route` reads fixed-width fields,
+/// and a default route printed as `0` instead of `00000000` shifts every
+/// column after it. The flags are a bitmask, and `RTF_GATEWAY` (0x2) on top of
+/// `RTF_UP` (0x1) is what marks the row as the one to send off-link traffic
+/// to. And the mask is derived from the prefix length, so a `/24` that prints
+/// a `/32` mask makes the machine believe it has no neighbours.
+///
+/// It takes its four values as arguments because the rows come from
+/// `drivers::all_net()`, which is empty in every host test: with the loop
+/// reading the interfaces, nothing in the row is reachable.
+fn route_row(name: &str, dst: u32, gateway: u32, prefix_len: u8) -> String {
+    let mask = u32::from_ne_bytes(crate::net::ipv4_netmask(prefix_len).0);
+    let flags = if gateway != 0 {
+        0x0003 // RTF_UP | RTF_GATEWAY
+    } else {
+        0x0001 // RTF_UP
+    };
+    alloc::format!("{name}\t{dst:08X}\t{gateway:08X}\t{flags:04X}\t0\t0\t0\t{mask:08X}\t0\t0\t0\n")
+}
 
+fn proc_net_route_content() -> String {
     let mut s = String::new();
     let _ = writeln!(
         s,
@@ -2067,18 +2102,7 @@ fn proc_net_route_content() -> String {
                     Some(IpAddress::Ipv4(gw)) => u32::from_ne_bytes(gw.0),
                     _ => 0,
                 };
-                let mask = u32::from_ne_bytes(ipv4_netmask(dst_cidr.prefix_len()).0);
-                let flags = if route.gateway.is_some() {
-                    0x0003 // RTF_UP | RTF_GATEWAY
-                } else {
-                    0x0001 // RTF_UP
-                };
-
-                let _ = writeln!(
-                    s,
-                    "{}\t{:08X}\t{:08X}\t{:04X}\t0\t0\t0\t{:08X}\t0\t0\t0",
-                    name, dst, gateway, flags, mask
-                );
+                s.push_str(&route_row(&name, dst, gateway, dst_cidr.prefix_len()));
             }
         }
     }
@@ -2091,12 +2115,24 @@ fn proc_uptime_content() -> String {
     // same convention `/proc/perf/kernel`'s idle% uses — and it is real halt
     // time (`kernel_hal::kstats::note_idle`, driven from the actual `hlt`/
     // `mwait` idle path), not a placeholder.
-    let now = kernel_hal::timer::timer_now();
-    let uptime = now.as_secs_f64();
-    let idle_ns = kernel_hal::kstats::snapshot().idle_ns;
-    let ncpus = kernel_hal::online_cpu_count().max(1) as f64;
-    let idle = idle_ns as f64 / 1_000_000_000.0 / ncpus;
-    format!("{:.2} {:.2}\n", uptime, idle)
+    uptime_text(
+        kernel_hal::timer::timer_now().as_secs_f64(),
+        kernel_hal::kstats::snapshot().idle_ns,
+        kernel_hal::online_cpu_count(),
+    )
+}
+
+/// `/proc/uptime` from its three inputs: seconds up, nanoseconds halted
+/// summed over the CPUs, and how many CPUs that sum came from.
+///
+/// Dividing is the whole point: the idle time is collected per CPU and
+/// `uptime(1)` wants one CPU's worth, so multiplying instead would report a
+/// two-CPU machine as having been idle for longer than it has been up.
+/// `ncpus` is an argument because `online_cpu_count()` never answers 0 here,
+/// which leaves the `.max(1)` guarding the division unreachable from a test.
+fn uptime_text(uptime_secs: f64, idle_ns: u64, ncpus: usize) -> String {
+    let idle = idle_ns as f64 / 1_000_000_000.0 / ncpus.max(1) as f64;
+    format!("{:.2} {:.2}\n", uptime_secs, idle)
 }
 
 /// `/proc/stat` — aggregate and per-CPU counters in USER_HZ jiffies
@@ -2136,20 +2172,13 @@ fn proc_stat_content() -> String {
     // it stays 0, as it was everywhere before.
     let ctxt = kernel_hal::kstats::sched_stats().0;
 
-    let (mut total_user, mut total_sys, mut total_idle) = (0u64, 0u64, 0u64);
-    let mut per_cpu = String::new();
-    for cpu in 0..ncpus {
-        let (user, sys, idle) = kernel_hal::kstats::cpu_times_jiffies(cpu);
-        total_user += user;
-        total_sys += sys;
-        total_idle += idle;
-        // "cpuN user nice system idle iowait irq softirq steal guest guest_nice"
-        let _ = writeln!(per_cpu, "cpu{cpu} {user} 0 {sys} {idle} 0 0 0 0 0 0");
-    }
+    let times: Vec<(u64, u64, u64)> = (0..ncpus)
+        .map(kernel_hal::kstats::cpu_times_jiffies)
+        .collect();
+    let cpu_lines = cpu_times_text(&times);
 
     format!(
-        "cpu  {total_user} 0 {total_sys} {total_idle} 0 0 0 0 0 0\n\
-         {per_cpu}\
+        "{cpu_lines}\
          intr {intr}\n\
          ctxt {ctxt}\n\
          btime {btime}\n\
@@ -2158,6 +2187,29 @@ fn proc_stat_content() -> String {
          procs_blocked 0\n",
         running
     )
+}
+
+/// The CPU lines of `/proc/stat`: the `cpu` summary, then one line per CPU,
+/// from each CPU's `(user, system, idle)` jiffies.
+///
+/// For its readers the file IS the column order -- `top`, `vmstat`, `mpstat`
+/// and every container runtime index into the line by position -- so system
+/// time landing in the idle column makes a saturated machine read as an idle
+/// one. The times are an argument because `kstats::cpu_times_jiffies` counts a
+/// scheduler this build does not run: on the host every column is 0, and two
+/// columns can be swapped, or the sum taken over the wrong one, without a
+/// single test changing its answer.
+fn cpu_times_text(times: &[(u64, u64, u64)]) -> String {
+    let (mut total_user, mut total_sys, mut total_idle) = (0u64, 0u64, 0u64);
+    let mut per_cpu = String::new();
+    for (cpu, &(user, sys, idle)) in times.iter().enumerate() {
+        total_user += user;
+        total_sys += sys;
+        total_idle += idle;
+        // "cpuN user nice system idle iowait irq softirq steal guest guest_nice"
+        let _ = writeln!(per_cpu, "cpu{cpu} {user} 0 {sys} {idle} 0 0 0 0 0 0");
+    }
+    format!("cpu  {total_user} 0 {total_sys} {total_idle} 0 0 0 0 0 0\n{per_cpu}")
 }
 
 /// The `btime` of `/proc/stat`: when the machine booted, in seconds since
@@ -2186,7 +2238,17 @@ fn proc_loadavg_content() -> String {
     // newest long after it had forked. KoIDs are handed out in increasing
     // order, so the largest live one is the newest.
     let last_pid = procs.iter().map(|p| p.id()).max().unwrap_or(1);
-    let [l1, l5, l15] = crate::loadavg::loadavg_f64();
+    loadavg_text(crate::loadavg::loadavg_f64(), running, total, last_pid)
+}
+
+/// The one line of `/proc/loadavg`.
+///
+/// The fourth field is `runnable/total`, in that order and with that
+/// separator: `uptime`, `procps` and every monitoring agent read the half
+/// before the slash as the run queue. Swapped, an idle machine with many
+/// threads reports a run queue of hundreds, which is what a pager fires on.
+fn loadavg_text(load: [f64; 3], running: usize, total: usize, last_pid: u64) -> String {
+    let [l1, l5, l15] = load;
     format!("{l1:.2} {l5:.2} {l15:.2} {running}/{total} {last_pid}\n")
 }
 
@@ -2198,6 +2260,20 @@ fn proc_hunter_content() -> String {
 
 fn proc_meminfo_content() -> String {
     let (used, total) = kernel_hal::mem::memory_usage();
+    let (kheap_used, kheap_total) = kernel_hal::mem::kernel_heap_usage();
+    meminfo_text(used, total, kheap_used, kheap_total)
+}
+
+/// The text of `/proc/meminfo` for a given set of counters.
+///
+/// The counters are arguments because `mem::memory_usage()` and
+/// `mem::kernel_heap_usage()` both answer `(0, 0)` on the host: with them read
+/// inside, every number in the file is zero, the kernel-heap block never
+/// appears, and `free = total - used` cannot be told apart from
+/// `used - total`. This is the file `free(1)`, every task manager and every
+/// runtime that sizes a cache read, and bytes printed where kilobytes are
+/// expected are a machine that claims a thousand times the memory it has.
+fn meminfo_text(used: usize, total: usize, kheap_used: usize, kheap_total: usize) -> String {
     let free = total.saturating_sub(used);
     let mut s = String::with_capacity(128);
     let _ = writeln!(s, "MemTotal:     {:>10} kB", total / 1024);
@@ -2209,7 +2285,6 @@ fn proc_meminfo_content() -> String {
     // running it out kills the machine (`alloc_error` -> panic). It appeared
     // in no /proc file, so its growth could only be seen as the crash. Not a
     // Linux meminfo field name: KernelHeap* says what it is.
-    let (kheap_used, kheap_total) = kernel_hal::mem::kernel_heap_usage();
     if kheap_total > 0 {
         let _ = writeln!(s, "KernelHeapTotal: {:>10} kB", kheap_total / 1024);
         let _ = writeln!(s, "KernelHeapUsed:  {:>10} kB", kheap_used / 1024);
@@ -4365,6 +4440,18 @@ mod dir_shape_tests {
 
     /// And a directory that holds directories says so: `/proc/sys` has
     /// `kernel`, `vm` and `fs` under it, so 2 + 3.
+    /// `0o555`, not `0o755`: nothing creates a file in `/proc`, and the write
+    /// bit is what makes `cp -r`, `rsync` and `rm -r` try before being told
+    /// no by the directory itself.
+    #[test]
+    fn a_proc_directory_is_read_only_to_everyone_root_included() {
+        let m = dir_metadata(7, 3);
+        assert_eq!(m.mode, 0o555);
+        assert_eq!(m.type_, FileType::Dir);
+        assert_eq!(m.nlinks, 5);
+        assert_eq!((m.uid, m.gid), (0, 0));
+    }
+
     #[test]
     fn a_directory_counts_its_subdirectories_in_its_links() {
         assert_eq!(PROC_SYS_DIR.metadata().unwrap().nlinks, 5);
@@ -4419,6 +4506,65 @@ mod sysctl_tests {
         assert!(matches!(s.as_bytes()[19], b'8' | b'9' | b'a' | b'b'));
     }
 
+    /// `HOST_NAME_MAX` is the last length that FITS, not the first one that
+    /// does not: a name of exactly 64 characters is one `sethostname(2)`
+    /// takes, and refusing it here would be `/proc` and the syscall
+    /// disagreeing about the same machine's name.
+    #[test]
+    fn a_name_of_exactly_the_longest_allowed_still_fits() {
+        let longest = alloc::string::String::from_utf8(alloc::vec![
+            b'a';
+            crate::uname::HOST_NAME_MAX
+        ])
+        .unwrap();
+        assert!(name_fits(&longest));
+        assert!(!name_fits(&alloc::format!("{}a", longest)));
+        assert!(name_fits(""));
+    }
+
+    /// `/proc/sys/kernel/domainname` writes the domain name. It shares its
+    /// length rule with the host name and nothing else: a write here that
+    /// landed on the host name would rename the machine from `dnsdomainname`.
+    #[test]
+    fn the_domainname_is_written_where_the_domainname_is_read() {
+        let inode = ProcSysWritableINode {
+            inode: 996,
+            generate: proc_sys_domainname_content,
+            store: store_domainname,
+        };
+        inode.write_at(0, b"silo.example\n").unwrap();
+        assert_eq!(crate::uname::domainname(), "silo.example");
+        let mut buf = [0u8; 32];
+        let read = inode.read_at(0, &mut buf).unwrap();
+        assert_eq!(&buf[..read], b"silo.example\n");
+        assert!(inode.write_at(0, &[b'a'; 65]).is_err());
+    }
+
+    /// `: > /proc/sys/kbd` and `echo -n "" > /proc/sys/kbd` arrive as nothing
+    /// to set, which is not the same as asking for a layout that does not
+    /// exist: a shell that truncates the file before writing would get an
+    /// error for the truncation alone.
+    #[test]
+    fn an_empty_write_to_kbd_is_not_an_unknown_layout() {
+        assert!(store_kbd("").is_ok());
+        assert!(store_kbd("\n").is_ok());
+        assert!(store_kbd("   \n").is_ok());
+    }
+
+    /// `echo toggle > /proc/sys/kbd` is the hotkey's whole implementation, and
+    /// the name is taken the way a shell writes it -- like the layout names
+    /// beside it, which `Layout::from_name` already reads case-insensitively.
+    #[test]
+    fn toggle_is_taken_however_it_is_typed() {
+        let _guard = crate::fs::kbd_layout::LAYOUT_TEST_LOCK.lock();
+        let before = crate::fs::kbd_layout::current_name();
+        store_kbd("TOGGLE\n").unwrap();
+        let after = crate::fs::kbd_layout::current_name();
+        assert_ne!(before, after, "«TOGGLE» no ha cambiado la distribucion");
+        store_kbd("Toggle").unwrap();
+        assert_eq!(crate::fs::kbd_layout::current_name(), before);
+    }
+
     #[test]
     fn writable_kbd_rejects_unknown_layout() {
         let inode = ProcSysWritableINode {
@@ -4431,6 +4577,7 @@ mod sysctl_tests {
 
     #[test]
     fn writable_kbd_truncate_then_echo_us() {
+        let _guard = crate::fs::kbd_layout::LAYOUT_TEST_LOCK.lock();
         let inode = ProcSysWritableINode {
             inode: 997,
             generate: proc_kbd_content,
@@ -4782,5 +4929,302 @@ mod comm_field_tests {
     fn a_read_with_no_caller_behind_it_is_the_kernel_s_own() {
         let target = a_process(9243, "otro");
         assert!(may_read_innards_between(None, &target));
+    }
+}
+
+/// The numbers of `/proc`, which in this build come from a HAL that answers
+/// zero.
+///
+/// Every function here formats a counter that `kernel_hal` reports as `(0, 0)`
+/// on the host, so the suite was blind to all of it: of the mutants tried over
+/// `meminfo`, `uptime`, `loadavg`, `/proc/stat` and `/proc/net/route`, sixteen
+/// of sixteen lived. Swapping `total - used` for `used - total`, dropping the
+/// division by 1024, printing system time in the idle column and the run queue
+/// upside down all passed. Taking the counters as arguments is what makes the
+/// difference visible at all -- see [`meminfo_text`], [`uptime_text`],
+/// [`loadavg_text`], [`cpu_times_text`] and [`route_row`].
+#[cfg(test)]
+mod proc_numbers_tests {
+    use super::*;
+
+    /// The kilobytes on a `/proc/meminfo` line, checking the unit as it goes.
+    fn mem_kb(text: &str, key: &str) -> u64 {
+        let line = text
+            .lines()
+            .find(|l| l.starts_with(key))
+            .unwrap_or_else(|| panic!("{} en {:?}", key, text));
+        let rest = line[key.len()..].trim();
+        let (n, unit) = rest.split_once(' ').unwrap_or((rest, ""));
+        assert_eq!(unit, "kB", "{:?} no esta en kB", line);
+        n.parse().unwrap()
+    }
+
+    fn column(line: &str, n: usize) -> &str {
+        line.split_whitespace()
+            .nth(n)
+            .unwrap_or_else(|| panic!("columna {} en {:?}", n, line))
+    }
+
+    fn route_fields(row: &str) -> Vec<&str> {
+        assert!(row.ends_with('\n'), "una fila es una linea: {:?}", row);
+        row.trim_end().split('\t').collect()
+    }
+
+    // ---------------- el paginador de todo /proc ----------------
+
+    /// The second `read(2)` has to carry on from where the first stopped.
+    ///
+    /// This is the whole of `cat /proc/meminfo` on a file bigger than the
+    /// buffer, and of a shell's `read` line by line: ignoring the offset
+    /// repeats the first chunk for ever, and nothing noticed because a test
+    /// reads a `/proc` file in one call.
+    #[test]
+    fn a_reader_that_comes_back_for_more_gets_the_rest_not_the_start() {
+        let whole = b"MemTotal:     16384 kB\nMemFree:      12288 kB\n";
+        let mut got = Vec::new();
+        let mut offset = 0;
+        loop {
+            let mut buf = [0u8; 7];
+            let n = slice_read_at(whole, offset, &mut buf).unwrap();
+            if n == 0 {
+                break;
+            }
+            got.extend_from_slice(&buf[..n]);
+            offset += n;
+        }
+        assert_eq!(got, whole);
+    }
+
+    #[test]
+    fn a_read_takes_what_is_left_and_not_what_the_buffer_would_hold() {
+        let whole = b"0.00 0.00\n";
+        let mut buf = [0u8; 64];
+        assert_eq!(slice_read_at(whole, 6, &mut buf).unwrap(), 4);
+        assert_eq!(&buf[..4], b".00\n");
+    }
+
+    #[test]
+    fn the_end_of_a_proc_file_is_the_end_however_far_past_it_you_ask() {
+        let whole = b"1\n";
+        let mut buf = [0u8; 8];
+        assert_eq!(slice_read_at(whole, 2, &mut buf).unwrap(), 0);
+        assert_eq!(slice_read_at(whole, 3, &mut buf).unwrap(), 0);
+        assert_eq!(slice_read_at(whole, usize::MAX, &mut buf).unwrap(), 0);
+        // A file with nothing in it is at its end from the first read.
+        assert_eq!(slice_read_at(&[], 0, &mut buf).unwrap(), 0);
+    }
+
+    /// And the same through a real `/proc/<pid>/stat`, which is the caller
+    /// that had its own copy of the rule.
+    #[test]
+    fn a_pid_file_read_from_the_middle_carries_on_from_there() {
+        use crate::process::LinuxProcess;
+        use rcore_fs_ramfs::RamFS;
+
+        let proc = Process::create_with_fixed_id_ext(
+            &ROOT_JOB,
+            9_000_019,
+            "pager",
+            LinuxProcess::new(RamFS::new(), 0),
+        )
+        .unwrap();
+        let inode = ProcPidFileINode {
+            pid: 9_000_019,
+            kind: ProcPidFileKind::Stat,
+        };
+        // "9000019 (pager) ..." -- the head of the line is the pid and the
+        // name, which do not move between two reads; the counters further
+        // along do.
+        let line = proc_pid_stat(&proc);
+        let head = line.as_bytes();
+        let mut buf = [0u8; 7];
+        assert_eq!(inode.read_at(8, &mut buf).unwrap(), 7);
+        assert_eq!(&buf, &head[8..15]);
+        assert_eq!(&buf, b"(pager)");
+        // Past the end there is nothing to read, not the start again.
+        let mut end = [0u8; 8];
+        assert_eq!(inode.read_at(100_000, &mut end).unwrap(), 0);
+    }
+
+    /// `/proc/self` is a symlink whose target is read like a file, so the
+    /// same rule holds there: a reader that already has the pid asks past the
+    /// end and has to be told there is nothing more, or `readlink` never
+    /// stops.
+    #[test]
+    fn proc_self_read_past_its_target_is_the_end() {
+        let inode = ProcSelfSymINode;
+        let mut buf = [0u8; 16];
+        let n = inode.read_at(0, &mut buf).unwrap();
+        assert_eq!(n, inode.metadata().unwrap().size);
+        let text = core::str::from_utf8(&buf[..n]).unwrap();
+        assert!(text.parse::<u64>().is_ok(), "{:?} no es un pid", text);
+        assert_eq!(inode.read_at(n, &mut buf).unwrap(), 0);
+    }
+
+    // ---------------- /proc/meminfo ----------------
+
+    #[test]
+    fn meminfo_counts_in_kilobytes_and_says_so_on_every_line() {
+        let text = meminfo_text(4 * 1024 * 1024, 16 * 1024 * 1024, 0, 0);
+        assert_eq!(mem_kb(&text, "MemTotal:"), 16 * 1024);
+        assert_eq!(mem_kb(&text, "MemFree:"), 12 * 1024);
+        assert_eq!(mem_kb(&text, "MemAvailable:"), 12 * 1024);
+        // `free` divides by 1024 again to show MiB: bytes printed here are a
+        // machine claiming a thousand times the memory it has.
+        for line in text.lines() {
+            assert!(line.ends_with(" kB"), "{:?}", line);
+        }
+    }
+
+    #[test]
+    fn free_memory_is_what_is_left_of_the_total_not_the_other_way_round() {
+        let text = meminfo_text(1024 * 1024, 4 * 1024 * 1024, 0, 0);
+        assert_eq!(mem_kb(&text, "MemFree:"), 3 * 1024);
+    }
+
+    #[test]
+    fn more_used_than_there_is_means_nothing_free_and_not_a_wrap() {
+        let text = meminfo_text(8 * 1024 * 1024, 1024 * 1024, 0, 0);
+        assert_eq!(mem_kb(&text, "MemFree:"), 0);
+        assert_eq!(mem_kb(&text, "MemAvailable:"), 0);
+    }
+
+    /// The kernel heap is a separate arena and its lines only make sense when
+    /// there is one, so the test is `> 0`: a heap of any size at all is a heap.
+    #[test]
+    fn the_kernel_heap_lines_are_there_when_there_is_a_heap_and_not_when_there_is_none() {
+        let none = meminfo_text(0, 1024 * 1024, 0, 0);
+        assert!(!none.contains("KernelHeap"), "{}", none);
+        assert!(meminfo_text(0, 0, 0, 1).contains("KernelHeapTotal:"));
+
+        let some = meminfo_text(0, 1024 * 1024, 3 * 1024 * 1024, 8 * 1024 * 1024);
+        assert_eq!(mem_kb(&some, "KernelHeapTotal:"), 8 * 1024);
+        assert_eq!(mem_kb(&some, "KernelHeapUsed:"), 3 * 1024);
+        assert_eq!(mem_kb(&some, "KernelHeapFree:"), 5 * 1024);
+    }
+
+    // ---------------- /proc/uptime ----------------
+
+    /// Four CPUs halted for two seconds each is two seconds idle, not eight:
+    /// the sum is collected per CPU and `uptime(1)` wants one CPU's worth.
+    #[test]
+    fn the_idle_seconds_of_uptime_are_one_cpu_s_worth() {
+        assert_eq!(uptime_text(10.0, 8_000_000_000, 4), "10.00 2.00\n");
+        assert_eq!(uptime_text(10.0, 8_000_000_000, 1), "10.00 8.00\n");
+    }
+
+    /// Counting no CPUs is counting one. Dividing by zero here prints `inf`,
+    /// which every reader of the file parses as garbage or as nothing.
+    #[test]
+    fn a_count_of_no_cpus_is_treated_as_one() {
+        assert_eq!(uptime_text(1.0, 3_000_000_000, 0), "1.00 3.00\n");
+    }
+
+    #[test]
+    fn uptime_is_two_numbers_two_decimals_and_a_newline() {
+        assert_eq!(uptime_text(1234.5678, 0, 1), "1234.57 0.00\n");
+    }
+
+    // ---------------- /proc/loadavg ----------------
+
+    /// The fourth field is `runnable/total` in that order: `uptime` and every
+    /// monitoring agent read the half before the slash as the run queue, so
+    /// swapped it turns an idle machine with many threads into a run queue of
+    /// hundreds, which is what a pager fires on.
+    #[test]
+    fn the_run_queue_of_loadavg_comes_before_the_total() {
+        let text = loadavg_text([0.5, 1.25, 2.0], 3, 41, 1234);
+        assert_eq!(text, "0.50 1.25 2.00 3/41 1234\n");
+    }
+
+    /// KoIDs are handed out in increasing order, so the last field is the
+    /// biggest live one. The smallest is whatever has been up longest, which
+    /// would date every new shell to boot time.
+    #[test]
+    fn the_last_pid_of_loadavg_is_the_newest_process_not_the_oldest() {
+        use crate::process::LinuxProcess;
+        use rcore_fs_ramfs::RamFS;
+
+        let _newest = Process::create_with_fixed_id_ext(
+            &ROOT_JOB,
+            9_000_017,
+            "loadavg",
+            LinuxProcess::new(RamFS::new(), 0),
+        )
+        .unwrap();
+        let text = proc_loadavg_content();
+        let last: u64 = column(text.trim_end(), 4).parse().unwrap();
+        assert!(last >= 9_000_017, "{:?}", text);
+    }
+
+    // ---------------- las lineas de cpu de /proc/stat ----------------
+
+    #[test]
+    fn the_cpu_summary_adds_the_columns_up_one_by_one() {
+        let text = cpu_times_text(&[(10, 20, 30), (1, 2, 3)]);
+        let summary = text.lines().next().unwrap();
+        assert_eq!(column(summary, 0), "cpu");
+        assert_eq!(column(summary, 1), "11"); // user
+        assert_eq!(column(summary, 3), "22"); // system
+        assert_eq!(column(summary, 4), "33"); // idle
+    }
+
+    /// `top`, `vmstat` and `mpstat` index into the line by position, so a
+    /// column out of place is a busy machine reading as an idle one.
+    #[test]
+    fn each_cpu_line_puts_its_time_in_the_column_its_readers_index() {
+        let text = cpu_times_text(&[(7, 0, 0), (0, 9, 0), (0, 0, 11)]);
+        let lines: Vec<&str> = text.lines().skip(1).collect();
+        assert_eq!(lines.len(), 3);
+        assert_eq!(column(lines[0], 0), "cpu0");
+        assert_eq!(column(lines[0], 1), "7"); // user
+        assert_eq!(column(lines[1], 3), "9"); // system
+        assert_eq!(column(lines[2], 4), "11"); // idle
+                                               // Name plus the ten counters `top` expects, on every line.
+        for line in text.lines() {
+            assert_eq!(line.split_whitespace().count(), 11, "{:?}", line);
+        }
+    }
+
+    #[test]
+    fn a_machine_that_counted_no_cpus_still_has_its_summary_line() {
+        assert_eq!(cpu_times_text(&[]), "cpu  0 0 0 0 0 0 0 0 0 0\n");
+    }
+
+    // ---------------- /proc/net/route ----------------
+
+    #[test]
+    fn a_route_with_a_gateway_is_the_one_flagged_as_one() {
+        let with = route_row("eth0", 0, u32::from_ne_bytes([192, 168, 1, 1]), 0);
+        assert_eq!(route_fields(&with)[3], "0003"); // RTF_UP | RTF_GATEWAY
+        let without = route_row("eth0", u32::from_ne_bytes([10, 0, 0, 0]), 0, 8);
+        assert_eq!(route_fields(&without)[3], "0001"); // RTF_UP
+    }
+
+    #[test]
+    fn the_mask_of_a_row_is_its_prefix_length_written_out() {
+        let slash24 = route_row("eth0", u32::from_ne_bytes([10, 1, 2, 0]), 0, 24);
+        assert_eq!(
+            route_fields(&slash24)[7],
+            alloc::format!("{:08X}", u32::from_ne_bytes([255, 255, 255, 0]))
+        );
+        let host = route_row("eth0", 0, 0, 32);
+        assert_eq!(
+            route_fields(&host)[7],
+            alloc::format!("{:08X}", u32::from_ne_bytes([255, 255, 255, 255]))
+        );
+    }
+
+    /// `route -n` reads the table by column, so the default route's `0` has to
+    /// be written as eight digits like every other address.
+    #[test]
+    fn every_address_in_the_table_is_eight_hex_digits() {
+        let row = route_row("eth0", 0, 0, 0);
+        let fields = route_fields(&row);
+        assert_eq!(fields.len(), 11);
+        assert_eq!(fields[0], "eth0");
+        assert_eq!(fields[1].len(), 8); // destination
+        assert_eq!(fields[2].len(), 8); // gateway
+        assert_eq!(fields[7].len(), 8); // mask
     }
 }
