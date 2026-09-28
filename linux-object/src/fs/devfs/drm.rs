@@ -6483,6 +6483,25 @@ pub fn atomic_commit(
         }
     }
     let active_change = upd.active.map(|a| a != cur.active).unwrap_or(false);
+    // "requesting event but off" (`drm_atomic_crtc_check`): an event on a
+    // CRTC that is off and stays off is refused, on purpose -- Linux's
+    // comment says userspace "has a track record of happily burning through
+    // 100% cpu (or worse, crash) when the display pipe is suspended", so a
+    // request for an event there is taken as a bug in the compositor's
+    // frame loop and answered EINVAL, like WAIT_VBLANK and the legacy page
+    // flip on a disabled pipe. This scheduled the flip event anyway, so the
+    // loop of a client that kept flipping a dark output ran on at vblank
+    // rate. Turning the pipe on or off in the same commit is fine (one of
+    // the two states is active). A TEST_ONLY commit carries no event on
+    // Linux, and the ioctl arm refuses the TEST_ONLY|EVENT pair before it
+    // gets here, so `want_event` alone is the whole condition.
+    let ends_active = upd.active.unwrap_or(cur.active);
+    if want_event && !ends_active && !cur.active {
+        log::error!(
+            "[drm] ATOMIC reject: PAGE_FLIP_EVENT requested on a CRTC that is off and stays off"
+        );
+        return Err(AtomicError::Invalid);
+    }
     if (mode_change || active_change) && !allow_modeset {
         // Linux: "[CRTC] requires full modeset" -> EINVAL without the flag.
         log::error!(
@@ -9461,13 +9480,18 @@ mod flip_latch_tests {
         let file = DrmFileState::new();
         leave_one_mid_delivery(&file);
 
+        // An event is only owed on a CRTC that is (or becomes) active: the
+        // check phase refuses one on a pipe that is off and stays off, as
+        // `drm_atomic_crtc_check` does. This is a frame on a running output.
+        let was_active = core::mem::replace(&mut DRM_STATE.lock().atomic.active, true);
         let (answer, first_completion_was_on_the_fd) = race_against_delivery(&file, |file| {
             atomic_commit(&AtomicUpdate::default(), false, false, true, 0xA70, file)
         });
+        DRM_STATE.lock().atomic.active = was_active;
         assert_eq!(
             answer,
             Ok(()),
-            "an empty commit that asks for an event is accepted"
+            "a commit on an active CRTC that asks for an event is accepted"
         );
         assert!(
             first_completion_was_on_the_fd,
