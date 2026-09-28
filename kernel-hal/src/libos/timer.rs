@@ -79,6 +79,11 @@ pub fn vdso_tsc_mult() -> Option<u64> {
     None
 }
 
+/// This boot's TSC time zero (libos: no vDSO, and no TSC of our own to base).
+pub fn vdso_tsc_base() -> u64 {
+    0
+}
+
 /// Register the clock-parameter observer (libos: nothing publishes a clock to
 /// userspace, so the registration is inert).
 pub fn set_clock_observer(_observer: fn()) {}

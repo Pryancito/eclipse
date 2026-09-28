@@ -174,6 +174,10 @@ fn enabled(wall_off_ns: u64) -> linux_vdso::VdsoData {
         _pad: 0,
         tsc_mult: ONE_GHZ_MULT,
         wall_off_ns,
+        // Time zero at TSC zero: the tests below bracket the answer against raw
+        // `rdtsc()` readings, which is only meaningful with no base subtracted.
+        // The base's own behaviour is pinned by the two tests that set one.
+        tsc_base: 0,
     }
 }
 
@@ -253,6 +257,7 @@ fn conversion_survives_an_overflowing_product() {
         _pad: 0,
         tsc_mult: mult,
         wall_off_ns: 0,
+        tsc_base: 0,
     });
     let clock_gettime: ClockGettime = m.sym("__vdso_clock_gettime");
 
@@ -284,6 +289,70 @@ fn conversion_survives_an_overflowing_product() {
         hi
     );
     assert!(ts.tv_nsec >= 0 && ts.tv_nsec < 1_000_000_000);
+}
+
+/// The base is what makes the answer an *uptime* rather than the time since the
+/// machine was last powered on.
+///
+/// The TSC is not zero when a kernel takes over: firmware ran first, and a warm
+/// reboot never resets the counter at all. Eclipse scaled the absolute reading,
+/// and Moebius's machine reported 711231 s -- 8.2 days -- of uptime from the
+/// first line of `dmesg`, with time then advancing correctly on top of it. The
+/// host running this test has been up for a while too, so its own `rdtsc()`
+/// stands in for that: with the base set to a reading taken moments ago, the
+/// clock has to answer microseconds, not the days the raw counter would give.
+#[test]
+fn the_base_is_subtracted_so_the_clock_starts_at_zero() {
+    let base = rdtsc();
+    // Not vacuous: at 1 ns/tick an un-subtracted reading of this counter is
+    // already minutes, and on any machine that has been up a while, days.
+    assert!(
+        base > 60 * 1_000_000_000,
+        "el TSC del host ({}) es demasiado bajo: sin base el test pasaria igual",
+        base
+    );
+
+    let m = Mapping::new(linux_vdso::VdsoData {
+        enabled: 1,
+        _pad: 0,
+        tsc_mult: ONE_GHZ_MULT,
+        wall_off_ns: 0,
+        tsc_base: base,
+    });
+    let clock_gettime: ClockGettime = m.sym("__vdso_clock_gettime");
+
+    let mut ts = Timespec::default();
+    assert_eq!(unsafe { clock_gettime(CLOCK_MONOTONIC, &mut ts) }, 0);
+    assert!(
+        ts.as_ns() < 1_000_000_000,
+        "el reloj arranco en {} ns: la base no se resto",
+        ts.as_ns()
+    );
+    assert_eq!(ts.tv_sec, 0, "un uptime recien nacido no tiene segundos");
+}
+
+/// A reading below the base saturates to zero.
+///
+/// The kernel latches the base on the first clock read of the boot, so every
+/// later reading is above it -- on the CPU that latched it. A sibling whose TSC
+/// is a few cycles behind can read lower, and an unsigned subtraction there
+/// would wrap to ~2^64 ticks: not a clock that is slightly early but one
+/// centuries in the future, which every deadline in the process would then be
+/// measured against.
+#[test]
+fn a_reading_below_the_base_reads_as_zero_not_as_a_wrapped_span() {
+    let m = Mapping::new(linux_vdso::VdsoData {
+        enabled: 1,
+        _pad: 0,
+        tsc_mult: ONE_GHZ_MULT,
+        wall_off_ns: 0,
+        tsc_base: u64::MAX,
+    });
+    let clock_gettime: ClockGettime = m.sym("__vdso_clock_gettime");
+
+    let mut ts = Timespec::default();
+    assert_eq!(unsafe { clock_gettime(CLOCK_MONOTONIC, &mut ts) }, 0);
+    assert_eq!(ts.as_ns(), 0, "la resta se desbordo en vez de saturar");
 }
 
 #[test]

@@ -63,11 +63,17 @@ struct vdso_data {
     // request so the caller falls back to the syscall.
     volatile uint32_t enabled;
     volatile uint32_t _pad;
-    // Monotonic nanoseconds = (rdtsc() * tsc_mult) >> 32. Same fixed-point
-    // multiplier the kernel's own `timer_now` uses.
+    // Monotonic nanoseconds = ((rdtsc() - tsc_base) * tsc_mult) >> 32. Same
+    // fixed-point multiplier the kernel's own `timer_now` uses.
     volatile uint64_t tsc_mult;
     // Added to monotonic nanoseconds to obtain CLOCK_REALTIME.
     volatile uint64_t wall_off_ns;
+    // The rdtsc() reading the kernel calls time zero for this boot, subtracted
+    // before scaling. The TSC is not zero when the kernel takes over (firmware
+    // ran first, and a warm reboot never resets it), so without this the clock
+    // reports the time since the machine was last powered on -- 8.2 days on the
+    // machine the bug was found on -- as uptime.
+    volatile uint64_t tsc_base;
 };
 
 // No seqlock. Both payload fields are naturally-aligned 64-bit quantities, and
@@ -107,12 +113,16 @@ static inline uint64_t vdso_rdtsc(void) {
     return ((uint64_t)hi << 32) | (uint64_t)lo;
 }
 
-// ns = (tsc * mult) >> 32, in 128 bits — exactly what the kernel's
-// `tsc_to_ns` does. The 64x64->128 multiply is a single `mulq`; going through
-// 64-bit arithmetic instead would overflow after about 71 days of uptime, which
-// is the bug that shape was chosen to avoid in the first place.
-static inline uint64_t vdso_tsc_to_ns(uint64_t tsc, uint64_t mult) {
-    return (uint64_t)(((unsigned __int128)tsc * (unsigned __int128)mult) >> 32);
+// ns = ((tsc - base) * mult) >> 32, in 128 bits — exactly what the kernel's
+// `tsc_to_ns` does (`kernel_hal::common::tsc_cal::mono_ns`). The 64x64->128
+// multiply is a single `mulq`; going through 64-bit arithmetic instead would
+// overflow after about 71 days of uptime, which is the bug that shape was
+// chosen to avoid in the first place. The subtraction saturates, so a reading
+// below the base -- a sibling CPU a few cycles behind the one that latched it
+// -- is zero rather than an enormous wrapped span.
+static inline uint64_t vdso_tsc_to_ns(uint64_t tsc, uint64_t base, uint64_t mult) {
+    uint64_t ticks = tsc > base ? tsc - base : 0;
+    return (uint64_t)(((unsigned __int128)ticks * (unsigned __int128)mult) >> 32);
 }
 
 // Returns 0 and fills `ns`, or non-zero if this clock cannot be served here.
@@ -120,7 +130,7 @@ static inline int vdso_now_ns(int clk, uint64_t *ns) {
     struct vdso_data *d = &_vdso_data;
     if (!d->enabled)
         return VDSO_ENOSYS;
-    uint64_t mono = vdso_tsc_to_ns(vdso_rdtsc(), d->tsc_mult);
+    uint64_t mono = vdso_tsc_to_ns(vdso_rdtsc(), d->tsc_base, d->tsc_mult);
     switch (clk) {
     case VDSO_CLOCK_MONOTONIC:
     case VDSO_CLOCK_MONOTONIC_RAW:

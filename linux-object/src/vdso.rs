@@ -151,7 +151,7 @@ fn build() -> Option<Vdso> {
 /// Write the current clock parameters into the image.
 ///
 /// Called on every change to the wall-clock offset or to the TSC's usability,
-/// through the observer registered in [`init`]. Cheap enough — three stores —
+/// through the observer registered in [`init`]. Cheap enough — four stores —
 /// that there is no value in trying to skip redundant calls.
 ///
 /// ## Why there is no lock and no seqlock
@@ -161,23 +161,26 @@ fn build() -> Option<Vdso> {
 /// because it publishes a whole coherent snapshot: a clock source, its mask,
 /// its shift, a base time and a cycle count that only make sense together.
 ///
-/// This publishes two numbers that do not depend on each other. `tsc_mult`
-/// converts ticks to nanoseconds; `wall_off_ns` shifts monotonic to realtime. A
-/// reader that catches a fresh one alongside a stale one gets an answer correct
-/// for the instant it read, which is everything a clock owes its caller. Both
-/// are naturally aligned 64-bit fields, and an aligned 64-bit load on x86_64
-/// cannot tear, so each is individually whole. What is left is ordering, and
+/// This publishes numbers that do not depend on each other. `tsc_mult` converts
+/// ticks to nanoseconds; `wall_off_ns` shifts monotonic to realtime; `tsc_base`
+/// is this boot's time zero and is latched once, before the image exists, and
+/// never republished with a different value. A reader that catches a fresh one
+/// alongside a stale one gets an answer correct for the instant it read, which
+/// is everything a clock owes its caller. All are naturally aligned 64-bit
+/// fields, and an aligned 64-bit load on x86_64 cannot tear, so each is
+/// individually whole. What is left is ordering, and
 /// only in one direction: `enabled` must not turn on before the values it
 /// vouches for are in memory, and must turn off before they stop being true.
 fn publish() {
     let Some(vdso) = vdso() else { return };
     let mult = kernel_hal::timer::vdso_tsc_mult();
     let wall_off_ns = kernel_hal::timer::wall_clock_offset_ns();
+    let tsc_base = kernel_hal::timer::vdso_tsc_base();
 
     // SAFETY: `data` addresses `_vdso_data` inside frames owned for the
     // lifetime of the system, whose extent the build script has checked lies
     // wholly within the image.
-    unsafe { publish_into(vdso.data, mult, wall_off_ns) }
+    unsafe { publish_into(vdso.data, mult, wall_off_ns, tsc_base) }
 }
 
 /// The write sequence itself, against any `VdsoData`.
@@ -192,12 +195,13 @@ fn publish() {
 /// # Safety
 ///
 /// `d` must point at a live, aligned `VdsoData` that the caller may write.
-unsafe fn publish_into(d: *mut VdsoData, mult: Option<u64>, wall_off_ns: u64) {
+unsafe fn publish_into(d: *mut VdsoData, mult: Option<u64>, wall_off_ns: u64, tsc_base: u64) {
     // Volatile writes because the reader is userspace and invisible to the
     // compiler.
     let enabled = core::ptr::addr_of_mut!((*d).enabled);
     let tsc_mult = core::ptr::addr_of_mut!((*d).tsc_mult);
     let wall = core::ptr::addr_of_mut!((*d).wall_off_ns);
+    let base = core::ptr::addr_of_mut!((*d).tsc_base);
 
     match mult {
         None => {
@@ -207,12 +211,20 @@ unsafe fn publish_into(d: *mut VdsoData, mult: Option<u64>, wall_off_ns: u64) {
             compiler_fence(Ordering::SeqCst);
             core::ptr::write_volatile(tsc_mult, 0);
             core::ptr::write_volatile(wall, wall_off_ns);
+            // The base goes too, and for the same reason the multiplier does: a
+            // stale base left standing is what a reader that forgets to check
+            // `enabled` would subtract, and subtracting last boot's base from
+            // this boot's counter is a wrong time rather than an absent one.
+            core::ptr::write_volatile(base, 0);
         }
         Some(mult) => {
             // Turning on, or updating: the parameters land first, so a reader
-            // that sees `enabled` sees them too.
+            // that sees `enabled` sees them too. The base belongs to that set:
+            // without it a reader would scale the absolute counter and answer a
+            // monotonic clock days ahead of the kernel's.
             core::ptr::write_volatile(tsc_mult, mult);
             core::ptr::write_volatile(wall, wall_off_ns);
+            core::ptr::write_volatile(base, tsc_base);
             compiler_fence(Ordering::SeqCst);
             core::ptr::write_volatile(enabled, 1);
         }
@@ -368,6 +380,7 @@ mod tests {
             _pad: 0xdead_beef,
             tsc_mult: 0xdead_beef_dead_beef,
             wall_off_ns: 0xdead_beef_dead_beef,
+            tsc_base: 0xdead_beef_dead_beef,
         }
     }
 
@@ -380,10 +393,31 @@ mod tests {
     fn turning_the_clock_on_publishes_both_parameters_and_then_enables() {
         let mut d = scratch_data();
         // SAFETY: `d` is a live, aligned `VdsoData` this test owns.
-        unsafe { publish_into(&mut d, Some(0x1234_5678_9abc_def0), 42) };
+        unsafe { publish_into(&mut d, Some(0x1234_5678_9abc_def0), 42, 7_000) };
         assert_eq!(d.enabled, 1);
         assert_eq!(d.tsc_mult, 0x1234_5678_9abc_def0);
         assert_eq!(d.wall_off_ns, 42);
+        assert_eq!(
+            d.tsc_base, 7_000,
+            "the base is a clock parameter like the rest"
+        );
+    }
+
+    /// The base is the field this whole struct was extended for, and forgetting
+    /// it is not a clock that declines to answer: it is a clock that answers the
+    /// time since the machine was last powered on, which on the machine the bug
+    /// was found on was 8.2 days ahead of the kernel's own monotonic clock.
+    /// Nothing else in userspace would notice, so the check lives here.
+    #[test]
+    fn enabling_never_leaves_the_base_behind_the_multiplier() {
+        let mut d = scratch_data();
+        // SAFETY: `d` is a live, aligned `VdsoData` this test owns.
+        unsafe { publish_into(&mut d, Some(3), 0, 2_631_000_000_000_000) };
+        assert_eq!(d.tsc_base, 2_631_000_000_000_000);
+        assert_ne!(
+            d.tsc_base, 0xdead_beef_dead_beef,
+            "the scratch value survived: the base was never written"
+        );
     }
 
     /// Disabling: `enabled` goes to zero, and the multiplier goes with it. Left
@@ -394,12 +428,13 @@ mod tests {
     fn turning_the_clock_off_clears_the_multiplier_as_well_as_the_flag() {
         let mut d = scratch_data();
         // SAFETY: as above.
-        unsafe { publish_into(&mut d, Some(99), 7) };
+        unsafe { publish_into(&mut d, Some(99), 7, 5) };
         // SAFETY: as above.
-        unsafe { publish_into(&mut d, None, 8) };
+        unsafe { publish_into(&mut d, None, 8, 5) };
         assert_eq!(d.enabled, 0);
         assert_eq!(d.tsc_mult, 0, "a stale multiplier must not survive");
         assert_eq!(d.wall_off_ns, 8, "the wall offset is published either way");
+        assert_eq!(d.tsc_base, 0, "a stale base must not survive either");
     }
 
     /// The padding exists only to keep the 64-bit fields aligned, which is what
@@ -409,10 +444,10 @@ mod tests {
     fn publishing_never_touches_the_padding() {
         let mut d = scratch_data();
         // SAFETY: as above.
-        unsafe { publish_into(&mut d, Some(1), 1) };
+        unsafe { publish_into(&mut d, Some(1), 1, 1) };
         assert_eq!(d._pad, 0xdead_beef);
         // SAFETY: as above.
-        unsafe { publish_into(&mut d, None, 1) };
+        unsafe { publish_into(&mut d, None, 1, 1) };
         assert_eq!(d._pad, 0xdead_beef);
     }
 
@@ -422,10 +457,13 @@ mod tests {
     fn publishing_again_replaces_what_was_there() {
         let mut d = scratch_data();
         // SAFETY: as above.
-        unsafe { publish_into(&mut d, Some(10), 100) };
+        unsafe { publish_into(&mut d, Some(10), 100, 1_000) };
         // SAFETY: as above.
-        unsafe { publish_into(&mut d, Some(20), 200) };
-        assert_eq!((d.enabled, d.tsc_mult, d.wall_off_ns), (1, 20, 200));
+        unsafe { publish_into(&mut d, Some(20), 200, 2_000) };
+        assert_eq!(
+            (d.enabled, d.tsc_mult, d.wall_off_ns, d.tsc_base),
+            (1, 20, 200, 2_000)
+        );
     }
 
     /// The guard page is the whole reason the image is not flush against the
