@@ -271,4 +271,155 @@ mod tests {
         );
         assert_eq!(end0.read(5, &mut buf, 3).unwrap_err(), ZxError::PEER_CLOSED);
     }
+
+    // ---------- The signals a fifo publishes ----------
+    //
+    // READABLE, WRITABLE and PEER_CLOSED are the whole of what a fifo tells
+    // anyone waiting on it: `zx_object_wait_one`, a port subscription and
+    // every poll on a fifo handle read nothing else. Not one of the six
+    // places that move them had a test, so swapping any two of them --
+    // asserting READABLE where WRITABLE belongs, clearing the reader's signal
+    // instead of the writer's -- passed green.
+
+    /// Which signals does a fifo carry right now?
+    fn signals_of(fifo: &Fifo) -> (bool, bool, bool) {
+        let s = fifo.base.signal();
+        (
+            s.contains(Signal::READABLE),
+            s.contains(Signal::WRITABLE),
+            s.contains(Signal::PEER_CLOSED),
+        )
+    }
+
+    /// A new fifo is writable at both ends and readable at neither.
+    #[test]
+    fn a_new_fifo_is_writable_at_both_ends_and_readable_at_neither() {
+        let (end0, end1) = Fifo::create(2, 5);
+        assert_eq!(signals_of(&end0), (false, true, false));
+        assert_eq!(signals_of(&end1), (false, true, false));
+    }
+
+    /// A write makes the FAR end readable — the data is queued on the peer,
+    /// so the peer is the one with something to read. Asserting it on the
+    /// writer instead wakes the wrong side of the pipe: the reader sleeps on
+    /// a fifo that has data in it.
+    #[test]
+    fn a_write_makes_the_far_end_readable_and_not_the_near_one() {
+        let (end0, end1) = Fifo::create(2, 5);
+        assert_eq!(end0.write(5, &[1u8; 5], 1), Ok(1));
+
+        assert_eq!(
+            signals_of(&end1),
+            (true, true, false),
+            "the end holding the data is the one that became readable"
+        );
+        assert_eq!(
+            signals_of(&end0),
+            (false, true, false),
+            "the writer became readable for data it sent"
+        );
+    }
+
+    /// Filling the fifo takes WRITABLE off the WRITER, and the first read at
+    /// the other end gives it back. The writer is the side that must stop, and
+    /// it is the side whose next `write` would answer `SHOULD_WAIT`.
+    #[test]
+    fn a_full_fifo_stops_being_writable_until_something_is_read() {
+        let (end0, end1) = Fifo::create(2, 5);
+        assert_eq!(end0.write(5, &[7u8; 10], 2), Ok(2));
+
+        assert_eq!(
+            signals_of(&end0),
+            (false, false, false),
+            "a writer with a full fifo in front of it is still writable"
+        );
+        assert_eq!(end0.write(5, &[7u8; 5], 1), Err(ZxError::SHOULD_WAIT));
+        assert_eq!(signals_of(&end1), (true, true, false));
+
+        let mut buf = [0u8; 5];
+        assert_eq!(end1.read(5, &mut buf, 1), Ok(1));
+        assert_eq!(
+            signals_of(&end0),
+            (false, true, false),
+            "room was made and the writer was not told"
+        );
+        assert_eq!(end0.write(5, &[9u8; 5], 1), Ok(1));
+    }
+
+    /// And emptying it takes READABLE off the READER, which is the side whose
+    /// next `read` would answer `SHOULD_WAIT`.
+    #[test]
+    fn an_empty_fifo_stops_being_readable() {
+        let (end0, end1) = Fifo::create(2, 5);
+        end0.write(5, &[3u8; 5], 1).unwrap();
+        assert_eq!(signals_of(&end1), (true, true, false));
+
+        let mut buf = [0u8; 5];
+        assert_eq!(end1.read(5, &mut buf, 1), Ok(1));
+        assert_eq!(
+            signals_of(&end1),
+            (false, true, false),
+            "an empty fifo was left looking readable"
+        );
+        assert_eq!(end1.read(5, &mut buf, 1), Err(ZxError::SHOULD_WAIT));
+        assert_eq!(
+            signals_of(&end0),
+            (false, true, false),
+            "the writer lost a signal it never had reason to lose"
+        );
+    }
+
+    /// A read takes what was asked for and leaves the rest queued, even when
+    /// the fifo holds more. Draining the whole queue for a one-element request
+    /// both loses the caller's data and writes past the buffer it was given.
+    #[test]
+    fn a_read_takes_what_was_asked_for_and_leaves_the_rest() {
+        let (end0, end1) = Fifo::create(4, 2);
+        end0.write(2, &[1, 2, 3, 4, 5, 6], 3).unwrap();
+
+        let mut one = [0u8; 2];
+        assert_eq!(end1.read(2, &mut one, 1), Ok(1));
+        assert_eq!(one, [1, 2]);
+        assert_eq!(
+            signals_of(&end1),
+            (true, true, false),
+            "two elements are still queued and the fifo says it is empty"
+        );
+
+        let mut rest = [0u8; 4];
+        assert_eq!(end1.read(2, &mut rest, 2), Ok(2));
+        assert_eq!(rest, [3, 4, 5, 6], "the rest was dropped by the first read");
+        assert_eq!(signals_of(&end1), (false, true, false));
+    }
+
+    /// Closing one end tells the other: PEER_CLOSED goes up and WRITABLE comes
+    /// down, in that order and on the end that is still alive. The two the
+    /// other way round is a writer that goes on writing into a fifo whose
+    /// reader is gone.
+    #[test]
+    fn closing_one_end_leaves_the_other_closed_and_not_writable() {
+        let (end0, end1) = Fifo::create(2, 5);
+        assert_eq!(signals_of(&end0), (false, true, false));
+
+        drop(end1);
+        assert_eq!(
+            signals_of(&end0),
+            (false, false, true),
+            "the surviving end was not told its peer had gone"
+        );
+        assert_eq!(end0.write(5, &[1u8; 5], 1), Err(ZxError::PEER_CLOSED));
+    }
+
+    /// A reader whose peer is gone gets PEER_CLOSED and not SHOULD_WAIT once
+    /// the queue runs dry: SHOULD_WAIT is a promise that waiting will help.
+    #[test]
+    fn a_reader_with_no_peer_is_told_so_rather_than_told_to_wait() {
+        let (end0, end1) = Fifo::create(2, 5);
+        end0.write(5, &[4u8; 5], 1).unwrap();
+        drop(end0);
+
+        let mut buf = [0u8; 5];
+        assert_eq!(end1.read(5, &mut buf, 1), Ok(1), "queued data survives");
+        assert_eq!(end1.read(5, &mut buf, 1), Err(ZxError::PEER_CLOSED));
+    }
 }
