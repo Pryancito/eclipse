@@ -63,6 +63,7 @@ pub fn install(rootfs: &Path) {
     write_eclipse_tz(rootfs);
     write_eclipse_look(rootfs);
     write_kde_helpers(rootfs);
+    write_kde_session(rootfs);
 }
 
 /// `/usr/local/bin/eclipse-xkbmap`: load the X keyboard map into Xwayland once
@@ -2455,9 +2456,10 @@ const MENU_EN: &[u8] = br#"<?xml version="1.0" encoding="UTF-8"?>
 fn write_labwc_environment(rootfs: &Path) {
     let cfg = rootfs.join("root/.config/labwc");
     let _ = fs::create_dir_all(&cfg);
-    fs::write(
-        cfg.join("environment"),
-        b"# Eclipse OS - env for the labwc session (sourced by labwc itself).\n\
+    // Built as a String rather than written as one literal: the last line
+    // depends on whether KDE was built into this image (see below).
+    let mut env = String::from(
+        "# Eclipse OS - env for the labwc session (sourced by labwc itself).\n\
           # PATH first: the per-VT console shells do NOT source /etc/profile,\n\
           # so a labwc launched from one inherits a PATH without\n\
           # /usr/local/bin - bypassing the labwc wrapper and making keybinds\n\
@@ -2534,22 +2536,31 @@ fn write_labwc_environment(rootfs: &Path) {
           # the connect is refused at once and apps carry on bus-less; a\n\
           # dbus-daemon bound to this path later is picked up automatically.\n\
           DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/0/bus\n\
-          # Qt, for the KDE look: native Wayland first, Xwayland as fallback.\n\
-          # The renderer-dependent half (QT_QUICK_BACKEND=software on pixman)\n\
-          # is exported by the labwc wrapper, like SDL's. NOT set here:\n\
-          # QT_QPA_PLATFORMTHEME=kde and XDG_CURRENT_DESKTOP=KDE, which the\n\
-          # usual \"KDE on labwc\" recipes recommend -- the first needs the\n\
-          # plasma-integration plugin and the second makes portals and GTK\n\
-          # look for a KDE session that is not there. Neither exists in this\n\
-          # image, so both only produce warnings and wrong lookups.\n\
+          # Qt: native Wayland first, Xwayland as fallback. The\n\
+          # renderer-dependent half (QT_QUICK_BACKEND=software on pixman) is\n\
+          # exported by the labwc wrapper, like SDL's, and so is\n\
+          # QT_QPA_PLATFORMTHEME -- deliberately NOT here, because naming the\n\
+          # `kde` theme is only right when plasma-integration really landed,\n\
+          # and a name with no plugin behind it makes every Qt app warn at\n\
+          # startup. The wrapper looks for the plugin file and decides.\n\
           QT_QPA_PLATFORM=wayland;xcb\n\
           QT_AUTO_SCREEN_SCALE_FACTOR=1\n\
-          # Desktop identity, for .desktop OnlyShowIn/NotShowIn filtering and\n\
-          # any app that asks: this IS a wlroots session, whatever it looks like.\n\
-          XDG_CURRENT_DESKTOP=labwc:wlroots\n\
-          XDG_SESSION_DESKTOP=labwc\n",
-    )
-    .unwrap();
+          # Desktop identity, for .desktop OnlyShowIn/NotShowIn filtering, for\n\
+          # xdg-desktop-portal's backend choice, and for any app that asks.\n\
+          # This IS a wlroots session whatever it looks like, so labwc:wlroots\n\
+          # is always in the list; KDE goes in FRONT of it only when the KDE\n\
+          # set was actually built into this image, because the first entry is\n\
+          # the portal backend the session asks for and a name with no\n\
+          # kde.portal behind it is a file dialog that falls back silently.\n\
+          ",
+    );
+    env.push_str(if crate::linux::xorg::kde_enabled() {
+        "XDG_CURRENT_DESKTOP=KDE:labwc:wlroots\n"
+    } else {
+        "XDG_CURRENT_DESKTOP=labwc:wlroots\n"
+    });
+    env.push_str("XDG_SESSION_DESKTOP=labwc\n");
+    fs::write(cfg.join("environment"), env).unwrap();
 }
 
 /// Session clients used to launch from labwc's `autostart` via
@@ -2578,6 +2589,111 @@ fn write_labwc_autostart(rootfs: &Path) {
           Wrappers: /usr/local/bin/eclipse-lunarbg, eclipse-lunarbar.\n",
     )
     .unwrap();
+}
+
+/// KDE proper (Qt 6 + KF6 + the KDE applications, see `KDE_PACKAGES` in
+/// `xorg.rs`): the `kded6` wrapper eclipse-init runs as a service, the
+/// palette seeding, and the `kdeglobals` every KDE app reads first.
+///
+/// These files are written whatever the build knob says. They cost a few
+/// hundred bytes, every one of them checks for its binary before doing
+/// anything, and writing them unconditionally means an image built without
+/// KDE and then `apk add`ed on the machine comes up configured.
+fn write_kde_session(rootfs: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let localbin = rootfs.join("usr/local/bin");
+    let _ = fs::create_dir_all(&localbin);
+
+    // kdeglobals is read by every KF6 app (and by plasma-integration for Qt
+    // apps that are not KDE's). Only the choices go here: the Breeze Dark
+    // COLOURS are copied in at first boot by eclipse-kde-colors below, from
+    // the scheme the breeze package ships, rather than transcribed -- a
+    // hand-typed palette is a palette that drifts from the real one.
+    let cfg = rootfs.join("root/.config");
+    let _ = fs::create_dir_all(&cfg);
+    fs::write(
+        cfg.join("kdeglobals"),
+        b"# Eclipse OS: defaults for KDE applications (dolphin, konsole,\n\
+          # kate, okular, ...). eclipse-kde-colors appends the Breeze Dark\n\
+          # [Colors:*] groups on first boot; everything else lives here.\n\
+          [General]\n\
+          widgetStyle=Breeze\n\
+          ColorScheme=BreezeDark\n\
+          \n\
+          [Icons]\n\
+          Theme=breeze-dark\n\
+          \n\
+          [KDE]\n\
+          LookAndFeelPackage=org.kde.breezedark.desktop\n\
+          # Double click to open, like the rest of this desktop (Thunar, the\n\
+          # lunarrun launcher). KDE's own default is single click.\n\
+          SingleClick=false\n\
+          \n\
+          # KIO asks the portal for file dialogs only in a session that has\n\
+          # one; here the KDE dialog IS the backend, so ask for it directly.\n\
+          [FileDialog]\n\
+          Sorting Style=Default\n",
+    )
+    .unwrap();
+
+    // kded6: the host process for KDE's background modules. Non-GUI as a
+    // binary but it builds a QGuiApplication, so it needs the compositor,
+    // and everything it does is D-Bus, so it needs the bus. BOTH gates live
+    // in kded.service (`wait_socket` for the wayland socket, `wait_path` for
+    // the bus socket): those are init's native 10 ms stat polls, where a
+    // wait loop here would fork a busybox `sleep` per iteration -- the same
+    // trade the labwc and lunarbg wrappers already made. What is left here
+    // is the one-shot diagnose, because a `type = respawn` service that
+    // exits immediately is otherwise a silent restart storm.
+    let kded = localbin.join("eclipse-kded");
+    fs::write(
+        &kded,
+        b"#!/bin/sh\n\
+          # Eclipse OS: KDE's session daemon (kded6). Started by\n\
+          # /etc/eclipse/services/kded.service; init wires a service's stdio\n\
+          # to /dev/null, so keep our own log.\n\
+          LOG=/tmp/kded.log\n\
+          : > \"$LOG\" 2>/dev/null || true\n\
+          : \"${XDG_RUNTIME_DIR:=/run/user/0}\"; export XDG_RUNTIME_DIR\n\
+          BUS=\"$XDG_RUNTIME_DIR/bus\"\n\
+          # kded6 without a bus prints one line and exits, which under\n\
+          # respawn looks like nothing at all. Say which bus was missing.\n\
+          [ -S \"$BUS\" ] || echo \"eclipse-kded: no session bus at $BUS\" >>\"$LOG\"\n\
+          for d in /usr/bin /bin /usr/local/bin; do\n\
+          \x20 [ -x \"$d/kded6\" ] && exec \"$d/kded6\" >>\"$LOG\" 2>&1\n\
+          done\n\
+          # NOT INSTALLED: say so where it can be found, and do not spin.\n\
+          MSG='eclipse-kded: kded6 is NOT INSTALLED -- no KDE background\n\
+          services (device notifications, kscreen, ...). Fix: apk add kded,\n\
+          or rebuild without ECLIPSE_KDE=0.'\n\
+          echo \"$MSG\" >>\"$LOG\"\n\
+          echo \"$MSG\" > /dev/console 2>/dev/null || true\n\
+          sleep 60\n\
+          exit 127\n",
+    )
+    .unwrap();
+    fs::set_permissions(&kded, fs::Permissions::from_mode(0o755)).unwrap();
+
+    // The colours. `.colors` files are KConfig files whose [Colors:*] groups
+    // are exactly what kdeglobals wants, so appending the file IS the merge
+    // (KConfig folds repeated groups, last value wins). Guarded on
+    // [Colors:Window] so a palette the user changed later is never
+    // overwritten on the next boot.
+    let colors = localbin.join("eclipse-kde-colors");
+    fs::write(
+        &colors,
+        b"#!/bin/sh\n\
+          # Eclipse OS: seed kdeglobals with Breeze Dark, once. Run as a\n\
+          # oneshot service before the session's KDE clients start.\n\
+          KG=/root/.config/kdeglobals\n\
+          SRC=/usr/share/color-schemes/BreezeDark.colors\n\
+          [ -f \"$SRC\" ] || exit 0\n\
+          [ -f \"$KG\" ] || exit 0\n\
+          grep -q '^\\[Colors:Window\\]' \"$KG\" 2>/dev/null && exit 0\n\
+          { printf '\\n'; cat \"$SRC\"; } >> \"$KG\"\n",
+    )
+    .unwrap();
+    fs::set_permissions(&colors, fs::Permissions::from_mode(0o755)).unwrap();
 }
 
 /// Prefer dark GTK everywhere (file managers, editors, dialogs).
@@ -2777,17 +2893,25 @@ fn write_labwc_wrapper(rootfs: &Path) {
           # through Pulse so several clients share the HDA PCM.\n\
           : \"${ALSOFT_DRIVERS:=pulse,alsa}\"; export ALSOFT_DRIVERS\n\
           : \"${PULSE_SERVER:=unix:/run/pulse/native}\"; export PULSE_SERVER\n\
-          # Qt 5/6 policy, for the KDE look. Nothing Qt is installed today\n\
-          # (no Qt, no KF6, and no way to run Plasma itself: plasmashell,\n\
-          # kded and krunner are D-Bus services and there is no session bus\n\
-          # -- see the DBUS_SESSION_BUS_ADDRESS note below). These make a Qt\n\
-          # app behave the day one IS installed, and cost nothing until then.\n\
-          # Native Wayland first, Xwayland as fallback, exactly like SDL.\n\
-          # QT_QPA_PLATFORMTHEME is deliberately NOT set to `kde`: that plugin\n\
-          # lives in plasma-integration/KF6 and, absent, makes every Qt app\n\
-          # warn about a missing platform theme at startup.\n\
+          # Qt 6 policy. Native Wayland first, Xwayland as fallback, exactly\n\
+          # like SDL. Qt and KF6 ARE installed now (see KDE_PACKAGES in\n\
+          # xorg.rs), and kded6 runs as a service against the session bus.\n\
           : \"${QT_QPA_PLATFORM:=wayland;xcb}\"; export QT_QPA_PLATFORM\n\
           : \"${QT_AUTO_SCREEN_SCALE_FACTOR:=1}\"; export QT_AUTO_SCREEN_SCALE_FACTOR\n\
+          # The KDE platform theme (Breeze colours, KDE file dialogs, icon\n\
+          # lookup) is the plasma-integration plugin. Name the theme only\n\
+          # when the plugin is really on disk: `kde` with nothing behind it\n\
+          # makes EVERY Qt app print a missing-platform-theme warning at\n\
+          # startup and then use the default anyway. This is a runtime test\n\
+          # rather than a build-time one because apk is best-effort here --\n\
+          # an unreachable mirror leaves the knob on and the plugin absent.\n\
+          for _t in /usr/lib/qt6/plugins/platformthemes/KDEPlasmaPlatformTheme*.so \\\n\
+          \x20 \x20 \x20 \x20 /usr/lib/qt5/plugins/platformthemes/KDEPlasmaPlatformTheme*.so; do\n\
+          \x20 [ -e \"$_t\" ] || continue\n\
+          \x20 : \"${QT_QPA_PLATFORMTHEME:=kde}\"; export QT_QPA_PLATFORMTHEME\n\
+          \x20 break\n\
+          done\n\
+          unset _t\n\
           # Qt Quick (all of Plasma's UI, and any QML app) needs GL. On the\n\
           # pixman session the only GL is llvmpipe, where Qt Quick's own\n\
           # software rasterizer is both faster and safer, so derive the backend\n\
@@ -3446,34 +3570,112 @@ mod tests {
     }
 
     /// The Qt policy is split between the static session environment and the
-    /// wrapper (the renderer-dependent half), exactly like SDL's. What must
-    /// NOT appear is as load-bearing as what must: `QT_QPA_PLATFORMTHEME=kde`
-    /// and `XDG_CURRENT_DESKTOP=KDE` are the two lines every "KDE on labwc"
-    /// recipe recommends, and both point at pieces this image does not have.
+    /// wrapper, exactly like SDL's. What must NOT appear is as load-bearing
+    /// as what must: `QT_QPA_PLATFORMTHEME=kde` names a plugin file, so it
+    /// belongs to the wrapper's runtime test and never to the static file --
+    /// apk is best-effort, so "KDE was asked for" and "KDE is on disk" are
+    /// different facts. `XDG_CURRENT_DESKTOP` is the opposite case: it is a
+    /// build-time fact, and it must track the knob rather than claim a
+    /// session that was never built.
     #[test]
-    fn qt_policy_is_present_without_claiming_to_be_kde() {
+    fn qt_policy_is_present_and_kde_is_claimed_only_when_built() {
         let dir = std::env::temp_dir().join(format!("eclipse-qt-test-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         write_labwc_environment(&dir);
         write_labwc_wrapper(&dir);
         let env = fs::read_to_string(dir.join("root/.config/labwc/environment")).unwrap();
         assert!(env.lines().any(|l| l == "QT_QPA_PLATFORM=wayland;xcb"));
-        assert!(env
+        let desktop = env
             .lines()
-            .any(|l| l == "XDG_CURRENT_DESKTOP=labwc:wlroots"));
-        // Mentioned in a comment saying why it is absent, never as a setting.
+            .find(|l| l.starts_with("XDG_CURRENT_DESKTOP="))
+            .expect("the session must say what desktop it is");
+        if crate::linux::xorg::kde_enabled() {
+            // KDE first: it is the portal backend the session asks for.
+            assert_eq!(desktop, "XDG_CURRENT_DESKTOP=KDE:labwc:wlroots");
+        } else {
+            assert_eq!(desktop, "XDG_CURRENT_DESKTOP=labwc:wlroots");
+        }
+        // Always a wlroots session, whatever the front of the list says.
+        assert!(desktop.ends_with("labwc:wlroots"));
         assert!(
             !env.lines().any(|l| {
                 let l = l.trim();
                 !l.starts_with('#') && l.starts_with("QT_QPA_PLATFORMTHEME=")
             }),
-            "no plasma-integration plugin exists here; setting the theme only warns"
+            "the theme depends on a plugin file, so only the wrapper may set it"
         );
-        assert!(!env.lines().any(|l| l.trim() == "XDG_CURRENT_DESKTOP=KDE"));
         let wrapper = fs::read_to_string(dir.join("usr/local/bin/labwc")).unwrap();
         assert!(
             wrapper.contains("QT_QUICK_BACKEND:=software"),
             "Qt Quick must fall back to its software raster on the pixman session"
+        );
+        assert!(
+            wrapper.contains("KDEPlasmaPlatformTheme"),
+            "the theme is set from the plugin file, so the wrapper must name it"
+        );
+        let theme = wrapper
+            .lines()
+            .position(|l| l.contains("QT_QPA_PLATFORMTHEME:=kde"))
+            .expect("the wrapper sets the KDE theme");
+        let guard = wrapper
+            .lines()
+            .position(|l| l.contains("KDEPlasmaPlatformTheme"))
+            .unwrap();
+        assert!(
+            guard < theme,
+            "the plugin test must come BEFORE the export, or it is not a test"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The KDE session files: both wrappers must be valid shell (init runs
+    /// them with no terminal and no one watching), must check for what they
+    /// need before using it, and kdeglobals must name the pieces the
+    /// packages provide.
+    #[test]
+    fn kde_session_files_check_before_they_act() {
+        let dir = std::env::temp_dir().join(format!("eclipse-kde-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        write_kde_session(&dir);
+        write_labwc_wrapper(&dir);
+
+        for name in ["eclipse-kded", "eclipse-kde-colors", "labwc"] {
+            let path = dir.join("usr/local/bin").join(name);
+            let st = std::process::Command::new("sh")
+                .arg("-n")
+                .arg(&path)
+                .status()
+                .unwrap();
+            assert!(st.success(), "sh -n rejected {name}");
+        }
+
+        let kded = fs::read_to_string(dir.join("usr/local/bin/eclipse-kded")).unwrap();
+        // kded6 without a bus exits at once, and `type = respawn` would then
+        // spin on it for the life of the session.
+        assert!(kded.contains("$BUS"), "kded must wait for the session bus");
+        assert!(
+            kded.contains("-x \"$d/kded6\""),
+            "and must look for the binary before exec'ing it"
+        );
+        let colors = fs::read_to_string(dir.join("usr/local/bin/eclipse-kde-colors")).unwrap();
+        assert!(
+            colors.contains("Colors:Window"),
+            "seeding twice would overwrite a palette the user changed"
+        );
+        assert!(colors.contains("BreezeDark.colors"));
+
+        let kg = fs::read_to_string(dir.join("root/.config/kdeglobals")).unwrap();
+        for line in [
+            "widgetStyle=Breeze",
+            "ColorScheme=BreezeDark",
+            "Theme=breeze-dark",
+        ] {
+            assert!(kg.lines().any(|l| l.trim() == line), "kdeglobals: {line}");
+        }
+        // The colours themselves come from the breeze package at first boot.
+        assert!(
+            !kg.lines().any(|l| l.trim_start().starts_with("[Colors:")),
+            "a hand-typed palette drifts from the real Breeze Dark"
         );
         let _ = fs::remove_dir_all(&dir);
     }
