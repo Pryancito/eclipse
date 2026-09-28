@@ -7767,6 +7767,17 @@ impl DrmScheme for NvidiaGpu {
         Some((probe.fence_va, probe.payload))
     }
 
+    fn cpu_prep_fences(&self, gem_handle: u32, owner_pid: u64) -> Vec<(usize, u32)> {
+        // The same pid set the blocking arm walks, and `ring_idle_probe` is
+        // the same probe it waits on -- appended here instead of there, and
+        // idempotent once the ring has drained, exactly as
+        // `render_fence_for_scanout` already does for the present path.
+        self.cpu_prep_pids(gem_handle, owner_pid)
+            .into_iter()
+            .filter_map(|pid| self.ring_idle_probe(pid).map(|p| (p.fence_va, p.payload)))
+            .collect()
+    }
+
     fn nouveau_gem_close(&self, handle: u32, owner_pid: u64) -> bool {
         // A close is where an earlier close's ring may have passed.
         self.reap_deferred_frees();
@@ -9956,6 +9967,30 @@ impl NvidiaGpu {
     /// answers EBUSY instead of blocking; a fence that never lands within the
     /// usual 10 s also answers EBUSY (Linux: a timed-out reservation wait is
     /// EBUSY too).
+    /// Every process whose channel a `GEM_CPU_PREP` on `gem_handle` has to
+    /// wait for: the caller, plus everyone whose VM_BIND maps the buffer.
+    ///
+    /// One function, because the blocking arm and the async pre-wait
+    /// ([`crate::scheme::DrmScheme::cpu_prep_fences`]) must name the SAME
+    /// set. A pre-wait that names fewer ends early and hands the spin back to
+    /// the sync arm, which is the whole thing it exists to avoid; one that
+    /// names more sleeps past what the ioctl promised.
+    ///
+    /// A pid listed twice (the caller maps it too, or maps it at two VAs)
+    /// costs nothing: once its channel has been waited for it is idle and the
+    /// next wait appends no probe.
+    fn cpu_prep_pids(&self, gem_handle: u32, owner_pid: u64) -> Vec<u64> {
+        let mut pids: Vec<u64> = alloc::vec![owner_pid];
+        pids.extend(
+            self.nouveau_vm_mappings
+                .lock()
+                .iter()
+                .filter(|m| m.gem_handle == gem_handle)
+                .map(|m| m.owner_pid),
+        );
+        pids
+    }
+
     fn cpu_prep_wait(&self, owner_pid: u64, nowait: bool) -> Result<usize, i32> {
         use super::nouveau_uapi as nv;
         const CPU_PREP_TIMEOUT_US: u64 = 10_000_000;
@@ -14183,18 +14218,7 @@ impl NvidiaGpu {
                 // polling a query result, a `PIPE_MAP_DONTBLOCK` map), and
                 // nothing but this file's own tests ever set bit 1.
                 let nowait = req.flags & nv::NOUVEAU_GEM_CPU_PREP_NOWAIT != 0;
-                // A pid listed twice (the caller maps it too, or maps it at
-                // two VAs) costs nothing: once its channel has been waited
-                // for it is idle and the next wait appends no probe.
-                let mut pids: Vec<u64> = alloc::vec![owner_pid];
-                pids.extend(
-                    self.nouveau_vm_mappings
-                        .lock()
-                        .iter()
-                        .filter(|m| m.gem_handle == req.handle)
-                        .map(|m| m.owner_pid),
-                );
-                for pid in pids {
+                for pid in self.cpu_prep_pids(req.handle, owner_pid) {
                     self.cpu_prep_wait(pid, nowait)?;
                 }
                 Ok(0)
@@ -19048,6 +19072,109 @@ mod nouveau_bookkeeping_tests {
         assert_eq!(run_gpu(0).len(), 3, "push and both probes");
         assert_eq!(cpu_prep_nowait(&gpu, h, A), Ok(0));
         assert_eq!(cpu_prep_nowait(&gpu, h, COMP), Ok(0));
+        test_clock::set_auto_advance(0);
+        gpu.nouveau_release_process(A);
+        gpu.nouveau_release_process(COMP);
+        assert_eq!(FAKE_RM.lock().bad, 0);
+    }
+
+    /// The async pre-wait's fences and the blocking arm agree, frame by
+    /// frame.
+    ///
+    /// `GEM_CPU_PREP` blocks by contract, and `io_control` is synchronous, so
+    /// the arm that serves it can only busy-wait -- a core pegged for however
+    /// long the GPU takes, on the ioctl Mesa calls every time it recycles a
+    /// buffer. `cpu_prep_fences` exists so `sys_ioctl` can sleep on the same
+    /// fences first and leave that arm nothing to spin for.
+    ///
+    /// "The same fences" is the whole contract, and it is what this pins:
+    /// while the list is unlanded the blocking arm answers EBUSY, and the
+    /// moment the last of it lands the blocking arm answers Ok. A list
+    /// missing the producer's ring -- the caller's pid alone, which is what
+    /// the blocking arm itself used to look at -- wakes the sleeper early and
+    /// hands the spin straight back.
+    #[test]
+    fn the_pre_waits_fences_land_exactly_when_the_blocking_cpu_prep_returns() {
+        let _g = LOCK.lock();
+        let _live = LiveBytes::hold();
+        let gpu = gpu_rm_ladder();
+        let _ch_c = client_with_pushbuf(&gpu, COMP);
+        let ch_a = client_with_pushbuf(&gpu, A);
+        const FRAME_VA: u64 = PUSH_VA + 0x10_0000;
+        // The client's frame, bound in its own VAS and imported and bound by
+        // the compositor: the producer is A, the caller below is COMP.
+        let h = gem_new_rm(&gpu, 65536, nv::NOUVEAU_GEM_DOMAIN_GART, A)
+            .unwrap()
+            .handle;
+        assert_eq!(vm_bind_ops(&gpu, A, &mut [map(h, FRAME_VA, 65536)]), Ok(0));
+        assert!(crate::scheme::gem_mmap::add_ref(h, COMP).is_some());
+        assert_eq!(
+            vm_bind_ops(&gpu, COMP, &mut [map(h, FRAME_VA, 65536)]),
+            Ok(0)
+        );
+        // Shared the same way but bound in no VM: nothing can be writing it.
+        let h_idle = gem_new_rm(&gpu, 4096, nv::NOUVEAU_GEM_DOMAIN_GART, A)
+            .unwrap()
+            .handle;
+        assert!(crate::scheme::gem_mmap::add_ref(h_idle, COMP).is_some());
+
+        let landed = |fences: &[(usize, u32)]| {
+            fences
+                .iter()
+                .all(|&(va, p)| crate::scheme::syncobj::hw_fence_landed(va, p))
+        };
+
+        // Nothing queued: no fence to sleep on, and the blocking arm does
+        // not block either.
+        assert!(
+            DrmScheme::cpu_prep_fences(&gpu, h, COMP).is_empty(),
+            "a ring with nothing on it gave the sleeper a fence"
+        );
+        assert_eq!(cpu_prep_nowait(&gpu, h, COMP), Ok(0));
+
+        // The client renders the frame: queued on its ring, not fetched.
+        assert_eq!(exec(&gpu, A, ch_a, &[push(PUSH_VA, 16)], &[], &[]), Ok(0));
+        let c1 = chan(1);
+        let fences = DrmScheme::cpu_prep_fences(&gpu, h, COMP);
+        assert!(
+            !fences.is_empty(),
+            "the producer's queued frame left the sleeper nothing to wait on, \
+             so it would return at once and the sync arm would spin the wait"
+        );
+        assert!(
+            !landed(&fences),
+            "the sleeper's fences read as landed while the frame is still queued"
+        );
+        // A buffer no VM maps still has nothing to wait for, whoever asks.
+        assert!(DrmScheme::cpu_prep_fences(&gpu, h_idle, COMP).is_empty());
+
+        // The GPU runs the frame and the probe behind it. Now every fence
+        // the sleeper was given has landed -- and that is exactly the moment
+        // the blocking arm stops saying EBUSY.
+        test_clock::set_auto_advance(1);
+        assert_eq!(
+            cpu_prep_nowait(&gpu, h, COMP),
+            Err(nv::EBUSY),
+            "the producer's channel still has the frame queued"
+        );
+        assert!(!landed(&fences), "landed before the GPU ran");
+        let fetched = run_gpu(1);
+        assert!(
+            fetched.iter().any(|f| matches!(f, Fetched::Release { .. })),
+            "the probe left no fence on the producer's ring ({:?})",
+            fetched
+        );
+        assert!(
+            landed(&fences),
+            "the sleeper is still parked on a ring that has drained"
+        );
+        assert_eq!(
+            cpu_prep_nowait(&gpu, h, COMP),
+            Ok(0),
+            "the blocking arm still waits after the sleeper's fences landed"
+        );
+        assert_eq!(userd(&c1).0, userd(&c1).1, "the ring drained");
+
         test_clock::set_auto_advance(0);
         gpu.nouveau_release_process(A);
         gpu.nouveau_release_process(COMP);

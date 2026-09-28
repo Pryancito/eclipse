@@ -1504,6 +1504,28 @@ pub fn scanout_render_fence(fb_id: u32) -> Vec<(usize, u32)> {
         .collect()
 }
 
+/// The GPU fences a blocking `GEM_CPU_PREP` on `gem_handle` would park on,
+/// each as `(fence landing-zone kernel VA, payload)`, for the async pre-wait
+/// in [`super::drm_scheme::DrmDev::cpu_prep_sleep`].
+///
+/// EVERY registered driver is asked, for the same reason
+/// [`scanout_render_fence`] asks them all: on a two-GPU box the buffer's work
+/// need not be on the primary. A driver that does not know the handle answers
+/// with nothing.
+///
+/// Not gated on `flip_fence_enabled`: that hatch turns off a wait this kernel
+/// added to the present path, whereas `GEM_CPU_PREP` has always blocked --
+/// this only moves where it blocks.
+pub fn cpu_prep_fences(gem_handle: u32, owner_pid: u64) -> Vec<(usize, u32)> {
+    // The guard is dropped before any driver call: `cpu_prep_fences` takes the
+    // driver's own locks and may append a probe to a GPU ring.
+    let drivers = DRM_STATE.lock().drivers.clone();
+    drivers
+        .iter()
+        .flat_map(|d| d.cpu_prep_fences(gem_handle, owner_pid))
+        .collect()
+}
+
 /// Per-open DRM file state (Linux `struct drm_file`).
 ///
 /// `ATOMIC_CLIENT` and the readable event queue belong to the fd that

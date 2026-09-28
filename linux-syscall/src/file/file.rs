@@ -1978,6 +1978,21 @@ impl Syscall<'_> {
                 }
             }
         }
+        // And `GEM_CPU_PREP`, the one driver-private ioctl that blocks by
+        // contract: Mesa calls it whenever it recycles or reads back a
+        // buffer, and the sync arm can only busy-wait for the GPU, pegging a
+        // core per call. Same split as the three above.
+        if linux_object::fs::devfs::drm_scheme::is_cpu_prep_ioctl(request as u32) {
+            if let Some(file) = file_like.downcast_ref::<File>() {
+                if let Some(dev) = file
+                    .inode()
+                    .as_any_ref()
+                    .downcast_ref::<linux_object::fs::devfs::DrmDev>()
+                {
+                    dev.cpu_prep_sleep(request as u32, arg1).await;
+                }
+            }
+        }
         // And the implicit-sync half, for the legacy presents this kernel
         // actually runs (`drm.atomic` is opt-in, so wlroots drives SETCRTC and
         // PAGE_FLIP). Neither ioctl carries a fence, so the buffer used to be

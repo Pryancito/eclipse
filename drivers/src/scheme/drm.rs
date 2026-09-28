@@ -205,6 +205,31 @@ pub trait DrmScheme: Scheme {
         None
     }
 
+    /// The GPU fences a BLOCKING `GEM_CPU_PREP` on `gem_handle` would park
+    /// on, each as `(kernel VA of the fence landing zone, payload)`, so the
+    /// async syscall path can sleep on them before the synchronous ioctl arm
+    /// runs.
+    ///
+    /// The sync arm cannot sleep -- `INode::io_control` is synchronous -- so
+    /// it busy-waits, which pegs a core for however long the GPU takes and
+    /// starves every other coroutine on that CPU. Mesa calls this ioctl
+    /// whenever it recycles or reads back a buffer, so that is a core held
+    /// per frame. Answering here lets the caller wait properly; the sync arm
+    /// then finds the work already done and returns without spinning.
+    ///
+    /// The answer must be the SAME set the blocking arm waits for, or the
+    /// sleep ends early and the spin comes back: every process whose VM maps
+    /// the buffer, plus the caller's own. It is conservative in the same
+    /// direction as [`Self::render_fence_for_scanout`] -- it may name work
+    /// that never touched the buffer, never miss work that did -- and an
+    /// empty answer simply leaves the ioctl behaving exactly as before.
+    ///
+    /// Never called for a `NOWAIT` prep: that one answers EBUSY instead of
+    /// blocking, so nothing may sleep ahead of it.
+    fn cpu_prep_fences(&self, _gem_handle: u32, _owner_pid: u64) -> Vec<(usize, u32)> {
+        Vec::new()
+    }
+
     /// Retrieve the raw 128-byte EDID for a connector, if available.
     fn get_connector_edid(&self, _id: u32) -> Option<[u8; 128]> {
         None
