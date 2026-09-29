@@ -2,19 +2,13 @@
 
 Eclipse OS incluye de serie una sesión de escritorio Wayland basada en
 **labwc** (wlroots + renderizador software pixman, ver
-[README-drm.md](README-drm.md)), con **cuatro apariencias** intercambiables.
-Tres de ellas son la misma sesión nativa con otra paleta y otra disposición:
-la original de Eclipse (la que trae la imagen), la de KDE Plasma y la de
-Windows 11; ahí el fondo es **lunarbg**, el panel **lunarbar** y el lanzador
-**lunarrun**.
+[README-drm.md](README-drm.md)), con **tres apariencias** intercambiables
+sobre exactamente las mismas piezas nativas: la original de Eclipse (la que
+trae la imagen), la de KDE Plasma y la de Windows 11. El fondo siempre es
+**lunarbg**, el panel siempre es **lunarbar** y el lanzador siempre es
+**lunarrun**; lo que cambia es la paleta y la disposición.
 
-La cuarta, `plasma`, no es una paleta: cambia el panel por el
-**`plasmashell` de verdad** de KDE, con sus propios widgets, su lanzador y su
-bandeja, sobre el mismo labwc. Tiene un límite que conviene saber antes de
-elegirla —la barra de tareas se queda vacía—, y está explicado en
-[KDE: lo que hay, lo que falta y por qué](#kde-lo-que-hay-lo-que-falta-y-por-qué).
-
-## Las cuatro apariencias
+## Las tres apariencias
 
 Se eligen con `eclipse-look` y se guardan en `/etc/eclipse/look` (manda
 `look=` de la cmdline si está). `eclipse-init` la aplica en el arranque,
@@ -25,16 +19,15 @@ eclipse-look            # imprime la actual
 eclipse-look eclipse    # la violeta original (por defecto)
 eclipse-look kde        # KDE Breeze Dark
 eclipse-look win11      # Windows 11
-eclipse-look plasma     # el plasmashell de KDE como panel
 ```
 
-| | `eclipse` (por defecto) | `kde` | `win11` | `plasma` |
-|---|---|---|---|---|
-| Tema de ventanas | `Eclipse-Dark` (violeta) | `Breeze-Dark` (#31363b, acento #3daee9) | `Win11-Dark` (#202020, acento #0078d4) | `Breeze-Dark` |
-| Panel | dos barras de 34 px (info arriba, tareas abajo) | una barra inferior de 44 px, estilo Plasma | una barra inferior de 48 px, **botones centrados**, translúcida | **`plasmashell`**, el panel de KDE con sus widgets |
-| Reloj | una línea abajo, fecha arriba | dos líneas, hora sobre fecha | dos líneas, hora sobre fecha | el widget de reloj digital de Plasma |
-| Terminal | paleta violeta | paleta Breeze (Konsole) | paleta Campbell (Windows Terminal) | paleta Breeze (Konsole) |
-| Lanzador | en el tercio superior | en el tercio superior | menú Inicio sobre la barra | Kickoff, el de Plasma |
+| | `eclipse` (por defecto) | `kde` | `win11` |
+|---|---|---|---|
+| Tema de ventanas | `Eclipse-Dark` (violeta) | `Breeze-Dark` (#31363b, acento #3daee9) | `Win11-Dark` (#202020, acento #0078d4) |
+| Panel | dos barras de 34 px (info arriba, tareas abajo) | una barra inferior de 44 px, estilo Plasma | una barra inferior de 48 px, **botones centrados**, translúcida |
+| Reloj | una línea abajo, fecha arriba | dos líneas, hora sobre fecha | dos líneas, hora sobre fecha |
+| Terminal | paleta violeta | paleta Breeze (Konsole) | paleta Campbell (Windows Terminal) |
+| Lanzador | en el tercio superior | en el tercio superior | menú Inicio sobre la barra |
 
 Un cambio de apariencia reescribe el `<name>` del tema en `rc.xml`, copia la
 paleta de foot correspondiente y reinicia el panel (init lo relanza al
@@ -99,71 +92,24 @@ Lo que **sigue sin poder funcionar**, y no se arregla instalando nada:
   (asiento, suspensión, cierre de sesión) no tienen con quién hablar. Aquí el
   asiento lo da seatd. Esas piezas se degradan a «no disponible», no rompen la
   aplicación.
-- **La barra de tareas de Plasma no puede listar ventanas sobre labwc.** El
-  gestor de tareas habla `org_kde_plasma_window_management` y nada más: en
-  `libtaskmanager/waylandtasksmodel.cpp` de plasma-workspace 6.6.5 —la versión
-  exacta que empaqueta Alpine 3.24— el único `include` de protocolo es
-  `qwayland-plasma-window-management.h`. Y labwc solo añade `wlr-layer-shell`
-  y `wlr-output-power-management` a lo que trae wlroots
+- **El panel de Plasma no puede listar ventanas sobre labwc.** El gestor de
+  tareas de Plasma habla `org_kde_plasma_window_management` y nada más
+  (`plasma-workspace/libtaskmanager/waylandtasksmodel.cpp`), y labwc solo añade
+  `wlr-layer-shell` y `wlr-output-power-management` a lo que trae wlroots
   (`labwc/protocols/meson.build`): el protocolo de KDE no está en ninguno de
-  los dos. Eso **no** se arregla configurando nada; hace falta otro
-  compositor, y el que lo implementa es `kwin_wayland`.
+  los dos. Un `plasmashell` sobre labwc arranca —lanzador, reloj y bandeja van,
+  porque son layer-shell y D-Bus— con la barra de tareas **vacía para
+  siempre**.
+- Por eso el shell de Plasma (`plasma-workspace`, `plasma-desktop`,
+  `systemsettings`) es un conjunto aparte y **apagado por defecto**:
+  `ECLIPSE_PLASMA=1` lo añade, y arrastra kwin, accountsservice, fprintd y un
+  gestor de sesión de pipewire como dependencias duras. Tiene sentido para
+  intentar la sesión Plasma completa bajo `kwin_wayland` (que sí implementa su
+  propio protocolo y sabe usar libseat), no para pegarle el panel de Plasma a
+  labwc.
 
-## La apariencia `plasma`: plasmashell como panel
-
-`eclipse-look plasma` cambia el panel de la sesión por el **`plasmashell` de
-KDE**, sobre el mismo labwc. Funciona porque plasmashell coloca sus dos
-superficies con `wlr-layer-shell` vía LayerShellQt —el panel en la capa
-superior y el escritorio en la de fondo—, que es justo lo que labwc sí sirve.
-Lo que se obtiene: Kickoff (el lanzador), el reloj, la bandeja del sistema, los
-widgets y el menú del escritorio, todo de KDE de verdad. Lo que **no**: la
-barra de tareas, vacía para siempre por lo del protocolo de arriba.
-
-Cómo está montado:
-
-- **Un solo servicio de panel con una rama dentro**, no dos servicios
-  (`/etc/eclipse/services/lunarbar.service` → `/usr/local/bin/eclipse-lunarbar`).
-  El wrapper lee `look` de `/etc/eclipse/look`, y con `plasma` hace
-  `exec plasmashell`; con cualquier otro valor, `exec lunarbar`. Tiene que ser
-  así: un servicio cuyo trabajo fuese *no* arrancar saldría al instante y
-  `type = respawn` lo repetiría cada 8 segundos toda la sesión.
-- **El fondo se lo queda Plasma.** Su escritorio (iconos, fondo, menú del
-  clic derecho) es también una superficie `wlr-layer-shell` de la capa de
-  **fondo** (`LayerBackground` con zona exclusiva −1, en
-  `shell/desktopview.cpp` de plasma-workspace 6.6.5), justo donde pinta
-  lunarbg. Medido aquí sobre wlroots con dos `swaybg`: **la superficie que se
-  entrega primero se queda encima**, y lunarbg siempre es la primera (arranca
-  con la sesión, mientras plasmashell tarda segundos en montar su QML). O sea
-  que lunarbg taparía el escritorio de Plasma entero y además seguiría
-  gastando frames debajo de algo opaco. Por eso, con `look=plasma`, el
-  envoltorio del fondo no pinta: se aparca y lo dice en `/tmp/lunarbg.log`.
-  Aparcarse y no salir, porque el servicio es `type = respawn` y uno que sale
-  es uno que init relanza cada 8 segundos para siempre. Al cambiar de
-  apariencia, `eclipse-look` lo mata y init lo relanza pintando otra vez; si
-  alguien edita `/etc/eclipse/look` a mano, el envoltorio lo relee cada hora y
-  se reinicia solo.
-- **Cae a `lunarbar` si `plasmashell` no está** (imagen construida con
-  `ECLIPSE_PLASMA=0` o `ECLIPSE_KDE=0`), diciéndolo en `/tmp/lunarbar.log`. La
-  sesión nunca se queda sin panel.
-- **El entorno lo pone el wrapper**, porque los servicios no heredan el de
-  labwc (init los lanza él): `QT_QPA_PLATFORM=wayland` sin respaldo a xcb (un
-  shell en Xwayland no puede tener superficies de capa), `KDE_FULL_SESSION`,
-  `KDE_SESSION_VERSION=6`, `XDG_CURRENT_DESKTOP=KDE` y, en la sesión pixman,
-  `QT_QUICK_BACKEND=software`: todo Plasma es QML, y el rasterizador de CPU de
-  Qt Quick es más rápido que el GL de llvmpipe.
-- **`plasma-workspace` y `plasma-desktop` van los dos**, y ninguno sobra: el
-  binario está en el primero, y el paquete de shell `org.kde.plasma.desktop`
-  que plasmashell carga está en el segundo (su `metadata.json` es el que lleva
-  `"KPackageStructure": "Plasma/Shell"`). Son ~1 GiB más, y las dependencias
-  duras de `plasma-workspace` arrastran kwin (instalado y nunca ejecutado,
-  porque el compositor es labwc), accountsservice, fprintd, kactivitymanagerd
-  y un gestor de sesión de pipewire. `ECLIPSE_PLASMA=0` deja fuera el conjunto
-  y mantiene las aplicaciones de KDE; `ECLIPSE_KDE=0` lo deja fuera también,
-  porque plasmashell sin Qt 6 ni KF6 no tendría nada que cargar.
-
-En las otras tres apariencias el panel y el lanzador siguen siendo `lunarbar` y
-`lunarrun`, que sí listan ventanas por `wlr-foreign-toplevel-management`. Si lo
-que hace falta es la barra de tareas, esas son las que la tienen.
+El panel y el lanzador de la sesión siguen siendo `lunarbar` y `lunarrun`,
+que sí listan ventanas por `wlr-foreign-toplevel-management`.
 
 Toda la configuración la genera `xtask` al construir el rootfs
 (`xtask/src/linux/desktop.rs`), así que está presente desde el primer
@@ -173,7 +119,7 @@ arranque sin pasos manuales.
 
 | Pieza | Archivo generado | Qué hace |
 |---|---|---|
-| **lunarbg** | `/bin/lunarbg` | Cliente de fondo **animado** de Eclipse OS (`tools/lunarbg`, Rust estático). Recrea el fondo del compositor smithay original de eclipse-old: media luna dorada central, anillo de texto «ECLIPSE-SYSTEM-KERNEL…» orbitando, tres arcos tech girando a velocidades distintas, anillos pulsantes y ticks técnicos, sobre base cósmica con estrellas y rejilla de 48 px. Dibuja proceduralmente a resolución nativa vía wlr-layer-shell + wl_shm (sin imágenes ni gdk-pixbuf), con render por *scanline spans* (~2 ms/frame a 1080p) y solo redibuja/daña la región del logo por frame. La animación apunta a 24 fps (`--fps`/`LUNARBG_FPS=1..60`) pero **cada commit se regula con el frame callback del compositor**: nunca renderiza por delante de lo que éste composita (en stacks lentos degrada sola, y con el fondo tapado cae a 1 Hz). Soporta HiDPI (`wl_output.scale` + `set_buffer_scale`), multi-monitor con aspecto físico por salida, `--output NAME` para pintar salidas concretas, pausa/reanuda con `SIGUSR1` y salida limpia con `SIGTERM`. `--static`/`LUNARBG_STATIC=1` desactiva la animación; debug: `--dump /tmp/out.raw:1920x1080` (+`--dump-ms N`) y `--bench` para cronometrar el renderizador. `lunarbg --help` lista todo. **Con `look=plasma` no pinta**: el escritorio de Plasma ocupa la misma capa de fondo, así que el envoltorio se aparca y le cede el sitio. |
+| **lunarbg** | `/bin/lunarbg` | Cliente de fondo **animado** de Eclipse OS (`tools/lunarbg`, Rust estático). Recrea el fondo del compositor smithay original de eclipse-old: media luna dorada central, anillo de texto «ECLIPSE-SYSTEM-KERNEL…» orbitando, tres arcos tech girando a velocidades distintas, anillos pulsantes y ticks técnicos, sobre base cósmica con estrellas y rejilla de 48 px. Dibuja proceduralmente a resolución nativa vía wlr-layer-shell + wl_shm (sin imágenes ni gdk-pixbuf), con render por *scanline spans* (~2 ms/frame a 1080p) y solo redibuja/daña la región del logo por frame. La animación apunta a 24 fps (`--fps`/`LUNARBG_FPS=1..60`) pero **cada commit se regula con el frame callback del compositor**: nunca renderiza por delante de lo que éste composita (en stacks lentos degrada sola, y con el fondo tapado cae a 1 Hz). Soporta HiDPI (`wl_output.scale` + `set_buffer_scale`), multi-monitor con aspecto físico por salida, `--output NAME` para pintar salidas concretas, pausa/reanuda con `SIGUSR1` y salida limpia con `SIGTERM`. `--static`/`LUNARBG_STATIC=1` desactiva la animación; debug: `--dump /tmp/out.raw:1920x1080` (+`--dump-ms N`) y `--bench` para cronometrar el renderizador. `lunarbg --help` lista todo. |
 | Wallpaper estático | `/usr/share/backgrounds/eclipse/eclipse-night.png` | La misma escena, renderizada en build a PNG (encoder propio, sin dependencias). Hoy ningún componente de la sesión la usa (swaybg no forma parte de ella); queda como imagen de respaldo para quien quiera un fondo estático. |
 | Temas de ventanas | `/usr/share/themes/{Win11-Dark,Breeze-Dark,Eclipse-Dark}/openbox-3/themerc` | Los tres temas openbox-3 que labwc aplica a bordes de ventana, menús y OSD. `eclipse-look` elige cuál nombra `rc.xml`. |
 | Config labwc | `/root/.config/labwc/rc.xml` | Tema de la apariencia activa (`Eclipse-Dark` de fábrica), esquinas redondeadas, 4 escritorios y los atajos de KDE/Windows. |
@@ -181,12 +127,11 @@ arranque sin pasos manuales.
 | Entorno de sesión | `/root/.config/labwc/environment` | Cursor Adwaita y `GTK_THEME=Adwaita:dark`. |
 | **lunarrun** | `/bin/lunarrun` | Lanzador tipo KRunner (`tools/lunarbar`, comparte biblioteca con el panel). Overlay centrado sobre wlr-layer-shell: se escribe para filtrar las aplicaciones instaladas (sin distinguir acentos), ↑/↓ o Tab para elegir, Intro para lanzar, Esc o clic fuera para cerrar. Una palabra que resuelva en `$PATH` sale como «ejecutar orden», así que `Alt+Espacio top` funciona como en KRunner. `lunarrun --toggle-desktop` es el Super+D de KDE: minimiza todas las ventanas por wlr-foreign-toplevel-management, o las restaura si ya lo estaban. `--dump RUTA:AnchoxAlto` lo dibuja a un fichero ARGB8888 sin compositor. Lo lanzan `eclipse-run` y `eclipse-showdesktop`. |
 | **lunarbar** | `/bin/lunarbar` | Panel propio de Eclipse OS (`tools/lunarbar`, Rust estático, wlr-layer-shell + wl_shm, sin GTK ni GL): una barra inferior por salida en `win11`/`kde` (dos en `eclipse`) con lanzador, barra de tareas, reloj, volumen, teclado y apagado, más popups (menú de aplicaciones) y tooltips. Traducido (`i18n.rs`). |
-| **plasmashell** | `/usr/local/bin/eclipse-lunarbar` (la rama `plasma`) | El panel de KDE de verdad, cuando la apariencia activa es `plasma`. El wrapper del servicio de panel lee `/etc/eclipse/look` y hace `exec plasmashell` en vez de `exec lunarbar`, exportando antes `QT_QPA_PLATFORM=wayland`, `KDE_FULL_SESSION`, `KDE_SESSION_VERSION=6`, `XDG_CURRENT_DESKTOP=KDE` y, en la sesión pixman, `QT_QUICK_BACKEND=software`. Coloca panel y escritorio con `wlr-layer-shell` (LayerShellQt), que labwc sirve; su barra de tareas se queda vacía, porque el gestor de tareas solo habla `org_kde_plasma_window_management`. Si no está instalado, el wrapper cae a `lunarbar` y lo dice en `/tmp/lunarbar.log`. |
 | **kded6** | `/usr/local/bin/eclipse-kded` + `/etc/eclipse/services/kded.service` | Demonio de servicios de KDE (el `kded6` de KF6), donde se cargan los módulos de fondo de KDE. El servicio espera al socket de Wayland y al del bus antes de arrancarlo (esperas nativas de init, sin bucles de shell) y, si `kded6` no está instalado, el wrapper lo dice en `/tmp/kded.log` y en la consola en vez de dejar que init lo reintente en bucle. |
 | Ajustes de KDE | `/root/.config/kdeglobals` | Estilo Breeze, iconos breeze-dark y doble clic para todas las aplicaciones KF6 y, vía plasma-integration, para cualquier app Qt. Las paletas `[Colors:*]` las añade `eclipse-kde-colors` (servicio `oneshot`) copiando el `BreezeDark.colors` que trae el paquete `breeze`, y solo si no están ya. |
 | Autoarranque | *(ausente a propósito)* | labwc lanza `sh ~/.config/labwc/autostart` con doble `fork`, y esa `ash` cae con SIGSEGV en este kernel (musl mallocng). En su lugar `eclipse-init` arranca el fondo y el panel como **servicios** (`/etc/eclipse/services/{lunarbg,lunarbar}.service`, con `after = labwc` y `wait_socket` sobre `wayland-0`) a través de los wrappers `/usr/local/bin/eclipse-lunarbg` y `eclipse-lunarbar`, que a su vez esperan al socket `wayland-*`. `~/.config/labwc/autostart.README` lo explica en el sistema instalado. |
 | GTK 3/4 | `/root/.config/gtk-{3.0,4.0}/settings.ini` | Modo oscuro por defecto para aplicaciones GTK. |
-| Terminal | `/root/.config/foot/foot.ini` (+ `foot.win11.ini`, `foot.kde.ini`, `foot.eclipse.ini`, `foot.plasma.ini`) | Paleta a juego con la apariencia activa; `eclipse-look` copia la que toque sobre `foot.ini`. La de `plasma` es la Breeze, la misma que `kde`. |
+| Terminal | `/root/.config/foot/foot.ini` (+ `foot.win11.ini`, `foot.kde.ini`, `foot.eclipse.ini`) | Paleta a juego con la apariencia activa; `eclipse-look` copia la que toque sobre `foot.ini`. |
 | Lanzador (shell) | `/usr/local/bin/labwc` | Wrapper endurecido de labwc. Lo usan tanto los shells interactivos (`login` limpia env) como `eclipse-init`, para que ambos pasen por la misma selección de renderer y variables de entorno. |
 
 ## Paquetes de runtime
@@ -219,9 +164,7 @@ aporta `libseat.so` y el demonio `seatd`, y `foot` es el terminal.
 - KDE (`KDE_PACKAGES`, ~1,2 GiB): `kded`, `plasma-integration`,
   `qt6-qtwayland`, `breeze`, `breeze-icons`, `kio-extras`, `kwallet`,
   `kde-cli-tools`, `xdg-desktop-portal-kde` y las aplicaciones. `ECLIPSE_KDE=0`
-  las deja fuera; `ECLIPSE_PLASMA=0` deja fuera solo el shell de Plasma
-  (`plasma-workspace`, `plasma-desktop`, `systemsettings`, ~1 GiB), con lo que
-  la apariencia `plasma` pierde su panel y cae a `lunarbar`. Ver
+  las deja fuera; `ECLIPSE_PLASMA=1` añade además el shell de Plasma. Ver
   «KDE: lo que hay, lo que falta y por qué».
 
 ## Xwayland (aplicaciones X11)

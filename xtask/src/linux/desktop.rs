@@ -763,23 +763,20 @@ fn write_eclipse_look(rootfs: &Path) {
     fs::write(
         &script,
         b"#!/bin/sh\n\
-          # Eclipse OS: desktop look. eclipse = violet, kde = Breeze Dark and\n\
-          # win11 = Windows 11, all three drawn by lunarbar; plasma = the same\n\
-          # Breeze window theme with KDE's OWN shell (plasmashell) as the\n\
-          # panel instead of lunarbar. See docs/README-desktop.md.\n\
+          # Eclipse OS: desktop look (kde = KDE Breeze Dark, eclipse = violet).\n\
           CONF=/etc/eclipse/look\n\
           CFG=\"${HOME:-/root}/.config\"\n\
           RC=\"$CFG/labwc/rc.xml\"\n\
           LOG=\"${HOME:-/root}/.eclipse-look.log\"\n\
           \n\
           look_ok() {\n\
-          \x20 case \"$1\" in win11|kde|eclipse|plasma) return 0 ;; *) return 1 ;; esac\n\
+          \x20 case \"$1\" in win11|kde|eclipse) return 0 ;; *) return 1 ;; esac\n\
           }\n\
           \n\
           theme_for() {\n\
           \x20 case \"$1\" in\n\
           \x20 win11) echo Win11-Dark ;;\n\
-          \x20 kde|plasma) echo Breeze-Dark ;;\n\
+          \x20 kde) echo Breeze-Dark ;;\n\
           \x20 *) echo Eclipse-Dark ;;\n\
           \x20 esac\n\
           }\n\
@@ -790,11 +787,7 @@ fn write_eclipse_look(rootfs: &Path) {
           \x20   { sub(/\\r$/, \"\") }\n\
           \x20   /^[[:space:]]*#/ { next }\n\
           \x20   /^[[:space:]]*look[[:space:]]*=/ {\n\
-          # Trailing comment first, then whitespace: without the first step\n\
-          # `look=plasma # nota` squeezes down to `plasma#nota` and matches\n\
-          # nothing, which reads as a look that was set and did not take.\n\
-          \x20     sub(/^[^=]*=/, \"\"); sub(/#.*$/, \"\")\n\
-          \x20     gsub(/[[:space:]]/, \"\"); print; exit\n\
+          \x20     sub(/^[^=]*=/, \"\"); gsub(/[[:space:]]/, \"\"); print; exit\n\
           \x20   }\n\
           \x20 ' \"$CONF\"\n\
           }\n\
@@ -842,31 +835,15 @@ fn write_eclipse_look(rootfs: &Path) {
           \x20   elif [ -x /usr/bin/labwc ]; then\n\
           \x20     /usr/bin/labwc --reconfigure >>\"$LOG\" 2>&1 || true\n\
           \x20   fi\n\
-          # The panel and the wallpaper read /etc/eclipse/look once at\n\
-          # start; eclipse-init respawns both with the new look immediately.\n\
-          # Three names for the panel and two for the wallpaper, because each\n\
-          # service runs whichever binary the look asked for, and a switch\n\
-          # between them only takes effect on that respawn.\n\
+          # The panel reads /etc/eclipse/look once at start; eclipse-init\n\
+          # respawns it with the new look immediately.\n\
           \x20   pkill -x lunarbar 2>/dev/null || true\n\
-          \x20   pkill -x plasmashell 2>/dev/null || true\n\
-          # `-x lunarbg` catches it while it paints (the wrapper exec's it,\n\
-          # so by then the name is lunarbg); the second catches the wrapper\n\
-          # parked under look=plasma, which never exec'd anything and so is\n\
-          # still `sh /usr/local/bin/eclipse-lunarbg`. The pattern is the\n\
-          # FULL path, not the basename: busybox pkill -f matches a substring\n\
-          # of the whole command line as a regex, so a bare `eclipse-lunarbg`\n\
-          # would also hit anything that merely mentions it -- an editor, a\n\
-          # `tail` on its log, a shell reading the script. Neither pattern\n\
-          # matches this script (its own cmdline is eclipse-look) nor the\n\
-          # panel's (eclipse-lunarbar does not contain eclipse-lunarbg).\n\
-          \x20   pkill -x lunarbg 2>/dev/null || true\n\
-          \x20   pkill -f /usr/local/bin/eclipse-lunarbg 2>/dev/null || true\n\
           \x20 fi\n\
           \x20 echo \"[$(date '+%H:%M:%S')] look=$look theme=$theme boot=$boot\" >>\"$LOG\"\n\
           }\n\
           \n\
           usage() {\n\
-          \x20 echo \"usage: eclipse-look [win11|kde|eclipse|plasma|--boot]\" >&2\n\
+          \x20 echo \"usage: eclipse-look [win11|kde|eclipse|--boot]\" >&2\n\
           \x20 exit 2\n\
           }\n\
           \n\
@@ -878,7 +855,7 @@ fn write_eclipse_look(rootfs: &Path) {
           \x20 current\n\
           \x20 exit 0\n\
           \x20 ;;\n\
-          win11|kde|eclipse|plasma)\n\
+          win11|kde|eclipse)\n\
           \x20 apply \"$1\"\n\
           \x20 echo \"$1\"\n\
           \x20 ;;\n\
@@ -899,8 +876,8 @@ fn write_eclipse_look(rootfs: &Path) {
 /// binary behind it here:
 ///   * `eclipse-run`   -- Alt+Space / Alt+F2 / Ctrl+Alt+Del: `lunarrun`, the
 ///     native KRunner stand-in (krunner itself is a D-Bus service).
-///   * `eclipse-files` -- Super+E: Dolphin when the KDE set was built in,
-///     else the best TUI file manager installed, else a shell in $HOME.
+///   * `eclipse-files` -- Super+E: no Dolphin (no Qt/KF6 in the image), so the
+///     best TUI file manager installed, else a shell in $HOME.
 ///   * `eclipse-showdesktop` -- Super+D: minimise/restore every window through
 ///     wlr-foreign-toplevel-management (`lunarrun --toggle-desktop`), which
 ///     works on every labwc release regardless of its action list.
@@ -942,16 +919,11 @@ fn write_kde_helpers(rootfs: &Path) {
     fs::write(
         &files,
         b"#!/bin/sh\n\
-          # Eclipse OS: KDE's Super+E (file manager). Dolphin is in the image\n\
-          # now (Qt 6 and KF6 ship with the KDE set), so it goes first and the\n\
-          # key does what it does on KDE. It is still only best-effort --\n\
-          # `apk` is, and ECLIPSE_KDE=0 takes it out -- so the text file\n\
-          # managers stay as the fallback, and a shell in the home directory\n\
-          # behind them, which is what the key is really for.\n\
+          # Eclipse OS: KDE's Super+E (file manager). Dolphin needs Qt + KF6,\n\
+          # neither of which is in this image, so run the best file manager\n\
+          # that IS installed inside a terminal; failing that, a shell in the\n\
+          # home directory, which is what the key is really for.\n\
           DIR=\"${1:-${HOME:-/root}}\"\n\
-          if command -v dolphin >/dev/null 2>&1; then\n\
-          \x20 exec dolphin \"$DIR\"\n\
-          fi\n\
           for fm in mc nnn lf ranger vifm; do\n\
           \x20 if command -v \"$fm\" >/dev/null 2>&1; then\n\
           \x20   exec /usr/local/bin/eclipse-terminal \"$fm\" \"$DIR\"\n\
@@ -2339,9 +2311,9 @@ fn write_labwc_rc(rootfs: &Path) {
     <keybind key="A-space"><action name="Execute"><command>/usr/local/bin/eclipse-run</command></action></keybind>
     <keybind key="A-F2"><action name="Execute"><command>/usr/local/bin/eclipse-run</command></action></keybind>
     <keybind key="C-A-Delete"><action name="Execute"><command>/usr/local/bin/eclipse-run</command></action></keybind>
-    <!-- Super+E: KDE's file manager key. eclipse-files opens Dolphin when
-         it is installed, and otherwise the best text file manager there is,
-         or a shell in $HOME. -->
+    <!-- Super+E: KDE's file manager key. No Dolphin here (Qt/KF6 are not in
+         the image), so eclipse-files opens the best text file manager
+         installed, or a shell in $HOME. -->
     <keybind key="W-E"><action name="Execute"><command>/usr/local/bin/eclipse-files</command></action></keybind>
     <!-- Super+D: show desktop. labwc has no such action on every release, so
          this minimises (or restores) every window through
@@ -2751,10 +2723,6 @@ fn write_foot_config(rootfs: &Path) {
     // (a running foot keeps its colours until restarted).
     fs::write(dir.join("foot.eclipse.ini"), foot_ini(FOOT_ECLIPSE)).unwrap();
     fs::write(dir.join("foot.kde.ini"), foot_ini(FOOT_BREEZE)).unwrap();
-    // `plasma` is the KDE look with KDE's own shell, so it takes KDE's
-    // terminal palette too. Its own file rather than a special case in
-    // eclipse-look, which copies `foot.$look.ini` and nothing else.
-    fs::write(dir.join("foot.plasma.ini"), foot_ini(FOOT_BREEZE)).unwrap();
     fs::write(dir.join("foot.win11.ini"), foot_ini(FOOT_CAMPBELL)).unwrap();
     fs::write(dir.join("foot.ini"), foot_ini(FOOT_ECLIPSE)).unwrap();
 }
@@ -3567,7 +3535,6 @@ mod tests {
             ("win11", "Win11-Dark"),
             ("kde", "Breeze-Dark"),
             ("eclipse", "Eclipse-Dark"),
-            ("plasma", "Breeze-Dark"),
         ] {
             assert!(script.contains(theme), "eclipse-look does not know {theme}");
             assert!(script.contains(name), "eclipse-look does not accept {name}");
@@ -3599,112 +3566,6 @@ mod tests {
             win.contains("background=0c0c0c"),
             "Windows terminal palette is Campbell"
         );
-
-        // RUN it, once per look. `contains(name)` above cannot tell a look
-        // apart from a comment mentioning it, and that is not hypothetical:
-        // `plasma` was added to the validator, to the theme map and to the
-        // usage line while the argv `case` still ended at `eclipse`, so
-        // `eclipse-look plasma` answered with usage and exit 2. Only running
-        // it says which looks the command actually accepts.
-        let sandbox = dir.join("run");
-        fs::create_dir_all(sandbox.join("bin")).unwrap();
-        // apply() signals the session's clients; neither the panel nor the
-        // wallpaper of the machine running this suite is ours to kill.
-        let nopkill = sandbox.join("bin/pkill");
-        fs::write(&nopkill, "#!/bin/sh\nexit 0\n").unwrap();
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&nopkill, fs::Permissions::from_mode(0o755)).unwrap();
-        }
-        let runnable = sandbox.join("eclipse-look");
-        fs::write(
-            &runnable,
-            script
-                .replace(
-                    "CONF=/etc/eclipse/look",
-                    &format!("CONF={}/look", sandbox.display()),
-                )
-                .replace(
-                    "mkdir -p /etc/eclipse",
-                    "mkdir -p /dev/null/nope 2>/dev/null; true",
-                )
-                .replace("/usr/bin/labwc", "/nonexistent/labwc"),
-        )
-        .unwrap();
-        for (name, theme) in [
-            ("plasma", "Breeze-Dark"),
-            ("win11", "Win11-Dark"),
-            ("kde", "Breeze-Dark"),
-            ("eclipse", "Eclipse-Dark"),
-        ] {
-            let out = std::process::Command::new("sh")
-                .arg(&runnable)
-                .arg(name)
-                .env("HOME", dir.join("root"))
-                .env("PATH", format!("{}/bin:/usr/bin:/bin", sandbox.display()))
-                .output()
-                .unwrap();
-            assert!(
-                out.status.success(),
-                "`eclipse-look {name}` exited {:?}: {}",
-                out.status.code(),
-                String::from_utf8_lossy(&out.stderr)
-            );
-            let saved = fs::read_to_string(sandbox.join("look")).unwrap();
-            assert_eq!(saved.trim(), format!("look={name}"), "look not saved");
-            let rc = fs::read_to_string(dir.join("root/.config/labwc/rc.xml")).unwrap();
-            assert!(
-                rc.contains(&format!("<name>{theme}</name>")),
-                "`eclipse-look {name}` did not put {theme} in rc.xml"
-            );
-            let want = fs::read_to_string(
-                dir.join("root/.config/foot")
-                    .join(format!("foot.{name}.ini")),
-            )
-            .unwrap();
-            let got = fs::read_to_string(dir.join("root/.config/foot/foot.ini")).unwrap();
-            assert_eq!(want, got, "`eclipse-look {name}` did not copy its palette");
-        }
-        // `eclipse-look` with no argument reports what the FILE says, and its
-        // awk has to agree with the wrappers' sed about a trailing comment:
-        // two readers that disagree are a look that reads as applied in one
-        // place and not in the other, which is the whole reason they were
-        // written to match.
-        for (written, want) in [
-            ("look=win11\n", "win11"),
-            ("look = win11 \n", "win11"),
-            ("look=win11 # la barra de Windows\n", "win11"),
-            ("#look=win11\n", "eclipse"),
-            ("", "eclipse"),
-        ] {
-            fs::write(sandbox.join("look"), written).unwrap();
-            let out = std::process::Command::new("sh")
-                .arg(&runnable)
-                .env("HOME", dir.join("root"))
-                .env("PATH", format!("{}/bin:/usr/bin:/bin", sandbox.display()))
-                .output()
-                .unwrap();
-            assert_eq!(
-                String::from_utf8_lossy(&out.stdout).trim(),
-                want,
-                "eclipse-look read {written:?} as something other than {want}"
-            );
-        }
-
-        // And a look nobody defined is still refused, so the `case` cannot be
-        // "fixed" by making it accept everything.
-        let out = std::process::Command::new("sh")
-            .arg(&runnable)
-            .arg("gnome")
-            .env("HOME", dir.join("root"))
-            .env("PATH", format!("{}/bin:/usr/bin:/bin", sandbox.display()))
-            .output()
-            .unwrap();
-        assert!(
-            !out.status.success(),
-            "eclipse-look accepted an unknown look"
-        );
-
         let _ = fs::remove_dir_all(&dir);
     }
 
