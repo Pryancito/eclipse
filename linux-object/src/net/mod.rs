@@ -823,14 +823,51 @@ fn mono_us() -> u64 {
     kernel_hal::timer::timer_now().as_micros() as u64
 }
 
-fn net_poll_interval_elapsed(interval_us: u64) -> bool {
-    let now = mono_us();
-    let last = LAST_NET_POLL_US.load(Ordering::Relaxed);
-    if now.wrapping_sub(last) < interval_us {
-        return false;
+/// Claim one turn of a periodic job, for exactly one caller per interval.
+///
+/// `load` / compare / `store` is not a throttle under SMP, it is a starting
+/// gun: every CPU that reaches the check inside the same interval reads the
+/// same `last`, every one of them passes, and every one of them stores `now`
+/// and runs the body. That is not theoretical -- it is the six-CPU pile-up on
+/// the e1000e `iface` lock captured on real hardware, where the HOLDER sat in
+/// `add_route` (reached from [`maybe_run_net_housekeeping`] via
+/// [`prepare_ipv4_stack`]) and the other five spun in `seed_neighbor` (reached
+/// from the *same* housekeeping pass, via
+/// [`sync_neighbor_cache_into_smoltcp`]). Both ends of that banner are inside
+/// the body this throttle is supposed to let one CPU run.
+///
+/// The `compare_exchange` makes the stamp the claim: the winner moves it and
+/// runs, the losers see the moved stamp on the retry and go home. Returns
+/// whether the caller won the turn.
+fn claim_interval(slot: &AtomicU64, now: u64, interval_us: u64) -> bool {
+    claim_interval_seen(slot, slot.load(Ordering::Relaxed), now, interval_us)
+}
+
+/// [`claim_interval`] from a stamp the caller has already read.
+///
+/// Split out for the tests, and only for them: a test that calls
+/// `claim_interval` one CPU after another cannot fail, because by the time the
+/// second one loads the stamp the first has already stored it -- the bug needs
+/// every CPU to have loaded the *old* stamp before any of them stores, which is
+/// precisely what handing them all the same `last` reproduces, without threads
+/// and without a timing window.
+fn claim_interval_seen(slot: &AtomicU64, mut last: u64, now: u64, interval_us: u64) -> bool {
+    loop {
+        if now.wrapping_sub(last) < interval_us {
+            return false;
+        }
+        match slot.compare_exchange_weak(last, now, Ordering::AcqRel, Ordering::Relaxed) {
+            Ok(_) => return true,
+            // Someone else moved it. Re-read and re-judge rather than assume
+            // they claimed *this* interval: the stamp they wrote may still be
+            // old enough that this caller is owed the turn.
+            Err(current) => last = current,
+        }
     }
-    LAST_NET_POLL_US.store(now, Ordering::Relaxed);
-    true
+}
+
+fn net_poll_interval_elapsed(interval_us: u64) -> bool {
+    claim_interval(&LAST_NET_POLL_US, mono_us(), interval_us)
 }
 
 #[inline]
@@ -843,13 +880,46 @@ fn adaptive_net_poll_interval_us() -> u64 {
     adaptive::net_poll_interval_us(kernel_hal::deferred_job::pending_deferred_jobs())
 }
 
+/// Held while a housekeeping pass is in flight, so only one CPU is ever inside
+/// the body.
+///
+/// [`claim_interval`] already hands the turn to one caller, but it hands it out
+/// by the clock, and `force` skips the clock entirely. This is the structural
+/// half: whatever the stamp says, a second CPU that arrives while the body is
+/// running turns around. The body's work is idempotent housekeeping, so the one
+/// that turns around loses nothing -- the pass already in flight does it.
+static NET_HOUSEKEEPING_RUNNING: AtomicBool = AtomicBool::new(false);
+
 #[inline]
 fn maybe_run_net_housekeeping(now_us: u64, force: bool) {
-    let last = LAST_NET_HOUSEKEEPING_US.load(Ordering::Relaxed);
-    if !force && now_us.wrapping_sub(last) < NET_HOUSEKEEPING_INTERVAL_US {
+    // One CPU per interval, or all of them at once -- see [`claim_interval`].
+    let won = claim_interval(
+        &LAST_NET_HOUSEKEEPING_US,
+        now_us,
+        NET_HOUSEKEEPING_INTERVAL_US,
+    );
+    if force {
+        // A forced pass runs whether or not it won the turn, and publishes the
+        // stamp as the old code did, so the periodic pass whose work it just
+        // did does not follow it a microsecond later.
+        LAST_NET_HOUSEKEEPING_US.store(now_us, Ordering::Relaxed);
+    } else if !won {
         return;
     }
-    LAST_NET_HOUSEKEEPING_US.store(now_us, Ordering::Relaxed);
+    if NET_HOUSEKEEPING_RUNNING.swap(true, Ordering::Acquire) {
+        return;
+    }
+    // Cleared by `Drop`, not by a store at the end: an early `return` added to
+    // the body later would otherwise latch the flag and kill housekeeping for
+    // the life of the kernel, which is exactly how `poll_pending` got stuck
+    // once already.
+    struct Running;
+    impl Drop for Running {
+        fn drop(&mut self) {
+            NET_HOUSEKEEPING_RUNNING.store(false, Ordering::Release);
+        }
+    }
+    let _running = Running;
     sync_neighbor_cache_into_smoltcp();
     if has_usable_ipv4() {
         prepare_ipv4_stack();
@@ -925,10 +995,7 @@ pub fn io_wait_tick(watch_net: bool, _watch_interactive: bool) {
         kernel_hal::deferred_job::drain_deferred_jobs_max(adaptive_deferred_jobs_per_tick());
         poll_ifaces_throttled();
     } else {
-        let now = mono_us();
-        let last = LAST_DEFERRED_IDLE_US.load(Ordering::Relaxed);
-        if now.wrapping_sub(last) >= DEFERRED_IDLE_INTERVAL_US {
-            LAST_DEFERRED_IDLE_US.store(now, Ordering::Relaxed);
+        if claim_interval(&LAST_DEFERRED_IDLE_US, mono_us(), DEFERRED_IDLE_INTERVAL_US) {
             kernel_hal::deferred_job::drain_deferred_jobs_max(1);
         }
     }
@@ -2378,6 +2445,81 @@ pub fn proc_net_unix_content() -> alloc::string::String {
 mod tests {
     use super::*;
     use smoltcp::wire::Ipv4Address;
+
+    /// Six CPUs reaching the same throttle in the same interval: exactly one
+    /// gets the turn.
+    ///
+    /// The old `load` / compare / `store` gave the turn to all six, which is
+    /// the e1000e pile-up in the hardware panic -- one CPU inside `add_route`
+    /// holding the smoltcp `iface` lock and the other five spinning on it in
+    /// `seed_neighbor`, both reached from this one body.
+    #[test]
+    fn claim_interval_admits_one_caller_per_interval() {
+        let slot = AtomicU64::new(500_000);
+        let now = 1_000_000;
+        // All six have loaded the same stamp before any of them stores: the
+        // interleaving the old `load` / compare / `store` could not survive.
+        let winners = (0..6)
+            .filter(|_| claim_interval_seen(&slot, 500_000, now, 250_000))
+            .count();
+        assert_eq!(winners, 1);
+        assert_eq!(slot.load(Ordering::Relaxed), now);
+    }
+
+    /// The same interleaving, but the stamp the racers read is old enough that
+    /// the *next* interval is owed too: the loser must not be handed the turn
+    /// by the retry, because the winner has just run the body.
+    #[test]
+    fn claim_interval_losers_do_not_win_on_the_retry() {
+        let slot = AtomicU64::new(0);
+        let now = 10_000_000;
+        let winners = (0..6)
+            .filter(|_| claim_interval_seen(&slot, 0, now, 250_000))
+            .count();
+        assert_eq!(winners, 1);
+    }
+
+    #[test]
+    fn claim_interval_refuses_before_the_interval_is_up() {
+        let slot = AtomicU64::new(0);
+        assert!(claim_interval(&slot, 1_000_000, 250_000));
+        assert!(!claim_interval(&slot, 1_000_000 + 249_999, 250_000));
+        // The refusals must not move the stamp, or a stream of early callers
+        // would push the next real turn out forever.
+        assert_eq!(slot.load(Ordering::Relaxed), 1_000_000);
+    }
+
+    #[test]
+    fn claim_interval_gives_the_turn_again_once_the_interval_elapses() {
+        let slot = AtomicU64::new(0);
+        assert!(claim_interval(&slot, 1_000_000, 250_000));
+        assert!(claim_interval(&slot, 1_250_000, 250_000));
+        assert_eq!(slot.load(Ordering::Relaxed), 1_250_000);
+    }
+
+    /// A fresh slot reads 0, so during the first interval of uptime the stamp
+    /// is indistinguishable from "ran just now" and the turn is refused. That
+    /// is the old behaviour kept deliberately: the first caller is a DHCP-time
+    /// poll, the work is periodic housekeeping, and it simply happens one
+    /// interval later.
+    #[test]
+    fn claim_interval_waits_out_the_first_interval_of_uptime() {
+        let slot = AtomicU64::new(0);
+        assert!(!claim_interval(&slot, 1, 250_000));
+        assert!(claim_interval(&slot, 250_000, 250_000));
+    }
+
+    /// The clock is `u64` micros and never wraps in any plausible uptime, but
+    /// the arithmetic is `wrapping_sub` on purpose; keep it that way, because
+    /// a plain subtraction here panics in debug rather than merely misjudging.
+    #[test]
+    fn claim_interval_survives_a_clock_that_went_backwards() {
+        let slot = AtomicU64::new(5_000_000);
+        // now < last: `wrapping_sub` yields a huge number, so the turn is
+        // granted and the stamp is repaired to the new reading.
+        assert!(claim_interval(&slot, 1_000, 250_000));
+        assert_eq!(slot.load(Ordering::Relaxed), 1_000);
+    }
 
     #[test]
     fn ipv4_placeholder_is_class_e_sentinel() {
