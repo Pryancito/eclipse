@@ -1726,22 +1726,42 @@ fn walk_mapped(vmar: &Arc<VmAddressRegion>, start: usize, end: usize) -> SysResu
     Ok(0)
 }
 
-/// Like [`walk_mapped`], but also writebacks each distinct MAP_SHARED
-/// file-backed VMO touched by the range (Firefox / SQLite `msync(MS_SYNC)`).
-fn walk_mapped_msync(vmar: &Arc<VmAddressRegion>, start: usize, end: usize) -> SysResult {
+/// The objects `[start, end)` touches, each one once, in the order the walk
+/// meets them -- or `ENOMEM` at the first page that is not mapped, like
+/// [`walk_mapped`].
+///
+/// "Each one once" is the whole of what [`walk_mapped_msync`] decides, and the
+/// writeback it drives is invisible from outside: a first page skipped is an
+/// `msync(MS_SYNC)` that never writes the file back, and a repeat is the whole
+/// object written again for every page of it. Neither shows up in the value the
+/// syscall returns, so the list is what a test can ask for.
+fn distinct_vmos(
+    vmar: &Arc<VmAddressRegion>,
+    start: usize,
+    end: usize,
+) -> LxResult<Vec<Arc<VmObject>>> {
     use alloc::collections::BTreeSet;
     let mut page = start;
     let mut seen: BTreeSet<usize> = BTreeSet::new();
+    let mut objects = Vec::new();
     while page < end {
         let Some(mapping) = vmar.find_mapping(page) else {
             return Err(LxError::ENOMEM);
         };
         let vmo = mapping.vmo();
-        let key = Arc::as_ptr(vmo) as usize;
-        if seen.insert(key) {
-            linux_object::fs::sync_shared_file_vmo(vmo);
+        if seen.insert(Arc::as_ptr(vmo) as usize) {
+            objects.push(vmo.clone());
         }
         page += PAGE_SIZE;
+    }
+    Ok(objects)
+}
+
+/// Like [`walk_mapped`], but also writebacks each distinct MAP_SHARED
+/// file-backed VMO touched by the range (Firefox / SQLite `msync(MS_SYNC)`).
+fn walk_mapped_msync(vmar: &Arc<VmAddressRegion>, start: usize, end: usize) -> SysResult {
+    for vmo in distinct_vmos(vmar, start, end)? {
+        linux_object::fs::sync_shared_file_vmo(&vmo);
     }
     Ok(0)
 }
@@ -2265,6 +2285,22 @@ mod user_range_tests {
     }
 
     #[test]
+    fn the_end_that_is_bounded_is_the_rounded_one() {
+        // The round-up is what the caller's pages actually cover, so it is the
+        // number that has to fit -- not the raw `len`. The two only come apart
+        // for an address that is not page-aligned, which is what `mremap` hands
+        // over before it checks alignment and what `mlock`'s stretched span is
+        // built from; bounding `len` instead lets a range in whose last page is
+        // off the end, and the walk behind it then runs past the address space.
+        let odd = USER_ASPACE_END - PAGE + 1;
+        assert_eq!(user_range(odd, PAGE - 1), UserRange::Beyond);
+        // A page lower down, the same unaligned address is fine: it is the
+        // rounded end running off the top that refuses the one above, not the
+        // alignment.
+        assert_eq!(user_range(odd - PAGE, PAGE - 1), UserRange::Pages(PAGE));
+    }
+
+    #[test]
     fn a_length_the_round_up_survives_can_still_be_absurd() {
         // 2^63 rounds cleanly and adds cleanly; what refuses it is the address
         // space. `mincore` sized a `Vec` from exactly this: 2^51 pages, from an
@@ -2374,6 +2410,37 @@ mod mm_range_tests {
                 name
             );
         }
+    }
+
+    #[test]
+    fn an_address_aligned_to_less_than_a_page_is_still_unaligned() {
+        // The check is `addr % PAGE_SIZE`, and every case above hands over an
+        // ODD address -- so a check that had decayed to "is it even" would pass
+        // the lot. Half a page is what a caller gets from an 8- or 2048-byte
+        // alignment and hands straight to `mprotect`.
+        for (name, answer) in answers(0x1000 + PAGE / 2, PAGE) {
+            if name == "mlock" {
+                // mlock(2) rounds the address DOWN instead of refusing it.
+                assert!(answer.is_ok(), "mlock refused an unaligned address");
+                continue;
+            }
+            assert_eq!(
+                answer,
+                Err(LxError::EINVAL),
+                "{} on an address aligned to half a page",
+                name
+            );
+        }
+    }
+
+    #[test]
+    fn mremaps_new_length_is_not_measured_from_the_old_address() {
+        // `may_move` places the new mapping wherever it likes, so the new
+        // length is bounded against the address space as a whole. Anchored at
+        // `old_addr` instead, a grow of a mapping near the top of the space is
+        // refused for a room problem that moving it is there to solve.
+        let old = USER_ASPACE_END - PAGE;
+        assert_eq!(mremap_args(old, PAGE, 16 * PAGE), Ok((PAGE, 16 * PAGE)));
     }
 
     #[test]
@@ -2583,7 +2650,9 @@ mod mm_walk_tests {
     //! themselves. A real root VMAR fits in a unit test in this crate, so the
     //! walk can be asked rather than reasoned about.
 
-    use super::{mincore_residency, mlock_args, walk_mapped, PAGE_SIZE};
+    use super::{
+        distinct_vmos, mincore_residency, mlock_args, walk_mapped, walk_mapped_msync, PAGE_SIZE,
+    };
     use alloc::sync::Arc;
     use linux_object::error::LxError;
     use zircon_object::vm::{MMUFlags, VmAddressRegion, VmObject};
@@ -2712,6 +2781,75 @@ mod mm_walk_tests {
             Err(LxError::ENOMEM)
         );
     }
+
+    /// A second object mapped straight behind the first, so a range can span
+    /// two of them.
+    fn map_another(vmar: &Arc<VmAddressRegion>, base: usize, pages: usize) {
+        vmar.map_ext_min(
+            Some(base),
+            VmObject::new_paged(pages),
+            0,
+            pages * PAGE_SIZE,
+            MMUFlags::RXW,
+            MMUFlags::READ | MMUFlags::WRITE | MMUFlags::USER,
+            false,
+            false,
+            false,
+            0,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn every_object_the_range_touches_is_written_back_once() {
+        // `msync(MS_SYNC)` over a span has to reach every object in it, and
+        // reach each one once. Both halves are invisible from the value the
+        // syscall returns: an object skipped is a file whose stores never
+        // land -- Firefox's and SQLite's reason for calling this at all -- and
+        // a repeat is the whole object written again for every page of it.
+        let (vmar, addr) = mapped(0x700_0000, 2);
+        map_another(&vmar, 0x700_0000 + 2 * PAGE_SIZE, 1);
+
+        assert_eq!(
+            distinct_vmos(&vmar, addr, addr + PAGE_SIZE).unwrap().len(),
+            1
+        );
+        assert_eq!(
+            distinct_vmos(&vmar, addr, addr + 2 * PAGE_SIZE)
+                .unwrap()
+                .len(),
+            1,
+            "two pages of one object are one writeback, not two"
+        );
+        assert_eq!(
+            distinct_vmos(&vmar, addr, addr + 3 * PAGE_SIZE)
+                .unwrap()
+                .len(),
+            2,
+            "the second object in the range was not reached"
+        );
+        assert!(
+            distinct_vmos(&vmar, addr, addr).unwrap().is_empty(),
+            "an empty range touches nothing"
+        );
+        assert_eq!(walk_mapped_msync(&vmar, addr, addr + 3 * PAGE_SIZE), Ok(0));
+    }
+
+    #[test]
+    fn the_writeback_walk_stops_at_a_hole_like_the_plain_one() {
+        // `msync(2)` owes its caller the same ENOMEM as `mlock`: a range with
+        // a hole is not a range this syscall succeeded over.
+        let (vmar, addr) = mapped(0x800_0000, 2);
+        assert_eq!(
+            walk_mapped_msync(&vmar, addr, addr + 3 * PAGE_SIZE),
+            Err(LxError::ENOMEM)
+        );
+        assert_eq!(
+            distinct_vmos(&vmar, addr + 2 * PAGE_SIZE, addr + 3 * PAGE_SIZE).err(),
+            Some(LxError::ENOMEM),
+            "a range that starts in the hole"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -2787,6 +2925,38 @@ mod mmap_flag_tests {
     /// `MAP_SHARED_VALIDATE` is the value 3, not a third bit, and it is a
     /// file-mapping answer: Linux's anonymous arm is a second `switch` that
     /// knows only `MAP_SHARED` and `MAP_PRIVATE`.
+    #[test]
+    fn the_kind_is_read_from_its_own_four_bits_and_not_from_the_rest() {
+        // `MAP_TYPE` is the low four bits; `MAP_FIXED` (0x10) and everything
+        // above it are ordinary flags that live outside it. Every case here
+        // passes a bare kind, so a mask that reached one bit further would turn
+        // the most ordinary call there is -- `mmap(.., MAP_SHARED | MAP_FIXED,
+        // ..)`, which is how every loader places a segment -- into a kind
+        // nobody named, and `EINVAL`.
+        const MAP_FIXED: usize = 0x10;
+        const MAP_ANONYMOUS: usize = 0x20;
+        const MAP_NORESERVE: usize = 0x4000;
+        for extra in [
+            MAP_FIXED,
+            MAP_ANONYMOUS,
+            MAP_FIXED | MAP_ANONYMOUS,
+            MAP_NORESERVE,
+        ] {
+            assert_eq!(
+                mmap_shared(MAP_SHARED | extra, false),
+                Ok(true),
+                "shared with {:#x}",
+                extra
+            );
+            assert_eq!(
+                mmap_shared(MAP_PRIVATE | extra, true),
+                Ok(false),
+                "private with {:#x}",
+                extra
+            );
+        }
+    }
+
     #[test]
     fn shared_validate_is_a_file_mapping_answer_only() {
         assert_eq!(mmap_shared(MAP_SHARED_VALIDATE, false), Ok(true));
