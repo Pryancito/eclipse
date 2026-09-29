@@ -211,11 +211,49 @@ impl PortOps for PortOpsImpl {
 /// Return assigned MSI interrupt number when applicable
 #[allow(dead_code)]
 unsafe fn enable(loc: Location, paddr: u64) -> Option<usize> {
+    // 23 and lower are used. Atomic, not `static mut`: device probe can run
+    // concurrently, and a plain `+=` on a `static mut` is a data race (UB).
+    static MSI_IRQ: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(23);
+    // SDM Vol. 3 §10.11 Message Signalled Interrupts: address bits 19:12
+    // carry the destination APIC id (physical mode). This used to be hardcoded
+    // to 0 with "0 is (usually) the apic id of the bsp" -- on firmware that
+    // gives the BSP any other id, every MSI (xHCI keyboard/mouse, e1000e RX)
+    // went to a CPU that may never come up and was silently lost. Route MSIs
+    // to the CPU that actually runs the interrupt handlers.
+    #[cfg(target_arch = "x86_64")]
+    let dest = crate::irq::x86::Apic::bsp_apic_id() as u32;
+    #[cfg(not(target_arch = "x86_64"))]
+    let dest = 0u32;
+    // SAFETY: same call as the body below, against the real config ports.
     unsafe {
-        let ops = &PortOpsImpl;
-        //let am = CSpaceAccessMethod::IO;
-        let am = PCI_ACCESS;
+        enable_with(&PortOpsImpl, PCI_ACCESS, loc, paddr, dest, || {
+            MSI_IRQ.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1
+        })
+    }
+}
 
+/// The body of [`enable`], with everything only the machine can answer handed
+/// in: the config-space accessor, the APIC id the MSIs must be addressed to,
+/// and the source of MSI irq numbers.
+///
+/// It is split out for the same reason as [`read_bar_addr`] and
+/// [`probe_bar_size`] above: `in`/`out` fault outside ring 0, so a fake
+/// config space is the only way any of this runs anywhere but on the machine
+/// -- and what it programs (the MSI address, the data register, the enable
+/// bit, the capability walk) is exactly the part whose failure mode is a
+/// device that never delivers an interrupt.
+///
+/// SAFETY: `ops` must address this device's configuration space.
+#[allow(dead_code)]
+pub(crate) unsafe fn enable_with<T: PortOps>(
+    ops: &T,
+    am: CSpaceAccessMethod,
+    loc: Location,
+    paddr: u64,
+    dest: u32,
+    mut next_irq: impl FnMut() -> u32,
+) -> Option<usize> {
+    unsafe {
         if paddr != 0 {
             // reveal PCI regs by setting paddr
             let bar0_raw = am.read32(ops, loc, BAR0);
@@ -226,10 +264,6 @@ unsafe fn enable(loc: Location, paddr: u64) -> Option<usize> {
                 am.read32(ops, loc, BAR0)
             );
         }
-
-        // 23 and lower are used. Atomic, not `static mut`: device probe can run
-        // concurrently, and a plain `+=` on a `static mut` is a data race (UB).
-        static MSI_IRQ: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(23);
 
         let orig = am.read16(ops, loc, PCI_COMMAND);
         // Always enable MEM space + Bus Mastering so DMA devices (e.g. AHCI) work
@@ -269,19 +303,8 @@ unsafe fn enable(loc: Location, paddr: u64) -> Option<usize> {
             let cap_id = am.read8(ops, loc, cap_ptr);
             if cap_id == PCI_CAP_ID_MSI {
                 let orig_ctrl = am.read32(ops, loc, cap_ptr + PCI_MSI_CTRL_CAP);
-                // SDM Vol. 3 §10.11 Message Signalled Interrupts: address
-                // bits 19:12 carry the destination APIC id (physical mode).
-                // This used to be hardcoded to 0 with "0 is (usually) the
-                // apic id of the bsp" -- on firmware that gives the BSP any
-                // other id, every MSI (xHCI keyboard/mouse, e1000e RX) went to
-                // a CPU that may never come up and was silently lost. Route
-                // MSIs to the CPU that actually runs the interrupt handlers.
-                #[cfg(target_arch = "x86_64")]
-                let dest = crate::irq::x86::Apic::bsp_apic_id() as u32;
-                #[cfg(not(target_arch = "x86_64"))]
-                let dest = 0u32;
                 am.write32(ops, loc, cap_ptr + PCI_MSI_ADDR, 0xfee0_0000 | (dest << 12));
-                let irq = MSI_IRQ.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
+                let irq = next_irq();
                 assigned_irq = Some(irq as usize);
                 // we offset all our irq numbers by 32
                 if (orig_ctrl >> 16) & (1 << 7) != 0 {
@@ -405,8 +428,10 @@ pub fn get_bar0_mem(loc: Location) -> Option<(usize, usize)> {
 }
 
 #[cfg(all(test, target_arch = "x86_64"))]
-mod bar_tests {
-    //! Host tests for BAR decoding.
+mod config_space_tests {
+    //! Host tests for what the driver reads out of, and writes into, a
+    //! device's configuration space: where a BAR lives, how big it is, and
+    //! how the device is told to interrupt.
     //!
     //! `read_bar_addr` is what tells the NVIDIA driver where BAR0 is and the
     //! AHCI driver where BAR5 is — the first thing either does on a real
@@ -419,6 +444,13 @@ mod bar_tests {
     //! its writable address bits set and hardwires the rest, so writing
     //! all-ones and reading back returns the size mask with the type flags
     //! still in place.
+    //!
+    //! `enable_with` is the other half, and the reason it was split out of
+    //! `enable`. Every number it programs — which APIC the message is
+    //! addressed to, the vector inside it, the bit that arms it — has the
+    //! same failure mode: a device that is found, claimed, and then never
+    //! interrupts. That is a keyboard that types nothing and a card that
+    //! receives nothing, and none of it shows up as an error anywhere.
 
     use super::*;
     use lock::Mutex;
@@ -432,6 +464,15 @@ mod bar_tests {
         /// Which bits of each dword the device lets software change.
         writable: Mutex<[u32; 64]>,
         latched: Mutex<u32>,
+        /// The decoding bits of the command register as they stood at every
+        /// write into a BAR, or-ed together. A probe has to turn them off
+        /// first, and nothing else could tell.
+        decoding_on_bar_write: Mutex<u16>,
+        /// How many times each dword has been read. A walk that loops does
+        /// not return a wrong answer, it returns the right one after reading
+        /// the same register over and over, and this is the only way to see
+        /// the difference.
+        reads: Mutex<[u32; 64]>,
     }
 
     impl FakeConfig {
@@ -441,10 +482,16 @@ mod bar_tests {
             // toggles to stop the device decoding while its BAR reads back
             // all-ones.
             writable[1] = 0xFFFF_FFFF;
+            // Of the last header dword only the interrupt LINE byte is
+            // writable: the pin beside it is read-only, which is what makes
+            // the driver's dword-wide write of the line number harmless.
+            writable[PCI_INTERRUPT_LINE as usize / 4] = 0x0000_00FF;
             Self {
                 space: Mutex::new([0u32; 64]),
                 writable: Mutex::new(writable),
                 latched: Mutex::new(0),
+                decoding_on_bar_write: Mutex::new(0),
+                reads: Mutex::new([0u32; 64]),
             }
         }
 
@@ -477,6 +524,54 @@ mod bar_tests {
         fn raw(&self, reg: u16) -> u32 {
             self.space.lock()[reg as usize / 4]
         }
+
+        /// Point the capability list at `first`.
+        fn cap_list(&self, first: u8) {
+            self.space.lock()[PCI_CAP_PTR as usize / 4] = first as u32;
+        }
+
+        /// A capability of a kind this driver steps over, at `at`, chained to
+        /// `next` (0 ends the list).
+        fn other_cap(&self, at: u16, id: u8, next: u8) {
+            self.space.lock()[at as usize / 4] = (id as u32) | ((next as u32) << 8);
+        }
+
+        /// An MSI capability at `at`. `ctrl` is Message Control, whose bit 7
+        /// says the device can take a 64-bit address and whose bit 0 is the
+        /// enable the driver sets. The id and the next pointer are hardwired
+        /// as on a device; the three dwords behind Message Control are the
+        /// address and the vector, and they are what software fills in.
+        fn msi_cap(&self, at: u16, next: u8, ctrl: u16) {
+            let i = at as usize / 4;
+            let mut space = self.space.lock();
+            let mut writable = self.writable.lock();
+            space[i] = (PCI_CAP_ID_MSI as u32) | ((next as u32) << 8) | ((ctrl as u32) << 16);
+            writable[i] = 0xFFFF_0000;
+            for d in 1..4 {
+                space[i + d] = 0;
+                writable[i + d] = 0xFFFF_FFFF;
+            }
+        }
+
+        /// How many times `reg`'s dword has been read.
+        fn reads_of(&self, reg: u16) -> u32 {
+            self.reads.lock()[reg as usize / 4]
+        }
+
+        /// The decoding bits seen while a BAR was being written.
+        fn decoding_while_probing(&self) -> u16 {
+            *self.decoding_on_bar_write.lock()
+        }
+
+        /// Leave `val` in a register, the way firmware would.
+        fn preset(&self, reg: u16, val: u32) {
+            self.space.lock()[reg as usize / 4] = val;
+        }
+
+        /// Let software change every bit of `reg`.
+        fn all_writable(&self, reg: u16) {
+            self.writable.lock()[reg as usize / 4] = 0xFFFF_FFFF;
+        }
     }
 
     impl PortOps for FakeConfig {
@@ -492,6 +587,7 @@ mod bar_tests {
                 "read from a port that is not the data one"
             );
             let off = (*self.latched.lock() & 0xFC) as usize;
+            self.reads.lock()[off / 4] += 1;
             self.space.lock()[off / 4]
         }
         unsafe fn write8(&self, _port: u16, _val: u8) {
@@ -512,6 +608,10 @@ mod bar_tests {
             let off = (*self.latched.lock() & 0xFC) as usize / 4;
             let w = self.writable.lock()[off];
             let mut space = self.space.lock();
+            // Dwords 4..10 are the six BARs. A write there is a probe step.
+            if (4..10).contains(&off) {
+                *self.decoding_on_bar_write.lock() |= (space[1] & 0x3) as u16;
+            }
             space[off] = (val & w) | (space[off] & !w);
         }
     }
@@ -612,6 +712,55 @@ mod bar_tests {
         // And a one-port BAR, where being two short would underflow.
         c.bar(BAR0, 0xCF8, 4, 0x1);
         assert_eq!(size(&c, BAR0), 4);
+        // An I/O BAR's address is bits 31:2, so bits 3:2 belong to the port
+        // number. Masking them off the way a memory BAR is masked moves the
+        // device eight ports down, onto whatever answers there.
+        assert_eq!(
+            addr(&c, BAR0),
+            0xCF8,
+            "bits 3:2 of an I/O BAR are address, not type flags"
+        );
+    }
+
+    #[test]
+    fn no_type_bit_a_device_reports_is_read_as_part_of_the_address() {
+        // Bit 0 says I/O and nothing else does. Bits 2:1 are the memory type
+        // — 00 anywhere in 32 bits, 10 anywhere in 64, and 01 the pre-2.2
+        // "locate below 1 MiB" window that old devices still report — and
+        // bit 3 is prefetchable. Read any of them as address and the base
+        // comes back up to eight bytes off; read bit 1 as the I/O flag and a
+        // memory window is handed over as a port number.
+        for flags in [0x0u32, 0x2, 0x8, 0xA] {
+            let c = FakeConfig::new();
+            c.bar(BAR0, 0x000C_0000, 128 * 1024, flags);
+            assert_eq!(addr(&c, BAR0), 0x000C_0000, "flags {flags:#x}");
+            assert_eq!(size(&c, BAR0), 128 * 1024, "flags {flags:#x}");
+        }
+    }
+
+    #[test]
+    fn a_bar_is_never_probed_while_the_device_is_still_decoding() {
+        let c = FakeConfig::new();
+        c.bar(BAR0, 0xF000_0000, 16 * MIB, 0x0);
+        // Memory and I/O decoding on, as a device that firmware already
+        // placed comes to us.
+        unsafe { IO.write16(&c, LOC, PCI_COMMAND, 0x0007) };
+        assert_eq!(size(&c, BAR0), 16 * MIB);
+        // All-ones written into a BAR that is still decoding moves the
+        // device to the top of the address space for as long as the probe
+        // lasts, on top of whatever lives there. The spec says to stop the
+        // decoding first; on a real bus the alternative is another device's
+        // window, or a machine check.
+        assert_eq!(
+            c.decoding_while_probing(),
+            0,
+            "the BAR was rewritten with the device still answering"
+        );
+        assert_eq!(
+            c.raw(PCI_COMMAND) & 0x7,
+            0x7,
+            "the probe left the device not decoding"
+        );
     }
 
     #[test]
@@ -671,5 +820,241 @@ mod bar_tests {
         // A mask with a gap in it — what a hardwired upper dword produces —
         // still yields the size rather than a number built from the gap.
         assert_eq!(size_from_mask(0x0000_0000_F000_0000), 256 * MIB);
+    }
+
+    /// Where the MSI capability sits in these tests. Anything from 0x40 up
+    /// is legal; the standard header ends there.
+    const MSI: u16 = 0x50;
+    /// Message Control bit 7: the device can be given a 64-bit address.
+    const MSI_64BIT: u16 = 1 << 7;
+    /// Message Control bit 0, as it sits in the capability's first dword.
+    const MSI_ENABLE_IN_DWORD: u32 = 0x0001_0000;
+
+    /// `enable_with` against a fake device, with an MSI number source of its
+    /// own so the numbers a test sees start at one.
+    fn enable_on(c: &FakeConfig, dest: u32) -> Option<usize> {
+        let mut n = 0u32;
+        unsafe {
+            enable_with(c, IO, LOC, 0, dest, || {
+                n += 1;
+                n
+            })
+        }
+    }
+
+    #[test]
+    fn an_msi_device_is_told_which_cpu_to_interrupt() {
+        let c = FakeConfig::new();
+        c.cap_list(MSI as u8);
+        c.msi_cap(MSI, 0, MSI_64BIT);
+        let irq = enable_on(&c, 7).expect("an MSI device gets a number");
+        // The destination APIC id rides in bits 19:12 of the message
+        // address. It was hardcoded to 0 once, on the reasoning that the BSP
+        // is usually APIC 0; where firmware says otherwise, every message
+        // went to a core that may never have come up.
+        assert_eq!(
+            c.raw(MSI + PCI_MSI_ADDR),
+            0xfee0_7000,
+            "the message is addressed to an APIC that does not run the handlers"
+        );
+        assert_eq!(
+            c.raw(MSI + PCI_MSI_DATA_64) & 0xffff,
+            irq as u32 + 32,
+            "the vector is the irq number offset by 32"
+        );
+        assert_ne!(
+            c.raw(MSI) & MSI_ENABLE_IN_DWORD,
+            0,
+            "the capability was programmed and then left disabled"
+        );
+        // And the legacy fallback did not also run. A device answered by
+        // MSI has no business being handed an INTx line as well: the line
+        // register is what the INTx path reads back, and a number left
+        // there is a second, wrong claim on an interrupt this device will
+        // never raise.
+        assert_eq!(
+            c.raw(PCI_INTERRUPT_LINE) & 0xff,
+            0,
+            "an MSI device was given a legacy interrupt line too"
+        );
+    }
+
+    #[test]
+    fn a_device_with_no_msi_capability_gets_the_legacy_interrupt_line() {
+        let c = FakeConfig::new();
+        assert_eq!(enable_on(&c, 7), None, "no capability, no MSI number");
+        assert_eq!(
+            c.raw(PCI_INTERRUPT_LINE) & 0xff,
+            33,
+            "a device with no MSI has to be given a line to raise"
+        );
+    }
+
+    #[test]
+    fn memory_space_and_bus_mastering_come_on_even_without_msi() {
+        let c = FakeConfig::new();
+        // INTX_DISABLE, as firmware may well leave it.
+        c.preset(PCI_COMMAND, 0x0000_0400);
+        let _ = enable_on(&c, 0);
+        let cmd = c.raw(PCI_COMMAND);
+        assert_eq!(
+            cmd & 0x7,
+            0x7,
+            "a DMA device needs I/O, memory space and bus mastering, MSI or not"
+        );
+        assert_ne!(
+            cmd & 0x0400,
+            0,
+            "the bits the firmware left in the command register were thrown away"
+        );
+    }
+
+    #[test]
+    fn the_msi_capability_is_found_behind_the_ones_in_front_of_it() {
+        let c = FakeConfig::new();
+        c.cap_list(0x40);
+        c.other_cap(0x40, 0x01, 0x48); // power management
+        c.other_cap(0x48, 0x10, MSI as u8); // PCI Express
+        c.msi_cap(MSI, 0, MSI_64BIT);
+        assert!(
+            enable_on(&c, 0).is_some(),
+            "the walk gave up before reaching the MSI capability"
+        );
+    }
+
+    #[test]
+    fn a_capability_that_points_at_itself_does_not_trap_the_probe() {
+        let c = FakeConfig::new();
+        c.cap_list(MSI as u8);
+        c.other_cap(MSI, 0x10, MSI as u8);
+        assert_eq!(enable_on(&c, 0), None);
+        assert_eq!(
+            c.raw(PCI_INTERRUPT_LINE) & 0xff,
+            33,
+            "the walk got out but the device was left without an interrupt"
+        );
+        // And it got out at once. Reaching the same capability twice is
+        // already the whole list; walking it to the step limit instead is
+        // sixty-odd config reads of a register whose answer will not change,
+        // on every device on the bus, at every boot.
+        assert!(
+            c.reads_of(MSI) <= 2,
+            "the same capability was read {} times",
+            c.reads_of(MSI)
+        );
+    }
+
+    #[test]
+    fn a_ring_of_capabilities_stops_at_the_step_limit() {
+        // Two capabilities pointing at each other: never equal to the one
+        // before, so the pointer guard never fires and only the step count
+        // ends it.
+        let c = FakeConfig::new();
+        c.cap_list(0x50);
+        c.other_cap(0x50, 0x10, 0x60);
+        c.other_cap(0x60, 0x11, 0x50);
+        assert_eq!(enable_on(&c, 0), None);
+        // Each step reads its capability's dword twice, for the id and for
+        // the pointer, so the whole walk fits in twice the step limit. The
+        // limit is what ends this one: without it the loop does not finish
+        // at all.
+        assert!(
+            c.reads_of(0x50) + c.reads_of(0x60) <= 2 * PCI_MAX_CAP_TRAVERSAL as u32,
+            "the walk took {} reads",
+            c.reads_of(0x50) + c.reads_of(0x60)
+        );
+    }
+
+    #[test]
+    fn a_capability_pointer_inside_the_standard_header_is_refused() {
+        // 0x00..0x40 is the standard header, so a pointer there is a device
+        // (or a bus) answering nonsense. Following it reads the header as if
+        // it were a capability list, and what it finds there can look like
+        // anything — including, as here, an MSI capability.
+        let c = FakeConfig::new();
+        c.cap_list(0x38);
+        c.msi_cap(0x38, 0, MSI_64BIT);
+        assert_eq!(
+            enable_on(&c, 0),
+            None,
+            "the header was walked as a capability list"
+        );
+    }
+
+    #[test]
+    fn a_32_bit_capability_gets_its_vector_where_the_upper_address_would_go() {
+        let c = FakeConfig::new();
+        c.cap_list(MSI as u8);
+        c.msi_cap(MSI, 0, 0);
+        let irq = enable_on(&c, 3).expect("an MSI device gets a number");
+        assert_eq!(
+            c.raw(MSI + PCI_MSI_DATA_32) & 0xffff,
+            irq as u32 + 32,
+            "a 32-bit capability carries its data one dword earlier"
+        );
+        assert_eq!(
+            c.raw(MSI + PCI_MSI_DATA_64),
+            0,
+            "a 32-bit capability has no fourth dword to write"
+        );
+    }
+
+    #[test]
+    fn a_64_bit_capability_has_its_upper_address_cleared_before_it_is_armed() {
+        let c = FakeConfig::new();
+        c.cap_list(MSI as u8);
+        c.msi_cap(MSI, 0, MSI_64BIT);
+        // Whatever was in the upper dword before us. The LAPIC window is at
+        // 0xFEE00000, so the upper half has to be zero; left alone, the
+        // device latches an address no CPU is listening at.
+        c.preset(MSI + PCI_MSI_UPPER_ADDR, 0xdead_beef);
+        let irq = enable_on(&c, 0).expect("an MSI device gets a number");
+        assert_eq!(
+            c.raw(MSI + PCI_MSI_UPPER_ADDR),
+            0,
+            "the upper half of the message address was left as we found it"
+        );
+        assert_eq!(
+            c.raw(MSI + PCI_MSI_DATA_64) & 0xffff,
+            irq as u32 + 32,
+            "a 64-bit capability carries its data one dword later"
+        );
+    }
+
+    #[test]
+    fn each_device_gets_a_vector_of_its_own() {
+        // Two devices sharing one number means one card's interrupts arrive
+        // as the other's, and the handler that runs is the wrong one.
+        let mut n = 0u32;
+        let mut next = || {
+            n += 1;
+            n
+        };
+        let a = FakeConfig::new();
+        a.cap_list(MSI as u8);
+        a.msi_cap(MSI, 0, MSI_64BIT);
+        let b = FakeConfig::new();
+        b.cap_list(MSI as u8);
+        b.msi_cap(MSI, 0, MSI_64BIT);
+        let first = unsafe { enable_with(&a, IO, LOC, 0, 0, &mut next) };
+        let second = unsafe { enable_with(&b, IO, LOC, 0, 0, &mut next) };
+        assert_eq!((first, second), (Some(1), Some(2)));
+        assert_ne!(
+            a.raw(MSI + PCI_MSI_DATA_64),
+            b.raw(MSI + PCI_MSI_DATA_64),
+            "two devices were given the same vector"
+        );
+    }
+
+    #[test]
+    fn revealing_the_registers_keeps_only_the_page_aligned_part_of_the_address() {
+        let c = FakeConfig::new();
+        c.all_writable(BAR0);
+        let _ = unsafe { enable_with(&c, IO, LOC, 0xf000_0abc, 0, || 1) };
+        assert_eq!(
+            c.raw(BAR0),
+            0xf000_0000,
+            "a BAR holds a base address, and the low bits of one are type flags"
+        );
     }
 }
