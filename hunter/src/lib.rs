@@ -721,3 +721,262 @@ mod tests {
         assert_eq!(policy::wx_mode(), Mode::Enforce);
     }
 }
+
+#[cfg(test)]
+mod elf_header_tests {
+    //! What `check_elf_binary` reads out of the first twenty bytes of a
+    //! program. The suite above checks that a non-ELF is refused; this
+    //! checks the header fields themselves, every one of which could be
+    //! ignored without a test noticing -- and an image hunter waves through
+    //! is one the loader then runs.
+
+    use super::*;
+    use alloc::vec;
+    use alloc::vec::Vec;
+
+    /// A well-formed little-endian ET_EXEC header for this build's machine.
+    fn an_elf() -> Vec<u8> {
+        let mut v = vec![0u8; 20];
+        v[0..4].copy_from_slice(b"\x7fELF");
+        v[4] = 2; // ELFCLASS64
+        v[5] = 1; // ELFDATA2LSB
+        v[6] = 1; // EV_CURRENT
+        v[16] = 2; // ET_EXEC, little endian
+        if let Some(m) = EXPECTED_MACHINE {
+            v[18] = (m & 0xff) as u8;
+            v[19] = (m >> 8) as u8;
+        }
+        v
+    }
+
+    /// Path policy off, so only the header decides.
+    fn only_the_header() -> impl Drop {
+        let g = crate::test_globals::lock();
+        policy::reset_for_test();
+        event_log::reset_for_test();
+        policy::set_exec_mode(Mode::Off);
+        g
+    }
+
+    #[test]
+    fn a_well_formed_header_is_accepted() {
+        let _g = only_the_header();
+        assert!(check_elf_binary("/bin/ok", &an_elf()));
+    }
+
+    #[test]
+    fn a_header_that_stops_before_the_machine_field_is_not_read_past_its_end() {
+        // The length gate is twenty because `e_machine` lives at 18..20.
+        // Lower it and this call reads off the end of the slice.
+        let _g = only_the_header();
+        let mut v = an_elf();
+        v.truncate(19);
+        assert!(check_elf_binary("/bin/short", &v));
+    }
+
+    #[test]
+    fn a_class_that_is_neither_32_nor_64_bit_is_refused() {
+        let _g = only_the_header();
+        let mut v = an_elf();
+        v[4] = 7;
+        assert!(!check_elf_binary("/bin/badclass", &v));
+    }
+
+    #[test]
+    fn an_endianness_byte_that_means_nothing_is_refused() {
+        // Laid out big-endian, so the only thing wrong with this header is
+        // the byte that says which way to read it. Drop that check and the
+        // reader falls into its big-endian arm for anything that is not 1:
+        // the header then parses cleanly and the program runs.
+        let _g = only_the_header();
+        let mut v = an_elf();
+        v[5] = 7;
+        v[16] = 0;
+        v[17] = 2;
+        if let Some(m) = EXPECTED_MACHINE {
+            v[18] = (m >> 8) as u8;
+            v[19] = (m & 0xff) as u8;
+        }
+        assert!(!check_elf_binary("/bin/badendian", &v));
+    }
+
+    #[test]
+    fn a_big_endian_header_is_read_big_endian_and_accepted() {
+        // ELFDATA2MSB is a real value, and the fields after it are then
+        // big-endian: read them the other way round and a valid program
+        // looks like a foreign machine.
+        let _g = only_the_header();
+        let mut v = an_elf();
+        v[5] = 2;
+        v[16] = 0;
+        v[17] = 2;
+        if let Some(m) = EXPECTED_MACHINE {
+            v[18] = (m >> 8) as u8;
+            v[19] = (m & 0xff) as u8;
+        }
+        assert!(check_elf_binary("/bin/bigendian", &v));
+    }
+
+    #[test]
+    fn a_header_version_that_is_not_the_current_one_is_refused() {
+        let _g = only_the_header();
+        let mut v = an_elf();
+        v[6] = 2;
+        assert!(!check_elf_binary("/bin/badversion", &v));
+    }
+
+    #[test]
+    fn a_shared_object_runs_and_a_core_dump_does_not() {
+        // ET_DYN is the type every position-independent executable has, so
+        // refusing it refuses most of userspace; ET_CORE is not a program.
+        let _g = only_the_header();
+        let mut v = an_elf();
+        v[16] = 3;
+        assert!(check_elf_binary("/bin/pie", &v));
+        v[16] = 4;
+        assert!(!check_elf_binary("/bin/core", &v));
+    }
+}
+
+#[cfg(test)]
+mod exec_learning_tests {
+    //! Trust on first use: the half of the exec policy that never denies.
+    use super::*;
+    use alloc::string::String;
+
+    fn start() -> impl Drop {
+        let g = crate::test_globals::lock();
+        policy::reset_for_test();
+        event_log::reset_for_test();
+        g
+    }
+
+    #[test]
+    fn learning_a_program_says_so_in_the_log() {
+        // The log line is the whole point: a userspace helper reads it (and
+        // `/proc/hunter`) to persist what was learned, and an operator reads
+        // it to see what walked onto the allowlist while learning was on.
+        let _g = start();
+        policy::set_exec_mode(Mode::Enforce);
+        policy::set_exec_learning(true);
+        assert!(check_exec_path("/usr/bin/new-thing"));
+        assert!(event_log::render().contains("learned trusted program"));
+        assert_eq!(policy::learned_exec_count(), 1);
+    }
+
+    #[test]
+    fn a_program_the_operator_trusts_runs_from_a_world_writable_place_too() {
+        // An explicit allowlist entry is the operator's own decision and
+        // outranks the location the file happens to sit in -- otherwise
+        // trusting a program under /tmp would be impossible to express.
+        let _g = start();
+        policy::set_exec_mode(Mode::Enforce);
+        policy::add_trusted_exec_path(String::from("/tmp/agent"));
+        policy::set_exec_learning(true);
+        assert!(policy::is_exec_listed("/tmp/agent"));
+        assert!(policy::is_world_writable_exec_path("/tmp/agent"));
+        assert!(check_exec_path("/tmp/agent"));
+    }
+}
+
+#[cfg(test)]
+mod wx_bookkeeping_tests {
+    //! The two-step W^X bypass: map a page writable, drop the write, add
+    //! execute. Catching it needs the writable region to have been
+    //! remembered, and the report to say which of the two it was.
+    use super::*;
+
+    const ADDR: usize = 0x4000_0000;
+    const LEN: usize = 0x1000;
+
+    fn start(pid: u64) -> impl Drop {
+        let g = crate::test_globals::lock();
+        policy::reset_for_test();
+        event_log::reset_for_test();
+        policy::set_wx_mode(Mode::Report);
+        wx::forget(pid);
+        g
+    }
+
+    #[test]
+    fn an_allowed_writable_mprotect_is_remembered_for_the_next_one() {
+        let pid = 8_001;
+        let _g = start(pid);
+        assert!(check_mprotect(pid, ADDR, LEN, true, false));
+        assert!(
+            wx::is_ever_writable(pid, ADDR, LEN),
+            "a region nobody recorded is a region the second step walks through"
+        );
+        wx::forget(pid);
+    }
+
+    #[test]
+    fn the_two_step_bypass_is_named_as_itself_not_as_a_plain_wx_mapping() {
+        let pid = 8_002;
+        let _g = start(pid);
+        assert!(check_mprotect(pid, ADDR, LEN, true, false));
+        assert!(check_mprotect(pid, ADDR, LEN, false, true));
+        let log = event_log::render();
+        assert!(
+            log.contains("executable mapping over an ever-writable region"),
+            "the report has to name the sequence, not the protections: {}",
+            log
+        );
+        assert!(!log.contains("mprotect: writable+executable mapping"));
+        wx::forget(pid);
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    //! What the fork/exit hooks do to the state hunter keeps per process.
+    use super::*;
+    use alloc::vec;
+
+    #[test]
+    fn a_child_inherits_its_parents_whitelist_and_not_the_other_way_round() {
+        // Inheriting the wrong way round means a process sheds its whitelist
+        // by forking, which is the bypass the hook exists to close.
+        let _g = crate::test_globals::lock();
+        policy::reset_for_test();
+        let (parent, child) = (8_101u64, 8_102u64);
+        policy::register_policy(parent, vec![60]);
+        task_fork(parent, child);
+        assert!(policy::is_syscall_allowed(child, 60).is_ok());
+        assert!(
+            policy::is_syscall_allowed(child, 101).is_err(),
+            "the child has to arrive holding the parent's whitelist"
+        );
+        heuristics::forget(child);
+        heuristics::forget(parent);
+    }
+
+    #[test]
+    fn a_process_that_exits_leaves_no_wx_intervals_behind() {
+        // Pids are recycled: an interval left behind is one the next process
+        // with this number is judged by.
+        let _g = crate::test_globals::lock();
+        policy::reset_for_test();
+        let pid = 8_103;
+        wx::record_writable(pid, 0x5000_0000, 0x1000);
+        assert!(wx::is_ever_writable(pid, 0x5000_0000, 0x1000));
+        task_exit(pid);
+        assert!(!wx::is_ever_writable(pid, 0x5000_0000, 0x1000));
+    }
+
+    #[test]
+    fn the_banner_is_recorded_once_however_many_boot_paths_call_init() {
+        // Two call sites reach `init` (bare-metal `main` and the loader's
+        // first spawn), and the latch is what keeps that from being two
+        // banners -- and, one day, two of whatever else init grows.
+        let _g = crate::test_globals::lock();
+        event_log::reset_for_test();
+        INITIALIZED.store(false, core::sync::atomic::Ordering::SeqCst);
+        init();
+        init();
+        assert_eq!(
+            event_log::render().matches("security subsystem v").count(),
+            1
+        );
+    }
+}
