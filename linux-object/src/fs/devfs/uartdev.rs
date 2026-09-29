@@ -435,6 +435,163 @@ mod uart_dev_tests {
     }
 
     #[test]
+    fn a_serial_line_is_a_character_device_only_its_owner_can_reach() {
+        // A block device here would make the shell's own stdin seekable and
+        // buffered; and the mode is the one thing keeping another account from
+        // reading what is typed at the port.
+        let m = dev(FakePort::new(&[], false, 0), 0).metadata().unwrap();
+        assert_eq!(m.type_, FileType::CharDevice);
+        assert_eq!(m.mode, 0o600, "owner read and write, and nobody else");
+        assert_eq!(m.size, 0, "a line has no length to seek within");
+    }
+
+    #[test]
+    fn a_read_of_one_single_byte_before_the_error_still_reports_that_byte() {
+        // One byte is the whole of what a prompt waits for, and it is already
+        // out of the receive register: the boundary of "has something" is one,
+        // not two.
+        let d = dev(FakePort::new(b"a", true, 0), 0);
+        let mut buf = [0u8; 8];
+        assert_eq!(d.read_at(0, &mut buf).unwrap(), 1);
+        assert_eq!(buf[0], b'a');
+        assert_eq!(d.read_at(0, &mut buf), Err(FsError::DeviceError));
+    }
+
+    #[test]
+    fn a_write_of_one_single_byte_before_the_error_still_reports_it() {
+        // Same boundary on the way out: answering with an error makes the
+        // caller resend from the start, so that one byte arrives twice.
+        let port = FakePort::new(&[], false, 1);
+        let d = dev(port.clone(), 0);
+        assert_eq!(d.write_at(0, b"ab").unwrap(), 1);
+        assert_eq!(&port.sent.lock()[..], b"a");
+    }
+
+    #[test]
+    fn a_serial_line_is_always_ready_to_take_what_is_written_to_it() {
+        // `poll` is how a shell decides whether it may write without blocking.
+        // A line that never says it can is a terminal nothing ever prints to.
+        let d = dev(FakePort::new(&[], false, 0), 0);
+        let st = d.poll().unwrap();
+        assert!(st.write);
+        assert!(!st.read, "nothing has been typed");
+        assert!(!st.error);
+        assert!(!st.hangup);
+    }
+
+    #[test]
+    fn only_the_flushing_form_of_tcsets_drops_the_byte_poll_peeked() {
+        // The three forms differ in exactly one thing: `TCSETSF` discards what
+        // was typed ahead. `getty` uses it before handing the line to `login`,
+        // which is what keeps a password out of the shell that follows.
+        for (cmd, gone) in [(TCSETS, false), (TCSETSW, false), (TCSETSF, true)] {
+            let d = dev(FakePort::new(b"typed-ahead", false, 0), 0);
+            assert!(d.poll().unwrap().read);
+            let t = Termios::default_tty();
+            assert_eq!(
+                d.io_control(cmd as u32, &t as *const Termios as usize),
+                Ok(0)
+            );
+            assert_eq!(
+                d.pending.lock().is_none(),
+                gone,
+                "cmd {:#x} took the wrong side",
+                cmd
+            );
+        }
+    }
+
+    #[test]
+    fn the_window_size_this_line_was_given_is_the_one_it_answers_with() {
+        // The framebuffer-derived default is right for the screen and far too
+        // big for a serial viewer, which is why `resize` and `stty` send this.
+        let d = dev(FakePort::new(&[], false, 0), 0);
+        let set = ConsoleWinSize {
+            ws_row: 40,
+            ws_col: 132,
+            ..Default::default()
+        };
+        assert_eq!(
+            d.io_control(TIOCSWINSZ as u32, &set as *const ConsoleWinSize as usize),
+            Ok(0)
+        );
+        let mut back = ConsoleWinSize::default();
+        assert_eq!(
+            d.io_control(TIOCGWINSZ as u32, &mut back as *mut ConsoleWinSize as usize),
+            Ok(0)
+        );
+        assert_eq!((back.ws_row, back.ws_col), (40, 132));
+        // And 0x0 is how a viewer hands the question back to the console.
+        let zero = ConsoleWinSize::default();
+        assert_eq!(
+            d.io_control(TIOCSWINSZ as u32, &zero as *const ConsoleWinSize as usize),
+            Ok(0)
+        );
+        assert!(
+            d.winsize.lock().is_none(),
+            "0x0 is not a size, it is a reset"
+        );
+    }
+
+    #[test]
+    fn a_window_size_with_one_dimension_left_at_zero_is_still_this_lines_own() {
+        // Only 0x0 means "ask the console". A viewer that knows its height and
+        // not its width still gets to say so, and losing that answer sends it
+        // back the framebuffer's size, which is what it was trying to avoid.
+        let d = dev(FakePort::new(&[], false, 0), 0);
+        for (row, col) in [(40u16, 0u16), (0, 132)] {
+            let set = ConsoleWinSize {
+                ws_row: row,
+                ws_col: col,
+                ..Default::default()
+            };
+            assert_eq!(
+                d.io_control(TIOCSWINSZ as u32, &set as *const ConsoleWinSize as usize),
+                Ok(0)
+            );
+            let mut back = ConsoleWinSize::default();
+            assert_eq!(
+                d.io_control(TIOCGWINSZ as u32, &mut back as *mut ConsoleWinSize as usize),
+                Ok(0)
+            );
+            assert_eq!((back.ws_row, back.ws_col), (row, col));
+        }
+    }
+
+    #[test]
+    fn every_port_error_becomes_the_filesystem_error_that_means_the_same() {
+        // What a program sees for a line that is not there, a line that is
+        // busy, and a line that broke mid-transfer has to be three different
+        // things, or a retry loop spins on a port that will never answer.
+        for (dev_err, fs_err) in [
+            (DeviceError::NotSupported, FsError::NotSupported),
+            (DeviceError::NotReady, FsError::Busy),
+            (DeviceError::InvalidParam, FsError::InvalidParam),
+            (DeviceError::BufferTooSmall, FsError::DeviceError),
+            (DeviceError::DmaError, FsError::DeviceError),
+            (DeviceError::IoError, FsError::DeviceError),
+            (DeviceError::AlreadyExists, FsError::DeviceError),
+            (DeviceError::NoResources, FsError::DeviceError),
+        ] {
+            assert_eq!(convert_error(dev_err), fs_err, "{:?}", dev_err);
+        }
+    }
+
+    #[test]
+    fn an_ioctl_that_cannot_reach_the_callers_memory_is_invalid_not_unsupported() {
+        // A null `struct termios *` is a caller bug, and `ENOSYS` in its place
+        // says the line is not a terminal -- which is what `isatty(3)` reads,
+        // and a shell believes it.
+        let d = dev(FakePort::new(&[], false, 0), 0);
+        assert_eq!(d.io_control(TCGETS as u32, 0), Err(FsError::InvalidParam));
+        assert_eq!(d.io_control(TCSETS as u32, 0), Err(FsError::InvalidParam));
+        assert_eq!(
+            d.io_control(TIOCGWINSZ as u32, 0),
+            Err(FsError::InvalidParam)
+        );
+    }
+
+    #[test]
     fn an_ioctl_this_line_does_not_know_is_still_refused() {
         let d = dev(FakePort::new(&[], false, 0), 0);
         assert_eq!(d.io_control(0x1234, 0), Err(FsError::NotSupported));

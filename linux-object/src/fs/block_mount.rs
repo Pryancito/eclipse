@@ -1399,6 +1399,278 @@ mod block_byte_tests {
         );
     }
 
+    /// A backing device that only holds `data`, so a read reaching past it
+    /// comes back SHORT -- the end-of-device shape, and the one case where
+    /// what the read-ahead planned and what the device delivered differ.
+    struct ShortReadDevice {
+        data: Mutex<Vec<u8>>,
+    }
+    impl Device for ShortReadDevice {
+        fn read_at(&self, offset: usize, buf: &mut [u8]) -> DevResult<usize> {
+            let d = self.data.lock();
+            let start = min(offset, d.len());
+            let take = min(buf.len(), d.len() - start);
+            buf[..take].copy_from_slice(&d[start..start + take]);
+            Ok(take)
+        }
+        fn write_at(&self, _offset: usize, buf: &[u8]) -> DevResult<usize> {
+            Ok(buf.len())
+        }
+        fn sync(&self) -> DevResult<()> {
+            Ok(())
+        }
+    }
+
+    /// `bytes` bytes of `pat` on a fresh ramfs.
+    fn ram_file(bytes: usize) -> Arc<dyn INode> {
+        use rcore_fs::vfs::{FileSystem, FileType};
+        let fs = rcore_fs_ramfs::RamFS::new();
+        let inode = fs
+            .root_inode()
+            .create("img", FileType::File, 0o644)
+            .unwrap();
+        let data: Vec<u8> = (0..bytes).map(pat).collect();
+        inode.write_at(0, &data).unwrap();
+        inode
+    }
+
+    // ── what a mount may be backed by, and how big it is ───────────────
+
+    #[test]
+    fn a_mount_is_backed_by_a_block_device_or_a_plain_file_and_nothing_else() {
+        use alloc::string::String;
+        use rcore_fs::vfs::{FileSystem, FileType};
+        // A loop-less loop mount: a regular file is a legal image.
+        let file = ram_file(1024);
+        assert!(matches!(
+            MountBackend::from_inode(file).unwrap(),
+            MountBackend::File(_)
+        ));
+        // And a node of `/dev` that really is a disk.
+        let disk: Arc<dyn INode> = Arc::new(BlockDev::new(
+            0,
+            MockBlock::new(8),
+            String::from("mockblock"),
+        ));
+        assert!(matches!(
+            MountBackend::from_inode(disk).unwrap(),
+            MountBackend::Block(_)
+        ));
+        // A directory is neither, and saying so is what turns a mistyped
+        // `mount` argument into an error instead of a parse of whatever the
+        // node happens to read as.
+        let fs = rcore_fs_ramfs::RamFS::new();
+        assert!(matches!(
+            MountBackend::from_inode(fs.root_inode()),
+            Err(FsError::NotSupported)
+        ));
+        let dir = fs.root_inode().create("d", FileType::Dir, 0o755).unwrap();
+        assert!(matches!(
+            MountBackend::from_inode(dir),
+            Err(FsError::NotSupported)
+        ));
+    }
+
+    #[test]
+    fn a_backing_store_is_measured_in_bytes_and_not_in_sectors() {
+        // This is the number the filesystem lays its superblock out against;
+        // 512 times too small and every image looks truncated.
+        let blk = MockBlock::new(8);
+        assert_eq!(
+            backend_size(&MountBackend::Block(blk.clone())).unwrap(),
+            8 * 512
+        );
+        let file = ram_file(1234);
+        assert_eq!(backend_size(&MountBackend::File(file)).unwrap(), 1234);
+    }
+
+    #[test]
+    fn the_device_a_mount_gets_knows_where_the_disk_really_ends() {
+        // The size handed to the cache is what clamps read-ahead. Measured in
+        // sectors instead of bytes it lands 512 times short of the real end,
+        // so the window never extends past the first sector and a sequential
+        // read pays one device command per piece all the way down the disk --
+        // which on polled AHCI is a synchronous round trip each.
+        let blk = MockBlock::new(8);
+        let d = device_from_backend(&MountBackend::Block(blk.clone())).unwrap();
+        let mut buf = [0u8; SECTOR];
+        // Three continuations prove the stream and fire the window.
+        for s in 0..3 {
+            d.read_at(s * SECTOR, &mut buf).unwrap();
+        }
+        let after_window = blk.commands();
+        for s in 3..8 {
+            d.read_at(s * SECTOR, &mut buf).unwrap();
+        }
+        assert_eq!(
+            blk.commands(),
+            after_window,
+            "read-ahead stopped short of the end of the device"
+        );
+    }
+
+    // ── a file-backed mount stops at the end of its file ───────────────
+
+    #[test]
+    fn a_file_backed_mount_is_clipped_to_the_image_it_was_given() {
+        let inode = ram_file(1000);
+        let d = FileByteDevice::new(inode.clone()).unwrap();
+        assert_eq!(
+            d.len, 1000,
+            "the image's length is its size, not its blocks"
+        );
+        let mut buf = [0u8; 16];
+        assert_eq!(d.read_at(0, &mut buf).unwrap(), 16);
+        assert_eq!(buf[0], pat(0));
+        // A read that straddles the end comes back with what is there.
+        assert_eq!(d.read_at(992, &mut buf).unwrap(), 8);
+        assert_eq!(d.read_at(1000, &mut buf).unwrap(), 0);
+        // And a write is clipped the same way: a mount must not be able to
+        // grow the file it was mounted from.
+        assert_eq!(d.write_at(992, &[0xEE; 16]).unwrap(), 8);
+        assert_eq!(
+            inode.metadata().unwrap().size,
+            1000,
+            "the image grew under the mount"
+        );
+        assert_eq!(d.write_at(1000, &[0xEE; 16]).unwrap(), 0);
+    }
+
+    // ── the read-ahead stream table ────────────────────────────────────
+
+    #[test]
+    fn a_stream_that_has_been_taken_up_stops_claiming_the_key_it_left() {
+        // `plan` vacates the entry because `commit` re-files it at the offset
+        // the next read will start from. Left behind, it answers a LATER read
+        // that happens to start there -- a re-read, not a continuation -- and
+        // hands it the confidence of a stream that has moved on, so a random
+        // access drags in a megabyte window and evicts the working set.
+        let dev = MockBlock::new(2048);
+        let raw = BlockByteDevice::new(dev.clone());
+        let data: Vec<u8> = (0..2048 * SECTOR).map(pat).collect();
+        raw.write_at(0, &data).unwrap();
+        let cd = cached(dev.clone(), 4096);
+        let mut buf = vec![0u8; SECTOR];
+        cd.read_at(0, &mut buf).unwrap();
+        cd.read_at(SECTOR, &mut buf).unwrap();
+        let st = cd.streams.lock();
+        assert!(
+            !st.slots.iter().any(|s| s.valid && s.last_end == SECTOR),
+            "a stale entry still names an offset its stream has moved off"
+        );
+        assert!(
+            st.slots.iter().any(|s| s.valid && s.last_end == 2 * SECTOR),
+            "the stream was not recorded where it actually ended"
+        );
+    }
+
+    #[test]
+    fn a_short_read_files_the_stream_where_the_next_read_will_start() {
+        // The plan's `read_end` is a prediction; a read at the end of the
+        // device comes back short. Filing the stream under what was asked for
+        // rather than what arrived means the next read looks in a bucket that
+        // is empty, or finds an entry naming an offset it will never reach,
+        // and a sequential reader never proves itself again.
+        let dev = Arc::new(ShortReadDevice {
+            data: Mutex::new((0..3 * SECTOR).map(pat).collect()),
+        });
+        let cd = CachedDevice::with_capacity(dev.clone(), 4 * SECTOR, 64);
+
+        // The aligned path: asks for two sectors from 1024, gets one.
+        let mut buf = vec![0u8; 2 * SECTOR];
+        assert_eq!(cd.read_at(2 * SECTOR, &mut buf).unwrap(), SECTOR);
+        {
+            let st = cd.streams.lock();
+            let slot = st.slots[StreamTable::idx(3 * SECTOR)];
+            assert!(slot.valid, "nothing is filed where the next read will look");
+            assert_eq!(slot.last_end, 3 * SECTOR, "filed under what was asked for");
+        }
+        // And the sector that never arrived is not in the cache pretending to
+        // be the zeros the buffer still held.
+        assert!(
+            !cd.cache.lock().contains(3),
+            "a sector the device never delivered was cached anyway"
+        );
+
+        // The unaligned path, which reads through a temporary: 500 bytes from
+        // 1100, of which only 436 are on the device.
+        let cd = CachedDevice::with_capacity(dev.clone(), 4 * SECTOR, 64);
+        let mut small = vec![0u8; 500];
+        assert_eq!(cd.read_at(2 * SECTOR + 76, &mut small).unwrap(), 436);
+        assert_eq!(small[0], pat(2 * SECTOR + 76));
+        assert_eq!(small[435], pat(3 * SECTOR - 1));
+        let st = cd.streams.lock();
+        let slot = st.slots[StreamTable::idx(3 * SECTOR)];
+        assert!(slot.valid && slot.last_end == 3 * SECTOR);
+    }
+
+    #[test]
+    fn read_ahead_past_the_end_of_the_device_still_names_a_span_going_forwards() {
+        // A filesystem can ask for a sector beyond the device -- a truncated
+        // image, a corrupt extent. Clamping the window to the device's end
+        // without holding it at the request's own end gives a span that ends
+        // BEFORE it starts, and the subtraction that measures it wraps.
+        let dev = Arc::new(ShortReadDevice {
+            data: Mutex::new(vec![0u8; 4 * SECTOR]),
+        });
+        let cd = CachedDevice::with_capacity(dev, 4 * SECTOR, 64);
+        let mut buf = vec![0u8; SECTOR];
+        // Three reads at the same past-the-end offset: each one continues the
+        // last (a short read ends where it started), so by the third the
+        // stream is proven and the window fires.
+        for _ in 0..3 {
+            assert_eq!(cd.read_at(8 * SECTOR, &mut buf).unwrap(), 0);
+        }
+    }
+
+    #[test]
+    fn the_end_of_the_device_is_rounded_up_to_a_whole_sector() {
+        // An image whose length is not a multiple of 512 still has that last
+        // partial sector on the disk, and read-ahead has to be allowed to
+        // fetch it; rounding the end DOWN leaves it out of every window, so
+        // the tail of every such image is one device command of its own.
+        let dev = Arc::new(ShortReadDevice {
+            data: Mutex::new((0..4 * SECTOR).map(pat).collect()),
+        });
+        let cd = CachedDevice::with_capacity(dev, 3 * SECTOR + 100, 64);
+        let mut buf = vec![0u8; SECTOR];
+        for s in 0..3 {
+            cd.read_at(s * SECTOR, &mut buf).unwrap();
+        }
+        assert!(
+            cd.cache.lock().contains(3),
+            "the window stopped short of the image's last, partial sector"
+        );
+    }
+
+    #[test]
+    fn a_failed_write_forgets_its_own_span_and_not_a_sector_more() {
+        // Both halves matter. A sector of the span left cached disagrees with
+        // the disk for as long as the mount lives; a sector outside it thrown
+        // away costs a device command for nothing, and on a polled driver that
+        // is a synchronous round trip.
+        let dev = Arc::new(PartialWriteDevice {
+            data: Mutex::new(vec![0xAA; 4 * SECTOR]),
+            fail_from: SECTOR, // sector 0 lands, sector 1 fails
+        });
+        let cd = CachedDevice::with_capacity(dev.clone(), 4 * SECTOR, 64);
+        let mut warm = vec![0u8; 3 * SECTOR];
+        assert_eq!(cd.read_at(0, &mut warm).unwrap(), 3 * SECTOR);
+        for s in 0..3 {
+            assert!(cd.cache.lock().contains(s), "sector {} did not warm", s);
+        }
+        assert!(cd.write_at(0, &vec![0xBBu8; 2 * SECTOR]).is_err());
+        assert!(!cd.cache.lock().contains(0));
+        assert!(
+            !cd.cache.lock().contains(1),
+            "the last sector of the failed span kept its old bytes"
+        );
+        assert!(
+            cd.cache.lock().contains(2),
+            "a sector the write never reached was dropped with it"
+        );
+    }
+
     #[test]
     fn cache_invalidate_clears_both_indexes() {
         let mut c = BlockCache::new(4);
