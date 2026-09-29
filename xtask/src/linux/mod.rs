@@ -3207,32 +3207,6 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
               desktop = labwc\n",
         )
         .unwrap();
-        // KDE's session daemon, and the one-time palette seeding that has to
-        // land before any KDE client reads kdeglobals. Both wrappers check
-        // for their own binary and exit quietly when KDE was left out of the
-        // image (ECLIPSE_KDE=0), so these two services are always written.
-        fs::write(
-            svc_dir.join("kde-colors.service"),
-            b"# Seed kdeglobals with Breeze Dark once. See eclipse-kde-colors.\n\
-              exec = /usr/local/bin/eclipse-kde-colors\n\
-              type = oneshot\n",
-        )
-        .unwrap();
-        fs::write(
-            svc_dir.join("kded.service"),
-            b"# KDE background services (kded6). See eclipse-kded.\n\
-              exec = /usr/local/bin/eclipse-kded\n\
-              type = respawn\n\
-              after = labwc dbus\n\
-              # Both gates, because kded6 needs both: a QGuiApplication (the\n\
-              # compositor socket) and a bus for every module it hosts. A\n\
-              # kded6 started without the bus exits at once and respawns\n\
-              # forever. Native stat polls, no forked `sleep` loops.\n\
-              wait_socket = /run/user/0/wayland-0\n\
-              wait_path = /run/user/0/bus\n\
-              desktop = labwc\n",
-        )
-        .unwrap();
         fs::write(
             svc_dir.join("lunarbar.service"),
             b"# Two-bar panel (wlr-layer-shell). See eclipse-lunarbar.\n\
