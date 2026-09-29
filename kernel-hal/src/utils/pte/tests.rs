@@ -144,6 +144,26 @@ fn the_contract<P: GenericPTE>(zeroed: fn() -> P, arch: &str) {
         arch
     );
 
+    // `is_unused` answers about the SLOT, not about the frame it names.
+    // Physical frame 0 is a frame like any other -- the first megabyte is
+    // where the BIOS data area and the AP trampoline live -- and an entry
+    // that decides by its address alone reports a live mapping of it as a
+    // free slot, which is what `next_table_mut` allocates over.
+    let e = a_leaf(zeroed(), 0, rw(), false);
+    assert!(!e.is_unused(), "{}: a mapping of frame 0 looks free", arch);
+    assert!(
+        e.is_present(),
+        "{}: a mapping of frame 0 is not present",
+        arch
+    );
+    assert_eq!(e.addr(), 0, "{}: a mapping of frame 0 moved", arch);
+    assert_eq!(
+        e.flags(),
+        rw(),
+        "{}: a mapping of frame 0 lost its flags",
+        arch
+    );
+
     // Clearing gets you back to nothing, which is what `unmap` relies on.
     let mut e = a_leaf(zeroed(), FRAME, rw(), true);
     e.clear();
@@ -234,6 +254,97 @@ fn a_no_access_mapping_is_claimed_but_absent() {
     // The other two do carry it.
     assert!(a_leaf(X86PTE::zeroed(), FRAME, MMUFlags::empty(), true).is_leaf());
     assert!(a_leaf(AARCH64PTE::zeroed(), FRAME, MMUFlags::empty(), true).is_leaf());
+
+    // And a no-access BLOCK is absent exactly as the 4 KiB page is. A huge
+    // leaf carries a bit the small one does not -- PS on x86, the cleared
+    // NON_BLOCK on AArch64 -- and an entry that calls itself present because
+    // *some* bit is set is a 2 MiB hole the first access walks straight
+    // into instead of faulting.
+    for (arch, present) in [
+        (
+            "x86_64",
+            a_leaf(X86PTE::zeroed(), FRAME, MMUFlags::empty(), true).is_present(),
+        ),
+        (
+            "aarch64",
+            a_leaf(AARCH64PTE::zeroed(), FRAME, MMUFlags::empty(), true).is_present(),
+        ),
+        (
+            "riscv64",
+            a_leaf(Rv64PTE::zeroed(), FRAME, MMUFlags::empty(), true).is_present(),
+        ),
+    ] {
+        assert!(!present, "{}: a no-access block is present", arch);
+    }
+    // Including the one PROT_NONE actually reaches: `mmap` asks for no
+    // access with USER set, and any non-empty flag set used to stamp
+    // PRESENT.
+    assert!(!a_leaf(X86PTE::zeroed(), FRAME, MMUFlags::USER, true).is_present());
+}
+
+/// An executable mapping with no read permission -- PF_X without PF_R, which
+/// is what Fuchsia's userboot ships -- is a mapping, not a hole. The guard
+/// that turns "no access at all" into an absent entry has to read all three
+/// permissions, and a guard that forgot EXECUTE would unmap the only segment
+/// of the first process.
+#[test]
+fn an_execute_only_mapping_is_still_a_mapping() {
+    for (arch, e) in [
+        (
+            "x86_64",
+            a_leaf(X86PTE::zeroed(), FRAME, MMUFlags::EXECUTE, false).is_present(),
+        ),
+        (
+            "aarch64",
+            a_leaf(AARCH64PTE::zeroed(), FRAME, MMUFlags::EXECUTE, false).is_present(),
+        ),
+        (
+            "riscv64",
+            a_leaf(Rv64PTE::zeroed(), FRAME, MMUFlags::EXECUTE, false).is_present(),
+        ),
+    ] {
+        assert!(e, "{}: an execute-only mapping is absent", arch);
+    }
+
+    // What comes back differs, and the difference is the hardware's. x86 and
+    // AArch64 have no read-disable bit, so an executable leaf is readable
+    // whether or not READ was asked for; RISC-V has one and says X alone.
+    assert_eq!(
+        a_leaf(X86PTE::zeroed(), FRAME, MMUFlags::EXECUTE, false).flags(),
+        MMUFlags::READ | MMUFlags::EXECUTE
+    );
+    assert_eq!(
+        a_leaf(AARCH64PTE::zeroed(), FRAME, MMUFlags::EXECUTE, false).flags(),
+        MMUFlags::READ | MMUFlags::EXECUTE
+    );
+    assert_eq!(
+        a_leaf(Rv64PTE::zeroed(), FRAME, MMUFlags::EXECUTE, false).flags(),
+        MMUFlags::EXECUTE
+    );
+}
+
+/// The top of each architecture's physical address range. A mask one bit
+/// short maps the frame somewhere else and only ever at addresses nobody has
+/// the RAM to reach, so it would ship. The shared contract can only use the
+/// narrowest of the three (AArch64's 40 bits); these are the other two.
+#[test]
+fn every_format_reaches_the_top_of_its_own_range() {
+    // x86-64 masks bits 12..52.
+    const TOP_X86: usize = 0x000f_ffff_ffff_f000;
+    let mut e = a_leaf(X86PTE::zeroed(), TOP_X86, rw(), false);
+    assert_eq!(e.addr(), TOP_X86, "x86_64: the top frame did not survive");
+    assert_eq!(e.flags(), rw(), "x86_64: the top frame ate the flags");
+    e.set_table(TOP_X86);
+    assert_eq!(e.addr(), TOP_X86, "x86_64: the top table did not survive");
+
+    // RISC-V's PPN is bits 10..54 of the entry and the frame is shifted
+    // right by two, so it reaches bit 56 of the physical address.
+    const TOP_RV: usize = 0x00ff_ffff_ffff_f000;
+    let mut e = a_leaf(Rv64PTE::zeroed(), TOP_RV, rw(), false);
+    assert_eq!(e.addr(), TOP_RV, "riscv64: the top frame did not survive");
+    assert_eq!(e.flags(), rw(), "riscv64: the top frame ate the flags");
+    e.set_table(TOP_RV);
+    assert_eq!(e.addr(), TOP_RV, "riscv64: the top table did not survive");
 }
 
 // ── x86-64: Intel SDM vol. 3A, tables 4-15 .. 4-20 ─────────────────────────
@@ -346,6 +457,112 @@ fn an_uncached_x86_mapping_carries_the_cache_bits() {
     x86_64::set_pat_wc_ready(false);
 }
 
+/// The cache policy is the low two bits of `MMUFlags`, and the only thing
+/// that reads them as a number is this file: `CachePolicy` names four of
+/// them and `zx_vmo_set_cache_policy` lets userspace choose. Every policy
+/// has to land on the encoding the CPU reads, and a policy read one bit
+/// short silently becomes Cached -- which is a device register in the cache.
+#[test]
+fn every_cache_policy_lands_on_the_encoding_the_cpu_reads() {
+    let _guard = PAT_WC.lock();
+    x86_64::set_pat_wc_ready(false);
+    let r = MMUFlags::READ;
+    for (name, asked, want) in [
+        ("Cached", r, 0),
+        ("Uncached", r | MMUFlags::CACHE_1, X86_PCD | X86_PWT),
+        ("UncachedDevice", r | MMUFlags::CACHE_2, X86_PCD | X86_PWT),
+        (
+            "WriteCombining",
+            r | MMUFlags::CACHE_1 | MMUFlags::CACHE_2,
+            X86_PCD | X86_PWT,
+        ),
+    ] {
+        let e = a_leaf(X86PTE::zeroed(), FRAME, asked, false);
+        assert_eq!(
+            e.raw() & (X86_PCD | X86_PWT),
+            want,
+            "{} did not reach the entry",
+            name
+        );
+    }
+
+    // And back. PAT index 3 is the only uncached encoding `PTF` can carry --
+    // the bit that tells 3 from 7 is not in `PTF` at all, because its
+    // position depends on the level -- so an uncached entry reads back as
+    // CACHE_1, never as CACHE_2 or as both.
+    let uncached = a_leaf(X86PTE::zeroed(), FRAME, r | MMUFlags::CACHE_1, false);
+    assert_eq!(uncached.flags(), r | MMUFlags::CACHE_1);
+    let wc = a_leaf(
+        X86PTE::zeroed(),
+        FRAME,
+        r | MMUFlags::CACHE_1 | MMUFlags::CACHE_2,
+        false,
+    );
+    assert_eq!(
+        wc.flags(),
+        r | MMUFlags::CACHE_1,
+        "write-combining read back"
+    );
+    assert_eq!(
+        a_leaf(X86PTE::zeroed(), FRAME, r, false).flags(),
+        r,
+        "a cached page came back with a cache bit"
+    );
+}
+
+/// `flags()` and `is_present()` are asked about entries this file did not
+/// write: `rboot` builds the first page tables and the kernel walks them
+/// afterwards. PAT index 1 is PWT alone and index 2 is PCD alone; both are
+/// cached, and only index 3 -- PCD *and* PWT -- is not.
+#[test]
+fn an_entry_this_kernel_did_not_write_is_read_the_way_the_cpu_reads_it() {
+    let cache_bits = MMUFlags::CACHE_1 | MMUFlags::CACHE_2;
+    for (name, raw) in [
+        ("write-through", X86_PRESENT | X86_PWT),
+        ("cache-disable", X86_PRESENT | X86_PCD),
+    ] {
+        let e = X86PTE::from_raw(FRAME as u64 | raw);
+        assert!(
+            !e.flags().intersects(cache_bits),
+            "{} read back as uncached",
+            name
+        );
+    }
+    let uncached = X86PTE::from_raw(FRAME as u64 | X86_PRESENT | X86_PCD | X86_PWT);
+    assert_eq!(uncached.flags() & cache_bits, MMUFlags::CACHE_1);
+
+    // PRESENT is one bit, not "any bit". An entry with attributes and no
+    // PRESENT is a page that faults, and the walker has to see that.
+    let absent = X86PTE::from_raw(FRAME as u64 | X86_NX | X86_PCD);
+    assert!(
+        !absent.is_present(),
+        "an absent entry called itself present"
+    );
+    assert!(!X86PTE::from_raw(X86_PS).is_present());
+}
+
+/// `set_addr` takes a physical address and must not let any of it reach the
+/// flags. Bit 63 of an x86 entry is NX, so an address one bit too wide would
+/// make a repointed mapping non-executable.
+#[test]
+fn an_address_wider_than_the_mask_cannot_reach_the_flags() {
+    let mut e = a_leaf(
+        X86PTE::zeroed(),
+        FRAME,
+        MMUFlags::READ | MMUFlags::EXECUTE,
+        false,
+    );
+    assert_eq!(e.flags(), MMUFlags::READ | MMUFlags::EXECUTE);
+    e.set_addr(OTHER_FRAME | 1 << 63);
+    assert_eq!(e.addr(), OTHER_FRAME, "the stray bits moved the frame");
+    assert_eq!(
+        e.flags(),
+        MMUFlags::READ | MMUFlags::EXECUTE,
+        "an address bit turned into a permission"
+    );
+    assert_eq!(e.raw(), OTHER_FRAME as u64 | X86_PRESENT);
+}
+
 // ── AArch64: ARM ARM, stage 1 VMSAv8-64 block and page descriptors ─────────
 
 const A64_VALID: u64 = 1 << 0;
@@ -419,6 +636,29 @@ fn an_invalid_aarch64_descriptor_grants_nothing() {
     // And attribute index 0 is Device, which a cleared entry has without ever
     // having been a device mapping.
     assert!(!e.flags().contains(MMUFlags::DEVICE));
+
+    // Which is why the entry this kernel writes for a no-access page carries
+    // the Normal index and its shareability, rather than being blank below
+    // the access flag: index 0 there would be a descriptor that says Device
+    // and never was one.
+    let e = a_leaf(AARCH64PTE::zeroed(), FRAME, MMUFlags::empty(), false);
+    assert_eq!(
+        e.raw(),
+        FRAME as u64 | A64_NORMAL | A64_INNER | A64_SHAREABLE | A64_AF | A64_NON_BLOCK
+    );
+
+    // A real device mapping does take index 0, and says so on the way back.
+    let e = a_leaf(
+        AARCH64PTE::zeroed(),
+        FRAME,
+        MMUFlags::READ | MMUFlags::WRITE | MMUFlags::DEVICE,
+        false,
+    );
+    assert_eq!(e.raw() & (A64_NORMAL | A64_INNER | A64_SHAREABLE), 0);
+    assert_eq!(
+        e.flags(),
+        MMUFlags::READ | MMUFlags::WRITE | MMUFlags::DEVICE
+    );
 }
 
 // ── RISC-V: privileged spec, Sv39/Sv48 page-table entry ────────────────────
@@ -463,6 +703,14 @@ fn the_riscv_entry_is_the_one_the_hardware_walks() {
     e.set_table(FRAME);
     assert_eq!(e.raw(), (FRAME as u64 >> 2) | RV_VALID);
     assert!(!e.is_leaf());
+    // And it grants nothing: V alone is the hardware's own encoding for "keep
+    // walking", so a reader that took it for a permission would report every
+    // inner node of the tree as a readable page.
+    assert!(
+        e.flags().is_empty(),
+        "a table pointer granted {:?}",
+        e.flags()
+    );
     assert!(a_leaf(Rv64PTE::zeroed(), FRAME, MMUFlags::READ, false).is_leaf());
     assert!(a_leaf(Rv64PTE::zeroed(), FRAME, MMUFlags::EXECUTE, false).is_leaf());
 

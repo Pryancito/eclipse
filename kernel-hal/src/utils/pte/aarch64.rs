@@ -246,3 +246,68 @@ impl AARCH64PTE {
         self.0
     }
 }
+
+#[cfg(test)]
+mod attribute_index_tests {
+    use super::*;
+
+    /// MAIR_EL1 holds eight memory attributes and a descriptor names one of
+    /// them in bits 4..2, so the field has to be able to say all eight. A
+    /// field a bit narrower still names Device and Normal, which is every
+    /// attribute this kernel uses today -- and then index 4 quietly becomes
+    /// index 0, which is Device, on the first mapping that needs a third.
+    #[test]
+    fn the_attribute_index_field_can_name_all_eight_mair_entries() {
+        for idx in 0..8u64 {
+            let f = PTF::from_bits_truncate((idx << 2) as usize);
+            assert_eq!(
+                (f.bits() as u64 & PTF::ATTR_INDEX_MASK) >> 2,
+                idx,
+                "attribute index {} did not survive the descriptor",
+                idx
+            );
+        }
+    }
+
+    /// The field is spelled twice -- once as a flag and once as the mask
+    /// `mem_type` reads it back with -- and the two have to be the same
+    /// bits. Neither spelling is checked against the hardware by anything
+    /// else: every index this kernel writes is 0 or 1, which fits in the
+    /// bottom bit of the field.
+    #[test]
+    fn the_two_spellings_of_the_field_are_the_same_bits() {
+        assert_eq!(PTF::ATTR_INDX.bits() as u64, PTF::ATTR_INDEX_MASK);
+        // And it is a field of its own: none of the bits around it belongs
+        // to it, so widening it would eat a neighbour.
+        let neighbours = PTF::VALID
+            | PTF::NON_BLOCK
+            | PTF::NS
+            | PTF::AP_EL0
+            | PTF::AP_RO
+            | PTF::INNER
+            | PTF::SHAREABLE
+            | PTF::AF
+            | PTF::NG;
+        assert_eq!(PTF::ATTR_INDX.bits() & neighbours.bits(), 0);
+    }
+
+    /// Each memory type goes into a descriptor and comes back out as
+    /// itself, and `mem_type` panics on anything else -- so an index this
+    /// file cannot produce is a kernel panic inside the page-table walk.
+    #[test]
+    fn a_memory_type_survives_the_trip_through_a_descriptor() {
+        for t in [MemType::Device, MemType::Normal] {
+            assert_eq!(
+                PTF::from_mem_type(t).mem_type(),
+                t,
+                "{:?} did not survive the descriptor",
+                t
+            );
+        }
+        // Normal memory is inner shareable so the other cores see the same
+        // bytes; Device memory is not shareable at all, which is what stops
+        // the hardware reordering or merging an access to a register.
+        assert!(PTF::from_mem_type(MemType::Normal).contains(PTF::INNER | PTF::SHAREABLE));
+        assert!(!PTF::from_mem_type(MemType::Device).intersects(PTF::INNER | PTF::SHAREABLE));
+    }
+}

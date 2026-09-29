@@ -171,4 +171,12 @@ impl X86PTE {
     pub(crate) fn raw(&self) -> u64 {
         self.0
     }
+
+    /// An entry this file did not write, to read back. `rboot` builds the
+    /// first page tables and the kernel walks them afterwards, so `flags()`
+    /// and `is_present()` are asked about bit patterns no code here ever
+    /// emits.
+    pub(crate) fn from_raw(bits: u64) -> Self {
+        Self(bits)
+    }
 }
