@@ -232,6 +232,14 @@ mod tests {
         PinRegistry::new()
     }
 
+    /// The unbalanced-unpin count is process-wide and a test binary runs a
+    /// crate's tests in one process, so the tests that measure a change in it
+    /// take turns.
+    fn counter_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     #[test]
     fn a_free_with_nothing_mapped_over_it_is_not_held() {
         let mut r = reg();
@@ -382,6 +390,7 @@ mod tests {
         // Pins and Drops are paired one to one, so a mismatch means some other
         // pin will never be dropped either — and that one holds its block out
         // of the pool until the machine reboots.
+        let _g = counter_lock();
         let before = unbalanced_unpins();
         let mut r = reg();
         r.pin(A, 4);
@@ -398,10 +407,57 @@ mod tests {
         assert!(r.unpin(A, 4).is_empty());
         // Second drop of a pin that is already gone: counted as unbalanced,
         // never a wrapped refcount that pins the range forever.
+        let _g = counter_lock();
         let before = unbalanced_unpins();
         assert!(r.unpin(A, 4).is_empty());
         assert_eq!(unbalanced_unpins(), before + 1);
         assert!(!r.pinned(A, 4));
+    }
+
+    #[test]
+    fn an_unpin_at_the_absent_address_is_no_drift_between_pins_and_drops() {
+        // `pin(0, _)` recorded nothing, so the `unpin(0, _)` that pairs with
+        // it is not a pin gone missing. Counting it would make the one number
+        // that says "some pin will never be dropped" say so on every VMO the
+        // callers hand a zero base.
+        let _g = counter_lock();
+        let before = unbalanced_unpins();
+        let mut r = reg();
+        r.pin(0, 4);
+        assert!(r.unpin(0, 4).is_empty());
+        assert_eq!(unbalanced_unpins(), before);
+    }
+
+    #[test]
+    fn dropping_a_pin_drops_the_one_it_names_and_not_the_first_at_that_base() {
+        // Two VMOs over the same buffer, of different lengths. Matching an
+        // unpin on the base alone drops whichever was recorded first, so the
+        // pin that is still mapped disappears and its block goes back to the
+        // frame pool underneath it.
+        let mut r = reg();
+        r.pin(A, 4);
+        r.pin(A, 1);
+        // A free that only the four-page pin covers.
+        assert!(r.hold_if_pinned(A + 2 * PG, 1));
+        assert!(
+            r.unpin(A, 1).is_empty(),
+            "the four-page pin is still holding it"
+        );
+        assert_eq!(r.unpin(A, 4), alloc::vec![(A + 2 * PG, 1)]);
+    }
+
+    #[test]
+    fn two_frees_that_start_at_the_same_page_are_parked_apart() {
+        // The dedup keeps one block from being parked twice; it is not there
+        // to drop a second block that happens to share a base. A free
+        // answered "held" that is on nobody's list is frames lost until the
+        // machine reboots.
+        let mut r = reg();
+        r.pin(A, 8);
+        assert!(r.hold_if_pinned(A, 4));
+        assert!(r.hold_if_pinned(A, 2));
+        assert_eq!(r.held.len(), 2);
+        assert_eq!(r.unpin(A, 8).len(), 2);
     }
 
     #[test]

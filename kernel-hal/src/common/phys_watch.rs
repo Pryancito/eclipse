@@ -394,6 +394,20 @@ mod tests {
     }
 
     #[test]
+    fn a_frame_tracked_below_the_range_is_not_an_alias() {
+        // The walk starts at the range's own word. Starting at word zero
+        // instead reads every word below it with a full mask, so one live
+        // coroutine stack anywhere lower answers "alias" for a write that
+        // never touches it -- and `pmem_write` refuses that write.
+        let s: FrameSet<4> = FrameSet::new();
+        s.mark(5); // word 0, well below the range asked about
+        assert!(!s.aliases(at(100), 4 * PAGE_SIZE));
+        // The same range does answer for a frame that is really in it.
+        s.mark(101);
+        assert!(s.aliases(at(100), 4 * PAGE_SIZE));
+    }
+
+    #[test]
     fn a_range_spanning_several_words_finds_a_frame_in_any_of_them() {
         let s = Small::new();
         s.mark(70);

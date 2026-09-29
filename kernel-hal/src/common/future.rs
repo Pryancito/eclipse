@@ -43,11 +43,42 @@ pub(super) struct SleepFuture {
     slot: Option<TimerWakerSlot>,
 }
 
+/// What a poll of [`SleepFuture`] does about its deadline, given the clock.
+#[derive(Debug, PartialEq, Eq)]
+enum Sleep {
+    /// The deadline has arrived: the sleep is over.
+    Over,
+    /// So far out that no timer can name it. Some other wake source has to
+    /// end this wait.
+    Unreachable,
+    /// Arm a timer for this instant.
+    Arm(Duration),
+}
+
 impl SleepFuture {
     pub fn new(deadline: Duration) -> Self {
         Self {
             deadline,
             slot: None,
+        }
+    }
+
+    /// What to do at `now` about a sleep until `deadline`.
+    ///
+    /// Split from [`Future::poll`] for the same reason as
+    /// [`DisplayFlushFuture::flush_due`]: `poll` reads the clock and arms a
+    /// timer, and a test can hold neither of those still. The boundary is the
+    /// whole of the first arm -- `sleep_until(t)` is over *at* `t`, not only
+    /// after it, and a deadline that lands on the very tick that reads it
+    /// would otherwise arm a timer for an instant already gone instead of
+    /// returning.
+    fn step(now: Duration, deadline: Duration) -> Sleep {
+        if now >= deadline {
+            Sleep::Over
+        } else if Self::is_never(deadline) {
+            Sleep::Unreachable
+        } else {
+            Sleep::Arm(deadline)
         }
     }
 
@@ -74,17 +105,17 @@ impl Future for SleepFuture {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
         let this = self.get_mut();
-        if timer::timer_now() >= this.deadline {
-            timer_waker::kill_timer_waker(&mut this.slot);
-            return Poll::Ready(());
+        match Self::step(timer::timer_now(), this.deadline) {
+            Sleep::Over => {
+                timer_waker::kill_timer_waker(&mut this.slot);
+                Poll::Ready(())
+            }
+            Sleep::Unreachable => Poll::Pending,
+            Sleep::Arm(deadline) => {
+                timer_waker::ensure_timer_waker(&mut this.slot, deadline, cx);
+                Poll::Pending
+            }
         }
-        if Self::is_never(this.deadline) {
-            // The caller relies on some other wake source.
-            return Poll::Pending;
-        }
-        let deadline = this.deadline;
-        timer_waker::ensure_timer_waker(&mut this.slot, deadline, cx);
-        Poll::Pending
     }
 }
 
@@ -247,11 +278,114 @@ impl Future for DisplayFlushFuture {
 mod tests {
     use super::*;
     use crate::timer_waker::test_waker::{waker_of, Probe};
+    use alloc::collections::VecDeque;
     use alloc::sync::Arc;
     use core::sync::atomic::{AtomicUsize, Ordering};
     use zcore_drivers::prelude::{ColorFormat, DisplayInfo, FrameBuffer};
-    use zcore_drivers::scheme::Scheme;
-    use zcore_drivers::DeviceResult;
+    use zcore_drivers::scheme::{EventScheme, Scheme, UartScheme};
+    use zcore_drivers::utils::EventHandler;
+    use zcore_drivers::{Device, DeviceResult};
+
+    /// A uart whose bytes a test hands it, counting its subscriptions.
+    ///
+    /// `zcore_drivers::mock::MockUart` reads the process's real stdin and
+    /// writes its real stdout, so it cannot answer a test.
+    struct FakeUart {
+        incoming: std::sync::Mutex<VecDeque<u8>>,
+        subscribed: AtomicUsize,
+        unsubscribed: AtomicUsize,
+    }
+
+    impl FakeUart {
+        fn with(bytes: &[u8]) -> Arc<Self> {
+            Arc::new(Self {
+                incoming: std::sync::Mutex::new(bytes.iter().copied().collect()),
+                subscribed: AtomicUsize::new(0),
+                unsubscribed: AtomicUsize::new(0),
+            })
+        }
+
+        fn push(&self, byte: u8) {
+            self.incoming
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push_back(byte);
+        }
+
+        fn subscribed(&self) -> usize {
+            self.subscribed.load(Ordering::SeqCst)
+        }
+
+        fn unsubscribed(&self) -> usize {
+            self.unsubscribed.load(Ordering::SeqCst)
+        }
+    }
+
+    impl Scheme for FakeUart {
+        fn name(&self) -> &str {
+            "fake-uart"
+        }
+    }
+
+    impl EventScheme for FakeUart {
+        type Event = ();
+
+        fn trigger(&self, _event: ()) {}
+
+        fn subscribe(&self, _handler: EventHandler<()>, _once: bool) -> Option<u64> {
+            Some(self.subscribed.fetch_add(1, Ordering::SeqCst) as u64)
+        }
+
+        fn unsubscribe(&self, _id: u64) {
+            self.unsubscribed.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    impl UartScheme for FakeUart {
+        fn try_recv(&self) -> DeviceResult<Option<u8>> {
+            Ok(self
+                .incoming
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .pop_front())
+        }
+
+        fn send(&self, _ch: u8) -> DeviceResult {
+            Ok(())
+        }
+
+        /// The console pushes the kernel log at whatever uart is registered,
+        /// and while this one is attached it is that uart: swallow another
+        /// test's log line rather than print it.
+        fn write_str(&self, _s: &str) -> DeviceResult {
+            Ok(())
+        }
+    }
+
+    /// Register `uart` as *the* uart for as long as the guard lives.
+    ///
+    /// The device lists are process-wide and `all_uart().first()` takes the
+    /// first entry, so only one test at a time may hold one.
+    struct Attached {
+        dev: Device,
+        _guard: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl Attached {
+        fn new(uart: &Arc<FakeUart>) -> Self {
+            static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+            let guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let dev = Device::Uart(uart.clone());
+            crate::drivers::add_device_hosted(dev.clone());
+            Self { dev, _guard: guard }
+        }
+    }
+
+    impl Drop for Attached {
+        fn drop(&mut self) {
+            let _ = crate::drivers::remove_device_hosted(&self.dev);
+        }
+    }
 
     /// A display with no pixels that counts how often it is asked to push a
     /// frame. This future never reads the framebuffer -- only how often it
@@ -347,6 +481,79 @@ mod tests {
         // 292 years of uptime is where this sits; everything real is below it.
         assert!(!SleepFuture::is_never(Duration::from_secs(86400 * 365)));
         assert!(!SleepFuture::is_never(Duration::from_millis(1)));
+    }
+
+    #[test]
+    fn the_sleep_is_over_at_the_deadline_itself_and_not_a_tick_later() {
+        // `sleep_until(t)` is over *at* `t`. This is the only thing the
+        // decision decides, and the clock `poll` reads cannot be held still,
+        // so the boundary is asked of the seam.
+        let t = Duration::from_secs(9);
+        assert_eq!(SleepFuture::step(t, t), Sleep::Over);
+        assert_eq!(
+            SleepFuture::step(t + Duration::from_nanos(1), t),
+            Sleep::Over
+        );
+        assert_eq!(
+            SleepFuture::step(t - Duration::from_nanos(1), t),
+            Sleep::Arm(t),
+            "a nanosecond short is still a wait, and what gets armed is the deadline"
+        );
+        let never = Duration::from_nanos(i64::MAX as u64);
+        assert_eq!(SleepFuture::step(Duration::ZERO, never), Sleep::Unreachable);
+    }
+
+    #[test]
+    fn a_single_byte_is_a_whole_console_read() {
+        // A read that waits for input has to come back on the first byte.
+        // Waiting for a second one leaves a reader parked on every single
+        // keystroke, which is every prompt there is.
+        let uart = FakeUart::with(b"k");
+        let _attached = Attached::new(&uart);
+        let probe = Probe::new();
+        let mut buf = [0u8; 16];
+        {
+            let mut f = SerialReadFuture::new(&mut buf);
+            assert_eq!(poll_once(&mut f, &probe), Poll::Ready(1));
+        }
+        assert_eq!(buf[0], b'k');
+    }
+
+    #[test]
+    fn the_reader_subscribes_once_and_only_while_it_is_waiting() {
+        // The subscription is what the arrival of a byte wakes. Subscribing
+        // only when one is already held means none is ever made and the read
+        // sleeps through every keystroke; subscribing on every poll parks a
+        // waker per poll inside the driver.
+        let uart = FakeUart::with(b"");
+        let _attached = Attached::new(&uart);
+        let probe = Probe::new();
+        let mut buf = [0u8; 4];
+        let mut f = SerialReadFuture::new(&mut buf);
+        assert_eq!(poll_once(&mut f, &probe), Poll::Pending);
+        assert_eq!(uart.subscribed(), 1);
+        assert_eq!(poll_once(&mut f, &probe), Poll::Pending);
+        assert_eq!(uart.subscribed(), 1, "one wait, one waker");
+        // And the byte that ends the wait takes the subscription with it.
+        uart.push(b'k');
+        assert_eq!(poll_once(&mut f, &probe), Poll::Ready(1));
+        assert_eq!(uart.unsubscribed(), 1);
+    }
+
+    #[test]
+    fn the_next_frame_is_measured_from_the_schedule_and_not_from_the_flush() {
+        // `flush_due` hands the clock and the schedule to `next_flush_after`
+        // in that order. The other way round, a frame pushed early sets the
+        // next deadline a whole frame after the push instead of after the
+        // frame it was due, which is the drift the resync exists to avoid.
+        let display = FlushCounter::new();
+        let mut f = DisplayFlushFuture::new(display.clone(), 100);
+        assert_eq!(f.frame_time, Duration::from_millis(10));
+        assert_eq!(
+            f.flush_due(Duration::from_millis(5)),
+            Duration::from_millis(10)
+        );
+        assert_eq!(display.flushes(), 1);
     }
 
     #[test]
